@@ -5,6 +5,34 @@ _Language: **English** | [한국어](CHANGELOG.ko.md)_
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.32
+
+### Fixed
+
+- **Validation checksums no longer false-mismatch on NULL-bearing rows.** The
+  per-row checksum joined columns with a `'\0'` NUL sentinel for NULLs, but that
+  byte renders differently on each engine (a single NUL on MySQL vs. the two-char
+  string `0x5C30` under PostgreSQL's `standard_conforming_strings`, DSQL's
+  default), so any row containing a NULL hashed differently on source and target
+  and was reported as a spurious difference. The sentinel is now the plain text
+  `<NULL>` (also avoiding NUL, which is invalid in PG text), so identical data
+  hashes identically on both engines.
+- **Validation checksums now agree on binary and BIT columns.** MySQL rendered
+  `BINARY`/`VARBINARY`/`BLOB` (and spatial) as raw bytes while the target side
+  used hex, and `BIT` was compared as raw bits vs. an integer — both produced a
+  guaranteed cross-engine mismatch even when the stored data was identical. Binary
+  columns are now hashed as lower-case hex on both sides (`LOWER(HEX(…))` on MySQL
+  to match PG `encode(…, 'hex')`), and `BIT(n)` is compared as its integer value
+  (`CAST(… AS UNSIGNED)` vs. `::text`).
+- **Out-of-range MySQL `TIME` values now fail loudly instead of corrupting the
+  target column.** MySQL `TIME` spans `-838:59:59..838:59:59`, but a DSQL `time`
+  column only holds `00:00:00..23:59:59.999999`. A value outside that range had no
+  `time` representation and would silently bind as an interval (or a non-time text
+  cell), corrupting the column. Full Load now raises a clear `ValueConversionError`
+  naming the column and value and pointing to the fix (remap the target type to
+  `interval`/`text` in Schema Conversion, or restrict the source values), matching
+  the existing `TINYINT(1)`-out-of-range guard — data is never silently mangled.
+
 ## v0.1.31
 
 ### Fixed
