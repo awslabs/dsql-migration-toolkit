@@ -29,7 +29,9 @@ from dsql_migrator.core.query_playground import (
 from dsql_migrator.ui.query_playground import (
     PlaygroundState,
     PlaygroundStore,
+    _build_retest_turn,
     classification_tone,
+    extract_sql_from_reply,
     is_testable,
     kind_meta,
     probe_outcome_tone,
@@ -416,6 +418,124 @@ def test_state_result_clears_stale_probe() -> None:
     state.set_result(QueryConverter().convert("SELECT 1"))
     # A fresh conversion invalidates the previous target-test verdict.
     assert state.probe is None
+
+
+# ---------------------------------------------------------------------------
+# AI query-optimizer: SQL extraction + re-test comparison turn
+# ---------------------------------------------------------------------------
+
+
+def test_extract_sql_from_reply_takes_last_fenced_block() -> None:
+    # A reply may show a 'before' block then the rewrite; the LAST block is the
+    # model's final proposal. Trailing ';' is stripped so it runs under EXPLAIN.
+    md = (
+        "Here's the original:\n```sql\nSELECT * FROM orders;\n```\n"
+        "and my rewrite:\n```sql\nSELECT id FROM orders WHERE id = 1;\n```\ndone"
+    )
+    assert extract_sql_from_reply(md) == "SELECT id FROM orders WHERE id = 1"
+
+
+def test_extract_sql_from_reply_handles_plain_fence_and_none() -> None:
+    # A fence with no 'sql' language tag still counts.
+    assert extract_sql_from_reply("```\nSELECT 1;\n```") == "SELECT 1"
+    # No code block -> nothing to test.
+    assert extract_sql_from_reply("just prose, no code") is None
+    assert extract_sql_from_reply("") is None
+
+
+def test_extract_sql_isolates_select_from_accompanying_ddl() -> None:
+    # A tuning reply often includes a suggested CREATE INDEX before the SELECT.
+    # Passing the whole block to EXPLAIN is a syntax error (and the read-only
+    # playground can't run DDL), so only the SELECT must be returned.
+    md = (
+        "```sql\n"
+        "CREATE INDEX ASYNC idx ON t (a) INCLUDE (b);\n\n"
+        "SELECT a, b FROM t WHERE a >= 4;\n"
+        "```"
+    )
+    assert extract_sql_from_reply(md) == "SELECT a, b FROM t WHERE a >= 4"
+
+
+def test_extract_sql_strips_comments_that_would_break_explain() -> None:
+    # A leading -- line comment would otherwise comment out the EXPLAIN wrapper we
+    # prepend, causing a syntax error; block comments must go too.
+    md = (
+        "```sql\n"
+        "-- rewrite: project only needed columns\n"
+        "/* covering-index friendly */\n"
+        "SELECT a, b FROM t WHERE a >= 4 LIMIT 20;\n"
+        "```"
+    )
+    assert extract_sql_from_reply(md) == "SELECT a, b FROM t WHERE a >= 4 LIMIT 20"
+
+
+def test_extract_sql_keeps_cte_and_returns_none_for_ddl_only() -> None:
+    # A CTE (WITH ...) is testable and must be kept whole.
+    cte = (
+        "```sql\nWITH c AS (SELECT id FROM t ORDER BY ts DESC LIMIT 20)\n"
+        "SELECT * FROM c;\n```"
+    )
+    assert extract_sql_from_reply(cte).startswith("WITH c AS")
+    # A reply with only DDL (no runnable SELECT) yields None, so the UI tells the
+    # user there's nothing to re-test rather than sending a doomed EXPLAIN.
+    assert extract_sql_from_reply("```sql\nCREATE INDEX ASYNC idx ON t (a);\n```") is None
+
+
+def _probe(outcome, *, dpu_total=None, plan="", analyzed=False, detail="ok", code=None):
+    from dsql_migrator.core.query_playground import DpuEstimate
+
+    dpu = (
+        DpuEstimate(compute=0.0, read=0.0, write=0.0, total=dpu_total,
+                    estimated_cost_usd=None)
+        if dpu_total is not None
+        else None
+    )
+    return ExecutionProbe(
+        outcome=outcome, mode=ProbeMode.EXPLAIN, detail=detail, error_code=code,
+        plan=plan, analyzed=analyzed, dpu=dpu,
+    )
+
+
+def test_retest_turn_reports_improvement_percentage() -> None:
+    # A cheaper rewrite (0.03 vs baseline 0.10) -> CHEAPER + correct percentage, so
+    # the AI can explain the win in-thread.
+    turn = _build_retest_turn(
+        _probe(ProbeOutcome.PASSED, dpu_total=0.03, plan="Index Only Scan", analyzed=True),
+        baseline_dpu=0.10,
+    )
+    assert "CHEAPER" in turn
+    assert "70.0%" in turn
+    assert "0.03000 DPU" in turn and "0.10000 DPU" in turn
+
+
+def test_retest_turn_flags_a_regression() -> None:
+    # A pricier rewrite must be reported honestly, not spun as an improvement.
+    turn = _build_retest_turn(
+        _probe(ProbeOutcome.PASSED, dpu_total=0.20, analyzed=True),
+        baseline_dpu=0.10,
+    )
+    assert "MORE EXPENSIVE" in turn
+
+
+def test_retest_turn_on_failed_rewrite_asks_for_a_fix() -> None:
+    turn = _build_retest_turn(
+        _probe(ProbeOutcome.FAILED, detail="syntax error", code="42601"),
+        baseline_dpu=0.10,
+    )
+    assert "REJECTED" in turn and "42601" in turn
+
+
+def test_retest_turn_without_baseline_or_dpu_is_honest() -> None:
+    # No DPU captured (plan-only) -> do not fabricate a number.
+    no_dpu = _build_retest_turn(
+        _probe(ProbeOutcome.PASSED, plan="Full Scan", analyzed=False), baseline_dpu=0.10
+    )
+    assert "no DPU cost estimate" in no_dpu.lower() or "no dpu" in no_dpu.lower()
+    # DPU present but no baseline -> report cost, note missing baseline.
+    no_base = _build_retest_turn(
+        _probe(ProbeOutcome.PASSED, dpu_total=0.05, analyzed=True), baseline_dpu=None
+    )
+    assert "0.05000 DPU" in no_base and "baseline" in no_base.lower()
 
 
 def test_state_probe_lifecycle() -> None:

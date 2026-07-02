@@ -21,6 +21,7 @@ satisfies it -- so this module stays UI-only and testable in isolation.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 from typing import Callable, Optional
@@ -324,8 +325,13 @@ def build_chat_drawer(ui: object) -> Callable[..., None]:
                 if footer_action is not None and footer_label:
                     answer = outcome.markdown
 
-                    def _do_footer(_e=None, _answer=answer) -> None:
-                        footer_action(_answer)  # type: ignore[misc]
+                    async def _do_footer(_e=None, _answer=answer) -> None:
+                        # footer_action may be sync (e.g. adopt SQL) or async (e.g.
+                        # re-test the rewrite on the target, which does off-loop
+                        # I/O); await it when it returns an awaitable.
+                        maybe = footer_action(_answer)  # type: ignore[misc]
+                        if inspect.isawaitable(maybe):
+                            await maybe
 
                     with actions:  # type: ignore[attr-defined]
                         ui.button(  # type: ignore[attr-defined]
@@ -357,7 +363,7 @@ def build_chat_drawer(ui: object) -> Callable[..., None]:
         streamer: ChatStreamer,
         footer_label: Optional[str] = None,
         footer_action: Optional[Callable[[str], None]] = None,
-    ) -> None:
+    ) -> Callable[[str], None]:
         conv["messages"] = []
         conv["busy"] = False
         conv["streamer"] = streamer
@@ -373,6 +379,16 @@ def build_chat_drawer(ui: object) -> Callable[..., None]:
         _set_busy(False)
         dialog.open()  # type: ignore[attr-defined]
         _run_turn(first_question)
+
+        # Return a sender so the opening screen can drive a follow-up turn
+        # programmatically (e.g. feed a re-test's before/after DPU numbers back so
+        # the SAME assistant explains the improvement in-thread). It goes through
+        # _run_turn like a typed message, so the reply is delivered BY THE AI and
+        # stays within the turn limit; a no-op once the conversation is at its cap.
+        def send_turn(text: str) -> None:
+            _run_turn(text)
+
+        return send_turn
 
     return open_chat
 

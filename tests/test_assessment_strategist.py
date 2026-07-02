@@ -418,6 +418,40 @@ def test_build_query_chat_system_grounds_on_query_and_error() -> None:
     assert "fix the statement" in system_err.lower()
 
 
+def test_build_query_optimize_system_grounds_on_dsql_efficiency_and_bans_pg_lore() -> None:
+    from dsql_migrator.core.assessment_strategist import build_query_optimize_system
+
+    # With a captured EXPLAIN ANALYZE plan + DPU: the real plan and cost are woven
+    # in so the advice is grounded in THIS query's actual DSQL execution.
+    plan = "Full Scan (btree-table) on public.orders  (cost=..)"
+    system = build_query_optimize_system(
+        "SELECT * FROM orders WHERE created_at > '2025-01-01'",
+        "SELECT * FROM orders WHERE created_at > '2025-01-01'",
+        plan=plan,
+        dpu_total=3.39262,
+        analyzed=True,
+    )
+    assert plan in system  # reason from the real plan
+    assert "3.39262 DPU" in system  # the measured cost baseline
+    # Grounded on DSQL-specific execution facts, not vanilla PostgreSQL.
+    assert "DPU" in system
+    assert "Full Scan" in system  # DSQL term (not "Seq Scan")
+    assert "filter" in system.lower() and "storage" in system.lower()
+    assert "identical" in system.lower()  # must not change results
+    # CRITICAL: it must explicitly forbid vanilla-PG tuning lore that is wrong/
+    # inexpressible on DSQL, so the model doesn't hallucinate it.
+    lowered = system.lower()
+    assert "vacuum" in lowered and "reindex" in lowered  # named in the ban list
+    assert "do not" in lowered or "not suggest" in lowered
+
+    # Without a captured plan: it must NOT fabricate a plan/DPU; it should nudge to
+    # run Test-on-target with ANALYZE first.
+    no_plan = build_query_optimize_system("SELECT 1", "SELECT 1")
+    assert "no query plan was captured" in no_plan.lower()
+    assert "do not invent" in no_plan.lower() or "do not fabricate" in no_plan.lower() \
+        or "not invent" in no_plan.lower()
+
+
 def test_build_validation_chat_system_grounds_on_facts_and_recovery() -> None:
     from dsql_migrator.core.assessment_strategist import build_validation_chat_system
 

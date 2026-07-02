@@ -371,6 +371,122 @@ def build_query_chat_system(
     )
 
 
+# Aurora DSQL query-efficiency guidance. DSQL is a DISTRIBUTED, PostgreSQL-
+# compatible engine, so generic PostgreSQL tuning lore is frequently wrong here.
+# This rubric grounds the "rewrite for efficiency" chat on how DSQL actually
+# executes queries (AWS Database Blog "Improve query performance with EXPLAIN
+# plans in Amazon Aurora DSQL") so the model reasons about DSQL, not vanilla PG.
+DSQL_QUERY_EFFICIENCY_RUBRIC = (
+    "How Aurora DSQL runs queries (this is DISTINCT from single-node PostgreSQL — "
+    "do NOT apply generic PostgreSQL tuning lore):\n"
+    "- There is NO heap: every table IS a B-tree organized by its primary key, so "
+    "the PK is a fully covering index. A table with no usable index for the "
+    "predicate is read with a 'Full Scan' (not a 'Seq Scan'). Range/equality "
+    "filters on the primary key are physically sequential and inherently cheap.\n"
+    "- Compute and storage are PHYSICALLY SEPARATED, so every row that crosses "
+    "from storage to compute costs latency and DPU (Distributed Processing Unit — "
+    "DSQL's real cost unit, shown as the 'Statement DPU Estimate' in EXPLAIN "
+    "ANALYZE VERBOSE; ignore raw PostgreSQL cost= numbers as the goal). The single "
+    "biggest lever is PUSHING FILTERS DOWN so fewer bytes move.\n"
+    "- Three filter layers, best to worst: (1) Index Condition — equality/range on "
+    "indexed key columns (put the most selective column leftmost in a composite "
+    "index); (2) Storage Filter — add non-key filter columns to an index INCLUDE "
+    "clause so storage filters before transfer; (3) Query Processor Filter — shows "
+    "as a top-level 'Filter:' line, all unfiltered data already crossed the "
+    "network (worst). Move predicates from layer 3 → 2 → 1.\n"
+    "- Scan types, cheapest last: Full Scan (add a PK or an index on the selective "
+    "column) → Index Scan with a 'Storage Lookup' node (an incomplete covering "
+    "index — add the missing SELECT/WHERE columns to INCLUDE) → Index Only Scan "
+    "(ideal).\n"
+    "Efficient-query patterns that are specific to DSQL:\n"
+    "- Replace SELECT * with an explicit column list (every projected column is "
+    "fetched across the network).\n"
+    "- A leading-wildcard LIKE ('%x%') cannot use an index condition; rewrite as a "
+    "prefix match, or add a more selective indexed predicate.\n"
+    "- In multi-table joins where a filter on one table logically applies to "
+    "another through a business relationship the optimizer can't infer, add a "
+    "REDUNDANT join predicate (one at a time) so it can use an index instead of a "
+    "Full Scan.\n"
+    "- For filter + ORDER BY + LIMIT that isn't fully index-covered, use CTE late "
+    "materialization: narrow to the final rows using only indexed columns first, "
+    "then join back to the base table for the remaining columns.\n"
+    "- Prefer randomly-distributed keys (e.g. UUID) over monotonic ones "
+    "(AUTO_INCREMENT, timestamps) which create hot partitions; secondary indexes "
+    "are built with CREATE INDEX ASYNC.\n"
+    "Do NOT suggest vanilla-PostgreSQL tactics that do not apply to DSQL: no "
+    "VACUUM/ANALYZE-as-tuning (DSQL auto-analyzes), no REINDEX/CLUSTER, no "
+    "fillfactor/HOT-update/bloat/autovacuum knobs, no planner GUCs, and do not "
+    "frame success as lowering the PostgreSQL cost= number. Frame efficiency as "
+    "fewer bytes crossing storage→compute (lower DPU)."
+)
+
+
+def build_query_optimize_system(
+    original_sql: str,
+    converted_sql: str,
+    *,
+    plan: Optional[str] = None,
+    dpu_total: Optional[float] = None,
+    analyzed: bool = False,
+) -> str:
+    """Build the system grounding for the "rewrite this query for efficiency" chat.
+
+    A sibling of :func:`build_query_chat_system` for the Query Playground's second
+    AI action. It grounds the model on the deterministic converted SQL, the same
+    :data:`DSQL_CONSTRAINTS`, the Aurora-DSQL-specific efficiency rubric
+    (:data:`DSQL_QUERY_EFFICIENCY_RUBRIC`, which BANS vanilla-PostgreSQL tuning
+    lore), and -- when a "Test on target" probe captured them -- the REAL EXPLAIN
+    plan text and the measured DPU total, so the advice is grounded in this query's
+    actual DSQL plan rather than priors. Advisory only: the model proposes a
+    rewrite for the operator to test, it is never auto-applied.
+    """
+    source = (original_sql or "(unavailable)").strip()[:_MAX_TEXT_CHARS]
+    target = (converted_sql or "(could not be converted)").strip()[:_MAX_TEXT_CHARS]
+    if plan:
+        kind = "EXPLAIN ANALYZE (actually executed)" if analyzed else "EXPLAIN (planned, not executed)"
+        dpu_line = (
+            f"\nMeasured Aurora DSQL cost for the current query: {dpu_total:.5f} DPU total.\n"
+            if dpu_total is not None
+            else "\n"
+        )
+        plan_block = (
+            f"\n\nThe current converted query's Aurora DSQL query plan "
+            f"({kind}) — reason from THIS plan (scan types, Storage Lookup nodes, "
+            f"top-level Filter: lines), not from priors:\n"
+            f"```\n{plan.strip()[:_MAX_TEXT_CHARS]}\n```"
+            f"{dpu_line}"
+        )
+    else:
+        plan_block = (
+            "\n\nNo query plan was captured yet. Suggest running \"Test on target\" "
+            "with the EXPLAIN ANALYZE toggle on to get the real plan + DPU cost, and "
+            "base concrete advice on that; do not invent plan details or a DPU number."
+        )
+    return (
+        "You are a senior AWS database engineer helping a teammate make a converted "
+        "query run efficiently on Amazon Aurora DSQL (a distributed, "
+        "PostgreSQL-compatible database). Answer naturally and conversationally — "
+        "explain in your own words, friendly and specific, not a rigid template. "
+        "When you propose a rewritten query, put it in a fenced ```sql code block so "
+        "it is easy to copy, and ALWAYS explain in detail WHAT you changed and WHY "
+        "it is cheaper on DSQL (which scan type / filter layer it improves, and why "
+        "fewer bytes cross from storage to compute / lower DPU). The rewrite MUST "
+        "return the SAME results as the original — never change its semantics to "
+        "make it faster; if a real speedup needs an index or schema change you "
+        "cannot express in the query alone, say so explicitly.\n\n"
+        "Stay strictly on making THIS query efficient on Aurora DSQL. If asked "
+        "anything off-topic, decline in one sentence and steer back.\n\n"
+        "Original query (MySQL):\n"
+        f"```sql\n{source}\n```\n\n"
+        "The tool's deterministic Aurora DSQL conversion (the query to optimize — "
+        "keep its results identical):\n"
+        f"```sql\n{target}\n```"
+        f"{plan_block}\n\n"
+        f"Aurora DSQL constraints:\n{DSQL_CONSTRAINTS}\n\n"
+        f"{DSQL_QUERY_EFFICIENCY_RUBRIC}"
+    )
+
+
 # How a migrated MySQL->DSQL pipeline can diverge, and what fixes it. Grounds the
 # validation chat so the model reasons about THIS tool's Full Load + CDC model
 # (not generic replication) and recommends the right recovery.
@@ -926,6 +1042,7 @@ class ObjectGuidanceOutcome:
 
 __all__ = [
     "DSQL_CONSTRAINTS",
+    "DSQL_QUERY_EFFICIENCY_RUBRIC",
     "AiAssessmentOutcome",
     "AssessmentStrategist",
     "ObjectGuidanceOutcome",
@@ -935,5 +1052,6 @@ __all__ = [
     "build_validation_chat_system",
     "build_conversion_chat_system",
     "build_query_chat_system",
+    "build_query_optimize_system",
     "parse_assessment_output",
 ]

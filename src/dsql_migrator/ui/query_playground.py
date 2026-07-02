@@ -23,11 +23,15 @@ helpers here are independent of NiceGUI so they can be unit tested directly; onl
 
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from dsql_migrator.core.assessment_strategist import build_query_chat_system
+from dsql_migrator.core.assessment_strategist import (
+    build_query_chat_system,
+    build_query_optimize_system,
+)
 from dsql_migrator.core.models import Classification, TargetConnectionConfig
 from dsql_migrator.core.query_converter import (
     QueryConversionResult,
@@ -103,6 +107,128 @@ def is_testable(result: QueryConversionResult) -> bool:
     if result.converted_sql is None:
         return False
     return result.statement_kind in (StatementKind.SELECT, StatementKind.DDL)
+
+
+_SQL_FENCE_RE = re.compile(r"```(?:sql)?\s*\n?(.*?)```", re.IGNORECASE | re.DOTALL)
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+
+
+def _strip_sql_comments(sql: str) -> str:
+    """Remove SQL comments so a rewrite runs cleanly under an EXPLAIN wrapper.
+
+    Drops ``/* ... */`` block comments and any ``-- ...`` line comment (to end of
+    line). Critically, a leading ``--`` comment inside the reply would otherwise
+    comment out the ``EXPLAIN`` we prepend (turning the whole probe into a
+    comment) and cause a syntax error. Keeps string literals intact for the common
+    case (comment markers inside quotes are rare in a rewrite and not worth a full
+    tokenizer here).
+    """
+    sql = _BLOCK_COMMENT_RE.sub(" ", sql)
+    lines = []
+    for line in sql.splitlines():
+        idx = line.find("--")
+        lines.append(line[:idx] if idx != -1 else line)
+    return "\n".join(lines)
+
+
+def _last_testable_statement(sql: str) -> Optional[str]:
+    """Return the last EXPLAIN-testable statement (SELECT/WITH) from ``sql``.
+
+    An AI rewrite reply can contain MORE than the query — e.g. a suggested
+    ``CREATE INDEX ASYNC ...;`` followed by the ``SELECT``. Passing the whole
+    thing to ``EXPLAIN`` is a syntax error, and the playground can't run DDL here
+    anyway. Split on statement boundaries (``;``) and return the LAST statement
+    that starts with SELECT or WITH (a CTE) — that's the query to plan. Returns
+    ``None`` when no such statement exists. Pure/testable.
+    """
+    # Split on semicolons (naive but sufficient: rewrites rarely embed ';' in a
+    # string literal; if they do, the target simply rejects it and we surface it).
+    parts = [p.strip() for p in sql.split(";")]
+    for part in reversed(parts):
+        if not part:
+            continue
+        head = part.lstrip("(").lstrip().upper()
+        if head.startswith("SELECT") or head.startswith("WITH"):
+            return part
+    return None
+
+
+def extract_sql_from_reply(markdown: str) -> Optional[str]:
+    """Extract the runnable rewritten query from an AI reply, or ``None``.
+
+    Pulls the LAST fenced ```sql block (the model's final proposal — it may show a
+    'before' block first), strips SQL comments, and returns only the last
+    EXPLAIN-testable statement (SELECT / WITH). This deliberately ISOLATES the
+    exact query text so it runs cleanly under the ``EXPLAIN`` wrapper: it drops
+    accompanying DDL (e.g. a suggested ``CREATE INDEX``, which the read-only
+    playground can't run) and inline comments (a leading ``--`` would otherwise
+    comment out the EXPLAIN and cause a syntax error). Returns ``None`` when no
+    fenced block or no testable statement is present. Pure/testable.
+    """
+    if not markdown:
+        return None
+    blocks = _SQL_FENCE_RE.findall(markdown)
+    for block in reversed(blocks):
+        cleaned = _strip_sql_comments(block).strip()
+        if not cleaned:
+            continue
+        stmt = _last_testable_statement(cleaned)
+        if stmt:
+            return stmt
+    return None
+
+
+def _build_retest_turn(probe: ExecutionProbe, baseline_dpu: Optional[float]) -> str:
+    """Compose the follow-up chat turn that reports a rewrite's re-test result.
+
+    The operator clicked "Test rewrite on target": we re-ran the AI's proposed
+    SQL on DSQL and captured a fresh probe. Rather than print raw numbers, we feed
+    the deterministic outcome (did it run, its DPU, and the measured before/after
+    delta vs the original's ``baseline_dpu``) back to the SAME assistant as a user
+    turn, so the AI reports — in the drawer, in its own words — whether and by how
+    much the rewrite actually improved. Pure/testable: builds only the text.
+    """
+    if probe.outcome is ProbeOutcome.FAILED:
+        detail = probe.detail + (
+            f" (SQLSTATE {probe.error_code})" if probe.error_code else ""
+        )
+        return (
+            "I re-tested your rewritten query on the Aurora DSQL target and it was "
+            f"REJECTED: {detail}\n\nExplain briefly why it failed and give a "
+            "corrected rewrite that still returns the same results."
+        )
+    new_dpu = probe.dpu.total if probe.dpu is not None else None
+    if new_dpu is None:
+        return (
+            "I re-tested your rewritten query on the target and it ran, but no DPU "
+            "cost estimate was captured (the plan was EXPLAIN-only). Here is its "
+            f"query plan:\n\n```\n{(probe.plan or '').strip()[:2000]}\n```\n\n"
+            "Briefly, does this plan confirm your rewrite is more efficient (scan "
+            "type / filter layer), and is there anything more to improve?"
+        )
+    if baseline_dpu is None:
+        return (
+            "I re-tested your rewritten query on the target with EXPLAIN ANALYZE. "
+            f"Its measured cost is {new_dpu:.5f} DPU total. The original query was "
+            "not measured with ANALYZE, so I don't have a baseline. Based on this "
+            "plan and DPU, is the rewrite efficient, and what else could improve it?"
+            f"\n\nPlan:\n```\n{(probe.plan or '').strip()[:2000]}\n```"
+        )
+    delta = baseline_dpu - new_dpu
+    pct = (delta / baseline_dpu * 100.0) if baseline_dpu else 0.0
+    direction = (
+        "CHEAPER" if delta > 0 else "MORE EXPENSIVE" if delta < 0 else "about the same"
+    )
+    return (
+        "I re-tested your rewritten query on the Aurora DSQL target with EXPLAIN "
+        f"ANALYZE. Measured cost: original ≈ {baseline_dpu:.5f} DPU vs rewrite ≈ "
+        f"{new_dpu:.5f} DPU — the rewrite is {direction} "
+        f"({abs(delta):.5f} DPU, {abs(pct):.1f}%).\n\n"
+        "Explain to me what this means: did your rewrite actually improve things, "
+        "by how much, and why (point to the change in scan type / filter layer / "
+        "bytes moved)? If it did NOT improve, say so honestly and suggest the next "
+        f"step. Rewrite's plan:\n```\n{(probe.plan or '').strip()[:2000]}\n```"
+    )
 
 
 def probe_outcome_tone(outcome: ProbeOutcome) -> str:
@@ -337,7 +463,7 @@ def build_query_playground_screen(
                 with ui.column().classes("w-full gap-3") as results_box:
                     _render_conversion(ui, result)
                     _render_test_panel(result, on_test, render_results.refresh)
-                    _render_ai_panel(result, on_ask_ai)
+                    _render_ai_panel(result, on_ask_ai, on_optimize_ai)
                 if scroll_after_convert["pending"]:
                     scroll_after_convert["pending"] = False
                     # Smoothly reveal the just-converted results beneath the editor,
@@ -445,6 +571,95 @@ def build_query_playground_screen(
                     ),
                 )
 
+            def on_optimize_ai() -> None:
+                # Open the SAME right chat drawer, but grounded on making THIS
+                # query efficient on Aurora DSQL: the model gets the converted SQL,
+                # the DSQL efficiency rubric, and (when a Test captured them) the
+                # real EXPLAIN plan + DPU. Under each reply a "Test rewrite on
+                # target" action re-runs the probe on the model's proposed SQL and
+                # feeds the before/after DPU back AS A NEW AI TURN, so the same
+                # assistant reports how much it actually improved. Advisory only —
+                # nothing is auto-applied; the user copies SQL back to run for real.
+                result = state.result
+                if result is None or open_chat is None:
+                    return
+                from dsql_migrator.core.assessment_strategist import (
+                    AssessmentStrategist,
+                )
+
+                probe = state.probe
+                baseline_dpu = (
+                    probe.dpu.total
+                    if probe is not None and probe.dpu is not None
+                    else None
+                )
+                system = build_query_optimize_system(
+                    result.original_sql,
+                    result.converted_sql or "",
+                    plan=probe.plan if probe is not None else None,
+                    dpu_total=baseline_dpu,
+                    analyzed=probe.analyzed if probe is not None else False,
+                )
+                strategist = AssessmentStrategist(
+                    session.ai_assist, aws_profile=getattr(session, "aws_profile", None)
+                )
+                # send_turn (returned by open_chat) lets us drive a follow-up turn
+                # so the re-test result is delivered BY THE AI, not as a raw panel.
+                sender: dict[str, object] = {"send": None}
+
+                async def _retest_rewrite(reply_markdown: str) -> None:
+                    # Pull the model's proposed SQL out of the reply, re-run the
+                    # read-only probe (EXPLAIN ANALYZE for a DPU number), then ask
+                    # the SAME assistant to compare it to the baseline.
+                    send = sender["send"]
+                    if send is None:
+                        return
+                    rewrite = extract_sql_from_reply(reply_markdown)
+                    if not rewrite:
+                        ui.notify(
+                            "No runnable SELECT found in the AI reply to test "
+                            "(e.g. it only suggested an index or DDL). Ask the AI "
+                            "for a rewritten SELECT in a ```sql block.",
+                            type="warning",
+                        )
+                        return
+                    if not session.has_target():
+                        ui.notify(
+                            "Verify the target connection first (Connect screen).",
+                            type="warning",
+                        )
+                        return
+                    target_config = session.target_config
+                    assert target_config is not None
+                    factory = make_factory(
+                        target_config, getattr(session, "aws_profile", None)
+                    )
+                    ui.notify("Re-testing the rewrite on the target…", type="info")
+                    # EXPLAIN ANALYZE so DSQL emits the DPU estimate to compare. The
+                    # rewrite is treated as a SELECT probe (read-only / EXPLAIN).
+                    rprobe = await run.io_bound(
+                        lambda: probe_statement(
+                            rewrite, StatementKind.SELECT, factory, analyze=True
+                        )
+                    )
+                    send(_build_retest_turn(rprobe, baseline_dpu))  # type: ignore[operator]
+
+                sender["send"] = open_chat(
+                    title="AI DBA — query tuning",
+                    subtitle="Query validation (playground) · Aurora DSQL efficiency",
+                    first_question=(
+                        "Rewrite this converted query to run more efficiently on "
+                        "Aurora DSQL. Explain in detail what you changed and why it "
+                        "is cheaper on DSQL (scan type / filter layer / fewer bytes "
+                        "and DPU) — and keep the results identical."
+                    ),
+                    streamer=lambda messages, on_delta: strategist.stream_chat(
+                        system, messages, on_delta
+                    ),
+                    footer_label="Test rewrite on target",
+                    footer_action=_retest_rewrite,
+                )
+
             with ui.row().classes("items-center gap-2"):
                 ui.button("Convert", icon="sync_alt", on_click=on_convert).props(
                     "color=primary"
@@ -507,14 +722,21 @@ def build_query_playground_screen(
     def _render_ai_panel(
         result: QueryConversionResult,
         on_ask_ai: Callable[[], object],
+        on_optimize_ai: Callable[[], object],
     ) -> None:
-        """Render the AI-assist entry point: a button that opens the chat drawer.
+        """Render the AI-assist entry points: buttons that open the chat drawer.
 
         Shown only when AI assist is enabled for the session (Connect screen);
         otherwise a one-line hint nudges toward enabling it on a hard case. The
         chat itself happens in the SAME shared right drawer the Evaluation and
         Schema Conversion screens use -- advisory only, nothing auto-applied
         (Property 13).
+
+        Two actions: "Ask AI to review / fix" (correctness), and — for a converted
+        SELECT — "Tune with AI DBA", which opens the AI-DBA tuning chat grounded on
+        the real EXPLAIN plan / DPU (when a Test has run) and offers an in-drawer
+        "Test rewrite on target" action that re-probes the AI's SQL and asks the AI
+        to report the before/after DPU improvement.
         """
         if not session.ai_assist.enabled:
             _render_ai_disabled_hint(ui, result)
@@ -525,14 +747,53 @@ def build_query_playground_screen(
         probe = state.probe
         failed = probe is not None and probe.outcome is ProbeOutcome.FAILED
         ask_label = "Ask AI to fix" if failed else "Ask AI to review / explain"
+        is_select = result.statement_kind is StatementKind.SELECT
+        # The AI DBA tunes for efficiency, so it only makes sense once the query has
+        # actually run on the target (a PASSED probe): the AI reasons from the real
+        # EXPLAIN plan, and the re-test loop compares against a real baseline. Gate
+        # the button on a successful Test on target for a converted SELECT.
+        tested_ok = (
+            is_select
+            and result.converted_sql is not None
+            and probe is not None
+            and probe.outcome is ProbeOutcome.PASSED
+        )
+        # A baseline DPU (only from an EXPLAIN ANALYZE test) lets the button show
+        # the current cost and enables the before/after comparison after a re-test.
+        baseline_dpu = (
+            probe.dpu.total
+            if probe is not None and probe.dpu is not None
+            else None
+        )
         with ui.row().classes("items-center gap-2 flex-wrap"):
             ui.button(
                 ask_label, icon="auto_awesome", on_click=on_ask_ai
             ).props("color=primary outline")
-            ui.label(
+            if tested_ok:
+                tune_label = "Tune with AI DBA"
+                if baseline_dpu is not None:
+                    tune_label += f"  (now ≈ {_fmt_dpu(baseline_dpu)} DPU)"
+                ui.button(
+                    tune_label, icon="tune", on_click=on_optimize_ai
+                ).props("color=primary outline")
+        # Footer hint adapts: nudge toward Testing first (so the tuner appears),
+        # and toward ANALYZE (so a DPU baseline exists for the before/after proof).
+        if tested_ok and baseline_dpu is None:
+            hint = (
+                "Tip: re-run Test with the EXPLAIN ANALYZE toggle on to capture a "
+                "DPU baseline — then the AI DBA can prove how much its rewrite saves."
+            )
+        elif not tested_ok and is_select and result.converted_sql is not None:
+            hint = (
+                "Run Test on target first (ideally with EXPLAIN ANALYZE) to unlock "
+                "\"Tune with AI DBA\" — it tunes from the real query plan and cost."
+            )
+        else:
+            hint = (
                 "Opens the AI chat (same as Evaluation / Schema Conversion); "
                 "advisory only, nothing is auto-applied."
-            ).classes("text-xs text-gray-500")
+            )
+        ui.label(hint).classes("text-xs text-gray-500")
 
     content.__name__ = "query_playground_content"
     return content
