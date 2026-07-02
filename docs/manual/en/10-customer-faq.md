@@ -378,6 +378,34 @@ reconnect and re-run the read-only steps). Don't run more than one task without
 moving that state to a shared store (e.g. an EFS mount for zero-loss resume). See
 [Chapter 6 §6.3](06-limitations.md#63-deployment-limits-the-aws-hosted-form).
 
+
+**Q31. How do I remove ALL the AWS infrastructure and start completely fresh?**
+
+First, be clear on the difference: the UI's **Start over** button only resets the
+tool's *session* (connections, plan, progress) — it deliberately does **not** delete
+any AWS resource, so nothing costly is torn down by accident. To actually remove the
+infrastructure and stop all cost, tear the stacks down in this order (the full
+procedure with exact commands is [Deployment §9 — Teardown](../../../deploy/DEPLOYMENT.md#9-teardown)):
+
+1. **CDC infrastructure first** (only if you ever deployed CDC — this is the costly
+   MSK / MSK Connect / NAT part). Do it **while the app is still running**, from the
+   UI: **Start over (top right) → "Delete all CDC infrastructure"** (the app drives
+   the `cdc-stack` deletion, ~15–25 min, and also removes the managed source-
+   credentials secret it created). If the app is already gone, delete the stack
+   manually: `aws cloudformation delete-stack --stack-name mysql-dsql-cdc-stack`.
+2. **app-stack** — run `deploy/teardown.sh <stack-name>` (deletes the ECS/ALB/IAM
+   stack; pass `DELETE_ECR=true` to also remove the container image repo).
+3. **build-stack** — only if you used the optional CodeBuild build path.
+4. **Check for leftovers the stacks don't own:** the tool auto-creates a per-account/
+   region **plugin bucket** `mysql-dsql-migrator-plugins-<account>-<region>` that is
+   NOT part of any stack, so `delete-stack` won't remove it — delete it manually if
+   you want a truly clean slate. Also remove any **Route 53** records you added by
+   hand. Then confirm no `mysql-dsql-*` CloudFormation stacks remain.
+
+After teardown you can redeploy from scratch exactly like a first-time install
+(Deployment guide). If you only want to *restart the migration itself* — same infra,
+fresh workflow — use **Start over** instead; it's instant and free.
+
 ---
 
 ## G. Where to go next

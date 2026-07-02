@@ -422,6 +422,29 @@ AWS에 배포하는 형태는 **ECS Fargate 태스크 하나로 동작**하며, 
 두 개 이상 늘려 실행하지 마세요.** 즉 지금 형태에서는 한 번에 하나의 마이그레이션을 다루는 것을 전제로
 합니다. [6장 §6.3](06-limitations.md#63-deployment-limits-the-aws-hosted-form) 참조.
 
+
+**Q31. AWS 인프라를 전부 제거하고 완전히 처음부터 다시 시작하려면 어떻게 하나요?**
+
+먼저 차이를 알아두세요. UI의 **Start over** 버튼은 도구의 *세션*(연결·플랜·진행 상황)만 초기화하며,
+**AWS 리소스는 일부러 아무것도 삭제하지 않습니다** — 실수로 비싼 인프라가 내려가는 일을 막기 위해서입니다.
+인프라를 실제로 제거해 비용까지 멈추려면 다음 순서로 스택을 내리세요(정확한 명령을 포함한 전체 절차는
+[배포 가이드 §9 — Teardown](../../../deploy/DEPLOYMENT.ko.md#9-teardown)에 있습니다):
+
+1. **CDC 인프라 먼저**(CDC를 배포한 적이 있을 때만 — MSK / MSK Connect / NAT로 비용의 핵심입니다).
+   **앱이 떠 있는 동안** UI에서 하세요: **Start over(우측 상단) → "Delete all CDC infrastructure"** (앱이
+   `cdc-stack` 삭제를 구동, ~15–25분; 도구가 만든 소스 자격증명 시크릿도 함께 제거됩니다). 앱이 이미
+   없으면 수동 삭제: `aws cloudformation delete-stack --stack-name mysql-dsql-cdc-stack`.
+2. **app-stack** — `deploy/teardown.sh <스택이름>` 실행(ECS/ALB/IAM 스택 삭제; `DELETE_ECR=true`를 주면
+   컨테이너 이미지 저장소까지 제거).
+3. **build-stack** — 선택적 CodeBuild 빌드 경로를 썼을 때만.
+4. **스택이 소유하지 않는 잔여 리소스 확인:** 도구는 계정/리전별 **플러그인 버킷**
+   `mysql-dsql-migrator-plugins-<계정>-<리전>`을 자동 생성하는데, 이건 어떤 스택에도 속하지 않아
+   `delete-stack`으로 지워지지 않습니다 — 완전히 깨끗이 하려면 직접 삭제하세요. 직접 만든 **Route 53**
+   레코드도 함께 제거하고, 마지막으로 `mysql-dsql-*` CloudFormation 스택이 남아 있지 않은지 확인하세요.
+
+teardown이 끝나면 최초 설치와 똑같이 처음부터 재배포할 수 있습니다(배포 가이드 참고). 인프라는 그대로 두고
+**마이그레이션만 다시 시작**하고 싶다면 **Start over**를 쓰세요 — 즉시, 비용 없이 됩니다.
+
 ---
 
 ## G. 다음으로
