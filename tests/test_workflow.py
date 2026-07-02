@@ -441,6 +441,32 @@ def test_start_over_cdc_warning_none_without_infra() -> None:
     assert _start_over_cdc_warning(state2) is None
 
 
+def test_start_over_cdc_warning_names_custom_stack() -> None:
+    # A custom (non-default) cdc-stack name is NOT re-discovered by a fresh session
+    # (which reverts to the default name), so the warning must name it explicitly so
+    # the operator knows exactly what to delete.
+    from dsql_migrator.core.cdc import CDC_DEFAULT_STACK_NAME
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.workflow import _start_over_cdc_warning
+
+    state = SessionConnectionState()
+    state.set_migration_type("full_load_and_cdc")
+    state.set_cdc_infra_inputs({"vpc_id": "vpc-0abc"})
+
+    custom = _start_over_cdc_warning(state, "mysql-dsql-cdc-orders")
+    assert custom is not None
+    assert "mysql-dsql-cdc-orders" in custom  # names the exact stack
+    assert "AWS console" in custom  # tells them where to delete if already reset
+
+    # The DEFAULT name (re-discoverable by a fresh session) keeps the generic text
+    # and does NOT clutter the message with the stack name.
+    default = _start_over_cdc_warning(state, CDC_DEFAULT_STACK_NAME)
+    assert default is not None
+    assert CDC_DEFAULT_STACK_NAME not in default
+    # No stack name passed (back-compat) behaves like the default-name case.
+    assert _start_over_cdc_warning(state) == default
+
+
 def test_build_migration_diagram_shows_source_server_version() -> None:
     from dsql_migrator.core.models import SourceConnectionConfig
     from dsql_migrator.ui.session import SessionConnectionState

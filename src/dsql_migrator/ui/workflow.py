@@ -981,7 +981,9 @@ def reconnect_notice(state: "object") -> Optional[str]:
     return None
 
 
-def _start_over_cdc_warning(state: "object") -> Optional[str]:
+def _start_over_cdc_warning(
+    state: "object", cdc_stack_name: "Optional[str]" = None
+) -> Optional[str]:
     """Return a caution when resetting would orphan deployed CDC infrastructure.
 
     Resetting clears only the tool's session/workbench, NOT any AWS resources. If
@@ -989,19 +991,40 @@ def _start_over_cdc_warning(state: "object") -> Optional[str]:
     infra inputs), warn the operator to tear it down FIRST via the CDC step's
     Delete action -- otherwise MSK/NAT keep billing with no session pointing at
     them. Returns ``None`` when there is nothing at risk.
+
+    ``cdc_stack_name`` is the session's current cdc-stack name (from the migration
+    state). A fresh session re-discovers a still-deployed stack ONLY at the default
+    name, so when a non-default (custom) name was used -- e.g. a second/parallel
+    migration via the CDC step's "Advanced — CDC stack name" field -- the reset
+    would leave it orphaned with no in-tool pointer. In that case name the exact
+    stack in the warning so the operator knows precisely what to delete (here or in
+    the AWS console). ``None`` / the default name keeps the generic guidance.
     """
     mt = getattr(state, "migration_type", None)
     mt_value = getattr(mt, "value", mt)
     chose_cdc = mt_value in ("cdc_only", "full_load_and_cdc")
     infra_getter = getattr(state, "cdc_infra_inputs", None)
     has_infra = bool(infra_getter()) if callable(infra_getter) else False
-    if chose_cdc and has_infra:
+    if not (chose_cdc and has_infra):
+        return None
+    # A custom (non-default) stack name will NOT be re-discovered by a fresh
+    # session (which reverts to the default name), so surface it explicitly.
+    from dsql_migrator.core.cdc import CDC_DEFAULT_STACK_NAME
+
+    if cdc_stack_name and cdc_stack_name != CDC_DEFAULT_STACK_NAME:
         return (
             "Heads up: if you deployed CDC infrastructure, resetting does NOT delete "
-            "it — MSK/NAT keep billing. Tear it down first with 'Delete CDC "
-            "infrastructure' on the CDC step, then start over."
+            f"it — MSK/NAT keep billing. This session uses a custom cdc-stack named "
+            f"'{cdc_stack_name}', which a fresh session will NOT re-discover, so "
+            "delete it FIRST with 'Delete CDC infrastructure' on the CDC step (or, if "
+            f"you already reset, delete the '{cdc_stack_name}' stack in the AWS "
+            "console), then start over."
         )
-    return None
+    return (
+        "Heads up: if you deployed CDC infrastructure, resetting does NOT delete "
+        "it — MSK/NAT keep billing. Tear it down first with 'Delete CDC "
+        "infrastructure' on the CDC step, then start over."
+    )
 
 
 def _open_start_over_dialog(
@@ -1014,14 +1037,17 @@ def _open_start_over_dialog(
     *,
     cdc_deployed: bool = False,
     on_reset_cdc: Optional[Callable[[str], None]] = None,
+    cdc_stack_name: Optional[str] = None,
 ) -> None:
     """Type-to-confirm dialog that clears the session and returns to Connect.
 
     Clears only the tool's per-session workbench (connections, workflow progress,
     selections, the chosen plan, CDC inputs) and the persisted snapshot -- never
-    any AWS resource. Shows the CDC-orphan caution when relevant.
+    any AWS resource. Shows the CDC-orphan caution when relevant. ``cdc_stack_name``
+    (the session's current stack name) lets the warning name a custom stack a fresh
+    session would not re-discover.
     """
-    warning = _start_over_cdc_warning(state)
+    warning = _start_over_cdc_warning(state, cdc_stack_name)
     with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 520px"):  # type: ignore[attr-defined]
         ui.label("Start over — reset this session").classes(  # type: ignore[attr-defined]
             "text-lg font-semibold text-red-700"
@@ -1190,6 +1216,7 @@ def build_workflow_sidebar(
     on_reset: Optional[Callable[[], None]] = None,
     on_reset_cdc: Optional[Callable[[str], None]] = None,
     cdc_deployed_getter: Optional[Callable[[], bool]] = None,
+    cdc_stack_name_getter: Optional[Callable[[], Optional[str]]] = None,
     optional_tools: Optional[dict[str, "OptionalTool"]] = None,
 ) -> None:
     """Render the app as a sidebar layout: header + left-drawer nav + content.
@@ -1349,6 +1376,9 @@ def build_workflow_sidebar(
                             bool(cdc_deployed_getter()) if cdc_deployed_getter else False
                         ),
                         on_reset_cdc=on_reset_cdc,
+                        cdc_stack_name=(
+                            cdc_stack_name_getter() if cdc_stack_name_getter else None
+                        ),
                     ),
                 ).props("flat dense color=white").tooltip(
                     "Clear this session and start a new migration"

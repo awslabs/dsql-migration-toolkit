@@ -309,6 +309,12 @@ def build_page(
             return True
         return getattr(migration_state, "cdc_stack_phase", None) in ("running", "infra")
 
+    def _cdc_stack_name() -> Optional[str]:
+        """The session's current cdc-stack name, so Start over's warning can name a
+        custom (non-default) stack that a fresh session would not re-discover."""
+        migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
+        return getattr(migration_state, "cdc_stack_name", None)
+
     def _cdc_teardown_on_reset(mode: str) -> None:
         """Submit a CDC teardown as part of Start over (called BEFORE the reset).
 
@@ -441,6 +447,7 @@ def build_page(
         on_reset=_reset_session,
         on_reset_cdc=_cdc_teardown_on_reset,
         cdc_deployed_getter=_cdc_deployed,
+        cdc_stack_name_getter=_cdc_stack_name,
         optional_tools={
             _QUERY_PLAYGROUND_VIEW: OptionalTool(
                 view_key=_QUERY_PLAYGROUND_VIEW,
