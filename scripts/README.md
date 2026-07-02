@@ -1,5 +1,7 @@
 # Command-line scripts — run and verify a Full Load / CDC migration
 
+_Language: **English** | [한국어](README.ko.md)_
+
 These helper scripts let you drive a **Full Load** and independently **verify**
 the result from the command line — using the tool's own engine, without opening
 the web UI. The source MySQL is always accessed **read-only**.

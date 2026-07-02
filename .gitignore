@@ -91,6 +91,7 @@ scripts/*
 !scripts/run_full_load.py
 !scripts/cdc_consistency_check.py
 !scripts/README.md
+!scripts/README.ko.md
 
 # Local Claude Code skills/config (dev aid, not published)
 .claude/
