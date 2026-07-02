@@ -2,7 +2,7 @@
 
 _언어: [English](../en/09-query-validation.md) | **한국어**_
 
-> **이전:** [8. 테스트와 검증](08-testing-and-verification.md)
+> **이전:** [8. 테스트 및 검증](08-testing-and-verification.md)
 
 스키마와 데이터를 옮기는 것만으로는 끝이 아닙니다 — 애플리케이션의 **쿼리**도 Aurora DSQL에서
 돌아가야 하고, *잘* 돌아가야 합니다. **Query Playground**(사이드바의 선택적 도구)는 MySQL 쿼리 하나를
@@ -53,16 +53,16 @@ ANALYZE일 때 DPU 비용이 표시됩니다.
 
 **AI 보조가 켜져 있으면**(Connect 화면; 기본 꺼짐) **Tune with AI DBA** 버튼이 나타납니다 — 단,
 변환된 SELECT가 **Test on target을 통과한 뒤에만** 보입니다. AI가 추측이 아니라 근거 기반으로 조언하려면
-이 쿼리의 실제 실행 플랜이 필요하기 때문에, 먼저 테스트하는 것이 필수입니다. 테스트를 **EXPLAIN
-ANALYZE**로 돌려 **DPU baseline**을 캡처하면, 버튼에 현재 비용(예: *now ≈ 0.03 DPU*)이 표시되고 이후
-AI가 재작성이 얼마나 절약하는지 증명할 수 있습니다.
+이 쿼리의 실제 실행 플랜이 필요하므로, 먼저 테스트하는 것이 필수입니다. 테스트를 **EXPLAIN
+ANALYZE**로 돌려 **DPU 기준값**을 캡처하면, 버튼에 현재 비용(예: *now ≈ 0.03 DPU*)이 표시되고, 이후
+AI가 재작성으로 얼마나 절약되는지 증명할 수 있습니다.
 
 버튼을 누르면 우측 공유 AI 채팅 드로어가 열리고, **이 쿼리의 실제 EXPLAIN 플랜과 DPU** + Aurora DSQL
 실행 모델에 근거해 AI가:
 
 - 재작성 쿼리를 코드 블록으로 제안하고,
-- **무엇을 바꿨고 왜 DSQL에서 더 저렴한지**(어떤 scan type/filter layer가 개선됐고, 왜 storage→compute로
-  넘어가는 바이트가 줄어드는지) 설명하며,
+- **무엇을 바꿨고 왜 DSQL에서 더 저렴한지**(어떤 스캔 유형(scan type)이나 필터 계층(filter layer)이
+  개선됐고, 왜 storage에서 compute로 넘어가는 바이트가 줄어드는지) 설명하며,
 - 쿼리의 **결과는 동일하게 유지**합니다 — 빠르게 만들려고 의미를 바꾸지 말라고 지시받습니다.
 
 DSQL에 맞지 않는 일반 PostgreSQL 튜닝 조언(`VACUUM`/`REINDEX`, fillfactor, 플래너 GUC, "`cost=`
@@ -75,35 +75,38 @@ DSQL에 맞지 않는 일반 PostgreSQL 튜닝 조언(`VACUUM`/`REINDEX`, fillfa
 되먹입니다 — 그래서 **AI가 실제 개선폭을 보고**합니다(개선이 없으면 솔직히 말합니다). 증거는 모델의
 설명이 아니라 실측 DPU입니다.
 
-> **advisory 전용.** 자동 적용되지 않습니다. 재작성을 편집기에 직접 복사해 Convert / Test를 다시
-> 돌리는 것이 human-review 게이트입니다. AI 보조는 opt-in이며 컨트롤 플레인에만 있고 데이터 경로에는
-> 절대 관여하지 않습니다.
+> **권고 전용.** 자동 적용되지 않습니다. 재작성을 편집기에 직접 복사해 Convert / Test를 다시
+> 돌리는 것이 사람의 검토(human-review) 게이트 역할을 합니다. AI 보조는 선택적으로 켜는 기능(opt-in)이며
+> 컨트롤 플레인에만 있고 데이터 경로에는 절대 관여하지 않습니다.
 
 ---
 
 ## 9.4 DSQL 쿼리 튜닝이 PostgreSQL과 다른 이유
 
-Aurora DSQL은 와이어 프로토콜상 PostgreSQL 호환이지만 *분산* 엔진으로 쿼리를 실행하므로, 쿼리를
-효율적으로 만드는 방법이 몇 가지 달라집니다. AI DBA는 이 사실들에 근거하며, 직접 플랜을 읽을 때도
-유용합니다.
+Aurora DSQL은 와이어 프로토콜 수준에서는 PostgreSQL과 호환되지만 *분산* 엔진으로 쿼리를 실행하므로,
+쿼리를 효율적으로 만드는 방법이 몇 가지 달라집니다. AI DBA는 이 사실들에 근거하며, 직접 플랜을 읽을
+때도 알아 두면 유용합니다.
 
 - **기본 키가 곧 테이블입니다.** 모든 테이블은 기본 키로 정렬된 B-tree이며 별도 heap이 없습니다. 술어에
   쓸 인덱스가 없는 테이블은 **Full Scan**(“Seq Scan”이 아님)으로 읽힙니다. 기본 키에 대한 범위/동등
   필터는 물리적으로 순차 읽기라 본질적으로 저렴하므로, **기본 키 선택이 PostgreSQL보다 훨씬 중요합니다.**
-- **compute와 storage가 분리돼 있습니다.** storage에서 compute로 넘어오는 모든 행이 latency와 **DPU**
+- **compute와 storage가 분리돼 있습니다.** storage에서 compute로 넘어오는 모든 행이 지연 시간과 **DPU**
   (Distributed Processing Unit — DSQL의 비용 단위, `EXPLAIN ANALYZE VERBOSE`에 표시; PostgreSQL의
-  `cost=` 숫자는 목표가 아님)를 소모합니다. **필터를 아래로 미는 것**이 핵심 지렛대입니다.
-- **3단계 필터, 좋은 것부터:** (1) *Index Condition* — 인덱스 키 컬럼에 대한 동등/범위 술어; (2)
-  *Storage Filter* — 비-키 컬럼을 인덱스 `INCLUDE`에 넣어 storage가 전송 전에 필터; (3) *Query
-  Processor Filter* — 상단 `Filter:` 줄로 나타나며, 필터되지 않은 데이터가 이미 네트워크를 건넌 상태
-  (최악). 술어를 3 → 2 → 1로 미세요.
-- **Scan type, 저렴한 순 마지막:** **Full Scan**(PK나 인덱스 추가) → **Index Scan**(`Storage Lookup`
-  노드는 커버링이 불완전하다는 뜻 — 빠진 컬럼을 `INCLUDE`에 추가) → **Index Only Scan**(이상적).
+  `cost=` 숫자는 목표가 아님)를 유발합니다. 옮겨지는 바이트를 줄이도록 **필터를 아래로 미는 것**이 핵심
+  지렛대입니다.
+- **필터 3단계, 좋은 것부터:** (1) *Index Condition* — 인덱스 키 컬럼에 대한 동등/범위 술어; (2)
+  *Storage Filter* — 비-키 컬럼을 인덱스 `INCLUDE`에 넣어 storage가 전송 전에 걸러 냄; (3) *Query
+  Processor Filter* — 상단 `Filter:` 줄로 나타나며, 걸러지지 않은 데이터가 이미 네트워크를 건넌 상태
+  (최악). 술어를 3 → 2 → 1 방향으로 미세요.
+- **스캔 유형, 저렴한 순으로 마지막이 최선:** **Full Scan**(PK나 인덱스 추가) → **Index Scan**(`Storage
+  Lookup` 노드는 커버링 인덱스가 불완전하다는 뜻 — 빠진 컬럼을 `INCLUDE`에 추가) → **Index Only Scan**
+  (이상적).
 
 AI DBA가 제안할 DSQL 적합 재작성: `SELECT *` 대신 필요한 컬럼만 투영; 선행 와일드카드 `LIKE '%x%'`
-회피(인덱스 사용 불가); 옵티마이저가 조인 너머로 추론 못 하는 **리던던트 조인 술어** 추가; `ORDER BY …
-LIMIT`에는 **CTE late materialization**; 인덱스를 커버링으로 만드는 `INCLUDE` 컬럼; 핫 파티션을 만드는
-단조 키(`AUTO_INCREMENT`, 타임스탬프)보다 무작위 분포 키(UUID) 선호.
+회피(인덱스 사용 불가); 옵티마이저가 조인 너머로는 추론하지 못하는 **중복 조인 술어(redundant join
+predicate)** 추가; `ORDER BY … LIMIT`에는 **CTE 지연 구체화(late materialization)**; 인덱스를 커버링으로
+만드는 `INCLUDE` 컬럼; 핫 파티션을 만드는 단조 증가 키(`AUTO_INCREMENT`, 타임스탬프)보다 무작위 분포
+키(UUID) 선호.
 
 ---
 

@@ -2,6 +2,8 @@
 
 _Language: **English** | [한국어](../ko/01-setup.md)_
 
+> **Prev:** [0. Before you begin](00-before-you-begin.md)
+
 This chapter gets you from "I have an Aurora MySQL database" to "the tool is
 open in my browser and connected to both my source and my Aurora DSQL target."
 

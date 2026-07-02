@@ -2,6 +2,8 @@
 
 _Language: **English** | [한국어](../ko/06-limitations.md)_
 
+> **Prev:** [5. Validation](05-validation.md)
+
 These are the **real, enforced** limits to plan around — most come from Aurora
 DSQL itself (it's distributed and intentionally omits features that don't scale
 horizontally), a few from how the tool is deployed. None of them are surprises at

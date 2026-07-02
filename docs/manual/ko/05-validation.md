@@ -2,6 +2,8 @@
 
 _언어: [English](../en/05-validation.md) | **한국어**_
 
+> **이전:** [4. CDC와 DSQL 제약](04-cdc-and-dsql-constraints.md)
+
 **Validation**은 타깃이 소스와 일치함을 증명하는 단계 — 안전한 전환의 근거입니다. **정확한**
 `COUNT(*)`와 체크섬을 실행하는 유일한 단계로(Full Load는 의도적으로 스캔 없는 추정을 사용), 근사가
 아니라 권위 있는 판정을 줍니다.

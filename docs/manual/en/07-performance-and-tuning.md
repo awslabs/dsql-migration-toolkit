@@ -2,6 +2,8 @@
 
 _Language: **English** | [한국어](../ko/07-performance-and-tuning.md)_
 
+> **Prev:** [6. Limitations](06-limitations.md)
+
 This chapter explains **why** the tool's data path is built the way it is —
 grounded in how Aurora DSQL actually works — and **how** to tune its parallelism
 for your workload. If you're evaluating whether to trust this tool for a
@@ -171,6 +173,44 @@ for DSQL efficiency and re-tests the rewrite to prove the DPU improvement.
 
 > See [Chapter 9 — Query validation and the AI DBA](09-query-validation.md) for the
 > full workflow.
+
+---
+
+## 7.4 A measured example — one run that backs §7.1 and §7.2
+
+Below is one run on live infrastructure, done to check whether the design rationale
+above actually shows up in practice. Read it **as an illustration of the method, not
+as a performance spec or guarantee** — anyone can reproduce it in their own
+environment with `scripts/measure_performance.py`.
+
+> [!note] The conditions these numbers came from
+> RDS MySQL 8.0.42 source + Aurora DSQL target + MSK, `us-east-1`, a single run.
+> **The hardware (source RDS class, Fargate/local CPU and memory, DSQL warm state,
+> network RTT) was not pinned**, so absolute throughput and lag are
+> environment-dependent and will differ elsewhere. This run also used an
+> `AUTO_INCREMENT` integer-PK schema — the **hot-partition worst case** described in
+> §7.1 — whereas the **UUID / cached-identity PK** this chapter recommends lowers
+> contention. Your numbers will differ.
+
+**Full Load — raising parallelism raises contention faster than throughput (the
+§7.2 guardrail).** Doubling both the table and batch parallelism (4×8 = 32 → 8×16 =
+128 connections) bought only **~+5%** throughput, while the **share of batches that
+hit at least one retry** rose by about a third (≈ 9.6% → 12.8%). Even for rows that
+don't logically conflict, writes converge on the same key range of a monotonic PK —
+exactly the hot-partition effect in §7.1. The takeaway: **fix the PK strategy before
+turning parallelism up blindly.**
+
+**CDC replication lag — a latency floor at the default sizing.** Source commit →
+visible on DSQL measured at roughly p50 0.8s / p95 1.3s under a sustained load, and
+p50 0.5s / p95 0.7s under a burst. This is a **good-case floor at the default CDC
+sizing (MCU=1, one worker, a single-column table)**; it can grow with many tables or
+a high change rate. Scale it with the §7.2 CDC parameters when you need throughput.
+
+> **Reproduce it:** `scripts/measure_performance.py full-load` (throughput +
+> contention) and `scripts/measure_performance.py cdc-lag` (replication lag) give you
+> the same metrics against your own source/target. Note that `full-load` **drops and
+> recreates** the target tables (needs `--yes`) so use it **only on a non-production
+> target**, and `cdc-lag` needs an active CDC pipeline.
 
 ---
 

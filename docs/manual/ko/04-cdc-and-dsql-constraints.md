@@ -2,9 +2,11 @@
 
 _언어: [English](../en/04-cdc-and-dsql-constraints.md) | **한국어**_
 
+> **이전:** [3. Full Load](03-full-load.md)
+
 **CDC(Change Data Capture)**는 거의 무중단 전환을 위한 **선택적** 스트리밍 파이프라인입니다. Full
-Load가 기존 행을 복사한 뒤, CDC는 소스의 모든 신규 insert/update/delete로 DSQL을 계속 최신 상태로
-유지합니다 — 긴 중단 없이 최소 다운타임으로 전환할 수 있게 합니다.
+Load가 기존 행을 복사한 뒤, CDC는 소스의 모든 신규 insert/update/delete를 반영해 DSQL을 계속 최신
+상태로 유지합니다. 덕분에 긴 중단 대신 최소 다운타임으로 전환할 수 있습니다.
 
 CDC가 필요한 경우는 **대규모 또는 지속적** 마이그레이션뿐입니다. 짧은 동결이 허용되는 일회성
 전환이라면 Full Load만으로 충분합니다.
@@ -30,15 +32,15 @@ Source MySQL ──binlog (ROW+GTID, 읽기 전용)──►  Debezium MySQL 소
 ```
 
 - **Debezium MySQL 소스 커넥터**가 소스 바이너리 로그를 읽기 전용으로 읽어 변경 이벤트를 냅니다.
-- **Amazon MSK(Kafka)**가 내구성 백본: **테이블당 토픽 1개**, 기본 키로 키잉(한 행의 모든 변경이 한
-  파티션에 순서대로 유지), 그리고 DLQ 토픽.
+- **Amazon MSK(Kafka)**가 내구성 있는 백본 역할을 합니다. **테이블당 토픽 1개**, 기본 키로 키잉(한
+  행의 모든 변경이 한 파티션에 순서대로 유지), 그리고 DLQ 토픽으로 구성됩니다.
 - **커스텀 DSQL 싱크 커넥터**(이 프로젝트가 소유한 Java Kafka Connect 플러그인)가 변경을 DSQL에
   적용합니다. 두 커넥터 모두 **관리형 MSK Connect**에서 실행되며, 도구는 **자체 싱크 컴퓨트를 돌리지
   않고** 컨트롤 플레인 역할만 합니다(구성 작성, 시작 오프셋 시드, 모니터링).
 
-왜 *커스텀* 싱크이고 표준 JDBC 싱크가 아닌가? 표준 JDBC 싱크는 낙관적 동시성 충돌(`SQLSTATE 40001`)을
-**배치 단위로** 재시도해, 고경합 TB 규모 CDC에서 처리량이 붕괴합니다. 커스텀 싱크는 **문장 단위**로
-재시도하고 DSQL의 단기 IAM 토큰, ≤3000행 배치, 재연결을 처리합니다(§4.4).
+왜 표준 JDBC 싱크가 아니라 *커스텀* 싱크일까요? 표준 JDBC 싱크는 낙관적 동시성 충돌(`SQLSTATE 40001`)을
+**배치 단위로** 재시도하기 때문에, 경합이 심한 TB 규모 CDC에서는 처리량이 무너집니다. 커스텀 싱크는
+**문장 단위**로 재시도하며 DSQL의 단기 IAM 토큰, ≤3000행 배치, 재연결을 처리합니다(§4.4).
 
 ---
 
@@ -47,7 +49,7 @@ Source MySQL ──binlog (ROW+GTID, 읽기 전용)──►  Debezium MySQL 소
 CDC는 **행 수준 데이터 변경**(insert/update/delete)을 복제합니다. SQL 문이나 **DDL**은 복제하지
 **않습니다.** 구체적으로:
 
-- Debezium은 `include.schema.changes=false`로 실행되고, 싱크는 DML만 적용.
+- Debezium은 `include.schema.changes=false`로 실행되고, 싱크는 DML만 적용함.
 - 소스 **DDL**(`ALTER TABLE`, `CREATE`, `DROP` 등)은 DSQL로 **전파되지 않음.**
 
 DSQL 타깃 스키마는 **Schema Conversion** 단계에서 고정됩니다. **CDC 중 소스 스키마를 바꾸면**,
@@ -64,12 +66,12 @@ DSQL 타깃 스키마는 **Schema Conversion** 단계에서 고정됩니다. **C
    ([3장 §3.5](03-full-load.md#35-워터마크--cdc로의-다리)).
 2. CDC를 시작하면 도구가 커넥터의 **시작 오프셋을 정확히 그 워터마크로 시드**합니다(소스 커넥터가
    시작하기 전에 in-VPC Lambda가 오프셋 레코드를 기록). 그래서 Debezium은 **스냅샷 이후 첫 변경**부터
-   스트리밍 — "지금"부터가 아니며, 데이터를 다시 읽지도 않습니다.
+   스트리밍을 시작합니다 — "지금"부터가 아니며, 데이터를 다시 읽지도 않습니다.
 3. 소스 커넥터는 **`snapshot.mode=recovery`**로 실행됩니다: 오프셋이 이미 시드돼 있으므로 Debezium은
    내부 **스키마 히스토리**를 **현재 소스 테이블**로부터 재구성한 뒤(binlog 이벤트를 디코딩하기 위해)
    **행 데이터는 다시 읽지 않고** 시드된 오프셋부터 재개합니다.
 
-결과: 스냅샷과 "지금" 사이의 모든 변경이 정확히 한 번 적용됩니다. 싱크는 PK를 기준으로 적용하므로 같은
+그 결과, 스냅샷과 "지금" 사이의 모든 변경이 정확히 한 번 적용됩니다. 싱크는 PK를 기준으로 적용하므로 같은
 변경이 겹치거나 재시도돼도 **중복이 생기지 않습니다**.
 
 > **워터마크 위치의 binlog가 CDC 시작 시점에 여전히 존재해야 합니다.** 이 핸드오프는 소스가 워터마크
@@ -87,7 +89,7 @@ DSQL 타깃 스키마는 **Schema Conversion** 단계에서 고정됩니다. **C
 
 ## 4.4 싱크가 데이터 경로에서 DSQL 제약을 처리하는 방식
 
-DSQL은 분산형·PostgreSQL 호환이라 싱크는 고전적 MySQL/JDBC 라이터처럼 동작할 수 없습니다. 제약별 처리:
+DSQL은 분산형이면서 PostgreSQL 호환이라, 싱크는 기존 MySQL/JDBC 라이터(writer)처럼 동작할 수 없습니다. 제약별 처리 방식은 다음과 같습니다:
 
 | DSQL 제약 | 커스텀 싱크의 처리 |
 |---|---|
@@ -95,7 +97,7 @@ DSQL은 분산형·PostgreSQL 호환이라 싱크는 고전적 MySQL/JDBC 라이
 | **낙관적 동시성(락 없음)** | `SQLSTATE 40001`에 대해 배치 전체가 아닌 **문장 단위**로 지수 백오프+지터로 재시도(최대 10회). 경합 시 처리량 차이의 핵심. |
 | **트랜잭션당 ≤ 3000행** | ≤ 3000행 청크로 적용(기본 배치 1000), 청크당 한 번 `commit()`. |
 | **문장 단위 UPDATE/재생 없음** | 모든 변경을 **PK 기준 upsert/delete**로 적용: insert/update는 `INSERT ... ON CONFLICT (pk) DO UPDATE`, delete는 `DELETE ... WHERE pk = ?`(Kafka tombstone 포함). 같은 이벤트를 다시 적용해도 안전(중복 없음). |
-| **커넥션 끊김(idle close / 토큰 만료 / 워커 교체)** | Dead 커넥션이나 half-open(끊겼지만 살아있는 듯 보이는) 커넥션을 감지해 새 토큰으로 재연결하고 **같은 오프셋부터 다시 적용** — 같은 변경을 다시 적용해도 중복이 안 생기므로 안전하며, 레코드를 버리지 않음. 연결 오류는 일시적(transient) 오류로 보고 재시도하며, 손상된 행(poison row)으로 오인하지 않음. |
+| **커넥션 끊김(idle close / 토큰 만료 / 워커 교체)** | 죽은 커넥션이나 half-open(끊겼지만 살아있는 듯 보이는) 커넥션을 감지해 새 토큰으로 재연결하고 **같은 오프셋부터 다시 적용**합니다. 같은 변경을 다시 적용해도 중복이 안 생기므로 안전하며, 레코드를 버리지 않습니다. 연결 오류는 일시적(transient) 오류로 보고 재시도하며, 손상된 행(poison row)으로 오인하지 않습니다. |
 
 ---
 
@@ -107,7 +109,7 @@ DSQL은 **약 1 MiB를 초과하는 단일 값**(`TEXT`/`bytea`)을 거부합니
 | 값 크기 | 처리 |
 |---|---|
 | **≤ 1 MiB** | 정상 적용. |
-| **1 MiB – 8 MiB** | 싱크가 쓰기 **전에** 각 값을 측정해 초대형 값을 **DLQ로 quarantine**(절대 적용 불가). 그런 레코드가 DLQ에 닿도록 Kafka를 통과하려면 토픽·클라이언트 한도를 상향(기본 4 MiB, 최대 8 MiB). |
+| **1 MiB – 8 MiB** | 싱크가 쓰기 **전에** 각 값을 측정해 초대형 값을 **DLQ로 격리(quarantine)**합니다(절대 적용 불가). 그런 레코드가 DLQ에 닿도록 Kafka를 통과하려면 토픽·클라이언트 한도를 상향(기본 4 MiB, 최대 8 MiB). |
 | **> 8 MiB** | Kafka에 들어갈 수 없음. **캡처 단계에서 제외**해야 함: Debezium `column.exclude.list`가 초대형 LOB 컬럼을 드롭(Evaluation `OVERSIZED_LOB` 플래그로 구동)해 파이프라인에 닿지 않게 함. |
 
 ### DLQ로 가는 것
@@ -118,7 +120,7 @@ DSQL은 **약 1 MiB를 초과하는 단일 값**(`TEXT`/`bytea`)을 거부합니
 
 ### DLQ가 보이는 곳 — Kafka 토픽이 아니라 CloudWatch
 
-싱크는 quarantine된 레코드를 **CloudWatch** 커넥터 로그 그룹에 로깅하고, 도구 모니터링이 그 줄을
+싱크는 격리(quarantine)된 레코드를 **CloudWatch** 커넥터 로그 그룹에 로깅하고, 도구 모니터링이 그 줄을
 파싱해 UI(테이블별 "Quarantined" 카운트와 단일 다운로드 에러 로그)로 보여 줍니다. 로깅된 사유에는 **SQL
 템플릿**(컬럼명 + `?` placeholder)이 들어가며 — **행 값이나 자격증명은 절대 포함하지 않음** — DSQL이
 거부한 정확한 문장 형태를 데이터 노출 없이 볼 수 있습니다. 적용도 DLQ 격리도 불가능한 레코드는 조용히
@@ -128,8 +130,8 @@ DSQL은 **약 1 MiB를 초과하는 단일 값**(`TEXT`/`bytea`)을 거부합니
 
 ## 4.6 MySQL → DSQL 타입과 제약 처리 (참조)
 
-Schema Conversion과 데이터 경로가 방언을 잇기 위해 하는 일입니다. Full Load 값 변환기와 CDC 싱크가
-모두 따르는 동일 매핑입니다(공유 "write contract"가 둘을 일치시킴).
+Schema Conversion과 데이터 경로가 SQL 방언 차이를 메우기 위해 하는 일입니다. Full Load 값 변환기와 CDC
+싱크가 모두 따르는 동일한 매핑이며, 공유 "write contract"가 이 둘을 일치시킵니다.
 
 ### 타입 매핑 (전체 참조)
 
@@ -144,7 +146,7 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 | MySQL 타입 | Aurora DSQL 타입 | 저장 값 형태 | 분류 | 비고 |
 |---|---|---|---|---|
 | `TINYINT` | `smallint` | `smallint` | AUTO | 부호 있는 8비트. |
-| `TINYINT(1)` | `boolean` | `boolean` (`true`/`false`) | MANUAL | MySQL boolean 관례; `0/1`→`false/true`. `{0,1}` **밖 값은 시끄럽게 실패**(조용한 평탄화 없음). |
+| `TINYINT(1)` | `boolean` | `boolean` (`true`/`false`) | MANUAL | MySQL boolean 관례; `0/1`→`false/true`. `{0,1}` **범위 밖의 값은 시끄럽게 실패**(조용한 평탄화 없음). |
 | `SMALLINT` | `smallint` | `smallint` | AUTO | 부호 있는 16비트. |
 | `MEDIUMINT` | `integer` | `integer` | AUTO | PostgreSQL에 3바이트 정수 없음; `integer`가 부호 있는 24비트 범위를 커버. |
 | `INT` / `INTEGER` | `integer` | `integer` | AUTO | 부호 있는 32비트. |

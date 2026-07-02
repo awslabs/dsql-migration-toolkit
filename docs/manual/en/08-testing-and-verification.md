@@ -2,6 +2,8 @@
 
 _Language: **English** | [한국어](../ko/08-testing-and-verification.md)_
 
+> **Prev:** [7. Performance and tuning](07-performance-and-tuning.md)
+
 This chapter is organized around a single idea: **each Aurora DSQL characteristic
 forces a specific migration scenario that must be tested.** A MySQL→MySQL
 migration never has to prove these — they exist precisely because DSQL is a

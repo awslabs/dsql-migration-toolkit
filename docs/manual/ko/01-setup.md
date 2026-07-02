@@ -2,6 +2,8 @@
 
 _언어: [English](../en/01-setup.md) | **한국어**_
 
+> **이전:** [0. 시작하기 전에](00-before-you-begin.md)
+
 이 장은 "Aurora MySQL 데이터베이스가 있다"에서 "도구가 브라우저에 열려 있고 소스와 Aurora DSQL
 타깃 모두에 연결됐다"까지를 안내합니다.
 
@@ -15,7 +17,7 @@ _언어: [English](../en/01-setup.md) | **한국어**_
 - **AWS(ECS Fargate)** — 실제 마이그레이션에서 대부분의 팀이 쓰는 배포 형태. Application Load
   Balancer 뒤의 웹 엔드포인트로 접속.
 
-어느 쪽이든 **동일한** 소스/타깃에 연결합니다. 도구 *프로세스*가 어디서 도느냐만 다릅니다.
+어느 쪽이든 **동일한** 소스/타깃에 연결합니다. 도구 *프로세스*가 어디서 실행되느냐만 다릅니다.
 
 ---
 
@@ -24,7 +26,7 @@ _언어: [English](../en/01-setup.md) | **한국어**_
 **데이터베이스**
 
 - 네트워크로 접근 가능한 소스 **Amazon RDS 또는 Aurora MySQL**. 스키마와 데이터를 읽을 수 있는
-  사용자면 충분합니다(읽기 전용으로 족함 — 도구는 소스에 절대 쓰지 않습니다).
+  사용자면 됩니다(읽기 전용으로 충분합니다 — 도구는 소스에 절대 쓰지 않습니다).
 - 도구를 실행할 리전과 **동일한 리전**의 타깃 **Amazon Aurora DSQL** 클러스터. (DSQL은 IAM 토큰
   인증을 쓰므로 관리할 비밀번호가 없습니다.)
 
@@ -32,7 +34,7 @@ _언어: [English](../en/01-setup.md) | **한국어**_
 
 - Python 3.10+ (프로젝트는 `.python-version`으로 3.12 고정).
 - 의존성 관리를 위한 [`uv`](https://docs.astral.sh/uv/).
-- 표준 자격증명 체인(환경 변수, `~/.aws`, 또는 named profile)으로 도달 가능한 AWS 자격증명으로,
+- 표준 자격증명 체인(환경 변수, `~/.aws`, 또는 명명된 프로파일)으로 도달 가능한 AWS 자격증명으로,
   **Aurora DSQL IAM 토큰 생성**(`dsql:DbConnect` / `dsql:DbConnectAdmin`) 권한 필요. 선택적으로
   `secretsmanager:GetSecretValue`(소스 자격증명이 Secrets Manager에 있을 때),
   `bedrock:InvokeModel`(AI 어시스트를 켤 때).
@@ -111,8 +113,8 @@ cp .env.example .env
 # .env 편집: 소스 DB host/port/user, 타깃 DSQL 엔드포인트, 리전 등
 ```
 
-> 앱은 `reload=False`로 실행되므로 코드 변경을 **핫 리로드하지 않습니다** — 편집을 반영하려면
-> 재시작하세요. 도구 자체를 수정할 때만 해당됩니다.
+> 앱은 `reload=False`로 실행되므로 코드 변경을 **자동으로 다시 불러오지 않습니다(핫 리로드 없음)** —
+> 편집을 반영하려면 재시작하세요. 도구 자체를 수정할 때만 해당됩니다.
 
 ---
 
@@ -159,7 +161,7 @@ CloudFormation 파라미터에 대응합니다:
 | 작업/세션 상태 | **EFS 백업** (무손실 재개가 필요하면 권장) | 태스크 교체 후에도 살아남아 진행 중 Full Load가 재개됨. 기본 `/tmp`는 태스크별·휘발성. |
 
 > *동작을 가장 빨리 보는* 길은 **Dev/Test 프로파일**(`internal` ALB,
-> `EnableCognitoAuth=false`, 자체 서명 인증서) — 여전히 실제 Fargate이고 부품만 적습니다.
+> `EnableCognitoAuth=false`, 자체 서명 인증서) — 여전히 실제 Fargate이며 구성 요소만 더 적습니다.
 > 평가 이상이면 **Prod 프로파일**(Cognito + 실제 도메인/인증서)로 승격하세요. 두 프로파일 모두
 > `deploy/DEPLOYMENT.md`에 있습니다.
 
@@ -186,8 +188,8 @@ CloudFormation 파라미터에 대응합니다:
 > 동일 리전에 있어야 하며** 크로스 리전 마이그레이션은 **지원되지 않습니다.** 도구도 그 리전에서
 > 실행하세요.
 
-두 연결이 모두 정상이면 **Migration plan**을 고른 뒤 **Evaluation** 준비 완료 — 도구가 양쪽 DB를
-introspect해 호환성 리포트를 만듭니다. 이후 안내 흐름은 Schema Conversion, Data Migration(Full
+두 연결이 모두 정상이면 **Migration plan**을 고른 뒤 **Evaluation** 준비가 끝납니다 — 도구가 양쪽
+DB를 조사(introspect)해 호환성 리포트를 만듭니다. 이후 안내 흐름은 Schema Conversion, Data Migration(Full
 Load + CDC), Validation, 그리고 마지막으로 **Cut over**(애플리케이션을 DSQL로 전환하는 런북)로
 이어지며, 각각 다음 장에서 다룹니다.
 

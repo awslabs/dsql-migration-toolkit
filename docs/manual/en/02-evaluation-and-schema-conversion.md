@@ -2,6 +2,8 @@
 
 _Language: **English** | [한국어](../ko/02-evaluation-and-schema-conversion.md)_
 
+> **Prev:** [1. Set up](01-setup.md)
+
 Between connecting and moving data are the two steps that make the migration
 **deterministic and predictable** instead of trial-and-error:
 
@@ -196,4 +198,4 @@ you must re-apply the equivalent DDL here yourself (see
 
 ---
 
-**Prev:** [1. Set up](01-setup.md) · **Next:** [3. Full Load →](03-full-load.md)
+**Next:** [3. Full Load →](03-full-load.md)

@@ -414,7 +414,3 @@ fresh workflow — use **Start over** instead; it's instant and free.
 - **The enforced limits to design around:** [Chapter 6 — Limitations](06-limitations.md).
 - **Prove correctness:** [Chapter 5 — Validation](05-validation.md).
 - **Choose a path and cut over:** [Chapter 10 — Conclusion](10-conclusion.md).
-
----
-
-**Prev:** [10. Conclusion →](10-conclusion.md)

@@ -2,6 +2,8 @@
 
 _Language: **English** | [한국어](../ko/05-validation.md)_
 
+> **Prev:** [4. CDC and DSQL constraints](04-cdc-and-dsql-constraints.md)
+
 **Validation** is the step that proves the target matches the source — your
 evidence for a safe cut-over. It's the only step that runs **exact** `COUNT(*)`
 and checksums (Full Load deliberately used scan-free estimates), so it gives you

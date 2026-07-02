@@ -2,6 +2,8 @@
 
 _Language: **English** | [한국어](../ko/04-cdc-and-dsql-constraints.md)_
 
+> **Prev:** [3. Full Load](03-full-load.md)
+
 **CDC (Change Data Capture)** is the **optional** streaming pipeline for a
 near-zero-downtime cut-over. After Full Load copies the existing rows, CDC keeps
 DSQL continuously up to date with every new insert/update/delete on the source —
