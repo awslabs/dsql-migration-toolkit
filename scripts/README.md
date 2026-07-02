@@ -1,17 +1,18 @@
-# Verification scripts — check your Full Load / CDC migration
+# Command-line scripts — run and verify a Full Load / CDC migration
 
-These two **read-only** helper scripts let you independently verify that your
-Full Load and/or CDC migration actually landed on Aurora DSQL — comparing your
-**source MySQL** against the **target DSQL** yourself, outside the tool's own UI.
+These helper scripts let you drive a **Full Load** and independently **verify**
+the result from the command line — using the tool's own engine, without opening
+the web UI. The source MySQL is always accessed **read-only**.
 
-| Script | What it answers | Cost |
+| Script | What it does | Writes to DSQL? |
 |---|---|---|
-| [`compare_rows.py`](compare_rows.py) | Do the **row counts** (and PK min/max range) match, per table? | Cheap — a quick sanity check you can run repeatedly. |
-| [`cdc_consistency_check.py`](cdc_consistency_check.py) | **Zero data loss?** For every table it loads the full primary-key set from both sides and names the exact PKs **missing on target** (lost rows) and **extra on target** (a source delete not yet applied). | Heavier — reads every PK; run it when you want proof, e.g. before cut-over. |
+| [`run_full_load.py`](run_full_load.py) | **Runs a Full Load** for your schema/tables: keyset-streamed export from MySQL → batched idempotent load into Aurora DSQL (the tool's own bulk loader). | Yes (target only). Needs `--yes`; prints a plan otherwise. |
+| [`compare_rows.py`](compare_rows.py) | **Row-count check:** do source vs target counts (and PK min/max) match, per table? | No — read-only. |
+| [`cdc_consistency_check.py`](cdc_consistency_check.py) | **Zero-data-loss check:** loads the full primary-key set from both sides and names the exact PKs **missing on target** (lost rows) and **extra on target** (a source delete not yet applied). | No — read-only. |
 
-Both are **read-only on both sides** (source is never modified), print a
-per-table report, and **exit `0` only when everything matches / is consistent**
-(non-zero otherwise) — so you can gate a shell script on them.
+The two verification scripts are **read-only on both sides**, print a per-table
+report, and **exit `0` only when everything matches / is consistent** (non-zero
+otherwise) — so you can gate a shell script on them.
 
 > These are optional, standalone utilities — the migration tool's own
 > **Validation** step (Chapter 5 of the manual) is the authoritative go/no-go and
@@ -49,7 +50,44 @@ set -a; source .env; set +a
 
 ---
 
-## 2. `compare_rows.py` — quick row-count check
+## 2. `run_full_load.py` — run a Full Load from the CLI
+
+Loads your source tables into Aurora DSQL using the tool's own bulk loader.
+**Plan first (no writes), then re-run with `--yes`.**
+
+```bash
+# 1) Plan — see what WOULD load (introspects the source read-only; no writes)
+.venv/bin/python scripts/run_full_load.py --schema sales --tables orders customers
+
+# 2) Load those tables (idempotent; target tables must already exist)
+.venv/bin/python scripts/run_full_load.py --schema sales --tables orders customers --yes
+
+# Fresh load of ALL tables in the schema (DROP+recreate target) + save a watermark
+.venv/bin/python scripts/run_full_load.py --schema sales --clean --yes \
+    --watermark-out sales_watermark.json
+```
+
+- `--schema` (required): the source MySQL database to load from.
+- `--tables …` (optional): specific tables; **omit to load every table** in the schema.
+- **Default mode is idempotent** (`INSERT ... ON CONFLICT DO NOTHING`) — safe to
+  re-run, never duplicates. The target tables must exist first (create them via the
+  tool's Schema Conversion step, or use `--clean`).
+- `--clean`: DROP + recreate each target table from the converted DDL before
+  loading (DSQL has no TRUNCATE). **⚠️ DESTRUCTIVE** — discards existing target
+  data for those tables; use for a fresh load.
+- `--watermark-out <file>`: save the captured binlog/GTID watermark, so CDC can
+  later start gaplessly from exactly that point.
+
+Memory stays bounded to one page per table regardless of table size (keyset
+streaming), so it is safe for very large / TB-scale tables. Exit `0` when every
+table loaded; non-zero if any table failed or a row was quarantined (permanently
+rejected, e.g. a value over DSQL's ~1 MiB per-value limit).
+
+After loading, verify with the read-only checks below.
+
+---
+
+## 3. `compare_rows.py` — quick row-count check
 
 Point it at **your own tables** with `-t schema.table` (repeatable). A table name
 without a schema defaults to the `cdc_demo` schema, so always qualify it.
@@ -70,7 +108,7 @@ watch the target converge.
 
 ---
 
-## 3. `cdc_consistency_check.py` — zero-data-loss reconciliation
+## 4. `cdc_consistency_check.py` — zero-data-loss reconciliation
 
 Stronger than counts: it compares the **full set of primary keys** on both sides.
 
@@ -101,10 +139,14 @@ DELETE to the exact operations, independent of the count comparison.
 
 ---
 
-## 4. A typical flow
+## 5. A typical flow
 
 ```bash
 set -a; source .env; set +a
+
+# Full Load (plan first, then run) — fresh load of the whole schema
+.venv/bin/python scripts/run_full_load.py --schema sales --clean          # plan
+.venv/bin/python scripts/run_full_load.py --schema sales --clean --yes    # run
 
 # After Full Load: counts should match
 .venv/bin/python scripts/compare_rows.py -t sales.orders -t sales.customers
@@ -116,5 +158,6 @@ set -a; source .env; set +a
 .venv/bin/python scripts/cdc_consistency_check.py --schema sales --tables orders customers payments
 ```
 
-Only what these two files touch is verified here; for checksums, full
-reconciliation, and drift attribution use the tool's built-in **Validation** step.
+These scripts cover a CLI-driven Full Load and read-only verification; for
+checksums, full reconciliation, and drift attribution use the tool's built-in
+**Validation** step (Chapter 5 of the manual).

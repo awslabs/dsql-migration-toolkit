@@ -88,6 +88,7 @@ CLAUDE.md
 # read-only verification helpers are tracked (see scripts/README.md).
 scripts/*
 !scripts/compare_rows.py
+!scripts/run_full_load.py
 !scripts/cdc_consistency_check.py
 !scripts/README.md
 
