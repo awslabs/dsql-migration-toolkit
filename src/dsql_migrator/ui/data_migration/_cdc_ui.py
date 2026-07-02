@@ -218,90 +218,6 @@ def _render_cdc_decision(
             "Locked once the migration has started or CDC infrastructure is deployed."
         ).classes("text-xs text-gray-500")
 
-def _render_cdc_stack_deploy_help(ui) -> None:
-    """Render a contextual guide for provisioning the CDC infrastructure.
-
-    The MSK cluster and MSK Connect are created by the optional ``cdc-stack``
-    CloudFormation template; until it is deployed these checks fail by design
-    (the control-plane app does not depend on it). This panel gives the concrete
-    deploy command + key parameters so the user can stand it up.
-    """
-    with ui.expansion(  # type: ignore[attr-defined]
-        "How to provision the CDC infrastructure (cdc-stack)", value=True
-    ).classes("w-full").props("expand-separator"):
-        ui.label(  # type: ignore[attr-defined]
-            "MSK and MSK Connect are created by the optional cdc-stack "
-            "CloudFormation template -- deploy it once with CloudFormation; "
-            "the control-plane app does not provision it automatically."
-        ).classes("text-sm text-gray-600")
-        ui.code(  # type: ignore[attr-defined]
-            "aws cloudformation validate-template \\\n"
-            "  --template-body file://deploy/cdc-stack/cdc-stack.yaml\n\n"
-            "aws cloudformation deploy \\\n"
-            "  --template-file deploy/cdc-stack/cdc-stack.yaml \\\n"
-            "  --stack-name mysql-dsql-cdc-stack \\\n"
-            "  --capabilities CAPABILITY_NAMED_IAM \\\n"
-            "  --parameter-overrides ...   # see the template Parameters",
-            language="bash",
-        ).classes("w-full text-xs")
-        ui.label(  # type: ignore[attr-defined]
-            "Key parameters: VPC + private subnets, the S3 location of both "
-            "plugin artifacts, the DSQL cluster endpoint/ARN, the source-credential "
-            "Secrets Manager ARN, and the source DB security group for egress."
-        ).classes("text-xs text-gray-500")
-        ui.label(  # type: ignore[attr-defined]
-            "MSK Serverless does not expose its bootstrap brokers via Ref/GetAtt, "
-            "so this is a two-pass deploy: pass 1 creates the cluster, then supply "
-            "its bootstrap string as MskBootstrapServers on pass 2 to create the "
-            "connectors. See deploy/cdc-stack/README.md."
-        ).classes("text-xs text-gray-500")
-        ui.label(  # type: ignore[attr-defined]
-            "After it is deployed, re-run these prerequisite checks."
-        ).classes("text-xs text-gray-600")
-
-    # Teardown guidance, symmetric with deploy. The cdc-stack (MSK Serverless +
-    # MSK Connect + NAT) bills hourly, so remind the operator to delete it after
-    # cutover. Informational only -- the control plane never calls CloudFormation
-    # (decision-change 8); collapsed by default so it is not mistaken for an action.
-    with ui.expansion(  # type: ignore[attr-defined]
-        "How to tear down the CDC infrastructure (stop the hourly bill)",
-        value=False,
-    ).classes("w-full").props("expand-separator"):
-        inline_hint(  # type: ignore[attr-defined]
-            ui,
-            "The cdc-stack (MSK Serverless + MSK Connect + NAT gateway) bills by "
-            "the hour while deployed. Delete it once you have cut over and no "
-            "longer need CDC streaming.",
-            tone="neutral",
-            classes="text-sm",
-        )
-        ui.code(  # type: ignore[attr-defined]
-            "aws cloudformation delete-stack \\\n"
-            "  --stack-name mysql-dsql-cdc-stack\n\n"
-            "aws cloudformation wait stack-delete-complete \\\n"
-            "  --stack-name mysql-dsql-cdc-stack",
-            language="bash",
-        ).classes("w-full text-xs")
-        ui.label(  # type: ignore[attr-defined]
-            "This permanently removes the MSK cluster, both connectors, and any "
-            "unprocessed messages (including the dead-letter queue). The DSQL "
-            "cluster and your migrated data are NOT part of this stack and "
-            "survive deletion."
-        ).classes("text-xs text-gray-500")
-        ui.label(  # type: ignore[attr-defined]
-            "Note: if you connected the source with a username/password, the tool "
-            "created a Secrets Manager secret for CDC. The in-app 'Delete CDC "
-            "infrastructure' button removes it for you; the CLI delete-stack above "
-            "does NOT — delete it manually so your database credentials do not "
-            "linger:"
-        ).classes("text-xs text-gray-500")
-        ui.code(  # type: ignore[attr-defined]
-            "aws secretsmanager delete-secret \\\n"
-            "  --secret-id mysql-dsql-migrator/cdc/mysql-dsql-cdc-stack/source \\\n"
-            "  --recovery-window-in-days 7",
-            language="bash",
-        ).classes("w-full text-xs")
-
 def _render_cdc_step(
     ui,
     migration_state,
@@ -2184,6 +2100,38 @@ async def _start_cdc_infra_deploy(
     sink_config = CdcPipelineOrchestrator().build_sink_config(
         "mysql-sink", tables_for_config, CDC_DEFAULT_DLQ_TOPIC, allow_empty=True
     )
+    # (c) source-DB security group. Scope the connector's egress-to-source rule to
+    #     the source DB's own SG so the stack does NOT fall back to an open
+    #     0.0.0.0/0 egress on the source port. Best effort + off the loop: if the
+    #     user supplied one it wins; otherwise look it up from RDS (read-only). A
+    #     non-RDS host / missing rds:DescribeDBInstances just leaves it empty (the
+    #     stack then uses the documented 0.0.0.0/0 fallback, as before).
+    source_db_security_group_id = (fields.get("source_db_security_group_id") or "").strip()
+    if not source_db_security_group_id:
+        # source_db_hostname was prefilled from the source config by _cdc_infra_prefill.
+        source_host = fields.get("source_db_hostname", "")
+
+        def _lookup_source_sg():
+            from dsql_migrator.core.rds_metadata import (
+                build_rds_client,
+                fetch_source_security_group_id,
+                parse_rds_region,
+            )
+
+            sg_region = parse_rds_region(source_host)
+            if sg_region is None:
+                return None
+            client = build_rds_client(aws_profile, sg_region)
+            return fetch_source_security_group_id(client, source_host)
+
+        if source_host:
+            try:
+                source_db_security_group_id = (
+                    await run.io_bound(_lookup_source_sg)
+                ) or ""
+            except Exception:  # noqa: BLE001 - optional; fall back to open egress
+                source_db_security_group_id = ""
+
     # Plugin bucket + keys are left EMPTY here; the deploy job ensures the managed
     # bucket, uploads the bundled artifacts, and patches these in before create.
     params = build_cdc_infra_params(
@@ -2195,7 +2143,7 @@ async def _start_cdc_infra_deploy(
         private_subnet_cidr_b=private_subnet_cidr_b,
         private_subnet_az_a=private_subnet_az_a,
         private_subnet_az_b=private_subnet_az_b,
-        source_db_security_group_id=fields.get("source_db_security_group_id", ""),
+        source_db_security_group_id=source_db_security_group_id,
         plugin_bucket_arn="",
         debezium_plugin_s3_key="",
         dsql_sink_plugin_s3_key="",

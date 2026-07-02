@@ -3226,7 +3226,6 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     _render_cdc_running_actions,
     _render_cdc_runs_on_banner,
     _render_cdc_source_config_card,
-    _render_cdc_stack_deploy_help,
     _render_cdc_start_action,
     _render_cdc_start_button,
     _render_cdc_start_point_card,

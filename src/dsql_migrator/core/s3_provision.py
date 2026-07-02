@@ -48,6 +48,10 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v12 rebuilds the sink plugin for a corrected start() advisory log only: when no
+#    ErrantRecordReporter is wired, the message now states a permanently-rejected
+#    record FAILS THE TASK (the actual quarantine() behavior) rather than the stale
+#    "logged and skipped". No behavior change; sink-jar log string only.
 # v10 fixes the ACTUAL cause of the typetest contiguous-gap data loss: the offset
 #    seeder silently failed, so the source connector started with NO seeded offset
 #    and skipped every change between the Full Load watermark and CDC start. Two
@@ -99,7 +103,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v11"
+PLUGIN_VERSION = "v12"
 
 
 class S3ProvisionError(RuntimeError):

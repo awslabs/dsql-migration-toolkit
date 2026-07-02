@@ -31,16 +31,15 @@ Pipeline for one table:
 
 Output formats and sinks are orthogonal. The :class:`RowWriter` abstraction is
 the format boundary; :class:`CsvRowWriter` implements CSV (stdlib ``csv``, no
-extra dependency) and can target a local file or an Amazon S3 object (uploaded
-via the already-present ``boto3`` client, which is injectable for tests). Parquet
-is intentionally **not** implemented here: per the project's no-bloat principle
-and because the import path (task 8.3) does not yet consume Parquet, CSV fully
-satisfies Requirement 5.1. A Parquet writer can be added as another
+extra dependency) targeting a text stream (e.g. a local file). The live import
+path does not stage rows to a file at all -- it converts and applies them in
+process via :meth:`TableExporter.stream_converted_rows` -- so CSV output is a
+utility, not the migration hot path. A Parquet writer could be added as another
 :class:`RowWriter` without touching the streaming/conversion core.
 
-Dependencies (engine, S3 client, output stream) are injectable -- mirroring
+Dependencies (engine, output stream) are injectable -- mirroring
 :class:`~dsql_migrator.core.introspector.SourceIntrospector` and the watermark
-capturer -- so unit tests never touch a real MySQL or S3.
+capturer -- so unit tests never touch a real MySQL.
 """
 
 from __future__ import annotations
@@ -324,15 +323,15 @@ class RowWriter(ABC):
 
     @abstractmethod
     def close(self) -> None:
-        """Flush and finalize output (e.g. close the file or upload to S3)."""
+        """Flush and finalize output (e.g. close the underlying file)."""
 
 
 class CsvRowWriter(RowWriter):
-    """Writes rows as CSV to a text stream (local file or S3 buffer).
+    """Writes rows as CSV to a text stream (e.g. a local file).
 
     Rows are emitted in the header's column order. The writer optionally owns the
     underlying stream (closing it on :meth:`close`) and optionally runs a
-    finalizer on close -- used by :meth:`for_s3` to upload the buffered CSV.
+    finalizer on close.
     """
 
     def __init__(
@@ -376,145 +375,6 @@ class CsvRowWriter(RowWriter):
         """Create a CSV writer that writes to (and owns) a local file at ``path``."""
         stream = open(path, "w", newline="", encoding="utf-8")  # noqa: SIM115
         return cls(stream, owns_stream=True)
-
-    @classmethod
-    def for_s3(
-        cls, s3_client: object, bucket: str, key: str
-    ) -> "CsvRowWriter":
-        """Create a CSV writer that buffers in memory and uploads to S3 on close.
-
-        ``s3_client`` is injected (e.g. ``boto3.client('s3')``) so tests can
-        supply a fake client and never reach real S3. The buffered CSV is sent
-        with a single ``put_object`` when the writer closes.
-        """
-        import io
-
-        buffer = io.StringIO()
-
-        def _upload() -> None:
-            s3_client.put_object(  # type: ignore[attr-defined]
-                Bucket=bucket,
-                Key=key,
-                Body=buffer.getvalue().encode("utf-8"),
-            )
-
-        return cls(buffer, owns_stream=True, on_close=_upload)
-
-
-# Default S3 multipart part size (8 MiB). S3 requires every non-final part to be
-# at least 5 MiB; 8 MiB keeps part counts low for multi-GB tables while never
-# buffering the whole CSV.
-_S3_MULTIPART_PART_SIZE = 8 * 1024 * 1024
-_S3_MIN_PART_SIZE = 5 * 1024 * 1024
-
-
-class _S3MultipartCsvStream:
-    """A text stream that uploads to S3 without buffering the whole file.
-
-    Written bytes accumulate until they reach the part size, then are flushed as
-    an S3 multipart-upload *part*, so neither local disk nor full memory ever
-    holds the entire CSV -- the staging path required for large-scale migrations.
-    Content smaller than one part is sent as a single ``put_object`` (no
-    multipart overhead). :meth:`abort` cancels an in-flight multipart upload so a
-    failed export leaves no partial object behind.
-
-    The object satisfies the minimal text-stream surface
-    (:meth:`write`/:meth:`flush`/:meth:`close`) that :class:`CsvRowWriter` drives,
-    so the existing streaming/conversion core is reused unchanged.
-    """
-
-    def __init__(
-        self,
-        s3_client: object,
-        bucket: str,
-        key: str,
-        *,
-        part_size_bytes: int = _S3_MULTIPART_PART_SIZE,
-    ) -> None:
-        if part_size_bytes < _S3_MIN_PART_SIZE:
-            raise ValueError(
-                f"S3 multipart part size must be >= {_S3_MIN_PART_SIZE} bytes (5 MiB)"
-            )
-        self._s3 = s3_client
-        self._bucket = bucket
-        self._key = key
-        self._part_size = part_size_bytes
-        self._buffer = bytearray()
-        self._upload_id: Optional[str] = None
-        self._parts: list[dict] = []
-        self._part_number = 0
-        self._aborted = False
-        self._closed = False
-
-    def write(self, text_chunk: str) -> int:
-        """Buffer ``text_chunk`` and flush full parts to S3 as they accumulate."""
-        self._buffer.extend(text_chunk.encode("utf-8"))
-        while len(self._buffer) >= self._part_size:
-            self._upload_part(self._part_size)
-        return len(text_chunk)
-
-    def flush(self) -> None:
-        """No-op: non-final S3 parts must be >= 5 MiB, so flush waits for close."""
-        return None
-
-    def _ensure_upload(self) -> None:
-        if self._upload_id is None:
-            response = self._s3.create_multipart_upload(  # type: ignore[attr-defined]
-                Bucket=self._bucket, Key=self._key
-            )
-            self._upload_id = response["UploadId"]
-
-    def _upload_part(self, size: int) -> None:
-        self._ensure_upload()
-        self._part_number += 1
-        chunk = bytes(self._buffer[:size])
-        del self._buffer[:size]
-        response = self._s3.upload_part(  # type: ignore[attr-defined]
-            Bucket=self._bucket,
-            Key=self._key,
-            PartNumber=self._part_number,
-            UploadId=self._upload_id,
-            Body=chunk,
-        )
-        self._parts.append(
-            {"PartNumber": self._part_number, "ETag": response["ETag"]}
-        )
-
-    def abort(self) -> None:
-        """Cancel an in-flight multipart upload (best effort); idempotent."""
-        if self._aborted:
-            return
-        self._aborted = True
-        if self._upload_id is not None:
-            try:
-                self._s3.abort_multipart_upload(  # type: ignore[attr-defined]
-                    Bucket=self._bucket, Key=self._key, UploadId=self._upload_id
-                )
-            except Exception:  # noqa: BLE001 - cleanup is best effort
-                pass
-
-    def close(self) -> None:
-        """Finalize: complete the multipart upload, or single-``put_object``."""
-        if self._closed or self._aborted:
-            self._closed = True
-            return
-        self._closed = True
-        if self._upload_id is None:
-            # Everything fit under one part: a single put_object is cheaper and
-            # avoids multipart entirely for small tables.
-            self._s3.put_object(  # type: ignore[attr-defined]
-                Bucket=self._bucket, Key=self._key, Body=bytes(self._buffer)
-            )
-            self._buffer.clear()
-            return
-        if self._buffer:  # final part may be < 5 MiB (allowed for the last part)
-            self._upload_part(len(self._buffer))
-        self._s3.complete_multipart_upload(  # type: ignore[attr-defined]
-            Bucket=self._bucket,
-            Key=self._key,
-            UploadId=self._upload_id,
-            MultipartUpload={"Parts": self._parts},
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -802,51 +662,6 @@ class TableExporter:
                     snapshot.execute(text(COMMIT))
         finally:
             engine.dispose()
-
-    def export_table_to_csv_s3(
-        self,
-        conn: SourceConnectionConfig,
-        table: TableDef,
-        s3_client: object,
-        bucket: str,
-        key: str,
-    ) -> int:
-        """Export ``table`` to ``s3://bucket/key`` as CSV via an injected client."""
-        writer = CsvRowWriter.for_s3(s3_client, bucket, key)
-        try:
-            return self.export_table(conn, table, writer)
-        finally:
-            writer.close()
-
-    def export_table_to_s3_streaming(
-        self,
-        conn: SourceConnectionConfig,
-        table: TableDef,
-        *,
-        s3_client: object,
-        bucket: str,
-        key: str,
-        part_size_bytes: int = _S3_MULTIPART_PART_SIZE,
-    ) -> int:
-        """Stream ``table`` to ``s3://bucket/key`` without local disk or full RAM.
-
-        Uses a multipart-upload sink (:class:`_S3MultipartCsvStream`): rows stream
-        from the source and parts upload as they fill, so a multi-GB/TB table is
-        never staged whole on the container's ephemeral disk (Fargate ~20 GB) nor
-        buffered entirely in memory. On any failure the in-flight multipart upload
-        is aborted so no partial object is left behind.
-        """
-        stream = _S3MultipartCsvStream(
-            s3_client, bucket, key, part_size_bytes=part_size_bytes
-        )
-        writer = CsvRowWriter(stream, owns_stream=True)
-        try:
-            rows = self.export_table(conn, table, writer)
-        except BaseException:
-            stream.abort()
-            raise
-        writer.close()  # completes the multipart upload (or single put_object)
-        return rows
 
 
 def export_rows(

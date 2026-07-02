@@ -15,7 +15,7 @@ instance size rather than failing. No credentials are read or logged here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -26,6 +26,10 @@ class SourceInstanceInfo:
     instance_class: Optional[str] = None
     engine: Optional[str] = None
     engine_version: Optional[str] = None
+    # The source's own VPC security group ids (from ``VpcSecurityGroups``). Used to
+    # scope the CDC connector's egress-to-source rule to the source DB's SG instead
+    # of falling back to an open ``0.0.0.0/0`` egress. Empty when unknown.
+    security_group_ids: tuple[str, ...] = field(default_factory=tuple)
 
 
 def parse_db_identifier(endpoint: str) -> Optional[str]:
@@ -99,9 +103,43 @@ def describe_source_instance(
             instance_class=instance.get("DBInstanceClass"),
             engine=instance.get("Engine"),
             engine_version=instance.get("EngineVersion"),
+            security_group_ids=_active_security_group_ids(instance),
         )
     except Exception:  # noqa: BLE001 - metadata is optional, never fatal
         return None
+
+
+def _active_security_group_ids(instance: dict) -> tuple[str, ...]:
+    """Return the ``active`` VPC security group ids attached to an RDS instance.
+
+    RDS reports each membership with a ``Status`` (``active`` / ``adding`` /
+    ``removing``); we keep only ``active`` ones (falling back to any with an id if
+    none report a status). Order is preserved and de-duplicated. Empty on any gap.
+    """
+    memberships = instance.get("VpcSecurityGroups") or []
+    ids: list[str] = []
+    for member in memberships:
+        sg_id = (member.get("VpcSecurityGroupId") or "").strip()
+        status = (member.get("Status") or "").strip().lower()
+        if sg_id and status in ("", "active") and sg_id not in ids:
+            ids.append(sg_id)
+    return tuple(ids)
+
+
+def fetch_source_security_group_id(
+    rds_client: object, endpoint: str
+) -> Optional[str]:
+    """Return the source DB's first active VPC security group id (best effort).
+
+    Used at CDC deploy time to scope the connector's egress-to-source rule to the
+    source DB's own security group, so the stack does not fall back to an open
+    ``0.0.0.0/0`` egress. Returns ``None`` for a non-RDS host, missing permission,
+    or a source with no discoverable security group.
+    """
+    info = describe_source_instance(rds_client, endpoint)
+    if info is None or not info.security_group_ids:
+        return None
+    return info.security_group_ids[0]
 
 
 def build_rds_client(aws_profile: Optional[str], region: Optional[str]) -> object:
@@ -117,5 +155,6 @@ __all__ = [
     "is_cluster_endpoint",
     "parse_rds_region",
     "describe_source_instance",
+    "fetch_source_security_group_id",
     "build_rds_client",
 ]

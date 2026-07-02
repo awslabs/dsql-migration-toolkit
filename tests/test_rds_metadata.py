@@ -10,6 +10,7 @@ from __future__ import annotations
 from dsql_migrator.core.rds_metadata import (
     SourceInstanceInfo,
     describe_source_instance,
+    fetch_source_security_group_id,
     is_cluster_endpoint,
     parse_db_identifier,
     parse_rds_region,
@@ -94,3 +95,49 @@ def test_describe_source_instance_best_effort_returns_none() -> None:
     assert describe_source_instance(_FakeRds(), "localhost") is None  # non-RDS host
     assert describe_source_instance(_FakeRds(), _INSTANCE) is None  # not found
     assert describe_source_instance(_FakeRds(raises=True), _INSTANCE) is None  # error
+
+
+def test_describe_source_instance_reads_active_security_groups() -> None:
+    rds = _FakeRds(
+        by_id={
+            "myinstance": [
+                {
+                    "DBInstanceClass": "db.r6g.large",
+                    "VpcSecurityGroups": [
+                        {"VpcSecurityGroupId": "sg-active", "Status": "active"},
+                        {"VpcSecurityGroupId": "sg-removing", "Status": "removing"},
+                    ],
+                }
+            ]
+        }
+    )
+    info = describe_source_instance(rds, _INSTANCE)
+    assert info is not None
+    # Only the active membership is kept; the removing one is dropped.
+    assert info.security_group_ids == ("sg-active",)
+
+
+def test_fetch_source_security_group_id_returns_first_active() -> None:
+    rds = _FakeRds(
+        by_id={
+            "myinstance": [
+                {
+                    "VpcSecurityGroups": [
+                        {"VpcSecurityGroupId": "sg-one", "Status": "active"},
+                        {"VpcSecurityGroupId": "sg-two", "Status": "active"},
+                    ]
+                }
+            ]
+        }
+    )
+    assert fetch_source_security_group_id(rds, _INSTANCE) == "sg-one"
+
+
+def test_fetch_source_security_group_id_best_effort_none() -> None:
+    # Non-RDS host, not found, and API error all yield None (open-egress fallback).
+    assert fetch_source_security_group_id(_FakeRds(), "localhost") is None
+    assert fetch_source_security_group_id(_FakeRds(), _INSTANCE) is None
+    assert fetch_source_security_group_id(_FakeRds(raises=True), _INSTANCE) is None
+    # An instance with no security groups also yields None (not an empty string).
+    rds = _FakeRds(by_id={"myinstance": [{"DBInstanceClass": "db.t3.medium"}]})
+    assert fetch_source_security_group_id(rds, _INSTANCE) is None

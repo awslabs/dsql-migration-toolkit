@@ -105,9 +105,11 @@ public class DsqlSinkTask extends SinkTask {
     }
     if (dlqReporter == null) {
       log.warn(
-          "No ErrantRecordReporter available; permanently-rejected records will be "
-              + "logged and skipped (no DLQ). Configure errors.tolerance=all + "
-              + "errors.deadletterqueue.topic.name to quarantine them.");
+          "No ErrantRecordReporter available; a permanently-rejected record will "
+              + "FAIL THE TASK (not be silently skipped), because skipping would "
+              + "advance the offset past unwritten data. Configure errors.tolerance="
+              + "all + errors.deadletterqueue.topic.name to quarantine such records "
+              + "to the DLQ instead of stalling.");
     }
   }
 
