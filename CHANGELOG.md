@@ -5,6 +5,35 @@ _Language: **English** | [한국어](CHANGELOG.ko.md)_
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.33
+
+### Fixed
+
+- **"Start over" now reliably offers to tear down a deployed CDC pipeline,
+  regardless of which step you were on.** The reset dialog decides whether to show
+  the stop/delete choices from the detected CDC deployment, but that detection was
+  only refreshed when the CDC step had been opened — so starting over from another
+  step (or a reconnected session) could fall back to a passive "resetting does not
+  delete CDC infrastructure" warning with no teardown action. Start over now runs a
+  read-only AWS probe when it opens, so it reflects the real deployed state.
+- **Teardown is offered for CDC resources in ANY state, not just running ones.** A
+  connector that is failed/still provisioning, a stuck or rolled-back cdc-stack, or
+  an infrastructure-only stack (the MSK cluster + NAT with no connectors yet) all
+  still bill — but were not always offered for teardown. Existence, not health, now
+  drives the offer, matching the CDC step (which already exposes Delete for a
+  stuck/unstable stack).
+- **A custom cdc-stack name is named explicitly in the Start-over warning.** If you
+  deployed CDC under a custom stack name (the CDC step's "Advanced — CDC stack
+  name", e.g. for a second parallel migration), a fresh session cannot re-discover
+  it (it reverts to the default name). The warning now names the exact stack so you
+  know precisely what to delete (in the tool or the AWS console).
+- **Deleting CDC infrastructure no longer submits a doomed delete against a stack
+  that is mid-operation.** If a CloudFormation operation was still running, the
+  delete raced it and could fail opaquely. Delete now stops with a clear
+  wait-and-retry message when an operation is in flight (and, if a deletion is
+  already underway, simply waits for it) — while still deleting stable, failed, and
+  rolled-back stacks as before.
+
 ## v0.1.32
 
 ### Fixed
