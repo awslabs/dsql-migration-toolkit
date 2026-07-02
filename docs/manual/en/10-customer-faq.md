@@ -349,6 +349,26 @@ Logs and reports record primary keys and counts, **never row values**. Optional
 AI-assist (Amazon Bedrock, off by default) is **advisory only** and **never** in the
 CDC data path.
 
+The AWS permissions the tool needs are the same whether you run it locally or on
+Fargate — what differs is **where those permissions attach**:
+
+- **Required (both modes):** `dsql:DbConnect` / `dsql:DbConnectAdmin` to mint the
+  DSQL IAM token (scoped to your cluster), plus read-only access to the source
+  MySQL. Optionally `secretsmanager:GetSecretValue` (to reuse a source-credentials
+  secret) and `bedrock:InvokeModel` (only if you enable AI-assist).
+- **Run locally** — the tool uses **your own IAM identity** via the standard
+  credential chain (`~/.aws`, env vars, `AWS_PROFILE`, SSO), so *your* identity must
+  hold those permissions directly. In particular, to use CDC your identity needs the
+  broader **infrastructure-creation permissions** the cdc-stack requires, because it
+  provisions MSK, MSK Connect, and IAM roles via CloudFormation.
+- **Deploy on AWS (ECS Fargate)** — you don't hand credentials to the app.
+  CloudFormation creates a **least-privilege Task Role** and attaches those
+  permissions to it. Privileged work such as deploying the CDC infrastructure is not
+  granted to the long-running task role; instead the task **assumes a dedicated
+  deploy role (CdcDeployRole) only for the duration of that operation**, so the
+  privilege escalation is isolated. (Whoever *first deploys* the app-stack does need
+  permission to create IAM roles, once.) This mode fits least-privilege best.
+
 
 **Q30. Can I run more than one migration / scale the tool horizontally?**
 

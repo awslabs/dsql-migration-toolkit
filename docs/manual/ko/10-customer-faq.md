@@ -396,6 +396,21 @@ Full Load만 쓰는 경우를 포함한 전체 컷오버 절차는
 - **AI**: 선택적 AI 보조 기능(Amazon Bedrock, 기본은 꺼짐)은 **제안만** 하며, CDC 데이터 경로에는
   **전혀** 관여하지 않습니다.
 
+필요한 AWS 권한 자체는 실행 방식(로컬/Fargate)과 무관하게 같지만, **그 권한이 어디에 붙느냐**가 다릅니다:
+
+- **필수 권한(공통)**: DSQL IAM 토큰 발급을 위한 `dsql:DbConnect` / `dsql:DbConnectAdmin`(해당 클러스터로
+  스코핑), 소스는 읽기 전용 MySQL 접근. 선택적으로 소스 자격증명을 Secrets Manager에서 재사용할 때
+  `secretsmanager:GetSecretValue`, AI 보조를 켤 때 `bedrock:InvokeModel`.
+- **로컬 실행** — 표준 자격증명 체인(`~/.aws`, 환경 변수, `AWS_PROFILE`, SSO)으로 **실행하는 사용자 본인의
+  IAM 신원**을 그대로 씁니다. 즉, 위 권한을 **사용자 신원이 직접** 갖고 있어야 합니다. 특히 CDC까지 쓰려면
+  cdc-stack이 CloudFormation으로 MSK·MSK Connect·IAM 역할 등을 생성하므로, 사용자 신원에 그만큼 **넓은
+  인프라 생성 권한**이 필요합니다.
+- **AWS(ECS Fargate) 배포** — 사용자가 자격증명을 앱에 넣지 않습니다. CloudFormation이 **최소 권한으로
+  스코핑한 Task Role**을 자동 생성해 태스크에 부여하고, 위 권한은 그 역할에 붙습니다. CDC 인프라 배포 같은
+  특권 작업은 상시 실행되는 태스크 역할이 아니라 **전용 배포 역할(CdcDeployRole)을 필요한 순간에만
+  assume**해 수행하므로, 권한 상승이 격리됩니다. (다만 app-stack을 **최초 배포하는 사람**은 IAM 역할을
+  만들 권한이 한 번 필요합니다.) 최소 권한 원칙에는 이 방식이 더 부합합니다.
+
 
 **Q30. 여러 마이그레이션을 동시에 하거나 도구를 수평 확장할 수 있나요?**
 
