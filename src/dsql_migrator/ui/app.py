@@ -302,18 +302,47 @@ def build_page(
         _LAST_SESSION_SIGNATURE.pop(session_id, None)
 
     def _cdc_deployed() -> bool:
-        """True when a CDC pipeline (connectors or a running/infra stack) is live,
-        so Start over can offer to tear it down."""
+        """True when ANY CDC AWS resource exists, so Start over can offer to tear it
+        down. Existence -- not health -- is what matters: a connector or stack that
+        is FAILED / mid-rollback / half-deployed still bills for MSK / NAT and must
+        be offered for teardown just like a running one.
+
+        So this is truthy when either (a) any of MY connectors exist in ANY state
+        (``cdc_connector_names`` is populated existence-based by ``_filter_mine``,
+        regardless of RUNNING), or (b) the cdc-stack phase is anything other than
+        ``absent`` -- i.e. ``running`` / ``infra`` / ``unstable`` (a stuck/rolled-
+        back stack is still deployed). Only ``absent`` (no stack at all) is safe.
+        This matches the CDC step, which already offers Delete for the ``unstable``
+        phase."""
         migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
         if getattr(migration_state, "cdc_connector_names", None):
             return True
-        return getattr(migration_state, "cdc_stack_phase", None) in ("running", "infra")
+        phase = getattr(migration_state, "cdc_stack_phase", None)
+        return phase is not None and phase != "absent"
 
     def _cdc_stack_name() -> Optional[str]:
         """The session's current cdc-stack name, so Start over's warning can name a
         custom (non-default) stack that a fresh session would not re-discover."""
         migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
         return getattr(migration_state, "cdc_stack_name", None)
+
+    def _cdc_probe() -> None:
+        """Refresh the cached CDC deployment state from a live, read-only AWS probe.
+
+        Called (off the event loop) when the user opens Start over, so the dialog
+        reflects the ACTUAL deployed CDC -- and offers the stop/delete tiles --
+        regardless of which step the user was on. ``_ensure_cdc_controller`` is
+        throttled per session; clear the throttle timestamp first so this explicit
+        user action always gets a fresh read. Best-effort and read-only."""
+        from dsql_migrator.ui.data_migration._status import _ensure_cdc_controller
+
+        migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
+        session = SESSION_STORE.get_or_create(session_id)
+        migration_state._cdc_discovery_monotonic = None  # bypass the render throttle
+        try:
+            _ensure_cdc_controller(migration_state, session)
+        except Exception:  # noqa: BLE001 - leave cached state; dialog opens regardless
+            pass
 
     def _cdc_teardown_on_reset(mode: str) -> None:
         """Submit a CDC teardown as part of Start over (called BEFORE the reset).
@@ -448,6 +477,7 @@ def build_page(
         on_reset_cdc=_cdc_teardown_on_reset,
         cdc_deployed_getter=_cdc_deployed,
         cdc_stack_name_getter=_cdc_stack_name,
+        cdc_probe=_cdc_probe,
         optional_tools={
             _QUERY_PLAYGROUND_VIEW: OptionalTool(
                 view_key=_QUERY_PLAYGROUND_VIEW,

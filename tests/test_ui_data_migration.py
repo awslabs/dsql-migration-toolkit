@@ -1065,6 +1065,44 @@ def test_refresh_cdc_status_no_controller_is_noop() -> None:
     assert state.cdc_status_view is None
 
 
+def test_ensure_cdc_controller_detects_deployed_connectors_for_start_over() -> None:
+    # The Start-over dialog decides whether to show the stop/delete tiles from the
+    # CACHED cdc_connector_names / cdc_stack_phase (what _cdc_deployed reads). Those
+    # are populated by _ensure_cdc_controller's live probe. This is the contract the
+    # Start-over fix relies on: when connectors for MY stack are deployed, a probe
+    # (triggered on Start-over from any step, not only the CDC step) must flip the
+    # cached state so cdc_deployed becomes True and the tiles appear.
+    from dsql_migrator.core.cdc import cdc_expected_connector_names
+    from dsql_migrator.ui.data_migration._status import _ensure_cdc_controller
+
+    state = DataMigrationState()
+    stack = state.cdc_stack_name  # default stack name
+    src, sink = cdc_expected_connector_names(stack)
+
+    class _Ctl:
+        def list_connectors(self):
+            # Both of MY connectors present and RUNNING on AWS.
+            return [
+                {"connectorName": src, "connectorState": "RUNNING"},
+                {"connectorName": sink, "connectorState": "RUNNING"},
+            ]
+
+    # Pre-wire the controller (the pre-wired branch of _ensure_cdc_controller re-lists
+    # connectors) and bypass the throttle exactly as the Start-over probe does.
+    state.set_cdc_controller(_Ctl())
+    state._cdc_discovery_monotonic = None
+
+    class _Sess:
+        target_config = None  # unused on the pre-wired path
+        aws_profile = None
+
+    _ensure_cdc_controller(state, _Sess())
+
+    # cdc_deployed (app._cdc_deployed) reads exactly these -> now truthy -> tiles show.
+    assert state.cdc_connector_names == [src, sink]
+    assert state.cdc_connector_running_names == [src, sink]
+
+
 def test_fetch_cdc_status_is_pure_read_then_apply_builds_view() -> None:
     # The live poller splits the blocking network read (_fetch_cdc_status, run on a
     # worker thread) from the in-memory view build (_apply_cdc_status, run on the

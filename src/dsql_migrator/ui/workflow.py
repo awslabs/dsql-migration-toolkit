@@ -1217,6 +1217,7 @@ def build_workflow_sidebar(
     on_reset_cdc: Optional[Callable[[str], None]] = None,
     cdc_deployed_getter: Optional[Callable[[], bool]] = None,
     cdc_stack_name_getter: Optional[Callable[[], Optional[str]]] = None,
+    cdc_probe: Optional[Callable[[], None]] = None,
     optional_tools: Optional[dict[str, "OptionalTool"]] = None,
 ) -> None:
     """Render the app as a sidebar layout: header + left-drawer nav + content.
@@ -1367,10 +1368,25 @@ def build_workflow_sidebar(
             ui.label(app_title).classes("text-lg font-bold")
         with ui.row().classes("items-center gap-3"):
             if on_reset is not None:
-                ui.button(
-                    "Start over",
-                    icon="restart_alt",
-                    on_click=lambda: _open_start_over_dialog(
+
+                async def _open_start_over() -> None:
+                    # Confirm the LIVE CDC deployment state before deciding whether to
+                    # show the stop/delete tiles. cdc_deployed_getter only reads cached
+                    # discovery, which is populated when the CDC step renders -- so from
+                    # any OTHER step (or a session that never opened it) a genuinely
+                    # deployed CDC would otherwise fall back to the passive warning with
+                    # no teardown action. Run the read-only AWS probe off the event loop
+                    # first (it is blocking network I/O), then open the dialog with the
+                    # freshly-refreshed cached state. Best-effort: if the probe fails we
+                    # still open with whatever was cached.
+                    if cdc_probe is not None:
+                        from nicegui import run as _sd_run
+
+                        try:
+                            await _sd_run.io_bound(cdc_probe)
+                        except Exception:  # noqa: BLE001 - open with cached state
+                            pass
+                    _open_start_over_dialog(
                         ui, state, on_reset, select, refresh_all, _CONNECT_VIEW,
                         cdc_deployed=(
                             bool(cdc_deployed_getter()) if cdc_deployed_getter else False
@@ -1379,7 +1395,12 @@ def build_workflow_sidebar(
                         cdc_stack_name=(
                             cdc_stack_name_getter() if cdc_stack_name_getter else None
                         ),
-                    ),
+                    )
+
+                ui.button(
+                    "Start over",
+                    icon="restart_alt",
+                    on_click=_open_start_over,
                 ).props("flat dense color=white").tooltip(
                     "Clear this session and start a new migration"
                 )
