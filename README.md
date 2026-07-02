@@ -391,7 +391,8 @@ streaming CDC pipeline is a separate **cdc-stack**, covered in the guide.)
 
 ## Version / changelog
 
-Current version: **v0.1.19**. What each version adds or changes is recorded in the
+The current version is declared in [`pyproject.toml`](pyproject.toml); what each
+version adds or changes is recorded in the
 [**changelog (CHANGELOG.md)**](CHANGELOG.md) — check there after an update to see
 what's new.
 
