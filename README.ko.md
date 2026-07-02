@@ -106,7 +106,7 @@ flowchart LR
   파티셔닝, 미지원 타입)을 이유·권장과 함께 플래그하는 **호환성 평가**.
 - `sqlglot` 기반 **스키마(DDL) 변환**: 타입 매핑, 앱 계층 무결성 주석과 함께 FK 제거,
   `CREATE INDEX ASYNC`, PK 전략, 트랜잭션당 단일 DDL 단위로 분할된 DDL/DML.
-- **대화형 적용**(AWS Schema Conversion Tool과 유사): 객체 트리, DDL 차이, 충돌 처리, 적용 시 `40001`/OC001 멱등 재시도.
+- **대화형 적용**(AWS Schema Conversion Tool과 유사): 객체 트리, DDL 차이, 충돌 처리, 적용 시 `40001`/OC001 안전 재시도(다시 시도해도 중복 부작용 없음).
 - 락 안티패턴 감지(예: DSQL 제약에 대한 `SELECT ... FOR UPDATE`)를 포함한 **쿼리(DML) 변환**.
 - 워터마크 캡처(binlog 좌표 / GTID / 스냅샷 타임스탬프), 일관성 스냅샷 export, OCC 재시도를 동반한
   배치 `INSERT ... ON CONFLICT` import(Aurora DSQL Loader가 주 경로), 트랜잭션당 한도를 존중하는

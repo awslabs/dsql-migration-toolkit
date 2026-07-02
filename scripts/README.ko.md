@@ -8,7 +8,7 @@ _언어: [English](README.md) | **한국어**_
 
 | 스크립트 | 하는 일 | DSQL에 쓰나? |
 |---|---|---|
-| [`run_full_load.py`](run_full_load.py) | 지정한 스키마/테이블에 대해 **Full Load 실행**: MySQL에서 keyset 스트리밍 export → Aurora DSQL로 배치 멱등 적재(도구 자체 벌크 로더). | 예(타깃만). `--yes` 필요; 없으면 계획만 출력. |
+| [`run_full_load.py`](run_full_load.py) | 지정한 스키마/테이블에 대해 **Full Load 실행**: MySQL에서 keyset 스트리밍 export → Aurora DSQL로 배치 적재(여러 번 실행해도 중복 없음; 도구 자체 벌크 로더). | 예(타깃만). `--yes` 필요; 없으면 계획만 출력. |
 | [`compare_rows.py`](compare_rows.py) | **행 수 확인:** 테이블별로 소스 vs 타깃 카운트(및 PK min/max)가 일치하나? | 아니요 — 읽기 전용. |
 | [`cdc_consistency_check.py`](cdc_consistency_check.py) | **무손실 확인:** 양쪽에서 전체 기본 키 집합을 읽어, 타깃에 **없는** PK(손실된 행)와 타깃에만 **있는** PK(아직 적용 안 된 소스 삭제)를 정확히 지목. | 아니요 — 읽기 전용. |
 
@@ -58,7 +58,7 @@ set -a; source .env; set +a
 # 1) 계획 — 무엇이 적재될지 확인 (소스를 읽기 전용으로 introspect; 쓰기 없음)
 .venv/bin/python scripts/run_full_load.py --schema sales --tables orders customers
 
-# 2) 해당 테이블 적재 (멱등; 타깃 테이블이 이미 있어야 함)
+# 2) 해당 테이블 적재 (여러 번 실행해도 중복 없음; 타깃 테이블이 이미 있어야 함)
 .venv/bin/python scripts/run_full_load.py --schema sales --tables orders customers --yes
 
 # 스키마의 모든 테이블을 새로 적재 (타깃 DROP+재생성) + 워터마크 저장
@@ -68,8 +68,9 @@ set -a; source .env; set +a
 
 - `--schema` (필수): 적재할 소스 MySQL 데이터베이스.
 - `--tables …` (선택): 특정 테이블들; **생략하면 스키마의 모든 테이블**을 적재.
-- **기본 모드는 멱등**(`INSERT ... ON CONFLICT DO NOTHING`) — 재실행해도 안전하며 중복이 생기지
-  않습니다. 타깃 테이블이 먼저 존재해야 합니다(도구의 Schema Conversion 단계로 생성하거나 `--clean` 사용).
+- **기본 모드는 재실행해도 안전**합니다(`INSERT ... ON CONFLICT DO NOTHING`) — 몇 번을 다시 돌려도
+  중복이 생기지 않습니다. 타깃 테이블이 먼저 존재해야 합니다(도구의 Schema Conversion 단계로 생성하거나
+  `--clean` 사용).
 - `--clean`: 적재 전 각 타깃 테이블을 변환된 DDL로 DROP + 재생성(DSQL에는 TRUNCATE 없음).
   **⚠️ 파괴적** — 해당 테이블의 기존 타깃 데이터를 버립니다; 새로 적재할 때 사용.
 - `--watermark-out <파일>`: 캡처한 binlog/GTID 워터마크를 저장해, 이후 CDC를 바로 그 지점부터 누락 없이
