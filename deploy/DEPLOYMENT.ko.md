@@ -478,7 +478,7 @@ UI에서 AI를 켜고, **Verify AI access** 사전 점검으로 도달성을 확
 >
 > 1. **cdc-stack 먼저 (CDC를 배포한 적이 있다면)** — 비용의 핵심입니다(Amazon MSK / MSK Connect /
 >    NAT). **앱이 떠 있는 동안** UI에서 제거하세요: **Start over(우측 상단) → "Delete all CDC
->    infrastructure"** (앱이 `cdc-stack` 삭제를 구동, ~45분). 앱이 이미 없으면 수동 삭제:
+>    infrastructure"** (앱이 `cdc-stack` 삭제를 구동, ~15–25분). 앱이 이미 없으면 수동 삭제:
 >    `aws cloudformation delete-stack --stack-name mysql-dsql-cdc-stack --region "$AWS_REGION"`.
 >    (CDC는 별도 `cdc-stack` — CDC 문서 참고.)
 > 2. **app-stack** — `deploy/teardown.sh` (아래).

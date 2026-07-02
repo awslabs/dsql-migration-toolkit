@@ -521,7 +521,7 @@ confirm reachability.
 > 1. **cdc-stack first (if you ever deployed CDC)** — this is the costly one
 >    (Amazon MSK / MSK Connect / NAT). Remove it **while the app is still up**, from
 >    the UI: **Start over (top right) → "Delete all CDC infrastructure"** (the app
->    drives the `cdc-stack` deletion, ~45 min). If the app is already gone, delete it
+>    drives the `cdc-stack` deletion, ~15–25 min). If the app is already gone, delete it
 >    manually: `aws cloudformation delete-stack --stack-name mysql-dsql-cdc-stack --region "$AWS_REGION"`.
 >    (CDC is the separate `cdc-stack`; see the CDC docs.)
 > 2. **app-stack** — `deploy/teardown.sh` (below).
