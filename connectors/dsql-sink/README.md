@@ -92,7 +92,7 @@ from the spike results before production deploy.
 > data-consistency bug needs row-level tracing on the target side* — so it can be
 > turned on deliberately rather than carried as always-on overhead. Until then,
 > use the Python-side row-consistency tools, which need no connector change:
-> `scripts/cdc_consistency_monitor.py` (live source↔DSQL drift + the exact PKs
+> `scripts/cdc_consistency_check.py` (source↔DSQL reconciliation + the exact PKs
 > missing on the target), Step 4 Validation's row-level diff
 > (`DSQL_MIGRATOR_VALIDATE_ROW_DIFF_SAMPLE_SIZE`), and the Full Load data-path
 > trace (`DSQL_MIGRATOR_LOG_LEVEL=DEBUG`).

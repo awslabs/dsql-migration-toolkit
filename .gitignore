@@ -80,3 +80,16 @@ deploy/cdc-stack/*params*.json
 
 # Internal design/spec artifacts (Kiro) — not published
 .kiro/
+
+# Agent guidance for Claude Code (local dev aid, not a published doc)
+CLAUDE.md
+
+# Internal operational/test scripts are not published. Only the customer-facing
+# read-only verification helpers are tracked (see scripts/README.md).
+scripts/*
+!scripts/compare_rows.py
+!scripts/cdc_consistency_check.py
+!scripts/README.md
+
+# Local Claude Code skills/config (dev aid, not published)
+.claude/

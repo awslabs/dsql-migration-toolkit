@@ -12,7 +12,7 @@ module can import it without risking a circular import. The ``ui`` object (the
 NiceGUI module or a test double) is always passed in explicitly rather than
 imported, keeping these helpers unit-testable without a running server.
 
-Design rules (see also the repo CLAUDE.md "UI / AWS-style design system" section):
+Design rules:
 
 - **Severity = tone, never ad-hoc color.** Use :func:`render_notice` with a tone
   from :data:`NOTICE_STYLE` (``info`` / ``success`` / ``warning`` / ``error``)

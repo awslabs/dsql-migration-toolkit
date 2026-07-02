@@ -11,7 +11,8 @@ take its own snapshot). Debezium reads its start position from the compacted
 The cdc-stack itself does not write that record, so without seeding the connector
 starts from the *current* binlog at creation time -- losing every change between
 the snapshot point and connector creation. This module builds the exact record;
-the actual produce to MSK runs in-VPC (see ``scripts/seed_cdc_offset.py``).
+the actual produce to MSK runs in-VPC via the offset-seeder Lambda the cdc-stack
+deploys (``deploy/cdc-stack/lambda/seeder.py``).
 
 This module is pure (no Kafka I/O) so the fragile record format is unit-tested.
 
