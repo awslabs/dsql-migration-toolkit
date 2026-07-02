@@ -62,32 +62,16 @@ import time
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "src"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _common import load_dotenv, log  # noqa: E402
 
-
-def _env(path: str) -> dict:
-    """Minimal KEY=VALUE parser for a .env file (no external dependency)."""
-    out: dict = {}
-    try:
-        for raw in open(path, encoding="utf-8"):
-            line = raw.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                out[k.strip()] = v.strip().strip('"').strip("'")
-    except FileNotFoundError:
-        pass
-    return out
-
-
-ENV = _env(os.path.join(_ROOT, ".env"))
+ENV = load_dotenv(os.path.join(_ROOT, ".env"))
 
 
 def cfg(key: str, default: str = "") -> str:
+    # Shell environment wins over .env here (the reverse of compare_rows.py's
+    # precedence) -- kept as-is so this script's behavior is unchanged.
     return os.environ.get(key) or ENV.get(key) or default
-
-
-def log(msg: str) -> None:
-    import datetime as _dt
-    print(f"[{_dt.datetime.now():%H:%M:%S}] {msg}", flush=True)
 
 
 def region(endpoint: str) -> str:

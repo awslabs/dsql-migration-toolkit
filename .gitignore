@@ -87,6 +87,7 @@ CLAUDE.md
 # Internal operational/test scripts are not published. Only the customer-facing
 # read-only verification helpers are tracked (see scripts/README.md).
 scripts/*
+!scripts/_common.py
 !scripts/compare_rows.py
 !scripts/run_full_load.py
 !scripts/cdc_consistency_check.py

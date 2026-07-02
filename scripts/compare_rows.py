@@ -22,31 +22,16 @@ can gate a test script (e.g. `python scripts/compare_rows.py && echo OK`).
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import os
 import sys
 import time
 
 import pymysql
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _common import load_dotenv, log  # noqa: E402
+
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def load_dotenv(path: str) -> dict:
-    """Minimal KEY=VALUE parser for a .env file (no external dependency)."""
-    values: dict = {}
-    try:
-        with open(path) as f:
-            for raw in f:
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, val = line.partition("=")
-                values[key.strip()] = val.strip().strip('"').strip("'")
-    except FileNotFoundError:
-        pass
-    return values
-
 
 _ENV = load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
 
@@ -62,11 +47,6 @@ TARGET_ENDPOINT = _cfg("TARGET_ENDPOINT")
 TARGET_REGION = _cfg("TARGET_REGION", "us-east-1")
 TARGET_DATABASE = _cfg("TARGET_DATABASE", "postgres")
 TARGET_USERNAME = _cfg("TARGET_USERNAME", "admin")
-
-
-def log(msg: str) -> None:
-    ts = dt.datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
 
 
 # --------------------------------------------------------------------------- #
