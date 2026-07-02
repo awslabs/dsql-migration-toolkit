@@ -1,8 +1,8 @@
-# 10. 고객 FAQ
+# 11. 고객 FAQ
 
-_언어: [English](../en/10-customer-faq.md) | **한국어**_
+_언어: [English](../en/11-customer-faq.md) | **한국어**_
 
-> **이전:** [9. 결론](09-conclusion.md)
+> **이전:** [10. 결론](10-conclusion.md)
 
 이기종 데이터베이스 마이그레이션은 고려할 점이 많습니다. 이 장은 고객이 가장 많이 묻는 질문 —
 **Full Load**, **CDC**, **제약(Limitation)**, **고려해야 할 점** — 에 답합니다. 모든 답변은
@@ -60,7 +60,7 @@ DSQL에 맞게 바꿔야 합니다. 어디를 바꿔야 하는지는 Evaluation(
 
 CDC는 실제 구성요소(MSK, MSK Connect, 싱크 커넥터)를 추가하며 **배포된 동안 비용이 발생**합니다.
 지속 복제가 정말 필요할 때만 쓰세요; 아니면 Full Load만으로 더 단순하고 저렴합니다.
-[9장 §9.1](09-conclusion.md#91-which-path-do-i-need) 참조.
+[10장 §10.1](10-conclusion.md#101-which-path-do-i-need) 참조.
 
 
 **Q6. 도구가 애플리케이션 컷오버까지 해주나요?**
@@ -69,7 +69,7 @@ CDC는 실제 구성요소(MSK, MSK Connect, 싱크 커넥터)를 추가하며 *
 전환할지는 고객만이 내릴 수 있는 운영 판단입니다. 대신 도구는 전환해도 되는지를 **증거로 뒷받침**해
 줍니다 — Validation의 최종 판정과, CDC를 쓰는 경우 누락 없이 이어지는 복제 스트림을 제공합니다. 실제
 전환은 도구가 화면에 보여 주는 **단계별 안내(runbook)**를 따라 직접 수행하면 됩니다
-([9장 §9.3](09-conclusion.md#93-the-cut-over-switching-your-application-to-dsql) 참조).
+([10장 §10.3](10-conclusion.md#103-the-cut-over-switching-your-application-to-dsql) 참조).
 
 ---
 
@@ -366,7 +366,7 @@ CDC를 쓰는 경우, 다음 순서로 진행하세요.
 6. **CDC 인프라는 맨 마지막에 제거**합니다.
 
 Full Load만 쓰는 경우를 포함한 전체 컷오버 절차는
-[9장 §9.3](09-conclusion.md#93-the-cut-over-switching-your-application-to-dsql)에 있습니다.
+[10장 §10.3](10-conclusion.md#103-the-cut-over-switching-your-application-to-dsql)에 있습니다.
 
 
 **Q28. 롤백할 수 있나요?**
@@ -452,8 +452,8 @@ teardown이 끝나면 최초 설치와 똑같이 처음부터 재배포할 수 �
 - **마이그레이션 계획:** [0장 — 시작하기 전에](00-before-you-begin.md).
 - **설계 시 고려할 강제 제약:** [6장 — 제약](06-limitations.md).
 - **정확성 증명:** [5장 — Validation](05-validation.md).
-- **경로 선택과 컷오버:** [9장 — 결론](09-conclusion.md).
+- **경로 선택과 컷오버:** [10장 — 결론](10-conclusion.md).
 
 ---
 
-**이전:** [9. 결론 →](09-conclusion.md)
+**이전:** [10. 결론 →](10-conclusion.md)

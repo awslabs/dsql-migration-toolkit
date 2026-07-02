@@ -161,4 +161,4 @@ before you cut over. You don't have to take the result on trust; you reproduce i
 
 ---
 
-**Next:** [9. Conclusion →](09-conclusion.md)
+**Next:** [9. Query validation and the AI DBA →](09-query-validation.md)

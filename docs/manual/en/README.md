@@ -46,8 +46,9 @@ application to DSQL once Validation passes.
 | 6 | [Limitations](06-limitations.md) | The real, enforced limits you must plan around (DSQL constraints, single-region CDC, single-task control plane). |
 | 7 | [Performance and tuning](07-performance-and-tuning.md) | Why the data path is built this way (AWS-grounded: OCC retry, hot-partition PKs, transaction envelope, async indexes, IAM tokens) and how to tune Full Load / Validation / CDC parallelism — locally and on Fargate. |
 | 8 | [Testing — the DSQL-driven scenarios](08-testing-and-verification.md) | The migration scenarios each Aurora DSQL characteristic *forces* you to test (transaction caps, OCC, 1 MiB values, IAM tokens, async indexes, no-FK, gapless handoff, drift) and how the tool exercises each — offline and on real AWS. |
-| 9 | [Conclusion](09-conclusion.md) | When to use which path, a recommended end-to-end flow, and where to go next. |
-| 10 | [Customer FAQ](10-customer-faq.md) | The questions customers ask most — Full Load, CDC, limitations, type mapping, validation, cut-over/rollback, and operations — each answered from the tool's actual behavior with links to the detail. |
+| 9 | [Query validation and the AI DBA](09-query-validation.md) | The optional Query Playground: convert a single MySQL query to Aurora DSQL, test it read-only on the target (`EXPLAIN` / `EXPLAIN ANALYZE` + DPU cost), and have the **AI DBA** rewrite it for DSQL efficiency and prove the improvement by re-testing. |
+| 10 | [Conclusion](10-conclusion.md) | When to use which path, a recommended end-to-end flow, and where to go next. |
+| 11 | [Customer FAQ](11-customer-faq.md) | The questions customers ask most — Full Load, CDC, limitations, type mapping, validation, cut-over/rollback, and operations — each answered from the tool's actual behavior with links to the detail. |
 
 ## A note for MySQL users about Aurora DSQL
 

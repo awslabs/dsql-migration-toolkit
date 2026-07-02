@@ -142,4 +142,4 @@ CDC → 수렴 → 권위 있는 PK 단위 대조. 실제 인프라에서 테스
 
 ---
 
-**다음:** [9. 결론 →](09-conclusion.md)
+**다음:** [9. 쿼리 검증과 AI DBA →](09-query-validation.md)

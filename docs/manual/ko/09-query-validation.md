@@ -1,0 +1,118 @@
+# 9. 쿼리 검증과 AI DBA
+
+_언어: [English](../en/09-query-validation.md) | **한국어**_
+
+> **이전:** [8. 테스트와 검증](08-testing-and-verification.md)
+
+스키마와 데이터를 옮기는 것만으로는 끝이 아닙니다 — 애플리케이션의 **쿼리**도 Aurora DSQL에서
+돌아가야 하고, *잘* 돌아가야 합니다. **Query Playground**(사이드바의 선택적 도구)는 MySQL 쿼리 하나를
+Aurora DSQL로 변환하고, 타깃에서 읽기 전용으로 테스트하며, AI 보조를 켜면 **AI DBA**가 DSQL에 맞게
+효율적으로 재작성하고 그 개선을 증명하는 곳입니다.
+
+이 장은 그 흐름을 다룹니다. 소스에는 절대 쓰지 않고, 타깃에 DML을 실행하지도 않습니다.
+
+---
+
+## 9.1 쿼리 변환
+
+MySQL 문을 붙여넣으면 스키마 변환과 동일한 규칙 기반(deterministic-first) 엔진(`sqlglot`)으로 Aurora
+DSQL(PostgreSQL)로 변환하고 분류합니다:
+
+- **AUTO** — 규칙 기반으로 변환 완료; 바로 테스트 가능.
+- **MANUAL** — 변환은 됐으나 검토 필요(DSQL에서 주의점이 있는 관용구).
+- **UNSUPPORTED** — 충실한 DSQL 대응이 없음(이유를 인라인으로 설명).
+
+또한 DSQL에서 문제가 되는 **안티패턴**을 표시합니다 — 예를 들어 `SELECT ... FOR UPDATE` 같은 잠금
+관용구는 DSQL의 낙관적 동시성 제어(OCC)에서 다르게 동작합니다.
+
+원본과 변환된 SQL을 나란히 보여줘 무엇이 바뀌었는지 정확히 확인할 수 있습니다.
+
+---
+
+## 9.2 타깃에서 테스트 (읽기 전용)
+
+변환된 **SELECT**는 **Test on target**으로 검증된 DSQL 타깃에서 `EXPLAIN`으로 계획을 세웁니다 — 쿼리를
+**실행하지 않고** 계획만 세우므로 행을 읽지 않습니다. **EXPLAIN ANALYZE** 토글을 켜면 실제로 (읽기
+전용) 쿼리를 실행해 실제 시간·행 수와 Aurora DSQL의 문장별 **DPU 비용 추정**을 캡처합니다.
+
+무엇을 테스트할 수 있고 없는지:
+
+- **SELECT** → `EXPLAIN`(계획만) 또는 `EXPLAIN ANALYZE`(읽기 전용 실행).
+- **DDL** → 트랜잭션 안에서 dry run 후 **롤백**(커밋하지 않음).
+- **DML**(INSERT/UPDATE/DELETE) → 타깃에 **절대 실행하지 않음**.
+
+판정에는 DSQL이 문을 받아들였는지, 아니라면 정확한 에러(SQLSTATE 포함), 캡처된 쿼리 플랜, 그리고
+ANALYZE일 때 DPU 비용이 표시됩니다.
+
+> **DSQL 플랜 읽기:** Aurora DSQL은 *분산* PostgreSQL 호환 엔진이라 플랜이 조금 다르게 읽힙니다 —
+> §9.4 참조.
+
+---
+
+## 9.3 AI DBA로 쿼리 튜닝
+
+**AI 보조가 켜져 있으면**(Connect 화면; 기본 꺼짐) **Tune with AI DBA** 버튼이 나타납니다 — 단,
+변환된 SELECT가 **Test on target을 통과한 뒤에만** 보입니다. AI가 추측이 아니라 근거 기반으로 조언하려면
+이 쿼리의 실제 실행 플랜이 필요하기 때문에, 먼저 테스트하는 것이 필수입니다. 테스트를 **EXPLAIN
+ANALYZE**로 돌려 **DPU baseline**을 캡처하면, 버튼에 현재 비용(예: *now ≈ 0.03 DPU*)이 표시되고 이후
+AI가 재작성이 얼마나 절약하는지 증명할 수 있습니다.
+
+버튼을 누르면 우측 공유 AI 채팅 드로어가 열리고, **이 쿼리의 실제 EXPLAIN 플랜과 DPU** + Aurora DSQL
+실행 모델에 근거해 AI가:
+
+- 재작성 쿼리를 코드 블록으로 제안하고,
+- **무엇을 바꿨고 왜 DSQL에서 더 저렴한지**(어떤 scan type/filter layer가 개선됐고, 왜 storage→compute로
+  넘어가는 바이트가 줄어드는지) 설명하며,
+- 쿼리의 **결과는 동일하게 유지**합니다 — 빠르게 만들려고 의미를 바꾸지 말라고 지시받습니다.
+
+DSQL에 맞지 않는 일반 PostgreSQL 튜닝 조언(`VACUUM`/`REINDEX`, fillfactor, 플래너 GUC, "`cost=`
+숫자를 낮춰라" 같은)은 명시적으로 배제됩니다.
+
+### 증명: 재작성 재테스트
+
+각 재작성 제안 아래에는 **Test rewrite on target** 액션이 있습니다. 도구가 답변에서 정확한 SELECT를
+추출해 타깃에서 `EXPLAIN ANALYZE`로 읽기 전용 재실행하고, 측정한 **개선 전/후 DPU**를 같은 채팅에
+되먹입니다 — 그래서 **AI가 실제 개선폭을 보고**합니다(개선이 없으면 솔직히 말합니다). 증거는 모델의
+설명이 아니라 실측 DPU입니다.
+
+> **advisory 전용.** 자동 적용되지 않습니다. 재작성을 편집기에 직접 복사해 Convert / Test를 다시
+> 돌리는 것이 human-review 게이트입니다. AI 보조는 opt-in이며 컨트롤 플레인에만 있고 데이터 경로에는
+> 절대 관여하지 않습니다.
+
+---
+
+## 9.4 DSQL 쿼리 튜닝이 PostgreSQL과 다른 이유
+
+Aurora DSQL은 와이어 프로토콜상 PostgreSQL 호환이지만 *분산* 엔진으로 쿼리를 실행하므로, 쿼리를
+효율적으로 만드는 방법이 몇 가지 달라집니다. AI DBA는 이 사실들에 근거하며, 직접 플랜을 읽을 때도
+유용합니다.
+
+- **기본 키가 곧 테이블입니다.** 모든 테이블은 기본 키로 정렬된 B-tree이며 별도 heap이 없습니다. 술어에
+  쓸 인덱스가 없는 테이블은 **Full Scan**(“Seq Scan”이 아님)으로 읽힙니다. 기본 키에 대한 범위/동등
+  필터는 물리적으로 순차 읽기라 본질적으로 저렴하므로, **기본 키 선택이 PostgreSQL보다 훨씬 중요합니다.**
+- **compute와 storage가 분리돼 있습니다.** storage에서 compute로 넘어오는 모든 행이 latency와 **DPU**
+  (Distributed Processing Unit — DSQL의 비용 단위, `EXPLAIN ANALYZE VERBOSE`에 표시; PostgreSQL의
+  `cost=` 숫자는 목표가 아님)를 소모합니다. **필터를 아래로 미는 것**이 핵심 지렛대입니다.
+- **3단계 필터, 좋은 것부터:** (1) *Index Condition* — 인덱스 키 컬럼에 대한 동등/범위 술어; (2)
+  *Storage Filter* — 비-키 컬럼을 인덱스 `INCLUDE`에 넣어 storage가 전송 전에 필터; (3) *Query
+  Processor Filter* — 상단 `Filter:` 줄로 나타나며, 필터되지 않은 데이터가 이미 네트워크를 건넌 상태
+  (최악). 술어를 3 → 2 → 1로 미세요.
+- **Scan type, 저렴한 순 마지막:** **Full Scan**(PK나 인덱스 추가) → **Index Scan**(`Storage Lookup`
+  노드는 커버링이 불완전하다는 뜻 — 빠진 컬럼을 `INCLUDE`에 추가) → **Index Only Scan**(이상적).
+
+AI DBA가 제안할 DSQL 적합 재작성: `SELECT *` 대신 필요한 컬럼만 투영; 선행 와일드카드 `LIKE '%x%'`
+회피(인덱스 사용 불가); 옵티마이저가 조인 너머로 추론 못 하는 **리던던트 조인 술어** 추가; `ORDER BY …
+LIMIT`에는 **CTE late materialization**; 인덱스를 커버링으로 만드는 `INCLUDE` 컬럼; 핫 파티션을 만드는
+단조 키(`AUTO_INCREMENT`, 타임스탬프)보다 무작위 분포 키(UUID) 선호.
+
+---
+
+## 9.5 다음으로
+
+- **데이터 경로 튜닝(병렬수):** [7장 — 성능과 튜닝](07-performance-and-tuning.md).
+- **결론과 컷오버:** [10장 — 결론](10-conclusion.md).
+- **자주 묻는 질문:** [11장 — 고객 FAQ](11-customer-faq.md).
+
+---
+
+**다음:** [10. 결론 →](10-conclusion.md)

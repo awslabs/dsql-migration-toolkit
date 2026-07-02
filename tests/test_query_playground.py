@@ -496,6 +496,32 @@ def _probe(outcome, *, dpu_total=None, plan="", analyzed=False, detail="ok", cod
     )
 
 
+def test_pretty_sql_multilines_and_falls_back_on_garbage() -> None:
+    from dsql_migrator.ui.query_playground import _pretty_sql
+
+    one_line = "SELECT a, b FROM t WHERE a >= 4 ORDER BY b DESC LIMIT 5"
+    pretty = _pretty_sql(one_line)
+    assert "\n" in pretty  # multi-lined for readability
+    assert "SELECT" in pretty and "FROM t" in pretty
+    # Never raises and never returns empty for non-empty input — this is display
+    # polish, so any weird text must round-trip safely (sqlglot is lenient and may
+    # reformat rather than raise; either way we must not blow up or drop content).
+    assert _pretty_sql("this is not sql ;;;").strip() != ""
+    assert _pretty_sql("") == ""
+
+
+def test_retest_turn_includes_pretty_tested_query() -> None:
+    # The turn should show the exact query it ran, pretty-printed in a ```sql block.
+    turn = _build_retest_turn(
+        _probe(ProbeOutcome.PASSED, dpu_total=0.03, plan="Index Only Scan", analyzed=True),
+        baseline_dpu=0.10,
+        rewrite_sql="SELECT id FROM orders WHERE id = 42",
+    )
+    assert "```sql" in turn
+    assert "The query I actually ran" in turn
+    assert "SELECT" in turn and "orders" in turn
+
+
 def test_retest_turn_reports_improvement_percentage() -> None:
     # A cheaper rewrite (0.03 vs baseline 0.10) -> CHEAPER + correct percentage, so
     # the AI can explain the win in-thread.

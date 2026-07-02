@@ -90,6 +90,13 @@ def build_chat_drawer(ui: object) -> Callable[..., None]:
             ".dsql-chat-md h2 { font-size: 1rem; }"
             ".dsql-chat-md h3, .dsql-chat-md h4, .dsql-chat-md h5, "
             ".dsql-chat-md h6 { font-size: 0.9rem; }"
+            # User bubbles render Markdown on a dark indigo background; give their
+            # code/plan blocks a light panel with dark text so SQL stays readable
+            # (default code styling would be white-on-indigo = invisible).
+            ".dsql-chat-user pre, .dsql-chat-user code { "
+            "background: rgba(255,255,255,0.95); color: #1e293b; "
+            "border-radius: 6px; padding: 1px 4px; }"
+            ".dsql-chat-user pre { padding: 8px 10px; margin: 4px 0; }"
         )
         with ui.card().classes(  # type: ignore[attr-defined]
             "full-height column no-wrap q-pa-none bg-gray-50"
@@ -175,9 +182,14 @@ def build_chat_drawer(ui: object) -> Callable[..., None]:
     def _user_bubble(text: str) -> None:
         with convo:  # type: ignore[attr-defined]
             with ui.row().classes("w-full justify-end"):  # type: ignore[attr-defined]
-                ui.label(text).classes(  # type: ignore[attr-defined]
+                # Render as Markdown (not a plain label) so fenced ```sql / plan
+                # code blocks in a turn — e.g. the re-test result the screen feeds
+                # back — show as readable monospace blocks instead of literal
+                # backticks. The white-on-indigo bubble styling is preserved; the
+                # dsql-chat-md rules keep long lines wrapped inside the bubble.
+                ui.markdown(text).classes(  # type: ignore[attr-defined]
                     "text-sm text-white bg-indigo-600 rounded-2xl rounded-tr-sm "
-                    "px-3 py-2"
+                    "px-3 py-2 dsql-chat-md dsql-chat-user"
                 ).style("max-width: 85%; overflow-wrap: anywhere")
 
     def _make_copy(state: dict, lock: "threading.Lock") -> Callable[[], object]:

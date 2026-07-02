@@ -97,7 +97,7 @@ The report is **exportable** so you can attach it to a cut-over decision.
 Once Validation reports a clean **MATCH** (or every difference is explained), the
 final workflow step — **Cut over** — appears in the UI with the runbook for
 switching your application from MySQL to DSQL. See the recommended end-to-end flow
-in the [Conclusion](09-conclusion.md) for the cut-over sequence (CDC-drain vs
+in the [Conclusion](10-conclusion.md) for the cut-over sequence (CDC-drain vs
 Full-Load freeze) and the rollback anchor.
 
 ---

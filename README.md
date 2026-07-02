@@ -17,7 +17,7 @@ migratability, automate what can be converted deterministically, and clearly
 surface the points that need human work.** Conversion is deterministic-first
 (`sqlglot`); the source database is always accessed read-only.
 
-> **Before you start, read the [Customer FAQ](docs/manual/en/10-customer-faq.md).**
+> **Before you start, read the [Customer FAQ](docs/manual/en/11-customer-faq.md).**
 > A heterogeneous MySQL → Aurora DSQL migration has more moving parts than a
 > version upgrade — the FAQ answers, up front, what to plan for: Full Load vs CDC,
 > the DSQL limitations your schema must fit, type mapping, how correctness is

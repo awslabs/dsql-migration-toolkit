@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어**_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.34
+
+### 추가 (Added)
+
+- **Query Playground의 AI DBA 쿼리 튜닝.** 변환된 `SELECT`가 "Test on target"을 통과하면, 새
+  **Tune with AI DBA** 액션으로 우측 AI 채팅 드로어가 열려 해당 쿼리를 Aurora DSQL에 맞게 효율적으로
+  재작성합니다. 재작성은 이 쿼리의 **실제 EXPLAIN 플랜과 DPU 비용**, 그리고 Aurora DSQL의 실행 모델(기본
+  키가 곧 테이블, 3단계 필터 푸시다운, `Full Scan` vs `Index`/`Index Only Scan`, 비용 단위인 DPU)에
+  근거합니다. 무엇을·왜 바꿨고 왜 DSQL에서 더 저렴한지 상세히 설명하며, DSQL에 맞지 않는 일반
+  PostgreSQL 튜닝 조언은 명시적으로 배제됩니다. 각 재작성 제안에는 **Test rewrite on target** 액션이
+  있어 타깃에서 읽기 전용으로 재실행하고, 개선 전/후 DPU를 같은 채팅에서 AI가 보고합니다. opt-in(AI는
+  기본 꺼짐), advisory 전용 — 자동 적용되지 않으며, 개선의 증거는 모델의 설명이 아니라 실측 DPU입니다.
+
 ## v0.1.33
 
 ### 수정 (Fixed)

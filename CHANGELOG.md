@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md)_
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.34
+
+### Added
+
+- **AI DBA query tuning in the Query Playground.** After a converted `SELECT`
+  passes "Test on target", a new **Tune with AI DBA** action opens the shared AI
+  chat drawer and rewrites the query for Aurora DSQL efficiency — grounded on the
+  query's REAL captured EXPLAIN plan and DPU cost, and on Aurora DSQL's own
+  execution model (the primary key *is* the table, filter pushdown through the
+  three filter layers, `Full Scan` vs. `Index`/`Index Only Scan`, and DPU as the
+  cost unit). It explains what it changed and why it is cheaper on DSQL, and is
+  explicitly steered away from vanilla-PostgreSQL tuning advice that does not
+  apply to DSQL. Each proposed rewrite has a **Test rewrite on target** action
+  that re-runs it read-only on the target and has the AI report the measured
+  before/after DPU improvement in the same chat. Opt-in (AI off by default),
+  advisory only — nothing is auto-applied, and the measured DPU (not the model's
+  prose) is the proof of improvement.
+
 ## v0.1.33
 
 ### Fixed

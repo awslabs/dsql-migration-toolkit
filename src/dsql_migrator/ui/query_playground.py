@@ -178,7 +178,43 @@ def extract_sql_from_reply(markdown: str) -> Optional[str]:
     return None
 
 
-def _build_retest_turn(probe: ExecutionProbe, baseline_dpu: Optional[float]) -> str:
+def _pretty_sql(sql: str) -> str:
+    """Pretty-print a SQL statement for readable display, best-effort.
+
+    The re-test turn is shown verbatim in the chat drawer, so a one-line rewritten
+    query reads much better multi-lined. Uses ``sqlglot`` (already a dependency)
+    with the PostgreSQL dialect (DSQL is PG-wire). Falls back to the original text
+    if parsing fails — never raises, since this is display polish, not correctness.
+    """
+    text = (sql or "").strip().rstrip(";")
+    if not text:
+        return text
+    try:
+        import sqlglot
+
+        formatted = sqlglot.transpile(
+            text, read="postgres", write="postgres", pretty=True
+        )
+        return formatted[0] if formatted else text
+    except Exception:  # noqa: BLE001 - display only; keep the original on any error
+        return text
+
+
+def _sql_block(sql: str) -> str:
+    """Wrap SQL in a fenced ```sql block (pretty-printed) for the chat markdown."""
+    return f"```sql\n{_pretty_sql(sql)}\n```"
+
+
+def _plan_block(plan: Optional[str]) -> str:
+    """Wrap an EXPLAIN plan in a plain fenced block, trimmed for the chat."""
+    return f"```\n{(plan or '').strip()[:2000]}\n```"
+
+
+def _build_retest_turn(
+    probe: ExecutionProbe,
+    baseline_dpu: Optional[float],
+    rewrite_sql: Optional[str] = None,
+) -> str:
     """Compose the follow-up chat turn that reports a rewrite's re-test result.
 
     The operator clicked "Test rewrite on target": we re-ran the AI's proposed
@@ -186,23 +222,26 @@ def _build_retest_turn(probe: ExecutionProbe, baseline_dpu: Optional[float]) -> 
     the deterministic outcome (did it run, its DPU, and the measured before/after
     delta vs the original's ``baseline_dpu``) back to the SAME assistant as a user
     turn, so the AI reports — in the drawer, in its own words — whether and by how
-    much the rewrite actually improved. Pure/testable: builds only the text.
+    much the rewrite actually improved. The tested query and the plan are rendered
+    in fenced (pretty-printed) code blocks so the drawer bubble is readable.
+    Pure/testable: builds only the text.
     """
+    tested = f"\n\nThe query I actually ran:\n{_sql_block(rewrite_sql)}" if rewrite_sql else ""
     if probe.outcome is ProbeOutcome.FAILED:
         detail = probe.detail + (
             f" (SQLSTATE {probe.error_code})" if probe.error_code else ""
         )
         return (
             "I re-tested your rewritten query on the Aurora DSQL target and it was "
-            f"REJECTED: {detail}\n\nExplain briefly why it failed and give a "
+            f"REJECTED: {detail}{tested}\n\nExplain briefly why it failed and give a "
             "corrected rewrite that still returns the same results."
         )
     new_dpu = probe.dpu.total if probe.dpu is not None else None
     if new_dpu is None:
         return (
             "I re-tested your rewritten query on the target and it ran, but no DPU "
-            "cost estimate was captured (the plan was EXPLAIN-only). Here is its "
-            f"query plan:\n\n```\n{(probe.plan or '').strip()[:2000]}\n```\n\n"
+            "cost estimate was captured (the plan was EXPLAIN-only)."
+            f"{tested}\n\nHere is its query plan:\n\n{_plan_block(probe.plan)}\n\n"
             "Briefly, does this plan confirm your rewrite is more efficient (scan "
             "type / filter layer), and is there anything more to improve?"
         )
@@ -212,7 +251,7 @@ def _build_retest_turn(probe: ExecutionProbe, baseline_dpu: Optional[float]) -> 
             f"Its measured cost is {new_dpu:.5f} DPU total. The original query was "
             "not measured with ANALYZE, so I don't have a baseline. Based on this "
             "plan and DPU, is the rewrite efficient, and what else could improve it?"
-            f"\n\nPlan:\n```\n{(probe.plan or '').strip()[:2000]}\n```"
+            f"{tested}\n\nPlan:\n{_plan_block(probe.plan)}"
         )
     delta = baseline_dpu - new_dpu
     pct = (delta / baseline_dpu * 100.0) if baseline_dpu else 0.0
@@ -223,11 +262,11 @@ def _build_retest_turn(probe: ExecutionProbe, baseline_dpu: Optional[float]) -> 
         "I re-tested your rewritten query on the Aurora DSQL target with EXPLAIN "
         f"ANALYZE. Measured cost: original ≈ {baseline_dpu:.5f} DPU vs rewrite ≈ "
         f"{new_dpu:.5f} DPU — the rewrite is {direction} "
-        f"({abs(delta):.5f} DPU, {abs(pct):.1f}%).\n\n"
+        f"({abs(delta):.5f} DPU, {abs(pct):.1f}%).{tested}\n\n"
         "Explain to me what this means: did your rewrite actually improve things, "
         "by how much, and why (point to the change in scan type / filter layer / "
-        "bytes moved)? If it did NOT improve, say so honestly and suggest the next "
-        f"step. Rewrite's plan:\n```\n{(probe.plan or '').strip()[:2000]}\n```"
+        f"bytes moved)? If it did NOT improve, say so honestly and suggest the next "
+        f"step. Rewrite's plan:\n{_plan_block(probe.plan)}"
     )
 
 
@@ -642,7 +681,9 @@ def build_query_playground_screen(
                             rewrite, StatementKind.SELECT, factory, analyze=True
                         )
                     )
-                    send(_build_retest_turn(rprobe, baseline_dpu))  # type: ignore[operator]
+                    send(  # type: ignore[operator]
+                        _build_retest_turn(rprobe, baseline_dpu, rewrite_sql=rewrite)
+                    )
 
                 sender["send"] = open_chat(
                     title="AI DBA — query tuning",

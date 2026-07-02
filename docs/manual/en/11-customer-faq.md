@@ -1,8 +1,8 @@
-# 10. Customer FAQ
+# 11. Customer FAQ
 
-_Language: **English** | [한국어](../ko/10-customer-faq.md)_
+_Language: **English** | [한국어](../ko/11-customer-faq.md)_
 
-> **Prev:** [9. Conclusion](09-conclusion.md)
+> **Prev:** [10. Conclusion](10-conclusion.md)
 
 Heterogeneous database migration raises a lot of questions — this chapter answers
 the ones customers ask most, about **Full Load**, **CDC**, **limitations**, and
@@ -65,7 +65,7 @@ pipeline runs in a single region/VPC. **Cross-region migration is not supported.
 CDC adds real moving parts (MSK, MSK Connect, a sink connector) and **costs money
 while deployed**. Use it only when you genuinely need continuous replication;
 otherwise Full Load alone is simpler and cheaper. See
-[Chapter 9 §9.1](09-conclusion.md#91-which-path-do-i-need).
+[Chapter 10 §10.1](10-conclusion.md#101-which-path-do-i-need).
 
 
 **Q6. Does the tool cut over my application for me?**
@@ -74,7 +74,7 @@ No. The tool **assesses, converts, loads, streams, and validates** — but *when
 and *how* you repoint your application is an operational decision only you can
 make. It gives you an evidence-backed go/no-go (Validation) and, for CDC, a gapless
 stream; you perform the cut-over using the runbook it shows
-([Chapter 9 §9.3](09-conclusion.md#93-the-cut-over-switching-your-application-to-dsql)).
+([Chapter 10 §10.3](10-conclusion.md#103-the-cut-over-switching-your-application-to-dsql)).
 
 ---
 
@@ -327,7 +327,7 @@ very end.
 (CDC path) Let CDC catch up → **freeze source writes** → wait for the final drain
 (lag → 0) → **re-run Validation** → cut over only on a clean MATCH → repoint the app
 and smoke-test → **tear the CDC pipeline down last**. Full details and the Full-Load-only
-variant are in [Chapter 9 §9.3](09-conclusion.md#93-the-cut-over-switching-your-application-to-dsql).
+variant are in [Chapter 10 §10.3](10-conclusion.md#103-the-cut-over-switching-your-application-to-dsql).
 
 
 **Q28. Can I roll back?**
@@ -413,8 +413,8 @@ fresh workflow — use **Start over** instead; it's instant and free.
 - **Plan your migration:** [Chapter 0 — Before you begin](00-before-you-begin.md).
 - **The enforced limits to design around:** [Chapter 6 — Limitations](06-limitations.md).
 - **Prove correctness:** [Chapter 5 — Validation](05-validation.md).
-- **Choose a path and cut over:** [Chapter 9 — Conclusion](09-conclusion.md).
+- **Choose a path and cut over:** [Chapter 10 — Conclusion](10-conclusion.md).
 
 ---
 
-**Prev:** [9. Conclusion →](09-conclusion.md)
+**Prev:** [10. Conclusion →](10-conclusion.md)

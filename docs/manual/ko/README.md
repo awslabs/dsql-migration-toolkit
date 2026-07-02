@@ -42,8 +42,9 @@ Data Migration은 **Full Load**(도구 자체의 벌크 로더)와, 선택적으
 | 6 | [한계](06-limitations.md) | 계획에 반드시 반영해야 하는 실제 제약(DSQL 제약, 단일 리전 CDC, 단일 태스크 컨트롤 플레인). |
 | 7 | [성능과 튜닝](07-performance-and-tuning.md) | 데이터 경로를 이렇게 설계한 이유(AWS 근거: OCC 재시도, 핫 파티션 PK, 트랜잭션 한도, 비동기 인덱스, IAM 토큰)와 Full Load / Validation / CDC 병렬수 튜닝 — 로컬 및 Fargate. |
 | 8 | [테스트 — DSQL 특성이 강제하는 시나리오](08-testing-and-verification.md) | 각 Aurora DSQL 특성이 *강제하는* 마이그레이션 테스트 시나리오(트랜잭션 한도, OCC, 1 MiB 값, IAM 토큰, 비동기 인덱스, FK 없음, 무손실 핸드오프, 드리프트)와 도구가 각각을 어떻게 행사하는지 — 오프라인 및 실제 AWS. |
-| 9 | [결론](09-conclusion.md) | 어떤 경로를 언제 쓸지, 권장 end-to-end 흐름, 다음 단계. |
-| 10 | [고객 FAQ](10-customer-faq.md) | 고객이 가장 많이 묻는 질문 — Full Load, CDC, 제약, 타입 매핑, 검증, 컷오버/롤백, 운영 — 을 도구의 실제 동작에 근거해 답하고 상세 장으로 연결. |
+| 9 | [쿼리 검증과 AI DBA](09-query-validation.md) | 선택적 Query Playground: MySQL 쿼리 하나를 Aurora DSQL로 변환하고, 타깃에서 읽기 전용으로 테스트(`EXPLAIN` / `EXPLAIN ANALYZE` + DPU 비용)하며, **AI DBA**가 DSQL에 맞게 효율적으로 재작성하고 재테스트로 개선을 증명. |
+| 10 | [결론](10-conclusion.md) | 어떤 경로를 언제 쓸지, 권장 end-to-end 흐름, 다음 단계. |
+| 11 | [고객 FAQ](11-customer-faq.md) | 고객이 가장 많이 묻는 질문 — Full Load, CDC, 제약, 타입 매핑, 검증, 컷오버/롤백, 운영 — 을 도구의 실제 동작에 근거해 답하고 상세 장으로 연결. |
 
 ## MySQL 사용자를 위한 Aurora DSQL 안내
 

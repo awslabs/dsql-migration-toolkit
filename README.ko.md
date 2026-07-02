@@ -17,7 +17,7 @@ Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 분산 데이터베이스
 변환은 먼저 규칙 기반 도구(`sqlglot`)로 처리하며, 소스 데이터베이스는 절대 수정하지 않고
 항상 읽기 전용으로만 접근합니다.
 
-> **시작하기 전에 [고객 FAQ](docs/manual/ko/10-customer-faq.md)를 꼭 읽어 보세요.**
+> **시작하기 전에 [고객 FAQ](docs/manual/ko/11-customer-faq.md)를 꼭 읽어 보세요.**
 > MySQL → Aurora DSQL 이기종 마이그레이션은 단순 버전 업그레이드보다 고려할 점이 많습니다 — FAQ는
 > 미리 알아 두어야 할 것들을 정리해 줍니다: Full Load와 CDC 중 무엇을 쓸지, 스키마가 맞춰야 하는 DSQL
 > 제약, 타입 매핑, 정확성 검증 방식, 컷오버/롤백, 그리고 비용·운영 고려사항까지. 먼저 읽어 두면

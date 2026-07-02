@@ -55,7 +55,7 @@ one-line "must know" plus a pointer to the chapter that covers it in depth.
       MSK Connect (and possibly a NAT gateway) that cost money until you tear them
       down. For a one-shot migration with a short freeze, **Full Load alone** is
       enough and provisions no streaming infrastructure. → [Chapter 4](04-cdc-and-dsql-constraints.md),
-      [§9.1](09-conclusion.md#91-which-path-do-i-need)
+      [§10.1](10-conclusion.md#101-which-path-do-i-need)
 
 - [ ] **CDC requires source binlog set up first (managed-MySQL way).** If you'll
       use CDC, the source must have **binary logging on in ROW format with a full

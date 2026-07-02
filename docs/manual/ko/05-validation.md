@@ -84,7 +84,7 @@ DSQL에는 외래 키가 없으므로, 선택적 **고아 검사**가 보존된(
 
 Validation이 깨끗한 **MATCH**(또는 모든 차이가 설명됨)를 보고하면, 마지막 워크플로 단계인 **Cut
 over**가 UI에 나타나며 애플리케이션을 MySQL에서 DSQL로 전환하는 런북을 제공합니다. 전환 순서
-(CDC drain vs Full Load freeze)와 롤백 앵커는 [결론](09-conclusion.md)의 권장 end-to-end 흐름을
+(CDC drain vs Full Load freeze)와 롤백 앵커는 [결론](10-conclusion.md)의 권장 end-to-end 흐름을
 참고하세요.
 
 ---

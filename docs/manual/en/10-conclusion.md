@@ -1,8 +1,8 @@
-# 9. Conclusion
+# 10. Conclusion
 
-_Language: **English** | [한국어](../ko/09-conclusion.md)_
+_Language: **English** | [한국어](../ko/10-conclusion.md)_
 
-> **Prev:** [8. Testing and verification](08-testing-and-verification.md)
+> **Prev:** [9. Query validation and the AI DBA](09-query-validation.md)
 
 You've now seen the whole journey: connect, plan, **evaluate**, **convert the
 schema**, **Full Load**, optionally **CDC**, **validate**, and **cut over**. This
@@ -11,7 +11,7 @@ cut-over runbook, and where to go next.
 
 ---
 
-## 9.1 Which path do I need?
+## 10.1 Which path do I need?
 
 | Your situation | Use |
 |---|---|
@@ -24,7 +24,7 @@ replication; otherwise Full Load alone is simpler and cheaper.
 
 ---
 
-## 9.2 A recommended end-to-end flow
+## 10.2 A recommended end-to-end flow
 
 1. **Connect** to source (read-only) and target (DSQL, IAM-token).
 2. **Migration plan** — decide only **whether this migration uses CDC (yes/no)**.
@@ -46,11 +46,11 @@ replication; otherwise Full Load alone is simpler and cheaper.
    quarantine, not-yet-converged CDC).
 7. **Cut over** — once Validation is a clean MATCH, switch your application to
    DSQL. This is the one step the tool does not perform for you; follow the
-   tailored runbook (§9.3 below).
+   tailored runbook (§10.3 below).
 
 ---
 
-## 9.3 The cut-over: switching your application to DSQL
+## 10.3 The cut-over: switching your application to DSQL
 
 "Cut over" is the final workflow step and the moment your application stops using
 MySQL and starts using Aurora DSQL. It is the one step the tool does **not** do for
@@ -101,7 +101,7 @@ reconciling them yourself first.
 
 ---
 
-## 9.4 Principles the tool follows (so you can trust the verdicts)
+## 10.4 Principles the tool follows (so you can trust the verdicts)
 
 - **Source is always read-only.** The tool never writes to your MySQL source.
 - **Loud over silent.** It refuses to corrupt data quietly — a value it can't
@@ -118,9 +118,9 @@ reconciling them yourself first.
 
 ---
 
-## 9.5 Where to go next
+## 10.5 Where to go next
 
-- **Common questions:** [Chapter 10 — Customer FAQ](10-customer-faq.md).
+- **Common questions:** [Chapter 11 — Customer FAQ](11-customer-faq.md).
 - **Run a migration:** start at [Chapter 1 — Set up](01-setup.md).
 - **Architecture & AWS services:** the [top-level README](../../../README.md).
 - **Deploying on AWS:** [`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.md).

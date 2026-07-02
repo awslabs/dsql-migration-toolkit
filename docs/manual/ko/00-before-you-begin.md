@@ -44,7 +44,7 @@ _언어: [English](../en/00-before-you-begin.md) | **한국어**_
       필요하며, MSK + MSK Connect(경우에 따라 NAT 게이트웨이)를 프로비저닝해 내릴 때까지 비용이 듭니다.
       짧은 동결을 허용하는 일회성 마이그레이션이라면 **Full Load만**으로 충분하고 스트리밍 인프라를
       프로비저닝하지 않습니다. → [4장](04-cdc-and-dsql-constraints.md),
-      [§9.1](09-conclusion.md#91-어떤-경로가-필요한가)
+      [§10.1](10-conclusion.md#101-어떤-경로가-필요한가)
 
 - [ ] **CDC는 소스 binlog를 먼저 설정해야 합니다(관리형 MySQL 방식).** CDC를 쓴다면 소스에
       **바이너리 로깅이 ROW 포맷·full row image로 켜져 있어야** 하고(`binlog_format=ROW`,
