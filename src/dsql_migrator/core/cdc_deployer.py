@@ -1432,16 +1432,39 @@ def run_cdc_delete(
             driver.log("Stack does not exist — nothing to delete.")
             driver.all_done()
             return
+        # A stack mid-operation cannot be cleanly deleted yet. If a delete is ALREADY
+        # underway (DELETE_IN_PROGRESS) just wait for it -- re-submitting is wasteful
+        # and CloudFormation ignores it. For any OTHER in-flight operation (a
+        # create/update/rollback still running) submitting a delete now races the
+        # live operation and CloudFormation may reject it, so stop with a clear
+        # wait-and-retry message instead of a blind, possibly-doomed submit. This
+        # mirrors the deploy path's IN_PROGRESS guard.
+        status = existing.stack_status
+        already_deleting = status == "DELETE_IN_PROGRESS"
+        # In-flight == any live CloudFormation operation (statuses end in
+        # ``_IN_PROGRESS``, e.g. CREATE_/UPDATE_/UPDATE_ROLLBACK_IN_PROGRESS).
+        in_flight = bool(status) and status.upper().endswith("_IN_PROGRESS")
+        if in_flight and not already_deleting:
+            raise CdcDeployError(
+                f"cdc-stack '{stack_name}' is '{status}' — an operation is still "
+                "running, so it cannot be deleted yet. Wait for it to finish, then "
+                "try Delete CDC infrastructure again. (If it stays stuck, delete the "
+                f"'{stack_name}' stack in the AWS CloudFormation console.)"
+            )
         driver.stage("discover_stack", "DONE")
 
         if driver.cancelled:
             return
 
-        # 2. submit delete
+        # 2. submit delete (skip the submit if a deletion is already in flight; just
+        #    fall through to wait for it to settle).
         driver.stage("submit_delete", "IN_PROGRESS")
         since = _now()
-        deployer.delete_stack(stack_name)
-        driver.log("Stack deletion submitted.")
+        if already_deleting:
+            driver.log("Stack deletion already in progress — waiting for it to finish.")
+        else:
+            deployer.delete_stack(stack_name)
+            driver.log("Stack deletion submitted.")
         driver.stage("submit_delete", "DONE")
 
         # 3. wait for the stack to disappear

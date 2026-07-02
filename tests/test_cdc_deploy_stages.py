@@ -600,6 +600,41 @@ def test_delete_absent_stack_is_noop_success() -> None:
     assert any("does not exist" in m for m in logs)
 
 
+def test_delete_inflight_stack_raises_wait_and_retry() -> None:
+    # A stack mid-operation (a create/update/rollback still running) cannot be
+    # deleted yet -- submitting a delete now races the live op. Stop with a clear
+    # wait-and-retry message and do NOT call delete_stack.
+    from dsql_migrator.core.cdc_deployer import CdcDeployError
+
+    handle = _FakeHandle()
+    _, on_log = _logs()
+    existing = CdcStackDiscovery("UPDATE_ROLLBACK_IN_PROGRESS", {}, False)
+    deployer = _FakeDeployer(existing=existing)
+    with pytest.raises(CdcDeployError) as ei:
+        run_cdc_delete(
+            handle, stack_name=STACK, deployer=deployer, on_log=on_log,
+            sleep=lambda _s: None,
+        )
+    assert "still" in str(ei.value) and "Wait" in str(ei.value)
+    assert "delete_stack" not in deployer.calls  # no blind, doomed submit
+
+
+def test_delete_when_already_deleting_skips_submit_and_waits() -> None:
+    # If a deletion is ALREADY underway (DELETE_IN_PROGRESS), don't re-submit --
+    # just wait for it to finish (it then vanishes -> success).
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    existing = CdcStackDiscovery("DELETE_IN_PROGRESS", {}, False)
+    deployer = _FakeDeployer(existing=existing, stack_statuses=("DELETE_IN_PROGRESS", None))
+    run_cdc_delete(
+        handle, stack_name=STACK, deployer=deployer, on_log=on_log,
+        sleep=lambda _s: None, delete_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    assert all(s == "DONE" for s in _statuses(handle).values())
+    assert "delete_stack" not in deployer.calls  # already in flight -> no re-submit
+    assert any("already in progress" in m for m in logs)
+
+
 def test_delete_cleans_up_source_secret_when_region_given(monkeypatch) -> None:
     handle = _FakeHandle()
     logs, on_log = _logs()
