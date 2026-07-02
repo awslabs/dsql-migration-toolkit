@@ -108,8 +108,21 @@ uv sync                                         # installs the playwright dev de
 ```
 
 The default "smoke" E2E needs no external infrastructure (it verifies the UI
-renders, navigates, and the Query Playground converts a query). Live-connection
-E2E steps are gated behind `RUN_E2E_CONNECTED=1` and a reachable source/target.
+renders, navigates, and the Query Playground converts a query). A **connected**
+tier drives the real flow against live infrastructure — verify source + target on
+the Connect screen, then Query validation → Test on target (`EXPLAIN ANALYZE` +
+DPU) and, when Amazon Bedrock is reachable, Tune with AI DBA → re-test → the
+per-code-block copy button:
+
+```bash
+RUN_E2E_CONNECTED=1 .venv/bin/python -m pytest -m e2e   # connected tier too
+```
+
+It is triple-gated so it never flakes on a missing dependency: `RUN_E2E_CONNECTED=1`
+opts in, then it skips cleanly unless the source MySQL + target Aurora DSQL are
+actually reachable (from `.env`), and the AI-tuning cases skip additionally unless
+Bedrock is reachable. Connection values come from the same `.env` the app prefills
+the Connect form from.
 
 ---
 

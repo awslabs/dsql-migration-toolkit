@@ -100,8 +100,19 @@ uv sync                                         # playwright dev 의존성 설�
 .venv/bin/python -m pytest -m e2e               # 브라우저 E2E 스위트 실행
 ```
 
-기본 "smoke" E2E는 외부 인프라가 필요 없습니다(UI 렌더·네비게이션·Query Playground 변환 검증). 실연결이
-필요한 E2E 단계는 `RUN_E2E_CONNECTED=1`과 도달 가능한 소스/타깃 뒤에 게이트됩니다.
+기본 "smoke" E2E는 외부 인프라가 필요 없습니다(UI 렌더·네비게이션·Query Playground 변환 검증).
+**connected** 티어는 라이브 인프라로 실제 흐름을 구동합니다 — Connect 화면에서 소스+타깃 검증 후 Query
+validation → Test on target(`EXPLAIN ANALYZE` + DPU), 그리고 Amazon Bedrock이 도달 가능하면 Tune with
+AI DBA → 재테스트 → 코드블록별 copy 버튼까지:
+
+```bash
+RUN_E2E_CONNECTED=1 .venv/bin/python -m pytest -m e2e   # connected 티어 포함
+```
+
+의존성이 없을 때 절대 깨지지 않도록 3중 게이트입니다: `RUN_E2E_CONNECTED=1`로 opt-in한 뒤, 소스 MySQL +
+타깃 Aurora DSQL이 실제로 도달 가능하지 않으면(`.env` 기준) 깔끔히 skip하고, AI 튜닝 케이스는 Bedrock이
+도달 가능하지 않으면 추가로 skip합니다. 연결값은 앱이 Connect 폼을 프리필할 때 쓰는 것과 동일한 `.env`에서
+옵니다.
 
 ---
 

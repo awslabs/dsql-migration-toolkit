@@ -211,3 +211,102 @@ connected = pytest.mark.skipif(
     reason="live-connection E2E; set RUN_E2E_CONNECTED=1 (needs a reachable "
     "source MySQL + target Aurora DSQL via .env)",
 )
+
+
+def _load_env_file() -> "dict[str, str]":
+    """Parse the repo-root .env the same way the app / scripts do (best-effort)."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    values: dict[str, str] = {}
+    try:
+        with open(os.path.join(root, ".env"), encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                values[k.strip()] = v.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    return values
+
+
+@pytest.fixture(scope="session")
+def live_infra() -> None:
+    """Skip the whole connected tier unless source MySQL + target DSQL are REACHABLE.
+
+    The ``connected`` marker only checks the opt-in env var; this fixture actually
+    opens both connections (read-only) so a connected run against a down DB skips
+    cleanly instead of failing mid-browser. Connection values come from the same
+    ``.env`` the app prefills the Connect form from — the single source of truth.
+    """
+    if not _connected_enabled():
+        pytest.skip("set RUN_E2E_CONNECTED=1 to run the connected E2E tier")
+    env = {**_load_env_file(), **os.environ}
+    if not env.get("DB_HOST") or not env.get("TARGET_ENDPOINT"):
+        pytest.skip("connected E2E needs DB_HOST + TARGET_ENDPOINT in .env")
+
+    import sys as _sys
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    _sys.path.insert(0, os.path.join(root, "src"))
+    # Source MySQL reachability (read-only SELECT 1).
+    try:
+        import pymysql
+
+        conn = pymysql.connect(
+            host=env["DB_HOST"], port=int(env.get("DB_PORT", "3306")),
+            user=env.get("DB_USER", "admin"),
+            password=env.get("DB_PASSWORD") or env.get("MYSQL_PWD") or "",
+            connect_timeout=10, read_timeout=15,
+        )
+        conn.close()
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"source MySQL unreachable: {type(exc).__name__}: {str(exc)[:100]}")
+    # Target DSQL reachability (IAM token + TLS SELECT 1).
+    try:
+        from dsql_migrator.core.models import TargetConnectionConfig
+        from dsql_migrator.core.target_connection import DsqlConnector
+
+        ep = env["TARGET_ENDPOINT"]
+        region = env.get("TARGET_REGION") or (
+            ep.split(".dsql.")[1].split(".on.aws")[0] if ".dsql." in ep else "us-east-1"
+        )
+        cfg = TargetConnectionConfig(
+            cluster_endpoint=ep, region=region,
+            database=env.get("TARGET_DATABASE", "postgres"),
+            username=env.get("TARGET_USERNAME", "admin"),
+        )
+        DsqlConnector(cfg, aws_profile=env.get("AWS_PROFILE")).connect().close()
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"target DSQL unreachable: {type(exc).__name__}: {str(exc)[:100]}")
+
+
+@pytest.fixture(scope="session")
+def bedrock_reachable() -> None:
+    """Skip the AI-tuning sub-tier unless Amazon Bedrock is actually reachable.
+
+    DB reachability does NOT imply Bedrock (missing bedrock:InvokeModel, blank/
+    wrong region, throttling), so the "Tune with AI DBA" tests gate on this in
+    ADDITION to ``live_infra``. Runs the app's own "Verify AI access" preflight.
+    """
+    env = {**_load_env_file(), **os.environ}
+    import sys as _sys
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    _sys.path.insert(0, os.path.join(root, "src"))
+    try:
+        from dsql_migrator.ui.ai_assist import build_ai_assist_config, run_verify_ai_access
+
+        cfg = build_ai_assist_config(
+            enabled=True,
+            model_id=env.get("BEDROCK_MODEL_ID"),
+            region=env.get("BEDROCK_REGION"),
+        )
+        result = run_verify_ai_access(cfg, env.get("AWS_PROFILE"))
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"Bedrock preflight errored: {type(exc).__name__}: {str(exc)[:100]}")
+    if not getattr(result, "ok", False):
+        pytest.skip(
+            f"Bedrock not reachable ({getattr(result, 'reason', '?')}); "
+            "AI-tuning E2E skipped"
+        )
