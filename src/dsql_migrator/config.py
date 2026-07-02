@@ -1,0 +1,469 @@
+"""Application configuration loading.
+
+This module loads runtime configuration from environment variables (and, for
+the NiceGUI UI, per-session state). It deliberately keeps credential values
+out of persisted/serialized configuration.
+
+Design principles enforced here:
+
+- Credential confidentiality (Property 7 / Requirement 9.2): credential values
+  are never stored in the serialized configuration and never appear in plaintext
+  in logs, reprs, or model dumps. They are represented either as opaque
+  references (``SecretRef``) or as masked values (``SecretValue``).
+- Environment-driven settings (Requirement 9.2): connection details and secrets
+  are not hardcoded; they are supplied at runtime via environment variables or
+  the UI session.
+
+Note: source/target connection configuration models (with their secret
+references) are defined in a later task. This module only establishes the
+configuration-loading scaffold and the secret-handling primitives.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from enum import Enum
+from typing import Mapping, Optional
+
+from pydantic import BaseModel, Field
+
+ENV_PREFIX = "DSQL_MIGRATOR_"
+
+
+class SecretSource(str, Enum):
+    """Where a secret value should be resolved from at runtime.
+
+    Resolution itself (e.g., calling Secrets Manager) is implemented in a later
+    task. This enum lets configuration describe *how* to obtain a secret without
+    ever embedding the secret value.
+    """
+
+    SECRETS_MANAGER = "SECRETS_MANAGER"
+    ENVIRONMENT = "ENVIRONMENT"
+    SESSION = "SESSION"
+
+
+class SecretRef(BaseModel):
+    """An opaque reference to a secret, never the secret value itself.
+
+    A ``SecretRef`` describes where a credential can be resolved from (for
+    example, a Secrets Manager ARN or an environment variable name) but does not
+    contain the plaintext credential. It is safe to log and serialize.
+    """
+
+    source: SecretSource
+    locator: str = Field(
+        ...,
+        description=(
+            "Pointer to the secret: a Secrets Manager ARN, an environment "
+            "variable name, or a session key. Not the secret value."
+        ),
+    )
+
+    def describe(self) -> str:
+        """Return a human-readable, log-safe description of this reference."""
+        return f"{self.source.value}:{self.locator}"
+
+
+class SecretValue:
+    """A wrapper around a resolved secret value that resists accidental disclosure.
+
+    The wrapped value is masked in ``repr``/``str`` output so it does not leak
+    through logging, f-strings, or exception messages. The real value must be
+    requested explicitly via :meth:`reveal`. Instances are intentionally not
+    Pydantic fields and are excluded from any serialized configuration.
+    """
+
+    __slots__ = ("_value",)
+
+    _MASK = "***"
+
+    def __init__(self, value: str) -> None:
+        if not isinstance(value, str):
+            raise TypeError("SecretValue requires a string value")
+        self._value = value
+
+    def reveal(self) -> str:
+        """Return the underlying plaintext secret. Call sites must be deliberate."""
+        return self._value
+
+    def __repr__(self) -> str:
+        return f"SecretValue('{self._MASK}')"
+
+    def __str__(self) -> str:
+        return self._MASK
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, SecretValue):
+            return self._value == other._value
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self._value)
+
+    def __bool__(self) -> bool:
+        return bool(self._value)
+
+
+class AppConfig(BaseModel):
+    """Top-level application configuration.
+
+    Contains only non-secret runtime settings. Credentials are resolved on demand
+    through ``SecretRef``/``SecretValue`` and are never stored on this model, so
+    ``AppConfig`` is always safe to serialize and log.
+    """
+
+    model_config = {"frozen": True}
+
+    app_host: str = Field(
+        default="127.0.0.1",
+        description="Host/interface the NiceGUI UI binds to.",
+    )
+    app_port: int = Field(
+        default=8080,
+        ge=1,
+        le=65535,
+        description="Port the NiceGUI UI listens on.",
+    )
+    aws_region: Optional[str] = Field(
+        default=None,
+        description="AWS region used for boto3 clients (e.g., DSQL token generation).",
+    )
+    aws_profile: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional single global AWS named profile applied to ALL AWS clients "
+            "(DSQL token generation, Secrets Manager, Bedrock-runtime). Non-secret: "
+            "only the profile NAME is stored, so it is safe to persist and log "
+            "(consistent with Property 7). When None, the standard AWS credential "
+            "chain (default chain + AWS_PROFILE) is used. Config key: "
+            "DSQL_MIGRATOR_AWS_PROFILE."
+        ),
+    )
+    job_state_path: str = Field(
+        default="job_state.sqlite",
+        description="Path to the local job-state store used for resumable jobs.",
+    )
+    activity_log_path: str = Field(
+        default="migration_activity.log",
+        description=(
+            "Path to the structured activity log file. Each migration event "
+            "(connection test, assessment, per-object schema apply, per-table "
+            "Full Load outcome, CDC control-plane action) is appended as one "
+            "UTC-timestamped JSON line, downloadable from the UI. Config key: "
+            "DSQL_MIGRATOR_ACTIVITY_LOG_PATH."
+        ),
+    )
+    session_state_path: str = Field(
+        default="session_state.sqlite",
+        description=(
+            "Path to the local per-session state store. Persists each session's "
+            "non-secret workbench state (workflow progress, evaluation result, "
+            "generated objects, migration job linkage) so a reconnecting browser "
+            "resumes where it left off after an app restart. Config key: "
+            "DSQL_MIGRATOR_SESSION_STATE_PATH."
+        ),
+    )
+    staging_bucket: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional S3 bucket for Full Load staging. When set, large tables are "
+            "exported to this bucket via a streaming multipart upload and loaded "
+            "from the s3:// URI, so a whole-table CSV never lands on the "
+            "container's ephemeral disk. When None, a bounded local temp CSV is "
+            "used (local dev / small tables only). Config key: "
+            "DSQL_MIGRATOR_STAGING_BUCKET."
+        ),
+    )
+    cdc_deploy_role_arn: Optional[str] = Field(
+        default=None,
+        description=(
+            "ARN of the dedicated CDC deploy role the app assumes (sts:AssumeRole) "
+            "before any cdc-stack CloudFormation/MSK/IAM operation, so the long-"
+            "running app's task role does not hold those broad privileges. When "
+            "None (local dev / admin creds), the deployer uses the shared profile "
+            "session directly. Only the non-secret ARN is stored. Config key: "
+            "DSQL_MIGRATOR_CDC_DEPLOY_ROLE_ARN."
+        ),
+    )
+    cdc_secret_kms_key_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional customer-managed KMS key id/ARN/alias used to encrypt the "
+            "tool-managed CDC source-credentials secret. When None, the secret is "
+            "encrypted with the account's default aws/secretsmanager AWS-managed "
+            "key. Set a CMK for stricter key-access control / auditing of the "
+            "production database credentials. Config key: "
+            "DSQL_MIGRATOR_CDC_SECRET_KMS_KEY_ID."
+        ),
+    )
+    log_level: str = Field(
+        default="INFO",
+        description="Logging level for the application.",
+    )
+    validate_row_diff_sample_size: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Dev-only: when > 0, Validation (Step 4) samples up to this many "
+            "diverging primary keys for each table that does NOT match, naming "
+            "WHICH rows differ (missing / extra / value-mismatch). Bounded "
+            "(ORDER BY pk LIMIT N), runs only for mismatched tables at validation "
+            "time, never on the migration hot path, and logs PK + checksum tokens "
+            "only -- never row values (Property 7). 0 (default) disables it. "
+            "Config key: DSQL_MIGRATOR_VALIDATE_ROW_DIFF_SAMPLE_SIZE."
+        ),
+    )
+    validate_max_workers: int = Field(
+        default=4,
+        ge=1,
+        le=32,
+        description=(
+            "Validation (Step 4) table-level parallelism: tables are compared "
+            "concurrently across this many workers, each on its own read-only "
+            "consistent-snapshot source connection + target connection. Cuts a "
+            "large multi-table run's wall clock from the sum of per-table scans "
+            "toward the slowest single table. 1 = sequential (historical "
+            "behavior). Bounded (<=32) to protect the source from too many "
+            "concurrent scans. Config key: DSQL_MIGRATOR_VALIDATE_MAX_WORKERS."
+        ),
+    )
+    full_load_table_parallelism: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description=(
+            "Full Load (Step 3) table-level parallelism: how many tables load "
+            "concurrently. The total concurrent DSQL connections is roughly "
+            "full_load_table_parallelism x full_load_batch_parallelism, so raise "
+            "both together with care and keep the product within DSQL's per-cluster "
+            "connection quota. Bounded (<=16). Config key: "
+            "DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM."
+        ),
+    )
+    full_load_batch_parallelism: int = Field(
+        default=8,
+        ge=1,
+        le=32,
+        description=(
+            "Full Load per-table batch parallelism: how many batched "
+            "INSERT ... ON CONFLICT statements are in flight at once for a single "
+            "table, each on its own pooled DSQL connection. Higher values raise "
+            "throughput but also the optimistic-concurrency (40001) collision rate "
+            "on hot key ranges; keep table x batch parallelism within the cluster "
+            "connection quota. Bounded (<=32). Config key: "
+            "DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM."
+        ),
+    )
+    full_load_batch_rows: int = Field(
+        default=2000,
+        ge=1,
+        le=3000,
+        description=(
+            "Full Load rows per batched write. Hard-capped at 3000 = DSQL's "
+            "per-transaction row limit; the effective size is additionally clamped "
+            "per table to fit DSQL's bind-parameter and per-write-transaction byte "
+            "limits. Config key: DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS."
+        ),
+    )
+    activity_log_to_stdout: bool = Field(
+        default=False,
+        description=(
+            "When true, also emit each activity-log event to stdout as a JSON "
+            "line in addition to the rotating file. On ECS the container's "
+            "awslogs driver forwards stdout to CloudWatch Logs, giving a "
+            "durable, queryable copy of the audit trail that survives task "
+            "replacement (the rotating file lives on ephemeral storage). "
+            "Off by default. Config key: DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT."
+        ),
+    )
+
+
+def _read(env: Mapping[str, str], name: str) -> Optional[str]:
+    """Read a prefixed environment variable, returning None when unset/blank."""
+    raw = env.get(f"{ENV_PREFIX}{name}")
+    if raw is None:
+        return None
+    raw = raw.strip()
+    return raw or None
+
+
+def load_config(env: Optional[Mapping[str, str]] = None) -> AppConfig:
+    """Load :class:`AppConfig` from environment variables.
+
+    Environment variables are read with the ``DSQL_MIGRATOR_`` prefix, e.g.
+    ``DSQL_MIGRATOR_APP_PORT``. Unset values fall back to model defaults. No
+    credential values are read into the returned configuration.
+    """
+    source = os.environ if env is None else env
+
+    values: dict[str, object] = {}
+    if (app_host := _read(source, "APP_HOST")) is not None:
+        values["app_host"] = app_host
+    if (app_port := _read(source, "APP_PORT")) is not None:
+        values["app_port"] = int(app_port)
+    if (aws_region := _read(source, "AWS_REGION")) is not None:
+        values["aws_region"] = aws_region
+    if (aws_profile := _read(source, "AWS_PROFILE")) is not None:
+        values["aws_profile"] = aws_profile
+    if (job_state_path := _read(source, "JOB_STATE_PATH")) is not None:
+        values["job_state_path"] = job_state_path
+    if (activity_log_path := _read(source, "ACTIVITY_LOG_PATH")) is not None:
+        values["activity_log_path"] = activity_log_path
+    if (session_state_path := _read(source, "SESSION_STATE_PATH")) is not None:
+        values["session_state_path"] = session_state_path
+    if (staging_bucket := _read(source, "STAGING_BUCKET")) is not None:
+        values["staging_bucket"] = staging_bucket
+    if (cdc_deploy_role_arn := _read(source, "CDC_DEPLOY_ROLE_ARN")) is not None:
+        values["cdc_deploy_role_arn"] = cdc_deploy_role_arn
+    if (cdc_secret_kms := _read(source, "CDC_SECRET_KMS_KEY_ID")) is not None:
+        values["cdc_secret_kms_key_id"] = cdc_secret_kms
+    if (log_level := _read(source, "LOG_LEVEL")) is not None:
+        values["log_level"] = log_level.upper()
+    if (row_diff := _read(source, "VALIDATE_ROW_DIFF_SAMPLE_SIZE")) is not None:
+        values["validate_row_diff_sample_size"] = int(row_diff)
+    if (max_workers := _read(source, "VALIDATE_MAX_WORKERS")) is not None:
+        values["validate_max_workers"] = int(max_workers)
+    if (fl_table_par := _read(source, "FULL_LOAD_TABLE_PARALLELISM")) is not None:
+        values["full_load_table_parallelism"] = int(fl_table_par)
+    if (fl_batch_par := _read(source, "FULL_LOAD_BATCH_PARALLELISM")) is not None:
+        values["full_load_batch_parallelism"] = int(fl_batch_par)
+    if (fl_batch_rows := _read(source, "FULL_LOAD_BATCH_ROWS")) is not None:
+        values["full_load_batch_rows"] = int(fl_batch_rows)
+    if (to_stdout := _read(source, "ACTIVITY_LOG_STDOUT")) is not None:
+        # Accept the common truthy spellings; anything else is treated as false.
+        values["activity_log_to_stdout"] = to_stdout.lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    return AppConfig(**values)
+
+
+@dataclass(frozen=True)
+class ConnectDefaults:
+    """Optional, dev-only prefill values for the Connect screen.
+
+    These populate the Connect form so a developer does not have to retype
+    connection details every session. They are read from the local (gitignored)
+    ``.env`` / environment and are never persisted by the app: the source
+    password is held only as a masked :class:`SecretValue` and, like all
+    credentials, stays in process memory (Property 7). All fields are optional;
+    an unset value leaves the corresponding form field at its normal blank /
+    default state.
+    """
+
+    source_host: Optional[str] = None
+    source_port: Optional[int] = None
+    source_database: Optional[str] = None
+    source_username: Optional[str] = None
+    source_password: Optional[SecretValue] = None
+    target_endpoint: Optional[str] = None
+    target_region: Optional[str] = None
+    target_database: Optional[str] = None
+    target_username: Optional[str] = None
+    bedrock_model_id: Optional[str] = None
+    bedrock_region: Optional[str] = None
+
+
+def read_env_file(path: str) -> dict[str, str]:
+    """Parse a simple ``KEY=VALUE`` ``.env`` file into a dict.
+
+    Comment lines (``#``) and blank lines are ignored. This is a best-effort,
+    dependency-free reader for local development: a missing or unreadable file
+    yields an empty dict rather than raising.
+    """
+    values: dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                values[key.strip()] = value.strip()
+    except OSError:
+        return {}
+    return values
+
+
+def _read_plain(env: Mapping[str, str], name: str) -> Optional[str]:
+    """Read an unprefixed env var, returning None when unset/blank."""
+    raw = env.get(name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    return raw or None
+
+
+def load_connect_defaults(
+    env: Optional[Mapping[str, str]] = None,
+) -> ConnectDefaults:
+    """Load optional Connect prefill defaults from the environment (dev only).
+
+    Source fields reuse the existing ``DB_*`` variables (the same source MySQL
+    the seed script targets), so a developer's current ``.env`` prefills the
+    source with no extra setup. The source database name (``DB_NAME``) is
+    intentionally NOT prefilled, since a specific schema is selected later in the
+    workflow. Target fields use ``TARGET_*`` variables and the AI-assist model id
+    uses ``BEDROCK_MODEL_ID`` / ``BEDROCK_REGION``. Every value is optional; the
+    source password is wrapped in :class:`SecretValue` so it is never logged in
+    plaintext (Property 7).
+    """
+    source = os.environ if env is None else env
+    port_raw = _read_plain(source, "DB_PORT")
+    password_raw = _read_plain(source, "DB_PASSWORD")
+    return ConnectDefaults(
+        source_host=_read_plain(source, "DB_HOST"),
+        source_port=int(port_raw) if port_raw and port_raw.isdigit() else None,
+        source_username=_read_plain(source, "DB_USER"),
+        source_password=SecretValue(password_raw) if password_raw else None,
+        target_endpoint=_read_plain(source, "TARGET_ENDPOINT"),
+        target_region=_read_plain(source, "TARGET_REGION"),
+        target_database=_read_plain(source, "TARGET_DATABASE"),
+        target_username=_read_plain(source, "TARGET_USERNAME"),
+        bedrock_model_id=_read_plain(source, "BEDROCK_MODEL_ID"),
+        bedrock_region=_read_plain(source, "BEDROCK_REGION"),
+    )
+
+
+def resolve_secret(
+    ref: SecretRef,
+    env: Optional[Mapping[str, str]] = None,
+) -> SecretValue:
+    """Resolve a :class:`SecretRef` into a masked :class:`SecretValue`.
+
+    Only environment-variable resolution is implemented at this scaffolding
+    stage; Secrets Manager and session resolution are completed in later tasks.
+    The resolved value is wrapped in :class:`SecretValue` so it cannot be logged
+    in plaintext, and it is never written back into :class:`AppConfig`.
+    """
+    if ref.source is SecretSource.ENVIRONMENT:
+        source = os.environ if env is None else env
+        raw = source.get(ref.locator)
+        if raw is None:
+            raise KeyError(
+                f"environment variable for secret '{ref.describe()}' is not set"
+            )
+        return SecretValue(raw)
+
+    raise NotImplementedError(
+        f"secret resolution for source '{ref.source.value}' is not implemented yet"
+    )
+
+
+__all__ = [
+    "ENV_PREFIX",
+    "SecretSource",
+    "SecretRef",
+    "SecretValue",
+    "AppConfig",
+    "load_config",
+    "ConnectDefaults",
+    "read_env_file",
+    "load_connect_defaults",
+    "resolve_secret",
+]

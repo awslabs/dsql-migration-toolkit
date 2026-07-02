@@ -1,0 +1,174 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Cloud build infrastructure for the MySQL -> Aurora DSQL migration tool image
+  (no local Docker required). Provisions an Amazon ECR repository, an S3 bucket
+  for the build source, and an AWS CodeBuild project (privileged mode) with a
+  least-privilege service role that builds deploy/Dockerfile and pushes the image
+  to ECR. Deploy this once; then run deploy/build_in_codebuild.sh to upload the
+  source and start a build. The resulting image URI is used as the app-stack's
+  ContainerImageUri.
+
+Parameters:
+  EcrRepoName:
+    Type: String
+    Default: mysql-dsql-migrator
+    Description: ECR repository name for the app image.
+
+  ProjectName:
+    Type: String
+    Default: mysql-dsql-migrator-build
+    Description: CodeBuild project name.
+
+Resources:
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName:
+        Ref: EcrRepoName
+      # Allow stack deletion to remove the repo even if it still holds images.
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-source
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}*
+        - PolicyName: ecr-push
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # GetAuthorizationToken is account-wide by design (no resource scope).
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              # ECR Public auth for pulling base images (avoids Docker Hub limits)
+              # AND for publishing the app image to ECR Public (the default image
+              # source customers pull from). GetAuthorizationToken / bearer token
+              # are account-wide by API design (no resource scope).
+              - Effect: Allow
+                Action:
+                  - ecr-public:GetAuthorizationToken
+                  - sts:GetServiceBearerToken
+                Resource: "*"
+              # Publish layers/manifests to ECR Public repositories (release path).
+              - Effect: Allow
+                Action:
+                  - ecr-public:BatchCheckLayerAvailability
+                  - ecr-public:InitiateLayerUpload
+                  - ecr-public:UploadLayerPart
+                  - ecr-public:CompleteLayerUpload
+                  - ecr-public:PutImage
+                Resource: "*"
+              # Push/pull layers scoped to this repository only.
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                Resource:
+                  Fn::GetAtt: [EcrRepository, Arn]
+        - PolicyName: read-source
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  Fn::Sub: ${SourceBucket.Arn}/*
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource:
+                  Fn::GetAtt: [SourceBucket, Arn]
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name:
+        Ref: ProjectName
+      ServiceRole:
+        Fn::GetAtt: [CodeBuildServiceRole, Arn]
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: S3
+        Location:
+          Fn::Sub: ${SourceBucket}/source.zip
+        BuildSpec: deploy/buildspec.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        # Privileged mode is required to run the Docker daemon for image builds.
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ACCOUNT_ID
+            Value:
+              Ref: AWS::AccountId
+          - Name: ECR_REPO
+            Value:
+              Ref: EcrRepoName
+          - Name: IMAGE_TAG
+            Value: latest
+      TimeoutInMinutes: 30
+
+Outputs:
+  EcrRepositoryUri:
+    Description: ECR repository URI; append :TAG for ContainerImageUri.
+    Value:
+      Fn::GetAtt: [EcrRepository, RepositoryUri]
+
+  SourceBucketName:
+    Description: S3 bucket the build source (source.zip) is uploaded to.
+    Value:
+      Ref: SourceBucket
+
+  ProjectName:
+    Description: CodeBuild project name.
+    Value:
+      Ref: BuildProject

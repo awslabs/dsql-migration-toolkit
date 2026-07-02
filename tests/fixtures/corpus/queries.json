@@ -1,0 +1,8 @@
+[
+  "INSERT INTO `users` (`id`, `email`) VALUES (1, 'a@example.com') ON DUPLICATE KEY UPDATE `email` = VALUES(`email`)",
+  "SELECT `id`, `email` FROM `users` WHERE `id` = 42 FOR UPDATE",
+  "SELECT u.`id` FROM `users` AS u JOIN `orders` AS o ON o.`user_id` = u.`id` WHERE u.`id` = 7 FOR UPDATE",
+  "SELECT `id` FROM `orders` WHERE `total` > 100 FOR UPDATE",
+  "SELECT IFNULL(`email`, 'n/a') AS email, CONCAT(`status`, '!') AS tag FROM `users` LIMIT 10, 5",
+  "SELECT `id`, `total` FROM `orders` ORDER BY `placed_at` DESC LIMIT 20"
+]

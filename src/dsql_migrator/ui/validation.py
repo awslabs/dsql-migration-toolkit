@@ -1,0 +1,2991 @@
+"""Step 4 (Validation) screen of the four-step migration workflow.
+
+The Validation screen drives the consistency check the design maps to this step
+(design.md "6. Validator"). From the source inventory produced by Step 1
+(Evaluation), the configured source/target connections, and the export watermark
+persisted by Step 3 (Data Migration), it:
+
+1. runs validation (Requirement 8.2),
+2. displays the consistency/validation report -- per-table row-count (and, in
+   CHECKSUM mode, checksum) matches and mismatches, the overall verdict, and any
+   orphan findings (Requirement 6.4) -- together with the drift report: the data
+   is compared as-of the watermark consistency point, and the current source
+   GTID is compared to the watermark's GTID to surface changes that occurred on
+   the source since the snapshot (Requirement 6.5 / Property 11), and
+3. lets the user export (download) the validation report as JSON or text
+   (Requirement 8.4).
+
+Because validation can be long-running (per-table counts/checksums against both
+engines), the run executes on a background job via
+:class:`~dsql_migrator.core.job_manager.JobManager` so the NiceGUI event loop is
+never blocked (Requirement 9.3); the screen polls the job with a ``ui.timer`` and
+updates the Validation step status in the per-session
+:class:`~dsql_migrator.core.models.WorkflowState` (NOT_STARTED -> IN_PROGRESS ->
+DONE/FAILED) through the workflow helpers.
+
+Engine wiring. The actual comparison is the implemented Task 9
+:class:`~dsql_migrator.core.validator.Validator`. It is reached through a small,
+injectable factory seam so the run orchestration and the UI can be unit tested
+with a fake validator (no real MySQL / DSQL). The export watermark is read
+straight from the Step 3 migration job snapshot, so validation always compares
+as-of the exact consistency point the data was exported at (Property 11).
+
+As with the sibling step screens, the run orchestration, report assembly /
+serialization, and drift/as-of presentation below are independent of NiceGUI so
+they can be unit tested directly; only :func:`build_validation_screen` and its
+render helpers touch NiceGUI.
+"""
+
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Callable, Optional, Protocol, Sequence
+
+from dsql_migrator.config import SecretValue, load_config
+from dsql_migrator.core.assessment_strategist import AssessmentStrategist
+from dsql_migrator.core.job_manager import JobManager, JobNotFoundError
+from dsql_migrator.core.models import (
+    AiAssistConfig,
+    DriftReport,
+    SourceConnectionConfig,
+    SourceInventory,
+    StepStatus,
+    TableDef,
+    TableSelection,
+    TableValidationResult,
+    TargetConnectionConfig,
+    ValidationMode,
+    ValidationReport,
+    Watermark,
+)
+from dsql_migrator.core.table_selection import TableSelectionError, TableSelector
+from dsql_migrator.core.validator import ValidationCancelled, Validator
+from dsql_migrator.core.validator import export_report as export_validation_report
+from dsql_migrator.ui.ai_chat_drawer import build_chat_drawer
+from dsql_migrator.ui.connect import make_source_engine_factory
+from dsql_migrator.ui.data_migration import DataMigrationStore, format_duration
+from dsql_migrator.ui.design import (
+    badge_classes,
+    chip_group_quasar_color,
+    chip_group_text_class,
+    inline_hint,
+    render_notice,
+    section_header,
+)
+
+# Builds the AI strategist for on-demand validation-mismatch guidance (the AI
+# chat drawer). Shares the one global AWS profile / credential context; the
+# Bedrock client is built lazily, so constructing it performs no network call.
+StrategistFactory = Callable[[AiAssistConfig, Optional[str]], AssessmentStrategist]
+
+
+def _default_strategist_factory(
+    config: AiAssistConfig, aws_profile: Optional[str]
+) -> AssessmentStrategist:
+    """Build the default Bedrock-backed strategist for the validation AI drawer."""
+    return AssessmentStrategist(config, aws_profile=aws_profile)
+from dsql_migrator.ui.evaluation import EvaluationStore
+from dsql_migrator.ui.session import SessionStore
+from dsql_migrator.ui.workflow import (
+    WorkflowStep,
+    _dev_unlock_steps,
+    get_status,
+    with_status,
+)
+
+# Text shown when a drift coordinate (GTID) could not be captured.
+_UNAVAILABLE = "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Validator seam (Protocol keeps run orchestration testable with fakes)
+# ---------------------------------------------------------------------------
+
+
+class _ValidationRunner(Protocol):
+    """Minimal contract used by :func:`run_validation` (read-only comparison)."""
+
+    def validate(
+        self,
+        source: SourceConnectionConfig,
+        target: TargetConnectionConfig,
+        tables: list[TableDef],
+        mode: ValidationMode = ...,
+        *,
+        watermark: Optional[Watermark] = ...,
+        check_orphans: bool = ...,
+        reconcile: bool = ...,
+        should_cancel: Optional[Callable[[], bool]] = ...,
+    ) -> ValidationReport: ...
+
+
+# ---------------------------------------------------------------------------
+# Run orchestration (NiceGUI-agnostic)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ValidationInputs:
+    """Everything needed to run a validation for one session.
+
+    ``inventory`` is the Step 1 (Evaluation) inventory, so the source schema is
+    not re-introspected. ``watermark`` is the Step 3 (Data Migration) export
+    watermark: when present, per-table source counts are taken as-of that
+    consistency point and drift since the snapshot is reported (Property 11);
+    when ``None``, validation runs against the live source and drift is not
+    available.
+    """
+
+    source_config: SourceConnectionConfig
+    source_password: Optional[SecretValue]
+    target_config: TargetConnectionConfig
+    inventory: SourceInventory
+    mode: ValidationMode = ValidationMode.ROW_COUNT
+    check_orphans: bool = False
+    watermark: Optional[Watermark] = None
+    # Full PK-set reconciliation (the pre-cut-over "no mismatched records" check):
+    # stream every PK from both sides and report the exact missing/extra rows.
+    # Defaults on -- Step 5 exists to verify cut-over readiness (Usability-first:
+    # infer the thorough check rather than make the user opt in).
+    reconcile: bool = True
+    # Fast pre-cut-over sweep: run the expensive checksum/reconciliation only for
+    # tables whose row counts differ. On a healthy migration (most tables match)
+    # this skips the per-row scans on the tables that need them least. Off by
+    # default so the thorough check stays the default; a count-matched table is
+    # then reported as verified-by-count (deep checks not run), never a false match.
+    deep_only_on_count_mismatch: bool = False
+
+
+# Builds a :class:`_ValidationRunner` bound to the run's inputs.
+ValidatorFactory = Callable[[ValidationInputs], _ValidationRunner]
+
+
+def _default_validator_factory(inputs: ValidationInputs) -> _ValidationRunner:
+    """Build the default :class:`Validator` for ``inputs``.
+
+    The source is reached through the read-only-guarded engine factory with the
+    in-memory password injected (Property 1 / Property 7); the target uses the
+    default IAM-authenticated DSQL connector. The dev-only row-level diff sample
+    size is read from config (default 0 == off), so a developer can enable it via
+    ``DSQL_MIGRATOR_VALIDATE_ROW_DIFF_SAMPLE_SIZE`` without any code change.
+    """
+    return Validator(
+        source_engine_factory=make_source_engine_factory(inputs.source_password),
+        row_diff_sample_size=load_config().validate_row_diff_sample_size,
+    )
+
+
+def run_validation(
+    inputs: ValidationInputs,
+    *,
+    validator_factory: ValidatorFactory = _default_validator_factory,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    on_progress: Optional[Callable[[str, int, int], None]] = None,
+    max_workers: Optional[int] = None,
+    deep_only_on_count_mismatch: bool = False,
+) -> ValidationReport:
+    """Compare the migrated target against the source and return a report.
+
+    Per-table row counts are compared (and, in CHECKSUM mode, checksums); when a
+    watermark is supplied the comparison is as-of the snapshot and drift since
+    the snapshot is reported (Requirement 6.5 / Property 11). The validator is
+    injectable so this orchestration can be unit tested without a database.
+    ``should_cancel`` (polled between tables) lets a caller cooperatively stop a
+    long run; the validator raises
+    :class:`~dsql_migrator.core.validator.ValidationCancelled` rather than
+    returning a partial report. ``on_progress(table, index, total)`` (when given)
+    is invoked before each table so a caller can surface live progress.
+    ``max_workers`` bounds table-level parallelism; ``None`` (default) reads the
+    configured ``validate_max_workers`` so the whole app shares one tuning knob.
+    ``deep_only_on_count_mismatch`` runs the expensive checksum/reconciliation only
+    for tables whose row counts differ (a fast pre-cut-over sweep).
+    """
+    workers = max_workers if max_workers is not None else load_config().validate_max_workers
+    validator = validator_factory(inputs)
+    return validator.validate(
+        inputs.source_config,
+        inputs.target_config,
+        list(inputs.inventory.tables),
+        inputs.mode,
+        watermark=inputs.watermark,
+        check_orphans=inputs.check_orphans,
+        reconcile=inputs.reconcile,
+        should_cancel=should_cancel,
+        on_progress=on_progress,
+        max_workers=workers,
+        deep_only_on_count_mismatch=deep_only_on_count_mismatch,
+    )
+
+
+def _connection_prerequisite_notices(
+    session: object, *, inventory_ready: bool
+) -> "list[tuple[str, str, str]]":
+    """Return ALL unmet prerequisites to show before validation can run.
+
+    Validation reads BOTH ends live, so it needs the source inventory plus a
+    CURRENT, verified connection to the source AND the target -- the same bar the
+    runner enforces. This surfaces EVERY unmet prerequisite UPFRONT (each a
+    ``(tone, header, body)``) so the user fixes them in one trip to Connect rather
+    than discovering target only after fixing source (or hitting a post-click
+    error). The target is treated symmetrically with the source. Inventory-missing
+    is returned alone (the source schema is unknown until Step 1 runs). Returns an
+    empty list when everything is ready. Pure (no NiceGUI), so it is unit-testable.
+    """
+    if not inventory_ready:
+        return [
+            (
+                "warning",
+                "Run Step 1 first",
+                "No source inventory yet. Run Step 1 (Evaluation) to introspect "
+                "the source schema.",
+            )
+        ]
+    notices: list[tuple[str, str, str]] = []
+    has_source = bool(getattr(session, "has_source", lambda: False)())
+    source_verified = bool(getattr(session, "source_verified", False))
+    if not has_source or not source_verified:
+        notices.append(
+            (
+                "warning",
+                "Source connection needed",
+                "Validation reads the source live, so it needs a verified source "
+                "connection. "
+                + (
+                    "Set up the source in the Connect section above, then test it."
+                    if not has_source
+                    else "Test the source connection on the Connect screen to "
+                    "(re)connect, then run validation."
+                ),
+            )
+        )
+    has_target = bool(getattr(session, "has_target", lambda: False)())
+    target_verified = bool(getattr(session, "target_verified", False))
+    if not has_target or not target_verified:
+        notices.append(
+            (
+                "warning",
+                "Target connection needed",
+                "Validation reads the target (Aurora DSQL) live and its access "
+                "token is short-lived, so it needs a verified target connection. "
+                + (
+                    "Set up the target in the Connect section above, then test it."
+                    if not has_target
+                    else "Test the target connection on the Connect screen to "
+                    "(re)connect, then run validation."
+                ),
+            )
+        )
+    return notices
+
+
+def job_status_to_step_status(job_status: str) -> Optional[StepStatus]:
+    """Map a :class:`JobManager` job status to the Validation step status.
+
+    Returns ``DONE``/``FAILED`` for those terminal states, ``NOT_STARTED`` for
+    ``CANCELLED`` (a cancelled run produced no report, so the step reads as "not
+    run" and can be re-run — it is not a failure), and ``None`` while the job is
+    still ``PENDING``/``RUNNING`` (the step stays ``IN_PROGRESS``).
+    """
+    if job_status == "DONE":
+        return StepStatus.DONE
+    if job_status == "FAILED":
+        return StepStatus.FAILED
+    if job_status == "CANCELLED":
+        return StepStatus.NOT_STARTED
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Report summary + drift presentation (NiceGUI-agnostic)
+# ---------------------------------------------------------------------------
+
+
+def cdc_active_connector_names(migration_state: object) -> tuple[str, ...]:
+    """Return the CDC connectors believed to be RUNNING right now (best-effort).
+
+    Used by the Validation screen to warn that a non-zero source/target count
+    difference may just be CDC lag (the target is a moving target while the stream
+    flows), not data loss -- so a confirmatory cut-over check should run with the
+    source quiesced. Reads ``cdc_connector_running_names`` last recorded by the
+    Data Migration screen's read-only poll; it can be stale on this screen (we do
+    not poll MSK here), which is acceptable for an advisory banner. Pure: no AWS,
+    no NiceGUI.
+    """
+    names = getattr(migration_state, "cdc_connector_running_names", None) or []
+    return tuple(n for n in names if n)
+
+
+@dataclass(frozen=True)
+class ValidationSummary:
+    """A snapshot summary of a validation report for display (Requirement 6.4).
+
+    Beyond the per-table match counts, this carries the three pre-cut-over
+    readiness checks the Validation report is built around: the data is identical
+    (counts/checksum), there are no mismatched records (full PK reconciliation),
+    and no table errored. ``ready_for_cutover`` is ``True`` only when all three
+    pass, so a reviewer gets one clear go/no-go verdict.
+    """
+
+    total_tables: int
+    matched_tables: int
+    mismatched_tables: int
+    orphan_count: int
+    is_match: bool
+    mode: str
+    as_of: str
+    # Pre-cut-over readiness checks.
+    reconcile_performed: bool
+    reconciled_tables: int
+    inconsistent_tables: int
+    missing_on_target: int
+    extra_on_target: int
+    errored_tables: int
+    ready_for_cutover: bool
+    # Names of the tables that did NOT pass (mismatch or error), in report order,
+    # so the UI can list/jump to exactly the tables needing attention.
+    failed_tables: tuple[str, ...] = ()
+
+
+def summarize_validation(report: ValidationReport) -> ValidationSummary:
+    """Summarize ``report`` into match counts and the three readiness checks."""
+    matched = sum(1 for item in report.items if item.matched)
+    as_of = humanize_as_of(report.snapshot_timestamp)
+    reconciled = [item for item in report.items if item.reconcile is not None]
+    inconsistent = [
+        item for item in reconciled if not item.reconcile.consistent  # type: ignore[union-attr]
+    ]
+    errored = [item for item in report.items if item.error is not None]
+    missing = sum(item.reconcile.missing_on_target for item in reconciled)  # type: ignore[union-attr]
+    extra = sum(item.reconcile.extra_on_target for item in reconciled)  # type: ignore[union-attr]
+    return ValidationSummary(
+        total_tables=len(report.items),
+        matched_tables=matched,
+        mismatched_tables=len(report.items) - matched,
+        orphan_count=len(report.orphan_findings),
+        is_match=report.is_match,
+        mode=report.mode.value,
+        as_of=as_of,
+        reconcile_performed=bool(reconciled),
+        reconciled_tables=len(reconciled),
+        inconsistent_tables=len(inconsistent),
+        missing_on_target=missing,
+        extra_on_target=extra,
+        errored_tables=len(errored),
+        # Cut-over readiness == the overall sound verdict (which already folds in
+        # reconciliation + per-table errors via ``matched``); named explicitly so
+        # the report can phrase it as a go/no-go for cut-over.
+        ready_for_cutover=report.is_match,
+        failed_tables=failed_table_names(report),
+    )
+
+
+# Sentinel string shown for the as-of when validation ran against the live source.
+_LIVE_SOURCE_AS_OF = "live source (no watermark)"
+
+
+def humanize_as_of(snapshot_timestamp: object) -> str:
+    """Format the as-of consistency point for display (human-readable UTC).
+
+    Renders a watermark timestamp as e.g. ``"2026-01-02 03:04 UTC"`` (minute
+    precision is enough for a consistency point) instead of a raw ISO-8601 string
+    with microseconds/offset. Returns the live-source sentinel when there is no
+    watermark. Accepts any object exposing ``strftime`` (a ``datetime``); anything
+    else degrades to ``str`` so the UI never breaks on an unexpected value.
+    """
+    if snapshot_timestamp is None:
+        return _LIVE_SOURCE_AS_OF
+    strftime = getattr(snapshot_timestamp, "strftime", None)
+    if callable(strftime):
+        return strftime("%Y-%m-%d %H:%M UTC")
+    return str(snapshot_timestamp)
+
+
+def failed_table_names(report: ValidationReport) -> tuple[str, ...]:
+    """Return the names of tables that did not pass, in report order.
+
+    A table "failed" when it errored or did not match (count/checksum/record
+    divergence). Used to list and jump to exactly the tables needing attention.
+    """
+    return tuple(
+        item.table
+        for item in report.items
+        if item.error is not None or not item.matched
+    )
+
+
+def reconcile_skipped_tables(report: ValidationReport) -> tuple[str, ...]:
+    """Return tables that were NOT record-reconciled while reconciliation ran.
+
+    When the reconciliation pass ran, a table with no :class:`ReconcileResult`
+    (and no error) was skipped because its primary key is composite/non-integer,
+    so it was compared by count/checksum only. Fast-sweep "verified by count"
+    tables are EXCLUDED here (they have their own honest label via
+    :func:`count_verified_tables`) so the composite-PK footnote stays accurate.
+    Empty when reconciliation was off (then no per-table reconcile is expected) --
+    the UI explains the global off state separately.
+    """
+    any_reconciled = any(item.reconcile is not None for item in report.items)
+    if not any_reconciled:
+        return ()
+    return tuple(
+        item.table
+        for item in report.items
+        if item.reconcile is None
+        and item.error is None
+        and not item.deep_checks_skipped
+    )
+
+
+def _split_schema(table_name: str) -> tuple[str, str]:
+    """Split a ``schema.table`` name into ``(schema, table)``.
+
+    Falls back to a ``"(default)"`` schema when the name is not dotted, so a chip
+    always has a stable group key. Only the FIRST dot splits, so a dotted table
+    name keeps its remainder intact.
+    """
+    schema, separator, obj = table_name.partition(".")
+    if separator and schema and obj:
+        return schema, obj
+    return "(default)", table_name
+
+
+def group_objects_by_schema(
+    table_names: "Sequence[str]",
+) -> "list[tuple[str, list[str]]]":
+    """Group fully-qualified table names by schema for the object picker.
+
+    Returns ``[(schema, [full_name, ...]), ...]`` sorted by schema then name, so
+    the validation object picker can render schema-colored, clickable chips in a
+    stable order. Pure (no NiceGUI), so the grouping is unit-testable.
+    """
+    buckets: dict[str, list[str]] = {}
+    for name in table_names:
+        schema, _obj = _split_schema(name)
+        buckets.setdefault(schema, []).append(name)
+    return [(schema, sorted(buckets[schema])) for schema in sorted(buckets)]
+
+
+def count_verified_tables(report: ValidationReport) -> tuple[str, ...]:
+    """Return tables the fast sweep verified by ROW COUNT only (deep checks skipped).
+
+    These had equal counts, so the fast sweep (deep-check-only-on-count-mismatch)
+    skipped their checksum/reconciliation. Surfaced so the UI can state honestly
+    that they were verified by count -- a count match, not a proven row-identical
+    match -- distinct from a composite-PK reconcile skip.
+    """
+    return tuple(
+        item.table
+        for item in report.items
+        if item.deep_checks_skipped and item.error is None
+    )
+
+
+# ---------------------------------------------------------------------------
+# Validation scope: WHAT is being validated (NiceGUI-agnostic)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ResolvedScope:
+    """The concrete set of tables a validation run will compare.
+
+    ``tables`` is the resolved list (inventory order). ``is_subset`` is ``True``
+    when the Data Migration table selection narrowed the inventory (a partial
+    migration), so the UI can say "selected N of M" rather than implying the whole
+    schema is validated. ``total_in_inventory`` is the full inventory size for
+    that "N of M" phrasing.
+    """
+
+    tables: tuple[TableDef, ...]
+    total_in_inventory: int
+    is_subset: bool
+
+
+def resolve_validation_tables(
+    inventory: SourceInventory, selection: TableSelection
+) -> ResolvedScope:
+    """Resolve which tables to validate from the inventory + migration selection.
+
+    Validation must cover exactly what was migrated: the Data Migration step lets
+    the user pick a subset of tables (an empty selection means "all"), and the
+    export watermark is captured for that subset. Validating the whole inventory
+    would flag every un-migrated table as "missing on target", so this narrows the
+    inventory to the migration selection using the SAME
+    :class:`~dsql_migrator.core.table_selection.TableSelector` semantics the
+    migration used (empty => all; inventory order preserved). A selection that
+    references names no longer in the inventory degrades to "all" rather than
+    raising, so a stale selection never blocks validation.
+    """
+    selector = TableSelector()
+    try:
+        resolved = selector.resolve(inventory, selection)
+    except TableSelectionError:
+        resolved = list(inventory.tables)
+    total = len(inventory.tables)
+    is_subset = len(resolved) < total
+    return ResolvedScope(
+        tables=tuple(resolved),
+        total_in_inventory=total,
+        is_subset=is_subset,
+    )
+
+
+def apply_table_filter(
+    scope_tables: "tuple[TableDef, ...] | list[TableDef]",
+    table_filter: "set[str] | frozenset[str]",
+) -> tuple[TableDef, ...]:
+    """Narrow the migration-scope tables to a user-chosen object filter.
+
+    The Validation step lets the user further filter the migration scope down to
+    specific objects. ``table_filter`` is a set of table names to keep; an empty
+    filter means "all in-scope tables" (the inferred default, so the common case
+    needs no clicks). Names in the filter that are not in ``scope_tables`` are
+    ignored (a stale filter never drops the scope), and the original scope order
+    is preserved. When the filter would select nothing (only unknown names), it
+    degrades to the full scope rather than an empty run.
+    """
+    if not table_filter:
+        return tuple(scope_tables)
+    kept = tuple(t for t in scope_tables if t.name in table_filter)
+    return kept or tuple(scope_tables)
+
+
+def included_from_exclusions(
+    scope_table_names: "Sequence[str]", excluded: "set[str] | frozenset[str]"
+) -> set[str]:
+    """Convert the picker's EXCLUSION set into an include-set over the scope.
+
+    The object picker stores which tables are turned OFF (``excluded``); the run
+    path and scope summary still speak the include-set language of
+    :func:`apply_table_filter` / :func:`build_validation_scope` (a set of names to
+    KEEP, empty == all). This maps one to the other: keep every in-scope name not
+    excluded. When nothing is excluded it returns an EMPTY set (the "all" sentinel,
+    so no false "filtered" badge); when everything would be excluded it also falls
+    back to empty (all), since validating nothing is never the intent. Pure.
+    """
+    names = [n for n in scope_table_names]
+    kept = {n for n in names if n not in excluded}
+    if not excluded or not kept or kept == set(names):
+        return set()  # nothing excluded (or all/none) -> the "validate all" sentinel
+    return kept
+
+
+@dataclass(frozen=True)
+class ValidationScope:
+    """Human-facing description of WHAT a validation run covers (for the UI).
+
+    Surfaces the run's identity before/independently of results: the migration
+    type, the source and target endpoints, the table scope (count + whether it is
+    a migration-selected subset + a short name sample), and the as-of consistency
+    point. All fields are display strings/derived counts so the render helper
+    stays trivial.
+    """
+
+    migration_type: str
+    source_label: str
+    source_detail: str
+    target_label: str
+    target_detail: str
+    table_count: int
+    total_in_inventory: int
+    is_subset: bool
+    table_sample: tuple[str, ...]
+    sample_overflow: int
+    as_of: str
+    # Object filter (a subset of the migration scope chosen on this screen).
+    is_filtered: bool = False
+    scope_count: int = 0  # tables in the migration scope (before the filter)
+
+
+# How many table names to show inline as chips before collapsing to "+N more".
+_SCOPE_SAMPLE_LIMIT = 8
+
+
+def build_validation_scope(
+    *,
+    migration_type: str,
+    source_config: Optional[SourceConnectionConfig],
+    target_config: Optional[TargetConnectionConfig],
+    target_cluster_name: Optional[str],
+    scope: ResolvedScope,
+    watermark: Optional[Watermark],
+    table_filter: "set[str] | frozenset[str] | None" = None,
+) -> ValidationScope:
+    """Build the :class:`ValidationScope` shown in the "Validating" context card.
+
+    Labels are derived from the (non-secret) connection configs and the resolved
+    scope; the as-of point is the watermark snapshot time (humanized) or the
+    live-source sentinel. ``table_filter`` (when non-empty) narrows the migration
+    scope to the user-chosen objects; the card then reports the filtered count and
+    sample. Pure/derivation-only so it is unit-testable without NiceGUI or a
+    database.
+    """
+    scope_count = len(scope.tables)
+    effective = apply_table_filter(scope.tables, table_filter or set())
+    is_filtered = bool(table_filter) and len(effective) < scope_count
+
+    names = [table.name for table in effective]
+    sample = tuple(names[:_SCOPE_SAMPLE_LIMIT])
+    overflow = max(0, len(names) - len(sample))
+
+    if source_config is not None:
+        database = source_config.database or "—"
+        source_label = f"Source · {database}"
+        source_detail = source_config.host
+    else:
+        source_label = "Source MySQL"
+        source_detail = "not connected"
+
+    if target_config is not None:
+        cluster = target_cluster_name or _dsql_cluster_id(target_config.cluster_endpoint)
+        target_label = f"Target · {cluster}"
+        target_detail = f"Aurora DSQL · {target_config.region}"
+    else:
+        target_label = "Target Aurora DSQL"
+        target_detail = "not connected"
+
+    return ValidationScope(
+        migration_type=migration_type,
+        source_label=source_label,
+        source_detail=source_detail,
+        target_label=target_label,
+        target_detail=target_detail,
+        table_count=len(names),
+        total_in_inventory=scope.total_in_inventory,
+        is_subset=scope.is_subset,
+        table_sample=sample,
+        sample_overflow=overflow,
+        as_of=humanize_as_of(watermark.snapshot_timestamp if watermark else None),
+        is_filtered=is_filtered,
+        scope_count=scope_count,
+    )
+
+
+def _dsql_cluster_id(endpoint: str) -> str:
+    """Derive a short DSQL cluster id from its endpoint (label before ``.dsql.``)."""
+    if not endpoint:
+        return "Aurora DSQL"
+    head, marker, _rest = endpoint.partition(".dsql.")
+    return head if marker else endpoint.split(".", 1)[0]
+
+
+def _migration_type_label(session: object) -> str:
+    """Return the chosen migration type's human label (e.g. 'Full load + CDC').
+
+    Resolved via the Data Migration metadata so the Validation card names the same
+    pattern the user picked on Migration Plan. Lazily imported (data_migration
+    imports nothing from here, but keeps this module import-light) and degrades to
+    a neutral label if it cannot be resolved.
+    """
+    try:
+        from dsql_migrator.ui.data_migration import _MIGRATION_TYPE_META
+
+        meta = _MIGRATION_TYPE_META.get(getattr(session, "migration_type", None))
+        if meta is not None:
+            return meta.label
+    except Exception:  # noqa: BLE001 - decorative; never break the page
+        pass
+    return "Migration"
+
+
+def _cdc_in_use(session: object) -> bool:
+    """Return whether the chosen migration path includes streaming CDC.
+
+    Branches the cut-over runbook (:func:`_render_cutover_section`): a CDC path
+    needs a "let it drain to zero lag" step before the final check, whereas a
+    Full-Load-only path just needs a source write-freeze. Degrades to ``False``
+    (the simpler Full-Load-only runbook) if the type cannot be resolved, so the
+    guidance is never wrong about a drain the user doesn't have.
+    """
+    try:
+        from dsql_migrator.ui.data_migration import MigrationType
+
+        return getattr(session, "migration_type", None) in (
+            MigrationType.CDC_ONLY,
+            MigrationType.FULL_LOAD_AND_CDC,
+        )
+    except Exception:  # noqa: BLE001 - decorative; never break the page
+        return False
+
+
+@dataclass(frozen=True)
+class DriftDisplay:
+    """The drift-since-watermark report formatted for display (Req 6.5).
+
+    ``available`` is ``False`` when validation ran without a watermark (drift is
+    undefined). ``determinable`` is ``False`` when a watermark exists but the
+    GTIDs needed to compare could not be read; in both cases the optional GTID
+    fields degrade to ``"unavailable"`` so the UI always renders a valid panel.
+    """
+
+    available: bool
+    determinable: bool
+    drifted: bool
+    watermark_gtid: str
+    current_gtid: str
+    detail: str
+    summary: str
+
+
+def format_drift(report: ValidationReport) -> DriftDisplay:
+    """Format ``report``'s drift section for display (Requirement 6.5).
+
+    Compares the current source GTID to the watermark's GTID to surface changes
+    on the source since the snapshot (Property 11). When no watermark was used,
+    or the GTIDs are unavailable, the panel says so rather than implying a clean
+    or dirty result.
+    """
+    drift: Optional[DriftReport] = report.drift
+    if drift is None:
+        return DriftDisplay(
+            available=False,
+            determinable=False,
+            drifted=False,
+            watermark_gtid=_UNAVAILABLE,
+            current_gtid=_UNAVAILABLE,
+            detail=(
+                "Validation ran without an export watermark, so changes since a "
+                "snapshot cannot be reported."
+            ),
+            summary="Drift since snapshot: not available (no watermark).",
+        )
+
+    determinable = drift.watermark_gtid is not None and drift.current_gtid is not None
+    if not determinable:
+        summary = "Drift since snapshot could not be determined (GTID unavailable)."
+    elif drift.drifted:
+        summary = (
+            "Source has advanced since the snapshot "
+            "(current GTID differs from the watermark)."
+        )
+    else:
+        summary = "No source changes since the snapshot."
+
+    return DriftDisplay(
+        available=True,
+        determinable=determinable,
+        drifted=drift.drifted,
+        watermark_gtid=drift.watermark_gtid or _UNAVAILABLE,
+        current_gtid=drift.current_gtid or _UNAVAILABLE,
+        detail=drift.detail,
+        summary=summary,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Report export serialization (NiceGUI-agnostic) -- Requirement 8.4
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReportDownload:
+    """A serialized report ready to be downloaded: name, content, media type."""
+
+    filename: str
+    content: str
+    media_type: str
+
+
+_MEDIA_TYPES: dict[str, str] = {"json": "application/json", "text": "text/plain"}
+_EXTENSIONS: dict[str, str] = {"json": "json", "text": "txt"}
+
+
+def _download_parts(stem: str, fmt: str) -> tuple[str, str]:
+    """Return the ``(filename, media_type)`` for ``stem`` in ``fmt``."""
+    normalized = fmt.lower()
+    if normalized not in _MEDIA_TYPES:
+        raise ValueError(f"unsupported report format: {fmt!r} (use 'json' or 'text')")
+    return f"{stem}.{_EXTENSIONS[normalized]}", _MEDIA_TYPES[normalized]
+
+
+def validation_download(report: ValidationReport, fmt: str = "json") -> ReportDownload:
+    """Serialize the validation report (incl. drift) for download (Req 8.4)."""
+    content = export_validation_report(report, fmt)
+    filename, media_type = _download_parts("validation_report", fmt)
+    return ReportDownload(filename=filename, content=content, media_type=media_type)
+
+
+# ---------------------------------------------------------------------------
+# Per-session validation state
+# ---------------------------------------------------------------------------
+
+
+class ValidationState:
+    """Per-session validation options/outputs and the running job id.
+
+    ``mode``/``check_orphans`` are read/written only on the UI thread, while
+    ``result``/``error`` are produced by a background worker and read by the UI
+    poller, so those two are guarded by a lock to make the cross-thread handoff
+    safe (mirroring the sibling step screens).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.mode: ValidationMode = ValidationMode.ROW_COUNT
+        self.check_orphans: bool = False
+        # Full PK-set reconciliation (the "no mismatched records" check) is on by
+        # default for the pre-cut-over report; the user can switch it off for a
+        # quick count-only pass.
+        self.reconcile: bool = True
+        # Fast sweep: run the expensive checksum/reconciliation only for tables
+        # whose row counts differ. Off by default (thorough check is the default).
+        self.deep_only_on_count_mismatch: bool = False
+        # Optional object EXCLUSIONS: the migration-scope table names the user has
+        # turned OFF in the object picker. Empty == validate every in-scope table
+        # (the inferred default, no clicks needed). Stored as exclusions (not an
+        # include-set) so the picker shows every object ON by default and a click
+        # toggles it off/on -- the on-screen state always matches what will be
+        # validated. Read/written only on the UI thread.
+        self.table_exclude: set[str] = set()
+        self.job_id: Optional[str] = None
+        # Set when the user requested a cancel of the current/last run, so the UI
+        # can show a "cancelled" notice once the worker stops. Cleared on a new run.
+        self.cancel_requested: bool = False
+        self._result: Optional[ValidationReport] = None
+        self._error: Optional[str] = None
+        # Live per-table progress for the running job, written by the background
+        # worker (validator on_progress) and read by the UI poller -- guarded by
+        # the same lock for the cross-thread handoff. ``(table, index, total)`` or
+        # ``None`` before the first table / after the run finishes.
+        self._progress: Optional[tuple[str, int, int]] = None
+        # Wall-clock timing for the current/last run (monotonic clock, immune to
+        # system clock changes): ``_run_started`` is stamped when the run starts and
+        # ``_run_elapsed`` is the total seconds once it finishes, so the result can
+        # report "Completed in Xm Ys". ``None`` until a run has started/finished.
+        self._run_started: Optional[float] = None
+        self._run_elapsed: Optional[float] = None
+        # Wall-clock time the last run FINISHED (UTC), for the "Completed at"/
+        # restored-as-of note and persistence. Distinct from the monotonic timing
+        # above (which can't be turned into a calendar time). None until finished.
+        self._completed_at: Optional[datetime] = None
+        # True only when the current result was re-hydrated from a saved snapshot
+        # (so the UI can show a "restored as-of <time>" note); a fresh run clears it.
+        self._restored: bool = False
+
+    def mark_run_started(self) -> None:
+        """Stamp the start of a run (clears any prior elapsed time)."""
+        import time
+
+        with self._lock:
+            self._run_started = time.monotonic()
+            self._run_elapsed = None
+
+    def mark_run_finished(self) -> None:
+        """Record the elapsed time + finish wall-clock time for the just-finished run."""
+        import time
+
+        with self._lock:
+            if self._run_started is not None:
+                self._run_elapsed = max(0.0, time.monotonic() - self._run_started)
+            self._run_started = None
+            self._completed_at = datetime.now(timezone.utc)
+
+    @property
+    def elapsed_seconds(self) -> Optional[float]:
+        """Total wall-clock seconds of the last finished run, or ``None``."""
+        with self._lock:
+            return self._run_elapsed
+
+    @property
+    def completed_at(self) -> Optional[datetime]:
+        """UTC wall-clock time the last run finished, or ``None``."""
+        with self._lock:
+            return self._completed_at
+
+    def restore(
+        self,
+        report: ValidationReport,
+        completed_at: Optional[datetime],
+    ) -> None:
+        """Re-hydrate a persisted result on reconnect (no elapsed time available).
+
+        Sets the report + finish time from the snapshot so the result page reopens;
+        ``_run_elapsed`` stays ``None`` (a restored run has no live duration). The
+        UI flags the result as restored-as-of ``completed_at`` so a stale verdict
+        (source advanced since) prompts a re-validate.
+        """
+        with self._lock:
+            self._result = report
+            self._error = None
+            self._progress = None
+            self._completed_at = completed_at
+            self._restored = True
+
+    @property
+    def restored(self) -> bool:
+        """True when the current result was re-hydrated from a snapshot."""
+        with self._lock:
+            return getattr(self, "_restored", False)
+
+    def set_progress(self, table: str, index: int, total: int) -> None:
+        """Record which table the running comparison is on (worker thread)."""
+        with self._lock:
+            self._progress = (table, index, total)
+
+    @property
+    def progress(self) -> Optional[tuple[str, int, int]]:
+        """Return the current ``(table, index, total)`` being compared, if any."""
+        with self._lock:
+            return self._progress
+
+    def clear_progress(self) -> None:
+        """Forget any in-flight progress (before a new run / once finished)."""
+        with self._lock:
+            self._progress = None
+
+    def set_result(self, result: ValidationReport) -> None:
+        """Record a successful run's report (clears any prior error + progress)."""
+        with self._lock:
+            self._result = result
+            self._error = None
+            self._progress = None
+            self._restored = False  # a freshly-run result, not a restored one
+
+    def set_error(self, message: str) -> None:
+        """Record a failure message for display."""
+        with self._lock:
+            self._error = message
+
+    @property
+    def result(self) -> Optional[ValidationReport]:
+        """Return the last successful report, if any."""
+        with self._lock:
+            return self._result
+
+    @property
+    def error(self) -> Optional[str]:
+        """Return the last failure message, if any."""
+        with self._lock:
+            return self._error
+
+    def clear_outputs(self) -> None:
+        """Discard the previous report/error before a (re-)run."""
+        with self._lock:
+            self._result = None
+            self._error = None
+
+
+@dataclass
+class ValidationStore:
+    """Process-memory map of session id to :class:`ValidationState`.
+
+    Mirrors :class:`~dsql_migrator.ui.evaluation.EvaluationStore`: each UI session
+    sees only its own validation state and nothing is persisted to disk.
+    """
+
+    _states: dict[str, ValidationState] = field(default_factory=dict)
+
+    def get_or_create(self, session_id: str) -> ValidationState:
+        """Return the state for ``session_id``, creating an empty one if needed."""
+        state = self._states.get(session_id)
+        if state is None:
+            state = ValidationState()
+            self._states[session_id] = state
+        return state
+
+    def get(self, session_id: str) -> Optional[ValidationState]:
+        """Return the state for ``session_id``, or ``None`` if absent."""
+        return self._states.get(session_id)
+
+    def clear(self, session_id: Optional[str]) -> None:
+        """Remove the state for ``session_id`` (no-op if absent)."""
+        if session_id is None:
+            return
+        self._states.pop(session_id, None)
+
+    def reset_in_place(self, session_id: Optional[str]) -> None:
+        """Reset the state WITHOUT replacing the object (no-op if absent).
+
+        The workflow screen captures this state object in its builder closures at
+        build time, so popping + recreating would orphan the captured reference.
+        Re-initialising the SAME instance keeps every closure on the live object.
+        """
+        if session_id is None:
+            return
+        state = self._states.get(session_id)
+        if state is not None:
+            state.__init__()  # type: ignore[misc]  # re-run init on the same object
+
+
+# ---------------------------------------------------------------------------
+# NiceGUI screen
+# ---------------------------------------------------------------------------
+
+# How often the screen polls the background validation job (seconds).
+_POLL_INTERVAL_SECONDS = 0.5
+
+
+def build_validation_screen(
+    store: SessionStore,
+    session_id: str,
+    *,
+    job_manager: JobManager,
+    eval_store: EvaluationStore,
+    migration_store: DataMigrationStore,
+    validation_store: ValidationStore,
+    validator_factory: ValidatorFactory = _default_validator_factory,
+    strategist_factory: StrategistFactory = _default_strategist_factory,
+) -> tuple[Callable[[Callable[[], None]], None], Callable[[], None]]:
+    """Build the Validation screen, returning ``(content_builder, runner)``.
+
+    ``content_builder`` renders the screen (status, options, validation report,
+    drift, downloads) and is given the workflow shell's refresh callback so it
+    can reflect background-job completion. ``runner`` is invoked by the step's
+    Run/Re-run button: it validates the source/target connections and the Step 1
+    inventory, reads the Step 3 export watermark, marks the step ``IN_PROGRESS``,
+    and submits the validation to ``job_manager`` (returning immediately so the
+    UI never blocks). Both plug into
+    :func:`~dsql_migrator.ui.workflow.build_workflow_sidebar`.
+    """
+    from nicegui import ui
+
+    session = store.get_or_create(session_id)
+    validation_state = validation_store.get_or_create(session_id)
+    eval_state = eval_store.get_or_create(session_id)
+    migration_state = migration_store.get_or_create(session_id)
+
+    def _inventory() -> Optional[SourceInventory]:
+        result = eval_state.result
+        return result.inventory if result is not None else None
+
+    def _migration_watermark() -> Optional[Watermark]:
+        job_id = migration_state.job_id
+        if job_id is None:
+            return None
+        try:
+            job = job_manager.get_status(job_id)
+        except JobNotFoundError:
+            return None
+        return job.watermark
+
+    def runner() -> None:
+        inventory = _inventory()
+        if inventory is None:
+            validation_state.set_error(
+                "Run Step 1 (Evaluation) first to introspect the source schema, "
+                "then run validation."
+            )
+            return
+        # Require a *verified* connection, not just a configured one: starting a
+        # run against an unreachable/untested source or target would otherwise
+        # block on connect and leave the step spinning. Fail fast with a clear
+        # call to action instead of submitting a job.
+        if not session.has_source() or not getattr(
+            session, "source_verified", False
+        ):
+            validation_state.set_error(
+                "Source connection is not verified. Test the source connection on "
+                "the Connect screen, then run validation."
+            )
+            return
+        if not session.has_target() or not getattr(
+            session, "target_verified", False
+        ):
+            validation_state.set_error(
+                "Target connection is not verified. Test the target connection on "
+                "the Connect screen, then run validation."
+            )
+            return
+        if not inventory.tables:
+            validation_state.set_error(
+                "The source inventory has no tables to validate."
+            )
+            return
+
+        # Validate exactly what was migrated: narrow the inventory to the Data
+        # Migration table selection (empty => all). Validating un-migrated tables
+        # would flag them all as "missing on target".
+        scope = resolve_validation_tables(inventory, migration_state.selection)
+        if not scope.tables:
+            validation_state.set_error(
+                "No tables in scope to validate. Select tables in Step 3 (Data "
+                "Migration) or check the source inventory."
+            )
+            return
+        # Then apply the optional object exclusions chosen on this screen (none =>
+        # all in-scope). Exclusions are converted to the include-set apply_table_
+        # filter expects; excluding everything degrades to the full scope so a run
+        # never ends up empty.
+        scope_names = [t.name for t in scope.tables]
+        include = included_from_exclusions(
+            scope_names, validation_state.table_exclude
+        )
+        scoped_tables = apply_table_filter(scope.tables, include)
+        scoped_inventory = inventory.model_copy(
+            update={"tables": list(scoped_tables)}
+        )
+
+        source_config = session.source_config
+        target_config = session.target_config
+        assert source_config is not None  # guaranteed by has_source()
+        assert target_config is not None  # guaranteed by has_target()
+        inputs = ValidationInputs(
+            source_config=source_config,
+            source_password=session.source_password,
+            target_config=target_config,
+            inventory=scoped_inventory,
+            mode=validation_state.mode,
+            check_orphans=validation_state.check_orphans,
+            watermark=_migration_watermark(),
+            reconcile=validation_state.reconcile,
+            deep_only_on_count_mismatch=(
+                validation_state.deep_only_on_count_mismatch
+            ),
+        )
+
+        validation_state.clear_outputs()
+        validation_state.clear_progress()
+        validation_state.cancel_requested = False
+        validation_state.mark_run_started()
+        session.set_workflow(
+            with_status(
+                session.workflow, WorkflowStep.VALIDATION, StepStatus.IN_PROGRESS
+            )
+        )
+
+        def work(handle: object) -> None:
+            # The worker polls the job handle's cancelled flag between tables. On a
+            # cooperative stop the validator raises ValidationCancelled; we catch
+            # it and RETURN normally (without storing a result) so the JobManager
+            # records the job as CANCELLED, not FAILED -- and no partial report is
+            # ever displayed. on_progress writes live per-table progress for the UI
+            # poller (worker thread -> ValidationState lock).
+            try:
+                result = run_validation(
+                    inputs,
+                    validator_factory=validator_factory,
+                    should_cancel=lambda: bool(getattr(handle, "cancelled", False)),
+                    on_progress=validation_state.set_progress,
+                    deep_only_on_count_mismatch=inputs.deep_only_on_count_mismatch,
+                )
+            except ValidationCancelled:
+                return
+            finally:
+                # Stamp the elapsed time + clear progress whether the run finished,
+                # was cancelled, or errored -- so a completed report can show how
+                # long it took and a cancelled/failed run does not show a stale one.
+                validation_state.mark_run_finished()
+                validation_state.clear_progress()
+            validation_state.set_result(result)
+
+        validation_state.job_id = job_manager.submit(work)
+
+    def content(refresh: Callable[[], None]) -> None:
+        status = get_status(session.workflow, WorkflowStep.VALIDATION)
+        inventory = _inventory()
+
+        with ui.column().classes("w-full gap-3"):
+            ui.label(
+                "The final pre-cut-over check. After Full Load + CDC, validation "
+                "confirms the migrated target is ready to switch over: the data is "
+                "identical, no records are missing or extra, and no table errored. "
+                "Results are shown as a report you can download; the comparison is "
+                "as-of the export watermark, with source changes since then shown "
+                "as drift."
+            ).classes("text-sm text-gray-500")
+
+            # The step header + journey stepper already show the status badge, so
+            # it is not repeated here (avoids a third copy of the same signal).
+            # Prerequisites the RUN actually enforces, surfaced UPFRONT so the user
+            # fixes them before clicking (not only as a post-click error): source
+            # inventory, then a verified source connection, then a verified target
+            # connection. Validation reads BOTH ends live, so -- exactly like the
+            # source -- the target must have a current, verified connection; a
+            # configured-but-unverified (or expired) target is called out the same
+            # way the source is, since the run reconnects to it.
+            conn_notices = _connection_prerequisite_notices(
+                session, inventory_ready=inventory is not None
+            )
+            for tone, header, body in conn_notices:
+                render_notice(ui, tone=tone, header=header, body=body)
+            if not conn_notices and _migration_watermark() is None:
+                # Expected/optional state (validation still runs live), so info —
+                # not an alarming warning (severity calibration).
+                render_notice(
+                    ui,
+                    tone="info",
+                    header="No export watermark — comparing against the live source",
+                    body=(
+                        "No export watermark found, so validation compares against "
+                        "the live source and drift since a snapshot is not "
+                        "available. Run Step 3 (Data Migration) first to validate "
+                        "as-of the exact consistency point."
+                    ),
+                )
+
+            # CDC-active advisory: when the stream is still RUNNING, the target is a
+            # moving target, so a non-zero count/PK difference may be replication lag
+            # rather than data loss. Validation is read-only and safe to run now
+            # (and useful for watching convergence), but a CONFIRMATORY cut-over
+            # check should run with the source quiesced so a clean MATCH truly means
+            # zero loss. Info, not warning — running mid-CDC is expected and fine.
+            active = cdc_active_connector_names(migration_state)
+            if active:
+                render_notice(
+                    ui,
+                    tone="info",
+                    header="CDC is still streaming — differences may be lag, not loss",
+                    body=(
+                        "A change-data-capture connector is running, so the target "
+                        "is still catching up. You can validate now to watch it "
+                        "converge, but a small source/target difference is likely "
+                        "replication lag (it shrinks as CDC catches up). For a "
+                        "final cut-over check, stop source writes (let CDC drain) "
+                        "first so a clean match confirms zero data loss."
+                    ),
+                )
+
+            # "Validating" context card: WHAT this run covers (source -> target,
+            # which/how many tables, as-of point). Shown when the inventory is known
+            # and a run is NOT in flight: during IN_PROGRESS the whole screen
+            # re-renders on every ~poll, which would recreate the object chips and
+            # make their hover tooltips flicker; the scope is also read-only then
+            # (the filter is disabled) and the live progress panel already says
+            # what's running. So the scope/filter is hidden while running and
+            # returns once the run settles.
+            if inventory is not None and status is not StepStatus.IN_PROGRESS:
+                scope = resolve_validation_tables(
+                    inventory, migration_state.selection
+                )
+                scope_view = build_validation_scope(
+                    migration_type=_migration_type_label(session),
+                    source_config=session.source_config,
+                    target_config=session.target_config,
+                    target_cluster_name=getattr(
+                        session, "target_cluster_name", None
+                    ),
+                    scope=scope,
+                    watermark=_migration_watermark(),
+                    table_filter=included_from_exclusions(
+                        [t.name for t in scope.tables],
+                        validation_state.table_exclude,
+                    ),
+                )
+                _render_scope_card(
+                    ui,
+                    scope_view,
+                    scope_tables=[t.name for t in scope.tables],
+                    validation_state=validation_state,
+                    status=status,
+                    refresh=refresh,
+                )
+
+            # Options (comparison mode, reconcile/orphan/fast-sweep) also carry
+            # hover tooltips, so they are hidden during a run for the same reason as
+            # the scope card -- they apply only to the NEXT run and are disabled
+            # while one is in flight. Shown otherwise.
+            if status is not StepStatus.IN_PROGRESS:
+                _render_options(
+                    ui,
+                    validation_state,
+                    status,
+                    has_result=validation_state.result is not None,
+                    refresh=refresh,
+                )
+
+            error = validation_state.error
+            if error and status is not StepStatus.IN_PROGRESS:
+                render_notice(
+                    ui,
+                    tone="error",
+                    header="Validation failed",
+                    body=error,
+                )
+
+            # A cancelled run leaves the step NOT_STARTED (no report); surface it
+            # as a calm info notice (not an error) so the user knows it stopped.
+            if (
+                validation_state.cancel_requested
+                and status is StepStatus.NOT_STARTED
+                and validation_state.result is None
+                and not error
+            ):
+                render_notice(
+                    ui,
+                    tone="info",
+                    header="Validation cancelled",
+                    body=(
+                        "The run was stopped before completing, so no report was "
+                        "produced. Adjust the scope/options if needed and Re-run to "
+                        "validate again. Nothing on the target was changed "
+                        "(validation is read-only)."
+                    ),
+                )
+
+            if status is StepStatus.IN_PROGRESS:
+                # Guard against a "stuck spinner": the step is IN_PROGRESS but no
+                # live job is actually running it. This happens when the persisted
+                # session snapshot restored IN_PROGRESS after a process restart /
+                # page reload (the validation job id is not persisted, and the
+                # JobManager is fresh), so polling would never finalize.
+                if _running_job_alive(job_manager, validation_state):
+                    _render_in_progress(
+                        ui, job_manager, session, validation_state, refresh
+                    )
+                elif validation_state.result is not None:
+                    # The run actually FINISHED (a report is present) but the step
+                    # was left/restored as IN_PROGRESS without a live job (the DONE
+                    # flip's persist did not land, or a reconnect restored a stale
+                    # status). Reconcile to DONE so the completed report shows --
+                    # never a misleading "not started"/"interrupted" for a run that
+                    # produced a result.
+                    session.set_workflow(
+                        with_status(
+                            session.workflow,
+                            WorkflowStep.VALIDATION,
+                            StepStatus.DONE,
+                        )
+                    )
+                    status = StepStatus.DONE
+                else:
+                    # Truly orphaned with no result: reconcile to NOT_STARTED and
+                    # tell the user to re-run, instead of spinning forever.
+                    session.set_workflow(
+                        with_status(
+                            session.workflow,
+                            WorkflowStep.VALIDATION,
+                            StepStatus.NOT_STARTED,
+                        )
+                    )
+                    status = StepStatus.NOT_STARTED
+                    render_notice(
+                        ui,
+                        tone="warning",
+                        header="Previous validation was interrupted",
+                        body=(
+                            "A validation run was in progress but is no longer "
+                            "active (the app restarted or the page was reloaded). "
+                            "No report was produced and nothing on the target was "
+                            "changed (validation is read-only). Click Re-run to "
+                            "validate again."
+                        ),
+                    )
+
+            result = validation_state.result
+            if result is not None and status is not StepStatus.IN_PROGRESS:
+                # On-demand AI diagnosis of mismatches is opt-in (AI Assist on).
+                # Build the shared chat drawer + a streamer bound to the validation
+                # grounding; when AI is off, no opener is passed and the renderer
+                # omits the AI buttons (the deterministic report stands on its own).
+                diagnose_provider = None
+                if session.ai_assist.enabled:
+                    strategist = strategist_factory(
+                        session.ai_assist, session.aws_profile
+                    )
+                    open_chat = build_chat_drawer(ui)
+
+                    def diagnose_provider(  # noqa: E731 - small bound opener
+                        *, title, subtitle, first_question, facts, scope
+                    ):
+                        open_chat(
+                            title=title,
+                            subtitle=subtitle,
+                            first_question=first_question,
+                            streamer=lambda messages, on_delta: (
+                                strategist.stream_validation_chat(
+                                    facts, messages, on_delta, scope=scope
+                                )
+                            ),
+                        )
+
+                _render_result(
+                    ui, result,
+                    diagnose_provider=diagnose_provider,
+                    elapsed_seconds=validation_state.elapsed_seconds,
+                    restored=validation_state.restored,
+                    completed_at=validation_state.completed_at,
+                )
+
+    return content, runner
+
+
+def _cutover_summary_for_preview() -> "ValidationSummary":
+    """A synthetic 'ready' summary used only for the dev-unlock cut-over preview.
+
+    Never used in real flows (the real summary comes from a validation run); it
+    exists so a developer reviewing the UI with DSQL_MIGRATOR_DEV_UNLOCK_STEPS on
+    can see the go-path runbook without a verdict.
+    """
+    return ValidationSummary(
+        total_tables=0,
+        matched_tables=0,
+        mismatched_tables=0,
+        orphan_count=0,
+        is_match=True,
+        mode="checksum",
+        as_of="preview",
+        reconcile_performed=True,
+        reconciled_tables=0,
+        inconsistent_tables=0,
+        missing_on_target=0,
+        extra_on_target=0,
+        errored_tables=0,
+        ready_for_cutover=True,
+    )
+
+
+def build_cutover_screen(
+    store: SessionStore,
+    session_id: str,
+    *,
+    validation_store: ValidationStore,
+) -> tuple[Callable[[Callable[[], None]], None], Callable[[], None]]:
+    """Build the Cut over step (step 6), returning ``(content_builder, runner)``.
+
+    Cut-over is the one step the tool does NOT perform: repointing the application
+    from MySQL to DSQL is an operational act only the operator can do. So this step
+    has no job to run — the ``runner`` simply marks the step ``DONE`` when the user
+    acknowledges they have cut over (the workflow shell's Run button is hidden for
+    this step; a dedicated in-content button drives the acknowledgement).
+
+    The content reflects the *last validation verdict* so the guidance is honest:
+    on a clean MATCH it shows the cut-over runbook (tailored to whether CDC is in
+    use); otherwise it tells the user to get a clean Validation first and offers no
+    "I've cut over" affordance. This keeps cut-over gated on evidence, not vibes.
+    """
+    from nicegui import ui
+
+    session = store.get_or_create(session_id)
+    validation_state = validation_store.get_or_create(session_id)
+
+    def runner() -> None:
+        # No job: mark DONE as the user's acknowledgement that they've cut over.
+        session.set_workflow(
+            with_status(session.workflow, WorkflowStep.CUT_OVER, StepStatus.DONE)
+        )
+
+    def content(refresh: Callable[[], None]) -> None:
+        with _section(ui, icon="rocket_launch", title="Cut over to Aurora DSQL"):
+            render_notice(
+                ui,
+                tone="info",
+                header="The final step is yours to perform",
+                body=(
+                    "Cut-over is the moment your application stops writing to MySQL "
+                    "and starts using Aurora DSQL. The tool has done its job — read "
+                    "the source, converted the schema, loaded the data, and proven "
+                    "consistency — but repointing your application is an operational "
+                    "act only you can do. This step is the runbook for doing it "
+                    "safely, with a rollback path."
+                ),
+            )
+
+        report = validation_state.result
+        summary = summarize_validation(report) if report is not None else None
+        drift = format_drift(report) if report is not None else None
+
+        # Dev-only UI review: with no clean verdict, synthesize a ready summary so
+        # the runbook itself can be reviewed without running the whole workflow.
+        # Gated on the same dev flag as the nav unlock; never reached in real use.
+        if (summary is None or not summary.ready_for_cutover) and _dev_unlock_steps():
+            render_notice(
+                ui,
+                tone="warning",
+                header="Developer preview (no real validation verdict)",
+                body=(
+                    "DSQL_MIGRATOR_DEV_UNLOCK_STEPS is on, so the cut-over runbook "
+                    "below is shown for UI review only. In real use it appears only "
+                    "after Validation reports a clean MATCH."
+                ),
+            )
+            summary = summary or _cutover_summary_for_preview()
+            _render_cutover_section(
+                ui, summary, drift, cdc_in_use=_cdc_in_use(session)
+            )
+            return
+
+        if summary is None or not summary.ready_for_cutover:
+            with _section(ui, icon="fact_check", title="Validate first"):
+                render_notice(
+                    ui,
+                    tone="warning",
+                    header="Get a clean validation before you cut over",
+                    body=(
+                        "Cut over only when Validation reports a clean MATCH (or "
+                        "every difference is explained). Go to the Validation step "
+                        "and run it; once the verdict is green, the cut-over runbook "
+                        "appears here."
+                        if summary is not None
+                        else
+                        "No validation result yet. Run the Validation step first — "
+                        "the cut-over runbook appears here once it reports a clean "
+                        "MATCH."
+                    ),
+                )
+            return
+
+        # Go path: the verdict is clean — show the tailored runbook + an explicit
+        # acknowledgement that marks the step (and the whole journey) Done.
+        _render_cutover_section(
+            ui, summary, drift, cdc_in_use=_cdc_in_use(session)
+        )
+
+        done = get_status(session.workflow, WorkflowStep.CUT_OVER) is StepStatus.DONE
+        with _section(ui, icon="flag", title="Finish"):
+            if done:
+                render_notice(
+                    ui,
+                    tone="success",
+                    header="Cut-over complete",
+                    body=(
+                        "You've marked the cut-over done — your application is live "
+                        "on Aurora DSQL. Keep the source as a read-only rollback "
+                        "anchor until you've signed off."
+                    ),
+                )
+            else:
+                ui.label(  # type: ignore[attr-defined]
+                    "When your application is live on DSQL and smoke-tested, mark "
+                    "the cut-over complete to finish the migration journey."
+                ).classes("text-sm text-gray-600")
+                with ui.row().classes("w-full justify-end"):  # type: ignore[attr-defined]
+                    def _acknowledge() -> None:
+                        runner()
+                        refresh()
+
+                    ui.button(  # type: ignore[attr-defined]
+                        "I've cut over to DSQL",
+                        icon="check_circle",
+                        on_click=_acknowledge,
+                    ).props("color=primary")
+
+    return content, runner
+
+
+def _running_job_alive(
+    job_manager: JobManager, validation_state: "ValidationState"
+) -> bool:
+    """Return whether a live (PENDING/RUNNING) validation job actually exists.
+
+    The step status alone can read IN_PROGRESS without a backing job after a
+    restart/reload (the validation job id is not persisted). This confirms there
+    is a real in-flight job before the UI shows the running spinner, so an
+    orphaned status is reconciled instead of spinning forever.
+    """
+    job_id = validation_state.job_id
+    if job_id is None:
+        return False
+    try:
+        job = job_manager.get_status(job_id)
+    except JobNotFoundError:
+        return False
+    return job.status in ("PENDING", "RUNNING")
+
+
+def _render_in_progress(
+    ui: object,
+    job_manager: JobManager,
+    session: object,
+    validation_state: "ValidationState",
+    refresh: Callable[[], None],
+) -> None:
+    """Render the running state: progress text + a Cancel action (AWS-styled).
+
+    The Cancel button is a Cloudscape "normal/secondary" destructive-intent action
+    (outlined, negative color) placed beside the spinner. It requests a
+    cooperative stop via the JobManager; the validator halts at the next table
+    boundary and the run ends CANCELLED. Once requested, the button switches to a
+    disabled "Stopping…" state so the click is acknowledged immediately.
+    """
+    stopping = (
+        validation_state.cancel_requested
+        or (
+            validation_state.job_id is not None
+            and job_manager.is_cancel_requested(validation_state.job_id)
+        )
+    )
+
+    def _cancel() -> None:
+        job_id = validation_state.job_id
+        if job_id is not None:
+            job_manager.request_cancel(job_id)
+        validation_state.cancel_requested = True
+        refresh()
+
+    progress = validation_state.progress
+    with ui.column().classes("w-full gap-2"):  # type: ignore[attr-defined]
+        with ui.row().classes("items-center gap-3 no-wrap"):  # type: ignore[attr-defined]
+            ui.spinner(size="sm")  # type: ignore[attr-defined]
+            ui.label(  # type: ignore[attr-defined]
+                "Stopping…"
+                if stopping
+                else _in_progress_label(progress)
+            ).classes("text-sm text-gray-700")
+            # AWS/Cloudscape: cancelling a read-only run is a *normal* (secondary)
+            # action, not a destructive (red) one -- red is reserved for
+            # irreversible deletes. Use a calm outlined grey button.
+            #
+            # NB: do NOT use Quasar's button ``loading`` prop here. On an outlined
+            # (transparent) button the loading spinner sits over the visible
+            # border and reads as a "spinning border" artifact. The in-progress
+            # cue is the disabled state + the "Stopping…" label instead; the
+            # surrounding spinner above already shows the run is active.
+            cancel_button = ui.button(  # type: ignore[attr-defined]
+                "Stopping…" if stopping else "Cancel validation",
+                icon="stop_circle",
+                on_click=_cancel,
+            ).props("outline color=grey-8 no-caps")
+            if stopping:
+                cancel_button.props("disable")  # type: ignore[attr-defined]
+        # Determinate progress bar once the worker reports its first table, so the
+        # user sees how far along a long multi-table run is (not just a spinner).
+        if progress is not None and not stopping:
+            _table, index, total = progress
+            fraction = (index / total) if total else 0.0
+            ui.linear_progress(  # type: ignore[attr-defined]
+                value=min(1.0, max(0.0, fraction)), show_value=False
+            ).props("rounded color=primary").classes("w-full")
+        # What this run is doing + the reassurances (background-safe, read-only,
+        # cancellable) -- wrapped in an info notice so it reads as the calm "here is
+        # what's happening" panel rather than loose gray text that gets skipped.
+        render_notice(
+            ui,
+            tone="info",
+            header="Comparison in progress — safe to leave running",
+            body=(
+                "Exact COUNT(*)/checksum and full per-table primary-key "
+                "reconciliation run against both engines, so this can take several "
+                "minutes for a large database. You can leave this screen — the run "
+                "continues in the background. Cancel stops at the next table; the "
+                "target is never modified (validation is read-only)."
+            ),
+        )
+    _install_poll_timer(ui, job_manager, session, validation_state, refresh)
+
+
+def _in_progress_label(progress: Optional[tuple[str, int, int]]) -> str:
+    """Build the running-state label, naming the table being compared if known.
+
+    Before the worker reports its first table (or after a restart-orphaned run),
+    ``progress`` is ``None`` and we fall back to the generic comparing message.
+    """
+    if not progress:
+        return "Comparing source and target…"
+    table, index, total = progress
+    return f"Checking table {index} of {total}: {table}"
+
+
+def _render_scope_card(
+    ui: object,
+    scope: "ValidationScope",
+    *,
+    scope_tables: "list[str]",
+    validation_state: "ValidationState",
+    status: StepStatus,
+    refresh: Callable[[], None],
+) -> None:
+    """Render the "Validating" context card: WHAT this run covers, with a filter.
+
+    A Cloudscape "Container" with the migration type in the header band and a body
+    that identifies source -> target, the table scope (count + subset/filtered
+    note + a short chip sample), the as-of consistency point, and an object filter
+    picker so the user can validate only specific tables within the migration
+    scope. ``scope_tables`` is the full migration scope (the filter's option
+    list); the filter narrows it.
+    """
+    # Table scope summary line (count + whether it is filtered / a migration subset).
+    if scope.is_filtered:
+        tables_value = f"{scope.table_count} of {scope.scope_count}"
+        tables_note = "filtered below"
+    elif scope.is_subset:
+        tables_value = f"{scope.table_count} of {scope.total_in_inventory}"
+        tables_note = "selected in Data Migration"
+    else:
+        tables_value = f"All {scope.table_count}"
+        tables_note = ""
+
+    with _section(ui, icon="checklist", title="Validating"):  # type: ignore[misc]
+        # Key-value pairs grid (Cloudscape "Container" key-value pairs): each label
+        # is a header bound to the value directly below it; the generous inter-pair
+        # gap (gap-y-5) separates one pair from the next, so a header is read with
+        # ITS value, not the one above/below.
+        with ui.element("div").classes(  # type: ignore[attr-defined]
+            "grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-5 w-full"
+        ):
+            _kv(ui, "Migration type", scope.migration_type)
+            _kv(ui, "As-of (consistency point)", scope.as_of)
+            _kv(ui, scope.source_label, scope.source_detail, mono=True)
+            _kv(ui, scope.target_label, scope.target_detail, mono=True)
+
+        # Tables: just the COUNT summary here (no chip sample). The full, clickable
+        # object list lives only in "Objects to validate" below -- duplicating the
+        # names here (truncated to "+N more") was confusing and the truncated ones
+        # could not be clicked. One place to see/select objects, no overlap.
+        with ui.column().classes(  # type: ignore[attr-defined]
+            "gap-1 min-w-0 pl-2 border-l-2 border-gray-200 w-full"
+        ):
+            _kv_label(ui, "Tables")
+            with ui.row().classes("items-baseline gap-2 no-wrap"):  # type: ignore[attr-defined]
+                ui.label(tables_value).classes(  # type: ignore[attr-defined]
+                    "text-sm text-gray-900 leading-snug"
+                )
+                if tables_note:
+                    ui.label(f"· {tables_note}").classes(  # type: ignore[attr-defined]
+                        "text-xs text-gray-500"
+                    )
+
+        # Divider, then the interactive object filter — the single place objects are
+        # listed and selected (every object as a clickable chip, none truncated).
+        ui.separator().classes("my-1")  # type: ignore[attr-defined]
+        _render_object_filter(ui, scope_tables, validation_state, status, refresh)
+
+
+def _render_object_filter(
+    ui: object,
+    scope_tables: "list[str]",
+    validation_state: "ValidationState",
+    status: StepStatus,
+    refresh: Callable[[], None],
+) -> None:
+    """Render the object filter as clickable, schema-colored object chips.
+
+    Every in-scope object starts INCLUDED (chip ON, filled in its schema color);
+    clicking a chip toggles it OFF (excluded, quiet gray) or back ON, so the
+    on-screen ON/OFF state always matches exactly what will be validated -- no
+    confusing "everything is validated but every chip looks off" inversion, and
+    re-including an object is just another click. Exclusions are stored in
+    ``validation_state.table_exclude`` (empty == validate all). Chips are grouped
+    and colored by schema; disabled while a run is in flight. Uses ``ui.button``
+    (not a label) so the click reliably toggles in both directions.
+    """
+    disabled = status is StepStatus.IN_PROGRESS
+    in_scope = set(scope_tables)
+    # Keep exclusions consistent with the current scope (drop names no longer in
+    # scope, e.g. after the migration selection changed).
+    excluded = validation_state.table_exclude & in_scope
+    included_count = len(in_scope) - len(excluded)
+    groups = group_objects_by_schema(scope_tables)
+
+    def _toggle(name: str) -> Callable[[], None]:
+        def _handler() -> None:
+            if disabled:
+                return
+            current = validation_state.table_exclude & in_scope
+            if name in current:
+                current.discard(name)  # re-include
+            else:
+                current.add(name)  # exclude
+            validation_state.table_exclude = current
+            refresh()
+
+        return _handler
+
+    def _set_excluded(value: set[str]) -> Callable[[], None]:
+        def _handler() -> None:
+            if disabled:
+                return
+            validation_state.table_exclude = value
+            refresh()
+
+        return _handler
+
+    with ui.column().classes("gap-2 w-full"):  # type: ignore[attr-defined]
+        # Header row: label + Include all / Exclude all shortcuts + live count.
+        with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+            _kv_label(ui, "Objects to validate")
+            ui.space()  # type: ignore[attr-defined]
+            ui.button(  # type: ignore[attr-defined]
+                "Include all", on_click=_set_excluded(set())
+            ).props("flat dense no-caps size=sm").set_enabled(
+                not disabled and bool(excluded)
+            )
+            ui.button(  # type: ignore[attr-defined]
+                "Exclude all", on_click=_set_excluded(set(in_scope))
+            ).props("flat dense no-caps size=sm").set_enabled(
+                not disabled and included_count > 0
+            )
+
+        # One chip row per schema. A chip is ON (included) unless excluded; clicking
+        # toggles it. Schema heading shown only for a multi-schema scope.
+        multi_schema = len(groups) > 1
+        for schema, names in groups:
+            with ui.column().classes("gap-1 w-full"):  # type: ignore[attr-defined]
+                if multi_schema:
+                    ui.label(schema).classes(  # type: ignore[attr-defined]
+                        "text-[11px] font-mono " + chip_group_text_class(schema)
+                    )
+                color = chip_group_quasar_color(schema)
+                with ui.row().classes("items-center gap-1.5 flex-wrap"):  # type: ignore[attr-defined]
+                    for name in names:
+                        _schema, obj = _split_schema(name)
+                        is_on = name not in excluded
+                        # Color comes from the Quasar `color` prop (reliable on a
+                        # q-btn) -- filled when included, outline when excluded -- so
+                        # both states always show the label (an excluded chip is NOT
+                        # a blank box) and the schema color is kept. An icon also
+                        # signals the state for accessibility / color-blind users.
+                        chip_props = (
+                            f"dense no-caps size=sm color={color} "
+                            f"icon={'check' if is_on else 'add'}"
+                            + ("" if is_on else " outline")
+                        )
+                        chip = ui.button(  # type: ignore[attr-defined]
+                            obj, on_click=_toggle(name)
+                        ).props(chip_props).classes("font-mono normal-case")
+                        chip.tooltip(  # type: ignore[attr-defined]
+                            f"{name} — {'included' if is_on else 'excluded'} "
+                            "(click to toggle)"
+                        )
+                        if disabled:
+                            chip.set_enabled(False)  # type: ignore[attr-defined]
+
+        # Hint: spell out exactly what will be validated + the all-by-default rule.
+        total = len(scope_tables)
+        if not excluded:
+            hint = f"All {total} object(s) will be validated. Click an object to exclude it."
+        elif disabled:
+            hint = (
+                f"{included_count} of {total} object(s) selected — applies to the "
+                "next run."
+            )
+        else:
+            hint = (
+                f"Validating {included_count} of {total} object(s) "
+                f"({len(excluded)} excluded). Click an excluded object to re-include; "
+                "Re-run to apply."
+            )
+        inline_hint(ui, hint, tone="neutral")
+
+
+def _kv_label(ui: object, label: str) -> None:
+    """Render a Cloudscape key-value-pair LABEL: a clear, anchoring header.
+
+    Semibold and gray-700 (not a faint gray-500) so the label reads as the HEADER
+    that owns the value below it -- the header↔value bond is what makes the pair
+    scannable. Uppercase + tracking keeps it compact and distinct from the value.
+    """
+    ui.label(label).classes(  # type: ignore[attr-defined]
+        "text-[11px] font-bold uppercase tracking-wider text-gray-700"
+    )
+
+
+def _kv(ui: object, label: str, value: str, *, mono: bool = False) -> None:
+    """Render one Cloudscape key-value pair: a header label tightly bound to its value.
+
+    The label sits directly on its value (no gap) behind a thin accent rule, so a
+    header and its value read as ONE unit; the grid's larger inter-pair gap then
+    separates pairs from each other. This makes "which header owns which value"
+    unambiguous -- the relationship the layout is built around.
+    """
+    value_classes = "text-sm text-gray-900 break-all leading-snug"
+    if mono:
+        value_classes += " font-mono text-[13px]"
+    # Left accent rule visually ties the stacked label+value into one pair.
+    with ui.column().classes(  # type: ignore[attr-defined]
+        "gap-0 min-w-0 pl-2 border-l-2 border-gray-200"
+    ):
+        _kv_label(ui, label)
+        ui.label(value).classes(value_classes)  # type: ignore[attr-defined]
+
+
+# Comparison-mode tiles: (mode, icon, title, description). The order is the tile
+# order; descriptions say what each mode actually compares.
+_MODE_TILES: tuple[tuple[ValidationMode, str, str, str], ...] = (
+    (
+        ValidationMode.ROW_COUNT,
+        "tag",
+        "Row count",
+        "Compare COUNT(*) per table. Fastest; confirms the row totals match.",
+    ),
+    (
+        ValidationMode.CHECKSUM,
+        "fingerprint",
+        "Row count + checksum",
+        "Also compares an order-independent per-row checksum, so a match means "
+        "the data itself is equal — not just the totals.",
+    ),
+)
+
+
+def _render_mode_tiles(
+    ui: object,
+    validation_state: ValidationState,
+    *,
+    disabled: bool,
+    refresh: Optional[Callable[[], None]] = None,
+) -> None:
+    """Render the comparison mode as AWS Cloudscape selectable radio tiles.
+
+    Each mode is a bordered card (radio + icon + title + description); the selected
+    tile gets the primary border + tint, mirroring the Data Migration migration-type
+    selector so the two choices look and feel identical across the journey. Disabled
+    (muted, non-interactive) while a run is in flight.
+    """
+    selected = validation_state.mode
+
+    def _select(mode: ValidationMode) -> Callable[[], None]:
+        def _handler() -> None:
+            if disabled or mode is validation_state.mode:
+                return
+            validation_state.mode = mode
+            if refresh is not None:
+                refresh()  # re-render so the chosen tile highlights
+
+        return _handler
+
+    with ui.column().classes("gap-1 w-full"):  # type: ignore[attr-defined]
+        _kv_label(ui, "Comparison mode")
+        with ui.row().classes("w-full gap-3 items-stretch no-wrap"):  # type: ignore[attr-defined]
+            for mode, icon, title, desc in _MODE_TILES:
+                is_selected = mode is selected
+                border = "border-blue-500" if is_selected else "border-gray-300"
+                bg = "bg-blue-50" if is_selected else "bg-white"
+                interactivity = (
+                    "opacity-60 cursor-not-allowed"
+                    if disabled
+                    else "cursor-pointer hover:border-blue-400"
+                )
+                tile = ui.card().classes(  # type: ignore[attr-defined]
+                    f"flex-1 p-3 rounded-lg border {border} {bg} {interactivity} "
+                    "transition-colors gap-1"
+                )
+                tile.on("click", _select(mode))  # type: ignore[attr-defined]
+                with tile:
+                    with ui.row().classes("items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
+                        ui.icon(  # type: ignore[attr-defined]
+                            "radio_button_checked"
+                            if is_selected
+                            else "radio_button_unchecked",
+                            color="primary" if is_selected else "grey-6",
+                        ).classes("text-lg")
+                        ui.icon(  # type: ignore[attr-defined]
+                            icon, color="primary" if is_selected else "grey-7"
+                        ).classes("text-lg")
+                        ui.label(title).classes("text-sm font-semibold")  # type: ignore[attr-defined]
+                    ui.label(desc).classes("text-xs text-gray-600")  # type: ignore[attr-defined]
+
+
+def _render_options(
+    ui: object,
+    validation_state: ValidationState,
+    status: StepStatus,
+    *,
+    has_result: bool = False,
+    refresh: Optional[Callable[[], None]] = None,
+) -> None:
+    """Render the validation mode select, reconcile, and orphan-check switches."""
+    disabled = status is StepStatus.IN_PROGRESS
+    # Comparison mode as AWS Cloudscape "tiles" (selectable radio cards), matching
+    # the Data Migration migration-type selector so the journey stays consistent.
+    _render_mode_tiles(ui, validation_state, disabled=disabled, refresh=refresh)
+    with ui.row().classes("items-center gap-4 flex-wrap"):  # type: ignore[attr-defined]
+        ui.switch(  # type: ignore[attr-defined]
+            "Reconcile every record (find missing / extra rows)",
+            value=validation_state.reconcile,
+            on_change=lambda e: setattr(
+                validation_state, "reconcile", bool(e.value)
+            ),
+        ).tooltip(  # type: ignore[attr-defined]
+            "Streams and compares every primary key on both sides to find the "
+            "exact rows missing on the target (lost / not-yet-replicated) or extra "
+            "on the target (a delete CDC has not applied). Single-column integer "
+            "keys only; other tables fall back to count/checksum."
+        )
+        ui.switch(  # type: ignore[attr-defined]
+            "Check for orphan records",
+            value=validation_state.check_orphans,
+            on_change=lambda e: setattr(
+                validation_state, "check_orphans", bool(e.value)
+            ),
+        )
+        ui.switch(  # type: ignore[attr-defined]
+            "Fast sweep (deep-check only tables whose counts differ)",
+            value=validation_state.deep_only_on_count_mismatch,
+            on_change=lambda e: setattr(
+                validation_state, "deep_only_on_count_mismatch", bool(e.value)
+            ),
+        ).tooltip(  # type: ignore[attr-defined]
+            "Speeds up a large run: compares row counts for every table but runs "
+            "the expensive checksum / full primary-key reconciliation only for "
+            "tables whose counts disagree. A count-matched table is reported as "
+            "verified by row count (deep checks not run) — never a false match."
+        )
+    # Make clear that toggling options does not change the report on screen until
+    # the next run -- both while a run is in flight and after a report is shown.
+    if disabled:
+        ui.label(  # type: ignore[attr-defined]
+            "Options apply to the next run."
+        ).classes("text-xs text-gray-400")
+    elif has_result:
+        ui.label(  # type: ignore[attr-defined]
+            "Changing options applies on the next run — use Re-run (top right) to "
+            "apply them."
+        ).classes("text-xs text-gray-400")
+
+
+def _install_poll_timer(
+    ui: object,
+    job_manager: JobManager,
+    session: object,
+    validation_state: ValidationState,
+    refresh: Callable[[], None],
+) -> None:
+    """Poll the running validation job once and re-arm via the next render.
+
+    Uses a ONE-SHOT timer (``once=True``): each IN_PROGRESS render installs a
+    single timer that fires once. While the job is still running the timer calls
+    ``refresh()``, which re-renders the in-progress state and installs the next
+    one-shot timer -- so polling stays alive without accumulating timers (a
+    repeating timer would re-install another repeating timer on every refresh and
+    multiply). When the job reaches a terminal state the status is updated, the
+    next render shows the result/cancelled state and installs no new timer.
+    """
+    job_id = validation_state.job_id
+    if job_id is None:
+        return
+
+    def poll() -> None:
+        try:
+            job = job_manager.get_status(job_id)
+        except JobNotFoundError:
+            return
+        mapped = job_status_to_step_status(job.status)
+        # Still running: re-render so the next one-shot poll timer is installed.
+        if mapped is None:
+            refresh()
+            return
+        if mapped is StepStatus.FAILED:
+            validation_state.set_error(
+                job_manager.get_error(job_id) or "Validation failed."
+            )
+        session.set_workflow(  # type: ignore[attr-defined]
+            with_status(
+                session.workflow,  # type: ignore[attr-defined]
+                WorkflowStep.VALIDATION,
+                mapped,
+            )
+        )
+        refresh()
+
+    ui.timer(_POLL_INTERVAL_SECONDS, poll, once=True)  # type: ignore[attr-defined]
+
+
+def _render_result(
+    ui: object,
+    report: ValidationReport,
+    *,
+    diagnose_provider=None,
+    elapsed_seconds: Optional[float] = None,
+    restored: bool = False,
+    completed_at: "Optional[datetime]" = None,
+) -> None:
+    """Render the cut-over readiness report: verdict, checks, then the details.
+
+    ``diagnose_provider`` (when given -- AI Assist on) opens the AI chat drawer
+    for a mismatch; it is threaded to the verdict (run-level "Diagnose with AI")
+    and to the failing-tables section (per-table "Explain with AI").
+    ``elapsed_seconds`` (when known) shows how long the run took under the verdict.
+    ``restored`` shows a "restored from a saved session" note (the result was
+    re-hydrated on reconnect, not run now), with its ``completed_at`` time, so a
+    stale verdict prompts a re-validate. The go-path "how to cut over" runbook
+    lives on the dedicated Cut over step, not in this result.
+    """
+    # Restored-from-snapshot banner FIRST, so the user knows this verdict is as-of
+    # a past run (the source may have changed since) before reading it.
+    if restored:
+        when = (
+            completed_at.strftime("%Y-%m-%d %H:%M UTC")
+            if completed_at is not None
+            else "a previous session"
+        )
+        render_notice(
+            ui,
+            tone="info",
+            header="Restored from your last session",
+            body=(
+                f"This is the validation result from {when}, reloaded after a "
+                "reconnect — it was not just re-run. If the source has changed "
+                "since then, click Re-run validation for a current verdict."
+            ),
+        )
+    summary = summarize_validation(report)
+    drift = format_drift(report)
+    _render_verdict(ui, summary, drift, elapsed_seconds=elapsed_seconds)
+    # On a no-go, the recovery path is its own prominent section right under the
+    # verdict (how to fix it + ordered steps + the AI diagnosis action). The go
+    # path's "how to actually cut over" runbook lives on the dedicated Cut over
+    # step (step 6), reached via the Next button — it is not duplicated here.
+    if not summary.ready_for_cutover:
+        _render_recovery_section(
+            ui, summary, drift, diagnose_provider=diagnose_provider
+        )
+    with _section(ui, icon="fact_check", title="Cut-over readiness"):
+        _render_readiness_checks(ui, summary, drift)
+    _render_failing_tables(
+        ui, report, summary, drift, diagnose_provider=diagnose_provider
+    )
+    with _section(ui, icon="table_view", title="Per-table results"):
+        _render_tables(ui, report)
+    _render_orphans(ui, report)
+    with _section(ui, icon="schedule", title="Drift since snapshot"):
+        _render_drift(ui, drift)
+    with _section(ui, icon="download", title="Export report"):
+        _render_downloads(ui, report)
+
+
+class _Section:
+    """Context manager: a titled section card, identical to every other page.
+
+    The app-wide section container is a plain ``ui.card().classes("w-full")`` with
+    a :func:`section_header` at the top and the body content directly inside (see
+    e.g. Evaluation's "Migration readiness" card). Validation used to draw its own
+    bordered header-band variant, which read as a different page; this now produces
+    the exact same DOM/spacing as the other steps so Validation is visually unified.
+    """
+
+    def __init__(self, ui: object, *, icon: str, title: str) -> None:
+        self._ui = ui
+        self._icon = icon
+        self._title = title
+        self._card = None
+
+    def __enter__(self):
+        ui = self._ui
+        self._card = ui.card().classes("w-full")  # type: ignore[attr-defined]
+        self._card.__enter__()
+        # Same header as every other page: shared section_header at the top of a
+        # default card; the caller's content lands directly in the card with the
+        # card's standard padding/gap.
+        section_header(ui, icon=self._icon, title=self._title)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._card.__exit__(*exc)  # type: ignore[attr-defined]
+
+
+def _section(ui: object, *, icon: str, title: str) -> _Section:
+    """Open a titled section container (see :class:`_Section`)."""
+    return _Section(ui, icon=icon, title=title)
+
+
+def _render_verdict(
+    ui: object, summary: ValidationSummary, drift: DriftDisplay, *,
+    elapsed_seconds: Optional[float] = None,
+) -> None:
+    """Render the overall go/no-go cut-over verdict as a Cloudscape notice (hero).
+
+    The verdict body also surfaces the two qualifiers that the strict
+    ``ready_for_cutover`` flag does not capture on its own: record-level
+    reconciliation being off (so "ready" is count/checksum-only), and the source
+    having advanced since the snapshot (fine under live CDC, but a re-verify
+    signal otherwise). ``elapsed_seconds`` (when known) is shown as a small
+    "Completed in …" caption. The recovery guidance on a no-go is a separate
+    section (:func:`_render_recovery_section`), not part of the verdict.
+    """
+    def _elapsed_caption() -> None:
+        if elapsed_seconds is None:
+            return
+        ui.label(  # type: ignore[attr-defined]
+            f"Completed in {format_duration(elapsed_seconds)}."
+        ).classes("text-xs text-gray-500")
+
+    if summary.ready_for_cutover:
+        body = (
+            f"All {summary.total_tables} table(s) match and no issues were found. "
+            f"Source and target are consistent as-of {summary.as_of}."
+        )
+        caveats: list[str] = []
+        if not summary.reconcile_performed:
+            caveats.append(
+                "record-level reconciliation was off, so this is a "
+                "count/checksum match only"
+            )
+        if drift.available and drift.determinable and drift.drifted:
+            caveats.append(
+                "the source has advanced since the snapshot — expected under live "
+                "CDC, but re-verify before cut-over if CDC is not running"
+            )
+        if caveats:
+            body += " Note: " + "; ".join(caveats) + "."
+        render_notice(ui, tone="success", header="Ready for cut-over", body=body)
+        _elapsed_caption()
+        return
+
+    render_notice(
+        ui,
+        tone="error",
+        header="Not ready for cut-over",
+        body=(
+            f"{summary.mismatched_tables} of {summary.total_tables} table(s) "
+            "did not pass. Review the failing checks and tables below before "
+            "switching over."
+        ),
+    )
+    _elapsed_caption()
+
+
+# How many missing/extra example PKs to summarize into the AI facts (range only,
+# never the full list -- Property 7: a bounded, non-enumerated hint).
+_FACTS_PK_SAMPLE = 5
+
+
+def _render_recovery_section(
+    ui: object, summary: ValidationSummary, drift: DriftDisplay, *,
+    diagnose_provider=None,
+) -> None:
+    """Render the mismatch-recovery guidance as its OWN titled section card.
+
+    Grouping it in a Cloudscape "Container" (the same `_section` every other block
+    uses) makes the recovery path a first-class, scannable unit rather than loose
+    notices under the verdict: a one-line why, the ordered click-path (Stop CDC
+    FIRST → re-run Full Load → resume CDC → re-validate), the quiesce-source
+    caveat, and an optional "Diagnose with AI" action.
+    """
+    with _section(ui, icon="build", title="How to recover"):  # type: ignore[misc]
+        render_notice(
+            ui,
+            tone="info",
+            header="Re-run Full Load + CDC to backfill the gap",
+            body=(
+                "These differences do not shrink over time, so they are a standing "
+                "gap (rows CDC won't re-deliver), not lag. Backfill them by "
+                "re-running the migration. The Full Load is idempotent "
+                "(INSERT ... ON CONFLICT) — it only fills missing rows and never "
+                "creates duplicates."
+            ),
+        )
+        # The exact, ordered click-path. STOP CDC FIRST is the critical step (a live
+        # CDC sink + a fresh Full Load collide; CDC resumes from the old watermark).
+        steps = (
+            ("1", "Go to the Data Migration step (left nav)."),
+            ("2", "Open the CDC sub-step and click Stop CDC — do this FIRST. "
+             "Re-running Full Load while CDC is live collides with the stream and "
+             "leaves a gap/overlap (CDC would resume from the old snapshot point)."),
+            ("3", "In the Full Load sub-step, click Start/Re-run to backfill the "
+             "missing rows (safe and duplicate-free)."),
+            ("4", "When it finishes, click Continue to CDC and start CDC again — it "
+             "resumes gaplessly from the new snapshot."),
+            ("5", "Come back here and click Re-run validation to confirm a clean "
+             "match."),
+        )
+        ui.label("Steps to recover").classes(  # type: ignore[attr-defined]
+            "text-sm font-semibold text-gray-900 mt-1"
+        )
+        with ui.column().classes("w-full gap-1.5"):  # type: ignore[attr-defined]
+            for num, text in steps:
+                with ui.row().classes("items-start gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+                    ui.label(num).classes(  # type: ignore[attr-defined]
+                        "shrink-0 w-5 h-5 rounded-full bg-blue-100 text-blue-700 "
+                        "text-[11px] font-semibold flex items-center justify-center"
+                    )
+                    ui.label(text).classes("text-xs text-gray-700 leading-snug")  # type: ignore[attr-defined]
+
+        source_live = bool(drift.available and drift.determinable and drift.drifted)
+        render_notice(
+            ui,
+            tone="warning" if source_live else "info",
+            header="For a definitive zero-loss verdict, quiesce the source first",
+            body=(
+                "The source has changed since the snapshot, so some difference may "
+                "be in-flight. Before the FINAL cut-over check, stop source writes "
+                "and let CDC drain (or Stop CDC from the Data Migration step), then "
+                "re-validate — a clean match then truly means no data was lost."
+                if source_live
+                else
+                "For the FINAL cut-over check, make sure source writes are quiesced "
+                "and CDC has caught up (Stop CDC from the Data Migration step) "
+                "before re-validating, so the target is not a moving target."
+            ),
+        )
+        if diagnose_provider is not None:
+            with ui.row().classes("w-full mt-1"):  # type: ignore[attr-defined]
+                ui.button(  # type: ignore[attr-defined]
+                    "Diagnose with AI",
+                    icon="auto_awesome",
+                    on_click=lambda: diagnose_provider(
+                        title="AI mismatch diagnosis",
+                        subtitle="Whole validation run",
+                        first_question=(
+                            "Diagnose these mismatches — is this replication lag, a "
+                            "standing gap, or extra rows, and exactly how do I "
+                            "reconcile to a clean cut-over?"
+                        ),
+                        facts=_validation_run_facts(summary, drift),
+                        scope="run",
+                    ),
+                ).props("color=primary outline no-caps")
+
+
+def _render_cutover_section(
+    ui: object, summary: ValidationSummary, drift: DriftDisplay, *,
+    cdc_in_use: bool = False,
+) -> None:
+    """Render the go-path cut-over runbook as its OWN titled section card.
+
+    The verdict says the target is consistent; this tells the user how to actually
+    finish — repoint the application to DSQL — which is the one step the tool does
+    not do for them. Mirrors :func:`_render_recovery_section` (same `_section`
+    container, info notice, numbered steps, closing caveat) so go and no-go feel
+    symmetric. The steps branch on ``cdc_in_use``: a CDC path drains the stream to
+    zero lag and tears the cdc-stack down afterwards; a Full-Load-only path just
+    needs a brief source write-freeze. Rollback is called out either way, because
+    once the application writes to DSQL those rows live only on DSQL (this tool
+    replicates MySQL -> DSQL, not the reverse).
+    """
+    with _section(ui, icon="rocket_launch", title="How to cut over"):  # type: ignore[misc]
+        render_notice(
+            ui,
+            tone="success",
+            header="Validation passed — you're ready to switch your app to DSQL",
+            body=(
+                "Cut-over is the moment your application stops writing to MySQL and "
+                "starts using Aurora DSQL. The tool has proven the target is "
+                "consistent; repointing the application is the final operational "
+                "step, and only you can do it. Follow the runbook below for a safe "
+                "switch with a rollback path."
+            ),
+        )
+        if cdc_in_use:
+            steps = (
+                ("1", "Let CDC catch up: on the Data Migration step, watch the CDC "
+                 "status until replication lag is at (or near) zero — DSQL is "
+                 "tracking the source's live writes."),
+                ("2", "Freeze writes on the source: briefly put your application in "
+                 "read-only / maintenance mode so MySQL stops taking new writes."),
+                ("3", "Wait for the final drain: let CDC apply the last in-flight "
+                 "change events until lag is zero again. MySQL and DSQL now hold "
+                 "the same rows."),
+                ("4", "Re-run validation here for the final go/no-go. Cut over only "
+                 "on a clean MATCH (or differences you can fully explain)."),
+                ("5", "Repoint your application to the Aurora DSQL endpoint "
+                 "(PostgreSQL wire, IAM-token auth — no password) and smoke-test "
+                 "the critical read/write paths."),
+                ("6", "Once you're confident, tear the CDC pipeline down: click "
+                 "Start over (top right) and choose \"Delete all CDC "
+                 "infrastructure\". Do this LAST — it ends replication. It stops "
+                 "MSK / MSK Connect / NAT cost AND clears the old stack, which a "
+                 "future fresh Full Load or CDC needs removed before it can deploy. "
+                 "(If that option isn't shown, CDC is already torn down — nothing "
+                 "left to remove.)"),
+            )
+        else:
+            steps = (
+                ("1", "Freeze writes on the source: put your application in "
+                 "read-only / maintenance mode so no new rows are written to "
+                 "MySQL while you switch."),
+                ("2", "If the source took writes since the snapshot, re-run Full "
+                 "Load once more (it's idempotent — only fills the unfinished "
+                 "work, never duplicates), then re-run validation here."),
+                ("3", "Confirm a clean MATCH on this screen — that's the go/no-go "
+                 "gate."),
+                ("4", "Repoint your application to the Aurora DSQL endpoint "
+                 "(PostgreSQL wire, IAM-token auth — no password) and smoke-test "
+                 "the critical read/write paths."),
+                ("5", "Lift the freeze — your application is now live on DSQL."),
+            )
+        steps_heading = (
+            "Steps to cut over (with CDC)"
+            if cdc_in_use
+            else "Steps to cut over (Full Load)"
+        )
+        ui.label(steps_heading).classes(  # type: ignore[attr-defined]
+            "text-base font-semibold text-gray-900 mt-1"
+        )
+        with ui.column().classes("w-full gap-2"):  # type: ignore[attr-defined]
+            for num, text in steps:
+                with ui.row().classes("items-start gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+                    ui.label(num).classes(  # type: ignore[attr-defined]
+                        "shrink-0 w-6 h-6 rounded-full bg-green-100 text-green-700 "
+                        "text-xs font-semibold flex items-center justify-center"
+                    )
+                    ui.label(text).classes("text-sm text-gray-700 leading-snug")  # type: ignore[attr-defined]
+
+        # Rollback caveat: once the app writes to DSQL, those rows exist only there
+        # (this tool does not replicate DSQL -> MySQL), so keep the source as a
+        # read-only rollback anchor until sign-off.
+        render_notice(
+            ui,
+            tone="info",
+            header="Keep the source as your rollback anchor",
+            body=(
+                "Until you've signed off on DSQL, keep the MySQL source frozen "
+                "(read-only) rather than dropping it. Before you repoint, rollback "
+                "is trivial — the source is untouched and still authoritative. "
+                "After the application writes to DSQL, those new rows live only on "
+                "DSQL (this tool replicates MySQL -> DSQL, not the reverse), so "
+                "rolling back then means reconciling them yourself first."
+            ),
+        )
+
+
+def _render_readiness_checks(
+    ui: object, summary: ValidationSummary, drift: DriftDisplay
+) -> None:
+    """Render the pre-cut-over checks as a compact, uniform pass/fail panel.
+
+    1. Data identical -- per-table row counts (and, in checksum mode, checksums).
+    2. No mismatched records -- full PK reconciliation (missing / extra rows).
+    3. No table errors -- every table could be compared.
+    4. No source drift -- the source has not advanced since the snapshot.
+    """
+    # Check 1: data identical.
+    _render_check_row(
+        ui,
+        passed=summary.is_match,
+        label="Data identical",
+        detail=(
+            f"{summary.matched_tables}/{summary.total_tables} tables matched"
+            + (
+                f", {summary.mismatched_tables} mismatched"
+                if summary.mismatched_tables
+                else ""
+            )
+            + f" (mode: {summary.mode})."
+        ),
+    )
+
+    # Check 2: no mismatched records (only meaningful when reconciliation ran).
+    if summary.reconcile_performed:
+        _render_check_row(
+            ui,
+            passed=summary.inconsistent_tables == 0,
+            label="No mismatched records",
+            detail=(
+                f"{summary.reconciled_tables} table(s) reconciled; "
+                f"{summary.missing_on_target:,} record(s) missing on target, "
+                f"{summary.extra_on_target:,} extra on target."
+            ),
+        )
+    else:
+        _render_check_row(
+            ui,
+            passed=True,
+            label="No mismatched records",
+            detail="Record-level reconciliation was turned off for this run.",
+            neutral=True,
+        )
+
+    # Check 3: no table errors.
+    _render_check_row(
+        ui,
+        passed=summary.errored_tables == 0,
+        label="No table errors",
+        detail=(
+            "Every table was compared successfully."
+            if summary.errored_tables == 0
+            else f"{summary.errored_tables} table(s) could not be compared."
+        ),
+    )
+
+    # Check 4: source drift since the snapshot (uniform with the others). Drift is
+    # not a hard failure (it is expected under live CDC), so an advanced source is
+    # a warning, an undeterminable/absent watermark is neutral.
+    if not drift.available or not drift.determinable:
+        _render_check_row(
+            ui,
+            passed=True,
+            label="No source drift since snapshot",
+            detail=drift.summary,
+            neutral=True,
+        )
+    else:
+        _render_check_row(
+            ui,
+            passed=not drift.drifted,
+            label="No source drift since snapshot",
+            detail=drift.summary,
+            warn_on_fail=True,
+        )
+
+    ui.label(f"As-of (consistency point): {summary.as_of}").classes(  # type: ignore[attr-defined]
+        "text-xs text-gray-500"
+    )
+
+
+def _render_check_row(
+    ui: object,
+    *,
+    passed: bool,
+    label: str,
+    detail: str,
+    neutral: bool = False,
+    warn_on_fail: bool = False,
+) -> None:
+    """Render one readiness check as an icon + bold label + status chip + detail.
+
+    ``neutral`` renders a quiet "Not run / N/A" row; ``warn_on_fail`` renders a
+    failed check as a non-blocking amber warning (used for drift) rather than a
+    blocking red failure.
+    """
+    if neutral:
+        icon, color, tone, status = "remove_circle_outline", "grey-6", "neutral", "N/A"
+    elif passed:
+        icon, color, tone, status = "check_circle", "green-6", "ok", "Passed"
+    elif warn_on_fail:
+        icon, color, tone, status = "warning", "amber-6", "reconnect", "Heads-up"
+    else:
+        icon, color, tone, status = "cancel", "red-6", "bad", "Failed"
+    with ui.row().classes("items-start gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+        ui.icon(icon, color=color).classes("text-lg mt-0.5")  # type: ignore[attr-defined]
+        with ui.column().classes("gap-0 min-w-0 flex-1"):  # type: ignore[attr-defined]
+            with ui.row().classes("items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
+                ui.label(label).classes("text-sm font-semibold text-gray-900")  # type: ignore[attr-defined]
+                ui.label(status).classes(  # type: ignore[attr-defined]
+                    "text-[10px] leading-tight border rounded px-2 py-0.5 "
+                    + badge_classes(tone)
+                )
+            ui.label(detail).classes("text-xs text-gray-600")  # type: ignore[attr-defined]
+
+
+def _render_failing_tables(
+    ui: object,
+    report: ValidationReport,
+    summary: ValidationSummary,
+    drift: "Optional[DriftDisplay]" = None,
+    *,
+    diagnose_provider=None,
+) -> None:
+    """Surface the failing tables (chips) + WHICH rows diverge (sample PKs).
+
+    The core triage aid for a no-go: instead of scanning the whole per-table
+    table, the reviewer sees exactly which tables need attention and, for each, a
+    short explanation plus example diverging primary keys (from reconciliation /
+    the dev row-diff sample). When AI Assist is on, each failing table gets an
+    "Explain with AI" button (``diagnose_provider``). Nothing renders when every
+    table passed.
+    """
+    failed = [
+        item
+        for item in report.items
+        if item.error is not None or not item.matched
+    ]
+    if not failed:
+        return
+    with _section(
+        ui, icon="error_outline", title=f"Tables needing attention ({len(failed)})"
+    ):
+        for item in failed:
+            _render_failing_table(ui, item, diagnose_provider=diagnose_provider)
+
+
+def _render_failing_table(
+    ui: object, item: TableValidationResult, *, diagnose_provider=None
+) -> None:
+    """Render one failing table: name + reason + example diverging PKs (+ AI)."""
+    with ui.row().classes("items-start gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+        ui.icon("cancel", color="red-6").classes("text-base mt-0.5")  # type: ignore[attr-defined]
+        with ui.column().classes("gap-0 min-w-0 flex-1"):  # type: ignore[attr-defined]
+            with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+                ui.label(item.table).classes(  # type: ignore[attr-defined]
+                    "text-sm font-semibold text-gray-900 font-mono break-all"
+                )
+                ui.space()  # type: ignore[attr-defined]
+                if diagnose_provider is not None:
+                    ui.button(  # type: ignore[attr-defined]
+                        "Explain with AI",
+                        icon="auto_awesome",
+                        on_click=lambda _e=None, _it=item: diagnose_provider(
+                            title="AI mismatch diagnosis",
+                            subtitle=f"{_it.table} · table",
+                            first_question=(
+                                f"Why does `{_it.table}` not match, and exactly how "
+                                "do I fix it?"
+                            ),
+                            facts=_validation_table_facts(_it),
+                            scope="table",
+                        ),
+                    ).props("flat dense no-caps size=sm color=indigo-6")
+            for line in _failure_reasons(item):
+                ui.label(line).classes("text-xs text-gray-600")  # type: ignore[attr-defined]
+            for label, pks, truncated in _sample_pk_lines(item):
+                if not pks:
+                    continue
+                shown = ", ".join(pks)
+                suffix = " …(more)" if truncated else ""
+                ui.label(f"{label}: {shown}{suffix}").classes(  # type: ignore[attr-defined]
+                    "text-[11px] text-gray-500 font-mono break-all"
+                )
+
+
+def _validation_table_facts(item: TableValidationResult) -> str:
+    """Build the credential-free fact block for ONE failing table's AI chat.
+
+    Counts, the match flags, a missing/extra SUMMARY (counts + a SHORT PK sample
+    as a hint, never the full row set), and any per-table error -- the same facts
+    shown on screen, formatted for grounding. No row values (Property 7).
+    """
+    lines = [
+        f"Table: {item.table}",
+        f"Source row count: {item.source_row_count:,}",
+        f"Target row count: {item.target_row_count:,}",
+        f"Row counts match: {item.row_count_match}",
+    ]
+    if item.error is not None:
+        lines.append(f"Could not be compared (error): {item.error}")
+    if item.checksum_match is not None:
+        lines.append(f"Checksum match: {item.checksum_match}")
+    if item.deep_checks_skipped:
+        lines.append(
+            "Deep checks (checksum / reconciliation) were skipped (fast sweep, "
+            "counts matched)."
+        )
+    rec = item.reconcile
+    if rec is not None:
+        lines.append(
+            f"Record reconciliation: {rec.missing_on_target:,} missing on target, "
+            f"{rec.extra_on_target:,} extra on target (PK column {rec.pk_column})."
+        )
+        miss = list(getattr(rec, "missing_sample", []) or [])[:_FACTS_PK_SAMPLE]
+        extra = list(getattr(rec, "extra_sample", []) or [])[:_FACTS_PK_SAMPLE]
+        if miss:
+            lines.append(f"Example missing PKs: {', '.join(map(str, miss))}")
+        if extra:
+            lines.append(f"Example extra PKs: {', '.join(map(str, extra))}")
+    return "\n".join(lines)
+
+
+def _validation_run_facts(summary: ValidationSummary, drift: DriftDisplay) -> str:
+    """Build the credential-free fact block for the whole-run AI diagnosis.
+
+    Roll-up counts (matched/mismatched, missing/extra totals, errored tables),
+    whether reconciliation ran, and the drift signal -- enough for the model to
+    judge lag vs standing gap vs extra rows and recommend recovery. No row values.
+    """
+    lines = [
+        f"Tables total: {summary.total_tables}",
+        f"Matched: {summary.matched_tables}; mismatched: {summary.mismatched_tables}",
+        f"Comparison mode: {summary.mode}",
+        f"Reconciliation ran: {summary.reconcile_performed}",
+        f"Records missing on target (total): {summary.missing_on_target:,}",
+        f"Records extra on target (total): {summary.extra_on_target:,}",
+        f"Tables that errored: {summary.errored_tables}",
+        f"As-of (consistency point): {summary.as_of}",
+    ]
+    if summary.failed_tables:
+        shown = ", ".join(summary.failed_tables[:10])
+        more = "" if len(summary.failed_tables) <= 10 else " …(more)"
+        lines.append(f"Failing tables: {shown}{more}")
+    if drift.available:
+        if not drift.determinable:
+            lines.append("Drift since snapshot: undeterminable (GTID unavailable).")
+        else:
+            lines.append(
+                "Drift since snapshot: source HAS advanced (likely still live)."
+                if drift.drifted
+                else "Drift since snapshot: none (source unchanged since snapshot)."
+            )
+    return "\n".join(lines)
+
+
+def _failure_reasons(item: TableValidationResult) -> list[str]:
+    """Return human reasons this table failed (error / counts / records)."""
+    if item.error is not None:
+        return [f"Could not be compared: {item.error}"]
+    reasons: list[str] = []
+    if not item.row_count_match:
+        reasons.append(
+            f"Row count differs — source {item.source_row_count:,}, "
+            f"target {item.target_row_count:,}."
+        )
+    if item.checksum_match is False:
+        reasons.append("Checksum differs (row counts equal, but data is not).")
+    reconcile = item.reconcile
+    if reconcile is not None and not reconcile.consistent:
+        reasons.append(
+            f"{reconcile.missing_on_target:,} record(s) missing on target, "
+            f"{reconcile.extra_on_target:,} extra on target."
+        )
+    if not reasons:
+        reasons.append("Did not match.")
+    return reasons
+
+
+def _sample_pk_lines(
+    item: TableValidationResult,
+) -> list[tuple[str, list[str], bool]]:
+    """Return ``(label, pk_values, truncated)`` example-PK lines for a table.
+
+    Prefers the full reconciliation's missing/extra PK samples (Property 7: PK
+    values only); falls back to the dev row-diff sample's PKs when present. Empty
+    when the table carries no PK-level samples (e.g. a composite-PK table, or a
+    checksum-only mismatch).
+    """
+    lines: list[tuple[str, list[str], bool]] = []
+    reconcile = item.reconcile
+    if reconcile is not None:
+        if reconcile.missing_sample:
+            lines.append(
+                (
+                    f"Missing on target (pk {reconcile.pk_column})",
+                    list(reconcile.missing_sample),
+                    reconcile.sample_truncated,
+                )
+            )
+        if reconcile.extra_sample:
+            lines.append(
+                (
+                    f"Extra on target (pk {reconcile.pk_column})",
+                    list(reconcile.extra_sample),
+                    reconcile.sample_truncated,
+                )
+            )
+    sample = item.row_diff_sample
+    if not lines and sample is not None and sample.findings:
+        pks = [f.pk for f in sample.findings]
+        lines.append((f"Diverging rows (pk {sample.pk_column})", pks, sample.truncated))
+    return lines
+
+
+# Per-table result-cell metadata: (display text, badge tone) for the colored
+# Quasar body-cell badges, so a match/mismatch reads at a glance (no plain text).
+def _cell(text: str, tone: str) -> dict[str, str]:
+    """Return a ``{text, color}`` cell payload for a colored Quasar badge."""
+    return {"text": text, "color": _QUASAR_BADGE_COLOR.get(tone, "grey-5")}
+
+
+# Map our semantic tone to a Quasar badge color (kept local; the per-cell badges
+# are rendered by Quasar, which wants its own color names).
+_QUASAR_BADGE_COLOR: dict[str, str] = {
+    "ok": "green-6",
+    "bad": "red-6",
+    "neutral": "grey-5",
+}
+
+
+def _render_tables(ui: object, report: ValidationReport) -> None:
+    """Render the per-table comparison results, sortable + filterable (6.1, 6.2).
+
+    Failed tables sort first by default and a search box filters to a table name
+    or status, so a reviewer can isolate problems instead of scrolling. Status
+    cells render as colored Quasar badges (no plain colored text), and counts are
+    thousands-separated.
+    """
+    if not report.items:
+        ui.label("No tables compared.").classes("text-sm text-gray-500")  # type: ignore[attr-defined]
+        return
+
+    columns = [
+        {"name": "table", "label": "Table", "field": "table", "align": "left",
+         "sortable": True},
+        {"name": "source_rows", "label": "Source rows", "field": "source_rows",
+         "align": "right", "sortable": True},
+        {"name": "target_rows", "label": "Target rows", "field": "target_rows",
+         "align": "right", "sortable": True},
+        {"name": "row_count", "label": "Row count", "field": "row_count"},
+        {"name": "checksum", "label": "Checksum", "field": "checksum"},
+        {"name": "missing", "label": "Missing", "field": "missing",
+         "align": "right", "sortable": True},
+        {"name": "extra", "label": "Extra", "field": "extra",
+         "align": "right", "sortable": True},
+        {"name": "result", "label": "Result", "field": "result_sort",
+         "sortable": True},
+    ]
+    rows = [_table_row(item) for item in report.items]
+    table = ui.table(  # type: ignore[attr-defined]
+        columns=columns,
+        rows=rows,
+        row_key="table",
+        pagination=20,
+    ).classes("w-full")
+    # Default sort: failures first (result_sort: 0=fail/error, 1=pass).
+    table.props("sort-by=result_sort")  # type: ignore[attr-defined]
+    # Search box filters by any visible value (table name or status text).
+    with table.add_slot("top-left"):  # type: ignore[attr-defined]
+        ui.input(placeholder="Filter tables…").props(  # type: ignore[attr-defined]
+            "dense outlined clearable"
+        ).classes("min-w-64").bind_value(table, "filter")
+    # Colored status badges (match/mismatch/error) instead of plain text.
+    for col in ("row_count", "checksum", "result"):
+        table.add_slot(  # type: ignore[attr-defined]
+            f"body-cell-{col}",
+            r"""
+            <q-td :props="props">
+              <q-badge v-if="props.value && props.value.text"
+                       :color="props.value.color" :label="props.value.text" />
+              <span v-else>—</span>
+            </q-td>
+            """,
+        )
+    # Footnote: explain the "n/a" missing/extra cells when reconciliation ran but
+    # could not cover every table (composite / non-integer PK).
+    skipped = reconcile_skipped_tables(report)
+    if skipped:
+        ui.label(  # type: ignore[attr-defined]
+            f"“n/a” in Missing/Extra: {len(skipped)} table(s) have a composite or "
+            "non-integer primary key, so they are compared by count/checksum only "
+            "(record-level reconciliation needs a single integer key)."
+        ).classes("text-xs text-gray-500")
+    # Fast sweep honesty: tables whose counts matched were NOT deep-checked, so the
+    # operator knows the "match" for them is by row count, not a proven identical
+    # row set. An info notice (expected state), not a warning.
+    count_only = count_verified_tables(report)
+    if count_only:
+        render_notice(
+            ui,
+            tone="info",
+            header=(
+                f"{len(count_only)} table(s) verified by row count only "
+                "(fast sweep)"
+            ),
+            body=(
+                "Fast sweep skipped the checksum / record reconciliation for tables "
+                "whose row counts matched, so those are confirmed equal by count but "
+                "not proven row-for-row identical. For a full record-level guarantee "
+                "before cut-over, turn off Fast sweep and re-run."
+            ),
+        )
+
+
+def _table_row(item: TableValidationResult) -> dict[str, object]:
+    """Build one per-table row, with colored-badge cells + sortable scalars."""
+    if item.error is not None:
+        # An errored table cannot offer counts; flag it clearly and sort first.
+        return {
+            "table": item.table,
+            "source_rows": "—",
+            "target_rows": "—",
+            "row_count": _cell("error", "bad"),
+            "checksum": None,
+            "missing": "—",
+            "extra": "—",
+            "result": _cell("ERROR", "bad"),
+            "result_sort": 0,
+        }
+    return {
+        "table": item.table,
+        "source_rows": f"{item.source_row_count:,}",
+        "target_rows": f"{item.target_row_count:,}",
+        "row_count": _cell(
+            "match" if item.row_count_match else "mismatch",
+            "ok" if item.row_count_match else "bad",
+        ),
+        "checksum": _checksum_cell(item),
+        "missing": _reconcile_cell(item, "missing"),
+        "extra": _reconcile_cell(item, "extra"),
+        "result": _cell(
+            "match" if item.matched else "mismatch",
+            "ok" if item.matched else "bad",
+        ),
+        "result_sort": 1 if item.matched else 0,
+    }
+
+
+def _reconcile_cell(item: TableValidationResult, which: str) -> object:
+    """Return the missing/extra reconciliation cell (``n/a`` when not reconciled)."""
+    if item.reconcile is None:
+        return "n/a"
+    value = (
+        item.reconcile.missing_on_target
+        if which == "missing"
+        else item.reconcile.extra_on_target
+    )
+    return f"{value:,}"
+
+
+def _checksum_cell(item: TableValidationResult) -> Optional[dict[str, str]]:
+    """Return the per-table checksum badge cell (``None`` => ``—`` in row-count mode)."""
+    if item.checksum_match is None:
+        return None
+    return _cell(
+        "match" if item.checksum_match else "mismatch",
+        "ok" if item.checksum_match else "bad",
+    )
+
+
+def _render_orphans(ui: object, report: ValidationReport) -> None:
+    """Render the orphan-record findings, if the orphan check was performed."""
+    if not report.orphan_check_performed:
+        return
+    with _section(ui, icon="link_off", title="Orphan records"):
+        if not report.orphan_findings:
+            ui.label("No orphan records found.").classes(  # type: ignore[attr-defined]
+                "text-sm text-gray-500"
+            )
+            return
+        columns = [
+            {"name": "table", "label": "Table", "field": "table", "align": "left"},
+            {"name": "foreign_key", "label": "Foreign key", "field": "foreign_key"},
+            {
+                "name": "referenced_table",
+                "label": "Referenced table",
+                "field": "referenced_table",
+                "align": "left",
+            },
+            {"name": "orphan_count", "label": "Orphans", "field": "orphan_count",
+             "align": "right"},
+        ]
+        rows = [
+            {
+                "table": finding.table,
+                "foreign_key": finding.foreign_key,
+                "referenced_table": finding.referenced_table,
+                "orphan_count": f"{finding.orphan_count:,}",
+            }
+            for finding in report.orphan_findings
+        ]
+        ui.table(columns=columns, rows=rows).classes("w-full")  # type: ignore[attr-defined]
+
+
+def _render_drift(ui: object, drift: DriftDisplay) -> None:
+    """Render the drift-since-watermark detail (GTID comparison; Req 6.5)."""
+    ui.label(drift.summary).classes("text-sm text-gray-700")  # type: ignore[attr-defined]
+    columns = [
+        {"name": "field", "label": "Field", "field": "field", "align": "left"},
+        {"name": "value", "label": "Value", "field": "value", "align": "left"},
+    ]
+    rows = [
+        {"field": "Watermark GTID", "value": drift.watermark_gtid},
+        {"field": "Current source GTID", "value": drift.current_gtid},
+        {"field": "Detail", "value": drift.detail},
+    ]
+    ui.table(columns=columns, rows=rows).classes("w-full")  # type: ignore[attr-defined]
+
+
+def _render_downloads(ui: object, report: ValidationReport) -> None:
+    """Render the export (download) buttons for the validation report (Req 8.4)."""
+
+    def _download(download: ReportDownload) -> None:
+        ui.download.content(  # type: ignore[attr-defined]
+            download.content, download.filename, download.media_type
+        )
+
+    with ui.row().classes("gap-4 flex-wrap"):  # type: ignore[attr-defined]
+        with ui.column().classes("gap-0"):  # type: ignore[attr-defined]
+            ui.button(  # type: ignore[attr-defined]
+                "JSON",
+                icon="data_object",
+                on_click=lambda: _download(validation_download(report, "json")),
+            ).props("outline")
+            ui.label("Machine-readable, for automation/archive.").classes(  # type: ignore[attr-defined]
+                "text-xs text-gray-500"
+            )
+        with ui.column().classes("gap-0"):  # type: ignore[attr-defined]
+            ui.button(  # type: ignore[attr-defined]
+                "Text",
+                icon="description",
+                on_click=lambda: _download(validation_download(report, "text")),
+            ).props("outline")
+            ui.label("Readable summary incl. sample diverging PKs.").classes(  # type: ignore[attr-defined]
+                "text-xs text-gray-500"
+            )
+
+
+__all__ = [
+    "ValidationInputs",
+    "ValidatorFactory",
+    "run_validation",
+    "job_status_to_step_status",
+    "ValidationSummary",
+    "summarize_validation",
+    "humanize_as_of",
+    "failed_table_names",
+    "reconcile_skipped_tables",
+    "count_verified_tables",
+    "group_objects_by_schema",
+    "ResolvedScope",
+    "resolve_validation_tables",
+    "apply_table_filter",
+    "included_from_exclusions",
+    "ValidationScope",
+    "build_validation_scope",
+    "DriftDisplay",
+    "format_drift",
+    "ReportDownload",
+    "validation_download",
+    "ValidationState",
+    "ValidationStore",
+    "build_validation_screen",
+    "build_cutover_screen",
+]

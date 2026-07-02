@@ -1,0 +1,48 @@
+version: 0.2
+
+# Builds the app image inside AWS CodeBuild (Docker runs in the managed build
+# environment, so no local Docker is required) and pushes it to Amazon ECR.
+# Provisioned by deploy/codebuild.yaml; kicked off by deploy/build_in_codebuild.sh.
+#
+# Environment variables provided by the CodeBuild project / start-build:
+#   ACCOUNT_ID          AWS account id (set by the CodeBuild project)
+#   AWS_DEFAULT_REGION  set automatically by CodeBuild
+#   ECR_REPO            ECR repository name (set by the project)
+#   IMAGE_TAG           image tag (overridden per build; default 'latest')
+#   PUBLIC_IMAGE_URI    optional: if set (e.g. public.ecr.aws/<alias>/mysql-dsql-migrator),
+#                       the built image is ALSO tagged + pushed there. This is the
+#                       release path -- the published ECR Public image is what
+#                       customers pull by default (deploy/cloudformation.yaml
+#                       ContainerImageUri default). Leave empty for a private-only build.
+
+env:
+  variables:
+    IMAGE_PLATFORM: "linux/amd64"
+    PUBLIC_IMAGE_URI: ""
+
+phases:
+  pre_build:
+    commands:
+      - REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      - IMAGE_URI="${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
+      - echo "Building ${IMAGE_URI} for ${IMAGE_PLATFORM}"
+      # ECR Public login (us-east-1 only) -- used both to pull base images (avoids
+      # Docker Hub rate limits) and, when PUBLIC_IMAGE_URI is set, to push the release.
+      - aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
+      # Authenticate to the private ECR registry we push to.
+      - aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | docker login --username AWS --password-stdin "${REGISTRY}"
+  build:
+    commands:
+      - docker build --platform "${IMAGE_PLATFORM}" -f deploy/Dockerfile -t "${IMAGE_URI}" .
+  post_build:
+    commands:
+      - docker push "${IMAGE_URI}"
+      - echo "Pushed ${IMAGE_URI}"
+      # Release path: also publish to ECR Public when PUBLIC_IMAGE_URI is provided.
+      - |
+        if [ -n "${PUBLIC_IMAGE_URI}" ]; then
+          echo "Publishing to ECR Public: ${PUBLIC_IMAGE_URI}:${IMAGE_TAG}"
+          docker tag "${IMAGE_URI}" "${PUBLIC_IMAGE_URI}:${IMAGE_TAG}"
+          docker push "${PUBLIC_IMAGE_URI}:${IMAGE_TAG}"
+          echo "Pushed ${PUBLIC_IMAGE_URI}:${IMAGE_TAG}"
+        fi

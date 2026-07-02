@@ -1,0 +1,18 @@
+# Keep the build context small and reproducible.
+.venv/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.git/
+.gitignore
+tests/
+scripts/
+deploy/
+# ...but the CDC infra deploy reads this template at runtime, so it must be in the
+# build context for the Dockerfile COPY (see deploy/Dockerfile).
+!deploy/cdc-stack/cdc-stack.yaml
+.env
+.env.*
+*.log
+*.sqlite
+.kiro/

@@ -1,0 +1,55 @@
+<mxfile host="Electron" agent="DrawioJSAPI/1.0.0">
+  <diagram id="diagram-simple" name="aws-architecture-simple">
+    <mxGraphModel dx="1497" dy="1090" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="620" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="mskconnect" parent="1" style="rounded=1;fillColor=#F2F7FF;strokeColor=#5A6C86;dashed=1;verticalAlign=top;align=center;fontStyle=2;fontColor=#5A6C86;whiteSpace=wrap;html=1;fontSize=12;" value="CDC pipeline — runs on Amazon MSK Connect (managed, no servers owned)" vertex="1">
+          <mxGeometry height="270" width="620" x="250" y="330" as="geometry" />
+        </mxCell>
+        <mxCell id="rds" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.rds;fillColor=#3B48CC" value="Source MySQL&#xa;(RDS / Aurora MySQL)" vertex="1">
+          <mxGeometry height="78" width="78" x="60" y="250" as="geometry" />
+        </mxCell>
+        <mxCell id="fargate" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.fargate;fillColor=#ED7100" value="Migration Tool&#xa;(ECS Fargate · web UI)" vertex="1">
+          <mxGeometry height="78" width="78" x="430" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="debezium" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d1c4e9;strokeColor=#5e35b1;fontSize=12;align=center;verticalAlign=middle;" value="① Debezium&#xa;MySQL Source Connector" vertex="1">
+          <mxGeometry height="80" width="160" x="280" y="400" as="geometry" />
+        </mxCell>
+        <mxCell id="msk" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=#945DF2;gradientDirection=north;fillColor=#5A30B5;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.managed_streaming_for_kafka;" value="Amazon MSK&#xa;(topics)" vertex="1">
+          <mxGeometry height="78" width="78" x="500" y="401" as="geometry" />
+        </mxCell>
+        <mxCell id="sink" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe0b2;strokeColor=#e65100;fontSize=12;align=center;verticalAlign=middle;" value="② Custom DSQL Sink Connector&#xa;(Java · IAM · OCC retry)" vertex="1">
+          <mxGeometry height="80" width="180" x="650" y="400" as="geometry" />
+        </mxCell>
+        <mxCell id="aurora" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.aurora;fillColor=#3B48CC" value="Amazon Aurora DSQL&#xa;(target)" vertex="1">
+          <mxGeometry height="78" width="78" x="960" y="250" as="geometry" />
+        </mxCell>
+        <mxCell id="e_fullload_src" edge="1" parent="1" source="rds" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=12;" target="fargate" value="Full Load (bulk read)">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_fullload_tgt" edge="1" parent="1" source="fargate" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=12;" target="aurora" value="convert + bulk load">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_cdc_src" edge="1" parent="1" source="rds" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=12;dashed=1;" target="debezium" value="binlog (CDC)">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_cdc_1" edge="1" parent="1" source="debezium" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=12;" target="msk" value="change events">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_cdc_2" edge="1" parent="1" source="msk" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=12;" target="sink" value="consume">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_cdc_tgt" edge="1" parent="1" source="sink" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=12;" target="aurora" value="upsert/delete">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="seeder" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;strokeColor=#ffffff;dashed=0;labelPosition=right;verticalLabelPosition=middle;align=left;verticalAlign=middle;spacingLeft=8;html=1;fontSize=11;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;fillColor=#ED7100" value="Offset-seeder Lambda&#xa;(gapless Full Load → CDC handoff)" vertex="1">
+          <mxGeometry height="60" width="60" x="509" y="532" as="geometry" />
+        </mxCell>
+        <mxCell id="e_seed" edge="1" parent="1" source="seeder" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;dashed=1;" target="msk" value="seed start offset">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

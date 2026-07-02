@@ -1,0 +1,893 @@
+"""Export source table rows to files via read-only PK keyset streaming.
+
+This module implements the export half of the data migrator (design.md section
+"Data Migration Design" -> "Export", Requirement 5.1 / Property 1). It streams a
+source MySQL table to an output file (CSV today; a pluggable :class:`RowWriter`
+keeps other formats orthogonal) while guaranteeing the source is only ever read.
+
+Pipeline for one table:
+
+1. PK keyset streaming (not OFFSET): rows are read in ascending primary-key
+   order with ``WHERE pk > :last ORDER BY pk LIMIT :batch_size`` (single key) or a
+   row-value tuple comparison ``(k1, ..., kn) > (:last_0, ..., :last_n)``
+   (composite key), carrying the last-seen primary key forward. This avoids large
+   ``OFFSET`` scans and yields a stable, resumable read order. Single- and
+   composite-column primary keys are supported; only a missing primary key raises
+   :class:`UnsupportedPrimaryKeyError` rather than being silently mishandled.
+2. Read-only consistent snapshot (Property 1 / Requirement 5.1): the stream runs
+   inside ``START TRANSACTION WITH CONSISTENT SNAPSHOT`` (InnoDB, REPEATABLE
+   READ) -- the same snapshot semantics used by watermark capture (task 8.1) --
+   and the read-only guard from :mod:`dsql_migrator.core.introspector` is
+   installed on the default engine so any accidental write/DDL is refused before
+   reaching the database. A server-side / streaming cursor (``stream_results``)
+   is used so large tables are never fully materialized in memory.
+3. Value conversion: cell values are converted with the **same** MySQL -> DSQL
+   type mapping used by the Schema Converter (task 5,
+   :func:`dsql_migrator.core.converter.map_mysql_type`). There is no second,
+   divergent mapping table: the target DSQL type decides the value transform
+   (``TINYINT(1)`` -> boolean ``0/1`` -> ``False/True``; ``DATETIME`` -> UTC
+   ``timestamp``; ``BLOB`` -> ``bytea`` bytes; ``ENUM``/``SET`` -> text).
+4. Streaming output: rows are written as they stream, never accumulated.
+
+Output formats and sinks are orthogonal. The :class:`RowWriter` abstraction is
+the format boundary; :class:`CsvRowWriter` implements CSV (stdlib ``csv``, no
+extra dependency) and can target a local file or an Amazon S3 object (uploaded
+via the already-present ``boto3`` client, which is injectable for tests). Parquet
+is intentionally **not** implemented here: per the project's no-bloat principle
+and because the import path (task 8.3) does not yet consume Parquet, CSV fully
+satisfies Requirement 5.1. A Parquet writer can be added as another
+:class:`RowWriter` without touching the streaming/conversion core.
+
+Dependencies (engine, S3 client, output stream) are injectable -- mirroring
+:class:`~dsql_migrator.core.introspector.SourceIntrospector` and the watermark
+capturer -- so unit tests never touch a real MySQL or S3.
+"""
+
+from __future__ import annotations
+
+import csv
+import logging
+from abc import ABC, abstractmethod
+from datetime import datetime, time, timedelta, timezone
+from typing import Callable, Iterator, Mapping, Optional, Protocol, TextIO
+
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
+
+from dsql_migrator.core.converter import is_spatial_mysql_type, map_mysql_type
+from dsql_migrator.core.introspector import _default_engine_factory
+from dsql_migrator.core.models import ColumnDef, SourceConnectionConfig, TableDef
+from dsql_migrator.core.watermark import COMMIT, START_CONSISTENT_SNAPSHOT
+
+# Dev row-trace logger (child of the ``dsql_migrator`` package logger, whose level
+# is set from DSQL_MIGRATOR_LOG_LEVEL at app start). Per-page (never per-row) DEBUG
+# lines record the PK range + count of each keyset page so a developer can trace
+# exactly which rows Full Load read, in what order. Guarded by ``isEnabledFor`` so
+# production (INFO) builds no strings and pays nothing. Logs PK values + counts
+# only -- NEVER row values (Property 7); a natural-key PK is the operator's risk.
+_LOGGER = logging.getLogger(__name__)
+
+# Default rows fetched per keyset page. A page is bounded by this value, so a
+# single page -- not the whole table -- is the upper bound on in-flight rows.
+DEFAULT_BATCH_SIZE = 1000
+
+
+class ExportError(RuntimeError):
+    """Base error for failures while exporting a source table."""
+
+
+class ValueConversionError(ExportError):
+    """Raised when a source cell cannot be safely converted to its target type.
+
+    Surfaces a value that would otherwise be silently corrupted -- e.g. a
+    ``TINYINT(1)`` column (mapped to DSQL ``boolean``) holding a value outside
+    ``{0, 1}`` (MySQL's ``(1)`` is display width, not a value constraint, so a
+    ``TINYINT(1)`` legally stores -128..127 / 0..255). ``bool(int(value))`` would
+    flatten any non-zero magnitude to ``True`` and lose the original number, so we
+    fail loudly (naming the column + value) instead of corrupting the row.
+    """
+
+
+class UnsupportedPrimaryKeyError(ExportError):
+    """Raised when a table's primary key cannot drive keyset streaming.
+
+    Keyset streaming requires a primary key (single- or composite-column) to
+    define a deterministic, resumable read order. Only a MISSING primary key is
+    unsupported; it is reported clearly instead of being silently mishandled.
+    """
+
+
+class _Connection(Protocol):
+    """Minimal connection contract used by the streaming helper.
+
+    Only ``execute`` is required, which keeps the streaming logic easy to unit
+    test with a lightweight fake connection that mirrors SQLAlchemy's result API
+    (``execute(...).mappings()`` yielding dict-like rows).
+    """
+
+    def execute(self, statement: object, parameters: object = ...) -> object: ...
+
+
+# ---------------------------------------------------------------------------
+# Value conversion (reuses the Schema Converter type mapping)
+# ---------------------------------------------------------------------------
+
+
+def _utc(value: datetime) -> datetime:
+    """Normalize a datetime to UTC (assume naive datetimes are already UTC).
+
+    MySQL ``DATETIME`` has no time zone, and the converter maps it to a DSQL
+    ``timestamp`` treated as UTC. A naive value therefore gets UTC attached; a
+    tz-aware value is converted to UTC.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _target_kind(mysql_type: str) -> str:
+    """Return the normalized DSQL target type name for a MySQL type string.
+
+    Reuses :func:`dsql_migrator.core.converter.map_mysql_type` so value
+    conversion stays consistent with schema conversion (no divergent mapping).
+    Parameters and casing are stripped (e.g. ``numeric(20, 0)`` -> ``numeric``).
+    Unparseable types degrade to a pass-through (their lower-cased text).
+    """
+    try:
+        target_type, _ = map_mysql_type(mysql_type)
+    except ValueError:
+        return mysql_type.strip().lower()
+    return target_type.split("(", 1)[0].strip().lower()
+
+
+class ValueConverter:
+    """Converts MySQL cell values to canonical values for the DSQL target type.
+
+    The conversion is keyed off the DSQL type produced by the shared type mapping
+    (Requirement 5.1, consistent with the Schema Converter). Canonical outputs:
+
+    - ``boolean``: Python ``bool`` (``TINYINT(1)`` ``0/1`` -> ``False/True``),
+    - ``bytea``: Python ``bytes`` (MySQL ``BLOB`` payload preserved),
+    - ``timestamp``: tz-aware UTC :class:`datetime` (``DATETIME`` normalized),
+    - everything else: the value unchanged.
+
+    Serialization to a concrete file format (e.g. CSV text) is the
+    :class:`RowWriter`'s responsibility, keeping type semantics and output format
+    separate.
+    """
+
+    def __init__(
+        self,
+        table: TableDef,
+        *,
+        target_types: Optional[Mapping[str, str]] = None,
+    ) -> None:
+        """Precompute the per-column target type kinds for ``table``.
+
+        ``target_types`` (optional) maps a column name to the *applied* target
+        type (e.g. parsed from the converted/edited DDL via
+        :func:`~dsql_migrator.core.converter.parse_target_column_types`). When a
+        column is present there, the conversion follows that applied type instead
+        of the source-derived mapping -- so a user remap in Schema Conversion
+        (e.g. ``TINYINT(1)`` -> ``smallint`` instead of ``boolean``) takes effect
+        on the Full Load value conversion. Columns absent from the override keep
+        the source-derived kind.
+        """
+        overrides = target_types or {}
+        self._kinds: dict[str, str] = {}
+        for column in table.columns:
+            if column.name in overrides:
+                self._kinds[column.name] = (
+                    overrides[column.name].split("(", 1)[0].strip().lower()
+                )
+            else:
+                self._kinds[column.name] = _target_kind(column.mysql_type)
+        # Source MySQL BIT(n) columns: the driver returns the value as big-endian
+        # bytes, but BIT maps to an integer target in DSQL (the bit type is
+        # unsupported), so those bytes must be decoded to an int at convert time.
+        self._bit_columns: frozenset[str] = frozenset(
+            column.name
+            for column in table.columns
+            if column.mysql_type.strip().lower().split("(", 1)[0] == "bit"
+        )
+
+    def convert_value(self, column_name: str, value: object) -> object:
+        """Convert a single cell value for ``column_name`` (``None`` passes through)."""
+        if value is None:
+            return None
+        if column_name in self._bit_columns:
+            # MySQL BIT(n) -> integer target. The driver returns big-endian bytes
+            # (e.g. b'\xdb'); decode to the unsigned integer the bit pattern holds.
+            # A driver that already returns an int (some configs) passes through.
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return int.from_bytes(bytes(value), byteorder="big")
+            return value
+        kind = self._kinds.get(column_name)
+        if kind == "boolean":
+            if isinstance(value, bool):
+                return value
+            # TINYINT(1) -> DSQL boolean. The (1) is display width, not a value
+            # constraint, so the column can legally hold values outside {0, 1};
+            # bool(int(value)) would flatten e.g. 2 or -1 to True and silently lose
+            # the magnitude. Fail loudly (naming the column + value) so a wrong
+            # boolean never lands instead of corrupting the row. A genuine 0/1
+            # boolean column is unaffected.
+            as_int = int(value)
+            if as_int not in (0, 1):
+                raise ValueConversionError(
+                    f"column '{column_name}' maps to DSQL boolean but the source "
+                    f"value {as_int!r} is outside {{0, 1}}; a TINYINT(1) storing "
+                    "values beyond 0/1 cannot be a boolean without data loss. In "
+                    "Schema Conversion, remap this column's target type to "
+                    "smallint/integer (the converted DDL is editable), re-apply, "
+                    "then retry this table -- the value then loads as an integer. "
+                    "Alternatively, restrict the source values to 0/1."
+                )
+            return bool(as_int)
+        if kind == "bytea":
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return bytes(value)
+            return value
+        if kind == "timestamp":
+            # MySQL DATETIME -> DSQL ``timestamp`` WITHOUT TIME ZONE. Normalize to
+            # UTC, then drop the tzinfo: binding a tz-AWARE datetime to a no-tz
+            # column makes PostgreSQL/psycopg convert it to the session TimeZone and
+            # discard the offset, so a non-UTC session would silently shift the
+            # stored wall-clock by hours. A naive UTC value stores the intended
+            # wall-clock regardless of the session's TimeZone.
+            if isinstance(value, datetime):
+                return _utc(value).replace(tzinfo=None)
+            return value
+        if kind == "timestamptz":
+            # MySQL TIMESTAMP -> DSQL ``timestamptz``. A tz-aware UTC value stores
+            # the correct instant independent of the session TimeZone.
+            if isinstance(value, datetime):
+                return _utc(value)
+            return value
+        if kind == "time":
+            # MySQL TIME comes off the driver as a timedelta; psycopg binds a
+            # timedelta to interval, not to a DSQL ``time`` column (type mismatch
+            # that fails the row). Convert an in-range (0 <= t < 24h) value to a
+            # datetime.time. MySQL TIME's full range is -838:59:59..838:59:59, and a
+            # value outside [0, 24h) has NO ``time`` representation -- passing the
+            # raw timedelta through would silently bind to interval (or emit a
+            # non-time text cell), corrupting the column. Fail loudly (naming the
+            # column + value) instead, matching the TINYINT(1)-out-of-range guard.
+            if isinstance(value, timedelta):
+                total = value.total_seconds()
+                if 0 <= total < 86400:
+                    secs = int(total)
+                    micros = value.microseconds
+                    return time(
+                        hour=secs // 3600,
+                        minute=(secs % 3600) // 60,
+                        second=secs % 60,
+                        microsecond=micros,
+                    )
+                raise ValueConversionError(
+                    f"column '{column_name}' maps to DSQL time but the source "
+                    f"value {value!r} is outside 00:00:00..23:59:59.999999; MySQL "
+                    "TIME allows -838:59:59..838:59:59, which has no DSQL 'time' "
+                    "representation and would corrupt the column. In Schema "
+                    "Conversion, remap this column's target type to interval or "
+                    "text (the converted DDL is editable), re-apply, then retry "
+                    "this table. Alternatively, restrict the source TIME values to "
+                    "the 0..24h range."
+                )
+            return value
+        return value
+
+    def convert_row(self, row: Mapping[str, object]) -> dict[str, object]:
+        """Convert every known cell in ``row`` (unknown columns pass through)."""
+        return {name: self.convert_value(name, value) for name, value in row.items()}
+
+
+# ---------------------------------------------------------------------------
+# Output: pluggable row writers (format boundary)
+# ---------------------------------------------------------------------------
+
+
+def _csv_cell(value: object) -> str:
+    """Serialize a converted value into a DSQL-loadable CSV text cell.
+
+    ``None`` becomes an empty field, booleans become ``true``/``false``, bytes
+    become PostgreSQL ``bytea`` hex (``\\x...``), and datetimes become ISO 8601.
+    Everything else uses its string form; the ``csv`` module handles quoting.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "\\x" + bytes(value).hex()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+class RowWriter(ABC):
+    """A streaming, single-file row writer; subclasses implement a format.
+
+    The exporter calls :meth:`write_header` once, then :meth:`write_row` per row
+    as rows stream from the source, then :meth:`close`. This interface is the
+    seam where additional formats (e.g. Parquet) or sinks plug in without
+    changing the streaming/conversion core.
+    """
+
+    @abstractmethod
+    def write_header(self, columns: list[str]) -> None:
+        """Write the column header (column order for subsequent rows)."""
+
+    @abstractmethod
+    def write_row(self, row: Mapping[str, object]) -> None:
+        """Write one already-converted row."""
+
+    @abstractmethod
+    def close(self) -> None:
+        """Flush and finalize output (e.g. close the file or upload to S3)."""
+
+
+class CsvRowWriter(RowWriter):
+    """Writes rows as CSV to a text stream (local file or S3 buffer).
+
+    Rows are emitted in the header's column order. The writer optionally owns the
+    underlying stream (closing it on :meth:`close`) and optionally runs a
+    finalizer on close -- used by :meth:`for_s3` to upload the buffered CSV.
+    """
+
+    def __init__(
+        self,
+        stream: TextIO,
+        *,
+        owns_stream: bool = False,
+        on_close: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Create a CSV writer over ``stream``.
+
+        ``owns_stream`` closes ``stream`` on :meth:`close`; ``on_close`` runs an
+        extra finalizer (after flushing, before closing the stream).
+        """
+        self._stream = stream
+        self._writer = csv.writer(stream)
+        self._owns_stream = owns_stream
+        self._on_close = on_close
+        self._columns: list[str] = []
+        self._closed = False
+
+    def write_header(self, columns: list[str]) -> None:
+        self._columns = list(columns)
+        self._writer.writerow(self._columns)
+
+    def write_row(self, row: Mapping[str, object]) -> None:
+        self._writer.writerow([_csv_cell(row.get(name)) for name in self._columns])
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stream.flush()
+        if self._on_close is not None:
+            self._on_close()
+        if self._owns_stream:
+            self._stream.close()
+
+    @classmethod
+    def for_local_path(cls, path: str) -> "CsvRowWriter":
+        """Create a CSV writer that writes to (and owns) a local file at ``path``."""
+        stream = open(path, "w", newline="", encoding="utf-8")  # noqa: SIM115
+        return cls(stream, owns_stream=True)
+
+    @classmethod
+    def for_s3(
+        cls, s3_client: object, bucket: str, key: str
+    ) -> "CsvRowWriter":
+        """Create a CSV writer that buffers in memory and uploads to S3 on close.
+
+        ``s3_client`` is injected (e.g. ``boto3.client('s3')``) so tests can
+        supply a fake client and never reach real S3. The buffered CSV is sent
+        with a single ``put_object`` when the writer closes.
+        """
+        import io
+
+        buffer = io.StringIO()
+
+        def _upload() -> None:
+            s3_client.put_object(  # type: ignore[attr-defined]
+                Bucket=bucket,
+                Key=key,
+                Body=buffer.getvalue().encode("utf-8"),
+            )
+
+        return cls(buffer, owns_stream=True, on_close=_upload)
+
+
+# Default S3 multipart part size (8 MiB). S3 requires every non-final part to be
+# at least 5 MiB; 8 MiB keeps part counts low for multi-GB tables while never
+# buffering the whole CSV.
+_S3_MULTIPART_PART_SIZE = 8 * 1024 * 1024
+_S3_MIN_PART_SIZE = 5 * 1024 * 1024
+
+
+class _S3MultipartCsvStream:
+    """A text stream that uploads to S3 without buffering the whole file.
+
+    Written bytes accumulate until they reach the part size, then are flushed as
+    an S3 multipart-upload *part*, so neither local disk nor full memory ever
+    holds the entire CSV -- the staging path required for large-scale migrations.
+    Content smaller than one part is sent as a single ``put_object`` (no
+    multipart overhead). :meth:`abort` cancels an in-flight multipart upload so a
+    failed export leaves no partial object behind.
+
+    The object satisfies the minimal text-stream surface
+    (:meth:`write`/:meth:`flush`/:meth:`close`) that :class:`CsvRowWriter` drives,
+    so the existing streaming/conversion core is reused unchanged.
+    """
+
+    def __init__(
+        self,
+        s3_client: object,
+        bucket: str,
+        key: str,
+        *,
+        part_size_bytes: int = _S3_MULTIPART_PART_SIZE,
+    ) -> None:
+        if part_size_bytes < _S3_MIN_PART_SIZE:
+            raise ValueError(
+                f"S3 multipart part size must be >= {_S3_MIN_PART_SIZE} bytes (5 MiB)"
+            )
+        self._s3 = s3_client
+        self._bucket = bucket
+        self._key = key
+        self._part_size = part_size_bytes
+        self._buffer = bytearray()
+        self._upload_id: Optional[str] = None
+        self._parts: list[dict] = []
+        self._part_number = 0
+        self._aborted = False
+        self._closed = False
+
+    def write(self, text_chunk: str) -> int:
+        """Buffer ``text_chunk`` and flush full parts to S3 as they accumulate."""
+        self._buffer.extend(text_chunk.encode("utf-8"))
+        while len(self._buffer) >= self._part_size:
+            self._upload_part(self._part_size)
+        return len(text_chunk)
+
+    def flush(self) -> None:
+        """No-op: non-final S3 parts must be >= 5 MiB, so flush waits for close."""
+        return None
+
+    def _ensure_upload(self) -> None:
+        if self._upload_id is None:
+            response = self._s3.create_multipart_upload(  # type: ignore[attr-defined]
+                Bucket=self._bucket, Key=self._key
+            )
+            self._upload_id = response["UploadId"]
+
+    def _upload_part(self, size: int) -> None:
+        self._ensure_upload()
+        self._part_number += 1
+        chunk = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        response = self._s3.upload_part(  # type: ignore[attr-defined]
+            Bucket=self._bucket,
+            Key=self._key,
+            PartNumber=self._part_number,
+            UploadId=self._upload_id,
+            Body=chunk,
+        )
+        self._parts.append(
+            {"PartNumber": self._part_number, "ETag": response["ETag"]}
+        )
+
+    def abort(self) -> None:
+        """Cancel an in-flight multipart upload (best effort); idempotent."""
+        if self._aborted:
+            return
+        self._aborted = True
+        if self._upload_id is not None:
+            try:
+                self._s3.abort_multipart_upload(  # type: ignore[attr-defined]
+                    Bucket=self._bucket, Key=self._key, UploadId=self._upload_id
+                )
+            except Exception:  # noqa: BLE001 - cleanup is best effort
+                pass
+
+    def close(self) -> None:
+        """Finalize: complete the multipart upload, or single-``put_object``."""
+        if self._closed or self._aborted:
+            self._closed = True
+            return
+        self._closed = True
+        if self._upload_id is None:
+            # Everything fit under one part: a single put_object is cheaper and
+            # avoids multipart entirely for small tables.
+            self._s3.put_object(  # type: ignore[attr-defined]
+                Bucket=self._bucket, Key=self._key, Body=bytes(self._buffer)
+            )
+            self._buffer.clear()
+            return
+        if self._buffer:  # final part may be < 5 MiB (allowed for the last part)
+            self._upload_part(len(self._buffer))
+        self._s3.complete_multipart_upload(  # type: ignore[attr-defined]
+            Bucket=self._bucket,
+            Key=self._key,
+            UploadId=self._upload_id,
+            MultipartUpload={"Parts": self._parts},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Keyset streaming (read-only)
+# ---------------------------------------------------------------------------
+
+
+def _quote_mysql_identifier(name: str) -> str:
+    """Quote a MySQL identifier with backticks, escaping embedded backticks."""
+    escaped = name.replace("`", "``")
+    return f"`{escaped}`"
+
+
+def _quote_mysql_table(name: str) -> str:
+    """Quote a possibly schema-qualified table name as ``\\`schema\\`.\\`table\\```.
+
+    Cluster-wide introspection qualifies names as ``database.table``; quoting the
+    whole string as one identifier yields ``\\`database.table\\``` which MySQL
+    reads as one table in the (unset) current database ("1046, No database
+    selected"). Split on the first dot so each part is quoted independently.
+    """
+    schema, separator, obj = name.partition(".")
+    if separator and schema and obj:
+        return f"{_quote_mysql_identifier(schema)}.{_quote_mysql_identifier(obj)}"
+    return _quote_mysql_identifier(name)
+
+
+def _primary_key_columns(table: TableDef) -> list[str]:
+    """Return the primary-key columns (one or more), or raise for a missing key.
+
+    Keyset export streams in ascending primary-key order. A single-column key uses
+    ``pk > :last``; a composite key uses a row-value (tuple) comparison
+    ``(k1, ..., kn) > (:last_0, ..., :last_n)`` which is lexicographic and uses the
+    primary-key index, giving the same stable, resumable read order. Only a
+    MISSING primary key is unsupported (no deterministic read order exists).
+    """
+    primary_key = list(table.primary_key)
+    if not primary_key:
+        raise UnsupportedPrimaryKeyError(
+            f"table '{table.name}' has no primary key; keyset export requires a "
+            "primary key to define a stable read order"
+        )
+    return primary_key
+
+
+class ExportCancelled(ExportError):
+    """Raised when a keyset stream is stopped early via its ``should_cancel`` hook.
+
+    Lets a cooperative stop interrupt the row pull *between pages* (not only
+    between load batches), so a Stop takes effect promptly even while rows are
+    being read; the caller treats it like any other cooperative stop (the table
+    is left incomplete and retryable, the re-load is idempotent).
+    """
+
+
+def _select_column_sql(column: ColumnDef) -> str:
+    """Return the SELECT-list expression for one source column.
+
+    Spatial columns (geometry/point/...) have no DSQL type and are migrated to
+    ``bytea``; read them as ``ST_AsBinary(col)`` so the value is the geometry's
+    WKB bytes -- identical to what Debezium delivers for CDC -- and aliased back
+    to the column name so the streamed row keeps its key. Other columns are read
+    as-is.
+    """
+    quoted = _quote_mysql_identifier(column.name)
+    if is_spatial_mysql_type(column.mysql_type):
+        return f"ST_AsBinary({quoted}) AS {quoted}"
+    return quoted
+
+
+def keyset_stream(
+    connection: _Connection,
+    table: TableDef,
+    *,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> Iterator[Mapping[str, object]]:
+    """Yield ``table`` rows in ascending primary-key order via keyset pagination.
+
+    Issues ``SELECT <cols> FROM <table> [WHERE pk > :last] ORDER BY pk LIMIT
+    :batch_size`` repeatedly, advancing ``:last`` to the last row's primary key,
+    until a short page signals exhaustion. Rows are yielded lazily one page at a
+    time, so the whole table is never materialized (Requirement 5.1). Every
+    statement is a ``SELECT`` (read-only, Property 1). Raises
+    :class:`UnsupportedPrimaryKeyError` for missing/composite primary keys.
+
+    ``should_cancel`` (optional) is polled before each page is fetched; when it
+    returns ``True`` the stream raises :class:`ExportCancelled` instead of issuing
+    the next ``SELECT``, so a cooperative stop interrupts the read promptly rather
+    than only between load batches.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
+
+    pk_columns = _primary_key_columns(table)
+    column_names = [column.name for column in table.columns]
+    if not column_names:
+        raise ExportError(f"table '{table.name}' has no columns to export")
+
+    columns_sql = ", ".join(_select_column_sql(column) for column in table.columns)
+    table_sql = _quote_mysql_table(table.name)
+    order_by_sql = ", ".join(_quote_mysql_identifier(c) for c in pk_columns)
+
+    if len(pk_columns) == 1:
+        # Single-column key: scalar ``pk > :last`` (one bind param ``last``).
+        pk_sql = _quote_mysql_identifier(pk_columns[0])
+        where_sql = f"{pk_sql} > :last"
+        last_param_names = ["last"]
+    else:
+        # Composite key: row-value (tuple) comparison, lexicographic and
+        # index-friendly: ``(k1, ..., kn) > (:last_0, ..., :last_n)``.
+        keys_sql = ", ".join(_quote_mysql_identifier(c) for c in pk_columns)
+        last_param_names = [f"last_{i}" for i in range(len(pk_columns))]
+        placeholders = ", ".join(f":{name}" for name in last_param_names)
+        where_sql = f"({keys_sql}) > ({placeholders})"
+
+    first_page_sql = (
+        f"SELECT {columns_sql} FROM {table_sql} "
+        f"ORDER BY {order_by_sql} LIMIT :batch_size"
+    )
+    next_page_sql = (
+        f"SELECT {columns_sql} FROM {table_sql} WHERE {where_sql} "
+        f"ORDER BY {order_by_sql} LIMIT :batch_size"
+    )
+
+    def _key_of(row: Mapping[str, object]) -> tuple:
+        return tuple(row[c] for c in pk_columns)
+
+    last_key: Optional[tuple] = None
+    page_index = 0
+    while True:
+        # Poll the cooperative stop before fetching each page so a Stop interrupts
+        # the pull between pages (not only between load batches). The partial read
+        # is fine: the table is left incomplete and the idempotent re-load resumes.
+        if should_cancel is not None and should_cancel():
+            raise ExportCancelled(table.name)
+        if last_key is None:
+            statement = text(first_page_sql)
+            params: dict[str, object] = {"batch_size": batch_size}
+        else:
+            statement = text(next_page_sql)
+            params = {"batch_size": batch_size}
+            for name, value in zip(last_param_names, last_key):
+                params[name] = value
+
+        result = connection.execute(statement, params)
+        page_index += 1
+        page_count = 0
+        first_key: Optional[tuple] = None
+        for row in result.mappings():  # type: ignore[attr-defined]
+            page_count += 1
+            key = _key_of(row)
+            if first_key is None:
+                first_key = key
+            last_key = key
+            yield row
+
+        # One DEBUG line PER PAGE (never per row): PK range + count, so the read
+        # order is observable at TB scale without O(#rows) log volume. Guarded so
+        # production (INFO) builds nothing. PK values + count only (Property 7).
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            single = len(pk_columns) == 1
+            pk_repr = pk_columns[0] if single else pk_columns
+            lo = first_key[0] if (single and first_key is not None) else first_key
+            hi = last_key[0] if (single and last_key is not None) else last_key
+            _LOGGER.debug(
+                "export keyset page table=%s page=%d pk=%s range=[%s..%s] rows=%d",
+                table.name, page_index, pk_repr, lo, hi, page_count,
+            )
+
+        if page_count < batch_size:
+            return
+
+
+# ---------------------------------------------------------------------------
+# Exporter
+# ---------------------------------------------------------------------------
+
+
+class TableExporter:
+    """Exports a source table to a file via read-only PK keyset streaming.
+
+    The engine factory is injectable (like
+    :class:`~dsql_migrator.core.introspector.SourceIntrospector`) so tests can
+    supply a fake connection; the default reuses the introspector's MySQL factory
+    which installs the read-only guard (Property 1).
+    """
+
+    def __init__(
+        self,
+        engine_factory: Optional[Callable[[SourceConnectionConfig], Engine]] = None,
+        *,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+    ) -> None:
+        """Create an exporter with an optional engine factory and page size."""
+        self._engine_factory = engine_factory or _default_engine_factory
+        self._batch_size = batch_size
+
+    def export_table(
+        self,
+        conn: SourceConnectionConfig,
+        table: TableDef,
+        writer: RowWriter,
+        *,
+        target_types: Optional[Mapping[str, str]] = None,
+    ) -> int:
+        """Stream ``table`` to ``writer`` from a consistent read-only snapshot.
+
+        Opens the source, runs the keyset stream inside ``START TRANSACTION WITH
+        CONSISTENT SNAPSHOT`` in autocommit mode (so the explicit transaction
+        controls the snapshot, matching watermark capture), converts each row's
+        values with :class:`ValueConverter`, and writes them as they stream
+        (Requirement 5.1 / Property 1). The caller owns ``writer`` and is
+        responsible for closing it. Returns the number of rows exported.
+        """
+        engine = self._engine_factory(conn)
+        try:
+            with engine.connect() as connection:
+                snapshot = connection.execution_options(
+                    isolation_level="AUTOCOMMIT", stream_results=True
+                )
+                return export_rows(
+                    snapshot,
+                    table,
+                    writer,
+                    batch_size=self._batch_size,
+                    target_types=target_types,
+                )
+        finally:
+            engine.dispose()
+
+    def export_table_to_csv_path(
+        self,
+        conn: SourceConnectionConfig,
+        table: TableDef,
+        path: str,
+    ) -> int:
+        """Export ``table`` to a local CSV file at ``path`` (manages the writer)."""
+        writer = CsvRowWriter.for_local_path(path)
+        try:
+            return self.export_table(conn, table, writer)
+        finally:
+            writer.close()
+
+    def stream_converted_rows(
+        self,
+        conn: SourceConnectionConfig,
+        table: TableDef,
+        *,
+        should_cancel: Optional[Callable[[], bool]] = None,
+        target_types: Optional[Mapping[str, str]] = None,
+    ) -> "Iterator[Mapping[str, object]]":
+        """Yield target-ready (converted) rows from a read-only consistent snapshot.
+
+        The in-process importer pulls these straight into batched ``INSERT``s with
+        no CSV/S3 staging. Mirrors :meth:`export_table` -- one ``START
+        TRANSACTION WITH CONSISTENT SNAPSHOT`` keyset stream with a per-row
+        :class:`ValueConverter` -- but is pull-based: rows are produced lazily so
+        only one page is held at a time (Requirement 5.1), and the source is only
+        ever read (Property 1). The snapshot transaction is held open for the
+        table's read and committed when the generator is exhausted or closed.
+
+        ``should_cancel`` (optional) is forwarded to :func:`keyset_stream`, which
+        polls it before each page so a cooperative stop interrupts the read
+        between pages (raising :class:`ExportCancelled`) instead of waiting for
+        the next load batch.
+        """
+        converter = ValueConverter(table, target_types=target_types)
+        engine = self._engine_factory(conn)
+        try:
+            with engine.connect() as connection:
+                snapshot = connection.execution_options(
+                    isolation_level="AUTOCOMMIT", stream_results=True
+                )
+                snapshot.execute(text(START_CONSISTENT_SNAPSHOT))
+                try:
+                    for raw in keyset_stream(
+                        snapshot,
+                        table,
+                        batch_size=self._batch_size,
+                        should_cancel=should_cancel,
+                    ):
+                        yield converter.convert_row(raw)
+                finally:
+                    snapshot.execute(text(COMMIT))
+        finally:
+            engine.dispose()
+
+    def export_table_to_csv_s3(
+        self,
+        conn: SourceConnectionConfig,
+        table: TableDef,
+        s3_client: object,
+        bucket: str,
+        key: str,
+    ) -> int:
+        """Export ``table`` to ``s3://bucket/key`` as CSV via an injected client."""
+        writer = CsvRowWriter.for_s3(s3_client, bucket, key)
+        try:
+            return self.export_table(conn, table, writer)
+        finally:
+            writer.close()
+
+    def export_table_to_s3_streaming(
+        self,
+        conn: SourceConnectionConfig,
+        table: TableDef,
+        *,
+        s3_client: object,
+        bucket: str,
+        key: str,
+        part_size_bytes: int = _S3_MULTIPART_PART_SIZE,
+    ) -> int:
+        """Stream ``table`` to ``s3://bucket/key`` without local disk or full RAM.
+
+        Uses a multipart-upload sink (:class:`_S3MultipartCsvStream`): rows stream
+        from the source and parts upload as they fill, so a multi-GB/TB table is
+        never staged whole on the container's ephemeral disk (Fargate ~20 GB) nor
+        buffered entirely in memory. On any failure the in-flight multipart upload
+        is aborted so no partial object is left behind.
+        """
+        stream = _S3MultipartCsvStream(
+            s3_client, bucket, key, part_size_bytes=part_size_bytes
+        )
+        writer = CsvRowWriter(stream, owns_stream=True)
+        try:
+            rows = self.export_table(conn, table, writer)
+        except BaseException:
+            stream.abort()
+            raise
+        writer.close()  # completes the multipart upload (or single put_object)
+        return rows
+
+
+def export_rows(
+    connection: _Connection,
+    table: TableDef,
+    writer: RowWriter,
+    *,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    target_types: Optional[Mapping[str, str]] = None,
+) -> int:
+    """Stream-convert-write ``table`` rows on an open connection (read-only).
+
+    Wraps the keyset stream in a consistent-snapshot transaction, writes the
+    header, then converts and writes each row as it arrives. Returns the row
+    count. The transaction is committed even if writing fails; the caller owns
+    the ``writer`` lifecycle.
+    """
+    value_converter = ValueConverter(table, target_types=target_types)
+    column_names = [column.name for column in table.columns]
+
+    connection.execute(text(START_CONSISTENT_SNAPSHOT))
+    rows_exported = 0
+    try:
+        writer.write_header(column_names)
+        for row in keyset_stream(connection, table, batch_size=batch_size):
+            writer.write_row(value_converter.convert_row(row))
+            rows_exported += 1
+    finally:
+        connection.execute(text(COMMIT))
+    return rows_exported
+
+
+__all__ = [
+    "DEFAULT_BATCH_SIZE",
+    "ExportError",
+    "ExportCancelled",
+    "UnsupportedPrimaryKeyError",
+    "ValueConverter",
+    "RowWriter",
+    "CsvRowWriter",
+    "keyset_stream",
+    "export_rows",
+    "TableExporter",
+]

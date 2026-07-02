@@ -1,0 +1,72 @@
+mysql-dsql-migrator
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+This product includes software developed by Amazon.com, Inc. and is licensed
+under the Apache License, Version 2.0 (see the LICENSE file).
+
+------------------------------------------------------------------------------
+Third-party components
+------------------------------------------------------------------------------
+
+This distribution bundles pre-built third-party artifacts under
+connectors/plugins/ so that the optional CDC pipeline can be deployed without a
+local Java/Maven toolchain. Each retains its own license; see the referenced
+upstream projects for the full license text. A consolidated enumeration is in
+THIRD-PARTY-NOTICES.md.
+
+Bundled artifacts:
+
+- Debezium (connector for MySQL and its runtime), version 2.7.4.Final
+  License: Apache License 2.0
+  https://github.com/debezium/debezium
+  (shipped as connectors/plugins/debezium-connector-mysql/ and
+   debezium-mysql-plugin.zip; the upstream Apache-2.0 LICENSE.txt is retained
+   inside the debezium-connector-mysql/ directory.)
+
+- ANTLR 4 Runtime, version 4.10.1
+  License: BSD 3-Clause
+  https://www.antlr.org/
+
+- mysql-binlog-connector-java, version 0.29.2
+  License: Apache License 2.0
+  https://github.com/osheroff/mysql-binlog-connector-java
+
+- zstd-jni, version 1.5.0-2
+  License: BSD 2-Clause
+  https://github.com/luben/zstd-jni
+
+- msk-config-providers, version 0.4.0
+  License: Apache License 2.0
+  https://github.com/aws-samples/msk-config-providers
+
+- MySQL Connector/J, version 8.3.0 (Community)
+  Copyright (c) Oracle and/or its affiliates.
+  License: GPLv2 (GNU General Public License, version 2) WITH the
+           Universal FOSS Exception, version 1.0.
+  Upstream / corresponding source: https://github.com/mysql/mysql-connector-j
+  (tag 8.3.0). The Universal FOSS Exception text and FAQ:
+  http://oss.oracle.com/licenses/universal-foss-exception
+
+  This component is distributed under different terms than the Apache-2.0
+  license that governs the rest of this project. It is redistributed here
+  UNMODIFIED (the original `mysql-connector-j-8.3.0.jar`, its own `LICENSE`
+  retained inside the jar), solely as a runtime JDBC dependency of the Debezium
+  MySQL connector for the optional CDC pipeline. This project does not link
+  against, modify, or incorporate its source.
+
+  Under GPLv2, redistribution of the binary carries an obligation to make the
+  corresponding source available; because the jar is unmodified, that obligation
+  is satisfied by the upstream source at the URL above. Under the Universal FOSS
+  Exception 1.0, combining/distributing this Community connector together with
+  OSI-approved open-source software (such as this Apache-2.0 project) does NOT
+  require that this project be relicensed under the GPL.
+
+  If these terms are unsuitable for your redistribution scenario, remove the
+  bundled jar and have your build/deploy step download it from the upstream
+  source instead; the tool's Full Load path does not require it.
+
+------------------------------------------------------------------------------
+
+The AWS CloudFormation custom-resource helper deploy/cdc-stack/lambda/cfnresponse.py
+is Copyright Amazon.com, Inc. or its affiliates and is licensed under MIT-0
+(see its file header).

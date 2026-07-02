@@ -1,0 +1,92 @@
+{
+  "_comment": "Shared DSQL write contract: the canonical target encoding for each boundary MySQL type, loaded by BOTH the Python bulk-loader parity test (tests/test_dsql_write_contract.py) and the Java sink parity test (DebeziumTypeConverterTest). One artifact governs both write paths so the same source row lands identically whether migrated by Full Load (Python) or CDC (Java). Mirror of converter.DSQL_WRITE_CONTRACT_CASES. Do not edit one language's copy in isolation -- this file is copied to connectors/dsql-sink/src/test/resources/ by the Java build/test setup.",
+  "cases": [
+    {
+      "name": "datetime",
+      "mysql_type": "DATETIME",
+      "dsql_kind": "timestamp",
+      "debezium_schema_name": "io.debezium.time.Timestamp",
+      "debezium_encoded_long": 1704067200000,
+      "expected_utc_epoch_ms": 1704067200000,
+      "expected_dsql_java_class": "java.sql.Timestamp",
+      "note": "Long millis-since-epoch -> java.sql.Timestamp (UTC). Python bulk loader attaches UTC to the naive datetime(2024-01-01 00:00:00)."
+    },
+    {
+      "name": "datetime6",
+      "mysql_type": "DATETIME(6)",
+      "dsql_kind": "timestamp",
+      "debezium_schema_name": "io.debezium.time.MicroTimestamp",
+      "debezium_encoded_long": 1704067200000123,
+      "expected_utc_epoch_ms": 1704067200000,
+      "expected_sub_milli_micros": 123,
+      "expected_dsql_java_class": "java.sql.Timestamp",
+      "note": "Long micros-since-epoch -> java.sql.Timestamp (UTC), microseconds preserved as nanos. This is the H5 bug: setObject(Long) to a TIMESTAMP column was rejected with SQLSTATE 42804."
+    },
+    {
+      "name": "timestamp_tz",
+      "mysql_type": "TIMESTAMP",
+      "dsql_kind": "timestamptz",
+      "debezium_schema_name": "io.debezium.time.ZonedTimestamp",
+      "debezium_encoded_string": "2024-01-01T00:00:00Z",
+      "expected_utc_epoch_ms": 1704067200000,
+      "expected_dsql_java_class": "java.sql.Timestamp",
+      "note": "ISO-8601 string -> java.sql.Timestamp (UTC)."
+    },
+    {
+      "name": "bigint_unsigned",
+      "mysql_type": "BIGINT UNSIGNED",
+      "dsql_kind": "decimal",
+      "debezium_schema_name": "org.apache.kafka.connect.data.Decimal",
+      "debezium_encoded_string": "18446744073709551615",
+      "expected_dsql_java_class": "java.math.BigDecimal",
+      "note": "2^64-1; requires bigint.unsigned.handling.mode=precise so Debezium sends a BigDecimal, not an overflowing Long. Binds to numeric(20,0)."
+    },
+    {
+      "name": "decimal",
+      "mysql_type": "DECIMAL(10,4)",
+      "dsql_kind": "decimal",
+      "debezium_schema_name": "org.apache.kafka.connect.data.Decimal",
+      "debezium_encoded_string": "1234.5678",
+      "expected_dsql_java_class": "java.math.BigDecimal",
+      "note": "Debezium precise mode sends BigDecimal; binds to numeric. No conversion needed at the sink (passes through)."
+    },
+    {
+      "name": "tinyint_one",
+      "mysql_type": "TINYINT(1)",
+      "dsql_kind": "boolean",
+      "debezium_schema_name": null,
+      "debezium_encoded_int": 1,
+      "expected_dsql_java_class": "java.lang.Boolean",
+      "expected_boolean": true,
+      "note": "MySQL boolean convention; 1 -> True, 0 -> False. Python: bool(int(v))."
+    },
+    {
+      "name": "blob",
+      "mysql_type": "BLOB",
+      "dsql_kind": "bytea",
+      "debezium_schema_name": null,
+      "debezium_encoded_base64": "AQID",
+      "expected_dsql_java_class": "[B",
+      "note": "byte[] passes through; setObject(byte[]) -> bytea. Python: bytes(v)."
+    },
+    {
+      "name": "json",
+      "mysql_type": "JSON",
+      "dsql_kind": "json",
+      "debezium_schema_name": "io.debezium.data.Json",
+      "debezium_encoded_string": "{\"k\": 1}",
+      "expected_dsql_java_class": "org.postgresql.util.PGobject",
+      "expected_pg_type": "json",
+      "note": "JSON text must be wrapped in a PGobject(type=json) so the JDBC driver targets the json column, not text. Python passes the string through (psycopg handles json)."
+    },
+    {
+      "name": "enum",
+      "mysql_type": "ENUM('a','b')",
+      "dsql_kind": "text",
+      "debezium_schema_name": null,
+      "debezium_encoded_string": "a",
+      "expected_dsql_java_class": "java.lang.String",
+      "note": "ENUM -> text; both paths keep the string."
+    }
+  ]
+}

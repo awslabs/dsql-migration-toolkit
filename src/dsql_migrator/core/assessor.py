@@ -1,0 +1,1487 @@
+"""Compatibility assessment rule engine for MySQL -> Aurora DSQL migration.
+
+The :class:`CompatibilityAssessor` evaluates a source inventory against a
+declarative, extensible list of :class:`Rule` objects and produces an
+:class:`~dsql_migrator.core.models.AssessmentReport`. Each inventory object
+(table, view, trigger, routine) is classified as ``AUTO``, ``MANUAL``, or
+``UNSUPPORTED`` together with a risk description and a recommended action, and
+the report carries a difficulty summary (object counts per classification).
+
+Design guarantees:
+
+- Assessment completeness (Property 8 / Requirement 2.1): every object in the
+  inventory ends up with exactly one classification. The engine emits exactly
+  one :class:`AssessmentItem` per object; objects matched by zero rules receive
+  a default ``AUTO`` classification, so nothing is left unclassified.
+- No silent data loss (Property 6 / Requirement 2.2, 2.3): objects that hit a
+  DSQL constraint are surfaced as ``MANUAL`` or ``UNSUPPORTED`` with the reason
+  and a recommended alternative; they are never silently treated as compatible.
+
+Aggregation strategy when several rules match the same object: the most severe
+classification wins (``UNSUPPORTED`` > ``MANUAL`` > ``AUTO``). The governing
+rule determines ``rule_id``/``classification`` while the risks and
+recommendations of all matched rules are combined so no finding is lost. Rules
+are evaluated in declaration order, which breaks ties deterministically.
+"""
+
+from __future__ import annotations
+
+import html
+import re
+from abc import ABC, abstractmethod
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Callable, ClassVar, Optional
+
+from dsql_migrator.core.models import (
+    AiAssessmentReport,
+    AssessmentItem,
+    AssessmentReport,
+    Classification,
+    EffortLevel,
+    ObjectType,
+    SourceInventory,
+    TargetInventory,
+)
+
+# Ordering used to pick the governing classification when several rules match
+# the same object. Higher value means more severe.
+_SEVERITY: dict[Classification, int] = {
+    Classification.AUTO: 0,
+    Classification.MANUAL: 1,
+    Classification.UNSUPPORTED: 2,
+}
+
+# Ordering used to pick the most demanding effort when several rules match the
+# same object. Higher value means more effort.
+_EFFORT_ORDER: dict[EffortLevel, int] = {
+    EffortLevel.SIMPLE: 0,
+    EffortLevel.MEDIUM: 1,
+    EffortLevel.SIGNIFICANT: 2,
+}
+
+# Object kinds used as the canonical unit of classification (Property 8).
+KIND_TABLE = "table"
+KIND_VIEW = "view"
+KIND_TRIGGER = "trigger"
+KIND_ROUTINE = "routine"
+KIND_PROCEDURE = "procedure"
+KIND_FUNCTION = "function"
+KIND_EVENT = "event"
+
+# Map a collected routine's subtype to the assessment kind so stored procedures
+# and functions are categorized separately (a generic routine falls back).
+_ROUTINE_KIND_BY_TYPE: dict[ObjectType, str] = {
+    ObjectType.PROCEDURE: KIND_PROCEDURE,
+    ObjectType.FUNCTION: KIND_FUNCTION,
+}
+
+
+def _routine_kind(routine: object) -> str:
+    """Return the assessment kind for a collected routine (procedure/function)."""
+    return _ROUTINE_KIND_BY_TYPE.get(
+        getattr(routine, "object_type", None), KIND_ROUTINE
+    )
+# Synthetic kind for cluster/inventory-level findings (not a single object).
+KIND_DATABASE = "database"
+
+# DSQL limit: at most 1,000 tables per database (cluster quotas).
+_MAX_TABLES_PER_DATABASE = 1000
+
+# MySQL base types with no lossless mapping to a DSQL (PostgreSQL 16) type.
+# These are flagged as UNSUPPORTED and require a type substitution/redesign.
+_UNSUPPORTED_TYPE_BASES = frozenset(
+    {
+        "geometry",
+        "point",
+        "linestring",
+        "polygon",
+        "multipoint",
+        "multilinestring",
+        "multipolygon",
+        "geometrycollection",
+    }
+)
+
+# DSQL hard limit: at most 255 columns per table (cluster quotas/database limits).
+_MAX_COLUMNS_PER_TABLE = 255
+
+# DSQL numeric maximum precision (numeric supports a precision of up to 38).
+_MAX_NUMERIC_PRECISION = 38
+
+# MySQL LOB/TEXT base types whose maximum size exceeds the DSQL text/bytea 1 MiB
+# limit, so a large enough value cannot be stored and must be reviewed.
+_OVERSIZED_LOB_BASES = frozenset(
+    {"mediumtext", "longtext", "mediumblob", "longblob"}
+)
+
+# MySQL base types with no native DSQL equivalent that map to text, losing their
+# allowed-value/domain semantics (manual review).
+_ENUM_SET_BASES = frozenset({"enum", "set"})
+
+# MySQL fixed-point base types whose precision must fit the DSQL numeric maximum.
+_DECIMAL_BASES = frozenset({"decimal", "numeric", "dec", "fixed"})
+
+# MySQL index types with no Aurora DSQL equivalent.
+_UNSUPPORTED_INDEX_TYPES = frozenset({"fulltext", "spatial"})
+
+# Captures the precision (first parenthesized integer) of a DECIMAL declaration.
+_DECIMAL_PRECISION_RE = re.compile(r"\(\s*(\d+)")
+
+
+@dataclass(frozen=True)
+class ObjectKey:
+    """Stable identity of an inventory object: its kind plus name."""
+
+    kind: str
+    name: str
+
+
+@dataclass(frozen=True)
+class Finding:
+    """A single rule match against one inventory object."""
+
+    object: ObjectKey
+    rule_id: str
+    classification: Classification
+    risk: str
+    recommendation: str
+    effort: Optional[EffortLevel] = None
+
+
+def _base_type(mysql_type: str) -> str:
+    """Return the lower-cased base type token of a MySQL type declaration.
+
+    For example ``"VARCHAR(100)"`` -> ``"varchar"`` and ``"INT UNSIGNED"`` ->
+    ``"int"``.
+    """
+    token = mysql_type.strip().lower()
+    for separator in ("(", " "):
+        index = token.find(separator)
+        if index != -1:
+            token = token[:index]
+    return token
+
+
+def _is_case_insensitive_collation(collation: str | None) -> bool:
+    """Return ``True`` for a MySQL case-insensitive collation (``*_ci``)."""
+    return bool(collation) and collation.strip().lower().endswith("_ci")
+
+
+# ---------------------------------------------------------------------------
+# Rule abstraction and concrete rules
+# ---------------------------------------------------------------------------
+
+
+class Rule(ABC):
+    """A single compatibility rule.
+
+    A rule inspects the inventory and emits a :class:`Finding` for every object
+    it flags. Rules are stateless and extensible: new rules can be added to the
+    list passed to :class:`CompatibilityAssessor` without changing the engine.
+    """
+
+    rule_id: ClassVar[str]
+
+    @abstractmethod
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        """Return findings for every object this rule flags in ``inventory``."""
+        raise NotImplementedError
+
+
+class ForeignKeyRule(Rule):
+    """Flag tables that declare foreign keys (DSQL does not support them)."""
+
+    rule_id = "FK_UNSUPPORTED"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            if table.foreign_keys:
+                names = ", ".join(fk.name for fk in table.foreign_keys)
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            f"Foreign key constraints ({names}) are not "
+                            "supported by Aurora DSQL."
+                        ),
+                        recommendation=(
+                            "Remove the foreign key and enforce referential "
+                            "integrity in the application layer."
+                        ),
+                        effort=EffortLevel.SIMPLE,
+                    )
+                )
+        return findings
+
+
+class TriggerRule(Rule):
+    """Flag triggers (Aurora DSQL has no trigger object at all)."""
+
+    rule_id = "TRIGGER_UNSUPPORTED"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        return [
+            Finding(
+                object=ObjectKey(KIND_TRIGGER, trigger.name),
+                rule_id=self.rule_id,
+                classification=Classification.UNSUPPORTED,
+                risk=(
+                    "Aurora DSQL has no trigger object; there is no target to "
+                    "migrate the trigger into."
+                ),
+                recommendation=(
+                    "Reimplement the trigger logic in the application or with "
+                    "event-driven processing (e.g., EventBridge)."
+                ),
+                effort=EffortLevel.SIGNIFICANT,
+            )
+            for trigger in inventory.triggers
+        ]
+
+
+class ProcedureRule(Rule):
+    """Flag stored procedures/functions (Aurora DSQL has no procedural routines)."""
+
+    rule_id = "PROC_PLPGSQL"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for routine in inventory.routines:
+            kind = _routine_kind(routine)
+            noun = (
+                "stored procedure"
+                if kind == KIND_PROCEDURE
+                else "function"
+                if kind == KIND_FUNCTION
+                else "routine"
+            )
+            findings.append(
+                Finding(
+                    object=ObjectKey(kind, routine.name),
+                    rule_id=self.rule_id,
+                    classification=Classification.UNSUPPORTED,
+                    risk=(
+                        f"Aurora DSQL does not support procedural {noun}s; there "
+                        f"is no target object to migrate the {noun} into."
+                    ),
+                    recommendation=(
+                        "Reimplement as a LANGUAGE SQL function or move the logic "
+                        "to the application or a Lambda function."
+                    ),
+                    effort=EffortLevel.SIGNIFICANT,
+                )
+            )
+        return findings
+
+
+class EventRule(Rule):
+    """Flag scheduled events (Aurora DSQL has no event scheduler)."""
+
+    rule_id = "EVENT_UNSUPPORTED"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        return [
+            Finding(
+                object=ObjectKey(KIND_EVENT, event.name),
+                rule_id=self.rule_id,
+                classification=Classification.UNSUPPORTED,
+                risk=(
+                    "Aurora DSQL has no event scheduler; there is no target to "
+                    "migrate the scheduled event into."
+                ),
+                recommendation=(
+                    "Reimplement the schedule outside the database, e.g. with "
+                    "Amazon EventBridge Scheduler invoking a Lambda function."
+                ),
+                effort=EffortLevel.SIGNIFICANT,
+            )
+            for event in inventory.events
+        ]
+
+
+class AutoIncrementRule(Rule):
+    """Flag tables that rely on an AUTO_INCREMENT primary key."""
+
+    rule_id = "AUTO_INCREMENT"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            column = table.auto_increment_column
+            if column:
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            f"AUTO_INCREMENT column '{column}' produces "
+                            "monotonic keys that cause hot partitions in "
+                            "Aurora DSQL."
+                        ),
+                        recommendation=(
+                            "Use a UUID/random key, or an identity/sequence "
+                            "with cache tuning."
+                        ),
+                        effort=EffortLevel.MEDIUM,
+                    )
+                )
+        return findings
+
+
+class NoPrimaryKeyRule(Rule):
+    """Flag tables without a primary key (DSQL requires a primary key)."""
+
+    rule_id = "NO_PRIMARY_KEY"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            if not table.primary_key:
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.UNSUPPORTED,
+                        risk="Aurora DSQL requires every table to have a primary key.",
+                        recommendation=(
+                            "Add a primary key (e.g., a UUID/random key) before "
+                            "migrating the table."
+                        ),
+                        effort=EffortLevel.MEDIUM,
+                    )
+                )
+        return findings
+
+
+class CaseInsensitiveCollationRule(Rule):
+    """Flag tables with a case-insensitive (``*_ci``) collation."""
+
+    rule_id = "CI_COLLATION"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            ci_columns = [
+                column.name
+                for column in table.columns
+                if _is_case_insensitive_collation(column.collation)
+            ]
+            if ci_columns:
+                names = ", ".join(ci_columns)
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            f"Case-insensitive collation on columns ({names}) "
+                            "changes sorting and uniqueness under the DSQL 'C' "
+                            "collation."
+                        ),
+                        recommendation=(
+                            "Review sorting/uniqueness behavior and adjust "
+                            "comparisons for the 'C' collation."
+                        ),
+                        effort=EffortLevel.MEDIUM,
+                    )
+                )
+        return findings
+
+
+class PartitionedTableRule(Rule):
+    """Flag tables that use MySQL native partitioning."""
+
+    rule_id = "PARTITIONED_TABLE"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            if table.partitioned:
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            "Manual partitioning is not used by Aurora DSQL, "
+                            "which distributes data automatically."
+                        ),
+                        recommendation=(
+                            "Remove the manual partitioning and rely on DSQL "
+                            "automatic data distribution."
+                        ),
+                        effort=EffortLevel.MEDIUM,
+                    )
+                )
+        return findings
+
+
+class UnsupportedTypeRule(Rule):
+    """Flag tables with a column type that cannot be mapped to a DSQL type."""
+
+    rule_id = "UNSUPPORTED_TYPE"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            unmapped = [
+                f"{column.name} ({column.mysql_type})"
+                for column in table.columns
+                if _base_type(column.mysql_type) in _UNSUPPORTED_TYPE_BASES
+            ]
+            if unmapped:
+                names = ", ".join(unmapped)
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.UNSUPPORTED,
+                        risk=(
+                            f"Column types ({names}) have no lossless mapping "
+                            "to an Aurora DSQL type."
+                        ),
+                        recommendation=(
+                            "Substitute an equivalent supported type or "
+                            "redesign the column."
+                        ),
+                        effort=EffortLevel.SIGNIFICANT,
+                    )
+                )
+        return findings
+
+
+def _decimal_precision(mysql_type: str) -> Optional[int]:
+    """Return the declared precision of a DECIMAL/NUMERIC type, or ``None``."""
+    match = _DECIMAL_PRECISION_RE.search(mysql_type)
+    return int(match.group(1)) if match else None
+
+
+class TooManyColumnsRule(Rule):
+    """Flag tables that exceed the DSQL per-table column limit."""
+
+    rule_id = "TOO_MANY_COLUMNS"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            count = len(table.columns)
+            if count > _MAX_COLUMNS_PER_TABLE:
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.UNSUPPORTED,
+                        risk=(
+                            f"The table has {count} columns; Aurora DSQL allows at "
+                            f"most {_MAX_COLUMNS_PER_TABLE} columns per table."
+                        ),
+                        recommendation=(
+                            "Reduce the column count (drop/merge columns) or split "
+                            "the table vertically before migrating."
+                        ),
+                        effort=EffortLevel.SIGNIFICANT,
+                    )
+                )
+        return findings
+
+
+class OversizedLobRule(Rule):
+    """Flag columns whose MySQL LOB/TEXT type can exceed the DSQL 1 MiB limit."""
+
+    rule_id = "OVERSIZED_LOB"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            columns = [
+                column.name
+                for column in table.columns
+                if _base_type(column.mysql_type) in _OVERSIZED_LOB_BASES
+            ]
+            if columns:
+                names = ", ".join(columns)
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            f"Columns ({names}) use a large MySQL LOB/TEXT type "
+                            "whose values can exceed the Aurora DSQL 1 MiB limit "
+                            "for text/bytea; an oversized value fails to load."
+                        ),
+                        recommendation=(
+                            "Confirm no value exceeds 1 MiB, or move large objects "
+                            "to external storage (e.g. Amazon S3) and store a "
+                            "reference instead."
+                        ),
+                        effort=EffortLevel.MEDIUM,
+                    )
+                )
+        return findings
+
+
+class DecimalPrecisionRule(Rule):
+    """Flag DECIMAL/NUMERIC columns whose precision exceeds the DSQL maximum."""
+
+    rule_id = "NUMERIC_PRECISION"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            over = [
+                f"{column.name} ({column.mysql_type})"
+                for column in table.columns
+                if _base_type(column.mysql_type) in _DECIMAL_BASES
+                and (precision := _decimal_precision(column.mysql_type)) is not None
+                and precision > _MAX_NUMERIC_PRECISION
+            ]
+            if over:
+                names = ", ".join(over)
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.UNSUPPORTED,
+                        risk=(
+                            f"Columns ({names}) exceed the Aurora DSQL numeric "
+                            f"maximum precision of {_MAX_NUMERIC_PRECISION} digits, "
+                            "so the value cannot be stored without loss."
+                        ),
+                        recommendation=(
+                            "Reduce the precision to 38 digits or fewer, or store "
+                            "the value as text if full precision must be kept."
+                        ),
+                        effort=EffortLevel.MEDIUM,
+                    )
+                )
+        return findings
+
+
+class EnumSetRule(Rule):
+    """Flag ENUM/SET columns (no native DSQL type; mapped to text)."""
+
+    rule_id = "ENUM_SET_TYPE"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            columns = [
+                column.name
+                for column in table.columns
+                if _base_type(column.mysql_type) in _ENUM_SET_BASES
+            ]
+            if columns:
+                names = ", ".join(columns)
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            f"Columns ({names}) use MySQL ENUM/SET, for which "
+                            "Aurora DSQL has no native type; the allowed-value "
+                            "constraint is lost when the column is mapped to text."
+                        ),
+                        recommendation=(
+                            "Re-enforce the allowed values in the application "
+                            "layer (or with a CHECK constraint if supported)."
+                        ),
+                        effort=EffortLevel.SIMPLE,
+                    )
+                )
+        return findings
+
+
+class GeneratedColumnRule(Rule):
+    """Flag MySQL generated/computed columns for review."""
+
+    rule_id = "GENERATED_COLUMN"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            columns = [c.name for c in table.columns if c.generated]
+            if columns:
+                names = ", ".join(columns)
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            f"Columns ({names}) are MySQL generated/computed "
+                            "columns; their generation expression is not "
+                            "auto-converted to Aurora DSQL."
+                        ),
+                        recommendation=(
+                            "Recreate as a PostgreSQL GENERATED column if "
+                            "supported on the target, or compute the value in "
+                            "the application."
+                        ),
+                        effort=EffortLevel.MEDIUM,
+                    )
+                )
+        return findings
+
+
+class AutoUpdateTimestampRule(Rule):
+    """Flag columns using MySQL ON UPDATE CURRENT_TIMESTAMP."""
+
+    rule_id = "ON_UPDATE_TIMESTAMP"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            columns = [c.name for c in table.columns if c.auto_update_timestamp]
+            if columns:
+                names = ", ".join(columns)
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            f"Columns ({names}) use MySQL ON UPDATE "
+                            "CURRENT_TIMESTAMP (auto-updated on every row change); "
+                            "Aurora DSQL does not apply this automatically."
+                        ),
+                        recommendation=(
+                            "Set the timestamp explicitly in the application on "
+                            "each update (DSQL has no ON UPDATE clause or "
+                            "triggers)."
+                        ),
+                        effort=EffortLevel.SIMPLE,
+                    )
+                )
+        return findings
+
+
+class UnsupportedIndexTypeRule(Rule):
+    """Flag FULLTEXT/SPATIAL indexes (no Aurora DSQL equivalent)."""
+
+    rule_id = "UNSUPPORTED_INDEX_TYPE"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            flagged = [
+                f"{index.name} ({index.index_type})"
+                for index in table.indexes
+                if index.index_type
+                and index.index_type.lower() in _UNSUPPORTED_INDEX_TYPES
+            ]
+            if flagged:
+                names = ", ".join(flagged)
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.UNSUPPORTED,
+                        risk=(
+                            f"Indexes ({names}) use a MySQL index type Aurora "
+                            "DSQL does not support (FULLTEXT/SPATIAL)."
+                        ),
+                        recommendation=(
+                            "Drop the index and implement full-text/spatial "
+                            "search outside the database (e.g. Amazon OpenSearch "
+                            "Service), or redesign the query."
+                        ),
+                        effort=EffortLevel.SIGNIFICANT,
+                    )
+                )
+        return findings
+
+
+class ViewCompatibilityRule(Rule):
+    """Flag views whose definition uses DSQL-unsupported/risky SQL constructs.
+
+    Reuses the application anti-pattern linter (unsupported MySQL functions,
+    ``FOR UPDATE``, trigger/routine calls) on each view's SELECT body; a view
+    that matches any anti-pattern is flagged ``MANUAL`` for review. Views with a
+    clean (or empty) definition stay ``AUTO``.
+    """
+
+    rule_id = "VIEW_UNSUPPORTED_SQL"
+
+    def __init__(self, linter: object = None) -> None:
+        """Create the rule, optionally injecting a linter (for tests)."""
+        if linter is None:
+            from dsql_migrator.core.linter import AppLinter
+
+            linter = AppLinter()
+        self._linter = linter
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        from dsql_migrator.core.linter import AppSource, SourceFile
+
+        findings: list[Finding] = []
+        for view in inventory.views:
+            definition = (view.definition or "").strip()
+            if not definition:
+                continue
+            source = AppSource(
+                files=[SourceFile(path=view.name, content=definition)]
+            )
+            matches = self._linter.scan(source)  # type: ignore[attr-defined]
+            if not matches:
+                continue
+            patterns = sorted({match.pattern.value for match in matches})
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_VIEW, view.name),
+                    rule_id=self.rule_id,
+                    classification=Classification.MANUAL,
+                    risk=(
+                        "The view definition uses DSQL-unsupported or risky "
+                        f"constructs ({', '.join(patterns)})."
+                    ),
+                    recommendation=(
+                        "Rewrite the view to avoid these constructs; see the "
+                        "application anti-pattern report for the exact locations."
+                    ),
+                    effort=EffortLevel.MEDIUM,
+                )
+            )
+        return findings
+
+
+# ---------------------------------------------------------------------------
+# Inventory-level (cluster/database-wide) checks -- not tied to one object
+# ---------------------------------------------------------------------------
+
+# An inventory rule classifies the source as a whole (e.g. spanning multiple
+# databases) rather than a single object; it returns ready-made items.
+InventoryRule = Callable[[SourceInventory], list[AssessmentItem]]
+
+
+def _source_databases(inventory: SourceInventory) -> list[str]:
+    """Return the distinct source database prefixes from qualified object names.
+
+    Objects are qualified as ``database.object``; the part before the first dot
+    is the database. Unqualified names contribute no database. Order preserved.
+    """
+    databases: list[str] = []
+    names = [table.name for table in inventory.tables]
+    names += [view.name for view in inventory.views]
+    for name in names:
+        if "." in name:
+            database = name.split(".", 1)[0]
+            if database and database not in databases:
+                databases.append(database)
+    return databases
+
+
+def check_multiple_source_databases(
+    inventory: SourceInventory,
+) -> list[AssessmentItem]:
+    """Flag a source that spans multiple databases (DSQL has one DB per cluster)."""
+    databases = _source_databases(inventory)
+    if len(databases) <= 1:
+        return []
+    names = ", ".join(databases)
+    return [
+        AssessmentItem(
+            object_name=f"{len(databases)} source databases",
+            rule_id="MULTIPLE_DATABASES",
+            classification=Classification.MANUAL,
+            risk=(
+                f"The source spans {len(databases)} databases ({names}); Aurora "
+                "DSQL provides a single database per cluster."
+            ),
+            recommendation=(
+                "Consolidate the databases into one cluster using separate "
+                "schemas, or provision a separate Aurora DSQL cluster per "
+                "database. Resolve any cross-database name collisions."
+            ),
+            effort=EffortLevel.MEDIUM,
+            kind=KIND_DATABASE.upper(),
+        )
+    ]
+
+
+def check_table_count(inventory: SourceInventory) -> list[AssessmentItem]:
+    """Flag a source whose table count exceeds the DSQL per-database limit."""
+    count = len(inventory.tables)
+    if count <= _MAX_TABLES_PER_DATABASE:
+        return []
+    return [
+        AssessmentItem(
+            object_name=f"{count} tables",
+            rule_id="TABLE_COUNT_LIMIT",
+            classification=Classification.UNSUPPORTED,
+            risk=(
+                f"The source has {count} tables; Aurora DSQL allows at most "
+                f"{_MAX_TABLES_PER_DATABASE} tables per database."
+            ),
+            recommendation=(
+                "Reduce the table count or split the workload across multiple "
+                "Aurora DSQL clusters before migrating."
+            ),
+            effort=EffortLevel.SIGNIFICANT,
+            kind=KIND_DATABASE.upper(),
+        )
+    ]
+
+
+def default_inventory_rules() -> list[InventoryRule]:
+    """Return the default inventory-level (cluster-wide) checks."""
+    return [check_multiple_source_databases, check_table_count]
+
+
+def default_rules() -> list[Rule]:
+    """Return the default, ordered list of compatibility rules.
+
+    The order is significant: it breaks ties when several rules of equal
+    severity match the same object.
+    """
+    return [
+        ForeignKeyRule(),
+        TriggerRule(),
+        ProcedureRule(),
+        EventRule(),
+        AutoIncrementRule(),
+        NoPrimaryKeyRule(),
+        CaseInsensitiveCollationRule(),
+        PartitionedTableRule(),
+        UnsupportedTypeRule(),
+        TooManyColumnsRule(),
+        OversizedLobRule(),
+        DecimalPrecisionRule(),
+        EnumSetRule(),
+        GeneratedColumnRule(),
+        AutoUpdateTimestampRule(),
+        UnsupportedIndexTypeRule(),
+        ViewCompatibilityRule(),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Assessment engine
+# ---------------------------------------------------------------------------
+
+
+def _inventory_objects(inventory: SourceInventory) -> list[ObjectKey]:
+    """Return the ordered, canonical list of objects to classify.
+
+    Tables first, then views, triggers, and routines, preserving inventory
+    order. This is the exact set over which Property 8 must hold.
+    """
+    objects: list[ObjectKey] = []
+    objects.extend(ObjectKey(KIND_TABLE, table.name) for table in inventory.tables)
+    objects.extend(ObjectKey(KIND_VIEW, view.name) for view in inventory.views)
+    objects.extend(
+        ObjectKey(KIND_TRIGGER, trigger.name) for trigger in inventory.triggers
+    )
+    objects.extend(
+        ObjectKey(_routine_kind(routine), routine.name)
+        for routine in inventory.routines
+    )
+    objects.extend(
+        ObjectKey(KIND_EVENT, event.name) for event in inventory.events
+    )
+    return objects
+
+
+def _aggregate(key: ObjectKey, findings: list[Finding]) -> AssessmentItem:
+    """Collapse all findings for one object into a single assessment item.
+
+    The most severe classification governs the item; risks and recommendations
+    of every matched rule are combined so no finding is lost. Objects with no
+    findings are classified ``AUTO``.
+    """
+    if not findings:
+        return AssessmentItem(
+            object_name=key.name,
+            rule_id="COMPATIBLE",
+            classification=Classification.AUTO,
+            risk="",
+            recommendation="No DSQL compatibility issues detected.",
+            effort=None,
+            kind=key.kind.upper(),
+        )
+
+    # Stable sort by descending severity keeps declaration order for ties.
+    ordered = sorted(findings, key=lambda f: -_SEVERITY[f.classification])
+    governing = ordered[0]
+    risk = "; ".join(f.risk for f in ordered if f.risk)
+    recommendation = "; ".join(f.recommendation for f in ordered if f.recommendation)
+    # The most demanding effort across all matched rules governs the estimate.
+    efforts = [f.effort for f in findings if f.effort is not None]
+    effort = max(efforts, key=lambda e: _EFFORT_ORDER[e]) if efforts else None
+    return AssessmentItem(
+        object_name=key.name,
+        rule_id=governing.rule_id,
+        classification=governing.classification,
+        risk=risk,
+        recommendation=recommendation,
+        effort=effort,
+        kind=key.kind.upper(),
+    )
+
+
+class CompatibilityAssessor:
+    """Classifies inventory objects as AUTO / MANUAL / UNSUPPORTED (Req 2)."""
+
+    def __init__(
+        self,
+        rules: list[Rule] | None = None,
+        *,
+        inventory_rules: list[InventoryRule] | None = None,
+    ) -> None:
+        """Create an assessor.
+
+        ``rules`` overrides the per-object rule list, enabling extension or
+        customization. The order of the rules breaks classification ties.
+        ``inventory_rules`` overrides the cluster/database-wide checks (e.g.
+        multiple source databases, table-count limit) that produce findings not
+        tied to a single object.
+        """
+        self._rules: list[Rule] = list(rules) if rules is not None else default_rules()
+        self._inventory_rules: list[InventoryRule] = (
+            list(inventory_rules)
+            if inventory_rules is not None
+            else default_inventory_rules()
+        )
+
+    def assess(self, inventory: SourceInventory) -> AssessmentReport:
+        """Assess ``inventory`` and return a complete report.
+
+        Guarantees Property 8: every inventory object appears in exactly one
+        per-object :class:`AssessmentItem`, so no object is left unclassified.
+        Inventory-level (cluster/database-wide) checks may append additional
+        items (kind ``DATABASE``) that are not tied to a single object.
+        """
+        findings_by_object: dict[ObjectKey, list[Finding]] = defaultdict(list)
+        for rule in self._rules:
+            for finding in rule.evaluate(inventory):
+                findings_by_object[finding.object].append(finding)
+
+        items = [
+            _aggregate(key, findings_by_object.get(key, []))
+            for key in _inventory_objects(inventory)
+        ]
+        for inventory_rule in self._inventory_rules:
+            items.extend(inventory_rule(inventory))
+        return AssessmentReport.from_items(items)
+
+
+# ---------------------------------------------------------------------------
+# Report export
+# ---------------------------------------------------------------------------
+
+
+def render_text_report(report: AssessmentReport) -> str:
+    """Render a human-readable text version of an assessment report (English)."""
+    lines = ["Compatibility Assessment Report", "=" * 31, ""]
+    lines.append("Difficulty summary (objects by classification):")
+    for classification in Classification:
+        lines.append(f"  {classification.value}: {report.summary.get(classification, 0)}")
+    lines.append("")
+    lines.append("Estimated manual effort (non-automatic objects):")
+    for level in EffortLevel:
+        lines.append(f"  {level.value}: {report.effort_summary.get(level, 0)}")
+    lines.append("")
+    lines.append(f"Items ({len(report.items)}):")
+    for item in report.items:
+        effort = item.effort.value if item.effort is not None else "NONE"
+        lines.append(
+            f"- {item.object_name} [{item.classification.value}] "
+            f"(effort: {effort}) ({item.rule_id})"
+        )
+        if item.risk:
+            lines.append(f"    Risk: {item.risk}")
+        if item.recommendation:
+            lines.append(f"    Recommendation: {item.recommendation}")
+    return "\n".join(lines)
+
+
+def export_report(report: AssessmentReport, fmt: str = "json") -> str:
+    """Export an assessment report as ``"json"``, ``"text"``, or ``"html"``.
+
+    JSON is produced from the Pydantic model (machine-readable, downloadable);
+    text is a readable summary; HTML is a styled, standalone document suitable
+    for sharing. Raises ``ValueError`` for unknown formats.
+    """
+    normalized = fmt.lower()
+    if normalized == "json":
+        return report.model_dump_json(indent=2)
+    if normalized == "text":
+        return render_text_report(report)
+    if normalized == "html":
+        return render_html_report(report)
+    raise ValueError(
+        f"unsupported report format: {fmt!r} (use 'json', 'text', or 'html')"
+    )
+
+
+# Background colors for the classification cell in the HTML report.
+_HTML_CLASS_COLOR: dict[Classification, str] = {
+    Classification.AUTO: "#e8f5e9",
+    Classification.MANUAL: "#fff8e1",
+    Classification.UNSUPPORTED: "#ffebee",
+}
+
+# Solid bar colors for the conversion-statistics chart (UI and HTML match).
+# A single severity ramp so the bars match the effort badges (green-6 / orange-8
+# / red-8): auto (deep green) -> simple (green) -> medium (orange) -> significant
+# (red). The earlier green->blue scheme clashed with the orange/red effort badges.
+_CHART_BUCKET_COLORS: dict[str, str] = {
+    "auto": "#2e7d32",
+    "simple": "#43a047",
+    "medium": "#ef6c00",
+    "significant": "#c62828",
+}
+
+
+@dataclass(frozen=True)
+class KindConversionStat:
+    """Per-object-kind conversion counts for the assessment chart.
+
+    Buckets each object as automatically convertible (``auto``) or, for
+    non-automatic objects, by estimated effort (``simple``/``medium``/
+    ``significant``). ``manual_share`` is the fraction of objects of this kind
+    that need manual work, used to order kinds by impact.
+    """
+
+    kind: str
+    auto: int
+    simple: int
+    medium: int
+    significant: int
+
+    @property
+    def total(self) -> int:
+        """Total assessed objects of this kind."""
+        return self.auto + self.simple + self.medium + self.significant
+
+    @property
+    def non_auto(self) -> int:
+        """Objects of this kind that need manual work (non-AUTO)."""
+        return self.simple + self.medium + self.significant
+
+    @property
+    def manual_share(self) -> float:
+        """Fraction (0..1) of this kind's objects that need manual work."""
+        return self.non_auto / self.total if self.total else 0.0
+
+
+def kind_conversion_stats(report: AssessmentReport) -> list[KindConversionStat]:
+    """Aggregate per-kind conversion counts, ordered by manual-work share desc.
+
+    Each object is bucketed as automatically convertible (AUTO) or, for
+    non-automatic objects, by effort (Simple/Medium/Significant; a non-automatic
+    item with no effort estimate counts as Simple, the smallest). Kinds are
+    ordered so the kind with the highest share of objects needing manual work
+    comes first (most impactful), breaking ties by total count (desc) then kind
+    name (asc).
+    """
+    counts: dict[str, dict[str, int]] = {}
+    for item in report.items:
+        bucket = counts.setdefault(
+            item.kind, {"auto": 0, "simple": 0, "medium": 0, "significant": 0}
+        )
+        if item.classification is Classification.AUTO:
+            bucket["auto"] += 1
+        elif item.effort is EffortLevel.SIMPLE:
+            bucket["simple"] += 1
+        elif item.effort is EffortLevel.MEDIUM:
+            bucket["medium"] += 1
+        elif item.effort is EffortLevel.SIGNIFICANT:
+            bucket["significant"] += 1
+        else:
+            bucket["simple"] += 1
+
+    stats = [
+        KindConversionStat(
+            kind=kind,
+            auto=bucket["auto"],
+            simple=bucket["simple"],
+            medium=bucket["medium"],
+            significant=bucket["significant"],
+        )
+        for kind, bucket in counts.items()
+    ]
+    stats.sort(key=lambda stat: (-stat.manual_share, -stat.total, stat.kind))
+    return stats
+
+
+def _render_html_chart(report: AssessmentReport) -> str:
+    """Render the conversion-statistics chart as a self-contained HTML/CSS block.
+
+    Produces a horizontal stacked bar per object kind (auto / simple / medium /
+    significant), ordered most-impactful first, scaled to the largest kind so
+    bar lengths reflect counts -- no external scripts, so the exported report
+    stays portable.
+    """
+    stats = kind_conversion_stats(report)
+    max_total = max((stat.total for stat in stats), default=0)
+    if not stats or max_total == 0:
+        return ""
+
+    legend_items = [
+        ("Auto-converted", _CHART_BUCKET_COLORS["auto"]),
+        ("Simple actions", _CHART_BUCKET_COLORS["simple"]),
+        ("Medium actions", _CHART_BUCKET_COLORS["medium"]),
+        ("Significant actions", _CHART_BUCKET_COLORS["significant"]),
+    ]
+    legend = "".join(
+        f'<span class="chip"><i style="background:{color}"></i>{label}</span>'
+        for label, color in legend_items
+    )
+
+    rows: list[str] = []
+    for stat in stats:
+        segments = [
+            (stat.auto, _CHART_BUCKET_COLORS["auto"]),
+            (stat.simple, _CHART_BUCKET_COLORS["simple"]),
+            (stat.medium, _CHART_BUCKET_COLORS["medium"]),
+            (stat.significant, _CHART_BUCKET_COLORS["significant"]),
+        ]
+        bars = "".join(
+            f'<span style="width:{count / max_total * 100:.2f}%;background:{color}"'
+            f' title="{count}"></span>'
+            for count, color in segments
+            if count > 0
+        )
+        manual_pct = round(stat.manual_share * 100)
+        rows.append(
+            '<div class="bar-row">'
+            f'<div class="bar-label">{html.escape(stat.kind)}</div>'
+            f'<div class="bar">{bars}</div>'
+            f'<div class="bar-meta">{stat.total} objects &middot; '
+            f"{manual_pct}% manual</div>"
+            "</div>"
+        )
+
+    return (
+        "<h2>Conversion statistics by object kind</h2>\n"
+        f'<div class="legend">{legend}</div>\n'
+        f'<div class="chart">{"".join(rows)}</div>\n'
+    )
+
+
+def _render_ai_html_section(ai_report: AiAssessmentReport) -> str:
+    """Render the optional AI-led assessment as an HTML section (advisory)."""
+    def esc(value: object) -> str:
+        return html.escape(str(value)) if value is not None else ""
+
+    parts = [
+        '<section class="ai-report">',
+        '<div class="ai-head"><span class="ai-badge">AI &middot; advisory</span>'
+        "<h2>AI-led migration assessment</h2></div>",
+        f'<p class="advisory">Generated by model {esc(ai_report.model_id)}. The '
+        "deterministic classification and effort above remain authoritative.</p>",
+    ]
+
+    if ai_report.strategy_summary:
+        # The AI reply is a free-form Markdown narrative; render it to HTML so the
+        # export reads like a report (headings, lists, tables) instead of a wall
+        # of escaped text. Untrusted output -> escape any embedded raw HTML.
+        try:
+            import markdown2
+
+            body = markdown2.markdown(
+                ai_report.strategy_summary,
+                safe_mode="escape",
+                extras=["tables", "fenced-code-blocks", "cuddled-lists"],
+            )
+        except Exception:  # noqa: BLE001 - degrade to plain text if rendering fails
+            body = "<p>" + esc(ai_report.strategy_summary).replace("\n", "<br>") + "</p>"
+        parts.append(f'<div class="ai-body">{body}</div>')
+
+    if ai_report.insights:
+        rows = "\n".join(
+            "<tr>"
+            f"<td>{esc(i.object_name)}</td>"
+            f"<td>{esc(i.ai_effort.value if i.ai_effort is not None else '-')}</td>"
+            f"<td>{esc(i.recommendation)}</td>"
+            f"<td>{esc(i.rationale)}</td>"
+            "</tr>"
+            for i in ai_report.insights
+        )
+        parts.append("<h3>Per-object AI guidance</h3>")
+        parts.append(
+            "<table>\n<thead><tr><th>Object</th><th>AI effort</th>"
+            "<th>AI recommendation</th><th>Rationale</th></tr></thead>\n"
+            f"<tbody>\n{rows}\n</tbody>\n</table>"
+        )
+
+    if ai_report.additional_findings:
+        rows = "\n".join(
+            "<tr>"
+            f"<td>{esc(f.area)}</td>"
+            f"<td>{esc(f.risk)}</td>"
+            f"<td>{esc(f.recommendation)}</td>"
+            "</tr>"
+            for f in ai_report.additional_findings
+        )
+        parts.append("<h3>Additional findings (AI, advisory)</h3>")
+        parts.append(
+            "<table>\n<thead><tr><th>Area</th><th>Risk</th>"
+            "<th>Recommendation</th></tr></thead>\n"
+            f"<tbody>\n{rows}\n</tbody>\n</table>"
+        )
+
+    parts.append("</section>")
+    return "\n".join(parts)
+
+
+def _render_target_html_section(
+    target: TargetInventory, conflicts: "list[str]"
+) -> str:
+    """Render the Target analysis (Aurora DSQL) section for the HTML export.
+
+    Mirrors the on-screen Target analysis: the target catalog summary (schemas /
+    tables / views) and any source objects that already exist on the target and
+    may conflict when applying converted DDL.
+    """
+    def esc(value: object) -> str:
+        return html.escape(str(value)) if value is not None else ""
+
+    table_count = sum(len(schema.tables) for schema in target.schemas)
+    view_count = sum(len(schema.views) for schema in target.schemas)
+    parts = [
+        '<section class="target-section">',
+        "<h2>Target analysis (Aurora DSQL)</h2>",
+        f"<p>Target catalog: <strong>{len(target.schemas)}</strong> schemas, "
+        f"<strong>{table_count}</strong> tables, <strong>{view_count}</strong> "
+        "views.</p>",
+    ]
+    if conflicts:
+        parts.append(
+            f'<p class="warn">{len(conflicts)} source object(s) already exist on '
+            "the target and may conflict when applying converted DDL:</p>"
+        )
+        chips = " ".join(
+            f'<span class="conflict">{esc(name)}</span>' for name in conflicts
+        )
+        parts.append(f"<p>{chips}</p>")
+        parts.append(
+            '<p class="muted">Resolve these in Schema Conversion: choose SKIP '
+            "(keep the existing object) or REPLACE (recreate it) when you "
+            "apply.</p>"
+        )
+    else:
+        parts.append(
+            '<p class="muted">No source objects conflict with existing target '
+            "objects.</p>"
+        )
+    parts.append("</section>")
+    return "\n".join(parts)
+
+
+def render_html_report(
+    report: AssessmentReport,
+    *,
+    ai_report: Optional[AiAssessmentReport] = None,
+    target: Optional[TargetInventory] = None,
+    conflicts: Optional[list[str]] = None,
+) -> str:
+    """Render a styled, standalone HTML assessment report (English).
+
+    The document is self-contained (inline CSS) so it can be saved and opened
+    directly. It shows the classification and effort summaries and a per-object
+    table with color-coded classifications. When ``ai_report`` is provided, an
+    AI-led assessment section (strategy, per-object guidance, and additional
+    findings) is appended as advisory content; the deterministic facts remain
+    authoritative.
+    """
+    def esc(value: object) -> str:
+        return html.escape(str(value)) if value is not None else ""
+
+    classification_summary = "".join(
+        f"<li>{c.value}: <strong>{report.summary.get(c, 0)}</strong></li>"
+        for c in Classification
+    )
+    effort_summary = "".join(
+        f"<li>{level.value}: <strong>{report.effort_summary.get(level, 0)}</strong></li>"
+        for level in EffortLevel
+    )
+
+    rows = []
+    for item in report.items:
+        color = _HTML_CLASS_COLOR.get(item.classification, "#ffffff")
+        effort = item.effort.value if item.effort is not None else "-"
+        rows.append(
+            "<tr "
+            f'data-kind="{esc(item.kind)}" '
+            f'data-classification="{esc(item.classification.value)}" '
+            f'data-effort="{esc(effort)}" '
+            f'data-name="{esc(item.object_name.lower())}">'
+            f"<td>{esc(item.object_name)}</td>"
+            f"<td>{esc(item.kind)}</td>"
+            f'<td style="background:{color}">{esc(item.classification.value)}</td>'
+            f"<td>{esc(effort)}</td>"
+            f"<td>{esc(item.rule_id)}</td>"
+            f"<td>{esc(item.risk)}</td>"
+            f"<td>{esc(item.recommendation)}</td>"
+            "</tr>"
+        )
+    table_rows = "\n".join(rows) if rows else (
+        '<tr><td colspan="7">No objects were assessed.</td></tr>'
+    )
+
+    # Distinct kinds present, for the Kind filter dropdown.
+    kinds_present = sorted({item.kind for item in report.items})
+
+    def _options(values: "list[str]") -> str:
+        return "".join(f'<option value="{esc(v)}">{esc(v)}</option>' for v in values)
+
+    filter_bar = (
+        '<div class="filters" id="assessed-filters">\n'
+        '<label>Type <select id="f-kind"><option value="">All</option>'
+        f"{_options(kinds_present)}</select></label>\n"
+        '<label>Classification <select id="f-class"><option value="">All</option>'
+        f"{_options([c.value for c in Classification])}</select></label>\n"
+        '<label>Effort <select id="f-effort"><option value="">All</option>'
+        f'{_options([level.value for level in EffortLevel] + ["-"])}</select></label>\n'
+        '<label>Search <input id="f-search" type="search" '
+        'placeholder="object name"></label>\n'
+        '<span id="f-count" class="f-count"></span>\n'
+        "</div>"
+    )
+    filter_script = (
+        "<script>\n"
+        "(function(){\n"
+        "function apply(){\n"
+        "var k=document.getElementById('f-kind').value;\n"
+        "var c=document.getElementById('f-class').value;\n"
+        "var e=document.getElementById('f-effort').value;\n"
+        "var q=(document.getElementById('f-search').value||'').toLowerCase();\n"
+        "var rows=document.querySelectorAll('#assessed-objects tbody tr[data-kind]');\n"
+        "var shown=0;\n"
+        "rows.forEach(function(r){\n"
+        "var ok=(!k||r.dataset.kind===k)&&(!c||r.dataset.classification===c)"
+        "&&(!e||r.dataset.effort===e)"
+        "&&(!q||(r.dataset.name||'').indexOf(q)>=0);\n"
+        "r.style.display=ok?'':'none';if(ok)shown++;});\n"
+        "var cnt=document.getElementById('f-count');\n"
+        "if(cnt)cnt.textContent=shown+' of '+rows.length+' shown';\n"
+        "}\n"
+        "['f-kind','f-class','f-effort'].forEach(function(id){\n"
+        "var el=document.getElementById(id);if(el)el.addEventListener('change',apply);});\n"
+        "var s=document.getElementById('f-search');if(s)s.addEventListener('input',apply);\n"
+        "apply();\n"
+        "})();\n"
+        "</script>"
+    )
+
+    ai_section = _render_ai_html_section(ai_report) if ai_report is not None else ""
+    target_section = (
+        _render_target_html_section(target, conflicts or [])
+        if target is not None
+        else ""
+    )
+    chart_section = _render_html_chart(report)
+
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+        "<title>MySQL to Aurora DSQL Compatibility Assessment</title>\n"
+        "<style>\n"
+        "body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;"
+        "margin:24px;color:#222;}\n"
+        "h1{font-size:22px;} h2{font-size:16px;margin-top:24px;} "
+        "h3{font-size:14px;margin-top:16px;}\n"
+        "ul{margin:4px 0;} li{margin:2px 0;}\n"
+        "table{border-collapse:collapse;width:100%;margin-top:8px;font-size:13px;}\n"
+        "th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;"
+        "vertical-align:top;}\n"
+        "th{background:#f5f5f5;}\n"
+        ".legend{display:flex;flex-wrap:wrap;gap:12px;margin:8px 0;font-size:12px;}\n"
+        ".chip{display:inline-flex;align-items:center;gap:4px;}\n"
+        ".chip i{width:12px;height:12px;border-radius:2px;display:inline-block;}\n"
+        ".chart{display:flex;flex-direction:column;gap:6px;margin-top:8px;}\n"
+        ".bar-row{display:flex;align-items:center;gap:8px;font-size:12px;}\n"
+        ".bar-label{width:90px;flex:none;font-weight:600;}\n"
+        ".bar{flex:1;display:flex;height:18px;border-radius:3px;overflow:hidden;"
+        "background:#f0f0f0;}\n"
+        ".bar span{display:inline-block;height:100%;}\n"
+        ".bar-meta{width:150px;flex:none;color:#666;}\n"
+        ".filters{display:flex;flex-wrap:wrap;gap:12px;align-items:center;"
+        "margin:8px 0;font-size:13px;}\n"
+        ".filters label{display:inline-flex;align-items:center;gap:4px;}\n"
+        ".filters select,.filters input{font-size:13px;padding:2px 4px;}\n"
+        ".f-count{color:#666;}\n"
+        ".ai-report,.target-section{border:1px solid #e0e0e0;border-radius:6px;"
+        "padding:12px 16px;margin-top:24px;background:#fafafa;}\n"
+        ".ai-head{display:flex;align-items:center;gap:8px;}\n"
+        ".ai-head h2{margin:0;} .ai-report h3,.target-section h3{margin-top:14px;}\n"
+        ".ai-badge{font-size:11px;font-weight:600;color:#fff;background:#5b6dcd;"
+        "border-radius:10px;padding:2px 8px;}\n"
+        ".advisory{color:#666;font-size:12px;margin:4px 0 8px;}\n"
+        ".ai-body{font-size:13px;} .ai-body h2{font-size:15px;} "
+        ".ai-body h3{font-size:13px;} .ai-body ul{margin:4px 0;padding-left:20px;}\n"
+        ".target-section .warn{color:#b35900;} .target-section .muted{color:#666;"
+        "font-size:12px;}\n"
+        ".conflict{display:inline-block;border:1px solid #e0a800;color:#8a6d00;"
+        "border-radius:10px;padding:1px 8px;margin:2px;font-size:12px;}\n"
+        "</style>\n</head>\n<body>\n"
+        "<h1>MySQL to Aurora DSQL Compatibility Assessment</h1>\n"
+        "<h2>Classification summary</h2>\n"
+        f"<ul>{classification_summary}</ul>\n"
+        "<h2>Estimated manual effort (non-automatic objects)</h2>\n"
+        f"<ul>{effort_summary}</ul>\n"
+        f"{chart_section}"
+        "<h2>Assessed objects</h2>\n"
+        f"{filter_bar}\n"
+        '<table id="assessed-objects">\n<thead><tr>'
+        "<th>Object</th><th>Kind</th><th>Classification</th><th>Effort</th>"
+        "<th>Rule</th><th>Risk</th><th>Recommendation</th>"
+        "</tr></thead>\n<tbody>\n"
+        f"{table_rows}\n"
+        "</tbody>\n</table>\n"
+        f"{filter_script}\n"
+        f"{target_section}\n"
+        f"{ai_section}\n"
+        "</body>\n</html>\n"
+    )
+
+
+__all__ = [
+    "ObjectKey",
+    "Finding",
+    "Rule",
+    "ForeignKeyRule",
+    "TriggerRule",
+    "ProcedureRule",
+    "EventRule",
+    "AutoIncrementRule",
+    "NoPrimaryKeyRule",
+    "CaseInsensitiveCollationRule",
+    "PartitionedTableRule",
+    "UnsupportedTypeRule",
+    "TooManyColumnsRule",
+    "OversizedLobRule",
+    "DecimalPrecisionRule",
+    "EnumSetRule",
+    "GeneratedColumnRule",
+    "AutoUpdateTimestampRule",
+    "UnsupportedIndexTypeRule",
+    "ViewCompatibilityRule",
+    "InventoryRule",
+    "check_multiple_source_databases",
+    "check_table_count",
+    "default_inventory_rules",
+    "default_rules",
+    "CompatibilityAssessor",
+    "render_text_report",
+    "render_html_report",
+    "export_report",
+    "KindConversionStat",
+    "kind_conversion_stats",
+    "KIND_TABLE",
+    "KIND_VIEW",
+    "KIND_TRIGGER",
+    "KIND_ROUTINE",
+    "KIND_PROCEDURE",
+    "KIND_FUNCTION",
+    "KIND_DATABASE",
+    "KIND_EVENT",
+]

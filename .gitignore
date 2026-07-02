@@ -1,0 +1,82 @@
+# Secrets / local config
+.env
+.env.*
+
+# Seed utility log
+scripts/seed.log
+
+# E2E runtime artifacts (may contain source coordinates; never committed)
+typetest_failrows.json
+e2e_watermark.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# OS / editor cruft
+.DS_Store
+
+# Runtime-generated local state (default paths from config.py): per-session
+# job/snapshot stores and the activity log. Regenerated on run; never committed.
+job_state.sqlite
+session_state.sqlite
+migration_activity.log
+
+# --- Connector plugins ------------------------------------------------------
+# NOTE: the deploy-critical plugin ZIPs are COMMITTED on purpose, not ignored:
+#   connectors/plugins/debezium-mysql-plugin.zip
+#   connectors/plugins/dsql-sink-plugin.zip
+# s3_provision.py uploads these exact files to S3 for the CDC stack, so a fresh
+# clone can deploy without a Java/Maven toolchain (deployment-convenience first).
+#
+# Ignore ONLY the regenerable intermediates that the deploy never reads directly:
+#  - the Glue converter jar (mvn-downloaded; already bundled INSIDE both zips).
+#    Unanchored so it is ignored wherever the build script copies it, including
+#    inside connectors/plugins/debezium-connector-mysql/.
+#  - the dsql-sink-plugin/ staging dir (the build script `rm -rf`s and recreates
+#    it from the sink jar + converter; pure staging, not a source input).
+#  - the Maven build output for the sink.
+# The committed inputs that DO stay: the two deploy zips above, the
+# connectors/plugins/debezium-connector-mysql/ input folder (the real Debezium
+# jars the build script does NOT fetch), and connectors/dsql-sink/src/.
+schema-registry-kafkaconnect-converter-*.jar
+connectors/plugins/dsql-sink-plugin/
+connectors/dsql-sink/target/
+
+# --- E2E orchestrator runtime artifacts -------------------------------------
+# Regenerated on every run of scripts/run_e2e_migration.py (binlog watermark,
+# workload pidfile). Not source; the watermark also carries live binlog/GTID
+# coordinates that should not be committed.
+e2e_watermark.json
+e2e_workload.pid
+# PKs of the intentional-failure rows seeded by scripts/seed_migration_typetest.py
+# (regenerated each seed run; carries no source values, just PKs).
+typetest_failrows.json
+# Landmark PKs seeded by scripts/seed_fullload_edgecases.py and the partial
+# chunk/watermark snapshots written by scripts/run_fullload_resume_harness.py
+# (regenerated each run; PKs + binlog coordinates, not source — never commit).
+edge_landmarks.json
+resume_watermark.json
+resume_partial_chunks.json
+# Working brief for a resumed session. Carries environment specifics (bastion /
+# security-group IDs, VPC, notes) that must NOT be committed; deleted when its
+# work lands. Ignored so a blanket `git add -A` can never capture it.
+RESUME_CONTEXT.md
+# Per-environment CDC deploy parameter files (account id, real ARNs, VPC/subnet
+# ids, MSK bootstrap). Regenerated per environment; not source — never commit.
+# Broad glob so ANY *params*.json under the cdc-stack tree is ignored (not just
+# the e2e/ subdir), preventing a repeat of committed real infra identifiers.
+deploy/cdc-stack/**/saved-params*.json
+deploy/cdc-stack/*params*.json
+
+# Editor/tool backup + scratch artifacts (never source).
+*.bak
+*.bak[0-9]
+*.bkp
+.$*
+
+
+# Internal design/spec artifacts (Kiro) — not published
+.kiro/

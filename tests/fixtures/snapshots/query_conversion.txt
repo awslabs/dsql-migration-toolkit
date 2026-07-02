@@ -1,0 +1,33 @@
+# query 0
+original:  INSERT INTO `users` (`id`, `email`) VALUES (1, 'a@example.com') ON DUPLICATE KEY UPDATE `email` = VALUES(`email`)
+converted: INSERT INTO "users" ("id", "email") VALUES (1, 'a@example.com') ON CONFLICT DO UPDATE SET "email" = EXCLUDED.email
+class:     MANUAL
+warning:   [ON_DUPLICATE_KEY_UPDATE] INSERT ... ON DUPLICATE KEY UPDATE was converted to INSERT ... ON CONFLICT DO UPDATE SET. PostgreSQL/DSQL requires an explicit conflict target (the unique/primary-key columns), which cannot be inferred here; add the conflict target and verify the rewrite.
+
+# query 1
+original:  SELECT `id`, `email` FROM `users` WHERE `id` = 42 FOR UPDATE
+converted: SELECT "id", "email" FROM "users" WHERE "id" = 42 FOR UPDATE
+class:     MANUAL
+warning:   [FOR_UPDATE_VERIFY_PK] Aurora DSQL allows SELECT ... FOR UPDATE only on a single table with a full primary-key equality predicate; this FOR UPDATE targets a single table with an equality predicate. Verify the predicate covers the full primary key, as primary-key metadata is not available to confirm it here.
+
+# query 2
+original:  SELECT u.`id` FROM `users` AS u JOIN `orders` AS o ON o.`user_id` = u.`id` WHERE u.`id` = 7 FOR UPDATE
+converted: SELECT u."id" FROM "users" AS u JOIN "orders" AS o ON o."user_id" = u."id" WHERE u."id" = 7 FOR UPDATE
+class:     MANUAL
+warning:   [FOR_UPDATE_MULTI_TABLE] Aurora DSQL allows SELECT ... FOR UPDATE only on a single table with a full primary-key equality predicate; this FOR UPDATE locks 2 tables (join), which violates the constraint. Lock a single table by primary key instead.
+
+# query 3
+original:  SELECT `id` FROM `orders` WHERE `total` > 100 FOR UPDATE
+converted: SELECT "id" FROM "orders" WHERE "total" > 100 FOR UPDATE
+class:     MANUAL
+warning:   [FOR_UPDATE_NO_EQUALITY_PREDICATE] Aurora DSQL allows SELECT ... FOR UPDATE only on a single table with a full primary-key equality predicate; this FOR UPDATE has no primary-key equality predicate (a range or multi-row lock), which violates the constraint.
+
+# query 4
+original:  SELECT IFNULL(`email`, 'n/a') AS email, CONCAT(`status`, '!') AS tag FROM `users` LIMIT 10, 5
+converted: SELECT COALESCE("email", 'n/a') AS email, "status" || '!' AS tag FROM "users" LIMIT 5 OFFSET 10
+class:     AUTO
+
+# query 5
+original:  SELECT `id`, `total` FROM `orders` ORDER BY `placed_at` DESC LIMIT 20
+converted: SELECT "id", "total" FROM "orders" ORDER BY "placed_at" DESC NULLS LAST LIMIT 20
+class:     AUTO

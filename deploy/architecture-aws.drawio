@@ -1,0 +1,167 @@
+<mxfile host="Electron" agent="DrawioJSAPI/1.0.0">
+  <diagram id="diagram-1" name="aws-architecture">
+    <mxGraphModel dx="2048" dy="1257" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="awscloud" parent="1" style="points=[[0,0],[0.25,0],[0.5,0],[0.75,0],[1,0],[1,0.25],[1,0.5],[1,0.75],[1,1],[0.75,1],[0.5,1],[0.25,1],[0,1],[0,0.75],[0,0.5],[0,0.25]];outlineConnect=0;gradientColor=none;html=1;whiteSpace=wrap;fontSize=12;fontStyle=0;container=1;pointerEvents=0;collapsible=0;recursiveResize=0;shape=mxgraph.aws4.group;grIcon=mxgraph.aws4.group_aws_cloud_alt;strokeColor=#232F3E;fillColor=none;verticalAlign=top;align=left;spacingLeft=30;fontColor=#232F3E" value="AWS Cloud" vertex="1">
+          <mxGeometry height="840" width="1560" x="200" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="fargate" parent="awscloud" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.fargate;fillColor=#ED7100" value="ECS Fargate (control-plane app)&#xa;image: ECR Public (default · no build)" vertex="1">
+          <mxGeometry height="78" width="78" x="56" y="580" as="geometry" />
+        </mxCell>
+        <mxCell id="s3" parent="awscloud" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.s3;fillColor=#7AA116" value="Amazon S3 (plugin bucket: Debezium + DSQL Sink jars + offset-seeder Lambda zip)" vertex="1">
+          <mxGeometry height="78" width="78" x="240" y="427" as="geometry" />
+        </mxCell>
+        <mxCell id="alb" parent="awscloud" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.application_load_balancer;fillColor=#8C4FFF" value="Application Load Balancer (HTTPS)" vertex="1">
+          <mxGeometry height="78" width="78" x="185" y="287" as="geometry" />
+        </mxCell>
+        <mxCell id="3" edge="1" parent="awscloud" source="alb" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;" target="fargate" value="forward">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="11" edge="1" parent="awscloud" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;" value="upsert/delete (IAM · OCC retry)">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1428" y="700" />
+              <mxPoint x="1428" y="608" />
+            </Array>
+            <mxPoint x="1049" y="700" as="sourcePoint" />
+            <mxPoint x="1440" y="608" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="secrets" parent="awscloud" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.secrets_manager;fillColor=#DD344C" value="Secrets Manager" vertex="1">
+          <mxGeometry height="78" width="78" x="286" y="157" as="geometry" />
+        </mxCell>
+        <mxCell id="5" edge="1" parent="awscloud" source="secrets" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;dashed=1;" target="fargate" value="DB credentials">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="aurora" parent="awscloud" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.aurora;fillColor=#3B48CC" value="Amazon Aurora DSQL (target)" vertex="1">
+          <mxGeometry height="78" width="78" x="1387" y="516" as="geometry" />
+        </mxCell>
+        <mxCell id="7" edge="1" parent="awscloud" source="fargate" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;" target="aurora" value="convert + bulk load (Full Load)">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="vpc" parent="1" style="points=[[0,0],[0.25,0],[0.5,0],[0.75,0],[1,0],[1,0.25],[1,0.5],[1,0.75],[1,1],[0.75,1],[0.5,1],[0.25,1],[0,1],[0,0.75],[0,0.5],[0,0.25]];outlineConnect=0;gradientColor=none;html=1;whiteSpace=wrap;fontSize=12;fontStyle=0;container=1;pointerEvents=0;collapsible=0;recursiveResize=0;shape=mxgraph.aws4.group;grIcon=mxgraph.aws4.group_vpc2;strokeColor=#8C4FFF;fillColor=none;verticalAlign=top;align=left;spacingLeft=30;fontColor=#AAB7B8" value="VPC · private subnets  (cdc-stack)" vertex="1">
+          <mxGeometry height="616" width="922" x="638" y="244" as="geometry" />
+        </mxCell>
+        <mxCell id="msk" parent="vpc" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=#945DF2;gradientDirection=north;fillColor=#5A30B5;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.managed_streaming_for_kafka;" value="Amazon MSK (topics + DLQ)" vertex="1">
+          <mxGeometry height="78" width="78" x="793" y="290.5" as="geometry" />
+        </mxCell>
+        <mxCell id="debezium" parent="vpc" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d1c4e9;strokeColor=#5e35b1;fontSize=11;align=center;verticalAlign=middle;" value="① Debezium MySQL Source Connector&#xa;(AWS::KafkaConnect::Connector — managed worker)&#xa;snapshot.mode=recovery · binlog → topics · resumes from seeded watermark offset" vertex="1">
+          <mxGeometry height="150" width="390" x="220" y="166" as="geometry" />
+        </mxCell>
+        <mxCell id="sink" parent="vpc" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe0b2;strokeColor=#e65100;fontSize=11;align=center;verticalAlign=middle;" value="② Custom DSQL Sink Connector&#xa;(AWS::KafkaConnect::Connector — managed worker · our Java plugin)&#xa;IAM token auth · upsert/delete by PK · OCC 40001 retry · ≤3,000-row batches" vertex="1">
+          <mxGeometry height="160" width="390" x="220" y="406" as="geometry" />
+        </mxCell>
+        <mxCell id="mskconnect" parent="vpc" style="fillColor=none;strokeColor=#5A6C86;dashed=1;verticalAlign=top;fontStyle=0;fontColor=#5A6C86;whiteSpace=wrap;html=1" value="Amazon MSK Connect — managed Kafka Connect runtime.&#xa;Runs BOTH connectors below as managed workers (we own no EC2 / ECS / EKS).&#xa;Each connector is an AWS::KafkaConnect::Connector; plugin jars are loaded from S3." vertex="1">
+          <mxGeometry height="513" width="430" x="200" y="73" as="geometry" />
+        </mxCell>
+        <mxCell id="9" edge="1" parent="vpc" source="debezium" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;" target="msk" value="change events">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="752" y="228" />
+              <mxPoint x="752" y="330" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="10" edge="1" parent="vpc" source="msk" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;" target="sink" value="consume (per-PK ordered)">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="433" y="330" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="seeder" parent="vpc" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;strokeColor=#ffffff;dashed=0;labelPosition=right;verticalLabelPosition=middle;align=left;verticalAlign=middle;spacingLeft=8;html=1;fontSize=11;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;fillColor=#ED7100" value="Offset-seeder Lambda&#xa;(CFN custom resource)" vertex="1">
+          <mxGeometry height="78" width="78" x="641" y="379" as="geometry" />
+        </mxCell>
+        <mxCell id="s3endpoint" parent="vpc" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;strokeColor=#ffffff;dashed=0;labelPosition=right;verticalLabelPosition=middle;align=left;verticalAlign=middle;spacingLeft=8;html=1;fontSize=11;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.endpoints;fillColor=#8C4FFF" value="S3 Gateway VPC Endpoint&#xa;(NAT-free S3 path for the&#xa;seeder&#39;s CFN teardown response)" vertex="1">
+          <mxGeometry height="78" width="78" x="654" y="523" as="geometry" />
+        </mxCell>
+        <mxCell id="18" edge="1" parent="vpc" source="seeder" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;" target="msk" value="seed connect-offsets (gapless)">
+          <mxGeometry relative="1" x="-0.0032" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="847" y="456" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="20" edge="1" parent="vpc" source="seeder" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;dashed=1;strokeColor=#8C4FFF;labelBackgroundColor=#FFFFFF;" target="s3endpoint" value="CFN response">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="cognito" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.cognito;fillColor=#DD344C" value="Amazon Cognito (OIDC, optional)&#xa;off by default · required only if ingress = 0.0.0.0/0" vertex="1">
+          <mxGeometry height="78" width="78" x="290" y="110" as="geometry" />
+        </mxCell>
+        <mxCell id="bedrock" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.bedrock;fillColor=#01A88D" value="Amazon Bedrock (optional AI)" vertex="1">
+          <mxGeometry height="78" width="78" x="630" y="110" as="geometry" />
+        </mxCell>
+        <mxCell id="rds" parent="1" style="sketch=0;points=[[0,0,0],[0.25,0,0],[0.5,0,0],[0.75,0,0],[1,0,0],[0,1,0],[0.25,1,0],[0.5,1,0],[0.75,1,0],[1,1,0],[0,0.25,0],[0,0.5,0],[0,0.75,0],[1,0.25,0],[1,0.5,0],[1,0.75,0]];outlineConnect=0;fontColor=#232F3E;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.rds;fillColor=#3B48CC" value="Source: RDS / Aurora MySQL" vertex="1">
+          <mxGeometry height="78" width="78" x="60" y="580" as="geometry" />
+        </mxCell>
+        <mxCell id="operator" parent="1" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;fontSize=11;" value="Operator" vertex="1">
+          <mxGeometry height="90" width="50" x="40" y="390" as="geometry" />
+        </mxCell>
+        <mxCell id="2" edge="1" parent="1" source="operator" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;" target="alb" value="HTTPS">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="4" edge="1" parent="1" source="alb" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;dashed=1;" target="cognito" value="OIDC">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="6" edge="1" parent="1" source="fargate" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;dashed=1;" target="bedrock" value="AI assist (optional)">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="754" y="659" />
+              <mxPoint x="754" y="149" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="8" edge="1" parent="1" source="rds" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;dashed=1;" target="debezium" value="binlog (ROW+GTID), read-only">
+          <mxGeometry relative="1" x="-0.3313" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="1053" y="635" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="14" edge="1" parent="1" source="fargate" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;dashed=1;" target="mskconnect" value="provision · seed offset · monitor">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="584" y="671" />
+              <mxPoint x="584" y="536" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="15" edge="1" parent="1" source="s3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;dashed=1;strokeColor=#7AA116;" target="debezium" value="Debezium plugin jar (CustomPlugin)">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="688" y="506" />
+              <mxPoint x="688" y="454" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="16" edge="1" parent="1" source="s3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;dashed=1;strokeColor=#7AA116;" target="sink" value="DSQL Sink plugin jar (CustomPlugin)">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1053" y="518" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="17" edge="1" parent="1" source="operator" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;dashed=1;" target="s3" value="deploy app-stack (CloudFormation)">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="260" y="435" />
+              <mxPoint x="260" y="520" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="19" edge="1" parent="1" source="s3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;dashed=1;strokeColor=#7AA116;" target="seeder" value="seeder zip (Lambda code)">
+          <mxGeometry relative="1" x="0.358" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="1331" y="529" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

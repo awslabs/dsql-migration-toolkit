@@ -1,0 +1,1379 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Optional streaming CDC data plane (cdc-stack) for the MySQL -> Aurora DSQL
+  migration tool (design Decision Log 결정 변경 8). Provisions an MSK Serverless
+  cluster (IAM auth), a Glue Schema Registry, two MSK Connect custom plugins
+  (Debezium MySQL source + our custom DSQL sink), two MSK Connect connectors,
+  and a least-privilege connector execution role. Runtime is managed MSK Connect
+  (no EKS/compute cluster); scale via MSK partitions, MSK Connect MCU/worker
+  count, and connector tasks.max. The app-stack control plane does NOT depend on
+  this stack. PREREQUISITES: connector spike (cdc-connector-spike.md, Req 12.13)
+  + both plugin artifacts uploaded to S3. NOTE: MSK Serverless does not expose
+  its bootstrap broker string via Ref/GetAtt, so it is supplied as the
+  MskBootstrapServers parameter (two-pass deploy). See deploy/cdc-stack/README.md.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC the CDC pipeline runs in (must reach the source MySQL and Aurora DSQL privately).
+
+  ConnectorSubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Optional: two or more existing private subnets (distinct AZs, NAT/PrivateLink
+      egress) for the MSK Serverless cluster and connectors. When LEFT EMPTY, the
+      stack creates its own two private subnets + a NAT gateway inside the VPC
+      (NatPublicSubnetId + PrivateSubnetCidr{A,B} + PrivateSubnetAz{A,B} are then
+      supplied by the tool). When provided, the stack uses these as-is and creates
+      no networking.
+
+  # --- Owned private networking (used only when ConnectorSubnetIds is empty) ---
+  # The tool computes these from the VPC topology; they are unused (empty) when the
+  # customer supplies ConnectorSubnetIds directly.
+  NatPublicSubnetId:
+    Type: String
+    Default: ""
+    Description: >
+      Existing IGW-routed public subnet to place the owned NAT gateway in. Auto-
+      computed from the VPC when ConnectorSubnetIds is empty; leave empty otherwise.
+
+  PrivateSubnetCidrA:
+    Type: String
+    Default: ""
+    Description: Free /24 CIDR for the first owned private subnet (AZ A).
+
+  PrivateSubnetCidrB:
+    Type: String
+    Default: ""
+    Description: Free /24 CIDR for the second owned private subnet (AZ B).
+
+  PrivateSubnetAzA:
+    Type: String
+    Default: ""
+    Description: Availability Zone for PrivateSubnetCidrA (e.g. us-east-1a).
+
+  PrivateSubnetAzB:
+    Type: String
+    Default: ""
+    Description: Availability Zone for PrivateSubnetCidrB (e.g. us-east-1b).
+
+  # --- Plugin artifacts (Task 23.2 output + Debezium) -------------------------
+  PluginBucketArn:
+    Type: String
+    Description: ARN of the S3 bucket holding both connector plugin artifacts.
+    AllowedPattern: ^arn:aws[a-zA-Z-]*:s3:::.+$
+
+  DebeziumPluginS3Key:
+    Type: String
+    Description: S3 object key of the Debezium MySQL source connector plugin zip.
+
+  DsqlSinkPluginS3Key:
+    Type: String
+    Description: >
+      S3 object key of the custom DSQL Sink Connector plugin jar/zip (the Task
+      23.2 build output, connectors/dsql-sink/target/...).
+
+  LambdaSeederS3Key:
+    Type: String
+    Default: ""
+    Description: >
+      S3 object key of the offset-seeder Lambda deployment zip (pure-Python:
+      seeder.py + cfnresponse + kafka-python + the MSK IAM SASL signer). When set
+      (alongside a watermark and a bootstrap string) the stack deploys an in-VPC
+      Lambda custom resource that creates the compacted source offsets topic and
+      seeds the Debezium connect-offsets record BEFORE the source connector is
+      created, for a gapless Full Load -> CDC handoff. Empty = no seeder (the
+      source connector then starts from the current binlog at creation time).
+
+  PluginVersion:
+    Type: String
+    Default: v1
+    Description: >
+      A short version token (e.g. v7, v8) appended to the CustomPlugin resource
+      names so swapping a plugin artifact (a new S3 key) creates a uniquely-named
+      plugin instead of colliding on a fixed name (gotcha #5). Bump this whenever
+      DebeziumPluginS3Key / DsqlSinkPluginS3Key changes; AllowedPattern keeps it to
+      the CustomPlugin name charset.
+    AllowedPattern: "^[A-Za-z0-9._-]{1,32}$"
+
+  # --- Source (MySQL) ---------------------------------------------------------
+  SourceDbHostname:
+    Type: String
+    Description: Source MySQL hostname (Debezium database.hostname).
+
+  SourceDbPort:
+    Type: Number
+    Default: 3306
+    MinValue: 1
+    MaxValue: 65535
+    Description: Source MySQL port (Debezium database.port; also connector egress).
+
+  SourceDbSecurityGroupId:
+    Type: String
+    Default: ""
+    Description: >
+      Optional security group id of the source RDS/Aurora MySQL. When set, egress
+      on SourceDbPort is allowed to this security group only (preferred over CIDR).
+
+  SourceDbServerId:
+    Type: Number
+    Default: 54321
+    Description: >
+      Unique Debezium database.server.id for this source (must not collide with
+      other replication clients on the source).
+
+  SourceSecretArn:
+    Type: String
+    Description: >
+      Secrets Manager secret ARN with the source DB credentials (keys: username,
+      password). Used to scope secretsmanager:GetSecretValue in the connector
+      execution role IAM policy only -- NOT used in connector config references
+      (the ARN contains colons that break the ${provider:path:key} parser).
+    AllowedPattern: ^arn:aws[a-zA-Z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$
+
+  SourceSecretName:
+    Type: String
+    Description: >
+      Secrets Manager secret NAME (no colons) for the source DB credentials.
+      Used by the MSK Connect config provider as ${secretsManager:<name>:<key>}.
+      The Kafka Connect ${provider:path:key} syntax splits on ':', so the full
+      ARN cannot be used here -- supply the name only (e.g. prod/mysql/cdc-user).
+      SourceSecretArn is kept separately for the IAM GetSecretValue resource scope.
+
+  # --- Target (Aurora DSQL) ---------------------------------------------------
+  DsqlClusterArn:
+    Type: String
+    Description: ARN of the target Aurora DSQL cluster (scopes dsql:DbConnect / dsql:DbConnectAdmin).
+    AllowedPattern: ^arn:aws[a-zA-Z-]*:dsql:[a-z0-9-]+:[0-9]{12}:cluster/.+$
+
+  DsqlClusterEndpoint:
+    Type: String
+    Description: >
+      Aurora DSQL cluster endpoint hostname for the sink connector
+      (dsql.cluster.endpoint). The custom connector authenticates with a generated IAM
+      token (no password), so no DSQL credential is stored here.
+
+  DsqlDatabaseName:
+    Type: String
+    Default: postgres
+    Description: Target DSQL database name the sink connector applies changes to.
+
+  DsqlConnectUser:
+    Type: String
+    Default: admin
+    Description: >
+      DSQL database role the sink connector connects as. "admin" requires
+      dsql:DbConnectAdmin; a non-admin role uses dsql:DbConnect. Both are scoped
+      to DsqlClusterArn.
+
+  # --- Kafka / MSK ------------------------------------------------------------
+  MskBootstrapServers:
+    Type: String
+    Default: ""
+    Description: >
+      MSK Serverless IAM bootstrap broker string (e.g.
+      boot-xxxx.c1.kafka-serverless.<region>.amazonaws.com:9098). NOT available
+      via Ref/GetAtt for serverless clusters — supply after the cluster exists
+      (see the two-pass note in the stack Description). Required for the
+      connectors to deploy.
+
+  TableIncludeList:
+    Type: CommaDelimitedList
+    Description: >
+      Fully-qualified tables to capture (db.table), mirrored into Debezium
+      table.include.list and the sink topic set. Matches the selection the
+      control plane passes to build_source_config / build_sink_config.
+
+  TopicPrefix:
+    Type: String
+    Default: dsqlcdc
+    Description: >
+      Debezium topic.prefix (logical server name). Per-table topics are
+      <TopicPrefix>.<db>.<table>.
+
+  SinkTopics:
+    Type: String
+    Description: >
+      Comma-separated list of fully-qualified Kafka topic names the sink connector
+      subscribes to (<TopicPrefix>.<db>.<table> for each captured table). Passed
+      explicitly to avoid the Fn::Sub backslash-escaping trap (topics.regex built
+      with Fn::Sub yields a literal-backslash pattern that matches nothing). The
+      control plane build_sink_config returns bare table names (db.table); the
+      caller must prefix each with <TopicPrefix>. before passing this parameter,
+      e.g. ','.join(f'{prefix}.{t}' for t in sink_config.topics).
+
+  DlqTopicName:
+    Type: String
+    Default: dsql-sink-dlq
+    Description: >
+      Dead-letter queue topic for poison change events (sink
+      errors.deadletterqueue.topic.name). The Kafka topic itself is not a
+      CloudFormation resource; it is auto-created by the sink connector at
+      runtime (Req 12.4-12.6).
+
+  SinkBatchMaxRows:
+    Type: Number
+    Default: 3000
+    MaxValue: 3000
+    MinValue: 1
+    Description: >
+      Max rows per DSQL transaction in the sink connector (DSQL constraint —
+      <=3,000 rows/transaction). Do not exceed 3000.
+
+  SourceTasksMax:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: >
+      Debezium source tasks.max. MySQL source is effectively single-task per
+      server; keep at 1 unless using a multi-task setup.
+
+  SinkTasksMax:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: >
+      Sink connector tasks.max (write parallelism). Effective concurrency is
+      capped by the topic partition count (Req 12.8).
+
+  ConnectorMcuCount:
+    Type: Number
+    Default: 1
+    AllowedValues: [1, 2, 4, 8]
+    Description: MSK Connect MCUs (compute units) per worker for each connector.
+
+  ConnectorWorkerCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: MSK Connect provisioned worker count for each connector.
+
+  MaxMessageBytes:
+    Type: Number
+    Default: 4194304
+    MinValue: 1048576
+    MaxValue: 8388608
+    Description: >
+      Per-message byte ceiling applied to the Kafka client limits in BOTH worker
+      configs (producer.max.request.size on the source; consumer.fetch.max.bytes /
+      consumer.max.partition.fetch.bytes on the sink). H13 mitigation: the Kafka
+      client default is 1 MiB, so a serialized change event >1 MiB throws
+      RecordTooLargeException on the source producer and kills the source task
+      (silent data loss / stall) even though MSK Serverless accepts up to 8 MiB.
+      Capped at the 8 MiB MSK Serverless broker limit.
+
+  ColumnExcludeList:
+    Type: String
+    Default: ""
+    Description: >
+      Comma-separated fully-qualified columns (db.table.column) to drop at capture
+      via Debezium column.exclude.list. H13 prevention: excludes a value that can
+      exceed DSQL's 1 MiB per-value limit (MySQL LONGTEXT/BLOB) before it reaches
+      Kafka. Drive the default set from the Evaluation OVERSIZED_LOB rule; never
+      list a PK column. Empty = exclude nothing.
+
+  DeploySink:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Whether to create the DSQL sink connector. Set "false" on the pass that
+      first deploys the source connector (so it creates the per-table data topic),
+      then "true" on a subsequent pass so the sink subscribes to a topic that
+      already exists. Avoids the sink-starts-before-topic race that crash-loops the
+      sink task.
+
+  KafkaConnectVersion:
+    Type: String
+    Default: "3.7.x"
+    Description: >
+      Kafka Connect version for the MSK Connect connectors. MUST be 3.7.x: the
+      spike found that 2.7.1's bundled AWS SDK is incompatible with the modern
+      msk-config-providers jar and fails worker start with
+      "NoSuchFieldError: AUTH_SCHEME_PROVIDER".
+
+  AwsRegion:
+    Type: String
+    Default: ""
+    Description: >
+      Region for IAM token generation (sink) and Glue converters. Defaults to
+      the stack region when left empty.
+
+  # --- Full Load -> CDC handoff watermark (drives the offset seeder) ----------
+  # The binlog coordinates the Full Load bulk loader captured. Passed to the
+  # in-VPC offset-seeder Lambda so the source connector resumes streaming from
+  # exactly the snapshot end point (gapless, Property 11). Empty when no Full Load
+  # watermark is available -> the seeder is not deployed (SeedOffset condition).
+  WatermarkBinlogFile:
+    Type: String
+    Default: ""
+    Description: Full Load watermark binlog file name (e.g. mysql-bin.000042).
+
+  WatermarkBinlogPos:
+    Type: String
+    Default: ""
+    Description: Full Load watermark binlog position (integer, as a string).
+
+  WatermarkGtids:
+    Type: String
+    Default: ""
+    Description: Full Load watermark GTID set (empty when the source has no GTIDs).
+
+  WatermarkTsSec:
+    Type: String
+    Default: ""
+    Description: Full Load watermark snapshot timestamp (unix seconds, as a string).
+
+Conditions:
+  UseSourceDbSecurityGroup:
+    Fn::Not:
+      - Fn::Equals: [Ref: SourceDbSecurityGroupId, ""]
+
+  # No source-DB security group supplied: the connector still needs egress on the
+  # MySQL port or Debezium can never reach the source (TCP connect times out). We
+  # then open SourceDbPort egress broadly (the route/destination SG still gate the
+  # actual reach) so CDC works without the operator having to discover the source
+  # SG id -- deployment-convenience first. Tighten by passing SourceDbSecurityGroupId.
+  NoSourceDbSecurityGroup:
+    Fn::Equals: [Ref: SourceDbSecurityGroupId, ""]
+
+  RegionProvided:
+    Fn::Not:
+      - Fn::Equals: [Ref: AwsRegion, ""]
+
+  # Connectors are created only once the MSK Serverless bootstrap string is
+  # supplied (it is not available via Ref/GetAtt, so it is a two-pass deploy).
+  HasBootstrapServers:
+    Fn::Not:
+      - Fn::Equals: [Ref: MskBootstrapServers, ""]
+
+  # Sink is created only when the bootstrap string is supplied AND DeploySink=true
+  # (deploy the source first so it creates the topic, then the sink -- gotcha #11).
+  DeploySinkConnector:
+    Fn::And:
+      - Fn::Not:
+          - Fn::Equals: [Ref: MskBootstrapServers, ""]
+      - Fn::Equals: [Ref: DeploySink, "true"]
+
+  # Deploy the in-VPC offset seeder (compact topic + connect-offsets seed) only
+  # when ALL of: the MSK bootstrap string is known (the Lambda must reach the
+  # cluster), the seeder Lambda zip key is supplied, and a Full Load watermark
+  # binlog file is present. Missing any of these -> no seeder is created and the
+  # source worker config still pins the fixed offset topic (the connector then
+  # starts from the current binlog, the legacy behavior). The source connector
+  # DependsOn the seed resource ONLY under this condition (Fn::If below).
+  SeedOffset:
+    Fn::And:
+      - Fn::Not:
+          - Fn::Equals: [Ref: MskBootstrapServers, ""]
+      - Fn::Not:
+          - Fn::Equals: [Ref: LambdaSeederS3Key, ""]
+      - Fn::Not:
+          - Fn::Equals: [Ref: WatermarkBinlogFile, ""]
+
+  # When no ConnectorSubnetIds are supplied, the stack creates its OWN private
+  # subnets + NAT gateway + route table inside the VPC (the customer's existing
+  # route tables are untouched). When subnets are supplied, the stack uses them
+  # and creates no networking. ConnectorSubnetIds is a CommaDelimitedList whose
+  # Ref renders the joined string; the default "" makes this comparison true.
+  CreateOwnedNetwork:
+    Fn::Equals:
+      - Fn::Join: ["", Ref: ConnectorSubnetIds]
+      - ""
+
+Resources:
+  # --- Observability ----------------------------------------------------------
+  ConnectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /msk-connect/${AWS::StackName}-cdc
+      RetentionInDays: 30
+
+  # --- Kafka backbone (MSK Serverless, IAM auth) ------------------------------
+  # NOTE: no Glue Schema Registry -- the pipeline uses the built-in JSON converter
+  # (schemas.enable=true), the spike's proven configuration. The Glue Avro converter
+  # was dropped (it bloated the plugin by ~59 MiB x2 and pulled a conflicting SDK).
+  MskCluster:
+    Type: AWS::MSK::ServerlessCluster
+    Properties:
+      ClusterName:
+        Fn::Sub: ${AWS::StackName}-msk
+      ClientAuthentication:
+        Sasl:
+          Iam:
+            Enabled: true
+      VpcConfigs:
+        - SubnetIds:
+            Fn::If:
+              - CreateOwnedNetwork
+              - - Ref: ConnectorSubnetA
+                - Ref: ConnectorSubnetB
+              - Ref: ConnectorSubnetIds
+          SecurityGroups:
+            - Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+
+  # --- Networking -------------------------------------------------------------
+  ConnectorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MSK Connect connectors and MSK Serverless egress for CDC pipeline
+      VpcId:
+        Ref: VpcId
+      # INLINE 443->S3 egress for the offset-seeder Lambda's CloudFormation response
+      # during TEARDOWN. The seeder's cfnresponse PUTs to the S3 bucket
+      # cloudformation-custom-resource-response-<region>; on owned networks that
+      # routes via the S3 gateway endpoint (ConnectorS3Endpoint) WITHOUT the NAT.
+      # This rule MUST be inline on the SG (not a standalone AWS::EC2::
+      # SecurityGroupEgress resource): an inline rule is part of the SG and cannot be
+      # deleted while the Lambda's ENI still references the SG -- and CloudFormation
+      # cannot delete that ENI until the custom resource's Delete has been handled
+      # (dependency chain: OffsetSeedResource -> OffsetSeederFunction -> this SG). A
+      # STANDALONE egress resource has no such ordering and is deleted in parallel
+      # with the custom-resource Delete (the ConnectorHttpsEgress 0.0.0.0/0 rule was
+      # observed gone BEFORE the seeder Delete ran -> cfnresponse PUT timed out ->
+      # teardown hung ~1h then DELETE_FAILED). Scoped to the S3 prefix list so it
+      # grants only what the response needs. Created only on owned networks (the
+      # gateway endpoint exists only then); customer-subnet deploys reach S3 via
+      # their own egress.
+      SecurityGroupEgress:
+        Fn::If:
+          - CreateOwnedNetwork
+          - - IpProtocol: tcp
+              FromPort: 443
+              ToPort: 443
+              CidrIp: 0.0.0.0/0
+              Description: >-
+                HTTPS egress for the offset-seeder CloudFormation response during
+                teardown (S3 via gateway endpoint, other 443 via NAT). Inline so it
+                outlives the custom-resource Delete (see SG comment above).
+          - Ref: "AWS::NoValue"
+
+  # MSK Serverless and the connectors share this SG; allow intra-SG Kafka traffic.
+  ConnectorSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort: 9098
+      ToPort: 9098
+      SourceSecurityGroupId:
+        Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+      Description: Kafka IAM/TLS traffic within the connector/MSK security group.
+
+  # Diagnostics access: let the in-VPC bastion reach MSK Serverless on 9098 for
+  # operational tasks the laptop can't do (MSK bootstrap is VPC-private) -- gapless
+  # offset seeding, topic alters (max.message.bytes), consumer-lag / offset checks.
+  # Allowed by CIDR (the bastion's subnet 172.31.0.0/20), NOT by SG id, so every
+  # FUTURE cdc-stack's fresh ConnectorSecurityGroup grants the same access without
+  # re-attaching the bastion to this SG (which previously blocked stack deletion --
+  # see the 2026-06-27 run notes). The bastion keeps its own SG; this is inbound on
+  # the MSK side only. /20 (not /32) so a bastion IP change still works.
+  ConnectorBastionDiagnosticsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort: 9098
+      ToPort: 9098
+      CidrIp: 172.31.0.0/20
+      Description: Diagnostics - bastion subnet to MSK Serverless (IAM/TLS 9098).
+
+  ConnectorKafkaEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId:
+        Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort: 9098
+      ToPort: 9098
+      DestinationSecurityGroupId:
+        Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+      Description: Egress to MSK brokers (IAM/TLS) within the security group.
+
+  ConnectorHttpsEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId:
+        Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: >-
+        HTTPS egress to AWS endpoints (Secrets Manager, Glue, CloudWatch, DSQL
+        IAM token signer, STS). Tighten to your VPC-endpoint/NAT CIDR in prod.
+
+  ConnectorDsqlEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId:
+        Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      CidrIp: 0.0.0.0/0
+      Description: >-
+        Egress to Aurora DSQL (PostgreSQL wire protocol, 5432) for the sink
+        connector. Tighten to the DSQL endpoint CIDR/PrivateLink in prod.
+
+  ConnectorSourceDbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: UseSourceDbSecurityGroup
+    Properties:
+      GroupId:
+        Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort:
+        Ref: SourceDbPort
+      ToPort:
+        Ref: SourceDbPort
+      DestinationSecurityGroupId:
+        Ref: SourceDbSecurityGroupId
+      Description: Egress to the source RDS/Aurora MySQL security group (Debezium).
+
+  # Fallback when no source-DB security group is supplied: without ANY egress on
+  # the MySQL port the Debezium source task cannot open a TCP connection to the
+  # source and fails connection validation with a SocketTimeoutException (the
+  # connector then CREATE_FAILs and the stack rolls back). Opening SourceDbPort to
+  # 0.0.0.0/0 lets the worker reach the source whether it resolves to a private
+  # (same-VPC) or public RDS address; the route table + the source SG inbound rules
+  # still gate what is actually reachable. Pass SourceDbSecurityGroupId to replace
+  # this with the tighter SG-to-SG rule above.
+  ConnectorSourceDbEgressOpen:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: NoSourceDbSecurityGroup
+    Properties:
+      GroupId:
+        Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort:
+        Ref: SourceDbPort
+      ToPort:
+        Ref: SourceDbPort
+      CidrIp: 0.0.0.0/0
+      Description: >-
+        Egress to the source MySQL on SourceDbPort (no source SG supplied). Tighten
+        by passing SourceDbSecurityGroupId so egress targets that SG only.
+
+  # --- Owned private networking (created only when ConnectorSubnetIds is empty) -
+  # The stack creates its own 2 private subnets + a NAT gateway + a private route
+  # table inside the customer's VPC, giving the connectors egress to DSQL / Secrets
+  # Manager / STS / Glue / CloudWatch WITHOUT touching the customer's existing route
+  # tables. All deleted automatically when the stack is deleted. The tool computes
+  # NatPublicSubnetId (an existing IGW-routed subnet) + the two free /24 CIDRs/AZs.
+  ConnectorEip:
+    Type: AWS::EC2::EIP
+    Condition: CreateOwnedNetwork
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-nat-eip
+
+  ConnectorNatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateOwnedNetwork
+    DependsOn: ConnectorEip
+    Properties:
+      AllocationId:
+        Fn::GetAtt: [ConnectorEip, AllocationId]
+      SubnetId:
+        Ref: NatPublicSubnetId
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-nat
+
+  ConnectorSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: CreateOwnedNetwork
+    Properties:
+      VpcId:
+        Ref: VpcId
+      CidrBlock:
+        Ref: PrivateSubnetCidrA
+      AvailabilityZone:
+        Ref: PrivateSubnetAzA
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-private-a
+
+  ConnectorSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: CreateOwnedNetwork
+    Properties:
+      VpcId:
+        Ref: VpcId
+      CidrBlock:
+        Ref: PrivateSubnetCidrB
+      AvailabilityZone:
+        Ref: PrivateSubnetAzB
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-private-b
+
+  ConnectorPrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateOwnedNetwork
+    Properties:
+      VpcId:
+        Ref: VpcId
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-private-rt
+
+  ConnectorNatRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateOwnedNetwork
+    DependsOn: ConnectorNatGateway
+    Properties:
+      RouteTableId:
+        Ref: ConnectorPrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId:
+        Ref: ConnectorNatGateway
+
+  # S3 Gateway VPC endpoint on the owned private route table. The in-VPC offset
+  # seeder Lambda signals CloudFormation by PUTting to a pre-signed *S3* response
+  # URL; with only a NAT route, that egress dies the moment the NAT is torn down
+  # during stack DELETE, so the custom resource's Delete response never arrives and
+  # CloudFormation hangs ~1h then DELETE_FAILS the whole stack. A gateway endpoint
+  # routes S3 traffic via the route table (no NAT, no internet), so the cfnresponse
+  # PUT succeeds even mid-teardown. Gateway endpoints are free and region-local.
+  ConnectorS3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateOwnedNetwork
+    Properties:
+      VpcId:
+        Ref: VpcId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - Ref: ConnectorPrivateRouteTable
+
+  ConnectorSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateOwnedNetwork
+    Properties:
+      SubnetId:
+        Ref: ConnectorSubnetA
+      RouteTableId:
+        Ref: ConnectorPrivateRouteTable
+
+  ConnectorSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateOwnedNetwork
+    Properties:
+      SubnetId:
+        Ref: ConnectorSubnetB
+      RouteTableId:
+        Ref: ConnectorPrivateRouteTable
+
+  # --- Connector execution role (least privilege) -----------------------------
+  ConnectorExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: kafkaconnect.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: dsql-connect
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The sink connects to DSQL with a generated IAM token. "admin"
+              # needs DbConnectAdmin; a non-admin role uses DbConnect. Scoped to
+              # this cluster only.
+              - Sid: DsqlConnect
+                Effect: Allow
+                Action:
+                  - dsql:DbConnect
+                  - dsql:DbConnectAdmin
+                Resource:
+                  Ref: DsqlClusterArn
+        - PolicyName: read-source-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: GetSourceSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  Ref: SourceSecretArn
+        - PolicyName: msk-cluster-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: MskConnect
+                Effect: Allow
+                Action:
+                  - kafka-cluster:Connect
+                  - kafka-cluster:DescribeCluster
+                  - kafka-cluster:AlterCluster
+                Resource:
+                  Fn::GetAtt: [MskCluster, Arn]
+              - Sid: MskTopics
+                Effect: Allow
+                Action:
+                  - kafka-cluster:CreateTopic
+                  - kafka-cluster:DescribeTopic
+                  - kafka-cluster:ReadData
+                  - kafka-cluster:WriteData
+                  - kafka-cluster:DescribeTopicDynamicConfiguration
+                  - kafka-cluster:AlterTopicDynamicConfiguration
+                Resource:
+                  Fn::Sub: >-
+                    arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/${AWS::StackName}-msk/*
+              - Sid: MskGroups
+                Effect: Allow
+                Action:
+                  - kafka-cluster:AlterGroup
+                  - kafka-cluster:DescribeGroup
+                Resource:
+                  Fn::Sub: >-
+                    arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:group/${AWS::StackName}-msk/*
+        - PolicyName: plugin-artifact-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadPluginArtifacts
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  Fn::Sub: ${PluginBucketArn}/*
+        - PolicyName: connector-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteConnectorLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource:
+                  Fn::GetAtt: [ConnectorLogGroup, Arn]
+
+  # --- Worker configuration: source connector (converters + Secrets Manager provider) ---
+  # MSK Connect requires key.converter/value.converter in every WorkerConfiguration
+  # (gotcha #1). We use the built-in JSON converter with schemas.enable=true (the
+  # spike's proven configuration): the custom sink's DebeziumEvents parser requires
+  # a Connect Struct envelope, which schemas.enable=true delivers. JSON converter is
+  # part of the MSK Connect runtime -- no extra plugin jar, no Glue Schema Registry,
+  # and no heavy shaded SDK (which is what caused the AUTH_SCHEME_PROVIDER conflict).
+  # The Secrets Manager config-provider class is bundled in the Debezium plugin zip
+  # (msk-config-providers jar); it is NOT on the MSK Connect runtime classpath, so
+  # the sink has its own separate worker config without it (gotcha #6, below).
+  #
+  # Internal-topic partition counts (offset.storage.partitions / status.storage.
+  # partitions): MSK Connect creates three COMPACTED internal topics per connector
+  # instance -- offsets (default 25), status (default 5), configs (1) = 31
+  # compacted partitions each. MSK Serverless caps COMPACTED partitions at 120
+  # cluster-wide, and the topic names embed the connector's instance UUID, so each
+  # (re)deploy creates a fresh 31-partition set and the old one is NOT reused/
+  # deleted -- ~3-4 redeploys exhaust the 120 cap and the next connector fails to
+  # create (its offsets topic can't be created -> worker never initializes). These
+  # internal topics carry only tiny, low-frequency metadata (an offset commit is a
+  # few records/sec regardless of data throughput), so 1 partition is ample; the
+  # defaults assume a large multi-connector cluster. Real replication throughput is
+  # driven by the per-table DATA topics (topic.creation.default.partitions), which
+  # are unaffected. Result: 31 -> 3 compacted partitions per connector (~10x
+  # headroom against the 120 cap) with no effect on CDC latency or correctness.
+  #
+  # offset.storage.topic: the source worker pins a FIXED, predictable offsets topic
+  # name (${AWS::StackName}-debezium-source-offsets) instead of letting MSK Connect
+  # derive a per-instance UUID-named one. This is what lets the OffsetSeeder Lambda
+  # create + seed that exact topic BEFORE the source connector is created, for a
+  # gapless Full Load -> CDC handoff. The topic must already exist as a COMPACTED
+  # topic (the seeder creates it); the connector does NOT auto-create a custom
+  # offset topic. Pinning it changes PropertiesFileContent, so this immutable custom-
+  # named resource is renamed via PluginVersion (v6) just like the plugins.
+  WorkerConfiguration:
+    Type: AWS::KafkaConnect::WorkerConfiguration
+    Properties:
+      # Name carries PluginVersion: AWS::KafkaConnect::WorkerConfiguration is
+      # custom-named and immutable, so changing PropertiesFileContent forces a
+      # replacement that would collide on a fixed name ("cannot update a stack when a
+      # custom-named resource requires replacing"). Versioning the name lets the
+      # worker config be swapped via a normal update_stack, same as the plugins.
+      Name:
+        Fn::Sub: ${AWS::StackName}-source-worker-config-${PluginVersion}
+      Description: JSON converters (schemas.enable=true), Secrets Manager config provider, and H13 producer limit for the Debezium source connector.
+      PropertiesFileContent:
+        Fn::Base64:
+          Fn::Sub: |
+            key.converter=org.apache.kafka.connect.json.JsonConverter
+            key.converter.schemas.enable=true
+            value.converter=org.apache.kafka.connect.json.JsonConverter
+            value.converter.schemas.enable=true
+            config.providers=secretsManager
+            config.providers.secretsManager.class=com.amazonaws.kafka.config.providers.SecretsManagerConfigProvider
+            config.providers.secretsManager.param.region=${AWS::Region}
+            producer.max.request.size=${MaxMessageBytes}
+            offset.storage.partitions=1
+            status.storage.partitions=1
+            offset.storage.topic=${AWS::StackName}-debezium-source-offsets
+
+  # --- Worker configuration: sink connector (converters + H13 consumer fetch limits) ---
+  # The sink plugin jar does NOT bundle the Secrets Manager config-provider class
+  # (com.amazonaws.kafka.config.providers.SecretsManagerConfigProvider), so
+  # declaring config.providers here would fail the sink with ClassNotFoundException
+  # (gotcha #6). The sink authenticates to DSQL via IAM token -- no secret reference
+  # needed. Converters MUST match the source (JSON, schemas.enable=true) so the sink
+  # deserializes exactly what the source serialized. Plus the H13 consumer fetch
+  # limits and producer send limit (so an oversized record can be fetched and
+  # dead-lettered up to the 8 MiB broker limit).
+  SinkWorkerConfiguration:
+    Type: AWS::KafkaConnect::WorkerConfiguration
+    Properties:
+      # Name carries PluginVersion (immutable custom-named resource; see source
+      # WorkerConfiguration above) so an update can replace it without a name clash.
+      Name:
+        Fn::Sub: ${AWS::StackName}-sink-worker-config-${PluginVersion}
+      Description: JSON converters (schemas.enable=true) and H13 consumer/producer fetch limits for the DSQL sink connector. No Secrets Manager provider (not bundled in the sink jar).
+      PropertiesFileContent:
+        Fn::Base64:
+          Fn::Sub: |
+            key.converter=org.apache.kafka.connect.json.JsonConverter
+            key.converter.schemas.enable=true
+            value.converter=org.apache.kafka.connect.json.JsonConverter
+            value.converter.schemas.enable=true
+            consumer.max.partition.fetch.bytes=${MaxMessageBytes}
+            consumer.fetch.max.bytes=${MaxMessageBytes}
+            producer.max.request.size=${MaxMessageBytes}
+            offset.storage.partitions=1
+            status.storage.partitions=1
+
+  # --- Custom plugins ---------------------------------------------------------
+  DebeziumSourcePlugin:
+    Type: AWS::KafkaConnect::CustomPlugin
+    Properties:
+      # Name carries PluginVersion so a new artifact (key change + version bump)
+      # creates a uniquely-named plugin instead of colliding on a fixed name.
+      Name:
+        Fn::Sub: ${AWS::StackName}-debezium-mysql-${PluginVersion}
+      ContentType: ZIP
+      Location:
+        S3Location:
+          BucketArn:
+            Ref: PluginBucketArn
+          FileKey:
+            Ref: DebeziumPluginS3Key
+
+  DsqlSinkPlugin:
+    Type: AWS::KafkaConnect::CustomPlugin
+    Properties:
+      # Name carries PluginVersion (gotcha #5 fix): AWS::KafkaConnect::CustomPlugin
+      # has a required, immutable Name, so changing the S3 key alone forces a
+      # replacement that collides on a fixed name ("cannot update a stack when a
+      # custom-named resource requires replacing"). Bumping PluginVersion alongside
+      # the key gives the replacement a new name, so the artifact can be swapped via
+      # a normal update_stack (no delete + recreate). Safe because the connectors
+      # reference the plugin by GetAtt ARN, which updates with the replacement.
+      Name:
+        Fn::Sub: ${AWS::StackName}-dsql-sink-${PluginVersion}
+      # ZIP bundle holding ONLY the sink jar (JSON converter is built into the MSK
+      # runtime, so no Glue converter jar is bundled -- that removed ~59 MiB and the
+      # SDK-conflict surface). A single-jar zip is a valid MSK Connect plugin format.
+      ContentType: ZIP
+      Location:
+        S3Location:
+          BucketArn:
+            Ref: PluginBucketArn
+          FileKey:
+            Ref: DsqlSinkPluginS3Key
+
+  # --- Offset seeder Lambda (gapless Full Load -> CDC handoff) -----------------
+  # An in-VPC CloudFormation custom-resource Lambda that, BEFORE the source
+  # connector is created, (1) creates the fixed compacted offsets topic the source
+  # worker config points at and (2) seeds the Debezium connect-offsets record from
+  # the Full Load watermark so the connector resumes streaming with no gap
+  # (Property 11). All three resources are conditional on SeedOffset; when absent
+  # the source connector simply starts from the current binlog (legacy behavior).
+  OffsetSeederRole:
+    Type: AWS::IAM::Role
+    Condition: SeedOffset
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      # In-VPC Lambda needs ENI management; AWSLambdaVPCAccessExecutionRole grants
+      # exactly that (create/describe/delete network interfaces) plus basic logs.
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: msk-seed-offsets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Connect to the cluster + create/describe/read/write ONLY the fixed
+              # source offsets topic (scoped to its exact name, not topic/*).
+              - Sid: MskConnect
+                Effect: Allow
+                Action:
+                  - kafka-cluster:Connect
+                  - kafka-cluster:DescribeCluster
+                  # kafka-python enables the idempotent producer under acks=all,
+                  # which sends InitProducerId -- MSK rejects that with
+                  # ClusterAuthorizationFailedError unless this CLUSTER-level grant
+                  # is present. The seeder now disables idempotence (so this isn't
+                  # strictly required), but grant it too so a future idempotent /
+                  # transactional seed path can't silently fail the gapless handoff
+                  # again. This action is cluster-scoped (not topic-scoped).
+                  - kafka-cluster:WriteDataIdempotently
+                Resource:
+                  Fn::GetAtt: [MskCluster, Arn]
+              - Sid: MskSeedTopic
+                Effect: Allow
+                Action:
+                  - kafka-cluster:CreateTopic
+                  - kafka-cluster:DescribeTopic
+                  - kafka-cluster:ReadData
+                  - kafka-cluster:WriteData
+                  - kafka-cluster:DescribeTopicDynamicConfiguration
+                  - kafka-cluster:AlterTopicDynamicConfiguration
+                Resource:
+                  Fn::Sub: >-
+                    arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/${AWS::StackName}-msk/*/${AWS::StackName}-debezium-source-offsets
+
+  OffsetSeederFunction:
+    Type: AWS::Lambda::Function
+    Condition: SeedOffset
+    Properties:
+      FunctionName:
+        Fn::Sub: ${AWS::StackName}-offset-seeder
+      Description: Seeds the Debezium source connect-offsets topic for a gapless Full Load -> CDC handoff.
+      Runtime: python3.12
+      Handler: seeder.handler
+      Role:
+        Fn::GetAtt: [OffsetSeederRole, Arn]
+      # Producing/consuming over MSK IAM SASL + creating a compacted topic can take
+      # tens of seconds on a cold start; 300s is comfortably under the CFN custom-
+      # resource 1h ceiling while bounding a wedged Kafka call.
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        S3Bucket:
+          # Reuse the managed plugin bucket (PluginBucketArn is arn:aws:s3:::<name>);
+          # strip the ARN prefix to the bare bucket name Lambda Code expects.
+          Fn::Select: [5, Fn::Split: [":", Ref: PluginBucketArn]]
+        S3Key:
+          Ref: LambdaSeederS3Key
+      VpcConfig:
+        # Same SG + subnets as the connectors -- already allow 9098 to MSK and 443
+        # egress (for the IAM SASL token signer's STS/region calls).
+        SecurityGroupIds:
+          - Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+        SubnetIds:
+          Fn::If:
+            - CreateOwnedNetwork
+            - - Ref: ConnectorSubnetA
+              - Ref: ConnectorSubnetB
+            - Ref: ConnectorSubnetIds
+      Environment:
+        Variables:
+          MSK_BOOTSTRAP:
+            Ref: MskBootstrapServers
+          OFFSETS_TOPIC:
+            Fn::Sub: ${AWS::StackName}-debezium-source-offsets
+          CONNECTOR_NAME:
+            Fn::Sub: ${AWS::StackName}-debezium-source
+          TOPIC_PREFIX:
+            Ref: TopicPrefix
+          # Match the source worker's offset.storage.partitions so the seeded
+          # compacted topic has the same partitioning the connector expects.
+          OFFSET_PARTITIONS: "1"
+          TARGET_REGION:
+            Fn::If: [RegionProvided, Ref: AwsRegion, Ref: "AWS::Region"]
+          # Teardown-ordering for the ROUTING half of the S3 egress path (owned-
+          # network only). The PRIMARY fix is the inline 443->S3-prefix-list egress
+          # rule on ConnectorSecurityGroup (a standalone SecurityGroupEgress resource
+          # races the custom-resource Delete and loses -- see that SG's comment). This
+          # env var complements it by keeping the ROUTE alive: the seeder's
+          # cfnresponse PUTs to S3, which the gateway endpoint routes WITHOUT the NAT,
+          # but only while the endpoint + the seeder subnet's route-table association
+          # still exist. Referencing them here forces the chain
+          #   OffsetSeedResource --(ServiceToken)--> this function --(these Refs)-->
+          #   {S3 endpoint, BOTH subnet route-table associations}
+          # so the whole routing path is torn down strictly AFTER the custom-resource
+          # Delete responds. (Route table is pinned transitively: endpoint & the
+          # associations both DependsOn it.) Unused by the handler; ordering only.
+          S3_EGRESS_ORDERING:
+            Fn::If:
+              - CreateOwnedNetwork
+              - Fn::Join:
+                  - ","
+                  - - Ref: ConnectorS3Endpoint
+                    - Ref: ConnectorSubnetARouteTableAssociation
+                    - Ref: ConnectorSubnetBRouteTableAssociation
+              - "none"
+
+  # The custom resource that actually invokes the seeder. ServiceToken points at
+  # the Lambda; the Watermark* properties are passed through to seeder._seed and,
+  # because they are resource properties, a change to ANY of them re-invokes the
+  # Lambda on the next stack update (idempotent: the Lambda no-clobbers an already-
+  # advanced offset). The source connector DependsOn this (see DebeziumSourceConnector)
+  # so the seed lands before the connector first reads its offset.
+  OffsetSeedResource:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: SeedOffset
+    DependsOn:
+      - MskCluster
+      - OffsetSeederRole
+    Properties:
+      ServiceToken:
+        Fn::GetAtt: [OffsetSeederFunction, Arn]
+      WatermarkBinlogFile:
+        Ref: WatermarkBinlogFile
+      WatermarkBinlogPos:
+        Ref: WatermarkBinlogPos
+      WatermarkGtids:
+        Ref: WatermarkGtids
+      WatermarkTsSec:
+        Ref: WatermarkTsSec
+
+  # --- Debezium MySQL source connector ----------------------------------------
+  # Configuration mirrors CdcPipelineOrchestrator.build_source_config:
+  # table.include.list = selected tables, snapshot.mode = recovery (Full Load
+  # already loaded the rows AND the offset is seeded, so Debezium rebuilds its
+  # schema-history from the live DB without re-reading rows — see snapshot.mode
+  # below). The start offset (GTID / binlog file:position from the Full Load
+  # watermark) is seeded by the control plane into the connect-offsets topic for a
+  # gapless handoff (Property 11) — it is not a static connector config key, so it
+  # is documented here rather than set inline.
+  DebeziumSourceConnector:
+    Type: AWS::KafkaConnect::Connector
+    Condition: HasBootstrapServers
+    DependsOn:
+      - MskCluster
+      - ConnectorSelfIngress
+    Properties:
+      ConnectorName:
+        Fn::Sub: ${AWS::StackName}-debezium-source
+      KafkaConnectVersion:
+        Ref: KafkaConnectVersion
+      ServiceExecutionRoleArn:
+        Fn::GetAtt: [ConnectorExecutionRole, Arn]
+      Capacity:
+        ProvisionedCapacity:
+          McuCount:
+            Ref: ConnectorMcuCount
+          WorkerCount:
+            Ref: ConnectorWorkerCount
+      KafkaCluster:
+        ApacheKafkaCluster:
+          BootstrapServers:
+            Ref: MskBootstrapServers
+          Vpc:
+            SecurityGroups:
+              - Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+            Subnets:
+              Fn::If:
+                - CreateOwnedNetwork
+                - - Ref: ConnectorSubnetA
+                  - Ref: ConnectorSubnetB
+                - Ref: ConnectorSubnetIds
+      KafkaClusterClientAuthentication:
+        AuthenticationType: IAM
+      KafkaClusterEncryptionInTransit:
+        EncryptionType: TLS
+      # Conditional dependency on the offset seed WITHOUT a DependsOn (which cannot
+      # take an Fn::If and errors if it names a condition-false resource). This tag's
+      # value references OffsetSeedResource via Fn::GetAtt ONLY when SeedOffset is
+      # true, which makes CloudFormation create the connector AFTER the seed lands
+      # (so it reads the seeded offset, not the current binlog). When SeedOffset is
+      # false the Fn::If returns "none" -- no reference, no dependency, and the
+      # (also-conditional) seed resource does not exist. The tag value "true"/
+      # "skipped"/"none" is benign metadata.
+      Tags:
+        - Key: OffsetSeed
+          Value:
+            Fn::If:
+              - SeedOffset
+              - Fn::GetAtt: [OffsetSeedResource, Seeded]
+              - "none"
+      WorkerConfiguration:
+        Revision:
+          Fn::GetAtt: [WorkerConfiguration, Revision]
+        WorkerConfigurationArn:
+          Fn::GetAtt: [WorkerConfiguration, WorkerConfigurationArn]
+      Plugins:
+        - CustomPlugin:
+            CustomPluginArn:
+              Fn::GetAtt: [DebeziumSourcePlugin, CustomPluginArn]
+            Revision:
+              Fn::GetAtt: [DebeziumSourcePlugin, Revision]
+      LogDelivery:
+        WorkerLogDelivery:
+          CloudWatchLogs:
+            Enabled: true
+            LogGroup:
+              Ref: ConnectorLogGroup
+      ConnectorConfiguration:
+        connector.class: io.debezium.connector.mysql.MySqlConnector
+        tasks.max:
+          Fn::Sub: "${SourceTasksMax}"
+        database.hostname:
+          Ref: SourceDbHostname
+        database.port:
+          Fn::Sub: "${SourceDbPort}"
+        # Resolved at runtime by the MSK Connect Secrets Manager config provider.
+        # Built with Fn::Join so the literal "${secretsManager:...}" reaches the
+        # connector config verbatim (Fn::Sub would try to interpret ${...}).
+        # SourceSecretName (colon-free) is used here -- NOT SourceSecretArn --
+        # because the ${provider:path:key} syntax splits on ':' and an ARN is full
+        # of colons (gotcha #7). SourceSecretArn is retained for the IAM policy.
+        database.user:
+          Fn::Join: ["", ["${secretsManager:", Ref: SourceSecretName, ":username}"]]
+        database.password:
+          Fn::Join: ["", ["${secretsManager:", Ref: SourceSecretName, ":password}"]]
+        database.server.id:
+          Fn::Sub: "${SourceDbServerId}"
+        topic.prefix:
+          Ref: TopicPrefix
+        table.include.list:
+          Fn::Join: [",", Ref: TableIncludeList]
+        # H13 prevention: drop oversized LOB columns at capture so a value that
+        # could exceed DSQL's 1 MiB per-value limit never reaches Kafka/the sink.
+        # Empty (default) excludes nothing; never list a PK column.
+        column.exclude.list:
+          Ref: ColumnExcludeList
+        # MSK Serverless does NOT auto-create topics (gotcha #8). Debezium must
+        # create per-table data topics itself. replication.factor=-1 uses the
+        # broker default (required for MSK Serverless). partitions must be a
+        # positive integer (-1 is REJECTED with "Number of partitions is below 1").
+        topic.creation.enable: "true"
+        topic.creation.default.replication.factor: "-1"
+        topic.creation.default.partitions: "1"
+        # H13: the per-table data topics must also accept a change event up to
+        # MaxMessageBytes. MSK Serverless creates topics with max.message.bytes at
+        # the broker default (~1 MiB), so even with producer.max.request.size raised
+        # the BROKER rejects a 1-4 MiB record ("RecordTooLargeException: ... larger
+        # than the max message size the server will accept") -- the source task drops
+        # it (silent loss) and it never reaches the sink/DLQ. Setting the topic's
+        # max.message.bytes here (capped at the 8 MiB MSK Serverless maximum) is what
+        # lets a 1-4 MiB record traverse Kafka so the SINK can dead-letter it on the
+        # DSQL 1 MiB per-value limit (the band that makes the DLQ demonstrable).
+        topic.creation.default.max.message.bytes:
+          Fn::Sub: "${MaxMessageBytes}"
+        # Full Load already loaded the row data; we only need to resume streaming
+        # from the watermark-seeded connect-offset WITHOUT re-reading any rows.
+        # MUST be `recovery` (NOT schema_only/no_data): the offset seeder seeds the
+        # connect-offsets topic, so Debezium sees a recorded position and takes the
+        # RESUME path -- which requires the schema-history topic to already exist.
+        # It does not (only the offset was seeded), so schema_only/no_data die with
+        # "The db history topic is missing". `recovery` is built for exactly this:
+        # with an existing offset it rebuilds the schema-history topic from the
+        # CURRENT source tables and resumes -- and it reads NO row data (Debezium
+        # 2.7 MySQL reference). Safe here because no DDL is applied to the source
+        # between watermark capture and connector start, and CDC doesn't propagate
+        # DDL. store.only.captured.tables.ddl=false (the default) lets recovery
+        # rebuild history for all tables. Re-running recovery on a restart is
+        # harmless (rebuilds history again, still no row re-read).
+        snapshot.mode: recovery
+        schema.history.internal.store.only.captured.tables.ddl: "false"
+        include.schema.changes: "false"
+        # Serialize BIGINT UNSIGNED as an exact BigDecimal (Avro decimal) instead
+        # of the default signed Long, which overflows for values > 2^63-1. The
+        # DSQL write contract maps BIGINT UNSIGNED to numeric(20,0); a BigDecimal
+        # binds correctly there, matching the Full Load bulk loader. (decimal.
+        # handling.mode stays at its default 'precise', so DECIMAL is a BigDecimal
+        # too -- the custom sink relies on these precise encodings.)
+        bigint.unsigned.handling.mode: precise
+        # Debezium internal schema history topic (self-managed on MSK).
+        schema.history.internal.kafka.bootstrap.servers:
+          Ref: MskBootstrapServers
+        schema.history.internal.kafka.topic:
+          Fn::Sub: ${TopicPrefix}.schema-history
+        schema.history.internal.producer.security.protocol: SASL_SSL
+        schema.history.internal.producer.sasl.mechanism: AWS_MSK_IAM
+        # MSK Connect auto-injects IAM auth for the connector's OWN producer, but the
+        # Debezium schema-history is a SEPARATE Kafka client: without an explicit JAAS
+        # entry + callback handler it boots with no 'KafkaClient' JAAS config and the
+        # task dies (IllegalArgumentException: Could not find a 'KafkaClient' entry).
+        # The IAMLoginModule/IAMClientCallbackHandler classes are provided by the MSK
+        # Connect 3.7.x runtime -- do NOT bundle aws-msk-iam-auth into the plugin (its
+        # older shaded AWS SDK conflicts with msk-config-providers and fails the worker
+        # with NoSuchFieldError: AUTH_SCHEME_PROVIDER; gotcha #4).
+        schema.history.internal.producer.sasl.jaas.config: software.amazon.msk.auth.iam.IAMLoginModule required;
+        schema.history.internal.producer.sasl.client.callback.handler.class: software.amazon.msk.auth.iam.IAMClientCallbackHandler
+        schema.history.internal.consumer.security.protocol: SASL_SSL
+        schema.history.internal.consumer.sasl.mechanism: AWS_MSK_IAM
+        schema.history.internal.consumer.sasl.jaas.config: software.amazon.msk.auth.iam.IAMLoginModule required;
+        schema.history.internal.consumer.sasl.client.callback.handler.class: software.amazon.msk.auth.iam.IAMClientCallbackHandler
+        # key.converter/value.converter are declared in WorkerConfiguration. They
+        # are intentionally absent here to avoid split authority -- the worker
+        # config is the single canonical source (connector config would shadow it).
+
+  # --- Custom DSQL sink connector ---------------------------------------------
+  # Configuration mirrors CdcPipelineOrchestrator.build_sink_config: one topic
+  # per selected table, PK keying (record_key), idempotent upsert + delete, and
+  # a DLQ for poison messages (Req 12.3-12.6). Statement-level OCC (40001) retry,
+  # IAM token refresh, and the <=3,000-row batch live in the connector plugin
+  # itself (Task 23.2), not in this config.
+  # Gated on DeploySinkConnector: deploy the source first (DeploySink=false) so it
+  # creates the per-table data topic, then deploy the sink (DeploySink=true) so it
+  # subscribes to an existing topic. Starting the sink before the topic exists
+  # causes an empty consumer assignment that never recovers (gotcha #11).
+  DsqlSinkConnector:
+    Type: AWS::KafkaConnect::Connector
+    Condition: DeploySinkConnector
+    DependsOn:
+      - MskCluster
+      - DebeziumSourceConnector
+      - ConnectorSelfIngress
+    Properties:
+      ConnectorName:
+        Fn::Sub: ${AWS::StackName}-dsql-sink
+      KafkaConnectVersion:
+        Ref: KafkaConnectVersion
+      ServiceExecutionRoleArn:
+        Fn::GetAtt: [ConnectorExecutionRole, Arn]
+      Capacity:
+        ProvisionedCapacity:
+          McuCount:
+            Ref: ConnectorMcuCount
+          WorkerCount:
+            Ref: ConnectorWorkerCount
+      KafkaCluster:
+        ApacheKafkaCluster:
+          BootstrapServers:
+            Ref: MskBootstrapServers
+          Vpc:
+            SecurityGroups:
+              - Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+            Subnets:
+              Fn::If:
+                - CreateOwnedNetwork
+                - - Ref: ConnectorSubnetA
+                  - Ref: ConnectorSubnetB
+                - Ref: ConnectorSubnetIds
+      KafkaClusterClientAuthentication:
+        AuthenticationType: IAM
+      KafkaClusterEncryptionInTransit:
+        EncryptionType: TLS
+      WorkerConfiguration:
+        Revision:
+          Fn::GetAtt: [SinkWorkerConfiguration, Revision]
+        WorkerConfigurationArn:
+          Fn::GetAtt: [SinkWorkerConfiguration, WorkerConfigurationArn]
+      Plugins:
+        - CustomPlugin:
+            CustomPluginArn:
+              Fn::GetAtt: [DsqlSinkPlugin, CustomPluginArn]
+            Revision:
+              Fn::GetAtt: [DsqlSinkPlugin, Revision]
+      LogDelivery:
+        WorkerLogDelivery:
+          CloudWatchLogs:
+            Enabled: true
+            LogGroup:
+              Ref: ConnectorLogGroup
+      ConnectorConfiguration:
+        # Our custom connector (Task 23.2, connectors/dsql-sink). Package path
+        # matches DsqlSinkConnector.java in that subproject.
+        connector.class: dev.dsqlmigrator.connect.DsqlSinkConnector
+        tasks.max:
+          Fn::Sub: "${SinkTasksMax}"
+        # Explicit topic list (avoids the Fn::Sub backslash-escaping trap that
+        # turned topics.regex into a literal-backslash pattern matching nothing --
+        # gotcha). Per-table topic = <TopicPrefix>.<db>.<table>. The caller must
+        # construct SinkTopics as:
+        #   ','.join(f'{prefix}.{t}' for t in build_sink_config.topics)
+        topics:
+          Ref: SinkTopics
+        # Idempotent apply: this custom connector always derives the PK from the
+        # Debezium record key and applies INSERT ... ON CONFLICT upsert
+        # (build_sink_config: pk_mode=record_key, insert_mode=upsert), so pk.mode/
+        # insert.mode are implicit and not set here. delete.enabled toggles
+        # DELETE/tombstone apply. Keys below match DsqlSinkConnectorConfig.
+        delete.enabled: "true"
+        # DSQL connection: IAM token auth (no password). The connector generates
+        # the token and refreshes it before the 1-hour timeout (Task 23.2).
+        dsql.cluster.endpoint:
+          Ref: DsqlClusterEndpoint
+        dsql.database:
+          Ref: DsqlDatabaseName
+        dsql.username:
+          Ref: DsqlConnectUser
+        dsql.region:
+          Fn::If: [RegionProvided, Ref: AwsRegion, Ref: "AWS::Region"]
+        # DSQL constraint: <=3,000 rows per transaction.
+        batch.size:
+          Fn::Sub: "${SinkBatchMaxRows}"
+        # Dead-letter queue for poison change events (Req 12.4-12.6). The topic
+        # is auto-created at runtime; it is not a CloudFormation resource.
+        errors.tolerance: all
+        errors.deadletterqueue.topic.name:
+          Ref: DlqTopicName
+        errors.deadletterqueue.context.headers.enable: "true"
+        errors.deadletterqueue.topic.replication.factor: "3"
+        errors.log.enable: "true"
+        # Retry retriable errors (e.g. OCC SQLSTATE 40001 conflicts) for up to
+        # 10 min before dead-lettering, so transient conflicts are absorbed by the
+        # connector's statement-level retry instead of being dropped to the DLQ
+        # with zero retries (the original errors.retry.timeout=0 default caused
+        # contiguous-band data loss under concurrent DML -- see 2026-06 analysis).
+        errors.retry.timeout: "600000"
+        errors.retry.delay.max.ms: "60000"
+        # Log the failed record + exception (not just that an error occurred) so
+        # DLQ root-cause is visible in CloudWatch without consuming the DLQ topic.
+        errors.log.include.messages: "true"
+        # key.converter/value.converter are declared in SinkWorkerConfiguration.
+        # They are intentionally absent here to avoid split authority. The H13
+        # message-size limits (producer.max.request.size / consumer.fetch.max.bytes
+        # / consumer.max.partition.fetch.bytes) live in the SINK worker config:
+        # MSK Connect supports those producer.*/consumer.* keys at the worker level
+        # and applies them to the connector's task clients (per the MSK Connect
+        # "Supported worker configuration properties" doc). Per-connector
+        # ".override." keys are NOT available on MSK Connect (it excludes
+        # connector.client.config.override.policy), so the worker config is the
+        # only place these can be set.
+
+Outputs:
+  MskClusterArn:
+    Description: ARN of the MSK Serverless cluster (read its bootstrap string with GetBootstrapBrokers).
+    Value:
+      Fn::GetAtt: [MskCluster, Arn]
+
+  ConnectorExecutionRoleArn:
+    Description: Least-privilege execution role assumed by both MSK Connect connectors.
+    Value:
+      Fn::GetAtt: [ConnectorExecutionRole, Arn]
+
+  DebeziumSourceConnectorArn:
+    Condition: HasBootstrapServers
+    Description: ARN of the Debezium MySQL source connector (only present once the bootstrap string is supplied).
+    Value:
+      Ref: DebeziumSourceConnector
+
+  DsqlSinkConnectorArn:
+    Condition: DeploySinkConnector
+    Description: ARN of the custom DSQL sink connector (only present when DeploySink=true).
+    Value:
+      Ref: DsqlSinkConnector
+
+  ConnectorLogGroupName:
+    Description: CloudWatch log group for connector worker logs (Req 12.9 monitoring).
+    Value:
+      Ref: ConnectorLogGroup

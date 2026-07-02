@@ -1,0 +1,266 @@
+"""Snapshot and invariant tests for execution-unit output (subtask 5.3).
+
+Schema conversion must emit DDL as ordered execution units that respect the
+single-DDL-per-transaction rule (Requirement 3.6 / Property 2): DDL is separated
+from DML, each execution unit holds exactly one DDL statement, and every
+``CREATE TABLE`` unit precedes the ``CREATE INDEX ASYNC`` units (an index needs
+its table to exist first). These tests pin the rendered script with inline
+snapshots over a representative MySQL corpus and assert the invariants
+programmatically so the output stays deterministic and reproducible.
+"""
+
+from __future__ import annotations
+
+import re
+
+import pytest
+
+from dsql_migrator.core.converter import (
+    ExecutionUnit,
+    ExecutionUnitKind,
+    PrimaryKeyStrategy,
+    SchemaConverter,
+    SchemaConversionResult,
+    SchemaConvertOptions,
+)
+from dsql_migrator.core.models import (
+    ColumnDef,
+    ForeignKeyDef,
+    IndexDef,
+    SourceInventory,
+    TableDef,
+)
+
+
+# ---------------------------------------------------------------------------
+# Representative corpus
+# ---------------------------------------------------------------------------
+
+
+def _corpus() -> SourceInventory:
+    """Build a representative two-table MySQL inventory.
+
+    ``rich_types`` exercises the type-mapping table (TINYINT(1), UNSIGNED int,
+    DATETIME, BLOB, ENUM, SET, JSON) and carries a secondary and a unique index.
+    ``orders`` carries an AUTO_INCREMENT primary key (so the primary-key strategy
+    applies), a foreign key (removed for DSQL), and a secondary index.
+    """
+    rich_types = TableDef(
+        name="rich_types",
+        columns=[
+            ColumnDef(name="id", mysql_type="INT", nullable=False),
+            ColumnDef(name="is_active", mysql_type="TINYINT(1)"),
+            ColumnDef(name="hits", mysql_type="INT UNSIGNED"),
+            ColumnDef(name="created_at", mysql_type="DATETIME"),
+            ColumnDef(name="payload", mysql_type="BLOB"),
+            ColumnDef(name="status", mysql_type="ENUM('open','closed')"),
+            ColumnDef(name="tags", mysql_type="SET('x','y')"),
+            ColumnDef(name="doc", mysql_type="JSON"),
+        ],
+        primary_key=["id"],
+        indexes=[
+            IndexDef(name="idx_status", columns=["status"]),
+            IndexDef(name="uq_doc_id", columns=["id", "status"], unique=True),
+        ],
+    )
+    orders = TableDef(
+        name="orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="INT", nullable=False),
+            ColumnDef(name="user_id", mysql_type="INT"),
+        ],
+        primary_key=["id"],
+        auto_increment_column="id",
+        foreign_keys=[
+            ForeignKeyDef(
+                name="fk_user",
+                columns=["user_id"],
+                referenced_table="users",
+                referenced_columns=["id"],
+            )
+        ],
+        indexes=[IndexDef(name="idx_user", columns=["user_id"])],
+    )
+    return SourceInventory(tables=[rich_types, orders])
+
+
+def _convert(strategy: PrimaryKeyStrategy) -> SchemaConversionResult:
+    return SchemaConverter().convert(
+        _corpus(), SchemaConvertOptions(primary_key_strategy=strategy)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Snapshot expectations (inline, deterministic)
+# ---------------------------------------------------------------------------
+
+
+_EXPECTED_KEEP_INTEGER = """\
+CREATE TABLE "rich_types" (
+  "id" INT NOT NULL,
+  "is_active" BOOLEAN,
+  "hits" BIGINT,
+  "created_at" TIMESTAMP,
+  "payload" BYTEA,
+  "status" TEXT CHECK ("status" IN ('open', 'closed')),
+  "tags" TEXT,
+  "doc" JSON,
+  PRIMARY KEY ("id")
+);
+
+CREATE TABLE "orders" (
+  "id" INT NOT NULL,
+  "user_id" INT,
+  PRIMARY KEY ("id")
+);
+
+CREATE INDEX ASYNC "idx_status" ON "rich_types" ("status");
+
+CREATE UNIQUE INDEX ASYNC "uq_doc_id" ON "rich_types" ("id", "status");
+
+CREATE INDEX ASYNC "idx_user" ON "orders" ("user_id");"""
+
+
+_EXPECTED_CONVERT_TO_UUID = """\
+CREATE TABLE "rich_types" (
+  "id" INT NOT NULL,
+  "is_active" BOOLEAN,
+  "hits" BIGINT,
+  "created_at" TIMESTAMP,
+  "payload" BYTEA,
+  "status" TEXT CHECK ("status" IN ('open', 'closed')),
+  "tags" TEXT,
+  "doc" JSON,
+  PRIMARY KEY ("id")
+);
+
+CREATE TABLE "orders" (
+  "id" UUID NOT NULL,
+  "user_id" INT,
+  PRIMARY KEY ("id")
+);
+
+CREATE INDEX ASYNC "idx_status" ON "rich_types" ("status");
+
+CREATE UNIQUE INDEX ASYNC "uq_doc_id" ON "rich_types" ("id", "status");
+
+CREATE INDEX ASYNC "idx_user" ON "orders" ("user_id");"""
+
+
+_EXPECTED_IDENTITY_WITH_CACHE = """\
+CREATE TABLE "rich_types" (
+  "id" INT NOT NULL,
+  "is_active" BOOLEAN,
+  "hits" BIGINT,
+  "created_at" TIMESTAMP,
+  "payload" BYTEA,
+  "status" TEXT CHECK ("status" IN ('open', 'closed')),
+  "tags" TEXT,
+  "doc" JSON,
+  PRIMARY KEY ("id")
+);
+
+CREATE TABLE "orders" (
+  "id" INT NOT NULL GENERATED BY DEFAULT AS IDENTITY (CACHE 100),
+  "user_id" INT,
+  PRIMARY KEY ("id")
+);
+
+CREATE INDEX ASYNC "idx_status" ON "rich_types" ("status");
+
+CREATE UNIQUE INDEX ASYNC "uq_doc_id" ON "rich_types" ("id", "status");
+
+CREATE INDEX ASYNC "idx_user" ON "orders" ("user_id");"""
+
+
+_EXPECTED_SCRIPTS = {
+    PrimaryKeyStrategy.KEEP_INTEGER: _EXPECTED_KEEP_INTEGER,
+    PrimaryKeyStrategy.CONVERT_TO_UUID: _EXPECTED_CONVERT_TO_UUID,
+    PrimaryKeyStrategy.IDENTITY_WITH_CACHE: _EXPECTED_IDENTITY_WITH_CACHE,
+}
+
+
+# ---------------------------------------------------------------------------
+# Snapshot regression tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("strategy", list(PrimaryKeyStrategy))
+def test_to_script_matches_snapshot(strategy: PrimaryKeyStrategy) -> None:
+    """The rendered execution-unit script matches the pinned snapshot."""
+    assert _convert(strategy).to_script() == _EXPECTED_SCRIPTS[strategy]
+
+
+def test_to_script_is_deterministic() -> None:
+    """Converting the same corpus twice yields an identical script."""
+    first = _convert(PrimaryKeyStrategy.KEEP_INTEGER).to_script()
+    second = _convert(PrimaryKeyStrategy.KEEP_INTEGER).to_script()
+    assert first == second
+
+
+# ---------------------------------------------------------------------------
+# Execution-unit invariants (Requirement 3.6 / Property 2)
+# ---------------------------------------------------------------------------
+
+
+_DML_KEYWORDS = ("INSERT", "UPDATE", "DELETE", "SELECT", "MERGE", "UPSERT")
+
+
+def _is_create_table(unit: ExecutionUnit) -> bool:
+    return unit.sql.lstrip().upper().startswith("CREATE TABLE")
+
+
+def _is_create_index(unit: ExecutionUnit) -> bool:
+    return "INDEX ASYNC" in unit.sql.upper()
+
+
+def test_each_unit_holds_exactly_one_ddl_statement() -> None:
+    """Property 2: one execution unit carries exactly one DDL statement.
+
+    A single statement has exactly one ``CREATE`` keyword and no statement
+    terminator, so multiple DDL statements can never share one transaction.
+    """
+    units = _convert(PrimaryKeyStrategy.KEEP_INTEGER).execution_units()
+    assert units
+    for unit in units:
+        assert len(re.findall(r"\bCREATE\b", unit.sql, re.IGNORECASE)) == 1
+        assert ";" not in unit.sql
+        assert _is_create_table(unit) ^ _is_create_index(unit)
+
+
+def test_all_table_units_precede_all_index_units() -> None:
+    """Property 2: every CREATE TABLE unit precedes the CREATE INDEX ASYNC units."""
+    units = _convert(PrimaryKeyStrategy.KEEP_INTEGER).execution_units()
+    kinds = ["table" if _is_create_table(u) else "index" for u in units]
+    assert kinds == ["table", "table", "index", "index", "index"]
+    last_table = max(i for i, k in enumerate(kinds) if k == "table")
+    first_index = min(i for i, k in enumerate(kinds) if k == "index")
+    assert last_table < first_index
+
+
+def test_execution_units_contain_no_dml() -> None:
+    """Property 2: schema conversion emits DDL only, never DML."""
+    result = _convert(PrimaryKeyStrategy.KEEP_INTEGER)
+    for unit in result.execution_units():
+        assert unit.kind is ExecutionUnitKind.DDL
+        first_word = unit.sql.lstrip().split(None, 1)[0].upper()
+        assert first_word not in _DML_KEYWORDS
+    script_words = re.findall(r"\b[A-Z]+\b", result.to_script().upper())
+    assert all(keyword not in script_words for keyword in _DML_KEYWORDS)
+
+
+def test_script_statement_count_equals_unit_count() -> None:
+    """Each execution unit renders as exactly one terminated statement."""
+    result = _convert(PrimaryKeyStrategy.KEEP_INTEGER)
+    units = result.execution_units()
+    script = result.to_script()
+    assert script.count(";") == len(units)
+    statements = [s for s in script.split(";") if s.strip()]
+    assert len(statements) == len(units)
+
+
+def test_empty_inventory_produces_no_units_and_empty_script() -> None:
+    """An empty inventory yields no execution units and an empty script."""
+    result = SchemaConverter().convert(SourceInventory())
+    assert result.execution_units() == []
+    assert result.to_script() == ""

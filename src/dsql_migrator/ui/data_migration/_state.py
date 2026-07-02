@@ -1,0 +1,534 @@
+"""Per-session Data Migration state (NiceGUI-free).
+
+The two per-session STATE classes for the Data Migration step live here so the
+package ``__init__`` keeps only the NiceGUI screen + render helpers. These classes
+hold the session's table selection, prerequisite reports, CDC lifecycle/monitoring
+state, the downloadable error log, the current job id, and the last failure
+message; the live migration progress itself lives in the
+:class:`~dsql_migrator.core.job_manager.JobManager` keyed by ``job_id``.
+
+These classes are intentionally NiceGUI-free (no ``ui`` param, no widget
+building) so they can be unit tested directly. ``DataMigrationState`` is
+re-exported from the package ``__init__`` so the public import surface is
+unchanged.
+"""
+
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional, Sequence
+
+from dsql_migrator.core.cdc import (
+    CDC_DEFAULT_STACK_NAME,
+    CdcResumePoint,
+)
+from dsql_migrator.core.error_log import ErrorLogStore
+from dsql_migrator.core.models import (
+    LoadStatusView,
+    MigrationMode,
+    PrerequisiteReport,
+    TableSelection,
+)
+
+from dsql_migrator.ui.data_migration._models import MigrationType
+from dsql_migrator.ui.data_migration._status import CdcActivitySummary
+
+
+class DataMigrationState:
+    """Per-session Data Migration sub-flow state (selection, prereqs, job, errors).
+
+    The live migration state (chunks, watermark, progress) lives in the
+    :class:`~dsql_migrator.core.job_manager.JobManager` keyed by ``job_id``; this
+    holds the session's table selection, the per-mode prerequisite reports, the
+    downloadable error log, the current ``job_id``, and the last failure message.
+    Mutated by the UI poller/handlers and read on render, so it is guarded by a
+    lock (mirroring the sibling step screens).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # Optional bound SessionConnectionState. When set (via bind_session), the
+        # migration type and the CDC infra inputs are written THROUGH to the
+        # session, which is the authoritative store now that the mode is chosen
+        # early on the Migration plan step. The local fields below remain as a
+        # fallback for tests / call sites that construct a state without a session.
+        self._session: object = None
+        self.job_id: Optional[str] = None
+        self._error: Optional[str] = None
+        # Multi-table selection; empty selected_tables => all (inferred default).
+        self.selection: TableSelection = TableSelection()
+        # Whether the user has explicitly changed the table picker. Until then
+        # the picker shows the pre-selected default (all generated-DDL tables);
+        # once touched, an explicit empty selection means "no tables selected".
+        self.selection_touched: bool = False
+        # Whether the user has accepted permanently-quarantined rows (e.g. values
+        # over DSQL's ~1 MiB per-value limit) so a quarantine-only incomplete Full
+        # Load no longer blocks CDC. Set explicitly via "Accept quarantined rows";
+        # carried into re-runs so the engine completes a quarantine-only run.
+        self.accept_quarantined_rows: bool = False
+        # Active sub-step of the Prerequisites -> Full Load -> CDC stepper. Held
+        # here so it survives the content re-render driven by the progress poller
+        # (None => derive a sensible default from the current job/prereq state).
+        self.active_substep: Optional[str] = None
+        # Last sub-step the screen actually rendered as "active". Used only to
+        # detect a real sub-step transition (e.g. Full Load finishing -> CDC
+        # opens) so the screen can bring the stepper back into view exactly once
+        # on that change -- without yanking the page on the routine progress-poll
+        # re-renders that keep the same active sub-step. UI-only; not persisted.
+        self.last_rendered_substep: Optional[str] = None
+        # Migration type the user selected (Full load only / CDC only / both).
+        # Determines which prerequisite mode is checked and which stepper
+        # sub-steps are shown; defaults to Full load only. Exposed via the
+        # ``migration_type`` property which reads through to a bound session when
+        # present (the Migration plan step is the authoritative chooser).
+        self._migration_type: MigrationType = MigrationType.FULL_LOAD_ONLY
+        # Single per-session downloadable error log for Full Load + CDC errors
+        # (single error path -- Req 13.2 / Property 15).
+        self.error_log: ErrorLogStore = ErrorLogStore()
+        # Last prerequisite report per mode (set when the user runs checks).
+        self._prereq_reports: dict[MigrationMode, PrerequisiteReport] = {}
+        # Modes whose prerequisite checks are currently running (transient, in
+        # memory only -- drives the immediate "checking..." feedback so the
+        # button does not appear unresponsive during the read-only checks).
+        self._prereq_running: set[MigrationMode] = set()
+        # Selected target tables that already contain rows and would be dropped &
+        # recreated on a confirmed Full Load (computed when the user clicks Start;
+        # drives the destructive warning and the run's replace set).
+        self._replace_targets: frozenset[str] = frozenset()
+        # One-shot flag: open the Full Load confirm dialog on the next render
+        # (set after the async non-empty-target check completes).
+        self.pending_full_load_confirm: bool = False
+        # CDC oversized-LOB columns the user opted to EXCLUDE at capture (H13),
+        # keyed by table name -> set of column names. Empty => exclude nothing.
+        # Feeds the connector template's ColumnExcludeList (Debezium
+        # column.exclude.list); an explicit, opt-in choice (no silent data loss).
+        self._cdc_excluded_lob_columns: dict[str, set[str]] = {}
+        # How the operator chose the CDC start point: "auto" (gapless from the
+        # Full Load watermark) or "manual" (an explicit GTID / binlog position).
+        # An explicit mode (vs. inferring it from whether an override is set)
+        # lets the UI show a clear radio choice and keep "Manual + empty inputs"
+        # distinct from "Automatic".
+        self._cdc_start_mode: str = "auto"
+        # Manual CDC start-position override the operator entered (a GTID set or
+        # a binlog file:position). Only used when ``_cdc_start_mode == "manual"``.
+        self._cdc_start_gtid: Optional[str] = None
+        self._cdc_start_binlog_file: Optional[str] = None
+        self._cdc_start_binlog_pos: Optional[int] = None
+        # Live CDC monitoring (Phase 2). The status view is rebuilt by the CDC
+        # poller from the controller's read-only signals; the controller talks to
+        # the already-deployed MSK Connect connectors (decision-change 8 -- the UI
+        # never deploys them). All transient/session-only -- not on MigrationJob.
+        self.cdc_status_view: Optional[LoadStatusView] = None
+        self.cdc_controller: Optional[object] = None  # MskConnectController
+        self.cdc_connector_names: list[str] = []
+        # Subset of cdc_connector_names whose MSK connectorState is RUNNING (vs
+        # still CREATING/UPDATING). Lets the lifecycle card distinguish "deployed
+        # and streaming" from "still provisioning" so a CREATING sink is not
+        # mislabeled "Streaming". Transient/session-only (re-derived on discovery).
+        self.cdc_connector_running_names: list[str] = []
+        self.cdc_activity: Optional["CdcActivitySummary"] = None
+        # Per-table source/target row counts for the migration-status view, fetched
+        # on demand (a direct COUNT(*) on each side -- read-only but adds source
+        # load, so it is an explicit "Refresh counts" action, not an auto-poll).
+        # name -> count (or None when the table is absent/erroring on that side).
+        self.row_count_source: dict[str, Optional[int]] = {}
+        self.row_count_target: dict[str, Optional[int]] = {}
+        # Per-table MAX(single-int PK) on each side: the stream high-water mark for
+        # the CDC "is it behind?" check (independent of row count).
+        self.row_max_pk_source: dict[str, Optional[int]] = {}
+        self.row_max_pk_target: dict[str, Optional[int]] = {}
+        self.row_counts_fetched_at: Optional[datetime] = None
+        # CDC lifecycle actions (Deploy infra / Start / Stop / Delete) -- each runs
+        # as a JobManager CloudFormation job; only one runs at a time, so a single
+        # ``cdc_deploy_job_id`` + ``cdc_action_kind`` (which operation it is, for the
+        # right stage labels) + an append-only step log live here (transient). The
+        # cdc-stack name every operation targets.
+        self.cdc_deploy_job_id: Optional[str] = None
+        self.cdc_action_kind: Optional[str] = None  # "infra"|"start"|"stop"|"delete"
+        self.cdc_stack_name: str = CDC_DEFAULT_STACK_NAME
+        self._cdc_deploy_log: list[tuple[datetime, str]] = []
+        # BYO-VPC infrastructure inputs the customer enters in the Deploy-infra
+        # form (VpcId, subnets, plugin S3 keys, source host/secret, DsqlClusterArn,
+        # …). Filled values only; pre-seeded from the target/source config where
+        # known. Transient/session-only.
+        self._cdc_infra_inputs: dict[str, str] = {}
+        # Cached, best-effort cdc-stack lifecycle phase so the UI can pick the right
+        # action without an AWS call on every render: "absent" (no stack -> Deploy),
+        # "infra" (stack up, no connectors -> Start), "running" (connectors ->
+        # Stop), "unstable" (in-progress/rolled-back), or None (not yet probed).
+        # ``cdc_stack_phase_status`` carries the raw StackStatus for messages.
+        self.cdc_stack_phase: Optional[str] = None
+        self.cdc_stack_phase_status: Optional[str] = None
+        self.cdc_stack_phase_checked: bool = False
+        # Monotonic timestamp of the last render-time CDC discovery (describe +
+        # list connectors); throttles those AWS reads across rapid re-renders.
+        # Reset to None here so a Start-over (reset_in_place re-runs __init__)
+        # forces a fresh discovery.
+        self._cdc_discovery_monotonic: Optional[float] = None
+        # Optional dedicated CDC deploy-role ARN (process config, threaded from
+        # AppConfig at screen-build time). When set, the cdc-stack deployer assumes
+        # this role for the privileged CloudFormation/MSK/IAM operations instead of
+        # using the app's own (task-role) identity. None = local dev / admin creds.
+        self.cdc_deploy_role_arn: Optional[str] = None
+        # Optional customer-managed KMS key id for the tool-created source secret
+        # (process config, threaded at screen-build time). None -> default key.
+        self.cdc_secret_kms_key_id: Optional[str] = None
+
+    def set_cdc_lob_exclusion(self, table: str, column: str, exclude: bool) -> None:
+        """Toggle whether one oversized-LOB column is excluded from CDC (H13)."""
+        with self._lock:
+            current = self._cdc_excluded_lob_columns.setdefault(table, set())
+            if exclude:
+                current.add(column)
+            else:
+                current.discard(column)
+                if not current:
+                    self._cdc_excluded_lob_columns.pop(table, None)
+
+    def cdc_lob_exclusions(self) -> dict[str, set[str]]:
+        """Return a copy of the per-table excluded-LOB-column selection (H13)."""
+        with self._lock:
+            return {
+                table: set(columns)
+                for table, columns in self._cdc_excluded_lob_columns.items()
+            }
+
+    def set_cdc_start_mode(self, mode: str) -> None:
+        """Record the chosen CDC start mode: ``"auto"`` or ``"manual"``.
+
+        ``"auto"`` uses the Full Load watermark (gapless); ``"manual"`` uses the
+        operator-entered GTID / binlog position. Any value other than ``"manual"``
+        normalizes to ``"auto"`` so the default is always the safe gapless path.
+        """
+        with self._lock:
+            self._cdc_start_mode = "manual" if mode == "manual" else "auto"
+
+    def cdc_start_mode(self) -> str:
+        """Return the chosen CDC start mode (``"auto"`` or ``"manual"``)."""
+        with self._lock:
+            return self._cdc_start_mode
+
+    def set_cdc_start_position(
+        self,
+        *,
+        gtid: Optional[str] = None,
+        binlog_file: Optional[str] = None,
+        binlog_pos: Optional[int] = None,
+    ) -> None:
+        """Record the manual CDC start-position override (GTID and/or binlog).
+
+        Blank/``None`` values clear that field. Stored verbatim; the UI validates
+        the strings before calling this (advisory) and :meth:`cdc_start_override`
+        assembles a :class:`CdcResumePoint` from whatever is set.
+        """
+        with self._lock:
+            self._cdc_start_gtid = (gtid or "").strip() or None
+            self._cdc_start_binlog_file = (binlog_file or "").strip() or None
+            self._cdc_start_binlog_pos = binlog_pos
+
+    def cdc_start_override(self) -> Optional[CdcResumePoint]:
+        """Return the manual start position as a CdcResumePoint, or None.
+
+        ``None`` means no usable manual override -- the caller uses the Full Load
+        watermark. Returns ``None`` whenever the mode is ``"auto"`` (regardless of
+        any stale entered values) so switching back to Automatic cleanly drops the
+        override. In ``"manual"`` mode a point is returned when a GTID or a
+        complete binlog file:position is present; :meth:`CdcResumePoint.has_coordinates`
+        then confirms it is usable.
+        """
+        with self._lock:
+            if self._cdc_start_mode != "manual":
+                return None
+            gtid = self._cdc_start_gtid
+            binlog_file = self._cdc_start_binlog_file
+            binlog_pos = self._cdc_start_binlog_pos
+        has_binlog = binlog_file is not None and binlog_pos is not None
+        if not gtid and not has_binlog:
+            return None
+        return CdcResumePoint(
+            gtid_executed=gtid,
+            binlog_file=binlog_file if has_binlog else None,
+            binlog_position=binlog_pos if has_binlog else None,
+        )
+
+    def set_cdc_status_view(self, view: Optional[LoadStatusView]) -> None:
+        """Record the latest CDC monitoring view (rebuilt by the poller)."""
+        with self._lock:
+            self.cdc_status_view = view
+
+    def set_cdc_activity(self, activity: Optional["CdcActivitySummary"]) -> None:
+        """Record the latest CDC throughput summary (rebuilt by the poller)."""
+        with self._lock:
+            self.cdc_activity = activity
+
+    def set_cdc_deploy_job_id(
+        self, job_id: Optional[str], *, kind: Optional[str] = None
+    ) -> None:
+        """Record (or clear) the running CDC lifecycle job's id + which operation.
+
+        ``kind`` is one of ``"infra"``/``"start"``/``"stop"``/``"delete"`` so the
+        progress UI can label the right stage set; cleared with the job id.
+        """
+        with self._lock:
+            self.cdc_deploy_job_id = job_id
+            self.cdc_action_kind = kind if job_id is not None else None
+
+    def set_cdc_infra_inputs(self, inputs: dict[str, str]) -> None:
+        """Replace the BYO-VPC infrastructure inputs (read-through to session)."""
+        session = self._session
+        if session is not None:
+            try:
+                session.set_cdc_infra_inputs(inputs)
+                return
+            except Exception:  # noqa: BLE001 - fall back to local storage
+                pass
+        with self._lock:
+            self._cdc_infra_inputs = dict(inputs)
+
+    def cdc_infra_inputs(self) -> dict[str, str]:
+        """Return a copy of the entered BYO-VPC infrastructure inputs."""
+        session = self._session
+        if session is not None:
+            try:
+                return session.cdc_infra_inputs()
+            except Exception:  # noqa: BLE001 - fall back to local storage
+                pass
+        with self._lock:
+            return dict(self._cdc_infra_inputs)
+
+    def set_cdc_stack_name(self, name: str) -> bool:
+        """Set the cdc-stack name when valid; return True if accepted.
+
+        The name must be inside the ``mysql-dsql-cdc-*`` family the deploy role grants
+        (see :func:`cdc_stack_name_is_valid`). An invalid name is rejected and the
+        current name is kept, so a typo never makes the tool deploy resources the
+        deploy role cannot manage. One cdc-stack per source DB lets several
+        migrations run concurrently in one account/region.
+        """
+        from dsql_migrator.core.cdc import cdc_stack_name_is_valid
+
+        candidate = (name or "").strip()
+        if not cdc_stack_name_is_valid(candidate):
+            return False
+        with self._lock:
+            self.cdc_stack_name = candidate
+        return True
+
+    def set_cdc_stack_phase(
+        self, phase: Optional[str], *, status: Optional[str] = None
+    ) -> None:
+        """Cache the probed cdc-stack lifecycle phase + raw status (best-effort)."""
+        with self._lock:
+            self.cdc_stack_phase = phase
+            self.cdc_stack_phase_status = status
+            self.cdc_stack_phase_checked = True
+
+    def append_cdc_deploy_log(self, when: datetime, message: str) -> None:
+        """Append one timestamped line to the deploy step log (thread-safe)."""
+        with self._lock:
+            self._cdc_deploy_log.append((when, message))
+
+    def get_cdc_deploy_log(self) -> list[tuple[datetime, str]]:
+        """Return a copy of the deploy step log lines."""
+        with self._lock:
+            return list(self._cdc_deploy_log)
+
+    def clear_cdc_deploy_log(self) -> None:
+        """Empty the deploy step log (called when a new deploy starts)."""
+        with self._lock:
+            self._cdc_deploy_log = []
+
+    def set_cdc_controller(self, controller: object) -> None:
+        """Inject the MSK Connect controller used to poll connector status."""
+        with self._lock:
+            self.cdc_controller = controller
+
+    def set_cdc_connector_names(self, names: Sequence[str]) -> None:
+        """Record the connector names the CDC poller should track (read-only)."""
+        with self._lock:
+            self.cdc_connector_names = [n for n in names if n]
+
+    def set_cdc_connector_running_names(self, names: Sequence[str]) -> None:
+        """Record which of my connectors are RUNNING (vs still provisioning)."""
+        with self._lock:
+            self.cdc_connector_running_names = [n for n in names if n]
+
+    def set_row_counts(
+        self,
+        *,
+        source: dict[str, Optional[int]],
+        target: dict[str, Optional[int]],
+        fetched_at: datetime,
+        source_max_pk: "Optional[dict[str, Optional[int]]]" = None,
+        target_max_pk: "Optional[dict[str, Optional[int]]]" = None,
+    ) -> None:
+        """Record the latest per-table source/target row counts + max-PK marks.
+
+        ``source_max_pk`` / ``target_max_pk`` are the per-table stream high-water
+        marks used by the CDC "is it behind?" check; omitted (None) leaves them
+        empty, so callers that only have counts still work.
+        """
+        with self._lock:
+            self.row_count_source = dict(source)
+            self.row_count_target = dict(target)
+            self.row_max_pk_source = dict(source_max_pk or {})
+            self.row_max_pk_target = dict(target_max_pk or {})
+            self.row_counts_fetched_at = fetched_at
+
+    def set_replace_targets(self, names: frozenset[str]) -> None:
+        """Record the non-empty target tables to replace on the next run."""
+        with self._lock:
+            self._replace_targets = names
+
+    @property
+    def replace_targets(self) -> frozenset[str]:
+        """Return the target tables that would be dropped & recreated."""
+        with self._lock:
+            return self._replace_targets
+
+    def set_selection(self, selection: TableSelection) -> None:
+        """Replace the table selection for the sub-flow (marks it user-touched)."""
+        with self._lock:
+            self.selection = selection
+            self.selection_touched = True
+
+    def set_accept_quarantined_rows(self, accepted: bool) -> None:
+        """Record whether permanently-quarantined rows are accepted (UI thread)."""
+        with self._lock:
+            self.accept_quarantined_rows = accepted
+
+    def set_active_substep(self, substep: Optional[str]) -> None:
+        """Record the active Prerequisites/Full Load/CDC sub-step (UI thread).
+
+        ``None`` clears the explicit choice so the next render derives a sensible
+        default for the current migration type/job state.
+        """
+        self.active_substep = substep
+
+    def bind_session(self, session: object) -> None:
+        """Bind the SessionConnectionState so mode/infra-inputs read-through to it.
+
+        The Migration plan step chooses the mode early and stores it on the
+        session; binding here makes ``migration_type`` and ``cdc_infra_inputs``
+        authoritative from the session while keeping the local fields as a
+        fallback when no session is bound (unit tests, legacy call sites).
+        """
+        self._session = session
+
+    @property
+    def migration_type(self) -> "MigrationType":
+        """The selected migration type (read-through to the bound session)."""
+        session = self._session
+        if session is not None:
+            try:
+                return session.migration_type
+            except Exception:  # noqa: BLE001 - fall back to the local value
+                pass
+        return self._migration_type
+
+    @migration_type.setter
+    def migration_type(self, value: "MigrationType") -> None:
+        self._migration_type = value
+        session = self._session
+        if session is not None:
+            try:
+                session.set_migration_type(value)
+            except Exception:  # noqa: BLE001 - local value still updated
+                pass
+
+    def set_migration_type(self, migration_type: "MigrationType") -> None:
+        """Record the user's Data Migration type selection (UI thread)."""
+        self.migration_type = migration_type  # routes through the property setter
+
+    def set_prereq_report(
+        self, mode: MigrationMode, report: PrerequisiteReport
+    ) -> None:
+        """Record the latest prerequisite report for ``mode``."""
+        with self._lock:
+            self._prereq_reports[mode] = report
+
+    def get_prereq_report(self, mode: MigrationMode) -> Optional[PrerequisiteReport]:
+        """Return the last prerequisite report for ``mode``, if any."""
+        with self._lock:
+            return self._prereq_reports.get(mode)
+
+    def set_prereq_running(self, mode: MigrationMode) -> None:
+        """Mark ``mode``'s prerequisite checks as running (for live feedback)."""
+        with self._lock:
+            self._prereq_running.add(mode)
+
+    def clear_prereq_running(self, mode: MigrationMode) -> None:
+        """Clear the running marker for ``mode``'s prerequisite checks."""
+        with self._lock:
+            self._prereq_running.discard(mode)
+
+    def is_prereq_running(self, mode: MigrationMode) -> bool:
+        """Return whether ``mode``'s prerequisite checks are currently running."""
+        with self._lock:
+            return mode in self._prereq_running
+
+    def set_error(self, message: str) -> None:
+        """Record a failure message for display."""
+        with self._lock:
+            self._error = message
+
+    @property
+    def error(self) -> Optional[str]:
+        """Return the last failure message, if any."""
+        with self._lock:
+            return self._error
+
+    def clear_outputs(self) -> None:
+        """Discard the previous error before a (re-)run."""
+        with self._lock:
+            self._error = None
+
+
+@dataclass
+class DataMigrationStore:
+    """Process-memory map of session id to :class:`DataMigrationState`.
+
+    Mirrors :class:`~dsql_migrator.ui.evaluation.EvaluationStore`: each UI session
+    sees only its own state and nothing is persisted to disk.
+    """
+
+    _states: dict[str, DataMigrationState] = field(default_factory=dict)
+
+    def get_or_create(self, session_id: str) -> DataMigrationState:
+        """Return the state for ``session_id``, creating an empty one if needed."""
+        state = self._states.get(session_id)
+        if state is None:
+            state = DataMigrationState()
+            self._states[session_id] = state
+        return state
+
+    def get(self, session_id: str) -> Optional[DataMigrationState]:
+        """Return the state for ``session_id``, or ``None`` if absent."""
+        return self._states.get(session_id)
+
+    def clear(self, session_id: Optional[str]) -> None:
+        """Remove the state for ``session_id`` (no-op if absent)."""
+        if session_id is None:
+            return
+        self._states.pop(session_id, None)
+
+    def reset_in_place(self, session_id: Optional[str]) -> None:
+        """Reset the state WITHOUT replacing the object (no-op if absent).
+
+        The workflow screen captures this state object in its builder closures at
+        build time, so popping + recreating would orphan the captured reference.
+        Re-initialising the SAME instance keeps every closure on the live object.
+        The session binding (set once at build time via ``bind_session``, not
+        per render) is preserved across the reset so ``migration_type`` keeps
+        reading through to the live session.
+        """
+        if session_id is None:
+            return
+        state = self._states.get(session_id)
+        if state is not None:
+            bound = getattr(state, "_session", None)
+            state.__init__()  # type: ignore[misc]  # re-run init on the same object
+            if bound is not None:
+                state.bind_session(bound)

@@ -1,0 +1,62 @@
+{
+  "tables": [
+    {
+      "name": "users",
+      "columns": [
+        {"name": "id", "mysql_type": "INT UNSIGNED", "nullable": false, "default": null, "collation": null},
+        {"name": "is_active", "mysql_type": "TINYINT(1)", "nullable": false, "default": null, "collation": null},
+        {"name": "email", "mysql_type": "VARCHAR(255)", "nullable": false, "default": null, "collation": "utf8mb4_general_ci"},
+        {"name": "status", "mysql_type": "ENUM('active','inactive','pending')", "nullable": false, "default": null, "collation": null},
+        {"name": "roles", "mysql_type": "SET('admin','user')", "nullable": true, "default": null, "collation": null},
+        {"name": "balance", "mysql_type": "BIGINT UNSIGNED", "nullable": false, "default": null, "collation": null},
+        {"name": "created_at", "mysql_type": "DATETIME", "nullable": false, "default": null, "collation": null},
+        {"name": "avatar", "mysql_type": "BLOB", "nullable": true, "default": null, "collation": null},
+        {"name": "metadata", "mysql_type": "JSON", "nullable": true, "default": null, "collation": null}
+      ],
+      "primary_key": ["id"],
+      "indexes": [
+        {"name": "uq_users_email", "columns": ["email"], "unique": true}
+      ],
+      "foreign_keys": [],
+      "auto_increment_column": "id",
+      "partitioned": false
+    },
+    {
+      "name": "orders",
+      "columns": [
+        {"name": "id", "mysql_type": "INT UNSIGNED", "nullable": false, "default": null, "collation": null},
+        {"name": "user_id", "mysql_type": "INT UNSIGNED", "nullable": false, "default": null, "collation": null},
+        {"name": "total", "mysql_type": "BIGINT UNSIGNED", "nullable": false, "default": null, "collation": null},
+        {"name": "placed_at", "mysql_type": "DATETIME", "nullable": false, "default": null, "collation": null}
+      ],
+      "primary_key": ["id"],
+      "indexes": [
+        {"name": "idx_orders_user", "columns": ["user_id"], "unique": false}
+      ],
+      "foreign_keys": [
+        {"name": "fk_orders_user", "columns": ["user_id"], "referenced_table": "users", "referenced_columns": ["id"]}
+      ],
+      "auto_increment_column": "id",
+      "partitioned": false
+    },
+    {
+      "name": "events",
+      "columns": [
+        {"name": "event_name", "mysql_type": "VARCHAR(100)", "nullable": false, "default": null, "collation": null},
+        {"name": "payload", "mysql_type": "JSON", "nullable": true, "default": null, "collation": null}
+      ],
+      "primary_key": [],
+      "indexes": [],
+      "foreign_keys": [],
+      "auto_increment_column": null,
+      "partitioned": false
+    }
+  ],
+  "views": [],
+  "triggers": [
+    {"name": "trg_users_audit", "object_type": "TRIGGER"}
+  ],
+  "routines": [
+    {"name": "sp_recalc_totals", "object_type": "ROUTINE"}
+  ]
+}
