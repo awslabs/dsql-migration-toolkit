@@ -27,8 +27,10 @@ replication; otherwise Full Load alone is simpler and cheaper.
 ## 9.2 A recommended end-to-end flow
 
 1. **Connect** to source (read-only) and target (DSQL, IAM-token).
-2. **Migration plan** — choose Full load only / CDC only / Full load + CDC. This
-   decides the prerequisite checks and whether CDC infrastructure is provisioned.
+2. **Migration plan** — decide only **whether this migration uses CDC (yes/no)**.
+   That single choice decides whether CDC streaming infrastructure is provisioned
+   early; the finer split (Full load + CDC vs. CDC only) is picked later on the
+   Data Migration step, and the choice is reversible.
 3. **Evaluation** — read the compatibility report. Resolve every **UNSUPPORTED**
    item (PK, triggers, routines, spatial types, precision > 38, oversized LOBs)
    and decide each **MANUAL** item (FK → app-side integrity, partitioning, etc.).

@@ -98,7 +98,7 @@ preliminary step:
 | Step | What it does |
 | --- | --- |
 | Connect | Enter source (RDS/Aurora MySQL) and target (Aurora DSQL) connection details. Credentials stay in per-session memory and are discarded when the session ends. |
-| 1. Migration plan | Choose the migration pattern (Full load only / CDC only / Full load + CDC) up front, which decides the prerequisite checks and whether streaming (CDC) infrastructure is provisioned. |
+| 1. Migration plan | Decide only **whether this migration uses CDC (yes/no)**. The only durable effect of this choice is whether streaming (CDC) infrastructure is provisioned early (yes → provisioned, no → Full Load only). The finer split — Full load + CDC vs. CDC only — is picked later on the Data Migration step, and the choice is reversible (you can start Full-load-only and add CDC afterwards). |
 | 2. Evaluation | Introspect source **and** target, produce a compatibility assessment report (`AUTO` / `MANUAL` / `UNSUPPORTED`) with conversion-effort estimates and target name-conflict detection, plus an optional AI-assisted strategy. |
 | 3. Schema Conversion | Browse source/target objects, view source-vs-converted DDL side by side, and apply converted DDL to the target (SKIP / REPLACE). |
 | 4. Data Migration | Run prerequisite checks and select tables, then **Full Load**: capture a consistency watermark, export the snapshot, and load into the target with per-table progress and a downloadable error log. Optionally extend to streaming **CDC** (separate cdc-stack). |

@@ -79,16 +79,16 @@ flowchart LR
 
 > 강제되는 한계의 전체 목록과 우회법은 사용자 매뉴얼 [6장 — 한계](docs/manual/ko/06-limitations.md)에 있습니다.
 
-## 워크플로
+## 워크플로우
 
-웹 UI는 **Connect**를 사전 단계로 한 6단계 워크플로를 안내합니다:
+웹 UI는 **Connect**를 사전 단계로 한 6단계 워크플로우를 안내합니다:
 
 `Connect → Migration plan → Evaluation → Schema Conversion → Data Migration → Validation → Cut over`
 
 | 단계 | 하는 일 |
 | --- | --- |
 | Connect | 소스(RDS/Aurora MySQL)와 타깃(Aurora DSQL) 연결 정보를 입력. 자격증명은 세션별 메모리에만 있다가 세션이 끝나면 폐기됩니다. |
-| 1. Migration plan | 마이그레이션 패턴(Full load only / CDC only / Full load + CDC)을 미리 선택 — 이것이 사전 점검 항목과 스트리밍(CDC) 인프라 프로비저닝 여부를 결정합니다. |
+| 1. Migration plan | 이 마이그레이션에 **CDC를 쓸지(예/아니오)** 만 결정합니다. 이 선택의 유일한 지속 효과는 스트리밍(CDC) 인프라를 미리 프로비저닝할지 여부입니다(예 → 프로비저닝, 아니오 → Full Load만). Full Load + CDC와 CDC only 중 무엇으로 할지 같은 세부 방식은 나중에 Data Migration 단계에서 고르며, 이 선택은 되돌릴 수 있습니다(Full load만으로 시작한 뒤 CDC를 추가 가능). |
 | 2. Evaluation | 소스 **와** 타깃을 introspect해 호환성 평가 리포트(`AUTO` / `MANUAL` / `UNSUPPORTED`)를 생성. 변환 작업량 추정, 타깃 이름 충돌 감지, 선택적 AI 보조 전략 포함. |
 | 3. Schema Conversion | 소스/타깃 객체를 탐색하고, 소스 vs 변환 DDL을 나란히 비교하며, 변환된 DDL을 타깃에 적용(SKIP / REPLACE). |
 | 4. Data Migration | 사전 점검을 실행하고 테이블을 선택한 뒤 **Full Load**: 일관성 워터마크를 캡처하고 스냅샷을 export해 타깃에 로드(테이블별 진행률 + 다운로드 가능한 에러 로그). 선택적으로 스트리밍 **CDC**(별도 cdc-stack)로 확장. |
@@ -296,7 +296,7 @@ cd mysql-dsql-migrator
 | `DSQL_MIGRATOR_AWS_PROFILE` | _(미설정)_ | 모든 AWS 클라이언트에 적용되는 선택적 단일 글로벌 AWS named profile. 미설정 시 표준 자격증명 체인으로 폴백. 프로필 이름(비밀 아님)만 저장됩니다. |
 | `DSQL_MIGRATOR_JOB_STATE_PATH` | `job_state.sqlite` | 로컬 job-state 저장소 경로. Full Load 작업 스냅샷(상태, 테이블별 진행률, 워터마크)이 여기에 영속화되고 재시작 시 다시 로드되어 중단된 작업을 재개할 수 있습니다(중단된 진행 중 테이블은 부분 재시도를 위해 실패로 표면화). |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_PATH` | `migration_activity.log` | 구조화된 활동 로그 파일 경로. 모든 마이그레이션 이벤트 — 연결 테스트, 평가 실행, 객체별 스키마 적용(CREATED/SKIPPED/FAILED), 테이블별 Full Load 결과(성공/실패와 상세), CDC 컨트롤 플레인 동작 — 이 UTC 타임스탬프 JSON 한 줄로 추가됩니다. UI("Download activity log")에서 다운로드해 전체 타임라인을 시간순으로 읽을 수 있고, 성공·실패 모두 기록됩니다(작업별 에러 로그는 실패 전용·행 단위 산출물로 별도 유지). 파일은 크기 제한·회전되어(세그먼트당 ~20 MB, 백업 4개, 총 ~100 MB) 무한히 커지지 않으며, 다운로드는 보존된 세그먼트를 시간순으로 이어 붙입니다. `DSQL_MIGRATOR_LOG_LEVEL=DEBUG`일 때 실패 이벤트는 전체 Python `stacktrace`(콜 스택만 — 행 값이나 자격증명은 절대 없음)를 추가로 담고, 기본 `INFO`에서는 생략됩니다. |
-| `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | 로컬 세션별 상태 저장소 경로. 각 세션의 비밀이 아닌 워크벤치 상태(워크플로 진행, 평가 결과, 생성된 객체, 마이그레이션 작업 연결)를 영속화해 재연결한 브라우저가 재시작 후에도 이어서 작업합니다. 브라우저 세션 id가 재시작 간에도 안정적이도록 `DSQL_MIGRATOR_STORAGE_SECRET`과 함께 사용하세요. |
+| `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | 로컬 세션별 상태 저장소 경로. 각 세션의 비밀이 아닌 워크벤치 상태(워크플로우 진행, 평가 결과, 생성된 객체, 마이그레이션 작업 연결)를 영속화해 재연결한 브라우저가 재시작 후에도 이어서 작업합니다. 브라우저 세션 id가 재시작 간에도 안정적이도록 `DSQL_MIGRATOR_STORAGE_SECRET`과 함께 사용하세요. |
 | `DSQL_MIGRATOR_STAGING_BUCKET` | _(미설정)_ | Full Load 스테이징용 선택적 S3 버킷. 설정 시 각 테이블을 스트리밍 멀티파트 업로드로 이 버킷에 export하고 `s3://` URI에서 로드하므로, 전체 테이블 CSV가 컨테이너 임시 디스크에 절대 떨어지지 않습니다(대형/TB 테이블용 확장 경로). 미설정 시 제한된 로컬 임시 CSV를 사용(로컬 개발 / 소형 테이블 전용). |
 | `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4` (≤16) | Full Load: 동시에 로드하는 테이블 수. 총 동시 DSQL 연결 ≈ 테이블 × 배치 병렬수. 클러스터 연결 쿼터 안에서 유지하세요. 매뉴얼의 [성능과 튜닝](docs/manual/ko/07-performance-and-tuning.md) 장 참고. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | Full Load: 테이블당 in-flight `INSERT ... ON CONFLICT` 배치 수. 높을수록 처리량↑ 그러나 핫 키 범위에서 OCC(40001) 충돌↑. |

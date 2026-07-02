@@ -25,8 +25,9 @@ CDC는 실제 구성 요소(MSK, MSK Connect, 싱크 커넥터)와 **배포 중 
 ## 9.2 권장 end-to-end 흐름
 
 1. **Connect** — 소스(읽기 전용)와 타깃(DSQL, IAM 토큰)에 연결.
-2. **Migration plan** — Full load only / CDC only / Full load + CDC 중 선택. 사전 점검 항목과
-   CDC 인프라 프로비저닝 여부가 여기서 결정됩니다.
+2. **Migration plan** — 이 마이그레이션에 **CDC를 쓸지(예/아니오)** 만 결정합니다. 이 선택은 CDC
+   스트리밍 인프라를 미리 프로비저닝할지 여부를 결정하며, Full Load + CDC와 CDC only 중 무엇으로 할지
+   같은 세부 방식은 나중에 Data Migration 단계에서 고릅니다(되돌릴 수 있음).
 3. **Evaluation** — 호환성 리포트를 읽습니다. 모든 **UNSUPPORTED** 항목(PK, 트리거, 루틴, 공간 타입,
    정밀도 > 38, 초대형 LOB)을 해결하고 각 **MANUAL** 항목(FK → 앱 측 무결성, 파티셔닝 등)을 결정.
    *건너뛰지 마세요* — "적재가 알 수 없이 실패했다"를 "그 객체는 변경이 필요한 줄 알았다"로 바꾸는 단계.
