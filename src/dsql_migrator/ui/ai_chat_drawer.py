@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import re
 import threading
 from typing import Callable, Optional
 
@@ -46,6 +47,40 @@ ChatStreamer = Callable[
     ["list[dict[str, str]]", Callable[[str], None]], ObjectGuidanceOutcome
 ]
 
+# A COMPLETE fenced code block: optional language tag, newline, body, closing fence.
+# Screen-agnostic (any language, not SQL) — the drawer stays generic. Only complete
+# blocks match, so a truncated/unterminated trailing fence is left as prose.
+_FENCE_RE = re.compile(r"```([\w+-]*)[ \t]*\r?\n(.*?)```", re.DOTALL)
+
+
+def split_markdown_segments(md: str) -> "list[tuple[str, str, str]]":
+    """Split markdown into ordered ("text"|"code", body, language) segments.
+
+    Used to render a finished assistant reply so each fenced code block becomes its
+    own component (with a per-block copy button) while surrounding prose stays
+    markdown. Generic: matches any language tag (or none), never SQL-specific, so
+    the shared drawer keeps no screen knowledge. An unterminated trailing fence is
+    not matched and therefore falls through as text (no content is dropped). Pure
+    and deterministic. Returns a single ("text", md, "") segment when there are no
+    complete code blocks.
+    """
+    segments: list[tuple[str, str, str]] = []
+    pos = 0
+    for m in _FENCE_RE.finditer(md or ""):
+        if m.start() > pos:
+            segments.append(("text", md[pos : m.start()], ""))
+        segments.append(("code", m.group(2), (m.group(1) or "").strip()))
+        pos = m.end()
+    tail = (md or "")[pos:]
+    if tail or not segments:
+        segments.append(("text", tail, ""))
+    return segments
+
+
+def markdown_has_code_block(md: str) -> bool:
+    """True when ``md`` contains at least one COMPLETE fenced code block."""
+    return _FENCE_RE.search(md or "") is not None
+
 
 def chat_turns_remaining(
     messages: "list[dict[str, str]]", *, max_turns: int = MAX_CHAT_TURNS
@@ -64,13 +99,22 @@ def build_chat_drawer(ui: object) -> Callable[..., None]:
     """Build the shared chat drawer chrome once; return an ``open_chat`` opener.
 
     ``open_chat(*, title, subtitle, first_question, streamer, footer_label=None,
-    footer_action=None)`` resets the transcript and starts a fresh conversation:
-    it asks ``first_question`` automatically, then lets the user ask follow-ups
-    via the composer (Enter or Send), each answered by ``streamer`` with the full
-    running transcript so the model keeps context. When ``footer_action`` is
-    given, each available assistant reply shows a ``footer_label`` button that
-    calls ``footer_action(markdown)`` (e.g. to adopt the reply's SQL).
+    footer_action=None, footer_visible=None)`` resets the transcript and starts a
+    fresh conversation: it asks ``first_question`` automatically, then lets the user
+    ask follow-ups via the composer (Enter or Send), each answered by ``streamer``
+    with the full running transcript so the model keeps context. When
+    ``footer_action`` is given, each assistant reply shows a ``footer_label`` button
+    that calls ``footer_action(markdown)`` (e.g. to adopt the reply's SQL). An
+    optional ``footer_visible(markdown) -> bool`` predicate gates that button per
+    reply — the button is shown only when it returns True (e.g. hide "Test rewrite
+    on target" when the reply proposes no runnable SQL). Returns a ``send(text)``
+    callable to drive a follow-up turn programmatically.
     """
+    # "Sticky bottom" state: while a reply streams we only auto-scroll if the user
+    # is already near the bottom, so scrolling UP to read earlier text is not fought
+    # by every stream tick. Updated by the scroll area's on_scroll below; starts
+    # True so a fresh conversation follows the first reply.
+    _scroll_state: dict[str, bool] = {"at_bottom": True}
     with ui.dialog().props("position=right persistent maximized=false") as dialog:  # type: ignore[attr-defined]
         # Wrap long content (code lines, unbroken identifiers) inside the chat
         # bubbles so the drawer never grows a horizontal/bottom scrollbar.
@@ -90,13 +134,17 @@ def build_chat_drawer(ui: object) -> Callable[..., None]:
             ".dsql-chat-md h2 { font-size: 1rem; }"
             ".dsql-chat-md h3, .dsql-chat-md h4, .dsql-chat-md h5, "
             ".dsql-chat-md h6 { font-size: 0.9rem; }"
-            # User bubbles render Markdown on a dark indigo background; give their
-            # code/plan blocks a light panel with dark text so SQL stays readable
-            # (default code styling would be white-on-indigo = invisible).
-            ".dsql-chat-user pre, .dsql-chat-user code { "
-            "background: rgba(255,255,255,0.95); color: #1e293b; "
-            "border-radius: 6px; padding: 1px 4px; }"
-            ".dsql-chat-user pre { padding: 8px 10px; margin: 4px 0; }"
+            # A short typed follow-up renders on a solid indigo bubble
+            # (.dsql-chat-user); give its inline code a light panel with dark text so
+            # it stays readable (default code styling would be white-on-indigo =
+            # invisible). Rich user turns (with code blocks) use the soft light
+            # bubble instead and get the neutral panel below.
+            ".dsql-chat-user code { background: rgba(255,255,255,0.95); "
+            "color: #1e293b; border-radius: 6px; padding: 1px 4px; }"
+            # Code/plan blocks in any chat bubble: a calm neutral panel, subtle
+            # border, comfortable padding — readable without shouting.
+            ".dsql-chat-md pre { background: #f8fafc; border: 1px solid #e2e8f0; "
+            "color: #1e293b; border-radius: 8px; padding: 8px 10px; margin: 4px 0; }"
         )
         with ui.card().classes(  # type: ignore[attr-defined]
             "full-height column no-wrap q-pa-none bg-gray-50"
@@ -116,7 +164,11 @@ def build_chat_drawer(ui: object) -> Callable[..., None]:
                 ui.button(icon="close", on_click=dialog.close).props(  # type: ignore[attr-defined]
                     "flat dense round"
                 ).tooltip("Close")
-            scroll = ui.scroll_area().classes("col").style("width: 100%")  # type: ignore[attr-defined]
+            scroll = ui.scroll_area(  # type: ignore[attr-defined]
+                on_scroll=lambda e: _scroll_state.__setitem__(
+                    "at_bottom", (e.vertical_percentage or 0) >= 0.95
+                )
+            ).classes("col").style("width: 100%")
             with scroll:  # type: ignore[attr-defined]
                 convo = ui.column().classes("w-full gap-3 q-pa-md")  # type: ignore[attr-defined]
             with ui.column().classes(  # type: ignore[attr-defined]
@@ -144,6 +196,7 @@ def build_chat_drawer(ui: object) -> Callable[..., None]:
         "streamer": None,
         "footer_label": None,
         "footer_action": None,
+        "footer_visible": None,
     }
 
     def _apply_composer_state() -> None:
@@ -173,9 +226,15 @@ def build_chat_drawer(ui: object) -> Callable[..., None]:
         conv["busy"] = busy
         _apply_composer_state()
 
-    def _autoscroll() -> None:
+    def _autoscroll(force: bool = False) -> None:
+        # Only follow the stream to the bottom when the user is already there
+        # (sticky bottom) — unless ``force`` (a user action, e.g. sending a turn),
+        # which should always reveal the newest message. A short smooth glide reads
+        # more naturally than an instant jump on every stream tick.
+        if not force and not _scroll_state.get("at_bottom", True):
+            return
         try:
-            scroll.scroll_to(percent=1.0, duration=0.0)  # type: ignore[attr-defined]
+            scroll.scroll_to(percent=1.0, duration=0.15)  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001
             pass
 
@@ -183,14 +242,26 @@ def build_chat_drawer(ui: object) -> Callable[..., None]:
         with convo:  # type: ignore[attr-defined]
             with ui.row().classes("w-full justify-end"):  # type: ignore[attr-defined]
                 # Render as Markdown (not a plain label) so fenced ```sql / plan
-                # code blocks in a turn — e.g. the re-test result the screen feeds
-                # back — show as readable monospace blocks instead of literal
-                # backticks. The white-on-indigo bubble styling is preserved; the
-                # dsql-chat-md rules keep long lines wrapped inside the bubble.
-                ui.markdown(text).classes(  # type: ignore[attr-defined]
-                    "text-sm text-white bg-indigo-600 rounded-2xl rounded-tr-sm "
-                    "px-3 py-2 dsql-chat-md dsql-chat-user"
-                ).style("max-width: 85%; overflow-wrap: anywhere")
+                # code blocks show as readable monospace instead of literal backticks.
+                # A short typed follow-up stays the compact solid-indigo pill; a rich
+                # turn that carries code/plan blocks (e.g. the re-test result the
+                # screen feeds back) uses a SOFT light bubble instead — a big solid
+                # dark-indigo block wrapping a bright code panel reads heavy and
+                # unnatural. Both are right-aligned so they still read as "from you".
+                has_code = "```" in text
+                if has_code:
+                    classes = (
+                        "text-sm text-gray-800 bg-indigo-50 border border-indigo-100 "
+                        "rounded-2xl rounded-tr-sm px-3 py-2 dsql-chat-md"
+                    )
+                    style = "max-width: 92%; overflow-wrap: anywhere"
+                else:
+                    classes = (
+                        "text-sm text-white bg-indigo-600 rounded-2xl rounded-tr-sm "
+                        "px-3 py-2 dsql-chat-md dsql-chat-user"
+                    )
+                    style = "max-width: 85%; overflow-wrap: anywhere"
+                ui.markdown(text).classes(classes).style(style)  # type: ignore[attr-defined]
 
     def _make_copy(state: dict, lock: "threading.Lock") -> Callable[[], object]:
         async def do_copy() -> None:
@@ -227,6 +298,10 @@ def build_chat_drawer(ui: object) -> Callable[..., None]:
         messages_snapshot = [dict(m) for m in conv["messages"]]  # type: ignore[attr-defined]
         footer_label = conv["footer_label"]
         footer_action = conv["footer_action"]
+        footer_visible = conv["footer_visible"]
+        # Posting a turn is a user action — always reveal it and re-arm sticky
+        # bottom so the incoming reply is followed until the user scrolls up.
+        _scroll_state["at_bottom"] = True
         _user_bubble(text)
 
         state: dict[str, object] = {"text": "", "done": False, "outcome": None}
@@ -282,7 +357,7 @@ def build_chat_drawer(ui: object) -> Callable[..., None]:
                         )
                         meta = ui.label("").classes("text-xs text-gray-400")  # type: ignore[attr-defined]
 
-        _autoscroll()
+        _autoscroll(force=True)  # reveal the just-posted turn + typing indicator
         threading.Thread(target=worker, daemon=True).start()
 
         timer_box: dict[str, object] = {}
@@ -324,7 +399,30 @@ def build_chat_drawer(ui: object) -> Callable[..., None]:
                 if msgs and msgs[-1].get("role") == "user":  # type: ignore[attr-defined]
                     msgs.pop()  # type: ignore[attr-defined]
             elif isinstance(outcome, ObjectGuidanceOutcome) and outcome.available:
-                answer_md.set_content(outcome.markdown)  # type: ignore[attr-defined]
+                # Finalize the reply. This done branch runs exactly once (the timer
+                # is already deactivated above), so it is safe to build per-block
+                # controls here — unlike the streaming ticks, which replace the whole
+                # markdown subtree every ~120ms. When the reply contains a fenced code
+                # block, re-render it as segments: prose stays ui.markdown, and each
+                # code block becomes a ui.code, which ships its OWN copy button (so
+                # the recommended query is one click to copy). Text-only replies keep
+                # the simple single-markdown path (no churn).
+                if markdown_has_code_block(outcome.markdown):
+                    answer_md.set_content("")  # type: ignore[attr-defined]
+                    with bubble:  # type: ignore[attr-defined]
+                        for kind, body, lang in split_markdown_segments(
+                            outcome.markdown
+                        ):
+                            if kind == "code":
+                                ui.code(  # type: ignore[attr-defined]
+                                    body.rstrip("\n"), language=lang or None
+                                ).classes("w-full dsql-chat-md")
+                            elif body.strip():
+                                ui.markdown(body).classes(  # type: ignore[attr-defined]
+                                    "text-sm w-full dsql-chat-md"
+                                )
+                else:
+                    answer_md.set_content(outcome.markdown)  # type: ignore[attr-defined]
                 meta.set_text(  # type: ignore[attr-defined]
                     f"Generated by model {outcome.model_id}"
                     if outcome.model_id
@@ -333,8 +431,19 @@ def build_chat_drawer(ui: object) -> Callable[..., None]:
                 conv["messages"].append(  # type: ignore[attr-defined]
                     {"role": "assistant", "text": outcome.markdown}
                 )
-                # Optional screen-supplied action on the reply (e.g. adopt SQL).
-                if footer_action is not None and footer_label:
+                # Optional screen-supplied action on the reply (e.g. adopt SQL, or
+                # re-test a rewrite). Only shown when there IS an action AND — if the
+                # screen supplied a ``footer_visible`` predicate — that predicate says
+                # this particular reply is actionable. This lets the AI DBA hide
+                # "Test rewrite on target" when a reply proposes no runnable SQL
+                # (e.g. it concluded the query is already efficient).
+                show_footer = footer_action is not None and bool(footer_label)
+                if show_footer and callable(footer_visible):
+                    try:
+                        show_footer = bool(footer_visible(outcome.markdown))
+                    except Exception:  # noqa: BLE001 - a bad predicate must not break the reply
+                        show_footer = False
+                if show_footer:
                     answer = outcome.markdown
 
                     async def _do_footer(_e=None, _answer=answer) -> None:
@@ -375,12 +484,14 @@ def build_chat_drawer(ui: object) -> Callable[..., None]:
         streamer: ChatStreamer,
         footer_label: Optional[str] = None,
         footer_action: Optional[Callable[[str], None]] = None,
+        footer_visible: Optional[Callable[[str], bool]] = None,
     ) -> Callable[[str], None]:
         conv["messages"] = []
         conv["busy"] = False
         conv["streamer"] = streamer
         conv["footer_label"] = footer_label
         conv["footer_action"] = footer_action
+        conv["footer_visible"] = footer_visible
         title_label.set_text(title)  # type: ignore[attr-defined]
         subtitle_label.set_text(subtitle)  # type: ignore[attr-defined]
         convo.clear()  # type: ignore[attr-defined]

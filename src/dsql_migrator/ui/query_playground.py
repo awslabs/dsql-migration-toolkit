@@ -699,6 +699,10 @@ def build_query_playground_screen(
                     ),
                     footer_label="Test rewrite on target",
                     footer_action=_retest_rewrite,
+                    # Only offer the re-test when the reply actually contains a
+                    # runnable rewritten query — a reply that just concludes "this
+                    # is already efficient" (no ```sql SELECT) gets no button.
+                    footer_visible=lambda md: extract_sql_from_reply(md) is not None,
                 )
 
             with ui.row().classes("items-center gap-2"):
