@@ -22,6 +22,11 @@ mysql-dsql-migrator = "dsql_migrator.cli.main:main"
 [dependency-groups]
 dev = [
     "pytest==9.0.3",
+    # Playwright core for browser E2E of the NiceGUI UI. We use the sync/async
+    # API directly (not the pytest-playwright plugin, which pins pytest<9 and
+    # would conflict with pytest 9.0.3 above). Browser binaries are shared with
+    # the existing Node install under ~/Library/Caches/ms-playwright.
+    "playwright==1.61.0",
 ]
 
 [build-system]
@@ -33,6 +38,12 @@ packages = ["src/dsql_migrator"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The default run is the fast unit suite. Browser E2E (tests/e2e) launches a real
+# app server + Chromium and is heavier / environment-dependent, so it is opt-in:
+#   .venv/bin/python -m pytest -m e2e        # run the browser E2E suite
+#   .venv/bin/python -m pytest               # unit suite only (E2E deselected)
+addopts = "-m 'not e2e'"
 markers = [
     "integration: end-to-end tests that require external infrastructure (a live MySQL and/or a PostgreSQL 16 container). Skipped unless RUN_INTEGRATION_TESTS=1 and the dependency is reachable.",
+    "e2e: browser end-to-end tests (Playwright + a real app server). Opt-in via '-m e2e'; needs the 'playwright' dev dep + its Chromium build.",
 ]

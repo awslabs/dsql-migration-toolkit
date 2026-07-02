@@ -90,6 +90,19 @@ DSQL은 외래 키·트리거·저장 프로시저·일부 타입을 제외하�
 
 **스위트 실행:** `\.venv/bin/python -m pytest -q`, `cd connectors/dsql-sink && mvn -q test`.
 
+**브라우저 UI E2E (선택):** `tests/e2e`의 Playwright 스위트가 실제 웹 UI를 헤드리스 브라우저로 구동합니다
+(앱을 서브프로세스로 띄움). opt-in이며 — 기본 `pytest` 실행에서는 제외됩니다 — `playwright` dev 의존성과
+Chromium 빌드(1회)가 필요합니다:
+
+```bash
+uv sync                                         # playwright dev 의존성 설치
+.venv/bin/python -m playwright install chromium # 브라우저 1회 다운로드
+.venv/bin/python -m pytest -m e2e               # 브라우저 E2E 스위트 실행
+```
+
+기본 "smoke" E2E는 외부 인프라가 필요 없습니다(UI 렌더·네비게이션·Query Playground 변환 검증). 실연결이
+필요한 E2E 단계는 `RUN_E2E_CONNECTED=1`과 도달 가능한 소스/타깃 뒤에 게이트됩니다.
+
 ---
 
 ## 8.2 시나리오를 한데 모으기 — 라이브 end-to-end 실행

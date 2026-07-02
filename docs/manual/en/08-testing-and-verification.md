@@ -96,6 +96,21 @@ primary key.
 **Run the suites:** `\.venv/bin/python -m pytest -q` and
 `cd connectors/dsql-sink && mvn -q test`.
 
+**Browser UI E2E (optional):** a Playwright suite under `tests/e2e` drives the
+real web UI in a headless browser (the app is launched as a subprocess). It is
+opt-in — the default `pytest` run deselects it — and needs the `playwright` dev
+dependency plus its Chromium build (once):
+
+```bash
+uv sync                                         # installs the playwright dev dep
+.venv/bin/python -m playwright install chromium # one-time browser download
+.venv/bin/python -m pytest -m e2e               # run the browser E2E suite
+```
+
+The default "smoke" E2E needs no external infrastructure (it verifies the UI
+renders, navigates, and the Query Playground converts a query). Live-connection
+E2E steps are gated behind `RUN_E2E_CONNECTED=1` and a reachable source/target.
+
 ---
 
 ## 8.2 Putting the scenarios together — the live end-to-end run

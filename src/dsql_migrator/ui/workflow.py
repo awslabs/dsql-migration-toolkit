@@ -1286,9 +1286,12 @@ def build_workflow_sidebar(
 
     def select(view: object) -> None:
         # An optional tool (string key, not a WorkflowStep) is reachable once the
-        # connections are unlocked, in any order -- it has no workflow gating.
+        # connections are unlocked, in any order -- it has no workflow gating. The
+        # dev escape hatch (DSQL_MIGRATOR_DEV_UNLOCK_STEPS) opens ANY step for local
+        # UI review, so it must open optional tools too (they were previously the
+        # one exception, which also blocked opening e.g. Query validation offline).
         if isinstance(view, str) and view in tools:
-            if not state.workflow_unlocked():
+            if not state.workflow_unlocked() and not _dev_unlock_steps():
                 ui.notify(
                     "Connect and verify the source and target connections first.",
                     type="warning",
