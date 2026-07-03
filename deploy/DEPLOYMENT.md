@@ -287,9 +287,20 @@ aws cloudformation deploy \
     ServiceSubnetIds="$SERVICE_SUBNET_IDS" \
     CertificateArn="$CERTIFICATE_ARN" \
     DsqlClusterArn="$DSQL_CLUSTER_ARN" \
-    SourceDbSecurityGroupId="$SOURCE_DB_SG"
+    SourceDbSecurityGroupId="$SOURCE_DB_SG" \
+    EnableAiAssist=true \
+    BedrockRegion="$AWS_REGION"
+    # BedrockModelId=us.anthropic.claude-sonnet-4-6   # optional — default shown; see §8
     # SourceSecretArn=...   # optional — only to reuse an existing source secret
 ```
+
+> **AI assist (recommended).** `EnableAiAssist=true` + `BedrockRegion` turns on the
+> AI DBA for Schema Conversion and the Query Playground — an opt-in, advisory-only
+> feature scoped to `bedrock:InvokeModel` for the selected model. You **must still
+> enable model access** for `BedrockModelId` (default
+> `us.anthropic.claude-sonnet-4-6`) in the Bedrock console for that region, and the
+> task needs egress to the Bedrock endpoint. Omit both to deploy without AI (the
+> deterministic path is unchanged). Full details + model choices in §8.
 
 For a **Prod profile**, add: `EnableCognitoAuth=true`, `CognitoDomainPrefix=...`,
 `AppDomainName=...` (and optionally `ContainerImageUri=...` for your own image).

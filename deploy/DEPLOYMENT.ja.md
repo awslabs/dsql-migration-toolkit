@@ -294,9 +294,20 @@ aws cloudformation deploy \
     ServiceSubnetIds="$SERVICE_SUBNET_IDS" \
     CertificateArn="$CERTIFICATE_ARN" \
     DsqlClusterArn="$DSQL_CLUSTER_ARN" \
-    SourceDbSecurityGroupId="$SOURCE_DB_SG"
+    SourceDbSecurityGroupId="$SOURCE_DB_SG" \
+    EnableAiAssist=true \
+    BedrockRegion="$AWS_REGION"
+    # BedrockModelId=us.anthropic.claude-sonnet-4-6   # オプション — デフォルト値を表示; §8 参照
     # SourceSecretArn=...   # オプション — 既存のソースシークレットを再利用する場合のみ
 ```
+
+> **AI アシスト（推奨）。** `EnableAiAssist=true` + `BedrockRegion` で Schema
+> Conversion と Query Playground の AI DBA を有効にします — オプトインかつ助言専用の
+> 機能で、選択したモデルに対する `bedrock:InvokeModel` のみにスコープされます。
+> `BedrockModelId`（デフォルト `us.anthropic.claude-sonnet-4-6`）について、その
+> リージョンの Bedrock コンソールで**モデルアクセスを有効化**する必要があり、タスクが
+> Bedrock エンドポイントへ egress できる必要があります。両方省略すれば AI なしで
+> デプロイされます（決定論的パスは変わりません）。詳細とモデル選択は §8 を参照。
 
 **Prod プロファイル**の場合は次を追加します: `EnableCognitoAuth=true`、
 `CognitoDomainPrefix=...`、`AppDomainName=...`（および自前イメージの場合は任意で
