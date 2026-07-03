@@ -89,6 +89,13 @@ over**가 UI에 나타나며 애플리케이션을 MySQL에서 DSQL로 전환하
 (CDC drain vs Full Load freeze)와 롤백 앵커는 [결론](10-conclusion.md)의 권장 end-to-end 흐름을
 참고하세요.
 
+> **명령줄에서 검증 (선택).** 이 내장 Validation 외에도, 읽기 전용 CLI 스크립트 2개로 셸에서
+> 스팟 체크할 수 있습니다(종료 코드로 스크립트 게이팅 가능): `scripts/compare_rows.py`(테이블별 행
+> 수 / PK 범위 확인, CDC 중 타깃 수렴을 지켜보는 `--watch N`)와 `scripts/cdc_consistency_check.py`
+> (전체 PK 대조 — 타깃에 **누락**되거나 **잉여**인 정확한 PK를 짚어 주는 전환 전 제로-데이터-손실
+> 증명). 자세한 내용은 [`scripts/README.md`](../../../scripts/README.md) 참고. 권위 있는 go/no-go는
+> 여전히 이 내장 Validation입니다(체크섬·드리프트 귀속까지 수행).
+
 ---
 
 **다음:** [6. 한계 →](06-limitations.md)

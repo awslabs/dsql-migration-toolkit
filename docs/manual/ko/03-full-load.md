@@ -158,6 +158,12 @@ quarantine됐는지 정확히 나열합니다.
 "실패 테이블 재시도" 경로는 실패 테이블만 대기 상태로 리셋하고, **원래 워터마크를 재사용**하며, 완료된
 테이블은 유지합니다 — 작업을 다시 하거나 CDC 핸드오프 지점을 잃지 않습니다.
 
+> **명령줄에서 Full Load 실행 (선택).** 동일한 벌크 로더를 CLI 스크립트로도 쓸 수 있습니다 —
+> `scripts/run_full_load.py`(먼저 계획 출력, 그다음 `--yes`; 선택적으로 `--clean`,
+> CDC 워터마크 캡처용 `--watermark-out`) — 웹 UI 없이 자동화나 TB급 실행에 유용합니다. 자세한 내용은
+> [`scripts/README.md`](../../../scripts/README.md) 참고. 소스는 읽기 전용, 로드는 UI와 똑같이
+> 멱등입니다.
+
 ---
 
 **다음:** [4. CDC와 DSQL 제약 →](04-cdc-and-dsql-constraints.md)

@@ -102,6 +102,16 @@ switching your application from MySQL to DSQL. See the recommended end-to-end fl
 in the [Conclusion](10-conclusion.md) for the cut-over sequence (CDC-drain vs
 Full-Load freeze) and the rollback anchor.
 
+> **Verify from the command line (optional).** Besides this built-in Validation,
+> two read-only CLI scripts let you spot-check from a shell (and gate a script on
+> their exit code): `scripts/compare_rows.py` (per-table row-count / PK-range check,
+> with `--watch N` to watch the target converge during CDC) and
+> `scripts/cdc_consistency_check.py` (full primary-key reconciliation that names the
+> exact PKs **missing** or **extra** on the target — the zero-data-loss proof before
+> cut-over). See [`scripts/README.md`](../../../scripts/README.md). This built-in
+> Validation step remains the authoritative go/no-go (it also runs checksums and
+> drift attribution).
+
 ---
 
 **Next:** [6. Limitations →](06-limitations.md)

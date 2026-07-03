@@ -176,6 +176,13 @@ The "retry failed tables" path resets only the failed tables to pending, **reuse
 the original watermark**, and keeps the completed tables — so you never redo work
 or lose the CDC handoff point.
 
+> **Run Full Load from the command line (optional).** The same bulk loader is
+> available as a CLI script — `scripts/run_full_load.py` (plan first, then `--yes`;
+> optional `--clean` and `--watermark-out` to capture the CDC watermark) — for
+> automation or a TB-scale run without the web UI. See
+> [`scripts/README.md`](../../../scripts/README.md); the source is read-only and the
+> load is idempotent, exactly as in the UI.
+
 ---
 
 **Next:** [4. CDC and DSQL constraints →](04-cdc-and-dsql-constraints.md)
