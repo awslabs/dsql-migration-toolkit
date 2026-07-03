@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.60
+
+### Changed
+
+- **Prerequisite checks can't be re-run while a Full Load is in progress.** You
+  could previously go back to the Prerequisites step and click "Check" mid-load.
+  It was harmless (the checks are read-only and never touch the running job — a
+  fresh result only applies to the *next* run), but pointless and confusing: a
+  newly-failing check would show a red "blocked" verdict while the load kept
+  running, and it added avoidable read load on the source. The Check button is now
+  disabled while a Full Load is IN_PROGRESS, with a short note explaining the
+  checks apply to the next run and don't affect the running load — matching how
+  the migration-type selector already locks during a run. Stop the load to re-run
+  checks.
+
 ## v0.1.59
 
 ### Changed

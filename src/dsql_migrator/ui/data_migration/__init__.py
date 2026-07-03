@@ -1100,6 +1100,7 @@ def build_data_migration_screen(
                         combined=(
                             migration_type is MigrationType.FULL_LOAD_AND_CDC
                         ),
+                        load_running=status is StepStatus.IN_PROGRESS,
                     )
                     with ui.row().classes("!flex w-full justify-end items-center"):
                         if guard_reason is None:
@@ -3301,6 +3302,7 @@ def _render_prerequisites_panel(
     mode: MigrationMode = MigrationMode.FULL_LOAD,
     *,
     combined: bool = False,
+    load_running: bool = False,
 ) -> None:
     """Render a mode's prerequisite check button and result panel (Req 5.10).
 
@@ -3313,6 +3315,13 @@ def _render_prerequisites_panel(
     ``mode`` (a superset of the Full Load checks), but the wording says "Full
     Load and CDC" and each result row is tagged with the phase that needs it, so
     the single run visibly covers both phases (no separate Full Load panel).
+
+    ``load_running`` is ``True`` while a Full Load is actively IN_PROGRESS. The
+    checks are read-only and never touch the running job, so re-running them
+    mid-load is harmless but pointless (the fresh result applies only to the NEXT
+    run, not the in-flight one) and adds avoidable source read load. When set, the
+    Check button is disabled with an explanatory notice, matching how the
+    migration-type selector locks during a run.
     """
     is_cdc = mode is MigrationMode.CDC
     if combined:
@@ -3348,8 +3357,25 @@ def _render_prerequisites_panel(
             "Checking…" if running else button_label,
             on_click=lambda: run_checks(mode),
         ).props("outline")
+        # Disable while the check itself runs, OR while a Full Load is in flight
+        # (a mid-load re-run is inert w.r.t. the running job and only adds source
+        # read load). The tooltip explains the load-running case.
         if running:
             check_btn.props("disable")
+        elif load_running:
+            check_btn.props("disable").tooltip(
+                "A Full Load is running — prerequisite checks are read-only and "
+                "apply to the NEXT run, not the one in progress. Stop the load "
+                "first to re-run checks."
+            )
+    # While a load runs, spell out that re-checking here won't affect it (the
+    # button is disabled above; this notice says why, so the disabled state isn't
+    # a mystery).
+    if load_running and not running:
+        ui.label(
+            "A Full Load is in progress. These checks apply to the next run — "
+            "they don't affect the running load."
+        ).classes("text-xs text-gray-400")
     # Immediate feedback directly below the button while a check runs, so the
     # click is acknowledged at once instead of seeming unresponsive.
     if running:
