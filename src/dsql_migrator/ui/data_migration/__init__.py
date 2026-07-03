@@ -1239,6 +1239,18 @@ def full_load_run_guard_reason(
     (re-)run button. This is what lets a reconnected user navigate Back to a
     finished Full Load and re-run it. A report that is present but failing still
     blocks, since that is a live signal worth surfacing.
+
+    The message distinguishes a *reconnected* user who had already cleared the
+    prerequisites (but hadn't started the load yet) from a first-time user who
+    never ran them. The persisted ``active_substep`` is the tell: the "Continue
+    to Full Load/CDC" button that advances it past ``"prerequisites"`` is only
+    reachable once the checks passed, and it survives a restart -- yet the report
+    itself does not. So ``report is None`` together with an advanced
+    ``active_substep`` (and no started run) means "reconnected, checks just need a
+    quick re-run", which we word accordingly instead of the blunt first-run
+    prompt. Either way the run stays gated until the read-only checks are re-run
+    (the connection was re-established on reconnect, so the old result can't be
+    trusted).
     """
     if inventory is None or not inventory.tables:
         return "Run Step 1 (Evaluation) first to introspect the source schema."
@@ -1246,6 +1258,12 @@ def full_load_run_guard_reason(
     if report is None:
         if has_run:
             return None
+        if getattr(state, "active_substep", None) in ("full_load", "cdc"):
+            return (
+                "Reconnected — re-run the prerequisite checks (Prerequisites "
+                "step) to resume. They're read-only and quick; your progress "
+                "wasn't lost, but the results aren't kept across an app restart."
+            )
         return "Run the prerequisite checks first (Prerequisites tab)."
     return prerequisite_block_reason(report)
 

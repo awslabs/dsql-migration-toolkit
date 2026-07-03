@@ -1326,6 +1326,27 @@ def test_full_load_run_guard_allows_rerun_when_already_run_without_report() -> N
     )
 
 
+def test_full_load_run_guard_reconnect_wording_when_checks_were_cleared() -> None:
+    # Reconnected session: the report isn't persisted, but the persisted
+    # active_substep proves the user had already advanced past Prerequisites
+    # (the "Continue" gate is only reachable once checks passed) and hadn't yet
+    # started the load (has_run stays False). The guard still blocks -- the
+    # read-only checks must re-run after a reconnect -- but the message is worded
+    # for the reconnect case, not the blunt first-run prompt.
+    state = DataMigrationState()
+    state.set_active_substep("full_load")
+    reason = full_load_run_guard_reason(state, _inventory())
+    assert reason is not None
+    assert "Reconnected" in reason
+    assert "read-only" in reason
+    # A first-time user (no advanced substep, no run) still gets the plain prompt.
+    fresh = DataMigrationState()
+    plain = full_load_run_guard_reason(fresh, _inventory())
+    assert plain is not None
+    assert "Reconnected" not in plain
+    assert "prerequisite checks" in plain
+
+
 def test_full_load_run_guard_still_blocks_failed_check_even_after_run() -> None:
     # has_run only excuses an ABSENT report (restore). A report that is present
     # and failing is a live signal and must still block, even mid-migration.

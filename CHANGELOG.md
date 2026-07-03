@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.46
+
+### Changed
+
+- **Clearer "re-run prerequisites" message after an app restart.** If you had
+  already cleared the Data Migration prerequisites but hadn't started the Full
+  Load yet, an app restart used to gate the run behind the same blunt "Run the
+  prerequisite checks first" prompt shown to a first-time user — reading as if
+  your progress was lost. The checks still must re-run (they're read-only, and
+  the source connection is re-established on reconnect so a stale result can't be
+  trusted), but the message now names the situation: "Reconnected — re-run the
+  prerequisite checks to resume. They're read-only and quick; your progress
+  wasn't lost, but the results aren't kept across an app restart." A genuine
+  first-time user still sees the original prompt. Detected from the persisted
+  active sub-step (only reachable once checks passed), so the two cases can't be
+  confused.
+
 ## v0.1.45
 
 ### Changed
