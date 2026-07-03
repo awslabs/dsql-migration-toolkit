@@ -650,89 +650,87 @@ def test_views_referencing_selects_only_dependent_views() -> None:
     assert _views_referencing(view_ddls, frozenset()) == []
 
 
-class _FakeViewApplier:
-    """Records drop / apply(REPLACE) calls for the dependent-view pre/post pass."""
+def _patch_view_ddl_calls(monkeypatch, migrator):
+    """Record the module-level drop_object / recreate_table calls the view pass
+    makes, and stub the connection factory so nothing touches a real DSQL.
 
-    def __init__(self) -> None:
-        self.dropped: list[str] = []
-        self.applied: list[str] = []
+    Patches the REAL functions the migrator calls (not a fake applier), so this
+    test exercises the actual construction path -- the gap that let a broken
+    ``SchemaApplier(...)`` slip through before (it required ``introspector``)."""
+    import dsql_migrator.ui.data_migration._engine as engine
 
-    def drop(self, ddl: str) -> None:
-        self.dropped.append(ddl)
+    dropped: list[str] = []
+    recreated: list[tuple] = []
+    monkeypatch.setattr(
+        engine.BatchedTableMigrator,
+        "_view_connection_factory",
+        lambda self: (lambda: object()),
+    )
+    monkeypatch.setattr(
+        "dsql_migrator.core.schema_applier.drop_object",
+        lambda ddl, *, connection_factory: dropped.append(ddl),
+    )
+    monkeypatch.setattr(
+        "dsql_migrator.core.schema_applier.recreate_table",
+        lambda schema_ddls, target_ddl, *, connection_factory: recreated.append(
+            (schema_ddls, target_ddl)
+        ),
+    )
+    return dropped, recreated
 
-    def apply(self, ddl: str, on_conflict, *, confirmed: bool = False) -> None:
-        self.applied.append(ddl)
 
-
-def test_migrator_predrops_and_recreates_dependent_views_on_replace() -> None:
+def _view_migrator(**overrides):
     import dataclasses
 
-    view_ddl = (
-        "CREATE VIEW shop.customer_order_summary AS SELECT * FROM orders"
-    )
-    inputs = dataclasses.replace(
-        _inputs(),
-        replace_tables=frozenset({"orders"}),
-        dependent_view_ddls={"shop.customer_order_summary": view_ddl},
-    )
-    migrator = BatchedTableMigrator(
-        inputs,
+    return BatchedTableMigrator(
+        dataclasses.replace(_inputs(), **overrides),
         exporter=_FakeExporter(),  # type: ignore[arg-type]
         watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
         importer_factory=lambda _inputs: _FakeImporter(),  # type: ignore[arg-type,return-value]
         table_recreator=lambda _t: [],
         target_counter=lambda _t: None,
     )
-    applier = _FakeViewApplier()
-    migrator._view_applier = lambda: applier  # type: ignore[assignment]
+
+
+def test_migrator_predrops_and_recreates_dependent_views_on_replace(monkeypatch) -> None:
+    view_ddl = "CREATE VIEW shop.customer_order_summary AS SELECT * FROM orders"
+    migrator = _view_migrator(
+        replace_tables=frozenset({"orders"}),
+        dependent_view_ddls={"shop.customer_order_summary": view_ddl},
+    )
+    dropped, recreated = _patch_view_ddl_calls(monkeypatch, migrator)
 
     migrator.predrop_dependent_views()
     migrator.recreate_dependent_views()
 
-    # The view that references the replaced 'orders' is dropped first, then
-    # recreated (REPLACE) after the load.
-    assert applier.dropped == [view_ddl]
-    assert applier.applied == [view_ddl]
+    # The view referencing the replaced 'orders' is dropped first (pre-pass), then
+    # recreated (DROP+CREATE, no schema DDLs) after the load.
+    assert dropped == [view_ddl]
+    assert recreated == [([], view_ddl)]
 
 
-def test_migrator_skips_view_pass_on_append_or_cdc() -> None:
-    import dataclasses
-
+def test_migrator_skips_view_pass_on_append_or_cdc(monkeypatch) -> None:
     view_ddl = "CREATE VIEW v AS SELECT * FROM orders"
-    common = dict(
-        exporter=_FakeExporter(),
-        watermark_capturer=_FakeWatermarkCapturer(_watermark()),
-        importer_factory=lambda _inputs: _FakeImporter(),
-        table_recreator=lambda _t: [],
-        target_counter=lambda _t: None,
-    )
+
     # Append run (no replace tables) -> no view drop/recreate even if views exist.
-    append = BatchedTableMigrator(
-        dataclasses.replace(
-            _inputs(), replace_tables=frozenset(), dependent_view_ddls={"v": view_ddl}
-        ),
-        **common,  # type: ignore[arg-type]
+    append = _view_migrator(
+        replace_tables=frozenset(), dependent_view_ddls={"v": view_ddl}
     )
-    a = _FakeViewApplier()
-    append._view_applier = lambda: a  # type: ignore[assignment]
+    dropped, recreated = _patch_view_ddl_calls(monkeypatch, append)
     append.predrop_dependent_views()
     append.recreate_dependent_views()
-    assert a.dropped == [] and a.applied == []
+    assert dropped == [] and recreated == []
 
     # CDC coexisting overrides DROP -> also no view pass.
-    cdc = BatchedTableMigrator(
-        dataclasses.replace(
-            _inputs(),
-            replace_tables=frozenset({"orders"}),
-            cdc_coexisting=True,
-            dependent_view_ddls={"v": view_ddl},
-        ),
-        **common,  # type: ignore[arg-type]
+    cdc = _view_migrator(
+        replace_tables=frozenset({"orders"}),
+        cdc_coexisting=True,
+        dependent_view_ddls={"v": view_ddl},
     )
-    c = _FakeViewApplier()
-    cdc._view_applier = lambda: c  # type: ignore[assignment]
+    dropped2, recreated2 = _patch_view_ddl_calls(monkeypatch, cdc)
     cdc.predrop_dependent_views()
-    assert c.dropped == []
+    cdc.recreate_dependent_views()
+    assert dropped2 == [] and recreated2 == []
 
 
 def test_reload_mode_drives_derived_replace_targets() -> None:

@@ -716,18 +716,32 @@ def _predrop_dependent_views(migrator: DataMigrator) -> None:
     """Call the migrator's dependent-view pre-drop, if it supports one.
 
     A no-op for a fake/older migrator without the method (tests) or an append run
-    (the method itself no-ops when nothing is being replaced).
+    (the method itself no-ops when nothing is being replaced). Any failure in this
+    optional pre-pass is swallowed (logged) rather than allowed to abort the whole
+    Full Load: if a view really still blocks a table's DROP, that surfaces as a
+    normal per-table failure the user can act on -- it must never wipe the run's
+    progress with an unhandled error.
     """
     hook = getattr(migrator, "predrop_dependent_views", None)
     if callable(hook):
-        hook()
+        try:
+            hook()
+        except Exception:  # noqa: BLE001 - optional pre-pass; never fail the run
+            _LOGGER.warning("Dependent-view pre-drop pass failed", exc_info=True)
 
 
 def _recreate_dependent_views(migrator: DataMigrator) -> None:
-    """Call the migrator's dependent-view recreate, if it supports one (else no-op)."""
+    """Call the migrator's dependent-view recreate, if it supports one (else no-op).
+
+    Best-effort post-pass: the tables/data are already loaded, so a failure here
+    is logged and swallowed rather than failing an otherwise-successful run.
+    """
     hook = getattr(migrator, "recreate_dependent_views", None)
     if callable(hook):
-        hook()
+        try:
+            hook()
+        except Exception:  # noqa: BLE001 - optional post-pass; never fail the run
+            _LOGGER.warning("Dependent-view recreate pass failed", exc_info=True)
 
 
 def run_full_load(
@@ -1265,10 +1279,12 @@ class BatchedTableMigrator:
         ddls = self._dependent_view_ddls_for_replace()
         if not ddls:
             return
-        applier = self._view_applier()
+        from dsql_migrator.core.schema_applier import drop_object
+
+        connect = self._view_connection_factory()
         for view_ddl in ddls:
             try:
-                applier.drop(view_ddl)
+                drop_object(view_ddl, connection_factory=connect)
             except Exception:  # noqa: BLE001 - best-effort; a real block surfaces on the table DROP
                 _LOGGER.warning("Could not pre-drop dependent view", exc_info=True)
 
@@ -1277,30 +1293,30 @@ class BatchedTableMigrator:
 
         Run-level post-pass: after the replace tables are reloaded, recreate the
         dependent views so the user's views survive a clean reload (they were only
-        dropped to clear the table-DROP dependency). Idempotent (``CREATE`` is
-        retried; an already-present view is left as-is). No-op on an append run.
+        dropped to clear the table-DROP dependency). Uses the same idempotent
+        DROP-then-CREATE as a table recreate (``recreate_table`` with no schema
+        DDLs), so a re-run converges. No-op on an append run.
         """
         ddls = self._dependent_view_ddls_for_replace()
         if not ddls:
             return
-        from dsql_migrator.core.models import ApplyMode
+        from dsql_migrator.core.schema_applier import recreate_table
 
-        applier = self._view_applier()
+        connect = self._view_connection_factory()
         for view_ddl in ddls:
             try:
-                # REPLACE + confirmed => DROP (if present) then CREATE, idempotent.
-                applier.apply(view_ddl, ApplyMode.REPLACE, confirmed=True)
+                # DROP VIEW IF EXISTS + CREATE VIEW (no schema DDLs -- the view's
+                # schema was already ensured when its tables were recreated).
+                recreate_table([], view_ddl, connection_factory=connect)
             except Exception:  # noqa: BLE001 - best-effort; the tables/data are already loaded
                 _LOGGER.warning("Could not recreate dependent view", exc_info=True)
 
-    def _view_applier(self):
-        """Build a SchemaApplier bound to this run's target (for view drop/apply)."""
-        from dsql_migrator.core.schema_applier import SchemaApplier
-
+    def _view_connection_factory(self):
+        """A fresh-DSQL-connection factory for the view pre-drop / recreate DDL."""
         connector = DsqlConnector(
             self._inputs.target_config, aws_profile=self._inputs.aws_profile
         )
-        return SchemaApplier(connection_factory=connector.connect)
+        return connector.connect
 
 
 def default_migrator_factory(inputs: DataMigrationInputs) -> DataMigrator:

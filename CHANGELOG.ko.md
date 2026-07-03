@@ -5,6 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.56
+
+### 수정 (Fixed)
+
+- **"Drop & reload"가 `SchemaApplier` TypeError로 전체 실행을 중단시키던 문제 수정.**
+  의존 뷰를 드롭/재생성해야 하는 테이블에 Drop & reload를 선택하면
+  `TypeError: SchemaApplier.__init__() missing 1 required positional argument:
+  'introspector'`가 발생해 Full Load 전체가 중단되고 테이블별 진행 상황 화면이 사라진
+  채 "Migration failed"만 표시됐습니다. 이제 의존 뷰 pre-drop/recreate가
+  `SchemaApplier`를 잘못 생성하지 않고 introspector가 필요 없는 DDL 헬퍼
+  (`drop_object` / `recreate_table`)를 사용해 클린 리로드가 성공합니다. 또한 선택적
+  뷰 pre-drop/recreate 단계는 이제 방어적으로 처리되어, 그곳에서 예기치 않은 실패가
+  나도 로그만 남기고 건너뛰며 실행을 실패시키지 않습니다 — 그래서 뷰 처리 문제가 다시는
+  Full Load 진행 상황을 날리지 않습니다(정말 드롭이 안 되는 테이블은 여전히 일반적인
+  테이블별 실패로 표시되어 대응 가능).
+- **CDC가 라이브이고 실행 가능한 상태일 때 Full Load 단계가 오류 나던 문제 수정.**
+  CDC가 스트리밍 중이고 Start/Re-run 버튼이 활성인 특정 경우에 Full Load 단계 렌더가
+  깨지던 `NameError`(오래된 `cdc_live` 참조)를 수정했습니다.
+
 ## v0.1.55
 
 ### 변경 (Changed)

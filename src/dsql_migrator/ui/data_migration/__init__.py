@@ -2560,7 +2560,7 @@ def _render_full_load_step(
             elif guard_reason:
                 start_btn.disable()
                 start_btn.tooltip(guard_reason)
-            elif cdc_live:
+            elif cdc_streaming_started(migration_state, job_manager):
                 # Not blocked, but warn up-front (the dialog reiterates the risk).
                 start_btn.tooltip(
                     "CDC is streaming -- re-running can break the live pipeline. "

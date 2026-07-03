@@ -399,6 +399,38 @@ def _execute_single_ddl(connection: Any, statement: object) -> None:
         _safe_close(cursor)
 
 
+def drop_object(
+    target_ddl: str,
+    *,
+    connection_factory: ConnectionFactory,
+    occ_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    occ_base_delay: float = DEFAULT_BASE_DELAY_SECONDS,
+    sleep: SleepFunc = time.sleep,
+    jitter: JitterFunc = random.random,
+) -> None:
+    """Drop the object ``target_ddl`` defines (``DROP <kind> IF EXISTS <name>``).
+
+    Standalone, introspector-free counterpart to :meth:`SchemaApplier.drop`, for
+    callers that only need a pre-drop (e.g. the Full Load "drop & reload" path
+    dropping a dependent view before recreating a table it depends on). The
+    kind/name are parsed from the CREATE DDL and composed injection-safely;
+    ``IF EXISTS`` keeps it idempotent under OC001 retry. Runs as a single
+    autocommit DDL on a fresh connection, which is closed afterward.
+    """
+    parsed = _parse(target_ddl)
+    retried = with_occ_retry(
+        max_attempts=occ_max_attempts,
+        base_delay=occ_base_delay,
+        sleep=sleep,
+        jitter=jitter,
+    )(_execute_single_ddl)
+    connection = connection_factory()
+    try:
+        retried(connection, _build_drop_statement(parsed))
+    finally:
+        _safe_close(connection)
+
+
 def recreate_table(
     schema_ddls: Sequence[str],
     target_ddl: str,

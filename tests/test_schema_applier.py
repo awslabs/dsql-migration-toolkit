@@ -571,3 +571,34 @@ def test_recreate_table_retries_drop_on_occ_conflict() -> None:
         'DROP TABLE IF EXISTS "t"',
         'CREATE TABLE "t" ("id" integer PRIMARY KEY)',
     ]
+
+
+def test_drop_object_emits_drop_if_exists() -> None:
+    # Standalone, introspector-free drop used by the Full Load "drop & reload"
+    # path to pre-drop a dependent view before recreating a table it references.
+    from dsql_migrator.core.schema_applier import drop_object
+
+    connection = _FakeConnection()
+    drop_object(
+        'CREATE VIEW "shop"."customer_order_summary" AS SELECT 1',
+        connection_factory=lambda: connection,
+        sleep=_no_sleep,
+        jitter=_zero_jitter,
+    )
+    assert connection.executed == [
+        'DROP VIEW IF EXISTS "shop"."customer_order_summary"'
+    ]
+    assert connection.closed is True
+
+
+def test_drop_object_retries_on_occ_conflict() -> None:
+    from dsql_migrator.core.schema_applier import drop_object
+
+    connection = _FakeConnection(failures=["40001"])
+    drop_object(
+        'CREATE VIEW "v" AS SELECT 1',
+        connection_factory=lambda: connection,
+        sleep=_no_sleep,
+        jitter=_zero_jitter,
+    )
+    assert connection.executed == ['DROP VIEW IF EXISTS "v"']

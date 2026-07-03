@@ -5,6 +5,27 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.56
+
+### Fixed
+
+- **"Drop & reload" no longer crashes the whole run with a `SchemaApplier`
+  TypeError.** Choosing Drop & reload for a table whose dependent views had to be
+  dropped/recreated raised `TypeError: SchemaApplier.__init__() missing 1 required
+  positional argument: 'introspector'`, which aborted the entire Full Load and
+  wiped the per-table progress view (showing only "Migration failed"). The
+  dependent-view pre-drop/recreate now uses introspector-free DDL helpers
+  (`drop_object` / `recreate_table`) instead of constructing a `SchemaApplier`
+  incorrectly, so a clean reload succeeds. Additionally, the optional view
+  pre-drop/recreate passes are now defensive: any unexpected failure there is
+  logged and skipped rather than failing the run — so a view-handling problem can
+  never again wipe your Full Load progress (a table that truly can't drop still
+  surfaces as a normal per-table failure you can act on).
+- **Full Load step no longer errors when CDC is live and the run is startable.**
+  Fixed a `NameError` (a stale `cdc_live` reference) that broke the Full Load
+  step's render in the specific case where CDC is streaming and the Start/Re-run
+  button is enabled.
+
 ## v0.1.55
 
 ### Changed
