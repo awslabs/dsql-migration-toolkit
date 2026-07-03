@@ -137,7 +137,16 @@ Full Load と Validation のノブは、ごく普通の `DSQL_MIGRATOR_*` **環�
 Fargate デプロイでは、これらは **ECS タスク定義のコンテナ `environment` ブロック** (テンプレートがすでに
 `DSQL_MIGRATOR_LOG_LEVEL` や `/tmp` の状態パスなどを設定しているのと同じ場所) で設定します — 上記のキーを
 `deploy/cloudformation.yaml` のコンテナ environment (または独自のタスク定義) に追加して再デプロイしてください。CDC の
-ノブは cdc-stack CloudFormation パラメータであり、ツールが cdc-stack をデプロイする際に渡されます。また、**Fargate
+ノブは cdc-stack CloudFormation パラメータであり、ツールが cdc-stack をデプロイする際に渡されます。
+
+> **再デプロイせずに実行間で再調整。** これらの Full Load / Validation 値を試行錯誤する際は、サイドバー
+> フッターの **Performance tuning** コントロール (Diagnostics の隣) を使ってください。ローダーとバリデータは
+> 実行ごとに設定を読み直すため、ここで設定した値は **次の** Full Load / Validation に即座に反映されます —
+> タスク定義の編集や再デプロイは不要です。アプリ全体 (単一タスク) に適用され、再起動でデプロイ/起動時の値に
+> リセットされるので、再起動をまたいで**永続化**したい値はタスク定義の `environment` に設定し、UI コントロールは
+> **実験**用に使ってください。
+
+また、**Fargate
 タスクの CPU/メモリ** (`ContainerCpu` / `ContainerMemory`) を並列度に合わせてサイジングしてください。メモリ使用量は
 テーブルサイズではなく行バッファの `table_parallelism × batch_parallelism × 約 8 MiB` によって有界になるため、複数
 テーブルの Full Load では約 1 vCPU / 2 GiB が妥当な出発点です。

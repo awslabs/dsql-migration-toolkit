@@ -343,6 +343,103 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> AppConfig:
     return AppConfig(**values)
 
 
+# --- Runtime-tunable performance knobs -------------------------------------
+# These four integer knobs are read FRESH from the environment on every Full
+# Load / Validation run (via load_config()), so an operator can retune them at
+# runtime -- no redeploy/restart -- by setting the corresponding os.environ key.
+# The UI's "Performance tuning" control uses these helpers so the same bounds
+# (the AppConfig field ge/le) are the single source of truth. Bounds are read
+# from the Pydantic field metadata rather than duplicated here.
+@dataclass(frozen=True)
+class TunableKnob:
+    """A runtime-adjustable integer performance knob (env-backed)."""
+
+    field: str  # AppConfig attribute name
+    env_suffix: str  # env key sans the DSQL_MIGRATOR_ prefix
+    label: str  # short human label for the UI
+
+    @property
+    def env_key(self) -> str:
+        return f"{ENV_PREFIX}{self.env_suffix}"
+
+    @property
+    def minimum(self) -> int:
+        return _field_bound(self.field, "ge", 1)
+
+    @property
+    def maximum(self) -> int:
+        return _field_bound(self.field, "le", 1_000_000)
+
+
+TUNABLE_KNOBS: tuple[TunableKnob, ...] = (
+    TunableKnob(
+        "full_load_table_parallelism",
+        "FULL_LOAD_TABLE_PARALLELISM",
+        "Full Load — tables in parallel",
+    ),
+    TunableKnob(
+        "full_load_batch_parallelism",
+        "FULL_LOAD_BATCH_PARALLELISM",
+        "Full Load — batches per table",
+    ),
+    TunableKnob(
+        "full_load_batch_rows",
+        "FULL_LOAD_BATCH_ROWS",
+        "Full Load — rows per batch",
+    ),
+    TunableKnob(
+        "validate_max_workers",
+        "VALIDATE_MAX_WORKERS",
+        "Validation — tables in parallel",
+    ),
+)
+
+_TUNABLE_BY_FIELD = {k.field: k for k in TUNABLE_KNOBS}
+
+
+def _field_bound(field: str, kind: str, fallback: int) -> int:
+    """Read a ge/le bound off an AppConfig field's Pydantic metadata."""
+    info = AppConfig.model_fields[field]
+    for meta in info.metadata:
+        value = getattr(meta, kind, None)
+        if value is not None:
+            return int(value)
+    return fallback
+
+
+class TuningValueError(ValueError):
+    """A proposed tuning value is out of range or not an integer."""
+
+
+def current_tuning_values() -> dict[str, int]:
+    """Return the CURRENTLY effective value of each tunable knob (from config)."""
+    cfg = load_config()
+    return {k.field: int(getattr(cfg, k.field)) for k in TUNABLE_KNOBS}
+
+
+def set_tuning_value(field: str, value: int) -> int:
+    """Validate ``value`` against the knob's bounds and set it in ``os.environ``.
+
+    Because load_config() re-reads the environment per run, the new value applies
+    to the NEXT Full Load / Validation without a restart. App-wide (single-task)
+    and reset to the deploy/startup value on restart. Returns the value set.
+    Raises :class:`TuningValueError` if out of range / not an integer.
+    """
+    knob = _TUNABLE_BY_FIELD.get(field)
+    if knob is None:
+        raise TuningValueError(f"unknown tuning knob: {field}")
+    try:
+        ivalue = int(value)
+    except (TypeError, ValueError):
+        raise TuningValueError(f"{knob.label}: value must be an integer") from None
+    if ivalue < knob.minimum or ivalue > knob.maximum:
+        raise TuningValueError(
+            f"{knob.label}: must be between {knob.minimum} and {knob.maximum}"
+        )
+    os.environ[knob.env_key] = str(ivalue)
+    return ivalue
+
+
 @dataclass(frozen=True)
 class ConnectDefaults:
     """Optional, dev-only prefill values for the Connect screen.
@@ -462,6 +559,11 @@ __all__ = [
     "SecretValue",
     "AppConfig",
     "load_config",
+    "TunableKnob",
+    "TUNABLE_KNOBS",
+    "TuningValueError",
+    "current_tuning_values",
+    "set_tuning_value",
     "ConnectDefaults",
     "read_env_file",
     "load_connect_defaults",

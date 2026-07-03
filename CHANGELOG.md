@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.36
+
+### Added
+
+- **Runtime performance tuning from the UI.** A new **Performance tuning** control
+  in the sidebar footer (next to Diagnostics) lets an operator retune the four Full
+  Load / Validation parallelism knobs (`FULL_LOAD_TABLE_PARALLELISM`,
+  `FULL_LOAD_BATCH_PARALLELISM`, `FULL_LOAD_BATCH_ROWS`, `VALIDATE_MAX_WORKERS`)
+  **between runs without a redeploy or restart** — the loader and validator re-read
+  the config on every run, so a value set here applies to the next Full Load /
+  Validation. Each field is bounded by the same limits as the config (single source
+  of truth), app-wide (single-task app), and resets to the deploy/startup values on
+  restart. Set the task-definition `environment` for values you want to persist;
+  use this control to experiment live.
+
 ## v0.1.35
 
 ### Fixed

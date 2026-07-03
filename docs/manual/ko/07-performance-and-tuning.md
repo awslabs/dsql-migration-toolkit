@@ -133,7 +133,15 @@ Full Load와 Validation 설정은 평범한 `DSQL_MIGRATOR_*` **환경 변수**�
 배포에서는 **ECS 태스크 정의의 컨테이너 `environment` 블록**(템플릿이 이미 `DSQL_MIGRATOR_LOG_LEVEL`,
 `/tmp` 상태 경로 등을 설정하는 그곳)에 설정합니다 — 위 키들을 `deploy/cloudformation.yaml`의 컨테이너
 environment(또는 자체 태스크 정의)에 추가하고 재배포하세요. CDC 설정은 도구가 cdc-stack을 배포할 때
-전달하는 cdc-stack CloudFormation 파라미터입니다. 또한 **Fargate 태스크 CPU/메모리**(`ContainerCpu` /
+전달하는 cdc-stack CloudFormation 파라미터입니다.
+
+> **재배포 없이 실행 사이에 재튜닝.** 이 Full Load / Validation 값을 이리저리 바꿔 보며 테스트할 때는
+> 사이드바 푸터의 **Performance tuning** 컨트롤(Diagnostics 옆)을 쓰세요. 로더와 검증기가 매 실행마다
+> 설정을 다시 읽으므로, 여기서 바꾼 값은 **다음** Full Load / Validation에 즉시 반영됩니다 — 태스크 정의
+> 수정·재배포 불필요. 앱 전역(단일 태스크)이며 재시작 시 배포/시작 값으로 리셋되므로, **영구히 유지**할
+> 값은 태스크 정의 `environment`에 설정하고, UI 컨트롤은 **실험**용으로 쓰세요.
+
+또한 **Fargate 태스크 CPU/메모리**(`ContainerCpu` /
 `ContainerMemory`)를 병렬수에 맞게 사이징하세요. 메모리 사용량은 테이블 크기가 아니라 행 버퍼 크기, 즉
 `table_parallelism × batch_parallelism × 약 8 MiB`로 정해집니다. 따라서 여러 테이블을 함께 적재하는 Full
 Load라면 약 1 vCPU / 2 GiB가 합리적인 출발점입니다.

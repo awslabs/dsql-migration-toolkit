@@ -7,19 +7,25 @@ Property 7: credential confidentiality).
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from pydantic import ValidationError
 
 from dsql_migrator.config import (
     ENV_PREFIX,
+    TUNABLE_KNOBS,
     ConnectDefaults,
     SecretRef,
     SecretSource,
     SecretValue,
+    TuningValueError,
+    current_tuning_values,
     load_config,
     load_connect_defaults,
     read_env_file,
     resolve_secret,
+    set_tuning_value,
 )
 
 
@@ -286,3 +292,67 @@ def test_read_env_file_parses_key_values(tmp_path) -> None:
 
 def test_read_env_file_missing_file_returns_empty() -> None:
     assert read_env_file("/nonexistent/path/.env") == {}
+
+
+# --- Runtime performance-tuning knobs --------------------------------------
+
+
+def test_tunable_knobs_bounds_match_appconfig_fields() -> None:
+    """Each knob's advertised min/max is read from the AppConfig field metadata,
+    so the UI and the config validate against the SAME bounds."""
+    expected = {
+        "full_load_table_parallelism": (1, 16),
+        "full_load_batch_parallelism": (1, 32),
+        "full_load_batch_rows": (1, 3000),
+        "validate_max_workers": (1, 32),
+    }
+    got = {k.field: (k.minimum, k.maximum) for k in TUNABLE_KNOBS}
+    assert got == expected
+    # Every knob's env key is DSQL_MIGRATOR_-prefixed.
+    assert all(k.env_key.startswith(ENV_PREFIX) for k in TUNABLE_KNOBS)
+
+
+def test_current_tuning_values_reflect_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    for k in TUNABLE_KNOBS:
+        monkeypatch.delenv(k.env_key, raising=False)
+    assert current_tuning_values() == {
+        "full_load_table_parallelism": 4,
+        "full_load_batch_parallelism": 8,
+        "full_load_batch_rows": 2000,
+        "validate_max_workers": 4,
+    }
+
+
+def test_set_tuning_value_writes_env_and_is_picked_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """set_tuning_value writes os.environ so the NEXT load_config() (read per run)
+    sees the new value -- no restart."""
+    monkeypatch.delenv(f"{ENV_PREFIX}FULL_LOAD_TABLE_PARALLELISM", raising=False)
+    returned = set_tuning_value("full_load_table_parallelism", 12)
+    assert returned == 12
+    assert os.environ[f"{ENV_PREFIX}FULL_LOAD_TABLE_PARALLELISM"] == "12"
+    # A fresh load_config() (as each run does) picks it up.
+    assert load_config().full_load_table_parallelism == 12
+    assert current_tuning_values()["full_load_table_parallelism"] == 12
+
+
+def test_set_tuning_value_rejects_out_of_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(f"{ENV_PREFIX}FULL_LOAD_TABLE_PARALLELISM", raising=False)
+    with pytest.raises(TuningValueError):
+        set_tuning_value("full_load_table_parallelism", 17)  # > 16
+    with pytest.raises(TuningValueError):
+        set_tuning_value("full_load_batch_rows", 0)  # < 1
+    # A rejected value must NOT touch the environment.
+    assert f"{ENV_PREFIX}FULL_LOAD_TABLE_PARALLELISM" not in os.environ
+
+
+def test_set_tuning_value_rejects_non_integer_and_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(TuningValueError):
+        set_tuning_value("full_load_batch_rows", "abc")  # type: ignore[arg-type]
+    with pytest.raises(TuningValueError):
+        set_tuning_value("no_such_knob", 5)

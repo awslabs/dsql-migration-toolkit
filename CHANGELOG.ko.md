@@ -5,6 +5,17 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.36
+
+### 추가 (Added)
+
+- **UI에서 런타임 성능 튜닝.** 사이드바 푸터에 **Performance tuning** 컨트롤(Diagnostics 옆)을 추가해,
+  Full Load / Validation 병렬수 4종(`FULL_LOAD_TABLE_PARALLELISM`, `FULL_LOAD_BATCH_PARALLELISM`,
+  `FULL_LOAD_BATCH_ROWS`, `VALIDATE_MAX_WORKERS`)을 **재배포·재시작 없이 실행 사이에** 재튜닝할 수
+  있습니다 — 로더와 검증기가 매 실행마다 설정을 다시 읽으므로 여기서 바꾼 값이 다음 실행에 반영됩니다.
+  각 필드는 config와 동일한 한도로 제한되고(단일 소스), 앱 전역(단일 태스크)이며 재시작 시 배포/시작
+  값으로 리셋됩니다. 영구히 유지할 값은 태스크 정의 `environment`에, 실험은 이 컨트롤로.
+
 ## v0.1.35
 
 ### 수정 (Fixed)

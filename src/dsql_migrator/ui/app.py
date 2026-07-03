@@ -493,7 +493,61 @@ def build_page(
 def _render_footer_tools(activity_log_path: str) -> None:
     """Render the sidebar footer tools: activity-log download + Diagnostics."""
     _render_activity_log_download(activity_log_path)
+    _render_performance_tuning_controls()
     _render_diagnostics_controls()
+
+
+def _render_performance_tuning_controls() -> None:
+    """Render runtime Full Load / Validation parallelism controls in the footer.
+
+    Like Diagnostics, these are NOT deploy-time inputs: the loader and validator
+    re-read the config on every run, so an operator can retune parallelism between
+    runs from here -- no redeploy/restart. Changes apply to the NEXT Full Load /
+    Validation, are app-wide (single-task app), and reset to the deploy/startup
+    values on restart. Each field is bounded by the same limits as the config.
+    """
+    from nicegui import ui
+
+    from dsql_migrator.config import (
+        TUNABLE_KNOBS,
+        TuningValueError,
+        current_tuning_values,
+        set_tuning_value,
+    )
+
+    current = current_tuning_values()
+
+    with ui.expansion("Performance tuning", icon="speed").props("dense").classes(
+        "w-full"
+    ):
+        ui.label(
+            "Applies to the NEXT Full Load / Validation. App-wide; resets on "
+            "restart. Total DSQL connections ≈ tables × batches — keep within "
+            "the cluster quota."
+        ).classes("text-xs text-gray-400")
+
+        for knob in TUNABLE_KNOBS:
+            def _on_change(event: object, k=knob) -> None:
+                raw = getattr(event, "value", None)
+                try:
+                    applied = set_tuning_value(k.field, raw)
+                except TuningValueError as exc:
+                    ui.notify(str(exc), type="warning", position="top")
+                    return
+                ui.notify(
+                    f"{k.label} = {applied} (applies to the next run).",
+                    type="info",
+                )
+
+            ui.number(
+                label=f"{knob.label} (≤ {knob.maximum})",
+                value=current[knob.field],
+                min=knob.minimum,
+                max=knob.maximum,
+                step=1,
+                format="%d",
+                on_change=_on_change,
+            ).props("dense outlined").classes("w-full text-xs")
 
 
 def _render_diagnostics_controls() -> None:

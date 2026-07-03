@@ -270,7 +270,10 @@ cd mysql-dsql-migrator
 > 적용됩니다. 아래는 자동화·튜닝·문제 해결에 필요한 운영자용 환경 변수 레퍼런스입니다(성능 튜닝
 > 노브의 배경은 매뉴얼 [성능과 튜닝](docs/manual/ko/07-performance-and-tuning.md) 장 참고).
 
-설정은 환경 변수에서 읽으며, 자격증명 값은 설정에 절대 영속화되지 않습니다.
+설정은 (config 파일이 아니라) 환경 변수에서 읽으며, 자격증명 값은 설정에 절대 영속화되지 않습니다.
+Fargate에서는 이 값들을 ECS 태스크 정의의 컨테이너 `environment`에 설정합니다. Full Load /
+Validation 병렬수 4개는 사이드바 푸터의 **Performance tuning** 컨트롤에서 **런타임에** 재튜닝할 수도
+있습니다 — 재배포 불필요, 다음 Full Load / Validation에 반영되고 재시작 시 리셋됩니다.
 
 | 변수 | 기본값 | 설명 |
 | --- | --- | --- |

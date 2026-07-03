@@ -151,7 +151,18 @@ the **ECS task definition's container `environment` block** (the same place the
 template already sets `DSQL_MIGRATOR_LOG_LEVEL`, the `/tmp` state paths, etc.) —
 add the keys above to `deploy/cloudformation.yaml`'s container environment (or your
 own task definition) and redeploy. The CDC knobs are cdc-stack CloudFormation
-parameters, passed when the tool deploys the cdc-stack. Also size the **Fargate
+parameters, passed when the tool deploys the cdc-stack.
+
+> **Retune between runs without redeploying.** For iterating on these Full Load /
+> Validation values, use the **Performance tuning** control in the sidebar footer
+> (next to Diagnostics): the loader and validator re-read the config on every run,
+> so a value you set there applies to the **next** Full Load / Validation
+> immediately — no task-definition edit or redeploy. It is app-wide (single-task
+> app) and resets to the deploy/startup values on restart, so set the
+> task-definition `environment` for the values you want to **persist** across
+> restarts, and use the UI control to **experiment** live.
+
+Also size the **Fargate
 task CPU/memory** (`ContainerCpu` / `ContainerMemory`) to match the parallelism:
 ~1 vCPU / 2 GiB is a reasonable starting point for a multi-table Full Load, since
 memory is bounded by `table_parallelism × batch_parallelism × ~8 MiB` of row

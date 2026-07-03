@@ -303,8 +303,12 @@ local for evaluation/small migrations; use Fargate for a real one.
 > automation, tuning, and troubleshooting (for the background on the performance
 > knobs, see the manual's [Performance and tuning](docs/manual/en/07-performance-and-tuning.md) chapter).
 
-Configuration is read from environment variables; no credential values are ever
-persisted in the configuration.
+Configuration is read from environment variables (not a config file); no
+credential values are ever persisted in the configuration. On Fargate, set these
+in the ECS task definition's container `environment`. The four Full Load /
+Validation parallelism knobs can also be retuned **at runtime** from the sidebar
+footer's **Performance tuning** control — no redeploy; the change applies to the
+next Full Load / Validation and resets on restart.
 
 | Variable | Default | Description |
 | --- | --- | --- |

@@ -5,6 +5,19 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.36
+
+### Added
+
+- **UI からの実行時パフォーマンスチューニング。** サイドバーフッターに **Performance tuning**
+  コントロール(Diagnostics の隣)を追加し、Full Load / Validation の並列度 4 つ
+  (`FULL_LOAD_TABLE_PARALLELISM`、`FULL_LOAD_BATCH_PARALLELISM`、`FULL_LOAD_BATCH_ROWS`、
+  `VALIDATE_MAX_WORKERS`)を**再デプロイ・再起動なしで実行間に**再調整できます — ローダーと
+  バリデータは実行ごとに設定を読み直すため、ここで設定した値が次の Full Load / Validation に
+  反映されます。各フィールドは config と同じ上限で制限され(単一の情報源)、アプリ全体(単一タスク)に
+  適用され、再起動でデプロイ/起動時の値にリセットされます。永続化したい値はタスク定義の
+  `environment` に、実験にはこのコントロールを。
+
 ## v0.1.35
 
 ### Fixed
