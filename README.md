@@ -154,7 +154,9 @@ behind an **HTTPS ALB** (`internal` by default, optional Cognito), pulling the
 container image from **Amazon ECR** (the published ECR Public image by default).
 For a one-glance view of the whole path, see [At a glance](#at-a-glance) above.
 
-![Full AWS architecture topology](deploy/architecture-aws.png)
+[![Full AWS architecture topology](deploy/architecture-aws.png)](deploy/architecture-aws.png)
+
+> The diagram is detailed — **click it to open the full-resolution image.**
 
 - **AI assist is control-plane only** — when enabled, **Amazon Bedrock** adds
   conversion suggestions, CDC readiness assessment, and DLQ triage, but is

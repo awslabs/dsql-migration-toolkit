@@ -133,7 +133,9 @@ AWS 아이콘 뷰(간소화):
 선택적 Cognito) 뒤에서 돌고, 컨테이너 이미지는 **Amazon ECR**(기본 ECR Public 이미지)에서
 가져옵니다. 전체 경로 한눈 요약은 위 [한눈에 보기](#한눈에-보기)를 참고하세요.
 
-![전체 AWS 아키텍처 토폴로지](deploy/architecture-aws.png)
+[![전체 AWS 아키텍처 토폴로지](deploy/architecture-aws.png)](deploy/architecture-aws.png)
+
+> 다이어그램이 상세합니다 — **클릭하면 원본 해상도로 열립니다.**
 
 - **AI 보조는 컨트롤 플레인만** — 켜면 **Amazon Bedrock**이 변환 제안·CDC 준비도·DLQ 분류를
   더해 주지만, **CDC 데이터 경로에는 절대 들어가지 않습니다**(기본 off).

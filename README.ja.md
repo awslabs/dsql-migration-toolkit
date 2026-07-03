@@ -145,7 +145,9 @@ Web UI は、**Connect** を予備ステップとして、6 ステップのワ�
 （既定は `internal`、任意で Cognito）として動作し、**Amazon ECR** からコンテナイメージを取得します
 （既定では公開されている ECR Public イメージ）。全経路をひと目で見るには、上記の [概要](#概要) を参照してください。
 
-![完全な AWS アーキテクチャトポロジー](deploy/architecture-aws.png)
+[![完全な AWS アーキテクチャトポロジー](deploy/architecture-aws.png)](deploy/architecture-aws.png)
+
+> 図は詳細です — **クリックすると原寸解像度で開きます。**
 
 - **AI アシストはコントロールプレーンのみ** — 有効化すると、**Amazon Bedrock** が変換の提案、
   CDC 準備状況の評価、DLQ トリアージを追加しますが、**CDC のデータ経路には決して配置されません**
