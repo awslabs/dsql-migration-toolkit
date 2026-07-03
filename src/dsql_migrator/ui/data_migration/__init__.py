@@ -3018,27 +3018,6 @@ def _render_full_load_progress(
     ]
     terminal = job.status in ("DONE", "FAILED", "CANCELLED")
 
-    def _reload_btn(table_name: str) -> None:
-        # Per-table Reload: only offered once the job has settled, so it can't
-        # collide with an in-flight run. Prefer the confirm path (probe + Drop-vs-
-        # Append choice for this table); fall back to a direct reload if no confirm
-        # opener was threaded in (older callers / tests).
-        if reload_confirm is not None and terminal:
-            ui.button(
-                "Reload",
-                on_click=lambda e, n=table_name: reload_confirm(n, e),
-            ).props("flat dense no-caps size=sm color=primary icon=replay").tooltip(
-                "Re-run Full Load for just this table — choose append or a clean "
-                "drop & reload if it already holds data."
-            )
-        elif reload_table is not None and terminal:
-            ui.button(
-                "Reload", on_click=lambda n=table_name: reload_table(n)
-            ).props("flat dense no-caps size=sm color=primary icon=replay").tooltip(
-                "Re-run Full Load for just this table (e.g. after fixing the "
-                "source value), keeping the others as-is."
-            )
-
     def _ai_btn(table_name: str, error_message: str) -> None:
         # Per-table AI Assist: opens the chat drawer to explain THIS failure's
         # cause + fix. Shown enabled only when AI Assist is on (an opener was
@@ -3059,30 +3038,68 @@ def _render_full_load_progress(
                 "failure with AI."
             )
 
-    # Real, retryable table failures (red) -- distinct from quarantined rows.
+    def _failure_row(*, table_name, message, tone, action=None) -> None:
+        # One failure/quarantine entry with a STABLE layout that doesn't shift when
+        # the error text is long: the table badge + wrapping message sit in a
+        # flex-1 column on the left, and the fixed-width action (AI Assist, and for
+        # quarantine a Reload) is pinned top-right -- so buttons never get pushed to
+        # a second line by a long message (the old row-nowrap did).
+        with ui.row().classes("items-start gap-2 w-full no-wrap"):
+            with ui.column().classes("gap-0 flex-1 min-w-0"):
+                ui.badge(table_name).props(
+                    f"color={'negative' if tone == 'error' else 'warning'} outline"
+                )
+                inline_hint(ui, message, tone=tone, classes="text-xs break-words")
+            if action is not None:
+                with ui.row().classes("items-center gap-1 no-wrap shrink-0"):
+                    action()
+
+    # Real, retryable table failures (red). Retry is driven by the single
+    # "Retry unfinished tables" control below (a checklist), so no per-row Reload
+    # here -- only per-table AI diagnosis, which is inherently per-table.
     if real_failures:
-        with ui.column().classes("w-full gap-1"):
+        with ui.column().classes("w-full gap-2"):
             render_notice(
                 ui,
                 tone="error",
                 header=f"Failure details ({len(real_failures)})",
             )
             for row in real_failures:
-                with ui.row().classes("items-center gap-2 w-full no-wrap"):
-                    ui.badge(row.table).props("color=negative outline")
-                    inline_hint(
-                        ui,
-                        row.error_message,
-                        tone="error",
-                        classes="text-xs break-all",
-                    )
-                    _ai_btn(row.table, row.error_message or "")
-                    _reload_btn(row.table)
+                _failure_row(
+                    table_name=row.table,
+                    message=row.error_message,
+                    tone="error",
+                    action=(lambda r=row: _ai_btn(r.table, r.error_message or "")),
+                )
 
     # Quarantined rows (amber): the table loaded -- these rows were permanently
     # dropped (e.g. a value over DSQL's ~1 MiB per-value limit), NOT a failure.
+    # A quarantine table is DONE (not "unfinished"), so the retry checklist does
+    # not cover it; a per-row Reload stays here for "I fixed the source value,
+    # reload just this table".
+    def _quar_reload(table_name: str):
+        def _btn() -> None:
+            if reload_confirm is not None and terminal:
+                ui.button(
+                    "Reload",
+                    on_click=lambda e, n=table_name: reload_confirm(n, e),
+                ).props(
+                    "flat dense no-caps size=sm color=primary icon=replay"
+                ).tooltip(
+                    "Reload just this table (e.g. after fixing the source value)."
+                )
+            elif reload_table is not None and terminal:
+                ui.button(
+                    "Reload", on_click=lambda n=table_name: reload_table(n)
+                ).props(
+                    "flat dense no-caps size=sm color=primary icon=replay"
+                ).tooltip(
+                    "Reload just this table (e.g. after fixing the source value)."
+                )
+        return _btn
+
     if quarantined:
-        with ui.column().classes("w-full gap-1"):
+        with ui.column().classes("w-full gap-2"):
             render_notice(
                 ui,
                 tone="warning",
@@ -3093,17 +3110,12 @@ def _render_full_load_progress(
                 ),
             )
             for row in quarantined:
-                with ui.row().classes("items-center gap-2 w-full no-wrap"):
-                    ui.badge(f"{row.table} · Done — quarantined").props(
-                        "color=warning outline"
-                    )
-                    inline_hint(
-                        ui,
-                        row.error_message,
-                        tone="warning",
-                        classes="text-xs break-all",
-                    )
-                    _reload_btn(row.table)
+                _failure_row(
+                    table_name=f"{row.table} · Done — quarantined",
+                    message=row.error_message,
+                    tone="warning",
+                    action=_quar_reload(row.table),
+                )
             # When the ONLY incompleteness is quarantine, offer to accept the gap
             # and unblock CDC (Validation still reports it). Real failures suppress
             # this -- they must be retried/reloaded first.

@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.59
+
+### Changed
+
+- **Full Load "Failure details" is cleaner and no longer shifts on long errors.**
+  Removed the per-row "Reload" button from each failure — retrying is now driven
+  solely by the single "Retry unfinished tables" checklist below, so there's one
+  consistent way to retry instead of two competing controls. Each failure row now
+  has a stable layout (table name + wrapping error message on the left, the
+  "AI Assist" action pinned to the right) so a long error message no longer pushes
+  the buttons onto a second line or misaligns them between rows. Quarantined-row
+  entries keep their own "Reload" (a quarantined table is DONE, not "unfinished",
+  so the retry checklist doesn't cover it).
+
 ## v0.1.58
 
 ### Fixed
