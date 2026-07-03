@@ -5,6 +5,16 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.40
+
+### 변경 (Changed)
+
+- **"Start over"가 CDC를 프로브하는 동안 "Checking…" 상태를 표시.** Start over를 열면 CDC stop/delete
+  타일을 보여줄지 판단하기 위해 ~1~2초 읽기 전용 AWS 프로브가 돌아갑니다. 이제 그동안 버튼이
+  비활성화되고 라벨/아이콘이 "Checking…"(모래시계)로 바뀌었다가 다이얼로그가 열리면 복원됩니다 —
+  진행 상태를 눈에 보이게 하면서 중복 열림도 막습니다. (앱 관례에 맞춰 라벨/아이콘 교체 방식 —
+  flat 버튼에서 테두리 아티팩트를 내는 Quasar `loading` prop은 사용하지 않음.)
+
 ## v0.1.39
 
 ### 수정 (Fixed)

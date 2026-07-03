@@ -1430,13 +1430,29 @@ def build_workflow_sidebar(
                     # first (it is blocking network I/O), then open the dialog with the
                     # freshly-refreshed cached state. Best-effort: if the probe fails we
                     # still open with whatever was cached.
+                    #
+                    # The probe is ~1-2s of network I/O, so show a busy cue on the
+                    # button while it runs: disable it (prevents a double-open) and
+                    # swap its label to "Checking…" + a sync/hourglass icon, restoring
+                    # both when the dialog opens. We swap the LABEL/ICON rather than use
+                    # Quasar's `loading` prop, matching the app-wide busy idiom in
+                    # connect.py (the loading prop spins the border on flat buttons and
+                    # reads as an artifact); the label swap makes the short wait legible.
                     if cdc_probe is not None:
                         from nicegui import run as _sd_run
 
+                        start_over_btn.disable()
+                        start_over_btn.set_text("Checking…")
+                        start_over_btn.props("icon=hourglass_top")
                         try:
                             await _sd_run.io_bound(cdc_probe)
                         except Exception:  # noqa: BLE001 - open with cached state
                             pass
+                        finally:
+                            if not getattr(start_over_btn, "is_deleted", False):
+                                start_over_btn.set_text("Start over")
+                                start_over_btn.props("icon=restart_alt")
+                                start_over_btn.enable()
                     _open_start_over_dialog(
                         ui, state, on_reset, select, refresh_all, _CONNECT_VIEW,
                         cdc_deployed=(
@@ -1453,13 +1469,12 @@ def build_workflow_sidebar(
                         ),
                     )
 
-                ui.button(
+                start_over_btn = ui.button(
                     "Start over",
                     icon="restart_alt",
                     on_click=_open_start_over,
-                ).props("flat dense color=white").tooltip(
-                    "Clear this session and start a new migration"
-                )
+                ).props("flat dense color=white")
+                start_over_btn.tooltip("Clear this session and start a new migration")
             ui.label(f"v{version}").classes("text-sm opacity-80")
 
     # --- Left drawer (navigation) --------------------------------------------

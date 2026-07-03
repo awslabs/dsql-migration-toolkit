@@ -5,6 +5,17 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.40
+
+### Changed
+
+- **"Start over" shows a "Checking…" busy state while it probes CDC.** Opening
+  Start over runs a ~1–2 s read-only AWS probe (to decide whether to offer the CDC
+  stop/delete tiles); the button now disables and swaps to "Checking…" with an
+  hourglass icon during that probe, then restores when the dialog opens — a visible
+  cue that also prevents a double-open. (Label/icon swap, matching the app's busy
+  idiom, not Quasar's `loading` prop which artifacts on flat buttons.)
+
 ## v0.1.39
 
 ### Fixed
