@@ -5,6 +5,14 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.43
+
+### 변경 (Changed)
+
+- **Deploy 로그 타임스탬프에 `UTC` 타임존 표시.** CDC 배포/철거 로그의 각 줄이 `HH:MM:SS UTC - …`로
+  표시됩니다(이전에는 타임존 없는 `HH:MM:SS - …`). 모호함이 없어지고, 다운로드하는 활동 로그·
+  CloudWatch·CloudFormation 이벤트(모두 UTC)와 일치합니다.
+
 ## v0.1.42
 
 ### 수정 (Fixed)

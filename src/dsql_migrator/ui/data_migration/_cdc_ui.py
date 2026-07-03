@@ -2502,8 +2502,11 @@ def _render_deploy_log(ui, log_lines, log_state=None) -> None:
         # ASCII-only separator ("-"), and sanitize each message, so the monospace
         # ui.code font never renders a missing-glyph box (tofu) for punctuation
         # like the em-dash / ellipsis some deploy messages contained.
+        # Timestamps are UTC (the deploy driver stamps datetime.now(timezone.utc)).
+        # Show the zone explicitly so a line reads unambiguously and matches the
+        # downloaded activity log / CloudWatch / CloudFormation events (all UTC).
         text = "\n".join(
-            f"{ts.strftime('%H:%M:%S')} - {_ascii_log(msg)}" for ts, msg in log_lines
+            f"{ts.strftime('%H:%M:%S')} UTC - {_ascii_log(msg)}" for ts, msg in log_lines
         )
         ui.code(text).classes("w-full text-xs")  # type: ignore[attr-defined]
 

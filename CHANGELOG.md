@@ -5,6 +5,15 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.43
+
+### Changed
+
+- **Deploy-log timestamps now show the `UTC` zone.** Each CDC deploy/teardown log
+  line reads `HH:MM:SS UTC - …` (was zone-less `HH:MM:SS - …`), making it
+  unambiguous and consistent with the downloaded activity log, CloudWatch, and
+  CloudFormation events — all UTC.
+
 ## v0.1.42
 
 ### Fixed

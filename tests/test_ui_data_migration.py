@@ -3744,6 +3744,22 @@ class _RecordingUi:
         return self._El()
 
 
+def test_deploy_log_lines_show_utc_timezone() -> None:
+    # Deploy-log timestamps are UTC (the driver stamps datetime.now(timezone.utc));
+    # the rendered line must say so, matching the downloaded log / CloudWatch.
+    from datetime import datetime, timezone
+
+    from dsql_migrator.ui.data_migration import _render_deploy_log
+
+    ui = _RecordingUi()
+    lines = [
+        (datetime(2026, 7, 3, 5, 12, 3, tzinfo=timezone.utc), "Stack deletion submitted."),
+    ]
+    _render_deploy_log(ui, lines, {"open": True})
+    body = "\n".join(ui.texts)
+    assert "05:12:03 UTC - Stack deletion submitted." in body
+
+
 def _completeness(
     *, total, settled, complete, failed, mismatched, unknown=0
 ):
