@@ -1,6 +1,6 @@
 # mysql-dsql-migrator
 
-_언어: [English](README.md) | **한국어**_
+_언어: [English](README.md) | **한국어** | [日本語](README.ja.md)_
 
 Amazon RDS MySQL / Aurora MySQL 데이터베이스를 **Amazon Aurora DSQL**로
 마이그레이션하는 웹 기반 All-In-One 도구입니다.

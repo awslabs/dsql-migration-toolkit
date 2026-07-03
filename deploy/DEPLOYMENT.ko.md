@@ -1,6 +1,6 @@
 # 배포 가이드 — MySQL → Aurora DSQL 마이그레이션 도구 (app-stack)
 
-_언어: [English](DEPLOYMENT.md) | **한국어**_
+_언어: [English](DEPLOYMENT.md) | **한국어** | [日本語](DEPLOYMENT.ja.md)_
 
 이 가이드는 **컨트롤 플레인 앱**을 고객 자신의 AWS 계정과 VPC 안에서(단일 테넌트),
 **Application Load Balancer (HTTPS)** 뒤의 단일 태스크 **Amazon ECS Fargate** 서비스로 배포합니다.

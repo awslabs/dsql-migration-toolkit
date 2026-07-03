@@ -1,6 +1,6 @@
 # 4. CDC 동작 방식과 DSQL 제약 처리
 
-_언어: [English](../en/04-cdc-and-dsql-constraints.md) | **한국어**_
+_언어: [English](../en/04-cdc-and-dsql-constraints.md) | **한국어** | [日本語](../ja/04-cdc-and-dsql-constraints.md)_
 
 > **이전:** [3. Full Load](03-full-load.md)
 

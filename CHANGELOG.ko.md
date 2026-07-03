@@ -1,6 +1,6 @@
 # 변경 이력 (Changelog)
 
-_언어: [English](CHANGELOG.md) | **한국어**_
+_언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.

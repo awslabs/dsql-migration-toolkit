@@ -1,6 +1,6 @@
 # 8. Testing — the DSQL-driven scenarios
 
-_Language: **English** | [한국어](../ko/08-testing-and-verification.md)_
+_Language: **English** | [한국어](../ko/08-testing-and-verification.md) | [日本語](../ja/08-testing-and-verification.md)_
 
 > **Prev:** [7. Performance and tuning](07-performance-and-tuning.md)
 

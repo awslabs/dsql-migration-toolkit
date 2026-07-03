@@ -1,6 +1,6 @@
 # 8. 테스트 및 검증
 
-_언어: [English](../en/08-testing-and-verification.md) | **한국어**_
+_언어: [English](../en/08-testing-and-verification.md) | **한국어** | [日本語](../ja/08-testing-and-verification.md)_
 
 > **이전:** [7. 성능과 튜닝](07-performance-and-tuning.md)
 

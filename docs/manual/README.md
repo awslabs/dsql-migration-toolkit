@@ -3,10 +3,11 @@
 A guided manual for migrating **Amazon RDS / Aurora MySQL** to **Amazon Aurora
 DSQL** with this tool.
 
-## Choose your language / 언어 선택
+## Choose your language / 언어 선택 / 言語選択
 
 - 🇬🇧 **[English](en/README.md)**
 - 🇰🇷 **[한국어](ko/README.md)**
+- 🇯🇵 **[日本語](ja/README.md)**
 
 ---
 

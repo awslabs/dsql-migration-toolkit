@@ -1,6 +1,6 @@
 # 4. How CDC works, and how DSQL constraints are handled
 
-_Language: **English** | [한국어](../ko/04-cdc-and-dsql-constraints.md)_
+_Language: **English** | [한국어](../ko/04-cdc-and-dsql-constraints.md) | [日本語](../ja/04-cdc-and-dsql-constraints.md)_
 
 > **Prev:** [3. Full Load](03-full-load.md)
 

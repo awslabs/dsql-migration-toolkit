@@ -1,6 +1,6 @@
 # 9. Query validation and the AI DBA
 
-_Language: **English** | [한국어](../ko/09-query-validation.md)_
+_Language: **English** | [한국어](../ko/09-query-validation.md) | [日本語](../ja/09-query-validation.md)_
 
 > **Prev:** [8. Testing and verification](08-testing-and-verification.md)
 

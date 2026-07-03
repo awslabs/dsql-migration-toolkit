@@ -1,6 +1,6 @@
 # 11. 고객 FAQ
 
-_언어: [English](../en/11-customer-faq.md) | **한국어**_
+_언어: [English](../en/11-customer-faq.md) | **한국어** | [日本語](../ja/11-customer-faq.md)_
 
 > **이전:** [10. 결론](10-conclusion.md)
 

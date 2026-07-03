@@ -1,6 +1,6 @@
 # 3. How Full Load works
 
-_Language: **English** | [한국어](../ko/03-full-load.md)_
+_Language: **English** | [한국어](../ko/03-full-load.md) | [日本語](../ja/03-full-load.md)_
 
 > **Prev:** [2. Evaluation and Schema Conversion](02-evaluation-and-schema-conversion.md)
 

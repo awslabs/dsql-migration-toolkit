@@ -1,6 +1,6 @@
 # 6. Limitations
 
-_Language: **English** | [한국어](../ko/06-limitations.md)_
+_Language: **English** | [한국어](../ko/06-limitations.md) | [日本語](../ja/06-limitations.md)_
 
 > **Prev:** [5. Validation](05-validation.md)
 

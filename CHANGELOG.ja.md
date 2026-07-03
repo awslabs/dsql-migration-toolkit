@@ -1,0 +1,573 @@
+# 変更履歴 (Changelog)
+
+_言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
+
+このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
+[セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
+
+## v0.1.34
+
+### Added
+
+- **Query Playground の AI DBA クエリチューニング。** 変換された `SELECT` が
+  「Test on target」を通過すると、新しい **Tune with AI DBA** アクションで共有 AI
+  チャットドロワーが開き、Aurora DSQL の効率性に合わせてクエリを書き換えます。書き換えは、
+  そのクエリの実際に取得された EXPLAIN プランと DPU コスト、および Aurora DSQL 自身の
+  実行モデル(主キーが *そのまま* テーブルであること、3 つのフィルタ層を通したフィルタ
+  プッシュダウン、`Full Scan` と `Index`/`Index Only Scan` の違い、コスト単位としての
+  DPU)に基づいています。何を・なぜ変更したのか、そしてなぜ DSQL で安価になるのかを説明し、
+  DSQL に当てはまらない素の PostgreSQL 向けチューニング助言からは明示的に遠ざけられます。
+  各書き換え提案には **Test rewrite on target** アクションがあり、ターゲット上で読み取り
+  専用として再実行し、AI が同じチャット内で実測した前後の DPU 改善を報告します。オプトイン
+  (AI はデフォルトでオフ)であり、助言のみ — 何も自動適用はされず、改善の証拠はモデルの
+  文章ではなく実測 DPU です。
+
+## v0.1.33
+
+### Fixed
+
+- **「Start over」が、どの手順にいても、配備済みの CDC パイプラインの解体を確実に提案する
+  ようになりました。** リセットダイアログは、検出された CDC 配備から stop/delete の選択肢を
+  表示するかどうかを決めますが、その検出は CDC 手順を開いたときにしか更新されませんでした —
+  そのため別の手順から(または再接続したセッションから)やり直すと、実際には CDC が配備されて
+  いても、解体アクションのない受動的な「リセットしても CDC インフラは削除されません」という
+  警告に後退することがありました。Start over は開いたときに読み取り専用の AWS プローブを実行
+  するようになり、実際の配備状態を反映します。
+- **解体は、稼働中のものだけでなく、任意の状態の CDC リソースに対して提案されます。** 失敗
+  している/まだプロビジョニング中のコネクタ、スタックしたまたはロールバックされた cdc-stack、
+  あるいはインフラのみのスタック(コネクタがまだ無い MSK クラスター + NAT)は、いずれも課金され
+  続けますが、常に解体の対象として提案されるわけではありませんでした。いまや健全性ではなく存在
+  そのものが提案を駆動し、CDC 手順(スタックしている/不安定なスタックに対して既に Delete を提供
+  している)と挙動を合わせています。
+- **カスタムの cdc-stack 名が Start over の警告に明示されます。** カスタムのスタック名で CDC を
+  配備した場合(CDC 手順の「Advanced — CDC stack name」、例えば 2 つ目の並行マイグレーション用)、
+  新しいセッションではそれを再発見できません(デフォルト名に戻ります)。警告が正確なスタック名を
+  示すようになったので、(ツール内でも AWS コンソールでも)何を削除すればよいかを正確に把握できます。
+- **CDC インフラの削除が、操作の途中にあるスタックに対して失敗確定の削除を送信しなくなりました。**
+  CloudFormation の操作がまだ実行中の場合、削除がそれと競合して不透明に失敗することがありました。
+  Delete は、操作が進行中のときは明確な「待って再試行してください」というメッセージで停止し(そして、
+  すでに削除が進行中の場合は単にその完了を待ちます)、一方で安定・失敗・ロールバック済みのスタックは
+  従来どおり削除します。
+
+## v0.1.32
+
+### Fixed
+
+- **Validation のチェックサムが、NULL を含む行で誤って不一致になることがなくなりました。** 行単位の
+  チェックサムは、NULL に対して `'\0'`(NUL)センチネルを使って列を連結していましたが、そのバイトは
+  エンジンごとに異なって表現されます(MySQL では単一の NUL、PostgreSQL の
+  `standard_conforming_strings`(DSQL のデフォルト)では 2 文字の文字列 `0x5C30`)。そのため NULL を
+  含む行はソースとターゲットで異なるハッシュになり、誤った差分として報告されていました。センチネルは
+  いまやプレーンテキストの `<NULL>` になり(PG のテキストで無効な NUL も回避)、同一のデータは両エンジン
+  で同一にハッシュされます。
+- **Validation のチェックサムが、バイナリ列と BIT 列で一致するようになりました。** MySQL は
+  `BINARY`/`VARBINARY`/`BLOB`(および空間型)を生バイトとして表現する一方、ターゲット側は 16 進数を
+  使い、`BIT` は生ビット対整数で比較されていました — どちらも、格納データが同一であってもエンジン間の
+  不一致が必ず発生していました。いまやバイナリ列は両側で小文字の 16 進数としてハッシュされ(MySQL の
+  `LOWER(HEX(…))` が PG の `encode(…, 'hex')` と一致)、`BIT(n)` はその整数値として比較されます
+  (`CAST(… AS UNSIGNED)` 対 `::text`)。
+- **範囲外の MySQL `TIME` 値が、ターゲット列を破損させる代わりに明示的に失敗するようになりました。**
+  MySQL の `TIME` は `-838:59:59..838:59:59` の範囲を持ちますが、DSQL の `time` 列は
+  `00:00:00..23:59:59.999999` しか保持できません。その範囲外の値には `time` 表現が無く、静かに
+  interval(または time ではないテキストセル)としてバインドされ、列を破損させていました。Full Load は
+  いまや、対象の列と値を明示し修正方法(Schema Conversion でターゲット型を `interval`/`text` に再マップ
+  するか、ソース値を制限する)を示す明確な `ValueConversionError` を発生させ、既存の `TINYINT(1)` 範囲
+  外ガードと同様に振る舞います — データが静かに壊されることは決してありません。
+
+## v0.1.31
+
+### Fixed
+
+- **CDC のみの実行中に Validation に到達できるようになりました(もう「Complete Data Migration first」
+  ではありません)。** Data Migration 手順は、完了した Full Load を経てのみ DONE に到達していたため、
+  CDC のみのプラン — またはローカルで Full Load を一度も実行しなかった再接続セッション — では、CDC が
+  ターゲットへ実際にレプリケートしているにもかかわらず Validation が永久にロックされたままでした。CDC が
+  ストリーミング中のとき、Data Migration 手順は下流のゲーティングにおいて DONE として扱われるように
+  なりました(新しい純粋関数 `data_migration_step_after_cdc`。昇格のみを行い、終端の DONE/FAILED を
+  降格させることは決してありません)。
+
+### Known issues
+
+- **再接続した CDC のみのセッションで、オブジェクトブラウザが依然として「すべて選択」(ロック)を表示する
+  ことがあります。** CDC が稼働中でも、このセッションに Full Load のウォーターマーク(watermark)も
+  ローカルで確定したテーブル選択も無い場合(例: Connect から新規に開始した後に再接続)、ツールはローカルの
+  状態から実際にストリーミングされているテーブル集合を解決できず、ロックされたブラウザは target-existing の
+  デフォルトに後退します。これを完全に修正するには、CDC ステータスの検出中に、配備済みコネクタの実際の
+  テーブル集合(`describe_connector`)をイベントループの外で読み取る必要があります — フォローアップとして
+  追跡中です。(v0.1.30 で、ウォーターマーク/選択が既知である一般的なケースはすでに修正済みです。)
+
+## v0.1.30
+
+### Fixed
+
+- **Data Migration のオブジェクトブラウザが、CDC 稼働中に「すべて選択」を表示しなくなりました。**
+  ピッカーがロックされている(CDC ストリーミング中)とき、再接続すると汎用の「ターゲット上のすべて」という
+  デフォルトに後退し、すべてのテーブルにチェックが付いていました — CDC が実際にレプリケートしている内容を
+  誤って表示していました(しかもフリーズしているため修正もできません)。ロックされたブラウザは、いまや
+  target-existing のデフォルトではなく、実際にストリーミングされている集合(CDC コネクタのテーブル集合、
+  Full Load のウォーターマーク/確定した選択に基づく)を反映します。
+- **Schema Conversion の「Apply to target」が、CDC 実行中はブロックされるようになりました。** 稼働中の
+  CDC の最中にスキーマを適用すること — 特に、テーブルを DROP して再作成する破壊的な REPLACE — は、シンクが
+  能動的に書き込んでいるテーブルを破損または切り詰め(Debezium は DDL を伝播しません)、データ損失/パイプ
+  ライン破損のリスクがあります。一括適用とオブジェクト単位のインライン適用のいずれも、いまや警告とともに
+  停止し、まず CDC を停止するよう操作者に伝えます。(アプリから注入された CDC ステータスのプローブで
+  ガードされます。利用できない場合、適用は影響を受けません。)
+
+## v0.1.29
+
+### Added / Changed
+
+- **Schema Conversion: ソースおよびターゲットの DDL をワンクリックでコピー。** 各 DDL ブロックに
+  クリップボードへのコピーアイコンが追加されました — 横並びのソース/ターゲット差分(各サイドのヘッダー
+  バー内)と、編集不可のビュー/トリガー/ルーチンのプレビュー(各「Source DDL」/「Target DDL」ラベルの隣)の
+  両方で。コピーは肯定的なトースト表示で確認され、ブラウザのクリップボードが利用できない場合(例: 非 HTTPS)は
+  「ブロックから選択してコピー」という落ち着いた案内に後退します。
+
+## v0.1.28
+
+### Fixed
+
+- **CDC の解体が、offset-seeder Lambda の残存 ENI によってブロックされた `DELETE_FAILED` スタックを
+  自動で回復します。** offset-seeder は VPC 内で実行されます(そうする必要があります — MSK Serverless の
+  ブートストラップは VPC プライベートなので、VPC の外にあるものはギャップの無い seed レコードを生成できません)。
+  そして VPC Lambda は AWS 管理のハイパープレーン ENI を残し、AWS はそれを非同期にのみ回収します(数分から
+  数十分)。それらが残っている間は、コネクタのサブネット/セキュリティグループの削除が失敗し、スタック全体が
+  `DELETE_FAILED` に陥ります — 従来はこれが行き止まりで、CLI から ENI を手動で削除し delete-stack を再実行する
+  必要があり(このセッションで繰り返し発生)、その間 MSK/NAT は課金され続けました。`run_cdc_delete` はいまや
+  `DELETE_FAILED` を検出し、失敗したサブネット/SG を固定している残存の *デタッチ済み*(`available`)ENI を削除
+  し、削除を再発行(依然としてスタックしているものは保持)して解体を完了させます。使用中の(まだ回収中の)ENI は
+  そのままにされ、全工程を通じてベストエフォートです。(これは offset-seeder ENI の既知の問題に対する現実的な
+  解決策です。Lambda を VPC の外に移せないため、ツールが解体を自己修復するようになりました。)
+
+## v0.1.27
+
+### Fixed
+
+- **CDC の配備が、行き止まりになる代わりに、動けなくなった `UPDATE_ROLLBACK_FAILED` の cdc-stack を自動で
+  回復します。** コネクタの `UpdateConnector` が失敗すると、コネクタが RUNNING でない状態のまま残り、そのうえ
+  CloudFormation 自身のロールバックもそのリソース上で失敗し(「only valid for RUNNING」)、スタックが
+  `UPDATE_ROLLBACK_FAILED` に留まります — この状態からはそれ以上の更新を送信できません(従来は CLI から手動で
+  `continue-update-rollback` が必要でした)。`discover_stack` はいまやその状態を検出し、スタックしたリソースを
+  スキップしながらロールバックを継続するため、スタックは `UPDATE_ROLLBACK_COMPLETE` に戻り、次の Start/Retry が
+  進行します。ベストエフォート: 回復呼び出し自体がエラーになった場合は、通常の「安定した状態ではありません」という
+  エラーが表面化します。
+
+## v0.1.26
+
+### Fixed
+
+- **CDC UI: 「テーブルが選択されていません」ガードを表面化し、再試行が Prerequisites に戻ってしまうのを
+  止めます。** v0.1.25 のバックエンドガードに続き、CDC 手順はいまや明確な「少なくとも 1 つのテーブルを選択して
+  ください」という通知を表示し(設定プレビューがクラッシュしたり、数分後にコネクタ作成で配備が失敗したりする
+  代わりに)、Start CDC もジョブを送信する前に同じメッセージでブロックします。早期の「インフラをプロビジョニング
+  する」配備は、まだコネクタを作成しないため、空の選択を依然として許可します(`build_sink_config(..., allow_empty=True)`) —
+  `SinkTopics` は Start CDC 時に埋められます。
+- **コネクタが配備された後、再試行/再描画で CDC サブ手順が Prerequisites に折りたたまれることがなくなりました。**
+  アクティブなサブ手順のリゾルバには「cdc」を永続化する場所が無かったため、あらゆる再描画(CDC の再試行、再接続)は
+  full_load/prerequisites に後退し、ユーザーを稼働中の CDC ビューから引き離していました。プランに CDC が含まれ、
+  コネクタが存在する場合、CDC サブ手順はいまやピン留めされ永続化されます。
+
+## v0.1.25
+
+### Fixed
+
+- **CDC の開始が、テーブルが選択されていないときに、壊れたシンクを配備する代わりに即座に失敗するようになりました。**
+  `build_sink_config` はテーブルリストが空だと例外を投げます: Kafka Connect のシンクは空でないトピックリストを
+  必要とするため、空の選択は `SinkTopics=""` を生成し、MSK Connect は配備開始から数分後に `POST /connectors` で
+  不透明な HTTP 400 を返してコネクタを拒否していました(v0.1.24 のノートを参照)。このガードは、それを、遅く課金の
+  発生する配備が試みられる前の早期で実行可能なエラー(「少なくとも 1 つのテーブルを選択してください」)に変えます。
+  (*ソース* 側の設定は変更ありません — 空の `table.include.list` はそこでは有効で「すべてのテーブル」を意味します。)
+
+## v0.1.24
+
+### Fixed
+
+- **CDC コネクタの配備: コネクタが実際に RUNNING に到達するよう、CdcDeployRole / タスクロールの IAM を完成させ
+  ました。** MSK Connect コネクタの作成は一連の権限を必要とし、それらが少しずつ欠けていて、追加するまではそのたびに
+  コネクタの CREATE が失敗していました(または UI がスタックしていました)。稼働中の cdc-stack に対してエンドツー
+  エンドで検証済み — Debezium ソースコネクタがいまや RUNNING に到達します。追加した権限:
+  - **CdcDeployRole** に `ec2:CreateNetworkInterface` / `DescribeNetworkInterfaces` / `DeleteNetworkInterface` —
+    MSK Connect はコネクタの ENI を *呼び出し元の* 資格情報で配置します(CloudTrail で確認: `CreateNetworkInterface` は
+    `kafkaconnect.amazonaws.com` によって呼び出されるが、権限付与は配備ロールに対して行われる)。コネクタの
+    ServiceExecutionRole でも MSK Connect のサービスリンクロールでもありません。(cdc-stack の
+    `ConnectorExecutionRole` に誤って追加された ENI 付与は削除しました — サービス実行ロールには不要です。)
+  - CdcDeployRole に CloudWatch Logs の *delivery* アクション(`logs:CreateLogDelivery`、`ListLogDeliveries`、
+    `PutResourcePolicy`、…) — コネクタは CloudWatch のワーカーログ配信を有効化し、これは配備ロールを使って
+    vended-logs delivery API 経由で設定されます。これらが無いとコネクタは `InvalidInput.WorkerLogsError` で FAILED になり、
+    ワーカーログは一切書き込まれませんでした。
+  - CdcDeployRole に `kafkaconnect:DescribeConnectorOperation` / `ListConnectorOperations` を、`connector/*` と
+    `connector-operation/*` の **両方の** ARN 形状にスコープして付与 — UpdateConnector は非同期であり、そのポーリングは
+    どちらの ARN に対しても権限付与され得ます。両方が無いと CDC の再試行がスタックをロールバックさせていました。
+  - **タスクロール** そのものに `kafkaconnect:ListConnectors` / `DescribeConnector` — アプリはコネクタの状態を
+    ポーリングして CDC UI を駆動します(そしてソースパスからシンクパスへ進めます)。これが無いと AccessDenied が
+    静かに握り潰され、実際には RUNNING のコネクタが永遠に「creating…」と表示されていました。
+- **DSQL シンクコネクタが RUNNING に到達 — source→MSK→sink→DSQL の完全なパイプラインがエンドツーエンドで検証
+  されました。** IAM/インフラが完成した後、シンクは `POST /connectors` で HTTP 400 で失敗していました。根本原因は
+  **空の `SinkTopics`** パラメータでした(Kafka Connect のシンクは `topics`/`topics.regex` を必要とするため、空の値は
+  登録時に拒否されます)。`SinkTopics` が空だったのは、2 パスの Start がそれを埋めなかったためです(下記の UI 既知の
+  問題を参照)。それを `<TopicPrefix>.<db>.<table>` に設定すると、シンクコネクタが作成され稼働します。
+
+### Known issues
+
+- **UI: 「Retry CDC」が配備を実行せずにビューを Prerequisites にリセットすることがあり、** source→sink の 2 パスが
+  長いスタックのクリーンアップの後に再開されず、テーブル選択をスキップした Start は `SinkTopics`/`TableIncludeList` を
+  空のまま残します(ソースはそれを許容し — すべてのテーブルをキャプチャ — しますが、その後シンクは `POST /connectors` で
+  HTTP 400 で失敗します)。フォローアップの UX/ガードレール対応では、テーブルが選択されていないときに CDC の開始を
+  ブロックし、空のトピック状態をコネクタ作成時ではなく配備前に表面化すべきです。
+  _更新: 空テーブルでの開始はいまやブロックされ、再試行時に CDC ビューが保持されます(v0.1.26)。長いクリーンアップの後の
+  2 パス再開が残りの部分です。_
+
+## v0.1.23
+
+### Added / Changed
+
+- **「CDC を開始する前に」という通知が、より親しみやすく、より適切なタイミングになりました。** いまや、どのテーブルが
+  ストリーミングされるかを Start ボタンのすぐそばで表示します(例: 「Will stream 3 tables: …」)。そのため「選択を確定して
+  ください」を、ユーザーに上へスクロールさせる代わりに、ひと目で確認できます。MSK 容量に関する注意は、新規配備後の最初の
+  開始(ハッピーパス — 警報なし)では落ち着いた info のヒントとして表示され、コネクタが実際に以前に存在したことがある場合
+  (以前の start/stop、または復元された実行)にのみ warning に昇格します。それは、繰り返しの作成/削除が MSK の返却され
+  ない容量を実際に消費し始める時点だからです。文言も「partition quota … exhaust … force a full teardown」ではなく、平易な
+  言葉(「MSK の限られた容量であり、再び解放されることはありません」)にしました。
+
+## v0.1.22
+
+### Fixed
+
+- **CDC コネクタの配備が「Access denied for operation 'AWS::KafkaConnect::Connector'」で失敗しなくなりました。**
+  `kafkaconnect:CreateConnector` はリソースレベルのサポートがありません(作成時点でコネクタの ARN は存在しません)が、
+  CdcDeployRole はそれを `connector/mysql-dsql-cdc-*` の ARN にスコープしていたため、DebeziumSourceConnector の CREATE が
+  拒否されていました。それ(および作成時の `TagResource`)は、いまや兄弟の CreateCustomPlugin / CreateWorkerConfiguration と
+  同様に `Resource: "*"` に付与されます。他のコネクタ操作はスコープされたままです。
+- **CDC コネクタの配備が「not authorized to perform ec2:CreateNetworkInterface」で失敗しなくなりました。** MSK Connect は
+  コネクタの ServiceExecutionRole を assume してコネクタのサブネットに ENI を配置しますが、そのロール(cdc-stack の
+  `ConnectorExecutionRole`)には EC2 ネットワークインターフェイスの権限がありませんでした。MSK Connect の `EC2NetworkAccess`
+  セット(`ec2:CreateNetworkInterface` / `DescribeNetworkInterfaces` / `DeleteNetworkInterface` + attach/detach/permission、
+  `Resource: "*"`)を追加し、コネクタが自身の ENI を作成/クリーンアップできるようにしました。(この 2 つは潜在的でした —
+  それ以前の CDC の失敗はコネクタの CREATE 段階より前で止まっていたため、コネクタは実際に一度も作成されたことがなかった
+  のです。)
+
+### Added / Changed
+
+- **Full-load-only の実行が完了した後、Full Load 手順が CDC を提案するようになりました。** Full-load-only のマイグレーション
+  には CDC フェーズがない(「Continue to CDC」ボタンがない)ため、完了時に info の通知が継続的レプリケーションの追加方法を
+  説明します: マイグレーションタイプを「CDC only」に変更する(この Full Load のウォーターマークから、すでにロード済みの
+  ターゲットへストリーミングし、再スナップショットはしません)。CDC インフラをまず配備する必要があるかもしれない点も添えます。
+
+## v0.1.21
+
+### Added / Changed
+
+- **Migration Plan は、3 択のマイグレーションタイプのタイル一式の代わりに、単一の「Include CDC?」という質問を尋ねる
+  ようになりました。** この手順の唯一の永続的な効果は、CDC ストリーミングインフラ(MSK、約 15〜20 分)を早期にプロビジョニング
+  するかどうかなので、コミットメントを誇張するのではなく、まさにそれ(Yes / No)を尋ねます — タイプは Data Migration で
+  自由に変更でき、Full Load は常に実行されます。No → `FULL_LOAD_ONLY`、Yes → `FULL_LOAD_AND_CDC`。より細かい Full Load + CDC
+  対 CDC のみの選択は Data Migration 手順に残ります(Yes を再選択しても CDC のみの選択を上書きしなくなりました)。基盤となる
+  `migration_type` の enum、サブ手順、prerequisite、セッションのスナップショットは変更されていません。
+- **「Migration type:」バナーは Migration Plan 手順では非表示になりました**(それ以降のすべての手順では連続性のために引き続き
+  表示されます)。プラン手順では「Include CDC?」コントロールが真実の源であるため、2 値の決定の上に 3 値のバナー(「Full load +
+  CDC」)があるのは冗長で、矛盾しているように読めました。
+
+## v0.1.20
+
+### Fixed
+
+- **Aurora DSQL への接続が、IPv4 のみの Fargate タスクでタイムアウトしなくなりました。** DSQL クラスターのエンドポイントは
+  デュアルスタックです(DNS は A レコードと AAAA レコードの両方を返します)が、IPv4 のみのサブネット/ENI(IPv6 CIDR なし、
+  IPv6 SG の egress なし)上の Fargate タスクは IPv6 アドレスへの経路を持ちません。glibc は AAAA を先に返すことがあり、
+  ドライバ(psycopg/libpq)は到達不能な IPv6 上で `connect_timeout` までブロックし、IPv4:5432 は到達可能であるにもかかわらず、
+  UI には「Connection failed: connection timeout expired」として表面化していました。コンテナイメージはいまや、すべての外向き
+  名前解決で IPv4 を優先するようになったため(`/etc/gai.conf`: `precedence ::ffff:0:0/96 100`)、`getaddrinfo` は到達可能な
+  IPv4 アドレスを先に返し、接続は成功します。本物のデュアルスタックタスクでも無害です(単に IPv4 が先に試されるだけです)。
+- **CDC のソースシークレットの再プロビジョニングが、解体後に AccessDenied で失敗しなくなりました。** タスクロールの
+  `provision-cdc-source-secret` ポリシーには `secretsmanager:RestoreSecret` が欠けていましたが、upsert は、以前の解体が削除を
+  スケジュール(復旧ウィンドウ)した同名のシークレットを、新しい値を書き込む前に復元します。削除後の CDC ソースシークレットの
+  再プロビジョニングがいまや成功します。このアクションは `mysql-dsql-migrator/cdc/*` のプレフィックスにスコープされたままです。
+
+### Added / Changed
+
+- **デプロイガイド + スタック詳細フォームの明確化。** 「Specify stack details」は、いまや必須フィールドの表と自己署名証明書の
+  1 行コマンドで始まります。デスクトップブラウザのアクセス用の組み合わせ(`AlbScheme=internet-facing` + パブリックな
+  `AlbSubnetIds` + `AllowedIngressCidr=<your-ip>/32`)が明記され、`HttpsEgressCidr` は「`0.0.0.0/0` のデフォルトを維持する」
+  (PrivateLink のときのみ絞る)と文書化されました。`ServiceSubnetIds` のガイダンスには、VPC にプライベート/NAT サブネットが
+  ない場合は ALB のサブネット + `AssignPublicIp=ENABLED` を再利用できると記載しています。
+
+## v0.1.19
+
+### Fixed
+
+- **Validation が、完了した実行を「in progress」(その後リフレッシュすると「not started」)と表示しなくなりました。**
+  IN_PROGRESS→DONE への切り替えは Validation 画面でのみ動作するポーリングタイマーによって駆動されるため、実行の途中で
+  別の画面へ移動する(例: Data Migration へ)と、ジョブが終了した後も手順が IN_PROGRESS のままスタックし、その後、
+  孤立したステータスの照合が完了レポートを「not started」として破棄していました。いまや、実行が実際に終了した
+  (レポートが存在する)のに手順が古い IN_PROGRESS で稼働中のジョブが無い場合、**DONE** に照合し、レポートを表示します。
+
+### Added / Changed
+
+- **CDC ライフサイクル + コネクタの状態遷移のアクティビティログ記録。** コントロールプレーンのアクション(CDC インフラの
+  deploy / start / stop / delete)およびコネクタの RUNNING/FAILED の遷移は、いまや個別のマイルストーンとしてアクティビティログに
+  追記されます(重複排除あり。連続的なラグ/スループットはログではなく、ライブパネルに残ります)。
+- **Cut over: 「Steps to cut over」の 1〜6 のランブックが大きくなり、読みやすくなりました**(重要なガイダンスが小さすぎ
+  ました) — cut-over のランブックのみにスコープしています。
+- **デプロイガイド: 完全な解体順序。** Teardown セクションはいまや、完全な廃止シーケンスを列挙します — コストのかかる
+  **cdc-stack** を最初に削除し(「Start over → Delete all CDC infrastructure」経由、または手動の `delete-stack`)、次に
+  app-stack、その次に build-stack、そして `mysql-dsql-*` のスタック / Route 53 レコード / ビルドバケットが残っていないことを
+  検証します — リソースやコストが後に残らないようにするためです。
+
+## v0.1.18
+
+### Fixed
+
+- **Full Load の再実行が、「Full load + CDC」パターンであっても、CDC が開始する前であれば確定したテーブルを DROP +
+  再作成するようになりました。** DROP + 再作成は、パターンが Full-load-+-CDC であるときは常に無効化されていました(そのため、
+  CDC 開始前の「Re-run all tables」は、新規にリロードする代わりに冪等にマージし、以前の行を「すでにそこにある」ものとして
+  残していました)。この抑制は、いまや CDC が **実際にストリーミングしているか** に応じてゲートされます: CDC 開始前の再実行は
+  確定したテーブルを DROP + 再作成し(クリーンなリロード)、能動的にストリーミングしている CDC パイプラインのみが、稼働中の
+  シンクとの競合を避けるために安全な冪等の `SKIP_EXISTING` ロード(DROP なし)を強制します。Start-Full-Load の確認は、DROP が
+  実際に行われるとき(CDC が稼働中でない)にのみ「will be DROPPED」警告を表示します。(DROP なしのリロードでは行が重複することは
+  決してありません — それは `INSERT ... ON CONFLICT (PK) DO NOTHING` です — が、ソースから削除された行が残る可能性があります。
+  クリーンなリロードはその曖昧さを取り除きます。)
+
+## v0.1.17
+
+### Fixed
+
+- **「Start / Re-run Full Load」の確認ダイアログが、数秒後に消えなくなりました。** それは定期的に再描画されるコンテンツの
+  内部に構築され、ワンショットのフラグ経由で開かれていたため、約 1.5 秒ごとの進捗ポーリングの再描画が、表示された直後に
+  それを破棄していました。いまやオンデマンドでトップレベルのクライアントコンテキストで作成・オープンされるため、
+  Confirm または Cancel するまで表示されたままになります。
+
+## v0.1.16
+
+### Fixed
+
+- **Full Load の再実行が、カスタマイズされたターゲットスキーマを元に戻さなくなりました。** オブジェクト単位の
+  **編集されたターゲット DDL**(例: `TINYINT(1)` → `smallint` の再マップ)は、いまや永続的なセッションのスナップショットに
+  永続化され、再接続/再起動時に復元されます。以前は編集がメモリ上にのみ存在していたため、再起動後に「Re-run all tables」を
+  実行すると、決定論的な変換からテーブルを再作成し(例: `smallint` を `boolean` に戻す)、範囲外の値が再びロードに失敗して
+  いました。再実行の DROP + 再作成は、いまやカスタマイズされた DDL を使用します。
+
+> 注: 復元はセッション ID で照合されるため、再起動をまたいでセッション(とその編集)を安定させるには
+> `DSQL_MIGRATOR_STORAGE_SECRET` を設定してください。コンテナの再配備は新しい一時ストレージを使用するため、
+> 再配備後は編集を再適用してください。
+
+## v0.1.15
+
+### Fixed
+
+- **Schema Conversion: 「Apply to target」が、いまや REPLACE の確認を確実に表示します。** 確認ダイアログはオブジェクト単位の
+  エディタの(ネストされた)スロット内に構築されていたため、ページオーバーレイとして描画されないことがしばしばあり — ボタンが
+  無反応に見えていました。いまやトップレベルのクライアントコンテキストで作成され、常に表示されます。
+- **Schema Conversion: 遅い適用が「parent slot deleted」でクラッシュしなくなりました。** await 後の UI フィードバック
+  (notify / refresh)は、いまや元のクライアントに再入し、ベストエフォートであるため、遅い適用の最中に破棄されたスロットが
+  例外を発生させることはありません。
+- **UI のバージョン(右上)が、実際にリリースされたバージョンを反映します。** `__version__` は、ハードコードされた値ではなく、
+  インストール済みパッケージのメタデータから読み取られるため、ビルドされた各イメージがその真のバージョンを表示します。
+
+### Added / Changed
+
+- **Schema Conversion & Data Migration: Select all / Unselect all** を両方のオブジェクトブラウザに追加し、素早い一括選択を
+  可能にしました。
+- **Schema Conversion: 「Generate DDL for selected」が生成後にロックされ**、「Reset all」の後に再度有効になるため、再生成が
+  常に明白になります(2 度目のクリックが、同じスコープを静かに再実行することがなくなりました)。
+- **Data Migration: より明確な事前選択のキャプション** — いくつのテーブルがなぜ(すでにターゲット上に存在するため)事前選択
+  されているかを、Select all / Unselect all コントロールとともに示します。
+- **隔離(quarantine)された行は、テーブルの失敗として扱われるのではなく、再フレーミングされます。** ロードは成功したが、DSQL の
+  ハード制限が拒否した行(例: 値あたり約 1 MiB の制限を超える値)を恒久的にドロップせざるを得なかったテーブルは「Done — quarantined」
+  (アンバー)として表示され、実際の再試行可能な失敗(赤)とは区別されます。
+- **テーブル単位の Reload。** ちょうど 1 つのテーブルに対して Full Load を再実行します(DONE のものでも) — 例: 過大なソース値を
+  修正して、以前に隔離された行がロードされるようにした後 — 他のテーブルはそのまま維持します。
+- **隔離された行を受け入れて続行(CDC のオーバーライド)。** Full Load が、恒久的に隔離された行のためだけに未完了である場合、その
+  ギャップを承知したうえで、再実行せずに CDC のブロックを解除できます。ギャップは依然として Validation で報告されます。再試行可能な
+  実際の失敗は依然としてブロックします(オーバーライドが復旧可能な失敗を隠すことは決してできません)。
+
+## v0.1.14
+
+### Fixed
+
+- **Schema Conversion: 編集が、いまや REPLACE 経由で確実に適用されます(以前はまだスキップされることがありました)。**
+  v0.1.13 は自動 REPLACE を、古かったり利用できなかったりする可能性のある UI 側の存在チェックにゲートしていたため、編集された
+  オブジェクトが依然として「SKIPPED — already existed; left unchanged」として戻ってくることがありました。編集されたオブジェクトの
+  適用は、いまや常に REPLACE の確認を経由します(REPLACE の `DROP ... IF EXISTS` は、まだ存在しないオブジェクトも安全に扱います)ので、
+  確認すると編集が反映されます。
+- **Schema Conversion: 適用が、開いていた Generated-DDL パネルを折りたたまなくなりました。** 適用後の再描画は、いまやすべてを
+  折りたたむ代わりに、各展開の開/閉の状態をオブジェクトごとに保持します。
+
+### Notes
+
+- UI の修正。`:0.1.14` イメージで出荷されます。
+
+## v0.1.13
+
+### Changed
+
+- **Schema Conversion: すでに存在する編集済みオブジェクトの適用が、静かにスキップする代わりに、いまや REPLACE(確認付き)を
+  使用します。** 以前は、変換された DDL を編集(例: 列の型を再マップ)してデフォルトの SKIP モードで「Apply to target」をクリックしても、
+  すでに存在するターゲットオブジェクトは手つかずのまま残され — 編集が静かに反映されず、唯一のフィードバックは短い SKIPPED トーストのみ
+  だったため、「何も起きなかった」ように見えていました。オブジェクト単位の適用は、いまや既存オブジェクトへの編集を検出し、それを
+  REPLACE の確認ダイアログ(「DROP して再作成 …」)経由でルーティングするため、確認すると変更が実際に反映されます。編集されていない
+  既存オブジェクトは依然としてスキップされ(冪等)、まだ存在しない編集済みオブジェクトは通常どおり作成されます。
+
+### Notes
+
+- UI/挙動の変更。`:0.1.13` イメージで出荷されます。
+
+## v0.1.12
+
+### Changed
+
+- **DSQL がサポートしないソース列は、いまや `bytea` として保存されます — ブロックされたり静かに NULL 化されたりすることは
+  決してなく — Full Load と CDC の両方にわたって。** MySQL の空間列(geometry/point/…)を持つテーブルは、以前は Schema Conversion で
+  全体が失敗していました(UNSUPPORTED の読み取り専用コメントのプレースホルダー)。いまや:
+  - **Schema Conversion** は空間列を `bytea` にマップし、実際の編集可能な `CREATE TABLE` を生成します(MANUAL に分類され、
+    「生バイト(WKB)として保存」のノート付き)。それを `text`(WKT)に編集する、列をドロップする、または `bytea` のまま保つことが
+    依然として可能です。
+  - **Full Load** は列を `ST_AsBinary(col)` 経由で読み取ります → WKB バイト → `bytea`。
+  - **CDC**: カスタムの DSQL シンクが Debezium の geometry 論理型(`io.debezium.data.geometry.Geometry`/`Geography`/`Point`)を
+    その WKB バイトに変換します → `bytea` — Full Load が書き込むのと **同じバイト**です(FL/CDC の一致。SRID は両方の経路で
+    ドロップされ、プレーンな WKB)。予期しない形状はそのままバインドされるため、DLQ へと明示的に失敗します — 静かに NULL 化される
+    ことは決してありません。
+  - 共有の write contract(`converter.DSQL_WRITE_CONTRACT_CASES`)が geometry → `bytea` を記録するため、Full Load(Python)と
+    CDC(Java)の書き込み経路が歩調を合わせたままになります。
+
+### Notes
+
+- CDC の geometry 処理が稼働中のパイプラインに反映されるには、DSQL シンクコネクタのプラグインを再ビルド/再公開する必要があり、
+  次のイメージ + プラグインのビルドで出荷されます。
+
+## v0.1.11
+
+### Changed
+
+- **Full Load の値変換が、いまや適用されたターゲットスキーマに従います。** 値変換器は以前、各列のターゲット型を *ソース* の
+  MySQL 型から再導出していたため、Schema Conversion で再マップされた列(例: `TINYINT(1)` → `boolean` ではなく `smallint`)は無視され、
+  0/1 でない値がテーブル全体を失敗させていました。Full Load はいまや、各値を *適用された* ターゲット型(変換/編集された DDL から
+  パースされる)に合わせて変換するため、`smallint`/`integer` に再マップされた列は 0/1 でない値を整数としてロードします。本物の
+  boolean 列は影響を受けません。
+- **fresh/replace の再ロードが、カスタム再マップされたターゲットスキーマを保存します。** fresh-load の再作成ステップは、いまや
+  決定論的な再導出ではなく、適用された(編集された)DDL から DROP + 再作成するため、フルの再ロード時にユーザーの再マップが静かに
+  上書きされることはありません。
+
+### Fixed
+
+- boolean の値変換の競合メッセージが、いまやユーザーに、Schema Conversion で列のターゲット型を `smallint`/`integer` に再マップし
+  (いまや有効)、テーブルを再試行するよう案内します(ソース側の変更のみを提案していたのから改善しました)。
+
+### Notes
+
+- 新しいコンテナイメージはまだ公開されていません(v0.1.10 とバッチにしています)。ローカルでは UI を再起動して取り込んでください。
+  ECS では次のイメージビルドで出荷されます。
+
+## v0.1.10
+
+### Fixed
+
+- **Schema Conversion のプレビュー: 自動変換できないオブジェクトは「Unsupported」とラベル付けされ、「Apply to target」ボタンを
+  表示しません。** 特定のプレースホルダー(例: MySQL の空間型)を持つテーブルは、以前は単に「N warning(s)」として表示され、編集可能な
+  ままで、Apply ボタンが提供されていました(押しても no-op / SKIP)。プレビューはいまや、(1) オブジェクトのヘッダーに変換の重大度
+  (「Unsupported」/「Review needed」)を表面化し、(2) 汎用の未変換ノートだけでなく、**すべての** 非 `CREATE` プレースホルダーを未自動変換
+  として扱います: 読み取り専用で、再設計の理由と AI 提案のオプションとともに表示され、適用の対象として提供されることは決してありません。
+  これは、適用の経路でそのようなオブジェクトを既に SKIP する v0.1.9 を補完します。
+
+## v0.1.9
+
+### Fixed
+
+- **Schema Conversion: 自動変換できないテーブルは、いまや FAILED ではなく SKIPPED になります。** 変換器が自動変換できなかった
+  テーブル(例: MySQL の空間/geometry 列を持つもの。Aurora DSQL には対応する型がありません)を適用すると、変換器がそれに対して
+  (`CREATE` ではなく)コメントのプレースホルダーを出力するため、紛らわしい `SchemaApplyError: target DDL must be a CREATE
+  TABLE/VIEW/MATERIALIZED VIEW/INDEX statement` が発生していました。そのようなテーブルは、いまや再設計の理由(その評価に一致)とともに
+  **SKIPPED** として報告され、適用器に送られることは決してありません。他の選択されたテーブルは通常どおり適用されます。
+
+## v0.1.8
+
+### Fixed
+
+- **CDC の offset-seeder(ギャップの無い Full Load → CDC の引き継ぎ)が、いまや配備できます。** CDC が Full Load のウォーターマーク
+  (`SeedOffset`)とともに配備されると、cdc-stack は VPC 内の offset-seeder Lambda とその独自の IAM ロールを作成し、それはカスタム
+  リソースによって呼び出されます。assume された `CdcDeployRole` にはこれを行う権限が欠けていたため、配備は `AccessDenied` で失敗して
+  ロールバックしていました。`CdcDeployRole` に追加:
+  - `function:mysql-dsql-cdc-*` に対する `lambda:*` のライフサイクル(`CreateFunction`/`DeleteFunction`/`InvokeFunction`/…);
+  - IAM ロール管理のスコープを `*-ConnectorExecutionRole-*` から `role/mysql-dsql-cdc-*` に拡大し、自動命名される offset-seeder
+    ロールもカバーするようにしました;
+  - `lambda.amazonaws.com` への `iam:PassRole`(MSK Connect に加えて)。
+- **CDC インフラ: MSK Serverless クラスターの作成。** MSK Serverless クラスターの作成は呼び出し元の資格情報で VPC を検証するため、
+  assume された `CdcDeployRole` は `ec2:DescribeVpcAttribute`(および `ec2:DescribeAvailabilityZones`)も必要とします。これらが無いと
+  配備は `You are not authorized to perform DescribeVpcAttribute` で失敗し、ロールバックしていました。
+- **CDC インフラ: コネクタロールの作成 + ロールバックのクリーンアップ。** `logs:DescribeLogGroups`(CloudFormation が `!GetAtt` の
+  ために LogGroup の `Arn` を解決する際に呼び出します)にはリソースレベルのサポートが無いため、いまやコネクタのロググループに
+  固定されるのではなく、アカウント/リージョンのロググループにスコープされた独自のステートメントになりました。そして MSK Serverless
+  クラスターの削除には `kafka:DeleteCluster` が必要です(`DeleteClusterV2` は存在しません) — これが無いとロールバック/解体が
+  クラスターを孤立させたままにしていました。
+- **不要になった Glue Schema Registry の権限を削除** しました: パイプラインは(v0.1.5 以降)組み込みの JSON コンバータを使用し、Glue
+  レジストリを作成しないため、`glue:*` の付与は未使用でした。
+
+### Notes
+
+- デプロイテンプレートのみ(app-stack の IAM)。**コンテナイメージの変更はありません** — 公開されている `:0.1.7` イメージは変更されず、
+  デフォルトのままです。
+
+## v0.1.7
+
+### Fixed
+
+- **CDC インフラが、いまや配備されます(cdc-stack)。** assume された `CdcDeployRole` 経由での cdc-stack の配備が、IAM 権限の不足と
+  テンプレートのバグにより失敗してロールバックしていました。修正:
+  - `CdcDeployRole` の IAM: 特大のテンプレートをプラグインバケットにステージング(`s3:PutObject`/`GetObject`);MSK Connect の
+    プラグイン + ワーカー設定のタグ権限(`kafkaconnect:TagResource`/`ListTagsForResource`/`UntagResource`)を、作成アクション
+    (リソースレベルのサポートが無い)に対して `Resource: "*"` で付与;そして VPC エンドポイントの権限(`ec2:CreateVpcEndpoint`、…)。
+  - `cdc-stack.yaml`: 無効な `!GetAtt ConnectorS3Endpoint.PrefixListId`(`AWS::EC2::VPCEndpoint` にはそのような属性がありません)を
+    削除し、EC2 の 256 文字未満 / 制限された文字セットのルールを満たすためにセキュリティグループのルールの説明を短縮しました。
+
+### Changed
+
+- デフォルトの `ContainerImageUri` → 公開されている `:0.1.7` イメージ。
+
+> 注: CDC の **インフラ** 経路はエンドツーエンドで検証済みです。コネクタの開始(「Start CDC」)と offset-seeder
+> (ウォーターマーク/ギャップの無い引き継ぎ)の経路は別途強化中です。
+
+## v0.1.6
+
+### Fixed
+
+- **CDC インフラの配備が、公開イメージで動作します。** 「Deploy CDC infrastructure」が実行時に読み取る cdc-stack の
+  CloudFormation テンプレート(`deploy/cdc-stack/cdc-stack.yaml`)がコンテナイメージにバンドルされていなかったため
+  (Dockerfile がそれをコピーせず、`.dockerignore` が `deploy/` を除外していた)、クリーンなイメージは「Could not read the
+  cdc-stack template」で失敗していました。いまやテンプレートはイメージにバンドルされています。
+
+### Changed
+
+- デフォルトの `ContainerImageUri` を公開されている `:0.1.6` イメージに引き上げました(新規の配備が CDC テンプレートの修正を含むように)。
+
+## v0.1.5
+
+### Changed
+
+- **CDC の配備コスト見積もりが、月あたりではなく時間あたりで表示されます**。これは、ツールが CDC パイプラインを(カットオーバー期間の間)
+  一時的に使用することに合わせたものです。そして、パイプラインが使用しない **Glue が** 列挙されたコストドライバーから **削除** されました。
+
+## v0.1.4
+
+### Fixed
+
+- **Schema Conversion が、サポートされない空間型で空白にならなくなりました。** MySQL の空間型(`POINT`、`LINESTRING`、`POLYGON`、…)を
+  使用するテーブルは、以前は Schema Conversion 手順全体を中断させる `sqlglot` の `ParseError` を発生させていました。この失敗はいまや
+  テーブルごとに分離されます: 影響を受けたテーブルは明確な理由(空間列を名指し)とともに `UNSUPPORTED` に分類され、残りのテーブルは
+  引き続き変換されます。
+- **Migration plan 手順の「Deploy CDC infrastructure」ボタンが、いまや機能します。** クリックは静かな no-op でした。非同期の
+  confirm-dialog/deploy ハンドラが `await` なしで呼び出されていた(コルーチンが await されることがなかった)ためです。ハンドラは
+  いまや await されるため、確認ダイアログが開き、配備が開始します。
+
+### Changed
+
+- **app-stack のネットワークガードレール。** `AllowedIngressCidr` のガイダンスが明確化され(インターネット向けの ALB → 自分の
+  パブリック IP を `x.x.x.x/32` として設定)、`SourceDbSecurityGroupId` / `SourceDbCidr` のうち少なくとも一方を必須とする新しい
+  `SourceReachabilityRequired` ルールにより、タスクが常にソース DB への egress を持つようにしました(配備後の静かな「ソースに接続
+  できない」を防止)。
+- **AI 支援モデルの選択。** `BedrockModelId` は、いまや Anthropic のキュレーションされたドロップダウンになり、タスクロールの
+  `bedrock:InvokeModel` のスコープは選択されたモデルから自動的に導出されます。`BedrockModelArns` は任意のオーバーライドになります。
+- **`CertificateArn` のテスト経路を文書化しました。** デプロイガイド(EN/KO)が整理されました: より明確な任意のセクション、そして
+  パブリック IP / テスト証明書の前提条件が前面に表面化されました。
+
+## v0.1.3
+
+- 以前に公開されたベースライン(ECR Public イメージ `:0.1.3`)。

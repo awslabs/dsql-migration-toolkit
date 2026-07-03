@@ -1,6 +1,6 @@
 # 1. Set up
 
-_Language: **English** | [한국어](../ko/01-setup.md)_
+_Language: **English** | [한국어](../ko/01-setup.md) | [日本語](../ja/01-setup.md)_
 
 > **Prev:** [0. Before you begin](00-before-you-begin.md)
 

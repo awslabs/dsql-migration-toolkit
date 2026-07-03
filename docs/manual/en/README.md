@@ -1,6 +1,6 @@
 # mysql-dsql-migrator — User Manual (English)
 
-_Language: **English** | [한국어](../ko/README.md)_
+_Language: **English** | [한국어](../ko/README.md) | [日本語](../ja/README.md)_
 
 A guided manual for migrating an **Amazon RDS / Aurora MySQL** database to
 **Amazon Aurora DSQL** with this tool. It is written for a **database operations

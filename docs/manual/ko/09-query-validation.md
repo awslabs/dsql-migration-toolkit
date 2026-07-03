@@ -1,6 +1,6 @@
 # 9. 쿼리 검증과 AI DBA
 
-_언어: [English](../en/09-query-validation.md) | **한국어**_
+_언어: [English](../en/09-query-validation.md) | **한국어** | [日本語](../ja/09-query-validation.md)_
 
 > **이전:** [8. 테스트 및 검증](08-testing-and-verification.md)
 

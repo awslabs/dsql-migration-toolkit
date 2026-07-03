@@ -1,6 +1,6 @@
 # 5. How Validation works
 
-_Language: **English** | [한국어](../ko/05-validation.md)_
+_Language: **English** | [한국어](../ko/05-validation.md) | [日本語](../ja/05-validation.md)_
 
 > **Prev:** [4. CDC and DSQL constraints](04-cdc-and-dsql-constraints.md)
 

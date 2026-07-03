@@ -1,6 +1,6 @@
 # 0. Before you begin
 
-_Language: **English** | [한국어](../ko/00-before-you-begin.md)_
+_Language: **English** | [한국어](../ko/00-before-you-begin.md) | [日本語](../ja/00-before-you-begin.md)_
 
 Read this short page **before** you start a migration. Aurora DSQL is **not** a
 version of MySQL — it's a different engine with different rules — so a handful of

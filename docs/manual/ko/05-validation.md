@@ -1,6 +1,6 @@
 # 5. Validation 동작 방식
 
-_언어: [English](../en/05-validation.md) | **한국어**_
+_언어: [English](../en/05-validation.md) | **한국어** | [日本語](../ja/05-validation.md)_
 
 > **이전:** [4. CDC와 DSQL 제약](04-cdc-and-dsql-constraints.md)
 

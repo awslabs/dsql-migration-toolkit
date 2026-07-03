@@ -1,6 +1,6 @@
 # 7. Performance, tuning, and why this design
 
-_Language: **English** | [한국어](../ko/07-performance-and-tuning.md)_
+_Language: **English** | [한국어](../ko/07-performance-and-tuning.md) | [日本語](../ja/07-performance-and-tuning.md)_
 
 > **Prev:** [6. Limitations](06-limitations.md)
 

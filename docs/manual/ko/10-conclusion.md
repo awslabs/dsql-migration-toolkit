@@ -1,6 +1,6 @@
 # 10. 결론
 
-_언어: [English](../en/10-conclusion.md) | **한국어**_
+_언어: [English](../en/10-conclusion.md) | **한국어** | [日本語](../ja/10-conclusion.md)_
 
 > **이전:** [9. 쿼리 검증과 AI DBA](09-query-validation.md)
 

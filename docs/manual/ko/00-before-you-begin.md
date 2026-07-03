@@ -1,6 +1,6 @@
 # 0. 시작하기 전에
 
-_언어: [English](../en/00-before-you-begin.md) | **한국어**_
+_언어: [English](../en/00-before-you-begin.md) | **한국어** | [日本語](../ja/00-before-you-begin.md)_
 
 마이그레이션을 시작하기 **전에** 이 짧은 페이지를 읽으세요. Aurora DSQL은 MySQL의 한 버전이 **아니라**
 규칙이 다른 별개의 엔진이므로, 몇 가지 사실이 첫 단계부터 계획을 좌우합니다. 아래 각 항목은 한 줄 "반드시

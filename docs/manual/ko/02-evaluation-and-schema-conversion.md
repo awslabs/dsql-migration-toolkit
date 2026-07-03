@@ -1,6 +1,6 @@
 # 2. Evaluation과 Schema Conversion
 
-_언어: [English](../en/02-evaluation-and-schema-conversion.md) | **한국어**_
+_언어: [English](../en/02-evaluation-and-schema-conversion.md) | **한국어** | [日本語](../ja/02-evaluation-and-schema-conversion.md)_
 
 > **이전:** [1. 설정](01-setup.md)
 

@@ -1,0 +1,188 @@
+# 4. CDC の動作と DSQL 制約の処理方法
+
+_言語: [English](../en/04-cdc-and-dsql-constraints.md) | [한국어](../ko/04-cdc-and-dsql-constraints.md) | **日本語**_
+
+> **前へ:** [3. Full Load](03-full-load.md)
+
+**CDC (Change Data Capture)** は、ほぼ無停止のカットオーバーを実現するための **オプション** のストリーミングパイプラインです。Full Load が既存の行をコピーした後、CDC はソース側で発生するすべての新規 insert/update/delete を反映し、DSQL を継続的に最新の状態に保ちます。これにより、長時間の停止を伴わず、最小限のダウンタイムでカットオーバーできます。
+
+CDC が必要になるのは、**大規模または継続的な** マイグレーションの場合だけです。短時間の凍結が許容される一回限りのカットオーバーであれば、Full Load だけで十分です。
+
+---
+
+## 4.1 パイプライン
+
+```
+Source MySQL ──binlog (ROW+GTID, read-only)──►  Debezium MySQL source connector
+                                                        │  change events
+                                                        ▼
+                                                 Amazon MSK (Kafka)
+                                          per-table topics, keyed by PK  + DLQ
+                                                        │
+                                                        ▼
+                                       Custom DSQL Sink Connector (our Java plugin)
+                                          IAM token · idempotent upsert/delete
+                                          statement-level OCC retry · ≤3000-row batches
+                                                        │
+                                                        ▼
+                                                  Aurora DSQL
+```
+
+- **Debezium MySQL source connector** は、ソースのバイナリログを読み取り専用で読み込み、変更イベントを出力します。
+- **Amazon MSK (Kafka)** は耐久性のあるバックボーンです。**テーブルごとに 1 トピック** を持ち、主キーでキーイングし (ある行のすべての変更が 1 つのパーティションで順序を保つ)、加えてデッドレター (DLQ) トピックを備えます。
+- **カスタム DSQL sink connector** — このプロジェクトが所有する Java Kafka Connect プラグイン — が変更を DSQL に適用します。両方の connector は **マネージドの MSK Connect** 上で実行され、ツール自身は **sink 用のコンピュートを一切持たず**、コントロールプレーンとして機能します (構成の作成、開始オフセットのシード、監視を行います)。
+
+なぜ標準的な JDBC sink ではなく *カスタム* sink なのでしょうか。標準的な JDBC sink は楽観的並行性の競合 (`SQLSTATE 40001`) を **バッチ単位で** リトライするため、競合の激しい TB 規模の CDC ではスループットが崩壊します。カスタム sink は **ステートメント単位で** リトライし、DSQL の短命な IAM トークン、≤3000 行のバッチ、再接続を処理します (詳細は §4.4)。
+
+---
+
+## 4.2 CDC は *スキーマ* ではなく *データ* を複製する — 重要
+
+CDC は **行レベルのデータ変更** (insert / update / delete) を複製します。SQL 文や **DDL** は複製 **しません**。具体的には次のとおりです。
+
+- Debezium は `include.schema.changes=false` で実行され、sink は DML のみを適用します。
+- ソースの **DDL** (`ALTER TABLE`、`CREATE`、`DROP` など) は DSQL に **伝播されません**。
+
+DSQL のターゲットスキーマは **Schema Conversion** ステップの実行時に固定されます。**CDC の実行中にソースのスキーマを変更する場合** は、同等の DDL を (Schema Conversion 経由で) **先に** DSQL 自身に適用してください。適用するまでの間、ターゲットの形状に合致しなくなった行 (たとえば新しい列を参照する行) は失われるのではなく **DLQ** に隔離されます — サイレントではなく可視化されます。
+
+---
+
+## 4.3 ギャップのない Full Load → CDC ハンドオフ
+
+これは、バルクロードとストリームの間で **変更の取りこぼしも重複もない** ことを保証する部分です。
+
+1. Full Load は、スナップショット時点で **ウォーターマーク (watermark)** (binlog 位置 + GTID) をキャプチャしました ([第 3 章 §3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。
+2. CDC を開始すると、ツールは connector の **開始オフセットを正確にそのウォーターマークにシード** します (source connector が開始する前に、VPC 内の Lambda がオフセットレコードを書き込みます)。これにより Debezium は **スナップショット後の最初の変更** からストリーミングを開始します — 「今」からでもなく、データを再読み込みするのでもありません。
+3. source connector は **`snapshot.mode=recovery`** で実行されます。オフセットがすでにシードされているため、Debezium は (binlog イベントをデコードするために) 内部の **スキーマ履歴** を **現在のソーステーブル** から再構築し、**行データを一切再読み込みせずに** シードされたオフセットから再開します。
+
+その結果、スナップショットと「今」の間のすべての変更が正確に 1 回だけ適用されます。sink の適用は (PK でキーイングされ) **冪等** であるため、オーバーラップやリトライがあっても重複が生じることはありません。
+
+> **ウォーターマーク位置の binlog は、CDC 開始時点でまだ存在している必要があります。** このハンドオフは、ソースがウォーターマーク位置のバイナリログをまだパージしていない場合にのみ機能します。RDS/Aurora はデフォルトで binlog を積極的にパージし (Aurora MySQL は 24 時間保持)、CDC スタックのデプロイには約 15〜20 分かかるため、**開始前に binlog の保持期間を延長してください** — [§1.1](01-setup.md#11-前提条件) を参照してください。該当セグメントがすでに失われている場合、CDC はギャップなく再開できないため、新しいウォーターマークを取得するために Full Load を再実行することになります。
+
+> **なぜ単純な schema-only 開始ではなく `recovery` なのか。** シードされたオフセットが存在すると、Debezium は「再開」パスをたどり、既存のスキーマ履歴トピックを期待します。`recovery` は、行を再スナップショットせずにその履歴をライブのデータベースから再構築するモードです — まさに「データは自分ですでにロード済みなので、このオフセットから再開するだけでよい」という状況に合致します。
+
+---
+
+## 4.4 sink がデータパスで DSQL の制約を処理する方法
+
+DSQL は分散型かつ PostgreSQL 互換であるため、sink は従来の MySQL/JDBC ライターのようには動作できません。各制約に対する処理は次のとおりです。
+
+| DSQL の制約 | カスタム sink の処理方法 |
+|---|---|
+| **IAM トークン認証 (パスワードなし)** | 短命な IAM トークン (admin または standard) を生成し、TLS 経由の JDBC パスワードとして使用します。**有効期限前に更新** し (15 分のトークン、2 分の更新マージン)、長時間実行される CDC が期限切れトークンで停止しないようにします。 |
+| **楽観的並行性制御 (ロックなし)** | `SQLSTATE 40001` の場合、バッチ全体ではなく **ステートメント単位で** 指数バックオフ + ジッターによりリトライします (最大 10 回)。これが競合下でのスループットの決定的な違いです。 |
+| **トランザクションあたり ≤ 3000 行** | ≤ 3000 行のチャンク単位で適用し (デフォルトバッチは 1000)、チャンクごとに 1 回 `commit()` します。 |
+| **ステートメント単位の UPDATE / リプレイなし** | すべての変更は **PK でキーイングされた冪等な upsert または delete** です。insert/update には `INSERT ... ON CONFLICT (pk) DO UPDATE`、delete には `DELETE ... WHERE pk = ?` (および Kafka のトゥームストーン) を使用します。同じイベントの再適用は安全です。 |
+| **接続の切断 (アイドルクローズ / トークン期限切れ / ワーカー再生成)** | 切断された接続やハーフオープンの接続を検出し、新しいトークンで再接続して **同じオフセットをリプレイ** します (適用が冪等なため安全)。レコードを破棄することはありません。接続エラーは一時的なものとして扱ってリトライし、poison row と誤認しません。 |
+
+---
+
+## 4.5 値ごとの 1 MiB 上限、および DLQ
+
+DSQL は **約 1 MiB を超える単一の値** (`TEXT`/`bytea` 値) を拒否します。パイプラインは特大サイズの値を **3 つの帯域** に分けて処理します。
+
+| 値のサイズ | 処理内容 |
+|---|---|
+| **≤ 1 MiB** | 通常どおり適用されます。 |
+| **1 MiB – 8 MiB** | sink は **書き込み前に** 各値を測定し、特大サイズの値を **DLQ** に **隔離 (quarantine)** します (適用されることは決してありません)。一方でそのレコードのテーブルの残りの値はそのまま流れ続けます。そのようなレコードがデッドレター化のために Kafka を通過できるように、テーブルごとのトピックとクライアントの上限が引き上げられます (デフォルト 4 MiB、最大 8 MiB)。 |
+| **> 8 MiB** | Kafka にまったく入ることができません。これらは **キャプチャ時に除外** する必要があります。Debezium の `column.exclude.list` が特大サイズの LOB 列をドロップし (Evaluation の `OVERSIZED_LOB` フラグにより駆動)、パイプラインに到達しないようにします。 |
+
+### デッドレター化される対象
+
+特大サイズの値に加えて、DLQ は DSQL が **恒久的に** 拒否するあらゆるレコードを隔離します — 型の不一致、制約違反、ターゲット列の欠落 (たとえば伝播されていないソースの `ALTER` の後) などです。一時的な失敗 (OCC `40001`、接続の切断) は **リトライ** され、デッドレター化はされません。
+
+### DLQ が表面化する場所 — 読み取る Kafka トピックではなく CloudWatch
+
+sink は隔離した各レコードをその **CloudWatch** connector ロググループに記録し、ツールの監視機能がそれらの行をパースして UI に反映します (テーブルごとの「Quarantined」件数と、ダウンロード可能な単一のエラーログ)。記録される理由には **SQL テンプレート** (列名 + `?` プレースホルダ) が含まれますが、**行の値や認証情報は一切含まれません** — そのため、データを露出させることなく、DSQL が拒否した正確なステートメントの形状を確認できます。適用もデッドレター化もできないレコードは、サイレントにスキップされるのではなくタスクを **明示的に失敗** させます — サイレントな損失よりも可視性を優先します。
+
+---
+
+## 4.6 MySQL → DSQL の型と制約の処理 (リファレンス)
+
+これは、Schema Conversion とデータパスが SQL 方言の違いを橋渡しするために行う処理です。Full Load の値コンバーターと CDC sink の両方が従う同一のマッピングであり、共有の「write contract」がこの 2 つを一致させます。
+
+### 型マッピング (完全なリファレンス)
+
+以下のすべての MySQL データ型について、Schema Conversion がターゲット DDL 型として出力するもの、**および** その値が Aurora DSQL 上でどのように格納されるかを示します。両方のマイグレーション経路 — Full Load バルクローダー (Python) と CDC sink (Java) — が同一のマッピングに従い、共有の **write-contract** パリティテストによって強制されるため、どちらの経路でマイグレーションしても同じソース行が同一に着地します。分類: **AUTO** = 自動・ロスレス、**MANUAL** = 変換されるが検討・判断が必要、**UNSUPPORTED** = 自動変換なし (再設計)。
+
+#### 整数型
+
+| MySQL 型 | Aurora DSQL 型 | 格納される値の形式 | 分類 | 備考 |
+|---|---|---|---|---|
+| `TINYINT` | `smallint` | `smallint` | AUTO | 符号付き 8 ビット。 |
+| `TINYINT(1)` | `boolean` | `boolean` (`true`/`false`) | MANUAL | MySQL の boolean 慣例。`0/1`→`false/true`。`{0,1}` **の範囲外の値は明示的に失敗** します (サイレントな平坦化はありません)。 |
+| `SMALLINT` | `smallint` | `smallint` | AUTO | 符号付き 16 ビット。 |
+| `MEDIUMINT` | `integer` | `integer` | AUTO | PostgreSQL には 3 バイト整数がありません。`integer` が符号付き 24 ビット範囲をカバーします。 |
+| `INT` / `INTEGER` | `integer` | `integer` | AUTO | 符号付き 32 ビット。 |
+| `BIGINT` | `bigint` | `bigint` | AUTO | 符号付き 64 ビット。 |
+| `TINYINT UNSIGNED` | `smallint` | `smallint` | AUTO | `0..255` を保持するために拡幅。 |
+| `SMALLINT UNSIGNED` | `integer` | `integer` | AUTO | `0..65535` を保持するために拡幅。 |
+| `MEDIUMINT UNSIGNED` | `integer` | `integer` | AUTO | `0..16M` を保持するために拡幅。 |
+| `INT UNSIGNED` | `bigint` | `bigint` | AUTO | `0..4.29B` を保持するために拡幅。 |
+| `BIGINT UNSIGNED` | `numeric(20,0)` | `numeric(20,0)` | AUTO | より幅の広い整数型は存在しません。`2^64-1` の全範囲を保持します。(CDC は `bigint.unsigned.handling.mode=precise` が必要です。) |
+| `INT(11)`、`BIGINT(20)`、… (表示幅) | bare `smallint`/`integer`/`bigint` | `smallint`/`integer`/`bigint` | AUTO | `(N)` 表示幅は **ドロップ** されます (MySQL では表示用。PostgreSQL の整数は幅を取りません)。 |
+| `BIT(n)` | `smallint` (n≤15) / `integer` (≤31) / `bigint` (≤63) / `numeric(20,0)` (64) | `smallint`/`integer`/`bigint`/`numeric(20,0)` | MANUAL | DSQL には **`BIT` 型がありません**。ビットパターンはそれが表す符号なし整数として格納されます。 |
+
+#### 固定小数点 & 浮動小数点
+
+| MySQL 型 | Aurora DSQL 型 | 格納される値の形式 | 分類 | 備考 |
+|---|---|---|---|---|
+| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 精度/スケールを保持。**精度 > 38 は UNSUPPORTED** です (DSQL は NUMERIC を 38 に制限)。 |
+| `DECIMAL(p,s) UNSIGNED` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 符号なしは表現できず、格納上の意味を持ちません。 |
+| `FLOAT` | `real` | `real` | AUTO | 単精度 float。 |
+| `FLOAT(M,D)` | `real` | `real` | AUTO | `(M,D)` 表示仕様はドロップされます (PostgreSQL の `float` はスケールではなく 1 つの精度を取ります)。 |
+| `DOUBLE` / `DOUBLE UNSIGNED` | `double precision` | `double precision` | AUTO | 倍精度 float。 |
+
+#### 日付 & 時刻
+
+| MySQL 型 | Aurora DSQL 型 | 格納される値の形式 | 分類 | 備考 |
+|---|---|---|---|---|
+| `DATE` | `date` | `date` | AUTO | |
+| `DATETIME` | `timestamp` (タイムゾーンなし) | `timestamp` (UTC wall-clock) | AUTO | **UTC** として扱われ/正規化されます。 |
+| `DATETIME(6)` | `timestamp` | `timestamp` (UTC, microsecond precision) | AUTO | 小数秒はマイクロ秒まで保持されます。 |
+| `TIMESTAMP` | `timestamptz` | `timestamptz` (UTC instant) | AUTO | 絶対的な UTC 時点として格納されます。 |
+| `TIME` | `time` (タイムゾーンなし) | `time` | AUTO | 範囲内は `00:00:00..23:59:59`。**範囲外** の MySQL `TIME` (負の値または `> 24h`、MySQL の範囲は `-838:59:59..838:59:59`) は `time` として表現できないため **明示的に失敗** します (代わりに `interval` 列が必要です)。 |
+| `YEAR` | `smallint` | `smallint` (integer year) | MANUAL | DSQL には `YEAR` 型がありません。`1901–2155` は `smallint` に収まり、整数の年として格納されます (`YEAR` の表示セマンティクスは保持されません)。 |
+
+#### 文字列、バイナリ、構造化
+
+| MySQL 型 | Aurora DSQL 型 | 格納される値の形式 | 分類 | 備考 |
+|---|---|---|---|---|
+| `CHAR(n)` | `char(n)` | `char(n)` | AUTO | |
+| `VARCHAR(n)` | `varchar(n)` | `varchar(n)` | AUTO | |
+| `TINYTEXT`/`TEXT`/`MEDIUMTEXT`/`LONGTEXT` | `text` | `text` | AUTO | 単一の値が **> 約 1 MiB** の場合は DSQL に拒否されます → 行単位の隔離 (Full Load) / DLQ (CDC)。特大サイズの LOB 列は Evaluation でフラグ付けされます。 |
+| `COLLATE` 付きの `CHAR`/`VARCHAR`/`TEXT` (例: `utf8mb4_*_ci`) | 同一、**照合順序はドロップ** | `text` (collation dropped) | MANUAL | DSQL はデフォルトの照合順序を使用します。大文字小文字を区別しない照合順序は保持されないため MANUAL としてフラグ付けされます。 |
+| `BINARY(n)` / `VARBINARY(n)` | `bytea` | `bytea` (raw bytes) | AUTO | 長さ修飾子はドロップされます (PostgreSQL の `bytea` は取りません)。 |
+| `TINYBLOB`/`BLOB`/`MEDIUMBLOB`/`LONGBLOB` | `bytea` | `bytea` (raw bytes) | AUTO | バイナリペイロードをバイト単位で保持します。 |
+| `ENUM('a','b',…)` | `text` + `CHECK (col IN ('a','b',…))` | `text` | MANUAL | DSQL には `ENUM` がありません。順序のセマンティクスは保持されません。 |
+| `SET('x','y',…)` | `text` | `text` (comma-joined) | MANUAL | ロスレスなマッピングはありません。複数値の set セマンティクスはアプリケーションで処理します。 |
+| `JSON` | `json` | `json` | AUTO | (CDC は JSON テキストを `PGobject(type=json)` でラップし、`json` 列をターゲットにします。) |
+| 空間型 (`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL には空間型がありません。データは生の WKB バイトとして **保持** されます (Full Load は `ST_AsBinary(col)` を読み取り、CDC は Debezium の geometry の `.wkb` を抽出します。**SRID はドロップ** されます)。`geometry` の *列型* 自体は UNSUPPORTED としてフラグ付けされますが、値は失われません。 |
+
+### 構造上の制約
+
+| DSQL のルール | ツールの動作 |
+|---|---|
+| **外部キーなし** | FK 定義は DDL から削除されますが、参照整合性をアプリケーションで強制するよう促す MANUAL の注記とともに **レポートには保持** されます。 |
+| **主キー必須** | PK のないテーブルは **UNSUPPORTED** としてフラグ付けされます (ロードできません)。 |
+| **`TRUNCATE` なし** | 「置換」ロードでは `TRUNCATE` ではなく **DROP + 再作成** を使用します。 |
+| **トランザクションあたり 1 つの DDL** | Schema Conversion は実行単位ごとに正確に 1 つの DDL 文を出力します。 |
+| **`CREATE INDEX ASYNC`** | セカンダリインデックスはデータの後に非同期で作成されます。 |
+| **楽観的並行性制御** | すべてのバッチと DDL は `40001` リトライでラップされます。 |
+| **トリガー / ストアドプロシージャ / イベントなし** | **UNSUPPORTED** としてフラグ付け — アプリケーションで再実装します (スケジュールイベントは EventBridge/Lambda で)。 |
+| **ネイティブパーティショニングなし** | DSQL が自動分散します。パーティション化されたテーブルは MANUAL としてフラグ付けされます。 |
+| **クラスターあたり 1 つのデータベース** | 複数データベースのソースは MANUAL としてフラグ付けされます (スキーマに統合するか、クラスターを分割します)。 |
+
+### 互換性の分類
+
+Evaluation はすべてのオブジェクトを次のいずれかに分類します。
+
+- **AUTO** — 人手による操作なしで自動的に変換されます。
+- **MANUAL** — 変換されますが、人による判断またはアプリ側の変更が必要です (FK、`AUTO_INCREMENT`、CI 照合順序、パーティショニング、特大サイズの LOB、`ENUM`/`SET`、生成列、`ON UPDATE` タイムスタンプ、複数データベース)。
+- **UNSUPPORTED** — 自動変換なし (トリガー、ルーチン、イベント、PK なし、空間型/未サポート型、`DECIMAL` 精度 > 38、テーブルあたり列 > 255、データベースあたりテーブル > 1000、FULLTEXT/SPATIAL インデックス)。
+
+オプションの **AI アシスト** (Amazon Bedrock、デフォルトはオフ) は `MANUAL`/`UNSUPPORTED` 項目の変換を提案できます — ただし提案は **検討専用** であり、明示的な承認なしに適用されることは決してなく、AI が CDC のデータパスに入ることも **決してありません**。
+
+---
+
+**次へ:** [5. Validation →](05-validation.md)

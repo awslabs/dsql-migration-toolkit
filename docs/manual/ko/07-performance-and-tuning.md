@@ -1,6 +1,6 @@
 # 7. 성능, 튜닝, 그리고 이 설계의 이유
 
-_언어: [English](../en/07-performance-and-tuning.md) | **한국어**_
+_언어: [English](../en/07-performance-and-tuning.md) | **한국어** | [日本語](../ja/07-performance-and-tuning.md)_
 
 > **이전:** [6. 한계](06-limitations.md)
 

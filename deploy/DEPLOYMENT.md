@@ -1,6 +1,6 @@
 # Deployment Guide — MySQL → Aurora DSQL Migration Tool (app-stack)
 
-_Language: **English** | [한국어](DEPLOYMENT.ko.md)_
+_Language: **English** | [한국어](DEPLOYMENT.ko.md) | [日本語](DEPLOYMENT.ja.md)_
 
 This guide deploys the **control-plane app** as a single-task **Amazon ECS
 Fargate** service behind an **Application Load Balancer (HTTPS)** in the

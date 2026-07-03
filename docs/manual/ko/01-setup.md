@@ -1,6 +1,6 @@
 # 1. 설정
 
-_언어: [English](../en/01-setup.md) | **한국어**_
+_언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-setup.md)_
 
 > **이전:** [0. 시작하기 전에](00-before-you-begin.md)
 

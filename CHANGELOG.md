@@ -1,6 +1,6 @@
 # Changelog
 
-_Language: **English** | [한국어](CHANGELOG.ko.md)_
+_Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja.md)_
 
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).

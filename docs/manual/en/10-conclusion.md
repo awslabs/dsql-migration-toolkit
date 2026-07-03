@@ -1,6 +1,6 @@
 # 10. Conclusion
 
-_Language: **English** | [한국어](../ko/10-conclusion.md)_
+_Language: **English** | [한국어](../ko/10-conclusion.md) | [日本語](../ja/10-conclusion.md)_
 
 > **Prev:** [9. Query validation and the AI DBA](09-query-validation.md)
 

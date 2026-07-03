@@ -1,6 +1,6 @@
 # 3. Full Load 동작 방식
 
-_언어: [English](../en/03-full-load.md) | **한국어**_
+_언어: [English](../en/03-full-load.md) | **한국어** | [日本語](../ja/03-full-load.md)_
 
 > **이전:** [2. Evaluation과 Schema Conversion](02-evaluation-and-schema-conversion.md)
 
