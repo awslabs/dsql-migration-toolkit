@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.41
+
+### Changed
+
+- **CDC stack-name field is now suffix-only, so a custom name can't be silently
+  rejected.** The mandatory `mysql-dsql-cdc-` prefix is shown as a fixed, read-only
+  addon and you edit only the suffix (e.g. `orders` → `mysql-dsql-cdc-orders`).
+  Previously, typing a name without the prefix (e.g. `abcde`) was rejected and
+  reverted to `mysql-dsql-cdc-stack` with a warning — confusing, since the prefix is
+  required by the deploy role's IAM scope. Now `abcde` simply becomes the valid
+  `mysql-dsql-cdc-abcde`; only an illegal-charset suffix is rejected.
+
 ## v0.1.40
 
 ### Changed

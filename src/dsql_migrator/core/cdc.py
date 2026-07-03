@@ -427,6 +427,33 @@ def cdc_stack_name_is_valid(name: str) -> bool:
     return bool(_CDC_STACK_NAME_RE.match(name))
 
 
+def cdc_stack_name_suffix(name: Optional[str]) -> str:
+    """Return the part of a cdc-stack name AFTER the mandatory prefix.
+
+    The UI edits only this suffix (the prefix is shown fixed), so a user can never
+    type a name outside the ``mysql-dsql-cdc-*`` family. ``mysql-dsql-cdc-orders``
+    -> ``orders``; the default ``mysql-dsql-cdc-stack`` -> ``stack``. A name without
+    the prefix (shouldn't happen) yields the whole name; ``None`` yields the default
+    suffix. Pure.
+    """
+    full = (name or CDC_DEFAULT_STACK_NAME)
+    if full.startswith(CDC_STACK_NAME_PREFIX):
+        return full[len(CDC_STACK_NAME_PREFIX):]
+    return full
+
+
+def build_cdc_stack_name(suffix: str) -> Optional[str]:
+    """Build a full cdc-stack name from a user-entered suffix, or None if invalid.
+
+    Prepends the mandatory prefix and validates the whole name, so the UI can offer
+    a suffix-only field: ``orders`` -> ``mysql-dsql-cdc-orders``. Returns ``None``
+    when the resulting name is invalid (e.g. the suffix has illegal characters or is
+    empty), so the caller can keep the current name and explain the rule. Pure.
+    """
+    candidate = CDC_STACK_NAME_PREFIX + (suffix or "").strip()
+    return candidate if cdc_stack_name_is_valid(candidate) else None
+
+
 # Rough hourly USD cost components for the CDC pipeline while it is deployed.
 # Order-of-magnitude figures for us-east-1 (2025), NOT a quote -- pricing varies by
 # region and (for MSK Serverless / NAT data processing) by actual throughput. Used

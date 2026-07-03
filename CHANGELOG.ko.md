@@ -5,6 +5,17 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.41
+
+### 변경 (Changed)
+
+- **CDC 스택 이름 필드를 접미사(suffix) 전용으로 변경 — 커스텀 이름이 조용히 거부되지 않음.** 필수
+  `mysql-dsql-cdc-` 접두사를 읽기 전용 고정 애드온으로 보여 주고, 사용자는 접미사만 입력합니다(예:
+  `orders` → `mysql-dsql-cdc-orders`). 이전에는 접두사 없는 이름(예: `abcde`)을 넣으면 거부되어
+  `mysql-dsql-cdc-stack`으로 되돌아가며 경고가 떴는데 — 접두사는 배포 역할의 IAM 스코프상 필수라
+  혼란스러웠습니다. 이제 `abcde`는 그대로 유효한 `mysql-dsql-cdc-abcde`가 되고, 문자 규칙을 위반한
+  접미사만 거부됩니다.
+
 ## v0.1.40
 
 ### 변경 (Changed)

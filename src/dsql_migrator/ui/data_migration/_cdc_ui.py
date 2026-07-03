@@ -36,8 +36,10 @@ from dsql_migrator.core.cdc import (
     CdcPipelineOrchestrator,
     CdcResumePoint,
     build_cdc_infra_params,
+    build_cdc_stack_name,
     build_cdc_stack_params,
     cdc_expected_connector_names,
+    cdc_stack_name_suffix,
     cdc_stack_params_to_json,
 )
 from dsql_migrator.core.cdc_coords import (
@@ -1491,28 +1493,45 @@ def _render_cdc_infra_form(ui, migration_state, *, session=None) -> None:
 
             field.on("blur", _save)
 
-        # Advanced: the cdc-stack name. Defaults to mysql-dsql-cdc-stack; change it (e.g.
-        # mysql-dsql-cdc-orders) to run a SECOND migration's CDC alongside an existing one.
-        # Must stay in the mysql-dsql-cdc-* family the deploy role authorizes.
-        name_field = ui.input(  # type: ignore[attr-defined]
-            label="Advanced — CDC stack name (one per source DB)",
-            value=getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME),
-            placeholder="mysql-dsql-cdc-stack",
-        ).classes("w-full text-sm")
+        # Advanced: the cdc-stack name. The mandatory "mysql-dsql-cdc-" prefix is
+        # shown as a FIXED, non-editable addon and the user types only the SUFFIX
+        # (e.g. "orders" -> mysql-dsql-cdc-orders) to run a SECOND migration's CDC
+        # alongside an existing one. Editing only the suffix makes it impossible to
+        # leave the mysql-dsql-cdc-* family the deploy role authorizes, so a bare
+        # "abcde" becomes the valid "mysql-dsql-cdc-abcde" instead of being rejected.
+        with ui.row().classes("w-full items-center no-wrap gap-0"):  # type: ignore[attr-defined]
+            ui.label(CDC_STACK_NAME_PREFIX).classes(  # type: ignore[attr-defined]
+                "text-sm font-mono text-gray-500 whitespace-nowrap"
+            )
+            name_field = ui.input(  # type: ignore[attr-defined]
+                label="Advanced — CDC stack name suffix (one per source DB)",
+                value=cdc_stack_name_suffix(
+                    getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
+                ),
+                placeholder="stack",
+            ).classes("flex-1 text-sm")
+
+        def _current_suffix() -> str:
+            return cdc_stack_name_suffix(
+                getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
+            )
 
         def _save_stack_name(_e, f=name_field) -> None:
-            candidate = (f.value or "").strip()
-            if not candidate:
-                # Empty -> keep the default; reflect it back in the field.
-                f.value = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
+            suffix = (f.value or "").strip()
+            if not suffix:
+                # Empty -> keep the current name; reflect its suffix back in the field.
+                f.value = _current_suffix()
                 return
-            if migration_state.set_cdc_stack_name(candidate):
+            full = build_cdc_stack_name(suffix)
+            if full is not None and migration_state.set_cdc_stack_name(full):
+                f.value = cdc_stack_name_suffix(full)  # normalize what's shown
                 return
-            # Reject: revert to the current name and explain the rule.
-            f.value = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
+            # Reject: revert to the current suffix and explain the (charset) rule --
+            # the prefix is already guaranteed, so only the suffix charset can fail.
+            f.value = _current_suffix()
             ui.notify(  # type: ignore[attr-defined]
-                f"CDC stack name must start with '{CDC_STACK_NAME_PREFIX}' and use "
-                "only letters, digits and hyphens (e.g. mysql-dsql-cdc-orders).",
+                "CDC stack name suffix may use only letters, digits and hyphens "
+                "(e.g. 'orders' -> mysql-dsql-cdc-orders).",
                 type="warning", position="top",
             )
 

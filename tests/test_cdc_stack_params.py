@@ -392,6 +392,37 @@ def test_stack_name_empty_or_blank_rejected() -> None:
     assert not cdc_stack_name_is_valid("")
 
 
+# build_cdc_stack_name / cdc_stack_name_suffix — the suffix-only UI field. The user
+# edits only the part after the fixed prefix, so a bare word can never escape the
+# mysql-dsql-cdc-* family (the old post-hoc reject-and-revert UX is gone).
+
+
+def test_build_cdc_stack_name_prepends_prefix_and_validates() -> None:
+    from dsql_migrator.core.cdc import build_cdc_stack_name
+
+    # A bare suffix (the reported "abcde" case) becomes a VALID full name.
+    assert build_cdc_stack_name("abcde") == "mysql-dsql-cdc-abcde"
+    assert build_cdc_stack_name("orders") == "mysql-dsql-cdc-orders"
+    assert build_cdc_stack_name(" orders ") == "mysql-dsql-cdc-orders"  # trimmed
+    # Empty / illegal-charset suffix -> None (caller keeps the current name).
+    assert build_cdc_stack_name("") is None
+    assert build_cdc_stack_name("a b") is None  # space is not allowed
+    assert build_cdc_stack_name("a/b") is None
+
+
+def test_cdc_stack_name_suffix_round_trips_with_build() -> None:
+    from dsql_migrator.core.cdc import (
+        build_cdc_stack_name,
+        cdc_stack_name_suffix,
+    )
+
+    assert cdc_stack_name_suffix(CDC_DEFAULT_STACK_NAME) == "stack"
+    assert cdc_stack_name_suffix("mysql-dsql-cdc-orders") == "orders"
+    assert cdc_stack_name_suffix(None) == "stack"  # default
+    # suffix(build(x)) == x for a valid suffix (what the field relies on).
+    assert cdc_stack_name_suffix(build_cdc_stack_name("orders")) == "orders"
+
+
 def test_custom_stack_name_flows_into_params_and_connector_names() -> None:
     # A per-DB stack name must propagate to the deployable params + the connector
     # names the monitor scopes to (so two stacks never see each other's connectors).
