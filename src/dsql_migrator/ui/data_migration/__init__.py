@@ -1968,7 +1968,13 @@ def _render_full_load_step(
         with client:  # type: ignore[attr-defined]
             _build()
 
-    async def _open_full_load_confirm() -> None:
+    # Re-entrancy guard: the confirm handler runs a ~1-2s off-loop probe before
+    # opening the dialog, so a double-click would open TWO dialogs. This flag drops
+    # a second click while the first is still resolving; the clicked button is also
+    # disabled + relabeled "Checking…" for a visible cue (restored on dialog open).
+    _confirm_busy = {"value": False}
+
+    async def _open_full_load_confirm(event: object = None) -> None:
         """Check which selected target tables hold data, then open the dialog.
 
         Runs the read-only non-empty probe off the event loop so the UI stays
@@ -1976,27 +1982,56 @@ def _render_full_load_step(
         run's replace set), then opens the confirm dialog in the top-level client
         context (so the progress poll re-render cannot close it).
         """
-        migration_state.set_replace_targets(frozenset())
-        target_config = getattr(session, "target_config", None)
-        if target_config is not None and selected_names:
-            from nicegui import run
-
-            def _probe() -> frozenset[str]:
-                connector = DsqlConnector(
-                    target_config, aws_profile=session.aws_profile
-                )
-                return frozenset(
-                    tables_with_rows(
-                        list(selected_names), connection_factory=connector.connect
-                    )
-                )
-
+        if _confirm_busy["value"]:
+            return  # a probe is already in flight -> ignore the extra click
+        _confirm_busy["value"] = True
+        btn = getattr(event, "sender", None)
+        original_text = getattr(btn, "text", None) if btn is not None else None
+        # Preserve the button's own icon (play_arrow for Start, restart_alt for the
+        # terminal Re-run) so restore does not swap it for the wrong one.
+        original_icon = None
+        if btn is not None:
+            original_icon = getattr(btn, "_props", {}).get("icon")
+        if btn is not None:
             try:
-                found = await run.io_bound(_probe)
-                migration_state.set_replace_targets(found)
-            except Exception:  # noqa: BLE001 - on probe failure, warn-less confirm
-                migration_state.set_replace_targets(frozenset())
-        _open_confirm_dialog_now()
+                btn.disable()
+                btn.set_text("Checking…")
+                btn.props("icon=hourglass_top")
+            except Exception:  # noqa: BLE001 - cue is best-effort
+                pass
+        try:
+            migration_state.set_replace_targets(frozenset())
+            target_config = getattr(session, "target_config", None)
+            if target_config is not None and selected_names:
+                from nicegui import run
+
+                def _probe() -> frozenset[str]:
+                    connector = DsqlConnector(
+                        target_config, aws_profile=session.aws_profile
+                    )
+                    return frozenset(
+                        tables_with_rows(
+                            list(selected_names), connection_factory=connector.connect
+                        )
+                    )
+
+                try:
+                    found = await run.io_bound(_probe)
+                    migration_state.set_replace_targets(found)
+                except Exception:  # noqa: BLE001 - on probe failure, warn-less confirm
+                    migration_state.set_replace_targets(frozenset())
+            _open_confirm_dialog_now()
+        finally:
+            _confirm_busy["value"] = False
+            if btn is not None and not getattr(btn, "is_deleted", False):
+                try:
+                    if original_icon:
+                        btn.props(f"icon={original_icon}")
+                    if original_text is not None:
+                        btn.set_text(original_text)
+                    btn.enable()
+                except Exception:  # noqa: BLE001
+                    pass
 
     # The watermark, object browser, prerequisites, and buttons are STATIC: they
     # are rendered once per full render and must NOT be rebuilt by the 0.5s poll,

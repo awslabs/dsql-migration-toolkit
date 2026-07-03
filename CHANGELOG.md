@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.44
+
+### Fixed
+
+- **"Start Full Load" can't be double-clicked into two confirm dialogs.** Opening
+  the confirm runs a ~1–2 s read-only probe (which target tables already hold data)
+  before the dialog appears; a fast double-click used to open the dialog twice. The
+  handler now drops a second click while the probe is in flight (re-entrancy guard)
+  and shows a busy cue — the clicked button disables and reads "Checking…" with an
+  hourglass icon, restoring when the dialog opens. Applies to both the initial
+  Start and the terminal Re-run buttons.
+
 ## v0.1.43
 
 ### Changed
