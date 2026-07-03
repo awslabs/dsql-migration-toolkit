@@ -1326,6 +1326,29 @@ def test_full_load_run_guard_allows_rerun_when_already_run_without_report() -> N
     )
 
 
+def test_prerequisites_section_expanded_stays_open_while_actionable() -> None:
+    from dsql_migrator.ui.data_migration import prerequisites_section_expanded
+
+    # Open when it is the active sub-step (the normal case).
+    assert prerequisites_section_expanded(
+        active_substep="prerequisites", running=False, done=False
+    )
+    # Reconnected session: active sub-step is a LATER step, but the checks are
+    # running (just clicked "Check") -> must stay open so the spinner shows.
+    assert prerequisites_section_expanded(
+        active_substep="full_load", running=True, done=False
+    )
+    # Reconnected, not running yet, but still required (guard not cleared) ->
+    # stay open so the user can act on it.
+    assert prerequisites_section_expanded(
+        active_substep="full_load", running=False, done=False
+    )
+    # Done and not the active step -> collapse (the flow has moved on).
+    assert not prerequisites_section_expanded(
+        active_substep="full_load", running=False, done=True
+    )
+
+
 def test_full_load_run_guard_reconnect_wording_when_checks_were_cleared() -> None:
     # Reconnected session: the report isn't persisted, but the persisted
     # active_substep proves the user had already advanced past Prerequisites

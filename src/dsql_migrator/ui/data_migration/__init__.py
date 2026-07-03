@@ -974,7 +974,9 @@ def build_data_migration_screen(
                 # (done ✓ green / active ● primary / upcoming ○ grey); the section is
                 # open when it is the active sub-step. Returns nothing; the body is
                 # built by ``render_body`` inside the expansion.
-                def _substep(name, title, *, state, render_body, first=False):
+                def _substep(
+                    name, title, *, state, render_body, first=False, expanded=None
+                ):
                     icon, color = {
                         "done": ("check_circle", "positive"),
                         "active": ("radio_button_checked", "primary"),
@@ -987,7 +989,13 @@ def build_data_migration_screen(
                             ui.element("div").classes(
                                 "w-px h-4 bg-gray-300 ml-[10px]"
                             )
-                    exp = ui.expansion(value=(name == active)).classes(
+                    # Open the section that is the active sub-step by default; an
+                    # explicit ``expanded`` overrides that (e.g. keep Prerequisites
+                    # open while its checks run / are still required, even when the
+                    # persisted active sub-step is a later one after a reconnect --
+                    # otherwise the Check button's re-render would collapse it).
+                    open_now = (name == active) if expanded is None else expanded
+                    exp = ui.expansion(value=open_now).classes(
                         "w-full border border-gray-200 rounded-md"
                     )
                     with exp.add_slot("header"):
@@ -1022,6 +1030,17 @@ def build_data_migration_screen(
                                 ui, guard_reason, tone="warning", classes="text-sm"
                             )
 
+                # Keep Prerequisites expanded while it is the actionable section:
+                # its checks are running, or it still blocks (guard not cleared).
+                # Without this a reconnected session (whose persisted active
+                # sub-step is a later one) would collapse this section the instant
+                # the "Check" button triggers a re-render, hiding the running
+                # spinner and results the user just asked for.
+                prereq_expanded = prerequisites_section_expanded(
+                    active_substep=active,
+                    running=migration_state.is_prereq_running(prereq_mode),
+                    done=prereq_done,
+                )
                 _substep(
                     "prerequisites",
                     "Prerequisites",
@@ -1032,6 +1051,7 @@ def build_data_migration_screen(
                     ),
                     render_body=_prereq_body,
                     first=True,
+                    expanded=prereq_expanded,
                 )
 
                 # --- Full Load -------------------------------------------------
@@ -1213,6 +1233,22 @@ def build_data_migration_screen(
                     )
 
     return content, runner
+
+
+def prerequisites_section_expanded(
+    *, active_substep: Optional[str], running: bool, done: bool
+) -> bool:
+    """Whether the Prerequisites sub-step section should render expanded.
+
+    The section normally follows the active sub-step (open only when it is the
+    active one). But it must ALSO stay open while it is the actionable section --
+    its checks are ``running``, or it is not yet ``done`` (the run guard still
+    blocks). This is what keeps it expanded through the "Check" button's
+    re-render in a reconnected session, whose persisted ``active_substep`` may be
+    a later step (e.g. ``"full_load"``): without it, clicking Check would collapse
+    the section and hide the running spinner / results. NiceGUI-agnostic for tests.
+    """
+    return active_substep == "prerequisites" or running or not done
 
 
 def full_load_run_guard_reason(
@@ -3260,6 +3296,7 @@ __all__ = [
     "prereq_mode_for_type",
     "substeps_for_type",
     "resolve_active_substep_for_type",
+    "prerequisites_section_expanded",
     "prereq_phase_tag",
     "PrereqPhaseVerdict",
     "prereq_phase_verdicts",

@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.51
+
+### Fixed
+
+- **Prerequisites section no longer collapses when you click "Check" in a
+  reconnected session.** After an app restart you may need to (re-)run the
+  prerequisite checks. Expanding the Prerequisites section and clicking Check
+  used to collapse it immediately — the click triggers a re-render, and the
+  section only stayed open when it was the "active" sub-step, which after a
+  reconnect is a later step. It now stays expanded while it is the actionable
+  section (its checks are running, or it still blocks the run), so the running
+  spinner and the results remain visible.
+
 ## v0.1.50
 
 ### Changed
