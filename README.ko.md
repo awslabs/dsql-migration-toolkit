@@ -34,8 +34,7 @@ Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 분산 데이터베이스
 
 ![아키텍처 다이어그램](deploy/architecture-aws-simple.png)
 
-> 편집 가능한 소스: [`deploy/architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio)
-> (draw.io로 열기). 상세 토폴로지는 [아키텍처](#아키텍처)에 있습니다.
+> 상세 토폴로지는 [아키텍처](#아키텍처)에 있습니다.
 
 ## 할 수 있는 것 / 없는 것
 
@@ -128,8 +127,6 @@ Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 분산 데이터베이스
 > **더 알아보기:**
 > - 전체 AWS 아이콘 토폴로지: [`deploy/architecture-aws.png`](deploy/architecture-aws.png)
 >   (간소화 개요: [`deploy/architecture-aws-simple.png`](deploy/architecture-aws-simple.png)).
->   편집 가능한 draw.io 소스: [`architecture-aws.drawio`](deploy/architecture-aws.drawio),
->   [`architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio).
 > - 사용 서비스별 역할: 아래 [사용되는 AWS 서비스](#사용되는-aws-서비스).
 > - CDC·DSQL 제약의 데이터 경로 동작: 사용자 매뉴얼
 >   [4장 — CDC와 DSQL 제약](docs/manual/ko/04-cdc-and-dsql-constraints.md).

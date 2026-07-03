@@ -67,6 +67,9 @@ RESUME_CONTEXT.md
 # Internal release-readiness review notes (produced by another tool). Not for the
 # public repo; ignored so a blanket `git add -A` can never capture it.
 docs/public-release-readiness-review-*.md
+# Editable draw.io architecture sources are NOT shared publicly -- only the
+# rendered PNGs (deploy/architecture-aws*.png) are committed for readers.
+*.drawio
 # Per-environment CDC deploy parameter files (account id, real ARNs, VPC/subnet
 # ids, MSK bootstrap). Regenerated per environment; not source — never commit.
 # Broad glob so ANY *params*.json under the cdc-stack tree is ignored (not just

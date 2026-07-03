@@ -35,8 +35,7 @@ tool, and an optional continuous **CDC** stream that runs on managed MSK Connect
 
 ![Architecture diagram](deploy/architecture-aws-simple.png)
 
-> Editable source: [`deploy/architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio)
-> (open with draw.io). The detailed topology is in [Architecture](#architecture).
+> The detailed topology is in [Architecture](#architecture).
 
 ## What it does / doesn't do
 
@@ -152,8 +151,6 @@ For a one-glance view of the whole path, see [At a glance](#at-a-glance) above.
 > **Learn more:**
 > - Full AWS-icon topology: [`deploy/architecture-aws.png`](deploy/architecture-aws.png)
 >   (simplified overview: [`deploy/architecture-aws-simple.png`](deploy/architecture-aws-simple.png)).
->   Editable draw.io sources: [`architecture-aws.drawio`](deploy/architecture-aws.drawio),
->   [`architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio).
 > - Per-service roles: [AWS services used](#aws-services-used) below.
 > - How CDC and DSQL constraints behave in the data path: User Manual
 >   [Chapter 4 — CDC and DSQL constraints](docs/manual/en/04-cdc-and-dsql-constraints.md).

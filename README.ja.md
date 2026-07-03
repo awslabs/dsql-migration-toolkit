@@ -34,8 +34,7 @@ Aurora DSQL は MySQL ではなく PostgreSQL 16 互換の分散データベー�
 
 ![アーキテクチャ図](deploy/architecture-aws-simple.png)
 
-> 編集可能なソース: [`deploy/architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio)
-> （draw.io で開いてください）。詳細なトポロジーは [アーキテクチャ](#アーキテクチャ) にあります。
+> 詳細なトポロジーは [アーキテクチャ](#アーキテクチャ) にあります。
 
 ## できること / できないこと
 
@@ -142,8 +141,6 @@ Web UI は、**Connect** を予備ステップとして、6 ステップのワ�
 > **詳しくは:**
 > - 完全な AWS アイコントポロジー: [`deploy/architecture-aws.png`](deploy/architecture-aws.png)
 >   （簡略版の概要: [`deploy/architecture-aws-simple.png`](deploy/architecture-aws-simple.png)）。
->   編集可能な draw.io ソース: [`architecture-aws.drawio`](deploy/architecture-aws.drawio),
->   [`architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio)。
 > - サービスごとの役割: 下記の [使用する AWS サービス](#使用する-aws-サービス)。
 > - CDC と DSQL 制約がデータ経路でどう振る舞うか: ユーザーマニュアル
 >   [第 4 章 — CDC と DSQL 制約](docs/manual/ja/04-cdc-and-dsql-constraints.md)。
