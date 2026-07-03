@@ -51,8 +51,11 @@ flowchart LR
     SNK -->|"upsert/delete"| DSQL
 ```
 
-> 編集可能な AWS アイコンのソース:
-> [`deploy/architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio)
+AWS アイコン表示（簡易版）:
+
+![簡易版 AWS アーキテクチャ](deploy/architecture-aws-simple.png)
+
+> 編集可能なソース: [`deploy/architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio)
 > （draw.io で開いてください）。詳細なトポロジーは [アーキテクチャ](#アーキテクチャ) にあります。
 
 ## できること / できないこと
@@ -142,6 +145,8 @@ Web UI は、**Connect** を予備ステップとして、6 ステップのワ�
 （既定は `internal`、任意で Cognito）として動作し、**Amazon ECR** からコンテナイメージを取得します
 （既定では公開されている ECR Public イメージ）。全経路をひと目で見るには、上記の [概要](#概要) を参照してください。
 
+![完全な AWS アーキテクチャトポロジー](deploy/architecture-aws.png)
+
 - **AI アシストはコントロールプレーンのみ** — 有効化すると、**Amazon Bedrock** が変換の提案、
   CDC 準備状況の評価、DLQ トリアージを追加しますが、**CDC のデータ経路には決して配置されません**
   （既定はオフ）。
@@ -154,9 +159,10 @@ Web UI は、**Connect** を予備ステップとして、6 ステップのワ�
   自前のシンクコンピューティングは一切動かしません。
 
 > **詳しくは:**
-> - 完全な AWS アイコントポロジー（編集可能）: [`deploy/architecture-aws.drawio`](deploy/architecture-aws.drawio)
->   （[draw.io](https://app.diagrams.net/) で開いてください）。簡略化された概要:
->   [`deploy/architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio)。
+> - 完全な AWS アイコントポロジー: [`deploy/architecture-aws.png`](deploy/architecture-aws.png)
+>   （簡略版の概要: [`deploy/architecture-aws-simple.png`](deploy/architecture-aws-simple.png)）。
+>   編集可能な draw.io ソース: [`architecture-aws.drawio`](deploy/architecture-aws.drawio),
+>   [`architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio)。
 > - サービスごとの役割: 下記の [使用する AWS サービス](#使用する-aws-サービス)。
 > - CDC と DSQL 制約がデータ経路でどう振る舞うか: ユーザーマニュアル
 >   [第 4 章 — CDC と DSQL 制約](docs/manual/ja/04-cdc-and-dsql-constraints.md)。

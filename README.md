@@ -52,8 +52,11 @@ flowchart LR
     SNK -->|"upsert/delete"| DSQL
 ```
 
-> Editable AWS-icon source:
-> [`deploy/architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio)
+AWS-icon view (simplified):
+
+![Simplified AWS architecture](deploy/architecture-aws-simple.png)
+
+> Editable source: [`deploy/architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio)
 > (open with draw.io). The detailed topology is in [Architecture](#architecture).
 
 ## What it does / doesn't do
@@ -151,6 +154,8 @@ behind an **HTTPS ALB** (`internal` by default, optional Cognito), pulling the
 container image from **Amazon ECR** (the published ECR Public image by default).
 For a one-glance view of the whole path, see [At a glance](#at-a-glance) above.
 
+![Full AWS architecture topology](deploy/architecture-aws.png)
+
 - **AI assist is control-plane only** — when enabled, **Amazon Bedrock** adds
   conversion suggestions, CDC readiness assessment, and DLQ triage, but is
   **never placed in the CDC data path** (off by default).
@@ -164,9 +169,10 @@ For a one-glance view of the whole path, see [At a glance](#at-a-glance) above.
   sink compute of its own.
 
 > **Learn more:**
-> - Full AWS-icon topology (editable): [`deploy/architecture-aws.drawio`](deploy/architecture-aws.drawio)
->   (open with [draw.io](https://app.diagrams.net/)); simplified overview:
->   [`deploy/architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio).
+> - Full AWS-icon topology: [`deploy/architecture-aws.png`](deploy/architecture-aws.png)
+>   (simplified overview: [`deploy/architecture-aws-simple.png`](deploy/architecture-aws-simple.png)).
+>   Editable draw.io sources: [`architecture-aws.drawio`](deploy/architecture-aws.drawio),
+>   [`architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio).
 > - Per-service roles: [AWS services used](#aws-services-used) below.
 > - How CDC and DSQL constraints behave in the data path: User Manual
 >   [Chapter 4 — CDC and DSQL constraints](docs/manual/en/04-cdc-and-dsql-constraints.md).

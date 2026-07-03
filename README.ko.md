@@ -51,8 +51,11 @@ flowchart LR
     SNK -->|"upsert/delete"| DSQL
 ```
 
-> 편집 가능한 AWS 아이콘 소스:
-> [`deploy/architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio)
+AWS 아이콘 뷰(간소화):
+
+![간소화 AWS 아키텍처](deploy/architecture-aws-simple.png)
+
+> 편집 가능한 소스: [`deploy/architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio)
 > (draw.io로 열기). 상세 토폴로지는 [아키텍처](#아키텍처)에 있습니다.
 
 ## 할 수 있는 것 / 없는 것
@@ -130,6 +133,8 @@ flowchart LR
 선택적 Cognito) 뒤에서 돌고, 컨테이너 이미지는 **Amazon ECR**(기본 ECR Public 이미지)에서
 가져옵니다. 전체 경로 한눈 요약은 위 [한눈에 보기](#한눈에-보기)를 참고하세요.
 
+![전체 AWS 아키텍처 토폴로지](deploy/architecture-aws.png)
+
 - **AI 보조는 컨트롤 플레인만** — 켜면 **Amazon Bedrock**이 변환 제안·CDC 준비도·DLQ 분류를
   더해 주지만, **CDC 데이터 경로에는 절대 들어가지 않습니다**(기본 off).
 - **CDC는 선택적 별도 경로** — 거의 무중단 전환이 필요하면 **Amazon MSK + Debezium** 스트리밍
@@ -140,9 +145,10 @@ flowchart LR
   직접 운영하지 않습니다.
 
 > **더 알아보기:**
-> - 전체 AWS 아이콘 토폴로지(편집 가능): [`deploy/architecture-aws.drawio`](deploy/architecture-aws.drawio)
->   ([draw.io](https://app.diagrams.net/)로 열기), 간소화 개요:
->   [`deploy/architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio).
+> - 전체 AWS 아이콘 토폴로지: [`deploy/architecture-aws.png`](deploy/architecture-aws.png)
+>   (간소화 개요: [`deploy/architecture-aws-simple.png`](deploy/architecture-aws-simple.png)).
+>   편집 가능한 draw.io 소스: [`architecture-aws.drawio`](deploy/architecture-aws.drawio),
+>   [`architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio).
 > - 사용 서비스별 역할: 아래 [사용되는 AWS 서비스](#사용되는-aws-서비스).
 > - CDC·DSQL 제약의 데이터 경로 동작: 사용자 매뉴얼
 >   [4장 — CDC와 DSQL 제약](docs/manual/ko/04-cdc-and-dsql-constraints.md).
