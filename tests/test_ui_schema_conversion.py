@@ -241,6 +241,28 @@ def test_generate_previews_only_for_ticked_tables_and_views() -> None:
     assert names == ["orders", "active_orders"]
 
 
+def test_build_object_tree_table_leaves_carry_pk_indicator_metadata() -> None:
+    # Each table leaf carries has_pk + a "header": "table" hook so the source
+    # browser's header-table slot can show a PK indicator. Views (and other
+    # object kinds) are not tables and do not carry these keys.
+    inventory = SourceInventory(
+        tables=[
+            TableDef(name="orders", primary_key=["id"]),
+            TableDef(name="audit_log", primary_key=[]),  # no PK
+        ],
+        views=[ViewDef(name="active_orders", definition="SELECT 1")],
+    )
+    tree = build_object_tree(inventory, schema_label="app")
+    categories = {child["id"]: child for child in tree[0]["children"]}
+    tables = {n["id"]: n for n in categories["category:tables:app"]["children"]}
+    assert tables[f"{TABLE_PREFIX}orders"]["has_pk"] is True
+    assert tables[f"{TABLE_PREFIX}orders"]["header"] == "table"
+    assert tables[f"{TABLE_PREFIX}audit_log"]["has_pk"] is False
+    # A view leaf is not a table -> no PK hook on it.
+    views = categories["category:views:app"]["children"]
+    assert all("header" not in v and "has_pk" not in v for v in views)
+
+
 def test_build_object_tree_annotates_existing_target_objects() -> None:
     tree = build_object_tree(_inventory(), existing_objects=["orders"])
     tables = tree[0]["children"][0]["children"]

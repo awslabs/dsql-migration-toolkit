@@ -966,12 +966,17 @@ def build_object_tree(
 
     for table in inventory.tables:
         schema, obj = _split_schema(table.name, schema_label)
-        bucket(schema)["tables"].append(
-            _node(
-                f"{TABLE_PREFIX}{table.name}",
-                _object_label(obj, exists_on_target=table.name in existing),
-            )
+        table_node = _node(
+            f"{TABLE_PREFIX}{table.name}",
+            _object_label(obj, exists_on_target=table.name in existing),
         )
+        # Carry a primary-key flag + a "header": "table" hook so the source
+        # browser's "header-table" Quasar slot can show a small PK indicator
+        # beside each table leaf (Aurora DSQL requires a primary key). Only table
+        # leaves get this; views/triggers/routines have no PK concept.
+        table_node["has_pk"] = bool(table.primary_key)
+        table_node["header"] = "table"
+        bucket(schema)["tables"].append(table_node)
     for view in inventory.views:
         schema, obj = _split_schema(view.name, schema_label)
         bucket(schema)["views"].append(
@@ -2778,8 +2783,20 @@ def _render_browser_and_preview(
                 .props("dense clearable outlined")
                 .classes("w-full")
             )
+            # Legend for the per-table primary-key indicator shown beside each
+            # table leaf (matches the Step 3 "Tables to migrate" browser). Only
+            # tables carry it; views/triggers/routines have no PK concept.
+            with ui.row().classes(  # type: ignore[attr-defined]
+                "items-center gap-3 w-full text-xs text-gray-500"
+            ):
+                with ui.row().classes("items-center gap-1 no-wrap"):  # type: ignore[attr-defined]
+                    ui.icon("check_circle", color="green-6").classes("text-sm")  # type: ignore[attr-defined]
+                    ui.label("Table has a primary key")  # type: ignore[attr-defined]
+                with ui.row().classes("items-center gap-1 no-wrap"):  # type: ignore[attr-defined]
+                    ui.icon("warning", color="amber-7").classes("text-sm")  # type: ignore[attr-defined]
+                    ui.label("No primary key (required for Aurora DSQL)")  # type: ignore[attr-defined]
             with ui.scroll_area().classes(  # type: ignore[attr-defined]
-                "w-full"
+                "w-full bg-white rounded-md border border-gray-200"
             ).style("height: 340px"):
 
                 def on_tick(event: object) -> None:
@@ -2793,7 +2810,27 @@ def _render_browser_and_preview(
                     tick_strategy="leaf",
                     on_tick=on_tick,
                 )
+                tree.props("no-connectors")  # type: ignore[attr-defined]
                 src_filter.bind_value_to(tree, "filter")  # type: ignore[attr-defined]
+                # A small PK indicator beside each table leaf (client-side Vue
+                # template, so no per-node Python work): green check when the
+                # table has a primary key, amber warning when it does not. Only
+                # nodes with "header": "table" (table leaves) use this slot.
+                tree.add_slot(  # type: ignore[attr-defined]
+                    "header-table",
+                    r"""
+                    <div class="row items-center no-wrap">
+                      <span class="text-body2">{{ props.node.label }}</span>
+                      <q-icon v-if="props.node.has_pk" name="check_circle"
+                              color="green-6" size="16px" class="q-ml-xs">
+                        <q-tooltip>Table has a primary key</q-tooltip>
+                      </q-icon>
+                      <q-icon v-else name="warning" color="amber-7" size="16px" class="q-ml-xs">
+                        <q-tooltip>No primary key — required to migrate to Aurora DSQL</q-tooltip>
+                      </q-icon>
+                    </div>
+                    """,
+                )
                 # Start collapsed so a schema expands to reveal its tables; keep
                 # the ticked set across refreshes (the tree is rebuilt on Generate).
                 if conv_state.ticked_node_ids:
@@ -2816,12 +2853,13 @@ def _render_browser_and_preview(
                     .classes("w-full")
                 )
             with ui.scroll_area().classes(  # type: ignore[attr-defined]
-                "w-full"
+                "w-full bg-white rounded-md border border-gray-200"
             ).style("height: 340px"):
                 if target_nodes:
                     tgt_tree = ui.tree(  # type: ignore[attr-defined]
                         target_nodes, label_key="label", node_key="id"
                     )
+                    tgt_tree.props("no-connectors")  # type: ignore[attr-defined]
                     tgt_filter.bind_value_to(tgt_tree, "filter")  # type: ignore[attr-defined]
                 else:
                     ui.label(  # type: ignore[attr-defined]

@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.50
+
+### Changed
+
+- **Schema Conversion object browser matches the "Tables to migrate" styling.**
+  The Step 2 source/target browsers now use the same look as the Step 3 table
+  picker: white, bordered scroll panels and connector-less trees. Each source
+  table leaf shows the same primary-key indicator (green check when the table has
+  a primary key, amber warning when it has none, which Aurora DSQL requires) with
+  a legend under the filter. Views/triggers/routines carry no PK indicator (they
+  have no primary key). Selection and DDL-generation behavior is unchanged.
+
 ## v0.1.49
 
 ### Fixed
