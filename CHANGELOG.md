@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.52
+
+### Added
+
+- **AI Assist on each failed Full Load table.** Every table in the Full Load
+  "Failure details" list now has an "AI Assist" button next to "Reload". It opens
+  the AI chat drawer and explains that specific failure's likely cause and how to
+  fix it — grounded in the actual error text (e.g. a `DependentObjectsStillExist`
+  drop conflict from a dependent view, or a transient `InternalError_: server
+  unavailable`) **and in this migration's situation**: the migration type
+  (Full-Load-only vs Full Load + CDC), whether the table was a DROP+recreate of an
+  existing target, and whether CDC is already streaming. So the guidance is
+  specific to your migration, not generic, and points at the right recovery
+  (fix a schema dependency, fix a source value, or just Reload a transient). Opt-in
+  — the button is enabled only when AI Assist is turned on at Connect; otherwise it
+  shows a disabled affordance pointing there. Reuses the existing chat-drawer /
+  Bedrock stack (no new credentials path).
+
 ## v0.1.51
 
 ### Fixed

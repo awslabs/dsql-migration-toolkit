@@ -1326,6 +1326,36 @@ def test_full_load_run_guard_allows_rerun_when_already_run_without_report() -> N
     )
 
 
+def test_full_load_error_migration_context_describes_situation() -> None:
+    from dsql_migrator.ui.data_migration import (
+        MigrationType,
+        full_load_error_migration_context,
+    )
+
+    state = DataMigrationState()
+    state.migration_type = MigrationType.FULL_LOAD_AND_CDC
+    state.set_replace_targets(frozenset({"customers_sample.countries"}))
+
+    # A table that pre-existed on the target (DROP+recreate) in a CDC plan.
+    ctx = full_load_error_migration_context(
+        state, table_name="customers_sample.countries", cdc_live=False
+    )
+    assert "Full Load + CDC" in ctx
+    assert "DROP+recreated" in ctx
+    assert "CDC has not started" in ctx
+    # A freshly-created table in a full-load-only plan: no CDC line, no DROP note.
+    fl_only = DataMigrationState()
+    fl_only.migration_type = MigrationType.FULL_LOAD_ONLY
+    ctx2 = full_load_error_migration_context(
+        fl_only, table_name="app.orders", cdc_live=False
+    )
+    assert "Full Load only" in ctx2
+    assert "created fresh" in ctx2
+    assert "CDC" not in ctx2.replace("no CDC", "")  # no CDC-streaming line
+    # Context carries no credential/connection detail (Property 7).
+    assert "password" not in ctx.lower() and "host" not in ctx.lower()
+
+
 def test_prerequisites_section_expanded_stays_open_while_actionable() -> None:
     from dsql_migrator.ui.data_migration import prerequisites_section_expanded
 

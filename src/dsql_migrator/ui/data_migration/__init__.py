@@ -907,6 +907,53 @@ def build_data_migration_screen(
                 # previously-quarantined row now loads. Reuses the scoped retry path.
                 _run_retry_for([table_name])
 
+            # On-demand AI diagnosis of a FAILED Full Load table (opt-in: AI Assist
+            # on). Reuses the shared chat drawer + a strategist bound to the Full
+            # Load error grounding, so a reply explains the specific failure
+            # (schema/DDL vs data vs transient) and the recovery step. Built lazily
+            # and ONCE (the drawer is a top-level dialog; the per-poll progress
+            # re-render must not create a new drawer each time). ``None`` when AI is
+            # off -> the renderer shows a disabled affordance instead.
+            ai_error_opener = None
+            if session.ai_assist.enabled:
+                _ai_drawer = {"open_chat": None}
+
+                def ai_error_opener(table_name: str, error_message: str) -> None:
+                    from dsql_migrator.core.assessment_strategist import (
+                        AssessmentStrategist,
+                    )
+                    from dsql_migrator.ui.ai_chat_drawer import build_chat_drawer
+
+                    if _ai_drawer["open_chat"] is None:
+                        _ai_drawer["open_chat"] = build_chat_drawer(ui)
+                    strategist = AssessmentStrategist(
+                        session.ai_assist, aws_profile=session.aws_profile
+                    )
+                    # Ground the reply in THIS migration's situation (type, CDC
+                    # status, DROP+recreate) so it isn't generic.
+                    migration_context = full_load_error_migration_context(
+                        migration_state,
+                        table_name=table_name,
+                        cdc_live=cdc_streaming_started(migration_state, job_manager),
+                    )
+                    _ai_drawer["open_chat"](
+                        title="AI Assist — Full Load failure",
+                        subtitle=table_name,
+                        first_question=(
+                            f"Why did loading {table_name} fail, and how do I "
+                            "fix it?"
+                        ),
+                        streamer=lambda messages, on_delta: (
+                            strategist.stream_full_load_error_chat(
+                                table_name,
+                                error_message,
+                                messages,
+                                on_delta,
+                                migration_context=migration_context,
+                            )
+                        ),
+                    )
+
             def accept_quarantine_and_continue() -> None:
                 # Accept permanently-quarantined rows (>1 MiB values, etc.) as an
                 # acknowledged gap and unblock CDC WITHOUT re-running: the loadable
@@ -1072,6 +1119,7 @@ def build_data_migration_screen(
                             accept_quarantine_and_continue=accept_quarantine_and_continue,
                             stop_full_load=stop_full_load,
                             refresh=refresh,
+                            ai_error_opener=ai_error_opener,
                         )
                         with ui.row().classes(
                             "!flex w-full justify-between items-center"
@@ -1233,6 +1281,49 @@ def build_data_migration_screen(
                     )
 
     return content, runner
+
+
+def full_load_error_migration_context(
+    migration_state,
+    *,
+    table_name: str,
+    cdc_live: bool,
+) -> str:
+    """Assemble a credential-free description of the CURRENT migration situation.
+
+    Fed to the Full Load "AI Assist" grounding so the reply is specific to THIS
+    migration (its type, whether CDC is part of the plan / already streaming,
+    whether the failed table was a DROP+recreate of an existing target) rather than
+    generic. Contains only tool state -- migration type, CDC status, and whether
+    the target table pre-existed -- never any connection/credential detail
+    (Property 7). NiceGUI-agnostic for tests.
+    """
+    mt = getattr(migration_state, "migration_type", None)
+    mt_value = getattr(mt, "value", mt)
+    type_label = {
+        "full_load_only": "Full Load only (no CDC in this plan)",
+        "cdc_only": "CDC only",
+        "full_load_and_cdc": "Full Load + CDC (change data capture will follow)",
+    }.get(str(mt_value), str(mt_value))
+    replace_targets = set(getattr(migration_state, "replace_targets", set()) or set())
+    lines = [
+        f"Migration type: {type_label}",
+        (
+            f"Target table '{table_name}' already existed and was being "
+            "DROP+recreated"
+            if table_name in replace_targets
+            else f"Target table '{table_name}' was being created fresh "
+            "(no pre-existing target table)"
+        ),
+    ]
+    if "cdc" in str(mt_value):
+        lines.append(
+            "CDC is currently streaming (a re-run of Full Load can collide with "
+            "the live sink)."
+            if cdc_live
+            else "CDC has not started streaming yet."
+        )
+    return "\n".join(lines)
 
 
 def prerequisites_section_expanded(
@@ -1968,6 +2059,7 @@ def _render_full_load_step(
     accept_quarantine_and_continue,
     stop_full_load,
     refresh,
+    ai_error_opener=None,
 ) -> None:
     """Render the Full Load step: confirm the selected workloads, then run it.
 
@@ -2178,6 +2270,7 @@ def _render_full_load_step(
             quarantine_only=_incomplete_is_quarantine_only(
                 current, migration_state.error_log
             ),
+            ai_error_opener=ai_error_opener,
         )
         # The completeness baseline (expected_rows) comes from the watermark's
         # per-table counts, which are scan-free information_schema ESTIMATES
@@ -2556,6 +2649,7 @@ def _render_full_load_progress(
     reload_table=None,
     accept_quarantine_and_continue=None,
     quarantine_only: bool = False,
+    ai_error_opener=None,
 ) -> None:
     """Render the overall progress, a status distribution, and a live per-table
     table with colored status badges and per-row progress bars."""
@@ -2674,6 +2768,26 @@ def _render_full_load_progress(
                 "source value), keeping the others as-is."
             )
 
+    def _ai_btn(table_name: str, error_message: str) -> None:
+        # Per-table AI Assist: opens the chat drawer to explain THIS failure's
+        # cause + fix. Shown enabled only when AI Assist is on (an opener was
+        # threaded in); otherwise a disabled, discoverable affordance points at
+        # the Connect screen -- mirroring Schema Conversion / Validation.
+        if ai_error_opener is not None:
+            ui.button(
+                "AI Assist",
+                on_click=lambda n=table_name, e=error_message: ai_error_opener(n, e),
+            ).props(
+                "flat dense no-caps size=sm color=indigo-6 icon=auto_awesome"
+            ).tooltip("Ask AI why this table failed and how to fix it.")
+        else:
+            ui.button("AI Assist").props(
+                "flat dense no-caps size=sm color=grey icon=auto_awesome"
+            ).props("disable").tooltip(
+                "Enable AI Assist on the Connect screen to diagnose this "
+                "failure with AI."
+            )
+
     # Real, retryable table failures (red) -- distinct from quarantined rows.
     if real_failures:
         with ui.column().classes("w-full gap-1"):
@@ -2691,6 +2805,7 @@ def _render_full_load_progress(
                         tone="error",
                         classes="text-xs break-all",
                     )
+                    _ai_btn(row.table, row.error_message or "")
                     _reload_btn(row.table)
 
     # Quarantined rows (amber): the table loaded -- these rows were permanently
@@ -3297,6 +3412,7 @@ __all__ = [
     "substeps_for_type",
     "resolve_active_substep_for_type",
     "prerequisites_section_expanded",
+    "full_load_error_migration_context",
     "prereq_phase_tag",
     "PrereqPhaseVerdict",
     "prereq_phase_verdicts",

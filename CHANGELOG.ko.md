@@ -5,6 +5,23 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.52
+
+### 추가 (Added)
+
+- **Full Load 실패 테이블마다 AI Assist.** Full Load "Failure details" 목록의 각
+  테이블에 "Reload" 옆으로 "AI Assist" 버튼이 생겼습니다. 누르면 AI 채팅 드로어가
+  열려 해당 실패의 원인과 해결법을 설명합니다 — 실제 에러 텍스트(예: 의존 뷰
+  때문에 발생한 `DependentObjectsStillExist` 드롭 충돌, 또는 일시적
+  `InternalError_: server unavailable`)뿐 아니라 **이 마이그레이션의 상황**까지
+  이해합니다: 마이그레이션 유형(Full Load 전용 vs Full Load + CDC), 해당 테이블이
+  기존 타깃을 DROP+재생성 중이었는지, CDC가 이미 스트리밍 중인지. 그래서 일반적인
+  답이 아니라 이 마이그레이션에 특화된 안내를 주고, 올바른 복구 방법(스키마 의존성
+  수정, 소스 값 수정, 또는 일시적 오류면 그냥 Reload)을 가리킵니다. 옵트인 —
+  Connect에서 AI Assist를 켰을 때만 활성화되고, 꺼져 있으면 그쪽을 안내하는
+  비활성 버튼이 보입니다. 기존 채팅 드로어/Bedrock 스택을 재사용합니다(새 자격
+  증명 경로 없음).
+
 ## v0.1.51
 
 ### 수정 (Fixed)

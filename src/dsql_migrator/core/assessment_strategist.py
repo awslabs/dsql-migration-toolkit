@@ -554,6 +554,82 @@ def build_validation_chat_system(facts: str, *, scope: str = "table") -> str:
     )
 
 
+_FULL_LOAD_RECOVERY_CONTEXT = (
+    "How this tool's Full Load works and how to recover a failed table:\n"
+    "- Full Load is the tool's OWN Python bulk loader (not a Debezium snapshot): it "
+    "streams source rows by primary-key keyset pagination and writes them to the "
+    "target with idempotent, batched INSERT ... ON CONFLICT (<= 3000 rows/txn), "
+    "each batch wrapped in optimistic-concurrency (SQLSTATE 40001) retry.\n"
+    "- Because the load is idempotent and resumable, RE-RUNNING a failed table is "
+    "safe: use the per-table 'Reload' button (re-runs Full Load for just that "
+    "table) or 'Retry failed tables' -- no duplicates are created.\n"
+    "- A table may also fail during the SCHEMA step (creating/replacing the target "
+    "table's DDL) rather than the row copy. A 'DependentObjectsStillExist ... "
+    "cannot drop table ... because ... view ... depends on it ... Use DROP ... "
+    "CASCADE' error means the tool tried to drop/replace a target table that a "
+    "VIEW (or other object) still depends on; DSQL blocks the drop. The fix is to "
+    "drop the dependent object(s) first (or recreate them after), or re-run once "
+    "the dependency order is resolved -- the tool applies one object per "
+    "transaction, so a view that depends on several tables must be handled around "
+    "those tables.\n"
+    "- A transient error like 'InternalError_: server unavailable', a timeout, or a "
+    "connection reset is usually not a data problem: just Reload that table (or "
+    "Retry failed tables). If it persists, check target reachability / IAM token "
+    "expiry and source read headroom.\n"
+    "- 'quarantined row' entries are NOT failures: the table loaded and specific "
+    "rows were skipped (e.g. a value over DSQL's ~1 MiB per-value limit).\n"
+    "- Distinguish a SCHEMA/DDL cause (fix dependency or DDL, then reload) from a "
+    "DATA cause (fix the source value, then reload) from a TRANSIENT cause (just "
+    "reload). Point the user at the right one."
+)
+
+
+def build_full_load_error_chat_system(
+    table_name: str, error_message: str, *, migration_context: str = ""
+) -> str:
+    """Build the system grounding for a chat about a FAILED Full Load table.
+
+    ``table_name`` is the (schema-qualified) table that failed and
+    ``error_message`` is the tool's captured, credential-free failure text (e.g. a
+    ``DependentObjectsStillExist`` drop conflict, an ``InternalError_: server
+    unavailable`` transient, or a per-row data error). ``migration_context`` is an
+    optional pre-formatted, credential-free block describing the CURRENT migration
+    situation (e.g. migration type Full-Load-only vs combined with CDC, whether
+    this table was a DROP+recreate of an existing target, whether CDC is already
+    streaming, how many tables were selected) so the reply is specific to THIS
+    migration, not generic. The model is told these facts are authoritative and is
+    pointed at this tool's Full Load recovery model (per-table Reload / Retry
+    failed tables, schema-vs-data-vs-transient triage, DSQL constraints) so its
+    advice matches what the tool can actually do. It must stay on the topic of
+    explaining and fixing THIS table's failure.
+    """
+    facts = f"Failed table: {table_name}\nError message:\n{error_message.strip()}"
+    if migration_context.strip():
+        facts += f"\n\nCurrent migration context:\n{migration_context.strip()}"
+    return (
+        "You are a senior AWS database migration engineer chatting with a teammate "
+        "who is running a MySQL -> Amazon Aurora DSQL migration and just had ONE "
+        "table fail during Full Load. You understand this exact migration's "
+        "situation from the context below — use it so your answer is specific to "
+        "THIS migration, not generic advice. Answer naturally and conversationally "
+        "— explain WHY this specific error likely happened and exactly HOW to fix "
+        "it, in a friendly, helpful tone, answering follow-ups in context. Do NOT "
+        "use a rigid template. Light GitHub-flavored Markdown is fine (a short "
+        "list, a little emphasis, a fenced code block for any SQL/commands) but "
+        "keep it reading like a natural reply. Be specific and concise, and give a "
+        "concrete next action (which button to click, or what to change).\n\n"
+        "Stay strictly on the topic of this table's Full Load failure and how to "
+        "resolve it (root cause, whether it is a schema/DDL issue vs a data issue "
+        "vs a transient error, and the recovery steps). If asked anything "
+        "off-topic, politely decline in one sentence and steer back.\n\n"
+        "These deterministic facts are authoritative — build on them and never "
+        "contradict them:\n"
+        f"{facts[:_MAX_TEXT_CHARS]}\n\n"
+        f"{_FULL_LOAD_RECOVERY_CONTEXT}\n\n"
+        f"Aurora DSQL constraints:\n{DSQL_CONSTRAINTS}"
+    )
+
+
 def _build_chat_body(
     system: str, messages: Sequence[Mapping[str, str]], max_tokens: int
 ) -> str:
@@ -954,6 +1030,32 @@ class AssessmentStrategist:
         """
         return self.stream_chat(
             build_validation_chat_system(facts, scope=scope), messages, on_delta
+        )
+
+    def stream_full_load_error_chat(
+        self,
+        table_name: str,
+        error_message: str,
+        messages: Sequence[Mapping[str, str]],
+        on_delta: Callable[[str], None],
+        *,
+        migration_context: str = "",
+    ) -> "ObjectGuidanceOutcome":
+        """Stream one assistant turn of a chat about a FAILED Full Load table.
+
+        Grounded by :func:`build_full_load_error_chat_system` on the failed
+        ``table_name`` + its captured ``error_message`` + the optional
+        ``migration_context`` (this migration's situation: type, CDC, DROP+recreate,
+        selection), so replies explain WHY the table failed and HOW to fix it
+        (schema/DDL vs data vs transient, then per-table Reload / Retry) specific to
+        THIS migration and consistent with this tool's Full Load model. Never raises.
+        """
+        return self.stream_chat(
+            build_full_load_error_chat_system(
+                table_name, error_message, migration_context=migration_context
+            ),
+            messages,
+            on_delta,
         )
 
     def stream_chat(

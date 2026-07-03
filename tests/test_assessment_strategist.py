@@ -475,6 +475,44 @@ def test_build_validation_chat_system_grounds_on_facts_and_recovery() -> None:
     )
 
 
+def test_build_full_load_error_chat_system_grounds_on_table_error_and_context() -> None:
+    from dsql_migrator.core.assessment_strategist import (
+        build_full_load_error_chat_system,
+    )
+
+    error = (
+        "DependentObjectsStillExist: cannot drop table customers_sample.countries "
+        "because other objects depend on it DETAIL: view "
+        "customers_sample.customer_order_summary depends on table ... "
+        "HINT: Use DROP ... CASCADE to drop the dependent objects too."
+    )
+    system = build_full_load_error_chat_system(
+        "customers_sample.countries",
+        error,
+        migration_context=(
+            "Migration type: Full Load + CDC (change data capture will follow)\n"
+            "Target table 'customers_sample.countries' already existed and was "
+            "being DROP+recreated\nCDC has not started streaming yet."
+        ),
+    )
+    # The failed table + its error are woven in verbatim, called authoritative.
+    assert "customers_sample.countries" in system
+    assert "DependentObjectsStillExist" in system
+    assert "authoritative" in system.lower()
+    # The migration situation is grounded so the reply is specific, not generic.
+    assert "Full Load + CDC" in system
+    assert "DROP+recreated" in system
+    # The tool's Full Load recovery model + DSQL constraints are grounded.
+    assert "Reload" in system  # per-table recovery action
+    assert "idempotent" in system.lower()
+    assert "Aurora DSQL constraints" in system
+    assert "decline" in system.lower()  # scope guard
+    # Context is optional -- omitting it still produces a valid grounding.
+    minimal = build_full_load_error_chat_system("t1", "InternalError_: server unavailable")
+    assert "InternalError_" in minimal
+    assert "Current migration context" not in minimal
+
+
 def test_trim_chat_messages_keeps_recent_within_budget() -> None:
     from dsql_migrator.core.assessment_strategist import _trim_chat_messages
 

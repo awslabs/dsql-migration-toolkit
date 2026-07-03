@@ -5,6 +5,23 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.52
+
+### Added
+
+- **Full Load の失敗テーブルごとに AI Assist。** Full Load の「Failure details」
+  リストの各テーブルに、「Reload」の隣に「AI Assist」ボタンが追加されました。押すと
+  AI チャットドロワーが開き、その失敗の原因と対処方法を説明します — 実際のエラー
+  テキスト(例: 依存ビューによる `DependentObjectsStillExist` のドロップ競合、または
+  一時的な `InternalError_: server unavailable`)だけでなく、**この移行の状況**も
+  理解します: 移行タイプ(Full Load のみ vs Full Load + CDC)、そのテーブルが既存
+  ターゲットの DROP+再作成だったか、CDC がすでにストリーミング中か。そのため汎用的な
+  回答ではなく、この移行に即した案内を行い、正しいリカバリ(スキーマ依存関係の修正、
+  ソース値の修正、または一時的エラーなら Reload)を指し示します。オプトイン —
+  Connect で AI Assist を有効にした場合のみ有効になり、無効時はそこへ誘導する
+  無効化ボタンが表示されます。既存のチャットドロワー / Bedrock スタックを再利用
+  します(新しい認証情報パスなし)。
+
 ## v0.1.51
 
 ### Fixed
