@@ -93,10 +93,16 @@ class DataMigrationState:
         # memory only -- drives the immediate "checking..." feedback so the
         # button does not appear unresponsive during the read-only checks).
         self._prereq_running: set[MigrationMode] = set()
-        # Selected target tables that already contain rows and would be dropped &
-        # recreated on a confirmed Full Load (computed when the user clicks Start;
-        # drives the destructive warning and the run's replace set).
-        self._replace_targets: frozenset[str] = frozenset()
+        # Selected target tables that already contain rows (computed by a
+        # read-only probe when the user clicks Start). Drives the Start-dialog
+        # choice below; NOT itself the drop set.
+        self._tables_with_data: frozenset[str] = frozenset()
+        # The user's run-wide choice for those pre-existing tables: "append"
+        # (keep existing rows, load only the missing ones -- idempotent
+        # SKIP_EXISTING, the non-destructive default) or "drop" (DROP+recreate
+        # each first, for a clean fresh load). Stored so a retry / per-table
+        # Reload follows the SAME choice instead of silently reverting to append.
+        self._reload_mode: str = "append"
         # One-shot flag: open the Full Load confirm dialog on the next render
         # (set after the async non-empty-target check completes).
         self.pending_full_load_confirm: bool = False
@@ -377,16 +383,54 @@ class DataMigrationState:
             self.row_max_pk_target = dict(target_max_pk or {})
             self.row_counts_fetched_at = fetched_at
 
-    def set_replace_targets(self, names: frozenset[str]) -> None:
-        """Record the non-empty target tables to replace on the next run."""
+    def set_tables_with_data(self, names: frozenset[str]) -> None:
+        """Record the selected target tables the probe found already holding rows."""
         with self._lock:
-            self._replace_targets = names
+            self._tables_with_data = names
+
+    @property
+    def tables_with_data(self) -> frozenset[str]:
+        """Return the pre-existing (non-empty) selected target tables."""
+        with self._lock:
+            return self._tables_with_data
+
+    def set_reload_mode(self, mode: str) -> None:
+        """Set the run-wide reload choice for pre-existing tables.
+
+        ``"drop"`` = DROP+recreate each first (clean reload); ``"append"`` = keep
+        existing rows and load only the missing ones (idempotent). Any other value
+        is coerced to the non-destructive ``"append"`` default.
+        """
+        with self._lock:
+            self._reload_mode = "drop" if mode == "drop" else "append"
+
+    @property
+    def reload_mode(self) -> str:
+        """Return the run-wide reload choice (``"append"`` default / ``"drop"``)."""
+        with self._lock:
+            return self._reload_mode
+
+    def set_replace_targets(self, names: frozenset[str]) -> None:
+        """Back-compat setter: record pre-existing tables and switch to drop mode.
+
+        Retained for callers/tests that set the drop set directly. Setting a
+        non-empty set implies the user chose to DROP+recreate those tables, so it
+        records them as the tables-with-data and flips the mode to ``"drop"``; an
+        empty set means append (nothing dropped).
+        """
+        with self._lock:
+            self._tables_with_data = names
+            self._reload_mode = "drop" if names else "append"
 
     @property
     def replace_targets(self) -> frozenset[str]:
-        """Return the target tables that would be dropped & recreated."""
+        """Return the tables that will be DROPped & recreated on the next run.
+
+        Derived: the pre-existing tables when the run-wide choice is ``"drop"``,
+        else empty (append keeps existing rows). This is the run's replace set.
+        """
         with self._lock:
-            return self._replace_targets
+            return self._tables_with_data if self._reload_mode == "drop" else frozenset()
 
     def set_selection(self, selection: TableSelection) -> None:
         """Replace the table selection for the sub-flow (marks it user-touched)."""

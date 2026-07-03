@@ -629,6 +629,28 @@ def applied_table_conversions(
     return conversions
 
 
+def applied_view_ddls(
+    result: SchemaConversionResult,
+    edited_target_ddls: Mapping[str, str],
+) -> dict[str, str]:
+    """Per-view APPLIED target CREATE-VIEW DDL (honoring user edits), by view name.
+
+    Full Load's "drop & reload" path consumes this to pre-drop and recreate the
+    views that depend on a replaced table (a dependent view otherwise blocks the
+    table's DROP). Only **auto-converted** views are included -- a view that needs
+    manual reimplementation has a comment-placeholder ``target_ddl`` (not runnable
+    DDL), so recreating it would fail; those are skipped. A user-edited view uses
+    its edited DDL, mirroring :func:`applied_table_conversions`.
+    """
+    ddls: dict[str, str] = {}
+    for view in result.views:
+        if not view.auto_converted:
+            continue
+        edited = edited_target_ddls.get(view.view)
+        ddls[view.view] = edited if edited is not None else view.target_ddl
+    return ddls
+
+
 def build_ai_apply_objects(
     suggestions: Sequence[AiConversionSuggestion],
 ) -> list[ApplyObject]:

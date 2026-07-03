@@ -88,6 +88,7 @@ from dsql_migrator.ui.schema_conversion import (
     TABLE_PREFIX,
     SchemaConversionStore,
     applied_table_conversions,
+    applied_view_ddls,
     selected_object_names,
 )
 from dsql_migrator.ui.session import SessionStore
@@ -352,6 +353,7 @@ def build_data_migration_screen(
         target_config = session.target_config
         assert source_config is not None  # guaranteed by has_source()
         assert target_config is not None  # guaranteed by has_target()
+        _conversion = SchemaConverter().convert(inventory)
         inputs = DataMigrationInputs(
             source_config=source_config,
             source_password=session.source_password,
@@ -367,7 +369,12 @@ def build_data_migration_screen(
             # live the load falls back to idempotent SKIP_EXISTING (no DROP).
             cdc_coexisting=cdc_streaming_started(migration_state, job_manager),
             table_conversions=applied_table_conversions(
-                SchemaConverter().convert(inventory), conv_state.edited_target_ddls
+                _conversion, conv_state.edited_target_ddls
+            ),
+            # Converted view DDLs so a "drop & reload" run can pre-drop / recreate
+            # views that depend on a replaced table (else the DROP is blocked).
+            dependent_view_ddls=applied_view_ddls(
+                _conversion, conv_state.edited_target_ddls
             ),
         )
         # Full Load runs over the tables the user selected in the picker. A
@@ -847,6 +854,24 @@ def build_data_migration_screen(
                 source_config = session.source_config
                 target_config = session.target_config
                 assert source_config is not None and target_config is not None
+                retry_cdc_coexisting = cdc_streaming_started(
+                    migration_state, job_manager
+                )
+                # Carry the run-wide reload choice onto the retry: if the user chose
+                # "Drop & reload", a table being retried must be recreated on the
+                # RE-run too, not left to skip-existing over the stale rows --
+                # otherwise a retry reports "0 new + N already there" over data that
+                # was never refreshed (e.g. after a first-run DROP failed on a
+                # dependent view). ``replace_targets`` already encodes the choice
+                # (drop set when mode=="drop", empty for append); scope it to the
+                # tables being retried and suppress when CDC is live (DROP races the
+                # sink).
+                retry_replace = (
+                    frozenset()
+                    if retry_cdc_coexisting
+                    else frozenset(migration_state.replace_targets) & set(names)
+                )
+                _retry_conversion = SchemaConverter().convert(inventory)
                 retry_inputs = DataMigrationInputs(
                     source_config=source_config,
                     source_password=session.source_password,
@@ -854,11 +879,14 @@ def build_data_migration_screen(
                     inventory=inventory,
                     aws_profile=session.aws_profile,
                     staging_bucket=staging_bucket,
-                    cdc_coexisting=cdc_streaming_started(
-                        migration_state, job_manager
-                    ),
+                    replace_tables=retry_replace,
+                    cdc_coexisting=retry_cdc_coexisting,
                     table_conversions=applied_table_conversions(
-                        SchemaConverter().convert(inventory),
+                        _retry_conversion,
+                        conv_state.edited_target_ddls,
+                    ),
+                    dependent_view_ddls=applied_view_ddls(
+                        _retry_conversion,
                         conv_state.edited_target_ddls,
                     ),
                 )
@@ -2087,13 +2115,9 @@ def _render_full_load_step(
     ).classes("text-xs text-gray-400")
 
     # Explicit confirmation before the (target-writing) Full Load begins. Tables
-    # that already hold data are listed as a destructive DROP+recreate warning.
-    replace_targets = sorted(migration_state.replace_targets)
-    # Re-running Full Load while CDC is streaming is dangerous: the snapshot writes
-    # (and any DROP+recreate) collide with the live CDC sink, which resumes from
-    # the OLD watermark -- creating gaps/overlap or losing rows the stream wrote.
-    # We surface a hard warning (not a silent block) so the operator decides.
-    cdc_live = cdc_streaming_started(migration_state, job_manager)
+    # that already hold data offer a Drop-vs-Append choice; CDC-live is a hard
+    # warning. Both are computed fresh inside the dialog builder below (so the
+    # periodic poll re-render can't tear a stale value into the dialog).
 
     def _open_confirm_dialog_now() -> None:
         """Build + open the Start-Full-Load confirm dialog in the TOP-LEVEL client.
@@ -2105,7 +2129,7 @@ def _render_full_load_step(
         from nicegui import context as _ctx
 
         client = _ctx.client
-        replace_targets_now = sorted(migration_state.replace_targets)
+        tables_with_data_now = sorted(migration_state.tables_with_data)
         cdc_live_now = cdc_streaming_started(migration_state, job_manager)
 
         def _build() -> None:
@@ -2137,19 +2161,35 @@ def _render_full_load_step(
                     with ui.row().classes("items-center gap-1 flex-wrap"):
                         for name in selected_names:
                             ui.badge(name).props("color=blue-grey-6 outline")
-                if replace_targets_now and not cdc_live_now:
+                # When selected targets already hold data (and CDC is not live),
+                # let the user choose the run-wide behavior: append (keep existing
+                # rows, load only the missing ones -- the non-destructive default)
+                # or drop & reload (DROP+recreate each first, for a clean load).
+                if tables_with_data_now and not cdc_live_now:
                     with ui.card().classes(
-                        "w-full bg-red-50 border border-red-200 gap-1"
+                        "w-full bg-amber-50 border border-amber-200 gap-2"
                     ):
                         ui.label(
-                            f"⚠ {len(replace_targets_now)} table(s) already contain "
-                            "data and will be DROPPED and recreated before loading "
-                            "(DSQL has no TRUNCATE). Existing rows in these tables "
-                            "will be permanently lost. This cannot be undone."
-                        ).classes("text-sm text-red-700")
+                            f"{len(tables_with_data_now)} selected table(s) already "
+                            "contain data on the target. Choose how to load them:"
+                        ).classes("text-sm text-gray-800")
                         with ui.row().classes("items-center gap-1 flex-wrap"):
-                            for name in replace_targets_now:
-                                ui.badge(name).props("color=red-6 outline")
+                            for name in tables_with_data_now:
+                                ui.badge(name).props("color=amber-8 outline")
+                        reload_choice = ui.radio(
+                            {
+                                "append": "Append — keep existing rows, load only "
+                                "the missing ones (idempotent; recommended)",
+                                "drop": "Drop & reload — DROP and recreate these "
+                                "tables first for a clean load (existing rows are "
+                                "permanently lost; DSQL has no TRUNCATE)",
+                            },
+                            value=migration_state.reload_mode,
+                            on_change=lambda e: migration_state.set_reload_mode(
+                                str(getattr(e, "value", "append"))
+                            ),
+                        ).props("dense").classes("text-sm")
+                        reload_choice.classes("w-full")
 
                 def _confirm() -> None:
                     confirm_dialog.close()
@@ -2159,16 +2199,38 @@ def _render_full_load_step(
                     ui.button("Cancel", on_click=confirm_dialog.close).props("flat")
                     if cdc_live_now:
                         confirm_label = "Re-run anyway (CDC is live)"
-                    elif replace_targets_now:
-                        confirm_label = "Drop, recreate and load"
+                    elif tables_with_data_now:
+                        # The button label + color follow the current choice so a
+                        # destructive drop reads as destructive.
+                        drop_chosen = migration_state.reload_mode == "drop"
+                        confirm_label = (
+                            "Drop, recreate and load" if drop_chosen
+                            else "Append and load"
+                        )
                     else:
                         confirm_label = "Confirm and start"
                     confirm_color = (
-                        "negative" if (replace_targets_now or cdc_live_now) else "primary"
+                        "negative"
+                        if (cdc_live_now or (tables_with_data_now
+                                             and migration_state.reload_mode == "drop"))
+                        else "primary"
                     )
-                    ui.button(confirm_label, on_click=_confirm).props(
+                    start_btn = ui.button(confirm_label, on_click=_confirm).props(
                         f"color={confirm_color}"
                     )
+                    # The label/color depend on the radio; re-render them on change
+                    # so switching Drop<->Append updates the button immediately.
+                    def _sync_btn(e: object) -> None:
+                        drop_now = str(getattr(e, "value", "append")) == "drop"
+                        start_btn.set_text(
+                            "Drop, recreate and load" if drop_now
+                            else "Append and load"
+                        )
+                        start_btn.props(
+                            f"color={'negative' if drop_now else 'primary'}"
+                        )
+                    if tables_with_data_now:
+                        reload_choice.on_value_change(_sync_btn)
             confirm_dialog.open()
 
         with client:  # type: ignore[attr-defined]
@@ -2206,7 +2268,11 @@ def _render_full_load_step(
             except Exception:  # noqa: BLE001 - cue is best-effort
                 pass
         try:
-            migration_state.set_replace_targets(frozenset())
+            # Probe which selected targets already hold rows. Default the run-wide
+            # choice to "append" (non-destructive); the confirm dialog lets the
+            # user switch to "drop" for a clean reload.
+            migration_state.set_tables_with_data(frozenset())
+            migration_state.set_reload_mode("append")
             target_config = getattr(session, "target_config", None)
             if target_config is not None and selected_names:
                 from nicegui import run
@@ -2223,9 +2289,9 @@ def _render_full_load_step(
 
                 try:
                     found = await run.io_bound(_probe)
-                    migration_state.set_replace_targets(found)
+                    migration_state.set_tables_with_data(found)
                 except Exception:  # noqa: BLE001 - on probe failure, warn-less confirm
-                    migration_state.set_replace_targets(frozenset())
+                    migration_state.set_tables_with_data(frozenset())
             _open_confirm_dialog_now()
         finally:
             _confirm_busy["value"] = False

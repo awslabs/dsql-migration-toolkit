@@ -105,6 +105,14 @@ class DataMigrationInputs:
     # remapped to smallint loads as an integer, not a boolean). A table absent
     # here falls back to the deterministic conversion / source-derived types.
     table_conversions: Mapping[str, TableConversion] = field(default_factory=dict)
+    # Converted target view DDLs (view name -> CREATE VIEW SQL), used ONLY on a
+    # "drop & reload" (replace) run: a view that SELECTs from a replaced table
+    # blocks that table's DROP ("other objects depend on it"). Before the replace
+    # tables are recreated, the views that reference them are dropped; after the
+    # load, those views are recreated -- so a clean reload succeeds without a blunt
+    # DROP ... CASCADE and the user's views survive. Empty on an append run or when
+    # nothing is being replaced.
+    dependent_view_ddls: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -704,6 +712,24 @@ def _finalize_run(
     )
 
 
+def _predrop_dependent_views(migrator: DataMigrator) -> None:
+    """Call the migrator's dependent-view pre-drop, if it supports one.
+
+    A no-op for a fake/older migrator without the method (tests) or an append run
+    (the method itself no-ops when nothing is being replaced).
+    """
+    hook = getattr(migrator, "predrop_dependent_views", None)
+    if callable(hook):
+        hook()
+
+
+def _recreate_dependent_views(migrator: DataMigrator) -> None:
+    """Call the migrator's dependent-view recreate, if it supports one (else no-op)."""
+    hook = getattr(migrator, "recreate_dependent_views", None)
+    if callable(hook):
+        hook()
+
+
 def run_full_load(
     handle: JobHandle,
     tables: Sequence[TableDef],
@@ -746,7 +772,12 @@ def run_full_load(
     watermark = migrator.capture_watermark(tables)
     handle.update(lambda job: setattr(job, "watermark", watermark))
 
+    # On a "drop & reload" run, drop views that depend on the replaced tables
+    # BEFORE the per-table DROP+recreate (a view can span several tables loaded in
+    # parallel, so this is a run-level pre-pass), then recreate them after.
+    _predrop_dependent_views(migrator)
     counts = _migrate_tables_in_parallel(handle, job_id, tables, migrator, error_log)
+    _recreate_dependent_views(migrator)
     _finalize_run(
         handle,
         job_id,
@@ -812,9 +843,14 @@ def run_full_load_retry(
     if watermark is not None:
         handle.update(lambda job: setattr(job, "watermark", watermark))
 
+    # Same run-level view pre-drop / recreate as run_full_load, so a retry that
+    # DROP+recreates a table whose view dependency blocked the first attempt now
+    # succeeds instead of silently skip-loading over stale rows.
+    _predrop_dependent_views(migrator)
     counts = _migrate_tables_in_parallel(
         handle, job_id, tables_to_retry, migrator, error_log
     )
+    _recreate_dependent_views(migrator)
     _finalize_run(
         handle,
         job_id,
@@ -941,6 +977,50 @@ def _default_importer_factory(inputs: "DataMigrationInputs") -> BatchedImporter:
 # Drops and recreates one table's target from converted DDL, returning its
 # secondary-index DDLs to (re)create after the data load. Injectable for tests.
 TableRecreator = Callable[[TableDef], list[str]]
+
+
+def _views_referencing(
+    view_ddls: Mapping[str, str], tables: "frozenset[str]"
+) -> list[str]:
+    """Return the CREATE-VIEW DDLs whose SQL references any of ``tables``.
+
+    A view that SELECTs from a table being DROP+recreated blocks that table's
+    DROP. We select exactly the views that name one of the replace ``tables`` --
+    matching either the qualified ``schema.table`` or the bare table name as a
+    word in the view's DDL -- so an unrelated view is never needlessly dropped.
+    Case-insensitive, word-boundary match to avoid matching a substring of a
+    longer identifier. Deterministic order (by view name) for stable behavior.
+    """
+    if not view_ddls or not tables:
+        return []
+    wanted: list[str] = []
+    for view_name in sorted(view_ddls):
+        ddl = view_ddls[view_name]
+        low = ddl.lower()
+        for table in tables:
+            bare = table.split(".")[-1].lower()
+            qualified = table.lower()
+            if _names_in(low, (qualified, bare)):
+                wanted.append(ddl)
+                break
+    return wanted
+
+
+def _names_in(haystack_lower: str, candidates: "Sequence[str]") -> bool:
+    """True if any candidate appears in ``haystack_lower`` as a bounded token.
+
+    Guards against a bare table name matching a substring of a longer identifier
+    (e.g. ``orders`` inside ``orders_archive``) by requiring a non-identifier
+    character (or string edge) on both sides.
+    """
+    import re
+
+    for name in candidates:
+        if not name:
+            continue
+        if re.search(rf"(?<![\w.]){re.escape(name)}(?![\w])", haystack_lower):
+            return True
+    return False
 
 
 def _default_table_recreator(inputs: "DataMigrationInputs") -> TableRecreator:
@@ -1157,6 +1237,70 @@ class BatchedTableMigrator:
             return value if isinstance(value, int) else None
         except Exception:  # noqa: BLE001 - verification is best-effort, never fatal
             return None
+
+    def _dependent_view_ddls_for_replace(self) -> list[str]:
+        """Converted view DDLs that reference a table being DROP+recreated.
+
+        A view that SELECTs from a replaced table blocks that table's ``DROP``
+        ("other objects depend on it"). Returns the CREATE-VIEW DDLs of exactly
+        the views whose SQL names one of the replace tables, so the caller can drop
+        them before recreating the tables and recreate them afterward. Empty on an
+        append run, when CDC is coexisting (no DROP happens), or when no view
+        references a replaced table.
+        """
+        if self._inputs.cdc_coexisting or not self._inputs.replace_tables:
+            return []
+        return _views_referencing(
+            self._inputs.dependent_view_ddls, self._inputs.replace_tables
+        )
+
+    def predrop_dependent_views(self) -> None:
+        """Drop views that depend on the replace tables (before recreating them).
+
+        Run-level pre-pass for a "drop & reload" run: a view can depend on several
+        tables loaded in parallel, so the drop must happen ONCE up front, not
+        per-table. Idempotent (``DROP VIEW IF EXISTS``); recreated by
+        :meth:`recreate_dependent_views` after the load. No-op on an append run.
+        """
+        ddls = self._dependent_view_ddls_for_replace()
+        if not ddls:
+            return
+        applier = self._view_applier()
+        for view_ddl in ddls:
+            try:
+                applier.drop(view_ddl)
+            except Exception:  # noqa: BLE001 - best-effort; a real block surfaces on the table DROP
+                _LOGGER.warning("Could not pre-drop dependent view", exc_info=True)
+
+    def recreate_dependent_views(self) -> None:
+        """Recreate the views dropped by :meth:`predrop_dependent_views`.
+
+        Run-level post-pass: after the replace tables are reloaded, recreate the
+        dependent views so the user's views survive a clean reload (they were only
+        dropped to clear the table-DROP dependency). Idempotent (``CREATE`` is
+        retried; an already-present view is left as-is). No-op on an append run.
+        """
+        ddls = self._dependent_view_ddls_for_replace()
+        if not ddls:
+            return
+        from dsql_migrator.core.models import ApplyMode
+
+        applier = self._view_applier()
+        for view_ddl in ddls:
+            try:
+                # REPLACE + confirmed => DROP (if present) then CREATE, idempotent.
+                applier.apply(view_ddl, ApplyMode.REPLACE, confirmed=True)
+            except Exception:  # noqa: BLE001 - best-effort; the tables/data are already loaded
+                _LOGGER.warning("Could not recreate dependent view", exc_info=True)
+
+    def _view_applier(self):
+        """Build a SchemaApplier bound to this run's target (for view drop/apply)."""
+        from dsql_migrator.core.schema_applier import SchemaApplier
+
+        connector = DsqlConnector(
+            self._inputs.target_config, aws_profile=self._inputs.aws_profile
+        )
+        return SchemaApplier(connection_factory=connector.connect)
 
 
 def default_migrator_factory(inputs: DataMigrationInputs) -> DataMigrator:

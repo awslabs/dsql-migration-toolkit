@@ -5,6 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.53
+
+### 수정 (Fixed)
+
+- **Full Load에서 기존 데이터가 있는 테이블에 대해 Drop vs Append를 선택할 수 있고,
+  retry도 그 선택을 유지합니다.** 이전에는 선택한 타깃 테이블에 이미 데이터가 있으면
+  도구가 임의로 결정했고(첫 실행 시 DROP+recreate), **retry는 조용히 append로
+  되돌아가** stale 데이터 위에서 "0 new + N already there"로 보고했습니다 — 실패한
+  로드가 실제로는 아무것도 갱신하지 않았는데도 깨끗하게 끝난 것처럼 보였습니다. 이제
+  Start Full Load 대화상자가 런당 한 번 묻습니다: **Append**(기존 행 유지, 없는 행만
+  로드 — 멱등, 기본값) 또는 **Drop & reload**(각 테이블을 먼저 DROP+recreate해 깨끗이
+  로드). 이 선택은 저장되어 **retry와 테이블별 Reload가 동일하게 동작**합니다.
+- **뷰가 테이블에 의존해도 "Drop & reload"가 더 이상 실패하지 않습니다.** 의존 뷰
+  (예: `customer_order_summary`)가 `DROP TABLE`을 `DependentObjectsStillExist`로 막아
+  옛 행이 그대로 남던 문제를, 이제 drop 경로가 의존 뷰를 먼저 드롭하고(뷰가 병렬 로드되는
+  여러 테이블에 걸칠 수 있으므로 런 레벨 사전 처리) **로드 후 다시 생성**합니다. 그래서
+  깨끗한 리로드가 성공하고 뷰도 보존됩니다 — 무딘 `DROP … CASCADE` 없이. CDC 스트리밍
+  중에는 억제됩니다(DROP이 라이브 sink와 충돌).
+
 ## v0.1.52
 
 ### 추가 (Added)

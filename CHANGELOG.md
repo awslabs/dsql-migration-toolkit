@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.53
+
+### Fixed
+
+- **Full Load now lets you choose Drop-vs-Append for tables that already have
+  data — and a retry keeps that choice.** Previously, if a selected target table
+  already held rows, the tool decided for you (DROP+recreate on the first run),
+  and a **retry silently reverted to append**, reporting "0 new + N already there"
+  over stale data — so a failed load could look clean without actually refreshing
+  anything. The Start Full Load dialog now asks, once for the run: **Append**
+  (keep existing rows, load only the missing ones — idempotent, the default) or
+  **Drop & reload** (DROP and recreate each table first, for a clean load). The
+  choice is stored, so **retry and per-table Reload follow the same behavior**
+  instead of quietly changing it.
+- **"Drop & reload" no longer fails when a view depends on the table.** A
+  dependent view (e.g. `customer_order_summary`) used to block `DROP TABLE` with
+  `DependentObjectsStillExist`, leaving the old rows in place. The drop path now
+  drops the dependent views first (a run-level pre-pass, since a view can span
+  several tables loaded in parallel) and **recreates them after the load**, so a
+  clean reload succeeds and your views survive — without a blunt `DROP … CASCADE`.
+  Suppressed while CDC is streaming (a DROP would race the live sink).
+
 ## v0.1.52
 
 ### Added
