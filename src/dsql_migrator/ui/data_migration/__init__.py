@@ -1855,6 +1855,16 @@ def _render_table_selection(
                 f"{len(effective_set)} of {total_leaves} selected"
             ).classes("text-xs text-gray-500 whitespace-nowrap")
 
+    # Legend for the per-table primary-key indicator, so the check / warning icons
+    # beside each leaf are self-explanatory (they also carry a hover tooltip).
+    with ui.row().classes("items-center gap-3 w-full text-xs text-gray-500"):
+        with ui.row().classes("items-center gap-1 no-wrap"):
+            ui.icon("check_circle", color="green-6").classes("text-sm")
+            ui.label("Has a primary key")
+        with ui.row().classes("items-center gap-1 no-wrap"):
+            ui.icon("warning", color="amber-7").classes("text-sm")
+            ui.label("No primary key (required to migrate to Aurora DSQL)")
+
     with ui.scroll_area().classes(
         "w-full bg-white rounded-md border border-gray-200"
     ).style("height: 280px"):
@@ -1868,6 +1878,11 @@ def _render_table_selection(
             on_tick=None if locked else on_tick,
         )
         tree.props(f"tick-color={'grey' if locked else 'primary'} no-connectors")
+        # Wire the name filter to the tree (Quasar QTree ``filter`` prop): typing
+        # narrows the visible nodes to matching table leaves. Without this bind
+        # the input renders but does nothing.
+        if filter_input is not None:
+            filter_input.bind_value_to(tree, "filter")
         # A small PK indicator beside each table leaf (client-side Vue template):
         # a green check when the table has a primary key, an amber warning when it
         # does not. Non-leaf nodes (schema / "Tables (N)") have no "header" key, so

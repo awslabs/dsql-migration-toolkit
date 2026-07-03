@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.49
+
+### Fixed
+
+- **"Tables to migrate" filter now works, and the primary-key icons have a
+  legend.** The name filter box above the table tree rendered but did nothing —
+  it wasn't bound to the tree — so typing filtered nothing; it's now wired to the
+  tree's filter (typing narrows to matching table leaves). Added a small legend
+  under the header explaining the per-table icons: a green check means the table
+  has a primary key, an amber warning means it has none (which Aurora DSQL
+  requires).
+
 ## v0.1.48
 
 ### Changed
