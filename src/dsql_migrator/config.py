@@ -352,11 +352,30 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> AppConfig:
 # from the Pydantic field metadata rather than duplicated here.
 @dataclass(frozen=True)
 class TunableKnob:
-    """A runtime-adjustable integer performance knob (env-backed)."""
+    """A runtime-adjustable integer performance knob (env-backed).
+
+    Carries the metadata the UI renders as an AWS Console (Cloudscape) "form
+    field": ``group`` is the section it belongs to (e.g. "Full Load"),
+    ``short_label`` is its field label within that section, and ``description``
+    is the one-line helper text under the label. ``label`` (the fully-qualified
+    name used in notifications / error messages) is derived from the two so the
+    UI and the messages can never drift apart.
+    """
 
     field: str  # AppConfig attribute name
     env_suffix: str  # env key sans the DSQL_MIGRATOR_ prefix
-    label: str  # short human label for the UI
+    group: str  # form section this knob belongs to ("Full Load" / "Validation")
+    short_label: str  # field label within its group, e.g. "Tables in parallel"
+    description: str  # one-line Cloudscape form-field helper text
+
+    @property
+    def label(self) -> str:
+        """Fully-qualified label for notifications / error messages.
+
+        Derived from ``group`` + ``short_label`` (single source of truth) so it
+        stays in sync with the UI, e.g. ``"Full Load — tables in parallel"``.
+        """
+        return f"{self.group} — {self.short_label.lower()}"
 
     @property
     def env_key(self) -> str:
@@ -375,22 +394,30 @@ TUNABLE_KNOBS: tuple[TunableKnob, ...] = (
     TunableKnob(
         "full_load_table_parallelism",
         "FULL_LOAD_TABLE_PARALLELISM",
-        "Full Load — tables in parallel",
+        "Full Load",
+        "Tables in parallel",
+        "How many source tables are loaded at the same time.",
     ),
     TunableKnob(
         "full_load_batch_parallelism",
         "FULL_LOAD_BATCH_PARALLELISM",
-        "Full Load — batches per table",
+        "Full Load",
+        "Batches per table",
+        "Concurrent row batches loaded per table.",
     ),
     TunableKnob(
         "full_load_batch_rows",
         "FULL_LOAD_BATCH_ROWS",
-        "Full Load — rows per batch",
+        "Full Load",
+        "Rows per batch",
+        "Rows per INSERT batch (DSQL caps a transaction at 3000 rows).",
     ),
     TunableKnob(
         "validate_max_workers",
         "VALIDATE_MAX_WORKERS",
-        "Validation — tables in parallel",
+        "Validation",
+        "Tables in parallel",
+        "How many tables are checksummed at the same time.",
     ),
 )
 

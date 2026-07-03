@@ -312,6 +312,25 @@ def test_tunable_knobs_bounds_match_appconfig_fields() -> None:
     assert all(k.env_key.startswith(ENV_PREFIX) for k in TUNABLE_KNOBS)
 
 
+def test_tunable_knob_label_is_derived_from_group_and_short_label() -> None:
+    """The fully-qualified ``label`` (used in notifications / errors) is derived
+    from ``group`` + ``short_label`` so the UI form fields and the messages can
+    never drift apart. Knobs are also ordered by group for section rendering."""
+    for k in TUNABLE_KNOBS:
+        assert k.group and k.short_label and k.description
+        assert k.label == f"{k.group} — {k.short_label.lower()}"
+    # A known knob renders the expected qualified label.
+    by_field = {k.field: k for k in TUNABLE_KNOBS}
+    assert by_field["full_load_table_parallelism"].label == (
+        "Full Load — tables in parallel"
+    )
+    # Knobs are grouped contiguously (Full Load ..., then Validation ...) so the
+    # UI can emit a section subheader on each group change without re-sorting.
+    groups = [k.group for k in TUNABLE_KNOBS]
+    assert groups == sorted(groups, key=groups.index)  # no group reappears later
+    assert len(set(groups)) < len(groups)  # at least one group has >1 knob
+
+
 def test_current_tuning_values_reflect_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     for k in TUNABLE_KNOBS:
         monkeypatch.delenv(k.env_key, raising=False)

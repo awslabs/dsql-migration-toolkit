@@ -548,40 +548,73 @@ def _render_performance_tuning_controls() -> None:
         current_tuning_values,
         set_tuning_value,
     )
+    from dsql_migrator.ui.design import render_notice
 
     current = current_tuning_values()
 
     with ui.expansion("Performance tuning", icon="speed").props("dense").classes(
         "w-full"
     ):
-        ui.label(
-            "Applies to the NEXT Full Load / Validation. App-wide; resets on "
-            "restart. Total DSQL connections ≈ tables × batches — keep within "
-            "the cluster quota."
-        ).classes("text-xs text-gray-400")
+        # Cloudscape "form" treatment, kept compact for the narrow sidebar: a
+        # single-line info Alert with the operational caveat up top, then the
+        # knobs laid out as grouped form fields -- one dense row per knob
+        # (label + allowed range + bounded input), with the longer description
+        # moved to a hover tooltip (Cloudscape's "info" idiom) so each field
+        # stays a single line.
+        render_notice(
+            ui,
+            tone="info",
+            header="Applies to the next run",
+            body="Live, app-wide; resets on restart. Connections ≈ tables × batches.",
+        )
 
+        def _on_change(event: object, k) -> None:
+            raw = getattr(event, "value", None)
+            try:
+                applied = set_tuning_value(k.field, raw)
+            except TuningValueError as exc:
+                ui.notify(str(exc), type="warning", position="top")
+                return
+            ui.notify(
+                f"{k.label} = {applied} (applies to the next run).",
+                type="info",
+            )
+
+        current_group: str | None = None
         for knob in TUNABLE_KNOBS:
-            def _on_change(event: object, k=knob) -> None:
-                raw = getattr(event, "value", None)
-                try:
-                    applied = set_tuning_value(k.field, raw)
-                except TuningValueError as exc:
-                    ui.notify(str(exc), type="warning", position="top")
-                    return
-                ui.notify(
-                    f"{k.label} = {applied} (applies to the next run).",
-                    type="info",
+            # Emit a Cloudscape-style section subheader when the group changes
+            # (knobs are ordered by group, so this groups them into "Full Load"
+            # / "Validation" sections without re-sorting).
+            if knob.group != current_group:
+                ui.label(knob.group).classes(
+                    "text-xs uppercase tracking-wide text-gray-500 font-medium "
+                    "mt-2 mb-0"
                 )
+                current_group = knob.group
 
-            ui.number(
-                label=f"{knob.label} (≤ {knob.maximum})",
-                value=current[knob.field],
-                min=knob.minimum,
-                max=knob.maximum,
-                step=1,
-                format="%d",
-                on_change=_on_change,
-            ).props("dense outlined").classes("w-full text-xs")
+            # One compact Cloudscape "form field" per row: label (+ range hint)
+            # on the left, a small info glyph carrying the description tooltip,
+            # and the bounded input on the right.
+            with ui.row().classes("items-center gap-1 no-wrap w-full"):
+                with ui.column().classes("gap-0 flex-1 min-w-0"):
+                    with ui.row().classes("items-center gap-1 no-wrap"):
+                        ui.label(knob.short_label).classes(
+                            "text-sm text-gray-900 truncate"
+                        )
+                        ui.icon("info").classes(
+                            "text-gray-400 text-xs cursor-help"
+                        ).tooltip(knob.description)
+                    ui.label(f"{knob.minimum}–{knob.maximum}").classes(
+                        "text-xs text-gray-400 leading-none"
+                    )
+                ui.number(
+                    value=current[knob.field],
+                    min=knob.minimum,
+                    max=knob.maximum,
+                    step=1,
+                    format="%d",
+                    on_change=lambda e, k=knob: _on_change(e, k),
+                ).props("dense outlined").classes("w-20 text-sm")
 
 
 def _render_diagnostics_controls() -> None:

@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.45
+
+### Changed
+
+- **Performance-tuning control restyled as a compact AWS Console (Cloudscape)
+  form.** The sidebar "Performance tuning" panel no longer stacks four bare
+  number inputs. It now opens with a one-line info Alert (applies to the next
+  run; live/app-wide, resets on restart; connections ≈ tables × batches), then
+  lays the knobs out as grouped form fields under "Full Load" / "Validation"
+  section subheaders. Each knob is a single dense row — label, an info glyph
+  whose tooltip carries the longer description, the allowed range, and a
+  bounded number input — so the whole panel stays tight in the narrow sidebar.
+  The knob metadata (group / label / description / range) all lives in
+  `config.py` so the UI and the validation messages share one source of truth.
+  No behavior change to what the knobs do.
+
 ## v0.1.44
 
 ### Fixed
