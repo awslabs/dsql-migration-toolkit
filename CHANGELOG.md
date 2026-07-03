@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.47
+
+### Changed
+
+- **"Tables to migrate" picker restyled as a compact AWS Console (Cloudscape)
+  data table.** Step 3's table picker was a schema → Tables → leaf tree with a
+  checkbox at every level. It's now a flat, sortable data table with a single
+  checkbox column and one row per table, showing more at a glance: schema,
+  column count, whether the table has a primary key (a green check, or an amber
+  warning when absent since DSQL requires one), secondary-index count, and a
+  "exists"/"new" target status chip. A name filter and a live "N of M selected"
+  counter sit above it. Fewer checkboxes, higher information density, same
+  selection behavior — the ticked set still drives Full Load / CDC / prerequisite
+  checks, and the picker still locks (dimmed, non-interactive) once checks have
+  run or CDC is live.
+
 ## v0.1.46
 
 ### Changed

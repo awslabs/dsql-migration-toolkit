@@ -1707,6 +1707,48 @@ def build_migration_table_tree(
     return schema_nodes
 
 
+def build_migration_table_rows(
+    inventory: SourceInventory,
+    migratable: Sequence[str],
+    *,
+    target_existing: Sequence[str] = (),
+) -> list[dict]:
+    """Assemble one flat, sortable row per migratable table for ``ui.table``.
+
+    The AWS Console (Cloudscape) "data table" counterpart to
+    :func:`build_migration_table_tree`: instead of a schema -> Tables -> leaf
+    tree with a checkbox at every level, each migratable table is a single row
+    carrying the metadata that helps an operator decide what to migrate --
+    schema, column count, whether it has a primary key, secondary-index count,
+    and whether the table already exists on the target DSQL. ``table`` (the full,
+    possibly-qualified name) is the row key, so a selected row maps straight back
+    to the inventory. Only migratable tables are included (same scoping as the
+    tree: a table with no target table to load into is omitted), in inventory
+    order. NiceGUI-agnostic so it is unit-testable without a running server.
+    """
+    migratable_set = set(migratable)
+    existing = set(target_existing)
+    rows: list[dict] = []
+    for table in inventory.tables:
+        if table.name not in migratable_set:
+            continue
+        schema, obj = _split_migration_schema(table.name)
+        rows.append(
+            {
+                "table": table.name,  # full/qualified name -> row key
+                "name": obj,  # short display name
+                "schema": schema,
+                "columns": len(table.columns),
+                # Store booleans as sortable ints plus a display glyph resolved in
+                # the cell slot; keep the raw bool for tests/consumers.
+                "has_pk": bool(table.primary_key),
+                "indexes": len(table.indexes),
+                "exists_on_target": table.name in existing,
+            }
+        )
+    return rows
+
+
 def _render_table_selection(
     ui,
     inventory: SourceInventory,
@@ -1795,65 +1837,96 @@ def _render_table_selection(
             touched=migration_state.selection_touched,
             default=list(target_existing),
         )
-    nodes = build_migration_table_tree(inventory, migratable_order)
+    # AWS Console (Cloudscape) "data table": one flat, sortable row per table
+    # (schema / columns / PK / indexes / target existence) with a single checkbox
+    # column and a built-in name filter -- denser and more informative than the
+    # schema -> Tables -> leaf tree, which put a checkbox at every level.
+    rows = build_migration_table_rows(
+        inventory, migratable_order, target_existing=target_existing
+    )
+    effective_set = set(effective)
 
-    def on_tick(event: object) -> None:
-        value = getattr(event, "value", None) or []
-        names = selected_object_names(value)
-        chosen = [name for name in migratable_order if name in names]
+    columns = [
+        {"name": "name", "label": "Table", "field": "name", "align": "left",
+         "sortable": True},
+        {"name": "schema", "label": "Schema", "field": "schema", "align": "left",
+         "sortable": True},
+        {"name": "columns", "label": "Columns", "field": "columns",
+         "align": "right", "sortable": True},
+        {"name": "has_pk", "label": "Primary key", "field": "has_pk",
+         "align": "center", "sortable": True},
+        {"name": "indexes", "label": "Indexes", "field": "indexes",
+         "align": "right", "sortable": True},
+        {"name": "exists_on_target", "label": "Target", "field": "exists_on_target",
+         "align": "left", "sortable": True},
+    ]
+
+    def _sync_selection(table) -> None:
+        chosen_names = {r["table"] for r in table.selected}
+        chosen = [name for name in migratable_order if name in chosen_names]
         migration_state.set_selection(TableSelection(selected_tables=chosen))
 
+    # A live filter box + selection counter above the table (Cloudscape header).
+    filter_input = None
     if not locked:
-        # Bulk selection over the migratable set. Programmatic tick/untick does not
-        # fire on_tick, so update the session selection directly to stay in sync.
-        with ui.row().classes("items-center gap-1 w-full no-wrap"):
-
-            def _dm_select_all() -> None:
-                tree.tick()
-                migration_state.set_selection(
-                    TableSelection(selected_tables=list(migratable_order))
-                )
-
-            def _dm_unselect_all() -> None:
-                tree.untick()
-                migration_state.set_selection(TableSelection(selected_tables=[]))
-
-            ui.button("Select all", on_click=_dm_select_all).props(
-                "flat dense no-caps size=sm color=primary icon=done_all"
+        with ui.row().classes("items-center gap-2 w-full no-wrap"):
+            filter_input = (
+                ui.input(placeholder="Filter tables by name")
+                .props("dense clearable outlined")
+                .classes("flex-1 min-w-0 text-sm")
             )
-            ui.button("Unselect all", on_click=_dm_unselect_all).props(
-                "flat dense no-caps size=sm color=grey-7 icon=remove_done"
-            )
+            count_label = ui.label(
+                f"{len(effective_set)} of {len(rows)} selected"
+            ).classes("text-xs text-gray-500 whitespace-nowrap")
 
-    with ui.scroll_area().classes(
-        "w-full bg-white rounded border border-gray-200"
-    ).style("height: 280px"):
-        # When locked, omit the on_tick handler so ticks can't change the
-        # selection, and disable the tree so it reads as non-interactive. The
-        # tick checkboxes are rendered grey (vs the primary color when active) so
-        # it is visually obvious the boxes cannot be changed -- not just inert.
-        tree = ui.tree(
-            nodes,
-            label_key="label",
-            node_key="id",
-            tick_strategy="leaf",
-            on_tick=None if locked else on_tick,
-        )
-        # Grey, non-interactive checkboxes when locked; the normal primary color
-        # (a live, changeable selection) otherwise.
-        tree.props(f"tick-color={'grey' if locked else 'primary'}")
-        # Load fully expanded so every schema's tables are visible without manual
-        # drilling (the migratable-only tree keeps this bounded).
-        tree.expand()
-        ticked_ids = [f"{TABLE_PREFIX}{name}" for name in effective]
-        if ticked_ids:
-            tree.tick(ticked_ids)
-        if locked:
-            # pointer-events-none blocks clicks; the greyed checkboxes + dimmed
-            # tree communicate "selection is locked" at a glance (not just dead).
-            tree.props("no-selection-unset").classes(
-                "pointer-events-none opacity-70"
-            )
+    def _on_select(event: object) -> None:
+        _sync_selection(table)
+        if not locked:
+            count_label.text = f"{len(table.selected)} of {len(rows)} selected"
+
+    table = ui.table(
+        columns=columns,
+        rows=rows,
+        row_key="table",
+        selection=None if locked else "multiple",
+        on_select=None if locked else _on_select,
+        pagination={"rowsPerPage": 0, "sortBy": "name"},
+    ).props("dense flat bordered wrap-cells").classes(
+        "w-full bg-white"
+    ).style("max-height: 320px")
+    # Pre-tick the effective selection (the rows whose full name is selected).
+    table.selected = [r for r in rows if r["table"] in effective_set]
+    if filter_input is not None:
+        filter_input.bind_value_to(table, "filter")
+
+    # Primary-key cell: a check when present, an amber warning when absent (no PK
+    # means the table can't be migrated to DSQL as-is -- worth surfacing here).
+    table.add_slot(
+        "body-cell-has_pk",
+        r"""
+        <q-td :props="props" class="text-center">
+          <q-icon v-if="props.row.has_pk" name="check_circle" color="green-6" size="18px" />
+          <q-icon v-else name="warning" color="amber-7" size="18px">
+            <q-tooltip>No primary key — required to migrate to Aurora DSQL</q-tooltip>
+          </q-icon>
+        </q-td>
+        """,
+    )
+    # Target-existence cell: a quiet "exists"/"new" status chip (Cloudscape
+    # StatusIndicator) so the operator sees which tables already have a target.
+    table.add_slot(
+        "body-cell-exists_on_target",
+        r"""
+        <q-td :props="props">
+          <q-badge v-if="props.row.exists_on_target" color="green-6" outline label="exists" />
+          <q-badge v-else color="grey-6" outline label="new" />
+        </q-td>
+        """,
+    )
+    if locked:
+        # Non-interactive when locked (prereqs ran / CDC live): dim it and block
+        # clicks so the frozen selection reads as locked, not merely inert.
+        table.classes("pointer-events-none opacity-70")
 
 
 def _render_full_load_step(
@@ -3206,6 +3279,7 @@ __all__ = [
     "format_selected_workloads",
     "effective_migration_selection",
     "build_migration_table_tree",
+    "build_migration_table_rows",
     "WatermarkDisplay",
     "format_binlog_coordinate",
     "format_watermark",

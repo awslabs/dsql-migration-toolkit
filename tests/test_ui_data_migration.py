@@ -53,6 +53,7 @@ from dsql_migrator.ui.data_migration import (
     DataMigrationStore,
     BatchedTableMigrator,
     build_migration_table_tree,
+    build_migration_table_rows,
     effective_migration_selection,
     format_binlog_coordinate,
     format_error_summary,
@@ -1542,6 +1543,57 @@ def test_build_migration_table_tree_omits_schema_with_no_migratable() -> None:
     assert schema_ids == ["schema:app"]
     app_leaves = tree[0]["children"][0]["children"]
     assert [leaf["id"] for leaf in app_leaves] == [f"{TABLE_PREFIX}app.orders"]
+
+
+def test_build_migration_table_rows_one_row_per_migratable_table() -> None:
+    # The Cloudscape data-table builder: one flat row per migratable table, in
+    # inventory order, carrying the decision metadata (schema, columns, PK,
+    # indexes, target existence). The full/qualified name is the row key.
+    inventory = _qualified_inventory()
+    rows = build_migration_table_rows(
+        inventory,
+        ["app.orders", "app.customers", "audit.events"],
+        target_existing=["app.orders"],
+    )
+    assert [r["table"] for r in rows] == [
+        "app.orders",
+        "app.customers",
+        "audit.events",
+    ]
+    orders = rows[0]
+    assert orders["name"] == "orders"  # short display name
+    assert orders["schema"] == "app"
+    assert orders["columns"] == 1
+    assert orders["has_pk"] is True
+    assert orders["indexes"] == 0
+    assert orders["exists_on_target"] is True  # in target_existing
+    assert rows[1]["exists_on_target"] is False  # app.customers not existing
+
+
+def test_build_migration_table_rows_omits_non_migratable() -> None:
+    # Same scoping as the tree: a table with no target table to load into is
+    # omitted entirely, and a table with no primary key is flagged (has_pk False).
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="orders",
+                columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                primary_key=["id"],
+            ),
+            TableDef(
+                name="audit_log",
+                columns=[ColumnDef(name="msg", mysql_type="text", nullable=True)],
+                primary_key=[],  # no PK
+            ),
+        ]
+    )
+    rows = build_migration_table_rows(inventory, ["orders", "audit_log"])
+    by_name = {r["table"]: r for r in rows}
+    assert set(by_name) == {"orders", "audit_log"}
+    assert by_name["audit_log"]["has_pk"] is False
+    # A non-migratable table is dropped.
+    only_orders = build_migration_table_rows(inventory, ["orders"])
+    assert [r["table"] for r in only_orders] == ["orders"]
 
 
 # ---------------------------------------------------------------------------
