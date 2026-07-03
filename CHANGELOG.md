@@ -5,6 +5,53 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.35
+
+### Fixed
+
+- **AI assist now deploys in non-US regions (e.g. Seoul / ap-northeast-2).** The
+  `BedrockModelId` deploy parameter accepted only `us.` inference profiles, and the
+  task-role `bedrock:InvokeModel` scope was derived by splitting on `"us."` and
+  hard-coded to the US member regions (us-east-1/2, us-west-2) — so AI assist could
+  not be enabled outside the US (a non-`us.` id was rejected at parameter
+  validation, and the derived IAM scope was wrong for other geographies). The
+  parameter now also offers `global.` profiles (portable to any region), the
+  foundation-model id is derived by splitting on `"anthropic."` (present in every
+  `us.`/`global.`/`apac.` profile id), and the foundation-model ARN is scoped
+  region-agnostically (region `*`, exact model id) instead of enumerating per-geo
+  member regions. Still least-privilege — the `*` is only the region field; the
+  model id stays exact and the resource is never a blanket `*`.
+- **CDC deploy no longer opens `0.0.0.0/0` egress to the source DB by default.** At
+  CDC-infra deploy the tool now auto-discovers the source DB's security group (RDS
+  `DescribeDBInstances`, read-only) and scopes the connector's egress-to-source
+  rule to it, so the stack stops falling back to an open source-port egress on
+  every UI deploy. Best effort — a non-RDS host or missing `rds:DescribeDBInstances`
+  leaves it empty (documented fallback, unchanged).
+- **CDC sink log corrected + dead in-memory S3 CSV export removed.** The sink's
+  `start()` advisory now states a permanently-rejected record with no DLQ **fails
+  the task** (the actual behavior), not "logged and skipped"; and an unreachable,
+  whole-file-in-memory S3 CSV export path was deleted (the shipping path streams
+  page-bounded). No behavior change to the live data path.
+
+### Changed
+
+- **Default container image bumped to `0.1.34`.** The app-stack default
+  `ContainerImageUri` still pointed at `0.1.31` while the shipped release was newer,
+  so a fresh deploy ran a stale image.
+
+### Docs
+
+- **Japanese (日本語) manual + docs**, with a 3-way English / 한국어 / 日本語
+  language switcher across the manual, README, deployment guide, and changelog.
+- **Natural-Korean pass** over the Korean manual (fluency + terminology
+  consistency), a rewritten testing chapter, and a new measured-results section in
+  the performance chapter.
+- **Architecture diagrams as PNGs** embedded in the README (the full topology is
+  click-to-enlarge); the editable `.drawio` sources are no longer shared.
+- **Deployment guide**: the AWS CLI example now enables AI assist inline
+  (`EnableAiAssist` / `BedrockRegion` / `BedrockModelId`); Apache-2.0 `LICENSE`
+  copyright line filled; internal working documents removed from the repo.
+
 ## v0.1.34
 
 ### Added

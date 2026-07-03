@@ -5,6 +5,40 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.35
+
+### 수정 (Fixed)
+
+- **비(非)US 리전(예: 서울 / ap-northeast-2)에서도 AI 어시스트 배포 가능.** `BedrockModelId`
+  배포 파라미터가 `us.` 추론 프로파일만 허용했고, 태스크 역할의 `bedrock:InvokeModel` 범위를
+  `"us."` 기준으로 분해해 US 멤버 리전(us-east-1/2, us-west-2)에 하드코딩했습니다 — 그래서 US
+  밖에서는 AI를 켤 수 없었습니다(비-`us.` ID는 파라미터 검증에서 거부, 파생 IAM 범위도 다른
+  지역에는 잘못됨). 이제 파라미터가 `global.` 프로파일(전 리전 이식 가능)도 제공하고,
+  foundation-model ID는 `"anthropic."` 기준으로 분해하며(모든 `us.`/`global.`/`apac.` 프로파일
+  ID에 존재), foundation-model ARN은 멤버 리전을 열거하는 대신 **리전 무관(`*`, 정확한 모델
+  ID)** 으로 범위를 잡습니다. 여전히 최소 권한 — `*`는 리전 필드에만, 모델 ID는 정확히 유지.
+- **CDC 배포가 기본적으로 소스 DB에 `0.0.0.0/0` egress를 열지 않음.** CDC 인프라 배포 시 소스
+  DB의 보안 그룹을 자동 발견(RDS `DescribeDBInstances`, 읽기 전용)해 커넥터의 소스행 egress를
+  그 SG로 범위 제한합니다. 최선 노력 — 비-RDS 호스트나 권한 부재 시 비워 둠(문서화된 폴백).
+- **CDC 싱크 로그 정정 + 죽은 인메모리 S3 CSV export 제거.** DLQ 없이 영구 거부된 레코드는
+  "logged and skipped"가 아니라 **태스크를 실패**시킨다는(실제 동작) 문구로 정정, 그리고 도달
+  불가한 전체-파일-메모리 적재 S3 CSV export 경로를 삭제(실제 경로는 페이지 단위 스트리밍).
+
+### 변경 (Changed)
+
+- **기본 컨테이너 이미지를 `0.1.34`로 상향.** app-stack 기본 `ContainerImageUri`가 아직
+  `0.1.31`을 가리켜, 새 배포가 옛 이미지를 실행하던 문제 수정.
+
+### 문서 (Docs)
+
+- **일본어(日本語) 매뉴얼·문서** 추가 및 매뉴얼/README/배포 가이드/체인지로그 전반에 영어/한국어/
+  일본어 3중 언어 스위처.
+- **한국어 매뉴얼 자연스러움 개선**(문장·용어 통일), 테스트 장 재작성, 성능 장에 실측 예시 추가.
+- **아키텍처 다이어그램 PNG**를 README에 임베드(전체 토폴로지는 클릭 확대), 편집용 `.drawio`
+  소스는 더 이상 공유하지 않음.
+- **배포 가이드**: AWS CLI 예시에 AI 어시스트 인라인 설정(`EnableAiAssist`/`BedrockRegion`/
+  `BedrockModelId`), Apache-2.0 `LICENSE` 저작권 기입, 내부 작업 문서 제거.
+
 ## v0.1.34
 
 ### 추가 (Added)
