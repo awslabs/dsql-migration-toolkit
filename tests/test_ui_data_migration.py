@@ -3131,6 +3131,36 @@ def test_failed_table_names_lists_only_failed_chunks() -> None:
     assert failed_table_names(job) == ["customers", "items"]
 
 
+def test_unsettled_table_names_includes_pending_and_failed() -> None:
+    # A fatal/aborted run can leave tables PENDING (never attempted) rather than
+    # FAILED. Recovery must resume those too -- unsettled = every non-DONE chunk --
+    # or a crash before the big tables loaded would strand them with no scoped retry.
+    from dsql_migrator.ui.data_migration import (
+        failed_table_names,
+        unsettled_table_names,
+    )
+
+    job = _full_load_job(
+        [
+            {"chunk_id": "categories", "status": "DONE", "rows_loaded": 1, "attempts": 1},
+            {"chunk_id": "orders", "status": "PENDING", "attempts": 3},
+            {"chunk_id": "payments", "status": "PENDING", "attempts": 3},
+            {"chunk_id": "reviews", "status": "FAILED", "attempts": 1},
+        ],
+        counts={},
+    )
+    # failed_table_names sees only the FAILED chunk (the pre-fix recovery gap)...
+    assert failed_table_names(job) == ["reviews"]
+    # ...unsettled_table_names resumes every unfinished table, PENDING included.
+    assert unsettled_table_names(job) == ["orders", "payments", "reviews"]
+    # An all-DONE job has nothing unsettled.
+    done = _full_load_job(
+        [{"chunk_id": "t", "status": "DONE", "rows_loaded": 1, "attempts": 1}],
+        counts={},
+    )
+    assert unsettled_table_names(done) == []
+
+
 def test_full_load_completeness_all_complete() -> None:
     from dsql_migrator.ui.data_migration import (
         build_full_load_table_rows,

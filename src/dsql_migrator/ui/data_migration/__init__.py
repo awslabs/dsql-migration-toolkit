@@ -150,6 +150,7 @@ from dsql_migrator.ui.data_migration._models import (
     FullLoadTableRow,
     build_full_load_table_rows,
     failed_table_names,
+    unsettled_table_names,
     format_duration,
     format_table_timing,
     FullLoadCompleteness,
@@ -922,12 +923,14 @@ def build_data_migration_screen(
                 refresh()
 
             def retry_failed_load() -> None:
-                # Re-run Full Load for only the previously failed tables, carrying
-                # the succeeded tables forward so the view stays unified.
+                # Re-run Full Load for the UNFINISHED tables (FAILED *or* still
+                # PENDING), carrying the succeeded tables forward so the view stays
+                # unified. PENDING matters when a fatal/aborted run left tables it
+                # never got to attempt -- they must be resumable, not stranded.
                 current = _current_job(job_manager, migration_state.job_id)
                 if current is None:
                     return
-                _run_retry_for(failed_table_names(current))
+                _run_retry_for(unsettled_table_names(current))
 
             def reload_table(table_name: str) -> None:
                 # Per-table Reload: re-run Full Load for exactly one table (even a
@@ -2542,10 +2545,14 @@ def _render_full_load_step(
         # main action. The standalone button is only for the pre-run Start and
         # for a clean finished run (DONE, no failures) where re-running all is the
         # natural single action.
+        # A terminated run with ANY unfinished table (FAILED or still PENDING)
+        # shows the recovery row (Retry unfinished / Re-run all) instead of a lone
+        # "Re-run Full Load" -- so a crash that left tables PENDING still offers a
+        # scoped retry, not just a full re-run.
         terminal_with_failures = (
             job is not None
             and status is not StepStatus.IN_PROGRESS
-            and bool(failed_table_names(job))
+            and bool(unsettled_table_names(job))
         )
         if not terminal_with_failures:
             start_label = "Re-run Full Load" if job is not None else "Start Full Load"
@@ -2597,7 +2604,12 @@ def _render_full_load_step(
                     body=job_error,
                 )
 
-            failed = failed_table_names(job)
+            # Recovery set = every table that did NOT finish (FAILED *or* still
+            # PENDING). A fatal/aborted run (e.g. a run-level crash before the big
+            # tables were attempted) leaves them PENDING, not FAILED -- so keying
+            # recovery off FAILED alone would strand them with only a full "Re-run"
+            # as escape. ``unsettled`` resumes exactly the unfinished tables.
+            failed = unsettled_table_names(job)
             if failed:
                 # Recovery needs a live source AND target. After an app restart the
                 # connections (and the in-memory source password) are NOT restored
@@ -2662,32 +2674,43 @@ def _render_full_load_step(
                     # Spacer pushes the recommended action to the right edge.
                     ui.space()
 
-                    # Per-table failure reasons (cause) for the retry checklist, so
-                    # the user can see WHY each table failed before deciding whether
-                    # to retry it now.
+                    # Per-table reason (cause) for the retry checklist, so the user
+                    # can see WHY each table is unfinished before deciding whether to
+                    # retry it now. FAILED tables carry their error-log message; a
+                    # still-PENDING table was never attempted (the run ended first),
+                    # so it gets a plain "not yet loaded" note.
                     _failure_reasons = migration_state.error_log.latest_messages(
                         job.job_id
                     )
+                    _pending_names = {
+                        c.chunk_id for c in job.chunks if c.status == "PENDING"
+                    }
+
+                    def _reason_for(name: str) -> str:
+                        msg = _failure_reasons.get(name, "")
+                        if msg:
+                            return msg
+                        if name in _pending_names:
+                            return "Not loaded yet — the previous run ended first."
+                        return ""
 
                     async def _confirm_retry_failed(event: object = None) -> None:
-                        # Route the failed-table retry through the same confirm
-                        # dialog as Start, as a CHECKLIST (all pre-checked) of the
-                        # failed tables + their reasons. Probing/Drop-vs-Append and
-                        # the retry are scoped to the CHECKED subset, so the user can
-                        # retry only the tables they're ready for.
+                        # Route the retry through the same confirm dialog as Start,
+                        # as a CHECKLIST (all pre-checked) of the UNFINISHED tables +
+                        # their reasons. Probing/Drop-vs-Append and the retry are
+                        # scoped to the CHECKED subset, so the user can retry only the
+                        # tables they're ready for.
                         retry_fn = retry_tables or (lambda _names: retry_failed_load())
                         await _open_full_load_confirm(
                             event,
                             probe_tables=list(failed),
                             on_confirm=retry_fn,
-                            title=f"Retry {len(failed)} failed table(s)?",
-                            table_reasons={
-                                n: _failure_reasons.get(n, "") for n in failed
-                            },
+                            title=f"Retry {len(failed)} unfinished table(s)?",
+                            table_reasons={n: _reason_for(n) for n in failed},
                         )
 
                     retry_btn = ui.button(
-                        f"Retry failed tables ({len(failed)})",
+                        f"Retry unfinished tables ({len(failed)})",
                         on_click=_confirm_retry_failed,
                         icon="replay",
                     ).props("color=primary")
@@ -2780,13 +2803,14 @@ def _incomplete_is_quarantine_only(
     """True when a run's only incompleteness is quarantined rows (overridable).
 
     A quarantine table's chunk completes DONE (its loadable rows are committed),
-    so there are NO failed chunks; the run is incomplete only because rows were
+    so there are NO unfinished chunks; the run is incomplete only because rows were
     permanently dropped. That is the one case the accept-and-continue override may
-    unblock -- a retryable table failure (a FAILED chunk) must still block.
+    unblock -- any UNFINISHED table (a FAILED chunk, or one still PENDING because
+    the run ended before it loaded) is retryable work and must still block.
     """
     if job is None:
         return False
-    if failed_table_names(job):  # a retryable real failure is present
+    if unsettled_table_names(job):  # retryable/unfinished work is present
         return False
     return _quarantined_row_count(job, error_log) > 0
 
@@ -3611,6 +3635,7 @@ __all__ = [
     "build_full_load_table_rows",
     "FullLoadTableRow",
     "failed_table_names",
+    "unsettled_table_names",
     "full_load_completeness",
     "FullLoadCompleteness",
     "build_migration_table_status",

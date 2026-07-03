@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.57
+
+### 수정 (Fixed)
+
+- **실패한 실행이 PENDING으로 남긴 테이블을 이제 재시도할 수 있음(이전엔 갇힘).**
+  Full Load가 일부 테이블을 시도하기도 전에 실패로 끝나면 그 테이블들이 `FAILED`가
+  아니라 `PENDING`으로 남았는데, 복구 UI가 `FAILED` 청크만 보고 있어서 "Retry" 동작이
+  안 뜨고 유일한 탈출구가 전체 "Re-run Full Load"뿐이었습니다. 이제 복구가 **미완료**
+  테이블 전체(FAILED 또는 PENDING)를 대상으로 합니다: 종료된 실행에 미완료 테이블이
+  있으면 재시도 행이 나타나고, 버튼은 "Retry unfinished tables (N)"으로 표시되며,
+  체크리스트가 각 테이블을 이유와 함께 보여줍니다(에러 메시지, 또는 PENDING 테이블은
+  "Not loaded yet — the previous run ended first."). 이미 로드된(DONE) 테이블은 그대로
+  유지되고 불필요하게 다시 실행되지 않습니다. (v0.1.56 크래시의 복구 경로입니다 —
+  업데이트 후 "Retry unfinished tables"를 눌러 PENDING 테이블을 이어서 로드하세요.)
+
 ## v0.1.56
 
 ### 수정 (Fixed)

@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.57
+
+### Fixed
+
+- **Tables left PENDING by a failed run can now be retried (were stranded).** If a
+  Full Load ended in failure *before* some tables were even attempted, those
+  tables stayed `PENDING` (not `FAILED`) — and the recovery UI keyed only off
+  `FAILED` chunks, so it showed no "Retry" action and the only escape was a full
+  "Re-run Full Load". Recovery now targets every **unfinished** table (FAILED *or*
+  PENDING): the retry row appears whenever a terminated run has unfinished tables,
+  the button reads "Retry unfinished tables (N)", and the checklist lists each one
+  with its reason (its error, or "Not loaded yet — the previous run ended first."
+  for a PENDING table). Already-loaded (DONE) tables are still kept and never
+  re-run needlessly. (This is the recovery path for the v0.1.56 crash: after
+  updating, click Retry unfinished tables to resume the PENDING ones.)
+
 ## v0.1.56
 
 ### Fixed

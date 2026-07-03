@@ -212,6 +212,22 @@ def failed_table_names(job: MigrationJob) -> list[str]:
     return [chunk.chunk_id for chunk in job.chunks if chunk.status == "FAILED"]
 
 
+def unsettled_table_names(job: MigrationJob) -> list[str]:
+    """Return the tables that did NOT finish -- ``FAILED`` **or** still ``PENDING``.
+
+    A run can end terminally (``FAILED``/``CANCELLED``) with tables left
+    ``PENDING`` rather than ``FAILED`` -- e.g. a fatal error (or a run-level
+    pre-pass crash) that aborted the job *before* those tables were even
+    attempted, or a cooperative stop that left queued tables untouched. Those
+    tables are unfinished and must be retryable, but :func:`failed_table_names`
+    (``FAILED`` only) misses them, which would strand them ``PENDING`` with no way
+    to resume short of re-running everything. This is the recovery set for a
+    terminated run: every chunk not ``DONE`` (idempotent to re-run; ``DONE``
+    tables are kept).
+    """
+    return [chunk.chunk_id for chunk in job.chunks if chunk.status != "DONE"]
+
+
 def format_duration(seconds: float) -> str:
     """Format a duration in seconds as a compact ``Hh Mm``/``Mm Ss``/``Ss`` string."""
     total = int(max(0, round(seconds)))

@@ -5,6 +5,22 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.57
+
+### Fixed
+
+- **失敗した実行が PENDING のまま残したテーブルを再試行できるように(以前は取り残されて
+  いた)。** Full Load が一部のテーブルを試行する前に失敗で終わると、それらは `FAILED`
+  ではなく `PENDING` のまま残り、復旧 UI が `FAILED` チャンクだけを見ていたため「Retry」
+  操作が表示されず、唯一の脱出手段が全体の「Re-run Full Load」だけでした。復旧は
+  **未完了** のテーブル全体(FAILED または PENDING)を対象にするようになりました:
+  終了した実行に未完了テーブルがあれば再試行の行が表示され、ボタンは
+  「Retry unfinished tables (N)」と表示され、チェックリストが各テーブルを理由とともに
+  示します(エラーメッセージ、または PENDING テーブルは「Not loaded yet — the previous
+  run ended first.」)。すでにロード済み(DONE)のテーブルは保持され、不要に再実行され
+  ません。(v0.1.56 のクラッシュの復旧経路です — 更新後、「Retry unfinished tables」を
+  押して PENDING のテーブルを続けてロードしてください。)
+
 ## v0.1.56
 
 ### Fixed
