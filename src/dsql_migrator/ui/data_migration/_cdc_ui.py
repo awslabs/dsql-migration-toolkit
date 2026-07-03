@@ -1494,22 +1494,23 @@ def _render_cdc_infra_form(ui, migration_state, *, session=None) -> None:
             field.on("blur", _save)
 
         # Advanced: the cdc-stack name. The mandatory "mysql-dsql-cdc-" prefix is
-        # shown as a FIXED, non-editable addon and the user types only the SUFFIX
-        # (e.g. "orders" -> mysql-dsql-cdc-orders) to run a SECOND migration's CDC
-        # alongside an existing one. Editing only the suffix makes it impossible to
-        # leave the mysql-dsql-cdc-* family the deploy role authorizes, so a bare
-        # "abcde" becomes the valid "mysql-dsql-cdc-abcde" instead of being rejected.
-        with ui.row().classes("w-full items-center no-wrap gap-0"):  # type: ignore[attr-defined]
-            ui.label(CDC_STACK_NAME_PREFIX).classes(  # type: ignore[attr-defined]
-                "text-sm font-mono text-gray-500 whitespace-nowrap"
-            )
-            name_field = ui.input(  # type: ignore[attr-defined]
-                label="Advanced — CDC stack name suffix (one per source DB)",
-                value=cdc_stack_name_suffix(
-                    getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
-                ),
-                placeholder="stack",
-            ).classes("flex-1 text-sm")
+        # rendered INSIDE the field via Quasar's built-in `prefix` prop (baseline-
+        # aligned with the typed text, like a "$" before an amount), and the user
+        # types only the SUFFIX (e.g. "orders" -> mysql-dsql-cdc-orders) to run a
+        # SECOND migration's CDC alongside an existing one. Editing only the suffix
+        # makes it impossible to leave the mysql-dsql-cdc-* family the deploy role
+        # authorizes, so a bare "abcde" becomes the valid "mysql-dsql-cdc-abcde".
+        name_field = ui.input(  # type: ignore[attr-defined]
+            label="Advanced — CDC stack name (one per source DB)",
+            value=cdc_stack_name_suffix(
+                getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
+            ),
+            placeholder="stack",
+        ).props(f'prefix="{CDC_STACK_NAME_PREFIX}"').classes("w-full text-sm")
+        ui.label(  # type: ignore[attr-defined]
+            "Full stack name = the fixed prefix + your suffix "
+            "(e.g. mysql-dsql-cdc-orders). One stack per source DB."
+        ).classes("w-full text-xs text-gray-500")
 
         def _current_suffix() -> str:
             return cdc_stack_name_suffix(

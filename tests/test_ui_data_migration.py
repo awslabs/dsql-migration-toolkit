@@ -3625,6 +3625,69 @@ def test_cdc_unstable_message_terminal_stuck_says_delete_then_retry() -> None:
         assert "Delete CDC infrastructure" in body
 
 
+def test_cdc_infra_form_stack_name_field_uses_fixed_prefix_prop() -> None:
+    """The stack-name field renders the mandatory prefix via Quasar's `prefix` prop
+    (inside the field, baseline-aligned) and prefills only the suffix — so the label
+    and typed text can't misalign and a bare word can't escape the mysql-dsql-cdc-*
+    family."""
+    from dsql_migrator.ui.data_migration import _render_cdc_infra_form
+
+    props_seen: list[str] = []
+    input_values: list[str] = []
+
+    class _El:
+        def classes(self, *_a, **_k):
+            return self
+
+        def props(self, *a, **_k):
+            if a and isinstance(a[0], str):
+                props_seen.append(a[0])
+            return self
+
+        def on(self, *_a, **_k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_e):
+            return False
+
+    class _Ui:
+        def input(self, *_a, value=None, **_k):
+            if value is not None:
+                input_values.append(value)
+            return _El()
+
+        def label(self, *_a, **_k):
+            return _El()
+
+        def row(self, *_a, **_k):
+            return _El()
+
+        def column(self, *_a, **_k):
+            return _El()
+
+        def expansion(self, *_a, **_k):
+            return _El()
+
+    class _MS:
+        cdc_stack_name = "mysql-dsql-cdc-stack"
+
+        def cdc_infra_inputs(self):
+            return {}
+
+        def set_cdc_infra_inputs(self, _v):
+            pass
+
+    _render_cdc_infra_form(_Ui(), _MS(), session=None)
+    # The fixed prefix is applied as a Quasar prop, not a floating separate label.
+    assert any('prefix="mysql-dsql-cdc-"' in p for p in props_seen)
+    # The field prefills the SUFFIX only ("stack"), never the whole name.
+    assert "stack" in input_values
+    assert "mysql-dsql-cdc-stack" not in input_values
+
+
 # --- _render_cdc_least_privilege_note: dedicated-CDC-user guidance -----------
 
 

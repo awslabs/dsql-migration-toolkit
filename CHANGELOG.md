@@ -5,6 +5,16 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.42
+
+### Fixed
+
+- **CDC stack-name field alignment.** The fixed `mysql-dsql-cdc-` prefix is now
+  rendered inside the input via Quasar's `prefix` prop (baseline-aligned with the
+  typed suffix, like `$` before an amount) instead of as a separate left label that
+  floated out of line with the field's own label. A one-line helper below shows the
+  resulting full stack name.
+
 ## v0.1.41
 
 ### Changed
