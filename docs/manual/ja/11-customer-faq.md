@@ -346,6 +346,22 @@ DSQL に書き込んだ **後** は、それらの新しい行は DSQL に **の
   専用のデプロイロール（CdcDeployRole）を引き受け** るため、権限昇格は分離されます。（app-stack を
   *最初にデプロイする* 人は、IAM ロールを作成する権限が一度だけ必要です。）このモードが最小権限に最も適合します。
 
+作業別の具体的な IAM アクションです（**Fargate では自動生成されるタスクロールにアタッチされ、自分で
+記述する必要はありません**。**ローカル実行時は自分の ID がこれらを保持している必要があります**）:
+
+| 対象 | IAM アクション（最小） |
+|---|---|
+| **ターゲット DSQL（常時）** | `dsql:DbConnect`、`dsql:DbConnectAdmin`（IAM トークン発行）、`dsql:GetCluster` |
+| **ソース MySQL（常時）** | IAM アクションなし — 読み取り専用の MySQL ユーザー/パスワード（または下記のシークレット） |
+| **ソースシークレット（任意）** | `secretsmanager:GetSecretValue` — ソース認証情報が Secrets Manager シークレットにある場合のみ |
+| **AI アシスト（任意）** | `bedrock:InvokeModel`、`bedrock:InvokeModelWithResponseStream` — 選択したモデルにスコープ。AI を有効にした場合のみ |
+| **CDC — パイプラインのデプロイ/削除** | cdc-stack が必要とする広範なインフラ作成権限: `cloudformation:CreateStack`/`UpdateStack`/`DeleteStack`/`Describe*`/`GetTemplate`、広範な `ec2:*`（VPC サブネット・NAT・EIP・ルートテーブル・セキュリティグループ・VPC エンドポイント・ネットワークインターフェイス）、`iam:CreateRole`/`AttachRolePolicy`/`PassRole`/…（コネクタロール）、`kafka:*` / `kafkaconnect:*`（MSK Serverless + MSK Connect）、`logs:*`、プラグインバケットへの `s3:*`。Full Load のみの移行では **一切不要**。 |
+
+> **Full Load のみ** なら上表の最初の 3 行だけで十分です。**CDC** は最後の行（広範なインフラ作成権限）を
+> 追加します。Fargate ではこの権限は分離された `CdcDeployRole`（デプロイ/削除中のみ引き受け）にあり、
+> 常時稼働のタスクは保持しません。しかし **ローカル実行では自分の ID が CDC 行全体を保持する必要がある**
+> ため、CDC には Fargate を推奨します。
+
 
 **Q30. 複数の移行を実行したり、ツールを水平スケールしたりできますか？**
 

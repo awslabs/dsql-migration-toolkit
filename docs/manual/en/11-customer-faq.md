@@ -369,6 +369,24 @@ Fargate — what differs is **where those permissions attach**:
   privilege escalation is isolated. (Whoever *first deploys* the app-stack does need
   permission to create IAM roles, once.) This mode fits least-privilege best.
 
+The concrete IAM actions, by what you're doing (on **Fargate these attach to the
+auto-created Task Role — you don't write them**; when **running locally your own
+identity must hold them**):
+
+| For | IAM actions (minimum) |
+|---|---|
+| **Target DSQL (always)** | `dsql:DbConnect`, `dsql:DbConnectAdmin` (mint the IAM token), `dsql:GetCluster` |
+| **Source MySQL (always)** | none in IAM — an ordinary read-only MySQL user/password (or the secret below) |
+| **Source secret (optional)** | `secretsmanager:GetSecretValue` — only if the source credentials come from a Secrets Manager secret |
+| **AI assist (optional)** | `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream` — scoped to the chosen model; only when AI is enabled |
+| **CDC — deploy/tear down the pipeline** | the broad infra-creation set the cdc-stack needs: `cloudformation:CreateStack`/`UpdateStack`/`DeleteStack`/`Describe*`/`GetTemplate`; a wide `ec2:*` set (VPC subnets, NAT, EIP, route tables, security groups, VPC endpoints, network interfaces); `iam:CreateRole`/`AttachRolePolicy`/`PassRole`/… (the connector roles); `kafka:*` / `kafkaconnect:*` (MSK Serverless + MSK Connect); `logs:*`; `s3:*` on the plugin bucket. Full-Load-only migrations need **none** of this. |
+
+> **Full Load only** needs just the first three rows. **CDC** adds the last row —
+> a large infrastructure-creation surface. On Fargate that surface lives on the
+> isolated `CdcDeployRole` (assumed only during a deploy/teardown), so the
+> always-running task never holds it; **running locally, your own identity must
+> hold the entire CDC row**, which is why Fargate is recommended for CDC.
+
 
 **Q30. Can I run more than one migration / scale the tool horizontally?**
 

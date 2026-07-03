@@ -411,6 +411,22 @@ Full Load만 쓰는 경우를 포함한 전체 컷오버 절차는
   맡아(assume)** 수행하므로, 권한 상승이 격리됩니다. (다만 app-stack을 **최초 배포하는 사람**은 IAM 역할을
   만들 권한이 한 번 필요합니다.) 최소 권한 원칙에는 이 방식이 더 부합합니다.
 
+작업별 구체적 IAM 액션입니다(**Fargate에서는 자동 생성된 Task Role에 붙으므로 직접 작성할 필요 없음**,
+**로컬 실행 시에는 사용자 본인 신원이 이 액션들을 직접 보유**해야 함):
+
+| 대상 | IAM 액션 (최소) |
+|---|---|
+| **타깃 DSQL (항상)** | `dsql:DbConnect`, `dsql:DbConnectAdmin`(IAM 토큰 발급), `dsql:GetCluster` |
+| **소스 MySQL (항상)** | IAM 액션 없음 — 읽기 전용 MySQL 사용자/비밀번호(또는 아래 시크릿) |
+| **소스 시크릿 (선택)** | `secretsmanager:GetSecretValue` — 소스 자격증명이 Secrets Manager 시크릿에 있을 때만 |
+| **AI 어시스트 (선택)** | `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream` — 선택 모델로 스코핑; AI 켤 때만 |
+| **CDC — 파이프라인 배포/철거** | cdc-stack이 요구하는 넓은 인프라 생성 권한: `cloudformation:CreateStack`/`UpdateStack`/`DeleteStack`/`Describe*`/`GetTemplate`; 광범위한 `ec2:*`(VPC 서브넷·NAT·EIP·라우트 테이블·보안 그룹·VPC 엔드포인트·네트워크 인터페이스); `iam:CreateRole`/`AttachRolePolicy`/`PassRole`/…(커넥터 역할); `kafka:*` / `kafkaconnect:*`(MSK Serverless + MSK Connect); `logs:*`; 플러그인 버킷에 대한 `s3:*`. Full Load만 하는 경우 **전혀 필요 없음**. |
+
+> **Full Load만**이면 위 표의 앞 3행만 필요합니다. **CDC**는 마지막 행(넓은 인프라 생성 권한)이
+> 추가됩니다. Fargate에서는 이 권한이 격리된 `CdcDeployRole`(배포/철거 중에만 assume)에 있어 상시
+> 태스크는 절대 보유하지 않지만, **로컬 실행 시에는 사용자 본인 신원이 CDC 행 전체를 보유**해야 하므로
+> CDC에는 Fargate를 권장합니다.
+
 
 **Q30. 여러 마이그레이션을 동시에 하거나 도구를 수평 확장할 수 있나요?**
 
