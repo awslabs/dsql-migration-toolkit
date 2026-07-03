@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.61
+
+### Changed
+
+- **Simpler Full Load progress table.** Trimmed from 9 columns to 6 so it reads at
+  a glance and stops wrapping: "Rows on target" and "Source rows" are merged into
+  one **Rows (target / source)** column with large counts abbreviated
+  (`1.18M / 33.6M`) and the exact figures + new/already-there breakdown moved to a
+  hover tooltip; the **Errors** column is folded into **Attempts** (e.g. `5 · 1 err`);
+  the redundant **Complete** column is dropped (Status + Progress already show it);
+  and the **Time** header no longer wraps. Small counts still show in full with
+  thousands separators.
+
 ## v0.1.60
 
 ### Changed

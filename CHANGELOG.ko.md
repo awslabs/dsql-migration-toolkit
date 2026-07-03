@@ -5,6 +5,17 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.61
+
+### 변경 (Changed)
+
+- **Full Load 진행 테이블 간소화.** 9열 → 6열로 줄여 한눈에 읽히고 줄바꿈이 사라졌습니다:
+  "Rows on target"와 "Source rows"를 **Rows (target / source)** 한 열로 병합하고 큰
+  숫자는 축약(`1.18M / 33.6M`), 정확한 수치와 new/already-there 분해는 hover 툴팁으로
+  옮겼습니다. **Errors** 열은 **Attempts**에 합쳤고(예: `5 · 1 err`), 중복이던
+  **Complete** 열은 제거했습니다(Status + Progress가 이미 표시). **Time** 헤더도 더 이상
+  줄바꿈되지 않습니다. 작은 숫자는 천단위 쉼표로 전체 표시됩니다.
+
 ## v0.1.60
 
 ### 변경 (Changed)

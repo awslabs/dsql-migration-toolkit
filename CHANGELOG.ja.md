@@ -5,6 +5,17 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.61
+
+### Changed
+
+- **Full Load の進捗テーブルを簡素化。** 9 列 → 6 列に減らし、一目で読めて折り返しが
+  なくなりました:「Rows on target」と「Source rows」を **Rows (target / source)** の
+  1 列に統合し、大きな数値は省略表記(`1.18M / 33.6M`)、正確な数値と new/already-there の
+  内訳はホバーのツールチップに移動しました。**Errors** 列は **Attempts** に統合し(例:
+  `5 · 1 err`)、冗長な **Complete** 列は削除しました(Status + Progress ですでに分かる)。
+  **Time** ヘッダーも折り返さなくなりました。小さい数値は桁区切り付きで全桁表示されます。
+
 ## v0.1.60
 
 ### Changed

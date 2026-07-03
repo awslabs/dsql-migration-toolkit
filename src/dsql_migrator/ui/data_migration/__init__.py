@@ -2854,6 +2854,56 @@ def _format_rows_on_target_cell(row: "FullLoadTableRow") -> str:
     return f"{row.rows_loaded:,}"
 
 
+def _abbrev_count(n: "Optional[int]") -> str:
+    """Compact count for a dense table: 1,180,000 -> "1.18M", 33585832 -> "33.6M".
+
+    Keeps small numbers exact (with thousands separators) and abbreviates large
+    ones to 3 significant figures so the "Rows (target / source)" column stays a
+    single narrow line regardless of scale. ``None`` -> an em dash.
+    """
+    if n is None:
+        return "—"
+    n = int(n)
+    if n < 100_000:
+        return f"{n:,}"
+    for div, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if n >= div:
+            val = n / div
+            # 3 sig figs: 1.18M, 33.6M, 747K
+            return f"{val:.2f}{suffix}" if val < 10 else f"{val:.1f}{suffix}"
+    return f"{n:,}"
+
+
+def _rows_target_source_cell(row: "FullLoadTableRow") -> str:
+    """Compact "<on target> / <source>" for the merged Rows column.
+
+    Both counts abbreviated (:func:`_abbrev_count`) so the cell is one short line;
+    the exact figures + the new/already-there breakdown live in the cell tooltip
+    (:func:`_rows_breakdown_tooltip`).
+    """
+    return f"{_abbrev_count(row.rows_present)} / {_abbrev_count(row.expected_rows)}"
+
+
+def _rows_breakdown_tooltip(row: "FullLoadTableRow") -> str:
+    """Exact figures + new/already-there split for the Rows cell's hover tooltip."""
+    parts = [f"{row.rows_present:,} on target"]
+    if row.rows_skipped:
+        parts.append(
+            f"{row.rows_loaded:,} new + {row.rows_skipped:,} already there"
+        )
+    if row.expected_rows is not None:
+        parts.append(f"{row.expected_rows:,} source rows (est.)")
+    return " · ".join(parts)
+
+
+def _format_attempts_cell(row: "FullLoadTableRow") -> str:
+    """Attempts, with a trailing error marker so a separate Errors column isn't
+    needed: ``"5"`` clean, ``"5 · 1 err"`` when the table logged errors."""
+    if row.errors:
+        return f"{row.attempts} · {row.errors} err"
+    return str(row.attempts)
+
+
 def _format_complete_cell(row: "FullLoadTableRow") -> str:
     """Render the per-table completeness cell comparing loaded vs source rows."""
     complete = row.complete
@@ -2913,26 +2963,21 @@ def _render_full_load_progress(
     # At-a-glance status distribution (scales to any table count).
     _render_table_state_summary(ui, rows)
 
+    # Simplified 6-column layout (was 9): the exact row breakdown and source-row
+    # figure moved into the "Rows" cell tooltip; Errors merged into Attempts; the
+    # redundant "Complete" column dropped (Status + Progress already convey it).
     columns = [
         {"name": "table", "label": "Table", "field": "table", "align": "left"},
         {"name": "state", "label": "Status", "field": "state", "align": "left"},
         {
-            "name": "rows_loaded",
-            "label": "Rows on target",
-            "field": "rows_loaded",
+            "name": "rows",
+            "label": "Rows (target / source)",
+            "field": "rows",
             "align": "left",
         },
-        {"name": "expected", "label": "Source rows", "field": "expected"},
         {"name": "progress", "label": "Progress", "field": "progress", "align": "left"},
-        {
-            "name": "time",
-            "label": "Time (ETA / total)",
-            "field": "time",
-            "align": "left",
-        },
-        {"name": "attempts", "label": "Attempts", "field": "attempts"},
-        {"name": "errors", "label": "Errors", "field": "errors"},
-        {"name": "complete", "label": "Complete", "field": "complete", "align": "left"},
+        {"name": "time", "label": "Time", "field": "time", "align": "left"},
+        {"name": "attempts", "label": "Attempts", "field": "attempts", "align": "left"},
     ]
     now = datetime.now(timezone.utc)
     table_rows = [
@@ -2941,16 +2986,14 @@ def _render_full_load_progress(
             "state": row.state,
             "state_label": _LOAD_STATE_LABELS.get(row.state, row.state),
             "state_color": _LOAD_STATE_COLORS.get(row.state, "grey"),
-            "rows_loaded": _format_rows_on_target_cell(row),
-            "expected": row.expected_rows if row.expected_rows is not None else "—",
+            "rows": _rows_target_source_cell(row),
+            "rows_tooltip": _rows_breakdown_tooltip(row),
             "progress": _format_progress_cell(row),
             "progress_value": (
                 None if row.progress_pct is None else round(row.progress_pct / 100.0, 4)
             ),
             "time": format_table_timing(row, now),
-            "attempts": row.attempts,
-            "errors": row.errors,
-            "complete": _format_complete_cell(row),
+            "attempts": _format_attempts_cell(row),
         }
         for row in rows
     ]
@@ -3002,6 +3045,18 @@ def _render_full_load_progress(
             <span class="text-caption">{{ props.value }}</span>
           </div>
           <span v-else>{{ props.value }}</span>
+        </q-td>
+        """,
+    )
+    # Rows cell: the compact "target / source" value with the exact figures +
+    # new/already-there breakdown on hover, so the detail is available without
+    # widening the column or wrapping to a second line.
+    table.add_slot(
+        "body-cell-rows",
+        r"""
+        <q-td :props="props">
+          <span>{{ props.value }}</span>
+          <q-tooltip>{{ props.row.rows_tooltip }}</q-tooltip>
         </q-td>
         """,
     )

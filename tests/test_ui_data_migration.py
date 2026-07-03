@@ -3117,6 +3117,45 @@ def test_format_rows_on_target_cell_breaks_down_new_vs_existing() -> None:
     assert cell == "1,067,310  ·  455,319 new + 611,991 already there"
 
 
+def test_abbrev_count_keeps_small_exact_and_abbreviates_large() -> None:
+    from dsql_migrator.ui.data_migration import _abbrev_count
+
+    assert _abbrev_count(None) == "—"
+    assert _abbrev_count(300) == "300"
+    assert _abbrev_count(40) == "40"
+    assert _abbrev_count(74747) == "74,747"           # < 100K stays exact
+    assert _abbrev_count(747_476) == "747.5K"
+    assert _abbrev_count(1_180_000) == "1.18M"        # < 10 -> 2 decimals
+    assert _abbrev_count(33_585_832) == "33.6M"       # >= 10 -> 1 decimal
+    assert _abbrev_count(2_000_000_000) == "2.00B"
+
+
+def test_rows_target_source_cell_and_attempts_cell() -> None:
+    from dsql_migrator.ui.data_migration import (
+        FullLoadTableRow,
+        _format_attempts_cell,
+        _rows_breakdown_tooltip,
+        _rows_target_source_cell,
+    )
+
+    row = FullLoadTableRow(
+        table="orders", state="IN_PROGRESS", rows_loaded=1_180_000,
+        expected_rows=33_585_832, attempts=6, errors=0,
+    )
+    # Merged, abbreviated "<on target> / <source>".
+    assert _rows_target_source_cell(row) == "1.18M / 33.6M"
+    # Exact figures live in the tooltip.
+    tip = _rows_breakdown_tooltip(row)
+    assert "1,180,000 on target" in tip and "33,585,832 source rows" in tip
+    # Attempts alone when no errors; with an error marker otherwise.
+    assert _format_attempts_cell(row) == "6"
+    row_err = FullLoadTableRow(
+        table="t", state="FAILED", rows_loaded=0, expected_rows=10,
+        attempts=5, errors=1,
+    )
+    assert _format_attempts_cell(row_err) == "5 · 1 err"
+
+
 def test_failed_table_names_lists_only_failed_chunks() -> None:
     from dsql_migrator.ui.data_migration import failed_table_names
 
