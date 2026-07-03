@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.38
+
+### 변경 (Changed)
+
+- **CDC 카드가 삭제 중임을 명확히 표시.** cdc-stack이 `DELETE_IN_PROGRESS`인 동안, 파이프라인 카드가
+  이전에는 애매하게 "Busy" / "cdc-stack needs cleanup — 현재 작업이 끝나길 기다리세요"로 보였습니다.
+  이제 **"Deleting…"** 배지와 함께 안심 알림 — *"CDC 인프라를 삭제하는 중입니다(~15~25분 소요 — VPC
+  내부 Lambda의 네트워크 인터페이스 detach에 시간이 걸림); 완료되면 MSK / NAT 과금이 중단됩니다"* — 을
+  계속 표시하고, 폴링을 이어가 완료 시 "Not deployed"로 자동 전환됩니다. 정착됐지만 막힌 스택
+  (`ROLLBACK_COMPLETE` / `DELETE_FAILED`)은 여전히 "정리 필요 — 삭제 후 재배포" 안내를 보여줍니다.
+  (새 순수 헬퍼 `cdc_unstable_message`가 배지와 알림을 한곳에서 결정.)
+
 ## v0.1.37
 
 ### 수정 (Fixed)

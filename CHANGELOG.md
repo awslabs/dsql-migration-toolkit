@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.38
+
+### Changed
+
+- **The CDC card shows a clear "being deleted" state during teardown.** While the
+  cdc-stack is `DELETE_IN_PROGRESS`, the pipeline card previously read as a vague
+  "Busy" / "cdc-stack needs cleanup — wait for the current operation". It now shows
+  a **"Deleting…"** badge and a reassuring notice — *"CDC infrastructure is being
+  deleted (~15–25 min — the in-VPC Lambda's network interfaces take time to detach);
+  MSK / NAT billing stops once it completes"* — and keeps polling so it flips to
+  "Not deployed" on its own. A settled-but-stuck stack (`ROLLBACK_COMPLETE` /
+  `DELETE_FAILED`) still shows the "needs cleanup — delete then redeploy" guidance.
+  (New pure helper `cdc_unstable_message` drives badge + notice from one place.)
+
 ## v0.1.37
 
 ### Fixed

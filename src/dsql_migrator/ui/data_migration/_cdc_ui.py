@@ -811,6 +811,49 @@ def classify_cdc_card_phase(
         return "provisioning"
     return "running"
 
+def cdc_unstable_message(status: Optional[str]) -> tuple[str, str, str, str]:
+    """Message for the ``unstable`` CDC card, keyed on the raw stack status.
+
+    Returns ``(badge_text, tone, header, body)``. Three cases:
+
+    - **DELETE_IN_PROGRESS** — a live teardown: the infra is being removed, so this
+      is REASSURING (info), names the ~15-25 min native ENI-detach wait, and says
+      billing stops on completion. Badge ``"Deleting…"``.
+    - **any other ``*_IN_PROGRESS``** — some other live operation: wait for it
+      (warning). Badge ``"Busy"``.
+    - **terminal stuck** (ROLLBACK_*/DELETE_FAILED/…) — will not clear on its own;
+      delete then redeploy (warning). Badge ``"Busy"``.
+
+    Pure / NiceGUI-agnostic so the messaging is unit-testable.
+    """
+    raw = (status or "busy")
+    upper = raw.upper()
+    if upper == "DELETE_IN_PROGRESS":
+        return (
+            "Deleting…",
+            "info",
+            "CDC infrastructure is being deleted",
+            "The cdc-stack is being torn down (this takes ~15–25 min — the in-VPC "
+            "Lambda's network interfaces take time to detach). MSK / NAT billing "
+            "stops once it completes. This view refreshes automatically; no action "
+            "is needed.",
+        )
+    if _is_inflight_stack_status(raw):
+        return (
+            "Busy",
+            "warning",
+            "cdc-stack is busy",
+            f"The cdc-stack is '{raw}'. Wait for the current operation to finish "
+            "(progress refreshes), then the next action appears.",
+        )
+    return (
+        "Busy",
+        "warning",
+        "cdc-stack needs cleanup",
+        f"The cdc-stack is stuck in '{raw}' from a failed operation — it will not "
+        "clear on its own. Use Delete CDC infrastructure below, then deploy again.",
+    )
+
 def cdc_live_running_names(discovery_running, connector_states) -> list:
     """Narrow the discovery "running" set to connectors LIVE-reported RUNNING.
 
@@ -921,13 +964,23 @@ def _render_cdc_start_action(
 
     with ui.card().classes("w-full"):  # type: ignore[attr-defined]
         with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+            # For the unstable phase the badge/notice depend on the raw stack status
+            # (a live DELETE reads as "Deleting…", not a vague "Busy"). Derive both
+            # from the single pure helper so badge and notice never diverge.
+            _unstable_badge, _unstable_tone, _unstable_header, _unstable_body = (
+                cdc_unstable_message(
+                    getattr(migration_state, "cdc_stack_phase_status", None)
+                )
+            )
+            _unstable_badge_color = "primary" if _unstable_tone == "info" else "warning"
             badge_text, badge_color, icon_color = (
                 ("Streaming", "positive", "positive") if phase == "running"
                 else ("Provisioning…", "primary", "primary") if phase == "provisioning"
                 else ("Working…", "primary", "primary") if deploying
                 else ("Incomplete", "warning", "warning") if phase == "partial"
                 else ("Infra ready", "primary", "primary") if phase == "infra"
-                else ("Busy", "warning", "warning") if phase == "unstable"
+                else (_unstable_badge, _unstable_badge_color, _unstable_badge_color)
+                if phase == "unstable"
                 else ("Not deployed", "grey", "grey")
             )
             ui.icon("rocket_launch", color=icon_color).classes("text-xl")  # type: ignore[attr-defined]
@@ -999,29 +1052,16 @@ def _render_cdc_start_action(
                 inventory=inventory, session=session,
             )
         elif phase == "unstable":
-            status = getattr(migration_state, "cdc_stack_phase_status", None) or "busy"
-            if _is_inflight_stack_status(status):
-                # A real in-progress operation -> waiting is the right action.
-                message = (
-                    f"The cdc-stack is '{status}'. Wait for the current operation to "
-                    "finish (progress refreshes), then the next action appears."
-                )
-            else:
-                # A terminal failed/rolled-back state (e.g. ROLLBACK_FAILED,
-                # ROLLBACK_COMPLETE, UPDATE_ROLLBACK_FAILED, DELETE_FAILED). The
-                # stack is stuck, NOT busy -- waiting never clears it. The user must
-                # delete it before redeploying.
-                message = (
-                    f"The cdc-stack is stuck in '{status}' from a failed operation — "
-                    "it will not clear on its own. Use Delete CDC infrastructure "
-                    "below, then deploy again."
-                )
             render_notice(
-                ui,
-                tone="warning",
-                header="cdc-stack needs cleanup",
-                body=message,
+                ui, tone=_unstable_tone, header=_unstable_header, body=_unstable_body
             )
+            # A live operation (DELETE / other *_IN_PROGRESS) clears on its own, so
+            # keep polling to flip the card when it settles; a terminal stuck state
+            # will not clear, so no auto-poll (the user must act).
+            if _is_inflight_stack_status(
+                getattr(migration_state, "cdc_stack_phase_status", None)
+            ):
+                ui.timer(_CDC_POLL_INTERVAL_SECONDS, refresh, once=True)  # type: ignore[attr-defined]
         else:  # absent / not yet probed
             _render_cdc_infra_deploy_action(
                 ui, migration_state, job_manager, refresh,

@@ -5,6 +5,19 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.38
+
+### Changed
+
+- **CDC カードがテアダウン中に「削除中」であることを明確に表示。** cdc-stack が
+  `DELETE_IN_PROGRESS` の間、パイプラインカードは以前は曖昧な「Busy」/「cdc-stack needs cleanup —
+  現在の操作の完了を待ってください」と表示されていました。今後は **「Deleting…」** バッジと安心できる
+  通知 — *「CDC インフラを削除中です(約 15〜25 分 — VPC 内 Lambda のネットワークインターフェイスの
+  detach に時間がかかります)。完了すると MSK / NAT の課金が停止します」* — を表示し続け、ポーリングを
+  継続して完了時に自動的に「Not deployed」へ切り替わります。落ち着いたが行き詰まったスタック
+  (`ROLLBACK_COMPLETE` / `DELETE_FAILED`)は引き続き「クリーンアップが必要 — 削除して再デプロイ」の
+  案内を表示します。(新しい純粋ヘルパー `cdc_unstable_message` がバッジと通知を一元的に決定。)
+
 ## v0.1.37
 
 ### Fixed

@@ -3592,6 +3592,39 @@ def test_inflight_status_false_for_terminal_stuck_states() -> None:
         assert _is_inflight_stack_status(s) is False, s
 
 
+def test_cdc_unstable_message_delete_in_progress_is_reassuring() -> None:
+    # While the cdc-stack is being torn down the card must say it's BEING DELETED
+    # (with the ~15-25 min expectation), not a vague "Busy" / "needs cleanup".
+    from dsql_migrator.ui.data_migration import cdc_unstable_message
+
+    badge, tone, header, body = cdc_unstable_message("DELETE_IN_PROGRESS")
+    assert badge == "Deleting…"
+    assert tone == "info"  # reassuring, not a warning — deletion is expected
+    assert "being deleted" in header.lower()
+    assert "15" in body and "billing stops" in body.lower()
+
+
+def test_cdc_unstable_message_other_in_progress_says_wait() -> None:
+    from dsql_migrator.ui.data_migration import cdc_unstable_message
+
+    badge, tone, header, body = cdc_unstable_message("UPDATE_IN_PROGRESS")
+    assert badge == "Busy"
+    assert tone == "warning"
+    assert "wait" in body.lower()
+    assert "UPDATE_IN_PROGRESS" in body
+
+
+def test_cdc_unstable_message_terminal_stuck_says_delete_then_retry() -> None:
+    from dsql_migrator.ui.data_migration import cdc_unstable_message
+
+    for status in ("ROLLBACK_COMPLETE", "DELETE_FAILED", None):
+        badge, tone, header, body = cdc_unstable_message(status)
+        assert badge == "Busy"
+        assert tone == "warning"
+        assert "cleanup" in header.lower()
+        assert "Delete CDC infrastructure" in body
+
+
 # --- _render_cdc_least_privilege_note: dedicated-CDC-user guidance -----------
 
 

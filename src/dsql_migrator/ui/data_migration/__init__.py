@@ -3164,6 +3164,7 @@ __all__ = [
     "ConnectorHealthRow",
     "connector_health_rows",
     "classify_cdc_card_phase",
+    "cdc_unstable_message",
     "CdcActivitySummary",
     "cdc_activity_summary",
     "CdcHandlingFact",
@@ -3245,6 +3246,7 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     cdc_deploy_connection_blocker,
     cdc_live_running_names,
     cdc_streaming_started,
+    cdc_unstable_message,
     classify_cdc_card_phase,
 )
 
