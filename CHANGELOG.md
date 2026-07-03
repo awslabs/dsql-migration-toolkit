@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.48
+
+### Changed
+
+- **"Tables to migrate" picker: back to the schema tree, with the modern
+  styling kept.** Reverted the flat data table (v0.1.47) to the schema → Tables →
+  leaf object-browser tree, but wrapped in the same AWS/Cloudscape styling — a
+  name filter, Select all / Unselect all, and a live "N of M selected" counter
+  above a white, bordered scroll panel. Each table leaf now shows a small primary-
+  key indicator (a green check, or an amber warning when the table has no primary
+  key, which Aurora DSQL requires); other metadata columns from the table view
+  were dropped to keep the tree light. The PK indicator is a client-side Quasar
+  slot, so it adds no per-node work. Selection behavior and the locked (dimmed,
+  non-interactive) state are unchanged.
+
 ## v0.1.47
 
 ### Changed

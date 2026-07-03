@@ -53,7 +53,6 @@ from dsql_migrator.ui.data_migration import (
     DataMigrationStore,
     BatchedTableMigrator,
     build_migration_table_tree,
-    build_migration_table_rows,
     effective_migration_selection,
     format_binlog_coordinate,
     format_error_summary,
@@ -1545,34 +1544,10 @@ def test_build_migration_table_tree_omits_schema_with_no_migratable() -> None:
     assert [leaf["id"] for leaf in app_leaves] == [f"{TABLE_PREFIX}app.orders"]
 
 
-def test_build_migration_table_rows_one_row_per_migratable_table() -> None:
-    # The Cloudscape data-table builder: one flat row per migratable table, in
-    # inventory order, carrying the decision metadata (schema, columns, PK,
-    # indexes, target existence). The full/qualified name is the row key.
-    inventory = _qualified_inventory()
-    rows = build_migration_table_rows(
-        inventory,
-        ["app.orders", "app.customers", "audit.events"],
-        target_existing=["app.orders"],
-    )
-    assert [r["table"] for r in rows] == [
-        "app.orders",
-        "app.customers",
-        "audit.events",
-    ]
-    orders = rows[0]
-    assert orders["name"] == "orders"  # short display name
-    assert orders["schema"] == "app"
-    assert orders["columns"] == 1
-    assert orders["has_pk"] is True
-    assert orders["indexes"] == 0
-    assert orders["exists_on_target"] is True  # in target_existing
-    assert rows[1]["exists_on_target"] is False  # app.customers not existing
-
-
-def test_build_migration_table_rows_omits_non_migratable() -> None:
-    # Same scoping as the tree: a table with no target table to load into is
-    # omitted entirely, and a table with no primary key is flagged (has_pk False).
+def test_build_migration_table_tree_leaves_carry_pk_indicator_metadata() -> None:
+    # Each table leaf carries has_pk (whether the table has a primary key) and a
+    # "header": "table" hook so the renderer's header-table slot can show a PK
+    # indicator. Non-leaf nodes (schema / "Tables (N)") do not carry these.
     inventory = SourceInventory(
         tables=[
             TableDef(
@@ -1587,13 +1562,15 @@ def test_build_migration_table_rows_omits_non_migratable() -> None:
             ),
         ]
     )
-    rows = build_migration_table_rows(inventory, ["orders", "audit_log"])
-    by_name = {r["table"]: r for r in rows}
-    assert set(by_name) == {"orders", "audit_log"}
-    assert by_name["audit_log"]["has_pk"] is False
-    # A non-migratable table is dropped.
-    only_orders = build_migration_table_rows(inventory, ["orders"])
-    assert [r["table"] for r in only_orders] == ["orders"]
+    tree = build_migration_table_tree(inventory, ["orders", "audit_log"])
+    leaves = tree[0]["children"][0]["children"]
+    by_id = {leaf["id"]: leaf for leaf in leaves}
+    assert by_id[f"{TABLE_PREFIX}orders"]["has_pk"] is True
+    assert by_id[f"{TABLE_PREFIX}audit_log"]["has_pk"] is False
+    assert all(leaf["header"] == "table" for leaf in leaves)
+    # The schema and category nodes are not table leaves -> no PK hook on them.
+    assert "header" not in tree[0]
+    assert "header" not in tree[0]["children"][0]
 
 
 # ---------------------------------------------------------------------------
