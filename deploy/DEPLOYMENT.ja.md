@@ -296,8 +296,9 @@ aws cloudformation deploy \
     DsqlClusterArn="$DSQL_CLUSTER_ARN" \
     SourceDbSecurityGroupId="$SOURCE_DB_SG" \
     EnableAiAssist=true \
-    BedrockRegion="$AWS_REGION"
-    # BedrockModelId=us.anthropic.claude-sonnet-4-6   # オプション — デフォルト値を表示; §8 参照
+    BedrockRegion="$AWS_REGION" \
+    BedrockModelId=us.anthropic.claude-sonnet-4-6
+    # BedrockModelId はデフォルト値を表示; 他のモデル選択肢は §8 参照
     # SourceSecretArn=...   # オプション — 既存のソースシークレットを再利用する場合のみ
 ```
 
