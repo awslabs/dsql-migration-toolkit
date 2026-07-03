@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.54
+
+### Changed
+
+- **"Retry failed tables" and per-table "Reload" now offer the same Drop-vs-Append
+  choice as Start.** Previously the choice was only made on the initial Start Full
+  Load and a retry silently reused it, so you couldn't switch to a clean reload
+  after a failed append (short of a full Start over). Retry and Reload now run the
+  same read-only probe (scoped to just the tables being retried) and open the same
+  confirm dialog, so you pick **Append** or **Drop & reload** at retry time too.
+- **The Drop & reload choice now spells out that it uses your edited schema.** The
+  dialog notes that a drop & reload recreates each table from your **applied Schema
+  Conversion — including any edits you made there** — and rebuilds its secondary
+  indexes after loading, so it's clear a schema change is honored on a clean
+  reload (it already was; this just makes it visible).
+
 ## v0.1.53
 
 ### Fixed

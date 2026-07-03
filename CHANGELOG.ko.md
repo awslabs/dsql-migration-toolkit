@@ -5,6 +5,22 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.54
+
+### 변경 (Changed)
+
+- **"Retry failed tables"와 테이블별 "Reload"도 이제 Start와 동일한 Drop vs Append
+  선택을 제공합니다.** 이전에는 초기 Start Full Load에서만 선택했고 retry는 그 선택을
+  조용히 재사용해서, append로 실패한 뒤 깨끗이 다시 로드하려면 전체 Start over밖에
+  없었습니다. 이제 retry와 Reload도 동일한 읽기 전용 프로브(재시도할 테이블만 대상)를
+  돌리고 동일한 확인 대화상자를 열어, retry 시점에도 **Append** 또는 **Drop & reload**를
+  고를 수 있습니다.
+- **Drop & reload 선택지가 "편집한 스키마가 반영됨"을 명시합니다.** 대화상자에
+  drop & reload는 각 테이블을 **적용된 Schema Conversion(변환 화면에서 편집한 내용
+  포함)** 으로 재생성하고 로드 후 보조 인덱스를 다시 만든다는 안내를 추가했습니다.
+  스키마 변경이 클린 리로드에 반영된다는 점이 명확해집니다(원래도 반영됐고, 이제
+  눈에 보이게 했습니다).
+
 ## v0.1.53
 
 ### 수정 (Fixed)

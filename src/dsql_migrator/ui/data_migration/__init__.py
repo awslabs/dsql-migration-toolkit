@@ -2119,12 +2119,19 @@ def _render_full_load_step(
     # warning. Both are computed fresh inside the dialog builder below (so the
     # periodic poll re-render can't tear a stale value into the dialog).
 
-    def _open_confirm_dialog_now() -> None:
-        """Build + open the Start-Full-Load confirm dialog in the TOP-LEVEL client.
+    def _open_confirm_dialog_now(
+        *, action_tables, on_confirm, title
+    ) -> None:
+        """Build + open the Full-Load confirm dialog in the TOP-LEVEL client.
 
-        Created in the client context (not the per-render content slot) and opened
-        on demand, so the periodic progress-poll re-render does NOT tear it down a
-        couple of seconds after it appears.
+        Shared by Start, Re-run-all, Retry-failed and per-table Reload:
+        ``action_tables`` is the set being (re)loaded (drives the summary/badges),
+        ``on_confirm`` is the action to run when confirmed, and ``title`` is the
+        dialog heading. Built in the client context (not the per-render content
+        slot) and opened on demand, so the periodic progress-poll re-render does
+        NOT tear it down a couple of seconds after it appears. The Drop-vs-Append
+        choice (when the target already holds data) applies to whichever action
+        this dialog wraps, so a retry/Reload honors the SAME choice as Start.
         """
         from nicegui import context as _ctx
 
@@ -2134,9 +2141,9 @@ def _render_full_load_step(
 
         def _build() -> None:
             with ui.dialog() as confirm_dialog, ui.card().classes("min-w-[360px]"):
-                ui.label("Start Full Load?").classes("text-lg font-semibold")
+                ui.label(title).classes("text-lg font-semibold")
                 ui.label(
-                    f"{format_selected_workloads(selected_names)}. The target "
+                    f"{format_selected_workloads(action_tables)}. The target "
                     "tables will receive the snapshot rows; the source is accessed "
                     "read only."
                 ).classes("text-sm")
@@ -2157,9 +2164,9 @@ def _render_full_load_step(
                             "Load, then start CDC again so it resumes from the new "
                             "snapshot."
                         ).classes("text-xs text-red-700")
-                if selected_names:
+                if action_tables:
                     with ui.row().classes("items-center gap-1 flex-wrap"):
-                        for name in selected_names:
+                        for name in action_tables:
                             ui.badge(name).props("color=blue-grey-6 outline")
                 # When selected targets already hold data (and CDC is not live),
                 # let the user choose the run-wide behavior: append (keep existing
@@ -2190,10 +2197,18 @@ def _render_full_load_step(
                             ),
                         ).props("dense").classes("text-sm")
                         reload_choice.classes("w-full")
+                        # Reassure the user that a Drop & reload recreates the target
+                        # from the APPLIED schema conversion -- including any edits
+                        # they made in Schema Conversion -- not a stale/original DDL.
+                        ui.label(
+                            "Drop & reload recreates each table from your applied "
+                            "Schema Conversion (including any edits you made there), "
+                            "then rebuilds its secondary indexes after loading."
+                        ).classes("text-xs text-gray-500")
 
                 def _confirm() -> None:
                     confirm_dialog.close()
-                    start_full_load()
+                    on_confirm()
 
                 with ui.row().classes("justify-end w-full gap-2"):
                     ui.button("Cancel", on_click=confirm_dialog.close).props("flat")
@@ -2242,21 +2257,34 @@ def _render_full_load_step(
     # disabled + relabeled "Checking…" for a visible cue (restored on dialog open).
     _confirm_busy = {"value": False}
 
-    async def _open_full_load_confirm(event: object = None) -> None:
-        """Check which selected target tables hold data, then open the dialog.
+    async def _open_full_load_confirm(
+        event: object = None,
+        *,
+        probe_tables=None,
+        on_confirm=None,
+        title="Start Full Load?",
+    ) -> None:
+        """Probe which target tables hold data, then open the confirm dialog.
 
-        Runs the read-only non-empty probe off the event loop so the UI stays
-        responsive, records the result (drives the destructive warning + the
+        Shared by Start, Re-run-all, Retry-failed and per-table Reload. Runs the
+        read-only non-empty probe off the event loop (over ``probe_tables`` -- the
+        tables this action will touch, defaulting to the full selection for
+        Start/Re-run), records the result (drives the Drop-vs-Append choice + the
         run's replace set), then opens the confirm dialog in the top-level client
-        context (so the progress poll re-render cannot close it).
+        context. ``on_confirm`` is the action to run on confirm (defaults to
+        ``start_full_load``); ``title`` is the dialog heading.
         """
         if _confirm_busy["value"]:
             return  # a probe is already in flight -> ignore the extra click
         _confirm_busy["value"] = True
+        action_tables = (
+            list(probe_tables) if probe_tables is not None else list(selected_names)
+        )
+        confirm_action = on_confirm if on_confirm is not None else start_full_load
         btn = getattr(event, "sender", None)
         original_text = getattr(btn, "text", None) if btn is not None else None
         # Preserve the button's own icon (play_arrow for Start, restart_alt for the
-        # terminal Re-run) so restore does not swap it for the wrong one.
+        # terminal Re-run, replay for Reload) so restore does not swap it wrongly.
         original_icon = None
         if btn is not None:
             original_icon = getattr(btn, "_props", {}).get("icon")
@@ -2268,13 +2296,13 @@ def _render_full_load_step(
             except Exception:  # noqa: BLE001 - cue is best-effort
                 pass
         try:
-            # Probe which selected targets already hold rows. Default the run-wide
+            # Probe which action tables already hold rows. Default the run-wide
             # choice to "append" (non-destructive); the confirm dialog lets the
             # user switch to "drop" for a clean reload.
             migration_state.set_tables_with_data(frozenset())
             migration_state.set_reload_mode("append")
             target_config = getattr(session, "target_config", None)
-            if target_config is not None and selected_names:
+            if target_config is not None and action_tables:
                 from nicegui import run
 
                 def _probe() -> frozenset[str]:
@@ -2283,7 +2311,7 @@ def _render_full_load_step(
                     )
                     return frozenset(
                         tables_with_rows(
-                            list(selected_names), connection_factory=connector.connect
+                            list(action_tables), connection_factory=connector.connect
                         )
                     )
 
@@ -2292,7 +2320,11 @@ def _render_full_load_step(
                     migration_state.set_tables_with_data(found)
                 except Exception:  # noqa: BLE001 - on probe failure, warn-less confirm
                     migration_state.set_tables_with_data(frozenset())
-            _open_confirm_dialog_now()
+            _open_confirm_dialog_now(
+                action_tables=action_tables,
+                on_confirm=confirm_action,
+                title=title,
+            )
         finally:
             _confirm_busy["value"] = False
             if btn is not None and not getattr(btn, "is_deleted", False):
@@ -2304,6 +2336,20 @@ def _render_full_load_step(
                     btn.enable()
                 except Exception:  # noqa: BLE001
                     pass
+
+    async def _open_reload_confirm(table_name: str, event: object = None) -> None:
+        """Per-table Reload -> the same probe + Drop-vs-Append confirm dialog.
+
+        Scopes the probe/choice to the single table being reloaded, so the user
+        chooses append vs drop for THAT table (and a schema-edited target is
+        recreated from the applied conversion on drop).
+        """
+        await _open_full_load_confirm(
+            event,
+            probe_tables=[table_name],
+            on_confirm=lambda n=table_name: reload_table(n),
+            title=f"Reload {table_name}?",
+        )
 
     # The watermark, object browser, prerequisites, and buttons are STATIC: they
     # are rendered once per full render and must NOT be rebuilt by the 0.5s poll,
@@ -2332,6 +2378,7 @@ def _render_full_load_step(
             current,
             rows,
             reload_table=reload_table,
+            reload_confirm=_open_reload_confirm,
             accept_quarantine_and_continue=accept_quarantine_and_continue,
             quarantine_only=_incomplete_is_quarantine_only(
                 current, migration_state.error_log
@@ -2542,9 +2589,21 @@ def _render_full_load_step(
                         )
                     # Spacer pushes the recommended action to the right edge.
                     ui.space()
+
+                    async def _confirm_retry_failed(event: object = None) -> None:
+                        # Route the failed-table retry through the same confirm
+                        # dialog as Start, probing ONLY the failed tables so the
+                        # Drop-vs-Append choice is scoped to what is being retried.
+                        await _open_full_load_confirm(
+                            event,
+                            probe_tables=list(failed),
+                            on_confirm=retry_failed_load,
+                            title=f"Retry {len(failed)} failed table(s)?",
+                        )
+
                     retry_btn = ui.button(
                         f"Retry failed tables ({len(failed)})",
-                        on_click=retry_failed_load,
+                        on_click=_confirm_retry_failed,
                         icon="replay",
                     ).props("color=primary")
                     if connections_missing:
@@ -2713,6 +2772,7 @@ def _render_full_load_progress(
     ui, job: MigrationJob, rows: "Sequence[FullLoadTableRow]",
     *,
     reload_table=None,
+    reload_confirm=None,
     accept_quarantine_and_continue=None,
     quarantine_only: bool = False,
     ai_error_opener=None,
@@ -2825,8 +2885,18 @@ def _render_full_load_progress(
 
     def _reload_btn(table_name: str) -> None:
         # Per-table Reload: only offered once the job has settled, so it can't
-        # collide with an in-flight run.
-        if reload_table is not None and terminal:
+        # collide with an in-flight run. Prefer the confirm path (probe + Drop-vs-
+        # Append choice for this table); fall back to a direct reload if no confirm
+        # opener was threaded in (older callers / tests).
+        if reload_confirm is not None and terminal:
+            ui.button(
+                "Reload",
+                on_click=lambda e, n=table_name: reload_confirm(n, e),
+            ).props("flat dense no-caps size=sm color=primary icon=replay").tooltip(
+                "Re-run Full Load for just this table — choose append or a clean "
+                "drop & reload if it already holds data."
+            )
+        elif reload_table is not None and terminal:
             ui.button(
                 "Reload", on_click=lambda n=table_name: reload_table(n)
             ).props("flat dense no-caps size=sm color=primary icon=replay").tooltip(
