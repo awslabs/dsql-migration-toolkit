@@ -58,6 +58,11 @@ end. The query runs over a **server-side / streaming cursor** inside a
 is rejected (it's also flagged `UNSUPPORTED` back in Evaluation, because DSQL
 requires a PK too). Single-column and composite PKs are both supported.
 
+> **Worried about read load on a busy production source?** Loading many tables at
+> once is bounded by one lever (table parallelism) and there are concrete steps to
+> keep the source healthy — see
+> [Chapter 7 §7.3 — Minimizing impact on the source](07-performance-and-tuning.md#73-minimizing-impact-on-the-source).
+
 ---
 
 ## 3.3 Type conversion on the fly

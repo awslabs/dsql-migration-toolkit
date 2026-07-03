@@ -173,7 +173,110 @@ buffers, not by table size.
 
 ---
 
-## 7.3 Tuning an individual query
+## 7.3 Minimizing impact on the source
+
+Full Load reads your production source, so the natural worry is: **"loading many
+tables at once means a heavy read — will it hurt the source?"** The design already
+keeps that read light (keyset streaming, no `OFFSET` re-scans, one ~1000-row page
+in flight per table, no global lock, scan-free `information_schema` counts instead
+of `COUNT(*)`, and implicit back-pressure — the next page is only read after the
+current one is loaded). What's left to manage is **concurrent read pressure**, and
+it scales almost entirely with **one lever**.
+
+### The one lever: table parallelism
+
+`DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` (default **4**, max **16**) is *how many
+tables are read from the source at once* — one streaming source connection per
+concurrent table. It is the dial on concurrent source read pressure. `BATCH_PARALLELISM`
+and `BATCH_ROWS` raise **DSQL write** pressure, not source read load; leave them
+unless DSQL is the bottleneck. (The source read **page size is fixed at 1000 rows**
+and is not tunable — table parallelism is your only source-read throttle.)
+
+> Set it in the **Performance tuning** sidebar control to experiment between runs,
+> or as the env var to persist it (see §7.2).
+
+### Start conservative, then tune under observation
+
+Treat parallelism as a **throttle, not a throughput dial** — ramp it against measured
+headroom, not the number of tables:
+
+1. **Start low (2–4)** even on a large instance. Finishing slower is far cheaper than
+   causing a production latency incident.
+2. **Watch the source** over a sustained 5–10 min window (not a single spike).
+3. **Raise in modest steps** only when there's clear headroom, and re-observe.
+   (Parallelism is read once per run, so a change applies to the **next** run.)
+
+**Signals to watch** (Amazon RDS/Aurora — CloudWatch + Performance Insights):
+
+- **Green light to raise:** `CPUUtilization` well below the line, `ReadLatency` flat
+  as `ReadIOPS` rises, `DiskQueueDepth` low, `BurstBalance` / `EBSIOBalance%` /
+  `CPUCreditBalance` near 100%, Aurora `BufferCacheHitRatio` steady (~99%).
+- **Back off now:** `CPUUtilization` sustained > ~85–90%; `ReadLatency` inflating 2–5×
+  while IOPS plateaus; any burst/credit balance **trending toward 0** (throttle
+  *before* it hits zero — recovery is slow); `FreeableMemory` near zero / `SwapUsage`;
+  Aurora `BufferCacheHitRatio` dropping (your cold scans are evicting production's hot
+  pages); and above all, **your application's own query latency rising** — the ultimate
+  back-off trigger regardless of instance metrics.
+
+> [!note] No built-in rate limiter
+> The tool has **no throughput/QPS rate limiting** — source read pressure scales
+> linearly with table parallelism. Lowering the knob is your control. Schedule the
+> bulk load **off-peak** and avoid overlapping the instance's backup/maintenance
+> window (a snapshot plus full scans is the worst case for gp2 `BurstBalance`).
+
+### Pre-flight headroom checklist
+
+Baseline these over a representative peak, then confirm there's room to add the load:
+**CPU** headroom; **storage** — gp2 `BurstBalance` (a sustained scan can drain it to
+zero and collapse to baseline IOPS — the most common way to hurt production), plus
+`ReadIOPS`/`ReadThroughput`/`ReadLatency`/`DiskQueueDepth` (Aurora: `VolumeReadIOPS`);
+**buffer pool** `BufferCacheHitRatio`; **connections** `DatabaseConnections` vs
+`max_connections` (16-way + your app pool must stay under the limit with margin);
+**free space / memory**. For a busy RDS source, gp3 with headroom IOPS removes the gp2
+burst cliff that most often bites full scans.
+
+### Large tables on a write-heavy source
+
+Each table's read runs in a `REPEATABLE READ` snapshot held open **for that table's
+entire read**. On a write-heavy source that keeps InnoDB's undo history (**History
+List Length**) from being purged — undo/disk growth and slower reads — and with 16
+tables in flight the **oldest** open read view sets the purge horizon. Mitigations:
+lower parallelism (fewer open read views); **shard the biggest tables by PK range**
+into separate, shorter runs (there's no page-size knob, so shortening any one
+snapshot means splitting the table set); and monitor History List Length, provisioning
+free-space headroom before starting so undo growth can't trip a storage-full condition.
+
+### What about reading from a read replica?
+
+Pointing Full Load at an **RDS read replica / Aurora reader endpoint** moves all the
+scan IOPS, CPU, and buffer-pool churn off the primary — the strongest way to protect
+production, and it lets you push parallelism harder.
+
+- ✅ **Full-Load-only migrations: a read replica is a good option.** The loader only
+  does read-only keyset `SELECT`s in a consistent snapshot; when CDC is off, the
+  watermark is captured but unused. (Expect the snapshot to reflect a slightly older
+  point due to replica lag — normal.)
+- ⛔ **If you are also running CDC, do NOT read from a replica — use the primary
+  (writer).** The tool captures the CDC handoff **watermark** (binlog file/position,
+  GTID, `server_uuid`) from the same source you connect to, and the CDC connector
+  streams from that same host. A replica's binlog coordinates live in a **different
+  namespace** than the primary's, and RDS replicas often have binlog **disabled or
+  unretained** — so a replica-sourced watermark can silently produce a **CDC data
+  gap** (changes between the snapshot point and CDC start are lost). For any Full
+  Load + CDC migration, connect to the **primary/writer**, keep it as your single
+  source, and set **binlog retention to outlive the entire Full Load**
+  (`CALL mysql.rds_set_configuration('binlog retention hours', N)`).
+
+> [!tip] Quick recommendation for a busy production source
+> **Full-Load-only:** read from a **read replica** (gp3, up-sized for the window if
+> needed); start parallelism at 4–8 and ramp on clear headroom. **Full Load + CDC:**
+> read from the **primary/writer** (never a replica), start parallelism at **2–4** and
+> ramp only on clear headroom, run **off-peak**, and set binlog retention to outlast
+> the load. Either way, shard the few largest tables into PK-range runs.
+
+---
+
+## 7.4 Tuning an individual query
 
 Beyond the parallelism knobs above, you can tune an individual query against Aurora
 DSQL's distributed execution model — where the primary key *is* the table, filter
@@ -187,7 +290,7 @@ for DSQL efficiency and re-tests the rewrite to prove the DPU improvement.
 
 ---
 
-## 7.4 A measured example — one run that backs §7.1 and §7.2
+## 7.5 A measured example — one run that backs §7.1 and §7.2
 
 Below is one run on live infrastructure, done to check whether the design rationale
 above actually shows up in practice. Read it **as an illustration of the method, not

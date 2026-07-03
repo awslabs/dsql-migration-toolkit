@@ -150,7 +150,90 @@ Load라면 약 1 vCPU / 2 GiB가 합리적인 출발점입니다.
 
 ---
 
-## 7.3 개별 쿼리 튜닝
+## 7.3 소스 부하 최소화
+
+Full Load는 프로덕션 소스를 읽으므로 자연스러운 걱정이 생깁니다: **"여러 테이블을 한꺼번에 로드하면 무거운
+읽기가 되는데, 소스에 영향을 주지 않을까?"** 설계 자체가 이미 그 읽기를 가볍게 유지합니다(keyset 스트리밍,
+`OFFSET` 재스캔 없음, 테이블당 한 번에 ~1000행 페이지 하나만 in-flight, 전역 락 없음, `COUNT(*)` 대신
+스캔 없는 `information_schema` 추정치, 그리고 암묵적 백프레셔 — 현재 페이지가 적재된 뒤에야 다음 페이지를
+읽음). 남은 관리 대상은 **동시 읽기 압력**이고, 이는 거의 전적으로 **하나의 레버**로 결정됩니다.
+
+### 유일한 레버: 테이블 병렬수
+
+`DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM`(기본 **4**, 최대 **16**)는 *소스에서 동시에 몇 개
+테이블을 읽는가* — 동시 테이블당 소스 스트리밍 커넥션 하나. 동시 소스 읽기 압력의 다이얼입니다.
+`BATCH_PARALLELISM`·`BATCH_ROWS`는 **DSQL 쓰기** 압력이지 소스 읽기 부하가 아니므로, DSQL이 병목이
+아니면 그대로 두세요. (소스 읽기 **페이지 크기는 1000행으로 고정**되어 튜닝 불가 — 소스 읽기 스로틀은
+테이블 병렬수가 유일합니다.)
+
+> 사이드바 **Performance tuning** 컨트롤에서 실행 사이에 실험하거나, 영속화하려면 환경 변수로 설정하세요(§7.2).
+
+### 낮게 시작해서 관찰하며 튜닝
+
+병렬수를 **처리량 다이얼이 아니라 스로틀**로 다루세요 — 테이블 개수가 아니라 측정된 여유에 맞춰 올립니다:
+
+1. **낮게 시작(2~4)** — 큰 인스턴스라도. 느리게 끝나는 게 프로덕션 지연 사고보다 훨씬 쌉니다.
+2. **소스를 지속 관찰** — 순간 스파이크가 아니라 5~10분 구간으로.
+3. **여유가 명확할 때만 조금씩 올리고** 재관찰. (병렬수는 런당 1회 읽히므로 변경은 **다음** 런부터 적용)
+
+**관찰할 신호** (Amazon RDS/Aurora — CloudWatch + Performance Insights):
+
+- **올려도 되는 신호:** `CPUUtilization`이 라인 한참 아래, `ReadIOPS`가 올라가도 `ReadLatency` 평평,
+  `DiskQueueDepth` 낮음, `BurstBalance` / `EBSIOBalance%` / `CPUCreditBalance` 100% 근처, Aurora
+  `BufferCacheHitRatio` 유지(~99%).
+- **즉시 낮출 신호:** `CPUUtilization` 지속 > ~85~90%; `ReadLatency`가 IOPS 정체 중 2~5배 상승;
+  burst/credit balance가 **0으로 하강**(0 되기 *전에* 스로틀 — 회복이 느림); `FreeableMemory` 바닥 /
+  `SwapUsage`; Aurora `BufferCacheHitRatio` 하락(콜드 스캔이 프로덕션 hot page를 밀어냄); 그리고 무엇보다
+  **애플리케이션 자체 쿼리 지연 상승** — 인스턴스 지표와 무관하게 최종 back-off 트리거.
+
+> [!note] 내장 rate limiter 없음
+> 이 도구에는 **처리량/QPS 제한이 없습니다** — 소스 읽기 압력은 테이블 병렬수에 선형 비례합니다. 레버를 낮추는
+> 것이 조절 수단입니다. 벌크 로드는 **오프피크**에 스케줄하고 인스턴스의 백업/유지보수 창과 겹치지 않게 하세요
+> (스냅샷 + 풀 스캔 동시 실행은 gp2 `BurstBalance`에 최악의 경우).
+
+### 시작 전 여유 점검 체크리스트
+
+대표 피크 구간에서 다음을 baseline으로 잡고, 로드를 얹을 여유가 있는지 확인하세요: **CPU** 여유; **스토리지**
+— gp2 `BurstBalance`(지속 스캔이 0으로 드레인되면 baseline IOPS로 붕괴 — 프로덕션을 해치는 가장 흔한 경로),
+그리고 `ReadIOPS`/`ReadThroughput`/`ReadLatency`/`DiskQueueDepth`(Aurora: `VolumeReadIOPS`);
+**버퍼 풀** `BufferCacheHitRatio`; **커넥션** `DatabaseConnections` vs `max_connections`(16-way + 앱
+풀이 여유를 두고 한도 아래); **여유 공간/메모리**. 바쁜 RDS 소스라면 gp3 + 여유 IOPS가 풀 스캔에서 가장 자주
+발목 잡는 gp2 버스트 절벽을 제거합니다.
+
+### 쓰기 많은 소스의 대형 테이블
+
+각 테이블 읽기는 `REPEATABLE READ` 스냅샷 안에서 실행되며 **그 테이블 읽기 내내** 열려 있습니다. 쓰기 많은
+소스에서는 이것이 InnoDB undo 히스토리(**History List Length**)의 purge를 막아 — undo/디스크 증가와
+읽기 지연 — 16개 테이블이 in-flight면 **가장 오래된** read view가 purge 지평을 정합니다. 완화책: 병렬수
+낮추기(열린 read view 감소); **가장 큰 테이블을 PK 범위로 쪼개** 별도의 짧은 런으로(페이지 크기 노브가 없으니
+개별 스냅샷을 짧게 하려면 테이블 셋을 쪼갬); History List Length 모니터링, 시작 전 여유 공간 확보로 undo 증가가
+storage-full을 유발하지 않게.
+
+### read replica에서 읽으면 어떨까?
+
+Full Load를 **RDS read replica / Aurora reader endpoint**로 향하게 하면 스캔 IOPS·CPU·버퍼풀 churn이
+전부 primary에서 벗어납니다 — 프로덕션을 보호하는 가장 강력한 방법이고, 병렬수도 더 세게 밀 수 있습니다.
+
+- ✅ **Full Load 전용 마이그레이션: read replica는 좋은 선택입니다.** 로더는 일관 스냅샷 안에서 읽기 전용
+  keyset `SELECT`만 하고, CDC가 꺼져 있으면 watermark는 캡처만 되고 사용되지 않습니다. (replica lag 때문에
+  스냅샷이 약간 과거 시점을 반영하는 것은 정상)
+- ⛔ **CDC도 함께 실행한다면, replica에서 읽지 마세요 — primary(writer)를 쓰세요.** 이 도구는 CDC 핸드오프
+  **watermark**(binlog 파일/위치, GTID, `server_uuid`)를 연결한 소스에서 캡처하고, CDC 커넥터도 같은
+  호스트에서 스트리밍합니다. replica의 binlog 좌표는 primary와 **다른 네임스페이스**에 있고, RDS replica는
+  binlog가 **비활성이거나 미보존**인 경우가 많아 — replica에서 잡은 watermark는 조용히 **CDC 데이터 갭**을
+  만들 수 있습니다(스냅샷 시점과 CDC 시작 사이 변경 유실). Full Load + CDC 마이그레이션에서는
+  **primary/writer**에 연결하고, 그것을 단일 소스로 유지하며, **binlog retention을 Full Load 전체 시간보다
+  길게** 설정하세요 (`CALL mysql.rds_set_configuration('binlog retention hours', N)`).
+
+> [!tip] 바쁜 프로덕션 소스를 위한 빠른 권장
+> **Full Load 전용:** **read replica**에서 읽기(gp3, 필요하면 창 동안 up-size); 병렬수 4~8에서 시작해
+> 여유가 명확하면 램프. **Full Load + CDC:** **primary/writer**에서 읽기(replica 금지), 병렬수 **2~4**에서
+> 시작해 여유가 명확할 때만 램프, **오프피크** 실행, binlog retention을 로드보다 길게. 어느 경우든 가장 큰
+> 테이블 몇 개는 PK 범위로 쪼개세요.
+
+---
+
+## 7.4 개별 쿼리 튜닝
 
 위의 병렬수 설정 외에, 개별 쿼리를 Aurora DSQL의 분산 실행 모델에 맞게 튜닝할 수 있습니다 — 기본 키가 곧
 테이블이고, 필터 푸시다운이 비용을 좌우하며, 비용 단위는 (PostgreSQL의 `cost=`가 아니라) **DPU**입니다.
@@ -161,7 +244,7 @@ Load라면 약 1 vCPU / 2 GiB가 합리적인 출발점입니다.
 
 ---
 
-## 7.4 실측 예시 — §7.1·§7.2를 뒷받침하는 한 번의 실행
+## 7.5 실측 예시 — §7.1·§7.2를 뒷받침하는 한 번의 실행
 
 아래는 위 설계 근거가 실제로 관측되는지 확인하려고 라이브 인프라에서 한 번 돌려 본 예시입니다. **성능
 규격이나 보장치가 아니라 방법을 보여 주는 예시**로만 읽어 주세요 — `scripts/measure_performance.py`로
