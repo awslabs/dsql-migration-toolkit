@@ -312,15 +312,25 @@ Parameters:
     Type: String
     Default: us.anthropic.claude-sonnet-4-6
     AllowedValues:
+      # US geo cross-region inference profiles (us-east-1/2, us-west-2).
       - us.anthropic.claude-opus-4-8
       - us.anthropic.claude-opus-4-6-v1
       - us.anthropic.claude-sonnet-4-6
+      # GLOBAL cross-region inference profiles -- work from ANY region (incl.
+      # ap-northeast-2 / Seoul, eu-*, etc.). Use one of these when deploying
+      # outside the US; the `us.` profiles are US-region-only.
+      - global.anthropic.claude-opus-4-8
+      - global.anthropic.claude-opus-4-6-v1
+      - global.anthropic.claude-sonnet-4-6
     Description: >
-      Anthropic model for AI-assisted conversion (US cross-region inference
-      profile; BEDROCK_MODEL_ID). When EnableAiAssist=true, the task role's
-      bedrock:InvokeModel scope is DERIVED from this automatically (the profile
-      plus its underlying foundation-model ARNs) -- you do not need to supply
-      BedrockModelArns. The model must be access-enabled in your account.
+      Anthropic cross-region inference profile for AI-assisted conversion
+      (BEDROCK_MODEL_ID). Pick a `us.` profile for a US-region deploy, or a
+      `global.` profile for any other region (e.g. ap-northeast-2/Seoul, eu-*).
+      When EnableAiAssist=true, the task role's bedrock:InvokeModel scope is
+      DERIVED from this automatically (the profile ARN in the deploy region +
+      the underlying anthropic foundation-model, region-agnostic) -- you do not
+      need to supply BedrockModelArns. The model must be access-enabled in your
+      account and region.
 
 # Reject insecure deployment combinations at create/update time (before any
 # resource is provisioned). The app enforces NO auth of its own -- it relies on
@@ -927,25 +937,25 @@ Resources:
               - bedrock:InvokeModel
               - bedrock:InvokeModelWithResponseStream
             Resource:
-              # Explicit BedrockModelArns override, else auto-derived scope: the US
-              # inference profile (this region/account) + its foundation-model ARNs
-              # in the regions it routes to (us-east-1/2, us-west-2). Fm = id sans 'us.'.
+              # Explicit BedrockModelArns override, else auto-derived scope,
+              # REGION-AGNOSTIC so it works for us. / global. (and apac.) profiles:
+              #   1) the inference profile in THIS deploy region/account, plus
+              #   2) the underlying anthropic foundation-model, scoped to the exact
+              #      model id but ANY region (`*`) -- a geo profile routes to a
+              #      geo-specific and/or region-less set (us: us-east/west; global:
+              #      region-less + calling region; apac: 8 ap-* regions), so we
+              #      cannot enumerate member regions per geo. The `*` is on the
+              #      REGION only; the model id stays exact (never a blanket `*`).
+              # Fm = model id minus its geo prefix: split on "anthropic." (present in
+              # every profile id: us./global./apac.anthropic.<model>) and re-prepend.
               Fn::If:
                 - HasBedrockModelArnsOverride
                 - Ref: BedrockModelArns
                 - - Fn::Sub: arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}
                   - Fn::Sub:
-                      - arn:${AWS::Partition}:bedrock:us-east-1::foundation-model/${Fm}
+                      - arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.${Fm}
                       - Fm:
-                          Fn::Select: [1, Fn::Split: ["us.", Ref: BedrockModelId]]
-                  - Fn::Sub:
-                      - arn:${AWS::Partition}:bedrock:us-east-2::foundation-model/${Fm}
-                      - Fm:
-                          Fn::Select: [1, Fn::Split: ["us.", Ref: BedrockModelId]]
-                  - Fn::Sub:
-                      - arn:${AWS::Partition}:bedrock:us-west-2::foundation-model/${Fm}
-                      - Fm:
-                          Fn::Select: [1, Fn::Split: ["us.", Ref: BedrockModelId]]
+                          Fn::Select: [1, Fn::Split: ["anthropic.", Ref: BedrockModelId]]
 
   AlbSecurityGroup:
     Type: AWS::EC2::SecurityGroup

@@ -1049,8 +1049,17 @@ def test_bedrock_invoke_is_opt_in_and_scoped(template: dict) -> None:
     assert fn_if[0] == "HasBedrockModelArnsOverride"
     assert fn_if[1] == {"Ref": "BedrockModelArns"}
     derived = fn_if[2]
-    assert isinstance(derived, list) and len(derived) == 4  # profile + 3 FM regions
-    assert "*" not in str(derived)
+    # Region-agnostic scope: the inference-profile ARN (this deploy region) + ONE
+    # region-agnostic foundation-model ARN (region `*`, exact model id). This works
+    # for us./global./apac. profiles without enumerating per-geo member regions.
+    assert isinstance(derived, list) and len(derived) == 2  # profile + FM (any region)
+    # The only `*` allowed is the REGION field of the foundation-model ARN; the
+    # resource must never be a blanket "*" and the model id stays exact.
+    assert resource != "*"
+    fm_arn = derived[1]["Fn::Sub"][0]
+    assert ":bedrock:*::foundation-model/anthropic.${Fm}" in fm_arn
+    # No wildcard on the model id / action scope beyond that region field.
+    assert "foundation-model/*" not in str(derived)
 
 
 def test_bedrock_model_id_is_curated_dropdown_with_auto_scope(template: dict) -> None:
@@ -1060,7 +1069,14 @@ def test_bedrock_model_id_is_curated_dropdown_with_auto_scope(template: dict) ->
     spec = template["Parameters"]["BedrockModelId"]
     allowed = spec["AllowedValues"]
     assert spec["Default"] in allowed
-    assert allowed and all(v.startswith("us.anthropic.") for v in allowed)
+    # Curated Anthropic profiles across geos: us. (US regions) + global. (any region,
+    # e.g. Seoul/eu). Every value is an anthropic cross-region inference profile id.
+    assert allowed and all(
+        v.startswith(("us.anthropic.", "global.anthropic.")) for v in allowed
+    )
+    # Both a US-only and a portable global profile must be offered.
+    assert any(v.startswith("us.anthropic.") for v in allowed)
+    assert any(v.startswith("global.anthropic.") for v in allowed)
     assert template["Conditions"]["HasBedrockModelArnsOverride"] == {
         "Fn::Not": [{"Fn::Equals": [{"Fn::Join": ["", {"Ref": "BedrockModelArns"}]}, ""]}]
     }
