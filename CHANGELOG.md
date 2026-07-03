@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.39
+
+### Fixed
+
+- **Start over no longer warns about "CDC keeps billing" when CDC is already gone.**
+  If a fresh live probe confirms no CDC infrastructure exists (e.g. you just
+  finished deleting the stack), the Start-over dialog no longer shows the
+  "resetting does not delete CDC infrastructure — MSK/NAT keep billing" caution,
+  which was misleading about infra that is already torn down. The warning still
+  appears when the probe is inconclusive (a hedge) and, of course, when CDC really
+  is deployed (that path shows the stop/delete tiles instead).
+
 ## v0.1.38
 
 ### Changed

@@ -467,6 +467,32 @@ def test_start_over_cdc_warning_names_custom_stack() -> None:
     assert _start_over_cdc_warning(state) == default
 
 
+def test_start_over_cdc_warning_suppressed_when_confirmed_absent() -> None:
+    # After a live probe confirms NO CDC is deployed (the user just deleted the
+    # stack), the "MSK/NAT keep billing" caution must NOT show even though the
+    # session still carries a CDC plan + infra inputs (those are wiped by the reset).
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.workflow import _start_over_cdc_warning
+
+    state = SessionConnectionState()
+    state.set_migration_type("full_load_and_cdc")
+    state.set_cdc_infra_inputs({"vpc_id": "vpc-0abc"})
+
+    # Without the flag (probe unknown / not run) the caution still shows (hedge).
+    assert _start_over_cdc_warning(state) is not None
+    # With a confirmed-absent probe, it is suppressed — nothing to orphan.
+    assert (
+        _start_over_cdc_warning(state, cdc_confirmed_absent=True) is None
+    )
+    # Also suppressed for a custom stack name once confirmed absent.
+    assert (
+        _start_over_cdc_warning(
+            state, "mysql-dsql-cdc-orders", cdc_confirmed_absent=True
+        )
+        is None
+    )
+
+
 def test_build_migration_diagram_shows_source_server_version() -> None:
     from dsql_migrator.core.models import SourceConnectionConfig
     from dsql_migrator.ui.session import SessionConnectionState

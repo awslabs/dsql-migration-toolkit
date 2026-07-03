@@ -982,7 +982,10 @@ def reconnect_notice(state: "object") -> Optional[str]:
 
 
 def _start_over_cdc_warning(
-    state: "object", cdc_stack_name: "Optional[str]" = None
+    state: "object",
+    cdc_stack_name: "Optional[str]" = None,
+    *,
+    cdc_confirmed_absent: bool = False,
 ) -> Optional[str]:
     """Return a caution when resetting would orphan deployed CDC infrastructure.
 
@@ -992,6 +995,13 @@ def _start_over_cdc_warning(
     Delete action -- otherwise MSK/NAT keep billing with no session pointing at
     them. Returns ``None`` when there is nothing at risk.
 
+    ``cdc_confirmed_absent`` short-circuits to ``None``: when a fresh live probe has
+    just confirmed that NO CDC resource exists (the caller's ``cdc_deployed`` is
+    False after a successful probe -- e.g. the user just finished deleting the
+    stack), there is nothing to orphan, so the "MSK/NAT keep billing" caution would
+    be misleading. Only the session's stale CDC-plan/infra-inputs remain, and those
+    are cleared by the reset itself.
+
     ``cdc_stack_name`` is the session's current cdc-stack name (from the migration
     state). A fresh session re-discovers a still-deployed stack ONLY at the default
     name, so when a non-default (custom) name was used -- e.g. a second/parallel
@@ -1000,6 +1010,8 @@ def _start_over_cdc_warning(
     stack in the warning so the operator knows precisely what to delete (here or in
     the AWS console). ``None`` / the default name keeps the generic guidance.
     """
+    if cdc_confirmed_absent:
+        return None
     mt = getattr(state, "migration_type", None)
     mt_value = getattr(mt, "value", mt)
     chose_cdc = mt_value in ("cdc_only", "full_load_and_cdc")
@@ -1080,7 +1092,13 @@ def _open_start_over_dialog(
             dialog.open()
             return
 
-        warning = _start_over_cdc_warning(state, cdc_stack_name)
+        # Suppress the orphan-billing caution when the fresh probe confirmed no CDC
+        # is deployed (cdc_deployed is False here -- the tiles branch above handled
+        # the deployed case). Otherwise a user who just deleted the stack would see
+        # a misleading "MSK/NAT keep billing" warning about infra that is gone.
+        warning = _start_over_cdc_warning(
+            state, cdc_stack_name, cdc_confirmed_absent=not cdc_deployed
+        )
         ui.label(  # type: ignore[attr-defined]
             "This clears your connections, migration plan, workflow progress, table "
             "selections and saved session state, returning you to a fresh Connect "
