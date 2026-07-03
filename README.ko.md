@@ -32,28 +32,7 @@ Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 분산 데이터베이스
 두 개의 데이터 경로가 Aurora DSQL로 수렴합니다: 도구가 주도하는 일회성 **Full Load**와,
 관리형 MSK Connect에서 돌아가는 선택적 연속 **CDC** 스트림.
 
-```mermaid
-flowchart LR
-    SRC[("Source MySQL<br/>(RDS / Aurora MySQL)")]
-    APP["Migration Tool<br/>(ECS Fargate · web UI)"]
-    MSK["Amazon MSK<br/>(topics)"]
-    subgraph MSKC["CDC pipeline · Amazon MSK Connect (managed)"]
-        DBZ["① Debezium<br/>MySQL Source Connector"]
-        SNK["② Custom DSQL Sink Connector<br/>(Java · IAM · OCC retry)"]
-    end
-    DSQL[("Amazon Aurora DSQL<br/>(target)")]
-
-    SRC -->|"Full Load (bulk read)"| APP
-    APP -->|"convert + bulk load"| DSQL
-    SRC -.->|"binlog (CDC)"| DBZ
-    DBZ -->|"change events"| MSK
-    MSK -->|"consume"| SNK
-    SNK -->|"upsert/delete"| DSQL
-```
-
-AWS 아이콘 뷰(간소화):
-
-![간소화 AWS 아키텍처](deploy/architecture-aws-simple.png)
+![아키텍처 다이어그램](deploy/architecture-aws-simple.png)
 
 > 편집 가능한 소스: [`deploy/architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio)
 > (draw.io로 열기). 상세 토폴로지는 [아키텍처](#아키텍처)에 있습니다.

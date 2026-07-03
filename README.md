@@ -33,28 +33,7 @@ surface the points that need human work.** Conversion is deterministic-first
 Two data paths converge on Aurora DSQL: a one-shot **Full Load** driven by the
 tool, and an optional continuous **CDC** stream that runs on managed MSK Connect.
 
-```mermaid
-flowchart LR
-    SRC[("Source MySQL<br/>(RDS / Aurora MySQL)")]
-    APP["Migration Tool<br/>(ECS Fargate · web UI)"]
-    MSK["Amazon MSK<br/>(topics)"]
-    subgraph MSKC["CDC pipeline · Amazon MSK Connect (managed)"]
-        DBZ["① Debezium<br/>MySQL Source Connector"]
-        SNK["② Custom DSQL Sink Connector<br/>(Java · IAM · OCC retry)"]
-    end
-    DSQL[("Amazon Aurora DSQL<br/>(target)")]
-
-    SRC -->|"Full Load (bulk read)"| APP
-    APP -->|"convert + bulk load"| DSQL
-    SRC -.->|"binlog (CDC)"| DBZ
-    DBZ -->|"change events"| MSK
-    MSK -->|"consume"| SNK
-    SNK -->|"upsert/delete"| DSQL
-```
-
-AWS-icon view (simplified):
-
-![Simplified AWS architecture](deploy/architecture-aws-simple.png)
+![Architecture diagram](deploy/architecture-aws-simple.png)
 
 > Editable source: [`deploy/architecture-aws-simple.drawio`](deploy/architecture-aws-simple.drawio)
 > (open with draw.io). The detailed topology is in [Architecture](#architecture).
