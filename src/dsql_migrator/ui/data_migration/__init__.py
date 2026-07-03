@@ -2432,6 +2432,14 @@ def _render_full_load_step(
     # would keep collapsing. Only this live region -- the per-table progress,
     # caption, completeness verdict, and error-log summary -- is refreshed on each
     # poll tick; the region re-arms its own one-shot timer while the job runs.
+    # The per-table progress table is rebuilt on every ~1.5s poll (it lives inside
+    # the refreshable _live_detail). A freshly-built ui.table resets to page 1, so
+    # without persisting the page a user browsing page 2+ is yanked back on each
+    # tick. This holder lives in _render_full_load_step (NOT rebuilt by the poll --
+    # only _live_detail is), so the chosen page survives the rebuild; the table
+    # seeds its pagination from it and writes back via on_pagination_change.
+    _progress_page = {"page": 1}
+
     @ui.refreshable
     def _live_detail() -> None:
         current = _current_job(job_manager, migration_state.job_id)
@@ -2459,6 +2467,7 @@ def _render_full_load_step(
                 current, migration_state.error_log
             ),
             ai_error_opener=ai_error_opener,
+            page_state=_progress_page,
         )
         # The completeness baseline (expected_rows) comes from the watermark's
         # per-table counts, which are scan-free information_schema ESTIMATES
@@ -2885,6 +2894,7 @@ def _render_full_load_progress(
     accept_quarantine_and_continue=None,
     quarantine_only: bool = False,
     ai_error_opener=None,
+    page_state=None,
 ) -> None:
     """Render the overall progress, a status distribution, and a live per-table
     table with colored status badges and per-row progress bars."""
@@ -2947,11 +2957,27 @@ def _render_full_load_progress(
     # second line instead of forcing the row wider than the card, and `dense`
     # tightens padding -- together the 9 columns fit the card width so the table
     # never shows a bottom horizontal scrollbar.
+    # Seed pagination from the persisted page (survives the ~1.5s poll rebuild) so
+    # a user browsing page 2+ is not yanked back to page 1 on every tick. The page
+    # is clamped to the current row count (a shrinking table can't leave you on a
+    # now-empty page). ``on_pagination_change`` writes the user's page back.
+    _rows_per_page = 10
+    _saved_page = 1
+    if isinstance(page_state, dict):
+        _max_page = max(1, -(-len(table_rows) // _rows_per_page))  # ceil-div
+        _saved_page = min(max(1, int(page_state.get("page", 1))), _max_page)
+
+    def _on_pagination_change(event: object) -> None:
+        if isinstance(page_state, dict):
+            value = getattr(event, "value", None) or {}
+            page_state["page"] = int(value.get("page", page_state.get("page", 1)))
+
     table = ui.table(
         columns=columns,
         rows=table_rows,
         row_key="table",
-        pagination=10,
+        pagination={"rowsPerPage": _rows_per_page, "page": _saved_page},
+        on_pagination_change=_on_pagination_change,
     ).props("wrap-cells dense").classes("w-full")
     # Colored status badge per row (visualizes each table's load state).
     table.add_slot(

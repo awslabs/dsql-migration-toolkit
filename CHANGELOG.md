@@ -5,6 +5,16 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.58
+
+### Fixed
+
+- **The Full Load progress table no longer jumps back to page 1 while a load is
+  running.** The per-table table refreshes every ~1.5 s, and each refresh rebuilt
+  it from scratch — so paging to page 2+ snapped you back to page 1 on the next
+  tick. The chosen page is now preserved across refreshes (and clamped so a
+  shrinking table can't strand you on a now-empty page).
+
 ## v0.1.57
 
 ### Fixed
