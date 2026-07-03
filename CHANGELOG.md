@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.55
+
+### Changed
+
+- **"Retry failed tables" now lets you pick which failed tables to retry.** The
+  retry dialog lists each failed table with a checkbox (all pre-checked) and its
+  failure reason, so you can uncheck the ones you're not ready to retry yet (e.g.
+  a source value you haven't fixed, or a dependency you haven't resolved) and
+  retry only the rest. Confirming retries just the checked subset — and the
+  read-only "already has data" probe and the Append-vs-Drop choice are scoped to
+  that subset too. Confirm is disabled when nothing is checked. Retrying all (the
+  common case) is unchanged: leave everything checked and confirm. The per-table
+  "Reload" shortcut is unchanged.
+
 ## v0.1.54
 
 ### Changed

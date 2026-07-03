@@ -935,6 +935,11 @@ def build_data_migration_screen(
                 # previously-quarantined row now loads. Reuses the scoped retry path.
                 _run_retry_for([table_name])
 
+            def retry_tables(names: Sequence[str]) -> None:
+                # Retry an explicit SUBSET of tables (the failed-table checklist's
+                # ticked set). Same scoped retry path as Reload, for many tables.
+                _run_retry_for(list(names))
+
             # On-demand AI diagnosis of a FAILED Full Load table (opt-in: AI Assist
             # on). Reuses the shared chat drawer + a strategist bound to the Full
             # Load error grounding, so a reply explains the specific failure
@@ -1143,6 +1148,7 @@ def build_data_migration_screen(
                             guard_reason=guard_reason,
                             start_full_load=start_full_load,
                             retry_failed_load=retry_failed_load,
+                            retry_tables=retry_tables,
                             reload_table=reload_table,
                             accept_quarantine_and_continue=accept_quarantine_and_continue,
                             stop_full_load=stop_full_load,
@@ -2087,6 +2093,7 @@ def _render_full_load_step(
     accept_quarantine_and_continue,
     stop_full_load,
     refresh,
+    retry_tables=None,
     ai_error_opener=None,
 ) -> None:
     """Render the Full Load step: confirm the selected workloads, then run it.
@@ -2120,7 +2127,7 @@ def _render_full_load_step(
     # periodic poll re-render can't tear a stale value into the dialog).
 
     def _open_confirm_dialog_now(
-        *, action_tables, on_confirm, title
+        *, action_tables, on_confirm, title, table_reasons=None
     ) -> None:
         """Build + open the Full-Load confirm dialog in the TOP-LEVEL client.
 
@@ -2132,12 +2139,23 @@ def _render_full_load_step(
         NOT tear it down a couple of seconds after it appears. The Drop-vs-Append
         choice (when the target already holds data) applies to whichever action
         this dialog wraps, so a retry/Reload honors the SAME choice as Start.
+
+        When ``table_reasons`` (a ``{table: failure_reason}`` map) is given -- the
+        Retry-failed case -- the dialog renders ``action_tables`` as a **checklist**
+        (all pre-checked) with each table's failure reason, so the user can uncheck
+        tables they aren't ready to retry (e.g. a not-yet-fixed source value) and
+        retry only the rest. ``on_confirm`` is then called with the checked subset;
+        otherwise it is called with no arguments.
         """
         from nicegui import context as _ctx
 
         client = _ctx.client
         tables_with_data_now = sorted(migration_state.tables_with_data)
         cdc_live_now = cdc_streaming_started(migration_state, job_manager)
+        selectable = table_reasons is not None
+        # Live set of checked tables (mutated by the per-row checkboxes). Starts as
+        # the full action set (all pre-checked) -- the common "retry everything".
+        checked: set = set(action_tables)
 
         def _build() -> None:
             with ui.dialog() as confirm_dialog, ui.card().classes("min-w-[360px]"):
@@ -2164,7 +2182,40 @@ def _render_full_load_step(
                             "Load, then start CDC again so it resumes from the new "
                             "snapshot."
                         ).classes("text-xs text-red-700")
-                if action_tables:
+                # Retry-failed: a checklist (all pre-checked) with each table's
+                # failure reason, so the user can uncheck tables not ready to retry
+                # and retry only the rest. Other actions just show badges.
+                if selectable and action_tables:
+                    ui.label(
+                        "Uncheck any table you're not ready to retry yet (e.g. a "
+                        "source value you haven't fixed):"
+                    ).classes("text-xs text-gray-500")
+                    with ui.column().classes(
+                        "w-full gap-1 max-h-60 overflow-auto"
+                    ):
+                        for name in action_tables:
+                            reason = (table_reasons or {}).get(name, "")
+
+                            def _toggle(e: object, n=name) -> None:
+                                if bool(getattr(e, "value", False)):
+                                    checked.add(n)
+                                else:
+                                    checked.discard(n)
+                                _sync_confirm_enabled()
+
+                            with ui.row().classes("items-start gap-2 no-wrap w-full"):
+                                ui.checkbox(value=True, on_change=_toggle).props(
+                                    "dense"
+                                )
+                                with ui.column().classes("gap-0 min-w-0"):
+                                    ui.label(name).classes(
+                                        "text-sm font-medium text-gray-900"
+                                    )
+                                    if reason:
+                                        ui.label(reason).classes(
+                                            "text-xs text-red-700 break-all"
+                                        )
+                elif action_tables:
                     with ui.row().classes("items-center gap-1 flex-wrap"):
                         for name in action_tables:
                             ui.badge(name).props("color=blue-grey-6 outline")
@@ -2207,8 +2258,16 @@ def _render_full_load_step(
                         ).classes("text-xs text-gray-500")
 
                 def _confirm() -> None:
+                    if selectable and not checked:
+                        return  # guard: nothing selected (button is also disabled)
                     confirm_dialog.close()
-                    on_confirm()
+                    # Retry-failed passes the checked subset (in the original order);
+                    # every other action calls on_confirm with no arguments.
+                    if selectable:
+                        chosen = [n for n in action_tables if n in checked]
+                        on_confirm(chosen)
+                    else:
+                        on_confirm()
 
                 with ui.row().classes("justify-end w-full gap-2"):
                     ui.button("Cancel", on_click=confirm_dialog.close).props("flat")
@@ -2233,6 +2292,15 @@ def _render_full_load_step(
                     start_btn = ui.button(confirm_label, on_click=_confirm).props(
                         f"color={confirm_color}"
                     )
+
+                    def _sync_confirm_enabled() -> None:
+                        # Disable confirm when the retry checklist has nothing ticked.
+                        if selectable and not checked:
+                            start_btn.disable()
+                        else:
+                            start_btn.enable()
+
+                    _sync_confirm_enabled()
                     # The label/color depend on the radio; re-render them on change
                     # so switching Drop<->Append updates the button immediately.
                     def _sync_btn(e: object) -> None:
@@ -2263,6 +2331,7 @@ def _render_full_load_step(
         probe_tables=None,
         on_confirm=None,
         title="Start Full Load?",
+        table_reasons=None,
     ) -> None:
         """Probe which target tables hold data, then open the confirm dialog.
 
@@ -2272,7 +2341,9 @@ def _render_full_load_step(
         Start/Re-run), records the result (drives the Drop-vs-Append choice + the
         run's replace set), then opens the confirm dialog in the top-level client
         context. ``on_confirm`` is the action to run on confirm (defaults to
-        ``start_full_load``); ``title`` is the dialog heading.
+        ``start_full_load``); ``title`` is the dialog heading. ``table_reasons``
+        (Retry-failed) turns the dialog into a per-table checklist and makes
+        ``on_confirm`` receive the checked subset.
         """
         if _confirm_busy["value"]:
             return  # a probe is already in flight -> ignore the extra click
@@ -2324,6 +2395,7 @@ def _render_full_load_step(
                 action_tables=action_tables,
                 on_confirm=confirm_action,
                 title=title,
+                table_reasons=table_reasons,
             )
         finally:
             _confirm_busy["value"] = False
@@ -2590,15 +2662,28 @@ def _render_full_load_step(
                     # Spacer pushes the recommended action to the right edge.
                     ui.space()
 
+                    # Per-table failure reasons (cause) for the retry checklist, so
+                    # the user can see WHY each table failed before deciding whether
+                    # to retry it now.
+                    _failure_reasons = migration_state.error_log.latest_messages(
+                        job.job_id
+                    )
+
                     async def _confirm_retry_failed(event: object = None) -> None:
                         # Route the failed-table retry through the same confirm
-                        # dialog as Start, probing ONLY the failed tables so the
-                        # Drop-vs-Append choice is scoped to what is being retried.
+                        # dialog as Start, as a CHECKLIST (all pre-checked) of the
+                        # failed tables + their reasons. Probing/Drop-vs-Append and
+                        # the retry are scoped to the CHECKED subset, so the user can
+                        # retry only the tables they're ready for.
+                        retry_fn = retry_tables or (lambda _names: retry_failed_load())
                         await _open_full_load_confirm(
                             event,
                             probe_tables=list(failed),
-                            on_confirm=retry_failed_load,
+                            on_confirm=retry_fn,
                             title=f"Retry {len(failed)} failed table(s)?",
+                            table_reasons={
+                                n: _failure_reasons.get(n, "") for n in failed
+                            },
                         )
 
                     retry_btn = ui.button(
