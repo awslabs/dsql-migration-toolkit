@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.37
+
+### Fixed
+
+- **"Start over" no longer races an in-flight CDC teardown.** After choosing to
+  stop/delete the CDC pipeline during Start over, the CloudFormation stack is
+  `DELETE_IN_PROGRESS` for ~15–25 min — during which the header "Start over" button
+  stayed clickable, and because the reset had already wiped the session, a second
+  attempt no longer recognized the running teardown (confusing, and for a custom
+  stack name a risk of orphaned MSK/NAT billing). Start over is now **blocked while
+  a CDC stop/delete is actually in flight**: the dialog explains that a teardown is
+  running and offers only Close (no RESET). Detection is narrow — a live
+  `*_IN_PROGRESS` stack status or a PENDING/RUNNING stop/delete job — so a settled
+  but stuck stack (`ROLLBACK_COMPLETE` / `DELETE_FAILED`) can still be reset and
+  cleaned up. The `run_cdc_delete` already-deleting backstop is unchanged.
+
 ## v0.1.36
 
 ### Added

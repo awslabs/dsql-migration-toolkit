@@ -5,6 +5,20 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.37
+
+### Fixed
+
+- **「Start over」が進行中の CDC 削除と競合しないように。** Start over で CDC パイプラインの
+  stop/delete を選ぶと、CloudFormation スタックは約 15〜25 分間 `DELETE_IN_PROGRESS` になりますが、
+  その間ヘッダーの「Start over」ボタンはクリック可能なままで、リセットがすでにセッションを消去して
+  いたため、2 回目の試行では進行中の削除を認識できませんでした(紛らわしく、カスタムスタック名の場合は
+  MSK/NAT の課金が孤立するリスク)。今後は **CDC の stop/delete が実際に進行中の間は Start over を
+  ブロック**します: ダイアログは削除が進行中であることを説明し、Close のみを提供します(RESET なし)。
+  検出は狭く — ライブの `*_IN_PROGRESS` スタックステータス、または PENDING/RUNNING の stop/delete
+  ジョブ — なので、落ち着いたが行き詰まったスタック(`ROLLBACK_COMPLETE` / `DELETE_FAILED`)は引き続き
+  リセットして片付けられます。`run_cdc_delete` の already-deleting バックストップは変更ありません。
+
 ## v0.1.36
 
 ### Added

@@ -764,3 +764,110 @@ def test_step_run_label_is_step_specific_rerun_once_not_pending() -> None:
     for status in (StepStatus.DONE, StepStatus.IN_PROGRESS, StepStatus.FAILED):
         assert step_run_label(WorkflowStep.VALIDATION, status) == "Re-run validation"
         assert step_run_label(WorkflowStep.FULL_LOAD, status) == "Re-run migration"
+
+
+class _DialogUi:
+    """NiceGUI double for _open_start_over_dialog: captures label text and records
+    whether any button was wired with an on('click', ...) handler (the reset
+    button). Enough to tell the blocking path (no reset wiring) from the normal one."""
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+        self.click_wired = False  # True once a button gets on('click', ...)
+        self.dialog_opened = False
+
+    class _El:
+        def __init__(self, ui, is_button=False):
+            self._ui = ui
+            self._is_button = is_button
+
+        def classes(self, *_a, **_k):
+            return self
+
+        def style(self, *_a, **_k):
+            return self
+
+        def props(self, *_a, **_k):
+            return self
+
+        def tooltip(self, *_a, **_k):
+            return self
+
+        def on(self, event=None, *_a, **_k):
+            if self._is_button and event == "click":
+                self._ui.click_wired = True
+            return self
+
+        def open(self, *_a, **_k):  # dialog.open() at the end of the builder
+            self._ui.dialog_opened = True
+            return self
+
+        def close(self, *_a, **_k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def label(self, text="", *_a, **_k):
+        if text is not None:
+            self.texts.append(str(text))
+        return self._El(self)
+
+    def button(self, text="", *_a, on_click=None, **_k):
+        if text is not None:
+            self.texts.append(str(text))
+        return self._El(self, is_button=True)
+
+    def input(self, *_a, **_k):
+        return self._El(self)
+
+    def icon(self, *_a, **_k):
+        return self._El(self)
+
+    def row(self, *_a, **_k):
+        return self._El(self)
+
+    def column(self, *_a, **_k):
+        return self._El(self)
+
+    def card(self, *_a, **_k):
+        return self._El(self)
+
+    def dialog(self, *_a, **_k):
+        return self._El(self)
+
+    def open(self):  # dialog.open() is called on the returned _El in real code;
+        self.dialog_opened = True  # our _El has no open(), so this is unused — kept
+
+
+def _render_start_over_dialog(**kwargs):
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.workflow import _open_start_over_dialog
+
+    ui = _DialogUi()
+    state = SessionConnectionState()
+    _open_start_over_dialog(
+        ui, state, lambda: None, lambda _v: None, lambda: None, object(), **kwargs
+    )
+    return ui
+
+
+def test_start_over_blocked_while_cdc_teardown_in_flight() -> None:
+    # The reported bug: resetting while a CDC delete is mid-flight. The dialog must
+    # explain and NOT offer a working reset (no reset button wired to click).
+    ui = _render_start_over_dialog(cdc_teardown_in_flight=True, cdc_deployed=True)
+    assert any("CDC teardown is already running" in t for t in ui.texts)
+    assert not ui.click_wired  # reset is NOT executable on the block path
+    assert any("Close" in t for t in ui.texts)  # only Close is offered
+
+
+def test_start_over_normal_path_wires_reset_when_not_in_flight() -> None:
+    # Regression: with no teardown in flight, the normal type-to-confirm reset flow
+    # renders (reset button wired for click) and the block notice is absent.
+    ui = _render_start_over_dialog(cdc_teardown_in_flight=False, cdc_deployed=False)
+    assert not any("CDC teardown is already running" in t for t in ui.texts)
+    assert ui.click_wired  # the reset button is wired on the normal path
+    assert any("Type RESET to confirm:" in t for t in ui.texts)

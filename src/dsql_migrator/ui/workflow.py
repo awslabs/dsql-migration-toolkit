@@ -1038,6 +1038,7 @@ def _open_start_over_dialog(
     cdc_deployed: bool = False,
     on_reset_cdc: Optional[Callable[[str], None]] = None,
     cdc_stack_name: Optional[str] = None,
+    cdc_teardown_in_flight: bool = False,
 ) -> None:
     """Type-to-confirm dialog that clears the session and returns to Connect.
 
@@ -1046,12 +1047,40 @@ def _open_start_over_dialog(
     any AWS resource. Shows the CDC-orphan caution when relevant. ``cdc_stack_name``
     (the session's current stack name) lets the warning name a custom stack a fresh
     session would not re-discover.
+
+    ``cdc_teardown_in_flight`` BLOCKS the reset: when a CDC stop/delete is currently
+    running (freshly probed), resetting would fire a second background teardown and
+    then wipe the session, hiding the in-flight delete. In that case the dialog only
+    explains this and offers Close -- no RESET input, no enabled confirm button.
     """
-    warning = _start_over_cdc_warning(state, cdc_stack_name)
     with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 520px"):  # type: ignore[attr-defined]
         ui.label("Start over — reset this session").classes(  # type: ignore[attr-defined]
             "text-lg font-semibold text-red-700"
         )
+
+        # Hard block: a CDC teardown (stop/delete) is mid-flight. Do NOT let the
+        # user start over and race it (a second teardown + a session wipe that would
+        # make the running delete invisible, and unre-discoverable for a custom
+        # stack name). Explain and offer only Close.
+        if cdc_teardown_in_flight:
+            render_notice(
+                ui,
+                tone="warning",
+                header="A CDC teardown is already running",
+                body=(
+                    "Your previous CDC stop/delete is still in progress (deleting "
+                    "the stack can take ~15–25 min). Starting over now would launch "
+                    "a second teardown and then clear this session, hiding the "
+                    "one already running. Wait for it to finish (watch the Data "
+                    "Migration step), then Start over."
+                ),
+            )
+            with ui.row().classes("justify-end gap-2 w-full"):  # type: ignore[attr-defined]
+                ui.button("Close", on_click=dialog.close).props("flat")  # type: ignore[attr-defined]
+            dialog.open()
+            return
+
+        warning = _start_over_cdc_warning(state, cdc_stack_name)
         ui.label(  # type: ignore[attr-defined]
             "This clears your connections, migration plan, workflow progress, table "
             "selections and saved session state, returning you to a fresh Connect "
@@ -1217,6 +1246,7 @@ def build_workflow_sidebar(
     on_reset_cdc: Optional[Callable[[str], None]] = None,
     cdc_deployed_getter: Optional[Callable[[], bool]] = None,
     cdc_stack_name_getter: Optional[Callable[[], Optional[str]]] = None,
+    cdc_teardown_in_flight_getter: Optional[Callable[[], bool]] = None,
     cdc_probe: Optional[Callable[[], None]] = None,
     optional_tools: Optional[dict[str, "OptionalTool"]] = None,
 ) -> None:
@@ -1397,6 +1427,11 @@ def build_workflow_sidebar(
                         on_reset_cdc=on_reset_cdc,
                         cdc_stack_name=(
                             cdc_stack_name_getter() if cdc_stack_name_getter else None
+                        ),
+                        cdc_teardown_in_flight=(
+                            bool(cdc_teardown_in_flight_getter())
+                            if cdc_teardown_in_flight_getter
+                            else False
                         ),
                     )
 

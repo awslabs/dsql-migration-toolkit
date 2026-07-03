@@ -16,7 +16,7 @@ needed only if you expose the UI publicly. The optional streaming **CDC pipeline
 
 In a hurry? The happy path, in order — each step is detailed in the sections below.
 
-1. Choose where to run (Fargate recommended).
+1. Choose where to run (testing — Local; real migration — Fargate recommended).
 2. Gather the required values.
 3. Prepare an ACM certificate.
 4. Upload the CloudFormation template.

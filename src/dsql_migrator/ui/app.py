@@ -326,6 +326,39 @@ def build_page(
         migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
         return getattr(migration_state, "cdc_stack_name", None)
 
+    def _cdc_teardown_in_flight() -> bool:
+        """True when a CDC stop/delete is CURRENTLY running, so Start over must not
+        race it. Two authoritative signals, both refreshed by ``_cdc_probe`` just
+        before the Start-over dialog opens:
+
+        (a) a local lifecycle job for a stop/delete is still PENDING/RUNNING, or
+        (b) the freshly-probed cdc-stack status is a live CloudFormation operation
+            (ends in ``_IN_PROGRESS`` -- e.g. ``DELETE_IN_PROGRESS``). We test the
+            raw status, NOT the coarse ``unstable`` phase, so a settled but stuck
+            stack (``ROLLBACK_COMPLETE`` / ``DELETE_FAILED``) is NOT over-blocked --
+            the user should still be able to Start over and choose to delete it.
+
+        Resetting mid-teardown would fire a second background teardown and then wipe
+        the session, leaving the in-flight delete invisible (and, for a custom stack
+        name, unre-discoverable) -- so we block the reset while this is true.
+        """
+        from dsql_migrator.ui.data_migration._status import (
+            _current_job,
+            _is_inflight_stack_status,
+        )
+
+        migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
+        job = _current_job(JOB_MANAGER, getattr(migration_state, "cdc_deploy_job_id", None))
+        if (
+            job is not None
+            and getattr(job, "status", None) in ("PENDING", "RUNNING")
+            and getattr(migration_state, "cdc_action_kind", None) in ("stop", "delete")
+        ):
+            return True
+        return _is_inflight_stack_status(
+            getattr(migration_state, "cdc_stack_phase_status", None)
+        )
+
     def _cdc_probe() -> None:
         """Refresh the cached CDC deployment state from a live, read-only AWS probe.
 
@@ -477,6 +510,7 @@ def build_page(
         on_reset_cdc=_cdc_teardown_on_reset,
         cdc_deployed_getter=_cdc_deployed,
         cdc_stack_name_getter=_cdc_stack_name,
+        cdc_teardown_in_flight_getter=_cdc_teardown_in_flight,
         cdc_probe=_cdc_probe,
         optional_tools={
             _QUERY_PLAYGROUND_VIEW: OptionalTool(

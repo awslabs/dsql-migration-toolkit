@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.37
+
+### 수정 (Fixed)
+
+- **"Start over"가 진행 중인 CDC 정리와 더 이상 경쟁하지 않음.** Start over에서 CDC 파이프라인
+  stop/delete를 선택하면 CloudFormation 스택이 ~15~25분간 `DELETE_IN_PROGRESS` 상태인데, 그동안
+  헤더 "Start over" 버튼이 계속 눌렸고, 리셋이 이미 세션을 지워 버려 두 번째 시도에서는 진행 중인
+  정리를 인식하지 못했습니다(혼란스럽고, 커스텀 스택명이면 MSK/NAT 고아 과금 위험). 이제 **CDC
+  stop/delete가 실제로 진행 중이면 Start over를 차단**합니다: 다이얼로그가 정리가 진행 중임을 알리고
+  Close만 제공(RESET 없음). 감지는 좁게 — 라이브 `*_IN_PROGRESS` 스택 상태 또는 PENDING/RUNNING인
+  stop/delete 작업 — 이라, 정착됐지만 막힌 스택(`ROLLBACK_COMPLETE` / `DELETE_FAILED`)은 여전히
+  리셋해 정리할 수 있습니다. `run_cdc_delete`의 already-deleting 백스톱은 그대로입니다.
+
 ## v0.1.36
 
 ### 추가 (Added)

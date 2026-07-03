@@ -14,7 +14,7 @@ _언어: [English](DEPLOYMENT.md) | **한국어** | [日本語](DEPLOYMENT.ja.md
 
 급하다면, 정상 경로를 순서대로. 각 단계의 상세 내용은 아래 섹션에 있습니다.
 
-1. 실행 위치 선택 (Fargate 권장).
+1. 실행 환경 선택 (테스트 — Local, 실 마이그레이션 — Fargate 권장).
 2. 필수 값 준비.
 3. ACM 인증서 준비.
 4. CloudFormation 템플릿 업로드.
