@@ -72,6 +72,9 @@ def test_load_config_full_load_parallelism_defaults() -> None:
     assert config.full_load_table_parallelism == 4
     assert config.full_load_batch_parallelism == 8
     assert config.full_load_batch_rows == 2000
+    # Reader sharding is OFF by default (one reader, previous behavior).
+    assert config.full_load_reader_shards == 1
+    assert config.full_load_shard_min_rows == 1_000_000
 
 
 def test_load_config_reads_full_load_parallelism() -> None:
@@ -79,11 +82,21 @@ def test_load_config_reads_full_load_parallelism() -> None:
         f"{ENV_PREFIX}FULL_LOAD_TABLE_PARALLELISM": "8",
         f"{ENV_PREFIX}FULL_LOAD_BATCH_PARALLELISM": "16",
         f"{ENV_PREFIX}FULL_LOAD_BATCH_ROWS": "3000",
+        f"{ENV_PREFIX}FULL_LOAD_READER_SHARDS": "4",
+        f"{ENV_PREFIX}FULL_LOAD_SHARD_MIN_ROWS": "500000",
     }
     config = load_config(env=env)
     assert config.full_load_table_parallelism == 8
     assert config.full_load_batch_parallelism == 16
     assert config.full_load_batch_rows == 3000
+    assert config.full_load_reader_shards == 4
+    assert config.full_load_shard_min_rows == 500000
+
+
+def test_load_config_reader_shards_rejects_over_cap() -> None:
+    # Bounded at 8 to keep source read concurrency (table_parallelism x shards) sane.
+    with pytest.raises(ValidationError):
+        load_config(env={f"{ENV_PREFIX}FULL_LOAD_READER_SHARDS": "16"})
 
 
 def test_load_config_full_load_batch_rows_rejects_over_cap() -> None:

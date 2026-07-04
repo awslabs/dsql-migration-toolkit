@@ -56,7 +56,11 @@ from sqlalchemy.engine import Engine
 from dsql_migrator.core.converter import is_spatial_mysql_type, map_mysql_type
 from dsql_migrator.core.introspector import _default_engine_factory
 from dsql_migrator.core.models import ColumnDef, SourceConnectionConfig, TableDef
-from dsql_migrator.core.watermark import COMMIT, START_CONSISTENT_SNAPSHOT
+from dsql_migrator.core.watermark import (
+    COMMIT,
+    START_CONSISTENT_SNAPSHOT,
+    estimate_source_rows,
+)
 
 # Dev row-trace logger (child of the ``dsql_migrator`` package logger, whose level
 # is set from DSQL_MIGRATOR_LOG_LEVEL at app start). Per-page (never per-row) DEBUG
@@ -430,6 +434,78 @@ class ExportCancelled(ExportError):
     """
 
 
+# MySQL integer base types (lower-cased, display width / UNSIGNED / ZEROFILL
+# stripped before matching). Only a single integer PK can be range-sharded: its
+# values are orderable and evenly sliceable by MIN/MAX arithmetic. A composite,
+# string, or other non-integer PK is never sharded (it falls back to one reader).
+_INTEGER_PK_TYPES = frozenset(
+    {"tinyint", "smallint", "mediumint", "int", "integer", "bigint"}
+)
+
+
+def shardable_int_pk(table: TableDef) -> Optional[str]:
+    """Return the PK column name if ``table`` has a single integer PK, else None.
+
+    Reader range sharding (splitting a big table into K disjoint PK ranges read
+    concurrently) only applies to a single integer primary key -- the one case
+    whose values can be evenly sliced by MIN/MAX arithmetic while still using the
+    PK index. Composite / non-integer PKs return None and use one reader.
+    """
+    pk = list(table.primary_key)
+    if len(pk) != 1:
+        return None
+    pk_col = pk[0]
+    for column in table.columns:
+        if column.name == pk_col:
+            base = column.mysql_type.split("(")[0].strip().lower().split()[0]
+            return pk_col if base in _INTEGER_PK_TYPES else None
+    return None
+
+
+def compute_pk_shard_ranges(
+    connection: _Connection, table: TableDef, shards: int
+) -> list[tuple[Optional[int], Optional[int]]]:
+    """Return ``shards`` half-open ``[lo, hi)`` PK ranges covering the whole table.
+
+    Reads ``MIN(pk)`` / ``MAX(pk)`` (index-only, read-only, Property 1) for the
+    single integer PK and splits ``[min, max]`` into ``shards`` contiguous slices.
+    The first range's ``lo`` is ``None`` (open start) and the last range's ``hi``
+    is ``None`` (open end) so the union is guaranteed to cover every row -- even
+    rows inserted outside the sampled [min,max] between this call and the read
+    (the read snapshot fixes the set, but the open ends are belt-and-suspenders).
+    Falls back to a single ``(None, None)`` range (one reader, whole table) when
+    the PK isn't a shardable integer, the table is empty, or ``shards <= 1``.
+
+    The split is **key-domain-uniform** (``[MIN,MAX]`` divided into equal PK-value
+    bands), which balances the shards well for a dense/monotonic key (e.g. AUTO_
+    INCREMENT). For a sparse or clustered key the bands can hold uneven row counts
+    (one hot shard, near-empty others) so the speedup is less than K -- it never
+    hurts correctness (ranges stay disjoint + covering), only balance.
+    """
+    pk_col = shardable_int_pk(table)
+    if pk_col is None or shards <= 1:
+        return [(None, None)]
+    quoted_col = _quote_mysql_identifier(pk_col)
+    quoted_table = _quote_mysql_table(table.name)
+    row = connection.execute(
+        text(f"SELECT MIN({quoted_col}) AS lo, MAX({quoted_col}) AS hi "
+             f"FROM {quoted_table}")
+    ).mappings().first()
+    if not row or row["lo"] is None or row["hi"] is None:
+        return [(None, None)]
+    lo, hi = int(row["lo"]), int(row["hi"])
+    span = hi - lo + 1  # inclusive count of the key domain
+    if span <= shards:
+        return [(None, None)]  # too small to bother splitting
+    step = span // shards
+    ranges: list[tuple[Optional[int], Optional[int]]] = []
+    for i in range(shards):
+        r_lo: Optional[int] = None if i == 0 else lo + i * step
+        r_hi: Optional[int] = None if i == shards - 1 else lo + (i + 1) * step
+        ranges.append((r_lo, r_hi))
+    return ranges
+
+
 def _select_column_sql(column: ColumnDef) -> str:
     """Return the SELECT-list expression for one source column.
 
@@ -451,6 +527,8 @@ def keyset_stream(
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
     should_cancel: Optional[Callable[[], bool]] = None,
+    pk_lower: Optional[int] = None,
+    pk_upper: Optional[int] = None,
 ) -> Iterator[Mapping[str, object]]:
     """Yield ``table`` rows in ascending primary-key order via keyset pagination.
 
@@ -465,6 +543,14 @@ def keyset_stream(
     returns ``True`` the stream raises :class:`ExportCancelled` instead of issuing
     the next ``SELECT``, so a cooperative stop interrupts the read promptly rather
     than only between load batches.
+
+    ``pk_lower`` / ``pk_upper`` (optional, **single integer PK only**) bound the
+    read to the half-open PK range ``[pk_lower, pk_upper)`` — the mechanism behind
+    reader range sharding, where K readers each stream a disjoint slice of a large
+    table concurrently. The bound composes with the keyset cursor (``pk >= :lo AND
+    pk < :hi``), still uses the PK index, and preserves ascending-PK order within
+    the slice. ``pk_upper=None`` means "to the end" (the last shard); ``pk_lower=
+    None`` means "from the start" (the first shard). Ignored for composite keys.
     """
     if batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
@@ -477,6 +563,19 @@ def keyset_stream(
     columns_sql = ", ".join(_select_column_sql(column) for column in table.columns)
     table_sql = _quote_mysql_table(table.name)
     order_by_sql = ", ".join(_quote_mysql_identifier(c) for c in pk_columns)
+
+    # Optional PK-range bound (reader sharding). Only meaningful for a single
+    # integer PK; a composite key ignores it (sharding never enables it there).
+    range_params: dict[str, object] = {}
+    range_clauses: list[str] = []
+    if len(pk_columns) == 1 and (pk_lower is not None or pk_upper is not None):
+        pk_sql_bound = _quote_mysql_identifier(pk_columns[0])
+        if pk_lower is not None:
+            range_clauses.append(f"{pk_sql_bound} >= :pk_lower")
+            range_params["pk_lower"] = pk_lower
+        if pk_upper is not None:
+            range_clauses.append(f"{pk_sql_bound} < :pk_upper")
+            range_params["pk_upper"] = pk_upper
 
     if len(pk_columns) == 1:
         # Single-column key: scalar ``pk > :last`` (one bind param ``last``).
@@ -491,12 +590,17 @@ def keyset_stream(
         placeholders = ", ".join(f":{name}" for name in last_param_names)
         where_sql = f"({keys_sql}) > ({placeholders})"
 
+    # The first page has no keyset cursor yet, so its WHERE is only the range
+    # bound (if any); later pages AND the cursor with the range bound.
+    first_where = " AND ".join(range_clauses)
+    next_where = " AND ".join([where_sql, *range_clauses])
     first_page_sql = (
-        f"SELECT {columns_sql} FROM {table_sql} "
+        f"SELECT {columns_sql} FROM {table_sql}"
+        f"{(' WHERE ' + first_where) if first_where else ''} "
         f"ORDER BY {order_by_sql} LIMIT :batch_size"
     )
     next_page_sql = (
-        f"SELECT {columns_sql} FROM {table_sql} WHERE {where_sql} "
+        f"SELECT {columns_sql} FROM {table_sql} WHERE {next_where} "
         f"ORDER BY {order_by_sql} LIMIT :batch_size"
     )
 
@@ -513,10 +617,10 @@ def keyset_stream(
             raise ExportCancelled(table.name)
         if last_key is None:
             statement = text(first_page_sql)
-            params: dict[str, object] = {"batch_size": batch_size}
+            params: dict[str, object] = {"batch_size": batch_size, **range_params}
         else:
             statement = text(next_page_sql)
-            params = {"batch_size": batch_size}
+            params = {"batch_size": batch_size, **range_params}
             for name, value in zip(last_param_names, last_key):
                 params[name] = value
 
@@ -606,6 +710,39 @@ class TableExporter:
         finally:
             engine.dispose()
 
+    def plan_pk_shard_ranges(
+        self,
+        conn: SourceConnectionConfig,
+        table: TableDef,
+        shards: int,
+        *,
+        min_rows: int = 0,
+    ) -> list[tuple[Optional[int], Optional[int]]]:
+        """Compute up to ``shards`` half-open PK ranges for ``table`` (read-only).
+
+        Opens a short read-only connection and, for a single integer PK, delegates
+        to :func:`compute_pk_shard_ranges` (one ``MIN/MAX`` query). Returns
+        ``[(None, None)]`` — one reader over the whole table, i.e. the current
+        behavior — whenever the table can't or shouldn't be sharded: ``shards <=
+        1``, a composite/non-integer PK, an empty table, or (when ``min_rows`` > 0)
+        a scan-free ``information_schema`` row estimate BELOW ``min_rows`` (small
+        tables don't justify the extra connections/snapshots). Called once per
+        table before the shard readers open their own snapshots.
+        """
+        if shards <= 1 or shardable_int_pk(table) is None:
+            return [(None, None)]
+        engine = self._engine_factory(conn)
+        try:
+            with engine.connect() as connection:
+                ro = connection.execution_options(isolation_level="AUTOCOMMIT")
+                if min_rows > 0:
+                    est = estimate_source_rows(ro, [table.name]).get(table.name)
+                    if est is not None and est < min_rows:
+                        return [(None, None)]
+                return compute_pk_shard_ranges(ro, table, shards)
+        finally:
+            engine.dispose()
+
     def export_table_to_csv_path(
         self,
         conn: SourceConnectionConfig,
@@ -626,6 +763,8 @@ class TableExporter:
         *,
         should_cancel: Optional[Callable[[], bool]] = None,
         target_types: Optional[Mapping[str, str]] = None,
+        pk_lower: Optional[int] = None,
+        pk_upper: Optional[int] = None,
     ) -> "Iterator[Mapping[str, object]]":
         """Yield target-ready (converted) rows from a read-only consistent snapshot.
 
@@ -641,6 +780,12 @@ class TableExporter:
         polls it before each page so a cooperative stop interrupts the read
         between pages (raising :class:`ExportCancelled`) instead of waiting for
         the next load batch.
+
+        ``pk_lower`` / ``pk_upper`` (optional, single integer PK only) bound this
+        stream to a half-open PK slice ``[pk_lower, pk_upper)`` -- one shard of a
+        range-sharded read. Each shard opens its OWN snapshot connection here (the
+        shards are disjoint, so their independently-timed snapshots never overlap a
+        row); see :func:`compute_pk_shard_ranges`.
         """
         converter = ValueConverter(table, target_types=target_types)
         engine = self._engine_factory(conn)
@@ -656,6 +801,8 @@ class TableExporter:
                         table,
                         batch_size=self._batch_size,
                         should_cancel=should_cancel,
+                        pk_lower=pk_lower,
+                        pk_upper=pk_upper,
                     ):
                         yield converter.convert_row(raw)
                 finally:

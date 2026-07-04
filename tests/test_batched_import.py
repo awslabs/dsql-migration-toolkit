@@ -606,6 +606,82 @@ def test_prefetch_close_joins_reader_without_leak() -> None:
     assert after == [], "prefetch reader thread should be joined after close()"
 
 
+def test_batch_chunk_id_namespaces_by_shard() -> None:
+    # Unsharded id is unchanged (byte-for-byte resume compatibility); a sharded id
+    # is namespaced so two shards' index-0 batches never collide.
+    assert batch_chunk_id("orders", 0) == "orders#batch-000000"
+    assert batch_chunk_id("orders", 5) == "orders#batch-000005"
+    assert batch_chunk_id("orders", 0, shard_id=0) == "orders#s00-batch-000000"
+    assert batch_chunk_id("orders", 0, shard_id=1) == "orders#s01-batch-000000"
+    assert (
+        batch_chunk_id("orders", 0, shard_id=0)
+        != batch_chunk_id("orders", 0, shard_id=1)
+    )
+
+
+def test_prefetch_many_merges_all_shards_and_drains_everything() -> None:
+    # K shard readers -> one queue -> the consumer sees every item exactly once.
+    # Order across shards is not guaranteed, so compare as a set.
+    def _shard(values):  # noqa: ANN001
+        return iter(values)
+
+    shards = [_shard(range(0, 10)), _shard(range(10, 20)), _shard(range(20, 30))]
+    out = list(BatchedImporter._prefetch_many(shards, depth=4))
+    assert sorted(out) == list(range(30))
+    assert len(out) == 30  # no drops, no duplicates
+
+
+def test_prefetch_many_empty_shard_list_returns_empty_not_deadlock() -> None:
+    # Guard against the "no producer ever posts _END" hang: an empty work_iters
+    # list must yield nothing and return promptly, not block on the queue forever.
+    out = list(BatchedImporter._prefetch_many([], depth=4))
+    assert out == []
+
+
+def test_prefetch_many_single_shard_still_drains() -> None:
+    # A one-element list is a degenerate merge but must still deliver every item.
+    out = list(BatchedImporter._prefetch_many([iter(range(5))], depth=4))
+    assert out == [0, 1, 2, 3, 4]
+
+
+def test_prefetch_many_reraises_a_shard_exception() -> None:
+    # A failing shard surfaces its error on the consumer (not swallowed on a
+    # worker thread), so the batch failure is reported like the single-reader path.
+    def _ok():
+        yield 1
+        yield 2
+
+    def _boom():
+        yield 3
+        raise RuntimeError("shard read failed")
+
+    gen = BatchedImporter._prefetch_many([_ok(), _boom()], depth=4)
+    with pytest.raises(RuntimeError, match="shard read failed"):
+        list(gen)
+
+
+def test_prefetch_many_joins_all_reader_threads_on_close() -> None:
+    # Closing early (cancel) must stop + join every shard producer -- no leak.
+    def _endless(start):  # noqa: ANN001
+        i = start
+        while True:
+            yield i
+            i += 1
+
+    gen = BatchedImporter._prefetch_many(
+        [_endless(0), _endless(1000), _endless(2000)], depth=2
+    )
+    assert next(gen) is not None
+    gen.close()
+    import time as _t
+    _t.sleep(0.2)
+    leaked = [
+        t for t in threading.enumerate()
+        if t.name.startswith("fullload-prefetch-s")
+    ]
+    assert leaked == [], "all shard prefetch threads should be joined after close()"
+
+
 def test_prefetch_enabled_default_on(monkeypatch: pytest.MonkeyPatch) -> None:
     # Prefetch is ON by default (unset env) so production behavior is unchanged.
     monkeypatch.delenv("DSQL_MIGRATOR_FULL_LOAD_PREFETCH", raising=False)

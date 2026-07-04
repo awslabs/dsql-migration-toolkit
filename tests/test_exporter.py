@@ -34,8 +34,10 @@ from dsql_migrator.core.exporter import (
     UnsupportedPrimaryKeyError,
     ValueConversionError,
     ValueConverter,
+    compute_pk_shard_ranges,
     export_rows,
     keyset_stream,
+    shardable_int_pk,
 )
 from dsql_migrator.core.introspector import is_write_or_ddl
 from dsql_migrator.core.models import ColumnDef, SourceConnectionConfig, TableDef
@@ -46,6 +48,19 @@ from dsql_migrator.core.models import ColumnDef, SourceConnectionConfig, TableDe
 # ---------------------------------------------------------------------------
 
 
+class _FakeMappings:
+    """Mirrors SQLAlchemy's MappingResult: iterable + ``.first()``."""
+
+    def __init__(self, rows: list[dict]) -> None:
+        self._rows = rows
+
+    def __iter__(self):  # noqa: ANN204
+        return iter(self._rows)
+
+    def first(self):  # noqa: ANN201 - mirrors SQLAlchemy MappingResult.first()
+        return self._rows[0] if self._rows else None
+
+
 class _FakeResult:
     """Mirrors the slice of the SQLAlchemy result API the exporter uses."""
 
@@ -53,7 +68,7 @@ class _FakeResult:
         self._rows = rows
 
     def mappings(self):  # noqa: ANN201 - mirrors SQLAlchemy
-        return iter(self._rows)
+        return _FakeMappings(self._rows)
 
 
 class _FakeConnection:
@@ -88,10 +103,23 @@ class _FakeConnection:
         self.page_queries += 1
         params = parameters or {}
         limit = params.get("batch_size")
+        # Honor the optional PK-range bound (reader sharding): [pk_lower, pk_upper).
+        pk_lower = params.get("pk_lower")
+        pk_upper = params.get("pk_upper")
+
+        def _in_range(row) -> bool:  # noqa: ANN001
+            v = row[self._pk]
+            if pk_lower is not None and v < pk_lower:
+                return False
+            if pk_upper is not None and v >= pk_upper:
+                return False
+            return True
+
         if len(self._pk_cols) == 1:
             last = params.get("last")
             candidates = [
-                row for row in self._rows if last is None or row[self._pk] > last
+                row for row in self._rows
+                if (last is None or row[self._pk] > last) and _in_range(row)
             ]
         else:
             if "last_0" in params:
@@ -304,6 +332,138 @@ def test_keyset_stream_rejects_missing_primary_key() -> None:
     )
     with pytest.raises(UnsupportedPrimaryKeyError, match="no primary key"):
         list(keyset_stream(_FakeConnection([]), table))
+
+
+# ---------------------------------------------------------------------------
+# Reader range sharding
+# ---------------------------------------------------------------------------
+
+
+def test_shardable_int_pk_accepts_single_integer_pk() -> None:
+    # A single integer PK is shardable; the helper returns its column name.
+    for mysql_type in ("INT", "BIGINT", "int(11)", "SMALLINT UNSIGNED", "MEDIUMINT"):
+        table = TableDef(
+            name="t",
+            columns=[ColumnDef(name="id", mysql_type=mysql_type)],
+            primary_key=["id"],
+        )
+        assert shardable_int_pk(table) == "id", mysql_type
+
+
+def test_shardable_int_pk_rejects_composite_and_non_integer() -> None:
+    composite = TableDef(
+        name="c",
+        columns=[
+            ColumnDef(name="a", mysql_type="INT"),
+            ColumnDef(name="b", mysql_type="INT"),
+        ],
+        primary_key=["a", "b"],
+    )
+    string_pk = TableDef(
+        name="s",
+        columns=[ColumnDef(name="uid", mysql_type="VARCHAR(36)")],
+        primary_key=["uid"],
+    )
+    assert shardable_int_pk(composite) is None
+    assert shardable_int_pk(string_pk) is None
+
+
+def test_compute_pk_shard_ranges_splits_min_max_into_half_open_ranges() -> None:
+    # MIN=1, MAX=1000, shards=4 -> 4 contiguous ranges; first lo=None, last hi=None
+    # (open ends guarantee full coverage), interior boundaries evenly spaced.
+    class _MinMaxConn:
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            assert "MIN(" in str(statement) and "MAX(" in str(statement)
+            return _FakeResult([{"lo": 1, "hi": 1000}])
+
+    ranges = compute_pk_shard_ranges(_MinMaxConn(), _simple_table(), 4)
+    assert len(ranges) == 4
+    assert ranges[0][0] is None            # open start
+    assert ranges[-1][1] is None           # open end
+    # contiguous: each range's hi == the next range's lo
+    for (lo_a, hi_a), (lo_b, _hi_b) in zip(ranges, ranges[1:]):
+        assert hi_a == lo_b
+    # step = (1000-1+1)//4 = 250, so interior boundaries are 251, 501, 751
+    assert ranges[0][1] == 251
+    assert ranges[1] == (251, 501)
+    assert ranges[2] == (501, 751)
+    assert ranges[3][0] == 751
+
+
+def test_compute_pk_shard_ranges_falls_back_for_small_or_empty_table() -> None:
+    class _EmptyConn:
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            return _FakeResult([{"lo": None, "hi": None}])
+
+    class _TinyConn:
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            return _FakeResult([{"lo": 1, "hi": 3}])  # span 3 <= shards 4
+
+    assert compute_pk_shard_ranges(_EmptyConn(), _simple_table(), 4) == [(None, None)]
+    assert compute_pk_shard_ranges(_TinyConn(), _simple_table(), 4) == [(None, None)]
+    # shards<=1 short-circuits without querying.
+    assert compute_pk_shard_ranges(_EmptyConn(), _simple_table(), 1) == [(None, None)]
+
+
+def test_compute_pk_shard_ranges_composite_pk_is_never_sharded() -> None:
+    composite = TableDef(
+        name="c",
+        columns=[
+            ColumnDef(name="a", mysql_type="INT"),
+            ColumnDef(name="b", mysql_type="INT"),
+        ],
+        primary_key=["a", "b"],
+    )
+    # Even with shards>1, a composite PK returns the single whole-table range.
+    assert compute_pk_shard_ranges(_FakeConnection([]), composite, 4) == [(None, None)]
+
+
+def test_keyset_stream_honors_pk_range_bounds() -> None:
+    # 10 rows, id 1..10; shard [4, 8) must yield exactly ids 4,5,6,7.
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 11)]
+    connection = _FakeConnection(rows)
+    out = list(
+        keyset_stream(
+            connection, _simple_table(), batch_size=100, pk_lower=4, pk_upper=8
+        )
+    )
+    assert [r["id"] for r in out] == [4, 5, 6, 7]
+
+
+def test_keyset_stream_pk_range_open_ends_cover_head_and_tail() -> None:
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 11)]
+    # First shard: (None, 4) -> ids < 4.  Last shard: (8, None) -> ids >= 8.
+    head = list(keyset_stream(_FakeConnection(rows), _simple_table(),
+                              batch_size=100, pk_lower=None, pk_upper=4))
+    tail = list(keyset_stream(_FakeConnection(rows), _simple_table(),
+                              batch_size=100, pk_lower=8, pk_upper=None))
+    assert [r["id"] for r in head] == [1, 2, 3]
+    assert [r["id"] for r in tail] == [8, 9, 10]
+
+
+def test_pk_range_shards_partition_all_rows_without_overlap() -> None:
+    # The union of all shards must equal the whole table, with no row in two shards.
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 21)]
+
+    class _MinMaxConn(_FakeConnection):
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            if "MIN(" in str(statement):
+                return _FakeResult([{"lo": 1, "hi": 20}])
+            return super().execute(statement, parameters)
+
+    ranges = compute_pk_shard_ranges(_MinMaxConn(rows), _simple_table(), 3)
+    seen: list[int] = []
+    for lo, hi in ranges:
+        got = [
+            r["id"]
+            for r in keyset_stream(
+                _FakeConnection(rows), _simple_table(),
+                batch_size=100, pk_lower=lo, pk_upper=hi,
+            )
+        ]
+        seen.extend(got)
+    assert sorted(seen) == list(range(1, 21))   # full coverage
+    assert len(seen) == len(set(seen))           # no overlap
 
 
 def test_keyset_stream_supports_composite_primary_key() -> None:

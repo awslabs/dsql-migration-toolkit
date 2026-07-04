@@ -5,6 +5,22 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.63
+
+### 변경 (Changed)
+
+- **Full Load가 큰 테이블을 여러 리더로 동시에 읽을 수 있습니다(reader range
+  sharding).** 단일 keyset 리더는 CPU-bound(행마다 타입 변환)이라 한 코어 근처에서
+  한계에 이르므로, 큰 테이블의 읽기를 K개의 disjoint 기본 키 범위로 나눠 동시에
+  스트리밍하고 모두 하나의 쓰기 풀에 먹입니다. 기본 꺼짐
+  (`DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS=1`). 단일 **정수** PK이면서 추정 행수가
+  `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS`(기본 1,000,000) 이상인 테이블에만 적용 —
+  복합/비정수 PK와 더 작은 테이블은 항상 단일 리더. 총 소스 리더 수
+  (`table_parallelism × shards`)가 안전 상한을 넘지 않도록 제한됩니다. 단일 일관
+  스냅샷을 유지해야 하는 clean replace 로드(plain INSERT, CDC 없음)에는 샤딩을
+  적용하지 않고, watermark + 멱등 재적재로 샤드별 스냅샷 시점 차이가 안전한 기존
+  데이터/CDC 경로에만 적용합니다. 재개·OCC 처리·쓰기 측 동작에는 변화 없음.
+
 ## v0.1.62
 
 ### 변경 (Changed)

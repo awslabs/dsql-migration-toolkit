@@ -15,7 +15,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable, Mapping, NamedTuple, Optional, Protocol, Sequence, Union
+from typing import (
+    Callable, Iterator, Mapping, NamedTuple, Optional, Protocol, Sequence, Union,
+)
 
 from dsql_migrator.config import SecretValue, load_config
 from dsql_migrator.core.activity_log import (
@@ -334,6 +336,12 @@ FULL_LOAD_SOURCE_READ_TIMEOUT_SECONDS = 300
 # while still advancing the count visibly mid-table; the exact final total is set
 # on completion regardless of this threshold.
 PROGRESS_FLUSH_ROWS = 10_000
+
+# Safety ceiling on concurrent SOURCE snapshot readers = table_parallelism x
+# reader_shards. Each holds a long-lived source connection; this caps the product
+# so a high table_parallelism x reader_shards can't exhaust the source MySQL's
+# max_connections. Reader sharding is clamped down (never up) to honor it.
+_MAX_SOURCE_READERS = 32
 
 
 class _FullLoadStopped(Exception):
@@ -1156,12 +1164,6 @@ class BatchedTableMigrator:
             if applied is not None
             else None
         )
-        rows = self._exporter.stream_converted_rows(
-            self._inputs.source_config,
-            table,
-            should_cancel=should_cancel,
-            target_types=target_types,
-        )
         # If the user confirmed loading this table fresh over existing data, DROP
         # and recreate its empty target first (DSQL has no TRUNCATE); the returned
         # secondary-index DDLs are (re)created after the load.
@@ -1172,9 +1174,64 @@ class BatchedTableMigrator:
             not self._inputs.cdc_coexisting
             and table.name in self._inputs.replace_tables
         )
+
+        # Reader range sharding: for a LARGE single-integer-PK table, split the read
+        # into K disjoint PK ranges streamed concurrently (each its own snapshot), so
+        # the CPU-bound single keyset reader isn't the ceiling. plan_pk_shard_ranges
+        # returns one (None, None) range -- i.e. the original single reader -- for
+        # small tables, composite/non-integer PKs, or when sharding is off (K<=1).
+        #
+        # NOT sharded on the REPLACE path (plain INSERT, no CDC): the K shards each
+        # open an independently-timed CONSISTENT SNAPSHOT, so a source written to
+        # DURING the load could land a cross-shard torn read (one row of a
+        # multi-row source txn in shard A's snapshot, its sibling not yet in shard
+        # B's) -- and with no CDC there is nothing to reconcile it. A single reader
+        # takes ONE snapshot = one point-in-time cut. Sharding is therefore limited
+        # to the idempotent SKIP_EXISTING path (existing data / CDC-coexisting),
+        # where the pre-load watermark + idempotent re-load make per-shard snapshot
+        # skew provably safe. (Snapshot skew across shards never double-loads a row:
+        # the ranges are disjoint.)
+        cfg = load_config()
+        shard_ranges: list = [(None, None)]
+        if not is_replace:
+            # Source-connection guardrail: total concurrent source snapshot readers
+            # = table_parallelism x reader_shards. Clamp the effective shard count so
+            # that product stays under a safe ceiling (each reader holds a long-lived
+            # source connection; unbounded, table_parallelism(<=16) x shards(<=8) =
+            # 128 could exhaust the source's max_connections). The write side is
+            # unaffected (one write pool per table). See config full_load_reader_shards.
+            max_src_readers = _MAX_SOURCE_READERS
+            tp = max(1, cfg.full_load_table_parallelism)
+            effective_shards = max(1, min(cfg.full_load_reader_shards,
+                                          max_src_readers // tp))
+            shard_ranges = self._exporter.plan_pk_shard_ranges(
+                self._inputs.source_config, table, effective_shards,
+                min_rows=cfg.full_load_shard_min_rows,
+            )
+
+        def _shard_stream(
+            lo: "Optional[int]", hi: "Optional[int]"
+        ) -> "Iterator[Mapping[str, object]]":
+            return self._exporter.stream_converted_rows(
+                self._inputs.source_config,
+                table,
+                should_cancel=should_cancel,
+                target_types=target_types,
+                pk_lower=lo,
+                pk_upper=hi,
+            )
+
+        sharded = len(shard_ranges) > 1
+        if sharded:
+            shard_sources = [_shard_stream(lo, hi) for (lo, hi) in shard_ranges]
+            rows: "Iterator[Mapping[str, object]]" = iter(())  # unused when sharded
+        else:
+            lo, hi = shard_ranges[0]
+            shard_sources = None
+            rows = _shard_stream(lo, hi)
+
         if is_replace:
             index_ddls = self._table_recreator(table)
-        if is_replace:
             # Clean load into a freshly-emptied target: plain INSERT (no ON
             # CONFLICT) -- DSQL never silently drops a non-conflicting row.
             load_on_conflict: Optional[OnConflictMode] = OnConflictMode.NONE
@@ -1193,6 +1250,7 @@ class BatchedTableMigrator:
                 on_batch_loaded=on_rows,
                 should_cancel=should_cancel,
                 on_conflict=load_on_conflict,
+                shard_sources=shard_sources,
             )
         except ExportCancelled as exc:
             # A cooperative stop interrupted the source read between pages (the

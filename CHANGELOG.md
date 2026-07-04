@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.63
+
+### Changed
+
+- **Full Load can read a large table with multiple concurrent readers (reader
+  range sharding).** The single keyset reader is CPU-bound (per-row type
+  conversion) and tops out near one core, so a big table's read is now optionally
+  split into K disjoint primary-key ranges streamed concurrently, all feeding the
+  one write pool. Off by default (`DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS=1`); only
+  applies to a table with a single **integer** PK and at least
+  `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` (default 1,000,000) estimated rows —
+  composite/non-integer PKs and smaller tables always use one reader. Bounded so
+  total source readers (`table_parallelism × shards`) stay within a safe ceiling.
+  Sharding is **not** applied on a clean replace load (plain INSERT, no CDC), whose
+  single consistent snapshot must be preserved; it is limited to the idempotent
+  existing-data/CDC path where the watermark + idempotent re-load make per-shard
+  snapshot skew safe. No change to resumability, OCC handling, or the write side.
+
 ## v0.1.62
 
 ### Changed

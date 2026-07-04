@@ -267,6 +267,35 @@ class AppConfig(BaseModel):
             "limits. Config key: DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS."
         ),
     )
+    full_load_reader_shards: int = Field(
+        default=1,
+        ge=1,
+        le=8,
+        description=(
+            "Full Load reader range sharding: how many concurrent readers split a "
+            "LARGE single-integer-PK table's read (each streams a disjoint PK "
+            "range from its own source snapshot). The single keyset reader is "
+            "CPU-bound (per-row type conversion) and tops out near one core, so K "
+            "readers let a big table use more cores. 1 = off (one reader, the "
+            "previous behavior). Only applies to tables with a single integer PK "
+            "and at least full_load_shard_min_rows estimated rows; composite/"
+            "non-integer PKs and smaller tables always use one reader. Raises "
+            "SOURCE read concurrency (total source readers = table_parallelism x "
+            "this) -- keep it modest on a busy source. Bounded (<=8). Config key: "
+            "DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS."
+        ),
+    )
+    full_load_shard_min_rows: int = Field(
+        default=1_000_000,
+        ge=1,
+        description=(
+            "Minimum estimated row count for a table to be reader-range-sharded "
+            "(see full_load_reader_shards). Below this, sharding's extra "
+            "connection/snapshot overhead isn't worth it, so the table uses one "
+            "reader. Uses the scan-free information_schema estimate. Config key: "
+            "DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS."
+        ),
+    )
     activity_log_to_stdout: bool = Field(
         default=False,
         description=(
@@ -331,6 +360,10 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> AppConfig:
         values["full_load_batch_parallelism"] = int(fl_batch_par)
     if (fl_batch_rows := _read(source, "FULL_LOAD_BATCH_ROWS")) is not None:
         values["full_load_batch_rows"] = int(fl_batch_rows)
+    if (fl_shards := _read(source, "FULL_LOAD_READER_SHARDS")) is not None:
+        values["full_load_reader_shards"] = int(fl_shards)
+    if (fl_shard_min := _read(source, "FULL_LOAD_SHARD_MIN_ROWS")) is not None:
+        values["full_load_shard_min_rows"] = int(fl_shard_min)
     if (to_stdout := _read(source, "ACTIVITY_LOG_STDOUT")) is not None:
         # Accept the common truthy spellings; anything else is treated as false.
         values["activity_log_to_stdout"] = to_stdout.lower() in (

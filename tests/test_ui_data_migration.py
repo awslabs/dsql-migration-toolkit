@@ -402,6 +402,16 @@ class _FakeExporter:
         self.streamed: list[str] = []
         self.target_types_by_table: dict[str, object] = {}
         self._rows_by_table = rows_by_table or {}
+        # Tests default to no sharding (one reader), matching an unsharded table.
+        self.shard_ranges_by_table: dict[str, list] = {}
+
+    def plan_pk_shard_ranges(
+        self, conn, table: TableDef, shards: int, *, min_rows: int = 0
+    ) -> list:
+        # Default: a single (None, None) range = one reader (current behavior). A
+        # test can inject multiple ranges via shard_ranges_by_table to exercise
+        # sharding.
+        return self.shard_ranges_by_table.get(table.name, [(None, None)])
 
     def stream_converted_rows(
         self,
@@ -410,10 +420,21 @@ class _FakeExporter:
         *,
         should_cancel=None,
         target_types=None,
+        pk_lower=None,
+        pk_upper=None,
     ) -> list[dict]:
         self.streamed.append(table.name)
         self.target_types_by_table[table.name] = target_types
-        return self._rows_by_table.get(table.name, [{"id": 1}])
+        # When sharded, serve only the rows whose id falls in [pk_lower, pk_upper)
+        # so a K-shard read reconstructs exactly the table (no overlap, no gap).
+        rows = self._rows_by_table.get(table.name, [{"id": 1}])
+        if pk_lower is not None or pk_upper is not None:
+            rows = [
+                r for r in rows
+                if (pk_lower is None or r["id"] >= pk_lower)
+                and (pk_upper is None or r["id"] < pk_upper)
+            ]
+        return rows
 
 
 class _FakeWatermarkCapturer:
@@ -443,9 +464,14 @@ class _FakeImporter:
 
     def import_rows(
         self, rows, table: TableDef, *, index_ddls=None, on_batch_loaded=None,
-        should_cancel=None, on_conflict=None,
+        should_cancel=None, on_conflict=None, shard_sources=None,
     ) -> BatchedImportResult:
-        materialized = list(rows)
+        # When sharded, the engine passes K row streams via shard_sources (and
+        # `rows` is an empty sentinel); otherwise the single `rows` stream is used.
+        if shard_sources is not None:
+            materialized = [row for src in shard_sources for row in src]
+        else:
+            materialized = list(rows)
         self.index_ddls_by_table[table.name] = index_ddls
         self.on_conflict_by_table[table.name] = on_conflict
         self.received.append((table.name, materialized))
@@ -504,6 +530,64 @@ def test_batched_table_migrator_streams_then_loads() -> None:
     assert exporter.streamed == ["orders"]
     assert importer.received == [("orders", [{"id": 1}, {"id": 2}])]
     assert rows.rows_loaded == 2
+
+
+def test_batched_table_migrator_shards_the_read_into_k_streams() -> None:
+    # When plan_pk_shard_ranges returns K ranges, migrate_table opens K shard
+    # streams and passes them to the importer as shard_sources -- together
+    # reconstructing the whole table (disjoint ranges, no overlap or gap).
+    exporter = _FakeExporter(
+        rows_by_table={"orders": [{"id": i} for i in range(1, 7)]}
+    )
+    # 3 shards: (None,3) -> 1,2 ; (3,5) -> 3,4 ; (5,None) -> 5,6
+    exporter.shard_ranges_by_table["orders"] = [(None, 3), (3, 5), (5, None)]
+    importer = _FakeImporter()
+
+    migrator = BatchedTableMigrator(
+        _inputs(),
+        exporter=exporter,  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _inputs: importer,  # type: ignore[arg-type,return-value]
+    )
+
+    result = migrator.migrate_table(_tables()[0])  # orders
+
+    # Three shard streams were opened (one stream_converted_rows call per shard).
+    assert exporter.streamed == ["orders", "orders", "orders"]
+    # The importer received every row across shards, exactly once.
+    loaded_table, loaded_rows = importer.received[0]
+    assert loaded_table == "orders"
+    assert sorted(r["id"] for r in loaded_rows) == [1, 2, 3, 4, 5, 6]
+    assert result.rows_loaded == 6
+
+
+def test_replace_path_is_never_sharded_even_when_ranges_available() -> None:
+    # A clean replace load (plain INSERT, no CDC) must NOT shard: K independently
+    # timed snapshots could produce a cross-shard torn read of a concurrently
+    # written source with nothing to reconcile it. Even though the fake would
+    # offer 3 shard ranges for "orders", the replace path opens ONE stream.
+    import dataclasses
+
+    exporter = _FakeExporter(
+        rows_by_table={"orders": [{"id": i} for i in range(1, 7)]}
+    )
+    exporter.shard_ranges_by_table["orders"] = [(None, 3), (3, 5), (5, None)]
+    importer = _FakeImporter()
+    inputs = dataclasses.replace(_inputs(), replace_tables=frozenset({"orders"}))
+    migrator = BatchedTableMigrator(
+        inputs,
+        exporter=exporter,  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _inputs: importer,  # type: ignore[arg-type,return-value]
+        table_recreator=lambda t: [],
+    )
+
+    migrator.migrate_table(_tables()[0])  # orders (replace)
+
+    # Exactly ONE stream opened (single snapshot), not three shards.
+    assert exporter.streamed == ["orders"]
+    # Loaded as a plain replace (NONE), single source.
+    assert importer.on_conflict_by_table["orders"] == OnConflictMode.NONE
 
 
 def test_batched_table_migrator_recreates_replace_tables_and_passes_index_ddls() -> None:

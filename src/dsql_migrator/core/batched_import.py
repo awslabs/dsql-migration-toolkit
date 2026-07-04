@@ -362,14 +362,33 @@ class BatchedImportResult(BaseModel):
     quarantine_records: list[QuarantineRecord] = Field(default_factory=list)
 
 
-def batch_chunk_id(table_name: str, index: int) -> str:
+def batch_chunk_id(
+    table_name: str, index: int, shard_id: Optional[int] = None
+) -> str:
     """Return the deterministic resumable chunk id for batch ``index``.
 
     Keyset-ordered export (task 8.2) makes batch ``index`` map to the same
     primary-key range on every run, so this id is a stable resumable unit
     (Property 4). Zero-padded so ids sort in batch order.
+
+    ``shard_id`` (reader range sharding): when a large table is read by K
+    concurrent shard readers, each shard restarts its batch ``index`` at 0, so the
+    id must be namespaced by shard to stay unique. ``shard_id=None`` keeps the
+    original single-reader id, so an unsharded table's resume state is byte-for-byte
+    unchanged. A sharded run's ids look like ``table#s00-batch-000000``.
+
+    NOTE on resume with sharding: a sharded ``chunk_id`` is stably mapped to a PK
+    range only if the shard ranges are recomputed identically, i.e. the source
+    ``MIN(pk)``/``MAX(pk)`` are unchanged between runs (K is fixed by config, but the
+    range boundaries come from live MIN/MAX). The Full Load engine does NOT pass a
+    ``job`` into ``import_rows`` (whole-table re-load under idempotent SKIP_EXISTING
+    on resume), so batch-level ``done_ids`` skipping is not exercised for a sharded
+    table today; a future caller that wires ``job=`` with ``shards>1`` must pin the
+    ranges (persist first-run MIN/MAX) before relying on batch-level resume.
     """
-    return f"{table_name}#batch-{index:06d}"
+    if shard_id is None:
+        return f"{table_name}#batch-{index:06d}"
+    return f"{table_name}#s{shard_id:02d}-batch-{index:06d}"
 
 
 def _pg_table_identifier(name: str) -> sql.Identifier:
@@ -576,6 +595,9 @@ class BatchedImporter:
         on_batch_loaded: Optional[Callable[[int, int], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
         on_conflict: Optional[OnConflictMode] = None,
+        shard_sources: Optional[
+            "list[Iterable[Mapping[str, object]]]"
+        ] = None,
     ) -> BatchedImportResult:
         """Load ``rows`` into ``table`` in bounded-parallel idempotent batches.
 
@@ -611,17 +633,35 @@ class BatchedImporter:
 
         done_ids = _done_chunk_ids(job)
         skipped_ids: list[str] = []
-        work_iter = self._iter_work(
-            rows, table, columns, key_columns, done_ids, skipped_ids,
-            effective_on_conflict,
-        )
+        # Reader range sharding: when ``shard_sources`` holds K disjoint-PK-range
+        # row streams, build K work iterators (each ``chunk_id``-namespaced by shard
+        # and appending to ``skipped_ids`` under a lock). Otherwise the single
+        # ``rows`` stream builds one unsharded work iterator -- byte-for-byte the
+        # previous behavior (``shard_id=None`` keeps the original chunk ids).
+        work_iters: list[Iterator[_BatchWork]]
+        if shard_sources:
+            skipped_lock = threading.Lock()
+            work_iters = [
+                self._iter_work(
+                    shard_rows, table, columns, key_columns, done_ids, skipped_ids,
+                    effective_on_conflict, shard_id=i, skipped_lock=skipped_lock,
+                )
+                for i, shard_rows in enumerate(shard_sources)
+            ]
+        else:
+            work_iters = [
+                self._iter_work(
+                    rows, table, columns, key_columns, done_ids, skipped_ids,
+                    effective_on_conflict,
+                )
+            ]
 
         pool = _ConnectionPool(self._connection_factory, self._options.parallelism)
         with self._quarantine_lock:
             self._quarantine = []
         try:
             outcomes, stopped_early = self._run_data_batches(
-                work_iter, pool, on_batch_loaded, should_cancel
+                work_iters, pool, on_batch_loaded, should_cancel
             )
             failures = sum(1 for outcome in outcomes if outcome.status == "FAILED")
             indexes_created = 0
@@ -653,12 +693,19 @@ class BatchedImporter:
         done_ids: set[str],
         skipped_ids: list[str],
         on_conflict: OnConflictMode,
+        shard_id: Optional[int] = None,
+        skipped_lock: Optional[threading.Lock] = None,
     ) -> Iterator[_BatchWork]:
         """Yield a work item per non-skipped batch (consumes rows lazily).
 
         Batches already ``DONE`` (per ``done_ids``) are recorded in ``skipped_ids``
         and their rows are dropped without being loaded -- ``ON CONFLICT`` makes
         re-loading safe, but skipping avoids needless work on resume (Property 4).
+
+        ``shard_id`` namespaces the ``chunk_id`` for one reader shard (batch
+        ``index`` restarts at 0 per shard). ``skipped_lock`` guards ``skipped_ids``
+        when K shard producers append concurrently; ``None`` (single reader) needs
+        no lock.
         """
         columns_tuple = tuple(columns)
         key_tuple = tuple(key_columns)
@@ -666,9 +713,13 @@ class BatchedImporter:
         for index, batch in enumerate(
             _iter_batches(rows, batch_size, MAX_BATCH_BYTES)
         ):
-            chunk_id = batch_chunk_id(table.name, index)
+            chunk_id = batch_chunk_id(table.name, index, shard_id)
             if chunk_id in done_ids:
-                skipped_ids.append(chunk_id)
+                if skipped_lock is not None:
+                    with skipped_lock:
+                        skipped_ids.append(chunk_id)
+                else:
+                    skipped_ids.append(chunk_id)
                 continue
             yield _BatchWork(
                 chunk_id=chunk_id,
@@ -740,9 +791,95 @@ class BatchedImporter:
                     break
             producer.join(timeout=1.0)
 
+    @staticmethod
+    def _prefetch_many(
+        work_iters: "list[Iterator[_BatchWork]]", depth: int
+    ) -> Iterator[_BatchWork]:
+        """Merge K shard readers into one bounded queue feeding a single write pool.
+
+        Reader range sharding: each of ``work_iters`` is one shard's work stream
+        (a disjoint PK range, its own source snapshot connection). K daemon
+        producer threads drain them CONCURRENTLY into one shared ``Queue(maxsize=
+        depth)``, so K source reads overlap each other AND the single write pool --
+        the whole point, since one reader tops out at one CPU core. The consumer
+        (the submit loop) still pulls from ONE queue, so the write side, progress
+        accounting, and OCC budget are unchanged from the single-reader path.
+
+        Order is NOT preserved across shards (batches interleave as shards produce
+        them), which is fine: each batch's ``chunk_id`` already encodes its shard +
+        index, so resume/idempotency is per-batch, not positional. The bound still
+        caps in-flight memory. Any shard's exception is re-raised on the consumer;
+        all producer threads are stopped and joined when the generator closes.
+        """
+        if not work_iters:
+            # No shards -> nothing to produce. Return an empty stream instead of
+            # blocking forever (with zero producers, the "last producer posts _END"
+            # rule would never fire). The caller only routes >1 shard here, so this
+            # is a guard against a future miswire, not a normal path.
+            return
+        _END = object()
+        q: "Queue[object]" = Queue(maxsize=depth)
+        error: list[BaseException] = []
+        stop = threading.Event()
+        remaining = [len(work_iters)]
+        remaining_lock = threading.Lock()
+
+        def _produce(it: "Iterator[_BatchWork]") -> None:
+            try:
+                for item in it:
+                    if stop.is_set():
+                        break
+                    q.put(item)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the consumer
+                error.append(exc)
+                stop.set()  # a failed shard stops the others promptly
+            finally:
+                # The LAST producer to finish posts the single end-of-stream marker.
+                with remaining_lock:
+                    remaining[0] -= 1
+                    last = remaining[0] == 0
+                if last:
+                    q.put(_END)
+
+        producers = [
+            threading.Thread(
+                target=_produce, args=(it,),
+                name=f"fullload-prefetch-s{i:02d}", daemon=True,
+            )
+            for i, it in enumerate(work_iters)
+        ]
+        for p in producers:
+            p.start()
+        try:
+            while True:
+                item = q.get()
+                if item is _END:
+                    break
+                yield item  # type: ignore[misc]
+            if error:
+                raise error[0]
+        finally:
+            stop.set()
+            # A producer blocked on q.put() into a full queue only exits once a slot
+            # frees, so keep draining WHILE any producer is alive -- but bound it by
+            # wall-clock so a producer genuinely wedged mid-page (its source socket
+            # read hasn't timed out yet) can't hold us for minutes. Producers are
+            # daemons: a still-hung one dies with the process / when its read times
+            # out, matching the single-reader _prefetch (which also returns ~1s).
+            deadline = time.monotonic() + 2.0
+            while any(p.is_alive() for p in producers):
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    q.get(timeout=0.05)
+                except Exception:  # noqa: BLE001 - empty within the window; re-check
+                    pass
+            for p in producers:
+                p.join(timeout=1.0)
+
     def _run_data_batches(
         self,
-        work_iter: Iterator[_BatchWork],
+        work_iters: "list[Iterator[_BatchWork]]",
         pool: _ConnectionPool,
         on_batch_loaded: Optional[Callable[[int, int], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
@@ -792,10 +929,21 @@ class BatchedImporter:
         # measurement seam (_prefetch_enabled), so the loop below consumes the raw
         # `work_iter` inline -- the exact pre-prefetch behavior -- letting one image
         # be A/B'd. `.close()` in the finally is safe on a plain generator too.
-        if _prefetch_enabled():
-            prefetched = self._prefetch(work_iter, _prefetch_depth(parallelism))
+        #
+        # With K shard readers (reader range sharding), _prefetch_many runs K
+        # producer threads into one bounded queue; with one reader it's the original
+        # single-producer _prefetch. When prefetch is disabled, a single reader is
+        # consumed inline (K shards still need the merge, so _prefetch_many is used
+        # regardless of the seam -- the seam only reproduces the pre-prefetch,
+        # pre-sharding single-reader path, which by definition has one work-iter).
+        if len(work_iters) > 1:
+            prefetched: Iterator[_BatchWork] = self._prefetch_many(
+                work_iters, _prefetch_depth(parallelism)
+            )
+        elif _prefetch_enabled():
+            prefetched = self._prefetch(work_iters[0], _prefetch_depth(parallelism))
         else:
-            prefetched = work_iter
+            prefetched = work_iters[0]
         with ThreadPoolExecutor(max_workers=parallelism) as executor:
             try:
                 for work in prefetched:
