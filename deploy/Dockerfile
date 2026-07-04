@@ -54,8 +54,9 @@ COPY deploy/cdc-stack/cdc-stack.yaml ./deploy/cdc-stack/cdc-stack.yaml
 # three measurement files are copied (they are also the only scripts/ entries
 # un-ignored in .dockerignore) to keep the image lean -- not the seed/CDC scratch.
 # measure_performance.py imports _e2e_tables at runtime, so both must be present.
-COPY scripts/measure_performance.py scripts/perf_compare.py scripts/_e2e_tables.py \
-     ./scripts/
+# perf_compare.py is NOT bundled: it only compares saved reports and runs locally
+# on the recovered JSONs (deploy/run_measure_on_fargate.sh), never in-container.
+COPY scripts/measure_performance.py scripts/_e2e_tables.py ./scripts/
 
 
 FROM public.ecr.aws/docker/library/python:3.12-slim AS runtime
