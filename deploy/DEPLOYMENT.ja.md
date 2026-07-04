@@ -363,7 +363,7 @@ Data Migration → Validation → Cut over）です。UI が表示されれば�
 | `AlbScheme` | no | `internal` | `internal` または `internet-facing`。**推奨: `internal`**（VPN/Direct Connect/ピアリング経由で到達）。`internet-facing` は Cognito オンの場合のみ使用。 |
 | `CertificateArn` | yes | — | HTTPS (443) リスナー用の ACM 証明書 ARN。 |
 | `ContainerImageUri` | no | 公開された ECR Public イメージ | デフォルトは ECR Public に公開されたイメージ — ビルド不要。制限されたネットワーク（ご自身のプライベート ECR コピー / pull-through キャッシュ）またはカスタムビルドの場合のみオーバーライド。イミュータブルなタグまたはダイジェストを推奨。 |
-| `ContainerCpu` | no | `512` | Fargate タスクの CPU ユニット。**Full Load は CPU バウンド**（ソースリーダーが行ごとに Python で型変換を行う）なので、大規模移行では引き上げること — 同一データの payments+orders ロード実測で **デフォルトの 512 より 4096（4 vCPU）で約 3.8 倍高速**だった。評価用途はデフォルト `512` で十分、実際の TB 級 Full Load には **2048–4096** を推奨。[マニュアル §7.2](../docs/manual/ja/07-performance-and-tuning.md#72-並列度のチューニング) 参照。 |
+| `ContainerCpu` | no | `512` | Fargate タスクの CPU ユニット。**Full Load は CPU バウンド**（ソースリーダーが行ごとに Python で型変換を行う）なので、大規模移行では引き上げること — 同一データの payments+orders ロード実測で **デフォルトの 512 より 4096（4 vCPU）で約 3.8 倍高速**だった。評価用途はデフォルト `512` で十分、実際の TB 級 Full Load には **4096 以上** を推奨。[マニュアル §7.2](../docs/manual/ja/07-performance-and-tuning.md#72-並列度のチューニング) 参照。 |
 | `ContainerMemory` | no | `1024` | Fargate タスクのメモリ（MiB）。CPU に対して有効な値（Fargate は CPU `2048` ならメモリ ≥ 4096、`4096` なら ≥ 8192 が必要）。メモリはテーブルサイズではなく `table_parallelism × batch_parallelism × ~8 MiB` で制限される。 |
 | `AppPort` | no | `8080` | コンテナのリッスンポート。 |
 | `AssignPublicIp` | no | `DISABLED` | NAT なしでタスクをパブリックサブネットで実行するには `ENABLED`（テスト）。**推奨: 本番では `DISABLED` のまま**（NAT ゲートウェイまたは VPC エンドポイント）。 |
