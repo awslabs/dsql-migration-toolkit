@@ -72,6 +72,7 @@ and primary key. A structured :class:`BatchedImportResult` is returned.
 from __future__ import annotations
 
 import logging
+import os
 import random
 import threading
 import time
@@ -139,6 +140,33 @@ MAX_BATCH_BYTES = 8 * 1024 * 1024
 # limits; combined with table-level parallelism upstream (so the total in-flight
 # connections is table_parallelism x this).
 DEFAULT_PARALLELISM = 8
+
+# How many assembled batches a background reader may run AHEAD of the write pool.
+# The source read is single-threaded (one keyset page in flight per table) and,
+# without a buffer, the submit loop pulls the next batch off the reader inline --
+# so page N+1's read never overlaps page N's writes and the write pool starves.
+# A bounded prefetch queue lets a dedicated reader thread stay this many batches
+# ahead, overlapping read and write, while the bound keeps in-flight memory
+# capped (Property 2). Sized to comfortably feed a full write pool without letting
+# the reader race unboundedly ahead: ~2x the parallelism, floor of a few.
+def _prefetch_depth(parallelism: int) -> int:
+    """Bounded prefetch queue depth for a write pool of ``parallelism`` workers."""
+    return max(4, parallelism * 2)
+
+
+# Measurement seam ONLY. Prefetch is ON by default (production behavior is
+# unchanged); setting DSQL_MIGRATOR_FULL_LOAD_PREFETCH to a falsey value ("0",
+# "false", "no", "off") makes the loader consume the source reader inline again --
+# i.e. the exact pre-prefetch code path. This exists so a SINGLE deployed image can
+# be A/B'd in-VPC (flag on vs off) instead of building two images from two commits;
+# ECS RunTask can flip the env var per task. Nothing in the normal app reads or sets
+# it, so it has no effect on a real migration.
+def _prefetch_enabled() -> bool:
+    """Whether the read-ahead prefetch queue is enabled (default True)."""
+    raw = os.environ.get("DSQL_MIGRATOR_FULL_LOAD_PREFETCH")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
 def _is_transient_connection_error(exc: BaseException) -> bool:
@@ -651,6 +679,67 @@ class BatchedImporter:
                 rows=tuple(batch),
             )
 
+    @staticmethod
+    def _prefetch(
+        work_iter: Iterator[_BatchWork], depth: int
+    ) -> Iterator[_BatchWork]:
+        """Read ``work_iter`` on a background thread, buffering up to ``depth`` items.
+
+        The underlying iterator is a single-threaded source reader: pulling the
+        next batch issues the next keyset page + per-row conversion. Consuming it
+        inline on the submit thread serializes read and write. This wrapper runs a
+        dedicated producer thread that keeps reading ahead into a bounded queue
+        (maxsize=``depth``), so page N+1's read overlaps page N's writes while the
+        write pool drains -- the queue's bound preserves the bounded-memory
+        guarantee (Property 2): the reader blocks on ``put`` once ``depth`` batches
+        are buffered.
+
+        Yields items in order. A producer exception is re-raised on the consumer
+        thread (after the already-buffered items are drained is NOT required -- we
+        surface it promptly so the batch failure is reported the same as before).
+        The producer thread is a daemon and is joined when the generator is closed
+        (consumer stops early, e.g. on cancel), so no thread leaks.
+        """
+        # Sentinels distinguish clean end-of-stream from a producer error.
+        _END = object()
+        q: "Queue[object]" = Queue(maxsize=depth)
+        error: list[BaseException] = []
+        stop = threading.Event()
+
+        def _produce() -> None:
+            try:
+                for item in work_iter:
+                    if stop.is_set():
+                        break
+                    q.put(item)  # blocks when the buffer is full (backpressure)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the consumer
+                error.append(exc)
+            finally:
+                q.put(_END)
+
+        producer = threading.Thread(
+            target=_produce, name="fullload-prefetch", daemon=True
+        )
+        producer.start()
+        try:
+            while True:
+                item = q.get()
+                if item is _END:
+                    break
+                yield item  # type: ignore[misc]
+            if error:
+                raise error[0]
+        finally:
+            # Consumer stopped (cancel / exhausted / exception): tell the producer
+            # to stop and drain any buffered item so its put() unblocks, then join.
+            stop.set()
+            while producer.is_alive():
+                try:
+                    q.get_nowait()
+                except Exception:  # noqa: BLE001 - empty; producer is exiting
+                    break
+            producer.join(timeout=1.0)
+
     def _run_data_batches(
         self,
         work_iter: Iterator[_BatchWork],
@@ -692,17 +781,37 @@ class BatchedImporter:
                 ):
                     on_batch_loaded(outcome.rows_loaded, outcome.conflicts)
 
+        # Read source pages AHEAD of the write pool on a dedicated thread so page
+        # N+1's read overlaps page N's writes (the single serial reader would
+        # otherwise starve the pool). The prefetch queue is bounded, preserving the
+        # bounded-memory guarantee; closing the generator (below / on cancel) stops
+        # and joins the reader thread. Nothing else in the loop changes: `work` is
+        # the same _BatchWork, just delivered pre-read.
+        #
+        # The prefetch wrapper is a no-op passthrough when disabled via the
+        # measurement seam (_prefetch_enabled), so the loop below consumes the raw
+        # `work_iter` inline -- the exact pre-prefetch behavior -- letting one image
+        # be A/B'd. `.close()` in the finally is safe on a plain generator too.
+        if _prefetch_enabled():
+            prefetched = self._prefetch(work_iter, _prefetch_depth(parallelism))
+        else:
+            prefetched = work_iter
         with ThreadPoolExecutor(max_workers=parallelism) as executor:
-            for work in work_iter:
-                if should_cancel is not None and should_cancel():
-                    # Stop pulling new batches; remaining rows stay unloaded so
-                    # the table is reported incomplete (retryable, idempotent).
-                    stopped_early = True
-                    break
-                future = executor.submit(self._load_batch, work, pool)
-                in_flight[future] = work.chunk_id
-                if len(in_flight) >= parallelism:
-                    drain_one()
+            try:
+                for work in prefetched:
+                    if should_cancel is not None and should_cancel():
+                        # Stop pulling new batches; remaining rows stay unloaded so
+                        # the table is reported incomplete (retryable, idempotent).
+                        stopped_early = True
+                        break
+                    future = executor.submit(self._load_batch, work, pool)
+                    in_flight[future] = work.chunk_id
+                    if len(in_flight) >= parallelism:
+                        drain_one()
+            finally:
+                # Stop + join the reader thread promptly on cancel/early-exit
+                # (also runs on the normal exhausted path -- a no-op there).
+                prefetched.close()
             while in_flight:
                 drain_one()
         return outcomes, stopped_early

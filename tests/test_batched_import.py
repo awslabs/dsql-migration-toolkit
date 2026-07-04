@@ -37,6 +37,7 @@ from dsql_migrator.core.batched_import import (
     BatchedImportOptions,
     BatchedImportResult,
     OnConflictMode,
+    _prefetch_enabled,
     batch_chunk_id,
     build_insert_statement,
 )
@@ -534,6 +535,98 @@ def test_import_stops_early_when_should_cancel_becomes_true() -> None:
     assert result.cancelled is True
     assert 0 < result.rows_loaded < 10
     assert len(store.rows) == result.rows_loaded
+
+
+def test_prefetch_preserves_order_and_drains_all() -> None:
+    # The bounded prefetch wrapper must yield every item in the SAME order the
+    # underlying reader produced them (batches map to fixed PK ranges -- order is
+    # load correctness, not cosmetics).
+    src = iter(range(50))
+    out = list(BatchedImporter._prefetch(src, depth=4))
+    assert out == list(range(50))
+
+
+def test_prefetch_runs_reader_ahead_of_consumer() -> None:
+    # The whole point: the reader keeps producing while the consumer is slow, so
+    # by the time the consumer takes item 0 the reader has already produced more
+    # than one item (overlap), bounded by `depth`. We record production timing.
+    produced: list[int] = []
+
+    def _slow_reader():
+        for i in range(10):
+            produced.append(i)
+            yield i
+
+    gen = BatchedImporter._prefetch(_slow_reader(), depth=4)
+    first = next(gen)  # consume just one
+    assert first == 0
+    # Give the background reader a moment to fill the bounded queue.
+    import time as _t
+    _t.sleep(0.1)
+    # It should have read ahead (more than the 1 we consumed), but not the whole
+    # stream unboundedly -- capped near depth + the in-flight item.
+    assert len(produced) > 1
+    assert len(produced) <= 4 + 2  # depth buffered + one in `put` + margin
+    gen.close()  # stop + join the reader thread (no leak)
+
+
+def test_prefetch_reraises_reader_exception() -> None:
+    # A source-read error must surface on the consumer, not vanish on the reader
+    # thread, so the batch failure is reported exactly as before.
+    def _boom():
+        yield 1
+        yield 2
+        raise RuntimeError("source read failed")
+
+    gen = BatchedImporter._prefetch(_boom(), depth=4)
+    got = []
+    with pytest.raises(RuntimeError, match="source read failed"):
+        for item in gen:
+            got.append(item)
+    assert got == [1, 2]  # items before the error are still delivered in order
+
+
+def test_prefetch_close_joins_reader_without_leak() -> None:
+    # Closing the generator early (e.g. on cancel) must stop and join the reader
+    # thread so no fullload-prefetch thread lingers.
+    before = {t.name for t in threading.enumerate()}
+
+    def _endless():
+        i = 0
+        while True:
+            yield i
+            i += 1
+
+    gen = BatchedImporter._prefetch(_endless(), depth=2)
+    assert next(gen) == 0
+    gen.close()
+    import time as _t
+    _t.sleep(0.2)
+    after = [t for t in threading.enumerate() if t.name == "fullload-prefetch"]
+    assert after == [], "prefetch reader thread should be joined after close()"
+
+
+def test_prefetch_enabled_default_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Prefetch is ON by default (unset env) so production behavior is unchanged.
+    monkeypatch.delenv("DSQL_MIGRATOR_FULL_LOAD_PREFETCH", raising=False)
+    assert _prefetch_enabled() is True
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("1", True), ("true", True), ("TRUE", True), ("yes", True), ("on", True),
+        ("0", False), ("false", False), ("False", False), ("no", False),
+        ("off", False), ("", False), ("  off  ", False),
+    ],
+)
+def test_prefetch_enabled_env_toggle(
+    monkeypatch: pytest.MonkeyPatch, value: str, expected: bool
+) -> None:
+    # The measurement seam: falsey values disable the read-ahead queue so a single
+    # deployed image can be A/B'd (prefetch on vs off) in-VPC via an ECS env var.
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_PREFETCH", value)
+    assert _prefetch_enabled() is expected
 
 
 def test_import_binds_values_and_does_not_interpolate() -> None:

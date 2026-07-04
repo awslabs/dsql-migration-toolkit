@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.62
+
+### 변경 (Changed)
+
+- **Full Load가 쓰기 풀보다 앞서 읽습니다(bounded prefetch 큐).** 소스 리더가
+  전용 백그라운드 스레드에서 bounded 큐를 채워, page N+1 읽기가 page N 쓰기와
+  겹칩니다(기존에는 읽기·쓰기가 직렬). 큐 상한이 쓰기 병렬도의 ~2배로 잡혀 메모리는
+  여전히 bounded이고, 적재 순서는 그대로(배치는 여전히 고정 PK 범위에 매핑),
+  중단/취소 시 리더 스레드를 join하므로 스레드 누수도 없습니다. 기본 켜짐이며,
+  측정용 seam(`DSQL_MIGRATOR_FULL_LOAD_PREFETCH=0`)으로 끄면 이전 경로를 그대로
+  재현해 A/B 벤치마크를 할 수 있습니다. 적재 정확성·재개 동작에는 변화 없음.
+
 ## v0.1.61
 
 ### 변경 (Changed)

@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.62
+
+### Changed
+
+- **Full Load reads ahead of the write pool (bounded prefetch queue).** The source
+  reader now fills a bounded queue from a dedicated background thread, so reading
+  page N+1 overlaps writing page N instead of the two running serially. Memory
+  stays bounded (the queue is capped at ~2× the write parallelism), the load order
+  is unchanged (batches still map to fixed PK ranges), and the reader thread is
+  joined on stop/cancel so nothing leaks. On by default; a measurement seam
+  (`DSQL_MIGRATOR_FULL_LOAD_PREFETCH=0`) can disable it to reproduce the previous
+  path for A/B benchmarking. No change to load correctness or resumability.
+
 ## v0.1.61
 
 ### Changed

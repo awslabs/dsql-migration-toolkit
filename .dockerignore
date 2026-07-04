@@ -11,6 +11,14 @@ deploy/
 # ...but the CDC infra deploy reads this template at runtime, so it must be in the
 # build context for the Dockerfile COPY (see deploy/Dockerfile).
 !deploy/cdc-stack/cdc-stack.yaml
+# ...and the perf-measurement scripts must be in the context so a one-shot in-VPC
+# RunTask can run `python scripts/measure_performance.py full-load ...` on the SAME
+# deployed image (deploy/Dockerfile COPYs scripts/; deploy/run_measure_on_fargate.sh
+# drives it). Only the three measurement files are un-ignored -- the rest of scripts/
+# (seed/CDC scratch, big data generators) stays out to keep the image lean.
+!scripts/measure_performance.py
+!scripts/perf_compare.py
+!scripts/_e2e_tables.py
 .env
 .env.*
 *.log

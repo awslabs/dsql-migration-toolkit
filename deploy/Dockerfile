@@ -45,6 +45,18 @@ COPY connectors/plugins/offset-seeder-lambda.zip \
 # Only the single template is copied (not the rest of deploy/cdc-stack/ scratch).
 COPY deploy/cdc-stack/cdc-stack.yaml ./deploy/cdc-stack/cdc-stack.yaml
 
+# Bundle the perf-measurement scripts. They add NO extra dependencies
+# (pymysql/sqlalchemy/psycopg are already installed above) and are NOT used by the
+# default `ui` entrypoint, so they don't affect the app -- they let the SAME deployed
+# image run a one-shot measurement task in the same VPC as the source/target (e.g.
+# `RunTask` overriding the command with `python scripts/measure_performance.py
+# full-load ...`), which is the only way to measure real in-VPC throughput. Only the
+# three measurement files are copied (they are also the only scripts/ entries
+# un-ignored in .dockerignore) to keep the image lean -- not the seed/CDC scratch.
+# measure_performance.py imports _e2e_tables at runtime, so both must be present.
+COPY scripts/measure_performance.py scripts/perf_compare.py scripts/_e2e_tables.py \
+     ./scripts/
+
 
 FROM public.ecr.aws/docker/library/python:3.12-slim AS runtime
 
