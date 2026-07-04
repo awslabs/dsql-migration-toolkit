@@ -85,6 +85,30 @@ streaming (resumable, bounded memory), DSQL-envelope-aware batching, statement
 changes so the sink can fall behind during an OCC retry burst **without** losing
 events or stalling the source's binlog rotation.
 
+### Reading ahead of the write pool (bounded prefetch queue)
+
+A single source table streams from **one** MySQL connection: pulling the next
+keyset page issues the next `SELECT … WHERE pk > :last LIMIT :page` plus per-row
+type conversion. If that read ran inline on the same thread that dispatches
+writes, page *N+1*'s read would only start **after** page *N*'s batch was
+submitted — read and write serialized, and the bounded write pool would sit idle
+during each read. The loader instead runs a **dedicated reader thread** that fills
+a **bounded queue** (depth ≈ 2× the write parallelism), so page *N+1* is read
+**while** page *N*'s `INSERT … ON CONFLICT` batches are still draining. The bound
+preserves the streaming memory guarantee (the reader blocks once the queue is
+full — it can't race unboundedly ahead), and load order is unchanged (batches
+still map to fixed PK ranges, so a stop/retry is still deterministic).
+
+This overlap helps most exactly where a real migration runs — **in-VPC, with
+adequate task CPU** — where the write side (network round-trips to DSQL, already
+issued in parallel) is what the reader can hide behind. On a measured in-VPC 4 vCPU
+run it was **~19% faster** than with the queue disabled. It is on by default; a
+measurement seam (`DSQL_MIGRATOR_FULL_LOAD_PREFETCH=0`) can disable it to reproduce
+the pre-prefetch path for A/B benchmarking. On a **CPU-starved** task (see §7.2) or
+a **high-RTT** link where the read isn't the thing on the critical path, the gain
+shrinks toward zero — which is why the tool leans on adequate CPU rather than this
+optimization alone.
+
 ### Short-lived IAM token refresh in long-running CDC
 
 DSQL uses **IAM-token auth only** (no static password), tokens are **short-lived**
@@ -110,6 +134,7 @@ variables, CDC via CloudFormation parameters.
 | `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | 4 | ≤ 16 | How many tables load concurrently. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | ≤ 32 | In-flight `INSERT … ON CONFLICT` batches per table. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | 2000 | ≤ 3000 | Rows per batched write (hard-capped at DSQL's 3000-row limit). |
+| `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1` (on) | on/off | Read-ahead prefetch queue (§7.1). **Leave on** — set `0` only to reproduce the pre-prefetch path for A/B benchmarking. |
 
 > **Connection-quota guardrail.** Total concurrent DSQL connections ≈
 > `table_parallelism × batch_parallelism` (the default 4 × 8 = 32). DSQL allows up
@@ -162,11 +187,17 @@ parameters, passed when the tool deploys the cdc-stack.
 > task-definition `environment` for the values you want to **persist** across
 > restarts, and use the UI control to **experiment** live.
 
-Also size the **Fargate
-task CPU/memory** (`ContainerCpu` / `ContainerMemory`) to match the parallelism:
-~1 vCPU / 2 GiB is a reasonable starting point for a multi-table Full Load, since
-memory is bounded by `table_parallelism × batch_parallelism × ~8 MiB` of row
-buffers, not by table size.
+Also size the **Fargate task CPU** (`ContainerCpu`) generously — **Full Load is
+CPU-bound**, not network-bound. The source reader converts every row's MySQL type
+to its DSQL form in Python (per-cell, GIL-held), so throughput scales with CPU:
+in a measured payments+orders load, **4 vCPU ran ~3.8× faster than the 0.5 vCPU
+(512) default** on the same data. Use **0.5–1 vCPU for evaluation**, but **2–4 vCPU
+for a real TB-scale Full Load**. Beyond ~4 vCPU returns diminish for a single large
+table — the reader is one thread and tops out near one core, so the next lever is
+sharding the read across PK ranges (a future enhancement), not more vCPU. **Memory**
+(`ContainerMemory`) is bounded by `table_parallelism × batch_parallelism × ~8 MiB`
+of row buffers, not by table size — Fargate's CPU/memory pairing (≥ 4 GiB at 2 vCPU,
+≥ 8 GiB at 4 vCPU) already covers it.
 
 > **Local runs** read the same environment variables — set them in your shell or
 > `.env` before launching `mysql-dsql-migrator ui`.

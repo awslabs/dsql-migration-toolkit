@@ -74,6 +74,25 @@ DSQL은 노드가 저장소를 공유하지 않는(shared-nothing) 분산·서�
 내구성 있게 버퍼링하므로 싱크가 OCC 재시도 폭주 중 뒤처져도 이벤트를 잃거나 소스 binlog 로테이션을
 막지 않습니다.
 
+### 쓰기 풀보다 앞서 읽기 (bounded prefetch 큐)
+
+하나의 소스 테이블은 **하나의** MySQL 커넥션에서 스트리밍됩니다: 다음 keyset 페이지를
+가져오려면 다음 `SELECT … WHERE pk > :last LIMIT :page`와 행별 타입 변환이 필요합니다.
+이 읽기가 쓰기를 디스패치하는 같은 스레드에서 인라인으로 돌면, 페이지 *N+1* 읽기는 페이지
+*N*의 배치가 제출된 **뒤에야** 시작됩니다 — 읽기·쓰기가 직렬화되고, 각 읽기 동안 한정 쓰기
+풀이 놀게 됩니다. 로더는 대신 **전용 리더 스레드**가 **bounded 큐**(깊이 ≈ 쓰기 병렬수의
+2배)를 채워, 페이지 *N*의 `INSERT … ON CONFLICT` 배치가 아직 빠지는 **동안** 페이지 *N+1*을
+읽습니다. 상한이 스트리밍 메모리 보장을 유지하고(큐가 차면 리더가 멈춤 — 무한정 앞서 못 감),
+적재 순서는 불변입니다(배치는 여전히 고정 PK 범위에 매핑되어 stop/retry가 결정적).
+
+이 겹침은 실제 마이그레이션이 도는 곳 — **in-VPC, 적정 태스크 CPU** — 에서 가장 큰 효과를
+냅니다. 리더가 뒤에 숨길 수 있는 쓰기 측(DSQL로의 네트워크 왕복, 이미 병렬로 발행됨)이 거기서
+지배적이기 때문입니다. in-VPC 4 vCPU 실측에서 큐를 끈 것보다 **약 19% 빨랐습니다**. 기본
+켜짐이며, 측정용 seam(`DSQL_MIGRATOR_FULL_LOAD_PREFETCH=0`)으로 끄면 pre-prefetch 경로를
+그대로 재현해 A/B 벤치마크를 할 수 있습니다. **CPU가 부족한** 태스크(§7.2)나 읽기가 크리티컬
+패스가 아닌 **고RTT** 링크에서는 이득이 0에 수렴합니다 — 그래서 도구는 이 최적화 하나가 아니라
+적정 CPU에 기댑니다.
+
 ### 장기 CDC에서 단기 IAM 토큰 갱신
 
 DSQL은 **IAM 토큰 인증만**(정적 비밀번호 없음) 쓰고, 토큰은 **단기**(~15분)이며 **연결은 60분 후
@@ -96,6 +115,7 @@ CloudFormation 파라미터로.
 | `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | 4 | ≤ 16 | 동시에 적재하는 테이블 수. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | ≤ 32 | 테이블당 동시 진행 `INSERT … ON CONFLICT` 배치 수. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | 2000 | ≤ 3000 | 배치 쓰기당 행 수(DSQL 3000행 하드 상한). |
+| `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1`(켜짐) | 켜짐/꺼짐 | 읽기 선행 prefetch 큐(§7.1). **켜 두세요** — A/B 벤치마크로 pre-prefetch 경로를 재현할 때만 `0`. |
 
 > **연결 쿼터 가드레일.** 총 동시 DSQL 연결 ≈ `table_parallelism × batch_parallelism`(기본 4 × 8 = 32).
 > DSQL은 **클러스터당 최대 10,000 연결**을 허용하지만 **초당 신규 100 연결**만 가능하므로, 곱을 쿼터 내에
@@ -141,10 +161,15 @@ environment(또는 자체 태스크 정의)에 추가하고 재배포하세요. 
 > 수정·재배포 불필요. 앱 전역(단일 태스크)이며 재시작 시 배포/시작 값으로 리셋되므로, **영구히 유지**할
 > 값은 태스크 정의 `environment`에 설정하고, UI 컨트롤은 **실험**용으로 쓰세요.
 
-또한 **Fargate 태스크 CPU/메모리**(`ContainerCpu` /
-`ContainerMemory`)를 병렬수에 맞게 사이징하세요. 메모리 사용량은 테이블 크기가 아니라 행 버퍼 크기, 즉
-`table_parallelism × batch_parallelism × 약 8 MiB`로 정해집니다. 따라서 여러 테이블을 함께 적재하는 Full
-Load라면 약 1 vCPU / 2 GiB가 합리적인 출발점입니다.
+또한 **Fargate 태스크 CPU**(`ContainerCpu`)를 넉넉히 사이징하세요 — **Full Load는 네트워크가
+아니라 CPU-bound**입니다. 소스 리더가 행마다 MySQL 타입을 DSQL 형식으로 Python에서(셀 단위,
+GIL 점유) 변환하므로 처리량이 CPU에 비례합니다: payments+orders 로드 실측에서 **동일 데이터의
+0.5 vCPU(512) 기본값보다 4 vCPU에서 약 3.8배 빨랐습니다**. **평가용은 0.5–1 vCPU**, **실제 TB급
+Full Load에는 2–4 vCPU**를 쓰세요. 단일 큰 테이블은 ~4 vCPU를 넘으면 수확체감입니다 — 리더가
+한 스레드라 한 코어 근처에서 한계에 이르므로, 다음 레버는 vCPU가 아니라 PK 범위로 읽기를 샤딩하는
+것(향후 개선)입니다. **메모리**(`ContainerMemory`)는 테이블 크기가 아니라 행 버퍼의
+`table_parallelism × batch_parallelism × 약 8 MiB`로 제한되며, Fargate의 CPU/메모리 짝(2 vCPU면
+≥ 4 GiB, 4 vCPU면 ≥ 8 GiB)이 이미 이를 충족합니다.
 
 > **로컬 실행**도 동일 환경 변수를 읽습니다 — `mysql-dsql-migrator ui` 실행 전 셸이나 `.env`에 설정하세요.
 
