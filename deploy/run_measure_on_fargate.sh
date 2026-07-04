@@ -72,6 +72,7 @@ REGION="${AWS_REGION:-$(aws configure get region || true)}"
 [ -z "${REGION}" ] && { echo "error: set AWS_REGION." >&2; exit 1; }
 [ -z "${DB_HOST:-}" ] && { echo "error: set DB_HOST (source MySQL)." >&2; exit 1; }
 [ -z "${DB_PASSWORD:-}" ] && { echo "error: set DB_PASSWORD (source MySQL)." >&2; exit 1; }
+[ -z "${TARGET_ENDPOINT:-}" ] && { echo "error: set TARGET_ENDPOINT (Aurora DSQL cluster endpoint; the app task-def does not bake one in). Source it from .env." >&2; exit 1; }
 
 q() { aws cloudformation describe-stacks --stack-name "${APP_STACK}" --region "${REGION}" \
         --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue|[0]" --output text; }
@@ -83,9 +84,11 @@ SERVICE="$(q ServiceName)"
 echo "==> Cluster: ${CLUSTER}  Service: ${SERVICE}  Region: ${REGION}"
 
 # Reuse the service's task definition + network config (subnets/SG/public-IP), so
-# the measurement task lands on the same network path as the app.
-TASK_DEF="$(aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE}" \
-  --region "${REGION}" --query "services[0].taskDefinition" --output text)"
+# the measurement task lands on the same network path as the app. TASK_DEF can be
+# overridden (e.g. a revision pinned to a freshly built image tag) so the measurement
+# runs a different image than the live UI service without redeploying that service.
+TASK_DEF="${TASK_DEF:-$(aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE}" \
+  --region "${REGION}" --query "services[0].taskDefinition" --output text)}"
 NETCFG="$(aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE}" \
   --region "${REGION}" --query "services[0].networkConfiguration" --output json)"
 echo "==> Task definition: ${TASK_DEF}"
@@ -102,6 +105,11 @@ mkdir -p "${OUT_DIR}"
 
 # Build the container command for one variant. Wraps the measure run so the JSON
 # report is echoed to stdout between markers for CloudWatch recovery.
+#
+# The measurement task-def sets entryPoint=["/bin/sh","-c"] (overriding the image's
+# `mysql-dsql-migrator` ENTRYPOINT, which an ECS command override alone can NOT do --
+# containerOverrides has no entryPoint field). So the command override is a
+# SINGLE-element array holding the shell string that `sh -c` runs.
 build_cmd_json() {
   local report_path="$1"
   python3 - "$MEASURE_SCHEMA" "$MEASURE_TABLES" "$TABLE_PARALLELISM" "$BATCH_PARALLELISM" \
@@ -115,25 +123,33 @@ if tables.strip():
     measure += ["--tables", *tables.split()]
 if no_prefetch == "1":
     measure += ["--no-prefetch"]
-# sh -c: run the measure, then emit the report between markers so the wrapper can
-# recover it from CloudWatch Logs (the task's /tmp is lost when it stops).
+# Run the measure, then emit the report between markers so the wrapper can recover
+# it from CloudWatch Logs (the task's /tmp is lost when it stops). The report JSON
+# has no trailing newline, so a bare `cat` would print `}===REPORT-END===` on one
+# line and the marker-strip would drop the closing brace -> invalid JSON. Emit the
+# markers on their OWN lines (echo before/after, and a newline after cat).
 inner = (" ".join(measure) +
-         " ; echo '===REPORT-BEGIN==='"
-         " ; cat " + report +
+         " ; echo '' ; echo '===REPORT-BEGIN==='"
+         " ; cat " + report + " ; echo ''"
          " ; echo '===REPORT-END==='")
-print(json.dumps(["sh", "-c", inner]))
+print(json.dumps([inner]))  # single arg for `sh -c`
 PY
 }
 
-# Overrides: container command + source-DB env (target DSQL comes from the task-def
-# env + IAM task role). Adds DSQL_MIGRATOR_FULL_LOAD_PREFETCH for the variant.
+# Overrides: container command + source-DB env + target-DSQL env. The app task-def
+# does NOT bake in a DSQL target (the UI collects it interactively), so the measure
+# script's TARGET_ENDPOINT/REGION/DATABASE/USERNAME must be passed here (from the
+# caller's env, typically sourced from .env). The DSQL IAM auth uses the task role.
+# Adds DSQL_MIGRATOR_FULL_LOAD_PREFETCH for the variant.
 build_overrides_json() {
   local cmd_json="$1" prefetch_env="$2"
   python3 - "$cmd_json" "$DB_HOST" "$DB_PORT" "$DB_USER" "$DB_PASSWORD" "$MEASURE_SCHEMA" \
-            "$CONTAINER" "$prefetch_env" <<'PY'
+            "$CONTAINER" "$prefetch_env" \
+            "${TARGET_ENDPOINT:-}" "${TARGET_REGION:-}" "${TARGET_DATABASE:-}" "${TARGET_USERNAME:-}" <<'PY'
 import json, sys
 cmd = json.loads(sys.argv[1])
 host, port, user, pw, schema, container, prefetch = sys.argv[2:9]
+tgt_ep, tgt_region, tgt_db, tgt_user = sys.argv[9:13]
 env = [
     {"name": "DB_HOST", "value": host},
     {"name": "DB_PORT", "value": port},
@@ -142,6 +158,12 @@ env = [
     {"name": "CDC_WORKLOAD_SCHEMA", "value": schema},
     {"name": "DSQL_MIGRATOR_FULL_LOAD_PREFETCH", "value": prefetch},
 ]
+# Target DSQL (only set the ones provided; measure_performance defaults region from
+# the endpoint and database/username to postgres/admin).
+for name, val in (("TARGET_ENDPOINT", tgt_ep), ("TARGET_REGION", tgt_region),
+                  ("TARGET_DATABASE", tgt_db), ("TARGET_USERNAME", tgt_user)):
+    if val:
+        env.append({"name": name, "value": val})
 print(json.dumps({"containerOverrides": [
     {"name": container, "command": cmd, "environment": env}
 ]}))
@@ -174,7 +196,23 @@ run_variant() {
   local task_id="${task_arn##*/}"
   echo "==> Task: ${task_arn}"
   echo "    Waiting for the task to stop (this runs a full DROP+recreate load)..."
-  aws ecs wait tasks-stopped --cluster "${CLUSTER}" --tasks "${task_arn}" --region "${REGION}"
+  # NOT `aws ecs wait tasks-stopped`: that caps at 100x6s = 10min, but a multi-million
+  # row load runs far longer, so the waiter would give up mid-load. Poll lastStatus
+  # until STOPPED with no fixed attempt cap (guarded by MAX_WAIT_MIN, default 6h).
+  local max_wait_min="${MAX_WAIT_MIN:-360}"
+  local waited=0
+  while true; do
+    local st
+    st="$(aws ecs describe-tasks --cluster "${CLUSTER}" --tasks "${task_arn}" --region "${REGION}" \
+      --query "tasks[0].lastStatus" --output text 2>/dev/null)"
+    [ "${st}" = "STOPPED" ] && break
+    if [ "${waited}" -ge "$(( max_wait_min * 60 ))" ]; then
+      echo "warning: task ${task_id} still ${st} after ${max_wait_min}min; giving up the wait." >&2
+      break
+    fi
+    sleep 30
+    waited=$(( waited + 30 ))
+  done
 
   local exit_code
   exit_code="$(aws ecs describe-tasks --cluster "${CLUSTER}" --tasks "${task_arn}" --region "${REGION}" \
@@ -187,11 +225,18 @@ run_variant() {
   echo "==> Recovering report from CloudWatch: ${LOG_GROUP} :: ${stream}"
   # Give logs a moment to flush after the task stops.
   sleep 8
+  # Extract between the markers. Robust to a marker glued to JSON on the same line
+  # (e.g. `}===REPORT-END===`): on the BEGIN line keep only what follows the marker,
+  # on the END line keep only what precedes it -- so the closing brace is never lost.
   aws logs get-log-events --log-group-name "${LOG_GROUP}" --log-stream-name "${stream}" \
     --region "${REGION}" --start-from-head --output text \
     --query "events[*].message" 2>/dev/null \
     | tr '\t' '\n' \
-    | awk '/===REPORT-BEGIN===/{f=1;next} /===REPORT-END===/{f=0} f' > "${out_report}" || true
+    | awk '
+        /===REPORT-END===/   { sub(/===REPORT-END===.*/, ""); if (f && $0 != "") print; f=0; next }
+        f                    { print }
+        /===REPORT-BEGIN===/ { sub(/.*===REPORT-BEGIN===/, ""); f=1; if ($0 != "") print }
+      ' > "${out_report}" || true
 
   if [ -s "${out_report}" ] && python3 -c "import json,sys; json.load(open('${out_report}'))" 2>/dev/null; then
     echo "==> Saved report -> ${out_report}"
