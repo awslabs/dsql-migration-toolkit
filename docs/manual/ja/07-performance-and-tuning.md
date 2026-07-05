@@ -120,6 +120,19 @@ Full Load と Validation はアプリの環境変数で、CDC は CloudFormation
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | ≤ 32 | テーブルごとに進行中の `INSERT … ON CONFLICT` バッチ数。 |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | 2000 | ≤ 3000 | バッチ書き込みごとの行数 (DSQL の 3000 行上限でハードキャップ)。 |
 | `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1`（有効） | 有効/無効 | 先読み prefetch キュー（§7.1）。**有効のままに** — A/B ベンチマークで pre-prefetch 経路を再現する場合のみ `0`。 |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1`（無効） | ≤ 8 | リーダー範囲シャーディング: **大きな単一整数 PK** テーブルの読み込みを K 個の並行リーダーに分割（§7.1）。**既定で無効、有効化する価値はまれ** — 下記の注意参照。 |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1000000 | — | この推定行数以上のテーブルのみシャーディング。小さいテーブルは常に単一リーダー。 |
+
+> **リーダーシャーディングはいつ効くか? まれ — in-VPC テストでは ~0% だった。** 行ごとの
+> 型変換は純粋 Python で GIL を保持するため、K 個のリーダー*スレッド*でも変換スループットは
+> ~1 コアを超えられません。スレッドシャーディングはリーダーの I/O 待ちを重ねるだけ（それは
+> prefetch が既に行う）で、変換に 2 つ目のコアを追加できません。in-VPC 4vCPU の実測で
+> `reader_shards=4` は単一リーダー比 **~0%** で CPU は ~1 コアに張り付きました。その負荷が
+> リーダーではなく **DSQL 書き込みラウンドトリップ遅延**に律速されていたためです。run が
+> read/convert 飢餓（リーダーが書き込みプールを満たせない）だという*証拠*があるときだけ
+> 上げてください。壁が書き込み側なら代わりに **`BATCH_PARALLELISM`** を上げます。ソース
+> リーダー総数 = `table_parallelism × reader_shards` で、ソース接続上限保護のため上限が
+> かかります。
 
 > **接続クォータのガードレール。** DSQL への同時接続数の合計は
 > `table_parallelism × batch_parallelism` におよそ等しくなります (デフォルトは 4 × 8 = 32)。DSQL は

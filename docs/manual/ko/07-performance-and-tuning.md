@@ -116,6 +116,17 @@ CloudFormation 파라미터로.
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | ≤ 32 | 테이블당 동시 진행 `INSERT … ON CONFLICT` 배치 수. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | 2000 | ≤ 3000 | 배치 쓰기당 행 수(DSQL 3000행 하드 상한). |
 | `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1`(켜짐) | 켜짐/꺼짐 | 읽기 선행 prefetch 큐(§7.1). **켜 두세요** — A/B 벤치마크로 pre-prefetch 경로를 재현할 때만 `0`. |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1`(꺼짐) | ≤ 8 | 리더 범위 샤딩: **큰 단일 정수 PK** 테이블의 읽기를 K개 동시 리더로 분할(§7.1). **기본 꺼짐이며 켤 가치가 드묾** — 아래 주의 참고. |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1000000 | — | 이 추정 행수 이상인 테이블만 샤딩; 더 작은 테이블은 항상 단일 리더. |
+
+> **리더 샤딩은 언제 효과가 있나? 드묾 — in-VPC 테스트에서 ~0%였음.** 행별 타입
+> 변환이 순수 Python이라 GIL을 점유 → K개 리더 *스레드*를 띄워도 변환 처리량이 ~1코어를
+> 못 넘습니다. 스레드 샤딩은 리더의 I/O 대기만 겹칠 뿐(그건 prefetch가 이미 함) 변환에
+> 두 번째 코어를 더하지 못합니다. in-VPC 4vCPU 실측에서 `reader_shards=4`는 단일 리더 대비
+> **~0%**였고 CPU가 ~1코어에 고정됐는데, 그 로드가 리더가 아니라 **DSQL 쓰기 왕복 지연**에
+> 묶여 있었기 때문입니다. run이 read/convert-starved(리더가 쓰기 풀을 못 채움)라는 *증거*가
+> 있을 때만 올리세요. 벽이 쓰기 측이면 대신 **`BATCH_PARALLELISM`**을 올리세요. 총 소스
+> 리더 = `table_parallelism × reader_shards`이며 소스 커넥션 한도 보호를 위해 상한이 걸립니다.
 
 > **연결 쿼터 가드레일.** 총 동시 DSQL 연결 ≈ `table_parallelism × batch_parallelism`(기본 4 × 8 = 32).
 > DSQL은 **클러스터당 최대 10,000 연결**을 허용하지만 **초당 신규 100 연결**만 가능하므로, 곱을 쿼터 내에

@@ -135,6 +135,20 @@ variables, CDC via CloudFormation parameters.
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | ≤ 32 | In-flight `INSERT … ON CONFLICT` batches per table. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | 2000 | ≤ 3000 | Rows per batched write (hard-capped at DSQL's 3000-row limit). |
 | `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1` (on) | on/off | Read-ahead prefetch queue (§7.1). **Leave on** — set `0` only to reproduce the pre-prefetch path for A/B benchmarking. |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1` (off) | ≤ 8 | Reader range sharding: split a **large single-integer-PK** table's read into K concurrent readers (§7.1). **Off by default and rarely worth turning on** — see the caveat below. |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1000000 | — | A table must have at least this many (estimated) rows to be sharded; smaller tables always use one reader. |
+
+> **When does reader sharding actually help? Rarely — and it was ~0% in our
+> in-VPC test.** The per-row type conversion is pure Python and holds the GIL, so K
+> reader *threads* still can't exceed ~one core of conversion throughput — thread
+> sharding overlaps the readers' I/O waits (which the prefetch queue already does)
+> but cannot add a second core of convert. In a measured in-VPC 4-vCPU run,
+> `reader_shards=4` gave **~0% over one reader** and CPU stayed pinned at ~1 core,
+> because that load was bounded by **DSQL write round-trip latency**, not by the
+> reader. Turn it up only if you have *evidence* a run is read/convert-starved (the
+> reader can't keep the write pool busy); when the wall is the write side, raise
+> **`BATCH_PARALLELISM`** instead. Total source readers = `table_parallelism ×
+> reader_shards`, clamped to a safe ceiling to protect the source's connection limit.
 
 > **Connection-quota guardrail.** Total concurrent DSQL connections ≈
 > `table_parallelism × batch_parallelism` (the default 4 × 8 = 32). DSQL allows up
