@@ -111,11 +111,11 @@ mkdir -p "${OUT_DIR}"
 # containerOverrides has no entryPoint field). So the command override is a
 # SINGLE-element array holding the shell string that `sh -c` runs.
 build_cmd_json() {
-  local report_path="$1"
+  local report_path="$1" no_prefetch="$2" reader_shards="${3:-0}"
   python3 - "$MEASURE_SCHEMA" "$MEASURE_TABLES" "$TABLE_PARALLELISM" "$BATCH_PARALLELISM" \
-            "$PROGRESS_INTERVAL" "$report_path" "$2" <<'PY'
+            "$PROGRESS_INTERVAL" "$report_path" "$no_prefetch" "$reader_shards" <<'PY'
 import json, sys
-schema, tables, tp, bp, interval, report, no_prefetch = sys.argv[1:8]
+schema, tables, tp, bp, interval, report, no_prefetch, reader_shards = sys.argv[1:9]
 measure = ["python", "scripts/measure_performance.py", "full-load", "--yes",
            "--schema", schema, "--table-parallelism", tp, "--batch-parallelism", bp,
            "--progress-interval", interval, "--report", report]
@@ -123,6 +123,10 @@ if tables.strip():
     measure += ["--tables", *tables.split()]
 if no_prefetch == "1":
     measure += ["--no-prefetch"]
+if reader_shards and reader_shards not in ("0", "1"):
+    # reader range sharding on: also lower the size threshold so payments/orders
+    # (each ~9M) qualify regardless of the default 1M gate.
+    measure += ["--reader-shards", reader_shards]
 # Run the measure, then emit the report between markers so the wrapper can recover
 # it from CloudWatch Logs (the task's /tmp is lost when it stops). The report JSON
 # has no trailing newline, so a bare `cat` would print `}===REPORT-END===` on one
@@ -171,18 +175,25 @@ PY
 }
 
 run_variant() {
-  local variant="$1"          # "off" or "on"
-  local no_prefetch prefetch_env
-  if [ "${variant}" = "off" ]; then no_prefetch=1; prefetch_env=0; else no_prefetch=0; prefetch_env=1; fi
+  local variant="$1"          # "off" | "on" | "shardN" (e.g. shard4)
+  # Map the variant name to (prefetch on/off, reader-shards). "off" = pre-prefetch
+  # baseline; "on" = prefetch, single reader; "shardN" = prefetch + N shard readers.
+  local no_prefetch prefetch_env reader_shards=0
+  case "${variant}" in
+    off)      no_prefetch=1; prefetch_env=0 ;;
+    on)       no_prefetch=0; prefetch_env=1 ;;
+    shard*)   no_prefetch=0; prefetch_env=1; reader_shards="${variant#shard}" ;;
+    *)        no_prefetch=0; prefetch_env=1 ;;
+  esac
 
   local report_in_task="/tmp/perf-${variant}.json"
   local cmd_json overrides
-  cmd_json="$(build_cmd_json "${report_in_task}" "${no_prefetch}")"
+  cmd_json="$(build_cmd_json "${report_in_task}" "${no_prefetch}" "${reader_shards}")"
   overrides="$(build_overrides_json "${cmd_json}" "${prefetch_env}")"
 
   echo ""
   echo "======================================================================"
-  echo "==> Variant: prefetch=${variant}  schema=${MEASURE_SCHEMA} tables='${MEASURE_TABLES:-ALL}' tp=${TABLE_PARALLELISM} bp=${BATCH_PARALLELISM}"
+  echo "==> Variant: ${variant}  (prefetch=${prefetch_env} reader_shards=${reader_shards})  schema=${MEASURE_SCHEMA} tables='${MEASURE_TABLES:-ALL}' tp=${TABLE_PARALLELISM} bp=${BATCH_PARALLELISM}"
   echo "======================================================================"
   local task_arn
   task_arn="$(aws ecs run-task --cluster "${CLUSTER}" --region "${REGION}" \
@@ -255,5 +266,5 @@ echo ""
 echo "==> Done. Recovered reports in ${OUT_DIR}/:"
 ls -1 "${OUT_DIR}"/*-in-vpc.json 2>/dev/null || echo "   (none recovered)"
 echo ""
-echo "Compare with:"
-echo "  python scripts/perf_compare.py compare ${OUT_DIR}/off-in-vpc.json ${OUT_DIR}/on-in-vpc.json --per-table"
+echo "Compare with (first = baseline):"
+echo "  python scripts/perf_compare.py compare ${OUT_DIR}/*-in-vpc.json --per-table"
