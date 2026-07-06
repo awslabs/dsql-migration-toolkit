@@ -1,9 +1,10 @@
-# mysql-dsql-migrator
+# mysql-dsql-migration-tool-with-AI
 
 _언어: [English](README.md) | **한국어** | [日本語](README.ja.md)_
 
 Amazon RDS MySQL / Aurora MySQL 데이터베이스를 **Amazon Aurora DSQL**로
-마이그레이션하는 웹 기반 All-In-One 도구입니다.
+마이그레이션하는 웹 기반 All-In-One 도구이며, 판단이 필요한 부분을 위한 **선택적 AI
+보조(Amazon Bedrock)**를 내장했습니다.
 
 Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 분산 데이터베이스이므로, 이것은
 두 개의 변환이 겹치는 **이종(heterogeneous) 마이그레이션**입니다:
@@ -27,6 +28,29 @@ Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 분산 데이터베이스
 > 엔지니어를 위한 작업 중심 안내서입니다 — 설정, Evaluation, Schema Conversion, Full Load,
 > CDC + DSQL 제약, Validation, Cut over, 그리고 한계까지.
 
+## AI 보조 (Amazon Bedrock)
+
+다른 엔진으로의 마이그레이션에는 규칙만으로 정리 안 되는 잔여물이 늘 남습니다 — 애매한 타입,
+쿼리 관용구, "여기서 CDC가 될까?" 같은 판단. 바로 그 지점을 내장 **AI DBA(Amazon Bedrock)**가
+세 방향에서 돕습니다:
+
+- **스키마 변환 제안** — 결정론적 변환기가 `MANUAL`/`UNSUPPORTED`로 표시한 객체에 대해 DSQL
+  호환 재작성을 근거와 함께 제안. **검토·승인 게이트** — 사용자가 승인해야만 타깃에 반영됩니다.
+- **CDC 준비도 & DLQ 분류** — 테이블이 스트리밍에 안전한지 평가하고, 격리(dead-letter)된 행을
+  자연어로 설명합니다.
+- **AI DBA 쿼리 튜닝(증거 기반)** — DSQL 실행 모델(PK가 곧 테이블, 필터 푸시다운, DPU 비용)에
+  맞게 쿼리를 재작성하고, **실제 `EXPLAIN ANALYZE` 전/후 DPU 델타로 개선을 증명**합니다 —
+  모델의 주장이 아니라 실측이 근거입니다.
+
+신뢰할 수 있도록 원칙을 지킵니다:
+
+- **opt-in, 기본 off.** 결정론적 경로(`sqlglot`)가 항상 먼저 돌고, AI를 꺼도 워크플로는 동일 —
+  AI는 잔여물만 **보강**합니다.
+- **컨트롤 플레인 전용, 데이터 경로엔 절대 없음.** AI는 Full Load / CDC 행 데이터를 보지도
+  건드리지도 않으며, 스키마/DDL/플랜 메타데이터만 사용합니다.
+- **IAM 기반 Amazon Bedrock** — 서드파티 API 키 없음. 필요한 권한은 범위 제한된
+  `bedrock:InvokeModel` 하나뿐입니다.
+
 ## 한눈에 보기
 
 두 개의 데이터 경로가 Aurora DSQL로 수렴합니다: 도구가 주도하는 일회성 **Full Load**와,
@@ -44,7 +68,7 @@ Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 분산 데이터베이스
 
 - MySQL 스키마를 introspect해 **DSQL 호환성 평가**(`AUTO` / `MANUAL` / `UNSUPPORTED` + 작업량 추정).
 - MySQL → DSQL **스키마(DDL) 자동 변환·적용** — 타입 매핑, FK 제거, 비동기 인덱스, PK 전략 등.
-- **Full Load** — 일관성 스냅샷을 스트리밍으로 벌크 적재(재개 가능, TB 규모 대응).
+- **Full Load** — 일관성 스냅샷을 스트리밍으로 벌크 적재(재개 가능, 대용량 대응).
 - **CDC**(선택) — 거의 무중단 전환을 위한 연속 변경 복제(Full Load와 무손실 핸드오프).
 - **Validation** — 행 수·체크섬·PK 대조로 소스↔타깃 일치 검증, 드리프트 보고.
 - **AI 보조**(선택, 기본 off) — 어려운 항목의 변환 제안(검토·승인 후에만 적용).
@@ -237,7 +261,7 @@ cd mysql-dsql-migrator
 **전체 단계는 [`deploy/DEPLOYMENT.ko.md`](deploy/DEPLOYMENT.ko.md)에 있습니다**(아래 [배포](#배포)
 요약). 로컬과 달리, **마이그레이션 트래픽(소스 읽기 → 변환 → DSQL 쓰기)은 전부 AWS 내부에서
 발생하며 내 로컬 머신을 거치지 않습니다** — 내 브라우저는 ALB URL로 UI만 띄울 뿐, 데이터 경로에는
-들어가지 않습니다. 그래서 대용량/TB 마이그레이션과 프라이빗 소스에 적합합니다.
+들어가지 않습니다. 그래서 대용량 마이그레이션과 프라이빗 소스에 적합합니다.
 
 > 두 방식의 상세 비교는 아래 [실행 방식: 로컬 vs ECS Fargate](#실행-방식-로컬-vs-ecs-fargate) 표를 보세요.
 
@@ -251,7 +275,7 @@ cd mysql-dsql-migrator
 
 | | **로컬 (내 머신)** | **ECS Fargate (AWS 배포)** |
 |---|---|---|
-| 적합한 경우 | 평가, 소규모, 개발 | 실제 마이그레이션, 대용량/TB |
+| 적합한 경우 | 평가, 소규모, 개발 | 실제 마이그레이션, 대용량 |
 | 실행 위치 | 내 노트북/워크스테이션 | 고객 VPC 안의 단일 태스크 Fargate |
 | **데이터 경로** | 소스→**내 머신**→DSQL (모든 데이터가 내 머신·네트워크를 통과) | 소스→**VPC 내 Fargate**→DSQL (데이터가 AWS 안에 머묾) |
 | 네트워크 도달 | 내 머신이 소스 MySQL과 DSQL **양쪽**에 도달해야 함(프라이빗 소스는 VPN/SSM 포워딩) | Fargate가 VPC 안에서 소스에 프라이빗하게 도달 |
@@ -284,7 +308,7 @@ Validation 병렬수 4개는 사이드바 푸터의 **Performance tuning** 컨�
 | `DSQL_MIGRATOR_JOB_STATE_PATH` | `job_state.sqlite` | 로컬 job-state 저장소 경로. Full Load 작업 스냅샷(상태, 테이블별 진행률, 워터마크)이 여기에 영속화되고 재시작 시 다시 로드되어 중단된 작업을 재개할 수 있습니다(중단된 진행 중 테이블은 부분 재시도를 위해 실패로 표면화). |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_PATH` | `migration_activity.log` | 구조화된 활동 로그 파일 경로. 모든 마이그레이션 이벤트 — 연결 테스트, 평가 실행, 객체별 스키마 적용(CREATED/SKIPPED/FAILED), 테이블별 Full Load 결과(성공/실패와 상세), CDC 컨트롤 플레인 동작 — 이 UTC 타임스탬프 JSON 한 줄로 추가됩니다. UI("Download activity log")에서 다운로드해 전체 타임라인을 시간순으로 읽을 수 있고, 성공·실패 모두 기록됩니다(작업별 에러 로그는 실패 전용·행 단위 산출물로 별도 유지). 파일은 크기 제한·회전되어(세그먼트당 ~20 MB, 백업 4개, 총 ~100 MB) 무한히 커지지 않으며, 다운로드는 보존된 세그먼트를 시간순으로 이어 붙입니다. `DSQL_MIGRATOR_LOG_LEVEL=DEBUG`일 때 실패 이벤트는 전체 Python `stacktrace`(콜 스택만 — 행 값이나 자격증명은 절대 없음)를 추가로 담고, 기본 `INFO`에서는 생략됩니다. |
 | `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | 로컬 세션별 상태 저장소 경로. 각 세션의 비밀이 아닌 워크벤치 상태(워크플로우 진행, 평가 결과, 생성된 객체, 마이그레이션 작업 연결)를 영속화해 재연결한 브라우저가 재시작 후에도 이어서 작업합니다. 브라우저 세션 id가 재시작 간에도 안정적이도록 `DSQL_MIGRATOR_STORAGE_SECRET`과 함께 사용하세요. |
-| `DSQL_MIGRATOR_STAGING_BUCKET` | _(미설정)_ | Full Load 스테이징용 선택적 S3 버킷. 설정 시 각 테이블을 스트리밍 멀티파트 업로드로 이 버킷에 export하고 `s3://` URI에서 로드하므로, 전체 테이블 CSV가 컨테이너 임시 디스크에 절대 떨어지지 않습니다(대형/TB 테이블용 확장 경로). 미설정 시 제한된 로컬 임시 CSV를 사용(로컬 개발 / 소형 테이블 전용). |
+| `DSQL_MIGRATOR_STAGING_BUCKET` | _(미설정)_ | Full Load 스테이징용 선택적 S3 버킷. 설정 시 각 테이블을 스트리밍 멀티파트 업로드로 이 버킷에 export하고 `s3://` URI에서 로드하므로, 전체 테이블 CSV가 컨테이너 임시 디스크에 절대 떨어지지 않습니다(대형 테이블용 확장 경로). 미설정 시 제한된 로컬 임시 CSV를 사용(로컬 개발 / 소형 테이블 전용). |
 | `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4` (≤16) | Full Load: 동시에 로드하는 테이블 수. 총 동시 DSQL 연결 ≈ 테이블 × 배치 병렬수. 클러스터 연결 쿼터 안에서 유지하세요. 매뉴얼의 [성능과 튜닝](docs/manual/ko/07-performance-and-tuning.md) 장 참고. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | Full Load: 테이블당 in-flight `INSERT ... ON CONFLICT` 배치 수. 높을수록 처리량↑ 그러나 핫 키 범위에서 OCC(40001) 충돌↑. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000` (≤3000) | Full Load: 배치 쓰기당 행 수, DSQL의 트랜잭션당 3000행 한도로 하드캡. |
