@@ -1,9 +1,10 @@
-# mysql-dsql-migrator
+# mysql-dsql-migration-tool-with-AI
 
 _Language: **English** | [한국어](README.ko.md) | [日本語](README.ja.md)_
 
 A web-based all-in-one tool for migrating Amazon RDS MySQL / Aurora MySQL
-databases to **Amazon Aurora DSQL**.
+databases to **Amazon Aurora DSQL**, with **optional AI assistance (Amazon
+Bedrock)** for the parts that genuinely need judgment.
 
 Aurora DSQL is a PostgreSQL 16–compatible distributed database, not a MySQL one,
 so this is a **heterogeneous migration** with two overlapping conversions:
@@ -28,6 +29,32 @@ surface the points that need human work.** Conversion is deterministic-first
 > walkthrough for engineers coming from Aurora MySQL — set up, Evaluation, Schema
 > Conversion, Full Load, CDC + DSQL constraints, Validation, and limitations.
 
+## AI assistance (Amazon Bedrock)
+
+Migration to a *different* engine always leaves a residue that rules can't settle
+on their own — an odd type, a query idiom, a "will CDC even work here?" judgment
+call. That's exactly where the built-in **AI DBA (Amazon Bedrock)** helps, on three
+fronts:
+
+- **Schema conversion suggestions** — for the objects the deterministic converter
+  flags `MANUAL`/`UNSUPPORTED`, the AI proposes a DSQL-compatible rewrite with a
+  rationale. **Review-and-approve gated** — nothing reaches the target without you.
+- **CDC readiness & DLQ triage** — assesses whether a table is safe to stream and
+  explains quarantined (dead-letter) rows in plain language.
+- **AI DBA query tuning (evidence-based)** — rewrites a query for DSQL's execution
+  model (PK-is-the-table, filter push-down, DPU cost) and **proves the gain with a
+  real `EXPLAIN ANALYZE` before/after DPU delta** — the measurement is the proof,
+  not the model's claim.
+
+Principled by design, so you can trust it:
+
+- **Opt-in, off by default.** The deterministic path (`sqlglot`) always runs first;
+  the workflow is identical with AI disabled — AI only *augments* the leftovers.
+- **Control plane only, never on the data path.** AI never sees or touches Full
+  Load / CDC row data — only schema/DDL/plan metadata.
+- **Amazon Bedrock via IAM** — no third-party API keys; the only permission is a
+  scoped `bedrock:InvokeModel`.
+
 ## At a glance
 
 Two data paths converge on Aurora DSQL: a one-shot **Full Load** driven by the
@@ -47,7 +74,7 @@ What the tool does for you, what you still do yourself, and what's out of scope 
   (`AUTO` / `MANUAL` / `UNSUPPORTED` + effort estimates).
 - **Converts and applies the schema (DDL)** MySQL → DSQL — type mapping, FK removal,
   async indexes, PK strategies, and more.
-- **Full Load** — bulk-loads a consistent snapshot by streaming (resumable, TB-scale).
+- **Full Load** — bulk-loads a consistent snapshot by streaming (resumable, large-scale).
 - **CDC** (optional) — continuous change replication for near-zero-downtime cut-over,
   with a gapless handoff from Full Load.
 - **Validation** — proves source ↔ target match by row count, checksum, and PK
@@ -270,7 +297,7 @@ cd mysql-dsql-migrator
 under [Deployment](#deployment) below). Unlike local, **all migration traffic
 (read source → convert → write DSQL) happens inside AWS and never passes through
 your local machine** — your browser only opens the UI over the ALB URL; it is not
-on the data path. This is what makes it suited to large/TB-scale migrations and
+on the data path. This is what makes it suited to large-scale migrations and
 private sources.
 
 > For a side-by-side comparison, see the [How you run it: local vs ECS Fargate](#how-you-run-it-local-vs-ecs-fargate) table below.
@@ -282,7 +309,7 @@ local for evaluation/small migrations; use Fargate for a real one.
 
 | | **Local (your machine)** | **ECS Fargate (deployed on AWS)** |
 |---|---|---|
-| Best for | Evaluation, small migrations, development | Real migrations, large/TB-scale |
+| Best for | Evaluation, small migrations, development | Real migrations, large-scale |
 | Runs on | Your laptop/workstation | A single-task Fargate service in your VPC |
 | **Data path** | source → **your machine** → DSQL (all data flows through your machine/network) | source → **Fargate in the VPC** → DSQL (data stays in AWS) |
 | Network reach | your machine must reach **both** the source MySQL and DSQL (private source needs VPN / SSM forward) | Fargate reaches the source privately from inside the VPC |
@@ -319,7 +346,7 @@ next Full Load / Validation and resets on restart.
 | `DSQL_MIGRATOR_JOB_STATE_PATH` | `job_state.sqlite` | Path to the local job-state store. Full Load job snapshots (status, per-table progress, watermark) are persisted here and reloaded on restart so an interrupted job can be resumed (interrupted in-flight tables are surfaced as failed for partial retry). |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_PATH` | `migration_activity.log` | Path to the structured activity log file. Every migration event — connection tests, the assessment run, each per-object schema apply (CREATED/SKIPPED/FAILED), each per-table Full Load outcome (success/failure with detail), and CDC control-plane actions — is appended as one UTC-timestamped JSON line. Downloadable from the UI ("Download activity log" in the sidebar) so the whole timeline can be read/sorted by time; success and failure are both recorded (the per-job error log remains the failures-only, row-level artifact). The file is size-capped and rotated (~20 MB per segment, 4 backups, ~100 MB total) so it never grows without bound, and the download concatenates the retained segments in chronological order. When `DSQL_MIGRATOR_LOG_LEVEL=DEBUG`, a failure event additionally carries the full Python `stacktrace` (call stack only — never row values or credentials) for debugging; at the default `INFO` level it is omitted to keep routine logs clean. |
 | `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | Path to the local per-session state store. Persists each session's non-secret workbench state (workflow progress, evaluation result, generated objects, migration job linkage) so a reconnecting browser resumes where it left off after a restart. Pair with `DSQL_MIGRATOR_STORAGE_SECRET` so the browser session id stays stable across restarts. |
-| `DSQL_MIGRATOR_STAGING_BUCKET` | _(unset)_ | Optional S3 bucket for Full Load staging. When set, each table is exported to this bucket via a streaming multipart upload and loaded from the `s3://` URI, so a whole-table CSV never lands on the container's ephemeral disk (the scalable path for large/TB tables). When unset, a bounded local temp CSV is used (local dev / small tables only). |
+| `DSQL_MIGRATOR_STAGING_BUCKET` | _(unset)_ | Optional S3 bucket for Full Load staging. When set, each table is exported to this bucket via a streaming multipart upload and loaded from the `s3://` URI, so a whole-table CSV never lands on the container's ephemeral disk (the scalable path for large tables). When unset, a bounded local temp CSV is used (local dev / small tables only). |
 | `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4` (≤16) | Full Load: how many tables load concurrently. Total concurrent DSQL connections ≈ table × batch parallelism; keep within the cluster connection quota. See the manual's [Performance and tuning](docs/manual/en/07-performance-and-tuning.md) chapter. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | Full Load: in-flight `INSERT ... ON CONFLICT` batches per table. Higher = more throughput but more OCC (40001) collisions on hot key ranges. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000` (≤3000) | Full Load: rows per batched write, hard-capped at DSQL's 3000-row per-transaction limit. |

@@ -102,3 +102,10 @@ scripts/*
 
 # Local Claude Code skills/config (dev aid, not published)
 .claude/
+
+# Local performance measurement outputs (not published)
+perf-runs/
+
+# Rendered deck outputs (source .md is tracked; html/pdf are build artifacts)
+docs/tech-talk-*.html
+docs/tech-talk-*.pdf

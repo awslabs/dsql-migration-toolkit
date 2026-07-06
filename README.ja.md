@@ -1,9 +1,10 @@
-# mysql-dsql-migrator
+# mysql-dsql-migration-tool-with-AI
 
 _言語: [English](README.md) | [한국어](README.ko.md) | **日本語**_
 
 Amazon RDS MySQL / Aurora MySQL データベースを **Amazon Aurora DSQL** へ移行するための、
-Web ベースのオールインワンツールです。
+Web ベースのオールインワンツールで、判断が必要な部分向けの **オプションの AI 支援
+（Amazon Bedrock）** を内蔵しています。
 
 Aurora DSQL は MySQL ではなく PostgreSQL 16 互換の分散データベースであるため、
 これは 2 つの変換が重なり合う **異種間移行（heterogeneous migration）** になります。
@@ -26,6 +27,30 @@ Aurora DSQL は MySQL ではなく PostgreSQL 16 互換の分散データベー�
 > **初めての方へ** [**ユーザーマニュアル**](docs/manual/README.md) は、Aurora MySQL から来る
 > エンジニア向けのタスク指向のウォークスルーです。セットアップ、Evaluation、Schema
 > Conversion、Full Load、CDC + DSQL 制約、Validation、そして制限事項を扱います。
+
+## AI 支援（Amazon Bedrock）
+
+異なるエンジンへの移行では、ルールだけでは片付かない残余が必ず残ります — 厄介な型、
+クエリのイディオム、「ここで CDC が成立するのか?」といった判断です。まさにその部分を、
+内蔵の **AI DBA（Amazon Bedrock）** が 3 つの側面で支援します。
+
+- **スキーマ変換の提案** — 確定的コンバータが `MANUAL`/`UNSUPPORTED` と分類したオブジェクトに
+  対し、DSQL 互換の書き換えを根拠付きで提案します。**レビュー・承認ゲート** — 承認するまで
+  ターゲットには反映されません。
+- **CDC 準備状況と DLQ トリアージ** — テーブルがストリーミングに安全かを評価し、隔離
+  （デッドレター）された行を平易な言葉で説明します。
+- **AI DBA によるクエリチューニング（証拠ベース）** — DSQL の実行モデル（PK がテーブルそのもの、
+  フィルタのプッシュダウン、DPU コスト）に合わせてクエリを書き換え、**実際の `EXPLAIN ANALYZE`
+  の前後 DPU 差分で改善を証明** します — モデルの主張ではなく実測が根拠です。
+
+信頼できるよう、原則を守ります。
+
+- **オプトイン、既定はオフ。** 確定的経路（`sqlglot`）が常に先に実行され、AI を無効にしても
+  ワークフローは同一 — AI は残余を **補強** するだけです。
+- **コントロールプレーン専用、データ経路には決して関与しない。** AI は Full Load / CDC の行
+  データを見ることも触れることもなく、スキーマ/DDL/プランのメタデータのみを使用します。
+- **IAM 経由の Amazon Bedrock** — サードパーティ API キーは不要。必要な権限はスコープ制限された
+  `bedrock:InvokeModel` の 1 つだけです。
 
 ## 概要
 
