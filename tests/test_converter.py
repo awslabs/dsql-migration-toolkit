@@ -563,6 +563,120 @@ def test_convert_applies_pk_strategy_across_inventory() -> None:
 
 
 # ---------------------------------------------------------------------------
+# COMPOSITE_KEY strategy (prepend a high-cardinality leading column)
+# ---------------------------------------------------------------------------
+
+
+def _composite_table(name: str = "orders") -> TableDef:
+    """A single-int-PK table with a NOT NULL high-cardinality column to lead with."""
+    return TableDef(
+        name=name,
+        columns=[
+            ColumnDef(name="id", mysql_type="BIGINT", nullable=False),
+            ColumnDef(name="customer_id", mysql_type="BIGINT", nullable=False),
+            ColumnDef(name="note", mysql_type="TEXT", nullable=True),
+        ],
+        primary_key=["id"],
+        auto_increment_column="id",
+    )
+
+
+def _composite_options(leading: str = "customer_id") -> SchemaConvertOptions:
+    return SchemaConvertOptions(
+        primary_key_strategy=PrimaryKeyStrategy.COMPOSITE_KEY,
+        composite_leading_column=leading,
+    )
+
+
+def test_composite_key_prepends_leading_column_to_primary_key() -> None:
+    from dsql_migrator.core.converter import parse_target_primary_key
+
+    result = SchemaConverter().convert_table(_composite_table(), _composite_options())
+    # The target PK is (leading, original_pk...) in that order.
+    assert parse_target_primary_key(result.target_ddl) == ["customer_id", "id"]
+    # Consequence is surfaced as a MANUAL warning (never applied silently).
+    manual = [w for w in result.warnings if w.classification is Classification.MANUAL]
+    assert any("composite" in w.message.lower() for w in manual)
+    assert any("immutable" in w.message.lower() for w in manual)
+
+
+def test_composite_key_emits_unique_index_on_original_key() -> None:
+    # A composite key drops the original key's standalone uniqueness, so a UNIQUE
+    # INDEX ASYNC on the original PK columns must be emitted to preserve it.
+    result = SchemaConverter().convert_table(_composite_table(), _composite_options())
+    unique_on_id = [
+        d for d in result.index_ddls
+        if d.startswith("CREATE UNIQUE INDEX ASYNC") and '("id")' in d
+    ]
+    assert len(unique_on_id) == 1
+
+
+def test_composite_key_does_not_change_source_data_columns() -> None:
+    # Only the KEY definition changes; every source column is still present.
+    result = SchemaConverter().convert_table(_composite_table(), _composite_options())
+    ddl = result.target_ddl
+    assert '"id"' in ddl and '"customer_id"' in ddl and '"note"' in ddl
+
+
+def test_composite_key_missing_leading_column_is_unsupported() -> None:
+    result = SchemaConverter().convert_table(
+        _composite_table(), _composite_options("nope")
+    )
+    assert result.warnings[0].classification is Classification.UNSUPPORTED
+    assert "does not exist" in result.warnings[0].message
+    # No broken DDL emitted -- the placeholder is a comment.
+    assert result.target_ddl.lstrip().startswith("--")
+
+
+def test_composite_key_nullable_leading_column_is_unsupported() -> None:
+    result = SchemaConverter().convert_table(
+        _composite_table(), _composite_options("note")
+    )
+    assert result.warnings[0].classification is Classification.UNSUPPORTED
+    assert "nullable" in result.warnings[0].message.lower()
+
+
+def test_composite_key_leading_already_in_pk_is_unsupported() -> None:
+    # Prepending a column already in the PK would not change write distribution.
+    result = SchemaConverter().convert_table(
+        _composite_table(), _composite_options("id")
+    )
+    assert result.warnings[0].classification is Classification.UNSUPPORTED
+    assert "already part of the primary key" in result.warnings[0].message
+
+
+def test_composite_options_requires_leading_column() -> None:
+    with pytest.raises(ValueError, match="requires composite_leading_column"):
+        SchemaConvertOptions(primary_key_strategy=PrimaryKeyStrategy.COMPOSITE_KEY)
+
+
+def test_composite_leading_column_requires_composite_strategy() -> None:
+    with pytest.raises(ValueError, match="only valid with the COMPOSITE_KEY"):
+        SchemaConvertOptions(composite_leading_column="customer_id")
+
+
+def test_validate_composite_leading_column_accepts_valid_choice() -> None:
+    from dsql_migrator.core.converter import validate_composite_leading_column
+
+    assert validate_composite_leading_column(_composite_table(), "customer_id") is None
+
+
+def test_composite_key_rejects_over_eight_columns() -> None:
+    # A 7-column source PK + a leading col = 8 is allowed; +1 more (9) is rejected.
+    from dsql_migrator.core.converter import validate_composite_leading_column
+
+    cols = [ColumnDef(name=f"k{i}", mysql_type="INT", nullable=False) for i in range(8)]
+    cols.append(ColumnDef(name="lead", mysql_type="INT", nullable=False))
+    table = TableDef(
+        name="wide",
+        columns=cols,
+        primary_key=[f"k{i}" for i in range(8)],  # 8 source PK cols
+    )
+    msg = validate_composite_leading_column(table, "lead")
+    assert msg is not None and "at most 8" in msg
+
+
+# ---------------------------------------------------------------------------
 # Schema-qualified table names (database.table -> "schema"."table")
 # ---------------------------------------------------------------------------
 
@@ -790,3 +904,59 @@ def test_parse_target_column_types_empty_for_non_create_placeholder() -> None:
     # overrides, so value conversion safely falls back to the source mapping.
     assert parse_target_column_types("-- not auto-converted") == {}
     assert parse_target_column_types("definitely not sql ;;;") == {}
+
+
+def test_parse_target_primary_key_single_table_level() -> None:
+    from dsql_migrator.core.converter import parse_target_primary_key
+
+    ddl = (
+        'CREATE TABLE "app"."orders" (\n'
+        '  "id" bigint NOT NULL,\n'
+        '  "customer_id" bigint NOT NULL,\n'
+        '  PRIMARY KEY ("id")\n'
+        ");"
+    )
+    assert parse_target_primary_key(ddl) == ["id"]
+
+
+def test_parse_target_primary_key_composite_preserves_key_order() -> None:
+    from dsql_migrator.core.converter import parse_target_primary_key
+
+    # A composite PK must return the columns in KEY order (leading column first),
+    # since that order is what the loader's ON CONFLICT target depends on.
+    ddl = (
+        'CREATE TABLE "app"."orders" (\n'
+        '  "id" bigint NOT NULL,\n'
+        '  "customer_id" bigint NOT NULL,\n'
+        '  PRIMARY KEY ("customer_id", "id")\n'
+        ");"
+    )
+    assert parse_target_primary_key(ddl) == ["customer_id", "id"]
+
+
+def test_parse_target_primary_key_inline_column_constraint() -> None:
+    from dsql_migrator.core.converter import parse_target_primary_key
+
+    ddl = 'CREATE TABLE "t" ("id" bigint NOT NULL PRIMARY KEY, "x" integer)'
+    assert parse_target_primary_key(ddl) == ["id"]
+
+
+def test_parse_target_primary_key_empty_when_absent_or_unparseable() -> None:
+    from dsql_migrator.core.converter import parse_target_primary_key
+
+    # No PK, a comment placeholder, and non-SQL all yield [] -- the caller treats
+    # [] as "unknown" and falls back to the source PK (today's behavior).
+    assert parse_target_primary_key('CREATE TABLE "t" ("x" integer)') == []
+    assert parse_target_primary_key("-- not auto-converted") == []
+    assert parse_target_primary_key("definitely not sql ;;;") == []
+
+
+def test_parse_target_primary_key_round_trips_real_converted_ddl() -> None:
+    # Guardrail from the plan: parse the ACTUAL pretty-printed postgres DDL that
+    # convert_table emits, not a hand-written string -- so the parser stays in
+    # lock-step with the emitter (sqlglot pretty-print quirks included).
+    from dsql_migrator.core.converter import parse_target_primary_key
+
+    table = _single_column_table("orders", "VARCHAR(64)")
+    result = _convert_table(table)
+    assert parse_target_primary_key(result.target_ddl) == ["id"]

@@ -458,13 +458,14 @@ class _FakeImporter:
         self.received: list[tuple[str, list[dict]]] = []
         self.index_ddls_by_table: dict[str, object] = {}
         self.on_conflict_by_table: dict[str, object] = {}
+        self.key_columns_by_table: dict[str, object] = {}
         self._rows = rows
         self._failures = failures
         self._first_error = first_error
 
     def import_rows(
         self, rows, table: TableDef, *, index_ddls=None, on_batch_loaded=None,
-        should_cancel=None, on_conflict=None, shard_sources=None,
+        should_cancel=None, on_conflict=None, shard_sources=None, key_columns=None,
     ) -> BatchedImportResult:
         # When sharded, the engine passes K row streams via shard_sources (and
         # `rows` is an empty sentinel); otherwise the single `rows` stream is used.
@@ -474,6 +475,7 @@ class _FakeImporter:
             materialized = list(rows)
         self.index_ddls_by_table[table.name] = index_ddls
         self.on_conflict_by_table[table.name] = on_conflict
+        self.key_columns_by_table[table.name] = key_columns
         self.received.append((table.name, materialized))
         loaded = self._rows if self._rows else len(materialized)
         if on_batch_loaded is not None and not self._failures and loaded:
@@ -627,6 +629,79 @@ def test_batched_table_migrator_recreates_replace_tables_and_passes_index_ddls()
     # DSQL-safe idempotent SKIP_EXISTING (insert only missing keys).
     assert importer.on_conflict_by_table["orders"] is OnConflictMode.NONE
     assert importer.on_conflict_by_table["customers"] is OnConflictMode.SKIP_EXISTING
+
+
+def test_replace_load_passes_target_composite_pk_to_importer() -> None:
+    # Phase 0: on a fresh (replace) load, migrate_table parses the PK out of the
+    # APPLIED target DDL and passes it to the importer as key_columns, so a
+    # composite target key drives ON CONFLICT even though the source PK is (id).
+    import dataclasses
+
+    from dsql_migrator.core.converter import TableConversion
+
+    exporter = _FakeExporter()
+    importer = _FakeImporter()
+    applied = TableConversion(
+        table="orders",
+        target_ddl=(
+            'CREATE TABLE "orders" ("id" bigint NOT NULL, '
+            '"customer_id" bigint NOT NULL, PRIMARY KEY ("customer_id", "id"))'
+        ),
+    )
+    inputs = dataclasses.replace(
+        _inputs(),
+        replace_tables=frozenset({"orders"}),
+        table_conversions={"orders": applied},
+    )
+    migrator = BatchedTableMigrator(
+        inputs,
+        exporter=exporter,  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _i: importer,  # type: ignore[arg-type,return-value]
+        table_recreator=lambda _t: [],
+        target_counter=lambda _t: None,
+    )
+
+    migrator.migrate_table(_tables()[0])  # orders -> replace
+
+    assert importer.key_columns_by_table["orders"] == ["customer_id", "id"]
+
+
+def test_append_with_changed_target_pk_is_refused() -> None:
+    # Phase 0 guard: appending (no recreate) into a target whose applied DDL asks
+    # for a DIFFERENT (composite) PK than the source must fail loudly -- the live
+    # target still has its original key, so keying the append on the new columns
+    # would skip-wrong or hit a missing constraint. Force a fresh reload instead.
+    import dataclasses
+
+    from dsql_migrator.core.converter import TableConversion
+
+    exporter = _FakeExporter()
+    importer = _FakeImporter()
+    applied = TableConversion(
+        table="orders",
+        target_ddl=(
+            'CREATE TABLE "orders" ("id" bigint NOT NULL, '
+            '"customer_id" bigint NOT NULL, PRIMARY KEY ("customer_id", "id"))'
+        ),
+    )
+    # orders NOT in replace_tables -> append path.
+    inputs = dataclasses.replace(
+        _inputs(),
+        replace_tables=frozenset(),
+        table_conversions={"orders": applied},
+    )
+    migrator = BatchedTableMigrator(
+        inputs,
+        exporter=exporter,  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _i: importer,  # type: ignore[arg-type,return-value]
+        table_recreator=lambda _t: [],
+        target_counter=lambda _t: None,
+    )
+
+    with pytest.raises(RuntimeError, match="changed primary key"):
+        migrator.migrate_table(_tables()[0])  # orders -> append, refused
 
 
 def test_batched_table_migrator_cdc_coexisting_skips_drop_uses_skip_existing() -> None:

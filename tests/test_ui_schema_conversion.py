@@ -79,6 +79,13 @@ from dsql_migrator.ui.schema_conversion import (
     selected_object_names,
     split_sql_statements,
 )
+from dsql_migrator.ui.schema_conversion import (
+    _render_pk_strategy_picker,
+    build_composite_conversion,
+    composite_leading_candidates,
+    composite_leading_from_ddl,
+    default_composite_leading,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1506,3 +1513,219 @@ def test_apply_should_replace_routes_edits_to_replace() -> None:
     assert _apply_should_replace(apply_mode=ApplyMode.SKIP_IF_EXISTS, edited=True)
     # A non-edited object in SKIP mode is not replaced (idempotent skip/create).
     assert not _apply_should_replace(apply_mode=ApplyMode.SKIP_IF_EXISTS, edited=False)
+
+
+# ---------------------------------------------------------------------------
+# Per-table Primary-key strategy picker (Phase 2: opt-in composite key)
+# ---------------------------------------------------------------------------
+
+
+def _pk_table(name: str = "orders") -> TableDef:
+    return TableDef(
+        name=name,
+        columns=[
+            ColumnDef(name="id", mysql_type="BIGINT", nullable=False),
+            ColumnDef(name="customer_id", mysql_type="BIGINT", nullable=False),
+            ColumnDef(name="region", mysql_type="VARCHAR(20)", nullable=False),
+            ColumnDef(name="note", mysql_type="TEXT", nullable=True),
+        ],
+        primary_key=["id"],
+        auto_increment_column="id",
+    )
+
+
+def test_composite_leading_candidates_excludes_nullable_and_pk() -> None:
+    # Only NOT NULL non-PK columns can lead a composite key (matches the converter
+    # validation), so the dropdown never offers an invalid choice.
+    assert composite_leading_candidates(_pk_table()) == ["customer_id", "region"]
+
+
+def test_default_composite_leading_is_first_candidate_or_none() -> None:
+    assert default_composite_leading(_pk_table()) == "customer_id"
+    # A table with no eligible column returns None (composite can't be offered).
+    no_lead = TableDef(
+        name="t",
+        columns=[
+            ColumnDef(name="id", mysql_type="INT", nullable=False),
+            ColumnDef(name="maybe", mysql_type="INT", nullable=True),
+        ],
+        primary_key=["id"],
+    )
+    assert default_composite_leading(no_lead) is None
+
+
+def test_composite_leading_from_ddl_round_trips_the_stored_choice() -> None:
+    # The picker keeps NO separate state: it infers the leading column back out of
+    # the stored (edited) target DDL. build -> render -> infer must round-trip.
+    table = _pk_table()
+    conversion = build_composite_conversion(SchemaConverter(), table, "customer_id")
+    stored = render_target_ddl(conversion)
+    assert composite_leading_from_ddl(table, stored) == "customer_id"
+
+
+def test_composite_leading_from_ddl_none_for_unchanged_key() -> None:
+    table = _pk_table()
+    deterministic = SchemaConverter().convert_table(table)
+    stored = render_target_ddl(deterministic)
+    # Unchanged key -> not composite -> the picker renders as "Keep integer PK".
+    assert composite_leading_from_ddl(table, stored) is None
+
+
+def test_build_composite_conversion_emits_unique_index_on_original_key() -> None:
+    conversion = build_composite_conversion(SchemaConverter(), _pk_table(), "customer_id")
+    script = render_target_ddl(conversion)
+    assert 'PRIMARY KEY ("customer_id", "id")' in script
+    assert "CREATE UNIQUE INDEX ASYNC" in script and '("id")' in script
+
+
+class _PickerEl:
+    """Chainable element double that captures a toggle/select's on_change handler."""
+
+    def __init__(self, recorder, kind, on_change=None):
+        self._recorder = recorder
+        self.kind = kind
+        self.on_change = on_change
+        self.disabled = False
+
+    def classes(self, *_a, **_k):
+        return self
+
+    def props(self, value="", *_a, **_k):
+        if "disable" in str(value):
+            self.disabled = True
+        return self
+
+    def tooltip(self, *_a, **_k):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _PickerUi:
+    """Minimal NiceGUI double capturing the picker's toggle + select + notices."""
+
+    def __init__(self):
+        self.toggle_el = None
+        self.select_el = None
+        self.select_options = None
+        self.select_value = None
+        self.notices: list[tuple[str, str]] = []  # (tone, header)
+        self.hints: list[str] = []
+
+    def card(self, *_a, **_k):
+        return _PickerEl(self, "card")
+
+    def row(self, *_a, **_k):
+        return _PickerEl(self, "row")
+
+    def column(self, *_a, **_k):
+        return _PickerEl(self, "column")
+
+    def label(self, *_a, **_k):
+        return _PickerEl(self, "label")
+
+    def icon(self, *_a, **_k):
+        return _PickerEl(self, "icon")
+
+    def space(self, *_a, **_k):
+        return _PickerEl(self, "space")
+
+    def html(self, *_a, **_k):
+        return _PickerEl(self, "html")
+
+    def toggle(self, options=None, *, value=None, on_change=None, **_k):
+        self.toggle_el = _PickerEl(self, "toggle", on_change=on_change)
+        return self.toggle_el
+
+    def select(self, options=None, *, value=None, on_change=None, label=None, **_k):
+        self.select_options = options
+        self.select_value = value
+        self.select_el = _PickerEl(self, "select", on_change=on_change)
+        return self.select_el
+
+
+def _event(value):
+    return type("Evt", (), {"value": value})()
+
+
+def test_pk_picker_selecting_composite_stores_composite_ddl() -> None:
+    ui = _PickerUi()
+    state = SchemaConversionState()
+    table = _pk_table()
+    refreshed: list[bool] = []
+    _render_pk_strategy_picker(ui, table, state, lambda: refreshed.append(True))
+
+    # Simulate choosing "Composite key" in the segmented control.
+    assert ui.toggle_el is not None
+    ui.toggle_el.on_change(_event("COMPOSITE"))
+
+    stored = state.get_edited_target_ddl("orders")
+    assert stored is not None
+    assert composite_leading_from_ddl(table, stored) == "customer_id"  # default lead
+    assert refreshed  # the screen re-rendered
+
+
+def test_pk_picker_leading_dropdown_switches_leading_column() -> None:
+    ui = _PickerUi()
+    state = SchemaConversionState()
+    table = _pk_table()
+    # Pre-seed a composite choice so the dropdown renders.
+    state.set_edited_target_ddl(
+        "orders", render_target_ddl(build_composite_conversion(SchemaConverter(), table, "customer_id"))
+    )
+    _render_pk_strategy_picker(ui, table, state, lambda: None)
+
+    # The dropdown offers exactly the eligible columns, preset to the current lead.
+    assert ui.select_options == ["customer_id", "region"]
+    assert ui.select_value == "customer_id"
+    # Switch the leading column to "region".
+    ui.select_el.on_change(_event("region"))
+    assert composite_leading_from_ddl(table, state.get_edited_target_ddl("orders")) == "region"
+
+
+def test_pk_picker_switching_back_to_keep_clears_override() -> None:
+    ui = _PickerUi()
+    state = SchemaConversionState()
+    table = _pk_table()
+    state.set_edited_target_ddl(
+        "orders", render_target_ddl(build_composite_conversion(SchemaConverter(), table, "customer_id"))
+    )
+    _render_pk_strategy_picker(ui, table, state, lambda: None)
+    ui.toggle_el.on_change(_event("KEEP"))
+    # Reverting to Keep integer PK drops the composite override entirely.
+    assert state.get_edited_target_ddl("orders") is None
+
+
+def test_pk_picker_disables_composite_when_no_eligible_leading() -> None:
+    ui = _PickerUi()
+    state = SchemaConversionState()
+    table = TableDef(
+        name="t",
+        columns=[
+            ColumnDef(name="id", mysql_type="INT", nullable=False),
+            ColumnDef(name="maybe", mysql_type="INT", nullable=True),
+        ],
+        primary_key=["id"],
+    )
+    _render_pk_strategy_picker(ui, table, state, lambda: None)
+    # No NOT NULL non-PK column -> composite offered but the control is disabled,
+    # and no dropdown/notice is rendered.
+    assert ui.toggle_el is not None and ui.toggle_el.disabled
+    assert ui.select_el is None
+
+
+def test_pk_picker_not_rendered_for_table_without_primary_key() -> None:
+    ui = _PickerUi()
+    state = SchemaConversionState()
+    keyless = TableDef(
+        name="k",
+        columns=[ColumnDef(name="v", mysql_type="INT", nullable=False)],
+        primary_key=[],
+    )
+    _render_pk_strategy_picker(ui, keyless, state, lambda: None)
+    # No PK -> no hot-partition concern -> the picker renders nothing.
+    assert ui.toggle_el is None

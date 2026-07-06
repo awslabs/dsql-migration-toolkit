@@ -274,6 +274,20 @@ Parameters:
       Kafka. Drive the default set from the Evaluation OVERSIZED_LOB rule; never
       list a PK column. Empty = exclude nothing.
 
+  MessageKeyColumns:
+    Type: String
+    Default: ""
+    Description: >-
+      Debezium message.key.columns value: composite record-key override for tables
+      whose Aurora DSQL target has a composite primary key (a high-cardinality
+      leading column prepended to the source PK to spread writes). Syntax:
+      "db.table:leading,pk;db2.table2:leading2,pk2" (";" between tables, ":" before
+      the column list, "," between columns; the table part is a regex). Debezium
+      then keys the change record on those columns so the sink's record-key
+      ON CONFLICT / DELETE match the target key -- no sink change needed. A listed
+      column must NOT be in ColumnExcludeList (it is read from the row/before-image
+      to build the key). Empty = key on the source primary key (default behavior).
+
   DeploySink:
     Type: String
     Default: "true"
@@ -342,6 +356,13 @@ Conditions:
   RegionProvided:
     Fn::Not:
       - Fn::Equals: [Ref: AwsRegion, ""]
+
+  # A composite record-key override is supplied. Debezium REJECTS an empty
+  # message.key.columns, so the key is omitted from the source connector config
+  # (AWS::NoValue) unless a value is present -- keeping the default source-PK key.
+  HasMessageKeyColumns:
+    Fn::Not:
+      - Fn::Equals: [Ref: MessageKeyColumns, ""]
 
   # Connectors are created only once the MSK Serverless bootstrap string is
   # supplied (it is not available via Ref/GetAtt, so it is a two-pass deploy).
@@ -1158,6 +1179,16 @@ Resources:
         # Empty (default) excludes nothing; never list a PK column.
         column.exclude.list:
           Ref: ColumnExcludeList
+        # Composite-PK re-key: when a table's DSQL target has a composite key
+        # (leading column prepended to the source PK), key the change record on
+        # those target columns so the sink's record-key ON CONFLICT/DELETE match.
+        # Debezium REJECTS an empty value, so the key is OMITTED (AWS::NoValue)
+        # when none is supplied -- then the record is keyed on the source PK.
+        message.key.columns:
+          Fn::If:
+            - HasMessageKeyColumns
+            - Ref: MessageKeyColumns
+            - Ref: AWS::NoValue
         # MSK Serverless does NOT auto-create topics (gotcha #8). Debezium must
         # create per-table data topics itself. replication.factor=-1 uses the
         # broker default (required for MSK Serverless). partitions must be a

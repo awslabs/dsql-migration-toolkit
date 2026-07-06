@@ -185,7 +185,11 @@ _EXPECTED_SCRIPTS = {
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("strategy", list(PrimaryKeyStrategy))
+# COMPOSITE_KEY is intentionally excluded from this inventory-wide snapshot: it is
+# a per-table, opt-in strategy that requires a leading column (SchemaConvertOptions
+# rejects it without one) and rewrites the key column set per table, so it is
+# covered by the dedicated per-table tests in test_converter.py, not a global snapshot.
+@pytest.mark.parametrize("strategy", list(_EXPECTED_SCRIPTS))
 def test_to_script_matches_snapshot(strategy: PrimaryKeyStrategy) -> None:
     """The rendered execution-unit script matches the pinned snapshot."""
     assert _convert(strategy).to_script() == _EXPECTED_SCRIPTS[strategy]

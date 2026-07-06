@@ -109,6 +109,79 @@ def test_dlq_topic_name_from_sink_config() -> None:
     assert dict(_params(dlq="custom-dlq").filled)["DlqTopicName"] == "custom-dlq"
 
 
+def test_message_key_columns_empty_when_no_composite() -> None:
+    # No composite re-key -> empty value (Debezium keys on the source PK).
+    assert dict(_params().filled)["MessageKeyColumns"] == ""
+
+
+def test_message_key_columns_rendered_for_composite_tables() -> None:
+    source = DebeziumSourceConfig(
+        name="mysql-source",
+        table_include_list=["app.orders"],
+        message_key_columns={"app.orders": ["customer_id", "id"]},
+    )
+    params = build_cdc_stack_params(
+        source, _sink(["app.orders"]), target_endpoint="c.dsql.us-east-1.on.aws"
+    )
+    assert dict(params.filled)["MessageKeyColumns"] == r"app\.orders:customer_id,id"
+
+
+def test_every_emitted_param_is_declared_in_the_template() -> None:
+    # Guard: a CFN deploy fails ("Parameters [X] do not exist in the template") if
+    # the tool emits a parameter the template does not declare. Cross-check every
+    # key emitted by the stack/infra/watermark builders against cdc-stack.yaml so a
+    # future param addition can't silently break the deploy. Parse the template
+    # tolerantly (it uses Fn:: long form plus occasional short tags).
+    import pathlib
+
+    import pytest
+
+    yaml = pytest.importorskip("yaml")
+
+    class _L(yaml.SafeLoader):
+        pass
+
+    def _any(loader, suffix, node):
+        if isinstance(node, yaml.ScalarNode):
+            return loader.construct_scalar(node)
+        if isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node)
+        return loader.construct_mapping(node)
+
+    _L.add_multi_constructor("!", _any)
+    template_path = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "deploy" / "cdc-stack" / "cdc-stack.yaml"
+    )
+    doc = yaml.load(template_path.read_text(encoding="utf-8"), Loader=_L)
+    declared = set(doc["Parameters"])
+
+    source = DebeziumSourceConfig(
+        name="s",
+        table_include_list=["app.orders"],
+        message_key_columns={"app.orders": ["customer_id", "id"]},
+    )
+    sink = _sink(["app.orders"])
+    stack = build_cdc_stack_params(source, sink, target_endpoint="ep.on.aws")
+    infra = build_cdc_infra_params(
+        source, sink, vpc_id="vpc-1", plugin_bucket_arn="arn",
+        debezium_plugin_s3_key="d", dsql_sink_plugin_s3_key="s",
+        source_db_hostname="h", source_secret_arn="a", source_secret_name="n",
+        dsql_cluster_arn="c", target_endpoint="ep", plugin_version="v12",
+    )
+    emitted = (
+        {k for k, _ in stack.filled}
+        | {k for k, _ in stack.placeholders}
+        | {k for k, _ in infra.filled}
+        | set(CDC_WATERMARK_PARAM_KEYS)
+    )
+    undeclared = emitted - declared
+    assert not undeclared, (
+        f"tool emits cdc-stack params the template does not declare: "
+        f"{sorted(undeclared)}"
+    )
+
+
 def test_target_connection_filled() -> None:
     p = build_cdc_stack_params(
         _source(("db.t",)),

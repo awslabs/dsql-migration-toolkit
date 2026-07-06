@@ -43,7 +43,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable, Literal, Optional, Sequence
+from typing import Callable, Literal, Mapping, Optional, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -269,7 +269,7 @@ class CdcCatchUp:
 # CDC pipeline orchestration (managed Debezium + MSK + custom DSQL Sink Connector)
 # ---------------------------------------------------------------------------
 #
-# TB-scale, continuous CDC (Requirement 12) runs as a pipeline whose data plane
+# Large-scale, continuous CDC (Requirement 12) runs as a pipeline whose data plane
 # is Kafka Connect connectors on managed MSK Connect (design Decision Log 결정
 # 변경 8): a Debezium MySQL source connector -> Amazon MSK -> our custom DSQL Sink
 # Connector plugin -> Aurora DSQL. This tool is the **control plane**: it builds
@@ -337,6 +337,18 @@ class DebeziumSourceConfig(BaseModel):
             "Debezium column.exclude.list -- oversized LOB columns whose values "
             "can exceed the Aurora DSQL 1 MiB per-value limit (spike H13). "
             "Maps to the cdc-stack ColumnExcludeList parameter. Empty = none."
+        ),
+    )
+    message_key_columns: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Per-table composite record-key override: {db.table: [leading, pk...]}. "
+            "For a table whose TARGET has a composite primary key (leading column "
+            "prepended), Debezium must key the change record on the SAME composite "
+            "columns so the sink's ON CONFLICT / DELETE match the target key. Maps "
+            "to Debezium message.key.columns; empty = key on the source PK "
+            "(unchanged behavior). The leading column is read from the source "
+            "row/before-image, so it must NOT be in column_exclude_list."
         ),
     )
 
@@ -555,6 +567,7 @@ class CdcPipelineOrchestrator:
         *,
         column_exclude_list: Optional[Sequence[str]] = None,
         resume_override: Optional[CdcResumePoint] = None,
+        message_key_columns: Optional[Mapping[str, Sequence[str]]] = None,
     ) -> DebeziumSourceConfig:
         """Build the Debezium source config for the selected tables.
 
@@ -576,6 +589,11 @@ class CdcPipelineOrchestrator:
         given it takes precedence over the watermark, so CDC can be seeded when no
         Full Load watermark exists in this session or when the operator needs a
         custom offset. When ``None`` the gapless watermark path is used.
+
+        ``message_key_columns`` (optional) maps ``{db.table: [target key cols]}``
+        for tables whose DSQL target has a composite primary key; Debezium then
+        keys the change record on those columns so the sink's record-key apply
+        matches the target key. Empty/omitted = key on the source PK (default).
         """
         resume = (
             resume_override
@@ -590,6 +608,10 @@ class CdcPipelineOrchestrator:
             start_binlog_file=resume.binlog_file,
             start_binlog_pos=resume.binlog_position,
             column_exclude_list=list(column_exclude_list or []),
+            message_key_columns={
+                table: list(cols)
+                for table, cols in (message_key_columns or {}).items()
+            },
         )
 
     def build_sink_config(
@@ -662,6 +684,81 @@ class CdcPipelineOrchestrator:
                     occurred_at=error.occurred_at or self._now(),
                 ),
             )
+
+
+def composite_key_columns_for_cdc(
+    tables: Sequence[TableDef],
+    table_conversions: "Mapping[str, object]",
+) -> dict[str, list[str]]:
+    """Map ``{db.table: [target key cols]}`` for tables with a composite target PK.
+
+    For each selected table whose APPLIED target primary key differs from its
+    source PK (a composite ``(leading, id)`` key chosen in Schema Conversion),
+    return the target key columns. Debezium is then told to key the change record
+    on exactly those columns (``message.key.columns``) so the sink's record-key
+    ON CONFLICT / DELETE match the target key -- no sink change needed.
+
+    Pure: reads each applied :class:`TableConversion`'s ``target_ddl`` and compares
+    its parsed primary key to ``table.primary_key``. A table with no applied
+    conversion, or an unparseable/absent target PK, is treated as unchanged (the
+    parser returning ``[]`` means "unknown") and omitted -- it keeps the source-PK
+    record key (today's behavior). Keys are the fully-qualified ``db.table`` names.
+    """
+    from dsql_migrator.core.converter import parse_target_primary_key
+
+    result: dict[str, list[str]] = {}
+    for table in tables:
+        conversion = table_conversions.get(table.name)
+        target_ddl = getattr(conversion, "target_ddl", None)
+        if not target_ddl:
+            continue
+        target_pk = parse_target_primary_key(target_ddl)
+        if target_pk and target_pk != list(table.primary_key):
+            result[table.name] = target_pk
+    return result
+
+
+def format_message_key_columns(message_key_columns: "Mapping[str, Sequence[str]]") -> str:
+    """Render the Debezium ``message.key.columns`` value from a per-table key map.
+
+    Debezium syntax: table entries separated by ``;``, the table pattern and its
+    columns separated by ``:``, and columns separated by ``,`` -- e.g.
+    ``app.orders:customer_id,id;app.items:tenant_id,id``. The table part is a Java
+    regex matched against ``db.table``; dots in the name are escaped so
+    ``app.orders`` matches literally (not ``appXorders``). Sorted for a stable,
+    reviewable value; empty input yields ``""`` (key on the source PK). Pure.
+    """
+    entries: list[str] = []
+    for table in sorted(message_key_columns):
+        cols = list(message_key_columns[table])
+        if not cols:
+            continue
+        pattern = table.replace(".", r"\.")
+        entries.append(f"{pattern}:{','.join(cols)}")
+    return ";".join(entries)
+
+
+def composite_cdc_excluded_key_columns(
+    message_key_columns: "Mapping[str, Sequence[str]]",
+    column_exclude_list: Sequence[str],
+) -> list[str]:
+    """Return ``db.table.column`` key columns that are wrongly in the exclude list.
+
+    A composite key column is read from the source row / before-image, so it must
+    NOT be dropped at capture via ``column.exclude.list`` -- if it were, Debezium
+    could not populate the record key and every change for that table would fail.
+    This is the ONE composite-CDC precondition to gate on before starting CDC
+    (the rest works via the source re-key). Returns the offending fully-qualified
+    columns (sorted); empty means safe to start. Pure.
+    """
+    excluded = set(column_exclude_list)
+    offending: list[str] = []
+    for table, cols in message_key_columns.items():
+        for col in cols:
+            qualified = f"{table}.{col}"
+            if qualified in excluded:
+                offending.append(qualified)
+    return sorted(offending)
 
 
 def build_cdc_status_view(
@@ -814,6 +911,11 @@ def build_cdc_stack_params(
         ("SinkTopics", sink_topics),
         ("DlqTopicName", sink_config.dlq_topic),
         ("ColumnExcludeList", ",".join(source_config.column_exclude_list)),
+        # Composite-PK re-key: Debezium keys the change record on the target's
+        # composite key so the sink's record-key ON CONFLICT/DELETE match it.
+        # Empty (the common case) leaves the record keyed on the source PK.
+        ("MessageKeyColumns",
+         format_message_key_columns(source_config.message_key_columns)),
         ("DsqlClusterEndpoint", target_endpoint),
         ("DsqlDatabaseName", target_database),
         ("DsqlConnectUser", target_username),
@@ -939,6 +1041,10 @@ def build_cdc_infra_params(
         ("SinkTopics", sink_topics),
         ("DlqTopicName", sink_config.dlq_topic),
         ("ColumnExcludeList", ",".join(source_config.column_exclude_list)),
+        # Composite-PK re-key (empty on the create path -- no connectors yet;
+        # Start CDC supplies the real value via build_cdc_stack_params).
+        ("MessageKeyColumns",
+         format_message_key_columns(source_config.message_key_columns)),
         # Plugin resource-name version suffix (gotcha #5: lets a new artifact get a
         # uniquely-named CustomPlugin instead of colliding on a fixed name).
         ("PluginVersion", plugin_version),

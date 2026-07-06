@@ -598,6 +598,7 @@ class BatchedImporter:
         shard_sources: Optional[
             "list[Iterable[Mapping[str, object]]]"
         ] = None,
+        key_columns: Optional[list[str]] = None,
     ) -> BatchedImportResult:
         """Load ``rows`` into ``table`` in bounded-parallel idempotent batches.
 
@@ -617,6 +618,9 @@ class BatchedImporter:
         total (Requirement 8.3). A re-load that mostly skips already-present rows
         therefore still shows movement rather than appearing stuck at zero. It is
         invoked from the draining thread (never concurrently for one call).
+        ``key_columns`` (optional) overrides the conflict/skip key with the TARGET
+        table's actual primary key (e.g. a composite ``(leading, id)``); when
+        omitted it falls back to ``options.key_columns`` then the source PK.
         Returns a structured :class:`BatchedImportResult`.
         """
         columns = [column.name for column in table.columns]
@@ -624,7 +628,17 @@ class BatchedImporter:
             raise BatchedImportError(
                 f"table '{table.name}' has no columns to import"
             )
-        key_columns = list(self._options.key_columns) or list(table.primary_key)
+        # Conflict-key resolution order: an explicit ``key_columns`` (the TARGET
+        # table's actual primary key, e.g. a composite (leading, id) chosen in
+        # Schema Conversion) wins, then options.key_columns, then the SOURCE table's
+        # PK. Passing the target PK here is what makes ON CONFLICT / SKIP_EXISTING
+        # match the constraint that actually exists on the recreated target -- see
+        # the Full Load engine, which derives it from the applied target DDL.
+        key_columns = (
+            list(key_columns)
+            if key_columns
+            else (list(self._options.key_columns) or list(table.primary_key))
+        )
         effective_on_conflict = on_conflict or self._options.on_conflict
         if effective_on_conflict is OnConflictMode.DO_UPDATE and not key_columns:
             raise BatchedImportError(
@@ -1158,7 +1172,7 @@ class BatchedImporter:
             return tuple(row[name] for name in key_columns)
 
         # Optimistic fast path: one plain INSERT of the whole batch, NO pre-SELECT.
-        # On a no-overlap load -- the dominant TB-scale initial CDC-coexisting case
+        # On a no-overlap load -- the dominant large-scale initial CDC-coexisting case
         # -- this is a single round-trip per batch (as fast as a clean load). Only
         # when a key already exists (a concurrent CDC insert or a re-run) does DSQL
         # raise a unique violation (23505); we then fall through to the SELECT-
