@@ -13,7 +13,7 @@
 ## Why a custom connector (and why Java)
 
 The standard managed JDBC sink retries OCC (`SQLSTATE 40001`) at **batch**
-granularity, which collapses throughput under high-contention TB-scale CDC
+granularity, which collapses throughput under high-contention large-scale CDC
 (결정 변경 8). This connector applies Debezium change events to Aurora DSQL while
 handling DSQL's constraints directly:
 

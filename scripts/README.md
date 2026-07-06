@@ -81,7 +81,7 @@ Loads your source tables into Aurora DSQL using the tool's own bulk loader.
   later start gaplessly from exactly that point.
 
 Memory stays bounded to one page per table regardless of table size (keyset
-streaming), so it is safe for very large / TB-scale tables. Exit `0` when every
+streaming), so it is safe for very large tables. Exit `0` when every
 table loaded; non-zero if any table failed or a row was quarantined (permanently
 rejected, e.g. a value over DSQL's ~1 MiB per-value limit).
 

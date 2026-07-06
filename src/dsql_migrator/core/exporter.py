@@ -637,7 +637,7 @@ def keyset_stream(
             yield row
 
         # One DEBUG line PER PAGE (never per row): PK range + count, so the read
-        # order is observable at TB scale without O(#rows) log volume. Guarded so
+        # order is observable at large scale without O(#rows) log volume. Guarded so
         # production (INFO) builds nothing. PK values + count only (Property 7).
         if _LOGGER.isEnabledFor(logging.DEBUG):
             single = len(pk_columns) == 1

@@ -44,7 +44,7 @@ Source MySQL ──binlog (ROW+GTID, read-only)──►  Debezium MySQL source 
 
 Why a *custom* sink and not a stock JDBC sink? A standard JDBC sink retries
 optimistic-concurrency conflicts (`SQLSTATE 40001`) **per batch**, which collapses
-throughput under high-contention TB-scale CDC. The custom sink retries at the
+throughput under high-contention large-scale CDC. The custom sink retries at the
 **statement level** and handles DSQL's short-lived IAM tokens, ≤3000-row batches,
 and reconnects (details in §4.4).
 

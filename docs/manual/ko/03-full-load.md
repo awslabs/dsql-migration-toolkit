@@ -164,7 +164,7 @@ quarantine됐는지 정확히 나열합니다.
 
 > **명령줄에서 Full Load 실행 (선택).** 동일한 벌크 로더를 CLI 스크립트로도 쓸 수 있습니다 —
 > `scripts/run_full_load.py`(먼저 계획 출력, 그다음 `--yes`; 선택적으로 `--clean`,
-> CDC 워터마크 캡처용 `--watermark-out`) — 웹 UI 없이 자동화나 TB급 실행에 유용합니다. 자세한 내용은
+> CDC 워터마크 캡처용 `--watermark-out`) — 웹 UI 없이 자동화나 대용량 실행에 유용합니다. 자세한 내용은
 > [`scripts/README.md`](../../../scripts/README.md) 참고. 소스는 읽기 전용, 로드는 UI와 똑같이
 > 멱등입니다.
 

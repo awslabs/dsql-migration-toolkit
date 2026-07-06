@@ -86,7 +86,7 @@ Full Load is the tool's **own bulk loader** (not a Debezium snapshot). It **stre
 source rows by **primary-key keyset pagination** (`WHERE pk > :last ORDER BY pk
 LIMIT n`, never `OFFSET`) over a server-side cursor and writes them as they flow,
 so **memory stays bounded by one page regardless of table size** — a whole table is
-never loaded into RAM. It's architected for **TB-scale** sources with very large
+never loaded into RAM. It's architected for **large-scale** sources with very large
 tables. See [Chapter 3 — Full Load](03-full-load.md).
 
 

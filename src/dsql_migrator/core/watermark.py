@@ -216,7 +216,7 @@ def estimate_source_rows(
 
     Reads the storage-engine row estimate from ``information_schema.tables.
     table_rows`` in a single metadata query -- never a ``COUNT(*)`` scan -- so it
-    adds negligible load to the source even for TB-scale tables. This is the
+    adds negligible load to the source even for large-scale tables. This is the
     scalable default for the per-table consistency view: source-side scans on a
     live production source must be avoided. A table missing from the estimate maps
     to ``None`` (unknown), distinct from a genuine 0. The estimate can drift from

@@ -701,7 +701,7 @@ def _diff_pks(
 # ---------------------------------------------------------------------------
 #
 # Default rows fetched per keyset page during reconciliation. Bounded so memory
-# stays at one page per side regardless of table size (TB-scale design).
+# stays at one page per side regardless of table size (large-scale design).
 _RECONCILE_PAGE_SIZE = 5000
 
 # How many diverging PKs to record per side in a ReconcileResult sample. The full

@@ -184,7 +184,7 @@ or lose the CDC handoff point.
 > **Run Full Load from the command line (optional).** The same bulk loader is
 > available as a CLI script — `scripts/run_full_load.py` (plan first, then `--yes`;
 > optional `--clean` and `--watermark-out` to capture the CDC watermark) — for
-> automation or a TB-scale run without the web UI. See
+> automation or a large-scale run without the web UI. See
 > [`scripts/README.md`](../../../scripts/README.md); the source is read-only and the
 > load is idempotent, exactly as in the UI.
 

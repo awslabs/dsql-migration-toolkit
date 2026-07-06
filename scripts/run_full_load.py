@@ -12,7 +12,7 @@ What it does, faithfully reusing the shipped engine:
      qualified as "<schema>"."<table>" so they land in a matching DSQL schema.
   3. Runs Full Load: keyset-streamed export -> bounded-parallel, idempotent
      ``INSERT ... ON CONFLICT`` batches with OCC retry (memory stays bounded to
-     one page per table regardless of size; TB-scale safe).
+     one page per table regardless of size; large-scale safe).
   4. Captures the binlog/GTID watermark and (optionally) writes it to a file, so
      you can start CDC gaplessly from exactly that point afterwards.
 
