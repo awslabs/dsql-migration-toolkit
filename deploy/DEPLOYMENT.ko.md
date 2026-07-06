@@ -324,7 +324,7 @@ Schema Conversion → Data Migration → Validation → Cut over). UI가 보이�
 | `AlbScheme` | no | `internal` | `internal` 또는 `internet-facing`. **권장: `internal`**(VPN/Direct Connect/피어링으로 도달); `internet-facing`은 Cognito 켤 때만. |
 | `CertificateArn` | yes | — | HTTPS(443) 리스너용 ACM 인증서 ARN. |
 | `ContainerImageUri` | no | 게시된 ECR Public 이미지 | ECR Public에 게시된 이미지가 기본 — 빌드 불필요. 제한된 네트워크(자체 프라이빗 ECR 사본 / pull-through 캐시)나 커스텀 빌드에만 오버라이드; immutable 태그 또는 digest 권장. |
-| `ContainerCpu` | no | `512` | Fargate 태스크 CPU 단위. **Full Load는 CPU-bound**(소스 리더가 행마다 Python 타입 변환 수행)이므로 대규모 마이그레이션에서는 올려야 함 — 동일 데이터의 payments+orders 로드 실측에서 **512(기본)보다 4096(4 vCPU)에서 약 3.8배 빨랐음**. 평가용은 기본 `512`로 충분, 실제 TB급 Full Load에는 **4096 이상** 권장. [매뉴얼 §7.2](../docs/manual/ko/07-performance-and-tuning.md#72-병렬수-튜닝) 참고. |
+| `ContainerCpu` | no | `512` | Fargate 태스크 CPU 단위. **Full Load는 CPU-bound**(소스 리더가 행마다 Python 타입 변환 수행)이므로 대규모 마이그레이션에서는 올려야 함 — 동일 데이터의 payments+orders 로드 실측에서 **512(기본)보다 4096(4 vCPU)에서 약 3.8배 빨랐음**. 평가용은 기본 `512`로 충분, 실제 대용량 Full Load에는 **4096 이상** 권장. [매뉴얼 §7.2](../docs/manual/ko/07-performance-and-tuning.md#72-병렬수-튜닝) 참고. |
 | `ContainerMemory` | no | `1024` | Fargate 태스크 메모리(MiB), CPU에 유효한 값(Fargate는 CPU `2048`이면 메모리 ≥ 4096, `4096`이면 ≥ 8192 필요). 메모리는 테이블 크기가 아니라 `table_parallelism × batch_parallelism × ~8 MiB`로 제한됨. |
 | `AppPort` | no | `8080` | 컨테이너 수신 포트. |
 | `AssignPublicIp` | no | `DISABLED` | NAT 없이 퍼블릭 서브넷에서 태스크 실행하려면 `ENABLED`(테스트); **권장: 프로덕션은 `DISABLED` 유지**(NAT 게이트웨이 또는 VPC 엔드포인트). |

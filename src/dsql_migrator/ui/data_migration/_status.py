@@ -306,7 +306,7 @@ def _fetch_migration_row_counts(migration_state, session, table_names, inventory
     # connection), instead of silently showing a dash that looks like a bug.
     source_available = False
     # Source side (MySQL): a scan-free row ESTIMATE (information_schema) + an
-    # index-only MAX(pk). Both are negligible-load even on TB-scale tables, so the
+    # index-only MAX(pk). Both are negligible-load even on large-scale tables, so the
     # consistency view never runs a COUNT(*) full scan against the live production
     # source. The estimate is a baseline (can drift under heavy writes); Validation
     # (Step 4) does the exact COUNT(*)/checksum reconciliation when needed.

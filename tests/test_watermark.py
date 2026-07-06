@@ -451,7 +451,7 @@ def test_max_pk_source_non_integer_max_is_none() -> None:
 
 def test_estimate_source_rows_uses_information_schema_not_count() -> None:
     # Reads the table_rows estimate via information_schema -- NO COUNT(*) scan
-    # (so it stays cheap on a TB-scale source).
+    # (so it stays cheap on a large-scale source).
     conn = _FakeConnection(counts={"orders": 12000, "items": 500}, current_db="cdc_demo")
     est = estimate_source_rows(conn, ["orders", "items"])
     assert est == {"orders": 12000, "items": 500}

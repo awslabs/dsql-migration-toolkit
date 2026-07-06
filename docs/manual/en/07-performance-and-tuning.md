@@ -7,7 +7,7 @@ _Language: **English** | [한국어](../ko/07-performance-and-tuning.md) | [日�
 This chapter explains **why** the tool's data path is built the way it is —
 grounded in how Aurora DSQL actually works — and **how** to tune its parallelism
 for your workload. If you're evaluating whether to trust this tool for a
-TB-scale migration, this is the technical case.
+large-scale migration, this is the technical case.
 
 > Every design choice below maps to a documented Aurora DSQL behavior or limit.
 > Sources: [DSQL quotas & limits](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html),
@@ -28,7 +28,7 @@ failure — `OC000` data conflict or `OC001` schema conflict). The losing
 transaction must **re-run**, and AWS explicitly notes that with OCC, "applications
 [must] exercise this logic **more frequently**" than with lock-based databases.
 
-A stock JDBC sink retries the **whole batch** on `40001`. At TB scale with
+A stock JDBC sink retries the **whole batch** on `40001`. At large scale with
 bounded parallelism that is the wrong unit: re-submitting all ~3000 rows
 re-pays the read/write work for the 99%+ that never conflicted, and the larger
 key range a transaction spans, the more likely *another* worker touches it before
@@ -206,7 +206,7 @@ CPU-bound**, not network-bound. The source reader converts every row's MySQL typ
 to its DSQL form in Python (per-cell, GIL-held), so throughput scales with CPU:
 in a measured payments+orders load, **4 vCPU ran ~3.8× faster than the 0.5 vCPU
 (512) default** on the same data. Use **0.5–1 vCPU for evaluation**, but **2–4 vCPU
-for a real TB-scale Full Load**. Beyond ~4 vCPU returns diminish for a single large
+for a real large-scale Full Load**. Beyond ~4 vCPU returns diminish for a single large
 table — the reader is one thread and tops out near one core, so the next lever is
 sharding the read across PK ranges (a future enhancement), not more vCPU. **Memory**
 (`ContainerMemory`) is bounded by `table_parallelism × batch_parallelism × ~8 MiB`
