@@ -115,6 +115,8 @@ def test_build_source_config_resume_override_takes_precedence() -> None:
     # Watermark's binlog coords are NOT used when an override is supplied.
     assert config.start_binlog_file is None
     assert config.start_binlog_pos is None
+    # Manual override path uses schema_only (no pre-existing schema-history topic).
+    assert config.snapshot_mode == "schema_only"
 
 
 def test_build_source_config_resume_override_binlog() -> None:
@@ -125,6 +127,8 @@ def test_build_source_config_resume_override_binlog() -> None:
     assert config.start_binlog_file == "mysql-bin.000999"
     assert config.start_binlog_pos == 12345
     assert config.start_gtid is None
+    # Manual override -> schema_only (brand-new connector, no schema-history).
+    assert config.snapshot_mode == "schema_only"
 
 
 def test_build_source_config_none_override_uses_watermark() -> None:

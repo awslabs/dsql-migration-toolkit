@@ -574,10 +574,18 @@ class CdcPipelineOrchestrator:
         Maps the resolved selection to ``table.include.list`` and seeds the start
         offset from the Full Load ``watermark`` via
         :meth:`CdcResumePoint.from_watermark`, so streaming resumes exactly where
-        the snapshot ended (gapless -- Property 11). Uses ``snapshot_mode=
-        recovery``: the bulk loader already loaded the rows and the offset is
-        seeded, so Debezium must rebuild its schema-history from the live DB
-        (without re-reading rows) and resume from the seeded offset.
+        the snapshot ended (gapless -- Property 11).
+
+        ``snapshot_mode`` is chosen automatically:
+
+        - **Gapless (watermark) path:** ``recovery`` — Debezium rebuilds its
+          schema-history from the live DB (without re-reading rows) and resumes
+          from the seeded offset. Requires the offset-seeder to have populated
+          both the connect-offsets and schema-history topics.
+        - **Manual override path (CDC-only, no Full Load):** ``schema_only`` —
+          Debezium reads the current source schema from scratch and begins
+          streaming from the user-supplied binlog position. Safe for a brand-new
+          connector with no pre-existing schema-history topic.
 
         ``column_exclude_list`` (optional) names fully-qualified columns
         (``db.table.column``) to drop at capture via Debezium
@@ -600,10 +608,20 @@ class CdcPipelineOrchestrator:
             if resume_override is not None
             else CdcResumePoint.from_watermark(watermark)
         )
+        # recovery: rebuilds schema-history from the live DB and resumes from a
+        # seeded offset. Requires a connect-offsets entry AND a populated
+        # schema-history topic (the offset-seeder Lambda creates both during the
+        # gapless Full-Load path).
+        # schema_only: reads the current source schema from scratch and starts
+        # streaming from the given binlog position. Safe for a brand-new connector
+        # with no pre-existing schema-history topic (the Manual/CDC-only path).
+        mode = (
+            "schema_only" if resume_override is not None else "recovery"
+        )
         return DebeziumSourceConfig(
             name=name,
             table_include_list=[table.name for table in tables],
-            snapshot_mode="recovery",
+            snapshot_mode=mode,
             start_gtid=resume.gtid_executed,
             start_binlog_file=resume.binlog_file,
             start_binlog_pos=resume.binlog_position,
