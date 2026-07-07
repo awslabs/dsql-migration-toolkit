@@ -64,7 +64,7 @@ from typing import Optional
 
 import sqlglot
 from sqlglot import exp
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from dsql_migrator.core.models import (
     Classification,
@@ -78,6 +78,12 @@ from dsql_migrator.core.models import (
 # strategy. A per-node cache hands out blocks of values so concurrent inserts do
 # not contend on a single hot key range in DSQL.
 _IDENTITY_CACHE_SIZE = 100
+
+# Aurora DSQL hard limits on primary/secondary keys (see the DSQL quotas docs).
+# Used to validate a COMPOSITE_KEY request so the converter never emits DDL that
+# DSQL would reject at CREATE/INSERT time. These are not configurable in DSQL.
+_DSQL_MAX_PK_COLUMNS = 8  # >8 -> error 54011 "more than 8 column keys ..."
+_DSQL_MAX_KEY_BYTES = 1024  # combined key >1 KiB -> error 54000 "key size too large"
 
 _MYSQL = "mysql"
 _POSTGRES = "postgres"
@@ -200,11 +206,19 @@ class PrimaryKeyStrategy(str, Enum):
     - ``IDENTITY_WITH_CACHE``: keep an integer key but generate it as an identity
       column with a per-node cache so concurrent inserts do not contend on one
       key range.
+    - ``COMPOSITE_KEY``: prepend a high-cardinality existing column to the primary
+      key, making it ``(leading_column, original_pk...)`` so DSQL scatters writes
+      across partitions instead of funnelling them to one key range. The source
+      data is unchanged; only the target key definition changes. The application's
+      queries/joins/upserts must key on the new composite key, and the leading
+      column must be immutable (DSQL primary keys cannot change after creation, and
+      CDC keys on it). Opt-in and per-table -- never the default.
     """
 
     KEEP_INTEGER = "KEEP_INTEGER"
     CONVERT_TO_UUID = "CONVERT_TO_UUID"
     IDENTITY_WITH_CACHE = "IDENTITY_WITH_CACHE"
+    COMPOSITE_KEY = "COMPOSITE_KEY"
 
 
 class SchemaConvertOptions(BaseModel):
@@ -214,6 +228,12 @@ class SchemaConvertOptions(BaseModel):
     key is rewritten for DSQL (Requirement 3.5). The default (``KEEP_INTEGER``)
     is the least invasive: it preserves the source key type and surfaces a
     hot-partition warning rather than silently changing the schema.
+
+    ``composite_leading_column`` names the existing column to prepend to the
+    primary key when ``primary_key_strategy`` is ``COMPOSITE_KEY``. It is required
+    for -- and only valid with -- that strategy; the model validator enforces that
+    pairing so a caller cannot silently request a composite key without a leading
+    column (or set a leading column that no strategy would use).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -222,6 +242,29 @@ class SchemaConvertOptions(BaseModel):
         default=PrimaryKeyStrategy.KEEP_INTEGER,
         description="How to handle a monotonic AUTO_INCREMENT primary key.",
     )
+    composite_leading_column: Optional[str] = Field(
+        default=None,
+        description=(
+            "Existing column to prepend to the primary key for COMPOSITE_KEY; "
+            "required for and only valid with that strategy."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_composite_pairing(self) -> "SchemaConvertOptions":
+        is_composite = self.primary_key_strategy is PrimaryKeyStrategy.COMPOSITE_KEY
+        has_leading = self.composite_leading_column is not None
+        if is_composite and not has_leading:
+            raise ValueError(
+                "COMPOSITE_KEY requires composite_leading_column to name the "
+                "column to prepend to the primary key."
+            )
+        if has_leading and not is_composite:
+            raise ValueError(
+                "composite_leading_column is only valid with the COMPOSITE_KEY "
+                "primary_key_strategy."
+            )
+        return self
 
 
 class ExecutionUnitKind(str, Enum):
@@ -619,6 +662,44 @@ def parse_target_column_types(create_ddl: str) -> dict[str, str]:
     return types
 
 
+def parse_target_primary_key(create_ddl: str) -> list[str]:
+    """Return the PRIMARY KEY column names (in key order) from a CREATE TABLE DDL.
+
+    Parses an applied/edited DSQL (PostgreSQL) ``CREATE TABLE`` and extracts the
+    primary-key column list, handling both a table-level ``PRIMARY KEY (a, b)``
+    constraint and an inline ``col ... PRIMARY KEY`` single-column key. This lets
+    the Full Load loader use the *applied* target PK (e.g. a composite
+    ``(leading, id)`` chosen in Schema Conversion) as the ``ON CONFLICT`` /
+    ``SKIP_EXISTING`` conflict key instead of assuming it equals the source PK.
+
+    Returns an empty list when the DDL is not a parseable ``CREATE TABLE`` or
+    declares no primary key. IMPORTANT: an empty list means "unknown" -- the caller
+    must NOT silently substitute the source PK for a table the user opted into a
+    changed (composite) key; it should require the target PK explicitly and fail
+    loudly on disagreement (see the Full Load engine wiring).
+    """
+    try:
+        parsed = sqlglot.parse_one(create_ddl, read="postgres")
+    except Exception:  # noqa: BLE001 - unparseable DDL -> unknown (empty list)
+        return []
+    if not isinstance(parsed, exp.Create):
+        return []
+    # Table-level: PRIMARY KEY (a, b) lives as an exp.PrimaryKey inside the schema
+    # expressions (the same list that holds the ColumnDefs).
+    for schema in parsed.find_all(exp.Schema):
+        for e in schema.expressions:
+            if isinstance(e, exp.PrimaryKey):
+                cols = [c.name for c in e.expressions if c.name]
+                if cols:
+                    return cols
+    # Inline: col <type> PRIMARY KEY (single-column key on a ColumnDef).
+    for column_def in parsed.find_all(exp.ColumnDef):
+        for _ in column_def.find_all(exp.PrimaryKeyColumnConstraint):
+            if column_def.name:
+                return [column_def.name]
+    return []
+
+
 def map_mysql_type(mysql_type: str) -> tuple[str, Optional[ConversionWarning]]:
     """Map a MySQL type string to a DSQL type string and optional warning.
 
@@ -954,6 +1035,35 @@ def _unparsable_table_conversion(
     )
 
 
+def _invalid_composite_conversion(table: TableDef, reason: str) -> "TableConversion":
+    """Build an UNSUPPORTED conversion for an invalid COMPOSITE_KEY request.
+
+    Mirrors :func:`_unparsable_table_conversion`: a bad leading-column choice
+    surfaces this one table as UNSUPPORTED (comment placeholder + classified
+    warning) so the user must fix the choice, rather than raising and blanking the
+    whole Schema Conversion step. The UI validates before applying, so this is the
+    backstop for a stale/forced options object.
+    """
+    return TableConversion(
+        table=table.name,
+        target_ddl=(
+            f"-- Could not apply a composite primary key to {table.name}: {reason}"
+        ),
+        schema_ddls=[],
+        index_ddls=[],
+        preserved_foreign_keys=list(table.foreign_keys),
+        warnings=[
+            ConversionWarning(
+                object_name=table.name,
+                classification=Classification.UNSUPPORTED,
+                message=(
+                    f"Composite primary key not applied to {table.name}: {reason}"
+                ),
+            )
+        ],
+    )
+
+
 def _strip_column_collation(column_def: exp.ColumnDef) -> Optional[str]:
     """Remove a MySQL ``COLLATE <name>`` constraint from ``column_def`` in place.
 
@@ -1044,6 +1154,198 @@ def _find_column_def(create: exp.Expression, column_name: str) -> Optional[exp.C
         if column_def.name == column_name:
             return column_def
     return None
+
+
+class CompositeKeyError(ValueError):
+    """A requested COMPOSITE_KEY leading column is invalid for Aurora DSQL.
+
+    Raised by :func:`_apply_composite_key` (and surfaced by the pure validator
+    :func:`validate_composite_leading_column`) when the chosen leading column
+    would produce a primary key DSQL rejects -- e.g. the column does not exist, is
+    nullable, is already in the key, or the composite key would exceed DSQL's
+    column-count or byte limits. The message is user-facing (English).
+    """
+
+
+# Best-effort byte sizes for the DSQL 1 KiB combined-key budget, keyed by the
+# converted (target) sqlglot DataType. DSQL enforces the real limit at runtime;
+# this catches an obviously-too-large composite key at conversion time so the user
+# sees the problem in Schema Conversion instead of a 54000 error mid-load.
+_T = exp.DataType.Type
+_KEY_TYPE_BYTES: dict = {
+    _T.BOOLEAN: 1,
+    _T.TINYINT: 1,
+    _T.SMALLINT: 2,
+    _T.INT: 4,
+    _T.BIGINT: 8,
+    _T.FLOAT: 4,
+    _T.DOUBLE: 8,
+    _T.DATE: 4,
+    _T.TIME: 8,
+    _T.TIMESTAMP: 8,
+    _T.TIMESTAMPTZ: 8,
+    _T.UUID: 16,
+}
+# Per-column cap DSQL applies to a variable-length (char/varchar/text) column when
+# it participates in a key, regardless of the column's declared length.
+_DSQL_MAX_VARLEN_KEY_BYTES = 255
+_VARLEN_KEY_TYPES = frozenset({_T.VARCHAR, _T.CHAR, _T.NCHAR, _T.NVARCHAR, _T.BPCHAR, _T.TEXT})
+
+
+def _estimate_key_column_bytes(create: exp.Expression, column_name: str) -> int:
+    """Estimate the DSQL key bytes a converted column contributes (upper bound).
+
+    Reads the post-type-mapping :class:`exp.DataType` from ``create`` so the
+    estimate reflects the TARGET type (e.g. a MySQL ``INT`` widened to ``bigint``).
+    Variable-length string types are counted at the DSQL 255-byte key cap (their
+    per-column ceiling in a key); ``numeric(p, s)`` at roughly ``ceil(p/2) + 2``;
+    an unknown type conservatively at the 255-byte cap so we never under-count.
+    """
+    column_def = _find_column_def(create, column_name)
+    data_type = column_def.args.get("kind") if column_def is not None else None
+    if not isinstance(data_type, exp.DataType):
+        return _DSQL_MAX_VARLEN_KEY_BYTES
+    kind = data_type.this
+    if kind in _KEY_TYPE_BYTES:
+        return _KEY_TYPE_BYTES[kind]
+    if kind in (_T.DECIMAL,):
+        params = [int(e.name) for e in data_type.expressions if e.name.isdigit()]
+        precision = params[0] if params else 38
+        return (precision // 2) + 2
+    if kind in _VARLEN_KEY_TYPES:
+        return _DSQL_MAX_VARLEN_KEY_BYTES
+    # Any other converted type (e.g. bytea fallback) -- count the key cap so a
+    # pathological choice is caught rather than silently under-counted.
+    return _DSQL_MAX_VARLEN_KEY_BYTES
+
+
+def _composite_key_columns(table: TableDef, leading: str) -> list[str]:
+    """The resulting composite key order: leading column first, then the source PK."""
+    return [leading] + [c for c in table.primary_key if c != leading]
+
+
+def validate_composite_leading_column(
+    table: TableDef, leading: str, create: Optional[exp.Expression] = None
+) -> Optional[str]:
+    """Return an error message if ``leading`` is an invalid composite-key leader.
+
+    Pure, side-effect-free validation of the DSQL structural rules (so the UI can
+    call it to gate the picker and render an inline error, and the converter can
+    call it before mutating the DDL -- one source of truth). Returns ``None`` when
+    the leading column is valid. ``create`` is the parsed (post-type-mapping)
+    CREATE node used for the byte estimate; when omitted the byte check is skipped
+    (the UI pre-check does not have it, and DSQL still enforces the limit).
+
+    Blocking rules (never emit a key DSQL would reject):
+    - the table has a primary key to prepend to;
+    - the leading column exists on the table;
+    - the leading column is NOT NULL (a key column cannot be nullable);
+    - the leading column is not already part of the primary key (no-op / reorder);
+    - the resulting key has at most 8 columns;
+    - the estimated combined key size is at most 1 KiB.
+    """
+    if not table.primary_key:
+        return (
+            f"Table '{table.name}' has no primary key to extend into a composite "
+            "key. Add a primary key first."
+        )
+    column = next((c for c in table.columns if c.name == leading), None)
+    if column is None:
+        return (
+            f"Leading column '{leading}' does not exist on table '{table.name}'. "
+            "Choose an existing column."
+        )
+    if column.nullable:
+        return (
+            f"Leading column '{leading}' is nullable; a primary-key column must be "
+            "NOT NULL. Choose a NOT NULL column."
+        )
+    if leading in table.primary_key:
+        return (
+            f"Leading column '{leading}' is already part of the primary key, so "
+            "prepending it would not change write distribution. Choose a "
+            "high-cardinality column that is not already in the key."
+        )
+    key_columns = _composite_key_columns(table, leading)
+    if len(key_columns) > _DSQL_MAX_PK_COLUMNS:
+        return (
+            f"The composite key {tuple(key_columns)} has {len(key_columns)} "
+            f"columns; Aurora DSQL allows at most {_DSQL_MAX_PK_COLUMNS}."
+        )
+    if create is not None:
+        total = sum(_estimate_key_column_bytes(create, c) for c in key_columns)
+        if total > _DSQL_MAX_KEY_BYTES:
+            return (
+                f"The composite key {tuple(key_columns)} is estimated at ~{total} "
+                f"bytes, over Aurora DSQL's {_DSQL_MAX_KEY_BYTES}-byte key limit. "
+                "Choose a smaller leading column."
+            )
+    return None
+
+
+def _apply_composite_key(
+    create: exp.Expression, table: TableDef, leading: str
+) -> ConversionWarning:
+    """Prepend ``leading`` to the primary key in ``create`` (COMPOSITE_KEY).
+
+    Rewrites the parsed table-level ``PRIMARY KEY`` node to
+    ``(leading, original_pk...)`` so DSQL scatters writes by the high-cardinality
+    leading column instead of funnelling them into one key range. The source data
+    is untouched -- only the target key definition changes. Raises
+    :class:`CompositeKeyError` when the leading column is invalid (see
+    :func:`validate_composite_leading_column`). Returns a MANUAL warning stating
+    the consequence (the application must key on the new composite key, and the
+    leading column must be immutable).
+    """
+    error = validate_composite_leading_column(table, leading, create)
+    if error is not None:
+        raise CompositeKeyError(error)
+
+    key_columns = _composite_key_columns(table, leading)
+    primary_key = next(iter(create.find_all(exp.PrimaryKey)), None)
+    if primary_key is None:
+        # _build_source_ddl always emits a table-level PRIMARY KEY, so this is a
+        # defensive guard, not an expected path.
+        raise CompositeKeyError(
+            f"Table '{table.name}' has no table-level PRIMARY KEY clause to rewrite."
+        )
+    primary_key.set(
+        "expressions",
+        [exp.to_identifier(name, quoted=True) for name in key_columns],
+    )
+    original = ", ".join(table.primary_key)
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        message=(
+            f"Primary key changed to composite {tuple(key_columns)} (leading "
+            f"column '{leading}') to spread writes across Aurora DSQL partitions "
+            f"and avoid the hot partition a monotonic key ({original}) causes. "
+            "IMPORTANT: the application's queries, joins, and upserts must now key "
+            f"on {tuple(key_columns)}, and the leading column '{leading}' must be "
+            "immutable (DSQL primary keys cannot change after creation, and CDC "
+            f"keys on it). A UNIQUE INDEX on the original key ({original}) is added "
+            "to preserve its uniqueness."
+        ),
+    )
+
+
+def _composite_unique_index_ddl(table: TableDef) -> str:
+    """A ``CREATE UNIQUE INDEX ASYNC`` preserving the original PK's uniqueness.
+
+    A composite key ``(leading, id)`` no longer makes the original key (``id``)
+    unique on its own, so global uniqueness of the source key would be silently
+    lost. This emits a unique async index on the original primary-key columns to
+    keep that guarantee. Identifiers are quoted via ``sqlglot`` (Requirement 9.4);
+    the index name is unqualified (created in the table's schema).
+    """
+    _, obj = _split_qualified(table.name)
+    index_name = "ux_" + "_".join([obj, *table.primary_key])
+    columns = ", ".join(_quote_pg_identifier(c) for c in table.primary_key)
+    return (
+        f"CREATE UNIQUE INDEX ASYNC {_quote_pg_identifier(index_name)} "
+        f"ON {_quote_pg_qualified(table.name)} ({columns})"
+    )
 
 
 def _apply_pk_strategy(
@@ -1299,9 +1601,28 @@ class SchemaConverter:
         # Apply DSQL structural constraints (Requirements 3.3, 3.5). Foreign keys
         # are never emitted by _build_source_ddl, so removal only requires
         # preserving them as metadata plus a warning.
-        pk_strategy_warning = _apply_pk_strategy(
-            create, table, options.primary_key_strategy
-        )
+        #
+        # COMPOSITE_KEY is distinct from the auto-increment strategies: it rewrites
+        # the KEY COLUMN SET (prepending a high-cardinality leading column) rather
+        # than the auto-increment column's type, and applies even when there is no
+        # AUTO_INCREMENT column. An invalid leading column must not blank the whole
+        # Schema Conversion step, so an invalid choice is isolated as UNSUPPORTED
+        # (mirrors the unparsable-table fallback), never raised.
+        extra_index_ddls: list[str] = []
+        if options.primary_key_strategy is PrimaryKeyStrategy.COMPOSITE_KEY:
+            leading = options.composite_leading_column or ""
+            try:
+                pk_strategy_warning: Optional[ConversionWarning] = _apply_composite_key(
+                    create, table, leading
+                )
+            except CompositeKeyError as exc:
+                return _invalid_composite_conversion(table, str(exc))
+            # Preserve the original key's uniqueness, which a composite key drops.
+            extra_index_ddls.append(_composite_unique_index_ddl(table))
+        else:
+            pk_strategy_warning = _apply_pk_strategy(
+                create, table, options.primary_key_strategy
+            )
         for optional_warning in (
             pk_strategy_warning,
             _no_primary_key_warning(table),
@@ -1321,7 +1642,7 @@ class SchemaConverter:
             table=table.name,
             target_ddl=target_ddl,
             schema_ddls=schema_ddls,
-            index_ddls=_build_index_ddls(table),
+            index_ddls=_build_index_ddls(table) + extra_index_ddls,
             preserved_foreign_keys=list(table.foreign_keys),
             warnings=warnings,
         )
@@ -1434,4 +1755,8 @@ __all__ = [
     "map_data_type",
     "map_mysql_type",
     "build_source_table_ddl",
+    "parse_target_column_types",
+    "parse_target_primary_key",
+    "CompositeKeyError",
+    "validate_composite_leading_column",
 ]

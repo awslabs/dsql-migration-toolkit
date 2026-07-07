@@ -51,6 +51,7 @@ from dsql_migrator.core.activity_log import (
 )
 from dsql_migrator.core.cdc import (
     CdcPipelineOrchestrator,
+    composite_key_columns_for_cdc,
 )
 from dsql_migrator.core.converter import SchemaConverter
 from dsql_migrator.core.error_log import ErrorLogStore
@@ -469,6 +470,19 @@ def build_data_migration_screen(
             )
             status = promoted
         inventory = _inventory()
+
+        # Composite-PK CDC re-key: when a table's applied Schema Conversion gave it
+        # a composite target key, Debezium must key its change record on those same
+        # columns (message.key.columns) so the sink's record-key ON CONFLICT/DELETE
+        # match the target -- no sink change. Recompute from the applied conversion
+        # each render and store it on the state for the CDC start path to read.
+        if inventory is not None and inventory.tables:
+            _applied = applied_table_conversions(
+                SchemaConverter().convert(inventory), conv_state.edited_target_ddls
+            )
+            migration_state.set_cdc_message_key_columns(
+                composite_key_columns_for_cdc(inventory.tables, _applied)
+            )
 
         async def run_checks(mode: MigrationMode) -> None:
             """Run read-only prerequisite checks for ``mode`` off the event loop."""

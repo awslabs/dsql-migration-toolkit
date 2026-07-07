@@ -111,6 +111,12 @@ class DataMigrationState:
         # Feeds the connector template's ColumnExcludeList (Debezium
         # column.exclude.list); an explicit, opt-in choice (no silent data loss).
         self._cdc_excluded_lob_columns: dict[str, set[str]] = {}
+        # Composite-PK record-key override for CDC, keyed by db.table -> target key
+        # columns [leading, pk...]. Set from the applied Schema Conversion when a
+        # table's DSQL target has a composite key, so Debezium re-keys the change
+        # record (message.key.columns) to match the target's ON CONFLICT/DELETE key
+        # -- no sink change needed. Empty => every table keys on its source PK.
+        self._cdc_message_key_columns: dict[str, list[str]] = {}
         # How the operator chose the CDC start point: "auto" (gapless from the
         # Full Load watermark) or "manual" (an explicit GTID / binlog position).
         # An explicit mode (vs. inferring it from whether an override is set)
@@ -199,6 +205,27 @@ class DataMigrationState:
             return {
                 table: set(columns)
                 for table, columns in self._cdc_excluded_lob_columns.items()
+            }
+
+    def set_cdc_message_key_columns(
+        self, message_key_columns: "dict[str, list[str]]"
+    ) -> None:
+        """Record the composite record-key override for CDC (db.table -> key cols).
+
+        Replaces the whole map (recomputed from the applied Schema Conversion on
+        each render). Empty means every table keys on its source PK.
+        """
+        with self._lock:
+            self._cdc_message_key_columns = {
+                table: list(cols) for table, cols in message_key_columns.items()
+            }
+
+    def cdc_message_key_columns(self) -> "dict[str, list[str]]":
+        """Return a copy of the composite record-key override map for CDC."""
+        with self._lock:
+            return {
+                table: list(cols)
+                for table, cols in self._cdc_message_key_columns.items()
             }
 
     def set_cdc_start_mode(self, mode: str) -> None:

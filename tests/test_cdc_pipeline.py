@@ -28,7 +28,11 @@ from dsql_migrator.core.cdc import (
     ConnectorState,
     ConnectorStatus,
     build_cdc_status_view,
+    composite_cdc_excluded_key_columns,
+    composite_key_columns_for_cdc,
+    format_message_key_columns,
 )
+from dsql_migrator.core.converter import TableConversion
 from dsql_migrator.core.error_log import ErrorLogStore
 from dsql_migrator.core.models import ErrorLogSummary, LoadKind, TableDef, Watermark
 
@@ -250,3 +254,75 @@ def test_build_cdc_status_view_empty() -> None:
     assert view.lag_seconds is None
     assert view.caught_up_to is None
     assert view.tables == []
+
+
+# ---------------------------------------------------------------------------
+# Composite-PK CDC via Debezium source re-key (message.key.columns)
+# ---------------------------------------------------------------------------
+
+
+def _composite_conversions():
+    return {
+        "app.orders": TableConversion(
+            table="app.orders",
+            target_ddl=(
+                'CREATE TABLE "app"."orders" ("id" bigint NOT NULL, '
+                '"customer_id" bigint NOT NULL, PRIMARY KEY ("customer_id", "id"))'
+            ),
+        ),
+        "app.customers": TableConversion(
+            table="app.customers",
+            target_ddl='CREATE TABLE "app"."customers" ("id" bigint NOT NULL, '
+            'PRIMARY KEY ("id"))',
+        ),
+    }
+
+
+def test_composite_key_columns_for_cdc_returns_target_key_for_changed_tables() -> None:
+    tables = _tables()  # app.orders, app.customers -- both source PK [id]
+    # Only the composite table maps to its (leading, id) target key; the unchanged
+    # one is omitted (keeps the source-PK record key).
+    assert composite_key_columns_for_cdc(tables, _composite_conversions()) == {
+        "app.orders": ["customer_id", "id"],
+    }
+
+
+def test_composite_key_columns_for_cdc_ignores_unknown_or_missing() -> None:
+    tables = _tables()
+    # No conversion, and an unparseable target_ddl (parse -> []), both mean
+    # "unknown" -> omitted (keyed on the source PK; today's behavior).
+    conversions = {
+        "app.customers": TableConversion(
+            table="app.customers", target_ddl="-- not auto-converted"
+        ),
+    }
+    assert composite_key_columns_for_cdc(tables, conversions) == {}
+
+
+def test_format_message_key_columns_debezium_syntax_and_regex_escaping() -> None:
+    # ';' between tables, ':' before columns, ',' between columns; dots escaped so
+    # the table pattern matches literally.
+    value = format_message_key_columns(
+        {"app.orders": ["customer_id", "id"], "app.items": ["tenant_id", "id"]}
+    )
+    assert value == r"app\.items:tenant_id,id;app\.orders:customer_id,id"
+    assert format_message_key_columns({}) == ""
+
+
+def test_build_source_config_threads_message_key_columns() -> None:
+    orch = CdcPipelineOrchestrator()
+    config = orch.build_source_config(
+        "src", _tables(), _watermark(),
+        message_key_columns={"app.orders": ["customer_id", "id"]},
+    )
+    assert config.message_key_columns == {"app.orders": ["customer_id", "id"]}
+
+
+def test_composite_cdc_excluded_key_columns_flags_excluded_key() -> None:
+    mkc = {"app.orders": ["customer_id", "id"]}
+    # A key column wrongly in the exclude list is flagged (Debezium can't build the
+    # key from a column dropped at capture); an unrelated exclusion is fine.
+    assert composite_cdc_excluded_key_columns(
+        mkc, ["app.orders.customer_id", "app.orders.blob_col"]
+    ) == ["app.orders.customer_id"]
+    assert composite_cdc_excluded_key_columns(mkc, ["app.orders.blob_col"]) == []

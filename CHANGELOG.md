@@ -5,6 +5,35 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.64
+
+### Added
+
+- **Opt-in per-table composite primary key (write hot-partition fix).** Aurora
+  DSQL stores rows in primary-key order, so a monotonic `AUTO_INCREMENT` key
+  funnels every insert into one partition — a write hot partition that caps
+  throughput. Schema Conversion (Step 2) now offers a per-table **primary key**
+  picker: keep the integer key (default, unchanged) or switch to a **composite
+  key** that prepends a high-cardinality column you choose (e.g.
+  `(customer_id, id)`) so writes spread across partitions. The source MySQL schema
+  is never changed — only the DSQL target key. The tool only offers NOT NULL,
+  non-key columns as the leading column, validates the result against DSQL's key
+  limits (≤ 8 columns, ≤ 1 KiB), and emits a `CREATE UNIQUE INDEX ASYNC` on the
+  original key so its uniqueness is preserved. A notice at selection time spells
+  out the consequence: after cutover the application's queries, joins, and upserts
+  must use the new composite key, and the leading column must be immutable.
+  - **Full Load** loads a composite table correctly: the idempotent
+    `INSERT ... ON CONFLICT` now keys on the **target** primary key (previously it
+    always used the source key), so a changed key no longer mismatches the target
+    constraint. Appending into an existing table whose target key differs is
+    refused with a clear message (reload fresh to apply the new key first).
+  - **CDC** replicates a composite table with no connector/plugin change: the
+    Debezium source is re-keyed via `message.key.columns` so each change record's
+    key matches the target composite key, and the sink's idempotent upsert/delete
+    apply against it unchanged. CDC start refuses to proceed only if a composite
+    key column was also chosen for LOB exclusion (it must be captured to build the
+    key), with an actionable message.
+
 ## v0.1.63
 
 ### Changed

@@ -44,7 +44,12 @@
 #   MEASURE_SCHEMA   schema to load (default: customers_sample)
 #   MEASURE_TABLES   space-separated table subset (default: all registered)
 #   VARIANTS         which variants to run, space-separated (default: "off on";
-#                    "off" = prefetch disabled/baseline, "on" = prefetch enabled)
+#                    "off" = prefetch disabled/baseline, "on" = prefetch enabled,
+#                    "shardN" = prefetch + N reader shards, "keep" = composite-A/B
+#                    baseline (integer PK), "composite" = composite PK on
+#                    COMPOSITE_LEADING). For the composite A/B: VARIANTS="keep composite".
+#   COMPOSITE_LEADING  high-cardinality column prepended to each table's PK for the
+#                    "composite" variant (e.g. customer_id; required by that variant).
 #   TABLE_PARALLELISM / BATCH_PARALLELISM  loader knobs (default 4 / 8)
 #   PROGRESS_INTERVAL  seconds between live progress logs (default 30)
 #   OUT_DIR          local dir for recovered reports (default: perf-runs)
@@ -111,11 +116,11 @@ mkdir -p "${OUT_DIR}"
 # containerOverrides has no entryPoint field). So the command override is a
 # SINGLE-element array holding the shell string that `sh -c` runs.
 build_cmd_json() {
-  local report_path="$1" no_prefetch="$2" reader_shards="${3:-0}"
+  local report_path="$1" no_prefetch="$2" reader_shards="${3:-0}" composite_leading="${4:-}"
   python3 - "$MEASURE_SCHEMA" "$MEASURE_TABLES" "$TABLE_PARALLELISM" "$BATCH_PARALLELISM" \
-            "$PROGRESS_INTERVAL" "$report_path" "$no_prefetch" "$reader_shards" <<'PY'
+            "$PROGRESS_INTERVAL" "$report_path" "$no_prefetch" "$reader_shards" "$composite_leading" <<'PY'
 import json, sys
-schema, tables, tp, bp, interval, report, no_prefetch, reader_shards = sys.argv[1:9]
+schema, tables, tp, bp, interval, report, no_prefetch, reader_shards, composite_leading = sys.argv[1:10]
 measure = ["python", "scripts/measure_performance.py", "full-load", "--yes",
            "--schema", schema, "--table-parallelism", tp, "--batch-parallelism", bp,
            "--progress-interval", interval, "--report", report]
@@ -127,6 +132,10 @@ if reader_shards and reader_shards not in ("0", "1"):
     # reader range sharding on: also lower the size threshold so payments/orders
     # (each ~9M) qualify regardless of the default 1M gate.
     measure += ["--reader-shards", reader_shards]
+if composite_leading.strip():
+    # Composite-PK variant: prepend this high-cardinality column to each table's
+    # PK (a table lacking it is skipped by measure_performance, keeping its key).
+    measure += ["--composite-leading", composite_leading]
 # Run the measure, then emit the report between markers so the wrapper can recover
 # it from CloudWatch Logs (the task's /tmp is lost when it stops). The report JSON
 # has no trailing newline, so a bare `cat` would print `}===REPORT-END===` on one
@@ -175,25 +184,29 @@ PY
 }
 
 run_variant() {
-  local variant="$1"          # "off" | "on" | "shardN" (e.g. shard4)
-  # Map the variant name to (prefetch on/off, reader-shards). "off" = pre-prefetch
-  # baseline; "on" = prefetch, single reader; "shardN" = prefetch + N shard readers.
-  local no_prefetch prefetch_env reader_shards=0
+  local variant="$1"          # "off" | "on" | "shardN" | "keep" | "composite"
+  # Map the variant name to (prefetch on/off, reader-shards, composite-leading).
+  # "off" = pre-prefetch baseline; "on" = prefetch, single reader; "shardN" =
+  # prefetch + N shard readers; "keep" = prefetch on, integer PK (composite A/B
+  # baseline); "composite" = prefetch on + composite PK on COMPOSITE_LEADING.
+  local no_prefetch prefetch_env reader_shards=0 composite_leading=""
   case "${variant}" in
-    off)      no_prefetch=1; prefetch_env=0 ;;
-    on)       no_prefetch=0; prefetch_env=1 ;;
-    shard*)   no_prefetch=0; prefetch_env=1; reader_shards="${variant#shard}" ;;
-    *)        no_prefetch=0; prefetch_env=1 ;;
+    off)        no_prefetch=1; prefetch_env=0 ;;
+    on)         no_prefetch=0; prefetch_env=1 ;;
+    shard*)     no_prefetch=0; prefetch_env=1; reader_shards="${variant#shard}" ;;
+    keep)       no_prefetch=0; prefetch_env=1 ;;
+    composite)  no_prefetch=0; prefetch_env=1; composite_leading="${COMPOSITE_LEADING:?set COMPOSITE_LEADING for the composite variant}" ;;
+    *)          no_prefetch=0; prefetch_env=1 ;;
   esac
 
   local report_in_task="/tmp/perf-${variant}.json"
   local cmd_json overrides
-  cmd_json="$(build_cmd_json "${report_in_task}" "${no_prefetch}" "${reader_shards}")"
+  cmd_json="$(build_cmd_json "${report_in_task}" "${no_prefetch}" "${reader_shards}" "${composite_leading}")"
   overrides="$(build_overrides_json "${cmd_json}" "${prefetch_env}")"
 
   echo ""
   echo "======================================================================"
-  echo "==> Variant: ${variant}  (prefetch=${prefetch_env} reader_shards=${reader_shards})  schema=${MEASURE_SCHEMA} tables='${MEASURE_TABLES:-ALL}' tp=${TABLE_PARALLELISM} bp=${BATCH_PARALLELISM}"
+  echo "==> Variant: ${variant}  (prefetch=${prefetch_env} reader_shards=${reader_shards} composite_leading='${composite_leading}')  schema=${MEASURE_SCHEMA} tables='${MEASURE_TABLES:-ALL}' tp=${TABLE_PARALLELISM} bp=${BATCH_PARALLELISM}"
   echo "======================================================================"
   local task_arn
   task_arn="$(aws ecs run-task --cluster "${CLUSTER}" --region "${REGION}" \

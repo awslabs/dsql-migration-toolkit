@@ -54,11 +54,14 @@ from dsql_migrator.core.assessment_strategist import (
 )
 from dsql_migrator.core.converter import (
     ConversionWarning,
+    PrimaryKeyStrategy,
     SchemaConversionResult,
     SchemaConvertOptions,
     SchemaConverter,
     TableConversion,
     ViewConversion,
+    parse_target_primary_key,
+    validate_composite_leading_column,
 )
 from dsql_migrator.core.models import (
     AiAssistConfig,
@@ -95,7 +98,7 @@ from dsql_migrator.core.activity_log import (
     ActivityStatus,
     log_activity,
 )
-from dsql_migrator.ui.design import inline_hint, render_notice
+from dsql_migrator.ui.design import inline_hint, render_notice, segmented_control
 from dsql_migrator.ui.ai_chat_drawer import build_chat_drawer
 from dsql_migrator.ui.evaluation import EvaluationStore, classification_label
 from dsql_migrator.ui.session import SessionStore
@@ -568,6 +571,82 @@ def ai_candidate_object_names(assessment: AssessmentReport) -> list[str]:
         if item.classification in flagged and item.object_name not in names:
             names.append(item.object_name)
     return names
+
+
+def composite_leading_candidates(table: TableDef) -> list[str]:
+    """Columns eligible to lead a composite primary key for ``table``.
+
+    A valid leading column is NOT NULL and not already part of the primary key
+    (mirrors :func:`validate_composite_leading_column` so the picker never offers
+    a choice that would then be rejected). Order follows the table's column order
+    so the dropdown reads like the source schema.
+    """
+    return [
+        column.name
+        for column in table.columns
+        if not column.nullable and column.name not in table.primary_key
+    ]
+
+
+def default_composite_leading(table: TableDef) -> Optional[str]:
+    """A sensible default leading column, or ``None`` when none is eligible.
+
+    Picks the first eligible NOT-NULL non-PK column so selecting "Composite key"
+    always yields a representable (valid) state without forcing the user to also
+    pick a column in the same click. The user can refine it via the dropdown.
+    """
+    candidates = composite_leading_candidates(table)
+    return candidates[0] if candidates else None
+
+
+def build_composite_conversion(
+    converter: SchemaConverter, table: TableDef, leading: str
+) -> TableConversion:
+    """Per-table conversion for ``table`` under a composite PK on ``leading``.
+
+    Runs the converter with the COMPOSITE_KEY strategy; the result's rendered
+    script (CREATE TABLE with the ``(leading, original_pk...)`` key + the UNIQUE
+    INDEX ASYNC that preserves the original key's uniqueness) is what the picker
+    bakes into ``edited_target_ddls`` -- the same field Full Load and Schema Apply
+    already consume -- so the composite choice is resume-safe (snapshotted) with no
+    separate persisted state. An invalid/too-large leading yields an UNSUPPORTED
+    conversion (comment placeholder), which the picker detects and surfaces as an
+    error rather than storing broken DDL.
+    """
+    return converter.convert_table(
+        table,
+        SchemaConvertOptions(
+            primary_key_strategy=PrimaryKeyStrategy.COMPOSITE_KEY,
+            composite_leading_column=leading,
+        ),
+    )
+
+
+def composite_leading_from_ddl(table: TableDef, target_ddl: str) -> Optional[str]:
+    """Infer the composite leading column from a stored target DDL, if composite.
+
+    The picker keeps no separate state: it reads the object's stored (edited)
+    target DDL and, when that DDL's parsed primary key is the composite
+    ``(leading, original_pk...)``, returns the leading column so the picker renders
+    as "Composite key" with the dropdown preset. Returns ``None`` when the DDL's
+    key equals the source key (not composite) or cannot be parsed -- i.e. the
+    single source of truth for the picker's state is the DDL itself.
+    """
+    # The stored DDL is the full script (CREATE TABLE + CREATE INDEX ...), but the
+    # PK parser reads a single statement -- isolate the CREATE TABLE first.
+    create_table = next(
+        (
+            stmt
+            for stmt in split_sql_statements(target_ddl)
+            if stmt.strip().upper().split("(", 1)[0].startswith("CREATE TABLE")
+        ),
+        target_ddl,
+    )
+    target_pk = parse_target_primary_key(create_table)
+    source_pk = list(table.primary_key)
+    if target_pk and target_pk != source_pk and target_pk[1:] == source_pk:
+        return target_pk[0]
+    return None
 
 
 def _classify_edited_table_conversion(
@@ -3013,6 +3092,14 @@ def _render_browser_and_preview(
             # So any "Not auto-converted" object also gets the AI conversion
             # button when AI assist is enabled.
             not_auto_converted = not _is_applicable_target_ddl(preview.target_ddl)
+            # Per-table primary-key strategy picker (opt-in composite key), shown
+            # above the DDL preview for an auto-converted TABLE only (views/other
+            # objects have no primary-key hot-partition concern). Changing it bakes
+            # the composite DDL into edited_target_ddls, so the preview below and
+            # Full Load pick it up.
+            source_table = _find_table(inventory, preview.object_name)
+            if source_table is not None and not not_auto_converted:
+                _render_pk_strategy_picker(ui, source_table, conv_state, refresh)
             _render_preview(
                 ui,
                 preview,
@@ -3077,6 +3164,108 @@ def _object_header_summary(
     if applied is not None:
         parts.append(f"applied: {applied.status.value}")
     return " · ".join(parts)
+
+
+_KEEP_PK = "KEEP"
+_COMPOSITE_PK = "COMPOSITE"
+
+
+def _render_pk_strategy_picker(
+    ui: object,
+    table: TableDef,
+    conv_state: SchemaConversionState,
+    refresh: Callable[[], None],
+) -> None:
+    """Per-table primary-key strategy picker (Keep integer vs Composite key).
+
+    Opt-in and per-table: the default is Keep integer PK (the source key
+    unchanged). Choosing "Composite key" rewrites this table's target key to
+    ``(leading, original_pk...)`` to spread writes across Aurora DSQL partitions
+    (avoiding the monotonic-key hot partition). The choice is stored by baking the
+    composite target script into ``conv_state.edited_target_ddls`` -- the same
+    field Full Load and Schema Apply already consume and the session snapshot
+    persists -- so the picker holds NO separate state and is resume-safe. The
+    picker's rendered state is derived by parsing that stored DDL.
+    """
+    # Only tables with a primary key can have a monotonic-key hot partition to fix.
+    if not table.primary_key:
+        return
+    candidates = composite_leading_candidates(table)
+    name = table.name
+    stored = conv_state.get_edited_target_ddl(name)
+    current_leading = (
+        composite_leading_from_ddl(table, stored) if stored is not None else None
+    )
+    is_composite = current_leading is not None
+    converter = SchemaConverter()
+
+    def _select_strategy(event: object) -> None:
+        choice = getattr(event, "value", _KEEP_PK)
+        if choice == _COMPOSITE_PK:
+            leading = default_composite_leading(table)
+            if leading is None:
+                return  # no eligible column; the control stays on Keep (see below)
+            conv_state.set_edited_target_ddl(
+                name, render_target_ddl(build_composite_conversion(converter, table, leading))
+            )
+        else:
+            # Back to the source key: drop the composite override so the table
+            # uses the deterministic (unchanged-key) conversion again.
+            conv_state.clear_edited_target_ddl(name)
+        refresh()
+
+    def _select_leading(event: object) -> None:
+        leading = getattr(event, "value", None)
+        if not leading:
+            return
+        conv_state.set_edited_target_ddl(
+            name, render_target_ddl(build_composite_conversion(converter, table, leading))
+        )
+        refresh()
+
+    with ui.card().classes("w-full !shadow-none border border-gray-200 bg-gray-50 p-3 gap-2"):  # type: ignore[attr-defined]
+        with ui.row().classes("items-center gap-3 w-full no-wrap"):  # type: ignore[attr-defined]
+            ui.label("Primary key").classes("text-sm font-semibold text-gray-700")  # type: ignore[attr-defined]
+            picker = segmented_control(
+                ui,
+                {_KEEP_PK: "Keep integer PK", _COMPOSITE_PK: "Composite key"},
+                value=_COMPOSITE_PK if is_composite else _KEEP_PK,
+                on_change=_select_strategy,
+            )
+            if not candidates:
+                # Nothing valid to lead with (no NOT NULL non-PK column), so the
+                # composite option cannot be offered for this table.
+                picker.props("disable")
+        if not candidates:
+            inline_hint(
+                ui,
+                "No NOT NULL non-key column is available to lead a composite key "
+                "for this table.",
+                tone="neutral",
+            )
+            return
+        if is_composite:
+            ui.select(  # type: ignore[attr-defined]
+                candidates,
+                value=current_leading,
+                label="Leading column (high-cardinality)",
+                on_change=_select_leading,
+            ).classes("w-full max-w-md").props("dense outlined")
+            key_order = [current_leading, *table.primary_key]
+            render_notice(
+                ui,
+                tone="warning",
+                header="Queries must use the new composite key after cutover",
+                body=(
+                    f"The target primary key becomes ({', '.join(key_order)}). This "
+                    "spreads writes across DSQL partitions, but the application's "
+                    "queries, joins, and upserts must key on the full composite key, "
+                    f"and '{current_leading}' must be immutable (DSQL keys cannot "
+                    "change after creation). A UNIQUE index on the original key "
+                    f"({', '.join(table.primary_key)}) preserves its uniqueness. "
+                    "Not yet supported with CDC."
+                ),
+            )
 
 
 def _render_preview(

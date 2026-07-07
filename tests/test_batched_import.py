@@ -412,6 +412,38 @@ def test_import_splits_rows_into_capped_batches() -> None:
     assert len(store.rows) == 5
 
 
+def test_import_key_columns_override_drives_on_conflict_target() -> None:
+    # Phase 0: when the TARGET PK differs from the source PK (a composite key),
+    # the engine passes key_columns= to import_rows and that must become the
+    # ON CONFLICT target -- otherwise the idempotent upsert references a
+    # constraint the target does not have (SQLSTATE 42P10).
+    store = _FakeStore()
+    columns = ["id", "customer_id", "name"]
+    override = ["customer_id", "id"]
+    importer = _importer(store, columns, override)
+    table = _table(columns=("id", "customer_id", "name"), primary_key=("id",))
+
+    rows = [
+        {"id": i, "customer_id": i % 3, "name": f"n{i}"} for i in range(4)
+    ]
+    importer.import_rows(iter(rows), table, key_columns=override)
+
+    sql = store.executed_inserts[0].sql_text
+    assert 'ON CONFLICT ("customer_id", "id")' in sql
+
+
+def test_import_without_key_columns_falls_back_to_source_pk() -> None:
+    # No override -> today's behavior: ON CONFLICT targets the source PK. This is
+    # the no-op guarantee for every table whose target PK == source PK.
+    store = _FakeStore()
+    importer = _importer(store, ["id", "name"], ["id"])
+
+    importer.import_rows(_rows(3), _table())
+
+    sql = store.executed_inserts[0].sql_text
+    assert 'ON CONFLICT ("id")' in sql
+
+
 def test_import_reports_each_batch_to_on_batch_loaded() -> None:
     store = _FakeStore()
     importer = _importer(

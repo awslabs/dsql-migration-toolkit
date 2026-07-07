@@ -39,6 +39,7 @@ from dsql_migrator.core.converter import (
     SchemaConvertOptions,
     TableConversion,
     parse_target_column_types,
+    parse_target_primary_key,
 )
 from dsql_migrator.core.schema_applier import recreate_table
 from dsql_migrator.core.models import (
@@ -1164,6 +1165,19 @@ class BatchedTableMigrator:
             if applied is not None
             else None
         )
+        # The TARGET table's primary key, parsed from the APPLIED (possibly user- or
+        # AI-edited) target DDL -- the single source of truth for the conflict key.
+        # When the target PK differs from the source PK (e.g. a composite
+        # (leading, id) chosen in Schema Conversion), Full Load MUST use the target
+        # PK for ON CONFLICT / SKIP_EXISTING, or it would key on the wrong columns
+        # (silent skip-wrong on append, or a 42P10/23505 hard failure). None => the
+        # applied DDL had no parseable PK, so the loader falls back to the source PK
+        # (unchanged behavior for the common target-PK == source-PK case).
+        target_key_columns = (
+            parse_target_primary_key(applied.target_ddl)
+            if applied is not None
+            else []
+        ) or None
         # If the user confirmed loading this table fresh over existing data, DROP
         # and recreate its empty target first (DSQL has no TRUNCATE); the returned
         # secondary-index DDLs are (re)created after the load.
@@ -1233,14 +1247,35 @@ class BatchedTableMigrator:
         if is_replace:
             index_ddls = self._table_recreator(table)
             # Clean load into a freshly-emptied target: plain INSERT (no ON
-            # CONFLICT) -- DSQL never silently drops a non-conflicting row.
+            # CONFLICT) -- DSQL never silently drops a non-conflicting row. The
+            # target was just recreated from the applied DDL, so target_key_columns
+            # (parsed from that same DDL) is exactly the new target's PK.
             load_on_conflict: Optional[OnConflictMode] = OnConflictMode.NONE
+            load_key_columns = target_key_columns
         else:
             # Idempotent load into existing/CDC-fed data: insert only the missing
             # keys (never overwrite a newer CDC row, never use the DSQL-unsafe
             # multi-row ON CONFLICT that silently drops rows). Works for single- or
             # composite-column keys.
             load_on_conflict = OnConflictMode.SKIP_EXISTING
+            # APPEND path does NOT recreate the target (no DDL applied), so the
+            # target still has whatever PK it was created with. If the applied
+            # conversion asks for a DIFFERENT (e.g. composite) PK than the source,
+            # we cannot safely key the append against a constraint the live target
+            # may not have -- probing/insert would skip-wrong or hit a missing
+            # constraint. Guard: only trust target_key_columns on append when it
+            # equals the source PK; otherwise refuse and require a fresh (replace)
+            # load so the composite DDL is actually applied first.
+            source_pk = list(table.primary_key)
+            if target_key_columns and target_key_columns != source_pk:
+                raise RuntimeError(
+                    f"Table '{table.name}' is configured with a changed primary key "
+                    f"{tuple(target_key_columns)} but is being APPENDED (not "
+                    "recreated), so the target still has its original key. Load it "
+                    "fresh (Drop & reload) to apply the new primary key before "
+                    "appending."
+                )
+            load_key_columns = None  # append: use the target's existing (source) PK
         importer = self._importer_factory(self._inputs)
         try:
             result = importer.import_rows(
@@ -1251,6 +1286,7 @@ class BatchedTableMigrator:
                 should_cancel=should_cancel,
                 on_conflict=load_on_conflict,
                 shard_sources=shard_sources,
+                key_columns=load_key_columns,
             )
         except ExportCancelled as exc:
             # A cooperative stop interrupted the source read between pages (the

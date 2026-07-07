@@ -39,6 +39,7 @@ from dsql_migrator.core.cdc import (
     build_cdc_stack_name,
     build_cdc_stack_params,
     cdc_expected_connector_names,
+    composite_cdc_excluded_key_columns,
     cdc_stack_name_suffix,
     cdc_stack_params_to_json,
 )
@@ -1902,12 +1903,39 @@ def _start_cdc_deploy(
             ),
         )
         return
+    # Composite-PK re-key: scope the stored key map to the tables actually being
+    # replicated, then gate the ONE precondition -- a composite key column must not
+    # be dropped at capture (column.exclude.list), or Debezium can't build the key.
+    selected_names = {t.name for t in tables_for_config}
+    message_key_columns = {
+        table: cols
+        for table, cols in migration_state.cdc_message_key_columns().items()
+        if table in selected_names
+    }
+    bad_key_cols = composite_cdc_excluded_key_columns(
+        message_key_columns, exclude_list or []
+    )
+    if bad_key_cols:
+        render_notice(
+            ui,
+            tone="error",
+            header="Composite key column is excluded from capture",
+            body=(
+                "These composite primary-key columns are in the column exclude list, "
+                "so Debezium cannot read them to build the record key: "
+                + ", ".join(bad_key_cols)
+                + ". Remove them from the LOB-exclusion selection before starting CDC "
+                "(a key column is small and safe to capture)."
+            ),
+        )
+        return
     source_config = CdcPipelineOrchestrator().build_source_config(
         "mysql-source",
         tables_for_config,
         watermark if watermark is not None else _sentinel_watermark(),
         column_exclude_list=exclude_list,
         resume_override=override if (mode == "manual" and override is not None and override.has_coordinates()) else None,
+        message_key_columns=message_key_columns,
     )
     sink_config = CdcPipelineOrchestrator().build_sink_config(
         "mysql-sink", tables_for_config, CDC_DEFAULT_DLQ_TOPIC
@@ -2753,7 +2781,7 @@ def _render_migration_table_status(
                     _status_table.refresh()
 
         # Top: the one thing to know before reading the numbers -- the source side
-        # is a scan-free estimate, so it adds no load on a TB-scale source but is
+        # is a scan-free estimate, so it adds no load on a large-scale source but is
         # approximate (Validation does the exact reconciliation).
         render_notice(
             ui,
@@ -2762,7 +2790,7 @@ def _render_migration_table_status(
             body=(
                 "Refresh reads the source row counts from information_schema "
                 "(table_rows) — a scan-free estimate, so it adds no load even on a "
-                "TB-scale source, but it can drift from the exact count under heavy "
+                "large-scale source, but it can drift from the exact count under heavy "
                 "writes. The target counts are exact. For an authoritative row/"
                 "checksum reconciliation, run Validation (Step 4)."
             ),
