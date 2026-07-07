@@ -1121,6 +1121,12 @@ def build_data_migration_screen(
 
                 # --- Prerequisites ---------------------------------------------
                 def _prereq_body():
+                    _cdc_deploying = (
+                        _is_inflight_stack_status(
+                            getattr(migration_state, "cdc_stack_phase_status", None)
+                        )
+                        or cdc_streaming_started(migration_state, job_manager)
+                    )
                     _render_prerequisites_panel(
                         ui,
                         migration_state,
@@ -1129,7 +1135,9 @@ def build_data_migration_screen(
                         combined=(
                             migration_type is MigrationType.FULL_LOAD_AND_CDC
                         ),
-                        load_running=status is StepStatus.IN_PROGRESS,
+                        load_running=(
+                            status is StepStatus.IN_PROGRESS or _cdc_deploying
+                        ),
                     )
                     with ui.row().classes("!flex w-full justify-end items-center"):
                         if guard_reason is None:
@@ -3454,17 +3462,16 @@ def _render_prerequisites_panel(
             check_btn.props("disable")
         elif load_running:
             check_btn.props("disable").tooltip(
-                "A Full Load is running — prerequisite checks are read-only and "
-                "apply to the NEXT run, not the one in progress. Stop the load "
-                "first to re-run checks."
+                "A migration operation is in progress — prerequisite checks are "
+                "read-only and apply to the NEXT run, not the one in progress."
             )
     # While a load runs, spell out that re-checking here won't affect it (the
     # button is disabled above; this notice says why, so the disabled state isn't
     # a mystery).
     if load_running and not running:
         ui.label(
-            "A Full Load is in progress. These checks apply to the next run — "
-            "they don't affect the running load."
+            "A migration operation is in progress. These checks apply to the "
+            "next run — they don't affect the running operation."
         ).classes("text-xs text-gray-400")
     # Immediate feedback directly below the button while a check runs, so the
     # click is acknowledged at once instead of seeming unresponsive.
