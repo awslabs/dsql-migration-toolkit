@@ -2615,9 +2615,15 @@ def _render_deploy_stages(ui, job, kind: str = "start", on_refresh=None) -> None
                 "flat dense round size=sm icon=refresh"
             ).tooltip("Refresh now")
     for chunk in job.chunks:
-        icon, color = _CDC_DEPLOY_STAGE_STYLE.get(chunk.status, _CDC_DEPLOY_STAGE_STYLE["PENDING"])
+        # When the job itself has ended (FAILED/DONE), any stage still marked
+        # IN_PROGRESS was interrupted — show it as FAILED so the spinner stops
+        # and the user sees a definitive state, not a stale hourglass.
+        effective_status = chunk.status
+        if not running and chunk.status == "IN_PROGRESS":
+            effective_status = "FAILED"
+        icon, color = _CDC_DEPLOY_STAGE_STYLE.get(effective_status, _CDC_DEPLOY_STAGE_STYLE["PENDING"])
         label = labels.get(chunk.chunk_id, chunk.chunk_id)
-        in_progress = chunk.status == "IN_PROGRESS"
+        in_progress = effective_status == "IN_PROGRESS"
         # Emphasize the running stage: a live animated hourglass spinner (instead of
         # the static icon) plus a bold, pulsing primary label, so the eye is drawn
         # to exactly which step is happening now.
