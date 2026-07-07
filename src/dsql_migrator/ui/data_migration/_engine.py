@@ -443,17 +443,37 @@ class _TableWorkerResult:
     quarantine_records: tuple = ()
 
 
-def _migrate_one_table_in_process(
-    args: _TableWorkerArgs,
+# Per-worker-process globals, set by _init_worker (ProcessPoolExecutor initializer).
+_worker_progress_queue: Optional["multiprocessing.Queue[object]"] = None
+_worker_cancel_event: Optional["multiprocessing.synchronize.Event"] = None
+
+
+def _init_worker(
     progress_queue: "multiprocessing.Queue[object]",
     cancel_event: "multiprocessing.synchronize.Event",
-) -> _TableWorkerResult:
+) -> None:
+    """Initializer for ProcessPoolExecutor workers — stores shared IPC objects.
+
+    Queue and Event are NOT picklable so they can't be passed as submit() args.
+    Instead they are inherited via the initializer (which receives them directly
+    from the parent through process inheritance, not pickle).
+    """
+    global _worker_progress_queue, _worker_cancel_event  # noqa: PLW0603
+    _worker_progress_queue = progress_queue
+    _worker_cancel_event = cancel_event
+
+
+def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
     """Run entirely inside a child process. Builds own MySQL+DSQL connections.
 
-    Module-level function (required for pickle with spawn context). Catches all
-    exceptions and returns a plain _TableWorkerResult; never raises past the
-    top-level try so unpicklable exceptions cannot break the ProcessPool.
+    Module-level function (required for pickle with spawn context). Reads the
+    shared progress_queue and cancel_event from worker-global state (set by
+    _init_worker). Catches all exceptions and returns a plain _TableWorkerResult;
+    never raises past the top-level try so unpicklable exceptions cannot break
+    the ProcessPool.
     """
+    progress_queue = _worker_progress_queue
+    cancel_event = _worker_cancel_event
     table = args.table
     name = table.name
     try:
@@ -468,15 +488,20 @@ def _migrate_one_table_in_process(
             if pending_loaded + pending_skipped >= PROGRESS_FLUSH_ROWS:
                 flush_l, flush_s = pending_loaded, pending_skipped
                 pending_loaded, pending_skipped = 0, 0
-                progress_queue.put((name, flush_l, flush_s))
+                if progress_queue is not None:
+                    progress_queue.put((name, flush_l, flush_s))
 
         outcome = _as_load_result(
             migrator.migrate_table(
-                table, on_rows=_on_rows, should_cancel=lambda: cancel_event.is_set()
+                table,
+                on_rows=_on_rows,
+                should_cancel=lambda: (
+                    cancel_event is not None and cancel_event.is_set()
+                ),
             )
         )
         # Flush remaining progress.
-        if pending_loaded or pending_skipped:
+        if (pending_loaded or pending_skipped) and progress_queue is not None:
             progress_queue.put((name, pending_loaded, pending_skipped))
         quarantine_recs = tuple(
             {"primary_key": r.primary_key, "message": r.message, "error_code": getattr(r, "error_code", None)}
@@ -772,7 +797,10 @@ def _migrate_tables_in_parallel(
 
         try:
             with ProcessPoolExecutor(
-                max_workers=workers, mp_context=ctx
+                max_workers=workers,
+                mp_context=ctx,
+                initializer=_init_worker,
+                initargs=(progress_queue, cancel_event),
             ) as pool:
                 futures = []
                 for i, table in enumerate(tables):
@@ -781,14 +809,11 @@ def _migrate_tables_in_parallel(
                     if handle.cancelled:
                         break
                     handle.update(lambda job, n=table.name: _start_chunk(job, n))
-                    args = _TableWorkerArgs(
+                    worker_args = _TableWorkerArgs(
                         job_id=job_id, table=table, inputs=migrator._inputs
                     )
                     futures.append(
-                        pool.submit(
-                            _migrate_one_table_in_process,
-                            args, progress_queue, cancel_event,
-                        )
+                        pool.submit(_migrate_one_table_in_process, worker_args)
                     )
 
                 for future in as_completed(futures):
