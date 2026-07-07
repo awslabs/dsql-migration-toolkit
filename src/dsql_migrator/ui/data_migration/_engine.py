@@ -583,14 +583,21 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             pk_lower=args.pk_lower,
             pk_upper=args.pk_upper,
         )
-        # Load with SKIP_EXISTING (idempotent, safe for concurrent shards).
+        # Use plain INSERT (NONE) when the table was just DROP+recreated in the
+        # parent (empty target, no conflicts possible, faster). Use SKIP_EXISTING
+        # for append/CDC-coexisting loads (existing data, idempotent).
+        is_replace = (
+            not args.inputs.cdc_coexisting
+            and table.name in args.inputs.replace_tables
+        )
+        conflict_mode = OnConflictMode.NONE if is_replace else OnConflictMode.SKIP_EXISTING
         importer = migrator._importer_factory(args.inputs)
         result = importer.import_rows(
             rows,
             table,
             on_batch_loaded=_on_rows,
             should_cancel=lambda: cancel_event is not None and cancel_event.is_set(),
-            on_conflict=OnConflictMode.SKIP_EXISTING,
+            on_conflict=conflict_mode,
         )
         if (pending_loaded or pending_skipped) and progress_queue is not None:
             progress_queue.put((name, pending_loaded, pending_skipped))
@@ -902,6 +909,17 @@ def _migrate_tables_in_parallel(
 
     if use_shard_processes and shard_table is not None:
         # Phase 2: single table, multiple PK-range shards as separate processes.
+        # If the table is in replace_tables, DROP+recreate it in the parent BEFORE
+        # spawning shards (so shards load into an empty table — no OCC conflicts
+        # from 32 concurrent writers hitting existing rows).
+        is_shard_replace = (
+            not migrator._inputs.cdc_coexisting
+            and shard_table.name in migrator._inputs.replace_tables
+        )
+        if is_shard_replace:
+            table_recreator = _default_table_recreator(migrator._inputs)
+            table_recreator(shard_table)
+
         ctx = multiprocessing.get_context("spawn")
         progress_queue: multiprocessing.Queue = ctx.Queue()
         cancel_event = ctx.Event()
