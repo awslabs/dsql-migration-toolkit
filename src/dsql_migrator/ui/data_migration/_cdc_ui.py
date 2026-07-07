@@ -2188,6 +2188,29 @@ async def _start_cdc_infra_deploy(
     private_subnet_cidr_b = ""
     private_subnet_az_a = ""
     private_subnet_az_b = ""
+    if connector_subnet_ids:
+        # User-supplied subnets: verify they have NAT egress. MSK Connect assigns
+        # private IPs only, so IGW-only subnets cannot reach Secrets Manager or
+        # any HTTPS AWS endpoint, causing a silent 10-minute deploy failure.
+        def _verify_manual_subnets():
+            from dsql_migrator.core.ec2_metadata import (
+                build_ec2_client,
+                verify_subnet_egress,
+            )
+            ec2 = build_ec2_client(aws_profile, region)
+            return verify_subnet_egress(ec2, connector_subnet_ids.split(","))
+
+        try:
+            egress_ok, egress_reason = await run.io_bound(_verify_manual_subnets)
+        except Exception:  # noqa: BLE001 — best-effort; don't block on EC2 errors
+            egress_ok = True  # assume OK if we can't verify
+            egress_reason = ""
+        if not egress_ok:
+            ui.notify(  # type: ignore[attr-defined]
+                egress_reason, type="negative", position="top",
+            )
+            return
+
     if not connector_subnet_ids:
         def _diagnose():
             from dsql_migrator.core.ec2_metadata import (

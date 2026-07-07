@@ -319,3 +319,83 @@ def test_diagnose_create_avoids_carving_over_peered_range() -> None:
     # The first two free /24s (.2 and .3) are routed to peering, so the carve
     # skips them and picks .4 / .5.
     assert d.private_subnet_cidrs == ["10.0.4.0/24", "10.0.5.0/24"]
+
+
+# --- verify_subnet_egress tests ---------------------------------------------------
+
+from dsql_migrator.core.ec2_metadata import verify_subnet_egress  # noqa: E402
+
+
+class _FakeEc2Verify:
+    """Minimal EC2 client for verify_subnet_egress tests."""
+
+    def __init__(self, subnets, route_tables):
+        self._subnets = subnets
+        self._rts = route_tables
+
+    def describe_subnets(self, **kw):
+        ids = set(kw.get("SubnetIds", []))
+        return {"Subnets": [s for s in self._subnets if s["SubnetId"] in ids]}
+
+    def describe_route_tables(self, **kw):
+        return {"RouteTables": self._rts}
+
+
+def test_verify_subnet_egress_nat_passes() -> None:
+    subnets = [
+        {"SubnetId": "subnet-a", "VpcId": "vpc-1"},
+        {"SubnetId": "subnet-b", "VpcId": "vpc-1"},
+    ]
+    rts = [{
+        "VpcId": "vpc-1",
+        "Associations": [{"SubnetId": "subnet-a"}, {"SubnetId": "subnet-b"}],
+        "Routes": [_nat_route()],
+    }]
+    ok, reason = verify_subnet_egress(_FakeEc2Verify(subnets, rts), ["subnet-a", "subnet-b"])
+    assert ok is True
+    assert reason == ""
+
+
+def test_verify_subnet_egress_igw_fails() -> None:
+    subnets = [
+        {"SubnetId": "subnet-a", "VpcId": "vpc-1"},
+        {"SubnetId": "subnet-b", "VpcId": "vpc-1"},
+    ]
+    rts = [{
+        "VpcId": "vpc-1",
+        "Associations": [{"Main": True}],
+        "Routes": [_igw_route()],
+    }]
+    ok, reason = verify_subnet_egress(_FakeEc2Verify(subnets, rts), ["subnet-a", "subnet-b"])
+    assert ok is False
+    assert "NAT gateway" in reason
+    assert "subnet-a" in reason
+
+
+def test_verify_subnet_egress_mixed_nat_and_igw_fails() -> None:
+    subnets = [
+        {"SubnetId": "subnet-nat", "VpcId": "vpc-1"},
+        {"SubnetId": "subnet-igw", "VpcId": "vpc-1"},
+    ]
+    rts = [
+        {
+            "VpcId": "vpc-1",
+            "Associations": [{"SubnetId": "subnet-nat"}],
+            "Routes": [_nat_route()],
+        },
+        {
+            "VpcId": "vpc-1",
+            "Associations": [{"Main": True}],
+            "Routes": [_igw_route()],
+        },
+    ]
+    ok, reason = verify_subnet_egress(_FakeEc2Verify(subnets, rts), ["subnet-nat", "subnet-igw"])
+    assert ok is False
+    assert "subnet-igw" in reason
+    assert "subnet-nat" not in reason
+
+
+def test_verify_subnet_egress_empty_ids() -> None:
+    ok, reason = verify_subnet_egress(_FakeEc2Verify([], []), [])
+    assert ok is False
+    assert "No subnet" in reason

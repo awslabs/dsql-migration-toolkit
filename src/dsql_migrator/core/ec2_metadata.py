@@ -85,6 +85,71 @@ def _classify_egress(routes: list[dict]) -> str:
     return "none"
 
 
+def verify_subnet_egress(
+    ec2_client: BotoSessionLike, subnet_ids: list[str]
+) -> tuple[bool, str]:
+    """Verify that user-supplied subnets have NAT egress (pre-flight check).
+
+    MSK Connect assigns private IPs only — connectors in IGW-only (public)
+    subnets cannot reach Secrets Manager, STS, or any HTTPS AWS endpoint. This
+    read-only check prevents a 10-minute deploy that silently fails with
+    "Network is unreachable".
+
+    Returns ``(True, "")`` when all subnets have NAT egress, or
+    ``(False, reason)`` with a user-facing explanation when any don't.
+    """
+    subnet_ids = [s.strip() for s in subnet_ids if s.strip()]
+    if not subnet_ids:
+        return False, "No subnet IDs provided."
+
+    try:
+        sub_resp = ec2_client.describe_subnets(SubnetIds=subnet_ids)
+    except Exception as exc:
+        raise Ec2MetadataError(f"describe_subnets failed: {exc}") from exc
+
+    subnets = sub_resp.get("Subnets", []) or []
+    if not subnets:
+        return False, f"Subnets not found: {', '.join(subnet_ids)}"
+
+    vpc_ids = {s["VpcId"] for s in subnets}
+    rt_filters = [{"Name": "vpc-id", "Values": list(vpc_ids)}]
+    try:
+        rt_resp = ec2_client.describe_route_tables(Filters=rt_filters)
+    except Exception as exc:
+        raise Ec2MetadataError(f"describe_route_tables failed: {exc}") from exc
+
+    route_tables = rt_resp.get("RouteTables", []) or []
+    explicit: dict[str, str] = {}
+    main_egress_by_vpc: dict[str, str] = {}
+    for rt in route_tables:
+        egress = _classify_egress(rt.get("Routes", []) or [])
+        vpc_id = rt.get("VpcId", "")
+        for assoc in rt.get("Associations", []) or []:
+            if assoc.get("Main"):
+                main_egress_by_vpc[vpc_id] = egress
+            sid = assoc.get("SubnetId")
+            if sid:
+                explicit[sid] = egress
+
+    bad_subnets: list[str] = []
+    for s in subnets:
+        sid = s["SubnetId"]
+        vpc = s["VpcId"]
+        egress = explicit.get(sid, main_egress_by_vpc.get(vpc, "none"))
+        if egress != "nat":
+            bad_subnets.append(sid)
+
+    if bad_subnets:
+        return False, (
+            f"Subnet(s) {', '.join(bad_subnets)} do not have NAT gateway egress. "
+            "MSK Connect connectors need NAT to reach Secrets Manager and other "
+            "AWS services. Either leave the subnet field blank (the stack will "
+            "create its own private subnets with NAT), or provide subnets that "
+            "route 0.0.0.0/0 through a NAT gateway."
+        )
+    return True, ""
+
+
 def select_connector_subnets(
     ec2_client: BotoSessionLike, vpc_id: str
 ) -> SubnetSelection:
