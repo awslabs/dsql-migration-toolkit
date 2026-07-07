@@ -11,7 +11,11 @@ module, so the public import surface is unchanged.
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+import multiprocessing.queues
+import threading
+import time as _time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -406,6 +410,271 @@ class _RunCounts(NamedTuple):
     quarantined: int
 
 
+# ---------------------------------------------------------------------------
+# Multiprocess worker infrastructure (Phase 1 — true multi-core Full Load)
+# ---------------------------------------------------------------------------
+
+# Stagger delay between process submissions to avoid DSQL IAM token/connection burst.
+_PROCESS_LAUNCH_STAGGER_SECONDS = 0.15
+
+# Sentinel put onto progress_queue to signal drain thread to stop.
+_PROGRESS_SENTINEL = None
+
+
+@dataclass(frozen=True)
+class _TableWorkerArgs:
+    """Picklable input for one table's Full Load in a worker process."""
+
+    job_id: str
+    table: TableDef
+    inputs: "DataMigrationInputs"
+
+
+@dataclass(frozen=True)
+class _ShardWorkerArgs:
+    """Picklable input for one PK-range shard of a single table (Phase 2).
+
+    Each shard loads a disjoint PK slice of the same table into the same target
+    using idempotent INSERT ON CONFLICT DO NOTHING. Multiple shards of the same
+    table run concurrently in separate processes, each with its own MySQL snapshot
+    + DSQL connection pool.
+    """
+
+    job_id: str
+    table: TableDef
+    inputs: "DataMigrationInputs"
+    pk_lower: Optional[int]
+    pk_upper: Optional[int]
+    shard_index: int
+
+
+@dataclass(frozen=True)
+class _TableWorkerResult:
+    """Picklable result from a worker process (never raises past boundary)."""
+
+    table_name: str
+    status: str  # "DONE" | "FAILED" | "STOPPED"
+    rows_loaded: int = 0
+    rows_skipped: int = 0
+    error_message: Optional[str] = None
+    error_code: Optional[str] = None
+    quarantine_records: tuple = ()
+    shard_index: int = -1
+
+
+# Per-worker-process globals, set by _init_worker (ProcessPoolExecutor initializer).
+_worker_progress_queue: Optional["multiprocessing.Queue[object]"] = None
+_worker_cancel_event: Optional["multiprocessing.synchronize.Event"] = None
+
+
+def _init_worker(
+    progress_queue: "multiprocessing.Queue[object]",
+    cancel_event: "multiprocessing.synchronize.Event",
+) -> None:
+    """Initializer for ProcessPoolExecutor workers — stores shared IPC objects.
+
+    Queue and Event are NOT picklable so they can't be passed as submit() args.
+    Instead they are inherited via the initializer (which receives them directly
+    from the parent through process inheritance, not pickle).
+    """
+    global _worker_progress_queue, _worker_cancel_event  # noqa: PLW0603
+    _worker_progress_queue = progress_queue
+    _worker_cancel_event = cancel_event
+
+
+def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
+    """Run entirely inside a child process. Builds own MySQL+DSQL connections.
+
+    Module-level function (required for pickle with spawn context). Reads the
+    shared progress_queue and cancel_event from worker-global state (set by
+    _init_worker). Catches all exceptions and returns a plain _TableWorkerResult;
+    never raises past the top-level try so unpicklable exceptions cannot break
+    the ProcessPool.
+    """
+    progress_queue = _worker_progress_queue
+    cancel_event = _worker_cancel_event
+    table = args.table
+    name = table.name
+    try:
+        migrator = BatchedTableMigrator(args.inputs)
+        pending_loaded = 0
+        pending_skipped = 0
+
+        def _on_rows(loaded: int, skipped: int = 0) -> None:
+            nonlocal pending_loaded, pending_skipped
+            pending_loaded += loaded
+            pending_skipped += skipped
+            if pending_loaded + pending_skipped >= PROGRESS_FLUSH_ROWS:
+                flush_l, flush_s = pending_loaded, pending_skipped
+                pending_loaded, pending_skipped = 0, 0
+                if progress_queue is not None:
+                    progress_queue.put((name, flush_l, flush_s))
+
+        outcome = _as_load_result(
+            migrator.migrate_table(
+                table,
+                on_rows=_on_rows,
+                should_cancel=lambda: (
+                    cancel_event is not None and cancel_event.is_set()
+                ),
+            )
+        )
+        # Flush remaining progress.
+        if (pending_loaded or pending_skipped) and progress_queue is not None:
+            progress_queue.put((name, pending_loaded, pending_skipped))
+        quarantine_recs = tuple(
+            {"primary_key": r.primary_key, "message": r.message, "error_code": getattr(r, "error_code", None)}
+            for r in (getattr(outcome, "quarantine_records", ()) or ())
+        )
+        return _TableWorkerResult(
+            table_name=name,
+            status="DONE",
+            rows_loaded=outcome.rows_loaded,
+            rows_skipped=outcome.rows_skipped,
+            quarantine_records=quarantine_recs,
+        )
+    except _FullLoadStopped:
+        return _TableWorkerResult(table_name=name, status="STOPPED")
+    except Exception as exc:  # noqa: BLE001
+        return _TableWorkerResult(
+            table_name=name,
+            status="FAILED",
+            error_message=f"{type(exc).__name__}: {exc}",
+            error_code=_error_code(exc),
+        )
+
+
+def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
+    """Load one PK-range shard of a table in its own process (Phase 2).
+
+    Same pattern as _migrate_one_table_in_process but reads only the
+    [pk_lower, pk_upper) slice. Each shard builds its own MySQL connection +
+    DSQL connection pool so they run on independent cores.
+    """
+    progress_queue = _worker_progress_queue
+    cancel_event = _worker_cancel_event
+    table = args.table
+    name = table.name
+    try:
+        migrator = BatchedTableMigrator(args.inputs)
+        pending_loaded = 0
+        pending_skipped = 0
+
+        def _on_rows(loaded: int, skipped: int = 0) -> None:
+            nonlocal pending_loaded, pending_skipped
+            pending_loaded += loaded
+            pending_skipped += skipped
+            if pending_loaded + pending_skipped >= PROGRESS_FLUSH_ROWS:
+                flush_l, flush_s = pending_loaded, pending_skipped
+                pending_loaded, pending_skipped = 0, 0
+                if progress_queue is not None:
+                    progress_queue.put((name, flush_l, flush_s))
+
+        # Build the single-shard row stream for this PK range.
+        applied = args.inputs.table_conversions.get(table.name)
+        target_types = (
+            parse_target_column_types(applied.target_ddl) if applied else None
+        )
+        rows = migrator._exporter.stream_converted_rows(
+            args.inputs.source_config,
+            table,
+            should_cancel=lambda: cancel_event is not None and cancel_event.is_set(),
+            target_types=target_types,
+            pk_lower=args.pk_lower,
+            pk_upper=args.pk_upper,
+        )
+        # Use plain INSERT (NONE) when the table was just DROP+recreated in the
+        # parent (empty target, no conflicts possible, faster). Use SKIP_EXISTING
+        # for append/CDC-coexisting loads (existing data, idempotent).
+        is_replace = (
+            not args.inputs.cdc_coexisting
+            and table.name in args.inputs.replace_tables
+        )
+        conflict_mode = OnConflictMode.NONE if is_replace else OnConflictMode.SKIP_EXISTING
+        importer = migrator._importer_factory(args.inputs)
+        result = importer.import_rows(
+            rows,
+            table,
+            on_batch_loaded=_on_rows,
+            should_cancel=lambda: cancel_event is not None and cancel_event.is_set(),
+            on_conflict=conflict_mode,
+        )
+        if (pending_loaded or pending_skipped) and progress_queue is not None:
+            progress_queue.put((name, pending_loaded, pending_skipped))
+        if result.cancelled:
+            return _TableWorkerResult(
+                table_name=name, status="STOPPED", shard_index=args.shard_index
+            )
+        if result.failures:
+            return _TableWorkerResult(
+                table_name=name, status="FAILED", shard_index=args.shard_index,
+                error_message=f"{result.failures} batch(es) failed",
+                rows_loaded=result.rows_loaded, rows_skipped=result.rows_skipped,
+            )
+        quarantine_recs = tuple(
+            {"primary_key": r.primary_key, "message": r.message, "error_code": getattr(r, "error_code", None)}
+            for r in (getattr(result, "quarantine_records", ()) or ())
+        )
+        return _TableWorkerResult(
+            table_name=name, status="DONE", shard_index=args.shard_index,
+            rows_loaded=result.rows_loaded, rows_skipped=result.rows_skipped,
+            quarantine_records=quarantine_recs,
+        )
+    except _FullLoadStopped:
+        return _TableWorkerResult(table_name=name, status="STOPPED", shard_index=args.shard_index)
+    except ExportCancelled:
+        return _TableWorkerResult(table_name=name, status="STOPPED", shard_index=args.shard_index)
+    except Exception as exc:  # noqa: BLE001
+        return _TableWorkerResult(
+            table_name=name, status="FAILED", shard_index=args.shard_index,
+            error_message=f"{type(exc).__name__}: {exc}",
+            error_code=_error_code(exc),
+        )
+
+
+def _drain_progress_queue(
+    progress_queue: "multiprocessing.Queue[object]",
+    handle: JobHandle,
+    cancel_event: "multiprocessing.synchronize.Event",
+    stop_event: threading.Event,
+) -> None:
+    """Drain thread: reads progress from worker processes → handle.update().
+
+    Also mirrors handle.cancelled → cancel_event so workers stop cooperatively.
+    Runs until ``stop_event`` is set AND the queue is empty.
+    """
+    while not stop_event.is_set():
+        # Mirror cancellation into the multiprocessing Event.
+        if handle.cancelled and not cancel_event.is_set():
+            cancel_event.set()
+        try:
+            msg = progress_queue.get(timeout=0.3)
+        except Exception:  # noqa: BLE001 - queue.Empty or other
+            continue
+        if msg is _PROGRESS_SENTINEL:
+            break
+        table_name, delta_loaded, delta_skipped = msg
+        handle.update(
+            lambda job, n=table_name, dl=delta_loaded, ds=delta_skipped: (
+                _advance_chunk_rows(job, n, dl, ds)
+            )
+        )
+    # Final drain (anything left after stop).
+    while True:
+        try:
+            msg = progress_queue.get_nowait()
+        except Exception:  # noqa: BLE001
+            break
+        if msg is _PROGRESS_SENTINEL or msg is None:
+            break
+        table_name, delta_loaded, delta_skipped = msg
+        handle.update(
+            lambda job, n=table_name, dl=delta_loaded, ds=delta_skipped: (
+                _advance_chunk_rows(job, n, dl, ds)
+            )
+        )
+
+
 def _migrate_one_table(
     handle: JobHandle,
     job_id: str,
@@ -607,25 +876,239 @@ def _migrate_tables_in_parallel(
 
     # Operator-tunable table-level parallelism (default FULL_LOAD_TABLE_PARALLELISM),
     # bounded by the table count.
-    table_parallelism = load_config().full_load_table_parallelism
-    workers = min(table_parallelism, len(tables))
-    if workers <= 1:
-        for table in tables:
-            _tally(_migrate_one_table(handle, job_id, table, migrator, error_log))
+    cfg = load_config()
+    table_parallelism = cfg.full_load_table_parallelism
+
+    # Process-parallel path: when the migrator is a BatchedTableMigrator (the
+    # production path), use ProcessPoolExecutor so each table gets its own GIL
+    # and its own CPU core. Fakes/test doubles fall through to ThreadPool.
+    use_processes = isinstance(migrator, BatchedTableMigrator) and table_parallelism > 1
+
+    if not use_processes:
+        # Thread fallback (test doubles, or table_parallelism<=1).
+        workers = min(table_parallelism, len(tables))
+        if workers <= 1:
+            for table in tables:
+                _tally(_migrate_one_table(handle, job_id, table, migrator, error_log))
+        else:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="fullload-table"
+            ) as pool:
+                futures = [
+                    pool.submit(
+                        _migrate_one_table, handle, job_id, table, migrator, error_log
+                    )
+                    for table in tables
+                ]
+                for future in as_completed(futures):
+                    _tally(future.result())
     else:
-        with ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="fullload-table"
-        ) as pool:
-            futures = [
-                pool.submit(
-                    _migrate_one_table, handle, job_id, table, migrator, error_log
-                )
-                for table in tables
-            ]
-            for future in as_completed(futures):
-                # _migrate_one_table never raises (per-table errors are caught
-                # inside); it returns how the table's load ended.
-                _tally(future.result())
+        # Unified process-parallel path: small tables get 1 worker each, large
+        # shardable tables get multiple shard workers. All submitted to ONE pool.
+        from dsql_migrator.core.exporter import shardable_int_pk
+
+        # Plan work units: for each table, decide if it should be sharded.
+        # A shardable large table gets K shard workers (K = remaining pool slots
+        # allocated proportionally). Small/non-shardable tables get 1 worker each.
+        work_units: list[tuple] = []  # ("table", table) or ("shard", table, lo, hi, idx)
+        non_shardable_count = 0
+        shardable_tables: list[TableDef] = []
+        for table in tables:
+            if shardable_int_pk(table) is not None:
+                shardable_tables.append(table)
+            else:
+                non_shardable_count += 1
+                work_units.append(("table", table))
+
+        # Allocate shard counts: distribute remaining pool slots among shardable
+        # tables. Each shardable table gets at least 1 shard; the rest of the
+        # pool budget goes to the largest tables proportionally.
+        remaining_slots = max(1, table_parallelism - non_shardable_count)
+        for table in shardable_tables:
+            # Each shardable table gets a share of remaining slots (at least 1).
+            if len(shardable_tables) == 1:
+                shards_for_table = remaining_slots
+            else:
+                shards_for_table = max(1, remaining_slots // len(shardable_tables))
+            shard_ranges = migrator._exporter.plan_pk_shard_ranges(
+                migrator._inputs.source_config,
+                table,
+                shards_for_table,
+                min_rows=cfg.full_load_shard_min_rows,
+            )
+            if len(shard_ranges) > 1:
+                for i, (lo, hi) in enumerate(shard_ranges):
+                    work_units.append(("shard", table, lo, hi, i))
+            else:
+                work_units.append(("table", table))
+
+        total_workers = min(table_parallelism, len(work_units))
+
+        # Pre-pass: DROP+recreate sharded tables that are in replace_tables
+        # BEFORE spawning workers (so shards load into empty tables).
+        table_recreator = _default_table_recreator(migrator._inputs)
+        sharded_table_names = {
+            wu[1].name for wu in work_units if wu[0] == "shard"
+        }
+        for tname in sharded_table_names:
+            is_replace = (
+                not migrator._inputs.cdc_coexisting
+                and tname in migrator._inputs.replace_tables
+            )
+            if is_replace:
+                tbl = next(t for t in tables if t.name == tname)
+                table_recreator(tbl)
+
+        ctx = multiprocessing.get_context("spawn")
+        progress_queue: multiprocessing.Queue = ctx.Queue()
+        cancel_event = ctx.Event()
+        stop_drain = threading.Event()
+        drain = threading.Thread(
+            target=_drain_progress_queue,
+            args=(progress_queue, handle, cancel_event, stop_drain),
+            daemon=True, name="fullload-progress-drain",
+        )
+        drain.start()
+
+        # Track shard results per table for aggregation.
+        shard_results: dict[str, list[_TableWorkerResult]] = {}
+
+        try:
+            with ProcessPoolExecutor(
+                max_workers=total_workers,
+                mp_context=ctx,
+                initializer=_init_worker,
+                initargs=(progress_queue, cancel_event),
+            ) as pool:
+                futures: dict = {}  # future -> ("table", name) or ("shard", name, idx)
+                submission_idx = 0
+                for wu in work_units:
+                    if handle.cancelled:
+                        break
+                    if submission_idx > 0:
+                        _time.sleep(_PROCESS_LAUNCH_STAGGER_SECONDS)
+                    submission_idx += 1
+
+                    if wu[0] == "table":
+                        table = wu[1]
+                        handle.update(lambda job, n=table.name: _start_chunk(job, n))
+                        args = _TableWorkerArgs(
+                            job_id=job_id, table=table, inputs=migrator._inputs
+                        )
+                        f = pool.submit(_migrate_one_table_in_process, args)
+                        futures[f] = ("table", table.name)
+                    else:  # "shard"
+                        table, lo, hi, shard_idx = wu[1], wu[2], wu[3], wu[4]
+                        # Start chunk only once per sharded table.
+                        if table.name not in shard_results:
+                            shard_results[table.name] = []
+                            handle.update(lambda job, n=table.name: _start_chunk(job, n))
+                        shard_args = _ShardWorkerArgs(
+                            job_id=job_id, table=table,
+                            inputs=migrator._inputs,
+                            pk_lower=lo, pk_upper=hi, shard_index=shard_idx,
+                        )
+                        f = pool.submit(_migrate_shard_in_process, shard_args)
+                        futures[f] = ("shard", table.name, shard_idx)
+
+                # Process results as they complete.
+                for future in as_completed(futures):
+                    tag = futures[future]
+                    result: _TableWorkerResult = future.result()
+                    name = result.table_name
+
+                    if tag[0] == "shard":
+                        # Accumulate shard results; finalize when all shards done.
+                        shard_results[name].append(result)
+                        expected_shards = sum(
+                            1 for wu in work_units
+                            if wu[0] == "shard" and wu[1].name == name
+                        )
+                        if len(shard_results[name]) < expected_shards:
+                            continue  # more shards pending for this table
+                        # All shards for this table complete — aggregate.
+                        total_loaded = sum(r.rows_loaded for r in shard_results[name])
+                        total_skipped = sum(r.rows_skipped for r in shard_results[name])
+                        all_quarantine = [
+                            rec for r in shard_results[name]
+                            for rec in r.quarantine_records
+                        ]
+                        any_failed = any(r.status == "FAILED" for r in shard_results[name])
+                        any_stopped = any(r.status == "STOPPED" for r in shard_results[name])
+                        if any_failed:
+                            for r in shard_results[name]:
+                                if r.status == "FAILED" and r.error_message:
+                                    error_log.record(job_id, DataErrorRecord(
+                                        table=name, chunk_id=name,
+                                        error_code=r.error_code,
+                                        message=f"shard {r.shard_index}: {r.error_message}",
+                                        occurred_at=datetime.now(timezone.utc),
+                                    ))
+                            log_activity(ActivityCategory.FULL_LOAD, "load table",
+                                status=ActivityStatus.FAILURE, target=name,
+                                detail=f"one or more shards failed ({total_loaded:,} rows loaded)")
+                            handle.update(lambda job, n=name: _fail_chunk(job, n))
+                            _tally(_TableLoadOutcome.FAILED)
+                        elif any_stopped:
+                            handle.update(lambda job, n=name: _fail_chunk(job, n))
+                            _tally(_TableLoadOutcome.STOPPED)
+                        else:
+                            for rec in all_quarantine:
+                                error_log.record(job_id, DataErrorRecord(
+                                    table=name, chunk_id=name,
+                                    error_code=rec.get("error_code"),
+                                    message=f"quarantined row pk[{rec.get('primary_key')}]: {rec.get('message')}",
+                                    occurred_at=datetime.now(timezone.utc),
+                                ))
+                            had_q = len(all_quarantine) > 0
+                            log_activity(ActivityCategory.FULL_LOAD, "load table",
+                                status=ActivityStatus.FAILURE if had_q else ActivityStatus.SUCCESS,
+                                target=name,
+                                detail=f"{total_loaded:,} rows loaded across {expected_shards} shards")
+                            handle.update(lambda job, n=name, r=total_loaded, s=total_skipped:
+                                _complete_chunk(job, n, r, s))
+                            _tally(_TableLoadOutcome.QUARANTINED if had_q else _TableLoadOutcome.LOADED)
+                    else:
+                        # Single-table worker result (same as before).
+                        if result.status == "DONE":
+                            had_quarantine = len(result.quarantine_records) > 0
+                            for rec in result.quarantine_records:
+                                error_log.record(job_id, DataErrorRecord(
+                                    table=name, chunk_id=name,
+                                    error_code=rec.get("error_code"),
+                                    message=f"quarantined row pk[{rec.get('primary_key')}]: {rec.get('message')}",
+                                    occurred_at=datetime.now(timezone.utc),
+                                ))
+                            log_activity(ActivityCategory.FULL_LOAD, "load table",
+                                status=ActivityStatus.FAILURE if had_quarantine else ActivityStatus.SUCCESS,
+                                target=name,
+                                detail=f"{result.rows_loaded:,} rows newly loaded")
+                            handle.update(lambda job, n=name, r=result.rows_loaded, s=result.rows_skipped:
+                                _complete_chunk(job, n, r, s))
+                            _tally(_TableLoadOutcome.QUARANTINED if had_quarantine else _TableLoadOutcome.LOADED)
+                        elif result.status == "STOPPED":
+                            log_activity(ActivityCategory.FULL_LOAD, "load table",
+                                status=ActivityStatus.INFO, target=name,
+                                detail="stopped by user (retryable)")
+                            handle.update(lambda job, n=name: _fail_chunk(job, n))
+                            _tally(_TableLoadOutcome.STOPPED)
+                        else:  # FAILED
+                            error_log.record(job_id, DataErrorRecord(
+                                table=name, chunk_id=name,
+                                error_code=result.error_code,
+                                message=result.error_message or "unknown error",
+                                occurred_at=datetime.now(timezone.utc),
+                            ))
+                            log_activity(ActivityCategory.FULL_LOAD, "load table",
+                                status=ActivityStatus.FAILURE, target=name,
+                                error_code=result.error_code,
+                                detail=result.error_message or "unknown error")
+                            handle.update(lambda job, n=name: _fail_chunk(job, n))
+                            _tally(_TableLoadOutcome.FAILED)
+        finally:
+            stop_drain.set()
+            progress_queue.put(_PROGRESS_SENTINEL)
+            drain.join(timeout=5)
 
     if handle.cancelled:
         handle.update(_fail_unfinished_chunks)

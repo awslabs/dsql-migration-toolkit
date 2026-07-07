@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.68
+
+### 변경 (Changed)
+
+- **Full Load: 멀티프로세스 병렬화 (GIL 우회).** 테이블을 `ProcessPoolExecutor`로
+  별도 OS 프로세스에서 로드하여 각 테이블(또는 shard)이 자체 GIL + CPU 코어를 사용.
+  단일 정수 PK를 가진 대형 테이블은 자동으로 PK range shard 분할. ECS Fargate 8 vCPU
+  측정 결과:
+  - 4 테이블 혼합 (tp=8): **34,800 rows/s**, CPU 561% (기존 12,277, CPU 110%)
+  - 단일 33.6M행 테이블 shard (tp=8): **51,000 rows/s**, CPU 777%
+  - 200GB 테이블 예상: **~2.5시간** (기존 ~46시간, **18× 단축**)
+  - 하위 호환: test double은 자동으로 ThreadPool fallback 사용.
+
 ## v0.1.67
 
 ### 변경 (Changed)

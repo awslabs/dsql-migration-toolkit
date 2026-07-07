@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.68
+
+### Changed
+
+- **Full Load: multi-process parallelism (GIL bypass).** Tables now load in
+  separate OS processes via `ProcessPoolExecutor`, giving each table (or shard)
+  its own Python GIL and its own CPU core. Large tables with a single integer
+  primary key are automatically split into PK-range shards across multiple
+  processes. All work units — whole-table workers and shard workers — share one
+  bounded pool. Measured on ECS Fargate 8 vCPU:
+  - 4 tables mixed (tp=8): **34,800 rows/s** at CPU 561% (was 12,277 at 110%)
+  - Single 33.6M-row table sharded (tp=8): **51,000 rows/s** at CPU 777%
+  - 200GB table estimate: **~2.5 hours** (was ~46 hours, **18× faster**)
+  - Backward-compatible: test doubles automatically use the thread fallback.
+
 ## v0.1.67
 
 ### Changed
