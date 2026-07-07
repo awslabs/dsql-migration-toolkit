@@ -2040,6 +2040,16 @@ def _start_cdc_deploy(
         aws_profile=getattr(session, "aws_profile", None),
         assume_role_arn=getattr(migration_state, "cdc_deploy_role_arn", None),
     )
+    # The cdc-stack template exceeds CFn's 51,200-byte inline limit, so the
+    # deployer stages it in S3 via TemplateURL. Derive the bucket name from the
+    # deterministic naming convention (same bucket the infra deploy created).
+    from dsql_migrator.core.s3_provision import plugin_bucket_name as _pbucket
+    try:
+        _sts = deployer._client("sts")
+        _acct = _sts.get_caller_identity()["Account"]  # type: ignore[attr-defined]
+        deployer.template_s3_bucket = _pbucket(_acct, region)
+    except Exception:  # noqa: BLE001 — best-effort; will fail later with a clear message
+        pass
     migration_state.clear_cdc_deploy_log()
     stack_name = migration_state.cdc_stack_name
 
