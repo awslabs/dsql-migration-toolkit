@@ -140,7 +140,7 @@ class _FakeDeployer:
             raise self._bootstrap_error
         return self._bootstrap
 
-    def submit_update(self, stack_name, overrides):
+    def submit_update(self, stack_name, overrides, *, template_body=None):
         self.calls.append("submit_update")
         self.updates.append(list(overrides))
         if self._update_error:

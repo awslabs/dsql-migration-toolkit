@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.71
+
+### 수정 (Fixed)
+
+- **CDC: `SnapshotMode`가 실제 CloudFormation 템플릿에 전달되도록 수정.** v0.1.70에서
+  Python이 올바른 모드를 계산했지만 CFn 템플릿에 `snapshot.mode: recovery`가 하드코딩.
+  `SnapshotMode` 파라미터를 추가하고 Start CDC 시 새 템플릿도 함께 전달하여 기존 스택
+  에서도 새 파라미터를 인식. "Could not find existing redo log information" 실패의
+  실제 원인 수정.
+
+- **CDC: 소스 DB 포트가 세션에서 실제 값을 읽도록 수정.** 기존에는 항상 3306 기본값
+  사용하여 비표준 포트에서 connector 타임아웃 실패 유발.
+
 ## v0.1.70
 
 ### 수정 (Fixed)

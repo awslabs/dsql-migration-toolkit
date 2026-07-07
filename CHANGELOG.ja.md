@@ -5,6 +5,19 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.71
+
+### Fixed
+
+- **CDC: `SnapshotMode` が実際に CloudFormation テンプレートに伝達されるよう修正。**
+  v0.1.70 で Python は正しいモードを計算していたが、CFn テンプレートに
+  `snapshot.mode: recovery` がハードコード。`SnapshotMode` パラメータを追加し、
+  Start CDC 時に新テンプレートも渡して既存スタックでも新パラメータを認識。
+  "Could not find existing redo log information" 失敗の実際の原因を修正。
+
+- **CDC: ソース DB ポートがセッションから実際の値を読み取るよう修正。** 以前は常に
+  3306 デフォルト使用、非標準ポートでコネクタータイムアウト失敗を引き起こした。
+
 ## v0.1.70
 
 ### Fixed

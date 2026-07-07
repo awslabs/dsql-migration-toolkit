@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.71
+
+### Fixed
+
+- **CDC: `SnapshotMode` now actually reaches the CloudFormation template.**
+  v0.1.70 computed the correct mode in Python but the cdc-stack template had
+  `snapshot.mode: recovery` hardcoded — the fix never reached the deployed
+  connector. Added a `SnapshotMode` CFn parameter and wired it through
+  `build_cdc_stack_params` / `build_cdc_infra_params`. Start CDC now also passes
+  the updated template (not `UsePreviousTemplate`) so new parameters are
+  recognized by stacks deployed before this version. This is the real fix for
+  the "Could not find existing redo log information" connector failure.
+
+- **CDC: source DB port is now read from the session's source config.** Previously
+  always defaulted to 3306, causing connector timeout failures when the source
+  runs on a non-standard port.
+
 ## v0.1.70
 
 ### Fixed

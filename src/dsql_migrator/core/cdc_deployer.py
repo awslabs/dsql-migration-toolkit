@@ -415,7 +415,11 @@ class CdcStackDeployer:
         return self.stack_status(stack_name) or "DELETE_FAILED"
 
     def submit_update(
-        self, stack_name: str, overrides: Sequence[tuple[str, str]]
+        self,
+        stack_name: str,
+        overrides: Sequence[tuple[str, str]],
+        *,
+        template_body: Optional[str] = None,
     ) -> bool:
         """UpdateStack with tool-known overrides; all other params unchanged.
 
@@ -425,6 +429,10 @@ class CdcStackDeployer:
         plugins, secrets, role) is untouched. Returns ``True`` when an update was
         submitted, ``False`` when CloudFormation reports no changes (idempotent
         re-click: the connectors already match the requested config).
+
+        When ``template_body`` is supplied, the update uses the new template
+        instead of ``UsePreviousTemplate``. This is required when the template
+        has new parameters that the deployed stack doesn't know about yet.
         """
         client = self._client("cloudformation")
         override_keys = {k for k, _ in overrides}
@@ -439,9 +447,13 @@ class CdcStackDeployer:
             if key and key not in override_keys:
                 param_list.append({"ParameterKey": key, "UsePreviousValue": True})
         try:
+            if template_body is not None:
+                template_kwargs = self._template_kwargs(template_body)
+            else:
+                template_kwargs = {"UsePreviousTemplate": True}
             client.update_stack(  # type: ignore[attr-defined]
                 StackName=stack_name,
-                UsePreviousTemplate=True,
+                **template_kwargs,
                 Parameters=param_list,
                 Capabilities=["CAPABILITY_NAMED_IAM"],
             )
@@ -1110,6 +1122,7 @@ def run_cdc_start(
     deployer: CdcStackDeployer,
     on_log: Callable[[datetime, str], None],
     watermark: Optional[Watermark] = None,
+    template_body: Optional[str] = None,
     connector_timeout_seconds: float = 2700.0,
     poll_interval_seconds: float = 15.0,
     sleep: Callable[[float], None] = None,  # type: ignore[assignment]
@@ -1239,7 +1252,9 @@ def run_cdc_start(
                 *watermark_overrides,
                 *connector_overrides,
             ]
-            changed = deployer.submit_update(stack_name, source_pass)
+            changed = deployer.submit_update(
+                stack_name, source_pass, template_body=template_body
+            )
             if changed:
                 driver.log("Source connector update submitted.")
                 driver.stage("submit_source", "DONE")
@@ -1284,7 +1299,9 @@ def run_cdc_start(
         else:
             driver.stage("submit_sink", "IN_PROGRESS")
             since = _now()
-            changed = deployer.submit_update(stack_name, [("DeploySink", "true")])
+            changed = deployer.submit_update(
+                stack_name, [("DeploySink", "true")], template_body=template_body
+            )
             if changed:
                 driver.log("Sink connector update submitted.")
                 driver.stage("submit_sink", "DONE")

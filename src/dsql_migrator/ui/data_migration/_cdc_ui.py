@@ -2043,6 +2043,8 @@ def _start_cdc_deploy(
     migration_state.clear_cdc_deploy_log()
     stack_name = migration_state.cdc_stack_name
 
+    template_body = _read_cdc_template_body()
+
     def work(handle) -> None:
         run_cdc_start(
             handle,
@@ -2054,6 +2056,7 @@ def _start_cdc_deploy(
             # has no watermark (or it lacks binlog coords) the seeder is not
             # deployed and the source connector starts from the current binlog.
             watermark=watermark,
+            template_body=template_body,
         )
 
     job_id = job_manager.submit(work)
