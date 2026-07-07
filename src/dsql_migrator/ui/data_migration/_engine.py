@@ -11,7 +11,11 @@ module, so the public import surface is unchanged.
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+import multiprocessing.queues
+import threading
+import time as _time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -406,6 +410,139 @@ class _RunCounts(NamedTuple):
     quarantined: int
 
 
+# ---------------------------------------------------------------------------
+# Multiprocess worker infrastructure (Phase 1 — true multi-core Full Load)
+# ---------------------------------------------------------------------------
+
+# Stagger delay between process submissions to avoid DSQL IAM token/connection burst.
+_PROCESS_LAUNCH_STAGGER_SECONDS = 0.15
+
+# Sentinel put onto progress_queue to signal drain thread to stop.
+_PROGRESS_SENTINEL = None
+
+
+@dataclass(frozen=True)
+class _TableWorkerArgs:
+    """Picklable input for one table's Full Load in a worker process."""
+
+    job_id: str
+    table: TableDef
+    inputs: "DataMigrationInputs"
+
+
+@dataclass(frozen=True)
+class _TableWorkerResult:
+    """Picklable result from a worker process (never raises past boundary)."""
+
+    table_name: str
+    status: str  # "DONE" | "FAILED" | "STOPPED"
+    rows_loaded: int = 0
+    rows_skipped: int = 0
+    error_message: Optional[str] = None
+    error_code: Optional[str] = None
+    quarantine_records: tuple = ()
+
+
+def _migrate_one_table_in_process(
+    args: _TableWorkerArgs,
+    progress_queue: "multiprocessing.Queue[object]",
+    cancel_event: "multiprocessing.synchronize.Event",
+) -> _TableWorkerResult:
+    """Run entirely inside a child process. Builds own MySQL+DSQL connections.
+
+    Module-level function (required for pickle with spawn context). Catches all
+    exceptions and returns a plain _TableWorkerResult; never raises past the
+    top-level try so unpicklable exceptions cannot break the ProcessPool.
+    """
+    table = args.table
+    name = table.name
+    try:
+        migrator = BatchedTableMigrator(args.inputs)
+        pending_loaded = 0
+        pending_skipped = 0
+
+        def _on_rows(loaded: int, skipped: int = 0) -> None:
+            nonlocal pending_loaded, pending_skipped
+            pending_loaded += loaded
+            pending_skipped += skipped
+            if pending_loaded + pending_skipped >= PROGRESS_FLUSH_ROWS:
+                flush_l, flush_s = pending_loaded, pending_skipped
+                pending_loaded, pending_skipped = 0, 0
+                progress_queue.put((name, flush_l, flush_s))
+
+        outcome = _as_load_result(
+            migrator.migrate_table(
+                table, on_rows=_on_rows, should_cancel=lambda: cancel_event.is_set()
+            )
+        )
+        # Flush remaining progress.
+        if pending_loaded or pending_skipped:
+            progress_queue.put((name, pending_loaded, pending_skipped))
+        quarantine_recs = tuple(
+            {"primary_key": r.primary_key, "message": r.message, "error_code": getattr(r, "error_code", None)}
+            for r in (getattr(outcome, "quarantine_records", ()) or ())
+        )
+        return _TableWorkerResult(
+            table_name=name,
+            status="DONE",
+            rows_loaded=outcome.rows_loaded,
+            rows_skipped=outcome.rows_skipped,
+            quarantine_records=quarantine_recs,
+        )
+    except _FullLoadStopped:
+        return _TableWorkerResult(table_name=name, status="STOPPED")
+    except Exception as exc:  # noqa: BLE001
+        return _TableWorkerResult(
+            table_name=name,
+            status="FAILED",
+            error_message=f"{type(exc).__name__}: {exc}",
+            error_code=_error_code(exc),
+        )
+
+
+def _drain_progress_queue(
+    progress_queue: "multiprocessing.Queue[object]",
+    handle: JobHandle,
+    cancel_event: "multiprocessing.synchronize.Event",
+    stop_event: threading.Event,
+) -> None:
+    """Drain thread: reads progress from worker processes → handle.update().
+
+    Also mirrors handle.cancelled → cancel_event so workers stop cooperatively.
+    Runs until ``stop_event`` is set AND the queue is empty.
+    """
+    while not stop_event.is_set():
+        # Mirror cancellation into the multiprocessing Event.
+        if handle.cancelled and not cancel_event.is_set():
+            cancel_event.set()
+        try:
+            msg = progress_queue.get(timeout=0.3)
+        except Exception:  # noqa: BLE001 - queue.Empty or other
+            continue
+        if msg is _PROGRESS_SENTINEL:
+            break
+        table_name, delta_loaded, delta_skipped = msg
+        handle.update(
+            lambda job, n=table_name, dl=delta_loaded, ds=delta_skipped: (
+                _advance_chunk_rows(job, n, dl, ds)
+            )
+        )
+    # Final drain (anything left after stop).
+    while True:
+        try:
+            msg = progress_queue.get_nowait()
+        except Exception:  # noqa: BLE001
+            break
+        if msg is _PROGRESS_SENTINEL or msg is None:
+            break
+        table_name, delta_loaded, delta_skipped = msg
+        handle.update(
+            lambda job, n=table_name, dl=delta_loaded, ds=delta_skipped: (
+                _advance_chunk_rows(job, n, dl, ds)
+            )
+        )
+
+
 def _migrate_one_table(
     handle: JobHandle,
     job_id: str,
@@ -609,10 +746,121 @@ def _migrate_tables_in_parallel(
     # bounded by the table count.
     table_parallelism = load_config().full_load_table_parallelism
     workers = min(table_parallelism, len(tables))
+
+    # Process-parallel path: when the migrator is a BatchedTableMigrator (the
+    # production path), use ProcessPoolExecutor so each table gets its own GIL
+    # and its own CPU core. Fakes/test doubles fall through to ThreadPool.
+    use_processes = isinstance(migrator, BatchedTableMigrator) and workers > 1
+
     if workers <= 1:
         for table in tables:
             _tally(_migrate_one_table(handle, job_id, table, migrator, error_log))
+    elif use_processes:
+        ctx = multiprocessing.get_context("spawn")
+        progress_queue: multiprocessing.Queue = ctx.Queue()
+        cancel_event = ctx.Event()
+        stop_drain = threading.Event()
+
+        # Start progress drain thread.
+        drain = threading.Thread(
+            target=_drain_progress_queue,
+            args=(progress_queue, handle, cancel_event, stop_drain),
+            daemon=True,
+            name="fullload-progress-drain",
+        )
+        drain.start()
+
+        try:
+            with ProcessPoolExecutor(
+                max_workers=workers, mp_context=ctx
+            ) as pool:
+                futures = []
+                for i, table in enumerate(tables):
+                    if i > 0:
+                        _time.sleep(_PROCESS_LAUNCH_STAGGER_SECONDS)
+                    if handle.cancelled:
+                        break
+                    handle.update(lambda job, n=table.name: _start_chunk(job, n))
+                    args = _TableWorkerArgs(
+                        job_id=job_id, table=table, inputs=migrator._inputs
+                    )
+                    futures.append(
+                        pool.submit(
+                            _migrate_one_table_in_process,
+                            args, progress_queue, cancel_event,
+                        )
+                    )
+
+                for future in as_completed(futures):
+                    result: _TableWorkerResult = future.result()
+                    name = result.table_name
+                    if result.status == "DONE":
+                        had_quarantine = len(result.quarantine_records) > 0
+                        for rec in result.quarantine_records:
+                            error_log.record(
+                                job_id,
+                                DataErrorRecord(
+                                    table=name, chunk_id=name,
+                                    error_code=rec.get("error_code"),
+                                    message=f"quarantined row pk[{rec.get('primary_key')}]: {rec.get('message')}",
+                                    occurred_at=datetime.now(timezone.utc),
+                                ),
+                            )
+                        skipped_note = (
+                            f", {result.rows_skipped:,} already on target (skipped)"
+                            if result.rows_skipped else ""
+                        )
+                        quarantine_note = (
+                            f", {len(result.quarantine_records):,} quarantined"
+                            if had_quarantine else ""
+                        )
+                        log_activity(
+                            ActivityCategory.FULL_LOAD, "load table",
+                            status=ActivityStatus.FAILURE if had_quarantine else ActivityStatus.SUCCESS,
+                            target=name,
+                            detail=f"{result.rows_loaded:,} rows newly loaded{skipped_note}{quarantine_note}",
+                        )
+                        handle.update(
+                            lambda job, n=name, r=result.rows_loaded, s=result.rows_skipped: (
+                                _complete_chunk(job, n, r, s)
+                            )
+                        )
+                        _tally(
+                            _TableLoadOutcome.QUARANTINED if had_quarantine
+                            else _TableLoadOutcome.LOADED
+                        )
+                    elif result.status == "STOPPED":
+                        log_activity(
+                            ActivityCategory.FULL_LOAD, "load table",
+                            status=ActivityStatus.INFO, target=name,
+                            detail="stopped by user (retryable)",
+                        )
+                        handle.update(lambda job, n=name: _fail_chunk(job, n))
+                        _tally(_TableLoadOutcome.STOPPED)
+                    else:  # FAILED
+                        error_log.record(
+                            job_id,
+                            DataErrorRecord(
+                                table=name, chunk_id=name,
+                                error_code=result.error_code,
+                                message=result.error_message or "unknown error",
+                                occurred_at=datetime.now(timezone.utc),
+                            ),
+                        )
+                        log_activity(
+                            ActivityCategory.FULL_LOAD, "load table",
+                            status=ActivityStatus.FAILURE, target=name,
+                            error_code=result.error_code,
+                            detail=result.error_message or "unknown error",
+                        )
+                        handle.update(lambda job, n=name: _fail_chunk(job, n))
+                        _tally(_TableLoadOutcome.FAILED)
+        finally:
+            stop_drain.set()
+            progress_queue.put(_PROGRESS_SENTINEL)
+            drain.join(timeout=5)
     else:
+        # Thread fallback (test doubles / single worker).
         with ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="fullload-table"
         ) as pool:
@@ -623,8 +871,6 @@ def _migrate_tables_in_parallel(
                 for table in tables
             ]
             for future in as_completed(futures):
-                # _migrate_one_table never raises (per-table errors are caught
-                # inside); it returns how the table's load ended.
                 _tally(future.result())
 
     if handle.cancelled:
