@@ -170,4 +170,53 @@ quarantine됐는지 정확히 나열합니다.
 
 ---
 
+## 3.7 멀티프로세스 병렬화 (GIL 우회)
+
+Python의 GIL(Global Interpreter Lock)은 단일 프로세스를 CPU 1코어로 제한합니다.
+Full Load의 행별 타입 변환과 배치 조립은 CPU-bound Python이므로, 이전에는 8 vCPU
+Fargate 태스크에서도 ~15,000 rows/s가 한계였습니다.
+
+v0.1.68부터 로더는 **`ProcessPoolExecutor`**를 사용합니다 — 각 테이블(또는 shard)이
+자체 OS 프로세스에서 자체 GIL + CPU 코어로 실행됩니다.
+
+### 동작 방식
+
+- **소형 테이블** (shard 불가 또는 행 수 미달): 테이블당 1 worker 프로세스.
+- **대형 테이블** (단일 정수 PK): 자동으로 K개 PK range shard로 분할, 각각 별도
+  worker 프로세스에서 로드.
+- **모든 work unit이 하나의 bounded pool 공유** — `table_parallelism`이 동시 worker 수를 제어.
+
+```
+ProcessPoolExecutor(max_workers=table_parallelism)
+  ├─ customers (소형)           → 1 worker
+  ├─ orders (9M, int PK)       → 2 shard workers
+  ├─ payments (9M, int PK)     → 2 shard workers
+  └─ order_items (33.6M, int PK) → 3 shard workers
+                                    ───────────────
+                                    8 workers = 8 cores
+```
+
+### 설정
+
+| 변수 | 기본값 | 설명 |
+|---|---|---|
+| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | 4 | 최대 동시 worker 프로세스 수. vCPU 수에 맞추면 전체 활용. |
+| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | worker당 동시 DSQL 연결 수 (프로세스 내 쓰기 병렬도). |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1,000,000 | PK shard 적용 최소 예상 행 수. 미만이면 shard 오버헤드가 불필요. |
+
+**대규모 마이그레이션 권장:** `TABLE_PARALLELISM`을 태스크 vCPU 수로 설정 (예: 8 vCPU
+태스크면 8). 로더가 자동으로 pool slot을 whole-table worker와 shard worker에 배분합니다.
+
+### 측정 성능 (ECS Fargate 8 vCPU)
+
+| 시나리오 | rows/s | CPU | 200GB 예상 |
+|---|---|---|---|
+| ThreadPool (GIL, v0.1.68 이전) | 12,277 | 110% | ~46시간 |
+| ProcessPool, 4 테이블 혼합, tp=8 | 34,800 | 561% | ~5시간 |
+| ProcessPool, 단일 대형 테이블, tp=8 | 51,000 | 777% | **~2.5시간** |
+
+전체 측정 이력은 [Appendix: 성능 테스트 결과](12-performance-test-results.md) 참고.
+
+---
+
 **다음:** [4. CDC와 DSQL 제약 →](04-cdc-and-dsql-constraints.md)

@@ -179,4 +179,55 @@ CDC の引き継ぎ地点を失ったりすることはありません。
 
 ---
 
+## 3.8 マルチプロセス並列化（GIL バイパス）
+
+Python の GIL (Global Interpreter Lock) は、単一プロセスを CPU 1 コアに制限します。
+Full Load の行ごとの型変換とバッチ組み立ては CPU バウンドな Python であるため、以前は
+8 vCPU の Fargate タスクでも約 15,000 rows/s が上限でした。
+
+v0.1.68 から、ローダーは **`ProcessPoolExecutor`** を使用します — 各テーブル（または
+シャード）が独自の OS プロセスで独自の GIL + CPU コアを使って実行されます。
+
+### 動作方式
+
+- **小規模テーブル**（シャード不可または行数閾値未満）：テーブルごとに 1 ワーカー。
+- **大規模テーブル**（単一整数 PK）：自動的に K 個の PK レンジシャードに分割され、
+  それぞれ別のワーカープロセスでロード。
+- **すべてのワークユニットが 1 つの bounded pool を共有** —
+  `table_parallelism` が同時ワーカー数を制御。
+
+```
+ProcessPoolExecutor(max_workers=table_parallelism)
+  ├─ customers（小規模）         → 1 worker
+  ├─ orders（9M, int PK）       → 2 shard workers
+  ├─ payments（9M, int PK）     → 2 shard workers
+  └─ order_items（33.6M, int PK）→ 3 shard workers
+                                    ───────────────
+                                    8 workers = 8 cores
+```
+
+### 設定
+
+| 変数 | デフォルト | 説明 |
+|---|---|---|
+| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | 4 | 最大同時ワーカープロセス数。vCPU 数に合わせると全活用。 |
+| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | ワーカーあたり同時 DSQL 接続数（プロセス内書き込み並列度）。 |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1,000,000 | PK シャード適用最小推定行数。未満ではシャードオーバーヘッド不要。 |
+
+**大規模マイグレーション推奨：** `TABLE_PARALLELISM` をタスクの vCPU 数に設定
+（例: 8 vCPU タスクなら 8）。ローダーが自動的に pool スロットをテーブルワーカーと
+シャードワーカーに配分します。
+
+### 測定性能（ECS Fargate 8 vCPU）
+
+| シナリオ | rows/s | CPU | 200GB 推定 |
+|---|---|---|---|
+| ThreadPool（GIL、v0.1.68 以前） | 12,277 | 110% | 約 46 時間 |
+| ProcessPool、4 テーブル混合、tp=8 | 34,800 | 561% | 約 5 時間 |
+| ProcessPool、単一大規模テーブル、tp=8 | 51,000 | 777% | **約 2.5 時間** |
+
+全測定履歴は [Appendix: パフォーマンステスト結果](12-performance-test-results.md) を参照。
+
+---
+
 **次へ:** [4. CDC と DSQL の制約 →](04-cdc-and-dsql-constraints.md)
