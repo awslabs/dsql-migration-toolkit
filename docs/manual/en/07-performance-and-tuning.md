@@ -52,6 +52,52 @@ or use an **identity column with caching** — so you can spread writes across t
 key range. This is a DSQL-specific concern that a same-engine (MySQL→MySQL)
 migration never has to think about.
 
+#### The composite-key option — the one lever that moves the server-side wall
+
+Why this option exists: in our in-VPC measurements, a large-table Full Load
+plateaued at roughly the same throughput no matter how much we tuned the
+**client** — a read-ahead prefetch queue, sharding the read across PK ranges, and
+raising batch size / write parallelism each moved throughput by ~0%. The wall was
+not the client; DSQL's `CommitLatency` sat at a healthy ~50 ms p50 but spiked to
+**several seconds (p99) and tens of seconds (max)** in a periodic long tail, while
+the OCC conflict rate stayed near zero. That long tail is the signature of a write
+**hot partition**: with a monotonic `AUTO_INCREMENT` key, every insert lands in the
+same rightmost key range, so one partition serializes the writes even though the
+rows never logically conflict. A hot partition is a *server-side* limit, so only a
+change that spreads writes across partitions can move it — and the composite key is
+that change.
+
+So Schema Conversion offers a fourth, **per-table** strategy: switch a table's
+target primary key to a **composite key** that prepends a high-cardinality column
+you choose ahead of the original key — e.g. `(customer_id, id)` instead of `(id)`.
+Because DSQL stores rows in primary-key order, leading with `customer_id` scatters
+inserts across many key ranges (one per customer) instead of funneling them to a
+single rightmost partition. Key points:
+
+- **The source MySQL schema is never changed** — only the DSQL target key. This is
+  a target-side migration decision, not a schema redesign you push back to MySQL.
+- **The original key's uniqueness is preserved.** The tool emits a
+  `CREATE UNIQUE INDEX ASYNC` on the original key alongside the composite PK, so a
+  lookup or constraint on the old key still holds.
+- **The tool validates the choice** against DSQL's key limits before you apply it
+  (the leading column must be `NOT NULL`, not already part of the key, and the
+  composite key must stay within ≤ 8 columns and ≤ 1 KiB), and spells out the
+  consequence at selection time: **after cutover the application's queries, joins,
+  and upserts must use the new composite key, and the leading column must be
+  immutable** (DSQL primary keys cannot be updated in place).
+- **Full Load and CDC both handle it.** Full Load's idempotent
+  `INSERT ... ON CONFLICT` keys on the target composite key; CDC needs **no
+  connector or plugin change** — the Debezium source is re-keyed (via
+  `message.key.columns`) so each change record's key matches the target composite
+  key, and the sink's upsert/delete apply against it unchanged.
+
+Reach for this when a table's writes are demonstrably hot-partitioned (a
+`CommitLatency` long tail under load with low OCC) **and** it has a natural
+high-cardinality grouping column. If the load is bounded by something else — client
+CPU, or write round-trip latency that isn't a hot partition — a composite key buys
+nothing, because there is no server-side wall for it to move; measure first
+(see [§7.5](#75-a-measured-example--one-run-that-backs-71-and-72)).
+
 ### Batched loads sized to DSQL's transaction envelope
 
 DSQL enforces a hard per-transaction envelope: **≤ 3000 rows**, **≤ 10 MiB of

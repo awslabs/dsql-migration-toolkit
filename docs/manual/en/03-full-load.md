@@ -56,7 +56,9 @@ end. The query runs over a **server-side / streaming cursor** inside a
 
 **A primary key is required.** A table with no PK cannot be keyset-paginated and
 is rejected (it's also flagged `UNSUPPORTED` back in Evaluation, because DSQL
-requires a PK too). Single-column and composite PKs are both supported.
+requires a PK too). Single-column and composite PKs are both supported — and a
+composite key is not just tolerated but is the tool's recommended fix for a write
+hot partition on a monotonic key (see [Chapter 7 §7.1](07-performance-and-tuning.md#primary-key-strategy--avoid-hot-partitions)).
 
 > **Worried about read load on a busy production source?** Loading many tables at
 > once is bounded by one lever (table parallelism) and there are concrete steps to

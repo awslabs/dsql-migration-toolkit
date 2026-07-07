@@ -154,8 +154,14 @@ DSQL-compatible DDL and applies it to the target. It's the SCT-like step:
 - **Browse** the source/target object tree.
 - **Compare** source DDL vs the converted DSQL DDL **side by side** for each
   object.
-- **Apply** the converted DDL to the target, choosing **SKIP** or **REPLACE** for
-  objects that already exist (driven by the conflict detection from Evaluation).
+- **Apply** the converted DDL to the target — all objects at once with **Apply
+  all**, or one object at a time with its own **Apply to target** button. For an
+  object that already exists on the target, you choose **SKIP** (leave it) or
+  **REPLACE** (drop and recreate); when you apply a single existing object the tool
+  asks **Replace / Skip / Cancel** right then, so the choice is explicit — this is
+  how you *re-apply* a table after changing its DDL, e.g. reverting a composite key
+  back to the integer key (SKIP would leave the old table in place; REPLACE
+  recreates it with the new key).
 
 ### What the conversion does for you
 
@@ -169,7 +175,13 @@ handles the dialect and constraint bridging automatically:
   report**, with a note to enforce referential integrity in the application.
 - **Primary-key strategies** — keep the integer PK, convert to UUID, or use an
   identity column with caching (to avoid hot-partition contention on a
-  monotonic key).
+  monotonic key). Each table's card also has a **primary-key picker** to switch it
+  to a **composite key** (a high-cardinality column prepended to the original key,
+  e.g. `(customer_id, id)`) — the one strategy that spreads writes across DSQL
+  partitions and moves a write hot-partition wall. It validates the choice against
+  DSQL's key limits and keeps the original key unique via a `CREATE UNIQUE INDEX
+  ASYNC`; see [Chapter 7 §7.1](07-performance-and-tuning.md#primary-key-strategy--avoid-hot-partitions)
+  for when and why to use it.
 - **Indexes as `CREATE INDEX ASYNC`** — DSQL builds secondary indexes
   asynchronously, after data.
 - **One DDL per transaction** — conversion emits each DDL statement as its own
