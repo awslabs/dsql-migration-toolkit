@@ -431,6 +431,24 @@ class _TableWorkerArgs:
 
 
 @dataclass(frozen=True)
+class _ShardWorkerArgs:
+    """Picklable input for one PK-range shard of a single table (Phase 2).
+
+    Each shard loads a disjoint PK slice of the same table into the same target
+    using idempotent INSERT ON CONFLICT DO NOTHING. Multiple shards of the same
+    table run concurrently in separate processes, each with its own MySQL snapshot
+    + DSQL connection pool.
+    """
+
+    job_id: str
+    table: TableDef
+    inputs: "DataMigrationInputs"
+    pk_lower: Optional[int]
+    pk_upper: Optional[int]
+    shard_index: int
+
+
+@dataclass(frozen=True)
 class _TableWorkerResult:
     """Picklable result from a worker process (never raises past boundary)."""
 
@@ -441,6 +459,7 @@ class _TableWorkerResult:
     error_message: Optional[str] = None
     error_code: Optional[str] = None
     quarantine_records: tuple = ()
+    shard_index: int = -1
 
 
 # Per-worker-process globals, set by _init_worker (ProcessPoolExecutor initializer).
@@ -520,6 +539,87 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
         return _TableWorkerResult(
             table_name=name,
             status="FAILED",
+            error_message=f"{type(exc).__name__}: {exc}",
+            error_code=_error_code(exc),
+        )
+
+
+def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
+    """Load one PK-range shard of a table in its own process (Phase 2).
+
+    Same pattern as _migrate_one_table_in_process but reads only the
+    [pk_lower, pk_upper) slice. Each shard builds its own MySQL connection +
+    DSQL connection pool so they run on independent cores.
+    """
+    progress_queue = _worker_progress_queue
+    cancel_event = _worker_cancel_event
+    table = args.table
+    name = table.name
+    try:
+        migrator = BatchedTableMigrator(args.inputs)
+        pending_loaded = 0
+        pending_skipped = 0
+
+        def _on_rows(loaded: int, skipped: int = 0) -> None:
+            nonlocal pending_loaded, pending_skipped
+            pending_loaded += loaded
+            pending_skipped += skipped
+            if pending_loaded + pending_skipped >= PROGRESS_FLUSH_ROWS:
+                flush_l, flush_s = pending_loaded, pending_skipped
+                pending_loaded, pending_skipped = 0, 0
+                if progress_queue is not None:
+                    progress_queue.put((name, flush_l, flush_s))
+
+        # Build the single-shard row stream for this PK range.
+        applied = args.inputs.table_conversions.get(table.name)
+        target_types = (
+            parse_target_column_types(applied.target_ddl) if applied else None
+        )
+        rows = migrator._exporter.stream_converted_rows(
+            args.inputs.source_config,
+            table,
+            should_cancel=lambda: cancel_event is not None and cancel_event.is_set(),
+            target_types=target_types,
+            pk_lower=args.pk_lower,
+            pk_upper=args.pk_upper,
+        )
+        # Load with SKIP_EXISTING (idempotent, safe for concurrent shards).
+        importer = migrator._importer_factory(args.inputs)
+        result = importer.import_rows(
+            rows,
+            table,
+            on_batch_loaded=_on_rows,
+            should_cancel=lambda: cancel_event is not None and cancel_event.is_set(),
+            on_conflict=OnConflictMode.SKIP_EXISTING,
+        )
+        if (pending_loaded or pending_skipped) and progress_queue is not None:
+            progress_queue.put((name, pending_loaded, pending_skipped))
+        if result.cancelled:
+            return _TableWorkerResult(
+                table_name=name, status="STOPPED", shard_index=args.shard_index
+            )
+        if result.failures:
+            return _TableWorkerResult(
+                table_name=name, status="FAILED", shard_index=args.shard_index,
+                error_message=f"{result.failures} batch(es) failed",
+                rows_loaded=result.rows_loaded, rows_skipped=result.rows_skipped,
+            )
+        quarantine_recs = tuple(
+            {"primary_key": r.primary_key, "message": r.message, "error_code": getattr(r, "error_code", None)}
+            for r in (getattr(result, "quarantine_records", ()) or ())
+        )
+        return _TableWorkerResult(
+            table_name=name, status="DONE", shard_index=args.shard_index,
+            rows_loaded=result.rows_loaded, rows_skipped=result.rows_skipped,
+            quarantine_records=quarantine_recs,
+        )
+    except _FullLoadStopped:
+        return _TableWorkerResult(table_name=name, status="STOPPED", shard_index=args.shard_index)
+    except ExportCancelled:
+        return _TableWorkerResult(table_name=name, status="STOPPED", shard_index=args.shard_index)
+    except Exception as exc:  # noqa: BLE001
+        return _TableWorkerResult(
+            table_name=name, status="FAILED", shard_index=args.shard_index,
             error_message=f"{type(exc).__name__}: {exc}",
             error_code=_error_code(exc),
         )
@@ -769,15 +869,141 @@ def _migrate_tables_in_parallel(
 
     # Operator-tunable table-level parallelism (default FULL_LOAD_TABLE_PARALLELISM),
     # bounded by the table count.
-    table_parallelism = load_config().full_load_table_parallelism
+    cfg = load_config()
+    table_parallelism = cfg.full_load_table_parallelism
     workers = min(table_parallelism, len(tables))
 
     # Process-parallel path: when the migrator is a BatchedTableMigrator (the
     # production path), use ProcessPoolExecutor so each table gets its own GIL
     # and its own CPU core. Fakes/test doubles fall through to ThreadPool.
-    use_processes = isinstance(migrator, BatchedTableMigrator) and workers > 1
+    use_processes = isinstance(migrator, BatchedTableMigrator) and table_parallelism > 1
 
-    if workers <= 1:
+    # Phase 2: PK-range process sharding for a single large table. When there
+    # are fewer tables than workers AND a table has a shardable integer PK, split
+    # it across multiple worker processes (each loads a disjoint PK range). This
+    # gives a single large table the same multi-core benefit as multiple tables.
+    use_shard_processes = False
+    shard_table: Optional[TableDef] = None
+    shard_ranges: list = []
+    if use_processes and len(tables) == 1:
+        from dsql_migrator.core.exporter import shardable_int_pk
+        candidate = tables[0]
+        if shardable_int_pk(candidate) is not None:
+            # Plan the PK ranges (one quick MIN/MAX query).
+            shard_ranges = migrator._exporter.plan_pk_shard_ranges(
+                migrator._inputs.source_config,
+                candidate,
+                table_parallelism,
+                min_rows=cfg.full_load_shard_min_rows,
+            )
+            if len(shard_ranges) > 1:
+                use_shard_processes = True
+                shard_table = candidate
+
+    if use_shard_processes and shard_table is not None:
+        # Phase 2: single table, multiple PK-range shards as separate processes.
+        ctx = multiprocessing.get_context("spawn")
+        progress_queue: multiprocessing.Queue = ctx.Queue()
+        cancel_event = ctx.Event()
+        stop_drain = threading.Event()
+        drain = threading.Thread(
+            target=_drain_progress_queue,
+            args=(progress_queue, handle, cancel_event, stop_drain),
+            daemon=True, name="fullload-shard-drain",
+        )
+        drain.start()
+        handle.update(lambda job, n=shard_table.name: _start_chunk(job, n))
+        try:
+            with ProcessPoolExecutor(
+                max_workers=len(shard_ranges),
+                mp_context=ctx,
+                initializer=_init_worker,
+                initargs=(progress_queue, cancel_event),
+            ) as pool:
+                futures = []
+                for i, (lo, hi) in enumerate(shard_ranges):
+                    if i > 0:
+                        _time.sleep(_PROCESS_LAUNCH_STAGGER_SECONDS)
+                    if handle.cancelled:
+                        break
+                    shard_args = _ShardWorkerArgs(
+                        job_id=job_id, table=shard_table,
+                        inputs=migrator._inputs,
+                        pk_lower=lo, pk_upper=hi, shard_index=i,
+                    )
+                    futures.append(pool.submit(_migrate_shard_in_process, shard_args))
+
+                # Aggregate shard results.
+                total_loaded = 0
+                total_skipped = 0
+                any_failed = False
+                any_stopped = False
+                all_quarantine: list = []
+                for future in as_completed(futures):
+                    result: _TableWorkerResult = future.result()
+                    total_loaded += result.rows_loaded
+                    total_skipped += result.rows_skipped
+                    all_quarantine.extend(result.quarantine_records)
+                    if result.status == "FAILED":
+                        any_failed = True
+                        if result.error_message:
+                            error_log.record(
+                                job_id,
+                                DataErrorRecord(
+                                    table=shard_table.name, chunk_id=shard_table.name,
+                                    error_code=result.error_code,
+                                    message=f"shard {result.shard_index}: {result.error_message}",
+                                    occurred_at=datetime.now(timezone.utc),
+                                ),
+                            )
+                    elif result.status == "STOPPED":
+                        any_stopped = True
+
+                # Record final outcome for the table.
+                name = shard_table.name
+                if any_failed:
+                    log_activity(
+                        ActivityCategory.FULL_LOAD, "load table",
+                        status=ActivityStatus.FAILURE, target=name,
+                        detail=f"one or more shards failed ({total_loaded:,} rows loaded)",
+                    )
+                    handle.update(lambda job, n=name: _fail_chunk(job, n))
+                    _tally(_TableLoadOutcome.FAILED)
+                elif any_stopped:
+                    handle.update(lambda job, n=name: _fail_chunk(job, n))
+                    _tally(_TableLoadOutcome.STOPPED)
+                else:
+                    for rec in all_quarantine:
+                        error_log.record(
+                            job_id,
+                            DataErrorRecord(
+                                table=name, chunk_id=name,
+                                error_code=rec.get("error_code"),
+                                message=f"quarantined row pk[{rec.get('primary_key')}]: {rec.get('message')}",
+                                occurred_at=datetime.now(timezone.utc),
+                            ),
+                        )
+                    had_quarantine = len(all_quarantine) > 0
+                    log_activity(
+                        ActivityCategory.FULL_LOAD, "load table",
+                        status=ActivityStatus.FAILURE if had_quarantine else ActivityStatus.SUCCESS,
+                        target=name,
+                        detail=f"{total_loaded:,} rows loaded across {len(shard_ranges)} shards",
+                    )
+                    handle.update(
+                        lambda job, n=name, r=total_loaded, s=total_skipped: (
+                            _complete_chunk(job, n, r, s)
+                        )
+                    )
+                    _tally(
+                        _TableLoadOutcome.QUARANTINED if had_quarantine
+                        else _TableLoadOutcome.LOADED
+                    )
+        finally:
+            stop_drain.set()
+            progress_queue.put(_PROGRESS_SENTINEL)
+            drain.join(timeout=5)
+    elif workers <= 1 or not use_processes:
         for table in tables:
             _tally(_migrate_one_table(handle, job_id, table, migrator, error_log))
     elif use_processes:
