@@ -117,6 +117,16 @@ Parameters:
       Optional security group id of the source RDS/Aurora MySQL. When set, egress
       on SourceDbPort is allowed to this security group only (preferred over CIDR).
 
+  SnapshotMode:
+    Type: String
+    Default: schema_only
+    AllowedValues: [recovery, schema_only]
+    Description: >
+      Debezium snapshot.mode. Use 'recovery' only when the offset-seeder Lambda
+      has pre-populated the schema-history topic (gapless Full-Load path). Use
+      'schema_only' for new connectors, CDC-only flows, or session resets where
+      no schema-history topic exists.
+
   SourceDbServerId:
     Type: Number
     Default: 54321
@@ -1075,9 +1085,9 @@ Resources:
 
   # --- Debezium MySQL source connector ----------------------------------------
   # Configuration mirrors CdcPipelineOrchestrator.build_source_config:
-  # table.include.list = selected tables, snapshot.mode = recovery (Full Load
-  # already loaded the rows AND the offset is seeded, so Debezium rebuilds its
-  # schema-history from the live DB without re-reading rows — see snapshot.mode
+  # table.include.list = selected tables, snapshot.mode = Ref: SnapshotMode
+  # (schema_only for fresh connectors / CDC-only; recovery only when the offset
+  # seeder pre-populated schema-history during the gapless Full-Load path — see
   # below). The start offset (GTID / binlog file:position from the Full Load
   # watermark) is seeded by the control plane into the connect-offsets topic for a
   # gapless handoff (Property 11) — it is not a static connector config key, so it
@@ -1215,13 +1225,16 @@ Resources:
         # It does not (only the offset was seeded), so schema_only/no_data die with
         # "The db history topic is missing". `recovery` is built for exactly this:
         # with an existing offset it rebuilds the schema-history topic from the
-        # CURRENT source tables and resumes -- and it reads NO row data (Debezium
-        # 2.7 MySQL reference). Safe here because no DDL is applied to the source
-        # between watermark capture and connector start, and CDC doesn't propagate
-        # DDL. store.only.captured.tables.ddl=false (the default) lets recovery
-        # rebuild history for all tables. Re-running recovery on a restart is
-        # harmless (rebuilds history again, still no row re-read).
-        snapshot.mode: recovery
+        # snapshot.mode is parameterized (SnapshotMode):
+        # - schema_only: fresh connector, CDC-only, or session reset — reads the
+        #   current source schema from scratch and streams from the given offset.
+        # - recovery: gapless Full-Load path where the offset seeder Lambda has
+        #   pre-populated schema-history — rebuilds history from the CURRENT source
+        #   tables without re-reading rows.
+        # store.only.captured.tables.ddl=false (default) lets recovery/schema_only
+        # cover all tables' DDL.
+        snapshot.mode:
+          Ref: SnapshotMode
         schema.history.internal.store.only.captured.tables.ddl: "false"
         include.schema.changes: "false"
         # Serialize BIGINT UNSIGNED as an exact BigDecimal (Avro decimal) instead

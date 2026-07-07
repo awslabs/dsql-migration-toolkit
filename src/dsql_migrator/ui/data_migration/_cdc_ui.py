@@ -2364,6 +2364,9 @@ async def _start_cdc_infra_deploy(
         debezium_plugin_s3_key="",
         dsql_sink_plugin_s3_key="",
         source_db_hostname=fields.get("source_db_hostname", ""),
+        source_db_port=int(getattr(
+            getattr(session, "source_config", None), "port", 3306
+        ) or 3306),
         source_secret_arn=source_secret_arn,
         source_secret_name=source_secret_name,
         dsql_cluster_arn=fields["dsql_cluster_arn"],

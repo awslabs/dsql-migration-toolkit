@@ -945,6 +945,9 @@ def build_cdc_stack_params(
         ("DsqlClusterEndpoint", target_endpoint),
         ("DsqlDatabaseName", target_database),
         ("DsqlConnectUser", target_username),
+        # Snapshot mode: schema_only for new connectors / CDC-only; recovery only
+        # when the offset seeder has pre-populated schema-history (gapless path).
+        ("SnapshotMode", source_config.snapshot_mode),
         # Whether to create the sink connector. The cdc-stack deploys the source
         # first (DeploySink=false) on a fresh stack so the data topic exists before
         # the sink subscribes; an update (the tool's deploy path) sets true since
@@ -1071,6 +1074,9 @@ def build_cdc_infra_params(
         # Start CDC supplies the real value via build_cdc_stack_params).
         ("MessageKeyColumns",
          format_message_key_columns(source_config.message_key_columns)),
+        # Snapshot mode: schema_only for new connectors / CDC-only; recovery only
+        # when the offset seeder has pre-populated schema-history (gapless path).
+        ("SnapshotMode", source_config.snapshot_mode),
         # Plugin resource-name version suffix (gotcha #5: lets a new artifact get a
         # uniquely-named CustomPlugin instead of colliding on a fixed name).
         ("PluginVersion", plugin_version),
