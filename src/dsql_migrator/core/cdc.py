@@ -615,9 +615,17 @@ class CdcPipelineOrchestrator:
         # schema_only: reads the current source schema from scratch and starts
         # streaming from the given binlog position. Safe for a brand-new connector
         # with no pre-existing schema-history topic (the Manual/CDC-only path).
-        mode = (
-            "schema_only" if resume_override is not None else "recovery"
+        #
+        # Use recovery ONLY when a real watermark (with binlog coordinates) was
+        # used AND no manual override is active — that's the gapless path where
+        # the offset seeder prepared schema-history. In ALL other cases (manual
+        # override, missing watermark, sentinel watermark) use schema_only.
+        has_real_watermark = (
+            resume_override is None
+            and watermark is not None
+            and (watermark.binlog_file is not None or watermark.gtid_executed is not None)
         )
+        mode = "recovery" if has_real_watermark else "schema_only"
         return DebeziumSourceConfig(
             name=name,
             table_include_list=[table.name for table in tables],
