@@ -2236,6 +2236,27 @@ async def _start_cdc_infra_deploy(
             return
         if diagnosis.mode == "discovered":
             connector_subnet_ids = diagnosis.connector_subnet_ids or ""
+            # Double-check: verify the discovered subnets still have NAT egress
+            # at this moment (they may have lost it if the owning stack was
+            # deleted between diagnosis and now — race condition).
+            def _verify_discovered():
+                from dsql_migrator.core.ec2_metadata import (
+                    build_ec2_client,
+                    verify_subnet_egress,
+                )
+                ec2 = build_ec2_client(aws_profile, region)
+                return verify_subnet_egress(ec2, connector_subnet_ids.split(","))
+
+            try:
+                disc_ok, disc_reason = await run.io_bound(_verify_discovered)
+            except Exception:  # noqa: BLE001
+                disc_ok = True
+                disc_reason = ""
+            if not disc_ok:
+                ui.notify(  # type: ignore[attr-defined]
+                    disc_reason, type="negative", position="top",
+                )
+                return
         else:  # "create" — the stack will make its own subnets + NAT
             nat_public_subnet_id = diagnosis.nat_public_subnet_id or ""
             private_subnet_cidr_a = diagnosis.private_subnet_cidrs[0]
