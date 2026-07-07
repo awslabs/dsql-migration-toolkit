@@ -2462,18 +2462,14 @@ def _render_deploy_stages(ui, job, kind: str = "start", on_refresh=None) -> None
             ui.label(f"est. {total_hint} remaining").classes(  # type: ignore[attr-defined]
                 "text-xs text-gray-400"
             )
-        if running:
-            # Right-aligned live signal + manual refresh: a long connector-create
-            # stage looks frozen otherwise. The caption proves it polls on its own;
-            # the button forces an immediate update for the impatient.
+        if running and on_refresh is not None:
+            # Manual refresh button only (the header's spinning icon + deploying
+            # badge already signals the operation is live; a redundant spinner +
+            # "Auto-refreshing…" text was just visual clutter).
             ui.space()  # type: ignore[attr-defined]
-            with ui.row().classes("items-center gap-1 no-wrap"):  # type: ignore[attr-defined]
-                ui.spinner(size="xs").props("color=primary")  # type: ignore[attr-defined]
-                ui.label("Auto-refreshing…").classes("text-xs text-gray-400")  # type: ignore[attr-defined]
-                if on_refresh is not None:
-                    ui.button(on_click=on_refresh).props(  # type: ignore[attr-defined]
-                        "flat dense round size=sm icon=refresh"
-                    ).tooltip("Refresh now")
+            ui.button(on_click=on_refresh).props(  # type: ignore[attr-defined]
+                "flat dense round size=sm icon=refresh"
+            ).tooltip("Refresh now")
     for chunk in job.chunks:
         icon, color = _CDC_DEPLOY_STAGE_STYLE.get(chunk.status, _CDC_DEPLOY_STAGE_STYLE["PENDING"])
         label = labels.get(chunk.chunk_id, chunk.chunk_id)
