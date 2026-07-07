@@ -192,4 +192,59 @@ or lose the CDC handoff point.
 
 ---
 
+## 3.7 Multi-process parallelism (GIL bypass)
+
+Python's GIL (Global Interpreter Lock) limits a single process to one CPU core
+regardless of how many threads it uses. Since Full Load's per-row type conversion
+and batch assembly are CPU-bound Python, the loader was previously capped at
+~15,000 rows/s even on an 8 vCPU Fargate task.
+
+Starting in v0.1.68, the loader uses **`ProcessPoolExecutor`** — each table (or
+table shard) loads in its own OS process with its own GIL and its own CPU core.
+
+### How it works
+
+- **Small tables** (non-shardable or below the row threshold): 1 worker process
+  each — same as before, just in a separate process instead of a thread.
+- **Large tables** with a single integer primary key: automatically split into K
+  PK-range shards, each loaded by its own worker process from a disjoint slice of
+  the source.
+- **All work units share one bounded pool** — `table_parallelism` controls the
+  total number of concurrent worker processes.
+
+```
+ProcessPoolExecutor(max_workers=table_parallelism)
+  ├─ customers (small)        → 1 worker
+  ├─ orders (9M, int PK)      → 2 shard workers
+  ├─ payments (9M, int PK)    → 2 shard workers
+  └─ order_items (33.6M, int PK) → 3 shard workers
+                                    ───────────────
+                                    8 workers = 8 cores
+```
+
+### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | 4 | Max concurrent worker processes. Set to vCPU count for full utilization. |
+| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | Concurrent DSQL connections per worker (write parallelism within one process). |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1,000,000 | Minimum estimated rows for a table to be PK-sharded. Below this, sharding overhead isn't worth it. |
+
+**Recommendation for large migrations:** set `TABLE_PARALLELISM` to the task's
+vCPU count (e.g. 8 for an 8-vCPU Fargate task). The loader automatically
+distributes the pool slots between whole-table workers and shard workers.
+
+### Measured performance (ECS Fargate 8 vCPU)
+
+| Scenario | rows/s | CPU | 200GB estimate |
+|---|---|---|---|
+| ThreadPool (GIL-bound, pre-v0.1.68) | 12,277 | 110% | ~46 hours |
+| ProcessPool, 4 tables mixed, tp=8 | 34,800 | 561% | ~5 hours |
+| ProcessPool, single large table, tp=8 | 51,000 | 777% | **~2.5 hours** |
+
+See [Appendix: Performance test results](12-performance-test-results.md) for the
+full measurement history.
+
+---
+
 **Next:** [4. CDC and DSQL constraints →](04-cdc-and-dsql-constraints.md)
