@@ -57,8 +57,10 @@ from dsql_migrator.ui.schema_conversion import (
     SchemaConversionState,
     SchemaConversionStore,
     DdlPreview,
+    _apply_should_replace,
     _object_header_summary,
     _render_copy_ddl_button,
+    _render_editable_target,
     applied_table_conversions,
     build_apply_objects,
     build_object_tree,
@@ -1729,3 +1731,133 @@ def test_pk_picker_not_rendered_for_table_without_primary_key() -> None:
     _render_pk_strategy_picker(ui, keyless, state, lambda: None)
     # No PK -> no hot-partition concern -> the picker renders nothing.
     assert ui.toggle_el is None
+
+
+# ---------------------------------------------------------------------------
+# Per-object "Apply to target" button — busy-state feedback
+# ---------------------------------------------------------------------------
+
+
+class _EditableUi:
+    """NiceGUI double for _render_editable_target.
+
+    Every element is a chainable, context-manager node; the Apply button records
+    the sequence of props(add / remove=...) calls so a test can assert the busy
+    state (loading + disable) is set for the duration of the apply and cleared
+    afterwards. on_click(cb) stores the click callback so the test can invoke it.
+    """
+
+    class _Node:
+        def __init__(self, ui: "_EditableUi", kind: str) -> None:
+            self._ui = ui
+            self.kind = kind
+            self.click_cb = None
+            self.prop_events: list[tuple[str, object]] = []
+
+        def classes(self, *_a, **_k):
+            return self
+
+        def props(self, add: str = "", *, remove: str = ""):
+            if add:
+                self.prop_events.append(("add", add))
+            if remove:
+                self.prop_events.append(("remove", remove))
+            return self
+
+        def style(self, *_a, **_k):
+            return self
+
+        def tooltip(self, *_a, **_k):
+            return self
+
+        def on_click(self, cb):
+            self.click_cb = cb
+            return self
+
+        def on(self, *_a, **_k):
+            return self
+
+        def clear(self):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    def __init__(self) -> None:
+        self.buttons: list["_EditableUi._Node"] = []
+
+    def _node(self, kind: str) -> "_EditableUi._Node":
+        return _EditableUi._Node(self, kind)
+
+    def button(self, *_a, **_k):
+        node = self._node("button")
+        self.buttons.append(node)
+        return node
+
+    # Everything else the render path touches is a no-op chainable node.
+    def __getattr__(self, name):  # noqa: ANN001
+        def _factory(*_a, **_k):
+            return self._node(name)
+
+        return _factory
+
+
+def _editable_preview() -> DdlPreview:
+    return DdlPreview(
+        object_name="orders",
+        source_ddl="CREATE TABLE `orders` (`id` int)",
+        target_ddl='CREATE TABLE "orders" ("id" integer)',
+    )
+
+
+def test_apply_button_shows_busy_state_during_apply() -> None:
+    import asyncio
+
+    ui = _EditableUi()
+    calls: list[str] = []
+
+    async def _on_apply(name: str) -> None:
+        # While the apply runs, the button must be in the busy state.
+        apply_btn = ui.buttons[-1]
+        assert ("add", "loading disable") in apply_btn.prop_events
+        assert ("remove", "loading disable") not in apply_btn.prop_events
+        calls.append(name)
+
+    _render_editable_target(
+        ui, _editable_preview(), SchemaConversionState(), on_apply_object=_on_apply
+    )
+    apply_btn = ui.buttons[-1]
+    assert apply_btn.click_cb is not None
+
+    asyncio.run(apply_btn.click_cb())
+
+    assert calls == ["orders"]
+    # After the apply completes the busy state is cleared (added, then removed).
+    assert ("add", "loading disable") in apply_btn.prop_events
+    assert ("remove", "loading disable") in apply_btn.prop_events
+    assert apply_btn.prop_events.index(
+        ("add", "loading disable")
+    ) < apply_btn.prop_events.index(("remove", "loading disable"))
+
+
+def test_apply_button_clears_busy_state_even_when_apply_raises() -> None:
+    import asyncio
+
+    ui = _EditableUi()
+
+    async def _boom(_name: str) -> None:
+        raise RuntimeError("apply failed")
+
+    _render_editable_target(
+        ui, _editable_preview(), SchemaConversionState(), on_apply_object=_boom
+    )
+    apply_btn = ui.buttons[-1]
+
+    with pytest.raises(RuntimeError, match="apply failed"):
+        asyncio.run(apply_btn.click_cb())
+
+    # The finally block still clears the busy state so the button is usable again.
+    assert ("remove", "loading disable") in apply_btn.prop_events

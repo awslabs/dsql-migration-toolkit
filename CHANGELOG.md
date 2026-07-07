@@ -5,6 +5,27 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.65
+
+### Changed
+
+- **Applying a single object that already exists now asks how to handle it,
+  instead of silently skipping.** In Schema Conversion (Step 2), clicking a
+  per-object **Apply to target** for a table that already exists on the target
+  (and whose DDL you did not edit) previously just reported `SKIPPED` and left the
+  target unchanged — easy to miss, and there was no way to change your mind from
+  that button. It now opens a **Replace / Skip / Cancel** dialog so the choice is
+  explicit at the moment you apply. This matters when you *revert* a choice — e.g.
+  switch a table back from a composite key to the integer key: SKIP would have left
+  the old composite table in place, whereas Replace drops and recreates it with the
+  new DDL. (Editing an object's DDL, or the global REPLACE mode, still routes
+  through the existing destructive-replace confirmation.)
+- **The per-object Apply to target button now shows it is working.** While the
+  apply runs (a target round-trip that can take a moment, or waits on the
+  confirmation dialog), the button switches to a disabled, loading spinner state
+  and returns to normal when the apply finishes — so a slow apply no longer looks
+  like a dead click. The busy state is always cleared, even if the apply fails.
+
 ## v0.1.64
 
 ### Added

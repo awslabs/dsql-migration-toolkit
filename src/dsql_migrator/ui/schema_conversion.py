@@ -2185,6 +2185,63 @@ def build_schema_conversion_screen(
         with dlg_client:  # type: ignore[attr-defined]
             _build_dialog()
 
+    def _open_conflict_dialog(
+        object_name: str,
+        on_replace: Callable[[], object],
+        on_skip: Callable[[], object],
+    ) -> None:
+        """Open the action-time REPLACE/SKIP choice dialog for one existing object.
+
+        Shown when a per-object apply targets an object that already exists on the
+        target and the global mode is SKIP (no edit forcing REPLACE): instead of
+        silently skipping, the user picks explicitly. ``Replace`` drops and
+        recreates (destructive); ``Skip`` leaves the target unchanged; ``Cancel``
+        does nothing. This makes "apply to an existing object" a clear, per-action
+        choice rather than a silent SKIP whose reason is easy to miss. Built in the
+        client's top-level context for the same reason as the REPLACE dialog.
+        """
+        from nicegui import context as _ctx
+
+        dlg_client = _ctx.client
+
+        def _build_dialog() -> None:
+            with ui.dialog() as dialog, ui.card().classes("gap-2").style(
+                "min-width: 380px"
+            ):
+                ui.label(f"'{object_name}' already exists on the target").classes(
+                    "text-lg font-semibold"
+                )
+                ui.label(
+                    "Choose how to apply it. Replace drops and recreates the object "
+                    "(destructive — any data in it is lost); Skip leaves the existing "
+                    "object unchanged."
+                ).classes("text-sm text-gray-600")
+                with ui.row().classes("justify-end gap-2 w-full"):
+                    ui.button("Cancel", on_click=dialog.close).props("flat")
+
+                    async def _do_skip() -> None:
+                        dialog.close()
+                        result = on_skip()
+                        if inspect.isawaitable(result):
+                            await result
+
+                    async def _do_replace() -> None:
+                        dialog.close()
+                        result = on_replace()
+                        if inspect.isawaitable(result):
+                            await result
+
+                    ui.button("Skip", on_click=_do_skip).props(
+                        "outline no-caps color=grey-8"
+                    )
+                    ui.button("Replace", on_click=_do_replace).props(
+                        "unelevated no-caps color=negative icon=find_replace"
+                    )
+            dialog.open()
+
+        with dlg_client:  # type: ignore[attr-defined]
+            _build_dialog()
+
     def _run_bulk_apply(
         only_names: Optional[set[str]] = None, *, merge: bool = False
     ) -> None:
@@ -2441,6 +2498,37 @@ def build_schema_conversion_screen(
                 _confirmed,
             )
             return
+        # Global SKIP mode, unedited object that ALREADY EXISTS on the target: don't
+        # silently skip (the user can't tell the apply did nothing, and can't reach
+        # REPLACE from here). Ask explicitly whether to Replace (drop + recreate) or
+        # Skip. This is the case where a user reverting a choice (e.g. composite -> keep
+        # integer PK) expects the target to change but SKIP would leave it as-is.
+        if exists:
+
+            def _on_replace() -> object:
+                async def _run() -> None:
+                    prev_mode = conv_state.apply_mode
+                    conv_state.apply_mode = ApplyMode.REPLACE
+                    conv_state.replace_confirmed = True
+                    try:
+                        await apply_object_inline(object_name)
+                    finally:
+                        conv_state.replace_confirmed = False
+                        conv_state.apply_mode = prev_mode
+                    _safe_post_await_ui(client, _refresh_view)
+
+                return _run()
+
+            def _on_skip() -> object:
+                async def _run() -> None:
+                    await apply_object_inline(object_name)
+                    _safe_post_await_ui(client, _refresh_view)
+
+                return _run()
+
+            _open_conflict_dialog(object_name, _on_replace, _on_skip)
+            return
+        # Object does not exist yet: a plain CREATE, no conflict to resolve.
         await apply_object_inline(object_name)
         # SKIP mode applies inline (no page rebuild for scroll/expansion), but the
         # Apply results panel and the Target browser still need to reflect the new
@@ -3589,16 +3677,32 @@ def _render_editable_target(
     """
     editor_box = ui.column().classes("w-full gap-2")  # type: ignore[attr-defined]
 
-    async def apply_click() -> None:
-        if on_apply_object is not None:
-            await on_apply_object(preview.object_name)
-            # The apply handler may have already rebuilt this editor via a full
-            # refresh (which deletes this slot), so re-render best-effort: a
-            # torn-down editor_box must not raise "parent slot deleted".
+    async def apply_click(button: object = None) -> None:
+        if on_apply_object is None:
+            return
+        # Show the apply is running: disable the button and swap in a spinner +
+        # "Applying…" label so a slow target round-trip (or a confirm dialog) never
+        # looks like a dead click. Best-effort — a torn-down button must not raise.
+        if button is not None:
             try:
-                render(editing=False)
-            except Exception:  # noqa: BLE001 - editor already rebuilt by the refresh
-                logger.debug("Inline editor re-render skipped: slot already rebuilt")
+                button.props("loading disable")  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 - button slot already gone
+                logger.debug("Apply button busy-state skipped: slot already rebuilt")
+        try:
+            await on_apply_object(preview.object_name)
+        finally:
+            if button is not None:
+                try:
+                    button.props(remove="loading disable")  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001 - button slot already gone
+                    logger.debug("Apply button reset skipped: slot already rebuilt")
+        # The apply handler may have already rebuilt this editor via a full
+        # refresh (which deletes this slot), so re-render best-effort: a
+        # torn-down editor_box must not raise "parent slot deleted".
+        try:
+            render(editing=False)
+        except Exception:  # noqa: BLE001 - editor already rebuilt by the refresh
+            logger.debug("Inline editor re-render skipped: slot already rebuilt")
 
     def reset_click() -> None:
         conv_state.clear_edited_target_ddl(preview.object_name)
@@ -3635,9 +3739,10 @@ def _render_editable_target(
                     if edited is not None:
                         ui.badge("Edited").props("color=amber-7")  # type: ignore[attr-defined]
                     if on_apply_object is not None:
-                        ui.button(  # type: ignore[attr-defined]
-                            "Apply to target", on_click=apply_click
+                        _apply_btn = ui.button(  # type: ignore[attr-defined]
+                            "Apply to target"
                         ).props("unelevated dense no-caps color=primary icon=cloud_upload")
+                        _apply_btn.on_click(lambda _e=None, b=_apply_btn: apply_click(b))
             else:
                 # Editing view (CodeMirror). Edits update the per-object buffer.
                 def on_edit(event: object) -> None:
@@ -3663,9 +3768,12 @@ def _render_editable_target(
                     ui.space()  # type: ignore[attr-defined]
                     ui.badge("Editing").props("color=amber-7")  # type: ignore[attr-defined]
                     if on_apply_object is not None:
-                        ui.button(  # type: ignore[attr-defined]
-                            "Apply to target", on_click=apply_click
+                        _apply_btn_edit = ui.button(  # type: ignore[attr-defined]
+                            "Apply to target"
                         ).props("unelevated dense no-caps color=primary icon=cloud_upload")
+                        _apply_btn_edit.on_click(
+                            lambda _e=None, b=_apply_btn_edit: apply_click(b)
+                        )
                     if extra_actions is not None:
                         extra_actions()
 
