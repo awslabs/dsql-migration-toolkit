@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.70
+
+### Fixed
+
+- **CDC: `snapshot.mode` now correctly uses `schema_only` for new connectors.**
+  Previously hardcoded to `recovery`, which requires a pre-existing schema-history
+  topic. Now `recovery` is used only when a real Full Load watermark (with binlog
+  coordinates) exists; all other cases — manual start, session reset, CDC-only
+  flow — use `schema_only`. Eliminates the "Could not find existing redo log
+  information" connector failure.
+
+- **CDC: pre-flight subnet NAT egress check prevents 10-minute silent failures.**
+  MSK Connect assigns private IPs only — subnets without NAT gateway egress
+  cannot reach Secrets Manager. Both user-supplied and auto-discovered subnets
+  are now verified before deploy submission. Also re-verifies discovered subnets
+  at deploy time to catch race conditions (e.g. another stack's NAT deleted
+  between diagnosis and deploy).
+
+- **CDC: prerequisites button locked during CDC deploy/start.** The Check button
+  was only disabled during Full Load; now it's also disabled while a CDC stack
+  operation is in flight.
+
 ## v0.1.69
 
 ### Added

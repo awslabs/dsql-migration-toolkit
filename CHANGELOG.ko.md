@@ -5,6 +5,23 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.70
+
+### 수정 (Fixed)
+
+- **CDC: 새 connector에 `snapshot.mode=schema_only` 올바르게 적용.** 기존에는
+  `recovery`로 하드코딩되어, schema-history 토픽이 없는 상황에서 "Could not find
+  existing redo log information" 에러로 실패. 이제 실제 Full Load 워터마크(binlog
+  좌표 포함)가 있을 때만 `recovery` 사용; 그 외(수동 시작, 세션 리셋, CDC-only)는
+  모두 `schema_only`.
+
+- **CDC: 배포 전 서브넷 NAT egress 사전 검증.** MSK Connect는 프라이빗 IP만 할당하므로
+  NAT 없는 서브넷에서는 Secrets Manager 접근 불가. 사용자 입력 및 자동 발견 서브넷 모두
+  배포 제출 전 검증. 다른 스택 삭제로 NAT가 사라지는 race condition도 방지.
+
+- **CDC: deploy/start 진행 중 prerequisites 버튼 비활성화.** CDC 스택 작업 진행 중에도
+  Check 버튼이 잠기도록 개선.
+
 ## v0.1.69
 
 ### 추가 (Added)
