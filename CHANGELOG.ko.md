@@ -5,6 +5,15 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.69
+
+### 추가 (Added)
+
+- **CDC: Manual 모드에서 "Fetch current position" 버튼 추가.** Full Load 워터마크가
+  없는 CDC-only 플로우에서 수동으로 GTID/binlog 위치를 입력해야 할 때, 소스 MySQL에
+  `SHOW MASTER STATUS`를 실행해 현재 위치를 자동으로 채워주는 버튼 추가. 사용자가 직접
+  소스에서 SQL을 실행하고 복사-붙여넣기할 필요 없음.
+
 ## v0.1.68
 
 ### 변경 (Changed)

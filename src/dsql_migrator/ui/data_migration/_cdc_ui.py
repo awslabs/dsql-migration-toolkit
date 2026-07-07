@@ -366,6 +366,7 @@ def _render_cdc_source_config_card(
         effective_resume=effective_resume,
         mode=mode,
         locked=started,
+        session=session,
     )
 
     if effective_resume is None:
@@ -548,6 +549,7 @@ def _render_cdc_start_point_card(
     effective_resume,
     mode: str,
     locked: bool = False,
+    session: object = None,
 ) -> None:
     """Render the PRIMARY 'CDC start point' card with an Automatic/Manual choice.
 
@@ -619,7 +621,9 @@ def _render_cdc_start_point_card(
             )
 
         if mode == "manual":
-            _render_cdc_manual_inputs(ui, migration_state, refresh, locked=locked)
+            _render_cdc_manual_inputs(
+                ui, migration_state, refresh, locked=locked, session=session,
+            )
         elif wm_usable and wm_resume is not None:
             _render_cdc_start_summary(
                 ui, wm_resume.gtid_executed, wm_resume.binlog_file,
@@ -654,13 +658,19 @@ def _render_cdc_start_summary(ui, gtid, binlog_file, binlog_pos) -> None:
                 ui.label(f"{label_text}:").classes("text-xs text-gray-500")  # type: ignore[attr-defined]
                 ui.label(str(value)).classes("text-xs font-mono")  # type: ignore[attr-defined]
 
-def _render_cdc_manual_inputs(ui, migration_state, refresh, *, locked: bool = False) -> None:
+def _render_cdc_manual_inputs(
+    ui, migration_state, refresh, *, locked: bool = False, session: object = None,
+) -> None:
     """Render the Manual start-position inputs (GTID / binlog file:pos) + Apply.
 
     Shown only when the Manual radio is selected. Advisory validation: an
     unrecognized-but-valid GTID must not be rejected, so a bad-looking value shows
     an orange hint but is still stored; MSK Connect validates at connector start.
     ``locked`` (CDC already started) renders the inputs + button read-only.
+
+    When a ``session`` with a live source connection is available, a "Fetch from
+    source" button queries ``SHOW MASTER STATUS`` and populates the fields
+    automatically — no manual copy-paste needed.
     """
     gtid_error = {"msg": None}  # mutable cell so the handler can show a hint
 
@@ -682,9 +692,6 @@ def _render_cdc_manual_inputs(ui, migration_state, refresh, *, locked: bool = Fa
             binlog_file=binlog_file,
             binlog_pos=binlog_pos,
         )
-        # Explicit feedback so the click is never silent. Anchored to the top so
-        # it appears near this card (which sits high on the page), not at the
-        # bottom-center default where it is easy to miss.
         if not gtid_raw and not binlog_raw:
             ui.notify(  # type: ignore[attr-defined]
                 "Enter a GTID set or a binlog file:position first.",
@@ -696,7 +703,6 @@ def _render_cdc_manual_inputs(ui, migration_state, refresh, *, locked: bool = Fa
                 type="negative", position="top",
             )
         elif gtid_error["msg"]:
-            # Stored anyway (advisory), but tell the user it looks off.
             ui.notify(  # type: ignore[attr-defined]
                 "Start point saved, but the GTID format looks unusual — "
                 "double-check it.",
@@ -709,6 +715,68 @@ def _render_cdc_manual_inputs(ui, migration_state, refresh, *, locked: bool = Fa
                 type="positive", position="top",
             )
         refresh()
+
+    async def _fetch_from_source() -> None:
+        """Query SHOW MASTER STATUS on the source and fill the input fields."""
+        from nicegui import run
+        from dsql_migrator.ui.connect import make_source_engine_factory
+        from sqlalchemy import text
+
+        source_config = getattr(session, "source_config", None)
+        source_password = getattr(session, "source_password", None)
+        if source_config is None or source_password is None:
+            ui.notify(  # type: ignore[attr-defined]
+                "Source connection not available — connect to the source first.",
+                type="warning", position="top",
+            )
+            return
+
+        fetch_btn.props("loading")
+
+        def _do_fetch():
+            engine_factory = make_source_engine_factory(source_password)
+            engine = engine_factory(source_config)
+            with engine.connect() as conn:
+                row = conn.execute(text("SHOW MASTER STATUS")).mappings().first()
+            engine.dispose()
+            return row
+
+        try:
+            row = await run.io_bound(_do_fetch)
+        except Exception as exc:  # noqa: BLE001
+            ui.notify(  # type: ignore[attr-defined]
+                f"Failed to fetch: {exc}",
+                type="negative", position="top",
+            )
+            fetch_btn.props(remove="loading")
+            return
+
+        fetch_btn.props(remove="loading")
+
+        if not row:
+            ui.notify(  # type: ignore[attr-defined]
+                "SHOW MASTER STATUS returned no data — binary logging may be "
+                "disabled.",
+                type="warning", position="top",
+            )
+            return
+
+        gtid_val = row.get("Executed_Gtid_Set") or ""
+        binlog_file_val = row.get("File") or ""
+        binlog_pos_val = row.get("Position")
+        binlog_coord = (
+            f"{binlog_file_val}:{binlog_pos_val}"
+            if binlog_file_val and binlog_pos_val is not None
+            else ""
+        )
+
+        gtid_input.set_value(gtid_val)
+        binlog_input.set_value(binlog_coord)
+        ui.notify(  # type: ignore[attr-defined]
+            "Fetched current position from source — click 'Use this start point' "
+            "to confirm.",
+            type="positive", position="top",
+        )
 
     ui.label(  # type: ignore[attr-defined]
         "Enter a GTID set, or a binlog file:position. Use a GTID when the source "
@@ -742,11 +810,27 @@ def _render_cdc_manual_inputs(ui, migration_state, refresh, *, locked: bool = Fa
     # coordinate into the connector config; it does NOT begin streaming. Actual
     # streaming starts when the config is deployed to the cdc-stack. Disabled once
     # CDC has started (the start point is already seeded and cannot change).
-    apply_btn = ui.button("Use this start point", on_click=_apply).props(  # type: ignore[attr-defined]
-        "size=sm color=primary"
-    )
-    if locked:
-        apply_btn.props("disable")
+    with ui.row().classes("items-center gap-2 mt-1"):  # type: ignore[attr-defined]
+        # Fetch from source: auto-populates from SHOW MASTER STATUS.
+        can_fetch = (
+            session is not None
+            and getattr(session, "source_config", None) is not None
+            and getattr(session, "source_password", None) is not None
+        )
+        if can_fetch and not locked:
+            fetch_btn = ui.button(  # type: ignore[attr-defined]
+                "Fetch current position",
+                on_click=_fetch_from_source,
+                icon="download",
+            ).props("size=sm flat color=primary")
+        else:
+            fetch_btn = None  # noqa: F841 — ref needed for the async handler above
+
+        apply_btn = ui.button("Use this start point", on_click=_apply).props(  # type: ignore[attr-defined]
+            "size=sm color=primary"
+        )
+        if locked:
+            apply_btn.props("disable")
 
 def _render_cdc_runs_on_banner(ui) -> None:
     """Orientation banner: where CDC runs (source -> MSK -> DSQL sink)."""
@@ -3188,7 +3272,13 @@ def _render_cdc_lob_exclusion_panel(
     weight of a settings card. The full opt-in card is shown only when there are
     actual candidates to exclude.
     """
-    candidates = lob_exclusion_candidates(inventory)
+    all_candidates = lob_exclusion_candidates(inventory)
+    selected_tables = set(migration_state.selection.selected_tables)
+    candidates = (
+        [c for c in all_candidates if c.table in selected_tables]
+        if selected_tables
+        else all_candidates
+    )
     selection = migration_state.cdc_lob_exclusions()
     if not candidates:
         # Nothing to exclude -> a lightweight info notice, not a heavy settings card.
@@ -3265,10 +3355,11 @@ def _render_cdc_handling_panel(ui) -> None:
                     ui.label(fact.title).classes("text-sm")  # type: ignore[attr-defined]
                     ui.label(fact.detail).classes("text-xs text-gray-500")  # type: ignore[attr-defined]
 
-    with ui.expansion("CDC behavior & limits", icon="info").classes(  # type: ignore[attr-defined]
-        "w-full"
-    ).props("expand-separator"):
-        with ui.column().classes("w-full gap-3 p-1"):  # type: ignore[attr-defined]
+    with ui.card().classes("w-full"):  # type: ignore[attr-defined]
+        with ui.row().classes("items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
+            ui.icon("info", color="primary").classes("text-xl")  # type: ignore[attr-defined]
+            ui.label("CDC behavior & limits").classes("text-sm font-semibold")  # type: ignore[attr-defined]
+        with ui.column().classes("w-full gap-3 mt-2"):  # type: ignore[attr-defined]
             if handled:
                 ui.label("Handled automatically").classes(  # type: ignore[attr-defined]
                     "text-xs font-semibold text-gray-500 uppercase tracking-wide"

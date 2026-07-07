@@ -5,6 +5,15 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.69
+
+### Added
+
+- **CDC: Manualモードに「Fetch current position」ボタン追加。** Full Loadウォーターマークが
+  ない CDC-only フローで、ソースMySQLに `SHOW MASTER STATUS` を実行し現在の
+  GTID/binlog位置を自動入力するボタンを追加。ユーザーがソースで手動SQLを実行して
+  コピー＆ペーストする必要がなくなりました。
+
 ## v0.1.68
 
 ### Changed

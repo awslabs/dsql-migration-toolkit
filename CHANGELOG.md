@@ -5,6 +5,16 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.69
+
+### Added
+
+- **CDC: "Fetch current position" button in Manual start-point mode.** When no
+  Full Load watermark is available (CDC-only flow), the Manual start-point form
+  now includes a "Fetch current position" button that queries `SHOW MASTER STATUS`
+  on the source and auto-fills the GTID and binlog fields. Eliminates the need to
+  manually run SQL on the source and copy-paste coordinates.
+
 ## v0.1.68
 
 ### Changed
