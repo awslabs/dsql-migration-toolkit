@@ -134,6 +134,38 @@ def badge_classes(tone: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Status indicator dot (Cloudscape "StatusIndicator" — dot + text)
+# ---------------------------------------------------------------------------
+
+# A lightweight status treatment for tight spaces: a small filled circle + colored
+# text, no border or background fill. Reads faster than a bordered chip and uses
+# less visual weight. Keyed by the same semantic tones as BADGE_TONES so the two
+# can coexist when migrating progressively.
+STATUS_DOT_TONES: dict[str, Tuple[str, str]] = {
+    "ok": ("bg-green-500", "text-green-700"),
+    "bad": ("bg-red-500", "text-red-600"),
+    "active": ("bg-blue-500", "text-blue-700"),
+    "neutral": ("bg-gray-400", "text-gray-500"),
+    "reconnect": ("bg-amber-500", "text-amber-700"),
+}
+
+
+def render_status_dot(ui, text: str, *, tone: str = "neutral") -> None:
+    """Render a Cloudscape-style StatusIndicator: colored dot + colored text.
+
+    Lighter than the bordered badge chips — uses only a small filled circle
+    (``h-2 w-2 rounded-full``) and colored text. For tight inline contexts
+    where a bordered pill would be too heavy (e.g. the migration overview
+    diagram segments). ``tone`` selects from :data:`STATUS_DOT_TONES`;
+    unknown tones fall back to ``neutral``.
+    """
+    dot_bg, text_color = STATUS_DOT_TONES.get(tone, STATUS_DOT_TONES["neutral"])
+    with ui.row().classes("items-center gap-1.5 no-wrap"):
+        ui.element("div").classes(f"h-2 w-2 rounded-full shrink-0 {dot_bg}")
+        ui.label(text).classes(f"text-[11px] leading-tight {text_color}")
+
+
+# ---------------------------------------------------------------------------
 # Selectable object chips, colored by group (e.g. schema)
 # ---------------------------------------------------------------------------
 
@@ -286,6 +318,8 @@ __all__ = [
     "inline_hint",
     "BADGE_TONES",
     "badge_classes",
+    "STATUS_DOT_TONES",
+    "render_status_dot",
     "CHIP_GROUP_PALETTE",
     "CHIP_GROUP_QUASAR_COLOR",
     "chip_group_index",

@@ -855,9 +855,19 @@ def build_data_migration_screen(
                 # source value), since it re-seeds exactly those chunks.
                 current = _current_job(job_manager, migration_state.job_id)
                 if current is None:
+                    ui.notify(
+                        "No previous load run found to retry from.",
+                        type="warning",
+                        position="top",
+                    )
                     return
                 names = [n for n in names_to_retry]
                 if not names:
+                    ui.notify(
+                        "No tables selected for retry.",
+                        type="info",
+                        position="top",
+                    )
                     return
                 if not session.has_source() or not session.has_target():
                     migration_state.set_error(
@@ -934,6 +944,11 @@ def build_data_migration_screen(
                     )
 
                 migration_state.job_id = job_manager.submit(work)
+                ui.notify(
+                    f"Retrying {len(names)} table(s) — progress below.",
+                    type="positive",
+                    position="top",
+                )
                 refresh()
 
             def retry_failed_load() -> None:
@@ -2380,10 +2395,16 @@ def _render_full_load_step(
         if btn is not None:
             try:
                 btn.disable()
-                btn.set_text("Checking…")
+                btn.set_text("Checking target…")
                 btn.props("icon=hourglass_top")
+                btn.update()
             except Exception:  # noqa: BLE001 - cue is best-effort
                 pass
+        # Yield to flush the button's busy-state to the client BEFORE the
+        # potentially slow target probe. Without this, NiceGUI batches the prop
+        # changes and the user sees no feedback until the await below returns.
+        import asyncio
+        await asyncio.sleep(0)
         try:
             # Probe which action tables already hold rows. Default the run-wide
             # choice to "append" (non-destructive); the confirm dialog lets the

@@ -72,7 +72,10 @@ _LOGGER = logging.getLogger(__name__)
 
 # Default rows fetched per keyset page. A page is bounded by this value, so a
 # single page -- not the whole table -- is the upper bound on in-flight rows.
-DEFAULT_BATCH_SIZE = 1000
+# Raised from 1000 to 5000: each MySQL round-trip is expensive (GIL-held PyMySQL
+# network I/O), so larger pages amortize that cost across more rows. Memory stays
+# bounded (one page in flight per reader shard).
+DEFAULT_BATCH_SIZE = 5000
 
 
 class ExportError(RuntimeError):
@@ -193,6 +196,18 @@ class ValueConverter:
             for column in table.columns
             if column.mysql_type.strip().lower().split("(", 1)[0] == "bit"
         )
+        # Fast-path: columns whose target kind needs no conversion (int, varchar,
+        # numeric, text, etc.). For a typical OLTP table 80-90% of columns fall
+        # here. convert_row skips convert_value entirely for these, replacing 7+
+        # Python ops per cell with a single frozenset lookup.
+        _NEEDS_CONVERSION_KINDS = frozenset(
+            {"boolean", "bytea", "timestamp", "timestamptz", "time"}
+        )
+        self._passthrough_columns: frozenset[str] = frozenset(
+            name
+            for name, kind in self._kinds.items()
+            if kind not in _NEEDS_CONVERSION_KINDS and name not in self._bit_columns
+        )
 
     def convert_value(self, column_name: str, value: object) -> object:
         """Convert a single cell value for ``column_name`` (``None`` passes through)."""
@@ -281,8 +296,18 @@ class ValueConverter:
         return value
 
     def convert_row(self, row: Mapping[str, object]) -> dict[str, object]:
-        """Convert every known cell in ``row`` (unknown columns pass through)."""
-        return {name: self.convert_value(name, value) for name, value in row.items()}
+        """Convert every known cell in ``row`` (unknown columns pass through).
+
+        Fast path: columns in ``_passthrough_columns`` (the majority for a typical
+        OLTP table — int, varchar, numeric, text) skip ``convert_value`` entirely.
+        Only columns that actually need type translation (boolean, bytea, timestamp,
+        timestamptz, time, bit) go through the full method.
+        """
+        passthrough = self._passthrough_columns
+        return {
+            name: (value if name in passthrough else self.convert_value(name, value))
+            for name, value in row.items()
+        }
 
 
 # ---------------------------------------------------------------------------

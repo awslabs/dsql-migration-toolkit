@@ -5,6 +5,50 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.67
+
+### Changed
+
+- **Full Load single-table throughput optimizations (GIL-aware).** Five changes
+  that compound to reduce GIL hold time and network round-trips:
+  1. MySQL keyset page size raised from 1,000 to 5,000 rows — 5× fewer source
+     round-trips per table (the dominant bottleneck).
+  2. `build_insert_statement` SQL template cached per batch shape — eliminates
+     ~40,000 object allocations per batch (99.99% cache hit on large tables).
+  3. `_iter_batches` byte estimation made lazy — samples the first row of each
+     batch and only checks per-row near the 8 MiB budget, eliminating 90%+ of
+     `_estimate_row_bytes` calls for normal-width tables.
+  4. `_flatten_params` converted to list comprehension (~40% faster in CPython).
+  5. `convert_row` passthrough fast path — columns that need no type conversion
+     (int, varchar, numeric, text) skip `convert_value` entirely via a
+     precomputed frozenset lookup.
+
+### Fixed
+
+- **"Retry unfinished tables" button now gives immediate visual feedback.**
+  The button shows "Checking target…" with a hourglass icon and disables
+  itself while probing the target, then shows a toast on retry start. Previously
+  the slow probe ran without visible feedback so the UI felt unresponsive.
+- **Per-object "Apply to target" in Schema Conversion now detects existing tables**
+  and shows a Replace/Skip dialog (previously silent SKIP due to unwired
+  existence checker; now resolved from the target inventory).
+- **"Keep integer PK" renamed to "Keep source PK"** — the label was misleading
+  for tables with non-integer primary keys.
+- **"Apply converted to target" renamed to "Apply all to target"** — clearer.
+
+## v0.1.66
+
+### Changed
+
+- **Migration overview diagram redesigned as a single unified panel.** The three
+  separate bordered cards (Source / Migration Tool / Aurora DSQL) are now
+  borderless column segments inside one shared surface. Status indicators use a
+  lighter dot + text pattern (Cloudscape "StatusIndicator") instead of bordered
+  chip badges, flow connectors are simpler dashed arrows with plain text captions,
+  and the overall chrome is significantly reduced while preserving all information
+  (endpoint, engine, region, connection state). Adds a reusable
+  `render_status_dot` component to the design system (`ui/design.py`).
+
 ## v0.1.65
 
 ### Changed

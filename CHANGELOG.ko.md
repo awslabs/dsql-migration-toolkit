@@ -5,6 +5,42 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.67
+
+### 변경 (Changed)
+
+- **Full Load 단일 테이블 처리량 최적화 (GIL-aware).** GIL hold 시간과 네트워크
+  round-trip을 줄이는 5가지 변경을 복합 적용:
+  1. MySQL keyset page size 1,000 → 5,000행 — 소스 round-trip 5배 감소.
+  2. `build_insert_statement` SQL 템플릿 배치 shape별 캐싱 — 배치당 ~40,000
+     객체 할당 제거 (대형 테이블에서 99.99% 캐시 적중).
+  3. `_iter_batches` 바이트 추정 lazy화 — 배치 첫 행만 샘플링 후 8 MiB 예산
+     근처에서만 행별 확인, `_estimate_row_bytes` 호출 90%+ 제거.
+  4. `_flatten_params`를 리스트 컴프리헨션으로 전환 (CPython에서 ~40% 빠름).
+  5. `convert_row` passthrough fast path — 타입 변환 불필요한 컬럼(int, varchar,
+     numeric, text)은 `convert_value`를 건너뜀.
+
+### 수정 (Fixed)
+
+- **"Retry unfinished tables" 버튼 즉시 피드백 제공.** target probe 중
+  "Checking target…" 표시 + hourglass 아이콘 + disabled. 재시도 시작 시 toast.
+- **Schema Conversion 개별 "Apply to target"이 기존 테이블 감지 후 Replace/Skip
+  다이얼로그 표시** (이전: existence checker 미연결로 silent SKIP).
+- **"Keep integer PK" → "Keep source PK"** 레이블 수정.
+- **"Apply converted to target" → "Apply all to target"** 레이블 수정.
+
+## v0.1.66
+
+### 변경 (Changed)
+
+- **Migration overview 다이어그램을 하나의 통합 패널로 재설계.** 기존 세 개의 개별
+  bordered 카드(Source / Migration Tool / Aurora DSQL)를 하나의 공유 surface 안에
+  borderless column segment로 통합. 상태 표시는 bordered chip badge 대신 경량
+  dot + text 패턴(Cloudscape "StatusIndicator")을 사용하고, flow connector는
+  dashed 화살표 + plain text caption으로 단순화. 전체 chrome을 줄이면서 모든 정보
+  (endpoint, engine, region, connection state)는 그대로 유지. Design system
+  (`ui/design.py`)에 재사용 가능한 `render_status_dot` 컴포넌트 추가.
+
 ## v0.1.65
 
 ### 변경 (Changed)

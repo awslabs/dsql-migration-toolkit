@@ -27,7 +27,12 @@ import re
 from typing import TYPE_CHECKING, Callable, Optional
 
 from dsql_migrator.core.models import StepStatus, WorkflowState
-from dsql_migrator.ui.design import BADGE_TONES, inline_hint, render_notice
+from dsql_migrator.ui.design import (
+    STATUS_DOT_TONES,
+    inline_hint,
+    render_notice,
+    render_status_dot,
+)
 
 
 def _dev_unlock_steps() -> bool:
@@ -707,122 +712,121 @@ def build_migration_diagram(
     return source, tool, target
 
 
-def _render_diagram_node(ui: object, node: DiagramNode) -> None:
-    """Render one diagram node card with an icon, title, subtitle, detail lines."""
-    # Connected -> full color; reconnect -> amber (resumable, re-test pending);
-    # otherwise grey (never connected this session).
-    color = "primary" if node.connected else ("amber-7" if node.reconnect else "grey-5")
-    # The card gets a soft amber ring on a reconnect so the "come back and re-test"
-    # cue reads at a glance even before the chip text is parsed.
-    card_extra = " ring-1 ring-amber-300 bg-amber-50" if node.reconnect else ""
-    with ui.card().classes(  # type: ignore[attr-defined]
-        "items-center gap-1 p-3 min-w-0 flex-1 self-stretch !shadow-sm" + card_extra
+def _render_diagram_segment(
+    ui: object,
+    node: DiagramNode,
+    *,
+    role_pill: "Optional[tuple[str, str]]" = None,
+) -> None:
+    """Render one segment of the unified migration overview panel.
+
+    ``role_pill`` is an optional ``(label, tailwind_classes)`` tuple that renders
+    a small pill badge at the top of the segment — used only on the tool node to
+    convey its "CONVERT · LOAD" function. Source/target are self-explanatory from
+    their titles and need no role pill.
+    """
+    segment_bg = " bg-amber-50/60" if node.reconnect else ""
+    with ui.column().classes(  # type: ignore[attr-defined]
+        "items-center gap-1 py-5 px-5 min-w-0 flex-1" + segment_bg
     ):
-        # Region above the icon (small), per the requested layout.
-        if node.region:
-            with ui.row().classes("items-center gap-1 no-wrap"):  # type: ignore[attr-defined]
-                ui.icon("public", color="grey-6").classes("text-[12px]")  # type: ignore[attr-defined]
-                ui.label(node.region).classes(  # type: ignore[attr-defined]
-                    "text-[10px] text-gray-500 leading-tight"
-                )
+        # Role pill — only on the tool node.
+        if role_pill is not None:
+            pill_text, pill_classes = role_pill
+            ui.label(pill_text).classes(  # type: ignore[attr-defined]
+                "text-[9px] font-bold tracking-widest uppercase "
+                f"px-2 py-0.5 rounded-full border {pill_classes} mb-1"
+            )
+        # Service glyph (SVG) or Material icon — scaled up for visual weight.
         if node.svg:
-            # Full opacity when connected; a light dim on a reconnect (remembered,
-            # re-test pending); faint when never connected.
             svg_opacity = (
-                "" if node.connected else (" opacity-70" if node.reconnect else " opacity-40")
+                "" if node.connected else (" opacity-60" if node.reconnect else " opacity-25")
             )
             ui.html(node.svg).classes("h-10 w-10" + svg_opacity)  # type: ignore[attr-defined]
         else:
+            color = "primary" if node.connected else ("amber-7" if node.reconnect else "grey-5")
             ui.icon(node.icon, color=color).classes("text-3xl")  # type: ignore[attr-defined]
-        ui.label(node.title).classes("text-sm font-semibold text-center")  # type: ignore[attr-defined]
-        # Wrap (break-all) rather than truncate so long endpoints/hosts stay
-        # fully readable (Usability: nothing important is cut off).
+        # Title — text-sm for clear hierarchy.
+        ui.label(node.title).classes(  # type: ignore[attr-defined]
+            "text-sm font-semibold text-gray-900 text-center mt-2"
+        )
+        # Subtitle.
         ui.label(node.subtitle).classes(  # type: ignore[attr-defined]
-            "text-xs text-gray-600 text-center break-all leading-tight"
+            "text-xs text-gray-400 text-center break-all leading-tight"
         )
-        # Small bordered status chips (label-card feel): connectivity on the
-        # source/target, stage + AI-assist on the tool.
-        if node.badges:
-            with ui.column().classes(  # type: ignore[attr-defined]
-                "items-center gap-1 mt-1 w-full"
-            ):
-                for text, tone in node.badges:
-                    ui.label(text).classes(  # type: ignore[attr-defined]
-                        "text-[10px] leading-tight border rounded px-2 py-0.5 "
-                        + BADGE_TONES.get(tone, BADGE_TONES["neutral"])
-                    )
-        # Blank line separating the name from the detail block (visual grouping).
-        if node.details:
-            ui.element("div").classes("h-2")  # type: ignore[attr-defined]
-        for icon_name, line in node.details:
-            with ui.row().classes(  # type: ignore[attr-defined]
-                "items-start gap-1 no-wrap w-full"
-            ):
-                ui.icon(icon_name, color="grey-6").classes("text-[12px] mt-0.5")  # type: ignore[attr-defined]
-                ui.label(line).classes(  # type: ignore[attr-defined]
-                    "text-[10px] text-gray-600 break-all leading-tight"
+        # Region.
+        if node.region:
+            with ui.row().classes("items-center gap-1 no-wrap mt-0.5"):  # type: ignore[attr-defined]
+                ui.icon("public", color="grey-4").classes("text-[10px]")  # type: ignore[attr-defined]
+                ui.label(node.region).classes(  # type: ignore[attr-defined]
+                    "text-[10px] text-gray-400"
                 )
-
-
-def _render_diagram_connector(ui: object, caption: str) -> None:
-    """Render a Cloudscape-style flow connector between two diagram nodes.
-
-    A thin horizontal rule terminating in an arrowhead, with a small bordered
-    caption pill centered on the line, so the data-flow semantics ("read-only",
-    "convert + load") read like an AWS console architecture diagram rather than a
-    bare Material arrow. Vertically centered so it lines up with the node bodies.
-    """
-    with ui.column().classes("items-center justify-center gap-1 shrink-0 px-1"):  # type: ignore[attr-defined]
-        # The caption pill sits above the line (label-card feel, matches the
-        # node status chips).
-        ui.label(caption).classes(  # type: ignore[attr-defined]
-            "text-[10px] leading-tight text-gray-500 border border-gray-300 "
-            "rounded-full px-2 py-0.5 bg-white"
-        )
-        # Thin connector rule + arrowhead glyph.
-        with ui.row().classes("items-center gap-0 no-wrap"):  # type: ignore[attr-defined]
-            ui.element("div").classes("h-px w-8 bg-gray-300")  # type: ignore[attr-defined]
-            ui.icon("arrow_right_alt", color="grey-5").classes("text-lg -ml-1")  # type: ignore[attr-defined]
+        # Status indicators — larger dot and heavier text for legibility.
+        if node.badges:
+            with ui.column().classes("items-center gap-1 mt-2"):  # type: ignore[attr-defined]
+                for text, tone in node.badges:
+                    dot_bg, text_color = STATUS_DOT_TONES.get(
+                        tone, STATUS_DOT_TONES["neutral"]
+                    )
+                    with ui.row().classes("items-center gap-1.5 no-wrap"):  # type: ignore[attr-defined]
+                        ui.element("div").classes(  # type: ignore[attr-defined]
+                            f"h-2.5 w-2.5 rounded-full shrink-0 {dot_bg}"
+                        )
+                        ui.label(text).classes(  # type: ignore[attr-defined]
+                            f"text-xs font-medium {text_color}"
+                        )
+        # Detail key-value pairs.
+        if node.details:
+            with ui.column().classes(  # type: ignore[attr-defined]
+                "gap-1 mt-3 w-full pt-2 border-t border-gray-100"
+            ):
+                for _icon_name, line in node.details:
+                    if ": " in line:
+                        label, _, value = line.partition(": ")
+                        with ui.column().classes("gap-0 w-full"):  # type: ignore[attr-defined]
+                            ui.label(label).classes(  # type: ignore[attr-defined]
+                                "text-[9px] text-gray-400 uppercase tracking-wide"
+                            )
+                            ui.label(value).classes(  # type: ignore[attr-defined]
+                                "text-[11px] text-gray-700 break-all leading-snug"
+                            )
+                    else:
+                        ui.label(line).classes(  # type: ignore[attr-defined]
+                            "text-[11px] text-gray-700 break-all leading-snug"
+                        )
 
 
 def _render_migration_diagram(
     ui: object, state: "object", current_step: "Optional[WorkflowStep]" = None
 ) -> None:
-    """Render the source -> tool -> target overview banner above a step screen.
+    """Render the source -> tool -> target overview as a single unified panel.
 
-    A lightweight orientation aid (Usability-first): it shows, at a glance, that
-    the migration reads from the source MySQL, converts/loads through this tool,
-    and writes to Aurora DSQL. The flow connectors carry the data-flow semantics
-    (read-only out of the source; convert + load into the target). ``current_step``
-    drives the middle node's active-stage label.
-
-    Framed as a Cloudscape "Container": a white surface with a subtle border and a
-    header band ("Migration overview"), so the orientation aid reads like an AWS
-    console panel instead of a flat grey strip.
+    Three segments share one surface. Flow direction is communicated by bold
+    ``arrow_forward`` icons between segments — no faint divider lines, no
+    redundant role labels. The tool segment gets a single "CONVERT · LOAD" pill
+    badge; source/target are self-explanatory from their titles.
     """
     source, tool, target = build_migration_diagram(state, current_step)
     with ui.card().classes(  # type: ignore[attr-defined]
-        "w-full !shadow-none border border-gray-200 rounded-lg p-0 overflow-hidden"
+        "w-full !shadow-none border border-gray-200 rounded-xl p-0 overflow-hidden"
     ):
-        # Container header band (Cloudscape "Container"/"Header").
         with ui.row().classes(  # type: ignore[attr-defined]
-            "items-center gap-2 no-wrap w-full px-3 py-2 border-b border-gray-200 "
-            "bg-gray-50"
+            "items-stretch w-full no-wrap gap-0"
         ):
-            ui.icon("account_tree", color="primary").classes("text-base")  # type: ignore[attr-defined]
-            ui.label("Migration overview").classes(  # type: ignore[attr-defined]
-                "text-xs font-semibold text-gray-700"
+            _render_diagram_segment(ui, source)
+            # Flow arrow — bold, unmistakable direction.
+            with ui.column().classes(  # type: ignore[attr-defined]
+                "items-center justify-center w-8 shrink-0 self-center"
+            ):
+                ui.icon("arrow_forward", color="grey-6").classes("text-xl")  # type: ignore[attr-defined]
+            _render_diagram_segment(
+                ui, tool, role_pill=("CONVERT · LOAD", "bg-blue-50 border-blue-200 text-blue-600")
             )
-        # Node row. items-stretch keeps all three nodes the same height regardless
-        # of how many detail lines each shows; the connectors center vertically.
-        with ui.row().classes(  # type: ignore[attr-defined]
-            "items-stretch justify-between w-full no-wrap gap-1 p-3"
-        ):
-            _render_diagram_node(ui, source)
-            _render_diagram_connector(ui, "read-only")
-            _render_diagram_node(ui, tool)
-            _render_diagram_connector(ui, "convert + load")
-            _render_diagram_node(ui, target)
+            # Flow arrow.
+            with ui.column().classes(  # type: ignore[attr-defined]
+                "items-center justify-center w-8 shrink-0 self-center"
+            ):
+                ui.icon("arrow_forward", color="grey-6").classes("text-xl")  # type: ignore[attr-defined]
+            _render_diagram_segment(ui, target)
 
 
 def _migration_type_meta(state: "object"):

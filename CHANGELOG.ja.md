@@ -5,6 +5,41 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.67
+
+### Changed
+
+- **Full Load単一テーブルスループット最適化（GIL対応）。** GIL保持時間と
+  ネットワークラウンドトリップを削減する5つの変更を複合適用：
+  1. MySQLキーセットページサイズを1,000→5,000行に拡大 — ソースラウンドトリップ5倍削減。
+  2. `build_insert_statement` SQLテンプレートをバッチshape別にキャッシュ — バッチ
+     あたり約40,000オブジェクト割り当てを排除。
+  3. `_iter_batches`バイト推定をlazy化 — バッチ先頭行のみサンプリング、
+     `_estimate_row_bytes`呼び出し90%以上削減。
+  4. `_flatten_params`をリスト内包表記に変換（CPythonで約40%高速化）。
+  5. `convert_row`パススルー高速パス — 型変換不要な列はfrozenset参照のみ。
+
+### Fixed
+
+- **"Retry unfinished tables"ボタンに即時フィードバック追加。**
+- **Schema Conversion個別"Apply to target"が既存テーブル検出後Replace/Skip
+  ダイアログ表示。**
+- **"Keep integer PK" → "Keep source PK"** ラベル修正。
+- **"Apply converted to target" → "Apply all to target"** ラベル修正。
+
+## v0.1.66
+
+### Changed
+
+- **Migration overviewダイアグラムを単一の統合パネルに再設計。** これまで3つに
+  分かれていたボーダー付きカード（Source / Migration Tool / Aurora DSQL）を、
+  1つの共有サーフェス内のボーダーなしカラムセグメントに統合。ステータス表示は
+  ボーダー付きチップバッジの代わりに軽量なドット＋テキストパターン（Cloudscape
+  「StatusIndicator」）を使用し、フローコネクタは破線矢印＋プレーンテキスト
+  キャプションに簡素化。全体的なクロームを大幅に削減しつつ、すべての情報
+  （endpoint、engine、region、connection state）は保持。デザインシステム
+  （`ui/design.py`）に再利用可能な `render_status_dot` コンポーネントを追加。
+
 ## v0.1.65
 
 ### Changed

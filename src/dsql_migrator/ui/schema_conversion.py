@@ -2628,6 +2628,14 @@ def build_schema_conversion_screen(
             target_inventory = (
                 eval_result.target_inventory if eval_result is not None else None
             )
+            # Resolve the existence checker: prefer the explicitly injected one
+            # (tests), otherwise build one from the target inventory (which is
+            # available after Evaluation's target browse or a "Refresh target").
+            # This enables the per-object Apply to detect existing tables and show
+            # the Replace/Skip dialog.
+            nonlocal existence_checker
+            if existence_checker is None and target_inventory is not None:
+                existence_checker = _InventoryExistenceChecker(target_inventory)
             # AI assistance is integrated per generated object (not a separate
             # section): for each object the deterministic conversion and the AI
             # suggestion are compared and shown as one view when identical, or as
@@ -3264,9 +3272,9 @@ def _render_pk_strategy_picker(
     conv_state: SchemaConversionState,
     refresh: Callable[[], None],
 ) -> None:
-    """Per-table primary-key strategy picker (Keep integer vs Composite key).
+    """Per-table primary-key strategy picker (Keep source PK vs Composite key).
 
-    Opt-in and per-table: the default is Keep integer PK (the source key
+    Opt-in and per-table: the default is Keep source PK (the source key
     unchanged). Choosing "Composite key" rewrites this table's target key to
     ``(leading, original_pk...)`` to spread writes across Aurora DSQL partitions
     (avoiding the monotonic-key hot partition). The choice is stored by baking the
@@ -3316,7 +3324,7 @@ def _render_pk_strategy_picker(
             ui.label("Primary key").classes("text-sm font-semibold text-gray-700")  # type: ignore[attr-defined]
             picker = segmented_control(
                 ui,
-                {_KEEP_PK: "Keep integer PK", _COMPOSITE_PK: "Composite key"},
+                {_KEEP_PK: "Keep source PK", _COMPOSITE_PK: "Composite key"},
                 value=_COMPOSITE_PK if is_composite else _KEEP_PK,
                 on_change=_select_strategy,
             )
@@ -4006,7 +4014,7 @@ def _render_apply_controls(
             apply_label = (
                 "Applying…"
                 if in_progress
-                else f"Apply converted to target ({table_count})"
+                else f"Apply all to target ({table_count})"
             )
             apply_button = ui.button(  # type: ignore[attr-defined]
                 apply_label,
@@ -4077,6 +4085,31 @@ def _summarize_apply(
     for item in results:
         summary[item.status] += 1
     return summary
+
+
+class _InventoryExistenceChecker:
+    """Existence checker backed by a previously browsed :class:`TargetInventory`.
+
+    A lightweight adapter that answers ``object_exists`` from the in-memory
+    target inventory (stored in the Evaluation result after Step 1 or a
+    "Refresh target" action) without issuing any SQL. Case-insensitive
+    matching mirrors PostgreSQL identifier folding.
+    """
+
+    def __init__(self, target_inventory: object) -> None:
+        names: set[str] = set()
+        for schema in getattr(target_inventory, "schemas", ()):
+            for table in getattr(schema, "tables", ()):
+                names.add(table.name.lower())
+                names.add(f"{schema.name}.{table.name}".lower())
+            for view in getattr(schema, "views", ()):
+                names.add(view.name.lower())
+                names.add(f"{schema.name}.{view.name}".lower())
+        self._names = names
+
+    def object_exists(self, object_name: str) -> bool:
+        normalized = object_name.strip().lower()
+        return normalized in self._names
 
 
 def _existing_object_names(

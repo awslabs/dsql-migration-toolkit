@@ -84,6 +84,9 @@ class _RecordingUi:
             self.texts.append(str(text))
         return _El(self, "badge")
 
+    def element(self, tag="div", *_a, **_k):
+        return _El(self, tag)
+
     def toggle(self, options=None, *_a, value=None, on_change=None, **_k):
         # Record the option labels so a test can assert what the segmented
         # control offered; returns a chainable element double.
@@ -120,6 +123,39 @@ def test_badge_tones_present_and_fallback() -> None:
     assert badge_classes("ok") == BADGE_TONES["ok"]
     # Unknown tone falls back to neutral, never raises.
     assert badge_classes("does-not-exist") == BADGE_TONES["neutral"]
+
+
+# ---------------------------------------------------------------------------
+# Status dot (StatusIndicator)
+# ---------------------------------------------------------------------------
+
+
+def test_status_dot_tones_cover_badge_tones() -> None:
+    from dsql_migrator.ui.design import STATUS_DOT_TONES
+
+    assert set(STATUS_DOT_TONES) >= {"ok", "bad", "active", "neutral", "reconnect"}
+
+
+def test_render_status_dot_emits_dot_and_text() -> None:
+    from dsql_migrator.ui.design import STATUS_DOT_TONES, render_status_dot
+
+    ui = _RecordingUi()
+    render_status_dot(ui, "Connected", tone="ok")
+    assert "Connected" in ui.texts
+    blob = " ".join(ui.classes)
+    dot_bg, text_color = STATUS_DOT_TONES["ok"]
+    assert dot_bg in blob
+    assert text_color in blob
+
+
+def test_render_status_dot_unknown_tone_falls_back() -> None:
+    from dsql_migrator.ui.design import STATUS_DOT_TONES, render_status_dot
+
+    ui = _RecordingUi()
+    render_status_dot(ui, "Unknown", tone="does-not-exist")
+    blob = " ".join(ui.classes)
+    dot_bg, _text_color = STATUS_DOT_TONES["neutral"]
+    assert dot_bg in blob
 
 
 # ---------------------------------------------------------------------------

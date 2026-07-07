@@ -1569,7 +1569,7 @@ def test_composite_leading_from_ddl_none_for_unchanged_key() -> None:
     table = _pk_table()
     deterministic = SchemaConverter().convert_table(table)
     stored = render_target_ddl(deterministic)
-    # Unchanged key -> not composite -> the picker renders as "Keep integer PK".
+    # Unchanged key -> not composite -> the picker renders as "Keep source PK".
     assert composite_leading_from_ddl(table, stored) is None
 
 
@@ -1698,7 +1698,7 @@ def test_pk_picker_switching_back_to_keep_clears_override() -> None:
     )
     _render_pk_strategy_picker(ui, table, state, lambda: None)
     ui.toggle_el.on_change(_event("KEEP"))
-    # Reverting to Keep integer PK drops the composite override entirely.
+    # Reverting to Keep source PK drops the composite override entirely.
     assert state.get_edited_target_ddl("orders") is None
 
 
@@ -1861,3 +1861,46 @@ def test_apply_button_clears_busy_state_even_when_apply_raises() -> None:
 
     # The finally block still clears the busy state so the button is usable again.
     assert ("remove", "loading disable") in apply_btn.prop_events
+
+
+# ---------------------------------------------------------------------------
+# _InventoryExistenceChecker (inventory-backed existence for per-object apply)
+# ---------------------------------------------------------------------------
+
+
+def test_inventory_existence_checker_detects_existing_tables() -> None:
+    from dsql_migrator.ui.schema_conversion import _InventoryExistenceChecker
+
+    class _Schema:
+        def __init__(self, name, tables, views=()):
+            self.name = name
+            self.tables = tables
+            self.views = views
+
+    class _Rel:
+        def __init__(self, name):
+            self.name = name
+
+    class _Inv:
+        def __init__(self, schemas):
+            self.schemas = schemas
+
+    inv = _Inv([
+        _Schema("public", [_Rel("orders"), _Rel("customers")], [_Rel("v_summary")]),
+    ])
+    checker = _InventoryExistenceChecker(inv)
+    assert checker.object_exists("orders") is True
+    assert checker.object_exists("ORDERS") is True  # case-insensitive
+    assert checker.object_exists("public.orders") is True
+    assert checker.object_exists("v_summary") is True
+    assert checker.object_exists("nonexistent") is False
+
+
+def test_inventory_existence_checker_handles_empty_inventory() -> None:
+    from dsql_migrator.ui.schema_conversion import _InventoryExistenceChecker
+
+    class _Inv:
+        schemas = []
+
+    checker = _InventoryExistenceChecker(_Inv())
+    assert checker.object_exists("anything") is False
