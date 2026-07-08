@@ -1241,7 +1241,15 @@ Resources:
         # (treating them as "already processed"), producing zero records. Setting
         # this to false disables GTID-based DML filtering so file:pos tracking
         # drives event delivery regardless of the source's GTID mode.
+        # GTID handling: when the source has gtid_mode=OFF or OFF_PERMISSIVE,
+        # new transactions do not receive GTIDs. Without these settings Debezium
+        # records the (stale) GTID set at snapshot time, then the binlog client
+        # applies a GTID filter that skips all non-GTID events → zero produce.
+        # gtid.source.filter.dml.events=false disables the DML skip logic, and
+        # gtid.source.excludes with a catch-all UUID pattern prevents Debezium
+        # from including any GTID set in the offset, forcing pure file:pos mode.
         gtid.source.filter.dml.events: "false"
+        gtid.source.excludes: ".*"
         schema.history.internal.store.only.captured.tables.ddl: "false"
         include.schema.changes: "false"
         # Serialize BIGINT UNSIGNED as an exact BigDecimal (Avro decimal) instead
