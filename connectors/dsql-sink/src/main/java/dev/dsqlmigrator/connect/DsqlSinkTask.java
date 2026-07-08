@@ -188,9 +188,7 @@ public class DsqlSinkTask extends SinkTask {
       OccRetry.withRetry(
           () -> {
             Connection conn = connection();
-            for (Applicable a : chunk) {
-              executeOne(conn, a.event());
-            }
+            applyChunkBatched(conn, chunk);
             conn.commit();
             return null;
           },
@@ -276,13 +274,72 @@ public class DsqlSinkTask extends SinkTask {
     return null;
   }
 
+  /**
+   * Apply a chunk in one transaction, coalescing every maximal run of
+   * consecutive events that render to the SAME SQL into a single
+   * {@link PreparedStatement#executeBatch()}. DSQL is a distributed store where
+   * each statement round-trip dominates apply cost (the task is latency-bound,
+   * not CPU-bound), so collapsing N per-row round-trips into one batched send is
+   * the primary throughput lever.
+   *
+   * <p><b>Ordering is preserved.</b> Only <em>contiguous</em> same-SQL events are
+   * grouped, so a delete that follows an upsert on the same PK (or vice-versa)
+   * still executes in arrival order — batching never reorders apply. A run breaks
+   * whenever the rendered SQL changes (different table, column set, or
+   * upsert↔delete), so mixed streams degrade gracefully to smaller batches, never
+   * to incorrect order.
+   *
+   * <p><b>Why {@code executeBatch}, not multi-row {@code VALUES}.</b> A rewritten
+   * multi-row {@code INSERT ... ON CONFLICT} would reject a chunk that carries the
+   * same PK twice ("ON CONFLICT DO UPDATE command cannot affect row a second
+   * time"); plain {@code executeBatch} runs each statement independently, so
+   * intra-chunk duplicate PKs stay safe while still pipelining the round-trips.
+   */
+  private void applyChunkBatched(Connection conn, List<Applicable> chunk) throws SQLException {
+    int i = 0;
+    while (i < chunk.size()) {
+      String sql = renderSql(chunk.get(i).event());
+      int end = runEnd(chunk, i); // exclusive end of the maximal same-SQL run
+      try (PreparedStatement ps = conn.prepareStatement(sql)) {
+        for (int j = i; j < end; j++) {
+          bind(ps, chunk.get(j).event());
+          ps.addBatch();
+        }
+        if (end - i == 1) {
+          ps.executeUpdate();
+        } else {
+          ps.executeBatch();
+        }
+      }
+      i = end;
+    }
+  }
+
+  /**
+   * Exclusive end index of the maximal run of consecutive events, starting at
+   * {@code start}, that render to the same SQL as {@code chunk[start]}. Pure and
+   * package-private so the run-grouping (which preserves apply order) is unit
+   * tested without a live JDBC connection.
+   */
+  static int runEnd(List<Applicable> chunk, int start) {
+    String sql = renderSql(chunk.get(start).event());
+    int j = start + 1;
+    while (j < chunk.size() && renderSql(chunk.get(j).event()).equals(sql)) {
+      j++;
+    }
+    return j;
+  }
+
+  /** Render the upsert/delete SQL for a change event (its batching group key). */
+  static String renderSql(ChangeEvent event) {
+    return event.isDelete()
+        ? DsqlDialect.deleteSql(event.table(), event.pkColumns())
+        : DsqlDialect.upsertSql(event.table(), event.columns(), event.pkColumns());
+  }
+
   /** Execute one change event (upsert or delete) on the open connection. */
   private void executeOne(Connection conn, ChangeEvent event) throws SQLException {
-    String sql =
-        event.isDelete()
-            ? DsqlDialect.deleteSql(event.table(), event.pkColumns())
-            : DsqlDialect.upsertSql(event.table(), event.columns(), event.pkColumns());
-    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+    try (PreparedStatement ps = conn.prepareStatement(renderSql(event))) {
       bind(ps, event);
       ps.executeUpdate();
     }
@@ -494,7 +551,7 @@ public class DsqlSinkTask extends SinkTask {
   }
 
   /** A change event paired with the SinkRecord it came from (for DLQ reporting). */
-  private static final class Applicable {
+  static final class Applicable {
     private final SinkRecord record;
     private final ChangeEvent event;
 

@@ -232,6 +232,19 @@ Parameters:
       Max rows per DSQL transaction in the sink connector (DSQL constraint —
       <=3,000 rows/transaction). Do not exceed 3000.
 
+  SinkMaxPollRecords:
+    Type: Number
+    Default: 3000
+    MinValue: 1
+    Description: >
+      consumer.max.poll.records for the sink worker: the max records handed to
+      one SinkTask.put() call, which bounds how many the connector can coalesce
+      into a single JDBC executeBatch (one DSQL round-trip). The Kafka default
+      (500) capped each batched apply well under the 3,000-row transaction limit,
+      leaving the latency-bound sink under-batched. Matches SinkBatchMaxRows so a
+      full poll fills one transaction. Set in the sink worker config (per-connector
+      consumer.* overrides are unavailable on MSK Connect).
+
   SourceTasksMax:
     Type: Number
     Default: 1
@@ -887,6 +900,7 @@ Resources:
             value.converter.schemas.enable=true
             consumer.max.partition.fetch.bytes=${MaxMessageBytes}
             consumer.fetch.max.bytes=${MaxMessageBytes}
+            consumer.max.poll.records=${SinkMaxPollRecords}
             producer.max.request.size=${MaxMessageBytes}
             offset.storage.partitions=1
             status.storage.partitions=1

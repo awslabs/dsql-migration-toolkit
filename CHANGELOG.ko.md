@@ -5,6 +5,43 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.72
+
+### 변경 (Changed)
+
+- **CDC 싱크 처리량: 배치 적용 (플러그인 `v13`).** DSQL 싱크 커넥터가 이제 동일한 SQL로
+  렌더링되는 *연속된* 변경 이벤트의 최대 구간을 행별 `executeUpdate()` 대신 하나의 JDBC
+  `executeBatch()`로 묶어서 적용합니다. DSQL은 지연(latency) 바운드입니다 — 각 문(statement)이
+  분산 왕복이며, 싱크 태스크는 CPU ~5% / ~550 rec/s로 관측되었습니다(연산이 아니라 왕복에
+  묶임). 행별 왕복을 배치 전송으로 접는 것이 처리량의 핵심 지렛대입니다. **적용 순서는
+  보존됩니다**: 연속된 동일 SQL 이벤트만 묶이므로 같은 PK에 대한 upsert 뒤의 delete도 도착
+  순서대로 적용되고, 테이블/컬럼셋/종류가 바뀌면 구간이 끊깁니다. poison-row 격리, OCC 재시도,
+  멱등 재적용은 그대로입니다(영구 실패 시 여전히 행별 적용으로 폴백). `PLUGIN_VERSION`을
+  `v13`으로 올림.
+- **CDC 싱크 `consumer.max.poll.records` 기본값 3000으로 변경.** 새 `SinkMaxPollRecords`
+  CFn 파라미터(기본 3000, 싱크 워커 설정에 지정). Kafka 기본값(500)이 한 `put()` 호출에
+  도달하는 레코드 수 — 따라서 하나의 ≤3000행 DSQL 트랜잭션에 배치할 수 있는 수 — 를 제한해
+  배치 적용이 덜 채워졌습니다. 트랜잭션 한도에 맞추면 한 번의 poll이 하나의 왕복을 가득
+  채웁니다.
+- **대규모 소스를 위한 CDC 처리량 기본값 상향:** `ConnectorMcuCount` 4, `SinkTasksMax` 4,
+  테이블별 `topic.creation.default.partitions` 4로 설정하여 싱크가 데이터 토픽을 4개
+  파티션에 걸쳐 병렬 소비할 수 있게 했습니다(유효 싱크 동시성은 파티션 수로 제한). 앱 스택은
+  이제 8/16 vCPU 태스크 크기도 허용합니다.
+
+### 수정 (Fixed)
+
+- **CDC: 非-GTID 소스가 file:position 모드로 안정적으로 폴백.** Debezium이 모든 GTID를
+  제외(`gtid.source.excludes=.*`)하고 GTID 부재 시 DML을 필터링하지 않도록
+  (`gtid.source.filter.dml.events=false`) 설정하여, `gtid_mode=OFF`인 소스(예: GTID를
+  켤 수 없는 RDS MySQL)가 0개 레코드 대신 binlog file:position으로 변경을 캡처합니다.
+
+### UI
+
+- **Start CDC 즉시 피드백:** 배포 요청이 진행 중일 때 버튼이 무응답처럼 보이던 것을, 클릭 시
+  로딩 상태와 토스트를 표시하도록 변경.
+- **중단된 CDC 단계에 FAILED 아이콘 표시:** 작업이 종료된 후 진행 중 스피너에 멈춰 있던 것을
+  실패 아이콘으로 표시.
+
 ## v0.1.71
 
 ### 수정 (Fixed)

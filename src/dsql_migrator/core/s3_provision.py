@@ -48,6 +48,16 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v13 rebuilds the sink plugin for a throughput win: the apply path coalesces each
+#    maximal run of CONSECUTIVE same-SQL change events into one JDBC executeBatch()
+#    instead of a per-row executeUpdate(). DSQL is latency-bound (each statement is
+#    a distributed round-trip; the sink task ran at ~5% CPU / ~550 rec/s), so
+#    collapsing per-row round-trips into batched sends is the primary lever. Order
+#    is preserved -- only contiguous identical-SQL events group, so an upsert
+#    followed by a delete on the same PK still applies in arrival order; a run
+#    breaks on any table/column-set/kind change. Poison-row isolation, OCC retry,
+#    and idempotent replay are unchanged (a permanent failure still falls back to
+#    record-by-record apply). Sink-jar change only.
 # v12 rebuilds the sink plugin for a corrected start() advisory log only: when no
 #    ErrantRecordReporter is wired, the message now states a permanently-rejected
 #    record FAILS THE TASK (the actual quarantine() behavior) rather than the stale
@@ -103,7 +113,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v12"
+PLUGIN_VERSION = "v13"
 
 
 class S3ProvisionError(RuntimeError):

@@ -5,6 +5,50 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.72
+
+### Changed
+
+- **CDC sink throughput: batched apply (plugin `v13`).** The DSQL sink connector
+  now coalesces each maximal run of *consecutive* change events that render to the
+  same SQL into a single JDBC `executeBatch()` instead of a per-row
+  `executeUpdate()`. DSQL is latency-bound — each statement is a distributed
+  round-trip, and the sink task was observed running at ~5% CPU / ~550 rec/s
+  (round-trip-bound, not compute-bound). Collapsing per-row round-trips into
+  batched sends is the primary throughput lever. Apply **order is preserved**:
+  only contiguous identical-SQL events group, so an upsert followed by a delete on
+  the same PK still applies in arrival order, and a run breaks on any
+  table/column-set/kind change. Poison-row isolation, OCC retry, and idempotent
+  replay are unchanged (a permanent failure still falls back to record-by-record
+  apply). Bumps `PLUGIN_VERSION` to `v13`.
+- **CDC sink `consumer.max.poll.records` now defaults to 3000.** New
+  `SinkMaxPollRecords` CFn parameter (default 3000, set in the sink worker config).
+  The Kafka default (500) capped how many records reach one `put()` call — and
+  thus how many the connector can batch into one ≤3000-row DSQL transaction —
+  leaving the batched apply under-filled. Matching it to the transaction limit lets
+  a full poll fill one round-trip.
+- **CDC throughput defaults raised for large-scale sources:** `ConnectorMcuCount`
+  4, `SinkTasksMax` 4, and per-table `topic.creation.default.partitions` 4, so the
+  sink can consume a data topic across 4 partitions in parallel out of the box
+  (effective sink concurrency is capped by the partition count). The app stack also
+  now allows 8/16 vCPU task sizes.
+
+### Fixed
+
+- **CDC: non-GTID sources reliably fall back to file:position mode.** Debezium is
+  now told to exclude all GTIDs (`gtid.source.excludes=.*`) and not filter DML on a
+  missing GTID (`gtid.source.filter.dml.events=false`), so a source with
+  `gtid_mode=OFF` (e.g. RDS MySQL where GTID can't be enabled) captures changes via
+  binlog file:position instead of producing zero records.
+
+### UI
+
+- **Start CDC gives immediate feedback:** the button shows a loading state and a
+  toast on click, rather than appearing unresponsive while the deploy request is
+  in flight.
+- **Interrupted CDC stages show a FAILED icon** once the job has ended, instead of
+  remaining stuck on an in-progress spinner.
+
 ## v0.1.71
 
 ### Fixed
