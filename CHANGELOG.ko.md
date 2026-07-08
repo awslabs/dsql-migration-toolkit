@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.76
+
+### 변경 (Changed)
+
+- **CDC 싱크: 파라미터 메타데이터를 statement당 1회만 조회 (플러그인 `v16`) — 싱크 처리량 ~9.7배.**
+  `bind()`가 모든 change event마다 `getParameterMetaData()`를 호출했는데, pgjdbc에서 이는 서버측
+  Parse/Describe 왕복이라 싱크가 **적용 행마다 읽기 전용 트랜잭션 1개**를 발생시키고 있었습니다 —
+  DSQL `ReadOnlyTransactions` 메트릭이 ~115,000/분(쓰기 속도의 약 60배)인 반면 `OccConflicts`는
+  줄곧 0인 것으로 확인. 즉 진짜 천장은 서버측 쓰기 경합이 아니라 이 숨은 왕복이었고, v13/v15의 배치
+  이득 대부분을 상쇄하고 있었습니다. 메타데이터는 같은 SQL이면 모든 행에 동일하므로 이제 prepared
+  statement당 1회만 조회해 `bind()`에 전달합니다. 측정 DSQL 적용 속도가 ~1,925 → **~18,672 rows/s**
+  (8 파티션/태스크)로 상승; 읽기 전용 트랜잭션 ~150배 감소, 싱크 CPU 10% → ~65%. 싱크 JAR 변경만
+  (`PLUGIN_VERSION` → `v16`).
+
 ## v0.1.75
 
 ### 변경 (Changed)

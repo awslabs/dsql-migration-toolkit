@@ -136,10 +136,11 @@ The connector-scaling knobs (partitions / `SinkTasksMax` / `ConnectorMcuCount`) 
 | 1: single partition | 1 partition / 1 task | 292 | — | partition count = 1 (no parallelism) | 1× |
 | 2: partitioned | 4 partitions / 4 tasks | ~550 | 5% | sink applied **one row per round-trip** | 1.9× |
 | 3: batched apply (**plugin v13**) | 4 partitions / 4 tasks | ~1,165 | 7% | source (under-tuned producer) | **4.0×** |
-| 4: source tuning (**plugin v14**) | 8 partitions / 8 tasks | ~1,500 | 6.5% | DSQL write contention | **5.1×** |
-| 5: multi-row rewrite (**plugin v15**) | 8 partitions / 8 tasks | ~1,925 | ~10% | DSQL write contention | **6.6×** |
+| 4: source tuning (**plugin v14**) | 8 partitions / 8 tasks | ~1,500 | 6.5% | hidden per-row metadata round-trip | **5.1×** |
+| 5: multi-row rewrite (**plugin v15**) | 8 partitions / 8 tasks | ~1,925 | ~10% | hidden per-row metadata round-trip | **6.6×** |
+| 6: metadata once/statement (**plugin v16**) | 8 partitions / 8 tasks | **~18,672** | ~65% | source / workload feed | **64×** |
 
-Three code/config changes did most of the work:
+Four code/config changes did most of the work:
 
 - **Plugin v13 — batched sink apply.** The sink coalesces each maximal run of
   consecutive same-SQL change events into one JDBC `executeBatch()` instead of a
@@ -158,12 +159,25 @@ Three code/config changes did most of the work:
   sink from ~1,500 → **~1,925 rows/s (+30%)**. Made safe by deduping each same-SQL
   run to one row per PK first (a rewritten multi-row `ON CONFLICT` rejects a
   duplicate conflict key).
+- **Plugin v16 — fetch parameter metadata once per statement.** The real ceiling
+  turned out **not** to be DSQL-side write contention (as v14/v15 assumed) but a
+  hidden client round-trip: `bind()` called `getParameterMetaData()` for every row,
+  and on pgjdbc that is a server Parse/Describe — one read-only transaction *per
+  applied row*. DSQL's `ReadOnlyTransactions` sat at ~115,000/min (≈60× the write
+  rate) while `OccConflicts` was flat **0**, disproving the contention theory.
+  Fetching the metadata once per prepared statement took the sink from ~1,925 →
+  **~18,672 rows/s (≈9.7×)**, cut read-only transactions ~150×, and lifted sink CPU
+  10% → ~65% (now doing real work, not waiting on round-trips).
 
-At 8 partitions the sink reached ~1,500 rows/s under v14 (DSQL apply cross-checked at
-1,484 rows/s) — but scaling 4→8 gave only **~1.4× (sublinear)**: concurrent upserts to
-one table begin to contend inside DSQL. This is exactly why the smart default caps
-effective parallelism at 8. The v15 rewrite then added another ~30% on the same 8
-partitions by cutting round-trips further, reaching ~1,925 rows/s.
+**On the (disproven) contention theory.** Under v14/v15 the sink plateaued near
+~1,500–1,925 rows/s and scaling 4→8 partitions gave only ~1.4×, which *looked* like
+DSQL-side write contention. It was not: `OccConflicts` was 0 throughout. The plateau
+was the per-row metadata round-trip above; once removed, the same 8 partitions ran
+~9.7× faster and the bottleneck moved to the source / workload feed (~20,000 rows/s).
+The lesson: **low sink CPU + sublinear partition scaling does not prove server-side
+contention** — a hidden client round-trip produces the same symptoms. DSQL's
+`OccConflicts` / `ReadOnlyTransactions` metrics settle it directly. A composite,
+partition-spreading PK helps only once `OccConflicts` actually rises — not here.
 
 ---
 
@@ -192,19 +206,24 @@ partitions by cutting round-trips further, reaching ~1,925 rows/s.
 
 ### CDC
 
-6. **The sink is latency-bound, not CPU-bound.** At ~5–7% CPU the sink was waiting
-   on DSQL round-trips, not computing — so the lever is *fewer, larger* writes
-   (batched `executeBatch`), not more compute.
+6. **The sink was latency-bound: every avoided round-trip is a win.** At low CPU the
+   sink was waiting on DSQL round-trips, not computing — so the lever is *fewer*
+   round-trips (batched `executeBatch`, multi-row rewrite, and — the big one —
+   killing the per-row metadata round-trip), not more compute.
 
-7. **Batching per-row round-trips is the biggest single CDC win** (~550 → ~1,165
-   rows/s from plugin v13 alone).
+7. **A hidden per-row round-trip was the real ceiling, ~9.7× when removed.**
+   `getParameterMetaData()` per row is a server Parse/Describe on pgjdbc; hoisting it
+   to once-per-statement took the sink ~1,925 → ~18,672 rows/s. Batching (v13/v15)
+   only paid off fully once this was gone.
 
 8. **The source was never the ceiling.** Producer tuning (batch/queue/`lz4`) took
    it 16× to ~31,000 rec/s; a single Debezium task per MySQL server is plenty.
 
-9. **Sink parallelism scales sublinearly.** 4 → 8 partitions gave ~1.4×, not 2×, as
-   concurrent upserts to one table contend inside DSQL — so effective parallelism is
-   capped at 8 in the smart default.
+9. **Low CPU + sublinear partition scaling ≠ server-side contention.** The 4→8
+   partition ~1.4× plateau looked like DSQL write contention but wasn't —
+   `OccConflicts` was 0; the cause was the per-row round-trip. Always check DSQL's
+   `OccConflicts` / `ReadOnlyTransactions` before blaming the server. A composite,
+   partition-spreading PK helps only once `OccConflicts` actually rises.
 
 10. **Partition count is irreversible**, so the tool infers it at create time from
     the captured-table count rather than exposing a UI knob that could be set wrong

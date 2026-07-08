@@ -315,8 +315,9 @@ public class DsqlSinkTask extends SinkTask {
       // can never carry a duplicate conflict key.
       List<Applicable> run = dedupeRunByPk(chunk, i, end);
       try (PreparedStatement ps = conn.prepareStatement(sql)) {
+        java.sql.ParameterMetaData meta = paramMetaOrNull(ps); // once per statement
         for (Applicable a : run) {
-          bind(ps, a.event());
+          bind(ps, a.event(), meta);
           ps.addBatch();
         }
         if (run.size() == 1) {
@@ -380,7 +381,7 @@ public class DsqlSinkTask extends SinkTask {
   /** Execute one change event (upsert or delete) on the open connection. */
   private void executeOne(Connection conn, ChangeEvent event) throws SQLException {
     try (PreparedStatement ps = conn.prepareStatement(renderSql(event))) {
-      bind(ps, event);
+      bind(ps, event, paramMetaOrNull(ps));
       ps.executeUpdate();
     }
   }
@@ -523,14 +524,10 @@ public class DsqlSinkTask extends SinkTask {
    * the Full Load value converter's TINYINT(1)-&gt;boolean handling so both data
    * paths agree.
    */
-  private static void bind(PreparedStatement ps, ChangeEvent event) throws SQLException {
+  private static void bind(
+      PreparedStatement ps, ChangeEvent event, java.sql.ParameterMetaData meta)
+      throws SQLException {
     List<Object> binds = event.isDelete() ? event.pkValues() : event.values();
-    java.sql.ParameterMetaData meta = null;
-    try {
-      meta = ps.getParameterMetaData();
-    } catch (SQLException ignored) {
-      // Some drivers can't describe params before execute; fall back to plain bind.
-    }
     for (int i = 0; i < binds.size(); i++) {
       Object value = binds.get(i);
       if (value instanceof Number && meta != null && isBooleanParam(meta, i + 1)) {
@@ -538,6 +535,24 @@ public class DsqlSinkTask extends SinkTask {
       } else {
         ps.setObject(i + 1, value);
       }
+    }
+  }
+
+  /**
+   * Fetch a statement's parameter metadata ONCE, tolerating drivers that can't
+   * describe params before execute. Hoisted out of {@link #bind} because on pgjdbc
+   * {@code getParameterMetaData()} issues a server-side Parse/Describe round-trip;
+   * calling it per row (as the old bind did) generated one extra round-trip per
+   * change event — the dominant cost on a latency-bound sink (it showed up as
+   * ~1 read-only transaction per applied row in DSQL's TotalTransactions metric).
+   * The parameter types are identical for every row of a given SQL, so one fetch
+   * per statement is all that is needed.
+   */
+  private static java.sql.ParameterMetaData paramMetaOrNull(PreparedStatement ps) {
+    try {
+      return ps.getParameterMetaData();
+    } catch (SQLException ignored) {
+      return null; // fall back to plain setObject binding
     }
   }
 

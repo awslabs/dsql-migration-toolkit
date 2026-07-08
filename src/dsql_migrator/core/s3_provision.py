@@ -48,6 +48,15 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v16 removes a hidden per-row round-trip in the sink: bind() called
+#    getParameterMetaData() for EVERY change event, and on pgjdbc that issues a
+#    server-side Parse/Describe (a read-only transaction) per row. DSQL's
+#    TotalTransactions ~= ReadOnlyTransactions ~= applied-rows/sec confirmed it --
+#    the sink was spending ~1 round-trip/row just to look up param types, negating
+#    much of the v13/v15 round-trip batching. Metadata is identical for all rows of
+#    a given SQL, so it is now fetched ONCE per prepared statement and passed into
+#    bind(). Sink-jar change only. (OccConflicts stayed 0 throughout: the ceiling
+#    was never server-side write contention -- it was this client round-trip.)
 # v15 rebuilds the sink plugin to further cut DSQL round-trips (still the final,
 #    latency-bound bottleneck after v13/v14). Two coupled changes: (1) the JDBC
 #    URL enables reWriteBatchedInserts=true, so pgjdbc collapses a batch of
@@ -134,7 +143,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v15"
+PLUGIN_VERSION = "v16"
 
 
 class S3ProvisionError(RuntimeError):

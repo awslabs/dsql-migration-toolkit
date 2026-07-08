@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.76
+
+### Changed
+
+- **CDC sink: fetch parameter metadata once per statement (plugin `v16`) — ~9.7×
+  sink throughput.** `bind()` called `getParameterMetaData()` for every change
+  event; on pgjdbc that is a server-side Parse/Describe round-trip, so the sink was
+  issuing roughly one read-only transaction *per applied row* — confirmed by DSQL's
+  `ReadOnlyTransactions` metric sitting at ~115,000/min (≈ 60× the write rate) while
+  `OccConflicts` was flat 0. That hidden round-trip, not server-side write
+  contention, was the real ceiling — it was cancelling most of the v13/v15 batching
+  gains. The metadata is identical for every row of a given SQL, so it is now
+  fetched once per prepared statement and passed into `bind()`. Measured DSQL apply
+  rate rose from ~1,925 to **~18,672 rows/s** (8 partitions/tasks); read-only
+  transactions dropped ~150× and sink CPU rose 10% → ~65%. Sink-jar change only
+  (`PLUGIN_VERSION` → `v16`).
+
 ## v0.1.75
 
 ### Changed
