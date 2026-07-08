@@ -315,7 +315,18 @@ Parameters:
     Type: Number
     Default: 4
     AllowedValues: [1, 2, 4, 8]
-    Description: MSK Connect MCUs (compute units) per worker for each connector.
+    Description: MSK Connect MCUs (compute units) per worker for the SOURCE connector.
+
+  SinkMcuCount:
+    Type: Number
+    Default: 4
+    AllowedValues: [1, 2, 4, 8]
+    Description: >
+      MSK Connect MCUs per worker for the SINK connector, separate from the source
+      so the two can be sized independently. The sink became CPU-bound once the
+      per-row round-trips were removed (plugin v16: it ran at ~80% CPU / ~21,000
+      rows/s at 4 MCU), whereas the single-task source has spare CPU — so the sink
+      typically wants more compute than the source.
 
   ConnectorWorkerCount:
     Type: Number
@@ -1340,6 +1351,23 @@ Resources:
         # handling.mode stays at its default 'precise', so DECIMAL is a BigDecimal
         # too -- the custom sink relies on these precise encodings.)
         bigint.unsigned.handling.mode: precise
+        # Source-reboot resilience. When the source RDS/Aurora instance reboots
+        # (routine maintenance patch, failover, instance-class change), the binlog
+        # stream is cut mid-event: Debezium raises a RETRIABLE error and restarts
+        # the task after a 10 s backoff -- but that single restart then hits
+        # "Error reading MySQL variables: Communications link failure" because the
+        # source is still booting, and with errors.retry.timeout at its DEFAULT (0 =
+        # do not retry) Kafka Connect KILLS the task ("will not recover until
+        # manually restarted") -- a permanent stall (SourceRecordWriteRate=0)
+        # requiring a Stop/Start to recover. That is unacceptable for a long-running
+        # CDC pipeline (reboots are routine). Mirroring the sink's setting, retry
+        # retriable errors for up to 10 min so the task keeps reattempting across the
+        # reboot window and resumes from the committed binlog offset once the source
+        # is back -- gapless, no human intervention. (2026-07-08: observed a permanent
+        # source stall after a 2->8 vCPU scale-up reboot; this is the fix.)
+        errors.retry.timeout: "600000"
+        errors.retry.delay.max.ms: "60000"
+        errors.log.enable: "true"
         # Throughput tuning (H: the source caps ~2,000 rec/s at ~12% CPU, i.e. it
         # is produce/queue-bound, not binlog-parse-bound). max.batch.size /
         # max.queue.size are Debezium connector properties (drain more events per
@@ -1404,7 +1432,7 @@ Resources:
       Capacity:
         ProvisionedCapacity:
           McuCount:
-            Ref: ConnectorMcuCount
+            Ref: SinkMcuCount
           WorkerCount:
             Ref: ConnectorWorkerCount
       KafkaCluster:

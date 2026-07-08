@@ -5,6 +5,32 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.77
+
+### Fixed
+
+- **CDC survives a source reboot without manual intervention.** When the source
+  RDS/Aurora instance rebooted (maintenance patch, failover, instance-class change),
+  the Debezium source connector hit a retriable binlog error, restarted once, failed
+  the restart with "Error reading MySQL variables: Communications link failure"
+  (source still booting), and — because `errors.retry.timeout` defaulted to `0` (no
+  retry) — Kafka Connect **killed the task permanently** ("will not recover until
+  manually restarted"), a silent stall (`SourceRecordWriteRate=0`) needing a
+  Stop/Start to recover. The source connector now sets `errors.retry.timeout=600000`
+  (10 min) + `errors.retry.delay.max.ms=60000` — mirroring the sink — so it keeps
+  reattempting across the reboot window and resumes from the committed binlog offset
+  once the source is back (gapless, no human intervention). Observed and fixed after
+  a 2→8 vCPU source scale-up reboot on 2026-07-08.
+
+### Changed
+
+- **CDC: sink MCU is now sized separately from the source (`SinkMcuCount`).** The
+  sink became CPU-bound once the per-row round-trips were removed (plugin v16: ~80%
+  CPU / ~21,000 rows/s at 4 MCU), while the single-task source has spare CPU. A new
+  `SinkMcuCount` CFn parameter (default 4) lets the sink scale independently;
+  `ConnectorMcuCount` now applies to the source only. Measured: sink 4→8 MCU took
+  throughput ~21,000 → ~26,200 rows/s and CPU 80% → ~34%.
+
 ## v0.1.76
 
 ### Changed

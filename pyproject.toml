@@ -1,6 +1,6 @@
 [project]
 name = "mysql-dsql-migrator"
-version = "0.1.76"
+version = "0.1.77"
 description = "RDS/Aurora MySQL to Amazon Aurora DSQL migration toolkit"
 readme = "README.md"
 requires-python = ">=3.10"

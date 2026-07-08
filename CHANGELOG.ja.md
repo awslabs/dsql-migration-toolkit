@@ -5,6 +5,28 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.77
+
+### Fixed
+
+- **CDC がソースの再起動を手動介入なしで乗り切る。** ソースの RDS/Aurora インスタンスが再起動すると
+  (メンテナンスパッチ、フェイルオーバー、インスタンスクラス変更)、Debezium ソースコネクタが retriable な
+  binlog エラーに遭遇して 1 回再起動し、その再起動が "Error reading MySQL variables: Communications link
+  failure"(ソースがまだ起動中)で失敗するが、`errors.retry.timeout` が既定値 `0`(再試行なし)のため
+  Kafka Connect が **タスクを永久に停止**("will not recover until manually restarted")させていました —
+  サイレントストール(`SourceRecordWriteRate=0`)で、Stop/Start でしか回復できませんでした。ソースコネクタも
+  シンクと同様に `errors.retry.timeout=600000`(10 分)+ `errors.retry.delay.max.ms=60000` を設定し、
+  再起動ウィンドウの間ずっと再試行し、ソースが復帰するとコミット済み binlog オフセットから gapless に再開します
+  (人手不要)。2026-07-08 のソース 2→8 vCPU スケールアップ再起動で観測・修正。
+
+### Changed
+
+- **CDC: シンクの MCU をソースと分離して個別に指定 (`SinkMcuCount`)。** 行ごとの往復が除去された後、
+  シンクは CPU バウンドになり(プラグイン v16: 4 MCU で CPU ~80% / ~21,000 rows/s)、一方シングルタスクの
+  ソースは CPU に余裕があります。新しい `SinkMcuCount` CFn パラメータ(既定 4)でシンクを独立してスケール
+  でき、`ConnectorMcuCount` はソースのみに適用されるようになりました。測定: シンク 4→8 MCU でスループット
+  ~21,000 → ~26,200 rows/s、CPU 80% → ~34%。
+
 ## v0.1.76
 
 ### Changed

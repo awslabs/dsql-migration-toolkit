@@ -5,6 +5,27 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.77
+
+### 수정 (Fixed)
+
+- **CDC가 소스 재부팅을 수동 개입 없이 견딤.** 소스 RDS/Aurora 인스턴스가 재부팅되면(유지보수 패치,
+  페일오버, 인스턴스 클래스 변경) Debezium 소스 커넥터가 retriable binlog 에러를 만나 1회 재시작하고,
+  그 재시작이 "Error reading MySQL variables: Communications link failure"(소스가 아직 부팅 중)로
+  실패하는데, `errors.retry.timeout`이 기본값 `0`(재시도 안 함)이라 Kafka Connect가 **task를 영구
+  종료**("will not recover until manually restarted")시켰습니다 — 조용한 스톨(`SourceRecordWriteRate=0`),
+  Stop/Start로만 복구 가능. 이제 소스 커넥터도 sink처럼 `errors.retry.timeout=600000`(10분) +
+  `errors.retry.delay.max.ms=60000`을 설정해, 재부팅 구간 내내 재시도하다가 소스가 돌아오면 커밋된
+  binlog offset부터 gapless로 재개합니다(사람 개입 불필요). 2026-07-08 소스 2→8 vCPU 스케일업 재부팅에서
+  관측·수정.
+
+### 변경 (Changed)
+
+- **CDC: sink MCU를 source와 분리해 별도 지정 (`SinkMcuCount`).** 행당 왕복이 제거된 뒤 sink가 CPU
+  바운드가 됨(플러그인 v16: 4 MCU에서 CPU ~80% / ~21,000 rows/s)에 반해 단일 task인 source는 CPU 여유가
+  있습니다. 새 `SinkMcuCount` CFn 파라미터(기본 4)로 sink를 독립적으로 스케일; `ConnectorMcuCount`는 이제
+  source에만 적용. 측정: sink 4→8 MCU로 처리량 ~21,000 → ~26,200 rows/s, CPU 80% → ~34%.
+
 ## v0.1.76
 
 ### 변경 (Changed)
