@@ -19,6 +19,8 @@ deploy/
 # perf_compare.py which only compares reports locally) stays out to keep it lean.
 !scripts/measure_performance.py
 !scripts/_e2e_tables.py
+!scripts/cdc_throughput_test.py
+!scripts/cdc_workload_customers_sample_new.py
 .env
 .env.*
 *.log
