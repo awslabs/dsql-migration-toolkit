@@ -94,9 +94,13 @@ CLAUDE.md
 # read-only verification helpers are tracked (see scripts/README.md).
 scripts/*
 !scripts/_common.py
+!scripts/_e2e_tables.py
 !scripts/compare_rows.py
+!scripts/measure_performance.py
 !scripts/run_full_load.py
 !scripts/cdc_consistency_check.py
+!scripts/cdc_throughput_test.py
+!scripts/cdc_workload_customers_sample_new.py
 !scripts/README.md
 !scripts/README.ko.md
 
