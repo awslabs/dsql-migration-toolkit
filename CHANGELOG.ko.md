@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.75
+
+### 변경 (Changed)
+
+- **CDC 싱크: multi-row INSERT 재작성 (플러그인 `v15`) — 싱크 처리량 +30%.** 싱크의 JDBC URL이
+  이제 pgjdbc `reWriteBatchedInserts=true`를 활성화하여, 단일행 `INSERT` 묶음을 하나의 multi-row
+  `INSERT ... VALUES (..),(..) ON CONFLICT ..` 문장으로 접습니다 — N번의 execute 왕복이 1번으로.
+  DSQL은 지연 바운드라 이로써 측정 싱크 처리량이 ~1,500 → ~1,925 rows/s(8 파티션/태스크)로
+  올랐고, DSQL 적용 속도로 교차검증했습니다. 재작성을 안전하게 하기 위해 `applyChunkBatched`가 각
+  동일 SQL run을 PK별 마지막 행으로 먼저 dedup합니다(last-write-wins — 멱등, 순서 보존). 이것이
+  없으면 재작성된 multi-row `ON CONFLICT`가 중복 충돌 키를 거부합니다("cannot affect row a second
+  time"). 싱크 JAR 변경만(`PLUGIN_VERSION` → `v15`).
+
 ## v0.1.74
 
 ### 변경 (Changed)

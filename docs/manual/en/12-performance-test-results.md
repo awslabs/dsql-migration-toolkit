@@ -137,8 +137,9 @@ The connector-scaling knobs (partitions / `SinkTasksMax` / `ConnectorMcuCount`) 
 | 2: partitioned | 4 partitions / 4 tasks | ~550 | 5% | sink applied **one row per round-trip** | 1.9× |
 | 3: batched apply (**plugin v13**) | 4 partitions / 4 tasks | ~1,165 | 7% | source (under-tuned producer) | **4.0×** |
 | 4: source tuning (**plugin v14**) | 8 partitions / 8 tasks | ~1,500 | 6.5% | DSQL write contention | **5.1×** |
+| 5: multi-row rewrite (**plugin v15**) | 8 partitions / 8 tasks | ~1,925 | ~10% | DSQL write contention | **6.6×** |
 
-Two code/config changes did most of the work:
+Three code/config changes did most of the work:
 
 - **Plugin v13 — batched sink apply.** The sink coalesces each maximal run of
   consecutive same-SQL change events into one JDBC `executeBatch()` instead of a
@@ -151,11 +152,18 @@ Two code/config changes did most of the work:
   producer batches took the source from ~1,940 → **~31,000 rec/s (16×)**, proving
   the source was never the real ceiling — it was under-batched. This exposed the
   sink→DSQL write as the true final bottleneck.
+- **Plugin v15 — multi-row INSERT rewrite.** Enabling pgjdbc
+  `reWriteBatchedInserts=true` collapses each `executeBatch` into a single multi-row
+  `INSERT ... VALUES (..),(..) ON CONFLICT` — N execute round-trips → 1 — lifting the
+  sink from ~1,500 → **~1,925 rows/s (+30%)**. Made safe by deduping each same-SQL
+  run to one row per PK first (a rewritten multi-row `ON CONFLICT` rejects a
+  duplicate conflict key).
 
-At 8 partitions the sink reached ~1,500 rows/s (DSQL apply cross-checked at 1,484
-rows/s) — but scaling 4→8 gave only **~1.4× (sublinear)**: concurrent upserts to one
-table begin to contend inside DSQL. This is exactly why the smart default caps
-effective parallelism at 8.
+At 8 partitions the sink reached ~1,500 rows/s under v14 (DSQL apply cross-checked at
+1,484 rows/s) — but scaling 4→8 gave only **~1.4× (sublinear)**: concurrent upserts to
+one table begin to contend inside DSQL. This is exactly why the smart default caps
+effective parallelism at 8. The v15 rewrite then added another ~30% on the same 8
+partitions by cutting round-trips further, reaching ~1,925 rows/s.
 
 ---
 

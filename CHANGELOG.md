@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.75
+
+### Changed
+
+- **CDC sink: multi-row INSERT rewrite (plugin `v15`) — +30% sink throughput.** The
+  sink's JDBC URL now enables pgjdbc `reWriteBatchedInserts=true`, so a batch of
+  single-row `INSERT`s is collapsed into one multi-row
+  `INSERT ... VALUES (..),(..) ON CONFLICT ..` statement — turning N execute
+  round-trips into 1. Because DSQL is latency-bound, this lifted measured sink
+  throughput from ~1,500 to ~1,925 rows/s (8 partitions/tasks), cross-checked by
+  the DSQL apply rate. To make the rewrite safe, `applyChunkBatched` first dedupes
+  each same-SQL run to one row per primary key (last image wins — idempotent,
+  order-preserving); without it a rewritten multi-row `ON CONFLICT` would reject a
+  duplicate conflict key ("cannot affect row a second time"). Sink-jar change only
+  (`PLUGIN_VERSION` → `v15`).
+
 ## v0.1.74
 
 ### Changed

@@ -5,6 +5,20 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.75
+
+### Changed
+
+- **CDC シンク: マルチ行 INSERT リライト (プラグイン `v15`) — シンクスループット +30%。** シンクの
+  JDBC URL で pgjdbc `reWriteBatchedInserts=true` を有効化し、単一行 `INSERT` のバッチを 1 つの
+  マルチ行 `INSERT ... VALUES (..),(..) ON CONFLICT ..` 文にまとめます — N 回の execute 往復が
+  1 回に。DSQL はレイテンシバウンドなので、これにより測定シンクスループットが ~1,500 → ~1,925 rows/s
+  (8 パーティション/タスク) に向上し、DSQL 適用レートでクロスチェックしました。リライトを安全にする
+  ため、`applyChunkBatched` はまず各同一 SQL ランをプライマリキーごとの最終行に dedup します
+  (last-write-wins — 冪等・順序保持)。これがないと、リライトされたマルチ行 `ON CONFLICT` が重複する
+  競合キーを拒否します ("cannot affect row a second time")。シンク JAR の変更のみ
+  (`PLUGIN_VERSION` → `v15`)。
+
 ## v0.1.74
 
 ### Changed

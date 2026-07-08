@@ -48,6 +48,15 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v15 rebuilds the sink plugin to further cut DSQL round-trips (still the final,
+#    latency-bound bottleneck after v13/v14). Two coupled changes: (1) the JDBC
+#    URL enables reWriteBatchedInserts=true, so pgjdbc collapses a batch of
+#    single-row INSERTs into ONE multi-row "INSERT ... VALUES (..),(..) ON CONFLICT"
+#    statement (N execute round-trips -> 1); (2) applyChunkBatched first dedupes
+#    each same-SQL run to one row per PK (last image wins -- idempotent,
+#    order-preserving), which is what makes the rewrite SAFE (a rewritten multi-row
+#    ON CONFLICT rejects a duplicate conflict key: "cannot affect row a second
+#    time"). Sink-jar change only.
 # v14 tunes the SOURCE for throughput (the bottleneck moved to the source after
 #    v13: ~2,000 rec/s at ~12% CPU = produce/queue-bound, not binlog-parse-bound).
 #    The source WorkerConfiguration now sets producer.batch.size / producer.linger.ms
@@ -125,7 +134,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v14"
+PLUGIN_VERSION = "v15"
 
 
 class S3ProvisionError(RuntimeError):

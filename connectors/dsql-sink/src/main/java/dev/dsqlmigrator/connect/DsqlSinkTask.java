@@ -122,9 +122,16 @@ public class DsqlSinkTask extends SinkTask {
     if (connection != null && !connection.isClosed() && connection.isValid(2)) {
       return connection;
     }
+    // reWriteBatchedInserts=true: pgjdbc collapses a batch of single-row INSERTs
+    // into one multi-row "INSERT ... VALUES (..),(..),.. ON CONFLICT .." statement,
+    // turning N execute round-trips into 1. DSQL is latency-bound, so this is a
+    // large win on top of executeBatch's pipelining. It is SAFE here only because
+    // applyChunkBatched dedupes each same-SQL run to one row per PK first: a
+    // rewritten multi-row upsert with a duplicate conflict key would otherwise fail
+    // with "ON CONFLICT DO UPDATE command cannot affect row a second time".
     String url =
         String.format(
-            "jdbc:postgresql://%s:5432/%s?sslmode=require",
+            "jdbc:postgresql://%s:5432/%s?sslmode=require&reWriteBatchedInserts=true",
             config.clusterEndpoint(), config.database());
     Properties props = new Properties();
     props.setProperty("user", config.username());
@@ -300,12 +307,19 @@ public class DsqlSinkTask extends SinkTask {
     while (i < chunk.size()) {
       String sql = renderSql(chunk.get(i).event());
       int end = runEnd(chunk, i); // exclusive end of the maximal same-SQL run
+      // Dedupe the run to the LAST event per PK. Within one same-SQL run every
+      // event is the same kind (all upsert or all delete) on the same table, so
+      // collapsing repeated PKs to their final image is apply-equivalent (the
+      // last write wins under ON CONFLICT / PK delete) AND order-preserving. This
+      // is what makes reWriteBatchedInserts safe: the rewritten multi-row upsert
+      // can never carry a duplicate conflict key.
+      List<Applicable> run = dedupeRunByPk(chunk, i, end);
       try (PreparedStatement ps = conn.prepareStatement(sql)) {
-        for (int j = i; j < end; j++) {
-          bind(ps, chunk.get(j).event());
+        for (Applicable a : run) {
+          bind(ps, a.event());
           ps.addBatch();
         }
-        if (end - i == 1) {
+        if (run.size() == 1) {
           ps.executeUpdate();
         } else {
           ps.executeBatch();
@@ -313,6 +327,32 @@ public class DsqlSinkTask extends SinkTask {
       }
       i = end;
     }
+  }
+
+  /**
+   * Collapse a same-SQL run {@code chunk[start, end)} to one entry per primary key,
+   * keeping the LAST occurrence (its final after-image / delete). Preserves the
+   * relative order of the surviving rows. Pure and package-private for unit tests.
+   *
+   * <p>Correctness: a run is a maximal block of consecutive events that render to
+   * identical SQL, so all are the same operation kind on the same table. Applying
+   * only the last write for a PK is equivalent to applying every write in order
+   * because the apply is idempotent last-write-wins (ON CONFLICT upsert / PK
+   * delete). Deduping here is REQUIRED for {@code reWriteBatchedInserts}: a
+   * rewritten multi-row {@code ON CONFLICT} rejects a duplicate conflict key
+   * ("cannot affect row a second time").
+   */
+  static List<Applicable> dedupeRunByPk(List<Applicable> chunk, int start, int end) {
+    // LinkedHashMap keyed by PK: a re-put keeps the key's FIRST-seen position but
+    // overwrites the value, so each surviving row is the LAST image for its PK and
+    // the run's relative order is preserved. (Order among distinct PKs is in fact
+    // apply-irrelevant within a same-SQL run, but keeping it stable is clearer.)
+    java.util.LinkedHashMap<List<Object>, Applicable> byPk = new java.util.LinkedHashMap<>();
+    for (int j = start; j < end; j++) {
+      Applicable a = chunk.get(j);
+      byPk.put(a.event().pkValues(), a);
+    }
+    return new ArrayList<>(byPk.values());
   }
 
   /**

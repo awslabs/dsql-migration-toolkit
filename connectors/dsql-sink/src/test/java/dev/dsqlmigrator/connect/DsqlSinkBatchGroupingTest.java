@@ -98,4 +98,53 @@ class DsqlSinkBatchGroupingTest {
     List<DsqlSinkTask.Applicable> chunk = List.of(delete("orders"), delete("orders"));
     assertEquals(List.of(2), runLengths(chunk));
   }
+
+  // --- dedupeRunByPk: required for safe reWriteBatchedInserts -----------------
+
+  private static DsqlSinkTask.Applicable upsertPk(int pk, int amt) {
+    return new DsqlSinkTask.Applicable(
+        null,
+        ChangeEvent.upsert(
+            "orders", List.of("id", "amt"), List.of(pk, amt), List.of("id"), List.of(pk)));
+  }
+
+  private static List<Object> pkOf(DsqlSinkTask.Applicable a) {
+    return a.event().pkValues();
+  }
+
+  @Test
+  void dedupeKeepsLastImagePerPkAndPreservesOrder() {
+    // pk 1 appears twice (amt 10 then 30), pk 2 once. Expect [pk1=30, pk2=20] --
+    // last write for pk1 wins, order of surviving rows preserved.
+    List<DsqlSinkTask.Applicable> chunk =
+        List.of(upsertPk(1, 10), upsertPk(2, 20), upsertPk(1, 30));
+    List<DsqlSinkTask.Applicable> out = DsqlSinkTask.dedupeRunByPk(chunk, 0, chunk.size());
+    assertEquals(2, out.size());
+    assertEquals(List.of(1), pkOf(out.get(0)));
+    assertEquals(30, out.get(0).event().values().get(1)); // last amt for pk 1
+    assertEquals(List.of(2), pkOf(out.get(1)));
+  }
+
+  @Test
+  void dedupeNoDuplicatesIsIdentity() {
+    // The perf-test workload: distinct auto-increment PKs -> dedup is a no-op.
+    List<DsqlSinkTask.Applicable> chunk =
+        List.of(upsertPk(1, 10), upsertPk(2, 20), upsertPk(3, 30));
+    List<DsqlSinkTask.Applicable> out = DsqlSinkTask.dedupeRunByPk(chunk, 0, chunk.size());
+    assertEquals(3, out.size());
+    assertEquals(List.of(1), pkOf(out.get(0)));
+    assertEquals(List.of(2), pkOf(out.get(1)));
+    assertEquals(List.of(3), pkOf(out.get(2)));
+  }
+
+  @Test
+  void dedupeHonorsStartEndWindow() {
+    // Only [1,3) is deduped: index 0 (pk 1) is outside the window and untouched.
+    List<DsqlSinkTask.Applicable> chunk =
+        List.of(upsertPk(1, 10), upsertPk(2, 20), upsertPk(2, 25));
+    List<DsqlSinkTask.Applicable> out = DsqlSinkTask.dedupeRunByPk(chunk, 1, 3);
+    assertEquals(1, out.size());
+    assertEquals(List.of(2), pkOf(out.get(0)));
+    assertEquals(25, out.get(0).event().values().get(1));
+  }
 }
