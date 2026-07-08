@@ -167,8 +167,8 @@ Parameters:
   ContainerCpu:
     Type: Number
     Default: 512
-    AllowedValues: [256, 512, 1024, 2048, 4096]
-    Description: Fargate task CPU units.
+    AllowedValues: [256, 512, 1024, 2048, 4096, 8192, 16384]
+    Description: Fargate task CPU units (8192 = 8 vCPU, 16384 = 16 vCPU).
 
   ContainerMemory:
     Type: Number

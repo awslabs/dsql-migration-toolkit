@@ -56,7 +56,9 @@ COPY deploy/cdc-stack/cdc-stack.yaml ./deploy/cdc-stack/cdc-stack.yaml
 # measure_performance.py imports _e2e_tables at runtime, so both must be present.
 # perf_compare.py is NOT bundled: it only compares saved reports and runs locally
 # on the recovered JSONs (deploy/run_measure_on_fargate.sh), never in-container.
-COPY scripts/measure_performance.py scripts/_e2e_tables.py ./scripts/
+COPY scripts/measure_performance.py scripts/_e2e_tables.py \
+     scripts/cdc_throughput_test.py scripts/cdc_workload_customers_sample_new.py \
+     ./scripts/
 
 
 FROM public.ecr.aws/docker/library/python:3.12-slim AS runtime
