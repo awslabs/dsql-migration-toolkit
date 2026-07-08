@@ -28,7 +28,7 @@ section h2 { font-size: 34px; }
 # MySQL to DSQL Migrator
 ## Migration Architecture & Data Path Deep Dive
 
-Speaker: dalyoung@ · 2026-07-06
+Speaker: dalyoung@ · 2026-07-08
 
 Gitlab - https://gitlab.aws.dev/dalyoung/mysql-dsql-migration-tool-public
 
@@ -250,8 +250,11 @@ WHERE pk > :last ORDER BY pk LIMIT 1000        -- composite PK uses row-value tu
 **Deterministic resume**: rows stream in keyset (PK) order → **batch i = always the same PK range**
 → a batch is a stable resume unit. Stop/retry re-runs **only the unfinished ranges** (no dupes)
 
-**Parallelism model**: `table_parallelism` (default 4, ≤16) × `batch_parallelism` (default 8, ≤32)
-→ concurrent DSQL connections ≈ 4×8=32 (well within the 10,000-conn / 100-new-per-sec cluster limits)
+**Parallelism model (v0.1.68+): multi-process — not threads**
+- `table_parallelism` (worker processes, default 4 · match to vCPU) × `batch_parallelism` (DSQL connections inside a process, default 8)
+- **`ProcessPoolExecutor`**: each table (or shard) runs in **its own OS process = its own GIL and CPU core**
+- **Large single-integer-PK tables → auto-split into PK-range shards**, scheduled alongside whole-table workers in one pool
+- concurrent DSQL connections ≈ table_par × batch_par (well within the 10,000-conn / 100-new-per-sec cluster limits)
 
 **OCC retry is per-statement** (not the whole batch)
 - 40001 (OC000 data / OC001 schema) → retry **only the conflicting `INSERT`** with backoff+jitter, up to 10×
@@ -269,32 +272,58 @@ WHERE pk > :last ORDER BY pk LIMIT 1000        -- composite PK uses row-value tu
 
 ---
 
-# Full Load performance — what we learned by measuring
+# Full Load performance — the GIL wall and breaking it (measured)
 
-**Key finding: CPU-bound, not network-bound**
-- The source reader converts MySQL→DSQL types per row in **pure Python (holds the GIL, Global Interpreter Lock)**
-- payments+orders measured: **4 vCPU is ~3.8× faster than 0.5 vCPU (512)**
+**Finding #1: CPU-bound, not network-bound**
+- The source reader converts MySQL→DSQL types per row in **pure Python (holds the GIL)**
+- ThreadPool era: CPU pinned at **~110% (1 core) on any vCPU** = the GIL signature. Reader sharding (threads) also **~0%**
 
-**The GIL wall**: reader sharding (K reader threads) still can't push conversion past ~1 core
-→ `reader_shards=4` gave **~0%** vs a single reader on in-VPC 4 vCPU (so it's off by default)
+**Breakthrough #2: multi-process (v0.1.68) — `ThreadPool → ProcessPoolExecutor`**
+- Each table/shard gets **its own process = its own GIL and core**. Large integer-PK tables **auto-split into PK-range shards**
 
-**prefetch queue** (reader reads the next page ahead): **~+19%** on in-VPC 4 vCPU
+| Approach (8 vCPU Fargate) | rows/s | CPU | 200GB estimate |
+|---|---|---|---|
+| ThreadPool (v0.1.67, prior) | 12,277 | 110% | ~12 h |
+| ProcessPool, 4 tables mixed, tp=8 | **34,800** | 561% | ~5 h |
+| ProcessPool, single large table sharded, tp=8 | **51,000** | 777% | **~2.5 h (18×)** |
+
+→ **Optimal setting: `table_parallelism = vCPU count`** (the loader auto-shards large tables)
+→ Around tp=8 the bottleneck moves from **CPU → DSQL server write capacity** (~67K rows/s peak)
+
+<!--
+- This is the biggest update since the last tech-talk. It used to end at "the GIL is the wall, just add CPU" — now multi-process breaks that wall.
+- Core narrative: threads can't use the vCPUs because of the GIL → each process has its own GIL so cores are actually used → 18× (200GB 46h→2.5h).
+- Uses the spawn context; each worker builds its own MySQL engine + DSQL connection pool (no inter-process row transfer). Test doubles auto-use the thread fallback (backward-compatible).
+- Replace path: for an empty table, plain INSERT (no ON CONFLICT) removes OCC contention → 41K–51K sustained, 67K peak.
+-->
+
+---
+
+# Parallelism is a throttle, not a throughput dial — the OCC guardrail
+
+**Once multi-process clears the CPU wall, the next wall is OCC (server write contention)**
 
 **Parallelism guardrail (measured)**: doubling to 128 connections (32→128) → only **+5%** throughput,
 while the retried-batch rate rose **9.6%→12.8%** (a monotonic PK piles writes into the same key range)
-→ **fix the PK strategy before blindly raising parallelism**
+
+**OCC storm**: many concurrent writers + an **already-populated** target + `ON CONFLICT` → livelock risk
+(observed: CPU maxed, zero progress). **Fix**: plain `INSERT` into an empty target; on the replace path DROP+recreate first
+
+**Source load** is a separate lever: `table_parallelism` = concurrent source-read pressure → start low (2–4), ramp with headroom
+
+→ In short, bottlenecks surface in layers: **① CPU (solved by multi-process) → ② OCC (PK strategy · empty target) → ③ IAM token / TLS cold-start**
 
 <!--
-- The most interesting slide for DB experts. Treat parallelism as "a throttle, not a throughput dial."
-- Memory ≈ table_par × batch_par × ~8 MiB (independent of table size). The Fargate CPU/memory pairing (4 vCPU→≥8 GiB) already covers it.
-- Bridge to CDC: this CPU-bound finding leads to the closing "hot partition isn't always the bottleneck" slide.
+- The old "parallelism +5%, retries 9.6→12.8%" measurement still holds — it's now repositioned as the story *after* clearing the CPU wall.
+- The OCC storm is a real landmine we hit when adding multi-process: 32 writers ON CONFLICT into a populated target → 8+ min at 0 rows. Fixed by plain INSERT into an empty target.
+- Memory ≈ table_par × batch_par × ~8 MiB (independent of table size). The Fargate CPU/memory pairing (8 vCPU→16 GiB) already covers it.
 -->
 
 ---
 
 # Performance case study — Composite PK A/B (in-VPC, measured)
 
-**Experiment**: `orders`+`payments`, prefetch ON, only the PK strategy varies → keep (integer) vs composite `(customer_id, id)`
+**Experiment**: `orders`+`payments`, only the PK strategy varies → keep (integer) vs composite `(customer_id, id)`
 (orders = treatment / payments has no `customer_id` so keeps its integer PK = control)
 
 | Condition | keep overall rows/s | composite overall rows/s | CPU |
@@ -302,16 +331,15 @@ while the retried-batch rate rose **9.6%→12.8%** (a monotonic PK piles writes 
 | **0.5 vCPU · bp8** | 4,270 | 4,243 (**0.99x**) | ~50% (1-core wall) |
 | **4 vCPU · bp16** | **10,055** | **10,088 (1.00x)** | 109~111% |
 
-- **8× CPU → ~2.4× throughput** (4,270 → 10,055). **CPU is the clear bottleneck** → raising vCPU is the practical lever
-- **composite made no difference in either condition.** DSQL `CommitLatency`: both **p50 ~47ms · p99 60~120ms** → **no hot-partition long tail** (server writes never became the bottleneck)
+- **composite made no difference in either condition.** DSQL `CommitLatency`: both **p50 ~47ms · p99 60~120ms** → **no hot-partition long tail**
+- This A/B was measured in the **thread (single-process)** era → the wall was client CPU, so the server-distribution lever (composite) had nothing to gain
 
-> **Lesson: measure the bottleneck before optimizing.** This workload's wall was **client CPU**, not server writes. Composite (a server-distribution lever) had nothing to fix, so gain = 0 — the feature works correctly (apply/skip/no-loss verified). Composite only pays off under much higher write concurrency or a genuine monotonic-PK hotspot.
+> **Lesson: measure the bottleneck before optimizing.** This workload's wall was **client CPU**, not server writes. So the answer wasn't composite — it was **multi-process (breaking the CPU wall)**. Composite only pays off under much higher write concurrency or a genuine monotonic-PK hotspot.
 
 <!--
-- This is our own measurement this week. The control (payments) moved identically to the treatment (orders) → not environment noise, a genuine no-effect.
-- Key point: composite PK is worth it "when the hot partition is the actual bottleneck." Here p99 is a stable 120ms → the server isn't the bottleneck → the GIL/CPU is the wall.
-- Where composite shines: (a) after first removing the client CPU bottleneck, (b) at much higher write concurrency where a monotonic PK heats one partition.
-- Side note: both runs hit an SSL EOF near the end failing 8/8964 batches (~0.09%) → room to add transient reconnect to the loader (follow-up).
+- Make clear this A/B predates multi-process (thread era) — that's why CPU was the wall, and the real fix for that wall was the later multi-process work.
+- The control (payments) moved identically to the treatment (orders) → not environment noise, a genuine no-effect.
+- Where composite shines: (a) after first removing the client CPU bottleneck (via multi-process), (b) at much higher write concurrency where a monotonic PK heats one partition.
 -->
 
 ---
@@ -456,18 +484,19 @@ Full Load/watermark row counts are **scan-free estimates** (to spare the source)
 **But — the hot partition isn't always the bottleneck (measured)**
 - keep vs composite A/B (orders+payments): **no throughput difference at either 0.5 vCPU·bp8 or 4 vCPU·bp16 (0.99~1.00x)**
 - DSQL CommitLatency: both **p50 ~47ms / p99 60~120ms** — no multi-second hot-partition long tail
-- The bottleneck is **client CPU, not server writes** (§Full Load). 8× CPU gives 2.4× throughput, yet DSQL still has headroom → composite gain = 0
+- The bottleneck is **client CPU, not server writes** (§Full Load) → the real fix wasn't composite, it was **multi-process** (breaking the GIL wall, 18×)
+- Only after multi-process clears the CPU wall and you push to tp=8 does the bottleneck move to **DSQL server writes** — that's when composite starts to pay off
 
 **Composite PK's real cost: the application's queries change**
 - Once the PK is `(customer_id, id)`, the app's reads/joins/**upserts must use the new composite key**, and the leading column must be **immutable**
 - A separate `UNIQUE INDEX ASYNC` is needed to preserve the original key's uniqueness; CDC needs `message.key.columns` re-keying
 
-> **Conclusion**: a hot-partition remedy (changing the PK) is worth it **only when you actually hit the server write wall**. Measure the bottleneck first (client vs server), and weigh composite together with its **query-change cost**.
+> **Conclusion**: bottlenecks come in layers — **CPU (solved by multi-process) → OCC/hot partition → server writes**. A hot-partition remedy (changing the PK) is worth it **only after you clear the CPU wall and actually hit the server write wall**. Measure first, and weigh composite together with its **query-change cost**.
 
 <!--
-- This is the honest diagnosis from this week's measurement. The composite PK feature works correctly (apply/skip/no-loss verified), but the gain was 0 in this workload — because the bottleneck was client CPU, not the server.
-- Message: "hot partitions are real, but measure before applying a remedy. And composite PK isn't free — app queries change."
-- Where composite shines: (a) after first removing the client CPU bottleneck, or (b) at much higher write concurrency where a monotonic PK heats a partition.
+- Honest diagnosis: the composite PK feature works correctly but gained 0 in this workload — because the bottleneck was client CPU, not the server. The real fix for that GIL wall was multi-process (18×).
+- Message: "hot partitions are real, but measure before applying a remedy. Bottlenecks layer as CPU→OCC→server writes. And composite PK isn't free — app queries change."
+- Where composite shines: (a) after removing the client CPU bottleneck via multi-process, (b) at much higher write concurrency where a monotonic PK heats a partition.
 -->
 
 ---
@@ -499,7 +528,7 @@ Full Load/watermark row counts are **scan-free estimates** (to spare the source)
 
 **Three-line summary**
 1. Heterogeneous migration — deterministic-first, surfaces where human work is needed
-2. Full Load (streaming bulk, CPU-bound) + CDC (custom sink, statement-OCC, gapless) → DSQL
+2. Full Load (streaming bulk, **multi-process to bypass the GIL → 200GB 46h→2.5h, 18×**) + CDC (custom sink, statement-OCC, gapless) → DSQL
 3. Loud failure over silent loss — credentials in memory only, verdict only in Validation
 
 <!--

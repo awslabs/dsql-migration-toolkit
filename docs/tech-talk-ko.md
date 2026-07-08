@@ -28,7 +28,7 @@ section h2 { font-size: 34px; }
 # MySQL to DSQL Migrator
 ## Migration Architecture & Data Path Deep Dive
 
-발표자: dalyoung@ · 2026-07-06
+발표자: dalyoung@ · 2026-07-08
 
 Gitlab - https://gitlab.aws.dev/dalyoung/mysql-dsql-migration-tool-public
 
@@ -251,8 +251,11 @@ WHERE pk > :last ORDER BY pk LIMIT 1000        -- 복합 PK는 행-값 튜플 �
 **결정론적 재개**: 행이 keyset(PK) 순서로 흐름 → **배치 i = 항상 같은 PK 범위**
 → 배치가 안정적 재개 단위. 중단/재시도는 **미완료 범위만** 재실행(중복 없음)
 
-**병렬 모델**: `table_parallelism`(기본4,≤16) × `batch_parallelism`(기본8,≤32)
-→ 동시 DSQL 연결 ≈ 4×8=32 (클러스터 한도 10,000연결·100신규/초 내 여유)
+**병렬 모델 (v0.1.68~): 멀티프로세스 — 스레드 아님**
+- `table_parallelism`(worker 프로세스 수, 기본4·vCPU에 맞춤) × `batch_parallelism`(프로세스 내 DSQL 연결, 기본8)
+- **`ProcessPoolExecutor`**: 테이블(또는 shard)마다 **자체 OS 프로세스 = 자체 GIL·CPU 코어**
+- **대형 단일 정수 PK 테이블 → PK 범위 shard로 자동 분할**, whole-table worker와 통합 풀에서 함께 스케줄
+- 동시 DSQL 연결 ≈ table_par × batch_par (클러스터 한도 10,000연결·100신규/초 내 여유)
 
 **OCC 재시도는 statement 단위** (배치 전체 아님)
 - 40001(OC000 데이터/OC001 스키마) → 충돌한 `INSERT` **문 하나만** 백오프+지터 최대 10회
@@ -270,32 +273,58 @@ WHERE pk > :last ORDER BY pk LIMIT 1000        -- 복합 PK는 행-값 튜플 �
 
 ---
 
-# Full Load 성능 — 실측으로 배운 것
+# Full Load 성능 — GIL 벽과 그 돌파 (실측)
 
-**핵심 발견: 네트워크가 아니라 CPU-bound**
-- 소스 리더가 행마다 MySQL→DSQL 타입 변환을 **순수 Python(GIL, Global Interpreter Lock 점유)**으로 수행
-- payments+orders 실측: **4 vCPU가 0.5 vCPU(512) 대비 ~3.8배**
+**1단계 발견: 네트워크가 아니라 CPU-bound**
+- 소스 리더가 행마다 MySQL→DSQL 타입 변환을 **순수 Python(GIL 점유)**으로 수행
+- ThreadPool 시절: 어떤 vCPU에서든 CPU **~110%(1코어) 고정** = GIL 서명. reader 샤딩(스레드)도 **~0%**
 
-**GIL 벽**: reader 샤딩(K개 리더 스레드)도 변환은 ~1코어 못 넘음
-→ `reader_shards=4`가 in-VPC 4vCPU에서 단일 리더 대비 **~0%** (그래서 기본 꺼짐)
+**2단계 돌파: 멀티프로세스 (v0.1.68) — `ThreadPool → ProcessPoolExecutor`**
+- 테이블/shard마다 **자체 프로세스 = 자체 GIL·자체 코어**. 대형 정수-PK 테이블은 **PK 범위 shard 자동 분할**
 
-**prefetch 큐**(리더가 다음 페이지 미리 읽음): in-VPC 4vCPU **~+19%**
+| 접근 (8 vCPU Fargate) | rows/s | CPU | 200GB 예상 |
+|---|---|---|---|
+| ThreadPool (v0.1.67, 기존) | 12,277 | 110% | ~12시간 |
+| ProcessPool, 4테이블 혼합, tp=8 | **34,800** | 561% | ~5시간 |
+| ProcessPool, 단일 대형 테이블 shard, tp=8 | **51,000** | 777% | **~2.5시간 (18×)** |
+
+→ **최적 설정: `table_parallelism = vCPU 수`** (로더가 대형 테이블을 자동 shard)
+→ tp=8 부근에서 병목이 **CPU → DSQL 서버 write 용량**으로 이동 (~67K rows/s peak)
+
+<!--
+- 이 슬라이드가 tech-talk 이후 가장 큰 업데이트. 예전엔 "GIL이 벽, CPU만 올려라"에서 끝났지만, 이제 멀티프로세스로 그 벽을 넘었다.
+- 핵심 서사: 스레드로는 GIL 때문에 vCPU를 못 쓴다 → 프로세스마다 GIL이 따로이므로 코어를 실제로 다 쓴다 → 18× (200GB 46h→2.5h).
+- spawn context 사용, 각 worker가 자체 MySQL engine + DSQL 연결 풀 구축(프로세스 간 행 전송 없음). 테스트 더블은 스레드 폴백 자동 사용(하위호환).
+- Replace 경로: 빈 테이블엔 plain INSERT(ON CONFLICT 없음)로 OCC 경합 제거 → 41K~51K sustained, 67K peak.
+-->
+
+---
+
+# 병렬수는 처리량 다이얼이 아니라 스로틀 — OCC 가드레일
+
+**멀티프로세스로 CPU 벽을 넘은 뒤, 다음 벽은 OCC(서버 write 경합)**
 
 **병렬수 가드레일 (실측)**: 32→128 연결로 2배 → 처리량 **+5%만**,
 재시도 배치 비율 **9.6%→12.8%** (단조 PK가 같은 키 범위로 몰림)
-→ **병렬수 무작정 올리기보다 PK 전략을 먼저**
+
+**OCC storm**: 동시 writer 多 + **이미 데이터 있는** 타깃 + `ON CONFLICT` → livelock 위험
+(관측: CPU 폭주하는데 진행 0). **처방**: 빈 타깃엔 plain `INSERT`, replace 경로는 DROP+recreate 먼저
+
+**소스 부하**는 별개 레버: `table_parallelism`이 동시 소스 읽기 압력 → 낮게 시작(2~4), 여유 보며 램프
+
+→ 정리: **① CPU (멀티프로세스로 해소) → ② OCC (PK 전략·빈 타깃) → ③ IAM 토큰/TLS 콜드스타트** 순서로 병목이 드러남
 
 <!--
-- 이 슬라이드가 DB 전문가에게 가장 흥미로울 부분. "병렬수는 처리량 다이얼이 아니라 스로틀"로 다뤄라.
-- 메모리는 table_par × batch_par × ~8 MiB (테이블 크기 무관). Fargate CPU/메모리 짝(4vCPU→≥8GiB)이 이미 충족.
-- 다음 CDC로 넘어가는 다리: 이 CPU-bound 발견이 "핫 파티션이 항상 병목은 아니다"라는 마지막 슬라이드 고민으로 이어짐.
+- 예전 "병렬수 +5%, 재시도 9.6→12.8%" 실측은 그대로 유효 — 다만 이제 CPU 벽을 넘은 *뒤의* 이야기로 위치가 바뀜.
+- OCC storm은 멀티프로세스 도입 때 실제로 밟은 지뢰: 32 writer가 populated 타깃에 ON CONFLICT → 8분+ 0행. 빈 타깃 plain INSERT로 해결.
+- 메모리는 table_par × batch_par × ~8 MiB (테이블 크기 무관). Fargate CPU/메모리 짝(8vCPU→16GiB)이 이미 충족.
 -->
 
 ---
 
 # 성능 케이스 스터디 — Composite PK A/B (in-VPC 실측)
 
-**실험**: `orders`+`payments`, prefetch ON, PK 전략만 변경 → keep(정수) vs composite `(customer_id, id)`
+**실험**: `orders`+`payments`, PK 전략만 변경 → keep(정수) vs composite `(customer_id, id)`
 (orders=처리군 / payments는 `customer_id` 없어 정수 PK 유지=대조군)
 
 | 조건 | keep 전체 rows/s | composite 전체 rows/s | CPU |
@@ -303,16 +332,15 @@ WHERE pk > :last ORDER BY pk LIMIT 1000        -- 복합 PK는 행-값 튜플 �
 | **0.5 vCPU · bp8** | 4,270 | 4,243 (**0.99x**) | ~50% (1코어 벽) |
 | **4 vCPU · bp16** | **10,055** | **10,088 (1.00x)** | 109~111% |
 
-- **CPU 8배 → 처리량 ~2.4배** (4,270 → 10,055). **CPU가 확실한 병목** → vCPU 상향이 실무 레버
-- **composite는 두 조건 모두 0% 차이.** DSQL `CommitLatency`: 양쪽 **p50 ~47ms · p99 60~120ms** → **핫 파티션 롱테일 없음** (서버 쓰기가 병목에 도달 못 함)
+- **composite는 두 조건 모두 0% 차이.** DSQL `CommitLatency`: 양쪽 **p50 ~47ms · p99 60~120ms** → **핫 파티션 롱테일 없음**
+- 이 A/B는 **스레드(단일 프로세스)** 시절 실측 → 병목이 클라 CPU라 서버 분산 레버(composite)는 이득 0
 
-> **교훈: 최적화 전에 병목을 측정하라.** 이 워크로드의 벽은 서버 쓰기가 아니라 **클라이언트 CPU**였다. composite(서버 분산 레버)는 고칠 서버 병목이 없어 이득 0 — 기능은 정상(적용/skip/무손실 확인). composite는 훨씬 높은 write 동시성·진짜 단조-PK 핫스팟에서만 값어치.
+> **교훈: 최적화 전에 병목을 측정하라.** 이 워크로드의 벽은 서버 쓰기가 아니라 **클라이언트 CPU**였다. 그래서 답은 composite가 아니라 **멀티프로세스(CPU 벽 돌파)**였다. composite는 훨씬 높은 write 동시성·진짜 단조-PK 핫스팟에서만 값어치.
 
 <!--
-- 이건 이번 주 직접 돌린 실측. 대조군(payments)이 처리군(orders)과 똑같이 0.99x → 환경 노이즈가 아니라 진짜 무효과.
-- 핵심: composite PK는 "핫 파티션이 실제 병목일 때" 값어치. 여기선 p99가 120ms로 안정 → 서버가 병목이 아님 → GIL이 벽.
-- composite가 빛나는 조건: (a) 클라 GIL 병목을 먼저 해소한 뒤, (b) 훨씬 높은 write 동시성에서 monotonic PK가 파티션을 달굴 때.
-- 부수 관찰: 양쪽 run 끝에 SSL EOF로 8/8964 배치(~0.09%) 실패 → 로더에 transient 재연결 추가 여지(후속 과제).
+- 이 A/B는 멀티프로세스 이전(스레드) 측정이라는 점을 명확히 — 그래서 CPU가 벽이었고, 그 벽의 진짜 해법이 이후의 멀티프로세스였다는 서사로 연결.
+- 대조군(payments)이 처리군(orders)과 똑같이 0.99x → 환경 노이즈가 아니라 진짜 무효과.
+- composite가 빛나는 조건: (a) 클라 CPU 병목을 (멀티프로세스로) 먼저 없앤 뒤, (b) 훨씬 높은 write 동시성에서 monotonic PK가 파티션을 달굴 때.
 -->
 
 ---
@@ -457,18 +485,19 @@ Full Load/워터마크 행 수는 **스캔 없는 추정**(소스 아끼려고).
 **그런데 — 핫 파티션이 항상 병목은 아니다 (실측)**
 - keep vs composite A/B(orders+payments): **0.5 vCPU·bp8도, 4 vCPU·bp16도 처리량 차이 없음(0.99~1.00x)**
 - DSQL CommitLatency: 양쪽 **p50 ~47ms / p99 60~120ms** — 수 초짜리 핫 파티션 롱테일 **없음**
-- 병목은 **서버 쓰기가 아니라 클라이언트 CPU**(§Full Load). CPU 8배 주면 처리량 2.4배지만, DSQL은 여전히 여유 → composite 이득 0
+- 병목은 **서버 쓰기가 아니라 클라이언트 CPU**(§Full Load) → 진짜 해법은 composite가 아니라 **멀티프로세스**(GIL 벽 돌파, 18×)였다
+- 멀티프로세스로 CPU 벽을 넘고 tp=8까지 밀어야 비로소 병목이 **DSQL 서버 write**로 이동 — composite는 그때부터 값어치
 
 **복합 PK의 진짜 비용: 애플리케이션 쿼리가 바뀐다**
 - PK가 `(customer_id, id)`가 되면 앱의 조회·조인·**upsert가 새 복합 키를 써야 함**, 선행 컬럼은 **불변**이어야 함
 - 원본 키 유일성 보존 위해 `UNIQUE INDEX ASYNC` 별도 필요, CDC는 `message.key.columns` 재키잉 필요
 
-> **결론**: 핫 파티션 대책(PK 변경)은 **서버 쓰기 벽에 실제로 부딪힐 때** 값어치가 있다. 먼저 병목을 측정하고(클라 vs 서버), composite는 **쿼리 변경 비용**과 함께 판단하라.
+> **결론**: 병목은 층으로 온다 — **CPU(멀티프로세스로 해소) → OCC/핫 파티션 → 서버 write**. 핫 파티션 대책(PK 변경)은 **CPU 벽을 넘고 서버 쓰기 벽에 실제로 부딪힐 때** 값어치가 있다. 먼저 측정하고, composite는 **쿼리 변경 비용**과 함께 판단하라.
 
 <!--
-- 이건 이번 주 실측에서 나온 정직한 진단. composite PK 기능은 정상 동작(적용/skip/무손실 확인)하지만, 이 워크로드에선 이득이 0이었다 — 왜냐면 병목이 서버가 아니라 클라이언트 GIL이었기 때문.
-- 메시지: "핫 파티션은 실재하지만, 대책을 넣기 전에 측정하라. 그리고 복합 PK는 공짜가 아니다 — 앱 쿼리가 바뀐다."
-- composite가 빛나는 조건: (a) 클라 GIL 병목을 먼저 없앤 뒤, 또는 (b) 훨씬 높은 write 동시성에서 monotonic PK가 파티션을 달굴 때.
+- 정직한 진단: composite PK 기능은 정상 동작하지만 이 워크로드에선 이득 0이었다 — 병목이 서버가 아니라 클라이언트 GIL이었기 때문. 그 GIL 벽의 진짜 해법이 멀티프로세스(18×)였다.
+- 메시지: "핫 파티션은 실재하지만, 대책을 넣기 전에 측정하라. 병목은 CPU→OCC→서버 write 순으로 층을 이룬다. 그리고 복합 PK는 공짜가 아니다 — 앱 쿼리가 바뀐다."
+- composite가 빛나는 조건: (a) 멀티프로세스로 클라 CPU 병목을 먼저 없앤 뒤, (b) 훨씬 높은 write 동시성에서 monotonic PK가 파티션을 달굴 때.
 -->
 
 ---
@@ -500,7 +529,7 @@ Full Load/워터마크 행 수는 **스캔 없는 추정**(소스 아끼려고).
 
 **핵심 3줄 요약**
 1. 이종 마이그레이션 — 결정론 우선, 사람 손 필요한 곳을 드러냄
-2. Full Load(스트리밍 벌크, CPU-bound) + CDC(커스텀 싱크, statement-OCC, gapless) → DSQL
+2. Full Load(스트리밍 벌크, **멀티프로세스로 GIL 우회 → 200GB 46h→2.5h, 18×**) + CDC(커스텀 싱크, statement-OCC, gapless) → DSQL
 3. 조용한 손실보다 시끄러운 실패 — 자격증명은 메모리에만, 판정은 Validation에서만
 
 <!--
