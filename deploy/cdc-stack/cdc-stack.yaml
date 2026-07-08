@@ -1235,6 +1235,13 @@ Resources:
         # cover all tables' DDL.
         snapshot.mode:
           Ref: SnapshotMode
+        # When the source has gtid_mode=OFF or OFF_PERMISSIVE, new transactions
+        # do NOT receive GTIDs. Without this flag, Debezium records the GTID set
+        # at snapshot time and then skips all non-GTID events in streaming
+        # (treating them as "already processed"), producing zero records. Setting
+        # this to false disables GTID-based DML filtering so file:pos tracking
+        # drives event delivery regardless of the source's GTID mode.
+        gtid.source.filter.dml.events: "false"
         schema.history.internal.store.only.captured.tables.ddl: "false"
         include.schema.changes: "false"
         # Serialize BIGINT UNSIGNED as an exact BigDecimal (Avro decimal) instead
