@@ -5,6 +5,21 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.73
+
+### Changed
+
+- **CDC ソースのスループットチューニング (プラグイン `v14`)。** v0.1.72 のシンクバッチ化の後、
+  ボトルネックが Debezium ソースへ移りました(~2,000 rec/s、CPU ~12% — binlog パースではなく
+  produce/キューバウンド)。ソースパイプラインのノブを CFn パラメータとして公開し、再デプロイで
+  広げられるようにしました: `SourceMaxBatchSize`(8192)と `SourceMaxQueueSize`(32768)は
+  ストリーミング反復あたりに排出する binlog イベント数を増やし、`SourceProducerBatchSize`
+  (256 KiB)・`SourceProducerLingerMs`(20)・`SourceProducerCompression`(`lz4`)は Kafka の
+  produce バッチを拡大・圧縮します。producer ノブは**ソースワーカー設定**に `producer.*` として
+  設定します — MSK Connect はコネクタ単位の `.override.` キーを拒否するためです — したがって
+  不変のワーカー設定は `PLUGIN_VERSION` を `v14` に更新して名前を差し替えます(コネクタ JAR の
+  変更なし)。
+
 ## v0.1.72
 
 ### Changed

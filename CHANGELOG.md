@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.73
+
+### Changed
+
+- **CDC source throughput tuning (plugin `v14`).** After the v0.1.72 sink batching,
+  the bottleneck moved to the Debezium source (~2,000 rec/s at ~12% CPU —
+  produce/queue-bound, not binlog-parse-bound). New CFn parameters expose the
+  source pipeline knobs so a redeploy can widen it: `SourceMaxBatchSize` (8192) and
+  `SourceMaxQueueSize` (32768) drain more binlog events per streaming iteration, and
+  `SourceProducerBatchSize` (256 KiB), `SourceProducerLingerMs` (20), and
+  `SourceProducerCompression` (`lz4`) enlarge and compress the Kafka produce batch.
+  The producer knobs are set as `producer.*` in the **source worker config** — MSK
+  Connect rejects per-connector `.override.` keys — so the immutable worker config
+  is renamed via a `PLUGIN_VERSION` bump to `v14` (no connector JAR changed).
+
 ## v0.1.72
 
 ### Changed

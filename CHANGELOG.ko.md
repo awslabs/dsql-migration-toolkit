@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.73
+
+### 변경 (Changed)
+
+- **CDC 소스 처리량 튜닝 (플러그인 `v14`).** v0.1.72 싱크 배치 이후 병목이 Debezium
+  소스로 이동했습니다(~2,000 rec/s, CPU ~12% — binlog 파싱이 아니라 produce/큐 바운드).
+  소스 파이프라인 노브를 CFn 파라미터로 노출하여 재배포만으로 넓힐 수 있게 했습니다:
+  `SourceMaxBatchSize`(8192)와 `SourceMaxQueueSize`(32768)는 스트리밍 반복당 더 많은 binlog
+  이벤트를 배출하고, `SourceProducerBatchSize`(256 KiB) · `SourceProducerLingerMs`(20) ·
+  `SourceProducerCompression`(`lz4`)는 Kafka produce 배치를 키우고 압축합니다. producer
+  노브는 **소스 워커 설정**에 `producer.*`로 지정합니다 — MSK Connect가 커넥터별 `.override.`
+  키를 거부하기 때문입니다 — 따라서 불변 워커 설정은 `PLUGIN_VERSION`을 `v14`로 올려 이름을
+  교체합니다(커넥터 JAR 변경 없음).
+
 ## v0.1.72
 
 ### 변경 (Changed)

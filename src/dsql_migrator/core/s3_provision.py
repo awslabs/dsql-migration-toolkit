@@ -48,6 +48,18 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v14 tunes the SOURCE for throughput (the bottleneck moved to the source after
+#    v13: ~2,000 rec/s at ~12% CPU = produce/queue-bound, not binlog-parse-bound).
+#    The source WorkerConfiguration now sets producer.batch.size / producer.linger.ms
+#    / producer.compression.type (SourceProducerBatchSize / SourceProducerLingerMs /
+#    SourceProducerCompression) so the connector's producer sends larger, compressed
+#    batches; the connector config gains max.batch.size / max.queue.size
+#    (SourceMaxBatchSize / SourceMaxQueueSize) to drain more binlog events per
+#    streaming iteration. The producer knobs MUST live in the worker config, not the
+#    connector config, because MSK Connect rejects per-connector ".override." keys.
+#    The source WorkerConfiguration is a custom-named immutable resource whose
+#    PropertiesFileContent changed, so its name (and thus PluginVersion) must bump --
+#    no plugin JAR changed. Template + PluginVersion only.
 # v13 rebuilds the sink plugin for a throughput win: the apply path coalesces each
 #    maximal run of CONSECUTIVE same-SQL change events into one JDBC executeBatch()
 #    instead of a per-row executeUpdate(). DSQL is latency-bound (each statement is
@@ -113,7 +125,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v13"
+PLUGIN_VERSION = "v14"
 
 
 class S3ProvisionError(RuntimeError):

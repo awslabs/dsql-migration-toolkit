@@ -253,6 +253,56 @@ Parameters:
       Debezium source tasks.max. MySQL source is effectively single-task per
       server; keep at 1 unless using a multi-task setup.
 
+  SourceMaxBatchSize:
+    Type: Number
+    Default: 8192
+    MinValue: 1
+    Description: >
+      Debezium max.batch.size: events drained from the binlog reader per
+      streaming iteration (default 2048). Raising it lets each iteration produce
+      a larger burst to Kafka, so the source spends less time per row on the
+      produce/queue round-trip — the observed source bottleneck (~2,000 rec/s at
+      ~12% CPU is queue/produce-bound, not CPU-bound). Bounded by SourceMaxQueueSize.
+
+  SourceMaxQueueSize:
+    Type: Number
+    Default: 32768
+    MinValue: 1
+    Description: >
+      Debezium max.queue.size: capacity of the in-memory queue between the binlog
+      reader and the Kafka producer (default 8192). A deeper queue keeps the reader
+      from stalling while a produce batch is in flight. Should be >= 2x
+      SourceMaxBatchSize.
+
+  SourceProducerBatchSize:
+    Type: Number
+    Default: 262144
+    MinValue: 0
+    Description: >
+      producer.override.batch.size (bytes) for the source connector's Kafka
+      producer (default 16384 = 16 KiB). Larger produce batches amortize the
+      broker round-trip across more records. Paired with SourceProducerLingerMs so
+      a batch has time to fill.
+
+  SourceProducerLingerMs:
+    Type: Number
+    Default: 20
+    MinValue: 0
+    Description: >
+      producer.override.linger.ms for the source producer (default 0 = send
+      immediately). A small linger lets the producer accumulate a fuller batch
+      before sending, trading a few ms of latency for markedly higher throughput
+      on a high-rate stream.
+
+  SourceProducerCompression:
+    Type: String
+    Default: lz4
+    AllowedValues: [none, gzip, snappy, lz4, zstd]
+    Description: >
+      producer.override.compression.type for the source producer (default none).
+      lz4 is cheap and compresses row-change JSON well, cutting the bytes on the
+      producer→broker path — the dominant cost when the source is produce-bound.
+
   SinkTasksMax:
     Type: Number
     Default: 4
@@ -870,6 +920,9 @@ Resources:
             config.providers.secretsManager.class=com.amazonaws.kafka.config.providers.SecretsManagerConfigProvider
             config.providers.secretsManager.param.region=${AWS::Region}
             producer.max.request.size=${MaxMessageBytes}
+            producer.batch.size=${SourceProducerBatchSize}
+            producer.linger.ms=${SourceProducerLingerMs}
+            producer.compression.type=${SourceProducerCompression}
             offset.storage.partitions=1
             status.storage.partitions=1
             offset.storage.topic=${AWS::StackName}-debezium-source-offsets
@@ -1273,6 +1326,18 @@ Resources:
         # handling.mode stays at its default 'precise', so DECIMAL is a BigDecimal
         # too -- the custom sink relies on these precise encodings.)
         bigint.unsigned.handling.mode: precise
+        # Throughput tuning (H: the source caps ~2,000 rec/s at ~12% CPU, i.e. it
+        # is produce/queue-bound, not binlog-parse-bound). max.batch.size /
+        # max.queue.size are Debezium connector properties (drain more events per
+        # streaming iteration), so they belong here. The producer batch/linger/
+        # compression knobs are NOT here: MSK Connect rejects per-connector
+        # ".override." keys (connector.client.config.override.policy is excluded),
+        # so those live in the SOURCE WorkerConfiguration as producer.* (same rule
+        # as the H13 producer.max.request.size and the sink's consumer.max.poll.records).
+        max.batch.size:
+          Fn::Sub: "${SourceMaxBatchSize}"
+        max.queue.size:
+          Fn::Sub: "${SourceMaxQueueSize}"
         # Debezium internal schema history topic (self-managed on MSK).
         schema.history.internal.kafka.bootstrap.servers:
           Ref: MskBootstrapServers
