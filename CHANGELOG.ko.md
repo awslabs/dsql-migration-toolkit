@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.74
+
+### 변경 (Changed)
+
+- **CDC 커넥터 스케일링을 하드코딩 대신 추론.** 툴이 테이블별 토픽 파티션 수, 싱크 `tasks.max`,
+  MSK Connect MCU 수를 캡처 대상 테이블 수로부터 계산(`compute_cdc_scaling_defaults`)해 cdc-stack
+  생성 시 전달합니다. 총 싱크 병렬수(`파티션 × 테이블`)가 상한 8에 도달하는 가장 작은 토픽당
+  파티션 수를 고릅니다 — 예: 테이블 1개 → 파티션 8, 4개 → 각 2, ≥8개 → 각 1 — 싱크가 DSQL 쓰기
+  지연 바운드라 그 지점을 넘으면 sublinear하게만 증가하기 때문입니다. 파티션 수는 비가역적(토픽
+  파티션은 늘리기만 가능)이라 생성 시점에 설정합니다. 이전에는 `topic.creation.default.partitions`가
+  `4`로 하드코딩돼 있었으나 이제 `TopicDefaultPartitions` CFn 파라미터입니다. 고급 사용자는
+  `DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS`, `DSQL_MIGRATOR_CDC_SINK_TASKS_MAX`,
+  `DSQL_MIGRATOR_CDC_MCU_COUNT`로 추론을 재정의할 수 있습니다. 매뉴얼 §7.2(CDC)에 모델을 문서화.
+
 ## v0.1.73
 
 ### 변경 (Changed)

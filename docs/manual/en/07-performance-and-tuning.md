@@ -213,20 +213,54 @@ Bounded at 32 to protect the source from too many concurrent scans.
 
 ### CDC (data plane)
 
-CDC parallelism is set on the **cdc-stack CloudFormation parameters**, not app env
-(the connectors run on managed MSK Connect, not in the app):
+**The tool infers CDC scaling for you — there is nothing to set in the UI.** The
+connectors run on managed MSK Connect, and their scaling knobs are computed from
+the one input that predicts parallelism: the **number of captured tables**. Each
+table is its own Kafka topic, and the sink consumes topic **partitions** in
+parallel (one sink task per partition), so total sink parallelism =
+`partitions-per-topic × tables`. The tool picks the smallest partition count that
+brings that product up to a sink-parallelism ceiling, then stops:
 
-| CloudFormation parameter | Default | Effect |
+| Captured tables | partitions / topic | `SinkTasksMax` | Effective parallelism |
+|---|---|---|---|
+| 1 | 8 | 8 | 8 |
+| 2 | 4 | 8 | 8 |
+| 3 | 3 | 8 | 8 |
+| 4 | 2 | 8 | 8 |
+| ≥ 8 | 1 | 8 | 8 |
+
+Why inferred and hidden, not a UI field:
+
+- **Partition count is irreversible.** A topic's partitions can only be *raised*,
+  never lowered — and in practice raising them means recreating the MSK cluster. A
+  wrong value is permanent, so it must be right at create time, not fiddled with.
+- **A CDC change is a 15–20 min connector redeploy**, not a cheap retune loop like
+  Full Load — so there is no fast experiment cycle to expose.
+- **The knobs interact and MCUs cost money** — a free-form combination is easy to
+  get wrong and can silently over-bill.
+
+The ceiling exists because the sink is **DSQL-write-latency-bound**: measured
+throughput scales with partitions **sublinearly** (4 → 8 partitions gave ~1.4×,
+not 2×) as concurrent upserts to one table start to contend inside DSQL. Beyond the
+ceiling, more partitions mostly add MCU cost without throughput. The source side is
+single-task per MySQL server (one binlog stream) but is **not** the bottleneck —
+with the shipped producer tuning it sustains tens of thousands of records/sec. As
+always, the real ceiling under load is OCC on hot primary keys — **PK strategy
+matters most** (see §7.1).
+
+**Overriding the inference (advanced).** If you have a reason to depart from the
+inferred values, set these environment variables before the tool deploys the
+cdc-stack (blank/invalid values fall back to the smart default):
+
+| Environment variable | Overrides | Notes |
 |---|---|---|
-| `SinkTasksMax` | 2 | Sink connector write parallelism (**capped by the topic partition count**). |
-| `SourceTasksMax` | 1 | Debezium source tasks — MySQL is effectively single-task per server; leave at 1. |
-| `ConnectorMcuCount` | 1 | MSK Connect compute units (MCUs) per worker (1/2/4/8). |
-| `ConnectorWorkerCount` | 1 | MSK Connect workers per connector. |
-| `SinkBatchMaxRows` | 3000 | Rows per DSQL write transaction in the sink (**do not exceed 3000**). |
+| `DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` | partitions per per-table topic | **Irreversible** once the topic exists. |
+| `DSQL_MIGRATOR_CDC_SINK_TASKS_MAX` | sink connector `tasks.max` | Capped in effect by the partition count. |
+| `DSQL_MIGRATOR_CDC_MCU_COUNT` | MSK Connect MCUs per worker | Must be one of 1 / 2 / 4 / 8. |
 
-CDC throughput scales with **MSK partitions × sink `tasks.max` × worker MCU/count**,
-ultimately bounded by the partition count; the real ceiling under load is OCC on
-hot primary keys — again, PK strategy matters most.
+Two related cdc-stack parameters are fixed, not inferred: `SourceTasksMax` = 1
+(MySQL is single-task per server) and `SinkBatchMaxRows` = 3000 (DSQL's
+per-transaction row limit — **do not exceed 3000**).
 
 ### On AWS (ECS Fargate) — yes, all of this is tunable there too
 

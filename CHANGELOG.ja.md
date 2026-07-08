@@ -5,6 +5,21 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.74
+
+### Changed
+
+- **CDC コネクタのスケーリングをハードコードではなく推論。** ツールはテーブルごとのトピックパーティション数、
+  シンク `tasks.max`、MSK Connect MCU 数を、キャプチャ対象テーブル数から計算し
+  (`compute_cdc_scaling_defaults`)、cdc-stack 作成時に渡します。総シンク並列度 (`パーティション × テーブル`)
+  が上限 8 に達する最小のトピックあたりパーティション数を選びます — 例: テーブル 1 個 → パーティション 8、
+  4 個 → 各 2、≥8 個 → 各 1 — シンクが DSQL 書き込みレイテンシバウンドで、その点を超えるとサブリニアにしか
+  増えないためです。パーティション数は不可逆 (トピックのパーティションは増やすことのみ可能) なので作成時に
+  設定します。以前は `topic.creation.default.partitions` が `4` にハードコードされていましたが、現在は
+  `TopicDefaultPartitions` CFn パラメータです。上級者は `DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS`、
+  `DSQL_MIGRATOR_CDC_SINK_TASKS_MAX`、`DSQL_MIGRATOR_CDC_MCU_COUNT` で推論を上書きできます。
+  マニュアル §7.2 (CDC) にモデルを文書化。
+
 ## v0.1.73
 
 ### Changed

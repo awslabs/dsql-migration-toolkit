@@ -39,6 +39,7 @@ provided here -- there is no live implementation behind it yet.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -408,6 +409,116 @@ CDC_DEFAULT_TOPIC_PREFIX = "dsqlcdc"
 CDC_DEFAULT_DLQ_TOPIC = "dsql-sink-dlq"
 CDC_SOURCE_SUFFIX = "-debezium-source"
 CDC_SINK_SUFFIX = "-dsql-sink"
+
+# --- CDC throughput smart defaults ------------------------------------------
+# The connector-scaling knobs (MSK Connect MCUs, sink tasks.max, per-table topic
+# partition count) are NOT surfaced in the UI: partition count is IRREVERSIBLE
+# (a topic's partitions can only be increased, never decreased -- and only by
+# recreating the MSK cluster in practice), the knobs interact non-trivially, and
+# a CDC connector change is a 15-20 min redeploy (unlike Full Load, there is no
+# cheap retune loop). So the tool INFERS them from the one input it has -- the
+# number of captured tables -- and an operator who truly needs to override can
+# set an env var. This mirrors the product principle "infer anything that can be
+# inferred instead of asking".
+#
+# The model is grounded in the 2026-07-08 throughput test (see the Obsidian note
+# "CDC Performance Test Results"):
+#   * Debezium (source) is single-task per MySQL server (one binlog stream); with
+#     the v14 producer tuning it sustains ~30k rec/s and is NOT the bottleneck.
+#   * The sink is DSQL-write-latency-bound. Throughput scales with the number of
+#     partitions consumed in parallel (one sink task per partition), but only
+#     SUBLINEARLY -- 4->8 partitions gave ~1.4x, not 2x, as concurrent upserts to
+#     one table start contending in DSQL. So total effective sink parallelism is
+#     capped at CDC_MAX_SINK_PARALLELISM; beyond that, more partitions mostly add
+#     cost (MCU) without throughput.
+#   * total effective parallelism = partitions_per_topic * num_tables (each table
+#     is its own topic). When there are few tables we raise partitions_per_topic
+#     to reach the cap; when there are many tables the tables themselves provide
+#     the parallelism, so 1 partition each suffices.
+CDC_MAX_SINK_PARALLELISM = 8  # effective sink-task ceiling before DSQL contention
+CDC_DEFAULT_MCU_COUNT = 2  # MSK Connect MCUs per worker (cost-conscious default)
+# Env overrides (read fresh, DSQL_MIGRATOR_ prefix). Empty/invalid -> smart default.
+CDC_ENV_SINK_TASKS_MAX = "DSQL_MIGRATOR_CDC_SINK_TASKS_MAX"
+CDC_ENV_MCU_COUNT = "DSQL_MIGRATOR_CDC_MCU_COUNT"
+CDC_ENV_TOPIC_PARTITIONS = "DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS"
+# ConnectorMcuCount is an AllowedValues enum in the template; keep overrides legal.
+_CDC_ALLOWED_MCU = (1, 2, 4, 8)
+
+
+@dataclass(frozen=True)
+class CdcScalingDefaults:
+    """The inferred (or overridden) CDC connector-scaling knobs for a deploy.
+
+    ``source`` is the effect on the two connectors that actually matters:
+    ``partitions_per_topic`` fixes the per-table topic partition count (set once,
+    irreversibly, at create), ``sink_tasks_max`` the sink write parallelism, and
+    ``mcu_count`` the MSK Connect compute per worker.
+    """
+
+    partitions_per_topic: int
+    sink_tasks_max: int
+    mcu_count: int
+    num_tables: int
+
+
+def _cdc_env_int(env: Mapping[str, str], key: str) -> Optional[int]:
+    """Return a positive int override from ``env[key]``, or None if unset/invalid."""
+    raw = (env.get(key) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 1 else None
+
+
+def compute_cdc_scaling_defaults(
+    num_tables: int, env: Optional[Mapping[str, str]] = None
+) -> CdcScalingDefaults:
+    """Infer the CDC connector-scaling knobs from the captured-table count.
+
+    Pure. ``num_tables`` is the number of tables being captured (one Kafka topic
+    each). Env overrides (:data:`CDC_ENV_SINK_TASKS_MAX` /
+    :data:`CDC_ENV_MCU_COUNT` / :data:`CDC_ENV_TOPIC_PARTITIONS`) take precedence
+    when set to a valid positive integer; the MCU override is additionally snapped
+    to the template's AllowedValues (1/2/4/8).
+
+    Smart default (see :data:`CDC_MAX_SINK_PARALLELISM`): pick the smallest
+    partitions-per-topic that brings total parallelism (partitions * tables) up to
+    the sink cap, so few-table captures still parallelise while many-table
+    captures use 1 partition each. ``sink_tasks_max`` matches total parallelism (a
+    sink task can only consume up to the partition count anyway).
+    """
+    source = os.environ if env is None else env
+    tables = max(1, int(num_tables))
+
+    # Partitions per topic: reach the sink-parallelism cap when tables are few.
+    part_override = _cdc_env_int(source, CDC_ENV_TOPIC_PARTITIONS)
+    if part_override is not None:
+        partitions = part_override
+    else:
+        # ceil(cap / tables), but never below 1 -- so tables>=cap -> 1 each.
+        partitions = max(1, -(-CDC_MAX_SINK_PARALLELISM // tables))
+
+    total_parallelism = min(partitions * tables, CDC_MAX_SINK_PARALLELISM)
+
+    tasks_override = _cdc_env_int(source, CDC_ENV_SINK_TASKS_MAX)
+    sink_tasks_max = tasks_override if tasks_override is not None else total_parallelism
+
+    mcu_override = _cdc_env_int(source, CDC_ENV_MCU_COUNT)
+    if mcu_override is not None and mcu_override in _CDC_ALLOWED_MCU:
+        mcu_count = mcu_override
+    else:
+        mcu_count = CDC_DEFAULT_MCU_COUNT
+
+    return CdcScalingDefaults(
+        partitions_per_topic=partitions,
+        sink_tasks_max=sink_tasks_max,
+        mcu_count=mcu_count,
+        num_tables=tables,
+    )
+
 
 # Every cdc-stack name MUST start with this prefix. The deploy role's IAM scopes
 # the whole "mysql-dsql-cdc-*" naming family (see deploy/cloudformation.yaml CdcDeployRole)
@@ -1032,8 +1143,14 @@ def build_cdc_infra_params(
     ``List<AWS::EC2::Subnet::Id>`` type is passed as a comma-joined value, never a
     Python list). ``MskBootstrapServers`` and ``DeploySink`` are pinned to
     ``""`` / ``"false"`` so no connectors are created on the first deploy.
+
+    The connector-scaling knobs (``TopicDefaultPartitions`` / ``SinkTasksMax`` /
+    ``ConnectorMcuCount``) are INFERRED from the captured-table count via
+    :func:`compute_cdc_scaling_defaults` (env-overridable). Partition count is set
+    here, at create, because it is irreversible for the life of the topic.
     """
     sink_topics = ",".join(f"{topic_prefix}.{t}" for t in sink_config.topics)
+    scaling = compute_cdc_scaling_defaults(len(sink_config.topics))
     filled: list[tuple[str, str]] = [
         # VPC / networking
         ("VpcId", vpc_id),
@@ -1080,6 +1197,13 @@ def build_cdc_infra_params(
         # Plugin resource-name version suffix (gotcha #5: lets a new artifact get a
         # uniquely-named CustomPlugin instead of colliding on a fixed name).
         ("PluginVersion", plugin_version),
+        # Connector scaling inferred from the captured-table count (env-overridable).
+        # TopicDefaultPartitions is set HERE because it is fixed for the life of the
+        # topic -- a partition count can only be raised (and only by recreating the
+        # cluster in practice), never lowered, so it must be right at create time.
+        ("TopicDefaultPartitions", str(scaling.partitions_per_topic)),
+        ("SinkTasksMax", str(scaling.sink_tasks_max)),
+        ("ConnectorMcuCount", str(scaling.mcu_count)),
         # No connectors on the first deploy -- Start CDC sets these two later.
         ("MskBootstrapServers", ""),
         ("DeploySink", "false"),
@@ -1138,4 +1262,11 @@ __all__ = [
     "CdcInfraParams",
     "build_cdc_infra_params",
     "cdc_stack_params_to_json",
+    "CdcScalingDefaults",
+    "compute_cdc_scaling_defaults",
+    "CDC_MAX_SINK_PARALLELISM",
+    "CDC_DEFAULT_MCU_COUNT",
+    "CDC_ENV_SINK_TASKS_MAX",
+    "CDC_ENV_MCU_COUNT",
+    "CDC_ENV_TOPIC_PARTITIONS",
 ]

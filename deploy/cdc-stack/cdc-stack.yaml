@@ -323,6 +323,19 @@ Parameters:
     MinValue: 1
     Description: MSK Connect provisioned worker count for each connector.
 
+  TopicDefaultPartitions:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    Description: >
+      Partitions for each auto-created per-table data topic
+      (topic.creation.default.partitions). This is the sink's unit of parallelism
+      (one sink task per partition) and is IRREVERSIBLE — a topic's partition
+      count can only be raised, never lowered, so the tool infers it from the
+      captured-table count at create time (compute_cdc_scaling_defaults). Effective
+      sink parallelism = this * number of tables, capped where concurrent DSQL
+      upserts to one table begin to contend.
+
   MaxMessageBytes:
     Type: Number
     Default: 4194304
@@ -1272,7 +1285,8 @@ Resources:
         # positive integer (-1 is REJECTED with "Number of partitions is below 1").
         topic.creation.enable: "true"
         topic.creation.default.replication.factor: "-1"
-        topic.creation.default.partitions: "4"
+        topic.creation.default.partitions:
+          Fn::Sub: "${TopicDefaultPartitions}"
         # H13: the per-table data topics must also accept a change event up to
         # MaxMessageBytes. MSK Serverless creates topics with max.message.bytes at
         # the broker default (~1 MiB), so even with producer.max.request.size raised

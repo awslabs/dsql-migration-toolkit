@@ -4,10 +4,12 @@ _Language: **English** | [한국어](../ko/12-performance-test-results.md) | [�
 
 > **Prev:** [11. Customer FAQ](11-customer-faq.md)
 
-This appendix documents the Full Load throughput measurements taken during
-development, showing how each optimization stage contributed to the final
-performance. All measurements were run on **ECS Fargate** in the same VPC as
-the source RDS MySQL and target Aurora DSQL (sub-ms network RTT).
+This appendix documents the throughput measurements taken during development for
+both data paths — **Full Load** (the tool's Python bulk loader) and **CDC** (the
+Debezium → MSK → custom DSQL sink pipeline) — showing how each optimization stage
+contributed to the final performance. All measurements were run on **ECS Fargate**
+(and, for CDC, managed **MSK Connect**) in the same VPC as the source RDS MySQL and
+target Aurora DSQL (sub-ms network RTT).
 
 ---
 
@@ -94,7 +96,72 @@ plain `INSERT` (no `ON CONFLICT`) which eliminates OCC contention entirely:
 
 ---
 
+## CDC throughput
+
+CDC is a different pipeline with a different bottleneck. Full Load is a Python
+process that is **CPU/GIL-bound**; CDC is `Debezium (source) → MSK topic → custom
+DSQL sink`, where the sink is **DSQL-write-latency-bound**. These measurements
+(2026-07-08) drove the shipped connector code (`dsql-sink` plugin) and the smart
+defaults in [§7.2](07-performance-and-tuning.md#72-tuning-parallelism).
+
+### Parameters that affect CDC throughput
+
+| Parameter | Where | Effect |
+|---|---|---|
+| `topic.creation.default.partitions` | cdc-stack (inferred) | Sink's unit of parallelism — one sink task consumes one partition. **Irreversible** (raise-only). |
+| `SinkTasksMax` | cdc-stack (inferred) | Sink connector write parallelism; effective value capped by the partition count. |
+| `ConnectorMcuCount` | cdc-stack (inferred) | MSK Connect compute units per worker (1/2/4/8). |
+| `SinkBatchMaxRows` | cdc-stack (3000, fixed) | Rows per DSQL write transaction (DSQL's hard limit). |
+| `consumer.max.poll.records` | sink worker config | Records handed to one `put()` — bounds how many the sink can coalesce into one JDBC `executeBatch`. |
+| `max.batch.size` / `max.queue.size` | source connector | Binlog events drained per streaming iteration / reader→producer queue depth. |
+| `producer.batch.size` / `linger.ms` / `compression.type` | source worker config | Size, fill-delay, and compression of the Kafka produce batch. |
+
+The connector-scaling knobs (partitions / `SinkTasksMax` / `ConnectorMcuCount`) are
+**inferred from the captured-table count** and not exposed in the UI — see
+[§7.2 → CDC](07-performance-and-tuning.md#72-tuning-parallelism).
+
+### Test environment (CDC)
+
+| Component | Configuration |
+|---|---|
+| **Source connector** | Debezium MySQL on MSK Connect, `ConnectorMcuCount`=4 |
+| **Sink connector** | custom `dsql-sink`, `SinkTasksMax` scaled 4→8 |
+| **Workload** | 4 ECS tasks bulk-inserting into `customers_sample.orders` (~20,000 rows/s into the source) |
+| **Measurement** | CloudWatch `AWS/KafkaConnect` `SourceRecordWriteRate` / `SinkRecordSendRate`, cross-checked by the DSQL target row-count delta |
+
+### Evolution of CDC throughput
+
+| Stage | Config | Sink rows/s | Sink CPU | Bottleneck | vs baseline |
+|---|---|---|---|---|---|
+| 1: single partition | 1 partition / 1 task | 292 | — | partition count = 1 (no parallelism) | 1× |
+| 2: partitioned | 4 partitions / 4 tasks | ~550 | 5% | sink applied **one row per round-trip** | 1.9× |
+| 3: batched apply (**plugin v13**) | 4 partitions / 4 tasks | ~1,165 | 7% | source (under-tuned producer) | **4.0×** |
+| 4: source tuning (**plugin v14**) | 8 partitions / 8 tasks | ~1,500 | 6.5% | DSQL write contention | **5.1×** |
+
+Two code/config changes did most of the work:
+
+- **Plugin v13 — batched sink apply.** The sink coalesces each maximal run of
+  consecutive same-SQL change events into one JDBC `executeBatch()` instead of a
+  per-row `executeUpdate()`. Because DSQL is latency-bound (each statement is a
+  distributed round-trip; the task ran at ~5% CPU), collapsing per-row round-trips
+  into batched sends **doubled** sink throughput (~550 → ~1,165 rows/s). Also raised
+  `consumer.max.poll.records` 500 → 3000 so a full poll fills one ≤3000-row
+  transaction.
+- **Plugin v14 — source producer tuning.** Larger batch/queue + `lz4`-compressed
+  producer batches took the source from ~1,940 → **~31,000 rec/s (16×)**, proving
+  the source was never the real ceiling — it was under-batched. This exposed the
+  sink→DSQL write as the true final bottleneck.
+
+At 8 partitions the sink reached ~1,500 rows/s (DSQL apply cross-checked at 1,484
+rows/s) — but scaling 4→8 gave only **~1.4× (sublinear)**: concurrent upserts to one
+table begin to contend inside DSQL. This is exactly why the smart default caps
+effective parallelism at 8.
+
+---
+
 ## Key findings
+
+### Full Load
 
 1. **GIL is the ceiling in Python-based data pipelines.** Even with I/O-releasing
    C extensions (psycopg3), the per-row Python conversion dominates and serializes
@@ -115,6 +182,26 @@ plain `INSERT` (no `ON CONFLICT`) which eliminates OCC contention entirely:
 5. **Optimal configuration:** set `TABLE_PARALLELISM` = vCPU count. The loader
    automatically shards large tables and allocates pool slots.
 
+### CDC
+
+6. **The sink is latency-bound, not CPU-bound.** At ~5–7% CPU the sink was waiting
+   on DSQL round-trips, not computing — so the lever is *fewer, larger* writes
+   (batched `executeBatch`), not more compute.
+
+7. **Batching per-row round-trips is the biggest single CDC win** (~550 → ~1,165
+   rows/s from plugin v13 alone).
+
+8. **The source was never the ceiling.** Producer tuning (batch/queue/`lz4`) took
+   it 16× to ~31,000 rec/s; a single Debezium task per MySQL server is plenty.
+
+9. **Sink parallelism scales sublinearly.** 4 → 8 partitions gave ~1.4×, not 2×, as
+   concurrent upserts to one table contend inside DSQL — so effective parallelism is
+   capped at 8 in the smart default.
+
+10. **Partition count is irreversible**, so the tool infers it at create time from
+    the captured-table count rather than exposing a UI knob that could be set wrong
+    permanently.
+
 ---
 
 ## Reproducing these measurements
@@ -132,6 +219,12 @@ See [`deploy/run_measure_on_fargate.sh`](../../../deploy/run_measure_on_fargate.
 for the full A/B measurement harness and
 [`scripts/measure_performance.py`](../../../scripts/measure_performance.py) for
 the in-process throughput + OCC reporting tool.
+
+For CDC, deploy the cdc-stack and start a steady insert workload on the source,
+then read the pipeline rates from CloudWatch `AWS/KafkaConnect`
+(`SourceRecordWriteRate` on the `-debezium-source` connector, `SinkRecordSendRate`
+on the `-dsql-sink` connector), cross-checking against the DSQL target's
+`COUNT(*)` delta over a fixed interval.
 
 ---
 

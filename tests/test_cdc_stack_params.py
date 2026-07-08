@@ -13,8 +13,13 @@ import json
 from datetime import datetime, timezone
 
 from dsql_migrator.core.cdc import (
+    CDC_DEFAULT_MCU_COUNT,
     CDC_DEFAULT_STACK_NAME,
     CDC_DEFAULT_TOPIC_PREFIX,
+    CDC_ENV_MCU_COUNT,
+    CDC_ENV_SINK_TASKS_MAX,
+    CDC_ENV_TOPIC_PARTITIONS,
+    CDC_MAX_SINK_PARALLELISM,
     CDC_PLACEHOLDER_PREFIX,
     CDC_STACK_NAME_MAX_LEN,
     CDC_STACK_NAME_PREFIX,
@@ -28,6 +33,7 @@ from dsql_migrator.core.cdc import (
     cdc_expected_connector_names,
     cdc_stack_name_is_valid,
     cdc_stack_params_to_json,
+    compute_cdc_scaling_defaults,
     estimate_cdc_hourly_cost,
 )
 from dsql_migrator.core.models import Watermark
@@ -540,3 +546,82 @@ def test_cost_estimate_caveat_is_clear_about_nature_and_billing() -> None:
     assert "delete" in est.caveat.lower()
     # Glue is not used by this pipeline -> must not be listed as a cost driver.
     assert "glue" not in est.caveat.lower()
+
+
+# ---------------------------------------------------------------------------
+# compute_cdc_scaling_defaults — CDC connector-scaling smart defaults
+# ---------------------------------------------------------------------------
+
+
+def test_scaling_few_tables_raises_partitions_to_reach_cap() -> None:
+    # 3 tables -> ceil(8/3)=3 partitions each, so total parallelism hits the cap.
+    d = compute_cdc_scaling_defaults(3, env={})
+    assert d.partitions_per_topic == 3
+    assert d.sink_tasks_max == CDC_MAX_SINK_PARALLELISM
+    assert d.mcu_count == CDC_DEFAULT_MCU_COUNT
+
+
+def test_scaling_single_table_uses_full_cap_on_one_topic() -> None:
+    d = compute_cdc_scaling_defaults(1, env={})
+    assert d.partitions_per_topic == CDC_MAX_SINK_PARALLELISM
+    assert d.sink_tasks_max == CDC_MAX_SINK_PARALLELISM
+
+
+def test_scaling_many_tables_use_one_partition_each() -> None:
+    # tables >= cap: the tables themselves provide the parallelism.
+    for n in (8, 10, 50, 100):
+        d = compute_cdc_scaling_defaults(n, env={})
+        assert d.partitions_per_topic == 1, n
+        assert d.sink_tasks_max == CDC_MAX_SINK_PARALLELISM, n
+
+
+def test_scaling_zero_or_negative_tables_treated_as_one() -> None:
+    d = compute_cdc_scaling_defaults(0, env={})
+    assert d.num_tables == 1
+    assert d.partitions_per_topic == CDC_MAX_SINK_PARALLELISM
+
+
+def test_scaling_env_overrides_take_precedence() -> None:
+    d = compute_cdc_scaling_defaults(
+        3,
+        env={
+            CDC_ENV_TOPIC_PARTITIONS: "2",
+            CDC_ENV_SINK_TASKS_MAX: "6",
+            CDC_ENV_MCU_COUNT: "4",
+        },
+    )
+    assert d.partitions_per_topic == 2
+    assert d.sink_tasks_max == 6
+    assert d.mcu_count == 4
+
+
+def test_scaling_invalid_mcu_override_falls_back_to_default() -> None:
+    # 3 is not in the template's AllowedValues (1/2/4/8) -> ignored.
+    d = compute_cdc_scaling_defaults(2, env={CDC_ENV_MCU_COUNT: "3"})
+    assert d.mcu_count == CDC_DEFAULT_MCU_COUNT
+
+
+def test_scaling_blank_and_nonint_env_ignored() -> None:
+    d = compute_cdc_scaling_defaults(
+        4, env={CDC_ENV_SINK_TASKS_MAX: "", CDC_ENV_TOPIC_PARTITIONS: "abc"}
+    )
+    # Falls back to smart default: 4 tables -> 2 partitions each, cap tasks.
+    assert d.partitions_per_topic == 2
+    assert d.sink_tasks_max == CDC_MAX_SINK_PARALLELISM
+
+
+def test_infra_params_emit_inferred_scaling_knobs() -> None:
+    # 2 tables -> ceil(8/2)=4 partitions each; tasks at the cap; default MCU.
+    by_key = dict(_infra(tables=("app.orders", "app.customers")).filled)
+    assert by_key["TopicDefaultPartitions"] == "4"
+    assert by_key["SinkTasksMax"] == str(CDC_MAX_SINK_PARALLELISM)
+    assert by_key["ConnectorMcuCount"] == str(CDC_DEFAULT_MCU_COUNT)
+
+
+def test_infra_params_scaling_knobs_are_declared_in_template() -> None:
+    # Guard: the inferred knobs must be real template parameters (else CFn rejects).
+    import pathlib
+
+    template = pathlib.Path("deploy/cdc-stack/cdc-stack.yaml").read_text()
+    for key in ("TopicDefaultPartitions", "SinkTasksMax", "ConnectorMcuCount"):
+        assert f"\n  {key}:" in template, key

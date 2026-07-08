@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.74
+
+### Changed
+
+- **CDC connector scaling is now inferred, not hardcoded.** The tool computes the
+  per-table topic partition count, sink `tasks.max`, and MSK Connect MCU count from
+  the number of captured tables (`compute_cdc_scaling_defaults`) and passes them at
+  cdc-stack create. It picks the smallest partitions-per-topic that brings total
+  sink parallelism (`partitions × tables`) up to a ceiling of 8 — e.g. 1 table → 8
+  partitions, 4 tables → 2 each, ≥8 tables → 1 each — because the sink is
+  DSQL-write-latency-bound and scales sublinearly past that point. Partition count
+  is set at create because it is irreversible (a topic's partitions can only be
+  raised). Previously `topic.creation.default.partitions` was hardcoded to `4`; it
+  is now the `TopicDefaultPartitions` CFn parameter. Advanced operators can override
+  the inference with `DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS`,
+  `DSQL_MIGRATOR_CDC_SINK_TASKS_MAX`, and `DSQL_MIGRATOR_CDC_MCU_COUNT`. Manual §7.2
+  (CDC) documents the model.
+
 ## v0.1.73
 
 ### Changed
