@@ -1823,6 +1823,10 @@ def _open_cdc_start_dialog(ui, migration_state, on_confirm, *, session=None) -> 
             )
 
         def _go() -> None:
+            start_btn.props("loading")
+            ui.notify(  # type: ignore[attr-defined]
+                "Submitting Start CDC…", type="info", position="top",
+            )
             dialog.close()
             on_confirm()
 
