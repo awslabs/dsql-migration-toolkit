@@ -242,7 +242,7 @@ Parameters:
 
   SinkTasksMax:
     Type: Number
-    Default: 2
+    Default: 4
     MinValue: 1
     Description: >
       Sink connector tasks.max (write parallelism). Effective concurrency is
@@ -250,7 +250,7 @@ Parameters:
 
   ConnectorMcuCount:
     Type: Number
-    Default: 1
+    Default: 4
     AllowedValues: [1, 2, 4, 8]
     Description: MSK Connect MCUs (compute units) per worker for each connector.
 
@@ -1205,7 +1205,7 @@ Resources:
         # positive integer (-1 is REJECTED with "Number of partitions is below 1").
         topic.creation.enable: "true"
         topic.creation.default.replication.factor: "-1"
-        topic.creation.default.partitions: "1"
+        topic.creation.default.partitions: "4"
         # H13: the per-table data topics must also accept a change event up to
         # MaxMessageBytes. MSK Serverless creates topics with max.message.bytes at
         # the broker default (~1 MiB), so even with producer.max.request.size raised
