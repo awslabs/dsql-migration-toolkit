@@ -243,6 +243,21 @@ def test_apply_create_schema_executes_without_existence_check() -> None:
     assert oracle.queried == []
 
 
+def test_apply_create_schema_self_heals_duplicate() -> None:
+    # A 42P07 duplicate-object race on CREATE SCHEMA is absorbed as CREATED (the
+    # schema is present), matching the table/view/index self-heal path -- not a
+    # spurious FAILED.
+    connection = _FakeConnection(failures=["42P07"])
+    applier, _, _ = _applier(existing=set(), connection=connection)
+
+    result = applier.apply(
+        'CREATE SCHEMA IF NOT EXISTS "app"', ApplyMode.SKIP_IF_EXISTS
+    )
+
+    assert result.status is ApplyStatus.CREATED
+    assert result.object_name == "app"
+
+
 # ---------------------------------------------------------------------------
 # apply — SKIPPED when the object exists (Requirement 10.4)
 # ---------------------------------------------------------------------------

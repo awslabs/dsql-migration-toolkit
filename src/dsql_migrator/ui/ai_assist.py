@@ -275,7 +275,27 @@ def run_verify_ai_access(
         if assistant_factory is not None
         else _default_verify_assistant_factory
     )
-    assistant = factory(config, aws_profile)
+    # Building the assistant constructs a boto3 client, which can raise before
+    # verify_access() runs (e.g. NoRegionError when no region is resolvable, or
+    # UnknownServiceError). verify_access() itself never raises, but the factory
+    # can -- so classify that failure to an actionable, credential-free result
+    # instead of letting a raw exception escape into the UI (Requirement 11.15/16).
+    try:
+        assistant = factory(config, aws_profile)
+    except Exception as exc:  # noqa: BLE001 - client construction must not crash the UI
+        from dsql_migrator.core.ai_assistant import (
+            _ACCESS_CHECK_DETAILS,
+            _classify_access_check_error,
+        )
+
+        reason = _classify_access_check_error(exc)
+        return AiAccessCheckResult(
+            ok=False,
+            reason=reason,
+            detail=_ACCESS_CHECK_DETAILS[reason],
+            model_id=config.model_id,
+            region=config.region,
+        )
     return assistant.verify_access()
 
 

@@ -1135,6 +1135,7 @@ def build_connect_page(
                 state.set_ai_assist(config)
                 ai_model.set_value(config.model_id)
 
+                ai_status.classes(replace=f"text-sm {INLINE_HINT_TEXT['neutral']}")
                 ai_status.set_text("Verifying AI access...")
                 # verify_access is non-blocking (never raises); run it off the
                 # event loop like the connection tests.
@@ -1146,6 +1147,16 @@ def build_connect_page(
                 # (NiceGUI #3028): the element/slot may have been deleted.
                 if ai_status.is_deleted:
                     return
+                # Carry the verdict severity into the persistent status line (not
+                # only the transient toast): route the notify type through the
+                # design-system inline-hint palette instead of leaving it as bare
+                # gray text with no severity cue.
+                tone = {
+                    "positive": "success",
+                    "negative": "error",
+                    "warning": "warning",
+                }.get(display.notify_type, "neutral")
+                ai_status.classes(replace=f"text-sm {INLINE_HINT_TEXT[tone]}")
                 ai_status.set_text(display.message)
                 ui.notify(display.message, type=display.notify_type)
 

@@ -281,11 +281,24 @@ def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[Tab
             if not (constrained and referred_table and referred_columns):
                 continue
             fk_name = fk.get("name") or f"{table_name}_{'_'.join(constrained)}_fkey"
+            # Qualify the referenced table the same way the caller qualifies table
+            # names in cluster-wide mode (``schema.table``): use the FK's own
+            # referred_schema for a cross-schema FK, else the schema being
+            # reflected (a same-schema FK). In single-database mode (``schema`` is
+            # None) names stay unqualified, matching the child table name -- so a
+            # downstream orphan-check/DDL query resolves the parent correctly
+            # instead of hitting the search_path (or a wrong same-named table).
+            referred_schema = fk.get("referred_schema") or schema
+            referenced_table = (
+                f"{referred_schema}.{referred_table}"
+                if referred_schema
+                else referred_table
+            )
             foreign_keys.append(
                 ForeignKeyDef(
                     name=fk_name,
                     columns=constrained,
-                    referenced_table=referred_table,
+                    referenced_table=referenced_table,
                     referenced_columns=referred_columns,
                 )
             )

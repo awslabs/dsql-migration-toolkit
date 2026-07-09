@@ -214,9 +214,13 @@ def test_build_bedrock_runtime_client_uses_injected_session_and_region() -> None
     client = build_bedrock_runtime_client(config, session=session)
 
     assert isinstance(client, _FakeClient)
-    assert session.calls == [
-        (BEDROCK_RUNTIME_SERVICE, {"region_name": "eu-central-1"})
-    ]
+    assert len(session.calls) == 1
+    service, kwargs = session.calls[0]
+    assert service == BEDROCK_RUNTIME_SERVICE
+    assert kwargs["region_name"] == "eu-central-1"
+    # Bounded connect/read timeouts so a hung Bedrock socket can't spin forever.
+    assert kwargs["config"].connect_timeout == 10
+    assert kwargs["config"].read_timeout == 60
 
 
 def test_build_bedrock_runtime_client_omits_region_when_unset() -> None:
@@ -226,7 +230,12 @@ def test_build_bedrock_runtime_client_omits_region_when_unset() -> None:
     build_bedrock_runtime_client(config, session=session)
 
     # When no region is configured, none is forwarded; the session decides.
-    assert session.calls == [(BEDROCK_RUNTIME_SERVICE, {})]
+    assert len(session.calls) == 1
+    service, kwargs = session.calls[0]
+    assert service == BEDROCK_RUNTIME_SERVICE
+    assert "region_name" not in kwargs
+    assert kwargs["config"].connect_timeout == 10
+    assert kwargs["config"].read_timeout == 60
 
 
 def test_build_bedrock_runtime_client_passes_no_credentials() -> None:
@@ -394,7 +403,11 @@ def test_assistant_builds_client_lazily_when_none_injected(monkeypatch: Any) -> 
     )
 
     # The lazy client was built from the configured region and used for InvokeModel.
-    assert session.calls == [(BEDROCK_RUNTIME_SERVICE, {"region_name": "us-east-1"})]
+    assert len(session.calls) == 1
+    service, kwargs = session.calls[0]
+    assert service == BEDROCK_RUNTIME_SERVICE
+    assert kwargs["region_name"] == "us-east-1"
+    assert kwargs["config"].read_timeout == 60
     assert len(fake_client.calls) == 1
     assert suggestion.suggested_sql_or_expr == "CREATE TABLE t (id uuid PRIMARY KEY)"
 
@@ -819,6 +832,39 @@ def test_verify_access_maps_access_denied() -> None:
     assert result.ok is False
     assert result.reason == "ACCESS_DENIED"
     assert "bedrock:InvokeModel".lower() in result.detail.lower()
+
+
+def test_expired_credentials_classified_as_access_denied_both_paths() -> None:
+    # Regression: an expired/invalid-credentials error used to fall through to a
+    # vague UNAVAILABLE (suggestion) / UNKNOWN (preflight) with an unhelpful
+    # message. It now maps to ACCESS_DENIED on BOTH classifiers, whose message
+    # tells the user to re-authenticate.
+    from dsql_migrator.core.ai_assistant import (
+        _classify_access_check_error,
+        _classify_bedrock_error,
+    )
+
+    for code in (
+        "ExpiredTokenException",
+        "ExpiredToken",
+        "InvalidSignatureException",
+        "InvalidClientTokenId",
+    ):
+        exc = _client_error(code)
+        assert _classify_bedrock_error(exc) == "ACCESS_DENIED"
+        assert _classify_access_check_error(exc) == "ACCESS_DENIED"
+
+
+def test_verify_access_expired_credentials_detail_mentions_reauth() -> None:
+    client = _RaisingBedrockRuntimeClient(_client_error("ExpiredTokenException"))
+    assistant = AiConversionAssistant(
+        AiAssistConfig(enabled=True, region="us-east-1"), client=client
+    )
+
+    result = assistant.verify_access()
+
+    assert result.reason == "ACCESS_DENIED"
+    assert "re-authenticate" in result.detail.lower()
 
 
 def test_verify_access_maps_validation_exception_to_model_not_enabled() -> None:

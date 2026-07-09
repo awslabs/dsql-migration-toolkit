@@ -5,6 +5,34 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.82
+
+### 수정 (Fixed)
+
+- **AI 어시스트: 만료/무효 AWS 자격증명이 이제 실행 가능한 메시지를 줌.** 세션 만료·서명 오류
+  (`ExpiredTokenException`, `InvalidSignatureException`, `InvalidClientTokenId` 등)가 일반적인
+  "unavailable"/"unknown"으로 오분류되어, 재인증하라는 힌트 없이 "AI 없이 계속"만 안내했다. 이제
+  이런 오류는 제안 경로와 "Verify AI access" 경로 양쪽에서 `ACCESS_DENIED`로 분류되고, 두 메시지
+  모두 자격증명/세션 만료 시 재인증하라고 안내한다.
+- **클러스터 전체 스키마 조사: 크로스-스키마 외래키 대상이 이제 스키마로 한정됨.** 클러스터 전체(여러
+  스키마)를 조사할 때 테이블명은 `schema.table`로 한정됐지만 외래키의 참조 테이블은 한정되지 않아,
+  하위의 고아행 검사/DDL 쿼리가 부모를 search_path(또는 다른 스키마의 동명 테이블)로 잘못 해석했다.
+  이제 FK 대상은 FK 자신의 `referred_schema`(동일 스키마 FK는 조사 중인 스키마)로 한정되어 테이블명
+  한정 방식과 일치한다.
+
+### 변경 (Changed)
+
+- **AI 어시스트 견고화.** Bedrock 클라이언트에 연결/읽기 타임아웃(10초/60초)을 설정해, 연결이 멈춰도
+  "AI is writing…"/"Verifying…" 상태가 무한정 도는 일이 없도록 했다(멈춘 소켓은 분류된 네트워크/타임아웃
+  오류로 표면화). "Verify AI access"는 이제 클라이언트 *생성* 중 오류(예: 리전 해석 불가)도 포착해
+  예외를 UI로 흘리지 않고 실행 가능한 결과로 보고한다. 연결 화면의 상시 AI 상태 줄은 회색 평문 대신
+  디자인 시스템 팔레트로 심각도를 표시한다.
+- **소스 개요: 리더가 아니라 Aurora writer의 인스턴스 클래스 표시.** Aurora 클러스터 엔드포인트의
+  소스 메타데이터 조회가 임의 멤버가 아니라 `DescribeDBClusters`(`IsClusterWriter`)로 writer를 찾도록
+  해, writer/reader 크기가 다른 구성에서 소스 용량을 잘못 표시하지 않는다(best-effort, 실패 시 첫 멤버로 폴백).
+- **스키마 적용: `CREATE SCHEMA`가 중복 레이스를 self-heal.** 스키마 생성 시 `42P07`을 이제
+  테이블/뷰/인덱스 경로와 동일하게 `CREATED`(스키마 존재)로 흡수해, 잘못된 `FAILED` 대신 수렴한다.
+
 ## v0.1.81
 
 ### 수정 (Fixed)

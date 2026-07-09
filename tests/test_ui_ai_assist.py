@@ -460,6 +460,24 @@ def test_run_verify_ai_access_threads_profile_to_assistant_factory() -> None:
     assert result is expected
 
 
+def test_run_verify_ai_access_handles_factory_exception() -> None:
+    # Building the Bedrock client can raise before verify_access() runs (e.g.
+    # NoRegionError when no region is resolvable). The helper must classify it to
+    # an actionable, credential-free result instead of letting it escape and
+    # crash the UI.
+    config = AiAssistConfig(enabled=True, model_id="model-x", region=None)
+
+    def factory(cfg: AiAssistConfig, aws_profile: str | None) -> _FakeVerifyAssistant:
+        raise RuntimeError("NoRegionError: You must specify a region.")
+
+    result = run_verify_ai_access(config, None, assistant_factory=factory)
+
+    assert result.ok is False
+    assert result.reason == "UNKNOWN"
+    assert result.model_id == "model-x"
+    assert result.detail  # a fixed, actionable message, not a raw exception
+
+
 def test_run_verify_ai_access_default_profile_is_none() -> None:
     captured: dict[str, object] = {}
     config = AiAssistConfig()

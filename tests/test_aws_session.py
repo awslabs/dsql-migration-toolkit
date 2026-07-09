@@ -148,9 +148,11 @@ def test_bedrock_client_built_from_shared_session_honoring_profile(
     # The Bedrock client comes from the shared session built for the global profile.
     assert recorded["aws_profile"] == "myprofile"
     assert isinstance(client, _FakeClient)
-    assert session.client_calls == [
-        (BEDROCK_RUNTIME_SERVICE, {"region_name": "us-east-1"})
-    ]
+    assert len(session.client_calls) == 1
+    service, kwargs = session.client_calls[0]
+    assert service == BEDROCK_RUNTIME_SERVICE
+    assert kwargs["region_name"] == "us-east-1"
+    assert kwargs["config"].read_timeout == 60  # bounded timeout, not a hang
 
 
 def test_bedrock_client_falls_back_to_default_shared_session(
@@ -169,7 +171,11 @@ def test_bedrock_client_falls_back_to_default_shared_session(
     build_bedrock_runtime_client(AiAssistConfig(enabled=True))
 
     assert recorded["aws_profile"] is None
-    assert session.client_calls == [(BEDROCK_RUNTIME_SERVICE, {})]
+    assert len(session.client_calls) == 1
+    service, kwargs = session.client_calls[0]
+    assert service == BEDROCK_RUNTIME_SERVICE
+    assert "region_name" not in kwargs
+    assert kwargs["config"].read_timeout == 60
 
 
 def test_bedrock_explicit_session_takes_precedence_over_profile(
@@ -187,9 +193,11 @@ def test_bedrock_explicit_session_takes_precedence_over_profile(
         aws_profile="ignored",
     )
 
-    assert injected.client_calls == [
-        (BEDROCK_RUNTIME_SERVICE, {"region_name": "eu-west-1"})
-    ]
+    assert len(injected.client_calls) == 1
+    service, kwargs = injected.client_calls[0]
+    assert service == BEDROCK_RUNTIME_SERVICE
+    assert kwargs["region_name"] == "eu-west-1"
+    assert kwargs["config"].read_timeout == 60
 
 
 # ---------------------------------------------------------------------------

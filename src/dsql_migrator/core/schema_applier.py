@@ -269,6 +269,16 @@ class SchemaApplier:
             try:
                 self._execute(parsed, target_ddl, drop_first=False)
             except Exception as exc:  # noqa: BLE001 - surfaced as a FAILED result
+                # CREATE SCHEMA IF NOT EXISTS is already idempotent, but self-heal
+                # a duplicate-object race (SQLSTATE 42P07) the same way the
+                # table/view/index path does below, so a concurrent create still
+                # converges to CREATED instead of a spurious FAILED.
+                if _is_duplicate_object(exc):
+                    return ApplyResult(
+                        object_name=parsed.name,
+                        status=ApplyStatus.CREATED,
+                        detail="Schema already present on the target.",
+                    )
                 return ApplyResult(
                     object_name=parsed.name,
                     status=ApplyStatus.FAILED,

@@ -43,9 +43,12 @@ def test_parse_rds_region() -> None:
 
 
 class _FakeRds:
-    def __init__(self, *, by_id=None, by_cluster=None, raises=False) -> None:  # noqa: ANN001
+    def __init__(
+        self, *, by_id=None, by_cluster=None, cluster_members=None, raises=False
+    ) -> None:  # noqa: ANN001
         self._by_id = by_id or {}
         self._by_cluster = by_cluster or {}
+        self._cluster_members = cluster_members or {}
         self._raises = raises
         self.calls: list[dict] = []
 
@@ -59,6 +62,48 @@ class _FakeRds:
             cluster = kwargs["Filters"][0]["Values"][0]
             instances = self._by_cluster.get(cluster, [])
         return {"DBInstances": instances}
+
+    def describe_db_clusters(self, **kwargs):  # noqa: ANN003, ANN201
+        self.calls.append(kwargs)
+        members = self._cluster_members.get(kwargs.get("DBClusterIdentifier"), [])
+        return {"DBClusters": [{"DBClusterMembers": members}]}
+
+
+def test_describe_source_instance_prefers_cluster_writer() -> None:
+    # An Aurora cluster reports all members with no writer flag on
+    # DescribeDBInstances; the writer is resolved via DescribeDBClusters so an
+    # asymmetric writer/reader topology reports the WRITER's class, not a reader's.
+    rds = _FakeRds(
+        by_cluster={
+            "mycluster": [
+                {"DBInstanceIdentifier": "reader-1", "DBInstanceClass": "db.r6g.large"},
+                {"DBInstanceIdentifier": "writer-1", "DBInstanceClass": "db.r6g.4xlarge"},
+            ]
+        },
+        cluster_members={
+            "mycluster": [
+                {"DBInstanceIdentifier": "reader-1", "IsClusterWriter": False},
+                {"DBInstanceIdentifier": "writer-1", "IsClusterWriter": True},
+            ]
+        },
+    )
+    info = describe_source_instance(rds, _CLUSTER)
+    assert info is not None
+    assert info.instance_class == "db.r6g.4xlarge"
+
+
+def test_describe_source_instance_cluster_falls_back_to_first_member() -> None:
+    # No writer info (or missing rds:DescribeDBClusters) -> first member, safely.
+    rds = _FakeRds(
+        by_cluster={
+            "mycluster": [
+                {"DBInstanceIdentifier": "only-1", "DBInstanceClass": "db.r6g.large"},
+            ]
+        }
+    )
+    info = describe_source_instance(rds, _CLUSTER)
+    assert info is not None
+    assert info.instance_class == "db.r6g.large"
 
 
 def test_describe_source_instance_for_instance_endpoint() -> None:

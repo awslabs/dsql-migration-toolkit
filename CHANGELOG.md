@@ -5,6 +5,45 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.82
+
+### Fixed
+
+- **AI assist: expired/invalid AWS credentials now give an actionable message.**
+  An expired-session or invalid-signature error (`ExpiredTokenException`,
+  `InvalidSignatureException`, `InvalidClientTokenId`, …) was misclassified as a
+  generic "unavailable"/"unknown", telling the user only that the workflow
+  continues without AI — with no hint to re-authenticate. Such errors are now
+  classified as `ACCESS_DENIED` on both the suggestion and "Verify AI access"
+  paths, and both messages now mention re-authenticating if credentials/session
+  expired.
+- **Cluster-wide schema read: cross-schema foreign-key targets are now
+  schema-qualified.** When reflecting an entire cluster (multiple schemas), a
+  table name was qualified `schema.table` but its foreign key's referenced table
+  stayed unqualified, so a downstream orphan-check / DDL query resolved the parent
+  against the search_path (or a wrong same-named table in another schema). The FK
+  target is now qualified with the FK's own `referred_schema` (or the reflected
+  schema for a same-schema FK), matching how table names are qualified.
+
+### Changed
+
+- **AI assist hardening.** The Bedrock client now sets bounded connect/read
+  timeouts (10s / 60s) so a hung connection can't leave an "AI is writing…" /
+  "Verifying…" state spinning forever (a stalled socket surfaces as a
+  classified network/timeout error). "Verify AI access" now also catches an
+  error while *building* the client (e.g. no resolvable region) and reports it
+  as an actionable result instead of letting the exception reach the UI. The
+  persistent AI-status line in the connection screen now carries its verdict
+  severity via the design-system palette instead of plain gray text.
+- **Source overview: report the Aurora writer's instance class, not a reader's.**
+  For an Aurora cluster endpoint the source-metadata lookup now resolves the
+  writer via `DescribeDBClusters` (`IsClusterWriter`) instead of taking an
+  arbitrary cluster member, so an asymmetric writer/reader topology no longer
+  mislabels the source capacity (best-effort; falls back to the first member).
+- **Schema apply: `CREATE SCHEMA` self-heals a duplicate-object race.** A `42P07`
+  on schema creation is now absorbed as `CREATED` (the schema is present),
+  matching the table/view/index self-heal path, instead of a spurious `FAILED`.
+
 ## v0.1.81
 
 ### Fixed

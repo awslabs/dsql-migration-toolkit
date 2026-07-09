@@ -450,7 +450,8 @@ class _FakeInspector:
         return []
 
     def get_foreign_keys(self, table_name, schema=None):
-        return []
+        table = self._catalog[schema]["tables"][table_name]
+        return list(table.get("foreign_keys", []))
 
     def get_view_names(self, schema=None):
         return list(self._catalog.get(schema, {}).get("views", {}).keys())
@@ -489,6 +490,64 @@ def test_cluster_wide_introspection_qualifies_names_across_schemas() -> None:
     assert table_names == {"shop.orders", "shop.customers", "billing.invoices"}
     assert {view.name for view in inventory.views} == {"shop.active"}
     assert "mysql.user" not in table_names
+
+
+def test_cluster_wide_introspection_qualifies_cross_schema_fk_target() -> None:
+    from dsql_migrator.core.introspector import _assemble_inventory
+
+    catalog = {
+        "shop": {
+            "tables": {
+                "orders": {
+                    "foreign_keys": [
+                        {
+                            "name": "fk_cust",
+                            "constrained_columns": ["customer_id"],
+                            "referred_schema": "billing",
+                            "referred_table": "customers",
+                            "referred_columns": ["id"],
+                        }
+                    ]
+                },
+            },
+        },
+        "billing": {"tables": {"customers": {}}},
+    }
+    inventory = _assemble_inventory(
+        _FakeInspector(catalog), _NonMysqlConnection(), None, is_mysql=False
+    )
+    orders = next(t for t in inventory.tables if t.name == "shop.orders")
+    # Cross-schema FK target is qualified with the FK's referred_schema, matching
+    # how the child table name is qualified in cluster-wide mode (was unqualified
+    # "customers", which resolved against the search_path / a wrong same-named table).
+    assert orders.foreign_keys[0].referenced_table == "billing.customers"
+
+
+def test_cluster_wide_same_schema_fk_qualified_with_reflected_schema() -> None:
+    from dsql_migrator.core.introspector import _assemble_inventory
+
+    catalog = {
+        "shop": {
+            "tables": {
+                "orders": {
+                    "foreign_keys": [
+                        {
+                            "name": "fk_self",
+                            "constrained_columns": ["parent_id"],
+                            "referred_table": "orders",
+                            "referred_columns": ["id"],
+                            # No referred_schema -> same schema as the child table.
+                        }
+                    ]
+                },
+            },
+        },
+    }
+    inventory = _assemble_inventory(
+        _FakeInspector(catalog), _NonMysqlConnection(), None, is_mysql=False
+    )
+    orders = next(t for t in inventory.tables if t.name == "shop.orders")
+    assert orders.foreign_keys[0].referenced_table == "shop.orders"
 
 
 def test_single_database_introspection_keeps_unqualified_names() -> None:

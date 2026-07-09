@@ -101,7 +101,11 @@ def describe_source_instance(
         instances = response.get("DBInstances", []) if response else []
         if not instances:
             return None
-        instance = instances[0]
+        instance = (
+            _prefer_cluster_writer(rds_client, identifier, instances)
+            if is_cluster_endpoint(endpoint)
+            else instances[0]
+        )
         return SourceInstanceInfo(
             instance_class=instance.get("DBInstanceClass"),
             engine=instance.get("Engine"),
@@ -110,6 +114,40 @@ def describe_source_instance(
         )
     except Exception:  # noqa: BLE001 - metadata is optional, never fatal
         return None
+
+
+def _prefer_cluster_writer(
+    rds_client: object, cluster_id: str, instances: list
+) -> dict:
+    """Return the cluster's writer instance, or the first member as a fallback.
+
+    ``describe_db_instances`` does not flag which member is the writer, so an
+    Aurora cluster with asymmetric writer/reader sizing could otherwise report a
+    reader's ``DBInstanceClass`` on the overview diagram. Resolve the writer's id
+    from ``describe_db_clusters`` (``DBClusterMembers[].IsClusterWriter``) and
+    return that instance. Best-effort: any failure (e.g. missing
+    ``rds:DescribeDBClusters``) or a no-match falls back to the first member.
+    """
+    try:
+        clusters = rds_client.describe_db_clusters(  # type: ignore[attr-defined]
+            DBClusterIdentifier=cluster_id
+        )
+        members = (clusters.get("DBClusters") or [{}])[0].get("DBClusterMembers") or []
+        writer_id = next(
+            (
+                member.get("DBInstanceIdentifier")
+                for member in members
+                if member.get("IsClusterWriter")
+            ),
+            None,
+        )
+        if writer_id:
+            for instance in instances:
+                if instance.get("DBInstanceIdentifier") == writer_id:
+                    return instance
+    except Exception:  # noqa: BLE001 - best-effort; fall back to the first member
+        pass
+    return instances[0]
 
 
 def _active_security_group_ids(instance: dict) -> tuple[str, ...]:

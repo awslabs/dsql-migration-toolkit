@@ -174,11 +174,19 @@ def build_bedrock_runtime_client(
         active_session = build_session(aws_profile)
     else:
         active_session = _default_session()
+    # Bound the connect/read timeouts so a hung TCP connection to Bedrock cannot
+    # leave an "AI is writing…"/"Verifying…" state spinning forever -- a stalled
+    # socket surfaces as a NETWORK/timeout error the caller classifies and shows.
+    # For a streaming response read_timeout applies per chunk (a healthy,
+    # progressing stream resets it), so it never truncates a long-but-live reply.
+    from botocore.config import Config as _BotoConfig
+
+    client_config = _BotoConfig(connect_timeout=10, read_timeout=60)
     if config.region:
         return active_session.client(
-            BEDROCK_RUNTIME_SERVICE, region_name=config.region
+            BEDROCK_RUNTIME_SERVICE, region_name=config.region, config=client_config
         )
-    return active_session.client(BEDROCK_RUNTIME_SERVICE)
+    return active_session.client(BEDROCK_RUNTIME_SERVICE, config=client_config)
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +318,8 @@ _UNAVAILABLE_DETAILS: dict[str, str] = {
         "AI assist is unavailable: access to Amazon Bedrock InvokeModel was "
         "denied. The deterministic conversion result and its MANUAL/UNSUPPORTED "
         "flag are kept. Grant a scoped bedrock:InvokeModel permission to enable "
-        "AI suggestions."
+        "AI suggestions -- or, if your AWS credentials or session have expired, "
+        "re-authenticate and retry."
     ),
     "THROTTLED": (
         "AI assist is temporarily unavailable: Amazon Bedrock throttled the "
@@ -387,6 +396,28 @@ class AiSuggestionOutcome:
         return cls(available=False, reason=error.reason, detail=error.detail)
 
 
+# IAM / SigV4 auth failures: either no permission, or the credentials/session
+# have expired or are otherwise invalid. Both map to ACCESS_DENIED -- the
+# actionable message covers granting the permission AND re-authenticating -- so
+# an expired-token error no longer degrades to a vague generic "unavailable".
+_ACCESS_DENIED_CODES = frozenset(
+    {
+        "AccessDeniedException",
+        "AccessDenied",
+        "UnauthorizedException",
+        "UnrecognizedClientException",
+        "ExpiredTokenException",
+        "ExpiredToken",
+        "RequestExpired",
+        "InvalidSignatureException",
+        "SignatureDoesNotMatch",
+        "InvalidClientTokenId",
+        "InvalidAccessKeyId",
+        "AuthFailure",
+    }
+)
+
+
 def _classify_bedrock_error(exc: BaseException) -> UnavailableReason:
     """Map a boto/Bedrock exception to a credential-free unavailability reason.
 
@@ -404,12 +435,7 @@ def _classify_bedrock_error(exc: BaseException) -> UnavailableReason:
         if isinstance(error, Mapping):
             code = str(error.get("Code") or "")
 
-    if code in {
-        "AccessDeniedException",
-        "AccessDenied",
-        "UnauthorizedException",
-        "UnrecognizedClientException",
-    }:
+    if code in _ACCESS_DENIED_CODES:
         return "ACCESS_DENIED"
     if code in {
         "ThrottlingException",
@@ -469,7 +495,8 @@ _ACCESS_CHECK_DETAILS: dict[str, str] = {
     "ACCESS_DENIED": (
         "Access to Amazon Bedrock InvokeModel was denied. Add a scoped "
         "bedrock:InvokeModel permission for the configured model and region, "
-        "then retry."
+        "then retry. If your AWS credentials or session have expired, "
+        "re-authenticate first."
     ),
     "MODEL_NOT_ENABLED": (
         "The configured model is not enabled or not available in the configured "
@@ -518,12 +545,7 @@ def _classify_access_check_error(exc: BaseException) -> AccessCheckReason:
         if isinstance(error, Mapping):
             code = str(error.get("Code") or "")
 
-    if code in {
-        "AccessDeniedException",
-        "AccessDenied",
-        "UnauthorizedException",
-        "UnrecognizedClientException",
-    }:
+    if code in _ACCESS_DENIED_CODES:
         return "ACCESS_DENIED"
     if code in _MODEL_NOT_ENABLED_CODES:
         return "MODEL_NOT_ENABLED"
