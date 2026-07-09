@@ -5,6 +5,22 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.80
+
+### 변경 (Changed)
+
+- **UI: 상태 표시를 임의 글리프/색상 대신 디자인 시스템 팔레트로 통일.** Data Migration ·
+  Evaluation 화면 전반의 디자인 시스템 일관화 패스:
+  - Full Load "CDC 스트리밍 중" 경고 카드와 CDC 일관성 / 스트림 지연 컬럼에서 리터럴
+    `✓`/`✗`/`⚠` 글리프 제거(해당 글리프가 없는 폰트에서 두부(tofu) 박스로 깨질 위험).
+    심각도는 기존 색상 알림 박스 / 상태 배지가 전달하며, 헬스 테이블 레전드는 글리프 대신
+    색상 배지를 설명하도록 문구를 수정.
+  - busy 버튼(Fetch current position, Start CDC, Apply to target)은 디자인 시스템이 금지한
+    Quasar `loading` prop 대신 버튼 비활성화 + 라벨 교체(예: "Applying…")로 진행 상태 표시.
+  - 경고/파괴적 큐는 orange 대신 디자인 시스템의 amber 사용(Stop CDC 버튼, 점수 게이지,
+    노력/충돌 배지).
+  - 렌더링되지 않던 죽은 `_format_complete_cell` 헬퍼 제거.
+
 ## v0.1.79
 
 ### 수정 (Fixed)

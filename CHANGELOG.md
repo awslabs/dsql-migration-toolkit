@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.80
+
+### Changed
+
+- **UI: statuses use the design-system palette instead of ad-hoc glyphs/colors.**
+  A design-system consistency pass across the Data Migration and Evaluation
+  screens:
+  - The Full Load "CDC is streaming" warning card and the CDC consistency /
+    stream-lag columns no longer embed literal `✓`/`✗`/`⚠` glyphs (a
+    tofu-box risk on fonts lacking them). Severity is carried by the existing
+    colored notice box / status badge; the health-table legend was reworded to
+    describe the colored badges rather than glyphs.
+  - Busy buttons (Fetch current position, Start CDC, Apply to target) now show
+    the in-progress state by disabling + swapping the label (e.g. "Applying…")
+    instead of the Quasar `loading` prop the design system forbids.
+  - Warning/disruptive cues use the design system's amber rather than orange
+    (Stop CDC buttons, the score gauge, effort/conflict badges).
+  - Removed a dead, never-rendered `_format_complete_cell` helper.
+
 ## v0.1.79
 
 ### Fixed

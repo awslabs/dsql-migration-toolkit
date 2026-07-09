@@ -317,7 +317,7 @@ _SCORE_BANDS: tuple[tuple[int, str, str, str], ...] = (
 # agrees with the tone-colored notice beneath it (one severity language).
 _SCORE_GAUGE_COLOR: dict[str, str] = {
     "success": "positive",
-    "warning": "orange",
+    "warning": "amber",
     "error": "negative",
 }
 
@@ -431,7 +431,7 @@ def classification_label(value: str) -> str:
 # Quasar badge colors for each effort level (impact cue).
 _EFFORT_BADGE_COLOR = {
     "SIMPLE": "green-6",
-    "MEDIUM": "orange-8",
+    "MEDIUM": "amber-8",
     "SIGNIFICANT": "red-8",
 }
 
@@ -1560,7 +1560,7 @@ def _render_target(ui: object, result: EvaluationResult) -> None:
         )
         with ui.row().classes("items-center gap-1 flex-wrap"):  # type: ignore[attr-defined]
             for name in result.target_conflicts:
-                ui.badge(name).props("color=orange-7 outline")  # type: ignore[attr-defined]
+                ui.badge(name).props("color=amber-7 outline")  # type: ignore[attr-defined]
         ui.label(  # type: ignore[attr-defined]
             "Resolve these in Schema Conversion: choose SKIP (keep the existing "
             "object) or REPLACE (recreate it) when you apply."

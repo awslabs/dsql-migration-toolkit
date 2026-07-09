@@ -486,7 +486,7 @@ def _render_cdc_params_file(ui, params) -> None:
     ).classes("w-full mt-2").props("expand-separator"):
         inline_hint(  # type: ignore[attr-defined]
             ui,
-            f"⚠ Replace every value starting with {CDC_PLACEHOLDER_PREFIX} "
+            f"Replace every value starting with {CDC_PLACEHOLDER_PREFIX} "
             f"({n_placeholder} customer-environment value(s)) before deploying — "
             "CloudFormation will reject or fail on an unfilled placeholder.",
             tone="warning",
@@ -734,7 +734,8 @@ def _render_cdc_manual_inputs(
             )
             return
 
-        fetch_btn.props("loading")
+        fetch_btn.disable()
+        fetch_btn.set_text("Fetching…")
 
         def _do_fetch():
             engine_factory = make_source_engine_factory(source_password)
@@ -751,10 +752,12 @@ def _render_cdc_manual_inputs(
                 f"Failed to fetch: {exc}",
                 type="negative", position="top",
             )
-            fetch_btn.props(remove="loading")
+            fetch_btn.set_text("Fetch current position")
+            fetch_btn.enable()
             return
 
-        fetch_btn.props(remove="loading")
+        fetch_btn.set_text("Fetch current position")
+        fetch_btn.enable()
 
         if not row:
             ui.notify(  # type: ignore[attr-defined]
@@ -1380,7 +1383,7 @@ def _render_cdc_running_actions(
 
     ui.button(  # type: ignore[attr-defined]
         "Stop CDC", on_click=_confirm, icon="stop_circle"
-    ).props("color=orange outline")
+    ).props("color=amber outline")
 
 def _render_cdc_infra_deploy_action(
     ui, migration_state, job_manager, refresh, *, inventory=None, session=None
@@ -1826,7 +1829,8 @@ def _open_cdc_start_dialog(ui, migration_state, on_confirm, *, session=None) -> 
             )
 
         def _go() -> None:
-            start_btn.props("loading")
+            start_btn.disable()
+            start_btn.set_text("Submitting…")
             ui.notify(  # type: ignore[attr-defined]
                 "Submitting Start CDC…", type="info", position="top",
             )
@@ -1879,7 +1883,7 @@ def _open_cdc_stop_dialog(ui, migration_state, on_confirm, *, partial: bool = Fa
 
         with ui.row().classes("justify-end gap-2 w-full"):  # type: ignore[attr-defined]
             ui.button("Cancel", on_click=dialog.close).props("flat")  # type: ignore[attr-defined]
-            ui.button(confirm_label, on_click=_go).props("color=orange")  # type: ignore[attr-defined]
+            ui.button(confirm_label, on_click=_go).props("color=amber-8")  # type: ignore[attr-defined]
     dialog.open()
 
 def _open_cdc_delete_dialog(ui, migration_state, on_confirm, *, session=None) -> None:
@@ -2780,10 +2784,10 @@ def _render_migration_table_status(
 
             # User-facing consistency label + the verdict key (drives the badge color).
             _CONSISTENCY_LABEL = {
-                "consistent": "✓ consistent",
-                "quarantined": "⚠ data quarantined",
+                "consistent": "consistent",
+                "quarantined": "data quarantined",
                 "behind": "replicating…",
-                "gap": "⚠ rows missing",
+                "gap": "rows missing",
                 "ahead": "target ahead",
                 "unknown": "refresh to check",
             }
@@ -2796,7 +2800,7 @@ def _render_migration_table_status(
                 # landed on the target. Distinguishes a lagging stream from a
                 # caught-up-but-gappy one.
                 if r.stream_caught_up is True:
-                    stream = "✓ caught up"
+                    stream = "caught up"
                 elif r.stream_caught_up is False:
                     stream = f"{r.pk_gap:,} behind"
                 else:
@@ -2971,11 +2975,12 @@ def _render_migration_table_status(
                 "negative when the stream net-deleted rows (e.g. more deletes than "
                 "inserts) — that is expected, not an error.",
                 "Source rows — scan-free estimate. Target rows — exact count.",
-                "Stream lag — newest row (PK) on each side: “✓ caught up” vs “N behind”.",
-                "Consistency — ✓ consistent = counts match · replicating… = catching "
-                "up · ⚠ rows missing = newest landed but rows gone mid-stream · "
-                "⚠ data quarantined = DLQ has un-applied events.",
-                "Anything other than ✓ means investigate.",
+                "Stream lag — newest row (PK) on each side: “caught up” vs “N behind”.",
+                "Consistency — read the colored badge: green “consistent” = counts "
+                "match · “replicating…” = catching up · red “rows missing” = newest "
+                "landed but rows gone mid-stream · red “data quarantined” = DLQ has "
+                "un-applied events.",
+                "Any non-green consistency badge means investigate.",
             ]
             for _line in _legend:
                 with ui.row().classes("items-start gap-2 no-wrap w-full pl-1"):  # type: ignore[attr-defined]

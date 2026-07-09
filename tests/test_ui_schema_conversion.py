@@ -1825,8 +1825,9 @@ def test_apply_button_shows_busy_state_during_apply() -> None:
     async def _on_apply(name: str) -> None:
         # While the apply runs, the button must be in the busy state.
         apply_btn = ui.buttons[-1]
-        assert ("add", "loading disable") in apply_btn.prop_events
-        assert ("remove", "loading disable") not in apply_btn.prop_events
+        # Busy state = disabled (never the forbidden Quasar `loading` prop).
+        assert ("add", "disable") in apply_btn.prop_events
+        assert ("remove", "disable") not in apply_btn.prop_events
         calls.append(name)
 
     _render_editable_target(
@@ -1839,11 +1840,11 @@ def test_apply_button_shows_busy_state_during_apply() -> None:
 
     assert calls == ["orders"]
     # After the apply completes the busy state is cleared (added, then removed).
-    assert ("add", "loading disable") in apply_btn.prop_events
-    assert ("remove", "loading disable") in apply_btn.prop_events
+    assert ("add", "disable") in apply_btn.prop_events
+    assert ("remove", "disable") in apply_btn.prop_events
     assert apply_btn.prop_events.index(
-        ("add", "loading disable")
-    ) < apply_btn.prop_events.index(("remove", "loading disable"))
+        ("add", "disable")
+    ) < apply_btn.prop_events.index(("remove", "disable"))
 
 
 def test_apply_button_clears_busy_state_even_when_apply_raises() -> None:
@@ -1863,7 +1864,7 @@ def test_apply_button_clears_busy_state_even_when_apply_raises() -> None:
         asyncio.run(apply_btn.click_cb())
 
     # The finally block still clears the busy state so the button is usable again.
-    assert ("remove", "loading disable") in apply_btn.prop_events
+    assert ("remove", "disable") in apply_btn.prop_events
 
 
 # ---------------------------------------------------------------------------

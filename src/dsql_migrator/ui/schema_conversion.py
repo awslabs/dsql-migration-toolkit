@@ -3696,7 +3696,8 @@ def _render_editable_target(
         # looks like a dead click. Best-effort — a torn-down button must not raise.
         if button is not None:
             try:
-                button.props("loading disable")  # type: ignore[attr-defined]
+                button.props("disable")  # type: ignore[attr-defined]
+                button.set_text("Applying…")  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001 - button slot already gone
                 logger.debug("Apply button busy-state skipped: slot already rebuilt")
         try:
@@ -3704,7 +3705,8 @@ def _render_editable_target(
         finally:
             if button is not None:
                 try:
-                    button.props(remove="loading disable")  # type: ignore[attr-defined]
+                    button.props(remove="disable")  # type: ignore[attr-defined]
+                    button.set_text("Apply to target")  # type: ignore[attr-defined]
                 except Exception:  # noqa: BLE001 - button slot already gone
                     logger.debug("Apply button reset skipped: slot already rebuilt")
         # The apply handler may have already rebuilt this editor via a full

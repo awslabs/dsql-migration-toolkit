@@ -2210,22 +2210,21 @@ def _render_full_load_step(
                     "read only."
                 ).classes("text-sm")
                 if cdc_live_now:
-                    with ui.card().classes(
-                        "w-full bg-red-50 border border-red-200 gap-1"
-                    ):
-                        ui.label(
-                            "⚠ CDC is currently streaming. Re-running Full Load now "
-                            "will collide with the live pipeline -- the snapshot (and "
-                            "any DROP+recreate) writes to tables the CDC sink is "
-                            "actively applying changes to, which can drop streamed "
-                            "rows or create a gap/overlap (CDC resumes from the "
-                            "ORIGINAL watermark, not this new one)."
-                        ).classes("text-sm text-red-700")
-                        ui.label(
-                            "Stop CDC first (CDC step → Stop CDC), re-run the Full "
-                            "Load, then start CDC again so it resumes from the new "
-                            "snapshot."
-                        ).classes("text-xs text-red-700")
+                    render_notice(
+                        ui,
+                        tone="error",
+                        header="CDC is currently streaming",
+                        body=(
+                            "Re-running Full Load now will collide with the live "
+                            "pipeline -- the snapshot (and any DROP+recreate) writes "
+                            "to tables the CDC sink is actively applying changes to, "
+                            "which can drop streamed rows or create a gap/overlap "
+                            "(CDC resumes from the ORIGINAL watermark, not this new "
+                            "one). Stop CDC first (CDC step → Stop CDC), re-run the "
+                            "Full Load, then start CDC again so it resumes from the "
+                            "new snapshot."
+                        ),
+                    )
                 # Retry-failed: a checklist (all pre-checked) with each table's
                 # failure reason, so the user can uncheck tables not ready to retry
                 # and retry only the rest. Other actions just show badges.
@@ -2631,7 +2630,7 @@ def _render_full_load_step(
                 )
                 inline_hint(
                     ui,
-                    "⚠ CDC is live. Re-running Full Load can collide with the "
+                    "CDC is live. Re-running Full Load can collide with the "
                     "running stream -- stop CDC first (CDC step → Stop CDC).",
                     tone="warning",
                 )
@@ -2948,16 +2947,6 @@ def _format_attempts_cell(row: "FullLoadTableRow") -> str:
     if row.errors:
         return f"{row.attempts} · {row.errors} err"
     return str(row.attempts)
-
-
-def _format_complete_cell(row: "FullLoadTableRow") -> str:
-    """Render the per-table completeness cell comparing loaded vs source rows."""
-    complete = row.complete
-    if complete is True:
-        return "✓ match"
-    if complete is False:
-        return f"✗ {row.rows_loaded}/{row.expected_rows}"
-    return ""
 
 
 # Friendly labels for each load state, used by the status-distribution chips.
