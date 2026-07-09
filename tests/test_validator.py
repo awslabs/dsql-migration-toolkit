@@ -1053,6 +1053,26 @@ def test_checksum_decimal_fixed_scale() -> None:
     assert "4" in pg_sql
 
 
+def test_numeric_mask_covers_full_decimal65_range() -> None:
+    # Regression: the mask integer run was 18 digits, but the MySQL side casts to
+    # DECIMAL(65, scale) and BIGINT UNSIGNED is stored as numeric(20, 0). A value
+    # like 18446744073709551615 (20 digits) overflowed the mask, making to_char
+    # emit '#' padding instead of the digits -> a spurious checksum MISMATCH on
+    # byte-identical data. The mask must span the full 65-digit integer range.
+    from dsql_migrator.core.validator import _pg_numeric_mask
+
+    mask = _pg_numeric_mask(0)
+    integer_positions = sum(ch in "90" for ch in mask)
+    assert integer_positions >= 65
+    # BIGINT UNSIGNED max (20 digits) and DECIMAL(65,0) both fit.
+    assert integer_positions >= len("18446744073709551615")
+
+    scaled = _pg_numeric_mask(4)
+    # Fixed 4-digit fraction preserved, integer run unchanged.
+    assert scaled.endswith("D0000")
+    assert sum(ch == "9" for ch in scaled.split("D")[0]) >= 64
+
+
 def test_checksum_float_columns_excluded() -> None:
     # FLOAT/DOUBLE have no byte-identical cross-engine text form, so they are
     # omitted from the concatenation entirely on BOTH engines and in all four

@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.78
+
+### Fixed
+
+- **Schema Conversion: `DOUBLE(M,D)` now emits valid DSQL DDL.** A MySQL
+  `DOUBLE(M,D)` column (e.g. `DOUBLE(10,2)`) fell through the type mapper (it parses
+  to sqlglot kind `DOUBLE`, which the `UDOUBLE`/`FLOAT` special cases both miss),
+  so it rendered as a two-argument `FLOAT(10, 2)`. PostgreSQL/DSQL `double precision`
+  takes no arguments, so this was a syntax error that failed the **entire** table's
+  `CREATE TABLE` at apply time. `DOUBLE(M,D)` now maps to a plain `double precision`
+  (the `(M,D)` display spec carries no storage meaning), matching the existing
+  `FLOAT(M,D) -> real` handling.
+- **Validation: large `BIGINT UNSIGNED` / `DECIMAL` values no longer produce false
+  checksum mismatches.** The PostgreSQL-side `to_char` numeric mask provided only 18
+  integer digit positions, but the MySQL side renders via `CAST(... AS DECIMAL(65,
+  scale))` and `BIGINT UNSIGNED` is stored as `numeric(20, 0)`. Any integer magnitude
+  at or above ~10^18 (e.g. `18446744073709551615`) overflowed the mask, so `to_char`
+  emitted the overflow indicator (`####...`) instead of the digits — making a
+  byte-identical value report a **checksum MISMATCH** and potentially blocking
+  cut-over on a false alarm. The mask now spans the full 65-digit `DECIMAL(65,0)`
+  integer range.
+
 ## v0.1.77
 
 ### Fixed

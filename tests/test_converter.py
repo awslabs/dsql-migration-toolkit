@@ -136,6 +136,32 @@ def test_float_with_scale_maps_to_real() -> None:
     assert "(" not in map_mysql_type("double")[0] or True
 
 
+def test_double_with_scale_maps_to_double_precision() -> None:
+    # MySQL DOUBLE(M,D) renders a two-arg FLOAT(10, 2) (sqlglot kind DOUBLE, which
+    # misses the UDOUBLE mapping); PG ``double precision`` takes NO argument, so the
+    # two-arg form is a syntax error. Must drop to a plain double precision.
+    target = map_mysql_type("double(10,2)")[0].lower()
+    assert target == "double precision"
+    assert "(" not in target
+
+
+def test_double_with_scale_emits_valid_ddl_end_to_end() -> None:
+    # Regression: DOUBLE(M,D) used to fall through to a bare FLOAT(10, 2) render,
+    # which fails the WHOLE CREATE TABLE on DSQL/PG16 ("syntax error at or near ,").
+    table = TableDef(
+        name="prices",
+        columns=[
+            ColumnDef(name="id", mysql_type="INT", nullable=False),
+            ColumnDef(name="amount", mysql_type="DOUBLE(10,2)"),
+        ],
+        primary_key=["id"],
+    )
+    ddl = SchemaConverter().convert_table(table).target_ddl
+    assert "double precision" in ddl.lower()
+    assert "FLOAT(10, 2)" not in ddl
+    assert "double precision(" not in ddl.lower()
+
+
 def test_decimal_unsigned_maps_to_numeric_preserving_precision() -> None:
     # DECIMAL(p,s) UNSIGNED renders the nonexistent UDECIMAL; must become numeric(p,s).
     target = map_mysql_type("decimal(10,2) unsigned")[0].lower()

@@ -177,8 +177,20 @@ def _pg_numeric_mask(scale: int) -> str:
     magnitude renders without a leading placeholder space, and ``0`` digits force
     a fixed fractional width matching MySQL ``CAST(col AS DECIMAL(65, scale))``.
     Mirrors the MySQL side so equal decimals render byte-identically.
+
+    The integer run must be wide enough for the widest value the MySQL side can
+    render. That side casts to ``DECIMAL(65, scale)`` (MySQL's max precision) and
+    ``BIGINT UNSIGNED`` is stored as ``numeric(20, 0)`` on the target, so integer
+    magnitudes reach up to 65 digits. A too-short mask makes ``to_char`` emit the
+    overflow indicator (``#``...) instead of the digits, so a byte-identical value
+    would produce a spurious cross-engine checksum MISMATCH. A generous run of
+    ``9`` positions is safe: under ``FM`` the extra positions render nothing for
+    smaller magnitudes (``9`` suppresses non-significant leading digits), so the
+    output is identical to a tighter mask for every value that fits.
     """
-    integer_part = "FM999999999999999990"
+    # 64 nines + a trailing zero = 65 integer digit positions, covering the full
+    # DECIMAL(65, 0) integer range (and thus BIGINT UNSIGNED's 20-digit max).
+    integer_part = "FM" + ("9" * 64) + "0"
     if scale <= 0:
         return integer_part
     return integer_part + "D" + ("0" * scale)

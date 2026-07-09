@@ -444,7 +444,8 @@ _SIGNED_INT_TARGET: dict[exp.DataType.Type, str] = {
 # ``DOUBLE UNSIGNED``->``UDOUBLE`` (nonexistent). Maps to a plain PG float type
 # (unsigned-ness is not representable and carries no storage meaning). ``FLOAT
 # UNSIGNED`` is not handled because sqlglot cannot even parse it as a standalone
-# type. ``FLOAT(M,D)`` and ``DECIMAL UNSIGNED`` are handled inline in map_data_type.
+# type. ``FLOAT(M,D)``, ``DOUBLE(M,D)`` and ``DECIMAL UNSIGNED`` are handled inline
+# in map_data_type.
 _FLOAT_TARGET: dict[exp.DataType.Type, str] = {
     _DType.UDOUBLE: "double precision",
 }
@@ -593,6 +594,15 @@ def map_data_type(data_type: exp.DataType) -> Optional[_Mapping]:
         # precision (1-53), not a scale, so the two-arg form is a syntax error. The
         # (M,D) display spec carries no storage meaning -> plain ``real``.
         return _Mapping(target=_build("real"))
+
+    if kind is _DType.DOUBLE and len(data_type.expressions) >= 2:
+        # MySQL DOUBLE(M,D) -> sqlglot renders a two-arg ``FLOAT(10, 2)`` (kind
+        # DOUBLE, not UDOUBLE, so it misses ``_FLOAT_TARGET`` above). PostgreSQL
+        # ``double precision`` takes NO arguments, so the (M,D) form is a syntax
+        # error. The display spec carries no storage meaning -> plain
+        # ``double precision``. (Bare DOUBLE renders correctly and falls through;
+        # DOUBLE UNSIGNED -> UDOUBLE is handled by ``_FLOAT_TARGET`` above.)
+        return _Mapping(target=_build("double precision"))
 
     if kind is _DType.UDECIMAL:
         # DECIMAL(p,s) UNSIGNED -> sqlglot ``UDECIMAL(p,s)`` (nonexistent). Map to

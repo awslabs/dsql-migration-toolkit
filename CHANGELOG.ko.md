@@ -5,6 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.78
+
+### 수정 (Fixed)
+
+- **스키마 변환: `DOUBLE(M,D)`가 이제 유효한 DSQL DDL을 생성함.** MySQL `DOUBLE(M,D)`
+  컬럼(예: `DOUBLE(10,2)`)이 타입 매퍼를 그대로 통과했다(sqlglot이 이를 `DOUBLE` 종류로
+  파싱하는데 `UDOUBLE`/`FLOAT` 특수 케이스 모두 이를 놓침). 그 결과 두 인자를 가진
+  `FLOAT(10, 2)`로 렌더링되었다. PostgreSQL/DSQL의 `double precision`은 인자를 받지
+  않으므로 이는 문법 오류였고, 적용 시점에 **테이블 전체**의 `CREATE TABLE`을 실패시켰다.
+  이제 `DOUBLE(M,D)`는 (표시용 `(M,D)` 스펙은 저장 의미가 없으므로) 기존 `FLOAT(M,D) -> real`
+  처리와 동일하게 순수 `double precision`으로 매핑된다.
+- **검증: 큰 `BIGINT UNSIGNED` / `DECIMAL` 값이 더 이상 잘못된 체크섬 불일치를 만들지 않음.**
+  PostgreSQL 측 `to_char` 숫자 마스크가 정수 자리를 18개만 제공했지만, MySQL 측은
+  `CAST(... AS DECIMAL(65, scale))`로 렌더링하고 `BIGINT UNSIGNED`는 `numeric(20, 0)`으로
+  저장된다. 약 10^18 이상의 정수 크기(예: `18446744073709551615`)는 마스크를 넘쳐
+  `to_char`가 자릿수 대신 오버플로 표시(`####...`)를 출력했고, 바이트 단위로 동일한 값이
+  **체크섬 불일치**로 보고되어 컷오버를 잘못 차단할 수 있었다. 이제 마스크는
+  `DECIMAL(65,0)`의 전체 65자리 정수 범위를 커버한다.
+
 ## v0.1.77
 
 ### 수정 (Fixed)
