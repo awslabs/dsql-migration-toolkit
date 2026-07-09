@@ -5,6 +5,32 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.81
+
+### Fixed
+
+- **Evaluation: `TINYINT(1)`, `BIT(n)`, and `YEAR` are no longer reported as
+  fully auto-compatible.** The compatibility assessor had no rule for these three
+  types, so a table whose only notable column was one of them was classified
+  `AUTO` / `COMPATIBLE` with zero findings — even though the schema converter maps
+  all three to a *different* DSQL type with changed semantics (`MANUAL`), and a
+  `TINYINT(1)` value outside `{0,1}` aborts Full Load. Evaluation therefore showed
+  "fully compatible, no risk" for a table that could fail at load, contradicting
+  the assessor's own "nothing is silently treated as compatible" guarantee. New
+  `TINYINT_BOOLEAN` / `BIT_TYPE` / `YEAR_TYPE` rules now surface each as `MANUAL`
+  with the specific risk, matching the converter's classification.
+
+### Changed
+
+- **Evaluation: spatial columns are now `MANUAL`, not `UNSUPPORTED`.** Spatial
+  types (`GEOMETRY`, `POINT`, `POLYGON`, …) were classified `UNSUPPORTED` with a
+  "substitute or redesign the column" recommendation, implying the table was
+  blocked. But the converter already auto-substitutes each spatial column to
+  `bytea` (raw WKB bytes preserved end-to-end through Full Load and CDC), so the
+  table migrates. The new `SPATIAL_TYPE` rule reclassifies these as `MANUAL`
+  (review whether raw `bytea` suffices; spatial operators/indexes are lost),
+  which no longer sends users to redesign a table the tool already migrates.
+
 ## v0.1.80
 
 ### Changed

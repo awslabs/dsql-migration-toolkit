@@ -5,6 +5,27 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.81
+
+### 수정 (Fixed)
+
+- **Evaluation: `TINYINT(1)`·`BIT(n)`·`YEAR`가 더 이상 "완전 자동 호환"으로 보고되지 않음.**
+  호환성 assessor에 이 세 타입 규칙이 없어, 이런 컬럼만 있는 테이블이 `AUTO`/`COMPATIBLE`(위험
+  0)로 분류됐다 — 스키마 컨버터는 셋 다 의미가 바뀐 *다른* DSQL 타입(`MANUAL`)으로 매핑하고,
+  특히 `TINYINT(1)` 값이 `{0,1}` 밖이면 Full Load가 중단되는데도. 즉 Evaluation이 적재에서
+  실패할 수 있는 테이블을 "완전 호환·위험 0"으로 보여줘 assessor의 "조용히 호환 처리 안 함"
+  보장과 모순됐다. 이제 `TINYINT_BOOLEAN`/`BIT_TYPE`/`YEAR_TYPE` 규칙이 각각을 컨버터 분류에
+  맞춰 구체적 위험과 함께 `MANUAL`로 표면화한다.
+
+### 변경 (Changed)
+
+- **Evaluation: 공간(spatial) 컬럼이 `UNSUPPORTED`가 아니라 `MANUAL`로 분류됨.** 공간
+  타입(`GEOMETRY`, `POINT`, `POLYGON` 등)이 "타입 치환 또는 컬럼 재설계" 권고와 함께
+  `UNSUPPORTED`로 분류돼 테이블이 차단된 것처럼 보였다. 하지만 컨버터는 이미 각 공간 컬럼을
+  `bytea`로 자동 치환(원본 WKB 바이트를 Full Load·CDC 전 구간 보존)하므로 테이블은 마이그레이션된다.
+  새 `SPATIAL_TYPE` 규칙이 이를 `MANUAL`(원본 `bytea`로 충분한지 검토; 공간 연산자/인덱스는 손실)로
+  재분류해, 이미 마이그레이션되는 테이블을 재설계하러 보내지 않는다.
+
 ## v0.1.80
 
 ### 변경 (Changed)

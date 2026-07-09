@@ -4,9 +4,10 @@
 """Unit tests for the compatibility assessment rule engine.
 
 Covers each rule (FK_UNSUPPORTED, TRIGGER_UNSUPPORTED, PROC_PLPGSQL,
-AUTO_INCREMENT, NO_PRIMARY_KEY, CI_COLLATION, PARTITIONED_TABLE,
-UNSUPPORTED_TYPE), the most-severe aggregation strategy, report export, and
-Property 8 (assessment completeness: every object is classified exactly once).
+AUTO_INCREMENT, NO_PRIMARY_KEY, CI_COLLATION, PARTITIONED_TABLE, SPATIAL_TYPE,
+TINYINT_BOOLEAN, BIT_TYPE, YEAR_TYPE), the most-severe aggregation strategy,
+report export, and Property 8 (assessment completeness: every object is
+classified exactly once).
 
 Requirements covered: 2.1, 2.2, 2.3, 2.4, 2.5.
 """
@@ -176,7 +177,9 @@ def test_partitioned_table_rule_classifies_table_manual() -> None:
     assert item.classification is Classification.MANUAL
 
 
-def test_unsupported_type_rule_classifies_table_unsupported() -> None:
+def test_spatial_type_rule_classifies_table_manual_not_unsupported() -> None:
+    # Spatial columns are auto-substituted to bytea (WKB preserved), so the table
+    # migrates -- it is MANUAL (review whether bytea suffices), not UNSUPPORTED.
     inventory = SourceInventory(
         tables=[
             _table_with_pk(
@@ -189,8 +192,9 @@ def test_unsupported_type_rule_classifies_table_unsupported() -> None:
         ]
     )
     item = _item_for(_assess(inventory), "places")
-    assert item.rule_id == "UNSUPPORTED_TYPE"
-    assert item.classification is Classification.UNSUPPORTED
+    assert item.rule_id == "SPATIAL_TYPE"
+    assert item.classification is Classification.MANUAL
+    assert "bytea" in item.risk
 
 
 def test_clean_table_is_classified_auto() -> None:
@@ -202,7 +206,7 @@ def test_clean_table_is_classified_auto() -> None:
     assert item.effort is None
 
 
-def test_significant_effort_for_unsupported_type() -> None:
+def test_medium_effort_for_spatial_type() -> None:
     inventory = SourceInventory(
         tables=[
             _table_with_pk(
@@ -215,7 +219,73 @@ def test_significant_effort_for_unsupported_type() -> None:
         ]
     )
     item = _item_for(_assess(inventory), "places")
-    assert item.effort is EffortLevel.SIGNIFICANT
+    assert item.effort is EffortLevel.MEDIUM
+
+
+def test_tinyint_one_flagged_manual_matching_converter() -> None:
+    # Regression: the assessor used to return AUTO/COMPATIBLE for a table whose
+    # only notable column was TINYINT(1)/BIT/YEAR, contradicting the converter's
+    # MANUAL classification and the "no silent compatible" guarantee. TINYINT(1)
+    # in particular is table-fatal at Full Load if a value is outside 0/1.
+    inventory = SourceInventory(
+        tables=[
+            _table_with_pk(
+                "flags",
+                columns=[
+                    ColumnDef(name="id", mysql_type="INT"),
+                    ColumnDef(name="active", mysql_type="TINYINT(1)"),
+                ],
+            )
+        ]
+    )
+    item = _item_for(_assess(inventory), "flags")
+    assert item.rule_id == "TINYINT_BOOLEAN"
+    assert item.classification is Classification.MANUAL
+
+
+def test_wide_tinyint_is_not_flagged_as_boolean() -> None:
+    # A wider TINYINT(n) is a normal small integer, not the boolean convention.
+    inventory = SourceInventory(
+        tables=[
+            _table_with_pk(
+                "counts",
+                columns=[
+                    ColumnDef(name="id", mysql_type="INT"),
+                    ColumnDef(name="n", mysql_type="TINYINT(4)"),
+                ],
+            )
+        ]
+    )
+    item = _item_for(_assess(inventory), "counts")
+    assert item.classification is Classification.AUTO
+
+
+def test_bit_and_year_flagged_manual() -> None:
+    inventory = SourceInventory(
+        tables=[
+            _table_with_pk(
+                "t_bit",
+                columns=[
+                    ColumnDef(name="id", mysql_type="INT"),
+                    ColumnDef(name="flags", mysql_type="BIT(8)"),
+                ],
+            ),
+            _table_with_pk(
+                "t_year",
+                columns=[
+                    ColumnDef(name="id", mysql_type="INT"),
+                    ColumnDef(name="yr", mysql_type="YEAR"),
+                ],
+            ),
+        ]
+    )
+    report = _assess(inventory)
+    bit_item = _item_for(report, "t_bit")
+    year_item = _item_for(report, "t_year")
+    assert bit_item.rule_id == "BIT_TYPE"
+    assert bit_item.classification is Classification.MANUAL
+    assert year_item.rule_id == "YEAR_TYPE"
+    assert year_item.classification is Classification.MANUAL
 
 
 def test_view_with_no_rules_is_classified_auto() -> None:
@@ -400,11 +470,14 @@ def test_default_rules_contains_all_documented_rule_ids() -> None:
         "NO_PRIMARY_KEY",
         "CI_COLLATION",
         "PARTITIONED_TABLE",
-        "UNSUPPORTED_TYPE",
+        "SPATIAL_TYPE",
         "TOO_MANY_COLUMNS",
         "OVERSIZED_LOB",
         "NUMERIC_PRECISION",
         "ENUM_SET_TYPE",
+        "TINYINT_BOOLEAN",
+        "BIT_TYPE",
+        "YEAR_TYPE",
         "VIEW_UNSUPPORTED_SQL",
         "GENERATED_COLUMN",
         "ON_UPDATE_TIMESTAMP",

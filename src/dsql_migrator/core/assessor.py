@@ -91,9 +91,11 @@ KIND_DATABASE = "database"
 # DSQL limit: at most 1,000 tables per database (cluster quotas).
 _MAX_TABLES_PER_DATABASE = 1000
 
-# MySQL base types with no lossless mapping to a DSQL (PostgreSQL 16) type.
-# These are flagged as UNSUPPORTED and require a type substitution/redesign.
-_UNSUPPORTED_TYPE_BASES = frozenset(
+# MySQL spatial base types with no native DSQL (PostgreSQL 16) equivalent. The
+# converter does NOT block these: it auto-substitutes each column to ``bytea``
+# and preserves the raw WKB bytes end-to-end, so they are flagged MANUAL (review
+# whether raw bytea suffices) rather than UNSUPPORTED (redesign required).
+_SPATIAL_TYPE_BASES = frozenset(
     {
         "geometry",
         "point",
@@ -130,6 +132,11 @@ _UNSUPPORTED_INDEX_TYPES = frozenset({"fulltext", "spatial"})
 
 # Captures the precision (first parenthesized integer) of a DECIMAL declaration.
 _DECIMAL_PRECISION_RE = re.compile(r"\(\s*(\d+)")
+
+# TINYINT(1) is MySQL's boolean convention (also the BOOL/BOOLEAN alias, which
+# information_schema reports as ``tinyint(1)``); a wider TINYINT(n) is a normal
+# small integer. Matches an explicit ``(1)`` display width only.
+_TINYINT_ONE_RE = re.compile(r"^\s*tinyint\s*\(\s*1\s*\)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -169,6 +176,11 @@ def _base_type(mysql_type: str) -> str:
 def _is_case_insensitive_collation(collation: str | None) -> bool:
     """Return ``True`` for a MySQL case-insensitive collation (``*_ci``)."""
     return bool(collation) and collation.strip().lower().endswith("_ci")
+
+
+def _is_tinyint_one(mysql_type: str) -> bool:
+    """Return ``True`` for ``TINYINT(1)`` (MySQL's boolean convention / BOOL)."""
+    return bool(_TINYINT_ONE_RE.match(mysql_type or ""))
 
 
 # ---------------------------------------------------------------------------
@@ -424,35 +436,47 @@ class PartitionedTableRule(Rule):
         return findings
 
 
-class UnsupportedTypeRule(Rule):
-    """Flag tables with a column type that cannot be mapped to a DSQL type."""
+class SpatialTypeRule(Rule):
+    """Flag spatial columns: auto-substituted to bytea, but review is needed.
 
-    rule_id = "UNSUPPORTED_TYPE"
+    MySQL spatial types have no native Aurora DSQL type. The converter does NOT
+    block the table -- it substitutes each spatial column to ``bytea`` and keeps
+    the raw WKB bytes (verified end-to-end through Full Load and CDC). But the
+    spatial type, its operators, and spatial indexes are lost, so the column is
+    flagged ``MANUAL`` for review rather than ``UNSUPPORTED`` (which would imply
+    a redesign is required before the table can migrate at all).
+    """
+
+    rule_id = "SPATIAL_TYPE"
 
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
         findings: list[Finding] = []
         for table in inventory.tables:
-            unmapped = [
+            spatial = [
                 f"{column.name} ({column.mysql_type})"
                 for column in table.columns
-                if _base_type(column.mysql_type) in _UNSUPPORTED_TYPE_BASES
+                if _base_type(column.mysql_type) in _SPATIAL_TYPE_BASES
             ]
-            if unmapped:
-                names = ", ".join(unmapped)
+            if spatial:
+                names = ", ".join(spatial)
                 findings.append(
                     Finding(
                         object=ObjectKey(KIND_TABLE, table.name),
                         rule_id=self.rule_id,
-                        classification=Classification.UNSUPPORTED,
+                        classification=Classification.MANUAL,
                         risk=(
-                            f"Column types ({names}) have no lossless mapping "
-                            "to an Aurora DSQL type."
+                            f"Spatial columns ({names}) have no native Aurora DSQL "
+                            "type; they are auto-converted to bytea (raw WKB bytes "
+                            "preserved), but spatial operators and spatial indexes "
+                            "are not available on the target."
                         ),
                         recommendation=(
-                            "Substitute an equivalent supported type or "
-                            "redesign the column."
+                            "Confirm raw WKB in a bytea column is sufficient; if "
+                            "spatial queries/indexes are needed, handle them in the "
+                            "application or a spatial service (e.g. Amazon "
+                            "OpenSearch Service)."
                         ),
-                        effort=EffortLevel.SIGNIFICANT,
+                        effort=EffortLevel.MEDIUM,
                     )
                 )
         return findings
@@ -594,6 +618,120 @@ class EnumSetRule(Rule):
                         recommendation=(
                             "Re-enforce the allowed values in the application "
                             "layer (or with a CHECK constraint if supported)."
+                        ),
+                        effort=EffortLevel.SIMPLE,
+                    )
+                )
+        return findings
+
+
+class TinyIntBooleanRule(Rule):
+    """Flag TINYINT(1)/BOOL columns (mapped to boolean by convention).
+
+    The converter maps ``TINYINT(1)`` to Aurora DSQL ``boolean`` (MySQL's boolean
+    convention). A stored value outside ``{0, 1}`` has no boolean representation
+    and aborts Full Load, so the column needs review -- ``MANUAL``, matching the
+    converter's own classification, not a silent AUTO verdict.
+    """
+
+    rule_id = "TINYINT_BOOLEAN"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            columns = [
+                column.name
+                for column in table.columns
+                if _is_tinyint_one(column.mysql_type)
+            ]
+            if columns:
+                names = ", ".join(columns)
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            f"Columns ({names}) are MySQL TINYINT(1) (the BOOL "
+                            "convention), mapped to Aurora DSQL boolean; a value "
+                            "outside 0/1 has no boolean representation and fails "
+                            "the load."
+                        ),
+                        recommendation=(
+                            "Confirm every value is 0 or 1, or migrate the column "
+                            "as a small integer instead of boolean."
+                        ),
+                        effort=EffortLevel.MEDIUM,
+                    )
+                )
+        return findings
+
+
+class BitTypeRule(Rule):
+    """Flag BIT(n) columns (no DSQL bit type; mapped to a sized integer)."""
+
+    rule_id = "BIT_TYPE"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            columns = [
+                column.name
+                for column in table.columns
+                if _base_type(column.mysql_type) == "bit"
+            ]
+            if columns:
+                names = ", ".join(columns)
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            f"Columns ({names}) use MySQL BIT, which Aurora DSQL "
+                            "does not support; the value is mapped to the smallest "
+                            "integer that holds the bits, so bit-string semantics "
+                            "and operators are not preserved."
+                        ),
+                        recommendation=(
+                            "Adjust application code that relied on bit-string "
+                            "behavior to work with the integer value."
+                        ),
+                        effort=EffortLevel.SIMPLE,
+                    )
+                )
+        return findings
+
+
+class YearTypeRule(Rule):
+    """Flag YEAR columns (no DSQL YEAR type; mapped to a smallint year)."""
+
+    rule_id = "YEAR_TYPE"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            columns = [
+                column.name
+                for column in table.columns
+                if _base_type(column.mysql_type) == "year"
+            ]
+            if columns:
+                names = ", ".join(columns)
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            f"Columns ({names}) use MySQL YEAR, which Aurora DSQL "
+                            "does not support; the value is mapped to a smallint "
+                            "integer year, so YEAR's display formatting and type "
+                            "semantics are not preserved."
+                        ),
+                        recommendation=(
+                            "Treat the column as an integer year in the "
+                            "application."
                         ),
                         effort=EffortLevel.SIMPLE,
                     )
@@ -852,11 +990,14 @@ def default_rules() -> list[Rule]:
         NoPrimaryKeyRule(),
         CaseInsensitiveCollationRule(),
         PartitionedTableRule(),
-        UnsupportedTypeRule(),
+        SpatialTypeRule(),
         TooManyColumnsRule(),
         OversizedLobRule(),
         DecimalPrecisionRule(),
         EnumSetRule(),
+        TinyIntBooleanRule(),
+        BitTypeRule(),
+        YearTypeRule(),
         GeneratedColumnRule(),
         AutoUpdateTimestampRule(),
         UnsupportedIndexTypeRule(),
@@ -1459,11 +1600,14 @@ __all__ = [
     "NoPrimaryKeyRule",
     "CaseInsensitiveCollationRule",
     "PartitionedTableRule",
-    "UnsupportedTypeRule",
+    "SpatialTypeRule",
     "TooManyColumnsRule",
     "OversizedLobRule",
     "DecimalPrecisionRule",
     "EnumSetRule",
+    "TinyIntBooleanRule",
+    "BitTypeRule",
+    "YearTypeRule",
     "GeneratedColumnRule",
     "AutoUpdateTimestampRule",
     "UnsupportedIndexTypeRule",
