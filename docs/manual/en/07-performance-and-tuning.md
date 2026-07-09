@@ -262,6 +262,18 @@ Two related cdc-stack parameters are fixed, not inferred: `SourceTasksMax` = 1
 (MySQL is single-task per server) and `SinkBatchMaxRows` = 3000 (DSQL's
 per-transaction row limit — **do not exceed 3000**).
 
+The sink's compute is sized separately from the source: `ConnectorMcuCount`
+applies to the source connector, `SinkMcuCount` (default 4) to the sink. The sink
+is CPU-bound under heavy load once its apply path was optimized, whereas the
+single-task source has spare CPU — so raise `SinkMcuCount` (not the source's) if
+the sink can't keep up. See the appendix (§12) for the measured curve.
+
+> **Source reboots are handled automatically.** The source connector sets
+> `errors.retry.timeout=600000` (10 min), so a source RDS/Aurora reboot
+> (maintenance, failover, resize) is absorbed: the connector retries across the
+> reboot and resumes from the committed binlog offset with no gap and no operator
+> action — you do **not** need to Stop/Start CDC after a reboot.
+
 ### On AWS (ECS Fargate) — yes, all of this is tunable there too
 
 The Full Load and Validation knobs are ordinary `DSQL_MIGRATOR_*` **environment

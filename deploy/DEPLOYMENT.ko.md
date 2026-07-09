@@ -2,8 +2,13 @@
 
 _언어: [English](DEPLOYMENT.md) | **한국어** | [日本語](DEPLOYMENT.ja.md)_
 
-이 가이드는 **컨트롤 플레인 앱**을 고객 자신의 AWS 계정과 VPC 안에서(단일 테넌트),
-**Application Load Balancer (HTTPS)** 뒤의 단일 태스크 **Amazon ECS Fargate** 서비스로 배포합니다.
+이 도구는 두 가지 방식으로 실행합니다: **로컬**(`uv run …`, 인프라 없음 — 평가·소규모
+마이그레이션에 적합)과 **ECS Fargate**(내 AWS 계정 안에서 도는 호스팅 서비스 — 실제·대규모
+마이그레이션에 적합)입니다. **이 가이드는 Fargate 배포(app-stack)를 다룹니다.** 로컬 실행은
+아래 [1단계](#1단계--어디서-실행할지-선택)와 루트 README를 참고하세요.
+
+Fargate에서는 **컨트롤 플레인 앱**이 고객 자신의 AWS 계정과 VPC 안에서(단일 테넌트),
+**Application Load Balancer (HTTPS)** 뒤의 단일 태스크 **Amazon ECS Fargate** 서비스로 뜨고,
 이미지는 **Amazon ECR**에서 가져옵니다. 기본적으로 ALB는 **`internal`**(로그인 불필요 — 네트워크가
 접근 게이트)이며, **Amazon Cognito (OIDC)** 로그인은 UI를 공개할 때만 필요한 opt-in 추가 기능입니다.
 선택적 스트리밍 **CDC 파이프라인**(MSK + Debezium + 싱크)은 별도의 `cdc-stack`이며 여기서 다루지 않습니다.
@@ -51,26 +56,29 @@ _언어: [English](DEPLOYMENT.md) | **한국어** | [日本語](DEPLOYMENT.ja.md
 
 ## 2단계 — ECS Fargate에 배포 (권장)
 
-이미지 빌드 불필요 — 이미지가 **ECR Public**에 있어 CloudFormation이 가져온다. 같은
-`deploy/cloudformation.yaml`을 배포하는 두 방법:
+이미지는 따로 빌드하지 않아도 됩니다 — **ECR Public**에 올라가 있어 CloudFormation이 알아서
+가져옵니다. 같은 `deploy/cloudformation.yaml`을 배포하는 방법은 두 가지입니다:
 
-- **AWS Console — 권장.** 템플릿을 업로드하면 안내형 폼이 값을 받아준다. [2절](#2-app-stack-배포) 참고.
-- **AWS CLI.** `aws cloudformation deploy` 한 명령으로 파라미터 전달. 역시 [2절](#2-app-stack-배포).
+- **AWS Console — 권장.** 템플릿을 업로드하면 안내형 폼이 필요한 값을 하나씩 물어봅니다.
+  [app-stack 배포](#app-stack-배포)를 참고하세요.
+- **AWS CLI.** `aws cloudformation deploy` 명령 하나로 파라미터를 넘깁니다. 이 방법도
+  [app-stack 배포](#app-stack-배포)에 있습니다.
 
-두 경로가 필요로 하는 값을 먼저 준비한다([1절](#1-사전-요구사항)에 상세). **VPC부터 정하고**(권장:
-소스 DB가 있는 VPC), 그 VPC의 ALB·태스크 **서브넷을 그 안에서 고른다**(콘솔에서는 VpcId를 고르면
-해당 VPC 서브넷이 드롭다운으로 나온다). 그 외 **ACM 인증서**, **DSQL 클러스터 ARN**. 소스 DB
-자격증명은 배포 후 UI(Connect 단계)에서 입력하므로(보통 id/password) 별도 시크릿이 필요 없다.
-나머지는 기본값이 처리한다(게시 이미지, `internal` ALB, Cognito off).
+어느 쪽이든 먼저 필요한 값을 준비하세요(자세한 내용은 [사전 요구사항](#사전-요구사항)).
+**VPC부터 정하는 게 좋습니다**(권장: 소스 DB가 있는 VPC). VPC를 정하면 ALB·태스크
+**서브넷은 그 안에서 고르면 됩니다**(콘솔에서는 VpcId를 선택하면 해당 VPC의 서브넷이 드롭다운으로
+나옵니다). 그 밖에 필요한 것은 **ACM 인증서**와 **DSQL 클러스터 ARN**입니다. 소스 DB 자격증명은
+배포 후 UI(Connect 단계)에서 입력하므로(보통 id/password) 별도의 시크릿은 필요 없습니다. 나머지는
+기본값이 알아서 처리합니다(게시된 이미지, `internal` ALB, Cognito 비활성화).
 
-**UI 접근 (internal ALB).** 기본이 internal이라 공용 엔드포인트가 없다(SEC05-BP02). `https://<LoadBalancerDns>/`를
-**VPC 안에서** 연다 — VPN / Direct Connect / SSM 포트 포워딩. 공개하려면 2절의 오버라이드 노트 참고.
+**UI 접근 (internal ALB).** 기본이 `internal`이라 공용 엔드포인트가 없습니다(SEC05-BP02).
+그래서 `https://<LoadBalancerDns>/`는 **VPC 안에서** 열어야 합니다 — VPN / Direct Connect /
+SSM 포트 포워딩을 이용하세요. 외부에 공개하려면 **app-stack 배포** 섹션의 오버라이드 노트를
+참고하세요.
 
----
+### 사전 요구사항
 
-## 1. 사전 요구사항
-
-### 접근
+#### 접근
 
 - **AWS Console** 접근(권장 경로), **또는** 대상 계정에 인증된 AWS CLI v2
   (`aws sts get-caller-identity`).
@@ -78,7 +86,7 @@ _언어: [English](DEPLOYMENT.md) | **한국어** | [日本語](DEPLOYMENT.ja.md
   Cognito(옵션 — 공개 ALB일 때만).
 - 이미지 빌드 불필요 — 이미지는 ECR Public에서 가져온다. (자체 빌드는 제한된 네트워크 전용; 부록 참고.)
 
-### 필수 값
+#### 필수 값
 
 > 🔑 **VPC부터 정하세요 — 나머지는 거기서 따라옵니다.** **소스 RDS/Aurora MySQL이 이미 있는 VPC**를
 > 쓰는 게 가장 단순하고 권장됩니다(도구가 소스에 프라이빗하게 도달하고, 소스 보안 그룹을 태스크에만
@@ -103,7 +111,7 @@ _언어: [English](DEPLOYMENT.md) | **한국어** | [日本語](DEPLOYMENT.ja.md
 > 보고 자동 선택하지 못합니다. DSQL 클러스터 ARN은 마이그레이션의 **타깃**입니다. 그 외는 모두
 > 기본값이 있습니다(아래 표).
 
-### 옵션 값 (없으면 합리적 기본값 사용)
+#### 옵션 값 (없으면 합리적 기본값 사용)
 
 | 옵션 | 파라미터 | 필요한 경우 |
 | --- | --- | --- |
@@ -114,14 +122,12 @@ _언어: [English](DEPLOYMENT.md) | **한국어** | [日本語](DEPLOYMENT.ja.md
 | **AI 보조** | `EnableAiAssist`, `BedrockModelId`, `BedrockRegion` | Amazon Bedrock 보조 변환을 켤 때만(모델 선택; IAM 스코프 자동 도출). |
 | **커스텀 이미지 / 사이징** | `ContainerImageUri`, `ContainerCpu`, `ContainerMemory` | 프라이빗 ECR 이미지나 기본 외 태스크 크기일 때만. |
 
----
-
-## 2. app-stack 배포
+### app-stack 배포
 
 `deploy/cloudformation.yaml`을 배포하는 두 방법 — 하나를 고른다. 둘 다 같은 스택을 만든다.
-파라미터 설명은 3절.
+파라미터 설명은 **파라미터 레퍼런스** 참고.
 
-### 권장 — AWS Console (안내형 폼)
+#### 권장 — AWS Console (안내형 폼)
 
 먼저 콘솔 우측 상단에서 **올바른 리전**(Aurora DSQL 클러스터와 같은 리전)인지 확인한 뒤:
 
@@ -227,9 +233,9 @@ internet-facing ALB인데 `AllowedIngressCidr`를 기본값 `10.0.0.0/8`로 두�
 > 따라가세요([설정](../docs/manual/ko/01-setup.md) → Connect에서 시작).
 
 **Prod 프로파일**은 3단계 폼에서 `EnableCognitoAuth=true`, `CognitoDomainPrefix`, `AppDomainName`을
-추가 설정(이후 4~5절 진행).
+추가 설정(이후 **DNS 지정** · **Cognito 사용자** 섹션 진행).
 
-### AWS CLI
+#### AWS CLI
 
 환경을 셸 변수로 한 번 설정; 명령 자체는 모든 고객에게 동일. 최소(Dev/Test) 배포:
 
@@ -312,9 +318,7 @@ UI가 뜹니다 — **Connect**로 시작하는 안내형 워크플로(Connect �
 Schema Conversion → Data Migration → Validation → Cut over). UI가 보이면 배포 성공이며,
 **Connect**에서 소스 DB 자격증명을 입력해 시작합니다.
 
----
-
-## 3. 파라미터 레퍼런스
+### 파라미터 레퍼런스
 
 | 파라미터 | 필수 | 기본값 | 설명 |
 | --- | --- | --- | --- |
@@ -343,9 +347,7 @@ Schema Conversion → Data Migration → Validation → Cut over). UI가 보이�
 | `BedrockRegion` | no | `""` | 앱의 `BEDROCK_REGION`. |
 | `BedrockModelId` | no | `us.anthropic.claude-sonnet-4-6` | Anthropic 모델(드롭다운); IAM 스코프 자동 도출. |
 
----
-
-## 4. DNS를 ALB로 지정 — Optional (커스텀 도메인만)
+### DNS를 ALB로 지정 — Optional (커스텀 도메인만)
 
 `AppDomainName`(자체 도메인)을 설정한 경우에만. **기본 설정이면 건너뛰세요** — ALB DNS 이름
 (`AppUrl` 출력값)으로 바로 접속합니다.
@@ -364,9 +366,7 @@ aws elbv2 describe-load-balancers \
 반환된 DNS 이름 + 호스티드 존 id로 alias 레코드를 생성(콘솔 또는
 `aws route53 change-resource-record-sets`).
 
----
-
-## 5. 운영자 사용자 생성 (Cognito) — Optional
+### 운영자 사용자 생성 (Cognito) — Optional
 
 Cognito를 켰을 때만(`EnableCognitoAuth=true`, 즉 공개 ALB). 기본 `internal` ALB면 건너뜁니다.
 스택의 사용자 풀에 사용자 생성:
@@ -384,9 +384,7 @@ aws cognito-idp admin-create-user \
 사용자는 임시 비밀번호를 받고, ALB가 트리거하는 Cognito hosted UI를 통해 첫 로그인 시 새 비밀번호를
 설정하라는 안내를 받습니다.
 
----
-
-## 6. 검증
+### 검증
 
 ```bash
 # ECS 서비스가 runningCount = desiredCount (1) 에 도달하고 ACTIVE 여야 함.
@@ -402,7 +400,7 @@ aws logs tail /ecs/mysql-dsql-migrator-mysql-dsql-migrator --follow --region "$A
 (켜져 있으면) Cognito 로그인으로 리디렉션된 뒤 마이그레이션 워크플로(Connect → Migration plan →
 Evaluation → Schema Conversion → Data Migration → Validation → Cut over)로 이동합니다.
 
-### 관측성 & 런타임 진단
+#### 관측성 & 런타임 진단
 
 배포는 의도적으로 파라미터를 최소화합니다: **로그 레벨과 활동 로그의 CloudWatch 미러링은
 CloudFormation 파라미터가 아닙니다** — 앱의 **Diagnostics** 컨트롤(사이드바 푸터)에서 런타임에
@@ -419,9 +417,7 @@ CloudFormation 파라미터가 아닙니다** — 앱의 **Diagnostics** 컨트�
 `DSQL_MIGRATOR_LOG_LEVEL` / `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` 환경 변수로 시작 기본값을 설정할 수
 있지만, Diagnostics 컨트롤이 의도된 경로입니다.
 
----
-
-## 7. 새 이미지 버전으로 업데이트
+### 새 이미지 버전으로 업데이트
 
 새 태그를 빌드·푸시한 뒤 새 `ContainerImageUri`로 재배포합니다. ECS가 태스크를 롤링 교체합니다:
 
@@ -446,9 +442,7 @@ aws cloudformation deploy \
 > **업데이트 전에 진행 중 작업을 끝내거나 정지**한 뒤, 재연결해 읽기 전용 Evaluation을 다시
 > 실행(몇 분)하세요.
 
----
-
-## 8. AI 보조 변환 활성화 (Optional)
+### AI 보조 변환 활성화 (Optional)
 
 AI 보조는 opt-in이며 **범위 제한된** `bedrock:InvokeModel`을 부여합니다:
 
@@ -481,9 +475,7 @@ aws cloudformation deploy ... \
 태스크 egress가 Bedrock runtime 엔드포인트에 도달할 수 있는지 확인(NAT 또는 Bedrock VPC 엔드포인트).
 UI에서 AI를 켜고, **Verify AI access** 사전 점검으로 도달성을 확인하세요.
 
----
-
-## 9. Teardown
+### Teardown
 
 > **완전 teardown 순서 (모든 리소스/비용 제거).** 마이그레이션은 최대 3개의 스택을 씁니다. 아무것도 —
 > 비용도 — 남지 않도록 다음 순서로 제거하세요:
@@ -516,9 +508,7 @@ DELETE_ECR=true deploy/teardown.sh mysql-dsql-migrator   # ECR repo + 이미지�
 aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region "$AWS_REGION"
 ```
 
----
-
-## 10. 문제 해결
+### 문제 해결
 
 | 증상 | 가능 원인 / 조치 |
 | --- | --- |
@@ -534,9 +524,7 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 | AI 켰을 때 Bedrock 에러 | `BedrockModelArns` 범위, `BedrockRegion`에서 모델 활성화, Bedrock 엔드포인트 egress. |
 | 실패 진단에 더 상세히 필요 | 앱 **Diagnostics** 컨트롤(사이드바 푸터)에서 로그 레벨을 `DEBUG`로 설정해 활동 로그 실패 이벤트에 Python 스택트레이스 추가; "Send to CloudWatch (stdout)"를 토글해 내구성 사본. 재배포 불필요. |
 
----
-
-## 11. 보안 노트
+### 보안 노트
 
 - **최소 권한**: task role은 `dsql:DbConnect` + `dsql:DbConnectAdmin`(클러스터 범위; 앱은 기본적으로
   DSQL `admin` 역할로 연결), 읽기 전용 `dsql:GetCluster` + `dsql:ListTagsForResource`(클러스터
@@ -549,7 +537,7 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   워크벤치 상태를 재개. 쿠키만 서명 — DB/사용자 자격증명 아님 — 하고 템플릿에 평문으로 절대 없음.
 - **감사 추적**: 구조화된 활동 로그(성공 + 실패 타임라인, UI에서 다운로드)는 비밀이 아닌 필드만 기록 —
   행 값, 비밀번호, IAM 토큰은 절대 없음. 태스크 임시 디스크에서 크기 제한·회전됨; 내구성 사본은
-  CloudWatch 미러(6절)를 켜기.
+  CloudWatch 미러(**검증** 섹션)를 켜기.
 - **네트워크**: ALB는 `AllowedIngressCidr`로부터만 443 수락; 태스크는 ALB로부터만 트래픽 수락;
   태스크 egress는 소스 DB(`SourceDbPort`), 아웃바운드 443(AWS 엔드포인트), 5432(Aurora DSQL
   엔드포인트)로 범위 제한. `internal` ALB 선호.
@@ -566,8 +554,8 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   이미지)로 재빌드하세요 — 단, 이는 별도 검증이 필요한 더 큰 변경입니다.
 - 이 스택은 이 저장소에서 배포된 적 **없음** — 프로덕션 사용 전 대상 계정에서 검증하세요.
 
----
 
+---
 
 ## 부록 — 자체 이미지 빌드 (제한된 네트워크 전용)
 

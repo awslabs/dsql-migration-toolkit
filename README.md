@@ -20,17 +20,20 @@ surface what needs human work.** The source database is always accessed read-onl
 > then follow the [**User Manual**](docs/manual/README.md) for the step-by-step
 > walkthrough.
 
-## At a glance
+---
 
-<p align="center">
-  <img src="docs/demo-ui.gif" alt="UI demo — guided 6-step migration workflow" width="720">
-</p>
+## At a glance
 
 Two data paths converge on Aurora DSQL: a one-shot **Full Load** driven by the
 tool, and an optional continuous **CDC** stream on managed MSK Connect. A
 binlog/GTID watermark bridges the two for a gapless handoff.
 
-![Architecture diagram](deploy/architecture-aws-simple.png)
+<p align="center">
+  <b>Simple architecture</b><br>
+  <img src="deploy/architecture-aws-simple.png" alt="Architecture diagram" width="720">
+</p>
+
+---
 
 ## What it does / doesn't do
 
@@ -60,6 +63,8 @@ binlog/GTID watermark bridges the two for a gapless handoff.
 > Full enforced-limit list and workarounds: User Manual
 > [Chapter 6 — Limitations](docs/manual/en/06-limitations.md).
 
+---
+
 ## Workflow
 
 The web UI guides you through six steps, with **Connect** as the preliminary step:
@@ -80,10 +85,22 @@ Each step shows its status (not started / in progress / done / failed) and can b
 run or re-run independently. Feature-level detail lives in the
 [User Manual](docs/manual/README.md).
 
+---
+
 ## Quick start
 
 Same tool, same UI — only **where it runs** changes. Run **locally** for
 evaluation / small migrations, on **ECS Fargate** for real ones.
+
+| | **Local** | **ECS Fargate** |
+|---|---|---|
+| Best for | Evaluation, small migrations | Real / large-scale migrations |
+| Setup | `uv sync` + run (seconds) | Deploy CloudFormation app-stack |
+| Migration engine runs on | Your machine | A single-task Fargate service in your VPC |
+| Reaches source & DSQL | From your machine (VPN / SSM for a private source) | Privately inside AWS (source → Fargate → DSQL) |
+| Data path | Through your machine | Stays in AWS; your browser only loads the UI |
+| Private source | Needs tunneling | Native (in-VPC) |
+| Compute / cost | Your laptop, free | Fargate task (bill until teardown) |
 
 ### Local (fastest)
 
@@ -112,6 +129,13 @@ large-scale migrations and private sources.
 
 **Full procedure: [`deploy/DEPLOYMENT.md`](deploy/DEPLOYMENT.md)** (quick deploy,
 parameters, Dev/Test vs Prod, DNS & Cognito, teardown, troubleshooting).
+
+<p align="center">
+  <b>Console (UI)</b><br>
+  <img src="docs/demo-ui.gif" alt="UI demo — guided 6-step migration workflow" width="720">
+</p>
+
+---
 
 ## Architecture
 
@@ -180,6 +204,8 @@ once only when you must build your own image on a restricted network.
 
 </details>
 
+---
+
 ## Prerequisites
 
 - A source **RDS / Aurora MySQL** with a read-only schema/data user.
@@ -190,6 +216,8 @@ once only when you must build your own image on a restricted network.
 
 > Full checklist incl. source-DB / CDC setup (binlog, etc.):
 > [User Manual §1.1](docs/manual/en/01-setup.md).
+
+---
 
 ## Configuration (advanced — usually no need to touch)
 
@@ -212,6 +240,9 @@ sidebar's **Performance tuning** control (no redeploy; resets on restart).
 | `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4` (≤16) | Tables loaded concurrently. Keep total DSQL connections within the cluster quota. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | In-flight `INSERT … ON CONFLICT` batches per table. Higher = more throughput but more OCC (40001) collisions. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000` (≤3000) | Rows per batched write, capped at DSQL's 3000-row per-transaction limit. |
+| `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1` (on) | Read-ahead prefetch queue (reader thread fills a bounded queue while writes drain). Keep on; set `0` only to reproduce the pre-prefetch path in an A/B benchmark. |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1` (off, ≤8) | Split one large single-integer-PK table's read across K concurrent readers. Rarely worth it (the reader is GIL-bound) — see manual §7.2. |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | Minimum estimated rows for a table to be reader-sharded; smaller tables always use one reader. |
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4` (≤32) | Tables compared concurrently in Validation. `1` = sequential. |
 | `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | Startup log level; `DEBUG` adds a stacktrace (call stack only) to failure events. Also changeable at runtime via **Diagnostics**. |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | Mirror activity-log events to stdout (→ CloudWatch on ECS). Also toggleable at runtime via **Diagnostics**. |
@@ -223,6 +254,14 @@ access** preflight (checks Bedrock reachability, reports actionable failures).
 Full background on the tuning knobs: manual
 [Performance and tuning](docs/manual/en/07-performance-and-tuning.md).
 
+> **CDC scaling is inferred, not set here.** The connector knobs (per-table topic
+> partitions, sink `tasks.max`, MSK Connect MCUs) are derived from the captured-table
+> count at cdc-stack deploy time; advanced env overrides
+> (`DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` / `_SINK_TASKS_MAX` / `_MCU_COUNT`) are
+> documented in manual [§7.2 — CDC](docs/manual/en/07-performance-and-tuning.md).
+
+---
+
 ## Project layout
 
 | Path | What's there |
@@ -233,6 +272,8 @@ Full background on the tuning knobs: manual
 | `connectors/dsql-sink/` | Custom Aurora DSQL Kafka Connect **sink connector** (Java; optional CDC plugin). |
 | `deploy/` | `Dockerfile`, CloudFormation templates, build/teardown scripts, diagrams. See [`deploy/DEPLOYMENT.md`](deploy/DEPLOYMENT.md). |
 | `docs/manual/` | The step-by-step user manual (EN / KO / JA). |
+
+---
 
 ## Deployment
 
@@ -250,10 +291,14 @@ production as a single-task **ECS Fargate** service from `deploy/cloudformation.
 > especially the CDC VPC, which must reach the source privately — deploys there.
 > Cross-region source/target is not supported.
 
+---
+
 ## Version / changelog
 
 Current version: [`pyproject.toml`](pyproject.toml); changes per version:
 [**CHANGELOG.md**](CHANGELOG.md).
+
+---
 
 ## License
 

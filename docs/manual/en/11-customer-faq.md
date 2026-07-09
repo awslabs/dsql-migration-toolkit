@@ -403,7 +403,7 @@ First, be clear on the difference: the UI's **Start over** button only resets th
 tool's *session* (connections, plan, progress) — it deliberately does **not** delete
 any AWS resource, so nothing costly is torn down by accident. To actually remove the
 infrastructure and stop all cost, tear the stacks down in this order (the full
-procedure with exact commands is [Deployment §9 — Teardown](../../../deploy/DEPLOYMENT.md#9-teardown)):
+procedure with exact commands is [Deployment §9 — Teardown](../../../deploy/DEPLOYMENT.md#teardown)):
 
 1. **CDC infrastructure first** (only if you ever deployed CDC — this is the costly
    MSK / MSK Connect / NAT part). Do it **while the app is still running**, from the

@@ -19,17 +19,20 @@ PostgreSQL 方言、続いて PostgreSQL → DSQL の制約（外部キー非対
 > （計画すべき事項 — Full Load vs CDC、DSQL の制限、検証、カットオーバー、コスト）を先に読み、
 > [**ユーザーマニュアル**](docs/manual/ja/README.md) の手順に従ってください。
 
-## 概要
+---
 
-<p align="center">
-  <img src="docs/demo-ui.gif" alt="UIデモ — 6ステップガイド付きマイグレーションワークフロー" width="720">
-</p>
+## 概要
 
 2 つのデータ経路が Aurora DSQL に収束します。ツールが駆動する 1 回限りの **Full Load** と、
 マネージド MSK Connect 上で動作する任意の継続的な **CDC** ストリームです。binlog/GTID
 ウォーターマークが両者をギャップなくつなぎます。
 
-![アーキテクチャ図](deploy/architecture-aws-simple.png)
+<p align="center">
+  <b>Simple architecture</b><br>
+  <img src="deploy/architecture-aws-simple.png" alt="アーキテクチャ図" width="720">
+</p>
+
+---
 
 ## できること / できないこと
 
@@ -56,6 +59,8 @@ PostgreSQL 方言、続いて PostgreSQL → DSQL の制約（外部キー非対
 > 適用される制限とその回避策の完全な一覧は、ユーザーマニュアル
 > [第 6 章 — 制限事項](docs/manual/ja/06-limitations.md)。
 
+---
+
 ## ワークフロー
 
 Web UI は、**Connect** を予備ステップとして 6 ステップを案内します。
@@ -75,10 +80,22 @@ Web UI は、**Connect** を予備ステップとして 6 ステップを案内�
 各ステップは状態（未開始 / 進行中 / 完了 / 失敗）を表示し、独立して実行/再実行できます。
 機能単位の詳細は [ユーザーマニュアル](docs/manual/ja/README.md) にあります。
 
+---
+
 ## クイックスタート
 
 同じツール・同じ UI で、変わるのは **どこで実行するか** だけです。評価/小規模には
 **ローカル**、実運用の移行には **ECS Fargate** を推奨します。
+
+| | **ローカル** | **ECS Fargate** |
+|---|---|---|
+| 適した用途 | 評価、小規模な移行 | 実運用・大規模な移行 |
+| セットアップ | `uv sync` + 実行（数秒） | CloudFormation app-stack をデプロイ |
+| 移行エンジンの実行場所 | ご自身のマシン | VPC 内の単一タスク Fargate サービス |
+| ソース・DSQL への到達 | マシンから（プライベートなソースは VPN / SSM） | AWS 内でプライベートに（ソース → Fargate → DSQL） |
+| データ経路 | マシンを経由 | AWS 内にとどまる。ブラウザは UI を開くだけ |
+| プライベートなソース | トンネリングが必要 | ネイティブ対応（VPC 内） |
+| コンピュート・コスト | ご自身のノート PC、無料 | Fargate タスク（ティアダウンまで課金） |
 
 ### ローカル（最速）
 
@@ -107,6 +124,13 @@ Public イメージを使用）、ツールが **VPC 内** の単一タスクの
 
 **完全な手順: [`deploy/DEPLOYMENT.ja.md`](deploy/DEPLOYMENT.ja.md)**（クイックデプロイ、
 パラメータ、Dev/Test vs Prod、DNS と Cognito、ティアダウン、トラブルシューティング）。
+
+<p align="center">
+  <b>Console (UI)</b><br>
+  <img src="docs/demo-ui.gif" alt="UIデモ — 6ステップガイド付きマイグレーションワークフロー" width="720">
+</p>
+
+---
 
 ## アーキテクチャ
 
@@ -173,6 +197,8 @@ MSK Connect *上で* 動作するオープンソースソフトウェアです�
 
 </details>
 
+---
+
 ## 前提条件
 
 - スキーマとデータを読み取れるユーザーを持つソース **RDS / Aurora MySQL**。
@@ -183,6 +209,8 @@ MSK Connect *上で* 動作するオープンソースソフトウェアです�
 
 > ソース DB・CDC のセットアップ（binlog など）を含む完全なチェックリスト:
 > [ユーザーマニュアル §1.1](docs/manual/ja/01-setup.md)。
+
+---
 
 ## 設定（上級者向け — 通常は触る必要なし）
 
@@ -205,6 +233,9 @@ Fargate では ECS タスク定義に設定します。Full Load / Validation �
 | `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4`（≤16） | 並行してロードするテーブル数。DSQL への合計接続数をクラスターのクォータ内に収める。 |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8`（≤32） | テーブルあたりの処理中の `INSERT … ON CONFLICT` バッチ数。大きいほどスループット↑、OCC（40001）衝突↑。 |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000`（≤3000） | バッチ書き込みあたりの行数。DSQL のトランザクションごとの 3000 行制限で上限。 |
+| `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1`（オン） | 先読み prefetch キュー（リーダースレッドが bounded キューを満たす間に書き込みが進行）。オンのままに。A/B ベンチで pre-prefetch 経路を再現する場合のみ `0`。 |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1`（オフ、≤8） | 大きな単一整数 PK テーブルの読み取りを K 個の並行リーダーに分割。効果があることは稀（リーダーが GIL バウンド）— マニュアル §7.2 参照。 |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | この推定行数以上のテーブルのみリーダーシャーディング対象；小さいテーブルは常に単一リーダー。 |
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4`（≤32） | Validation で並行して比較するテーブル数。`1` = 逐次。 |
 | `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | 起動時のログレベル。`DEBUG` は失敗イベントに stacktrace（コールスタックのみ）を追加。実行時に **Diagnostics** からも変更可。 |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | アクティビティログイベントを標準出力にもミラーリング（ECS では → CloudWatch）。実行時に **Diagnostics** から切り替え可。 |
@@ -214,6 +245,14 @@ Fargate では ECS タスク定義に設定します。Full Load / Validation �
 AI アシストは既定でオフで、UI でオンにします。UI は Bedrock の到達可能性をチェックし、実行可能な
 失敗理由を報告する **Verify AI access** のプリフライトも提供します。チューニング項目の背景は
 マニュアル [パフォーマンスとチューニング](docs/manual/ja/07-performance-and-tuning.md)。
+
+> **CDC のスケーリングはここでは設定せず、推論されます。** コネクタのノブ（テーブルごとのトピック
+> パーティション数、シンクの `tasks.max`、MSK Connect の MCU）は cdc-stack のデプロイ時にキャプチャ
+> 対象テーブル数から導出されます。高度な環境変数による上書き（`DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` /
+> `_SINK_TASKS_MAX` / `_MCU_COUNT`）はマニュアル
+> [§7.2 — CDC](docs/manual/ja/07-performance-and-tuning.md) に記載されています。
+
+---
 
 ## プロジェクト構成
 
@@ -225,6 +264,8 @@ AI アシストは既定でオフで、UI でオンにします。UI は Bedrock
 | `connectors/dsql-sink/` | カスタム Aurora DSQL Kafka Connect **シンクコネクタ**（Java。任意の CDC プラグイン）。 |
 | `deploy/` | `Dockerfile`、CloudFormation テンプレート、ビルド/ティアダウンスクリプト、図。[`deploy/DEPLOYMENT.ja.md`](deploy/DEPLOYMENT.ja.md) を参照。 |
 | `docs/manual/` | ステップバイステップのユーザーマニュアル（EN / KO / JA）。 |
+
+---
 
 ## デプロイ
 
@@ -242,10 +283,14 @@ CDC は別途の **cdc-stack** です。
 > ソースへプライベートに到達しなければならない CDC VPC — がそのリージョンにデプロイされます。
 > クロスリージョンのソース/ターゲットはサポートされません。
 
+---
+
 ## バージョン / 変更履歴
 
 現在のバージョン: [`pyproject.toml`](pyproject.toml)。バージョンごとの変更内容:
 [**CHANGELOG.ja.md**](CHANGELOG.ja.md)。
+
+---
 
 ## ライセンス
 

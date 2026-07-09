@@ -12,27 +12,17 @@ CDC が必要になるのは、**大規模または継続的な** マイグレ�
 
 ## 4.1 パイプライン
 
-```
-Source MySQL ──binlog (ROW+GTID, read-only)──►  Debezium MySQL source connector
-                                                        │  change events
-                                                        ▼
-                                                 Amazon MSK (Kafka)
-                                          per-table topics, keyed by PK  + DLQ
-                                                        │
-                                                        ▼
-                                       Custom DSQL Sink Connector (our Java plugin)
-                                          IAM token · idempotent upsert/delete
-                                          statement-level OCC retry · ≤3000-row batches
-                                                        │
-                                                        ▼
-                                                  Aurora DSQL
-```
+<p align="center">
+  <img src="../../../deploy/architecture-cdc-pipeline.png" alt="CDC パイプライン: ソース MySQL binlog → Debezium ソースコネクタ → Amazon MSK（PK でキー付けしたテーブルごとのトピック + DLQ）→ カスタム DSQL シンクコネクタ → Aurora DSQL" width="900">
+</p>
 
 - **Debezium MySQL source connector** は、ソースのバイナリログを読み取り専用で読み込み、変更イベントを出力します。
 - **Amazon MSK (Kafka)** は耐久性のあるバックボーンです。**テーブルごとに 1 トピック** を持ち、主キーでキーイングし (ある行のすべての変更が 1 つのパーティションで順序を保つ)、加えてデッドレター (DLQ) トピックを備えます。
 - **カスタム DSQL sink connector** — このプロジェクトが所有する Java Kafka Connect プラグイン — が変更を DSQL に適用します。両方の connector は **マネージドの MSK Connect** 上で実行され、ツール自身は **sink 用のコンピュートを一切持たず**、コントロールプレーンとして機能します (構成の作成、開始オフセットのシード、監視を行います)。
 
-なぜ標準的な JDBC sink ではなく *カスタム* sink なのでしょうか。標準的な JDBC sink は楽観的並行性の競合 (`SQLSTATE 40001`) を **バッチ単位で** リトライするため、競合の激しい TB 規模の CDC ではスループットが崩壊します。カスタム sink は **ステートメント単位で** リトライし、DSQL の短命な IAM トークン、≤3000 行のバッチ、再接続を処理します (詳細は §4.4)。
+**なぜ標準的な JDBC sink ではなく *カスタム* sink なのでしょうか。**
+
+標準的な JDBC sink は楽観的並行性の競合 (`SQLSTATE 40001`) を **バッチ単位で** リトライするため、競合の激しい TB 規模の CDC ではスループットが崩壊します。カスタム sink は **ステートメント単位で** リトライし、DSQL の短命な IAM トークン、≤3000 行のバッチ、再接続を処理します (詳細は §4.4)。
 
 ---
 

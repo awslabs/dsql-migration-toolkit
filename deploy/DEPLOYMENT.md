@@ -2,13 +2,19 @@
 
 _Language: **English** | [한국어](DEPLOYMENT.ko.md) | [日本語](DEPLOYMENT.ja.md)_
 
-This guide deploys the **control-plane app** as a single-task **Amazon ECS
-Fargate** service behind an **Application Load Balancer (HTTPS)** in the
-customer's own AWS account and VPC (single-tenant). The image is pulled from
-**Amazon ECR**. By default the ALB is **`internal`** (no login needed — the
-network is the access gate); **Amazon Cognito (OIDC)** login is an opt-in add-on,
-needed only if you expose the UI publicly. The optional streaming **CDC pipeline**
-(MSK + Debezium + sink) is a separate `cdc-stack`, not covered here.
+The tool runs in one of two ways: **locally** (`uv run …`, no infrastructure —
+best for evaluation and small migrations) or on **ECS Fargate** (a hosted service
+in your own AWS account — best for real, large-scale migrations). **This guide
+covers the Fargate deployment (the app-stack);** for running locally, see
+[Step 1](#step-1--choose-where-to-run) below and the root README.
+
+On Fargate, the **control-plane app** runs as a single-task **Amazon ECS Fargate**
+service behind an **Application Load Balancer (HTTPS)**, inside the customer's own
+AWS account and VPC (single-tenant), with the image pulled from **Amazon ECR**. By
+default the ALB is **`internal`** (no login needed — the network is the access
+gate); **Amazon Cognito (OIDC)** login is an opt-in add-on, needed only if you
+expose the UI publicly. The optional streaming **CDC pipeline** (MSK + Debezium +
+sink) is a separate `cdc-stack`, not covered here.
 
 ---
 
@@ -60,11 +66,11 @@ No image build needed — the image is on **ECR Public** and CloudFormation pull
 it. Two ways to deploy the same `deploy/cloudformation.yaml`:
 
 - **AWS Console — RECOMMENDED.** Upload the template; a guided form collects the
-  values for you. See [section 2](#2-deploy-the-app-stack).
+  values for you. See [Deploy the app-stack](#deploy-the-app-stack).
 - **AWS CLI.** One `aws cloudformation deploy` command with parameter overrides.
-  Also in [section 2](#2-deploy-the-app-stack).
+  Also in [Deploy the app-stack](#deploy-the-app-stack).
 
-First gather the values both paths need ([section 1](#1-prerequisites) has the
+First gather the values both paths need ([Prerequisites](#prerequisites) has the
 details). **Start with the VPC** (recommended: the one your source DB lives in) —
 then pick its ALB + task **subnets from that VPC** (in the Console they appear in a
 dropdown once you choose the VpcId). Plus an **ACM certificate**, the **DSQL cluster
@@ -74,13 +80,11 @@ rest (published image, `internal` ALB, Cognito off).
 **Reaching the UI (internal ALB).** The ALB is internal by default, so browse
 `https://<LoadBalancerDns>/` from **inside the VPC** — VPN / Direct Connect / SSM
 port-forward. No public endpoint by design (Well-Architected SEC05-BP02). To
-expose it publicly, see the override note in section 2.
+expose it publicly, see the override note under **Deploy the app-stack**.
 
----
+### Prerequisites
 
-## 1. Prerequisites
-
-### Access
+#### Access
 
 - **AWS Console** access (recommended path), **or** AWS CLI v2 authenticated to the
   target account (`aws sts get-caller-identity`).
@@ -89,7 +93,7 @@ expose it publicly, see the override note in section 2.
 - No image build needed — the image is pulled from ECR Public. (Building your own
   is only for a restricted network; see the Appendix.)
 
-### Required values
+#### Required values
 
 > 🔑 **Start with the VPC — everything else follows from it.** Use the **VPC your
 > source RDS/Aurora MySQL already lives in**: same-VPC is the simplest and
@@ -119,7 +123,7 @@ expose it publicly, see the override note in section 2.
 > them from the VPC alone. The DSQL cluster ARN is the migration's **target**. The
 > rest have defaults (next table).
 
-### Optional values (sensible defaults otherwise)
+#### Optional values (sensible defaults otherwise)
 
 | Optional | Parameter | When you need it |
 | --- | --- | --- |
@@ -130,14 +134,12 @@ expose it publicly, see the override note in section 2.
 | **AI assist** | `EnableAiAssist`, `BedrockModelId`, `BedrockRegion` | Only to enable Amazon Bedrock-assisted conversion (pick a model; IAM scope auto-derived). |
 | **Custom image / sizing** | `ContainerImageUri`, `ContainerCpu`, `ContainerMemory` | Only for a private-ECR image or non-default task size. |
 
----
-
-## 2. Deploy the app-stack
+### Deploy the app-stack
 
 Two ways to deploy `deploy/cloudformation.yaml` — pick one. Both produce the same
-stack; the parameter reference is section 3.
+stack; see **Parameter reference** below.
 
-### Recommended — AWS Console (guided form)
+#### Recommended — AWS Console (guided form)
 
 First confirm you're in the **right region** (top-right of the console — the same
 region as your Aurora DSQL cluster), then:
@@ -257,7 +259,7 @@ otherwise the task can't pull its image or reach DSQL and fails to start. → **
 For a **Prod profile**, additionally set `EnableCognitoAuth=true`,
 `CognitoDomainPrefix`, and `AppDomainName` in step 3 (then do sections 4–5).
 
-### AWS CLI
+#### AWS CLI
 
 Set your environment as shell variables once; the command itself is identical for
 every customer. The minimal (Dev/Test) deploy:
@@ -343,9 +345,7 @@ Migration Tool** UI loads — the guided workflow starting at **Connect** (Conne
 Cut over). Seeing the UI means the deployment succeeded; enter your source DB
 credentials at **Connect** to begin.
 
----
-
-## 3. Parameter reference
+### Parameter reference
 
 | Parameter | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -374,9 +374,7 @@ credentials at **Connect** to begin.
 | `BedrockRegion` | no | `""` | `BEDROCK_REGION` for the app. |
 | `BedrockModelId` | no | `us.anthropic.claude-sonnet-4-6` | Anthropic model (dropdown); IAM scope auto-derived from it. |
 
----
-
-## 4. Point DNS at the ALB — optional (custom domain only)
+### Point DNS at the ALB — optional (custom domain only)
 
 Only when you set `AppDomainName` (your own domain). **Skip this with the default
 setup** — you reach the app at the ALB DNS name (the `AppUrl` output) directly.
@@ -396,9 +394,7 @@ aws elbv2 describe-load-balancers \
 Use the returned DNS name + hosted-zone id to create the alias record (console
 or `aws route53 change-resource-record-sets`).
 
----
-
-## 5. Create operator users (Cognito) — optional
+### Create operator users (Cognito) — optional
 
 Only when you enabled Cognito (`EnableCognitoAuth=true`, i.e. a public ALB).
 Skip this with the default `internal` ALB. Create users in the stack's user pool:
@@ -416,9 +412,7 @@ aws cognito-idp admin-create-user \
 The user receives a temporary password and is prompted to set a new one on first
 sign-in via the Cognito hosted UI (triggered by the ALB).
 
----
-
-## 6. Verify
+### Verify
 
 ```bash
 # ECS service should reach runningCount = desiredCount (1) and be ACTIVE.
@@ -435,7 +429,7 @@ Then open `https://AppDomainName/` from a host inside the allowed network
 and then to the migration workflow (Connect → Migration plan → Evaluation →
 Schema Conversion → Data Migration → Validation → Cut over).
 
-### Observability & runtime diagnostics
+#### Observability & runtime diagnostics
 
 Deployment is deliberately parameter-light: **log level and CloudWatch
 mirroring of the activity log are not CloudFormation parameters** — adjust them
@@ -455,9 +449,7 @@ advanced operators can set the startup defaults via the
 `DSQL_MIGRATOR_LOG_LEVEL` / `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` environment
 variables, but the Diagnostics control is the intended path.
 
----
-
-## 7. Update to a new image version
+### Update to a new image version
 
 Build and push a new tag, then redeploy with the new `ContainerImageUri`. ECS
 performs a rolling replacement of the task:
@@ -484,9 +476,7 @@ aws cloudformation deploy \
 > and does **not** survive — **finish or quiesce in-flight jobs before updating**,
 > then reconnect and re-run the read-only Evaluation (minutes).
 
----
-
-## 8. Enable AI-assisted conversion (optional)
+### Enable AI-assisted conversion (optional)
 
 AI assist is opt-in and grants a **scoped** `bedrock:InvokeModel`:
 
@@ -522,9 +512,7 @@ Ensure task egress can reach the Bedrock runtime endpoint (NAT or a Bedrock VPC
 endpoint). Enable AI in the UI; use the **Verify AI access** preflight to
 confirm reachability.
 
----
-
-## 9. Teardown
+### Teardown
 
 > **Complete teardown order (remove ALL resources / stop ALL cost).** The
 > migration uses up to three stacks; remove them in this order so nothing — and no
@@ -560,9 +548,7 @@ has `EmptyOnDelete`, so images are removed with it):
 aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region "$AWS_REGION"
 ```
 
----
-
-## 10. Troubleshooting
+### Troubleshooting
 
 | Symptom | Likely cause / fix |
 | --- | --- |
@@ -578,9 +564,7 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 | Bedrock errors when AI on | `BedrockModelArns` scope, model enabled in `BedrockRegion`, and egress to the Bedrock endpoint. |
 | Need more detail when diagnosing a failure | Set log level to `DEBUG` in the app's **Diagnostics** control (sidebar footer) to add Python stacktraces to activity-log failure events; toggle "Send to CloudWatch (stdout)" for a durable copy. No redeploy. |
 
----
-
-## 11. Security notes
+### Security notes
 
 - **Least privilege**: the task role grants only `dsql:DbConnect` +
   `dsql:DbConnectAdmin` (scoped to the cluster; the app connects as the DSQL
@@ -600,7 +584,7 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 - **Audit trail**: the structured activity log (success + failure timeline,
   downloadable from the UI) records non-secret fields only — never row values,
   passwords, or IAM tokens. It is size-capped and rotated on the task's
-  ephemeral disk; enable the CloudWatch mirror (see section 6) for a durable
+  ephemeral disk; enable the CloudWatch mirror (see **Verify**) for a durable
   copy.
 - **Network**: the ALB accepts 443 only from `AllowedIngressCidr`; the task
   accepts traffic only from the ALB; task egress is scoped to the source DB
@@ -624,8 +608,8 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 - This stack has **not** been deployed from this repository — validate it in
   your target account before production use.
 
----
 
+---
 
 ## Appendix — Build your own image (restricted network only)
 

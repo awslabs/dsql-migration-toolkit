@@ -2,13 +2,18 @@
 
 _言語: [English](DEPLOYMENT.md) | [한국어](DEPLOYMENT.ko.md) | **日本語**_
 
-このガイドでは、**コントロールプレーンアプリ**を、お客様自身の AWS アカウントおよび
-VPC 内で（シングルテナント）、**Application Load Balancer (HTTPS)** の背後にある
-単一タスクの **Amazon ECS Fargate** サービスとしてデプロイします。イメージは
-**Amazon ECR** から取得します。デフォルトでは ALB は **`internal`** です（ログイン不要 —
-ネットワークがアクセスゲートになります）。**Amazon Cognito (OIDC)** ログインは opt-in の
-追加機能であり、UI を公開する場合にのみ必要です。オプションのストリーミング
-**CDC パイプライン**（MSK + Debezium + シンク）は別の `cdc-stack` であり、本書では扱いません。
+本ツールの実行方法は 2 通りあります。**ローカル**（`uv run …`、インフラ不要 — 評価・小規模な
+移行に最適）と、**ECS Fargate**（お客様自身の AWS アカウント内で動作するホスト型サービス —
+実運用・大規模な移行に最適）です。**本ガイドは Fargate デプロイ（app-stack）を扱います。**
+ローカル実行については、以下の[ステップ 1](#ステップ-1--実行場所を選ぶ)とルート README を参照してください。
+
+Fargate では、**コントロールプレーンアプリ**が、お客様自身の AWS アカウントおよび VPC 内で
+（シングルテナント）、**Application Load Balancer (HTTPS)** の背後にある単一タスクの
+**Amazon ECS Fargate** サービスとして動作し、イメージは **Amazon ECR** から取得します。
+デフォルトでは ALB は **`internal`** です（ログイン不要 — ネットワークがアクセスゲートになります）。
+**Amazon Cognito (OIDC)** ログインは opt-in の追加機能であり、UI を公開する場合にのみ必要です。
+オプションのストリーミング **CDC パイプライン**（MSK + Debezium + シンク）は別の `cdc-stack`
+であり、本書では扱いません。
 
 ---
 
@@ -61,12 +66,12 @@ VPC 内で（シングルテナント）、**Application Load Balancer (HTTPS)**
 取得します。同じ `deploy/cloudformation.yaml` をデプロイする 2 つの方法があります。
 
 - **AWS Console — 推奨。** テンプレートをアップロードすると、ガイド付きフォームが
-  値を受け取ってくれます。[セクション 2](#2-app-stack-のデプロイ) を参照。
+  値を受け取ってくれます。[app-stack のデプロイ](#app-stack-のデプロイ) を参照。
 - **AWS CLI。** パラメータのオーバーライドを伴う `aws cloudformation deploy` コマンド
-  1 つで実行します。こちらも [セクション 2](#2-app-stack-のデプロイ) にあります。
+  1 つで実行します。こちらも [app-stack のデプロイ](#app-stack-のデプロイ) にあります。
 
 まず、両方の経路で必要になる値を集めます（詳細は
-[セクション 1](#1-前提条件) にあります）。**VPC から始めてください**（推奨: ソース DB が
+[前提条件](#前提条件) にあります）。**VPC から始めてください**（推奨: ソース DB が
 存在する VPC）。次に、その VPC から ALB 用とタスク用の**サブネット**を選びます
 （Console では VpcId を選ぶと、その VPC のサブネットがドロップダウンに表示されます）。
 加えて **ACM 証明書**、**DSQL クラスター ARN**、ソース DB 用の
@@ -76,13 +81,11 @@ VPC 内で（シングルテナント）、**Application Load Balancer (HTTPS)**
 **UI への到達 (internal ALB)。** ALB はデフォルトで internal なので、`https://<LoadBalancerDns>/`
 には **VPC 内から**アクセスします — VPN / Direct Connect / SSM ポートフォワード。
 設計上、公開エンドポイントはありません（Well-Architected SEC05-BP02）。公開する
-には、セクション 2 のオーバーライドの注記を参照してください。
+には、**app-stack のデプロイ** セクションのオーバーライドの注記を参照してください。
 
----
+### 前提条件
 
-## 1. 前提条件
-
-### アクセス
+#### アクセス
 
 - **AWS Console** へのアクセス（推奨経路）、**または**対象アカウントに認証済みの
   AWS CLI v2（`aws sts get-caller-identity`）。
@@ -91,7 +94,7 @@ VPC 内で（シングルテナント）、**Application Load Balancer (HTTPS)**
 - イメージのビルドは不要です — イメージは ECR Public から取得されます。（自前ビルドは
   制限されたネットワーク向けのみ。付録を参照。）
 
-### 必須の値
+#### 必須の値
 
 > 🔑 **VPC から始めてください — 残りはすべてそこから決まります。** **ソースの
 > RDS/Aurora MySQL がすでに存在する VPC** を使用してください。同一 VPC が最も単純で
@@ -121,7 +124,7 @@ VPC 内で（シングルテナント）、**Application Load Balancer (HTTPS)**
 > 必要で、CloudFormation は VPC だけからそれらを自動で選ぶことができません。DSQL
 > クラスター ARN は移行の**ターゲット**です。残りはデフォルトがあります（次の表）。
 
-### オプションの値 (それ以外の場合は妥当なデフォルト)
+#### オプションの値 (それ以外の場合は妥当なデフォルト)
 
 | オプション | パラメータ | 必要になる場合 |
 | --- | --- | --- |
@@ -132,15 +135,13 @@ VPC 内で（シングルテナント）、**Application Load Balancer (HTTPS)**
 | **AI アシスト** | `EnableAiAssist`, `BedrockModelId`, `BedrockRegion` | Amazon Bedrock 支援の変換を有効化する場合のみ（モデルを選択。IAM スコープは自動的に導出）。 |
 | **カスタムイメージ / サイジング** | `ContainerImageUri`, `ContainerCpu`, `ContainerMemory` | プライベート ECR イメージ、またはデフォルト以外のタスクサイズの場合のみ。 |
 
----
-
-## 2. app-stack のデプロイ
+### app-stack のデプロイ
 
 `deploy/cloudformation.yaml` をデプロイする 2 つの方法があります — いずれか 1 つを
 選んでください。どちらも同じスタックを作成します。パラメータのリファレンスは
-セクション 3 です。
+**パラメータリファレンス** セクションにあります。
 
-### 推奨 — AWS Console (ガイド付きフォーム)
+#### 推奨 — AWS Console (ガイド付きフォーム)
 
 まず、**正しいリージョン**（コンソール右上 — Aurora DSQL クラスターと同一リージョン）
 にいることを確認し、次に:
@@ -262,9 +263,9 @@ internet-facing ALB で `AllowedIngressCidr` をデフォルトの `10.0.0.0/8` 
 > → Connect から開始）。
 
 **Prod プロファイル**の場合は、step 3 で追加で `EnableCognitoAuth=true`、
-`CognitoDomainPrefix`、`AppDomainName` を設定してください（その後セクション 4〜5 を実施）。
+`CognitoDomainPrefix`、`AppDomainName` を設定してください（その後 **DNS を ALB に向ける** ・ **Cognito** セクションを実施）。
 
-### AWS CLI
+#### AWS CLI
 
 環境をシェル変数として一度設定します。コマンド自体はどのお客様でも同一です。
 最小構成（Dev/Test）のデプロイ:
@@ -351,9 +352,7 @@ Migration Tool** の UI が読み込まれます — **Connect** から始まる
 Data Migration → Validation → Cut over）です。UI が表示されればデプロイは
 成功です。**Connect** でソース DB の認証情報を入力して開始します。
 
----
-
-## 3. パラメータリファレンス
+### パラメータリファレンス
 
 | パラメータ | 必須 | デフォルト | 説明 |
 | --- | --- | --- | --- |
@@ -382,9 +381,7 @@ Data Migration → Validation → Cut over）です。UI が表示されれば�
 | `BedrockRegion` | no | `""` | アプリの `BEDROCK_REGION`。 |
 | `BedrockModelId` | no | `us.anthropic.claude-sonnet-4-6` | Anthropic モデル（ドロップダウン）。IAM スコープはこれから自動導出。 |
 
----
-
-## 4. DNS を ALB に向ける — オプション (カスタムドメインのみ)
+### DNS を ALB に向ける — オプション (カスタムドメインのみ)
 
 `AppDomainName`（ご自身のドメイン）を設定した場合のみです。**デフォルト設定では
 これをスキップしてください** — アプリには ALB の DNS 名（`AppUrl` 出力）で直接
@@ -405,9 +402,7 @@ aws elbv2 describe-load-balancers \
 返された DNS 名 + ホストゾーン id を使ってエイリアスレコードを作成します
 （コンソールまたは `aws route53 change-resource-record-sets`）。
 
----
-
-## 5. 運用者ユーザーの作成 (Cognito) — オプション
+### 運用者ユーザーの作成 (Cognito) — オプション
 
 Cognito を有効化した場合のみです（`EnableCognitoAuth=true`、すなわち公開 ALB）。
 デフォルトの `internal` ALB ではこれをスキップします。スタックのユーザープールに
@@ -426,9 +421,7 @@ aws cognito-idp admin-create-user \
 ユーザーは一時パスワードを受け取り、（ALB がトリガーする）Cognito hosted UI 経由の
 初回サインイン時に新しいパスワードを設定するよう求められます。
 
----
-
-## 6. 検証
+### 検証
 
 ```bash
 # ECS サービスは runningCount = desiredCount (1) に達し、ACTIVE であるべきです。
@@ -445,7 +438,7 @@ aws logs tail /ecs/mysql-dsql-migrator-mysql-dsql-migrator --follow --region "$A
 リダイレクトされ、その後、移行ワークフロー（Connect → Migration plan → Evaluation →
 Schema Conversion → Data Migration → Validation → Cut over）に移動するはずです。
 
-### 可観測性 & ランタイム診断
+#### 可観測性 & ランタイム診断
 
 デプロイは意図的にパラメータを最小限にしています: **ログレベルとアクティビティログの
 CloudWatch ミラーリングは CloudFormation パラメータではありません** — これらはアプリの
@@ -467,9 +460,7 @@ CloudWatch ミラーリングは CloudFormation パラメータではありま�
 環境変数で起動時のデフォルトを設定できますが、Diagnostics コントロールが意図された
 経路です。
 
----
-
-## 7. 新しいイメージバージョンへの更新
+### 新しいイメージバージョンへの更新
 
 新しいタグをビルドしてプッシュし、新しい `ContainerImageUri` で再デプロイします。
 ECS はタスクのローリング置き換えを実行します:
@@ -496,9 +487,7 @@ aws cloudformation deploy \
 > ジョブを完了または静止させて**から、再接続して読み取り専用の Evaluation を再実行
 > してください（数分）。
 
----
-
-## 8. AI 支援変換の有効化 (オプション)
+### AI 支援変換の有効化 (オプション)
 
 AI アシストは opt-in であり、**スコープが絞られた** `bedrock:InvokeModel` を付与します:
 
@@ -534,9 +523,7 @@ Bedrock コンソールで**モデルアクセスを有効化する必要は依�
 （NAT または Bedrock VPC エンドポイント）。UI で AI を有効化し、**Verify AI access** の
 事前チェックで到達性を確認してください。
 
----
-
-## 9. Teardown
+### Teardown
 
 > **完全な teardown の順序 (すべてのリソースを削除 / すべてのコストを停止)。** 移行は
 > 最大 3 つのスタックを使用します。何も — そしてコストも — 残らないよう、この順序で
@@ -573,9 +560,7 @@ DELETE_ECR=true deploy/teardown.sh mysql-dsql-migrator   # ECR リポジトリ +
 aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region "$AWS_REGION"
 ```
 
----
-
-## 10. トラブルシューティング
+### トラブルシューティング
 
 | 症状 | 考えられる原因 / 対処 |
 | --- | --- |
@@ -591,9 +576,7 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 | AI オン時の Bedrock エラー | `BedrockModelArns` のスコープ、`BedrockRegion` でのモデル有効化、Bedrock エンドポイントへの egress。 |
 | 失敗の診断にさらに詳細が必要 | アプリの **Diagnostics** コントロール（サイドバーのフッター）でログレベルを `DEBUG` に設定して、アクティビティログの失敗イベントに Python スタックトレースを追加。「Send to CloudWatch (stdout)」をトグルして耐久性のあるコピーを取得。再デプロイ不要。 |
 
----
-
-## 11. セキュリティに関する注記
+### セキュリティに関する注記
 
 - **最小権限**: タスクロールは、`dsql:DbConnect` + `dsql:DbConnectAdmin`（クラスターに
   スコープ限定。アプリはデフォルトで DSQL の `admin` ロールとして接続します）、読み取り
@@ -636,8 +619,8 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 - このスタックはこのリポジトリからデプロイされたことが**ありません** — 本番利用の前に
   対象アカウントで検証してください。
 
----
 
+---
 
 ## 付録 — 自前のイメージをビルドする (制限されたネットワークのみ)
 

@@ -97,10 +97,10 @@ OCC 경합 완전 제거:
 
 ## CDC 처리량
 
-CDC는 병목이 다른 파이프라인입니다. Full Load는 **CPU/GIL 바운드**인 Python 프로세스지만,
-CDC는 `Debezium(소스) → MSK 토픽 → 커스텀 DSQL 싱크`이며 싱크가 **DSQL 쓰기 지연 바운드**입니다.
-이 측정(2026-07-08)이 출하된 커넥터 코드(`dsql-sink` 플러그인)와
-[§7.2](07-performance-and-tuning.md#72-병렬수-튜닝)의 스마트 기본값을 이끌었습니다.
+CDC는 병목 지점이 Full Load와 다른 파이프라인입니다. Full Load가 **CPU/GIL 바운드**인 Python
+프로세스인 반면, CDC는 `Debezium(소스) → MSK 토픽 → 커스텀 DSQL 싱크` 구조이고 싱크가 **DSQL 쓰기
+지연 바운드**입니다. 아래 측정(2026-07-08)이 실제 출하된 커넥터 코드(`dsql-sink` 플러그인)와
+[§7.2](07-performance-and-tuning.md#72-병렬수-튜닝)의 스마트 기본값을 이끌어 냈습니다.
 
 ### CDC 처리량에 영향을 주는 파라미터
 
@@ -167,38 +167,62 @@ sublinear해도 서버측 경합의 증거가 아니다** — 숨은 클라이�
 `OccConflicts` / `ReadOnlyTransactions` 메트릭이 이를 즉시 갈라줍니다. 파티션 분산형 composite PK는
 `OccConflicts`가 실제로 오를 때만 도움이 되며 — 여기서는 아닙니다.
 
+### sink를 source와 별도로 sizing
+
+행당 왕복이 사라진 뒤(v16) sink가 **CPU 바운드**가 됨(4 MCU에서 ~80% / ~21,000 rows/s)에 반해,
+단일 task인 Debezium source는 CPU 여유가 있습니다. 그래서 sink의 MSK Connect 컴퓨트(`SinkMcuCount`,
+기본 4)는 source의 것(`ConnectorMcuCount`)과 별도 노브입니다. sink를 **8 MCU**로 올리니 ~34% CPU에서
+~26,000 rows/s. 그 이상은 source(단일 binlog reader)와 소스 DB 자체 용량이 한계 — 작은 소스 인스턴스는
+쓰기 워크로드와 Debezium binlog 읽기를 동시에 감당하다 CDC를 막을 수 있음(2 vCPU 소스가 CPU 93%로
+파이프라인을 막았고, 스케일업 후 해소).
+
+### 소스 재부팅 견디기 (처리량 아닌 복원력)
+
+프로덕션 CDC는 몇 주간 돌며 소스 재부팅(유지보수 패치, 페일오버, 인스턴스 클래스 변경)을 **반드시**
+겪습니다. Debezium 소스 커넥터는 `errors.retry.timeout`을 10분으로 설정해 재부팅을 자동 흡수합니다:
+binlog 스트림이 끊기면 재부팅 구간 내내 재시도하고, 소스가 돌아오면 **커밋된 binlog offset부터 재개 —
+gapless, 운영자 개입 불필요**. (Kafka Connect 기본값 `0`이면 첫 재시작 실패에 task가 kill되어
+`SourceRecordWriteRate=0`으로 조용히 스톨, Stop/Start로만 복구 — 소스를 스트리밍 중 재부팅해 sink가
+gap 없이 따라잡음을 실증으로 확인.)
+
 ---
 
 ## 핵심 발견
 
 ### Full Load
 
-1. **GIL이 Python 데이터 파이프라인의 천장.** I/O를 해제하는 C 확장(psycopg3)이 있어도
-   행당 Python 변환이 지배하여 1코어에 직렬화.
-2. **`spawn` context의 ProcessPoolExecutor가 올바른 GIL 우회.** 각 worker가 자체 MySQL
-   engine + DSQL connector를 구축 — 프로세스 간 행 전송 불필요.
-3. **OCC 경합은 기존 데이터에 대한 동시 writer 수에 비례.** 32 writer가 같은 행에
-   ON CONFLICT 치면 livelock. 빈 테이블에 plain INSERT로 완전 제거.
-4. **tp=8에서 처리량 상한이 CPU → DSQL write 용량으로 이동.** ~8 writer process 이상은
-   DSQL 서버측 write throughput이 병목 (~67K rows/s peak 관측).
-5. **최적 설정:** `TABLE_PARALLELISM` = vCPU 수. 로더가 자동으로 대형 테이블을 shard.
+1. **Python 데이터 파이프라인에서는 GIL이 천장이 됩니다.** psycopg3처럼 I/O 구간에서 GIL을 놓아주는
+   C 확장을 쓰더라도, 행마다 수행하는 Python 타입 변환이 비용을 지배해 결국 한 코어에서 직렬화됩니다.
+2. **`spawn` 방식의 `ProcessPoolExecutor`가 이 GIL을 우회하는 정답입니다.** 각 워커 프로세스가 자신의
+   MySQL 엔진과 DSQL 커넥터를 직접 만들기 때문에, 프로세스 사이로 행 데이터를 주고받을 필요가 없습니다
+   (진행 카운터만 IPC로 오갑니다).
+3. **OCC 경합은 기존 데이터에 대한 동시 writer 수에 비례해 심해집니다.** 32개 writer가 같은 행을
+   `ON CONFLICT`로 동시에 건드리면 라이브락에 빠질 수 있습니다. 대상 테이블을 DROP 후 재생성해 빈
+   상태에서 순수 `INSERT`로 적재하면 이 경합이 완전히 사라집니다.
+4. **tp=8에 이르면 병목이 CPU에서 DSQL 쓰기 용량으로 넘어갑니다.** writer 프로세스가 약 8개를 넘으면
+   Python CPU가 아니라 DSQL 서버측 쓰기 처리량이 한계가 됩니다(피크 약 67K rows/s 관측).
+5. **권장 설정은 `TABLE_PARALLELISM` = vCPU 개수입니다.** 로더가 대형 테이블을 자동으로 샤딩해 남는
+   코어까지 활용합니다.
 
 ### CDC
 
-6. **싱크는 지연 바운드였다: 아낀 왕복 하나하나가 개선.** CPU가 낮을 때 싱크는 연산이 아니라 DSQL
-   왕복을 기다렸음 — 따라서 레버는 *더 적은* 왕복(배치 `executeBatch`, multi-row 재작성, 그리고 —
-   결정타 — 행당 메타데이터 왕복 제거)이지 더 많은 컴퓨트가 아님.
-7. **숨은 행당 왕복이 진짜 천장이었고, 제거하니 ~9.7배.** 행마다 `getParameterMetaData()`는 pgjdbc에서
-   서버 Parse/Describe; statement당 1회로 hoist하니 싱크가 ~1,925 → ~18,672 rows/s. 배치화(v13/v15)는
-   이걸 제거한 뒤에야 온전히 효과를 냈음.
-8. **소스는 애초에 천장이 아니었음.** producer 튜닝(배치/큐/`lz4`)으로 16× ~31,000 rec/s 도달;
-   MySQL 서버당 단일 Debezium 태스크로 충분.
-9. **낮은 CPU + sublinear 파티션 스케일 ≠ 서버측 경합.** 4→8 파티션 ~1.4배 정체가 DSQL 쓰기 경합처럼
-   보였으나 아니었음 — `OccConflicts`는 0; 원인은 행당 왕복. 서버를 탓하기 전에 항상 DSQL의
-   `OccConflicts` / `ReadOnlyTransactions`를 확인할 것. 파티션 분산형 composite PK는 `OccConflicts`가
-   실제로 오를 때만 도움이 됨.
-10. **파티션 수는 비가역적**이므로, 툴은 영구적으로 잘못 설정될 수 있는 UI 노브 대신 캡처 테이블
-    수로부터 생성 시점에 추론.
+6. **싱크는 지연(latency) 바운드였고, 왕복을 하나 줄일 때마다 그만큼 빨라졌습니다.** CPU가 낮은 동안
+   싱크는 연산이 아니라 DSQL 왕복 응답을 기다리고 있었습니다. 따라서 지렛대는 컴퓨트를 늘리는 것이
+   아니라 왕복 횟수를 줄이는 것이었습니다 — 배치 `executeBatch`, 멀티행 재작성, 그리고 결정적으로 행당
+   메타데이터 왕복 제거입니다.
+7. **숨어 있던 행당 왕복이 진짜 천장이었고, 이를 없애자 약 9.7배 빨라졌습니다.** 행마다 호출하던
+   `getParameterMetaData()`는 pgjdbc에서 서버로 나가는 Parse/Describe 왕복입니다. 이 호출을 statement당
+   한 번으로 끌어올리자 싱크가 ~1,925 → ~18,672 rows/s로 뛰었습니다. 앞선 배치화(v13/v15)도 이 왕복을
+   제거한 뒤에야 비로소 온전한 효과를 냈습니다.
+8. **소스는 애초에 병목이 아니었습니다.** producer 튜닝(배치·큐·`lz4` 압축)만으로 소스가 16배인
+   ~31,000 rec/s에 도달했습니다. MySQL 서버당 단일 Debezium 태스크로도 충분합니다.
+9. **낮은 CPU + sublinear한 파티션 확장은 서버측 경합의 증거가 아닙니다.** 4→8 파티션에서 ~1.4배에
+   그친 정체가 DSQL 쓰기 경합처럼 보였지만 실제로는 아니었습니다 — `OccConflicts`가 내내 0이었고, 원인은
+   행당 왕복이었습니다. 서버를 탓하기 전에 반드시 DSQL의 `OccConflicts` / `ReadOnlyTransactions` 지표를
+   먼저 확인하세요. 쓰기를 분산하는 composite PK는 `OccConflicts`가 실제로 오르기 시작할 때에만 효과가
+   있습니다.
+10. **파티션 수는 비가역적입니다.** 그래서 이 도구는 잘못 설정하면 영구적으로 남는 UI 노브를 두지
+    않고, 캡처 대상 테이블 수로부터 생성 시점에 자동으로 추론합니다.
 
 ---
 

@@ -981,7 +981,7 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 - **Data Migration: 사전 선택 캡션 명확화** — 몇 개가 왜(타깃에 이미 존재) 미리 선택됐는지 표시 +
   Select all/Unselect all.
 - **격리(quarantine) 행을 "실패"가 아니라 재프레이밍** — 적재 가능분은 다 적재했고 DSQL 하드
-  리밋(예: 값당 ~1 MiB 초과)으로 한 행을 영구 드롭한 테이블은 **"Done — quarantined"(앰버)**로,
+  리밋(예: 값당 ~1 MiB 초과)으로 한 행을 영구 드롭한 테이블은 **"Done — quarantined"**(앰버)로,
   재시도 가능한 실제 실패(레드)와 분리 표시.
 - **테이블별 Reload** — 한 테이블만(DONE이어도) Full Load 재실행. 예: 초과 소스 값을 고친 뒤
   이전에 격리된 행을 적재. 나머지 테이블은 그대로 유지.

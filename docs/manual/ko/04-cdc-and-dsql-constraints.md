@@ -4,7 +4,7 @@ _언어: [English](../en/04-cdc-and-dsql-constraints.md) | **한국어** | [日�
 
 > **이전:** [3. Full Load](03-full-load.md)
 
-**CDC(Change Data Capture)**는 거의 무중단 전환을 위한 **선택적** 스트리밍 파이프라인입니다. Full
+**CDC**(Change Data Capture)는 거의 무중단 전환을 위한 **선택적** 스트리밍 파이프라인입니다. Full
 Load가 기존 행을 복사한 뒤, CDC는 소스의 모든 신규 insert/update/delete를 반영해 DSQL을 계속 최신
 상태로 유지합니다. 덕분에 긴 중단 대신 최소 다운타임으로 전환할 수 있습니다.
 
@@ -15,32 +15,22 @@ CDC가 필요한 경우는 **대규모 또는 지속적** 마이그레이션뿐�
 
 ## 4.1 파이프라인
 
-```
-Source MySQL ──binlog (ROW+GTID, 읽기 전용)──►  Debezium MySQL 소스 커넥터
-                                                        │  변경 이벤트
-                                                        ▼
-                                                 Amazon MSK (Kafka)
-                                          테이블별 토픽, PK로 키잉  + DLQ
-                                                        │
-                                                        ▼
-                                       커스텀 DSQL 싱크 커넥터 (자체 Java 플러그인)
-                                          IAM 토큰 · 재적용해도 안전한 upsert/delete
-                                          문장 단위 OCC 재시도 · ≤3000행 배치
-                                                        │
-                                                        ▼
-                                                  Aurora DSQL
-```
+<p align="center">
+  <img src="../../../deploy/architecture-cdc-pipeline.png" alt="CDC 파이프라인: 소스 MySQL binlog → Debezium 소스 커넥터 → Amazon MSK(PK로 키잉한 테이블별 토픽 + DLQ) → 커스텀 DSQL 싱크 커넥터 → Aurora DSQL" width="900">
+</p>
 
 - **Debezium MySQL 소스 커넥터**가 소스 바이너리 로그를 읽기 전용으로 읽어 변경 이벤트를 냅니다.
-- **Amazon MSK(Kafka)**가 내구성 있는 백본 역할을 합니다. **테이블당 토픽 1개**, 기본 키로 키잉(한
+- **Amazon MSK**(Kafka)가 내구성 있는 백본 역할을 합니다. **테이블당 토픽 1개**, 기본 키로 키잉(한
   행의 모든 변경이 한 파티션에 순서대로 유지), 그리고 DLQ 토픽으로 구성됩니다.
 - **커스텀 DSQL 싱크 커넥터**(이 프로젝트가 소유한 Java Kafka Connect 플러그인)가 변경을 DSQL에
   적용합니다. 두 커넥터 모두 **관리형 MSK Connect**에서 실행되며, 도구는 **자체 싱크 컴퓨트를 돌리지
   않고** 컨트롤 플레인 역할만 합니다(구성 작성, 시작 오프셋 시드, 모니터링).
 
-왜 표준 JDBC 싱크가 아니라 *커스텀* 싱크일까요? 표준 JDBC 싱크는 낙관적 동시성 충돌(`SQLSTATE 40001`)을
-**배치 단위로** 재시도하기 때문에, 경합이 심한 대용량 CDC에서는 처리량이 무너집니다. 커스텀 싱크는
-**문장 단위**로 재시도하며 DSQL의 단기 IAM 토큰, ≤3000행 배치, 재연결을 처리합니다(§4.4).
+**왜 표준 JDBC 싱크가 아니라 *커스텀* 싱크일까요?**
+
+표준 JDBC 싱크는 낙관적 동시성 충돌(`SQLSTATE 40001`)을 **배치 단위로** 재시도하기 때문에, 경합이
+심한 대용량 CDC에서는 처리량이 무너집니다. 커스텀 싱크는 **문장 단위**로 재시도하며 DSQL의 단기
+IAM 토큰, ≤3000행 배치, 재연결을 처리합니다(§4.4).
 
 ---
 
@@ -109,7 +99,7 @@ DSQL은 **약 1 MiB를 초과하는 단일 값**(`TEXT`/`bytea`)을 거부합니
 | 값 크기 | 처리 |
 |---|---|
 | **≤ 1 MiB** | 정상 적용. |
-| **1 MiB – 8 MiB** | 싱크가 쓰기 **전에** 각 값을 측정해 초대형 값을 **DLQ로 격리(quarantine)**합니다(절대 적용 불가). 그런 레코드가 DLQ에 닿도록 Kafka를 통과하려면 토픽·클라이언트 한도를 상향(기본 4 MiB, 최대 8 MiB). |
+| **1 MiB – 8 MiB** | 싱크가 쓰기 **전에** 각 값을 측정해 초대형 값을 **DLQ로 격리**(quarantine)합니다(절대 적용 불가). 그런 레코드가 DLQ에 닿도록 Kafka를 통과하려면 토픽·클라이언트 한도를 상향(기본 4 MiB, 최대 8 MiB). |
 | **> 8 MiB** | Kafka에 들어갈 수 없음. **캡처 단계에서 제외**해야 함: Debezium `column.exclude.list`가 초대형 LOB 컬럼을 드롭(Evaluation `OVERSIZED_LOB` 플래그로 구동)해 파이프라인에 닿지 않게 함. |
 
 ### DLQ로 가는 것

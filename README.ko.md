@@ -3,7 +3,7 @@
 _언어: [English](README.md) | **한국어** | [日本語](README.ja.md)_
 
 Amazon RDS MySQL / Aurora MySQL을 **Amazon Aurora DSQL**로 마이그레이션하는 웹 기반
-All-In-One 도구이며, 판단이 필요한 부분을 위한 **선택적 AI 보조(Amazon Bedrock)**를
+All-In-One 도구이며, 판단이 필요한 부분을 위한 **선택적 AI 보조**(Amazon Bedrock)를
 내장했습니다.
 
 Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 *분산* 데이터베이스이므로, 이것은
@@ -19,17 +19,20 @@ Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 *분산* 데이터베이�
 > 하는지 — Full Load vs CDC, DSQL 제약, 검증, 컷오버, 비용)를 먼저 읽고,
 > [**사용자 매뉴얼**](docs/manual/ko/README.md)의 단계별 안내를 따라가세요.
 
-## 한눈에 보기
+---
 
-<p align="center">
-  <img src="docs/demo-ui.gif" alt="UI 데모 — 6단계 가이드 마이그레이션 워크플로우" width="720">
-</p>
+## 한눈에 보기
 
 두 개의 데이터 경로가 Aurora DSQL로 수렴합니다: 도구가 주도하는 일회성 **Full Load**와,
 관리형 MSK Connect에서 돌아가는 선택적 연속 **CDC** 스트림. binlog/GTID 워터마크가 둘을
 무손실로 이어 줍니다.
 
-![아키텍처 다이어그램](deploy/architecture-aws-simple.png)
+<p align="center">
+  <b>Simple architecture</b><br>
+  <img src="deploy/architecture-aws-simple.png" alt="아키텍처 다이어그램" width="720">
+</p>
+
+---
 
 ## 할 수 있는 것 / 없는 것
 
@@ -56,6 +59,8 @@ Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 *분산* 데이터베이�
 > 강제되는 한계의 전체 목록과 우회법은 사용자 매뉴얼
 > [6장 — 한계](docs/manual/ko/06-limitations.md).
 
+---
+
 ## 워크플로우
 
 웹 UI는 **Connect**를 사전 단계로 한 6단계를 안내합니다:
@@ -75,10 +80,22 @@ Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 *분산* 데이터베이�
 각 단계는 상태(시작 안 함 / 진행 중 / 완료 / 실패)를 표시하며 독립적으로 실행/재실행할 수
 있습니다. 기능 단위 상세는 [사용자 매뉴얼](docs/manual/ko/README.md)에 있습니다.
 
+---
+
 ## 빠른 시작
 
 같은 도구·같은 UI이며 **어디서 실행하느냐**만 다릅니다. 평가·소규모는 **로컬**, 실제
 마이그레이션은 **ECS Fargate**를 권장합니다.
+
+| | **로컬** | **ECS Fargate** |
+|---|---|---|
+| 적합한 용도 | 평가, 소규모 마이그레이션 | 실제·대규모 마이그레이션 |
+| 셋업 | `uv sync` + 실행 (수 초) | CloudFormation app-stack 배포 |
+| 마이그레이션 엔진 실행 위치 | 내 머신 | 내 VPC 안의 단일 태스크 Fargate 서비스 |
+| 소스·DSQL 도달 | 내 머신에서 (프라이빗 소스는 VPN/SSM) | AWS 내부에서 프라이빗하게 (소스 → Fargate → DSQL) |
+| 데이터 경로 | 내 머신을 경유 | AWS 내부에 머무름; 브라우저는 UI만 로드 |
+| 프라이빗 소스 | 터널링 필요 | 네이티브 지원 (in-VPC) |
+| 컴퓨트·비용 | 내 노트북, 무료 | Fargate 태스크 (teardown까지 과금) |
 
 ### 로컬 (가장 빠름)
 
@@ -106,6 +123,13 @@ UI만 띄우므로, 대용량 마이그레이션과 프라이빗 소스에 적�
 
 **전체 절차: [`deploy/DEPLOYMENT.ko.md`](deploy/DEPLOYMENT.ko.md)**(빠른 배포, 파라미터,
 Dev/Test vs Prod, DNS·Cognito, teardown, 문제 해결).
+
+<p align="center">
+  <b>Console (UI)</b><br>
+  <img src="docs/demo-ui.gif" alt="UI 데모 — 6단계 가이드 마이그레이션 워크플로우" width="720">
+</p>
+
+---
 
 ## 아키텍처
 
@@ -170,6 +194,8 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 
 </details>
 
+---
+
 ## 사전 요구사항
 
 - 스키마·데이터를 읽을 수 있는 사용자를 가진 소스 **RDS / Aurora MySQL**.
@@ -180,6 +206,8 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 
 > 소스 DB·CDC 설정(binlog 등)을 포함한 전체 체크리스트:
 > [사용자 매뉴얼 §1.1](docs/manual/ko/01-setup.md).
+
+---
 
 ## 설정 (고급 — 보통은 건드릴 필요 없음)
 
@@ -201,6 +229,9 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 | `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4` (≤16) | 동시에 로드하는 테이블 수. 총 DSQL 연결을 클러스터 쿼터 안에서 유지. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | 테이블당 in-flight `INSERT … ON CONFLICT` 배치 수. 높을수록 처리량↑, OCC(40001) 충돌↑. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000` (≤3000) | 배치 쓰기당 행 수, DSQL의 트랜잭션당 3000행 한도로 하드캡. |
+| `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1` (켜짐) | 읽기 선행 prefetch 큐(리더 스레드가 bounded 큐를 채우는 동안 쓰기 진행). 켜 두세요. A/B 벤치마크로 pre-prefetch 경로를 재현할 때만 `0`. |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1` (꺼짐, ≤8) | 큰 단일 정수 PK 테이블의 읽기를 K개 동시 리더로 분할. 대개 이득이 드묾(리더가 GIL 바운드) — 매뉴얼 §7.2 참고. |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | 이 추정 행수 이상인 테이블만 리더 샤딩; 더 작은 테이블은 항상 단일 리더. |
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4` (≤32) | Validation에서 동시에 비교하는 테이블 수. `1` = 순차. |
 | `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | 시작 로그 레벨. `DEBUG`는 실패 이벤트에 stacktrace(콜 스택만) 추가. 런타임에 **Diagnostics**에서도 변경 가능. |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | 활동 로그 이벤트를 stdout에도 미러링(ECS에서는 → CloudWatch). 런타임에 **Diagnostics**에서 토글 가능. |
@@ -210,6 +241,13 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 AI 보조는 기본 off이며 UI에서 켭니다. UI는 Bedrock 도달 가능 여부를 확인하고 조치 가능한 실패
 이유를 보고하는 **Verify AI access** 사전 점검도 제공합니다. 튜닝 노브의 배경은 매뉴얼
 [성능과 튜닝](docs/manual/ko/07-performance-and-tuning.md).
+
+> **CDC 스케일링은 여기서 설정하지 않고 추론됩니다.** 커넥터 노브(테이블별 토픽 파티션 수, 싱크
+> `tasks.max`, MSK Connect MCU)는 cdc-stack 배포 시점에 캡처 대상 테이블 수로부터 결정됩니다. 고급
+> 환경 변수 재정의(`DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` / `_SINK_TASKS_MAX` / `_MCU_COUNT`)는 매뉴얼
+> [§7.2 — CDC](docs/manual/ko/07-performance-and-tuning.md)에 문서화돼 있습니다.
+
+---
 
 ## 프로젝트 구조
 
@@ -221,6 +259,8 @@ AI 보조는 기본 off이며 UI에서 켭니다. UI는 Bedrock 도달 가능 �
 | `connectors/dsql-sink/` | 커스텀 Aurora DSQL Kafka Connect **싱크 커넥터**(Java; 선택적 CDC 플러그인). |
 | `deploy/` | `Dockerfile`, CloudFormation 템플릿, 빌드/teardown 스크립트, 다이어그램. [`deploy/DEPLOYMENT.ko.md`](deploy/DEPLOYMENT.ko.md) 참고. |
 | `docs/manual/` | 단계별 사용자 매뉴얼(영·한·일). |
+
+---
 
 ## 배포
 
@@ -236,10 +276,14 @@ AI 보조는 기본 off이며 UI에서 켭니다. UI는 Bedrock 도달 가능 �
 > 도출), 프로비저닝되는 모든 인프라 — 특히 소스에 프라이빗하게 도달해야 하는 CDC VPC — 가 그
 > 리전에 배포됩니다. 크로스 리전 소스/타깃은 지원되지 않습니다.
 
+---
+
 ## 버전 / 변경 이력
 
 현재 버전: [`pyproject.toml`](pyproject.toml); 버전별 변경 내용:
 [**CHANGELOG.ko.md**](CHANGELOG.ko.md).
+
+---
 
 ## 라이선스
 

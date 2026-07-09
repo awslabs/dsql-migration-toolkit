@@ -179,6 +179,29 @@ contention** — a hidden client round-trip produces the same symptoms. DSQL's
 `OccConflicts` / `ReadOnlyTransactions` metrics settle it directly. A composite,
 partition-spreading PK helps only once `OccConflicts` actually rises — not here.
 
+### Sizing the sink independently of the source
+
+Once the per-row round-trip was gone (v16) the sink became **CPU-bound** (~80% at 4
+MCU / ~21,000 rows/s), while the single-task Debezium source has spare CPU. So the
+sink's MSK Connect compute is a separate knob (`SinkMcuCount`, default 4) from the
+source's (`ConnectorMcuCount`). Raising the sink to **8 MCU** took it to ~26,000
+rows/s at ~34% CPU. Beyond that the source (a single binlog reader) and the source
+DB's own capacity become the limit — a small source instance can even bottleneck CDC
+because it serves the write workload *and* Debezium's binlog read at once (a 2 vCPU
+source ran at 93% CPU and capped the pipeline until it was scaled up).
+
+### Surviving a source reboot (resilience, not throughput)
+
+A production CDC pipeline runs for weeks and **will** see the source reboot
+(maintenance patch, failover, instance-class change). The Debezium source connector
+sets `errors.retry.timeout` to 10 minutes so a reboot is absorbed automatically: the
+binlog stream is cut, the task retries across the reboot window, and once the source
+is back it **resumes from the committed binlog offset — gapless, no operator
+action**. (With the Kafka Connect default of `0` the task would be killed on the
+first failed restart and stall silently at `SourceRecordWriteRate=0` until a manual
+Stop/Start — verified fixed by rebooting the source mid-stream and watching the sink
+catch up with no gap.)
+
 ---
 
 ## Key findings

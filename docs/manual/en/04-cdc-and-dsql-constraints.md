@@ -16,21 +16,9 @@ cut-over where a short freeze is acceptable, Full Load alone is enough.
 
 ## 4.1 The pipeline
 
-```
-Source MySQL ──binlog (ROW+GTID, read-only)──►  Debezium MySQL source connector
-                                                        │  change events
-                                                        ▼
-                                                 Amazon MSK (Kafka)
-                                          per-table topics, keyed by PK  + DLQ
-                                                        │
-                                                        ▼
-                                       Custom DSQL Sink Connector (our Java plugin)
-                                          IAM token · idempotent upsert/delete
-                                          statement-level OCC retry · ≤3000-row batches
-                                                        │
-                                                        ▼
-                                                  Aurora DSQL
-```
+<p align="center">
+  <img src="../../../deploy/architecture-cdc-pipeline.png" alt="CDC pipeline: source MySQL binlog → Debezium source connector → Amazon MSK (per-table topics keyed by PK + DLQ) → custom DSQL sink connector → Aurora DSQL" width="900">
+</p>
 
 - **Debezium MySQL source connector** reads the source's binary log (read-only)
   and emits change events.
@@ -42,11 +30,12 @@ Source MySQL ──binlog (ROW+GTID, read-only)──►  Debezium MySQL source 
   Connect**; the tool runs **no sink compute of its own**, it is the control
   plane (it builds the configs, seeds the start offset, and monitors).
 
-Why a *custom* sink and not a stock JDBC sink? A standard JDBC sink retries
-optimistic-concurrency conflicts (`SQLSTATE 40001`) **per batch**, which collapses
-throughput under high-contention large-scale CDC. The custom sink retries at the
-**statement level** and handles DSQL's short-lived IAM tokens, ≤3000-row batches,
-and reconnects (details in §4.4).
+**Why a *custom* sink and not a stock JDBC sink?**
+
+A standard JDBC sink retries optimistic-concurrency conflicts (`SQLSTATE 40001`)
+**per batch**, which collapses throughput under high-contention large-scale CDC.
+The custom sink retries at the **statement level** and handles DSQL's short-lived
+IAM tokens, ≤3000-row batches, and reconnects (details in §4.4).
 
 ---
 
