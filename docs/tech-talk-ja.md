@@ -28,10 +28,6 @@ section h2 { font-size: 34px; }
 # MySQL to DSQL Migrator
 ## Migration Architecture & Data Path Deep Dive
 
-発表者: dalyoung@ · 2026-07-08
-
-Gitlab - https://gitlab.aws.dev/dalyoung/mysql-dsql-migration-tool-public
-
 <!--
 - （口頭）社内技術共有 · 発表20分 + デモ5分 · 対象: DB 専門家。
 - 上の GitLab リンクは公開リポジトリ — 参加者が clone して追従できる。

@@ -1,8 +1,8 @@
 /*
- * Task 23.2 — custom Aurora DSQL Kafka Connect sink connector.
+ * Custom Aurora DSQL Kafka Connect sink connector.
  * Pure SQL builders for the DSQL dialect (PostgreSQL wire protocol).
- * Offline unit-tested; exact column/value binding is validated against a live
- * DSQL cluster in the spike (cdc-connector-spike.md).
+ * Offline unit-tested; validate exact column/value binding against a live
+ * DSQL cluster before a production deploy.
  */
 package dev.dsqlmigrator.connect;
 

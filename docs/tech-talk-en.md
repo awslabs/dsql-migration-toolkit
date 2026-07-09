@@ -28,10 +28,6 @@ section h2 { font-size: 34px; }
 # MySQL to DSQL Migrator
 ## Migration Architecture & Data Path Deep Dive
 
-Speaker: dalyoung@ · 2026-07-08
-
-Gitlab - https://gitlab.aws.dev/dalyoung/mysql-dsql-migration-tool-public
-
 <!--
 - (verbal) Internal tech share · 20-min talk + 5-min demo · audience: DB experts.
 - This tool is a web app that migrates RDS/Aurora MySQL to Aurora DSQL (PostgreSQL-16 compatible, distributed).

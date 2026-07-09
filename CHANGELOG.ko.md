@@ -5,6 +5,23 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.79
+
+### 수정 (Fixed)
+
+- **앱 셸: 단계 렌더링 크래시가 이제 파란 info가 아닌 빨간 error 알림으로 표시됨.**
+  최상위 "단계를 표시할 수 없음" 폴백이 `render_notice(tone="negative")`를 호출했는데,
+  `negative`는 정의된 알림 톤이 아니어서 조용히 차분한 파란 `info` 스타일로 폴백했다 —
+  실제로는 앱에서 가장 경보해야 할 상태(처리되지 않은 렌더링 예외)인데도. 이제 심각도에 맞게
+  `tone="error"`(빨강)를 사용한다.
+
+### 정리 (Housekeeping)
+
+- 오픈소스 공개 위생: 내부 세션 핸드오프 노트와 발표 자료의 내부 작성자/리포 식별자를 제거하고,
+  커넥터 소스·CloudFormation 템플릿·CDC read-model에서 내부(비공개) 설계/스펙 문서에 대한
+  깨진 인용을 인라인 요약으로 대체했다. `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`,
+  `SECURITY.md`를 추가했다.
+
 ## v0.1.78
 
 ### 수정 (Fixed)

@@ -1780,7 +1780,7 @@ def build_workflow_sidebar(
                     )
                     render_notice(
                         ui,
-                        tone="negative",
+                        tone="error",
                         header=f"{step_title(step)} could not be displayed",
                         body=(
                             "An unexpected error occurred while rendering this step "

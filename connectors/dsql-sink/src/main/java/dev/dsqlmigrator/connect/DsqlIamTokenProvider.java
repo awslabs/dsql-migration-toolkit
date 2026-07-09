@@ -1,7 +1,7 @@
 /*
- * Task 23.2 — custom Aurora DSQL Kafka Connect sink connector.
- * Implemented and offline unit-tested. Live MSK Connect + DSQL load validation
- * (cdc-connector-spike.md, H1) is still pending: see README.md.
+ * Custom Aurora DSQL Kafka Connect sink connector.
+ * Implemented and offline unit-tested. Validate IAM token rotation on a live
+ * MSK Connect + DSQL runtime before a production deploy: see README.md.
  */
 package dev.dsqlmigrator.connect;
 

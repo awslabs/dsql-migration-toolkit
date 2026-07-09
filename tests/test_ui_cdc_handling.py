@@ -1,8 +1,7 @@
-"""Unit tests for the CDC screen's connector-spike handling read-models.
+"""Unit tests for the CDC screen's connector handling read-models.
 
-These cover the NiceGUI-agnostic helpers added to surface the connector-spike
-findings (cdc-handling-design.md / deploy/cdc-stack/SPIKE-RESULTS.md) in the CDC
-screen:
+These cover the NiceGUI-agnostic helpers that surface the CDC connector
+handling behavior in the CDC screen:
 
 - Oversized-LOB exclusion candidates + Debezium ``column.exclude.list`` value
   (H13), including PK exclusion and stable ordering.

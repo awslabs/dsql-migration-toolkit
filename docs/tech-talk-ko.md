@@ -28,10 +28,6 @@ section h2 { font-size: 34px; }
 # MySQL to DSQL Migrator
 ## Migration Architecture & Data Path Deep Dive
 
-발표자: dalyoung@ · 2026-07-08
-
-Gitlab - https://gitlab.aws.dev/dalyoung/mysql-dsql-migration-tool-public
-
 <!--
 - (구두) 내부 기술 공유 · 발표 20분 + 데모 5분 · 대상: DB 전문가.
 - 위 GitLab 링크가 공개 리포지토리 — 참석자가 clone해서 따라올 수 있음.
@@ -378,7 +374,7 @@ WHERE pk > :last ORDER BY pk LIMIT 1000        -- 복합 PK는 행-값 튜플 �
 - **제한적(bounded) cross-language 중복은 관리형 런타임의 대가** — write-contract 패리티 테스트로 강제
 
 <!--
-- "결정 변경 8"이 이 근거. 표준 JDBC 싱크가 40001을 batch로 재시도 → 3000행 통째 재생 → 넓은 키 범위 → livelock.
+- 이것이 커스텀 싱크 커넥터를 만든 근거. 표준 JDBC 싱크가 40001을 batch로 재시도 → 3000행 통째 재생 → 넓은 키 범위 → livelock.
 - Full Load(Python)와 CDC 싱크(Java)가 같은 타입 매핑을 따르도록 공유 패리티 테스트로 강제 → 어느 경로로 옮겨도 같은 행이 동일하게 적재.
 - CDC 특유: BIGINT UNSIGNED는 precise 모드, JSON은 PGobject 래핑, GEOMETRY는 .wkb 추출.
 -->

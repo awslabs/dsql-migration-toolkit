@@ -2,14 +2,13 @@ AWSTemplateFormatVersion: "2010-09-09"
 
 Description: >
   Optional streaming CDC data plane (cdc-stack) for the MySQL -> Aurora DSQL
-  migration tool (design Decision Log 결정 변경 8). Provisions an MSK Serverless
+  migration tool. Provisions an MSK Serverless
   cluster (IAM auth), a Glue Schema Registry, two MSK Connect custom plugins
   (Debezium MySQL source + our custom DSQL sink), two MSK Connect connectors,
   and a least-privilege connector execution role. Runtime is managed MSK Connect
   (no EKS/compute cluster); scale via MSK partitions, MSK Connect MCU/worker
   count, and connector tasks.max. The app-stack control plane does NOT depend on
-  this stack. PREREQUISITES: connector spike (cdc-connector-spike.md, Req 12.13)
-  + both plugin artifacts uploaded to S3. NOTE: MSK Serverless does not expose
+  this stack. PREREQUISITES: both plugin artifacts uploaded to S3. NOTE: MSK Serverless does not expose
   its bootstrap broker string via Ref/GetAtt, so it is supplied as the
   MskBootstrapServers parameter (two-pass deploy). See deploy/cdc-stack/README.md.
 

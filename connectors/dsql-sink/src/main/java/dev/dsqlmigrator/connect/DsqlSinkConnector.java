@@ -1,6 +1,5 @@
 /*
- * SPIKE-GATED SCAFFOLD (Task 23.2) — NOT YET BUILT OR VERIFIED.
- * See ../../../../README.md and cdc-connector-spike.md (Req 12.13).
+ * Custom Aurora DSQL Kafka Connect sink connector. See ../../../../README.md.
  */
 package dev.dsqlmigrator.connect;
 

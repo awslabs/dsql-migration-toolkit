@@ -780,16 +780,15 @@ def format_watermark(watermark: Watermark) -> WatermarkDisplay:
 
 
 # ---------------------------------------------------------------------------
-# CDC handling read-models (NiceGUI-agnostic) -- surface the connector-spike
-# findings (cdc-handling-design.md / deploy/cdc-stack/SPIKE-RESULTS.md) in the
-# CDC screen: oversized-LOB exclusion (H13), DLQ/circuit-breaker reporting
-# (H5/H6/H11), connector health + lag (H1/H2/H9), and the handling contract the
-# pipeline guarantees (H3/H4/H8). All pure: they take already-gathered facts and
-# return display data, mirroring format_watermark / format_error_summary.
+# CDC handling read-models (NiceGUI-agnostic) -- surface the CDC connector
+# behavior in the CDC screen: oversized-LOB exclusion, DLQ/circuit-breaker
+# reporting, connector health + lag, and the handling contract the pipeline
+# guarantees. All pure: they take already-gathered facts and return display
+# data, mirroring format_watermark / format_error_summary.
 # ---------------------------------------------------------------------------
 
 # Aurora DSQL rejects a single text/bytea value over 1 MiB; a row over the Kafka
-# client limit kills the source task (spike H13). The CDC screen reuses the
+# client limit kills the source task. The CDC screen reuses the
 # evaluation OVERSIZED_LOB type set (_OVERSIZED_LOB_BASES) and base-type parser
 # (_base_type) imported above, so the exclusion offer stays in lock-step with the
 # evaluation rule instead of duplicating the type list.
@@ -797,14 +796,14 @@ def format_watermark(watermark: Watermark) -> WatermarkDisplay:
 
 @dataclass(frozen=True)
 class LobExclusionCandidate:
-    """One table's columns that CDC can optionally exclude at capture (H13).
+    """One table's columns that CDC can optionally exclude at capture.
 
     ``columns`` are the column names flagged by the evaluation ``OVERSIZED_LOB``
     rule (MySQL ``mediumtext/longtext/mediumblob/longblob``) whose values can
     exceed the Aurora DSQL 1 MiB per-value limit. Excluding them at capture
     (Debezium ``column.exclude.list``) is the only safe handling for values that
     can also exceed the 8 MiB broker limit -- runtime isolation cannot catch
-    those (cdc-handling-design.md §4-b).
+    those.
     """
 
     table: str
@@ -1035,8 +1034,7 @@ def cdc_handling_facts() -> list[CdcHandlingFact]:
     upsert, ≤3,000-row batching, type mapping, DELETE/tombstone, OCC retry, token
     refresh, at-least-once resume) versus what to watch (oversized LOBs, DDL not
     propagated, no automatic circuit breaker), so the user sets correct
-    expectations before streaming. Pure/static -- the verified behavior from
-    cdc-handling-design.md §5.
+    expectations before streaming. Pure/static -- the verified handling behavior.
     """
     return [
         CdcHandlingFact(

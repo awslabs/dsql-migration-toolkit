@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.79
+
+### Fixed
+
+- **App shell: a step-render crash now shows a red error notice, not a blue
+  info one.** The top-level "step could not be displayed" fallback called
+  `render_notice(tone="negative")`, but `negative` is not a defined notice tone,
+  so it silently fell back to the calm blue `info` styling for what is actually
+  the most alarming state in the app (an unhandled rendering exception). It now
+  uses `tone="error"` (red), matching the severity.
+
+### Housekeeping
+
+- Open-source release hygiene: removed an internal session handoff note and
+  internal author/repo identifiers from the talk decks, and replaced dangling
+  citations of internal (unpublished) design/spec documents in the connector
+  sources, CloudFormation template, and CDC read-models with inline summaries.
+  Added `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, and `SECURITY.md`.
+
 ## v0.1.78
 
 ### Fixed

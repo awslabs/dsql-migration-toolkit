@@ -1,9 +1,8 @@
 /*
- * Task 23.2 — custom Aurora DSQL Kafka Connect sink connector.
+ * Custom Aurora DSQL Kafka Connect sink connector.
  * Implemented; the deterministic apply logic (event parse, dialect, batching,
- * OCC retry) is offline unit-tested. The JDBC reconnect/commit behavior against
- * a live MSK Connect + DSQL run is validated in the spike (cdc-connector-spike.md,
- * H1/H3/H4): see README.md.
+ * OCC retry) is offline unit-tested. Validate the JDBC reconnect/commit behavior
+ * against a live MSK Connect + DSQL run before a production deploy: see README.md.
  */
 package dev.dsqlmigrator.connect;
 
@@ -28,7 +27,7 @@ import org.slf4j.LoggerFactory;
  * Applies Debezium change events to Aurora DSQL with idempotent PK upsert/delete,
  * statement-level OCC retry, &lt;=3,000-row batches, and IAM-token reconnect.
  *
- * <p><b>Error handling (heterogeneous-engine policy — see cdc-handling-design.md).</b>
+ * <p><b>Error handling (heterogeneous-engine policy).</b>
  * A change event that DSQL permanently rejects (type mismatch, constraint
  * violation, oversized value, missing object, …) MUST NOT crash the task or stall
  * the pipeline. Such a record is isolated to the dead-letter queue via the
@@ -62,13 +61,13 @@ public class DsqlSinkTask extends SinkTask {
    * so the sink quarantines it to the DLQ from a copy held in memory <em>before</em>
    * attempting any DSQL write — see {@link #oversizedColumn}.
    *
-   * <p><b>Why the dead-letter actually works (spike H13).</b> A record only reaches
+   * <p><b>Why the dead-letter actually works.</b> A record only reaches
    * this task if the broker accepted it, and the MSK Serverless broker caps a
    * message at 8 MiB, so any record we see is &le;8 MiB and CAN be produced to the
    * DLQ — provided the Kafka client limits are raised above the 1 MiB client
    * default (worker config {@code producer.max.request.size} /
-   * {@code consumer.*.fetch.bytes}; see {@code cdc-stack-spike.yaml}
-   * {@code MaxMessageBytes}). Without that, the SOURCE producer throws
+   * {@code consumer.*.fetch.bytes}; see the {@code deploy/cdc-stack/cdc-stack.yaml}
+   * {@code MaxMessageBytes} parameter). Without that, the SOURCE producer throws
    * {@code RecordTooLargeException} and the row never arrives — a stall this guard
    * cannot see. The two go together: raised limits make the row reachable, this
    * guard keeps a per-value-oversized one from being sent to DSQL.

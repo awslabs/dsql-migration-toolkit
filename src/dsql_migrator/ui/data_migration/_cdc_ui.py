@@ -3332,8 +3332,8 @@ def _render_cdc_lob_exclusion_panel(
     Lists the columns the evaluation flagged as able to exceed the DSQL 1 MiB
     per-value limit and lets the user exclude them from capture (Debezium
     ``column.exclude.list``). Excluding is the only safe handling for values that
-    can also exceed the broker limit -- runtime isolation can't recover those
-    (cdc-handling-design.md §4-b). No silent loss: nothing is excluded unless the
+    can also exceed the broker limit -- runtime isolation can't recover those.
+    No silent loss: nothing is excluded unless the
     user ticks it, and the resulting list is shown verbatim.
 
     When no oversized-LOB column qualifies (the common case), there is nothing to

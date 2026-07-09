@@ -1,21 +1,20 @@
 # Custom DSQL Sink Connector (Task 23.2)
 
-> **STATUS: implemented + offline unit-tested + plugin jar builds. Live load
-> validation still pending (spike H1–H4).**
+> **STATUS: implemented + offline unit-tested + plugin jar builds.**
 > The connector logic is complete and verified at the unit/build level
 > (`mvn test` → 20 tests pass; `mvn package` → shaded MSK Connect plugin jar).
-> What is **not** yet covered here is runtime validation on a live MSK Connect +
-> Aurora DSQL environment: the key hypotheses — IAM token rotation, OCC `40001`
+> Before a production deploy, validate the runtime characteristics on a live
+> MSK Connect + Aurora DSQL environment: IAM token rotation, OCC `40001`
 > throughput under contention, ≤3,000-row batching / 1-hour reconnect, and
-> effectively-once delivery — should be validated before deploying to a real
-> account via `deploy/cdc-stack`.
+> effectively-once delivery, deploying to an account via `deploy/cdc-stack`.
 
 ## Why a custom connector (and why Java)
 
 The standard managed JDBC sink retries OCC (`SQLSTATE 40001`) at **batch**
-granularity, which collapses throughput under high-contention large-scale CDC
-(결정 변경 8). This connector applies Debezium change events to Aurora DSQL while
-handling DSQL's constraints directly:
+granularity, which collapses throughput under high-contention large-scale CDC:
+a single `40001` replays the whole batch, so a wide key range keeps colliding and
+throughput degrades toward a livelock. This connector applies Debezium change
+events to Aurora DSQL while handling DSQL's constraints directly:
 
 - **IAM short-lived tokens (~15 min)** — auto-refresh + reconnect before the
   1-hour connection timeout (`DsqlIamTokenProvider`).
@@ -30,8 +29,8 @@ handling DSQL's constraints directly:
 managed **MSK Connect** = managed **Apache Kafka Connect**, whose connector
 plugins are JVM (`SinkConnector`/`SinkTask`) classes packaged as JVM jars. There
 is no Python connector plugin on this runtime, so choosing the managed Kafka
-Connect runtime dictates a JVM/Java connector (see design `결정 변경 8` →
-"왜 Java인가"). The token-generation, OCC-retry, and DSQL-dialect logic is
+Connect runtime dictates a JVM/Java connector. The token-generation, OCC-retry,
+and DSQL-dialect logic is
 therefore mirrored from the Python `core/` into this Java subproject — a small,
 bounded cross-language duplication that is the price of the managed runtime.
 
@@ -77,8 +76,8 @@ Covered without AWS/DSQL: DSQL dialect SQL generation (upsert/delete), OCC
 `40001` statement-retry policy, ≤3,000-row batch partitioning, Debezium
 envelope → upsert/delete parsing, and the IAM-token refresh trigger.
 
-**Not** covered here (requires the live spike — `cdc-connector-spike.md`,
-H1–H4): real IAM token rotation across >15 min / >1 h inside an MSK Connect
+**Not** covered here (requires live MSK Connect + Aurora DSQL validation):
+real IAM token rotation across >15 min / >1 h inside an MSK Connect
 worker, OCC throughput/conflict rate under target parallelism, and
 at-least-once + idempotent → effectively-once convergence under a real change
 stream. Tune `batch.size` / `tasks.max` / partition count / key distribution

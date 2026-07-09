@@ -1,7 +1,7 @@
 /*
- * Task 23.2 — custom Aurora DSQL Kafka Connect sink connector.
- * Implemented and offline unit-tested. Live throughput under contention
- * (cdc-connector-spike.md, H2) is still pending: see README.md.
+ * Custom Aurora DSQL Kafka Connect sink connector.
+ * Implemented and offline unit-tested. Validate live throughput under contention
+ * before a production deploy: see README.md.
  */
 package dev.dsqlmigrator.connect;
 

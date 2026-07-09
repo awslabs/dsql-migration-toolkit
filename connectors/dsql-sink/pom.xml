@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Task 23.2 — custom Aurora DSQL Kafka Connect sink connector.
-  Deterministic apply logic is offline unit-tested (mvn test). Live MSK Connect
-  + DSQL load validation (cdc-connector-spike.md, H1-H4) is still pending before
-  production deployment via deploy/cdc-stack (Task 23.3).
+  Custom Aurora DSQL Kafka Connect sink connector.
+  Deterministic apply logic is offline unit-tested (mvn test). Validate the live
+  MSK Connect + DSQL runtime characteristics before a production deployment via
+  deploy/cdc-stack.
 -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
