@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Per-session, in-memory connection state for the Connect screen.
 
 Credentials entered in the Connect screen are confidential (Property 7 /

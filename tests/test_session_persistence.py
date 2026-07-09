@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for durable per-session state (reconnect/resume, Property 4).
 
 Covers the SQLite/in-memory session-state stores and the NiceGUI-agnostic

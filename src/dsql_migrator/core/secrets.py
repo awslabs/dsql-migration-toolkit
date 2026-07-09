@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Resolve a source database credential from AWS Secrets Manager.
 
 The Connect screen lets a user authenticate the source MySQL connection either

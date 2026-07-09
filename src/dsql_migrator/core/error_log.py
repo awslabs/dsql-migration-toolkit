@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Job-scoped data-error capture and downloadable error logs.
 
 During a load (Full Load or CDC), per-table/per-row data errors are captured so

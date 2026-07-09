@@ -1,3 +1,6 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * Unit tests for DsqlSinkTask's contiguous same-SQL run grouping (the JDBC
  * executeBatch throughput path). The grouping MUST preserve apply order — only

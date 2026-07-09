@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Pure view-models, formatters, and enums for the Data Migration screen.
 
 Progress aggregation, the unified Full Load status/table views, prerequisite

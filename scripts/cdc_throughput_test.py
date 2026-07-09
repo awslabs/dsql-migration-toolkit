@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """CDC throughput test: generate a high-rate INSERT workload on the source
 and measure how quickly the CDC sink catches up on the target (lag convergence).
 

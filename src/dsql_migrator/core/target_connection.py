@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Target Aurora DSQL connection layer (psycopg v3 + IAM token auth).
 
 The :class:`DsqlConnector` opens ``psycopg`` (v3) connections to an Amazon

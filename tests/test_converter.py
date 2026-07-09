@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the schema (DDL) converter type-mapping foundation.
 
 Covers each documented MySQL -> Aurora DSQL (PostgreSQL 16) type mapping

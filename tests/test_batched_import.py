@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the built-in batched ``INSERT`` import fallback (task 8.4).
 
 Covers (Requirements 5.2/5.3/5.6, Properties 2, 3, 4, 5, 9.4):

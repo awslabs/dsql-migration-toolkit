@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Single source of truth for the E2E migration-test table sets.
 
 The end-to-end harness (run_e2e_migration.py), the Full Load harness

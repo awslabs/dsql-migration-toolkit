@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Run a Full Load from the command line, for YOUR own schema and tables.
 
 A headless way to drive the tool's **own** Full Load engine (the same bulk loader

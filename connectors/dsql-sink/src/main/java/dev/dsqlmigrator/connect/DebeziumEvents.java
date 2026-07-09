@@ -1,5 +1,8 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 /*
- * Task 23.2 — custom Aurora DSQL Kafka Connect sink connector.
+ * Custom Aurora DSQL Kafka Connect sink connector.
  * Maps a Debezium envelope SinkRecord to a ChangeEvent. Offline unit-tested
  * with synthetic Connect Structs; the exact envelope shape produced by the
  * deployed Debezium + Glue converter config is confirmed in the spike.

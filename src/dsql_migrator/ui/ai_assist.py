@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """AI-assisted conversion: NiceGUI-agnostic config, review gate, and seam.
 
 This module holds the AI-assist logic that is independent of NiceGUI so it can

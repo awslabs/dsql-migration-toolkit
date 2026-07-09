@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Migration plan screen: decide whether CDC is in scope, provision CDC infra early.
 
 This is the first workflow step after Connect. Mature migration tooling separates

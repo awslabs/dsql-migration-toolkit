@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Target Aurora DSQL catalog introspection (browsing + conflict detection).
 
 The :class:`TargetIntrospector` queries the target's PostgreSQL system catalog

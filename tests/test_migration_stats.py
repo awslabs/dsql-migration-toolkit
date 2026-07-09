@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the post-migration statistics report (Task 24.3 / Req 13.3).
 
 Covers combining existing outputs (no recomputation -- Req 13.4): rows from the

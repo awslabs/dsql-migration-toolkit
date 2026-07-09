@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the consistency validator (task 9).
 
 Covers (Requirements 6.1-6.5, Properties 9 and 11):

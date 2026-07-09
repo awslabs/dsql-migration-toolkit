@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for best-effort source RDS/Aurora metadata (overview diagram).
 
 Covers endpoint parsing (identifier, cluster detection, region) and the

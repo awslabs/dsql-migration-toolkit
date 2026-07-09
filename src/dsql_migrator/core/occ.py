@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Optimistic-concurrency (OCC) retry utility for Aurora DSQL writes.
 
 Aurora DSQL uses optimistic concurrency control: a write transaction can fail at

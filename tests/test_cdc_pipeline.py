@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the CDC pipeline control-plane orchestrator (Task 23.1).
 
 Covers (Requirement 12 / Property 11 / Property 15 / Property 1):

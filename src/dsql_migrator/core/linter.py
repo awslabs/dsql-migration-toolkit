@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Application anti-pattern linter: static analysis of app SQL/source (Req 7).
 
 This module implements the :class:`AppLinter` component (design.md section

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Background job manager for long-running migration operations.
 
 Long-running steps (schema introspection, data migration) must not block the

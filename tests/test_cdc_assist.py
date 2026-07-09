@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for AI-assisted CDC (readiness assessment + DLQ triage, Task 23.4).
 
 Fake Bedrock client (no AWS). Covers (Req 12.13-12.15 / Property 11/13):

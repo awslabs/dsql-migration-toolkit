@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Connect screen: bring-your-own (BYO) source/target connection setup.
 
 This is the preliminary step of the four-step migration workflow. The user

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the job-scoped error log store (Task 21).
 
 Covers (Property 15 / Property 7 / Requirements 8.3, 8.4, 8.9):

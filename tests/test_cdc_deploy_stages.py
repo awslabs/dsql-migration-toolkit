@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the CDC lifecycle orchestration stage progressions.
 
 Drives the four JobManager work functions -- run_cdc_infra_deploy / run_cdc_start

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Compare row counts between the source MySQL and the target Aurora DSQL.
 
 A read-only consistency check for Full Load + CDC testing: for each table it

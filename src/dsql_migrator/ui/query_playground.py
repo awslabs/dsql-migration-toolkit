@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Query Playground screen (Optional tools): convert + test a MySQL query on DSQL.
 
 A standalone, optional tool (not part of the four-step migration) where a user

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the AI-assisted conversion UI logic (NiceGUI-agnostic).
 
 These cover the parts of the Step 2 AI-assist integration that do not touch

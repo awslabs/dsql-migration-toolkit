@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Best-effort source RDS/Aurora metadata for the overview diagram.
 
 The source server version is read over the SQL connection

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """A shared, reusable right slide-in AI chat drawer (Cloudscape-styled).
 
 Both the Evaluation screen (per-object migration guidance) and the Schema

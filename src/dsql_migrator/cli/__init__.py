@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Command-line interface layer.
 
 Exposes a single console entrypoint (``mysql-dsql-migrator``) that wraps the core

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Table selection for the Data Migration sub-flow (multi-table).
 
 The Data Migration sub-flow (Prerequisites Check -> Full Load | CDC) operates on

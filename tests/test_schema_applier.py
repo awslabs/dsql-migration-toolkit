@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the Schema Applier / DDL executor (task 15.2).
 
 Covers (Requirements 10.4, 10.5, 10.6, 10.7, 10.8, Properties 12, 1, 2, 5):

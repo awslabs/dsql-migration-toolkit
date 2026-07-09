@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """AI-assisted conversion: config/env loading and Bedrock-runtime client seam.
 
 Task 16.1 scope. The AI data models (:class:`~dsql_migrator.core.models.AiAssistConfig`

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the four-step workflow shell logic (NiceGUI-agnostic).
 
 Covers step ordering/titles, status reads and transitions, prerequisite gating

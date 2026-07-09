@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Schema Applier (DDL executor) for the target Aurora DSQL cluster.
 
 The :class:`SchemaApplier` applies one piece of converted DDL to the target and

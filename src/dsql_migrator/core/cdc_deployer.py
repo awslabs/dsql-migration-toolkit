@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Deploy and manage the whole CDC pipeline lifecycle via the cdc-stack.
 
 The UI owns the entire CDC lifecycle through this module, all expressed as

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Capture/restore a UI session's workbench state for reconnect/resume.
 
 These pure helpers translate between the in-memory per-session state objects

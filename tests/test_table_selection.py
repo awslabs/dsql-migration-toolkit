@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the multi-table TableSelector (Task 19).
 
 Covers (Requirement 5.9 / 9.4 / Property 16):

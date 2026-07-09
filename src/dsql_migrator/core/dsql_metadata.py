@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Best-effort target Aurora DSQL metadata for the overview diagram.
 
 The DSQL cluster *endpoint* carries the cluster **id** (e.g. ``mycluster`` in

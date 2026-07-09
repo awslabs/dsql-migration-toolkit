@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the CDC screen's connector handling read-models.
 
 These cover the NiceGUI-agnostic helpers that surface the CDC connector

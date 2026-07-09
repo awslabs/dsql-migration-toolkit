@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for connector-subnet auto-selection (read-only EC2, fake client).
 
 Drives ``select_connector_subnets`` with a fake EC2 client returning scripted

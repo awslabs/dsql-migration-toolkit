@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Read-only source introspection for MySQL (RDS/Aurora).
 
 The :class:`SourceIntrospector` connects to a source MySQL database using

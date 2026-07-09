@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Full Load backend run engine for the Data Migration screen (NiceGUI-free).
 
 The run inputs, the :class:`DataMigrator` seam, the run orchestration

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Prerequisite checks gating Full Load / CDC (read-only).
 
 Before a Full Load or CDC run, the Data Migration sub-flow always runs a

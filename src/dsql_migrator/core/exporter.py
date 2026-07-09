@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Export source table rows to files via read-only PK keyset streaming.
 
 This module implements the export half of the data migrator (design.md section

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the in-VPC offset-seeder Lambda (deploy/cdc-stack/lambda/seeder.py).
 
 The Lambda seeds the Debezium source connect-offsets record for a gapless Full

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the read-only PK keyset table exporter.
 
 Covers (Requirement 5.1 / Property 1):

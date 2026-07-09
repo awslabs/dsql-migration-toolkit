@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the Connect screen (BYO source/target) and session state.
 
 These tests cover the NiceGUI-agnostic core of the Connect screen:

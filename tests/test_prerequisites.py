@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the prerequisite gate (Task 20).
 
 Covers (Property 14 / Property 1 / Property 7 / Requirements 5.10, 5.11, 12.1):

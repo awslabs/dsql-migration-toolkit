@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Connected browser E2E — needs live source MySQL + target Aurora DSQL.
 
 Opt-in and reachability-gated (see conftest ``live_infra``): runs only when

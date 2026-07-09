@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Post-migration statistics review (Req 13.3).
 
 After a load completes, the user reviews per-table and per-object migration

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared data models for the migration engine.
 
 These Pydantic v2 models are the common vocabulary used across the engine

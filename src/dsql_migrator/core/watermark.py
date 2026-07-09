@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Capture a consistency point (watermark) at the start of a data export.
 
 Before any rows are exported, the :class:`WatermarkCapturer` records the exact

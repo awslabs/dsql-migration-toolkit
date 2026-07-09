@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Structured, file-based activity log for the migration tool.
 
 The migration is a multi-step, high-stakes operation, so an operator needs an

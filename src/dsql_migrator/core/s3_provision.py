@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Provision the S3 bucket + connector plugin artifacts for a CDC deploy.
 
 The cdc-stack's two MSK Connect plugins (the Debezium MySQL source zip and our

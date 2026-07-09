@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Zero-data-loss reconciliation between source MySQL and target Aurora DSQL.
 
 Stronger than a row COUNT(*): for every table it loads the FULL single-column

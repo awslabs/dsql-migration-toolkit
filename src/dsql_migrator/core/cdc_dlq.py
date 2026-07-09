@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Parse MSK Connect sink dead-letter (DLQ) log lines into error records.
 
 The custom DSQL sink (``connectors/dsql-sink``) logs each permanently-rejected

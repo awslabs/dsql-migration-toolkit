@@ -1,3 +1,6 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package dev.dsqlmigrator.connect;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;

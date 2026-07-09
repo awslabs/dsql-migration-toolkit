@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Step 2 (Schema Conversion) screen of the four-step migration workflow.
 
 This is the AWS Schema Conversion Tool-like (SCT-like) experience the design

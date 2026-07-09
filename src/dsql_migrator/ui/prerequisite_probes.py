@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Read-only prerequisite probes wired to a session's live connections.
 
 The pure prerequisite check functions live in

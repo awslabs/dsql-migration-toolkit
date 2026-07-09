@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """AI-assisted CDC: control-plane readiness assessment + DLQ triage (Req 12.13-12.15).
 
 Bedrock augments CDC only on the **control plane** (assessment/diagnosis) and is

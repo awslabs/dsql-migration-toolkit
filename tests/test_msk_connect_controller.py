@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for MskConnectController (CDC connector control + monitoring).
 
 Read-only status (list/describe), CloudWatch lag, and the single guarded

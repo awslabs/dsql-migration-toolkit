@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the shared AI chat drawer's pure helpers.
 
 The drawer itself is NiceGUI-heavy, but its markdown segmentation (used to render

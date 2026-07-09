@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """End-to-end integration tests wiring the migration engine together (Task 14).
 
 This module exercises the full pipeline -- introspection -> compatibility

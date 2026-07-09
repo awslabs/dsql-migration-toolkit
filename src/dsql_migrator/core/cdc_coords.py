@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Pure validators/parsers for user-entered CDC start coordinates.
 
 When the operator seeds a CDC run manually (no Full Load watermark in the

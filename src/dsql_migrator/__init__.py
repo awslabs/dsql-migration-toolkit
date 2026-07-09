@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """dsql_migrator: RDS/Aurora MySQL to Amazon Aurora DSQL migration toolkit.
 
 The package is organized into three clearly separated layers so the core

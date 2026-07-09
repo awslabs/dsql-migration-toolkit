@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Measure migration PERFORMANCE on real infrastructure (throughput + CDC lag + OCC).
 
 The functional harnesses answer "is it correct?"; this one answers "how fast, and

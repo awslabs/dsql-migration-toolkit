@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Step 3 (Data Migration) screen of the four-step migration workflow.
 
 The Data Migration screen drives the export -> import pipeline the design maps to

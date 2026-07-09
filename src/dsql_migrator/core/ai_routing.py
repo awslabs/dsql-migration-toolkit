@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """AI conversion routing: augment the deterministic path for flagged items.
 
 Task 16.4 scope. This is the thin orchestration seam that connects the

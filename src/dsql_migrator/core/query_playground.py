@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Non-destructive "does it run on DSQL?" probe for the Query Playground.
 
 The Query Playground lets a user paste a MySQL statement, see how it converts to

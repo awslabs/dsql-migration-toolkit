@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Fallback import path: built-in batched ``INSERT ... ON CONFLICT`` loader.
 
 This module is the **in-process** import path of the data migrator (design.md

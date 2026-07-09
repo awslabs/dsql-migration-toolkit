@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """CDC status / controller / deploy-formatting logic (NiceGUI-free).
 
 Extracted from the Data Migration screen package ``__init__`` so the heavy

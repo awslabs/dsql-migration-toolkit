@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Step 4 (Validation) screen of the four-step migration workflow.
 
 The Validation screen drives the consistency check the design maps to this step

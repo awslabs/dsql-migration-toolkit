@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Snapshot and invariant tests for execution-unit output (subtask 5.3).
 
 Schema conversion must emit DDL as ordered execution units that respect the

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the Query Playground engine + screen logic (no DB, no NiceGUI).
 
 Covers the non-destructive target probe (SELECT -> EXPLAIN read-only, DDL ->

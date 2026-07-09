@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Pytest fixtures for the browser E2E suite (Playwright + a real app server).
 
 These are true end-to-end tests: they launch the actual NiceGUI app as a

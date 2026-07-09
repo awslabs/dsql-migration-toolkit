@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """CloudFormation custom-resource Lambda: seed the Debezium connect-offsets topic.
 
 Runs IN-VPC during cdc-stack deployment to give the Full Load -> CDC handoff a

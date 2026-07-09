@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Schema (DDL) converter: MySQL -> Aurora DSQL (PostgreSQL 16) type mapping.
 
 This module implements the foundation of the :class:`SchemaConverter` component

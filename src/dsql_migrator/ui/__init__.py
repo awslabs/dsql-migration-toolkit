@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Web UI layer.
 
 The NiceGUI web application is the primary interface for the tool. It presents

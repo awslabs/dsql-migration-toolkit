@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Durable per-session workbench state for reconnect/resume (Property 4).
 
 The web UI keeps each session's progress in process memory (the workflow step

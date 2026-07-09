@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Query (DML) converter: MySQL -> Aurora DSQL (PostgreSQL 16) + lock checks.
 
 This module implements the :class:`QueryConverter` component (design.md section

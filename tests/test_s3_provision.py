@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for S3 plugin-bucket provisioning + upload (fake clients, no AWS)."""
 
 from __future__ import annotations

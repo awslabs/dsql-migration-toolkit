@@ -1,4 +1,4 @@
-# Custom DSQL Sink Connector (Task 23.2)
+# Custom DSQL Sink Connector
 
 > **STATUS: implemented + offline unit-tested + plugin jar builds.**
 > The connector logic is complete and verified at the unit/build level

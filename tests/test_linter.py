@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the application anti-pattern linter.
 
 Covers per-pattern detection (pessimistic locks, foreign-key dependency,

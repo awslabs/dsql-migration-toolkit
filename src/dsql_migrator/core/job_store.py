@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Durable persistence for migration job state (resumability, Property 4).
 
 The :class:`~dsql_migrator.core.job_manager.JobManager` keeps live job state in

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for resolving a source credential from AWS Secrets Manager.
 
 These tests exercise :func:`resolve_source_secret` with an injected fake session

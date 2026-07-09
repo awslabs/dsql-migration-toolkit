@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Auto-select MSK Connect subnets for a VPC (read-only EC2 discovery).
 
 The CDC connectors run as MSK Connect tasks on ENIs that have NO public IP, so

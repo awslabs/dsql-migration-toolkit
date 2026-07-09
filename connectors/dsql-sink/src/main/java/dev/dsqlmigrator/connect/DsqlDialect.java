@@ -1,3 +1,6 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * Custom Aurora DSQL Kafka Connect sink connector.
  * Pure SQL builders for the DSQL dialect (PostgreSQL wire protocol).

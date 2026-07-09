@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Regression (snapshot-style) tests over a representative MySQL corpus.
 
 These tests pin the *deterministic* conversion output of the engine so that any

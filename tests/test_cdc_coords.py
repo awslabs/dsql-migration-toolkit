@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for CDC start-coordinate validators/parsers (pure functions).
 
 These guard the manual start-position input: GTID and binlog file:position

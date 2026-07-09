@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit and property tests for the AI conversion routing/augmentation layer.
 
 Covers Task 16.4 (Schema/Query Converter routing + read-only guarantee):

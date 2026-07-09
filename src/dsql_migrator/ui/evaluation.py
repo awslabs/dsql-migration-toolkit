@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Step 1 (Evaluation) screen of the four-step migration workflow.
 
 The Evaluation screen produces an AWS SCT-style assessment report by analyzing

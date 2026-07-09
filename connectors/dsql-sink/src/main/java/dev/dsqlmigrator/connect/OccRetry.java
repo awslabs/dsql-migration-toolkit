@@ -1,3 +1,6 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * Custom Aurora DSQL Kafka Connect sink connector.
  * Implemented and offline unit-tested. Validate live throughput under contention

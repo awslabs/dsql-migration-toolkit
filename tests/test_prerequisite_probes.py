@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the session-wired prerequisite probes (UI adapter layer).
 
 Focus on :class:`SessionMskProbe`: it must report MSK / MSK Connect availability

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared helpers for the command-line scripts (``.env`` parsing + logging).
 
 These are the small, byte-identical utilities that ``run_full_load.py`` and

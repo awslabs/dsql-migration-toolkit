@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the Step 2 (Schema Conversion) screen's NiceGUI-agnostic logic.
 
 These cover the parts of the Schema Conversion screen that do not touch NiceGUI:

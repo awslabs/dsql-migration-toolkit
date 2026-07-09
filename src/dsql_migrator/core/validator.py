@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Consistency validation of migrated data (design.md "6. Validator").
 
 The :class:`Validator` compares a migrated DSQL target against its MySQL source

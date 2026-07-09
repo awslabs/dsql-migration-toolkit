@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Browser E2E for the Query Playground (Query validation) — no live infra.
 
 Uses the dev-unlocked app server so the optional Query validation tool opens

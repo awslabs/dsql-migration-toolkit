@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the AI-led assessment strategist.
 
 These tests use a fake Bedrock client (no AWS) and cover:

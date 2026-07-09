@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """AI-led migration assessment that augments the deterministic assessment.
 
 The :class:`AssessmentStrategist` uses Amazon Bedrock to act as a "senior

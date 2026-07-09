@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for AI-assist data models, config loading, and the Bedrock seam.
 
 Covers Task 16.1:

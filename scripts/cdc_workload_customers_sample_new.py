@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Random CDC workload generator for the ``customers_sample_new`` schema.
 
 Standalone operational utility (NOT part of the shipped tool) for validating a

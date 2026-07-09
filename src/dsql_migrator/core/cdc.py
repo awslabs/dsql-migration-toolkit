@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Optional CDC catch-up mode: interface/stub (Requirement 5.5, optional goal).
 
 This module defines the *interface* for an opt-in, binlog-based Change Data

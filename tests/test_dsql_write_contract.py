@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """DSQL write-contract parity tests — the Python (bulk-loader) half.
 
 Both write paths to Aurora DSQL must encode each MySQL source type identically:

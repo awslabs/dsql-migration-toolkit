@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the Step 4 (Validation) screen's NiceGUI-agnostic logic.
 
 These cover the parts of the Validation screen that do not touch NiceGUI:

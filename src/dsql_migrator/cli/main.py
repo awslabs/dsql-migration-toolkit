@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Command-line entrypoint for the DSQL migration tool.
 
 Provides a minimal, extensible CLI. At this scaffolding stage it supports

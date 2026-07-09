@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Build the Kafka Connect ``connect-offsets`` record that seeds a Debezium
 MySQL source connector to resume streaming from a Full Load watermark.
 

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Control + read-only monitoring of already-deployed MSK Connect connectors.
 
 The tool's UI does NOT deploy the cdc-stack (decision-change 8) -- the CDC data

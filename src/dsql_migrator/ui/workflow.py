@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Four-step migration workflow shell (stepper) and its pure logic.
 
 The migration is organized into four top-level steps shown to the user as a

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Browser E2E smoke tests — no live infrastructure required.
 
 These drive a real Chromium against the real app and assert the UI actually

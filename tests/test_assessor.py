@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the compatibility assessment rule engine.
 
 Covers each rule (FK_UNSUPPORTED, TRIGGER_UNSUPPORTED, PROC_PLPGSQL,
