@@ -509,6 +509,23 @@ Conditions:
       - Fn::Not:
           - Fn::Equals: [Ref: WatermarkBinlogFile, ""]
 
+  # The offset-seeder Lambda (+ its role) is deployed whenever its code + a
+  # watermark exist, INDEPENDENT of MskBootstrapServers -- so it PERSISTS across a
+  # Stop (which only blanks MskBootstrapServers). This keeps the VPC-attached
+  # Lambda's slow ENI reclamation OUT of the Stop path: a Stop then only removes the
+  # connectors + the OffsetSeedResource invoker (all fast), so the stack settles
+  # well inside the control plane's Stop timeout instead of hanging ~20-40 min on
+  # the Lambda's ENI cleanup. The seeder is torn down only on a full stack delete
+  # (whose timeout already accommodates that). SeedOffset (still the gate on the
+  # OffsetSeedResource that actually invokes the seed) implies this condition, so
+  # OffsetSeedResource's ServiceToken -> OffsetSeederFunction reference stays valid.
+  DeploySeederFunction:
+    Fn::And:
+      - Fn::Not:
+          - Fn::Equals: [Ref: LambdaSeederS3Key, ""]
+      - Fn::Not:
+          - Fn::Equals: [Ref: WatermarkBinlogFile, ""]
+
   # When no ConnectorSubnetIds are supplied, the stack creates its OWN private
   # subnets + NAT gateway + route table inside the VPC (the customer's existing
   # route tables are untouched). When subnets are supplied, the stack uses them
@@ -1044,11 +1061,13 @@ Resources:
   # connector is created, (1) creates the fixed compacted offsets topic the source
   # worker config points at and (2) seeds the Debezium connect-offsets record from
   # the Full Load watermark so the connector resumes streaming with no gap
-  # (Property 11). All three resources are conditional on SeedOffset; when absent
-  # the source connector simply starts from the current binlog (legacy behavior).
+  # (Property 11). The Role + Function persist across a Stop (DeploySeederFunction,
+  # independent of MskBootstrapServers) so the VPC-Lambda ENI teardown is kept OFF
+  # the Stop path; only the OffsetSeedResource invoker below is gated on SeedOffset.
+  # When neither applies the source connector simply starts from the current binlog.
   OffsetSeederRole:
     Type: AWS::IAM::Role
-    Condition: SeedOffset
+    Condition: DeploySeederFunction
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -1098,7 +1117,7 @@ Resources:
 
   OffsetSeederFunction:
     Type: AWS::Lambda::Function
-    Condition: SeedOffset
+    Condition: DeploySeederFunction
     Properties:
       FunctionName:
         Fn::Sub: ${AWS::StackName}-offset-seeder

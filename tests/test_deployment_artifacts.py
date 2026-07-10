@@ -1241,22 +1241,34 @@ def test_cdc_stack_source_worker_pins_fixed_offset_topic_not_sink(
     assert "offset.storage.topic=" not in sink
 
 
-def test_cdc_stack_seeder_resources_are_conditional_on_seed_offset(
+def test_cdc_stack_seeder_function_persists_across_stop(
     cdc_template: dict,
 ) -> None:
-    # The seeder role/function/custom-resource exist only when SeedOffset is true
-    # (bootstrap known AND seeder key supplied AND a watermark present), so a deploy
-    # without a Full Load watermark simply omits them (no seeder).
+    # The seeder Role + Function are gated on DeploySeederFunction (seeder key AND a
+    # watermark -- NOT MskBootstrapServers), so they PERSIST across a Stop (which
+    # only blanks MskBootstrapServers). That keeps the slow VPC-Lambda ENI teardown
+    # OFF the Stop path (Stop then removes only the connectors + the fast
+    # OffsetSeedResource invoker), so a Stop no longer exceeds the settle timeout.
     resources = cdc_template["Resources"]
-    for name in ("OffsetSeederRole", "OffsetSeederFunction", "OffsetSeedResource"):
+    for name in ("OffsetSeederRole", "OffsetSeederFunction"):
         assert name in resources, name
-        assert resources[name].get("Condition") == "SeedOffset", name
-    cond = cdc_template["Conditions"]["SeedOffset"]
-    text = json.dumps(cond)
-    # All three preconditions are referenced in the condition.
-    assert "MskBootstrapServers" in text
-    assert "LambdaSeederS3Key" in text
-    assert "WatermarkBinlogFile" in text
+        assert resources[name].get("Condition") == "DeploySeederFunction", name
+    # The invoker (which actually seeds the offset) is still gated on SeedOffset, so
+    # a Stop removes it (fast) and a Start re-creates + re-runs it.
+    assert resources["OffsetSeedResource"].get("Condition") == "SeedOffset"
+
+    conds = cdc_template["Conditions"]
+    deploy_text = json.dumps(conds["DeploySeederFunction"])
+    assert "LambdaSeederS3Key" in deploy_text
+    assert "WatermarkBinlogFile" in deploy_text
+    # The whole point of the split: the FUNCTION condition must NOT depend on
+    # MskBootstrapServers (else a Stop would tear it down and re-introduce the tail).
+    assert "MskBootstrapServers" not in deploy_text
+    # SeedOffset (the invoker's gate) still requires all three preconditions.
+    seed_text = json.dumps(conds["SeedOffset"])
+    assert "MskBootstrapServers" in seed_text
+    assert "LambdaSeederS3Key" in seed_text
+    assert "WatermarkBinlogFile" in seed_text
 
 
 def test_cdc_stack_seeder_is_in_vpc_python_lambda_from_plugin_bucket(

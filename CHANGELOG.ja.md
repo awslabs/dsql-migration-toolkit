@@ -5,6 +5,22 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.94
+
+### Fixed
+
+- **CDC 停止がもう誤った「Stack operation timed out」を報告しません。** Stop CDC は
+  `MskBootstrapServers` を空にしてコネクタを削除しますが、以前は in-VPC のオフセット seeder
+  Lambda まで削除しており、その Lambda の Hyperplane ENI 回収に約 20〜40 分かかって、コントロール
+  プレーンの 10 分の停止待ちを大きく超えていました。その結果、コネクタはすでに削除済み(= CDC は
+  実際に停止)なのに停止が失敗と報告され、スタックは数分後に自力で `UPDATE_COMPLETE` に到達して
+  いました。cdc-stack テンプレートは新しい `DeploySeederFunction` 条件(seeder キー + ウォーター
+  マークのみに依存し、`MskBootstrapServers` とは無関係)により**停止中も seeder Lambda(+ ロール)を
+  維持**し、停止時には高速な `OffsetSeedResource` invoker のみを削除します。これにより停止時の
+  クリーンアップはコネクタ 2 個 + invoker(いずれも高速)だけになり、タイムアウト内で収束します。
+  VPC-Lambda の ENI 撤去はスタック全体の削除時(そちらのタイムアウトは既に許容)にのみ発生します。
+  更新後のテンプレートがデプロイされてから — つまり次回の Start CDC から — 有効になります。
+
 ## v0.1.93
 
 ### Added

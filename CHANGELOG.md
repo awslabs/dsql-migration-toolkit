@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.94
+
+### Fixed
+
+- **Stopping CDC no longer reports a false "Stack operation timed out".** Stop CDC
+  blanks `MskBootstrapServers`, which removes the connectors — but it also used to
+  tear down the in-VPC offset-seeder Lambda, and reclaiming that Lambda's Hyperplane
+  ENIs takes ~20–40 min, well past the control plane's 10-minute stop wait. So the
+  stop reported a failure even though the connectors were already removed (CDC was
+  actually stopped) and the stack reached `UPDATE_COMPLETE` on its own minutes
+  later. The cdc-stack template now keeps the seeder Lambda (+ its role) deployed
+  across a stop via a new `DeploySeederFunction` condition (gated on the seeder key
+  + watermark, independent of `MskBootstrapServers`); only the fast
+  `OffsetSeedResource` invoker is removed on stop. Stop cleanup is then just the two
+  connectors + the invoker (all quick), so the stack settles well inside the
+  timeout; the VPC-Lambda ENI teardown now happens only on a full stack delete
+  (whose timeout already accommodates it). Takes effect once the updated template is
+  deployed — i.e. from the next Start CDC.
+
 ## v0.1.93
 
 ### Added
