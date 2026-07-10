@@ -694,8 +694,11 @@ class CdcPipelineOrchestrator:
 
         - **Gapless (watermark) path:** ``recovery`` — Debezium rebuilds its
           schema-history from the live DB (without re-reading rows) and resumes
-          from the seeded offset. Requires the offset-seeder to have populated
-          both the connect-offsets and schema-history topics.
+          from the seeded offset. Requires only that the offset-seeder seeded the
+          ``connect-offsets`` entry (the resume position); the schema-history
+          topic need NOT pre-exist — ``recovery`` rebuilds it from the live source
+          (verified in the Seoul E2E: "Snapshot step 6 - Persisting schema
+          history" then "Snapshot step 7 - Skipping snapshotting of data").
         - **Manual override path (CDC-only, no Full Load):** ``schema_only`` —
           Debezium reads the current source schema from scratch and begins
           streaming from the user-supplied binlog position. Safe for a brand-new
@@ -723,9 +726,11 @@ class CdcPipelineOrchestrator:
             else CdcResumePoint.from_watermark(watermark)
         )
         # recovery: rebuilds schema-history from the live DB and resumes from a
-        # seeded offset. Requires a connect-offsets entry AND a populated
-        # schema-history topic (the offset-seeder Lambda creates both during the
-        # gapless Full-Load path).
+        # seeded offset. Requires only a seeded connect-offsets entry (the resume
+        # position the offset-seeder Lambda writes during the gapless Full-Load
+        # path); it REBUILDS the schema-history topic from the live source, so
+        # that topic need not pre-exist. (schema_only with a seeded offset but no
+        # schema-history dies at task start: "The db history topic is missing".)
         # schema_only: reads the current source schema from scratch and starts
         # streaming from the given binlog position. Safe for a brand-new connector
         # with no pre-existing schema-history topic (the Manual/CDC-only path).
@@ -1059,8 +1064,9 @@ def build_cdc_stack_params(
         ("DsqlClusterEndpoint", target_endpoint),
         ("DsqlDatabaseName", target_database),
         ("DsqlConnectUser", target_username),
-        # Snapshot mode: schema_only for new connectors / CDC-only; recovery only
-        # when the offset seeder has pre-populated schema-history (gapless path).
+        # Snapshot mode: schema_only for new connectors / CDC-only; recovery on
+        # the gapless path (offset seeded; recovery rebuilds schema-history from
+        # the live source — it does not need the topic pre-populated).
         ("SnapshotMode", source_config.snapshot_mode),
         # Whether to create the sink connector. The cdc-stack deploys the source
         # first (DeploySink=false) on a fresh stack so the data topic exists before
@@ -1194,8 +1200,9 @@ def build_cdc_infra_params(
         # Start CDC supplies the real value via build_cdc_stack_params).
         ("MessageKeyColumns",
          format_message_key_columns(source_config.message_key_columns)),
-        # Snapshot mode: schema_only for new connectors / CDC-only; recovery only
-        # when the offset seeder has pre-populated schema-history (gapless path).
+        # Snapshot mode: schema_only for new connectors / CDC-only; recovery on
+        # the gapless path (offset seeded; recovery rebuilds schema-history from
+        # the live source — it does not need the topic pre-populated).
         ("SnapshotMode", source_config.snapshot_mode),
         # Plugin resource-name version suffix (gotcha #5: lets a new artifact get a
         # uniquely-named CustomPlugin instead of colliding on a fixed name).
