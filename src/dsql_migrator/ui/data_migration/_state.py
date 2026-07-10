@@ -143,6 +143,15 @@ class DataMigrationState:
         # and streaming" from "still provisioning" so a CREATING sink is not
         # mislabeled "Streaming". Transient/session-only (re-derived on discovery).
         self.cdc_connector_running_names: list[str] = []
+        # Table set reconciled from the live cdc-stack's ``TableIncludeList`` param
+        # (the source connector's table.include.list = each table's ``.name``). This
+        # lets an ADOPTED / out-of-band pipeline -- one this session did not itself
+        # Full-Load + Start (e.g. after a session reset + "Attach to <stack>") --
+        # still resolve WHICH tables are being replicated, so the CDC config preview,
+        # the "select a table" guard, and the per-table status reflect the running
+        # pipeline instead of showing "no tables selected". Populated by the phase
+        # probe; empty when no stack / no params. Transient/session-only.
+        self.cdc_reconciled_table_names: list[str] = []
         self.cdc_activity: Optional["CdcActivitySummary"] = None
         # Per-table source/target row counts for the migration-status view, fetched
         # on demand (a direct COUNT(*) on each side -- read-only but adds source
@@ -393,6 +402,8 @@ class DataMigrationState:
             self.cdc_stack_phase_status = None
             self.cdc_stack_phase_checked = False
             self.cdc_other_stacks = []
+            # Belongs to the previously-targeted stack; the fresh probe repopulates.
+            self.cdc_reconciled_table_names = []
         return True
 
     def append_cdc_deploy_log(self, when: datetime, message: str) -> None:
@@ -419,6 +430,16 @@ class DataMigrationState:
         """Record the connector names the CDC poller should track (read-only)."""
         with self._lock:
             self.cdc_connector_names = [n for n in names if n]
+
+    def set_cdc_reconciled_table_names(self, names: Sequence[str]) -> None:
+        """Record the table set reconciled from the live stack's TableIncludeList.
+
+        Read-only reflection of the running pipeline's tables (each entry is a
+        table's ``.name``), so an adopted / out-of-band pipeline resolves its
+        replicated tables even when this session holds no watermark or selection.
+        """
+        with self._lock:
+            self.cdc_reconciled_table_names = [n.strip() for n in names if n and n.strip()]
 
     def set_cdc_connector_running_names(self, names: Sequence[str]) -> None:
         """Record which of my connectors are RUNNING (vs still provisioning)."""

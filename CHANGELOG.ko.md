@@ -5,6 +5,23 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.92
+
+### 수정 (Fixed)
+
+- **기존 CDC 파이프라인을 attach하면 이제 테이블 집합까지 reconcile되어, CDC 단계가 "테이블
+  미선택"이 아니라 실제 실행 중인 파이프라인을 반영합니다.** 세션이 기존 cdc-stack에 연결
+  ("Attach to &lt;stack&gt;", 예: 세션 리셋 후)하거나 파이프라인이 세션 밖에서 시작된 경우,
+  세션엔 Full Load 워터마크도 세션 내 테이블 선택도 없어서 — 파이프라인이 실제로 복제 중인데도 —
+  CDC 단계가 "Select at least one table before starting CDC"를 띄우고, 빈 집합으로 config
+  미리보기를 만들며, 테이블별 상태를 채우지 못했습니다. 이제 렌더 시점 스택 프로브가 라이브 스택의
+  `TableIncludeList`(소스 커넥터의 `table.include.list` = 각 테이블 이름)를 읽어 세션에
+  reconcile하고, `_cdc_tables_for_config`가 이를 (세션 내 워터마크/선택 다음의) 최종 폴백으로
+  사용합니다. 그래서 adopt/out-of-band 파이프라인도 어떤 테이블을 복제 중인지 정확히 해석해 —
+  "테이블 선택" 경고가 사라지고, config 미리보기·테이블별 상태가 실제와 일치합니다 — 반면 일반적인
+  세션 내 Full Load → Start CDC 흐름은 그대로입니다. 다른 스택을 재adopt하면 이전 reconcile 집합은
+  비워지고 새 프로브가 다시 채웁니다.
+
 ## v0.1.91
 
 ### 수정 (Fixed)

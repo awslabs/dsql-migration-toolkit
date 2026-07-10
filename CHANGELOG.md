@@ -5,6 +5,27 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.92
+
+### Fixed
+
+- **Adopting an existing CDC pipeline now reconciles its table set, so the CDC
+  step reflects the running pipeline instead of "no tables selected".** When a
+  session attaches to a pre-existing cdc-stack ("Attach to &lt;stack&gt;", e.g.
+  after a session reset) — or the pipeline was otherwise started out of band —
+  the session held no Full Load watermark and no in-session table selection, so
+  the CDC step showed "Select at least one table before starting CDC", built its
+  config preview from an empty set, and could not populate the per-table status,
+  even though the pipeline was actively replicating. The render-time stack probe
+  now reads the live stack's `TableIncludeList` (the source connector's
+  `table.include.list`, i.e. each table's name) and reconciles it onto the
+  session; `_cdc_tables_for_config` uses it as a final fallback (after an
+  in-session watermark or selection). So an adopted/out-of-band pipeline resolves
+  exactly which tables it is replicating — the "select a table" warning clears,
+  the config preview and per-table status reflect reality — while a normal
+  in-session Full Load → Start CDC flow is unchanged. Re-adopting a different
+  stack clears the previous reconciled set (the fresh probe repopulates it).
+
 ## v0.1.91
 
 ### Fixed

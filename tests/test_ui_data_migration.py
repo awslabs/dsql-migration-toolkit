@@ -1444,6 +1444,73 @@ def test_probe_cdc_stack_phase_populates_other_stacks(monkeypatch) -> None:
     assert state.cdc_other_stacks == [("mysql-dsql-cdc-seoul-test", "UPDATE_COMPLETE")]
 
 
+def test_cdc_reconciled_table_names_setter_trims_and_adopt_clears() -> None:
+    # The reconciled set is trimmed / blank-dropped, and re-adopting a stack clears
+    # it (it belonged to the previously-targeted stack; the fresh probe repopulates).
+    state = DataMigrationState()
+    assert state.cdc_reconciled_table_names == []
+    state.set_cdc_reconciled_table_names(["a.x", " a.y ", "", "  "])
+    assert state.cdc_reconciled_table_names == ["a.x", "a.y"]
+    assert state.adopt_cdc_stack("mysql-dsql-cdc-seoul-test") is True
+    assert state.cdc_reconciled_table_names == []
+
+
+def test_cdc_tables_for_config_falls_back_to_reconciled_stack_tables() -> None:
+    # Adopted / out-of-band pipeline: no watermark, no in-session selection, but the
+    # live stack's TableIncludeList (reconciled onto the state) names the replicated
+    # tables -> resolve them from inventory by .name, so the CDC config/guard/per-table
+    # status reflect the running pipeline instead of showing "no tables selected".
+    from dsql_migrator.ui.data_migration._cdc_ui import _cdc_tables_for_config
+
+    inv = _inventory()  # tables: orders, customers
+    state = DataMigrationState()
+    # No watermark, no selection, no reconciled set -> the "select a table" state.
+    assert _cdc_tables_for_config(state, inv, None) == []
+    # Reconcile from the stack's TableIncludeList (entries are each table's .name).
+    state.set_cdc_reconciled_table_names(["orders"])
+    resolved = _cdc_tables_for_config(state, inv, None)
+    assert [t.name for t in resolved] == ["orders"]
+
+
+def test_probe_cdc_stack_phase_reconciles_table_include_list(monkeypatch) -> None:
+    # The render-time probe reflects the live stack's TableIncludeList onto the state
+    # so an adopted pipeline resolves its tables (each entry is a table's .name).
+    import dsql_migrator.core.cdc_deployer as deployer_mod
+    from dsql_migrator.ui.data_migration._status import _probe_cdc_stack_phase
+
+    state = DataMigrationState()
+
+    class _Disc:
+        stack_status = "UPDATE_COMPLETE"
+        is_stable = True
+        current_parameters = {
+            "TableIncludeList": "ecommerce_demo.orders,ecommerce_demo.customers",
+        }
+
+    class _FakeDeployer:
+        def describe_stack_or_none(self, name):
+            return _Disc()
+
+        def list_cdc_stacks(self):
+            return []
+
+    monkeypatch.setattr(
+        deployer_mod, "build_cdc_stack_deployer", lambda *a, **k: _FakeDeployer()
+    )
+
+    class _Sess:
+        class target_config:
+            region = "ap-northeast-2"
+
+        aws_profile = None
+
+    _probe_cdc_stack_phase(state, _Sess())
+    assert state.cdc_reconciled_table_names == [
+        "ecommerce_demo.orders",
+        "ecommerce_demo.customers",
+    ]
+
+
 def test_fetch_cdc_status_is_pure_read_then_apply_builds_view() -> None:
     # The live poller splits the blocking network read (_fetch_cdc_status, run on a
     # worker thread) from the in-memory view build (_apply_cdc_status, run on the

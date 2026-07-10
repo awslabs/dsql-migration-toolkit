@@ -529,8 +529,11 @@ def _cdc_tables_for_config(
 
     Prefers the watermark's covered tables (the snapshot's exact set) when both
     inventory and watermark are present; otherwise falls back to the user's
-    confirmed table selection (the manual-seed case where no Full Load ran).
-    Returns an empty list when neither is available (config shows "all selected").
+    confirmed table selection (the manual-seed case where no Full Load ran); and
+    finally, for an ADOPTED / out-of-band pipeline (this session ran neither Full
+    Load nor Start CDC -- e.g. after a reset + "Attach to <stack>"), to the table
+    set reconciled from the live stack's ``TableIncludeList``. Returns an empty
+    list only when none are available (config shows "all selected").
     """
     if inventory is None:
         return []
@@ -540,6 +543,14 @@ def _cdc_tables_for_config(
     selection = migration_state.selection
     if selection is not None and selection.selected_tables:
         return TableSelector().resolve(inventory, selection)
+    # Adopted / out-of-band pipeline: the session has no watermark or selection,
+    # but the live stack's TableIncludeList tells us which tables are replicating.
+    # Each include entry is a table's ``.name`` (build_source_config uses
+    # ``[table.name for table in tables]``), so match on ``.name`` -- identical to
+    # the watermark path above.
+    reconciled = set(getattr(migration_state, "cdc_reconciled_table_names", []) or [])
+    if reconciled:
+        return [t for t in inventory.tables if t.name in reconciled]
     return []
 
 def _render_cdc_start_point_card(

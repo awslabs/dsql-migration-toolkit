@@ -471,6 +471,19 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
     phase, status = _classify_cdc_stack_phase(discovery)
     migration_state.set_cdc_stack_phase(phase, status=status)
     migration_state.set_cdc_other_stacks(others)
+    # Reconcile the replicated table set from the live stack's TableIncludeList
+    # (source connector's table.include.list = each table's ``.name``), so an
+    # ADOPTED / out-of-band pipeline resolves its tables even when this session
+    # holds no watermark or in-session selection. Empty when the stack is absent
+    # or carries no such param (fresh infra) -- the normal config path then applies.
+    includes_raw = (
+        (getattr(discovery, "current_parameters", None) or {}).get("TableIncludeList", "")
+        if discovery is not None
+        else ""
+    )
+    migration_state.set_cdc_reconciled_table_names(
+        [n for n in includes_raw.split(",") if n.strip()]
+    )
 
 
 def _ensure_cdc_controller(migration_state, session) -> None:
