@@ -5,6 +5,20 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.89
+
+### Fixed
+
+- **「既存の CDC インフラにアタッチ」バナーが、実際に CDC を選ぶ Migration Plan ステップにも表示される
+  ようになった。** v0.1.88 でバナーを追加したが、**Data Migration ステップのマイグレーションタイプ
+  セレクタにのみ**あった。**Migration Plan** ステップは別画面(「CDC を含める? — はい、同期を保つ」を
+  答える)で、そこではバナーが出ず、keep-in-sync を選んでも既存パイプラインがあるのに依然として
+  「CDC インフラをデプロイ」フロー(および「already exists」エラー)に落ちていた。現在は Migration Plan
+  の CDC インフラセクションが、別のスタック名で既存の `mysql-dsql-cdc-*` パイプラインを検出すると
+  **「Attach to &lt;スタック&gt;」**バナーを表示する(そのステップで既に走る phase probe が検出結果も
+  埋める)。そこでアタッチするとセッションがそのスタックを対象にし、次の probe がデプロイ済みと認識して
+  「CDC infrastructure ready」を表示する。Data Migration 側の表示も維持される。
+
 ## v0.1.88
 
 ### Added

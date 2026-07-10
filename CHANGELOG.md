@@ -5,7 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
-## v0.1.88
+## v0.1.89
+
+### Fixed
+
+- **The "attach to existing CDC infrastructure" banner now appears on the Migration
+  Plan step, where CDC is actually chosen.** v0.1.88 added the banner but only on
+  the Data Migration step's migration-type selector; the **Migration Plan** step is
+  a separate screen (where you answer "Include CDC? — Yes, keep in sync"), and it
+  did not surface the banner — so selecting keep-in-sync there still dropped you
+  into the fresh "deploy CDC infrastructure" flow (and the "already exists" error)
+  for a pipeline that already exists. The Migration Plan's CDC-infrastructure
+  section now shows the **"Attach to &lt;stack&gt;"** banner when an existing
+  `mysql-dsql-cdc-*` pipeline is discovered under a different stack name (the phase
+  probe that already runs on that step also populates the discovery). Attaching
+  points the session at that stack; the next probe recognizes it as deployed and
+  shows "CDC infrastructure ready". The Data Migration surfacing is kept as well.
 
 ### Added
 

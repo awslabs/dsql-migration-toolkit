@@ -4292,6 +4292,59 @@ def test_cdc_existing_infra_banner_surfaces_adoptable_stacks() -> None:
     assert "mysql-dsql-cdc-seoul-test" in body
 
 
+def test_migration_plan_offers_attach_when_other_cdc_stacks_exist(monkeypatch) -> None:
+    # On the Migration Plan step (where CDC is chosen), when an existing CDC pipeline
+    # was discovered under a different name, the infra section must surface the ADOPT
+    # banner -- not the fresh "deploy CDC infrastructure" VPC form (which would risk a
+    # duplicate MSK).
+    import dsql_migrator.ui.migration_plan as mp
+    from dsql_migrator.ui.data_migration import MigrationType
+
+    class _El:
+        def classes(self, *_a, **_k):
+            return self
+
+        def props(self, *_a, **_k):
+            return self
+
+        def on(self, *_a, **_k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_e):
+            return False
+
+    class _Ui:
+        def __getattr__(self, _name):
+            return lambda *a, **k: _El()
+
+    state = DataMigrationState()
+    state.set_migration_type(MigrationType.FULL_LOAD_AND_CDC)
+    state.set_cdc_stack_phase("absent")     # default-named stack not deployed
+    state.cdc_stack_phase_checked = True    # skip the (blocking) re-probe timer
+    state.set_cdc_other_stacks([("mysql-dsql-cdc-seoul-test", "UPDATE_COMPLETE")])
+
+    calls = {"banner": 0, "form": 0}
+    monkeypatch.setattr(
+        mp, "_render_cdc_existing_infra_banner",
+        lambda *a, **k: calls.__setitem__("banner", calls["banner"] + 1),
+    )
+    monkeypatch.setattr(
+        mp, "_render_cdc_infra_form",
+        lambda *a, **k: calls.__setitem__("form", calls["form"] + 1),
+    )
+
+    class _JM:  # no deploy job in flight
+        def get_job(self, *_a, **_k):
+            return None
+
+    mp._render_infra_section(_Ui(), state, _JM(), lambda: None, session=object())
+    assert calls["banner"] == 1  # adopt banner surfaced
+    assert calls["form"] == 0     # fresh-deploy VPC form NOT shown
+
+
 def _completeness(
     *, total, settled, complete, failed, mismatched, unknown=0
 ):

@@ -40,6 +40,7 @@ from dsql_migrator.ui.data_migration import (
     _probe_cdc_stack_phase,
     _render_cdc_decision,
     _render_cdc_deploy_live,
+    _render_cdc_existing_infra_banner,
     _render_cdc_infra_form,
     _start_cdc_infra_deploy,
     migration_type_locked,
@@ -216,6 +217,18 @@ def _render_infra_section(
             render_notice(
                 ui, tone="success", header="CDC infrastructure ready", body=body
             )
+            return
+
+        # An existing CDC pipeline was found under a DIFFERENT stack name than this
+        # session targets (a reset single-task session forgets which stack it
+        # deployed). Offer to ATTACH to it here -- right where CDC is chosen -- so
+        # the user does not deploy a duplicate (a second, costly MSK cluster). This
+        # is a choice, not a block: deploying a deliberate second pipeline (a
+        # different stack-name suffix) remains available on the Data Migration → CDC
+        # step. (cdc_other_stacks is populated by the phase probe armed above.)
+        other_stacks = getattr(migration_state, "cdc_other_stacks", []) or []
+        if other_stacks:
+            _render_cdc_existing_infra_banner(ui, migration_state, refresh)
             return
 
         render_notice(

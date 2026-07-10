@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.89
+
+### 수정 (Fixed)
+
+- **"기존 CDC 인프라에 연결" 배너가 실제로 CDC를 선택하는 Migration Plan 단계에도 표시됩니다.**
+  v0.1.88이 배너를 추가했지만 **Data Migration 단계의 migration-type 선택기에만** 있었습니다.
+  **Migration Plan** 단계는 별도 화면("CDC 포함? — 예, keep in sync")인데 거기서 배너가 안 떠서,
+  거기서 keep-in-sync를 선택하면 이미 존재하는 파이프라인인데도 여전히 "CDC 인프라 배포" 플로우(그리고
+  "already exists" 에러)로 떨어졌습니다. 이제 Migration Plan의 CDC-인프라 섹션이, 다른 스택 이름으로
+  기존 `mysql-dsql-cdc-*` 파이프라인이 발견되면 **"Attach to &lt;스택&gt;"** 배너를 보여줍니다(그
+  단계에서 이미 도는 phase probe가 발견 결과도 채웁니다). 거기서 연결하면 세션이 그 스택을 대상으로
+  잡고, 다음 probe가 배포됨으로 인식해 "CDC infrastructure ready"를 표시합니다. Data Migration 쪽
+  노출도 유지됩니다.
+
 ## v0.1.88
 
 ### 추가 (Added)
