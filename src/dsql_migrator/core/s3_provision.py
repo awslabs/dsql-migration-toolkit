@@ -51,6 +51,18 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v17 makes the sink survive a transient DSQL connectivity blip instead of dying.
+#    On a transient failure (OCC budget exhausted, or a connection torn down by
+#    DSQL's 1h idle close / IAM-token expiry / MSK Connect worker recycle),
+#    isTransient() was correct but applyBatch/applyRecordByRecord re-raised a plain
+#    org.apache.kafka.connect.errors.ConnectException -- which WorkerSinkTask treats
+#    as FATAL (kills the task; offset never advances; CDC stalls until a manual
+#    restart). v17 throws RetriableException instead (via a new transientRetryException
+#    helper), which WorkerSinkTask catches and pauses+redelivers the same batch on the
+#    next poll, so the sink self-heals across a reconnect. Retried indefinitely until
+#    DSQL recovers (NOT bounded by errors.retry.timeout, which only wraps the
+#    conversion stage). isTransient()'s classification and the permanent/quarantine
+#    (DLQ) path are unchanged. Sink-jar change only.
 # v16 removes a hidden per-row round-trip in the sink: bind() called
 #    getParameterMetaData() for EVERY change event, and on pgjdbc that issues a
 #    server-side Parse/Describe (a read-only transaction) per row. DSQL's
@@ -146,7 +158,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v16"
+PLUGIN_VERSION = "v17"
 
 
 class S3ProvisionError(RuntimeError):

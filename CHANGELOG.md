@@ -5,6 +5,41 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.84
+
+### Fixed
+
+- **CDC sink survives a transient DSQL connectivity blip instead of dying
+  (connector rebuilt, `PLUGIN_VERSION` v17).** On a transient failure — OCC
+  retry budget exhausted, or a connection torn down by DSQL's 1-hour idle close,
+  IAM-token expiry, or an MSK Connect worker recycle — the sink re-raised a plain
+  `ConnectException`, which Kafka Connect's `WorkerSinkTask` treats as **fatal**:
+  it kills the task, the offset never advances, and CDC stalls until a human
+  restarts the connector. The sink now throws `RetriableException` for these
+  transient cases, which `WorkerSinkTask` catches and redelivers (pause + retry
+  the same batch) so the pipeline self-heals across a reconnect. Apply is
+  idempotent, so replaying the same offsets is safe. The transient-vs-permanent
+  classification is unchanged; a genuine poison row still goes to the DLQ.
+- **Gapless resumability on a low-traffic source: the Debezium source connector
+  now sets `heartbeat.interval.ms`.** Debezium only advances its committed binlog
+  offset when it emits a record. If the captured tables are idle while other
+  tables churn the binlog, the committed offset can fall behind the live binlog
+  head; if source binlog retention then purges past it, a restart cannot resume
+  (a gap → forced re-Full-Load). A periodic heartbeat keeps the offset advancing.
+  `heartbeat.action.query` is deliberately not set — it would write to the
+  read-only source; emitting the heartbeat record is enough for MySQL.
+
+### Added
+
+- **CloudWatch alarms surface a failed CDC connector automatically.** Each
+  connector (Debezium source, DSQL sink) now has an alarm on the
+  `AWS/KafkaConnect` `ErroredTaskCount` metric, so a task that errors out is
+  visible without a human watching the console — previously, recovery waited
+  entirely on someone noticing a FAILED connector, and a long gap could exceed
+  source binlog retention. The alarms are always created (visible in CloudWatch);
+  set the new optional `AlarmNotificationTopicArn` parameter to an SNS topic ARN
+  to also be notified. No SNS wiring is required to deploy (the default is empty).
+
 ## v0.1.83
 
 ### Fixed

@@ -5,6 +5,34 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.84
+
+### 수정 (Fixed)
+
+- **CDC 싱크가 일시적 DSQL 연결 오류에 죽지 않고 자가 복구 (커넥터 재빌드, `PLUGIN_VERSION` v17).**
+  일시적 실패(OCC 재시도 예산 소진, 또는 DSQL의 1시간 유휴 종료·IAM 토큰 만료·MSK Connect 워커
+  재활용으로 연결이 끊긴 경우) 시 싱크가 일반 `ConnectException`을 다시 던졌는데, Kafka Connect의
+  `WorkerSinkTask`는 이를 **치명적**으로 간주해 태스크를 죽이고 오프셋을 전진시키지 않아, 사람이
+  커넥터를 재시작할 때까지 CDC가 멈췄다. 이제 이런 일시적 경우에는 `RetriableException`을 던지며,
+  `WorkerSinkTask`가 이를 잡아 같은 배치를 재전송(일시정지 후 재시도)하므로 재연결을 거쳐 파이프라인이
+  스스로 복구된다. 적용은 멱등이라 같은 오프셋 재생은 안전하다. 일시/영구 분류는 그대로이며, 진짜
+  poison 행은 여전히 DLQ로 간다.
+- **저트래픽 소스에서의 gapless 재개: Debezium 소스 커넥터에 `heartbeat.interval.ms` 추가.**
+  Debezium은 레코드를 방출할 때만 커밋된 binlog 오프셋을 전진시킨다. 캡처 대상 테이블은 유휴인데 다른
+  테이블이 binlog를 갱신하면 커밋 오프셋이 live binlog head보다 뒤처질 수 있고, 이후 소스 binlog
+  리텐션이 그 지점을 지나 정리(purge)하면 재시작 시 재개가 불가능해진다(갭 → 강제 재-Full-Load).
+  주기적 heartbeat가 오프셋을 계속 전진시킨다. `heartbeat.action.query`는 의도적으로 설정하지 않는다
+  — 읽기 전용 소스에 쓰기를 하게 되며, MySQL은 heartbeat 레코드 방출만으로 충분하다.
+
+### 추가 (Added)
+
+- **CloudWatch 알람으로 실패한 CDC 커넥터를 자동 감지.** 각 커넥터(Debezium 소스, DSQL 싱크)에
+  `AWS/KafkaConnect`의 `ErroredTaskCount` 메트릭 알람을 추가해, 사람이 콘솔을 지켜보지 않아도 errored
+  태스크가 드러난다 — 기존에는 복구가 전적으로 누군가 FAILED 커넥터를 발견하는 데 의존했고, 그 공백이
+  소스 binlog 리텐션을 넘길 수 있었다. 알람은 항상 생성된다(CloudWatch에서 확인 가능). 새 선택 파라미터
+  `AlarmNotificationTopicArn`에 SNS 토픽 ARN을 지정하면 알림도 받는다. 배포에 SNS 연결은 필요 없다
+  (기본값은 빈 값).
+
 ## v0.1.83
 
 ### 수정 (Fixed)

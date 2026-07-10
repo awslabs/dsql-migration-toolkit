@@ -699,6 +699,62 @@ def test_cdc_stack_worker_config_names_carry_plugin_version(cdc_template: dict) 
         assert "${PluginVersion}" in json.dumps(name), cfg_name
 
 
+def test_cdc_source_connector_has_heartbeat_without_source_write(cdc_template: dict) -> None:
+    # H4: a heartbeat keeps Debezium's committed binlog offset advancing while the
+    # CAPTURED tables are idle (other tables churn the binlog), so source binlog
+    # retention cannot purge past a stale offset and break gapless resume. It must
+    # NOT set heartbeat.action.query -- that would WRITE to the read-only source.
+    cfg = cdc_template["Resources"]["DebeziumSourceConnector"]["Properties"][
+        "ConnectorConfiguration"
+    ]
+    assert cfg.get("heartbeat.interval.ms"), "source connector must set a heartbeat interval (H4)"
+    assert int(cfg["heartbeat.interval.ms"]) > 0
+    assert "heartbeat.action.query" not in cfg, (
+        "heartbeat.action.query would write to the READ-ONLY source"
+    )
+
+
+def test_cdc_stack_alarms_on_connector_errored_tasks(cdc_template: dict) -> None:
+    # H5: each connector gets a CloudWatch alarm on AWS/KafkaConnect ErroredTaskCount
+    # (dimension ConnectorName) so a FAILED task is surfaced automatically. The alarm
+    # is gated to the SAME condition as the connector it watches, so a not-yet-created
+    # connector has no permanently-INSUFFICIENT_DATA alarm.
+    resources = cdc_template["Resources"]
+    expected = {
+        "DebeziumSourceErroredTaskAlarm": (
+            "HasBootstrapServers", "${AWS::StackName}-debezium-source"),
+        "DsqlSinkErroredTaskAlarm": (
+            "DeploySinkConnector", "${AWS::StackName}-dsql-sink"),
+    }
+    for name, (cond, connector_name) in expected.items():
+        alarm = resources[name]
+        assert alarm["Type"] == "AWS::CloudWatch::Alarm", name
+        assert alarm["Condition"] == cond, name
+        props = alarm["Properties"]
+        assert props["Namespace"] == "AWS/KafkaConnect", name
+        assert props["MetricName"] == "ErroredTaskCount", name
+        assert props["ComparisonOperator"] == "GreaterThanThreshold", name
+        assert int(props["Threshold"]) == 0, name
+        dim = props["Dimensions"][0]
+        # Exact dimension name per the MSK Connect monitoring docs -- a wrong name
+        # means the alarm silently never fires (stuck INSUFFICIENT_DATA).
+        assert dim["Name"] == "ConnectorName", name
+        assert dim["Value"]["Fn::Sub"] == connector_name, name
+
+
+def test_cdc_stack_alarm_notification_topic_is_optional(cdc_template: dict) -> None:
+    # H5: notifications are opt-in (deployment convenience -- no SNS wiring needed to
+    # deploy). The param defaults empty and the alarm actions are gated on HasAlarmTopic
+    # so an empty ARN yields NO action (AWS::NoValue) rather than an invalid action.
+    tpl = cdc_template
+    assert tpl["Parameters"]["AlarmNotificationTopicArn"]["Default"] == ""
+    assert "HasAlarmTopic" in tpl["Conditions"]
+    for name in ("DebeziumSourceErroredTaskAlarm", "DsqlSinkErroredTaskAlarm"):
+        actions = tpl["Resources"][name]["Properties"]["AlarmActions"]
+        assert actions["Fn::If"][0] == "HasAlarmTopic", name
+        assert actions["Fn::If"][2] == {"Ref": "AWS::NoValue"}, name
+
+
 # --- cdc-stack template: tool-owned NAT networking ---------------------------
 
 CDC_STACK_TEMPLATE = DEPLOY_DIR / "cdc-stack" / "cdc-stack.yaml"

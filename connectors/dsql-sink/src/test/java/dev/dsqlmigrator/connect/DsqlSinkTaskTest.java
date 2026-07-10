@@ -14,11 +14,14 @@
 package dev.dsqlmigrator.connect;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.sql.SQLException;
 import java.sql.SQLNonTransientConnectionException;
 import java.sql.SQLRecoverableException;
+import org.apache.kafka.connect.errors.RetriableException;
 import org.junit.jupiter.api.Test;
 
 class DsqlSinkTaskTest {
@@ -65,5 +68,24 @@ class DsqlSinkTaskTest {
     // DSQL per-value limit rejection is permanent (handled by the oversized guard
     // pre-write, but if it reaches here it must not loop).
     assertFalse(task.isTransient(new SQLException("datatype limit exceeded", "54000")));
+  }
+
+  @Test
+  void transientRetryExceptionIsRetriable() {
+    // A transient SQLException must surface as a Kafka Connect RetriableException so
+    // WorkerSinkTask redelivers the batch instead of killing the task. Assert on
+    // RetriableException specifically -- NOT ConnectException (its supertype), which
+    // would pass trivially and not guard against a revert to plain ConnectException
+    // (the fatal type that killed the task on transient connectivity blips).
+    SQLException closed = new SQLException("This connection has been closed.");
+    assertInstanceOf(RetriableException.class, DsqlSinkTask.transientRetryException(closed));
+  }
+
+  @Test
+  void transientRetryExceptionCarriesSqlStateAndCause() {
+    SQLException adminShutdown = new SQLException("admin shutdown", "57P01");
+    RetriableException wrapped = DsqlSinkTask.transientRetryException(adminShutdown);
+    assertTrue(wrapped.getMessage().contains("57P01"));
+    assertSame(adminShutdown, wrapped.getCause());
   }
 }

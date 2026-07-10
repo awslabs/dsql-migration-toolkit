@@ -225,6 +225,16 @@ Parameters:
       CloudFormation resource; it is auto-created by the sink connector at
       runtime (Req 12.4-12.6).
 
+  AlarmNotificationTopicArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional SNS topic ARN notified when a connector task errors out
+      (AWS/KafkaConnect ErroredTaskCount > 0). Leave empty (default): the alarms
+      are still created and visible in the CloudWatch console/API -- this only
+      adds a notification action, so NO manual notification wiring is needed to
+      deploy (deployment-convenience first). Supply a topic ARN to be paged.
+
   SinkBatchMaxRows:
     Type: Number
     Default: 3000
@@ -476,6 +486,12 @@ Conditions:
       - Fn::Not:
           - Fn::Equals: [Ref: MskBootstrapServers, ""]
       - Fn::Equals: [Ref: DeploySink, "true"]
+
+  # An SNS topic was supplied for connector-errored-task notifications. The alarms
+  # are created regardless (visible in CloudWatch); this only gates the notify action.
+  HasAlarmTopic:
+    Fn::Not:
+      - Fn::Equals: [Ref: AlarmNotificationTopicArn, ""]
 
   # Deploy the in-VPC offset seeder (compact topic + connect-offsets seed) only
   # when ALL of: the MSK bootstrap string is known (the Lambda must reach the
@@ -1370,6 +1386,21 @@ Resources:
         errors.retry.timeout: "600000"
         errors.retry.delay.max.ms: "60000"
         errors.log.enable: "true"
+        # Offset-staleness guard (gapless resumability). Debezium only advances its
+        # committed binlog offset when it emits a record; on a source where the
+        # CAPTURED tables are idle while OTHER tables churn the binlog, the committed
+        # offset falls behind the live binlog head. If source binlog retention then
+        # purges past that stale offset, a restart cannot resume -> gap (forced
+        # re-Full-Load). A heartbeat emits a periodic record carrying the current
+        # position to the heartbeat topic (__debezium-heartbeat.<topic.prefix>, auto-
+        # created + covered by the topic/${AWS::StackName}-msk/* IAM grant), so the
+        # offset keeps advancing during idle-captured windows. heartbeat.action.query
+        # is deliberately NOT set: that would execute a WRITE against the source, and
+        # the source is read-only (Property) -- unlike Postgres logical replication,
+        # MySQL's binlog position advances from any server activity, so emitting the
+        # heartbeat record is enough. The heartbeat topic is internal (never added to
+        # SinkTopics), so the sink never sees it.
+        heartbeat.interval.ms: "300000"
         # Throughput tuning (H: the source caps ~2,000 rec/s at ~12% CPU, i.e. it
         # is produce/queue-bound, not binlog-parse-bound). max.batch.size /
         # max.queue.size are Debezium connector properties (drain more events per
@@ -1531,6 +1562,89 @@ Resources:
         # ".override." keys are NOT available on MSK Connect (it excludes
         # connector.client.config.override.policy), so the worker config is the
         # only place these can be set.
+
+  # ------------------------------------------------------------------------- #
+  # Observability: alarm when a connector task errors out (H5). Without this,
+  # recovery waited entirely on a human noticing a FAILED connector in the
+  # console -- and if that gap exceeds source binlog retention the resume
+  # position is lost. Each alarm watches AWS/KafkaConnect ErroredTaskCount for
+  # its connector (dimension ConnectorName; namespace + dimension confirmed
+  # against the MSK Connect monitoring docs), so a stalled connector is surfaced
+  # automatically. They exist regardless of AlarmNotificationTopicArn (visible in
+  # CloudWatch) and notify that SNS topic when one is supplied.
+  #
+  # NOTE (post-H1 interaction): once the sink throws RetriableException on
+  # transient DSQL blips (PLUGIN_VERSION v17), a transient failure no longer
+  # errors the task -- it pauses+redelivers and stays RUNNING -- so ErroredTaskCount
+  # fires only for genuinely-fatal states (poison record + no DLQ, or a fatal
+  # source error). A sink that is retrying indefinitely (DSQL down for a long
+  # time) is NOT caught by ErroredTaskCount; that is a known limitation, not
+  # covered here to avoid false positives on legitimately-idle sources.
+  DebeziumSourceErroredTaskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasBootstrapServers
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-debezium-source-errored-task
+      AlarmDescription: >
+        Debezium MySQL source connector has one or more errored tasks (CDC
+        capture stalled). Investigate + restart the connector; a prolonged stall
+        past source binlog retention breaks gapless resume (forced re-Full-Load).
+      Namespace: AWS/KafkaConnect
+      MetricName: ErroredTaskCount
+      Dimensions:
+        - Name: ConnectorName
+          Value:
+            Fn::Sub: ${AWS::StackName}-debezium-source
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmTopic
+          - [Ref: AlarmNotificationTopicArn]
+          - Ref: AWS::NoValue
+      OKActions:
+        Fn::If:
+          - HasAlarmTopic
+          - [Ref: AlarmNotificationTopicArn]
+          - Ref: AWS::NoValue
+
+  DsqlSinkErroredTaskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeploySinkConnector
+    Properties:
+      AlarmName:
+        Fn::Sub: ${AWS::StackName}-dsql-sink-errored-task
+      AlarmDescription: >
+        Custom DSQL sink connector has one or more errored tasks (apply to DSQL
+        stalled). Investigate + restart; unapplied change events accumulate in
+        the data topic until the sink recovers.
+      Namespace: AWS/KafkaConnect
+      MetricName: ErroredTaskCount
+      Dimensions:
+        - Name: ConnectorName
+          Value:
+            Fn::Sub: ${AWS::StackName}-dsql-sink
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        Fn::If:
+          - HasAlarmTopic
+          - [Ref: AlarmNotificationTopicArn]
+          - Ref: AWS::NoValue
+      OKActions:
+        Fn::If:
+          - HasAlarmTopic
+          - [Ref: AlarmNotificationTopicArn]
+          - Ref: AWS::NoValue
 
 Outputs:
   MskClusterArn:

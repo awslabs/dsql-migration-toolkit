@@ -5,6 +5,35 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.84
+
+### Fixed
+
+- **CDC シンクが一時的な DSQL 接続エラーで停止せず自己回復(コネクタ再ビルド、`PLUGIN_VERSION` v17)。**
+  一時的な失敗(OCC 再試行予算の枯渇、または DSQL の1時間アイドルクローズ・IAM トークン失効・MSK
+  Connect ワーカー再生成による接続切断)の際、シンクは通常の `ConnectException` を再スローしていたが、
+  Kafka Connect の `WorkerSinkTask` はこれを**致命的**とみなしてタスクを停止し、オフセットは前進せず、
+  人手でコネクタを再起動するまで CDC が停止していた。これらの一時的ケースでは `RetriableException` を
+  スローするようになり、`WorkerSinkTask` がそれを捕捉して同じバッチを再配信(一時停止して再試行)する
+  ため、再接続を経てパイプラインが自己回復する。適用は冪等なので同じオフセットの再生は安全。一時/恒久の
+  分類は変更なく、本物の poison 行は引き続き DLQ に送られる。
+- **低トラフィックなソースでの gapless 再開: Debezium ソースコネクタに `heartbeat.interval.ms` を追加。**
+  Debezium はレコードを送出したときのみコミット済み binlog オフセットを前進させる。キャプチャ対象テーブルが
+  アイドルで他テーブルが binlog を更新している場合、コミット済みオフセットがライブ binlog ヘッドから遅れ、
+  その後ソース binlog 保持期間がその位置を越えて削除(purge)すると、再起動時に再開できなくなる(ギャップ
+  → 強制的な再 Full Load)。定期的なハートビートがオフセットを前進させ続ける。`heartbeat.action.query`
+  は意図的に設定しない — 読み取り専用ソースへの書き込みになるため。MySQL ではハートビートレコードの送出で
+  十分である。
+
+### Added
+
+- **CloudWatch アラームで失敗した CDC コネクタを自動検知。** 各コネクタ(Debezium ソース、DSQL シンク)に
+  `AWS/KafkaConnect` の `ErroredTaskCount` メトリクスに対するアラームを追加し、人がコンソールを見て
+  いなくても errored タスクが可視化される — 従来は復旧が完全に誰かが FAILED コネクタに気づくことに依存し、
+  その空白がソース binlog 保持期間を超える可能性があった。アラームは常に作成される(CloudWatch で確認可能)。
+  新しい任意パラメータ `AlarmNotificationTopicArn` に SNS トピック ARN を指定すると通知も受け取れる。デプロイに
+  SNS の配線は不要(デフォルトは空)。
+
 ## v0.1.83
 
 ### Fixed

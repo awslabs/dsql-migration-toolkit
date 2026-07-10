@@ -20,6 +20,7 @@ import java.util.Map;
 import java.util.Properties;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
+import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
@@ -208,11 +209,21 @@ public class DsqlSinkTask extends SinkTask {
       if (isTransient(e)) {
         // OCC budget exhausted or connectivity issue: discard the (possibly
         // half-open) connection so the next attempt truly reconnects -- isValid()
-        // can pass on a stale socket -- then re-raise so Connect retries/backs off
-        // the whole batch (not a poison row). Apply is idempotent, so a replay of
-        // the same offsets is safe.
+        // can pass on a stale socket -- then re-raise as a RetriableException so
+        // Connect redelivers the whole batch (not a poison row). Apply is
+        // idempotent, so a replay of the same offsets is safe.
+        //
+        // RetriableException (NOT ConnectException): WorkerSinkTask.deliverMessages()
+        // catches RetriableException and pauses+redelivers the SAME batch on the next
+        // poll; a plain ConnectException falls through to its fatal catch and KILLS
+        // the task (offset never advances, CDC stalled until a manual restart). This
+        // is retried INDEFINITELY until DSQL recovers -- it is NOT bounded by
+        // errors.retry.timeout (that only wraps the conversion stage, never put()).
+        // Do not "fix" this into a bounded/fail-fast retry: that would dead-letter
+        // healthy rows during a routine reconnect (idle close / token expiry / worker
+        // recycle) -- the exact data-loss mode this path exists to prevent.
         discardConnection();
-        throw new ConnectException("DSQL apply failed (transient sqlstate=" + e.getSQLState() + ")", e);
+        throw transientRetryException(e);
       }
       // Permanent failure somewhere in the batch — find and isolate the poison
       // row(s); apply the rest. Single-row chunk → that row is the poison.
@@ -245,9 +256,10 @@ public class DsqlSinkTask extends SinkTask {
       } catch (SQLException e) {
         rollbackQuietly();
         if (isTransient(e)) {
+          // Transient: reconnect + re-raise as RetriableException so Connect
+          // redelivers (see applyBatch for the full rationale). Not fatal.
           discardConnection();
-          throw new ConnectException(
-              "DSQL apply failed (transient sqlstate=" + e.getSQLState() + ")", e);
+          throw transientRetryException(e);
         }
         reportOrThrow(a.record(), a.event(), e);
       }
@@ -472,6 +484,19 @@ public class DsqlSinkTask extends SinkTask {
         // Never let the observation wiring itself break the apply path.
       }
     }
+  }
+
+  /**
+   * Wrap a transient {@link SQLException} as a Kafka Connect {@link RetriableException}
+   * so {@code WorkerSinkTask} redelivers the batch instead of killing the task. Call
+   * this ONLY when {@link #isTransient(SQLException)} is true -- it is not a
+   * general-purpose wrapper (wrapping a permanent error would make Connect retry a
+   * poison row forever). Pure + package-private so a unit test can assert the surfaced
+   * exception TYPE without a live JDBC connection.
+   */
+  static RetriableException transientRetryException(SQLException e) {
+    return new RetriableException(
+        "DSQL apply failed (transient sqlstate=" + e.getSQLState() + "); Connect will retry", e);
   }
 
   /**
