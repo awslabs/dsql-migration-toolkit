@@ -35,32 +35,56 @@ In a hurry? The happy path, in order — each step is detailed in the sections b
 
 ## Step 1 — Choose where to run
 
-- **Local** — `uv run mysql-dsql-migrator ui`. The UI runs on your own
-  machine (browser → `127.0.0.1:8080`), and **the migration itself runs there
-  too**: your workstation is the engine that reads the source and writes to DSQL,
-  so all data flows through your machine and its network. This means your
-  **desktop must be able to reach _both_** the source MySQL **and** the target
-  Aurora DSQL — a private source needs an SSM port-forward / VPN, and your machine
-  needs outbound HTTPS + AWS credentials to the DSQL region. Zero infra — best for
-  evaluation / smaller migrations / development. It is *not* the hosted
-  architecture; for a real migration use Fargate.
-
-  > **Tip — keep your session (and edits) across restarts.** Set
-  > `DSQL_MIGRATOR_STORAGE_SECRET` to a fixed random string before launching, e.g.
-  > `DSQL_MIGRATOR_STORAGE_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(32))") uv run mysql-dsql-migrator ui`.
-  > Without it, each restart gets a new browser-session id, so workflow progress
-  > **and your Schema Conversion edits (a customized target DDL — e.g. a
-  > `TINYINT(1)`→`smallint` remap)** are not restored, and a Full Load re-run would
-  > recreate the table from the default conversion. With it set, the session
-  > resumes where you left off and the re-run reuses your applied schema. (Treat
-  > the value as a secret; see [`.env.example`](../.env.example).)
-- **ECS Fargate — RECOMMENDED** — the same engine runs as a single-task Fargate
+- **Local** (testing / evaluation / development) — **one command, no
+  infrastructure. 👉 Try this first, before you deploy to ECS Fargate.** See
+  **[Step 2a](#step-2a--run-locally-try-this-first)**.
+- **ECS Fargate — RECOMMENDED for production workloads** — the same engine runs as a single-task Fargate
   service + HTTPS ALB **inside your VPC**, so the data path stays in AWS (not your
-  laptop). The real deployment, and the rest of this guide.
+  laptop). The real deployment. See
+  **[Step 2b](#step-2b--deploy-on-ecs-fargate-recommended-for-production-workloads)**.
 
 ---
 
-## Step 2 — Deploy on ECS Fargate (recommended)
+## Step 2a — Run locally (try this first)
+
+**Before you commit to an ECS Fargate deployment, try it locally first** — **one
+command and the UI is up. That's it.**
+
+```console
+$ uv run mysql-dsql-migrator ui
+NiceGUI ready to go on http://127.0.0.1:8080
+```
+
+Open that URL in your browser and you're in — **no infrastructure, no build, no AWS
+resources to create.** Great for a first look, evaluation, and smaller migrations
+before deciding on Fargate.
+
+<div align="center">
+  <img src="../docs/demo-ui.gif" alt="The tool's UI — guided 6-step migration workflow" width="560">
+</div>
+
+The UI runs on your own machine (browser → `127.0.0.1:8080`), and **the migration
+itself runs there too**: your workstation is the engine that reads the source and
+writes to DSQL, so all data flows through your machine and its network. This means
+your **desktop must be able to reach _both_** the source MySQL **and** the target
+Aurora DSQL — a private source needs an SSM port-forward / VPN, and your machine
+needs outbound HTTPS + AWS credentials to the DSQL region. Zero infra — best for
+evaluation / smaller migrations / development. It is *not* the hosted architecture;
+for a real migration use ECS Fargate (**[Step 2b](#step-2b--deploy-on-ecs-fargate-recommended-for-production-workloads)**).
+
+> **Tip — keep your session (and edits) across restarts.** Set
+> `DSQL_MIGRATOR_STORAGE_SECRET` to a fixed random string before launching, e.g.
+> `DSQL_MIGRATOR_STORAGE_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(32))") uv run mysql-dsql-migrator ui`.
+> Without it, each restart gets a new browser-session id, so workflow progress
+> **and your Schema Conversion edits (a customized target DDL — e.g. a
+> `TINYINT(1)`→`smallint` remap)** are not restored, and a Full Load re-run would
+> recreate the table from the default conversion. With it set, the session
+> resumes where you left off and the re-run reuses your applied schema. (Treat
+> the value as a secret; see [`.env.example`](../.env.example).)
+
+---
+
+## Step 2b — Deploy on ECS Fargate (recommended for production workloads)
 
 No image build needed — the image is on **ECR Public** and CloudFormation pulls
 it. Two ways to deploy the same `deploy/cloudformation.yaml`:
@@ -140,6 +164,31 @@ Two ways to deploy `deploy/cloudformation.yaml` — pick one. Both produce the s
 stack; see **Parameter reference** below.
 
 #### Recommended — AWS Console (guided form)
+
+**At a glance** — upload the template, fill 5 fields, create, open the URL
+(~5 min of clicks + ~3–5 min for the stack to come up):
+
+1. **CloudFormation → Create stack → With new resources (standard).** Check the
+   Region (top-right) matches your Aurora DSQL cluster.
+2. **Upload a template file** → pick `deploy/cloudformation.yaml` → **Next**.
+3. **Stack name** `mysql-dsql-migrator`, then fill the **5 required fields** —
+   `VpcId`, `AlbSubnetIds` (2 subnets, 2 AZs), `ServiceSubnetIds` (2 private
+   subnets, 2 AZs), `CertificateArn`, `DsqlClusterArn`. Leave everything else at its
+   default → **Next**.
+4. **Next** (stack options) → tick the **IAM-capabilities acknowledgement** →
+   **Create stack**.
+5. Wait for **CREATE_COMPLETE** → open the **Outputs** tab → copy **`AppUrl`** →
+   browse it from inside the VPC. Done.
+
+<!-- Screenshot slot: capture the CloudFormation "Create stack → Upload a template
+     file" screen, save it as deploy/images/cfn-create-stack.png, then uncomment:
+![CloudFormation — Create stack → Upload a template file](images/cfn-create-stack.png)
+-->
+> 📸 *A screenshot of the "Create stack → Upload a template file" screen belongs
+> here (see the placeholder in the source).*
+
+The field-by-field details, subnet-picking tips, the no-domain cert command, and
+public-access options follow below.
 
 First confirm you're in the **right region** (top-right of the console — the same
 region as your Aurora DSQL cluster), then:

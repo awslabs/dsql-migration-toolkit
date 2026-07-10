@@ -32,29 +32,51 @@ Fargate에서는 **컨트롤 플레인 앱**이 고객 자신의 AWS 계정과 V
 
 ## 1단계 — 어디서 실행할지 선택
 
-- **로컬** — `uv run mysql-dsql-migrator ui`. UI가 내 머신에서 돌고(브라우저 → `127.0.0.1:8080`),
-  **마이그레이션 자체도 거기서 실행**됩니다 — 내 워크스테이션이 소스를 읽고 DSQL에 쓰는 엔진이라,
-  모든 데이터가 내 머신과 네트워크를 통과합니다. 따라서 **내 데스크톱이 소스 MySQL과 타깃 Aurora
-  DSQL _양쪽_ 모두에 도달**할 수 있어야 합니다 — 프라이빗 소스는 SSM 포트 포워딩 / VPN이 필요하고,
-  내 머신은 DSQL 리전으로의 아웃바운드 HTTPS + AWS 자격증명이 있어야 합니다. 인프라 없음 — 평가 /
-  소규모 마이그레이션 / 개발에 적합. 호스팅 아키텍처는 아니며, 실제 마이그레이션은 Fargate를 쓰세요.
-
-  > **팁 — 재시작에도 세션(과 편집)을 유지하세요.** 실행 전에
-  > `DSQL_MIGRATOR_STORAGE_SECRET`을 고정 랜덤 문자열로 설정하세요. 예:
-  > `DSQL_MIGRATOR_STORAGE_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(32))") uv run mysql-dsql-migrator ui`.
-  > 설정하지 않으면 재시작마다 브라우저 세션 id가 바뀌어, 워크플로 진행과 **Schema Conversion
-  > 편집(커스터마이즈한 타깃 DDL — 예: `TINYINT(1)`→`smallint` 리매핑)** 이 복원되지 않고, Full Load
-  > 재실행이 기본 변환으로 테이블을 재생성합니다. 설정하면 세션이 이어지고 재실행이 적용된 스키마를
-  > 재사용합니다. (값은 비밀로 취급 — [`.env.example`](../.env.example) 참고.)
-- **ECS Fargate — 권장** — 같은 엔진이 **내 VPC 안의** 단일 태스크 Fargate 서비스 + HTTPS ALB로
-  실행되어, 데이터 경로가 내 노트북이 아니라 AWS 안에 머뭅니다. 실제 배포이며 이 가이드의 나머지가
-  다룹니다.
+- **로컬** (테스트 / 평가 / 개발) — **명령어 한 줄, 인프라 없음. 👉 ECS Fargate에 배포하기 전에
+  먼저 이걸 시도해보세요.** [2a단계](#2a단계--로컬에서-실행-먼저-시도) 참고.
+- **ECS Fargate — 프로덕션 워크로드에 권장** — 같은 엔진이 **내 VPC 안의** 단일 태스크 Fargate 서비스 + HTTPS ALB로
+  실행되어, 데이터 경로가 내 노트북이 아니라 AWS 안에 머뭅니다. 실제 배포.
+  [2b단계](#2b단계--ecs-fargate에-배포-프로덕션-워크로드에-권장) 참고.
 
 > 선택적 대규모 스트리밍 **CDC**(MSK + Debezium + 싱크)는 별도의 `cdc-stack`이며 여기서 다루지 않음.
 
 ---
 
-## 2단계 — ECS Fargate에 배포 (권장)
+## 2a단계 — 로컬에서 실행 (먼저 시도)
+
+**ECS Fargate 배포를 결정하기 전에, 먼저 로컬에서 시도해보세요** — **명령어 한 줄이면 UI가 뜹니다.
+끝입니다.**
+
+```console
+$ uv run mysql-dsql-migrator ui
+NiceGUI ready to go on http://127.0.0.1:8080
+```
+
+이 URL을 브라우저에서 열면 바로 사용 — **인프라도, 빌드도, 만들 AWS 리소스도 없습니다.** 첫 확인·
+평가·소규모 마이그레이션에 좋고, Fargate로 갈지 결정하기 전에 써보기 좋습니다.
+
+<div align="center">
+  <img src="../docs/demo-ui.gif" alt="도구 UI — 6단계 가이드 마이그레이션 워크플로우" width="560">
+</div>
+
+UI가 내 머신에서 돌고(브라우저 → `127.0.0.1:8080`), **마이그레이션 자체도 거기서 실행**됩니다 — 내
+워크스테이션이 소스를 읽고 DSQL에 쓰는 엔진이라, 모든 데이터가 내 머신과 네트워크를 통과합니다.
+따라서 **내 데스크톱이 소스 MySQL과 타깃 Aurora DSQL _양쪽_ 모두에 도달**할 수 있어야 합니다 —
+프라이빗 소스는 SSM 포트 포워딩 / VPN이 필요하고, 내 머신은 DSQL 리전으로의 아웃바운드 HTTPS +
+AWS 자격증명이 있어야 합니다. 인프라 없음 — 평가 / 소규모 마이그레이션 / 개발에 적합. 호스팅
+아키텍처는 아니며, 실제 마이그레이션은 ECS Fargate([2b단계](#2b단계--ecs-fargate에-배포-프로덕션-워크로드에-권장))를 쓰세요.
+
+> **팁 — 재시작에도 세션(과 편집)을 유지하세요.** 실행 전에
+> `DSQL_MIGRATOR_STORAGE_SECRET`을 고정 랜덤 문자열로 설정하세요. 예:
+> `DSQL_MIGRATOR_STORAGE_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(32))") uv run mysql-dsql-migrator ui`.
+> 설정하지 않으면 재시작마다 브라우저 세션 id가 바뀌어, 워크플로 진행과 **Schema Conversion
+> 편집(커스터마이즈한 타깃 DDL — 예: `TINYINT(1)`→`smallint` 리매핑)** 이 복원되지 않고, Full Load
+> 재실행이 기본 변환으로 테이블을 재생성합니다. 설정하면 세션이 이어지고 재실행이 적용된 스키마를
+> 재사용합니다. (값은 비밀로 취급 — [`.env.example`](../.env.example) 참고.)
+
+---
+
+## 2b단계 — ECS Fargate에 배포 (프로덕션 워크로드에 권장)
 
 이미지는 따로 빌드하지 않아도 됩니다 — **ECR Public**에 올라가 있어 CloudFormation이 알아서
 가져옵니다. 같은 `deploy/cloudformation.yaml`을 배포하는 방법은 두 가지입니다:
@@ -128,6 +150,25 @@ SSM 포트 포워딩을 이용하세요. 외부에 공개하려면 **app-stack �
 파라미터 설명은 **파라미터 레퍼런스** 참고.
 
 #### 권장 — AWS Console (안내형 폼)
+
+**한눈에** — 템플릿 업로드, 5개 필드 입력, 생성, URL 열기 (클릭 ~5분 + 스택 기동 ~3–5분):
+
+1. **CloudFormation → Create stack → With new resources (standard).** 우측 상단 리전이
+   Aurora DSQL 클러스터와 같은지 확인.
+2. **Upload a template file** → `deploy/cloudformation.yaml` 선택 → **Next**.
+3. **Stack name** `mysql-dsql-migrator` 입력 후 **필수 5개 필드**만 채웁니다 —
+   `VpcId`, `AlbSubnetIds`(서브넷 2개, AZ 2개), `ServiceSubnetIds`(프라이빗 서브넷 2개, AZ 2개),
+   `CertificateArn`, `DsqlClusterArn`. 나머지는 기본값 그대로 → **Next**.
+4. **Next**(스택 옵션) → **IAM 권한 확인 체크** → **Create stack**.
+5. **CREATE_COMPLETE** 대기 → **Outputs** 탭 → **`AppUrl`** 복사 → VPC 내부에서 접속. 끝.
+
+<!-- 스크린샷 자리: CloudFormation "Create stack → Upload a template file" 화면을 캡처해
+     deploy/images/cfn-create-stack.png 로 저장한 뒤 주석 해제:
+![CloudFormation — Create stack → Upload a template file](images/cfn-create-stack.png)
+-->
+> 📸 *"Create stack → Upload a template file" 화면 스크린샷이 여기 들어갑니다(소스의 자리 표시 참고).*
+
+필드별 상세, 서브넷 고르는 팁, 도메인 없을 때의 인증서 명령, 퍼블릭 접근 옵션은 아래에 이어집니다.
 
 먼저 콘솔 우측 상단에서 **올바른 리전**(Aurora DSQL 클러스터와 같은 리전)인지 확인한 뒤:
 

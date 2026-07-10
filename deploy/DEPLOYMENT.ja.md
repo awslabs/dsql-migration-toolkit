@@ -34,33 +34,55 @@ Fargate では、**コントロールプレーンアプリ**が、お客様自�
 
 ## ステップ 1 — 実行場所を選ぶ
 
-- **ローカル** — `uv run mysql-dsql-migrator ui`。UI はご自身のマシンで動作し
-  （ブラウザ → `127.0.0.1:8080`）、**移行そのものもそこで実行されます**。ご自身の
-  ワークステーションがソースを読み取り DSQL に書き込むエンジンとなるため、すべての
-  データがご自身のマシンとそのネットワークを通過します。つまり、**ご自身のデスクトップが
-  ソース MySQL _と_ ターゲット Aurora DSQL の _両方_ に到達できる必要があります** —
-  プライベートなソースには SSM ポートフォワード / VPN が必要で、ご自身のマシンには
-  DSQL リージョンへのアウトバウンド HTTPS + AWS 認証情報が必要です。インフラ不要 —
-  評価 / 小規模な移行 / 開発に最適です。これはホスティングされたアーキテクチャ
-  では *ありません*。実際の移行には Fargate を使用してください。
-
-  > **ヒント — 再起動をまたいでセッション（と編集内容）を維持する。** 起動前に
-  > `DSQL_MIGRATOR_STORAGE_SECRET` を固定のランダム文字列に設定してください。例:
-  > `DSQL_MIGRATOR_STORAGE_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(32))") uv run mysql-dsql-migrator ui`。
-  > 設定しないと、再起動のたびに新しいブラウザセッション ID が発行されるため、
-  > ワークフローの進捗**および Schema Conversion の編集内容（カスタマイズした
-  > ターゲット DDL — 例: `TINYINT(1)`→`smallint` の再マッピング）** が復元されず、
-  > Full Load を再実行するとデフォルトの変換でテーブルが再作成されてしまいます。
-  > 設定しておけば、セッションは中断したところから再開され、再実行では適用済みの
-  > スキーマが再利用されます。（この値はシークレットとして扱ってください。
-  > [`.env.example`](../.env.example) を参照。）
-- **ECS Fargate — 推奨** — 同じエンジンが、**ご自身の VPC 内の**単一タスク Fargate
+- **ローカル**（テスト / 評価 / 開発）— **コマンド 1 つ、インフラ不要。👉 ECS Fargate に
+  デプロイする前に、まずこちらを試してください。** [ステップ 2a](#ステップ-2a--ローカルで実行-まず試す) を参照。
+- **ECS Fargate — 本番ワークロードに推奨** — 同じエンジンが、**ご自身の VPC 内の**単一タスク Fargate
   サービス + HTTPS ALB として動作するため、データ経路はご自身のノート PC ではなく
-  AWS 内にとどまります。実際のデプロイであり、本ガイドの残りが扱う対象です。
+  AWS 内にとどまります。実際のデプロイ。[ステップ 2b](#ステップ-2b--ecs-fargate-にデプロイ-本番ワークロードに推奨) を参照。
 
 ---
 
-## ステップ 2 — ECS Fargate にデプロイ (推奨)
+## ステップ 2a — ローカルで実行 (まず試す)
+
+**ECS Fargate のデプロイを決める前に、まずローカルで試してください** — **コマンド 1 つで
+UI が起動します。それだけです。**
+
+```console
+$ uv run mysql-dsql-migrator ui
+NiceGUI ready to go on http://127.0.0.1:8080
+```
+
+この URL をブラウザで開けばすぐ使えます — **インフラも、ビルドも、作成する AWS リソースも
+ありません。** 最初の確認・評価・小規模な移行に最適で、Fargate に進むか決める前に試すのに
+向いています。
+
+<div align="center">
+  <img src="../docs/demo-ui.gif" alt="ツールの UI — ガイド付き 6 ステップの移行ワークフロー" width="560">
+</div>
+
+UI はご自身のマシンで動作し（ブラウザ → `127.0.0.1:8080`）、**移行そのものもそこで実行
+されます**。ご自身のワークステーションがソースを読み取り DSQL に書き込むエンジンとなるため、
+すべてのデータがご自身のマシンとそのネットワークを通過します。つまり、**ご自身のデスクトップが
+ソース MySQL _と_ ターゲット Aurora DSQL の _両方_ に到達できる必要があります** —
+プライベートなソースには SSM ポートフォワード / VPN が必要で、ご自身のマシンには
+DSQL リージョンへのアウトバウンド HTTPS + AWS 認証情報が必要です。インフラ不要 —
+評価 / 小規模な移行 / 開発に最適です。これはホスティングされたアーキテクチャ
+では *ありません*。実際の移行には ECS Fargate（[ステップ 2b](#ステップ-2b--ecs-fargate-にデプロイ-本番ワークロードに推奨)）を使用してください。
+
+> **ヒント — 再起動をまたいでセッション（と編集内容）を維持する。** 起動前に
+> `DSQL_MIGRATOR_STORAGE_SECRET` を固定のランダム文字列に設定してください。例:
+> `DSQL_MIGRATOR_STORAGE_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(32))") uv run mysql-dsql-migrator ui`。
+> 設定しないと、再起動のたびに新しいブラウザセッション ID が発行されるため、
+> ワークフローの進捗**および Schema Conversion の編集内容（カスタマイズした
+> ターゲット DDL — 例: `TINYINT(1)`→`smallint` の再マッピング）** が復元されず、
+> Full Load を再実行するとデフォルトの変換でテーブルが再作成されてしまいます。
+> 設定しておけば、セッションは中断したところから再開され、再実行では適用済みの
+> スキーマが再利用されます。（この値はシークレットとして扱ってください。
+> [`.env.example`](../.env.example) を参照。）
+
+---
+
+## ステップ 2b — ECS Fargate にデプロイ (本番ワークロードに推奨)
 
 イメージのビルドは不要です — イメージは **ECR Public** にあり、CloudFormation が
 取得します。同じ `deploy/cloudformation.yaml` をデプロイする 2 つの方法があります。
@@ -142,6 +164,28 @@ Fargate では、**コントロールプレーンアプリ**が、お客様自�
 **パラメータリファレンス** セクションにあります。
 
 #### 推奨 — AWS Console (ガイド付きフォーム)
+
+**概要** — テンプレートをアップロード、5 つのフィールドを入力、作成、URL を開く
+（クリック約 5 分 + スタック起動 約 3〜5 分）:
+
+1. **CloudFormation → Create stack → With new resources (standard).** 右上のリージョンが
+   Aurora DSQL クラスターと同じか確認。
+2. **Upload a template file** → `deploy/cloudformation.yaml` を選択 → **Next**。
+3. **Stack name** に `mysql-dsql-migrator` を入力し、**必須 5 フィールド**だけ埋めます —
+   `VpcId`、`AlbSubnetIds`（サブネット 2 個、2 AZ）、`ServiceSubnetIds`（プライベート
+   サブネット 2 個、2 AZ）、`CertificateArn`、`DsqlClusterArn`。他はすべて既定値のまま → **Next**。
+4. **Next**（スタックオプション）→ **IAM 権限の承認にチェック** → **Create stack**。
+5. **CREATE_COMPLETE** を待つ → **Outputs** タブ → **`AppUrl`** をコピー → VPC 内部から
+   アクセス。完了。
+
+<!-- スクリーンショット枠: CloudFormation "Create stack → Upload a template file" 画面を
+     キャプチャして deploy/images/cfn-create-stack.png に保存し、コメントを解除:
+![CloudFormation — Create stack → Upload a template file](images/cfn-create-stack.png)
+-->
+> 📸 *「Create stack → Upload a template file」画面のスクリーンショットがここに入ります（ソースのプレースホルダー参照）。*
+
+フィールドごとの詳細、サブネット選択のヒント、ドメインなしの証明書コマンド、公開アクセスの
+オプションは以下に続きます。
 
 まず、**正しいリージョン**（コンソール右上 — Aurora DSQL クラスターと同一リージョン）
 にいることを確認し、次に:

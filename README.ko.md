@@ -263,6 +263,20 @@ AI 보조는 기본 off이며 UI에서 켭니다. UI는 Bedrock 도달 가능 �
 
 ---
 
+## 문서 (Documentation)
+
+| 문서 | 내용 |
+|---|---|
+| [**배포 가이드**](deploy/DEPLOYMENT.ko.md) | 로컬은 명령어 한 줄, 또는 ECS Fargate 배포(AWS Console 또는 CLI) — 사전 요구사항, 파라미터, 커스텀 도메인 / Cognito / AI 어시스트, teardown, 트러블슈팅. |
+| [**사용자 매뉴얼**](docs/manual/) | 6단계 마이그레이션 단계별 안내 — **성능 튜닝 & 측정 테스트 결과**, 테스트 / 검증, **고객 FAQ** 포함. |
+| [**아키텍처**](#아키텍처) | 구성 요소와 동작 + AWS·CDC 파이프라인 다이어그램(`deploy/architecture-*.png`). |
+| [**변경 이력**](CHANGELOG.ko.md) | 릴리스별 변경(유의적 버전). |
+
+다국어: [English README](README.md) · [日本語 README](README.ja.md) — 배포 가이드·변경
+이력·사용자 매뉴얼도 번역되어 있습니다.
+
+---
+
 ## 배포
 
 이 도구는 고객의 프라이빗 RDS/Aurora와 DSQL에 고객의 IAM 컨텍스트로 연결하므로 **고객 환경

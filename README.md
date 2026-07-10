@@ -276,6 +276,20 @@ Full background on the tuning knobs: manual
 
 ---
 
+## Documentation
+
+| Doc | What's inside |
+|---|---|
+| [**Deployment guide**](deploy/DEPLOYMENT.md) | Run locally in one command, or deploy on ECS Fargate (AWS Console or CLI) — prerequisites, parameters, custom domain / Cognito / AI assist, teardown, troubleshooting. |
+| [**User manual**](docs/manual/) | Step-by-step walkthrough of the six migration steps — plus **performance tuning & measured test results**, testing / verification, and a **customer FAQ**. |
+| [**Architecture**](#architecture) | How the pieces fit, plus the AWS and CDC-pipeline diagrams (`deploy/architecture-*.png`). |
+| [**Changelog**](CHANGELOG.md) | Per-release changes (semantic-versioned). |
+
+Localized: [한국어 README](README.ko.md) · [日本語 README](README.ja.md) — the deployment
+guide, changelog, and user manual are translated too.
+
+---
+
 ## Deployment
 
 The tool connects to a customer's private RDS/Aurora and DSQL in the customer's IAM
