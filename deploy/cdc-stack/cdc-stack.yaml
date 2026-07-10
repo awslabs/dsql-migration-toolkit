@@ -1564,22 +1564,21 @@ Resources:
         # only place these can be set.
 
   # ------------------------------------------------------------------------- #
-  # Observability: alarm when a connector task errors out (H5). Without this,
-  # recovery waited entirely on a human noticing a FAILED connector in the
-  # console -- and if that gap exceeds source binlog retention the resume
-  # position is lost. Each alarm watches AWS/KafkaConnect ErroredTaskCount for
-  # its connector (dimension ConnectorName; namespace + dimension confirmed
-  # against the MSK Connect monitoring docs), so a stalled connector is surfaced
-  # automatically. They exist regardless of AlarmNotificationTopicArn (visible in
-  # CloudWatch) and notify that SNS topic when one is supplied.
+  # Observability: alarm when a connector task errors out. Without this, recovery
+  # waited entirely on a human noticing a FAILED connector in the console -- and if
+  # that gap exceeds source binlog retention the resume position is lost. Each alarm
+  # watches AWS/KafkaConnect ErroredTaskCount for its connector (dimension
+  # ConnectorName; namespace + dimension confirmed against the MSK Connect monitoring
+  # docs), so a stalled connector is surfaced automatically. They exist regardless of
+  # AlarmNotificationTopicArn (visible in CloudWatch) and notify that SNS topic when
+  # one is supplied.
   #
-  # NOTE (post-H1 interaction): once the sink throws RetriableException on
-  # transient DSQL blips (PLUGIN_VERSION v17), a transient failure no longer
-  # errors the task -- it pauses+redelivers and stays RUNNING -- so ErroredTaskCount
-  # fires only for genuinely-fatal states (poison record + no DLQ, or a fatal
-  # source error). A sink that is retrying indefinitely (DSQL down for a long
-  # time) is NOT caught by ErroredTaskCount; that is a known limitation, not
-  # covered here to avoid false positives on legitimately-idle sources.
+  # NOTE: because the sink re-raises a transient DSQL error as a RetriableException
+  # (the connector pauses + redelivers and stays RUNNING rather than dying),
+  # ErroredTaskCount fires only for genuinely-fatal states (a poison record with no
+  # DLQ, or a fatal source error). A sink that is retrying indefinitely (DSQL down
+  # for a long time) is NOT caught by ErroredTaskCount; that is a known limitation,
+  # not covered here to avoid false positives on legitimately-idle sources.
   DebeziumSourceErroredTaskAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HasBootstrapServers

@@ -164,6 +164,19 @@ def test_cdc_deploy_role_can_configure_connector_log_delivery(template: dict) ->
     } <= actions
 
 
+def test_cdc_deploy_role_can_manage_connector_alarms(template: dict) -> None:
+    # The cdc-stack creates a CloudWatch alarm per connector on ErroredTaskCount, so
+    # the deploy role must be able to create/read/delete those alarms -- else the
+    # cdc-stack deploy fails creating the alarm with AccessDenied
+    # (cloudwatch:PutMetricAlarm) and its rollback fails on cloudwatch:DeleteAlarms.
+    actions = _cdc_deploy_role_actions(template)
+    assert {
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:DeleteAlarms",
+        "cloudwatch:DescribeAlarms",
+    } <= actions
+
+
 def test_cloudformation_parses_as_yaml(template: dict) -> None:
     assert template["AWSTemplateFormatVersion"] == "2010-09-09"
     assert "Resources" in template
@@ -700,14 +713,14 @@ def test_cdc_stack_worker_config_names_carry_plugin_version(cdc_template: dict) 
 
 
 def test_cdc_source_connector_has_heartbeat_without_source_write(cdc_template: dict) -> None:
-    # H4: a heartbeat keeps Debezium's committed binlog offset advancing while the
+    # A heartbeat keeps Debezium's committed binlog offset advancing while the
     # CAPTURED tables are idle (other tables churn the binlog), so source binlog
     # retention cannot purge past a stale offset and break gapless resume. It must
     # NOT set heartbeat.action.query -- that would WRITE to the read-only source.
     cfg = cdc_template["Resources"]["DebeziumSourceConnector"]["Properties"][
         "ConnectorConfiguration"
     ]
-    assert cfg.get("heartbeat.interval.ms"), "source connector must set a heartbeat interval (H4)"
+    assert cfg.get("heartbeat.interval.ms"), "source connector must set a heartbeat interval"
     assert int(cfg["heartbeat.interval.ms"]) > 0
     assert "heartbeat.action.query" not in cfg, (
         "heartbeat.action.query would write to the READ-ONLY source"
@@ -715,7 +728,7 @@ def test_cdc_source_connector_has_heartbeat_without_source_write(cdc_template: d
 
 
 def test_cdc_stack_alarms_on_connector_errored_tasks(cdc_template: dict) -> None:
-    # H5: each connector gets a CloudWatch alarm on AWS/KafkaConnect ErroredTaskCount
+    # Each connector gets a CloudWatch alarm on AWS/KafkaConnect ErroredTaskCount
     # (dimension ConnectorName) so a FAILED task is surfaced automatically. The alarm
     # is gated to the SAME condition as the connector it watches, so a not-yet-created
     # connector has no permanently-INSUFFICIENT_DATA alarm.
@@ -743,7 +756,7 @@ def test_cdc_stack_alarms_on_connector_errored_tasks(cdc_template: dict) -> None
 
 
 def test_cdc_stack_alarm_notification_topic_is_optional(cdc_template: dict) -> None:
-    # H5: notifications are opt-in (deployment convenience -- no SNS wiring needed to
+    # Notifications are opt-in (deployment convenience -- no SNS wiring needed to
     # deploy). The param defaults empty and the alarm actions are gated on HasAlarmTopic
     # so an empty ARN yields NO action (AWS::NoValue) rather than an invalid action.
     tpl = cdc_template

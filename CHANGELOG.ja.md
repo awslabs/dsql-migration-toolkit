@@ -5,6 +5,19 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.85
+
+### Fixed
+
+- **CDC のデプロイが失敗: CDC デプロイ用ロールに CloudWatch アラーム権限が欠けていた。** v0.1.84 で
+  CDC スタックにコネクタごとの CloudWatch アラーム(`ErroredTaskCount`)を追加したが、アプリの
+  `cdc-deploy` ロールに `cloudwatch:PutMetricAlarm` / `DeleteAlarms` / `DescribeAlarms` を付与して
+  いなかった。そのため CDC 開始時にアラーム作成で `AccessDenied` となって失敗し、CDC スタックが
+  ロールバック(ロールバックも `cloudwatch:DeleteAlarms` で失敗)して、コネクタが1つも作成されなかった。
+  ロールは CDC スタック系列のアラーム ARN にスコープされたアラーム権限を持つようになった。**app-stack を
+  再デプロイして権限を反映してから CDC 開始を再試行**すればよい(新しいイメージのビルドは不要 — IAM のみの
+  テンプレート変更)。
+
 ## v0.1.84
 
 ### Fixed

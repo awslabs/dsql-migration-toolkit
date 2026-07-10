@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.85
+
+### Fixed
+
+- **CDC failed to deploy: the privileged CDC-deploy role was missing CloudWatch
+  alarm permissions.** v0.1.84 added a per-connector CloudWatch alarm (on
+  `ErroredTaskCount`) to the CDC stack, but the app's `cdc-deploy` role was not
+  granted `cloudwatch:PutMetricAlarm` / `DeleteAlarms` / `DescribeAlarms`. Starting
+  CDC therefore failed while creating the alarm with an `AccessDenied` error, and
+  the CDC stack rolled back (its rollback then also failed on
+  `cloudwatch:DeleteAlarms`), so no connectors were created. The role now has the
+  scoped alarm permissions (alarm ARNs in the CDC stack family). **Redeploy the
+  app-stack to pick up the permission, then retry Start CDC** (no new image build
+  is required — this is an IAM-only template change).
+
 ## v0.1.84
 
 ### Fixed

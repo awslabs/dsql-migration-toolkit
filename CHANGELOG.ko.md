@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.85
+
+### 수정 (Fixed)
+
+- **CDC 배포 실패: CDC 배포 역할에 CloudWatch 알람 권한이 없었음.** v0.1.84에서 CDC 스택에
+  커넥터별 CloudWatch 알람(`ErroredTaskCount`)을 추가했으나, 앱의 `cdc-deploy` 역할에
+  `cloudwatch:PutMetricAlarm` / `DeleteAlarms` / `DescribeAlarms` 권한을 부여하지 않았다.
+  그래서 CDC 시작 시 알람 생성에서 `AccessDenied`로 실패하고 CDC 스택이 롤백됐으며(롤백도
+  `cloudwatch:DeleteAlarms`에서 실패), 커넥터가 하나도 생성되지 않았다. 이제 역할이 CDC 스택
+  계열의 알람 ARN으로 스코프된 알람 권한을 갖는다. **app-stack을 재배포해 권한을 반영한 뒤 CDC
+  시작을 재시도**하면 된다(새 이미지 빌드 불필요 — IAM만 바뀌는 템플릿 변경).
+
 ## v0.1.84
 
 ### 수정 (Fixed)

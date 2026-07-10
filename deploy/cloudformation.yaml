@@ -870,6 +870,30 @@ Resources:
                   - logs:PutResourcePolicy
                   - logs:DescribeResourcePolicies
                 Resource: "*"
+              # The cdc-stack creates a CloudWatch alarm per connector on
+              # AWS/KafkaConnect ErroredTaskCount (to surface a FAILED connector
+              # automatically). THIS deploy role creates/updates/deletes those alarms,
+              # so it needs the alarm actions -- without them the cdc-stack deploy
+              # fails creating the alarm with AccessDenied (cloudwatch:PutMetricAlarm)
+              # and its rollback fails on cloudwatch:DeleteAlarms. PutMetricAlarm /
+              # DeleteAlarms + tagging support resource-level scoping (alarm ARN, cdc
+              # family, matching the log-group scoping above); DescribeAlarms does not.
+              - Sid: CdcConnectorAlarms
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:TagResource
+                  - cloudwatch:UntagResource
+                  - cloudwatch:ListTagsForResource
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:mysql-dsql-cdc-*
+              # cloudwatch:DescribeAlarms has no resource-level support; CFN calls it to
+              # read the alarm's state on create/update. Scope to "*" (read-only).
+              - Sid: CdcConnectorAlarmsDescribe
+                Effect: Allow
+                Action: cloudwatch:DescribeAlarms
+                Resource: "*"
               # IAM roles the cdc-stack auto-names (connector exec role + seeder role).
               - Sid: IamCdcStackRoles
                 Effect: Allow
