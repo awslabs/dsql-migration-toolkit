@@ -5,6 +5,27 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.93
+
+### Added
+
+- **Durable per-session resume across a redeploy (S3-backed session store).** A
+  reconnecting browser resumes its per-session workbench (workflow progress, the
+  Step-1 Evaluation result, Schema Conversion choices, the CDC start point / adopted
+  stack) instead of re-running Evaluation. That snapshot previously lived in a local
+  SQLite file on the container's **ephemeral** disk, so a Fargate **task
+  replacement** (any redeploy) wiped it — the operator had to redo Evaluation after
+  every deploy. A new `S3SessionStateStore` (implementing the existing
+  `SessionStateStore` protocol) writes each non-secret snapshot to the tool's managed
+  plugin bucket (`mysql-dsql-migrator-plugins-<account>-<region>`, auto-provisioned —
+  no new parameter or customer setup) under a `sessions/` prefix, so resume now
+  survives a redeploy. Selected automatically on the Fargate deploy via a new
+  `DSQL_MIGRATOR_SESSION_STATE_BUCKET` (the template points it at the managed
+  bucket); local dev keeps the SQLite path. Non-secret state only (Property 7 — the
+  source DB password is re-entered on Connect); persistence is best-effort (a
+  transient S3 error is logged and never breaks the UI). The task role gains
+  `s3:DeleteObject` for session delete/prune.
+
 ## v0.1.92
 
 ### Fixed

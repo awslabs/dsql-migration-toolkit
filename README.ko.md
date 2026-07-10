@@ -224,7 +224,8 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 | `DSQL_MIGRATOR_AWS_PROFILE` | _(미설정)_ | 선택적 글로벌 AWS named profile. 미설정 시 표준 체인으로 폴백. 프로필 이름(비밀 아님)만 저장. |
 | `DSQL_MIGRATOR_JOB_STATE_PATH` | `job_state.sqlite` | Full Load 작업 스냅샷(상태, 테이블별 진행률, 워터마크) — 재시작 후 재개용. |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_PATH` | `migration_activity.log` | 구조화된 활동 로그(이벤트당 UTC 타임스탬프 JSON 한 줄); UI에서 다운로드, 크기 제한·회전(~20 MB × 백업 4개). |
-| `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | 세션별 비밀 아닌 워크벤치 상태 — 재연결 브라우저가 이어서 작업. `DSQL_MIGRATOR_STORAGE_SECRET`과 함께 사용. |
+| `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | 세션별 비밀 아닌 워크벤치 상태 — 재연결 브라우저가 이어서 작업. `DSQL_MIGRATOR_STORAGE_SECRET`과 함께 사용. 로컬 디스크 — Fargate 배포는 아래 durable S3 스토어를 대신 사용. |
+| `DSQL_MIGRATOR_SESSION_STATE_BUCKET` | _(미설정)_ | 세션 스냅샷용 durable S3 스토어 — 인프로세스 재시작뿐 아니라 Fargate 태스크 교체(재배포)까지 재개가 유지됨. Fargate 배포가 관리형 플러그인 버킷으로 자동 설정(설정 불필요); 로컬은 미설정 시 위 SQLite 경로 사용. |
 | `DSQL_MIGRATOR_STAGING_BUCKET` | _(미설정)_ | Full Load 스테이징용 S3 버킷(스트리밍 멀티파트 업로드 — 대형 테이블 확장 경로). 미설정 시 제한된 로컬 임시 CSV(개발 / 소형). |
 | `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4` (≤16) | 동시에 로드하는 테이블 수. 총 DSQL 연결을 클러스터 쿼터 안에서 유지. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | 테이블당 in-flight `INSERT … ON CONFLICT` 배치 수. 높을수록 처리량↑, OCC(40001) 충돌↑. |

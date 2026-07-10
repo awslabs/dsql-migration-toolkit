@@ -5,6 +5,22 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.93
+
+### 추가 (Added)
+
+- **재배포를 넘어 유지되는 durable 세션 재개 (S3 기반 세션 스토어).** 재연결한 브라우저가
+  세션별 워크벤치(워크플로 진행·Step-1 Evaluation 결과·Schema Conversion 선택·CDC 시작점/adopt한
+  스택)를 Evaluation 재실행 없이 이어서 작업합니다. 이 스냅샷이 이전엔 컨테이너 **임시 디스크**의
+  로컬 SQLite 파일에 있어, Fargate **태스크 교체**(모든 재배포)가 이를 지웠고 — 배포할 때마다
+  Evaluation을 다시 해야 했습니다. 새 `S3SessionStateStore`(기존 `SessionStateStore` protocol
+  구현)가 각 비밀-아님 스냅샷을 툴의 관리형 플러그인 버킷(`mysql-dsql-migrator-plugins-<account>-<region>`,
+  자동 프로비저닝 — 새 파라미터·고객 설정 없음)의 `sessions/` 프리픽스에 기록해, 이제 재배포를 견딥니다.
+  Fargate 배포에서 새 `DSQL_MIGRATOR_SESSION_STATE_BUCKET`(템플릿이 관리형 버킷으로 지정)으로 자동
+  선택되고, 로컬 dev는 SQLite 경로 유지. 비밀 아닌 상태만 저장(Property 7 — 소스 DB 비밀번호는 Connect에서
+  재입력); 영속화는 best-effort(일시적 S3 오류는 로깅만·UI 안 깨짐). 태스크 역할에 세션 삭제/prune용
+  `s3:DeleteObject` 추가.
+
 ## v0.1.92
 
 ### 수정 (Fixed)

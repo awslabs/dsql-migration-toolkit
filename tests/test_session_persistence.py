@@ -11,6 +11,8 @@ objects, and the Full Load job linkage). No NiceGUI is rendered.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from dsql_migrator.core.models import (
     AssessmentReport,
     ColumnDef,
@@ -22,6 +24,7 @@ from dsql_migrator.core.models import (
 )
 from dsql_migrator.core.session_state_store import (
     InMemorySessionStateStore,
+    S3SessionStateStore,
     SessionSnapshot,
     SqliteSessionStateStore,
 )
@@ -130,6 +133,134 @@ def test_sqlite_session_store_round_trips_a_snapshot(tmp_path) -> None:  # noqa:
 
     reopened.delete("s1")
     assert reopened.load("s1") is None
+
+
+# ---------------------------------------------------------------------------
+# S3-backed store (durable across a Fargate task replacement)
+# ---------------------------------------------------------------------------
+
+
+class _S3Error(Exception):
+    """A boto3-shaped S3 error carrying an Error.Code for absence detection."""
+
+    def __init__(self, code: str, msg: str = "") -> None:
+        super().__init__(f"{code}: {msg}")
+        self.response = {"Error": {"Code": code}}
+
+
+class _Body:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def read(self) -> bytes:
+        return self._data
+
+
+class _FakePaginator:
+    def __init__(self, objects: dict) -> None:
+        self._objects = objects
+
+    def paginate(self, *, Bucket, Prefix=""):  # noqa: N803
+        contents = [
+            {"Key": key, "LastModified": lm}
+            for key, (_, lm) in self._objects.items()
+            if key.startswith(Prefix)
+        ]
+        # Two pages so the store's pagination handling is exercised.
+        yield {"Contents": contents[:1]}
+        yield {"Contents": contents[1:]}
+
+
+class _FakeS3:
+    """A minimal in-memory S3 double for :class:`S3SessionStateStore` tests."""
+
+    def __init__(self, *, buckets=("b",), put_error=None) -> None:
+        self._objects: dict = {}
+        self._buckets = set(buckets)
+        self._put_error = put_error
+        self._clock = 0
+        self.created_buckets: list[str] = []
+
+    def head_bucket(self, *, Bucket):  # noqa: N803
+        if Bucket not in self._buckets:
+            raise _S3Error("404", "Not Found")
+
+    def create_bucket(self, *, Bucket, **_kw):  # noqa: N803
+        self._buckets.add(Bucket)
+        self.created_buckets.append(Bucket)
+
+    def put_object(self, *, Bucket, Key, Body, **_kw):  # noqa: N803
+        if self._put_error is not None:
+            raise self._put_error
+        self._clock += 1
+        last_modified = datetime(2026, 7, 11, 0, 0, 0, self._clock, tzinfo=timezone.utc)
+        self._objects[Key] = (bytes(Body), last_modified)
+
+    def get_object(self, *, Bucket, Key):  # noqa: N803
+        if Key not in self._objects:
+            raise _S3Error("NoSuchKey", "Not Found")
+        body, _ = self._objects[Key]
+        return {"Body": _Body(body)}
+
+    def delete_object(self, *, Bucket, Key):  # noqa: N803
+        self._objects.pop(Key, None)
+
+    def get_paginator(self, _name):
+        return _FakePaginator(self._objects)
+
+
+def test_s3_session_store_round_trips_and_deletes() -> None:
+    fake = _FakeS3(buckets=("b",))
+    store = S3SessionStateStore("b", s3_client=fake)
+    store.save(SessionSnapshot(session_id="s1", generated_node_ids=["table:orders"]))
+
+    loaded = store.load("s1")
+    assert loaded is not None
+    assert loaded.generated_node_ids == ["table:orders"]
+    # A missing session is a normal None (NoSuchKey), not an error.
+    assert store.load("missing") is None
+
+    store.delete("s1")
+    assert store.load("s1") is None
+
+
+def test_s3_session_store_creates_bucket_when_absent() -> None:
+    # Self-provisioning: if the managed bucket is not there yet, the store creates
+    # it (idempotent) on first save -- no separate setup step for the customer.
+    fake = _FakeS3(buckets=())
+    store = S3SessionStateStore("b", region="ap-northeast-2", s3_client=fake)
+    store.save(SessionSnapshot(session_id="s1"))
+    assert "b" in fake.created_buckets
+    assert store.load("s1") is not None
+
+
+def test_s3_session_store_prune_keeps_most_recent() -> None:
+    fake = _FakeS3(buckets=("b",))
+    store = S3SessionStateStore("b", s3_client=fake)
+    for sid in ("old1", "old2", "new1"):  # saved in order -> new1 is most recent
+        store.save(SessionSnapshot(session_id=sid))
+
+    deleted = store.prune(1)  # keep only the single newest
+    assert set(deleted) == {"old1", "old2"}
+    assert store.load("new1") is not None
+    assert store.load("old1") is None
+
+
+def test_s3_session_store_save_is_best_effort_on_error() -> None:
+    # A transient S3 error on save must be swallowed so the live UI never breaks;
+    # persistence merely degrades (a later load finds nothing).
+    fake = _FakeS3(buckets=("b",), put_error=_S3Error("SlowDown", "throttled"))
+    store = S3SessionStateStore("b", s3_client=fake)
+    store.save(SessionSnapshot(session_id="s1"))  # must NOT raise
+    assert store.load("s1") is None
+
+
+def test_config_reads_session_state_bucket_env() -> None:
+    from dsql_migrator.config import load_config
+
+    cfg = load_config({"DSQL_MIGRATOR_SESSION_STATE_BUCKET": "my-bucket"})
+    assert cfg.session_state_bucket == "my-bucket"
+    assert load_config({}).session_state_bucket is None  # default unset
 
 
 # ---------------------------------------------------------------------------

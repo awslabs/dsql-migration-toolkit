@@ -611,8 +611,10 @@ Resources:
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/msk-connect/mysql-dsql-cdc-*:*
               # The tool manages a single per-account/region plugin bucket
-              # (mysql-dsql-migrator-plugins-<account>-<region>) and uploads the two
-              # bundled connector artifacts to it. Scoped to that bucket only.
+              # (mysql-dsql-migrator-plugins-<account>-<region>). It holds the two
+              # bundled connector artifacts AND the durable per-session resume
+              # snapshots (sessions/ prefix). CreateBucket makes it self-provisioning;
+              # ListBucket backs snapshot pruning. Scoped to that bucket only.
               - Sid: ManagePluginBucket
                 Effect: Allow
                 Action:
@@ -620,11 +622,14 @@ Resources:
                   - s3:ListBucket
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}
+              # PutObject/GetObject: upload plugins + read/write session snapshots.
+              # DeleteObject: remove a session on "Start over" and prune old ones.
               - Sid: UploadPlugins
                 Effect: Allow
                 Action:
                   - s3:PutObject
                   - s3:GetObject
+                  - s3:DeleteObject
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}/*
               # The privileged cdc-stack CloudFormation/MSK/IAM operations are NOT
@@ -1245,16 +1250,27 @@ Resources:
                 Fn::GetAtt: [CdcDeployRole, Arn]
             - Name: DSQL_MIGRATOR_LOG_LEVEL
               Value: INFO
-            # Resumable job + session-snapshot stores live on the task's EPHEMERAL
-            # /tmp: they survive reloads/reconnects while the task runs but are lost
-            # on task replacement (acceptable -- the cdc-stack/migrated data are
-            # external, CDC phase is re-probed on reconnect, and a lost session just
-            # means re-running the read-only Evaluation). For zero-loss resume use a
-            # shared store (DynamoDB behind the JobStore/SessionStateStore protocols).
+            # The JOB store stays on the task's EPHEMERAL /tmp (an in-flight Full
+            # Load does not resume across a task replacement; the cdc-stack and the
+            # migrated data are external, and CDC phase is re-probed on reconnect).
             - Name: DSQL_MIGRATOR_JOB_STATE_PATH
               Value: /tmp/job_state.sqlite
+            # Local SQLite path is the fallback when no session bucket is set; on
+            # Fargate the DURABLE S3 store below takes precedence.
             - Name: DSQL_MIGRATOR_SESSION_STATE_PATH
               Value: /tmp/session_state.sqlite
+            # DURABLE per-session resume: point the SessionStateStore at the tool's
+            # managed plugin bucket (deterministic name, auto-provisioned -- no extra
+            # customer setup) so a session's non-secret snapshot survives a Fargate
+            # task replacement (a redeploy) instead of being lost with /tmp. A
+            # reconnecting browser then resumes its workbench (Evaluation result,
+            # schema choices, CDC start point) rather than re-running Step 1. The
+            # snapshot is non-secret (Property 7); the stable StorageSecret below
+            # keeps the browser id (the snapshot key) constant across restarts so
+            # the persisted snapshot is found.
+            - Name: DSQL_MIGRATOR_SESSION_STATE_BUCKET
+              Value:
+                Fn::Sub: mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}
             - Name: DSQL_MIGRATOR_ACTIVITY_LOG_PATH
               Value: /tmp/migration_activity.log
             - Name: BEDROCK_MODEL_ID

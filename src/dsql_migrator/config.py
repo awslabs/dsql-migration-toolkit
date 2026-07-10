@@ -168,6 +168,18 @@ class AppConfig(BaseModel):
             "DSQL_MIGRATOR_SESSION_STATE_PATH."
         ),
     )
+    session_state_bucket: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional S3 bucket for a DURABLE per-session state store. When set "
+            "(the container deploy points it at the tool's managed plugin bucket), "
+            "each session's non-secret snapshot is written to S3, so a Fargate "
+            "task replacement (a redeploy) no longer loses the resume state -- "
+            "unlike session_state_path, which lives on the task's EPHEMERAL disk "
+            "and is wiped on replacement. When None, the local SQLite path is used "
+            "(local dev). Config key: DSQL_MIGRATOR_SESSION_STATE_BUCKET."
+        ),
+    )
     staging_bucket: Optional[str] = Field(
         default=None,
         description=(
@@ -345,6 +357,8 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> AppConfig:
         values["activity_log_path"] = activity_log_path
     if (session_state_path := _read(source, "SESSION_STATE_PATH")) is not None:
         values["session_state_path"] = session_state_path
+    if (session_state_bucket := _read(source, "SESSION_STATE_BUCKET")) is not None:
+        values["session_state_bucket"] = session_state_bucket
     if (staging_bucket := _read(source, "STAGING_BUCKET")) is not None:
         values["staging_bucket"] = staging_bucket
     if (cdc_deploy_role_arn := _read(source, "CDC_DEPLOY_ROLE_ARN")) is not None:

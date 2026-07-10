@@ -533,8 +533,13 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   범위 제한됨. 별도의 execution role이 ECR pull + 로그를 처리하고 컨테이너 시작 시 주입할 자동 생성
   세션 쿠키 시크릿만 읽음(범위 제한된 `secretsmanager:GetSecretValue`).
 - **자동 생성 세션 쿠키 시크릿**: 스택이 브라우저 세션 쿠키(`DSQL_MIGRATOR_STORAGE_SECRET`)를 서명하는
-  `AWS::SecretsManager::Secret`(운영자 입력 없음)을 생성해, 재연결한 브라우저가 태스크 재시작 간에도
-  워크벤치 상태를 재개. 쿠키만 서명 — DB/사용자 자격증명 아님 — 하고 템플릿에 평문으로 절대 없음.
+  `AWS::SecretsManager::Secret`(운영자 입력 없음)을 생성해, 재시작 간에도 브라우저 세션 id가 안정적으로
+  유지됨 — 아래의 durable 스냅샷을 찾는 키. 쿠키만 서명 — DB/사용자 자격증명 아님 — 하고 템플릿에 평문으로 절대 없음.
+- **Durable 세션 재개**: 각 세션의 비밀 아닌 워크벤치 스냅샷(워크플로 진행·평가 결과·스키마 선택·CDC 시작점)을
+  툴의 관리형 플러그인 버킷(`mysql-dsql-migrator-plugins-<account>-<region>`, 자동 프로비저닝 — 운영자 입력 없음)의
+  `sessions/` 프리픽스에 기록해, 인프로세스 재시작뿐 아니라 Fargate **태스크 교체**(재배포)까지 견딤. 위의 안정적
+  쿠키 시크릿과 함께, 재연결한 브라우저가 Step 1(Evaluation) 재실행 없이 워크벤치를 재개. 비밀 아님만(Property 7) —
+  소스 DB 비밀번호는 Connect 화면에서 다시 입력.
 - **감사 추적**: 구조화된 활동 로그(성공 + 실패 타임라인, UI에서 다운로드)는 비밀이 아닌 필드만 기록 —
   행 값, 비밀번호, IAM 토큰은 절대 없음. 태스크 임시 디스크에서 크기 제한·회전됨; 내구성 사본은
   CloudWatch 미러(**검증** 섹션)를 켜기.

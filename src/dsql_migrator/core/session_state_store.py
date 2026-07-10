@@ -22,11 +22,14 @@ the downstream screens are fully functional after a restore.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Protocol
+
+_LOGGER = logging.getLogger(__name__)
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -251,9 +254,186 @@ class SqliteSessionStateStore:
             self._conn.close()
 
 
+class S3SessionStateStore:
+    """An S3-backed :class:`SessionStateStore`: one JSON object per session.
+
+    Durable across a Fargate **task replacement** (unlike :class:`SqliteSessionStateStore`,
+    whose file lives on the task's EPHEMERAL disk and is lost on redeploy/restart),
+    so a reconnecting browser resumes its workbench even after a new image is
+    deployed. Stores only the non-secret :class:`SessionSnapshot` (Property 7 --
+    source credentials are never in it). Reuses the tool's managed plugin bucket
+    (deterministic per-account/region name, auto-provisioned), so it adds NO
+    customer setup -- the same "the tool provisions its own S3" convenience the
+    plugin/staging paths already use.
+
+    Best-effort by design: a transient S3 / permission error is logged and never
+    raised to the caller, so persistence degrades to "resume may not work" instead
+    of breaking the live migration UI (the in-process session still functions).
+    Concurrency: the control plane runs as a single task and boto3 clients are
+    thread-safe, so only the lazy client build + one-time bucket ensure are guarded.
+    """
+
+    def __init__(
+        self,
+        bucket: str,
+        *,
+        region: Optional[str] = None,
+        aws_profile: Optional[str] = None,
+        prefix: str = "sessions/",
+        s3_client: object = None,
+    ) -> None:
+        self._bucket = bucket
+        self._region = region
+        self._aws_profile = aws_profile
+        self._prefix = prefix if prefix.endswith("/") else prefix + "/"
+        self._lock = threading.Lock()
+        self._client = s3_client  # injected in tests; else built lazily
+        self._ensured = False
+
+    # -- internals --------------------------------------------------------- #
+    def _s3(self):
+        """Return the boto3 S3 client, building it lazily (benign build race)."""
+        client = self._client
+        if client is None:
+            import boto3
+
+            session = (
+                boto3.Session(profile_name=self._aws_profile)
+                if self._aws_profile
+                else boto3.Session()
+            )
+            client = session.client("s3", region_name=self._region)
+            self._client = client
+        return client
+
+    def _key(self, session_id: str) -> str:
+        return f"{self._prefix}{session_id}.json"
+
+    def _session_id_from_key(self, key: str) -> Optional[str]:
+        if key.startswith(self._prefix) and key.endswith(".json"):
+            return key[len(self._prefix) : -len(".json")]
+        return None
+
+    def _ensure_bucket(self) -> None:
+        """Create the bucket if absent (idempotent). Caller must hold ``_lock``."""
+        if self._ensured:
+            return
+        client = self._s3()
+        try:
+            client.head_bucket(Bucket=self._bucket)
+            self._ensured = True
+            return
+        except Exception:  # noqa: BLE001 - not found / no access; try to create
+            pass
+        try:
+            if self._region and self._region != "us-east-1":
+                client.create_bucket(
+                    Bucket=self._bucket,
+                    CreateBucketConfiguration={"LocationConstraint": self._region},
+                )
+            else:
+                client.create_bucket(Bucket=self._bucket)
+        except Exception as exc:  # noqa: BLE001
+            if "BucketAlreadyOwnedByYou" not in str(exc):
+                raise
+        self._ensured = True
+
+    @staticmethod
+    def _is_absent(exc: Exception) -> bool:
+        """True when an S3 error means the object/bucket simply does not exist."""
+        code = ""
+        response = getattr(exc, "response", None)
+        if isinstance(response, dict):
+            code = str(response.get("Error", {}).get("Code", ""))
+        blob = f"{code} {exc}"
+        return any(
+            marker in blob
+            for marker in ("NoSuchKey", "NoSuchBucket", "404", "Not Found")
+        )
+
+    # -- SessionStateStore protocol --------------------------------------- #
+    def save(self, snapshot: SessionSnapshot) -> None:
+        payload = snapshot.model_dump_json()
+        try:
+            with self._lock:
+                self._ensure_bucket()
+            self._s3().put_object(
+                Bucket=self._bucket,
+                Key=self._key(snapshot.session_id),
+                Body=payload.encode("utf-8"),
+                ContentType="application/json",
+            )
+        except Exception:  # noqa: BLE001 - best-effort; must never break the UI
+            _LOGGER.warning(
+                "Could not persist session %s to s3://%s (resume may not work "
+                "after a restart)",
+                snapshot.session_id,
+                self._bucket,
+                exc_info=True,
+            )
+
+    def load(self, session_id: str) -> Optional[SessionSnapshot]:
+        try:
+            obj = self._s3().get_object(Bucket=self._bucket, Key=self._key(session_id))
+            payload = obj["Body"].read().decode("utf-8")
+        except Exception as exc:  # noqa: BLE001
+            if not self._is_absent(exc):
+                _LOGGER.warning(
+                    "Could not read session %s from s3://%s",
+                    session_id,
+                    self._bucket,
+                    exc_info=True,
+                )
+            return None
+        try:
+            return SessionSnapshot.model_validate_json(payload)
+        except Exception:  # noqa: BLE001 - corrupt / incompatible snapshot
+            _LOGGER.warning("Ignoring unreadable session snapshot %s", session_id)
+            return None
+
+    def delete(self, session_id: str) -> None:
+        try:
+            self._s3().delete_object(Bucket=self._bucket, Key=self._key(session_id))
+        except Exception:  # noqa: BLE001 - best-effort
+            _LOGGER.warning(
+                "Could not delete session %s from s3://%s",
+                session_id,
+                self._bucket,
+                exc_info=True,
+            )
+
+    def prune(self, keep_most_recent: int) -> list[str]:
+        try:
+            with self._lock:
+                self._ensure_bucket()
+            client = self._s3()
+            objects: list[tuple[str, datetime]] = []
+            epoch = datetime.min.replace(tzinfo=timezone.utc)
+            paginator = client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self._bucket, Prefix=self._prefix):
+                for obj in page.get("Contents", []):
+                    objects.append((obj["Key"], obj.get("LastModified") or epoch))
+            # Newest first; keep the most-recent N, delete the older remainder.
+            objects.sort(key=lambda kv: kv[1], reverse=True)
+            keep = max(keep_most_recent, 0)
+            deleted: list[str] = []
+            for key, _ in objects[keep:]:
+                client.delete_object(Bucket=self._bucket, Key=key)
+                session_id = self._session_id_from_key(key)
+                if session_id is not None:
+                    deleted.append(session_id)
+            return deleted
+        except Exception:  # noqa: BLE001 - best-effort; skip pruning on error
+            _LOGGER.warning(
+                "Could not prune sessions in s3://%s", self._bucket, exc_info=True
+            )
+            return []
+
+
 __all__ = [
     "SessionSnapshot",
     "SessionStateStore",
     "InMemorySessionStateStore",
     "SqliteSessionStateStore",
+    "S3SessionStateStore",
 ]

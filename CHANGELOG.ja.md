@@ -5,6 +5,23 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.93
+
+### Added
+
+- **再デプロイを越えて保持される durable なセッション再開(S3 ベースのセッションストア)。** 再接続した
+  ブラウザが、セッションごとのワークベンチ(ワークフロー進捗・Step-1 Evaluation 結果・Schema Conversion
+  の選択・CDC 開始点/アタッチしたスタック)を Evaluation の再実行なしに再開します。このスナップショットは
+  従来コンテナの**エフェメラル**ディスク上のローカル SQLite ファイルにあったため、Fargate の**タスク置換**
+  (あらゆる再デプロイ)で消え、デプロイのたびに Evaluation をやり直す必要がありました。新しい
+  `S3SessionStateStore`(既存の `SessionStateStore` プロトコル実装)が、各非機密スナップショットをツール管理の
+  プラグインバケット(`mysql-dsql-migrator-plugins-<account>-<region>`、自動プロビジョニング — 新しい
+  パラメータや顧客設定は不要)の `sessions/` プレフィックスに書き込むため、再デプロイを越えて保持されます。
+  Fargate デプロイでは新しい `DSQL_MIGRATOR_SESSION_STATE_BUCKET`(テンプレートが管理バケットを指定)で
+  自動選択され、ローカル開発は SQLite パスのまま。非機密の状態のみ保存(Property 7 — ソース DB パスワードは
+  Connect で再入力);永続化はベストエフォート(一時的な S3 エラーはログのみ・UI を壊さない)。タスクロールに
+  セッション削除/prune 用の `s3:DeleteObject` を追加。
+
 ## v0.1.92
 
 ### Fixed

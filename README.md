@@ -235,7 +235,8 @@ sidebar's **Performance tuning** control (no redeploy; resets on restart).
 | `DSQL_MIGRATOR_AWS_PROFILE` | _(unset)_ | Optional global AWS named profile; falls back to the standard chain. Only the (non-secret) name is stored. |
 | `DSQL_MIGRATOR_JOB_STATE_PATH` | `job_state.sqlite` | Full Load job snapshots (status, per-table progress, watermark) for resume after restart. |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_PATH` | `migration_activity.log` | Structured activity log (one UTC-timestamped JSON line per event); downloadable from the UI, size-capped/rotated (~20 MB × 4 backups). |
-| `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | Per-session non-secret workbench state so a reconnecting browser resumes. Pair with `DSQL_MIGRATOR_STORAGE_SECRET`. |
+| `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | Per-session non-secret workbench state so a reconnecting browser resumes. Pair with `DSQL_MIGRATOR_STORAGE_SECRET`. Local disk — the Fargate deploy uses the durable S3 store below instead. |
+| `DSQL_MIGRATOR_SESSION_STATE_BUCKET` | _(unset)_ | Durable S3 store for the per-session snapshot, so resume survives a Fargate task replacement (a redeploy), not just an in-task restart. The Fargate deploy auto-sets it to the managed plugin bucket (no setup); leave unset locally to use the SQLite path above. |
 | `DSQL_MIGRATOR_STAGING_BUCKET` | _(unset)_ | S3 bucket for Full Load staging (streaming multipart upload — the scalable path for large tables). Unset = bounded local temp CSV (dev / small tables). |
 | `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4` (≤16) | Tables loaded concurrently. Keep total DSQL connections within the cluster quota. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | In-flight `INSERT … ON CONFLICT` batches per table. Higher = more throughput but more OCC (40001) collisions. |

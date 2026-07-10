@@ -578,9 +578,19 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   (scoped `secretsmanager:GetSecretValue`) to inject it at container start.
 - **Auto-generated session-cookie secret**: the stack creates an
   `AWS::SecretsManager::Secret` (no operator input) that signs the browser
-  session cookie (`DSQL_MIGRATOR_STORAGE_SECRET`), so a reconnecting browser
-  resumes its workbench state across task restarts. It signs the cookie only —
-  no DB/user credentials — and is never plaintext in the template.
+  session cookie (`DSQL_MIGRATOR_STORAGE_SECRET`), so the browser session id stays
+  stable across restarts — the key under which the durable snapshot (next bullet)
+  is found. It signs the cookie only — no DB/user credentials — and is never
+  plaintext in the template.
+- **Durable session resume**: each session's non-secret workbench snapshot
+  (workflow progress, Evaluation result, schema choices, CDC start point) is
+  written to the tool's managed plugin bucket
+  (`mysql-dsql-migrator-plugins-<account>-<region>`, auto-provisioned — no operator
+  input) under a `sessions/` prefix, so it survives a Fargate **task replacement**
+  (a redeploy), not just an in-task restart. Combined with the stable cookie secret
+  above, a reconnecting browser resumes its workbench instead of re-running Step 1
+  (Evaluation). Non-secret only (Property 7) — the source DB password is re-entered
+  on the Connect screen.
 - **Audit trail**: the structured activity log (success + failure timeline,
   downloadable from the UI) records non-secret fields only — never row values,
   passwords, or IAM tokens. It is size-capped and rotated on the task's

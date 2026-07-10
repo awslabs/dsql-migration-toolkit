@@ -800,9 +800,25 @@ def main() -> None:
     # session's non-secret workbench state so a reconnecting browser resumes
     # where it left off after a restart.
     global SESSION_STATE_STORE
-    from dsql_migrator.core.session_state_store import SqliteSessionStateStore
+    from dsql_migrator.core.session_state_store import (
+        S3SessionStateStore,
+        SqliteSessionStateStore,
+    )
 
-    SESSION_STATE_STORE = SqliteSessionStateStore(config.session_state_path)
+    # A DURABLE S3 store (when a bucket is configured -- the container deploy points
+    # DSQL_MIGRATOR_SESSION_STATE_BUCKET at the tool's managed plugin bucket)
+    # survives a Fargate task replacement, so a reconnecting browser resumes its
+    # workbench across a redeploy instead of re-running Evaluation. Local dev (no
+    # bucket) keeps the on-disk SQLite store. Both satisfy the SessionStateStore
+    # protocol, so the save/load/delete/prune call sites are unchanged.
+    if config.session_state_bucket:
+        SESSION_STATE_STORE = S3SessionStateStore(
+            config.session_state_bucket,
+            region=config.aws_region,
+            aws_profile=config.aws_profile,
+        )
+    else:
+        SESSION_STATE_STORE = SqliteSessionStateStore(config.session_state_path)
     SESSION_STATE_STORE.prune(_KEEP_SESSIONS)
 
     # Dev convenience: prefill the Connect form from the local .env / environment

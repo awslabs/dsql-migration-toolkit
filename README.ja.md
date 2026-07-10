@@ -228,7 +228,8 @@ Fargate では ECS タスク定義に設定します。Full Load / Validation �
 | `DSQL_MIGRATOR_AWS_PROFILE` | _(未設定)_ | 任意のグローバル AWS 名前付きプロファイル。未設定時は標準チェーンにフォールバック。プロファイル名（非機密）のみ保存。 |
 | `DSQL_MIGRATOR_JOB_STATE_PATH` | `job_state.sqlite` | Full Load ジョブのスナップショット（状態、テーブルごとの進捗、ウォーターマーク）— 再起動後の再開用。 |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_PATH` | `migration_activity.log` | 構造化アクティビティログ（イベントごとに UTC タイムスタンプ付きの JSON 1 行）。UI からダウンロード可、サイズ上限・ローテーション（約 20 MB × バックアップ 4 個）。 |
-| `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | セッションごとの非機密のワークベンチ状態 — 再接続したブラウザが再開。`DSQL_MIGRATOR_STORAGE_SECRET` と併用。 |
+| `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | セッションごとの非機密のワークベンチ状態 — 再接続したブラウザが再開。`DSQL_MIGRATOR_STORAGE_SECRET` と併用。ローカルディスク — Fargate デプロイは下記の durable な S3 ストアを使用。 |
+| `DSQL_MIGRATOR_SESSION_STATE_BUCKET` | _(未設定)_ | セッションスナップショット用の durable な S3 ストア — プロセス内再起動だけでなく Fargate のタスク置換（再デプロイ）を越えて再開が保持される。Fargate デプロイが管理対象プラグインバケットに自動設定（設定不要）;ローカルは未設定で上記 SQLite パスを使用。 |
 | `DSQL_MIGRATOR_STAGING_BUCKET` | _(未設定)_ | Full Load ステージング用の S3 バケット（ストリーミングのマルチパートアップロード — 大規模テーブル向けのスケーラブルな経路）。未設定時は上限付きローカル一時 CSV（開発 / 小規模）。 |
 | `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4`（≤16） | 並行してロードするテーブル数。DSQL への合計接続数をクラスターのクォータ内に収める。 |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8`（≤32） | テーブルあたりの処理中の `INSERT … ON CONFLICT` バッチ数。大きいほどスループット↑、OCC（40001）衝突↑。 |
