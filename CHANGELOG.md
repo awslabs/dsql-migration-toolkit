@@ -5,7 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
-## v0.1.87
+## v0.1.88
+
+### Added
+
+- **Existing CDC infrastructure is now surfaced on the Migration Plan, not only
+  deep in the CDC step.** The previous release added account-wide CDC discovery and
+  an "attach to existing" choice, but that affordance only rendered inside the
+  active CDC sub-step — which a session reset makes hard to reach (you must pass the
+  earlier steps first). Now, the moment the plan includes CDC, a banner beside the
+  migration-type choice names any existing `mysql-dsql-cdc-*` pipeline with an
+  **"Attach to &lt;stack&gt;"** action, so you adopt it right where you are —
+  without navigating to the CDC sub-step and hitting a duplicate-deploy risk. The
+  discovery already runs at plan time (it is gated on the plan including CDC); this
+  just surfaces its result where the user is. Attaching remains read/attach-only,
+  and deploying a deliberate second pipeline (a different stack-name suffix) is
+  still available from the CDC step — so this is a choice, never a hard block.
 
 ### Added
 

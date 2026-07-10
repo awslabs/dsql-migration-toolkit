@@ -4273,6 +4273,25 @@ def test_deploy_log_lines_show_utc_timezone() -> None:
     assert "05:12:03 UTC - Stack deletion submitted." in body
 
 
+def test_cdc_existing_infra_banner_surfaces_adoptable_stacks() -> None:
+    # Plan-level surfacing: when CDC infra already exists in the account (under a name
+    # this reset session does not target), the banner names it so the user can attach
+    # from the plan instead of navigating to the deep CDC substep. Nothing when none.
+    from dsql_migrator.ui.data_migration import _render_cdc_existing_infra_banner
+
+    state = DataMigrationState()
+    ui_empty = _RecordingUi()
+    _render_cdc_existing_infra_banner(ui_empty, state, lambda: None)
+    assert ui_empty.texts == []  # no other stacks -> renders nothing
+
+    state.set_cdc_other_stacks([("mysql-dsql-cdc-seoul-test", "UPDATE_COMPLETE")])
+    ui_found = _RecordingUi()
+    _render_cdc_existing_infra_banner(ui_found, state, lambda: None)
+    body = "\n".join(ui_found.texts)
+    assert "Existing CDC infrastructure found" in body
+    assert "mysql-dsql-cdc-seoul-test" in body
+
+
 def _completeness(
     *, total, settled, complete, failed, mismatched, unknown=0
 ):

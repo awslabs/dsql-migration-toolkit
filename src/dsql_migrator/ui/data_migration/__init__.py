@@ -602,6 +602,13 @@ def build_data_migration_screen(
                     migration_state, job_manager, status=status
                 ),
             )
+            # Plan-level CDC discovery surfacing: the moment the plan includes CDC,
+            # the discovery (armed below on has_cdc) populates cdc_other_stacks. Show
+            # any existing CDC infrastructure right here -- where the user selects the
+            # type -- so they can ATTACH instead of navigating to the deep CDC substep
+            # only to find a duplicate-deploy risk (a second, costly MSK cluster).
+            if "cdc" in substeps_for_type(migration_type):
+                _render_cdc_existing_infra_banner(ui, migration_state, refresh)
 
             with ui.row().classes("items-center gap-2"):
                 ui.label("Data Migration status:").classes(
@@ -1724,6 +1731,46 @@ def migration_type_lock_reason(migration_state, *, status) -> Optional[str]:
             "CDC infrastructure' on the CDC step first."
         )
     return None
+
+
+def _render_cdc_existing_infra_banner(ui, migration_state, refresh) -> None:
+    """Plan-level banner: existing CDC infrastructure was found in the account under a
+    name this (reset) session does not target -- offer to ATTACH here, next to the
+    migration-type choice, so the user need not reach the deep CDC substep to avoid a
+    duplicate deploy.
+
+    Driven by ``cdc_other_stacks`` (populated by the CDC discovery that runs whenever
+    the plan includes CDC), so it appears as soon as the user picks a CDC-inclusive
+    type. Renders nothing when no other stacks exist. Attaching is read/attach-only:
+    it points the session at the stack and forces a fresh probe, so a running pipeline
+    opens straight to its monitoring view in the CDC step; starting fresh stays the
+    explicit Stop/Delete path. Deploying a deliberate SECOND pipeline (a different
+    suffix) is still possible from the CDC step, so this surfaces a CHOICE, never a
+    hard block.
+    """
+    others = getattr(migration_state, "cdc_other_stacks", []) or []
+    if not others:
+        return
+    listed = ", ".join(f"{name} ({status})" for name, status in others)
+    _render_notice(
+        ui,
+        tone="warning",
+        header="Existing CDC infrastructure found",
+        body=(
+            f"This account already has CDC infrastructure: {listed}. Attach to it "
+            "instead of deploying a new one — a second Amazon MSK cluster is costly. "
+            "Attaching re-reads its live state; a running pipeline opens straight to "
+            "monitoring in the CDC step."
+        ),
+    )
+    with ui.row().classes("items-center gap-2 flex-wrap"):  # type: ignore[attr-defined]
+        for name, _status in others:
+            def _adopt(_name=name) -> None:
+                if migration_state.adopt_cdc_stack(_name):
+                    refresh()
+            ui.button(  # type: ignore[attr-defined]
+                f"Attach to {name}", on_click=_adopt, icon="link"
+            ).props("color=primary")
 
 
 def _render_migration_type_selector(
