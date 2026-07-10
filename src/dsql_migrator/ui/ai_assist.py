@@ -8,7 +8,7 @@ be unit tested directly:
 
 - building the per-session :class:`~dsql_migrator.core.models.AiAssistConfig`
   from the settings form (default disabled / opt-in, default model id
-  ``us.anthropic.claude-sonnet-4-6`` -- Requirements 11.1, 11.2, 11.3, 11.4),
+  ``global.anthropic.claude-sonnet-4-6`` -- Requirements 11.1, 11.2, 11.3, 11.4),
 - the injectable :class:`AiConversionAssistant` Protocol seam. The real
   Bedrock-backed assistant lands in Task 16; the UI depends only on this seam so
   it can be wired later without changing the screen,
@@ -44,7 +44,10 @@ AI_STATUS_REJECTED = "REJECTED"
 # as ``modelId`` to ``invoke_model``), not a display name. Sonnet 4.6 is the
 # general, cost-effective default; AI assist is opt-in and every suggestion
 # passes the human-review gate (Property 13) before it can touch the schema.
-DEFAULT_BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-6"
+# The ``global.`` (not ``us.``) cross-region-inference profile is used so the
+# default is reachable from any commercial region -- a ``us.*`` profile is
+# US-geography-scoped and fails InvokeModel in e.g. ap-northeast-2 (Seoul).
+DEFAULT_BEDROCK_MODEL_ID = "global.anthropic.claude-sonnet-4-6"
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +65,7 @@ def build_ai_assist_config(
 
     AI assist is opt-in: ``enabled`` defaults to ``False`` via the model and is
     coerced to ``bool`` here. A blank ``model_id`` falls back to the default
-    ``us.anthropic.claude-sonnet-4-6`` (``BEDROCK_MODEL_ID``); a blank ``region``
+    ``global.anthropic.claude-sonnet-4-6`` (``BEDROCK_MODEL_ID``); a blank ``region``
     becomes ``None`` so the model's default applies (``BEDROCK_REGION``).
     """
     cleaned_model = (model_id or "").strip()

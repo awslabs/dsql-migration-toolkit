@@ -1081,10 +1081,10 @@ def build_connect_page(
                 ai_model = ui.input(
                     "Model ID (BEDROCK_MODEL_ID)",
                     value=state.ai_assist.model_id,
-                    placeholder="us.anthropic.claude-sonnet-4-6",
+                    placeholder="global.anthropic.claude-sonnet-4-6",
                 ).props(
                     "hint=\"Use the exact model / inference-profile ID, not the "
-                    "display name (e.g. us.anthropic.claude-sonnet-4-6).\""
+                    "display name (e.g. global.anthropic.claude-sonnet-4-6).\""
                 ).classes("w-full")
                 ai_region = ui.input(
                     "Region (BEDROCK_REGION, optional)",

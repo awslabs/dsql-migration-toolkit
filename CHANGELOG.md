@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.83
+
+### Fixed
+
+- **AI assist works outside US regions: the default Bedrock model is now a
+  region-agnostic `global.*` profile.** The code-level default model id was
+  `us.anthropic.claude-sonnet-4-6`, a US-geography cross-region-inference profile
+  that `InvokeModel` rejects from a non-US region. An operator deploying in, e.g.,
+  ap-northeast-2 (Seoul) who enabled AI assist and left the model id blank (the
+  natural path) got a failure. The default is now
+  `global.anthropic.claude-sonnet-4-6` (reachable from any commercial region),
+  matching the CloudFormation template's own recommendation. Set `BEDROCK_MODEL_ID`
+  to override. (Found by a region-portability audit; the deploy templates, region
+  derivation, STS/token region, and S3 endpoint/LocationConstraint handling were
+  all already region-correct — only this code default was US-locked.)
+
 ## v0.1.82
 
 ### Fixed

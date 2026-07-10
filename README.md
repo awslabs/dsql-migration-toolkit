@@ -246,7 +246,7 @@ sidebar's **Performance tuning** control (no redeploy; resets on restart).
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4` (≤32) | Tables compared concurrently in Validation. `1` = sequential. |
 | `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | Startup log level; `DEBUG` adds a stacktrace (call stack only) to failure events. Also changeable at runtime via **Diagnostics**. |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | Mirror activity-log events to stdout (→ CloudWatch on ECS). Also toggleable at runtime via **Diagnostics**. |
-| `BEDROCK_MODEL_ID` | `us.anthropic.claude-sonnet-4-6` | Bedrock model / inference-profile id for AI assist. |
+| `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | Bedrock model / inference-profile id for AI assist. The `global.*` profile is reachable from any commercial region; a `us.*` profile is US-only. |
 | `BEDROCK_REGION` | _(unset)_ | Region for Amazon Bedrock calls. |
 
 AI assist is off by default and enabled in the UI, which also offers a **Verify AI

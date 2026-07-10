@@ -239,7 +239,7 @@ Fargate では ECS タスク定義に設定します。Full Load / Validation �
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4`（≤32） | Validation で並行して比較するテーブル数。`1` = 逐次。 |
 | `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | 起動時のログレベル。`DEBUG` は失敗イベントに stacktrace（コールスタックのみ）を追加。実行時に **Diagnostics** からも変更可。 |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | アクティビティログイベントを標準出力にもミラーリング（ECS では → CloudWatch）。実行時に **Diagnostics** から切り替え可。 |
-| `BEDROCK_MODEL_ID` | `us.anthropic.claude-sonnet-4-6` | AI アシスト用の Bedrock モデル / 推論プロファイル ID。 |
+| `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | AI アシスト用の Bedrock モデル / 推論プロファイル ID。`global.*` プロファイルは全ての商用リージョンから呼び出せます（`us.*` は米国専用）。 |
 | `BEDROCK_REGION` | _(未設定)_ | Amazon Bedrock 呼び出し用のリージョン。 |
 
 AI アシストは既定でオフで、UI でオンにします。UI は Bedrock の到達可能性をチェックし、実行可能な

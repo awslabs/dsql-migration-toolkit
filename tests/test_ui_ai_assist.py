@@ -7,7 +7,7 @@ These cover the parts of the Step 2 AI-assist integration that do not touch
 NiceGUI:
 
 - Building :class:`AiAssistConfig` from the settings form: opt-in default
-  (disabled) and default model id ``us.anthropic.claude-sonnet-4-6`` (Requirements 11.1-11.4).
+  (disabled) and default model id ``global.anthropic.claude-sonnet-4-6`` (Requirements 11.1-11.4).
 - Per-session AI config state isolation (Requirement 9.2 pattern).
 - Suggestion review status transitions (edit / approve / reject) and the
   invariant that editing revokes any prior approval.
@@ -69,7 +69,7 @@ def _suggestion(
         kind=kind,  # type: ignore[arg-type]
         suggested_sql_or_expr=sql,
         rationale="example",
-        model_id="us.anthropic.claude-sonnet-4-6",
+        model_id="global.anthropic.claude-sonnet-4-6",
         status=status,  # type: ignore[arg-type]
         approved_by_user=approved,
     )
@@ -83,8 +83,21 @@ def _suggestion(
 def test_ai_assist_config_defaults_disabled_and_default_model() -> None:
     config = AiAssistConfig()
     assert config.enabled is False
-    assert config.model_id == "us.anthropic.claude-sonnet-4-6"
+    assert config.model_id == "global.anthropic.claude-sonnet-4-6"
     assert config.region is None
+
+
+def test_default_model_is_region_agnostic_global_profile() -> None:
+    # Regression (region portability): the default MUST be a `global.*`
+    # cross-region-inference profile so AI assist works in any commercial region.
+    # A `us.*` profile is US-geography-scoped and fails InvokeModel in e.g.
+    # ap-northeast-2 (Seoul) when the operator leaves the model id blank.
+    from dsql_migrator.ui.ai_assist import DEFAULT_BEDROCK_MODEL_ID
+
+    assert DEFAULT_BEDROCK_MODEL_ID.startswith("global.")
+    assert not DEFAULT_BEDROCK_MODEL_ID.startswith("us.")
+    # The model-level default and the UI-level default must not drift apart.
+    assert AiAssistConfig().model_id == DEFAULT_BEDROCK_MODEL_ID
 
 
 def test_ai_conversion_suggestion_defaults_pending_and_unapproved() -> None:
@@ -130,7 +143,7 @@ def test_session_ai_assist_defaults_disabled() -> None:
     store = SessionStore()
     state = store.get_or_create("session-a")
     assert state.ai_assist.enabled is False
-    assert state.ai_assist.model_id == "us.anthropic.claude-sonnet-4-6"
+    assert state.ai_assist.model_id == "global.anthropic.claude-sonnet-4-6"
 
 
 def test_session_ai_assist_is_isolated_per_session() -> None:
@@ -144,7 +157,7 @@ def test_session_ai_assist_is_isolated_per_session() -> None:
     assert a.ai_assist.model_id == "model-x"
     # Session B is unaffected and keeps the opt-in default.
     assert b.ai_assist.enabled is False
-    assert b.ai_assist.model_id == "us.anthropic.claude-sonnet-4-6"
+    assert b.ai_assist.model_id == "global.anthropic.claude-sonnet-4-6"
 
 
 def test_session_clear_resets_ai_assist_to_default() -> None:
@@ -155,7 +168,7 @@ def test_session_clear_resets_ai_assist_to_default() -> None:
     state.clear()
 
     assert state.ai_assist.enabled is False
-    assert state.ai_assist.model_id == "us.anthropic.claude-sonnet-4-6"
+    assert state.ai_assist.model_id == "global.anthropic.claude-sonnet-4-6"
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +377,7 @@ def _access_result(
     ok: bool,
     reason: str,
     detail: str = "actionable next step",
-    model_id: str = "us.anthropic.claude-sonnet-4-6",
+    model_id: str = "global.anthropic.claude-sonnet-4-6",
     region: str | None = "us-east-1",
 ) -> AiAccessCheckResult:
     return AiAccessCheckResult(

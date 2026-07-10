@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.83
+
+### 수정 (Fixed)
+
+- **미국 외 리전에서도 AI 어시스트 동작: 기본 Bedrock 모델을 리전 무관 `global.*` 프로파일로 변경.**
+  코드 기본 모델 id가 `us.anthropic.claude-sonnet-4-6`(미국 geo 전용 교차리전 추론 프로파일)이라
+  비-미국 리전에서 `InvokeModel`이 거부했다. 예로 ap-northeast-2(서울)에 배포하고 AI 어시스트를
+  켠 뒤 모델 id를 비워두면(자연스러운 경로) 실패했다. 이제 기본값은
+  `global.anthropic.claude-sonnet-4-6`(모든 상용 리전에서 호출 가능)로, CloudFormation 템플릿의
+  권장과 일치한다. `BEDROCK_MODEL_ID`로 재정의 가능. (리전 이식성 감사로 발견 — 배포 템플릿·리전
+  파싱·STS/토큰 리전·S3 엔드포인트/LocationConstraint는 이미 리전-정상이었고, 이 코드 기본값만
+  미국 고정이었음.)
+
 ## v0.1.82
 
 ### 수정 (Fixed)

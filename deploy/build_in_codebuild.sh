@@ -55,7 +55,8 @@ echo "==> Packaging source"
 TMPZIP="$(mktemp -t mysql-dsql-migrator-source-XXXXXX).zip"
 trap 'rm -f "${TMPZIP}"' EXIT
 ( cd "${REPO_ROOT}" && zip -r -q -X "${TMPZIP}" . \
-    -x '.git/*' '.venv/*' '*/__pycache__/*' '*.pyc' '.pytest_cache/*' '*.sqlite' '*.log' )
+    -x '.git/*' '.venv/*' '*/__pycache__/*' '*.pyc' '.pytest_cache/*' '*.sqlite' '*.log' \
+       '.env' '.env.*' '*.pem' )
 
 echo "==> Uploading source to s3://${BUCKET}/source.zip"
 aws s3 cp "${TMPZIP}" "s3://${BUCKET}/source.zip" --region "${REGION}" >/dev/null
