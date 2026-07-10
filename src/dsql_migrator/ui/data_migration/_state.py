@@ -164,6 +164,11 @@ class DataMigrationState:
         self.cdc_action_kind: Optional[str] = None  # "infra"|"start"|"stop"|"delete"
         self.cdc_stack_name: str = CDC_DEFAULT_STACK_NAME
         self._cdc_deploy_log: list[tuple[datetime, str]] = []
+        # UI-only: remembered open/closed state of the "Deploy log" expansion.
+        # Anchored on the (session-scoped) state -- NOT a local of the render fn --
+        # so the whole CDC panel's ~5s live-poll rebuild does not snap a log the
+        # user opened shut. ``_render_deploy_log`` reads/writes ``["open"]``.
+        self.cdc_deploy_log_ui_state: dict = {"open": False}
         # BYO-VPC infrastructure inputs the customer enters in the Deploy-infra
         # form (VpcId, subnets, plugin S3 keys, source host/secret, DsqlClusterArn,
         # …). Filled values only; pre-seeded from the target/source config where

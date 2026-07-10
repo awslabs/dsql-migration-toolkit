@@ -2561,11 +2561,12 @@ def _render_cdc_deploy_live(ui, migration_state, job_manager, refresh) -> None:
     stack phase and triggers a full ``refresh`` so the card flips to the next
     action (e.g. infra-deploy DONE → Start button appears).
     """
-    # The deploy log expansion is rebuilt on every 5s poll (it lives inside the
-    # refreshable region). Hoist its open/closed state here -- outside the
-    # refreshable -- so a user who expands it stays expanded across polls instead
-    # of having it snap shut every refresh.
-    log_state = {"open": False}
+    # The deploy log expansion is rebuilt on every 5s poll -- both by the inner
+    # refreshable AND by the OUTER CDC panel poll (``_poll_cdc``), which re-invokes
+    # this whole function. A local dict would be recreated on that outer rebuild and
+    # snap an opened log shut every few seconds, so anchor the open/closed state on
+    # the session-scoped migration state (survives every level of re-render).
+    log_state = migration_state.cdc_deploy_log_ui_state
 
     @ui.refreshable
     def _deploy_live() -> None:  # type: ignore[misc]

@@ -4273,6 +4273,53 @@ def test_deploy_log_lines_show_utc_timezone() -> None:
     assert "05:12:03 UTC - Stack deletion submitted." in body
 
 
+class _ExpansionCapturingUi(_RecordingUi):
+    """Records the ui.expansion(value=, on_value_change=) so a test can assert the
+    remembered open-state is applied and user toggles are written back."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.expansion_value = None
+        self.on_value_change = None
+
+    def expansion(self, *_a, value=None, on_value_change=None, **_k):
+        self.expansion_value = value
+        self.on_value_change = on_value_change
+        return self._El()
+
+
+def test_deploy_log_expansion_opens_to_remembered_state_and_writes_back() -> None:
+    # The expansion must open to the caller-remembered state (not the default
+    # collapsed) and write user toggles back into that same dict, so the CDC
+    # panel's 5s poll rebuild does not snap an opened log shut.
+    from datetime import datetime, timezone
+
+    from dsql_migrator.ui.data_migration import _render_deploy_log
+
+    lines = [(datetime(2026, 7, 3, 5, 12, 3, tzinfo=timezone.utc), "line")]
+    log_state = {"open": True}
+    ui = _ExpansionCapturingUi()
+    _render_deploy_log(ui, lines, log_state)
+    assert ui.expansion_value is True  # opened to remembered state
+
+    class _Ev:  # on_value_change receives an event carrying the new value
+        value = False
+
+    ui.on_value_change(_Ev())
+    assert log_state["open"] is False  # user collapse persisted to the dict
+
+
+def test_cdc_deploy_log_ui_state_persists_on_migration_state() -> None:
+    # The deploy-log open/closed flag lives on the session-scoped migration state
+    # (a stable, mutable dict) -- NOT a local of the render function -- so a full
+    # CDC-panel re-render cannot recreate it and reset the log to collapsed.
+    state = DataMigrationState()
+    assert state.cdc_deploy_log_ui_state == {"open": False}
+    ref = state.cdc_deploy_log_ui_state
+    ref["open"] = True
+    assert state.cdc_deploy_log_ui_state["open"] is True  # same object, mutation sticks
+
+
 def test_cdc_existing_infra_banner_surfaces_adoptable_stacks() -> None:
     # Plan-level surfacing: when CDC infra already exists in the account (under a name
     # this reset session does not target), the banner names it so the user can attach

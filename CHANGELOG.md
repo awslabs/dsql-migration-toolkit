@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.91
+
+### Fixed
+
+- **The CDC "Deploy log" no longer snaps shut every few seconds while a
+  lifecycle job runs.** The live CDC panel re-renders on a ~5s poll to stream
+  new deploy-log lines and connector status. The "Deploy log" expansion's
+  open/closed state was held in a local variable of the panel's render function,
+  so each full re-render recreated it as collapsed — a log the operator expanded
+  to watch a Start/Stop/Deploy would close itself a few seconds later. The
+  open/closed state now lives on the session-scoped migration state, so it
+  survives every level of re-render (both the inner refreshable and the outer
+  panel poll) and stays open until the operator closes it.
+
 ## v0.1.90
 
 ### Fixed
