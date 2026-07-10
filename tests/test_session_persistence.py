@@ -255,6 +255,21 @@ def test_s3_session_store_save_is_best_effort_on_error() -> None:
     assert store.load("s1") is None
 
 
+def test_s3_session_store_save_swallows_serialization_error() -> None:
+    # Even a failure to SERIALIZE the snapshot must not escape save() (the store's
+    # "never raised to the caller" contract): serialization is guarded inside the try.
+    class _BoomSnapshot:
+        session_id = "s1"
+
+        def model_dump_json(self) -> str:
+            raise ValueError("cannot serialize")
+
+    fake = _FakeS3(buckets=("b",))
+    store = S3SessionStateStore("b", s3_client=fake)
+    store.save(_BoomSnapshot())  # must NOT raise
+    assert store.load("s1") is None  # nothing was written
+
+
 def test_config_reads_session_state_bucket_env() -> None:
     from dsql_migrator.config import load_config
 

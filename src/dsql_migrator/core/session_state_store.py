@@ -353,8 +353,12 @@ class S3SessionStateStore:
 
     # -- SessionStateStore protocol --------------------------------------- #
     def save(self, snapshot: SessionSnapshot) -> None:
-        payload = snapshot.model_dump_json()
         try:
+            # Serialize INSIDE the guard: SessionSnapshot has no validate_assignment,
+            # so a caller that set a field post-construction could (in theory) make
+            # model_dump_json raise -- and this store's contract is that save() never
+            # raises to the caller (persistence is best-effort; the UI must not break).
+            payload = snapshot.model_dump_json()
             with self._lock:
                 self._ensure_bucket()
             self._s3().put_object(

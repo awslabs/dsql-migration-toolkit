@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.95
+
+### Fixed
+
+- **Hardened the S3 session store so a snapshot serialization error can't break the
+  UI.** In `S3SessionStateStore.save()` the `model_dump_json()` serialization ran
+  just outside the `try`/`except` that guarantees the store never raises to its
+  caller, so a (dormant, but possible) serialization failure could escape and break
+  the live UI request that persists session state. Moved the serialization inside
+  the guard so `save()` honors its best-effort contract in all cases — no behavior
+  change on the normal path. (Surfaced by the v0.1.93 change's own adversarial
+  review.)
+
 ## v0.1.94
 
 ### Fixed
