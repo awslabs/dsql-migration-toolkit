@@ -91,6 +91,11 @@ from dsql_migrator.ui.schema_conversion import (
     composite_leading_from_ddl,
     default_composite_leading,
 )
+from dsql_migrator.ui.schema_conversion import (
+    CDC_APPLY_BLOCK_BODY,
+    CDC_APPLY_BLOCK_HEADER,
+    _cdc_apply_is_blocked,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1908,3 +1913,43 @@ def test_inventory_existence_checker_handles_empty_inventory() -> None:
 
     checker = _InventoryExistenceChecker(_Inv())
     assert checker.object_exists("anything") is False
+
+
+# ---------------------------------------------------------------------------
+# CDC-live apply block (Step 2 must not apply schema while CDC is streaming)
+# ---------------------------------------------------------------------------
+
+
+def test_cdc_apply_is_blocked_none_probe_is_not_blocked() -> None:
+    # No probe wired (tests / data-migration state not connected): apply is free.
+    assert _cdc_apply_is_blocked(None) is False
+
+
+def test_cdc_apply_is_blocked_reflects_probe_result() -> None:
+    assert _cdc_apply_is_blocked(lambda: True) is True
+    assert _cdc_apply_is_blocked(lambda: False) is False
+
+
+def test_cdc_apply_is_blocked_coerces_truthy_to_bool() -> None:
+    # A truthy/falsey non-bool probe result is normalised to a real bool.
+    assert _cdc_apply_is_blocked(lambda: "streaming") is True
+    assert _cdc_apply_is_blocked(lambda: 0) is False
+
+
+def test_cdc_apply_is_blocked_swallows_probe_errors() -> None:
+    # A status probe must never break the page: a raising probe reads as "not
+    # blocked" so the UI stays usable rather than erroring on render.
+    def _boom() -> bool:
+        raise RuntimeError("status read failed")
+
+    assert _cdc_apply_is_blocked(_boom) is False
+
+
+def test_cdc_apply_block_message_is_actionable() -> None:
+    # The single-sourced block message points to the two real paths forward
+    # (Skip to continue, or stop CDC in Data Migration to change the schema) and
+    # explains why applying now is unsafe (DDL is not replicated).
+    assert "Skip conversion & continue" in CDC_APPLY_BLOCK_BODY
+    assert "Data Migration" in CDC_APPLY_BLOCK_BODY
+    assert "DDL is not replicated" in CDC_APPLY_BLOCK_BODY
+    assert "CDC is streaming to the target" in CDC_APPLY_BLOCK_HEADER

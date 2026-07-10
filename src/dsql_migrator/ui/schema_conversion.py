@@ -1944,6 +1944,38 @@ def _default_ai_assistant_factory(
     return _BedrockAssistant(config, client=client)
 
 
+# When a live CDC pipeline is streaming into the target, applying schema
+# conversion is blocked (the sink is actively writing the target tables and
+# Debezium does not propagate DDL, so a REPLACE would drop/corrupt what CDC is
+# replicating). The message is single-sourced here so the persistent notice on
+# the page and the on-Apply toast say the same thing and stay in sync.
+CDC_APPLY_BLOCK_HEADER = "CDC is streaming to the target — the schema is already applied"
+CDC_APPLY_BLOCK_BODY = (
+    "A CDC pipeline is replicating live changes into the target right now, so "
+    "its tables already exist. Applying conversion here — especially a REPLACE, "
+    "which drops and recreates tables — would corrupt or truncate what the sink "
+    "is writing (DDL is not replicated). Nothing needs converting: use \"Skip "
+    "conversion & continue\" below to proceed. To change the schema, stop CDC "
+    "in Data Migration first, then return here to apply."
+)
+
+
+def _cdc_apply_is_blocked(cdc_active_check: Optional[Callable[[], bool]]) -> bool:
+    """Best-effort: True when a live CDC pipeline must block applying schema.
+
+    Wraps the injected ``cdc_active_check`` probe so a status read can never
+    break the UI: returns ``False`` when no probe is wired (tests / when the
+    data-migration state is not connected) and ``False`` if the probe raises.
+    Shared by the persistent page notice and the on-Apply toast so both agree.
+    """
+    if cdc_active_check is None:
+        return False
+    try:
+        return bool(cdc_active_check())
+    except Exception:  # noqa: BLE001 - a status probe must never break the page
+        return False
+
+
 def build_schema_conversion_screen(
     store: SessionStore,
     session_id: str,
@@ -2274,19 +2306,21 @@ def build_schema_conversion_screen(
         Debezium does not propagate DDL. Applying schema now -- especially a
         destructive REPLACE, which DROPs and recreates the table -- would corrupt
         or truncate what CDC is replicating (data loss / broken pipeline). So while
-        CDC is live, block Apply and tell the operator to stop CDC first. Guarded by
-        the injected ``cdc_active_check`` (best-effort; absent in tests / when the
-        data-migration state is not wired, in which case apply is unaffected).
+        CDC is live, block Apply and tell the operator what to do instead. Guarded
+        by the injected ``cdc_active_check`` (best-effort; absent in tests / when
+        the data-migration state is not wired, in which case apply is unaffected).
+        The page already carries the persistent warning notice with the same
+        guidance; this toast is the on-click echo for the operator who clicks Apply
+        anyway, and it points to the two actionable paths (Skip / stop CDC).
         """
-        try:
-            active = cdc_active_check is not None and cdc_active_check()
-        except Exception:  # noqa: BLE001 - never let a status probe block the UI
-            active = False
+        active = _cdc_apply_is_blocked(cdc_active_check)
         if active:
             ui.notify(  # type: ignore[attr-defined]
-                "CDC is running — applying schema now could drop or corrupt tables "
-                "the sink is writing (DDL is not replicated). Stop CDC first, then "
-                "apply schema changes.",
+                "CDC is streaming to the target — the schema is already applied. "
+                "Applying it again could drop or corrupt the tables the sink is "
+                "writing (DDL is not replicated). Use \"Skip conversion & "
+                "continue\" to proceed, or stop CDC in Data Migration first to "
+                "change the schema.",
                 type="warning", position="top", timeout=8000,
             )
         return active
@@ -2597,18 +2631,35 @@ def build_schema_conversion_screen(
                 else:
                     refresh()
 
+            # When CDC is already streaming into the target, applying conversion is
+            # blocked (the sink is writing the tables; DDL is not replicated). Make
+            # the block a persistent, actionable notice at the top of the step --
+            # not just the on-Apply toast -- because Data Migration (where CDC is
+            # stopped) is prerequisite-locked behind this step, so the only path
+            # forward is to Skip (the schema is already applied), which both
+            # continues and unlocks Data Migration to stop CDC there if needed.
+            cdc_active = _cdc_apply_is_blocked(cdc_active_check)
             with ui.card().classes("w-full"):
-                render_notice(
-                    ui,
-                    tone="info",
-                    header="Schema already prepared?",
-                    body=(
-                        "If the target tables already exist (conversion applied "
-                        "earlier or out of band), skip this step to unlock Data "
-                        "Migration. Data Migration loads only the tables that have "
-                        "a target table, so not every source table needs to exist."
-                    ),
-                )
+                if cdc_active:
+                    render_notice(
+                        ui,
+                        tone="warning",
+                        header=CDC_APPLY_BLOCK_HEADER,
+                        body=CDC_APPLY_BLOCK_BODY,
+                    )
+                else:
+                    render_notice(
+                        ui,
+                        tone="info",
+                        header="Schema already prepared?",
+                        body=(
+                            "If the target tables already exist (conversion applied "
+                            "earlier or out of band), skip this step to unlock Data "
+                            "Migration. Data Migration loads only the tables that "
+                            "have a target table, so not every source table needs "
+                            "to exist."
+                        ),
+                    )
                 ui.button(
                     "Skip conversion & continue to Data Migration",
                     on_click=skip_schema_conversion,

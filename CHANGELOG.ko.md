@@ -5,6 +5,24 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.90
+
+### 수정 (Fixed)
+
+- **Schema Conversion 단계의 "CDC 실행 중이라 스키마 적용 불가" 차단이 이제 막다른 길이
+  아니라 실행 가능한 안내로 바뀌었습니다.** CDC 파이프라인이 이미 타깃으로 스트리밍 중이면
+  스키마 변환 적용은 (정상적으로) 차단됩니다 — 싱크가 해당 테이블에 쓰고 있고 DDL은 복제되지
+  않으므로, REPLACE는 그 테이블을 drop하거나 손상시킬 수 있기 때문입니다. 이전에는 이 안내가
+  Apply를 눌렀을 때 잠깐 뜨는 토스트로만 나타나 "먼저 CDC를 중지하라"고만 했는데, CDC를 중지할
+  수 있는 유일한 곳인 Data Migration은 Schema Conversion을 선행 조건으로 잠겨 있어 그 화면에서
+  앞으로 나아갈 방법이 없었습니다. 이제 Schema Conversion은 CDC가 살아 있을 때 단계 상단에
+  **상시 표시되는 경고 알림**을 보여 줍니다 — 타깃 스키마는 (CDC가 스트리밍 중이므로) **이미
+  적용된 상태**임을 설명하고, 안전한 한 가지 경로인 **"Skip conversion & continue to Data
+  Migration"**(스키마 변환 건너뛰고 Data Migration으로 진행)을 제시합니다. 이 버튼은 진행과
+  동시에 Data Migration을 잠금 해제하여, 스키마를 정말로 바꿔야 한다면 그곳에서 CDC를 중지할 수
+  있게 합니다. Apply 시 뜨는 토스트도 동일한 실행 가능 안내(계속하려면 Skip, 스키마를 바꾸려면
+  Data Migration에서 CDC 중지)를 담도록 바뀌었습니다.
+
 ## v0.1.89
 
 ### 수정 (Fixed)

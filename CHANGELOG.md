@@ -5,6 +5,26 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.90
+
+### Fixed
+
+- **The "CDC is running, can't apply schema" block on Schema Conversion is now
+  actionable instead of a dead end.** When a CDC pipeline is already streaming into
+  the target, applying schema conversion is (correctly) blocked — the sink is
+  writing those tables and DDL is not replicated, so a REPLACE would drop or
+  corrupt them. Previously this only surfaced as a transient toast shown when you
+  clicked Apply, telling you to "stop CDC first" — but Data Migration (the only
+  place CDC can be stopped) is prerequisite-locked behind Schema Conversion, so
+  there was no way forward from that screen. Schema Conversion now shows a
+  **persistent warning notice** at the top of the step whenever CDC is live,
+  explaining that the target schema is **already applied** (CDC is streaming to it)
+  and offering the one safe path: **"Skip conversion & continue to Data
+  Migration"** — which both proceeds and unlocks Data Migration, where CDC can be
+  stopped if the schema genuinely needs to change. The on-Apply toast now carries
+  the same actionable guidance (Skip to continue, or stop CDC in Data Migration to
+  change the schema).
+
 ## v0.1.89
 
 ### Fixed
