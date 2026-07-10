@@ -268,22 +268,26 @@ def test_task_role_grants_least_privilege_dsql_and_secrets(template: dict) -> No
     assert secret["Resource"] == {"Ref": "SourceSecretArn"}
 
     # The discovery/status actions that AWS cannot resource-scope (EC2 Describe*,
-    # sts:GetCallerIdentity, kafkaconnect:ListConnectors) are the ONLY statements
-    # allowed to use "*", and they must be strictly read-only. Everything else
-    # stays scoped.
+    # sts:GetCallerIdentity, kafkaconnect:ListConnectors, cloudwatch:GetMetricData)
+    # are the ONLY statements allowed to use "*", and they must be strictly
+    # read-only. Everything else stays scoped.
     _UNSCOPABLE_READONLY_SIDS = {
         "DiscoverConnectorSubnets",
         "CallerIdentity",
         "DiscoverCdcConnectors",
+        "ReadConnectorMetrics",
     }
     for sid, stmt in statements.items():
         if sid in _UNSCOPABLE_READONLY_SIDS:
             assert stmt["Resource"] == "*"
             actions = stmt["Action"]
             actions = actions if isinstance(actions, list) else [actions]
-            # Read-only verbs only (Describe* / List* / GetCallerIdentity).
+            # Read-only verbs only (Describe* / List* / GetCallerIdentity /
+            # GetMetricData — CloudWatch's metric read has no resource-level scoping).
             assert all(
-                a.split(":", 1)[1].startswith(("Describe", "List", "GetCallerIdentity"))
+                a.split(":", 1)[1].startswith(
+                    ("Describe", "List", "GetCallerIdentity", "GetMetricData")
+                )
                 for a in actions
             )
         else:

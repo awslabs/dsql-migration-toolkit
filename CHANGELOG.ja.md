@@ -5,6 +5,20 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.97
+
+### Fixed
+
+- **ライブ CDC パイプラインヘルスのスループットが実際に表示されるようになりました。** UI は
+  change-flow パネルでコネクタの `AWS/KafkaConnect` CloudWatch メトリクス（`SinkRecordSendRate`、
+  `SourceRecordPollRate`、running/errored タスク数）を読みますが、アプリのタスクロールに
+  `cloudwatch:GetMetricData` が付与されていなかったため、すべての読み取りが `AccessDenied` で失敗し
+  best-effort で握り潰され、スループットが空/unknown のままでした。`cloudwatch:GetMetricData`
+  （Resource `*` — この API はリソースレベルのスコープ不可）を付与し、実際の send/poll レートが
+  表示されるようにしました。**ソーススキャン不要**の軽量な CDC アクティビティ信号であり、次に追加する
+  テーブル別 net-rows カスタムメトリクスの読み取り準備も整います。テンプレートの IAM 変更のみ —
+  デプロイでロールを更新（イメージの再ビルドは不要）。
+
 ## v0.1.96
 
 ### Fixed

@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.97
+
+### 수정 (Fixed)
+
+- **라이브 CDC 파이프라인 헬스의 처리율이 이제 실제로 표시됩니다.** UI는 change-flow 패널에서
+  커넥터의 `AWS/KafkaConnect` CloudWatch 메트릭(`SinkRecordSendRate`, `SourceRecordPollRate`,
+  running/errored 태스크 수)을 읽는데, 앱 태스크 역할에 `cloudwatch:GetMetricData` 권한이 없어서 모든
+  읽기가 `AccessDenied`로 실패하고 best-effort로 삼켜져 처리율이 빈 값/unknown으로 보였습니다.
+  `cloudwatch:GetMetricData`(Resource `*` — 이 API는 리소스 스코프 미지원)를 부여해 실제 send/poll
+  rate가 표시되도록 했습니다. **소스 스캔이 없는** 경량 CDC 활동 신호이며, 다음에 추가할 테이블별
+  net-rows 커스텀 메트릭 읽기 준비도 됩니다. 템플릿 IAM 변경만 — 배포로 역할 갱신(이미지 재빌드 불필요).
+
 ## v0.1.96
 
 ### 수정 (Fixed)

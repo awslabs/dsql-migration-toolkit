@@ -601,6 +601,15 @@ Resources:
                 Action: kafkaconnect:DescribeConnector
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector/mysql-dsql-cdc-*/*
+              # Read the pipeline's CloudWatch metrics for the live health panel:
+              # the built-in AWS/KafkaConnect throughput/task metrics
+              # (SinkRecordSendRate, SourceRecordPollRate, Running/ErroredTaskCount)
+              # AND the sink's per-table net-rows custom metric. get_metric_data has
+              # no resource-level scoping, so it is granted on "*" (like ListConnectors).
+              - Sid: ReadConnectorMetrics
+                Effect: Allow
+                Action: cloudwatch:GetMetricData
+                Resource: "*"
               # Read connector worker logs to surface an actionable reason when a
               # connector enters FAILED (worker-log-driven diagnosis in the UI).
               - Sid: ReadConnectorWorkerLogs

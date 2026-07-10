@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.97
+
+### Fixed
+
+- **The live CDC pipeline-health throughput now actually populates.** The UI reads
+  the connectors' `AWS/KafkaConnect` CloudWatch metrics (`SinkRecordSendRate`,
+  `SourceRecordPollRate`, running/errored task counts) for the change-flow panel,
+  but the app task role was never granted `cloudwatch:GetMetricData` — so every read
+  failed with `AccessDenied` and was swallowed best-effort, leaving the throughput
+  showing blank/unknown. Grant `cloudwatch:GetMetricData` (Resource `*` — the API
+  has no resource-level scoping) so the panel shows real send/poll rates. This is a
+  lightweight, **source-scan-free** CDC-activity signal; it also readies the role to
+  read the per-table net-rows custom metric added next. Template-only IAM change —
+  a deploy updates the role (no image rebuild).
+
 ## v0.1.96
 
 ### Fixed
