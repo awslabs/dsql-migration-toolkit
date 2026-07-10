@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.96
+
+### 수정 (Fixed)
+
+- **CDC 시작/정지가 `kafkaconnect:ListConnectors`에 대한 `AccessDeniedException`으로 더 이상
+  실패하지 않습니다.** CDC 배포 역할이 `ListConnectors`를 커넥터 ARN(`connector/mysql-dsql-cdc-*/*`)으로
+  스코프했는데, `ListConnectors`는 **계정 수준** list 작업이라 `.../v1/connectors`에 대해 인가되므로 ARN
+  스코프로는 아무 권한도 부여되지 않았습니다. deployer는 2-pass Start CDC(및 Stop) 중 소스/싱크 상태를
+  읽으려 커넥터를 list하는데, 이 읽기가 AccessDenied로 막혀 작업이 오류("could not read … state")로
+  끝났습니다. v0.1.86에서 커넥터 상태 읽기가 (조용히 `None` 반환 대신) 예외를 던지도록 바뀌면서 드러났습니다.
+  이제 `ListConnectors`는 별도 문장에서 `Resource: "*"`로 부여되고(태스크 역할의 discovery 권한과 동일),
+  나머지 커넥터 작업은 `mysql-dsql-cdc-*` 패밀리로 스코프 유지됩니다. 역할 갱신을 위해 앱 스택 배포 필요(이미지
+  재빌드는 불필요).
+
 ## v0.1.95
 
 ### 수정 (Fixed)

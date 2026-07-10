@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.96
+
+### Fixed
+
+- **Start/Stop CDC no longer fails with `AccessDeniedException` on
+  `kafkaconnect:ListConnectors`.** The CDC-deploy role granted `ListConnectors` but
+  scoped it to a connector ARN (`connector/mysql-dsql-cdc-*/*`) — yet `ListConnectors`
+  is an **account-level** list operation, authorized against `.../v1/connectors`, so
+  the ARN scope granted nothing. The deployer lists connectors to read source/sink
+  state during the two-pass Start CDC (and Stop), so that read hit AccessDenied and
+  the operation errored ("could not read … state"). It became visible once v0.1.86
+  made the connector-state read raise (instead of silently returning `None`).
+  `ListConnectors` is now granted on `Resource: "*"` in its own statement (matching
+  the task role's discovery grant); the other connector operations stay scoped to the
+  `mysql-dsql-cdc-*` family. Requires an app-stack deploy to update the role (no image
+  rebuild).
+
 ## v0.1.95
 
 ### Fixed

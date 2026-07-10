@@ -5,6 +5,20 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.96
+
+### Fixed
+
+- **CDC の開始/停止が `kafkaconnect:ListConnectors` の `AccessDeniedException` で失敗しなくなりました。**
+  CDC デプロイロールは `ListConnectors` をコネクタ ARN（`connector/mysql-dsql-cdc-*/*`）にスコープして
+  いましたが、`ListConnectors` は **アカウントレベル** の list 操作で `.../v1/connectors` に対して認可される
+  ため、ARN スコープでは何の権限も付与されていませんでした。デプロイヤーは 2-pass の Start CDC（および
+  Stop）中にソース/シンクの状態を読むためコネクタを list しますが、その読み取りが AccessDenied で阻まれ、
+  操作がエラー（"could not read … state"）で終了していました。v0.1.86 でコネクタ状態の読み取りが（静かに
+  `None` を返す代わりに）例外を投げるようになったことで顕在化しました。`ListConnectors` は独立した文で
+  `Resource: "*"` に付与し（タスクロールの discovery 権限と同じ）、他のコネクタ操作は `mysql-dsql-cdc-*`
+  ファミリーにスコープしたままにしました。ロール更新のためアプリスタックのデプロイが必要（イメージの再ビルドは不要）。
+
 ## v0.1.95
 
 ### Fixed

@@ -735,6 +735,16 @@ Resources:
                   - kafkaconnect:CreateConnector
                   - kafkaconnect:TagResource
                 Resource: "*"
+              # ListConnectors is an ACCOUNT-LEVEL list operation (authorized against
+              # .../v1/connectors), so it cannot be resource-scoped -- it must be "*"
+              # (same as the task role's DiscoverCdcConnectors grant). run_cdc_start /
+              # run_cdc_stop list connectors to read source/sink state during the
+              # two-pass start and the stop. A connector-ARN scope silently grants
+              # nothing, so the deployer got AccessDeniedException on ListConnectors.
+              - Sid: KafkaConnectListConnectors
+                Effect: Allow
+                Action: kafkaconnect:ListConnectors
+                Resource: "*"
               # MSK Connect connector operations that DO support resource-level
               # scoping (the connector ARN exists by then): scope to the cdc family.
               - Sid: KafkaConnectConnector
@@ -742,7 +752,6 @@ Resources:
                 Action:
                   - kafkaconnect:DeleteConnector
                   - kafkaconnect:DescribeConnector
-                  - kafkaconnect:ListConnectors
                   - kafkaconnect:UpdateConnector
                   - kafkaconnect:UntagResource
                   - kafkaconnect:ListTagsForResource
