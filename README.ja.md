@@ -212,49 +212,6 @@ MSK Connect *上で* 動作するオープンソースソフトウェアです�
 
 ---
 
-## 設定（上級者向け — 通常は触る必要なし）
-
-すべては UI で行われ、妥当な既定値が適用されます。以下は自動化・チューニング用のオペレーター
-向けリファレンスで、環境変数から読み取られ（config ファイルなし、認証情報は永続化されない）、
-Fargate では ECS タスク定義に設定します。Full Load / Validation の並列度 4 つは、サイドバーの
-**Performance tuning** コントロールから **実行時に** 再調整することもできます（再デプロイ不要、
-再起動でリセット）。
-
-| 変数 | 既定値 | 説明 |
-| --- | --- | --- |
-| `DSQL_MIGRATOR_APP_HOST` | `127.0.0.1` | UI がバインドするホスト/インターフェース。 |
-| `DSQL_MIGRATOR_APP_PORT` | `8080` | UI がリッスンするポート。 |
-| `DSQL_MIGRATOR_AWS_REGION` | _(未設定)_ | boto3 クライアント用の AWS リージョン。 |
-| `DSQL_MIGRATOR_AWS_PROFILE` | _(未設定)_ | 任意のグローバル AWS 名前付きプロファイル。未設定時は標準チェーンにフォールバック。プロファイル名（非機密）のみ保存。 |
-| `DSQL_MIGRATOR_JOB_STATE_PATH` | `job_state.sqlite` | Full Load ジョブのスナップショット（状態、テーブルごとの進捗、ウォーターマーク）— 再起動後の再開用。 |
-| `DSQL_MIGRATOR_ACTIVITY_LOG_PATH` | `migration_activity.log` | 構造化アクティビティログ（イベントごとに UTC タイムスタンプ付きの JSON 1 行）。UI からダウンロード可、サイズ上限・ローテーション（約 20 MB × バックアップ 4 個）。 |
-| `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | セッションごとの非機密のワークベンチ状態 — 再接続したブラウザが再開。`DSQL_MIGRATOR_STORAGE_SECRET` と併用。ローカルディスク — Fargate デプロイは下記の durable な S3 ストアを使用。 |
-| `DSQL_MIGRATOR_SESSION_STATE_BUCKET` | _(未設定)_ | セッションスナップショット用の durable な S3 ストア — プロセス内再起動だけでなく Fargate のタスク置換（再デプロイ）を越えて再開が保持される。Fargate デプロイが管理対象プラグインバケットに自動設定（設定不要）;ローカルは未設定で上記 SQLite パスを使用。 |
-| `DSQL_MIGRATOR_STAGING_BUCKET` | _(未設定)_ | Full Load ステージング用の S3 バケット（ストリーミングのマルチパートアップロード — 大規模テーブル向けのスケーラブルな経路）。未設定時は上限付きローカル一時 CSV（開発 / 小規模）。 |
-| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4`（≤16） | 並行してロードするテーブル数。DSQL への合計接続数をクラスターのクォータ内に収める。 |
-| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8`（≤32） | テーブルあたりの処理中の `INSERT … ON CONFLICT` バッチ数。大きいほどスループット↑、OCC（40001）衝突↑。 |
-| `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000`（≤3000） | バッチ書き込みあたりの行数。DSQL のトランザクションごとの 3000 行制限で上限。 |
-| `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1`（オン） | 先読み prefetch キュー（リーダースレッドが bounded キューを満たす間に書き込みが進行）。オンのままに。A/B ベンチで pre-prefetch 経路を再現する場合のみ `0`。 |
-| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1`（オフ、≤8） | 大きな単一整数 PK テーブルの読み取りを K 個の並行リーダーに分割。効果があることは稀（リーダーが GIL バウンド）— マニュアル §7.2 参照。 |
-| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | この推定行数以上のテーブルのみリーダーシャーディング対象；小さいテーブルは常に単一リーダー。 |
-| `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4`（≤32） | Validation で並行して比較するテーブル数。`1` = 逐次。 |
-| `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | 起動時のログレベル。`DEBUG` は失敗イベントに stacktrace（コールスタックのみ）を追加。実行時に **Diagnostics** からも変更可。 |
-| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | アクティビティログイベントを標準出力にもミラーリング（ECS では → CloudWatch）。実行時に **Diagnostics** から切り替え可。 |
-| `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | AI アシスト用の Bedrock モデル / 推論プロファイル ID。`global.*` プロファイルは全ての商用リージョンから呼び出せます（`us.*` は米国専用）。 |
-| `BEDROCK_REGION` | _(未設定)_ | Amazon Bedrock 呼び出し用のリージョン。 |
-
-AI アシストは既定でオフで、UI でオンにします。UI は Bedrock の到達可能性をチェックし、実行可能な
-失敗理由を報告する **Verify AI access** のプリフライトも提供します。チューニング項目の背景は
-マニュアル [パフォーマンスとチューニング](docs/manual/ja/07-performance-and-tuning.md)。
-
-> **CDC のスケーリングはここでは設定せず、推論されます。** コネクタのノブ（テーブルごとのトピック
-> パーティション数、シンクの `tasks.max`、MSK Connect の MCU）は cdc-stack のデプロイ時にキャプチャ
-> 対象テーブル数から導出されます。高度な環境変数による上書き（`DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` /
-> `_SINK_TASKS_MAX` / `_MCU_COUNT`）はマニュアル
-> [§7.2 — CDC](docs/manual/ja/07-performance-and-tuning.md) に記載されています。
-
----
-
 ## プロジェクト構成
 
 | パス | 内容 |
@@ -297,6 +254,55 @@ CDC は別途の **cdc-stack** です。
 > （リージョンは DSQL エンドポイントから導出）、プロビジョニングされるすべてのインフラ — 特に
 > ソースへプライベートに到達しなければならない CDC VPC — がそのリージョンにデプロイされます。
 > クロスリージョンのソース/ターゲットはサポートされません。
+
+---
+
+## 設定（上級者向け — 通常は触る必要なし）
+
+すべては UI で行われ、妥当な既定値が適用されます — **ほとんどの運用者は触りません。**
+自動化・チューニング用の環境変数リファレンス一式は以下にあります。
+
+<details>
+<summary><b>環境変数リファレンス</b> — クリックで展開</summary>
+
+環境変数から読み取られ（config ファイルなし、認証情報は永続化されない）、Fargate では ECS タスク
+定義に設定します。Full Load / Validation の並列度 4 つは、サイドバーの **Performance tuning**
+コントロールから **実行時に** 再調整することもできます（再デプロイ不要、再起動でリセット）。
+
+| 変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `DSQL_MIGRATOR_APP_HOST` | `127.0.0.1` | UI がバインドするホスト/インターフェース。 |
+| `DSQL_MIGRATOR_APP_PORT` | `8080` | UI がリッスンするポート。 |
+| `DSQL_MIGRATOR_AWS_REGION` | _(未設定)_ | boto3 クライアント用の AWS リージョン。 |
+| `DSQL_MIGRATOR_AWS_PROFILE` | _(未設定)_ | 任意のグローバル AWS 名前付きプロファイル。未設定時は標準チェーンにフォールバック。プロファイル名（非機密）のみ保存。 |
+| `DSQL_MIGRATOR_JOB_STATE_PATH` | `job_state.sqlite` | Full Load ジョブのスナップショット（状態、テーブルごとの進捗、ウォーターマーク）— 再起動後の再開用。 |
+| `DSQL_MIGRATOR_ACTIVITY_LOG_PATH` | `migration_activity.log` | 構造化アクティビティログ（イベントごとに UTC タイムスタンプ付きの JSON 1 行）。UI からダウンロード可、サイズ上限・ローテーション（約 20 MB × バックアップ 4 個）。 |
+| `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | セッションごとの非機密のワークベンチ状態 — 再接続したブラウザが再開。`DSQL_MIGRATOR_STORAGE_SECRET` と併用。ローカルディスク — Fargate デプロイは下記の durable な S3 ストアを使用。 |
+| `DSQL_MIGRATOR_SESSION_STATE_BUCKET` | _(未設定)_ | セッションスナップショット用の durable な S3 ストア — プロセス内再起動だけでなく Fargate のタスク置換（再デプロイ）を越えて再開が保持される。Fargate デプロイが管理対象プラグインバケットに自動設定（設定不要）;ローカルは未設定で上記 SQLite パスを使用。 |
+| `DSQL_MIGRATOR_STAGING_BUCKET` | _(未設定)_ | Full Load ステージング用の S3 バケット（ストリーミングのマルチパートアップロード — 大規模テーブル向けのスケーラブルな経路）。未設定時は上限付きローカル一時 CSV（開発 / 小規模）。 |
+| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4`（≤16） | 並行してロードするテーブル数。DSQL への合計接続数をクラスターのクォータ内に収める。 |
+| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8`（≤32） | テーブルあたりの処理中の `INSERT … ON CONFLICT` バッチ数。大きいほどスループット↑、OCC（40001）衝突↑。 |
+| `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000`（≤3000） | バッチ書き込みあたりの行数。DSQL のトランザクションごとの 3000 行制限で上限。 |
+| `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1`（オン） | 先読み prefetch キュー（リーダースレッドが bounded キューを満たす間に書き込みが進行）。オンのままに。A/B ベンチで pre-prefetch 経路を再現する場合のみ `0`。 |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1`（オフ、≤8） | 大きな単一整数 PK テーブルの読み取りを K 個の並行リーダーに分割。効果があることは稀（リーダーが GIL バウンド）— マニュアル §7.2 参照。 |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | この推定行数以上のテーブルのみリーダーシャーディング対象；小さいテーブルは常に単一リーダー。 |
+| `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4`（≤32） | Validation で並行して比較するテーブル数。`1` = 逐次。 |
+| `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | 起動時のログレベル。`DEBUG` は失敗イベントに stacktrace（コールスタックのみ）を追加。実行時に **Diagnostics** からも変更可。 |
+| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | アクティビティログイベントを標準出力にもミラーリング（ECS では → CloudWatch）。実行時に **Diagnostics** から切り替え可。 |
+| `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | AI アシスト用の Bedrock モデル / 推論プロファイル ID。`global.*` プロファイルは全ての商用リージョンから呼び出せます（`us.*` は米国専用）。 |
+| `BEDROCK_REGION` | _(未設定)_ | Amazon Bedrock 呼び出し用のリージョン。 |
+
+AI アシストは既定でオフで、UI でオンにします。UI は Bedrock の到達可能性をチェックし、実行可能な
+失敗理由を報告する **Verify AI access** のプリフライトも提供します。チューニング項目の背景は
+マニュアル [パフォーマンスとチューニング](docs/manual/ja/07-performance-and-tuning.md)。
+
+> **CDC のスケーリングはここでは設定せず、推論されます。** コネクタのノブ（テーブルごとのトピック
+> パーティション数、シンクの `tasks.max`、MSK Connect の MCU）は cdc-stack のデプロイ時にキャプチャ
+> 対象テーブル数から導出されます。高度な環境変数による上書き（`DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` /
+> `_SINK_TASKS_MAX` / `_MCU_COUNT`）はマニュアル
+> [§7.2 — CDC](docs/manual/ja/07-performance-and-tuning.md) に記載されています。
+
+</details>
 
 ---
 

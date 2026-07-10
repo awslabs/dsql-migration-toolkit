@@ -219,50 +219,6 @@ once only when you must build your own image on a restricted network.
 
 ---
 
-## Configuration (advanced — usually no need to touch)
-
-Everything is done in the UI with sensible defaults. Below is an operator reference
-for automation/tuning; read from environment variables (no config file, no
-persisted credentials). On Fargate, set these in the ECS task definition. The four
-Full Load / Validation parallelism knobs can also be retuned **at runtime** from the
-sidebar's **Performance tuning** control (no redeploy; resets on restart).
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `DSQL_MIGRATOR_APP_HOST` | `127.0.0.1` | Host/interface the UI binds to. |
-| `DSQL_MIGRATOR_APP_PORT` | `8080` | Port the UI listens on. |
-| `DSQL_MIGRATOR_AWS_REGION` | _(unset)_ | AWS region for boto3 clients. |
-| `DSQL_MIGRATOR_AWS_PROFILE` | _(unset)_ | Optional global AWS named profile; falls back to the standard chain. Only the (non-secret) name is stored. |
-| `DSQL_MIGRATOR_JOB_STATE_PATH` | `job_state.sqlite` | Full Load job snapshots (status, per-table progress, watermark) for resume after restart. |
-| `DSQL_MIGRATOR_ACTIVITY_LOG_PATH` | `migration_activity.log` | Structured activity log (one UTC-timestamped JSON line per event); downloadable from the UI, size-capped/rotated (~20 MB × 4 backups). |
-| `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | Per-session non-secret workbench state so a reconnecting browser resumes. Pair with `DSQL_MIGRATOR_STORAGE_SECRET`. Local disk — the Fargate deploy uses the durable S3 store below instead. |
-| `DSQL_MIGRATOR_SESSION_STATE_BUCKET` | _(unset)_ | Durable S3 store for the per-session snapshot, so resume survives a Fargate task replacement (a redeploy), not just an in-task restart. The Fargate deploy auto-sets it to the managed plugin bucket (no setup); leave unset locally to use the SQLite path above. |
-| `DSQL_MIGRATOR_STAGING_BUCKET` | _(unset)_ | S3 bucket for Full Load staging (streaming multipart upload — the scalable path for large tables). Unset = bounded local temp CSV (dev / small tables). |
-| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4` (≤16) | Tables loaded concurrently. Keep total DSQL connections within the cluster quota. |
-| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | In-flight `INSERT … ON CONFLICT` batches per table. Higher = more throughput but more OCC (40001) collisions. |
-| `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000` (≤3000) | Rows per batched write, capped at DSQL's 3000-row per-transaction limit. |
-| `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1` (on) | Read-ahead prefetch queue (reader thread fills a bounded queue while writes drain). Keep on; set `0` only to reproduce the pre-prefetch path in an A/B benchmark. |
-| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1` (off, ≤8) | Split one large single-integer-PK table's read across K concurrent readers. Rarely worth it (the reader is GIL-bound) — see manual §7.2. |
-| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | Minimum estimated rows for a table to be reader-sharded; smaller tables always use one reader. |
-| `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4` (≤32) | Tables compared concurrently in Validation. `1` = sequential. |
-| `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | Startup log level; `DEBUG` adds a stacktrace (call stack only) to failure events. Also changeable at runtime via **Diagnostics**. |
-| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | Mirror activity-log events to stdout (→ CloudWatch on ECS). Also toggleable at runtime via **Diagnostics**. |
-| `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | Bedrock model / inference-profile id for AI assist. The `global.*` profile is reachable from any commercial region; a `us.*` profile is US-only. |
-| `BEDROCK_REGION` | _(unset)_ | Region for Amazon Bedrock calls. |
-
-AI assist is off by default and enabled in the UI, which also offers a **Verify AI
-access** preflight (checks Bedrock reachability, reports actionable failures).
-Full background on the tuning knobs: manual
-[Performance and tuning](docs/manual/en/07-performance-and-tuning.md).
-
-> **CDC scaling is inferred, not set here.** The connector knobs (per-table topic
-> partitions, sink `tasks.max`, MSK Connect MCUs) are derived from the captured-table
-> count at cdc-stack deploy time; advanced env overrides
-> (`DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` / `_SINK_TASKS_MAX` / `_MCU_COUNT`) are
-> documented in manual [§7.2 — CDC](docs/manual/en/07-performance-and-tuning.md).
-
----
-
 ## Project layout
 
 | Path | What's there |
@@ -305,6 +261,57 @@ production as a single-task **ECS Fargate** service from `deploy/cloudformation.
 > region** (derived from the DSQL endpoint), and all provisioned infrastructure —
 > especially the CDC VPC, which must reach the source privately — deploys there.
 > Cross-region source/target is not supported.
+
+---
+
+## Configuration (advanced — usually no need to touch)
+
+Everything is done in the UI with sensible defaults — **most operators never touch
+this.** The full environment-variable reference (for automation / tuning) is below.
+
+<details>
+<summary><b>Environment-variable reference</b> — click to expand</summary>
+
+Read from environment variables (no config file, no persisted credentials). On
+Fargate, set these in the ECS task definition. The four Full Load / Validation
+parallelism knobs can also be retuned **at runtime** from the sidebar's
+**Performance tuning** control (no redeploy; resets on restart).
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DSQL_MIGRATOR_APP_HOST` | `127.0.0.1` | Host/interface the UI binds to. |
+| `DSQL_MIGRATOR_APP_PORT` | `8080` | Port the UI listens on. |
+| `DSQL_MIGRATOR_AWS_REGION` | _(unset)_ | AWS region for boto3 clients. |
+| `DSQL_MIGRATOR_AWS_PROFILE` | _(unset)_ | Optional global AWS named profile; falls back to the standard chain. Only the (non-secret) name is stored. |
+| `DSQL_MIGRATOR_JOB_STATE_PATH` | `job_state.sqlite` | Full Load job snapshots (status, per-table progress, watermark) for resume after restart. |
+| `DSQL_MIGRATOR_ACTIVITY_LOG_PATH` | `migration_activity.log` | Structured activity log (one UTC-timestamped JSON line per event); downloadable from the UI, size-capped/rotated (~20 MB × 4 backups). |
+| `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | Per-session non-secret workbench state so a reconnecting browser resumes. Pair with `DSQL_MIGRATOR_STORAGE_SECRET`. Local disk — the Fargate deploy uses the durable S3 store below instead. |
+| `DSQL_MIGRATOR_SESSION_STATE_BUCKET` | _(unset)_ | Durable S3 store for the per-session snapshot, so resume survives a Fargate task replacement (a redeploy), not just an in-task restart. The Fargate deploy auto-sets it to the managed plugin bucket (no setup); leave unset locally to use the SQLite path above. |
+| `DSQL_MIGRATOR_STAGING_BUCKET` | _(unset)_ | S3 bucket for Full Load staging (streaming multipart upload — the scalable path for large tables). Unset = bounded local temp CSV (dev / small tables). |
+| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4` (≤16) | Tables loaded concurrently. Keep total DSQL connections within the cluster quota. |
+| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | In-flight `INSERT … ON CONFLICT` batches per table. Higher = more throughput but more OCC (40001) collisions. |
+| `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000` (≤3000) | Rows per batched write, capped at DSQL's 3000-row per-transaction limit. |
+| `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1` (on) | Read-ahead prefetch queue (reader thread fills a bounded queue while writes drain). Keep on; set `0` only to reproduce the pre-prefetch path in an A/B benchmark. |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1` (off, ≤8) | Split one large single-integer-PK table's read across K concurrent readers. Rarely worth it (the reader is GIL-bound) — see manual §7.2. |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | Minimum estimated rows for a table to be reader-sharded; smaller tables always use one reader. |
+| `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4` (≤32) | Tables compared concurrently in Validation. `1` = sequential. |
+| `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | Startup log level; `DEBUG` adds a stacktrace (call stack only) to failure events. Also changeable at runtime via **Diagnostics**. |
+| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | Mirror activity-log events to stdout (→ CloudWatch on ECS). Also toggleable at runtime via **Diagnostics**. |
+| `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | Bedrock model / inference-profile id for AI assist. The `global.*` profile is reachable from any commercial region; a `us.*` profile is US-only. |
+| `BEDROCK_REGION` | _(unset)_ | Region for Amazon Bedrock calls. |
+
+AI assist is off by default and enabled in the UI, which also offers a **Verify AI
+access** preflight (checks Bedrock reachability, reports actionable failures).
+Full background on the tuning knobs: manual
+[Performance and tuning](docs/manual/en/07-performance-and-tuning.md).
+
+> **CDC scaling is inferred, not set here.** The connector knobs (per-table topic
+> partitions, sink `tasks.max`, MSK Connect MCUs) are derived from the captured-table
+> count at cdc-stack deploy time; advanced env overrides
+> (`DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` / `_SINK_TASKS_MAX` / `_MCU_COUNT`) are
+> documented in manual [§7.2 — CDC](docs/manual/en/07-performance-and-tuning.md).
+
+</details>
 
 ---
 

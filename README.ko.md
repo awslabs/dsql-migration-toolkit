@@ -209,47 +209,6 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 
 ---
 
-## 설정 (고급 — 보통은 건드릴 필요 없음)
-
-모든 작업은 UI에서 이뤄지고 합리적 기본값이 적용됩니다. 아래는 자동화·튜닝용 운영자 레퍼런스로,
-환경 변수에서 읽으며(config 파일 없음, 자격증명 미영속화) Fargate에서는 ECS 태스크 정의에
-설정합니다. Full Load / Validation 병렬수 4개는 사이드바의 **Performance tuning** 컨트롤에서
-**런타임에** 재튜닝할 수도 있습니다(재배포 불필요, 재시작 시 리셋).
-
-| 변수 | 기본값 | 설명 |
-| --- | --- | --- |
-| `DSQL_MIGRATOR_APP_HOST` | `127.0.0.1` | UI가 바인딩할 호스트/인터페이스. |
-| `DSQL_MIGRATOR_APP_PORT` | `8080` | UI가 수신할 포트. |
-| `DSQL_MIGRATOR_AWS_REGION` | _(미설정)_ | boto3 클라이언트용 AWS 리전. |
-| `DSQL_MIGRATOR_AWS_PROFILE` | _(미설정)_ | 선택적 글로벌 AWS named profile. 미설정 시 표준 체인으로 폴백. 프로필 이름(비밀 아님)만 저장. |
-| `DSQL_MIGRATOR_JOB_STATE_PATH` | `job_state.sqlite` | Full Load 작업 스냅샷(상태, 테이블별 진행률, 워터마크) — 재시작 후 재개용. |
-| `DSQL_MIGRATOR_ACTIVITY_LOG_PATH` | `migration_activity.log` | 구조화된 활동 로그(이벤트당 UTC 타임스탬프 JSON 한 줄); UI에서 다운로드, 크기 제한·회전(~20 MB × 백업 4개). |
-| `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | 세션별 비밀 아닌 워크벤치 상태 — 재연결 브라우저가 이어서 작업. `DSQL_MIGRATOR_STORAGE_SECRET`과 함께 사용. 로컬 디스크 — Fargate 배포는 아래 durable S3 스토어를 대신 사용. |
-| `DSQL_MIGRATOR_SESSION_STATE_BUCKET` | _(미설정)_ | 세션 스냅샷용 durable S3 스토어 — 인프로세스 재시작뿐 아니라 Fargate 태스크 교체(재배포)까지 재개가 유지됨. Fargate 배포가 관리형 플러그인 버킷으로 자동 설정(설정 불필요); 로컬은 미설정 시 위 SQLite 경로 사용. |
-| `DSQL_MIGRATOR_STAGING_BUCKET` | _(미설정)_ | Full Load 스테이징용 S3 버킷(스트리밍 멀티파트 업로드 — 대형 테이블 확장 경로). 미설정 시 제한된 로컬 임시 CSV(개발 / 소형). |
-| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4` (≤16) | 동시에 로드하는 테이블 수. 총 DSQL 연결을 클러스터 쿼터 안에서 유지. |
-| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | 테이블당 in-flight `INSERT … ON CONFLICT` 배치 수. 높을수록 처리량↑, OCC(40001) 충돌↑. |
-| `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000` (≤3000) | 배치 쓰기당 행 수, DSQL의 트랜잭션당 3000행 한도로 하드캡. |
-| `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1` (켜짐) | 읽기 선행 prefetch 큐(리더 스레드가 bounded 큐를 채우는 동안 쓰기 진행). 켜 두세요. A/B 벤치마크로 pre-prefetch 경로를 재현할 때만 `0`. |
-| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1` (꺼짐, ≤8) | 큰 단일 정수 PK 테이블의 읽기를 K개 동시 리더로 분할. 대개 이득이 드묾(리더가 GIL 바운드) — 매뉴얼 §7.2 참고. |
-| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | 이 추정 행수 이상인 테이블만 리더 샤딩; 더 작은 테이블은 항상 단일 리더. |
-| `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4` (≤32) | Validation에서 동시에 비교하는 테이블 수. `1` = 순차. |
-| `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | 시작 로그 레벨. `DEBUG`는 실패 이벤트에 stacktrace(콜 스택만) 추가. 런타임에 **Diagnostics**에서도 변경 가능. |
-| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | 활동 로그 이벤트를 stdout에도 미러링(ECS에서는 → CloudWatch). 런타임에 **Diagnostics**에서 토글 가능. |
-| `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | AI 보조용 Bedrock 모델 / 추론 프로파일 id. `global.*` 프로파일은 모든 상용 리전에서 호출 가능하며, `us.*`는 미국 전용입니다. |
-| `BEDROCK_REGION` | _(미설정)_ | Amazon Bedrock 호출용 리전. |
-
-AI 보조는 기본 off이며 UI에서 켭니다. UI는 Bedrock 도달 가능 여부를 확인하고 조치 가능한 실패
-이유를 보고하는 **Verify AI access** 사전 점검도 제공합니다. 튜닝 노브의 배경은 매뉴얼
-[성능과 튜닝](docs/manual/ko/07-performance-and-tuning.md).
-
-> **CDC 스케일링은 여기서 설정하지 않고 추론됩니다.** 커넥터 노브(테이블별 토픽 파티션 수, 싱크
-> `tasks.max`, MSK Connect MCU)는 cdc-stack 배포 시점에 캡처 대상 테이블 수로부터 결정됩니다. 고급
-> 환경 변수 재정의(`DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` / `_SINK_TASKS_MAX` / `_MCU_COUNT`)는 매뉴얼
-> [§7.2 — CDC](docs/manual/ko/07-performance-and-tuning.md)에 문서화돼 있습니다.
-
----
-
 ## 프로젝트 구조
 
 | 경로 | 내용 |
@@ -290,6 +249,54 @@ AI 보조는 기본 off이며 UI에서 켭니다. UI는 Bedrock 도달 가능 �
 > Aurora MySQL)와 타깃(Aurora DSQL)은 **동일 리전에 있어야 하며**(리전은 DSQL 엔드포인트에서
 > 도출), 프로비저닝되는 모든 인프라 — 특히 소스에 프라이빗하게 도달해야 하는 CDC VPC — 가 그
 > 리전에 배포됩니다. 크로스 리전 소스/타깃은 지원되지 않습니다.
+
+---
+
+## 설정 (고급 — 보통은 건드릴 필요 없음)
+
+모든 작업은 UI에서 이뤄지고 합리적 기본값이 적용됩니다 — **대부분의 운영자는 건드릴 일이
+없습니다.** 자동화·튜닝용 전체 환경 변수 레퍼런스는 아래에 있습니다.
+
+<details>
+<summary><b>환경 변수 레퍼런스</b> — 펼치기</summary>
+
+환경 변수에서 읽으며(config 파일 없음, 자격증명 미영속화) Fargate에서는 ECS 태스크 정의에
+설정합니다. Full Load / Validation 병렬수 4개는 사이드바의 **Performance tuning** 컨트롤에서
+**런타임에** 재튜닝할 수도 있습니다(재배포 불필요, 재시작 시 리셋).
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `DSQL_MIGRATOR_APP_HOST` | `127.0.0.1` | UI가 바인딩할 호스트/인터페이스. |
+| `DSQL_MIGRATOR_APP_PORT` | `8080` | UI가 수신할 포트. |
+| `DSQL_MIGRATOR_AWS_REGION` | _(미설정)_ | boto3 클라이언트용 AWS 리전. |
+| `DSQL_MIGRATOR_AWS_PROFILE` | _(미설정)_ | 선택적 글로벌 AWS named profile. 미설정 시 표준 체인으로 폴백. 프로필 이름(비밀 아님)만 저장. |
+| `DSQL_MIGRATOR_JOB_STATE_PATH` | `job_state.sqlite` | Full Load 작업 스냅샷(상태, 테이블별 진행률, 워터마크) — 재시작 후 재개용. |
+| `DSQL_MIGRATOR_ACTIVITY_LOG_PATH` | `migration_activity.log` | 구조화된 활동 로그(이벤트당 UTC 타임스탬프 JSON 한 줄); UI에서 다운로드, 크기 제한·회전(~20 MB × 백업 4개). |
+| `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | 세션별 비밀 아닌 워크벤치 상태 — 재연결 브라우저가 이어서 작업. `DSQL_MIGRATOR_STORAGE_SECRET`과 함께 사용. 로컬 디스크 — Fargate 배포는 아래 durable S3 스토어를 대신 사용. |
+| `DSQL_MIGRATOR_SESSION_STATE_BUCKET` | _(미설정)_ | 세션 스냅샷용 durable S3 스토어 — 인프로세스 재시작뿐 아니라 Fargate 태스크 교체(재배포)까지 재개가 유지됨. Fargate 배포가 관리형 플러그인 버킷으로 자동 설정(설정 불필요); 로컬은 미설정 시 위 SQLite 경로 사용. |
+| `DSQL_MIGRATOR_STAGING_BUCKET` | _(미설정)_ | Full Load 스테이징용 S3 버킷(스트리밍 멀티파트 업로드 — 대형 테이블 확장 경로). 미설정 시 제한된 로컬 임시 CSV(개발 / 소형). |
+| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4` (≤16) | 동시에 로드하는 테이블 수. 총 DSQL 연결을 클러스터 쿼터 안에서 유지. |
+| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | 테이블당 in-flight `INSERT … ON CONFLICT` 배치 수. 높을수록 처리량↑, OCC(40001) 충돌↑. |
+| `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000` (≤3000) | 배치 쓰기당 행 수, DSQL의 트랜잭션당 3000행 한도로 하드캡. |
+| `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1` (켜짐) | 읽기 선행 prefetch 큐(리더 스레드가 bounded 큐를 채우는 동안 쓰기 진행). 켜 두세요. A/B 벤치마크로 pre-prefetch 경로를 재현할 때만 `0`. |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1` (꺼짐, ≤8) | 큰 단일 정수 PK 테이블의 읽기를 K개 동시 리더로 분할. 대개 이득이 드묾(리더가 GIL 바운드) — 매뉴얼 §7.2 참고. |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | 이 추정 행수 이상인 테이블만 리더 샤딩; 더 작은 테이블은 항상 단일 리더. |
+| `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4` (≤32) | Validation에서 동시에 비교하는 테이블 수. `1` = 순차. |
+| `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | 시작 로그 레벨. `DEBUG`는 실패 이벤트에 stacktrace(콜 스택만) 추가. 런타임에 **Diagnostics**에서도 변경 가능. |
+| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | 활동 로그 이벤트를 stdout에도 미러링(ECS에서는 → CloudWatch). 런타임에 **Diagnostics**에서 토글 가능. |
+| `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | AI 보조용 Bedrock 모델 / 추론 프로파일 id. `global.*` 프로파일은 모든 상용 리전에서 호출 가능하며, `us.*`는 미국 전용입니다. |
+| `BEDROCK_REGION` | _(미설정)_ | Amazon Bedrock 호출용 리전. |
+
+AI 보조는 기본 off이며 UI에서 켭니다. UI는 Bedrock 도달 가능 여부를 확인하고 조치 가능한 실패
+이유를 보고하는 **Verify AI access** 사전 점검도 제공합니다. 튜닝 노브의 배경은 매뉴얼
+[성능과 튜닝](docs/manual/ko/07-performance-and-tuning.md).
+
+> **CDC 스케일링은 여기서 설정하지 않고 추론됩니다.** 커넥터 노브(테이블별 토픽 파티션 수, 싱크
+> `tasks.max`, MSK Connect MCU)는 cdc-stack 배포 시점에 캡처 대상 테이블 수로부터 결정됩니다. 고급
+> 환경 변수 재정의(`DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` / `_SINK_TASKS_MAX` / `_MCU_COUNT`)는 매뉴얼
+> [§7.2 — CDC](docs/manual/ko/07-performance-and-tuning.md)에 문서화돼 있습니다.
+
+</details>
 
 ---
 
