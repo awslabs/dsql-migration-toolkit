@@ -5,7 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
-## v0.1.86
+## v0.1.87
+
+### Added
+
+- **The CDC screen now discovers existing CDC infrastructure and offers to attach
+  to it, instead of blindly re-deploying.** The tool tracked which CDC stack a
+  migration uses in session state only; a single-task app restart (an ECS/Fargate
+  task replacement) loses that, so a reconnected session defaulted to a fresh
+  "deploy CDC infrastructure" flow even when a CDC pipeline was already running
+  under a different stack name — risking a second, billable Amazon MSK cluster. The
+  CDC step now scans the account for `mysql-dsql-cdc-*` stacks and, when one exists
+  that the session doesn't target, surfaces it with a primary **"Attach to
+  &lt;stack&gt;"** action (fresh deploy is de-emphasized behind an expansion).
+  Attaching re-reads the pipeline's live state from AWS (running / provisioning /
+  infra), so a running pipeline lands straight on its monitoring view; it never
+  mutates the stack or connectors — starting over remains the explicit **Stop CDC**
+  (connectors only, keeps MSK) or **Delete CDC infrastructure** path. Requires the
+  CDC-deploy role to have `cloudformation:ListStacks` (added to the app stack);
+  discovery is best-effort and simply shows nothing if the grant is absent.
 
 ### Fixed
 

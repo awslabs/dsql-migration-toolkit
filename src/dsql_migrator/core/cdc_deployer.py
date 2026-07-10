@@ -54,6 +54,7 @@ from typing import Callable, Optional, Sequence
 from dsql_migrator.core.aws_session import BotoSessionLike, build_session
 from dsql_migrator.core.cdc import (
     CDC_PLACEHOLDER_PREFIX,
+    CDC_STACK_NAME_PREFIX,
     CDC_WATERMARK_PARAM_KEYS,
     CdcInfraParams,
     CdcStackParams,
@@ -634,6 +635,45 @@ class CdcStackDeployer:
             current_parameters=params,
             is_stable=status in _STABLE_STACK_STATES,
         )
+
+    def list_cdc_stacks(self) -> list[tuple[str, str]]:
+        """List every CloudFormation stack in this region in the
+        ``mysql-dsql-cdc-*`` family (excluding ``DELETE_COMPLETE``), as
+        ``(stack_name, stack_status)`` pairs.
+
+        Account-scoped discovery so the CDC screen can find infrastructure a prior
+        or other session already deployed under a name the current session no
+        longer remembers -- without it, a reset session (the app is single-task and
+        loses in-memory state on an ECS task replacement) shows a fresh "deploy"
+        flow and can silently create a SECOND, costly MSK stack. ``ListStacks`` has
+        no server-side name filter, so names are filtered client-side by
+        :data:`~dsql_migrator.core.cdc.CDC_STACK_NAME_PREFIX`.
+
+        Best-effort: returns ``[]`` on any read error (e.g. the deploy role lacks
+        ``cloudformation:ListStacks``), so this discovery is purely additive and
+        never blocks the screen. Paginates via ``NextToken``.
+        """
+        try:
+            client = self._client("cloudformation")
+            found: list[tuple[str, str]] = []
+            token: Optional[str] = None
+            while True:
+                resp = (
+                    client.list_stacks(NextToken=token)  # type: ignore[attr-defined]
+                    if token
+                    else client.list_stacks()  # type: ignore[attr-defined]
+                )
+                for summary in resp.get("StackSummaries", []) or []:
+                    name = str(summary.get("StackName", ""))
+                    status = str(summary.get("StackStatus", ""))
+                    if name.startswith(CDC_STACK_NAME_PREFIX) and status != "DELETE_COMPLETE":
+                        found.append((name, status))
+                token = resp.get("NextToken")
+                if not token:
+                    break
+            return found
+        except Exception:  # noqa: BLE001 - best-effort; discovery must never block
+            return []
 
     def create_stack(
         self, stack_name: str, template_body: str, parameters: Sequence[tuple[str, str]]

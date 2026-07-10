@@ -682,10 +682,16 @@ Resources:
                 Resource:
                   - Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/mysql-dsql-cdc-*/*
                   - Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/mysql-dsql-cdc-*
-              # ValidateTemplate has no stack ARN; read-only.
-              - Sid: CloudFormationValidate
+              # ValidateTemplate + ListStacks have no stack ARN (they are account/
+              # region-wide); read-only. ListStacks lets the CDC screen discover an
+              # existing mysql-dsql-cdc-* stack that a reset session no longer
+              # remembers, so it can adopt it instead of silently creating a second
+              # (costly) MSK stack. Names are filtered to the cdc family client-side.
+              - Sid: CloudFormationAccountReads
                 Effect: Allow
-                Action: cloudformation:ValidateTemplate
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:ListStacks
                 Resource: "*"
               # Stage the oversize cdc-stack template in the plugin bucket: this role
               # does the PutObject; CloudFormation reads it back (TemplateURL) too.

@@ -459,13 +459,18 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
             aws_profile=getattr(session, "aws_profile", None),
             assume_role_arn=getattr(migration_state, "cdc_deploy_role_arn", None),
         )
-        discovery = deployer.describe_stack_or_none(
-            getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
-        )
+        mine = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
+        discovery = deployer.describe_stack_or_none(mine)
+        # Account-scoped discovery: OTHER mysql-dsql-cdc-* stacks this session does
+        # not target. Lets the card offer to ADOPT an existing pipeline instead of
+        # deploying a duplicate (a reset single-task session forgets which stack it
+        # deployed). Best-effort (list_cdc_stacks returns [] on any read error).
+        others = [(n, s) for (n, s) in deployer.list_cdc_stacks() if n != mine]
     except Exception:  # noqa: BLE001 - leave unprobed; card defaults to Deploy
         return
     phase, status = _classify_cdc_stack_phase(discovery)
     migration_state.set_cdc_stack_phase(phase, status=status)
+    migration_state.set_cdc_other_stacks(others)
 
 
 def _ensure_cdc_controller(migration_state, session) -> None:

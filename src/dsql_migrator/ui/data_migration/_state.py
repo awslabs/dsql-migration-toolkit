@@ -177,6 +177,12 @@ class DataMigrationState:
         self.cdc_stack_phase: Optional[str] = None
         self.cdc_stack_phase_status: Optional[str] = None
         self.cdc_stack_phase_checked: bool = False
+        # Other ``mysql-dsql-cdc-*`` stacks discovered in the account that the
+        # current session does NOT target (name != ``cdc_stack_name``). Populated
+        # best-effort by the render-time probe so the CDC screen can offer to ADOPT
+        # an existing pipeline instead of showing a fresh deploy -- and never
+        # silently create a second, costly MSK stack. List of (name, StackStatus).
+        self.cdc_other_stacks: list[tuple[str, str]] = []
         # Monotonic timestamp of the last render-time CDC discovery (describe +
         # list connectors); throttles those AWS reads across rapid re-renders.
         # Reset to None here so a Start-over (reset_in_place re-runs __init__)
@@ -360,6 +366,29 @@ class DataMigrationState:
             self.cdc_stack_phase = phase
             self.cdc_stack_phase_status = status
             self.cdc_stack_phase_checked = True
+
+    def set_cdc_other_stacks(self, stacks: list[tuple[str, str]]) -> None:
+        """Cache other ``mysql-dsql-cdc-*`` stacks found in the account whose name is
+        NOT the one this session targets, so the CDC screen can offer to adopt an
+        existing pipeline instead of deploying a duplicate."""
+        with self._lock:
+            self.cdc_other_stacks = list(stacks)
+
+    def adopt_cdc_stack(self, name: str) -> bool:
+        """Adopt an existing cdc-stack: point the session at ``name`` and force a
+        fresh discovery so the CDC screen re-derives the TRUE live state (running /
+        infra) from AWS rather than a stale probe. Returns ``False`` if ``name`` is
+        invalid. Read/attach only -- it never mutates the live stack or connectors
+        (starting fresh is the explicit Stop/Delete path, not adoption)."""
+        if not self.set_cdc_stack_name(name):
+            return False
+        with self._lock:
+            self._cdc_discovery_monotonic = None  # force the next render probe to re-run
+            self.cdc_stack_phase = None
+            self.cdc_stack_phase_status = None
+            self.cdc_stack_phase_checked = False
+            self.cdc_other_stacks = []
+        return True
 
     def append_cdc_deploy_log(self, when: datetime, message: str) -> None:
         """Append one timestamped line to the deploy step log (thread-safe)."""

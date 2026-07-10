@@ -81,6 +81,11 @@ class _FakeClient:
         self._maybe_raise("list_connectors")
         return self._responses.get("list_connectors", {})
 
+    def list_stacks(self, **kw: Any) -> Any:
+        self.calls.append(("list_stacks", kw))
+        self._maybe_raise("list_stacks")
+        return self._responses.get("list_stacks", {})
+
     def create_stack(self, **kw: Any) -> Any:
         self.calls.append(("create_stack", kw))
         self._maybe_raise("create_stack")
@@ -292,6 +297,60 @@ def test_connector_state_found() -> None:
 def test_connector_state_absent_is_none() -> None:
     client = _FakeClient({"list_connectors": {"connectors": []}})
     assert _dep(client).connector_state("c") is None
+
+
+def test_list_cdc_stacks_filters_family_and_excludes_deleted() -> None:
+    # Account-scoped discovery: keep only the mysql-dsql-cdc-* family and drop
+    # DELETE_COMPLETE (a gone stack), so the CDC screen can adopt a real existing one.
+    client = _FakeClient({"list_stacks": {"StackSummaries": [
+        {"StackName": "mysql-dsql-cdc-seoul-test", "StackStatus": "UPDATE_COMPLETE"},
+        {"StackName": "mysql-dsql-cdc-orders", "StackStatus": "CREATE_COMPLETE"},
+        {"StackName": "mysql-dsql-cdc-old", "StackStatus": "DELETE_COMPLETE"},   # gone
+        {"StackName": "some-other-stack", "StackStatus": "CREATE_COMPLETE"},     # not ours
+    ]}})
+    assert _dep(client).list_cdc_stacks() == [
+        ("mysql-dsql-cdc-seoul-test", "UPDATE_COMPLETE"),
+        ("mysql-dsql-cdc-orders", "CREATE_COMPLETE"),
+    ]
+
+
+def test_list_cdc_stacks_empty_on_read_error() -> None:
+    # Best-effort: a read error (e.g. deploy role lacks cloudformation:ListStacks)
+    # must degrade to [] so discovery never blocks the screen.
+    client = _FakeClient({}, raise_on={"list_stacks": RuntimeError("AccessDenied")})
+    assert _dep(client).list_cdc_stacks() == []
+
+
+def test_list_cdc_stacks_paginates() -> None:
+    from dsql_migrator.core.cdc_deployer import CdcStackDeployer
+
+    pages = [
+        {"StackSummaries": [
+            {"StackName": "mysql-dsql-cdc-a", "StackStatus": "CREATE_COMPLETE"}],
+         "NextToken": "t2"},
+        {"StackSummaries": [
+            {"StackName": "mysql-dsql-cdc-b", "StackStatus": "UPDATE_COMPLETE"}]},
+    ]
+
+    class _Paged:
+        def __init__(self) -> None:
+            self.n = 0
+            self.tokens: list = []
+
+        def list_stacks(self, **kw: Any) -> Any:
+            self.tokens.append(kw.get("NextToken"))
+            page = pages[self.n]
+            self.n += 1
+            return page
+
+    paged = _Paged()
+    result = CdcStackDeployer("us-east-1", session=_FakeSession(paged)).list_cdc_stacks()
+    assert result == [
+        ("mysql-dsql-cdc-a", "CREATE_COMPLETE"),
+        ("mysql-dsql-cdc-b", "UPDATE_COMPLETE"),
+    ]
+    # First call has no token; the second follows NextToken from page 1.
+    assert paged.tokens == [None, "t2"]
 
 
 def test_connector_state_raises_on_read_error() -> None:

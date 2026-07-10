@@ -1156,10 +1156,21 @@ def _render_cdc_start_action(
             ):
                 ui.timer(_CDC_POLL_INTERVAL_SECONDS, refresh, once=True)  # type: ignore[attr-defined]
         else:  # absent / not yet probed
-            _render_cdc_infra_deploy_action(
-                ui, migration_state, job_manager, refresh,
-                inventory=inventory, session=session,
-            )
+            # Account-scoped discovery: if CDC infra already exists under a name this
+            # (reset) session does not target, offer to ADOPT it rather than deploy a
+            # duplicate (a second, costly MSK cluster). Adoption re-reads the live
+            # state from AWS, so a running pipeline lands on its monitoring view.
+            other_stacks = getattr(migration_state, "cdc_other_stacks", []) or []
+            if other_stacks:
+                _render_cdc_adopt_or_deploy_choice(
+                    ui, migration_state, job_manager, refresh, other_stacks,
+                    inventory=inventory, session=session,
+                )
+            else:
+                _render_cdc_infra_deploy_action(
+                    ui, migration_state, job_manager, refresh,
+                    inventory=inventory, session=session,
+                )
 
         # Full teardown (guarded) once a stack might exist. When a connector is up
         # (running OR partial) the inline primary action is Stop CDC (connectors
@@ -1384,6 +1395,50 @@ def _render_cdc_running_actions(
     ui.button(  # type: ignore[attr-defined]
         "Stop CDC", on_click=_confirm, icon="stop_circle"
     ).props("color=amber outline")
+
+def _render_cdc_adopt_or_deploy_choice(
+    ui, migration_state, job_manager, refresh, other_stacks, *,
+    inventory=None, session=None,
+) -> None:
+    """CDC infra exists under a name this (reset) session does not target: offer to
+    ADOPT it instead of deploying a duplicate.
+
+    Deploying a second cdc-stack means a second, billable Amazon MSK cluster, so the
+    adopt path is primary. Adoption is read/attach-only -- it re-reads the live state
+    from AWS (running / provisioning / infra), so a running pipeline lands straight on
+    its monitoring view; starting fresh remains the explicit Stop/Delete path, never a
+    side effect of adopting. A separate fresh deploy stays reachable but de-emphasized.
+    """
+    listed = ", ".join(f"{name} ({status})" for name, status in other_stacks)
+    render_notice(
+        ui,
+        tone="warning",
+        header="Existing CDC infrastructure found",
+        body=(
+            f"This account already has CDC infrastructure: {listed}. Deploying a new "
+            "one would create a SEPARATE Amazon MSK cluster (ongoing cost). Attach to "
+            "the existing pipeline instead — the tool re-reads its live state from AWS "
+            "(if its connectors are already running, you go straight to monitoring)."
+        ),
+    )
+    with ui.row().classes("items-center gap-2 flex-wrap w-full"):  # type: ignore[attr-defined]
+        for name, _status in other_stacks:
+            def _adopt(_name=name) -> None:
+                if migration_state.adopt_cdc_stack(_name):
+                    refresh()
+            ui.button(  # type: ignore[attr-defined]
+                f"Attach to {name}", on_click=_adopt, icon="link"
+            ).props("color=primary")
+    # A fresh, separate deploy stays available but de-emphasized (a duplicate MSK is
+    # expensive and rarely intended). Reuses the standard deploy form + guard dialog.
+    with ui.expansion(  # type: ignore[attr-defined]
+        "Deploy a separate CDC pipeline instead", icon="warning"
+    ).classes("w-full"):
+        _render_cdc_infra_deploy_action(
+            ui, migration_state, job_manager, refresh,
+            inventory=inventory, session=session,
+        )
+
 
 def _render_cdc_infra_deploy_action(
     ui, migration_state, job_manager, refresh, *, inventory=None, session=None

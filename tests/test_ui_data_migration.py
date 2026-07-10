@@ -1390,6 +1390,60 @@ def test_ensure_cdc_controller_detects_deployed_connectors_for_start_over() -> N
     assert state.cdc_connector_running_names == [src, sink]
 
 
+def test_adopt_cdc_stack_points_session_and_forces_rediscovery() -> None:
+    # Adopting an existing stack must (a) set the stack name, (b) force a fresh
+    # discovery (reset throttle + clear cached phase) so the screen re-reads the live
+    # state, and (c) clear the "other stacks" list. It must not mutate AWS.
+    state = DataMigrationState()
+    state.set_cdc_other_stacks([("mysql-dsql-cdc-seoul-test", "UPDATE_COMPLETE")])
+    state.set_cdc_stack_phase("absent", status=None)
+    state._cdc_discovery_monotonic = 123.0
+
+    assert state.adopt_cdc_stack("mysql-dsql-cdc-seoul-test") is True
+    assert state.cdc_stack_name == "mysql-dsql-cdc-seoul-test"
+    assert state._cdc_discovery_monotonic is None    # throttle reset -> next render re-probes
+    assert state.cdc_stack_phase is None             # cached phase cleared
+    assert state.cdc_stack_phase_checked is False
+    assert state.cdc_other_stacks == []              # others cleared after adopting one
+
+    # A name outside the mysql-dsql-cdc-* family is rejected; the name is unchanged.
+    assert state.adopt_cdc_stack("not-a-cdc-stack") is False
+    assert state.cdc_stack_name == "mysql-dsql-cdc-seoul-test"
+
+
+def test_probe_cdc_stack_phase_populates_other_stacks(monkeypatch) -> None:
+    # The render-time probe surfaces OTHER mysql-dsql-cdc-* stacks (name != mine) so
+    # the card can offer to adopt an existing pipeline instead of deploying a duplicate.
+    import dsql_migrator.core.cdc_deployer as deployer_mod
+    from dsql_migrator.ui.data_migration._status import _probe_cdc_stack_phase
+
+    state = DataMigrationState()  # default stack name
+    mine = state.cdc_stack_name
+
+    class _FakeDeployer:
+        def describe_stack_or_none(self, name):
+            return None  # my stack not deployed under the current (default) name
+
+        def list_cdc_stacks(self):
+            return [
+                (mine, "CREATE_COMPLETE"),  # mine -> filtered out
+                ("mysql-dsql-cdc-seoul-test", "UPDATE_COMPLETE"),
+            ]
+
+    monkeypatch.setattr(
+        deployer_mod, "build_cdc_stack_deployer", lambda *a, **k: _FakeDeployer()
+    )
+
+    class _Sess:
+        class target_config:
+            region = "ap-northeast-2"
+
+        aws_profile = None
+
+    _probe_cdc_stack_phase(state, _Sess())
+    assert state.cdc_other_stacks == [("mysql-dsql-cdc-seoul-test", "UPDATE_COMPLETE")]
+
+
 def test_fetch_cdc_status_is_pure_read_then_apply_builds_view() -> None:
     # The live poller splits the blocking network read (_fetch_cdc_status, run on a
     # worker thread) from the in-memory view build (_apply_cdc_status, run on the
