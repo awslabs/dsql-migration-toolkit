@@ -27,6 +27,8 @@ from dsql_migrator.core.cdc_deployer import (
     CDC_STOP_STAGES,
     CdcDeployError,
     CdcStackDiscovery,
+    _MAX_STATE_READ_FAILURES,
+    _wait_connector_running,
     run_cdc_delete,
     run_cdc_infra_deploy,
     run_cdc_start,
@@ -824,3 +826,76 @@ def test_connector_failed_without_known_log_falls_back_to_generic() -> None:
     with pytest.raises(CdcDeployError) as excinfo:
         _run_start(handle, deployer)
     assert "FAILED" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# _wait_connector_running: a connector-state READ failure must be surfaced, not
+# masqueraded as "still creating" (the bug where a RUNNING source connector never
+# advanced to the sink pass because connector_state kept returning None).
+# ---------------------------------------------------------------------------
+
+
+class _WaitDriver:
+    """Minimal _StageDriver double for _wait_connector_running (no real sleeps)."""
+
+    cancelled = False
+
+    def __init__(self) -> None:
+        self.logs: list[str] = []
+
+    def heartbeat(self) -> None:
+        pass
+
+    def log(self, msg: str) -> None:
+        self.logs.append(msg)
+
+    def sleep(self, _seconds: float) -> None:
+        pass  # never wait for real in tests
+
+
+class _StateSeqDeployer:
+    """Scripts connector_state as a sequence; an Exception item is RAISED (read error)."""
+
+    def __init__(self, seq: list) -> None:
+        self._seq = list(seq)
+
+    def connector_state(self, _name: str):
+        value = self._seq.pop(0) if len(self._seq) > 1 else self._seq[0]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def connector_log_tail(self, *_a, **_k) -> str:
+        return ""
+
+
+def _wait(deployer, *, timeout=1e9):
+    _wait_connector_running(deployer, "c", "stage", _WaitDriver(), timeout, 0)
+
+
+def test_wait_connector_running_returns_on_running() -> None:
+    _wait(_StateSeqDeployer(["CREATING", "RUNNING"]))  # no raise = success
+
+
+def test_wait_connector_running_tolerates_a_transient_read_blip() -> None:
+    # One read error then RUNNING: a transient blip is tolerated (streak resets).
+    _wait(_StateSeqDeployer([RuntimeError("throttled"), "RUNNING"]))
+
+
+def test_wait_connector_running_surfaces_persistent_read_failure() -> None:
+    # Every read fails (non-terminal): after the tolerance budget, fail WITH the
+    # cause instead of looping on "creating…" forever.
+    seq = [RuntimeError("kafkaconnect unreachable")] * (_MAX_STATE_READ_FAILURES + 1)
+    with pytest.raises(CdcDeployError) as ei:
+        _wait(_StateSeqDeployer(seq))
+    assert "Could not read" in str(ei.value)
+
+
+def test_wait_connector_running_fails_fast_on_expired_credentials() -> None:
+    # A credential-expiry read error will not self-heal -> fail immediately (not
+    # after burning the whole retry budget) with an actionable, retryable message.
+    err = RuntimeError("ExpiredTokenException: the security token is expired")
+    with pytest.raises(CdcDeployError) as ei:
+        _wait(_StateSeqDeployer([err]))
+    msg = str(ei.value)
+    assert "Could not read" in msg and ("expired" in msg.lower() or "Credentials" in msg)

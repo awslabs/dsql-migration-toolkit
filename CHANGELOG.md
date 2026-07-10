@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.86
+
+### Fixed
+
+- **CDC no longer stalls silently when it can't read a connector's state; it
+  surfaces the cause.** When starting CDC, the tool waits for the source connector
+  to reach `RUNNING` before it requests the sink connector. That wait read the
+  connector state through a helper that swallowed **every** error (credential
+  expiry, throttling, a transient network blip) to `None` — indistinguishable from
+  "still creating" — so a read failure made the wait log "creating…" forever: the
+  sink was never requested, the deploy appeared stuck, and no error was shown.
+  Recovering then required restarting the app task, which on Fargate wipes the
+  in-progress session (all workflow steps had to be redone). Now the state read
+  **propagates** errors; the `RUNNING`-wait tolerates a few consecutive transient
+  read failures and then fails with the **actual cause**, and fails **immediately**
+  on a non-recoverable credential/authorization error with a "retry Start CDC"
+  hint. A genuinely-absent connector still reads as `None` (unchanged), so normal
+  "still provisioning" polling is unaffected.
+
 ## v0.1.85
 
 ### Fixed

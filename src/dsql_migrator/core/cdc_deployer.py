@@ -120,6 +120,38 @@ CDC_DELETE_STAGES: tuple[tuple[str, str], ...] = (
 _CONNECTOR_RUNNING = "RUNNING"
 _CONNECTOR_FAILED = "FAILED"
 
+# How many CONSECUTIVE connector-state read failures a RUNNING-wait tolerates before
+# it gives up and surfaces the cause. A read failure (throttle, transient network,
+# credential expiry) must NOT masquerade as "still creating" and stall the wait
+# forever with no error -- the observed failure mode where the source connector was
+# RUNNING but the deploy never advanced to the sink pass.
+_MAX_STATE_READ_FAILURES = 5
+
+# AWS error codes/markers for a NON-self-healing read failure (credentials expired,
+# access lost). These will never recover on retry, so the wait fails immediately
+# with an actionable cause instead of burning the whole retry budget.
+_TERMINAL_READ_ERROR_MARKERS = (
+    "ExpiredToken",
+    "ExpiredTokenException",
+    "InvalidClientTokenId",
+    "UnrecognizedClientException",
+    "SignatureDoesNotMatch",
+    "AccessDenied",
+    "AccessDeniedException",
+    "UnauthorizedOperation",
+)
+
+
+def _is_terminal_read_error(exc: Exception) -> bool:
+    """True when ``exc`` is a credential/authorization failure that will not recover
+    on retry (so the RUNNING-wait should fail fast with the cause, not keep polling)."""
+    code = ""
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        code = str(response.get("Error", {}).get("Code", ""))
+    text = code + " " + str(exc)
+    return any(marker in text for marker in _TERMINAL_READ_ERROR_MARKERS)
+
 
 class CdcDeployError(RuntimeError):
     """A deploy precondition failed (bad stack state, unfilled placeholder, …)."""
@@ -506,14 +538,21 @@ class CdcStackDeployer:
             return None
 
     def connector_state(self, connector_name: str) -> Optional[str]:
-        """Return the named connector's ``connectorState``, or ``None`` if absent."""
-        try:
-            client = self._client("kafkaconnect")
-            for c in client.list_connectors().get("connectors", []) or []:
-                if c.get("connectorName") == connector_name:
-                    return str(c.get("connectorState"))
-        except Exception:  # noqa: BLE001
-            return None
+        """Return the named connector's ``connectorState``, or ``None`` if it is not
+        present in the (successfully read) connector list.
+
+        Raises on an API/read error (credential expiry, throttle, permission) rather
+        than swallowing it to ``None``. A swallowed read error is indistinguishable
+        from "connector absent"/"still creating", so it made a RUNNING-wait poll
+        (:func:`_wait_connector_running`) loop on "creating…" forever with no surfaced
+        cause -- the observed failure where a RUNNING source never advanced to the
+        sink pass. Callers that only want a best-effort snapshot (fast-path skips)
+        wrap this and treat any error as ``None``; the RUNNING-wait treats a raised
+        error as a bounded-retry / fail-with-cause signal."""
+        client = self._client("kafkaconnect")
+        for c in client.list_connectors().get("connectors", []) or []:
+            if c.get("connectorName") == connector_name:
+                return str(c.get("connectorState"))
         return None
 
     def connector_log_tail(
@@ -1232,7 +1271,13 @@ def run_cdc_start(
         )
 
         # -- Pass A: source connector (DeploySink=false) ----------------------
-        src_state = deployer.connector_state(src_name)
+        # Best-effort pre-check: a read error here only means "cannot confirm it is
+        # already RUNNING", so fall through to the (idempotent) pass rather than
+        # failing. A persistent read error surfaces in the RUNNING-wait below.
+        try:
+            src_state = deployer.connector_state(src_name)
+        except Exception:  # noqa: BLE001
+            src_state = None
         if src_state == _CONNECTOR_RUNNING and not config_changed:
             driver.log(
                 f"{src_name}: already RUNNING with the requested configuration "
@@ -1290,7 +1335,10 @@ def run_cdc_start(
             return
 
         # -- Pass B: sink connector (DeploySink=true) -------------------------
-        sink_state = deployer.connector_state(sink_name)
+        try:
+            sink_state = deployer.connector_state(sink_name)
+        except Exception:  # noqa: BLE001
+            sink_state = None  # cannot confirm -> run the (idempotent) sink pass
         if sink_state == _CONNECTOR_RUNNING and not config_changed:
             driver.log(
                 f"{sink_name}: already RUNNING with the requested configuration "
@@ -1583,13 +1631,40 @@ def _wait_connector_running(
     "entered FAILED state".
     """
     deadline = _monotonic_deadline(timeout)
+    read_failures = 0
     while True:
         if driver.cancelled:
             return
         # Prove liveness each poll so a connector that legitimately takes many
         # minutes to reach RUNNING is not reaped by the stall watchdog.
         driver.heartbeat()
-        state = deployer.connector_state(connector)
+        try:
+            state = deployer.connector_state(connector)
+        except Exception as exc:  # noqa: BLE001 - a state READ failure, not a state
+            # A read failure must NOT masquerade as "still creating" (that stalled the
+            # deploy forever with no surfaced cause). A credential/authorization error
+            # will not self-heal -> fail immediately with the cause; a transient error
+            # is tolerated for a few consecutive polls, then surfaced.
+            read_failures += 1
+            cause = str(exc).splitlines()[0]
+            terminal = _is_terminal_read_error(exc)
+            driver.log(
+                f"{connector}: could not read state ({cause}) "
+                f"[{read_failures}/{_MAX_STATE_READ_FAILURES}]"
+            )
+            if terminal or read_failures >= _MAX_STATE_READ_FAILURES:
+                hint = (
+                    " Credentials may have expired or access was lost; retry Start CDC."
+                    if terminal else ""
+                )
+                raise CdcDeployError(
+                    f"Could not read {connector} state: {cause}.{hint}"
+                )
+            if _deadline_passed(deadline):
+                raise CdcDeployError(f"{connector} did not reach RUNNING in time.")
+            driver.sleep(interval)
+            continue
+        read_failures = 0  # a successful read clears the transient-failure streak
         if state == _CONNECTOR_RUNNING:
             driver.log(f"{connector}: RUNNING")
             return

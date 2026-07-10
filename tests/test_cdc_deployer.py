@@ -294,6 +294,16 @@ def test_connector_state_absent_is_none() -> None:
     assert _dep(client).connector_state("c") is None
 
 
+def test_connector_state_raises_on_read_error() -> None:
+    # A read/API error must PROPAGATE (it was previously swallowed to None, which is
+    # indistinguishable from "connector absent" and made a RUNNING-wait loop on
+    # "creating…" forever with no surfaced cause). None is reserved for a connector
+    # genuinely absent from a SUCCESSFULLY-read list.
+    client = _FakeClient({}, raise_on={"list_connectors": RuntimeError("throttled")})
+    with pytest.raises(RuntimeError):
+        _dep(client).connector_state("c")
+
+
 def test_stack_status_returns_value() -> None:
     client = _FakeClient({"describe_stacks": _stack(status="UPDATE_COMPLETE")})
     assert _dep(client).stack_status("s") == "UPDATE_COMPLETE"
