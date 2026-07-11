@@ -5,6 +5,23 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.99
+
+### 수정 (Fixed)
+
+- **테이블별 순증 행수 모니터가 이제 cluster 모드뿐 아니라 single-database 모드에서도
+  동작합니다.** DSQL 싱크는 `NetRowsApplied` 메트릭의 `Table` 차원을 항상 **스키마 정규화된**
+  형태(`db.table`, 예: `ecommerce_demo.orders`)로 발행하는데, single-database 모드에서는 툴이
+  테이블을 **bare** 이름(`orders`)으로 지칭하므로 모니터의 정확 차원 CloudWatch 조회가 빗나가
+  "Full Load 이후 순증 행수" 컬럼이 조용히 `COUNT(*)` 기반 값으로 폴백했습니다. 이제 reader가
+  해당 스택에 대해 싱크가 실제로 발행한 `Table` 차원 값들을 `ListMetrics`로 발견한 뒤, 요청된
+  테이블을 정확 이름으로, 없으면 **모호하지 않은 bare** 테이블 이름으로 매칭합니다 — 그래서 정규화
+  방식을 가정하지 않고 cluster(이미 정규화됨)와 single-database(bare) 양쪽에서 스캔 없는 컬럼이
+  동작합니다. bare 이름이 모호한 경우(두 스키마에 같은 테이블 이름)는 잘못 귀속시키지 않도록
+  건너뜁니다(해당 테이블은 COUNT로 폴백). 앱 태스크 역할에 `cloudwatch:ListMetrics`를 부여합니다
+  (리소스 수준 스코핑이 없어 Resource `*`). reader + IAM 변경만 있고 커넥터/플러그인 변경은
+  없습니다: 배포하면 역할이 갱신되고 reader가 반영됩니다 — 플러그인 재빌드나 CDC 재배포 불필요.
+
 ## v0.1.98
 
 ### 추가 (Added)

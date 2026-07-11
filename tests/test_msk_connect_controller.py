@@ -47,6 +47,12 @@ class _FakeClient:
             raise RuntimeError("boom")
         return self._responses.get("get_metric_data", {})
 
+    def list_metrics(self, **kwargs: Any) -> Any:
+        self.calls.append(("list_metrics", kwargs))
+        if self._raise_on == "list_metrics":
+            raise RuntimeError("boom")
+        return self._responses.get("list_metrics", {})
+
     def delete_connector(self, **kwargs: Any) -> Any:
         self.calls.append(("delete_connector", kwargs))
         if self._raise_on == "delete_connector":
@@ -207,31 +213,110 @@ def test_health_empty_names_makes_no_call() -> None:
     assert _controller(client).connector_health([]) == {}
 
 
-def test_net_rows_by_table_sums_delta_datapoints() -> None:
-    # Query ids are n{tableIndex}; the sink's per-commit deltas are summed per table.
+def _net_rows_responses(list_tables: list[str], data: dict[str, list[float]]) -> dict:
+    """Canned ListMetrics (discovered Table dims) + GetMetricData (n{i} -> values)."""
+    return {
+        "list_metrics": {
+            "Metrics": [
+                {"Dimensions": [{"Name": "Stack", "Value": "stk"},
+                                {"Name": "Table", "Value": t}]}
+                for t in list_tables
+            ]
+        },
+        "get_metric_data": {
+            "MetricDataResults": [
+                {"Id": f"n{i}", "Values": vals} for i, vals in enumerate(data.values())
+            ]
+        },
+    }
+
+
+def test_net_rows_by_table_exact_match_cluster_mode() -> None:
+    # Cluster mode: the tool's names are already schema-qualified and match the
+    # sink's Table dimension exactly. Query ids are n{i}; per-commit deltas summed.
     client = _FakeClient(
-        {"get_metric_data": {"MetricDataResults": [
-            {"Id": "n0", "Values": [5.0, 3.0]},   # orders: 8 net rows applied
-            {"Id": "n1", "Values": []},           # customers: no datapoint -> absent
-        ]}}
+        _net_rows_responses(
+            ["cdc_demo.orders", "cdc_demo.customers"],
+            {"cdc_demo.orders": [5.0, 3.0], "cdc_demo.customers": []},
+        )
     )
     got = _controller(client).net_rows_by_table(
-        "mysql-dsql-cdc-seoul-test", ["orders", "customers"]
+        "stk", ["cdc_demo.orders", "cdc_demo.customers"]
     )
+    assert got == {"cdc_demo.orders": 8}
+
+
+def test_net_rows_by_table_suffix_match_single_db_mode() -> None:
+    # Single-db mode: the tool uses bare names ("orders") but the sink always
+    # publishes schema-qualified ("ecommerce_demo.orders"). The bare name must still
+    # match the one published value (this is the whole point of discover-then-match).
+    client = _FakeClient(
+        _net_rows_responses(["ecommerce_demo.orders"], {"orders": [10.0, -2.0]})
+    )
+    got = _controller(client).net_rows_by_table("stk", ["orders"])
     assert got == {"orders": 8}
+    # It discovered via ListMetrics before querying data.
+    assert [c[0] for c in client.calls] == ["list_metrics", "get_metric_data"]
+
+
+def test_net_rows_by_table_ambiguous_bare_name_skipped() -> None:
+    # A bare name matching two schemas' tables is ambiguous -> skipped (falls back to
+    # COUNT) rather than attributing another schema's rows to it.
+    client = _FakeClient(
+        {"list_metrics": {"Metrics": [
+            {"Dimensions": [{"Name": "Table", "Value": "a.orders"}]},
+            {"Dimensions": [{"Name": "Table", "Value": "b.orders"}]},
+        ]}}
+    )
+    got = _controller(client).net_rows_by_table("stk", ["orders"])
+    assert got == {}
+    # No data query when nothing matched unambiguously.
+    assert [c[0] for c in client.calls] == ["list_metrics"]
+
+
+def test_net_rows_by_table_empty_when_nothing_published() -> None:
+    # No metrics discovered -> return {} without a GetMetricData call.
+    client = _FakeClient({"list_metrics": {"Metrics": []}})
+    assert _controller(client).net_rows_by_table("stk", ["orders"]) == {}
+    assert [c[0] for c in client.calls] == ["list_metrics"]
 
 
 def test_net_rows_by_table_empty_on_error() -> None:
-    client = _FakeClient({}, raise_on="get_metric_data")
-    assert _controller(client).net_rows_by_table("stk", ["orders"]) == {}
+    # Fail closed on either the discovery or the data read.
+    assert _controller(_FakeClient({}, raise_on="list_metrics")).net_rows_by_table(
+        "stk", ["orders"]
+    ) == {}
+    client = _FakeClient(
+        {"list_metrics": {"Metrics": [
+            {"Dimensions": [{"Name": "Table", "Value": "orders"}]}]}},
+        raise_on="get_metric_data",
+    )
+    assert client and _controller(client).net_rows_by_table("stk", ["orders"]) == {}
 
 
 def test_net_rows_by_table_no_call_without_stack_or_tables() -> None:
-    client = _FakeClient({"get_metric_data": {"MetricDataResults": []}})
+    client = _FakeClient({"list_metrics": {"Metrics": []}})
     assert _controller(client).net_rows_by_table("", ["orders"]) == {}
     assert _controller(client).net_rows_by_table("stk", []) == {}
     assert client.calls == []  # never hit CloudWatch
-    assert client.calls == []
+
+
+def test_match_metric_tables_prefers_exact_then_unambiguous_bare() -> None:
+    from dsql_migrator.core.msk_connect_controller import _match_metric_tables
+
+    discovered = ["cdc_demo.orders", "cdc_demo.customers", "other.orders"]
+    # Exact qualified name -> itself.
+    assert _match_metric_tables(["cdc_demo.customers"], discovered) == {
+        "cdc_demo.customers": "cdc_demo.customers"
+    }
+    # Bare "customers" is unambiguous -> the one qualified value.
+    assert _match_metric_tables(["customers"], discovered) == {
+        "customers": "cdc_demo.customers"
+    }
+    # Bare "orders" is ambiguous (two schemas) -> skipped.
+    assert _match_metric_tables(["orders"], discovered) == {}
+    # Unknown table -> skipped.
+    assert _match_metric_tables(["nope"], discovered) == {}
 
 
 # ---------------------------------------------------------------------------

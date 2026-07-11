@@ -604,11 +604,17 @@ Resources:
               # Read the pipeline's CloudWatch metrics for the live health panel:
               # the built-in AWS/KafkaConnect throughput/task metrics
               # (SinkRecordSendRate, SourceRecordPollRate, Running/ErroredTaskCount)
-              # AND the sink's per-table net-rows custom metric. get_metric_data has
-              # no resource-level scoping, so it is granted on "*" (like ListConnectors).
+              # AND the sink's per-table net-rows custom metric. ListMetrics discovers
+              # the sink's actual per-table dimension values (the sink emits the Table
+              # dimension schema-qualified, e.g. db.table) so the monitor matches them
+              # to the tool's table names regardless of single-db vs cluster naming.
+              # Neither API has resource-level scoping, so both are granted on "*"
+              # (like ListConnectors).
               - Sid: ReadConnectorMetrics
                 Effect: Allow
-                Action: cloudwatch:GetMetricData
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:ListMetrics
                 Resource: "*"
               # Read connector worker logs to surface an actionable reason when a
               # connector enters FAILED (worker-log-driven diagnosis in the UI).

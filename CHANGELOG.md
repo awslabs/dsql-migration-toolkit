@@ -5,6 +5,26 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.99
+
+### Fixed
+
+- **The per-table net-rows monitor now works in single-database mode, not just
+  cluster mode.** The DSQL sink always emits the `NetRowsApplied` metric's `Table`
+  dimension **schema-qualified** (`db.table`, e.g. `ecommerce_demo.orders`), but in
+  single-database mode the tool addresses tables by **bare** name (`orders`) — so the
+  monitor's exact-dimension CloudWatch lookup missed and the "Net rows since Full
+  Load" column silently fell back to the `COUNT(*)`-based figure. The reader now
+  `ListMetrics`-discovers the `Table` dimension values the sink actually published for
+  the stack and matches each requested table by exact name, else by an **unambiguous
+  bare** table name — so the scan-free column works in both cluster (already-qualified)
+  and single-database (bare) naming, without assuming the qualification scheme.
+  Ambiguous bare matches (the same table name under two schemas) are skipped rather
+  than risk misattributing rows (that table falls back to the COUNT). Grants the app
+  task role `cloudwatch:ListMetrics` (Resource `*` — the API has no resource-level
+  scoping). Reader + IAM only (no connector/plugin change): a deploy updates the role
+  and ships the reader — no plugin rebuild or CDC re-deploy needed.
+
 ## v0.1.98
 
 ### Added

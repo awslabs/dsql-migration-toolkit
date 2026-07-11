@@ -83,6 +83,34 @@ _CDC_METRIC_NAMESPACE = "MysqlDsqlMigrator/CDC"
 _NET_ROWS_METRIC = "NetRowsApplied"
 
 
+def _match_metric_tables(
+    requested: Sequence[str], discovered: Sequence[str]
+) -> dict[str, str]:
+    """Map each requested table name to a published metric ``Table`` dimension value.
+
+    The sink emits ``Table`` schema-qualified (``db.table``); the tool's names may be
+    bare or qualified. An exact match wins; otherwise the bare table name (the last
+    dotted segment) must match **exactly one** published value. Ambiguous bare matches
+    (the same table name under two schemas) are skipped rather than risk attributing
+    another schema's rows to the wrong table — that table just falls back to the
+    COUNT-based figure. Pure, so it is unit-tested without AWS.
+    """
+    discovered_set = set(discovered)
+    by_bare: dict[str, list[str]] = {}
+    for value in discovered:
+        by_bare.setdefault(value.rsplit(".", 1)[-1], []).append(value)
+    matched: dict[str, str] = {}
+    for name in requested:
+        if name in discovered_set:  # exact (cluster mode / already qualified)
+            matched[name] = name
+            continue
+        candidates = by_bare.get(name.rsplit(".", 1)[-1], [])
+        if len(candidates) == 1:  # unambiguous bare match (single-db mode)
+            matched[name] = candidates[0]
+        # 0 candidates (not published yet) or >1 (ambiguous) -> skip -> COUNT fallback
+    return matched
+
+
 class MskConnectController:
     """Read-only status + guarded stop over already-deployed MSK Connect connectors."""
 
@@ -321,10 +349,19 @@ class MskConnectController:
         updates 0) under ``MysqlDsqlMigrator/CDC`` dimensioned ``Stack`` + ``Table``;
         this Sums it over the trailing ``window_seconds`` to get net rows applied — a
         lightweight, **source-scan-free** per-table signal that replaces a COUNT(*) on
-        the source in the live monitor. Best-effort: returns ``{}`` on any error /
-        no datapoint (UI shows "-"); approximate under replay (a monitor, not the
-        exact reconciliation, which is Validation). ``now`` is the live clock; tests
-        inject a fake CloudWatch client.
+        the source in the live monitor.
+
+        The sink always emits the ``Table`` dimension **schema-qualified**
+        (``db.table``, e.g. ``ecommerce_demo.orders``), while the tool's table names
+        can be bare (single-database mode) or already qualified (cluster mode). So we
+        first ``ListMetrics`` to discover the dimension values the sink actually
+        published for this stack, then match each requested name to one (exact, else
+        the bare table name matches exactly one published value) — working in either
+        mode without assuming the qualification scheme.
+
+        Best-effort: returns ``{}`` on any error / no datapoint (UI shows "-");
+        approximate under replay (a monitor, not the exact reconciliation, which is
+        Validation). Uses the live clock; tests inject a fake CloudWatch client.
         """
         names = [t for t in tables if t]
         if not stack or not names:
@@ -332,15 +369,23 @@ class MskConnectController:
         result: dict[str, int] = {}
         try:
             client = self._client("cloudwatch")
+            # 1) Discover the Table dimension values the sink published for this stack.
+            discovered = self._list_net_rows_dimensions(client, stack)
+            if not discovered:
+                return {}
+            # 2) Map each requested table name to a published dimension value.
+            by_dim = _match_metric_tables(names, discovered)
+            if not by_dim:
+                return {}
             now = datetime.now(timezone.utc)
             start = datetime.fromtimestamp(
                 now.timestamp() - window_seconds, tz=timezone.utc
             )
             queries = []
             id_map: dict[str, str] = {}
-            for i, table in enumerate(names):
+            for i, (name, dim) in enumerate(by_dim.items()):
                 qid = f"n{i}"
-                id_map[qid] = table
+                id_map[qid] = name
                 queries.append(
                     {
                         "Id": qid,
@@ -350,7 +395,7 @@ class MskConnectController:
                                 "MetricName": _NET_ROWS_METRIC,
                                 "Dimensions": [
                                     {"Name": "Stack", "Value": stack},
-                                    {"Name": "Table", "Value": table},
+                                    {"Name": "Table", "Value": dim},
                                 ],
                             },
                             # Daily Sum buckets over the window; summed below = total
@@ -365,14 +410,42 @@ class MskConnectController:
                 MetricDataQueries=queries, StartTime=start, EndTime=now
             )
             for item in response.get("MetricDataResults", []):
-                table = id_map.get(item.get("Id"))
+                name = id_map.get(item.get("Id"))
                 values = item.get("Values", [])
-                if table is None or not values:
+                if name is None or not values:
                     continue
-                result[table] = int(round(sum(float(v) for v in values)))
+                result[name] = int(round(sum(float(v) for v in values)))
         except Exception:  # noqa: BLE001 - best-effort monitor signal only
             return {}
         return result
+
+    def _list_net_rows_dimensions(self, client: object, stack: str) -> list[str]:
+        """Discover the ``Table`` dimension values the sink published for ``stack``.
+
+        Filters ``ListMetrics`` to the net-rows metric with this ``Stack`` dimension
+        and returns each metric's ``Table`` value. Paginates over ``NextToken`` with a
+        bounded loop (500 metrics/page) so a large schema is covered without an
+        unbounded call chain.
+        """
+        tables: list[str] = []
+        token: Optional[str] = None
+        for _ in range(20):  # 500 metrics/page -> up to 10k tables; a hard cap
+            kwargs: dict = {
+                "Namespace": _CDC_METRIC_NAMESPACE,
+                "MetricName": _NET_ROWS_METRIC,
+                "Dimensions": [{"Name": "Stack", "Value": stack}],
+            }
+            if token:
+                kwargs["NextToken"] = token
+            resp = client.list_metrics(**kwargs)  # type: ignore[attr-defined]
+            for metric in resp.get("Metrics", []):
+                for dim in metric.get("Dimensions", []):
+                    if dim.get("Name") == "Table" and dim.get("Value"):
+                        tables.append(dim["Value"])
+            token = resp.get("NextToken")
+            if not token:
+                break
+        return tables
 
     # -- guarded mutation ---------------------------------------------------
 
