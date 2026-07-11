@@ -80,6 +80,8 @@ class DebeziumEventsTest {
     assertEquals(List.of(1L, "Alice"), event.values());
     assertEquals(List.of("id"), event.pkColumns());
     assertEquals(List.of(1L), event.pkValues());
+    // op "c" is an insert -> +1 to the target row count (net-rows monitor metric).
+    assertEquals(1, event.netRowDelta());
   }
 
   @Test
@@ -89,6 +91,8 @@ class DebeziumEventsTest {
     ChangeEvent event = DebeziumEvents.parse(record(key(1L), env, "dsqlcdc.app.users"));
     assertFalse(event.isDelete());
     assertEquals(List.of(1L, "Alice2"), event.values());
+    // op "u" is an update -> row count unchanged (net 0).
+    assertEquals(0, event.netRowDelta());
   }
 
   @Test
@@ -100,6 +104,8 @@ class DebeziumEventsTest {
     assertEquals("app.users", event.table());
     assertEquals(List.of("id"), event.pkColumns());
     assertEquals(List.of(5L), event.pkValues());
+    // op "d" is a delete -> -1 to the target row count.
+    assertEquals(-1, event.netRowDelta());
   }
 
   @Test

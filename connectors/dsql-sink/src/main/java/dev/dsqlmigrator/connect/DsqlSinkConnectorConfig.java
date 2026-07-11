@@ -32,6 +32,11 @@ public class DsqlSinkConnectorConfig extends AbstractConfig {
   public static final String BATCH_SIZE = "batch.size";
   public static final String MAX_RETRIES = "occ.max.retries";
   public static final String RETRY_BACKOFF_MS = "occ.retry.backoff.ms";
+  // Per-table net-rows monitor metric (CloudWatch). Best-effort and off unless a
+  // stack name is supplied by the cdc-stack connector config; a metric-emit failure
+  // never affects replication.
+  public static final String METRICS_ENABLED = "metrics.enabled";
+  public static final String METRICS_STACK = "metrics.stack";
 
   // DSQL hard limit: a transaction may modify at most 3,000 rows.
   public static final int DSQL_MAX_ROWS_PER_TXN = 3000;
@@ -66,7 +71,19 @@ public class DsqlSinkConnectorConfig extends AbstractConfig {
               Type.LONG,
               50L,
               Importance.LOW,
-              "Base backoff for OCC retry (ms).");
+              "Base backoff for OCC retry (ms).")
+          .define(
+              METRICS_ENABLED,
+              Type.BOOLEAN,
+              true,
+              Importance.LOW,
+              "Emit the per-table NetRowsApplied CloudWatch metric (best-effort).")
+          .define(
+              METRICS_STACK,
+              Type.STRING,
+              "",
+              Importance.LOW,
+              "Value of the metric's Stack dimension (the cdc-stack name); blank disables emission.");
 
   public DsqlSinkConnectorConfig(Map<String, String> props) {
     super(CONFIG_DEF, props);
@@ -106,5 +123,13 @@ public class DsqlSinkConnectorConfig extends AbstractConfig {
 
   public long retryBackoffMs() {
     return getLong(RETRY_BACKOFF_MS);
+  }
+
+  public boolean metricsEnabled() {
+    return getBoolean(METRICS_ENABLED);
+  }
+
+  public String metricsStack() {
+    return getString(METRICS_STACK);
   }
 }

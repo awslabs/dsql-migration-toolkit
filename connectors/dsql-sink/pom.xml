@@ -48,6 +48,14 @@
       <version>${aws.sdk.version}</version>
     </dependency>
 
+    <!-- AWS SDK v2 CloudWatch: emit the per-table NetRowsApplied monitor metric
+         (best-effort). Shaded into the plugin jar like the DSQL client. -->
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>cloudwatch</artifactId>
+      <version>${aws.sdk.version}</version>
+    </dependency>
+
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>

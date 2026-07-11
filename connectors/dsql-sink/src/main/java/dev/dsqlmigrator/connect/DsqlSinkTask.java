@@ -15,9 +15,14 @@ import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.errors.RetriableException;
@@ -26,6 +31,12 @@ import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.cloudwatch.CloudWatchClient;
+import software.amazon.awssdk.services.cloudwatch.model.Dimension;
+import software.amazon.awssdk.services.cloudwatch.model.MetricDatum;
+import software.amazon.awssdk.services.cloudwatch.model.PutMetricDataRequest;
+import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
 
 /**
  * Applies Debezium change events to Aurora DSQL with idempotent PK upsert/delete,
@@ -88,6 +99,19 @@ public class DsqlSinkTask extends SinkTask {
   private Connection connection;
   private ErrantRecordReporter dlqReporter; // null if the runtime has no DLQ wired
 
+  // --- Per-table net-rows monitor metric (best-effort CloudWatch) -----------
+  // The UI reads this instead of COUNT(*)-ing the source: the sink knows exactly
+  // how many rows it net-applied per table (inserts +1, deletes -1, updates 0),
+  // so a lightweight, source-scan-free "net rows since Full Load" signal costs a
+  // running counter + one PutMetricData per offset-commit window. Emission is
+  // strictly best-effort: a CloudWatch error is logged and NEVER breaks apply.
+  private static final String METRIC_NAMESPACE = "MysqlDsqlMigrator/CDC";
+  private static final String METRIC_NET_ROWS = "NetRowsApplied";
+  private boolean metricsEnabled;
+  private String metricsStack = "";
+  private final Map<String, LongAdder> netByTable = new ConcurrentHashMap<>();
+  private volatile CloudWatchClient cloudWatch; // built lazily on first emit
+
   @Override
   public String version() {
     return "0.1.0-SNAPSHOT";
@@ -96,6 +120,10 @@ public class DsqlSinkTask extends SinkTask {
   @Override
   public void start(Map<String, String> props) {
     this.config = new DsqlSinkConnectorConfig(props);
+    // Net-rows metric is on only when a Stack dimension was supplied (the cdc-stack
+    // connector config sets it); otherwise stay silent (e.g. local/unit runs).
+    this.metricsStack = config.metricsStack();
+    this.metricsEnabled = config.metricsEnabled() && !metricsStack.isEmpty();
     this.tokenProvider =
         new DsqlIamTokenProvider(config.clusterEndpoint(), config.region(), config.username());
     // The errant-record reporter is wired only when errors.deadletterqueue.* /
@@ -204,6 +232,7 @@ public class DsqlSinkTask extends SinkTask {
           },
           config.maxRetries(),
           config.retryBackoffMs());
+      recordNet(chunk); // committed: count the chunk's per-table net row delta
     } catch (SQLException e) {
       rollbackQuietly();
       if (isTransient(e)) {
@@ -253,6 +282,7 @@ public class DsqlSinkTask extends SinkTask {
             },
             config.maxRetries(),
             config.retryBackoffMs());
+        recordNet(a.event()); // committed this row: count its net row delta
       } catch (SQLException e) {
         rollbackQuietly();
         if (isTransient(e)) {
@@ -621,14 +651,118 @@ public class DsqlSinkTask extends SinkTask {
     }
   }
 
+  /**
+   * Called by Connect on each offset commit: emit the per-table net-row deltas
+   * accumulated since the last emit as a CloudWatch metric, then reset. Best-effort.
+   */
+  @Override
+  public void flush(Map<TopicPartition, OffsetAndMetadata> offsets) {
+    emitMetrics();
+  }
+
   @Override
   public void stop() {
+    emitMetrics(); // flush any counts accumulated since the last offset commit
+    closeCloudWatchQuietly();
     try {
       if (connection != null && !connection.isClosed()) {
         connection.close();
       }
     } catch (SQLException ignored) {
       // best-effort
+    }
+  }
+
+  // --- Per-table net-rows metric helpers (best-effort; never affect apply) ---
+
+  /** Add every applied event's net row delta to its table's running counter. */
+  private void recordNet(List<Applicable> chunk) {
+    if (!metricsEnabled) {
+      return;
+    }
+    for (Applicable a : chunk) {
+      recordNet(a.event());
+    }
+  }
+
+  private void recordNet(ChangeEvent event) {
+    if (!metricsEnabled) {
+      return;
+    }
+    int delta = event.netRowDelta();
+    if (delta != 0) {
+      netByTable.computeIfAbsent(event.table(), t -> new LongAdder()).add(delta);
+    }
+  }
+
+  /**
+   * Emit one {@code NetRowsApplied} datum per table (dimensions Stack + Table) for
+   * the deltas accumulated since the last emit, then reset. A failure is logged and
+   * swallowed: the metric is a monitor, so its emission must never fail replication.
+   * Called single-threaded by the Connect worker (put/flush/stop), so the
+   * sum-then-reset on each counter is not racing a concurrent apply.
+   */
+  private void emitMetrics() {
+    if (!metricsEnabled) {
+      return;
+    }
+    List<MetricDatum> data = new ArrayList<>();
+    for (Map.Entry<String, LongAdder> e : netByTable.entrySet()) {
+      long delta = e.getValue().sumThenReset();
+      if (delta == 0) {
+        continue;
+      }
+      data.add(
+          MetricDatum.builder()
+              .metricName(METRIC_NET_ROWS)
+              .dimensions(
+                  Dimension.builder().name("Stack").value(metricsStack).build(),
+                  Dimension.builder().name("Table").value(e.getKey()).build())
+              .value((double) delta)
+              .unit(StandardUnit.COUNT)
+              .build());
+    }
+    if (data.isEmpty()) {
+      return;
+    }
+    try {
+      // PutMetricData accepts up to 1000 datums/request; the captured-table count is
+      // far below that, so one request per commit window suffices.
+      cloudWatch()
+          .putMetricData(
+              PutMetricDataRequest.builder().namespace(METRIC_NAMESPACE).metricData(data).build());
+    } catch (RuntimeException ex) {
+      // Drop this window (do NOT re-accumulate: avoids unbounded growth if CloudWatch
+      // stays unreachable); the next window re-reports its own delta.
+      log.warn(
+          "Could not emit CDC net-rows metric (best-effort; replication unaffected): {}",
+          ex.toString());
+    }
+  }
+
+  private CloudWatchClient cloudWatch() {
+    CloudWatchClient client = cloudWatch;
+    if (client == null) {
+      synchronized (this) {
+        client = cloudWatch;
+        if (client == null) {
+          client = CloudWatchClient.builder().region(Region.of(config.region())).build();
+          cloudWatch = client;
+        }
+      }
+    }
+    return client;
+  }
+
+  private void closeCloudWatchQuietly() {
+    CloudWatchClient client = cloudWatch;
+    if (client != null) {
+      try {
+        client.close();
+      } catch (RuntimeException ignored) {
+        // best-effort
+      }
+      cloudWatch = null;
     }
   }
 

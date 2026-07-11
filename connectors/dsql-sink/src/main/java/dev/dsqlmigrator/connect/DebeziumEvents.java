@@ -67,7 +67,13 @@ final class DebeziumEvents {
       throw new DataException(
           "Cannot build upsert for table " + table + ": record has no key (pk) fields");
     }
-    return ChangeEvent.upsert(table, columns, values, pkColumns, pkValues);
+    // Classify for the net-rows monitor metric: c (create) / r (snapshot read) are
+    // inserts (+1 to the target row count); u (update) is an upsert that leaves the
+    // count unchanged (net 0). Both apply identically (idempotent ON CONFLICT upsert).
+    boolean isInsert = "c".equals(op) || "r".equals(op);
+    return isInsert
+        ? ChangeEvent.insert(table, columns, values, pkColumns, pkValues)
+        : ChangeEvent.upsert(table, columns, values, pkColumns, pkValues);
   }
 
   private static ChangeEvent buildDelete(

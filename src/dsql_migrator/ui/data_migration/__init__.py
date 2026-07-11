@@ -3910,6 +3910,7 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     _DLQ_RECORD_LIST_LIMIT,
     _DLQ_RECORD_PAGE_SIZE,
     _cdc_infra_prefill,
+    _cdc_is_streaming,
     _cdc_tables_for_config,
     _cdc_target_region,
     _diagnose_for_dialog,

@@ -205,6 +205,32 @@ def test_health_unknown_on_error() -> None:
 def test_health_empty_names_makes_no_call() -> None:
     client = _FakeClient({})
     assert _controller(client).connector_health([]) == {}
+
+
+def test_net_rows_by_table_sums_delta_datapoints() -> None:
+    # Query ids are n{tableIndex}; the sink's per-commit deltas are summed per table.
+    client = _FakeClient(
+        {"get_metric_data": {"MetricDataResults": [
+            {"Id": "n0", "Values": [5.0, 3.0]},   # orders: 8 net rows applied
+            {"Id": "n1", "Values": []},           # customers: no datapoint -> absent
+        ]}}
+    )
+    got = _controller(client).net_rows_by_table(
+        "mysql-dsql-cdc-seoul-test", ["orders", "customers"]
+    )
+    assert got == {"orders": 8}
+
+
+def test_net_rows_by_table_empty_on_error() -> None:
+    client = _FakeClient({}, raise_on="get_metric_data")
+    assert _controller(client).net_rows_by_table("stk", ["orders"]) == {}
+
+
+def test_net_rows_by_table_no_call_without_stack_or_tables() -> None:
+    client = _FakeClient({"get_metric_data": {"MetricDataResults": []}})
+    assert _controller(client).net_rows_by_table("", ["orders"]) == {}
+    assert _controller(client).net_rows_by_table("stk", []) == {}
+    assert client.calls == []  # never hit CloudWatch
     assert client.calls == []
 
 

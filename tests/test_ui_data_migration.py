@@ -1566,8 +1566,92 @@ def test_fetch_cdc_status_includes_dlq_errors_when_controller_exposes_reader() -
 
     fetched = _fetch_cdc_status(state)
     assert fetched is not None
-    _statuses, _health, dlq_errors = fetched
+    _statuses, _health, dlq_errors, _net = fetched
     assert [e.table for e in dlq_errors] == ["orders"]
+
+
+def test_fetch_cdc_status_reads_net_rows_when_controller_exposes_reader() -> None:
+    # When the controller exposes net_rows_by_table and the caller passes the
+    # migrated table set, _fetch scopes the scan-free metric read to those tables
+    # and _apply stores it on state (drives the "Net rows since Full Load" column).
+    from dsql_migrator.core.cdc import ConnectorState, ConnectorStatus
+    from dsql_migrator.core.msk_connect_controller import ConnectorHealth
+    from dsql_migrator.ui.data_migration import _apply_cdc_status, _fetch_cdc_status
+
+    seen: dict = {}
+
+    class _CtrlWithNet(_FakeCdcController):
+        def net_rows_by_table(self, stack, tables, **_kw):
+            seen["stack"] = stack
+            seen["tables"] = list(tables)
+            return {"orders": 5, "customers": -2}
+
+    state = DataMigrationState()
+    state.set_cdc_stack_name("mysql-dsql-cdc-seoul-test")
+    state.set_cdc_controller(
+        _CtrlWithNet(
+            statuses=[ConnectorStatus(name="sink", state=ConnectorState.RUNNING)],
+            health={"sink": ConnectorHealth(running_tasks=1, errored_tasks=0)},
+        )
+    )
+    state.set_cdc_connector_names(["sink"])
+
+    fetched = _fetch_cdc_status(state, ["orders", "customers"])
+    assert fetched is not None
+    assert seen == {
+        "stack": "mysql-dsql-cdc-seoul-test",
+        "tables": ["orders", "customers"],
+    }
+    _apply_cdc_status(state, fetched)
+    assert state.cdc_net_rows_by_table == {"orders": 5, "customers": -2}
+
+
+def test_fetch_cdc_status_skips_net_rows_without_tables() -> None:
+    # No table set (non-UI caller / before Full Load) -> the metric read is not
+    # attempted, so a source scan is never triggered for it.
+    from dsql_migrator.core.cdc import ConnectorState, ConnectorStatus
+    from dsql_migrator.core.msk_connect_controller import ConnectorHealth
+    from dsql_migrator.ui.data_migration import _fetch_cdc_status
+
+    called = {"n": 0}
+
+    class _CtrlWithNet(_FakeCdcController):
+        def net_rows_by_table(self, stack, tables, **_kw):
+            called["n"] += 1
+            return {}
+
+    state = DataMigrationState()
+    state.set_cdc_stack_name("stk")
+    state.set_cdc_controller(
+        _CtrlWithNet(
+            statuses=[ConnectorStatus(name="sink", state=ConnectorState.RUNNING)],
+            health={"sink": ConnectorHealth(running_tasks=1, errored_tasks=0)},
+        )
+    )
+    state.set_cdc_connector_names(["sink"])
+
+    _fetch_cdc_status(state)  # tables omitted
+    assert called["n"] == 0
+
+
+def test_cdc_is_streaming_gates_poll_and_table_refresh() -> None:
+    # Single gate for arming the ~5s CDC poll timers (live-status region AND the
+    # per-table net-rows table). Both a controller AND connector names are needed;
+    # missing either -> static (manual refresh only), so an idle/Full-Load-only
+    # page never arms a timer that would re-render forever.
+    from dsql_migrator.ui.data_migration import _cdc_is_streaming
+
+    state = DataMigrationState()
+    assert _cdc_is_streaming(state) is False  # neither wired
+
+    state.set_cdc_controller(object())
+    assert _cdc_is_streaming(state) is False  # controller but no connectors
+
+    state.set_cdc_connector_names(["sink"])
+    assert _cdc_is_streaming(state) is True  # both -> streaming
+
+    state.set_cdc_connector_names([])
+    assert _cdc_is_streaming(state) is False  # connectors dropped -> static again
 
 
 def test_apply_cdc_status_folds_dlq_errors_into_error_log_and_depth() -> None:
@@ -3210,6 +3294,48 @@ def test_cdc_applied_net_none_until_both_known() -> None:
     # No Full Load job -> full_load_rows None -> cdc_applied_net None.
     (row,) = build_migration_table_status(["t"], target_counts={"t": 50})
     assert row.cdc_applied_net is None
+
+
+def test_cdc_applied_net_prefers_sink_metric_over_count_fallback() -> None:
+    # The scan-free NetRowsApplied metric wins over target-minus-Full Load, so the
+    # net-rows column needs no COUNT(*) once the sink is emitting it.
+    from dsql_migrator.ui.data_migration import build_migration_table_status
+
+    job = _full_load_job(
+        [{"chunk_id": "orders", "status": "DONE", "rows_loaded": 100, "attempts": 1}],
+        counts={"orders": 100},
+    )
+    # Metric says +5; target COUNT (137) would imply +37. Metric wins.
+    (row,) = build_migration_table_status(
+        ["orders"], full_load_job=job,
+        target_counts={"orders": 137},
+        net_rows_metric={"orders": 5},
+    )
+    assert row.cdc_net_metric == 5
+    assert row.cdc_applied_net == 5  # metric, not 137 - 100
+
+    # Metric can be net-negative (stream net-deleted rows).
+    (neg,) = build_migration_table_status(
+        ["orders"], full_load_job=job, net_rows_metric={"orders": -3},
+    )
+    assert neg.cdc_applied_net == -3
+
+
+def test_cdc_applied_net_falls_back_when_metric_absent() -> None:
+    # No metric datapoint for the table -> fall back to target - Full Load.
+    from dsql_migrator.ui.data_migration import build_migration_table_status
+
+    job = _full_load_job(
+        [{"chunk_id": "orders", "status": "DONE", "rows_loaded": 100, "attempts": 1}],
+        counts={"orders": 100},
+    )
+    (row,) = build_migration_table_status(
+        ["orders"], full_load_job=job,
+        target_counts={"orders": 137},
+        net_rows_metric={"customers": 9},  # different table -> no entry for orders
+    )
+    assert row.cdc_net_metric is None
+    assert row.cdc_applied_net == 37  # 137 target - 100 Full Load
 
 
 def test_stream_lag_distinguishes_behind_from_mid_stream_gap() -> None:

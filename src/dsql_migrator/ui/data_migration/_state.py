@@ -164,6 +164,12 @@ class DataMigrationState:
         self.row_max_pk_source: dict[str, Optional[int]] = {}
         self.row_max_pk_target: dict[str, Optional[int]] = {}
         self.row_counts_fetched_at: Optional[datetime] = None
+        # Per-table net rows the CDC sink reports applying since it started
+        # streaming (inserts minus deletes), from its ``NetRowsApplied`` CloudWatch
+        # metric. Refreshed every CDC poll -- scan-free (no source/target COUNT), so
+        # it drives the "Net rows since Full Load" column cheaply. name -> net count;
+        # empty when the metric is unavailable (older plugin / sink not emitting).
+        self.cdc_net_rows_by_table: dict[str, int] = {}
         # CDC lifecycle actions (Deploy infra / Start / Stop / Delete) -- each runs
         # as a JobManager CloudFormation job; only one runs at a time, so a single
         # ``cdc_deploy_job_id`` + ``cdc_action_kind`` (which operation it is, for the
@@ -404,6 +410,9 @@ class DataMigrationState:
             self.cdc_other_stacks = []
             # Belongs to the previously-targeted stack; the fresh probe repopulates.
             self.cdc_reconciled_table_names = []
+            # Net-rows metric is per-stack too; drop it so the adopted stack's poll
+            # repopulates rather than showing the prior stack's figures.
+            self.cdc_net_rows_by_table = {}
         return True
 
     def append_cdc_deploy_log(self, when: datetime, message: str) -> None:
@@ -440,6 +449,18 @@ class DataMigrationState:
         """
         with self._lock:
             self.cdc_reconciled_table_names = [n.strip() for n in names if n and n.strip()]
+
+    def set_cdc_net_rows_by_table(self, net_rows: "dict[str, int]") -> None:
+        """Record the per-table net rows the sink applied (from ``NetRowsApplied``).
+
+        Scan-free CDC progress (inserts minus deletes) read from CloudWatch on the
+        live poll; drives the "Net rows since Full Load" column without any
+        ``COUNT(*)``. Replaces the prior map (empty when the metric is unavailable).
+        """
+        with self._lock:
+            self.cdc_net_rows_by_table = {
+                str(k): int(v) for k, v in dict(net_rows or {}).items()
+            }
 
     def set_cdc_connector_running_names(self, names: Sequence[str]) -> None:
         """Record which of my connectors are RUNNING (vs still provisioning)."""

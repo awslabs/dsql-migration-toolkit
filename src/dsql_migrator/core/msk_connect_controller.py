@@ -75,6 +75,13 @@ _SEND_RATE_METRIC = "SinkRecordSendRate"
 # (both ~0 after the source is quiesced = pipeline idle / caught up).
 _SOURCE_POLL_RATE_METRIC = "SourceRecordPollRate"
 
+# The custom DSQL sink's per-table net-rows metric (connectors/dsql-sink emits a
+# per-offset-commit delta of inserts-minus-deletes, dimensioned Stack + Table).
+# Summed over the window here to get net rows applied — a source-scan-free per-table
+# CDC signal that replaces COUNT(*)-ing the source in the live monitor.
+_CDC_METRIC_NAMESPACE = "MysqlDsqlMigrator/CDC"
+_NET_ROWS_METRIC = "NetRowsApplied"
+
 
 class MskConnectController:
     """Read-only status + guarded stop over already-deployed MSK Connect connectors."""
@@ -299,6 +306,72 @@ class MskConnectController:
                     health.poll_rate = latest
         except Exception:  # noqa: BLE001 - treated as "health unknown"
             return {name: ConnectorHealth() for name in names}
+        return result
+
+    def net_rows_by_table(
+        self,
+        stack: str,
+        tables: Sequence[str],
+        *,
+        window_seconds: int = 14 * 24 * 3600,
+    ) -> dict[str, int]:
+        """Net rows CDC has applied per table, from the sink's ``NetRowsApplied`` metric.
+
+        The custom sink emits a per-offset-commit delta (inserts +1 / deletes -1 /
+        updates 0) under ``MysqlDsqlMigrator/CDC`` dimensioned ``Stack`` + ``Table``;
+        this Sums it over the trailing ``window_seconds`` to get net rows applied — a
+        lightweight, **source-scan-free** per-table signal that replaces a COUNT(*) on
+        the source in the live monitor. Best-effort: returns ``{}`` on any error /
+        no datapoint (UI shows "-"); approximate under replay (a monitor, not the
+        exact reconciliation, which is Validation). ``now`` is the live clock; tests
+        inject a fake CloudWatch client.
+        """
+        names = [t for t in tables if t]
+        if not stack or not names:
+            return {}
+        result: dict[str, int] = {}
+        try:
+            client = self._client("cloudwatch")
+            now = datetime.now(timezone.utc)
+            start = datetime.fromtimestamp(
+                now.timestamp() - window_seconds, tz=timezone.utc
+            )
+            queries = []
+            id_map: dict[str, str] = {}
+            for i, table in enumerate(names):
+                qid = f"n{i}"
+                id_map[qid] = table
+                queries.append(
+                    {
+                        "Id": qid,
+                        "MetricStat": {
+                            "Metric": {
+                                "Namespace": _CDC_METRIC_NAMESPACE,
+                                "MetricName": _NET_ROWS_METRIC,
+                                "Dimensions": [
+                                    {"Name": "Stack", "Value": stack},
+                                    {"Name": "Table", "Value": table},
+                                ],
+                            },
+                            # Daily Sum buckets over the window; summed below = total
+                            # net rows applied (avoids an over-large single Period).
+                            "Period": 86400,
+                            "Stat": "Sum",
+                        },
+                        "ReturnData": True,
+                    }
+                )
+            response = client.get_metric_data(
+                MetricDataQueries=queries, StartTime=start, EndTime=now
+            )
+            for item in response.get("MetricDataResults", []):
+                table = id_map.get(item.get("Id"))
+                values = item.get("Values", [])
+                if table is None or not values:
+                    continue
+                result[table] = int(round(sum(float(v) for v in values)))
+        except Exception:  # noqa: BLE001 - best-effort monitor signal only
+            return {}
         return result
 
     # -- guarded mutation ---------------------------------------------------

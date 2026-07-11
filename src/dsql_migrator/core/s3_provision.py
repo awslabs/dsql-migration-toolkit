@@ -51,6 +51,15 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v18 emits a per-table NetRowsApplied CloudWatch metric (namespace
+#    MysqlDsqlMigrator/CDC, dimensions Stack + Table) so the UI shows CDC net-rows
+#    per table WITHOUT COUNT(*)-scanning the source. The sink keeps a running
+#    per-table net counter (insert +1 / delete -1 / update 0, classified from the
+#    Debezium op) and flushes it once per offset-commit via PutMetricData. Strictly
+#    best-effort: a CloudWatch error is logged and NEVER fails replication; disabled
+#    unless the cdc-stack passes metrics.stack. Adds the aws-sdk cloudwatch dep to the
+#    shaded jar (~11.5->13 MiB) and requires cloudwatch:PutMetricData on the connector
+#    execution role. Sink-jar + connector config + connector-role IAM change.
 # v17 makes the sink survive a transient DSQL connectivity blip instead of dying.
 #    On a transient failure (OCC budget exhausted, or a connection torn down by
 #    DSQL's 1h idle close / IAM-token expiry / MSK Connect worker recycle),
@@ -158,7 +167,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v17"
+PLUGIN_VERSION = "v18"
 
 
 class S3ProvisionError(RuntimeError):

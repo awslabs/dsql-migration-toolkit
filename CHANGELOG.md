@@ -5,6 +5,35 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.98
+
+### Added
+
+- **Per-table "Net rows since Full Load" is now scan-free — sourced from a sink
+  metric, not a `COUNT(*)`.** The DSQL sink connector now emits a per-table
+  `NetRowsApplied` CloudWatch metric (namespace `MysqlDsqlMigrator/CDC`, dimensions
+  `Stack` + `Table`): each commit records inserts − deletes (an insert is +1, an
+  update 0, a delete −1), so summing the metric gives the net rows CDC has applied
+  to each table since it started streaming. The per-table migration-status monitor
+  reads this on the existing ~5 s CDC poll and shows it directly, so the "Net rows
+  since Full Load" column no longer needs any `COUNT(*)` on the source or target —
+  it stays light and never scans the (potentially billion-row) source. While CDC is
+  streaming the per-table table now re-renders on that poll (reading the stored
+  metric, no network), so the column updates **live** instead of only when you click
+  "Refresh source/target counts" (which still runs the exact source/target
+  `COUNT(*)` — those columns are unchanged). Emission is strictly best-effort in the
+  sink (a metric failure never affects replication or offset commits), and the
+  column falls back to the old `target − Full Load` figure when the metric is
+  unavailable (older plugin, or the sink not yet emitting). The figure is a live
+  progress monitor, not the authoritative reconciliation: it can slightly over-count
+  if Kafka Connect redelivers an already-applied batch (at-least-once), so the exact
+  source-vs-target verdict remains Validation (Step 4).
+- Requires the rebuilt connector plugin (`PLUGIN_VERSION` → `v18`) and a CDC
+  re-deploy to take effect; until then the monitor uses the `COUNT(*)`-based
+  fallback. Template change grants the sink's connector-execution role
+  `cloudwatch:PutMetricData` scoped by a namespace condition; the app task role's
+  `cloudwatch:GetMetricData` (added in v0.1.97) reads it back.
+
 ## v0.1.97
 
 ### Fixed

@@ -357,6 +357,13 @@ class MigrationTableStatus:
     # when the table has no single integer PK or the value is unknown.
     source_max_pk: Optional[int] = None
     target_max_pk: Optional[int] = None
+    # Net rows the CDC SINK reports having applied since it started streaming
+    # (inserts minus deletes), read from its ``NetRowsApplied`` CloudWatch metric.
+    # Authoritative and scan-free: unlike ``cdc_applied_net``'s target-minus-Full
+    # Load fallback it needs NO ``COUNT(*)`` on either side, so it is the light,
+    # source-friendly way to show CDC progress. ``None`` when the metric is
+    # unavailable (sink not yet emitting / older plugin without the metric).
+    cdc_net_metric: Optional[int] = None
 
     @property
     def pk_gap(self) -> Optional[int]:
@@ -385,12 +392,18 @@ class MigrationTableStatus:
 
     @property
     def cdc_applied_net(self) -> Optional[int]:
-        """Net rows CDC applied since Full Load (``target - full_load_rows``).
+        """Net rows CDC applied since Full Load (inserts minus deletes).
 
-        ``None`` until both the Full Load row count and a live target count are
+        Prefers the sink's ``NetRowsApplied`` metric (``cdc_net_metric``) when
+        present -- it is scan-free and needs no ``COUNT(*)`` on either side. Falls
+        back to ``target_rows - full_load_rows`` when the metric is unavailable
+        (sink not yet emitting the metric / older plugin), which needs both the
+        Full Load row count and a live target count. ``None`` when neither is
         known. Can be negative if the stream net-deleted rows. This is a net row
         delta, not a raw insert/update/delete event count.
         """
+        if self.cdc_net_metric is not None:
+            return self.cdc_net_metric
         if self.target_rows is None or self.full_load_rows is None:
             return None
         return self.target_rows - self.full_load_rows
@@ -456,6 +469,7 @@ def build_migration_table_status(
     dlq_counts: "Optional[dict[str, int]]" = None,
     source_max_pk: "Optional[dict[str, Optional[int]]]" = None,
     target_max_pk: "Optional[dict[str, Optional[int]]]" = None,
+    net_rows_metric: "Optional[dict[str, Optional[int]]]" = None,
     source_is_estimate: bool = True,
 ) -> list["MigrationTableStatus"]:
     """Assemble the per-table migration status for ``table_names`` (pure).
@@ -466,8 +480,11 @@ def build_migration_table_status(
     ``source_counts`` (else the watermark estimate is used as ``source_rows`` and
     flagged ``source_estimate``). ``dlq_counts`` (per-table quarantined-event
     counts from the error log) surfaces changes that did NOT reach the target.
-    NiceGUI-agnostic so it can be unit tested with plain dicts; the UI supplies
-    the live counts from a read-only poll.
+    ``net_rows_metric`` (per-table net rows from the sink's ``NetRowsApplied``
+    CloudWatch metric) drives the scan-free "Net rows since Full Load" figure when
+    present, so that column needs no ``COUNT(*)`` on either side. NiceGUI-agnostic
+    so it can be unit tested with plain dicts; the UI supplies the live counts
+    from a read-only poll.
     """
     chunks_by_table: dict[str, ChunkState] = {}
     expected: dict[str, int] = {}
@@ -480,6 +497,7 @@ def build_migration_table_status(
     dlq_counts = dlq_counts or {}
     source_max_pk = source_max_pk or {}
     target_max_pk = target_max_pk or {}
+    net_rows_metric = net_rows_metric or {}
 
     out: list[MigrationTableStatus] = []
     for name in table_names:
@@ -508,6 +526,7 @@ def build_migration_table_status(
                 dlq_count=dlq_counts.get(name),
                 source_max_pk=source_max_pk.get(name),
                 target_max_pk=target_max_pk.get(name),
+                cdc_net_metric=net_rows_metric.get(name),
             )
         )
     return out

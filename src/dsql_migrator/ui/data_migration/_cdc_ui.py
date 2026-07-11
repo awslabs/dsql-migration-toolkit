@@ -124,6 +124,20 @@ from dsql_migrator.ui.data_migration import (
 # connector state / replication lag change on the order of seconds, not 0.5s.
 _CDC_POLL_INTERVAL_SECONDS = 5.0
 
+
+def _cdc_is_streaming(migration_state) -> bool:
+    """True when a CDC controller + connector names are wired (pipeline is live).
+
+    The single gate for arming the ~5 s CDC poll timers: both the live-status
+    region and the per-table net-rows table re-render on this cadence only while
+    streaming, and stay static (manual refresh only) otherwise. Duck-typed so the
+    UI double and a bare state object both work.
+    """
+    return getattr(migration_state, "cdc_controller", None) is not None and bool(
+        getattr(migration_state, "cdc_connector_names", []) or []
+    )
+
+
 def _render_cdc_decision(
     ui, migration_state, *, status, refresh, locked: Optional[bool] = None
 ) -> None:
@@ -2769,13 +2783,15 @@ def _render_migration_table_status(
 
     Answers the operator's real question -- "did CDC replicate everything, is
     anything missing?". It separates the one-shot Full Load row count from the net
-    rows CDC has applied since (``target − Full Load``), shows the source-vs-target
-    consistency verdict, and surfaces per-table quarantined (DLQ) events -- changes
-    that did NOT reach the target. MSK Connect publishes no per-table replicated-row
-    metric, so the source/target counts come from a direct COUNT(*) on each side;
-    that scans the source, so it is an explicit "Refresh counts" action (not an
-    auto-poll). Shown once a Full Load job exists (the CDC step is reached only
-    after Full Load in the combined flow).
+    rows CDC has applied since, shows the source-vs-target consistency verdict, and
+    surfaces per-table quarantined (DLQ) events -- changes that did NOT reach the
+    target. The "Net rows since Full Load" column is fed scan-free by the sink's own
+    ``NetRowsApplied`` CloudWatch metric (inserts minus deletes, refreshed each CDC
+    poll), so it needs no COUNT(*); it falls back to ``target − Full Load`` only
+    when that metric is unavailable. The source/target-count columns still come from
+    a direct COUNT(*) on each side, which scans the source, so those remain an
+    explicit "Refresh counts" action (not an auto-poll). Shown once a Full Load job
+    exists (the CDC step is reached only after Full Load in the combined flow).
     """
     table_names = _migration_status_tables(migration_state, job_manager)
     if not table_names:
@@ -2816,6 +2832,7 @@ def _render_migration_table_status(
                 dlq_counts=dlq_counts,
                 source_max_pk=getattr(migration_state, "row_max_pk_source", {}),
                 target_max_pk=getattr(migration_state, "row_max_pk_target", {}),
+                net_rows_metric=getattr(migration_state, "cdc_net_rows_by_table", {}),
             )
             # Columns separate the one-shot Full Load contribution from the ongoing
             # CDC contribution, then show the source-vs-target consistency verdict
@@ -2923,6 +2940,22 @@ def _render_migration_table_status(
                 </q-td>
                 """,
             )
+            # Keep the "Net rows since Full Load" column live while CDC streams. The
+            # CDC poll (_render_cdc_live_monitoring) fetches the scan-free
+            # NetRowsApplied metric and stores it on migration_state every
+            # ~_CDC_POLL_INTERVAL_SECONDS, but this per-table table is a SEPARATE
+            # refreshable region the poll does not re-render -- so without this it
+            # would only pick up new net-rows on a manual "Refresh counts" click
+            # (which also runs the COUNT(*) this feature exists to avoid). Re-render
+            # on the poll interval to reflect the stored metric. This reads state
+            # only (NO network / no COUNT), so it stays scan-free. One-shot + re-arm
+            # (not a repeating timer) mirrors the live region and avoids the "parent
+            # slot deleted" crash. Armed only while CDC is active; idle/Full-Load-only
+            # leaves the table static (manual "Refresh counts" still refreshes it).
+            if _cdc_is_streaming(migration_state):
+                ui.timer(  # type: ignore[attr-defined]
+                    _CDC_POLL_INTERVAL_SECONDS, _status_table.refresh, once=True
+                )
 
         async def _refresh_counts() -> None:
             # The source/target counts are a direct COUNT(*)/MAX(pk) on each side and
@@ -3036,11 +3069,11 @@ def _render_migration_table_status(
                 )
             _legend = [
                 "Full Load rows — rows the one-shot snapshot loaded.",
-                "Net rows since Full Load — the NET change in target row count "
-                "since Full Load (target − Full Load), not a count of CDC events: "
-                "inserts add, deletes subtract, updates don't change it. So it is "
-                "negative when the stream net-deleted rows (e.g. more deletes than "
-                "inserts) — that is expected, not an error.",
+                "Net rows since Full Load — the NET rows CDC has applied since Full "
+                "Load, not a count of CDC events: inserts add, deletes subtract, "
+                "updates don't change it. Reported live by the sink (scan-free, no "
+                "COUNT), so it is negative when the stream net-deleted rows (e.g. "
+                "more deletes than inserts) — that is expected, not an error.",
                 "Source rows — scan-free estimate. Target rows — exact count.",
                 "Stream lag — newest row (PK) on each side: “caught up” vs “N behind”.",
                 "Consistency — read the colored badge: green “consistent” = counts "
@@ -3083,9 +3116,7 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
                     "Live connector health and replication lag appear here once "
                     "the cdc-stack connectors are detected."
                 ).classes("text-xs text-gray-500")
-        if getattr(migration_state, "cdc_controller", None) is not None and getattr(
-            migration_state, "cdc_connector_names", []
-        ):
+        if _cdc_is_streaming(migration_state):
             ui.timer(_CDC_POLL_INTERVAL_SECONDS, _poll_cdc, once=True)  # type: ignore[attr-defined]
 
     async def _poll_cdc() -> None:
@@ -3096,8 +3127,10 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
         # happens back on the loop after the fetch returns.
         from nicegui import run
 
+        # Scope the scan-free net-rows metric read to the migrated table set.
+        tables = _migration_status_tables(migration_state, job_manager)
         try:
-            fetched = await run.io_bound(_fetch_cdc_status, migration_state)
+            fetched = await run.io_bound(_fetch_cdc_status, migration_state, tables)
         except Exception:  # noqa: BLE001 - keep the last good view on any error
             fetched = None
         if fetched is not None:
