@@ -5,6 +5,33 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.100
+
+### Added
+
+- **Durable S3 job store — an interrupted Full Load AND the per-table migration
+  monitor now survive a Fargate redeploy.** The JobManager's job state lived in a
+  SQLite file on the task's **ephemeral `/tmp`**, so an app redeploy (ECS task
+  replacement) wiped it: an interrupted Full Load couldn't resume, and the
+  per-table migration monitor — which is keyed to the Full Load job — went **blank**
+  after a deploy (the S3 session store kept only the `job_id` linkage, not the job
+  itself). New `S3JobStore` persists each job snapshot as a JSON object under
+  `jobs/` in the tool's **managed plugin bucket** (same bucket as the session store,
+  auto-provisioned — no extra setup), so job/resume state survives a task
+  replacement. Wired on Fargate via `DSQL_MIGRATOR_JOB_STATE_BUCKET` → the managed
+  bucket; local dev keeps the on-disk SQLite store (both satisfy the `JobStore`
+  protocol, so the JobManager is unchanged).
+- **Scale-safe writes (no PUT storm).** The Full Load drain persists on every
+  progress tick, which is cheap for local SQLite but would flood S3 on a large
+  table. Since only chunk/job **status transitions** matter for resume (a non-`DONE`
+  chunk is re-run whole; sub-chunk progress is display-only and an interrupted chunk
+  is reconciled to `FAILED` on reload), `S3JobStore` PUTs immediately on a status
+  signature change and throttles pure-progress writes to ≤ 1 PUT / 5 s — bounding
+  PUTs to ~the number of status transitions regardless of row count. Best-effort (an
+  S3 error never breaks the live migration); no new IAM (the task role's existing
+  bucket `/*` grant covers the `jobs/` prefix). Template + code only — no
+  connector/plugin change; takes effect on the next app redeploy.
+
 ## v0.1.99
 
 ### Fixed

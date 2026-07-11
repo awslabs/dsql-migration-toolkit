@@ -148,6 +148,18 @@ class AppConfig(BaseModel):
         default="job_state.sqlite",
         description="Path to the local job-state store used for resumable jobs.",
     )
+    job_state_bucket: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional S3 bucket for a DURABLE job-state store. When set (the "
+            "container deploy points it at the tool's managed plugin bucket), Full "
+            "Load job snapshots are written to S3, so a Fargate task replacement (a "
+            "redeploy) no longer loses job/resume state -- unlike job_state_path, "
+            "which lives on the task's EPHEMERAL /tmp and is wiped on replacement. "
+            "When None, the local SQLite path is used (local dev). Config key: "
+            "DSQL_MIGRATOR_JOB_STATE_BUCKET."
+        ),
+    )
     activity_log_path: str = Field(
         default="migration_activity.log",
         description=(
@@ -353,6 +365,8 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> AppConfig:
         values["aws_profile"] = aws_profile
     if (job_state_path := _read(source, "JOB_STATE_PATH")) is not None:
         values["job_state_path"] = job_state_path
+    if (job_state_bucket := _read(source, "JOB_STATE_BUCKET")) is not None:
+        values["job_state_bucket"] = job_state_bucket
     if (activity_log_path := _read(source, "ACTIVITY_LOG_PATH")) is not None:
         values["activity_log_path"] = activity_log_path
     if (session_state_path := _read(source, "SESSION_STATE_PATH")) is not None:

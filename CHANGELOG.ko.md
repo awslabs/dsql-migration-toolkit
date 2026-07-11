@@ -5,6 +5,28 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.100
+
+### 추가 (Added)
+
+- **내구성 있는 S3 job 스토어 — 중단된 Full Load와 테이블별 마이그레이션 모니터가 이제 Fargate
+  재배포에도 살아남습니다.** JobManager의 작업 상태가 태스크의 **임시 `/tmp`** SQLite 파일에
+  있어서, 앱 재배포(ECS 태스크 교체) 시 초기화됐습니다: 중단된 Full Load가 resume 불가였고,
+  Full Load 작업에 묶인 **테이블별 모니터가 재배포 후 빈 화면**이 됐습니다(S3 세션 스토어는
+  `job_id` 링크만 저장하고 작업 자체는 저장 안 함). 새 `S3JobStore`는 각 작업 스냅샷을 툴의
+  **관리형 플러그인 버킷**(세션 스토어와 같은 버킷, 자동 프로비저닝 — 추가 설정 없음) `jobs/`
+  접두사에 JSON 객체로 저장해, 태스크 교체에도 작업/resume 상태가 유지됩니다. Fargate에선
+  `DSQL_MIGRATOR_JOB_STATE_BUCKET` → 관리형 버킷으로 연결; 로컬 개발은 기존 SQLite 스토어 유지
+  (둘 다 `JobStore` 프로토콜 충족이라 JobManager는 무변경).
+- **스케일 안전 쓰기(PUT storm 없음).** Full Load drain은 progress tick마다 저장하는데, 로컬
+  SQLite엔 저렴하지만 대형 테이블에선 S3를 폭주시킵니다. resume엔 chunk/job **상태 전이만**
+  중요하므로(비-`DONE` chunk는 통째 재실행, 하위 progress는 표시용이며 중단된 chunk는 reload 시
+  `FAILED`로 조정), `S3JobStore`는 상태 시그니처가 바뀔 때 즉시 PUT하고 순수 progress 쓰기는
+  5초당 최대 1회로 throttle합니다 — 행 수와 무관하게 PUT을 상태 전이 수 수준으로 bound. best-effort
+  (S3 오류가 라이브 마이그레이션을 절대 깨지 않음), 신규 IAM 없음(태스크 역할의 기존 버킷 `/*`
+  권한이 `jobs/` 접두사를 커버). 템플릿+코드 변경만 있고 커넥터/플러그인 변경은 없음 — 다음 앱
+  재배포 시 반영.
+
 ## v0.1.99
 
 ### 수정 (Fixed)

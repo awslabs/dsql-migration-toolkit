@@ -789,9 +789,24 @@ def main() -> None:
     # an app restart does not lose progress. Interrupted in-flight jobs are
     # reconciled to FAILED on load so the "retry failed tables" path resumes the
     # unfinished work.
-    from dsql_migrator.core.job_store import SqliteJobStore
+    from dsql_migrator.core.job_store import S3JobStore, SqliteJobStore
 
-    JOB_MANAGER.attach_store(SqliteJobStore(config.job_state_path))
+    # A DURABLE S3 store (when a bucket is configured -- the container deploy points
+    # DSQL_MIGRATOR_JOB_STATE_BUCKET at the tool's managed plugin bucket) survives a
+    # Fargate task replacement, so an interrupted Full Load AND the per-table
+    # migration monitor resume across a redeploy instead of being lost with the
+    # task's EPHEMERAL /tmp SQLite file. Local dev (no bucket) keeps the on-disk
+    # SQLite store. Both satisfy the JobStore protocol, so JobManager is unchanged.
+    if config.job_state_bucket:
+        JOB_MANAGER.attach_store(
+            S3JobStore(
+                config.job_state_bucket,
+                region=config.aws_region,
+                aws_profile=config.aws_profile,
+            )
+        )
+    else:
+        JOB_MANAGER.attach_store(SqliteJobStore(config.job_state_path))
     # Bound growth: drop all but the most recent completed jobs (resumable/active
     # jobs are never pruned).
     JOB_MANAGER.prune_terminal(_KEEP_DONE_JOBS)

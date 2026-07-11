@@ -627,9 +627,11 @@ Resources:
                   Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/msk-connect/mysql-dsql-cdc-*:*
               # The tool manages a single per-account/region plugin bucket
               # (mysql-dsql-migrator-plugins-<account>-<region>). It holds the two
-              # bundled connector artifacts AND the durable per-session resume
-              # snapshots (sessions/ prefix). CreateBucket makes it self-provisioning;
-              # ListBucket backs snapshot pruning. Scoped to that bucket only.
+              # bundled connector artifacts, the durable per-session resume snapshots
+              # (sessions/ prefix), AND the durable Full Load job snapshots (jobs/
+              # prefix). CreateBucket makes it self-provisioning; ListBucket backs
+              # snapshot pruning; the object-level grant on /* covers both prefixes
+              # (incl. head_object via s3:GetObject). Scoped to that bucket only.
               - Sid: ManagePluginBucket
                 Effect: Allow
                 Action:
@@ -1274,11 +1276,20 @@ Resources:
                 Fn::GetAtt: [CdcDeployRole, Arn]
             - Name: DSQL_MIGRATOR_LOG_LEVEL
               Value: INFO
-            # The JOB store stays on the task's EPHEMERAL /tmp (an in-flight Full
-            # Load does not resume across a task replacement; the cdc-stack and the
-            # migrated data are external, and CDC phase is re-probed on reconnect).
+            # Local SQLite path is the fallback when no JOB bucket is set; on
+            # Fargate the DURABLE S3 job store below takes precedence.
             - Name: DSQL_MIGRATOR_JOB_STATE_PATH
               Value: /tmp/job_state.sqlite
+            # DURABLE job/resume state: point the JobStore at the tool's managed
+            # plugin bucket (same bucket as the session store, jobs/ prefix) so a
+            # Full Load job snapshot -- and the per-table migration monitor that
+            # reads it -- survives a Fargate task replacement (a redeploy) instead of
+            # being lost with the task's EPHEMERAL /tmp SQLite. Writes are coalesced
+            # to status transitions (S3JobStore), so this is scan/PUT-safe even for a
+            # billion-row load. The snapshot is non-secret (Property 7).
+            - Name: DSQL_MIGRATOR_JOB_STATE_BUCKET
+              Value:
+                Fn::Sub: mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}
             # Local SQLite path is the fallback when no session bucket is set; on
             # Fargate the DURABLE S3 store below takes precedence.
             - Name: DSQL_MIGRATOR_SESSION_STATE_PATH
