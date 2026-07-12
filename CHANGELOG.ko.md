@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.101
+
+### 수정 (Fixed)
+
+- **CDC 인프라를 삭제한 뒤 재연결하면, 예전 "Infrastructure deleted" 로그에 갇히지 않고 다시
+  "Deploy CDC infrastructure" 버튼이 나타납니다.** 재연결 시 세션 복원이 **완료된** CDC lifecycle
+  작업 링크를 다시 적용해(끝난 삭제 작업의 스테이지 로그가 계속 렌더링됨) + 삭제 이전의 **낡은
+  커넥터 이름**을 복원해(카드가 파이프라인을 잘못 분류) 재배포 경로를 못 보여줬습니다. 이제 마지막
+  CDC 액션이 **teardown(`delete`/`stop`)**이면 복원 시 그 **완료-작업 링크와 낡은 커넥터 이름을
+  건너뜁니다** → 카드가 새 읽기 전용 AWS phase 프로브로 구동됩니다: **absent → Deploy CDC
+  infrastructure**, **infra → Start CDC**. 스택 식별자는 계속 복원되어 프로브가 어떤 스택을 볼지
+  알 수 있고, 진행 중인 teardown은 낡은 작업이 아니라 프로브의 실시간 스택 상태로 반영됩니다.
+
 ## v0.1.100
 
 ### 추가 (Added)

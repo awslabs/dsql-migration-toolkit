@@ -210,7 +210,17 @@ def apply_session_snapshot(
         snapshot.cdc_start_mode or "auto"
     )
     _restore_lob_exclusions(migration_state, snapshot.cdc_lob_exclusions)
-    if snapshot.cdc_connector_names:
+    # A COMPLETED teardown (Stop / Delete) leaves NO live connectors and no operation
+    # worth resume-displaying. Restoring its stale connector names or its finished
+    # lifecycle-job link on RECONNECT makes the CDC card cling to that prior state --
+    # e.g. after a Delete, the card kept showing the old "Infrastructure deleted" log
+    # (from the restored job) and/or classified the pipeline off stale connector
+    # names, so it never surfaced the "Deploy CDC infrastructure" action. Skip both
+    # for a teardown so the fresh read-only AWS phase probe drives the card (absent ->
+    # Deploy, infra -> Start); a still-in-flight teardown is reflected by the probe's
+    # live stack status, not a stale job.
+    _cdc_teardown = snapshot.cdc_action_kind in ("delete", "stop")
+    if snapshot.cdc_connector_names and not _cdc_teardown:
         migration_state.set_cdc_connector_names(snapshot.cdc_connector_names)  # type: ignore[attr-defined]
 
     # Restore the in-flight/just-finished CDC lifecycle job link so the CDC card
@@ -218,7 +228,9 @@ def apply_session_snapshot(
     # restart, instead of dropping them. The JobManager has already reconciled the
     # job itself (a RUNNING one became FAILED on restore); this only re-points the
     # UI at it. Guarded by hasattr so a session double without the setter is fine.
-    if snapshot.cdc_deploy_job_id and hasattr(
+    # Skipped after a teardown (see above): a finished Stop/Delete's log must not
+    # dominate the reconnected card.
+    if snapshot.cdc_deploy_job_id and not _cdc_teardown and hasattr(
         migration_state, "set_cdc_deploy_job_id"
     ):
         migration_state.set_cdc_deploy_job_id(  # type: ignore[attr-defined]

@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.101
+
+### Fixed
+
+- **After deleting the CDC infrastructure, a reconnected session now shows the
+  "Deploy CDC infrastructure" action again instead of getting stuck on the old
+  "Infrastructure deleted" log.** On reconnect the session restore was re-applying a
+  *completed* CDC lifecycle job's link (so the finished delete's stage log kept
+  rendering) and the *stale* connector names from before the teardown (so the card
+  could misclassify the pipeline) — with no path to redeploy. Restore now skips both
+  the finished-job link and the stale connector names when the last CDC action was a
+  teardown (`delete` / `stop`), so the card is driven by the fresh read-only AWS
+  phase probe: **absent → Deploy CDC infrastructure**, **infra → Start CDC**. The
+  stack identity is still restored so the probe knows which stack to check; an
+  in-flight teardown is reflected by the probe's live stack status, not a stale job.
+
 ## v0.1.100
 
 ### Added

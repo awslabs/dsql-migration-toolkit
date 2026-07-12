@@ -362,6 +362,34 @@ def test_cdc_deploy_job_id_round_trips_for_reconnect() -> None:
     assert m2.cdc_action_kind == "start"
 
 
+def test_teardown_reconnect_drops_stale_connectors_and_job_link() -> None:
+    # Regression: after a completed Stop/Delete, a RECONNECT must NOT restore the
+    # finished lifecycle-job link or the (now-gone) connector names -- otherwise the
+    # CDC card clung to the old "Infrastructure deleted" log and classified the
+    # pipeline off stale connector names, so it never surfaced the "Deploy CDC
+    # infrastructure" action. The stack identity IS kept so the fresh AWS phase probe
+    # knows which stack to check (absent -> Deploy, infra -> Start).
+    for kind in ("delete", "stop"):
+        session, eval_state, conv_state, migration_state = _populated_states()
+        migration_state.set_cdc_connector_names(["src", "sink"])
+        migration_state.set_cdc_deploy_job_id("cdc-teardown-1", kind=kind)
+        migration_state.set_cdc_stack_name("mysql-dsql-cdc-seoul-test")
+
+        snapshot = capture_session_snapshot(
+            "s1", session, eval_state, conv_state, migration_state
+        )
+        assert snapshot.cdc_action_kind == kind
+        assert snapshot.cdc_deploy_job_id == "cdc-teardown-1"
+        assert snapshot.cdc_connector_names == ["src", "sink"]
+
+        m2 = DataMigrationState()
+        apply_session_snapshot(snapshot, SessionConnectionState(), EvaluationState(),
+                               SchemaConversionState(), m2)
+        assert m2.cdc_deploy_job_id is None, kind  # stale finished job NOT restored
+        assert m2.cdc_connector_names == [], kind  # stale connectors NOT restored
+        assert m2.cdc_stack_name == "mysql-dsql-cdc-seoul-test", kind  # stack id kept
+
+
 def test_pre_cdc_deploy_job_snapshot_restores_without_link() -> None:
     # Older snapshots (and sessions that never started a CDC op) have no deploy
     # job: the fields default to None and restore leaves the link unset.
