@@ -726,6 +726,77 @@ def test_validation_result_round_trips_and_flags_restored() -> None:
     assert v2.elapsed_seconds is None
 
 
+def test_reconnect_reconciles_stuck_in_progress_validation_to_done() -> None:
+    # Regression: if a validation is saved as IN_PROGRESS but WITH a completed report
+    # (disconnect right at completion, before the DONE flip persisted), a reconnect
+    # must reconcile the step to DONE. Otherwise the shell shows a stuck "In progress"
+    # badge over a completed report with a permanently-locked "Re-run validation".
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.models import (
+        TableValidationResult,
+        ValidationMode,
+        ValidationReport,
+    )
+    from dsql_migrator.ui.validation import ValidationState
+    from dsql_migrator.ui.workflow import get_status
+
+    session, eval_state, conv_state, migration_state = _populated_states()
+    session.set_workflow(  # the stuck state: IN_PROGRESS ...
+        with_status(session.workflow, WorkflowStep.VALIDATION, StepStatus.IN_PROGRESS)
+    )
+    vstate = ValidationState()
+    vstate._result = ValidationReport.build(  # ... but a completed report exists
+        mode=ValidationMode.ROW_COUNT,
+        items=[
+            TableValidationResult(
+                table="orders", source_row_count=10, target_row_count=10,
+                row_count_match=True, matched=True,
+            )
+        ],
+    )
+    vstate._completed_at = datetime(2026, 7, 13, 1, 2, 3, tzinfo=timezone.utc)
+
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state, vstate
+    )
+    assert getattr(snapshot.workflow, "validation") is StepStatus.IN_PROGRESS
+    assert snapshot.validation_report is not None
+
+    s2 = SessionConnectionState()
+    v2 = ValidationState()
+    apply_session_snapshot(
+        snapshot, s2, EvaluationState(), SchemaConversionState(),
+        DataMigrationState(), v2,
+    )
+    # Reconciled to DONE -> Re-run enabled + the completed report shows cleanly.
+    assert get_status(s2.workflow, WorkflowStep.VALIDATION) is StepStatus.DONE
+    assert v2.result is not None
+
+
+def test_genuine_in_progress_validation_without_report_is_not_marked_done() -> None:
+    # Guard the reconcile's precondition: IN_PROGRESS with NO report (a genuinely
+    # in-flight run -- clear_outputs() wiped the report at run start) must stay
+    # IN_PROGRESS on restore, never flipped to DONE.
+    from dsql_migrator.ui.validation import ValidationState
+    from dsql_migrator.ui.workflow import get_status
+
+    session, eval_state, conv_state, migration_state = _populated_states()
+    session.set_workflow(
+        with_status(session.workflow, WorkflowStep.VALIDATION, StepStatus.IN_PROGRESS)
+    )
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state, ValidationState()
+    )
+    assert snapshot.validation_report is None
+    s2 = SessionConnectionState()
+    apply_session_snapshot(
+        snapshot, s2, EvaluationState(), SchemaConversionState(),
+        DataMigrationState(), ValidationState(),
+    )
+    assert get_status(s2.workflow, WorkflowStep.VALIDATION) is StepStatus.IN_PROGRESS
+
+
 def test_validation_signature_changes_when_result_recorded() -> None:
     from dsql_migrator.core.models import (
         TableValidationResult,

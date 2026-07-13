@@ -21,8 +21,9 @@ from __future__ import annotations
 
 from typing import Optional
 
+from dsql_migrator.core.models import StepStatus
 from dsql_migrator.core.session_state_store import SessionSnapshot
-from dsql_migrator.ui.workflow import WorkflowStep
+from dsql_migrator.ui.workflow import WorkflowStep, get_status, with_status
 
 
 def _flatten_lob_exclusions(exclusions: dict) -> list[str]:
@@ -145,6 +146,22 @@ def apply_session_snapshot(
             restore(
                 snapshot.validation_report.model_copy(deep=True),
                 snapshot.validation_completed_at,
+            )
+        # A step that reads IN_PROGRESS but has a restored report has NO live job
+        # after a reconnect (the validation job id is not persisted, so it can never
+        # resume) -- the run actually FINISHED (the report proves it). Reconcile to
+        # DONE HERE, before the workflow shell renders, so the header shows the
+        # completed result with an ENABLED "Re-run validation" button. Without this,
+        # the step is stuck showing an "In progress" badge over a completed report
+        # with a permanently-locked Re-run: the in-content reconcile runs too late --
+        # after the shell header/button already drew the stale IN_PROGRESS state, and
+        # nothing re-renders the shell. (A genuinely in-flight run has NO report --
+        # clear_outputs() wipes it at run start -- so this never hides a live run.)
+        if get_status(session.workflow, WorkflowStep.VALIDATION) is StepStatus.IN_PROGRESS:
+            session.set_workflow(
+                with_status(
+                    session.workflow, WorkflowStep.VALIDATION, StepStatus.DONE
+                )
             )
 
     # Reopen the last-viewed step on reconnect (app.py applies a back-compat

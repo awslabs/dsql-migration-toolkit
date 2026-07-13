@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.102
+
+### Fixed
+
+- **Validation no longer gets stuck on "In progress" with a permanently-locked
+  "Re-run validation" button after a reconnect.** If the browser reconnected right as
+  a validation finished (or the session was saved mid-run), the step was restored as
+  `IN_PROGRESS` while its completed report was also restored — but the validation job
+  id is not persisted, so no live job could ever flip it to `DONE`. The in-content
+  reconcile to `DONE` ran too late (after the workflow shell had already drawn the
+  stale "In progress" badge + disabled Re-run button, and nothing re-rendered the
+  shell), leaving the step showing a finished report under an "In progress" header
+  with Re-run locked forever. Session restore now reconciles the step to `DONE` when
+  it reads `IN_PROGRESS` but a completed report is present (a report proves the run
+  finished) — before the shell renders — so the completed result shows with an
+  enabled Re-run button. A genuinely in-flight run has no report (it is cleared at
+  run start), so this never hides a live run.
+
 ## v0.1.101
 
 ### Fixed
