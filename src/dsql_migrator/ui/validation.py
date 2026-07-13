@@ -1317,12 +1317,15 @@ def build_validation_screen(
                     ),
                 )
 
+            _reconciled_late = False
             if status is StepStatus.IN_PROGRESS:
                 # Guard against a "stuck spinner": the step is IN_PROGRESS but no
                 # live job is actually running it. This happens when the persisted
                 # session snapshot restored IN_PROGRESS after a process restart /
                 # page reload (the validation job id is not persisted, and the
-                # JobManager is fresh), so polling would never finalize.
+                # JobManager is fresh), so polling would never finalize -- OR when
+                # the run finished while the user was on ANOTHER step (the poll timer
+                # is torn down on navigation, so nothing flipped the status to DONE).
                 if _running_job_alive(job_manager, validation_state):
                     _render_in_progress(
                         ui, job_manager, session, validation_state, refresh
@@ -1342,6 +1345,7 @@ def build_validation_screen(
                         )
                     )
                     status = StepStatus.DONE
+                    _reconciled_late = True
                 else:
                     # Truly orphaned with no result: reconcile to NOT_STARTED and
                     # tell the user to re-run, instead of spinning forever.
@@ -1353,6 +1357,7 @@ def build_validation_screen(
                         )
                     )
                     status = StepStatus.NOT_STARTED
+                    _reconciled_late = True
                     render_notice(
                         ui,
                         tone="warning",
@@ -1365,6 +1370,16 @@ def build_validation_screen(
                             "validate again."
                         ),
                     )
+            if _reconciled_late:
+                # This in-content reconcile changed the PERSISTED workflow status, but
+                # the workflow shell (step header badge + "Re-run validation" button)
+                # already rendered with the stale IN_PROGRESS status THIS pass, and
+                # nothing else re-renders it -- so the step would stay stuck showing an
+                # "In progress" badge + a permanently-locked Re-run over the finished
+                # report. Defer a one-shot refresh so the shell re-renders with the
+                # reconciled status. The next pass reads DONE/NOT_STARTED (no reconcile,
+                # so no further timer) -- a single extra render, never a loop.
+                ui.timer(0.05, refresh, once=True)  # type: ignore[attr-defined]
 
             result = validation_state.result
             if result is not None and status is not StepStatus.IN_PROGRESS:

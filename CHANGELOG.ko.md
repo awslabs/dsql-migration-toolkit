@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.103
+
+### 수정 (Fixed)
+
+- **재실행 중 다른 스텝으로 이동했다가 돌아왔을 때 Validation이 "In progress"에 갇혀 "Re-run
+  validation" 버튼이 잠기는 문제 수정.** Re-run을 누른 뒤 실행 중에 화면을 벗어나면(예: Data
+  Migration 스텝으로 가서 Stop CDC), 스텝을 `DONE`으로 넘기는 poll 타이머가 페이지와 함께 사라집니다
+  — 그래서 백그라운드에서 실행이 끝난 뒤 Validation으로 돌아오면 스텝이 **content 렌더 안에서**
+  `DONE`으로 정리되는데, 이는 상단 shell(스텝 헤더 배지 + Re-run 버튼)이 이미 stale "In progress"로
+  그려진 뒤라 shell이 다시 안 그려집니다. 이제 content 안의 정리가 저장 상태를 바꿀 때마다(실행-중-
+  이탈 케이스 및 v0.1.102의 재연결 케이스) **one-shot refresh를 예약해 shell을 다시 그리도록** 했습니다
+  → 완료 리포트가 표시되고 Re-run 버튼이 활성화됩니다. (다음 렌더는 `DONE`/`NOT_STARTED`를 보므로
+  루프 없음.)
+
 ## v0.1.102
 
 ### 수정 (Fixed)

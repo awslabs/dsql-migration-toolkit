@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.103
+
+### Fixed
+
+- **Validation no longer gets stuck on "In progress" with a locked "Re-run
+  validation" button when a run finishes while you're on another step.** If you
+  clicked Re-run and then navigated away (e.g. to the Data Migration step to Stop
+  CDC) while the run was in flight, the poll timer that flips the step to `DONE` was
+  torn down with the page — so when the run finished in the background and you
+  returned to Validation, the step reconciled to `DONE` *inside the content render*,
+  too late for the workflow shell (the step-header badge + Re-run button had already
+  drawn the stale "In progress" state, and nothing re-rendered them). Now, whenever
+  the in-content reconcile changes the persisted status (finished-while-away or the
+  v0.1.102 reconnect case), it schedules a one-shot refresh so the shell re-renders
+  with the reconciled status — the completed report shows with an enabled Re-run
+  button. (The follow-up render sees `DONE`/`NOT_STARTED`, so it never loops.)
+
 ## v0.1.102
 
 ### Fixed
