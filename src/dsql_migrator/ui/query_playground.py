@@ -559,12 +559,21 @@ def build_query_playground_screen(
                 converted = result.converted_sql
                 kind = result.statement_kind
                 analyze = state.analyze
+                # Point the probe's search_path at the migrated schema (a MySQL DB
+                # maps to a PG schema), so an UNQUALIFIED table reference in the
+                # user's query (SELECT ... FROM orders) resolves to the migrated
+                # table instead of failing with relation-does-not-exist under the
+                # default public search_path -- mirroring how the query ran against
+                # that MySQL database.
+                source_config = getattr(session, "source_config", None)
+                search_path = getattr(source_config, "database", None) or None
                 state.begin_probe()
                 render_results.refresh()
                 # The probe is a network round-trip; run it off the event loop.
                 probe = await run.io_bound(
                     lambda: probe_statement(
-                        converted, kind, factory, analyze=analyze
+                        converted, kind, factory, analyze=analyze,
+                        search_path=search_path,
                     )
                 )
                 state.set_probe(probe)

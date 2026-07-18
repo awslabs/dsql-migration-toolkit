@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.104
+
+### 수정 (Fixed)
+
+- **Query Playground의 "Test on target"이 스키마 없는(unqualified) 테이블 이름을 이제 제대로
+  찾습니다 — `relation "orders" does not exist` (42P01) 실패 해결.** MySQL 데이터베이스 대상으로
+  작성한 쿼리는 테이블을 스키마 없이 씁니다(`SELECT * FROM orders`). 그런데 마이그레이션은 각 MySQL
+  데이터베이스를 같은 이름의 PostgreSQL **스키마**(`ecommerce_demo`)로 매핑하므로, DSQL에선 테이블이
+  그 스키마에 있습니다 — 프로브가 돌던 기본 `public` search_path엔 없어서 unqualified 참조가 전부
+  거부됐습니다. 이제 프로브가 `EXPLAIN`/dry run 전에 `search_path`를 소스 데이터베이스의 스키마(그 다음
+  `public`)로 설정해, MySQL 실행 컨텍스트를 재현하고 변환된 쿼리가 마이그레이션된 테이블 대상으로
+  검증되게 합니다. 소스 연결에 데이터베이스가 지정되지 않았으면 영향 없음(search_path 그대로).
+
 ## v0.1.103
 
 ### 수정 (Fixed)

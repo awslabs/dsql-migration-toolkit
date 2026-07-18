@@ -161,6 +161,31 @@ def test_select_explain_strips_trailing_semicolon() -> None:
     assert conn.executed[0] == "EXPLAIN SELECT 1"
 
 
+def test_search_path_set_before_explain_so_unqualified_tables_resolve() -> None:
+    # A query written against a MySQL database uses unqualified table names; the
+    # migrated tables live in a same-named PG schema. Passing search_path sets it
+    # (then public) BEFORE the EXPLAIN so "orders" resolves instead of failing with
+    # relation-does-not-exist (42P01) under the default public search_path.
+    conn = _FakeConnection()
+    probe = probe_statement(
+        "SELECT * FROM orders", StatementKind.SELECT, _factory(conn),
+        search_path="ecommerce_demo",
+    )
+    assert probe.outcome is ProbeOutcome.PASSED
+    assert conn.executed[0] == 'SET search_path TO "ecommerce_demo", public'
+    assert conn.executed[1].upper().startswith("EXPLAIN ")
+    assert "SELECT * FROM orders" in conn.executed[1]
+
+
+def test_no_search_path_leaves_explain_first() -> None:
+    # Without a source database (search_path=None) the probe runs no SET -- behavior
+    # is unchanged (the default public search_path).
+    conn = _FakeConnection()
+    probe_statement("SELECT * FROM t", StatementKind.SELECT, _factory(conn))
+    assert not any(s.upper().startswith("SET SEARCH_PATH") for s in conn.executed)
+    assert conn.executed[0].upper().startswith("EXPLAIN ")
+
+
 def test_select_explain_captures_query_plan() -> None:
     conn = _FakeConnection()
     probe = probe_statement("SELECT * FROM orders", StatementKind.SELECT, _factory(conn))

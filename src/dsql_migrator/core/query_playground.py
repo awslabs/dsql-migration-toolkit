@@ -140,6 +140,26 @@ def _safe_close(closeable: Any) -> None:
         pass
 
 
+def _set_search_path(connection: Any, schema: str) -> None:
+    """Point the session ``search_path`` at ``schema`` (then ``public``).
+
+    A migration maps each MySQL database to a PostgreSQL schema, so a query written
+    against a MySQL database uses UNQUALIFIED table names (``orders``) that live in
+    the ``<database>`` schema on the target. Without this the probe runs with the
+    default ``public`` search_path and DSQL rejects it with ``relation "orders" does
+    not exist`` (42P01). Setting the search_path to the source database's schema
+    mirrors the MySQL execution context so the converted query resolves the same
+    tables. ``schema`` is quoted as an identifier (never interpolated as a value);
+    an absent schema is a no-op (PostgreSQL only warns when a name fails to resolve).
+    """
+    ident = '"' + schema.replace('"', '""') + '"'
+    cursor = connection.cursor()
+    try:
+        cursor.execute(f"SET search_path TO {ident}, public")
+    finally:
+        _safe_close(cursor)
+
+
 def _probe_detail(exc: Exception) -> tuple[str, Optional[str]]:
     """Render a target rejection as a (message, sqlstate) pair (log-safe).
 
@@ -330,6 +350,7 @@ def probe_statement(
     *,
     analyze: bool = False,
     usd_per_dpu: float = DEFAULT_USD_PER_DPU,
+    search_path: Optional[str] = None,
 ) -> ExecutionProbe:
     """Test-run one converted statement against the target, non-destructively.
 
@@ -343,7 +364,9 @@ def probe_statement(
     (``converted_sql is None``) is also skipped. The target connection is opened
     from ``connection_factory`` and always closed. A rejection by the target is
     captured as ``FAILED`` with the reason + ``SQLSTATE`` rather than raised, so
-    the UI can render the verdict.
+    the UI can render the verdict. ``search_path`` (when given, the source
+    database's name) points the session at the migrated schema so UNQUALIFIED table
+    references resolve to the migrated tables (a MySQL DB maps to a PG schema).
     """
     if converted_sql is None:
         return ExecutionProbe(
@@ -368,6 +391,12 @@ def probe_statement(
     connection: Optional[Any] = None
     try:
         connection = connection_factory()
+        # Resolve UNQUALIFIED table names to the migrated schema (MySQL DB -> PG
+        # schema), so a query written against a MySQL database validates against the
+        # same tables instead of failing with relation-does-not-exist under the
+        # default public search_path.
+        if search_path:
+            _set_search_path(connection, search_path)
         if statement_kind is StatementKind.SELECT:
             return _run_explain(
                 connection,

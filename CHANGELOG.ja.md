@@ -5,6 +5,20 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.104
+
+### Fixed
+
+- **Query Playground の「Test on target」が、修飾なしのテーブル名を解決できるようになりました
+  （`relation "orders" does not exist` (42P01) の失敗を修正）。** MySQL データベースに対して書かれた
+  クエリはテーブル名を修飾なしで使います（`SELECT * FROM orders`）が、移行では各 MySQL データベースを
+  同名の PostgreSQL **スキーマ**（`ecommerce_demo`）にマッピングするため、DSQL 上ではテーブルはその
+  スキーマに存在します — プローブが動作していたデフォルトの `public` search_path には無いので、修飾なし
+  参照はすべて拒否されていました。プローブは `EXPLAIN`／ドライラン の前に `search_path` をソース
+  データベースのスキーマ（次に `public`）へ設定するようになり、MySQL の実行コンテキストを再現して、
+  変換後のクエリが移行済みテーブルに対して検証されます。ソース接続でデータベースが指定されていない
+  場合は影響なし（search_path はそのまま）。
+
 ## v0.1.103
 
 ### Fixed

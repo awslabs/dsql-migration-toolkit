@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.104
+
+### Fixed
+
+- **Query Playground "Test on target" now resolves unqualified table names instead
+  of failing with `relation "orders" does not exist` (42P01).** A query written
+  against a MySQL database uses unqualified table names (`SELECT * FROM orders`), but
+  the migration maps each MySQL database to a same-named PostgreSQL **schema**
+  (`ecommerce_demo`), so on DSQL the tables live in that schema — not the default
+  `public` search_path the probe ran under, so every unqualified reference was
+  rejected. The probe now sets `search_path` to the source database's schema (then
+  `public`) before the `EXPLAIN` / dry run, mirroring the MySQL execution context so
+  the converted query validates against the migrated tables. No effect when the
+  source connection specified no database (search_path unchanged).
+
 ## v0.1.103
 
 ### Fixed
