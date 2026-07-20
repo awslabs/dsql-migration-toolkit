@@ -81,6 +81,11 @@ _SOURCE_POLL_RATE_METRIC = "SourceRecordPollRate"
 # CDC signal that replaces COUNT(*)-ing the source in the live monitor.
 _CDC_METRIC_NAMESPACE = "MysqlDsqlMigrator/CDC"
 _NET_ROWS_METRIC = "NetRowsApplied"
+# End-to-end replication lag (ms) the sink emits per table = apply-wall-clock minus
+# the event's source commit time (source.ts_ms). Time-based + PK-agnostic, so it is
+# a far more accurate "how far behind is the target" signal than the UI's MAX(pk)
+# leading-edge check. Read with Stat=Maximum (worst recent lag) over a short window.
+_REPLICATION_LAG_METRIC = "ReplicationLagMs"
 
 
 def _match_metric_tables(
@@ -370,7 +375,7 @@ class MskConnectController:
         try:
             client = self._client("cloudwatch")
             # 1) Discover the Table dimension values the sink published for this stack.
-            discovered = self._list_net_rows_dimensions(client, stack)
+            discovered = self._list_metric_dimensions(client, stack, _NET_ROWS_METRIC)
             if not discovered:
                 return {}
             # 2) Map each requested table name to a published dimension value.
@@ -419,20 +424,101 @@ class MskConnectController:
             return {}
         return result
 
-    def _list_net_rows_dimensions(self, client: object, stack: str) -> list[str]:
-        """Discover the ``Table`` dimension values the sink published for ``stack``.
+    def replication_lag_by_table(
+        self,
+        stack: str,
+        tables: Sequence[str],
+        *,
+        window_seconds: int = 15 * 60,
+    ) -> dict[str, int]:
+        """Per-table end-to-end replication lag in **milliseconds**, from the sink's
+        ``ReplicationLagMs`` metric (apply-wall-clock minus the event's source commit
+        time). Time-based and PK-agnostic — a far more accurate replication-lag signal
+        than the UI's ``MAX(pk)`` leading-edge check.
 
-        Filters ``ListMetrics`` to the net-rows metric with this ``Stack`` dimension
-        and returns each metric's ``Table`` value. Paginates over ``NextToken`` with a
-        bounded loop (500 metrics/page) so a large schema is covered without an
-        unbounded call chain.
+        Discovery + name matching are identical to :meth:`net_rows_by_table` (the sink
+        emits the same schema-qualified ``Table`` dimension). Read with ``Stat=Maximum``
+        (worst lag) at 1-minute resolution over the trailing ``window_seconds`` and
+        return the **most recent** minute's value per table (current worst lag). Idle
+        tables (no recent events) have no datapoint and are simply absent — the stream
+        is caught up. Best-effort: ``{}`` on any error / no datapoint.
+        """
+        names = [t for t in tables if t]
+        if not stack or not names:
+            return {}
+        result: dict[str, int] = {}
+        try:
+            client = self._client("cloudwatch")
+            discovered = self._list_metric_dimensions(
+                client, stack, _REPLICATION_LAG_METRIC
+            )
+            if not discovered:
+                return {}
+            by_dim = _match_metric_tables(names, discovered)
+            if not by_dim:
+                return {}
+            now = datetime.now(timezone.utc)
+            start = datetime.fromtimestamp(
+                now.timestamp() - window_seconds, tz=timezone.utc
+            )
+            queries = []
+            id_map: dict[str, str] = {}
+            for i, (name, dim) in enumerate(by_dim.items()):
+                qid = f"l{i}"
+                id_map[qid] = name
+                queries.append(
+                    {
+                        "Id": qid,
+                        "MetricStat": {
+                            "Metric": {
+                                "Namespace": _CDC_METRIC_NAMESPACE,
+                                "MetricName": _REPLICATION_LAG_METRIC,
+                                "Dimensions": [
+                                    {"Name": "Stack", "Value": stack},
+                                    {"Name": "Table", "Value": dim},
+                                ],
+                            },
+                            # 1-minute worst-lag buckets; the newest bucket is the
+                            # current lag. Maximum (not Average) so a lag spike shows.
+                            "Period": 60,
+                            "Stat": "Maximum",
+                        },
+                        "ReturnData": True,
+                    }
+                )
+            # TimestampDescending -> Values[0] is the most recent minute.
+            response = client.get_metric_data(
+                MetricDataQueries=queries,
+                StartTime=start,
+                EndTime=now,
+                ScanBy="TimestampDescending",
+            )
+            for item in response.get("MetricDataResults", []):
+                name = id_map.get(item.get("Id"))
+                values = item.get("Values", [])
+                if name is None or not values:
+                    continue
+                result[name] = int(round(float(values[0])))
+        except Exception:  # noqa: BLE001 - best-effort monitor signal only
+            return {}
+        return result
+
+    def _list_metric_dimensions(
+        self, client: object, stack: str, metric_name: str
+    ) -> list[str]:
+        """Discover the ``Table`` dimension values the sink published for ``stack``
+        under ``metric_name`` (``NetRowsApplied`` or ``ReplicationLagMs``).
+
+        Filters ``ListMetrics`` to that metric with this ``Stack`` dimension and returns
+        each metric's ``Table`` value. Paginates over ``NextToken`` with a bounded loop
+        (500 metrics/page) so a large schema is covered without an unbounded call chain.
         """
         tables: list[str] = []
         token: Optional[str] = None
         for _ in range(20):  # 500 metrics/page -> up to 10k tables; a hard cap
             kwargs: dict = {
                 "Namespace": _CDC_METRIC_NAMESPACE,
-                "MetricName": _NET_ROWS_METRIC,
+                "MetricName": metric_name,
                 "Dimensions": [{"Name": "Stack", "Value": stack}],
             }
             if token:

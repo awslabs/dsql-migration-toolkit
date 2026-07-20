@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
@@ -107,9 +108,17 @@ public class DsqlSinkTask extends SinkTask {
   // strictly best-effort: a CloudWatch error is logged and NEVER breaks apply.
   private static final String METRIC_NAMESPACE = "MysqlDsqlMigrator/CDC";
   private static final String METRIC_NET_ROWS = "NetRowsApplied";
+  // End-to-end replication lag: apply-wall-clock - event's source commit time
+  // (source.ts_ms). Time-based (milliseconds) and PK-agnostic, unlike the UI's
+  // MAX(pk) leading-edge check. Per table we keep the WORST (max) lag seen since the
+  // last emit and publish it as a gauge; the reader takes Maximum over a trailing
+  // window ("worst recent lag"). Idle windows (no events) emit nothing = caught up.
+  private static final String METRIC_REPLICATION_LAG = "ReplicationLagMs";
   private boolean metricsEnabled;
   private String metricsStack = "";
   private final Map<String, LongAdder> netByTable = new ConcurrentHashMap<>();
+  // Per-table worst replication lag (ms) since the last emit (reset on emit).
+  private final Map<String, AtomicLong> lagByTable = new ConcurrentHashMap<>();
   private volatile CloudWatchClient cloudWatch; // built lazily on first emit
 
   @Override
@@ -693,6 +702,15 @@ public class DsqlSinkTask extends SinkTask {
     if (delta != 0) {
       netByTable.computeIfAbsent(event.table(), t -> new LongAdder()).add(delta);
     }
+    // End-to-end replication lag for this just-applied event: how long from the
+    // source commit (source.ts_ms) to now (apply/commit time). Keep the WORST lag
+    // per table since the last emit. Clamp to >= 0 (source/target clock skew can
+    // make a fresh event read slightly negative). Only when source.ts_ms was present.
+    long src = event.sourceTsMs();
+    if (src > 0L) {
+      long lag = Math.max(0L, System.currentTimeMillis() - src);
+      lagByTable.computeIfAbsent(event.table(), t -> new AtomicLong(0L)).accumulateAndGet(lag, Math::max);
+    }
   }
 
   /**
@@ -722,6 +740,25 @@ public class DsqlSinkTask extends SinkTask {
               .unit(StandardUnit.COUNT)
               .build());
     }
+    // Replication lag (gauge): the worst apply-time lag per table since the last
+    // emit, then reset. getAndSet(0) reads-and-clears so an idle next window (no
+    // events) emits no datapoint (= caught up). Same Stack+Table dimensions and the
+    // same PutMetricData request as the net-rows datums above.
+    for (Map.Entry<String, AtomicLong> e : lagByTable.entrySet()) {
+      long lagMs = e.getValue().getAndSet(0L);
+      if (lagMs <= 0L) {
+        continue;
+      }
+      data.add(
+          MetricDatum.builder()
+              .metricName(METRIC_REPLICATION_LAG)
+              .dimensions(
+                  Dimension.builder().name("Stack").value(metricsStack).build(),
+                  Dimension.builder().name("Table").value(e.getKey()).build())
+              .value((double) lagMs)
+              .unit(StandardUnit.MILLISECONDS)
+              .build());
+    }
     if (data.isEmpty()) {
       return;
     }
@@ -735,7 +772,8 @@ public class DsqlSinkTask extends SinkTask {
       // Drop this window (do NOT re-accumulate: avoids unbounded growth if CloudWatch
       // stays unreachable); the next window re-reports its own delta.
       log.warn(
-          "Could not emit CDC net-rows metric (best-effort; replication unaffected): {}",
+          "Could not emit CDC monitor metrics (net-rows / replication-lag; best-effort; "
+              + "replication unaffected): {}",
           ex.toString());
     }
   }

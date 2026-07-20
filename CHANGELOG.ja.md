@@ -5,6 +5,25 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.105
+
+### Added
+
+- **正確な時間ベースの CDC レプリケーションラグ — 不正確な `MAX(pk)`「Stream lag」を置き換え。**
+  従来のテーブルごとの「Stream lag (newest)」は両側の `MAX(pk)` を比較していました: PK 単位の数
+  (時間ではない)で、insert のみを反映(UPDATE/DELETE の遅延は見えない)し、単一整数 PK でのみ動作
+  しました。DSQL シンクが各変更の**ソースコミット時刻**(Debezium `source.ts_ms`)を読み、テーブル
+  ごとの **`ReplicationLagMs`** CloudWatch メトリクス = 適用時刻 − ソースコミット時刻(オフセット
+  コミット窓ごとの最悪ラグ、ミリ秒)を送信するようになりました。移行モニターの **「Stream lag」**
+  列が実際の時間値(「8.5s behind」「2m 10s behind」「caught up」)をライブかつスキャン不要で表示
+  します — PK 型に依存せず、最新の insert だけでなく update/delete の遅延も反映します。時間
+  メトリクスが利用できない場合(旧プラグイン)やカウント未更新時のみ、従来の `MAX(pk)` リーディング
+  エッジチェック(「N behind (PK)」)にフォールバックします。送信は完全に best-effort(レプリケーション
+  に影響なし)で、v18 のメトリクス配管/IAM(`cloudwatch:PutMetricData`、`metrics.stack`)を再利用 —
+  新規 IAM なし。
+- 反映するには、再ビルドされたコネクタプラグイン(`PLUGIN_VERSION` → `v19`)と CDC の再デプロイが
+  必要です。それまでは列は `MAX(pk)` フォールバックを使用します。
+
 ## v0.1.104
 
 ### Fixed

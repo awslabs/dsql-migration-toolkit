@@ -170,6 +170,13 @@ class DataMigrationState:
         # it drives the "Net rows since Full Load" column cheaply. name -> net count;
         # empty when the metric is unavailable (older plugin / sink not emitting).
         self.cdc_net_rows_by_table: dict[str, int] = {}
+        # Per-table end-to-end replication lag (milliseconds) from the sink's
+        # ``ReplicationLagMs`` CloudWatch metric (apply time minus source commit time).
+        # Refreshed every CDC poll; drives the time-based "Stream lag" column (a far
+        # more accurate signal than the MAX(pk) leading-edge fallback). name -> ms;
+        # empty/absent when the metric is unavailable (older plugin) or the table is
+        # idle/caught up.
+        self.cdc_replication_lag_by_table: dict[str, int] = {}
         # CDC lifecycle actions (Deploy infra / Start / Stop / Delete) -- each runs
         # as a JobManager CloudFormation job; only one runs at a time, so a single
         # ``cdc_deploy_job_id`` + ``cdc_action_kind`` (which operation it is, for the
@@ -410,9 +417,10 @@ class DataMigrationState:
             self.cdc_other_stacks = []
             # Belongs to the previously-targeted stack; the fresh probe repopulates.
             self.cdc_reconciled_table_names = []
-            # Net-rows metric is per-stack too; drop it so the adopted stack's poll
-            # repopulates rather than showing the prior stack's figures.
+            # Net-rows + replication-lag metrics are per-stack too; drop them so the
+            # adopted stack's poll repopulates rather than showing the prior stack's.
             self.cdc_net_rows_by_table = {}
+            self.cdc_replication_lag_by_table = {}
         return True
 
     def append_cdc_deploy_log(self, when: datetime, message: str) -> None:
@@ -460,6 +468,18 @@ class DataMigrationState:
         with self._lock:
             self.cdc_net_rows_by_table = {
                 str(k): int(v) for k, v in dict(net_rows or {}).items()
+            }
+
+    def set_cdc_replication_lag_by_table(self, lag_ms: "dict[str, int]") -> None:
+        """Record per-table replication lag in ms (from ``ReplicationLagMs``).
+
+        Time-based end-to-end lag read from CloudWatch on the live poll; drives the
+        "Stream lag" column. Replaces the prior map (empty when the metric is
+        unavailable or every table is idle/caught up).
+        """
+        with self._lock:
+            self.cdc_replication_lag_by_table = {
+                str(k): int(v) for k, v in dict(lag_ms or {}).items()
             }
 
     def set_cdc_connector_running_names(self, names: Sequence[str]) -> None:

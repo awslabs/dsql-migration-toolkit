@@ -37,8 +37,8 @@ final class DebeziumEvents {
 
     Object value = record.value();
     if (value == null) {
-      // Tombstone -> delete by key.
-      return buildDelete(tableFromTopic(record.topic()), pkColumns, pkValues);
+      // Tombstone -> delete by key. No envelope, so no source.ts_ms (lag unknown).
+      return buildDelete(tableFromTopic(record.topic()), pkColumns, pkValues, 0L);
     }
     if (!(value instanceof Struct envelope)) {
       throw new DataException(
@@ -47,6 +47,9 @@ final class DebeziumEvents {
 
     String op = optString(envelope, "op");
     String table = resolveTable(envelope, record.topic());
+    // Source commit time for the end-to-end replication-lag metric (now - ts at
+    // apply). 0 when the source block omits ts_ms -> lag simply not recorded.
+    long sourceTsMs = optLong(optStruct(envelope, "source"), "ts_ms");
     Struct after = optStruct(envelope, "after");
 
     if ("d".equals(op) || after == null) {
@@ -57,7 +60,7 @@ final class DebeziumEvents {
           extractStruct(before, pkColumns, pkValues);
         }
       }
-      return buildDelete(table, pkColumns, pkValues);
+      return buildDelete(table, pkColumns, pkValues, sourceTsMs);
     }
 
     List<String> columns = new ArrayList<>();
@@ -72,17 +75,17 @@ final class DebeziumEvents {
     // count unchanged (net 0). Both apply identically (idempotent ON CONFLICT upsert).
     boolean isInsert = "c".equals(op) || "r".equals(op);
     return isInsert
-        ? ChangeEvent.insert(table, columns, values, pkColumns, pkValues)
-        : ChangeEvent.upsert(table, columns, values, pkColumns, pkValues);
+        ? ChangeEvent.insert(table, columns, values, pkColumns, pkValues, sourceTsMs)
+        : ChangeEvent.upsert(table, columns, values, pkColumns, pkValues, sourceTsMs);
   }
 
   private static ChangeEvent buildDelete(
-      String table, List<String> pkColumns, List<Object> pkValues) {
+      String table, List<String> pkColumns, List<Object> pkValues, long sourceTsMs) {
     if (pkColumns.isEmpty()) {
       throw new DataException(
           "Cannot build DELETE for table " + table + ": no primary key in record key or before-image");
     }
-    return ChangeEvent.delete(table, pkColumns, pkValues);
+    return ChangeEvent.delete(table, pkColumns, pkValues, sourceTsMs);
   }
 
   private static void extractStruct(Object maybeStruct, List<String> names, List<Object> values) {
@@ -157,5 +160,14 @@ final class DebeziumEvents {
     }
     Object value = struct.get(field);
     return value instanceof Struct nested ? nested : null;
+  }
+
+  /** Read an epoch-millis long field (e.g. source.ts_ms); 0 when absent/null. Null-safe. */
+  private static long optLong(Struct struct, String field) {
+    if (struct == null || struct.schema().field(field) == null) {
+      return 0L;
+    }
+    Object value = struct.get(field);
+    return value instanceof Number number ? number.longValue() : 0L;
   }
 }

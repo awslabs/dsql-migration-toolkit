@@ -1566,7 +1566,7 @@ def test_fetch_cdc_status_includes_dlq_errors_when_controller_exposes_reader() -
 
     fetched = _fetch_cdc_status(state)
     assert fetched is not None
-    _statuses, _health, dlq_errors, _net = fetched
+    _statuses, _health, dlq_errors, _net, _lag = fetched
     assert [e.table for e in dlq_errors] == ["orders"]
 
 
@@ -1604,6 +1604,38 @@ def test_fetch_cdc_status_reads_net_rows_when_controller_exposes_reader() -> Non
     }
     _apply_cdc_status(state, fetched)
     assert state.cdc_net_rows_by_table == {"orders": 5, "customers": -2}
+
+
+def test_fetch_cdc_status_reads_replication_lag_when_controller_exposes_reader() -> None:
+    # _fetch scopes the ReplicationLagMs read to the migrated table set and _apply
+    # stores it on state (drives the time-based "Stream lag" column).
+    from dsql_migrator.core.cdc import ConnectorState, ConnectorStatus
+    from dsql_migrator.core.msk_connect_controller import ConnectorHealth
+    from dsql_migrator.ui.data_migration import _apply_cdc_status, _fetch_cdc_status
+
+    seen: dict = {}
+
+    class _CtrlWithLag(_FakeCdcController):
+        def replication_lag_by_table(self, stack, tables, **_kw):
+            seen["stack"] = stack
+            seen["tables"] = list(tables)
+            return {"orders": 8500, "customers": 200}
+
+    state = DataMigrationState()
+    state.set_cdc_stack_name("mysql-dsql-cdc-seoul-test")
+    state.set_cdc_controller(
+        _CtrlWithLag(
+            statuses=[ConnectorStatus(name="sink", state=ConnectorState.RUNNING)],
+            health={"sink": ConnectorHealth(running_tasks=1, errored_tasks=0)},
+        )
+    )
+    state.set_cdc_connector_names(["sink"])
+
+    fetched = _fetch_cdc_status(state, ["orders", "customers"])
+    assert fetched is not None
+    assert seen == {"stack": "mysql-dsql-cdc-seoul-test", "tables": ["orders", "customers"]}
+    _apply_cdc_status(state, fetched)
+    assert state.cdc_replication_lag_by_table == {"orders": 8500, "customers": 200}
 
 
 def test_fetch_cdc_status_skips_net_rows_without_tables() -> None:
@@ -3269,6 +3301,26 @@ def test_migration_table_status_quarantined_means_data_missing() -> None:
     )
     assert row.dlq_count == 3
     assert row.consistency == "quarantined"  # missing data wins over a count match
+
+
+def test_migration_table_status_carries_replication_lag_ms() -> None:
+    # The per-table time-based replication lag (ReplicationLagMs) is threaded onto the
+    # row so the "Stream lag" column can show it (preferred over the MAX(pk) fallback).
+    from dsql_migrator.ui.data_migration import build_migration_table_status
+
+    (row,) = build_migration_table_status(
+        ["orders"],
+        source_max_pk={"orders": 1000}, target_max_pk={"orders": 900},  # PK gap present
+        replication_lag_ms={"orders": 8500},
+    )
+    assert row.replication_lag_ms == 8500
+    assert row.pk_gap == 100  # PK fallback still computed, but the metric is preferred
+
+    # Absent from the metric map -> None (column falls back to the PK leading edge).
+    (row2,) = build_migration_table_status(
+        ["orders"], replication_lag_ms={"customers": 1},
+    )
+    assert row2.replication_lag_ms is None
 
 
 def test_migration_table_status_consistency_verdicts() -> None:

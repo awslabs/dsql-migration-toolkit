@@ -2833,6 +2833,9 @@ def _render_migration_table_status(
                 source_max_pk=getattr(migration_state, "row_max_pk_source", {}),
                 target_max_pk=getattr(migration_state, "row_max_pk_target", {}),
                 net_rows_metric=getattr(migration_state, "cdc_net_rows_by_table", {}),
+                replication_lag_ms=getattr(
+                    migration_state, "cdc_replication_lag_by_table", {}
+                ),
             )
             # Columns separate the one-shot Full Load contribution from the ongoing
             # CDC contribution, then show the source-vs-target consistency verdict
@@ -2848,7 +2851,7 @@ def _render_migration_table_status(
                 },
                 {"name": "source", "label": "Source rows", "field": "source"},
                 {"name": "target", "label": "Target rows", "field": "target"},
-                {"name": "stream", "label": "Stream lag (newest)", "field": "stream"},
+                {"name": "stream", "label": "Stream lag", "field": "stream"},
                 {"name": "dlq", "label": "Quarantined", "field": "dlq"},
                 {
                     "name": "consistency",
@@ -2866,6 +2869,20 @@ def _render_migration_table_status(
                     return "—"
                 return f"+{n:,}" if n > 0 else f"{n:,}"
 
+            def _fmt_lag(ms: "Optional[int]") -> str:
+                # Time-based replication lag (ms) -> human "behind" text. Sub-second
+                # rounds to "caught up" (effectively real-time); else s / m·s / h·m.
+                if ms is None:
+                    return "—"
+                if ms < 1000:
+                    return "caught up"
+                secs = ms / 1000.0
+                if secs < 60:
+                    return f"{secs:.1f}s behind"
+                if secs < 3600:
+                    return f"{int(secs // 60)}m {int(secs % 60)}s behind"
+                return f"{int(secs // 3600)}h {int((secs % 3600) // 60)}m behind"
+
             # User-facing consistency label + the verdict key (drives the badge color).
             _CONSISTENCY_LABEL = {
                 "consistent": "consistent",
@@ -2880,13 +2897,18 @@ def _render_migration_table_status(
                 source_label = _fmt(r.source_rows)
                 if r.source_estimate and r.source_rows is not None:
                     source_label += " (est.)"
-                # Stream lag: whether the newest source row (high-water PK) has
-                # landed on the target. Distinguishes a lagging stream from a
-                # caught-up-but-gappy one.
-                if r.stream_caught_up is True:
+                # Stream lag: prefer the sink's TIME-based end-to-end lag
+                # (ReplicationLagMs = apply time − source commit time) — accurate and
+                # PK-agnostic. Fall back to the MAX(pk) leading-edge check (caught up /
+                # N behind) only when the metric is unavailable (older plugin) or the
+                # counts weren't refreshed. A metric present but idle (no recent
+                # datapoint) means the stream drained → "caught up".
+                if r.replication_lag_ms is not None:
+                    stream = _fmt_lag(r.replication_lag_ms)
+                elif r.stream_caught_up is True:
                     stream = "caught up"
                 elif r.stream_caught_up is False:
-                    stream = f"{r.pk_gap:,} behind"
+                    stream = f"{r.pk_gap:,} behind (PK)"
                 else:
                     stream = "—"
                 verdict = r.consistency
@@ -3075,7 +3097,11 @@ def _render_migration_table_status(
                 "COUNT), so it is negative when the stream net-deleted rows (e.g. "
                 "more deletes than inserts) — that is expected, not an error.",
                 "Source rows — scan-free estimate. Target rows — exact count.",
-                "Stream lag — newest row (PK) on each side: “caught up” vs “N behind”.",
+                "Stream lag — how far the target is behind the source in TIME "
+                "(the sink reports apply-time minus each change's source commit "
+                "time). “caught up” = sub-second / drained. Falls back to a MAX(pk) "
+                "leading-edge check (“N behind (PK)”) only when the time metric "
+                "isn't available.",
                 "Consistency — read the colored badge: green “consistent” = counts "
                 "match · “replicating…” = catching up · red “rows missing” = newest "
                 "landed but rows gone mid-stream · red “data quarantined” = DLQ has "

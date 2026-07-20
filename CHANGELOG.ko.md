@@ -5,6 +5,23 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.105
+
+### 추가 (Added)
+
+- **정확한 시간 기반 CDC replication lag — 부정확한 `MAX(pk)` "Stream lag"를 대체.** 기존
+  테이블별 "Stream lag (newest)"는 양쪽 `MAX(pk)`를 비교했는데, 이는 PK 개수(시간 아님)이고,
+  insert만 반영(UPDATE/DELETE 지연은 못 봄)하며, 단일 정수 PK에서만 동작했습니다. 이제 DSQL 싱크가
+  각 변경의 **소스 커밋 시각**(Debezium `source.ts_ms`)을 읽어, 테이블별 **`ReplicationLagMs`**
+  CloudWatch 메트릭 = 적용시각 − 소스 커밋시각(오프셋 커밋 창당 최악 lag, 밀리초)을 발행합니다.
+  마이그레이션 모니터의 **"Stream lag"** 컬럼이 이제 실제 시간값("8.5s behind", "2m 10s behind",
+  "caught up")을 라이브·스캔프리로 보여줍니다 — PK 타입 무관하고 최신 insert뿐 아니라 update/delete
+  지연도 반영. 시간 메트릭을 쓸 수 없을 때(구버전 플러그인)나 카운트 미갱신 시에만 기존 `MAX(pk)`
+  leading-edge 체크("N behind (PK)")로 폴백합니다. 발행은 철저히 best-effort(복제에 영향 없음)이고
+  v18 메트릭 배관/IAM(`cloudwatch:PutMetricData`, `metrics.stack`)을 재사용 — 신규 IAM 없음.
+- 반영하려면 재빌드된 커넥터 플러그인(`PLUGIN_VERSION` → `v19`)과 CDC 재배포가 필요하며, 그 전까지는
+  컬럼이 `MAX(pk)` 폴백을 사용합니다.
+
 ## v0.1.104
 
 ### 수정 (Fixed)

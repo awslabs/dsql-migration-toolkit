@@ -614,7 +614,7 @@ def cdc_activity_summary(health: dict) -> CdcActivitySummary:
 def _fetch_cdc_status(migration_state, tables=None):
     """Read connector state + CloudWatch task health (BLOCKING network I/O).
 
-    Returns ``(statuses, health, dlq_errors, net_rows)`` from the duck-typed
+    Returns ``(statuses, health, dlq_errors, net_rows, lag_ms)`` from the duck-typed
     ``MskConnectController``, or ``None`` when there is nothing to read or the read
     fails. This is the only part of the CDC poll that touches the network, so the
     live poller runs it on a worker thread (``run.io_bound``) -- keeping the
@@ -644,6 +644,16 @@ def _fetch_cdc_status(migration_state, tables=None):
             net_rows = dict(net_reader(stack, list(tables)) or {})
         except Exception:  # noqa: BLE001 - advisory, keep status even if it fails
             net_rows = {}
+    # Best-effort: read per-table end-to-end replication lag (ms) from the sink's
+    # ReplicationLagMs metric -- a time-based, PK-agnostic lag for the "Stream lag"
+    # column (accurate, unlike the MAX(pk) leading-edge fallback). Never fatal.
+    lag_ms: dict = {}
+    lag_reader = getattr(controller, "replication_lag_by_table", None)
+    if callable(lag_reader) and stack and tables:
+        try:
+            lag_ms = dict(lag_reader(stack, list(tables)) or {})
+        except Exception:  # noqa: BLE001 - advisory, keep status even if it fails
+            lag_ms = {}
     # Best-effort: pull NEW sink dead-letter events from the connector's
     # CloudWatch log group so the DLQ surface reflects the real pipeline (not just
     # in-tool errors). Only when the controller exposes the reader; never fatal.
@@ -655,7 +665,7 @@ def _fetch_cdc_status(migration_state, tables=None):
             dlq_errors = list(reader(f"/msk-connect/{stack_name}-cdc") or [])
         except Exception:  # noqa: BLE001 - advisory, keep status even if logs fail
             dlq_errors = []
-    return statuses, health, dlq_errors, net_rows
+    return statuses, health, dlq_errors, net_rows, lag_ms
 
 
 def cdc_error_log_key(migration_state) -> str:
@@ -689,12 +699,17 @@ def _apply_cdc_status(migration_state, fetched) -> None:
     statuses, health, *rest = fetched
     dlq_errors = rest[0] if rest else []
     net_rows = rest[1] if len(rest) > 1 else {}
+    lag_ms = rest[2] if len(rest) > 2 else {}
     # Store the scan-free per-table net rows the sink applied so the per-table
     # monitor can show CDC progress without a COUNT(*). Setter is a no-op-safe
     # replace; empty when the metric was unavailable this poll.
     setter = getattr(migration_state, "set_cdc_net_rows_by_table", None)
     if callable(setter):
         setter(net_rows or {})
+    # Store per-table replication lag (ms) for the time-based "Stream lag" column.
+    lag_setter = getattr(migration_state, "set_cdc_replication_lag_by_table", None)
+    if callable(lag_setter):
+        lag_setter(lag_ms or {})
     adjusted = []
     for status in statuses:
         h = health.get(status.name)

@@ -5,6 +5,27 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.105
+
+### Added
+
+- **Accurate, time-based CDC replication lag — replacing the imprecise `MAX(pk)`
+  "Stream lag".** The old per-table "Stream lag (newest)" compared `MAX(pk)` on each
+  side: a count of PK units (not time), insert-only (blind to UPDATE/DELETE lag), and
+  only for single-column integer PKs. The DSQL sink now reads each change's **source
+  commit time** (Debezium `source.ts_ms`) and emits a per-table **`ReplicationLagMs`**
+  CloudWatch metric = apply-wall-clock − source commit time (the worst lag per
+  offset-commit window, in milliseconds). The migration monitor's **"Stream lag"**
+  column now shows a real time value ("8.5s behind", "2m 10s behind", "caught up"),
+  read live and scan-free — accurate for any PK type and reflecting update/delete lag,
+  not just the newest insert. It falls back to the `MAX(pk)` leading-edge check
+  ("N behind (PK)") only when the time metric is unavailable (older plugin) or the
+  counts weren't refreshed. Emission is strictly best-effort (never affects
+  replication) and reuses the v18 metric plumbing/IAM (`cloudwatch:PutMetricData`,
+  `metrics.stack`) — no new IAM.
+- Requires the rebuilt connector plugin (`PLUGIN_VERSION` → `v19`) and a CDC
+  re-deploy to take effect; until then the column uses the `MAX(pk)` fallback.
+
 ## v0.1.104
 
 ### Fixed

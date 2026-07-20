@@ -364,6 +364,12 @@ class MigrationTableStatus:
     # source-friendly way to show CDC progress. ``None`` when the metric is
     # unavailable (sink not yet emitting / older plugin without the metric).
     cdc_net_metric: Optional[int] = None
+    # End-to-end replication lag in milliseconds from the sink's ``ReplicationLagMs``
+    # CloudWatch metric (apply time minus the event's source commit time). Time-based
+    # and PK-agnostic -- the accurate "Stream lag" signal, preferred over the MAX(pk)
+    # leading-edge (``pk_gap``) fallback. ``None`` when unavailable (older plugin) or
+    # the table is idle/caught up (no recent datapoint).
+    replication_lag_ms: Optional[int] = None
 
     @property
     def pk_gap(self) -> Optional[int]:
@@ -470,6 +476,7 @@ def build_migration_table_status(
     source_max_pk: "Optional[dict[str, Optional[int]]]" = None,
     target_max_pk: "Optional[dict[str, Optional[int]]]" = None,
     net_rows_metric: "Optional[dict[str, Optional[int]]]" = None,
+    replication_lag_ms: "Optional[dict[str, Optional[int]]]" = None,
     source_is_estimate: bool = True,
 ) -> list["MigrationTableStatus"]:
     """Assemble the per-table migration status for ``table_names`` (pure).
@@ -498,6 +505,7 @@ def build_migration_table_status(
     source_max_pk = source_max_pk or {}
     target_max_pk = target_max_pk or {}
     net_rows_metric = net_rows_metric or {}
+    replication_lag_ms = replication_lag_ms or {}
 
     out: list[MigrationTableStatus] = []
     for name in table_names:
@@ -527,6 +535,7 @@ def build_migration_table_status(
                 source_max_pk=source_max_pk.get(name),
                 target_max_pk=target_max_pk.get(name),
                 cdc_net_metric=net_rows_metric.get(name),
+                replication_lag_ms=replication_lag_ms.get(name),
             )
         )
     return out

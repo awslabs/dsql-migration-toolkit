@@ -25,11 +25,12 @@ class DsqlSinkBatchGroupingTest {
       vals.add(i);
     }
     return new DsqlSinkTask.Applicable(
-        null, ChangeEvent.upsert(table, cols, vals, List.of(cols.get(0)), List.of(0)));
+        null, ChangeEvent.upsert(table, cols, vals, List.of(cols.get(0)), List.of(0), 0L));
   }
 
   private static DsqlSinkTask.Applicable delete(String table) {
-    return new DsqlSinkTask.Applicable(null, ChangeEvent.delete(table, List.of("id"), List.of(1)));
+    return new DsqlSinkTask.Applicable(
+        null, ChangeEvent.delete(table, List.of("id"), List.of(1), 0L));
   }
 
   /** Partition a chunk into run lengths using runEnd, mirroring applyChunkBatched. */
@@ -108,7 +109,7 @@ class DsqlSinkBatchGroupingTest {
     return new DsqlSinkTask.Applicable(
         null,
         ChangeEvent.upsert(
-            "orders", List.of("id", "amt"), List.of(pk, amt), List.of("id"), List.of(pk)));
+            "orders", List.of("id", "amt"), List.of(pk, amt), List.of("id"), List.of(pk), 0L));
   }
 
   private static List<Object> pkOf(DsqlSinkTask.Applicable a) {

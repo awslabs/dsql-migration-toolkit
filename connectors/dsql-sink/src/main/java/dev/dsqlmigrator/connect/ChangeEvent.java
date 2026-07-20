@@ -31,6 +31,11 @@ final class ChangeEvent {
   private final List<Object> values;
   private final List<String> pkColumns;
   private final List<Object> pkValues;
+  // Debezium source commit time (epoch millis, from the event's source.ts_ms).
+  // The sink computes end-to-end replication lag = apply-wall-clock - sourceTsMs at
+  // apply time and emits it as the ReplicationLagMs monitor metric. 0 when the event
+  // carried no source.ts_ms (e.g. a tombstone) — in which case lag is not recorded.
+  private final long sourceTsMs;
 
   private ChangeEvent(
       String table,
@@ -39,7 +44,8 @@ final class ChangeEvent {
       List<String> columns,
       List<Object> values,
       List<String> pkColumns,
-      List<Object> pkValues) {
+      List<Object> pkValues,
+      long sourceTsMs) {
     this.table = table;
     this.delete = delete;
     this.netRowDelta = netRowDelta;
@@ -47,6 +53,7 @@ final class ChangeEvent {
     this.values = values;
     this.pkColumns = pkColumns;
     this.pkValues = pkValues;
+    this.sourceTsMs = sourceTsMs;
   }
 
   /** An UPDATE (op u): applied as an idempotent upsert; net row delta 0. */
@@ -55,8 +62,10 @@ final class ChangeEvent {
       List<String> columns,
       List<Object> values,
       List<String> pkColumns,
-      List<Object> pkValues) {
-    return new ChangeEvent(table, false, 0, List.copyOf(columns), values, List.copyOf(pkColumns), pkValues);
+      List<Object> pkValues,
+      long sourceTsMs) {
+    return new ChangeEvent(
+        table, false, 0, List.copyOf(columns), values, List.copyOf(pkColumns), pkValues, sourceTsMs);
   }
 
   /** An INSERT (op c / snapshot r): same upsert apply, but net row delta +1. */
@@ -65,12 +74,16 @@ final class ChangeEvent {
       List<String> columns,
       List<Object> values,
       List<String> pkColumns,
-      List<Object> pkValues) {
-    return new ChangeEvent(table, false, 1, List.copyOf(columns), values, List.copyOf(pkColumns), pkValues);
+      List<Object> pkValues,
+      long sourceTsMs) {
+    return new ChangeEvent(
+        table, false, 1, List.copyOf(columns), values, List.copyOf(pkColumns), pkValues, sourceTsMs);
   }
 
-  static ChangeEvent delete(String table, List<String> pkColumns, List<Object> pkValues) {
-    return new ChangeEvent(table, true, -1, List.of(), List.of(), List.copyOf(pkColumns), pkValues);
+  static ChangeEvent delete(
+      String table, List<String> pkColumns, List<Object> pkValues, long sourceTsMs) {
+    return new ChangeEvent(
+        table, true, -1, List.of(), List.of(), List.copyOf(pkColumns), pkValues, sourceTsMs);
   }
 
   String table() {
@@ -84,6 +97,11 @@ final class ChangeEvent {
   /** +1 insert / 0 update / -1 delete — for the per-table net-rows monitor metric. */
   int netRowDelta() {
     return netRowDelta;
+  }
+
+  /** Source commit time (epoch millis) from source.ts_ms; 0 if unknown. */
+  long sourceTsMs() {
+    return sourceTsMs;
   }
 
   List<String> columns() {

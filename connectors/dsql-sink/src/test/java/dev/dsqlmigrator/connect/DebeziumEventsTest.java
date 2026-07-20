@@ -82,6 +82,34 @@ class DebeziumEventsTest {
     assertEquals(List.of(1L), event.pkValues());
     // op "c" is an insert -> +1 to the target row count (net-rows monitor metric).
     assertEquals(1, event.netRowDelta());
+    // No ts_ms on this source block -> 0 (replication-lag not recorded).
+    assertEquals(0L, event.sourceTsMs());
+  }
+
+  @Test
+  void sourceTsMsParsedForReplicationLag() {
+    // source.ts_ms (source commit time) is carried onto the ChangeEvent so the sink
+    // can compute end-to-end replication lag = now - source.ts_ms at apply time.
+    Schema srcSchema =
+        SchemaBuilder.struct()
+            .name("Source")
+            .field("db", Schema.STRING_SCHEMA)
+            .field("table", Schema.STRING_SCHEMA)
+            .field("ts_ms", Schema.INT64_SCHEMA)
+            .optional()
+            .build();
+    Schema envSchema =
+        SchemaBuilder.struct()
+            .name("Envelope")
+            .field("op", Schema.STRING_SCHEMA)
+            .field("after", ROW)
+            .field("source", srcSchema)
+            .build();
+    Struct src =
+        new Struct(srcSchema).put("db", "app").put("table", "users").put("ts_ms", 1_700_000_000_000L);
+    Struct env = new Struct(envSchema).put("op", "u").put("after", row(1L, "Alice")).put("source", src);
+    ChangeEvent event = DebeziumEvents.parse(record(key(1L), env, "dsqlcdc.app.users"));
+    assertEquals(1_700_000_000_000L, event.sourceTsMs());
   }
 
   @Test

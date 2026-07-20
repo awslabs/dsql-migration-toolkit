@@ -301,6 +301,58 @@ def test_net_rows_by_table_no_call_without_stack_or_tables() -> None:
     assert client.calls == []  # never hit CloudWatch
 
 
+def _lag_responses(list_tables: list[str], values_by_table: dict[str, list[float]]) -> dict:
+    """ListMetrics (discovered dims) + GetMetricData (l{i} -> lag-ms values, newest first)."""
+    return {
+        "list_metrics": {
+            "Metrics": [
+                {"Dimensions": [{"Name": "Stack", "Value": "stk"},
+                                {"Name": "Table", "Value": t}]}
+                for t in list_tables
+            ]
+        },
+        "get_metric_data": {
+            "MetricDataResults": [
+                {"Id": f"l{i}", "Values": vals}
+                for i, vals in enumerate(values_by_table.values())
+            ]
+        },
+    }
+
+
+def test_replication_lag_by_table_takes_most_recent_ms() -> None:
+    # Stat=Maximum, ScanBy=TimestampDescending -> Values[0] is the newest minute's
+    # worst lag (current lag), rounded to int ms. Idle table (no datapoint) -> absent.
+    client = _FakeClient(_lag_responses(
+        ["ecommerce_demo.orders", "ecommerce_demo.customers"],
+        {"ecommerce_demo.orders": [8500.0, 12000.0], "ecommerce_demo.customers": []},
+    ))
+    got = _controller(client).replication_lag_by_table(
+        "stk", ["ecommerce_demo.orders", "ecommerce_demo.customers"])
+    assert got == {"ecommerce_demo.orders": 8500}  # newest value; customers idle -> absent
+    assert [c[0] for c in client.calls] == ["list_metrics", "get_metric_data"]
+    lm = [c for c in client.calls if c[0] == "list_metrics"][0][1]
+    assert lm["MetricName"] == "ReplicationLagMs"
+
+
+def test_replication_lag_by_table_suffix_match_single_db() -> None:
+    # Single-db bare name resolves to the sink's schema-qualified Table dimension.
+    client = _FakeClient(_lag_responses(["ecommerce_demo.orders"], {"orders": [3200.0]}))
+    assert _controller(client).replication_lag_by_table("stk", ["orders"]) == {"orders": 3200}
+
+
+def test_replication_lag_by_table_empty_on_error() -> None:
+    assert _controller(_FakeClient({}, raise_on="list_metrics")).replication_lag_by_table(
+        "stk", ["orders"]) == {}
+
+
+def test_replication_lag_by_table_no_call_without_stack_or_tables() -> None:
+    client = _FakeClient({"list_metrics": {"Metrics": []}})
+    assert _controller(client).replication_lag_by_table("", ["orders"]) == {}
+    assert _controller(client).replication_lag_by_table("stk", []) == {}
+    assert client.calls == []
+
+
 def test_match_metric_tables_prefers_exact_then_unambiguous_bare() -> None:
     from dsql_migrator.core.msk_connect_controller import _match_metric_tables
 
