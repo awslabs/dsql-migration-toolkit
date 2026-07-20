@@ -5,6 +5,22 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.107
+
+### Changed
+
+- **Evaluation の「Objects by importance」フィルターを、分かりにくい単一コントロール
+  から、カテゴリーベースの明確な 2 つのドロップダウンに変更しました。** 以前の
+  セグメントコントロールは、派生的な「Needs attention」区分と分類ごとの値を 1 つの
+  軸に混在させており曖昧でした（例:「Needs attention」と「Review needed」）。これを
+  AWS コンソール風のフィルタードロップダウン 2 つ — **Classification**（Automatic /
+  Review needed / Unsupported）と **Estimated manual effort**（Simple / Medium /
+  Significant）— に置き換えました。これはサマリーバッジがすでに示している色分け
+  カテゴリーと同じです。2 つのフィルターは AND で結合され、いずれかのフィルターが
+  有効なときは **Clear filters** リンクが表示されます。ドロップダウンが Cloudscape
+  の「filtering」スタイルに一致するよう、再利用可能な `filter_select` / `filter_bar`
+  をデザインシステム（単一の情報源）に追加しました。
+
 ## v0.1.106
 
 ### Fixed

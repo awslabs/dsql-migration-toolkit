@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.107
+
+### Changed
+
+- **Evaluation "Objects by importance" filter is now two clear, category-based
+  dropdowns instead of one confusing mixed control.** The old segmented control
+  mixed a derived "Needs attention" bucket with per-classification values on one
+  axis, which read ambiguously (e.g. "Needs attention" vs. "Review needed"). It
+  is replaced by two AWS-Console-style filter dropdowns — **Classification**
+  (Automatic / Review needed / Unsupported) and **Estimated manual effort**
+  (Simple / Medium / Significant) — the same color-coded categories the summary
+  badges already show. The two filters combine (AND), and a **Clear filters**
+  link appears when any filter is active. Added a reusable `filter_select` /
+  `filter_bar` to the design system (single source of truth) so the dropdowns
+  match the Cloudscape "filtering" look.
+
 ## v0.1.106
 
 ### Fixed

@@ -291,6 +291,50 @@ def segmented_control(
 
 
 # ---------------------------------------------------------------------------
+# Filter dropdown (Cloudscape collection "filtering" Select)
+# ---------------------------------------------------------------------------
+
+# AWS Console list views filter a collection with compact, outlined "Select"
+# dropdowns (one per property, e.g. an EC2 instance-state filter) sitting in a
+# filter bar above the list -- not a segmented control (which suits 2-4 mutually
+# exclusive views, not a property with several values that combine). This is the
+# single source of truth for that look: a dense, outlined, white-background
+# dropdown with a floating property label. Use ``filter_bar`` to wrap several.
+FILTER_SELECT_PROPS = "outlined dense options-dense"
+FILTER_SELECT_CLASSES = "bg-white text-sm min-w-[13rem]"
+
+
+def filter_bar(ui, *, classes: str = ""):
+    """Return a row container for a group of :func:`filter_select` dropdowns.
+
+    A left-aligned, wrapping row with consistent gaps -- the Cloudscape "filtering"
+    bar that sits above a filtered collection. Use as a context manager::
+
+        with filter_bar(ui):
+            filter_select(ui, label="Classification", ...)
+            filter_select(ui, label="Estimated manual effort", ...)
+    """
+    return ui.row().classes(
+        f"items-center gap-3 flex-wrap {classes}".strip()
+    )
+
+
+def filter_select(ui, *, label, options, value, on_change, classes: str = ""):
+    """Render an AWS Console (Cloudscape filtering "Select")-style filter dropdown.
+
+    ``options`` is a ``{value: display_label}`` mapping (as ``ui.select`` takes);
+    ``label`` is the property name shown as the floating caption; ``value`` /
+    ``on_change`` are forwarded unchanged. Reusing this keeps every list filter in
+    the app visually identical instead of styling a ``ui.select`` ad hoc. Returns
+    the created select so the caller can chain (e.g. ``.tooltip(...)``).
+    """
+    select = ui.select(options, value=value, label=label, on_change=on_change)
+    select.props(FILTER_SELECT_PROPS)
+    select.classes(f"{FILTER_SELECT_CLASSES} {classes}".strip())
+    return select
+
+
+# ---------------------------------------------------------------------------
 # Container header (Cloudscape "Container"/"Header")
 # ---------------------------------------------------------------------------
 
@@ -332,5 +376,9 @@ __all__ = [
     "SEGMENTED_TOGGLE_PROPS",
     "SEGMENTED_TOGGLE_CLASSES",
     "segmented_control",
+    "FILTER_SELECT_PROPS",
+    "FILTER_SELECT_CLASSES",
+    "filter_bar",
+    "filter_select",
     "section_header",
 ]

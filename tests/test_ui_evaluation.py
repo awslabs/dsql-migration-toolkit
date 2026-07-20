@@ -453,38 +453,62 @@ def test_filter_assessment_items_all_keeps_everything() -> None:
     from dsql_migrator.ui.evaluation import filter_assessment_items
 
     items = _filter_items()
-    assert filter_assessment_items(items, mode="ALL") == items
-    # An unknown mode falls back to ALL.
-    assert filter_assessment_items(items, mode="bogus") == items
-
-
-def test_filter_assessment_items_attention_excludes_auto() -> None:
-    from dsql_migrator.ui.evaluation import filter_assessment_items
-
-    names = [
-        item.object_name
-        for item in filter_assessment_items(_filter_items(), mode="ATTENTION")
-    ]
-    assert names == ["fk_table", "no_pk"]  # AUTO ('clean') excluded; order kept
+    assert filter_assessment_items(items) == items
+    assert filter_assessment_items(items, classification="ALL", effort="ALL") == items
+    # An unknown value on either axis falls back to ALL (nothing hidden).
+    assert filter_assessment_items(items, classification="bogus") == items
+    assert filter_assessment_items(items, effort="bogus") == items
 
 
 def test_filter_assessment_items_specific_classification() -> None:
     from dsql_migrator.ui.evaluation import filter_assessment_items
 
     items = _filter_items()
-    assert [i.object_name for i in filter_assessment_items(items, mode="AUTO")] == [
-        "clean"
-    ]
     assert [
-        i.object_name for i in filter_assessment_items(items, mode="UNSUPPORTED")
+        i.object_name for i in filter_assessment_items(items, classification="AUTO")
+    ] == ["clean"]
+    assert [
+        i.object_name
+        for i in filter_assessment_items(items, classification="UNSUPPORTED")
     ] == ["no_pk"]
     assert [
-        i.object_name for i in filter_assessment_items(items, mode="MANUAL")
+        i.object_name for i in filter_assessment_items(items, classification="MANUAL")
     ] == ["fk_table"]
 
 
-def test_evaluation_state_assessment_filter_defaults_to_all() -> None:
-    assert EvaluationState().assessment_filter == "ALL"
+def test_filter_assessment_items_specific_effort_excludes_auto() -> None:
+    from dsql_migrator.ui.evaluation import filter_assessment_items
+
+    items = _filter_items()
+    # SIMPLE keeps only the MANUAL/SIMPLE object; AUTO (no effort) is excluded.
+    assert [
+        i.object_name for i in filter_assessment_items(items, effort="SIMPLE")
+    ] == ["fk_table"]
+    assert [
+        i.object_name for i in filter_assessment_items(items, effort="MEDIUM")
+    ] == ["no_pk"]
+    # No SIGNIFICANT items in the fixture.
+    assert filter_assessment_items(items, effort="SIGNIFICANT") == []
+
+
+def test_filter_assessment_items_combines_classification_and_effort() -> None:
+    from dsql_migrator.ui.evaluation import filter_assessment_items
+
+    items = _filter_items()
+    # MANUAL + SIMPLE matches fk_table; MANUAL + MEDIUM matches nothing (AND).
+    assert [
+        i.object_name
+        for i in filter_assessment_items(items, classification="MANUAL", effort="SIMPLE")
+    ] == ["fk_table"]
+    assert (
+        filter_assessment_items(items, classification="MANUAL", effort="MEDIUM") == []
+    )
+
+
+def test_evaluation_state_filters_default_to_all() -> None:
+    state = EvaluationState()
+    assert state.classification_filter == "ALL"
+    assert state.effort_filter == "ALL"
 
 
 # ---------------------------------------------------------------------------

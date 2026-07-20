@@ -65,7 +65,12 @@ from dsql_migrator.core.models import (
 from dsql_migrator.core.target_introspector import TargetIntrospector
 from dsql_migrator.ui.connect import make_source_engine_factory
 from dsql_migrator.ui.ai_chat_drawer import build_chat_drawer, chat_turns_remaining
-from dsql_migrator.ui.design import render_notice, section_header, segmented_control
+from dsql_migrator.ui.design import (
+    filter_bar,
+    filter_select,
+    render_notice,
+    section_header,
+)
 from dsql_migrator.ui.session import SessionStore
 from dsql_migrator.ui.workflow import WorkflowStep, get_status, status_label, with_status
 
@@ -466,28 +471,40 @@ def sort_assessment_items(items: list) -> list:
     )
 
 
-def filter_assessment_items(items: list, *, mode: str) -> list:
-    """Return the assessment items kept under the "Objects by importance" filter.
+def filter_assessment_items(
+    items: list, *, classification: str = "ALL", effort: str = "ALL"
+) -> list:
+    """Return the assessment items kept under the two "Objects by importance" filters.
 
-    ``mode`` is one of ``ALL`` (everything), ``ATTENTION`` (only objects that
-    need manual work -- MANUAL or UNSUPPORTED), or a specific classification
-    name (``UNSUPPORTED`` / ``MANUAL`` / ``AUTO``). An unknown mode falls back to
-    ``ALL``. Order is preserved, so callers can sort first and filter after.
+    Filters along the two color-coded categories independently and combines them
+    (AND): ``classification`` is ``ALL`` or a classification enum value
+    (``AUTO`` / ``MANUAL`` / ``UNSUPPORTED``); ``effort`` is ``ALL`` or an
+    :class:`EffortLevel` value (``SIMPLE`` / ``MEDIUM`` / ``SIGNIFICANT``). An
+    unknown value for either axis is treated as ``ALL`` (nothing hidden). Because
+    ``AUTO`` objects carry no effort, selecting a specific effort naturally
+    excludes them. Order is preserved, so callers can sort first and filter after.
     """
-    from dsql_migrator.core.models import Classification
+    from dsql_migrator.core.models import Classification, EffortLevel
 
-    if mode == "ATTENTION":
-        attention = {Classification.MANUAL, Classification.UNSUPPORTED}
-        return [item for item in items if item.classification in attention]
-    by_name = {
+    class_target = {
         "UNSUPPORTED": Classification.UNSUPPORTED,
         "MANUAL": Classification.MANUAL,
         "AUTO": Classification.AUTO,
-    }
-    target = by_name.get(mode)
-    if target is None:  # "ALL" or any unknown value
-        return list(items)
-    return [item for item in items if item.classification == target]
+    }.get(classification)
+    effort_target = {
+        "SIMPLE": EffortLevel.SIMPLE,
+        "MEDIUM": EffortLevel.MEDIUM,
+        "SIGNIFICANT": EffortLevel.SIGNIFICANT,
+    }.get(effort)
+
+    def _keep(item) -> bool:
+        if class_target is not None and item.classification != class_target:
+            return False
+        if effort_target is not None and item.effort != effort_target:
+            return False
+        return True
+
+    return [item for item in items if _keep(item)]
 
 
 # Display order for grouping assessed objects by kind. Tables come first (the
@@ -686,10 +703,14 @@ class EvaluationState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.job_id: Optional[str] = None
-        # Filter for the "Objects by importance" list (UI-thread only): one of
-        # ALL / ATTENTION / UNSUPPORTED / MANUAL / AUTO. Lets the user focus on
-        # actionable objects in a large schema instead of scrolling past AUTO.
-        self.assessment_filter: str = "ALL"
+        # Filters for the "Objects by importance" list (UI-thread only), split
+        # along the two color-coded categories the summary already shows so the
+        # controls read as "narrow by Classification and/or Estimated manual
+        # effort" rather than one list mixing a derived "needs attention" bucket
+        # with per-classification values. Each is "ALL" or an enum value; they
+        # combine (AND). Lets the user focus on actionable objects at scale.
+        self.classification_filter: str = "ALL"
+        self.effort_filter: str = "ALL"
         self._result: Optional[EvaluationResult] = None
         self._error: Optional[str] = None
         # Coarse progress for the in-progress UI, updated by the background
@@ -1378,9 +1399,10 @@ def _render_assessment(
         _render_assessment_chart(ui, report)
 
     # Per-object detail as an expandable list (accordion), ordered by importance
-    # so the most critical objects are at the top. A filter lets the user focus
-    # on actionable objects (Needs attention / a specific classification) instead
-    # of scrolling past every AUTO object in a large schema.
+    # so the most critical objects are at the top. Two AWS-style dropdown filters
+    # (Classification / Estimated manual effort — the same color-coded categories
+    # the summary badges show) let the user focus on actionable objects in a large
+    # schema instead of scrolling past every AUTO object.
     if not report.items:
         ui.label("Objects by importance (most critical first)").classes(  # type: ignore[attr-defined]
             "text-md font-semibold"
@@ -1388,37 +1410,64 @@ def _render_assessment(
         ui.label("No objects were assessed.").classes("text-sm text-gray-500")  # type: ignore[attr-defined]
         return
 
-    mode = eval_state.assessment_filter if eval_state is not None else "ALL"
+    class_mode = eval_state.classification_filter if eval_state is not None else "ALL"
+    effort_mode = eval_state.effort_filter if eval_state is not None else "ALL"
     ordered = sort_assessment_items(report.items)
-    visible = filter_assessment_items(ordered, mode=mode)
+    visible = filter_assessment_items(
+        ordered, classification=class_mode, effort=effort_mode
+    )
 
-    with ui.row().classes("items-center gap-3 w-full flex-wrap"):  # type: ignore[attr-defined]
-        ui.label(  # type: ignore[attr-defined]
-            f"Objects by importance — showing {len(visible)} of {len(report.items)}"
-        ).classes("text-md font-semibold")
-        if eval_state is not None and refresh is not None:
-            ui.space()  # type: ignore[attr-defined]
+    ui.label(  # type: ignore[attr-defined]
+        f"Objects by importance — showing {len(visible)} of {len(report.items)}"
+    ).classes("text-md font-semibold")
+    if eval_state is not None and refresh is not None:
 
-            def on_filter(event: object) -> None:
-                eval_state.assessment_filter = getattr(event, "value", "ALL") or "ALL"
-                refresh()
+        def on_class(event: object) -> None:
+            eval_state.classification_filter = getattr(event, "value", "ALL") or "ALL"
+            refresh()
 
-            segmented_control(  # type: ignore[attr-defined]
+        def on_effort(event: object) -> None:
+            eval_state.effort_filter = getattr(event, "value", "ALL") or "ALL"
+            refresh()
+
+        def on_clear() -> None:
+            eval_state.classification_filter = "ALL"
+            eval_state.effort_filter = "ALL"
+            refresh()
+
+        with filter_bar(ui):  # type: ignore[attr-defined]
+            filter_select(  # type: ignore[attr-defined]
                 ui,
-                {
-                    "ALL": "All",
-                    "ATTENTION": "Needs attention",
-                    "UNSUPPORTED": classification_label("UNSUPPORTED"),
-                    "MANUAL": classification_label("MANUAL"),
+                label="Classification",
+                options={
+                    "ALL": "All classifications",
                     "AUTO": classification_label("AUTO"),
+                    "MANUAL": classification_label("MANUAL"),
+                    "UNSUPPORTED": classification_label("UNSUPPORTED"),
                 },
-                value=mode,
-                on_change=on_filter,
+                value=class_mode,
+                on_change=on_class,
             )
+            filter_select(  # type: ignore[attr-defined]
+                ui,
+                label="Estimated manual effort",
+                options={
+                    "ALL": "All efforts",
+                    "SIMPLE": "Simple (< 2h)",
+                    "MEDIUM": "Medium (2–6h)",
+                    "SIGNIFICANT": "Significant (> 6h)",
+                },
+                value=effort_mode,
+                on_change=on_effort,
+            )
+            if class_mode != "ALL" or effort_mode != "ALL":
+                ui.button("Clear filters", on_click=on_clear).props(  # type: ignore[attr-defined]
+                    "flat dense no-caps color=primary"
+                )
 
     if not visible:
         ui.label(  # type: ignore[attr-defined]
-            "No objects match this filter."
+            "No objects match these filters."
         ).classes("text-sm text-gray-500")
         return
 

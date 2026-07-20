@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.107
+
+### Changed
+
+- **Evaluation의 "Objects by importance" 필터를 혼동스러운 단일 컨트롤 대신 카테고리
+  기반의 명확한 두 개 드롭다운으로 변경했습니다.** 기존 세그먼트 컨트롤은 파생된
+  "Needs attention" 묶음과 분류(classification)별 값을 한 축에 섞어 놓아 모호하게
+  읽혔습니다(예: "Needs attention" vs "Review needed"). 이제 AWS 콘솔 스타일의 필터
+  드롭다운 두 개 — **Classification**(Automatic / Review needed / Unsupported)과
+  **Estimated manual effort**(Simple / Medium / Significant) — 로 대체했으며, 이는
+  요약 배지에 이미 표시되는 색상 구분 카테고리와 동일합니다. 두 필터는 AND로
+  결합되며, 필터가 하나라도 활성화되면 **Clear filters** 링크가 나타납니다.
+  드롭다운이 Cloudscape "filtering" 스타일과 일치하도록 재사용 가능한
+  `filter_select` / `filter_bar`를 디자인 시스템(단일 소스)에 추가했습니다.
+
 ## v0.1.106
 
 ### Fixed

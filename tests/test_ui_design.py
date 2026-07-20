@@ -99,6 +99,17 @@ class _RecordingUi:
             self.texts.extend(str(v) for v in options)
         return _El(self, "toggle")
 
+    def select(self, options=None, *_a, value=None, label=None, on_change=None, **_k):
+        # Record the option labels and the floating property label so a test can
+        # assert what the filter dropdown offered; returns a chainable double.
+        if label:
+            self.texts.append(str(label))
+        if isinstance(options, dict):
+            self.texts.extend(str(v) for v in options.values())
+        elif isinstance(options, (list, tuple)):
+            self.texts.extend(str(v) for v in options)
+        return _El(self, "select")
+
 
 # ---------------------------------------------------------------------------
 # Palette invariants
@@ -298,6 +309,52 @@ def test_segmented_control_appends_caller_props_and_classes() -> None:
     )
     assert "spread" in " ".join(ui.props)
     assert "w-full" in " ".join(ui.classes)
+
+
+# ---------------------------------------------------------------------------
+# filter_select / filter_bar
+# ---------------------------------------------------------------------------
+
+
+def test_filter_select_tokens_are_aws_style() -> None:
+    from dsql_migrator.ui.design import FILTER_SELECT_CLASSES, FILTER_SELECT_PROPS
+
+    # Cloudscape filtering "Select": compact, outlined, white background.
+    assert "outlined" in FILTER_SELECT_PROPS
+    assert "dense" in FILTER_SELECT_PROPS
+    assert "bg-white" in FILTER_SELECT_CLASSES
+
+
+def test_filter_select_emits_label_options_and_props() -> None:
+    from dsql_migrator.ui.design import filter_select
+
+    ui = _RecordingUi()
+    captured: list[object] = []
+    select = filter_select(
+        ui,
+        label="Classification",
+        options={"ALL": "All classifications", "AUTO": "Automatic"},
+        value="ALL",
+        on_change=lambda e: captured.append(e),
+    )
+    assert select is not None
+    # The floating property label and the option labels were offered.
+    assert "Classification" in ui.texts
+    assert "All classifications" in ui.texts and "Automatic" in ui.texts
+    # The shared AWS-style outlined/dense props + white bg were applied.
+    props_blob = " ".join(ui.props)
+    assert "outlined" in props_blob and "dense" in props_blob
+    assert "bg-white" in " ".join(ui.classes)
+
+
+def test_filter_bar_is_a_wrapping_row() -> None:
+    from dsql_migrator.ui.design import filter_bar
+
+    ui = _RecordingUi()
+    bar = filter_bar(ui)
+    assert bar is not None
+    classes_blob = " ".join(ui.classes)
+    assert "flex-wrap" in classes_blob and "items-center" in classes_blob
 
 
 # ---------------------------------------------------------------------------
