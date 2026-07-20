@@ -28,6 +28,7 @@ from dsql_migrator.core.cdc_deployer import (
     CdcDeployError,
     CdcStackDiscovery,
     _MAX_STATE_READ_FAILURES,
+    _parse_unsupported_azs,
     _wait_connector_running,
     run_cdc_delete,
     run_cdc_infra_deploy,
@@ -89,6 +90,8 @@ class _FakeDeployer:
         bootstrap_error: Exception | None = None,
         # poll_events: list of (logical_id, status, reason) emitted once
         events=None,
+        # find_unsupported_azs: AZ names MSK rejected (reactive-retry trigger)
+        unsupported_azs=None,
     ):
         self._discover_error = discover_error
         self._discovery_params = discovery_params or {}
@@ -106,6 +109,7 @@ class _FakeDeployer:
         self._bootstrap_error = bootstrap_error
         self._events = list(events or [])
         self._events_emitted = False
+        self._unsupported_azs = set(unsupported_azs or set())
         self.calls: list[str] = []
         self.updates: list[list[tuple[str, str]]] = []
         self.created: list[tuple[str, list[tuple[str, str]]]] = []
@@ -134,6 +138,10 @@ class _FakeDeployer:
 
     def delete_stack(self, stack_name):
         self.calls.append("delete_stack")
+
+    def find_unsupported_azs(self, stack_name):
+        self.calls.append("find_unsupported_azs")
+        return set(self._unsupported_azs)
 
     def get_stack_output(self, stack_name, key):
         self.calls.append("get_stack_output")
@@ -333,6 +341,107 @@ def test_infra_deploy_create_rollback_fails_stage() -> None:
             stack_name=STACK, template_body="T", params=_infra_params(),
             create_timeout_seconds=5.0, poll_interval_seconds=0.0,
         )
+    assert _statuses(handle)["stack_create"] == "FAILED"
+
+
+@pytest.mark.parametrize(
+    "reason,expected",
+    [
+        (
+            "Resource handler returned message: unsupported availability zones: "
+            "[ap-northeast-2d]",
+            {"ap-northeast-2d"},
+        ),
+        (
+            "unsupported availability zones: [ap-northeast-2d, ap-northeast-2c]",
+            {"ap-northeast-2d", "ap-northeast-2c"},
+        ),
+        ("Unsupported Availability Zone: [us-east-1e]", {"us-east-1e"}),
+        ("Some unrelated failure reason", set()),
+        ("", set()),
+    ],
+)
+def test_parse_unsupported_azs(reason, expected) -> None:
+    assert _parse_unsupported_azs(reason) == expected
+
+
+class _FakeEc2ForRetry:
+    """Fake EC2 for the reactive-retry subnet re-selection (3 NAT AZs)."""
+
+    def describe_subnets(self, **kw):
+        return {
+            "Subnets": [
+                {"SubnetId": "subnet-x", "AvailabilityZone": "us-east-1a"},
+                {"SubnetId": "subnet-y", "AvailabilityZone": "us-east-1b"},
+                {"SubnetId": "subnet-d", "AvailabilityZone": "us-east-1d"},
+            ]
+        }
+
+    def describe_route_tables(self, **kw):
+        return {
+            "RouteTables": [
+                {
+                    "Associations": [{"Main": True}],
+                    "Routes": [
+                        {"DestinationCidrBlock": "0.0.0.0/0", "NatGatewayId": "nat-1"}
+                    ],
+                }
+            ]
+        }
+
+
+def test_infra_deploy_retries_excluding_unsupported_az() -> None:
+    # First create rolls back with an unsupported-AZ reason; the deploy deletes
+    # the stack, re-selects subnets excluding that AZ, and the retry succeeds.
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    deployer = _FakeDeployer(
+        stack_statuses=("ROLLBACK_COMPLETE", None, "CREATE_COMPLETE"),
+        unsupported_azs={"us-east-1d"},
+    )
+    _run_infra(
+        handle, deployer, on_log,
+        stack_name=STACK, template_body="T", params=_infra_params(),
+        ec2_client=_FakeEc2ForRetry(),
+        create_timeout_seconds=5.0, poll_interval_seconds=0.0,
+        delete_timeout_seconds=5.0,
+    )
+    assert all(s == "DONE" for s in _statuses(handle).values())
+    # Two create attempts, with a delete in between.
+    assert deployer.calls.count("create_stack") == 2
+    assert "delete_stack" in deployer.calls
+    # The retry re-selected subnets across the two supported AZs (d excluded).
+    _, retried = deployer.created[1]
+    assert dict(retried)["ConnectorSubnetIds"] == "subnet-x,subnet-y"
+    assert any("does not support" in m for m in logs)
+
+
+def test_infra_deploy_gives_up_when_exclusion_leaves_one_az() -> None:
+    # Only two NAT AZs and MSK rejects one → re-select can't reach >=2 → fail.
+    class _TwoAzEc2(_FakeEc2ForRetry):
+        def describe_subnets(self, **kw):
+            return {
+                "Subnets": [
+                    {"SubnetId": "subnet-x", "AvailabilityZone": "us-east-1a"},
+                    {"SubnetId": "subnet-d", "AvailabilityZone": "us-east-1d"},
+                ]
+            }
+
+    handle = _FakeHandle()
+    _, on_log = _logs()
+    deployer = _FakeDeployer(
+        stack_statuses=("ROLLBACK_COMPLETE", None),
+        unsupported_azs={"us-east-1d"},
+    )
+    with pytest.raises(CdcDeployError) as exc:
+        _run_infra(
+            handle, deployer, on_log,
+            stack_name=STACK, template_body="T", params=_infra_params(),
+            ec2_client=_TwoAzEc2(),
+            create_timeout_seconds=5.0, poll_interval_seconds=0.0,
+            delete_timeout_seconds=5.0,
+        )
+    assert "us-east-1d" in str(exc.value)
     assert _statuses(handle)["stack_create"] == "FAILED"
 
 

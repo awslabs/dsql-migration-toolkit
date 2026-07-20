@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.106
+
+### Fixed
+
+- **CDC infrastructure deploy now self-heals when MSK Serverless rejects an
+  auto-selected subnet's availability zone.** MSK Serverless supports only a
+  subset of a region's AZs and offers no API to list them, so when the deploy
+  auto-selects one NAT-egress subnet per AZ it can pick a subnet in an
+  unsupported AZ (e.g. `ap-northeast-2d`), making `MskCluster` fail with
+  `CREATE_FAILED … unsupported availability zones: [ap-northeast-2d]` and the
+  whole stack roll back. The deployer now detects that specific failure, parses
+  the rejected AZ(s) from the stack event, deletes the rolled-back stack,
+  re-selects connector subnets with those AZ(s) excluded, and retries the create
+  automatically (bounded, so a genuinely stuck deploy still stops). If excluding
+  the unsupported AZ(s) leaves fewer than two NAT-egress AZs, it stops with a
+  clear message naming the excluded AZ(s) instead of looping. No new inputs —
+  the user still supplies only a VpcId.
+
 ## v0.1.105
 
 ### Added

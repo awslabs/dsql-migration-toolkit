@@ -5,6 +5,22 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.106
+
+### Fixed
+
+- **MSK Serverless가 자동 선택된 서브넷의 가용 영역을 거부할 때 CDC 인프라 배포가
+  스스로 복구합니다.** MSK Serverless는 리전의 일부 AZ만 지원하며 이를 조회하는
+  API가 없습니다. 그래서 배포가 AZ마다 NAT 이그레스 서브넷을 하나씩 자동 선택할 때
+  지원되지 않는 AZ(예: `ap-northeast-2d`)의 서브넷을 고를 수 있고, 이 경우
+  `MskCluster`가 `CREATE_FAILED … unsupported availability zones: [ap-northeast-2d]`
+  로 실패하며 스택 전체가 롤백됩니다. 이제 배포기가 이 특정 실패를 감지해 스택
+  이벤트에서 거부된 AZ를 파싱하고, 롤백된 스택을 삭제한 뒤 해당 AZ를 제외하고
+  커넥터 서브넷을 다시 선택하여 생성을 자동으로 재시도합니다(무한 반복을 막도록
+  횟수 제한). 지원되지 않는 AZ를 제외했을 때 NAT 이그레스 AZ가 2개 미만으로
+  남으면, 반복하지 않고 제외된 AZ를 명시한 명확한 메시지와 함께 중단합니다. 새로
+  입력할 값은 없으며 사용자는 여전히 VpcId만 제공하면 됩니다.
+
 ## v0.1.105
 
 ### 추가 (Added)

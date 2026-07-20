@@ -145,6 +145,47 @@ def test_three_az_picks_one_per_az() -> None:
     assert sel.subnet_ids == "subnet-a,subnet-b,subnet-c"
 
 
+def test_excluded_az_dropped_still_two_az() -> None:
+    # Three NAT AZs; excluding the MSK-unsupported one leaves two → still selects.
+    subnets = [
+        _subnet("subnet-a", "us-east-1a"),
+        _subnet("subnet-b", "us-east-1b"),
+        _subnet("subnet-d", "us-east-1d"),
+    ]
+    rts = [
+        {
+            "Associations": [{"SubnetId": s} for s in
+                             ("subnet-a", "subnet-b", "subnet-d")],
+            "Routes": [_nat_route()],
+        }
+    ]
+    sel = select_connector_subnets(
+        _FakeEc2(subnets, rts), "vpc-1", excluded_azs={"us-east-1d"}
+    )
+    assert sel.can_auto_select is True
+    assert sel.subnet_ids == "subnet-a,subnet-b"
+    assert sel.az_count == 2
+    assert "us-east-1d" in sel.reason
+
+
+def test_excluded_az_leaves_too_few_azs() -> None:
+    # Two NAT AZs; excluding one leaves a single AZ → cannot auto-select, and the
+    # reason names the excluded AZ so the retry's give-up is explained.
+    subnets = [_subnet("subnet-a", "us-east-1a"), _subnet("subnet-d", "us-east-1d")]
+    rts = [
+        {
+            "Associations": [{"SubnetId": "subnet-a"}, {"SubnetId": "subnet-d"}],
+            "Routes": [_nat_route()],
+        }
+    ]
+    sel = select_connector_subnets(
+        _FakeEc2(subnets, rts), "vpc-1", excluded_azs={"us-east-1d"}
+    )
+    assert sel.can_auto_select is False
+    assert sel.subnet_ids is None
+    assert "us-east-1d" in sel.reason
+
+
 # ---------------------------------------------------------------------------
 # diagnose_cdc_network — discovered / create / blocked
 # ---------------------------------------------------------------------------

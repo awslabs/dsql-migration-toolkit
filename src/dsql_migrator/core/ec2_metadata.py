@@ -154,7 +154,10 @@ def verify_subnet_egress(
 
 
 def select_connector_subnets(
-    ec2_client: BotoSessionLike, vpc_id: str
+    ec2_client: BotoSessionLike,
+    vpc_id: str,
+    *,
+    excluded_azs: Optional[set[str]] = None,
 ) -> SubnetSelection:
     """Auto-select NAT-egress connector subnets for ``vpc_id`` (one per AZ, >=2).
 
@@ -164,7 +167,14 @@ def select_connector_subnets(
     distinct AZ. Auto-selects only when >=2 AZs are covered; otherwise returns
     ``can_auto_select=False`` with a reason so the caller can ask for manual
     subnet ids. Read-only; raises :class:`Ec2MetadataError` only on an API error.
+
+    ``excluded_azs`` drops subnets in those AZs from consideration. MSK Serverless
+    supports only a subset of a region's AZs and there is no API to list them, so
+    when a deploy fails with "unsupported availability zones: [X]" the deployer
+    re-selects with X excluded (a reactive retry) — this keeps deployment
+    convenient without asking the user which AZs MSK happens to support.
     """
+    excluded = {az for az in (excluded_azs or set()) if az}
     vpc_id = (vpc_id or "").strip()
     if not vpc_id:
         return SubnetSelection(subnet_ids=None, reason="No VPC id provided.")
@@ -218,23 +228,46 @@ def select_connector_subnets(
         classified.append(SubnetInfo(subnet_id=sid, az=az, egress_type=egress))
 
     nat_subnets = [s for s in classified if s.egress_type == "nat"]
+    # Drop AZs a prior deploy proved MSK Serverless does not support here.
+    eligible = [s for s in nat_subnets if s.az not in excluded]
     # One NAT subnet per distinct AZ (sorted for deterministic selection).
     by_az: dict[str, SubnetInfo] = {}
-    for s in sorted(nat_subnets, key=lambda x: (x.az, x.subnet_id)):
+    for s in sorted(eligible, key=lambda x: (x.az, x.subnet_id)):
         by_az.setdefault(s.az, s)
     chosen = list(by_az.values())
     az_count = len(by_az)
+    excluded_note = (
+        f" (excluding {', '.join(sorted(excluded))})" if excluded else ""
+    )
 
     if az_count >= 2:
         ids = ",".join(s.subnet_id for s in chosen)
         return SubnetSelection(
             subnet_ids=ids,
-            subnets=nat_subnets,
+            subnets=eligible,
             az_count=az_count,
             can_auto_select=True,
             reason=(
                 f"Auto-selected {len(chosen)} NAT-egress subnets across "
-                f"{az_count} availability zones."
+                f"{az_count} availability zones{excluded_note}."
+            ),
+        )
+
+    if excluded and az_count <= 1:
+        # Excluding the MSK-unsupported AZ(s) left too few AZs to place the
+        # cluster. Surface this distinctly so the user knows the retry gave up
+        # (rather than the VPC never having had NAT egress).
+        return SubnetSelection(
+            subnet_ids=None,
+            subnets=eligible,
+            az_count=az_count,
+            can_auto_select=False,
+            reason=(
+                "After excluding availability zones MSK Serverless does not "
+                f"support ({', '.join(sorted(excluded))}), only {az_count} "
+                "NAT-egress AZ(s) remain; MSK Connect needs >=2. Add a "
+                "NAT-routed subnet in another supported AZ, or enter subnet ids "
+                "manually."
             ),
         )
 

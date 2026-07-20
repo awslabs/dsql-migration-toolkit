@@ -47,6 +47,7 @@ RUNNING) to avoid burning quota on retries.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Optional, Sequence
@@ -529,6 +530,24 @@ class CdcStackDeployer:
         out.sort(key=lambda x: x[0])
         return out
 
+    def find_unsupported_azs(self, stack_name: str) -> set[str]:
+        """Scan stack events for an MSK "unsupported availability zones" failure.
+
+        Returns the AZ names MSK Serverless rejected (e.g. ``{"ap-northeast-2d"}``)
+        across all failure events, or an empty set when no such reason is present.
+        Best-effort: any read error yields an empty set. Used by the deploy retry
+        to re-select connector subnets with the unsupported AZ(s) excluded.
+        """
+        try:
+            client = self._client("cloudformation")
+            response = client.describe_stack_events(StackName=stack_name)
+        except Exception:  # noqa: BLE001
+            return set()
+        azs: set[str] = set()
+        for ev in response.get("StackEvents", []) or []:
+            azs |= _parse_unsupported_azs(ev.get("ResourceStatusReason", ""))
+        return azs
+
     def stack_status(self, stack_name: str) -> Optional[str]:
         """Return the stack's current StackStatus, or ``None`` on error."""
         try:
@@ -916,6 +935,26 @@ def _is_partition_quota_message(msg: str) -> bool:
     )
 
 
+# MSK Serverless supports only a subset of a region's AZs and offers no API to
+# list them; a subnet in an unsupported AZ makes MskCluster CREATE_FAILED with a
+# reason like "unsupported availability zones: [ap-northeast-2d]" (one or more,
+# comma-separated inside the brackets). This extracts those AZ names so the
+# deploy can re-select subnets with them excluded.
+_UNSUPPORTED_AZ_RE = re.compile(
+    r"unsupported availability zones?:?\s*\[([^\]]*)\]", re.IGNORECASE
+)
+
+
+def _parse_unsupported_azs(reason: str) -> set[str]:
+    """Extract the AZ names from an MSK "unsupported availability zones: [..]" reason.
+
+    Returns an empty set when the reason is not that failure. Pure (no AWS)."""
+    match = _UNSUPPORTED_AZ_RE.search(reason or "")
+    if not match:
+        return set()
+    return {az.strip() for az in match.group(1).split(",") if az.strip()}
+
+
 # Known connector-failure signatures and the actionable guidance for each. The
 # CloudFormation event for a CREATE_FAILED connector is only a generic
 # GeneralServiceException; the real cause is in the worker log. Each entry is
@@ -1069,6 +1108,88 @@ def _patch_plugin_params(params: CdcInfraParams, upload) -> CdcInfraParams:
     )
 
 
+def _param_value(params: CdcInfraParams, key: str) -> Optional[str]:
+    """Return a filled parameter's value by key, or ``None`` if absent."""
+    for k, v in params.filled:
+        if k == key:
+            return str(v)
+    return None
+
+
+def _with_subnet_param(params: CdcInfraParams, subnet_ids: str) -> CdcInfraParams:
+    """Return a copy of ``params`` with ConnectorSubnetIds replaced. Pure (no AWS)."""
+    new_filled = [
+        (k, subnet_ids if k == "ConnectorSubnetIds" else v) for k, v in params.filled
+    ]
+    return CdcInfraParams(
+        filled=new_filled,
+        stack_name=params.stack_name,
+        topic_prefix=params.topic_prefix,
+    )
+
+
+def _retry_infra_without_azs(
+    driver: "_StageDriver",
+    deployer: CdcStackDeployer,
+    stack_name: str,
+    params: CdcInfraParams,
+    *,
+    excluded_azs: set[str],
+    new_azs: set[str],
+    ec2_client: Optional[BotoSessionLike],
+    aws_profile: Optional[str],
+    region: Optional[str],
+    delete_timeout: float,
+    interval: float,
+) -> CdcInfraParams:
+    """Recover from an MSK unsupported-AZ CREATE_FAILED by re-selecting subnets.
+
+    Tears down the rolled-back stack, then re-selects NAT-egress connector subnets
+    with ``excluded_azs`` removed and returns ``params`` with the new
+    ConnectorSubnetIds. Raises :class:`CdcDeployError` when the VPC can no longer
+    yield >=2 supported AZs (so the caller stops rather than looping forever).
+    """
+    from dsql_migrator.core.ec2_metadata import (
+        Ec2MetadataError,
+        build_ec2_client,
+        select_connector_subnets,
+    )
+
+    driver.log(
+        "MSK Serverless does not support availability zone(s) "
+        f"{', '.join(sorted(new_azs))} in this region; excluding them and "
+        "retrying with different subnets."
+    )
+
+    vpc_id = _param_value(params, "VpcId")
+    if not vpc_id:
+        raise CdcDeployError(
+            "MSK rejected the connector subnets' availability zone(s) "
+            f"({', '.join(sorted(new_azs))}) and no VpcId is available to "
+            "re-select subnets. Enter subnet ids in supported AZs manually."
+        )
+
+    # Tear down the rolled-back stack — CloudFormation will not create over it.
+    driver.log(f"Deleting the rolled-back stack '{stack_name}' before retrying…")
+    deployer.delete_stack(stack_name)
+    _wait_stack_settles(
+        deployer, stack_name, driver=driver, since=_now(),
+        timeout=delete_timeout, interval=interval, vanish_ok=True,
+    )
+
+    client = ec2_client or build_ec2_client(aws_profile, region)
+    try:
+        selection = select_connector_subnets(
+            client, vpc_id, excluded_azs=excluded_azs
+        )
+    except Ec2MetadataError as exc:
+        raise CdcDeployError(str(exc)) from exc
+    if not selection.can_auto_select or not selection.subnet_ids:
+        raise CdcDeployError(selection.reason)
+    driver.log(selection.reason)
+    return _with_subnet_param(params, selection.subnet_ids)
+
+
 def run_cdc_infra_deploy(
     handle,
     *,
@@ -1081,8 +1202,11 @@ def run_cdc_infra_deploy(
     aws_profile: Optional[str] = None,
     s3_client: Optional[BotoSessionLike] = None,
     sts_client: Optional[BotoSessionLike] = None,
+    ec2_client: Optional[BotoSessionLike] = None,
     create_timeout_seconds: float = 1800.0,
     poll_interval_seconds: float = 30.0,
+    delete_timeout_seconds: float = 1200.0,
+    max_az_retries: int = 3,
     sleep: Callable[[float], None] = None,  # type: ignore[assignment]
 ) -> None:
     """Deploy CDC infrastructure with ``create_stack`` (no connectors yet).
@@ -1166,23 +1290,49 @@ def run_cdc_infra_deploy(
         if driver.cancelled:
             return
 
-        # 3. create_stack
-        driver.stage("create_stack", "IN_PROGRESS")
-        since = _now()
-        deployer.create_stack(stack_name, template_body, params.filled)
-        driver.log("Stack creation submitted — this provisions MSK (~15-20 min).")
-        driver.stage("create_stack", "DONE")
+        # 3+4. create_stack, wait for CREATE_COMPLETE, and self-heal the one
+        # failure the user cannot pre-empt: MSK Serverless supports only a subset
+        # of a region's AZs (no API to list them), so a NAT subnet auto-selected
+        # in an unsupported AZ makes MskCluster CREATE_FAILED. On that reason we
+        # delete the rolled-back stack, re-select subnets with the AZ excluded,
+        # and retry — bounded by max_az_retries so a genuinely stuck deploy stops.
+        excluded_azs: set[str] = set()
+        attempt = 0
+        while True:
+            if driver.cancelled:
+                return
+            attempt += 1
 
-        # 4. wait for CREATE_COMPLETE
-        driver.stage("stack_create", "IN_PROGRESS")
-        try:
-            _wait_stack_settles(
-                deployer, stack_name, driver=driver, since=since,
-                timeout=create_timeout_seconds, interval=poll_interval_seconds,
-            )
-        except CdcDeployError:
-            driver.stage("stack_create", "FAILED")
-            raise
+            driver.stage("create_stack", "IN_PROGRESS")
+            since = _now()
+            deployer.create_stack(stack_name, template_body, params.filled)
+            driver.log("Stack creation submitted — this provisions MSK (~15-20 min).")
+            driver.stage("create_stack", "DONE")
+
+            driver.stage("stack_create", "IN_PROGRESS")
+            try:
+                _wait_stack_settles(
+                    deployer, stack_name, driver=driver, since=since,
+                    timeout=create_timeout_seconds, interval=poll_interval_seconds,
+                )
+                break
+            except CdcDeployError:
+                new_azs = deployer.find_unsupported_azs(stack_name) - excluded_azs
+                if not new_azs or attempt > max_az_retries:
+                    driver.stage("stack_create", "FAILED")
+                    raise
+                excluded_azs |= new_azs
+                try:
+                    params = _retry_infra_without_azs(
+                        driver, deployer, stack_name, params,
+                        excluded_azs=excluded_azs, new_azs=new_azs,
+                        ec2_client=ec2_client, aws_profile=aws_profile, region=region,
+                        delete_timeout=delete_timeout_seconds,
+                        interval=poll_interval_seconds,
+                    )
+                except CdcDeployError:
+                    driver.stage("stack_create", "FAILED")
+                    raise
         if driver.cancelled:
             return
         driver.stage("stack_create", "DONE")
