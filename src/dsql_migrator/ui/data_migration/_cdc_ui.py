@@ -99,6 +99,7 @@ from dsql_migrator.ui.data_migration._status import (
 )
 from dsql_migrator.ui.design import (
     NOTICE_STYLE,
+    definition_row,
     inline_hint,
     render_notice,
 )
@@ -3021,6 +3022,44 @@ def _render_migration_table_status(
                 </q-td>
                 """,
             )
+            # In-context help: an ⓘ next to the three columns whose meaning isn't
+            # obvious from the label, so the explanation is right where the eye is
+            # (the legend below is the fuller reference). Quasar `header-cell-<name>`
+            # slot renders the label + a hover tooltip.
+            def _hdr_info(name: str, tip: str) -> None:
+                table.add_slot(
+                    f"header-cell-{name}",
+                    r"""
+                    <q-th :props="props">
+                      {{ props.col.label }}
+                      <q-icon name="info" size="14px" class="q-ml-xs text-grey-5"
+                        style="cursor:help">
+                        <q-tooltip class="text-body2" style="max-width:340px">"""
+                    + tip
+                    + r"""</q-tooltip>
+                      </q-icon>
+                    </q-th>
+                    """,
+                )
+
+            _hdr_info(
+                "cdc_net",
+                "NET rows CDC applied since Full Load — inserts add, deletes "
+                "subtract, updates don't change it (not an event count). Live from "
+                "the sink; negative is normal when deletes outweigh inserts.",
+            )
+            _hdr_info(
+                "stream",
+                "How far the target is behind the source in TIME (apply time − "
+                "source commit time). “caught up” = sub-second / drained. Falls back "
+                "to “N behind (PK)” only when the time metric isn't available.",
+            )
+            _hdr_info(
+                "consistency",
+                "Green “consistent” = counts match · “replicating…” = catching up · "
+                "red “rows missing” = newest landed but rows gone mid-stream · red "
+                "“data quarantined” = DLQ has un-applied events.",
+            )
             # Keep the "Net rows since Full Load" column live while CDC streams. The
             # CDC poll (_render_cdc_live_monitoring) fetches the scan-free
             # NetRowsApplied metric and stores it on migration_state every
@@ -3139,38 +3178,56 @@ def _render_migration_table_status(
             icon="sync",
         ).props("color=primary outline size=sm")
         _status_table()
-        # Below the table (lower importance): the column legend. A plain transparent
-        # block (not a tinted notice box) of simple bullet points -- it is reference
-        # help, not a status to act on, so it stays visually quiet.
-        with ui.column().classes("gap-1 w-full mt-1"):  # type: ignore[attr-defined]
+        # Below the table (reference help, not a status to act on): the column
+        # legend as scannable definition rows in a quiet bordered panel. Each term
+        # matches a table header, so the mapping is obvious; the Consistency row
+        # renders the REAL badge chips (same Quasar colors as the table cells), so
+        # the reader sees the actual green/amber/red instead of imagining it. The
+        # per-column ⓘ tooltips above carry the same help in-context.
+        with ui.column().classes(  # type: ignore[attr-defined]
+            "gap-1 w-full mt-2 border border-gray-200 rounded-md bg-gray-50 p-3"
+        ):
             with ui.row().classes("items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
-                ui.icon("info").classes("text-sky-600 text-base")  # type: ignore[attr-defined]
+                ui.icon("help_outline").classes("text-sky-600 text-base")  # type: ignore[attr-defined]
                 ui.label("How to read this table").classes(  # type: ignore[attr-defined]
                     "text-sm font-semibold text-gray-900"
                 )
-            _legend = [
-                "Full Load rows — rows the one-shot snapshot loaded.",
-                "Net rows since Full Load — the NET rows CDC has applied since Full "
-                "Load, not a count of CDC events: inserts add, deletes subtract, "
-                "updates don't change it. Reported live by the sink (scan-free, no "
-                "COUNT), so it is negative when the stream net-deleted rows (e.g. "
-                "more deletes than inserts) — that is expected, not an error.",
-                "Source rows — scan-free estimate. Target rows — exact count.",
-                "Stream lag — how far the target is behind the source in TIME "
-                "(the sink reports apply-time minus each change's source commit "
-                "time). “caught up” = sub-second / drained. Falls back to a MAX(pk) "
-                "leading-edge check (“N behind (PK)”) only when the time metric "
-                "isn't available.",
-                "Consistency — read the colored badge: green “consistent” = counts "
-                "match · “replicating…” = catching up · red “rows missing” = newest "
-                "landed but rows gone mid-stream · red “data quarantined” = DLQ has "
-                "un-applied events.",
-                "Any non-green consistency badge means investigate.",
-            ]
-            for _line in _legend:
-                with ui.row().classes("items-start gap-2 no-wrap w-full pl-1"):  # type: ignore[attr-defined]
-                    ui.label("•").classes("text-xs text-gray-400")  # type: ignore[attr-defined]
-                    ui.label(_line).classes("text-xs text-gray-600 flex-1")  # type: ignore[attr-defined]
+            definition_row(
+                ui, "Full Load rows", "Rows the one-shot snapshot loaded."
+            )
+            definition_row(
+                ui,
+                "Net rows since Full Load",
+                "NET rows CDC applied since Full Load — inserts add, deletes "
+                "subtract, updates don't change it (not an event count). Live from "
+                "the sink (scan-free); negative is normal when deletes outweigh "
+                "inserts.",
+            )
+            definition_row(
+                ui,
+                "Source / Target rows",
+                "Source = scan-free estimate · Target = exact count.",
+            )
+            definition_row(
+                ui,
+                "Stream lag",
+                "How far the target is behind the source in TIME (apply time − "
+                "source commit time). “caught up” = sub-second / drained; falls back "
+                "to “N behind (PK)” only when the time metric isn't available.",
+            )
+            # Consistency: the actual badge chips, colored exactly like the table's
+            # body-cell-consistency slot (consistent→positive, behind→warning,
+            # gap/quarantined→negative). Keep these labels/colors in sync with that
+            # slot and _CONSISTENCY_LABEL above.
+            _consistency_desc = definition_row(ui, "Consistency")
+            with _consistency_desc:  # type: ignore[attr-defined]
+                ui.badge("consistent").props("color=positive outline")  # type: ignore[attr-defined]
+                ui.badge("replicating…").props("color=warning outline")  # type: ignore[attr-defined]
+                ui.badge("rows missing").props("color=negative outline")  # type: ignore[attr-defined]
+                ui.badge("data quarantined").props("color=negative outline")  # type: ignore[attr-defined]
+                ui.label("— any non-green badge means investigate.").classes(  # type: ignore[attr-defined]
+                    "text-xs text-gray-600"
+                )
 
 def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
     """Live connector health + DLQ, polled read-only from MSK Connect.

@@ -5,6 +5,22 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.109
+
+### Changed
+
+- **CDC 테이블별 상태의 "How to read this table"를 훨씬 스캔하기 쉽게 개선하고,
+  까다로운 컬럼은 그 자리에서 스스로 설명하도록 했습니다.** 기존 범례는 작은 회색
+  글머리표가 통짜로 나열되어 컬럼명이 설명 문장 속에 묻히고, consistency 색상은
+  글자로만 서술됐습니다. 이제 옅은 테두리 패널의 **정의 행(definition rows)** 으로
+  바뀌어 각 용어가 테이블 헤더와 일치하므로 매핑이 한눈에 보이고, Consistency 항목은
+  색상을 글자로 쓰는 대신 테이블 셀과 **동일한 색의 실제 배지 칩**(`consistent` /
+  `replicating…` / `rows missing` / `data quarantined`)을 그대로 렌더합니다. 또한
+  의미가 자명하지 않은 세 컬럼 헤더(**Net rows since Full Load**, **Stream lag**,
+  **Consistency**)에 한 줄 설명이 담긴 **ⓘ 툴팁**을 추가해, 도움말이 눈이 보는 그
+  자리에 있게 했습니다. 범례 레이아웃용 재사용 컴포넌트 `definition_row`를 디자인
+  시스템(단일 소스)에 추가했습니다.
+
 ## v0.1.108
 
 ### Fixed

@@ -358,6 +358,38 @@ def section_header(ui, *, icon: str, title: str, badge: Optional[Tuple[str, str]
     return None
 
 
+# ---------------------------------------------------------------------------
+# Definition row (Cloudscape "key-value pairs" / definition list)
+# ---------------------------------------------------------------------------
+
+
+def definition_row(ui, term, description: str = "", *, term_width: str = "min-w-[10rem]"):
+    """Render one AWS-style definition row: a bold term beside its description.
+
+    A scannable alternative to a bullet list for a legend/glossary: the bold
+    ``term`` (e.g. a table column name) sits on the left at a fixed min-width so
+    terms align into a column, and the description flows to its right. Returns the
+    **description container** so the caller can append rich content — e.g. status
+    badges that match a table's cells — via ``with``::
+
+        desc = definition_row(ui, "Consistency")
+        with desc:
+            ui.badge("consistent").props("color=positive outline")
+
+    When ``description`` text is given it is rendered as a plain label inside that
+    container. Reusing this keeps every in-app legend visually identical.
+    """
+    with ui.row().classes("items-start gap-2 w-full no-wrap"):
+        ui.label(term).classes(
+            f"text-xs font-semibold text-gray-900 {term_width} shrink-0"
+        )
+        desc = ui.row().classes("items-center gap-1.5 flex-1 flex-wrap")
+        if description:
+            with desc:
+                ui.label(description).classes("text-xs text-gray-600")
+    return desc
+
+
 __all__ = [
     "NOTICE_STYLE",
     "render_notice",
@@ -380,5 +412,6 @@ __all__ = [
     "FILTER_SELECT_CLASSES",
     "filter_bar",
     "filter_select",
+    "definition_row",
     "section_header",
 ]

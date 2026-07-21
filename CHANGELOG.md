@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.109
+
+### Changed
+
+- **CDC per-table status: "How to read this table" is far easier to scan, and
+  each tricky column now explains itself in place.** The legend was a wall of
+  small gray bullets where the column name was buried in prose and the
+  consistency colors were only described in words. It is now a quiet bordered
+  panel of **definition rows** — each term matches a table header, so the mapping
+  is obvious — and the Consistency entry renders the **real badge chips**
+  (`consistent` / `replicating…` / `rows missing` / `data quarantined`) in the
+  exact same colors as the table cells, instead of naming the colors. In addition,
+  the three non-obvious column headers (**Net rows since Full Load**, **Stream
+  lag**, **Consistency**) now carry an **ⓘ tooltip** with a one-line explanation,
+  so help is available right where the eye is. Added a reusable `definition_row`
+  to the design system (single source of truth) for the legend layout.
+
 ## v0.1.108
 
 ### Fixed

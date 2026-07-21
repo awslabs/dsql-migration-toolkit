@@ -358,6 +358,36 @@ def test_filter_bar_is_a_wrapping_row() -> None:
 
 
 # ---------------------------------------------------------------------------
+# definition_row
+# ---------------------------------------------------------------------------
+
+
+def test_definition_row_emits_bold_term_and_description() -> None:
+    from dsql_migrator.ui.design import definition_row
+
+    ui = _RecordingUi()
+    desc = definition_row(ui, "Stream lag", "how far behind in time")
+    assert desc is not None
+    assert "Stream lag" in ui.texts
+    assert "how far behind in time" in ui.texts
+    # The term is rendered bold (semibold) so it stands out as the key.
+    assert "font-semibold" in " ".join(ui.classes)
+
+
+def test_definition_row_returns_container_for_rich_description() -> None:
+    # With no description text, the caller fills the returned container (e.g. with
+    # status badges) — it must be a usable context manager and stay empty of text.
+    from dsql_migrator.ui.design import definition_row
+
+    ui = _RecordingUi()
+    desc = definition_row(ui, "Consistency")
+    assert "Consistency" in ui.texts
+    with desc:
+        ui.badge("consistent")
+    assert "consistent" in ui.texts
+
+
+# ---------------------------------------------------------------------------
 # Selectable object chips, colored by group (schema)
 # ---------------------------------------------------------------------------
 
