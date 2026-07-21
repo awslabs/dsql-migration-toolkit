@@ -215,11 +215,12 @@ Bounded at 32 to protect the source from too many concurrent scans.
 
 **The tool infers CDC scaling for you — there is nothing to set in the UI.** The
 connectors run on managed MSK Connect, and their scaling knobs are computed from
-the one input that predicts parallelism: the **number of captured tables**. Each
-table is its own Kafka topic, and the sink consumes topic **partitions** in
-parallel (one sink task per partition), so total sink parallelism =
-`partitions-per-topic × tables`. The tool picks the smallest partition count that
-brings that product up to a sink-parallelism ceiling, then stops:
+the **number of captured tables** (plus, for a skewed workload, each table's
+estimated size — see below). Each table is its own Kafka topic, and the sink
+consumes topic **partitions** in parallel (one sink task per partition), so total
+sink parallelism = `partitions-per-topic × tables`. The tool picks the smallest
+partition count that brings that product up to a sink-parallelism ceiling, then
+stops:
 
 | Captured tables | partitions / topic | `SinkTasksMax` | Effective parallelism |
 |---|---|---|---|
@@ -228,6 +229,25 @@ brings that product up to a sink-parallelism ceiling, then stops:
 | 3 | 3 | 8 | 8 |
 | 4 | 2 | 8 | 8 |
 | ≥ 8 | 1 | 8 | 8 |
+
+**Skewed workloads — size-proportional partitions.** The table above assumes load
+is spread **evenly** across tables. It often isn't: a few "hot" tables can carry
+most of the writes. With many tables the uniform rule gives **1 partition each**,
+and a 1-partition topic is consumed by **at most one sink task** — so a hot table
+would be streamed by a single task while the rest sit idle (pure throughput loss,
+even when DSQL is near idle). To avoid that, the tool reads **scan-free per-table
+row-count estimates** (the Full Load watermark's, or a fresh `information_schema`
+estimate when CDC infra is deployed before Full Load) and gives the larger tables
+**more partitions — 2 or 4** — via Debezium `topic.creation` groups, so a hot
+table streams across several sink tasks in parallel. 4 is the per-table ceiling (a
+single table's gain flattens past ~4 partitions as concurrent DSQL upserts to it
+contend). This is **automatic**: it activates only for a genuinely skewed,
+many-table capture, is a **no-op under even load**, and falls back to the uniform
+default when there is no size signal (or you set
+`DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS`). Ordering is unaffected — Debezium keys each
+record by primary key, so all changes for a row still land on one partition.
+Because a topic's partition count is fixed at creation, this is decided at CDC
+infra deploy; changing it needs a fresh CDC deploy.
 
 Why inferred and hidden, not a UI field:
 
@@ -254,7 +274,7 @@ cdc-stack (blank/invalid values fall back to the smart default):
 
 | Environment variable | Overrides | Notes |
 |---|---|---|
-| `DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` | partitions per per-table topic | **Irreversible** once the topic exists. |
+| `DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` | partitions per per-table topic | **Irreversible** once the topic exists. Also **forces a uniform count** — disables the size-proportional allocation above. |
 | `DSQL_MIGRATOR_CDC_SINK_TASKS_MAX` | sink connector `tasks.max` | Capped in effect by the partition count. |
 | `DSQL_MIGRATOR_CDC_MCU_COUNT` | MSK Connect MCUs per worker | Must be one of 1 / 2 / 4 / 8. |
 

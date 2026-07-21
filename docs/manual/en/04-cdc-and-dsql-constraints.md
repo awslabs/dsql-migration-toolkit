@@ -241,4 +241,42 @@ applied without your explicit approval, and AI is **never** in the CDC data path
 
 ---
 
+## 4.7 Monitoring CDC progress (the migration monitor)
+
+While CDC runs, the Data Migration screen shows a live per-table monitor. It
+refreshes on its own (no manual reload) and is **scan-free** on the source — it
+never runs a `COUNT(*)` against your production database. The columns:
+
+| Column | What it means |
+|---|---|
+| **Full Load rows** | Rows the one-shot snapshot loaded into the table. |
+| **Net rows since Full Load** | The **net** rows CDC has applied since Full Load — *not* a count of CDC events: inserts add, deletes subtract, updates don't change it. Reported live by the sink (scan-free). It is **negative** when the stream net-deleted rows (more deletes than inserts) — expected, not an error. |
+| **Source rows** | Scan-free `information_schema` **estimate**. **Target rows** — exact DSQL count. |
+| **Stream lag** | How far the target is behind the source **in time** (see below). |
+| **Consistency** | A colored badge: green *consistent* = counts match · *replicating…* = catching up · red *rows missing* = the newest change landed but rows went missing mid-stream · red *data quarantined* = the DLQ has un-applied events. |
+
+### Stream lag — a real time measure, not a row count
+
+**Stream lag** is the end-to-end replication delay: for each change, the sink
+records **apply time − the source commit time** (Debezium `source.ts_ms`) and
+emits it as a per-table `ReplicationLagMs` CloudWatch metric; the monitor shows
+the most recent value.
+
+- Reads as a **duration**: `caught up` (sub-second / the stream has drained),
+  `8.5s behind`, `2m 10s behind`, `1h 4m behind`.
+- It is a true **time** lag, so it is accurate for **any** primary-key type and
+  reflects update/delete lag too — not just the newest insert.
+- **Fallback:** when the time metric isn't available yet (an older sink plugin, or
+  the metric hasn't emitted a datapoint), the monitor falls back to a `MAX(pk)`
+  **leading-edge** check and shows `N behind (PK)` (how many PK units the target's
+  newest key trails the source's) or `caught up`. This fallback only works for a
+  single-column integer PK; the time-based value above is the preferred, general
+  measure.
+
+Lag is emitted strictly **best-effort** and never affects replication. Use "Stream
+lag → caught up" as the signal that it's safe to proceed to
+[cut-over](10-conclusion.md).
+
+---
+
 **Next:** [5. Validation →](05-validation.md)

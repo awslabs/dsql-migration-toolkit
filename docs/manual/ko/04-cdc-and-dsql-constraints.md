@@ -215,4 +215,37 @@ Evaluation은 모든 객체를 다음 중 하나로 분류합니다:
 
 ---
 
+## 4.7 CDC 진행 모니터링 (마이그레이션 모니터)
+
+CDC 실행 중에는 Data Migration 화면이 테이블별 실시간 모니터를 보여줍니다. 수동 새로고침 없이 자동으로
+갱신되며, 소스에는 **스캔이 없습니다** — 프로덕션 DB에 `COUNT(*)`를 실행하지 않습니다. 컬럼:
+
+| 컬럼 | 의미 |
+|---|---|
+| **Full Load rows** | 원샷 스냅샷이 테이블에 적재한 행 수. |
+| **Net rows since Full Load** | Full Load 이후 CDC가 적용한 **순증감(net)** 행 수 — CDC 이벤트 수가 *아님*: insert는 더하고, delete는 빼며, update는 바꾸지 않습니다. 싱크가 실시간 보고(스캔 없음). 스트림이 순삭제(insert보다 delete가 많음)했으면 **음수**가 되며, 이는 오류가 아니라 정상입니다. |
+| **Source rows** | 스캔 없는 `information_schema` **추정치**. **Target rows** — DSQL 정확 카운트. |
+| **Stream lag** | 타깃이 소스보다 **시간상** 얼마나 뒤처졌는지(아래 참고). |
+| **Consistency** | 색상 배지: 초록 *consistent* = 카운트 일치 · *replicating…* = 따라잡는 중 · 빨강 *rows missing* = 최신 변경은 도착했으나 중간에 행 유실 · 빨강 *data quarantined* = DLQ에 미적용 이벤트 존재. |
+
+### Stream lag — 행 수가 아니라 실제 시간 척도
+
+**Stream lag**은 종단 간 복제 지연입니다: 각 변경에 대해 싱크가 **적용 시각 − 소스 커밋 시각**(Debezium
+`source.ts_ms`)을 기록해 테이블별 `ReplicationLagMs` CloudWatch 메트릭으로 내보내며, 모니터는 가장 최근
+값을 표시합니다.
+
+- **시간(duration)** 으로 표시됩니다: `caught up`(1초 미만 / 스트림 소진), `8.5s behind`,
+  `2m 10s behind`, `1h 4m behind`.
+- 실제 **시간** 지연이므로 **모든** 기본 키 타입에서 정확하고, 최신 insert뿐 아니라 update/delete 지연도
+  반영합니다.
+- **폴백:** 시간 메트릭이 아직 없으면(구버전 싱크 플러그인이거나 메트릭 데이터포인트가 아직 없을 때) 모니터는
+  `MAX(pk)` **선행 엣지** 검사로 폴백해 `N behind (PK)`(타깃 최신 키가 소스보다 몇 PK 단위 뒤처졌는지) 또는
+  `caught up`을 표시합니다. 이 폴백은 단일 컬럼 정수 PK에서만 동작하며, 위의 시간 기반 값이 일반적이고 권장되는
+  척도입니다.
+
+지연 측정은 철저히 **best-effort**이며 복제에 영향을 주지 않습니다. "Stream lag → caught up"을
+[cut over](10-conclusion.md)로 넘어가도 안전하다는 신호로 사용하세요.
+
+---
+
 **다음:** [5. Validation →](05-validation.md)
