@@ -373,6 +373,36 @@ Parameters:
       (silent data loss / stall) even though MSK Serverless accepts up to 8 MiB.
       Capped at the 8 MiB MSK Serverless broker limit.
 
+  # Size-proportional partitions (skewed-workload fix). TopicDefaultPartitions
+  # above sets a UNIFORM per-topic count; when a few "hot" tables carry most of
+  # the writes and there are many tables (default collapses to 1 each), a hot
+  # topic's single partition serializes it on one sink task. The tool then keeps
+  # TopicDefaultPartitions=1 and puts the hot topics into elevated Debezium
+  # topic.creation GROUPS (p2 = 2 partitions, p4 = 4) so they stream across
+  # several tasks. Each *Include is a comma-separated list of topic-name regexes;
+  # empty = that group is omitted (Fn::If -> AWS::NoValue). TopicCreationGroups is
+  # the comma-separated list of active group names ("" | "p2" | "p4" | "p2,p4").
+  # The group partition counts (2 / 4) are fixed here to match the tool's tiers
+  # (see compute_cdc_partition_plan / CDC_PARTITION_TIERS).
+  TopicCreationGroups:
+    Type: String
+    Default: ""
+    Description: >
+      Comma-separated Debezium topic.creation group names to activate (subset of
+      "p2,p4"), or empty for the uniform TopicDefaultPartitions default only.
+  TopicGroupInclude2:
+    Type: String
+    Default: ""
+    Description: >
+      Comma-separated topic-name regexes auto-created with 2 partitions (the "p2"
+      group). Empty = no p2 group.
+  TopicGroupInclude4:
+    Type: String
+    Default: ""
+    Description: >
+      Comma-separated topic-name regexes auto-created with 4 partitions (the "p4"
+      group). Empty = no p4 group.
+
   ColumnExcludeList:
     Type: String
     Default: ""
@@ -472,6 +502,21 @@ Conditions:
   HasMessageKeyColumns:
     Fn::Not:
       - Fn::Equals: [Ref: MessageKeyColumns, ""]
+
+  # Size-proportional topic.creation groups (skewed-workload fix). Each group is
+  # emitted only when the tool supplies a non-empty include list for it, and the
+  # topic.creation.groups key is emitted only when at least one group is active
+  # (Debezium rejects an empty groups list / an empty group include, same as
+  # message.key.columns above).
+  HasTopicCreationGroups:
+    Fn::Not:
+      - Fn::Equals: [Ref: TopicCreationGroups, ""]
+  HasTopicGroup2:
+    Fn::Not:
+      - Fn::Equals: [Ref: TopicGroupInclude2, ""]
+  HasTopicGroup4:
+    Fn::Not:
+      - Fn::Equals: [Ref: TopicGroupInclude4, ""]
 
   # Connectors are created only once the MSK Serverless bootstrap string is
   # supplied (it is not available via Ref/GetAtt, so it is a two-pass deploy).
@@ -1360,6 +1405,38 @@ Resources:
         # DSQL 1 MiB per-value limit (the band that makes the DLQ demonstrable).
         topic.creation.default.max.message.bytes:
           Fn::Sub: "${MaxMessageBytes}"
+        # Size-proportional partitions: hot tables get more partitions than the
+        # default so they are not serialized on one sink task (skewed-workload
+        # fix). Each key is omitted (AWS::NoValue) unless its group is active. The
+        # groups MUST also set max.message.bytes (H13) and replication.factor=-1,
+        # exactly like the default group -- a group inherits nothing from default.
+        topic.creation.groups:
+          Fn::If:
+            - HasTopicCreationGroups
+            - Ref: TopicCreationGroups
+            - Ref: AWS::NoValue
+        topic.creation.p2.include:
+          Fn::If: [HasTopicGroup2, Ref: TopicGroupInclude2, Ref: AWS::NoValue]
+        topic.creation.p2.partitions:
+          Fn::If: [HasTopicGroup2, "2", Ref: AWS::NoValue]
+        topic.creation.p2.replication.factor:
+          Fn::If: [HasTopicGroup2, "-1", Ref: AWS::NoValue]
+        topic.creation.p2.max.message.bytes:
+          Fn::If:
+            - HasTopicGroup2
+            - Fn::Sub: "${MaxMessageBytes}"
+            - Ref: AWS::NoValue
+        topic.creation.p4.include:
+          Fn::If: [HasTopicGroup4, Ref: TopicGroupInclude4, Ref: AWS::NoValue]
+        topic.creation.p4.partitions:
+          Fn::If: [HasTopicGroup4, "4", Ref: AWS::NoValue]
+        topic.creation.p4.replication.factor:
+          Fn::If: [HasTopicGroup4, "-1", Ref: AWS::NoValue]
+        topic.creation.p4.max.message.bytes:
+          Fn::If:
+            - HasTopicGroup4
+            - Fn::Sub: "${MaxMessageBytes}"
+            - Ref: AWS::NoValue
         # Full Load already loaded the row data; we only need to resume streaming
         # from the watermark-seeded connect-offset WITHOUT re-reading any rows.
         # MUST be `recovery` (NOT schema_only/no_data): the offset seeder seeds the

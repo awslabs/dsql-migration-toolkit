@@ -5,6 +5,31 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.108
+
+### Fixed
+
+- **Skewed CDC workloads no longer serialize a hot table on one sink task —
+  Kafka topic partitions are now allocated proportionally to table size.** The
+  scaling default spread partitions uniformly, which assumes write load is even
+  across tables; when there are many tables (≥ the sink-parallelism cap) it
+  collapsed to **1 partition per topic**, and a 1-partition topic can be consumed
+  by at most one sink task. So when a few "hot" tables carried most of the writes
+  (e.g. a sysbench run hitting 4 of 9 tables), each hot table was streamed by a
+  single task while the rest sat idle — pure throughput loss (DSQL was near idle).
+  The tool now reads scan-free per-table row-count estimates (the Full Load
+  watermark's, or a fresh `information_schema` estimate if CDC infra is deployed
+  before Full Load) and gives the larger tables **more partitions** via Debezium
+  `topic.creation` groups (2 or 4 partitions for hot tables; 4 is the per-table
+  ceiling, where a single table's gain flattens as concurrent DSQL upserts
+  contend), so a hot table streams across several tasks in parallel. It is a
+  no-op under even load and falls back to the previous uniform default when there
+  is no size signal or an explicit `DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` override
+  is set. Partition counts are fixed at topic creation, so this is decided at CDC
+  infra deploy; ordering is unaffected (Debezium keys each record by primary key,
+  so a given key always lands on one partition). Requires a fresh CDC infra
+  deploy to take effect (existing topics' partition counts are immutable).
+
 ## v0.1.107
 
 ### Changed

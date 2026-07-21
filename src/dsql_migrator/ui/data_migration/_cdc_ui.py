@@ -567,6 +567,52 @@ def _cdc_tables_for_config(
         return [t for t in inventory.tables if t.name in reconciled]
     return []
 
+
+def _cdc_row_counts_from_watermark(watermark, tables_for_config):
+    """Per-table row estimates from a Full Load watermark, scoped to the capture.
+
+    Returns ``{table_name: rows}`` (positive counts only) for the tables actually
+    being captured, or ``None`` when the watermark carries no counts. These are the
+    scan-free ``information_schema`` estimates captured at snapshot time -- exactly
+    the RELATIVE size signal the partition planner needs. Pure.
+    """
+    counts = getattr(watermark, "table_row_counts", None) if watermark else None
+    if not counts:
+        return None
+    names = {t.name for t in tables_for_config}
+    scoped = {n: int(c) for n, c in counts.items() if n in names and c}
+    return scoped or None
+
+
+def _estimate_cdc_table_rows(session, table_names):
+    """BLOCKING, read-only scan-free per-table row estimates from the source.
+
+    Runs on a worker thread (caller uses ``run.io_bound``). Used to size CDC topic
+    partitions proportionally to table size when no Full Load watermark is present
+    (e.g. CDC infra deployed early). Best-effort: returns ``None`` when the source
+    cannot be read (no connection/password after a restore) or on any error, so the
+    deploy simply falls back to the uniform partition default. Mirrors the
+    information_schema estimate the migration-status view already uses.
+    """
+    if not table_names:
+        return None
+    try:
+        from dsql_migrator.core.watermark import estimate_source_rows
+        from dsql_migrator.ui.connect import make_source_engine_factory
+
+        source_config = getattr(session, "source_config", None)
+        has_password = getattr(session, "source_password", None) is not None
+        if source_config is None or not session.has_source() or not has_password:
+            return None
+        engine = make_source_engine_factory(session.source_password)(source_config)
+        with engine.connect() as connection:
+            estimates = estimate_source_rows(connection, list(table_names))
+        scoped = {n: int(c) for n, c in estimates.items() if c}
+        return scoped or None
+    except Exception:  # noqa: BLE001 - optional sizing signal; uniform fallback
+        return None
+
+
 def _render_cdc_start_point_card(
     ui,
     migration_state,
@@ -2420,6 +2466,18 @@ async def _start_cdc_infra_deploy(
     sink_config = CdcPipelineOrchestrator().build_sink_config(
         "mysql-sink", tables_for_config, CDC_DEFAULT_DLQ_TOPIC, allow_empty=True
     )
+    # Size-proportional topic partitions (skewed-workload fix): weight Kafka
+    # partitions toward the largest tables so a hot table is not serialized on a
+    # single sink task. Partition counts are fixed at topic-creation (which happens
+    # at Start CDC, but the source connector reads these persisted params), so they
+    # must be decided here at create. Prefer the Full Load watermark's scan-free
+    # estimates; if absent (infra deployed before Full Load), fetch fresh
+    # information_schema estimates off the loop. Best-effort -> None -> uniform.
+    row_counts_by_table = _cdc_row_counts_from_watermark(watermark, tables_for_config)
+    if not row_counts_by_table:
+        row_counts_by_table = await run.io_bound(
+            _estimate_cdc_table_rows, session, [t.name for t in tables_for_config]
+        )
     # (c) source-DB security group. Scope the connector's egress-to-source rule to
     #     the source DB's own SG so the stack does NOT fall back to an open
     #     0.0.0.0/0 egress on the source port. Best effort + off the loop: if the
@@ -2479,6 +2537,7 @@ async def _start_cdc_infra_deploy(
         target_username=getattr(target, "username", "admin") if target else "admin",
         stack_name=migration_state.cdc_stack_name,
         topic_prefix=CDC_DEFAULT_TOPIC_PREFIX,
+        row_counts_by_table=row_counts_by_table,
     )
     deployer = build_cdc_stack_deployer(
         region,

@@ -523,6 +523,135 @@ def compute_cdc_scaling_defaults(
     )
 
 
+# --- Size-proportional partition plan (skewed-workload fix) -----------------
+#
+# compute_cdc_scaling_defaults spreads partitions UNIFORMLY, which assumes write
+# load is even across tables. When tables >= CDC_MAX_SINK_PARALLELISM the uniform
+# default collapses to 1 partition per topic, and a Kafka topic with 1 partition
+# is consumed by at most ONE sink task -- so a "hot" table (a few tables carrying
+# most of the writes, e.g. a sysbench run) is serialized on a single task while
+# the rest sit idle. This plan instead gives the hot tables MORE partitions (by
+# scan-free row-count estimate) so each streams across several tasks in parallel,
+# leaving small tables at 1. It is a no-op under uniform load (nothing is elevated)
+# and is gated to the many-tables regime where the uniform default actually hurts.
+#
+# Partitions are discretized into a FIXED tier set so the plan maps onto a small,
+# bounded number of Debezium ``topic.creation`` groups (the CloudFormation
+# template carries a fixed number of group blocks). 4 is the per-table ceiling:
+# the 2026-07-08 throughput test showed a single table's gain flattens past ~4
+# partitions (4->8 was only ~1.4x) as concurrent upserts to one table contend in
+# DSQL, so more partitions on one table mostly add MCU cost without throughput.
+CDC_PARTITION_TIERS = (2, 4)  # elevated per-table partition counts (>1); default 1
+# A table is elevated when its estimated rows, as a multiple of the AVERAGE
+# captured table's rows ("excess over fair share" = rows * num_tables / total),
+# cross these thresholds. 1.0 == an average-sized table; only clearly-dominant
+# tables are lifted, so an even workload keeps 1 partition each. Highest first.
+_CDC_TIER_THRESHOLDS = ((4.0, 4), (2.0, 2))
+
+
+@dataclass(frozen=True)
+class CdcTopicGroup:
+    """One Debezium ``topic.creation`` group: a partition count + its topics.
+
+    ``name`` is the group name used in the connector config (``p2`` / ``p4``);
+    ``topics`` are the fully-qualified topic names (``<prefix>.<db>.<table>``)
+    that should be auto-created with ``partitions`` partitions.
+    """
+
+    name: str
+    partitions: int
+    topics: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CdcPartitionPlan:
+    """A size-proportional per-topic partition allocation for a skewed workload.
+
+    ``partitions_by_topic`` is the full topic->partition map; ``groups`` are just
+    the elevated tiers (>1 partition) that have at least one topic, rendered as
+    Debezium ``topic.creation`` groups; tier-1 topics use ``default_partitions``.
+    ``sink_tasks_max`` sizes the sink so the elevated partitions can be consumed
+    concurrently (capped for cost); ``total_partitions`` is the sum across topics.
+    """
+
+    partitions_by_topic: dict[str, int]
+    default_partitions: int
+    groups: tuple[CdcTopicGroup, ...]
+    sink_tasks_max: int
+    total_partitions: int
+
+
+def compute_cdc_partition_plan(
+    row_counts_by_topic: Mapping[str, int],
+    *,
+    env: Optional[Mapping[str, str]] = None,
+) -> Optional[CdcPartitionPlan]:
+    """Allocate Kafka topic partitions proportional to per-table size, or ``None``.
+
+    ``row_counts_by_topic`` maps each captured table's topic name to its estimated
+    row count (scan-free ``information_schema`` estimates are fine -- only the
+    RELATIVE sizes matter). Returns a :class:`CdcPartitionPlan` when a hot table is
+    worth elevating, else ``None`` so the caller falls back to the uniform
+    :func:`compute_cdc_scaling_defaults`. Pure. Returns ``None`` (uniform) when:
+
+    * an explicit ``DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS`` override is set (the
+      operator asked for a fixed uniform count);
+    * fewer than :data:`CDC_MAX_SINK_PARALLELISM` tables -- the uniform default
+      already gives each topic several partitions in that regime;
+    * no usable size signal (empty / all-zero counts); or
+    * load is even (no table crosses a tier threshold), so 1 each is already right.
+    """
+    source = os.environ if env is None else env
+    if _cdc_env_int(source, CDC_ENV_TOPIC_PARTITIONS) is not None:
+        return None
+
+    counts = {t: max(0, int(c)) for t, c in row_counts_by_topic.items() if t}
+    num_tables = len(counts)
+    if num_tables < CDC_MAX_SINK_PARALLELISM:
+        return None
+    total_rows = sum(counts.values())
+    if total_rows <= 0:
+        return None
+
+    fair_share = 1.0 / num_tables
+    partitions_by_topic: dict[str, int] = {}
+    elevated = False
+    for topic, rows in counts.items():
+        excess = (rows / total_rows) / fair_share  # 1.0 == an average-sized table
+        partitions = 1
+        for min_excess, tier in _CDC_TIER_THRESHOLDS:  # highest tier first
+            if excess >= min_excess:
+                partitions = tier
+                elevated = True
+                break
+        partitions_by_topic[topic] = partitions
+    if not elevated:
+        return None
+
+    groups: list[CdcTopicGroup] = []
+    for tier in sorted(set(CDC_PARTITION_TIERS)):
+        topics = tuple(
+            sorted(t for t, p in partitions_by_topic.items() if p == tier)
+        )
+        if topics:
+            groups.append(CdcTopicGroup(name=f"p{tier}", partitions=tier, topics=topics))
+
+    total_partitions = sum(partitions_by_topic.values())
+    tasks_override = _cdc_env_int(source, CDC_ENV_SINK_TASKS_MAX)
+    sink_tasks_max = (
+        tasks_override
+        if tasks_override is not None
+        else min(total_partitions, CDC_MAX_SINK_PARALLELISM)
+    )
+    return CdcPartitionPlan(
+        partitions_by_topic=partitions_by_topic,
+        default_partitions=1,
+        groups=tuple(groups),
+        sink_tasks_max=sink_tasks_max,
+        total_partitions=total_partitions,
+    )
+
+
 # Every cdc-stack name MUST start with this prefix. The deploy role's IAM scopes
 # the whole "mysql-dsql-cdc-*" naming family (see deploy/cloudformation.yaml CdcDeployRole)
 # so one app can run many cdc-stacks concurrently (one per source DB) -- but only
@@ -1085,6 +1214,64 @@ def build_cdc_stack_params(
     )
 
 
+def _topic_group_include(group: "CdcTopicGroup") -> str:
+    """Render a topic.creation group's topics as a comma-separated regex list.
+
+    Each topic name is regex-escaped so it matches literally (Debezium treats the
+    include entries as regexes and full-matches topic names). Pure.
+    """
+    return ",".join(re.escape(topic) for topic in group.topics)
+
+
+def cdc_scaling_params(
+    topics: Sequence[str],
+    topic_prefix: str,
+    *,
+    row_counts_by_table: Optional[Mapping[str, int]] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> list[tuple[str, str]]:
+    """Build the (partition/parallelism) CFN parameters for a CDC deploy.
+
+    Returns the ``TopicDefaultPartitions`` / ``SinkTasksMax`` /
+    ``TopicCreationGroups`` / ``TopicGroupInclude2`` / ``TopicGroupInclude4``
+    pairs. When ``row_counts_by_table`` yields a size-proportional
+    :func:`compute_cdc_partition_plan` (a skewed, many-table capture), the hot
+    tables go into elevated ``topic.creation`` groups and the default drops to 1;
+    otherwise it falls back to the uniform :func:`compute_cdc_scaling_defaults`
+    (empty groups). ``topics`` are table names (``db.table``); the group include
+    regexes use the real topic names (``<topic_prefix>.<db>.<table>``). Pure.
+    """
+    plan = None
+    if row_counts_by_table:
+        counts_by_topic = {
+            f"{topic_prefix}.{table}": count
+            for table, count in row_counts_by_table.items()
+            if table in set(topics)
+        }
+        plan = compute_cdc_partition_plan(counts_by_topic, env=env)
+
+    if plan is not None:
+        by_tier = {group.partitions: group for group in plan.groups}
+        return [
+            ("TopicDefaultPartitions", str(plan.default_partitions)),
+            ("SinkTasksMax", str(plan.sink_tasks_max)),
+            ("TopicCreationGroups", ",".join(group.name for group in plan.groups)),
+            ("TopicGroupInclude2",
+             _topic_group_include(by_tier[2]) if 2 in by_tier else ""),
+            ("TopicGroupInclude4",
+             _topic_group_include(by_tier[4]) if 4 in by_tier else ""),
+        ]
+
+    scaling = compute_cdc_scaling_defaults(len(topics), env=env)
+    return [
+        ("TopicDefaultPartitions", str(scaling.partitions_per_topic)),
+        ("SinkTasksMax", str(scaling.sink_tasks_max)),
+        ("TopicCreationGroups", ""),
+        ("TopicGroupInclude2", ""),
+        ("TopicGroupInclude4", ""),
+    ]
+
+
 class CdcInfraParams(BaseModel):
     """A complete cdc-stack parameter set for the first ``create_stack`` deploy.
 
@@ -1139,6 +1326,12 @@ def build_cdc_infra_params(
     stack_name: str = CDC_DEFAULT_STACK_NAME,
     topic_prefix: str = CDC_DEFAULT_TOPIC_PREFIX,
     plugin_version: str = "v1",
+    # Per-table estimated row counts ({table_name: rows}, scan-free estimates).
+    # When a skewed, many-table capture is detected, drives size-proportional
+    # topic partitions so hot tables are not serialized on one sink task; absent /
+    # even load falls back to the uniform partition default. Set at create because
+    # partition counts are fixed for the life of the topic.
+    row_counts_by_table: Optional[Mapping[str, int]] = None,
 ) -> CdcInfraParams:
     """Build the full cdc-stack parameter set for a first-time ``create_stack``.
 
@@ -1160,6 +1353,9 @@ def build_cdc_infra_params(
     """
     sink_topics = ",".join(f"{topic_prefix}.{t}" for t in sink_config.topics)
     scaling = compute_cdc_scaling_defaults(len(sink_config.topics))
+    scaling_params = cdc_scaling_params(
+        sink_config.topics, topic_prefix, row_counts_by_table=row_counts_by_table
+    )
     filled: list[tuple[str, str]] = [
         # VPC / networking
         ("VpcId", vpc_id),
@@ -1207,12 +1403,14 @@ def build_cdc_infra_params(
         # Plugin resource-name version suffix (gotcha #5: lets a new artifact get a
         # uniquely-named CustomPlugin instead of colliding on a fixed name).
         ("PluginVersion", plugin_version),
-        # Connector scaling inferred from the captured-table count (env-overridable).
-        # TopicDefaultPartitions is set HERE because it is fixed for the life of the
-        # topic -- a partition count can only be raised (and only by recreating the
-        # cluster in practice), never lowered, so it must be right at create time.
-        ("TopicDefaultPartitions", str(scaling.partitions_per_topic)),
-        ("SinkTasksMax", str(scaling.sink_tasks_max)),
+        # Connector scaling inferred from the captured tables (env-overridable).
+        # TopicDefaultPartitions / the topic.creation groups are set HERE because a
+        # topic's partition count is fixed for its life -- it can only be raised (and
+        # only by recreating the cluster in practice), never lowered, so it must be
+        # right at create time. cdc_scaling_params emits TopicDefaultPartitions,
+        # SinkTasksMax, and the size-proportional topic.creation group params
+        # (TopicCreationGroups / TopicGroupInclude2 / TopicGroupInclude4).
+        *scaling_params,
         ("ConnectorMcuCount", str(scaling.mcu_count)),
         # No connectors on the first deploy -- Start CDC sets these two later.
         ("MskBootstrapServers", ""),
@@ -1274,6 +1472,11 @@ __all__ = [
     "cdc_stack_params_to_json",
     "CdcScalingDefaults",
     "compute_cdc_scaling_defaults",
+    "CdcTopicGroup",
+    "CdcPartitionPlan",
+    "compute_cdc_partition_plan",
+    "cdc_scaling_params",
+    "CDC_PARTITION_TIERS",
     "CDC_MAX_SINK_PARALLELISM",
     "CDC_DEFAULT_MCU_COUNT",
     "CDC_ENV_SINK_TASKS_MAX",

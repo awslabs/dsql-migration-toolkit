@@ -35,7 +35,9 @@ from dsql_migrator.core.cdc import (
     build_watermark_params,
     cdc_expected_connector_names,
     cdc_stack_name_is_valid,
+    cdc_scaling_params,
     cdc_stack_params_to_json,
+    compute_cdc_partition_plan,
     compute_cdc_scaling_defaults,
     estimate_cdc_hourly_cost,
 )
@@ -628,3 +630,150 @@ def test_infra_params_scaling_knobs_are_declared_in_template() -> None:
     template = pathlib.Path("deploy/cdc-stack/cdc-stack.yaml").read_text()
     for key in ("TopicDefaultPartitions", "SinkTasksMax", "ConnectorMcuCount"):
         assert f"\n  {key}:" in template, key
+
+
+# ---------------------------------------------------------------------------
+# compute_cdc_partition_plan — size-proportional partitions (skewed workload)
+# ---------------------------------------------------------------------------
+
+
+def _row_counts(hot, cold, *, hot_rows=750_000, cold_rows=10_000):
+    """{topic: rows} with ``hot`` hot tables and ``cold`` small ones."""
+    counts = {f"pfx.app.hot{i}": hot_rows for i in range(hot)}
+    counts.update({f"pfx.app.cold{i}": cold_rows for i in range(cold)})
+    return counts
+
+
+def test_partition_plan_elevates_hot_tables_in_skewed_many_table_capture() -> None:
+    # 4 hot (~750k) + 5 cold (~10k), 9 tables total (>= cap so uniform would give 1
+    # each). The hot tables are ~2.2x the average -> tier 2; cold stay at 1.
+    plan = compute_cdc_partition_plan(_row_counts(4, 5), env={})
+    assert plan is not None
+    assert all(plan.partitions_by_topic[f"pfx.app.hot{i}"] == 2 for i in range(4))
+    assert all(plan.partitions_by_topic[f"pfx.app.cold{i}"] == 1 for i in range(5))
+    assert plan.default_partitions == 1
+    # One elevated group (p2) listing exactly the four hot topics.
+    assert [g.name for g in plan.groups] == ["p2"]
+    assert plan.groups[0].partitions == 2
+    assert set(plan.groups[0].topics) == {f"pfx.app.hot{i}" for i in range(4)}
+    assert plan.total_partitions == 4 * 2 + 5  # 13
+    assert plan.sink_tasks_max == CDC_MAX_SINK_PARALLELISM  # min(13, cap)
+
+
+def test_partition_plan_gives_a_dominant_table_the_top_tier() -> None:
+    # One table dwarfs the other eight (>= 4x average) -> tier 4.
+    counts = {"pfx.app.big": 5_000_000}
+    counts.update({f"pfx.app.s{i}": 10_000 for i in range(8)})
+    plan = compute_cdc_partition_plan(counts, env={})
+    assert plan is not None
+    assert plan.partitions_by_topic["pfx.app.big"] == 4
+    assert all(plan.partitions_by_topic[f"pfx.app.s{i}"] == 1 for i in range(8))
+    assert [g.name for g in plan.groups] == ["p4"]
+    assert plan.groups[0].topics == ("pfx.app.big",)
+
+
+def test_partition_plan_none_for_uniform_load() -> None:
+    # Every table the same size -> nothing exceeds fair share -> uniform is right.
+    counts = {f"pfx.app.t{i}": 100_000 for i in range(9)}
+    assert compute_cdc_partition_plan(counts, env={}) is None
+
+
+def test_partition_plan_none_below_cap_table_count() -> None:
+    # Few tables: the uniform default already parallelises, even with skew.
+    counts = {"pfx.app.big": 5_000_000, "pfx.app.a": 1, "pfx.app.b": 1}
+    assert compute_cdc_partition_plan(counts, env={}) is None
+
+
+def test_partition_plan_none_without_size_signal() -> None:
+    assert compute_cdc_partition_plan({}, env={}) is None
+    all_zero = {f"pfx.app.t{i}": 0 for i in range(9)}
+    assert compute_cdc_partition_plan(all_zero, env={}) is None
+
+
+def test_partition_plan_none_when_partition_override_set() -> None:
+    # An explicit uniform partition override wins over the proportional plan.
+    plan = compute_cdc_partition_plan(
+        _row_counts(4, 5), env={CDC_ENV_TOPIC_PARTITIONS: "4"}
+    )
+    assert plan is None
+
+
+def test_partition_plan_sink_tasks_env_override_respected() -> None:
+    plan = compute_cdc_partition_plan(
+        _row_counts(4, 5), env={CDC_ENV_SINK_TASKS_MAX: "3"}
+    )
+    assert plan is not None
+    assert plan.sink_tasks_max == 3
+
+
+# ---------------------------------------------------------------------------
+# cdc_scaling_params — the CFN param tuples (uniform vs size-proportional)
+# ---------------------------------------------------------------------------
+
+
+def test_scaling_params_uniform_when_no_row_counts() -> None:
+    # No size signal -> uniform default, empty topic.creation groups.
+    params = dict(cdc_scaling_params(["db.a", "db.b"], "pfx", env={}))
+    assert params["TopicDefaultPartitions"] == "4"  # 2 tables -> ceil(8/2)
+    assert params["SinkTasksMax"] == str(CDC_MAX_SINK_PARALLELISM)
+    assert params["TopicCreationGroups"] == ""
+    assert params["TopicGroupInclude2"] == ""
+    assert params["TopicGroupInclude4"] == ""
+
+
+def test_scaling_params_size_proportional_groups_hot_tables() -> None:
+    # 9 tables, 4 hot -> the "p2" group lists the four hot topics (regex-escaped,
+    # prefixed), default drops to 1, and no p4 group.
+    tables = [f"hot{i}" for i in range(4)] + [f"cold{i}" for i in range(5)]
+    row_counts = {f"hot{i}": 750_000 for i in range(4)}
+    row_counts.update({f"cold{i}": 10_000 for i in range(5)})
+    params = dict(cdc_scaling_params(tables, "pfx", row_counts_by_table=row_counts))
+    assert params["TopicDefaultPartitions"] == "1"
+    assert params["TopicCreationGroups"] == "p2"
+    assert params["TopicGroupInclude4"] == ""
+    # Regex-escaped, prefixed topic names, comma-joined.
+    inc2 = params["TopicGroupInclude2"]
+    assert set(inc2.split(",")) == {rf"pfx\.hot{i}" for i in range(4)}
+
+
+def test_scaling_params_ignores_row_counts_for_untracked_tables() -> None:
+    # Counts for tables not in the capture list must not create phantom groups.
+    tables = [f"t{i}" for i in range(9)]
+    row_counts = {"not_captured": 9_000_000}
+    params = dict(cdc_scaling_params(tables, "pfx", row_counts_by_table=row_counts))
+    # No captured table has a size signal -> uniform (1 each for 9 tables), no groups.
+    assert params["TopicCreationGroups"] == ""
+
+
+def test_infra_params_size_proportional_partitions_from_row_counts() -> None:
+    # End-to-end through build_cdc_infra_params: a skewed capture yields the p2
+    # group + default 1, all declared params.
+    tables = tuple([f"app.hot{i}" for i in range(4)] + [f"app.cold{i}" for i in range(5)])
+    row_counts = {f"app.hot{i}": 750_000 for i in range(4)}
+    row_counts.update({f"app.cold{i}": 10_000 for i in range(5)})
+    by_key = dict(_infra(tables=tables, row_counts_by_table=row_counts).filled)
+    assert by_key["TopicDefaultPartitions"] == "1"
+    assert by_key["TopicCreationGroups"] == "p2"
+    assert by_key["TopicGroupInclude2"]  # non-empty
+    # 13 total partitions capped at the sink-parallelism ceiling.
+    assert by_key["SinkTasksMax"] == str(CDC_MAX_SINK_PARALLELISM)
+
+
+def test_partition_tier_params_and_template_group_blocks_agree() -> None:
+    # Guard the Python<->template coupling: each elevated tier N in
+    # CDC_PARTITION_TIERS must have a matching topic.creation.pN group in the
+    # template whose partition literal is N, and the group-include params the tool
+    # emits must be declared. A tier change that misses the template would silently
+    # drop the group (Debezium would use the default partition count).
+    import pathlib
+
+    from dsql_migrator.core.cdc import CDC_PARTITION_TIERS
+
+    template = pathlib.Path("deploy/cdc-stack/cdc-stack.yaml").read_text()
+    for tier in CDC_PARTITION_TIERS:
+        assert f"topic.creation.p{tier}.include" in template, tier
+        assert f'[HasTopicGroup{tier}, "{tier}", Ref: AWS::NoValue]' in template, tier
+        assert f"\n  TopicGroupInclude{tier}:" in template, tier
+    for key in ("TopicCreationGroups",):
+        assert f"\n  {key}:" in template, key
+
