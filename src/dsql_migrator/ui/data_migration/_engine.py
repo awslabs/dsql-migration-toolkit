@@ -431,6 +431,9 @@ class _TableWorkerArgs:
     job_id: str
     table: TableDef
     inputs: "DataMigrationInputs"
+    # True when the parent already DROP+recreated this empty target in the serial
+    # pre-pass; the worker then loads without re-running the DDL (no startup storm).
+    pre_recreated: bool = False
 
 
 @dataclass(frozen=True)
@@ -520,6 +523,7 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
                 should_cancel=lambda: (
                     cancel_event is not None and cancel_event.is_set()
                 ),
+                pre_recreated=args.pre_recreated,
             )
         )
         # Flush remaining progress.
@@ -947,20 +951,30 @@ def _migrate_tables_in_parallel(
 
         total_workers = min(table_parallelism, len(work_units))
 
-        # Pre-pass: DROP+recreate sharded tables that are in replace_tables
-        # BEFORE spawning workers (so shards load into empty tables).
+        # Pre-pass: DROP+recreate EVERY replace table BEFORE spawning workers, and do
+        # it SERIALLY. DSQL runs one DDL per transaction under optimistic concurrency;
+        # if N table workers each recreated their own table at once on startup they
+        # contend on the shared schema catalog and raise OC001 (40001, "schema has
+        # been updated by another transaction"), which can exhaust the DDL retry
+        # budget and fail a table before a single row loads. The DROP+CREATE is
+        # metadata-only, so doing it here (sequential, ~one connect per table) removes
+        # that startup DDL storm at the source. Workers then load into the already-
+        # empty target WITHOUT re-running the DDL (they derive the same post-load
+        # secondary-index DDLs from the applied conversion) -- the same way sharded
+        # tables have always been pre-recreated here.
         table_recreator = _default_table_recreator(migrator._inputs)
-        sharded_table_names = {
-            wu[1].name for wu in work_units if wu[0] == "shard"
-        }
-        for tname in sharded_table_names:
+        recreated_names: set[str] = set()
+        for wu in work_units:
+            tbl = wu[1]
+            if tbl.name in recreated_names:
+                continue
             is_replace = (
                 not migrator._inputs.cdc_coexisting
-                and tname in migrator._inputs.replace_tables
+                and tbl.name in migrator._inputs.replace_tables
             )
             if is_replace:
-                tbl = next(t for t in tables if t.name == tname)
                 table_recreator(tbl)
+                recreated_names.add(tbl.name)
 
         ctx = multiprocessing.get_context("spawn")
         progress_queue: multiprocessing.Queue = ctx.Queue()
@@ -996,7 +1010,8 @@ def _migrate_tables_in_parallel(
                         table = wu[1]
                         handle.update(lambda job, n=table.name: _start_chunk(job, n))
                         args = _TableWorkerArgs(
-                            job_id=job_id, table=table, inputs=migrator._inputs
+                            job_id=job_id, table=table, inputs=migrator._inputs,
+                            pre_recreated=table.name in recreated_names,
                         )
                         f = pool.submit(_migrate_one_table_in_process, args)
                         futures[f] = ("table", table.name)
@@ -1637,6 +1652,7 @@ class BatchedTableMigrator:
         *,
         on_rows: Optional[Callable[[int, int], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
+        pre_recreated: bool = False,
     ) -> TableLoadResult:
         """Stream ``table`` from the source and load it via batched INSERTs.
 
@@ -1739,7 +1755,16 @@ class BatchedTableMigrator:
             rows = _shard_stream(lo, hi)
 
         if is_replace:
-            index_ddls = self._table_recreator(table)
+            if pre_recreated:
+                # The parent already DROP+recreated this empty target in the serial
+                # pre-pass (avoiding a concurrent-DDL catalog storm at startup). Don't
+                # re-run the DDL; derive the same secondary-index DDLs from the applied
+                # conversion so they are still (re)created after the load.
+                index_ddls = (
+                    list(applied.index_ddls) if applied is not None else []
+                )
+            else:
+                index_ddls = self._table_recreator(table)
             # Clean load into a freshly-emptied target: plain INSERT (no ON
             # CONFLICT) -- DSQL never silently drops a non-conflicting row. The
             # target was just recreated from the applied DDL, so target_key_columns

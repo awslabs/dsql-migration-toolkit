@@ -634,6 +634,49 @@ def test_batched_table_migrator_recreates_replace_tables_and_passes_index_ddls()
     assert importer.on_conflict_by_table["customers"] is OnConflictMode.SKIP_EXISTING
 
 
+def test_pre_recreated_replace_table_skips_ddl_but_keeps_replace_semantics() -> None:
+    # BUG-B: when the parent already DROP+recreated the table in the serial pre-pass
+    # (pre_recreated=True), the worker must NOT re-run the DDL -- re-running it
+    # concurrently across workers is exactly the startup catalog storm (OC001). The
+    # load still uses the replace path (plain INSERT NONE) and the post-load index
+    # DDLs are derived from the applied conversion instead of from a recreate call.
+    import dataclasses
+
+    from dsql_migrator.core.converter import TableConversion
+
+    exporter = _FakeExporter()
+    importer = _FakeImporter()
+    recreated: list[str] = []
+
+    applied = TableConversion(
+        table="orders",
+        target_ddl='CREATE TABLE "orders" ("id" bigint PRIMARY KEY)',
+        index_ddls=["CREATE INDEX ASYNC ix_orders_x"],
+    )
+    inputs = dataclasses.replace(
+        _inputs(),
+        replace_tables=frozenset({"orders"}),
+        table_conversions={"orders": applied},
+    )
+    migrator = BatchedTableMigrator(
+        inputs,
+        exporter=exporter,  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _inputs: importer,  # type: ignore[arg-type,return-value]
+        table_recreator=lambda t: recreated.append(t.name) or ["SHOULD NOT BE USED"],
+        target_counter=lambda _t: None,
+    )
+
+    migrator.migrate_table(_tables()[0], pre_recreated=True)  # orders (replace)
+
+    # The recreator was NOT called (no per-worker DDL storm)...
+    assert recreated == []
+    # ...but the load is still a clean replace (plain INSERT), and the index DDLs
+    # come from the applied conversion, not from the (skipped) recreate.
+    assert importer.on_conflict_by_table["orders"] is OnConflictMode.NONE
+    assert importer.index_ddls_by_table["orders"] == ["CREATE INDEX ASYNC ix_orders_x"]
+
+
 def test_replace_load_passes_target_composite_pk_to_importer() -> None:
     # Phase 0: on a fresh (replace) load, migrate_table parses the PK out of the
     # APPLIED target DDL and passes it to the importer as key_columns, so a

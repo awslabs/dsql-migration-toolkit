@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.116
+
+### Fixed
+
+- **모든 replace 테이블을 병렬 데이터 로드 시작 전에 한 번, 순차적으로 DROP+recreate** 하도록
+  바꿔 최대 병렬에서의 startup DDL storm을 막았습니다. 기존에는 각 테이블 워커가 자기 프로세스
+  안에서 타깃을 recreate해서, 높은 table-parallelism에선 모든 워커가 동시에 공유 스키마 카탈로그에
+  `CREATE SCHEMA`/`DROP`/`CREATE`를 실행했습니다. DSQL은 트랜잭션당 DDL 하나를 낙관적 동시성으로
+  처리하므로 이 동시 카탈로그 쓰기가 OC001(`SQLSTATE 40001`, "schema has been updated by another
+  transaction")로 충돌하고, DDL 재시도 예산을 소진해 한 행도 적재하기 전에 테이블을 실패시킬 수
+  있었습니다. 이제 메타데이터 전용 DROP+recreate를 기존 pre-pass에서 (sharded뿐 아니라) **모든**
+  replace 테이블에 대해 수행하고, 워커는 이미 비워진 타깃에 DDL을 다시 실행하지 않고 로드합니다
+  (post-load `CREATE INDEX ASYNC` DDL은 적용된 conversion에서 그대로 유도). 최대 병렬 Full Load가
+  카탈로그를 경합하지 않고 결정적으로 시작됩니다.
+
 ## v0.1.115
 
 ### Fixed

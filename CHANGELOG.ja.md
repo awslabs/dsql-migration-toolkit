@@ -5,6 +5,22 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.116
+
+### Fixed
+
+- **すべての replace テーブルを、並列データロード開始前に一度、順次 DROP+recreate** するように
+  変更し、最大並列時のスタートアップ DDL ストームを解消しました。従来は各テーブルワーカーが自身の
+  プロセス内でターゲットを recreate していたため、高い table-parallelism では全ワーカーが同時に
+  共有スキーマカタログへ `CREATE SCHEMA`/`DROP`/`CREATE` を発行していました。DSQL はトランザクション
+  あたり 1 つの DDL を楽観的並行性で処理するため、この同時カタログ書き込みが OC001
+  (`SQLSTATE 40001`、"schema has been updated by another transaction")で競合し、DDL 再試行の予算を
+  使い切って 1 行もロードする前にテーブルを失敗させることがありました。メタデータのみの
+  DROP+recreate を既存の pre-pass で(シャード分割済みだけでなく)**すべて**の replace テーブルに
+  対して実行し、ワーカーは既に空のターゲットへ DDL を再実行せずにロードします(ロード後の
+  `CREATE INDEX ASYNC` DDL は適用済みの変換から導出)。最大並列の Full Load がカタログを競合させず
+  決定的に開始します。
+
 ## v0.1.115
 
 ### Fixed

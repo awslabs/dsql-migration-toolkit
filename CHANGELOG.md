@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.116
+
+### Fixed
+
+- **Every replace table is now DROP+recreated once, serially, before the parallel
+  data load starts** — closing a startup DDL storm at maximum parallelism. Each
+  table worker used to recreate its own target inside its process, so at high
+  table-parallelism all workers issued `CREATE SCHEMA` / `DROP` / `CREATE` against
+  the shared schema catalog at once. DSQL runs one DDL per transaction under
+  optimistic concurrency, so those concurrent catalog writes conflict with OC001
+  (`SQLSTATE 40001`, "schema has been updated by another transaction") and could
+  exhaust the DDL retry budget, failing a table before a single row loaded. The
+  DROP+recreate (metadata-only) now runs in the existing pre-pass for **all**
+  replace tables, not just sharded ones; workers load into the already-empty target
+  without re-running the DDL (they derive the same post-load `CREATE INDEX ASYNC`
+  DDLs from the applied conversion). This makes a max-parallelism Full Load start
+  deterministically instead of racing the catalog.
+
 ## v0.1.115
 
 ### Fixed
