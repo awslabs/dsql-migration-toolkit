@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.114
+
+### Changed
+
+- **The OCC/connection retry loop now logs its retries and give-ups**, so a
+  batch failure is diagnosable directly instead of inferred from timing.
+  `with_occ_retry` was silent; it now logs each retry at DEBUG (attempt N/max, the
+  error type + SQLSTATE, and the backoff delay) and, when the budget is exhausted,
+  a WARNING with the **attempt count, total elapsed time, and the last error +
+  SQLSTATE**. That WARNING is the direct evidence needed to tell apart *"the retry
+  budget was too small"* from *"the transient storm lasted longer than the budget"*
+  from *"the error wasn't retryable"* — e.g. `occ-retry gave up after 30 attempts
+  over 131.4s; last=ConnectionTimeout sqlstate=None`. Purely additive logging; no
+  behavior change to the retry itself.
+
 ## v0.1.113
 
 ### Changed

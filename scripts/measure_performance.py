@@ -456,6 +456,18 @@ def cmd_full_load(args) -> int:
     prev_level = importer_logger.level
     importer_logger.setLevel(logging.DEBUG)
     importer_logger.addHandler(counter)
+    # Surface the retry-loop diagnostics (per-attempt DEBUG + give-up WARNING) to
+    # stdout/CloudWatch via a dedicated handler on the occ logger: which error, its
+    # SQLSTATE, attempt count, and total elapsed per failed batch -- direct evidence
+    # of WHY a batch failed (budget too small vs a storm longer than the budget vs a
+    # non-transient error), instead of inferring from timing.
+    occ_logger = logging.getLogger("dsql_migrator.core.occ")
+    prev_occ_level = occ_logger.level
+    occ_logger.setLevel(logging.DEBUG)
+    _occ_handler = logging.StreamHandler(sys.stdout)
+    _occ_handler.setFormatter(logging.Formatter("[occ] %(levelname)s %(message)s"))
+    occ_logger.addHandler(_occ_handler)
+    occ_logger.propagate = False
 
     # --composite-leading COL: measure the COMPOSITE-KEY variant. Convert each
     # wanted table with the COMPOSITE_KEY strategy (leading column COL prepended to

@@ -5,6 +5,19 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.114
+
+### Changed
+
+- **OCC/接続リトライループがリトライと give-up をログ出力する**ようになり、バッチ
+  失敗をタイミング推論ではなくログで直接診断できます。`with_occ_retry` は無音でしたが、
+  各リトライを DEBUG(attempt N/max、エラー型 + SQLSTATE、バックオフ遅延)で、予算
+  枯渇時に WARNING(**リトライ回数、総経過時間、最後のエラー + SQLSTATE**)で記録します。
+  この WARNING が *「リトライ予算が小さすぎた」* vs *「一時的ストームが予算より長かった」*
+  vs *「リトライ不可のエラーだった」* を区別する直接的証拠です — 例:
+  `occ-retry gave up after 30 attempts over 131.4s; last=ConnectionTimeout
+  sqlstate=None`。純粋に追加のログであり、リトライ動作自体は変更なし。
+
 ## v0.1.113
 
 ### Changed

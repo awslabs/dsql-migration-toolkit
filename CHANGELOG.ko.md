@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.114
+
+### Changed
+
+- **OCC/연결 재시도 루프가 재시도와 give-up을 로깅**하도록 해, 배치 실패를 타이밍
+  추론이 아니라 로그로 직접 진단할 수 있습니다. `with_occ_retry`는 조용했지만, 이제
+  각 재시도를 DEBUG(attempt N/max, 에러 타입 + SQLSTATE, 백오프 지연)로, budget
+  소진 시 WARNING(**재시도 횟수, 총 경과 시간, 마지막 에러 + SQLSTATE**)으로
+  남깁니다. 이 WARNING이 *"재시도 budget이 부족했다"* vs *"일시적 스톰이 budget보다
+  길었다"* vs *"재시도 불가 에러였다"* 를 구분하는 직접 증거입니다 — 예:
+  `occ-retry gave up after 30 attempts over 131.4s; last=ConnectionTimeout
+  sqlstate=None`. 순수 추가 로깅이며 재시도 동작 자체는 변경 없음.
+
 ## v0.1.113
 
 ### Changed

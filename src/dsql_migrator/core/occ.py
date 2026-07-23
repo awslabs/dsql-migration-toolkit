@@ -35,9 +35,12 @@ does not provide a generalized retry framework.
 from __future__ import annotations
 
 import functools
+import logging
 import random
 import time
 from typing import Callable, Optional, TypeVar
+
+_LOGGER = logging.getLogger(__name__)
 
 # SQLSTATE class for an optimistic-concurrency / serialization failure in DSQL.
 OCC_SQLSTATE = "40001"
@@ -111,6 +114,7 @@ def with_occ_retry(
         @functools.wraps(operation)
         def wrapper(*args: object, **kwargs: object) -> T:
             last_conflict: Optional[Exception] = None
+            started = time.monotonic()
             for attempt in range(max_attempts):
                 try:
                     return operation(*args, **kwargs)
@@ -120,9 +124,29 @@ def with_occ_retry(
                     last_conflict = exc
                     if attempt + 1 >= max_attempts:
                         break
-                    sleep(_backoff_delay(attempt, base_delay, max_delay, jitter))
-            # Retries exhausted: surface the last error (Property 5).
+                    delay = _backoff_delay(attempt, base_delay, max_delay, jitter)
+                    # Per-attempt trace (DEBUG): which error, its SQLSTATE, and the
+                    # backoff — so a diagnostic run can see exactly how a batch was
+                    # retried (e.g. every attempt a ConnectionTimeout during a storm).
+                    _LOGGER.debug(
+                        "occ-retry %d/%d after %s (sqlstate=%s) -> backoff %.2fs",
+                        attempt + 1, max_attempts, type(exc).__name__,
+                        getattr(exc, "sqlstate", None), delay,
+                    )
+                    sleep(delay)
+            # Retries exhausted: surface the last error (Property 5). Log the
+            # give-up at WARNING (always visible, no DEBUG needed) with the attempt
+            # count, total elapsed, and last error/SQLSTATE -- direct evidence of
+            # WHY a batch finally failed (budget too small vs a storm longer than
+            # the budget vs a non-transient error), instead of inferring from timing.
             assert last_conflict is not None  # loop ran at least once
+            _LOGGER.warning(
+                "occ-retry gave up after %d attempts over %.1fs; last=%s sqlstate=%s: %s",
+                max_attempts, time.monotonic() - started,
+                type(last_conflict).__name__,
+                getattr(last_conflict, "sqlstate", None),
+                (str(last_conflict).splitlines() or [""])[0][:160],
+            )
             raise last_conflict
 
         return wrapper

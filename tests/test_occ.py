@@ -159,6 +159,27 @@ def test_reraises_after_max_attempts_when_always_conflicting() -> None:
     assert len(sleeper.delays) == 3  # no sleep after the final failed attempt
 
 
+def test_giveup_logs_warning_with_attempts_and_last_error(caplog) -> None:
+    # On exhaustion, a WARNING is logged with the attempt count and last error so a
+    # diagnostic run shows WHY a batch finally failed (budget vs storm) without
+    # relying on DEBUG level or timing inference.
+    import logging
+
+    operation = _FlakyOperation(failures=1000)  # always conflicts
+    decorated = with_occ_retry(
+        max_attempts=4, sleep=_SleepRecorder(), jitter=_constant_jitter(0.5)
+    )(operation)
+    with caplog.at_level(logging.WARNING, logger="dsql_migrator.core.occ"):
+        with pytest.raises(_FakeSerializationFailure):
+            decorated()
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, "expected a give-up WARNING"
+    msg = warnings[-1].getMessage()
+    assert "gave up after 4 attempts" in msg
+    assert "_FakeSerializationFailure" in msg
+    assert OCC_SQLSTATE in msg
+
+
 def test_single_attempt_does_not_sleep_and_reraises() -> None:
     operation = _FlakyOperation(failures=1000)
     sleeper = _SleepRecorder()
