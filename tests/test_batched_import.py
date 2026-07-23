@@ -1216,6 +1216,47 @@ def test_transient_connection_error_is_retried_and_recovers() -> None:
     assert result.rows_loaded == 3
 
 
+def test_ssl_eof_drop_without_sqlstate_is_transient_and_retryable() -> None:
+    # The exact production failure: a mid-query TLS teardown surfaces as a psycopg
+    # OperationalError with NO sqlstate. It MUST be classified transient (retryable)
+    # so the loader reconnects + replays the idempotent batch, instead of failing
+    # the whole table. Regression guard for the class-08-only under-classification.
+    from dsql_migrator.core.batched_import import (
+        _is_retryable_load_error,
+        _is_transient_connection_error,
+    )
+
+    class _ConnDrop(Exception):
+        sqlstate = None
+
+    exc = _ConnDrop(
+        "sending prepared query failed: SSL error: unexpected eof while reading"
+    )
+    assert _is_transient_connection_error(exc) is True
+    assert _is_retryable_load_error(exc) is True
+
+
+def test_transient_classifier_positives_and_negatives() -> None:
+    from dsql_migrator.core.batched_import import _is_transient_connection_error
+
+    class _E(Exception):
+        def __init__(self, msg: str, state):
+            super().__init__(msg)
+            self.sqlstate = state
+
+    # class-08 (server-reported connection exception) stays transient
+    assert _is_transient_connection_error(_E("connection failure", "08006")) is True
+    # other no-sqlstate connection-lost signatures
+    assert _is_transient_connection_error(
+        _E("server closed the connection unexpectedly", None)) is True
+    assert _is_transient_connection_error(_E("connection reset by peer", None)) is True
+    # a real DATA error carries a (non-08) sqlstate -> NOT transient
+    assert _is_transient_connection_error(_E("invalid input syntax", "22P02")) is False
+    # a structural error with NO sqlstate but NOT a connection drop -> NOT transient
+    # (must not be retried forever / must surface as a real failure)
+    assert _is_transient_connection_error(_E("table has no primary key", None)) is False
+
+
 def test_poison_row_is_isolated_and_the_rest_loads() -> None:
     store = _FakeStore()
     store.poison_keys = {(1,)}  # id=1 permanently fails to insert (data error)

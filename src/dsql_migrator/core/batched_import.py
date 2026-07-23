@@ -172,17 +172,61 @@ def _prefetch_enabled() -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
-def _is_transient_connection_error(exc: BaseException) -> bool:
-    """True for a transient connection-level error (SQLSTATE class ``08``).
+# Connection-lost signatures for a drop that carries NO SQLSTATE. When the TLS
+# socket is torn down MID-QUERY the server never sends an error code, so psycopg
+# raises an OperationalError with ``sqlstate=None`` and only a libpq/OpenSSL
+# message like "SSL error: unexpected eof while reading" or "server closed the
+# connection unexpectedly". The class-08 check below misses these (there is no
+# SQLSTATE to classify), so they are matched by message here. Lowercase substrings.
+_TRANSIENT_CONN_SIGNATURES = (
+    "ssl error",
+    "unexpected eof",
+    "eof detected",
+    "server closed the connection",
+    "connection already closed",
+    "connection is closed",
+    "connection is lost",
+    "connection reset",
+    "consuming input failed",
+    "could not receive data",
+    "could not send data",
+    "terminating connection",
+    "broken pipe",
+    "no connection to the server",
+    "connection not open",
+)
 
-    A dropped/closed connection or an expired short-lived IAM token surfaces as a
-    class-08 connection exception. The batched loader leases a FRESH connection
-    per retry (the pool discards a failed one on lease exit), so retrying after
-    the reconnect -- which re-mints the IAM token via the factory -- recovers
-    without data loss (each batch is an idempotent, atomic statement).
+
+def _is_transient_connection_error(exc: BaseException) -> bool:
+    """True for a transient connection-level error the loader can recover from.
+
+    Two shapes, both recoverable by leasing a FRESH connection and replaying the
+    (idempotent, atomic) batch:
+
+    1. **SQLSTATE class ``08``** -- a connection exception the server reported
+       (e.g. an expired short-lived IAM token, admin-closed connection).
+    2. **A mid-query connection drop with NO SQLSTATE** -- a TLS teardown / reset
+       socket surfaces as a psycopg ``OperationalError`` whose ``sqlstate`` is
+       ``None`` and whose message matches :data:`_TRANSIENT_CONN_SIGNATURES`
+       (e.g. "SSL error: unexpected eof while reading"). This class was previously
+       MISCLASSIFIED as permanent -- keying only on class ``08`` -- so a transient
+       drop (common under high write parallelism, when DSQL severs connections at
+       peak pressure) failed the whole table instead of reconnecting and retrying.
+
+    The batched loader leases a FRESH connection per retry (the pool discards a
+    failed one on lease exit) and each batch is an idempotent
+    ``INSERT ... ON CONFLICT``, so retrying after a drop recovers without data loss.
     """
     state = getattr(exc, "sqlstate", None)
-    return isinstance(state, str) and state.startswith("08")
+    if isinstance(state, str) and state.startswith("08"):
+        return True
+    # No SQLSTATE => the server never answered (connection died mid-flight, not a
+    # row/constraint error, which always carries a SQLSTATE). Match the drop by its
+    # libpq/OpenSSL message so a recoverable teardown is retried, not failed.
+    if state is None:
+        message = str(exc).lower()
+        return any(sig in message for sig in _TRANSIENT_CONN_SIGNATURES)
+    return False
 
 
 def _is_retryable_load_error(exc: BaseException) -> bool:

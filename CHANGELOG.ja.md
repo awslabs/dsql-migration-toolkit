@@ -5,6 +5,28 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.110
+
+### Fixed
+
+- **Full Load が、SQLSTATE を伴わないクエリ実行中の接続ドロップ(TLS 切断など)で
+  テーブル全体を失敗させず復旧するようになりました。** バッチローダーは一時的な接続
+  ドロップを新しい接続で冪等バッチを再実行してリトライする設計ですが、
+  `_is_transient_connection_error` はサーバーが報告した **SQLSTATE クラス `08`** の
+  ドロップしか認識していませんでした。TLS ソケットがクエリ実行中に切断されると
+  サーバーはエラーコードを送れず、psycopg は `sqlstate=None` の `OperationalError` と
+  *"SSL error: unexpected eof while reading"* / *"server closed the connection
+  unexpectedly"* のようなメッセージのみを投げます。これらが**恒久的エラーと誤分類**
+  され → リトライされず → バッチ(およびテーブル全体)が失敗していました。特に高い
+  書き込み並列度で顕著(同時接続が多いほど DSQL がピーク時に一部接続を切断):
+  in-VPC の 1TB ロードを `table_parallelism=16 × batch_parallelism=32`(512 接続)で
+  実行したところ、完了間際に 16/20 テーブルが `SSL error: unexpected eof` で失われ
+  ました。分類器が **SQLSTATE の無い接続喪失エラー**(libpq/OpenSSL のドロップ
+  シグネチャで一致)も一時的として扱い、再接続・リトライするようになりました — CDC
+  sink の一時的再接続に対応する Full Load 版です。SQLSTATE を持つ実データ/制約
+  エラーや、接続ドロップでない SQLSTATE 無し構造エラーは影響なし(引き続き表面化し、
+  無限リトライしません)。
+
 ## v0.1.109
 
 ### Changed

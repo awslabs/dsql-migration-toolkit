@@ -5,6 +5,26 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.110
+
+### Fixed
+
+- **Full Load가 SQLSTATE 없는 쿼리 도중 연결 드롭(예: TLS 끊김)에서 테이블 전체를
+  실패시키지 않고 복구하도록 수정했습니다.** 배치 로더는 일시적 연결 드롭을 새
+  연결로 멱등 배치를 재실행해 재시도하도록 설계돼 있지만, `_is_transient_connection_error`가
+  **서버가 보고한 SQLSTATE class `08`** 만 인정했습니다. TLS 소켓이 쿼리 도중 끊기면
+  서버가 에러 코드를 못 보내 psycopg가 `sqlstate=None` 인 `OperationalError`와
+  *"SSL error: unexpected eof while reading"* / *"server closed the connection
+  unexpectedly"* 같은 메시지만 던집니다. 이게 **영구 오류로 오분류** → 재시도 안 함
+  → 배치(및 테이블 전체) 실패로 이어졌습니다. 특히 높은 쓰기 병렬수에서 심각(동시
+  연결이 많을수록 DSQL이 피크에 일부 연결을 끊음): in-VPC 1TB 적재를
+  `table_parallelism=16 × batch_parallelism=32`(512 연결)로 돌리자 완료 직전
+  16/20 테이블이 `SSL error: unexpected eof`로 유실됐습니다. 이제 분류기가
+  **SQLSTATE 없는 연결 끊김 오류**(libpq/OpenSSL 드롭 시그니처로 매칭)도 transient로
+  인정해 재연결·재시도합니다 — CDC sink의 transient 재연결에 대응하는 Full Load판.
+  SQLSTATE를 가진 실제 데이터/제약 오류나, 연결 드롭이 아닌 SQLSTATE 없는 구조적
+  오류는 영향 없음(계속 표면화, 무한 재시도 안 함).
+
 ## v0.1.109
 
 ### Changed

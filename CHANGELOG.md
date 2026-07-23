@@ -5,6 +5,30 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.110
+
+### Fixed
+
+- **Full Load now recovers from a mid-query connection drop that carries no
+  SQLSTATE (e.g. a TLS teardown), instead of failing the whole table.** The
+  batched loader is designed to retry a transient connection drop by leasing a
+  fresh connection and replaying the idempotent batch — but `_is_transient_connection_error`
+  only recognized drops the server reported with a **SQLSTATE class `08`**. When
+  the TLS socket is severed mid-query the server never sends an error code, so
+  psycopg raises an `OperationalError` with `sqlstate=None` and a libpq/OpenSSL
+  message like *"SSL error: unexpected eof while reading"* / *"server closed the
+  connection unexpectedly"*. Those were **mis-classified as permanent** → not
+  retried → the batch (and the whole table) failed. This bit hardest under high
+  write parallelism (many concurrent connections → DSQL severs some at peak
+  pressure): an in-VPC 1 TB load at `table_parallelism=16 × batch_parallelism=32`
+  (512 connections) lost 16/20 tables near completion to `SSL error: unexpected
+  eof`. The classifier now also treats a **no-SQLSTATE connection-lost error**
+  (matched by libpq/OpenSSL drop signatures) as transient, so the loader
+  reconnects and retries — the Full Load analogue of the CDC sink's transient
+  reconnect. A real data/constraint error (which always carries a SQLSTATE) and a
+  structural error with no SQLSTATE that isn't a connection drop are unaffected
+  (still surface, never retried forever).
+
 ## v0.1.109
 
 ### Changed
