@@ -194,6 +194,9 @@ _TRANSIENT_CONN_SIGNATURES = (
     "broken pipe",
     "no connection to the server",
     "connection not open",
+    "connection timeout expired",
+    "timeout expired",
+    "timed out",
 )
 
 
@@ -220,10 +223,22 @@ def _is_transient_connection_error(exc: BaseException) -> bool:
     state = getattr(exc, "sqlstate", None)
     if isinstance(state, str) and state.startswith("08"):
         return True
-    # No SQLSTATE => the server never answered (connection died mid-flight, not a
-    # row/constraint error, which always carries a SQLSTATE). Match the drop by its
-    # libpq/OpenSSL message so a recoverable teardown is retried, not failed.
+    # No SQLSTATE => the server never answered. A genuine row/constraint error
+    # ALWAYS carries a SQLSTATE, so a psycopg connection error with sqlstate=None is
+    # a connection/network failure (dropped socket, TLS teardown, connect timeout,
+    # unreachable address) -- all recoverable by reconnecting and replaying the
+    # idempotent batch. Treat ANY psycopg OperationalError/InterfaceError as
+    # transient (not just known message signatures -- the failure mode varies:
+    # "SSL error: unexpected eof", "Network is unreachable", "connection timeout
+    # expired", …). The exception TYPE gates this so the loader's own no-SQLSTATE
+    # structural errors (BatchedImportError/ValueError) are NOT retried.
     if state is None:
+        module = (type(exc).__module__ or "")
+        name = type(exc).__name__
+        if module.startswith("psycopg") or name in ("OperationalError", "InterfaceError"):
+            return True
+        # Fallback for a wrapped/re-raised connection error (type info lost): match
+        # the libpq/OpenSSL message signature.
         message = str(exc).lower()
         return any(sig in message for sig in _TRANSIENT_CONN_SIGNATURES)
     return False

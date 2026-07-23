@@ -5,6 +5,22 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.112
+
+### Fixed
+
+- **Full Load가 알려진 메시지 시그니처뿐 아니라 SQLSTATE 없는 연결 오류를 전부
+  재시도합니다.** v0.1.110에서 SQLSTATE 없는 연결 드롭을 재시도하도록 했지만
+  libpq/OpenSSL 메시지 부분문자열 목록으로 매칭했습니다. 높은 병렬도의 연결 폭풍
+  (여러 테이블이 동시에 끝나며 수백 개 동시 연결)에서 DSQL은 드롭을 *다양한* 형태로
+  던집니다 — "SSL error: unexpected eof", "Network is unreachable", 그리고
+  **"connection timeout expired"** — 목록에 없는 메시지는 영구 실패로 새어나갔습니다
+  (512 연결 1TB 실행이 `connection timeout expired`로 테이블을 잃음). 이제 분류기가
+  **`sqlstate=None`인 psycopg `OperationalError`/`InterfaceError`는 전부** 일시적
+  연결 오류로 취급하며(실제 데이터/제약 오류는 항상 SQLSTATE를 가짐), 예외 타입으로
+  게이트해 도구 자체의 SQLSTATE 없는 구조적 오류는 여전히 재시도하지 않습니다.
+  메시지 시그니처 목록은 타입이 유실된 래핑 오류용 폴백으로만 유지합니다.
+
 ## v0.1.111
 
 ### Fixed

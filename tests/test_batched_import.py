@@ -1257,6 +1257,35 @@ def test_transient_classifier_positives_and_negatives() -> None:
     assert _is_transient_connection_error(_E("table has no primary key", None)) is False
 
 
+def test_any_psycopg_no_sqlstate_connection_error_is_transient() -> None:
+    # The robust rule: a psycopg OperationalError/InterfaceError with NO sqlstate is
+    # a connection/network failure whatever the message (dropped socket, TLS eof,
+    # unreachable IPv6, "connection timeout expired", ...). Gate on TYPE so the
+    # tool's own no-sqlstate structural errors are NOT retried. Simulate psycopg by
+    # class name (avoids importing psycopg into the test).
+    from dsql_migrator.core.batched_import import _is_transient_connection_error
+
+    class OperationalError(Exception):
+        sqlstate = None
+
+    class InterfaceError(Exception):
+        sqlstate = None
+
+    # A message the signature list does NOT contain -> still transient by type.
+    assert _is_transient_connection_error(
+        OperationalError("connection timeout expired")) is True
+    assert _is_transient_connection_error(
+        OperationalError("something totally novel about the socket")) is True
+    assert _is_transient_connection_error(InterfaceError("the connection is bad")) is True
+
+    # A NON-connection exception type with no sqlstate is still NOT transient.
+    class BatchedImportError(Exception):
+        sqlstate = None
+
+    assert _is_transient_connection_error(
+        BatchedImportError("table has no primary key")) is False
+
+
 def test_poison_row_is_isolated_and_the_rest_loads() -> None:
     store = _FakeStore()
     store.poison_keys = {(1,)}  # id=1 permanently fails to insert (data error)

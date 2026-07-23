@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.112
+
+### Fixed
+
+- **Full Load now retries ANY no-SQLSTATE connection error, not just known
+  message signatures.** v0.1.110 taught the loader to retry connection drops that
+  carry no SQLSTATE, but matched them by a fixed list of libpq/OpenSSL message
+  substrings. Under a high-parallelism connection storm (many tables finishing at
+  once → hundreds of concurrent connections), DSQL surfaces the drop in *varying*
+  forms — "SSL error: unexpected eof", "Network is unreachable", and
+  **"connection timeout expired"** — and any message the list didn't contain
+  slipped through as a permanent failure (a 1 TB run at 512 connections lost
+  tables to `connection timeout expired`). The classifier now treats **any
+  psycopg `OperationalError`/`InterfaceError` with `sqlstate=None`** as a transient
+  connection failure (a genuine data/constraint error always carries a SQLSTATE),
+  gated on the exception type so the tool's own no-SQLSTATE structural errors are
+  still never retried. The message-signature list is kept only as a fallback for a
+  wrapped/re-raised error whose type was lost.
+
 ## v0.1.111
 
 ### Fixed

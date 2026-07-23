@@ -5,6 +5,23 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.112
+
+### Fixed
+
+- **Full Load が、既知のメッセージシグネチャだけでなく SQLSTATE の無い接続エラーを
+  すべてリトライするようになりました。** v0.1.110 で SQLSTATE の無い接続ドロップを
+  リトライするようにしましたが、libpq/OpenSSL のメッセージ部分文字列リストで照合して
+  いました。高並列の接続ストーム(多数のテーブルが同時に完了し数百の同時接続)では
+  DSQL はドロップを様々な形で返します — "SSL error: unexpected eof"、"Network is
+  unreachable"、そして **"connection timeout expired"** — リストに無いメッセージは
+  恒久的失敗としてすり抜けていました(512 接続の 1TB 実行が `connection timeout
+  expired` でテーブルを失った)。分類器は **`sqlstate=None` の psycopg
+  `OperationalError`/`InterfaceError` をすべて**一時的な接続エラーとして扱うように
+  なり(実データ/制約エラーは常に SQLSTATE を持つ)、例外の型でゲートするため、ツール
+  自身の SQLSTATE 無し構造エラーは引き続きリトライしません。メッセージシグネチャ
+  リストは型情報が失われたラップ済みエラー用のフォールバックとしてのみ残します。
+
 ## v0.1.111
 
 ### Fixed
