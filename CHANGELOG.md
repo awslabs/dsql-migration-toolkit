@@ -5,6 +5,26 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.111
+
+### Fixed
+
+- **DSQL connections are now pinned to IPv4, so a reconnect in an IPv4-only
+  network can't fail on the endpoint's unreachable IPv6 address.** Aurora DSQL
+  endpoints are dual-stack (A + AAAA records). In an IPv4-only VPC (e.g. an ECS
+  task with no IPv6 egress), a reconnect that libpq routes to the IPv6 (AAAA)
+  address fails with *"connection to server at … failed: Network is
+  unreachable"*. That normally stays hidden — until a transient DSQL event (e.g.
+  a brief `XX000 server unavailable`) forces many reconnects at once, at which
+  point the IPv6 attempts fail an in-flight Full Load even though IPv4 is
+  perfectly reachable (observed: a 1 TB in-VPC load lost tables to IPv6
+  `Network is unreachable` right after a DSQL blip). `DsqlConnector.connect` now
+  resolves the endpoint's IPv4 address and passes it as `hostaddr` (the DNS name
+  stays as `host` for TLS SNI / certificate verification), so every connect and
+  reconnect stays on the reachable address family. It falls back to the previous
+  host-based resolution when no IPv4 is available (an IPv6-only environment is
+  unaffected). Covers all DSQL connections — Full Load, Validation, and probes.
+
 ## v0.1.110
 
 ### Fixed

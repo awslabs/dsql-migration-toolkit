@@ -118,12 +118,16 @@ def _connector(
     connect: _ConnectRecorder | None = None,
     clock: _ManualClock | None = None,
     config: TargetConnectionConfig | None = None,
+    ipv4_resolver=None,
 ) -> DsqlConnector:
     return DsqlConnector(
         config or _target_config(),
         token_generator=generator or _RecordingTokenGenerator(),
         connect_factory=connect or _ConnectRecorder(),
         clock=clock or _ManualClock(),
+        # Default to a no-IPv4 resolver so unit tests do NO real DNS (host-only
+        # connect, the pre-pinning behavior). Specific tests inject an IPv4.
+        ipv4_resolver=ipv4_resolver if ipv4_resolver is not None else (lambda _host: None),
     )
 
 
@@ -149,6 +153,28 @@ def test_connect_uses_generated_token_as_password() -> None:
     assert kwargs["password"] == "iam-token-1"
     assert kwargs["user"] == "admin"
     assert kwargs["dbname"] == "postgres"
+    assert kwargs["host"] == "my-cluster.dsql.us-east-1.on.aws"
+
+
+def test_connect_pins_ipv4_via_hostaddr_when_resolvable() -> None:
+    # DSQL is dual-stack; in an IPv4-only network a reconnect to the IPv6 address
+    # fails ("Network is unreachable"). The connector pins the TCP target to the
+    # resolved IPv4 via `hostaddr`, while `host` stays the DNS name for TLS SNI.
+    connect = _ConnectRecorder()
+    connector = _connector(connect=connect, ipv4_resolver=lambda _host: "10.1.2.3")
+    connector.connect()
+    kwargs = connect.connections[0].kwargs
+    assert kwargs["hostaddr"] == "10.1.2.3"        # TCP target pinned to IPv4
+    assert kwargs["host"] == "my-cluster.dsql.us-east-1.on.aws"  # SNI/cert unchanged
+
+
+def test_connect_falls_back_to_host_when_no_ipv4() -> None:
+    # No IPv4 resolvable (e.g. IPv6-only env) -> no hostaddr, default host resolution.
+    connect = _ConnectRecorder()
+    connector = _connector(connect=connect, ipv4_resolver=lambda _host: None)
+    connector.connect()
+    kwargs = connect.connections[0].kwargs
+    assert "hostaddr" not in kwargs
     assert kwargs["host"] == "my-cluster.dsql.us-east-1.on.aws"
 
 

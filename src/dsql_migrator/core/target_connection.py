@@ -35,6 +35,7 @@ as a separate utility in a later subtask.
 
 from __future__ import annotations
 
+import socket
 import time
 from typing import Any, Callable, Optional
 
@@ -63,6 +64,36 @@ TokenGenerator = Callable[[str, str, int], str]
 
 # A connect factory mirrors ``psycopg.connect`` and returns a connection object.
 ConnectFactory = Callable[..., Any]
+
+# An IPv4 resolver maps a hostname to one of its IPv4 (A-record) addresses, or
+# None when it has no IPv4 / cannot be resolved. Injectable so unit tests never do
+# real DNS.
+Ipv4Resolver = Callable[[str], Optional[str]]
+
+
+def _resolve_ipv4(host: str) -> Optional[str]:
+    """Return an IPv4 (A-record) address for ``host``, or ``None``.
+
+    Aurora DSQL endpoints are **dual-stack** (both A and AAAA records). In an
+    IPv4-only VPC (e.g. an ECS task with no IPv6 egress), a reconnect that libpq
+    routes to the AAAA (IPv6) address fails with ``Network is unreachable`` -- and
+    when a transient DSQL event forces many reconnects at once, that can fail an
+    in-flight Full Load even though IPv4 is perfectly reachable. Resolving the
+    IPv4 here lets :meth:`DsqlConnector.connect` pin the TCP target to IPv4 via
+    ``hostaddr`` (the DNS ``host`` is still passed for TLS SNI / cert verification),
+    so every connect and reconnect stays on the reachable address family. Returns
+    ``None`` (caller falls back to default host-based resolution) if there is no
+    IPv4 or the lookup fails, so an IPv6-only environment is unaffected.
+    """
+    try:
+        infos = socket.getaddrinfo(host, 5432, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return None
+    for info in infos:
+        sockaddr = info[4]
+        if sockaddr and sockaddr[0]:
+            return sockaddr[0]
+    return None
 
 
 def _default_token_generator(
@@ -123,6 +154,7 @@ class DsqlConnector:
         refresh_margin_seconds: int = DEFAULT_REFRESH_MARGIN_SECONDS,
         connect_timeout_seconds: int = DEFAULT_CONNECT_TIMEOUT_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        ipv4_resolver: Optional[Ipv4Resolver] = None,
     ) -> None:
         """Create a connector.
 
@@ -153,6 +185,10 @@ class DsqlConnector:
         self._refresh_margin_seconds = refresh_margin_seconds
         self._connect_timeout = connect_timeout_seconds
         self._clock = clock
+        # Pin DSQL connects to IPv4 (see _resolve_ipv4) so a reconnect in an
+        # IPv4-only network never routes to an unreachable IPv6 address. Injectable
+        # so unit tests do no real DNS.
+        self._ipv4_resolver = ipv4_resolver or _resolve_ipv4
         self._cached: Optional[_CachedToken] = None
 
     def _current_token(self) -> SecretValue:
@@ -185,7 +221,16 @@ class DsqlConnector:
         in the usual sense) and uses ``sslmode=require`` (DSQL mandates TLS).
         """
         token = self._current_token()
-        connection = self._connect_factory(
+        # Pin the TCP target to IPv4 when the endpoint resolves to one: DSQL is
+        # dual-stack, and in an IPv4-only network libpq may otherwise (re)connect to
+        # the unreachable IPv6 address ("Network is unreachable"). ``hostaddr`` sets
+        # the connect IP while ``host`` stays the DNS name for TLS SNI / certificate
+        # verification. Falls back to host-only resolution when there is no IPv4.
+        try:
+            ipv4 = self._ipv4_resolver(self._config.cluster_endpoint)
+        except Exception:  # noqa: BLE001 - resolution is best-effort; fall back
+            ipv4 = None
+        connect_kwargs: dict[str, Any] = dict(
             host=self._config.cluster_endpoint,
             port=5432,
             dbname=self._config.database,
@@ -199,6 +244,9 @@ class DsqlConnector:
             # the OS default. Mirrors the source introspector's connect_timeout.
             connect_timeout=self._connect_timeout,
         )
+        if ipv4:
+            connect_kwargs["hostaddr"] = ipv4
+        connection = self._connect_factory(**connect_kwargs)
         # Defensively enforce autocommit even if the driver ignored the kwarg.
         try:
             if getattr(connection, "autocommit", True) is not True:

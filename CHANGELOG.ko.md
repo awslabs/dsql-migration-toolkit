@@ -5,6 +5,24 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.111
+
+### Fixed
+
+- **DSQL 연결을 IPv4로 고정해, IPv4-only 네트워크에서 재연결이 엔드포인트의 도달
+  불가능한 IPv6 주소로 실패하지 않도록 했습니다.** Aurora DSQL 엔드포인트는
+  dual-stack(A + AAAA 레코드)입니다. IPv4-only VPC(예: IPv6 egress가 없는 ECS
+  태스크)에서 libpq가 재연결을 IPv6(AAAA) 주소로 시도하면 *"connection to server
+  at … failed: Network is unreachable"* 로 실패합니다. 평소엔 드러나지 않다가,
+  일시적 DSQL 이벤트(예: 순간 `XX000 server unavailable`)로 재연결이 한꺼번에
+  발생할 때 IPv4가 멀쩡히 도달 가능함에도 IPv6 시도들이 진행 중인 Full Load를
+  실패시킵니다(실측: in-VPC 1TB 적재가 DSQL 블립 직후 IPv6 `Network is
+  unreachable`로 테이블들을 잃음). 이제 `DsqlConnector.connect`가 엔드포인트의 IPv4
+  주소를 resolve해 `hostaddr`로 전달(DNS 이름은 TLS SNI/인증서 검증용으로 `host`에
+  유지)하므로, 모든 연결·재연결이 도달 가능한 주소 계열에 머뭅니다. IPv4가 없으면
+  기존 host 기반 resolve로 폴백(IPv6-only 환경은 영향 없음). Full Load·Validation·
+  프로브 등 모든 DSQL 연결에 적용됩니다.
+
 ## v0.1.110
 
 ### Fixed
