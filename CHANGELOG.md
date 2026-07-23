@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.113
+
+### Changed
+
+- **Full Load's per-batch retry budget is now more patient (10 → 20) and
+  operator-tunable**, so a batch rides out a longer transient DSQL connection
+  storm instead of failing the table. The budget (`occ_max_attempts`) is shared by
+  OCC (`40001`) conflicts and the transient connection retries added in
+  v0.1.110/112; at high parallelism a connection storm at a load transition (many
+  tables finishing → a burst of reconnects) can outlast the old 10-attempt (~20s)
+  budget and exhaust it, failing a table with `ConnectionTimeout` even though the
+  error was correctly classified as retryable. Raised the default to 20 (~70s of
+  exponential-backoff retrying) — a large-scale load runs for hours and will meet
+  such a blip — and exposed it as `DSQL_MIGRATOR_FULL_LOAD_OCC_MAX_ATTEMPTS`
+  (1–100) for environments that need more. Each retry still leases a fresh
+  connection and replays the idempotent batch, so this only adds patience, never
+  duplicates.
+
 ## v0.1.112
 
 ### Fixed

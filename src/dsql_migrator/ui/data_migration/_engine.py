@@ -1480,7 +1480,15 @@ def _default_importer_factory(inputs: "DataMigrationInputs") -> BatchedImporter:
         parallelism=cfg.full_load_batch_parallelism,
         batch_size=cfg.full_load_batch_rows,
     )
-    return BatchedImporter(options, connection_factory=connector.connect)
+    # occ_max_attempts is the per-batch retry budget for BOTH OCC conflicts and
+    # transient connection failures; a large-scale load needs it patient enough to
+    # ride out a connection storm at a high-parallelism transition (config key
+    # DSQL_MIGRATOR_FULL_LOAD_OCC_MAX_ATTEMPTS).
+    return BatchedImporter(
+        options,
+        connection_factory=connector.connect,
+        occ_max_attempts=cfg.full_load_occ_max_attempts,
+    )
 
 
 # Drops and recreates one table's target from converted DDL, returning its

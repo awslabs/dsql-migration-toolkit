@@ -294,6 +294,22 @@ class AppConfig(BaseModel):
             "limits. Config key: DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS."
         ),
     )
+    full_load_occ_max_attempts: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description=(
+            "Full Load per-batch retry budget, shared by OCC (SQLSTATE 40001) "
+            "conflicts AND transient connection failures (dropped socket, TLS eof, "
+            "connect timeout). Each retry leases a FRESH connection and replays the "
+            "idempotent batch, so a batch rides out a transient DSQL blip / "
+            "connection storm instead of failing the whole table. Raised from the "
+            "generic 10 to 20 because a large-scale load runs for hours and WILL "
+            "meet a transient connection storm at a high-parallelism transition; "
+            "with exponential backoff this spans ~70s of retrying. Config key: "
+            "DSQL_MIGRATOR_FULL_LOAD_OCC_MAX_ATTEMPTS."
+        ),
+    )
     full_load_reader_shards: int = Field(
         default=1,
         ge=1,
@@ -391,6 +407,8 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> AppConfig:
         values["full_load_batch_parallelism"] = int(fl_batch_par)
     if (fl_batch_rows := _read(source, "FULL_LOAD_BATCH_ROWS")) is not None:
         values["full_load_batch_rows"] = int(fl_batch_rows)
+    if (fl_occ := _read(source, "FULL_LOAD_OCC_MAX_ATTEMPTS")) is not None:
+        values["full_load_occ_max_attempts"] = int(fl_occ)
     if (fl_shards := _read(source, "FULL_LOAD_READER_SHARDS")) is not None:
         values["full_load_reader_shards"] = int(fl_shards)
     if (fl_shard_min := _read(source, "FULL_LOAD_SHARD_MIN_ROWS")) is not None:
