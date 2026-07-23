@@ -61,8 +61,45 @@ from dsql_migrator.core.occ import (
     DEFAULT_MAX_ATTEMPTS,
     JitterFunc,
     SleepFunc,
+    is_occ_conflict,
     with_occ_retry,
 )
+from dsql_migrator.core.target_connection import is_transient_connection_error
+
+
+def _is_retryable_connect_error(exc: BaseException) -> bool:
+    """Retryable while OPENING a DSQL connection for DDL: an OCC ``40001`` or a
+    transient connection failure (dropped socket / TLS teardown / connect timeout /
+    the new-connection rate limit rejecting a connect under a burst). Lets a
+    per-table DROP+recreate connect ride out a connection storm instead of failing
+    the table -- the same resilience the batched loader's pool leases already have.
+    """
+    return is_occ_conflict(exc) or is_transient_connection_error(exc)
+
+
+def _open_connection_with_retry(
+    connection_factory: "ConnectionFactory",
+    *,
+    occ_max_attempts: int,
+    occ_base_delay: float,
+    sleep: "SleepFunc",
+    jitter: "JitterFunc",
+) -> Any:
+    """Open a fresh DSQL connection, retrying a transient connect failure.
+
+    Every DDL path here opens a brand-new connection. Opening it must tolerate a
+    connection storm (many workers connecting at once when a wave of tables
+    finishes, tripping DSQL's new-connection rate limit) exactly as the batched
+    loader's pool does -- otherwise the connect fails the whole operation before a
+    single statement runs. Backoff/jitter/attempts are the caller's OCC budget.
+    """
+    return with_occ_retry(
+        max_attempts=occ_max_attempts,
+        base_delay=occ_base_delay,
+        sleep=sleep,
+        jitter=jitter,
+        retryable=_is_retryable_connect_error,
+    )(connection_factory)()
 
 # A connection factory opens one new DSQL connection (autocommit + TLS + IAM).
 # Injectable so unit tests never reach a real cluster.
@@ -355,7 +392,13 @@ class SchemaApplier:
         recreated later by its own apply unit, so this only reorders the drop.
         """
         parsed = _parse(target_ddl)
-        connection = self._connection_factory()
+        connection = _open_connection_with_retry(
+            self._connection_factory,
+            occ_max_attempts=self._occ_max_attempts,
+            occ_base_delay=self._occ_base_delay,
+            sleep=self._sleep,
+            jitter=self._jitter,
+        )
         try:
             self._run_ddl(connection, _build_drop_statement(parsed))
         finally:
@@ -371,7 +414,13 @@ class SchemaApplier:
         never combined into one transaction (Property 2 / DDL separation). Each
         statement is wrapped in OCC retry for OC001 idempotency (Property 5).
         """
-        connection = self._connection_factory()
+        connection = _open_connection_with_retry(
+            self._connection_factory,
+            occ_max_attempts=self._occ_max_attempts,
+            occ_base_delay=self._occ_base_delay,
+            sleep=self._sleep,
+            jitter=self._jitter,
+        )
         try:
             if drop_first:
                 self._run_ddl(connection, _build_drop_statement(parsed))
@@ -437,7 +486,13 @@ def drop_object(
         sleep=sleep,
         jitter=jitter,
     )(_execute_single_ddl)
-    connection = connection_factory()
+    connection = _open_connection_with_retry(
+        connection_factory,
+        occ_max_attempts=occ_max_attempts,
+        occ_base_delay=occ_base_delay,
+        sleep=sleep,
+        jitter=jitter,
+    )
     try:
         retried(connection, _build_drop_statement(parsed))
     finally:
@@ -479,7 +534,19 @@ def recreate_table(
         sleep=sleep,
         jitter=jitter,
     )(_execute_single_ddl)
-    connection = connection_factory()
+    # Opening the connection is itself retried on a transient connection failure:
+    # when many table workers finish together and the next wave all open fresh DSQL
+    # connections at once, DSQL's new-connection rate limit can reject/time-out a
+    # connect. Without this, that per-table DROP+recreate connect failed the table
+    # outright (0 rows, no batch ever ran); with it, the connect rides out the storm
+    # -- matching the batched loader's pool, which already leases inside a retry.
+    connection = _open_connection_with_retry(
+        connection_factory,
+        occ_max_attempts=occ_max_attempts,
+        occ_base_delay=occ_base_delay,
+        sleep=sleep,
+        jitter=jitter,
+    )
     try:
         for schema_ddl in schema_ddls:
             retried(connection, schema_ddl)

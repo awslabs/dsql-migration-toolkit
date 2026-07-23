@@ -591,6 +591,67 @@ def test_recreate_table_retries_drop_on_occ_conflict() -> None:
     ]
 
 
+class _TransientConnectError(Exception):
+    """A psycopg-like connection error with NO sqlstate (server never answered).
+
+    Mirrors ``ConnectionTimeout: connection timeout expired`` -- what DSQL's
+    new-connection rate limit surfaces under a connect storm. ``sqlstate`` is
+    ``None`` so it is classified transient by exception name, not by message.
+    """
+
+    sqlstate = None
+
+
+def test_recreate_table_retries_the_connection_open_on_transient_failure() -> None:
+    # Regression: the per-table DROP+recreate connect used to run OUTSIDE any retry,
+    # so a transient ConnectionTimeout at the front-16 -> next-wave transition (many
+    # workers opening fresh connections at once, tripping DSQL's new-connection rate
+    # limit) failed the table with 0 rows loaded. The connect open is now retried.
+    good = _FakeConnection()
+    attempts = {"n": 0}
+
+    def flaky_factory() -> _FakeConnection:
+        attempts["n"] += 1
+        if attempts["n"] <= 2:  # first two connects storm-fail, third succeeds
+            raise _TransientConnectError("connection timeout expired")
+        return good
+
+    recreate_table(
+        [],
+        'CREATE TABLE "t" ("id" integer PRIMARY KEY)',
+        connection_factory=flaky_factory,
+        sleep=_no_sleep,
+        jitter=_zero_jitter,
+    )
+
+    assert attempts["n"] == 3  # two transient failures were retried, then succeeded
+    assert good.executed == [
+        'DROP TABLE IF EXISTS "t"',
+        'CREATE TABLE "t" ("id" integer PRIMARY KEY)',
+    ]
+
+
+def test_recreate_table_connect_gives_up_after_max_attempts() -> None:
+    # A connect that never recovers still surfaces (bounded by the OCC budget) --
+    # the retry is not infinite.
+    attempts = {"n": 0}
+
+    def always_fails() -> _FakeConnection:
+        attempts["n"] += 1
+        raise _TransientConnectError("connection timeout expired")
+
+    with pytest.raises(_TransientConnectError):
+        recreate_table(
+            [],
+            'CREATE TABLE "t" ("id" integer PRIMARY KEY)',
+            connection_factory=always_fails,
+            occ_max_attempts=3,
+            sleep=_no_sleep,
+            jitter=_zero_jitter,
+        )
+    assert attempts["n"] == 3  # exactly the budget, then re-raised
+
+
 def test_drop_object_emits_drop_if_exists() -> None:
     # Standalone, introspector-free drop used by the Full Load "drop & reload"
     # path to pre-drop a dependent view before recreating a table it references.

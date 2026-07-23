@@ -5,6 +5,27 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.115
+
+### Fixed
+
+- **The per-table DROP+recreate connection is now retried on a transient connect
+  failure**, closing the last gap that could fail a table during a connection
+  storm. In a max-parallelism Full Load (table-parallelism 16, 20 tables), the
+  four queued tables start only when the first sixteen finish — which they do
+  nearly together, so all four open fresh DSQL connections at once and trip
+  DSQL's ~100 new-connections/second limit. `recreate_table` (and the other DDL
+  connect paths in `schema_applier`) opened that connection **outside** any retry,
+  so the resulting `ConnectionTimeout: connection timeout expired` failed the
+  whole table with **0 rows loaded, before a single batch ran** (no OCC retry, no
+  give-up log — the failure was outside the batch loop the earlier fixes hardened).
+  The connection open is now wrapped in the same transient-connection retry the
+  batched loader's pool leases already use, so the connect rides out the storm.
+- The transient-connection classifier moved to `core/target_connection.py`
+  (`is_transient_connection_error`) so **every** DSQL connect/execute path shares
+  one definition — the batched loader's pool leases and the DDL connects alike.
+  `batched_import` keeps a back-compat alias.
+
 ## v0.1.114
 
 ### Changed

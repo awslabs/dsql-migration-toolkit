@@ -58,6 +58,66 @@ DEFAULT_REFRESH_MARGIN_SECONDS = 60
 # Mirrors the source introspector's 10s connect_timeout.
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10
 
+# Lowercase substrings of libpq/OpenSSL messages for a transient connection
+# failure that carries NO SQLSTATE (the server never answered): a dropped socket,
+# TLS teardown, or a connect that timed out / was rate-limited. Used only as a
+# fallback when the exception TYPE was lost (a wrapped/re-raised error); a live
+# psycopg OperationalError/InterfaceError is classified by type below.
+TRANSIENT_CONN_SIGNATURES = (
+    "ssl error",
+    "unexpected eof",
+    "eof detected",
+    "server closed the connection",
+    "connection already closed",
+    "connection is closed",
+    "connection is lost",
+    "connection reset",
+    "consuming input failed",
+    "could not receive data",
+    "could not send data",
+    "terminating connection",
+    "broken pipe",
+    "no connection to the server",
+    "connection not open",
+    "connection timeout expired",
+    "timeout expired",
+    "timed out",
+)
+
+
+def is_transient_connection_error(exc: BaseException) -> bool:
+    """True for a transient DSQL connection-level error worth retrying.
+
+    Two recoverable shapes, both fixed by opening a FRESH connection (which
+    re-mints a short-lived IAM token) and replaying the idempotent work:
+
+    1. **SQLSTATE class ``08``** -- a connection exception the server reported
+       (e.g. an expired token, admin-closed connection).
+    2. **No SQLSTATE** -- the server never answered, so this is a
+       connection/network failure (dropped socket, TLS teardown, connect timeout,
+       unreachable address, or DSQL's new-connection rate limit rejecting the
+       connect under a burst). A genuine row/constraint error ALWAYS carries a
+       SQLSTATE, so a psycopg error with ``sqlstate=None`` is a connection failure.
+       The exception TYPE gates this so a caller's own no-SQLSTATE structural
+       error (a ``ValueError`` etc.) is NOT misclassified as retryable.
+
+    Shared by every DSQL connect/execute path (the batched loader's pool leases
+    AND the per-table DROP+recreate connect) so a connection storm -- e.g. many
+    table workers opening fresh connections at once when a wave of tables finishes
+    together -- is absorbed by reconnecting instead of failing the table.
+    """
+    state = getattr(exc, "sqlstate", None)
+    if isinstance(state, str) and state.startswith("08"):
+        return True
+    if state is None:
+        module = type(exc).__module__ or ""
+        name = type(exc).__name__
+        if module.startswith("psycopg") or name in ("OperationalError", "InterfaceError"):
+            return True
+        message = str(exc).lower()
+        return any(sig in message for sig in TRANSIENT_CONN_SIGNATURES)
+    return False
+
 # A token generator takes (hostname, region, expires_in_seconds) and returns the
 # token string. It is injectable so tests can supply a fake (no real AWS calls).
 TokenGenerator = Callable[[str, str, int], str]

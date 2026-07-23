@@ -5,6 +5,23 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.115
+
+### Fixed
+
+- **테이블별 DROP+recreate 연결이 이제 일시적 연결 실패 시 재시도됩니다.** 연결 storm에서
+  테이블이 실패하던 마지막 갭을 막습니다. 최대 병렬 Full Load(table-parallelism 16, 테이블
+  20개)에서 큐에 대기하던 4개 테이블은 앞선 16개가 완료될 때 비로소 시작되는데, 이 16개가
+  거의 동시에 끝나므로 4개가 한꺼번에 새 DSQL 연결을 열어 DSQL의 초당 신규연결 ~100개
+  한도를 초과합니다. `recreate_table`(및 `schema_applier`의 다른 DDL 연결 경로)은 이 연결을
+  **어떤 재시도로도 감싸지 않고** 열었기 때문에, 발생한 `ConnectionTimeout: connection
+  timeout expired`가 **배치 하나 실행되기도 전에 0행으로 테이블 전체를 실패**시켰습니다(OCC
+  재시도도, give-up 로그도 없음 — 이전 수정이 강화한 배치 루프 바깥에서 실패). 이제 연결
+  open을 배치 로더 풀이 이미 쓰는 것과 동일한 일시적-연결 재시도로 감싸 storm을 견딥니다.
+- 일시적-연결 분류기를 `core/target_connection.py`(`is_transient_connection_error`)로 옮겨
+  **모든** DSQL 연결/실행 경로가 하나의 정의를 공유합니다(배치 로더 풀 lease와 DDL 연결 모두).
+  `batched_import`에는 하위호환 alias를 남겼습니다.
+
 ## v0.1.114
 
 ### Changed
