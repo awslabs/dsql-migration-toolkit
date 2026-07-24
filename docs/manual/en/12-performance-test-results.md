@@ -81,21 +81,6 @@ plain `INSERT` (no `ON CONFLICT`) which eliminates OCC contention entirely:
 
 ---
 
-## Summary: 200GB single-table load time estimate
-
-| Version | Approach | rows/s | 200GB estimate | Improvement |
-|---|---|---|---|---|
-| Pre-v0.1.67 | ThreadPool, page=1000 | ~4,000 | ~46 hours | — |
-| v0.1.67 | ThreadPool, code optimizations | ~6,000 | ~31 hours | 1.5× |
-| v0.1.67 | ThreadPool, 8 vCPU | ~15,000 | ~12 hours | 3.8× |
-| **v0.1.68** | **ProcessPool, tp=4, 8 vCPU** | **~41,000** | **~4 hours** | **10×** |
-| **v0.1.68** | **ProcessPool, tp=8, 8 vCPU** | **~51,000** | **~2.5 hours** | **18×** |
-
-> Estimates assume ~300 bytes/row average. Actual times vary by row width, network
-> latency, DSQL cluster load, and OCC collision rate.
-
----
-
 ## Large-scale validation: 1TB multi-table Full Load (16 vCPU, composite PK)
 
 The sections above traced the optimization evolution at 8 vCPU. This section is a
