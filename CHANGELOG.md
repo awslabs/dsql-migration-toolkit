@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.117
+
+### Fixed
+
+- **DSQL's 10-schema-per-cluster limit now surfaces as an actionable error.** When
+  the target cluster is already at its hard cap of 10 schemas, a `CREATE SCHEMA` for
+  the migration's schema fails with `program_limit_exceeded` (SQLSTATE 54000,
+  "more than 10 schemas not allowed") — even with `IF NOT EXISTS`, because DSQL
+  checks the limit before the existence check. This is a hard limit (retrying never
+  clears it), so it is translated immediately into a clear message telling the user
+  to free a schema (`DROP SCHEMA ... CASCADE`) or use another cluster, instead of an
+  opaque driver error. It is deliberately not routed through the OCC/transient retry.
+- **The `measure_performance` harness now prints the job's failure reason.** A
+  failure that propagated out of `run_full_load` (e.g. the pre-pass schema/DDL error
+  above, before any table worker ran) was stored only as the JobManager's captured
+  exception; the run printed `status=FAILED` with every table `PENDING` and no
+  reason. It now logs `FAILURE REASON: <exception>` so a failed perf run is
+  diagnosable from its logs alone.
+
 ## v0.1.116
 
 ### Fixed

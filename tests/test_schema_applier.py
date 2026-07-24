@@ -652,6 +652,64 @@ def test_recreate_table_connect_gives_up_after_max_attempts() -> None:
     assert attempts["n"] == 3  # exactly the budget, then re-raised
 
 
+class _SchemaLimitError(Exception):
+    """A psycopg-like ``program_limit_exceeded`` (SQLSTATE 54000) for DSQL's
+    10-schema cap: ``CREATE SCHEMA`` beyond the limit ("more than 10 schemas
+    not allowed")."""
+
+    def __init__(self, message: str = "more than 10 schemas not allowed",
+                 sqlstate: str = "54000") -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+class _SchemaLimitConnection(_FakeConnection):
+    """A fake connection that raises the schema-limit error on ``CREATE SCHEMA``."""
+
+    def handle_execute(self, statement: Any, _params) -> None:  # type: ignore[override]
+        text = statement if isinstance(statement, str) else statement.as_string(None)
+        if text.upper().startswith("CREATE SCHEMA"):
+            raise _SchemaLimitError()
+        self.executed.append(text)
+
+
+def test_is_schema_limit_exceeded_detects_54000_with_schema_message() -> None:
+    from dsql_migrator.core.schema_applier import _is_schema_limit_exceeded
+
+    assert _is_schema_limit_exceeded(_SchemaLimitError()) is True
+    # 54000 covers other program limits too; only schema-mentioning ones match.
+    assert _is_schema_limit_exceeded(
+        _SchemaLimitError(message="target lists can have at most 1664 entries")
+    ) is False
+    # Message fallback when the SQLSTATE was lost (wrapped/re-raised).
+    assert _is_schema_limit_exceeded(
+        _SchemaLimitError(message="ERROR: more than 10 schemas not allowed", sqlstate=None)
+    ) is True
+    assert _is_schema_limit_exceeded(RuntimeError("boom")) is False
+
+
+def test_recreate_table_translates_schema_limit_to_actionable_error() -> None:
+    # DSQL's hard 10-schema cap surfaces on CREATE SCHEMA as an opaque driver error;
+    # it must become an actionable SchemaApplyError (not be retried -- it's a hard
+    # limit) telling the user to free a schema.
+    connection = _SchemaLimitConnection()
+
+    with pytest.raises(SchemaApplyError) as exc_info:
+        recreate_table(
+            ['CREATE SCHEMA IF NOT EXISTS "app"'],
+            'CREATE TABLE "app"."orders" ("id" integer PRIMARY KEY)',
+            connection_factory=lambda: connection,
+            occ_max_attempts=5,
+            sleep=_no_sleep,
+            jitter=_zero_jitter,
+        )
+    msg = str(exc_info.value)
+    assert "10 schemas" in msg
+    assert "DROP SCHEMA" in msg
+    # The DROP/CREATE TABLE were never reached (failed on the schema ensure).
+    assert connection.executed == []
+
+
 def test_drop_object_emits_drop_if_exists() -> None:
     # Standalone, introspector-free drop used by the Full Load "drop & reload"
     # path to pre-drop a dependent view before recreating a table it references.

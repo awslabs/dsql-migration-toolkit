@@ -5,6 +5,22 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.117
+
+### Fixed
+
+- **DSQL의 "클러스터당 스키마 10개" 한도가 이제 actionable 에러로 표시됩니다.** 타깃
+  클러스터가 이미 10개 한도에 도달하면 마이그레이션 스키마용 `CREATE SCHEMA`가
+  `program_limit_exceeded`(SQLSTATE 54000, "more than 10 schemas not allowed")로 실패합니다 —
+  `IF NOT EXISTS`가 있어도 DSQL이 존재 확인보다 한도를 먼저 검사하기 때문입니다. 이는 하드
+  리밋(재시도해도 안 풀림)이라 즉시 명확한 메시지로 번역해, 미사용 스키마 제거
+  (`DROP SCHEMA ... CASCADE`) 또는 다른 클러스터 사용을 안내합니다(불투명한 드라이버 에러 대신).
+  OCC/transient 재시도 경로에는 일부러 넣지 않았습니다.
+- **`measure_performance` 하니스가 job 실패 사유를 출력합니다.** `run_full_load` 밖으로
+  전파된 실패(예: 위의 pre-pass 스키마/DDL 에러 — 테이블 워커가 돌기 전)는 JobManager가
+  잡은 예외로만 보관돼, 런이 `status=FAILED`에 모든 테이블 `PENDING`·사유 없음으로 찍혔습니다.
+  이제 `FAILURE REASON: <예외>`를 남겨 실패한 perf 런을 로그만으로 진단할 수 있습니다.
+
 ## v0.1.116
 
 ### Fixed

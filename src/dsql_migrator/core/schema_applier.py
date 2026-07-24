@@ -119,6 +119,14 @@ _SCHEMA = "SCHEMA"
 # the pre-apply introspection snapshot was stale (Property 5 spirit).
 _DUPLICATE_OBJECT_SQLSTATE = "42P07"
 
+# PostgreSQL ``program_limit_exceeded``. Aurora DSQL raises this on ``CREATE SCHEMA``
+# when the cluster is already at its hard cap of 10 schemas ("more than 10 schemas
+# not allowed"). It is a HARD limit, not a transient/OCC conflict -- retrying never
+# clears it -- so it must surface immediately as an actionable message telling the
+# user to free a schema, not be swallowed or retried.
+_PROGRAM_LIMIT_SQLSTATE = "54000"
+_DSQL_MAX_SCHEMAS = 10
+
 # Parses the leading ``CREATE <kind> [modifiers] <identifier>`` of a converted
 # DDL statement to recover the kind and the created object's name. Tolerant of
 # the DSQL-specific ``ASYNC`` index modifier and the usual ``IF NOT EXISTS`` /
@@ -453,10 +461,27 @@ def _build_drop_statement(parsed: _ParsedObject) -> sql.Composed:
 
 
 def _execute_single_ddl(connection: Any, statement: object) -> None:
-    """Execute exactly one DDL statement on ``connection`` (one transaction)."""
+    """Execute exactly one DDL statement on ``connection`` (one transaction).
+
+    DSQL's hard 10-schema-per-cluster limit surfaces here (on ``CREATE SCHEMA``) as
+    a raw ``program_limit_exceeded``; it is translated into an actionable
+    :class:`SchemaApplyError` so the user is told to free a schema rather than
+    seeing an opaque driver error. It is NOT retried (a hard limit, not transient),
+    so raising here propagates straight out of the (OCC-only) retry wrapper.
+    """
     cursor = connection.cursor()
     try:
         cursor.execute(statement)
+    except Exception as exc:  # noqa: BLE001 - translate one specific hard limit
+        if _is_schema_limit_exceeded(exc):
+            raise SchemaApplyError(
+                f"Aurora DSQL allows at most {_DSQL_MAX_SCHEMAS} schemas per "
+                "cluster, and this one is already at the limit, so the schema this "
+                "migration needs could not be created. Remove an unused schema from "
+                "the target cluster (DROP SCHEMA ... CASCADE) or use a different "
+                "cluster, then retry."
+            ) from exc
+        raise
     finally:
         _safe_close(cursor)
 
@@ -566,6 +591,22 @@ def _is_duplicate_object(exc: BaseException) -> bool:
     :func:`~dsql_migrator.core.occ.is_occ_conflict`.
     """
     return getattr(exc, "sqlstate", None) == _DUPLICATE_OBJECT_SQLSTATE
+
+
+def _is_schema_limit_exceeded(exc: BaseException) -> bool:
+    """Return ``True`` if ``exc`` is DSQL's "too many schemas" hard-limit error.
+
+    DSQL caps a cluster at ``_DSQL_MAX_SCHEMAS`` schemas and raises
+    ``program_limit_exceeded`` (SQLSTATE ``54000``) on a ``CREATE SCHEMA`` that
+    would exceed it. Match the SQLSTATE and require the message to mention schemas
+    (``54000`` also covers other program limits, e.g. too many columns), and fall
+    back to a message signature when the SQLSTATE was lost (wrapped/re-raised).
+    """
+    state = getattr(exc, "sqlstate", None)
+    message = str(exc).lower()
+    if state == _PROGRAM_LIMIT_SQLSTATE:
+        return "schema" in message
+    return "schemas not allowed" in message or "more than 10 schemas" in message
 
 
 def _default_connection_factory(target: TargetConnectionConfig) -> ConnectionFactory:

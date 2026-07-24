@@ -614,6 +614,15 @@ def cmd_full_load(args) -> int:
 
     log(f"status={job.status} wall={elapsed:.1f}s rows={total_rows} "
         f"overall={report['overall_rows_per_sec']} rows/s")
+    # Surface WHY the job failed. A failure that propagates out of run_full_load
+    # (e.g. a pre-pass DROP+recreate error, before any table worker runs) is stored
+    # only as the JobManager's captured exception text -- without this line the run
+    # just prints "status=FAILED" with every table PENDING and no reason, which is
+    # undiagnosable from the logs alone.
+    if job.status == "FAILED":
+        job_error = jm.get_error(job_id)
+        report["error"] = job_error
+        log(f"FAILURE REASON: {job_error or '(no error message captured)'}")
     if counter.batch_ms:
         w = report["write_rtt_ms"]
         log(f"write RTT/batch: p50={w['p50']}ms p95={w['p95']}ms max={w['max']}ms "
