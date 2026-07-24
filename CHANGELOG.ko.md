@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.119
+
+### Fixed
+
+- **샤드 분할된 단일 대형 테이블이 이제 FAILED로 표시되지 않고 정상 적재됩니다.** PK-range 샤드
+  워커가 결과를 `rows_skipped=result.rows_skipped`로 만들었는데, `BatchedImportResult`에는 그
+  속성이 없습니다(`conflicts`가 있음). 모든 샤드가 반환 지점에서 `AttributeError`를 내고, 잡혀서
+  `rows_loaded=0`인 `FAILED`로 보고 → 큰 단일 테이블(엔진이 코어당 1샤드로 분할)이 **모든 행이
+  적재됐는데도 FAILED**로 표시됐습니다. 샤드 경로만 영향받았고, 비-샤드 테이블은
+  `rows_skipped = result.conflicts`로 올바르게 매핑하므로 멀티테이블 로드(테이블당 1워커, 비샤드)는
+  무영향이었습니다. 이제 샤드 워커도 `rows_skipped`를 `conflicts`에서 매핑합니다.
+- **샤드 테이블 실패 시 모든 실패 샤드의 status/rows/message를 error log에 기록**합니다(메시지가 있는
+  샤드만이 아니라) — "one or more shards failed"가 항상 진단 가능해집니다(이전엔 메시지 없이 실패한
+  샤드는 원인이 남지 않음).
+
 ## v0.1.118
 
 ### Fixed

@@ -677,6 +677,51 @@ def test_pre_recreated_replace_table_skips_ddl_but_keeps_replace_semantics() -> 
     assert importer.index_ddls_by_table["orders"] == ["CREATE INDEX ASYNC ix_orders_x"]
 
 
+def test_migrate_shard_in_process_maps_rows_skipped_from_conflicts(monkeypatch) -> None:
+    # Regression: the shard worker referenced `result.rows_skipped`, which does NOT
+    # exist on BatchedImportResult (it exposes `conflicts`). Every shard of a sharded
+    # single-table load therefore raised AttributeError at its return, was caught and
+    # returned FAILED with rows_loaded=0 -- so a single large table failed even though
+    # all rows loaded (only the sharded path hit this; the unsharded table path maps
+    # rows_skipped=conflicts correctly). Assert the shard worker returns DONE and maps
+    # rows_skipped from conflicts.
+    import dataclasses
+
+    from dsql_migrator.ui.data_migration import _engine
+
+    table = _tables()[0]  # orders
+    inputs = dataclasses.replace(_inputs(), replace_tables=frozenset({table.name}))
+
+    class _ConflictImporter:
+        def import_rows(self, rows, _table, *, on_batch_loaded=None,
+                        should_cancel=None, on_conflict=None, **_kw):
+            list(rows)  # drain the shard's row stream
+            if on_batch_loaded is not None:
+                on_batch_loaded(5, 3)
+            return BatchedImportResult(rows_loaded=5, conflicts=3, failures=0)
+
+    def _fake_migrator(inp):
+        return BatchedTableMigrator(
+            inp,
+            exporter=_FakeExporter(),
+            watermark_capturer=_FakeWatermarkCapturer(_watermark()),
+            importer_factory=lambda _i: _ConflictImporter(),
+            target_counter=lambda _t: None,
+        )
+
+    monkeypatch.setattr(_engine, "BatchedTableMigrator", _fake_migrator)
+
+    args = _engine._ShardWorkerArgs(
+        job_id="j", table=table, inputs=inputs,
+        pk_lower=None, pk_upper=None, shard_index=0,
+    )
+    result = _engine._migrate_shard_in_process(args)
+
+    assert result.status == "DONE"  # did NOT crash on result.rows_skipped
+    assert result.rows_loaded == 5
+    assert result.rows_skipped == 3  # mapped from BatchedImportResult.conflicts
+
+
 def test_replace_load_passes_target_composite_pk_to_importer() -> None:
     # Phase 0: on a fresh (replace) load, migrate_table parses the PK out of the
     # APPLIED target DDL and passes it to the importer as key_columns, so a

@@ -5,6 +5,22 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.119
+
+### Fixed
+
+- **シャード分割された単一の大きなテーブルが、FAILED とされず正常にロードされるようになりました。**
+  PK レンジのシャードワーカーは結果を `rows_skipped=result.rows_skipped` で構築していましたが、
+  `BatchedImportResult` にその属性はありません（`conflicts` があります）。各シャードが return 時に
+  `AttributeError` を発生させ、捕捉されて `rows_loaded=0` の `FAILED` として報告 → 大きな単一
+  テーブル（エンジンがコアごとに 1 シャードへ分割）が**全行ロード済みでも FAILED** と表示されて
+  いました。影響はシャード経路のみで、非シャードのテーブルは `rows_skipped = result.conflicts` を
+  正しくマッピングするため、マルチテーブルのロード（テーブルごとに 1 ワーカー、非シャード）は
+  無影響でした。シャードワーカーも `rows_skipped` を `conflicts` からマッピングするようにしました。
+- **シャードテーブルの失敗時、失敗した全シャードの status/rows/message をエラーログに記録**します
+  （メッセージを持つシャードだけではなく）― "one or more shards failed" が常に診断可能になります
+  （以前はメッセージなしで失敗したシャードは原因が残りませんでした）。
+
 ## v0.1.118
 
 ### Fixed

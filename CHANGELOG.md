@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.119
+
+### Fixed
+
+- **A sharded single large table now loads successfully instead of being marked
+  FAILED.** The PK-range shard worker built its result with
+  `rows_skipped=result.rows_skipped`, but `BatchedImportResult` has no such
+  attribute (it exposes `conflicts`). Every shard raised `AttributeError` at its
+  return, was caught, and reported `FAILED` with `rows_loaded=0` — so a big single
+  table (which the engine splits into one shard per core) was marked FAILED even
+  though all its rows had loaded. Only the sharded path was affected; an unsharded
+  table maps `rows_skipped = result.conflicts` correctly, which is why multi-table
+  loads (one worker per table, unsharded) were unaffected. The shard worker now maps
+  `rows_skipped` from `conflicts` too.
+- **A sharded table's failure now records every failed shard's status/rows/message
+  to the error log**, not only shards that carried a message — so "one or more
+  shards failed" is always diagnosable (previously a shard that failed without a
+  message left no cause).
+
 ## v0.1.118
 
 ### Fixed

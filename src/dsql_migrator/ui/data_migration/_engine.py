@@ -616,7 +616,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             return _TableWorkerResult(
                 table_name=name, status="FAILED", shard_index=args.shard_index,
                 error_message=f"{result.failures} batch(es) failed",
-                rows_loaded=result.rows_loaded, rows_skipped=result.rows_skipped,
+                rows_loaded=result.rows_loaded, rows_skipped=result.conflicts,
             )
         quarantine_recs = tuple(
             {"primary_key": r.primary_key, "message": r.message, "error_code": getattr(r, "error_code", None)}
@@ -624,7 +624,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
         )
         return _TableWorkerResult(
             table_name=name, status="DONE", shard_index=args.shard_index,
-            rows_loaded=result.rows_loaded, rows_skipped=result.rows_skipped,
+            rows_loaded=result.rows_loaded, rows_skipped=result.conflicts,
             quarantine_records=quarantine_recs,
         )
     except _FullLoadStopped:
@@ -1054,12 +1054,23 @@ def _migrate_tables_in_parallel(
                         any_failed = any(r.status == "FAILED" for r in shard_results[name])
                         any_stopped = any(r.status == "STOPPED" for r in shard_results[name])
                         if any_failed:
+                            # Record EVERY shard's outcome (status + rows + message),
+                            # not just failed shards that carried a message. A shard
+                            # that failed without a message was previously invisible,
+                            # leaving "one or more shards failed" with no diagnosable
+                            # cause; logging each shard's status/rows makes the partial
+                            # state and the failing shard(s) explicit.
                             for r in shard_results[name]:
-                                if r.status == "FAILED" and r.error_message:
+                                if r.status == "FAILED":
                                     error_log.record(job_id, DataErrorRecord(
-                                        table=name, chunk_id=name,
+                                        table=name,
+                                        chunk_id=f"{name} shard {r.shard_index}",
                                         error_code=r.error_code,
-                                        message=f"shard {r.shard_index}: {r.error_message}",
+                                        message=(
+                                            f"shard {r.shard_index} FAILED "
+                                            f"(rows_loaded={r.rows_loaded}): "
+                                            f"{r.error_message or '(no error message)'}"
+                                        ),
                                         occurred_at=datetime.now(timezone.utc),
                                     ))
                             log_activity(ActivityCategory.FULL_LOAD, "load table",
