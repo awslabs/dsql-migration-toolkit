@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.118
+
+### Fixed
+
+- **The `measure_performance` harness now dumps the per-table/-shard/-batch error
+  records on a failed run.** A sharded table marks itself `FAILED` when any shard
+  fails, but the shard's actual reason is written only to the error log; the perf
+  run printed "one or more shards failed" with no cause. It now prints each
+  `DATA ERRORS` entry (table/chunk, code, message) alongside the `FAILURE REASON`,
+  so a failed run — including a late single-shard failure on a large single-table
+  load — is diagnosable from its logs alone.
+
 ## v0.1.117
 
 ### Fixed

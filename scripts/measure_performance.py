@@ -623,6 +623,21 @@ def cmd_full_load(args) -> int:
         job_error = jm.get_error(job_id)
         report["error"] = job_error
         log(f"FAILURE REASON: {job_error or '(no error message captured)'}")
+        # Also dump the per-table/-shard/-batch error records. A sharded table marks
+        # itself FAILED when ANY shard fails, but the shard's actual reason is written
+        # only to the error log (which the UI surfaces) -- without this the perf run
+        # printed "one or more shards failed" with no cause. Print them so a failed
+        # run is diagnosable from its logs alone (mirrors the FAILURE REASON line).
+        data_errors = error_log.records(job_id)
+        if data_errors:
+            report["data_errors"] = [
+                {"table": e.table, "chunk_id": e.chunk_id,
+                 "error_code": e.error_code, "message": e.message}
+                for e in data_errors
+            ]
+            log(f"DATA ERRORS ({len(data_errors)}):")
+            for e in data_errors[:20]:
+                log(f"  [{e.table}/{e.chunk_id}] {e.error_code or ''} {e.message}")
     if counter.batch_ms:
         w = report["write_rtt_ms"]
         log(f"write RTT/batch: p50={w['p50']}ms p95={w['p95']}ms max={w['max']}ms "

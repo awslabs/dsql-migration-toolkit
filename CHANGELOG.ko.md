@@ -5,6 +5,16 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.118
+
+### Fixed
+
+- **`measure_performance` 하니스가 실패한 런에서 테이블/샤드/배치별 에러 레코드를 덤프합니다.**
+  샤드 분할된 테이블은 샤드 중 하나라도 실패하면 `FAILED`로 표시되는데, 샤드의 실제 사유는
+  error log에만 기록돼 perf 런은 "one or more shards failed"만 찍고 원인이 없었습니다. 이제
+  `FAILURE REASON`과 함께 각 `DATA ERRORS` 항목(테이블/청크·코드·메시지)을 출력해, 대형
+  단일 테이블 로드의 막판 단일-샤드 실패까지 로그만으로 진단할 수 있습니다.
+
 ## v0.1.117
 
 ### Fixed
