@@ -95,6 +95,69 @@ OCC 경합 완전 제거:
 
 ---
 
+## 대규모 검증: 1TB 멀티테이블 Full Load (16 vCPU, composite PK)
+
+앞 절이 8 vCPU에서의 최적화 진화를 다뤘다면, 이 절은 **최대 병렬(16 vCPU)** 에서 **~1TB
+데이터셋을 실제로 완주**시킨 대규모 검증입니다 (2026-07, us-east-1). 배포된 도구를 UI 클릭이
+아니라 **자동 스크립팅(ECS RunTask)** 으로 실행·모니터링했습니다.
+
+### 테스트 환경 (1TB)
+
+| 구성요소 | 설정 |
+|---|---|
+| **ECS Fargate** | 16 vCPU (16384 CPU units), 32 GB |
+| **소스** | Aurora MySQL `db.r7g.8xlarge` (측정 위해 임시 업사이즈) |
+| **타깃** | Aurora DSQL, us-east-1 |
+| **데이터셋** | `dsql_test_multi` — 20테이블 × 45.78M행 = **915.7M행 (≈ 1.07TB)** |
+| **로더 설정** | composite PK(`dist_key`) 20/20, `TABLE_PARALLELISM=16`, `BATCH_PARALLELISM=32`, batch-rows 3000 |
+
+### 결과
+
+| 지표 | 값 |
+|---|---|
+| **완주** | **20/20 테이블, 실패 0** |
+| **총 소요 (wall)** | **8,851.5s = 2h27m32s** |
+| **평균 처리량** | 103,455 rows/s |
+| **OCC 40001 재시도** | **0건** (composite PK로 hot-partition 경합 완전 제거) |
+| **병목** | CPU (16 vCPU 포화) |
+
+- **composite PK가 hot-partition 병목을 없앤다는 것을 대규모에서 재확인.** monotonic
+  AUTO_INCREMENT PK는 뒤쪽 파티션에 쓰기가 몰려 OCC 경합을 유발하지만, 높은 카디널리티 컬럼을
+  앞에 붙인 composite PK로 쓰기가 분산돼 40001 재시도가 **정확히 0**이었습니다.
+
+### tail penalty — "테이블 수 > parallelism" 불균형
+
+8,851s에는 **20테이블 / 16슬롯** 불균형의 꼬리 비용이 섞여 있습니다:
+
+| 구간 | 내용 | 처리량 |
+|---|---|---|
+| front-16 병렬 | 16테이블 = 732.6M행을 ~5,562s에 (16코어 포화) | **~131K rows/s** ← 진짜 최대 병렬 |
+| back-4 tail | 남은 4테이블이 16슬롯 중 4개만 사용, ~3,290s 추가 (12코어 유휴) | ~21K rows/s (합계) |
+
+- **balanced(테이블 수 ≤ `TABLE_PARALLELISM`)라면 ~131K rows/s → 915.7M행 ≈ 약 1h56m** 예상.
+  tail 불균형이 ~31분을 추가한 셈입니다.
+- **교훈:** 테이블 수가 vCPU 이하이면 `TABLE_PARALLELISM`을 **테이블 수 이상**으로 잡아 꼬리
+  직렬화를 피하세요. 큰 테이블은 로더가 PK-shard로 자동 분할해 남는 코어를 채웁니다.
+
+### 최대 병렬 startup/transition에서 드러난 두 connection storm (v0.1.115 / v0.1.116)
+
+16개 워커가 동시에 기동/전환하면서 이전 소규모 테스트에선 안 보이던 두 종류의 storm이 드러나
+각각 수정했습니다. 둘 다 **DSQL의 초당 신규연결 ~100개 한도** 와 **트랜잭션당 DDL 1개 + OCC**
+모델에서 비롯됩니다:
+
+| | BUG-A (연결 storm) | BUG-B (DDL 카탈로그 storm) |
+|---|---|---|
+| 시점 | front-16 완료 → back-4 시작 (전환) | 시작 직후 (16워커 동시 기동) |
+| 원인 | 테이블별 DROP+recreate **연결 open** 이 재시도 밖 → 신규연결 폭주 시 `ConnectionTimeout` | 16워커가 동시에 같은 스키마 카탈로그에 DDL → OC001(40001) 경합, DDL 재시도 예산 소진 |
+| 증상 | 해당 테이블 rows=0 실패, OCC 배치 0, give-up 로그 없음 | `SerializationFailure: schema has been updated by another transaction` |
+| 수정 | **v0.1.115** — 모든 DSQL 연결 open을 transient-connection 재시도로 감쌈 | **v0.1.116** — 모든 replace 테이블을 워커 스폰 전 **serial pre-pass** 로 DROP+recreate(워커는 재실행 안 함) |
+
+두 수정 이후 재실행에서 **20/20이 실패 0으로 완주** 해 실전 검증되었습니다. 교훈: **대량
+병렬로 스케일하면 "행 적재" 자체보다 동시 연결·DDL 개시(startup·전환)가 먼저 한계에 부딪힌다** —
+모든 DSQL 연결 open과 DDL을 rate-limit/OCC에 견디게 만들어야 합니다.
+
+---
+
 ## CDC 처리량
 
 CDC는 병목 지점이 Full Load와 다른 파이프라인입니다. Full Load가 **CPU/GIL 바운드**인 Python

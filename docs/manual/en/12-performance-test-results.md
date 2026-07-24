@@ -96,6 +96,73 @@ plain `INSERT` (no `ON CONFLICT`) which eliminates OCC contention entirely:
 
 ---
 
+## Large-scale validation: 1TB multi-table Full Load (16 vCPU, composite PK)
+
+The sections above traced the optimization evolution at 8 vCPU. This section is a
+large-scale validation that actually ran a **~1TB dataset to completion** at
+**maximum parallelism (16 vCPU)** (2026-07, us-east-1). The deployed tool was driven
+by **automated scripting (ECS RunTask)**, not by clicking the UI.
+
+### Test environment (1TB)
+
+| Component | Setting |
+|---|---|
+| **ECS Fargate** | 16 vCPU (16384 CPU units), 32 GB |
+| **Source** | Aurora MySQL `db.r7g.8xlarge` (temporarily upsized for the test) |
+| **Target** | Aurora DSQL, us-east-1 |
+| **Dataset** | `dsql_test_multi` — 20 tables × 45.78M rows = **915.7M rows (≈ 1.07TB)** |
+| **Loader settings** | composite PK (`dist_key`) on all 20, `TABLE_PARALLELISM=16`, `BATCH_PARALLELISM=32`, batch-rows 3000 |
+
+### Result
+
+| Metric | Value |
+|---|---|
+| **Completion** | **20/20 tables, 0 failures** |
+| **Total wall time** | **8,851.5s = 2h27m32s** |
+| **Average throughput** | 103,455 rows/s |
+| **OCC 40001 retries** | **0** (composite PK removed hot-partition contention entirely) |
+| **Bottleneck** | CPU (16 vCPU saturated) |
+
+- **Confirmed at scale that a composite PK removes the hot-partition bottleneck.** A
+  monotonic AUTO_INCREMENT PK funnels writes into the trailing partition and provokes
+  OCC contention; prepending a high-cardinality column spreads the writes, so 40001
+  retries were **exactly 0**.
+
+### Tail penalty — the "more tables than parallelism" imbalance
+
+The 8,851s includes a tail cost from the **20 tables / 16 slots** imbalance:
+
+| Phase | What | Throughput |
+|---|---|---|
+| front-16 parallel | 16 tables = 732.6M rows in ~5,562s (16 cores saturated) | **~131K rows/s** ← true max parallel |
+| back-4 tail | remaining 4 tables use only 4 of 16 slots, +~3,290s (12 cores idle) | ~21K rows/s (combined) |
+
+- **Balanced (tables ≤ `TABLE_PARALLELISM`) this would be ~131K rows/s → 915.7M rows
+  ≈ ~1h56m.** The tail imbalance added ~31 minutes.
+- **Lesson:** when the table count is ≤ vCPU, set `TABLE_PARALLELISM` to **at least the
+  table count** to avoid serializing the tail. Large tables are auto-split by the
+  loader (PK sharding) to fill the remaining cores.
+
+### Two connection storms exposed at max-parallelism startup/transition (v0.1.115 / v0.1.116)
+
+With 16 workers starting and transitioning at once, two storm classes that smaller
+tests never surfaced appeared and were each fixed. Both stem from **DSQL's ~100
+new-connections/second limit** and its **one-DDL-per-transaction + OCC** model:
+
+| | BUG-A (connection storm) | BUG-B (DDL catalog storm) |
+|---|---|---|
+| When | front-16 finish → back-4 start (transition) | right at startup (16 workers start together) |
+| Cause | per-table DROP+recreate **connection open** was outside any retry → `ConnectionTimeout` under a new-connection burst | 16 workers issue DDL against the same schema catalog at once → OC001 (40001) contention exhausts the DDL retry budget |
+| Symptom | that table fails with rows=0, 0 OCC batches, no give-up log | `SerializationFailure: schema has been updated by another transaction` |
+| Fix | **v0.1.115** — wrap every DSQL connection open in the transient-connection retry | **v0.1.116** — DROP+recreate all replace tables in a **serial pre-pass** before spawning workers (workers no longer re-run the DDL) |
+
+After both fixes, a rerun **completed 20/20 with 0 failures**, validating them in
+production. Lesson: **as you scale out in parallel, concurrent connection and DDL
+initiation (startup/transition) hit a limit before row loading itself does** — every
+DSQL connection open and every DDL must tolerate the rate limit / OCC.
+
+---
+
 ## CDC throughput
 
 CDC is a different pipeline with a different bottleneck. Full Load is a Python
