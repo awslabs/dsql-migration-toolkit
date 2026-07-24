@@ -161,6 +161,31 @@ production. Lesson: **as you scale out in parallel, concurrent connection and DD
 initiation (startup/transition) hit a limit before row loading itself does** — every
 DSQL connection open and every DDL must tolerate the rate limit / OCC.
 
+### Variant: a single huge table (1TB in one table)
+
+Same 16 vCPU, but the data lives in **one table** `big_events` (915.7M rows ≈ 1.07TB,
+BIGINT AUTO_INCREMENT PK) instead of 20. The engine detects the integer PK and
+auto-splits the table into **16 PK-range shards, one per core**.
+
+| Metric | Value |
+|---|---|
+| **Completion** | all 915.7M rows loaded |
+| **Total wall time** | **~2h10m** (faster than the 20-table 2h27m — 16 even shards, no tail penalty) |
+| **Throughput** | ~16K at first → **~120–150K rows/s** after ramp (CPU saturated) |
+| **OCC 40001** | 0 |
+
+- **Key insight — a fresh single table's partition warm-up.** A just-created DSQL
+  table starts with one partition, so even with 16 shards writing at once, the writes
+  initially funnel into that single partition and the load **starts slow (~16K
+  rows/s)**. As DSQL **splits the table into more partitions under load**, throughput
+  climbs ~16K → 46K → 97K → **120–150K (CPU-saturated)**. The multi-table load never
+  hit this because **20 tables = 20× the initial partitions** — spreading data across
+  tables gives DSQL write parallelism from the start.
+- On this path we found and fixed a **shard result-aggregation bug** (it referenced a
+  non-existent `result.rows_skipped`, wrongly marking a fully-loaded single table
+  `FAILED`) in **v0.1.119** (`rows_skipped` now maps from `conflicts`). Multi-table
+  loads (one worker per table, unsharded) were unaffected.
+
 ---
 
 ## CDC throughput
