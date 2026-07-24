@@ -121,8 +121,9 @@ OCC 경합 완전 제거:
 
 - **balanced(테이블 수 ≤ `TABLE_PARALLELISM`)라면 ~131K rows/s → 915.7M행 ≈ 약 1h56m** 예상.
   tail 불균형이 ~31분을 추가한 셈입니다.
-- **교훈:** 테이블 수가 vCPU 이하이면 `TABLE_PARALLELISM`을 **테이블 수 이상**으로 잡아 꼬리
-  직렬화를 피하세요. 큰 테이블은 로더가 PK-shard로 자동 분할해 남는 코어를 채웁니다.
+- **교훈:** 테이블 수가 vCPU 이하이면 `TABLE_PARALLELISM`을 **테이블 수 이상**으로 잡아, 마지막에
+  소수 테이블만 남아 직렬로 처리되며 늘어지는 tail penalty를 피하세요. 큰 테이블은 로더가
+  PK-shard로 자동 분할해 남는 코어를 채웁니다.
 
 ### 최대 병렬 startup/transition에서 드러난 두 connection storm (v0.1.115 / v0.1.116)
 
