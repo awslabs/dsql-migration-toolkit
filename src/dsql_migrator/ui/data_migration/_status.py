@@ -747,6 +747,16 @@ def _fetch_cdc_status(migration_state, tables=None):
             lag_ms = dict(lag_reader(stack, list(tables)) or {})
         except Exception:  # noqa: BLE001 - advisory, keep status even if it fails
             lag_ms = {}
+    # Best-effort: pipeline-wide replication-lag TIME SERIES (max across tables per
+    # 1-minute bucket over the trailing window) for the "Stream lag over time" trend
+    # chart. Reuses the same CloudWatch metric the per-table read fetches; never fatal.
+    lag_series: list = []
+    series_reader = getattr(controller, "replication_lag_series", None)
+    if callable(series_reader) and stack and tables:
+        try:
+            lag_series = list(series_reader(stack, list(tables)) or [])
+        except Exception:  # noqa: BLE001 - advisory, keep status even if it fails
+            lag_series = []
     # Best-effort: pull NEW sink dead-letter events from the connector's
     # CloudWatch log group so the DLQ surface reflects the real pipeline (not just
     # in-tool errors). Only when the controller exposes the reader; never fatal.
@@ -758,7 +768,7 @@ def _fetch_cdc_status(migration_state, tables=None):
             dlq_errors = list(reader(f"/msk-connect/{stack_name}-cdc") or [])
         except Exception:  # noqa: BLE001 - advisory, keep status even if logs fail
             dlq_errors = []
-    return statuses, health, dlq_errors, net_rows, lag_ms
+    return statuses, health, dlq_errors, net_rows, lag_ms, lag_series
 
 
 def cdc_error_log_key(migration_state) -> str:
@@ -793,6 +803,7 @@ def _apply_cdc_status(migration_state, fetched) -> None:
     dlq_errors = rest[0] if rest else []
     net_rows = rest[1] if len(rest) > 1 else {}
     lag_ms = rest[2] if len(rest) > 2 else {}
+    lag_series = rest[3] if len(rest) > 3 else []
     # Store the scan-free per-table net rows the sink applied so the per-table
     # monitor can show CDC progress without a COUNT(*). Setter is a no-op-safe
     # replace; empty when the metric was unavailable this poll.
@@ -803,6 +814,11 @@ def _apply_cdc_status(migration_state, fetched) -> None:
     lag_setter = getattr(migration_state, "set_cdc_replication_lag_by_table", None)
     if callable(lag_setter):
         lag_setter(lag_ms or {})
+    # Store the pipeline-wide lag time series for the trend chart (re-fetched each
+    # poll; no client-side history buffer). Empty when the metric is unavailable.
+    series_setter = getattr(migration_state, "set_cdc_replication_lag_series", None)
+    if callable(series_setter):
+        series_setter(lag_series or [])
     adjusted = []
     for status in statuses:
         h = health.get(status.name)

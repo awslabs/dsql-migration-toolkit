@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.123
+
+### Added
+
+- **Stream lag over time — a trend line chart in the CDC "Pipeline health" card.**
+  The per-table "Stream lag" column shows the *current* lag, but a snapshot can't
+  tell you whether the stream is catching up or falling behind — which is exactly
+  the cut-over question. The chart plots the **worst end-to-end lag across tables per
+  1-minute bucket over the trailing ~15 min** (seconds behind, from the sink's
+  `ReplicationLagMs` metric): flat near zero means caught up and safe to cut over; a
+  rising line means the pipeline is falling behind. It reuses CloudWatch datapoints
+  the per-table read already fetched (no extra state, survives a page reload) and the
+  in-app ECharts component (no new dependency). Resolution is ~1 minute (CloudWatch
+  Period), so it's a trend, not a per-second readout.
+
 ## v0.1.122
 
 ### Fixed

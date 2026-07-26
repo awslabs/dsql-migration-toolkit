@@ -13,7 +13,7 @@ surface is unchanged.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, Sequence
 
@@ -241,6 +241,42 @@ def format_duration(seconds: float) -> str:
         return f"{minutes}m {secs}s"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h {minutes}m"
+
+
+def build_lag_chart_option(
+    series: "Sequence[tuple[int, int]]",
+) -> Optional[dict]:
+    """Build the ECharts option for the pipeline-wide "Stream lag over time" line
+    chart from ``[(epoch_seconds, max_lag_ms), ...]``, or ``None`` when there is
+    nothing meaningful to plot (fewer than 2 points -- a single dot is not a trend).
+
+    Y is **seconds behind** (ms/1000, the operator-facing unit); X is each 1-minute
+    bucket's UTC ``HH:MM``. Pure / NiceGUI-free so it is unit-testable and mirrors the
+    inline ``ui.echart(option)`` pattern already used on the Evaluation screen.
+    """
+    points = sorted((int(ts), int(ms)) for ts, ms in (series or []))
+    if len(points) < 2:
+        return None
+    labels = [
+        datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M") for ts, _ in points
+    ]
+    seconds = [round(ms / 1000.0, 1) for _, ms in points]
+    return {
+        "tooltip": {"trigger": "axis"},
+        "grid": {"left": 52, "right": 16, "top": 24, "bottom": 28},
+        "xAxis": {"type": "category", "data": labels, "boundaryGap": False},
+        "yAxis": {"type": "value", "name": "sec behind", "min": 0, "minInterval": 1},
+        "series": [
+            {
+                "name": "Max stream lag",
+                "type": "line",
+                "smooth": True,
+                "showSymbol": False,
+                "areaStyle": {},
+                "data": seconds,
+            }
+        ],
+    }
 
 
 def format_table_timing(row: "FullLoadTableRow", now: datetime) -> str:

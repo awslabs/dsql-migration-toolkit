@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.123
+
+### Added
+
+- **Stream lag 추세 라인 차트 — CDC "Pipeline health" 카드에 추가.** per-table "Stream lag"
+  컬럼은 *현재* lag만 보여줘서, 스트림이 따라잡는 중인지 벌어지는 중인지(정확히 cutover
+  판단 질문)를 알 수 없었습니다. 이 차트는 sink의 `ReplicationLagMs` 지표에서 **최근 ~15분
+  동안 1분 버킷별 테이블 전체 최대 lag**(초 단위)를 그립니다 — 0 근처에서 평평하면 따라잡음
+  (cutover 안전), 우상향이면 파이프라인이 뒤처지는 중. per-table read가 이미 가져오던
+  CloudWatch 데이터포인트를 재사용(추가 상태 없음, 리로드에도 유지)하고 앱 내장 ECharts를
+  씁니다(신규 의존성 0). 해상도는 ~1분(CloudWatch Period)이라 실시간이 아니라 추세용입니다.
+
 ## v0.1.122
 
 ### Fixed

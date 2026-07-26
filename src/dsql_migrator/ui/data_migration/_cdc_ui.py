@@ -68,6 +68,7 @@ from dsql_migrator.ui.data_migration._models import (
     _BROKER_MESSAGE_LIMIT_MIB,
     _DSQL_VALUE_LIMIT_MIB,
     assess_dlq_health,
+    build_lag_chart_option,
     build_migration_table_status,
     cdc_handling_facts,
     connector_health_rows,
@@ -3281,7 +3282,10 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
         view = _cdc_status_view(migration_state, job_manager)
         if view is not None:
             _render_cdc_pipeline_health(
-                ui, view, getattr(migration_state, "cdc_activity", None)
+                ui,
+                view,
+                getattr(migration_state, "cdc_activity", None),
+                lag_series=getattr(migration_state, "cdc_replication_lag_series", None),
             )
             _render_cdc_dlq_panel(
                 ui, migration_state, job_manager, view, on_refresh=_poll_cdc
@@ -3318,7 +3322,10 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
     _cdc_live()
 
 def _render_cdc_pipeline_health(
-    ui, status_view: LoadStatusView, activity: "Optional[CdcActivitySummary]"
+    ui,
+    status_view: LoadStatusView,
+    activity: "Optional[CdcActivitySummary]",
+    lag_series: "Optional[Sequence[tuple[int, int]]]" = None,
 ) -> None:
     """Render the combined "Pipeline health" card: connector health + change flow.
 
@@ -3366,6 +3373,25 @@ def _render_cdc_pipeline_health(
                     row.state, color=_badge_color.get(row.tone, "grey")
                 ).props("outline")
             ui.label(row.detail).classes("text-xs text-gray-500 ml-6")  # type: ignore[attr-defined]
+
+        # --- Stream lag (trend) ----------------------------------------------
+        # A pipeline-wide "worst lag over time" line: a snapshot number can't show
+        # whether the stream is catching up or falling behind, which is exactly the
+        # cutover question. Sourced from CloudWatch datapoints already fetched for the
+        # per-table column. Rendered only with >=2 points (a single dot is not a
+        # trend); the per-table "Stream lag" column carries the current detail.
+        _lag_option = build_lag_chart_option(lag_series or [])
+        if _lag_option is not None:
+            ui.separator().classes("my-1")  # type: ignore[attr-defined]
+            ui.label("Stream lag").classes(  # type: ignore[attr-defined]
+                "text-xs font-semibold text-gray-500 uppercase tracking-wide"
+            )
+            ui.label(  # type: ignore[attr-defined]
+                "Worst end-to-end lag across tables over ~15 min (1-minute "
+                "resolution). Flat near zero = caught up (safe to cut over); a rising "
+                "line means the pipeline is falling behind."
+            ).classes("text-xs text-gray-500")
+            ui.echart(_lag_option).classes("w-full").style("height: 200px")  # type: ignore[attr-defined]
 
         # --- Change flow ------------------------------------------------------
         if activity is not None:

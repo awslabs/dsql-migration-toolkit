@@ -503,6 +503,82 @@ class MskConnectController:
             return {}
         return result
 
+    def replication_lag_series(
+        self,
+        stack: str,
+        tables: Sequence[str],
+        *,
+        window_seconds: int = 15 * 60,
+    ) -> list[tuple[int, int]]:
+        """Pipeline-wide replication-lag TIME SERIES for the trend chart.
+
+        Same ``ReplicationLagMs`` metric / dimensions / read as
+        :meth:`replication_lag_by_table`, but keeps the WHOLE trailing
+        ``window_seconds`` (not just the newest 1-minute bucket) and collapses the
+        per-table series into ONE worst-case line -- the MAX per-table lag per bucket
+        -- answering "is the pipeline catching up or falling behind?" for the cutover
+        decision. Returns ``[(epoch_seconds, max_lag_ms), ...]`` ascending by time;
+        buckets with no datapoint on any table are simply absent (the stream is caught
+        up there). The datapoints are already fetched by the per-table read but
+        discarded; this keeps them. Best-effort: ``[]`` on any error / no data.
+        """
+        names = [t for t in tables if t]
+        if not stack or not names:
+            return []
+        try:
+            client = self._client("cloudwatch")
+            discovered = self._list_metric_dimensions(
+                client, stack, _REPLICATION_LAG_METRIC
+            )
+            if not discovered:
+                return []
+            by_dim = _match_metric_tables(names, discovered)
+            if not by_dim:
+                return []
+            now = datetime.now(timezone.utc)
+            start = datetime.fromtimestamp(
+                now.timestamp() - window_seconds, tz=timezone.utc
+            )
+            queries = [
+                {
+                    "Id": f"l{i}",
+                    "MetricStat": {
+                        "Metric": {
+                            "Namespace": _CDC_METRIC_NAMESPACE,
+                            "MetricName": _REPLICATION_LAG_METRIC,
+                            "Dimensions": [
+                                {"Name": "Stack", "Value": stack},
+                                {"Name": "Table", "Value": dim},
+                            ],
+                        },
+                        "Period": 60,
+                        "Stat": "Maximum",
+                    },
+                    "ReturnData": True,
+                }
+                for i, (_name, dim) in enumerate(by_dim.items())
+            ]
+            response = client.get_metric_data(
+                MetricDataQueries=queries,
+                StartTime=start,
+                EndTime=now,
+                ScanBy="TimestampAscending",
+            )
+            # Collapse every table's per-minute series into one worst-case line:
+            # MAX lag across tables per timestamp bucket.
+            by_bucket: dict[int, float] = {}
+            for item in response.get("MetricDataResults", []):
+                timestamps = item.get("Timestamps", []) or []
+                values = item.get("Values", []) or []
+                for ts, val in zip(timestamps, values):
+                    epoch = int(ts.timestamp()) if hasattr(ts, "timestamp") else int(ts)
+                    fval = float(val)
+                    if epoch not in by_bucket or fval > by_bucket[epoch]:
+                        by_bucket[epoch] = fval
+            return [(epoch, int(round(by_bucket[epoch]))) for epoch in sorted(by_bucket)]
+        except Exception:  # noqa: BLE001 - best-effort monitor signal only
+            return []
+
     def _list_metric_dimensions(
         self, client: object, stack: str, metric_name: str
     ) -> list[str]:

@@ -353,6 +353,45 @@ def test_replication_lag_by_table_no_call_without_stack_or_tables() -> None:
     assert client.calls == []
 
 
+def test_replication_lag_series_max_across_tables_ascending() -> None:
+    # The trend series keeps the WHOLE window (not just values[0]) and collapses the
+    # per-table series into one worst-case (MAX across tables) line per 1-min bucket,
+    # ascending by time. Reads with ScanBy=TimestampAscending.
+    from datetime import datetime, timezone
+
+    t0 = datetime(2026, 7, 27, 10, 0, tzinfo=timezone.utc)
+    t1 = datetime(2026, 7, 27, 10, 1, tzinfo=timezone.utc)
+    client = _FakeClient({
+        "list_metrics": {"Metrics": [
+            {"Dimensions": [{"Name": "Stack", "Value": "stk"},
+                            {"Name": "Table", "Value": "ecommerce_demo.orders"}]},
+            {"Dimensions": [{"Name": "Stack", "Value": "stk"},
+                            {"Name": "Table", "Value": "ecommerce_demo.customers"}]},
+        ]},
+        "get_metric_data": {"MetricDataResults": [
+            {"Id": "l0", "Timestamps": [t0, t1], "Values": [8000.0, 12000.0]},
+            {"Id": "l1", "Timestamps": [t0, t1], "Values": [3000.0, 20000.0]},
+        ]},
+    })
+    got = _controller(client).replication_lag_series(
+        "stk", ["ecommerce_demo.orders", "ecommerce_demo.customers"])
+    assert got == [
+        (int(t0.timestamp()), 8000),   # max(8000, 3000)
+        (int(t1.timestamp()), 20000),  # max(12000, 20000)
+    ]
+    gmd = [c for c in client.calls if c[0] == "get_metric_data"][0][1]
+    assert gmd["ScanBy"] == "TimestampAscending"
+
+
+def test_replication_lag_series_empty_on_error_or_no_input() -> None:
+    assert _controller(_FakeClient({}, raise_on="list_metrics")).replication_lag_series(
+        "stk", ["orders"]) == []
+    client = _FakeClient({"list_metrics": {"Metrics": []}})
+    assert _controller(client).replication_lag_series("", ["orders"]) == []
+    assert _controller(client).replication_lag_series("stk", []) == []
+    assert client.calls == []
+
+
 def test_match_metric_tables_prefers_exact_then_unambiguous_bare() -> None:
     from dsql_migrator.core.msk_connect_controller import _match_metric_tables
 

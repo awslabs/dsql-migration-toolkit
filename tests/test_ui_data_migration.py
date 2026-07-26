@@ -1943,7 +1943,7 @@ def test_fetch_cdc_status_includes_dlq_errors_when_controller_exposes_reader() -
 
     fetched = _fetch_cdc_status(state)
     assert fetched is not None
-    _statuses, _health, dlq_errors, _net, _lag = fetched
+    _statuses, _health, dlq_errors, _net, _lag, _series = fetched
     assert [e.table for e in dlq_errors] == ["orders"]
 
 
@@ -2013,6 +2013,47 @@ def test_fetch_cdc_status_reads_replication_lag_when_controller_exposes_reader()
     assert seen == {"stack": "mysql-dsql-cdc-seoul-test", "tables": ["orders", "customers"]}
     _apply_cdc_status(state, fetched)
     assert state.cdc_replication_lag_by_table == {"orders": 8500, "customers": 200}
+
+
+def test_fetch_cdc_status_reads_lag_series_and_stores_it() -> None:
+    # _fetch reads the pipeline-wide lag TIME SERIES (for the trend chart) and _apply
+    # stores it on state; the render reads state.cdc_replication_lag_series.
+    from dsql_migrator.core.cdc import ConnectorState, ConnectorStatus
+    from dsql_migrator.core.msk_connect_controller import ConnectorHealth
+    from dsql_migrator.ui.data_migration import _apply_cdc_status, _fetch_cdc_status
+
+    class _CtrlWithSeries(_FakeCdcController):
+        def replication_lag_series(self, stack, tables, **_kw):
+            return [(1000, 8000), (1060, 500)]
+
+    state = DataMigrationState()
+    state.set_cdc_stack_name("mysql-dsql-cdc-seoul-test")
+    state.set_cdc_controller(
+        _CtrlWithSeries(
+            statuses=[ConnectorStatus(name="sink", state=ConnectorState.RUNNING)],
+            health={"sink": ConnectorHealth(running_tasks=1, errored_tasks=0)},
+        )
+    )
+    state.set_cdc_connector_names(["sink"])
+
+    fetched = _fetch_cdc_status(state, ["orders"])
+    assert fetched is not None
+    _apply_cdc_status(state, fetched)
+    assert state.cdc_replication_lag_series == [(1000, 8000), (1060, 500)]
+
+
+def test_build_lag_chart_option_line_and_none() -> None:
+    from dsql_migrator.ui.data_migration._models import build_lag_chart_option
+
+    assert build_lag_chart_option([]) is None
+    assert build_lag_chart_option([(1000, 500)]) is None  # 1 point is not a trend
+    opt = build_lag_chart_option([(1000, 500), (1060, 12000), (1120, 0)])
+    assert opt["series"][0]["type"] == "line"
+    assert opt["series"][0]["data"] == [0.5, 12.0, 0.0]  # ms -> seconds behind
+    assert len(opt["xAxis"]["data"]) == 3  # one HH:MM bucket label per point
+    # Unordered input is sorted by time before plotting.
+    opt2 = build_lag_chart_option([(1120, 0), (1000, 500), (1060, 12000)])
+    assert opt2["series"][0]["data"] == [0.5, 12.0, 0.0]
 
 
 def test_fetch_cdc_status_skips_net_rows_without_tables() -> None:
@@ -5375,6 +5416,92 @@ def _cdc_view_with_dlq(depth: int):
     by_table = {"orders": depth} if depth else {}
     summary = ErrorLogSummary(total_errors=depth, errors_by_table=by_table)
     return build_cdc_status_view([], summary, dlq_depth=depth)
+
+
+class _EchartUi:
+    """NiceGUI double that records label text and every ui.echart(option) call, and
+    is context-safe for card/row/column. Enough to assert the pipeline-health card's
+    Stream-lag chart is (or is not) rendered."""
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+        self.echarts: list = []
+
+    class _El:
+        def classes(self, *_a, **_k):
+            return self
+
+        def props(self, *_a, **_k):
+            return self
+
+        def style(self, *_a, **_k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _rec(self, text):
+        if text is not None:
+            self.texts.append(str(text))
+        return self._El()
+
+    def card(self, *_a, **_k):
+        return self._El()
+
+    def row(self, *_a, **_k):
+        return self._El()
+
+    def column(self, *_a, **_k):
+        return self._El()
+
+    def icon(self, *_a, **_k):
+        return self._El()
+
+    def space(self, *_a, **_k):
+        return self._El()
+
+    def separator(self, *_a, **_k):
+        return self._El()
+
+    def badge(self, text="", *_a, **_k):
+        return self._rec(text)
+
+    def label(self, text="", *_a, **_k):
+        return self._rec(text)
+
+    def echart(self, option, *_a, **_k):
+        self.echarts.append(option)
+        return self._El()
+
+
+def test_render_cdc_pipeline_health_lag_chart_shown_only_with_series() -> None:
+    from dsql_migrator.core.cdc import (
+        ConnectorState,
+        ConnectorStatus,
+        build_cdc_status_view,
+    )
+    from dsql_migrator.core.models import ErrorLogSummary
+    from dsql_migrator.ui.data_migration import _render_cdc_pipeline_health
+
+    view = build_cdc_status_view(
+        [ConnectorStatus(name="sink", state=ConnectorState.RUNNING)],
+        ErrorLogSummary(total_errors=0, errors_by_table={}),
+        dlq_depth=0,
+    )
+    # >=2 points → a line chart is rendered under a "Stream lag" sub-group.
+    ui = _EchartUi()
+    _render_cdc_pipeline_health(ui, view, None, lag_series=[(1000, 8000), (1060, 500)])
+    assert len(ui.echarts) == 1
+    assert ui.echarts[0]["series"][0]["type"] == "line"
+    assert any("Stream lag" in t for t in ui.texts)
+    # No / insufficient series → no chart (nothing to plot), no Stream-lag group.
+    ui2 = _EchartUi()
+    _render_cdc_pipeline_health(ui2, view, None, lag_series=[])
+    assert ui2.echarts == []
+    assert not any("Stream lag" in t for t in ui2.texts)
 
 
 class _JobJM:

@@ -177,6 +177,12 @@ class DataMigrationState:
         # empty/absent when the metric is unavailable (older plugin) or the table is
         # idle/caught up.
         self.cdc_replication_lag_by_table: dict[str, int] = {}
+        # Pipeline-wide replication-lag TIME SERIES for the "Stream lag over time"
+        # trend chart: [(epoch_seconds, max_lag_ms), ...] -- max lag across tables per
+        # 1-minute bucket over the trailing ~15 min. Re-fetched wholesale each poll
+        # from CloudWatch (survives reload; no client-side history buffer); empty when
+        # the metric is unavailable or the stream is caught up across the window.
+        self.cdc_replication_lag_series: list[tuple[int, int]] = []
         # CDC lifecycle actions (Deploy infra / Start / Stop / Delete) -- each runs
         # as a JobManager CloudFormation job; only one runs at a time, so a single
         # ``cdc_deploy_job_id`` + ``cdc_action_kind`` (which operation it is, for the
@@ -476,6 +482,7 @@ class DataMigrationState:
             # adopted stack's poll repopulates rather than showing the prior stack's.
             self.cdc_net_rows_by_table = {}
             self.cdc_replication_lag_by_table = {}
+            self.cdc_replication_lag_series = []
         return True
 
     def append_cdc_deploy_log(self, when: datetime, message: str) -> None:
@@ -536,6 +543,22 @@ class DataMigrationState:
             self.cdc_replication_lag_by_table = {
                 str(k): int(v) for k, v in dict(lag_ms or {}).items()
             }
+
+    def set_cdc_replication_lag_series(
+        self, series: "Sequence[tuple[int, int]]"
+    ) -> None:
+        """Record the pipeline-wide replication-lag time series for the trend chart.
+
+        ``[(epoch_seconds, max_lag_ms), ...]`` (max lag across tables per 1-minute
+        bucket over the trailing ~15 min), read from CloudWatch each poll and
+        re-fetched wholesale -- so the chart survives a page reload and needs no
+        client-side history buffer. Replaces the prior series (empty when the metric
+        is unavailable or the stream is caught up across the whole window).
+        """
+        with self._lock:
+            self.cdc_replication_lag_series = [
+                (int(ts), int(v)) for ts, v in (series or [])
+            ]
 
     def set_cdc_connector_running_names(self, names: Sequence[str]) -> None:
         """Record which of my connectors are RUNNING (vs still provisioning)."""
