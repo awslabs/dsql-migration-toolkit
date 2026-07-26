@@ -12,12 +12,15 @@ connector configuration:
   customer's BYO-VPC inputs, ``MskBootstrapServers=""`` and
   ``DeploySink="false"`` so MSK / VPC wiring / plugins / IAM are created but no
   connectors yet (the MSK Serverless cluster takes ~15-20 min).
-* **Start CDC** (:func:`run_cdc_start`) -- a two-pass ``update_stack``: fetch the
-  cluster bootstrap brokers, set ``MskBootstrapServers`` + ``DeploySink="false"``
-  to create the source connector, wait until it is RUNNING (so it has created
-  the per-table topic), then set ``DeploySink="true"`` to add the sink. The
-  source-before-sink split avoids the empty-partition-assignment race (gotcha
-  #11).
+* **Start CDC** (:func:`run_cdc_start`) -- a SINGLE-pass ``update_stack``: fetch
+  the cluster bootstrap brokers, then set ``MskBootstrapServers`` +
+  ``DeploySink="true"`` so CloudFormation runs ``CdcStartPrepResource`` (which
+  PRE-CREATES the per-table topics, and on a gapless handoff seeds the offset) and
+  then creates the source AND sink connectors IN PARALLEL -- both DependsOn only
+  the pre-created topics, not each other. Pre-creating the topics removes the
+  empty-partition-assignment race (formerly gotcha #11, worked around by a serial
+  source-then-sink two-pass) at its source and roughly halves the connector wall
+  time. We then wait for both connectors to reach RUNNING.
 * **Stop CDC** (:func:`run_cdc_stop`) -- ``update_stack`` setting
   ``MskBootstrapServers=""``; both connectors' template conditions
   (``HasBootstrapServers`` / ``DeploySinkConnector``) go false, so
@@ -86,18 +89,20 @@ CDC_INFRA_STAGES: tuple[tuple[str, str], ...] = (
     ("infra_ready", "Infrastructure ready"),
 )
 
-# Start CDC: two-pass update (source connector first, then sink) so the source
-# creates the per-table topic before the sink subscribes (gotcha #11).
+# Start CDC: a SINGLE-pass update creates BOTH connectors at once. The stack's
+# CdcStartPrepResource pre-creates the per-table topics (so the sink no longer hits
+# the empty-partition-assignment race and no longer has to wait for the source to
+# auto-create them). Source and sink then deploy IN PARALLEL and are waited on
+# together in one "connectors_running" stage -- roughly halving the connector wall
+# time vs the old source-then-sink two-pass. The per-connector state (source /sink
+# still CREATING vs RUNNING) is shown by the live connector-state chips.
 CDC_START_STAGES: tuple[tuple[str, str], ...] = (
     ("discover_stack", "Discovering cdc-stack"),
     ("validate_params", "Validating configuration"),
     ("fetch_bootstrap", "Fetching MSK bootstrap brokers"),
-    ("submit_source", "Starting source connector"),
-    ("stack_source", "Source connector deploying"),
-    ("source_connector", "Waiting for source connector"),
-    ("submit_sink", "Starting sink connector"),
-    ("stack_sink", "Sink connector deploying"),
-    ("sink_connector", "Waiting for sink connector"),
+    ("submit_connectors", "Starting connectors (topics + source + sink)"),
+    ("stack_connectors", "Connectors deploying"),
+    ("connectors_running", "Waiting for connectors (source + sink)"),
     ("pipeline_running", "Pipeline running"),
 )
 
@@ -1359,22 +1364,27 @@ def run_cdc_start(
     poll_interval_seconds: float = 15.0,
     sleep: Callable[[float], None] = None,  # type: ignore[assignment]
 ) -> None:
-    """Start CDC with a two-pass update: source connector first, then sink.
+    """Start CDC with a SINGLE-pass update that creates both connectors at once.
 
-    Walks :data:`CDC_START_STAGES`. Fetches the cluster bootstrap brokers, then
-    Pass A sets ``MskBootstrapServers`` + ``DeploySink="false"`` to create the
-    source connector and waits for it to reach RUNNING (so it has created the
-    per-table topic). Pass B sets ``DeploySink="true"`` to add the sink. The flow
-    is config-aware idempotent: a pass is skipped only when its connector is
-    already RUNNING AND the desired connector configuration (notably the table set
-    -> ``TableIncludeList`` / ``SinkTopics``) matches the deployed stack. When the
-    configuration changed (e.g. a different set of tables), the connectors are
-    updated rather than silently kept on the old table set; an identical re-start
-    still no-ops (CloudFormation reports no changes) and burns no MSK quota.
+    Walks :data:`CDC_START_STAGES`. Fetches the cluster bootstrap brokers, then a
+    single ``update_stack`` sets ``MskBootstrapServers`` + ``DeploySink="true"`` so
+    CloudFormation runs ``CdcStartPrepResource`` (pre-creating the per-table topics
+    and, on a gapless handoff, seeding the offset) and then creates the source AND
+    sink connectors IN PARALLEL (both DependsOn only the pre-created topics, not each
+    other). We then wait for both to reach RUNNING. This roughly halves the
+    connector wall time vs the old source-then-sink two-pass, and removes the
+    empty-partition-assignment race at its source (topics exist before either
+    connector starts). The flow is config-aware idempotent: the whole pass is
+    skipped only when BOTH connectors are already RUNNING AND the desired connector
+    configuration (notably the table set -> ``TableIncludeList`` / ``SinkTopics``)
+    matches the deployed stack. When the configuration changed (e.g. a different set
+    of tables), the connectors are updated rather than silently kept on the old
+    table set; an identical re-start still no-ops (CloudFormation reports no changes)
+    and burns no MSK quota.
 
-    ``connector_timeout_seconds`` is the upper bound PER connector wait (it is
-    applied independently to ``stack_source``/``source_connector`` and again to
-    ``stack_sink``/``sink_connector``), NOT the whole operation. It defaults to
+    ``connector_timeout_seconds`` is the upper bound PER connector wait (applied to
+    each connector's RUNNING wait; because both deploy in parallel the total wait is
+    ~max(source, sink), not their sum), NOT the whole operation. It defaults to
     2700s (45 min) because MSK Connect connector creation (Fargate provisioning +
     plugin download of our ~70-90 MiB zips + Kafka Connect worker boot + Glue
     Schema Registry connect) can take well past 15-25 min EACH, and a too-short
@@ -1460,116 +1470,86 @@ def run_cdc_start(
             for key, value in connector_overrides
         )
 
-        # -- Pass A: source connector (DeploySink=false) ----------------------
-        # Best-effort pre-check: a read error here only means "cannot confirm it is
-        # already RUNNING", so fall through to the (idempotent) pass rather than
-        # failing. A persistent read error surfaces in the RUNNING-wait below.
+        # -- Single pass: create BOTH connectors at once ----------------------
+        # CdcStartPrepResource (in the stack) pre-creates the per-table topics, so
+        # the sink no longer waits for the source; both connectors deploy in
+        # parallel. Best-effort pre-check: a read error only means "cannot confirm
+        # RUNNING", so fall through to the (idempotent) pass. Skip the whole pass
+        # only when BOTH connectors are already RUNNING with the requested config.
         try:
             src_state = deployer.connector_state(src_name)
         except Exception:  # noqa: BLE001
             src_state = None
-        if src_state == _CONNECTOR_RUNNING and not config_changed:
+        try:
+            sink_state = deployer.connector_state(sink_name)
+        except Exception:  # noqa: BLE001
+            sink_state = None
+        both_running = (
+            src_state == _CONNECTOR_RUNNING and sink_state == _CONNECTOR_RUNNING
+        )
+        if both_running and not config_changed:
             driver.log(
-                f"{src_name}: already RUNNING with the requested configuration "
-                "— skipping source pass."
+                "Both connectors already RUNNING with the requested configuration "
+                "— nothing to start."
             )
-            driver.stage("submit_source", "DONE")
-            driver.stage("stack_source", "DONE")
-            driver.stage("source_connector", "DONE")
+            driver.stage("submit_connectors", "DONE")
+            driver.stage("stack_connectors", "DONE")
+            driver.stage("connectors_running", "DONE")
         else:
-            if src_state == _CONNECTOR_RUNNING and config_changed:
+            if both_running and config_changed:
                 driver.log(
-                    f"{src_name}: RUNNING but the connector configuration changed "
-                    "(e.g. a different table set) — updating it."
+                    "Connectors RUNNING but the configuration changed (e.g. a "
+                    "different table set) — updating them."
                 )
-            driver.stage("submit_source", "IN_PROGRESS")
+            driver.stage("submit_connectors", "IN_PROGRESS")
             since = _now()
-            source_pass = [
+            start_pass = [
                 ("MskBootstrapServers", bootstrap),
-                ("DeploySink", "false"),
+                ("DeploySink", "true"),
                 *watermark_overrides,
                 *connector_overrides,
             ]
             changed = deployer.submit_update(
-                stack_name, source_pass, template_body=template_body
+                stack_name, start_pass, template_body=template_body
             )
             if changed:
-                driver.log("Source connector update submitted.")
-                driver.stage("submit_source", "DONE")
-                driver.stage("stack_source", "IN_PROGRESS")
+                driver.log(
+                    "Connector deploy submitted (topics + source + sink in one pass)."
+                )
+                driver.stage("submit_connectors", "DONE")
+                driver.stage("stack_connectors", "IN_PROGRESS")
                 try:
                     _wait_stack_settles(
                         deployer, stack_name, driver=driver, since=since,
                         timeout=connector_timeout_seconds, interval=poll_interval_seconds,
-                        connector_for_log=src_name,
+                        connector_for_log=f"{src_name} + {sink_name}",
                     )
                 except CdcDeployError:
-                    driver.stage("stack_source", "FAILED")
+                    driver.stage("stack_connectors", "FAILED")
                     raise
-                driver.stage("stack_source", "DONE")
+                driver.stage("stack_connectors", "DONE")
             else:
-                driver.log("No source-connector changes needed.")
-                driver.stage("submit_source", "DONE")
-                driver.stage("stack_source", "DONE")
+                driver.log("No connector changes needed.")
+                driver.stage("submit_connectors", "DONE")
+                driver.stage("stack_connectors", "DONE")
             if driver.cancelled:
                 return
-            driver.stage("source_connector", "IN_PROGRESS")
+            # Both connectors were created by the single stack update and deploy in
+            # parallel; wait for each to reach RUNNING under the one connectors_running
+            # stage. Sequential polling, so the total wait is ~max(source, sink) --
+            # not their sum -- because both are already deploying concurrently.
+            driver.stage("connectors_running", "IN_PROGRESS")
             _wait_connector_running(
-                deployer, src_name, "source_connector", driver,
+                deployer, src_name, "connectors_running", driver,
                 connector_timeout_seconds, poll_interval_seconds,
                 stack_name=stack_name,
             )
-            driver.stage("source_connector", "DONE")
-
-        if driver.cancelled:
-            return
-
-        # -- Pass B: sink connector (DeploySink=true) -------------------------
-        try:
-            sink_state = deployer.connector_state(sink_name)
-        except Exception:  # noqa: BLE001
-            sink_state = None  # cannot confirm -> run the (idempotent) sink pass
-        if sink_state == _CONNECTOR_RUNNING and not config_changed:
-            driver.log(
-                f"{sink_name}: already RUNNING with the requested configuration "
-                "— skipping sink pass."
-            )
-            driver.stage("submit_sink", "DONE")
-            driver.stage("stack_sink", "DONE")
-            driver.stage("sink_connector", "DONE")
-        else:
-            driver.stage("submit_sink", "IN_PROGRESS")
-            since = _now()
-            changed = deployer.submit_update(
-                stack_name, [("DeploySink", "true")], template_body=template_body
-            )
-            if changed:
-                driver.log("Sink connector update submitted.")
-                driver.stage("submit_sink", "DONE")
-                driver.stage("stack_sink", "IN_PROGRESS")
-                try:
-                    _wait_stack_settles(
-                        deployer, stack_name, driver=driver, since=since,
-                        timeout=connector_timeout_seconds, interval=poll_interval_seconds,
-                        connector_for_log=sink_name,
-                    )
-                except CdcDeployError:
-                    driver.stage("stack_sink", "FAILED")
-                    raise
-                driver.stage("stack_sink", "DONE")
-            else:
-                driver.log("No sink-connector changes needed.")
-                driver.stage("submit_sink", "DONE")
-                driver.stage("stack_sink", "DONE")
-            if driver.cancelled:
-                return
-            driver.stage("sink_connector", "IN_PROGRESS")
             _wait_connector_running(
-                deployer, sink_name, "sink_connector", driver,
+                deployer, sink_name, "connectors_running", driver,
                 connector_timeout_seconds, poll_interval_seconds,
                 stack_name=stack_name,
             )
-            driver.stage("sink_connector", "DONE")
+            driver.stage("connectors_running", "DONE")
 
         # final
         driver.stage("pipeline_running", "IN_PROGRESS")

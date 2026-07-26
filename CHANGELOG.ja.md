@@ -5,6 +5,23 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.120
+
+### Changed
+
+- **CDC Start が、ソースとシンクのコネクタを 1 回の並列パスで作成する**ようになり、コネクタ
+  作成の実時間をおよそ半分にします。従来は直列の 2 パスでした — ソースコネクタを作成し、
+  RUNNING を待ち(Debezium がテーブルごとのトピックを自動作成)、その後シンクを作成 — トピックが
+  存在しないうちにシンクが起動すると empty-partition-assignment レースに陥るためです。cdc-stack の
+  start-prep カスタムリソース(汎用化した seeder Lambda)が、毎回の start で**テーブルごとのシンク
+  トピックを事前作成**するようになりました — ツールが既に算出する決定的な名前
+  `<prefix>.<db>.<table>` とパーティション数で — その結果、両コネクタは互いにではなく事前作成済み
+  トピックにのみ依存し、並行してデプロイされます。seeder は引き続き gapless な Full-Load
+  ハンドオフ(ウォーターマークあり)のときだけ connect-offsets レコードを seed し、トピックの
+  事前作成は無条件なので CDC-only の start でも恩恵を受けます。Start の進捗は source-then-sink の
+  6 ステップから単一の "Waiting for connectors (source + sink)" ステップに集約され、コネクタ個別の
+  状態はライブチップに残ります。
+
 ## v0.1.119
 
 ### Fixed

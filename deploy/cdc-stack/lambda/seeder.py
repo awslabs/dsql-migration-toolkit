@@ -157,6 +157,44 @@ def _ensure_compact_topic(bootstrap, region, topic, partitions):
         admin.close()
 
 
+def _ensure_data_topics(bootstrap, region, topics_csv, partitions):
+    """Pre-create each per-table sink topic (idempotent), so the sink connector can
+    be created IN PARALLEL with the source instead of after it.
+
+    Without pre-created topics the sink hits the empty-partition-assignment race, so
+    the deploy used to create the source first (and wait for Debezium to auto-create
+    the topics) THEN the sink -- two serial MSK Connect creations. Creating the topics
+    here up front (deterministic names ``<prefix>.<db>.<table>`` the caller already
+    computes, with the sink's unit-of-parallelism partition count) lets both
+    connectors deploy in one pass and removes the race at its source. Each topic is
+    created individually so already-existing ones are skipped (Debezium's
+    topic.creation then no-ops on them). ``replication_factor=-1`` lets the broker
+    apply its default (required for MSK Serverless).
+    """
+    topics = [t.strip() for t in (topics_csv or "").split(",") if t.strip()]
+    if not topics:
+        print("no data topics to pre-create (empty SinkTopics)")
+        return
+    admin = KafkaAdminClient(bootstrap_servers=bootstrap, **_iam_sasl_args(region))
+    created = skipped = 0
+    try:
+        for name in topics:
+            try:
+                admin.create_topics(
+                    [NewTopic(name=name, num_partitions=int(partitions),
+                              replication_factor=-1)]
+                )
+                created += 1
+            except TopicAlreadyExistsError:
+                skipped += 1
+    finally:
+        admin.close()
+    print(
+        f"pre-created {created} data topic(s) ({partitions} partition(s) each), "
+        f"{skipped} already existed"
+    )
+
+
 def _read_existing_offset(bootstrap, region, topic, key_json):
     """Scan the compacted offsets topic for the latest value of ``key_json``.
 
@@ -257,13 +295,23 @@ def _produce(bootstrap, region, topic, key_json, value_json):
 # Custom-resource entry points
 # --------------------------------------------------------------------------- #
 def _seed(props):
-    """Create the offset topic and seed the connect-offsets record (idempotent).
+    """Pre-create topics (ALWAYS) and seed the connect-offsets record (ONLY when a
+    watermark is present).
 
-    ``props`` is the custom resource's ResourceProperties -- the watermark fields
-    (WatermarkBinlogFile/WatermarkBinlogPos/WatermarkGtids/WatermarkTsSec) the Full
-    Load captured. Everything else (bootstrap, topic, connector identity, region)
-    comes from the Lambda environment the cdc-stack sets. Returns a small dict
-    echoed back as the custom resource's Data.
+    ``props`` is the custom resource's ResourceProperties: the per-table sink topic
+    list + partition count (``SinkTopics`` / ``TopicPartitions``, always present) and
+    the Full-Load watermark fields (``WatermarkBinlogFile`` etc., present only on the
+    gapless Full-Load -> CDC handoff). Everything else (bootstrap, offset topic,
+    connector identity, region) comes from the Lambda environment the cdc-stack sets.
+
+    Two responsibilities, split so this resource can run on EVERY start (including
+    CDC-only, which has no watermark):
+    1. **Always** pre-create the per-table data topics + the compacted offset topic,
+       so the source and sink connectors can be created in one parallel pass (the
+       sink no longer waits for the source to auto-create topics).
+    2. **Only with a watermark** seed the connect-offsets record for a gapless handoff.
+
+    Returns a small dict echoed back as the custom resource's Data.
     """
     bootstrap = os.environ["MSK_BOOTSTRAP"]
     topic = os.environ["OFFSETS_TOPIC"]
@@ -274,6 +322,18 @@ def _seed(props):
     partitions = os.environ.get("OFFSET_PARTITIONS", "1")
     region = os.environ.get("AWS_REGION") or os.environ.get("TARGET_REGION", "us-east-1")
 
+    # (1) ALWAYS: pre-create the per-table sink topics (parallel-connector deploy) and
+    # the compacted offset topic (MSK Connect requires it pre-created). Data topics
+    # use the sink's unit-of-parallelism partition count from TopicPartitions.
+    data_partitions = props.get("TopicPartitions") or os.environ.get(
+        "TOPIC_PARTITIONS", "1"
+    )
+    _ensure_data_topics(bootstrap, region, props.get("SinkTopics"), data_partitions)
+    _ensure_compact_topic(bootstrap, region, topic, partitions)
+
+    # (2) CONDITIONAL: seed the connect-offsets record only for a gapless Full-Load
+    # handoff (a watermark is present). CDC-only starts have none -> topics are
+    # created above and the connector starts from the current binlog (legacy).
     wm = {
         "file": props.get("WatermarkBinlogFile"),
         "pos": props.get("WatermarkBinlogPos"),
@@ -281,16 +341,10 @@ def _seed(props):
         "ts_sec": props.get("WatermarkTsSec"),
     }
     if not wm["file"] or wm["pos"] in (None, ""):
-        raise ValueError(
-            "no watermark binlog file:position in resource properties; cannot "
-            "seed a gapless offset"
-        )
+        print("no watermark -> topics ensured, offset seed skipped (CDC-only)")
+        return {"Seeded": "skipped"}
     if wm["ts_sec"] in (None, ""):
         wm["ts_sec"] = 0
-
-    # Always ensure the compacted offset topic exists -- the source connector's
-    # worker config points at it and MSK Connect requires it pre-created.
-    _ensure_compact_topic(bootstrap, region, topic, partitions)
 
     # Build the key first so we can read the connector's live offset for the
     # read-modify-write / no-clobber guard.

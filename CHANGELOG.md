@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.120
+
+### Changed
+
+- **CDC Start now creates the source and sink connectors in ONE parallel pass**,
+  roughly halving connector-creation wall time. Previously Start ran a serial
+  two-pass update — create the source connector, wait for it to reach RUNNING (so
+  Debezium auto-created the per-table topics), then create the sink — because a sink
+  that starts before its topics exist hits an empty-partition-assignment race. The
+  cdc-stack's start-prep custom resource (the seeder Lambda, generalized) now
+  **pre-creates the per-table sink topics up front** on every start — with the
+  deterministic `<prefix>.<db>.<table>` names and partition count the tool already
+  computes — so both connectors depend only on the pre-created topics (not on each
+  other) and deploy concurrently. The seeder still seeds the connect-offsets record
+  only on a gapless Full-Load handoff (watermark present); topic pre-creation is
+  unconditional so CDC-only starts benefit too. Start progress collapses from six
+  source-then-sink steps to a single "Waiting for connectors (source + sink)" step;
+  per-connector state remains visible in the live connector chips.
+
 ## v0.1.119
 
 ### Fixed

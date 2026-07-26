@@ -1248,31 +1248,28 @@ def test_cdc_stack_source_worker_pins_fixed_offset_topic_not_sink(
 def test_cdc_stack_seeder_function_persists_across_stop(
     cdc_template: dict,
 ) -> None:
-    # The seeder Role + Function are gated on DeploySeederFunction (seeder key AND a
-    # watermark -- NOT MskBootstrapServers), so they PERSIST across a Stop (which
-    # only blanks MskBootstrapServers). That keeps the slow VPC-Lambda ENI teardown
-    # OFF the Stop path (Stop then removes only the connectors + the fast
-    # OffsetSeedResource invoker), so a Stop no longer exceeds the settle timeout.
+    # The seeder Role + Function are gated on DeploySeederFunction, which is now an
+    # Fn::Or (bootstrap present OR the code key supplied). The OR means the code key
+    # alone keeps the Function deployed when a Stop blanks MskBootstrapServers, so it
+    # PERSISTS across a Stop -- keeping the slow VPC-Lambda ENI teardown OFF the Stop
+    # path. It also makes HasBootstrapServers imply DeploySeederFunction, so the
+    # start-prep invoker (gated on HasBootstrapServers) can always reference it.
     resources = cdc_template["Resources"]
     for name in ("OffsetSeederRole", "OffsetSeederFunction"):
         assert name in resources, name
         assert resources[name].get("Condition") == "DeploySeederFunction", name
-    # The invoker (which actually seeds the offset) is still gated on SeedOffset, so
-    # a Stop removes it (fast) and a Start re-creates + re-runs it.
-    assert resources["OffsetSeedResource"].get("Condition") == "SeedOffset"
+    # The invoker (pre-creates topics + seeds the offset) is gated on
+    # HasBootstrapServers, so a Stop removes it (fast) and a Start re-creates + reruns it.
+    assert resources["CdcStartPrepResource"].get("Condition") == "HasBootstrapServers"
 
     conds = cdc_template["Conditions"]
-    deploy_text = json.dumps(conds["DeploySeederFunction"])
+    deploy = conds["DeploySeederFunction"]
+    assert "Fn::Or" in deploy  # bootstrap present OR key present
+    deploy_text = json.dumps(deploy)
+    # Key-present alone keeps the Function deployed across a Stop (persist), and the
+    # OR includes bootstrap so HasBootstrapServers implies this condition.
     assert "LambdaSeederS3Key" in deploy_text
-    assert "WatermarkBinlogFile" in deploy_text
-    # The whole point of the split: the FUNCTION condition must NOT depend on
-    # MskBootstrapServers (else a Stop would tear it down and re-introduce the tail).
-    assert "MskBootstrapServers" not in deploy_text
-    # SeedOffset (the invoker's gate) still requires all three preconditions.
-    seed_text = json.dumps(conds["SeedOffset"])
-    assert "MskBootstrapServers" in seed_text
-    assert "LambdaSeederS3Key" in seed_text
-    assert "WatermarkBinlogFile" in seed_text
+    assert "MskBootstrapServers" in deploy_text
 
 
 def test_cdc_stack_seeder_is_in_vpc_python_lambda_from_plugin_bucket(
@@ -1379,19 +1376,23 @@ def test_cdc_stack_seeder_role_scoped_to_the_fixed_offset_topic(
     assert "AWSLambdaVPCAccessExecutionRole" in managed
 
 
-def test_cdc_stack_source_connector_depends_on_seed_only_when_seeding(
+def test_cdc_stack_connectors_deploy_in_parallel_via_start_prep(
     cdc_template: dict,
 ) -> None:
-    # DependsOn cannot take an Fn::If, so the conditional dependency is expressed as
-    # an implicit ref: a tag on the source connector references OffsetSeedResource
-    # via Fn::GetAtt ONLY when SeedOffset is true (else "none" -> no dependency).
-    conn = cdc_template["Resources"]["DebeziumSourceConnector"]["Properties"]
-    tags = conn["Tags"]
-    seed_tag = next(t for t in tags if t["Key"] == "OffsetSeed")
-    fn_if = seed_tag["Value"]["Fn::If"]
-    assert fn_if[0] == "SeedOffset"
-    assert fn_if[1] == {"Fn::GetAtt": ["OffsetSeedResource", "Seeded"]}
-    assert fn_if[2] == "none"
+    # Both connectors depend on CdcStartPrepResource (pre-created topics), NOT on
+    # each other, so they deploy in ONE parallel pass. The source expresses the
+    # ordering via the OffsetSeed tag's Fn::GetAtt (an implicit ref -- CdcStartPrepResource
+    # shares the source's HasBootstrapServers condition, so no Fn::If is needed); the
+    # sink via a hard DependsOn. Crucially the sink must NOT DependsOn the source
+    # connector -- that was the old serial source-then-sink ordering.
+    resources = cdc_template["Resources"]
+    src = resources["DebeziumSourceConnector"]["Properties"]
+    seed_tag = next(t for t in src["Tags"] if t["Key"] == "OffsetSeed")
+    assert seed_tag["Value"] == {"Fn::GetAtt": ["CdcStartPrepResource", "Seeded"]}
+
+    sink_depends = resources["DsqlSinkConnector"].get("DependsOn", [])
+    assert "CdcStartPrepResource" in sink_depends
+    assert "DebeziumSourceConnector" not in sink_depends
 
 
 def test_cdc_stack_declares_watermark_and_seeder_params(cdc_template: dict) -> None:

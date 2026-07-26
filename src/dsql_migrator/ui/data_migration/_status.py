@@ -116,12 +116,9 @@ _CDC_STAGE_LABELS = {
         "discover_stack": "Discovering cdc-stack",
         "validate_params": "Validating configuration",
         "fetch_bootstrap": "Fetching MSK bootstrap brokers",
-        "submit_source": "Starting source connector",
-        "stack_source": "Source connector deploying",
-        "source_connector": "Waiting for source connector",
-        "submit_sink": "Starting sink connector",
-        "stack_sink": "Sink connector deploying",
-        "sink_connector": "Waiting for sink connector",
+        "submit_connectors": "Starting connectors (topics + source + sink)",
+        "stack_connectors": "Connectors deploying",
+        "connectors_running": "Waiting for connectors (source + sink)",
         "pipeline_running": "Pipeline running",
     },
     "stop": {
@@ -161,17 +158,15 @@ _CDC_STAGE_ETA_SECONDS = {
     "start": {
         # MSK Connect connector creation is slow: Fargate provisioning + plugin
         # download (our plugin zips are ~70-90 MiB) + Kafka Connect worker boot +
-        # Glue Schema Registry connect. Measured at ~10-15 min EACH for source and
-        # sink, so the stage that waits for the connector to settle/RUN dominates.
+        # Glue Schema Registry connect, ~10-15 min EACH. Source and sink now deploy
+        # IN PARALLEL (one pass, topics pre-created), so the connector-wait stages
+        # are estimated at ONE connector's time (~max), not the sum of two.
         "discover_stack": 5,
         "validate_params": 2,
         "fetch_bootstrap": 5,
-        "submit_source": 10,
-        "stack_source": 12 * 60,       # CFN waits for the connector resource to create
-        "source_connector": 12 * 60,   # connector reaches RUNNING (created topic)
-        "submit_sink": 10,
-        "stack_sink": 12 * 60,
-        "sink_connector": 12 * 60,
+        "submit_connectors": 10,
+        "stack_connectors": 13 * 60,     # CFN creates topics + both connectors (parallel)
+        "connectors_running": 13 * 60,   # both reach RUNNING concurrently (~max)
         "pipeline_running": 5,
     },
     "stop": {

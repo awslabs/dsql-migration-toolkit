@@ -429,10 +429,39 @@ def test_seed_read_modify_write_preserves_live_offset_shape(seeder_env) -> None:
     assert produced["server_id"] == 7
 
 
-def test_seed_raises_without_watermark_coordinates(seeder_env) -> None:
-    module, _ = seeder_env
-    with pytest.raises(ValueError):
-        module._seed(_props(WatermarkBinlogFile="", WatermarkBinlogPos=""))
+def test_seed_without_watermark_creates_topics_and_skips_seed(seeder_env) -> None:
+    # No watermark (CDC-only start): the seeder still pre-creates the topics but
+    # skips the offset seed (there is nothing to seed). It must NOT raise -- topic
+    # pre-creation is unconditional so the sink can deploy in parallel.
+    module, recorder = seeder_env
+    recorder.topic_partitions = set()
+    result = module._seed(
+        _props(
+            WatermarkBinlogFile="", WatermarkBinlogPos="",
+            SinkTopics="dsqlcdc.app.orders,dsqlcdc.app.customers", TopicPartitions="4",
+        )
+    )
+    assert result == {"Seeded": "skipped"}
+    # The two data topics were pre-created (4 partitions each) plus the compact
+    # offset topic; no offset record was produced (no watermark).
+    created = {name: parts for name, parts, _cfg in recorder.created_topics}
+    assert created.get("dsqlcdc.app.orders") == 4
+    assert created.get("dsqlcdc.app.customers") == 4
+    assert recorder.produced == []
+
+
+def test_seed_pre_creates_data_topics_before_seeding(seeder_env) -> None:
+    # A gapless handoff (watermark present) both pre-creates the per-table topics
+    # AND seeds the offset.
+    module, recorder = seeder_env
+    recorder.topic_partitions = set()
+    result = module._seed(
+        _props(SinkTopics="dsqlcdc.app.orders", TopicPartitions="8")
+    )
+    assert result == {"Seeded": "true"}
+    created = {name: parts for name, parts, _cfg in recorder.created_topics}
+    assert created.get("dsqlcdc.app.orders") == 8  # data topic pre-created
+    assert recorder.produced  # offset seeded too
 
 
 # --------------------------------------------------------------------------- #
@@ -479,8 +508,10 @@ def test_handler_reports_failed_on_exception(seeder_env) -> None:
     import cfnresponse
 
     cfnresponse.sent.clear()
-    # Missing watermark coords -> _seed raises -> handler must send FAILED, not hang.
-    module.handler(_event("Create", WatermarkBinlogFile="", WatermarkBinlogPos=""), _Ctx())
+    # A broker-side failure (e.g. topic creation raises a non-"already exists" error)
+    # -> _seed raises -> handler must send FAILED, not hang.
+    recorder.create_raises = RuntimeError
+    module.handler(_event("Create"), _Ctx())
     status, data, _pid = cfnresponse.sent[-1]
     assert status == cfnresponse.FAILED
     assert "Error" in data

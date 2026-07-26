@@ -538,38 +538,37 @@ Conditions:
     Fn::Not:
       - Fn::Equals: [Ref: AlarmNotificationTopicArn, ""]
 
-  # Deploy the in-VPC offset seeder (compact topic + connect-offsets seed) only
-  # when ALL of: the MSK bootstrap string is known (the Lambda must reach the
-  # cluster), the seeder Lambda zip key is supplied, and a Full Load watermark
-  # binlog file is present. Missing any of these -> no seeder is created and the
-  # source worker config still pins the fixed offset topic (the connector then
-  # starts from the current binlog, the legacy behavior). The source connector
-  # DependsOn the seed resource ONLY under this condition (Fn::If below).
-  SeedOffset:
-    Fn::And:
+  # (Formerly SeedOffset gated a separate offset-seed-only resource. Topic
+  # pre-creation + offset seeding are now the single CdcStartPrepResource, which runs
+  # on every start (HasBootstrapServers) and seeds the offset only when a watermark
+  # is present -- so no separate SeedOffset condition is needed.)
+
+  # The seeder Lambda (+ its role) is deployed whenever its code exists, INDEPENDENT
+  # of MskBootstrapServers AND of a watermark -- so it PERSISTS across a Stop (which
+  # only blanks MskBootstrapServers). This keeps the VPC-attached Lambda's slow ENI
+  # reclamation OUT of the Stop path: a Stop then only removes the connectors + the
+  # CdcStartPrepResource invoker (all fast), so the stack settles well inside the
+  # control plane's Stop timeout instead of hanging ~20-40 min on the Lambda's ENI
+  # cleanup. The Lambda is torn down only on a full stack delete (whose timeout
+  # already accommodates that). It no longer requires a watermark: the Lambda now
+  # ALSO pre-creates the per-table sink topics on every start (not just seeds an
+  # offset on a gapless handoff), so it must exist for CDC-only starts too.
+  # HasBootstrapServers (the gate on CdcStartPrepResource, which references this
+  # function's Arn) implies the code key is supplied at start, so the ServiceToken
+  # reference stays valid.
+  # Deploy the seeder Lambda whenever CDC is running (MskBootstrapServers set, so
+  # CdcStartPrepResource will invoke it) OR its code key is supplied (so it PERSISTS
+  # across a Stop, which blanks MskBootstrapServers -- keeping the Lambda's slow ENI
+  # reclamation out of the Stop path). The OR is deliberate: HasBootstrapServers
+  # implies this condition, so CdcStartPrepResource (gated on HasBootstrapServers)
+  # can always reference the function's Arn / role. In practice the deployer always
+  # supplies LambdaSeederS3Key, so this is effectively always true.
+  DeploySeederFunction:
+    Fn::Or:
       - Fn::Not:
           - Fn::Equals: [Ref: MskBootstrapServers, ""]
       - Fn::Not:
           - Fn::Equals: [Ref: LambdaSeederS3Key, ""]
-      - Fn::Not:
-          - Fn::Equals: [Ref: WatermarkBinlogFile, ""]
-
-  # The offset-seeder Lambda (+ its role) is deployed whenever its code + a
-  # watermark exist, INDEPENDENT of MskBootstrapServers -- so it PERSISTS across a
-  # Stop (which only blanks MskBootstrapServers). This keeps the VPC-attached
-  # Lambda's slow ENI reclamation OUT of the Stop path: a Stop then only removes the
-  # connectors + the OffsetSeedResource invoker (all fast), so the stack settles
-  # well inside the control plane's Stop timeout instead of hanging ~20-40 min on
-  # the Lambda's ENI cleanup. The seeder is torn down only on a full stack delete
-  # (whose timeout already accommodates that). SeedOffset (still the gate on the
-  # OffsetSeedResource that actually invokes the seed) implies this condition, so
-  # OffsetSeedResource's ServiceToken -> OffsetSeederFunction reference stays valid.
-  DeploySeederFunction:
-    Fn::And:
-      - Fn::Not:
-          - Fn::Equals: [Ref: LambdaSeederS3Key, ""]
-      - Fn::Not:
-          - Fn::Equals: [Ref: WatermarkBinlogFile, ""]
 
   # When no ConnectorSubnetIds are supplied, the stack creates its OWN private
   # subnets + NAT gateway + route table inside the VPC (the customer's existing
@@ -628,7 +627,7 @@ Resources:
       # SecurityGroupEgress resource): an inline rule is part of the SG and cannot be
       # deleted while the Lambda's ENI still references the SG -- and CloudFormation
       # cannot delete that ENI until the custom resource's Delete has been handled
-      # (dependency chain: OffsetSeedResource -> OffsetSeederFunction -> this SG). A
+      # (dependency chain: CdcStartPrepResource -> OffsetSeederFunction -> this SG). A
       # STANDALONE egress resource has no such ordering and is deleted in parallel
       # with the custom-resource Delete (the ConnectorHttpsEgress 0.0.0.0/0 rule was
       # observed gone BEFORE the seeder Delete ran -> cfnresponse PUT timed out ->
@@ -1122,7 +1121,7 @@ Resources:
   # the Full Load watermark so the connector resumes streaming with no gap
   # (Property 11). The Role + Function persist across a Stop (DeploySeederFunction,
   # independent of MskBootstrapServers) so the VPC-Lambda ENI teardown is kept OFF
-  # the Stop path; only the OffsetSeedResource invoker below is gated on SeedOffset.
+  # the Stop path; only the CdcStartPrepResource invoker below is gated on SeedOffset.
   # When neither applies the source connector simply starts from the current binlog.
   OffsetSeederRole:
     Type: AWS::IAM::Role
@@ -1231,7 +1230,7 @@ Resources:
           # cfnresponse PUTs to S3, which the gateway endpoint routes WITHOUT the NAT,
           # but only while the endpoint + the seeder subnet's route-table association
           # still exist. Referencing them here forces the chain
-          #   OffsetSeedResource --(ServiceToken)--> this function --(these Refs)-->
+          #   CdcStartPrepResource --(ServiceToken)--> this function --(these Refs)-->
           #   {S3 endpoint, BOTH subnet route-table associations}
           # so the whole routing path is torn down strictly AFTER the custom-resource
           # Delete responds. (Route table is pinned transitively: endpoint & the
@@ -1246,21 +1245,31 @@ Resources:
                     - Ref: ConnectorSubnetBRouteTableAssociation
               - "none"
 
-  # The custom resource that actually invokes the seeder. ServiceToken points at
-  # the Lambda; the Watermark* properties are passed through to seeder._seed and,
-  # because they are resource properties, a change to ANY of them re-invokes the
-  # Lambda on the next stack update (idempotent: the Lambda no-clobbers an already-
-  # advanced offset). The source connector DependsOn this (see DebeziumSourceConnector)
-  # so the seed lands before the connector first reads its offset.
-  OffsetSeedResource:
+  # The custom resource that invokes the seeder Lambda on every CDC start. It runs
+  # whenever the bootstrap string is known (HasBootstrapServers) -- NOT only when a
+  # watermark exists -- because it now has TWO jobs:
+  #  (1) ALWAYS pre-create the per-table sink topics (SinkTopics) with the sink's
+  #      partition count, so the source and sink connectors can be created in one
+  #      PARALLEL pass (both DependsOn this resource) instead of source-then-sink.
+  #  (2) Seed the connect-offsets record ONLY when a watermark is present (gapless
+  #      Full-Load handoff).
+  # All properties are resource properties, so a change to ANY of them re-invokes
+  # the Lambda on the next stack update (idempotent: existing topics are skipped, an
+  # advanced offset is no-clobbered). Both connectors DependsOn this so the topics
+  # (and, when present, the seed) land before either connector is created.
+  CdcStartPrepResource:
     Type: AWS::CloudFormation::CustomResource
-    Condition: SeedOffset
+    Condition: HasBootstrapServers
     DependsOn:
       - MskCluster
       - OffsetSeederRole
     Properties:
       ServiceToken:
         Fn::GetAtt: [OffsetSeederFunction, Arn]
+      SinkTopics:
+        Ref: SinkTopics
+      TopicPartitions:
+        Ref: TopicDefaultPartitions
       WatermarkBinlogFile:
         Ref: WatermarkBinlogFile
       WatermarkBinlogPos:
@@ -1285,6 +1294,9 @@ Resources:
     DependsOn:
       - MskCluster
       - ConnectorSelfIngress
+    # Ordering after CdcStartPrepResource (topics pre-created; offset seeded on a
+    # gapless handoff) is enforced by the OffsetSeed Tag's Fn::GetAtt below, so no
+    # explicit DependsOn is needed here.
     Properties:
       ConnectorName:
         Fn::Sub: ${AWS::StackName}-debezium-source
@@ -1315,21 +1327,15 @@ Resources:
         AuthenticationType: IAM
       KafkaClusterEncryptionInTransit:
         EncryptionType: TLS
-      # Conditional dependency on the offset seed WITHOUT a DependsOn (which cannot
-      # take an Fn::If and errors if it names a condition-false resource). This tag's
-      # value references OffsetSeedResource via Fn::GetAtt ONLY when SeedOffset is
-      # true, which makes CloudFormation create the connector AFTER the seed lands
-      # (so it reads the seeded offset, not the current binlog). When SeedOffset is
-      # false the Fn::If returns "none" -- no reference, no dependency, and the
-      # (also-conditional) seed resource does not exist. The tag value "true"/
-      # "skipped"/"none" is benign metadata.
+      # Reference CdcStartPrepResource.Seeded so the connector is created AFTER the
+      # start-prep resource (topics pre-created; offset seeded on a gapless handoff).
+      # CdcStartPrepResource shares this connector's condition (HasBootstrapServers),
+      # so the reference is always valid -- no Fn::If needed. The tag value
+      # "true"/"skipped" is benign metadata (whether an offset was seeded).
       Tags:
         - Key: OffsetSeed
           Value:
-            Fn::If:
-              - SeedOffset
-              - Fn::GetAtt: [OffsetSeedResource, Seeded]
-              - "none"
+            Fn::GetAtt: [CdcStartPrepResource, Seeded]
       WorkerConfiguration:
         Revision:
           Fn::GetAtt: [WorkerConfiguration, Revision]
@@ -1563,8 +1569,13 @@ Resources:
     Condition: DeploySinkConnector
     DependsOn:
       - MskCluster
-      - DebeziumSourceConnector
       - ConnectorSelfIngress
+      # Depend on the PRE-CREATED TOPICS, not the source connector, so the sink is
+      # created IN PARALLEL with the source (both wait only for CdcStartPrepResource
+      # to pre-create the topics + partitions -- no empty-partition-assignment race).
+      # Previously this DependsOn DebeziumSourceConnector, forcing serial
+      # source-then-sink creation (~2x the connector-creation wall time).
+      - CdcStartPrepResource
     Properties:
       ConnectorName:
         Fn::Sub: ${AWS::StackName}-dsql-sink

@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.120
+
+### Changed
+
+- **CDC Start가 이제 소스·싱크 커넥터를 한 번의 병렬 pass로 생성**해 커넥터 생성 시간을 대략
+  절반으로 줄입니다. 기존에는 순차 2-pass였습니다 — 소스 커넥터 생성 → RUNNING 대기(그래야
+  Debezium이 per-table 토픽 자동 생성) → 싱크 생성 — 토픽이 없을 때 싱크가 시작하면
+  empty-partition-assignment race에 걸리기 때문이었습니다. 이제 cdc-stack의 start-prep 커스텀
+  리소스(일반화된 seeder Lambda)가 매 start마다 **per-table 싱크 토픽을 미리 생성**합니다 —
+  도구가 이미 계산하는 결정적 이름 `<prefix>.<db>.<table>` + 파티션 수로 — 그래서 두 커넥터가
+  서로가 아니라 미리 생성된 토픽에만 의존해 동시에 배포됩니다. seeder는 여전히 gapless
+  Full-Load handoff(watermark 있음)에서만 connect-offsets 레코드를 seed하고, 토픽 선생성은
+  무조건이라 CDC-only start도 혜택을 봅니다. Start 진행이 source-then-sink 6스텝에서 단일
+  "Waiting for connectors (source + sink)" 스텝으로 축약되며, 커넥터별 상태는 라이브 칩에 유지됩니다.
+
 ## v0.1.119
 
 ### Fixed

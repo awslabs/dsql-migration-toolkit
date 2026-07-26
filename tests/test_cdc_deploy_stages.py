@@ -488,7 +488,7 @@ def _run_start(handle, deployer, logs=None):
     return captured
 
 
-def test_start_happy_path_two_passes() -> None:
+def test_start_happy_path_single_pass() -> None:
     handle = _FakeHandle()
     # Neither connector running yet, then each reaches RUNNING.
     deployer = _FakeDeployer(
@@ -496,14 +496,13 @@ def test_start_happy_path_two_passes() -> None:
     )
     _run_start(handle, deployer)
     assert all(s == "DONE" for s in _statuses(handle).values())
-    # Two updates: Pass A (source) sets bootstrap + DeploySink=false;
-    # Pass B (sink) sets only DeploySink=true.
-    assert len(deployer.updates) == 2
-    pass_a = dict(deployer.updates[0])
-    assert pass_a["MskBootstrapServers"] == "b-1:9098"
-    assert pass_a["DeploySink"] == "false"
-    pass_b = dict(deployer.updates[1])
-    assert pass_b == {"DeploySink": "true"}
+    # ONE update creates BOTH connectors: bootstrap + DeploySink=true. The stack's
+    # CdcStartPrepResource pre-creates the topics so source + sink deploy in parallel
+    # (no source-then-sink two-pass).
+    assert len(deployer.updates) == 1
+    only = dict(deployer.updates[0])
+    assert only["MskBootstrapServers"] == "b-1:9098"
+    assert only["DeploySink"] == "true"
 
 
 def _connector_overrides() -> dict:
@@ -541,13 +540,14 @@ def test_start_running_but_config_changed_updates_connectors() -> None:
     )
     logs = _run_start(handle, deployer)
     assert all(s == "DONE" for s in _statuses(handle).values())
-    assert len(deployer.updates) == 2  # both passes ran despite RUNNING
+    assert len(deployer.updates) == 1  # single pass updates both, despite RUNNING
     assert any("configuration changed" in m for m in logs)
 
 
-def test_start_source_only_running_does_sink_pass() -> None:
+def test_start_sink_missing_runs_single_pass() -> None:
     handle = _FakeHandle()
-    # Source already up (with matching config), sink missing -> one update (sink).
+    # Source already up (matching config) but sink missing -> NOT both RUNNING, so
+    # the single pass runs (reconciling both). One update with DeploySink=true.
     deployer = _FakeDeployer(
         connector_states={SRC: ["RUNNING"], SINK: ["CREATING", "RUNNING"]},
         discovery_params=_connector_overrides(),
@@ -555,16 +555,17 @@ def test_start_source_only_running_does_sink_pass() -> None:
     _run_start(handle, deployer)
     assert all(s == "DONE" for s in _statuses(handle).values())
     assert len(deployer.updates) == 1
-    assert dict(deployer.updates[0]) == {"DeploySink": "true"}
+    assert dict(deployer.updates[0])["DeploySink"] == "true"
 
 
-def test_start_source_failed_raises_before_sink() -> None:
+def test_start_connector_failed_raises() -> None:
     handle = _FakeHandle()
     deployer = _FakeDeployer(connector_states={SRC: ["FAILED"], SINK: ["RUNNING"]})
     with pytest.raises(CdcDeployError):
         _run_start(handle, deployer)
-    assert _statuses(handle)["source_connector"] == "IN_PROGRESS"
-    assert _statuses(handle)["sink_connector"] == "PENDING"
+    # The single connectors_running stage never completes; pipeline stays PENDING.
+    assert _statuses(handle)["connectors_running"] != "DONE"
+    assert _statuses(handle)["pipeline_running"] == "PENDING"
 
 
 def _watermark():
@@ -580,7 +581,7 @@ def _watermark():
     )
 
 
-def test_start_passes_watermark_params_on_source_pass_only() -> None:
+def test_start_passes_watermark_params_on_single_pass() -> None:
     handle = _FakeHandle()
     deployer = _FakeDeployer(
         connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]}
@@ -592,13 +593,14 @@ def test_start_passes_watermark_params_on_source_pass_only() -> None:
         watermark=_watermark(),
         connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
     )
-    pass_a = dict(deployer.updates[0])
-    # Pass A carries the watermark coordinates so the in-VPC seeder runs.
-    assert pass_a["WatermarkBinlogFile"] == "mysql-bin.000042"
-    assert pass_a["WatermarkBinlogPos"] == "15324"
-    assert pass_a["WatermarkGtids"] == "UUID:1-9"
-    # Pass B (sink) is watermark-free -- it is purely DeploySink=true.
-    assert dict(deployer.updates[1]) == {"DeploySink": "true"}
+    # The single pass carries the watermark coordinates + DeploySink=true, so the
+    # in-VPC CdcStartPrepResource seeds the offset and both connectors are created.
+    assert len(deployer.updates) == 1
+    only = dict(deployer.updates[0])
+    assert only["WatermarkBinlogFile"] == "mysql-bin.000042"
+    assert only["WatermarkBinlogPos"] == "15324"
+    assert only["WatermarkGtids"] == "UUID:1-9"
+    assert only["DeploySink"] == "true"
     assert any("Seeding gapless CDC start offset" in m for m in captured)
 
 
