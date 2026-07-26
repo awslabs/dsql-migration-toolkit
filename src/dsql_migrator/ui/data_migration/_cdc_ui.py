@@ -2600,7 +2600,17 @@ def _start_cdc_stop(
     if should_replace_teardown_marker(
         job_manager, migration_state.cdc_teardown_job_id, job_id
     ):
-        migration_state.set_cdc_teardown(job_id, kind="stop", stack=stack_name)
+        migration_state.set_cdc_teardown(
+            job_id,
+            kind="stop",
+            stack=stack_name,
+            ctx={
+                "region": region,
+                "role_arn": getattr(migration_state, "cdc_deploy_role_arn", None),
+                "profile": getattr(session, "aws_profile", None),
+                "cleanup_secret": False,
+            },
+        )
     _log_cdc_event("stop CDC connectors", detail=f"stack {stack_name}")
     ui.notify("Stop CDC submitted — removing connectors.", type="positive", position="top")  # type: ignore[attr-defined]
     refresh()
@@ -2649,7 +2659,17 @@ def _start_cdc_delete(
     if should_replace_teardown_marker(
         job_manager, migration_state.cdc_teardown_job_id, job_id
     ):
-        migration_state.set_cdc_teardown(job_id, kind="delete", stack=stack_name)
+        migration_state.set_cdc_teardown(
+            job_id,
+            kind="delete",
+            stack=stack_name,
+            ctx={
+                "region": region,
+                "role_arn": getattr(migration_state, "cdc_deploy_role_arn", None),
+                "profile": aws_profile,
+                "cleanup_secret": cleanup_secret,
+            },
+        )
     _log_cdc_event("delete CDC infrastructure", detail=f"stack {stack_name}")
     ui.notify("Delete CDC infrastructure submitted.", type="warning", position="top")  # type: ignore[attr-defined]
     refresh()

@@ -541,3 +541,74 @@ def test_handler_reports_failed_on_exception(seeder_env) -> None:
     status, data, _pid = cfnresponse.sent[-1]
     assert status == cfnresponse.FAILED
     assert "Error" in data
+
+
+# --------------------------------------------------------------------------- #
+# The REAL vendored cfnresponse: bounded PUT retries (v21). A single failed PUT
+# left CloudFormation with no response -> ~1h hang -> DELETE_FAILED (orphaned MSK).
+# --------------------------------------------------------------------------- #
+
+
+def _load_real_cfnresponse():
+    """Load the actual deploy/cdc-stack/lambda/cfnresponse.py from its path (the
+    tests elsewhere inject a FAKE cfnresponse; here we exercise the real one)."""
+    path = SEEDER_PATH.parent / "cfnresponse.py"
+    spec = importlib.util.spec_from_file_location("cfnresponse_real_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _CfnCtx:
+    log_stream_name = "log-stream-xyz"
+
+
+def _cfn_event():
+    return {
+        "ResponseURL": "https://s3.example/presigned-put",
+        "StackId": "stack-1",
+        "RequestId": "req-1",
+        "LogicalResourceId": "CdcStartPrepResource",
+    }
+
+
+class _Resp200:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+def test_cfnresponse_retries_put_until_success(monkeypatch) -> None:
+    cfn = _load_real_cfnresponse()
+    calls = {"n": 0}
+
+    def _fake_urlopen(_req, timeout=None):  # noqa: ANN001
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise OSError("egress not ready yet")  # transient, e.g. ENIs settling
+        return _Resp200()
+
+    monkeypatch.setattr(cfn.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(cfn.time, "sleep", lambda _s: None)  # skip real backoff
+    cfn.send(_cfn_event(), _CfnCtx(), cfn.SUCCESS, {}, "pid")
+    assert calls["n"] == 3  # failed twice, succeeded on the 3rd -> stopped retrying
+
+
+def test_cfnresponse_gives_up_after_max_attempts_without_raising(monkeypatch) -> None:
+    cfn = _load_real_cfnresponse()
+    calls = {"n": 0}
+
+    def _always_fail(_req, timeout=None):  # noqa: ANN001
+        calls["n"] += 1
+        raise OSError("egress down")
+
+    monkeypatch.setattr(cfn.urllib.request, "urlopen", _always_fail)
+    monkeypatch.setattr(cfn.time, "sleep", lambda _s: None)
+    # A raising response helper would crash the handler; it must exhaust the BOUNDED
+    # retries and return quietly (never loop forever, never propagate).
+    cfn.send(_cfn_event(), _CfnCtx(), cfn.FAILED, {}, "pid", reason="boom")
+    assert calls["n"] == cfn._SEND_MAX_ATTEMPTS  # bounded (not 1, not infinite)

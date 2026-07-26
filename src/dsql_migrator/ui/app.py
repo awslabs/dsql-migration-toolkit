@@ -356,24 +356,31 @@ def build_page(
         and the JobManager status -- cheap, no AWS call. Returns ``{"kind", "stack"}``
         while the stop/delete job is PENDING/RUNNING so the banner shows on EVERY view
         (including the Connect screen a Start-over → delete lands on); once the job
-        settles it clears the marker (idempotent) and returns ``None`` so the banner
-        disappears and the Start-over guard releases.
+        while running it returns ``{"state":"running",...}``; when the teardown
+        FAILED it returns ``{"state":"failed",...}`` (an actionable banner, marker
+        kept so the user can retry/dismiss); when it settled OK (or the job was lost)
+        it clears the marker and returns ``None`` so the banner disappears and the
+        Start-over guard releases.
         """
         from dsql_migrator.ui.data_migration._status import (
-            cdc_teardown_banner_active,
+            cdc_teardown_banner_state,
         )
 
         migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
         job_id = getattr(migration_state, "cdc_teardown_job_id", None)
         if not job_id:
             return None
-        if cdc_teardown_banner_active(JOB_MANAGER, job_id):
+        state = cdc_teardown_banner_state(JOB_MANAGER, job_id)
+        if state in ("running", "failed"):
             return {
+                "state": state,
                 "kind": getattr(migration_state, "cdc_teardown_kind", None),
                 "stack": getattr(migration_state, "cdc_teardown_stack", None),
             }
-        # Settled (or a job the manager no longer knows, e.g. lost across a restart):
-        # clear the marker so the banner disappears and the guard releases.
+        # Settled OK (DONE) or a job the manager no longer knows (lost across a
+        # restart): clear the marker so the banner disappears and the guard releases.
+        # A FAILED teardown is NOT cleared here -- it stays as an actionable
+        # "retry cleanup" banner until the user retries or dismisses it.
         migration_state.clear_cdc_teardown()
         return None
 
@@ -420,38 +427,35 @@ def build_page(
         except Exception:  # noqa: BLE001 - leave cached state; dialog opens regardless
             pass
 
-    def _cdc_teardown_on_reset(mode: str) -> None:
-        """Submit a CDC teardown as part of Start over (called BEFORE the reset).
-
-        ``mode`` is ``"stop"`` (delete only the 2 MSK connectors, keep MSK/VPC/
-        IAM for a fast restart) or ``"delete"`` (tear down the whole cdc-stack).
-        All config is captured into the job closure now, so the imminent session
-        reset cannot race it; the teardown runs in the background (no UI log sink).
+    def _launch_cdc_teardown(
+        migration_state,
+        *,
+        mode,
+        stack_name,
+        region,
+        role_arn,
+        aws_profile,
+        cleanup_secret,
+    ) -> Optional[str]:
+        """Build the deployer and submit a CDC teardown (stop/delete) as a background
+        job, recording the durable marker + the retry context ({region, role_arn,
+        profile, cleanup_secret}). Shared by the Start-over teardown and the banner's
+        one-click "Retry cleanup". Returns the submitted job id (or ``None`` when the
+        ownership guard declined to overwrite a different, still-running teardown).
         """
         from dsql_migrator.core.cdc_deployer import (
             build_cdc_stack_deployer,
             run_cdc_delete,
             run_cdc_stop,
         )
+        from dsql_migrator.ui.data_migration._status import (
+            should_replace_teardown_marker,
+        )
 
-        migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
-        session = SESSION_STORE.get_or_create(session_id)
-        target = getattr(session, "target_config", None)
-        region = getattr(target, "region", None) if target else None
-        if not region and target is not None:
-            endpoint = getattr(target, "cluster_endpoint", "") or ""
-            if ".dsql." in endpoint and ".on.aws" in endpoint:
-                region = endpoint.split(".dsql.")[1].split(".on.aws")[0]
-        stack_name = getattr(migration_state, "cdc_stack_name", None)
-        if not region or not stack_name:
-            return
-        aws_profile = getattr(session, "aws_profile", None)
-        role_arn = getattr(migration_state, "cdc_deploy_role_arn", None)
         deployer = build_cdc_stack_deployer(
             region, aws_profile=aws_profile, assume_role_arn=role_arn
         )
         if mode == "delete":
-            cleanup_secret = not getattr(session, "source_secret_id", None)
 
             def work(handle) -> None:
                 run_cdc_delete(
@@ -475,28 +479,68 @@ def build_page(
                 )
 
         job_id = JOB_MANAGER.submit(work)
-        # Durable teardown marker: set it BEFORE the imminent session reset. It is
-        # preserved across reset_in_place, so the persistent cross-view banner keeps
-        # the background teardown visible (and the Start-over guard keeps blocking a
-        # second reset) from the moment it starts -- not only once the CloudFormation
-        # stack flips to DELETE_IN_PROGRESS. Cleared by _cdc_teardown_banner on settle.
-        # Ownership guard: don't clobber a DIFFERENT teardown still tracked+running
-        # (rare two-tab race) -- keep the first, longer-lived one.
-        from dsql_migrator.ui.data_migration._status import (
-            should_replace_teardown_marker,
-        )
-
+        # Durable marker (survives the Start-over reset) + the retry context so the
+        # banner can re-launch this teardown even after the session is wiped. Ownership
+        # guard: don't clobber a DIFFERENT teardown still tracked+running (rare two-tab
+        # race) -- keep the first, longer-lived one.
         if should_replace_teardown_marker(
-            JOB_MANAGER,
-            getattr(migration_state, "cdc_teardown_job_id", None),
-            job_id,
+            JOB_MANAGER, getattr(migration_state, "cdc_teardown_job_id", None), job_id
         ):
-            migration_state.set_cdc_teardown(job_id, kind=mode, stack=stack_name)
-        # The teardown runs in the background after the session resets, so poll it
-        # and surface a completion toast — the user knows when the connectors (or
-        # the whole stack) are gone and a fresh migration can start.
+            migration_state.set_cdc_teardown(
+                job_id,
+                kind=mode,
+                stack=stack_name,
+                ctx={
+                    "region": region,
+                    "role_arn": role_arn,
+                    "profile": aws_profile,
+                    "cleanup_secret": cleanup_secret,
+                },
+            )
+            return job_id
+        return None
+
+    def _cdc_teardown_on_reset(mode: str) -> None:
+        """Submit a CDC teardown as part of Start over (called BEFORE the reset).
+
+        ``mode`` is ``"stop"`` (delete only the 2 MSK connectors, keep MSK/VPC/IAM
+        for a fast restart) or ``"delete"`` (tear down the whole cdc-stack). All
+        config is captured now (into the durable marker's retry ctx and the job
+        closure), so the imminent session reset cannot race it; the teardown runs in
+        the background and stays visible/retryable via the persistent banner.
+        """
+        migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
+        session = SESSION_STORE.get_or_create(session_id)
+        target = getattr(session, "target_config", None)
+        region = getattr(target, "region", None) if target else None
+        if not region and target is not None:
+            endpoint = getattr(target, "cluster_endpoint", "") or ""
+            if ".dsql." in endpoint and ".on.aws" in endpoint:
+                region = endpoint.split(".dsql.")[1].split(".on.aws")[0]
+        stack_name = getattr(migration_state, "cdc_stack_name", None)
+        if not region or not stack_name:
+            return
+        aws_profile = getattr(session, "aws_profile", None)
+        role_arn = getattr(migration_state, "cdc_deploy_role_arn", None)
+        cleanup_secret = mode == "delete" and not getattr(
+            session, "source_secret_id", None
+        )
+        job_id = _launch_cdc_teardown(
+            migration_state,
+            mode=mode,
+            stack_name=stack_name,
+            region=region,
+            role_arn=role_arn,
+            aws_profile=aws_profile,
+            cleanup_secret=cleanup_secret,
+        )
+        # The teardown runs in the background after the session resets; surface a
+        # completion toast (the persistent banner also tracks it). If the marker was
+        # not claimed (another teardown already running), poll whatever is tracked.
         from nicegui import ui
 
+        if job_id is None:
+            job_id = getattr(migration_state, "cdc_teardown_job_id", None)
         if mode == "delete":
             started = "Deleting CDC infrastructure in the background (~45 min)…"
             done = "CDC infrastructure deleted — MSK/NAT billing stopped."
@@ -520,14 +564,59 @@ def build_page(
                 ui.notify(done, type="positive", position="top", timeout=8000)  # type: ignore[attr-defined]
             else:
                 ui.notify(  # type: ignore[attr-defined]
-                    "CDC teardown did not complete cleanly — check the CDC step or "
-                    "CloudWatch.",
+                    "CDC teardown did not complete cleanly — a banner with a "
+                    "Retry cleanup button stays on screen until it succeeds.",
                     type="warning",
                     position="top",
                     timeout=8000,
                 )
 
         timer_ref["t"] = ui.timer(10.0, _poll)  # type: ignore[attr-defined]
+
+    def _cdc_teardown_retry() -> None:
+        """Re-launch the tracked teardown from the durable marker's retry context.
+
+        Backs the failed-teardown banner's one-click "Retry cleanup": rebuilds the
+        deployer from the saved region/role/profile (the session may have been wiped
+        by Start over) and re-submits the teardown, which retains any stuck resource
+        and re-issues the delete (recover_delete_failed). Sets the marker back to
+        running so the banner returns to the in-progress state.
+        """
+        from nicegui import ui
+
+        migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
+        stack_name = getattr(migration_state, "cdc_teardown_stack", None)
+        kind = getattr(migration_state, "cdc_teardown_kind", None) or "delete"
+        ctx = dict(getattr(migration_state, "cdc_teardown_ctx", {}) or {})
+        region = ctx.get("region")
+        if not stack_name or not region:
+            ui.notify(  # type: ignore[attr-defined]
+                "Can't retry automatically here — open the Data Migration → CDC step "
+                "and use Delete CDC infrastructure.",
+                type="warning",
+                position="top",
+            )
+            return
+        # Clear first so the ownership guard sees a fresh claim (the old FAILED job is
+        # a different, settled one, so it would allow the write anyway).
+        migration_state.clear_cdc_teardown()
+        _launch_cdc_teardown(
+            migration_state,
+            mode=kind,
+            stack_name=stack_name,
+            region=region,
+            role_arn=ctx.get("role_arn"),
+            aws_profile=ctx.get("profile"),
+            cleanup_secret=bool(ctx.get("cleanup_secret")),
+        )
+        ui.notify("Retrying CDC cleanup…", type="info", position="top")  # type: ignore[attr-defined]
+
+    def _cdc_teardown_dismiss() -> None:
+        """Dismiss a FAILED teardown banner (clear the marker only). The AWS resources
+        are NOT touched -- the user chooses to stop tracking it here (e.g. they will
+        finish cleanup in the console)."""
+        migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
+        migration_state.clear_cdc_teardown()
 
     build_workflow_sidebar(
         SESSION_STORE,
@@ -572,6 +661,8 @@ def build_page(
         cdc_stack_name_getter=_cdc_stack_name,
         cdc_teardown_in_flight_getter=_cdc_teardown_in_flight,
         cdc_teardown_banner_getter=_cdc_teardown_banner,
+        cdc_teardown_retry=_cdc_teardown_retry,
+        cdc_teardown_dismiss=_cdc_teardown_dismiss,
         cdc_op_in_flight_getter=_cdc_op_in_flight,
         cdc_probe=_cdc_probe,
         optional_tools={

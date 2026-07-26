@@ -199,6 +199,12 @@ class DataMigrationState:
         self.cdc_teardown_job_id: Optional[str] = None
         self.cdc_teardown_kind: Optional[str] = None  # "stop"|"delete"
         self.cdc_teardown_stack: Optional[str] = None
+        # Everything a one-click "Retry cleanup" needs to re-launch this teardown
+        # AFTER a Start-over session reset has wiped the session config (region /
+        # deploy-role / profile / whether to also delete the tool-managed secret).
+        # {"region","role_arn","profile","cleanup_secret"}. Preserved with the marker
+        # across reset_in_place; empty when no teardown is tracked.
+        self.cdc_teardown_ctx: dict = {}
         # UI-only: remembered open/closed state of the "Deploy log" expansion.
         # Anchored on the (session-scoped) state -- NOT a local of the render fn --
         # so the whole CDC panel's ~5s live-poll rebuild does not snap a log the
@@ -363,28 +369,35 @@ class DataMigrationState:
         *,
         kind: Optional[str] = None,
         stack: Optional[str] = None,
+        ctx: Optional[dict] = None,
     ) -> None:
         """Record an in-flight CDC teardown (stop/delete) for the persistent banner
         and the Start-over race-guard.
 
         ``kind`` is ``"stop"`` (remove connectors) or ``"delete"`` (tear down the
-        whole cdc-stack); ``stack`` names the targeted cdc-stack for the banner copy.
-        Unlike :meth:`set_cdc_deploy_job_id`, this marker is PRESERVED across a
-        Start-over :meth:`~DataMigrationStore.reset_in_place`, so a teardown fired by
-        Start-over stays visible/guarded even though the session was wiped. Cleared
-        with :meth:`clear_cdc_teardown` once the job settles.
+        whole cdc-stack); ``stack`` names the targeted cdc-stack for the banner copy;
+        ``ctx`` carries the config a one-click retry needs after a session reset
+        ({"region","role_arn","profile","cleanup_secret"}). Unlike
+        :meth:`set_cdc_deploy_job_id`, this marker is PRESERVED across a Start-over
+        :meth:`~DataMigrationStore.reset_in_place`, so a teardown fired by Start-over
+        stays visible/guarded/retryable even though the session was wiped. Cleared
+        with :meth:`clear_cdc_teardown` once the job settles (or the user dismisses a
+        failed one).
         """
         with self._lock:
             self.cdc_teardown_job_id = job_id
             self.cdc_teardown_kind = kind if job_id is not None else None
             self.cdc_teardown_stack = stack if job_id is not None else None
+            self.cdc_teardown_ctx = dict(ctx) if (job_id is not None and ctx) else {}
 
     def clear_cdc_teardown(self) -> None:
-        """Clear the in-flight teardown marker (the stop/delete job has settled)."""
+        """Clear the in-flight teardown marker (the stop/delete job settled or a
+        failed one was dismissed)."""
         with self._lock:
             self.cdc_teardown_job_id = None
             self.cdc_teardown_kind = None
             self.cdc_teardown_stack = None
+            self.cdc_teardown_ctx = {}
 
     def set_cdc_infra_inputs(self, inputs: dict[str, str]) -> None:
         """Replace the BYO-VPC infrastructure inputs (read-through to session)."""
@@ -751,11 +764,12 @@ class DataMigrationStore:
                 getattr(state, "cdc_teardown_job_id", None),
                 getattr(state, "cdc_teardown_kind", None),
                 getattr(state, "cdc_teardown_stack", None),
+                getattr(state, "cdc_teardown_ctx", None),
             )
             state.__init__()  # type: ignore[misc]  # re-run init on the same object
             if bound is not None:
                 state.bind_session(bound)
             if teardown[0] is not None:
                 state.set_cdc_teardown(
-                    teardown[0], kind=teardown[1], stack=teardown[2]
+                    teardown[0], kind=teardown[1], stack=teardown[2], ctx=teardown[3]
                 )

@@ -485,18 +485,29 @@ def should_replace_teardown_marker(
     )
 
 
-def cdc_teardown_banner_active(
+def cdc_teardown_banner_state(
     job_manager: JobManager, teardown_job_id: Optional[str]
-) -> bool:
-    """True while the durable teardown job is still PENDING/RUNNING (so the banner
-    should stay visible). False when there is no marker, or the job has settled / is
-    unknown to the manager -- the caller then clears the marker and hides the banner.
+) -> Optional[str]:
+    """State of the tracked teardown job, for the persistent banner:
+
+    * ``"running"`` -- PENDING/RUNNING → show the in-progress banner.
+    * ``"failed"``  -- FAILED/CANCELLED → show the actionable "teardown failed —
+      retry cleanup" banner. The caller does NOT clear the marker (it persists so
+      the user can retry or dismiss); MSK/NAT may still be billing.
+    * ``None``      -- no marker, or the job is DONE / unknown to the manager (lost
+      across a restart) → the caller clears the marker and hides the banner.
+
     Pure/read-only; the state-clearing side effect stays with the caller.
     """
     if not teardown_job_id:
-        return False
+        return None
     job = _current_job(job_manager, teardown_job_id)
-    return job is not None and getattr(job, "status", None) in ("PENDING", "RUNNING")
+    status = getattr(job, "status", None) if job is not None else None
+    if status in ("PENDING", "RUNNING"):
+        return "running"
+    if status in ("FAILED", "CANCELLED"):
+        return "failed"
+    return None
 
 
 def _classify_cdc_stack_phase(discovery) -> tuple[str, Optional[str]]:

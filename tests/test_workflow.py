@@ -934,19 +934,32 @@ def test_start_over_teardown_block_takes_precedence_over_op_warning() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_cdc_teardown_banner_copy_delete_stop_and_none() -> None:
+def test_cdc_teardown_banner_copy_running_failed_and_none() -> None:
     from dsql_migrator.ui.workflow import _cdc_teardown_banner_copy
 
     assert _cdc_teardown_banner_copy(None) is None
     assert _cdc_teardown_banner_copy({}) is None
-    d_header, d_body = _cdc_teardown_banner_copy({"kind": "delete", "stack": "cdc-x"})
-    assert "teardown in progress" in d_header.lower()
-    assert "cdc-x" in d_body and "billing" in d_body.lower()
-    s_header, s_body = _cdc_teardown_banner_copy({"kind": "stop", "stack": "cdc-y"})
-    assert "connector" in s_header.lower()
-    assert "cdc-y" in s_body
-    # A missing stack name falls back to a generic label (never a dangling quote).
-    _, fb = _cdc_teardown_banner_copy({"kind": "delete"})
+    # running delete → info tone.
+    tone, header, body = _cdc_teardown_banner_copy(
+        {"state": "running", "kind": "delete", "stack": "cdc-x"}
+    )
+    assert tone == "info"
+    assert "teardown in progress" in header.lower()
+    assert "cdc-x" in body and "billing" in body.lower()
+    # running stop → info tone, connector wording.
+    tone, header, body = _cdc_teardown_banner_copy(
+        {"state": "running", "kind": "stop", "stack": "cdc-y"}
+    )
+    assert tone == "info" and "connector" in header.lower() and "cdc-y" in body
+    # failed → error tone + actionable wording.
+    tone, header, body = _cdc_teardown_banner_copy(
+        {"state": "failed", "kind": "delete", "stack": "cdc-z"}
+    )
+    assert tone == "error"
+    assert "failed" in header.lower()
+    assert "cdc-z" in body and "DELETE_FAILED" in body
+    # No state defaults to running; missing stack → generic label (no dangling quote).
+    _, _, fb = _cdc_teardown_banner_copy({"kind": "delete"})
     assert "the cdc-stack" in fb
 
 
@@ -958,6 +971,7 @@ class _BannerUi:
     def __init__(self) -> None:
         self.texts: list[str] = []
         self.timer_armed = False
+        self.buttons: list = []  # (label, on_click) for the failed-state actions
 
     class _El:
         def classes(self, *_a, **_k):
@@ -1000,6 +1014,10 @@ class _BannerUi:
     def card(self, *_a, **_k):
         return self._El()
 
+    def button(self, text="", *_a, on_click=None, **_k):
+        self.buttons.append((str(text), on_click))
+        return self._El()
+
 
 def test_render_cdc_teardown_banner_shows_while_in_flight_and_arms_poll() -> None:
     from dsql_migrator.ui.workflow import _render_cdc_teardown_banner
@@ -1038,3 +1056,36 @@ def test_render_cdc_teardown_banner_survives_getter_error() -> None:
     ui = _BannerUi()
     _render_cdc_teardown_banner(ui, _boom)  # a broken getter must never break render
     assert ui.texts == []
+
+
+def test_render_cdc_teardown_banner_running_has_no_action_buttons() -> None:
+    from dsql_migrator.ui.workflow import _render_cdc_teardown_banner
+
+    ui = _BannerUi()
+    _render_cdc_teardown_banner(
+        ui, lambda: {"state": "running", "kind": "delete", "stack": "cdc-z"}
+    )
+    assert any("teardown in progress" in t.lower() for t in ui.texts)
+    assert ui.buttons == []  # no retry/dismiss while running
+    assert ui.timer_armed  # running self-polls
+
+
+def test_render_cdc_teardown_banner_failed_shows_retry_and_dismiss() -> None:
+    from dsql_migrator.ui.workflow import _render_cdc_teardown_banner
+
+    calls = {"retry": 0, "dismiss": 0}
+    ui = _BannerUi()
+    _render_cdc_teardown_banner(
+        ui,
+        lambda: {"state": "failed", "kind": "delete", "stack": "cdc-z"},
+        on_retry=lambda: calls.__setitem__("retry", calls["retry"] + 1),
+        on_dismiss=lambda: calls.__setitem__("dismiss", calls["dismiss"] + 1),
+    )
+    assert any("failed" in t.lower() for t in ui.texts)
+    assert not ui.timer_armed  # failed is terminal-until-acted; no self-poll churn
+    by_label = {label: cb for label, cb in ui.buttons}
+    assert "Retry cleanup" in by_label and "Dismiss" in by_label
+    # Clicking each action invokes the wired callback.
+    by_label["Retry cleanup"]()
+    by_label["Dismiss"]()
+    assert calls == {"retry": 1, "dismiss": 1}

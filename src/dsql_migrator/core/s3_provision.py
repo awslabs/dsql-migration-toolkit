@@ -51,6 +51,13 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v21 rebuilds the offset-seeder Lambda zip: cfnresponse.send now RETRIES the
+#    CloudFormation response PUT (bounded, ~4 attempts with backoff) instead of
+#    giving up after one failed attempt. A single failed PUT during teardown left
+#    CloudFormation with NO response -> it waited its own ~1h custom-resource timeout
+#    -> the whole cdc-stack landed in DELETE_FAILED (leaving billable MSK/NAT).
+#    Retrying rides out a transient S3-gateway egress hiccup while ENIs/routes settle.
+#    Seeder-zip change only; neither connector plugin changed.
 # v20 rebuilds the offset-seeder Lambda zip: the seeder now ALSO pre-creates the
 #    per-table sink topics on every start (not just seeds the offset on a gapless
 #    handoff), so the source and sink connectors can be created in one parallel pass
@@ -180,7 +187,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v20"
+PLUGIN_VERSION = "v21"
 
 
 class S3ProvisionError(RuntimeError):

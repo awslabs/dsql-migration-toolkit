@@ -1183,18 +1183,27 @@ def test_set_and_clear_cdc_teardown_marker() -> None:
     # Start-over race-guard; it must round-trip and clear cleanly.
     state = DataMigrationState()
     assert state.cdc_teardown_job_id is None
-    state.set_cdc_teardown("job-del", kind="delete", stack="mysql-dsql-cdc-x")
+    assert state.cdc_teardown_ctx == {}
+    state.set_cdc_teardown(
+        "job-del",
+        kind="delete",
+        stack="mysql-dsql-cdc-x",
+        ctx={"region": "ap-northeast-2", "cleanup_secret": True},
+    )
     assert state.cdc_teardown_job_id == "job-del"
     assert state.cdc_teardown_kind == "delete"
     assert state.cdc_teardown_stack == "mysql-dsql-cdc-x"
-    state.clear_cdc_teardown()  # job settled
+    assert state.cdc_teardown_ctx["region"] == "ap-northeast-2"  # retry context kept
+    state.clear_cdc_teardown()  # job settled / dismissed
     assert state.cdc_teardown_job_id is None
     assert state.cdc_teardown_kind is None
     assert state.cdc_teardown_stack is None
-    # job_id=None also drops the kind/stack (no orphaned metadata).
-    state.set_cdc_teardown("j", kind="stop", stack="s")
+    assert state.cdc_teardown_ctx == {}
+    # job_id=None also drops the kind/stack/ctx (no orphaned metadata).
+    state.set_cdc_teardown("j", kind="stop", stack="s", ctx={"region": "r"})
     state.set_cdc_teardown(None)
     assert state.cdc_teardown_kind is None and state.cdc_teardown_stack is None
+    assert state.cdc_teardown_ctx == {}
 
 
 def test_reset_in_place_preserves_cdc_teardown_marker() -> None:
@@ -1204,16 +1213,23 @@ def test_reset_in_place_preserves_cdc_teardown_marker() -> None:
     store = DataMigrationStore()
     state = store.get_or_create("s1")
     state.job_id = "job-xyz"
-    state.set_cdc_teardown("teardown-1", kind="delete", stack="mysql-dsql-cdc-seoul")
+    state.set_cdc_teardown(
+        "teardown-1",
+        kind="delete",
+        stack="mysql-dsql-cdc-seoul",
+        ctx={"region": "ap-northeast-2", "cleanup_secret": True},
+    )
 
     store.reset_in_place("s1")
 
     assert store.get_or_create("s1") is state  # same instance
     assert state.job_id is None  # everything else wiped
-    # ...but the in-flight teardown marker survives the reset.
+    # ...but the in-flight teardown marker + its retry context survive the reset (so
+    # the persistent banner + one-click Retry cleanup keep working post-reset).
     assert state.cdc_teardown_job_id == "teardown-1"
     assert state.cdc_teardown_kind == "delete"
     assert state.cdc_teardown_stack == "mysql-dsql-cdc-seoul"
+    assert state.cdc_teardown_ctx == {"region": "ap-northeast-2", "cleanup_secret": True}
 
 
 def test_reset_in_place_without_teardown_leaves_marker_clear() -> None:
@@ -1381,17 +1397,18 @@ def test_should_replace_teardown_marker_ownership() -> None:
     assert should_replace_teardown_marker(jm, "ghost", "new") is True  # unknown/lost
 
 
-def test_cdc_teardown_banner_active_tracks_job_status() -> None:
-    # The banner shows while the durable job is PENDING/RUNNING and hides once it
-    # settles or the manager no longer knows it (caller then clears the marker).
-    from dsql_migrator.ui.data_migration._status import cdc_teardown_banner_active
+def test_cdc_teardown_banner_state_tracks_job_status() -> None:
+    # running while PENDING/RUNNING; failed on FAILED/CANCELLED (actionable banner);
+    # None when settled-ok/unknown (caller clears the marker + hides the banner).
+    from dsql_migrator.ui.data_migration._status import cdc_teardown_banner_state
 
-    assert cdc_teardown_banner_active(_MultiJobJM({}), None) is False  # no marker
-    assert cdc_teardown_banner_active(_MultiJobJM({"j": "PENDING"}), "j") is True
-    assert cdc_teardown_banner_active(_MultiJobJM({"j": "RUNNING"}), "j") is True
-    assert cdc_teardown_banner_active(_MultiJobJM({"j": "DONE"}), "j") is False
-    assert cdc_teardown_banner_active(_MultiJobJM({"j": "FAILED"}), "j") is False
-    assert cdc_teardown_banner_active(_MultiJobJM({}), "ghost") is False  # lost job
+    assert cdc_teardown_banner_state(_MultiJobJM({}), None) is None  # no marker
+    assert cdc_teardown_banner_state(_MultiJobJM({"j": "PENDING"}), "j") == "running"
+    assert cdc_teardown_banner_state(_MultiJobJM({"j": "RUNNING"}), "j") == "running"
+    assert cdc_teardown_banner_state(_MultiJobJM({"j": "FAILED"}), "j") == "failed"
+    assert cdc_teardown_banner_state(_MultiJobJM({"j": "CANCELLED"}), "j") == "failed"
+    assert cdc_teardown_banner_state(_MultiJobJM({"j": "DONE"}), "j") is None  # ok
+    assert cdc_teardown_banner_state(_MultiJobJM({}), "ghost") is None  # lost job
 
 
 def test_cdc_step_delete_and_stop_handlers_set_teardown_marker(monkeypatch) -> None:
@@ -1431,12 +1448,17 @@ def test_cdc_step_delete_and_stop_handlers_set_teardown_marker(monkeypatch) -> N
     assert state.cdc_teardown_job_id == "job-1"
     assert state.cdc_teardown_kind == "delete"
     assert state.cdc_teardown_stack == state.cdc_stack_name
+    # Retry context captured so a one-click retry works even post-reset.
+    assert state.cdc_teardown_ctx["region"] == "us-east-1"
+    assert state.cdc_teardown_ctx["cleanup_secret"] is True  # no SM secret → tool cleans up
 
     state2 = DataMigrationState()
     _cdcui._start_cdc_stop(_Ui(), state2, _SubmitOnlyJM(), lambda: None, session=session)
     assert state2.cdc_teardown_job_id == "job-1"
     assert state2.cdc_teardown_kind == "stop"
     assert state2.cdc_teardown_stack == state2.cdc_stack_name
+    assert state2.cdc_teardown_ctx["region"] == "us-east-1"
+    assert state2.cdc_teardown_ctx["cleanup_secret"] is False  # stop never cleans the secret
 
 
 # ---------------------------------------------------------------------------

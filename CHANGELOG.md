@@ -5,6 +5,29 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.122
+
+### Fixed
+
+- **A failed CloudFormation delete no longer silently strands the CDC
+  infrastructure.** The in-VPC seeder Lambda's CloudFormation response now
+  **retries** its response PUT (bounded, ~4 attempts) instead of giving up after
+  one. A single failed PUT during teardown previously left CloudFormation with no
+  response, so it waited its own ~1h custom-resource timeout and the whole cdc-stack
+  landed in `DELETE_FAILED` — leaving MSK/NAT billing. Retrying rides out a transient
+  S3-gateway egress hiccup while ENIs/routes settle. (Takes effect on freshly
+  deployed CDC infrastructure; `PLUGIN_VERSION` bumped to v21.)
+
+### Added
+
+- **The teardown banner now recovers from a `DELETE_FAILED`.** When a CDC teardown
+  ends in CloudFormation `DELETE_FAILED`, the persistent banner switches from
+  "in progress" to an actionable **"CDC teardown failed — action needed"** state
+  (error styling) with a one-click **Retry cleanup** — which re-runs the delete,
+  retaining the stuck resource so the rest (MSK/NAT) is removed — and a **Dismiss**.
+  The retry works even after Start over has reset the session: the region / deploy
+  role / profile it needs are saved with the durable teardown marker.
+
 ## v0.1.121
 
 ### Fixed

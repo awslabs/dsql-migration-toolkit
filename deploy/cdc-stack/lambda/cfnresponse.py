@@ -7,10 +7,20 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.request
 
 SUCCESS = "SUCCESS"
 FAILED = "FAILED"
+
+# The response PUT is retried: a single failed attempt means CloudFormation receives
+# NO response and then waits its OWN ~1h custom-resource timeout before failing the
+# stack op (the classic DELETE_FAILED hang). During teardown the S3-gateway egress
+# path may be momentarily unreachable while ENIs/routes settle, so a few bounded
+# retries land the response instead of dead-ending the whole teardown. Kept well
+# under the Lambda's timeout: worst case ~4*10s PUT + (3+6+9)s backoff ≈ 58s.
+_SEND_MAX_ATTEMPTS = 4
+_SEND_TIMEOUT_SECONDS = 10
 
 
 def send(
@@ -43,18 +53,31 @@ def send(
         "content-length": str(len(json_response_body)),
     }
 
-    try:
-        req = urllib.request.Request(
-            response_url,
-            data=json_response_body,
-            headers=headers,
-            method="PUT",
-        )
-        # Short bounded timeout: the response URL is an S3 pre-signed PUT reachable
-        # via the stack's S3 gateway VPC endpoint. If egress is ever unavailable
-        # (e.g. a teardown race), fail fast rather than hanging the full 122s so the
-        # invocation does not burn its whole budget.
-        with urllib.request.urlopen(req, timeout=10) as response:  # noqa: S310
-            print(f"Status code: {response.status}")
-    except Exception as exc:  # noqa: BLE001
-        print(f"send(..) failed executing urllib.request.urlopen(..): {exc}")
+    # Retry the PUT so a transient egress hiccup during teardown does not leave
+    # CloudFormation with no response (which it would then wait ~1h on before
+    # DELETE_FAILED). Each attempt uses a short bounded timeout to fail fast rather
+    # than hang; between attempts we back off briefly to let the S3-gateway egress
+    # path settle. Any successful PUT means CloudFormation has the outcome -> return.
+    last_exc: Exception | None = None
+    for attempt in range(1, _SEND_MAX_ATTEMPTS + 1):
+        try:
+            req = urllib.request.Request(
+                response_url,
+                data=json_response_body,
+                headers=headers,
+                method="PUT",
+            )
+            with urllib.request.urlopen(  # noqa: S310
+                req, timeout=_SEND_TIMEOUT_SECONDS
+            ) as response:
+                print(f"Status code: {response.status} (attempt {attempt})")
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            print(f"send(..) attempt {attempt} failed: {exc}")
+            if attempt < _SEND_MAX_ATTEMPTS:
+                time.sleep(3 * attempt)  # 3s, 6s, 9s backoff
+    print(
+        "send(..) exhausted retries executing urllib.request.urlopen(..); "
+        f"last error: {last_exc}"
+    )

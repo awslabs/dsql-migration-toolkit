@@ -5,6 +5,27 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.122
+
+### Fixed
+
+- **CloudFormation 삭제 실패가 더 이상 CDC 인프라를 조용히 방치하지 않습니다.** in-VPC
+  seeder Lambda의 CloudFormation 응답 PUT이 이제 한 번 실패하면 포기하지 않고 **재시도**
+  합니다(바운드, ~4회). 기존에는 teardown 중 PUT이 한 번 실패하면 CloudFormation이 응답을
+  받지 못해 자체 ~1시간 커스텀 리소스 타임아웃을 기다렸고, 결국 cdc-stack 전체가
+  `DELETE_FAILED`로 빠져 MSK/NAT 과금이 남았습니다. 재시도로 ENI/라우트가 정리되는 동안의
+  일시적 S3 게이트웨이 egress 순단을 넘깁니다. (새로 배포되는 CDC 인프라에 적용;
+  `PLUGIN_VERSION` v21로 상향.)
+
+### Added
+
+- **teardown 배너가 `DELETE_FAILED`에서 복구합니다.** CDC teardown이 CloudFormation
+  `DELETE_FAILED`로 끝나면, 지속 배너가 "진행 중"에서 **"CDC teardown 실패 — 조치 필요"**
+  (에러 스타일) 상태로 전환되고, 원클릭 **Retry cleanup**(막힌 리소스를 retain하고 삭제를
+  재실행해 MSK/NAT까지 정리)과 **Dismiss**를 제공합니다. Start over로 세션이 초기화된
+  뒤에도 재시도가 동작합니다 — 필요한 region/배포 역할/프로필을 durable teardown 마커에
+  함께 저장합니다.
+
 ## v0.1.121
 
 ### Fixed

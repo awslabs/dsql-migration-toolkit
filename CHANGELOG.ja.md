@@ -5,6 +5,27 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.122
+
+### Fixed
+
+- **CloudFormation の削除失敗が、CDC インフラを黙って放置しなくなりました。** in-VPC の
+  seeder Lambda の CloudFormation レスポンス PUT が、1 回失敗しても諦めずに **リトライ**
+  するようになりました(上限あり、約 4 回)。従来は teardown 中に PUT が 1 回失敗すると
+  CloudFormation がレスポンスを受け取れず、自身の約 1 時間のカスタムリソースタイムアウトを
+  待ち、結果として cdc-stack 全体が `DELETE_FAILED` に陥って MSK/NAT の課金が残っていました。
+  リトライにより、ENI/ルートが落ち着くまでの一時的な S3 ゲートウェイ egress の瞬断を乗り
+  切ります。(新規デプロイの CDC インフラに適用。`PLUGIN_VERSION` を v21 に更新。)
+
+### Added
+
+- **teardown バナーが `DELETE_FAILED` から復旧します。** CDC teardown が CloudFormation
+  `DELETE_FAILED` で終わると、永続バナーが「進行中」から **「CDC teardown 失敗 — 要対応」**
+  (エラー表示)状態に切り替わり、ワンクリックの **Retry cleanup**(スタックしたリソースを
+  retain して削除を再実行し、MSK/NAT まで片付ける)と **Dismiss** を提供します。Start over
+  でセッションがリセットされた後でもリトライは動作します — 必要な region/デプロイロール/
+  プロファイルを durable な teardown マーカーに一緒に保存します。
+
 ## v0.1.121
 
 ### Fixed

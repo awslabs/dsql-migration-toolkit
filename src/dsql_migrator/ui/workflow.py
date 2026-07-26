@@ -1286,23 +1286,35 @@ _TEARDOWN_BANNER_POLL_SECONDS = 10.0
 
 def _cdc_teardown_banner_copy(
     info: "Optional[dict]",
-) -> "Optional[tuple[str, str]]":
-    """Map teardown-banner info to ``(header, body)``, or ``None`` when nothing is in
-    flight. Pure/side-effect-free so the copy is unit-testable independent of the
-    render+poll wrapper. ``info`` is ``{"kind": "stop"|"delete", "stack": <name>}``.
+) -> "Optional[tuple[str, str, str]]":
+    """Map teardown-banner info to ``(tone, header, body)``, or ``None`` when nothing
+    is in flight. Pure/side-effect-free so the copy is unit-testable independent of
+    the render+poll wrapper. ``info`` is ``{"state": "running"|"failed", "kind":
+    "stop"|"delete", "stack": <name>}``.
     """
     if not info:
         return None
+    state = info.get("state", "running")
     kind = info.get("kind")
     stack = info.get("stack") or "the cdc-stack"
+    if state == "failed":
+        return (
+            "error",
+            "CDC teardown failed — action needed",
+            f"Tearing down '{stack}' did not complete (CloudFormation reported "
+            "DELETE_FAILED). MSK / NAT may still be billing. Retry the cleanup, or "
+            "dismiss this to finish in the AWS console.",
+        )
     if kind == "delete":
         return (
+            "info",
             "CDC infrastructure teardown in progress",
             f"Deleting '{stack}' in the background (~15–45 min). MSK / NAT keep "
             "billing until it completes. You can keep working — this banner clears "
             "itself automatically when the teardown finishes.",
         )
     return (
+        "info",
         "Removing CDC connectors",
         f"Removing the CDC connectors from '{stack}' in the background. This banner "
         "clears itself automatically when it finishes.",
@@ -1310,19 +1322,28 @@ def _cdc_teardown_banner_copy(
 
 
 def _render_cdc_teardown_banner(
-    ui: object, banner_getter: "Optional[Callable[[], Optional[dict]]]"
+    ui: object,
+    banner_getter: "Optional[Callable[[], Optional[dict]]]",
+    *,
+    on_retry: "Optional[Callable[[], None]]" = None,
+    on_dismiss: "Optional[Callable[[], None]]" = None,
 ) -> None:
-    """Persistent, cross-view banner while a CDC teardown (stop/delete) runs in the
-    background.
+    """Persistent, cross-view banner for a CDC teardown (stop/delete).
 
     Shown on EVERY view -- including the Connect screen a Start-over → delete lands
     on -- so the operator always knows a teardown is still in flight (and that MSK /
     NAT keep billing until it finishes). Without it, a Start-over-triggered delete
     runs invisibly and the user cannot tell whether the infrastructure is gone yet.
-    It self-polls via a one-shot timer chain (the app-wide idiom that avoids the
-    "parent slot deleted" crash a repeating timer causes when the region is torn
-    down) and removes itself the moment the ``banner_getter`` reports the teardown
-    settled (the getter clears the durable marker on completion).
+
+    Two states from ``banner_getter``:
+    * ``running`` -- an info notice that self-polls via a one-shot timer chain (the
+      app-wide idiom that avoids the "parent slot deleted" crash a repeating timer
+      causes when the region is torn down) and removes itself once the getter reports
+      the teardown settled.
+    * ``failed`` -- an error notice with a one-click **Retry cleanup** (``on_retry``,
+      which re-runs the teardown / ``recover_delete_failed``) and **Dismiss**
+      (``on_dismiss``, stop tracking here). No self-poll -- it is terminal until the
+      user acts, then a refresh re-reads the state.
     """
     if banner_getter is None:
         return
@@ -1336,9 +1357,34 @@ def _render_cdc_teardown_banner(
         copy = _cdc_teardown_banner_copy(info)
         if copy is None:
             return  # nothing in flight (or just settled) → render nothing, stop polling
-        header, body = copy
-        render_notice(ui, tone="info", header=header, body=body)
-        # Re-arm a single-shot poll so the banner disappears once the job settles.
+        tone, header, body = copy
+        state = (info or {}).get("state", "running")
+        render_notice(ui, tone=tone, header=header, body=body)
+        if state == "failed":
+            # Actionable, terminal-until-acted: retry re-launches the teardown (the
+            # getter then reports "running" again); dismiss clears the marker. No poll.
+            with ui.row().classes("gap-2 mt-1"):  # type: ignore[attr-defined]
+                if on_retry is not None:
+
+                    def _retry(_e=None) -> None:
+                        on_retry()
+                        _banner.refresh()  # type: ignore[attr-defined]
+
+                    ui.button(  # type: ignore[attr-defined]
+                        "Retry cleanup", icon="restart_alt", on_click=_retry
+                    ).props("color=primary")
+                if on_dismiss is not None:
+
+                    def _dismiss(_e=None) -> None:
+                        on_dismiss()
+                        _banner.refresh()  # type: ignore[attr-defined]
+
+                    ui.button("Dismiss", on_click=_dismiss).props(  # type: ignore[attr-defined]
+                        "flat color=grey"
+                    )
+            return
+        # running → re-arm a single-shot poll so the banner disappears (or flips to
+        # the failed state) once the job settles.
         ui.timer(_TEARDOWN_BANNER_POLL_SECONDS, _banner.refresh, once=True)  # type: ignore[attr-defined]
 
     _banner()
@@ -1365,6 +1411,8 @@ def build_workflow_sidebar(
     cdc_stack_name_getter: Optional[Callable[[], Optional[str]]] = None,
     cdc_teardown_in_flight_getter: Optional[Callable[[], bool]] = None,
     cdc_teardown_banner_getter: Optional[Callable[[], Optional[dict]]] = None,
+    cdc_teardown_retry: Optional[Callable[[], None]] = None,
+    cdc_teardown_dismiss: Optional[Callable[[], None]] = None,
     cdc_op_in_flight_getter: Optional[Callable[[], Optional[str]]] = None,
     cdc_probe: Optional[Callable[[], None]] = None,
     optional_tools: Optional[dict[str, "OptionalTool"]] = None,
@@ -1752,7 +1800,12 @@ def build_workflow_sidebar(
             # workflow steps, and the optional tools) so a background stop/delete --
             # e.g. one fired by Start over, which lands the user on Connect -- stays
             # visible until it completes. Self-polls and removes itself on settle.
-            _render_cdc_teardown_banner(ui, cdc_teardown_banner_getter)
+            _render_cdc_teardown_banner(
+                ui,
+                cdc_teardown_banner_getter,
+                on_retry=cdc_teardown_retry,
+                on_dismiss=cdc_teardown_dismiss,
+            )
             if view == _CONNECT_VIEW:
                 # Refresh only the nav (not main) so verifying a connection
                 # unlocks the steps without rebuilding the Connect form.
