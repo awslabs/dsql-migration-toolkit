@@ -51,6 +51,12 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v20 rebuilds the offset-seeder Lambda zip: the seeder now ALSO pre-creates the
+#    per-table sink topics on every start (not just seeds the offset on a gapless
+#    handoff), so the source and sink connectors can be created in one parallel pass
+#    (both DependsOn the pre-created topics, not each other). Seeder-zip change only;
+#    neither connector plugin changed. The versioned S3 key forces the new zip to be
+#    re-uploaded so the cdc-stack picks it up.
 # v19 adds a per-table ReplicationLagMs CloudWatch metric (same namespace/dims as
 #    v18): the sink reads each event's source commit time (source.ts_ms) and, at
 #    apply time, records the worst end-to-end lag (now - source.ts_ms) per table,
@@ -174,7 +180,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v19"
+PLUGIN_VERSION = "v20"
 
 
 class S3ProvisionError(RuntimeError):
