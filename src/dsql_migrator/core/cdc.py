@@ -1260,6 +1260,14 @@ def cdc_scaling_params(
              _topic_group_include(by_tier[2]) if 2 in by_tier else ""),
             ("TopicGroupInclude4",
              _topic_group_include(by_tier[4]) if 4 in by_tier else ""),
+            # Explicit per-topic partition map for the seeder Lambda, which
+            # PRE-CREATES the topics (Debezium topic.creation only applies to topics
+            # it creates -- and the seeder now creates them first). Format
+            # "topic:count,...". Without this the seeder would create every topic
+            # with the flat TopicDefaultPartitions (=1 here), silently defeating the
+            # size-proportional plan (topic partition counts are immutable).
+            ("SinkTopicPartitions",
+             ",".join(f"{t}:{p}" for t, p in sorted(plan.partitions_by_topic.items()))),
         ]
 
     scaling = compute_cdc_scaling_defaults(len(topics), env=env)
@@ -1269,6 +1277,9 @@ def cdc_scaling_params(
         ("TopicCreationGroups", ""),
         ("TopicGroupInclude2", ""),
         ("TopicGroupInclude4", ""),
+        # Uniform plan: every topic gets TopicDefaultPartitions, so no per-topic map
+        # is needed (the seeder falls back to the flat count).
+        ("SinkTopicPartitions", ""),
     ]
 
 

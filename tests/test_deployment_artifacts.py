@@ -1395,6 +1395,31 @@ def test_cdc_stack_connectors_deploy_in_parallel_via_start_prep(
     assert "DebeziumSourceConnector" not in sink_depends
 
 
+def test_cdc_start_prep_passes_partition_map_and_max_bytes(cdc_template: dict) -> None:
+    # Pre-creation must reproduce Debezium topic.creation's shaping, so the seeder
+    # gets the per-topic partition map (SinkTopicPartitions) and max.message.bytes.
+    props = cdc_template["Resources"]["CdcStartPrepResource"]["Properties"]
+    assert props["SinkTopics"] == {"Ref": "SinkTopics"}
+    assert props["SinkTopicPartitions"] == {"Ref": "SinkTopicPartitions"}
+    assert props["MaxMessageBytes"] == {"Ref": "MaxMessageBytes"}
+    assert "SinkTopicPartitions" in cdc_template["Parameters"]
+
+
+def test_cdc_stack_seeder_iam_covers_per_table_topics(cdc_template: dict) -> None:
+    # The seeder now CREATES the per-table data topics too, so its IAM CreateTopic
+    # grant must cover them (scoped to <TopicPrefix>.*), not only the fixed offsets
+    # topic -- else every start fails with a Kafka authorization error.
+    role = cdc_template["Resources"]["OffsetSeederRole"]["Properties"]
+    stmts = role["Policies"][0]["PolicyDocument"]["Statement"]
+    seed = next(s for s in stmts if s.get("Sid") == "MskSeedTopic")
+    assert "kafka-cluster:CreateTopic" in seed["Action"]
+    resources = seed["Resource"]
+    assert isinstance(resources, list)
+    blob = json.dumps(resources)
+    assert "debezium-source-offsets" in blob  # the fixed offsets topic
+    assert "${TopicPrefix}." in blob           # the per-table data topics
+
+
 def test_cdc_stack_declares_watermark_and_seeder_params(cdc_template: dict) -> None:
     params = cdc_template["Parameters"]
     for p in (

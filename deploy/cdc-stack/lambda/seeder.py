@@ -157,7 +157,27 @@ def _ensure_compact_topic(bootstrap, region, topic, partitions):
         admin.close()
 
 
-def _ensure_data_topics(bootstrap, region, topics_csv, partitions):
+def _parse_partitions_map(partitions_map_csv):
+    """Parse a "topic:count,topic:count" string into {topic: int}. Skips malformed
+    entries (a bad count leaves that topic on the flat default)."""
+    result = {}
+    for pair in (partitions_map_csv or "").split(","):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        topic, _, count = pair.rpartition(":")
+        topic = topic.strip()
+        try:
+            result[topic] = int(count.strip())
+        except ValueError:
+            continue
+    return result
+
+
+def _ensure_data_topics(
+    bootstrap, region, topics_csv, default_partitions,
+    partitions_map_csv=None, max_message_bytes=None,
+):
     """Pre-create each per-table sink topic (idempotent), so the sink connector can
     be created IN PARALLEL with the source instead of after it.
 
@@ -165,24 +185,38 @@ def _ensure_data_topics(bootstrap, region, topics_csv, partitions):
     the deploy used to create the source first (and wait for Debezium to auto-create
     the topics) THEN the sink -- two serial MSK Connect creations. Creating the topics
     here up front (deterministic names ``<prefix>.<db>.<table>`` the caller already
-    computes, with the sink's unit-of-parallelism partition count) lets both
-    connectors deploy in one pass and removes the race at its source. Each topic is
-    created individually so already-existing ones are skipped (Debezium's
-    topic.creation then no-ops on them). ``replication_factor=-1`` lets the broker
+    computes) lets both connectors deploy in one pass and removes the race at its
+    source. Because Debezium's ``topic.creation`` only shapes topics IT creates, the
+    seeder must reproduce that shaping itself so pre-creation is not a regression:
+
+    * **Per-topic partitions** -- ``partitions_map_csv`` ("topic:count,...") carries
+      the size-proportional plan (compute_cdc_partition_plan.partitions_by_topic);
+      topics absent from it use ``default_partitions``. Partition counts are
+      IRREVERSIBLE, so getting them right at creation is essential.
+    * **max.message.bytes** -- set to ``max_message_bytes`` so a >1 MiB change event
+      isn't rejected (the Kafka default is 1 MiB; the source producer uses this too).
+
+    Each topic is created individually so already-existing ones are skipped (Debezium
+    ``topic.creation`` then no-ops on them). ``replication_factor=-1`` lets the broker
     apply its default (required for MSK Serverless).
     """
     topics = [t.strip() for t in (topics_csv or "").split(",") if t.strip()]
     if not topics:
         print("no data topics to pre-create (empty SinkTopics)")
         return
+    part_map = _parse_partitions_map(partitions_map_csv)
+    topic_configs = None
+    if max_message_bytes:
+        topic_configs = {"max.message.bytes": str(int(max_message_bytes))}
     admin = KafkaAdminClient(bootstrap_servers=bootstrap, **_iam_sasl_args(region))
     created = skipped = 0
     try:
         for name in topics:
+            parts = int(part_map.get(name, default_partitions))
             try:
                 admin.create_topics(
-                    [NewTopic(name=name, num_partitions=int(partitions),
-                              replication_factor=-1)]
+                    [NewTopic(name=name, num_partitions=parts,
+                              replication_factor=-1, topic_configs=topic_configs)]
                 )
                 created += 1
             except TopicAlreadyExistsError:
@@ -190,7 +224,8 @@ def _ensure_data_topics(bootstrap, region, topics_csv, partitions):
     finally:
         admin.close()
     print(
-        f"pre-created {created} data topic(s) ({partitions} partition(s) each), "
+        f"pre-created {created} data topic(s) (per-topic partitions from map, "
+        f"default {default_partitions}; max.message.bytes={max_message_bytes}), "
         f"{skipped} already existed"
     )
 
@@ -324,11 +359,17 @@ def _seed(props):
 
     # (1) ALWAYS: pre-create the per-table sink topics (parallel-connector deploy) and
     # the compacted offset topic (MSK Connect requires it pre-created). Data topics
-    # use the sink's unit-of-parallelism partition count from TopicPartitions.
+    # reproduce Debezium topic.creation's shaping: per-topic partitions from the
+    # size-proportional map (SinkTopicPartitions), flat TopicPartitions as the
+    # fallback, and max.message.bytes so a >1 MiB event isn't rejected.
     data_partitions = props.get("TopicPartitions") or os.environ.get(
         "TOPIC_PARTITIONS", "1"
     )
-    _ensure_data_topics(bootstrap, region, props.get("SinkTopics"), data_partitions)
+    _ensure_data_topics(
+        bootstrap, region, props.get("SinkTopics"), data_partitions,
+        partitions_map_csv=props.get("SinkTopicPartitions"),
+        max_message_bytes=props.get("MaxMessageBytes"),
+    )
     _ensure_compact_topic(bootstrap, region, topic, partitions)
 
     # (2) CONDITIONAL: seed the connect-offsets record only for a gapless Full-Load

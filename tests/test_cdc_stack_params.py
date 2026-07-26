@@ -719,6 +719,8 @@ def test_scaling_params_uniform_when_no_row_counts() -> None:
     assert params["TopicCreationGroups"] == ""
     assert params["TopicGroupInclude2"] == ""
     assert params["TopicGroupInclude4"] == ""
+    # Uniform plan -> no per-topic map; the seeder uses the flat TopicDefaultPartitions.
+    assert params["SinkTopicPartitions"] == ""
 
 
 def test_scaling_params_size_proportional_groups_hot_tables() -> None:
@@ -734,6 +736,16 @@ def test_scaling_params_size_proportional_groups_hot_tables() -> None:
     # Regex-escaped, prefixed topic names, comma-joined.
     inc2 = params["TopicGroupInclude2"]
     assert set(inc2.split(",")) == {rf"pfx\.hot{i}" for i in range(4)}
+    # The seeder pre-creates the topics, so it needs the EXPLICIT per-topic partition
+    # map (Debezium topic.creation groups only apply to topics Debezium creates).
+    # Hot topics = 2 partitions (the p2 tier), cold = 1 (the default).
+    part_map = dict(
+        pair.rsplit(":", 1) for pair in params["SinkTopicPartitions"].split(",")
+    )
+    assert part_map == {
+        **{f"pfx.hot{i}": "2" for i in range(4)},
+        **{f"pfx.cold{i}": "1" for i in range(5)},
+    }
 
 
 def test_scaling_params_ignores_row_counts_for_untracked_tables() -> None:

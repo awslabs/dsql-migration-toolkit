@@ -402,6 +402,18 @@ Parameters:
     Description: >
       Comma-separated topic-name regexes auto-created with 4 partitions (the "p4"
       group). Empty = no p4 group.
+  SinkTopicPartitions:
+    Type: String
+    Default: ""
+    Description: >
+      Explicit per-topic partition map ("topic:count,...") for the seeder Lambda,
+      which PRE-CREATES the per-table topics so the source and sink connectors can
+      deploy in parallel. Debezium's topic.creation groups (above) only apply to
+      topics Debezium itself creates, but the seeder now creates them first, so the
+      seeder must reproduce the size-proportional counts here (topic partitions are
+      immutable). Empty = the seeder uses the flat TopicDefaultPartitions for every
+      topic (uniform plan). The tool derives this from compute_cdc_partition_plan's
+      partitions_by_topic.
 
   ColumnExcludeList:
     Type: String
@@ -1169,9 +1181,16 @@ Resources:
                   - kafka-cluster:WriteData
                   - kafka-cluster:DescribeTopicDynamicConfiguration
                   - kafka-cluster:AlterTopicDynamicConfiguration
+                # Two topic scopes: (1) the fixed compacted offsets topic (seeded on a
+                # gapless handoff); (2) the per-table data topics the seeder now
+                # PRE-CREATES so both connectors deploy in parallel -- scoped to this
+                # capture's Debezium topic.prefix (<TopicPrefix>.<db>.<table>). Without
+                # (2) CreateTopic on the data topics is denied and every start fails.
                 Resource:
-                  Fn::Sub: >-
-                    arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/${AWS::StackName}-msk/*/${AWS::StackName}-debezium-source-offsets
+                  - Fn::Sub: >-
+                      arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/${AWS::StackName}-msk/*/${AWS::StackName}-debezium-source-offsets
+                  - Fn::Sub: >-
+                      arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/${AWS::StackName}-msk/*/${TopicPrefix}.*
 
   OffsetSeederFunction:
     Type: AWS::Lambda::Function
@@ -1268,8 +1287,16 @@ Resources:
         Fn::GetAtt: [OffsetSeederFunction, Arn]
       SinkTopics:
         Ref: SinkTopics
+      # Flat fallback partition count; SinkTopicPartitions (below) overrides it
+      # per-topic so the seeder reproduces the size-proportional plan.
       TopicPartitions:
         Ref: TopicDefaultPartitions
+      SinkTopicPartitions:
+        Ref: SinkTopicPartitions
+      # So the pre-created data topics get the same max.message.bytes the source
+      # worker's producer uses -- otherwise a >1 MiB change event RecordTooLarges.
+      MaxMessageBytes:
+        Ref: MaxMessageBytes
       WatermarkBinlogFile:
         Ref: WatermarkBinlogFile
       WatermarkBinlogPos:

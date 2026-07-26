@@ -450,6 +450,32 @@ def test_seed_without_watermark_creates_topics_and_skips_seed(seeder_env) -> Non
     assert recorder.produced == []
 
 
+def test_seed_data_topics_use_per_topic_partitions_and_max_bytes(seeder_env) -> None:
+    # Pre-creation must reproduce Debezium topic.creation's shaping, or it regresses:
+    # (1) size-proportional per-topic partitions from SinkTopicPartitions (a hot topic
+    # gets 4, others the flat default), and (2) max.message.bytes so a >1 MiB event
+    # isn't RecordTooLarge'd. Topic partition counts are immutable, so this must be
+    # right at creation.
+    module, recorder = seeder_env
+    recorder.topic_partitions = set()
+    module._seed(
+        _props(
+            WatermarkBinlogFile="", WatermarkBinlogPos="",  # CDC-only: topics only
+            SinkTopics="dsqlcdc.app.hot,dsqlcdc.app.cold",
+            TopicPartitions="1",  # flat fallback
+            SinkTopicPartitions="dsqlcdc.app.hot:4",  # hot table elevated
+            MaxMessageBytes="4194304",
+        )
+    )
+    by_name = {name: (parts, cfg) for name, parts, cfg in recorder.created_topics}
+    # Hot topic gets its mapped 4 partitions; cold falls back to the flat default 1.
+    assert by_name["dsqlcdc.app.hot"][0] == 4
+    assert by_name["dsqlcdc.app.cold"][0] == 1
+    # Both data topics carry max.message.bytes.
+    assert by_name["dsqlcdc.app.hot"][1].get("max.message.bytes") == "4194304"
+    assert by_name["dsqlcdc.app.cold"][1].get("max.message.bytes") == "4194304"
+
+
 def test_seed_pre_creates_data_topics_before_seeding(seeder_env) -> None:
     # A gapless handoff (watermark present) both pre-creates the per-table topics
     # AND seeds the offset.
