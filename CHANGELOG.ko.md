@@ -5,6 +5,29 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.121
+
+### Fixed
+
+- **CDC 인프라 삭제(teardown)가 완료될 때까지 화면에 계속 표시됩니다.** Start over에서
+  "Delete all CDC infrastructure"(또는 "Remove connectors, keep infrastructure")를
+  선택하면 세션은 곧바로 초기화되어 Connect 화면으로 돌아가고 teardown은 백그라운드에서
+  진행됩니다. 기존에는 진행 중이라는 표시가 전혀 없어 MSK/NAT가 아직 과금 중인지, 인프라가
+  이미 삭제됐는지 알 수 없었습니다. 이제 **모든 화면(Connect 포함)** 상단에 지속 배너
+  ("CDC infrastructure teardown in progress…")가 뜨고, teardown이 끝나면 자동으로
+  사라집니다. CDC 단계의 Delete/Stop 버튼으로 시작한 teardown도 포함되므로, 다른 단계로
+  이동해도 표시가 사라지지 않습니다.
+- **Start over가 진행 중인 CDC teardown과 경쟁하지 않습니다.** stop/delete가 도는 중
+  reset은 이미 막혀 있었지만, Start over → delete 직후 CloudFormation 스택이 아직
+  `DELETE_IN_PROGRESS`로 바뀌기 전의 짧은 창에서 두 번째 reset이 빠져나가 중복 teardown을
+  일으킬 수 있었습니다. 세션 초기화에도 살아남는 durable teardown 마커가 이 창을 닫습니다.
+
+### Changed
+
+- CDC 인프라 배포 또는 Start CDC 작업이 진행 중일 때 Start over가 (조용히 진행하는 대신)
+  **경고**합니다. 해당 작업은 재검색(re-discover) 가능하고 막으면 stuck 상태 탈출을
+  가로막게 되므로 reset은 여전히 허용하되, 백그라운드에서 계속 실행된다는 점을 알려줍니다.
+
 ## v0.1.120
 
 ### Changed

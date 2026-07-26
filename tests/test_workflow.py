@@ -900,3 +900,141 @@ def test_start_over_normal_path_wires_reset_when_not_in_flight() -> None:
     assert not any("CDC teardown is already running" in t for t in ui.texts)
     assert ui.click_wired  # the reset button is wired on the normal path
     assert any("Type RESET to confirm:" in t for t in ui.texts)
+
+
+def test_start_over_warns_but_allows_reset_when_cdc_deploy_in_flight() -> None:
+    # Concern #2 (deploy/start extension): a running Deploy/Start is re-discoverable
+    # and must not trap the user, so Start over WARNS rather than hard-blocks --
+    # the reset stays executable (reset button wired), unlike the teardown block.
+    ui = _render_start_over_dialog(cdc_op_in_flight="infra", cdc_deployed=False)
+    assert any("CDC infrastructure deploy is still running" in t for t in ui.texts)
+    assert ui.click_wired  # warn, not block: reset is still executable
+    assert any("Type RESET to confirm:" in t for t in ui.texts)
+
+
+def test_start_over_warns_when_cdc_start_in_flight() -> None:
+    ui = _render_start_over_dialog(cdc_op_in_flight="start", cdc_deployed=False)
+    assert any("Start CDC is still running" in t for t in ui.texts)
+    assert ui.click_wired
+
+
+def test_start_over_teardown_block_takes_precedence_over_op_warning() -> None:
+    # A teardown in flight hard-blocks even if a deploy/start is also flagged: the
+    # early-return block path wins and no working reset is offered.
+    ui = _render_start_over_dialog(
+        cdc_teardown_in_flight=True, cdc_op_in_flight="infra", cdc_deployed=True
+    )
+    assert any("CDC teardown is already running" in t for t in ui.texts)
+    assert not ui.click_wired
+    assert not any("deploy is still running" in t for t in ui.texts)
+
+
+# ---------------------------------------------------------------------------
+# Persistent CDC-teardown banner (cross-view "teardown in progress")
+# ---------------------------------------------------------------------------
+
+
+def test_cdc_teardown_banner_copy_delete_stop_and_none() -> None:
+    from dsql_migrator.ui.workflow import _cdc_teardown_banner_copy
+
+    assert _cdc_teardown_banner_copy(None) is None
+    assert _cdc_teardown_banner_copy({}) is None
+    d_header, d_body = _cdc_teardown_banner_copy({"kind": "delete", "stack": "cdc-x"})
+    assert "teardown in progress" in d_header.lower()
+    assert "cdc-x" in d_body and "billing" in d_body.lower()
+    s_header, s_body = _cdc_teardown_banner_copy({"kind": "stop", "stack": "cdc-y"})
+    assert "connector" in s_header.lower()
+    assert "cdc-y" in s_body
+    # A missing stack name falls back to a generic label (never a dangling quote).
+    _, fb = _cdc_teardown_banner_copy({"kind": "delete"})
+    assert "the cdc-stack" in fb
+
+
+class _BannerUi:
+    """NiceGUI double for _render_cdc_teardown_banner: records notice text and
+    whether a poll timer was armed. Supports the @ui.refreshable decorator (returns
+    the fn with a no-op .refresh) and render_notice's row/icon/column/label."""
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+        self.timer_armed = False
+
+    class _El:
+        def classes(self, *_a, **_k):
+            return self
+
+        def props(self, *_a, **_k):
+            return self
+
+        def style(self, *_a, **_k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def refreshable(self, fn):
+        fn.refresh = lambda *_a, **_k: None
+        return fn
+
+    def timer(self, *_a, **_k):
+        self.timer_armed = True
+        return self._El()
+
+    def label(self, text="", *_a, **_k):
+        if text is not None:
+            self.texts.append(str(text))
+        return self._El()
+
+    def icon(self, *_a, **_k):
+        return self._El()
+
+    def row(self, *_a, **_k):
+        return self._El()
+
+    def column(self, *_a, **_k):
+        return self._El()
+
+    def card(self, *_a, **_k):
+        return self._El()
+
+
+def test_render_cdc_teardown_banner_shows_while_in_flight_and_arms_poll() -> None:
+    from dsql_migrator.ui.workflow import _render_cdc_teardown_banner
+
+    ui = _BannerUi()
+    _render_cdc_teardown_banner(ui, lambda: {"kind": "delete", "stack": "cdc-z"})
+    assert any("teardown in progress" in t.lower() for t in ui.texts)
+    assert any("cdc-z" in t for t in ui.texts)
+    assert ui.timer_armed  # re-arms a one-shot poll so it clears itself on settle
+
+
+def test_render_cdc_teardown_banner_silent_when_nothing_in_flight() -> None:
+    from dsql_migrator.ui.workflow import _render_cdc_teardown_banner
+
+    ui = _BannerUi()
+    _render_cdc_teardown_banner(ui, lambda: None)  # getter: no teardown in flight
+    assert ui.texts == []
+    assert not ui.timer_armed  # no pointless polling when idle
+
+
+def test_render_cdc_teardown_banner_none_getter_is_noop() -> None:
+    from dsql_migrator.ui.workflow import _render_cdc_teardown_banner
+
+    ui = _BannerUi()
+    _render_cdc_teardown_banner(ui, None)  # feature not wired
+    assert ui.texts == []
+    assert not ui.timer_armed
+
+
+def test_render_cdc_teardown_banner_survives_getter_error() -> None:
+    from dsql_migrator.ui.workflow import _render_cdc_teardown_banner
+
+    def _boom():
+        raise RuntimeError("probe failed")
+
+    ui = _BannerUi()
+    _render_cdc_teardown_banner(ui, _boom)  # a broken getter must never break render
+    assert ui.texts == []

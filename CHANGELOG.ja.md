@@ -5,6 +5,31 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.121
+
+### Fixed
+
+- **CDC インフラの削除(teardown)が、完了するまで画面に表示され続けます。** Start over で
+  「Delete all CDC infrastructure」(または「Remove connectors, keep infrastructure」)を
+  選ぶと、セッションはすぐにリセットされ Connect 画面に戻り、teardown はバックグラウンドで
+  進行します。従来は進行中である表示がまったくなく、MSK/NAT がまだ課金中なのか、インフラが
+  すでに削除済みなのか判断できませんでした。今後は **すべての画面(Connect を含む)** の上部に
+  永続バナー(「CDC infrastructure teardown in progress…」)が表示され、teardown が完了すると
+  自動的に消えます。CDC ステップの Delete/Stop ボタンから開始した teardown も対象なので、
+  別のステップに移動しても表示が消えることはありません。
+- **Start over が進行中の CDC teardown と競合しなくなりました。** stop/delete の実行中は
+  reset がすでにブロックされていましたが、Start over → delete の直後、CloudFormation スタックが
+  まだ `DELETE_IN_PROGRESS` に変わる前の短いウィンドウで 2 回目の reset が通り抜け、重複した
+  teardown を起こす可能性がありました。セッションのリセットを生き延びる durable な teardown
+  マーカーがこのウィンドウを塞ぎます。
+
+### Changed
+
+- CDC インフラのデプロイまたは Start CDC ジョブが実行中のとき、Start over が(黙って進める
+  代わりに)**警告** するようになりました。その作業は再検出(re-discover)可能で、ブロックすると
+  スタックした実行からの脱出を妨げてしまうため、reset は引き続き許可しつつ、バックグラウンドで
+  実行され続けることを伝えます。
+
 ## v0.1.120
 
 ### Changed

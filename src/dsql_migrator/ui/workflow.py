@@ -1058,6 +1058,7 @@ def _open_start_over_dialog(
     on_reset_cdc: Optional[Callable[[str], None]] = None,
     cdc_stack_name: Optional[str] = None,
     cdc_teardown_in_flight: bool = False,
+    cdc_op_in_flight: Optional[str] = None,
 ) -> None:
     """Type-to-confirm dialog that clears the session and returns to Connect.
 
@@ -1071,6 +1072,10 @@ def _open_start_over_dialog(
     running (freshly probed), resetting would fire a second background teardown and
     then wipe the session, hiding the in-flight delete. In that case the dialog only
     explains this and offers Close -- no RESET input, no enabled confirm button.
+
+    ``cdc_op_in_flight`` (``"infra"``/``"start"``) instead only WARNS: a deploy/start
+    is re-discoverable and shorter, so resetting stays allowed but the dialog notes
+    the job keeps running in the background (no silent orphaning, no trapping).
     """
     with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 520px"):  # type: ignore[attr-defined]
         ui.label("Start over — reset this session").classes(  # type: ignore[attr-defined]
@@ -1112,6 +1117,27 @@ def _open_start_over_dialog(
             "screen. It does NOT change or delete any AWS resource (your DSQL "
             "cluster and migrated data are untouched)."
         ).classes("text-sm text-gray-700")
+        # A non-teardown CDC job (Deploy infra / Start CDC) is still running. Unlike a
+        # stop/delete (hard-blocked above), a deploy/start is re-discoverable and must
+        # not trap a user escaping a stuck run -- so warn, don't block: reset is still
+        # allowed, but the operator is told the job keeps running in the background.
+        if cdc_op_in_flight in ("infra", "start"):
+            op_label = (
+                "CDC infrastructure deploy"
+                if cdc_op_in_flight == "infra"
+                else "Start CDC"
+            )
+            render_notice(
+                ui,
+                tone="warning",
+                header=f"A {op_label} is still running",
+                body=(
+                    "Resetting is allowed, but that operation keeps running in the "
+                    "background after the reset — the Data Migration step will pick it "
+                    "up again once you reconnect. Consider waiting for it to finish "
+                    "before starting over."
+                ),
+            )
         cdc_choice = {"mode": "none"}
         if cdc_deployed and on_reset_cdc is not None:
             cdc_choice["mode"] = "stop"
@@ -1252,6 +1278,72 @@ def _render_reconnect_banner(ui: object, state: "object") -> None:
     )
 
 
+# How often the persistent CDC-teardown banner re-checks the background job. A
+# teardown runs for minutes (delete ~15–45 min), so a slow poll is plenty; it only
+# needs to notice completion to remove itself.
+_TEARDOWN_BANNER_POLL_SECONDS = 10.0
+
+
+def _cdc_teardown_banner_copy(
+    info: "Optional[dict]",
+) -> "Optional[tuple[str, str]]":
+    """Map teardown-banner info to ``(header, body)``, or ``None`` when nothing is in
+    flight. Pure/side-effect-free so the copy is unit-testable independent of the
+    render+poll wrapper. ``info`` is ``{"kind": "stop"|"delete", "stack": <name>}``.
+    """
+    if not info:
+        return None
+    kind = info.get("kind")
+    stack = info.get("stack") or "the cdc-stack"
+    if kind == "delete":
+        return (
+            "CDC infrastructure teardown in progress",
+            f"Deleting '{stack}' in the background (~15–45 min). MSK / NAT keep "
+            "billing until it completes. You can keep working — this banner clears "
+            "itself automatically when the teardown finishes.",
+        )
+    return (
+        "Removing CDC connectors",
+        f"Removing the CDC connectors from '{stack}' in the background. This banner "
+        "clears itself automatically when it finishes.",
+    )
+
+
+def _render_cdc_teardown_banner(
+    ui: object, banner_getter: "Optional[Callable[[], Optional[dict]]]"
+) -> None:
+    """Persistent, cross-view banner while a CDC teardown (stop/delete) runs in the
+    background.
+
+    Shown on EVERY view -- including the Connect screen a Start-over → delete lands
+    on -- so the operator always knows a teardown is still in flight (and that MSK /
+    NAT keep billing until it finishes). Without it, a Start-over-triggered delete
+    runs invisibly and the user cannot tell whether the infrastructure is gone yet.
+    It self-polls via a one-shot timer chain (the app-wide idiom that avoids the
+    "parent slot deleted" crash a repeating timer causes when the region is torn
+    down) and removes itself the moment the ``banner_getter`` reports the teardown
+    settled (the getter clears the durable marker on completion).
+    """
+    if banner_getter is None:
+        return
+
+    @ui.refreshable  # type: ignore[attr-defined,misc]
+    def _banner() -> None:
+        try:
+            info = banner_getter()
+        except Exception:  # noqa: BLE001 - a banner must never break the page render
+            info = None
+        copy = _cdc_teardown_banner_copy(info)
+        if copy is None:
+            return  # nothing in flight (or just settled) → render nothing, stop polling
+        header, body = copy
+        render_notice(ui, tone="info", header=header, body=body)
+        # Re-arm a single-shot poll so the banner disappears once the job settles.
+        ui.timer(_TEARDOWN_BANNER_POLL_SECONDS, _banner.refresh, once=True)  # type: ignore[attr-defined]
+
+    _banner()
+
+
 def build_workflow_sidebar(
     store: "SessionStore",
     session_id: str,
@@ -1272,6 +1364,8 @@ def build_workflow_sidebar(
     cdc_deployed_getter: Optional[Callable[[], bool]] = None,
     cdc_stack_name_getter: Optional[Callable[[], Optional[str]]] = None,
     cdc_teardown_in_flight_getter: Optional[Callable[[], bool]] = None,
+    cdc_teardown_banner_getter: Optional[Callable[[], Optional[dict]]] = None,
+    cdc_op_in_flight_getter: Optional[Callable[[], Optional[str]]] = None,
     cdc_probe: Optional[Callable[[], None]] = None,
     optional_tools: Optional[dict[str, "OptionalTool"]] = None,
 ) -> None:
@@ -1474,6 +1568,11 @@ def build_workflow_sidebar(
                             if cdc_teardown_in_flight_getter
                             else False
                         ),
+                        cdc_op_in_flight=(
+                            cdc_op_in_flight_getter()
+                            if cdc_op_in_flight_getter
+                            else None
+                        ),
                     )
 
                 start_over_btn = ui.button(
@@ -1649,6 +1748,11 @@ def build_workflow_sidebar(
         @ui.refreshable
         def render_main() -> None:
             view = selected["view"]
+            # Persistent CDC-teardown banner, pinned above ALL views (Connect, the
+            # workflow steps, and the optional tools) so a background stop/delete --
+            # e.g. one fired by Start over, which lands the user on Connect -- stays
+            # visible until it completes. Self-polls and removes itself on settle.
+            _render_cdc_teardown_banner(ui, cdc_teardown_banner_getter)
             if view == _CONNECT_VIEW:
                 # Refresh only the nav (not main) so verifying a connection
                 # unlocks the steps without rebuilding the Connect form.

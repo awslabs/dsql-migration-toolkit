@@ -1173,6 +1173,273 @@ def test_reset_in_place_keeps_object_and_preserves_session_binding() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Durable CDC-teardown marker + Start-over race-guard predicate
+# (persistent "teardown in progress" banner + block re-reset while in flight)
+# ---------------------------------------------------------------------------
+
+
+def test_set_and_clear_cdc_teardown_marker() -> None:
+    # The durable marker drives BOTH the persistent teardown banner and the
+    # Start-over race-guard; it must round-trip and clear cleanly.
+    state = DataMigrationState()
+    assert state.cdc_teardown_job_id is None
+    state.set_cdc_teardown("job-del", kind="delete", stack="mysql-dsql-cdc-x")
+    assert state.cdc_teardown_job_id == "job-del"
+    assert state.cdc_teardown_kind == "delete"
+    assert state.cdc_teardown_stack == "mysql-dsql-cdc-x"
+    state.clear_cdc_teardown()  # job settled
+    assert state.cdc_teardown_job_id is None
+    assert state.cdc_teardown_kind is None
+    assert state.cdc_teardown_stack is None
+    # job_id=None also drops the kind/stack (no orphaned metadata).
+    state.set_cdc_teardown("j", kind="stop", stack="s")
+    state.set_cdc_teardown(None)
+    assert state.cdc_teardown_kind is None and state.cdc_teardown_stack is None
+
+
+def test_reset_in_place_preserves_cdc_teardown_marker() -> None:
+    # Concern #1's crux: Start over → delete submits the teardown, THEN wipes the
+    # session. reset_in_place must PRESERVE the teardown marker (so the persistent
+    # banner + guard keep working) while wiping everything else.
+    store = DataMigrationStore()
+    state = store.get_or_create("s1")
+    state.job_id = "job-xyz"
+    state.set_cdc_teardown("teardown-1", kind="delete", stack="mysql-dsql-cdc-seoul")
+
+    store.reset_in_place("s1")
+
+    assert store.get_or_create("s1") is state  # same instance
+    assert state.job_id is None  # everything else wiped
+    # ...but the in-flight teardown marker survives the reset.
+    assert state.cdc_teardown_job_id == "teardown-1"
+    assert state.cdc_teardown_kind == "delete"
+    assert state.cdc_teardown_stack == "mysql-dsql-cdc-seoul"
+
+
+def test_reset_in_place_without_teardown_leaves_marker_clear() -> None:
+    # No teardown in flight → reset leaves the marker empty (no spurious banner).
+    store = DataMigrationStore()
+    state = store.get_or_create("s2")
+    store.reset_in_place("s2")
+    assert state.cdc_teardown_job_id is None
+    assert state.cdc_teardown_kind is None
+    assert state.cdc_teardown_stack is None
+
+
+class _MultiJobJM:
+    """Job-manager double mapping job_id -> status; unknown ids raise
+    JobNotFoundError (matching JobManager.get_status)."""
+
+    def __init__(self, statuses) -> None:
+        self._s = dict(statuses)
+
+    def get_status(self, job_id):
+        from types import SimpleNamespace
+
+        from dsql_migrator.core.job_manager import JobNotFoundError
+
+        if job_id not in self._s:
+            raise JobNotFoundError(job_id)
+        return SimpleNamespace(status=self._s[job_id])
+
+
+def test_cdc_teardown_in_flight_true_via_durable_marker_closes_race() -> None:
+    # Concern #2: right after Start over → delete, the local deploy pointer is wiped
+    # and the stack has NOT yet flipped to DELETE_IN_PROGRESS -- yet the durable
+    # teardown marker (RUNNING) must still block a second Start over (race closed).
+    from dsql_migrator.ui.data_migration._status import cdc_teardown_in_flight
+
+    jm = _MultiJobJM({"td-1": "RUNNING"})
+    assert (
+        cdc_teardown_in_flight(
+            jm,
+            teardown_job_id="td-1",
+            deploy_job_id=None,  # wiped by the reset
+            action_kind=None,  # wiped by the reset
+            stack_status="CREATE_COMPLETE",  # not yet DELETE_IN_PROGRESS
+        )
+        is True
+    )
+
+
+def test_cdc_teardown_in_flight_true_via_local_job_or_stack_status() -> None:
+    from dsql_migrator.ui.data_migration._status import cdc_teardown_in_flight
+
+    # (a) local stop/delete job still running.
+    jm = _MultiJobJM({"dep-1": "RUNNING"})
+    assert (
+        cdc_teardown_in_flight(
+            jm,
+            teardown_job_id=None,
+            deploy_job_id="dep-1",
+            action_kind="delete",
+            stack_status=None,
+        )
+        is True
+    )
+    # (b) freshly-probed stack is mid-operation.
+    assert (
+        cdc_teardown_in_flight(
+            _MultiJobJM({}),
+            teardown_job_id=None,
+            deploy_job_id=None,
+            action_kind=None,
+            stack_status="DELETE_IN_PROGRESS",
+        )
+        is True
+    )
+
+
+def test_cdc_teardown_in_flight_false_for_deploy_start_and_settled_states() -> None:
+    from dsql_migrator.ui.data_migration._status import cdc_teardown_in_flight
+
+    # A running Deploy/Start (kind infra/start) is NOT a teardown → not blocked
+    # (re-discoverable; must not trap a user escaping a stuck run).
+    assert (
+        cdc_teardown_in_flight(
+            _MultiJobJM({"dep-1": "RUNNING"}),
+            teardown_job_id=None,
+            deploy_job_id="dep-1",
+            action_kind="infra",
+            stack_status=None,
+        )
+        is False
+    )
+    # A settled marker (DONE) does not block.
+    assert (
+        cdc_teardown_in_flight(
+            _MultiJobJM({"td-1": "DONE"}),
+            teardown_job_id="td-1",
+            deploy_job_id=None,
+            action_kind=None,
+            stack_status=None,
+        )
+        is False
+    )
+    # A stuck/terminal stack (DELETE_FAILED / ROLLBACK_COMPLETE) is NOT over-blocked
+    # -- the user should still be able to Start over and delete it.
+    assert (
+        cdc_teardown_in_flight(
+            _MultiJobJM({}),
+            teardown_job_id=None,
+            deploy_job_id=None,
+            action_kind=None,
+            stack_status="DELETE_FAILED",
+        )
+        is False
+    )
+
+
+def test_cdc_teardown_in_flight_ignores_deploy_start_stack_status() -> None:
+    # Blocker fix: a running Deploy (CREATE_IN_PROGRESS) or Start CDC
+    # (UPDATE_IN_PROGRESS) drives the SAME stack through a live status but is NOT a
+    # teardown -- it must NOT hard-block Start over (it only warns via
+    # cdc_op_in_flight). Only DELETE_IN_PROGRESS counts as a stack-level teardown.
+    from dsql_migrator.ui.data_migration._status import cdc_teardown_in_flight
+
+    for kind, status in (
+        ("start", "UPDATE_IN_PROGRESS"),
+        ("infra", "CREATE_IN_PROGRESS"),
+    ):
+        assert (
+            cdc_teardown_in_flight(
+                _MultiJobJM({"dep-1": "RUNNING"}),
+                teardown_job_id=None,
+                deploy_job_id="dep-1",
+                action_kind=kind,
+                stack_status=status,
+            )
+            is False
+        ), f"{kind}/{status} must not hard-block Start over"
+    # ...but an unambiguous DELETE_IN_PROGRESS still blocks even with no local job
+    # (e.g. a teardown probed cross-session / after a lost job pointer).
+    assert (
+        cdc_teardown_in_flight(
+            _MultiJobJM({}),
+            teardown_job_id=None,
+            deploy_job_id=None,
+            action_kind=None,
+            stack_status="DELETE_IN_PROGRESS",
+        )
+        is True
+    )
+
+
+def test_should_replace_teardown_marker_ownership() -> None:
+    # Single-slot marker must not be clobbered by a DIFFERENT still-running teardown
+    # (rare two-tab race): keep the first, longer-lived one so the banner/guard don't
+    # switch to a shorter job and prematurely clear tracking of the still-running one.
+    from dsql_migrator.ui.data_migration._status import (
+        should_replace_teardown_marker,
+    )
+
+    jm = _MultiJobJM({"old": "RUNNING", "settled": "DONE"})
+    assert should_replace_teardown_marker(jm, None, "new") is True  # no current
+    assert should_replace_teardown_marker(jm, "old", "old") is True  # same job
+    assert should_replace_teardown_marker(jm, "old", "new") is False  # different+running
+    assert should_replace_teardown_marker(jm, "settled", "new") is True  # settled
+    assert should_replace_teardown_marker(jm, "ghost", "new") is True  # unknown/lost
+
+
+def test_cdc_teardown_banner_active_tracks_job_status() -> None:
+    # The banner shows while the durable job is PENDING/RUNNING and hides once it
+    # settles or the manager no longer knows it (caller then clears the marker).
+    from dsql_migrator.ui.data_migration._status import cdc_teardown_banner_active
+
+    assert cdc_teardown_banner_active(_MultiJobJM({}), None) is False  # no marker
+    assert cdc_teardown_banner_active(_MultiJobJM({"j": "PENDING"}), "j") is True
+    assert cdc_teardown_banner_active(_MultiJobJM({"j": "RUNNING"}), "j") is True
+    assert cdc_teardown_banner_active(_MultiJobJM({"j": "DONE"}), "j") is False
+    assert cdc_teardown_banner_active(_MultiJobJM({"j": "FAILED"}), "j") is False
+    assert cdc_teardown_banner_active(_MultiJobJM({}), "ghost") is False  # lost job
+
+
+def test_cdc_step_delete_and_stop_handlers_set_teardown_marker(monkeypatch) -> None:
+    # The CDC-step Delete / Stop buttons must ALSO set the durable marker (not just
+    # the Start-over path), so the persistent banner survives navigating away from
+    # the CDC step. Exercise the real handlers with stubs (no AWS): job_manager.submit
+    # returns an id WITHOUT running the work closure, and the deployer/logger are
+    # stubbed. (These handlers had zero coverage before.)
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.cdc_deployer as _dep
+    import dsql_migrator.ui.data_migration._cdc_ui as _cdcui
+
+    monkeypatch.setattr(_dep, "build_cdc_stack_deployer", lambda *a, **k: object())
+    monkeypatch.setattr(_cdcui, "_log_cdc_event", lambda *a, **k: None)
+
+    class _SubmitOnlyJM:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def submit(self, _work):  # never runs work → no AWS call
+            self.n += 1
+            return f"job-{self.n}"
+
+    class _Ui:
+        def notify(self, *_a, **_k):
+            return None
+
+    session = SimpleNamespace(
+        target_config=SimpleNamespace(region="us-east-1"),
+        aws_profile=None,
+        source_secret_id=None,
+    )
+
+    state = DataMigrationState()
+    _cdcui._start_cdc_delete(_Ui(), state, _SubmitOnlyJM(), lambda: None, session=session)
+    assert state.cdc_teardown_job_id == "job-1"
+    assert state.cdc_teardown_kind == "delete"
+    assert state.cdc_teardown_stack == state.cdc_stack_name
+
+    state2 = DataMigrationState()
+    _cdcui._start_cdc_stop(_Ui(), state2, _SubmitOnlyJM(), lambda: None, session=session)
+    assert state2.cdc_teardown_job_id == "job-1"
+    assert state2.cdc_teardown_kind == "stop"
+    assert state2.cdc_teardown_stack == state2.cdc_stack_name
+
+
+# ---------------------------------------------------------------------------
 # run_full_load: per-table error recording to the error log (Property 15)
 # ---------------------------------------------------------------------------
 

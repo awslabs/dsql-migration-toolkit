@@ -331,36 +331,76 @@ def build_page(
 
     def _cdc_teardown_in_flight() -> bool:
         """True when a CDC stop/delete is CURRENTLY running, so Start over must not
-        race it. Two authoritative signals, both refreshed by ``_cdc_probe`` just
-        before the Start-over dialog opens:
+        race it (a second teardown + a session wipe that hides the running delete,
+        unre-discoverable for a custom stack name). Thin session-bound wrapper over
+        the pure :func:`cdc_teardown_in_flight` predicate: passes the durable teardown
+        marker (which survives the reset and closes the post-Start-over race window),
+        the local lifecycle job + kind, and the freshly-probed raw stack status. The
+        job/stack signals are refreshed by ``_cdc_probe`` just before the dialog opens.
+        """
+        from dsql_migrator.ui.data_migration._status import cdc_teardown_in_flight
 
-        (a) a local lifecycle job for a stop/delete is still PENDING/RUNNING, or
-        (b) the freshly-probed cdc-stack status is a live CloudFormation operation
-            (ends in ``_IN_PROGRESS`` -- e.g. ``DELETE_IN_PROGRESS``). We test the
-            raw status, NOT the coarse ``unstable`` phase, so a settled but stuck
-            stack (``ROLLBACK_COMPLETE`` / ``DELETE_FAILED``) is NOT over-blocked --
-            the user should still be able to Start over and choose to delete it.
+        migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
+        return cdc_teardown_in_flight(
+            JOB_MANAGER,
+            teardown_job_id=getattr(migration_state, "cdc_teardown_job_id", None),
+            deploy_job_id=getattr(migration_state, "cdc_deploy_job_id", None),
+            action_kind=getattr(migration_state, "cdc_action_kind", None),
+            stack_status=getattr(migration_state, "cdc_stack_phase_status", None),
+        )
 
-        Resetting mid-teardown would fire a second background teardown and then wipe
-        the session, leaving the in-flight delete invisible (and, for a custom stack
-        name, unre-discoverable) -- so we block the reset while this is true.
+    def _cdc_teardown_banner() -> Optional[dict]:
+        """Info for the persistent 'CDC teardown in progress' banner, or ``None``.
+
+        Reads the durable teardown marker (which survives Start-over's session reset)
+        and the JobManager status -- cheap, no AWS call. Returns ``{"kind", "stack"}``
+        while the stop/delete job is PENDING/RUNNING so the banner shows on EVERY view
+        (including the Connect screen a Start-over → delete lands on); once the job
+        settles it clears the marker (idempotent) and returns ``None`` so the banner
+        disappears and the Start-over guard releases.
         """
         from dsql_migrator.ui.data_migration._status import (
-            _current_job,
-            _is_inflight_stack_status,
+            cdc_teardown_banner_active,
         )
 
         migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
-        job = _current_job(JOB_MANAGER, getattr(migration_state, "cdc_deploy_job_id", None))
+        job_id = getattr(migration_state, "cdc_teardown_job_id", None)
+        if not job_id:
+            return None
+        if cdc_teardown_banner_active(JOB_MANAGER, job_id):
+            return {
+                "kind": getattr(migration_state, "cdc_teardown_kind", None),
+                "stack": getattr(migration_state, "cdc_teardown_stack", None),
+            }
+        # Settled (or a job the manager no longer knows, e.g. lost across a restart):
+        # clear the marker so the banner disappears and the guard releases.
+        migration_state.clear_cdc_teardown()
+        return None
+
+    def _cdc_op_in_flight() -> Optional[str]:
+        """Kind (``"infra"``/``"start"``) of a NON-teardown CDC lifecycle job still
+        running, else ``None``.
+
+        Lets Start over WARN (not hard-block) that a deploy/start will keep running in
+        the background after the reset, so an orphaned job is never a silent surprise.
+        Teardowns (stop/delete) are the destructive/billing-relevant case and stay
+        hard-blocked by :func:`_cdc_teardown_in_flight`; a deploy/start is
+        re-discoverable and must not trap a user trying to escape a stuck run.
+        """
+        from dsql_migrator.ui.data_migration._status import _current_job
+
+        migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
+        job = _current_job(
+            JOB_MANAGER, getattr(migration_state, "cdc_deploy_job_id", None)
+        )
+        kind = getattr(migration_state, "cdc_action_kind", None)
         if (
             job is not None
             and getattr(job, "status", None) in ("PENDING", "RUNNING")
-            and getattr(migration_state, "cdc_action_kind", None) in ("stop", "delete")
+            and kind in ("infra", "start")
         ):
-            return True
-        return _is_inflight_stack_status(
-            getattr(migration_state, "cdc_stack_phase_status", None)
-        )
+            return kind
+        return None
 
     def _cdc_probe() -> None:
         """Refresh the cached CDC deployment state from a live, read-only AWS probe.
@@ -435,6 +475,23 @@ def build_page(
                 )
 
         job_id = JOB_MANAGER.submit(work)
+        # Durable teardown marker: set it BEFORE the imminent session reset. It is
+        # preserved across reset_in_place, so the persistent cross-view banner keeps
+        # the background teardown visible (and the Start-over guard keeps blocking a
+        # second reset) from the moment it starts -- not only once the CloudFormation
+        # stack flips to DELETE_IN_PROGRESS. Cleared by _cdc_teardown_banner on settle.
+        # Ownership guard: don't clobber a DIFFERENT teardown still tracked+running
+        # (rare two-tab race) -- keep the first, longer-lived one.
+        from dsql_migrator.ui.data_migration._status import (
+            should_replace_teardown_marker,
+        )
+
+        if should_replace_teardown_marker(
+            JOB_MANAGER,
+            getattr(migration_state, "cdc_teardown_job_id", None),
+            job_id,
+        ):
+            migration_state.set_cdc_teardown(job_id, kind=mode, stack=stack_name)
         # The teardown runs in the background after the session resets, so poll it
         # and surface a completion toast — the user knows when the connectors (or
         # the whole stack) are gone and a fresh migration can start.
@@ -514,6 +571,8 @@ def build_page(
         cdc_deployed_getter=_cdc_deployed,
         cdc_stack_name_getter=_cdc_stack_name,
         cdc_teardown_in_flight_getter=_cdc_teardown_in_flight,
+        cdc_teardown_banner_getter=_cdc_teardown_banner,
+        cdc_op_in_flight_getter=_cdc_op_in_flight,
         cdc_probe=_cdc_probe,
         optional_tools={
             _QUERY_PLAYGROUND_VIEW: OptionalTool(

@@ -96,6 +96,7 @@ from dsql_migrator.ui.data_migration._status import (
     _migration_status_tables,
     _read_cdc_template_body,
     cdc_error_log_key,
+    should_replace_teardown_marker,
 )
 from dsql_migrator.ui.design import (
     NOTICE_STYLE,
@@ -2593,6 +2594,13 @@ def _start_cdc_stop(
 
     job_id = job_manager.submit(work)
     migration_state.set_cdc_deploy_job_id(job_id, kind="stop")
+    # Durable marker → the persistent cross-view "teardown in progress" banner (so
+    # navigating away from the CDC step doesn't hide the running stop). Ownership
+    # guard: don't clobber a DIFFERENT teardown still running (rare two-tab race).
+    if should_replace_teardown_marker(
+        job_manager, migration_state.cdc_teardown_job_id, job_id
+    ):
+        migration_state.set_cdc_teardown(job_id, kind="stop", stack=stack_name)
     _log_cdc_event("stop CDC connectors", detail=f"stack {stack_name}")
     ui.notify("Stop CDC submitted — removing connectors.", type="positive", position="top")  # type: ignore[attr-defined]
     refresh()
@@ -2634,6 +2642,14 @@ def _start_cdc_delete(
 
     job_id = job_manager.submit(work)
     migration_state.set_cdc_deploy_job_id(job_id, kind="delete")
+    # Durable marker → the persistent cross-view "teardown in progress" banner (the
+    # delete runs ~15–45 min; the banner keeps it visible on every step, not just
+    # the CDC card the user may navigate away from). Ownership guard: don't clobber a
+    # DIFFERENT teardown still running (rare two-tab race).
+    if should_replace_teardown_marker(
+        job_manager, migration_state.cdc_teardown_job_id, job_id
+    ):
+        migration_state.set_cdc_teardown(job_id, kind="delete", stack=stack_name)
     _log_cdc_event("delete CDC infrastructure", detail=f"stack {stack_name}")
     ui.notify("Delete CDC infrastructure submitted.", type="warning", position="top")  # type: ignore[attr-defined]
     refresh()

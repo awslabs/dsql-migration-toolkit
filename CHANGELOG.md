@@ -5,6 +5,34 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.121
+
+### Fixed
+
+- **A CDC infrastructure teardown now stays visible until it finishes.** When you
+  Start over and choose "Delete all CDC infrastructure" (or "Remove connectors,
+  keep infrastructure"), the teardown runs in the background while the session
+  resets to a fresh Connect screen. Previously nothing indicated it was still
+  running, so you couldn't tell whether MSK/NAT were still billing or the
+  infrastructure was already gone. A persistent banner now shows on **every**
+  screen (Connect included) — "CDC infrastructure teardown in progress…" — and
+  clears itself automatically the moment the teardown completes. It also covers a
+  teardown started from the CDC step's Delete/Stop buttons, so navigating to
+  another step no longer hides it.
+- **Start over can no longer race an in-flight CDC teardown.** Resetting was
+  already blocked while a stop/delete ran, but a brief window right after
+  Start over → delete — before CloudFormation flipped the stack to
+  `DELETE_IN_PROGRESS` — could let a second reset slip through and fire a duplicate
+  teardown. A durable teardown marker that survives the session reset now closes
+  that window.
+
+### Changed
+
+- Start over now **warns** (instead of silently proceeding) when a CDC
+  infrastructure deploy or Start CDC job is still running. The reset is still
+  allowed — that work is re-discoverable and blocking it would trap a user escaping
+  a stuck run — but you're told it keeps running in the background.
+
 ## v0.1.120
 
 ### Changed

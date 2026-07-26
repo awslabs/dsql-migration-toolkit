@@ -412,6 +412,93 @@ def _is_inflight_stack_status(status: Optional[str]) -> bool:
     return bool(status) and status.upper().endswith("_IN_PROGRESS")
 
 
+def cdc_teardown_in_flight(
+    job_manager: JobManager,
+    *,
+    teardown_job_id: Optional[str],
+    deploy_job_id: Optional[str],
+    action_kind: Optional[str],
+    stack_status: Optional[str],
+) -> bool:
+    """Pure predicate: is a CDC teardown (stop/delete) currently running?
+
+    Start over must not race an in-flight teardown -- resetting would fire a second
+    background teardown and then wipe the session, hiding the running delete (and,
+    for a custom stack name, leaving it unre-discoverable). Three signals, first
+    match wins:
+
+    (0) the **durable teardown marker** (``teardown_job_id``) is a PENDING/RUNNING
+        job. This is set the instant the teardown is submitted and SURVIVES the
+        Start-over session reset, so it closes the race window that (a)+(b) alone
+        left open: right after Start over → delete, the local ``deploy_job_id`` is
+        wiped by the reset and the CloudFormation stack has not yet flipped to
+        ``DELETE_IN_PROGRESS``, so a second Start over used to slip through.
+    (a) the local lifecycle job (``deploy_job_id``) is a PENDING/RUNNING stop/delete.
+    (b) the freshly-probed ``stack_status`` is ``DELETE_IN_PROGRESS`` -- the only
+        stack-level status that is an UNAMBIGUOUS teardown. It is deliberately NOT
+        any ``*_IN_PROGRESS``: a Deploy (``CREATE_IN_PROGRESS``) or Start CDC
+        (``UPDATE_IN_PROGRESS``) drives the SAME stack through a live status for
+        ~minutes, and those must NOT hard-block Start over -- they only WARN via
+        ``cdc_op_in_flight`` (blocking them would trap a user escaping a stuck run).
+        An in-session stop is a benign ``UPDATE`` already covered by (0)/(a); its
+        rare cross-session variant is short and low-harm, so not blocking it here is
+        preferred over trapping a deploy/start. A settled-but-stuck stack
+        (``ROLLBACK_COMPLETE`` / ``DELETE_FAILED``) is likewise NOT blocked -- the
+        user should still be able to Start over and delete it.
+    """
+    tjob = _current_job(job_manager, teardown_job_id)
+    if tjob is not None and getattr(tjob, "status", None) in ("PENDING", "RUNNING"):
+        return True
+    job = _current_job(job_manager, deploy_job_id)
+    if (
+        job is not None
+        and getattr(job, "status", None) in ("PENDING", "RUNNING")
+        and action_kind in ("stop", "delete")
+    ):
+        return True
+    return bool(stack_status) and stack_status.upper() == "DELETE_IN_PROGRESS"
+
+
+def should_replace_teardown_marker(
+    job_manager: JobManager,
+    current_job_id: Optional[str],
+    new_job_id: Optional[str],
+) -> bool:
+    """Whether a newly submitted teardown may claim the single durable marker.
+
+    The marker is one slot, so a second teardown must NOT clobber a DIFFERENT one
+    still running: otherwise the banner switches to the wrong (e.g. shorter stop)
+    job and, when THAT settles, ``clear_cdc_teardown`` wipes tracking of the still-
+    running delete -- reopening the exact Start-over race the marker was added to
+    close. Allow the write when there is no current marker, it is the SAME job, or
+    the currently-tracked job has already settled / is unknown to the manager; refuse
+    it only while a different tracked teardown is still PENDING/RUNNING (keep the
+    first, longer-lived one). This needs two concurrent teardowns on one session
+    (e.g. two browser tabs) -- rare; the un-tracked second targets the same stack and
+    is redundant, so dropping its tracking is safe.
+    """
+    if not current_job_id or current_job_id == new_job_id:
+        return True
+    cur = _current_job(job_manager, current_job_id)
+    return not (
+        cur is not None and getattr(cur, "status", None) in ("PENDING", "RUNNING")
+    )
+
+
+def cdc_teardown_banner_active(
+    job_manager: JobManager, teardown_job_id: Optional[str]
+) -> bool:
+    """True while the durable teardown job is still PENDING/RUNNING (so the banner
+    should stay visible). False when there is no marker, or the job has settled / is
+    unknown to the manager -- the caller then clears the marker and hides the banner.
+    Pure/read-only; the state-clearing side effect stays with the caller.
+    """
+    if not teardown_job_id:
+        return False
+    job = _current_job(job_manager, teardown_job_id)
+    return job is not None and getattr(job, "status", None) in ("PENDING", "RUNNING")
+
+
 def _classify_cdc_stack_phase(discovery) -> tuple[str, Optional[str]]:
     """Map a stack discovery (or None) to a lifecycle phase + raw status.
 
