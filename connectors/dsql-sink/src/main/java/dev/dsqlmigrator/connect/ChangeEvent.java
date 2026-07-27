@@ -94,7 +94,21 @@ final class ChangeEvent {
     return delete;
   }
 
-  /** +1 insert / 0 update / -1 delete — for the per-table net-rows monitor metric. */
+  /** An INSERT (Debezium op c / snapshot r): applied as an upsert, net row delta +1. */
+  boolean isInsert() {
+    return !delete && netRowDelta == 1;
+  }
+
+  /** An UPDATE (Debezium op u): applied as an idempotent upsert, net row delta 0. */
+  boolean isUpdate() {
+    return !delete && netRowDelta == 0;
+  }
+
+  /**
+   * +1 insert / 0 update / -1 delete. Encodes the op kind (see {@link #isInsert()} /
+   * {@link #isUpdate()} / {@link #isDelete()}); summed it also gives a table's net
+   * row-count change over a committed chunk.
+   */
   int netRowDelta() {
     return netRowDelta;
   }

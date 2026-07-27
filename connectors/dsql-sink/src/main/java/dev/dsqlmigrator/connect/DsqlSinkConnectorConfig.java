@@ -77,7 +77,8 @@ public class DsqlSinkConnectorConfig extends AbstractConfig {
               Type.BOOLEAN,
               true,
               Importance.LOW,
-              "Emit the per-table NetRowsApplied CloudWatch metric (best-effort).")
+              "Emit the per-table applied-ops CloudWatch metrics (InsertsApplied / "
+                  + "UpdatesApplied / DeletesApplied) + ReplicationLagMs (best-effort).")
           .define(
               METRICS_STACK,
               Type.STRING,

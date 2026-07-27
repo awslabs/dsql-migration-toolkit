@@ -5,6 +5,22 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.127
+
+### Changed
+
+- **테이블별 CDC 모니터가 DMS 스타일 변경 분해(I/U/D)를 표시합니다.** "Net rows since
+  Full Load" 열을 **"Changes since Full Load"** 로 교체 — 테이블마다 라이브 카운터 3개:
+  **insert**(초록 `add`), **update**(파랑 `edit`), **delete**(빨강 `remove`). 이제 UPDATE
+  트래픽이 처음으로 보입니다: 기존 net-rows 값은 insert − delete 만 합산하고 update 는
+  건너뛰어서 update 위주 테이블이 유휴처럼 보였습니다. 여전히 스캔 프리(`COUNT(*)` 없음):
+  DSQL 싱크가 단일 `NetRowsApplied` 대신 CloudWatch 메트릭 3개 — `InsertsApplied` /
+  `UpdatesApplied` / `DeletesApplied`(네임스페이스 `MysqlDsqlMigrator/CDC`, 디멘션
+  `Stack` + `Table`) — 를 방출하고, 컨트롤 플레인이 창(window) 단위로 각각 합산합니다.
+  net rows 는 필요 시 여전히 (insert − delete)로 파생됩니다. 재빌드된 싱크 플러그인이
+  필요하므로(`PLUGIN_VERSION` v21 → v22), 반영하려면 CDC 인프라를 **Delete + Deploy**
+  해야 합니다.
+
 ## v0.1.126
 
 ### Changed

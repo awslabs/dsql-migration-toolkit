@@ -392,13 +392,14 @@ class MigrationTableStatus:
     # when the table has no single integer PK or the value is unknown.
     source_max_pk: Optional[int] = None
     target_max_pk: Optional[int] = None
-    # Net rows the CDC SINK reports having applied since it started streaming
-    # (inserts minus deletes), read from its ``NetRowsApplied`` CloudWatch metric.
-    # Authoritative and scan-free: unlike ``cdc_applied_net``'s target-minus-Full
-    # Load fallback it needs NO ``COUNT(*)`` on either side, so it is the light,
-    # source-friendly way to show CDC progress. ``None`` when the metric is
-    # unavailable (sink not yet emitting / older plugin without the metric).
-    cdc_net_metric: Optional[int] = None
+    # Per-op change counts the CDC SINK reports having applied since it started
+    # streaming, from its ``InsertsApplied`` / ``UpdatesApplied`` / ``DeletesApplied``
+    # CloudWatch metrics. A DMS-style breakdown: ``{"inserts": N, "updates": N,
+    # "deletes": N}``. Authoritative and scan-free (needs NO ``COUNT(*)`` on either
+    # side) and — unlike the old net-rows figure — makes UPDATE traffic visible.
+    # ``None`` when unavailable (sink not yet emitting / older plugin without the
+    # metrics).
+    cdc_applied_ops: "Optional[dict[str, int]]" = None
     # End-to-end replication lag in milliseconds from the sink's ``ReplicationLagMs``
     # CloudWatch metric (apply time minus the event's source commit time). Time-based
     # and PK-agnostic -- the accurate "Stream lag" signal, preferred over the MAX(pk)
@@ -432,19 +433,42 @@ class MigrationTableStatus:
         return None if g is None else g <= 0
 
     @property
+    def cdc_inserts(self) -> Optional[int]:
+        """INSERTs CDC has applied since it started streaming, or ``None``."""
+        if self.cdc_applied_ops is None:
+            return None
+        return int(self.cdc_applied_ops.get("inserts", 0))
+
+    @property
+    def cdc_updates(self) -> Optional[int]:
+        """UPDATEs CDC has applied since it started streaming, or ``None``."""
+        if self.cdc_applied_ops is None:
+            return None
+        return int(self.cdc_applied_ops.get("updates", 0))
+
+    @property
+    def cdc_deletes(self) -> Optional[int]:
+        """DELETEs CDC has applied since it started streaming, or ``None``."""
+        if self.cdc_applied_ops is None:
+            return None
+        return int(self.cdc_applied_ops.get("deletes", 0))
+
+    @property
     def cdc_applied_net(self) -> Optional[int]:
         """Net rows CDC applied since Full Load (inserts minus deletes).
 
-        Prefers the sink's ``NetRowsApplied`` metric (``cdc_net_metric``) when
-        present -- it is scan-free and needs no ``COUNT(*)`` on either side. Falls
-        back to ``target_rows - full_load_rows`` when the metric is unavailable
-        (sink not yet emitting the metric / older plugin), which needs both the
-        Full Load row count and a live target count. ``None`` when neither is
-        known. Can be negative if the stream net-deleted rows. This is a net row
-        delta, not a raw insert/update/delete event count.
+        Derived from the sink's per-op metrics (``cdc_applied_ops``) when present --
+        scan-free, needs no ``COUNT(*)`` on either side. Falls back to
+        ``target_rows - full_load_rows`` when those metrics are unavailable (sink not
+        yet emitting / older plugin), which needs both the Full Load row count and a
+        live target count. ``None`` when neither is known. Can be negative if the
+        stream net-deleted rows. This is a net row delta, not a raw event count --
+        the per-op ``cdc_inserts`` / ``cdc_updates`` / ``cdc_deletes`` are the counts.
         """
-        if self.cdc_net_metric is not None:
-            return self.cdc_net_metric
+        if self.cdc_applied_ops is not None:
+            return int(self.cdc_applied_ops.get("inserts", 0)) - int(
+                self.cdc_applied_ops.get("deletes", 0)
+            )
         if self.target_rows is None or self.full_load_rows is None:
             return None
         return self.target_rows - self.full_load_rows
@@ -510,7 +534,7 @@ def build_migration_table_status(
     dlq_counts: "Optional[dict[str, int]]" = None,
     source_max_pk: "Optional[dict[str, Optional[int]]]" = None,
     target_max_pk: "Optional[dict[str, Optional[int]]]" = None,
-    net_rows_metric: "Optional[dict[str, Optional[int]]]" = None,
+    applied_ops_metric: "Optional[dict[str, dict[str, int]]]" = None,
     replication_lag_ms: "Optional[dict[str, Optional[int]]]" = None,
     source_is_estimate: bool = True,
 ) -> list["MigrationTableStatus"]:
@@ -522,11 +546,12 @@ def build_migration_table_status(
     ``source_counts`` (else the watermark estimate is used as ``source_rows`` and
     flagged ``source_estimate``). ``dlq_counts`` (per-table quarantined-event
     counts from the error log) surfaces changes that did NOT reach the target.
-    ``net_rows_metric`` (per-table net rows from the sink's ``NetRowsApplied``
-    CloudWatch metric) drives the scan-free "Net rows since Full Load" figure when
-    present, so that column needs no ``COUNT(*)`` on either side. NiceGUI-agnostic
-    so it can be unit tested with plain dicts; the UI supplies the live counts
-    from a read-only poll.
+    ``applied_ops_metric`` (per-table ``{"inserts","updates","deletes"}`` counts from
+    the sink's ``InsertsApplied`` / ``UpdatesApplied`` / ``DeletesApplied`` CloudWatch
+    metrics) drives the scan-free "Changes since Full Load" (I/U/D) figures when
+    present, so those need no ``COUNT(*)`` on either side. NiceGUI-agnostic so it can
+    be unit tested with plain dicts; the UI supplies the live counts from a read-only
+    poll.
     """
     chunks_by_table: dict[str, ChunkState] = {}
     expected: dict[str, int] = {}
@@ -539,7 +564,7 @@ def build_migration_table_status(
     dlq_counts = dlq_counts or {}
     source_max_pk = source_max_pk or {}
     target_max_pk = target_max_pk or {}
-    net_rows_metric = net_rows_metric or {}
+    applied_ops_metric = applied_ops_metric or {}
     replication_lag_ms = replication_lag_ms or {}
 
     out: list[MigrationTableStatus] = []
@@ -569,7 +594,7 @@ def build_migration_table_status(
                 dlq_count=dlq_counts.get(name),
                 source_max_pk=source_max_pk.get(name),
                 target_max_pk=target_max_pk.get(name),
-                cdc_net_metric=net_rows_metric.get(name),
+                cdc_applied_ops=applied_ops_metric.get(name),
                 replication_lag_ms=replication_lag_ms.get(name),
             )
         )

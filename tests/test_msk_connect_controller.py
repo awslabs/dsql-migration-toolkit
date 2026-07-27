@@ -45,12 +45,29 @@ class _FakeClient:
         self.calls.append(("get_metric_data", kwargs))
         if self._raise_on == "get_metric_data":
             raise RuntimeError("boom")
-        return self._responses.get("get_metric_data", {})
+        resp = self._responses.get("get_metric_data", {})
+        # "echo": return one datapoint (value 1.0) per query id in THIS request, so a
+        # batching test can assert every query's result is merged across multiple calls
+        # without hand-listing hundreds of ids.
+        if resp == "echo":
+            return {
+                "MetricDataResults": [
+                    {"Id": q["Id"], "Values": [1.0]}
+                    for q in kwargs.get("MetricDataQueries", [])
+                ]
+            }
+        return resp
 
     def list_metrics(self, **kwargs: Any) -> Any:
         self.calls.append(("list_metrics", kwargs))
         if self._raise_on == "list_metrics":
             raise RuntimeError("boom")
+        # When "list_metrics_by_name" is set, vary the response by the MetricName kwarg
+        # so a test can publish a Table dimension under only SOME op metrics (exercising
+        # the union-across-metrics discovery). Otherwise fall back to a flat response.
+        by_name = self._responses.get("list_metrics_by_name")
+        if by_name is not None:
+            return by_name.get(kwargs.get("MetricName"), {"Metrics": []})
         return self._responses.get("list_metrics", {})
 
     def delete_connector(self, **kwargs: Any) -> Any:
@@ -213,8 +230,23 @@ def test_health_empty_names_makes_no_call() -> None:
     assert _controller(client).connector_health([]) == {}
 
 
-def _net_rows_responses(list_tables: list[str], data: dict[str, list[float]]) -> dict:
-    """Canned ListMetrics (discovered Table dims) + GetMetricData (n{i} -> values)."""
+def _applied_ops_responses(
+    list_tables: list[str],
+    ops_by_table: "dict[str, dict[str, list[float]]]",
+) -> dict:
+    """Canned ListMetrics (discovered Table dims) + GetMetricData for applied-ops.
+
+    ``ops_by_table`` maps a REQUESTED table name -> ``{"inserts":[...], "updates":[...],
+    "deletes":[...]}`` of per-commit datapoints. The controller builds one query per
+    (table, op) with ids ``o0, o1, o2, ...`` in insert/update/delete order per table,
+    so we lay the canned results out the same way.
+    """
+    results = []
+    i = 0
+    for _name, ops in ops_by_table.items():
+        for op_key in ("inserts", "updates", "deletes"):
+            results.append({"Id": f"o{i}", "Values": ops.get(op_key, [])})
+            i += 1
     return {
         "list_metrics": {
             "Metrics": [
@@ -223,67 +255,150 @@ def _net_rows_responses(list_tables: list[str], data: dict[str, list[float]]) ->
                 for t in list_tables
             ]
         },
-        "get_metric_data": {
-            "MetricDataResults": [
-                {"Id": f"n{i}", "Values": vals} for i, vals in enumerate(data.values())
-            ]
-        },
+        "get_metric_data": {"MetricDataResults": results},
     }
 
 
-def test_net_rows_by_table_exact_match_cluster_mode() -> None:
+def test_applied_ops_by_table_exact_match_cluster_mode() -> None:
     # Cluster mode: the tool's names are already schema-qualified and match the
-    # sink's Table dimension exactly. Query ids are n{i}; per-commit deltas summed.
+    # sink's Table dimension exactly. Per-op datapoints summed into I/U/D counts; a
+    # table with no datapoints at all is absent (falls back to the COUNT figure).
     client = _FakeClient(
-        _net_rows_responses(
+        _applied_ops_responses(
             ["cdc_demo.orders", "cdc_demo.customers"],
-            {"cdc_demo.orders": [5.0, 3.0], "cdc_demo.customers": []},
+            {
+                "cdc_demo.orders": {
+                    "inserts": [5.0, 3.0], "updates": [2.0], "deletes": [1.0]
+                },
+                "cdc_demo.customers": {"inserts": [], "updates": [], "deletes": []},
+            },
         )
     )
-    got = _controller(client).net_rows_by_table(
+    got = _controller(client).applied_ops_by_table(
         "stk", ["cdc_demo.orders", "cdc_demo.customers"]
     )
-    assert got == {"cdc_demo.orders": 8}
+    assert got == {"cdc_demo.orders": {"inserts": 8, "updates": 2, "deletes": 1}}
 
 
-def test_net_rows_by_table_suffix_match_single_db_mode() -> None:
+def test_applied_ops_by_table_suffix_match_single_db_mode() -> None:
     # Single-db mode: the tool uses bare names ("orders") but the sink always
     # publishes schema-qualified ("ecommerce_demo.orders"). The bare name must still
     # match the one published value (this is the whole point of discover-then-match).
     client = _FakeClient(
-        _net_rows_responses(["ecommerce_demo.orders"], {"orders": [10.0, -2.0]})
+        _applied_ops_responses(
+            ["ecommerce_demo.orders"],
+            {"orders": {"inserts": [10.0], "updates": [4.0, 1.0], "deletes": [2.0]}},
+        )
     )
-    got = _controller(client).net_rows_by_table("stk", ["orders"])
-    assert got == {"orders": 8}
-    # It discovered via ListMetrics before querying data.
-    assert [c[0] for c in client.calls] == ["list_metrics", "get_metric_data"]
+    got = _controller(client).applied_ops_by_table("stk", ["orders"])
+    assert got == {"orders": {"inserts": 10, "updates": 5, "deletes": 2}}
+    # Discovery runs ListMetrics once per op metric (3x) before the single data query.
+    assert [c[0] for c in client.calls] == [
+        "list_metrics", "list_metrics", "list_metrics", "get_metric_data",
+    ]
 
 
-def test_net_rows_by_table_ambiguous_bare_name_skipped() -> None:
+def test_applied_ops_by_table_update_only_table_visible() -> None:
+    # A table receiving ONLY updates has no InsertsApplied datapoint but must still
+    # surface (the whole point of the per-op split over the old net counter, which
+    # skipped delta==0 and made update-heavy tables look idle).
+    client = _FakeClient(
+        _applied_ops_responses(
+            ["cdc_demo.orders"],
+            {"cdc_demo.orders": {"inserts": [], "updates": [7.0, 3.0], "deletes": []}},
+        )
+    )
+    got = _controller(client).applied_ops_by_table("stk", ["cdc_demo.orders"])
+    assert got == {"cdc_demo.orders": {"inserts": 0, "updates": 10, "deletes": 0}}
+
+
+def test_applied_ops_by_table_unions_dims_across_op_metrics() -> None:
+    # Discovery must UNION the Table dims across all three op metrics: a table
+    # published under only ONE metric (e.g. update-only -> no InsertsApplied dim) would
+    # be DROPPED if discovery overwrote instead of unioning. Two tables, each published
+    # under a DIFFERENT single metric, must BOTH surface. (A regression to
+    # `discovered = set(dims)` would drop one and fail this test.)
+    client = _FakeClient(
+        {
+            "list_metrics_by_name": {
+                "InsertsApplied": {"Metrics": [
+                    {"Dimensions": [{"Name": "Stack", "Value": "stk"},
+                                    {"Name": "Table", "Value": "cdc.a_only"}]}]},
+                "UpdatesApplied": {"Metrics": [
+                    {"Dimensions": [{"Name": "Stack", "Value": "stk"},
+                                    {"Name": "Table", "Value": "cdc.b_only"}]}]},
+                "DeletesApplied": {"Metrics": []},
+            },
+            # by_dim order = requested order [a_only, b_only]; ids o0..o5 =
+            # (a_only I,U,D), (b_only I,U,D). a_only has only inserts, b_only only updates.
+            "get_metric_data": {"MetricDataResults": [
+                {"Id": "o0", "Values": [5.0]},   # a_only inserts
+                {"Id": "o1", "Values": []},      # a_only updates
+                {"Id": "o2", "Values": []},      # a_only deletes
+                {"Id": "o3", "Values": []},      # b_only inserts
+                {"Id": "o4", "Values": [7.0]},   # b_only updates
+                {"Id": "o5", "Values": []},      # b_only deletes
+            ]},
+        }
+    )
+    got = _controller(client).applied_ops_by_table("stk", ["cdc.a_only", "cdc.b_only"])
+    assert got == {
+        "cdc.a_only": {"inserts": 5, "updates": 0, "deletes": 0},
+        "cdc.b_only": {"inserts": 0, "updates": 7, "deletes": 0},
+    }
+
+
+def test_applied_ops_by_table_batches_over_500_query_cap() -> None:
+    # GetMetricData caps at 500 MetricDataQueries/request and this builds 3 per table,
+    # so >~166 tables would exceed it in a single call -> raise -> blanket except blanks
+    # the WHOLE monitor. The queries must be split into <=500-query batches and merged
+    # so a large table set scales instead of failing.
+    tables = [f"cdc.t{i}" for i in range(200)]  # 200 tables -> 600 queries
+    client = _FakeClient(
+        {
+            "list_metrics": {"Metrics": [
+                {"Dimensions": [{"Name": "Stack", "Value": "stk"},
+                                {"Name": "Table", "Value": t}]} for t in tables]},
+            "get_metric_data": "echo",
+        }
+    )
+    got = _controller(client).applied_ops_by_table("stk", tables)
+    assert len(got) == 200  # every table surfaced; none dropped by an over-cap failure
+    assert got["cdc.t0"] == {"inserts": 1, "updates": 1, "deletes": 1}
+    gmd_calls = [c for c in client.calls if c[0] == "get_metric_data"]
+    assert len(gmd_calls) == 2  # ceil(600 / 500) = 2 batches
+    assert all(len(c[1]["MetricDataQueries"]) <= 500 for c in gmd_calls)  # cap respected
+
+
+def test_applied_ops_by_table_ambiguous_bare_name_skipped() -> None:
     # A bare name matching two schemas' tables is ambiguous -> skipped (falls back to
-    # COUNT) rather than attributing another schema's rows to it.
+    # COUNT) rather than attributing another schema's rows to it. Discovery still
+    # runs once per op metric (3x); no data query when nothing matched unambiguously.
     client = _FakeClient(
         {"list_metrics": {"Metrics": [
             {"Dimensions": [{"Name": "Table", "Value": "a.orders"}]},
             {"Dimensions": [{"Name": "Table", "Value": "b.orders"}]},
         ]}}
     )
-    got = _controller(client).net_rows_by_table("stk", ["orders"])
+    got = _controller(client).applied_ops_by_table("stk", ["orders"])
     assert got == {}
-    # No data query when nothing matched unambiguously.
-    assert [c[0] for c in client.calls] == ["list_metrics"]
+    assert [c[0] for c in client.calls] == [
+        "list_metrics", "list_metrics", "list_metrics",
+    ]
 
 
-def test_net_rows_by_table_empty_when_nothing_published() -> None:
-    # No metrics discovered -> return {} without a GetMetricData call.
+def test_applied_ops_by_table_empty_when_nothing_published() -> None:
+    # No metrics discovered under any op metric -> return {} without a data query.
     client = _FakeClient({"list_metrics": {"Metrics": []}})
-    assert _controller(client).net_rows_by_table("stk", ["orders"]) == {}
-    assert [c[0] for c in client.calls] == ["list_metrics"]
+    assert _controller(client).applied_ops_by_table("stk", ["orders"]) == {}
+    assert [c[0] for c in client.calls] == [
+        "list_metrics", "list_metrics", "list_metrics",
+    ]
 
 
-def test_net_rows_by_table_empty_on_error() -> None:
+def test_applied_ops_by_table_empty_on_error() -> None:
     # Fail closed on either the discovery or the data read.
-    assert _controller(_FakeClient({}, raise_on="list_metrics")).net_rows_by_table(
+    assert _controller(_FakeClient({}, raise_on="list_metrics")).applied_ops_by_table(
         "stk", ["orders"]
     ) == {}
     client = _FakeClient(
@@ -291,13 +406,13 @@ def test_net_rows_by_table_empty_on_error() -> None:
             {"Dimensions": [{"Name": "Table", "Value": "orders"}]}]}},
         raise_on="get_metric_data",
     )
-    assert client and _controller(client).net_rows_by_table("stk", ["orders"]) == {}
+    assert client and _controller(client).applied_ops_by_table("stk", ["orders"]) == {}
 
 
-def test_net_rows_by_table_no_call_without_stack_or_tables() -> None:
+def test_applied_ops_by_table_no_call_without_stack_or_tables() -> None:
     client = _FakeClient({"list_metrics": {"Metrics": []}})
-    assert _controller(client).net_rows_by_table("", ["orders"]) == {}
-    assert _controller(client).net_rows_by_table("stk", []) == {}
+    assert _controller(client).applied_ops_by_table("", ["orders"]) == {}
+    assert _controller(client).applied_ops_by_table("stk", []) == {}
     assert client.calls == []  # never hit CloudWatch
 
 

@@ -100,14 +100,18 @@ public class DsqlSinkTask extends SinkTask {
   private Connection connection;
   private ErrantRecordReporter dlqReporter; // null if the runtime has no DLQ wired
 
-  // --- Per-table net-rows monitor metric (best-effort CloudWatch) -----------
-  // The UI reads this instead of COUNT(*)-ing the source: the sink knows exactly
-  // how many rows it net-applied per table (inserts +1, deletes -1, updates 0),
-  // so a lightweight, source-scan-free "net rows since Full Load" signal costs a
-  // running counter + one PutMetricData per offset-commit window. Emission is
-  // strictly best-effort: a CloudWatch error is logged and NEVER breaks apply.
+  // --- Per-table applied-ops monitor metrics (best-effort CloudWatch) --------
+  // The UI reads these instead of COUNT(*)-ing the source: the sink knows exactly
+  // how many inserts / updates / deletes it applied per table (a DMS-style
+  // change breakdown), a source-scan-free signal costing three running counters +
+  // one PutMetricData per offset-commit window. NOTE updates are counted too --
+  // the old single "net rows" counter (inserts - deletes) skipped them entirely
+  // (netRowDelta 0), so an update-heavy table looked idle. Emission is strictly
+  // best-effort: a CloudWatch error is logged and NEVER breaks apply.
   private static final String METRIC_NAMESPACE = "MysqlDsqlMigrator/CDC";
-  private static final String METRIC_NET_ROWS = "NetRowsApplied";
+  private static final String METRIC_INSERTS = "InsertsApplied";
+  private static final String METRIC_UPDATES = "UpdatesApplied";
+  private static final String METRIC_DELETES = "DeletesApplied";
   // End-to-end replication lag: apply-wall-clock - event's source commit time
   // (source.ts_ms). Time-based (milliseconds) and PK-agnostic, unlike the UI's
   // MAX(pk) leading-edge check. Per table we keep the WORST (max) lag seen since the
@@ -116,7 +120,9 @@ public class DsqlSinkTask extends SinkTask {
   private static final String METRIC_REPLICATION_LAG = "ReplicationLagMs";
   private boolean metricsEnabled;
   private String metricsStack = "";
-  private final Map<String, LongAdder> netByTable = new ConcurrentHashMap<>();
+  private final Map<String, LongAdder> insertsByTable = new ConcurrentHashMap<>();
+  private final Map<String, LongAdder> updatesByTable = new ConcurrentHashMap<>();
+  private final Map<String, LongAdder> deletesByTable = new ConcurrentHashMap<>();
   // Per-table worst replication lag (ms) since the last emit (reset on emit).
   private final Map<String, AtomicLong> lagByTable = new ConcurrentHashMap<>();
   private volatile CloudWatchClient cloudWatch; // built lazily on first emit
@@ -241,7 +247,7 @@ public class DsqlSinkTask extends SinkTask {
           },
           config.maxRetries(),
           config.retryBackoffMs());
-      recordNet(chunk); // committed: count the chunk's per-table net row delta
+      recordOps(chunk); // committed: count the chunk's per-table applied ops
     } catch (SQLException e) {
       rollbackQuietly();
       if (isTransient(e)) {
@@ -291,7 +297,7 @@ public class DsqlSinkTask extends SinkTask {
             },
             config.maxRetries(),
             config.retryBackoffMs());
-        recordNet(a.event()); // committed this row: count its net row delta
+        recordOps(a.event()); // committed this row: count its applied op
       } catch (SQLException e) {
         rollbackQuietly();
         if (isTransient(e)) {
@@ -682,26 +688,30 @@ public class DsqlSinkTask extends SinkTask {
     }
   }
 
-  // --- Per-table net-rows metric helpers (best-effort; never affect apply) ---
+  // --- Per-table applied-ops metric helpers (best-effort; never affect apply) ---
 
-  /** Add every applied event's net row delta to its table's running counter. */
-  private void recordNet(List<Applicable> chunk) {
+  /** Count every applied event by op kind (insert/update/delete) into its table. */
+  private void recordOps(List<Applicable> chunk) {
     if (!metricsEnabled) {
       return;
     }
     for (Applicable a : chunk) {
-      recordNet(a.event());
+      recordOps(a.event());
     }
   }
 
-  private void recordNet(ChangeEvent event) {
+  private void recordOps(ChangeEvent event) {
     if (!metricsEnabled) {
       return;
     }
-    int delta = event.netRowDelta();
-    if (delta != 0) {
-      netByTable.computeIfAbsent(event.table(), t -> new LongAdder()).add(delta);
-    }
+    // Count the applied op by KIND (inserts / updates / deletes). Unlike the old net
+    // counter (which added netRowDelta and skipped delta==0), updates ARE counted --
+    // they were previously invisible in "net rows".
+    final Map<String, LongAdder> counter =
+        event.isDelete()
+            ? deletesByTable
+            : event.isInsert() ? insertsByTable : updatesByTable;
+    counter.computeIfAbsent(event.table(), t -> new LongAdder()).increment();
     // End-to-end replication lag for this just-applied event: how long from the
     // source commit (source.ts_ms) to now (apply/commit time). Keep the WORST lag
     // per table since the last emit. Clamp to >= 0 (source/target clock skew can
@@ -714,32 +724,47 @@ public class DsqlSinkTask extends SinkTask {
   }
 
   /**
-   * Emit one {@code NetRowsApplied} datum per table (dimensions Stack + Table) for
-   * the deltas accumulated since the last emit, then reset. A failure is logged and
-   * swallowed: the metric is a monitor, so its emission must never fail replication.
-   * Called single-threaded by the Connect worker (put/flush/stop), so the
-   * sum-then-reset on each counter is not racing a concurrent apply.
+   * Append one COUNT {@link MetricDatum} per table (dimensions Stack + Table) for the
+   * counts accumulated in {@code byTable} since the last emit, then reset each counter
+   * ({@code sumThenReset}). A table with a zero count this window emits nothing.
+   */
+  private void emitOpCounter(
+      List<MetricDatum> data, Map<String, LongAdder> byTable, String metricName) {
+    for (Map.Entry<String, LongAdder> e : byTable.entrySet()) {
+      long count = e.getValue().sumThenReset();
+      if (count == 0) {
+        continue;
+      }
+      data.add(
+          MetricDatum.builder()
+              .metricName(metricName)
+              .dimensions(
+                  Dimension.builder().name("Stack").value(metricsStack).build(),
+                  Dimension.builder().name("Table").value(e.getKey()).build())
+              .value((double) count)
+              .unit(StandardUnit.COUNT)
+              .build());
+    }
+  }
+
+  /**
+   * Emit the per-table applied-ops counters ({@code InsertsApplied} /
+   * {@code UpdatesApplied} / {@code DeletesApplied}) and the worst replication lag
+   * ({@code ReplicationLagMs}) accumulated since the last emit, then reset. A failure
+   * is logged and swallowed: the metrics are a monitor, so emission must never fail
+   * replication. Called single-threaded by the Connect worker (put/flush/stop), so
+   * the sum-then-reset on each counter is not racing a concurrent apply.
    */
   private void emitMetrics() {
     if (!metricsEnabled) {
       return;
     }
     List<MetricDatum> data = new ArrayList<>();
-    for (Map.Entry<String, LongAdder> e : netByTable.entrySet()) {
-      long delta = e.getValue().sumThenReset();
-      if (delta == 0) {
-        continue;
-      }
-      data.add(
-          MetricDatum.builder()
-              .metricName(METRIC_NET_ROWS)
-              .dimensions(
-                  Dimension.builder().name("Stack").value(metricsStack).build(),
-                  Dimension.builder().name("Table").value(e.getKey()).build())
-              .value((double) delta)
-              .unit(StandardUnit.COUNT)
-              .build());
-    }
+    // Applied-ops counters: one COUNT datum per (table, kind) for the counts since the
+    // last emit, then reset. A table/kind idle this window emits nothing.
+    emitOpCounter(data, insertsByTable, METRIC_INSERTS);
+    emitOpCounter(data, updatesByTable, METRIC_UPDATES);
+    emitOpCounter(data, deletesByTable, METRIC_DELETES);
     // Replication lag (gauge): the worst apply-time lag per table since the last
     // emit, then reset. getAndSet(0) reads-and-clears so an idle next window (no
     // events) emits no datapoint (= caught up). Same Stack+Table dimensions and the

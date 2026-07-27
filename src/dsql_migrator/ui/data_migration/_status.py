@@ -712,14 +712,14 @@ def cdc_activity_summary(health: dict) -> CdcActivitySummary:
 def _fetch_cdc_status(migration_state, tables=None):
     """Read connector state + CloudWatch task health (BLOCKING network I/O).
 
-    Returns ``(statuses, health, dlq_errors, net_rows, lag_ms)`` from the duck-typed
-    ``MskConnectController``, or ``None`` when there is nothing to read or the read
-    fails. This is the only part of the CDC poll that touches the network, so the
-    live poller runs it on a worker thread (``run.io_bound``) -- keeping the
+    Returns ``(statuses, health, dlq_errors, applied_ops, lag_ms, lag_series)`` from
+    the duck-typed ``MskConnectController``, or ``None`` when there is nothing to read
+    or the read fails. This is the only part of the CDC poll that touches the network,
+    so the live poller runs it on a worker thread (``run.io_bound``) -- keeping the
     blocking calls off the NiceGUI event loop so the browser's WebSocket keep-alive
     is never starved. Pure read: it does not mutate ``migration_state`` (the apply
     step does that on the loop). ``tables`` (the migrated table set) scopes the
-    scan-free per-table net-rows metric read; omitted (non-UI callers) -> skipped.
+    scan-free per-table applied-ops metrics read; omitted (non-UI callers) -> skipped.
     """
     controller = getattr(migration_state, "cdc_controller", None)
     names = list(getattr(migration_state, "cdc_connector_names", []) or [])
@@ -730,18 +730,18 @@ def _fetch_cdc_status(migration_state, tables=None):
         health = controller.connector_health(names)
     except Exception:  # noqa: BLE001 - keep the last good view on any error
         return None
-    # Best-effort: read the sink's per-table net rows applied (NetRowsApplied) so
+    # Best-effort: read the sink's per-table applied-ops (Inserts/Updates/Deletes) so
     # the per-table monitor shows CDC progress WITHOUT a source/target COUNT(*).
     # Only when the controller exposes the reader and we know the table set; never
     # fatal (the COUNT-based fallback still renders if this is empty).
-    net_rows: dict = {}
+    applied_ops: dict = {}
     stack = getattr(migration_state, "cdc_stack_name", None)
-    net_reader = getattr(controller, "net_rows_by_table", None)
-    if callable(net_reader) and stack and tables:
+    ops_reader = getattr(controller, "applied_ops_by_table", None)
+    if callable(ops_reader) and stack and tables:
         try:
-            net_rows = dict(net_reader(stack, list(tables)) or {})
+            applied_ops = dict(ops_reader(stack, list(tables)) or {})
         except Exception:  # noqa: BLE001 - advisory, keep status even if it fails
-            net_rows = {}
+            applied_ops = {}
     # Best-effort: read per-table end-to-end replication lag (ms) from the sink's
     # ReplicationLagMs metric -- a time-based, PK-agnostic lag for the "Stream lag"
     # column (accurate, unlike the MAX(pk) leading-edge fallback). Never fatal.
@@ -773,7 +773,7 @@ def _fetch_cdc_status(migration_state, tables=None):
             dlq_errors = list(reader(f"/msk-connect/{stack_name}-cdc") or [])
         except Exception:  # noqa: BLE001 - advisory, keep status even if logs fail
             dlq_errors = []
-    return statuses, health, dlq_errors, net_rows, lag_ms, lag_series
+    return statuses, health, dlq_errors, applied_ops, lag_ms, lag_series
 
 
 def cdc_error_log_key(migration_state) -> str:
@@ -806,15 +806,15 @@ def _apply_cdc_status(migration_state, fetched) -> None:
         return
     statuses, health, *rest = fetched
     dlq_errors = rest[0] if rest else []
-    net_rows = rest[1] if len(rest) > 1 else {}
+    applied_ops = rest[1] if len(rest) > 1 else {}
     lag_ms = rest[2] if len(rest) > 2 else {}
     lag_series = rest[3] if len(rest) > 3 else []
-    # Store the scan-free per-table net rows the sink applied so the per-table
-    # monitor can show CDC progress without a COUNT(*). Setter is a no-op-safe
-    # replace; empty when the metric was unavailable this poll.
-    setter = getattr(migration_state, "set_cdc_net_rows_by_table", None)
+    # Store the scan-free per-table applied-ops (I/U/D) the sink reported so the
+    # per-table monitor can show CDC progress without a COUNT(*). Setter is a
+    # no-op-safe replace; empty when the metrics were unavailable this poll.
+    setter = getattr(migration_state, "set_cdc_applied_ops_by_table", None)
     if callable(setter):
-        setter(net_rows or {})
+        setter(applied_ops or {})
     # Store per-table replication lag (ms) for the time-based "Stream lag" column.
     lag_setter = getattr(migration_state, "set_cdc_replication_lag_by_table", None)
     if callable(lag_setter):

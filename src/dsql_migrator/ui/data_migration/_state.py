@@ -164,12 +164,13 @@ class DataMigrationState:
         self.row_max_pk_source: dict[str, Optional[int]] = {}
         self.row_max_pk_target: dict[str, Optional[int]] = {}
         self.row_counts_fetched_at: Optional[datetime] = None
-        # Per-table net rows the CDC sink reports applying since it started
-        # streaming (inserts minus deletes), from its ``NetRowsApplied`` CloudWatch
-        # metric. Refreshed every CDC poll -- scan-free (no source/target COUNT), so
-        # it drives the "Net rows since Full Load" column cheaply. name -> net count;
-        # empty when the metric is unavailable (older plugin / sink not emitting).
-        self.cdc_net_rows_by_table: dict[str, int] = {}
+        # Per-table applied-ops the CDC sink reports since it started streaming, from
+        # its ``InsertsApplied`` / ``UpdatesApplied`` / ``DeletesApplied`` CloudWatch
+        # metrics. Refreshed every CDC poll -- scan-free (no source/target COUNT), so
+        # it drives the "Changes since Full Load" (I/U/D) column cheaply. name ->
+        # {"inserts","updates","deletes"}; empty when the metrics are unavailable
+        # (older plugin / sink not emitting).
+        self.cdc_applied_ops_by_table: dict[str, dict[str, int]] = {}
         # Per-table end-to-end replication lag (milliseconds) from the sink's
         # ``ReplicationLagMs`` CloudWatch metric (apply time minus source commit time).
         # Refreshed every CDC poll; drives the time-based "Stream lag" column (a far
@@ -478,9 +479,9 @@ class DataMigrationState:
             self.cdc_other_stacks = []
             # Belongs to the previously-targeted stack; the fresh probe repopulates.
             self.cdc_reconciled_table_names = []
-            # Net-rows + replication-lag metrics are per-stack too; drop them so the
+            # Applied-ops + replication-lag metrics are per-stack too; drop them so the
             # adopted stack's poll repopulates rather than showing the prior stack's.
-            self.cdc_net_rows_by_table = {}
+            self.cdc_applied_ops_by_table = {}
             self.cdc_replication_lag_by_table = {}
             self.cdc_replication_lag_series = []
         return True
@@ -520,17 +521,26 @@ class DataMigrationState:
         with self._lock:
             self.cdc_reconciled_table_names = [n.strip() for n in names if n and n.strip()]
 
-    def set_cdc_net_rows_by_table(self, net_rows: "dict[str, int]") -> None:
-        """Record the per-table net rows the sink applied (from ``NetRowsApplied``).
+    def set_cdc_applied_ops_by_table(
+        self, applied_ops: "dict[str, dict[str, int]]"
+    ) -> None:
+        """Record the per-table applied-ops the sink reported (Inserts/Updates/Deletes).
 
-        Scan-free CDC progress (inserts minus deletes) read from CloudWatch on the
-        live poll; drives the "Net rows since Full Load" column without any
-        ``COUNT(*)``. Replaces the prior map (empty when the metric is unavailable).
+        Scan-free CDC progress read from CloudWatch on the live poll; drives the
+        "Changes since Full Load" (I/U/D) column without any ``COUNT(*)``. Replaces
+        the prior map (empty when the metrics are unavailable). Each value is
+        normalized to ``{"inserts","updates","deletes"}`` with int counts.
         """
         with self._lock:
-            self.cdc_net_rows_by_table = {
-                str(k): int(v) for k, v in dict(net_rows or {}).items()
-            }
+            normalized: dict[str, dict[str, int]] = {}
+            for table, ops in dict(applied_ops or {}).items():
+                ops = ops or {}
+                normalized[str(table)] = {
+                    "inserts": int(ops.get("inserts", 0) or 0),
+                    "updates": int(ops.get("updates", 0) or 0),
+                    "deletes": int(ops.get("deletes", 0) or 0),
+                }
+            self.cdc_applied_ops_by_table = normalized
 
     def set_cdc_replication_lag_by_table(self, lag_ms: "dict[str, int]") -> None:
         """Record per-table replication lag in ms (from ``ReplicationLagMs``).

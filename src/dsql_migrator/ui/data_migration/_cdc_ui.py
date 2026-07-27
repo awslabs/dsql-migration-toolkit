@@ -2890,13 +2890,13 @@ def _render_migration_table_status(
     """Per-table consistency view: Full Load vs CDC, source-vs-target, DLQ.
 
     Answers the operator's real question -- "did CDC replicate everything, is
-    anything missing?". It separates the one-shot Full Load row count from the net
-    rows CDC has applied since, shows the source-vs-target consistency verdict, and
+    anything missing?". It separates the one-shot Full Load row count from the
+    changes CDC has applied since, shows the source-vs-target consistency verdict, and
     surfaces per-table quarantined (DLQ) events -- changes that did NOT reach the
-    target. The "Net rows since Full Load" column is fed scan-free by the sink's own
-    ``NetRowsApplied`` CloudWatch metric (inserts minus deletes, refreshed each CDC
-    poll), so it needs no COUNT(*); it falls back to ``target − Full Load`` only
-    when that metric is unavailable. The source/target-count columns still come from
+    target. The "Changes since Full Load" (I/U/D) column is fed scan-free by the sink's
+    own ``InsertsApplied`` / ``UpdatesApplied`` / ``DeletesApplied`` CloudWatch metrics
+    (a DMS-style per-op breakdown, refreshed each CDC poll), so it needs no COUNT(*).
+    The source/target-count columns still come from
     a direct COUNT(*) on each side, which scans the source, so those remain an
     explicit "Refresh counts" action (not an auto-poll). Shown once a Full Load job
     exists (the CDC step is reached only after Full Load in the combined flow).
@@ -2940,7 +2940,9 @@ def _render_migration_table_status(
                 dlq_counts=dlq_counts,
                 source_max_pk=getattr(migration_state, "row_max_pk_source", {}),
                 target_max_pk=getattr(migration_state, "row_max_pk_target", {}),
-                net_rows_metric=getattr(migration_state, "cdc_net_rows_by_table", {}),
+                applied_ops_metric=getattr(
+                    migration_state, "cdc_applied_ops_by_table", {}
+                ),
                 replication_lag_ms=getattr(
                     migration_state, "cdc_replication_lag_by_table", {}
                 ),
@@ -2953,9 +2955,10 @@ def _render_migration_table_status(
                 {"name": "fl", "label": "Full Load", "field": "fl", "align": "left"},
                 {"name": "fl_rows", "label": "Full Load rows", "field": "fl_rows"},
                 {
-                    "name": "cdc_net",
-                    "label": "Net rows since Full Load",
-                    "field": "cdc_net",
+                    "name": "changes",
+                    "label": "Changes since Full Load",
+                    "field": "changes",
+                    "align": "left",
                 },
                 {"name": "source", "label": "Source rows", "field": "source"},
                 {"name": "target", "label": "Target rows", "field": "target"},
@@ -2972,10 +2975,11 @@ def _render_migration_table_status(
             def _fmt(n: "Optional[int]") -> str:
                 return "—" if n is None else f"{n:,}"
 
-            def _fmt_signed(n: "Optional[int]") -> str:
-                if n is None:
-                    return "—"
-                return f"+{n:,}" if n > 0 else f"{n:,}"
+            def _fmt_count(n: "Optional[int]") -> str:
+                # Bare thousands-separated count for the I/U/D sub-cells (no sign:
+                # each op count is non-negative). "0" when the metric is present but
+                # that op hasn't happened; the has_ops flag drives the "—" empty case.
+                return "0" if n is None else f"{n:,}"
 
             def _fmt_lag(ms: "Optional[int]") -> str:
                 # Time-based replication lag (ms) -> human "behind" text. Sub-second
@@ -3033,7 +3037,20 @@ def _render_migration_table_status(
                         }.get(r.full_load_state, r.full_load_state) or "—",
                         "fl_state": r.full_load_state or "",
                         "fl_rows": _fmt(r.full_load_rows),
-                        "cdc_net": _fmt_signed(r.cdc_applied_net),
+                        # DMS-style per-op breakdown: inserts / updates / deletes the
+                        # sink applied since streaming began (scan-free). has_ops is
+                        # False when the metrics are unavailable (older plugin / not
+                        # yet emitting) -> the cell shows "—". "changes" is a plain
+                        # text fallback for accessibility / no-slot rendering.
+                        "has_ops": r.cdc_applied_ops is not None,
+                        "cdc_ins": _fmt_count(r.cdc_inserts),
+                        "cdc_upd": _fmt_count(r.cdc_updates),
+                        "cdc_del": _fmt_count(r.cdc_deletes),
+                        "changes": (
+                            "—"
+                            if r.cdc_applied_ops is None
+                            else f"+{r.cdc_inserts:,} ~{r.cdc_updates:,} -{r.cdc_deletes:,}"
+                        ),
                         "source": source_label,
                         "target": _fmt(r.target_rows),
                         "stream": stream,
@@ -3061,6 +3078,24 @@ def _render_migration_table_status(
                   <q-badge v-if="props.row.fl_state"
                     :color="{'DONE':'positive','IN_PROGRESS':'primary','FAILED':'negative','PENDING':'grey'}[props.row.fl_state] || 'grey'"
                     :label="props.value" outline />
+                  <span v-else>—</span>
+                </q-td>
+                """,
+            )
+            # DMS-style per-op change breakdown: three inline counters (green inserts /
+            # sky updates / red deletes) with a leading Material glyph each, so the mix
+            # of change types is scannable at a glance. "—" when the metrics aren't
+            # available yet (older plugin / sink not emitting). Native `title` gives a
+            # hover label; the header ⓘ carries the fuller explanation.
+            table.add_slot(
+                "body-cell-changes",
+                r"""
+                <q-td :props="props">
+                  <span v-if="props.row.has_ops" class="inline-flex items-center no-wrap" style="gap:12px">
+                    <span class="text-green-700" title="Inserts applied"><q-icon name="add" size="14px" /> {{ props.row.cdc_ins }}</span>
+                    <span class="text-sky-700" title="Updates applied"><q-icon name="edit" size="14px" /> {{ props.row.cdc_upd }}</span>
+                    <span class="text-red-700" title="Deletes applied"><q-icon name="remove" size="14px" /> {{ props.row.cdc_del }}</span>
+                  </span>
                   <span v-else>—</span>
                 </q-td>
                 """,
@@ -3098,10 +3133,11 @@ def _render_migration_table_status(
                 )
 
             _hdr_info(
-                "cdc_net",
-                "NET rows CDC applied since Full Load — inserts add, deletes "
-                "subtract, updates don't change it (not an event count). Live from "
-                "the sink; negative is normal when deletes outweigh inserts.",
+                "changes",
+                "Row changes CDC applied since Full Load, broken out by type — "
+                "green add = inserts, blue edit = updates, red remove = deletes. "
+                "Live from the sink (scan-free); “—” means the metrics aren't "
+                "available yet.",
             )
             _hdr_info(
                 "stream",
@@ -3115,12 +3151,12 @@ def _render_migration_table_status(
                 "red “rows missing” = newest landed but rows gone mid-stream · red "
                 "“data quarantined” = DLQ has un-applied events.",
             )
-            # Keep the "Net rows since Full Load" column live while CDC streams. The
-            # CDC poll (_render_cdc_live_monitoring) fetches the scan-free
-            # NetRowsApplied metric and stores it on migration_state every
+            # Keep the "Changes since Full Load" (I/U/D) column live while CDC streams.
+            # The CDC poll (_render_cdc_live_monitoring) fetches the scan-free
+            # applied-ops metrics and stores them on migration_state every
             # ~_CDC_POLL_INTERVAL_SECONDS, but this per-table table is a SEPARATE
             # refreshable region the poll does not re-render -- so without this it
-            # would only pick up new net-rows on a manual "Refresh counts" click
+            # would only pick up new counts on a manual "Refresh counts" click
             # (which also runs the COUNT(*) this feature exists to avoid). Re-render
             # on the poll interval to reflect the stored metric. This reads state
             # only (NO network / no COUNT), so it stays scan-free. One-shot + re-arm
@@ -3252,11 +3288,11 @@ def _render_migration_table_status(
             )
             definition_row(
                 ui,
-                "Net rows since Full Load",
-                "NET rows CDC applied since Full Load — inserts add, deletes "
-                "subtract, updates don't change it (not an event count). Live from "
-                "the sink (scan-free); negative is normal when deletes outweigh "
-                "inserts.",
+                "Changes since Full Load",
+                "Row changes CDC applied since Full Load, broken out by type — "
+                "green add = inserts, blue edit = updates, red remove = deletes. "
+                "Live from the sink (scan-free); “—” means the metrics aren't "
+                "available yet.",
             )
             definition_row(
                 ui,

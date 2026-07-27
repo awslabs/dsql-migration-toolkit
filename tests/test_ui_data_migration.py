@@ -1947,26 +1947,29 @@ def test_fetch_cdc_status_includes_dlq_errors_when_controller_exposes_reader() -
     assert [e.table for e in dlq_errors] == ["orders"]
 
 
-def test_fetch_cdc_status_reads_net_rows_when_controller_exposes_reader() -> None:
-    # When the controller exposes net_rows_by_table and the caller passes the
+def test_fetch_cdc_status_reads_applied_ops_when_controller_exposes_reader() -> None:
+    # When the controller exposes applied_ops_by_table and the caller passes the
     # migrated table set, _fetch scopes the scan-free metric read to those tables
-    # and _apply stores it on state (drives the "Net rows since Full Load" column).
+    # and _apply stores it on state (drives the "Changes since Full Load" I/U/D cell).
     from dsql_migrator.core.cdc import ConnectorState, ConnectorStatus
     from dsql_migrator.core.msk_connect_controller import ConnectorHealth
     from dsql_migrator.ui.data_migration import _apply_cdc_status, _fetch_cdc_status
 
     seen: dict = {}
 
-    class _CtrlWithNet(_FakeCdcController):
-        def net_rows_by_table(self, stack, tables, **_kw):
+    class _CtrlWithOps(_FakeCdcController):
+        def applied_ops_by_table(self, stack, tables, **_kw):
             seen["stack"] = stack
             seen["tables"] = list(tables)
-            return {"orders": 5, "customers": -2}
+            return {
+                "orders": {"inserts": 5, "updates": 3, "deletes": 1},
+                "customers": {"inserts": 2, "updates": 0, "deletes": 4},
+            }
 
     state = DataMigrationState()
     state.set_cdc_stack_name("mysql-dsql-cdc-seoul-test")
     state.set_cdc_controller(
-        _CtrlWithNet(
+        _CtrlWithOps(
             statuses=[ConnectorStatus(name="sink", state=ConnectorState.RUNNING)],
             health={"sink": ConnectorHealth(running_tasks=1, errored_tasks=0)},
         )
@@ -1980,7 +1983,10 @@ def test_fetch_cdc_status_reads_net_rows_when_controller_exposes_reader() -> Non
         "tables": ["orders", "customers"],
     }
     _apply_cdc_status(state, fetched)
-    assert state.cdc_net_rows_by_table == {"orders": 5, "customers": -2}
+    assert state.cdc_applied_ops_by_table == {
+        "orders": {"inserts": 5, "updates": 3, "deletes": 1},
+        "customers": {"inserts": 2, "updates": 0, "deletes": 4},
+    }
 
 
 def test_fetch_cdc_status_reads_replication_lag_when_controller_exposes_reader() -> None:
@@ -2130,7 +2136,7 @@ def test_migration_status_tables_falls_back_to_reconciled_without_job() -> None:
     assert _migration_status_tables(state, _JobJM2()) == ["t1", "t2"]
 
 
-def test_fetch_cdc_status_skips_net_rows_without_tables() -> None:
+def test_fetch_cdc_status_skips_applied_ops_without_tables() -> None:
     # No table set (non-UI caller / before Full Load) -> the metric read is not
     # attempted, so a source scan is never triggered for it.
     from dsql_migrator.core.cdc import ConnectorState, ConnectorStatus
@@ -2139,15 +2145,15 @@ def test_fetch_cdc_status_skips_net_rows_without_tables() -> None:
 
     called = {"n": 0}
 
-    class _CtrlWithNet(_FakeCdcController):
-        def net_rows_by_table(self, stack, tables, **_kw):
+    class _CtrlWithOps(_FakeCdcController):
+        def applied_ops_by_table(self, stack, tables, **_kw):
             called["n"] += 1
             return {}
 
     state = DataMigrationState()
     state.set_cdc_stack_name("stk")
     state.set_cdc_controller(
-        _CtrlWithNet(
+        _CtrlWithOps(
             statuses=[ConnectorStatus(name="sink", state=ConnectorState.RUNNING)],
             health={"sink": ConnectorHealth(running_tasks=1, errored_tasks=0)},
         )
@@ -3840,33 +3846,52 @@ def test_cdc_applied_net_none_until_both_known() -> None:
     assert row.cdc_applied_net is None
 
 
-def test_cdc_applied_net_prefers_sink_metric_over_count_fallback() -> None:
-    # The scan-free NetRowsApplied metric wins over target-minus-Full Load, so the
-    # net-rows column needs no COUNT(*) once the sink is emitting it.
+def test_applied_ops_metric_surfaces_per_op_and_wins_net_over_count() -> None:
+    # The scan-free per-op metrics (Inserts/Updates/Deletes) surface I/U/D directly
+    # AND derive net (inserts - deletes), winning over target-minus-Full Load so the
+    # column needs no COUNT(*) once the sink is emitting them.
     from dsql_migrator.ui.data_migration import build_migration_table_status
 
     job = _full_load_job(
         [{"chunk_id": "orders", "status": "DONE", "rows_loaded": 100, "attempts": 1}],
         counts={"orders": 100},
     )
-    # Metric says +5; target COUNT (137) would imply +37. Metric wins.
+    # Metric: +5 inserts / 3 updates / 0 deletes -> net +5; target COUNT (137) would
+    # imply +37, but the metric wins. Updates are now visible (the old net hid them).
     (row,) = build_migration_table_status(
         ["orders"], full_load_job=job,
         target_counts={"orders": 137},
-        net_rows_metric={"orders": 5},
+        applied_ops_metric={"orders": {"inserts": 5, "updates": 3, "deletes": 0}},
     )
-    assert row.cdc_net_metric == 5
-    assert row.cdc_applied_net == 5  # metric, not 137 - 100
+    assert row.cdc_applied_ops == {"inserts": 5, "updates": 3, "deletes": 0}
+    assert (row.cdc_inserts, row.cdc_updates, row.cdc_deletes) == (5, 3, 0)
+    assert row.cdc_applied_net == 5  # inserts - deletes, not 137 - 100
 
-    # Metric can be net-negative (stream net-deleted rows).
+    # Net can be negative when deletes outweigh inserts.
     (neg,) = build_migration_table_status(
-        ["orders"], full_load_job=job, net_rows_metric={"orders": -3},
+        ["orders"], full_load_job=job,
+        applied_ops_metric={"orders": {"inserts": 2, "updates": 1, "deletes": 5}},
     )
     assert neg.cdc_applied_net == -3
+    assert (neg.cdc_inserts, neg.cdc_updates, neg.cdc_deletes) == (2, 1, 5)
+
+
+def test_applied_ops_metric_update_only_table_visible() -> None:
+    # A table with ONLY updates surfaces the update count (net 0) rather than looking
+    # idle -- the whole point of the per-op split over the old net-rows figure.
+    from dsql_migrator.ui.data_migration import build_migration_table_status
+
+    (row,) = build_migration_table_status(
+        ["orders"],
+        applied_ops_metric={"orders": {"inserts": 0, "updates": 12, "deletes": 0}},
+    )
+    assert (row.cdc_inserts, row.cdc_updates, row.cdc_deletes) == (0, 12, 0)
+    assert row.cdc_applied_net == 0
 
 
 def test_cdc_applied_net_falls_back_when_metric_absent() -> None:
-    # No metric datapoint for the table -> fall back to target - Full Load.
+    # No metric datapoint for the table -> per-op is None and net falls back to
+    # target - Full Load.
     from dsql_migrator.ui.data_migration import build_migration_table_status
 
     job = _full_load_job(
@@ -3876,9 +3901,10 @@ def test_cdc_applied_net_falls_back_when_metric_absent() -> None:
     (row,) = build_migration_table_status(
         ["orders"], full_load_job=job,
         target_counts={"orders": 137},
-        net_rows_metric={"customers": 9},  # different table -> no entry for orders
+        applied_ops_metric={"customers": {"inserts": 9}},  # different table
     )
-    assert row.cdc_net_metric is None
+    assert row.cdc_applied_ops is None
+    assert (row.cdc_inserts, row.cdc_updates, row.cdc_deletes) == (None, None, None)
     assert row.cdc_applied_net == 37  # 137 target - 100 Full Load
 
 

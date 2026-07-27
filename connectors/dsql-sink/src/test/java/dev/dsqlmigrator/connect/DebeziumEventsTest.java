@@ -80,8 +80,11 @@ class DebeziumEventsTest {
     assertEquals(List.of(1L, "Alice"), event.values());
     assertEquals(List.of("id"), event.pkColumns());
     assertEquals(List.of(1L), event.pkValues());
-    // op "c" is an insert -> +1 to the target row count (net-rows monitor metric).
+    // op "c" is an insert -> +1 net; classified as an insert for the applied-ops metrics.
     assertEquals(1, event.netRowDelta());
+    assertTrue(event.isInsert());
+    assertFalse(event.isUpdate());
+    assertFalse(event.isDelete());
     // No ts_ms on this source block -> 0 (replication-lag not recorded).
     assertEquals(0L, event.sourceTsMs());
   }
@@ -119,8 +122,10 @@ class DebeziumEventsTest {
     ChangeEvent event = DebeziumEvents.parse(record(key(1L), env, "dsqlcdc.app.users"));
     assertFalse(event.isDelete());
     assertEquals(List.of(1L, "Alice2"), event.values());
-    // op "u" is an update -> row count unchanged (net 0).
+    // op "u" is an update -> net 0; classified as an update for the applied-ops metrics.
     assertEquals(0, event.netRowDelta());
+    assertTrue(event.isUpdate());
+    assertFalse(event.isInsert());
   }
 
   @Test
@@ -132,8 +137,11 @@ class DebeziumEventsTest {
     assertEquals("app.users", event.table());
     assertEquals(List.of("id"), event.pkColumns());
     assertEquals(List.of(5L), event.pkValues());
-    // op "d" is a delete -> -1 to the target row count.
+    // op "d" is a delete -> -1 net; classified as a delete for the applied-ops metrics.
     assertEquals(-1, event.netRowDelta());
+    assertTrue(event.isDelete());
+    assertFalse(event.isInsert());
+    assertFalse(event.isUpdate());
   }
 
   @Test

@@ -5,6 +5,23 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.127
+
+### Changed
+
+- **テーブル別 CDC モニターが DMS スタイルの変更内訳(I/U/D)を表示するようになりました。**
+  「Net rows since Full Load」列を **「Changes since Full Load」** に置き換え —
+  テーブルごとに 3 つのライブカウンター: **insert**(緑 `add`)・**update**(青 `edit`)・
+  **delete**(赤 `remove`)。これにより UPDATE トラフィックが初めて可視化されます。従来の
+  net-rows 値は insert − delete のみを合算し update を無視していたため、update 主体の
+  テーブルがアイドルに見えていました。依然としてスキャン不要(`COUNT(*)` なし):DSQL シンクは
+  単一の `NetRowsApplied` に代えて CloudWatch メトリクスを 3 つ — `InsertsApplied` /
+  `UpdatesApplied` / `DeletesApplied`(名前空間 `MysqlDsqlMigrator/CDC`、ディメンション
+  `Stack` + `Table`)— を送出し、コントロールプレーンがウィンドウ単位でそれぞれ合算します。
+  net rows は必要に応じて(insert − delete)で引き続き導出できます。再ビルドされたシンク
+  プラグインが必要なため(`PLUGIN_VERSION` v21 → v22)、反映するには CDC インフラの
+  **Delete + Deploy** が必要です。
+
 ## v0.1.126
 
 ### Changed

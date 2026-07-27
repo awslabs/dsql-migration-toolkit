@@ -75,12 +75,21 @@ _SEND_RATE_METRIC = "SinkRecordSendRate"
 # (both ~0 after the source is quiesced = pipeline idle / caught up).
 _SOURCE_POLL_RATE_METRIC = "SourceRecordPollRate"
 
-# The custom DSQL sink's per-table net-rows metric (connectors/dsql-sink emits a
-# per-offset-commit delta of inserts-minus-deletes, dimensioned Stack + Table).
-# Summed over the window here to get net rows applied — a source-scan-free per-table
-# CDC signal that replaces COUNT(*)-ing the source in the live monitor.
+# The custom DSQL sink's per-table applied-ops metrics (connectors/dsql-sink emits a
+# per-offset-commit COUNT of inserts / updates / deletes, dimensioned Stack + Table).
+# Summed over the window here to get a DMS-style change breakdown per table — a
+# source-scan-free CDC signal that replaces COUNT(*)-ing the source in the live
+# monitor, and (unlike the old NetRowsApplied) makes UPDATE traffic visible.
 _CDC_METRIC_NAMESPACE = "MysqlDsqlMigrator/CDC"
-_NET_ROWS_METRIC = "NetRowsApplied"
+_APPLIED_OP_METRICS = {  # result key -> CloudWatch metric name
+    "inserts": "InsertsApplied",
+    "updates": "UpdatesApplied",
+    "deletes": "DeletesApplied",
+}
+# CloudWatch GetMetricData accepts at most 500 MetricDataQueries per request. The
+# applied-ops read builds 3 queries per matched table, so a large-scale migration
+# (>~166 tracked tables) would exceed this in one call -- batch to stay under it.
+_GMD_MAX_QUERIES = 500
 # End-to-end replication lag (ms) the sink emits per table = apply-wall-clock minus
 # the event's source commit time (source.ts_ms). Time-based + PK-agnostic, so it is
 # a far more accurate "how far behind is the target" signal than the UI's MAX(pk)
@@ -341,45 +350,49 @@ class MskConnectController:
             return {name: ConnectorHealth() for name in names}
         return result
 
-    def net_rows_by_table(
+    def applied_ops_by_table(
         self,
         stack: str,
         tables: Sequence[str],
         *,
         window_seconds: int = 14 * 24 * 3600,
-    ) -> dict[str, int]:
-        """Net rows CDC has applied per table, from the sink's ``NetRowsApplied`` metric.
+    ) -> dict[str, dict[str, int]]:
+        """Per-table applied-ops breakdown CDC has applied, from the sink's
+        ``InsertsApplied`` / ``UpdatesApplied`` / ``DeletesApplied`` metrics.
 
-        The custom sink emits a per-offset-commit delta (inserts +1 / deletes -1 /
-        updates 0) under ``MysqlDsqlMigrator/CDC`` dimensioned ``Stack`` + ``Table``;
-        this Sums it over the trailing ``window_seconds`` to get net rows applied — a
-        lightweight, **source-scan-free** per-table signal that replaces a COUNT(*) on
-        the source in the live monitor.
+        Returns ``{table: {"inserts": N, "updates": N, "deletes": N}}`` (a DMS-style
+        change breakdown), each summed over the trailing ``window_seconds`` — a
+        lightweight, **source-scan-free** per-table signal that replaces COUNT(*)-ing
+        the source in the live monitor. Unlike the old net-rows metric it makes UPDATE
+        traffic visible (net = inserts - deletes hid updates entirely).
 
-        The sink always emits the ``Table`` dimension **schema-qualified**
-        (``db.table``, e.g. ``ecommerce_demo.orders``), while the tool's table names
-        can be bare (single-database mode) or already qualified (cluster mode). So we
-        first ``ListMetrics`` to discover the dimension values the sink actually
-        published for this stack, then match each requested name to one (exact, else
-        the bare table name matches exactly one published value) — working in either
-        mode without assuming the qualification scheme.
+        The sink emits the ``Table`` dimension **schema-qualified** (``db.table``),
+        while the tool's names can be bare or qualified, so we ``ListMetrics`` to
+        discover the published dimension values (UNION across the three op metrics —
+        an update-only table has no ``InsertsApplied`` dimension) then match each
+        requested name to one, working in either mode.
 
-        Best-effort: returns ``{}`` on any error / no datapoint (UI shows "-");
-        approximate under replay (a monitor, not the exact reconciliation, which is
-        Validation). Uses the live clock; tests inject a fake CloudWatch client.
+        Best-effort: returns ``{}`` on any error / no datapoint; approximate under
+        replay (a monitor, not the exact reconciliation, which is Validation). Uses
+        the live clock; tests inject a fake CloudWatch client.
         """
         names = [t for t in tables if t]
         if not stack or not names:
             return {}
-        result: dict[str, int] = {}
+        result: dict[str, dict[str, int]] = {}
         try:
             client = self._client("cloudwatch")
-            # 1) Discover the Table dimension values the sink published for this stack.
-            discovered = self._list_metric_dimensions(client, stack, _NET_ROWS_METRIC)
+            # 1) Discover the Table dims the sink published, UNION across the three op
+            #    metrics (a table with only updates has no InsertsApplied dimension).
+            discovered: set[str] = set()
+            for metric in _APPLIED_OP_METRICS.values():
+                discovered |= set(
+                    self._list_metric_dimensions(client, stack, metric) or []
+                )
             if not discovered:
                 return {}
             # 2) Map each requested table name to a published dimension value.
-            by_dim = _match_metric_tables(names, discovered)
+            by_dim = _match_metric_tables(names, sorted(discovered))
             if not by_dim:
                 return {}
             now = datetime.now(timezone.utc)
@@ -387,39 +400,54 @@ class MskConnectController:
                 now.timestamp() - window_seconds, tz=timezone.utc
             )
             queries = []
-            id_map: dict[str, str] = {}
-            for i, (name, dim) in enumerate(by_dim.items()):
-                qid = f"n{i}"
-                id_map[qid] = name
-                queries.append(
-                    {
-                        "Id": qid,
-                        "MetricStat": {
-                            "Metric": {
-                                "Namespace": _CDC_METRIC_NAMESPACE,
-                                "MetricName": _NET_ROWS_METRIC,
-                                "Dimensions": [
-                                    {"Name": "Stack", "Value": stack},
-                                    {"Name": "Table", "Value": dim},
-                                ],
+            id_map: dict[str, tuple[str, str]] = {}  # qid -> (table name, op key)
+            i = 0
+            for name, dim in by_dim.items():
+                for op_key, metric in _APPLIED_OP_METRICS.items():
+                    qid = f"o{i}"
+                    i += 1
+                    id_map[qid] = (name, op_key)
+                    queries.append(
+                        {
+                            "Id": qid,
+                            "MetricStat": {
+                                "Metric": {
+                                    "Namespace": _CDC_METRIC_NAMESPACE,
+                                    "MetricName": metric,
+                                    "Dimensions": [
+                                        {"Name": "Stack", "Value": stack},
+                                        {"Name": "Table", "Value": dim},
+                                    ],
+                                },
+                                # Daily Sum buckets over the window; summed below =
+                                # total ops applied (avoids an over-large single Period).
+                                "Period": 86400,
+                                "Stat": "Sum",
                             },
-                            # Daily Sum buckets over the window; summed below = total
-                            # net rows applied (avoids an over-large single Period).
-                            "Period": 86400,
-                            "Stat": "Sum",
-                        },
-                        "ReturnData": True,
-                    }
+                            "ReturnData": True,
+                        }
+                    )
+            # get_metric_data caps at 500 MetricDataQueries/request and we build 3 per
+            # matched table, so at >~166 tables a single call would exceed the cap and
+            # raise -- which the outer except would swallow, blanking the WHOLE monitor
+            # (every table, not just the overflow). Batch into <=500-query requests and
+            # merge, so the per-op monitor scales to a large table set. Each query id is
+            # unique across batches, so merging by (table, op) never double-counts.
+            for offset in range(0, len(queries), _GMD_MAX_QUERIES):
+                batch = queries[offset : offset + _GMD_MAX_QUERIES]
+                response = client.get_metric_data(
+                    MetricDataQueries=batch, StartTime=start, EndTime=now
                 )
-            response = client.get_metric_data(
-                MetricDataQueries=queries, StartTime=start, EndTime=now
-            )
-            for item in response.get("MetricDataResults", []):
-                name = id_map.get(item.get("Id"))
-                values = item.get("Values", [])
-                if name is None or not values:
-                    continue
-                result[name] = int(round(sum(float(v) for v in values)))
+                for item in response.get("MetricDataResults", []):
+                    key = id_map.get(item.get("Id"))
+                    values = item.get("Values", [])
+                    if key is None or not values:
+                        continue
+                    name, op_key = key
+                    bucket = result.setdefault(
+                        name, {"inserts": 0, "updates": 0, "deletes": 0}
+                    )
+                    bucket[op_key] = int(round(sum(float(v) for v in values)))
         except Exception:  # noqa: BLE001 - best-effort monitor signal only
             return {}
         return result
@@ -436,8 +464,8 @@ class MskConnectController:
         time). Time-based and PK-agnostic — a far more accurate replication-lag signal
         than the UI's ``MAX(pk)`` leading-edge check.
 
-        Discovery + name matching are identical to :meth:`net_rows_by_table` (the sink
-        emits the same schema-qualified ``Table`` dimension). Read with ``Stat=Maximum``
+        Discovery + name matching are identical to :meth:`applied_ops_by_table` (the
+        sink emits the same schema-qualified ``Table`` dimension). Read with ``Stat=Maximum``
         (worst lag) at 1-minute resolution over the trailing ``window_seconds`` and
         return the **most recent** minute's value per table (current worst lag). Idle
         tables (no recent events) have no datapoint and are simply absent — the stream
@@ -583,7 +611,7 @@ class MskConnectController:
         self, client: object, stack: str, metric_name: str
     ) -> list[str]:
         """Discover the ``Table`` dimension values the sink published for ``stack``
-        under ``metric_name`` (``NetRowsApplied`` or ``ReplicationLagMs``).
+        under ``metric_name`` (e.g. ``InsertsApplied`` or ``ReplicationLagMs``).
 
         Filters ``ListMetrics`` to that metric with this ``Stack`` dimension and returns
         each metric's ``Table`` value. Paginates over ``NextToken`` with a bounded loop

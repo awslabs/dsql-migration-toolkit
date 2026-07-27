@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.127
+
+### Changed
+
+- **Per-table CDC monitor now shows a DMS-style change breakdown (I/U/D).** The
+  "Net rows since Full Load" column is replaced by **"Changes since Full Load"** —
+  three live counters per table: **inserts** (green `add`), **updates** (blue
+  `edit`), and **deletes** (red `remove`). This makes UPDATE traffic visible for the
+  first time: the old net-rows figure summed inserts − deletes and skipped updates
+  entirely, so an update-heavy table looked idle. Still scan-free (no `COUNT(*)`):
+  the DSQL sink now emits three CloudWatch metrics — `InsertsApplied` /
+  `UpdatesApplied` / `DeletesApplied` (namespace `MysqlDsqlMigrator/CDC`, dimensions
+  `Stack` + `Table`) — in place of the single `NetRowsApplied`, and the control plane
+  sums each over the window. Net rows stays derivable (inserts − deletes) where still
+  needed. Requires the rebuilt sink plugin (`PLUGIN_VERSION` v21 → v22), so a
+  **Delete + Deploy** of the CDC infra is needed to pick it up.
+
 ## v0.1.126
 
 ### Changed

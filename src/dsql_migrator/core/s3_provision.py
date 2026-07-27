@@ -51,6 +51,14 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v22 rebuilds the DSQL sink jar: the per-table CloudWatch monitor now emits a
+#    change BREAKDOWN -- InsertsApplied / UpdatesApplied / DeletesApplied (COUNT per
+#    Stack+Table) -- instead of the single NetRowsApplied. Critically it counts
+#    UPDATES too: the old net counter added netRowDelta and skipped delta==0, so an
+#    update-heavy table looked idle. Net rows stays derivable (inserts - deletes). The
+#    reader (MskConnectController.applied_ops_by_table) and the per-table "Net rows"
+#    column become the "Changes since Full Load" (I/U/D) cell. Sink-jar change only;
+#    the debezium plugin is unchanged.
 # v21 rebuilds the offset-seeder Lambda zip: cfnresponse.send now RETRIES the
 #    CloudFormation response PUT (bounded, ~4 attempts with backoff) instead of
 #    giving up after one failed attempt. A single failed PUT during teardown left
@@ -187,7 +195,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v21"
+PLUGIN_VERSION = "v22"
 
 
 class S3ProvisionError(RuntimeError):
