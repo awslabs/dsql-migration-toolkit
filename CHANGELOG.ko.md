@@ -5,6 +5,17 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.125
+
+### Fixed
+
+- **이미 실행 중인 CDC 파이프라인에 재연결했을 때 CDC per-table 상태 뷰(및 라이브 지표)가
+  비어 보이던 문제 수정.** per-table 테이블 집합(net rows·stream lag·라이브 lag 차트의 지표
+  읽기 범위도 됨)이 **Full Load 잡의 chunk에서만** 유도돼서, Full Load 잡이 없는 세션(실행 중
+  파이프라인에 재연결, 또는 CDC-only)은 파이프라인이 실제로 스트리밍 중인데도 빈 테이블 +
+  lag/차트 없음으로 보였습니다. 이제 잡이 없으면 **라이브 스택 구성에서 reconcile된 테이블**로
+  폴백합니다.
+
 ## v0.1.124
 
 ### Changed

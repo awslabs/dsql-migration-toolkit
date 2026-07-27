@@ -2094,6 +2094,42 @@ def test_record_cdc_lag_sample_seeds_appends_and_trims() -> None:
     assert state.cdc_replication_lag_series == before
 
 
+def test_migration_status_tables_falls_back_to_reconciled_without_job() -> None:
+    # CDC often runs WITHOUT a Full Load job in this session (reconnected to a running
+    # pipeline). Without a job, the per-table set (which also scopes the lag/net-rows
+    # metric reads + the live chart) must fall back to the reconciled CDC tables, or
+    # the whole per-table view + metrics render empty while the pipeline is streaming.
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.job_manager import JobNotFoundError
+    from dsql_migrator.ui.data_migration import _migration_status_tables
+
+    class _NoJobJM:
+        def get_status(self, job_id):
+            raise JobNotFoundError(job_id)
+
+    state = DataMigrationState()
+    state.job_id = None
+    assert _migration_status_tables(state, _NoJobJM()) == []  # no job, no reconciled
+    state.set_cdc_reconciled_table_names(
+        ["ecommerce_demo.customers", "ecommerce_demo.orders"]
+    )
+    assert _migration_status_tables(state, _NoJobJM()) == [
+        "ecommerce_demo.customers",
+        "ecommerce_demo.orders",
+    ]
+
+    # A Full Load job still wins (authoritative set).
+    class _JobJM2:
+        def get_status(self, _job_id):
+            return SimpleNamespace(
+                chunks=[SimpleNamespace(chunk_id="t1"), SimpleNamespace(chunk_id="t2")]
+            )
+
+    state.job_id = "fl-1"
+    assert _migration_status_tables(state, _JobJM2()) == ["t1", "t2"]
+
+
 def test_fetch_cdc_status_skips_net_rows_without_tables() -> None:
     # No table set (non-UI caller / before Full Load) -> the metric read is not
     # attempted, so a source scan is never triggered for it.

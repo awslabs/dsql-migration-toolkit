@@ -247,14 +247,19 @@ def _ascii_log(message: str) -> str:
 def _migration_status_tables(migration_state, job_manager) -> list[str]:
     """The table names to show in the per-table migration-status view.
 
-    Uses the Full Load job's chunk ids (the tables actually migrated) when a job
-    exists -- that is the authoritative set across Full Load + CDC. Returns [] when
-    no job has run yet (nothing to show).
+    Prefers the Full Load job's chunk ids (the tables actually migrated) -- the
+    authoritative set across Full Load + CDC. But CDC commonly runs WITHOUT a Full
+    Load job in this session (reconnected to an already-running pipeline, or a
+    CDC-only run), so fall back to the tables reconciled from the live stack's config.
+    Without this fallback the per-table view -- and its scan-free CDC metrics (net
+    rows, stream lag, and the live lag chart, all scoped to this set) -- would be
+    empty even while the pipeline is actively streaming. ``[]`` only when neither the
+    job nor a reconciled set is known.
     """
     job = _current_job(job_manager, migration_state.job_id)
-    if job is None:
-        return []
-    return [c.chunk_id for c in job.chunks]
+    if job is not None:
+        return [c.chunk_id for c in job.chunks]
+    return list(getattr(migration_state, "cdc_reconciled_table_names", []) or [])
 
 
 def _single_int_pk_by_table(inventory, table_names) -> dict[str, str]:

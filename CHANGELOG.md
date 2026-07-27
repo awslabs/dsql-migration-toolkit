@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.125
+
+### Fixed
+
+- **The CDC per-table status view (and its live metrics) no longer comes up empty
+  when you reconnect to an already-running CDC pipeline.** The per-table set — which
+  also scopes the scan-free CDC metrics (net rows, stream lag, and the live lag
+  chart) — was derived *only* from a Full Load job's chunks, so a session with no
+  Full Load job (reconnected to a running pipeline, or a CDC-only run) showed an
+  empty table and no lag/chart even while the pipeline was actively streaming. It now
+  falls back to the tables reconciled from the live stack's config.
+
 ## v0.1.124
 
 ### Changed
