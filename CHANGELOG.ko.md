@@ -5,6 +5,31 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.136
+
+### Added
+
+- **Validation에서 전체 재실행 없이 개별 테이블만 다시 검증.** row count나 checksum이
+  mismatch된 테이블은 "Tables needing attention"의 각 항목에 **Re-check** 버튼이 생깁니다
+  (실패 테이블이 여러 개면 **Re-check all N tables**도 함께). 해당 테이블만 다시 비교한 뒤
+  결과를 기존 리포트에 **머지**하므로 나머지 테이블의 판정과 전체 cut-over go/no-go가 그대로
+  유지되면서 갱신됩니다 — 마지막 실패 테이블을 고치면 몇 시간짜리 전체 재실행 없이 판정이
+  "Ready for cut-over"로 바뀝니다.
+  - 재검증은 **원래 런의 옵션**(비교 모드, reconciliation, orphan check)을 리포트 자체에서
+    복원해 사용하므로 머지된 리포트가 자기모순에 빠지지 않고, 재접속으로 복원된 리포트도
+    재검증할 수 있습니다. Fast sweep은 재검증에서 **강제 off** — 이미 다르다고 아는 테이블이라
+    checksum/reconciliation이야말로 돌려야 하는 검사입니다.
+  - 시점이 섞인 사실을 명시합니다: **"N table(s) re-checked at &lt;시각&gt; — newer than the rest
+    of this run"**(대상 테이블 나열). 판정이 두 시점을 함께 반영하기 때문이며, 이 표시는
+    재접속 후에도 유지됩니다.
+  - 재검증은 완료된 스텝 위에서 돌아갑니다(스텝은 **Done** 유지, 리포트도 화면에 남고) 해당
+    행에만 "Re-checking…" 인라인 표시가 붙습니다. validation job 슬롯을 하나만 공유하므로
+    재검증 중에는 "Re-run validation"이 비활성화되고 그 역도 같습니다 — 전체 재실행이 재검증
+    작업을 고아로 만들거나 머지 대상 리포트를 지우는 일이 없습니다.
+  - 재검증을 시작할 수 없는 경우(예: 리포트 생성 이후 단수명 DSQL 타깃 토큰 만료)는 **"Could
+    not re-check those tables"** 별도 notice로 알리고 기존 리포트를 건드리지 않습니다 —
+    "Validation failed"로 표시되지 않습니다.
+
 ## v0.1.135
 
 ### Fixed

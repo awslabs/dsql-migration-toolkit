@@ -52,6 +52,7 @@ from dsql_migrator.core.job_manager import JobManager, JobNotFoundError
 from dsql_migrator.core.models import (
     AiAssistConfig,
     DriftReport,
+    OrphanFinding,
     SourceConnectionConfig,
     SourceInventory,
     StepStatus,
@@ -524,6 +525,113 @@ def count_verified_tables(report: ValidationReport) -> tuple[str, ...]:
 
 
 # ---------------------------------------------------------------------------
+# Re-checking individual tables (merge a fresh comparison into a prior report)
+# ---------------------------------------------------------------------------
+
+
+def merge_revalidated(
+    report: ValidationReport,
+    new_items: "Sequence[TableValidationResult]",
+    *,
+    orphan_findings: "Optional[Sequence[OrphanFinding]]" = None,
+) -> ValidationReport:
+    """Return ``report`` with the re-checked tables' results replaced.
+
+    Backs the per-table "Re-check" action: after a mismatch is investigated and
+    fixed, the user re-validates JUST that table instead of re-running the whole
+    (potentially hour-long) comparison, and the WHOLE report -- every other
+    table's verdict and the overall cut-over go/no-go -- is kept.
+
+    The merge is deliberately narrow and sound:
+
+    - Item ORDER is preserved (the report must read deterministically), so a
+      replaced item stays in its original row; nothing is appended or reordered.
+    - ``is_match`` is RECOMPUTED by :meth:`ValidationReport.build`, never carried
+      over, so the verdict always reflects the current item set (Property 9). If
+      the last failing table now passes, the verdict flips to a clean match on its
+      own; if a previously-passing table now fails, it flips the other way.
+    - A ``new_items`` entry naming a table NOT in ``report`` is IGNORED rather
+      than appended: it can only come from a stale scope (e.g. the migration
+      selection changed under a queued re-check), and silently widening the
+      report's scope would change what "all tables match" means.
+    - ``mode``, ``orphan_check_performed`` and ``snapshot_timestamp`` are carried
+      over unchanged -- they describe the RUN, and a re-check is required to use
+      the same options, so they still hold.
+    - ``drift`` is carried over as-is. It is a whole-source signal that a
+      single-table re-check does not re-measure, so overwriting it with a fresh
+      reading would silently re-date the report's drift verdict.
+    - ``orphan_findings`` (when given) REPLACE the findings for the re-checked
+      tables only: findings for those tables are dropped and the new ones added,
+      so a table whose orphans were fixed correctly loses its finding, while every
+      other table's findings survive. Passing ``None`` leaves the findings alone
+      (the re-check did not re-run the orphan check).
+
+    Pure: builds a new report and leaves ``report`` untouched, so it is unit
+    testable without NiceGUI or a database.
+    """
+    replacements = {item.table: item for item in new_items}
+    known = {item.table for item in report.items}
+    # Only tables actually present in the report can be replaced (see docstring).
+    rechecked = {name for name in replacements if name in known}
+    merged_items = [
+        replacements[item.table] if item.table in rechecked else item
+        for item in report.items
+    ]
+
+    findings = list(report.orphan_findings)
+    if orphan_findings is not None:
+        # Drop the re-checked tables' old findings, then add the fresh ones (a
+        # table whose orphans are gone correctly ends up with no finding).
+        findings = [f for f in findings if f.table not in rechecked]
+        findings.extend(f for f in orphan_findings if f.table in rechecked)
+
+    return ValidationReport.build(
+        mode=report.mode,
+        items=merged_items,
+        orphan_findings=findings,
+        orphan_check_performed=report.orphan_check_performed,
+        drift=report.drift,
+        snapshot_timestamp=report.snapshot_timestamp,
+    )
+
+
+@dataclass(frozen=True)
+class RunOptions:
+    """The comparison options a validation run used (mode + which checks ran)."""
+
+    mode: ValidationMode
+    reconcile: bool
+    check_orphans: bool
+
+
+def report_run_options(report: ValidationReport) -> RunOptions:
+    """Recover the options a report was produced with, FROM the report itself.
+
+    A re-check must compare the table the same way the original run did, or the
+    merged report's derived summaries stop being truthful (e.g. splicing a
+    reconciled item into a report where reconciliation never ran would make
+    :func:`reconcile_skipped_tables` mislabel every OTHER table as composite-PK).
+
+    The options are derived rather than remembered on purpose:
+
+    - the live option toggles cannot be used -- the user may have changed them on
+      screen after the run, and they describe the NEXT run, not this report;
+    - a restored report (re-hydrated from a session snapshot) has no remembered
+      options at all, yet must still be re-checkable.
+
+    ``reconcile`` is taken as "at least one item carries a reconciliation result",
+    which is exactly the ``reconcile_performed`` claim :func:`summarize_validation`
+    already makes about the report -- so a re-check reproduces the checks the UI
+    says the report contains, keeping the merged report self-consistent.
+    """
+    return RunOptions(
+        mode=report.mode,
+        reconcile=any(item.reconcile is not None for item in report.items),
+        check_orphans=report.orphan_check_performed,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Validation scope: WHAT is being validated (NiceGUI-agnostic)
 # ---------------------------------------------------------------------------
 
@@ -886,6 +994,23 @@ class ValidationState:
         self.cancel_requested: bool = False
         self._result: Optional[ValidationReport] = None
         self._error: Optional[str] = None
+        # Per-table RE-CHECK track (the same single job slot as a full run --
+        # ``job_id`` -- so there is never more than one comparison in flight).
+        # Non-empty while a re-check of exactly these tables is running/just ran;
+        # it is what tells the worker to MERGE its result into the existing report
+        # instead of replacing it. Written on the UI thread when a re-check starts
+        # and read by the UI poller + the worker, so it is lock-guarded.
+        self._recheck_tables: tuple[str, ...] = ()
+        # Tables whose result in the CURRENT report came from a re-check, and when
+        # the last re-check finished -- so the report can say honestly which rows
+        # are newer than the rest of the run. Cleared whenever a full run replaces
+        # the report (then every row is from the same run again).
+        self._rechecked_tables: tuple[str, ...] = ()
+        self._rechecked_at: Optional[datetime] = None
+        # A re-check's own failure message, kept apart from ``_error`` (a full
+        # run's failure) so a failed re-check never reads as "validation failed"
+        # over a perfectly good report.
+        self._recheck_error: Optional[str] = None
         # Live per-table progress for the running job, written by the background
         # worker (validator on_progress) and read by the UI poller -- guarded by
         # the same lock for the cross-thread handoff. ``(table, index, total)`` or
@@ -939,6 +1064,9 @@ class ValidationState:
         self,
         report: ValidationReport,
         completed_at: Optional[datetime],
+        *,
+        rechecked_tables: "Sequence[str]" = (),
+        rechecked_at: Optional[datetime] = None,
     ) -> None:
         """Re-hydrate a persisted result on reconnect (no elapsed time available).
 
@@ -946,6 +1074,11 @@ class ValidationState:
         ``_run_elapsed`` stays ``None`` (a restored run has no live duration). The
         UI flags the result as restored-as-of ``completed_at`` so a stale verdict
         (source advanced since) prompts a re-validate.
+
+        ``rechecked_tables``/``rechecked_at`` carry the per-table re-check marks
+        from the snapshot, so a restored MERGED report still discloses that those
+        rows are newer than the rest of the run (both default to empty, which is
+        the ordinary "one uniform run" case and what older snapshots restore as).
         """
         with self._lock:
             self._result = report
@@ -953,6 +1086,10 @@ class ValidationState:
             self._progress = None
             self._completed_at = completed_at
             self._restored = True
+            self._rechecked_tables = tuple(rechecked_tables)
+            self._rechecked_at = rechecked_at
+            self._recheck_tables = ()
+            self._recheck_error = None
 
     @property
     def restored(self) -> bool:
@@ -977,12 +1114,97 @@ class ValidationState:
             self._progress = None
 
     def set_result(self, result: ValidationReport) -> None:
-        """Record a successful run's report (clears any prior error + progress)."""
+        """Record a successful run's report (clears any prior error + progress).
+
+        A full run replaces the whole report, so any earlier per-table re-check
+        marks are cleared too -- every row is once again from one run.
+        """
         with self._lock:
             self._result = result
             self._error = None
             self._progress = None
             self._restored = False  # a freshly-run result, not a restored one
+            self._rechecked_tables = ()
+            self._rechecked_at = None
+
+    def start_recheck(self, tables: "Sequence[str]") -> None:
+        """Mark a per-table re-check of ``tables`` as starting (clears its error)."""
+        with self._lock:
+            self._recheck_tables = tuple(tables)
+            self._recheck_error = None
+
+    @property
+    def recheck_tables(self) -> tuple[str, ...]:
+        """Tables the in-flight (or just-finished) re-check covers; ``()`` if none."""
+        with self._lock:
+            return self._recheck_tables
+
+    def finish_recheck(self) -> None:
+        """Clear the in-flight re-check marker (the job reached a terminal state)."""
+        with self._lock:
+            self._recheck_tables = ()
+
+    def merge_recheck_result(
+        self,
+        new_items: "Sequence[TableValidationResult]",
+        *,
+        orphan_findings: "Optional[Sequence[OrphanFinding]]" = None,
+        completed_at: Optional[datetime] = None,
+    ) -> bool:
+        """Splice a re-check's per-table results into the existing report.
+
+        Returns ``False`` (and changes nothing) when there is no report to merge
+        into -- e.g. a full re-run cleared it while the re-check was in flight --
+        so a re-check can never resurrect a discarded report or create a
+        single-table one that would read as the whole run.
+
+        The merged report keeps the un-rechecked tables' verdicts and recomputes
+        the overall one (see :func:`merge_revalidated`). The re-checked table names
+        accumulate (re-checking table B after table A leaves BOTH marked as newer
+        than the run) and the finish time is stamped so the UI can date them.
+        """
+        with self._lock:
+            if self._result is None:
+                return False
+            merged = merge_revalidated(
+                self._result, new_items, orphan_findings=orphan_findings
+            )
+            self._result = merged
+            names = {item.table for item in new_items} & {
+                item.table for item in merged.items
+            }
+            self._rechecked_tables = tuple(
+                sorted(set(self._rechecked_tables) | names)
+            )
+            self._rechecked_at = completed_at or datetime.now(timezone.utc)
+            # The report is no longer purely the restored snapshot -- part of it was
+            # just measured live, so the "restored, may be stale" banner would be
+            # misleading. The re-check note takes over the as-of story.
+            self._restored = False
+            return True
+
+    @property
+    def rechecked_tables(self) -> tuple[str, ...]:
+        """Tables in the current report whose result came from a later re-check."""
+        with self._lock:
+            return self._rechecked_tables
+
+    @property
+    def rechecked_at(self) -> Optional[datetime]:
+        """UTC time the last re-check finished, or ``None``."""
+        with self._lock:
+            return self._rechecked_at
+
+    def set_recheck_error(self, message: str) -> None:
+        """Record a re-check's failure (kept apart from a full run's error)."""
+        with self._lock:
+            self._recheck_error = message
+
+    @property
+    def recheck_error(self) -> Optional[str]:
+        """Return the last re-check's failure message, if any."""
+        with self._lock:
+            return self._recheck_error
 
     def set_error(self, message: str) -> None:
         """Record a failure message for display."""
@@ -1002,10 +1224,18 @@ class ValidationState:
             return self._error
 
     def clear_outputs(self) -> None:
-        """Discard the previous report/error before a (re-)run."""
+        """Discard the previous report/error before a (re-)run.
+
+        Also drops the re-check marks: the report they annotated is gone, so
+        keeping them would date rows in a report they don't belong to.
+        """
         with self._lock:
             self._result = None
             self._error = None
+            self._recheck_tables = ()
+            self._rechecked_tables = ()
+            self._rechecked_at = None
+            self._recheck_error = None
 
 
 @dataclass
@@ -1101,14 +1331,21 @@ def build_validation_screen(
             return None
         return job.watermark
 
-    def runner() -> None:
+    def _run_prerequisite_error() -> Optional[str]:
+        """Return why a comparison cannot start right now, or ``None`` if it can.
+
+        Shared by the full run and the per-table re-check so both enforce exactly
+        the same bar: a Step 1 inventory plus a CURRENTLY VERIFIED source and
+        target. The target check matters just as much for a re-check as for a first
+        run -- DSQL access is a short-lived IAM token, so a report that validated
+        fine an hour ago can sit in front of an expired target connection.
+        """
         inventory = _inventory()
         if inventory is None:
-            validation_state.set_error(
+            return (
                 "Run Step 1 (Evaluation) first to introspect the source schema, "
                 "then run validation."
             )
-            return
         # Require a *verified* connection, not just a configured one: starting a
         # run against an unreachable/untested source or target would otherwise
         # block on connect and leave the step spinning. Fail fast with a clear
@@ -1116,24 +1353,28 @@ def build_validation_screen(
         if not session.has_source() or not getattr(
             session, "source_verified", False
         ):
-            validation_state.set_error(
+            return (
                 "Source connection is not verified. Test the source connection on "
                 "the Connect screen, then run validation."
             )
-            return
         if not session.has_target() or not getattr(
             session, "target_verified", False
         ):
-            validation_state.set_error(
+            return (
                 "Target connection is not verified. Test the target connection on "
                 "the Connect screen, then run validation."
             )
-            return
         if not inventory.tables:
-            validation_state.set_error(
-                "The source inventory has no tables to validate."
-            )
+            return "The source inventory has no tables to validate."
+        return None
+
+    def runner() -> None:
+        gate = _run_prerequisite_error()
+        if gate is not None:
+            validation_state.set_error(gate)
             return
+        inventory = _inventory()
+        assert inventory is not None  # guaranteed by the gate
 
         # Validate exactly what was migrated: narrow the inventory to the Data
         # Migration table selection (empty => all). Validating un-migrated tables
@@ -1214,6 +1455,98 @@ def build_validation_screen(
                 validation_state.mark_run_finished()
                 validation_state.clear_progress()
             validation_state.set_result(result)
+
+        validation_state.job_id = job_manager.submit(work)
+
+    def _recheck(tables: "Sequence[str]") -> None:
+        """Re-validate ONLY ``tables`` and merge the result into the current report.
+
+        The per-table "Re-check" action: after investigating (and fixing) a failing
+        table, re-compare just that table instead of re-running the whole
+        comparison, keeping every other table's verdict and letting the overall
+        cut-over verdict update on its own.
+
+        Deliberate choices:
+
+        - The comparison OPTIONS come from the existing report
+          (:func:`report_run_options`), not the live toggles, so the merged report
+          stays internally consistent (and a restored report is re-checkable).
+        - ``deep_only_on_count_mismatch`` is forced OFF: this table is already known
+          to differ, so the fast sweep's "skip deep checks when counts agree" would
+          be exactly the wrong economy -- if the counts now agree we specifically
+          want the checksum/reconciliation to confirm the rows really match.
+        - The step status stays as-is (DONE). Flipping it to IN_PROGRESS would hide
+          the whole report mid-re-check and lock the shell's Re-run; the running
+          state is shown inline on the affected rows instead.
+        - It reuses the SINGLE ``job_id`` slot, so a re-check and a full run can
+          never be in flight together.
+        """
+        report = validation_state.result
+        if report is None:
+            return  # nothing to merge into (the report was cleared)
+        wanted = tuple(dict.fromkeys(tables))  # de-dup, keep order
+        if not wanted:
+            return
+        gate = _run_prerequisite_error()
+        if gate is not None:
+            validation_state.set_recheck_error(gate)
+            return
+        inventory = _inventory()
+        assert inventory is not None  # guaranteed by the gate
+
+        # Compare the SAME table definitions the report covers: resolve from the
+        # inventory (the source of truth for columns/PK) and keep only the requested
+        # names. A name that is no longer in the inventory is dropped -- and if that
+        # leaves nothing, say so instead of silently re-checking everything.
+        by_name = {t.name: t for t in inventory.tables}
+        scoped = [by_name[name] for name in wanted if name in by_name]
+        if not scoped:
+            validation_state.set_recheck_error(
+                "These tables are no longer in the source inventory. Re-run "
+                "Step 1 (Evaluation), then validate again."
+            )
+            return
+
+        options = report_run_options(report)
+        source_config = session.source_config
+        target_config = session.target_config
+        assert source_config is not None  # guaranteed by the gate
+        assert target_config is not None  # guaranteed by the gate
+        inputs = ValidationInputs(
+            source_config=source_config,
+            source_password=session.source_password,
+            target_config=target_config,
+            inventory=inventory.model_copy(update={"tables": scoped}),
+            mode=options.mode,
+            check_orphans=options.check_orphans,
+            watermark=_migration_watermark(),
+            reconcile=options.reconcile,
+            # Always deep-check a re-check (see docstring).
+            deep_only_on_count_mismatch=False,
+            excluded_columns=migration_state.cdc_lob_exclusions(),
+        )
+
+        validation_state.start_recheck([t.name for t in scoped])
+        validation_state.cancel_requested = False
+
+        def work(handle: object) -> None:
+            try:
+                fresh = run_validation(
+                    inputs,
+                    validator_factory=validator_factory,
+                    should_cancel=lambda: bool(getattr(handle, "cancelled", False)),
+                    deep_only_on_count_mismatch=False,
+                )
+            except ValidationCancelled:
+                return  # cancelled: the report is simply left as it was
+            # Merge under the state lock; a False return means a full re-run cleared
+            # the report while this was in flight, so there is nothing to update.
+            validation_state.merge_recheck_result(
+                fresh.items,
+                orphan_findings=(
+                    fresh.orphan_findings if options.check_orphans else None
+                ),
+            )
 
         validation_state.job_id = job_manager.submit(work)
 
@@ -1331,6 +1664,19 @@ def build_validation_screen(
                     body=error,
                 )
 
+            # A per-table re-check that could not START (e.g. the target token
+            # expired since the report was produced) reports separately from a full
+            # run's failure -- the existing report is still perfectly valid, so this
+            # must not read as "Validation failed".
+            recheck_error = validation_state.recheck_error
+            if recheck_error:
+                render_notice(
+                    ui,
+                    tone="warning",
+                    header="Could not re-check those tables",
+                    body=recheck_error,
+                )
+
             # A cancelled run leaves the step NOT_STARTED (no report); surface it
             # as a calm info notice (not an error) so the user knows it stopped.
             if (
@@ -1442,15 +1788,82 @@ def build_validation_screen(
                             ),
                         )
 
+                # Per-table re-check: which tables are being re-compared right now
+                # (inline spinner on those rows) and the action that starts one. The
+                # action is withheld while ANY comparison is in flight so the single
+                # job slot is never double-claimed.
+                rechecking = validation_state.recheck_tables
+                busy = bool(rechecking) and _running_job_alive(
+                    job_manager, validation_state
+                )
+                if rechecking and not busy:
+                    # The re-check job settled (merged, failed, or was cancelled)
+                    # while we were elsewhere; clear the marker so the rows stop
+                    # showing a spinner.
+                    validation_state.finish_recheck()
+                    rechecking = ()
+
+                def _start_recheck(tables: "Sequence[str]") -> None:
+                    _recheck(tables)
+                    refresh()
+
                 _render_result(
                     ui, result,
                     diagnose_provider=diagnose_provider,
                     elapsed_seconds=validation_state.elapsed_seconds,
                     restored=validation_state.restored,
                     completed_at=validation_state.completed_at,
+                    recheck_provider=None if busy else _start_recheck,
+                    rechecking_tables=rechecking,
+                    rechecked_tables=validation_state.rechecked_tables,
+                    rechecked_at=validation_state.rechecked_at,
                 )
+                if busy:
+                    _install_recheck_poll_timer(
+                        ui, job_manager, validation_state, refresh
+                    )
 
     return content, runner
+
+
+def _install_recheck_poll_timer(
+    ui: object,
+    job_manager: JobManager,
+    validation_state: "ValidationState",
+    refresh: Callable[[], None],
+) -> None:
+    """Poll an in-flight per-table re-check once, re-arming via the next render.
+
+    Same one-shot discipline as :func:`_install_poll_timer` (each render installs
+    exactly one timer, so timers never accumulate), but deliberately does NOT touch
+    the workflow step status: a re-check runs on top of an already-``DONE`` step and
+    must leave that verdict -- and the visible report -- in place. On a terminal
+    state it clears the in-flight marker (surfacing a failure as the re-check's own
+    error) and refreshes so the merged rows appear.
+    """
+    job_id = validation_state.job_id
+    if job_id is None:
+        return
+
+    def poll() -> None:
+        try:
+            job = job_manager.get_status(job_id)
+        except JobNotFoundError:
+            validation_state.finish_recheck()
+            refresh()
+            return
+        if job.status in ("PENDING", "RUNNING"):
+            refresh()  # still running: re-render, which installs the next timer
+            return
+        if job.status == "FAILED":
+            validation_state.set_recheck_error(
+                job_manager.get_error(job_id)
+                or "The re-check failed. Try again, or re-run the full validation."
+            )
+        validation_state.finish_recheck()
+        refresh()
+
+    ui.timer(_POLL_INTERVAL_SECONDS, poll, once=True)  # type: ignore[attr-defined]
 
 
 def _cutover_summary_for_preview() -> "ValidationSummary":
@@ -1604,6 +2017,30 @@ def build_cutover_screen(
                     ).props("color=primary")
 
     return content, runner
+
+
+def validation_run_guard_reason(
+    job_manager: JobManager, validation_state: "ValidationState"
+) -> Optional[str]:
+    """Return a disable reason for the step's Re-run button, or ``None``.
+
+    A per-table re-check and a full run share ONE job slot, so while a re-check is
+    in flight the shell's "Re-run validation" must be disabled -- otherwise a
+    full run would overwrite ``job_id``, orphaning the re-check job and (worse)
+    clearing the very report the re-check is about to merge into. The re-check
+    buttons are withheld symmetrically while any comparison runs, so the two can
+    never collide in either direction.
+
+    NiceGUI-agnostic (takes the manager + state), so the guard is unit-testable.
+    """
+    if validation_state.recheck_tables and _running_job_alive(
+        job_manager, validation_state
+    ):
+        return (
+            "A table re-check is running. Wait for it to finish, then re-run the "
+            "full validation."
+        )
+    return None
 
 
 def _running_job_alive(
@@ -2120,6 +2557,10 @@ def _render_result(
     elapsed_seconds: Optional[float] = None,
     restored: bool = False,
     completed_at: "Optional[datetime]" = None,
+    recheck_provider=None,
+    rechecking_tables: "Sequence[str]" = (),
+    rechecked_tables: "Sequence[str]" = (),
+    rechecked_at: "Optional[datetime]" = None,
 ) -> None:
     """Render the cut-over readiness report: verdict, checks, then the details.
 
@@ -2131,6 +2572,13 @@ def _render_result(
     re-hydrated on reconnect, not run now), with its ``completed_at`` time, so a
     stale verdict prompts a re-validate. The go-path "how to cut over" runbook
     lives on the dedicated Cut over step, not in this result.
+
+    ``recheck_provider`` (when given) starts a per-table re-check for the table
+    names it is called with; it is withheld while any comparison is in flight, and
+    the failing-tables section then shows the tables in ``rechecking_tables`` as
+    busy instead. ``rechecked_tables``/``rechecked_at`` describe which rows in this
+    report are NEWER than the rest of the run, so the mixed as-of is stated
+    plainly rather than left for the reader to infer.
     """
     # Restored-from-snapshot banner FIRST, so the user knows this verdict is as-of
     # a past run (the source may have changed since) before reading it.
@@ -2153,6 +2601,11 @@ def _render_result(
     summary = summarize_validation(report)
     drift = format_drift(report)
     _render_verdict(ui, summary, drift, elapsed_seconds=elapsed_seconds)
+    # Mixed as-of honesty: when part of this report came from a later per-table
+    # re-check, say which tables and when, right under the verdict -- the verdict
+    # above is computed over BOTH vintages, so the reader must know that before
+    # acting on it. Info tone: a re-check is a normal, expected action.
+    _render_recheck_note(ui, rechecked_tables, rechecked_at)
     # On a no-go, the recovery path is its own prominent section right under the
     # verdict (how to fix it + ordered steps + the AI diagnosis action). The go
     # path's "how to actually cut over" runbook lives on the dedicated Cut over
@@ -2164,7 +2617,10 @@ def _render_result(
     with _section(ui, icon="fact_check", title="Cut-over readiness"):
         _render_readiness_checks(ui, summary, drift)
     _render_failing_tables(
-        ui, report, summary, drift, diagnose_provider=diagnose_provider
+        ui, report, summary, drift,
+        diagnose_provider=diagnose_provider,
+        recheck_provider=recheck_provider,
+        rechecking_tables=rechecking_tables,
     )
     with _section(ui, icon="table_view", title="Per-table results"):
         _render_tables(ui, report)
@@ -2264,6 +2720,50 @@ def _render_verdict(
         ),
     )
     _elapsed_caption()
+
+
+# How many re-checked table names to spell out in the mixed-as-of note before
+# collapsing to a count (keeps the notice one readable line).
+_RECHECK_NOTE_SAMPLE = 6
+
+
+def _render_recheck_note(
+    ui: object,
+    rechecked_tables: "Sequence[str]",
+    rechecked_at: "Optional[datetime]",
+) -> None:
+    """Note which tables in this report were re-checked later than the rest.
+
+    A merged report holds two vintages: most rows are from the full run, the
+    re-checked ones were measured just now. The verdict is computed over both, so
+    the mix is stated explicitly instead of leaving a reader to assume one as-of.
+    Renders nothing when no table was re-checked (the ordinary single-run case).
+    """
+    names = [n for n in rechecked_tables if n]
+    if not names:
+        return
+    shown = ", ".join(names[:_RECHECK_NOTE_SAMPLE])
+    overflow = len(names) - min(len(names), _RECHECK_NOTE_SAMPLE)
+    listed = f"{shown} and {overflow} more" if overflow else shown
+    when = (
+        rechecked_at.strftime("%Y-%m-%d %H:%M UTC")
+        if rechecked_at is not None
+        else "just now"
+    )
+    render_notice(
+        ui,
+        tone="info",
+        header=(
+            f"{len(names)} table(s) re-checked at {when} — newer than the rest "
+            "of this run"
+        ),
+        body=(
+            f"Re-checked: {listed}. Those rows were compared just now with the same "
+            "options as the original run; every other table's result is from that "
+            "earlier run, and the verdict above covers both. For a single "
+            "consistency point across all tables, re-run the full validation."
+        ),
+    )
 
 
 # How many missing/extra example PKs to summarize into the AI facts (range only,
@@ -2586,6 +3086,8 @@ def _render_failing_tables(
     drift: "Optional[DriftDisplay]" = None,
     *,
     diagnose_provider=None,
+    recheck_provider=None,
+    rechecking_tables: "Sequence[str]" = (),
 ) -> None:
     """Surface the failing tables (chips) + WHICH rows diverge (sample PKs).
 
@@ -2595,6 +3097,11 @@ def _render_failing_tables(
     the dev row-diff sample). When AI Assist is on, each failing table gets an
     "Explain with AI" button (``diagnose_provider``). Nothing renders when every
     table passed.
+
+    ``recheck_provider`` (when given) adds the re-validate actions: one per table
+    plus a "Re-check all" for the whole failing set, so a fixed table can be
+    re-confirmed without re-running the entire comparison. Tables named in
+    ``rechecking_tables`` render as busy instead of offering the action.
     """
     failed = [
         item
@@ -2603,17 +3110,47 @@ def _render_failing_tables(
     ]
     if not failed:
         return
+    busy = {name for name in rechecking_tables}
     with _section(
         ui, icon="error_outline", title=f"Tables needing attention ({len(failed)})"
     ):
+        # Re-check the whole failing set in one click -- the common move after a
+        # backfill. Offered only when more than one table failed (for a single
+        # table the per-row action already is "re-check all").
+        if recheck_provider is not None and len(failed) > 1:
+            with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+                names = [item.table for item in failed]
+                ui.button(  # type: ignore[attr-defined]
+                    f"Re-check all {len(failed)} tables",
+                    icon="refresh",
+                    on_click=lambda _e=None, _n=names: recheck_provider(_n),
+                ).props("outline no-caps size=sm color=primary")
+                ui.label(  # type: ignore[attr-defined]
+                    "Re-compares only these tables and updates their rows in this "
+                    "report."
+                ).classes("text-xs text-gray-500")
         for item in failed:
-            _render_failing_table(ui, item, diagnose_provider=diagnose_provider)
+            _render_failing_table(
+                ui, item,
+                diagnose_provider=diagnose_provider,
+                recheck_provider=recheck_provider,
+                busy=item.table in busy,
+            )
 
 
 def _render_failing_table(
-    ui: object, item: TableValidationResult, *, diagnose_provider=None
+    ui: object,
+    item: TableValidationResult,
+    *,
+    diagnose_provider=None,
+    recheck_provider=None,
+    busy: bool = False,
 ) -> None:
-    """Render one failing table: name + reason + example diverging PKs (+ AI)."""
+    """Render one failing table: name + reason + example diverging PKs (+ actions).
+
+    ``busy`` renders the inline "Re-checking…" state for a table whose re-check is
+    in flight (the action is not offered again while it runs).
+    """
     with ui.row().classes("items-start gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
         ui.icon("cancel", color="red-6").classes("text-base mt-0.5")  # type: ignore[attr-defined]
         with ui.column().classes("gap-0 min-w-0 flex-1"):  # type: ignore[attr-defined]
@@ -2622,6 +3159,22 @@ def _render_failing_table(
                     "text-sm font-semibold text-gray-900 font-mono break-all"
                 )
                 ui.space()  # type: ignore[attr-defined]
+                if busy:
+                    ui.spinner(size="sm")  # type: ignore[attr-defined]
+                    ui.label("Re-checking…").classes(  # type: ignore[attr-defined]
+                        "text-xs text-gray-600"
+                    )
+                elif recheck_provider is not None:
+                    ui.button(  # type: ignore[attr-defined]
+                        "Re-check",
+                        icon="refresh",
+                        on_click=lambda _e=None, _n=item.table: recheck_provider(
+                            [_n]
+                        ),
+                    ).props("flat dense no-caps size=sm color=primary").tooltip(
+                        "Re-compare only this table (same options as this run) and "
+                        "update its row in this report."
+                    )
                 if diagnose_provider is not None:
                     ui.button(  # type: ignore[attr-defined]
                         "Explain with AI",
@@ -3023,6 +3576,10 @@ __all__ = [
     "failed_table_names",
     "reconcile_skipped_tables",
     "count_verified_tables",
+    "merge_revalidated",
+    "RunOptions",
+    "report_run_options",
+    "validation_run_guard_reason",
     "group_objects_by_schema",
     "ResolvedScope",
     "resolve_validation_tables",

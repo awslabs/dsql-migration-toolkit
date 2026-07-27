@@ -19,6 +19,7 @@ These cover the parts of the Validation screen that do not touch NiceGUI:
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timezone
 
 import pytest
@@ -879,6 +880,313 @@ def test_validation_download_json_includes_reconcile_and_error() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-table re-check: merging a fresh comparison into an existing report
+# ---------------------------------------------------------------------------
+
+
+def _item(
+    table: str,
+    *,
+    matched: bool = True,
+    source: int = 10,
+    target: int = 10,
+    error: str | None = None,
+    reconcile: ReconcileResult | None = None,
+) -> TableValidationResult:
+    """Build one per-table result for the merge tests."""
+    return TableValidationResult(
+        table=table,
+        source_row_count=source,
+        target_row_count=target,
+        row_count_match=source == target,
+        matched=matched,
+        error=error,
+        reconcile=reconcile,
+    )
+
+
+def _mismatched_report() -> ValidationReport:
+    """A 3-table report where 'orders' fails on row count (the others pass)."""
+    from dsql_migrator.ui.validation import merge_revalidated  # noqa: F401
+
+    return ValidationReport.build(
+        mode=ValidationMode.CHECKSUM,
+        items=[
+            _item("orders", matched=False, source=10, target=9),
+            _item("customers"),
+            _item("products"),
+        ],
+        snapshot_timestamp=datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+    )
+
+
+def test_merge_revalidated_replaces_only_the_rechecked_table_in_place() -> None:
+    from dsql_migrator.ui.validation import merge_revalidated
+
+    report = _mismatched_report()
+    merged = merge_revalidated(report, [_item("orders", source=10, target=10)])
+    # Order preserved; only 'orders' changed; the other verdicts survive untouched.
+    assert [i.table for i in merged.items] == ["orders", "customers", "products"]
+    assert merged.items[0].target_row_count == 10
+    assert merged.items[0].matched is True
+    assert merged.items[1] == report.items[1]
+    assert merged.items[2] == report.items[2]
+    # The run-level fields describe the RUN and are carried over.
+    assert merged.mode is ValidationMode.CHECKSUM
+    assert merged.snapshot_timestamp == report.snapshot_timestamp
+    # The original report is untouched (pure).
+    assert report.items[0].matched is False
+    assert report.is_match is False
+
+
+def test_merge_revalidated_recomputes_verdict_in_both_directions() -> None:
+    from dsql_migrator.ui.validation import merge_revalidated
+
+    report = _mismatched_report()
+    assert report.is_match is False
+    # The last failing table now passes -> the overall verdict flips to a match.
+    fixed = merge_revalidated(report, [_item("orders")])
+    assert fixed.is_match is True
+    assert summarize_validation(fixed).ready_for_cutover is True
+    # And a previously-passing table that now fails flips it back (never a stale
+    # carried-over True).
+    broken = merge_revalidated(fixed, [_item("customers", matched=False, target=4)])
+    assert broken.is_match is False
+
+
+def test_merge_revalidated_ignores_tables_absent_from_the_report() -> None:
+    from dsql_migrator.ui.validation import merge_revalidated
+
+    report = _mismatched_report()
+    merged = merge_revalidated(
+        report, [_item("orders"), _item("not_in_scope", matched=False)]
+    )
+    # A stale name is dropped, never appended -- the report's scope cannot widen
+    # (that would change what "all tables match" means).
+    assert [i.table for i in merged.items] == ["orders", "customers", "products"]
+    assert merged.is_match is True
+
+
+def test_merge_revalidated_replaces_orphans_for_rechecked_tables_only() -> None:
+    from dsql_migrator.ui.validation import merge_revalidated
+
+    report = ValidationReport.build(
+        mode=ValidationMode.ROW_COUNT,
+        items=[_item("orders", matched=False, target=9), _item("customers")],
+        orphan_findings=[
+            OrphanFinding(
+                table="orders",
+                foreign_key="fk_o",
+                referenced_table="customers",
+                orphan_count=5,
+            ),
+            OrphanFinding(
+                table="customers",
+                foreign_key="fk_c",
+                referenced_table="regions",
+                orphan_count=2,
+            ),
+        ],
+        orphan_check_performed=True,
+    )
+    # 'orders' orphans were fixed: re-checking it with an empty finding list drops
+    # its finding, while 'customers' keeps its own.
+    merged = merge_revalidated(report, [_item("orders")], orphan_findings=[])
+    assert [f.table for f in merged.orphan_findings] == ["customers"]
+    assert merged.orphan_check_performed is True
+    # Still no overall match: an orphan finding remains (Property 9).
+    assert merged.is_match is False
+
+    # Passing None leaves the findings alone (the re-check did not re-run orphans).
+    untouched = merge_revalidated(report, [_item("orders")])
+    assert [f.table for f in untouched.orphan_findings] == ["orders", "customers"]
+
+
+def test_merge_revalidated_carries_drift_over_unchanged() -> None:
+    from dsql_migrator.ui.validation import merge_revalidated
+
+    drift = DriftReport(
+        watermark_gtid="uuid:1-5", current_gtid="uuid:1-9", drifted=True
+    )
+    report = ValidationReport.build(
+        mode=ValidationMode.ROW_COUNT,
+        items=[_item("orders", matched=False, target=9)],
+        drift=drift,
+    )
+    merged = merge_revalidated(report, [_item("orders")])
+    # Drift is a whole-source signal a single-table re-check does not re-measure,
+    # so it must be carried over rather than silently re-dated.
+    assert merged.drift == drift
+
+
+def test_merge_revalidated_clears_a_resolved_error() -> None:
+    from dsql_migrator.ui.validation import merge_revalidated
+
+    report = ValidationReport.build(
+        mode=ValidationMode.ROW_COUNT,
+        items=[_item("orders", matched=False, error="relation does not exist")],
+    )
+    assert summarize_validation(report).errored_tables == 1
+    merged = merge_revalidated(report, [_item("orders")])
+    # An errored table is re-checkable and its error clears when it succeeds.
+    assert merged.items[0].error is None
+    assert summarize_validation(merged).errored_tables == 0
+    assert merged.is_match is True
+
+
+def test_report_run_options_recovers_mode_reconcile_and_orphans() -> None:
+    from dsql_migrator.ui.validation import report_run_options
+
+    # A checksum + reconciled + orphan-checked run.
+    reconciled = ReconcileResult(
+        pk_column="id",
+        source_count=10,
+        target_count=10,
+        missing_on_target=0,
+        extra_on_target=0,
+        consistent=True,
+    )
+    report = ValidationReport.build(
+        mode=ValidationMode.CHECKSUM,
+        items=[_item("orders", reconcile=reconciled), _item("customers")],
+        orphan_check_performed=True,
+    )
+    options = report_run_options(report)
+    assert options.mode is ValidationMode.CHECKSUM
+    assert options.reconcile is True
+    assert options.check_orphans is True
+    # Matches the claim summarize_validation makes about the same report, so a
+    # re-check reproduces exactly the checks the UI says the report contains.
+    assert options.reconcile is summarize_validation(report).reconcile_performed
+
+    # A plain row-count run with no reconciliation and no orphan check.
+    plain = ValidationReport.build(
+        mode=ValidationMode.ROW_COUNT, items=[_item("orders")]
+    )
+    plain_options = report_run_options(plain)
+    assert plain_options.mode is ValidationMode.ROW_COUNT
+    assert plain_options.reconcile is False
+    assert plain_options.check_orphans is False
+
+
+def test_recheck_options_come_from_report_not_live_toggles() -> None:
+    # The screen must re-check with the REPORT's options, not whatever the user has
+    # since selected on screen -- otherwise a reconciled item spliced into a
+    # never-reconciled report would make reconcile_skipped_tables mislabel every
+    # other table as composite-PK.
+    from dsql_migrator.ui.validation import report_run_options
+
+    report = ValidationReport.build(
+        mode=ValidationMode.ROW_COUNT, items=[_item("orders", matched=False, target=9)]
+    )
+    state = ValidationState()
+    state.mode = ValidationMode.CHECKSUM  # user changed the toggles after the run
+    state.reconcile = True
+    state.check_orphans = True
+    options = report_run_options(report)
+    assert options.mode is ValidationMode.ROW_COUNT
+    assert options.reconcile is False
+    assert options.check_orphans is False
+
+
+def test_merge_recheck_result_accumulates_marks_and_stamps_time() -> None:
+    state = ValidationState()
+    state.set_result(_mismatched_report())
+    assert state.rechecked_tables == ()
+    assert state.rechecked_at is None
+
+    assert state.merge_recheck_result([_item("orders")]) is True
+    assert state.rechecked_tables == ("orders",)
+    assert state.rechecked_at is not None
+    assert state.result is not None and state.result.is_match is True
+
+    # A second re-check accumulates (both rows are newer than the run).
+    assert state.merge_recheck_result([_item("customers")]) is True
+    assert state.rechecked_tables == ("customers", "orders")
+
+
+def test_merge_recheck_result_is_a_noop_without_a_report() -> None:
+    # A full re-run clears the report while a re-check is in flight: the late merge
+    # must NOT resurrect it (or leave a single-table report reading as the whole run).
+    state = ValidationState()
+    state.set_result(_mismatched_report())
+    state.clear_outputs()
+    assert state.merge_recheck_result([_item("orders")]) is False
+    assert state.result is None
+    assert state.rechecked_tables == ()
+
+
+def test_full_run_result_clears_prior_recheck_marks() -> None:
+    state = ValidationState()
+    state.set_result(_mismatched_report())
+    state.merge_recheck_result([_item("orders")])
+    assert state.rechecked_tables == ("orders",)
+    # A full run replaces the whole report -> every row is from one run again.
+    state.set_result(_mismatched_report())
+    assert state.rechecked_tables == ()
+    assert state.rechecked_at is None
+
+
+def test_merge_recheck_result_drops_the_restored_banner() -> None:
+    # Part of the report was just measured live, so the "restored, may be stale"
+    # banner would be misleading; the re-check note takes over the as-of story.
+    state = ValidationState()
+    state.restore(_mismatched_report(), datetime(2026, 1, 1, tzinfo=timezone.utc))
+    assert state.restored is True
+    state.merge_recheck_result([_item("orders")])
+    assert state.restored is False
+
+
+def test_recheck_track_start_and_finish() -> None:
+    state = ValidationState()
+    assert state.recheck_tables == ()
+    state.start_recheck(["orders", "customers"])
+    assert state.recheck_tables == ("orders", "customers")
+    state.set_recheck_error("token expired")
+    assert state.recheck_error == "token expired"
+    # Starting another re-check clears the previous error.
+    state.start_recheck(["orders"])
+    assert state.recheck_error is None
+    state.finish_recheck()
+    assert state.recheck_tables == ()
+
+
+def test_restore_rehydrates_recheck_marks_and_defaults_empty() -> None:
+    state = ValidationState()
+    completed = datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)
+    rechecked = datetime(2026, 1, 2, 4, 0, tzinfo=timezone.utc)
+    state.restore(
+        _mismatched_report(),
+        completed,
+        rechecked_tables=("orders",),
+        rechecked_at=rechecked,
+    )
+    assert state.rechecked_tables == ("orders",)
+    assert state.rechecked_at == rechecked
+    # Older snapshots (no marks) restore as a plain uniform run.
+    plain = ValidationState()
+    plain.restore(_mismatched_report(), completed)
+    assert plain.rechecked_tables == ()
+    assert plain.rechecked_at is None
+
+
+def test_reset_in_place_clears_the_recheck_track() -> None:
+    store = ValidationStore()
+    state = store.get_or_create("s")
+    state.set_result(_mismatched_report())
+    state.merge_recheck_result([_item("orders")])
+    state.start_recheck(["customers"])
+    store.reset_in_place("s")
+    # Same object (closures keep their reference), fully re-initialised.
+    assert store.get_or_create("s") is state
+    assert state.result is None
+    assert state.recheck_tables == ()
+    assert state.rechecked_tables == ()
+    assert state.rechecked_at is None
+    assert state.recheck_error is None
+
+
+# ---------------------------------------------------------------------------
 # Per-session validation state and store
 # ---------------------------------------------------------------------------
 
@@ -1477,6 +1785,529 @@ def test_source_engine_kwargs_pins_session_time_zone_to_utc() -> None:
     # Still present when the Full Load stream opts into per-socket timeouts.
     ca2 = source_engine_kwargs(read_timeout_seconds=30)["connect_args"]
     assert ca2["init_command"] == "SET time_zone = '+00:00'"
+
+
+# ---------------------------------------------------------------------------
+# Per-table re-check: run guard, render output, and the screen's recheck runner
+# ---------------------------------------------------------------------------
+
+
+def test_validation_run_guard_blocks_rerun_while_a_recheck_runs() -> None:
+    # A re-check and a full run share ONE job slot: while a re-check is in flight the
+    # shell's Re-run must be disabled, or a full run would orphan the re-check job
+    # AND clear the very report it is about to merge into.
+    import time
+
+    from dsql_migrator.ui.validation import validation_run_guard_reason
+
+    manager = JobManager()
+    state = ValidationState()
+    # No re-check in flight -> runnable.
+    assert validation_run_guard_reason(manager, state) is None
+
+    release = threading.Event()
+    state.start_recheck(["orders"])
+    state.job_id = manager.submit(lambda _h: release.wait(5.0))
+    # Wait for the job to actually be observable as in-flight.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if manager.get_status(state.job_id).status in ("PENDING", "RUNNING"):
+            break
+        time.sleep(0.01)
+    reason = validation_run_guard_reason(manager, state)
+    assert reason is not None and "re-check is running" in reason
+
+    release.set()
+    assert manager.wait(state.job_id, timeout=5.0) is True
+    # Settled job -> no longer blocking, even before the marker is cleared.
+    assert validation_run_guard_reason(manager, state) is None
+    # And a cleared marker alone is enough.
+    state.finish_recheck()
+    assert validation_run_guard_reason(manager, state) is None
+
+
+class _RecheckUi(_CutoverUi):
+    """A NiceGUI double that also records button callbacks, spinners and tooltips."""
+
+    def __init__(self):
+        super().__init__()
+        self.buttons: list[tuple[str, object]] = []
+        self.spinners = 0
+
+    def button(self, text="", *_a, **kwargs):
+        if text:
+            self.texts.append(str(text))
+        self.buttons.append((str(text), kwargs.get("on_click")))
+        return _CutoverEl()
+
+    def spinner(self, *_a, **_k):
+        self.spinners += 1
+        return _CutoverEl()
+
+    def separator(self, *_a, **_k):
+        return _CutoverEl()
+
+
+def _failing_report_for_render() -> ValidationReport:
+    return ValidationReport.build(
+        mode=ValidationMode.ROW_COUNT,
+        items=[
+            TableValidationResult(
+                table="orders",
+                source_row_count=10,
+                target_row_count=9,
+                row_count_match=False,
+                matched=False,
+            ),
+            TableValidationResult(
+                table="customers",
+                source_row_count=3,
+                target_row_count=1,
+                row_count_match=False,
+                matched=False,
+            ),
+        ],
+    )
+
+
+def test_failing_tables_render_recheck_actions_and_invoke_provider() -> None:
+    from dsql_migrator.ui.validation import _render_failing_tables
+
+    report = _failing_report_for_render()
+    called: list[list[str]] = []
+    ui = _RecheckUi()
+    _render_failing_tables(
+        ui,
+        report,
+        summarize_validation(report),
+        recheck_provider=lambda tables: called.append(list(tables)),
+    )
+    blob = " ".join(ui.texts)
+    # A per-table action for each failing table + a bulk action for the whole set.
+    assert "Re-check" in blob
+    assert "Re-check all 2 tables" in blob
+    labels = [text for text, _cb in ui.buttons]
+    assert labels.count("Re-check") == 2
+
+    # The bulk button passes ALL failing table names; a row button passes just its own.
+    bulk = next(cb for text, cb in ui.buttons if text.startswith("Re-check all"))
+    bulk()
+    assert called == [["orders", "customers"]]
+    row = next(cb for text, cb in ui.buttons if text == "Re-check")
+    row()
+    assert called[-1] == ["orders"]
+
+
+def test_failing_tables_show_busy_row_instead_of_action_while_rechecking() -> None:
+    from dsql_migrator.ui.validation import _render_failing_tables
+
+    report = _failing_report_for_render()
+    ui = _RecheckUi()
+    _render_failing_tables(
+        ui,
+        report,
+        summarize_validation(report),
+        recheck_provider=lambda _t: None,
+        rechecking_tables=("orders",),
+    )
+    blob = " ".join(ui.texts)
+    assert "Re-checking…" in blob and ui.spinners >= 1
+    # Only the OTHER table still offers the per-row action.
+    assert [t for t, _cb in ui.buttons].count("Re-check") == 1
+
+
+def test_failing_tables_omit_recheck_actions_without_a_provider() -> None:
+    from dsql_migrator.ui.validation import _render_failing_tables
+
+    report = _failing_report_for_render()
+    ui = _RecheckUi()
+    _render_failing_tables(ui, report, summarize_validation(report))
+    blob = " ".join(ui.texts)
+    assert "Re-check" not in blob
+    assert ui.spinners == 0
+
+
+def test_recheck_note_states_which_tables_are_newer_and_when() -> None:
+    from dsql_migrator.ui.validation import _render_recheck_note
+
+    ui = _RecheckUi()
+    _render_recheck_note(
+        ui, ("orders",), datetime(2026, 3, 4, 5, 6, tzinfo=timezone.utc)
+    )
+    blob = " ".join(ui.texts)
+    assert "1 table(s) re-checked at 2026-03-04 05:06 UTC" in blob
+    assert "newer than the rest" in blob
+    assert "orders" in blob
+    # And it says how to get one uniform consistency point again.
+    assert "re-run the full validation" in blob
+
+    # Nothing renders for an ordinary single-run report.
+    quiet = _RecheckUi()
+    _render_recheck_note(quiet, (), None)
+    assert quiet.texts == []
+
+
+def test_recheck_note_collapses_a_long_table_list() -> None:
+    from dsql_migrator.ui.validation import _render_recheck_note
+
+    ui = _RecheckUi()
+    _render_recheck_note(ui, tuple(f"t{i}" for i in range(9)), None)
+    blob = " ".join(ui.texts)
+    assert "9 table(s) re-checked at just now" in blob
+    assert "and 3 more" in blob  # 6 shown + 3 collapsed
+
+
+def _build_screen_for_recheck(*, target_verified: bool = True):
+    """Build the validation screen with a fake validator that returns fixed items.
+
+    Returns ``(content, runner, state, manager, fake)`` so a test can drive the
+    re-check through the real screen closures without a database.
+    """
+    from dsql_migrator.core.models import AssessmentReport, TargetInventory
+    from dsql_migrator.ui.evaluation import EvaluationResult, EvaluationStore
+    from dsql_migrator.ui.data_migration import DataMigrationStore
+    from dsql_migrator.ui.session import SessionStore
+
+    session_id = "s-recheck"
+    store = SessionStore()
+    eval_store = EvaluationStore()
+    migration_store = DataMigrationStore()
+    validation_store = ValidationStore()
+    manager = JobManager()
+
+    session = store.get_or_create(session_id)
+    session.set_source(
+        SourceConnectionConfig(host="db", database="app"), SecretValue("pw")
+    )
+    session.set_target(
+        TargetConnectionConfig(
+            cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"
+        )
+    )
+    session.set_source_verified(True)
+    session.set_target_verified(target_verified)
+
+    eval_store.get_or_create(session_id).set_result(
+        EvaluationResult(
+            inventory=_inventory(),
+            assessment=AssessmentReport.from_items([]),
+            target_inventory=TargetInventory(),
+            target_conflicts=[],
+        )
+    )
+    # The fake returns a MATCHING 'orders' result, as a successful re-check would.
+    fake = _FakeValidator(
+        ValidationReport.build(
+            mode=ValidationMode.ROW_COUNT,
+            items=[
+                TableValidationResult(
+                    table="orders",
+                    source_row_count=10,
+                    target_row_count=10,
+                    row_count_match=True,
+                    matched=True,
+                )
+            ],
+        )
+    )
+    content, runner = build_validation_screen(
+        store,
+        session_id,
+        job_manager=manager,
+        eval_store=eval_store,
+        migration_store=migration_store,
+        validation_store=validation_store,
+        validator_factory=lambda _i: fake,
+    )
+    return content, runner, validation_store.get_or_create(session_id), manager, fake
+
+
+def _recheck_closure(content):
+    """Extract the screen's bound ``_recheck`` closure for direct driving.
+
+    ``content`` is the screen's content builder; ``_recheck`` is one of its
+    co-closures, reachable through the shared closure cells (the screen returns only
+    (content, runner), and the re-check is wired into the render tree via a
+    provider). Grabbing it here keeps the test on the REAL closure rather than a
+    re-implementation.
+    """
+    cells = {
+        name: cell.cell_contents
+        for name, cell in zip(
+            content.__code__.co_freevars, content.__closure__ or ()
+        )
+    }
+    return cells["_recheck"]
+
+
+def test_recheck_merges_into_the_existing_report_keeping_other_tables() -> None:
+    content, _runner, state, manager, fake = _build_screen_for_recheck()
+    # Seed a completed report where BOTH tables failed.
+    state.set_result(_failing_report_for_render())
+    recheck = _recheck_closure(content)
+
+    recheck(["orders"])
+    assert state.job_id is not None
+    assert manager.wait(state.job_id, timeout=5.0) is True
+
+    report = state.result
+    assert report is not None
+    # 'orders' now matches; 'customers' keeps its earlier failing verdict.
+    assert [i.table for i in report.items] == ["orders", "customers"]
+    assert report.items[0].matched is True
+    assert report.items[1].matched is False
+    assert report.is_match is False
+    assert state.rechecked_tables == ("orders",)
+    # Only the requested table was compared.
+    assert fake.calls[-1]["tables"] == ["orders"]
+
+
+def test_recheck_uses_report_options_and_forces_deep_checks() -> None:
+    content, _runner, state, manager, fake = _build_screen_for_recheck()
+    # A CHECKSUM report with orphan checking on; the live toggles say otherwise.
+    state.set_result(
+        ValidationReport.build(
+            mode=ValidationMode.CHECKSUM,
+            items=[
+                TableValidationResult(
+                    table="orders",
+                    source_row_count=10,
+                    target_row_count=9,
+                    row_count_match=False,
+                    matched=False,
+                    reconcile=ReconcileResult(
+                        pk_column="id",
+                        source_count=10,
+                        target_count=9,
+                        missing_on_target=1,
+                        extra_on_target=0,
+                        consistent=False,
+                    ),
+                )
+            ],
+            orphan_check_performed=True,
+        )
+    )
+    state.mode = ValidationMode.ROW_COUNT  # live toggles differ from the report
+    state.reconcile = False
+    state.check_orphans = False
+    state.deep_only_on_count_mismatch = True
+
+    _recheck_closure(content)(["orders"])
+    assert manager.wait(state.job_id, timeout=5.0) is True
+
+    call = fake.calls[-1]
+    # The REPORT's options are reproduced, not the live toggles...
+    assert call["mode"] is ValidationMode.CHECKSUM
+    assert call["reconcile"] is True
+    assert call["check_orphans"] is True
+    # ...and the fast sweep is forced OFF (this table is known to differ, so its
+    # deep checks are exactly what we want to run).
+    assert call["deep_only_on_count_mismatch"] is False
+
+
+def test_recheck_does_not_touch_the_step_status() -> None:
+    from dsql_migrator.ui.workflow import WorkflowStep, get_status, with_status
+    from dsql_migrator.ui.session import SessionStore  # noqa: F401
+
+    content, _runner, state, manager, _fake = _build_screen_for_recheck()
+    state.set_result(_failing_report_for_render())
+    # Put the step where a finished run leaves it.
+    cells = {
+        name: cell.cell_contents
+        for name, cell in zip(
+            content.__code__.co_freevars, content.__closure__ or ()
+        )
+    }
+    session = cells["session"]
+    session.set_workflow(
+        with_status(session.workflow, WorkflowStep.VALIDATION, StepStatus.DONE)
+    )
+    _recheck_closure(content)(["orders"])
+    # DONE throughout: flipping to IN_PROGRESS would hide the whole report and lock
+    # the shell's Re-run over a perfectly readable result.
+    assert get_status(session.workflow, WorkflowStep.VALIDATION) is StepStatus.DONE
+    assert manager.wait(state.job_id, timeout=5.0) is True
+    assert get_status(session.workflow, WorkflowStep.VALIDATION) is StepStatus.DONE
+
+
+def test_recheck_blocks_on_an_unverified_target_without_touching_the_report() -> None:
+    # DSQL access is a short-lived IAM token, so a report that validated fine an hour
+    # ago can face an expired target. The re-check must fail fast with its OWN error
+    # (never "Validation failed") and leave the existing report intact.
+    content, _runner, state, manager, _fake = _build_screen_for_recheck(
+        target_verified=False
+    )
+    seeded = _failing_report_for_render()
+    state.set_result(seeded)
+    _recheck_closure(content)(["orders"])
+    assert state.job_id is None  # no job submitted
+    assert state.recheck_error is not None
+    assert "Target connection is not verified" in state.recheck_error
+    assert state.error is None  # NOT reported as a full-run failure
+    assert state.result is seeded  # report untouched
+
+
+def test_recheck_is_a_noop_without_a_report_or_tables() -> None:
+    content, _runner, state, _manager, _fake = _build_screen_for_recheck()
+    recheck = _recheck_closure(content)
+    # No report to merge into.
+    recheck(["orders"])
+    assert state.job_id is None
+    # A report but an empty request.
+    state.set_result(_failing_report_for_render())
+    recheck([])
+    assert state.job_id is None
+
+
+def test_recheck_reports_unknown_tables_instead_of_validating_everything() -> None:
+    content, _runner, state, _manager, _fake = _build_screen_for_recheck()
+    state.set_result(
+        ValidationReport.build(
+            mode=ValidationMode.ROW_COUNT,
+            items=[
+                TableValidationResult(
+                    table="dropped_table",
+                    source_row_count=1,
+                    target_row_count=0,
+                    row_count_match=False,
+                    matched=False,
+                )
+            ],
+        )
+    )
+    _recheck_closure(content)(["dropped_table"])
+    # Not in the inventory any more -> a clear message, and crucially NO job that
+    # would silently re-validate the whole scope instead.
+    assert state.job_id is None
+    assert state.recheck_error is not None
+    assert "no longer in the source inventory" in state.recheck_error
+
+
+def test_validation_sig_changes_when_a_recheck_merges() -> None:
+    # A merge does not change the run's completed_at, so the persistence signature
+    # must fold in the re-check time or a merged report would never be saved (the
+    # reconnect would restore the PRE-re-check verdict).
+    from dsql_migrator.ui.session_persistence import _validation_sig
+
+    state = ValidationState()
+    state.set_result(_failing_report_for_render())
+    state.mark_run_finished()
+    before = _validation_sig(state)
+    state.merge_recheck_result(
+        [
+            TableValidationResult(
+                table="orders",
+                source_row_count=10,
+                target_row_count=10,
+                row_count_match=True,
+                matched=True,
+            )
+        ]
+    )
+    assert _validation_sig(state) != before
+
+
+def test_snapshot_roundtrip_preserves_recheck_marks() -> None:
+    # The "these rows are newer" disclosure must survive a reconnect, or a merged
+    # report would silently read as one uniform comparison.
+    from dsql_migrator.core.session_state_store import SessionSnapshot
+    from dsql_migrator.ui.session_persistence import apply_session_snapshot
+
+    state = ValidationState()
+    state.set_result(_failing_report_for_render())
+    state.merge_recheck_result(
+        [
+            TableValidationResult(
+                table="orders",
+                source_row_count=10,
+                target_row_count=10,
+                row_count_match=True,
+                matched=True,
+            )
+        ]
+    )
+    snapshot = SessionSnapshot(
+        session_id="s",
+        validation_report=state.result,
+        validation_completed_at=state.completed_at,
+        validation_rechecked_tables=list(state.rechecked_tables),
+        validation_rechecked_at=state.rechecked_at,
+    )
+    # Survives serialization (the snapshot is persisted as JSON).
+    revived = SessionSnapshot.model_validate_json(snapshot.model_dump_json())
+    assert revived.validation_rechecked_tables == ["orders"]
+
+    fresh = ValidationState()
+    apply_session_snapshot(
+        revived,
+        _RestoreSession(),
+        _RestoreEvalState(),
+        _RestoreConvState(),
+        _RestoreMigrationState(),
+        validation_state=fresh,
+    )
+    assert fresh.rechecked_tables == ("orders",)
+    assert fresh.rechecked_at == state.rechecked_at
+    assert fresh.result is not None and fresh.result.items[0].matched is True
+
+
+class _RestoreSession:
+    """Minimal session double for the snapshot-restore path."""
+
+    def __init__(self):
+        from dsql_migrator.core.models import WorkflowState
+
+        self.workflow = WorkflowState()
+        self.ai_assist = None
+
+    def set_workflow(self, workflow):
+        self.workflow = workflow
+
+    def set_active_view(self, _view):
+        pass
+
+    def set_migration_type(self, _t):
+        pass
+
+
+class _RestoreEvalState:
+    result = None
+
+    def set_result(self, _r):
+        pass
+
+
+class _RestoreConvState:
+    generated_node_ids = None
+    ticked_node_ids = None
+    edited_target_ddls: dict = {}
+
+
+class _RestoreMigrationState:
+    """Migration-state double accepting the restore path's setters."""
+
+    def __init__(self):
+        from dsql_migrator.core.models import TableSelection as _TS
+        from dsql_migrator.ui.data_migration import MigrationType
+
+        self.job_id = None
+        self.selection = _TS()
+        self.selection_touched = False
+        self.active_substep = None
+        self.migration_type = MigrationType.FULL_LOAD_ONLY
+
+    def bind_session(self, _s):
+        pass
+
+    def set_cdc_start_position(self, **_k):
+        pass
+
+    def set_cdc_start_mode(self, _m):
+        pass
+
+    def set_cdc_lob_exclusion(self, *_a):
+        pass
 
 
 def test_apply_column_exclusions_drops_excluded_but_keeps_pk() -> None:

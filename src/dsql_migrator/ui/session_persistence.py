@@ -114,6 +114,14 @@ def capture_session_snapshot(
             snapshot.validation_completed_at = getattr(
                 validation_state, "completed_at", None
             )
+            # Keep the per-table re-check marks with the report, so a reconnected
+            # merged report still says which rows are newer than the run.
+            snapshot.validation_rechecked_tables = list(
+                getattr(validation_state, "rechecked_tables", ()) or ()
+            )
+            snapshot.validation_rechecked_at = getattr(
+                validation_state, "rechecked_at", None
+            )
     return snapshot
 
 
@@ -146,6 +154,8 @@ def apply_session_snapshot(
             restore(
                 snapshot.validation_report.model_copy(deep=True),
                 snapshot.validation_completed_at,
+                rechecked_tables=tuple(snapshot.validation_rechecked_tables or ()),
+                rechecked_at=snapshot.validation_rechecked_at,
             )
         # A step that reads IN_PROGRESS but has a restored report has NO live job
         # after a reconnect (the validation job id is not persisted, so it can never
@@ -405,14 +415,25 @@ def session_signature(
 
 
 def _validation_sig(validation_state: object) -> tuple:
-    """Cheap signature of the persistable validation result (presence + finish time)."""
+    """Cheap signature of the persistable validation result (presence + finish time).
+
+    Also folds in the last per-table RE-CHECK time: a re-check merges fresh results
+    into the existing report WITHOUT changing the run's ``completed_at``, so keying
+    on that alone would leave a merged report unsaved (the reconnect would restore
+    the pre-re-check verdict). Still cheap -- two timestamps, never the report.
+    """
     if validation_state is None:
         return (False,)
     report = getattr(validation_state, "result", None)
     if report is None:
         return (False,)
     completed = getattr(validation_state, "completed_at", None)
-    return (True, completed.isoformat() if completed is not None else None)
+    rechecked = getattr(validation_state, "rechecked_at", None)
+    return (
+        True,
+        completed.isoformat() if completed is not None else None,
+        rechecked.isoformat() if rechecked is not None else None,
+    )
 
 
 __all__ = [

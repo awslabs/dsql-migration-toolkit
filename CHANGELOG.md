@@ -5,6 +5,34 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.136
+
+### Added
+
+- **Re-check an individual table in Validation instead of re-running everything.**
+  When a table fails on row count or checksum, each entry under "Tables needing
+  attention" now has a **Re-check** action (plus **Re-check all N tables** for the
+  whole failing set). It re-compares only those tables and **merges** the fresh
+  result into the existing report, so every other table's verdict — and the overall
+  cut-over go/no-go — is kept and updates on its own: fix the last failing table and
+  the verdict flips to "Ready for cut-over" without an hour-long full re-run.
+  - The re-check reproduces the **original run's options** (comparison mode,
+    reconciliation, orphan check) read back from the report itself, so the merged
+    report stays internally consistent — and a report restored after a reconnect is
+    re-checkable too. The fast sweep is forced **off** for a re-check: the table is
+    already known to differ, so its checksum/reconciliation is exactly what should run.
+  - The report states the mixed as-of plainly: **"N table(s) re-checked at &lt;time&gt; —
+    newer than the rest of this run"**, listing the tables, since the verdict now
+    covers two vintages. The disclosure survives a reconnect.
+  - A re-check runs on top of the completed step (the step stays **Done**, the report
+    stays on screen) with an inline "Re-checking…" state on the affected rows. It
+    shares the single validation job slot, so "Re-run validation" is disabled while a
+    re-check runs and vice versa — a full re-run can never orphan a re-check or clear
+    the report it is about to merge into.
+  - A re-check that cannot start (e.g. the short-lived DSQL target token expired since
+    the report was produced) reports as its own **"Could not re-check those tables"**
+    notice and leaves the existing report untouched — never as "Validation failed".
+
 ## v0.1.135
 
 ### Fixed

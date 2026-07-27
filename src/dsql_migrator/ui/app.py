@@ -56,6 +56,7 @@ from dsql_migrator.ui.validation import (
     ValidationStore,
     build_cutover_screen,
     build_validation_screen,
+    validation_run_guard_reason,
 )
 from dsql_migrator.ui.workflow import (
     OptionalTool,
@@ -205,6 +206,14 @@ def build_page(
         if not conv_state.ticked_node_ids:
             return "Select one or more objects in the Object browser first."
         return None
+
+    def validation_run_guard() -> str | None:
+        # Disable "Re-run validation" while a per-table re-check owns the single
+        # validation job slot (a full run would orphan it and clear the report it
+        # is about to merge into).
+        return validation_run_guard_reason(
+            JOB_MANAGER, VALIDATION_STORE.get_or_create(session_id)
+        )
 
     def data_migration_run_guard() -> str | None:
         # Disable the Full Load Run until the Full Load prerequisite checks have
@@ -651,6 +660,7 @@ def build_page(
         run_guards={
             WorkflowStep.SCHEMA_CONVERSION: schema_run_guard,
             WorkflowStep.FULL_LOAD: data_migration_run_guard,
+            WorkflowStep.VALIDATION: validation_run_guard,
         },
         on_state_change=_persist_session,
         nav_export=lambda select_fn: _nav.__setitem__("select", select_fn),

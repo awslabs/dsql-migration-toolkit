@@ -137,6 +137,13 @@ class SessionSnapshot(BaseModel):
     # note since a stored verdict can go stale as the source advances.
     validation_report: Optional[ValidationReport] = None
     validation_completed_at: Optional[datetime] = None
+    # Tables in ``validation_report`` whose result came from a later per-table
+    # re-check, and when that re-check finished. Persisted so the reconnected report
+    # can still state that those rows are NEWER than the rest of the run -- without
+    # them a merged report would silently read as one uniform comparison. Empty /
+    # ``None`` for a report that was never partially re-checked (the usual case).
+    validation_rechecked_tables: list[str] = Field(default_factory=list)
+    validation_rechecked_at: Optional[datetime] = None
 
 
 class SessionStateStore(Protocol):
