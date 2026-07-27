@@ -817,11 +817,17 @@ def _apply_cdc_status(migration_state, fetched) -> None:
     lag_ms = rest[2] if len(rest) > 2 else {}
     lag_series = rest[3] if len(rest) > 3 else []
     # Store the scan-free per-table applied-ops (I/U/D) the sink reported so the
-    # per-table monitor can show CDC progress without a COUNT(*). Setter is a
-    # no-op-safe replace; empty when the metrics were unavailable this poll.
+    # per-table monitor can show CDC progress without a COUNT(*). MERGE into the
+    # last-known map rather than replace: the counts are cumulative (monotonic), and
+    # a flaky/empty poll (CloudWatch throttle/timeout, or tables momentarily empty)
+    # would otherwise blank the columns -> the "appears then disappears" flicker. So
+    # only apply a NON-empty read, and keep prior per-table values for any table not
+    # in this read. reset_in_place still clears the map on a genuine reset.
     setter = getattr(migration_state, "set_cdc_applied_ops_by_table", None)
-    if callable(setter):
-        setter(applied_ops or {})
+    if callable(setter) and applied_ops:
+        merged = dict(getattr(migration_state, "cdc_applied_ops_by_table", {}) or {})
+        merged.update(applied_ops)
+        setter(merged)
     # Store per-table replication lag (ms) for the time-based "Stream lag" column.
     lag_setter = getattr(migration_state, "set_cdc_replication_lag_by_table", None)
     if callable(lag_setter):

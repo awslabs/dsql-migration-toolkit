@@ -5,6 +5,30 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.132
+
+### Changed
+
+- **Per-table CDC monitor now has separate Inserts / Updates / Deletes columns**
+  (DMS-style), replacing the single combined "Changes since Full Load" cell. Each is
+  a **cumulative running total** of what CDC has applied since it started streaming,
+  colour-coded (green inserts / blue updates / red deletes).
+
+### Fixed
+
+- **I/U/D counts no longer flicker ("appears then disappears").** The applied-ops read
+  is best-effort, so a flaky/empty poll (CloudWatch throttle/timeout, or tables
+  momentarily empty) used to overwrite the stored counts with an empty map and blank
+  the columns. The counts are cumulative (monotonic), so the poll now **merges** a
+  non-empty read into the last-known values and **never wipes** on an empty read —
+  the counters stay put and only increase.
+- **The per-table header ⓘ tooltips (Stream lag, Consistency, …) no longer close mid-
+  hover.** The table used to fully re-render every ~5s poll, tearing down the tooltip.
+  The table element + its header tooltips are now built **once** and only the row data
+  is swapped **in place** each poll, so a tooltip stays open while you read it.
+- **Clearer Stream lag / Consistency explanations** in both the header tooltips and the
+  legend (plain-language wording instead of the terse metric definitions).
+
 ## v0.1.131
 
 ### Fixed

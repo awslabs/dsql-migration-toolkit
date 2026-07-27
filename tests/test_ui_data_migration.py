@@ -5829,3 +5829,40 @@ def test_log_cdc_connector_transitions_logs_changes_only(monkeypatch) -> None:  
     dm._log_cdc_connector_transitions(ms, object())
     assert events[-1] == ("connector sink failed", dm.ActivityStatus.FAILURE)
     assert len(events) == 2
+
+
+def test_apply_cdc_status_merges_applied_ops_and_never_wipes_on_empty() -> None:
+    # Cumulative I/U/D counters must not flicker ("appears then disappears"): a
+    # non-empty read MERGES into the last-known map (per table), and an EMPTY read
+    # (flaky poll / metrics momentarily unavailable) KEEPS the prior values instead
+    # of blanking the columns. A partial read (some tables missing) also keeps the
+    # absent tables via merge.
+    from dsql_migrator.ui.data_migration import _apply_cdc_status
+
+    state = DataMigrationState()
+    state.set_cdc_stack_name("stk")
+
+    def fetched(ops):
+        # (statuses, health, dlq_errors, applied_ops, lag_ms, lag_series)
+        return ([], {}, [], ops, {}, [])
+
+    # First non-empty read populates.
+    _apply_cdc_status(state, fetched({"orders": {"inserts": 5, "updates": 2, "deletes": 1}}))
+    assert state.cdc_applied_ops_by_table["orders"] == {"inserts": 5, "updates": 2, "deletes": 1}
+
+    # An EMPTY read must NOT wipe -> values persist (kills the flicker).
+    _apply_cdc_status(state, fetched({}))
+    assert state.cdc_applied_ops_by_table["orders"] == {"inserts": 5, "updates": 2, "deletes": 1}
+
+    # A later read updates orders AND adds customers (merge keeps both).
+    _apply_cdc_status(state, fetched({
+        "orders": {"inserts": 9, "updates": 4, "deletes": 1},
+        "customers": {"inserts": 3, "updates": 0, "deletes": 0},
+    }))
+    assert state.cdc_applied_ops_by_table["orders"]["inserts"] == 9
+    assert state.cdc_applied_ops_by_table["customers"]["inserts"] == 3
+
+    # A partial read that omits customers keeps it via merge; orders still advances.
+    _apply_cdc_status(state, fetched({"orders": {"inserts": 10, "updates": 4, "deletes": 1}}))
+    assert state.cdc_applied_ops_by_table["orders"]["inserts"] == 10
+    assert "customers" in state.cdc_applied_ops_by_table  # not dropped by the partial read
