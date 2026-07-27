@@ -3340,7 +3340,7 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
     # every 5s (which flickered). The card is hidden until there are >=2 points (a
     # single dot is not a trend). The rolling series behind it is a hybrid: seeded
     # from CloudWatch's 1-min history (survives reload) then extended each poll.
-    lag = {"card": None, "chart": None}
+    lag = {"card": None, "chart": None, "empty": None}
     with ui.card().classes("w-full") as _lag_card:  # type: ignore[attr-defined]
         with ui.row().classes("items-center gap-1.5 no-wrap w-full"):  # type: ignore[attr-defined]
             ui.icon("show_chart", color="primary").classes("text-base")  # type: ignore[attr-defined]
@@ -3363,24 +3363,48 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
             .classes("w-full")
             .style("height: 220px")
         )
+        # Shown INSTEAD of the chart when there is no >=2-point trend but CDC is live:
+        # the sink emits ReplicationLagMs only while applying events, so a drained /
+        # caught-up pipeline has no recent datapoint to plot. Without this the whole
+        # panel vanished after a session restore (the in-memory trend is not persisted
+        # and a caught-up pipeline can't be re-seeded from CloudWatch), so the operator
+        # saw NO stream-lag signal at all. Now the metric is always present when CDC is
+        # running -- as a "caught up" line when there is nothing to trend.
+        with ui.row().classes("items-center gap-1.5 no-wrap") as _lag_empty:  # type: ignore[attr-defined]
+            ui.icon("check_circle").classes("text-green-600 text-base")  # type: ignore[attr-defined]
+            ui.label(  # type: ignore[attr-defined]
+                "Caught up — no replication lag in the recent window."
+            ).classes("text-sm text-gray-700")
+        lag["empty"] = _lag_empty  # type: ignore[assignment]
     lag["card"] = _lag_card  # type: ignore[assignment]
 
     def _update_lag_chart() -> None:
-        """Push the latest rolling series into the persistent echart IN PLACE, and
-        show/hide the card (hidden until there is a >=2-point trend)."""
+        """Push the latest rolling series into the persistent echart IN PLACE and
+        toggle the card's three states: the trend chart (>=2 points), a "caught up"
+        line (CDC live but no trend to plot -- e.g. right after a session restore of a
+        drained pipeline), or fully hidden (CDC not streaming)."""
         option = build_lag_chart_option(
             getattr(migration_state, "cdc_replication_lag_series", None) or []
         )
-        card, chart = lag["card"], lag["chart"]
+        card, chart, empty = lag["card"], lag["chart"], lag["empty"]
         if card is None or chart is None:
             return
-        if option is None:
+        if option is not None:
+            chart.options.clear()  # type: ignore[attr-defined]
+            chart.options.update(option)  # type: ignore[attr-defined]
+            chart.update()  # type: ignore[attr-defined]
+            chart.set_visibility(True)  # type: ignore[attr-defined]
+            if empty is not None:
+                empty.set_visibility(False)  # type: ignore[attr-defined]
+            card.set_visibility(True)  # type: ignore[attr-defined]
+        elif _cdc_is_streaming(migration_state):
+            # No trend, but the pipeline is live -> caught up. Keep the panel visible.
+            chart.set_visibility(False)  # type: ignore[attr-defined]
+            if empty is not None:
+                empty.set_visibility(True)  # type: ignore[attr-defined]
+            card.set_visibility(True)  # type: ignore[attr-defined]
+        else:
             card.set_visibility(False)  # type: ignore[attr-defined]
-            return
-        chart.options.clear()  # type: ignore[attr-defined]
-        chart.options.update(option)  # type: ignore[attr-defined]
-        chart.update()  # type: ignore[attr-defined]
-        card.set_visibility(True)  # type: ignore[attr-defined]
 
     @ui.refreshable
     def _cdc_live() -> None:  # type: ignore[misc]

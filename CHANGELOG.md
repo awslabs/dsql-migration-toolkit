@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.131
+
+### Fixed
+
+- **Stream lag panel no longer disappears after a session restore of a drained
+  pipeline.** The live lag trend is an in-memory rolling buffer that is not persisted,
+  so a reconnect re-seeds it from CloudWatch `ReplicationLagMs` — but that metric is
+  event-driven, so once the source is quiesced (caught up) there are no recent
+  datapoints to seed from, and the chart (which needs ≥2 points) hid the entire panel:
+  the operator saw no stream-lag signal at all after reconnecting. The panel now shows
+  a **"Caught up — no replication lag in the recent window"** line whenever CDC is live
+  but there is no trend to plot, so the metric is always present; it only fully hides
+  before streaming starts.
+
 ## v0.1.130
 
 ### Changed

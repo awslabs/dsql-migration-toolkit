@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.131
+
+### Fixed
+
+- **drain된 파이프라인을 세션 복원했을 때 Stream lag 패널이 사라지던 문제 수정.** 라이브 lag
+  추세는 메모리상 롤링 버퍼라 영속화되지 않아, 재연결 시 CloudWatch `ReplicationLagMs`에서
+  다시 시드합니다 — 그런데 이 지표는 이벤트 기반이라 소스를 멈춰(caught up) 최근 datapoint가
+  없으면 시드할 게 없고, 차트는 ≥2 포인트가 필요하므로 **패널 전체가 숨겨져** 재연결 후
+  stream-lag 신호가 아예 안 보였습니다. 이제 CDC가 살아있지만 그릴 추세가 없을 때 **"Caught up
+  — no replication lag in the recent window"** 줄을 표시해 지표가 항상 존재하도록 했고,
+  스트리밍 시작 전에만 완전히 숨깁니다.
+
 ## v0.1.130
 
 ### Changed
