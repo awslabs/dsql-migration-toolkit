@@ -5,6 +5,17 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.134
+
+### Changed
+
+- **CDC 스트리밍 중 적용 불가한 액션을 툴팁 경고만이 아니라 시각적으로 비활성(grey out) 처리:**
+  - **Start / Re-run Full Load**를 CDC 실행 중엔 **비활성화**(기존엔 경고만 뜨고 클릭 가능했음)
+    — 실행 시 스트림과 충돌. 툴팁/힌트로 "Stop CDC 먼저" 안내.
+  - **CDC start point**는 잠금 상태였지만 잠긴 것처럼 안 보였는데, 이제 라디오 선택과 수동
+    GTID/binlog 입력을 **명확히 흐리게(muted + not-allowed 커서)** 처리해 "Locked" 배지와
+    일치시킴.
+
 ## v0.1.133
 
 ### Changed

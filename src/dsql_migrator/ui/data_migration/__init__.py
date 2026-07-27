@@ -2670,15 +2670,19 @@ def _render_full_load_step(
                 start_btn.disable()
                 start_btn.tooltip(guard_reason)
             elif cdc_streaming_started(migration_state, job_manager):
-                # Not blocked, but warn up-front (the dialog reiterates the risk).
+                # CDC is live: starting/re-running Full Load would collide with the
+                # running stream, so DISABLE (grey out) the button rather than let it
+                # look clickable. The tooltip + hint say how to re-enable it (Stop CDC),
+                # so it is a clear "not now", not a dead end.
+                start_btn.disable()
                 start_btn.tooltip(
-                    "CDC is streaming -- re-running can break the live pipeline. "
-                    "Stop CDC first."
+                    "CDC is streaming -- starting Full Load would collide with the "
+                    "live pipeline. Stop CDC first (CDC step → Stop CDC) to run it."
                 )
                 inline_hint(
                     ui,
-                    "CDC is live. Re-running Full Load can collide with the "
-                    "running stream -- stop CDC first (CDC step → Stop CDC).",
+                    "CDC is live, so Full Load is disabled. Stop CDC first "
+                    "(CDC step → Stop CDC) to run it.",
                     tone="warning",
                 )
 

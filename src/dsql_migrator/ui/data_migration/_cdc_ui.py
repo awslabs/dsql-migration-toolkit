@@ -691,7 +691,12 @@ def _render_cdc_start_point_card(
             on_change=lambda e: _on_mode(e.value),
         ).props("inline=false")
         if locked:
-            radio.props("disable")
+            # Read-only AND clearly greyed: a bare Quasar `disable` dims too subtly
+            # to read as "locked", so mute the whole choice (opacity + not-allowed
+            # cursor) to match the "Locked" badge.
+            radio.props("disable").classes(
+                "opacity-50 pointer-events-none cursor-not-allowed"
+            )
         if not wm_usable and mode == "auto" and not locked:
             # Steer to manual: auto is not usable here.
             inline_hint(  # type: ignore[attr-defined]
@@ -883,9 +888,11 @@ def _render_cdc_manual_inputs(
         placeholder="mysql-bin.000123:45678",
     ).classes("w-full text-xs")
     if locked:
-        # CDC started: the coordinate is already committed -- show it read-only.
-        gtid_input.props("readonly")
-        binlog_input.props("readonly")
+        # CDC started: the coordinate is already committed -- show it read-only AND
+        # visibly greyed so it reads as locked (matches the radio + "Locked" badge).
+        # The committed coordinate stays readable in the "Start point set — …" line.
+        for _inp in (gtid_input, binlog_input):
+            _inp.props("readonly").classes("opacity-50 pointer-events-none")
 
     if gtid_error["msg"]:
         inline_hint(ui, gtid_error["msg"], tone="warning")  # type: ignore[attr-defined]

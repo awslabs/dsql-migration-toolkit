@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.134
+
+### Changed
+
+- **While CDC is streaming, actions that can't apply are now visibly disabled (greyed),
+  not just tooltip-warned:**
+  - **Start / Re-run Full Load** is now **disabled** during live CDC (it previously
+    stayed clickable with only a warning) — running it would collide with the stream.
+    The tooltip/hint say to Stop CDC first to re-enable it.
+  - **CDC start point** was already read-only when locked but didn't *look* locked —
+    the radio choice and the manual GTID/binlog inputs are now clearly **greyed
+    (muted + not-allowed cursor)** to match the "Locked" badge.
+
 ## v0.1.133
 
 ### Changed
