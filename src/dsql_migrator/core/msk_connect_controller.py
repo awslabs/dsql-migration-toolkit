@@ -95,6 +95,15 @@ _GMD_MAX_QUERIES = 500
 # a far more accurate "how far behind is the target" signal than the UI's MAX(pk)
 # leading-edge check. Read with Stat=Maximum (worst recent lag) over a short window.
 _REPLICATION_LAG_METRIC = "ReplicationLagMs"
+# ReplicationLagMs is EVENT-DRIVEN: the sink emits a datapoint only when it applies
+# an event. When the source is quiesced and the pipeline drains, emission stops -- so
+# the newest datapoint still inside the read window is the LAST applied event's lag,
+# not the current state (nothing is in flight -> caught up). Treat a "current lag"
+# datapoint older than this cutoff as absent, so a drained pipeline reads as caught up
+# (lag drops to 0) instead of freezing at the last value until it ages out of the
+# window. Sized above the metric's 1-min resolution + CloudWatch ingestion delay so an
+# actively-streaming pipeline (which emits every offset-commit) is never falsely idled.
+_LAG_FRESHNESS_SECONDS = 180
 
 
 def _match_metric_tables(
@@ -469,7 +478,15 @@ class MskConnectController:
         (worst lag) at 1-minute resolution over the trailing ``window_seconds`` and
         return the **most recent** minute's value per table (current worst lag). Idle
         tables (no recent events) have no datapoint and are simply absent — the stream
-        is caught up. Best-effort: ``{}`` on any error / no datapoint.
+        is caught up.
+
+        Because the metric is event-driven (a datapoint is emitted only when the sink
+        applies an event), a drained pipeline stops emitting: the newest datapoint left
+        in the window is then the LAST applied event's lag, which is stale, not the
+        current state. So a "most recent" datapoint older than ``_LAG_FRESHNESS_SECONDS``
+        is treated as absent — the table reads as caught up (lag drops) once the source
+        is quiesced, instead of freezing at the last value until it ages out of the
+        window. Best-effort: ``{}`` on any error / no (fresh) datapoint.
         """
         names = [t for t in tables if t]
         if not stack or not names:
@@ -521,11 +538,26 @@ class MskConnectController:
                 EndTime=now,
                 ScanBy="TimestampDescending",
             )
+            fresh_cutoff = now.timestamp() - _LAG_FRESHNESS_SECONDS
             for item in response.get("MetricDataResults", []):
                 name = id_map.get(item.get("Id"))
                 values = item.get("Values", [])
                 if name is None or not values:
                     continue
+                # Drop a stale "current lag": if the newest datapoint predates the
+                # freshness cutoff, the pipeline has drained (no recent applies) -> the
+                # table is caught up, so omit it rather than report the frozen last-event
+                # lag. Timestamps[0] aligns with Values[0] (TimestampDescending). When
+                # timestamps are absent (defensive / older shape), keep the value.
+                timestamps = item.get("Timestamps") or []
+                if timestamps:
+                    newest = timestamps[0]
+                    newest_ts = (
+                        newest.timestamp() if hasattr(newest, "timestamp")
+                        else float(newest)
+                    )
+                    if newest_ts < fresh_cutoff:
+                        continue
                 result[name] = int(round(float(values[0])))
         except Exception:  # noqa: BLE001 - best-effort monitor signal only
             return {}

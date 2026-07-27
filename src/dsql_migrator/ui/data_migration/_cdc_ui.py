@@ -652,24 +652,25 @@ def _render_cdc_start_point_card(
                 color="primary" if effective_resume is not None else "grey",
             ).classes("text-xl")
             ui.label("CDC start point").classes("text-sm font-semibold")  # type: ignore[attr-defined]
+            # "What is this?" moved to a hover ⓘ instead of a standing paragraph.
+            ui.icon("info").classes(  # type: ignore[attr-defined]
+                "text-gray-400 text-sm cursor-help"
+            ).tooltip(
+                "Where change streaming begins. Automatic resumes exactly where the "
+                "Full Load snapshot ended (no gap, no overlap)."
+            )
             ui.space()  # type: ignore[attr-defined]
             if locked:
-                ui.badge("Locked", color="grey").props("outline")  # type: ignore[attr-defined]
+                # The locked reason + how to change it rides on the badge tooltip, so
+                # no separate standing "CDC has started — locked…" line is needed.
+                ui.badge("Locked", color="grey").props("outline").tooltip(  # type: ignore[attr-defined]
+                    "CDC has started — the start point is locked. To change it, "
+                    "stop CDC first."
+                )
             elif effective_resume is not None:
                 ui.badge("Ready", color="positive").props("outline")  # type: ignore[attr-defined]
             else:
                 ui.badge("Action needed", color="warning").props("outline")  # type: ignore[attr-defined]
-        ui.label(  # type: ignore[attr-defined]
-            "Where change streaming begins. Automatic resumes exactly where the "
-            "Full Load snapshot ended (no gap, no overlap)."
-        ).classes("text-xs text-gray-500")
-
-        if locked:
-            # CDC has started: the start point is fixed (seeded into connect-offsets).
-            ui.label(  # type: ignore[attr-defined]
-                "CDC has started — the start point is locked. To change it, stop "
-                "CDC first."
-            ).classes("text-xs text-gray-500")
 
         auto_label = (
             "Automatic — gapless from Full Load (recommended)"
@@ -1465,12 +1466,10 @@ def _render_cdc_running_actions(
     ui, migration_state, job_manager, refresh, *, session=None
 ) -> None:
     """The 'Stop CDC' action shown while connectors are running."""
-    ui.label(  # type: ignore[attr-defined]
-        "The cdc-stack connectors are deployed and streaming — see live status "
-        "below. Stop CDC removes just the connectors; MSK, the VPC wiring, and "
-        "the plugins are kept so you can restart quickly."
-    ).classes("text-xs text-gray-600")
-
+    # No always-on blurb here: that the pipeline is streaming is already clear from
+    # the live status right below, and the "Stop removes only the connectors, infra
+    # is kept" impact is spelled out in the confirmation dialog (and the button
+    # tooltip). Keeping it as static text just clutters the running view.
     def _confirm() -> None:
         _open_cdc_stop_dialog(
             ui, migration_state,
@@ -1479,7 +1478,10 @@ def _render_cdc_running_actions(
 
     ui.button(  # type: ignore[attr-defined]
         "Stop CDC", on_click=_confirm, icon="stop_circle"
-    ).props("color=amber outline")
+    ).props("color=amber outline").tooltip(
+        "Removes only the connectors — MSK, the VPC wiring and the plugins are "
+        "kept, so you can Start CDC again quickly."
+    )
 
 def _render_cdc_adopt_or_deploy_choice(
     ui, migration_state, job_manager, refresh, other_stacks, *,
@@ -3340,14 +3342,20 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
     # from CloudWatch's 1-min history (survives reload) then extended each poll.
     lag = {"card": None, "chart": None}
     with ui.card().classes("w-full") as _lag_card:  # type: ignore[attr-defined]
-        with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+        with ui.row().classes("items-center gap-1.5 no-wrap w-full"):  # type: ignore[attr-defined]
             ui.icon("show_chart", color="primary").classes("text-base")  # type: ignore[attr-defined]
             ui.label("Stream lag").classes("text-sm font-semibold")  # type: ignore[attr-defined]
-        ui.label(  # type: ignore[attr-defined]
-            "Worst end-to-end replication lag across tables, live (max lag in ms). "
-            "Flat near zero = caught up (safe to cut over); a rising line means the "
-            "pipeline is falling behind."
-        ).classes("text-xs text-gray-500")
+            # The interpretation guidance (what flat/rising means, cut-over safety)
+            # is genuinely useful but reads as clutter when always on -- move it to a
+            # hover ⓘ, matching the per-table header tooltips. The chart title +
+            # y-axis "lag (ms)" carry the basics on their own.
+            ui.icon("info").classes(  # type: ignore[attr-defined]
+                "text-gray-400 text-sm cursor-help"
+            ).tooltip(
+                "Worst end-to-end replication lag across tables, live (max lag in "
+                "ms). Flat near zero = caught up (safe to cut over); a rising line "
+                "means the pipeline is falling behind."
+            )
         lag["chart"] = (  # type: ignore[assignment]
             ui.echart(  # type: ignore[attr-defined]
                 {"xAxis": {"type": "time"}, "yAxis": {"type": "value"}, "series": []}
@@ -3475,14 +3483,20 @@ def _render_cdc_pipeline_health(
         # --- Change flow ------------------------------------------------------
         if activity is not None:
             ui.separator().classes("my-1")  # type: ignore[attr-defined]
-            ui.label("Change flow").classes(  # type: ignore[attr-defined]
-                "text-xs font-semibold text-gray-500 uppercase tracking-wide"
-            )
-            ui.label(  # type: ignore[attr-defined]
-                "Whether changes are still streaming from the source to the target. "
-                "When you quiesce the source for cutover, watch this drop to idle — "
-                "it means the pipeline has drained."
-            ).classes("text-xs text-gray-500")
+            with ui.row().classes("items-center gap-1 no-wrap"):  # type: ignore[attr-defined]
+                ui.label("Change flow").classes(  # type: ignore[attr-defined]
+                    "text-xs font-semibold text-gray-500 uppercase tracking-wide"
+                )
+                # Both the "what/why" and the data-source note move to a hover ⓘ so
+                # the change-flow block is just the state line + rate gauges.
+                ui.icon("info").classes(  # type: ignore[attr-defined]
+                    "text-gray-400 text-sm cursor-help"
+                ).tooltip(
+                    "Whether changes are still streaming from the source to the "
+                    "target. When you quiesce the source for cutover, watch this "
+                    "drop to idle — the pipeline has drained. Rates are from "
+                    "CloudWatch (about the last few minutes)."
+                )
             _render_change_flow_status(ui, activity)
 
 def _render_change_flow_status(ui, activity: "CdcActivitySummary") -> None:
@@ -3543,9 +3557,8 @@ def _render_change_flow_status(ui, activity: "CdcActivitySummary") -> None:
 
     _rate_bar("Source poll", sp)
     _rate_bar("Sink send", ss)
-    ui.label("CloudWatch, ~last few min").classes(  # type: ignore[attr-defined]
-        "text-xs text-gray-400 ml-6"
-    )
+    # Data-source/freshness note moved to the "Change flow" header ⓘ tooltip; the
+    # gauges stand on their own here (no standing provenance caption).
 
 # Health level (assess_dlq_health) -> notice tone + status badge (label, quasar
 # color) for the DLQ panel, so the panel speaks the same severity language as the

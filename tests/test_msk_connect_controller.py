@@ -416,8 +416,27 @@ def test_applied_ops_by_table_no_call_without_stack_or_tables() -> None:
     assert client.calls == []  # never hit CloudWatch
 
 
-def _lag_responses(list_tables: list[str], values_by_table: dict[str, list[float]]) -> dict:
-    """ListMetrics (discovered dims) + GetMetricData (l{i} -> lag-ms values, newest first)."""
+def _lag_responses(
+    list_tables: list[str],
+    values_by_table: dict[str, list[float]],
+    *,
+    age_seconds: int = 0,
+) -> dict:
+    """ListMetrics (discovered dims) + GetMetricData (l{i} -> lag-ms values, newest first).
+
+    Attaches ``Timestamps`` aligned with the (newest-first) values so the freshness
+    cutoff in ``replication_lag_by_table`` is exercised. ``age_seconds`` shifts the
+    NEWEST datapoint that far into the past (0 = fresh; > cutoff = stale/drained).
+    """
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    results = []
+    for i, vals in enumerate(values_by_table.values()):
+        # Newest-first timestamps (TimestampDescending): index 0 is the most recent,
+        # shifted back by age_seconds; older buckets step back a minute each.
+        ts = [now - timedelta(seconds=age_seconds + 60 * k) for k in range(len(vals))]
+        results.append({"Id": f"l{i}", "Timestamps": ts, "Values": vals})
     return {
         "list_metrics": {
             "Metrics": [
@@ -426,12 +445,7 @@ def _lag_responses(list_tables: list[str], values_by_table: dict[str, list[float
                 for t in list_tables
             ]
         },
-        "get_metric_data": {
-            "MetricDataResults": [
-                {"Id": f"l{i}", "Values": vals}
-                for i, vals in enumerate(values_by_table.values())
-            ]
-        },
+        "get_metric_data": {"MetricDataResults": results},
     }
 
 
@@ -454,6 +468,20 @@ def test_replication_lag_by_table_suffix_match_single_db() -> None:
     # Single-db bare name resolves to the sink's schema-qualified Table dimension.
     client = _FakeClient(_lag_responses(["ecommerce_demo.orders"], {"orders": [3200.0]}))
     assert _controller(client).replication_lag_by_table("stk", ["orders"]) == {"orders": 3200}
+
+
+def test_replication_lag_by_table_ignores_stale_datapoint() -> None:
+    # ReplicationLagMs is event-driven: after the source is quiesced the pipeline
+    # drains and stops emitting, so the newest datapoint left in the window is the
+    # last applied event's lag (stale). A datapoint older than the freshness cutoff
+    # must be treated as absent -> the table reads as caught up (lag drops), not
+    # frozen at the last value. Same values as the "most recent" test, but aged out.
+    client = _FakeClient(_lag_responses(
+        ["ecommerce_demo.orders"], {"ecommerce_demo.orders": [8500.0, 12000.0]},
+        age_seconds=600,  # newest datapoint is 10 min old -> past the 3-min cutoff
+    ))
+    assert _controller(client).replication_lag_by_table(
+        "stk", ["ecommerce_demo.orders"]) == {}  # stale -> caught up (absent)
 
 
 def test_replication_lag_by_table_empty_on_error() -> None:

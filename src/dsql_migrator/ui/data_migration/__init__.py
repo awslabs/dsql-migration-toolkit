@@ -2001,6 +2001,14 @@ def _render_table_selection(
     """
     with ui.row().classes("items-center gap-1"):
         ui.label("Tables to migrate").classes("text-sm font-semibold")
+        # "Why only tables?" is useful context but reads as clutter when always on --
+        # move it to a hover ⓘ next to the title (matches the app's other header
+        # tooltips) instead of a standing paragraph.
+        ui.icon("info").classes("text-gray-400 text-sm cursor-help").tooltip(
+            "Only tables are listed — they hold the row data. Views, triggers and "
+            "routines have no data of their own; they are created in Schema "
+            "Conversion, not migrated in this step."
+        )
         # The refresh button is hidden once locked: re-introspecting could change
         # the migratable set out from under the prerequisite checks/config.
         if on_refresh is not None and not locked:
@@ -2008,21 +2016,12 @@ def _render_table_selection(
                 "flat dense round size=sm icon=refresh"
             ).tooltip("Refresh source/target objects")
         if locked:
+            # The lock icon's tooltip carries the reason + how to change it, so no
+            # separate standing "Locked — …" paragraph is needed below.
             ui.icon("lock", color="grey").classes("text-sm").tooltip(
-                "Locked after prerequisite checks ran for this selection"
+                "Locked — prerequisite checks ran for this selection. Re-run the "
+                "checks (Prerequisites step) to change which tables are migrated."
             )
-    ui.label(
-        "Only tables are listed here — they hold the row data to migrate. Views, "
-        "triggers and routines have no data of their own and are not migrated in "
-        "this step; they are created in Schema Conversion (a view reflects its "
-        "tables' data once loaded)."
-    ).classes("text-xs text-gray-500")
-    if locked:
-        ui.label(
-            "Locked — prerequisite checks ran for this table selection. "
-            "Re-run the checks (Prerequisites step) to change which tables "
-            "are migrated."
-        ).classes("text-xs text-gray-500")
     if not migratable:
         render_notice(
             ui,
@@ -2037,10 +2036,8 @@ def _render_table_selection(
 
     pre_selected_count = sum(1 for n in migratable if n in set(target_existing))
     ui.label(
-        f"Pre-selected by default: {pre_selected_count} table(s) that already "
-        "exist on the target DSQL (schema applied earlier — this session or a "
-        "prior one). Only tables with a target table to load into are listed; "
-        "untick any to skip, or use Select all / Unselect all below."
+        f"Pre-selected: {pre_selected_count} table(s) already on the target — "
+        "untick any to skip."
     ).classes("text-xs text-gray-400")
 
     migratable_order = list(migratable)

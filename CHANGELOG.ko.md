@@ -5,6 +5,36 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.128
+
+### Fixed
+
+- **파이프라인이 drain된 뒤 Stream lag이 마지막 값에 고정되던 문제 수정.** `ReplicationLagMs`
+  는 이벤트 기반 지표(싱크가 변경을 적용할 때만 datapoint 방출)라, cut-over를 위해 소스를
+  quiesce하면 파이프라인이 방출을 멈춥니다. 그런데 reader가 15분 window 안에 남아있는 마지막
+  datapoint를 계속 "현재" lag으로 반환해서, source-poll / sink-send rate는 이미 idle(0)로
+  떨어졌는데도 Stream lag 차트/열이 최대 ~15분간 예: 1068 ms 에 flat하게 머물렀습니다. 이제
+  최신 datapoint가 freshness 컷오프(~3분)보다 오래됐으면 없는 것으로 처리해, drain된
+  파이프라인은 **caught up**으로 읽히고 소스가 조용해진 직후 차트가 0으로 떨어집니다.
+  reader 측 수정(싱크 재배포 불필요).
+
+### Changed
+
+- **Data Migration / CDC 화면 정리: 상시 노출되던 장문 설명을 hover ⓘ 툴팁으로 이동(중복은
+  삭제).** 상시 안내문은 화면에 익숙해지면 노이즈가 되므로, 설명은 hover로 옮기고 화면을 더
+  깔끔하게 했습니다:
+  - **Stream lag** 차트 캡션 → 제목 옆 ⓘ (제목 + `lag (ms)` 축이 기본 정보 전달).
+  - **Tables to migrate** — "왜 테이블만(뷰/트리거/루틴 제외)" 문단 → 제목 ⓘ; "Locked —
+    prerequisite 체크 재실행…" 줄 → 잠금 아이콘 툴팁으로 통합; 사전 선택 안내는
+    `Pre-selected: N table(s) already on the target — untick any to skip.` 로 축약.
+  - **CDC start point** — "스트리밍 시작 지점 / Automatic은 gapless" 문단 → 제목 ⓘ;
+    "CDC has started — locked…" 줄 → **Locked** 배지 툴팁으로 통합.
+  - **Stop CDC** — "커넥터가 스트리밍 중… Stop은 커넥터만 제거…" 상시 문단 삭제(스트리밍
+    여부는 live status로, 영향은 Stop 확인 대화상자에 이미 명시), 버튼에는 짧은 안심 툴팁만.
+  - **Change flow** — "변경이 계속 흐르는지 / cutover 시 idle로 떨어지는지 지켜보라" 문단과
+    "CloudWatch, ~last few min" 출처 표기 → "Change flow" 헤더의 ⓘ 하나로 통합, 상태 줄 +
+    source/sink rate 게이지만 남김.
+
 ## v0.1.127
 
 ### Changed

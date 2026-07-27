@@ -5,6 +5,44 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.128
+
+### Fixed
+
+- **Stream lag no longer freezes at the last value after the pipeline drains.** The
+  `ReplicationLagMs` metric is event-driven (the sink emits a datapoint only when it
+  applies a change), so once the source is quiesced for cut-over the pipeline stops
+  emitting — but the reader kept returning the last datapoint still inside its 15-min
+  window as the "current" lag, so the Stream lag chart/column sat flat at e.g. 1068 ms
+  for up to ~15 minutes even though the source-poll / sink-send rates had correctly
+  dropped to idle. The reader now treats a most-recent datapoint older than a freshness
+  cutoff (~3 min) as absent, so a drained pipeline reads as **caught up** and the chart
+  drops to 0 shortly after the source goes quiet. Reader-side fix (no sink redeploy).
+
+### Changed
+
+- **Decluttered the Data Migration / CDC screens: verbose standing explanations moved
+  to hover ⓘ tooltips (or dropped when redundant).** The always-on help paragraphs
+  read as noise once the screen is familiar, so the guidance now lives a hover away
+  and the views are quieter:
+  - **Stream lag** chart caption → an ⓘ next to the title (the title + `lag (ms)` axis
+    carry the basics).
+  - **Tables to migrate** — the "why only tables (not views/triggers/routines)"
+    paragraph → ⓘ on the title; the "Locked — re-run prerequisite checks…" line →
+    folded into the lock-icon tooltip; the pre-selection blurb trimmed to
+    `Pre-selected: N table(s) already on the target — untick any to skip.`
+  - **CDC start point** — the "where streaming begins / Automatic is gapless"
+    paragraph → ⓘ on the title; the "CDC has started — locked…" line → folded into
+    the **Locked** badge tooltip.
+  - **Stop CDC** — the standing "connectors are streaming… Stop removes only the
+    connectors…" paragraph removed (the live status shows streaming; the impact is
+    already spelled out in the Stop confirmation dialog), with a short reassurance
+    tooltip on the button.
+  - **Change flow** — the "whether changes are still streaming / watch it drop to
+    idle for cutover" paragraph and the "CloudWatch, ~last few min" provenance note
+    → folded into one ⓘ on the "Change flow" header, leaving just the state line +
+    the source/sink rate gauges.
+
 ## v0.1.127
 
 ### Changed
