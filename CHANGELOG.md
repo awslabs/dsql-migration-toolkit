@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.129
+
+### Changed
+
+- **Change flow reads "idle" once the pipeline drains, absorbing the source
+  connector's heartbeat floor.** The source (Debezium) connector never fully goes
+  silent — `heartbeat.interval.ms=300000` emits a heartbeat every 5 min, so
+  `SourceRecordPollRate` idles at a small floor (~0.03/s on the CloudWatch average)
+  rather than 0. The idle threshold was `0.01/s`, so that heartbeat residual kept the
+  change-flow line showing "streaming" even after the source was quiesced. Raised the
+  threshold to `0.1/s` — above the heartbeat floor, far below any real change traffic
+  (typically ≥1/s). The rule still requires BOTH the source-poll AND sink-send rates
+  below the threshold, so a stalled sink (source still producing, sink not sending) is
+  never mislabelled idle — it correctly stays "streaming".
+
 ## v0.1.128
 
 ### Fixed

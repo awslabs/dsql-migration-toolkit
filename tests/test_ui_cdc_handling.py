@@ -347,3 +347,28 @@ def test_activity_takes_max_rate_across_connectors() -> None:
     assert summary.source_poll_rate == 2.0
     assert summary.sink_send_rate == 1.0
     assert summary.idle is False
+
+
+def test_activity_idle_absorbs_source_heartbeat_floor() -> None:
+    # The source (Debezium) connector never fully goes silent: heartbeats
+    # (heartbeat.interval.ms=300000) keep SourceRecordPollRate at a small floor
+    # (~0.03/s on the CloudWatch average) even when the captured tables are idle.
+    # The threshold sits above that floor, so a drained pipeline (sink send 0) still
+    # reads as idle instead of lingering as "streaming".
+    health = {
+        "src": ConnectorHealth(poll_rate=0.03),  # heartbeat residual, no real changes
+        "sink": ConnectorHealth(send_rate=0.0),  # nothing being applied
+    }
+    assert cdc_activity_summary(health).idle is True
+
+
+def test_activity_not_idle_when_sink_stalled() -> None:
+    # Safety property of the AND-both-rates rule: if the SOURCE is still producing
+    # real changes (poll rate well above the heartbeat floor) but the SINK is not
+    # sending (stalled / lagging), the pipeline is NOT drained -- it must read as
+    # "streaming", never idle, so cut-over is not wrongly signalled as safe.
+    health = {
+        "src": ConnectorHealth(poll_rate=5.0),  # real change traffic
+        "sink": ConnectorHealth(send_rate=0.0),  # sink not keeping up
+    }
+    assert cdc_activity_summary(health).idle is False

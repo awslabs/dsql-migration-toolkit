@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.129
+
+### Changed
+
+- **파이프라인이 drain되면 Change flow가 "idle"로 표시되도록 — 소스 커넥터의 heartbeat
+  바닥을 흡수.** 소스(Debezium) 커넥터는 완전히 조용해지지 않습니다 —
+  `heartbeat.interval.ms=300000`(5분)이 주기적으로 heartbeat을 방출해
+  `SourceRecordPollRate`가 0이 아니라 작은 바닥(CloudWatch 평균 ~0.03/s)에 머뭅니다. 기존
+  idle 임계값이 `0.01/s`라 이 heartbeat 잔량 때문에 소스를 멈춘 뒤에도 change-flow가
+  "streaming"으로 보였습니다. 임계값을 `0.1/s`로 상향 — heartbeat 바닥 위, 실제 변경
+  트래픽(보통 ≥1/s)보다는 훨씬 아래. 판정은 여전히 **source-poll·sink-send 둘 다** 임계값
+  미만이어야 하므로, stall(소스는 생산 중인데 sink가 못 보냄)은 idle로 오분류되지 않고
+  정확히 "streaming"으로 유지됩니다.
+
 ## v0.1.128
 
 ### Fixed

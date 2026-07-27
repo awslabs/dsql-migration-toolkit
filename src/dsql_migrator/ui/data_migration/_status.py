@@ -668,8 +668,15 @@ def _ensure_cdc_controller(migration_state, session) -> None:
 
 
 # A change rate at or below this (events/sec) counts as "no changes flowing".
-# Not exactly 0 because CloudWatch averages can carry a tiny residual.
-_CDC_IDLE_RATE_THRESHOLD = 0.01
+# Not 0: the source (Debezium) connector never fully goes silent even when the
+# captured tables are idle -- heartbeat.interval.ms=300000 emits a heartbeat record
+# every 5 min (~0.0033/s), which the CloudWatch moving average blips up to ~0.03/s,
+# so SourceRecordPollRate has an irreducible floor. 0.1/s sits well above that
+# heartbeat floor yet far below any real migration change traffic (typically >=1/s),
+# so a drained pipeline reads as idle instead of lingering as "streaming". Idle still
+# requires BOTH rates below this (see cdc_activity_summary), so a stalled sink (source
+# still producing, sink not sending) is NOT mislabelled idle.
+_CDC_IDLE_RATE_THRESHOLD = 0.1
 
 
 @dataclass(frozen=True)
