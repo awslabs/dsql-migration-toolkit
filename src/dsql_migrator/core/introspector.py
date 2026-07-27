@@ -83,7 +83,16 @@ def source_engine_kwargs(
     single long query (exact counts/checksums) without a per-read deadline.
     """
     connect_args: dict[str, object] = {
-        "connect_timeout": SOURCE_CONNECT_TIMEOUT_SECONDS
+        "connect_timeout": SOURCE_CONNECT_TIMEOUT_SECONDS,
+        # Pin the session to UTC. MySQL TIMESTAMP is stored in UTC but read/rendered
+        # in the session's time_zone, so a non-UTC server/client default would make
+        # TIMESTAMP columns drift versus the target's UTC rendering -- both in the
+        # Full Load loader's reads and the validation checksum (which renders
+        # TIMESTAMP via DATE_FORMAT while the PG side uses AT TIME ZONE 'UTC').
+        # DATETIME is a wall-clock and unaffected; this makes TIMESTAMP deterministic
+        # regardless of the server/client zone. Applied to every source engine (test,
+        # introspection, validation, Full Load stream) since they share these kwargs.
+        "init_command": "SET time_zone = '+00:00'",
     }
     if read_timeout_seconds is not None:
         # PyMySQL applies these per socket operation, not to the whole query.

@@ -204,9 +204,10 @@ def _checksum_kind(column: "ColumnDef") -> str:
 
     Returns one of: ``"binary"`` (bytea/spatial WKB), ``"bit"`` (BIT(n) ->
     integer target), ``"boolean"``, ``"timestamp"`` / ``"timestamptz"`` /
-    ``"time"`` (temporal), ``"numeric"`` (DECIMAL), ``"float"`` (FLOAT/DOUBLE ->
-    excluded from the checksum), or ``"plain"`` (all safe types rendered by the
-    engine's native text cast). Reuses the SAME converter classification the Full
+    ``"time"`` (temporal), ``"numeric"`` (DECIMAL), ``"float"`` (FLOAT/DOUBLE) and
+    ``"json"`` (both excluded from the checksum -- no byte-identical cross-engine
+    text form), or ``"plain"`` (all safe types rendered by the engine's native text
+    cast). Reuses the SAME converter classification the Full
     Load loader used to STORE the value (converter.map_mysql_type / the exporter's
     _target_kind), so the rendered text matches the stored value on the target.
     """
@@ -236,6 +237,14 @@ def _checksum_kind(column: "ColumnDef") -> str:
         return "numeric"
     if kind in ("real", "double precision", "double", "float"):
         return "float"
+    if kind == "json":
+        # JSON has no byte-identical cross-engine text form: MySQL CAST(col AS CHAR)
+        # emits a SPACED canonical form ({"k": "v"}), while a CDC-written row holds
+        # Debezium's COMPACT serialization ({"k":"v"}) in the PG `json` column. The
+        # values are logically equal but the text differs, so -- like FLOAT/DOUBLE --
+        # JSON is excluded from the checksum (row counts + all other columns still
+        # validate; a JSON-text diff is a false positive, not data loss).
+        return "json"
     return "plain"
 
 
@@ -243,8 +252,10 @@ def _mysql_checksum_expr(column: "ColumnDef") -> Optional[str]:
     """Inner MySQL render expression for one column (``None`` = omit from checksum).
 
     Normalizes each divergent type to the SAME canonical text the PG side
-    produces (see :func:`_pg_checksum_expr`). ``float`` returns ``None`` so
-    FLOAT/DOUBLE are excluded (no byte-identical cross-engine text form exists).
+    produces (see :func:`_pg_checksum_expr`). ``float`` and ``json`` return ``None``
+    so FLOAT/DOUBLE and JSON are excluded (no byte-identical cross-engine text form
+    exists: floats have no exact decimal string, and JSON's whitespace/formatting
+    differs between MySQL's canonical form and the CDC sink's compact serialization).
     """
     ident = _quote_mysql_identifier(column.name)
     kind = _checksum_kind(column)
@@ -272,7 +283,7 @@ def _mysql_checksum_expr(column: "ColumnDef") -> Optional[str]:
         # to_char(round(...)) side byte-for-byte.
         scale = _decimal_scale(column.mysql_type)
         return f"CAST({ident} AS DECIMAL(65, {scale}))"
-    if kind == "float":
+    if kind in ("float", "json"):
         return None
     return f"CAST({ident} AS CHAR)"
 
@@ -307,7 +318,7 @@ def _pg_checksum_expr(column: "ColumnDef") -> "Optional[sql.Composed]":
             scale=sql.Literal(scale),
             mask=sql.Literal(_pg_numeric_mask(scale)),
         )
-    if kind == "float":
+    if kind in ("float", "json"):
         return None
     return sql.SQL("{col}::text").format(col=ident)
 
@@ -326,7 +337,8 @@ def build_mysql_checksum_sql(table: TableDef) -> str:
     the engine-normalized :func:`_mysql_checksum_expr` (so equal data hashes
     equally cross-engine) inside ``COALESCE(..., <sentinel>)`` so ``NULL`` columns
     map to the shared sentinel and never silently drop out of the concatenation.
-    FLOAT/DOUBLE columns are omitted (``_mysql_checksum_expr`` returns ``None``).
+    FLOAT/DOUBLE and JSON columns are omitted (``_mysql_checksum_expr`` returns
+    ``None`` -- neither has a byte-identical cross-engine text form).
     """
     rendered = [_mysql_checksum_expr(column) for column in table.columns]
     columns = ", ".join(
@@ -352,7 +364,7 @@ def build_pg_checksum_sql(table: TableDef) -> sql.Composed:
     Mirrors :func:`build_mysql_checksum_sql`: the first ``_CHECKSUM_HEX_DIGITS``
     MD5 hex digits of each row are summed as a positive ``bigint``. Each column is
     rendered with the engine-normalized :func:`_pg_checksum_expr` inside
-    ``COALESCE(..., <sentinel>)`` (FLOAT/DOUBLE columns are omitted). Identifiers
+    ``COALESCE(..., <sentinel>)`` (FLOAT/DOUBLE and JSON columns are omitted). Identifiers
     are composed with :class:`psycopg.sql.Identifier` so a column/table name can
     never break out of the SQL (Requirement 9.4). All access is a single
     ``SELECT`` (read-only).

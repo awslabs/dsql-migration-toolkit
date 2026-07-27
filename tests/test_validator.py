@@ -1084,6 +1084,26 @@ def test_checksum_float_columns_excluded() -> None:
         assert "ratio" not in rendered
 
 
+def test_checksum_json_columns_excluded() -> None:
+    # JSON has no byte-identical cross-engine text form: MySQL CAST(col AS CHAR)
+    # emits a SPACED canonical form ({"k": "v"}), while a CDC-written row holds
+    # Debezium's COMPACT serialization ({"k":"v"}) in the PG `json` column. Equal
+    # data, different text -> a checksum false positive. So -- like FLOAT/DOUBLE --
+    # JSON is omitted from the checksum on BOTH engines and in all four builders;
+    # the 'meta' column must never appear (the int PK 'id' still anchors the concat).
+    table = TableDef(
+        name="j",
+        columns=[
+            ColumnDef(name="id", mysql_type="int"),
+            ColumnDef(name="meta", mysql_type="JSON"),
+        ],
+        primary_key=["id"],
+    )
+    for rendered in _all_four_rendered(table):
+        assert "meta" not in rendered
+        assert "id" in rendered  # non-JSON PK still rendered, so the concat is valid
+
+
 def test_pk_token_matches_checksum_per_column_terms() -> None:
     # Requirement 1: the PK-token per-row hash must reproduce the table-checksum
     # per-row hash, so the SAME per-column inner terms appear in both.

@@ -5,6 +5,26 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.135
+
+### Fixed
+
+- **CDC 後に JSON 列が原因で Validation が「data differs」を誤報する問題を修正。** MySQL `JSON` は
+  Postgres `json` 列にマップされ、チェックサムは生テキストを比較していました。MySQL は空白入りの
+  正規形(`{"k": "v"}`)、CDC で書かれた行は Debezium のコンパクト形(`{"k":"v"}`)— 論理的には同じ
+  でもテキストが異なり、JSON を持つ CDC 書き込み行が失敗していました(Full Load 行は一致)。JSON は
+  チェックサムから除外(FLOAT/DOUBLE と同様)し、行数とその他の列は引き続き検証します。
+  `customers`/`products`/`suppliers` の誤検出の原因でした。
+
+### Changed(チェックサムのクロスエンジン堅牢化)
+
+- **ソース MySQL セッションを UTC に固定**(`SET time_zone='+00:00'` — 接続テスト/イントロスペクション/
+  validation/Full Load ストリームの全ソースエンジン)。MySQL `TIMESTAMP` は UTC 格納だがセッション
+  タイムゾーンで読み出されるため、UTC 以外だとターゲットの UTC レンダリングとチェックサムでズレる
+  可能性がありました。(`DATETIME` はウォールクロックで影響なし。)
+- **Validation がマイグレーション除外列をスキップ**(例:CDC の oversized-LOB 除外):ターゲットに
+  書かれていない列はチェックサムから外し、常に「差分あり」にならないようにします(PK は除外しない)。
+
 ## v0.1.134
 
 ### Changed

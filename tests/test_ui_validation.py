@@ -1464,3 +1464,45 @@ def test_validation_state_run_timing_roundtrip() -> None:
     # Starting a new run clears the previous elapsed until it finishes.
     state.mark_run_started()
     assert state.elapsed_seconds is None
+
+
+def test_source_engine_kwargs_pins_session_time_zone_to_utc() -> None:
+    # Hardening: every source MySQL engine pins the session to UTC so TIMESTAMP
+    # columns (stored UTC, displayed in the session tz) can't drift vs the target's
+    # UTC rendering in the checksum. DATETIME is a wall-clock and unaffected.
+    from dsql_migrator.core.introspector import source_engine_kwargs
+
+    ca = source_engine_kwargs()["connect_args"]
+    assert ca["init_command"] == "SET time_zone = '+00:00'"
+    # Still present when the Full Load stream opts into per-socket timeouts.
+    ca2 = source_engine_kwargs(read_timeout_seconds=30)["connect_args"]
+    assert ca2["init_command"] == "SET time_zone = '+00:00'"
+
+
+def test_apply_column_exclusions_drops_excluded_but_keeps_pk() -> None:
+    # Migration-excluded columns (CDC oversized-LOB exclusion) must be dropped from
+    # the checksum's column set -- they're not on the target, so comparing them is a
+    # false failure. A PK is never dropped (it anchors each row) even if listed.
+    from dsql_migrator.core.models import ColumnDef, TableDef
+    from dsql_migrator.ui.validation import _apply_column_exclusions
+
+    t = TableDef(
+        name="products",
+        columns=[
+            ColumnDef(name="id", mysql_type="int"),
+            ColumnDef(name="tags", mysql_type="json"),
+            ColumnDef(name="notes", mysql_type="longtext"),
+        ],
+        primary_key=["id"],
+    )
+    (out,) = _apply_column_exclusions([t], {"products": {"notes"}})
+    assert [c.name for c in out.columns] == ["id", "tags"]  # 'notes' excluded
+
+    # No exclusions -> the SAME objects pass through untouched (no needless copies).
+    assert _apply_column_exclusions([t], {}) == [t]
+    assert _apply_column_exclusions([t], {"other": {"x"}})[0] is t
+
+    # A PK listed for exclusion is still kept.
+    (out2,) = _apply_column_exclusions([t], {"products": {"id", "notes"}})
+    assert "id" in [c.name for c in out2.columns]
+    assert "notes" not in [c.name for c in out2.columns]

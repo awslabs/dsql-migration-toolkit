@@ -5,6 +5,26 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.135
+
+### Fixed
+
+- **CDC 이후 JSON 컬럼 때문에 Validation이 "data differs"로 오탐하던 문제 수정.** MySQL `JSON`은
+  Postgres `json` 컬럼으로 매핑되고 checksum이 원문 텍스트를 비교하는데, MySQL은 공백 있는
+  정규형(`{"k": "v"}`), CDC로 쓰인 행은 Debezium compact(`{"k":"v"}`) — 논리적으로 같지만 텍스트가
+  달라 JSON 있는 CDC-touched 행이 실패했습니다(Full Load 행은 일치). 이제 JSON을 checksum에서
+  제외(FLOAT/DOUBLE처럼)하며 row count·그 외 컬럼은 계속 검증합니다. `customers`/`products`/
+  `suppliers` 오탐의 원인이었습니다.
+
+### Changed (checksum 크로스엔진 하드닝)
+
+- **소스 MySQL 세션을 UTC로 고정**(`SET time_zone='+00:00'` — 연결 테스트/인트로스펙션/validation/
+  Full Load 스트림의 모든 소스 엔진). MySQL `TIMESTAMP`는 UTC로 저장되지만 세션 타임존으로 읽혀,
+  UTC가 아니면 대상의 UTC 렌더링과 checksum에서 어긋날 수 있었습니다. (`DATETIME`은 wall-clock이라
+  영향 없음.)
+- **Validation이 마이그레이션 제외 컬럼을 스킵**(예: CDC oversized-LOB 제외): 대상에 쓰이지 않은
+  컬럼은 checksum에서 빼서 항상 "다름"으로 뜨지 않게 합니다(PK는 절대 제외 안 함).
+
 ## v0.1.134
 
 ### Changed

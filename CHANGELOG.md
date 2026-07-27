@@ -5,6 +5,30 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.135
+
+### Fixed
+
+- **Validation no longer false-reports "data differs" for JSON columns after CDC.**
+  MySQL `JSON` maps to a Postgres `json` column and the checksum compared raw text:
+  MySQL renders a spaced canonical form (`{"k": "v"}`) while a CDC-written row holds
+  Debezium's compact serialization (`{"k":"v"}`) — logically-equal data, different
+  text, so CDC-touched rows with JSON failed the checksum (Full-Load rows matched).
+  JSON is now excluded from the checksum (like FLOAT/DOUBLE); row counts and every
+  other column still validate. This was the cause of spurious `customers` / `products`
+  / `suppliers` checksum failures.
+
+### Changed (checksum cross-engine hardening)
+
+- **Source MySQL sessions are pinned to UTC** (`SET time_zone='+00:00'` on every
+  source engine: connection test, introspection, validation, Full Load stream). MySQL
+  `TIMESTAMP` is stored UTC but read in the session's zone; without this a non-UTC
+  server/client zone would make `TIMESTAMP` columns drift versus the target's UTC
+  rendering in the checksum. (`DATETIME` is a wall-clock and was unaffected.)
+- **Validation skips migration-excluded columns** (e.g. the CDC oversized-LOB
+  exclusion): a column that was never written to the target is dropped from the
+  checksum instead of always "differing" (PK columns are never dropped).
+
 ## v0.1.134
 
 ### Changed

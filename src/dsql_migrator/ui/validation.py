@@ -159,6 +159,13 @@ class ValidationInputs:
     # default so the thorough check stays the default; a count-matched table is
     # then reported as verified-by-count (deep checks not run), never a false match.
     deep_only_on_count_mismatch: bool = False
+    # Columns EXCLUDED from the migration (per-table column names, e.g. the CDC
+    # oversized-LOB exclusion) must be skipped by the checksum: they are not written
+    # to the target, so comparing them would always "differ" (a false failure). Maps
+    # table name -> set of excluded column names; empty (default) validates every
+    # column. run_validation drops these from each table's column list before the
+    # checksum builds its per-row concatenation.
+    excluded_columns: dict[str, set[str]] = field(default_factory=dict)
 
 
 # Builds a :class:`_ValidationRunner` bound to the run's inputs.
@@ -178,6 +185,31 @@ def _default_validator_factory(inputs: ValidationInputs) -> _ValidationRunner:
         source_engine_factory=make_source_engine_factory(inputs.source_password),
         row_diff_sample_size=load_config().validate_row_diff_sample_size,
     )
+
+
+def _apply_column_exclusions(
+    tables: "list[TableDef]", excluded: "dict[str, set[str]]"
+) -> "list[TableDef]":
+    """Return ``tables`` with each table's migration-excluded columns dropped.
+
+    ``excluded`` maps table name -> excluded column names (the CDC oversized-LOB
+    exclusion / ColumnExcludeList). Those columns are not written to the target, so
+    the checksum must not compare them. Pure: returns model copies, leaves the input
+    untouched, and never drops a primary-key column (PKs are never excludable and
+    the checksum needs them to anchor each row).
+    """
+    if not excluded:
+        return tables
+    out: list[TableDef] = []
+    for table in tables:
+        drop = excluded.get(table.name)
+        if not drop:
+            out.append(table)
+            continue
+        pk = set(table.primary_key)
+        kept = [c for c in table.columns if c.name not in drop or c.name in pk]
+        out.append(table.model_copy(update={"columns": kept}) if len(kept) != len(table.columns) else table)
+    return out
 
 
 def run_validation(
@@ -207,10 +239,16 @@ def run_validation(
     """
     workers = max_workers if max_workers is not None else load_config().validate_max_workers
     validator = validator_factory(inputs)
+    # Drop migration-excluded columns (e.g. oversized-LOB exclusion) so the checksum
+    # never compares a column that was never written to the target -> no false "data
+    # differs". Row counts + every other column are still validated.
+    tables = _apply_column_exclusions(
+        list(inputs.inventory.tables), inputs.excluded_columns
+    )
     return validator.validate(
         inputs.source_config,
         inputs.target_config,
-        list(inputs.inventory.tables),
+        tables,
         inputs.mode,
         watermark=inputs.watermark,
         check_orphans=inputs.check_orphans,
@@ -1136,6 +1174,10 @@ def build_validation_screen(
             deep_only_on_count_mismatch=(
                 validation_state.deep_only_on_count_mismatch
             ),
+            # Skip columns the migration excluded (CDC oversized-LOB exclusion), so a
+            # column that was never written to the target can't cause a false checksum
+            # mismatch. Empty for a migration that excluded nothing.
+            excluded_columns=migration_state.cdc_lob_exclusions(),
         )
 
         validation_state.clear_outputs()
