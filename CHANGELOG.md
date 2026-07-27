@@ -5,6 +5,17 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.130
+
+### Changed
+
+- **Decluttered the Validation screen text.** The 5-line intro is trimmed to a single
+  sentence, and the three status notices (No export watermark / CDC still streaming /
+  Comparison in progress) keep their headers but have their bodies cut to the one
+  actionable line each — so a combined state (no watermark + CDC active + running) no
+  longer stacks into a wall of text. The notices stay (they carry real conditional
+  state), just concise.
+
 ## v0.1.129
 
 ### Changed

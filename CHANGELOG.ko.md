@@ -5,6 +5,16 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.130
+
+### Changed
+
+- **Validation 화면 텍스트 정리.** 5줄짜리 인트로를 한 문장으로 축약하고, 세 개의 상태 알림
+  (No export watermark / CDC still streaming / Comparison in progress)은 헤더는 유지하되
+  본문을 각각 핵심 한 줄로 줄였습니다. 그래서 세 상태가 동시에 뜨는 경우(watermark 없음 +
+  CDC 활성 + 실행 중)에도 더 이상 텍스트 벽이 되지 않습니다. 알림 박스 자체는 실제 조건부
+  상태를 전달하므로 유지하되 간결하게만 바꿨습니다.
+
 ## v0.1.129
 
 ### Changed

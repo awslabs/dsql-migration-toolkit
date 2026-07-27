@@ -1181,12 +1181,9 @@ def build_validation_screen(
 
         with ui.column().classes("w-full gap-3"):
             ui.label(
-                "The final pre-cut-over check. After Full Load + CDC, validation "
-                "confirms the migrated target is ready to switch over: the data is "
-                "identical, no records are missing or extra, and no table errored. "
-                "Results are shown as a report you can download; the comparison is "
-                "as-of the export watermark, with source changes since then shown "
-                "as drift."
+                "The final pre-cut-over check: exact counts, checksums and per-table "
+                "primary-key reconciliation confirm the target matches the source "
+                "(as-of the export watermark). Results download as a report."
             ).classes("text-sm text-gray-500")
 
             # The step header + journey stepper already show the status badge, so
@@ -1211,10 +1208,8 @@ def build_validation_screen(
                     tone="info",
                     header="No export watermark — comparing against the live source",
                     body=(
-                        "No export watermark found, so validation compares against "
-                        "the live source and drift since a snapshot is not "
-                        "available. Run Step 3 (Data Migration) first to validate "
-                        "as-of the exact consistency point."
+                        "Run Step 3 (Data Migration) first to validate as-of the "
+                        "exact consistency point instead."
                     ),
                 )
 
@@ -1231,12 +1226,9 @@ def build_validation_screen(
                     tone="info",
                     header="CDC is still streaming — differences may be lag, not loss",
                     body=(
-                        "A change-data-capture connector is running, so the target "
-                        "is still catching up. You can validate now to watch it "
-                        "converge, but a small source/target difference is likely "
-                        "replication lag (it shrinks as CDC catches up). For a "
-                        "final cut-over check, stop source writes (let CDC drain) "
-                        "first so a clean match confirms zero data loss."
+                        "A small source/target difference is likely replication lag. "
+                        "For a final cut-over check, stop source writes (let CDC "
+                        "drain) so a clean match confirms zero data loss."
                     ),
                 )
 
@@ -1663,11 +1655,9 @@ def _render_in_progress(
             tone="info",
             header="Comparison in progress — safe to leave running",
             body=(
-                "Exact COUNT(*)/checksum and full per-table primary-key "
-                "reconciliation run against both engines, so this can take several "
-                "minutes for a large database. You can leave this screen — the run "
-                "continues in the background. Cancel stops at the next table; the "
-                "target is never modified (validation is read-only)."
+                "Exact COUNT(*)/checksum + per-table PK reconciliation on both "
+                "engines — minutes for a large database. Runs in the background; "
+                "read-only (the target is never modified)."
             ),
         )
     _install_poll_timer(ui, job_manager, session, validation_state, refresh)

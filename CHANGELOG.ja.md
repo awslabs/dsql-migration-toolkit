@@ -5,6 +5,16 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.130
+
+### Changed
+
+- **Validation 画面のテキストを整理。** 5 行のイントロを 1 文に短縮し、3 つのステータス通知
+  (No export watermark / CDC still streaming / Comparison in progress)はヘッダーを残しつつ
+  本文をそれぞれ要点 1 行に削減しました。これにより、3 つが同時に表示される状態(watermark
+  なし + CDC 稼働中 + 実行中)でもテキストの壁になりません。通知ボックス自体は実際の条件付き
+  状態を伝えるため残し、簡潔にしただけです。
+
 ## v0.1.129
 
 ### Changed
