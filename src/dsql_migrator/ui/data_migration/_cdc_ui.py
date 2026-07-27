@@ -3012,7 +3012,14 @@ def _render_migration_table_status(
                 table_rows.append(
                     {
                         "table": r.table,
-                        "fl": r.full_load_state or "—",
+                        # Title-case label (Done/In progress/…) to match the Full Load
+                        # stats table's status badge; fl_state stays raw for the color.
+                        "fl": {
+                            "DONE": "Done",
+                            "IN_PROGRESS": "In progress",
+                            "FAILED": "Failed",
+                            "PENDING": "Pending",
+                        }.get(r.full_load_state, r.full_load_state) or "—",
                         "fl_state": r.full_load_state or "",
                         "fl_rows": _fmt(r.full_load_rows),
                         "cdc_net": _fmt_signed(r.cdc_applied_net),
@@ -3277,15 +3284,55 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
     """
     ui.label("Live status").classes("text-sm font-semibold")  # type: ignore[attr-defined]
 
+    # --- Live "Stream lag" chart -------------------------------------------------
+    # Created ONCE here, OUTSIDE the 5s refreshable below, and updated IN PLACE via
+    # chart.update() on each poll -- so the line extends continuously like a
+    # CloudWatch graph instead of the whole echart being torn down and recreated
+    # every 5s (which flickered). The card is hidden until there are >=2 points (a
+    # single dot is not a trend). The rolling series behind it is a hybrid: seeded
+    # from CloudWatch's 1-min history (survives reload) then extended each poll.
+    lag = {"card": None, "chart": None}
+    with ui.card().classes("w-full") as _lag_card:  # type: ignore[attr-defined]
+        with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+            ui.icon("show_chart", color="primary").classes("text-base")  # type: ignore[attr-defined]
+            ui.label("Stream lag").classes("text-sm font-semibold")  # type: ignore[attr-defined]
+        ui.label(  # type: ignore[attr-defined]
+            "Worst end-to-end replication lag across tables, live (max lag in ms). "
+            "Flat near zero = caught up (safe to cut over); a rising line means the "
+            "pipeline is falling behind."
+        ).classes("text-xs text-gray-500")
+        lag["chart"] = (  # type: ignore[assignment]
+            ui.echart(  # type: ignore[attr-defined]
+                {"xAxis": {"type": "time"}, "yAxis": {"type": "value"}, "series": []}
+            )
+            .classes("w-full")
+            .style("height: 220px")
+        )
+    lag["card"] = _lag_card  # type: ignore[assignment]
+
+    def _update_lag_chart() -> None:
+        """Push the latest rolling series into the persistent echart IN PLACE, and
+        show/hide the card (hidden until there is a >=2-point trend)."""
+        option = build_lag_chart_option(
+            getattr(migration_state, "cdc_replication_lag_series", None) or []
+        )
+        card, chart = lag["card"], lag["chart"]
+        if card is None or chart is None:
+            return
+        if option is None:
+            card.set_visibility(False)  # type: ignore[attr-defined]
+            return
+        chart.options.clear()  # type: ignore[attr-defined]
+        chart.options.update(option)  # type: ignore[attr-defined]
+        chart.update()  # type: ignore[attr-defined]
+        card.set_visibility(True)  # type: ignore[attr-defined]
+
     @ui.refreshable
     def _cdc_live() -> None:  # type: ignore[misc]
         view = _cdc_status_view(migration_state, job_manager)
         if view is not None:
             _render_cdc_pipeline_health(
-                ui,
-                view,
-                getattr(migration_state, "cdc_activity", None),
-                lag_series=getattr(migration_state, "cdc_replication_lag_series", None),
+                ui, view, getattr(migration_state, "cdc_activity", None)
             )
             _render_cdc_dlq_panel(
                 ui, migration_state, job_manager, view, on_refresh=_poll_cdc
@@ -3317,15 +3364,16 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
             fetched = None
         if fetched is not None:
             _apply_cdc_status(migration_state, fetched)
-        _cdc_live.refresh()
+        _update_lag_chart()  # persistent chart: update in place (no flicker)
+        _cdc_live.refresh()  # connector health / change flow / DLQ (text) redraw
 
+    _update_lag_chart()  # initial state (hidden until >=2 points)
     _cdc_live()
 
 def _render_cdc_pipeline_health(
     ui,
     status_view: LoadStatusView,
     activity: "Optional[CdcActivitySummary]",
-    lag_series: "Optional[Sequence[tuple[int, int]]]" = None,
 ) -> None:
     """Render the combined "Pipeline health" card: connector health + change flow.
 
@@ -3354,44 +3402,22 @@ def _render_cdc_pipeline_health(
             ui.label(  # type: ignore[attr-defined]
                 f"Caught up to {status_view.caught_up_to.isoformat()}"
             ).classes("text-xs text-gray-500")
-        _badge_color = {"ok": "positive", "warn": "warning", "bad": "negative"}
+        # Minimal one-line-per-connector: a status icon (colour = health) + the
+        # friendly role label (raw connector id in a hover tooltip) + a muted detail.
+        # A compact, Cloudscape-style status list -- drops the previous id sub-line and
+        # the outline state badge (the icon colour + detail already convey the state).
         for row in rows:
             _border, _bg, icon_color, icon = _CDC_TONE_STYLE.get(
                 row.tone, _CDC_TONE_STYLE["warn"]
             )
             with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
-                ui.icon(icon, color=icon_color).classes("text-base")  # type: ignore[attr-defined]
-                with ui.column().classes("gap-0"):  # type: ignore[attr-defined]
-                    # Friendly role label is primary; raw connector id is a small
-                    # secondary line for reference/debugging.
-                    ui.label(row.label or row.name).classes(  # type: ignore[attr-defined]
-                        "text-sm font-medium"
-                    )
-                    ui.label(row.name).classes("text-xs text-gray-400 font-mono")  # type: ignore[attr-defined]
-                ui.space()  # type: ignore[attr-defined]
-                ui.badge(  # type: ignore[attr-defined]
-                    row.state, color=_badge_color.get(row.tone, "grey")
-                ).props("outline")
-            ui.label(row.detail).classes("text-xs text-gray-500 ml-6")  # type: ignore[attr-defined]
-
-        # --- Stream lag (trend) ----------------------------------------------
-        # A pipeline-wide "worst lag over time" line: a snapshot number can't show
-        # whether the stream is catching up or falling behind, which is exactly the
-        # cutover question. Sourced from CloudWatch datapoints already fetched for the
-        # per-table column. Rendered only with >=2 points (a single dot is not a
-        # trend); the per-table "Stream lag" column carries the current detail.
-        _lag_option = build_lag_chart_option(lag_series or [])
-        if _lag_option is not None:
-            ui.separator().classes("my-1")  # type: ignore[attr-defined]
-            ui.label("Stream lag").classes(  # type: ignore[attr-defined]
-                "text-xs font-semibold text-gray-500 uppercase tracking-wide"
-            )
-            ui.label(  # type: ignore[attr-defined]
-                "Worst end-to-end lag across tables over ~15 min (1-minute "
-                "resolution). Flat near zero = caught up (safe to cut over); a rising "
-                "line means the pipeline is falling behind."
-            ).classes("text-xs text-gray-500")
-            ui.echart(_lag_option).classes("w-full").style("height: 200px")  # type: ignore[attr-defined]
+                ui.icon(icon, color=icon_color).classes("text-sm shrink-0")  # type: ignore[attr-defined]
+                ui.label(row.label or row.name).classes(  # type: ignore[attr-defined]
+                    "text-sm text-gray-800 shrink-0"
+                ).tooltip(row.name)
+                ui.label(row.detail or row.state).classes(  # type: ignore[attr-defined]
+                    "text-xs text-gray-500 truncate"
+                )
 
         # --- Change flow ------------------------------------------------------
         if activity is not None:
@@ -3430,10 +3456,34 @@ def _render_change_flow_status(ui, activity: "CdcActivitySummary") -> None:
         else:
             ui.icon("help_outline", color="grey").classes("text-base")  # type: ignore[attr-defined]
             ui.label("Activity unknown").classes("text-sm text-gray-500")  # type: ignore[attr-defined]
-    ui.label(  # type: ignore[attr-defined]
-        f"source poll: {_fmt(activity.source_poll_rate)} · "
-        f"sink send: {_fmt(activity.sink_send_rate)}  (CloudWatch, ~last few min)"
-    ).classes("text-xs text-gray-500 ml-6")
+    # Visual rate gauges: source poll vs sink send on the SAME scale, so at a glance
+    # you can see whether the sink is keeping up with the source (matched bars) or
+    # falling behind (shorter sink bar). Unknown rates show "unknown" with no bar.
+    sp, ss = activity.source_poll_rate, activity.sink_send_rate
+    scale = max([r for r in (sp, ss) if r is not None] or [0.0])
+
+    def _rate_bar(label: str, rate: "Optional[float]") -> None:
+        with ui.row().classes("items-center gap-2 no-wrap w-full ml-6"):  # type: ignore[attr-defined]
+            ui.label(label).classes(  # type: ignore[attr-defined]
+                "text-xs text-gray-600 shrink-0"
+            ).style("width: 76px")
+            with ui.element("div").classes(  # type: ignore[attr-defined]
+                "relative h-2 rounded bg-gray-200 flex-1 min-w-0"
+            ):
+                if rate is not None and scale > 0:
+                    pct = max(3.0, min(100.0, rate / scale * 100.0))
+                    ui.element("div").classes(  # type: ignore[attr-defined]
+                        "absolute inset-y-0 left-0 rounded bg-sky-500"
+                    ).style(f"width: {pct:.1f}%")
+            ui.label(_fmt(rate)).classes(  # type: ignore[attr-defined]
+                "text-xs font-mono text-gray-700 text-right shrink-0"
+            ).style("width: 72px")
+
+    _rate_bar("Source poll", sp)
+    _rate_bar("Sink send", ss)
+    ui.label("CloudWatch, ~last few min").classes(  # type: ignore[attr-defined]
+        "text-xs text-gray-400 ml-6"
+    )
 
 # Health level (assess_dlq_health) -> notice tone + status badge (label, quasar
 # color) for the DLQ panel, so the panel speaks the same severity language as the

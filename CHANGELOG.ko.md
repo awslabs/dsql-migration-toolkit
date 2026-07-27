@@ -5,6 +5,24 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.124
+
+### Changed
+
+- **Stream lag 차트가 라이브 in-place 시계열**이 되었습니다(기존엔 5초 폴링마다 통째로 다시
+  그려져 깜빡였음). 차트 요소를 유지하고 제자리에서 갱신하므로 CloudWatch 그래프처럼 라인이
+  끊김 없이 연장됩니다. **x=시간축, y=lag(ms)**. 데이터는 하이브리드 롤링 시계열 — CloudWatch
+  1분 history로 시드(리로드에도 유지) 후 매 ~5초 폴링의 현재 최대 lag으로 연장(따라잡으면 0),
+  ~15분으로 bounded. Live status 상단의 전용 "Stream lag" 패널로 이동.
+- **Change flow(source poll / sink send)를 비주얼화** — 평문 대신 **동일 스케일의 막대 게이지
+  2개**로 표시해, sink가 source를 따라잡는지(막대 일치)/뒤처지는지 한눈에 보입니다.
+- **Full Load·CDC 통계 테이블의 상태 배지 통일** — 둘 다 동일한 **아웃라인 칩 + title-case**
+  라벨로. (Full Load "Status" 배지는 솔리드·대문자였는데, CDC 테이블의 아웃라인 스타일 및
+  디자인 시스템 규칙에 맞춤.)
+- **Live status의 "Connectors" 목록을 미니멀하게** — 커넥터당 한 줄(상태 아이콘 + 역할 이름
+  + 흐린 detail; raw 커넥터 id는 hover 툴팁으로 이동)로, 기존의 2줄(id + 아웃라인 배지)
+  표기를 대체.
+
 ## v0.1.123
 
 ### Added

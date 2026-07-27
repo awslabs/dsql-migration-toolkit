@@ -5,6 +5,29 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.124
+
+### Changed
+
+- **The Stream lag chart is now a live, in-place time series** (previously it was
+  redrawn from scratch on every 5s poll, which flickered). The chart element persists
+  and updates in place, so the line extends continuously like a CloudWatch graph. X is
+  a **time** axis; Y is lag in **milliseconds**. Its data is a hybrid rolling series —
+  seeded from CloudWatch's 1-minute history (so it survives a page reload) then
+  extended each ~5s poll with the current worst-across-tables lag (caught-up shown as
+  0), bounded to ~15 min. It moved to its own persistent "Stream lag" panel at the top
+  of Live status.
+- **Change flow (source poll / sink send) is now visual** — two labelled bar gauges on
+  a shared scale instead of a plain text line, so you can see at a glance whether the
+  sink is keeping up with the source (matched bars) or falling behind.
+- **Status badges are unified across the Full Load and CDC statistics tables** — both
+  now use the same outline chip with title-case labels. (The Full Load "Status" badge
+  was a solid, uppercase chip; it now matches the CDC table's outline style and the
+  design system's status-chip convention.)
+- **The Live-status "Connectors" list is now minimal** — one compact line per
+  connector (status icon + role name + a muted detail; the raw connector id moved to
+  a hover tooltip), replacing the previous two-line id + outline-badge treatment.
+
 ## v0.1.123
 
 ### Added

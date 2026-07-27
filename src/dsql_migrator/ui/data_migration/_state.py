@@ -177,11 +177,11 @@ class DataMigrationState:
         # empty/absent when the metric is unavailable (older plugin) or the table is
         # idle/caught up.
         self.cdc_replication_lag_by_table: dict[str, int] = {}
-        # Pipeline-wide replication-lag TIME SERIES for the "Stream lag over time"
-        # trend chart: [(epoch_seconds, max_lag_ms), ...] -- max lag across tables per
-        # 1-minute bucket over the trailing ~15 min. Re-fetched wholesale each poll
-        # from CloudWatch (survives reload; no client-side history buffer); empty when
-        # the metric is unavailable or the stream is caught up across the window.
+        # Rolling replication-lag series backing the live "Stream lag" chart:
+        # [(epoch_seconds, max_lag_ms), ...], bounded to ~15 min. Hybrid — seeded once
+        # from CloudWatch's 1-minute history (survives a reload) then extended by each
+        # ~5s poll's current worst-across-tables lag, so the line updates continuously.
+        # Maintained by record_cdc_lag_sample; empty when the metric is unavailable.
         self.cdc_replication_lag_series: list[tuple[int, int]] = []
         # CDC lifecycle actions (Deploy infra / Start / Stop / Delete) -- each runs
         # as a JobManager CloudFormation job; only one runs at a time, so a single
@@ -544,21 +544,45 @@ class DataMigrationState:
                 str(k): int(v) for k, v in dict(lag_ms or {}).items()
             }
 
-    def set_cdc_replication_lag_series(
-        self, series: "Sequence[tuple[int, int]]"
+    def record_cdc_lag_sample(
+        self,
+        *,
+        current_ms: "Optional[int]",
+        now_epoch: int,
+        seed_series: "Optional[Sequence[tuple[int, int]]]" = None,
+        window_seconds: int = 900,
+        max_points: int = 400,
     ) -> None:
-        """Record the pipeline-wide replication-lag time series for the trend chart.
+        """Append one live replication-lag sample to the rolling series that backs the
+        live "Stream lag" chart (hybrid strategy):
 
-        ``[(epoch_seconds, max_lag_ms), ...]`` (max lag across tables per 1-minute
-        bucket over the trailing ~15 min), read from CloudWatch each poll and
-        re-fetched wholesale -- so the chart survives a page reload and needs no
-        client-side history buffer. Replaces the prior series (empty when the metric
-        is unavailable or the stream is caught up across the whole window).
+        * on the FIRST sample (empty buffer, e.g. a fresh load or a page reload) the
+          buffer is SEEDED from the CloudWatch 1-minute history (``seed_series``), so
+          the chart shows immediate history and survives a reload;
+        * every ~5s poll then APPENDS the current worst-across-tables lag
+          (``current_ms``) at ``now_epoch`` so the line extends continuously (denser
+          than CloudWatch's 1-minute cadence);
+        * the buffer is trimmed to the last ``window_seconds`` and hard-capped at
+          ``max_points`` so it stays bounded regardless of how long CDC runs.
+
+        ``current_ms`` is the current max lag in ms, ``0`` when caught up, or ``None``
+        to skip appending (metric unavailable / nothing to plot yet).
         """
         with self._lock:
-            self.cdc_replication_lag_series = [
-                (int(ts), int(v)) for ts, v in (series or [])
-            ]
+            buf = list(self.cdc_replication_lag_series)
+            if not buf and seed_series:
+                buf = [(int(t), int(v)) for t, v in seed_series]
+            if current_ms is not None:
+                e = int(now_epoch)
+                if buf and buf[-1][0] == e:
+                    buf[-1] = (e, int(current_ms))  # coalesce same-second samples
+                else:
+                    buf.append((e, int(current_ms)))
+            cutoff = int(now_epoch) - int(window_seconds)
+            buf = [(t, v) for t, v in buf if t >= cutoff]
+            if len(buf) > max_points:
+                buf = buf[-max_points:]
+            self.cdc_replication_lag_series = buf
 
     def set_cdc_connector_running_names(self, names: Sequence[str]) -> None:
         """Record which of my connectors are RUNNING (vs still provisioning)."""

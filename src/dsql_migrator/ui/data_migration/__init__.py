@@ -614,7 +614,10 @@ def build_data_migration_screen(
                 ui.label("Data Migration status:").classes(
                     "text-sm text-gray-500"
                 )
-                ui.badge(status.value).props(f"color={_STATUS_COLORS[status]}")
+                # Outline chip to match the CDC table's status badges (Full Load /
+                # Consistency / DLQ are all outline) — one consistent status-chip style
+                # across both stats tables, per the design system.
+                ui.badge(status.value).props(f"color={_STATUS_COLORS[status]} outline")
 
             if inventory is None:
                 render_notice(

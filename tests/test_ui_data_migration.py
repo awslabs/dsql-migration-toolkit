@@ -2015,31 +2015,36 @@ def test_fetch_cdc_status_reads_replication_lag_when_controller_exposes_reader()
     assert state.cdc_replication_lag_by_table == {"orders": 8500, "customers": 200}
 
 
-def test_fetch_cdc_status_reads_lag_series_and_stores_it() -> None:
-    # _fetch reads the pipeline-wide lag TIME SERIES (for the trend chart) and _apply
-    # stores it on state; the render reads state.cdc_replication_lag_series.
+def test_fetch_cdc_status_records_lag_sample() -> None:
+    # _fetch reads the per-table lag + the CloudWatch series; _apply APPENDS one live
+    # sample to the rolling buffer (current worst-across-tables lag = the latest point).
     from dsql_migrator.core.cdc import ConnectorState, ConnectorStatus
     from dsql_migrator.core.msk_connect_controller import ConnectorHealth
     from dsql_migrator.ui.data_migration import _apply_cdc_status, _fetch_cdc_status
 
-    class _CtrlWithSeries(_FakeCdcController):
+    class _CtrlWithLag(_FakeCdcController):
+        def replication_lag_by_table(self, stack, tables, **_kw):
+            return {"orders": 8000, "customers": 3000}
+
         def replication_lag_series(self, stack, tables, **_kw):
-            return [(1000, 8000), (1060, 500)]
+            return [(1000, 5000)]  # ancient seed → trimmed; the live append survives
 
     state = DataMigrationState()
     state.set_cdc_stack_name("mysql-dsql-cdc-seoul-test")
     state.set_cdc_controller(
-        _CtrlWithSeries(
+        _CtrlWithLag(
             statuses=[ConnectorStatus(name="sink", state=ConnectorState.RUNNING)],
             health={"sink": ConnectorHealth(running_tasks=1, errored_tasks=0)},
         )
     )
     state.set_cdc_connector_names(["sink"])
 
-    fetched = _fetch_cdc_status(state, ["orders"])
+    fetched = _fetch_cdc_status(state, ["orders", "customers"])
     assert fetched is not None
     _apply_cdc_status(state, fetched)
-    assert state.cdc_replication_lag_series == [(1000, 8000), (1060, 500)]
+    # The current MAX lag across tables (8000) is appended as the latest live sample.
+    assert state.cdc_replication_lag_series
+    assert state.cdc_replication_lag_series[-1][1] == 8000
 
 
 def test_build_lag_chart_option_line_and_none() -> None:
@@ -2049,11 +2054,44 @@ def test_build_lag_chart_option_line_and_none() -> None:
     assert build_lag_chart_option([(1000, 500)]) is None  # 1 point is not a trend
     opt = build_lag_chart_option([(1000, 500), (1060, 12000), (1120, 0)])
     assert opt["series"][0]["type"] == "line"
-    assert opt["series"][0]["data"] == [0.5, 12.0, 0.0]  # ms -> seconds behind
-    assert len(opt["xAxis"]["data"]) == 3  # one HH:MM bucket label per point
+    assert opt["xAxis"]["type"] == "time"  # CloudWatch-style time axis
+    assert "ms" in opt["yAxis"]["name"]  # y = lag in ms
+    # data is [[epoch_ms, lag_ms], ...] (ECharts time axis wants epoch milliseconds).
+    assert opt["series"][0]["data"] == [[1000000, 500], [1060000, 12000], [1120000, 0]]
     # Unordered input is sorted by time before plotting.
-    opt2 = build_lag_chart_option([(1120, 0), (1000, 500), (1060, 12000)])
-    assert opt2["series"][0]["data"] == [0.5, 12.0, 0.0]
+    opt2 = build_lag_chart_option([(1120, 0), (1000, 500)])
+    assert opt2["series"][0]["data"][0][0] == 1000000
+
+
+def test_record_cdc_lag_sample_seeds_appends_and_trims() -> None:
+    # The rolling buffer behind the live chart: seed once from CloudWatch history,
+    # append each poll's current lag, coalesce same-second samples, stay bounded.
+    state = DataMigrationState()
+    now = 1_000_000
+    # First sample (empty buffer) → seed from history THEN append the live point.
+    state.record_cdc_lag_sample(
+        current_ms=500, now_epoch=now, seed_series=[(now - 120, 8000), (now - 60, 3000)]
+    )
+    assert state.cdc_replication_lag_series == [
+        (now - 120, 8000),
+        (now - 60, 3000),
+        (now, 500),
+    ]
+    # Next poll: no re-seed (buffer non-empty), just append.
+    state.record_cdc_lag_sample(current_ms=200, now_epoch=now + 5, seed_series=[(0, 9)])
+    assert state.cdc_replication_lag_series[-1] == (now + 5, 200)
+    assert (now - 120, 8000) in state.cdc_replication_lag_series  # still within window
+    # Same-second sample coalesces (no duplicate epoch).
+    state.record_cdc_lag_sample(current_ms=222, now_epoch=now + 5)
+    assert state.cdc_replication_lag_series[-1] == (now + 5, 222)
+    assert sum(1 for t, _ in state.cdc_replication_lag_series if t == now + 5) == 1
+    # A far-future poll trims everything older than the window.
+    state.record_cdc_lag_sample(current_ms=0, now_epoch=now + 10_000, window_seconds=900)
+    assert all(t >= now + 10_000 - 900 for t, _ in state.cdc_replication_lag_series)
+    # current_ms=None → skip (nothing appended).
+    before = list(state.cdc_replication_lag_series)
+    state.record_cdc_lag_sample(current_ms=None, now_epoch=now + 10_005)
+    assert state.cdc_replication_lag_series == before
 
 
 def test_fetch_cdc_status_skips_net_rows_without_tables() -> None:
@@ -5416,92 +5454,6 @@ def _cdc_view_with_dlq(depth: int):
     by_table = {"orders": depth} if depth else {}
     summary = ErrorLogSummary(total_errors=depth, errors_by_table=by_table)
     return build_cdc_status_view([], summary, dlq_depth=depth)
-
-
-class _EchartUi:
-    """NiceGUI double that records label text and every ui.echart(option) call, and
-    is context-safe for card/row/column. Enough to assert the pipeline-health card's
-    Stream-lag chart is (or is not) rendered."""
-
-    def __init__(self) -> None:
-        self.texts: list[str] = []
-        self.echarts: list = []
-
-    class _El:
-        def classes(self, *_a, **_k):
-            return self
-
-        def props(self, *_a, **_k):
-            return self
-
-        def style(self, *_a, **_k):
-            return self
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    def _rec(self, text):
-        if text is not None:
-            self.texts.append(str(text))
-        return self._El()
-
-    def card(self, *_a, **_k):
-        return self._El()
-
-    def row(self, *_a, **_k):
-        return self._El()
-
-    def column(self, *_a, **_k):
-        return self._El()
-
-    def icon(self, *_a, **_k):
-        return self._El()
-
-    def space(self, *_a, **_k):
-        return self._El()
-
-    def separator(self, *_a, **_k):
-        return self._El()
-
-    def badge(self, text="", *_a, **_k):
-        return self._rec(text)
-
-    def label(self, text="", *_a, **_k):
-        return self._rec(text)
-
-    def echart(self, option, *_a, **_k):
-        self.echarts.append(option)
-        return self._El()
-
-
-def test_render_cdc_pipeline_health_lag_chart_shown_only_with_series() -> None:
-    from dsql_migrator.core.cdc import (
-        ConnectorState,
-        ConnectorStatus,
-        build_cdc_status_view,
-    )
-    from dsql_migrator.core.models import ErrorLogSummary
-    from dsql_migrator.ui.data_migration import _render_cdc_pipeline_health
-
-    view = build_cdc_status_view(
-        [ConnectorStatus(name="sink", state=ConnectorState.RUNNING)],
-        ErrorLogSummary(total_errors=0, errors_by_table={}),
-        dlq_depth=0,
-    )
-    # >=2 points → a line chart is rendered under a "Stream lag" sub-group.
-    ui = _EchartUi()
-    _render_cdc_pipeline_health(ui, view, None, lag_series=[(1000, 8000), (1060, 500)])
-    assert len(ui.echarts) == 1
-    assert ui.echarts[0]["series"][0]["type"] == "line"
-    assert any("Stream lag" in t for t in ui.texts)
-    # No / insufficient series → no chart (nothing to plot), no Stream-lag group.
-    ui2 = _EchartUi()
-    _render_cdc_pipeline_health(ui2, view, None, lag_series=[])
-    assert ui2.echarts == []
-    assert not any("Stream lag" in t for t in ui2.texts)
 
 
 class _JobJM:

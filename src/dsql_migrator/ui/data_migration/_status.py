@@ -814,11 +814,23 @@ def _apply_cdc_status(migration_state, fetched) -> None:
     lag_setter = getattr(migration_state, "set_cdc_replication_lag_by_table", None)
     if callable(lag_setter):
         lag_setter(lag_ms or {})
-    # Store the pipeline-wide lag time series for the trend chart (re-fetched each
-    # poll; no client-side history buffer). Empty when the metric is unavailable.
-    series_setter = getattr(migration_state, "set_cdc_replication_lag_series", None)
-    if callable(series_setter):
-        series_setter(lag_series or [])
+    # Append one live sample to the rolling lag series behind the live chart (hybrid:
+    # seeded from the CloudWatch 1-min history, then extended each poll). current_ms =
+    # current worst-across-tables lag; 0 when caught up (metric emits but no recent
+    # datapoint); None when the metric is unavailable entirely (don't plot a fake 0).
+    recorder = getattr(migration_state, "record_cdc_lag_sample", None)
+    if callable(recorder):
+        if lag_ms:
+            current_ms = max(int(v) for v in lag_ms.values())
+        elif lag_series or getattr(migration_state, "cdc_replication_lag_series", None):
+            current_ms = 0
+        else:
+            current_ms = None
+        recorder(
+            current_ms=current_ms,
+            now_epoch=int(datetime.now(timezone.utc).timestamp()),
+            seed_series=lag_series or [],
+        )
     adjusted = []
     for status in statuses:
         h = health.get(status.name)
