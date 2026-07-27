@@ -5,6 +5,14 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.133
+
+### Changed
+
+- **Inserts / Updates / Deletes cells are now just the coloured count** — the leading
+  glyphs (＋ / ✎ / − ) are removed; the column header + green/blue/red colour already
+  identify the op. Their header ⓘ tooltips are trimmed to a single plain sentence.
+
 ## v0.1.132
 
 ### Changed

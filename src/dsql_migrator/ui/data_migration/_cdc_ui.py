@@ -3093,27 +3093,25 @@ def _render_migration_table_status(
                 </q-td>
                 """,
             )
-            # DMS-style per-op counters, one column each: cumulative inserts (green
-            # add) / updates (sky edit) / deletes (red remove) CDC has applied. Each
-            # cell shows the running count with the op's colour + glyph, or "—" when
-            # the metrics aren't available yet (older plugin / sink not emitting).
-            def _op_cell(name: str, colour: str, icon: str) -> None:
+            # DMS-style per-op counters, one column each: cumulative inserts (green) /
+            # updates (sky) / deletes (red) CDC has applied. Just the running count in
+            # the op's colour (no leading glyph), or "—" when the metrics aren't
+            # available yet (older plugin / sink not emitting).
+            def _op_cell(name: str, colour: str) -> None:
                 table.add_slot(
                     f"body-cell-{name}",
                     r"""
                     <q-td :props="props" class="text-right">
-                      <span v-if="props.row.has_ops" class="%s inline-flex items-center no-wrap justify-end">
-                        <q-icon name="%s" size="14px" class="q-mr-xs" /> {{ props.value }}
-                      </span>
+                      <span v-if="props.row.has_ops" class="%s">{{ props.value }}</span>
                       <span v-else>—</span>
                     </q-td>
                     """
-                    % (colour, icon),
+                    % colour,
                 )
 
-            _op_cell("ins", "text-green-700", "add")
-            _op_cell("upd", "text-sky-700", "edit")
-            _op_cell("del", "text-red-700", "remove")
+            _op_cell("ins", "text-green-700")
+            _op_cell("upd", "text-sky-700")
+            _op_cell("del", "text-red-700")
             # Color the consistency verdict (green=consistent, red=quarantined,
             # amber=behind/ahead, grey=unknown) so a problem is obvious at a glance.
             table.add_slot(
@@ -3146,24 +3144,9 @@ def _render_migration_table_status(
                     """,
                 )
 
-            _hdr_info(
-                "ins",
-                "Cumulative INSERTs CDC has applied since it started streaming "
-                "(running total, live from the sink, scan-free). “—” = the metrics "
-                "aren't available yet.",
-            )
-            _hdr_info(
-                "upd",
-                "Cumulative UPDATEs CDC has applied since it started streaming "
-                "(running total, live from the sink, scan-free). “—” = the metrics "
-                "aren't available yet.",
-            )
-            _hdr_info(
-                "del",
-                "Cumulative DELETEs CDC has applied since it started streaming "
-                "(running total, live from the sink, scan-free). “—” = the metrics "
-                "aren't available yet.",
-            )
+            _hdr_info("ins", "Cumulative inserts CDC has applied since it started streaming.")
+            _hdr_info("upd", "Cumulative updates CDC has applied since it started streaming.")
+            _hdr_info("del", "Cumulative deletes CDC has applied since it started streaming.")
             _hdr_info(
                 "stream",
                 "How far behind the target is, in time — the age of the newest "
@@ -3313,9 +3296,8 @@ def _render_migration_table_status(
                 ui,
                 "Inserts / Updates / Deletes",
                 "Cumulative row changes CDC has applied since it started streaming — "
-                "green add = inserts, blue edit = updates, red remove = deletes "
-                "(running totals, live from the sink, scan-free). “—” = the metrics "
-                "aren't available yet.",
+                "green = inserts, blue = updates, red = deletes (running totals, live "
+                "from the sink, scan-free). “—” = the metrics aren't available yet.",
             )
             definition_row(
                 ui,
