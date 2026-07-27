@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.126
+
+### Changed
+
+- **CDC Live-status polish (readability + less noise):**
+  - **Change flow** rate gauges no longer overflow the Pipeline health card (fixed-
+    width bars + inner padding), and the rates are labelled **`rec/s`** (change-event
+    records per second — `SourceRecordPollRate` / `SinkRecordSendRate`) instead of a
+    bare `/s`.
+  - **Connectors** show a colour-coded state **badge** (green "Running", etc.) again
+    for at-a-glance health, kept on the compact one-line-per-connector layout.
+  - **"CDC behavior & limits"** reference section is **collapsed by default** — it is
+    info-only and long, so it no longer adds noise on every visit.
+  - The **"Runs on the … cdc-stack"** orientation banner shows **only before the
+    cdc-stack is deployed**; once it exists (or the phase is still resolving) it is
+    hidden, so it doesn't repeat on every visit or flash on a reconnect.
+
 ## v0.1.125
 
 ### Fixed

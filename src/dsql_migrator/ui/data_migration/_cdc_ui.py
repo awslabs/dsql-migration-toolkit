@@ -264,8 +264,11 @@ def _render_cdc_step(
     step, so there is no separate cutover panel.
     ``run_checks`` is accepted for signature parity; the prerequisites step owns it.
     """
-    # 1. Where CDC runs (orientation banner).
-    _render_cdc_runs_on_banner(ui)
+    # 1. Where CDC runs (orientation banner) -- only BEFORE the cdc-stack is
+    #    deployed; once it exists the flow is self-evident, so hide it to cut noise.
+    _render_cdc_runs_on_banner(
+        ui, phase=getattr(migration_state, "cdc_stack_phase", None)
+    )
 
     # 2. DECIDE: the CDC start point (Automatic/Manual). This is the central
     #    decision, so it comes first -- the source/sink connector config it
@@ -912,8 +915,16 @@ def _render_cdc_manual_inputs(
         if locked:
             apply_btn.props("disable")
 
-def _render_cdc_runs_on_banner(ui) -> None:
-    """Orientation banner: where CDC runs (source -> MSK -> DSQL sink)."""
+def _render_cdc_runs_on_banner(ui, phase=None) -> None:
+    """Orientation banner: where CDC runs (source -> MSK -> DSQL sink).
+
+    Shown only BEFORE the cdc-stack is deployed (phase ``"absent"``); once it exists
+    the architecture is self-evident, so the banner is hidden to reduce noise. Also
+    hidden for an unknown (``None``) phase, so it never flashes on a reconnect to an
+    already-running pipeline (before the phase probe resolves).
+    """
+    if phase != "absent":
+        return
     with ui.row().classes(  # type: ignore[attr-defined]
         "w-full items-start gap-2 p-3 rounded-lg border border-blue-200 "
         "bg-blue-50 no-wrap"
@@ -3402,10 +3413,12 @@ def _render_cdc_pipeline_health(
             ui.label(  # type: ignore[attr-defined]
                 f"Caught up to {status_view.caught_up_to.isoformat()}"
             ).classes("text-xs text-gray-500")
-        # Minimal one-line-per-connector: a status icon (colour = health) + the
-        # friendly role label (raw connector id in a hover tooltip) + a muted detail.
-        # A compact, Cloudscape-style status list -- drops the previous id sub-line and
-        # the outline state badge (the icon colour + detail already convey the state).
+        # Compact one-line-per-connector: status icon + friendly role label (raw
+        # connector id in a hover tooltip) + a colour-coded state BADGE (green
+        # "Running", etc.) for at-a-glance health + a muted detail. Keeps the minimal
+        # list but restores the visible state badge (plain "streaming normally" text
+        # read as too subtle); outline + title-case to match the other status chips.
+        _badge_color = {"ok": "positive", "warn": "warning", "bad": "negative"}
         for row in rows:
             _border, _bg, icon_color, icon = _CDC_TONE_STYLE.get(
                 row.tone, _CDC_TONE_STYLE["warn"]
@@ -3415,7 +3428,11 @@ def _render_cdc_pipeline_health(
                 ui.label(row.label or row.name).classes(  # type: ignore[attr-defined]
                     "text-sm text-gray-800 shrink-0"
                 ).tooltip(row.name)
-                ui.label(row.detail or row.state).classes(  # type: ignore[attr-defined]
+                if row.state:
+                    ui.badge(  # type: ignore[attr-defined]
+                        row.state.title(), color=_badge_color.get(row.tone, "grey")
+                    ).props("outline")
+                ui.label(row.detail).classes(  # type: ignore[attr-defined]
                     "text-xs text-gray-500 truncate"
                 )
 
@@ -3440,7 +3457,9 @@ def _render_change_flow_status(ui, activity: "CdcActivitySummary") -> None:
     as such, never as 0/idle.
     """
     def _fmt(rate: "Optional[float]") -> str:
-        return f"{rate:.2f}/s" if rate is not None else "unknown"
+        # Unit = change-event RECORDS per second (SourceRecordPollRate /
+        # SinkRecordSendRate); spell "rec/s" so a bare "/s" is not ambiguous.
+        return f"{rate:.2f} rec/s" if rate is not None else "unknown"
 
     with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
         if activity.idle is True:
@@ -3463,12 +3482,19 @@ def _render_change_flow_status(ui, activity: "CdcActivitySummary") -> None:
     scale = max([r for r in (sp, ss) if r is not None] or [0.0])
 
     def _rate_bar(label: str, rate: "Optional[float]") -> None:
-        with ui.row().classes("items-center gap-2 no-wrap w-full ml-6"):  # type: ignore[attr-defined]
+        # Compact fixed-width row: label + a FIXED-width bar (not flex-1, so it never
+        # stretches to the card edge) + the value right after it. Indent with pl-6
+        # (padding, inside the width) NOT ml-6 (margin, which added to a w-full row
+        # pushed the trailing value outside the Pipeline health card). No w-full → the
+        # row sizes to its content and stays within the card.
+        with ui.row().classes("items-center gap-2 no-wrap pl-6"):  # type: ignore[attr-defined]
             ui.label(label).classes(  # type: ignore[attr-defined]
                 "text-xs text-gray-600 shrink-0"
             ).style("width: 76px")
-            with ui.element("div").classes(  # type: ignore[attr-defined]
-                "relative h-2 rounded bg-gray-200 flex-1 min-w-0"
+            with (
+                ui.element("div")  # type: ignore[attr-defined]
+                .classes("relative h-2 rounded bg-gray-200 shrink-0")
+                .style("width: 140px")
             ):
                 if rate is not None and scale > 0:
                     pct = max(3.0, min(100.0, rate / scale * 100.0))
@@ -3476,8 +3502,8 @@ def _render_change_flow_status(ui, activity: "CdcActivitySummary") -> None:
                         "absolute inset-y-0 left-0 rounded bg-sky-500"
                     ).style(f"width: {pct:.1f}%")
             ui.label(_fmt(rate)).classes(  # type: ignore[attr-defined]
-                "text-xs font-mono text-gray-700 text-right shrink-0"
-            ).style("width: 72px")
+                "text-xs font-mono text-gray-700 shrink-0"
+            )
 
     _rate_bar("Source poll", sp)
     _rate_bar("Sink send", ss)
@@ -3788,18 +3814,21 @@ def _render_cdc_handling_panel(ui) -> None:
                     ui.label(fact.detail).classes("text-xs text-gray-500")  # type: ignore[attr-defined]
 
     with ui.card().classes("w-full"):  # type: ignore[attr-defined]
-        with ui.row().classes("items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
-            ui.icon("info", color="primary").classes("text-xl")  # type: ignore[attr-defined]
-            ui.label("CDC behavior & limits").classes("text-sm font-semibold")  # type: ignore[attr-defined]
-        with ui.column().classes("w-full gap-3 mt-2"):  # type: ignore[attr-defined]
-            if handled:
-                ui.label("Handled automatically").classes(  # type: ignore[attr-defined]
-                    "text-xs font-semibold text-gray-500 uppercase tracking-wide"
-                )
-                _fact_rows(handled, icon="check_circle", color="positive")
-            if limits:
-                ui.separator().classes("my-1")  # type: ignore[attr-defined]
-                ui.label("Limits to watch").classes(  # type: ignore[attr-defined]
-                    "text-xs font-semibold text-gray-500 uppercase tracking-wide"
-                )
-                _fact_rows(limits, icon="warning", color="warning")
+        # Collapsed by DEFAULT: this is reference-only info (no action), and the full
+        # text is long -- showing it expanded on every visit adds noise and can
+        # confuse the operator. They open it when they want the contract details.
+        with ui.expansion("CDC behavior & limits", icon="info").classes(  # type: ignore[attr-defined]
+            "w-full"
+        ):
+            with ui.column().classes("w-full gap-3 mt-1"):  # type: ignore[attr-defined]
+                if handled:
+                    ui.label("Handled automatically").classes(  # type: ignore[attr-defined]
+                        "text-xs font-semibold text-gray-500 uppercase tracking-wide"
+                    )
+                    _fact_rows(handled, icon="check_circle", color="positive")
+                if limits:
+                    ui.separator().classes("my-1")  # type: ignore[attr-defined]
+                    ui.label("Limits to watch").classes(  # type: ignore[attr-defined]
+                        "text-xs font-semibold text-gray-500 uppercase tracking-wide"
+                    )
+                    _fact_rows(limits, icon="warning", color="warning")

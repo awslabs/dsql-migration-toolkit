@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.126
+
+### Changed
+
+- **CDC Live status 폴리시(가독성↑·노이즈↓):**
+  - **Change flow** rate 게이지가 Pipeline health 카드를 벗어나던 문제 수정(고정폭 막대 +
+    안쪽 패딩), rate 단위를 `/s` 대신 **`rec/s`**(초당 변경 이벤트 레코드 —
+    `SourceRecordPollRate` / `SinkRecordSendRate`)로 명시.
+  - **Connectors**에 상태 **색상 배지**(초록 "Running" 등)를 되살려 한눈에 보이게(콤팩트
+    한 줄 레이아웃 유지).
+  - **"CDC behavior & limits"** 참고 섹션을 **기본 접힘**으로 — 정보성·장문이라 매 방문마다
+    노이즈가 되지 않도록.
+  - **"Runs on … cdc-stack"** 오리엔테이션 배너는 **cdc-stack 배포 전에만** 표시(배포됨/미확정
+    시 숨김) — 매 방문 반복·재연결 시 깜빡임 방지.
+
 ## v0.1.125
 
 ### Fixed
