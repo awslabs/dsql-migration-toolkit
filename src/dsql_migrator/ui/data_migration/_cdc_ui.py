@@ -2973,7 +2973,11 @@ def _render_migration_table_status(
                 {"name": "ins", "label": "Inserts", "field": "ins", "align": "right"},
                 {"name": "upd", "label": "Updates", "field": "upd", "align": "right"},
                 {"name": "del", "label": "Deletes", "field": "del", "align": "right"},
-                {"name": "source", "label": "Source rows", "field": "source"},
+                # Header says "(est.)" once: the source figure here is the scan-free
+                # information_schema estimate (an exact COUNT(*) on a large production
+                # source is not run from this view), so the approximation belongs in
+                # the column's name rather than only repeated in every cell.
+                {"name": "source", "label": "Source rows (est.)", "field": "source"},
                 {"name": "target", "label": "Target rows", "field": "target"},
                 {"name": "stream", "label": "Stream lag", "field": "stream"},
                 {"name": "dlq", "label": "Quarantined", "field": "dlq"},
@@ -3009,19 +3013,25 @@ def _render_migration_table_status(
                 return f"{int(secs // 3600)}h {int((secs % 3600) // 60)}m behind"
 
             # User-facing consistency label + the verdict key (drives the badge color).
+            # NB: there is deliberately no "target ahead" verdict. The source figure
+            # here is an ESTIMATE that typically UNDERCOUNTS, so a target exceeding it
+            # is the normal case -- flagging it as an anomaly made most healthy tables
+            # look broken (see MigrationTableStatus.consistency).
             _CONSISTENCY_LABEL = {
                 "consistent": "consistent",
                 "quarantined": "data quarantined",
                 "behind": "replicating…",
                 "gap": "rows missing",
-                "ahead": "target ahead",
                 "unknown": "refresh to check",
             }
             table_rows = []
             for r in rows_model:
+                # The header already says "(est.)" (the normal case), so only the
+                # UNUSUAL case is marked per-cell: an EXACT source count, which is
+                # worth flagging because it makes the row's verdict authoritative.
                 source_label = _fmt(r.source_rows)
-                if r.source_estimate and r.source_rows is not None:
-                    source_label += " (est.)"
+                if not r.source_estimate and r.source_rows is not None:
+                    source_label += " (exact)"
                 # Stream lag: prefer the sink's TIME-based end-to-end lag
                 # (ReplicationLagMs = apply time − source commit time) — accurate and
                 # PK-agnostic. Fall back to the MAX(pk) leading-edge check (caught up /
@@ -3119,14 +3129,14 @@ def _render_migration_table_status(
             _op_cell("ins", "text-green-700")
             _op_cell("upd", "text-sky-700")
             _op_cell("del", "text-red-700")
-            # Color the consistency verdict (green=consistent, red=quarantined,
-            # amber=behind/ahead, grey=unknown) so a problem is obvious at a glance.
+            # Color the consistency verdict (green=consistent, red=quarantined/gap,
+            # amber=behind, grey=unknown) so a problem is obvious at a glance.
             table.add_slot(
                 "body-cell-consistency",
                 r"""
                 <q-td :props="props">
                   <q-badge
-                    :color="{'consistent':'positive','quarantined':'negative','gap':'negative','behind':'warning','ahead':'warning','unknown':'grey'}[props.row.verdict] || 'grey'"
+                    :color="{'consistent':'positive','quarantined':'negative','gap':'negative','behind':'warning','unknown':'grey'}[props.row.verdict] || 'grey'"
                     :label="props.value" outline />
                 </q-td>
                 """,
@@ -3162,12 +3172,25 @@ def _render_migration_table_status(
                 "the time-based metric isn't available yet.",
             )
             _hdr_info(
+                "source",
+                "Approximate row count from the source's information_schema — a "
+                "scan-free ESTIMATE, so this view never runs a COUNT(*) full scan "
+                "against your live source. InnoDB derives it from index sampling, so "
+                "it commonly differs from the true count by several percent (more on "
+                "a large table) and often UNDERCOUNTS — a target that slightly "
+                "exceeds it is normal, not data duplication. For an exact "
+                "source-vs-target comparison, run Validation (step 4).",
+            )
+            _hdr_info(
                 "consistency",
-                "Overall verdict for the table: “consistent” (green) = source and "
-                "target row counts match · “replicating…” (amber) = target still "
-                "catching up · “rows missing” (red) = newest rows landed but some in "
-                "between are missing · “data quarantined” (red) = changes failed and "
-                "were set aside (DLQ). Any non-green = worth investigating.",
+                "Overall verdict for the table: “consistent” (green) = the stream has "
+                "caught up and nothing indicates missing rows · “replicating…” "
+                "(amber) = target still catching up · “rows missing” (red) = newest "
+                "rows landed but some in between are missing · “data quarantined” "
+                "(red) = changes failed and were set aside (DLQ). Because Source rows "
+                "is an estimate, “consistent” means nothing looks wrong rather than a "
+                "proven exact match — Validation (step 4) is the exact check. Any "
+                "non-green = worth investigating.",
             )
             # Keep the per-op Inserts/Updates/Deletes columns (and lag/quarantined)
             # live while CDC streams. Created ONCE (this block only runs on the first
@@ -3309,7 +3332,11 @@ def _render_migration_table_status(
             definition_row(
                 ui,
                 "Source / Target rows",
-                "Source = scan-free estimate · Target = exact count.",
+                "Source = scan-free information_schema ESTIMATE (never a COUNT(*) on "
+                "your live source) · Target = exact count. The estimate comes from "
+                "InnoDB index sampling and often undercounts by a few percent, so a "
+                "target slightly above it is normal — the two numbers are not meant "
+                "to match exactly. Run Validation (step 4) for the exact comparison.",
             )
             definition_row(
                 ui,
@@ -3329,9 +3356,11 @@ def _render_migration_table_status(
                 ui.badge("replicating…").props("color=warning outline")  # type: ignore[attr-defined]
                 ui.badge("rows missing").props("color=negative outline")  # type: ignore[attr-defined]
                 ui.badge("data quarantined").props("color=negative outline")  # type: ignore[attr-defined]
-                ui.label("— any non-green badge means investigate.").classes(  # type: ignore[attr-defined]
-                    "text-xs text-gray-600"
-                )
+                ui.label(  # type: ignore[attr-defined]
+                    "— any non-green badge means investigate. “consistent” means "
+                    "nothing looks wrong (the source count is an estimate, so it is "
+                    "not a proven exact match); Validation (step 4) is the exact check."
+                ).classes("text-xs text-gray-600")
 
 def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
     """Live connector health + DLQ, polled read-only from MSK Connect.

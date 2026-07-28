@@ -113,6 +113,17 @@ def build_full_load_status_view(
     )
 
 
+# Fraction by which a scan-free source ESTIMATE is assumed to be able to differ from
+# the true count before a shortfall is treated as a real problem. The source figures
+# on both the Full Load and CDC status views come from
+# ``information_schema.TABLE_ROWS``, which InnoDB derives from index sampling: it is
+# commonly several percent off (observed ~8.5% on a 3M-row table) in EITHER direction.
+# A generous 20% keeps "rows missing"/"incomplete" for genuine data loss instead of
+# firing on statistics noise; exact counts are compared with no tolerance at all.
+# Exactness is Validation's (step 4) job -- it runs a real COUNT(*) + reconciliation.
+_ESTIMATE_TOLERANCE = 0.20
+
+
 @dataclass(frozen=True)
 class FullLoadTableRow:
     """Live per-table Full Load detail for the progress table.
@@ -150,30 +161,67 @@ class FullLoadTableRow:
     def progress_pct(self) -> Optional[float]:
         """Per-table load progress as a percent, or ``None`` when unknown.
 
-        With a known source count it is ``rows_present / expected`` (capped at
-        100), so rows that already existed on the target (skipped) count as
-        progress; without a count it is 100 for a finished table and ``None``
-        while the table has not finished (the loader reports rows only on
-        completion).
+        A table the loader has FINISHED is 100% by definition: the export streams
+        the table by PK keyset to exhaustion, so ``DONE`` means every source row was
+        read and written -- it does not depend on ``expected_rows`` agreeing. This
+        matters because ``expected_rows`` is the watermark's scan-free
+        ``information_schema`` ESTIMATE, which InnoDB derives from index sampling and
+        can OVERCOUNT: dividing by it would leave a fully-loaded table stuck at e.g.
+        "91%" and imply rows were lost.
+
+        While the table is still loading, the estimate is the only baseline available,
+        so it drives the in-flight percentage (capped at 100 for the progress bar);
+        rows that already existed on the target (skipped) count as progress.
         """
+        if self.state == "DONE":
+            return 100.0
         if self.expected_rows is None or self.expected_rows <= 0:
-            return 100.0 if self.state == "DONE" else None
+            return None
         return min(100.0, round(self.rows_present / self.expected_rows * 100.0, 1))
 
     @property
     def complete(self) -> Optional[bool]:
-        """Whether a finished table now holds every source row.
+        """Whether a finished table loaded everything the source held.
 
-        ``None`` until the table is ``DONE`` or when no source count is known to
-        compare against; otherwise ``True`` iff every source row is present --
-        newly loaded OR already on the target (skipped) -- i.e.
-        ``rows_loaded + rows_skipped >= expected_rows``. Using rows-present (not
-        just newly inserted) avoids a false mismatch for a table whose rows
-        pre-existed on the target (the idempotent load skips them).
+        ``None`` until the table is ``DONE``. Once ``DONE``, the loader ran the
+        table's PK keyset stream to exhaustion, so completeness is established by
+        that fact -- NOT by matching the watermark's ``expected_rows``, which is a
+        scan-free ``information_schema`` ESTIMATE (InnoDB index sampling, routinely
+        several percent off in EITHER direction). Comparing against it used to make
+        a fully-loaded table report incomplete whenever the estimate happened to
+        overcount.
+
+        So this reports ``True`` for a ``DONE`` table unless the shortfall against
+        the estimate is too large to be sampling error, in which case the estimate is
+        worth heeding as a signal that something really did not load. The exact
+        guarantee is Validation (step 4), which runs a real ``COUNT(*)`` and
+        record-level reconciliation.
         """
-        if self.state != "DONE" or self.expected_rows is None:
+        if self.state != "DONE":
             return None
-        return self.rows_present >= self.expected_rows
+        if self.expected_rows is None or self.expected_rows <= 0:
+            return True
+        shortfall = self.expected_rows - self.rows_present
+        if shortfall <= 0:
+            return True
+        return shortfall <= self.expected_rows * _ESTIMATE_TOLERANCE
+
+    @property
+    def expected_exceeded_pct(self) -> Optional[float]:
+        """How far ``rows_present`` EXCEEDS the source estimate, as a percent.
+
+        The progress bar caps at 100%, which hides the (common) case of loading more
+        rows than the scan-free estimate predicted -- a normal undercount, not a
+        problem. Surfacing it lets the UI explain the "target > source" arithmetic a
+        reader sees in the Rows column. ``None`` when there is no estimate or the
+        loaded count did not exceed it.
+        """
+        if self.expected_rows is None or self.expected_rows <= 0:
+            return None
+        excess = self.rows_present - self.expected_rows
+        if excess <= 0:
+            return None
+        return round(excess / self.expected_rows * 100.0, 1)
 
 
 def build_full_load_table_rows(
@@ -336,7 +384,14 @@ class FullLoadCompleteness:
 
 
 def full_load_completeness(rows: Sequence[FullLoadTableRow]) -> FullLoadCompleteness:
-    """Summarize source-vs-loaded completeness across all Full Load tables."""
+    """Summarize source-vs-loaded completeness across all Full Load tables.
+
+    ``mismatched`` lists only tables whose shortfall against the source ESTIMATE is
+    too large to be that estimate's sampling error (see
+    :attr:`FullLoadTableRow.complete`), so a normal few-percent discrepancy no longer
+    reports a finished table as mismatched. ``unknown`` still counts finished tables
+    with no estimate at all to compare against.
+    """
     total = len(rows)
     settled = sum(1 for r in rows if r.state in ("DONE", "FAILED"))
     failed = sum(1 for r in rows if r.state == "FAILED")
@@ -475,54 +530,109 @@ class MigrationTableStatus:
 
     @property
     def delta(self) -> Optional[int]:
-        """Rows the target is behind the source now (``source - target``), or None."""
+        """Rows the target is behind the source now (``source - target``), or None.
+
+        NOTE: when :attr:`source_estimate` is set, ``source_rows`` is a scan-free
+        ``information_schema`` estimate, so this delta carries that estimate's error
+        (percent-level on a large table) and must NOT be read as an exact shortfall.
+        :attr:`counts_comparable` says whether it can be; :attr:`consistency` already
+        accounts for it.
+        """
         if self.source_rows is None or self.target_rows is None:
             return None
         return self.source_rows - self.target_rows
 
     @property
     def in_sync(self) -> Optional[bool]:
-        """True when target == source (caught up); None when either is unknown."""
+        """True when target == source (caught up).
+
+        ``None`` when either count is unknown OR the source figure is an ESTIMATE:
+        an estimate cannot establish equality, so this reports "not determinable"
+        rather than a false negative on statistics noise.
+        """
+        if not self.counts_comparable:
+            return None
         d = self.delta
         return None if d is None else d == 0
+
+    @property
+    def counts_comparable(self) -> bool:
+        """Whether source and target row counts may be compared for EQUALITY.
+
+        Only when the source figure is an EXACT count. The CDC status view's source
+        figure is normally a scan-free ``information_schema`` ESTIMATE (to spare a
+        large production source), and InnoDB derives that from index sampling -- it
+        routinely differs from the truth by several percent, and on a big table by
+        ~10%. Subtracting an exact target ``COUNT(*)`` from an estimate therefore
+        produces a meaningless delta, so no equality-based verdict ("counts match",
+        "target exceeds source") may be drawn from it.
+        """
+        return not self.source_estimate
 
     @property
     def consistency(self) -> str:
         """A plain-language consistency verdict for this table.
 
-        Uses the row-count delta AND the stream high-water (PK) mark, so a stream
-        that is genuinely lagging is told apart from one that has caught up its
-        leading edge but is missing rows in the middle:
+        Combines the DLQ, the stream high-water (PK) / time-based lag signals, and --
+        only when the source count is EXACT -- the row-count delta, so a stream that
+        is genuinely lagging is told apart from one whose leading edge has caught up
+        but is missing rows in the middle:
 
         - ``"quarantined"`` -- DLQ has events that never reached the target (data
           is missing); this wins over everything else.
-        - ``"consistent"`` -- target row count equals source.
-        - ``"behind"`` -- counts differ AND the stream high-water PK trails the
-          source (newest source rows not yet applied -- CDC is catching up).
-        - ``"gap"`` -- counts differ but the stream high-water PK has caught up
-          (latest rows landed, yet rows are missing mid-stream -- a real gap to
-          investigate, not mere lag).
-        - ``"ahead"`` -- target exceeds source (unusual).
-        - ``"unknown"`` -- counts not yet fetched.
+        - ``"consistent"`` -- the stream's leading edge has caught up and nothing
+          indicates missing rows. With an EXACT source count this means the counts
+          are equal; with an ESTIMATE it means the lag signals are clean and the
+          counts agree within the estimate's tolerance (an estimate cannot prove
+          equality, so this is the honest reading of "nothing looks wrong").
+        - ``"behind"`` -- the stream is still catching up (its high-water PK trails
+          the source, or counts show the target short with no PK signal).
+        - ``"gap"`` -- the leading edge HAS caught up, yet rows are missing
+          mid-stream -- a real gap to investigate, not mere lag.
+        - ``"unknown"`` -- nothing to judge on yet (no counts and no lag signal).
+
+        Crucially, a source ESTIMATE never produces ``"gap"`` from a small
+        difference, and never produces the old ``"ahead"`` verdict at all: a target
+        that merely EXCEEDS an estimate is the normal case (the estimate undercounts),
+        not an anomaly, and reporting it as one made most healthy tables look broken.
         """
         if self.dlq_count:
             return "quarantined"
-        d = self.delta
-        if d is None:
-            return "unknown"
-        if d == 0:
-            return "consistent"
-        if d < 0:
-            return "ahead"
-        # Counts differ and target is short. Distinguish lag from a mid-stream gap
-        # via the high-water PK: if the newest source row has NOT landed -> behind;
-        # if it has (or PK comparison unavailable) -> a gap to investigate.
         caught = self.stream_caught_up
-        if caught is False:
+        d = self.delta
+
+        if self.counts_comparable:
+            # Exact source count: the delta is authoritative.
+            if d is None:
+                return "unknown" if caught is None else (
+                    "consistent" if caught else "behind"
+                )
+            if d == 0:
+                return "consistent"
+            if d < 0:
+                # Target exceeds an EXACT source count. Real but not a shortfall --
+                # read it as the stream still settling rather than the alarming
+                # "target ahead" (which fired constantly on estimates).
+                return "behind"
+            if caught is True:
+                return "gap"
             return "behind"
-        if caught is True:
-            return "gap"
-        return "behind"  # PK signal unavailable: default to the lag reading
+
+        # Source figure is an ESTIMATE: it cannot prove equality, so lean on the
+        # lag signals and only treat a LARGE shortfall as a gap.
+        if d is not None and d > 0 and self._exceeds_estimate_tolerance(d):
+            # Materially fewer rows than even a noisy estimate allows for.
+            return "gap" if caught is True else "behind"
+        if caught is None:
+            # No PK/lag signal and no usable count comparison.
+            return "unknown" if d is None else "consistent"
+        return "consistent" if caught else "behind"
+
+    def _exceeds_estimate_tolerance(self, shortfall: int) -> bool:
+        """Whether ``shortfall`` is too large to be source-estimate noise."""
+        if self.source_rows is None or self.source_rows <= 0:
+            return False
+        return shortfall > self.source_rows * _ESTIMATE_TOLERANCE
 
 
 def build_migration_table_status(

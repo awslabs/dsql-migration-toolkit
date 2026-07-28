@@ -2981,14 +2981,26 @@ def _rows_target_source_cell(row: "FullLoadTableRow") -> str:
 
 
 def _rows_breakdown_tooltip(row: "FullLoadTableRow") -> str:
-    """Exact figures + new/already-there split for the Rows cell's hover tooltip."""
+    """Exact figures + new/already-there split for the Rows cell's hover tooltip.
+
+    Also explains the (normal) case of holding MORE rows than the source estimate:
+    the watermark count is scan-free ``information_schema`` sampling and often
+    undercounts, so "target > source" here is an estimate artifact, not duplicated
+    data. Without this the arithmetic looks like a bug.
+    """
     parts = [f"{row.rows_present:,} on target"]
     if row.rows_skipped:
         parts.append(
             f"{row.rows_loaded:,} new + {row.rows_skipped:,} already there"
         )
     if row.expected_rows is not None:
-        parts.append(f"{row.expected_rows:,} source rows (est.)")
+        parts.append(f"{row.expected_rows:,} source rows (estimate)")
+        exceeded = row.expected_exceeded_pct
+        if exceeded is not None:
+            parts.append(
+                f"{exceeded:.1f}% above the estimate — normal (the scan-free "
+                "estimate undercounts); Validation (step 4) counts exactly"
+            )
     return " · ".join(parts)
 
 
@@ -3056,8 +3068,12 @@ def _render_full_load_progress(
         {"name": "table", "label": "Table", "field": "table", "align": "left"},
         {"name": "state", "label": "Status", "field": "state", "align": "left"},
         {
+            # "(est.)" belongs in the header: the source side of this cell is the
+            # watermark's scan-free information_schema estimate, so a reader scanning
+            # the column must not read "3.01M / 2.77M" as the target holding 240k rows
+            # MORE than the source (the estimate simply undercounted).
             "name": "rows",
-            "label": "Rows (target / source)",
+            "label": "Rows (target / source est.)",
             "field": "rows",
             "align": "left",
         },
@@ -3144,6 +3160,29 @@ def _render_full_load_progress(
           <span>{{ props.value }}</span>
           <q-tooltip>{{ props.row.rows_tooltip }}</q-tooltip>
         </q-td>
+        """,
+    )
+    # Header ⓘ on the Rows column (same idiom as the CDC status table): explain that
+    # the source side is an estimate right where the eye is, so "target / source"
+    # arithmetic that looks off is understood without hovering a cell.
+    table.add_slot(
+        "header-cell-rows",
+        r"""
+        <q-th :props="props">
+          {{ props.col.label }}
+          <q-icon name="info" size="14px" class="q-ml-xs text-grey-5"
+            style="cursor:help">
+            <q-tooltip class="text-body2" style="max-width:340px">
+              Rows now on the target vs. the source row count recorded on the export
+              watermark. The source figure is a scan-free information_schema
+              ESTIMATE (InnoDB index sampling), so it is commonly off by a few
+              percent and often UNDERCOUNTS — the target legitimately exceeding it is
+              normal, not duplicated data. A finished table is 100% because the
+              loader streamed it to exhaustion, not because the two numbers match.
+              Validation (step 4) does the exact COUNT(*) comparison.
+            </q-tooltip>
+          </q-icon>
+        </q-th>
         """,
     )
 

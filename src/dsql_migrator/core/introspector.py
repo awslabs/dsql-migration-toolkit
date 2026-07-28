@@ -64,6 +64,151 @@ SOURCE_CONNECT_TIMEOUT_SECONDS = 10
 # for the Full Load keyset stream, which returns a bounded page well within it.
 SOURCE_READ_TIMEOUT_SECONDS = 300
 
+# MySQL client/server error codes that mean "this connection is gone", not "your
+# query was wrong". An Aurora MySQL failover (writer promotion during a patch,
+# instance replacement, or an AZ event) closes every open connection, so a Full
+# Load reading a large table mid-stream sees one of these:
+#   2013 CR_SERVER_LOST            -- lost connection during the query
+#   2006 CR_SERVER_GONE_ERROR      -- server closed the connection before the query
+#   2003 CR_CONN_HOST_ERROR        -- can't connect (endpoint still re-pointing)
+#   2002 CR_CONNECTION_ERROR       -- socket-level connect failure
+#   2055 CR_SERVER_LOST_EXTENDED   -- lost connection, with a system error detail
+#   1053 ER_SERVER_SHUTDOWN        -- server shutting down (promotion in progress)
+#   1077/1079                      -- normal/aborted shutdown in progress
+#   1927 ER_CONNECTION_KILLED      -- the connection was killed (failover fencing)
+# These are all recoverable by RE-READING the table from a fresh connection.
+#   1040 ER_CON_COUNT_ERROR       -- too many connections (see below)
+#   1203 ER_TOO_MANY_USER_CONNECTIONS
+# 1040/1203 are included because they are also SELF-INFLICTED and self-clearing: a
+# failover makes every reader reconnect at once, and a high table x shard fan-out can
+# briefly exceed the source's max_connections. Backing off and re-reading is exactly
+# the right response -- the connections drain as other readers finish.
+MYSQL_TRANSIENT_ERROR_CODES = frozenset(
+    {2013, 2006, 2003, 2002, 2055, 1053, 1077, 1079, 1927, 1040, 1203}
+)
+
+# Lowercase message substrings for the same conditions, as a fallback when the
+# numeric code was lost (SQLAlchemy/PyMySQL wrapping, or a socket timeout raised as
+# a plain OSError). Deliberately NOT generic words like "error" -- each of these is
+# specific to a connection that died, never to a bad query or a data problem.
+MYSQL_TRANSIENT_SIGNATURES = (
+    "lost connection",
+    "server has gone away",
+    "server closed the connection",
+    "connection was killed",
+    "can't connect to mysql server",
+    "broken pipe",
+    "connection reset",
+    "connection aborted",
+    "server shutdown in progress",
+    "too many connections",
+    "read timed out",
+    "timed out",
+)
+
+
+def is_source_transient_error(exc: BaseException) -> bool:
+    """True for a source-MySQL failure that a fresh connection can recover from.
+
+    The Full Load's source read is the one place this matters: an Aurora failover
+    (or any connection drop / stall) kills the in-flight read of a large table.
+    Such a table is NOT broken -- re-reading it from a new connection succeeds -- so
+    it is worth an automatic retry, whereas a genuine data/schema error (a bad type,
+    a missing column) would fail identically forever and must surface immediately.
+
+    Classification, in order: the MySQL error CODE carried by the driver exception
+    (checked first because it is unambiguous), then a socket timeout type, then a
+    message-signature fallback for a wrapped error whose code was lost. Anything
+    unrecognized is treated as NON-transient, so a real error is never retried into
+    a delay loop.
+    """
+    import socket
+
+    # A DBAPI error wrapped by SQLAlchemy keeps the driver exception on .orig.
+    candidates = [exc]
+    orig = getattr(exc, "orig", None)
+    if orig is not None and orig is not exc:
+        candidates.append(orig)
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and cause is not exc:
+        candidates.append(cause)
+
+    for candidate in candidates:
+        # PyMySQL raises OperationalError(code, message) -- the code is args[0].
+        args = getattr(candidate, "args", ()) or ()
+        if args and isinstance(args[0], int) and args[0] in MYSQL_TRANSIENT_ERROR_CODES:
+            return True
+        # A stalled read hits the socket read_timeout (or the OS), which surfaces as
+        # a timeout rather than a MySQL error code.
+        if isinstance(candidate, (socket.timeout, TimeoutError)):
+            return True
+
+    message = str(exc).lower()
+    return any(sig in message for sig in MYSQL_TRANSIENT_SIGNATURES)
+
+
+# Operator-facing explanation for a source connection that dropped mid-load. The
+# raw driver text ("OperationalError: (2013, 'Lost connection to MySQL server
+# during query')") tells the user nothing about what to do, and this case is
+# EXPECTED on Aurora (failover during a multi-hour load), so it gets a concrete
+# next step and an explicit safety reassurance instead.
+SOURCE_CONNECTION_LOST_HINT = (
+    "The source MySQL connection dropped mid-read. On Aurora this is usually a "
+    "failover (writer promotion during patching, an instance replacement, or an AZ "
+    "event) — the database itself is fine. Nothing on the source was changed (the "
+    "load only reads it), and re-running is safe: the load is idempotent and "
+    "resumes by primary key, so it fills only what is missing and never duplicates "
+    "rows."
+)
+
+
+# Codes that specifically mean the SOURCE ran out of connection slots, which needs
+# different advice from a failover: fewer concurrent readers, not "wait and re-run".
+_MYSQL_TOO_MANY_CONNECTIONS_CODES = frozenset({1040, 1203})
+
+SOURCE_TOO_MANY_CONNECTIONS_HINT = (
+    "The source MySQL refused a new connection because it is at its connection "
+    "limit. Full Load opens one source reader per table (times the reader shards "
+    "per table), so a high parallelism can exhaust a small instance's "
+    "max_connections. Lower DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM (and/or "
+    "FULL_LOAD_READER_SHARDS), or raise the source's max_connections, then re-run — "
+    "the load is idempotent and fills only what is missing."
+)
+
+
+def _is_too_many_connections(exc: BaseException) -> bool:
+    """True when ``exc`` is the source refusing a connection for lack of slots."""
+    candidates = [exc]
+    for attr in ("orig", "__cause__"):
+        nested = getattr(exc, attr, None)
+        if nested is not None and nested is not exc:
+            candidates.append(nested)
+    for candidate in candidates:
+        args = getattr(candidate, "args", ()) or ()
+        if (
+            args
+            and isinstance(args[0], int)
+            and args[0] in _MYSQL_TOO_MANY_CONNECTIONS_CODES
+        ):
+            return True
+    return "too many connections" in str(exc).lower()
+
+
+def source_error_hint(exc: BaseException) -> Optional[str]:
+    """Return an actionable operator hint for ``exc``, or ``None`` if there is none.
+
+    Keeps the "what happened / what to do next" phrasing next to the classifier that
+    recognizes the condition, so every surface (per-table error log, activity log,
+    the UI notice) explains a source failure the same way. Connection EXHAUSTION gets
+    its own hint: it is also transient, but waiting is not the fix -- the operator
+    needs to reduce reader concurrency or raise the source's limit.
+    """
+    if _is_too_many_connections(exc):
+        return SOURCE_TOO_MANY_CONNECTIONS_HINT
+    if is_source_transient_error(exc):
+        return SOURCE_CONNECTION_LOST_HINT
+    return None
+
 
 def source_engine_kwargs(
     *, read_timeout_seconds: Optional[int] = None

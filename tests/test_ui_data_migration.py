@@ -3680,11 +3680,80 @@ def test_build_full_load_table_rows_pairs_loaded_with_source_count() -> None:
 
     assert by["orders"].progress_pct == 100.0
     assert by["orders"].complete is True
-    assert by["items"].progress_pct == 80.0
-    assert by["items"].complete is False  # 40 of 50 loaded -> incomplete
+    # A DONE table is 100% because the loader streamed it to exhaustion -- NOT because
+    # rows_present matches the source ESTIMATE (which can over- or undercount).
+    assert by["items"].progress_pct == 100.0
+    # 40 of an ESTIMATED 50 is a 20% shortfall == exactly the sampling tolerance, so
+    # it is not escalated to "incomplete" (Validation does the exact check).
+    assert by["items"].complete is True
     assert by["customers"].complete is None  # not DONE -> unknown
     assert by["customers"].errors == 1
     assert by["customers"].attempts == 2
+
+
+def test_done_table_is_complete_even_when_the_estimate_overcounts() -> None:
+    # The regression this guards: expected_rows is the watermark's scan-free
+    # information_schema ESTIMATE (InnoDB index sampling). When it OVERCOUNTS, a
+    # fully-loaded table used to report e.g. "91%" and complete=False, implying rows
+    # were lost. A DONE table streamed its PK keyset to exhaustion, so it is 100%.
+    from dsql_migrator.ui.data_migration import build_full_load_table_rows
+
+    job = _full_load_job(
+        [{"chunk_id": "orders", "status": "DONE", "rows_loaded": 1_000_000,
+          "attempts": 1}],
+        counts={"orders": 1_100_000},  # estimate 10% ABOVE the truth
+    )
+    (row,) = build_full_load_table_rows(job)
+    assert row.progress_pct == 100.0
+    assert row.complete is True
+
+
+def test_done_table_still_reports_gross_shortfall_as_incomplete() -> None:
+    # The tolerance must not hide real loss: a shortfall far beyond any sampling
+    # error still reports incomplete, so a genuinely truncated load is surfaced.
+    from dsql_migrator.ui.data_migration import (
+        build_full_load_table_rows,
+        full_load_completeness,
+    )
+
+    job = _full_load_job(
+        [{"chunk_id": "orders", "status": "DONE", "rows_loaded": 100, "attempts": 1}],
+        counts={"orders": 1_000_000},  # loaded 0.01% of the table
+    )
+    rows = build_full_load_table_rows(job)
+    assert rows[0].complete is False
+    assert full_load_completeness(rows).mismatched == ["orders"]
+
+
+def test_rows_exceeding_the_estimate_is_surfaced_as_normal() -> None:
+    # Loading MORE rows than the scan-free estimate predicted is the common case
+    # (the estimate undercounts). The progress bar caps at 100%, so the excess is
+    # reported separately and the tooltip explains it is not duplicated data.
+    from dsql_migrator.ui.data_migration import (
+        _rows_breakdown_tooltip,
+        build_full_load_table_rows,
+    )
+
+    job = _full_load_job(
+        [{"chunk_id": "order_items", "status": "DONE", "rows_loaded": 3_010_557,
+          "attempts": 1}],
+        counts={"order_items": 2_774_078},  # the real observed estimate
+    )
+    (row,) = build_full_load_table_rows(job)
+    assert row.complete is True
+    assert row.expected_exceeded_pct == 8.5
+    tip = _rows_breakdown_tooltip(row)
+    assert "source rows (estimate)" in tip
+    assert "8.5% above the estimate" in tip and "normal" in tip
+
+    # No excess -> nothing extra claimed.
+    job2 = _full_load_job(
+        [{"chunk_id": "t", "status": "DONE", "rows_loaded": 100, "attempts": 1}],
+        counts={"t": 100},
+    )
+    (exact,) = build_full_load_table_rows(job2)
+    assert exact.expected_exceeded_pct is None
+    assert "above the estimate" not in _rows_breakdown_tooltip(exact)
 
 
 def test_build_migration_table_status_combines_full_load_and_live_counts() -> None:
@@ -3825,17 +3894,96 @@ def test_migration_table_status_consistency_verdicts() -> None:
     from dsql_migrator.ui.data_migration import build_migration_table_status
 
     def verdict(src, tgt, dlq=None):
+        # An EXACT source count (source_is_estimate=False): the delta is
+        # authoritative, so equality-based verdicts are allowed.
         (r,) = build_migration_table_status(
             ["t"], source_counts={"t": src}, target_counts={"t": tgt},
             dlq_counts={"t": dlq} if dlq else None,
+            source_is_estimate=False,
         )
         return r.consistency
 
     assert verdict(100, 100) == "consistent"
     assert verdict(100, 80) == "behind"      # target trails source (replicating)
-    assert verdict(80, 100) == "ahead"       # unusual: target exceeds source
+    # A target exceeding even an EXACT source count reads as the stream still
+    # settling -- never the old alarming "ahead" verdict, which fired constantly on
+    # estimates (where an undercount makes target > source the NORMAL case).
+    assert verdict(80, 100) == "behind"
     assert verdict(100, None) == "unknown"   # not yet counted
     assert verdict(100, 100, dlq=5) == "quarantined"
+
+
+def test_estimate_source_never_claims_exact_equality_or_target_ahead() -> None:
+    # The CDC status view's source figure is a scan-free information_schema ESTIMATE
+    # (InnoDB index sampling), which routinely UNDERCOUNTS by several percent. It
+    # must never drive an equality verdict: a target slightly above it is the normal
+    # healthy case, not an anomaly. This is the live regression that made 8 of 11
+    # healthy tables show a red/amber "target ahead" badge.
+    from dsql_migrator.ui.data_migration import build_migration_table_status
+
+    def row(src, tgt, **kw):
+        (r,) = build_migration_table_status(
+            ["t"], source_counts={"t": src}, target_counts={"t": tgt}, **kw
+        )
+        return r
+
+    # Estimate is the DEFAULT for this builder.
+    est = row(2_774_078, 3_010_557, source_max_pk={"t": 5}, target_max_pk={"t": 5})
+    assert est.source_estimate is True
+    assert est.counts_comparable is False
+    # Target exceeds the estimate by ~8% (real observed InnoDB sampling error) and
+    # the stream has caught up -> nothing is wrong.
+    assert est.consistency == "consistent"
+    # in_sync is NOT determinable from an estimate (never a false negative).
+    assert est.in_sync is None
+    # An exact count of the same shape IS comparable.
+    exact = row(2_774_078, 3_010_557, source_is_estimate=False)
+    assert exact.counts_comparable is True and exact.in_sync is False
+
+
+def test_estimate_tolerates_sampling_noise_but_still_reports_gross_loss() -> None:
+    # A small shortfall against an ESTIMATE is statistics noise, not missing rows.
+    # A GROSS shortfall (well beyond any sampling error) is still reported, so real
+    # data loss is not hidden by the tolerance.
+    from dsql_migrator.ui.data_migration import build_migration_table_status
+
+    def verdict(src, tgt, caught=True):
+        pk = {"t": 100} if caught else {"t": 100}
+        tgt_pk = {"t": 100} if caught else {"t": 50}
+        (r,) = build_migration_table_status(
+            ["t"], source_counts={"t": src}, target_counts={"t": tgt},
+            source_max_pk=pk, target_max_pk=tgt_pk,
+        )
+        return r.consistency
+
+    # 5% short of the estimate, leading edge caught up -> noise, not a gap.
+    assert verdict(1_000_000, 950_000) == "consistent"
+    # Half the table missing -> a real gap, reported despite the tolerance.
+    assert verdict(1_000_000, 500_000) == "gap"
+    # Grossly short AND the leading edge trails -> still catching up.
+    assert verdict(1_000_000, 500_000, caught=False) == "behind"
+
+
+def test_estimate_verdict_still_defers_to_dlq_and_lag_signals() -> None:
+    # The trustworthy signals are unaffected by the estimate: quarantined data wins
+    # over everything, and a trailing high-water PK still reads as replicating.
+    from dsql_migrator.ui.data_migration import build_migration_table_status
+
+    (quarantined,) = build_migration_table_status(
+        ["t"],
+        source_counts={"t": 100}, target_counts={"t": 100},
+        dlq_counts={"t": 2},
+    )
+    assert quarantined.consistency == "quarantined"
+
+    (behind,) = build_migration_table_status(
+        ["t"],
+        source_counts={"t": 1000}, target_counts={"t": 1000},
+        source_max_pk={"t": 1000}, target_max_pk={"t": 400},
+    )
+    # Counts agree (within the estimate) but the newest rows have NOT landed.
+    assert behind.stream_caught_up is False
+    assert behind.consistency == "behind"
 
 
 def test_cdc_applied_net_none_until_both_known() -> None:
@@ -3934,15 +4082,30 @@ def test_stream_lag_distinguishes_behind_from_mid_stream_gap() -> None:
 
 
 def test_stream_caught_up_unknown_without_pk_marks() -> None:
-    # Without high-water PK marks, stream_caught_up is None and a short target
-    # falls back to "behind" (the conservative lag reading).
+    # Without high-water PK marks, stream_caught_up is None. With an EXACT source
+    # count a short target still falls back to "behind" (the conservative lag
+    # reading); with an ESTIMATE a 20%-of-estimate shortfall is within sampling
+    # tolerance, so it is not escalated.
     from dsql_migrator.ui.data_migration import build_migration_table_status
 
-    (row,) = build_migration_table_status(
+    (exact,) = build_migration_table_status(
+        ["orders"], source_counts={"orders": 100}, target_counts={"orders": 80},
+        source_is_estimate=False,
+    )
+    assert exact.pk_gap is None and exact.stream_caught_up is None
+    assert exact.consistency == "behind"
+
+    (est,) = build_migration_table_status(
         ["orders"], source_counts={"orders": 100}, target_counts={"orders": 80}
     )
-    assert row.pk_gap is None and row.stream_caught_up is None
-    assert row.consistency == "behind"
+    assert est.pk_gap is None and est.stream_caught_up is None
+    assert est.consistency == "consistent"  # within the estimate's tolerance
+
+    # A gross shortfall with no PK signal is still surfaced as replicating/behind.
+    (gross,) = build_migration_table_status(
+        ["orders"], source_counts={"orders": 100}, target_counts={"orders": 10}
+    )
+    assert gross.consistency == "behind"
 
 
 def test_stream_caught_up_consistent_when_counts_match() -> None:
@@ -4207,7 +4370,10 @@ def test_full_load_completeness_flags_mismatch_and_failure() -> None:
     job = _full_load_job(
         [
             {"chunk_id": "orders", "status": "DONE", "rows_loaded": 100, "attempts": 1},
-            {"chunk_id": "items", "status": "DONE", "rows_loaded": 40, "attempts": 1},
+            # A GROSS shortfall (5 of an estimated 50) -- far beyond sampling error, so
+            # it is still reported as mismatched. (A few-percent gap would not be: the
+            # source figure is an estimate, not an exact count.)
+            {"chunk_id": "items", "status": "DONE", "rows_loaded": 5, "attempts": 1},
             {"chunk_id": "customers", "status": "FAILED", "attempts": 1},
         ],
         counts={"orders": 100, "items": 50, "customers": 10},
@@ -5866,3 +6032,387 @@ def test_apply_cdc_status_merges_applied_ops_and_never_wipes_on_empty() -> None:
     _apply_cdc_status(state, fetched({"orders": {"inserts": 10, "updates": 4, "deletes": 1}}))
     assert state.cdc_applied_ops_by_table["orders"]["inserts"] == 10
     assert "customers" in state.cdc_applied_ops_by_table  # not dropped by the partial read
+
+
+# ---------------------------------------------------------------------------
+# Source connection drop (Aurora failover) during Full Load: automatic re-read
+# ---------------------------------------------------------------------------
+
+
+class _RetryHandle:
+    """JobHandle stand-in exposing only what the source-retry path reads."""
+
+    def __init__(self, cancelled: bool = False) -> None:
+        self.cancelled = cancelled
+
+
+def _lost_connection(code: int = 2013) -> Exception:
+    class OperationalError(Exception):
+        pass
+
+    return OperationalError(code, "Lost connection to MySQL server during query")
+
+
+class _FlakySourceMigrator:
+    """Fails the first ``fail_times`` loads with a source drop, then succeeds.
+
+    Records each attempt's ``pre_recreated`` so a test can assert a retry does NOT
+    keep claiming the target is freshly-emptied.
+    """
+
+    def __init__(self, *, fail_times: int, error: Exception | None = None) -> None:
+        self._fail_times = fail_times
+        self._error = error or _lost_connection()
+        self.attempts = 0
+        self.pre_recreated_seen: list[bool] = []
+
+    def migrate_table(self, table, *, on_rows=None, should_cancel=None,
+                      pre_recreated=False):
+        self.attempts += 1
+        self.pre_recreated_seen.append(pre_recreated)
+        if self.attempts <= self._fail_times:
+            raise self._error
+        from dsql_migrator.ui.data_migration._engine import TableLoadResult
+
+        return TableLoadResult(rows_loaded=7)
+
+
+def _no_backoff(monkeypatch) -> None:
+    """Make the retry backoff zero so the tests don't actually sleep."""
+    import dsql_migrator.ui.data_migration._engine as engine
+
+    monkeypatch.setattr(engine._time, "sleep", lambda _s: None)
+
+
+def test_source_drop_retries_the_table_and_succeeds(monkeypatch) -> None:
+    # An Aurora failover mid-load must be recovered automatically: the table is
+    # re-read from a fresh snapshot instead of failing and waiting for a human.
+    from dsql_migrator.ui.data_migration._engine import (
+        _migrate_table_with_source_retry,
+    )
+
+    _no_backoff(monkeypatch)
+    migrator = _FlakySourceMigrator(fail_times=1)
+    result = _migrate_table_with_source_retry(
+        migrator, _tables()[0], on_rows=lambda *_a, **_k: None,
+        handle=_RetryHandle(),
+    )
+    assert migrator.attempts == 2  # failed once, then re-read successfully
+    assert result.rows_loaded == 7
+
+
+def test_source_drop_gives_up_after_the_configured_attempts(monkeypatch) -> None:
+    # The budget is bounded: a source that never comes back surfaces the real error
+    # (so the table is FAILED and retryable by hand) instead of looping forever.
+    from dsql_migrator.ui.data_migration._engine import (
+        _migrate_table_with_source_retry,
+    )
+
+    _no_backoff(monkeypatch)
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_SOURCE_RETRY_ATTEMPTS", "3")
+    migrator = _FlakySourceMigrator(fail_times=99)
+    with pytest.raises(Exception) as excinfo:
+        _migrate_table_with_source_retry(
+            migrator, _tables()[0], on_rows=lambda *_a, **_k: None,
+            handle=_RetryHandle(),
+        )
+    assert "Lost connection" in str(excinfo.value)
+    assert migrator.attempts == 3  # exactly the configured budget
+
+
+def test_data_error_is_not_retried(monkeypatch) -> None:
+    # A schema/data error fails identically forever, so retrying only adds delay.
+    from dsql_migrator.ui.data_migration._engine import (
+        _migrate_table_with_source_retry,
+    )
+
+    _no_backoff(monkeypatch)
+
+    class _Unknown(Exception):
+        pass
+
+    migrator = _FlakySourceMigrator(
+        fail_times=99, error=_Unknown(1054, "Unknown column 'x' in 'field list'")
+    )
+    with pytest.raises(Exception):
+        _migrate_table_with_source_retry(
+            migrator, _tables()[0], on_rows=lambda *_a, **_k: None,
+            handle=_RetryHandle(),
+        )
+    assert migrator.attempts == 1  # no retry
+
+
+def test_user_stop_is_not_retried(monkeypatch) -> None:
+    # A cooperative stop is not a failure: it must propagate immediately.
+    from dsql_migrator.ui.data_migration._engine import (
+        _FullLoadStopped,
+        _migrate_table_with_source_retry,
+    )
+
+    _no_backoff(monkeypatch)
+
+    class _Stopping:
+        def __init__(self):
+            self.attempts = 0
+
+        def migrate_table(self, table, **_kw):
+            self.attempts += 1
+            raise _FullLoadStopped()
+
+    migrator = _Stopping()
+    with pytest.raises(_FullLoadStopped):
+        _migrate_table_with_source_retry(
+            migrator, _tables()[0], on_rows=lambda *_a, **_k: None,
+            handle=_RetryHandle(),
+        )
+    assert migrator.attempts == 1
+
+
+def test_retry_aborts_promptly_when_the_user_stops_mid_backoff(monkeypatch) -> None:
+    # A Stop during the failover wait must not be ignored for the whole backoff.
+    from dsql_migrator.ui.data_migration._engine import (
+        _migrate_table_with_source_retry,
+    )
+    import dsql_migrator.ui.data_migration._engine as engine
+
+    handle = _RetryHandle()
+    # The user presses Stop while the retry is sleeping.
+    monkeypatch.setattr(
+        engine._time, "sleep", lambda _s: setattr(handle, "cancelled", True)
+    )
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_SOURCE_RETRY_BACKOFF_SECONDS", "60")
+    migrator = _FlakySourceMigrator(fail_times=99)
+    with pytest.raises(Exception):
+        _migrate_table_with_source_retry(
+            migrator, _tables()[0], on_rows=lambda *_a, **_k: None, handle=handle,
+        )
+    assert migrator.attempts == 1  # aborted during the wait, never re-read
+
+
+def test_retry_disabled_by_config_fails_immediately(monkeypatch) -> None:
+    # attempts=1 means "no retry" -- the documented way to keep the old behavior.
+    from dsql_migrator.ui.data_migration._engine import (
+        _migrate_table_with_source_retry,
+    )
+
+    _no_backoff(monkeypatch)
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_SOURCE_RETRY_ATTEMPTS", "1")
+    migrator = _FlakySourceMigrator(fail_times=99)
+    with pytest.raises(Exception):
+        _migrate_table_with_source_retry(
+            migrator, _tables()[0], on_rows=lambda *_a, **_k: None,
+            handle=_RetryHandle(),
+        )
+    assert migrator.attempts == 1
+
+
+def test_in_process_retry_drops_pre_recreated_on_a_retry(monkeypatch) -> None:
+    # ``pre_recreated`` says the parent already emptied the target, which is what
+    # licenses a plain INSERT. After a failed attempt has written rows, that is no
+    # longer true -- so a retry must NOT keep the flag, or the re-read would collide
+    # with its own rows. (Regression guard for the multiprocess load path.)
+    import dsql_migrator.ui.data_migration._engine as engine
+
+    _no_backoff(monkeypatch)
+    migrator = _FlakySourceMigrator(fail_times=1)
+    state = {"first": True}
+
+    def _load():
+        pre = True and state["first"]
+        state["first"] = False
+        return migrator.migrate_table(
+            _tables()[0], on_rows=None, should_cancel=lambda: False,
+            pre_recreated=pre,
+        )
+
+    engine._retry_source_drops_in_process(
+        _load, cancelled=lambda: False, table_name="orders"
+    )
+    assert migrator.pre_recreated_seen == [True, False]
+
+
+def test_in_process_retry_classifies_like_the_single_process_path(monkeypatch) -> None:
+    # The multiprocess path is the default for a large migration, so it must recover
+    # from the same failover the single-process path does -- and likewise refuse to
+    # retry a data error (a run must not behave differently per worker mode).
+    import dsql_migrator.ui.data_migration._engine as engine
+
+    _no_backoff(monkeypatch)
+    calls = {"n": 0}
+
+    def _flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _lost_connection(2006)
+        return "ok"
+
+    assert engine._retry_source_drops_in_process(
+        _flaky, cancelled=lambda: False, table_name="t"
+    ) == "ok"
+    assert calls["n"] == 2
+
+    permanent = {"n": 0}
+
+    def _permanent():
+        permanent["n"] += 1
+        raise ValueError("bad column type")
+
+    with pytest.raises(ValueError):
+        engine._retry_source_drops_in_process(
+            _permanent, cancelled=lambda: False, table_name="t"
+        )
+    assert permanent["n"] == 1
+
+
+def test_failed_table_error_message_explains_a_dropped_source(monkeypatch) -> None:
+    # Part A: once the retries are exhausted, the recorded per-table error carries the
+    # operator explanation, not just the raw driver text.
+    from dsql_migrator.core.error_log import ErrorLogStore
+    from dsql_migrator.ui.data_migration._engine import _migrate_one_table
+
+    _no_backoff(monkeypatch)
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_SOURCE_RETRY_ATTEMPTS", "1")
+
+    class _Handle:
+        cancelled = False
+
+        def update(self, _fn):
+            pass
+
+    error_log = ErrorLogStore()
+    outcome = _migrate_one_table(
+        _Handle(), "job-1", _tables()[0],
+        _FlakySourceMigrator(fail_times=99), error_log,
+    )
+    assert outcome.name == "FAILED"
+    (record,) = error_log.records("job-1")
+    assert "Lost connection" in record.message  # the real cause is kept
+    assert "failover" in record.message.lower()  # plus what it means
+    assert "idempotent" in record.message.lower()  # plus why re-running is safe
+
+
+# ---------------------------------------------------------------------------
+# Connection management: an abandoned source stream must not stay open
+# ---------------------------------------------------------------------------
+
+
+class _TrackingStream:
+    """A generator-like source stream that records when it is closed.
+
+    Mirrors ``stream_converted_rows``: it holds a "connection" until closed. Used to
+    prove the retry path releases the DEAD stream before waiting out a failover
+    instead of pinning it (and then opening a second one).
+    """
+
+    def __init__(self, log: list, name: str) -> None:
+        self._log = log
+        self._name = name
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise _lost_connection()
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self._log.append(self._name)
+
+
+def test_retry_releases_the_dead_source_stream_before_waiting(monkeypatch) -> None:
+    # The leak this guards: the row streams are generators whose source engine is
+    # disposed in their own `finally`, so an abandoned one holds its MySQL connection
+    # until closed/collected -- and the raising frame keeps it referenced. If the
+    # retry waited with it still open, a 16x8 fan-out would DOUBLE the source
+    # connection count exactly when a just-promoted Aurora writer is most fragile.
+    import dsql_migrator.ui.data_migration._engine as engine
+
+    closed: list[str] = []
+    sleeps: list[float] = []
+    # Record the order of (close, sleep) so the release is proven to precede the wait.
+    order: list[str] = []
+    monkeypatch.setattr(
+        engine._time, "sleep", lambda s: (sleeps.append(s), order.append("sleep"))
+    )
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_SOURCE_RETRY_BACKOFF_SECONDS", "3")
+
+    streams: list[_TrackingStream] = []
+    calls = {"n": 0}
+
+    def _work():
+        calls["n"] += 1
+        stream = _TrackingStream(closed, f"stream{calls['n']}")
+        streams.append(stream)
+        if calls["n"] == 1:
+            raise _lost_connection()
+        return "ok"
+
+    def _release():
+        for s in streams:
+            if not s.closed:
+                s.close()
+                order.append("close")
+
+    assert engine._retry_source_drops_in_process(
+        _work, cancelled=lambda: False, table_name="orders", release=_release
+    ) == "ok"
+    # The failed attempt's stream was closed...
+    assert closed == ["stream1"]
+    # ...and closed BEFORE the backoff wait began (not after it).
+    assert order[0] == "close"
+    assert "sleep" in order
+    assert sleeps  # the wait did happen
+
+
+def test_migrate_table_closes_row_streams_on_failure() -> None:
+    # Every caller benefits: migrate_table closes the streams it created when the
+    # load raises, so the source connection is released as the exception leaves.
+    import dsql_migrator.ui.data_migration._engine as engine
+
+    closed: list[str] = []
+    rows = _TrackingStream(closed, "rows")
+    shards = [_TrackingStream(closed, "shard0"), _TrackingStream(closed, "shard1")]
+
+    engine._close_row_streams(rows, shards)
+    assert sorted(closed) == ["rows", "shard0", "shard1"]
+
+    # Idempotent + exception-safe: a stream whose close() raises must not mask the
+    # original failure, and a None/closeless value is ignored.
+    class _Angry:
+        def close(self):
+            raise RuntimeError("close failed")
+
+    engine._close_row_streams(_Angry(), [None, object()])  # must not raise
+    engine._close_row_streams(None, None)  # must not raise
+
+
+def test_too_many_connections_is_transient_with_its_own_advice() -> None:
+    # A failover makes every reader reconnect at once, so the source can hit its
+    # connection cap. That IS worth retrying (slots drain as readers finish), but the
+    # operator advice differs: reduce concurrency / raise the limit, not "just wait".
+    from dsql_migrator.core.introspector import (
+        is_source_transient_error,
+        source_error_hint,
+    )
+
+    class OperationalError(Exception):
+        pass
+
+    too_many = OperationalError(1040, "Too many connections")
+    assert is_source_transient_error(too_many) is True
+    hint = source_error_hint(too_many)
+    assert hint is not None
+    assert "connection limit" in hint.lower()
+    assert "TABLE_PARALLELISM" in hint  # names the knob that actually helps
+    assert "max_connections" in hint
+    # It must NOT be the generic failover text (that advice would not fix this).
+    assert "failover" not in hint.lower()
+
+    # The per-user variant classifies the same way.
+    assert is_source_transient_error(OperationalError(1203, "User has exceeded")) is True
+
+    # A failover still gets the failover hint, not this one.
+    failover_hint = source_error_hint(_lost_connection())
+    assert failover_hint is not None and "failover" in failover_hint.lower()

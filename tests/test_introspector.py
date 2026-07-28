@@ -660,3 +660,108 @@ def test_test_connection_version_is_optional_when_unavailable() -> None:
     assert result.success is True
     assert result.server_version is None
     assert result.mysql_version is None
+
+
+# ---------------------------------------------------------------------------
+# Source transient-error classification (Aurora failover mid-Full-Load)
+# ---------------------------------------------------------------------------
+
+
+def _pymysql_operational(code: int, message: str) -> Exception:
+    """A stand-in for PyMySQL's OperationalError(code, message) shape."""
+
+    class OperationalError(Exception):
+        pass
+
+    return OperationalError(code, message)
+
+
+def test_source_transient_error_recognizes_failover_error_codes() -> None:
+    # An Aurora failover closes every open connection; the driver reports one of
+    # these codes. Each must be recognized so the table is RE-READ, not failed.
+    from dsql_migrator.core.introspector import is_source_transient_error
+
+    assert is_source_transient_error(
+        _pymysql_operational(2013, "Lost connection to MySQL server during query")
+    )
+    assert is_source_transient_error(
+        _pymysql_operational(2006, "MySQL server has gone away")
+    )
+    assert is_source_transient_error(
+        _pymysql_operational(2003, "Can't connect to MySQL server on 'host'")
+    )
+    assert is_source_transient_error(
+        _pymysql_operational(1053, "Server shutdown in progress")
+    )
+    assert is_source_transient_error(
+        _pymysql_operational(1927, "Connection was killed")
+    )
+
+
+def test_source_transient_error_unwraps_sqlalchemy_and_cause() -> None:
+    # SQLAlchemy wraps the driver error; the code lives on .orig. A re-raised error
+    # may only carry __cause__. Both must still classify.
+    from dsql_migrator.core.introspector import is_source_transient_error
+
+    class DBAPIError(Exception):
+        def __init__(self, orig):
+            super().__init__("(pymysql.err.OperationalError) wrapped")
+            self.orig = orig
+
+    wrapped = DBAPIError(_pymysql_operational(2013, "Lost connection"))
+    assert is_source_transient_error(wrapped) is True
+
+    chained = RuntimeError("export failed")
+    chained.__cause__ = _pymysql_operational(2006, "gone away")
+    assert is_source_transient_error(chained) is True
+
+
+def test_source_transient_error_recognizes_socket_timeout() -> None:
+    # A failover can stall the socket rather than reset it; the bounded read_timeout
+    # then raises a timeout, which carries no MySQL error code.
+    import socket
+
+    from dsql_migrator.core.introspector import is_source_transient_error
+
+    assert is_source_transient_error(socket.timeout("timed out")) is True
+    assert is_source_transient_error(TimeoutError("read timed out")) is True
+
+
+def test_source_transient_error_rejects_data_and_schema_errors() -> None:
+    # A data/schema error fails identically forever, so retrying it would only add
+    # delay before the same failure. These must NOT be classified as transient.
+    from dsql_migrator.core.introspector import is_source_transient_error
+
+    assert is_source_transient_error(
+        _pymysql_operational(1054, "Unknown column 'x' in 'field list'")
+    ) is False
+    assert is_source_transient_error(
+        _pymysql_operational(1146, "Table 'db.t' doesn't exist")
+    ) is False
+    assert is_source_transient_error(ValueError("bad value for column id")) is False
+    assert is_source_transient_error(KeyError("missing_key")) is False
+    # A permission error is a real configuration problem, not a blip.
+    assert is_source_transient_error(
+        _pymysql_operational(1045, "Access denied for user")
+    ) is False
+
+
+def test_source_error_hint_explains_failover_and_reassures() -> None:
+    # Part A: the raw driver text tells the operator nothing, so a dropped source
+    # connection gets a what-happened / what-to-do-next explanation.
+    from dsql_migrator.core.introspector import is_source_transient_error, source_error_hint
+
+    hint = source_error_hint(
+        _pymysql_operational(2013, "Lost connection to MySQL server during query")
+    )
+    assert hint is not None
+    assert "failover" in hint.lower()
+    # It must state the two things the user needs to trust a re-run.
+    assert "idempotent" in hint.lower()
+    assert "never duplicates" in hint.lower() or "no duplicates" in hint.lower()
+    # And that the source was not modified (the load only reads it).
+    assert "only reads" in hint.lower() or "was changed" in hint.lower()
+
+    # No hint invented for an unrelated error (it would be misleading).
+    assert source_error_hint(_pymysql_operational(1054, "Unknown column")) is None
+    assert is_source_transient_error(_pymysql_operational(1054, "Unknown column")) is False

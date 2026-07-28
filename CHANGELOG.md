@@ -5,6 +5,152 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.140
+
+### Fixed
+
+- **A failed source read no longer holds its MySQL connection open while the retry
+  waits.** The source row streams are generators that dispose their engine in their
+  own `finally`, so an abandoned one keeps its connection until it is closed or
+  garbage-collected — and the raising frame keeps it referenced. The v0.1.139 retry
+  therefore waited out the whole failover backoff (up to 60s) with the dead
+  connection still open, then opened another one to re-read. At 16 tables × 8 shards
+  that **doubles the source connection count exactly when a just-promoted Aurora
+  writer is most fragile**, risking `1040 Too many connections` — which would have
+  failed the table outright.
+  - `migrate_table` now closes the row streams it created when a load raises, so the
+    connection is released as the exception leaves.
+  - The retry's backoff wait moved OUT of the `except` block, so the traceback (and
+    with it the failed attempt's frames and generator) is dropped before waiting.
+  - Verified end-to-end: the connection is now disposed *before* the wait starts.
+
+### Added
+
+- **`Too many connections` on the source is now retried, with its own advice.** MySQL
+  1040 / 1203 are self-inflicted and self-clearing (a failover makes every reader
+  reconnect at once; slots drain as readers finish), so they are classified as
+  transient. The operator hint differs from the failover one, because waiting is not
+  the fix: it names `FULL_LOAD_TABLE_PARALLELISM` / `FULL_LOAD_READER_SHARDS` and the
+  source's `max_connections`.
+- **A clamped reader-shard count now says so.** Concurrent source readers are capped
+  at 32 (`table_parallelism × reader_shards`); when that ceiling reduces the
+  configured shard count, the log states the old and new values and why, instead of
+  silently loading with fewer readers than requested — which looked like the setting
+  had no effect.
+
+## v0.1.139
+
+### Added
+
+- **Full Load now survives a source Aurora failover.** A writer promotion (patching,
+  an instance replacement, an AZ event) closes every open MySQL connection, so a
+  multi-hour load would meet one — and previously the table in flight simply failed
+  and waited for someone to press Re-run. Such a table is now **re-read
+  automatically** (3 attempts by default, 15s → 30s → 60s backoff to let DNS
+  re-point at the promoted writer).
+  - The retry deliberately **re-reads the table from a fresh consistent snapshot**
+    rather than resuming the dead read at its last primary key. Resuming would splice
+    two different MySQL snapshots into one table, leaving it consistent as of no
+    single point in time — and the gapless Full Load → CDC handoff depends on each
+    table being consistent as of the run's watermark. Already-written rows are skipped
+    by the idempotent load, so a retry costs re-read I/O but never duplicates rows.
+    (Reader sharding shrinks even that cost: each shard already holds its own
+    snapshot, so only the affected shard re-reads.)
+  - Only **connection-level** failures retry (MySQL 2013/2006/2003/2002/2055/1053/
+    1077/1079/1927 and socket timeouts). A data or schema error fails immediately, as
+    before — retrying it would only add delay before the same failure.
+  - Applies to the multiprocess load path (the default at scale) as well as the
+    single-process one, so a run does not behave differently per worker mode. A retry
+    correctly stops treating the target as freshly-emptied, so the re-read cannot
+    collide with rows its own failed attempt already wrote.
+  - A user **Stop** is honored during the backoff wait, not after it.
+  - Tunable: `DSQL_MIGRATOR_FULL_LOAD_SOURCE_RETRY_ATTEMPTS` (1 = off, the previous
+    behavior) and `DSQL_MIGRATOR_FULL_LOAD_SOURCE_RETRY_BACKOFF_SECONDS`.
+
+### Changed
+
+- **A dropped source connection now explains itself.** When the retries are
+  exhausted, the per-table error no longer reads as a bare
+  `OperationalError: (2013, 'Lost connection to MySQL server during query')`. It now
+  states that this is usually an Aurora failover, that nothing on the source was
+  changed (the load only reads it), and that re-running is safe because the load is
+  idempotent and resumes by primary key — filling only what is missing.
+
+## v0.1.138
+
+### Fixed
+
+- **A fully-loaded Full Load table can no longer report as incomplete because the
+  source ESTIMATE overcounted.** Per-table `Progress` and the completeness verdict
+  divided by / compared against the watermark's scan-free `information_schema` count.
+  That estimate comes from InnoDB index sampling and errs in *both* directions, so
+  whenever it overcounted, a table the loader had streamed to exhaustion showed e.g.
+  **"91%" and counted as mismatched** — implying rows were lost when none were.
+  - A `DONE` table is now **100%** by definition: the export streams the table by PK
+    keyset until exhausted, so finishing *is* the completeness evidence — it does not
+    depend on the estimate agreeing.
+  - `complete` reports `True` for a finished table unless the shortfall exceeds the
+    estimate's sampling tolerance, so a genuinely truncated load is still flagged
+    (and a few-percent discrepancy no longer is).
+  - Loading **more** rows than the estimate predicted (the common undercount case) is
+    now stated as normal in the Rows tooltip, with the percentage, instead of being
+    silently hidden by the 100% cap.
+
+### Changed
+
+- **The Full Load table is explicit that its source figure is approximate.** The
+  column header now reads **Rows (target / source est.)** with a new ⓘ tooltip
+  explaining the sampling error, why a target exceeding the source is normal, and
+  that a finished table is 100% because the loader exhausted it — not because the two
+  numbers match. Validation (step 4) remains the exact comparison.
+
+- **The CDC status table no longer flags healthy tables as "target ahead".** Its
+  Source rows figure is a scan-free `information_schema` **estimate** (so a large
+  production source is never `COUNT(*)`-scanned), but the consistency verdict was
+  subtracting the exact target `COUNT(*)` from it and treating any difference as an
+  anomaly. InnoDB derives that estimate from index sampling and routinely
+  *undercounts* by several percent, so a perfectly healthy target legitimately
+  exceeds it — on a live 11-table schema **8 tables showed an amber "target ahead"
+  badge** with zero quarantined rows and every stream caught up.
+  - The `"target ahead"` verdict is **removed**. A target exceeding an estimated
+    source count is the normal case, not an anomaly.
+  - Verdicts now lean on the signals that are actually exact and cheap: the DLQ, the
+    time-based `ReplicationLagMs`, and the `MAX(pk)` leading edge. A shortfall
+    against an *estimate* is only escalated to "rows missing" when it exceeds the
+    sampling tolerance, so genuine data loss is still reported while statistics
+    noise is not.
+  - Equality claims are gated on an **exact** source count (`counts_comparable`);
+    `in_sync` now returns "not determinable" rather than a false negative when the
+    source figure is an estimate.
+
+### Changed
+
+- **The CDC table is explicit that Source rows is approximate.** The column header
+  now reads **Source rows (est.)** with a new ⓘ tooltip explaining the sampling error
+  and pointing to Validation (step 4) for the exact comparison; the per-cell `(est.)`
+  suffix is gone (it now marks only the unusual *exact* case). The Consistency
+  tooltip and the "How to read this table" legend state that green means "nothing
+  looks wrong", not a proven exact match.
+
+## v0.1.137
+
+### Added
+
+- **Fast-sweep "verified by row count only" tables can now be deep-checked in place.**
+  The footnote that lists tables the fast sweep passed on row count alone previously
+  only advised turning Fast sweep off and re-running everything. It now offers
+  **Deep-check N count-only table(s)**, which re-compares just those tables with the
+  checksum / record reconciliation the run skipped and merges the results into the
+  existing report — the same per-table mechanism v0.1.136 added for failing tables.
+  This is the one *passing* case where re-validating is genuinely useful, since those
+  tables were never proven row-for-row identical.
+  - The action is withheld when it would be a no-op: in a `ROW_COUNT`-mode report
+    with no reconciliation there is no deeper check to run, so the honest "turn off
+    Fast sweep and re-run" advice stands instead of a button that repeats the
+    identical count comparison.
+  - Otherwise-passing tables still get no re-check button; the affordance appears
+    only where it adds a check (failing tables, or count-only fast-sweep tables).
+
 ## v0.1.136
 
 ### Added

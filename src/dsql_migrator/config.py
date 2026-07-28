@@ -310,6 +310,37 @@ class AppConfig(BaseModel):
             "DSQL_MIGRATOR_FULL_LOAD_OCC_MAX_ATTEMPTS."
         ),
     )
+    full_load_source_retry_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description=(
+            "How many times Full Load re-reads a table whose SOURCE connection "
+            "dropped mid-load (e.g. an Aurora failover: writer promotion during "
+            "patching, an instance replacement, or an AZ event). 1 = no retry (fail "
+            "the table for a manual re-run). The retry RE-READS the table from a "
+            "FRESH consistent snapshot rather than resuming the dead one, so the "
+            "table stays internally consistent as-of a single point in time -- the "
+            "gapless Full Load -> CDC watermark handoff depends on that. Already-"
+            "written rows are skipped by the idempotent load, so a retry costs "
+            "re-read I/O but never duplicates rows. Only CONNECTION-level failures "
+            "retry; a data/schema error fails immediately. Config key: "
+            "DSQL_MIGRATOR_FULL_LOAD_SOURCE_RETRY_ATTEMPTS."
+        ),
+    )
+    full_load_source_retry_backoff_seconds: float = Field(
+        default=15.0,
+        ge=0.0,
+        le=300.0,
+        description=(
+            "Base delay (seconds) before Full Load re-reads a table after a source "
+            "connection drop, doubling per attempt (15s, 30s, 60s...). An Aurora "
+            "failover typically completes within 30-60s, so the first wait is sized "
+            "to let DNS re-point at the promoted writer before reconnecting -- "
+            "retrying instantly would just fail again. Config key: "
+            "DSQL_MIGRATOR_FULL_LOAD_SOURCE_RETRY_BACKOFF_SECONDS."
+        ),
+    )
     full_load_reader_shards: int = Field(
         default=1,
         ge=1,
@@ -409,6 +440,12 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> AppConfig:
         values["full_load_batch_rows"] = int(fl_batch_rows)
     if (fl_occ := _read(source, "FULL_LOAD_OCC_MAX_ATTEMPTS")) is not None:
         values["full_load_occ_max_attempts"] = int(fl_occ)
+    if (fl_src_retry := _read(source, "FULL_LOAD_SOURCE_RETRY_ATTEMPTS")) is not None:
+        values["full_load_source_retry_attempts"] = int(fl_src_retry)
+    if (
+        fl_src_backoff := _read(source, "FULL_LOAD_SOURCE_RETRY_BACKOFF_SECONDS")
+    ) is not None:
+        values["full_load_source_retry_backoff_seconds"] = float(fl_src_backoff)
     if (fl_shards := _read(source, "FULL_LOAD_READER_SHARDS")) is not None:
         values["full_load_reader_shards"] = int(fl_shards)
     if (fl_shard_min := _read(source, "FULL_LOAD_SHARD_MIN_ROWS")) is not None:

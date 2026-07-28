@@ -631,6 +631,21 @@ def report_run_options(report: ValidationReport) -> RunOptions:
     )
 
 
+def deep_recheck_adds_checks(report: ValidationReport) -> bool:
+    """Whether re-checking a count-only table would actually run MORE checks.
+
+    Gates the "verified by row count only" (fast sweep) re-check action. Those
+    tables skipped their deep checks because their counts agreed, so re-checking
+    them is only worth offering when a deep check EXISTS to run: a checksum (this
+    report is in CHECKSUM mode) or a record reconciliation (this report shows
+    reconciliation ran). In a ROW_COUNT-mode report with no reconciliation there is
+    nothing deeper to do -- the re-check would repeat the identical count
+    comparison -- so the action is withheld rather than offered as a no-op.
+    """
+    options = report_run_options(report)
+    return options.mode is ValidationMode.CHECKSUM or options.reconcile
+
+
 # ---------------------------------------------------------------------------
 # Validation scope: WHAT is being validated (NiceGUI-agnostic)
 # ---------------------------------------------------------------------------
@@ -2623,7 +2638,11 @@ def _render_result(
         rechecking_tables=rechecking_tables,
     )
     with _section(ui, icon="table_view", title="Per-table results"):
-        _render_tables(ui, report)
+        _render_tables(
+            ui, report,
+            recheck_provider=recheck_provider,
+            rechecking_tables=rechecking_tables,
+        )
     _render_orphans(ui, report)
     with _section(ui, icon="schedule", title="Drift since snapshot"):
         _render_drift(ui, drift)
@@ -3347,13 +3366,24 @@ _QUASAR_BADGE_COLOR: dict[str, str] = {
 }
 
 
-def _render_tables(ui: object, report: ValidationReport) -> None:
+def _render_tables(
+    ui: object,
+    report: ValidationReport,
+    *,
+    recheck_provider=None,
+    rechecking_tables: "Sequence[str]" = (),
+) -> None:
     """Render the per-table comparison results, sortable + filterable (6.1, 6.2).
 
     Failed tables sort first by default and a search box filters to a table name
     or status, so a reviewer can isolate problems instead of scrolling. Status
     cells render as colored Quasar badges (no plain colored text), and counts are
     thousands-separated.
+
+    ``recheck_provider`` (when given) also lets the fast-sweep footnote offer a
+    deep re-check of the tables that were verified by ROW COUNT only -- the one
+    "passing" case where re-validating is genuinely useful, since those tables were
+    never checksum/record-compared.
     """
     if not report.items:
         ui.label("No tables compared.").classes("text-sm text-gray-500")  # type: ignore[attr-defined]
@@ -3415,6 +3445,13 @@ def _render_tables(ui: object, report: ValidationReport) -> None:
     # row set. An info notice (expected state), not a warning.
     count_only = count_verified_tables(report)
     if count_only:
+        # Whether a deep re-check would actually add a check (a checksum or a record
+        # reconciliation). In a ROW_COUNT-mode report with no reconciliation there is
+        # nothing deeper to run, so we keep the plain "turn off Fast sweep and re-run"
+        # advice instead of offering a no-op button.
+        deepen = recheck_provider is not None and deep_recheck_adds_checks(report)
+        busy = {name for name in rechecking_tables}
+        pending = [name for name in count_only if name not in busy]
         render_notice(
             ui,
             tone="info",
@@ -3425,10 +3462,34 @@ def _render_tables(ui: object, report: ValidationReport) -> None:
             body=(
                 "Fast sweep skipped the checksum / record reconciliation for tables "
                 "whose row counts matched, so those are confirmed equal by count but "
-                "not proven row-for-row identical. For a full record-level guarantee "
-                "before cut-over, turn off Fast sweep and re-run."
+                "not proven row-for-row identical. "
+                + (
+                    "Deep-check them below without re-running the whole validation."
+                    if deepen
+                    else
+                    "For a full record-level guarantee before cut-over, turn off "
+                    "Fast sweep and re-run."
+                )
             ),
         )
+        if deepen:
+            with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+                if pending:
+                    ui.button(  # type: ignore[attr-defined]
+                        f"Deep-check {len(pending)} count-only table(s)",
+                        icon="fact_check",
+                        on_click=lambda _e=None, _n=list(pending): recheck_provider(
+                            _n
+                        ),
+                    ).props("outline no-caps size=sm color=primary").tooltip(
+                        "Re-compare these tables with the checksum / record "
+                        "reconciliation this run skipped, and update their rows here."
+                    )
+                else:
+                    ui.spinner(size="sm")  # type: ignore[attr-defined]
+                    ui.label("Deep-checking…").classes(  # type: ignore[attr-defined]
+                        "text-xs text-gray-600"
+                    )
 
 
 def _table_row(item: TableValidationResult) -> dict[str, object]:
@@ -3579,6 +3640,7 @@ __all__ = [
     "merge_revalidated",
     "RunOptions",
     "report_run_options",
+    "deep_recheck_adds_checks",
     "validation_run_guard_reason",
     "group_objects_by_schema",
     "ResolvedScope",

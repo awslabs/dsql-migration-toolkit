@@ -34,6 +34,10 @@ from dsql_migrator.core.activity_log import (
 )
 from dsql_migrator.core.error_log import ErrorLogStore
 from dsql_migrator.core.exporter import ExportCancelled, TableExporter
+from dsql_migrator.core.introspector import (
+    is_source_transient_error,
+    source_error_hint,
+)
 from dsql_migrator.core.job_manager import JobHandle
 from dsql_migrator.core.batched_import import (
     BatchedImporter,
@@ -488,6 +492,132 @@ def _init_worker(
     _worker_cancel_event = cancel_event
 
 
+def _retry_source_drops_in_process(work, *, cancelled, table_name: str, release=None):
+    """Run ``work()`` in a child process, retrying a dropped SOURCE connection.
+
+    The in-process twin of :func:`_migrate_table_with_source_retry` (see it for why a
+    retry RE-READS the table instead of resuming the dead snapshot). It is separate
+    because a child process has no ``JobHandle`` and cannot ``log_activity`` to the
+    parent's log -- it signals only through its returned ``_TableWorkerResult`` -- so
+    the retry state lives entirely in this call and the outcome is what the parent
+    sees. ``cancelled`` is a zero-arg predicate over the shared cancel event.
+
+    ``release`` (optional) closes the failed attempt's source row stream before the
+    retry waits, so the dead connection is not pinned for the whole backoff
+    (:func:`_release_source_stream`).
+
+    Without this, the multiprocess load path (the default for a large migration)
+    would still fail a table on an Aurora failover while the single-process path
+    recovered -- the same run behaving differently depending on the worker mode.
+    """
+    config = load_config()
+    attempts = max(1, int(config.full_load_source_retry_attempts))
+    backoff = max(0.0, float(config.full_load_source_retry_backoff_seconds))
+
+    for attempt in range(1, attempts + 1):
+        cause = ""
+        try:
+            return work()
+        except _FullLoadStopped:
+            raise
+        except ExportCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 - classify transient vs permanent
+            if attempt >= attempts or not is_source_transient_error(exc):
+                raise
+            if cancelled():
+                raise
+            # Keep only the TEXT of the failure, then leave the except block before
+            # waiting -- see _wait_before_source_reread for why that matters.
+            cause = f"{type(exc).__name__}: {exc}"
+        _release_source_stream(release)
+        if not _wait_before_source_reread(
+            table_name=table_name, attempt=attempt, attempts=attempts,
+            backoff=backoff, cause=cause, cancelled=cancelled,
+        ):
+            raise _FullLoadStopped()
+    raise AssertionError("source retry loop exited without a result")
+
+
+def _close_row_streams(rows, shard_sources) -> None:
+    """Close source row generators so their MySQL connections are freed now.
+
+    ``TableExporter.stream_converted_rows`` yields from inside a
+    ``START TRANSACTION WITH CONSISTENT SNAPSHOT`` and disposes its engine in the
+    generator's own ``finally``, so that cleanup runs only when the generator is
+    exhausted, explicitly closed, or collected. On the failure path neither of the
+    first two happens and the traceback keeps it referenced, so closing it here is
+    what actually returns the connection. Best-effort and exception-safe: cleanup
+    must never replace the failure that triggered it.
+    """
+    candidates = list(shard_sources or ())
+    if rows is not None:
+        candidates.append(rows)
+    for candidate in candidates:
+        close = getattr(candidate, "close", None)
+        if not callable(close):
+            continue
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - cleanup must not mask the real error
+            pass
+
+
+def _release_source_stream(release) -> None:
+    """Close an abandoned source row stream before a retry waits (best-effort).
+
+    The row streams are GENERATORS whose source engine is disposed in their own
+    ``finally`` (see ``TableExporter.stream_converted_rows``), so an abandoned one
+    holds its MySQL connection open until it is closed or collected. Closing it
+    explicitly releases the dead snapshot connection immediately instead of leaving
+    it pinned for the whole backoff.
+    """
+    if release is None:
+        return
+    try:
+        release()
+    except Exception:  # noqa: BLE001 - cleanup must never mask the real failure
+        pass
+
+
+def _wait_before_source_reread(
+    *,
+    table_name: str,
+    attempt: int,
+    attempts: int,
+    backoff: float,
+    cause: str,
+    cancelled,
+) -> bool:
+    """Wait out the failover before re-reading; ``False`` if the user stopped.
+
+    Called from OUTSIDE the ``except`` block on purpose. Inside it, the live
+    exception keeps its traceback alive, which keeps the failed attempt's frames
+    alive, which keeps that attempt's source row generator (a frame local) alive --
+    so the dead source connection would stay open for the entire backoff, and the
+    retry would then open ANOTHER one. At 16 tables x 8 shards that doubles the
+    source connection count at exactly the moment a just-promoted Aurora writer is
+    most fragile, risking ``1040 Too many connections``. Returning here drops the
+    traceback first, so the old connection is released before the wait.
+
+    The wait itself is sliced so a user Stop is honored promptly rather than after
+    the full delay.
+    """
+    delay = backoff * (2 ** (attempt - 1))
+    _LOGGER.warning(
+        "Full Load source connection lost for table %s (attempt %d/%d): %s -- "
+        "re-reading from a fresh snapshot in %.0fs",
+        table_name, attempt, attempts, cause, delay,
+    )
+    waited = 0.0
+    while waited < delay:
+        if cancelled():
+            return False
+        _time.sleep(min(1.0, delay - waited))
+        waited += 1.0
+    return not cancelled()
+
+
 def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
     """Run entirely inside a child process. Builds own MySQL+DSQL connections.
 
@@ -516,14 +646,30 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
                 if progress_queue is not None:
                     progress_queue.put((name, flush_l, flush_s))
 
-        outcome = _as_load_result(
-            migrator.migrate_table(
+        _is_cancelled = lambda: (  # noqa: E731 - shared by the load + its retry
+            cancel_event is not None and cancel_event.is_set()
+        )
+        # ``pre_recreated`` says the parent already DROP+recreated this (empty) target,
+        # which is what lets a replace load use a plain INSERT. That only holds for the
+        # FIRST attempt: once a retry re-reads the table, rows from the failed attempt
+        # are already on the target, so a plain INSERT would collide on their keys.
+        # Clearing the flag on a retry makes this worker recreate the table itself, so
+        # the re-read again loads into an empty target and stays duplicate-free.
+        _attempt_state = {"first": True}
+
+        def _load_table():
+            pre = args.pre_recreated and _attempt_state["first"]
+            _attempt_state["first"] = False
+            return migrator.migrate_table(
                 table,
                 on_rows=_on_rows,
-                should_cancel=lambda: (
-                    cancel_event is not None and cancel_event.is_set()
-                ),
-                pre_recreated=args.pre_recreated,
+                should_cancel=_is_cancelled,
+                pre_recreated=pre,
+            )
+
+        outcome = _as_load_result(
+            _retry_source_drops_in_process(
+                _load_table, cancelled=_is_cancelled, table_name=name
             )
         )
         # Flush remaining progress.
@@ -577,18 +723,12 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
                 if progress_queue is not None:
                     progress_queue.put((name, flush_l, flush_s))
 
-        # Build the single-shard row stream for this PK range.
         applied = args.inputs.table_conversions.get(table.name)
         target_types = (
             parse_target_column_types(applied.target_ddl) if applied else None
         )
-        rows = migrator._exporter.stream_converted_rows(
-            args.inputs.source_config,
-            table,
-            should_cancel=lambda: cancel_event is not None and cancel_event.is_set(),
-            target_types=target_types,
-            pk_lower=args.pk_lower,
-            pk_upper=args.pk_upper,
+        _is_cancelled = lambda: (  # noqa: E731 - shared by the load + its retry
+            cancel_event is not None and cancel_event.is_set()
         )
         # Use plain INSERT (NONE) when the table was just DROP+recreated in the
         # parent (empty target, no conflicts possible, faster). Use SKIP_EXISTING
@@ -599,12 +739,50 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
         )
         conflict_mode = OnConflictMode.NONE if is_replace else OnConflictMode.SKIP_EXISTING
         importer = migrator._importer_factory(args.inputs)
-        result = importer.import_rows(
-            rows,
-            table,
-            on_batch_loaded=_on_rows,
-            should_cancel=lambda: cancel_event is not None and cancel_event.is_set(),
-            on_conflict=conflict_mode,
+
+        # First attempt uses the planned mode; any retry downgrades to SKIP_EXISTING
+        # so re-reading a partially-written shard stays duplicate-free. ``_live_rows``
+        # holds the CURRENT attempt's generator so a retry can close it (releasing the
+        # dead source connection) before waiting out the failover.
+        _shard_conflict_mode = [conflict_mode]
+        _live_rows: list = [None]
+
+        def _load_shard():
+            # Stream + import together so a retry re-opens the SHARD's own snapshot
+            # from its pk_lower: the generator is single-use, and re-reading the
+            # shard's whole PK range keeps it consistent as of one point in time.
+            rows = migrator._exporter.stream_converted_rows(
+                args.inputs.source_config,
+                table,
+                should_cancel=_is_cancelled,
+                target_types=target_types,
+                pk_lower=args.pk_lower,
+                pk_upper=args.pk_upper,
+            )
+            _live_rows[0] = rows
+            return importer.import_rows(
+                rows,
+                table,
+                on_batch_loaded=_on_rows,
+                should_cancel=_is_cancelled,
+                on_conflict=_shard_conflict_mode[0],
+            )
+
+        def _attempt():
+            try:
+                return _load_shard()
+            finally:
+                _shard_conflict_mode[0] = OnConflictMode.SKIP_EXISTING
+
+        def _release_rows() -> None:
+            rows, _live_rows[0] = _live_rows[0], None
+            close = getattr(rows, "close", None)
+            if callable(close):
+                close()
+
+        result = _retry_source_drops_in_process(
+            _attempt, cancelled=_is_cancelled, table_name=name,
+            release=_release_rows,
         )
         if (pending_loaded or pending_skipped) and progress_queue is not None:
             progress_queue.put((name, pending_loaded, pending_skipped))
@@ -682,6 +860,83 @@ def _drain_progress_queue(
         )
 
 
+def _migrate_table_with_source_retry(
+    migrator: "DataMigrator",
+    table: TableDef,
+    *,
+    on_rows: Callable[..., None],
+    handle: JobHandle,
+) -> object:
+    """Load ``table``, RE-READING it from a fresh snapshot if the source drops.
+
+    An Aurora MySQL failover (writer promotion during patching, an instance
+    replacement, an AZ event) closes every open connection, so a multi-hour Full
+    Load will meet one. Without this, the table in flight simply failed and waited
+    for a human to press Re-run.
+
+    The retry deliberately re-reads the table FROM THE START on a new connection
+    instead of resuming the dead read at its last primary key. Resuming would splice
+    two different MySQL snapshots into one table (the pre-failover rows plus rows as
+    of a minute later), leaving it consistent as of no single point in time -- and
+    the gapless Full Load -> CDC handoff depends on each table being consistent as
+    of the run's watermark, so a spliced table could leave a change the stream
+    replays against rows that already moved past it. Re-reading keeps that
+    guarantee; the idempotent load skips the rows already written, so the only cost
+    is re-read I/O (and reader sharding shrinks even that, since each shard already
+    holds its own snapshot).
+
+    Only CONNECTION-level failures retry (:func:`is_source_transient_error`); a data
+    or schema error would fail identically forever, so it propagates at once. A
+    cooperative stop is honored between attempts and never retried.
+    """
+    config = load_config()
+    attempts = max(1, int(config.full_load_source_retry_attempts))
+    backoff = max(0.0, float(config.full_load_source_retry_backoff_seconds))
+    name = table.name
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return migrator.migrate_table(
+                table, on_rows=on_rows, should_cancel=lambda: handle.cancelled
+            )
+        except _FullLoadStopped:
+            raise  # a user stop is not a failure to retry
+        except Exception as exc:  # noqa: BLE001 - classify transient vs permanent
+            if attempt >= attempts or not is_source_transient_error(exc):
+                raise
+            if handle.cancelled:
+                raise
+            delay = backoff * (2 ** (attempt - 1))
+            _LOGGER.warning(
+                "Full Load source connection lost for table %s (attempt %d/%d): "
+                "%s: %s -- re-reading from a fresh snapshot in %.0fs",
+                name, attempt, attempts, type(exc).__name__, exc, delay,
+            )
+            log_activity(
+                ActivityCategory.FULL_LOAD,
+                "load table",
+                status=ActivityStatus.INFO,
+                target=name,
+                detail=(
+                    f"source connection lost (attempt {attempt}/{attempts}) — "
+                    f"likely an Aurora failover; re-reading this table from a fresh "
+                    f"snapshot in {delay:.0f}s. Already-written rows are skipped "
+                    f"(idempotent), so no duplicates."
+                ),
+            )
+            # Wait for the promoted writer to take over (DNS re-points within ~30-60s
+            # on Aurora); reconnecting instantly would just fail again. Sleep in short
+            # slices so a user Stop is honored promptly instead of after the full wait.
+            waited = 0.0
+            while waited < delay:
+                if handle.cancelled:
+                    raise
+                _time.sleep(min(1.0, delay - waited))
+                waited += 1.0
+    # Unreachable: the loop either returns or raises.
+    raise AssertionError("source retry loop exited without a result")
+
+
 def _migrate_one_table(
     handle: JobHandle,
     job_id: str,
@@ -740,8 +995,8 @@ def _migrate_one_table(
 
     try:
         outcome = _as_load_result(
-            migrator.migrate_table(
-                table, on_rows=_on_rows, should_cancel=lambda: handle.cancelled
+            _migrate_table_with_source_retry(
+                migrator, table, on_rows=_on_rows, handle=handle
             )
         )
     except _FullLoadStopped:
@@ -759,6 +1014,15 @@ def _migrate_one_table(
         return _TableLoadOutcome.STOPPED
     except Exception as exc:  # noqa: BLE001 - recorded as a per-table failure
         message = f"{type(exc).__name__}: {exc}"
+        # A dropped SOURCE connection (Aurora failover) is an EXPECTED event on a
+        # multi-hour load, and the raw driver text ("(2013, 'Lost connection to MySQL
+        # server during query')") tells the operator nothing about what to do. Append
+        # the what-happened/what-next explanation so the error log, the activity log,
+        # and the inline per-table message all explain it the same way. Only added
+        # when the retries above were exhausted -- a recovered failover never gets here.
+        hint = source_error_hint(exc)
+        if hint:
+            message = f"{message} — {hint}"
         _LOGGER.warning("Full Load failed for table %s: %s", name, message)
         code = _error_code(exc)
         error_log.record(
@@ -1739,6 +2003,19 @@ class BatchedTableMigrator:
             tp = max(1, cfg.full_load_table_parallelism)
             effective_shards = max(1, min(cfg.full_load_reader_shards,
                                           max_src_readers // tp))
+            # Say so when the configured shard count was clamped. Silently loading
+            # with fewer readers than asked for looks like the setting had no effect;
+            # naming the ceiling (and that it protects the SOURCE's max_connections)
+            # makes the trade-off visible and points at the knob that would help.
+            if effective_shards < cfg.full_load_reader_shards:
+                _LOGGER.info(
+                    "Table %s: reader shards clamped %d -> %d (table parallelism %d "
+                    "x shards must stay <= %d concurrent source readers to protect "
+                    "the source's max_connections; lower table parallelism to allow "
+                    "more shards per table)",
+                    table.name, cfg.full_load_reader_shards, effective_shards, tp,
+                    max_src_readers,
+                )
             shard_ranges = self._exporter.plan_pk_shard_ranges(
                 self._inputs.source_config, table, effective_shards,
                 min_rows=cfg.full_load_shard_min_rows,
@@ -1822,7 +2099,18 @@ class BatchedTableMigrator:
             # A cooperative stop interrupted the source read between pages (the
             # importer was pulling rows). Treat it exactly like a batch-boundary
             # stop: incomplete + retryable, not a data error.
+            _close_row_streams(rows, shard_sources)
             raise _FullLoadStopped(table.name) from exc
+        except BaseException:
+            # Any other failure (notably a dropped source connection) abandons these
+            # row streams mid-read. They are GENERATORS that dispose their source
+            # engine in their own ``finally``, so an abandoned one keeps its MySQL
+            # connection open until it is closed or garbage-collected -- and the
+            # raising frame keeps it referenced. Close them here so the connection is
+            # released as the exception leaves, instead of staying pinned while a
+            # caller waits out a failover and opens ANOTHER connection to retry.
+            _close_row_streams(rows, shard_sources)
+            raise
         if result.cancelled:
             raise _FullLoadStopped(table.name)
         if result.failures:

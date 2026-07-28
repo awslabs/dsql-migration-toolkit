@@ -1826,6 +1826,16 @@ def test_validation_run_guard_blocks_rerun_while_a_recheck_runs() -> None:
     assert validation_run_guard_reason(manager, state) is None
 
 
+class _TableEl(_CutoverEl):
+    """A ui.table double supporting the slot/bind chaining _render_tables uses."""
+
+    def add_slot(self, *_a, **_k):
+        return _CutoverEl()
+
+    def bind_value(self, *_a, **_k):
+        return self
+
+
 class _RecheckUi(_CutoverUi):
     """A NiceGUI double that also records button callbacks, spinners and tooltips."""
 
@@ -1846,6 +1856,12 @@ class _RecheckUi(_CutoverUi):
 
     def separator(self, *_a, **_k):
         return _CutoverEl()
+
+    def table(self, *_a, **_k):
+        return _TableEl()
+
+    def input(self, *_a, **_k):
+        return _TableEl()
 
 
 def _failing_report_for_render() -> ValidationReport:
@@ -1955,6 +1971,138 @@ def test_recheck_note_collapses_a_long_table_list() -> None:
     blob = " ".join(ui.texts)
     assert "9 table(s) re-checked at just now" in blob
     assert "and 3 more" in blob  # 6 shown + 3 collapsed
+
+
+def _fast_sweep_report(
+    *, mode: ValidationMode = ValidationMode.CHECKSUM, reconciled: bool = False
+) -> ValidationReport:
+    """A report where 'customers' passed by ROW COUNT only (fast sweep skipped deep).
+
+    'orders' carries the run's deep-check evidence (a reconcile result when
+    ``reconciled``), so report_run_options can recover what the run actually ran.
+    """
+    orders = TableValidationResult(
+        table="orders",
+        source_row_count=10,
+        target_row_count=10,
+        row_count_match=True,
+        matched=True,
+        checksum_match=True if mode is ValidationMode.CHECKSUM else None,
+        reconcile=(
+            ReconcileResult(
+                pk_column="id",
+                source_count=10,
+                target_count=10,
+                missing_on_target=0,
+                extra_on_target=0,
+                consistent=True,
+            )
+            if reconciled
+            else None
+        ),
+    )
+    customers = TableValidationResult(
+        table="customers",
+        source_row_count=3,
+        target_row_count=3,
+        row_count_match=True,
+        matched=True,
+        deep_checks_skipped=True,  # fast sweep: counts agreed, deep checks skipped
+    )
+    return ValidationReport.build(mode=mode, items=[orders, customers])
+
+
+def test_deep_recheck_adds_checks_only_when_a_deeper_check_exists() -> None:
+    from dsql_migrator.ui.validation import deep_recheck_adds_checks
+
+    # CHECKSUM mode -> a checksum can be run for the count-only table.
+    assert deep_recheck_adds_checks(_fast_sweep_report()) is True
+    # ROW_COUNT mode but reconciliation ran -> a record reconciliation can be run.
+    assert (
+        deep_recheck_adds_checks(
+            _fast_sweep_report(mode=ValidationMode.ROW_COUNT, reconciled=True)
+        )
+        is True
+    )
+    # ROW_COUNT mode, no reconciliation -> nothing deeper exists; re-checking would
+    # repeat the identical count comparison, so the action must be withheld.
+    assert (
+        deep_recheck_adds_checks(_fast_sweep_report(mode=ValidationMode.ROW_COUNT))
+        is False
+    )
+
+
+def test_tables_offer_deep_check_for_count_only_tables() -> None:
+    from dsql_migrator.ui.validation import _render_tables
+
+    report = _fast_sweep_report()
+    called: list[list[str]] = []
+    ui = _RecheckUi()
+    _render_tables(ui, report, recheck_provider=lambda t: called.append(list(t)))
+    blob = " ".join(ui.texts)
+    assert "verified by row count only" in blob
+    assert "Deep-check 1 count-only table(s)" in blob
+    # It re-checks exactly the count-only tables, not the whole report.
+    next(cb for text, cb in ui.buttons if text.startswith("Deep-check"))()
+    assert called == [["customers"]]
+
+
+def test_tables_withhold_deep_check_when_nothing_deeper_can_run() -> None:
+    from dsql_migrator.ui.validation import _render_tables
+
+    ui = _RecheckUi()
+    _render_tables(
+        ui,
+        _fast_sweep_report(mode=ValidationMode.ROW_COUNT),
+        recheck_provider=lambda _t: None,
+    )
+    blob = " ".join(ui.texts)
+    # No no-op button; the honest fallback advice stands instead.
+    assert "Deep-check" not in blob
+    assert "turn off " in blob and "re-run" in blob
+
+
+def test_tables_show_busy_while_deep_checking() -> None:
+    from dsql_migrator.ui.validation import _render_tables
+
+    ui = _RecheckUi()
+    _render_tables(
+        ui,
+        _fast_sweep_report(),
+        recheck_provider=lambda _t: None,
+        rechecking_tables=("customers",),
+    )
+    blob = " ".join(ui.texts)
+    assert "Deep-checking…" in blob and ui.spinners >= 1
+    assert "Deep-check 1" not in blob
+
+
+def test_tables_have_no_recheck_action_without_a_provider() -> None:
+    from dsql_migrator.ui.validation import _render_tables
+
+    ui = _RecheckUi()
+    _render_tables(ui, _fast_sweep_report())
+    blob = " ".join(ui.texts)
+    # A passing table never grows a button on its own (only the fast-sweep footnote
+    # offers one, and only when a provider is supplied).
+    assert "Deep-check" not in blob
+    assert ui.spinners == 0
+
+
+def test_passing_tables_get_no_recheck_button_in_the_failing_section() -> None:
+    from dsql_migrator.ui.validation import _render_failing_tables
+
+    # An all-passing report renders NO "tables needing attention" section at all, so
+    # a clean run shows no re-check affordance anywhere in it.
+    ui = _RecheckUi()
+    _render_failing_tables(
+        ui,
+        _fast_sweep_report(),
+        summarize_validation(_fast_sweep_report()),
+        recheck_provider=lambda _t: None,
+    )
+    assert ui.texts == []
+    assert ui.buttons == []
 
 
 def _build_screen_for_recheck(*, target_verified: bool = True):
