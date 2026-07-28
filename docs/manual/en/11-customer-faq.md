@@ -92,11 +92,31 @@ tables. See [Chapter 3 — Full Load](03-full-load.md).
 
 **Q8. Is Full Load idempotent? What if it's interrupted?**
 
-Yes. Rows load in bounded-parallel, idempotent `INSERT … ON CONFLICT` batches, each
-mapped to a stable PK range. If a load is **interrupted** (crash, stop, task
-replacement), re-running it **re-runs only the unfinished PK ranges** and converges
-to exactly the uninterrupted state — **no duplicates, no loss**. Per-table failures
-are isolated: one bad table doesn't abort the others.
+Yes. Rows load in bounded-parallel, idempotent batches, each mapped to a stable PK
+range. If a load is **interrupted** (crash, stop, task replacement), re-running it
+**re-runs only the unfinished PK ranges** and converges to exactly the uninterrupted
+state — **no duplicates, no loss**. Per-table failures are isolated: one bad table
+doesn't abort the others.
+
+
+**Q8a. What if the source Aurora cluster fails over mid-load?**
+
+It's handled automatically. A writer promotion (patching, an instance replacement, an
+AZ event) closes every open MySQL connection, so a multi-hour load will meet one. The
+affected table is **re-read automatically** (3 attempts by default, with a 15s → 30s →
+60s backoff to let DNS re-point at the promoted writer).
+
+The retry deliberately **re-reads that table from a fresh consistent snapshot**
+instead of resuming the dead read where it stopped: resuming would splice two
+different MySQL snapshots into one table, and the gapless Full Load → CDC handoff
+depends on each table being consistent as of a single point in time. Because the load
+is idempotent, the rows already written are skipped — the retry costs re-read I/O, not
+duplicate rows.
+
+Only **connection-level** failures retry; a data or schema error fails immediately
+(retrying it would just add delay before the same failure). If the retries are
+exhausted, the per-table error says so in plain language and re-running is safe.
+Tunable via `DSQL_MIGRATOR_FULL_LOAD_SOURCE_RETRY_ATTEMPTS` (1 = no retry).
 
 
 **Q9. Does Full Load need binary logging on the source?**
@@ -178,21 +198,31 @@ infrastructure* does this). Full Load alone provisions **no** streaming
 infrastructure. See [Chapter 6 §6.2](06-limitations.md#62-migration-process-limits).
 
 
-**Q17. How long does CDC infrastructure take to deploy / tear down — and why so long?**
+**Q17. How long do the CDC steps take — and why so long?**
 
-Both deploy and teardown take roughly **15–25 minutes**. It isn't instant, by
-design — here's why.
+CDC has **three** long-running operations, and they are separate. Budget for all
+three (a common surprise is treating *Start CDC* as instant because the
+infrastructure is already up):
 
-**Why startup (deploy) takes a while** — the cdc-stack creates several AWS
-resources in order:
+| Operation | Typical | What dominates it |
+|---|---|---|
+| **Deploy CDC infrastructure** | **~15–20 min** | Waiting for the MSK Serverless cluster to become ready |
+| **Start CDC** (create the connectors) | **~20–30 min** | Each MSK Connect connector going `CREATING → RUNNING` |
+| **Delete CDC infrastructure** | **~15–25 min** | ENI cleanup for the VPC-attached Lambda (see below) |
 
-1. **Provisioning the MSK Serverless cluster** — waiting for the managed Kafka
-   cluster to become ready (the biggest single chunk).
-2. **Creating the two MSK Connect connectors** — the source (Debezium) connector
-   first (so its topics exist), then the sink (DSQL) connector. Each takes a few
-   minutes to go `CREATING → RUNNING`, and they run in sequence, so the times add up.
-3. Meanwhile the in-VPC **offset-seeder Lambda** seeds the offset for the gapless
-   handoff.
+None of this is instant, by design — here's why.
+
+**Why deploying the infrastructure takes a while** — the cdc-stack provisions the
+MSK Serverless cluster and waits for it to become ready. That wait is the single
+biggest chunk, and it is AWS-side: there is nothing to tune.
+
+**Why Start CDC takes a while** — it creates the two MSK Connect connectors (source
+= Debezium, sink = DSQL). Both are submitted in **one pass and deploy in parallel**
+(the stack pre-creates the per-table topics first, so the sink no longer has to wait
+for the source to create them), and the step waits for both to reach `RUNNING`
+together. Even so, an MSK Connect connector takes many minutes to start, so this is
+the second-largest wait in the CDC path — plan for it separately from the
+infrastructure deploy.
 
 **Why teardown takes a while** — deleting MSK itself is relatively quick, but the
 last resource to go — the in-VPC **offset-seeder Lambda** — is the bottleneck.
@@ -204,8 +234,15 @@ delay is hard to avoid on teardown.
 
 > **Tip:** for iterating or restarting, **restart in place (keep the existing
 > infrastructure)** rather than full delete-and-recreate where possible — it avoids
-> this ~20-minute ENI cleanup. Tear the stack down for good once cut-over is done and
+> this ~20-minute ENI cleanup. **Stop CDC** preserves the MSK cluster, plugins, VPC
+> and IAM (it only removes the two connectors), so a later **Start CDC** skips the
+> infrastructure wait entirely and resumes from the offsets kept in the cluster's
+> `connect-offsets` topic. Tear the stack down for good once cut-over is done and
 > you no longer need CDC.
+
+Each of these operations records its **outcome** (succeeded / failed, with the
+elapsed time) in the activity log, so you can confirm after the fact that — for
+example — the Stop you ran before cut-over really did complete.
 
 ---
 
@@ -277,7 +314,21 @@ increasingly strict passes** — each more precise (and more expensive) than the
   unexplained missing/extra row means it is *not* a MATCH.
 - **A count-only "match" is never trusted.** Equal counts can still hide differing
   values, so a table must also pass the checksum and PK reconciliation to count as a
-  true match.
+  true match. If you enable the optional **Fast sweep** (deep-check only the tables
+  whose counts differ), the tables it skipped are labelled *verified by row count
+  only* rather than being reported as full matches — and you can **deep-check just
+  those** from the report without re-running everything.
+- **A few column types are excluded from the checksum by design**, because their
+  text form legitimately differs between the two engines while the value is equal:
+  floating-point (`FLOAT`/`DOUBLE`) and `JSON` (MySQL renders a spaced canonical
+  form, a CDC-written row holds the compact serialization). Row counts and every
+  other column still validate, and PK reconciliation is unaffected.
+
+**Fixed a mismatch? Re-check that one table.** Each failing table in the report has a
+**Re-check** action (plus *Re-check all N*) that re-compares only that table with the
+same options and merges the result into the existing report — so a multi-hour
+validation doesn't have to be re-run to confirm a single fix, and the overall
+go/no-go verdict updates on its own.
 
 So running this before cut-over means you decide to switch based on **proof that
 source and target actually match**, not on hope. See
