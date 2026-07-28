@@ -5,6 +5,31 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.141
+
+### Fixed
+
+- **CDC lifecycle actions now record their OUTCOME in the activity log, not just
+  "started".** Deploy infrastructure / Start CDC / Stop CDC / Delete infrastructure
+  each take minutes to tens of minutes, but only the submit was logged — nothing
+  recorded whether the action succeeded, failed, or how long it took. The audit trail
+  therefore could not answer the question that matters most at cut-over: *did the
+  Stop actually succeed, and when?* Connector-state transitions were the only proxy,
+  and those are written by the UI poller, so an action completing while the operator
+  was on another screen was never logged at all (recovering a Start CDC duration from
+  the log required guessing from later poll lines).
+  - Each lifecycle job body is now wrapped so the outcome is logged **from the job
+    thread**, independent of what the UI is showing: `success` with the elapsed time,
+    `failure` with the elapsed time plus the error, or `info` for a cooperative
+    cancel (`run_cdc_*` returns normally when cancelled, so the job handle — not an
+    exception — distinguishes "stopped early" from "finished").
+  - A failure is still re-raised, so the JobManager keeps marking the job `FAILED`.
+  - The `core` deployer is untouched: `core` deliberately has no activity-log
+    dependency, so the logging stays in the UI layer (mirroring Full Load).
+  - Known gap: if the process dies mid-action, that job keeps only its `started`
+    line (the JobManager reconciles it to `FAILED` on restart without logging an
+    activity event).
+
 ## v0.1.140
 
 ### Fixed

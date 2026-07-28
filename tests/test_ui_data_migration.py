@@ -6416,3 +6416,116 @@ def test_too_many_connections_is_transient_with_its_own_advice() -> None:
     # A failover still gets the failover hint, not this one.
     failover_hint = source_error_hint(_lost_connection())
     assert failover_hint is not None and "failover" in failover_hint.lower()
+
+
+# ---------------------------------------------------------------------------
+# CDC lifecycle actions log their OUTCOME (not just "started")
+# ---------------------------------------------------------------------------
+
+
+class _RecordingHandle:
+    def __init__(self, cancelled: bool = False) -> None:
+        self.cancelled = cancelled
+
+
+def _capture_cdc_events(monkeypatch) -> list:
+    """Patch the CDC activity-log anchor and return the captured event list."""
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+
+    events: list = []
+
+    def _fake(action, *, detail=None, status=None):
+        events.append((action, getattr(status, "value", status), detail))
+
+    monkeypatch.setattr(cdc_ui, "_log_cdc_event", _fake)
+    return events
+
+
+def test_cdc_lifecycle_logs_success_with_elapsed(monkeypatch) -> None:
+    # The gap this closes: the submit site logs only STARTED, so the audit trail
+    # could not answer "did the Stop before cut-over succeed, and when?".
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+
+    events = _capture_cdc_events(monkeypatch)
+    ran: list = []
+    wrapped = cdc_ui._logged_cdc_lifecycle(
+        "stop CDC connectors", detail="stack s1", work=lambda h: ran.append(h)
+    )
+    handle = _RecordingHandle()
+    wrapped(handle)
+
+    assert ran == [handle]  # the real work still runs, unchanged
+    (action, status, detail) = events[-1]
+    assert action == "stop CDC connectors"
+    assert status == "success"
+    assert "stack s1" in detail and "completed in" in detail
+
+
+def test_cdc_lifecycle_logs_failure_and_reraises(monkeypatch) -> None:
+    # A failed Start/Stop must be visible in the log AND still fail the job (the
+    # JobManager marks FAILED off the raised exception).
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+
+    events = _capture_cdc_events(monkeypatch)
+
+    def _boom(_handle):
+        raise RuntimeError("CFN update failed")
+
+    wrapped = cdc_ui._logged_cdc_lifecycle(
+        "start CDC connectors", detail="stack s1", work=_boom
+    )
+    with pytest.raises(RuntimeError, match="CFN update failed"):
+        wrapped(_RecordingHandle())
+
+    (action, status, detail) = events[-1]
+    assert action == "start CDC connectors"
+    assert status == "failure"
+    assert "failed after" in detail
+    assert "RuntimeError" in detail and "CFN update failed" in detail
+
+
+def test_cdc_lifecycle_logs_cancel_as_info(monkeypatch) -> None:
+    # run_cdc_* RETURNS normally when cancelled, so the handle -- not an exception --
+    # is what distinguishes "stopped early" from "finished". A cancel is neither a
+    # success nor a failure.
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+
+    events = _capture_cdc_events(monkeypatch)
+    wrapped = cdc_ui._logged_cdc_lifecycle(
+        "deploy CDC infrastructure", detail="stack s1", work=lambda _h: None
+    )
+    wrapped(_RecordingHandle(cancelled=True))
+
+    (action, status, detail) = events[-1]
+    assert status == "info"
+    assert "cancelled after" in detail
+
+
+def test_cdc_lifecycle_outcome_is_logged_from_the_job_thread(monkeypatch) -> None:
+    # The whole point: the outcome must be recorded by the JOB, not by the UI poller
+    # (which only runs while the operator is looking at the CDC screen -- so a 20-30
+    # minute action completing while they are elsewhere was previously never logged).
+    import threading
+
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    from dsql_migrator.core.job_manager import JobManager
+
+    events = _capture_cdc_events(monkeypatch)
+    seen_threads: list = []
+
+    def _work(_handle):
+        seen_threads.append(threading.current_thread().name)
+
+    manager = JobManager()
+    job_id = manager.submit(
+        cdc_ui._logged_cdc_lifecycle(
+            "start CDC connectors", detail="stack s1", work=_work
+        )
+    )
+    assert manager.wait(job_id, timeout=5.0) is True
+    assert manager.get_status(job_id).status == "DONE"
+
+    # Logged without any UI render/poll happening.
+    assert [e[1] for e in events] == ["success"]
+    # And it ran off the main thread (i.e. on the job worker).
+    assert seen_threads and seen_threads[0] != threading.main_thread().name

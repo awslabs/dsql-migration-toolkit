@@ -114,12 +114,76 @@ from dsql_migrator.ui.design import (
 # re-export at the very bottom -- after these four names are already bound. The
 # moved functions reference them as module globals, so they must be real imports
 # here (a module-level ``__getattr__`` would not satisfy a function's LOAD_GLOBAL).
+from dsql_migrator.core.activity_log import ActivityStatus
 from dsql_migrator.ui.data_migration import (
     _log_cdc_event,
     migration_type_lock_reason,
     _LOGGER,
     _render_notice,
 )
+
+
+def _logged_cdc_lifecycle(action: str, *, detail: str, work):
+    """Wrap a CDC lifecycle job body so its OUTCOME reaches the activity log.
+
+    The four lifecycle actions (deploy infra / start / stop / delete) each take
+    minutes to tens of minutes, and the ``_log_cdc_event`` at their submit site only
+    records that they were STARTED. Nothing logged their result, so the audit trail
+    could not answer "did the Stop before cut-over actually succeed, and when?" --
+    the question that matters most at the moment an operator is deciding to cut over.
+    Connector-state transitions were the only proxy, and those are written by the UI
+    POLLER, so they are missed entirely whenever the operator navigates away while a
+    20-30 minute action runs.
+
+    Wrapping the job body fixes both: this runs on the background job thread, so the
+    outcome is recorded regardless of what the UI is showing. The wrapped ``work``
+    keeps its own signature/behavior, and the ``core`` deployer functions are
+    untouched -- ``core`` deliberately has no activity-log dependency, so the logging
+    stays in this UI layer (mirroring how Full Load logs from ``_engine``).
+
+    Records SUCCESS with the elapsed time, FAILURE with the elapsed time + the error
+    (re-raising so the JobManager still marks the job FAILED), or INFO for a
+    cooperative cancel -- ``run_cdc_*`` returns normally when cancelled, so the
+    handle is what distinguishes "stopped early" from "finished".
+
+    Known gap: if the PROCESS dies mid-action nothing runs here, so that job is left
+    with only its STARTED line (the JobManager reconciles it to FAILED on restart,
+    but does not log an activity event).
+    """
+    import time as _time
+
+    def wrapped(handle) -> None:
+        started = _time.monotonic()
+
+        def _elapsed() -> str:
+            return format_duration(max(0.0, _time.monotonic() - started))
+
+        try:
+            work(handle)
+        except Exception as exc:  # noqa: BLE001 - log the outcome, then re-raise
+            _log_cdc_event(
+                action,
+                status=ActivityStatus.FAILURE,
+                detail=(
+                    f"{detail} — failed after {_elapsed()}: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+            raise
+        if bool(getattr(handle, "cancelled", False)):
+            _log_cdc_event(
+                action,
+                status=ActivityStatus.INFO,
+                detail=f"{detail} — cancelled after {_elapsed()}",
+            )
+            return
+        _log_cdc_event(
+            action,
+            status=ActivityStatus.SUCCESS,
+            detail=f"{detail} — completed in {_elapsed()}",
+        )
+
+    return wrapped
 
 
 # How often the CDC step polls MSK Connect + the DSQL target for live status.
@@ -2229,9 +2293,13 @@ def _start_cdc_deploy(
             template_body=template_body,
         )
 
-    job_id = job_manager.submit(work)
+    _action = "start CDC connectors"
+    _detail = f"stack {stack_name}"
+    job_id = job_manager.submit(
+        _logged_cdc_lifecycle(_action, detail=_detail, work=work)
+    )
     migration_state.set_cdc_deploy_job_id(job_id, kind="start")
-    _log_cdc_event("start CDC connectors", detail=f"stack {stack_name}")
+    _log_cdc_event(_action, detail=_detail)
     ui.notify("Start CDC submitted — watch the progress below.", type="positive", position="top")  # type: ignore[attr-defined]
     refresh()
 
@@ -2582,9 +2650,13 @@ async def _start_cdc_infra_deploy(
             aws_profile=aws_profile,
         )
 
-    job_id = job_manager.submit(work)
+    _action = "deploy CDC infrastructure"
+    _detail = f"stack {stack_name}"
+    job_id = job_manager.submit(
+        _logged_cdc_lifecycle(_action, detail=_detail, work=work)
+    )
     migration_state.set_cdc_deploy_job_id(job_id, kind="infra")
-    _log_cdc_event("deploy CDC infrastructure", detail=f"stack {stack_name}")
+    _log_cdc_event(_action, detail=_detail)
     ui.notify("Infrastructure deploy started (~15-20 min).", type="positive", position="top")  # type: ignore[attr-defined]
     refresh()
 
@@ -2613,7 +2685,11 @@ def _start_cdc_stop(
             on_log=migration_state.append_cdc_deploy_log,
         )
 
-    job_id = job_manager.submit(work)
+    _action = "stop CDC connectors"
+    _detail = f"stack {stack_name}"
+    job_id = job_manager.submit(
+        _logged_cdc_lifecycle(_action, detail=_detail, work=work)
+    )
     migration_state.set_cdc_deploy_job_id(job_id, kind="stop")
     # Durable marker → the persistent cross-view "teardown in progress" banner (so
     # navigating away from the CDC step doesn't hide the running stop). Ownership
@@ -2632,7 +2708,7 @@ def _start_cdc_stop(
                 "cleanup_secret": False,
             },
         )
-    _log_cdc_event("stop CDC connectors", detail=f"stack {stack_name}")
+    _log_cdc_event(_action, detail=_detail)
     ui.notify("Stop CDC submitted — removing connectors.", type="positive", position="top")  # type: ignore[attr-defined]
     refresh()
 
@@ -2671,7 +2747,11 @@ def _start_cdc_delete(
             cleanup_source_secret=cleanup_secret,
         )
 
-    job_id = job_manager.submit(work)
+    _action = "delete CDC infrastructure"
+    _detail = f"stack {stack_name}"
+    job_id = job_manager.submit(
+        _logged_cdc_lifecycle(_action, detail=_detail, work=work)
+    )
     migration_state.set_cdc_deploy_job_id(job_id, kind="delete")
     # Durable marker → the persistent cross-view "teardown in progress" banner (the
     # delete runs ~15–45 min; the banner keeps it visible on every step, not just
@@ -2691,7 +2771,7 @@ def _start_cdc_delete(
                 "cleanup_secret": cleanup_secret,
             },
         )
-    _log_cdc_event("delete CDC infrastructure", detail=f"stack {stack_name}")
+    _log_cdc_event(_action, detail=_detail)
     ui.notify("Delete CDC infrastructure submitted.", type="warning", position="top")  # type: ignore[attr-defined]
     refresh()
 
