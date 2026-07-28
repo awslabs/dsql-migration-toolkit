@@ -64,6 +64,30 @@ _SETS: dict[str, tuple[list[str], list[tuple[str, str]]]] = {
             ("product_reviews", "review_id"),
         ],
     ),
+    # Seoul E2E demo schema (scripts/seed_sample_db.py): same 11-table shape as
+    # customers_sample_new, ~8.5M rows (order_items 3M, product_reviews 2M,
+    # orders/payments 1M, customer_addresses 750k, customers 500k, products 200k).
+    # Used for the ap-northeast-2 Full Load + CDC end-to-end run.
+    "ecommerce_demo": (
+        [
+            "categories", "countries", "regions", "suppliers", "products",
+            "customers", "customer_addresses", "orders", "order_items",
+            "payments", "product_reviews",
+        ],
+        [
+            ("categories", "category_id"),
+            ("countries", "country_id"),
+            ("regions", "region_id"),
+            ("suppliers", "supplier_id"),
+            ("products", "product_id"),
+            ("customers", "customer_id"),
+            ("customer_addresses", "address_id"),
+            ("orders", "order_id"),
+            ("order_items", "order_item_id"),
+            ("payments", "payment_id"),
+            ("product_reviews", "review_id"),
+        ],
+    ),
     # New type-coverage schema: a small parent->child/lob FK chain that exercises
     # the maximum MySQL type/syntax surface (incl. LOB). typetest_loud and
     # typetest_spatial are intentionally EXCLUDED from the migrated set -- they
@@ -93,6 +117,31 @@ _SETS: dict[str, tuple[list[str], list[tuple[str, str]]]] = {
             ("edge_wide", "id"),
             ("edge_empty", "id"),
         ],
+    ),
+    # us-east-1 large-scale Full Load THROUGHPUT test: 20 uniform tables (~52.7 GB
+    # / ~43M rows each, ~1 TB total), each a single BIGINT UNSIGNED AUTO_INCREMENT
+    # PK `id`, no secondary indexes. No FK chain (independent tables), so order is
+    # arbitrary. Drives the in-VPC ECS RunTask perf measurement.
+    "dsql_test_multi": (
+        [f"t{n:02d}" for n in range(1, 21)],
+        [(f"t{n:02d}", "id") for n in range(1, 21)],
+    ),
+    # us-east-1 SINGLE huge-table Full Load test: one ~1 TB table (~865M rows),
+    # BIGINT UNSIGNED AUTO_INCREMENT PK `id`, no secondary indexes. Exercises the
+    # single-reader (one large table) throughput path vs dsql_test_multi's
+    # multi-table parallelism.
+    "dsql_test_large": (
+        ["big_events"],
+        [("big_events", "id")],
+    ),
+    # FAST storm-repro: same 20 uniform tables as dsql_test_multi but only ~500K
+    # rows each (copied from the head of dsql_test_multi), so a 16x32 (=512
+    # connection) load finishes the front-16 together in ~1-2 min and reproduces
+    # the connection-storm at simultaneous completion WITHOUT waiting for a 1 TB
+    # load. Same shape (BIGINT auto_increment PK `id`, dist_key for composite).
+    "dsql_test_small": (
+        [f"t{n:02d}" for n in range(1, 21)],
+        [(f"t{n:02d}", "id") for n in range(1, 21)],
     ),
 }
 
