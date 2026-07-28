@@ -111,6 +111,15 @@ _SPATIAL_TYPE_BASES = frozenset(
 # DSQL hard limit: at most 255 columns per table (cluster quotas/database limits).
 _MAX_COLUMNS_PER_TABLE = 255
 
+# DSQL hard limit: at most 24 indexes per table -- error 54000 "more than 24 indexes
+# per table are not allowed" (MySQL allows 64). The PRIMARY KEY index COUNTS toward
+# this budget: verified against a live cluster, where the 24th CREATE INDEX on a table
+# that already had a PK failed and pg_indexes then showed 24 rows including the PK. So
+# a migrated table (DSQL always requires a PK) can carry at most 23 SECONDARY indexes,
+# which is what the source's reflected index list is compared against.
+_MAX_INDEXES_PER_TABLE = 24
+_MAX_SECONDARY_INDEXES_PER_TABLE = _MAX_INDEXES_PER_TABLE - 1
+
 # DSQL numeric maximum precision (numeric supports a precision of up to 38).
 _MAX_NUMERIC_PRECISION = 38
 
@@ -230,6 +239,76 @@ class ForeignKeyRule(Rule):
                         effort=EffortLevel.SIMPLE,
                     )
                 )
+        return findings
+
+
+class CascadeForeignKeyRule(Rule):
+    """Flag foreign keys whose referential ACTION cannot survive CDC.
+
+    Distinct from :class:`ForeignKeyRule` (which flags the constraint itself). A
+    ``ON DELETE/UPDATE CASCADE``, ``SET NULL`` or ``SET DEFAULT`` makes MySQL change
+    CHILD rows on its own, and InnoDB performs that change INSIDE the storage engine
+    -- so the resulting child-row writes never reach the binary log (MySQL bug
+    #32506, closed as documented behavior; the same reason cascaded actions do not
+    fire triggers). Debezium reads the binary log, so a CDC stream simply never sees
+    them, and DSQL has no foreign keys to re-perform the cascade on its own. The
+    child rows are therefore left behind on the target with **no error and no
+    warning** -- silently diverging while everything reports healthy.
+
+    This is a limitation of every binlog-based CDC tool (Debezium, DMS, Maxwell),
+    not of this migrator, but it is invisible unless it is called out BEFORE the
+    stream starts -- hence flagging it here, at planning time, rather than leaving
+    the operator to discover orphaned rows after cut-over.
+    """
+
+    rule_id = "FK_CASCADE_CDC_GAP"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            affected = [fk for fk in table.foreign_keys if fk.has_cascade_action]
+            if not affected:
+                continue
+            detail = ", ".join(
+                f"{fk.name} ("
+                + ", ".join(
+                    part
+                    for part in (
+                        f"ON DELETE {fk.on_delete.upper()}" if fk.on_delete else None,
+                        f"ON UPDATE {fk.on_update.upper()}" if fk.on_update else None,
+                    )
+                    if part
+                )
+                + ")"
+                for fk in affected
+            )
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, table.name),
+                    rule_id=self.rule_id,
+                    classification=Classification.MANUAL,
+                    risk=(
+                        f"Foreign keys with automatic referential actions "
+                        f"({detail}) change CHILD rows inside the InnoDB engine, so "
+                        "those changes are NOT written to the binary log. CDC reads "
+                        "the binary log, so it cannot replicate them and Aurora DSQL "
+                        "(no foreign keys) cannot re-perform them -- the child rows "
+                        "are left behind on the target with no error or warning. "
+                        "This affects every binlog-based CDC tool (MySQL bug #32506)."
+                    ),
+                    recommendation=(
+                        "Before starting CDC, replace the automatic action with "
+                        "EXPLICIT child-row statements in the application (e.g. "
+                        "delete the children, then the parent) so the changes are "
+                        "logged and replicated. You need this application logic on "
+                        "DSQL anyway, since DSQL has no foreign keys to cascade for "
+                        "you. Until then, enable the orphan-record check in "
+                        "Validation and quiesce source writes before the final "
+                        "cut-over comparison, so any divergence is caught."
+                    ),
+                    effort=EffortLevel.MEDIUM,
+                )
+            )
         return findings
 
 
@@ -514,6 +593,58 @@ class TooManyColumnsRule(Rule):
                         effort=EffortLevel.SIGNIFICANT,
                     )
                 )
+        return findings
+
+
+class TooManyIndexesRule(Rule):
+    """Flag tables that exceed the DSQL per-table index limit.
+
+    Caught here, at planning time, because the failure otherwise surfaces at the
+    WORST possible moment: the secondary indexes are created by post-load
+    ``CREATE INDEX ASYNC`` statements, so the limit is hit only AFTER Full Load has
+    finished writing every row -- turning a multi-hour load into a failed table that
+    a re-run cannot fix (the limit is not transient). The operator has to change the
+    schema and start over.
+
+    The budget is compared against SECONDARY indexes only: DSQL always requires a
+    primary key and its index counts toward the 24, leaving 23 for the source's
+    reflected indexes (which exclude the PK).
+    """
+
+    rule_id = "TOO_MANY_INDEXES"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            count = len(table.indexes)
+            if count <= _MAX_SECONDARY_INDEXES_PER_TABLE:
+                continue
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, table.name),
+                    rule_id=self.rule_id,
+                    classification=Classification.MANUAL,
+                    risk=(
+                        f"The table has {count} secondary indexes; with its primary "
+                        f"key that is {count + 1} against Aurora DSQL's limit of "
+                        f"{_MAX_INDEXES_PER_TABLE} indexes per table (MySQL allows "
+                        "64). The excess index fails with error 54000 \"more than "
+                        f"{_MAX_INDEXES_PER_TABLE} indexes per table are not "
+                        "allowed\" — and because secondary indexes are built AFTER "
+                        "the data loads, that failure appears only once Full Load has "
+                        "already written every row."
+                    ),
+                    recommendation=(
+                        f"Drop indexes you no longer need so at most "
+                        f"{_MAX_SECONDARY_INDEXES_PER_TABLE} secondary indexes remain "
+                        "(unused or redundant indexes are common — check "
+                        "sys.schema_unused_indexes on the source), or split the table. "
+                        "Decide before loading: re-running Full Load will not clear "
+                        "this, since the limit is not transient."
+                    ),
+                    effort=EffortLevel.MEDIUM,
+                )
+            )
         return findings
 
 
@@ -983,6 +1114,7 @@ def default_rules() -> list[Rule]:
     """
     return [
         ForeignKeyRule(),
+        CascadeForeignKeyRule(),
         TriggerRule(),
         ProcedureRule(),
         EventRule(),
@@ -992,6 +1124,7 @@ def default_rules() -> list[Rule]:
         PartitionedTableRule(),
         SpatialTypeRule(),
         TooManyColumnsRule(),
+        TooManyIndexesRule(),
         OversizedLobRule(),
         DecimalPrecisionRule(),
         EnumSetRule(),

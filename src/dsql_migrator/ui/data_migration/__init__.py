@@ -3191,8 +3191,20 @@ def _render_full_load_progress(
     # shown (not collapsible) so the live poll re-render never hides it.
     failures = [row for row in rows if row.error_message]
     quar_prefix = "quarantined row pk["
+    # An index that could not be created is recorded against the table like any other
+    # error-log entry, but it is NOT a load failure: every row is present and only an
+    # access path is missing. Split it out so it is reported as its own warning instead
+    # of appearing among the failed tables (which would contradict the table's DONE
+    # state and imply data was lost).
+    index_prefix = "index not created: "
+    index_only = [
+        r for r in failures if str(r.error_message).startswith(index_prefix)
+    ]
     real_failures = [
-        r for r in failures if not str(r.error_message).startswith(quar_prefix)
+        r
+        for r in failures
+        if not str(r.error_message).startswith(quar_prefix)
+        and not str(r.error_message).startswith(index_prefix)
     ]
     quarantined = [
         r for r in failures if str(r.error_message).startswith(quar_prefix)
@@ -3227,9 +3239,14 @@ def _render_full_load_progress(
         # a second line by a long message (the old row-nowrap did).
         with ui.row().classes("items-start gap-2 w-full no-wrap"):
             with ui.column().classes("gap-0 flex-1 min-w-0"):
-                ui.badge(table_name).props(
-                    f"color={'negative' if tone == 'error' else 'warning'} outline"
-                )
+                # negative = a real failure, warning = quarantine (rows dropped),
+                # info = data complete but an index is missing.
+                _badge_color = {
+                    "error": "negative",
+                    "warning": "warning",
+                    "info": "info",
+                }.get(tone, "warning")
+                ui.badge(table_name).props(f"color={_badge_color} outline")
                 inline_hint(ui, message, tone=tone, classes="text-xs break-words")
             if action is not None:
                 with ui.row().classes("items-center gap-1 no-wrap shrink-0"):
@@ -3278,6 +3295,35 @@ def _render_full_load_progress(
                     "Reload just this table (e.g. after fixing the source value)."
                 )
         return _btn
+
+    if index_only:
+        # Data-complete, index-missing. Deliberately its own INFO-toned block, apart
+        # from failures and quarantine: nothing is missing from the target, so the
+        # migration can proceed -- but the operator has to know an index they asked
+        # for does not exist, since queries relying on it will be slow.
+        with ui.column().classes("w-full gap-2"):
+            render_notice(
+                ui,
+                tone="info",
+                header=(
+                    f"Indexes not created ({len(index_only)}) — the data loaded "
+                    "completely"
+                ),
+                body=(
+                    "Every row is on the target; only these secondary indexes are "
+                    "missing, so no data was lost and you do not need to re-run the "
+                    "load. Add them later, or reduce the table's index count — Aurora "
+                    "DSQL allows 24 indexes per table, including the primary key. "
+                    "Queries that depend on a missing index will be slower until it "
+                    "exists."
+                ),
+            )
+            for row in index_only:
+                _failure_row(
+                    table_name=f"{row.table} · Done — index missing",
+                    message=row.error_message,
+                    tone="info",
+                )
 
     if quarantined:
         with ui.column().classes("w-full gap-2"):

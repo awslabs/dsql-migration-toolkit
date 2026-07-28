@@ -463,6 +463,7 @@ def test_default_rules_contains_all_documented_rule_ids() -> None:
     rule_ids = {rule.rule_id for rule in default_rules()}
     assert rule_ids == {
         "FK_UNSUPPORTED",
+        "FK_CASCADE_CDC_GAP",
         "TRIGGER_UNSUPPORTED",
         "PROC_PLPGSQL",
         "EVENT_UNSUPPORTED",
@@ -472,6 +473,7 @@ def test_default_rules_contains_all_documented_rule_ids() -> None:
         "PARTITIONED_TABLE",
         "SPATIAL_TYPE",
         "TOO_MANY_COLUMNS",
+        "TOO_MANY_INDEXES",
         "OVERSIZED_LOB",
         "NUMERIC_PRECISION",
         "ENUM_SET_TYPE",
@@ -799,3 +801,184 @@ def test_render_text_report_matches_export_text() -> None:
     report = _assess(_representative_inventory())
     assert render_text_report(report) == export_report(report, "text")
 
+
+
+# ---------------------------------------------------------------------------
+# FK referential actions: the CDC gap (MySQL bug #32506)
+# ---------------------------------------------------------------------------
+
+
+def _fk(name="fk_child", *, on_delete=None, on_update=None):
+    from dsql_migrator.core.models import ForeignKeyDef
+
+    return ForeignKeyDef(
+        name=name,
+        columns=["parent_id"],
+        referenced_table="parent",
+        referenced_columns=["id"],
+        on_delete=on_delete,
+        on_update=on_update,
+    )
+
+
+def _child_table(*fks):
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    return TableDef(
+        name="child",
+        columns=[
+            ColumnDef(name="id", mysql_type="int", nullable=False),
+            ColumnDef(name="parent_id", mysql_type="int"),
+        ],
+        primary_key=["id"],
+        foreign_keys=list(fks),
+    )
+
+
+def test_has_cascade_action_only_for_actions_that_write_child_rows() -> None:
+    # RESTRICT/NO ACTION only REJECT the parent change, so they never produce an
+    # unlogged child write -- they must NOT be flagged. CASCADE / SET NULL /
+    # SET DEFAULT all change child rows inside InnoDB, so all three must be.
+    assert _fk(on_delete="CASCADE").has_cascade_action is True
+    assert _fk(on_update="CASCADE").has_cascade_action is True
+    assert _fk(on_delete="SET NULL").has_cascade_action is True
+    assert _fk(on_delete="SET DEFAULT").has_cascade_action is True
+    assert _fk(on_delete="RESTRICT").has_cascade_action is False
+    assert _fk(on_delete="NO ACTION").has_cascade_action is False
+    assert _fk().has_cascade_action is False  # default (no action recorded)
+    # Case- and separator-insensitive (drivers report "SET NULL" or "SET_NULL").
+    assert _fk(on_delete="set null").has_cascade_action is True
+    assert _fk(on_delete="SET_NULL").has_cascade_action is True
+
+
+def test_cascade_fk_rule_flags_the_cdc_gap_with_the_action_named() -> None:
+    from dsql_migrator.core.assessor import CascadeForeignKeyRule
+
+    inventory = SourceInventory(tables=[_child_table(_fk(on_delete="CASCADE"))])
+    (finding,) = CascadeForeignKeyRule().evaluate(inventory)
+    assert finding.rule_id == "FK_CASCADE_CDC_GAP"
+    # MANUAL, not UNSUPPORTED: the table migrates fine; the operator has to move the
+    # cascade into the application (which DSQL requires anyway).
+    assert finding.classification is Classification.MANUAL
+    # The risk must name the concrete action, why CDC misses it, and that it is silent.
+    assert "ON DELETE CASCADE" in finding.risk
+    assert "binary log" in finding.risk
+    assert "no error" in finding.risk.lower()
+    assert "#32506" in finding.risk
+    # The recommendation must give the fix AND the interim safety net.
+    assert "EXPLICIT" in finding.recommendation
+    assert "orphan" in finding.recommendation.lower()
+
+
+def test_cascade_fk_rule_reports_both_actions_and_skips_safe_ones() -> None:
+    from dsql_migrator.core.assessor import CascadeForeignKeyRule
+
+    both = _fk("fk_both", on_delete="CASCADE", on_update="CASCADE")
+    inventory = SourceInventory(tables=[_child_table(both)])
+    (finding,) = CascadeForeignKeyRule().evaluate(inventory)
+    assert "ON DELETE CASCADE" in finding.risk and "ON UPDATE CASCADE" in finding.risk
+
+    # A RESTRICT-only FK produces NO finding (it cannot cause unlogged child writes).
+    safe = SourceInventory(tables=[_child_table(_fk(on_delete="RESTRICT"))])
+    assert CascadeForeignKeyRule().evaluate(safe) == []
+    # And a table with no FKs at all is untouched.
+    assert CascadeForeignKeyRule().evaluate(
+        SourceInventory(tables=[_table_with_pk("plain")])
+    ) == []
+
+
+def test_cascade_fk_rule_is_separate_from_the_plain_fk_finding() -> None:
+    # Both rules fire on a CASCADE FK: one for the dropped constraint, one for the
+    # un-replicable action. They answer different questions and must not be merged.
+    from dsql_migrator.core.assessor import CascadeForeignKeyRule, ForeignKeyRule
+
+    inventory = SourceInventory(tables=[_child_table(_fk(on_delete="CASCADE"))])
+    assert [f.rule_id for f in ForeignKeyRule().evaluate(inventory)] == ["FK_UNSUPPORTED"]
+    assert [f.rule_id for f in CascadeForeignKeyRule().evaluate(inventory)] == [
+        "FK_CASCADE_CDC_GAP"
+    ]
+
+
+def test_foreign_key_def_defaults_keep_actions_optional() -> None:
+    # Older persisted inventories (and non-MySQL reflection) carry no actions; the
+    # model must accept that and report no cascade rather than failing validation.
+    from dsql_migrator.core.models import ForeignKeyDef
+
+    fk = ForeignKeyDef(
+        name="fk", columns=["a"], referenced_table="p", referenced_columns=["id"]
+    )
+    assert fk.on_delete is None and fk.on_update is None
+    assert fk.has_cascade_action is False
+
+
+# ---------------------------------------------------------------------------
+# DSQL per-table index limit (24, PRIMARY KEY included)
+# ---------------------------------------------------------------------------
+
+
+def _table_with_indexes(n: int, name: str = "wide"):
+    """A table with a PK and ``n`` single-column secondary indexes."""
+    return TableDef(
+        name=name,
+        columns=[ColumnDef(name="id", mysql_type="INT", nullable=False)]
+        + [ColumnDef(name=f"c{i}", mysql_type="INT") for i in range(1, n + 1)],
+        primary_key=["id"],
+        indexes=[IndexDef(name=f"ix_{i}", columns=[f"c{i}"]) for i in range(1, n + 1)],
+    )
+
+
+def test_too_many_indexes_budget_reserves_one_slot_for_the_primary_key() -> None:
+    # Verified against a live DSQL cluster: the 24th CREATE INDEX on a table that
+    # already had a PK failed, and pg_indexes then showed 24 rows INCLUDING the PK.
+    # So the source's reflected indexes (which exclude the PK) may number at most 23.
+    from dsql_migrator.core.assessor import TooManyIndexesRule
+
+    rule = TooManyIndexesRule()
+    assert rule.evaluate(SourceInventory(tables=[_table_with_indexes(22)])) == []
+    assert rule.evaluate(SourceInventory(tables=[_table_with_indexes(23)])) == []  # exactly at the limit
+    (finding,) = rule.evaluate(SourceInventory(tables=[_table_with_indexes(24)]))
+    assert finding.rule_id == "TOO_MANY_INDEXES"
+
+
+def test_too_many_indexes_explains_the_post_load_failure_timing() -> None:
+    # The whole point of catching this at planning time: secondary indexes are built
+    # by post-load CREATE INDEX ASYNC, so the limit is hit only AFTER Full Load has
+    # written every row -- and a re-run cannot fix it.
+    from dsql_migrator.core.assessor import TooManyIndexesRule
+
+    (finding,) = TooManyIndexesRule().evaluate(
+        SourceInventory(tables=[_table_with_indexes(30)])
+    )
+    assert finding.classification is Classification.MANUAL  # solvable: drop indexes
+    assert finding.effort is EffortLevel.MEDIUM
+    # Names the real counts on both sides of the limit.
+    assert "30 secondary indexes" in finding.risk
+    assert "31" in finding.risk and "24" in finding.risk
+    assert "MySQL allows" in finding.risk
+    # The error the user would otherwise hit, and WHEN.
+    assert "54000" in finding.risk
+    assert "after the data loads" in finding.risk.lower() or "already written" in finding.risk.lower()
+    # Actionable: how many to remove, where to look, and that re-running won't help.
+    assert "23 secondary indexes" in finding.recommendation
+    assert "unused" in finding.recommendation.lower()
+    assert "not transient" in finding.recommendation.lower()
+
+
+def test_too_many_indexes_reported_through_the_full_assessment() -> None:
+    # End-to-end through the default rule set (the rule must be registered).
+    inventory = SourceInventory(tables=[_table_with_indexes(25, name="orders")])
+    item = _item_for(_assess(inventory), "orders")
+    assert "TOO_MANY_INDEXES" in item.rule_id or "indexes" in item.risk
+    assert item.classification is Classification.MANUAL
+
+
+def test_clean_table_index_count_is_not_flagged() -> None:
+    from dsql_migrator.core.assessor import TooManyIndexesRule
+
+    # No indexes at all, and a normal handful, are both fine.
+    assert TooManyIndexesRule().evaluate(
+        SourceInventory(tables=[_table_with_pk("plain")])
+    ) == []
+    assert TooManyIndexesRule().evaluate(
+        SourceInventory(tables=[_table_with_indexes(5)])
+    ) == []

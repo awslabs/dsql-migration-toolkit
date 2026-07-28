@@ -6529,3 +6529,61 @@ def test_cdc_lifecycle_outcome_is_logged_from_the_job_thread(monkeypatch) -> Non
     assert [e[1] for e in events] == ["success"]
     # And it ran off the main thread (i.e. on the job worker).
     assert seen_threads and seen_threads[0] != threading.main_thread().name
+
+
+# ---------------------------------------------------------------------------
+# Index-creation failures are reported without failing the table
+# ---------------------------------------------------------------------------
+
+
+def test_index_failures_are_logged_as_info_not_a_table_failure() -> None:
+    # A missing index must not read as data loss: the entry goes to the error log so
+    # the operator knows WHICH index is absent, but the table stays loaded.
+    from dsql_migrator.core.error_log import ErrorLogStore
+    from dsql_migrator.ui.data_migration._engine import _record_index_failures
+
+    log = ErrorLogStore()
+    _record_index_failures(
+        log, "job-1", "orders",
+        ["ix_total: more than 24 indexes per table are not allowed"],
+    )
+    (record,) = log.records("job-1")
+    assert record.table == "orders"
+    assert "index not created" in record.message
+    assert "ix_total" in record.message
+    # It must say the data is fine and how to resolve it.
+    assert "DATA loaded" in record.message
+    assert "24 per table" in record.message
+    # No error code: this is not a row-level data error.
+    assert record.error_code is None
+
+
+def test_no_index_failures_logs_nothing() -> None:
+    from dsql_migrator.core.error_log import ErrorLogStore
+    from dsql_migrator.ui.data_migration._engine import _record_index_failures
+
+    log = ErrorLogStore()
+    _record_index_failures(log, "job-1", "orders", [])
+    _record_index_failures(log, "job-1", "orders", None)
+    assert log.records("job-1") == []
+
+
+def test_table_load_result_carries_index_failures() -> None:
+    from dsql_migrator.ui.data_migration._engine import TableLoadResult
+
+    r = TableLoadResult(rows_loaded=10, index_failures=("ix_a: boom",))
+    assert r.index_failures == ("ix_a: boom",)
+    # Default is empty, so an ordinary load reports nothing.
+    assert TableLoadResult(rows_loaded=10).index_failures == ()
+
+
+def test_worker_result_carries_index_failures_for_the_parent() -> None:
+    # The multiprocess path must report missing indexes too, or a run would behave
+    # differently depending on the worker mode.
+    from dsql_migrator.ui.data_migration._engine import _TableWorkerResult
+
+    r = _TableWorkerResult(
+        table_name="orders", status="DONE", index_failures=("ix_a: boom",)
+    )
+    assert r.index_failures == ("ix_a: boom",)
+    assert _TableWorkerResult(table_name="t", status="DONE").index_failures == ()

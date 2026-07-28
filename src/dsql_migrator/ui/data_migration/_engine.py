@@ -147,6 +147,12 @@ class TableLoadResult:
     # log so the loss is visible, never silent. Empty tuple for a clean load.
     rows_quarantined: int = 0
     quarantine_records: tuple = ()
+    # Post-load ``CREATE INDEX ASYNC`` statements that failed (one message each).
+    # Distinct from quarantined rows: the table's DATA is complete, so the table is
+    # reported as loaded -- only an access path is missing. Surfaced as a warning so
+    # the operator can add the index later (the common cause, DSQL's 24-index limit,
+    # is flagged before loading by the TOO_MANY_INDEXES assessment rule).
+    index_failures: tuple = ()
 
 
 def _as_load_result(value: "Union[int, TableLoadResult]") -> TableLoadResult:
@@ -469,6 +475,10 @@ class _TableWorkerResult:
     error_message: Optional[str] = None
     error_code: Optional[str] = None
     quarantine_records: tuple = ()
+    # Post-load index DDLs that failed. Carried back to the parent so a fully-loaded
+    # table still reports its missing indexes (a warning), rather than the worker
+    # either swallowing them or failing the table over an access path.
+    index_failures: tuple = ()
     shard_index: int = -1
 
 
@@ -685,6 +695,7 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
             rows_loaded=outcome.rows_loaded,
             rows_skipped=outcome.rows_skipped,
             quarantine_records=quarantine_recs,
+            index_failures=tuple(getattr(outcome, "index_failures", ()) or ()),
         )
     except _FullLoadStopped:
         return _TableWorkerResult(table_name=name, status="STOPPED")
@@ -804,6 +815,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             table_name=name, status="DONE", shard_index=args.shard_index,
             rows_loaded=result.rows_loaded, rows_skipped=result.conflicts,
             quarantine_records=quarantine_recs,
+            index_failures=tuple(getattr(result, "index_failures", ()) or ()),
         )
     except _FullLoadStopped:
         return _TableWorkerResult(table_name=name, status="STOPPED", shard_index=args.shard_index)
@@ -858,6 +870,48 @@ def _drain_progress_queue(
                 _advance_chunk_rows(job, n, dl, ds)
             )
         )
+
+
+def _record_index_failures(
+    error_log: ErrorLogStore, job_id: str, table_name: str, failures
+) -> None:
+    """Log post-load index-creation failures for a table that DID load its data.
+
+    Shared by the single-process and multiprocess paths so a missing index is
+    reported identically either way. Deliberately does NOT fail the table: every row
+    is present, so only an access path is absent -- failing here used to mark a
+    fully-loaded table FAILED and block the Validation gate on data with nothing
+    missing. Logged as INFO (not FAILURE) for the same reason.
+    """
+    entries = tuple(failures or ())
+    if not entries:
+        return
+    for failure in entries:
+        error_log.record(
+            job_id,
+            DataErrorRecord(
+                table=table_name,
+                chunk_id=table_name,
+                error_code=None,
+                message=(
+                    f"index not created: {failure} — the table's DATA loaded "
+                    "completely; add the index later or reduce the table's index "
+                    "count (Aurora DSQL allows 24 per table, including the "
+                    "primary key)"
+                ),
+                occurred_at=datetime.now(timezone.utc),
+            ),
+        )
+    log_activity(
+        ActivityCategory.FULL_LOAD,
+        "load table",
+        status=ActivityStatus.INFO,
+        target=table_name,
+        detail=(
+            f"{len(entries)} index(es) could not be created; the table's data "
+            "loaded completely (see the error log)"
+        ),
+    )
 
 
 def _migrate_table_with_source_retry(
@@ -1062,6 +1116,14 @@ def _migrate_one_table(
                     occurred_at=datetime.now(timezone.utc),
                 ),
             )
+        # Indexes that could not be created. Recorded so the operator sees WHICH
+        # index is missing, but deliberately NOT treated as a table failure: every
+        # row loaded, so the table is complete -- only an access path is absent.
+        # (Failing here used to mark a fully-loaded table FAILED and block the
+        # Validation gate on data that had nothing missing.)
+        _record_index_failures(
+            error_log, job_id, name, getattr(outcome, "index_failures", ())
+        )
         skipped_note = (
             f", {outcome.rows_skipped:,} already on target (skipped)"
             if outcome.rows_skipped
@@ -1353,6 +1415,11 @@ def _migrate_tables_in_parallel(
                                     message=f"quarantined row pk[{rec.get('primary_key')}]: {rec.get('message')}",
                                     occurred_at=datetime.now(timezone.utc),
                                 ))
+                            _record_index_failures(
+                                error_log, job_id, name,
+                                [f for r in shard_results[name]
+                                 for f in (r.index_failures or ())],
+                            )
                             had_q = len(all_quarantine) > 0
                             log_activity(ActivityCategory.FULL_LOAD, "load table",
                                 status=ActivityStatus.FAILURE if had_q else ActivityStatus.SUCCESS,
@@ -1372,6 +1439,9 @@ def _migrate_tables_in_parallel(
                                     message=f"quarantined row pk[{rec.get('primary_key')}]: {rec.get('message')}",
                                     occurred_at=datetime.now(timezone.utc),
                                 ))
+                            _record_index_failures(
+                                error_log, job_id, name, result.index_failures
+                            )
                             log_activity(ActivityCategory.FULL_LOAD, "load table",
                                 status=ActivityStatus.FAILURE if had_quarantine else ActivityStatus.SUCCESS,
                                 target=name,
@@ -2141,6 +2211,7 @@ class BatchedTableMigrator:
             rows_skipped=result.conflicts,
             rows_quarantined=getattr(result, "quarantined", 0) or 0,
             quarantine_records=tuple(getattr(result, "quarantine_records", ()) or ()),
+            index_failures=tuple(getattr(result, "index_failures", ()) or ()),
         )
 
     def _default_count_target_rows(self, table: TableDef) -> Optional[int]:

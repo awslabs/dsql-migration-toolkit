@@ -156,6 +156,32 @@ class ForeignKeyDef(BaseModel):
     columns: list[str] = Field(min_length=1)
     referenced_table: str = Field(min_length=1)
     referenced_columns: list[str] = Field(min_length=1)
+    # The MySQL referential ACTIONS (``CASCADE`` / ``SET NULL`` / ``RESTRICT`` /
+    # ``NO ACTION`` / ``SET DEFAULT``), upper-cased, or ``None`` for the default
+    # (``NO ACTION``). These matter beyond the dropped constraint itself: MySQL
+    # performs a cascade INSIDE the InnoDB engine, so the resulting child-row
+    # changes are never written to the binary log (MySQL bug #32506, closed as
+    # documented behavior -- the same reason "cascaded foreign key actions do not
+    # activate triggers"). Debezium reads the binary log, so a CDC stream CANNOT
+    # replicate them, and DSQL has no foreign keys to re-perform the cascade. The
+    # assessor uses these to flag the affected tables up front.
+    on_delete: Optional[str] = None
+    on_update: Optional[str] = None
+
+    @property
+    def has_cascade_action(self) -> bool:
+        """True when this FK cascades (or nulls/defaults) child rows automatically.
+
+        Any action MySQL performs on the child table by itself is invisible to the
+        binary log, so all of them are un-replicable by CDC -- not just ``CASCADE``.
+        ``RESTRICT``/``NO ACTION`` only REJECT the parent change, so they never
+        produce an unlogged child write and are excluded.
+        """
+        actions = {
+            (self.on_delete or "").upper().replace("_", " "),
+            (self.on_update or "").upper().replace("_", " "),
+        }
+        return bool(actions & {"CASCADE", "SET NULL", "SET DEFAULT"})
 
 
 class TableDef(BaseModel):

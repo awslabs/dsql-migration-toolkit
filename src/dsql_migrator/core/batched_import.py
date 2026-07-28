@@ -77,6 +77,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import re
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -357,6 +358,18 @@ class BatchedImportResult(BaseModel):
         ),
     )
     indexes_created: int = Field(default=0, ge=0)
+    index_failures: list[str] = Field(
+        default_factory=list,
+        description=(
+            "One credential-free message per post-load ``CREATE INDEX ASYNC`` that "
+            "could not be created. Kept SEPARATE from ``failures`` (which counts "
+            "DATA batches) because a failed index does not cost a single row: the "
+            "table's data is complete and usable, only an access path is missing. "
+            "The most common cause is DSQL's 24-indexes-per-table limit, which the "
+            "assessor now flags up front (TOO_MANY_INDEXES) -- but it is reported "
+            "here too, since an index can also fail for other reasons."
+        ),
+    )
     quarantined: int = Field(
         default=0,
         ge=0,
@@ -690,10 +703,13 @@ class BatchedImporter:
             )
             failures = sum(1 for outcome in outcomes if outcome.status == "FAILED")
             indexes_created = 0
+            index_failures: list[str] = []
             # Skip post-load indexing when the table is incomplete (a stop) or
             # any batch failed -- indexing only makes sense for a full table.
             if failures == 0 and not stopped_early and index_ddls:
-                indexes_created = self._create_indexes(pool, index_ddls)
+                indexes_created, index_failures = self._create_indexes(
+                    pool, index_ddls
+                )
         finally:
             pool.close_all()
 
@@ -703,6 +719,10 @@ class BatchedImporter:
         result = _aggregate_result(
             outcomes, skipped_ids, indexes_created, cancelled=stopped_early
         )
+        # Indexes that could not be created. Reported alongside a SUCCESSFUL data
+        # load: the rows are all present, so this is a missing access path to fix
+        # later, not a reason to fail (and re-run) the table.
+        result.index_failures = list(index_failures)
         with self._quarantine_lock:
             quarantined = list(self._quarantine)
         result.quarantined = len(quarantined)
@@ -1272,7 +1292,9 @@ class BatchedImporter:
             f"{max_attempts} attempts due to concurrent unique violations"
         ) from last_error
 
-    def _create_indexes(self, pool: _ConnectionPool, index_ddls: list[str]) -> int:
+    def _create_indexes(
+        self, pool: _ConnectionPool, index_ddls: list[str]
+    ) -> "tuple[int, list[str]]":
         """Issue post-load ``CREATE INDEX ASYNC`` statements, one per transaction.
 
         Each DDL string (already produced and safely quoted by the Schema
@@ -1281,6 +1303,14 @@ class BatchedImporter:
         retry for ``OC001`` schema-conflict idempotency (Property 5). DSQL builds
         the index asynchronously in the background, so each statement returns
         promptly.
+
+        Returns ``(created, failures)``. A failing index is ISOLATED rather than
+        raised: indexes are built AFTER every row is written, so letting one
+        propagate marked the whole table FAILED even though its data was complete --
+        which also blocked the Validation gate on a table that had nothing missing.
+        Since an index is an access path, not data, each DDL is attempted
+        independently (one bad index no longer stops the remaining ones) and the
+        failures are returned for the caller to surface as a warning.
         """
         retried = with_occ_retry(
             max_attempts=self._occ_max_attempts,
@@ -1289,11 +1319,22 @@ class BatchedImporter:
             jitter=self._jitter,
         )(_execute_ddl)
         created = 0
+        failures: list[str] = []
         with pool.lease() as connection:
             for ddl in index_ddls:
-                retried(connection, ddl)
-                created += 1
-        return created
+                try:
+                    retried(connection, ddl)
+                except Exception as exc:  # noqa: BLE001 - isolate per-index failure
+                    # Log-safe: the DDL is tool-generated (no row values, no
+                    # credentials) and the driver message is a schema-level error.
+                    failures.append(f"{_index_name_of(ddl)}: {_safe_error(exc)}")
+                    _LOGGER.warning(
+                        "Post-load index creation failed (data is unaffected): %s",
+                        failures[-1],
+                    )
+                else:
+                    created += 1
+        return created, failures
 
 
 def _default_connection_factory(target: TargetConnectionConfig) -> ConnectionFactory:
@@ -1305,6 +1346,29 @@ def _default_connection_factory(target: TargetConnectionConfig) -> ConnectionFac
     """
     connector = DsqlConnector(target)
     return connector.connect
+
+
+def _index_name_of(ddl: str) -> str:
+    """Extract the index name from a ``CREATE [UNIQUE] INDEX ASYNC <name> ON ...``.
+
+    Best-effort labelling for a failure message so the operator can identify WHICH
+    index did not get created. Falls back to a truncated DDL when the shape is
+    unexpected (the DDL is tool-generated, so it never carries row values).
+    """
+    match = re.search(
+        r'CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:ASYNC\s+)?"?([^"\s(]+)"?',
+        ddl,
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else ddl[:60]
+
+
+def _safe_error(exc: BaseException) -> str:
+    """Render an exception as a short, credential-free single line."""
+    message = " ".join(str(exc).split())
+    if len(message) > 300:
+        message = message[:297] + "..."
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
 
 def _execute_ddl(connection: Any, ddl: str) -> None:

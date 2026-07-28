@@ -5,6 +5,69 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.143
+
+### Fixed
+
+- **A failing post-load index no longer fails a fully-loaded table.** Secondary
+  indexes are created by `CREATE INDEX ASYNC` **after** every row is written, and the
+  error propagated out of the import — so a table whose data was **completely loaded**
+  was marked `FAILED`, which also **blocked the Validation gate** on a table with
+  nothing missing. Re-running did not help: the usual cause (DSQL's 24-index limit) is
+  not transient, so the run hit the same error every time.
+  - An index failure is now **isolated**: the data load reports success (`failures=0`,
+    every row present) and the failure is returned separately as
+    `BatchedImportResult.index_failures`.
+  - **One bad index no longer stops the rest.** Each DDL is attempted independently,
+    so the remaining indexes are still created (previously the first failure aborted
+    the loop).
+  - Reported as its own **info**-toned block in the Full Load result — *"Indexes not
+    created (N) — the data loaded completely"* — kept apart from failures and from
+    quarantined rows, since no data is missing. The error log names which index and
+    why, and says the load does not need re-running.
+  - Applies to the multiprocess load path as well, so a run does not behave
+    differently depending on the worker mode.
+
+## v0.1.142
+
+### Added
+
+- **Evaluation now checks Aurora DSQL's per-table index limit** (`TOO_MANY_INDEXES`).
+  DSQL allows **24 indexes per table** (MySQL allows 64), and the **primary-key index
+  counts toward that budget** — verified against a live cluster, where the 24th
+  `CREATE INDEX` on a table that already had a PK failed and `pg_indexes` then showed
+  24 rows including the PK. A migrated table can therefore carry at most **23
+  secondary indexes**, which is what the source's reflected index list is compared
+  against.
+  - Caught at planning time because the failure otherwise surfaces at the worst
+    moment: secondary indexes are created by **post-load** `CREATE INDEX ASYNC`, so
+    the limit is hit only **after Full Load has written every row** — turning a
+    multi-hour load into a failed table that a re-run cannot fix (the limit is not
+    transient).
+  - Classified **MANUAL**: unused/redundant indexes are common, so the fix is usually
+    to drop a few (the finding points at `sys.schema_unused_indexes`) rather than
+    redesign. The message names both counts, the exact error (`54000`), and when it
+    would have fired.
+
+- **Evaluation now flags foreign keys whose cascade CDC cannot replicate**
+  (`FK_CASCADE_CDC_GAP`). MySQL performs `ON DELETE/UPDATE CASCADE` (and `SET NULL` /
+  `SET DEFAULT`) **inside the InnoDB engine**, so the resulting child-row changes are
+  never written to the binary log — the same reason cascaded actions don't fire
+  triggers. Debezium reads the binary log, so a CDC stream cannot see them, and
+  Aurora DSQL has no foreign keys to re-perform the cascade: the child rows are left
+  behind on the target **with no error and no warning**. (MySQL bug #32506, closed as
+  documented behavior — it affects every binlog-based CDC tool, not just this one.)
+  - The referential actions are now captured during introspection
+    (`ForeignKeyDef.on_delete` / `on_update`), read from information the source
+    reflection already returns — no extra source query.
+  - Classified **MANUAL** (not UNSUPPORTED): the table migrates fine, but the cascade
+    has to move into the application — which DSQL requires anyway, since it has no
+    foreign keys. The finding names the concrete action, explains why CDC misses it,
+    and points at the interim safety net (Validation's orphan-record check plus
+    quiescing source writes before the final comparison).
+  - `RESTRICT` / `NO ACTION` are **not** flagged: they only reject the parent change,
+    so they never produce an unlogged child write.
+
 ## v0.1.141
 
 ### Fixed

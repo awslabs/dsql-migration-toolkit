@@ -91,6 +91,8 @@ class _FakeStore:
     executed_inserts: list[_ExecutedInsert] = field(default_factory=list)
     executed_ddls: list[str] = field(default_factory=list)
     insert_failures: list[str] = field(default_factory=list)
+    # Index names whose CREATE INDEX must fail (simulates DSQL's 24-index limit).
+    failing_index_names: set = field(default_factory=set)
     poison_keys: set = field(default_factory=set)
     connections_created: int = 0
     select_calls: int = 0
@@ -141,6 +143,12 @@ class _FakeConnection:
     ) -> None:
         text = query if isinstance(query, str) else query.as_string(None)
         if "CREATE" in text and "INDEX" in text:
+            if any(name in text for name in self._store.failing_index_names):
+                error = Exception(
+                    "more than 24 indexes per table are not allowed"
+                )
+                error.sqlstate = "54000"  # type: ignore[attr-defined]
+                raise error
             with self._store.lock:
                 self._store.history.append(f"DDL:{text}")
                 self._store.executed_ddls.append(text)
@@ -1352,3 +1360,75 @@ def test_pool_discards_connection_after_in_use_error() -> None:
     with pool.lease() as conn2:
         assert conn2 is not created[0]
     assert len(created) == 2
+
+
+# ---------------------------------------------------------------------------
+# A failing post-load index must NOT fail the (fully loaded) table
+# ---------------------------------------------------------------------------
+
+
+def test_failing_index_does_not_fail_a_fully_loaded_table() -> None:
+    # The regression this guards: indexes are built AFTER every row is written, so a
+    # propagating index error marked a table FAILED even though its data was complete
+    # -- and blocked the Validation gate on a table with nothing missing. A re-run
+    # could not fix it either (DSQL's 24-index limit is not transient).
+    store = _FakeStore()
+    store.failing_index_names = {"ix_email"}
+    importer = _importer(
+        store,
+        ["id", "name"],
+        ["id"],
+        options=BatchedImportOptions(batch_size=2, parallelism=1),
+    )
+
+    result = importer.import_rows(_rows(4), _table(), index_ddls=_index_ddls())
+
+    # The DATA load is a success: no batch failures, every row loaded.
+    assert result.failures == 0
+    assert result.rows_loaded == 4
+    # The failure is reported separately, naming the index that did not get created.
+    assert len(result.index_failures) == 1
+    assert "ix_email" in result.index_failures[0]
+    assert "24 indexes" in result.index_failures[0]
+
+
+def test_one_failing_index_does_not_stop_the_remaining_ones() -> None:
+    # Previously the first failure aborted the loop, so indexes AFTER the bad one were
+    # never attempted even though they would have succeeded.
+    store = _FakeStore()
+    store.failing_index_names = {"ix_name"}  # the FIRST of the two DDLs
+    importer = _importer(
+        store,
+        ["id", "name"],
+        ["id"],
+        options=BatchedImportOptions(batch_size=10, parallelism=1),
+    )
+
+    result = importer.import_rows(_rows(3), _table(), index_ddls=_index_ddls())
+
+    assert result.indexes_created == 1  # the second one still ran
+    assert [d for d in store.executed_ddls if "ix_email" in d]
+    assert len(result.index_failures) == 1 and "ix_name" in result.index_failures[0]
+
+
+def test_clean_load_reports_no_index_failures() -> None:
+    store = _FakeStore()
+    importer = _importer(
+        store,
+        ["id", "name"],
+        ["id"],
+        options=BatchedImportOptions(batch_size=10, parallelism=1),
+    )
+    result = importer.import_rows(_rows(3), _table(), index_ddls=_index_ddls())
+    assert result.indexes_created == 2
+    assert result.index_failures == []
+
+
+def test_index_name_is_extracted_for_the_failure_message() -> None:
+    from dsql_migrator.core.batched_import import _index_name_of
+
+    assert _index_name_of('CREATE INDEX ASYNC "ix_a" ON "t" ("c")') == "ix_a"
+    assert _index_name_of('CREATE UNIQUE INDEX ASYNC "ix_b" ON "t" ("c")') == "ix_b"
+    assert _index_name_of("CREATE INDEX ix_c ON t (c)") == "ix_c"
+    # Unexpected shape degrades to a truncated DDL rather than raising.
+    assert _index_name_of("SOMETHING ELSE") == "SOMETHING ELSE"

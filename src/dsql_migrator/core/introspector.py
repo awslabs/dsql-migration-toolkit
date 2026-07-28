@@ -448,12 +448,22 @@ def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[Tab
                 if referred_schema
                 else referred_table
             )
+            # Referential actions (ON DELETE / ON UPDATE). SQLAlchemy's MySQL
+            # dialect parses these out of SHOW CREATE TABLE into ``options`` and
+            # OMITS the key when the action is the default NO ACTION, so a missing
+            # key simply means "no automatic child-row change". Captured because a
+            # CASCADE / SET NULL / SET DEFAULT is performed inside InnoDB and is
+            # therefore absent from the binary log -- so CDC cannot replicate it
+            # (see ForeignKeyDef.has_cascade_action).
+            options = fk.get("options") or {}
             foreign_keys.append(
                 ForeignKeyDef(
                     name=fk_name,
                     columns=constrained,
                     referenced_table=referenced_table,
                     referenced_columns=referred_columns,
+                    on_delete=(options.get("ondelete") or None),
+                    on_update=(options.get("onupdate") or None),
                 )
             )
 
