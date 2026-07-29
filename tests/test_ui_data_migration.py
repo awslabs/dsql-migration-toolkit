@@ -2283,6 +2283,86 @@ def test_cdc_streaming_started_when_lifecycle_job_in_flight() -> None:
     assert cdc_streaming_started(state, mgr)
 
 
+# ---------------------------------------------------------------------------
+# cdc_pipeline_live -- the NARROW "data is actually flowing" signal, distinct
+# from cdc_streaming_started's "inputs are committed, stop editing" latch. Only
+# this drives the Data Migration "Success" badge / step DONE promotion.
+# ---------------------------------------------------------------------------
+
+
+def test_cdc_pipeline_live_true_only_when_connectors_or_phase_running() -> None:
+    from dsql_migrator.ui.data_migration import cdc_pipeline_live
+
+    connectors = DataMigrationState()
+    connectors.set_cdc_controller(_FakeCdcController(statuses=[], health={}))
+    connectors.set_cdc_connector_names(["mysql-dsql-cdc-stack-debezium-source"])
+    assert cdc_pipeline_live(connectors) is True
+
+    running = DataMigrationState()
+    running.set_cdc_stack_phase("running")
+    assert cdc_pipeline_live(running) is True
+
+
+def test_cdc_pipeline_live_false_while_a_start_job_is_still_in_flight() -> None:
+    # The bug this fixes: an in-flight connector START job made the Data Migration
+    # step (and its "Success" badge on both the stepper header and the in-screen
+    # chip) flip to DONE while the connectors were still coming up on MSK Connect
+    # (~10-20 min) and no row had reached the target. cdc_streaming_started latches
+    # then on purpose (inputs are committed), but the pipeline is NOT live yet.
+    from dsql_migrator.ui.data_migration import (
+        cdc_pipeline_live,
+        cdc_streaming_started,
+    )
+
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("start-1", kind="start")
+    mgr = _StubJobManager({"start-1": _StubJob("RUNNING")})
+
+    assert cdc_streaming_started(state, mgr) is True  # inputs latch immediately
+    assert cdc_pipeline_live(state) is False  # ...but nothing is streaming yet
+
+
+def test_cdc_pipeline_live_false_before_start_and_for_infra() -> None:
+    from dsql_migrator.ui.data_migration import cdc_pipeline_live
+
+    assert cdc_pipeline_live(DataMigrationState()) is False
+
+    infra = DataMigrationState()
+    infra.set_cdc_stack_phase("infra")
+    assert cdc_pipeline_live(infra) is False
+
+
+def test_data_migration_step_promotes_only_when_pipeline_live_not_on_start() -> None:
+    """End-to-end: the step DONE promotion must follow cdc_pipeline_live.
+
+    Ties the two pieces together -- a RUNNING start job must NOT promote the step
+    (badge stays In progress), but detected connectors must.
+    """
+    from dsql_migrator.ui.data_migration import (
+        cdc_pipeline_live,
+        data_migration_step_after_cdc,
+    )
+
+    starting = DataMigrationState()
+    starting.set_cdc_deploy_job_id("start-1", kind="start")
+    assert (
+        data_migration_step_after_cdc(
+            StepStatus.IN_PROGRESS, cdc_streaming=cdc_pipeline_live(starting)
+        )
+        is None  # not promoted while the start job is still in flight
+    )
+
+    live = DataMigrationState()
+    live.set_cdc_controller(_FakeCdcController(statuses=[], health={}))
+    live.set_cdc_connector_names(["mysql-dsql-cdc-stack-debezium-source"])
+    assert (
+        data_migration_step_after_cdc(
+            StepStatus.IN_PROGRESS, cdc_streaming=cdc_pipeline_live(live)
+        )
+        is StepStatus.DONE
+    )
+
+
 def test_cdc_streaming_started_false_when_only_infra() -> None:
     from dsql_migrator.ui.data_migration import cdc_streaming_started
 

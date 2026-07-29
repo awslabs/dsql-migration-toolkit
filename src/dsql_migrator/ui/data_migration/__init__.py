@@ -481,8 +481,15 @@ def build_data_migration_screen(
         # target, so Validation must be reachable. Without this the step only ever
         # reaches DONE via a finished Full Load, leaving CDC-only runs stuck at
         # "Complete Data Migration first before opening Validation".
+        #
+        # Gate this on cdc_pipeline_live (connectors detected / phase running), NOT
+        # cdc_streaming_started: the latter latches the instant Start is pressed, so
+        # promoting on it flipped the Data Migration step (and its "Success" badge)
+        # to DONE while the connectors were still coming up and no row had reached
+        # the target. Promotion means "data has actually arrived", so it must wait
+        # for the pipeline to be genuinely live.
         promoted = data_migration_step_after_cdc(
-            status, cdc_streaming=cdc_streaming_started(migration_state, job_manager)
+            status, cdc_streaming=cdc_pipeline_live(migration_state)
         )
         if promoted is not None:
             session.set_workflow(  # type: ignore[attr-defined]
@@ -4222,6 +4229,7 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     cdc_deploy_card_superseded,
     cdc_deploy_connection_blocker,
     cdc_live_running_names,
+    cdc_pipeline_live,
     cdc_streaming_started,
     cdc_unstable_message,
     classify_cdc_card_phase,

@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.157
+
+### Fixed
+
+- **Data Migration showed "Success" the moment CDC start was pressed — before any data
+  streamed.** The step (and its badge on both the stepper header and the in-screen status
+  chip) is promoted to Done once CDC is live, which also unlocks Validation. But it was
+  gated on the same signal that latches the CDC *inputs* — and that signal deliberately
+  fires the instant Start is pressed (so the start point / table set can no longer be
+  edited), while the connectors are still coming up on MSK Connect (~10–20 min) and no
+  row has reached the target. So the header read Success mid-start. The promotion now
+  uses a separate, narrower signal — connectors actually detected, or the cdc-stack phase
+  is `running` — so "Success" means data is genuinely flowing. The input-locking latch is
+  unchanged (it still fires at Start, as it should), and a finished Full Load still marks
+  the step Done as before.
+
 ## v0.1.156
 
 ### Fixed

@@ -278,17 +278,44 @@ def _render_cdc_step(
     #    and change-flow idle in the Pipeline health card -- so it only duplicated.)
     _render_cdc_handling_panel(ui)
 
+def cdc_pipeline_live(migration_state) -> bool:
+    """True only when CDC connectors actually exist and are streaming.
+
+    The narrow, no-false-positive signal: connectors have been detected (a live
+    controller with connector names), or the cdc-stack phase is ``running``. Unlike
+    :func:`cdc_streaming_started`, an *in-flight start job* does NOT count here --
+    the connectors are still coming up (~10-20 min on MSK Connect) and no row has
+    reached the target yet.
+
+    Use this for anything that asserts CDC is DONE / data has flowed (e.g. promoting
+    the Data Migration step, which drives the "Success" badge and unlocks
+    Validation). Use :func:`cdc_streaming_started` instead for "the start point is
+    committed, stop editing inputs", which must latch the moment Start is pressed.
+    """
+    controller = getattr(migration_state, "cdc_controller", None)
+    names = getattr(migration_state, "cdc_connector_names", []) or []
+    if controller is not None and names:
+        return True  # connectors detected -> streaming
+    return getattr(migration_state, "cdc_stack_phase", None) == "running"
+
+
 def cdc_streaming_started(migration_state, job_manager) -> bool:
     """True once CDC has been started, so its inputs must no longer change.
 
-    "Started" means the connectors are deployed/streaming (cdc-stack phase
-    ``running`` -- detected connectors), or a **connector-level** CDC lifecycle job
-    (start/stop/delete) is in flight. After this point the start position is
-    already seeded into the MSK connect-offsets topic and the table set is fixed by
-    the running source connector, so editing the CDC start point or the table
-    selection would have no effect on the live pipeline and only mislead the
+    "Started" means the pipeline is live (:func:`cdc_pipeline_live` -- detected
+    connectors or cdc-stack phase ``running``), or a **connector-level** CDC
+    lifecycle job (start/stop/delete) is in flight. After this point the start
+    position is already seeded into the MSK connect-offsets topic and the table set
+    is fixed by the running source connector, so editing the CDC start point or the
+    table selection would have no effect on the live pipeline and only mislead the
     operator. Mirrors the "running" detection in :func:`_render_cdc_start_action`.
     Read-only/best-effort.
+
+    This latches earlier than :func:`cdc_pipeline_live` on purpose: an in-flight
+    connector start job counts, because the inputs are already committed even though
+    the connectors have not reached RUNNING yet. It is therefore the wrong signal
+    for "data has arrived" -- use :func:`cdc_pipeline_live` for that (promoting the
+    Data Migration step / the "Success" badge).
 
     An in-flight ``kind="infra"`` job is deliberately EXCLUDED: the infrastructure
     create (``create_stack``: MSK Serverless, networking, plugins, IAM) makes no
@@ -301,11 +328,7 @@ def cdc_streaming_started(migration_state, job_manager) -> bool:
     re-run into an append. Excluding it is also what lets the ~15-20 min MSK create
     overlap the Full Load instead of serializing after it.
     """
-    controller = getattr(migration_state, "cdc_controller", None)
-    names = getattr(migration_state, "cdc_connector_names", []) or []
-    if controller is not None and names:
-        return True  # connectors detected -> streaming
-    if getattr(migration_state, "cdc_stack_phase", None) == "running":
+    if cdc_pipeline_live(migration_state):
         return True
     # Only a connector-level lifecycle job counts (start/stop/delete); an "infra"
     # create touches no connector, so it must not read as streaming.
