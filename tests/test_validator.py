@@ -1559,3 +1559,143 @@ def test_validate_completes_when_never_cancelled() -> None:
     )
     assert report.is_match is True
     assert len(report.items) == 1
+
+
+# ---------------------------------------------------------------------------
+# Drift by binlog file:position -- the fallback for a source without GTID, which
+# is the NORMAL case on RDS MySQL 8.0 (GTID cannot be enabled there).
+# ---------------------------------------------------------------------------
+
+
+def test_binlog_advanced_same_file_compares_position() -> None:
+    from dsql_migrator.core.validator import binlog_advanced
+
+    assert binlog_advanced("mysql-bin.000004", 1120, "mysql-bin.000004", 8450) is True
+    assert binlog_advanced("mysql-bin.000004", 1120, "mysql-bin.000004", 1120) is False
+
+
+def test_binlog_advanced_treats_a_rotated_file_as_advanced() -> None:
+    """A new binlog file means the server kept writing, even at a SMALLER position.
+
+    The position restarts near the top of each file, so any "is it greater" test on the
+    raw numbers would call a rotated log unchanged -- or worse, went-backwards.
+    """
+    from dsql_migrator.core.validator import binlog_advanced
+
+    assert binlog_advanced("mysql-bin.000004", 8450, "mysql-bin.000005", 154) is True
+
+
+def test_binlog_advanced_counts_a_backwards_jump_as_changed() -> None:
+    # A restored/rebuilt source or RESET MASTER can move the coordinate backwards. It
+    # is certainly not "unchanged since the snapshot", so it must not report clean.
+    from dsql_migrator.core.validator import binlog_advanced
+
+    assert binlog_advanced("mysql-bin.000009", 500, "mysql-bin.000002", 120) is True
+    assert binlog_advanced("mysql-bin.000004", 8450, "mysql-bin.000004", 1120) is True
+
+
+def test_binlog_advanced_is_undeterminable_when_a_coordinate_is_incomplete() -> None:
+    # Both halves are required: a position restarts per file, so one without the other
+    # cannot be compared.
+    from dsql_migrator.core.validator import binlog_advanced
+
+    assert binlog_advanced(None, 1120, "mysql-bin.000004", 8450) is None
+    assert binlog_advanced("mysql-bin.000004", None, "mysql-bin.000004", 8450) is None
+    assert binlog_advanced("mysql-bin.000004", 1120, None, 8450) is None
+    assert binlog_advanced("mysql-bin.000004", 1120, "mysql-bin.000004", None) is None
+
+
+def test_format_binlog_coordinate() -> None:
+    from dsql_migrator.core.validator import format_binlog_coordinate
+
+    assert format_binlog_coordinate("mysql-bin.000004", 1120) == "mysql-bin.000004:1120"
+    assert format_binlog_coordinate("mysql-bin.000004", 0) == "mysql-bin.000004:0"
+    assert format_binlog_coordinate(None, 1120) is None
+    assert format_binlog_coordinate("mysql-bin.000004", None) is None
+
+
+def _coord_watermark(*, gtid=None, binlog_file=None, binlog_position=None):
+    """A watermark carrying replication coordinates (own name: the module already has
+    a ``_watermark`` for the row-count fixtures)."""
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.models import Watermark
+
+    return Watermark(
+        gtid_executed=gtid,
+        binlog_file=binlog_file,
+        binlog_position=binlog_position,
+        snapshot_timestamp=datetime(2026, 7, 30, tzinfo=timezone.utc),
+        table_row_counts={},
+    )
+
+
+def test_build_drift_falls_back_to_binlog_when_the_source_has_no_gtid() -> None:
+    """The RDS MySQL 8.0 case: no GTID, so drift MUST come from file:pos.
+
+    Previously drift was GTID-only, so on the primary supported source every run
+    reported "could not be determined" and the whole section was dead -- even though
+    the watermark already carried file:pos and CDC already resumes from it.
+    """
+    from dsql_migrator.core.validator import _build_drift
+
+    drifted = _build_drift(
+        _coord_watermark(binlog_file="mysql-bin.000004", binlog_position=1120),
+        None,  # no GTID on either side
+        "mysql-bin.000004",
+        8450,
+    )
+    assert drifted is not None
+    assert drifted.basis == "binlog"
+    assert drifted.drifted is True
+    assert drifted.watermark_binlog == "mysql-bin.000004:1120"
+    assert drifted.current_binlog == "mysql-bin.000004:8450"
+    assert "binlog position moved" in drifted.detail
+
+    clean = _build_drift(
+        _coord_watermark(binlog_file="mysql-bin.000004", binlog_position=1120),
+        None,
+        "mysql-bin.000004",
+        1120,
+    )
+    assert clean is not None
+    assert clean.basis == "binlog"
+    assert clean.drifted is False
+    assert "No source changes" in clean.detail
+
+
+def test_build_drift_prefers_gtid_when_both_sides_have_one() -> None:
+    # GTID is the stronger signal (a global set, not a per-file offset), so it wins;
+    # the binlog pair is still recorded for the audit detail.
+    from dsql_migrator.core.validator import _build_drift
+
+    report = _build_drift(
+        _coord_watermark(gtid="uuid:1-5", binlog_file="mysql-bin.000004", binlog_position=1120),
+        "uuid:1-5",
+        "mysql-bin.000009",  # would say "advanced" by binlog...
+        77,
+    )
+    assert report is not None
+    assert report.basis == "gtid"
+    assert report.drifted is False  # ...but the GTID says unchanged, and GTID wins
+    assert report.watermark_binlog == "mysql-bin.000004:1120"
+
+
+def test_build_drift_undeterminable_only_when_neither_coordinate_works() -> None:
+    from dsql_migrator.core.validator import _build_drift
+
+    report = _build_drift(_coord_watermark(), None, None, None)
+    assert report is not None
+    assert report.basis == ""
+    assert report.drifted is False
+    assert "could not be determined" in report.detail
+    # The message must name BOTH missing coordinates, not just the GTID -- blaming the
+    # GTID alone is what made this look like a GTID-only feature.
+    assert "binlog" in report.detail
+
+
+def test_build_drift_is_none_without_a_watermark() -> None:
+    # No consistency point -> drift is undefined (not "clean").
+    from dsql_migrator.core.validator import _build_drift
+
+    assert _build_drift(None, "uuid:1-5", "mysql-bin.000004", 1120) is None

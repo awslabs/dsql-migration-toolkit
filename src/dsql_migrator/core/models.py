@@ -1130,13 +1130,20 @@ class OrphanFinding(BaseModel):
 
 
 class DriftReport(BaseModel):
-    """Source change since the export watermark, by GTID comparison (Req 6.5).
+    """Source change since the export watermark (Req 6.5).
 
     For a live source, validation is performed as-of the recorded watermark; this
-    reports whether the source has advanced since then (the current
-    ``gtid_executed`` differs from the watermark's), so a reviewer knows the
+    reports whether the source has advanced since then, so a reviewer knows the
     comparison reflects the snapshot, not necessarily the source's current state
     (Property 11).
+
+    Drift is judged by GTID when available, else by **binlog file:position**. The
+    fallback matters because it is the normal case on the primary supported source:
+    RDS MySQL 8.0 cannot enable GTID, so a GTID-only comparison reported
+    "unavailable" on every run and the whole section was dead weight. The watermark
+    already records file:pos (and CDC already resumes from it), so the coordinate is
+    there to use. ``basis`` names which one was used, so a reader is never left
+    guessing what "drifted" was derived from.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1145,6 +1152,11 @@ class DriftReport(BaseModel):
     current_gtid: Optional[str] = None
     drifted: bool = False
     detail: str = ""
+    # "gtid" | "binlog" | "" (undeterminable). Defaulted so older persisted reports
+    # (written before the fallback existed) still validate under extra="forbid".
+    basis: str = ""
+    watermark_binlog: Optional[str] = None
+    current_binlog: Optional[str] = None
 
 
 class ValidationReport(BaseModel):

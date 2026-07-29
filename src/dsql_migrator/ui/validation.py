@@ -99,7 +99,7 @@ from dsql_migrator.ui.workflow import (
     with_status,
 )
 
-# Text shown when a drift coordinate (GTID) could not be captured.
+# Text shown when a replication coordinate (GTID or binlog file:pos) is absent.
 _UNAVAILABLE = "unavailable"
 
 
@@ -876,12 +876,17 @@ def _cdc_in_use(session: object) -> bool:
 
 @dataclass(frozen=True)
 class DriftDisplay:
-    """The drift-since-watermark report formatted for display (Req 6.5).
+    """The source-changes-since-snapshot report formatted for display (Req 6.5).
 
     ``available`` is ``False`` when validation ran without a watermark (drift is
-    undefined). ``determinable`` is ``False`` when a watermark exists but the
-    GTIDs needed to compare could not be read; in both cases the optional GTID
-    fields degrade to ``"unavailable"`` so the UI always renders a valid panel.
+    undefined). ``determinable`` is ``False`` when a watermark exists but NEITHER
+    coordinate could be compared; the optional coordinate fields degrade to
+    ``"unavailable"`` so the UI always renders a valid panel.
+
+    ``basis`` records WHICH coordinate answered the question -- ``"gtid"``,
+    ``"binlog"``, or ``""`` when undeterminable -- so the panel can name its evidence
+    instead of always speaking of GTIDs. That matters because the primary supported
+    source (RDS MySQL 8.0) cannot enable GTID, making ``"binlog"`` the normal basis.
     """
 
     available: bool
@@ -891,15 +896,18 @@ class DriftDisplay:
     current_gtid: str
     detail: str
     summary: str
+    basis: str = ""
+    watermark_binlog: str = _UNAVAILABLE
+    current_binlog: str = _UNAVAILABLE
 
 
 def format_drift(report: ValidationReport) -> DriftDisplay:
-    """Format ``report``'s drift section for display (Requirement 6.5).
+    """Format ``report``'s source-change section for display (Requirement 6.5).
 
-    Compares the current source GTID to the watermark's GTID to surface changes
-    on the source since the snapshot (Property 11). When no watermark was used,
-    or the GTIDs are unavailable, the panel says so rather than implying a clean
-    or dirty result.
+    Surfaces whether the source changed after the snapshot (Property 11), judged by
+    GTID when both sides have one and otherwise by binlog ``file:position``. When no
+    watermark was used, or neither coordinate is comparable, the panel says so rather
+    than implying a clean or dirty result.
     """
     drift: Optional[DriftReport] = report.drift
     if drift is None:
@@ -913,17 +921,25 @@ def format_drift(report: ValidationReport) -> DriftDisplay:
                 "Validation ran without an export watermark, so changes since a "
                 "snapshot cannot be reported."
             ),
-            summary="Drift since snapshot: not available (no watermark).",
+            summary="Source changes since snapshot: not available (no watermark).",
+            basis="",
         )
 
-    determinable = drift.watermark_gtid is not None and drift.current_gtid is not None
+    basis = getattr(drift, "basis", "") or ""
+    # Determinability follows the BASIS the core actually used, so a GTID-less source
+    # that was compared by binlog position is (correctly) determinable. Older reports
+    # predate `basis`; fall back to the GTID pair so they still render as before.
+    determinable = bool(basis) if basis else (
+        drift.watermark_gtid is not None and drift.current_gtid is not None
+    )
     if not determinable:
-        summary = "Drift since snapshot could not be determined (GTID unavailable)."
-    elif drift.drifted:
         summary = (
-            "Source has advanced since the snapshot "
-            "(current GTID differs from the watermark)."
+            "Source changes since the snapshot could not be determined "
+            "(no GTID or binlog position to compare)."
         )
+    elif drift.drifted:
+        evidence = "binlog position moved" if basis == "binlog" else "GTID changed"
+        summary = f"Source has changed since the snapshot ({evidence})."
     else:
         summary = "No source changes since the snapshot."
 
@@ -935,6 +951,9 @@ def format_drift(report: ValidationReport) -> DriftDisplay:
         current_gtid=drift.current_gtid or _UNAVAILABLE,
         detail=drift.detail,
         summary=summary,
+        basis=basis,
+        watermark_binlog=getattr(drift, "watermark_binlog", None) or _UNAVAILABLE,
+        current_binlog=getattr(drift, "current_binlog", None) or _UNAVAILABLE,
     )
 
 
@@ -1832,6 +1851,7 @@ def build_validation_screen(
                     rechecking_tables=rechecking,
                     rechecked_tables=validation_state.rechecked_tables,
                     rechecked_at=validation_state.rechecked_at,
+                    cdc_in_use=_cdc_in_use(session),
                 )
                 if busy:
                     _install_recheck_poll_timer(
@@ -2634,6 +2654,7 @@ def _render_result(
     rechecking_tables: "Sequence[str]" = (),
     rechecked_tables: "Sequence[str]" = (),
     rechecked_at: "Optional[datetime]" = None,
+    cdc_in_use: bool = False,
 ) -> None:
     """Render the cut-over readiness report: verdict, checks, then the details.
 
@@ -2702,8 +2723,11 @@ def _render_result(
             rechecking_tables=rechecking_tables,
         )
     _render_orphans(ui, report)
-    with _section(ui, icon="schedule", title="Drift since snapshot"):
-        _render_drift(ui, drift)
+    # "Drift since snapshot" was jargon: "drift" is a replication term and "snapshot"
+    # is the tool's internal name for the watermark. The section answers "did the
+    # source keep changing while/after we compared?", so it is titled that way.
+    with _section(ui, icon="schedule", title="Source changes since the comparison"):
+        _render_drift(ui, drift, cdc_in_use=cdc_in_use)
     with _section(ui, icon="download", title="Export report"):
         _render_downloads(ui, report)
 
@@ -3339,7 +3363,10 @@ def _validation_run_facts(summary: ValidationSummary, drift: DriftDisplay) -> st
         lines.append(f"Failing tables: {shown}{more}")
     if drift.available:
         if not drift.determinable:
-            lines.append("Drift since snapshot: undeterminable (GTID unavailable).")
+            lines.append(
+                "Source changes since snapshot: undeterminable (no GTID or binlog "
+                "position to compare)."
+            )
         else:
             lines.append(
                 "Drift since snapshot: source HAS advanced (likely still live)."
@@ -3640,19 +3667,119 @@ def _render_orphans(ui: object, report: ValidationReport) -> None:
         ui.table(columns=columns, rows=rows).classes("w-full")  # type: ignore[attr-defined]
 
 
-def _render_drift(ui: object, drift: DriftDisplay) -> None:
-    """Render the drift-since-watermark detail (GTID comparison; Req 6.5)."""
-    ui.label(drift.summary).classes("text-sm text-gray-700")  # type: ignore[attr-defined]
-    columns = [
-        {"name": "field", "label": "Field", "field": "field", "align": "left"},
-        {"name": "value", "label": "Value", "field": "value", "align": "left"},
-    ]
-    rows = [
-        {"field": "Watermark GTID", "value": drift.watermark_gtid},
-        {"field": "Current source GTID", "value": drift.current_gtid},
-        {"field": "Detail", "value": drift.detail},
-    ]
-    ui.table(columns=columns, rows=rows).classes("w-full")  # type: ignore[attr-defined]
+def drift_verdict(
+    drift: DriftDisplay, *, cdc_in_use: bool
+) -> tuple[str, str, str]:
+    """Return the ``(tone, header, body)`` notice for the drift section.
+
+    The raw fact -- "the source GTID differs from the watermark" -- is not what the
+    user needs; what they need is whether it threatens the cut-over, and THAT depends
+    on whether CDC is replicating. The section used to state the fact with no regard
+    for the migration type, so a perfectly healthy CDC run was told its source "has
+    advanced since the snapshot", which reads as a problem when it is the normal,
+    expected state. Per the design system's severity calibration an expected state is
+    ``info``, never ``warning``.
+
+    * drift + CDC        -> ``info``: normal, CDC is carrying those writes across.
+    * drift, no CDC      -> ``warning``: real, non-blocking -- post-snapshot writes
+      are NOT on the target, so a cut-over now would lose them.
+    * no drift           -> ``success``: the comparison is still current.
+    * undeterminable     -> ``info``: no comparable coordinate; say what to do
+      instead of alarming.
+
+    Pure, so the calibration is unit-testable without NiceGUI.
+    """
+    if not drift.available:
+        # No watermark at all: the run compared against the LIVE source, so there is
+        # no consistency point to have drifted from. Distinguished from the
+        # GTID-missing case below -- naming a GTID here would misdescribe the cause.
+        return (
+            "info",
+            "Compared against the live source (no snapshot)",
+            "This run had no export watermark, so it compared against the source as "
+            "it was during the run rather than as-of a consistency point. For a "
+            "definitive pre-cut-over check, freeze source writes and re-validate.",
+        )
+    if not drift.determinable:
+        return (
+            "info",
+            "Could not tell whether the source changed",
+            "The source reported neither a GTID nor a comparable binlog position, so "
+            "this run cannot tell whether the source changed after the snapshot. "
+            "Freeze source writes and re-validate for a definitive pre-cut-over "
+            "check.",
+        )
+    if not drift.drifted:
+        return (
+            "success",
+            "No source changes since the snapshot",
+            "The source has not advanced since the consistency point, so this "
+            "comparison still reflects the live source.",
+        )
+    if cdc_in_use:
+        return (
+            "info",
+            "Source has advanced since the snapshot — expected with CDC",
+            "New writes have landed on the source since the consistency point. CDC "
+            "is replicating them to the target, so this is the normal steady state, "
+            "not a gap. Before the final cut-over check, let CDC drain to zero lag "
+            "with source writes frozen, then re-validate.",
+        )
+    return (
+        "warning",
+        "Source has advanced since the snapshot — not replicated",
+        "New writes have landed on the source since the consistency point, and this "
+        "migration has no CDC stream carrying them to the target. Those rows are "
+        "therefore NOT on the target: cutting over now would lose them. Re-run the "
+        "data migration (or freeze source writes and re-validate) before cut-over.",
+    )
+
+
+def _render_drift(ui: object, drift: DriftDisplay, *, cdc_in_use: bool = False) -> None:
+    """Render the drift-since-watermark verdict, with the GTIDs as opt-in detail.
+
+    The verdict notice carries the meaning (see :func:`drift_verdict`). The raw GTID
+    pair is diagnostic -- the values cannot be read as "how far behind" (GTIDs are
+    not a distance) and every actionable conclusion is already in the notice -- so it
+    is collapsed rather than presented as the primary content.
+    """
+    tone, header, body = drift_verdict(drift, cdc_in_use=cdc_in_use)
+    render_notice(ui, tone=tone, header=header, body=body)
+    with ui.expansion(  # type: ignore[attr-defined]
+        "Technical detail (replication coordinates)", icon="fingerprint"
+    ).classes("w-full").props("dense expand-separator"):
+        columns = [
+            {"name": "field", "label": "Field", "field": "field", "align": "left"},
+            {"name": "value", "label": "Value", "field": "value", "align": "left"},
+        ]
+        # Lead with the coordinate that ANSWERED the question, and label it as such.
+        # Listing GTIDs first when the verdict came from binlog positions (the normal
+        # case on RDS MySQL, where GTID is off) put two "unavailable" rows at the top
+        # and buried the evidence that was actually used.
+        if drift.basis == "binlog":
+            rows = [
+                {
+                    "field": "Compared using",
+                    "value": "Binlog position (GTID not enabled on the source)",
+                },
+                {"field": "At snapshot", "value": drift.watermark_binlog},
+                {"field": "Now", "value": drift.current_binlog},
+            ]
+        elif drift.basis == "gtid":
+            rows = [
+                {"field": "Compared using", "value": "GTID"},
+                {"field": "At snapshot", "value": drift.watermark_gtid},
+                {"field": "Now", "value": drift.current_gtid},
+            ]
+        else:
+            rows = [
+                {"field": "GTID at snapshot", "value": drift.watermark_gtid},
+                {"field": "GTID now", "value": drift.current_gtid},
+                {"field": "Binlog at snapshot", "value": drift.watermark_binlog},
+                {"field": "Binlog now", "value": drift.current_binlog},
+            ]
+        rows.append({"field": "Detail", "value": drift.detail})
+        ui.table(columns=columns, rows=rows).classes("w-full")  # type: ignore[attr-defined]
 
 
 def _render_downloads(ui: object, report: ValidationReport) -> None:

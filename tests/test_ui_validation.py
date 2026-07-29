@@ -758,6 +758,7 @@ def test_format_drift_reports_advance_since_snapshot() -> None:
         current_gtid="uuid:1-9",
         drifted=True,
         detail="Source advanced since the snapshot (GTID changed).",
+        basis="gtid",
     )
     display = format_drift(_report(drift=drift))
     assert display.available is True
@@ -765,7 +766,10 @@ def test_format_drift_reports_advance_since_snapshot() -> None:
     assert display.drifted is True
     assert display.watermark_gtid == "uuid:1-5"
     assert display.current_gtid == "uuid:1-9"
-    assert "advanced since the snapshot" in display.summary
+    # The summary names its evidence, so a reader knows what "changed" was derived from.
+    assert "changed since the snapshot" in display.summary
+    assert "GTID changed" in display.summary
+    assert display.basis == "gtid"
 
 
 def test_format_drift_reports_no_change_since_snapshot() -> None:
@@ -2731,3 +2735,239 @@ def test_object_picker_shortcuts_are_disabled_while_a_run_is_in_flight() -> None
 
     nothing_excluded = _render(status=StepStatus.NOT_STARTED, excluded=[])
     assert nothing_excluded["Include all"] is False  # already all included
+
+
+# ---------------------------------------------------------------------------
+# drift_verdict -- drift only threatens a cut-over when NO CDC is carrying the
+# post-snapshot writes, so the notice must be read through the migration type.
+# ---------------------------------------------------------------------------
+
+
+def _drifted_display(
+    *, drifted=True, determinable=True, available=True, basis="gtid"
+):
+    from dsql_migrator.ui.validation import DriftDisplay
+
+    return DriftDisplay(
+        available=available,
+        determinable=determinable,
+        drifted=drifted,
+        watermark_gtid="uuid:1-5",
+        current_gtid="uuid:1-9" if drifted else "uuid:1-5",
+        detail="detail",
+        summary="summary",
+        basis=basis if determinable else "",
+        watermark_binlog="mysql-bin.000004:1120",
+        current_binlog="mysql-bin.000004:8450" if drifted else "mysql-bin.000004:1120",
+    )
+
+
+def test_drift_with_cdc_is_info_not_a_warning() -> None:
+    """An advancing source under live CDC is the NORMAL state, so it must stay calm.
+
+    The section used to state the bare fact regardless of migration type, so a healthy
+    CDC run was told its source "has advanced since the snapshot" -- which reads as a
+    problem. Per the design system's severity calibration an expected state is info.
+    """
+    from dsql_migrator.ui.validation import drift_verdict
+
+    tone, header, body = drift_verdict(_drifted_display(), cdc_in_use=True)
+    assert tone == "info"
+    assert "expected with CDC" in header
+    # Says why it is fine AND what the pre-cut-over step is.
+    assert "replicating" in body
+    assert "zero lag" in body
+
+
+def test_drift_without_cdc_warns_that_those_rows_are_not_on_the_target() -> None:
+    # Full-Load-only: nothing is carrying post-snapshot writes across, so cutting over
+    # now would lose them. Real but non-blocking -> warning, not error.
+    from dsql_migrator.ui.validation import drift_verdict
+
+    tone, header, body = drift_verdict(_drifted_display(), cdc_in_use=False)
+    assert tone == "warning"
+    assert "not replicated" in header
+    assert "NOT on the target" in body
+    assert "lose them" in body
+
+
+def test_no_drift_is_success_regardless_of_cdc() -> None:
+    from dsql_migrator.ui.validation import drift_verdict
+
+    for cdc in (True, False):
+        tone, header, _body = drift_verdict(
+            _drifted_display(drifted=False), cdc_in_use=cdc
+        )
+        assert tone == "success", cdc
+        assert "No source changes" in header
+
+
+def test_undeterminable_drift_is_info_and_says_what_to_do() -> None:
+    # No GTID -> the tool cannot judge. Alarming here would be wrong (nothing is known
+    # to be broken), but it must still name the definitive check.
+    from dsql_migrator.ui.validation import drift_verdict
+
+    tone, header, body = drift_verdict(
+        _drifted_display(determinable=False), cdc_in_use=False
+    )
+    assert tone == "info"
+    assert "Could not tell whether the source changed" == header
+    assert "Freeze source writes and re-validate" in body
+
+
+def test_no_watermark_is_described_as_a_live_comparison_not_a_missing_gtid() -> None:
+    """No watermark and no GTID are different causes and must not share one message.
+
+    Without a watermark there is no consistency point to have drifted FROM -- the run
+    compared against the live source. Blaming a missing GTID would misdescribe it.
+    """
+    from dsql_migrator.ui.validation import drift_verdict
+
+    tone, header, body = drift_verdict(
+        _drifted_display(available=False, determinable=False), cdc_in_use=False
+    )
+    assert tone == "info"
+    assert "live source" in header
+    assert "no export watermark" in body
+    assert "GTID" not in body  # the cause is the watermark, not the GTID
+
+
+def test_drift_section_keeps_the_gtids_available_but_collapsed() -> None:
+    """The GTID pair is diagnostic, not the primary content.
+
+    Its values cannot be read as "how far behind" (a GTID is not a distance) and every
+    actionable conclusion is in the notice -- but it must remain reachable for an audit
+    trail, so it is collapsed rather than removed.
+    """
+    from dsql_migrator.ui.validation import _render_drift
+
+    expansions: list[str] = []
+    tables: list[list] = []
+
+    class _Ui(_CopyUi):
+        def expansion(self, text="", *_a, **_k):
+            expansions.append(str(text))
+            return self._El(self)
+
+        def table(self, *_a, columns=None, rows=None, **_k):
+            tables.append(rows or [])
+            return self._El(self)
+
+    ui = _Ui()
+    _render_drift(ui, _drifted_display(), cdc_in_use=True)
+
+    # The verdict is rendered as a notice (its header text lands in the recorder).
+    assert any("expected with CDC" in t for t in ui.texts)
+    # The coordinates live behind one collapsed section, and are still present.
+    assert any("replication coordinates" in t for t in expansions)
+    fields = {row["field"] for row in tables[0]}
+    assert {"Compared using", "At snapshot", "Now"} <= fields
+
+
+def test_cdc_in_use_is_actually_threaded_from_the_screen_to_the_drift_section() -> None:
+    """The verdict is only correct if the screen passes the real migration type down.
+
+    drift_verdict can be perfect and the section still wrong if cdc_in_use never
+    reaches it, so assert the whole chain: the CDC-only / Full-Load-and-CDC types
+    resolve to True, and _render_result forwards it to the drift notice.
+    """
+    import inspect
+
+    from dsql_migrator.ui.data_migration import MigrationType
+    from dsql_migrator.ui.validation import _cdc_in_use, _render_result
+
+    class _Session:
+        def __init__(self, migration_type) -> None:
+            self.migration_type = migration_type
+
+    assert _cdc_in_use(_Session(MigrationType.CDC_ONLY)) is True
+    assert _cdc_in_use(_Session(MigrationType.FULL_LOAD_AND_CDC)) is True
+    assert _cdc_in_use(_Session(MigrationType.FULL_LOAD_ONLY)) is False
+    assert _cdc_in_use(object()) is False  # unresolvable -> the safer Full-Load path
+
+    # _render_result accepts it and hands it to the drift section.
+    assert "cdc_in_use" in inspect.signature(_render_result).parameters
+    body = inspect.getsource(_render_result)
+    assert "_render_drift(ui, drift, cdc_in_use=cdc_in_use)" in body
+
+    # ...and the screen supplies it from the session (not a hardcoded default).
+    screen_src = inspect.getsource(inspect.getmodule(_render_result))
+    assert "cdc_in_use=_cdc_in_use(session)" in screen_src
+
+
+def test_drift_panel_works_on_a_source_without_gtid() -> None:
+    """The RDS MySQL 8.0 path must produce a real verdict, not "unavailable".
+
+    GTID cannot be enabled on RDS MySQL 8.0, so before the binlog fallback this panel
+    showed two "unavailable" rows and "could not be determined" on EVERY run -- the
+    section could never answer its own question on the tool's primary source.
+    """
+    from dsql_migrator.core.models import DriftReport
+    from dsql_migrator.ui.validation import drift_verdict, format_drift
+
+    drift = DriftReport(
+        watermark_gtid=None,
+        current_gtid=None,
+        drifted=True,
+        detail=(
+            "Source advanced since the snapshot (binlog position moved from "
+            "mysql-bin.000004:1120 to mysql-bin.000004:8450)."
+        ),
+        basis="binlog",
+        watermark_binlog="mysql-bin.000004:1120",
+        current_binlog="mysql-bin.000004:8450",
+    )
+    display = format_drift(_report(drift=drift))
+
+    # Determinable DESPITE having no GTID -- that is the whole point of the fallback.
+    assert display.determinable is True
+    assert display.basis == "binlog"
+    assert display.drifted is True
+    # The summary names the evidence actually used, not a GTID it never had.
+    assert "binlog position moved" in display.summary
+    assert "GTID" not in display.summary
+
+    # And the verdict still reads through the CDC lens.
+    assert drift_verdict(display, cdc_in_use=True)[0] == "info"
+    assert drift_verdict(display, cdc_in_use=False)[0] == "warning"
+
+
+def test_drift_detail_leads_with_the_coordinate_that_was_compared() -> None:
+    # Listing GTIDs first when the verdict came from binlog positions put two
+    # "unavailable" rows at the top and buried the evidence that was actually used.
+    from dsql_migrator.ui.validation import _render_drift
+
+    tables: list[list] = []
+
+    class _Ui(_CopyUi):
+        def expansion(self, text="", *_a, **_k):
+            return self._El(self)
+
+        def table(self, *_a, columns=None, rows=None, **_k):
+            tables.append(rows or [])
+            return self._El(self)
+
+    _render_drift(
+        _Ui(), _drifted_display(basis="binlog"), cdc_in_use=False
+    )
+    rows = tables[0]
+    assert rows[0]["field"] == "Compared using"
+    assert "Binlog position" in rows[0]["value"]
+    assert "GTID not enabled" in rows[0]["value"]  # says WHY, so it reads as normal
+    assert rows[1]["value"] == "mysql-bin.000004:1120"  # at snapshot
+    assert rows[2]["value"] == "mysql-bin.000004:8450"  # now
+
+
+def test_drift_section_header_avoids_replication_jargon() -> None:
+    """"Drift since snapshot" was jargon on both words.
+
+    "Drift" is a replication term and "snapshot" is the tool's internal name for the
+    watermark, so the old title did not say what the section answers.
+    """
+    import inspect
+
+    from dsql_migrator.ui import validation
+
+    src = inspect.getsource(validation._render_result)
+    assert 'title="Source changes since the comparison"' in src
+    assert 'title="Drift since snapshot"' not in src

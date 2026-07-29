@@ -5,6 +5,40 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.160
+
+### Fixed
+
+- **The source-change check now works on RDS MySQL, where it always read
+  "unavailable".** Drift was judged by GTID only, but RDS MySQL 8.0 cannot enable GTID
+  — so on the tool's primary supported source every run reported *"could not be
+  determined (GTID unavailable)"* and the section could never answer its own question.
+  The watermark already records the binlog `file:position` (and CDC already resumes
+  from it), so the coordinate needed was being collected and then ignored. Drift is now
+  judged by GTID when both sides have one and otherwise by binlog `file:position`, and
+  the report records which basis was used. The comparison tests equality rather than
+  ordering, which is what makes it correct across a log rotation (the position restarts
+  in each new file, so a later file can hold a smaller offset) and treats a coordinate
+  that moved backwards — a restored source, `RESET MASTER` — as changed rather than
+  clean.
+
+### Changed
+
+- **The section reads through the migration type instead of stating a raw fact.** An
+  advancing source is the normal steady state under live CDC, but the panel said "the
+  source has advanced since the snapshot" regardless of migration type, which reads as
+  a problem. Now: with CDC it is `info` ("expected — CDC is replicating them; drain to
+  zero lag before the final check"); without CDC it is `warning` and says plainly that
+  those rows are **not** on the target and cutting over now would lose them; no change
+  is `success`; and an undeterminable result stays `info` rather than alarming.
+- **Plainer heading and detail.** "Drift since snapshot" was jargon twice over —
+  "drift" is a replication term and "snapshot" is the tool's internal name for the
+  watermark — so the section is now **"Source changes since the comparison"**. The raw
+  coordinate pair moves into a collapsed "Technical detail" block (its values cannot be
+  read as "how far behind"; a GTID is not a distance) and leads with the coordinate
+  that actually produced the verdict, naming *why* when GTID is off — instead of
+  putting two "unavailable" rows at the top and burying the evidence that was used.
+
 ## v0.1.159
 
 ### Changed

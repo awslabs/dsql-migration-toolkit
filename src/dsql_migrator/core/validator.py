@@ -612,6 +612,32 @@ def _source_gtid(connection: _SourceConnection) -> Optional[str]:
     return text_value or None
 
 
+def _source_binlog_position(
+    connection: _SourceConnection,
+) -> tuple[Optional[str], Optional[int]]:
+    """Read the source's current binlog ``(file, position)``, or ``(None, None)``.
+
+    The drift fallback for a source without GTID -- which is the normal case on RDS
+    MySQL 8.0, where GTID cannot be enabled. Read-only (``SHOW MASTER STATUS``) and
+    best-effort: any failure degrades to ``(None, None)`` so validation still
+    produces a report, exactly like :func:`_source_gtid`.
+    """
+    try:
+        row = connection.execute(
+            text("SHOW MASTER STATUS")
+        ).mappings().first()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - drift info is optional; degrade gracefully
+        return None, None
+    if not row:
+        return None, None
+    file_name = row.get("File") or None
+    position = row.get("Position")
+    try:
+        return file_name, (int(position) if position is not None else None)
+    except (TypeError, ValueError):  # non-numeric position: unusable for comparison
+        return file_name, None
+
+
 # ---------------------------------------------------------------------------
 # Target reads (psycopg, read-only)
 # ---------------------------------------------------------------------------
@@ -1083,6 +1109,11 @@ class Validator:
                 source_connection.execute(text(START_CONSISTENT_SNAPSHOT))
                 try:
                     current_gtid = _source_gtid(source_connection)
+                    # Also capture file:pos -- the drift fallback when the source has
+                    # no GTID (the normal case on RDS MySQL 8.0).
+                    current_binlog_file, current_binlog_position = (
+                        _source_binlog_position(source_connection)
+                    )
                     target_connection = self._target_connection_factory(target)
                     try:
                         total = len(tables)
@@ -1121,7 +1152,9 @@ class Validator:
         finally:
             source_engine.dispose()
 
-        drift = _build_drift(watermark, current_gtid)
+        drift = _build_drift(
+            watermark, current_gtid, current_binlog_file, current_binlog_position
+        )
         snapshot_timestamp = (
             watermark.snapshot_timestamp if watermark is not None else None
         )
@@ -1206,8 +1239,12 @@ class Validator:
         for found in orphans_by_index:
             orphan_findings.extend(found)
 
-        current_gtid = self._read_source_gtid(source)
-        drift = _build_drift(watermark, current_gtid)
+        current_gtid, current_binlog_file, current_binlog_position = (
+            self._read_source_position(source)
+        )
+        drift = _build_drift(
+            watermark, current_gtid, current_binlog_file, current_binlog_position
+        )
         snapshot_timestamp = (
             watermark.snapshot_timestamp if watermark is not None else None
         )
@@ -1269,12 +1306,17 @@ class Validator:
             source_engine.dispose()
         return item, orphans
 
-    def _read_source_gtid(self, source: SourceConnectionConfig) -> Optional[str]:
-        """Read the current source GTID once (own short snapshot) for drift.
+    def _read_source_position(
+        self, source: SourceConnectionConfig
+    ) -> tuple[Optional[str], Optional[str], Optional[int]]:
+        """Read the source's current ``(gtid, binlog_file, binlog_position)`` once.
 
-        Used by the parallel path, where no shared main-thread snapshot exists.
-        Best-effort and read-only: any failure degrades to ``None`` (drift
-        becomes "undeterminable"), never aborting the run.
+        Used by the parallel path, where no shared main-thread snapshot exists. Both
+        coordinates are read on the SAME short-lived connection so they describe the
+        same instant. The binlog pair is the drift fallback for a source without GTID
+        -- the normal case on RDS MySQL 8.0, where a GTID-only comparison could never
+        determine drift at all. Best-effort and read-only: any failure degrades to
+        ``None`` values (drift becomes "undeterminable"), never aborting the run.
         """
         engine = self._source_engine_factory(source)
         try:
@@ -1282,9 +1324,11 @@ class Validator:
                 connection = raw_connection.execution_options(
                     isolation_level="AUTOCOMMIT"
                 )
-                return _source_gtid(connection)
+                gtid = _source_gtid(connection)
+                binlog_file, binlog_position = _source_binlog_position(connection)
+                return gtid, binlog_file, binlog_position
         except Exception:  # noqa: BLE001 - drift is advisory
-            return None
+            return None, None, None
         finally:
             engine.dispose()
 
@@ -1474,37 +1518,128 @@ class Validator:
         return findings
 
 
+def format_binlog_coordinate(
+    file_name: Optional[str], position: Optional[int]
+) -> Optional[str]:
+    """Render a binlog coordinate as ``file:position``, or ``None`` if incomplete.
+
+    Both halves are required: a file without a position cannot be compared, and a
+    position without a file is meaningless (positions restart per file).
+    """
+    if not file_name or position is None:
+        return None
+    return f"{file_name}:{position}"
+
+
+def binlog_advanced(
+    watermark_file: Optional[str],
+    watermark_position: Optional[int],
+    current_file: Optional[str],
+    current_position: Optional[int],
+) -> Optional[bool]:
+    """Whether the source advanced, comparing binlog coordinates. Pure.
+
+    Returns ``None`` when either coordinate is incomplete (undeterminable).
+
+    Only EQUALITY is needed, not ordering, which keeps this correct without having to
+    reason about rotation: the position restarts at the top of each new binlog file,
+    so a later file can hold a SMALLER position and any "is it greater" comparison of
+    the raw values would be wrong. So: same file -> the position must be identical to
+    count as unchanged; different file -> the log rotated (or was reset), which only
+    happens if the server kept writing. Either way an inequality means the source did
+    not stand still, which is exactly the question being asked. A coordinate that
+    moved backwards (restored/rebuilt source, ``RESET MASTER``) therefore also reads
+    as drift -- correctly, since it is certainly not "unchanged since the snapshot".
+    """
+    if not watermark_file or watermark_position is None:
+        return None
+    if not current_file or current_position is None:
+        return None
+    if watermark_file == current_file:
+        return current_position != watermark_position
+    # Different files -> the log rotated (or was reset), which means writes happened.
+    return True
+
+
 def _build_drift(
-    watermark: Optional[Watermark], current_gtid: Optional[str]
+    watermark: Optional[Watermark],
+    current_gtid: Optional[str],
+    current_binlog_file: Optional[str] = None,
+    current_binlog_position: Optional[int] = None,
 ) -> Optional[DriftReport]:
-    """Build a drift report from the watermark and the current source GTID.
+    """Build a drift report from the watermark and the source's current position.
 
     Returns ``None`` when no watermark was supplied (drift is undefined without a
-    consistency point). When both GTIDs are known, ``drifted`` is whether they
-    differ; if either is unknown, drift cannot be determined and is reported as
-    such (Requirement 6.5 / Property 11).
+    consistency point). GTID is preferred when BOTH sides have one; otherwise this
+    falls back to comparing binlog ``file:position`` (Requirement 6.5 / Property 11).
+
+    The fallback is the normal path on the primary supported source: RDS MySQL 8.0
+    cannot enable GTID, so a GTID-only comparison reported "could not be determined"
+    on every single run -- the section could never say anything. The watermark already
+    captures file:pos (``SHOW MASTER STATUS`` returns it alongside the GTID, and CDC
+    already resumes from it), so the coordinate needed to answer the question was
+    being collected and then ignored.
     """
     if watermark is None:
         return None
     watermark_gtid = watermark.gtid_executed
-    if watermark_gtid is None or current_gtid is None:
+    watermark_binlog = format_binlog_coordinate(
+        watermark.binlog_file, watermark.binlog_position
+    )
+    current_binlog = format_binlog_coordinate(
+        current_binlog_file, current_binlog_position
+    )
+
+    if watermark_gtid is not None and current_gtid is not None:
+        drifted = watermark_gtid != current_gtid
         return DriftReport(
             watermark_gtid=watermark_gtid,
             current_gtid=current_gtid,
-            drifted=False,
-            detail="GTID unavailable; drift since snapshot could not be determined.",
+            drifted=drifted,
+            detail=(
+                "Source advanced since the snapshot (GTID changed)."
+                if drifted
+                else "No source changes since the snapshot."
+            ),
+            basis="gtid",
+            watermark_binlog=watermark_binlog,
+            current_binlog=current_binlog,
         )
-    drifted = watermark_gtid != current_gtid
-    detail = (
-        "Source advanced since the snapshot (GTID changed)."
-        if drifted
-        else "No source changes since the snapshot."
+
+    advanced = binlog_advanced(
+        watermark.binlog_file,
+        watermark.binlog_position,
+        current_binlog_file,
+        current_binlog_position,
     )
+    if advanced is not None:
+        return DriftReport(
+            watermark_gtid=watermark_gtid,
+            current_gtid=current_gtid,
+            drifted=advanced,
+            detail=(
+                "Source advanced since the snapshot (binlog position moved from "
+                f"{watermark_binlog} to {current_binlog})."
+                if advanced
+                else "No source changes since the snapshot (binlog position "
+                f"unchanged at {watermark_binlog})."
+            ),
+            basis="binlog",
+            watermark_binlog=watermark_binlog,
+            current_binlog=current_binlog,
+        )
+
     return DriftReport(
         watermark_gtid=watermark_gtid,
         current_gtid=current_gtid,
-        drifted=drifted,
-        detail=detail,
+        drifted=False,
+        detail=(
+            "Neither a GTID nor a binlog position was available on both sides, so "
+            "drift since the snapshot could not be determined."
+        ),
+        basis="",
+        watermark_binlog=watermark_binlog,
+        current_binlog=current_binlog,
     )
 
 
