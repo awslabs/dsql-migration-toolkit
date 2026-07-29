@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.162
+
+### Changed
+
+- **The "Query validation" tool is now called "Query Converter".** The old name reused
+  *Validation*, which is Step 4's own name for a completely different job — comparing
+  **migrated data** by exact `COUNT(*)`, checksums and per-table PK reconciliation — so
+  an optional side tool read as a repeat of a workflow step. It also named the screen
+  after a secondary action: conversion is the one thing this screen always does (the
+  target test needs a verified target connection, and the AI review / AI DBA tuning are
+  further opt-ins on top), so the title now names the core action. It pairs with Step 2's
+  **Schema Conversion** — schemas there, queries here. The caption still reads
+  *"Convert & test app queries"*, so the narrower title hides nothing. The manual is
+  updated in all three languages; chapter filenames are unchanged (they are linked from
+  many places), and the code keeps its `query_playground` module name, noted in that
+  module's docstring so the two spellings are not mistaken for two screens.
+
 ## v0.1.161
 
 ### Fixed

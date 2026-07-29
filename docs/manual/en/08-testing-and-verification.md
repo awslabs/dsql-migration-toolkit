@@ -110,9 +110,9 @@ uv sync                                         # installs the playwright dev de
 ```
 
 The default "smoke" E2E needs no external infrastructure (it verifies the UI
-renders, navigates, and the Query Playground converts a query). A **connected**
+renders, navigates, and the Query Converter converts a query). A **connected**
 tier drives the real flow against live infrastructure — verify source + target on
-the Connect screen, then Query validation → Test on target (`EXPLAIN ANALYZE` +
+the Connect screen, then Query Converter → Test on target (`EXPLAIN ANALYZE` +
 DPU) and, when Amazon Bedrock is reachable, Tune with AI DBA → re-test → the
 per-code-block copy button:
 
@@ -191,4 +191,4 @@ before you cut over. You don't have to take the result on trust; you reproduce i
 
 ---
 
-**Next:** [9. Query validation and the AI DBA →](09-query-validation.md)
+**Next:** [9. The Query Converter and the AI DBA →](09-query-validation.md)

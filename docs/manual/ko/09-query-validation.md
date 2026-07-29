@@ -1,11 +1,11 @@
-# 9. 쿼리 검증과 AI DBA
+# 9. Query Converter와 AI DBA
 
 _언어: [English](../en/09-query-validation.md) | **한국어** | [日本語](../ja/09-query-validation.md)_
 
 > **이전:** [8. 테스트 및 검증](08-testing-and-verification.md)
 
 스키마와 데이터를 옮기는 것만으로는 끝이 아닙니다 — 애플리케이션의 **쿼리**도 Aurora DSQL에서
-돌아가야 하고, *잘* 돌아가야 합니다. **Query Playground**(사이드바의 선택적 도구)는 MySQL 쿼리 하나를
+돌아가야 하고, *잘* 돌아가야 합니다. **Query Converter**(사이드바의 선택적 도구)는 MySQL 쿼리 하나를
 Aurora DSQL로 변환하고, 타깃에서 읽기 전용으로 테스트하며, AI 보조를 켜면 **AI DBA**가 DSQL에 맞게
 효율적으로 재작성하고 그 개선을 증명하는 곳입니다.
 

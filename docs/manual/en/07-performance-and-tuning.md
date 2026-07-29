@@ -438,11 +438,11 @@ production, and it lets you push parallelism harder.
 Beyond the parallelism knobs above, you can tune an individual query against Aurora
 DSQL's distributed execution model — where the primary key *is* the table, filter
 pushdown drives cost, and **DPU** (not PostgreSQL's `cost=`) is the unit. The
-optional **Query Playground** converts a MySQL query, probes it read-only with
+optional **Query Converter** converts a MySQL query, probes it read-only with
 `EXPLAIN` / `EXPLAIN ANALYZE`, and — with AI assist on — an **AI DBA** rewrites it
 for DSQL efficiency and re-tests the rewrite to prove the DPU improvement.
 
-> See [Chapter 9 — Query validation and the AI DBA](09-query-validation.md) for the
+> See [Chapter 9 — The Query Converter and the AI DBA](09-query-validation.md) for the
 > full workflow.
 
 ---

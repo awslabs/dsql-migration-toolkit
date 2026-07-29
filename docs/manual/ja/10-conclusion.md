@@ -2,7 +2,7 @@
 
 _言語: [English](../en/10-conclusion.md) | [한국어](../ko/10-conclusion.md) | **日本語**_
 
-> **前へ:** [9. クエリ検証と AI DBA](09-query-validation.md)
+> **前へ:** [9. Query Converter と AI DBA](09-query-validation.md)
 
 ここまでで全体の流れをひととおり見てきました。すなわち、接続、計画、**Evaluation（評価）**、**Schema Conversion（スキーマ変換）**、**Full Load**、必要に応じた **CDC**、**Validation（検証）**、そして **Cut over（カットオーバー）** です。この章では、どの経路を選ぶか、推奨するエンドツーエンドのフロー、カットオーバーのランブック、そして次に進むべき場所という形で、これらすべてを 1 つに結び付けます。
 

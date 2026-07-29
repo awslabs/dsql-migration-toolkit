@@ -1,11 +1,11 @@
-# 9. Query validation and the AI DBA
+# 9. The Query Converter and the AI DBA
 
 _Language: **English** | [한국어](../ko/09-query-validation.md) | [日本語](../ja/09-query-validation.md)_
 
 > **Prev:** [8. Testing and verification](08-testing-and-verification.md)
 
 Migrating the schema and the data is only part of the story — your application's
-**queries** have to run on Aurora DSQL too, and run *well*. The **Query Playground**
+**queries** have to run on Aurora DSQL too, and run *well*. The **Query Converter**
 (an optional tool in the sidebar) is where you convert a single MySQL query to
 Aurora DSQL, test it read-only on the target, and — with AI assist on — have an
 **AI DBA** rewrite it for DSQL efficiency and prove the improvement.

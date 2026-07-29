@@ -1,4 +1,4 @@
-# 9. クエリ検証と AI DBA
+# 9. Query Converter と AI DBA
 
 _言語: [English](../en/09-query-validation.md) | [한국어](../ko/09-query-validation.md) | **日本語**_
 
@@ -6,7 +6,7 @@ _言語: [English](../en/09-query-validation.md) | [한국어](../ko/09-query-va
 
 スキーマとデータを移行するだけでは終わりではありません。アプリケーションの
 **クエリ**も Aurora DSQL で動作する必要があり、しかも*快適に*動作しなければなりません。
-**Query Playground**（サイドバーにある任意のツール）は、1 つの MySQL クエリを
+**Query Converter**（サイドバーにある任意のツール）は、1 つの MySQL クエリを
 Aurora DSQL に変換し、ターゲットで読み取り専用でテストし、そして AI 補助を有効にすると
 **AI DBA** が DSQL 向けに効率的に書き換え、その改善を証明する場所です。
 

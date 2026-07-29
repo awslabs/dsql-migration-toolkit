@@ -94,7 +94,7 @@ uv sync                                         # installs the playwright dev de
 .venv/bin/python -m pytest -m e2e               # run the browser E2E suite
 ```
 
-デフォルトの「スモーク」E2E は外部インフラを必要としません(UI がレンダリングされ、ナビゲートし、Query Playground がクエリを変換することを検証します)。**connected**(接続)ティアは、ライブインフラに対して実際のフローを駆動します。Connect 画面でソース + ターゲットを検証し、続いて Query validation → Test on target(`EXPLAIN ANALYZE` + DPU)、そして Amazon Bedrock に到達可能な場合は Tune with AI DBA → 再テスト → コードブロックごとのコピーボタンを検証します。
+デフォルトの「スモーク」E2E は外部インフラを必要としません(UI がレンダリングされ、ナビゲートし、Query Converter がクエリを変換することを検証します)。**connected**(接続)ティアは、ライブインフラに対して実際のフローを駆動します。Connect 画面でソース + ターゲットを検証し、続いて Query Converter → Test on target(`EXPLAIN ANALYZE` + DPU)、そして Amazon Bedrock に到達可能な場合は Tune with AI DBA → 再テスト → コードブロックごとのコピーボタンを検証します。
 
 ```bash
 RUN_E2E_CONNECTED=1 .venv/bin/python -m pytest -m e2e   # connected tier too
@@ -135,4 +135,4 @@ RUN_E2E_CONNECTED=1 .venv/bin/python -m pytest -m e2e   # connected tier too
 
 ---
 
-**次へ:** [9. クエリ検証と AI DBA →](09-query-validation.md)
+**次へ:** [9. Query Converter と AI DBA →](09-query-validation.md)

@@ -1,7 +1,15 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Query Playground screen (Optional tools): convert + test a MySQL query on DSQL.
+"""Query Converter screen (Optional tools): convert + test a MySQL query on DSQL.
+
+Named "Query Converter" in the UI. The module/identifiers keep the older
+"query_playground" name (renaming the files is a wider, purely mechanical change), so
+expect that spelling throughout the code -- they are the same screen. The user-facing
+name deliberately avoids "validation": that is Step 4's own name for comparing MIGRATED
+DATA (COUNT(*)/checksum/PK reconciliation), and reusing it made this optional tool read
+as a repeat of a workflow step. Conversion is also the screen's only always-available
+action, and it pairs with Step 2's "Schema Conversion".
 
 A standalone, optional tool (not part of the four-step migration) where a user
 pastes a real MySQL statement and sees:
@@ -454,7 +462,7 @@ def build_query_playground_screen(
         )
         with ui.column().classes("w-full gap-3"):
             section_header(
-                ui, icon="science", title="Query validation (playground)"
+                ui, icon="science", title="Query Converter"
             )
             intro = (
                 "Paste a MySQL statement to see how it converts to Aurora DSQL "
@@ -615,7 +623,7 @@ def build_query_playground_screen(
                 )
                 open_chat(
                     title="AI query assistant",
-                    subtitle="Query validation (playground)",
+                    subtitle="Query Converter",
                     first_question=first_question,
                     streamer=lambda messages, on_delta: strategist.stream_chat(
                         system, messages, on_delta
@@ -699,7 +707,7 @@ def build_query_playground_screen(
 
                 sender["send"] = open_chat(
                     title="AI DBA — query tuning",
-                    subtitle="Query validation (playground) · Aurora DSQL efficiency",
+                    subtitle="Query Converter · Aurora DSQL efficiency",
                     first_question=(
                         "Rewrite this converted query to run more efficiently on "
                         "Aurora DSQL. Explain in detail what you changed and why it "

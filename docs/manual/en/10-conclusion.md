@@ -2,7 +2,7 @@
 
 _Language: **English** | [한국어](../ko/10-conclusion.md) | [日本語](../ja/10-conclusion.md)_
 
-> **Prev:** [9. Query validation and the AI DBA](09-query-validation.md)
+> **Prev:** [9. The Query Converter and the AI DBA](09-query-validation.md)
 
 You've now seen the whole journey: connect, plan, **evaluate**, **convert the
 schema**, **Full Load**, optionally **CDC**, **validate**, and **cut over**. This

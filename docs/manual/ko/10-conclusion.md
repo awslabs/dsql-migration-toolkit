@@ -2,7 +2,7 @@
 
 _언어: [English](../en/10-conclusion.md) | **한국어** | [日本語](../ja/10-conclusion.md)_
 
-> **이전:** [9. 쿼리 검증과 AI DBA](09-query-validation.md)
+> **이전:** [9. Query Converter와 AI DBA](09-query-validation.md)
 
 이제 전체 여정을 살펴보았습니다: 연결, 계획, **평가(Evaluation)**, **스키마 변환(Schema Conversion)**,
 **Full Load**, 선택적 **CDC**, **검증(Validation)**, 그리고 **전환(Cut over)**. 이 장은 이 모두를

@@ -336,10 +336,10 @@ Full Load를 **RDS read replica / Aurora reader endpoint**로 향하게 하면 �
 
 위의 병렬수 설정 외에, 개별 쿼리를 Aurora DSQL의 분산 실행 모델에 맞게 튜닝할 수 있습니다 — 기본 키가 곧
 테이블이고, 필터 푸시다운이 비용을 좌우하며, 비용 단위는 (PostgreSQL의 `cost=`가 아니라) **DPU**입니다.
-선택적 **Query Playground**는 MySQL 쿼리를 변환하고 `EXPLAIN` / `EXPLAIN ANALYZE`로 읽기 전용
+선택적 **Query Converter**는 MySQL 쿼리를 변환하고 `EXPLAIN` / `EXPLAIN ANALYZE`로 읽기 전용
 프로브한 뒤, AI 보조를 켜면 **AI DBA**가 DSQL에 맞게 재작성하고 재테스트로 DPU 개선을 증명합니다.
 
-> 전체 흐름은 [9장 — 쿼리 검증과 AI DBA](09-query-validation.md)를 참고하세요.
+> 전체 흐름은 [9장 — Query Converter와 AI DBA](09-query-validation.md)를 참고하세요.
 
 ---
 

@@ -710,7 +710,15 @@ def build_page(
         optional_tools={
             _QUERY_PLAYGROUND_VIEW: OptionalTool(
                 view_key=_QUERY_PLAYGROUND_VIEW,
-                label="Query validation",
+                # "Query Converter", NOT "Query validation": Validation is Step 4's
+                # own name for a completely different job (COUNT(*)/checksum/PK
+                # reconciliation of migrated DATA), so reusing the word here read as
+                # "am I doing Step 4 again?". This screen's always-available core
+                # action is CONVERSION -- the target test, AI review and AI DBA tuning
+                # are optional extras on top -- and it pairs with Step 2's "Schema
+                # Conversion" (schemas there, queries here). The caption still names
+                # the test, so nothing is hidden by the narrower title.
+                label="Query Converter",
                 caption="Optional · Convert & test app queries",
                 icon="science",
                 content=query_playground_content,

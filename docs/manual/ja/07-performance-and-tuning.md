@@ -353,11 +353,11 @@ churn がすべてプライマリから外れます — 本番を保護する最
 
 上記の並列度のノブに加えて、Aurora DSQL の分散実行モデルに合わせて個々のクエリをチューニングできます — そこでは
 プライマリキーが *まさに* テーブルであり、フィルタのプッシュダウンがコストを左右し、単位は (PostgreSQL の `cost=` では
-なく) **DPU** です。オプションの **Query Playground** は MySQL クエリを変換し、`EXPLAIN` / `EXPLAIN ANALYZE` で
+なく) **DPU** です。オプションの **Query Converter** は MySQL クエリを変換し、`EXPLAIN` / `EXPLAIN ANALYZE` で
 読み取り専用でプローブし、そして AI 支援をオンにすると **AI DBA** が DSQL の効率のためにそれを書き換え、書き換えを
 再テストして DPU の改善を証明します。
 
-> 完全なワークフローについては [第 9 章 — クエリ検証と AI DBA](09-query-validation.md) を参照してください。
+> 完全なワークフローについては [第 9 章 — Query Converter と AI DBA](09-query-validation.md) を参照してください。
 
 ---
 

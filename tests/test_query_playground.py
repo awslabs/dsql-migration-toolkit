@@ -687,3 +687,43 @@ def test_await_probe_only_refreshes_on_the_transition() -> None:
     state["probing"] = False
     timers.pop()()
     assert calls["refresh"] == 1
+
+
+def test_screen_is_named_query_converter_not_query_validation() -> None:
+    """The name must not reuse "Validation", which is Step 4's own name.
+
+    Step 4 (Validation) compares MIGRATED DATA -- exact COUNT(*), checksums, per-table PK
+    reconciliation. This screen converts a single MySQL query, and only optionally tests
+    it. Sharing the word made an optional tool read as a repeat of a workflow step, and
+    it named the screen after a secondary action: conversion is the always-available
+    core (the target test needs a verified connection), and it pairs with Step 2's
+    "Schema Conversion".
+    """
+    import inspect
+
+    from dsql_migrator.ui import app, query_playground
+
+    for module in (app, query_playground):
+        src = inspect.getsource(module)
+        # No user-facing string may say "Query validation" any more.
+        assert 'label="Query validation"' not in src, module.__name__
+        assert 'title="Query validation' not in src, module.__name__
+        assert 'subtitle="Query validation' not in src, module.__name__
+
+    app_src = inspect.getsource(app)
+    assert 'label="Query Converter"' in app_src
+    # The caption still advertises the optional test, so the narrower title hides nothing.
+    assert 'caption="Optional · Convert & test app queries"' in app_src
+
+    screen_src = inspect.getsource(query_playground)
+    assert 'title="Query Converter"' in screen_src
+    assert 'subtitle="Query Converter",' in screen_src
+
+
+def test_query_converter_name_does_not_collide_with_the_validation_step() -> None:
+    # Guard the distinction itself: Step 4's title must stay "Validation", and this tool
+    # must not be titled with it, so the two can never read as the same screen.
+    from dsql_migrator.ui.workflow import WorkflowStep, step_title
+
+    assert step_title(WorkflowStep.VALIDATION) == "Validation"
+    assert "Converter" not in step_title(WorkflowStep.VALIDATION)

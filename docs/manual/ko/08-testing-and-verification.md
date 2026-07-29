@@ -112,4 +112,4 @@ _언어: [English](../en/08-testing-and-verification.md) | **한국어** | [日�
 
 ---
 
-**다음:** [9. 쿼리 검증과 AI DBA →](09-query-validation.md)
+**다음:** [9. Query Converter와 AI DBA →](09-query-validation.md)
