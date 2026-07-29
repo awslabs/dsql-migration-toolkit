@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.164
+
+### Changed
+
+- **The sidebar footer is now a single "Settings" entry that opens a tabbed dialog.**
+  Performance tuning, Diagnostics and the activity-log download used to sit in the
+  sidebar as two inline expansion panels plus a button — which squeezed a nine-field form
+  into the ~16rem sidebar column, and made opening one panel shove the others around.
+  They are also all the same kind of thing (app-wide runtime settings, none of them part
+  of the migration flow), so they now live behind one gear row. The dialog groups them as
+  **Performance / Diagnostics / Activity log** tabs, because you come here to change one
+  category, not to read all three. The body is built once, so a half-typed value survives
+  closing and reopening, and the dialog is persistent with an explicit close so an
+  outside click cannot discard it. Each panel is bounded (`max-height` + scroll) but not
+  padded to a common height — a two-control panel no longer renders a screen of empty
+  space. With the extra room, the copy also says what each section actually affects
+  instead of repeating the same "live, app-wide" caveat three times.
+
 ## v0.1.163
 
 ### Changed

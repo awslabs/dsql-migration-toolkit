@@ -728,10 +728,65 @@ def build_page(
 
 
 def _render_footer_tools(activity_log_path: str) -> None:
-    """Render the sidebar footer tools: activity-log download + Diagnostics."""
-    _render_activity_log_download(activity_log_path)
-    _render_performance_tuning_controls()
-    _render_diagnostics_controls()
+    """Render the sidebar footer as ONE "Settings" row that opens a modal.
+
+    These three utilities (performance tuning, diagnostics, activity-log download) used
+    to sit in the sidebar as two inline ``ui.expansion`` panels plus a button. That put
+    a nine-field form into a ~16rem column, and opening one panel shoved the others
+    around. They are also all the same KIND of thing -- app-wide runtime settings, none
+    of them part of the migration flow -- so they belong behind one entry point rather
+    than three competing rows.
+
+    The sidebar now shows a single gear + "Settings"; the modal groups the details into
+    labelled categories. The body is built ONCE (not per click), so anything the user
+    typed survives closing and reopening.
+    """
+    from nicegui import ui
+
+    from dsql_migrator.ui.design import section_header
+
+    dialog = ui.dialog().props("persistent")
+    with dialog, ui.card().classes("gap-0").style("width: 42rem; max-width: 94vw"):
+        with ui.row().classes("items-center gap-2 w-full no-wrap"):
+            section_header(ui, icon="settings", title="Settings")
+            ui.button(icon="close", on_click=dialog.close).props(
+                "flat dense round size=sm color=grey-7"
+            ).tooltip("Close")
+        ui.label(
+            "App-wide and live: changes apply to the next run and reset when the app "
+            "restarts. Nothing here is a deploy-time parameter."
+        ).classes("text-xs text-gray-500 -mt-1 mb-2")
+        # Tabs, not stacked sections: the three categories are unrelated -- you come
+        # here to change ONE of them -- so stacking made the reader scroll past two
+        # groups to reach the third, and the modal grew with every added knob. Same
+        # ui.tabs/tab_panels shape the Schema Conversion screen uses.
+        with ui.tabs().props("dense align=left").classes("w-full") as tabs:
+            performance_tab = ui.tab("Performance", icon="speed")
+            diagnostics_tab = ui.tab("Diagnostics", icon="tune")
+            activity_tab = ui.tab("Activity log", icon="download")
+        with ui.tab_panels(tabs, value=performance_tab).classes("w-full").style(
+            # A small floor keeps the tab strip from jumping between panels of very
+            # different heights, without padding a short panel (Diagnostics is two
+            # controls) with a screen of empty space -- 22rem did exactly that. The cap
+            # makes a long panel scroll instead of pushing the dialog off-viewport.
+            "min-height: 9rem; max-height: 68vh; overflow-y: auto"
+        ):
+            with ui.tab_panel(performance_tab).classes("p-0 pt-3"):
+                _render_performance_tuning_controls()
+            with ui.tab_panel(diagnostics_tab).classes("p-0 pt-3"):
+                _render_diagnostics_controls()
+            with ui.tab_panel(activity_tab).classes("p-0 pt-3"):
+                _render_activity_log_download(activity_log_path)
+
+    with ui.item(on_click=dialog.open).props("clickable").classes("rounded-borders"):
+        with ui.item_section().props("avatar"):
+            ui.icon("settings", color="grey-7")
+        with ui.item_section():
+            ui.item_label("Settings").classes("text-sm")
+            # Short enough to stay on ONE line in the ~16rem sidebar: the full list
+            # ("Tuning · diagnostics · activity log") wrapped to two lines and made the
+            # row taller than every nav item above it.
+            ui.item_label("Tuning · logging").props("caption")
 
 
 def _render_performance_tuning_controls() -> None:
@@ -755,69 +810,68 @@ def _render_performance_tuning_controls() -> None:
 
     current = current_tuning_values()
 
-    with ui.expansion("Performance tuning", icon="speed").props("dense").classes(
-        "w-full"
-    ):
-        # Cloudscape "form" treatment, kept compact for the narrow sidebar: a
-        # single-line info Alert with the operational caveat up top, then the
-        # knobs laid out as grouped form fields -- one dense row per knob
-        # (label + allowed range + bounded input), with the longer description
-        # moved to a hover tooltip (Cloudscape's "info" idiom) so each field
-        # stays a single line.
-        render_notice(
-            ui,
-            tone="info",
-            header="Applies to the next run",
-            body="Live, app-wide; resets on restart. Connections ≈ tables × batches.",
+    # Cloudscape "form" treatment: the knobs are grouped form fields -- one dense row
+    # per knob (label + allowed range + bounded input), with the longer description on a
+    # hover tooltip (Cloudscape's "info" idiom) so each field stays a single line.
+    # Rendered into the Settings modal, which already states the live/app-wide caveat,
+    # so only the knob-specific note is repeated here.
+    render_notice(
+        ui,
+        tone="info",
+        header="Connections ≈ tables in parallel × batches per table",
+        body=(
+            "Raise these together carefully: the product is how many DSQL connections "
+            "a run opens at once."
+        ),
+    )
+
+    def _on_change(event: object, k) -> None:
+        raw = getattr(event, "value", None)
+        try:
+            applied = set_tuning_value(k.field, raw)
+        except TuningValueError as exc:
+            ui.notify(str(exc), type="warning", position="top")
+            return
+        ui.notify(
+            f"{k.label} = {applied} (applies to the next run).",
+            type="info",
         )
 
-        def _on_change(event: object, k) -> None:
-            raw = getattr(event, "value", None)
-            try:
-                applied = set_tuning_value(k.field, raw)
-            except TuningValueError as exc:
-                ui.notify(str(exc), type="warning", position="top")
-                return
-            ui.notify(
-                f"{k.label} = {applied} (applies to the next run).",
-                type="info",
+    current_group: str | None = None
+    for knob in TUNABLE_KNOBS:
+        # Emit a Cloudscape-style section subheader when the group changes
+        # (knobs are ordered by group, so this groups them into "Full Load"
+        # / "Validation" sections without re-sorting).
+        if knob.group != current_group:
+            ui.label(knob.group).classes(
+                "text-xs uppercase tracking-wide text-gray-500 font-medium "
+                "mt-2 mb-0"
             )
+            current_group = knob.group
 
-        current_group: str | None = None
-        for knob in TUNABLE_KNOBS:
-            # Emit a Cloudscape-style section subheader when the group changes
-            # (knobs are ordered by group, so this groups them into "Full Load"
-            # / "Validation" sections without re-sorting).
-            if knob.group != current_group:
-                ui.label(knob.group).classes(
-                    "text-xs uppercase tracking-wide text-gray-500 font-medium "
-                    "mt-2 mb-0"
-                )
-                current_group = knob.group
-
-            # One compact Cloudscape "form field" per row: label (+ range hint)
-            # on the left, a small info glyph carrying the description tooltip,
-            # and the bounded input on the right.
-            with ui.row().classes("items-center gap-1 no-wrap w-full"):
-                with ui.column().classes("gap-0 flex-1 min-w-0"):
-                    with ui.row().classes("items-center gap-1 no-wrap"):
-                        ui.label(knob.short_label).classes(
-                            "text-sm text-gray-900 truncate"
-                        )
-                        ui.icon("info").classes(
-                            "text-gray-400 text-xs cursor-help"
-                        ).tooltip(knob.description)
-                    ui.label(f"{knob.minimum}–{knob.maximum}").classes(
-                        "text-xs text-gray-400 leading-none"
+        # One compact Cloudscape "form field" per row: label (+ range hint)
+        # on the left, a small info glyph carrying the description tooltip,
+        # and the bounded input on the right.
+        with ui.row().classes("items-center gap-1 no-wrap w-full"):
+            with ui.column().classes("gap-0 flex-1 min-w-0"):
+                with ui.row().classes("items-center gap-1 no-wrap"):
+                    ui.label(knob.short_label).classes(
+                        "text-sm text-gray-900 truncate"
                     )
-                ui.number(
-                    value=current[knob.field],
-                    min=knob.minimum,
-                    max=knob.maximum,
-                    step=1,
-                    format="%d",
-                    on_change=lambda e, k=knob: _on_change(e, k),
-                ).props("dense outlined").classes("w-20 text-sm")
+                    ui.icon("info").classes(
+                        "text-gray-400 text-xs cursor-help"
+                    ).tooltip(knob.description)
+                ui.label(f"{knob.minimum}–{knob.maximum}").classes(
+                    "text-xs text-gray-400 leading-none"
+                )
+            ui.number(
+                value=current[knob.field],
+                min=knob.minimum,
+                max=knob.maximum,
+                step=1,
+                format="%d",
+                on_change=lambda e, k=knob: _on_change(e, k),
+            ).props("dense outlined").classes("w-20 text-sm")
 
 
 def _render_diagnostics_controls() -> None:
@@ -847,36 +901,36 @@ def _render_diagnostics_controls() -> None:
     if current not in levels:
         current = "INFO"
 
-    with ui.expansion("Diagnostics", icon="tune").props("dense").classes("w-full"):
-        ui.label(
-            "Live, app-wide; resets on restart."
-        ).classes("text-xs text-gray-400")
+    ui.label(
+        "DEBUG adds failure stacktraces. The stdout mirror is what reaches CloudWatch "
+        "when the app runs on ECS."
+    ).classes("text-xs text-gray-500")
 
-        def _on_level(event: object) -> None:
-            value = str(getattr(event, "value", "INFO"))
-            set_activity_log_level(getattr(logging, value, logging.INFO))
-            ui.notify(f"Log level set to {value}.", type="info")
+    def _on_level(event: object) -> None:
+        value = str(getattr(event, "value", "INFO"))
+        set_activity_log_level(getattr(logging, value, logging.INFO))
+        ui.notify(f"Log level set to {value}.", type="info")
 
-        ui.select(
-            levels, value=current, label="Log level", on_change=_on_level
-        ).props("dense outlined").classes("w-full text-xs")
+    ui.select(
+        levels, value=current, label="Log level", on_change=_on_level
+    ).props("dense outlined").classes("w-full text-xs")
 
-        def _on_toggle(event: object) -> None:
-            if bool(getattr(event, "value", False)):
-                configure_activity_stdout_log(level=current_activity_log_level())
-                ui.notify(
-                    "Mirroring activity log to stdout (CloudWatch on ECS).",
-                    type="info",
-                )
-            else:
-                disable_activity_stdout_log()
-                ui.notify("Stopped mirroring activity log to stdout.", type="info")
+    def _on_toggle(event: object) -> None:
+        if bool(getattr(event, "value", False)):
+            configure_activity_stdout_log(level=current_activity_log_level())
+            ui.notify(
+                "Mirroring activity log to stdout (CloudWatch on ECS).",
+                type="info",
+            )
+        else:
+            disable_activity_stdout_log()
+            ui.notify("Stopped mirroring activity log to stdout.", type="info")
 
-        ui.switch(
-            "Send to CloudWatch (stdout)",
-            value=activity_stdout_enabled(),
-            on_change=_on_toggle,
-        ).props("dense").classes("text-xs")
+    ui.switch(
+        "Send to CloudWatch (stdout)",
+        value=activity_stdout_enabled(),
+        on_change=_on_toggle,
+    ).props("dense").classes("text-xs")
 
 
 def _render_activity_log_download(activity_log_path: str) -> None:
@@ -898,9 +952,16 @@ def _render_activity_log_download(activity_log_path: str) -> None:
             return
         ui.download(data, "migration_activity.log")
 
+    # In the Settings modal there is room to say WHAT the file contains, which the
+    # bare sidebar button could not. Outlined (not flat) so it reads as the section's
+    # action rather than a link.
+    ui.label(
+        "One UTC line per event across the whole session — connections, assessment, "
+        "schema apply, Full Load, CDC — independent of which step is open."
+    ).classes("text-xs text-gray-500")
     ui.button("Download activity log", on_click=_download).props(
-        "flat dense icon=download size=sm"
-    ).classes("text-xs")
+        "outline dense icon=download no-caps size=sm color=primary"
+    )
 
 
 def main() -> None:

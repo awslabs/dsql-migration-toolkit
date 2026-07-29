@@ -609,3 +609,69 @@ def test_diff_row_tints_are_barely_there() -> None:
         _mark, _cls, tint = DIFF_SIDE_STYLE[role]
         assert "-50/" in tint, f"{role} tint should be a -50 shade with alpha: {tint}"
         assert "-100" not in tint and "-200" not in tint
+
+
+# ---------------------------------------------------------------------------
+# Sidebar footer: one "Settings" entry whose modal groups the utilities in tabs.
+# ---------------------------------------------------------------------------
+
+
+def test_footer_is_one_settings_entry_not_three_inline_panels() -> None:
+    """The three runtime utilities live behind ONE sidebar row.
+
+    They used to be two inline ``ui.expansion`` panels plus a button: that put a
+    nine-field form into the ~16rem sidebar column, and opening one panel shoved the
+    others around. They are also all the same kind of thing -- app-wide runtime settings,
+    none part of the migration flow -- so they belong behind a single entry point.
+    """
+    import inspect
+
+    from dsql_migrator.ui import app
+
+    src = inspect.getsource(app._render_footer_tools)
+    # A single gear row, with a caption short enough not to wrap in the sidebar.
+    assert 'ui.icon("settings"' in src
+    assert 'ui.item_label("Settings")' in src
+    # No inline expansions for these utilities any more.
+    for module_fn in (
+        app._render_performance_tuning_controls,
+        app._render_diagnostics_controls,
+    ):
+        body = inspect.getsource(module_fn)
+        assert 'ui.expansion(' not in body, module_fn.__name__
+
+
+def test_settings_modal_groups_the_categories_in_tabs() -> None:
+    # Tabs, not stacked sections: you come here to change ONE category, so stacking made
+    # the reader scroll past two groups to reach the third.
+    import inspect
+
+    from dsql_migrator.ui import app
+
+    src = inspect.getsource(app._render_footer_tools)
+    assert "ui.tabs(" in src and "ui.tab_panels(" in src
+    for label in ('"Performance"', '"Diagnostics"', '"Activity log"'):
+        assert f"ui.tab({label}" in src, label
+    # Each utility renders into its own panel.
+    assert "_render_performance_tuning_controls()" in src
+    assert "_render_diagnostics_controls()" in src
+    assert "_render_activity_log_download(activity_log_path)" in src
+
+
+def test_settings_modal_panels_are_bounded_but_not_padded() -> None:
+    """A short panel must not be padded out to a tall one's height.
+
+    A 22rem floor gave Diagnostics (two controls) a screen of empty space; the cap is
+    what keeps a long panel scrolling instead of pushing the dialog off-viewport.
+    """
+    import inspect
+
+    from dsql_migrator.ui import app
+
+    src = inspect.getsource(app._render_footer_tools)
+    assert "min-height: 9rem" in src
+    assert "max-height: 68vh" in src
+    assert "overflow-y: auto" in src
+    # Persistent + an explicit close, so an outside click cannot lose a half-typed value.
+    assert '.props("persistent")' in src
+    assert 'icon="close"' in src
