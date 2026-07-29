@@ -7653,3 +7653,94 @@ def test_cleanup_sentinel_is_also_nonblocking() -> None:
 
     src = inspect.getsource(_engine._migrate_tables_in_parallel)
     assert "_report_progress(progress_queue, _PROGRESS_SENTINEL)" in src
+
+
+# ---------------------------------------------------------------------------
+# CDC prerequisite gate — must not punish the normal Full-load-+-CDC flow
+# ---------------------------------------------------------------------------
+
+
+def _passing_cdc_report():
+    return PrerequisiteReport.build(
+        MigrationMode.CDC,
+        [_result(PrerequisiteCheckId.BINLOG_ROW_FORMAT, PrerequisiteStatus.PASS)],
+    )
+
+
+def _failing_cdc_report():
+    return PrerequisiteReport.build(
+        MigrationMode.CDC,
+        [_result(PrerequisiteCheckId.BINLOG_ROW_FORMAT, PrerequisiteStatus.FAIL)],
+    )
+
+
+def _gate(state):
+    """Mirror the UI's call: report + the durable gated-mode escape hatch."""
+    from dsql_migrator.ui.data_migration import cdc_prerequisite_block_reason
+
+    return cdc_prerequisite_block_reason(
+        state.get_prereq_report(MigrationMode.CDC),
+        cdc_checks_already_passed=(
+            getattr(state, "prereq_gated_mode", None) is MigrationMode.CDC
+        ),
+    )
+
+
+def test_cdc_gate_allows_deploy_after_a_finished_full_load_and_cdc_run() -> None:
+    """The reported bug: run the CDC checks, finish the Full Load, deploy is blocked.
+
+    The prerequisite reports live in process memory and are deliberately never
+    persisted -- and the Full Load clears them when it starts. So a finished
+    Full-load-+-CDC run legitimately has no report, and the gate told the user to run
+    checks they had just run. The run could only have STARTED once the CDC-superset
+    checks passed, and that IS recorded durably (prereq_gated_mode).
+    """
+    state = DataMigrationState()
+    state.set_prereq_gated_mode(MigrationMode.CDC)  # what starting the load records
+    assert state.get_prereq_report(MigrationMode.CDC) is None  # report is gone
+    assert _gate(state) is None, "deploy must not be blocked after the load ran"
+
+
+def test_cdc_gate_still_blocks_a_session_that_never_checked() -> None:
+    state = DataMigrationState()
+    reason = _gate(state)
+    assert reason is not None
+    assert "CDC prerequisite checks" in reason
+
+
+def test_cdc_gate_does_not_accept_a_full_load_only_pass() -> None:
+    # A Full-load-only run passed only the FULL_LOAD checks -- binlog ROW/FULL was
+    # never verified, so it must not excuse the CDC gate.
+    state = DataMigrationState()
+    state.set_prereq_gated_mode(MigrationMode.FULL_LOAD)
+    assert _gate(state) is not None
+
+
+def test_cdc_gate_prefers_a_present_failing_report_over_the_escape_hatch() -> None:
+    # A failing report is a LIVE signal: even with the gated mode recorded, a source
+    # whose binlog is not ROW/FULL can never stream, so deploy must stay blocked.
+    state = DataMigrationState()
+    state.set_prereq_gated_mode(MigrationMode.CDC)
+    state.set_prereq_report(MigrationMode.CDC, _failing_cdc_report())
+    reason = _gate(state)
+    assert reason is not None
+    assert "ROW format" in reason
+
+
+def test_cdc_gate_allows_a_freshly_passing_report() -> None:
+    state = DataMigrationState()
+    state.set_prereq_report(MigrationMode.CDC, _passing_cdc_report())
+    assert _gate(state) is None
+
+
+def test_cdc_gate_call_sites_pass_the_escape_hatch() -> None:
+    # Both CDC lifecycle gates (Deploy infrastructure, Start CDC) must use it, or the
+    # bug returns on whichever one was missed.
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    src = inspect.getsource(_cdc_ui)
+    assert src.count("cdc_checks_already_passed=") == 2, (
+        "both the deploy and start gates must pass cdc_checks_already_passed"
+    )

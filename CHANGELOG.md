@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.154
+
+### Fixed
+
+- **"Deploy CDC infrastructure" was blocked after a finished Full load + CDC run.** The
+  CDC prerequisite gate added in v0.1.145 demanded a CDC-mode report, but those reports
+  live in process memory only — they are deliberately never persisted, and the Full Load
+  clears them when it starts. So the normal flow (run the CDC prerequisites → let the
+  load finish → deploy) hit *"Run the CDC prerequisite checks first"* about checks the
+  user had just run. The gate now also accepts the durable signal recorded when the load
+  started: a Full Load can only have STARTED once the CDC-superset checks passed. A
+  report that is present but FAILING still blocks (a live signal), a Full-load-only pass
+  still does not excuse the CDC gate, and a session that never checked is still blocked.
+  Both CDC lifecycle gates (Deploy infrastructure and Start CDC) are covered.
+
 ## v0.1.153
 
 ### Fixed

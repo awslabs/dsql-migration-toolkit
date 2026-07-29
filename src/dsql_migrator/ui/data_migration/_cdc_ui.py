@@ -1455,7 +1455,10 @@ def _render_cdc_start_button(
     # session can reach Start CDC on already-deployed (or adopted) infrastructure
     # without having passed through the deploy action.
     prereq_block = cdc_prerequisite_block_reason(
-        migration_state.get_prereq_report(MigrationMode.CDC)
+        migration_state.get_prereq_report(MigrationMode.CDC),
+        cdc_checks_already_passed=(
+            getattr(migration_state, "prereq_gated_mode", None) is MigrationMode.CDC
+        ),
     )
     if prereq_block:
         render_notice(
@@ -1728,7 +1731,14 @@ def _render_cdc_infra_deploy_action(
     # any infrastructure is paid for, rather than discovering it as an undiagnosed
     # connector failure later.
     _prereq_block = cdc_prerequisite_block_reason(
-        migration_state.get_prereq_report(MigrationMode.CDC)
+        migration_state.get_prereq_report(MigrationMode.CDC),
+        # The reports are never persisted and the Full Load clears them when it
+        # starts, so a finished Full-load-+-CDC run legitimately has none. The run
+        # could only have STARTED once the CDC-superset checks passed, and THAT is
+        # recorded durably -- use it instead of re-demanding the checks.
+        cdc_checks_already_passed=(
+            getattr(migration_state, "prereq_gated_mode", None) is MigrationMode.CDC
+        ),
     )
     deploy_btn = ui.button(  # type: ignore[attr-defined]
         "Deploy CDC infrastructure", on_click=_confirm, icon="cloud_upload"

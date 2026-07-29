@@ -1503,6 +1503,8 @@ def cdc_cascade_gap_tables(assessment: object) -> list[str]:
 
 def cdc_prerequisite_block_reason(
     report: Optional[PrerequisiteReport],
+    *,
+    cdc_checks_already_passed: bool = False,
 ) -> Optional[str]:
     """Why the CDC lifecycle must not proceed, or ``None`` when it may.
 
@@ -1527,9 +1529,20 @@ def cdc_prerequisite_block_reason(
 
     Deliberately does NOT gate on ``report.can_proceed``: that also covers per-table
     ``TARGET_SCHEMA_READY`` / ``TABLE_PRIMARY_KEY`` failures, which the Full Load
-    guard already owns and which do not make streaming impossible. Pure/unit-testable.
+    guard already owns and which do not make streaming impossible.
+
+    ``cdc_checks_already_passed`` excuses an ABSENT report. The reports live in process
+    memory only and are deliberately never persisted, so they vanish on an app restart
+    -- and the Full Load itself clears them when it starts. Without this the gate
+    punished the normal Full-load-+-CDC flow: run the CDC prerequisites, let the load
+    finish, and "Deploy CDC infrastructure" was blocked telling you to run checks you
+    had already run. Callers pass the recorded gated mode (the load could only have
+    STARTED once the CDC-superset checks passed), which is durable. A report that is
+    present but failing still blocks -- that is a live signal. Pure/unit-testable.
     """
     if report is None:
+        if cdc_checks_already_passed:
+            return None
         return (
             "Run the CDC prerequisite checks first (Prerequisites step) — they "
             "verify the source binary log is usable for streaming before any "

@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.154
+
+### Fixed
+
+- **Full load + CDC 실행이 끝난 뒤 "Deploy CDC infrastructure"가 차단되던 문제를 수정했습니다.**
+  v0.1.145에서 추가한 CDC 선행 조건 게이트가 CDC 모드 리포트를 요구했지만, 그 리포트는 프로세스
+  메모리에만 존재합니다 — 의도적으로 영구 저장하지 않으며, Full Load가 시작될 때 초기화됩니다.
+  그래서 정상 흐름(CDC 선행 조건 실행 → 적재 완료 → 배포)에서 방금 실행한 점검을 두고
+  *"Run the CDC prerequisite checks first"*가 표시되었습니다. 이제 게이트가 적재 시작 시 기록되는
+  durable 신호도 인정합니다: Full Load는 CDC 상위 집합 점검이 통과했을 때만 **시작될 수** 있기
+  때문입니다. 리포트가 존재하지만 **실패**한 경우는 여전히 차단되고(라이브 신호), Full-load-only
+  통과로는 CDC 게이트가 면제되지 않으며, 한 번도 점검하지 않은 세션도 여전히 차단됩니다. CDC
+  라이프사이클 게이트 두 곳(Deploy infrastructure, Start CDC) 모두 적용했습니다.
+
 ## v0.1.153
 
 ### Fixed
