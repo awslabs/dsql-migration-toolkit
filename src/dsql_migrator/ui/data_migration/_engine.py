@@ -18,7 +18,12 @@ import multiprocessing
 import multiprocessing.queues
 import threading
 import time as _time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+    as_completed,
+)
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -430,6 +435,15 @@ class _RunCounts(NamedTuple):
 # Stagger delay between process submissions to avoid DSQL IAM token/connection burst.
 _PROCESS_LAUNCH_STAGGER_SECONDS = 0.15
 
+# How long Stop Full Load waits for the worker processes to wind down cooperatively
+# before it stops waiting on them. Cancellation is cooperative: a worker finishes its
+# current batch, sees ``cancel_event`` and returns. That is normally seconds, so this
+# is a generous backstop -- not a normal timeout. Its job is to guarantee that Stop
+# ALWAYS terminates: without it a worker wedged anywhere (a hung socket read, a
+# blocked queue put -- the observed deadlock) left the parent in ``as_completed``
+# forever while the UI insisted it was "finishing the current batch".
+_CANCEL_GRACE_SECONDS = 90.0
+
 # Sentinel put onto progress_queue to signal drain thread to stop.
 _PROGRESS_SENTINEL = None
 
@@ -500,6 +514,31 @@ def _init_worker(
     global _worker_progress_queue, _worker_cancel_event  # noqa: PLW0603
     _worker_progress_queue = progress_queue
     _worker_cancel_event = cancel_event
+
+
+def _report_progress(
+    progress_queue: "Optional[multiprocessing.Queue[object]]", message: object
+) -> None:
+    """Send a progress message from a worker process WITHOUT ever blocking.
+
+    A plain ``queue.put`` blocks once the pipe's buffer is full, and that is how Stop
+    Full Load deadlocked: the drain thread stopped consuming, the workers filled the
+    queue and parked in ``sem_wait`` inside ``put``, and there they could no longer
+    reach the code that polls ``cancel_event``. The parent's ``as_completed`` then
+    waited forever while the UI showed a reassuring "Stopping… finishing the current
+    batch."
+
+    Progress is pure telemetry: the counters are DELTAS that the next flush re-accrues,
+    and the authoritative totals come from the worker's return value, so dropping a
+    message costs at most a slightly stale progress bar. Correctness never depends on
+    it -- unlike liveness, which did. So use ``put_nowait`` and swallow a full queue.
+    """
+    if progress_queue is None:
+        return
+    try:
+        progress_queue.put_nowait(message)
+    except Exception:  # noqa: BLE001 - queue.Full / closed pipe: telemetry only
+        pass
 
 
 def _retry_source_drops_in_process(work, *, cancelled, table_name: str, release=None):
@@ -653,8 +692,7 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
             if pending_loaded + pending_skipped >= PROGRESS_FLUSH_ROWS:
                 flush_l, flush_s = pending_loaded, pending_skipped
                 pending_loaded, pending_skipped = 0, 0
-                if progress_queue is not None:
-                    progress_queue.put((name, flush_l, flush_s))
+                _report_progress(progress_queue, (name, flush_l, flush_s))
 
         _is_cancelled = lambda: (  # noqa: E731 - shared by the load + its retry
             cancel_event is not None and cancel_event.is_set()
@@ -684,7 +722,7 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
         )
         # Flush remaining progress.
         if (pending_loaded or pending_skipped) and progress_queue is not None:
-            progress_queue.put((name, pending_loaded, pending_skipped))
+            _report_progress(progress_queue, (name, pending_loaded, pending_skipped))
         quarantine_recs = tuple(
             {"primary_key": r.primary_key, "message": r.message, "error_code": getattr(r, "error_code", None)}
             for r in (getattr(outcome, "quarantine_records", ()) or ())
@@ -731,8 +769,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             if pending_loaded + pending_skipped >= PROGRESS_FLUSH_ROWS:
                 flush_l, flush_s = pending_loaded, pending_skipped
                 pending_loaded, pending_skipped = 0, 0
-                if progress_queue is not None:
-                    progress_queue.put((name, flush_l, flush_s))
+                _report_progress(progress_queue, (name, flush_l, flush_s))
 
         applied = args.inputs.table_conversions.get(table.name)
         target_types = (
@@ -796,7 +833,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             release=_release_rows,
         )
         if (pending_loaded or pending_skipped) and progress_queue is not None:
-            progress_queue.put((name, pending_loaded, pending_skipped))
+            _report_progress(progress_queue, (name, pending_loaded, pending_skipped))
         if result.cancelled:
             return _TableWorkerResult(
                 table_name=name, status="STOPPED", shard_index=args.shard_index
@@ -1356,7 +1393,42 @@ def _migrate_tables_in_parallel(
                         futures[f] = ("shard", table.name, shard_idx)
 
                 # Process results as they complete.
-                for future in as_completed(futures):
+                # Bounded wait so Stop Full Load can never hang. Cancellation is
+                # cooperative (a worker finishes its batch, sees cancel_event, returns),
+                # but a wedged worker used to strand the parent in as_completed with no
+                # timeout -- forever, while the UI showed "Stopping… finishing the
+                # current batch". Waiting in slices lets us notice the grace period
+                # expiring and stop waiting instead.
+                _cancel_deadline: Optional[float] = None
+                _pending = set(futures)
+                while _pending:
+                    if handle.cancelled and _cancel_deadline is None:
+                        _cancel_deadline = _time.monotonic() + _CANCEL_GRACE_SECONDS
+                    try:
+                        done_iter = as_completed(_pending, timeout=1.0)
+                        future = next(iter(done_iter))
+                    except StopIteration:
+                        break
+                    except FuturesTimeoutError:
+                        if (
+                            _cancel_deadline is not None
+                            and _time.monotonic() >= _cancel_deadline
+                        ):
+                            # Cooperative stop did not take. Abandon the wait; the
+                            # `with ProcessPoolExecutor` exit terminates the workers,
+                            # and the unfinished chunks are marked FAILED below (they
+                            # are retryable -- the load is idempotent).
+                            _LOGGER.warning(
+                                "Full Load cancel: %d worker task(s) did not stop "
+                                "within %.0fs; abandoning the wait and tearing down "
+                                "the pool.",
+                                len(_pending), _CANCEL_GRACE_SECONDS,
+                            )
+                            for _f in _pending:
+                                _f.cancel()
+                            break
+                        continue
+                    _pending.discard(future)
                     tag = futures[future]
                     result: _TableWorkerResult = future.result()
                     name = result.table_name
@@ -1470,7 +1542,11 @@ def _migrate_tables_in_parallel(
                             _tally(_TableLoadOutcome.FAILED)
         finally:
             stop_drain.set()
-            progress_queue.put(_PROGRESS_SENTINEL)
+            # Non-blocking: this runs on the CLEANUP path, so a full queue must not
+            # be able to wedge it. ``stop_drain`` already tells the drain to exit, so
+            # the sentinel is only a fast-path wake-up -- losing it costs at most the
+            # drain's 0.3 s poll interval.
+            _report_progress(progress_queue, _PROGRESS_SENTINEL)
             drain.join(timeout=5)
 
     if handle.cancelled:

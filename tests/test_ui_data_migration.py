@@ -7404,3 +7404,252 @@ def test_attach_banner_separates_cleanup_from_attachable(monkeypatch) -> None:
     assert not any("0727" in b for b in buttons), (
         "a DELETE_FAILED stack must not get an Attach button"
     )
+
+
+# ---------------------------------------------------------------------------
+# Full Load progress table — pagination survives the ~1.5s poll rebuild
+# ---------------------------------------------------------------------------
+
+
+class _TableUi:
+    """Double capturing ui.table's pagination + on_pagination_change handler."""
+
+    def __init__(self):
+        self.pagination = None
+        self.on_pagination_change = None
+        self.texts: list[str] = []
+
+    class _El:
+        def __init__(self, rec):
+            self._rec = rec
+
+        def classes(self, *_a, **_k):
+            return self
+
+        def props(self, *_a, **_k):
+            return self
+
+        def tooltip(self, *_a, **_k):
+            return self
+
+        def add_slot(self, *_a, **_k):
+            return self
+
+        def on(self, *_a, **_k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def table(self, *_a, pagination=None, on_pagination_change=None, **_k):
+        self.pagination = pagination
+        self.on_pagination_change = on_pagination_change
+        return self._El(self)
+
+    def label(self, text="", *_a, **_k):
+        if text:
+            self.texts.append(str(text))
+        return self._El(self)
+
+    def __getattr__(self, _name):
+        # Any other ui.* call is a no-op chainable element.
+        return lambda *a, **k: _TableUi._El(self)
+
+
+def _status_rows(n: int):
+    """n FullLoadTableRows, enough to exercise multi-page pagination."""
+    from dsql_migrator.ui.data_migration import FullLoadTableRow
+
+    return [
+        FullLoadTableRow(
+            table=f"db.t{i}",
+            state="DONE",
+            rows_loaded=10,
+            expected_rows=10,
+            attempts=1,
+            errors=0,
+        )
+        for i in range(n)
+    ]
+
+
+def test_progress_table_holder_persists_rows_per_page() -> None:
+    """The poll holder must carry rowsPerPage, not just the page.
+
+    The per-table progress table is rebuilt on every ~1.5s poll tick, so a pagination
+    value that is hardcoded at build time is silently restored on the next tick: raising
+    "Records per page" appeared to do nothing, and the reverting select made the table
+    look like it was refreshing itself.
+    """
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    src = inspect.getsource(dm._render_full_load_step)
+    assert '_progress_page = {"page": 1, "rowsPerPage": 10}' in src, (
+        "the poll-surviving holder must seed rowsPerPage too"
+    )
+
+
+def test_progress_table_writes_back_both_pagination_fields() -> None:
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    src = inspect.getsource(dm._render_full_load_progress)
+    # Seeds from the holder (not a hardcoded constant)...
+    assert 'page_state.get("rowsPerPage"' in src
+    # ...and writes the user's choice back, or the next tick would undo it.
+    assert 'page_state["rowsPerPage"]' in src
+
+
+def test_progress_table_pagination_round_trips_through_the_holder() -> None:
+    """End-to-end: pick 50 rows/page, then rebuild -> the choice is still 50."""
+    from dsql_migrator.core.models import MigrationJob
+    from dsql_migrator.ui.data_migration import _render_full_load_progress
+
+    job = MigrationJob(job_id="j1")
+    job.progress_pct = 50.0
+    rows = _status_rows(25)
+    holder = {"page": 1, "rowsPerPage": 10}
+
+    ui = _TableUi()
+    _render_full_load_progress(ui, job, rows, page_state=holder)
+    assert ui.pagination == {"rowsPerPage": 10, "page": 1}
+
+    # The user raises Records per page to 50 (Quasar fires the change event).
+    ui.on_pagination_change(type("E", (), {"value": {"page": 1, "rowsPerPage": 50}})())
+    assert holder["rowsPerPage"] == 50
+
+    # The next poll tick rebuilds the table: the choice must survive.
+    ui2 = _TableUi()
+    _render_full_load_progress(ui2, job, rows, page_state=holder)
+    assert ui2.pagination["rowsPerPage"] == 50, (
+        "rows-per-page was reset by the rebuild -- the setting looks broken"
+    )
+
+
+def test_progress_table_supports_the_all_option_and_clamps_the_page() -> None:
+    # rowsPerPage == 0 is Quasar's "All": every row on one page, so the page must not
+    # be computed from a ceil-div by zero. And a shrinking table must clamp the page
+    # rather than leave the user on a now-empty one.
+    from dsql_migrator.core.models import MigrationJob
+    from dsql_migrator.ui.data_migration import _render_full_load_progress
+
+    job = MigrationJob(job_id="j1")
+    rows = _status_rows(25)
+
+    all_holder = {"page": 1, "rowsPerPage": 0}
+    ui = _TableUi()
+    _render_full_load_progress(ui, job, rows, page_state=all_holder)
+    assert ui.pagination == {"rowsPerPage": 0, "page": 1}
+
+    deep = {"page": 3, "rowsPerPage": 10}
+    ui2 = _TableUi()
+    _render_full_load_progress(ui2, job, rows, page_state=deep)
+    assert ui2.pagination["page"] == 3  # 25 rows / 10 -> page 3 exists
+    ui3 = _TableUi()
+    _render_full_load_progress(ui3, job, _status_rows(5), page_state=deep)
+    assert ui3.pagination["page"] == 1  # only 1 page left -> clamped
+
+
+# ---------------------------------------------------------------------------
+# Stop Full Load — must always terminate (observed deadlock regression)
+# ---------------------------------------------------------------------------
+
+
+def test_report_progress_never_blocks_on_a_full_queue() -> None:
+    """THE deadlock fix: a worker must never park inside a progress put.
+
+    Observed live: Stop Full Load sat on "Stopping… finishing the current batch."
+    forever. The drain thread stopped consuming, the workers filled the queue and
+    blocked in sem_wait inside ``queue.put`` -- and there they could no longer reach the
+    code that polls ``cancel_event``, so cancellation could never be seen. Progress is
+    telemetry (deltas re-accrued by the next flush; authoritative totals come from the
+    worker's return value), so dropping a message is harmless. Blocking was not.
+    """
+    from dsql_migrator.ui.data_migration._engine import _report_progress
+
+    class _FullQueue:
+        def __init__(self):
+            self.attempts = 0
+
+        def put_nowait(self, _msg):
+            self.attempts += 1
+            import queue
+
+            raise queue.Full
+
+        def put(self, *_a, **_k):  # pragma: no cover - must never be called
+            raise AssertionError("must not use the blocking put()")
+
+    q = _FullQueue()
+    _report_progress(q, ("db.t", 100, 0))  # must return, not raise, not block
+    assert q.attempts == 1
+
+    # A closed/broken pipe is equally survivable.
+    class _Broken:
+        def put_nowait(self, _msg):
+            raise OSError("handle is closed")
+
+    _report_progress(_Broken(), ("db.t", 1, 0))
+    # And a missing queue is a no-op (single-process path).
+    _report_progress(None, ("db.t", 1, 0))
+
+
+def test_worker_progress_paths_use_the_nonblocking_helper() -> None:
+    # Every worker-side send must go through _report_progress; a bare
+    # progress_queue.put() anywhere in a worker re-introduces the deadlock.
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _engine
+
+    src = inspect.getsource(_engine)
+    assert "progress_queue.put(" not in src, (
+        "a blocking progress_queue.put() would re-introduce the Stop deadlock; "
+        "use _report_progress()"
+    )
+    # The helper itself uses put_nowait.
+    assert "put_nowait" in inspect.getsource(_engine._report_progress)
+
+
+def test_parallel_load_bounds_the_cancel_wait() -> None:
+    """Stop must terminate even if a worker never responds.
+
+    The parent waited in ``as_completed(futures)`` with no timeout, so a worker wedged
+    anywhere (hung socket, blocked queue put) stranded the whole job in RUNNING while
+    the UI claimed it was finishing a batch. The wait is now sliced so an expiring
+    grace period ends it.
+    """
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _engine
+
+    src = inspect.getsource(_engine._migrate_tables_in_parallel)
+    # Scope to the PROCESS path (the one that hung). The thread fallback above it is
+    # for test doubles / parallelism<=1: it shares the process, uses no IPC queue, and
+    # its workers poll cancellation directly in the batch loop, so the queue deadlock
+    # cannot arise there.
+    process_path = src[src.index("# Unified process-parallel path"):]
+    assert "as_completed(futures)" not in process_path, (
+        "as_completed(futures) with no timeout is the unbounded wait that hung Stop"
+    )
+    assert "timeout=" in process_path and "FuturesTimeoutError" in process_path
+    # A cancel starts a bounded grace period, after which the wait is abandoned.
+    assert "_CANCEL_GRACE_SECONDS" in src
+    assert "_cancel_deadline" in src
+    assert _engine._CANCEL_GRACE_SECONDS > 0
+
+
+def test_cleanup_sentinel_is_also_nonblocking() -> None:
+    # The sentinel is sent on the FINALLY path. A blocking put there could wedge the
+    # very cleanup that is supposed to unwind the job.
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _engine
+
+    src = inspect.getsource(_engine._migrate_tables_in_parallel)
+    assert "_report_progress(progress_queue, _PROGRESS_SENTINEL)" in src

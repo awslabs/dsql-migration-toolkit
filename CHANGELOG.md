@@ -5,6 +5,45 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.153
+
+### Fixed
+
+- **"Stop Full Load" could hang forever, and said it was almost done while it did.**
+  Observed live: the screen sat on *"Stopping… finishing the current batch."* with no
+  progress — the job stayed `RUNNING`, four worker processes idled at 0% CPU, and the
+  row count had not moved. It was a deadlock, not a slow shutdown: the progress drain
+  stopped consuming, the workers filled the IPC queue and parked inside a blocking
+  `queue.put`, and **there they could no longer reach the code that polls the cancel
+  event** — so cancellation could never be observed. The parent then waited in
+  `as_completed(futures)` with no timeout. Three fixes, each closing one link:
+  - Worker progress is sent with `put_nowait` and a full queue is dropped. Progress is
+    telemetry — the counters are deltas the next flush re-accrues, and the authoritative
+    totals come from the worker's return value — so losing a message costs a slightly
+    stale progress bar. Blocking cost liveness.
+  - The cleanup sentinel is non-blocking too; on the `finally` path a full queue could
+    otherwise wedge the very teardown meant to unwind the job.
+  - The parent now waits in slices with a bounded grace period after a cancel. If the
+    workers do not wind down in time it stops waiting, tears the pool down, and marks
+    the unfinished tables retryable (the load is idempotent) instead of hanging.
+- **The stop message no longer overstates what is happening.** "Stopping… finishing the
+  current batch" read as a promise the tool could not keep. It now says it is waiting for
+  the in-flight batches, and the tooltip explains that an unresponsive worker is torn
+  down after a grace period with its tables left retryable.
+
+## v0.1.152
+
+### Fixed
+
+- **"Records per page" on the Full Load progress table now sticks.** The per-table
+  progress table is rebuilt on every ~1.5 s poll tick while a load runs, and only the
+  *page* was carried across that rebuild — the rows-per-page was hardcoded at 10. So
+  raising it was undone by the very next tick: the setting appeared to do nothing, and
+  the select snapping back made the table look like it was refreshing itself. The
+  poll-surviving holder now carries `rowsPerPage` as well, including Quasar's "All"
+  option (`0`), and a shrinking table still clamps the page instead of leaving you on an
+  empty one.
+
 ## v0.1.151
 
 ### Fixed

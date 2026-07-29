@@ -2678,7 +2678,9 @@ def _render_full_load_step(
     # tick. This holder lives in _render_full_load_step (NOT rebuilt by the poll --
     # only _live_detail is), so the chosen page survives the rebuild; the table
     # seeds its pagination from it and writes back via on_pagination_change.
-    _progress_page = {"page": 1}
+    # It carries rowsPerPage too: without that, raising "Records per page" was undone
+    # by the very next poll tick, so the setting looked broken.
+    _progress_page = {"page": 1, "rowsPerPage": 10}
 
     @ui.refreshable
     def _live_detail() -> None:
@@ -2769,8 +2771,14 @@ def _render_full_load_step(
             stopping = False
         with ui.row().classes("items-center gap-2"):
             ui.spinner(size="sm")
+            # Say what is actually guaranteed. "finishing the current batch" read as a
+            # promise the tool could not keep: a wedged worker once left this label up
+            # indefinitely with nothing progressing, so it looked like normal shutdown
+            # when the job was in fact stuck. The stop is COOPERATIVE (each worker
+            # finishes its batch, then returns) and now has a bounded grace period, so
+            # the honest wording is "waiting for the workers", not "almost done".
             ui.label(
-                "Stopping… finishing the current batch."
+                "Stopping… waiting for the in-flight batches to finish."
                 if stopping
                 else "Full Load in progress…"
             ).classes("text-sm text-gray-500")
@@ -2779,7 +2787,11 @@ def _render_full_load_step(
             ).props("color=negative outline")
             if stopping:
                 stop_btn.disable()
-                stop_btn.tooltip("Stop already requested; finishing the current batch.")
+                stop_btn.tooltip(
+                    "Stop already requested — waiting for the in-flight batches. If a "
+                    "worker does not respond, the run is torn down after a grace "
+                    "period and the unfinished tables become retryable."
+                )
             else:
                 stop_btn.tooltip(
                     "Stop after the current batch. Loaded tables are kept; the "
@@ -3254,16 +3266,29 @@ def _render_full_load_progress(
     # a user browsing page 2+ is not yanked back to page 1 on every tick. The page
     # is clamped to the current row count (a shrinking table can't leave you on a
     # now-empty page). ``on_pagination_change`` writes the user's page back.
+    # BOTH the page and the rows-per-page must be persisted. The table is rebuilt on
+    # every ~1.5s poll tick, so any pagination value that is hardcoded here is silently
+    # restored on the next tick: picking a larger "Records per page" appeared to do
+    # nothing (and the reverting select looked like the table was refreshing itself).
     _rows_per_page = 10
     _saved_page = 1
     if isinstance(page_state, dict):
-        _max_page = max(1, -(-len(table_rows) // _rows_per_page))  # ceil-div
+        _rows_per_page = int(page_state.get("rowsPerPage", _rows_per_page))
+        # rowsPerPage == 0 is Quasar's "All" option: everything on one page.
+        _max_page = (
+            max(1, -(-len(table_rows) // _rows_per_page))  # ceil-div
+            if _rows_per_page > 0
+            else 1
+        )
         _saved_page = min(max(1, int(page_state.get("page", 1))), _max_page)
 
     def _on_pagination_change(event: object) -> None:
         if isinstance(page_state, dict):
             value = getattr(event, "value", None) or {}
             page_state["page"] = int(value.get("page", page_state.get("page", 1)))
+            page_state["rowsPerPage"] = int(
+                value.get("rowsPerPage", page_state.get("rowsPerPage", 10))
+            )
 
     table = ui.table(
         columns=columns,
