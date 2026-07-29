@@ -5,6 +5,33 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.161
+
+### Fixed
+
+- **Tooltips flickered and could not be read while a background job was running.** A
+  Quasar tooltip is a *child* of the element it is attached to, so re-rendering a region
+  destroys the element the pointer is over — Quasar closes the tooltip, and it only
+  reopens on a fresh hover. Both of the sub-second polls did an unconditional full
+  re-render on every tick, which meant the tooltip was recreated 2–3 times a second:
+  - **Validation's "Cancel validation"** (0.5 s poll). Only three things actually change
+    during a run — the progress label, the progress bar, and the cancel/stopping state —
+    so the panel is now built once and the poll updates those in place (`set_text` /
+    `set_enabled` / `set_value`) and re-arms its own timer, the way the Connect step
+    already gates its Next button. A terminal status still re-renders, since the whole
+    screen changes to the result view.
+  - **Query playground's "Test on target"** (0.4 s poll). Nothing in the probing branch
+    changes between ticks (a spinner plus fixed text), so the poll now waits for the
+    probe to finish and re-renders exactly once, when the verdict actually needs drawing.
+  `render_notice` returns its header/body labels so a polled region can swap the wording
+  in place; existing callers that draw a static notice are unaffected.
+
+### Notes
+
+- The same pattern still exists on the slower polls — Full Load progress (1.5 s) and CDC
+  monitoring (5 s). They are far less disruptive at those intervals and are left for a
+  separate change.
+
 ## v0.1.160
 
 ### Fixed

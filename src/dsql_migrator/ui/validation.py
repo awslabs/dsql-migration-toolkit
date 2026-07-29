@@ -2121,37 +2121,60 @@ def _render_in_progress(
     than implying an immediate halt -- a bare "Stopping…" beside the unchanged
     "safe to leave running" panel read as a cancel that had been ignored.
     """
-    stopping = (
-        validation_state.cancel_requested
-        or (
-            validation_state.job_id is not None
-            and job_manager.is_cancel_requested(validation_state.job_id)
+    # Elements are built ONCE and then updated IN PLACE by the poll, instead of the
+    # whole panel being re-rendered every _POLL_INTERVAL_SECONDS. A q-tooltip is a
+    # CHILD of its anchor, so rebuilding the button destroyed the element the pointer
+    # was over -- Quasar closed the tooltip and it only came back on a fresh hover. At
+    # a 0.5s tick the Cancel tooltip flickered and could not be read at all. Only
+    # three things actually change while a run is in flight (the progress label, the
+    # progress bar, and the cancel/stopping state), so those are the only things the
+    # poll touches. Mirrors ui/connect.py's update_next_state().
+    def _is_stopping() -> bool:
+        return bool(
+            validation_state.cancel_requested
+            or (
+                validation_state.job_id is not None
+                and job_manager.is_cancel_requested(validation_state.job_id)
+            )
         )
-    )
 
     def _cancel() -> None:
         job_id = validation_state.job_id
         if job_id is not None:
             job_manager.request_cancel(job_id)
         validation_state.cancel_requested = True
-        refresh()
+        _sync()  # reflect it immediately, without rebuilding the panel
 
-    progress = validation_state.progress
+    _STOPPING_TIP = (
+        "Cancel already requested — tables not yet started are skipped, and a long "
+        "reconciliation stops within a few thousand rows. A COUNT(*) or checksum "
+        "already running on a large table has no interruption point, so it finishes "
+        "first (this can take minutes). Nothing is being written either way — "
+        "validation is read-only."
+    )
+    _RUNNING_TIP = (
+        "Stop the comparison. Tables not yet started are skipped; the ones already "
+        "running finish first. Read-only, so nothing is left half-changed."
+    )
+    _STOPPING_NOTICE = (
+        "Cancelling — finishing the comparisons already running",
+        "Tables not yet started are skipped. A COUNT(*) or checksum already running "
+        "on a large table cannot be interrupted mid-query, so it completes first — "
+        "minutes on a large table, and every table running concurrently does the "
+        "same. No partial report is produced, and nothing is modified: validation "
+        "only reads both engines.",
+    )
+    _RUNNING_NOTICE = (
+        "Comparison in progress — safe to leave running",
+        "Exact COUNT(*)/checksum + per-table PK reconciliation on both engines — "
+        "minutes for a large database. Runs in the background; read-only (the target "
+        "is never modified).",
+    )
+
     with ui.column().classes("w-full gap-2"):  # type: ignore[attr-defined]
         with ui.row().classes("items-center gap-3 no-wrap"):  # type: ignore[attr-defined]
             ui.spinner(size="sm")  # type: ignore[attr-defined]
-            # Say what the stop is actually waiting for. A bare "Stopping…" looked
-            # like the cancel had not registered: the stop is COOPERATIVE and is only
-            # polled before each table and every few thousand merged rows during PK
-            # reconciliation -- so a single in-flight COUNT(*)/checksum on a large
-            # table has no polling point inside it and runs to completion first
-            # (minutes), with every concurrent table doing the same. Nothing is
-            # wedged, but the user cannot tell that from "Stopping…".
-            ui.label(  # type: ignore[attr-defined]
-                "Stopping… waiting for the in-flight table comparisons to finish."
-                if stopping
-                else _in_progress_label(progress)
-            ).classes("text-sm text-gray-700")
+            status_label = ui.label().classes("text-sm text-gray-700")  # type: ignore[attr-defined]
             # AWS/Cloudscape: cancelling a read-only run is a *normal* (secondary)
             # action, not a destructive (red) one -- red is reserved for
             # irreversible deletes. Use a calm outlined grey button.
@@ -2170,30 +2193,16 @@ def _render_in_progress(
                 icon="stop_circle",
                 on_click=_cancel,
             ).props("outline color=grey-8 no-caps")
-            if stopping:
-                cancel_button.props("disable")  # type: ignore[attr-defined]
-                cancel_button.tooltip(  # type: ignore[attr-defined]
-                    "Cancel already requested — tables not yet started are skipped, "
-                    "and a long reconciliation stops within a few thousand rows. A "
-                    "COUNT(*) or checksum already running on a large table has no "
-                    "interruption point, so it finishes first (this can take "
-                    "minutes). Nothing is being written either way — validation is "
-                    "read-only."
-                )
-            else:
-                cancel_button.tooltip(  # type: ignore[attr-defined]
-                    "Stop the comparison. Tables not yet started are skipped; the "
-                    "ones already running finish first. Read-only, so nothing is "
-                    "left half-changed."
-                )
+            # ONE tooltip element whose TEXT is swapped, so the anchor survives the
+            # poll and the tooltip stays open while hovered.
+            cancel_tip = cancel_button.tooltip("")  # type: ignore[attr-defined]
         # Determinate progress bar once the worker reports its first table, so the
         # user sees how far along a long multi-table run is (not just a spinner).
-        if progress is not None and not stopping:
-            _table, index, total = progress
-            fraction = (index / total) if total else 0.0
-            ui.linear_progress(  # type: ignore[attr-defined]
-                value=min(1.0, max(0.0, fraction)), show_value=False
-            ).props("rounded color=primary").classes("w-full")
+        # Created up front and shown/hidden, since creating it later would mean
+        # rebuilding this region.
+        progress_bar = ui.linear_progress(  # type: ignore[attr-defined]
+            value=0.0, show_value=False
+        ).props("rounded color=primary").classes("w-full")
         # What this run is doing + the reassurances (background-safe, read-only,
         # cancellable) -- wrapped in an info notice so it reads as the calm "here is
         # what's happening" panel rather than loose gray text that gets skipped.
@@ -2201,32 +2210,40 @@ def _render_in_progress(
         # Once a cancel is requested the panel must stop saying "in progress -- safe
         # to leave running": that is the pre-cancel reassurance, and leaving it up
         # made the requested stop look ignored. Explain the wind-down instead.
-        if stopping:
-            render_notice(
-                ui,
-                tone="info",
-                header="Cancelling — finishing the comparisons already running",
-                body=(
-                    "Tables not yet started are skipped. A COUNT(*) or checksum "
-                    "already running on a large table cannot be interrupted "
-                    "mid-query, so it completes first — minutes on a large table, "
-                    "and every table running concurrently does the same. No partial "
-                    "report is produced, and nothing is modified: validation only "
-                    "reads both engines."
-                ),
-            )
-        else:
-            render_notice(
-                ui,
-                tone="info",
-                header="Comparison in progress — safe to leave running",
-                body=(
-                    "Exact COUNT(*)/checksum + per-table PK reconciliation on both "
-                    "engines — minutes for a large database. Runs in the background; "
-                    "read-only (the target is never modified)."
-                ),
-            )
-    _install_poll_timer(ui, job_manager, session, validation_state, refresh)
+        # Built with placeholder text; _sync() fills it and swaps it on cancel. Using
+        # the shared render_notice keeps the tone/border/icon from design.py.
+        notice_header, notice_body = render_notice(
+            ui, tone="info", header=_RUNNING_NOTICE[0], body=_RUNNING_NOTICE[1]
+        )
+
+    def _sync() -> None:
+        """Push the current job state onto the existing elements (no re-render)."""
+        if getattr(status_label, "is_deleted", False):
+            return  # the page was rebuilt under us (e.g. the run finished)
+        stopping = _is_stopping()
+        progress = validation_state.progress
+        status_label.set_text(
+            "Stopping… waiting for the in-flight table comparisons to finish."
+            if stopping
+            else _in_progress_label(progress)
+        )
+        cancel_button.set_enabled(not stopping)
+        cancel_tip.set_text(_STOPPING_TIP if stopping else _RUNNING_TIP)
+        # The bar tracks tables COMPLETING, so during a wind-down it would keep
+        # advancing and contradict "Cancelling" -- hide it instead.
+        show_bar = progress is not None and not stopping
+        progress_bar.set_visibility(show_bar)
+        if show_bar:
+            _table, index, total = progress
+            progress_bar.set_value(min(1.0, max(0.0, (index / total) if total else 0.0)))
+        header, body = _STOPPING_NOTICE if stopping else _RUNNING_NOTICE
+        notice_header.set_text(header)
+        notice_body.set_text(body)
+
+    _sync()
+    _install_poll_timer(
+        ui, job_manager, session, validation_state, refresh, on_tick=_sync
+    )
 
 
 def _in_progress_label(progress: Optional[tuple[str, int, int]]) -> str:
@@ -2601,8 +2618,15 @@ def _install_poll_timer(
     session: object,
     validation_state: ValidationState,
     refresh: Callable[[], None],
+    on_tick: Optional[Callable[[], None]] = None,
 ) -> None:
     """Poll the running validation job once and re-arm via the next render.
+
+    ``on_tick`` (when given) updates the live panel IN PLACE while the job is still
+    running, and this function re-arms its own timer -- so the region, and any tooltip
+    hovered inside it, is never destroyed mid-run. Without it the poll falls back to
+    ``refresh()`` (a full re-render) as before. A terminal status always re-renders,
+    since the whole screen changes to the result view.
 
     Uses a ONE-SHOT timer (``once=True``): each IN_PROGRESS render installs a
     single timer that fires once. While the job is still running the timer calls
@@ -2622,9 +2646,17 @@ def _install_poll_timer(
         except JobNotFoundError:
             return
         mapped = job_status_to_step_status(job.status)
-        # Still running: re-render so the next one-shot poll timer is installed.
         if mapped is None:
-            refresh()
+            # STILL RUNNING. Update the existing elements in place and re-arm, rather
+            # than calling refresh(): a full re-render recreates the Cancel button, and
+            # a q-tooltip is a child of its anchor, so the tooltip the user is hovering
+            # is destroyed on every tick (0.5s -> unreadable flicker). Falls back to
+            # refresh() when no in-place updater was supplied.
+            if on_tick is None:
+                refresh()
+                return
+            on_tick()
+            ui.timer(_POLL_INTERVAL_SECONDS, poll, once=True)  # type: ignore[attr-defined]
             return
         if mapped is StepStatus.FAILED:
             validation_state.set_error(

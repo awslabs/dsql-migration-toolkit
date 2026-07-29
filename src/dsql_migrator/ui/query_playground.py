@@ -768,8 +768,21 @@ def build_query_playground_screen(
                 ui.label("Testing on the target...").classes(
                     "text-sm text-gray-500"
                 )
-            # Re-render shortly so the verdict appears once the worker finishes.
-            ui.timer(_POLL_INTERVAL_SECONDS, refresh, once=True)
+            # Poll for the verdict, but only re-render ONCE the probe has finished.
+            # ``refresh`` rebuilds the whole results region -- including the "Test on
+            # target" button above and its tooltip -- and a q-tooltip is a CHILD of its
+            # anchor, so an unconditional re-render every 0.4s destroyed the element the
+            # pointer was over: the tooltip closed and only reopened on a fresh hover,
+            # i.e. it flickered and could not be read. Nothing in this branch changes
+            # between ticks (a spinner plus fixed text), so waiting for the state change
+            # costs nothing and leaves the hovered tooltip alone.
+            def _await_probe() -> None:
+                if state.probing:
+                    ui.timer(_POLL_INTERVAL_SECONDS, _await_probe, once=True)
+                    return
+                refresh()  # finished: now the verdict needs to be drawn
+
+            ui.timer(_POLL_INTERVAL_SECONDS, _await_probe, once=True)
             return
 
         probe = state.probe

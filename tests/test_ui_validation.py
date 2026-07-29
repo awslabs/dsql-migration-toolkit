@@ -2497,6 +2497,28 @@ def test_apply_column_exclusions_drops_excluded_but_keeps_pk() -> None:
 # ---------------------------------------------------------------------------
 
 
+class _Tip:
+    """A stand-in for NiceGUI's tooltip element: records every text it is given."""
+
+    def __init__(self, owner, text="") -> None:
+        self._owner = owner
+        self.is_deleted = False
+        self.text = ""
+        if text:
+            self.set_text(text)
+
+    def set_text(self, text="", *_a, **_k):
+        self.text = str(text)
+        self._owner.tooltips.append(str(text))
+        return self
+
+    def classes(self, *_a, **_k):
+        return self
+
+    def props(self, *_a, **_k):
+        return self
+
+
 class _CopyUi:
     """A minimal NiceGUI stand-in that records every emitted string.
 
@@ -2512,6 +2534,11 @@ class _CopyUi:
     class _El:
         def __init__(self, owner) -> None:
             self._owner = owner
+            self.text = ""
+            self.enabled = True
+            self.visible = True
+            self.value = None
+            self.is_deleted = False
 
         def classes(self, *_a, **_k):
             return self
@@ -2520,10 +2547,29 @@ class _CopyUi:
             return self
 
         def tooltip(self, text="", *_a, **_k):
-            self._owner.tooltips.append(str(text))
+            # NiceGUI returns the tooltip ELEMENT, so the caller can swap its text in
+            # place; every text it is ever given is recorded.
+            return _Tip(self._owner, text)
+
+        def set_text(self, text="", *_a, **_k):
+            self.text = str(text)
+            self._owner.texts.append(str(text))
+            return self
+
+        def set_value(self, value=None, *_a, **_k):
+            self.value = value
+            return self
+
+        def set_visibility(self, visible=True, *_a, **_k):
+            self.visible = bool(visible)
+            return self
+
+        def set_enabled(self, value=True, *_a, **_k):
+            self.enabled = bool(value)
             return self
 
         def disable(self, *_a, **_k):
+            self.enabled = False
             return self
 
         def __enter__(self):
@@ -2571,6 +2617,41 @@ class _CopyUi:
         return "\n".join(self.tooltips)
 
 
+class _PanelUi(_CopyUi):
+    """Records the panel's live elements so a test can read their FINAL state.
+
+    The panel is built once with placeholder copy and then updated in place, so the
+    plain text recorder accumulates both the placeholder and the update. What matters
+    is what the user ends up seeing, i.e. each element's last value.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.labels: list = []
+        self.buttons: list = []
+        self.bars: list = []
+
+    def label(self, text="", *_a, **_k):
+        element = super().label(text)
+        if not isinstance(element, _Tip):
+            self.labels.append(element)
+        return element
+
+    def button(self, text="", *_a, **_k):
+        element = super().button(text)
+        self.buttons.append(element)
+        return element
+
+    def linear_progress(self, *_a, **_k):
+        element = self._El(self)
+        self.bars.append(element)
+        return element
+
+    def final_text(self) -> str:
+        """Every element's CURRENT text (what is actually on screen)."""
+        return "\n".join(e.text for e in self.labels if getattr(e, "text", ""))
+
+
 def _render_running(*, cancel_requested: bool):
     from dsql_migrator.ui.validation import ValidationState, _render_in_progress
 
@@ -2578,7 +2659,7 @@ def _render_running(*, cancel_requested: bool):
     state.set_progress("orders", 2, 7)
     state.cancel_requested = cancel_requested
 
-    ui = _CopyUi()
+    ui = _PanelUi()
     _render_in_progress(ui, JobManager(), object(), state, lambda: None)
     return ui
 
@@ -2602,7 +2683,7 @@ def test_stopping_panel_says_what_the_cancel_is_waiting_for() -> None:
     or the user retries or assumes the button is broken.
     """
     ui = _render_running(cancel_requested=True)
-    body = ui.body()
+    body = ui.final_text()  # what is on screen after the in-place update
 
     # The label names what is being awaited, not just that it is stopping.
     assert "waiting for the in-flight table comparisons to finish" in body
@@ -2626,23 +2707,12 @@ def test_stopping_tooltip_explains_the_delay_and_that_nothing_is_written() -> No
 
 def test_stopping_state_hides_the_progress_bar() -> None:
     # The determinate bar tracks tables COMPLETING; during a wind-down it would keep
-    # advancing and contradict "Cancelling".
-    from dsql_migrator.ui.validation import ValidationState, _render_in_progress
-
-    calls = {"bars": 0}
-
-    class _Ui(_CopyUi):
-        def linear_progress(self, *a, **k):
-            calls["bars"] += 1
-            return super().linear_progress(*a, **k)
-
-    for cancel_requested, expected in ((False, 1), (True, 0)):
-        state = ValidationState()
-        state.set_progress("orders", 2, 7)
-        state.cancel_requested = cancel_requested
-        calls["bars"] = 0
-        _render_in_progress(_Ui(), JobManager(), object(), state, lambda: None)
-        assert calls["bars"] == expected, cancel_requested
+    # advancing and contradict "Cancelling". It is created once (so the poll never has
+    # to rebuild this region) and hidden instead.
+    for cancel_requested, expect_visible in ((False, True), (True, False)):
+        ui = _render_running(cancel_requested=cancel_requested)
+        assert len(ui.bars) == 1, "one bar, created once -- not per poll tick"
+        assert ui.bars[0].visible is expect_visible, cancel_requested
 
 
 def test_cancel_button_keeps_its_name_while_stopping() -> None:
@@ -2971,3 +3041,94 @@ def test_drift_section_header_avoids_replication_jargon() -> None:
     src = inspect.getsource(validation._render_result)
     assert 'title="Source changes since the comparison"' in src
     assert 'title="Drift since snapshot"' not in src
+
+
+def test_poll_updates_the_panel_in_place_so_a_hovered_tooltip_survives() -> None:
+    """A poll tick must NOT recreate the Cancel button, or its tooltip flickers.
+
+    A q-tooltip is a CHILD of its anchor, so re-rendering the panel destroys the element
+    the pointer is over and Quasar closes the tooltip; it only reopens on a fresh hover.
+    At the 0.5s validation poll that made the tooltip unreadable. The tick therefore
+    updates the existing elements (set_text / set_enabled / set_value) and re-arms its
+    own timer instead of calling refresh().
+    """
+    from dsql_migrator.ui.validation import ValidationState, _render_in_progress
+
+    timers: list = []
+    refreshes = {"n": 0}
+
+    class _Ui(_PanelUi):
+        def timer(self, interval, callback=None, *_a, **_k):
+            timers.append((interval, callback))
+            return self._El(self)
+
+    class _RunningJobs:
+        """A job manager whose job stays RUNNING, so the poll takes the live path."""
+
+        status = "RUNNING"
+
+        def get_status(self, _job_id):
+            return type("_Job", (), {"status": self.status})()
+
+        def is_cancel_requested(self, _job_id):
+            return False
+
+    state = ValidationState()
+    state.job_id = "job-1"
+    state.set_progress("orders", 2, 7)
+
+    ui = _Ui()
+    _render_in_progress(
+        ui,
+        _RunningJobs(),
+        object(),
+        state,
+        lambda: refreshes.__setitem__("n", refreshes["n"] + 1),
+    )
+
+    buttons_after_build = list(ui.buttons)
+    labels_after_build = list(ui.labels)
+    assert timers, "the running panel must arm a poll timer"
+
+    # Fire the poll a few times, as the running job would.
+    for _ in range(3):
+        interval, callback = timers[-1]
+        callback()
+
+    # No element was recreated -> a hovered tooltip is never destroyed.
+    assert ui.buttons == buttons_after_build
+    assert ui.labels == labels_after_build
+    # ...and the panel was NOT re-rendered wholesale.
+    assert refreshes["n"] == 0
+    # The poll keeps itself alive by re-arming.
+    assert len(timers) >= 4
+
+
+def test_cancel_tooltip_text_is_swapped_not_recreated() -> None:
+    # One tooltip element whose text changes, rather than a new tooltip per state: a new
+    # element would again mean the hovered one is gone.
+    from dsql_migrator.ui.validation import ValidationState, _render_in_progress
+
+    tips: list = []
+
+    class _Ui(_PanelUi):
+        def button(self, text="", *_a, **_k):
+            element = super().button(text)
+            make_tip = element.tooltip
+
+            def _tooltip(t="", *a, **k):
+                tip = make_tip(t, *a, **k)
+                tips.append(tip)
+                return tip
+
+            element.tooltip = _tooltip
+            return element
+
+    state = ValidationState()
+    state.set_progress("orders", 2, 7)
+    _render_in_progress(_Ui(), JobManager(), object(), state, lambda: None)
+
+    # Exactly one tooltip element for the Cancel button.
+    assert len(tips) == 1
+    # And it ends up holding the running-state wording.
+    assert "Tables not yet started are skipped" in tips[0].text

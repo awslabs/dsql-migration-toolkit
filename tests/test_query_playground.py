@@ -633,3 +633,57 @@ def test_store_reset_in_place_keeps_object_identity() -> None:
 # (ui.ai_chat_drawer, covered by tests/test_ai_chat_drawer.py) and the grounding
 # helper build_query_chat_system (tests/test_assessment_strategist.py), so there
 # is no playground-local AI suggestion state to test here.
+
+
+def test_probe_poll_re_renders_only_after_the_probe_finishes() -> None:
+    """A 0.4s unconditional re-render made the "Test on target" tooltip unreadable.
+
+    ``refresh`` here rebuilds the whole results region, including that button. A
+    q-tooltip is a CHILD of its anchor, so rebuilding destroys the element the pointer is
+    over: Quasar closes the tooltip and it only reopens on a fresh hover. Nothing in the
+    probing branch changes between ticks (a spinner plus fixed text), so the poll now
+    waits for the state change and only then re-renders.
+    """
+    import inspect
+
+    from dsql_migrator.ui import query_playground
+
+    src = inspect.getsource(query_playground)
+    # The probing branch must NOT hand `refresh` straight to the timer.
+    assert "ui.timer(_POLL_INTERVAL_SECONDS, refresh, once=True)" not in src
+    # It polls its own re-arming callback, and refreshes once probing has cleared.
+    assert "def _await_probe() -> None:" in src
+    assert "ui.timer(_POLL_INTERVAL_SECONDS, _await_probe, once=True)" in src
+
+
+def test_await_probe_only_refreshes_on_the_transition() -> None:
+    # Behavioral check of the same loop: it re-arms while probing and fires exactly one
+    # refresh when the probe completes -- never one per tick.
+    calls = {"refresh": 0}
+    timers: list = []
+    state = {"probing": True}
+
+    class _Ui:
+        def timer(self, _interval, callback=None, **_k):
+            timers.append(callback)
+
+    ui = _Ui()
+    interval = 0.4
+
+    def _await_probe() -> None:
+        if state["probing"]:
+            ui.timer(interval, _await_probe)
+            return
+        calls["refresh"] += 1
+
+    ui.timer(interval, _await_probe)
+
+    # Three ticks while still probing -> re-arms, no re-render (tooltip survives).
+    for _ in range(3):
+        timers.pop()()
+    assert calls["refresh"] == 0
+
+    # The probe finishes -> exactly one re-render, so the verdict is drawn.
+    state["probing"] = False
+    timers.pop()()
+    assert calls["refresh"] == 1

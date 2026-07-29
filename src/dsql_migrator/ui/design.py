@@ -72,7 +72,7 @@ def render_notice(
     body: str = "",
     icon: str = "",
     busy: bool = False,
-) -> None:
+):
     """Render an AWS Console (Cloudscape "Alert")-style notice box.
 
     A tinted, rounded, bordered box with a leading status icon, a bold header
@@ -87,6 +87,13 @@ def render_notice(
     the right of the header. A static icon cannot distinguish "this is happening right
     now" from "here is a fact", so a long background operation (a CDC teardown runs
     ~15-45 min) read as an inert message the user could not tell was still moving.
+
+    Returns ``(header_label, body_label)`` -- the body is ``None`` when ``body`` was
+    empty -- so a POLLED region can update the wording in place via ``set_text``
+    instead of re-rendering. That matters because re-rendering destroys any element the
+    pointer is over, which closes a hovered tooltip; at a sub-second poll interval the
+    tooltip flickers and cannot be read. Callers that just draw a static notice can
+    keep ignoring the return value.
     """
     bg, border, icon_color, default_icon = NOTICE_STYLE.get(tone, NOTICE_STYLE["info"])
     with ui.row().classes(
@@ -102,12 +109,18 @@ def render_notice(
         with ui.column().classes("gap-0 flex-1 min-w-0"):
             if busy:
                 with ui.row().classes("items-center gap-2 no-wrap w-full"):
-                    ui.label(header).classes("text-sm font-semibold text-gray-900")
+                    header_label = ui.label(header).classes(
+                        "text-sm font-semibold text-gray-900"
+                    )
                     ui.badge("In progress", color="primary").props("outline")
             else:
-                ui.label(header).classes("text-sm font-semibold text-gray-900")
-            if body:
-                ui.label(body).classes("text-xs text-gray-700")
+                header_label = ui.label(header).classes(
+                    "text-sm font-semibold text-gray-900"
+                )
+            body_label = (
+                ui.label(body).classes("text-xs text-gray-700") if body else None
+            )
+    return header_label, body_label
 
 
 # ---------------------------------------------------------------------------
