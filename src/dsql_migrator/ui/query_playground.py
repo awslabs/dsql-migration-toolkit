@@ -491,11 +491,40 @@ def build_query_playground_screen(
                 value=state.sql,
                 on_change=lambda e: setattr(state, "sql", e.value or ""),
             ).props(
-                # A tall starting height so a multi-line query is fully visible;
-                # autogrow still expands it further for longer statements.
-                'outlined autogrow input-class=font-mono '
-                'input-style="min-height: 14rem; font-size: 0.875rem"'
+                # A tall starting height so a multi-line query is fully visible, and a
+                # drag handle in the bottom-right corner so the editor can be resized
+                # for a long statement (CSS `resize: vertical` -- the width is bound to
+                # the column, so a horizontal drag would just fight the layout).
+                #
+                # Quasar's `autogrow` is deliberately NOT used: its adjustHeight()
+                # rewrites the textarea's inline `height` on every input event (to
+                # scrollHeight), so it would immediately undo a manual drag -- the two
+                # cannot coexist. Explicit `rows` + `resize` gives the user control
+                # instead of taking it away, and `max-height` keeps a very long paste
+                # from pushing the Convert button off-screen (it scrolls within the box).
+                'outlined rows=10 input-class=font-mono '
+                'input-style="resize: vertical; min-height: 14rem; '
+                'max-height: 70vh; font-size: 0.875rem"'
             ).classes("w-full")
+            # The browser draws the resize grip in the TEXTAREA's bottom-right corner,
+            # but Quasar's `.q-field__control` insets its content 12px horizontally and
+            # leaves only ~2px below, so the grip sat under the field's rounded border
+            # and rendered as a half-clipped mark. Pull the native element out to the
+            # field's own corner: 2px of clearance is enough for the whole grip to show
+            # while it still reads as attached to the corner (10px looked like it was
+            # floating above the border instead). The right padding moves onto the
+            # textarea so the text keeps its breathing room.
+            #
+            # NOTE the selector direction: NiceGUI puts its element id on the TEXTAREA
+            # itself, not on a wrapper, so the Quasar chrome must be reached by walking
+            # UP with :has() -- a descendant selector from the id matches nothing.
+            # Scoped to this one element, so no other field is affected.
+            ui.add_css(
+                f".q-field__control:has(#c{sql_input.id}) {{ padding-right: 2px; }}"
+                f".q-field__control-container:has(#c{sql_input.id}) "
+                f"{{ padding-bottom: 2px; }}"
+                f"#c{sql_input.id} {{ padding-right: 10px; }}"
+            )
 
             # Results render into their own refreshable region so Convert / Test /
             # Ask AI update just this area (no full-page rebuild / scroll reset),

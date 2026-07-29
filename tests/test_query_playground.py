@@ -727,3 +727,51 @@ def test_query_converter_name_does_not_collide_with_the_validation_step() -> Non
 
     assert step_title(WorkflowStep.VALIDATION) == "Validation"
     assert "Converter" not in step_title(WorkflowStep.VALIDATION)
+
+
+def test_sql_editor_is_user_resizable_and_does_not_use_autogrow() -> None:
+    """The editor must be drag-resizable, which rules out Quasar's autogrow.
+
+    Quasar's autogrow rewrites the textarea's inline ``height`` to ``scrollHeight`` on
+    every input event, so a manual drag would be undone the moment the user typed -- the
+    two cannot coexist. Verified in a real browser (the drag survives typing); this test
+    pins the props so the combination cannot be reintroduced.
+    """
+    import inspect
+
+    from dsql_migrator.ui import query_playground
+
+    src = inspect.getsource(query_playground.build_query_playground_screen)
+    assert "resize: vertical" in src
+    # Check the PROPS, not the whole function: the comment above them explains why
+    # autogrow is unusable here, so a plain substring search would match its own
+    # rationale.
+    code = "\n".join(
+        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "autogrow" not in code, "autogrow would fight the manual resize"
+    # An explicit starting size, and a ceiling so a huge paste cannot push the Convert
+    # button off-screen.
+    assert "rows=10" in src
+    assert "min-height: 14rem" in src
+    assert "max-height: 70vh" in src
+
+
+def test_resize_grip_is_pulled_out_to_the_field_corner() -> None:
+    """Quasar's field padding clipped the grip; the override must survive refactors.
+
+    ``.q-field__control`` insets its content 12px horizontally, so the browser-drawn grip
+    landed under the field's rounded border and showed as a half-clipped mark.
+    """
+    import inspect
+
+    from dsql_migrator.ui import query_playground
+
+    src = inspect.getsource(query_playground.build_query_playground_screen)
+    # Reached by walking UP from the id: NiceGUI puts the id on the textarea itself, so a
+    # descendant selector would silently match nothing (it did, on the first attempt).
+    assert ".q-field__control:has(#c" in src
+    assert ".q-field__control-container:has(#c" in src
+    # Small clearance: enough to un-clip the grip without making it look detached.
+    assert "padding-right: 2px" in src
+    assert "padding-bottom: 2px" in src

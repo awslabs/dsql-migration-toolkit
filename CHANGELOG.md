@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.163
+
+### Changed
+
+- **The Query Converter's SQL editor can be resized by dragging its bottom-right
+  corner.** A long statement no longer has to be scrolled inside a fixed box. This
+  required dropping Quasar's `autogrow`: it rewrites the textarea's inline height to the
+  content height on every input event, so it undid a manual drag the moment you typed —
+  the two cannot coexist. The editor now starts at the same tall default, has a
+  `max-height` so a very large paste cannot push the Convert button off-screen, and keeps
+  a drag applied even while typing (verified in a real browser). The resize grip also had
+  to be pulled out to the field's corner: Quasar insets field content by 12px
+  horizontally, which left the browser-drawn grip under the rounded border, rendering as
+  a half-clipped mark.
+
 ## v0.1.162
 
 ### Changed
