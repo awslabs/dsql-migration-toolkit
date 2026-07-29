@@ -8,7 +8,7 @@ _言語: [English](../en/02-evaluation-and-schema-conversion.md) | [한국어](.
 ステップがあります。
 
 ```
-Connect → 1. Migration plan → [ 2. Evaluation → 3. Schema Conversion ] → 4. Data Migration → 5. Validation → 6. Cut over
+Connect → [ 1. Evaluation → 2. Schema Conversion ] → 3. Data Migration → 4. Validation → 5. Cut over
 ```
 
 - **Evaluation** は *「自分の MySQL データベースの中で何が DSQL に移り、何が移らないのか、そして

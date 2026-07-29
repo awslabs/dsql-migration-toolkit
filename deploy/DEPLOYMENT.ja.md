@@ -57,7 +57,7 @@ NiceGUI ready to go on http://127.0.0.1:8080
 向いています。
 
 <div align="center">
-  <img src="../docs/demo-ui.gif" alt="ツールの UI — ガイド付き 6 ステップの移行ワークフロー" width="560">
+  <img src="../docs/demo-ui.png" alt="ツールの UI — ガイド付き 5 ステップの移行ワークフロー" width="560">
 </div>
 
 UI はご自身のマシンで動作し（ブラウザ → `127.0.0.1:8080`）、**移行そのものもそこで実行
@@ -297,8 +297,8 @@ internet-facing ALB で `AllowedIngressCidr` をデフォルトの `10.0.0.0/8` 
 
 **7. 開く — ツールが表示されるはずです。** ブラウザで `AppUrl` にアクセスします
    （VPC 内から）。**MySQL → Aurora DSQL Migration Tool** の UI が読み込まれます —
-   **Connect** から始まるガイド付きワークフロー（Connect → Migration plan → Evaluation
-   → Schema Conversion → Data Migration → Validation → Cut over）です。読み込まれれば
+   **Connect** から始まるガイド付きワークフロー（Connect → Evaluation → Schema
+   Conversion → Data Migration → Validation → Cut over）です。読み込まれれば
    デプロイは完了です。**Connect** でソース DB の認証情報を入力して開始します。
 
 > **▶ 次: 最初の移行を実行する。** デプロイはここで終わりです — UI が起動しています。
@@ -392,7 +392,7 @@ aws cloudformation describe-stacks --stack-name mysql-dsql-migrator \
 
 ブラウザで **`AppUrl`** を開きます（VPC 内から）。**MySQL → Aurora DSQL
 Migration Tool** の UI が読み込まれます — **Connect** から始まるガイド付き
-ワークフロー（Connect → Migration plan → Evaluation → Schema Conversion →
+ワークフロー（Connect → Evaluation → Schema Conversion →
 Data Migration → Validation → Cut over）です。UI が表示されればデプロイは
 成功です。**Connect** でソース DB の認証情報を入力して開始します。
 
@@ -479,7 +479,7 @@ aws logs tail /ecs/mysql-dsql-migrator-mysql-dsql-migrator --follow --region "$A
 
 次に、許可されたネットワーク（`AllowedIngressCidr`）内のホストから
 `https://AppDomainName/` を開きます。（有効な場合は）Cognito サインインに
-リダイレクトされ、その後、移行ワークフロー（Connect → Migration plan → Evaluation →
+リダイレクトされ、その後、移行ワークフロー（Connect → Evaluation →
 Schema Conversion → Data Migration → Validation → Cut over）に移動するはずです。
 
 #### 可観測性 & ランタイム診断

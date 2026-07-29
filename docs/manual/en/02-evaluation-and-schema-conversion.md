@@ -8,7 +8,7 @@ Between connecting and moving data are the two steps that make the migration
 **deterministic and predictable** instead of trial-and-error:
 
 ```
-Connect → 1. Migration plan → [ 2. Evaluation → 3. Schema Conversion ] → 4. Data Migration → 5. Validation → 6. Cut over
+Connect → [ 1. Evaluation → 2. Schema Conversion ] → 3. Data Migration → 4. Validation → 5. Cut over
 ```
 
 - **Evaluation** answers *"what in my MySQL database will and won't move to DSQL,

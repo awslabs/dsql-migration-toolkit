@@ -67,19 +67,18 @@ binlog/GTID watermark bridges the two for a gapless handoff.
 
 ## Workflow
 
-The web UI guides you through six steps, with **Connect** as the preliminary step:
+The web UI guides you through five steps, with **Connect** as the preliminary step:
 
-`Connect → Migration plan → Evaluation → Schema Conversion → Data Migration → Validation → Cut over`
+`Connect → Evaluation → Schema Conversion → Data Migration → Validation → Cut over`
 
 | Step | What it does |
 | --- | --- |
 | Connect | Enter source (RDS/Aurora MySQL) and target (Aurora DSQL) connection details. Credentials stay in per-session memory and are discarded on session end. |
-| 1. Migration plan | Decide only **whether this migration uses CDC**. The choice just controls whether streaming infra is provisioned early; it's reversible (start Full-Load-only, add CDC later). |
-| 2. Evaluation | Introspect source **and** target, produce a compatibility report (`AUTO`/`MANUAL`/`UNSUPPORTED`) with effort estimates and name-conflict detection, plus optional AI strategy. |
-| 3. Schema Conversion | Browse objects, view source-vs-converted DDL side by side, apply to target (SKIP / REPLACE) with idempotent retry. |
-| 4. Data Migration | Prerequisite checks, table selection, then **Full Load** (watermark → export → load, per-table progress + error log). Optionally extend to **CDC** (separate cdc-stack). |
-| 5. Validation | Compare target against source as of the watermark; report row-count/checksum results and drift; export the report. |
-| 6. Cut over | Runbook for switching your app MySQL → DSQL once validation passes — the one step the tool doesn't execute. MySQL source kept as rollback anchor. |
+| 1. Evaluation | Introspect source **and** target, produce a compatibility report (`AUTO`/`MANUAL`/`UNSUPPORTED`) with effort estimates and name-conflict detection, plus optional AI strategy. |
+| 2. Schema Conversion | Browse objects, view source-vs-converted DDL side by side, apply to target (SKIP / REPLACE) with idempotent retry. |
+| 3. Data Migration | Choose the migration type (**Full Load** only, or add **CDC**), run prerequisite checks and pick tables, then run the snapshot (watermark → export → load, per-table progress + error log). For a CDC type the streaming infrastructure is deployed here too, so its ~15–20 min create runs **while** the Full Load does. |
+| 4. Validation | Compare target against source as of the watermark; report row-count/checksum results and drift; export the report. |
+| 5. Cut over | Runbook for switching your app MySQL → DSQL once validation passes — the one step the tool doesn't execute. MySQL source kept as rollback anchor. |
 
 Each step shows its status (not started / in progress / done / failed) and can be
 run or re-run independently. Feature-level detail lives in the
@@ -132,7 +131,7 @@ parameters, Dev/Test vs Prod, DNS & Cognito, teardown, troubleshooting).
 
 <p align="center">
   <b>Console (UI)</b><br>
-  <img src="docs/demo-ui.gif" alt="UI demo — guided 6-step migration workflow" width="720">
+  <img src="docs/demo-ui.png" alt="The tool's UI — the guided five-step migration workflow" width="720">
 </p>
 
 ---

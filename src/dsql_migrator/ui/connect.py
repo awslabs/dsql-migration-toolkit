@@ -564,12 +564,12 @@ def build_connect_page(
                 "five steps:"
             ).classes("text-sm text-gray-600")
             ui.label(
-                "1. Migration plan — choose Full Load (one-shot copy) or add CDC "
-                "(continuous streaming for near-zero-downtime cutover).\n"
-                "2. Evaluation — read-only compatibility assessment of your schema.\n"
-                "3. Schema Conversion — review/apply the converted DDL on DSQL.\n"
-                "4. Data Migration — run the snapshot (and, if chosen, start CDC).\n"
-                "5. Validation — compare the migrated target against the source."
+                "1. Evaluation — read-only compatibility assessment of your schema.\n"
+                "2. Schema Conversion — review/apply the converted DDL on DSQL.\n"
+                "3. Data Migration — choose Full Load (one-shot copy) or add CDC "
+                "(continuous streaming for a near-zero-downtime cutover), then run it.\n"
+                "4. Validation — compare the migrated target against the source.\n"
+                "5. Cut over — the runbook for switching your application to DSQL."
             ).classes("text-sm text-gray-600 whitespace-pre-line")
             # AWS-console-style info callout (tinted, bordered, info icon + bold
             # header) so the glossary reads as a deliberate "good to know" panel,
@@ -1184,7 +1184,7 @@ def build_connect_page(
             if on_next is not None and state.connection_ready():
                 on_next()
 
-        next_button = ui.button("Next: Migration plan", on_click=on_next_click)
+        next_button = ui.button("Next: Evaluation", on_click=on_next_click)
         update_next_state()
 
 

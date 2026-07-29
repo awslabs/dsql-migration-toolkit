@@ -74,6 +74,14 @@ class SessionSnapshot(BaseModel):
     migration_selection: TableSelection = Field(default_factory=TableSelection)
     migration_selection_touched: bool = False
     migration_active_substep: Optional[str] = None
+    # The prerequisite mode ("FULL_LOAD" / "CDC") that gated the most recent
+    # started Full Load. The reports themselves are deliberately not persisted, so
+    # the run-guard excuses an absent report once a run exists; this scopes that
+    # excuse to the mode that actually cleared the gate, so switching the type to
+    # add CDC afterwards does not inherit a Full-load-only pass. Optional/string
+    # for compatibility: older snapshots lack it and restore as None, which keeps
+    # the previous lenient behavior (never hard-blocks a reconnect).
+    migration_prereq_gated_mode: Optional[str] = None
     # Selected migration type ("full_load_only" / "cdc_only" /
     # "full_load_and_cdc"). Optional/string for forward+backward compatibility:
     # older snapshots lack it and restore as the Full-load-only default.
@@ -228,11 +236,29 @@ class SqliteSessionStateStore:
             self._conn.commit()
 
     def load(self, session_id: str) -> Optional[SessionSnapshot]:
+        """Return the persisted snapshot, or ``None`` when absent/unreadable.
+
+        A snapshot that no longer validates must DEGRADE, not crash. ``SessionSnapshot``
+        (and ``WorkflowState``) are ``extra="forbid"``, so a payload written by a newer
+        build -- or one naming a field that has since been removed -- raises here; with
+        the exception propagating, the whole page build failed and the user was locked
+        out of the tool rather than merely losing the restored progress. Mirrors the S3
+        store, which already warns and returns ``None``.
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT payload FROM sessions WHERE session_id = ?", (session_id,)
             ).fetchone()
-        return SessionSnapshot.model_validate_json(row[0]) if row else None
+        if not row:
+            return None
+        try:
+            return SessionSnapshot.model_validate_json(row[0])
+        except Exception:  # noqa: BLE001 - unreadable snapshot: start fresh, don't crash
+            _LOGGER.warning(
+                "Could not parse persisted session %s; ignoring it", session_id,
+                exc_info=True,
+            )
+            return None
 
     def delete(self, session_id: str) -> None:
         with self._lock:

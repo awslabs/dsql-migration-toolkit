@@ -188,7 +188,9 @@ from dsql_migrator.ui.data_migration._models import (
     connector_role_label,
     connector_health_rows,
     CdcHandlingFact,
+    cdc_cascade_gap_tables,
     cdc_handling_facts,
+    cdc_prerequisite_block_reason,
 )
 
 # CDC status / controller / deploy-formatting logic (NiceGUI-free); re-exported so
@@ -212,6 +214,7 @@ from dsql_migrator.ui.data_migration._status import (
     _cdc_status_view,
     _filter_mine,
     _is_inflight_stack_status,
+    is_infra_create_stack_status,
     _classify_cdc_stack_phase,
     _probe_cdc_stack_phase,
     _ensure_cdc_controller,
@@ -306,7 +309,7 @@ def build_data_migration_screen(
     session = store.get_or_create(session_id)
     migration_state = migration_store.get_or_create(session_id)
     # Bind the session so migration_type / cdc_infra_inputs read-through to it
-    # (the Migration plan step chose the mode early and stored it on the session).
+    # (the session is the authoritative store for the mode + CDC infra inputs).
     migration_state.bind_session(session)
     # Thread the process-config CDC deploy-role ARN onto the per-session state so
     # the (module-level) deploy handlers can pass it to build_cdc_stack_deployer.
@@ -327,6 +330,11 @@ def build_data_migration_screen(
         # proceed when Schema Conversion was applied in a prior session.
         result = eval_state.result
         return result.target_inventory if result is not None else None
+
+    def _assessment():
+        """The Step 1 (Evaluation) compatibility report, or None if it hasn't run."""
+        result = eval_state.result
+        return getattr(result, "assessment", None) if result is not None else None
 
     def runner() -> None:
         inventory = _inventory()
@@ -413,6 +421,14 @@ def build_data_migration_screen(
         error_log = migration_state.error_log
 
         migration_state.clear_outputs()
+        # Record WHICH prerequisite mode cleared the gate for this run. The reports
+        # are not persisted, so the run-guard excuses an absent report once a run
+        # exists; scoping that excuse to this mode is what stops a later switch to a
+        # CDC type from inheriting a Full-load-only pass (the CDC checks -- binlog
+        # ROW/FULL, replication grants -- would never have run).
+        migration_state.set_prereq_gated_mode(
+            prereq_mode_for_type(migration_state.migration_type)
+        )
         session.set_workflow(
             with_status(
                 session.workflow, WorkflowStep.FULL_LOAD, StepStatus.IN_PROGRESS
@@ -558,6 +574,16 @@ def build_data_migration_screen(
                 return
             migration_state.clear_prereq_running(mode)
             migration_state.set_prereq_report(mode, report)
+            # Pin the exact table set the checks covered. The picker locks the moment
+            # a report exists (``selection_locked`` below), so from here on this set
+            # IS the migration scope -- but until now it was only implied by the
+            # default when the user never touched the picker, leaving
+            # ``migration_state.selection`` empty. Anything downstream that reads the
+            # selection (the CDC connector's TableIncludeList / SinkTopics and the
+            # topic partition plan) then resolved to "no tables". Recording it makes
+            # the confirmed scope explicit, so a CDC deploy fired right after the
+            # checks -- before any Full Load watermark exists -- gets the real set.
+            migration_state.set_selection(TableSelection(selected_tables=list(names)))
             # Record the prerequisite-check outcome on the activity log so the
             # timeline shows readiness was assessed and whether it passed. Both
             # modes run the same prerequisite checker, so the action label is
@@ -609,6 +635,39 @@ def build_data_migration_screen(
             # only to find a duplicate-deploy risk (a second, costly MSK cluster).
             if "cdc" in substeps_for_type(migration_type):
                 _render_cdc_existing_infra_banner(ui, migration_state, refresh)
+                # Surface the CDC-specific Evaluation finding right where CDC is
+                # chosen. The assessment already detects FK cascades that CDC cannot
+                # replicate (they never reach the binary log), but that finding lived
+                # only in the Evaluation report -- read BEFORE the user knew whether
+                # CDC was in scope. Its own guidance starts with "Before starting
+                # CDC", so this is the moment it is actionable.
+                _cascade_tables = cdc_cascade_gap_tables(_assessment())
+                if _cascade_tables:
+                    _listed = ", ".join(_cascade_tables[:6]) + (
+                        f" +{len(_cascade_tables) - 6} more"
+                        if len(_cascade_tables) > 6
+                        else ""
+                    )
+                    _noun = "table" if len(_cascade_tables) == 1 else "tables"
+                    render_notice(
+                        ui,
+                        tone="warning",
+                        header=(
+                            "CDC cannot replicate this schema's cascading foreign keys"
+                        ),
+                        body=(
+                            f"{len(_cascade_tables)} {_noun} use foreign keys with "
+                            f"automatic ON DELETE/UPDATE actions ({_listed}). MySQL "
+                            "applies those to child rows inside InnoDB, so they never "
+                            "reach the binary log — CDC cannot see them, and DSQL has "
+                            "no foreign keys to re-perform them. The child rows are "
+                            "left behind on the target with no error. Replace the "
+                            "automatic actions with explicit child-row statements in "
+                            "your application before starting CDC (you need that on "
+                            "DSQL anyway), and enable the orphan-record check in "
+                            "Validation. See Evaluation for the full list."
+                        ),
+                    )
 
             with ui.row().classes("items-center gap-2"):
                 ui.label("Data Migration status:").classes(
@@ -1081,6 +1140,47 @@ def build_data_migration_screen(
             else:
                 first_phase_label = "Continue to CDC"
 
+            # Discover the deployed CDC connectors/stack OFF the event loop, armed
+            # BEFORE any sub-step renders. The describe_stacks + list_connectors calls
+            # are BLOCKING network I/O; running them during render starved the NiceGUI
+            # WebSocket. Render only READS state -- a throttled one-shot timer runs the
+            # AWS reads on a worker thread and refreshes when done. The throttle
+            # timestamp (set inside _ensure_cdc_controller) gates re-arming, so the
+            # refresh does not loop.
+            #
+            # It is armed here (plan level) rather than inside the CDC sub-step block
+            # because the Prerequisites sub-step now renders the first-deploy
+            # affordance, and it must not offer a fresh deploy before the account-wide
+            # discovery has reported -- otherwise the duplicate-MSK guard (attach to an
+            # existing pipeline) is gone and the user can pay for a second cluster.
+            # Sub-steps render in order (Prerequisites -> Full Load -> CDC), so arming
+            # after them would leave the first pass with an unprobed state.
+            if has_cdc:
+                import time as _disc_time
+                from nicegui import run as _disc_run
+
+                _last_disc = getattr(
+                    migration_state, "_cdc_discovery_monotonic", None
+                )
+                if (
+                    _last_disc is None
+                    or (_disc_time.monotonic() - _last_disc)
+                    >= _CDC_DISCOVERY_THROTTLE_SECONDS
+                ):
+
+                    async def _discover_cdc() -> None:
+                        try:
+                            await _disc_run.io_bound(
+                                _ensure_cdc_controller, migration_state, session
+                            )
+                        except Exception:  # noqa: BLE001 - best-effort discovery
+                            pass
+                        # Log any connector RUNNING/FAILED transition (on change).
+                        _log_cdc_connector_transitions(migration_state, job_manager)
+                        refresh()
+
+                    ui.timer(0.05, _discover_cdc, once=True)  # type: ignore[attr-defined]
+
             # Vertical stepper: the sub-steps stack top-to-bottom (Prerequisites
             # -> Full Load -> CDC) and advancing expands the next step inline below
             # the current one instead of swapping the whole panel, so the work reads
@@ -1134,12 +1234,21 @@ def build_data_migration_screen(
 
                 # --- Prerequisites ---------------------------------------------
                 def _prereq_body():
-                    _cdc_deploying = (
-                        _is_inflight_stack_status(
-                            getattr(migration_state, "cdc_stack_phase_status", None)
-                        )
-                        or cdc_streaming_started(migration_state, job_manager)
+                    # A live CDC *connector* operation (Start/Stop -> update_stack)
+                    # or an actually-streaming pipeline means re-checking here is
+                    # inert, so the Check button is disabled. The ~15-20 min
+                    # infrastructure create (create_stack) is explicitly NOT counted:
+                    # nothing streams and no load is running during it, so the
+                    # prerequisite checks are precisely what the user should run --
+                    # and running them then is what lets the MSK create overlap the
+                    # Full Load instead of serializing after it.
+                    _stack_status = getattr(
+                        migration_state, "cdc_stack_phase_status", None
                     )
+                    _cdc_deploying = (
+                        _is_inflight_stack_status(_stack_status)
+                        and not is_infra_create_stack_status(_stack_status)
+                    ) or cdc_streaming_started(migration_state, job_manager)
                     _render_prerequisites_panel(
                         ui,
                         migration_state,
@@ -1163,6 +1272,20 @@ def build_data_migration_screen(
                             inline_hint(
                                 ui, guard_reason, tone="warning", classes="text-sm"
                             )
+                    # CDC infrastructure prep, offered HERE (bottom of Prerequisites)
+                    # rather than only deep inside the CDC sub-step: the ~15-20 min MSK
+                    # create should overlap the Full Load, so it must be reachable
+                    # before the load starts -- and by this point the checks have
+                    # pinned a real table set for the connector/partition plan.
+                    if has_cdc:
+                        _render_cdc_infra_prep_section(
+                            ui,
+                            migration_state,
+                            job_manager,
+                            refresh,
+                            inventory=inventory,
+                            session=session,
+                        )
 
                 # Keep Prerequisites expanded while it is the actionable section:
                 # its checks are running, or it still blocks (guard not cleared).
@@ -1298,38 +1421,6 @@ def build_data_migration_screen(
 
                 # --- CDC -------------------------------------------------------
                 if has_cdc:
-                    # Discover the deployed CDC connectors/stack OFF the event loop.
-                    # The describe_stacks + list_connectors calls are BLOCKING network
-                    # I/O; running them during render (as before) starved the NiceGUI
-                    # WebSocket. Render now only READS state — a throttled one-shot
-                    # timer runs the AWS reads on a worker thread and refreshes when
-                    # done. The throttle timestamp (set inside _ensure_cdc_controller)
-                    # gates re-arming, so the refresh does not loop.
-                    import time as _disc_time
-                    from nicegui import run as _disc_run
-
-                    _last_disc = getattr(
-                        migration_state, "_cdc_discovery_monotonic", None
-                    )
-                    if (
-                        _last_disc is None
-                        or (_disc_time.monotonic() - _last_disc)
-                        >= _CDC_DISCOVERY_THROTTLE_SECONDS
-                    ):
-
-                        async def _discover_cdc() -> None:
-                            try:
-                                await _disc_run.io_bound(
-                                    _ensure_cdc_controller, migration_state, session
-                                )
-                            except Exception:  # noqa: BLE001 - best-effort discovery
-                                pass
-                            # Log any connector RUNNING/FAILED transition (on change).
-                            _log_cdc_connector_transitions(migration_state, job_manager)
-                            refresh()
-
-                        ui.timer(0.05, _discover_cdc, once=True)  # type: ignore[attr-defined]
-
                     def _cdc_body():
                         _render_cdc_step(
                             ui,
@@ -1455,6 +1546,17 @@ def full_load_run_guard_reason(
     finished Full Load and re-run it. A report that is present but failing still
     blocks, since that is a live signal worth surfacing.
 
+    That excuse is scoped to the mode that ACTUALLY cleared the gate
+    (``state.prereq_gated_mode``). A Full-load-only run passed only the
+    ``FULL_LOAD`` checks, so a user who finishes it and then switches the type to
+    add CDC must not inherit that pass for ``CDC`` mode -- the CDC-only checks
+    (binlog ``ROW``/``FULL`` row image, the replication grants) were never run. This
+    is the "add CDC later" path the docs advertise as reversible, and it previously
+    reached the CDC sub-step with the binlog format unverified, so a source on
+    ``STATEMENT``/``MIXED`` was only discovered as an undiagnosed connector failure
+    ~26 min into a billable create. When the modes differ the checks are required
+    again, worded for the mode that is now missing.
+
     The message distinguishes a *reconnected* user who had already cleared the
     prerequisites (but hadn't started the load yet) from a first-time user who
     never ran them. The persisted ``active_substep`` is the tell: the "Continue
@@ -1471,8 +1573,20 @@ def full_load_run_guard_reason(
         return "Run Step 1 (Evaluation) first to introspect the source schema."
     report = state.get_prereq_report(prereq_mode)
     if report is None:
-        if has_run:
+        # Only excuse the absent report when the completed run was gated by THIS
+        # mode. An unknown gated mode (older session, or a snapshot written before
+        # the field existed) keeps the previous lenient behavior so a reconnect is
+        # never hard-blocked; a KNOWN but different mode means these checks have
+        # genuinely never run.
+        gated_mode = getattr(state, "prereq_gated_mode", None)
+        if has_run and (gated_mode is None or gated_mode is prereq_mode):
             return None
+        if has_run:
+            return (
+                "Run the prerequisite checks for this migration type first — "
+                "adding CDC needs checks the completed Full Load never ran "
+                "(binary-log format and replication grants)."
+            )
         if getattr(state, "active_substep", None) in ("full_load", "cdc"):
             return (
                 "Reconnected — re-run the prerequisite checks (Prerequisites "
@@ -3969,7 +4083,9 @@ __all__ = [
     "CdcActivitySummary",
     "cdc_activity_summary",
     "CdcHandlingFact",
+    "cdc_cascade_gap_tables",
     "cdc_handling_facts",
+    "cdc_prerequisite_block_reason",
     "ImporterFactory",
     "BatchedTableMigrator",
     "default_migrator_factory",
@@ -4009,7 +4125,6 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     _open_cdc_start_dialog,
     _open_cdc_stop_dialog,
     _render_cdc_cost_estimate,
-    _render_cdc_decision,
     _render_cdc_delete_action,
     _render_cdc_deploy_live,
     _render_cdc_dlq_breakdown,
@@ -4019,6 +4134,8 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     _render_cdc_handling_panel,
     _render_cdc_infra_deploy_action,
     _render_cdc_infra_form,
+    _render_cdc_infra_prep_section,
+    cdc_infra_prep_state,
     _render_cdc_least_privilege_note,
     _render_cdc_live_monitoring,
     _render_cdc_lob_exclusion_panel,

@@ -56,7 +56,7 @@ NiceGUI ready to go on http://127.0.0.1:8080
 평가·소규모 마이그레이션에 좋고, Fargate로 갈지 결정하기 전에 써보기 좋습니다.
 
 <div align="center">
-  <img src="../docs/demo-ui.gif" alt="도구 UI — 6단계 가이드 마이그레이션 워크플로우" width="560">
+  <img src="../docs/demo-ui.png" alt="도구 UI — 5단계 가이드 마이그레이션 워크플로우" width="560">
 </div>
 
 UI가 내 머신에서 돌고(브라우저 → `127.0.0.1:8080`), **마이그레이션 자체도 거기서 실행**됩니다 — 내
@@ -265,7 +265,7 @@ internet-facing ALB인데 `AllowedIngressCidr`를 기본값 `10.0.0.0/8`로 두�
 
 **7. 열기 — 도구가 보여야 함.** 브라우저에서 `AppUrl`로 접속(VPC 내부에서)하면
    **MySQL → Aurora DSQL Migration Tool** UI가 뜹니다 — **Connect**로 시작하는 안내형
-   워크플로(Connect → Migration plan → Evaluation → Schema Conversion → Data Migration →
+   워크플로(Connect → Evaluation → Schema Conversion → Data Migration →
    Validation → Cut over). UI가 보이면 배포 완료이며, **Connect**에서 소스 DB 자격증명을
    입력해 시작합니다.
 
@@ -355,7 +355,7 @@ aws cloudformation describe-stacks --stack-name mysql-dsql-migrator \
 `TaskRoleArn`, `CognitoHostedUiDomain`.
 
 브라우저에서 **`AppUrl`**로 접속(VPC 내부에서)하면 **MySQL → Aurora DSQL Migration Tool**
-UI가 뜹니다 — **Connect**로 시작하는 안내형 워크플로(Connect → Migration plan → Evaluation →
+UI가 뜹니다 — **Connect**로 시작하는 안내형 워크플로(Connect → Evaluation →
 Schema Conversion → Data Migration → Validation → Cut over). UI가 보이면 배포 성공이며,
 **Connect**에서 소스 DB 자격증명을 입력해 시작합니다.
 
@@ -438,7 +438,7 @@ aws logs tail /ecs/mysql-dsql-migrator-mysql-dsql-migrator --follow --region "$A
 ```
 
 그다음 허용 네트워크(`AllowedIngressCidr`) 안의 호스트에서 `https://AppDomainName/`을 엽니다.
-(켜져 있으면) Cognito 로그인으로 리디렉션된 뒤 마이그레이션 워크플로(Connect → Migration plan →
+(켜져 있으면) Cognito 로그인으로 리디렉션된 뒤 마이그레이션 워크플로(Connect →
 Evaluation → Schema Conversion → Data Migration → Validation → Cut over)로 이동합니다.
 
 #### 관측성 & 런타임 진단

@@ -36,6 +36,34 @@ def _flatten_lob_exclusions(exclusions: dict) -> list[str]:
     return sorted(flat)
 
 
+def _mode_value(mode: object) -> Optional[str]:
+    """Return a ``MigrationMode``'s string value (or ``None``), enum-or-str safe."""
+    if mode is None:
+        return None
+    return str(getattr(mode, "value", mode))
+
+
+def _restore_prereq_gated_mode(migration_state: object, raw: Optional[str]) -> None:
+    """Restore the prerequisite mode that gated the last started Full Load.
+
+    An unknown/absent value restores as ``None``, which keeps the run-guard's
+    lenient "a run exists, so don't re-block an absent report" behavior for older
+    snapshots -- a reconnect is never hard-blocked by this field.
+    """
+    setter = getattr(migration_state, "set_prereq_gated_mode", None)
+    if setter is None:
+        return
+    if not raw:
+        setter(None)
+        return
+    from dsql_migrator.core.models import MigrationMode
+
+    try:
+        setter(MigrationMode(raw))
+    except ValueError:
+        setter(None)
+
+
 def _restore_lob_exclusions(migration_state: object, flat: list) -> None:
     """Restore ``"table:column"`` strings onto the state's LOB exclusions."""
     for entry in flat or []:
@@ -71,6 +99,9 @@ def capture_session_snapshot(
         migration_selection=migration_state.selection.model_copy(deep=True),  # type: ignore[attr-defined]
         migration_selection_touched=migration_state.selection_touched,  # type: ignore[attr-defined]
         migration_active_substep=migration_state.active_substep,  # type: ignore[attr-defined]
+        migration_prereq_gated_mode=_mode_value(
+            getattr(migration_state, "prereq_gated_mode", None)
+        ),
         migration_type=migration_state.migration_type.value,  # type: ignore[attr-defined]
         cdc_start_mode=migration_state.cdc_start_mode(),  # type: ignore[attr-defined]
         cdc_start_gtid=migration_state._cdc_start_gtid,  # type: ignore[attr-defined]
@@ -206,6 +237,9 @@ def apply_session_snapshot(
     migration_state.selection = snapshot.migration_selection.model_copy(deep=True)  # type: ignore[attr-defined]
     migration_state.selection_touched = snapshot.migration_selection_touched  # type: ignore[attr-defined]
     migration_state.active_substep = snapshot.migration_active_substep  # type: ignore[attr-defined]
+    _restore_prereq_gated_mode(
+        migration_state, snapshot.migration_prereq_gated_mode
+    )
     # Bind the session so the migration_type restore writes through to it (the
     # session is the authoritative store now that the mode is chosen early).
     if hasattr(migration_state, "bind_session"):
@@ -386,6 +420,7 @@ def session_signature(
         selection,
         migration_state.selection_touched,  # type: ignore[attr-defined]
         migration_state.active_substep,  # type: ignore[attr-defined]
+        _mode_value(getattr(migration_state, "prereq_gated_mode", None)),
         migration_state.migration_type.value,  # type: ignore[attr-defined]
         migration_state.cdc_start_mode(),  # type: ignore[attr-defined]
         migration_state._cdc_start_gtid,  # type: ignore[attr-defined]

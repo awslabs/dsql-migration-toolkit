@@ -2293,6 +2293,154 @@ def test_cdc_streaming_started_false_when_only_infra() -> None:
     assert cdc_streaming_started(state, _StubJobManager({})) is False
 
 
+def test_cdc_streaming_started_false_while_infra_deploy_in_flight() -> None:
+    from dsql_migrator.ui.data_migration import cdc_streaming_started
+
+    # An in-flight kind="infra" job creates MSK/networking but NO connectors (the
+    # template gates both on HasBootstrapServers, blank on the infra pass), so
+    # nothing streams for the ~15-20 min it runs. Counting it as "streaming" made
+    # the deploy masquerade as a live pipeline -- promoting Data Migration to DONE,
+    # disabling Start Full Load, freezing the picker, and turning "Drop & reload"
+    # into an append. It must also NOT block the deploy overlapping the Full Load.
+    for status in ("PENDING", "RUNNING"):
+        state = DataMigrationState()
+        state.set_cdc_deploy_job_id("infra-1", kind="infra")
+        mgr = _StubJobManager({"infra-1": _StubJob(status)})
+        assert cdc_streaming_started(state, mgr) is False, status
+
+
+def test_cdc_streaming_started_true_when_infra_job_but_connectors_detected() -> None:
+    from dsql_migrator.ui.data_migration import cdc_streaming_started
+
+    # The kind="infra" exclusion must not mask a genuinely live pipeline: detected
+    # connectors (or phase "running") still win, so the CDC-live safety gates hold
+    # even if a stale infra marker is left on the state.
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("infra-1", kind="infra")
+    state.set_cdc_controller(_FakeCdcController(statuses=[], health={}))
+    state.set_cdc_connector_names(["mysql-dsql-cdc-stack-debezium-source"])
+    mgr = _StubJobManager({"infra-1": _StubJob("RUNNING")})
+    assert cdc_streaming_started(state, mgr) is True
+
+    running_phase = DataMigrationState()
+    running_phase.set_cdc_deploy_job_id("infra-2", kind="infra")
+    running_phase.set_cdc_stack_phase("running")
+    assert (
+        cdc_streaming_started(
+            running_phase, _StubJobManager({"infra-2": _StubJob("RUNNING")})
+        )
+        is True
+    )
+
+
+def test_infra_deploy_does_not_promote_data_migration_to_done() -> None:
+    """An in-flight infra deploy must leave the Data Migration step untouched.
+
+    ``data_migration_step_after_cdc`` promotes the step to DONE (which unlocks
+    Validation) and never downgrades it, so a bogus promotion during the ~15-20 min
+    MSK create persisted -- Validation opened with zero rows loaded. The promotion
+    is driven purely by ``cdc_streaming_started``, so excluding kind="infra" there
+    is what keeps the step at NOT_STARTED.
+    """
+    from dsql_migrator.ui.data_migration import cdc_streaming_started
+    from dsql_migrator.ui.data_migration._engine import data_migration_step_after_cdc
+    from dsql_migrator.ui.workflow import StepStatus
+
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("infra-1", kind="infra")
+    mgr = _StubJobManager({"infra-1": _StubJob("RUNNING")})
+
+    streaming = cdc_streaming_started(state, mgr)
+    assert streaming is False
+    assert (
+        data_migration_step_after_cdc(
+            StepStatus.NOT_STARTED, cdc_streaming=streaming
+        )
+        is None
+    )
+
+
+def test_infra_deploy_keeps_drop_and_reload_dropping() -> None:
+    """``cdc_coexisting`` must stay False during an infra deploy.
+
+    It feeds ``is_replace``: when True the loader falls back to idempotent
+    SKIP_EXISTING (no DROP) because a DROP would race a live sink. During an infra
+    create there is no sink, so a "Drop & reload" run must still drop -- otherwise
+    the re-load silently appends over stale rows ("0 new + N already there").
+    """
+    from dsql_migrator.ui.data_migration import cdc_streaming_started
+
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("infra-1", kind="infra")
+    mgr = _StubJobManager({"infra-1": _StubJob("RUNNING")})
+    assert cdc_streaming_started(state, mgr) is False
+
+
+def test_infra_create_stack_status_is_not_a_live_migration_operation() -> None:
+    """``CREATE_IN_PROGRESS`` must not disable the prerequisite Check button.
+
+    The generic ``_is_inflight_stack_status`` is True for every ``*_IN_PROGRESS``,
+    which kept the Check button dead for the whole ~15-20 min CFN create -- a
+    SECOND path independent of ``cdc_streaming_started``. Only the infra create uses
+    ``create_stack``; Start/Stop CDC go through ``update_stack``, so
+    ``UPDATE_IN_PROGRESS`` must still count as a live operation.
+    """
+    from dsql_migrator.ui.data_migration import (
+        _is_inflight_stack_status,
+        is_infra_create_stack_status,
+    )
+
+    assert is_infra_create_stack_status("CREATE_IN_PROGRESS") is True
+    assert is_infra_create_stack_status("create_in_progress") is True
+    for other in (
+        "UPDATE_IN_PROGRESS",
+        "DELETE_IN_PROGRESS",
+        "UPDATE_ROLLBACK_IN_PROGRESS",
+        "CREATE_COMPLETE",
+        None,
+        "",
+    ):
+        assert is_infra_create_stack_status(other) is False, other
+
+    # The composite the Prerequisites panel uses: in-flight AND not an infra create.
+    def _live_operation(status: str | None) -> bool:
+        return bool(_is_inflight_stack_status(status)) and not is_infra_create_stack_status(
+            status
+        )
+
+    assert _live_operation("CREATE_IN_PROGRESS") is False
+    assert _live_operation("UPDATE_IN_PROGRESS") is True
+    assert _live_operation("DELETE_IN_PROGRESS") is True
+
+
+def test_infra_deploy_does_not_block_schema_conversion_apply() -> None:
+    """Schema Conversion's Apply must stay available during an infra deploy.
+
+    ``cdc_active_check`` (wired in app.py to ``cdc_streaming_started``) blocks Apply
+    because a live sink is writing the target tables. During an infra create no sink
+    exists, so blocking would trap the user: Data Migration is prerequisite-locked
+    behind Schema Conversion, so they could not reach the CDC step to stop anything.
+    """
+    from dsql_migrator.ui.data_migration import cdc_streaming_started
+    from dsql_migrator.ui.schema_conversion import _cdc_apply_is_blocked
+
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("infra-1", kind="infra")
+    mgr = _StubJobManager({"infra-1": _StubJob("RUNNING")})
+
+    assert _cdc_apply_is_blocked(lambda: cdc_streaming_started(state, mgr)) is False
+
+    # A genuinely live pipeline still blocks (no regression of the safety gate).
+    live = DataMigrationState()
+    live.set_cdc_stack_phase("running")
+    assert (
+        _cdc_apply_is_blocked(
+            lambda: cdc_streaming_started(live, _StubJobManager({}))
+        )
+        is True
+    )
+
+
 def test_full_load_run_guard_requires_checks_first() -> None:
     state = DataMigrationState()
     reason = full_load_run_guard_reason(state, _inventory())
@@ -2340,9 +2488,517 @@ def test_full_load_run_guard_allows_rerun_when_already_run_without_report() -> N
     # No report set (mimics a fresh process after restore).
     assert full_load_run_guard_reason(state, _inventory()) is not None
     assert full_load_run_guard_reason(state, _inventory(), has_run=True) is None
+    # An UNKNOWN gated mode (an older snapshot, written before the field existed)
+    # keeps the lenient behavior for every mode, so a reconnect is never hard-blocked.
+    assert state.prereq_gated_mode is None
     assert (
         full_load_run_guard_reason(
             state, _inventory(), prereq_mode=MigrationMode.CDC, has_run=True
+        )
+        is None
+    )
+
+
+def test_full_load_run_guard_scopes_the_has_run_excuse_to_the_gated_mode() -> None:
+    # The reversible "add CDC after a Full-load-only run" path: the completed run
+    # passed only the FULL_LOAD checks, so switching the type to a CDC mode must NOT
+    # inherit that pass -- the CDC-only checks (binlog ROW/FULL, replication grants)
+    # never ran. Previously has_run=True excused the absent CDC report outright, so
+    # Prerequisites collapsed as "done" and the CDC sub-step opened with the binary
+    # log format unverified.
+    state = DataMigrationState()
+    state.set_prereq_gated_mode(MigrationMode.FULL_LOAD)
+
+    # Same mode as the one that gated the run -> still excused (re-run stays open).
+    assert (
+        full_load_run_guard_reason(
+            state, _inventory(), prereq_mode=MigrationMode.FULL_LOAD, has_run=True
+        )
+        is None
+    )
+    # A DIFFERENT mode -> the checks genuinely never ran, so it blocks.
+    reason = full_load_run_guard_reason(
+        state, _inventory(), prereq_mode=MigrationMode.CDC, has_run=True
+    )
+    assert reason is not None
+    assert "adding CDC" in reason
+
+    # Running the CDC checks clears it (a present, passing report always wins).
+    state.set_prereq_report(
+        MigrationMode.CDC,
+        PrerequisiteReport.build(
+            MigrationMode.CDC,
+            [_result(PrerequisiteCheckId.BINLOG_ROW_FORMAT, PrerequisiteStatus.PASS)],
+        ),
+    )
+    assert (
+        full_load_run_guard_reason(
+            state, _inventory(), prereq_mode=MigrationMode.CDC, has_run=True
+        )
+        is None
+    )
+
+
+def test_full_load_run_guard_gated_mode_cdc_covers_a_later_full_load_rerun() -> None:
+    # The reverse direction must stay open: a combined (Full load + CDC) run is
+    # gated by the CDC superset, which already covers every FULL_LOAD check, so a
+    # later Full-load-only re-run is not re-blocked... except that the recorded mode
+    # differs, so it asks for a (cheap, read-only) re-check rather than silently
+    # trusting a superset it can no longer see. Assert the behavior explicitly so
+    # the trade-off is deliberate rather than accidental.
+    state = DataMigrationState()
+    state.set_prereq_gated_mode(MigrationMode.CDC)
+    reason = full_load_run_guard_reason(
+        state, _inventory(), prereq_mode=MigrationMode.FULL_LOAD, has_run=True
+    )
+    assert reason is not None  # asks for the checks; never silently proceeds
+
+
+def test_cdc_prerequisite_gate_requires_a_cdc_report() -> None:
+    # The CDC lifecycle actions (Deploy infra / Start CDC) previously had NO
+    # prerequisite gate of their own -- they were safe only because the linear
+    # sub-step order happened to put the checks first. With the type changeable late,
+    # the gate has to be explicit.
+    from dsql_migrator.ui.data_migration import cdc_prerequisite_block_reason
+
+    reason = cdc_prerequisite_block_reason(None)
+    assert reason is not None
+    assert "CDC prerequisite checks" in reason
+
+
+def test_cdc_prerequisite_gate_blocks_on_failed_binlog_format() -> None:
+    from dsql_migrator.ui.data_migration import cdc_prerequisite_block_reason
+
+    failing = PrerequisiteReport.build(
+        MigrationMode.CDC,
+        [
+            _result(
+                PrerequisiteCheckId.BINLOG_ROW_FORMAT,
+                PrerequisiteStatus.FAIL,
+                title="Binary log uses ROW format with full row image",
+            )
+        ],
+    )
+    reason = cdc_prerequisite_block_reason(failing)
+    assert reason is not None
+    assert "ROW format" in reason
+    # A report that ran the checks and passed the binlog one clears the gate.
+    passing = PrerequisiteReport.build(
+        MigrationMode.CDC,
+        [_result(PrerequisiteCheckId.BINLOG_ROW_FORMAT, PrerequisiteStatus.PASS)],
+    )
+    assert cdc_prerequisite_block_reason(passing) is None
+
+
+def test_cdc_prerequisite_gate_ignores_unrelated_required_failures() -> None:
+    # Deliberately NOT gated on report.can_proceed: a per-table TARGET_SCHEMA_READY
+    # failure is the Full Load guard's business and does not make streaming
+    # impossible, so it must not also block the CDC lifecycle (that would double-
+    # report one problem in two places).
+    from dsql_migrator.ui.data_migration import cdc_prerequisite_block_reason
+
+    report = PrerequisiteReport.build(
+        MigrationMode.CDC,
+        [
+            _result(PrerequisiteCheckId.BINLOG_ROW_FORMAT, PrerequisiteStatus.PASS),
+            _result(
+                PrerequisiteCheckId.TARGET_SCHEMA_READY,
+                PrerequisiteStatus.FAIL,
+                target="orders",
+            ),
+        ],
+    )
+    assert report.can_proceed is False
+    assert cdc_prerequisite_block_reason(report) is None
+
+
+def test_cdc_prerequisite_gate_blocks_when_binlog_check_is_skipped() -> None:
+    # A FULL_LOAD-mode run reports the CDC checks as SKIP. If such a report were
+    # ever consulted for the CDC gate, "skipped" must not read as "passed".
+    from dsql_migrator.ui.data_migration import cdc_prerequisite_block_reason
+
+    skipped = PrerequisiteReport.build(
+        MigrationMode.FULL_LOAD,
+        [_result(PrerequisiteCheckId.BINLOG_ROW_FORMAT, PrerequisiteStatus.SKIP)],
+    )
+    assert cdc_prerequisite_block_reason(skipped) is not None
+
+
+def test_binlog_resume_gap_detects_a_purged_watermark_log() -> None:
+    # The watermark is captured at Full Load START, so a long load + the ~15-20 min
+    # infra create + the connector create all elapse before Debezium reads it. If the
+    # source purged that file the gapless hand-off is impossible -- today that only
+    # surfaces as an undiagnosed connector CREATE_FAILED ~26 min into a billable
+    # create (MySQL 1236).
+    from dsql_migrator.core.watermark import binlog_resume_gap_reason
+
+    reason = binlog_resume_gap_reason(
+        "mysql-bin.000010", ["mysql-bin.000042", "mysql-bin.000043"]
+    )
+    assert reason is not None
+    assert "mysql-bin.000010" in reason
+    assert "mysql-bin.000042" in reason  # names the oldest log still kept
+    assert "binlog retention hours" in reason  # actionable remediation
+
+    # Still retained -> no warning.
+    assert (
+        binlog_resume_gap_reason(
+            "mysql-bin.000042", ["mysql-bin.000042", "mysql-bin.000043"]
+        )
+        is None
+    )
+
+
+def test_binlog_resume_gap_never_blocks_on_unknown() -> None:
+    # "Unknown" must never be reported as a gap: no watermark file, or a source where
+    # SHOW BINARY LOGS is unavailable / the privilege is missing (list_binary_logs
+    # returns None, distinct from an empty list).
+    from dsql_migrator.core.watermark import binlog_resume_gap_reason
+
+    assert binlog_resume_gap_reason(None, ["mysql-bin.000042"]) is None
+    assert binlog_resume_gap_reason("", ["mysql-bin.000042"]) is None
+    assert binlog_resume_gap_reason("mysql-bin.000010", None) is None
+    assert binlog_resume_gap_reason("mysql-bin.000010", []) is None
+
+
+def test_list_binary_logs_returns_none_when_unavailable() -> None:
+    # Distinguishing None ("unknown") from [] matters: treating a failed probe as an
+    # empty log list would wrongly claim every watermark had been purged.
+    from dsql_migrator.core.watermark import list_binary_logs
+
+    class _Boom:
+        def execute(self, statement, parameters=None):
+            raise RuntimeError("SHOW BINARY LOGS denied")
+
+    assert list_binary_logs(_Boom()) is None
+
+    class _Rows:
+        def execute(self, statement, parameters=None):
+            class _R:
+                def mappings(self):
+                    class _M:
+                        def all(self):
+                            return [
+                                {"Log_name": "mysql-bin.000042", "File_size": 1},
+                                {"Log_name": "mysql-bin.000043", "File_size": 2},
+                            ]
+
+                    return _M()
+
+            return _R()
+
+    assert list_binary_logs(_Rows()) == ["mysql-bin.000042", "mysql-bin.000043"]
+
+
+def test_cdc_start_dialog_is_a_coroutine_and_awaited() -> None:
+    # _open_cdc_start_dialog became async (the binlog pre-flight runs via
+    # run.io_bound). Every call must be awaited, or the dialog silently never opens
+    # and "Start CDC" looks dead. Mirrors the infra-dialog guard.
+    import ast
+    import inspect as _inspect
+    import pathlib
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    assert _inspect.iscoroutinefunction(_cdc_ui._open_cdc_start_dialog)
+
+    tree = ast.parse(pathlib.Path(_cdc_ui.__file__).read_text(encoding="utf-8"))
+    awaited = {
+        id(node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Await)
+    }
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_open_cdc_start_dialog"
+    ]
+    assert calls, "expected at least one _open_cdc_start_dialog call site"
+    for call in calls:
+        assert id(call) in awaited, "_open_cdc_start_dialog call is not awaited"
+
+
+def test_cdc_infra_prep_state_classifies_the_deploy_situation() -> None:
+    """The Prerequisites-step CDC section must render the right thing per situation."""
+    from dsql_migrator.ui.data_migration import cdc_infra_prep_state
+
+    # Not probed yet -> "unknown": render NOTHING. Showing a fresh-deploy form before
+    # the account-wide discovery has reported risks a duplicate (billable) MSK cluster.
+    fresh = DataMigrationState()
+    assert fresh.cdc_stack_phase_checked is False
+    assert cdc_infra_prep_state(fresh, _StubJobManager({})) == "unknown"
+
+    # Probed, nothing found -> offer the deploy.
+    empty = DataMigrationState()
+    empty.set_cdc_stack_phase(None)  # sets cdc_stack_phase_checked
+    assert cdc_infra_prep_state(empty, _StubJobManager({})) == "deploy"
+
+    # Probed, another stack exists under a different name -> offer to attach.
+    other = DataMigrationState()
+    other.set_cdc_stack_phase(None)
+    other.set_cdc_other_stacks([("mysql-dsql-cdc-old", "CREATE_COMPLETE")])
+    assert cdc_infra_prep_state(other, _StubJobManager({})) == "adopt"
+
+    # Already deployed (any live phase) -> nothing to provision here.
+    for phase in ("infra", "running", "unstable", "provisioning", "partial"):
+        ready = DataMigrationState()
+        ready.set_cdc_stack_phase(phase)
+        assert cdc_infra_prep_state(ready, _StubJobManager({})) == "ready", phase
+
+    # An infra create in flight -> show live progress only.
+    deploying = DataMigrationState()
+    deploying.set_cdc_stack_phase(None)
+    deploying.set_cdc_deploy_job_id("infra-1", kind="infra")
+    mgr = _StubJobManager({"infra-1": _StubJob("RUNNING")})
+    assert cdc_infra_prep_state(deploying, mgr) == "deploying"
+
+
+def test_cdc_infra_prep_state_ignores_a_connector_level_job() -> None:
+    # Only an "infra" job means "provisioning here"; a start/stop job belongs to the
+    # CDC sub-step's own lifecycle card and must not hijack this section.
+    from dsql_migrator.ui.data_migration import cdc_infra_prep_state
+
+    state = DataMigrationState()
+    state.set_cdc_stack_phase("infra")
+    state.set_cdc_deploy_job_id("start-1", kind="start")
+    mgr = _StubJobManager({"start-1": _StubJob("RUNNING")})
+    assert cdc_infra_prep_state(state, mgr) == "ready"
+
+
+def test_cdc_infra_prep_section_is_rendered_from_the_prerequisites_substep() -> None:
+    """Pin WHERE the deploy affordance lives: inside ``_prereq_body``.
+
+    The point of moving it out of the deep CDC sub-step is that the ~15-20 min MSK
+    create must be reachable BEFORE the Full Load starts, so it can overlap. If the
+    call drifted into the CDC body the overlap would be lost again (for the combined
+    type the CDC section is only reached after the load completes).
+    """
+    import ast
+    import pathlib
+
+    import dsql_migrator.ui.data_migration as dm
+
+    tree = ast.parse(pathlib.Path(dm.__file__).read_text(encoding="utf-8"))
+    bodies = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name in ("_prereq_body", "_cdc_body", "_full_load_body")
+    }
+    assert "_prereq_body" in bodies
+
+    def _calls(fn):
+        return {
+            node.func.id
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+
+    assert "_render_cdc_infra_prep_section" in _calls(bodies["_prereq_body"])
+    for other in ("_cdc_body", "_full_load_body"):
+        if other in bodies:
+            assert "_render_cdc_infra_prep_section" not in _calls(bodies[other])
+
+
+def test_cdc_discovery_is_armed_before_the_substeps_render() -> None:
+    """The account probe must be armed before any sub-step body renders.
+
+    ``cdc_infra_prep_state`` returns "unknown" until the probe reports, and the
+    sub-steps render in order (Prerequisites -> Full Load -> CDC). The discovery timer
+    used to be armed inside the CDC sub-step block -- i.e. AFTER Prerequisites had
+    already rendered -- so on the first pass the new deploy section would be
+    suppressed, or (worse, if it were not gated) offered without the duplicate-MSK
+    guard populated.
+    """
+    import ast
+    import pathlib
+
+    import dsql_migrator.ui.data_migration as dm
+
+    src = pathlib.Path(dm.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    arm_lines = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_discover_cdc"
+    ]
+    assert len(arm_lines) == 1, "expected exactly one _discover_cdc definition"
+    substep_call_lines = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_substep"
+    ]
+    assert substep_call_lines, "expected _substep call sites"
+    assert arm_lines[0] < min(substep_call_lines), (
+        "the CDC discovery must be armed before the first _substep renders"
+    )
+
+
+def test_cdc_cascade_gap_tables_extracts_the_cdc_specific_finding() -> None:
+    # The assessment detects FK cascades CDC cannot replicate, but that finding only
+    # lived in the Evaluation report -- read BEFORE the user knew whether CDC was in
+    # scope. Surface it where CDC is chosen.
+    from dsql_migrator.ui.data_migration import cdc_cascade_gap_tables
+
+    class _Item:
+        def __init__(self, rule_id, object_name):
+            self.rule_id = rule_id
+            self.object_name = object_name
+
+    class _Report:
+        def __init__(self, items):
+            self.items = items
+
+    report = _Report(
+        [
+            _Item("FK_CASCADE_CDC_GAP", "shop.order_items"),
+            _Item("FK_NOT_SUPPORTED", "shop.orders"),
+            _Item("FK_CASCADE_CDC_GAP", "shop.addresses"),
+            _Item("FK_CASCADE_CDC_GAP", "shop.order_items"),  # duplicate
+        ]
+    )
+    assert cdc_cascade_gap_tables(report) == ["shop.addresses", "shop.order_items"]
+
+    # Degrades quietly: no assessment yet, or an object without items.
+    assert cdc_cascade_gap_tables(None) == []
+    assert cdc_cascade_gap_tables(object()) == []
+    assert cdc_cascade_gap_tables(_Report([])) == []
+
+
+def test_prerequisite_checks_pin_the_confirmed_table_selection() -> None:
+    """Running the checks must record the exact table set they covered.
+
+    The picker locks the moment a report exists, so that set IS the migration scope --
+    but it was only implied by the default when the user never touched the picker,
+    leaving ``selection`` empty. Anything reading the selection then resolved to "no
+    tables", which is what made a CDC deploy fired right after the checks (before any
+    watermark exists) produce an empty TableIncludeList and a uniform partition plan.
+    Guard the contract structurally: run_checks calls set_selection with the resolved
+    names.
+    """
+    import ast
+    import pathlib
+
+    import dsql_migrator.ui.data_migration as dm
+
+    tree = ast.parse(pathlib.Path(dm.__file__).read_text(encoding="utf-8"))
+    checks = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_checks"
+    ]
+    assert len(checks) == 1, "expected exactly one run_checks"
+    setters = [
+        node
+        for node in ast.walk(checks[0])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "set_selection"
+    ]
+    assert setters, "run_checks must pin the checked table set via set_selection"
+
+
+def test_cdc_tables_for_config_uses_the_pinned_selection_without_a_watermark() -> None:
+    # The deploy can now fire from the Prerequisites step, i.e. BEFORE any Full Load
+    # watermark exists. The connector's table set then comes from the pinned selection;
+    # without it the config would say "all selected" (empty), and the topic partition
+    # plan would fall back to a uniform default.
+    from dsql_migrator.core.models import TableSelection
+    from dsql_migrator.ui.data_migration import _cdc_tables_for_config
+
+    state = DataMigrationState()
+    inv = _inventory()
+    # No watermark, untouched picker -> nothing resolvable (the old behavior).
+    assert _cdc_tables_for_config(state, inv, None) == []
+
+    # After the checks pin the confirmed set, it resolves.
+    names = [t.name for t in inv.tables]
+    state.set_selection(TableSelection(selected_tables=names))
+    resolved = [t.name for t in _cdc_tables_for_config(state, inv, None)]
+    assert resolved == names
+
+
+def test_infra_stage_eta_includes_bucket_and_plugin_upload() -> None:
+    # These two stages exist in CDC_INFRA_STAGES but had no estimate, so the total ETA
+    # under-reported the wait -- the user's only signal during a ~15-20 min deploy that
+    # is now a foreground action.
+    from dsql_migrator.core.cdc_deployer import CDC_INFRA_STAGES
+    from dsql_migrator.ui.data_migration._status import _CDC_STAGE_ETA_SECONDS
+
+    etas = _CDC_STAGE_ETA_SECONDS["infra"]
+    assert etas.get("ensure_bucket", 0) > 0
+    assert etas.get("upload_plugins", 0) > 0
+    # Every declared infra stage now carries an estimate (no silent gaps).
+    for key, _label in CDC_INFRA_STAGES:
+        assert etas.get(key, 0) > 0, key
+
+
+def test_sidebar_run_guard_derives_prereq_mode_from_the_migration_type() -> None:
+    """The sidebar Run guard must not hardcode ``MigrationMode.FULL_LOAD``.
+
+    ``full_load_run_guard_reason`` defaults ``prereq_mode`` to FULL_LOAD, so calling
+    it without the argument made the sidebar Run button look enabled for a CDC type
+    whose (superset) checks had never run -- contradicting the in-content guard on the
+    same screen. ``data_migration_run_guard`` is a closure inside ``build_page``, so
+    the contract is pinned structurally: its call passes ``prereq_mode``.
+    """
+    import ast
+    import pathlib
+
+    import dsql_migrator.ui.app as app_mod
+
+    tree = ast.parse(pathlib.Path(app_mod.__file__).read_text(encoding="utf-8"))
+    guards = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "data_migration_run_guard"
+    ]
+    assert len(guards) == 1, "expected exactly one data_migration_run_guard"
+    calls = [
+        node
+        for node in ast.walk(guards[0])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "full_load_run_guard_reason"
+    ]
+    assert calls, "expected the guard to call full_load_run_guard_reason"
+    for call in calls:
+        kwargs = {kw.arg for kw in call.keywords}
+        assert "prereq_mode" in kwargs, (
+            "the sidebar guard must pass prereq_mode (derived from the migration "
+            "type), not fall back to the FULL_LOAD default"
+        )
+
+
+def test_probe_binlog_resume_gap_skips_a_manual_start_point() -> None:
+    # A manual start position overrides the watermark, so the watermark's log being
+    # purged is not what CDC will resume from -- warning about it would be wrong.
+    from dsql_migrator.ui.data_migration._cdc_ui import _probe_binlog_resume_gap
+
+    state = DataMigrationState()
+    state.set_cdc_start_mode("manual")
+    state.set_cdc_start_position(binlog_file="mysql-bin.000099", binlog_pos=4)
+    assert state.cdc_start_override() is not None
+
+    # A job whose watermark points at a long-purged log. The manual override wins, so
+    # the probe must return None -- and must do so WITHOUT touching the source (the
+    # session double below would raise if it were used).
+    class _ExplodingSession:
+        @property
+        def source_config(self):  # pragma: no cover - must never be reached
+            raise AssertionError("manual start point must skip the source probe")
+
+    job = MigrationJob(job_id="j1")
+    job.watermark = _watermark()
+    state.job_id = "j1"
+    assert (
+        _probe_binlog_resume_gap(
+            state, _StubJobManager({"j1": job}), _ExplodingSession()
         )
         is None
     )
@@ -3269,123 +3925,6 @@ def test_state_migration_type_default_and_setter() -> None:
     assert state.migration_type is MigrationType.FULL_LOAD_ONLY
     state.set_migration_type(MigrationType.FULL_LOAD_AND_CDC)
     assert state.migration_type is MigrationType.FULL_LOAD_AND_CDC
-
-
-# ---------------------------------------------------------------------------
-# _render_cdc_decision -- the Migration Plan's Include-CDC? Yes/No control
-# ---------------------------------------------------------------------------
-
-
-class _TileUi:
-    """UI double that captures each tile's click handler (element.on) in order.
-
-    The CDC-decision tiles register their selection via ``tile.on("click", ...)``,
-    so the element records its own handler; ``click_handlers`` ends up ordered as
-    [No-tile, Yes-tile], matching the render order in _render_cdc_decision.
-    """
-
-    def __init__(self) -> None:
-        self.texts: list[str] = []
-        self.click_handlers: list = []
-
-    class _El:
-        def __init__(self, ui):
-            self._ui = ui
-
-        def classes(self, *_a, **_k):
-            return self
-
-        def props(self, *_a, **_k):
-            return self
-
-        def on(self, event, handler, *_a, **_k):
-            if event == "click":
-                self._ui.click_handlers.append(handler)
-            return self
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    def _record(self, text):
-        if text is not None:
-            self.texts.append(str(text))
-        return self._El(self)
-
-    def label(self, text="", *_a, **_k):
-        return self._record(text)
-
-    def icon(self, *_a, **_k):
-        return self._El(self)
-
-    def row(self, *_a, **_k):
-        return self._El(self)
-
-    def card(self, *_a, **_k):
-        return self._El(self)
-
-
-def _render_cdc_decision_double(state, *, status, locked=None):
-    from dsql_migrator.ui.data_migration import _render_cdc_decision
-
-    ui = _TileUi()
-    calls = {"refresh": 0}
-
-    def _refresh():
-        calls["refresh"] += 1
-
-    _render_cdc_decision(ui, state, status=status, refresh=_refresh, locked=locked)
-    return ui, calls
-
-
-def test_cdc_decision_yes_sets_full_load_and_cdc() -> None:
-    from dsql_migrator.ui.data_migration import DataMigrationState, MigrationType
-
-    state = DataMigrationState()  # defaults to FULL_LOAD_ONLY
-    ui, calls = _render_cdc_decision_double(state, status=StepStatus.NOT_STARTED)
-    # Order is [No, Yes]; click "Yes".
-    ui.click_handlers[1]()
-    assert state.migration_type is MigrationType.FULL_LOAD_AND_CDC
-    assert calls["refresh"] == 1
-
-
-def test_cdc_decision_no_sets_full_load_only() -> None:
-    from dsql_migrator.ui.data_migration import DataMigrationState, MigrationType
-
-    state = DataMigrationState()
-    state.set_migration_type(MigrationType.FULL_LOAD_AND_CDC)
-    ui, calls = _render_cdc_decision_double(state, status=StepStatus.NOT_STARTED)
-    # Click "No".
-    ui.click_handlers[0]()
-    assert state.migration_type is MigrationType.FULL_LOAD_ONLY
-    assert calls["refresh"] == 1
-
-
-def test_cdc_decision_yes_keeps_cdc_only_variant() -> None:
-    # Yes must not clobber a CDC-only choice into FULL_LOAD_AND_CDC: the CDC-only
-    # variant already "includes CDC", so re-selecting Yes is a no-op.
-    from dsql_migrator.ui.data_migration import DataMigrationState, MigrationType
-
-    state = DataMigrationState()
-    state.set_migration_type(MigrationType.CDC_ONLY)
-    ui, calls = _render_cdc_decision_double(state, status=StepStatus.NOT_STARTED)
-    ui.click_handlers[1]()  # Yes
-    assert state.migration_type is MigrationType.CDC_ONLY
-    assert calls["refresh"] == 0  # unchanged -> no re-render
-
-
-def test_cdc_decision_locked_ignores_clicks() -> None:
-    from dsql_migrator.ui.data_migration import DataMigrationState, MigrationType
-
-    state = DataMigrationState()  # FULL_LOAD_ONLY
-    ui, calls = _render_cdc_decision_double(
-        state, status=StepStatus.NOT_STARTED, locked=True
-    )
-    ui.click_handlers[1]()  # try to switch to Yes while locked
-    assert state.migration_type is MigrationType.FULL_LOAD_ONLY
-    assert calls["refresh"] == 0
 
 
 def test_prereq_phase_tag_combined_marks_common_vs_cdc_only() -> None:
@@ -4823,16 +5362,17 @@ def test_cdc_deploy_handlers_are_coroutine_functions() -> None:
     assert _inspect.iscoroutinefunction(_start_cdc_infra_deploy)
 
 
-def test_migration_plan_awaits_async_cdc_helpers() -> None:
-    # The Migration plan screen reuses the async CDC helpers and MUST await them.
-    # Calling _open_cdc_infra_dialog / _start_cdc_infra_deploy without await leaves
-    # an un-awaited coroutine (RuntimeWarning) -> the dialog never opens and the
-    # "Deploy CDC infrastructure" button does nothing. Guard: every call to those
-    # helpers in migration_plan.py is the operand of an `await`.
+def test_cdc_ui_awaits_async_cdc_helpers() -> None:
+    # The async CDC helpers MUST be awaited at every call site. Calling
+    # _open_cdc_infra_dialog / _start_cdc_infra_deploy without await leaves an
+    # un-awaited coroutine (RuntimeWarning) -> the dialog never opens and the
+    # "Deploy CDC infrastructure" button does nothing. (This guard originally
+    # covered migration_plan.py, which had exactly that bug; that screen is retired,
+    # so it now guards the module that owns the helpers and their call sites.)
     import ast
     import pathlib
 
-    import dsql_migrator.ui.migration_plan as mp
+    from dsql_migrator.ui.data_migration import _cdc_ui as mp
 
     targets = {"_open_cdc_infra_dialog", "_start_cdc_infra_deploy"}
     tree = ast.parse(pathlib.Path(mp.__file__).read_text(encoding="utf-8"))
@@ -4842,6 +5382,18 @@ def test_migration_plan_awaits_async_cdc_helpers() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.Await) and isinstance(node.value, ast.Call)
     }
+    # A call inside a `lambda` is a deferred callback, not an immediate invocation:
+    # the coroutine is created only when the callee invokes it, and the dialog awaits
+    # it there (`result = on_confirm(); if inspect.isawaitable(result): await result`).
+    # Requiring `await` inside a lambda is impossible anyway (a lambda cannot be
+    # async), so exempt those and only flag genuinely-immediate un-awaited calls.
+    deferred = {
+        id(node)
+        for lam in ast.walk(tree)
+        if isinstance(lam, ast.Lambda)
+        for node in ast.walk(lam)
+        if isinstance(node, ast.Call)
+    }
     unawaited = [
         (node.func.id, node.lineno)
         for node in ast.walk(tree)
@@ -4849,6 +5401,7 @@ def test_migration_plan_awaits_async_cdc_helpers() -> None:
         and isinstance(node.func, ast.Name)
         and node.func.id in targets
         and id(node) not in awaited
+        and id(node) not in deferred
     ]
     assert not unawaited, f"async CDC helper(s) called without await: {unawaited}"
 
@@ -5150,6 +5703,30 @@ class _RecordingUi:
         def props(self, *_a, **_k):
             return self
 
+        def tooltip(self, *_a, **_k):
+            return self
+
+        def style(self, *_a, **_k):
+            return self
+
+        def on(self, *_a, **_k):
+            return self
+
+        def bind_value(self, *_a, **_k):
+            return self
+
+        def enable(self, *_a, **_k):
+            return self
+
+        def disable(self, *_a, **_k):
+            return self
+
+        def set_text(self, *_a, **_k):
+            return self
+
+        def add_slot(self, *_a, **_k):
+            return self
+
         def __enter__(self):
             return self
 
@@ -5184,6 +5761,122 @@ class _RecordingUi:
 
     def card(self, *_a, **_k):
         return self._El()
+
+    # --- extras needed by the CDC infra-prep section -----------------------
+    def separator(self, *_a, **_k):
+        return self._El()
+
+    def space(self, *_a, **_k):
+        return self._El()
+
+    def badge(self, text="", *_a, **_k):
+        return self._record(text)
+
+    def spinner(self, *_a, **_k):
+        return self._El()
+
+    def timer(self, *_a, **_k):
+        return self._El()
+
+    def notify(self, *_a, **_k):
+        return None
+
+    def element(self, *_a, **_k):
+        return self._El()
+
+    def input(self, label="", *_a, **_k):
+        return self._record(label)
+
+    def select(self, *_a, **_k):
+        return self._El()
+
+    def checkbox(self, text="", *_a, **_k):
+        return self._record(text)
+
+    def refreshable(self, fn):
+        # NiceGUI's @ui.refreshable returns a wrapper that renders when CALLED (not at
+        # decoration time) and carries a .refresh(). Mirror that: decorating must not
+        # invoke the body, or closures defined after the @-line are still unbound.
+        fn.refresh = lambda *_a, **_k: None
+        return fn
+
+
+def test_cdc_infra_prep_section_renders_the_overlap_guidance() -> None:
+    """The deploy section must tell the user the create can overlap the Full Load.
+
+    That is the whole reason it sits on the Prerequisites sub-step instead of the deep
+    CDC one, so the copy has to say it -- otherwise the user still waits ~15-20 min
+    before starting the snapshot.
+    """
+    from dsql_migrator.ui.data_migration import _render_cdc_infra_prep_section
+
+    ui = _RecordingUi()
+    state = DataMigrationState()
+    state.set_cdc_stack_phase(None)  # probed, nothing found -> the deploy branch
+    _render_cdc_infra_prep_section(
+        ui, state, _StubJobManager({}), lambda: None, inventory=None, session=None
+    )
+    joined = " ".join(ui.texts)
+    assert "CDC streaming infrastructure" in joined
+    assert "Not deployed" in joined
+    assert "WHILE your Full Load" in joined
+    assert "15-20 minutes" in joined
+    # Says it is skippable (the CDC step remains a valid place to deploy later).
+    assert "deploy later from the CDC step" in joined
+
+
+def test_cdc_infra_prep_section_deploying_tells_user_to_start_the_load() -> None:
+    from dsql_migrator.ui.data_migration import _render_cdc_infra_prep_section
+
+    ui = _RecordingUi()
+    state = DataMigrationState()
+    state.set_cdc_stack_phase(None)
+    state.set_cdc_deploy_job_id("infra-1", kind="infra")
+    # A real MigrationJob: the live-progress card reads job.chunks/created_at, so the
+    # minimal _StubJob is not enough here.
+    job = MigrationJob(job_id="infra-1")
+    job.status = "RUNNING"
+    mgr = _StubJobManager({"infra-1": job})
+    _render_cdc_infra_prep_section(
+        ui, state, mgr, lambda: None, inventory=None, session=None
+    )
+    joined = " ".join(ui.texts)
+    assert "Deploying" in joined
+    assert "start your Full Load now" in joined
+    assert "does not hold up the snapshot" in joined
+
+
+def test_cdc_infra_prep_section_renders_nothing_before_the_probe_reports() -> None:
+    # Rendering a fresh-deploy form before the account-wide discovery has reported
+    # would drop the duplicate-MSK guard, so the section stays silent.
+    from dsql_migrator.ui.data_migration import _render_cdc_infra_prep_section
+
+    ui = _RecordingUi()
+    _render_cdc_infra_prep_section(
+        ui,
+        DataMigrationState(),
+        _StubJobManager({}),
+        lambda: None,
+        inventory=None,
+        session=None,
+    )
+    assert ui.texts == []
+
+
+def test_cdc_infra_prep_section_ready_points_at_the_cdc_step() -> None:
+    from dsql_migrator.ui.data_migration import _render_cdc_infra_prep_section
+
+    ui = _RecordingUi()
+    state = DataMigrationState()
+    state.set_cdc_stack_name("mysql-dsql-cdc-orders")
+    state.set_cdc_stack_phase("infra")
+    _render_cdc_infra_prep_section(
+        ui, state, _StubJobManager({}), lambda: None, inventory=None, session=None
+    )
+    joined = " ".join(ui.texts)
+    assert "already deployed" in joined
+    assert "mysql-dsql-cdc-orders" in joined
+    assert "Ready" in joined
 
 
 def test_deploy_log_lines_show_utc_timezone() -> None:
@@ -5268,57 +5961,35 @@ def test_cdc_existing_infra_banner_surfaces_adoptable_stacks() -> None:
     assert "mysql-dsql-cdc-seoul-test" in body
 
 
-def test_migration_plan_offers_attach_when_other_cdc_stacks_exist(monkeypatch) -> None:
-    # On the Migration Plan step (where CDC is chosen), when an existing CDC pipeline
-    # was discovered under a different name, the infra section must surface the ADOPT
-    # banner -- not the fresh "deploy CDC infrastructure" VPC form (which would risk a
-    # duplicate MSK).
-    import dsql_migrator.ui.migration_plan as mp
-    from dsql_migrator.ui.data_migration import MigrationType
-
-    class _El:
-        def classes(self, *_a, **_k):
-            return self
-
-        def props(self, *_a, **_k):
-            return self
-
-        def on(self, *_a, **_k):
-            return self
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_e):
-            return False
-
-    class _Ui:
-        def __getattr__(self, _name):
-            return lambda *a, **k: _El()
+def test_cdc_infra_prep_prefers_attach_over_a_duplicate_deploy(monkeypatch) -> None:
+    # The duplicate-MSK guard, re-targeted from the retired Migration plan screen to
+    # the Prerequisites-step section that replaced it: when an existing CDC pipeline
+    # was discovered under a DIFFERENT stack name, the section must surface the ADOPT
+    # choice -- never the fresh "deploy CDC infrastructure" VPC form, which would risk
+    # a second, billable Amazon MSK cluster.
+    from dsql_migrator.ui.data_migration import _cdc_ui, MigrationType
 
     state = DataMigrationState()
     state.set_migration_type(MigrationType.FULL_LOAD_AND_CDC)
-    state.set_cdc_stack_phase("absent")     # default-named stack not deployed
-    state.cdc_stack_phase_checked = True    # skip the (blocking) re-probe timer
+    state.set_cdc_stack_phase(None)  # default-named stack not deployed (marks probed)
     state.set_cdc_other_stacks([("mysql-dsql-cdc-seoul-test", "UPDATE_COMPLETE")])
 
-    calls = {"banner": 0, "form": 0}
+    calls = {"adopt": 0, "deploy": 0}
     monkeypatch.setattr(
-        mp, "_render_cdc_existing_infra_banner",
-        lambda *a, **k: calls.__setitem__("banner", calls["banner"] + 1),
+        _cdc_ui, "_render_cdc_adopt_or_deploy_choice",
+        lambda *a, **k: calls.__setitem__("adopt", calls["adopt"] + 1),
     )
     monkeypatch.setattr(
-        mp, "_render_cdc_infra_form",
-        lambda *a, **k: calls.__setitem__("form", calls["form"] + 1),
+        _cdc_ui, "_render_cdc_infra_deploy_action",
+        lambda *a, **k: calls.__setitem__("deploy", calls["deploy"] + 1),
     )
 
-    class _JM:  # no deploy job in flight
-        def get_job(self, *_a, **_k):
-            return None
-
-    mp._render_infra_section(_Ui(), state, _JM(), lambda: None, session=object())
-    assert calls["banner"] == 1  # adopt banner surfaced
-    assert calls["form"] == 0     # fresh-deploy VPC form NOT shown
+    _cdc_ui._render_cdc_infra_prep_section(
+        _RecordingUi(), state, _StubJobManager({}), lambda: None,
+        inventory=None, session=object(),
+    )
+    assert calls["adopt"] == 1   # adopt choice surfaced
+    assert calls["deploy"] == 0  # fresh-deploy form NOT shown
 
 
 def _completeness(

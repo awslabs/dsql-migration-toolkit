@@ -135,6 +135,61 @@ def test_sqlite_session_store_round_trips_a_snapshot(tmp_path) -> None:  # noqa:
     assert reopened.load("s1") is None
 
 
+def test_sqlite_store_loads_a_snapshot_naming_the_retired_migration_plan_step(
+    tmp_path,
+) -> None:  # noqa: ANN001
+    # THE back-compat guarantee for retiring the Migration plan step. Real persisted
+    # snapshots carry workflow.migration_plan, and WorkflowState is extra="forbid" --
+    # so if the field were removed, every one of them would fail to validate. The
+    # sqlite load had no try/except, so that exception propagated out of build_page and
+    # locked the user out of the tool entirely (not merely losing restored progress).
+    import json
+
+    store = SqliteSessionStateStore(str(tmp_path / "sessions.sqlite"))
+    payload = json.dumps(
+        {
+            "session_id": "old",
+            "workflow": {
+                "migration_plan": "DONE",
+                "evaluation": "DONE",
+                "schema_conversion": "NOT_STARTED",
+                "data_migration": "NOT_STARTED",
+                "full_load": "NOT_STARTED",
+                "cdc": "NOT_STARTED",
+                "validation": "NOT_STARTED",
+                "cut_over": "NOT_STARTED",
+            },
+            "migration_type": "full_load_and_cdc",
+            "active_view": "migration_plan",
+        }
+    )
+    store._conn.execute(  # noqa: SLF001 - simulate a pre-existing row
+        "INSERT INTO sessions (session_id, payload, updated_at) VALUES (?, ?, ?)",
+        ("old", payload, "2026-07-01T00:00:00Z"),
+    )
+    store._conn.commit()  # noqa: SLF001
+
+    loaded = store.load("old")
+    assert loaded is not None
+    assert loaded.workflow.migration_plan is StepStatus.DONE
+    assert loaded.migration_type == "full_load_and_cdc"
+    # The parked view survives on the snapshot; app.py redirects it to Evaluation.
+    assert loaded.active_view == "migration_plan"
+
+
+def test_sqlite_store_degrades_on_an_unreadable_snapshot(tmp_path) -> None:  # noqa: ANN001
+    # A payload that cannot validate (e.g. written by a newer build naming a field
+    # this one does not know, since the model is extra="forbid") must be IGNORED, not
+    # raise: the exception used to propagate out of build_page and break the page.
+    store = SqliteSessionStateStore(str(tmp_path / "sessions.sqlite"))
+    store._conn.execute(  # noqa: SLF001
+        "INSERT INTO sessions (session_id, payload, updated_at) VALUES (?, ?, ?)",
+        ("bad", '{"session_id": "bad", "a_field_from_the_future": 1}', "2026-07-01Z"),
+    )
+    store._conn.commit()  # noqa: SLF001
+    assert store.load("bad") is None  # degraded, no exception
+
+
 # ---------------------------------------------------------------------------
 # S3-backed store (durable across a Fargate task replacement)
 # ---------------------------------------------------------------------------
@@ -463,6 +518,61 @@ def test_cdc_start_mode_round_trips() -> None:
                            SchemaConversionState(), m2)
     assert m2.cdc_start_mode() == "manual"
     assert m2.cdc_start_override() is not None
+
+
+def test_prereq_gated_mode_round_trips() -> None:
+    # The prerequisite REPORTS are deliberately not persisted, so the run-guard
+    # excuses an absent report once a run exists. That excuse must be scoped to the
+    # mode that actually cleared the gate -- otherwise a Full-load-only run, after a
+    # restart, would let a switch to a CDC type inherit its pass and reach Start CDC
+    # with the binary-log format never checked. So the gated MODE must survive.
+    from dsql_migrator.core.models import MigrationMode
+
+    session, eval_state, conv_state, migration_state = _populated_states()
+    migration_state.set_prereq_gated_mode(MigrationMode.FULL_LOAD)
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+    assert snapshot.migration_prereq_gated_mode == MigrationMode.FULL_LOAD.value
+
+    m2 = DataMigrationState()
+    apply_session_snapshot(snapshot, SessionConnectionState(), EvaluationState(),
+                           SchemaConversionState(), m2)
+    assert m2.prereq_gated_mode is MigrationMode.FULL_LOAD
+
+
+def test_prereq_gated_mode_absent_or_unknown_restores_as_none() -> None:
+    # Back-compat: snapshots written before this field existed (and any unrecognized
+    # value) must restore as None, which keeps the lenient "a run exists, don't
+    # re-block an absent report" behavior -- a reconnect is never hard-blocked by it.
+    session, eval_state, conv_state, migration_state = _populated_states()
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+    assert snapshot.migration_prereq_gated_mode is None
+
+    m2 = DataMigrationState()
+    apply_session_snapshot(snapshot, SessionConnectionState(), EvaluationState(),
+                           SchemaConversionState(), m2)
+    assert m2.prereq_gated_mode is None
+
+    bogus = snapshot.model_copy(update={"migration_prereq_gated_mode": "NOT_A_MODE"})
+    m3 = DataMigrationState()
+    apply_session_snapshot(bogus, SessionConnectionState(), EvaluationState(),
+                           SchemaConversionState(), m3)
+    assert m3.prereq_gated_mode is None
+
+
+def test_session_signature_changes_on_prereq_gated_mode() -> None:
+    # The dirty-checked signature gates the save, so a change that is only the gated
+    # mode must still trigger a persist -- otherwise the field silently never lands.
+    from dsql_migrator.core.models import MigrationMode
+
+    session, eval_state, conv_state, migration_state = _populated_states()
+    sig1 = session_signature(session, eval_state, conv_state, migration_state)
+    migration_state.set_prereq_gated_mode(MigrationMode.CDC)
+    sig2 = session_signature(session, eval_state, conv_state, migration_state)
+    assert sig2 != sig1
 
 
 def test_cdc_stack_name_and_infra_inputs_round_trip() -> None:

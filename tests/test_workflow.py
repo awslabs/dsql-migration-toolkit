@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the four-step workflow shell logic (NiceGUI-agnostic).
+"""Unit tests for the five-step workflow shell logic (NiceGUI-agnostic).
 
 Covers step ordering/titles, status reads and transitions, prerequisite gating
 guidance (advisory, not a hard block — Requirement 8.6), status display mappings
@@ -35,18 +35,33 @@ from dsql_migrator.ui.workflow import (
 
 
 def test_ordered_steps_follow_the_migration_sequence() -> None:
-    # Migration plan is the first post-Connect step (choose the mode early);
+    # Five steps. Evaluation is the first post-Connect step: the retired Migration
+    # plan step asked "Include CDC?" before Evaluation had produced any evidence to
+    # decide on, and duplicated the migration-type selector Data Migration owns.
     # Data Migration is a single nav step (backed by WorkflowStep.FULL_LOAD); the
-    # Full load / CDC / both choice is an inner type selector, so CDC is no longer
-    # a separate nav step. Cut over is the final step (operational guidance).
+    # Full load / CDC / both choice is an inner type selector, so CDC is not a
+    # separate nav step. Cut over is the final step (operational guidance).
     assert ordered_steps() == (
-        WorkflowStep.MIGRATION_PLAN,
         WorkflowStep.EVALUATION,
         WorkflowStep.SCHEMA_CONVERSION,
         WorkflowStep.FULL_LOAD,
         WorkflowStep.VALIDATION,
         WorkflowStep.CUT_OVER,
     )
+    # The retired step must NOT be a nav entry...
+    assert WorkflowStep.MIGRATION_PLAN not in ordered_steps()
+
+
+def test_retired_migration_plan_step_still_resolves() -> None:
+    # ...but it must stay resolvable: real persisted snapshots name it (a stored
+    # active_view, or a status field), so step_title/prerequisite must not KeyError.
+    assert step_title(WorkflowStep.MIGRATION_PLAN) == "Migration plan"
+    assert prerequisite(WorkflowStep.MIGRATION_PLAN) is None
+    # And WorkflowState must still accept the field, or every old snapshot would
+    # fail to validate (the model is extra="forbid").
+    assert "migration_plan" in WorkflowState.model_fields
+    state = WorkflowState.model_validate({"migration_plan": "DONE"})
+    assert state.migration_plan is StepStatus.DONE
 
 
 def test_step_enum_values_match_workflow_state_fields() -> None:
@@ -77,10 +92,9 @@ def test_step_group_and_breadcrumb() -> None:
 
 
 def test_prerequisite_chain() -> None:
-    # Migration plan is the new first step (no prerequisite); Evaluation now
-    # depends on it.
-    assert prerequisite(WorkflowStep.MIGRATION_PLAN) is None
-    assert prerequisite(WorkflowStep.EVALUATION) is WorkflowStep.MIGRATION_PLAN
+    # Evaluation is the first step, so it has no prerequisite (Connect is gated
+    # separately by the sidebar's workflow-unlock latch, not by this chain).
+    assert prerequisite(WorkflowStep.EVALUATION) is None
     assert prerequisite(WorkflowStep.SCHEMA_CONVERSION) is WorkflowStep.EVALUATION
     # The unified Data Migration step depends only on Schema Conversion.
     assert prerequisite(WorkflowStep.FULL_LOAD) is WorkflowStep.SCHEMA_CONVERSION
@@ -109,14 +123,15 @@ def test_data_migration_needs_schema_conversion() -> None:
     assert is_prerequisite_met(ready, WorkflowStep.FULL_LOAD) is True
 
 
-def test_evaluation_needs_migration_plan() -> None:
+def test_evaluation_is_reachable_immediately() -> None:
     from dsql_migrator.ui.workflow import is_prerequisite_met
 
     base = WorkflowState()
-    # Evaluation now depends on the Migration plan step being DONE.
-    assert is_prerequisite_met(base, WorkflowStep.EVALUATION) is False
-    ready = with_status(base, WorkflowStep.MIGRATION_PLAN, StepStatus.DONE)
-    assert is_prerequisite_met(ready, WorkflowStep.EVALUATION) is True
+    # Evaluation is the first step: nothing in the workflow gates it (Connect is
+    # enforced by the sidebar's unlock latch). It must be open on a fresh session --
+    # previously it waited on the Migration plan step being marked DONE.
+    assert is_prerequisite_met(base, WorkflowStep.EVALUATION) is True
+    assert gating_message(base, WorkflowStep.EVALUATION) is None
 
 
 def test_step_definitions_are_ordered_and_consistent() -> None:
@@ -126,10 +141,8 @@ def test_step_definitions_are_ordered_and_consistent() -> None:
 
 
 def test_navigation_previous_and_next() -> None:
-    # Migration plan is the first step now; Evaluation follows it.
-    assert previous_step(WorkflowStep.MIGRATION_PLAN) is None
-    assert next_step(WorkflowStep.MIGRATION_PLAN) is WorkflowStep.EVALUATION
-    assert previous_step(WorkflowStep.EVALUATION) is WorkflowStep.MIGRATION_PLAN
+    # Evaluation is the first step, so it has no previous.
+    assert previous_step(WorkflowStep.EVALUATION) is None
     assert next_step(WorkflowStep.EVALUATION) is WorkflowStep.SCHEMA_CONVERSION
     # Data Migration (WorkflowStep.FULL_LOAD) is followed directly by Validation
     # now that CDC is folded into it.
@@ -175,9 +188,9 @@ def test_with_status_supports_full_transition_lifecycle() -> None:
 
 def test_first_step_prerequisite_always_met() -> None:
     state = WorkflowState()
-    # Migration plan is the new first step and has no prerequisite.
-    assert is_prerequisite_met(state, WorkflowStep.MIGRATION_PLAN) is True
-    assert gating_message(state, WorkflowStep.MIGRATION_PLAN) is None
+    # Evaluation is the first step and has no prerequisite.
+    assert is_prerequisite_met(state, WorkflowStep.EVALUATION) is True
+    assert gating_message(state, WorkflowStep.EVALUATION) is None
 
 
 def test_later_step_is_gated_until_prerequisite_done() -> None:
@@ -377,9 +390,10 @@ def test_reconnect_notice_none_when_connections_verified() -> None:
 
 
 def test_reconnect_notice_shown_for_cdc_infra_with_no_step_started() -> None:
-    # The real bug: CDC infrastructure was deployed from the Migration plan step
-    # before any workflow step ran, so every step is NOT_STARTED. The banner must
-    # STILL show on reconnect (there is a deployed cdc-stack + plan to resume).
+    # The real bug: CDC infrastructure was deployed before any workflow step
+    # completed (it is offered on Data Migration's Prerequisites sub-step so the MSK
+    # create overlaps the Full Load), so every step is NOT_STARTED. The banner must
+    # STILL show on reconnect (there is a deployed cdc-stack to resume).
     from dsql_migrator.ui.session import SessionConnectionState
     from dsql_migrator.ui.workflow import reconnect_notice
 
@@ -433,15 +447,47 @@ def test_start_over_cdc_warning_none_without_infra() -> None:
     from dsql_migrator.ui.session import SessionConnectionState
     from dsql_migrator.ui.workflow import _start_over_cdc_warning
 
-    # CDC plan chosen but no infra inputs entered yet -> nothing deployed to orphan.
+    # CDC type chosen but no infra inputs entered yet -> nothing deployed to orphan.
     state = SessionConnectionState()
     state.set_migration_type("cdc_only")
     assert _start_over_cdc_warning(state) is None
 
-    # Full-load-only with infra inputs somehow set -> still no CDC infra concern.
-    state2 = SessionConnectionState()
-    state2.set_cdc_infra_inputs({"vpc_id": "vpc-x"})
-    assert _start_over_cdc_warning(state2) is None
+    # A totally untouched session (no type, no inputs) is likewise silent.
+    assert _start_over_cdc_warning(SessionConnectionState()) is None
+
+
+def test_start_over_cdc_warning_fires_on_infra_inputs_alone() -> None:
+    # Entered infra inputs are the real "something may be deployed" signal, so they
+    # alone must warn. Requiring the migration type to STILL name a CDC mode was a
+    # hole: the type is freely switchable, so a user who deployed MSK and then flipped
+    # back to Full-load-only got no warning and could silently orphan a billing
+    # cluster. (With the Migration plan step gone, the type is even easier to change.)
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.workflow import _start_over_cdc_warning
+
+    state = SessionConnectionState()
+    state.set_cdc_infra_inputs({"vpc_id": "vpc-x"})
+    assert state.migration_type.value == "full_load_only"
+    warning = _start_over_cdc_warning(state)
+    assert warning is not None
+    assert "MSK/NAT keep billing" in warning
+
+    # A confirmed-absent live probe still short-circuits it (nothing to orphan).
+    assert _start_over_cdc_warning(state, cdc_confirmed_absent=True) is None
+
+
+def test_start_over_cdc_warning_fires_on_custom_stack_without_inputs() -> None:
+    # A non-default stack name is the case MOST at risk: a fresh session only
+    # re-discovers the DEFAULT name, so this one would be orphaned with no in-tool
+    # pointer -- even if the session has no infra inputs left (e.g. after a restore).
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.workflow import _start_over_cdc_warning
+
+    warning = _start_over_cdc_warning(
+        SessionConnectionState(), "mysql-dsql-cdc-orders"
+    )
+    assert warning is not None
+    assert "mysql-dsql-cdc-orders" in warning
 
 
 def test_start_over_cdc_warning_names_custom_stack() -> None:
@@ -644,22 +690,58 @@ def _render_header_texts(step) -> list[str]:
     return ui.texts
 
 
-def test_journey_header_hides_type_banner_on_migration_plan() -> None:
-    # On the Migration Plan step the "Include CDC?" control is the source of truth,
-    # so the "Migration type:" banner is omitted to avoid a redundant/conflicting
-    # three-value label above the two-value decision.
-    texts = _render_header_texts(WorkflowStep.MIGRATION_PLAN)
-    assert "Migration type:" not in texts
-    assert "Full load + CDC" not in texts
-    # Band 1 (the stepper) still renders — the plan step label is present.
-    assert any("Migration plan" in t for t in texts)
+def test_journey_header_shows_the_type_banner_on_every_step() -> None:
+    # The retired Migration plan step was the ONE screen that had to suppress the
+    # banner (its two-value "Include CDC?" control contradicted the three-value
+    # label). With it gone the header is finally identical everywhere -- the
+    # "one consistent journey" the design system asks for.
+    for step in ordered_steps():
+        texts = _render_header_texts(step)
+        assert "Migration type:" in texts, step
+        assert "Full load + CDC" in texts, step
 
 
-def test_journey_header_shows_type_banner_on_later_steps() -> None:
-    # Every step after the plan keeps the banner for continuity.
+def test_retired_view_redirect_is_wired_for_the_migration_plan_step() -> None:
+    """A session parked on the retired step must land on Evaluation, not Connect.
+
+    ``_restore_view`` silently falls back to Connect for any stored view with no
+    step_content entry, so without an explicit redirect the user loses their place.
+    This is not hypothetical: 8 of the 19 snapshots in the repo's real
+    session_state.sqlite are parked on ``"migration_plan"``. The redirect lives in
+    ``build_page``'s restore block (a closure), so the contract is pinned
+    structurally, next to the identical back-compat redirect for the old "cdc" view.
+    """
+    import ast
+    import pathlib
+
+    import dsql_migrator.ui.app as app_mod
+
+    src = pathlib.Path(app_mod.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    # Find `if _session.active_view == WorkflowStep.MIGRATION_PLAN.value:` and assert
+    # its body sets the view to EVALUATION.
+    redirects = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and "MIGRATION_PLAN" in ast.dump(node.test)
+    ]
+    assert redirects, "no active_view redirect for the retired MIGRATION_PLAN step"
+    body = ast.dump(ast.Module(body=redirects[0].body, type_ignores=[]))
+    assert "set_active_view" in body
+    assert "EVALUATION" in body
+
+
+def test_journey_header_stepper_is_five_numbered_steps() -> None:
     texts = _render_header_texts(WorkflowStep.EVALUATION)
-    assert "Migration type:" in texts
-    assert "Full load + CDC" in texts
+    assert "1. Evaluation" in texts
+    assert "2. Schema Conversion" in texts
+    assert "3. Data Migration" in texts
+    assert "4. Validation" in texts
+    assert "5. Cut over" in texts
+    # The retired step must not appear anywhere in the stepper.
+    assert not any("Migration plan" in t for t in texts)
 
 
 def test_build_migration_diagram_reconnect_state_on_resume() -> None:
@@ -963,6 +1045,40 @@ def test_cdc_teardown_banner_copy_running_failed_and_none() -> None:
     assert "the cdc-stack" in fb
 
 
+def test_cdc_banner_copy_covers_an_in_flight_infra_deploy() -> None:
+    # The ~15-20 min infrastructure create is the one CDC operation the user is meant
+    # to walk away from (it should overlap the Full Load), so it needs the cross-view
+    # banner too -- otherwise, once off the Data Migration screen, there is no sign it
+    # is still running and the user waits on it instead of starting the snapshot.
+    from dsql_migrator.ui.workflow import _cdc_teardown_banner_copy
+
+    tone, header, body = _cdc_teardown_banner_copy(
+        {"state": "running", "kind": "infra", "stack": "cdc-infra-1"}
+    )
+    assert tone == "info"
+    assert "deploying" in header.lower()
+    assert "cdc-infra-1" in body
+    # It must say the Full Load is NOT blocked -- that is the whole point of
+    # surfacing it (the deploy overlaps the load).
+    assert "does not block" in body.lower()
+    assert "streaming" in body.lower()
+    # Missing stack still reads cleanly.
+    _, _, generic = _cdc_teardown_banner_copy({"state": "running", "kind": "infra"})
+    assert "the cdc-stack" in generic
+
+
+def test_cdc_banner_copy_infra_failure_keeps_the_actionable_error() -> None:
+    # A FAILED infra job must NOT be softened into the reassuring "deploying in the
+    # background" copy: the failure branch (with Retry/Dismiss) has to win.
+    from dsql_migrator.ui.workflow import _cdc_teardown_banner_copy
+
+    tone, header, _body = _cdc_teardown_banner_copy(
+        {"state": "failed", "kind": "infra", "stack": "cdc-infra-1"}
+    )
+    assert tone == "error"
+    assert "failed" in header.lower()
+
+
 class _BannerUi:
     """NiceGUI double for _render_cdc_teardown_banner: records notice text and
     whether a poll timer was armed. Supports the @ui.refreshable decorator (returns
@@ -972,6 +1088,9 @@ class _BannerUi:
         self.texts: list[str] = []
         self.timer_armed = False
         self.buttons: list = []  # (label, on_click) for the failed-state actions
+        self.spinners = 0        # animated "still running" glyphs
+        self.badges: list[str] = []
+        self.icons: list[str] = []
 
     class _El:
         def classes(self, *_a, **_k):
@@ -1002,7 +1121,20 @@ class _BannerUi:
             self.texts.append(str(text))
         return self._El()
 
-    def icon(self, *_a, **_k):
+    def icon(self, name="", *_a, **_k):
+        if name:
+            self.icons.append(str(name))
+        return self._El()
+
+    def spinner(self, *_a, **_k):
+        self.spinners += 1
+        return self._El()
+
+    def badge(self, text="", *_a, **_k):
+        self.badges.append(str(text))
+        return self._El()
+
+    def space(self, *_a, **_k):
         return self._El()
 
     def row(self, *_a, **_k):
@@ -1027,6 +1159,39 @@ def test_render_cdc_teardown_banner_shows_while_in_flight_and_arms_poll() -> Non
     assert any("teardown in progress" in t.lower() for t in ui.texts)
     assert any("cdc-z" in t for t in ui.texts)
     assert ui.timer_armed  # re-arms a one-shot poll so it clears itself on settle
+
+
+def test_render_cdc_teardown_banner_shows_live_progress_affordances() -> None:
+    # A teardown runs ~15-45 min. With only a static icon the banner read as an inert
+    # message and the user could not tell the work was still moving, so a RUNNING
+    # banner gets an animated spinner (in place of the glyph) + an "In progress" badge.
+    from dsql_migrator.ui.workflow import _render_cdc_teardown_banner
+
+    for kind in ("delete", "stop", "infra"):
+        ui = _BannerUi()
+        _render_cdc_teardown_banner(ui, lambda k=kind: {"kind": k, "stack": "cdc-z"})
+        assert ui.spinners == 1, kind
+        assert "In progress" in ui.badges, kind
+        assert ui.icons == [], kind  # the spinner REPLACES the static glyph
+
+
+def test_render_cdc_teardown_banner_failed_state_is_static_not_busy() -> None:
+    # A FAILED teardown is terminal until the user acts: showing a spinner would
+    # imply work is still happening. It keeps the static error glyph and its actions.
+    from dsql_migrator.ui.workflow import _render_cdc_teardown_banner
+
+    ui = _BannerUi()
+    _render_cdc_teardown_banner(
+        ui,
+        lambda: {"state": "failed", "kind": "delete", "stack": "cdc-z"},
+        on_retry=lambda: None,
+        on_dismiss=lambda: None,
+    )
+    assert ui.spinners == 0
+    assert "In progress" not in ui.badges
+    assert ui.icons  # the static error icon is still rendered
+    assert not ui.timer_armed  # terminal -> no self-poll
+    assert [label for label, _ in ui.buttons] == ["Retry cleanup", "Dismiss"]
 
 
 def test_render_cdc_teardown_banner_silent_when_nothing_in_flight() -> None:

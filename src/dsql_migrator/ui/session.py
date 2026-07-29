@@ -113,15 +113,15 @@ class SessionConnectionState:
         # WorkflowStep value), so a browser refresh restores the same location
         # instead of resetting to the Connect screen. In-memory per session.
         self.active_view: Optional[str] = None
-        # The migration pattern the user chose on the Migration plan step
+        # The migration pattern the user chose on the Data Migration step
         # (Full load / CDC / Full+CDC). Promoted to the session (was previously
         # only on DataMigrationState) so it is chosen ONCE, early, right after
         # Connect, and readable from every step. Stored as the enum's string
         # value to keep this module free of a ``data_migration`` import (which
         # imports this module -- a cycle). Defaults to full-load-only.
         self._migration_type: str = "full_load_only"
-        # BYO-VPC infrastructure inputs entered on the Migration plan step (or the
-        # CDC sub-step): VpcId, subnets, plugin S3 keys, source host/secret,
+        # BYO-VPC infrastructure inputs entered on the Data Migration step (its
+        # Prerequisites or CDC sub-step): VpcId, subnets, plugin S3 keys, source host/secret,
         # DsqlClusterArn, etc. Filled values only; pre-seeded from the target/
         # source config where known. Transient/session-only.
         self._cdc_infra_inputs: dict[str, str] = {}

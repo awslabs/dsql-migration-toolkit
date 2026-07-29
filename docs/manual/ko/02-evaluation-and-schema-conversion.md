@@ -8,7 +8,7 @@ _언어: [English](../en/02-evaluation-and-schema-conversion.md) | **한국어**
 주는 두 단계가 있습니다:
 
 ```
-Connect → 1. Migration plan → [ 2. Evaluation → 3. Schema Conversion ] → 4. Data Migration → 5. Validation → 6. Cut over
+Connect → [ 1. Evaluation → 2. Schema Conversion ] → 3. Data Migration → 4. Validation → 5. Cut over
 ```
 
 - **Evaluation**은 *"내 MySQL DB에서 무엇이 DSQL로 옮겨지고 무엇이 안 되며, 각각 작업량은 얼마인가?"*

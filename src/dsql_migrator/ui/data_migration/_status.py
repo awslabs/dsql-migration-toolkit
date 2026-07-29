@@ -149,6 +149,12 @@ _CDC_ACTION_TITLE = {
 # map (or estimated at 0) show no hint.
 _CDC_STAGE_ETA_SECONDS = {
     "infra": {
+        # The first two stages were previously unestimated, so the total ETA
+        # under-reported the wait. They upload the three bundled artifacts
+        # (Debezium ~31 MiB + DSQL sink ~11 MiB + seeder Lambda ~1 MiB); already
+        # up-to-date objects are skipped, so this is the cold-start estimate.
+        "ensure_bucket": 10,
+        "upload_plugins": 60,
         "check_existing": 5,
         "validate_params": 2,
         "create_stack": 10,
@@ -415,6 +421,23 @@ def _is_inflight_stack_status(status: Optional[str]) -> bool:
     will never clear it, so the user must delete the stack and retry.
     """
     return bool(status) and status.upper().endswith("_IN_PROGRESS")
+
+
+def is_infra_create_stack_status(status: Optional[str]) -> bool:
+    """True when the stack status is the CDC *infrastructure* create in flight.
+
+    Only the first deploy uses ``create_stack``
+    (:func:`~dsql_migrator.core.cdc_deployer.run_cdc_infra_deploy`); every later
+    connector operation (Start / Stop CDC) goes through ``submit_update``, so it
+    reports ``UPDATE_IN_PROGRESS``. That makes ``CREATE_IN_PROGRESS`` an unambiguous
+    "MSK/networking is being provisioned, no connector exists yet" signal.
+
+    Used to keep the ~15-20 min infra create from reading as a live *migration*
+    operation: during it nothing streams and no Full Load is running, so the
+    prerequisite checks are exactly what the user should be doing (the generic
+    ``_is_inflight_stack_status`` would disable them for the whole create). Pure.
+    """
+    return bool(status) and status.upper() == "CREATE_IN_PROGRESS"
 
 
 def cdc_teardown_in_flight(

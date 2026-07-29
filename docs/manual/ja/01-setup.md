@@ -204,10 +204,11 @@ AWS_REGION=us-east-1 deploy/build_in_codebuild.sh      # イメージ URI を出
 > **ソースとターゲットは同じリージョンになければなりません** — クロスリージョンのマイグレーションは
 > **サポートされていません**。ツールもそのリージョンで実行してください。
 
-両方の接続テストが緑色になったら、**Migration plan** を選択し、**Evaluation** へ進みます — ツールが
+両方の接続テストが緑色になったら、そのまま **Evaluation** へ進みます — ツールが
 両方のデータベースをイントロスペクトして互換性レポートを生成します。ここからガイド付きフローは
-Schema Conversion、Data Migration(Full Load + CDC)、Validation、そして最後に **Cut over**
-(アプリケーションを DSQL へ切り替えるためのランブック)へと続き、それぞれ以降の章で扱います。
+Schema Conversion、Data Migration(ここで Full Load のみか CDC を追加するかを選んで実行)、
+Validation、そして最後に **Cut over**(アプリケーションを DSQL へ切り替えるためのランブック)へと
+続き、それぞれ以降の章で扱います。
 
 ---
 

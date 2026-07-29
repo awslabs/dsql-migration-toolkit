@@ -5,6 +5,210 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.148
+
+### Changed
+
+- **A notice reporting a live background operation now shows an animated spinner and
+  an "In progress" badge.** The cross-view CDC banner ("Deleting '<stack>' in the
+  background (~15–45 min)…") carried only a static info icon, so a 15–45 minute
+  teardown looked like an inert message — there was no way to tell it was still
+  moving rather than stalled. `render_notice` gains a `busy` flag that swaps the
+  static glyph for a tone-colored spinner and pins an **In progress** badge beside the
+  header; the running teardown/stop banner, and the CDC-infrastructure deploy notice
+  on Data Migration's Prerequisites sub-step, both use it. A **failed** teardown stays
+  static and keeps its Retry/Dismiss actions — a spinner there would wrongly imply
+  work is still happening.
+
+## v0.1.147
+
+### Changed
+
+- **The workflow is now five steps: the "Migration plan" step is retired.**
+  `Connect → Evaluation → Schema Conversion → Data Migration → Validation → Cut
+  over`. The step asked one question — "Include CDC?" — at the moment of *minimum*
+  information: nothing consumed the answer for three steps, and Evaluation (which
+  detects, for example, cascading foreign keys that CDC can never replicate) had not
+  run yet. It also duplicated a decision Data Migration already owns: the same CDC
+  choice existed there as the three-way migration-type selector, which was never
+  locked, so the type was decided twice. Everything the step did now lives where it
+  is actionable:
+  - the **migration type** is chosen on Data Migration, after the compatibility
+    report tells you what you are dealing with;
+  - the **CDC infrastructure deploy** is offered on Data Migration's Prerequisites
+    sub-step (v0.1.146), which still precedes the Full Load — so the ~15–20 minute
+    MSK create overlaps the snapshot instead of being front-loaded before Evaluation.
+  - Connect now advances straight to **Evaluation**, and the duplicate "Include CDC?"
+    control is gone.
+- **The migration-type banner now appears on every step.** The retired step was the
+  one screen that had to suppress it (its two-value "Include CDC?" control read as
+  conflicting with the three-value banner), so the journey header is finally
+  identical everywhere.
+- **"Start over" now warns about orphaned CDC infrastructure in more cases.** The
+  caution required the migration type to *still* name a CDC mode, which was a hole:
+  the type is freely switchable, so someone who deployed MSK and then switched back
+  to Full-load-only got no warning and could silently leave a billing cluster behind.
+  Entered infrastructure inputs — or a non-default stack name, which a fresh session
+  never re-discovers — are now enough on their own.
+
+### Fixed
+
+- **An unreadable persisted session no longer breaks the page.** The SQLite session
+  store parsed its payload with no error handling, and both `SessionSnapshot` and
+  `WorkflowState` are `extra="forbid"` — so a snapshot written by a newer build (or
+  naming a field since removed) raised out of the page build and locked the user out
+  of the tool entirely, rather than just losing the restored progress. It now warns
+  and starts fresh, matching the S3 store.
+
+### Compatibility
+
+- `WorkflowStep.MIGRATION_PLAN` and `WorkflowState.migration_plan` are **kept** as
+  back-compat only (like the older `data_migration` alias). Removing the field would
+  make every already-persisted snapshot that names it fail to validate. All 19
+  snapshots in the reference session store still load unchanged.
+- A session **parked on the retired step** is redirected to Evaluation on restore
+  (8 of those 19 were), instead of silently falling back to the Connect screen.
+- The presentation decks (`docs/tech-talk-*`) have been removed from the repository.
+- The README/deployment screenshot is now a **static PNG** (`docs/demo-ui.png`),
+  recaptured on the five-step UI. The previous animated GIF baked the retired
+  six-step sidebar — and a stale version chip — into its frames.
+
+## v0.1.146
+
+### Added / Changed
+
+- **CDC infrastructure can now be deployed from the Data Migration step, so the
+  ~15–20 minute MSK create overlaps the Full Load.** The deploy form previously lived
+  only inside the CDC sub-step — which, for a Full Load + CDC migration, is reached
+  only *after* the snapshot finishes. So the wait was serialized: the load ran, and
+  only then did ~15–20 minutes of provisioning start. It is now offered at the bottom
+  of the **Prerequisites** sub-step, which still precedes the Full Load, with copy
+  that says explicitly the deploy runs in the background and the snapshot should be
+  started now. The deep CDC sub-step form stays available (a session can still arrive
+  at CDC with nothing deployed).
+  - Prerequisites is the right anchor, not the migration-type tiles: running the
+    checks is what pins and locks the confirmed table set, which the connector's
+    table list and the topic partition plan both need.
+  - The section adapts to the situation: not deployed → the form; deploying → live
+    progress and "start your Full Load now"; already deployed → a short "ready,
+    nothing to do here"; found under another name → attach instead of paying for a
+    second MSK cluster. It renders **nothing** until the account-wide discovery has
+    reported, so a fresh-deploy form can never appear before the duplicate-cluster
+    guard is populated.
+- **The prerequisite checks now record the exact table set they covered.** The picker
+  locks as soon as a report exists, so that set *is* the migration scope — but when
+  the user never touched the picker it was only implied by the default, leaving the
+  stored selection empty. Anything reading it then resolved to "no tables": a CDC
+  deploy started before any Full Load watermark exists produced an empty connector
+  table list and a uniform topic-partition plan.
+- **An in-flight CDC infrastructure deploy is now visible from every screen.** It is
+  the one CDC operation the user is meant to walk away from, but the cross-view banner
+  covered only stop/delete — so after leaving Data Migration there was no sign it was
+  still running, and a user could sit and wait on it. The banner now also reports a
+  running deploy and repeats that the Full Load is not blocked.
+- **Evaluation's CDC-specific foreign-key finding is now surfaced where CDC is
+  chosen.** The assessment already detects foreign keys with automatic `ON
+  DELETE`/`ON UPDATE` actions: MySQL applies those to child rows inside InnoDB, so
+  they never reach the binary log, CDC cannot see them, and DSQL (no foreign keys)
+  cannot re-perform them — the child rows are silently left behind on the target. The
+  finding's own guidance begins "Before starting CDC", yet it appeared only in the
+  Evaluation report, read *before* the user knew whether CDC was in scope. Selecting a
+  CDC migration type now names the affected tables inline.
+
+### Fixed
+
+- **The CDC infrastructure deploy's progress estimate no longer under-reports the
+  wait.** The `ensure_bucket` and `upload_plugins` stages carried no estimate even
+  though they upload ~43 MiB of connector plugins, so the total ETA — the user's only
+  signal during the deploy — was short by roughly a minute on a cold start.
+
+## v0.1.145
+
+### Fixed
+
+- **Adding CDC after a Full-Load-only run no longer skips the CDC prerequisite
+  checks.** The prerequisite report is intentionally not persisted, so the run guard
+  excuses an absent report once a load has run — that is what lets a reconnected user
+  re-run a finished Full Load. But the excuse was not scoped to the mode that
+  actually cleared the gate, so on the "start Full-Load-only, add CDC later" path the
+  tool inherited the Full Load pass for **CDC** mode: Prerequisites collapsed as
+  "done" and the CDC sub-step opened with the **binary-log format never verified**. A
+  source on `STATEMENT`/`MIXED` (or without `binlog_row_image=FULL`) can never be
+  streamed, so this was only discovered as an undiagnosed connector failure ~26
+  minutes into a billable create. The mode that gated the run is now recorded (and
+  persisted), and a switch that needs different checks asks for them. Older snapshots
+  lack the field and keep the previous lenient behavior, so a reconnect is never
+  hard-blocked.
+- **The sidebar's Data Migration Run guard now agrees with the on-screen guard.** It
+  called the guard without a mode, silently defaulting to Full Load — so for a CDC
+  migration type the sidebar Run button appeared enabled while the in-content button
+  (correctly gated on the CDC superset) was disabled. The mode is now derived from
+  the selected migration type in both places.
+
+### Added
+
+- **Deploy CDC infrastructure and Start CDC now have their own prerequisite gate.**
+  Both actions previously relied on the sub-step order (Prerequisites → Full Load →
+  CDC) to guarantee the checks had run — an implicit guarantee that only held because
+  the migration type was chosen early. Both now explicitly require the CDC-mode
+  checks to have run with **`BINLOG_ROW_FORMAT` passing**, and explain what to fix
+  (on RDS, a parameter-group change plus a reboot) before any billable
+  infrastructure is created. The gate deliberately ignores unrelated required
+  failures (e.g. a per-table target-schema check), which the Full Load guard already
+  reports — one problem is not surfaced twice.
+- **Start CDC warns when the snapshot's binary log has already been purged.** The
+  watermark is captured at Full Load **start**, so a long load plus the ~15–20 minute
+  infrastructure create plus the connector create all elapse before Debezium reads
+  it. If the source purged that log in the meantime the gapless hand-off is
+  impossible, and the only correct recovery is a fresh snapshot. A single read-only
+  `SHOW BINARY LOGS` now runs before the connectors are created and names the missing
+  log, the oldest one still retained, and the retention command to raise it — instead
+  of failing ~26 minutes later with an undiagnosable `CREATE_FAILED` (MySQL error
+  1236). It is a **warning, not a block** (starting with a known gap can be
+  deliberate), and it stays silent whenever the answer is unknown — no watermark, a
+  manual start position, or the statement/privilege unavailable.
+
+## v0.1.144
+
+### Fixed
+
+- **Deploying CDC infrastructure no longer masquerades as a live CDC stream.** The
+  ~15–20 minute infrastructure deploy (`create_stack`: MSK Serverless, networking,
+  plugins, IAM) creates **no connectors** — the template gates both on
+  `HasBootstrapServers`, which the infra pass leaves blank — so nothing is streaming
+  while it runs. But the "is CDC streaming?" predicate counted **any** in-flight CDC
+  lifecycle job, including the infra deploy, so starting a deploy (e.g. from the
+  Migration plan step) and then opening Data Migration made the tool behave as if a
+  pipeline were live:
+  - **Data Migration was promoted to `Success`**, unlocking **Validation with zero
+    rows loaded** — and because that promotion never downgrades, the bogus status was
+    **persisted** and survived a restart.
+  - **Start Full Load was disabled** with a misleading "CDC is streaming — stop CDC
+    first" tooltip, and the table picker was frozen.
+  - A **"Drop & reload" re-run silently became an append**: the DROP is suppressed
+    while a live sink is writing the target, so the reload skipped over stale rows
+    ("0 new + N already there") instead of refreshing them.
+  - **Applying schema was blocked** on the Schema Conversion step — a dead end, since
+    Data Migration (the only place CDC can be stopped) is prerequisite-locked behind
+    it.
+  A `kind="infra"` job is now excluded: only a **connector-level** operation
+  (Start / Stop / Delete CDC) or an actually-streaming pipeline counts. Detected
+  connectors and stack phase `running` still win, so every CDC-live safety gate is
+  unchanged.
+- **The prerequisite "Check" button is no longer disabled for the whole
+  infrastructure deploy.** A second, independent path disabled it: the panel treated
+  every CloudFormation `*_IN_PROGRESS` status as a live migration operation, so
+  `CREATE_IN_PROGRESS` kept the read-only checks unavailable for the full ~15–20
+  minutes — exactly when the user should be running them. Only the first deploy uses
+  `create_stack` (Start / Stop CDC go through `update_stack` →
+  `UPDATE_IN_PROGRESS`), so `CREATE_IN_PROGRESS` is now recognized as
+  "infrastructure provisioning, nothing streaming yet" and leaves the checks
+  available. `UPDATE_IN_PROGRESS` / `DELETE_IN_PROGRESS` still count as live
+  operations.
+
+Together these let the ~15–20 minute MSK create **overlap** the Full Load instead of
+serializing after it — the deploy runs in the background while the snapshot loads.
+
 ## v0.1.143
 
 ### Fixed

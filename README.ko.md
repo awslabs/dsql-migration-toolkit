@@ -63,19 +63,18 @@ Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 *분산* 데이터베이�
 
 ## 워크플로우
 
-웹 UI는 **Connect**를 사전 단계로 한 6단계를 안내합니다:
+웹 UI는 **Connect**를 사전 단계로 한 5단계를 안내합니다:
 
-`Connect → Migration plan → Evaluation → Schema Conversion → Data Migration → Validation → Cut over`
+`Connect → Evaluation → Schema Conversion → Data Migration → Validation → Cut over`
 
 | 단계 | 하는 일 |
 | --- | --- |
 | Connect | 소스(RDS/Aurora MySQL)와 타깃(Aurora DSQL) 연결 정보 입력. 자격증명은 세션별 메모리에만 있다가 세션 종료 시 폐기. |
-| 1. Migration plan | 이 마이그레이션에 **CDC를 쓸지**만 결정. 이 선택은 스트리밍 인프라를 미리 프로비저닝할지만 좌우하며, 되돌릴 수 있음(Full-Load만으로 시작한 뒤 CDC 추가 가능). |
-| 2. Evaluation | 소스 **와** 타깃을 introspect해 호환성 리포트(`AUTO`/`MANUAL`/`UNSUPPORTED`) 생성. 작업량 추정·이름 충돌 감지·선택적 AI 전략 포함. |
-| 3. Schema Conversion | 객체를 탐색하고 소스 vs 변환 DDL을 나란히 비교, 타깃에 적용(SKIP / REPLACE), 안전 재시도 포함. |
-| 4. Data Migration | 사전 점검·테이블 선택 후 **Full Load**(워터마크 → export → 로드, 테이블별 진행률 + 에러 로그). 선택적으로 **CDC**(별도 cdc-stack)로 확장. |
-| 5. Validation | 워터마크 시점 기준으로 타깃을 소스와 비교 — 행 수/체크섬 결과와 드리프트를 보고, 리포트 export. |
-| 6. Cut over | Validation 통과 후 앱을 MySQL → DSQL로 전환하는 운영 런북 — 도구가 대신 실행하지 않는 유일한 단계. MySQL 소스는 롤백 앵커로 유지. |
+| 1. Evaluation | 소스 **와** 타깃을 introspect해 호환성 리포트(`AUTO`/`MANUAL`/`UNSUPPORTED`) 생성. 작업량 추정·이름 충돌 감지·선택적 AI 전략 포함. |
+| 2. Schema Conversion | 객체를 탐색하고 소스 vs 변환 DDL을 나란히 비교, 타깃에 적용(SKIP / REPLACE), 안전 재시도 포함. |
+| 3. Data Migration | 마이그레이션 타입(**Full Load**만, 또는 **CDC** 추가)을 선택하고, 사전 점검·테이블 선택 후 스냅샷 실행(워터마크 → export → 로드, 테이블별 진행률 + 에러 로그). CDC 타입이면 스트리밍 인프라도 여기서 배포되므로 약 15~20분의 생성이 Full Load와 **동시에** 진행됩니다. |
+| 4. Validation | 워터마크 시점 기준으로 타깃을 소스와 비교 — 행 수/체크섬 결과와 드리프트를 보고, 리포트 export. |
+| 5. Cut over | Validation 통과 후 앱을 MySQL → DSQL로 전환하는 운영 런북 — 도구가 대신 실행하지 않는 유일한 단계. MySQL 소스는 롤백 앵커로 유지. |
 
 각 단계는 상태(시작 안 함 / 진행 중 / 완료 / 실패)를 표시하며 독립적으로 실행/재실행할 수
 있습니다. 기능 단위 상세는 [사용자 매뉴얼](docs/manual/ko/README.md)에 있습니다.
@@ -126,7 +125,7 @@ Dev/Test vs Prod, DNS·Cognito, teardown, 문제 해결).
 
 <p align="center">
   <b>Console (UI)</b><br>
-  <img src="docs/demo-ui.gif" alt="UI 데모 — 6단계 가이드 마이그레이션 워크플로우" width="720">
+  <img src="docs/demo-ui.png" alt="도구 UI — 5단계 가이드 마이그레이션 워크플로우" width="720">
 </p>
 
 ---
@@ -227,7 +226,7 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 | 문서 | 내용 |
 |---|---|
 | [**배포 가이드**](deploy/DEPLOYMENT.ko.md) | 로컬은 명령어 한 줄, 또는 ECS Fargate 배포(AWS Console 또는 CLI) — 사전 요구사항, 파라미터, 커스텀 도메인 / Cognito / AI 어시스트, teardown, 트러블슈팅. |
-| [**사용자 매뉴얼**](docs/manual/) | 6단계 마이그레이션 단계별 안내 — **성능 튜닝 & 측정 테스트 결과**, 테스트 / 검증, **고객 FAQ** 포함. |
+| [**사용자 매뉴얼**](docs/manual/) | 5단계 마이그레이션 단계별 안내 — **성능 튜닝 & 측정 테스트 결과**, 테스트 / 검증, **고객 FAQ** 포함. |
 | [**아키텍처**](#아키텍처) | 구성 요소와 동작 + AWS·CDC 파이프라인 다이어그램(`deploy/architecture-*.png`). |
 | [**변경 이력**](CHANGELOG.ko.md) | 릴리스별 변경(유의적 버전). |
 

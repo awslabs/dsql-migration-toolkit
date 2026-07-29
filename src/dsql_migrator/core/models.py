@@ -814,9 +814,12 @@ class WorkflowState(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    # Migration plan: the first post-Connect step where the migration pattern is
-    # chosen (and CDC infra optionally provisioned early). Prerequisite of
-    # Evaluation. Defaults NOT_STARTED; older snapshots lacking it still load.
+    # RETIRED step, kept for back-compat ONLY -- do NOT remove. This model is
+    # ``extra="forbid"``, so dropping the field would make every already-persisted
+    # snapshot that names it fail to validate. It was the first post-Connect step
+    # (choose the migration pattern, optionally provision CDC infra early); the
+    # pattern is now chosen on Data Migration, which also owns the CDC-infra deploy.
+    # Same treatment as ``data_migration`` below.
     migration_plan: StepStatus = StepStatus.NOT_STARTED
     evaluation: StepStatus = StepStatus.NOT_STARTED
     schema_conversion: StepStatus = StepStatus.NOT_STARTED

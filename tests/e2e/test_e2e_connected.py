@@ -48,7 +48,7 @@ def _verify_connections(page: Page, *, enable_ai: bool = False) -> None:
     page.get_by_role("button", name="Test target connection").click()
     # Both cards now show "Verified"; the Next gate unlocks.
     expect(
-        page.get_by_role("button", name="Next: Migration plan")
+        page.get_by_role("button", name="Next: Evaluation")
     ).to_be_enabled(timeout=_PROBE_TIMEOUT_MS)
 
 

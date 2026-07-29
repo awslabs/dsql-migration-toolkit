@@ -14,11 +14,14 @@ connector networking, and the connector IAM role.
 
 ## How the app deploys it (the normal path)
 
-1. On the **Migration plan** step, choose a mode that includes CDC.
-2. On the **Data Migration** step, the **CDC pipeline** card walks you through:
-   **Deploy CDC infrastructure** (this template, ~15–20 min) → **Start CDC**
-   (creates the connectors) → live monitoring → **Stop** / **Delete**.
-3. The deploy form asks for only your **VPC ID**; subnets/NAT egress, the plugin
+1. On the **Data Migration** step, choose a migration type that includes CDC.
+2. Its **Prerequisites** sub-step then offers **Deploy CDC infrastructure** (this
+   template, ~15–20 min). Deploying here is deliberate: it precedes the Full Load,
+   so the MSK create runs **while** the snapshot loads instead of after it.
+3. The CDC sub-step takes over from there: **Start CDC** (creates the connectors) →
+   live monitoring → **Stop** / **Delete**. It can also deploy the infrastructure,
+   for a session that reaches CDC with nothing provisioned yet.
+4. The deploy form asks for only your **VPC ID**; subnets/NAT egress, the plugin
    S3 bucket + artifacts, the DSQL cluster ARN, the source host, and the
    source-credentials secret are all resolved automatically. A confirmation dialog
    shows the network plan and a rough monthly cost before any billable resource is

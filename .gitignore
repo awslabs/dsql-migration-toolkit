@@ -110,6 +110,6 @@ scripts/*
 # Local performance measurement outputs (not published)
 perf-runs/
 
-# Rendered deck outputs (source .md is tracked; html/pdf are build artifacts)
-docs/tech-talk-*.html
-docs/tech-talk-*.pdf
+# Rendered deck outputs (build artifacts; keeps a local Marp render out of git)
+docs/*-slides-*.html
+docs/*-slides-*.pdf

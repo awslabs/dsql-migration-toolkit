@@ -21,11 +21,11 @@ you convert across those differences.
 
 It is a **web tool** (and importable engine) that performs a **heterogeneous,
 deterministic-first migration**: MySQL → PostgreSQL-dialect → DSQL constraints.
-The **source is always read-only**. The migration is a six-step guided flow,
+The **source is always read-only**. The migration is a five-step guided flow,
 with **Connect** as the preliminary step:
 
 ```
-Connect → 1. Migration plan → 2. Evaluation → 3. Schema Conversion → 4. Data Migration → 5. Validation → 6. Cut over
+Connect → 1. Evaluation → 2. Schema Conversion → 3. Data Migration → 4. Validation → 5. Cut over
 ```
 
 Data Migration is **Full Load** (the tool's own bulk loader) and, optionally,

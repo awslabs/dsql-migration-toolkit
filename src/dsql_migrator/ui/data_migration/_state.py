@@ -55,7 +55,7 @@ class DataMigrationState:
         # Optional bound SessionConnectionState. When set (via bind_session), the
         # migration type and the CDC infra inputs are written THROUGH to the
         # session, which is the authoritative store now that the mode is chosen
-        # early on the Migration plan step. The local fields below remain as a
+        # on the Data Migration step. The local fields below remain as a
         # fallback for tests / call sites that construct a state without a session.
         self._session: object = None
         self.job_id: Optional[str] = None
@@ -85,13 +85,23 @@ class DataMigrationState:
         # Determines which prerequisite mode is checked and which stepper
         # sub-steps are shown; defaults to Full load only. Exposed via the
         # ``migration_type`` property which reads through to a bound session when
-        # present (the Migration plan step is the authoritative chooser).
+        # present (the session is the authoritative store).
         self._migration_type: MigrationType = MigrationType.FULL_LOAD_ONLY
         # Single per-session downloadable error log for Full Load + CDC errors
         # (single error path -- Req 13.2 / Property 15).
         self.error_log: ErrorLogStore = ErrorLogStore()
         # Last prerequisite report per mode (set when the user runs checks).
         self._prereq_reports: dict[MigrationMode, PrerequisiteReport] = {}
+        # The prerequisite MODE that actually gated the most recent started Full
+        # Load. The reports themselves are deliberately not persisted (a restored
+        # connection can't be trusted), so ``full_load_run_guard_reason`` excuses an
+        # absent report once a run exists -- that is what lets a reconnected user
+        # re-run a finished load. But the excuse must be scoped to the mode that
+        # cleared the gate: a Full-load-only run passed only the FULL_LOAD checks,
+        # so switching the type to add CDC afterwards must NOT inherit that pass
+        # (the CDC-only checks -- binlog ROW/FULL, replication grants -- were never
+        # run). Persisted so the distinction survives a restart.
+        self._prereq_gated_mode: Optional[MigrationMode] = None
         # Modes whose prerequisite checks are currently running (transient, in
         # memory only -- drives the immediate "checking..." feedback so the
         # button does not appear unresponsive during the read-only checks).
@@ -692,7 +702,7 @@ class DataMigrationState:
     def bind_session(self, session: object) -> None:
         """Bind the SessionConnectionState so mode/infra-inputs read-through to it.
 
-        The Migration plan step chooses the mode early and stores it on the
+        The Data Migration step chooses the mode and stores it on the
         session; binding here makes ``migration_type`` and ``cdc_infra_inputs``
         authoritative from the session while keeping the local fields as a
         fallback when no session is bound (unit tests, legacy call sites).
@@ -735,6 +745,17 @@ class DataMigrationState:
         """Return the last prerequisite report for ``mode``, if any."""
         with self._lock:
             return self._prereq_reports.get(mode)
+
+    def set_prereq_gated_mode(self, mode: Optional[MigrationMode]) -> None:
+        """Record which prerequisite mode gated the most recent started Full Load."""
+        with self._lock:
+            self._prereq_gated_mode = mode
+
+    @property
+    def prereq_gated_mode(self) -> Optional[MigrationMode]:
+        """The prerequisite mode that cleared the gate for the last started run."""
+        with self._lock:
+            return self._prereq_gated_mode
 
     def set_prereq_running(self, mode: MigrationMode) -> None:
         """Mark ``mode``'s prerequisite checks as running (for live feedback)."""

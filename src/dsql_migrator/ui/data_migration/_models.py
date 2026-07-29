@@ -1467,3 +1467,88 @@ _MIGRATION_TYPE_META: dict[MigrationType, _MigrationTypeMeta] = {
         ),
     ),
 }
+
+
+# The Evaluation rule whose finding only matters once CDC is in scope: foreign keys
+# with automatic referential actions (ON DELETE/UPDATE CASCADE|SET NULL) change child
+# rows inside InnoDB, so those changes never reach the binary log and CDC cannot
+# replicate them (MySQL bug #32506). See core/assessor.py.
+_FK_CASCADE_CDC_RULE_ID = "FK_CASCADE_CDC_GAP"
+
+
+def cdc_cascade_gap_tables(assessment: object) -> list[str]:
+    """Return the tables whose FK cascades CDC cannot replicate (sorted, de-duped).
+
+    The deterministic assessment already detects this at Evaluation time, but the
+    finding is CDC-specific -- and it was surfaced only in the Evaluation report,
+    which the user reads BEFORE deciding whether CDC is in scope. Its own
+    recommendation opens with "Before starting CDC", so it belongs next to the CDC
+    choice too: silently orphaned child rows on the target are exactly the kind of
+    divergence that is expensive to find later.
+
+    Accepts any object exposing ``items`` (the real ``AssessmentReport`` or a test
+    double) and degrades to ``[]`` when absent/unreadable, so a decorative surface can
+    never break the screen. Pure.
+    """
+    items = getattr(assessment, "items", None) or []
+    names: list[str] = []
+    for item in items:
+        if getattr(item, "rule_id", None) != _FK_CASCADE_CDC_RULE_ID:
+            continue
+        name = getattr(item, "object_name", None)
+        if name and name not in names:
+            names.append(str(name))
+    return sorted(names)
+
+
+def cdc_prerequisite_block_reason(
+    report: Optional[PrerequisiteReport],
+) -> Optional[str]:
+    """Why the CDC lifecycle must not proceed, or ``None`` when it may.
+
+    The CDC actions (Deploy infrastructure / Start CDC) previously had NO
+    prerequisite gate of their own -- they were reachable only because the linear
+    sub-step order (Prerequisites -> Full Load -> CDC) happened to put the checks
+    first. That ordering was an implicit guarantee established by choosing the
+    migration type early; once the type can change late (or the deploy is offered
+    beside Prerequisites), the guarantee has to be explicit.
+
+    Gates on the two things that make CDC *possible at all* on the source, both
+    checked only in ``MigrationMode.CDC``:
+
+    * the report exists (the CDC-mode checks have actually run), and
+    * ``BINLOG_ROW_FORMAT`` passed -- Debezium cannot read a ``STATEMENT``/``MIXED``
+      binlog, nor reconstruct rows without ``binlog_row_image=FULL``.
+
+    Without this, a source on the wrong binlog format surfaced only as an
+    undiagnosed connector ``CREATE_FAILED`` ~26 min into a billable create; and
+    fixing it needs an RDS parameter-group change plus a reboot, so it must be known
+    before any infrastructure is paid for.
+
+    Deliberately does NOT gate on ``report.can_proceed``: that also covers per-table
+    ``TARGET_SCHEMA_READY`` / ``TABLE_PRIMARY_KEY`` failures, which the Full Load
+    guard already owns and which do not make streaming impossible. Pure/unit-testable.
+    """
+    if report is None:
+        return (
+            "Run the CDC prerequisite checks first (Prerequisites step) — they "
+            "verify the source binary log is usable for streaming before any "
+            "billable infrastructure is created."
+        )
+    binlog = next(
+        (
+            r
+            for r in report.results
+            if r.check_id is PrerequisiteCheckId.BINLOG_ROW_FORMAT
+        ),
+        None,
+    )
+    if binlog is None or binlog.status is not PrerequisiteStatus.PASS:
+        detail = (binlog.detail or "").strip() if binlog is not None else ""
+        suffix = f" {detail}" if detail else ""
+        return (
+            "CDC needs the source binary log in ROW format with a FULL row image "
+            f"— that check has not passed.{suffix} Fix it on the source (an RDS "
+            "parameter-group change needs a reboot), then re-run the checks."
+        )
+    return None

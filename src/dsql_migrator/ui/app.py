@@ -40,9 +40,9 @@ from dsql_migrator.ui.data_migration import (
     build_data_migration_screen,
     cdc_streaming_started,
     full_load_run_guard_reason,
+    prereq_mode_for_type,
 )
 from dsql_migrator.ui.evaluation import EvaluationStore, build_evaluation_screen
-from dsql_migrator.ui.migration_plan import build_migration_plan_screen
 from dsql_migrator.ui.schema_conversion import (
     SchemaConversionStore,
     build_schema_conversion_screen,
@@ -119,14 +119,9 @@ def build_page(
     """
     # Build each step's (content_builder, runner). These only prepare closures;
     # nothing renders until the sidebar selects and invokes a screen.
-    # Step 0 (Migration plan): choose the migration mode early and, for CDC modes,
-    # provision the cdc-stack infrastructure in the background ("provision early").
-    migration_plan_content, migration_plan_runner = build_migration_plan_screen(
-        SESSION_STORE,
-        session_id,
-        job_manager=JOB_MANAGER,
-        migration_store=DATA_MIGRATION_STORE,
-    )
+    # Step 1 (Evaluation) is the first workflow step after Connect. The migration
+    # TYPE (and the CDC-infrastructure deploy) belong to Data Migration, so there is
+    # no separate up-front plan screen.
     evaluation_content, evaluation_runner = build_evaluation_screen(
         SESSION_STORE,
         session_id,
@@ -216,13 +211,20 @@ def build_page(
         )
 
     def data_migration_run_guard() -> str | None:
-        # Disable the Full Load Run until the Full Load prerequisite checks have
-        # been run and all required checks pass (Property 14).
+        # Disable the Full Load Run until the prerequisite checks have been run and
+        # all required checks pass (Property 14). The mode is derived from the
+        # selected migration type -- exactly as the in-content guard does -- so the
+        # two never disagree: hardcoding FULL_LOAD here let the sidebar Run appear
+        # enabled for a CDC type whose (superset) checks had not run.
         migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
         eval_state = EVALUATION_STORE.get_or_create(session_id)
         result = eval_state.result
         inventory = result.inventory if result is not None else None
-        return full_load_run_guard_reason(migration_state, inventory)
+        return full_load_run_guard_reason(
+            migration_state,
+            inventory,
+            prereq_mode=prereq_mode_for_type(migration_state.migration_type),
+        )
 
     # Resume support (Property 4): restore this session's persisted snapshot once
     # per process when the in-memory session is still fresh, and persist a
@@ -284,6 +286,14 @@ def build_page(
                 # opens the Data Migration step instead of a blank view.
                 if _session.active_view == WorkflowStep.CDC.value:
                     _session.set_active_view(WorkflowStep.FULL_LOAD.value)
+                # Back-compat: the Migration plan step was retired (its CDC decision
+                # is the Data Migration type selector, and its infra deploy moved to
+                # that step's Prerequisites sub-step). A session parked on it would
+                # restore an active_view with no step_content entry, and _restore_view
+                # silently falls back to Connect -- losing the user's place. Send them
+                # to Evaluation, which is now the first workflow step.
+                if _session.active_view == WorkflowStep.MIGRATION_PLAN.value:
+                    _session.set_active_view(WorkflowStep.EVALUATION.value)
 
     def _reset_session() -> None:
         # "Start over": wipe ALL per-session in-memory state + the durable
@@ -378,6 +388,17 @@ def build_page(
         migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
         job_id = getattr(migration_state, "cdc_teardown_job_id", None)
         if not job_id:
+            # No teardown -- but an in-flight INFRASTRUCTURE create also needs the
+            # cross-view banner: it runs ~15-20 min and is meant to overlap the Full
+            # Load, so once the user leaves the Data Migration screen there would
+            # otherwise be no sign it is still going (and they might wait on it).
+            # Reuses _cdc_op_in_flight, which already reads the deploy job + kind.
+            if _cdc_op_in_flight() == "infra":
+                return {
+                    "state": "running",
+                    "kind": "infra",
+                    "stack": getattr(migration_state, "cdc_stack_name", None),
+                }
             return None
         state = cdc_teardown_banner_state(JOB_MANAGER, job_id)
         if state in ("running", "failed"):
@@ -642,7 +663,6 @@ def build_page(
             )
         ),
         step_content={
-            WorkflowStep.MIGRATION_PLAN: migration_plan_content,
             WorkflowStep.EVALUATION: evaluation_content,
             WorkflowStep.SCHEMA_CONVERSION: schema_content,
             WorkflowStep.FULL_LOAD: data_migration_content,
@@ -650,7 +670,6 @@ def build_page(
             WorkflowStep.CUT_OVER: cutover_content,
         },
         runners={
-            WorkflowStep.MIGRATION_PLAN: migration_plan_runner,
             WorkflowStep.EVALUATION: evaluation_runner,
             WorkflowStep.SCHEMA_CONVERSION: schema_runner,
             WorkflowStep.FULL_LOAD: data_migration_runner,

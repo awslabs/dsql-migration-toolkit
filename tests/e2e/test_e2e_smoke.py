@@ -22,15 +22,14 @@ def test_app_loads_with_title(page: Page) -> None:
 
 
 def test_workflow_steps_render_in_nav(page: Page) -> None:
-    # All six workflow steps + the optional Query validation tool appear in the
+    # All five workflow steps + the optional Query validation tool appear in the
     # left nav (locked until connected, but present).
     for label in (
-        "1. Migration plan",
-        "2. Evaluation",
-        "3. Schema Conversion",
-        "4. Data Migration",
-        "5. Validation",
-        "6. Cut over",
+        "1. Evaluation",
+        "2. Schema Conversion",
+        "3. Data Migration",
+        "4. Validation",
+        "5. Cut over",
         "Query validation",
     ):
         expect(page.get_by_text(label, exact=False).first).to_be_visible()

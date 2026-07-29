@@ -56,6 +56,7 @@ from dsql_migrator.core.job_manager import (
 )
 from dsql_migrator.core.models import (
     LoadStatusView,
+    MigrationMode,
     SourceInventory,
     StepStatus,
     Watermark,
@@ -71,6 +72,7 @@ from dsql_migrator.ui.data_migration._models import (
     build_lag_chart_option,
     build_migration_table_status,
     cdc_handling_facts,
+    cdc_prerequisite_block_reason,
     connector_health_rows,
     connector_role_label,
     format_column_exclude_list,
@@ -104,6 +106,7 @@ from dsql_migrator.ui.design import (
     definition_row,
     inline_hint,
     render_notice,
+    section_header,
 )
 
 # These four names live in the package ``__init__``: the activity-log anchor
@@ -205,106 +208,6 @@ def _cdc_is_streaming(migration_state) -> bool:
     )
 
 
-def _render_cdc_decision(
-    ui, migration_state, *, status, refresh, locked: Optional[bool] = None
-) -> None:
-    """Render the Migration Plan's single real decision: include CDC or not.
-
-    The Migration Plan step's only durable effect is whether CDC streaming
-    infrastructure (MSK, ~15-20 min) is provisioned early, so it asks exactly that
-    -- "Include CDC?" Yes/No -- instead of the full three-way type tiles (which
-    overstate the commitment: the type is freely changeable on the Data Migration
-    step, and Full Load vs the CDC-only variant is decided there when tables are
-    picked). Mapping: **No -> FULL_LOAD_ONLY**, **Yes -> FULL_LOAD_AND_CDC** (the
-    common snapshot-then-stream default; the rarer CDC-only variant is selected on
-    the Data Migration step). Internally this still writes the same
-    ``migration_type`` enum, so substeps / prerequisites / the journey banner /
-    session snapshots are unchanged. Locking mirrors the type selector: once a
-    migration is running or CDC infrastructure is deployed, the choice is frozen
-    (with the reason shown) so it cannot change out from under billable resources.
-    """
-    running = locked if locked is not None else (status is StepStatus.IN_PROGRESS)
-    includes_cdc = migration_state.migration_type in (
-        MigrationType.CDC_ONLY,
-        MigrationType.FULL_LOAD_AND_CDC,
-    )
-
-    def _choose(include_cdc: bool) -> None:
-        if running:
-            return
-        # No-op if the answer already matches: any CDC mode (FULL_LOAD_AND_CDC or
-        # CDC_ONLY) already "includes CDC", so re-selecting Yes must NOT clobber a
-        # CDC_ONLY choice the user made on the Data Migration step. Only flip when
-        # the include-CDC answer actually changes.
-        if include_cdc == includes_cdc:
-            return
-        new_type = (
-            MigrationType.FULL_LOAD_AND_CDC
-            if include_cdc
-            else MigrationType.FULL_LOAD_ONLY
-        )
-        migration_state.set_migration_type(new_type)
-        migration_state.set_active_substep(None)  # default for the new type
-        refresh()
-
-    ui.label("Include CDC (continuous replication)?").classes(  # type: ignore[attr-defined]
-        "text-sm font-semibold"
-    )
-    lock_reason = migration_type_lock_reason(migration_state, status=status)
-    if running and lock_reason:
-        ui.label(lock_reason).classes(  # type: ignore[attr-defined]
-            "text-xs text-amber-700 mb-1"
-        )
-    # Two Cloudscape-style tiles: No (Full Load only) / Yes (Full Load + CDC).
-    options = (
-        (
-            False,
-            "sync_disabled",
-            "No — one-time load",
-            "Full Load only: a one-shot snapshot copy. No streaming infrastructure.",
-        ),
-        (
-            True,
-            "sync",
-            "Yes — keep in sync",
-            "Provision CDC (MSK) so the target stays in sync after the load — for a "
-            "near-zero-downtime cutover. You choose the exact pattern (Full Load + "
-            "CDC, or CDC only) on the Data Migration step.",
-        ),
-    )
-    with ui.row().classes("w-full gap-3 items-stretch no-wrap"):  # type: ignore[attr-defined]
-        for value, icon, title, blurb in options:
-            is_selected = value == includes_cdc
-            border = "border-blue-500" if is_selected else "border-gray-300"
-            bg = "bg-blue-50" if is_selected else "bg-white"
-            interactivity = (
-                "opacity-60 cursor-not-allowed"
-                if running
-                else "cursor-pointer hover:border-blue-400"
-            )
-            tile = ui.card().classes(  # type: ignore[attr-defined]
-                f"flex-1 p-3 rounded-lg border {border} {bg} {interactivity} "
-                "transition-colors gap-1"
-            )
-            tile.on("click", lambda _e=None, _v=value: _choose(_v))
-            with tile:
-                with ui.row().classes("items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
-                    ui.icon(  # type: ignore[attr-defined]
-                        "radio_button_checked"
-                        if is_selected
-                        else "radio_button_unchecked",
-                        color="primary" if is_selected else "grey-6",
-                    ).classes("text-lg")
-                    ui.icon(  # type: ignore[attr-defined]
-                        icon, color="primary" if is_selected else "grey-7"
-                    ).classes("text-lg")
-                    ui.label(title).classes("text-sm font-semibold")  # type: ignore[attr-defined]
-                ui.label(blurb).classes("text-xs text-gray-600")  # type: ignore[attr-defined]
-    if running:
-        ui.label(  # type: ignore[attr-defined]
-            "Locked once the migration has started or CDC infrastructure is deployed."
-        ).classes("text-xs text-gray-500")
-
 def _render_cdc_step(
     ui,
     migration_state,
@@ -378,12 +281,24 @@ def cdc_streaming_started(migration_state, job_manager) -> bool:
     """True once CDC has been started, so its inputs must no longer change.
 
     "Started" means the connectors are deployed/streaming (cdc-stack phase
-    ``running`` -- detected connectors), or a CDC lifecycle job (start/stop/delete)
-    is in flight. After this point the start position is already seeded into the
-    MSK connect-offsets topic and the table set is fixed by the running source
-    connector, so editing the CDC start point or the table selection would have no
-    effect on the live pipeline and only mislead the operator. Mirrors the
-    "running" detection in :func:`_render_cdc_start_action`. Read-only/best-effort.
+    ``running`` -- detected connectors), or a **connector-level** CDC lifecycle job
+    (start/stop/delete) is in flight. After this point the start position is
+    already seeded into the MSK connect-offsets topic and the table set is fixed by
+    the running source connector, so editing the CDC start point or the table
+    selection would have no effect on the live pipeline and only mislead the
+    operator. Mirrors the "running" detection in :func:`_render_cdc_start_action`.
+    Read-only/best-effort.
+
+    An in-flight ``kind="infra"`` job is deliberately EXCLUDED: the infrastructure
+    create (``create_stack``: MSK Serverless, networking, plugins, IAM) makes no
+    connectors -- the template gates both on ``HasBootstrapServers``, which the
+    infra pass leaves blank -- so nothing is streaming and no offset is seeded for
+    the ~15-20 min it runs. Treating it as "streaming" made an infra deploy
+    masquerade as a live pipeline: it promoted the Data Migration step to DONE
+    (unlocking Validation with zero rows loaded, and never downgrading), disabled
+    Start Full Load, froze the table picker, and silently turned a "Drop & reload"
+    re-run into an append. Excluding it is also what lets the ~15-20 min MSK create
+    overlap the Full Load instead of serializing after it.
     """
     controller = getattr(migration_state, "cdc_controller", None)
     names = getattr(migration_state, "cdc_connector_names", []) or []
@@ -391,6 +306,10 @@ def cdc_streaming_started(migration_state, job_manager) -> bool:
         return True  # connectors detected -> streaming
     if getattr(migration_state, "cdc_stack_phase", None) == "running":
         return True
+    # Only a connector-level lifecycle job counts (start/stop/delete); an "infra"
+    # create touches no connector, so it must not read as streaming.
+    if getattr(migration_state, "cdc_action_kind", None) == "infra":
+        return False
     deploy_job = _current_job(
         job_manager, getattr(migration_state, "cdc_deploy_job_id", None)
     )
@@ -1514,20 +1433,44 @@ def _render_cdc_start_button(
             ),
         )
 
-    def _confirm() -> None:
-        _open_cdc_start_dialog(
+    # _open_cdc_start_dialog is async (it runs the read-only binlog-retention
+    # pre-flight via run.io_bound), so it MUST be awaited -- otherwise the dialog
+    # never opens and "Start CDC" appears to do nothing.
+    async def _confirm() -> None:
+        await _open_cdc_start_dialog(
             ui, migration_state,
             lambda: _start_cdc_deploy(
                 ui, migration_state, job_manager, refresh,
                 inventory=inventory, session=session,
             ),
             session=session,
+            job_manager=job_manager,
+        )
+
+    # Explicit CDC-prerequisite gate, independent of the sub-step ordering: a
+    # source whose binary log is not ROW/FULL can never be streamed, and creating
+    # connectors against it burns ~26 min of billable create before failing with an
+    # undiagnosed error. Checked here as well as before the infra deploy, because a
+    # session can reach Start CDC on already-deployed (or adopted) infrastructure
+    # without having passed through the deploy action.
+    prereq_block = cdc_prerequisite_block_reason(
+        migration_state.get_prereq_report(MigrationMode.CDC)
+    )
+    if prereq_block:
+        render_notice(
+            ui,
+            tone="warning",
+            header="Run the CDC prerequisite checks first",
+            body=prereq_block,
         )
 
     start_btn = ui.button(  # type: ignore[attr-defined]
         "Start CDC", on_click=_confirm, icon="play_arrow"
     ).props("color=primary")
-    if not ready:
+    if prereq_block:
+        start_btn.props("disable")
+        start_btn.tooltip(prereq_block)
+    elif not ready:
         start_btn.props("disable")
         ui.label(  # type: ignore[attr-defined]
             "Set the CDC start point above first."
@@ -1553,6 +1496,137 @@ def _render_cdc_running_actions(
         "Removes only the connectors — MSK, the VPC wiring and the plugins are "
         "kept, so you can Start CDC again quickly."
     )
+
+def cdc_infra_prep_state(migration_state, job_manager) -> str:
+    """Classify the CDC-infrastructure situation for the Prerequisites-step section.
+
+    Returns one of:
+
+    * ``"deploying"`` -- an infra create is in flight (show live progress only).
+    * ``"ready"``     -- a cdc-stack already exists (deployed earlier / adopted), so
+      there is nothing to deploy here; Start CDC happens on the CDC sub-step.
+    * ``"adopt"``     -- CDC infrastructure exists under a name this session does not
+      target, so offer to attach instead of paying for a second MSK cluster.
+    * ``"deploy"``    -- nothing exists yet: offer the BYO-VPC form + deploy.
+    * ``"unknown"``   -- the account probe has not reported yet; render nothing rather
+      than briefly showing a deploy form that could duplicate an existing pipeline.
+
+    Pure (reads already-populated state; no AWS I/O) so it is safe during render.
+    """
+    deploy_job = _current_job(
+        job_manager, getattr(migration_state, "cdc_deploy_job_id", None)
+    )
+    if (
+        getattr(migration_state, "cdc_action_kind", None) == "infra"
+        and deploy_job is not None
+        and deploy_job.status in ("PENDING", "RUNNING")
+    ):
+        return "deploying"
+    phase = getattr(migration_state, "cdc_stack_phase", None)
+    if phase in ("infra", "running", "unstable", "provisioning", "partial"):
+        return "ready"
+    # Gate on the probe having actually reported: ``cdc_other_stacks`` is only
+    # meaningful once the account-wide discovery ran. Showing a fresh-deploy form
+    # before then risks a duplicate (billable) MSK cluster.
+    if not getattr(migration_state, "cdc_stack_phase_checked", False):
+        return "unknown"
+    if getattr(migration_state, "cdc_other_stacks", None):
+        return "adopt"
+    return "deploy"
+
+
+def _render_cdc_infra_prep_section(
+    ui, migration_state, job_manager, refresh, *, inventory=None, session=None
+) -> None:
+    """CDC infrastructure prep, rendered at the BOTTOM of the Prerequisites sub-step.
+
+    Why here and not beside the migration-type tiles: the ~15-20 min MSK create should
+    OVERLAP the Full Load, so it has to be offered before the load starts -- but it
+    also needs a real table set (the connector's ``TableIncludeList`` and the topic
+    partition plan). Prerequisites is the first point where both hold: running the
+    checks pins and locks the confirmed selection, and this sub-step still precedes
+    Full Load. Beside the tiles the picker is typically untouched, so the table set
+    would resolve to "none".
+
+    Deliberately does NOT duplicate the CDC sub-step's lifecycle card: only the
+    first-deploy affordance lives here. Start CDC, monitoring, Stop and Delete stay on
+    the CDC sub-step, which remains reachable with no infrastructure deployed.
+    """
+    prep = cdc_infra_prep_state(migration_state, job_manager)
+    if prep == "unknown":
+        return
+
+    ui.separator()  # type: ignore[attr-defined]
+    section_header(
+        ui,
+        icon="cloud_upload",
+        title="CDC streaming infrastructure",
+        badge=(
+            ("Deploying…", "primary") if prep == "deploying"
+            else ("Ready", "positive") if prep == "ready"
+            else ("Not deployed", "grey")
+        ),
+    )
+
+    if prep == "deploying":
+        render_notice(
+            ui,
+            tone="info",
+            busy=True,  # ~15-20 min live operation: spinner + "In progress" badge
+            header="Deploying in the background — start your Full Load now",
+            body=(
+                "Amazon MSK takes ~15-20 minutes to provision. Nothing is streaming "
+                "yet, so this does not hold up the snapshot: continue to Full Load "
+                "and let the two run together. You can leave this screen; progress "
+                "is kept and shown when you return."
+            ),
+        )
+        _render_cdc_deploy_live(ui, migration_state, job_manager, refresh)
+        return
+
+    if prep == "ready":
+        stack = getattr(migration_state, "cdc_stack_name", "the cdc-stack")
+        render_notice(
+            ui,
+            tone="success",
+            header="CDC infrastructure is ready",
+            body=(
+                f"'{stack}' is already deployed, so there is nothing to provision "
+                "here. You start streaming on the CDC step after the Full Load."
+            ),
+        )
+        return
+
+    if prep == "adopt":
+        _render_cdc_adopt_or_deploy_choice(
+            ui,
+            migration_state,
+            job_manager,
+            refresh,
+            getattr(migration_state, "cdc_other_stacks", []) or [],
+            inventory=inventory,
+            session=session,
+        )
+        return
+
+    render_notice(
+        ui,
+        tone="info",
+        icon="schedule",
+        header="Deploy now so it is ready when the Full Load finishes",
+        body=(
+            "CDC needs Amazon MSK, which takes ~15-20 minutes to provision and bills "
+            "while it exists. Deploying it here lets it run WHILE your Full Load "
+            "does, instead of waiting afterwards — the snapshot is unaffected, and "
+            "no data streams until you explicitly start CDC. You can also skip this "
+            "and deploy later from the CDC step."
+        ),
+    )
+    _render_cdc_infra_deploy_action(
+        ui, migration_state, job_manager, refresh,
+        inventory=inventory, session=session,
+    )
+
 
 def _render_cdc_adopt_or_deploy_choice(
     ui, migration_state, job_manager, refresh, other_stacks, *,
@@ -1623,9 +1697,26 @@ def _render_cdc_infra_deploy_action(
             session=session,
         )
 
-    ui.button(  # type: ignore[attr-defined]
+    # Explicit CDC-prerequisite gate. MSK is billable and takes ~15-20 min to
+    # create, and a source whose binlog is not ROW/FULL can never stream -- fixing
+    # it needs a parameter-group change plus a reboot on RDS. So verify that BEFORE
+    # any infrastructure is paid for, rather than discovering it as an undiagnosed
+    # connector failure later.
+    _prereq_block = cdc_prerequisite_block_reason(
+        migration_state.get_prereq_report(MigrationMode.CDC)
+    )
+    deploy_btn = ui.button(  # type: ignore[attr-defined]
         "Deploy CDC infrastructure", on_click=_confirm, icon="cloud_upload"
     ).props("color=primary")
+    if _prereq_block:
+        deploy_btn.props("disable")
+        deploy_btn.tooltip(_prereq_block)
+        render_notice(
+            ui,
+            tone="warning",
+            header="Run the CDC prerequisite checks first",
+            body=_prereq_block,
+        )
 
 def _render_cdc_least_privilege_note(ui, *, session=None) -> None:
     """Recommend a dedicated least-privilege CDC MySQL user before deploy.
@@ -2012,18 +2103,83 @@ def _diagnose_for_dialog(migration_state, session):
         return "", "", ""
     return diagnosis.reason, diagnosis.mode, (diagnosis.routed_cidr_warning or "")
 
-def _open_cdc_start_dialog(ui, migration_state, on_confirm, *, session=None) -> None:
+def _probe_binlog_resume_gap(migration_state, job_manager, session) -> Optional[str]:
+    """Read-only: is the watermark's binary log still on the source? (blocking)
+
+    Runs one ``SHOW BINARY LOGS`` against the source and compares it with the Full
+    Load watermark's binlog file. Returns an actionable reason when the log has been
+    purged (a gapless resume is impossible), else ``None`` -- including whenever the
+    answer is unknown (no watermark, manual start point, no source password after a
+    restart, or the statement/privilege is unavailable), so this never blocks on
+    uncertainty. Blocking I/O: callers MUST run it via ``run.io_bound``.
+    """
+    # A manual start point overrides the watermark, so the watermark's log being
+    # gone is not what CDC will resume from -- nothing to warn about here.
+    # ``cdc_start_override`` already returns None in "auto" mode, so this is the
+    # single condition needed.
+    if migration_state.cdc_start_override() is not None:
+        return None
+    job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+    watermark = getattr(job, "watermark", None) if job is not None else None
+    watermark_file = getattr(watermark, "binlog_file", None)
+    if not watermark_file:
+        return None
+    source_config = getattr(session, "source_config", None)
+    if source_config is None:
+        return None
+    try:
+        from dsql_migrator.core.watermark import (
+            binlog_resume_gap_reason,
+            list_binary_logs,
+        )
+        from dsql_migrator.ui.connect import make_source_engine_factory
+
+        engine = make_source_engine_factory(
+            getattr(session, "source_password", None)
+        )(source_config)
+        try:
+            with engine.connect() as connection:
+                retained = list_binary_logs(connection)
+        finally:
+            engine.dispose()
+    except Exception:  # noqa: BLE001 - advisory pre-flight; unknown never blocks
+        return None
+    return binlog_resume_gap_reason(watermark_file, retained)
+
+
+async def _open_cdc_start_dialog(
+    ui, migration_state, on_confirm, *, session=None, job_manager=None
+) -> None:
     """Confirm dialog before the (billable, partition-quota-using) Start.
 
-    A pre-flight connection check (:func:`cdc_deploy_connection_blocker`) runs
-    first: Start CDC creates the source connector's credentials secret from the
-    in-memory source password (not restored after a restart) and needs a live
-    target, so if either is missing the dialog says so and disables Start CDC --
-    the user reconnects BEFORE starting instead of hitting a failure mid-submit
-    (and wasting MSK partition quota on a half-created connector).
+    Two read-only pre-flight checks run first, so a doomed Start is caught before it
+    consumes ~26 min of billable connector create and MSK partition quota:
+
+    * :func:`cdc_deploy_connection_blocker` -- Start CDC builds the source
+      connector's credentials secret from the in-memory source password (not
+      restored after a restart) and needs a live target. Missing either is a hard
+      block: the user reconnects first.
+    * :func:`_probe_binlog_resume_gap` -- the Full Load watermark's binary log must
+      still exist on the source, or the gapless hand-off is impossible. This one is
+      a **warning**, not a block: starting with a gap can be a deliberate choice,
+      and the check degrades to silence whenever the answer is unknown.
+
+    The binlog probe is blocking source I/O, so it runs via ``run.io_bound`` -- which
+    is why this helper is async and MUST be awaited (an un-awaited coroutine would
+    silently never open the dialog).
     """
     stack_name = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
     conn_blocker = cdc_deploy_connection_blocker(session)
+    binlog_gap: Optional[str] = None
+    if job_manager is not None:
+        from nicegui import run
+
+        try:
+            binlog_gap = await run.io_bound(
+                _probe_binlog_resume_gap, migration_state, job_manager, session
+            )
+        except Exception:  # noqa: BLE001 - advisory only; never block the dialog
+            binlog_gap = None
     with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 460px"):  # type: ignore[attr-defined]
         ui.label("Start CDC — create connectors").classes("text-lg font-semibold")  # type: ignore[attr-defined]
         ui.label(  # type: ignore[attr-defined]
@@ -2039,6 +2195,14 @@ def _open_cdc_start_dialog(ui, migration_state, on_confirm, *, session=None) -> 
                 icon="link_off",
                 header="Reconnect before starting CDC",
                 body=conn_blocker,
+            )
+        if binlog_gap:
+            _render_notice(
+                ui,
+                tone="warning",
+                icon="history_toggle_off",
+                header="The snapshot's binary log has been purged",
+                body=binlog_gap,
             )
 
         def _go() -> None:

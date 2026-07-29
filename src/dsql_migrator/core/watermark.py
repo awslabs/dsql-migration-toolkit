@@ -65,6 +65,7 @@ from dsql_migrator.core.models import SourceConnectionConfig, Watermark
 # are writes or DDL, so they pass the read-only guard (Property 1).
 START_CONSISTENT_SNAPSHOT = "START TRANSACTION WITH CONSISTENT SNAPSHOT"
 SHOW_MASTER_STATUS = "SHOW MASTER STATUS"
+SHOW_BINARY_LOGS = "SHOW BINARY LOGS"
 COMMIT = "COMMIT"
 
 
@@ -417,13 +418,74 @@ class WatermarkCapturer:
             engine.dispose()
 
 
+def list_binary_logs(connection: _Connection) -> Optional[list[str]]:
+    """Return the binlog file names the source still retains (read-only).
+
+    ``SHOW BINARY LOGS`` lists only the logs that have **not** been purged. Returns
+    ``None`` -- meaning "unknown", never "empty" -- when the statement is
+    unavailable or the privilege is missing, so a caller can degrade to a warning
+    instead of wrongly claiming the log is gone. A :class:`ReadOnlySourceError` is
+    never suppressed.
+    """
+    try:
+        result = connection.execute(text(SHOW_BINARY_LOGS))
+        rows = result.mappings().all()
+    except ReadOnlySourceError:
+        raise
+    except Exception:  # noqa: BLE001 - optional diagnostic; degrade to "unknown"
+        return None
+    names: list[str] = []
+    for row in rows:
+        name = row.get("Log_name")
+        if name:
+            names.append(str(name))
+    return names
+
+
+def binlog_resume_gap_reason(
+    watermark_file: Optional[str], retained: Optional[list[str]]
+) -> Optional[str]:
+    """Why a gapless CDC resume from ``watermark_file`` is impossible, or ``None``.
+
+    The Full Load watermark pins the binlog coordinate CDC must resume from, but the
+    watermark is captured at Full Load **start** -- so a long load plus the ~15-20
+    min infrastructure create plus the connector create all elapse before Debezium
+    reads it. If the source purged that file in the meantime the gapless hand-off
+    (Property 11) is impossible: rows changed between the snapshot point and the new
+    log start are lost, and the only correct recovery is a re-snapshot.
+
+    Today that surfaces only as an undiagnosed connector ``CREATE_FAILED`` roughly
+    26 minutes into a billable create (MySQL error 1236, "could not find first log
+    file"), so checking it up front turns a dead end into an actionable message.
+
+    ``retained`` is ``None`` when the check could not run (statement unavailable /
+    privilege missing) -- treated as "unknown", which never blocks. Pure.
+    """
+    if not watermark_file or retained is None or not retained:
+        return None
+    if watermark_file in retained:
+        return None
+    return (
+        f"The Full Load watermark points at binary log '{watermark_file}', which the "
+        f"source no longer retains (oldest kept: '{retained[0]}'). A gapless resume "
+        "from the snapshot is no longer possible — changes made since then are not "
+        "in the remaining logs. Re-run the Full Load to take a fresh snapshot (and "
+        "raise the source's binlog retention first, e.g. "
+        "CALL mysql.rds_set_configuration('binlog retention hours', 168)), or start "
+        "CDC from a manual position and accept the gap."
+    )
+
+
 __all__ = [
     "WatermarkCapturer",
     "capture_watermark",
     "count_source_rows",
     "estimate_source_rows",
     "max_pk_source",
+    "list_binary_logs",
+    "binlog_resume_gap_reason",
     "START_CONSISTENT_SNAPSHOT",
     "SHOW_MASTER_STATUS",
+    "SHOW_BINARY_LOGS",
     "COMMIT",
 ]

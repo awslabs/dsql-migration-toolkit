@@ -30,7 +30,7 @@ No. DSQL speaks the **PostgreSQL** wire protocol, authenticates with short-lived
 and intentionally omits features that don't scale horizontally — **no foreign
 keys, no triggers/stored procedures, a per-transaction row limit, a 1 MiB
 per-value limit**, and more. Your schema and, in places, your application must
-adapt. Evaluation (step 2) tells you exactly where.
+adapt. Evaluation (step 1) tells you exactly where.
 
 
 **Q3. Should I run the tool locally or deploy it on AWS (ECS Fargate)?**
@@ -299,7 +299,7 @@ primary key on the source (or in your redesign) first.
 
 **Q22. How do I know the migration is correct?**
 
-Validation (step 5) gives you **evidence**, comparing source vs target in **three
+Validation (step 4) gives you **evidence**, comparing source vs target in **three
 increasingly strict passes** — each more precise (and more expensive) than the last.
 
 | Pass | What it checks | What it catches |

@@ -188,10 +188,10 @@ CloudFormation 파라미터에 대응합니다:
 > 동일 리전에 있어야 하며** 크로스 리전 마이그레이션은 **지원되지 않습니다.** 도구도 그 리전에서
 > 실행하세요.
 
-두 연결이 모두 정상이면 **Migration plan**을 고른 뒤 **Evaluation** 준비가 끝납니다 — 도구가 양쪽
-DB를 조사(introspect)해 호환성 리포트를 만듭니다. 이후 안내 흐름은 Schema Conversion, Data Migration(Full
-Load + CDC), Validation, 그리고 마지막으로 **Cut over**(애플리케이션을 DSQL로 전환하는 런북)로
-이어지며, 각각 다음 장에서 다룹니다.
+두 연결이 모두 정상이면 곧바로 **Evaluation**으로 넘어갑니다 — 도구가 양쪽
+DB를 조사(introspect)해 호환성 리포트를 만듭니다. 이후 안내 흐름은 Schema Conversion,
+Data Migration(여기서 Full Load만 할지 CDC를 추가할지 고르고 실행), Validation, 그리고 마지막으로
+**Cut over**(애플리케이션을 DSQL로 전환하는 런북)로 이어지며, 각각 다음 장에서 다룹니다.
 
 ---
 

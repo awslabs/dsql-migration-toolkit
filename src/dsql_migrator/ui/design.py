@@ -53,6 +53,16 @@ NOTICE_STYLE: dict[str, Tuple[str, str, str, str]] = {
     "error": ("bg-red-50", "border-red-200", "text-red-600", "error"),
 }
 
+# Quasar color name per tone, for the animated spinner a ``busy`` notice shows in
+# place of its static glyph. ``ui.spinner`` takes a Quasar color, not the Tailwind
+# text class in NOTICE_STYLE, so the two cannot share one value.
+_QUASAR_SPINNER_COLOR: dict[str, str] = {
+    "info": "primary",
+    "success": "positive",
+    "warning": "warning",
+    "error": "negative",
+}
+
 
 def render_notice(
     ui,
@@ -61,6 +71,7 @@ def render_notice(
     header: str,
     body: str = "",
     icon: str = "",
+    busy: bool = False,
 ) -> None:
     """Render an AWS Console (Cloudscape "Alert")-style notice box.
 
@@ -70,14 +81,31 @@ def render_notice(
     from :data:`NOTICE_STYLE` (unknown tones fall back to ``info``); ``icon``
     overrides the tone's default Material icon. ``body`` is optional so the box
     can be a single bold line.
+
+    ``busy`` marks the notice as reporting a **live, still-running** operation: the
+    leading glyph becomes an animated spinner and an "In progress" badge is pinned to
+    the right of the header. A static icon cannot distinguish "this is happening right
+    now" from "here is a fact", so a long background operation (a CDC teardown runs
+    ~15-45 min) read as an inert message the user could not tell was still moving.
     """
     bg, border, icon_color, default_icon = NOTICE_STYLE.get(tone, NOTICE_STYLE["info"])
     with ui.row().classes(
         f"items-start gap-2 no-wrap w-full rounded-md border {border} {bg} p-3"
     ):
-        ui.icon(icon or default_icon).classes(f"{icon_color} text-lg")
+        if busy:
+            # Quasar's spinner takes a Quasar color name, while the tone palette is a
+            # Tailwind text class ("text-sky-600"); map it to the closest Quasar color
+            # so the spinner still reads as part of the tone.
+            ui.spinner(size="sm", color=_QUASAR_SPINNER_COLOR.get(tone, "primary"))
+        else:
+            ui.icon(icon or default_icon).classes(f"{icon_color} text-lg")
         with ui.column().classes("gap-0 flex-1 min-w-0"):
-            ui.label(header).classes("text-sm font-semibold text-gray-900")
+            if busy:
+                with ui.row().classes("items-center gap-2 no-wrap w-full"):
+                    ui.label(header).classes("text-sm font-semibold text-gray-900")
+                    ui.badge("In progress", color="primary").props("outline")
+            else:
+                ui.label(header).classes("text-sm font-semibold text-gray-900")
             if body:
                 ui.label(body).classes("text-xs text-gray-700")
 

@@ -27,24 +27,26 @@ replication; otherwise Full Load alone is simpler and cheaper.
 ## 10.2 A recommended end-to-end flow
 
 1. **Connect** to source (read-only) and target (DSQL, IAM-token).
-2. **Migration plan** — decide only **whether this migration uses CDC (yes/no)**.
-   That single choice decides whether CDC streaming infrastructure is provisioned
-   early; the finer split (Full load + CDC vs. CDC only) is picked later on the
-   Data Migration step, and the choice is reversible.
-3. **Evaluation** — read the compatibility report. Resolve every **UNSUPPORTED**
+2. **Evaluation** — read the compatibility report. Resolve every **UNSUPPORTED**
    item (PK, triggers, routines, spatial types, precision > 38, oversized LOBs)
    and decide each **MANUAL** item (FK → app-side integrity, partitioning, etc.).
    *Don't skip this* — it's what turns "the load failed mysteriously" into "I knew
-   that object needed changing."
-4. **Schema Conversion** — review the source-vs-converted DDL and apply it to DSQL.
-5. **Data Migration** — **Full Load** bulk-copies the rows and captures the
+   that object needed changing." It is also where you learn whether CDC is viable
+   at all: cascading foreign keys never reach the binary log, so CDC cannot
+   replicate them.
+3. **Schema Conversion** — review the source-vs-converted DDL and apply it to DSQL.
+4. **Data Migration** — choose the migration type (**Full Load** only, or add
+   **CDC**) now that the report tells you what you are dealing with. Run the
+   prerequisite checks, then **Full Load** bulk-copies the rows and captures the
    watermark (check the error log: quarantined rows are expected, e.g. oversized
-   values, or actionable). For a live cut-over, optionally start **CDC** from that
-   watermark and watch the target converge.
-6. **Validation** — run row-count + checksum (+ reconcile before cut-over). The
+   values, or actionable). For a CDC type, deploy the streaming infrastructure from
+   the Prerequisites sub-step **before** starting the load, so its ~15–20 min create
+   overlaps the snapshot; then start **CDC** from that watermark and watch the target
+   converge.
+5. **Validation** — run row-count + checksum (+ reconcile before cut-over). The
    verdict is **MATCH** only when every difference is explained (drift, intentional
    quarantine, not-yet-converged CDC).
-7. **Cut over** — once Validation is a clean MATCH, switch your application to
+6. **Cut over** — once Validation is a clean MATCH, switch your application to
    DSQL. This is the one step the tool does not perform for you; follow the
    tailored runbook (§10.3 below).
 

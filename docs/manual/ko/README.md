@@ -19,10 +19,10 @@ _언어: [English](../en/README.md) | **한국어** | [日本語](../ja/README.m
 
 **이종(heterogeneous) 마이그레이션을 결정론(deterministic) 우선 방식으로** 수행하는 **웹 도구**(및
 임포트 가능한 엔진)입니다: MySQL → PostgreSQL 방언 → DSQL 제약. **소스는 항상 읽기 전용**입니다.
-마이그레이션은 **Connect**를 사전 단계로 두는 6단계 안내 흐름입니다:
+마이그레이션은 **Connect**를 사전 단계로 두는 5단계 안내 흐름입니다:
 
 ```
-Connect → 1. Migration plan → 2. Evaluation → 3. Schema Conversion → 4. Data Migration → 5. Validation → 6. Cut over
+Connect → 1. Evaluation → 2. Schema Conversion → 3. Data Migration → 4. Validation → 5. Cut over
 ```
 
 Data Migration은 **Full Load**(도구 자체의 벌크 로더)와, 선택적으로 스트리밍 **CDC**(거의 무중단

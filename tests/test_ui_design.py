@@ -62,6 +62,11 @@ class _RecordingUi:
         self.icons: list[str] = []
         self.classes: list[str] = []
         self.props: list[str] = []
+        self.spinner_colors: list[str] = []
+
+    def spinner(self, *_a, color=None, **_k):
+        self.spinner_colors.append(str(color))
+        return _El(self, "spinner")
 
     def row(self, *_a, **_k):
         return _El(self, "row")
@@ -207,6 +212,43 @@ def test_render_notice_body_optional() -> None:
     ui = _RecordingUi()
     render_notice(ui, tone="info", header="Header only")
     assert ui.texts == ["Header only"]
+
+
+def test_render_notice_busy_swaps_the_glyph_for_a_spinner_and_badge() -> None:
+    # A static icon cannot distinguish "this is happening right now" from "here is a
+    # fact", so a notice reporting a long-running background operation (a CDC teardown
+    # runs ~15-45 min) marks itself busy: animated spinner + "In progress" badge.
+    ui = _RecordingUi()
+    render_notice(ui, tone="info", header="Teardown in progress", body="~15-45 min.")
+    assert ui.spinner_colors == []          # not busy -> no spinner
+    assert NOTICE_STYLE["info"][3] in ui.icons
+
+    busy = _RecordingUi()
+    render_notice(
+        busy, tone="info", header="Teardown in progress", body="~15-45 min.", busy=True
+    )
+    assert busy.spinner_colors == ["primary"]  # tone -> Quasar color
+    assert busy.icons == []                    # the spinner REPLACES the static glyph
+    assert "In progress" in busy.texts
+    assert "Teardown in progress" in busy.texts
+    assert "~15-45 min." in busy.texts
+
+
+def test_render_notice_busy_spinner_color_follows_the_tone() -> None:
+    # ui.spinner takes a Quasar color name, while NOTICE_STYLE holds a Tailwind text
+    # class -- so the mapping is explicit and must cover every tone.
+    from dsql_migrator.ui.design import _QUASAR_SPINNER_COLOR
+
+    assert set(_QUASAR_SPINNER_COLOR) == set(NOTICE_STYLE)
+    for tone, expected in _QUASAR_SPINNER_COLOR.items():
+        ui = _RecordingUi()
+        render_notice(ui, tone=tone, header="x", busy=True)
+        assert ui.spinner_colors == [expected], tone
+
+    # An unknown tone still renders (falls back like the palette does).
+    unknown = _RecordingUi()
+    render_notice(unknown, tone="bogus", header="x", busy=True)
+    assert unknown.spinner_colors == ["primary"]
 
 
 # ---------------------------------------------------------------------------

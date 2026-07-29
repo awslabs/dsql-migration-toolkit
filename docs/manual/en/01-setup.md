@@ -211,10 +211,10 @@ them.
 > available, but **source and target must be in the same region** — cross-region
 > migration is **not** supported. Run the tool in that region too.
 
-Once both connections test green, you choose your **Migration plan** and move on
-to **Evaluation** — the tool introspects both databases and produces a
-compatibility report. From there the guided flow continues through Schema
-Conversion, Data Migration (Full Load + CDC), Validation, and finally **Cut over**
+Once both connections test green you move on to **Evaluation** — the tool
+introspects both databases and produces a compatibility report. From there the
+guided flow continues through Schema Conversion, Data Migration (where you choose
+Full Load only or add CDC, and run it), Validation, and finally **Cut over**
 (the runbook for switching your application to DSQL), each covered in the
 following chapters.
 

@@ -29,10 +29,10 @@ DSQL** へ移行するためのガイド付きマニュアルです。本書は�
 **異種（heterogeneous）かつ決定論（deterministic）優先の移行**を実行する **Web ツール**
 （およびインポート可能なエンジン）です。つまり MySQL → PostgreSQL 方言 → DSQL 制約という
 流れで変換します。**ソースは常に読み取り専用**です。移行は **Connect** を事前ステップと
-する 6 ステップのガイド付きフローです。
+する 5 ステップのガイド付きフローです。
 
 ```
-Connect → 1. Migration plan → 2. Evaluation → 3. Schema Conversion → 4. Data Migration → 5. Validation → 6. Cut over
+Connect → 1. Evaluation → 2. Schema Conversion → 3. Data Migration → 4. Validation → 5. Cut over
 ```
 
 Data Migration は **Full Load**（ツール独自のバルクローダー）と、任意で行うストリーミング

@@ -1,12 +1,12 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Four-step migration workflow shell (stepper) and its pure logic.
+"""Five-step migration workflow shell (stepper) and its pure logic.
 
-The migration is organized into four top-level steps shown to the user as a
+The migration is organized into five top-level steps shown to the user as a
 stepper (Connect is the preliminary step handled in ``connect.py``):
 
-    Evaluation -> Schema Conversion -> Data Migration -> Validation
+    Evaluation -> Schema Conversion -> Data Migration -> Validation -> Cut over
 
 Each step's status (NOT_STARTED / IN_PROGRESS / DONE / FAILED) is tracked in a
 per-session :class:`~dsql_migrator.core.models.WorkflowState` and displayed on
@@ -66,9 +66,13 @@ class WorkflowStep(str, Enum):
     be read/written by attribute name.
     """
 
-    # The first post-Connect step: choose the migration pattern (Full / CDC /
-    # Full+CDC) and, when CDC is involved, kick off the cdc-stack infra deploy
-    # early so MSK is warm by the time Start CDC runs ("provision early").
+    # RETIRED as a nav step. It asked "Include CDC?" before Evaluation had produced
+    # any evidence to decide on, and duplicated the migration-type selector that
+    # Data Migration already owns; the CDC-infra deploy it offered now lives on Data
+    # Migration's Prerequisites sub-step, where the table set is confirmed and the
+    # ~15-20 min MSK create can overlap the Full Load. The member (and its
+    # WorkflowState field) is KEPT so older persisted snapshots -- which name it --
+    # still load, mirroring the deprecated ``DATA_MIGRATION`` alias below.
     MIGRATION_PLAN = "migration_plan"
     EVALUATION = "evaluation"
     SCHEMA_CONVERSION = "schema_conversion"
@@ -121,10 +125,7 @@ class OptionalTool:
 # Validation depends on that step having run. Connect is the precondition for
 # Evaluation and is handled separately by the page.
 _STEP_DEFINITIONS: tuple[StepDefinition, ...] = (
-    StepDefinition(WorkflowStep.MIGRATION_PLAN, "Migration plan", None),
-    StepDefinition(
-        WorkflowStep.EVALUATION, "Evaluation", WorkflowStep.MIGRATION_PLAN
-    ),
+    StepDefinition(WorkflowStep.EVALUATION, "Evaluation", None),
     StepDefinition(
         WorkflowStep.SCHEMA_CONVERSION, "Schema Conversion", WorkflowStep.EVALUATION
     ),
@@ -148,6 +149,14 @@ _DEFINITION_BY_STEP[WorkflowStep.DATA_MIGRATION] = StepDefinition(
 )
 _DEFINITION_BY_STEP[WorkflowStep.CDC] = StepDefinition(
     WorkflowStep.CDC, "Data Migration", WorkflowStep.SCHEMA_CONVERSION
+)
+# The retired Migration plan step: a restored session can still name it (a stored
+# ``active_view``, or a persisted status), so ``step_title``/``prerequisite`` must
+# keep resolving instead of raising KeyError. It is deliberately absent from
+# ``_STEP_DEFINITIONS``, so it never appears in the nav / stepper and is never
+# reachable via previous_step/next_step.
+_DEFINITION_BY_STEP[WorkflowStep.MIGRATION_PLAN] = StepDefinition(
+    WorkflowStep.MIGRATION_PLAN, "Migration plan", None
 )
 
 # Steps whose prerequisite is satisfied when ANY of the listed steps is DONE
@@ -835,7 +844,7 @@ def _render_migration_diagram(
 def _migration_type_meta(state: "object"):
     """Return (label, icon, blurb) for the session's chosen migration type.
 
-    Read-only: the type is chosen on Migration Plan; every later step shows it for
+    Read-only: the type is chosen on Data Migration; every step shows it for
     continuity. Imported lazily to avoid a circular import (data_migration imports
     workflow). Falls back to a neutral label if the metadata can't be resolved.
     """
@@ -862,16 +871,15 @@ def _render_journey_header(
     Two unified bands, identical on all steps so the flow reads as a single guided
     journey rather than separate screens:
 
-    1. A horizontal progress stepper (Plan -> Evaluation -> Schema -> Migration ->
-       Validation) with each step's real status icon/color and the current step
-       highlighted; clicking a step navigates to it (the sidebar's lock rules still
-       apply via ``select``).
-    2. A compact migration-type banner showing the type chosen on Migration Plan,
-       so the choice stays visible through the whole flow. It is omitted ON the
-       Migration Plan step itself, where the "Include CDC?" decision control right
-       below it is the source of truth -- showing both the three-value banner
-       ("Full load + CDC") and the two-value decision (Include CDC? Yes/No) on the
-       same screen is redundant and reads as conflicting.
+    1. A horizontal progress stepper (Evaluation -> Schema -> Migration ->
+       Validation -> Cut over) with each step's real status icon/color and the
+       current step highlighted; clicking a step navigates to it (the sidebar's lock
+       rules still apply via ``select``).
+    2. A compact migration-type banner showing the type chosen on Data Migration, so
+       the choice stays visible through the whole flow. Now shown on EVERY step: the
+       retired Migration plan step was the one screen that had to suppress it (its
+       two-value "Include CDC?" control contradicted the three-value banner), so with
+       that gone the header is finally identical everywhere.
     """
     steps = ordered_steps()
     # Band 1: the journey stepper.
@@ -907,13 +915,9 @@ def _render_journey_header(
             if index < len(steps) - 1:
                 ui.icon("chevron_right", color="grey-5").classes("text-sm")  # type: ignore[attr-defined]
 
-    # Band 2: the migration-type banner (the choice made on Migration Plan).
-    # Skipped ON the Migration Plan step: its "Include CDC?" control below is the
-    # authoritative input there, so a "Migration type: Full load + CDC" banner
-    # right above a "Include CDC? Yes/No" picker is redundant/conflicting. Every
-    # later step still shows it for continuity.
-    if current_step is WorkflowStep.MIGRATION_PLAN:
-        return
+    # Band 2: the migration-type banner (the choice made on Data Migration). Shown on
+    # every step -- the retired Migration plan step was the sole exception, because its
+    # two-value "Include CDC?" control read as conflicting with the three-value banner.
     # Layout: icon + "Migration type:" + the type name stay together on one line
     # (no-wrap), and the description wraps fully onto following lines (never
     # truncated/cut off). items-start so the icon aligns to the first line when
@@ -953,17 +957,17 @@ def reconnect_notice(state: "object") -> Optional[str]:
     workflow = getattr(state, "workflow", None)
     if workflow is None:
         return None
-    # "Progressed" is broader than just a started workflow step: choosing a
-    # migration plan, deploying CDC infrastructure (cdc-stack), or being parked on
-    # a non-Connect view all mean there is real restored work to resume -- even
-    # when every workflow step is still NOT_STARTED (e.g. CDC infra was deployed
-    # from the Migration plan step before any step ran).
+    # "Progressed" is broader than just a started workflow step: choosing a CDC
+    # migration type, deploying CDC infrastructure (cdc-stack), or being parked on a
+    # non-Connect view all mean there is real restored work to resume -- even when
+    # every workflow step is still NOT_STARTED (e.g. CDC infra was deployed from the
+    # Data Migration step's Prerequisites sub-step before any step completed).
     step_progressed = any(
         getattr(workflow, step.value) != "NOT_STARTED" for step in WorkflowStep
     )
     active_view = getattr(state, "active_view", None)
     parked_past_connect = bool(active_view) and active_view != "connect"
-    # A chosen migration plan that includes CDC is restorable work. Normalize the
+    # A chosen migration type that includes CDC is restorable work. Normalize the
     # value (enum or string) and only count the non-default CDC modes -- the
     # full-load-only default is not, by itself, "progress" to resume.
     mt = getattr(state, "migration_type", None)
@@ -980,8 +984,8 @@ def reconnect_notice(state: "object") -> Optional[str]:
     )
     if progressed and not connected:
         return (
-            "Reconnected — your previous progress was restored (your migration "
-            "plan, any deployed CDC infrastructure, and the step you were on). "
+            "Reconnected — your previous progress was restored (your migration type, "
+            "any deployed CDC infrastructure, and the step you were on). "
             "Re-verify the source and target connections on the Connect step to "
             "resume exactly where you left off; nothing already done is lost."
         )
@@ -997,9 +1001,9 @@ def _start_over_cdc_warning(
     """Return a caution when resetting would orphan deployed CDC infrastructure.
 
     Resetting clears only the tool's session/workbench, NOT any AWS resources. If
-    the session shows signs of a deployed cdc-stack (a chosen CDC plan + entered
-    infra inputs), warn the operator to tear it down FIRST via the CDC step's
-    Delete action -- otherwise MSK/NAT keep billing with no session pointing at
+    the session shows signs of a deployed cdc-stack (entered infra inputs, or a
+    non-default stack name), warn the operator to tear it down FIRST via the CDC
+    step's Delete action -- otherwise MSK/NAT keep billing with no session pointing at
     them. Returns ``None`` when there is nothing at risk.
 
     ``cdc_confirmed_absent`` short-circuits to ``None``: when a fresh live probe has
@@ -1019,18 +1023,21 @@ def _start_over_cdc_warning(
     """
     if cdc_confirmed_absent:
         return None
-    mt = getattr(state, "migration_type", None)
-    mt_value = getattr(mt, "value", mt)
-    chose_cdc = mt_value in ("cdc_only", "full_load_and_cdc")
-    infra_getter = getattr(state, "cdc_infra_inputs", None)
-    has_infra = bool(infra_getter()) if callable(infra_getter) else False
-    if not (chose_cdc and has_infra):
-        return None
-    # A custom (non-default) stack name will NOT be re-discovered by a fresh
-    # session (which reverts to the default name), so surface it explicitly.
+    # Entered infra inputs are the real signal that infrastructure may exist, so they
+    # alone are enough. Previously this ALSO required the migration type to still name
+    # a CDC mode -- but the type is freely switchable, so a user who deployed MSK and
+    # then flipped back to Full-load-only got NO warning and could silently orphan a
+    # billing cluster. A known non-default stack name is likewise sufficient: a fresh
+    # session only re-discovers the DEFAULT name, so that is the case most at risk.
     from dsql_migrator.core.cdc import CDC_DEFAULT_STACK_NAME
 
-    if cdc_stack_name and cdc_stack_name != CDC_DEFAULT_STACK_NAME:
+    infra_getter = getattr(state, "cdc_infra_inputs", None)
+    has_infra = bool(infra_getter()) if callable(infra_getter) else False
+    custom_stack = bool(cdc_stack_name) and cdc_stack_name != CDC_DEFAULT_STACK_NAME
+    if not (has_infra or custom_stack):
+        return None
+
+    if custom_stack:
         return (
             "Heads up: if you deployed CDC infrastructure, resetting does NOT delete "
             f"it — MSK/NAT keep billing. This session uses a custom cdc-stack named "
@@ -1287,16 +1294,29 @@ _TEARDOWN_BANNER_POLL_SECONDS = 10.0
 def _cdc_teardown_banner_copy(
     info: "Optional[dict]",
 ) -> "Optional[tuple[str, str, str]]":
-    """Map teardown-banner info to ``(tone, header, body)``, or ``None`` when nothing
-    is in flight. Pure/side-effect-free so the copy is unit-testable independent of
-    the render+poll wrapper. ``info`` is ``{"state": "running"|"failed", "kind":
-    "stop"|"delete", "stack": <name>}``.
+    """Map CDC-lifecycle banner info to ``(tone, header, body)``, or ``None`` when
+    nothing is in flight. Pure/side-effect-free so the copy is unit-testable
+    independent of the render+poll wrapper. ``info`` is ``{"state":
+    "running"|"failed", "kind": "stop"|"delete"|"infra", "stack": <name>}``.
     """
     if not info:
         return None
     state = info.get("state", "running")
     kind = info.get("kind")
     stack = info.get("stack") or "the cdc-stack"
+    if kind == "infra" and state != "failed":
+        # An infrastructure create is the one CDC operation the user is meant to walk
+        # AWAY from: it takes ~15-20 min and is supposed to overlap the Full Load. So
+        # it needs a cross-view banner too -- otherwise, having left the Data
+        # Migration screen, the user has no way to tell it is still running and waits
+        # on it instead of starting the snapshot.
+        return (
+            "info",
+            "CDC infrastructure is deploying in the background",
+            f"Provisioning '{stack}' (Amazon MSK, ~15–20 min). Nothing is streaming "
+            "yet, so this does not block the Full Load — start it now and let the two "
+            "run together. This banner clears itself when the deploy finishes.",
+        )
     if state == "failed":
         return (
             "error",
@@ -1359,7 +1379,13 @@ def _render_cdc_teardown_banner(
             return  # nothing in flight (or just settled) → render nothing, stop polling
         tone, header, body = copy
         state = (info or {}).get("state", "running")
-        render_notice(ui, tone=tone, header=header, body=body)
+        # A running teardown/deploy is a LIVE operation that takes ~15-45 min, so mark
+        # the notice busy: an animated spinner + "In progress" badge make it obvious the
+        # work is still moving. With only a static icon the banner read as an inert
+        # message, and the user could not tell whether it had stalled.
+        render_notice(
+            ui, tone=tone, header=header, body=body, busy=(state != "failed")
+        )
         if state == "failed":
             # Actionable, terminal-until-acted: retry re-launches the teardown (the
             # getter then reports "running" again); dismiss clears the marker. No poll.
@@ -1851,19 +1877,6 @@ def build_workflow_sidebar(
                 """
                 if following is None:
                     return
-                if step is WorkflowStep.MIGRATION_PLAN:
-                    # The migration plan is a choice, not a job — there is nothing
-                    # to "Run". The Next button confirms the plan (marks the step
-                    # DONE so Evaluation unlocks) and advances in one click.
-                    def _confirm_and_advance(s=following) -> None:
-                        _make_runner(step)()  # runner marks the step DONE + refresh
-                        select(s)
-
-                    ui.button(
-                        f"Next: {step_title(following)}",
-                        on_click=_confirm_and_advance,
-                    ).props("color=primary")
-                    return
                 next_button = ui.button(
                     f"Next: {step_title(following)}",
                     on_click=lambda s=following: select(s),
@@ -1905,14 +1918,11 @@ def build_workflow_sidebar(
                     # Every other step keeps the top Run/Re-run from the start.
                     # Cut over has no job to run (it's an operational step the
                     # operator performs); it is acknowledged from in-content, so it
-                    # never shows a top Run/Re-run button — like Migration plan.
+                    # never shows a top Run/Re-run button.
                     hide_top_run = (
                         step is WorkflowStep.EVALUATION
                         and status is StepStatus.NOT_STARTED
-                    ) or step in (
-                        WorkflowStep.MIGRATION_PLAN,
-                        WorkflowStep.CUT_OVER,
-                    )
+                    ) or step is WorkflowStep.CUT_OVER
                     if not hide_top_run:
                         run_button = ui.button(
                             run_label, on_click=_make_runner(step)

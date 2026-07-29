@@ -839,7 +839,7 @@ def _migration_type_label(session: object) -> str:
     """Return the chosen migration type's human label (e.g. 'Full load + CDC').
 
     Resolved via the Data Migration metadata so the Validation card names the same
-    pattern the user picked on Migration Plan. Lazily imported (data_migration
+    pattern the user picked on Data Migration. Lazily imported (data_migration
     imports nothing from here, but keeps this module import-light) and degrades to
     a neutral label if it cannot be resolved.
     """

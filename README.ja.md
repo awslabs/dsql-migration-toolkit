@@ -63,19 +63,18 @@ PostgreSQL 方言、続いて PostgreSQL → DSQL の制約（外部キー非対
 
 ## ワークフロー
 
-Web UI は、**Connect** を予備ステップとして 6 ステップを案内します。
+Web UI は、**Connect** を予備ステップとして 5 ステップを案内します。
 
-`Connect → Migration plan → Evaluation → Schema Conversion → Data Migration → Validation → Cut over`
+`Connect → Evaluation → Schema Conversion → Data Migration → Validation → Cut over`
 
 | ステップ | 内容 |
 | --- | --- |
 | Connect | ソース（RDS/Aurora MySQL）とターゲット（Aurora DSQL）の接続情報を入力。認証情報はセッションごとのメモリに保持され、セッション終了時に破棄。 |
-| 1. Migration plan | **この移行で CDC を使うか** だけを決めます。この選択はストリーミングインフラを早期にプロビジョニングするかどうかのみを左右し、取り消し可能です（Full-Load のみで開始して後から CDC を追加可能）。 |
-| 2. Evaluation | ソース **と** ターゲットをイントロスペクトし、互換性レポート（`AUTO`/`MANUAL`/`UNSUPPORTED`）を生成。工数見積もり・名前の競合検出・任意の AI 戦略を含む。 |
-| 3. Schema Conversion | オブジェクトを閲覧し、ソースと変換後の DDL を並べて表示、ターゲットに適用（SKIP / REPLACE）。冪等リトライを含む。 |
-| 4. Data Migration | 前提条件チェックとテーブル選択の後、**Full Load**（ウォーターマーク → エクスポート → ロード、テーブルごとの進捗 + エラーログ）。任意で **CDC**（別途の cdc-stack）へ拡張。 |
-| 5. Validation | ウォーターマーク時点のソースとターゲットを比較 — 行数/チェックサムの結果とドリフトを報告し、レポートをエクスポート。 |
-| 6. Cut over | Validation 通過後にアプリを MySQL → DSQL へ切り替える運用ランブック — ツールが代わりに実行しない唯一のステップ。MySQL ソースはロールバックのアンカーとして保持。 |
+| 1. Evaluation | ソース **と** ターゲットをイントロスペクトし、互換性レポート（`AUTO`/`MANUAL`/`UNSUPPORTED`）を生成。工数見積もり・名前の競合検出・任意の AI 戦略を含む。 |
+| 2. Schema Conversion | オブジェクトを閲覧し、ソースと変換後の DDL を並べて表示、ターゲットに適用（SKIP / REPLACE）。冪等リトライを含む。 |
+| 3. Data Migration | 移行タイプ（**Full Load** のみ、または **CDC** を追加）を選び、前提条件チェックとテーブル選択の後にスナップショットを実行（ウォーターマーク → エクスポート → ロード、テーブルごとの進捗 + エラーログ）。CDC タイプではストリーミングインフラもここでデプロイされるため、約 15〜20 分の作成が Full Load と **並行して** 進みます。 |
+| 4. Validation | ウォーターマーク時点のソースとターゲットを比較 — 行数/チェックサムの結果とドリフトを報告し、レポートをエクスポート。 |
+| 5. Cut over | Validation 通過後にアプリを MySQL → DSQL へ切り替える運用ランブック — ツールが代わりに実行しない唯一のステップ。MySQL ソースはロールバックのアンカーとして保持。 |
 
 各ステップは状態（未開始 / 進行中 / 完了 / 失敗）を表示し、独立して実行/再実行できます。
 機能単位の詳細は [ユーザーマニュアル](docs/manual/ja/README.md) にあります。
@@ -127,7 +126,7 @@ Public イメージを使用）、ツールが **VPC 内** の単一タスクの
 
 <p align="center">
   <b>Console (UI)</b><br>
-  <img src="docs/demo-ui.gif" alt="UIデモ — 6ステップガイド付きマイグレーションワークフロー" width="720">
+  <img src="docs/demo-ui.png" alt="ツールの UI — ガイド付き 5 ステップの移行ワークフロー" width="720">
 </p>
 
 ---
@@ -230,7 +229,7 @@ MSK Connect *上で* 動作するオープンソースソフトウェアです�
 | ドキュメント | 内容 |
 |---|---|
 | [**デプロイガイド**](deploy/DEPLOYMENT.ja.md) | ローカルはコマンド 1 つ、または ECS Fargate へデプロイ（AWS Console または CLI）— 前提条件、パラメータ、カスタムドメイン / Cognito / AI アシスト、ティアダウン、トラブルシューティング。 |
-| [**ユーザーマニュアル**](docs/manual/) | 6 ステップの移行をステップバイステップで解説 — さらに**性能チューニング & 実測テスト結果**、テスト / 検証、**お客様向け FAQ** を含む。 |
+| [**ユーザーマニュアル**](docs/manual/) | 5 ステップの移行をステップバイステップで解説 — さらに**性能チューニング & 実測テスト結果**、テスト / 検証、**お客様向け FAQ** を含む。 |
 | [**アーキテクチャ**](#アーキテクチャ) | 構成要素と動作 + AWS・CDC パイプライン図（`deploy/architecture-*.png`）。 |
 | [**変更履歴**](CHANGELOG.ja.md) | リリースごとの変更（セマンティックバージョニング）。 |
 

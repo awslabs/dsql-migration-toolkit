@@ -60,7 +60,7 @@ resources to create.** Great for a first look, evaluation, and smaller migration
 before deciding on Fargate.
 
 <div align="center">
-  <img src="../docs/demo-ui.gif" alt="The tool's UI — guided 6-step migration workflow" width="560">
+  <img src="../docs/demo-ui.png" alt="The tool's UI — the guided five-step migration workflow" width="560">
 </div>
 
 The UI runs on your own machine (browser → `127.0.0.1:8080`), and **the migration
@@ -296,8 +296,8 @@ otherwise the task can't pull its image or reach DSQL and fails to start. → **
 
 **7. Open it — you should see the tool.** Browse `AppUrl` in a browser (from
    inside the VPC). The **MySQL → Aurora DSQL Migration Tool** UI loads — the
-   guided workflow starting at **Connect** (Connect → Migration plan → Evaluation
-   → Schema Conversion → Data Migration → Validation → Cut over). If it loads, the
+   guided workflow starting at **Connect** (Connect → Evaluation → Schema
+   Conversion → Data Migration → Validation → Cut over). If it loads, the
    deployment is done; enter your source DB credentials at **Connect** to begin.
 
 > **▶ Next: run your first migration.** Deployment ends here — the UI is up. For
@@ -390,8 +390,8 @@ Key outputs: `LoadBalancerDns`, `AppUrl`, `ClusterName`, `ServiceName`,
 
 Open **`AppUrl`** in a browser (from inside the VPC). The **MySQL → Aurora DSQL
 Migration Tool** UI loads — the guided workflow starting at **Connect** (Connect
-→ Migration plan → Evaluation → Schema Conversion → Data Migration → Validation →
-Cut over). Seeing the UI means the deployment succeeded; enter your source DB
+→ Evaluation → Schema Conversion → Data Migration → Validation → Cut
+over). Seeing the UI means the deployment succeeded; enter your source DB
 credentials at **Connect** to begin.
 
 ### Parameter reference
@@ -475,8 +475,8 @@ aws logs tail /ecs/mysql-dsql-migrator-mysql-dsql-migrator --follow --region "$A
 
 Then open `https://AppDomainName/` from a host inside the allowed network
 (`AllowedIngressCidr`). You should be redirected to Cognito sign-in (if enabled)
-and then to the migration workflow (Connect → Migration plan → Evaluation →
-Schema Conversion → Data Migration → Validation → Cut over).
+and then to the migration workflow (Connect → Evaluation → Schema
+Conversion → Data Migration → Validation → Cut over).
 
 #### Observability & runtime diagnostics
 
