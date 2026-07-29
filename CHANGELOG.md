@@ -68,7 +68,9 @@ All notable changes to this project are recorded here. This project follows
   snapshots in the reference session store still load unchanged.
 - A session **parked on the retired step** is redirected to Evaluation on restore
   (8 of those 19 were), instead of silently falling back to the Connect screen.
-- The presentation decks (`docs/tech-talk-*`) have been removed from the repository.
+- The presentation decks (`docs/tech-talk-*`, `docs/full-load-cdc-slides-*`) have
+  been removed from the repository; `docs/` now holds only the user manual and the
+  UI screenshot.
 - The README/deployment screenshot is now a **static PNG** (`docs/demo-ui.png`),
   recaptured on the five-step UI. The previous animated GIF baked the retired
   six-step sidebar — and a stale version chip — into its frames.

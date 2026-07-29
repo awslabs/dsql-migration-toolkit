@@ -110,6 +110,3 @@ scripts/*
 # Local performance measurement outputs (not published)
 perf-runs/
 
-# Rendered deck outputs (build artifacts; keeps a local Marp render out of git)
-docs/*-slides-*.html
-docs/*-slides-*.pdf
