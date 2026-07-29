@@ -5,6 +5,26 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.156
+
+### Fixed
+
+- **A stray apostrophe in the CDC template made every CDC deploy fail — and left the
+  failed stack needing manual cleanup.** The inline HTTPS-egress rule on
+  `ConnectorSecurityGroup` described itself as reaching S3 "via the *customer's* own NAT".
+  EC2 accepts only `a-zA-Z0-9` and `. _-:/()#,@[]+=&;{}!$*` in a security-group **rule**
+  description — the apostrophe is not in that set, and the set is narrower than the
+  free-form text allowed in `Parameters` and resource descriptions elsewhere in the same
+  template, so it read as perfectly normal prose. The result (observed on
+  `mysql-dsql-cdc-stack-0729`) was `ConnectorSecurityGroup CREATE_FAILED - Invalid rule
+  description`, which rolled the stack back — and the rollback itself then hit
+  `ROLLBACK_FAILED`, because the two `CustomPlugin` resources were still `CREATING` and
+  MSK Connect refuses to delete a plugin in that state. So a single character cost a
+  manual stack cleanup rather than a simple retry. The description is reworded, and two
+  tests now validate every security-group rule description in the template — inline rules
+  and standalone `AWS::EC2::SecurityGroup{Ingress,Egress}` resources alike — against EC2's
+  character set and its 255-character limit, so the next one cannot reach a deploy.
+
 ## v0.1.155
 
 ### Fixed

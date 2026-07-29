@@ -789,3 +789,100 @@ def test_partition_tier_params_and_template_group_blocks_agree() -> None:
     for key in ("TopicCreationGroups",):
         assert f"\n  {key}:" in template, key
 
+
+
+# EC2 accepts only these characters in a security-group RULE description (this is
+# narrower than the free-form text allowed elsewhere in the template -- notably it
+# excludes the apostrophe), max 255 chars.
+_SG_RULE_DESCRIPTION_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    " ._-:/()#,@[]+=&;{}!$*"
+)
+
+
+def _load_cdc_template():
+    """Parse cdc-stack.yaml tolerantly (Fn:: long form plus occasional short tags)."""
+    import pathlib
+
+    import pytest
+
+    yaml = pytest.importorskip("yaml")
+
+    class _L(yaml.SafeLoader):
+        pass
+
+    def _any(loader, suffix, node):
+        if isinstance(node, yaml.ScalarNode):
+            return loader.construct_scalar(node)
+        if isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node)
+        return loader.construct_mapping(node)
+
+    _L.add_multi_constructor("!", _any)
+    path = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "deploy" / "cdc-stack" / "cdc-stack.yaml"
+    )
+    return yaml.load(path.read_text(encoding="utf-8"), Loader=_L)
+
+
+def _security_group_rule_descriptions() -> list[tuple[str, str]]:
+    """Every SG rule Description in the template, as ``(resource_name, text)``.
+
+    Covers both shapes: inline ``SecurityGroupIngress``/``SecurityGroupEgress`` lists on
+    an ``AWS::EC2::SecurityGroup``, and standalone
+    ``AWS::EC2::SecurityGroup{Ingress,Egress}`` resources.
+    """
+    doc = _load_cdc_template()
+    found: list[tuple[str, str]] = []
+    for name, resource in doc["Resources"].items():
+        kind = resource.get("Type")
+        props = resource.get("Properties") or {}
+        if kind == "AWS::EC2::SecurityGroup":
+            for key in ("SecurityGroupIngress", "SecurityGroupEgress"):
+                for rule in props.get(key) or []:
+                    if isinstance(rule, dict) and isinstance(
+                        rule.get("Description"), str
+                    ):
+                        found.append((f"{name}.{key}", rule["Description"]))
+        elif kind in (
+            "AWS::EC2::SecurityGroupIngress",
+            "AWS::EC2::SecurityGroupEgress",
+        ):
+            if isinstance(props.get("Description"), str):
+                found.append((name, props["Description"]))
+    return found
+
+
+def test_security_group_rule_descriptions_use_only_characters_ec2_accepts() -> None:
+    """A stray apostrophe in a rule description fails the whole CDC deploy.
+
+    Observed on mysql-dsql-cdc-stack-0729: "customer's own NAT" in the inline 443 egress
+    description made ConnectorSecurityGroup CREATE_FAILED with *"Invalid rule
+    description"*, which rolled the stack back -- and the rollback itself then hit
+    ROLLBACK_FAILED, because the two CustomPlugins were still CREATING and MSK Connect
+    refuses to delete a plugin in that state. So one bad character costs a manual
+    cleanup, not just a retry. EC2's accepted set here is narrower than the free-form
+    text allowed in Parameter/resource descriptions elsewhere in this template.
+    """
+    descriptions = _security_group_rule_descriptions()
+    # Guard the guard: if the scan finds nothing, the test would pass vacuously.
+    assert len(descriptions) >= 5, descriptions
+
+    offenders = {
+        name: sorted(set(text) - _SG_RULE_DESCRIPTION_CHARS)
+        for name, text in descriptions
+        if set(text) - _SG_RULE_DESCRIPTION_CHARS
+    }
+    assert not offenders, f"disallowed characters in SG rule descriptions: {offenders}"
+
+
+def test_security_group_rule_descriptions_are_within_the_length_limit() -> None:
+    # EC2 caps a rule description at 255 characters; a long wrapped YAML block scalar
+    # can cross that without looking long in the source.
+    too_long = {
+        name: len(text)
+        for name, text in _security_group_rule_descriptions()
+        if len(text) > 255
+    }
+    assert not too_long, f"SG rule descriptions over 255 chars: {too_long}"

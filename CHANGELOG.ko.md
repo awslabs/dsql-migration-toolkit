@@ -5,6 +5,24 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.156
+
+### Fixed
+
+- **CDC 템플릿의 아포스트로피 하나 때문에 CDC 배포가 매번 실패하고, 실패한 스택은 수동 정리가
+  필요한 상태로 남았습니다.** `ConnectorSecurityGroup`의 인라인 HTTPS egress 규칙 설명에 S3에
+  도달하는 경로를 "via the *customer's* own NAT"로 적어두었습니다. EC2는 보안 그룹 **규칙**
+  설명에 `a-zA-Z0-9`와 `. _-:/()#,@[]+=&;{}!$*`만 허용하는데 아포스트로피는 여기에 없습니다.
+  더구나 이 문자 집합은 같은 템플릿의 `Parameters`나 리소스 설명에 허용되는 자유 텍스트보다
+  좁아서, 문장으로는 전혀 이상해 보이지 않았습니다. 그 결과(`mysql-dsql-cdc-stack-0729`에서
+  확인) `ConnectorSecurityGroup CREATE_FAILED - Invalid rule description`으로 스택이
+  롤백되었고, 롤백마저 `ROLLBACK_FAILED`가 되었습니다 — `CustomPlugin` 두 개가 아직
+  `CREATING` 상태였고 MSK Connect는 그 상태의 플러그인 삭제를 거부하기 때문입니다. 즉 문자
+  하나가 단순 재시도가 아니라 수동 스택 정리를 요구했습니다. 해당 문구를 수정했고, 템플릿의 모든
+  보안 그룹 규칙 설명(인라인 규칙과 독립 `AWS::EC2::SecurityGroup{Ingress,Egress}` 리소스
+  모두)을 EC2 허용 문자 집합과 255자 제한으로 검증하는 테스트 2개를 추가해 다음 실수는 배포까지
+  도달할 수 없게 했습니다.
+
 ## v0.1.155
 
 ### Fixed

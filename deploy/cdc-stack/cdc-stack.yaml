@@ -660,11 +660,16 @@ Resources:
           FromPort: 443
           ToPort: 443
           CidrIp: 0.0.0.0/0
+          # NO apostrophe (or any char outside EC2's set for rule descriptions:
+          # a-zA-Z0-9 and . _-:/()#,@[]+=&;{}!$*). "customer's" here made the whole
+          # SG CREATE_FAIL with "Invalid rule description", which rolled the stack
+          # back -- and the rollback then hit ROLLBACK_FAILED because the two
+          # CustomPlugins were still CREATING and cannot be deleted in that state.
           Description: >-
             HTTPS egress for the offset-seeder CloudFormation response during
-            teardown (S3 via the gateway endpoint on an owned network, or via the
-            customer's own NAT on supplied subnets). Inline so it outlives the
-            custom-resource Delete (see SG comment above).
+            teardown (S3 via the gateway endpoint on an owned network, or via a
+            supplied subnet NAT). Inline so it outlives the custom-resource
+            Delete (see SG comment above).
 
   # MSK Serverless and the connectors share this SG; allow intra-SG Kafka traffic.
   ConnectorSelfIngress:
