@@ -45,6 +45,7 @@ from __future__ import annotations
 import difflib
 import inspect
 import logging
+import re
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
@@ -56,6 +57,7 @@ from dsql_migrator.core.assessment_strategist import (
     build_conversion_chat_system,
 )
 from dsql_migrator.core.converter import (
+    ConversionNoteKind,
     ConversionWarning,
     PrimaryKeyStrategy,
     SchemaConversionResult,
@@ -101,7 +103,17 @@ from dsql_migrator.core.activity_log import (
     ActivityStatus,
     log_activity,
 )
-from dsql_migrator.ui.design import inline_hint, render_notice, segmented_control
+from dsql_migrator.ui.design import (
+    CODE_HEADER_CLASSES,
+    CODE_HEADER_LABEL_CLASSES,
+    CODE_SURFACE_CLASSES,
+    CODE_TEXT_CLASSES,
+    DIFF_GUTTER_CLASSES,
+    DIFF_SIDE_STYLE,
+    inline_hint,
+    radio_tiles,
+    render_notice,
+)
 from dsql_migrator.ui.ai_chat_drawer import build_chat_drawer
 from dsql_migrator.ui.evaluation import EvaluationStore, classification_label
 from dsql_migrator.ui.session import SessionStore
@@ -124,6 +136,34 @@ ROUTINE_PREFIX = "routine:"
 _NOT_AUTO_CONVERTED = (
     "-- Not auto-converted for Aurora DSQL. Reimplement this object manually."
 )
+
+
+def split_conversion_notes(
+    notes: Sequence[ConversionWarning],
+) -> tuple[list[ConversionWarning], list[ConversionWarning]]:
+    """Split conversion notes into ``(losses, recommendations)``.
+
+    ``Classification`` says how much WORK a note implies (MANUAL vs UNSUPPORTED) but
+    not whether anything is actually wrong, so the two were conflated: a kept
+    AUTO_INCREMENT key converts perfectly and works, yet it was listed under
+    "Conversion warnings" with the same amber MANUAL badge as a removed foreign key.
+    That presented throughput advice as a defect.
+
+    Notes default to ``LOSS`` (what every note historically meant), so anything that
+    does not explicitly opt into ``RECOMMENDATION`` -- including a payload
+    deserialized from an older session snapshot -- keeps its current treatment. Pure.
+    """
+    losses = [
+        n
+        for n in notes
+        if getattr(n, "kind", None) is not ConversionNoteKind.RECOMMENDATION
+    ]
+    recommendations = [
+        n
+        for n in notes
+        if getattr(n, "kind", None) is ConversionNoteKind.RECOMMENDATION
+    ]
+    return losses, recommendations
 
 
 # ---------------------------------------------------------------------------
@@ -1308,10 +1348,49 @@ def build_table_preview(
 
 
 def render_source_view_ddl(view: ViewDef) -> str:
-    """Render a readable MySQL ``CREATE VIEW`` for the source side of the diff."""
+    """Render a readable MySQL ``CREATE VIEW`` for the source side of the diff.
+
+    MySQL's ``SHOW CREATE VIEW`` returns the whole definition on ONE line, prefixed
+    with server metadata (``ALGORITHM=``, ``DEFINER=``, ``SQL SECURITY``). Shown raw it
+    was an unreadable wall of text -- and unusable in the side-by-side diff, where the
+    target side is pretty-printed, so a one-line source could never align with it.
+
+    So the definition is re-rendered with sqlglot in MySQL dialect (``pretty=True``).
+    The ``ALGORITHM``/``DEFINER``/``SQL SECURITY`` prefix is stripped FIRST: it is
+    server bookkeeping with no bearing on the conversion, and sqlglot mangles the
+    ``DEFINER=`user`@`host`` backticks into double quotes when it round-trips them,
+    which would show the user invalid MySQL. The original text is returned unchanged
+    when it cannot be parsed: an unparseable definition is exactly the case where the
+    user needs to see the source verbatim.
+    """
     body = (view.definition or "").strip()
     if not body:
         return f"-- View definition unavailable for {view.name}."
+    try:
+        import sqlglot
+
+        # Drop the server metadata between CREATE and VIEW (ALGORITHM=..., DEFINER=...,
+        # SQL SECURITY ...) so what is shown is the view itself.
+        stripped = re.sub(
+            r"^CREATE\s+(?:ALGORITHM\s*=\s*\S+\s+|DEFINER\s*=\s*\S+\s+"
+            r"|SQL\s+SECURITY\s+\w+\s+)+VIEW\b",
+            "CREATE VIEW",
+            body,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        # A definition that is only a SELECT body (some servers/introspection paths
+        # return it without the CREATE prefix) must keep its CREATE VIEW header, or
+        # the pretty-printed source would silently lose the object's identity.
+        if not stripped.upper().startswith("CREATE"):
+            stripped = f"CREATE VIEW {view.name} AS {stripped}"
+        parsed = sqlglot.parse_one(stripped, read="mysql")
+        if parsed is not None:
+            pretty = parsed.sql(dialect="mysql", pretty=True).strip()
+            if pretty:
+                return pretty
+    except Exception:  # noqa: BLE001 - unparseable: show the source verbatim
+        logger.debug("View %s could not be pretty-printed; showing raw", view.name)
     if body.upper().startswith("CREATE"):
         return body
     return f"CREATE VIEW {view.name} AS\n{body}"
@@ -2837,6 +2916,11 @@ def build_schema_conversion_screen(
                         if session.ai_assist.enabled
                         else None
                     ),
+                    # Freeze the source selection while an apply is in flight: the
+                    # worker already holds a fixed object list, so re-ticking cannot
+                    # change what it writes and would only desynchronize the screen
+                    # from the target.
+                    apply_in_progress=status is StepStatus.IN_PROGRESS,
                 )
 
             def apply_all() -> None:
@@ -2972,6 +3056,7 @@ def _render_browser_and_preview(
     on_refresh_source: Optional[Callable[[], object]] = None,
     on_refresh_target: Optional[Callable[[], object]] = None,
     on_ai_chat: Optional[Callable[[str, str, str], None]] = None,
+    apply_in_progress: bool = False,
 ) -> None:
     """Render side-by-side source/target browsers and the selected DDL diff.
 
@@ -2981,6 +3066,13 @@ def _render_browser_and_preview(
     converted target DDL in a left/right comparison below. ``result_provider``
     lazily computes the deterministic conversion; it is invoked only when the
     user has generated DDL, so merely opening the screen runs no conversion.
+
+    ``apply_in_progress`` freezes the source selection while a schema apply is
+    running. The apply worker was handed a fixed object list when it started, so
+    re-ticking mid-run cannot change what it does -- it would only desynchronize what
+    the screen shows from what is actually being written to the target, and a
+    "Generate DDL" during the run could swap the DDL under the in-flight apply. The
+    tree, the bulk buttons and the filter are all disabled with an explanatory note.
     """
     existing = _existing_object_names(inventory, existence_checker)
     source_nodes = build_object_tree(
@@ -2996,34 +3088,53 @@ def _render_browser_and_preview(
     with ui.row().classes("w-full gap-4 items-stretch no-wrap"):  # type: ignore[attr-defined]
         # --- Source browser (checkboxes; selection drives DDL generation) -
         with ui.card().classes("w-1/2 min-w-0 !shadow-sm"):  # type: ignore[attr-defined]
+            # Header row: title on the left, the bulk-selection actions and the
+            # refresh next to it on the right. Keeping Select all / Unselect all up
+            # here (rather than on their own row below) is what lets the source and
+            # target panels start their filter box at the SAME y-position -- the two
+            # sides read as one comparison instead of being visibly offset.
+            def _sc_select_all() -> None:
+                leaf_ids = _tree_leaf_ids(source_nodes)
+                conv_state.ticked_node_ids = leaf_ids
+                tree.tick(leaf_ids)
+
+            def _sc_unselect_all() -> None:
+                conv_state.ticked_node_ids = []
+                tree.untick()
+
             with ui.row().classes("items-center justify-between w-full no-wrap"):  # type: ignore[attr-defined]
                 ui.label("Source (MySQL)").classes(  # type: ignore[attr-defined]
                     "text-sm font-semibold text-blue-800"
                 )
-                if on_refresh_source is not None:
-                    ui.button(on_click=on_refresh_source).props(  # type: ignore[attr-defined]
-                        "flat dense round size=sm icon=refresh"
-                    ).tooltip("Refresh source objects")
-            # Bulk selection: tick/untick every selectable object leaf at once
-            # (the per-object ticks still work for fine-grained picks). Programmatic
-            # tick/untick does not fire on_tick, so keep ticked_node_ids in sync here.
-            with ui.row().classes("items-center gap-1 w-full no-wrap"):  # type: ignore[attr-defined]
-
-                def _sc_select_all() -> None:
-                    leaf_ids = _tree_leaf_ids(source_nodes)
-                    conv_state.ticked_node_ids = leaf_ids
-                    tree.tick(leaf_ids)
-
-                def _sc_unselect_all() -> None:
-                    conv_state.ticked_node_ids = []
-                    tree.untick()
-
-                ui.button("Select all", on_click=_sc_select_all).props(  # type: ignore[attr-defined]
-                    "flat dense no-caps size=sm color=primary icon=done_all"
-                )
-                ui.button("Unselect all", on_click=_sc_unselect_all).props(  # type: ignore[attr-defined]
-                    "flat dense no-caps size=sm color=grey-7 icon=remove_done"
-                )
+                with ui.row().classes("items-center gap-1 no-wrap"):  # type: ignore[attr-defined]
+                    # Bulk selection: tick/untick every selectable object leaf at once
+                    # (the per-object ticks still work for fine-grained picks).
+                    # Programmatic tick/untick does not fire on_tick, so
+                    # ticked_node_ids is kept in sync in the handlers above.
+                    select_all_btn = ui.button(  # type: ignore[attr-defined]
+                        "Select all", on_click=_sc_select_all
+                    ).props("flat dense no-caps size=sm color=primary icon=done_all")
+                    unselect_all_btn = ui.button(  # type: ignore[attr-defined]
+                        "Unselect all", on_click=_sc_unselect_all
+                    ).props("flat dense no-caps size=sm color=grey-7 icon=remove_done")
+                    if apply_in_progress:
+                        for _btn in (select_all_btn, unselect_all_btn):
+                            _btn.props("disable")
+                            _btn.tooltip(
+                                "The selection is locked while the apply is running."
+                            )
+                    if on_refresh_source is not None:
+                        refresh_btn = ui.button(on_click=on_refresh_source).props(  # type: ignore[attr-defined]
+                            "flat dense round size=sm icon=refresh"
+                        )
+                        if apply_in_progress:
+                            refresh_btn.props("disable")
+                            refresh_btn.tooltip(
+                                "Re-introspecting would change the objects the "
+                                "running apply was started with."
+                            )
+                        else:
+                            refresh_btn.tooltip("Refresh source objects")
             # Name filter: for large schemas (thousands of objects) typing here
             # narrows the q-tree to MATCHING nodes only, so the browser never has
             # to render an entire "Tables (N)" category at once. The full node set
@@ -3034,18 +3145,8 @@ def _render_browser_and_preview(
                 .props("dense clearable outlined")
                 .classes("w-full")
             )
-            # Legend for the per-table primary-key indicator shown beside each
-            # table leaf (matches the Step 3 "Tables to migrate" browser). Only
-            # tables carry it; views/triggers/routines have no PK concept.
-            with ui.row().classes(  # type: ignore[attr-defined]
-                "items-center gap-3 w-full text-xs text-gray-500"
-            ):
-                with ui.row().classes("items-center gap-1 no-wrap"):  # type: ignore[attr-defined]
-                    ui.icon("check_circle", color="green-6").classes("text-sm")  # type: ignore[attr-defined]
-                    ui.label("Table has a primary key")  # type: ignore[attr-defined]
-                with ui.row().classes("items-center gap-1 no-wrap"):  # type: ignore[attr-defined]
-                    ui.icon("warning", color="amber-7").classes("text-sm")  # type: ignore[attr-defined]
-                    ui.label("No primary key (required for Aurora DSQL)")  # type: ignore[attr-defined]
+            if apply_in_progress:
+                src_filter.props("disable")
             with ui.scroll_area().classes(  # type: ignore[attr-defined]
                 "w-full bg-white rounded-md border border-gray-200"
             ).style("height: 340px"):
@@ -3086,6 +3187,40 @@ def _render_browser_and_preview(
                 # the ticked set across refreshes (the tree is rebuilt on Generate).
                 if conv_state.ticked_node_ids:
                     tree.tick(list(conv_state.ticked_node_ids))
+                if apply_in_progress:
+                    # Freeze the selection: the apply worker was handed a fixed
+                    # object list at start, so re-ticking cannot change what it
+                    # writes -- it would only desynchronize the screen from the
+                    # target.
+                    #
+                    # Quasar's q-tree has NO `disable` prop, so props("disable") is
+                    # silently ignored and the tree stays fully clickable. Block it
+                    # the way the Data Migration table picker already does:
+                    # pointer-events-none stops the clicks, and the dimmed tree reads
+                    # as "locked" rather than merely dead.
+                    tree.classes("pointer-events-none opacity-70")  # type: ignore[attr-defined]
+            # Legend for the per-table primary-key indicator shown beside each table
+            # leaf (matches the Step 3 "Tables to migrate" browser). Only tables carry
+            # it; views/triggers/routines have no PK concept. Kept BELOW the tree so
+            # the source and target panels start their trees at the same y-position --
+            # above the tree it pushed the source list down and the two sides no longer
+            # lined up.
+            with ui.row().classes(  # type: ignore[attr-defined]
+                "items-center gap-3 w-full text-xs text-gray-500"
+            ):
+                with ui.row().classes("items-center gap-1 no-wrap"):  # type: ignore[attr-defined]
+                    ui.icon("check_circle", color="green-6").classes("text-sm")  # type: ignore[attr-defined]
+                    ui.label("Table has a primary key")  # type: ignore[attr-defined]
+                with ui.row().classes("items-center gap-1 no-wrap"):  # type: ignore[attr-defined]
+                    ui.icon("warning", color="amber-7").classes("text-sm")  # type: ignore[attr-defined]
+                    ui.label("No primary key (required for Aurora DSQL)")  # type: ignore[attr-defined]
+            if apply_in_progress:
+                inline_hint(
+                    ui,
+                    "Selection is locked while the schema apply runs — it was "
+                    "started with the objects listed above.",
+                    tone="neutral",
+                )
 
         # --- Target browser (browse-only: what already exists on DSQL) ----
         with ui.card().classes("w-1/2 min-w-0 !shadow-sm"):  # type: ignore[attr-defined]
@@ -3134,21 +3269,39 @@ def _render_browser_and_preview(
         gen_btn = ui.button(  # type: ignore[attr-defined]
             "Generate DDL for selected", on_click=on_generate
         ).props("color=primary")
-        if conv_state.generated_node_ids is not None:
+        if apply_in_progress:
+            # Regenerating mid-apply would swap the DDL under the in-flight worker,
+            # so the target could end up with statements the screen no longer shows.
+            gen_btn.disable()  # type: ignore[attr-defined]
+            gen_btn.tooltip(  # type: ignore[attr-defined]
+                "Wait for the apply to finish — regenerating now would change the "
+                "DDL the running apply is using."
+            )
+        elif conv_state.generated_node_ids is not None:
             # Lock re-generation until "Reset all": clicking Generate again would
             # silently re-run over the same committed scope with no visible change
             # (so it looks unresponsive). Disable it and require an explicit reset
             # to start a fresh generation, which makes the regeneration obvious.
             gen_btn.disable()  # type: ignore[attr-defined]
-            ui.button("Reset all", on_click=on_clear).props(  # type: ignore[attr-defined]
+        if conv_state.generated_node_ids is not None:
+            reset_btn = ui.button("Reset all", on_click=on_clear).props(  # type: ignore[attr-defined]
                 "flat icon=restart_alt"
-            ).tooltip(
-                "Discard the generated DDL, edits, AI suggestions, and apply "
-                "results, and start fresh."
             )
-            ui.label(  # type: ignore[attr-defined]
-                'Generated below — use "Reset all" to generate a new selection.'
-            ).classes("text-xs text-gray-500")
+            if apply_in_progress:
+                # Reset discards the generated DDL the running apply is executing.
+                reset_btn.disable()  # type: ignore[attr-defined]
+                reset_btn.tooltip(  # type: ignore[attr-defined]
+                    "Wait for the apply to finish — resetting now would discard the "
+                    "DDL it is applying."
+                )
+            else:
+                reset_btn.tooltip(  # type: ignore[attr-defined]
+                    "Discard the generated DDL, edits, AI suggestions, and apply "
+                    "results, and start fresh."
+                )
+                ui.label(  # type: ignore[attr-defined]
+                    'Generated below — use "Reset all" to generate a new selection.'
+                ).classes("text-xs text-gray-500")
 
     # --- Generated DDL comparison (only after Generate) -------------------
     if conv_state.generated_node_ids is None:
@@ -3298,17 +3451,26 @@ def _object_header_summary(
     if preview.exists_on_target is True:
         parts.append("exists on target")
     if preview.warnings:
-        count = len(preview.warnings)
-        warning_text = f"{count} warning{'s' if count != 1 else ''}"
-        # Surface the severity (Unsupported > Review needed) so the user sees that
-        # an object needs manual work, not merely that it has "N warnings".
-        classes = {w.classification for w in preview.warnings}
-        if Classification.UNSUPPORTED in classes:
-            parts.append(f"{classification_label('UNSUPPORTED')} · {warning_text}")
-        elif Classification.MANUAL in classes:
-            parts.append(f"{classification_label('MANUAL')} · {warning_text}")
-        else:
-            parts.append(warning_text)
+        # Count the two kinds separately: a recommendation is not a warning, and
+        # calling it one made a table whose ONLY note was throughput advice read as
+        # "Review needed - 1 warning". Losses drive the severity label; advice is
+        # reported on its own as "N recommendations".
+        losses, recommendations = split_conversion_notes(preview.warnings)
+        if losses:
+            count = len(losses)
+            warning_text = f"{count} warning{'s' if count != 1 else ''}"
+            # Surface the severity (Unsupported > Review needed) so the user sees that
+            # an object needs manual work, not merely that it has "N warnings".
+            classes = {w.classification for w in losses}
+            if Classification.UNSUPPORTED in classes:
+                parts.append(f"{classification_label('UNSUPPORTED')} · {warning_text}")
+            elif Classification.MANUAL in classes:
+                parts.append(f"{classification_label('MANUAL')} · {warning_text}")
+            else:
+                parts.append(warning_text)
+        if recommendations:
+            n = len(recommendations)
+            parts.append(f"{n} recommendation{'s' if n != 1 else ''}")
     if edited:
         parts.append("edited")
     if applied is not None:
@@ -3349,8 +3511,8 @@ def _render_pk_strategy_picker(
     is_composite = current_leading is not None
     converter = SchemaConverter()
 
-    def _select_strategy(event: object) -> None:
-        choice = getattr(event, "value", _KEEP_PK)
+    def _select_strategy(choice: str) -> None:
+        """Apply a primary-key strategy choice (called with the tile's value)."""
         if choice == _COMPOSITE_PK:
             leading = default_composite_leading(table)
             if leading is None:
@@ -3374,18 +3536,38 @@ def _render_pk_strategy_picker(
         refresh()
 
     with ui.card().classes("w-full !shadow-none border border-gray-200 bg-gray-50 p-3 gap-2"):  # type: ignore[attr-defined]
-        with ui.row().classes("items-center gap-3 w-full no-wrap"):  # type: ignore[attr-defined]
-            ui.label("Primary key").classes("text-sm font-semibold text-gray-700")  # type: ignore[attr-defined]
-            picker = segmented_control(
-                ui,
-                {_KEEP_PK: "Keep source PK", _COMPOSITE_PK: "Composite key"},
-                value=_COMPOSITE_PK if is_composite else _KEEP_PK,
-                on_change=_select_strategy,
-            )
-            if not candidates:
-                # Nothing valid to lead with (no NOT NULL non-PK column), so the
-                # composite option cannot be offered for this table.
-                picker.props("disable")
+        ui.label("Primary key").classes("text-sm font-semibold text-gray-700")  # type: ignore[attr-defined]
+        # Cloudscape "Tiles", not a segmented control: this is a design decision with
+        # real consequences (a composite key changes what the application must key on,
+        # and is immutable once created), so each option needs a sentence explaining
+        # the trade-off. A segmented control is for switching views. Shared with the
+        # Data Migration type picker via ui/design.radio_tiles.
+        radio_tiles(
+            ui,
+            (
+                (
+                    _KEEP_PK,
+                    "vpn_key",
+                    "Keep source PK",
+                    f"Target key stays ({', '.join(table.primary_key)}), exactly as on "
+                    "the source. Nothing in the application changes.",
+                ),
+                (
+                    _COMPOSITE_PK,
+                    "shuffle",
+                    "Composite key",
+                    "Prepend a high-cardinality column to spread writes across DSQL "
+                    "partitions. Higher insert throughput, but the application must "
+                    "key on the full composite key.",
+                ),
+            ),
+            selected=_COMPOSITE_PK if is_composite else _KEEP_PK,
+            on_select=_select_strategy,
+            # Nothing valid to lead with (no NOT NULL non-PK column), so the composite
+            # option cannot be offered for this table.
+            locked=not candidates,
+            compact=True,
+        )
         if not candidates:
             inline_hint(
                 ui,
@@ -3586,65 +3768,128 @@ _WARNING_BADGE_COLOR: dict[str, str] = {
 def _render_conversion_warnings(
     ui: object, warnings: Sequence[ConversionWarning]
 ) -> None:
-    """Render conversion warnings as a wrapping list (not a truncating table).
+    """Render conversion notes as wrapping lists, split by kind.
 
-    Each warning is a full-width row: a severity badge, an optional column
-    badge, and the message in a flexible cell that wraps, so long messages are
-    never cut off on the right (unlike fixed table columns).
+    Two separate sections, because they are different claims:
+
+    * **Conversion warnings** -- something could not be carried over or changed
+      meaning (a removed foreign key, a dropped collation, an unmapped type). Keeps
+      the severity badge (MANUAL amber / UNSUPPORTED red): the operator has to decide
+      what to do.
+    * **Recommendations** -- the conversion is complete and correct; this is advice
+      for running well on DSQL (e.g. a kept AUTO_INCREMENT key works, but a
+      UUID/random or cached-identity key spreads inserts). Rendered in a calm
+      info-blue "RECOMMENDED" badge, never the amber warning treatment, so advice is
+      not mistaken for a defect. Severity calibration per the design system: things
+      that need no action are info, not warning.
+
+    Each row is full-width: badges plus the message in a flexible cell that wraps, so
+    long messages are never cut off on the right (unlike fixed table columns).
     """
-    ui.label("Conversion warnings").classes("text-sm font-semibold")  # type: ignore[attr-defined]
-    with ui.column().classes("w-full gap-1"):  # type: ignore[attr-defined]
-        for warning in warnings:
-            color = _WARNING_BADGE_COLOR.get(warning.classification.value, "grey")
-            with ui.row().classes(  # type: ignore[attr-defined]
-                "items-start gap-2 w-full no-wrap border rounded p-2"
-            ):
-                ui.badge(warning.classification.value).props(f"color={color}")  # type: ignore[attr-defined]
-                if warning.column_name:
-                    ui.badge(warning.column_name).props(  # type: ignore[attr-defined]
-                        "color=blue-grey-6 outline"
-                    )
-                ui.label(warning.message).classes(  # type: ignore[attr-defined]
-                    "text-sm flex-1 min-w-0 whitespace-normal break-words"
+    losses, recommendations = split_conversion_notes(warnings)
+
+    def _rows(notes, *, badge_text=None, badge_color=None) -> None:
+        with ui.column().classes("w-full gap-1"):  # type: ignore[attr-defined]
+            for note in notes:
+                color = badge_color or _WARNING_BADGE_COLOR.get(
+                    note.classification.value, "grey"
                 )
+                with ui.row().classes(  # type: ignore[attr-defined]
+                    "items-start gap-2 w-full no-wrap border rounded p-2"
+                ):
+                    ui.badge(badge_text or note.classification.value).props(  # type: ignore[attr-defined]
+                        f"color={color}"
+                    )
+                    if note.column_name:
+                        ui.badge(note.column_name).props(  # type: ignore[attr-defined]
+                            "color=blue-grey-6 outline"
+                        )
+                    ui.label(note.message).classes(  # type: ignore[attr-defined]
+                        "text-sm flex-1 min-w-0 whitespace-normal break-words"
+                    )
+
+    if losses:
+        ui.label("Conversion warnings").classes("text-sm font-semibold")  # type: ignore[attr-defined]
+        _rows(losses)
+    if recommendations:
+        # The "these are optional, not problems" explanation lives in a tooltip on a
+        # help glyph rather than as a standing line of text: the RECOMMENDED badge and
+        # the section title already carry the message, so a permanent paragraph
+        # restating it is noise on a screen that repeats this block per object.
+        with ui.row().classes(  # type: ignore[attr-defined]
+            "items-center gap-1 no-wrap" + (" mt-2" if losses else "")
+        ):
+            ui.label("Recommendations").classes("text-sm font-semibold")  # type: ignore[attr-defined]
+            ui.icon("help_outline").classes(  # type: ignore[attr-defined]
+                "text-gray-400 text-sm cursor-help"
+            ).tooltip(
+                "The conversion is complete — these are optional tuning suggestions "
+                "for Aurora DSQL, not problems to fix."
+            )
+        _rows(recommendations, badge_text="RECOMMENDED", badge_color="info")
 
 
 # Tailwind background classes for a diff cell, keyed by (DiffKind value, side),
 # tuned for a calm "editor" surface (slate base): removed (source-only) lines get
 # a soft rose tint, added (target-only) lines a soft emerald tint, a changed line
 # is gently tinted on both sides, and an unchanged line stays on the base surface.
-_DIFF_CELL_BG: dict[tuple[str, str], str] = {
-    (DiffKind.EQUAL.value, "left"): "",
-    (DiffKind.EQUAL.value, "right"): "",
-    (DiffKind.REPLACE.value, "left"): "bg-rose-50",
-    (DiffKind.REPLACE.value, "right"): "bg-emerald-50",
-    (DiffKind.DELETE.value, "left"): "bg-rose-100",
-    (DiffKind.DELETE.value, "right"): "",
-    (DiffKind.INSERT.value, "left"): "",
-    (DiffKind.INSERT.value, "right"): "bg-emerald-100",
+# Which change a given (kind, side) represents, as a DIFF_SIDE_STYLE key. Only the
+# side that actually changed is marked: on a REPLACE the source shows "removed" and the
+# target "added", so a rewritten line is one clear before/after pair rather than two
+# loud blocks. DELETE marks only the source, INSERT only the target.
+_DIFF_SIDE_ROLE: dict[tuple[str, str], str] = {
+    (DiffKind.EQUAL.value, "left"): "unchanged",
+    (DiffKind.EQUAL.value, "right"): "unchanged",
+    (DiffKind.REPLACE.value, "left"): "removed",
+    (DiffKind.REPLACE.value, "right"): "added",
+    (DiffKind.DELETE.value, "left"): "removed",
+    (DiffKind.DELETE.value, "right"): "unchanged",
+    (DiffKind.INSERT.value, "left"): "unchanged",
+    (DiffKind.INSERT.value, "right"): "added",
 }
 
 
+def _diff_side_role(kind: DiffKind, side: str) -> str:
+    """Return the DIFF_SIDE_STYLE role ("unchanged"/"removed"/"added") for a cell."""
+    return _DIFF_SIDE_ROLE.get((kind.value, side), "unchanged")
+
+
 def _diff_cell_bg(kind: DiffKind, side: str) -> str:
-    """Return the Tailwind background class for one diff cell."""
-    return _DIFF_CELL_BG.get((kind.value, side), "")
+    """Return the row tint for one diff cell (empty when unchanged).
+
+    Kept as the historical name/signature so existing callers and tests keep working;
+    the styling itself now comes from ``ui.design.DIFF_SIDE_STYLE``.
+    """
+    _mark, _mark_class, tint = DIFF_SIDE_STYLE[_diff_side_role(kind, side)]
+    return tint
 
 
 def _render_diff_cell(
     ui: object, text: Optional[str], kind: DiffKind, side: str
 ) -> None:
-    """Render one cell (one side of one diff row) with its highlight color."""
-    bg = _diff_cell_bg(kind, side)
-    # A non-breaking space keeps an empty cell's height equal to a text cell so
-    # the two sides stay row-aligned.
-    content = text if text else "\u00a0"
-    # A subtle gutter divider on the left cell separates the two sides like an
-    # editor's split view; calm slate text on the slate surface.
+    """Render one cell (one side of one diff row): status gutter + code text.
+
+    Follows the AWS Console code-surface treatment (``ui.design`` CODE_*/DIFF_* tokens):
+    a narrow ``+``/``\u2212`` gutter carries the change, the code itself stays on a neutral
+    surface with only a barely-there row wash. Color is never the sole signal, and the
+    monospace text is not competing with a saturated fill -- which is what made a
+    full-file rewrite look like an error report.
+    """
+    mark, mark_class, tint = DIFF_SIDE_STYLE[_diff_side_role(kind, side)]
+    # A subtle divider on the left cell separates the two sides like an editor's
+    # split view.
     divider = "border-r border-slate-200" if side == "left" else ""
-    ui.label(content).classes(  # type: ignore[attr-defined]
-        "w-1/2 min-w-0 px-3 py-0.5 font-mono text-xs leading-relaxed "
-        f"text-slate-700 whitespace-pre-wrap break-all {divider} {bg}"
-    )
+    with ui.row().classes(  # type: ignore[attr-defined]
+        f"w-1/2 min-w-0 gap-0 no-wrap items-start pr-3 {divider} {tint}"
+    ):
+        ui.label(mark or "\u00a0").classes(  # type: ignore[attr-defined]
+            f"{DIFF_GUTTER_CLASSES} {mark_class} py-0.5"
+        )
+        # A non-breaking space keeps an empty cell's height equal to a text cell so
+        # the two sides stay row-aligned.
+        ui.label(text if text else "\u00a0").classes(  # type: ignore[attr-defined]
+            f"flex-1 min-w-0 py-0.5 {CODE_TEXT_CLASSES} whitespace-pre-wrap break-all"
+        )
 
 
 def _render_copy_ddl_button(ui: object, text: str, *, label: str) -> None:
@@ -3682,22 +3927,19 @@ def _render_ddl_diff(ui: object, source_ddl: str, target_ddl: str) -> None:
     keys, async indexes, remapped types).
     """
     rows = diff_ddl_lines(source_ddl, target_ddl)
-    # An "editor"-style panel: one rounded, bordered surface in a calm slate tone
-    # with a tab-like header bar naming each side, then the aligned diff lines in
-    # a monospace split view (soft tints mark what the conversion changed).
-    with ui.column().classes(  # type: ignore[attr-defined]
-        "w-full gap-0 rounded-lg border border-slate-200 overflow-hidden bg-slate-50"
-    ):
+    # An AWS-Console code surface: a white, bordered panel with a quiet header bar
+    # naming each side, then the aligned diff in a monospace split view. The code area
+    # stays NEUTRAL -- change is carried by the per-row +/- gutter, not by washing the
+    # panel in red/green (see ui.design CODE_*/DIFF_* tokens).
+    with ui.column().classes(f"w-full gap-0 {CODE_SURFACE_CLASSES}"):  # type: ignore[attr-defined]
         with ui.row().classes(  # type: ignore[attr-defined]
-            "w-full gap-0 no-wrap bg-slate-100 border-b border-slate-200"
+            f"w-full gap-0 no-wrap {CODE_HEADER_CLASSES}"
         ):
             with ui.row().classes(  # type: ignore[attr-defined]
                 "w-1/2 items-center gap-2 px-3 py-1.5 border-r border-slate-200 no-wrap"
             ):
                 ui.icon("storage", color="blue-grey-5").classes("text-sm")  # type: ignore[attr-defined]
-                ui.label("Source — MySQL").classes(  # type: ignore[attr-defined]
-                    "text-xs font-semibold tracking-wide text-slate-500"
-                )
+                ui.label("Source — MySQL").classes(CODE_HEADER_LABEL_CLASSES)  # type: ignore[attr-defined]
                 ui.space()  # type: ignore[attr-defined]
                 _render_copy_ddl_button(ui, source_ddl, label="Source DDL")
             with ui.row().classes(  # type: ignore[attr-defined]
@@ -3705,7 +3947,7 @@ def _render_ddl_diff(ui: object, source_ddl: str, target_ddl: str) -> None:
             ):
                 ui.icon("cloud_queue", color="blue-grey-5").classes("text-sm")  # type: ignore[attr-defined]
                 ui.label("Target — Aurora DSQL").classes(  # type: ignore[attr-defined]
-                    "text-xs font-semibold tracking-wide text-slate-500"
+                    CODE_HEADER_LABEL_CLASSES
                 )
                 ui.space()  # type: ignore[attr-defined]
                 _render_copy_ddl_button(ui, target_ddl, label="Target DDL")

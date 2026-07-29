@@ -47,6 +47,12 @@ class _El:
             self._recorder.props.append(value)
         return self
 
+    def on(self, event, handler=None, *_a, **_k):
+        # radio_tiles registers each tile's selection as a click on its card.
+        if event == "click" and handler is not None:
+            self._recorder.clicks.append(handler)
+        return self
+
     def __enter__(self):
         return self
 
@@ -63,10 +69,14 @@ class _RecordingUi:
         self.classes: list[str] = []
         self.props: list[str] = []
         self.spinner_colors: list[str] = []
+        self.clicks: list = []  # radio_tiles click handlers, in render order
 
     def spinner(self, *_a, color=None, **_k):
         self.spinner_colors.append(str(color))
         return _El(self, "spinner")
+
+    def card(self, *_a, **_k):
+        return _El(self, "card")
 
     def row(self, *_a, **_k):
         return _El(self, "row")
@@ -473,3 +483,129 @@ def test_chip_group_quasar_color_is_stable_and_aligned() -> None:
         CHIP_GROUP_QUASAR_COLOR[chip_group_index("orders")]
     )
     assert chip_group_quasar_color("x") == chip_group_quasar_color("x")
+
+
+# ---------------------------------------------------------------------------
+# radio_tiles (Cloudscape "Tiles")
+# ---------------------------------------------------------------------------
+
+
+def _tile_options():
+    return (
+        ("KEEP", "vpn_key", "Keep source PK", "Nothing in the application changes."),
+        ("COMPOSITE", "shuffle", "Composite key", "Higher insert throughput."),
+    )
+
+
+def test_radio_tiles_render_label_description_and_radio_glyph() -> None:
+    from dsql_migrator.ui.design import radio_tiles
+
+    ui = _RecordingUi()
+    radio_tiles(
+        ui, _tile_options(), selected="KEEP", on_select=lambda _v: None
+    )
+    # Both options' labels + descriptions are emitted.
+    assert "Keep source PK" in ui.texts
+    assert "Composite key" in ui.texts
+    assert "Nothing in the application changes." in ui.texts
+    # The selected tile gets the filled radio, the other the empty one.
+    assert "radio_button_checked" in ui.icons
+    assert "radio_button_unchecked" in ui.icons
+    # Each option's leading icon is rendered too.
+    assert "vpn_key" in ui.icons and "shuffle" in ui.icons
+    # One palette: selected tile is primary-bordered + tinted (design system).
+    blob = " ".join(ui.classes)
+    assert "border-blue-500" in blob and "bg-blue-50" in blob
+
+
+def test_radio_tiles_report_the_clicked_value_including_the_current_one() -> None:
+    # Re-selecting must still fire: a caller may treat clicking the already-selected
+    # tile as CONFIRMING a default (the migration-type picker does exactly that).
+    from dsql_migrator.ui.design import radio_tiles
+
+    ui = _RecordingUi()
+    picked: list[str] = []
+    radio_tiles(
+        ui, _tile_options(), selected="KEEP", on_select=picked.append
+    )
+    assert len(ui.clicks) == 2  # one handler per tile, in render order
+    ui.clicks[0]()
+    ui.clicks[1]()
+    assert picked == ["KEEP", "COMPOSITE"]
+
+
+def test_radio_tiles_locked_group_wires_no_handlers() -> None:
+    # A locked group must be inert AND look inert -- not silently clickable.
+    from dsql_migrator.ui.design import radio_tiles
+
+    ui = _RecordingUi()
+    radio_tiles(
+        ui, _tile_options(), selected="KEEP", on_select=lambda _v: None, locked=True
+    )
+    assert ui.clicks == []
+    blob = " ".join(ui.classes)
+    assert "cursor-not-allowed" in blob and "opacity-60" in blob
+    assert "cursor-pointer" not in blob
+
+
+def test_radio_tiles_tolerate_missing_icon_and_description() -> None:
+    from dsql_migrator.ui.design import radio_tiles
+
+    ui = _RecordingUi()
+    radio_tiles(
+        ui, (("A", "", "Only a label", ""),), selected="A", on_select=lambda _v: None
+    )
+    assert "Only a label" in ui.texts
+    # No leading icon beyond the radio glyph, and no description label.
+    assert ui.icons == ["radio_button_checked"]
+    assert ui.texts == ["Only a label"]
+
+
+# ---------------------------------------------------------------------------
+# Code surface + diff tokens (Cloudscape "CodeEditor")
+# ---------------------------------------------------------------------------
+
+
+def test_code_surface_is_neutral_not_tinted() -> None:
+    # AWS renders code on a NEUTRAL surface and keeps semantic color to narrow
+    # accents. A washed panel made a heterogeneous conversion (which rewrites nearly
+    # every line) look like an error report.
+    from dsql_migrator.ui.design import (
+        CODE_HEADER_CLASSES,
+        CODE_SURFACE_CLASSES,
+        CODE_TEXT_CLASSES,
+    )
+
+    assert "bg-white" in CODE_SURFACE_CLASSES
+    assert "border" in CODE_SURFACE_CLASSES and "rounded" in CODE_SURFACE_CLASSES
+    # No semantic (red/green) fill anywhere on the reading surface.
+    for token in (CODE_SURFACE_CLASSES, CODE_HEADER_CLASSES, CODE_TEXT_CLASSES):
+        for hue in ("rose", "emerald", "red", "green"):
+            assert hue not in token, f"{hue} must not tint the code surface: {token}"
+    assert "font-mono" in CODE_TEXT_CLASSES
+
+
+def test_diff_side_style_marks_change_without_relying_on_color() -> None:
+    # Color must never be the ONLY signal: each changed side carries a +/- glyph, so
+    # the diff survives a monochrome screenshot and is legible to a colorblind reader.
+    from dsql_migrator.ui.design import DIFF_SIDE_STYLE
+
+    assert set(DIFF_SIDE_STYLE) == {"unchanged", "removed", "added"}
+    removed_mark, removed_class, removed_tint = DIFF_SIDE_STYLE["removed"]
+    added_mark, added_class, added_tint = DIFF_SIDE_STYLE["added"]
+    assert removed_mark and added_mark and removed_mark != added_mark
+    assert "rose" in removed_class and "emerald" in added_class
+    # An unchanged row is completely unmarked, so the eye lands only on differences.
+    mark, _cls, tint = DIFF_SIDE_STYLE["unchanged"]
+    assert mark == "" and tint == ""
+
+
+def test_diff_row_tints_are_barely_there() -> None:
+    # The wash groups a changed row without competing with the text: a *-50 shade at
+    # reduced alpha, never a solid *-100 fill (which is what looked unprofessional).
+    from dsql_migrator.ui.design import DIFF_SIDE_STYLE
+
+    for role in ("removed", "added"):
+        _mark, _cls, tint = DIFF_SIDE_STYLE[role]
+        assert "-50/" in tint, f"{role} tint should be a -50 shade with alpha: {tint}"
+        assert "-100" not in tint and "-200" not in tint

@@ -127,6 +127,17 @@ _DUPLICATE_OBJECT_SQLSTATE = "42P07"
 _PROGRAM_LIMIT_SQLSTATE = "54000"
 _DSQL_MAX_SCHEMAS = 10
 
+# PostgreSQL ``dependent_objects_still_exist``. Raised when a destructive REPLACE
+# tries to DROP a table that a VIEW still selects from. The apply already pre-drops
+# the views IN THE APPLY SET before recreating tables, but a view created by an
+# EARLIER session (and not selected this time) is invisible to that pre-pass, so the
+# DROP fails. The raw error names the blocking view and suggests DROP ... CASCADE --
+# which is the wrong advice here: it would silently destroy a view this tool may not
+# know how to recreate. The actionable fix is to include that view in the selection so
+# the apply drops and recreates it in the right order, which is what the translated
+# message says.
+_DEPENDENT_OBJECTS_SQLSTATE = "2BP01"
+
 # Parses the leading ``CREATE <kind> [modifiers] <identifier>`` of a converted
 # DDL statement to recover the kind and the created object's name. Tolerant of
 # the DSQL-specific ``ASYNC`` index modifier and the usual ``IF NOT EXISTS`` /
@@ -472,7 +483,7 @@ def _execute_single_ddl(connection: Any, statement: object) -> None:
     cursor = connection.cursor()
     try:
         cursor.execute(statement)
-    except Exception as exc:  # noqa: BLE001 - translate one specific hard limit
+    except Exception as exc:  # noqa: BLE001 - translate specific, actionable failures
         if _is_schema_limit_exceeded(exc):
             raise SchemaApplyError(
                 f"Aurora DSQL allows at most {_DSQL_MAX_SCHEMAS} schemas per "
@@ -481,6 +492,11 @@ def _execute_single_ddl(connection: Any, statement: object) -> None:
                 "the target cluster (DROP SCHEMA ... CASCADE) or use a different "
                 "cluster, then retry."
             ) from exc
+        if _is_dependent_objects_error(exc):
+            # Replace the driver's "Use DROP ... CASCADE" hint with the safe fix
+            # (select the dependent view too). Not retried: a dependency is a hard
+            # state, not a transient conflict.
+            raise SchemaApplyError(dependent_objects_hint(str(exc))) from exc
         raise
     finally:
         _safe_close(cursor)
@@ -591,6 +607,66 @@ def _is_duplicate_object(exc: BaseException) -> bool:
     :func:`~dsql_migrator.core.occ.is_occ_conflict`.
     """
     return getattr(exc, "sqlstate", None) == _DUPLICATE_OBJECT_SQLSTATE
+
+
+def _is_dependent_objects_error(exc: BaseException) -> bool:
+    """Return ``True`` if a DROP failed because another object depends on the target.
+
+    PostgreSQL/DSQL raise ``dependent_objects_still_exist`` (SQLSTATE ``2BP01``).
+    Matches the SQLSTATE, with a message fallback for a wrapped/re-raised error that
+    lost it (mirroring :func:`_is_schema_limit_exceeded`).
+    """
+    if getattr(exc, "sqlstate", None) == _DEPENDENT_OBJECTS_SQLSTATE:
+        return True
+    return "depend on it" in str(exc).lower()
+
+
+def dependent_objects_hint(error_text: str) -> str:
+    """Turn a raw ``dependent_objects_still_exist`` error into actionable guidance.
+
+    The database's own HINT is "Use DROP ... CASCADE", which is the WRONG advice for
+    this tool: cascading would silently destroy a view the tool may not be able to
+    recreate (Property 12 -- destructive work stays under the operator's control).
+
+    The apply already pre-drops every view IN THE SELECTION before recreating tables,
+    so a blocking view means it simply was not selected -- typically created by an
+    earlier apply. Including it in the selection is the fix: the pre-pass then drops it
+    first and its own apply unit recreates it.
+
+    Names the blocking objects when the driver reported them (the DETAIL lines), so the
+    user knows exactly what to add. Pure/unit-testable: takes the error text, returns
+    the replacement message.
+    """
+    # DETAIL lines read e.g. "view ecommerce_demo.customer_order_summary depends on
+    # table ecommerce_demo.countries" -- pull the dependent object's name.
+    blockers: list[str] = []
+    for match in re.finditer(
+        r"\b(?:view|materialized view)\s+([A-Za-z_][\w.\"$]*)\s+depends on\b",
+        error_text,
+        re.IGNORECASE,
+    ):
+        name = match.group(1).strip('"')
+        if name not in blockers:
+            blockers.append(name)
+    if blockers:
+        listed = ", ".join(blockers)
+        one = len(blockers) == 1
+        return (
+            f"Cannot replace this table: the {'view' if one else 'views'} {listed} "
+            f"still {'depends' if one else 'depend'} on it. Select "
+            f"{'that view' if one else 'those views'} in the object browser as well "
+            f"and re-run the apply — {'it is' if one else 'they are'} then dropped "
+            "before the table is recreated, and recreated afterwards. (Avoid DROP ... "
+            "CASCADE, which the database suggests: it would delete the "
+            f"{'view' if one else 'views'} outright.)"
+        )
+    return (
+        "Cannot replace this table: another object (usually a view) still depends on "
+        "it. Select the dependent object in the object browser as well and re-run the "
+        "apply — it is then dropped before the table is recreated, and recreated "
+        "afterwards. (Avoid DROP ... CASCADE, which the database suggests: it would "
+        "delete the dependent object outright.)"
+    )
 
 
 def _is_schema_limit_exceeded(exc: BaseException) -> bool:

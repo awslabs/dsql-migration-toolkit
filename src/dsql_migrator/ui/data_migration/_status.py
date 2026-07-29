@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Sequence
 
 from dsql_migrator.core.cdc import (
     CDC_DEFAULT_STACK_NAME,
@@ -409,6 +409,63 @@ def _running_mine(raw_connectors, stack_name: str) -> list[str]:
         and str(c.get("connectorState", "")).upper() == "RUNNING"
     }
     return [name for name in expected if name in running]
+
+
+# CloudFormation statuses a discovered cdc-stack must NOT be offered for "attach".
+# Attaching points the session at a stack and re-reads its live state, so it only makes
+# sense for a stack that is (or can become) a working pipeline. A half-deleted or
+# rolled-back stack is the opposite: its resources are partly gone, so streaming from it
+# is impossible -- and offering "Attach" hides the real problem, which is that MSK/NAT
+# may still be BILLING with no session tracking it. These need cleanup, not adoption.
+_UNATTACHABLE_STACK_STATUSES = frozenset(
+    {
+        "DELETE_FAILED",
+        "DELETE_IN_PROGRESS",
+        "ROLLBACK_COMPLETE",
+        "ROLLBACK_FAILED",
+        "ROLLBACK_IN_PROGRESS",
+        "CREATE_FAILED",
+        "UPDATE_ROLLBACK_FAILED",
+        "UPDATE_ROLLBACK_COMPLETE",
+        "UPDATE_ROLLBACK_IN_PROGRESS",
+    }
+)
+
+
+def stack_status_needs_cleanup(status: Optional[str]) -> bool:
+    """True when a cdc-stack is in a state that leaves resources needing cleanup.
+
+    A teardown JOB finishing is not the same as the STACK being gone: a delete can end
+    in ``DELETE_FAILED`` (typically leftover Lambda ENIs pinning the subnets), and a
+    job record can vanish with an app restart. In both cases the cross-view banner used
+    to go silent while the leftover Amazon MSK / NAT kept BILLING with nothing in the UI
+    saying so. This lets the banner stay on the (cached) stack status instead of only
+    the job's. Pure.
+    """
+    return bool(status) and str(status).upper() in _UNATTACHABLE_STACK_STATUSES
+
+
+def split_attachable_stacks(
+    stacks: "Sequence[tuple[str, str]]",
+) -> "tuple[list[tuple[str, str]], list[tuple[str, str]]]":
+    """Split discovered cdc-stacks into ``(attachable, needs_cleanup)``.
+
+    ``needs_cleanup`` holds stacks in a failed/rolled-back/deleting state
+    (:data:`_UNATTACHABLE_STACK_STATUSES`). Offering "Attach to <stack>" for those was
+    actively harmful: a ``DELETE_FAILED`` stack cannot stream (its resources are partly
+    gone), so attaching produces a dead session -- while the real, urgent fact is that
+    its MSK / NAT may still be billing after a teardown that did not finish. Pure.
+    """
+    attachable: list[tuple[str, str]] = []
+    needs_cleanup: list[tuple[str, str]] = []
+    for name, status in stacks:
+        target = (
+            needs_cleanup
+            if str(status).upper() in _UNATTACHABLE_STACK_STATUSES
+            else attachable
+        )
+        target.append((name, status))
+    return attachable, needs_cleanup
 
 
 def _is_inflight_stack_status(status: Optional[str]) -> bool:

@@ -383,6 +383,7 @@ def build_page(
         """
         from dsql_migrator.ui.data_migration._status import (
             cdc_teardown_banner_state,
+            stack_status_needs_cleanup as _stack_status_needs_cleanup,
         )
 
         migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
@@ -407,10 +408,22 @@ def build_page(
                 "kind": getattr(migration_state, "cdc_teardown_kind", None),
                 "stack": getattr(migration_state, "cdc_teardown_stack", None),
             }
-        # Settled OK (DONE) or a job the manager no longer knows (lost across a
-        # restart): clear the marker so the banner disappears and the guard releases.
-        # A FAILED teardown is NOT cleared here -- it stays as an actionable
-        # "retry cleanup" banner until the user retries or dismisses it.
+        # The job settled OK (DONE) or is unknown (lost across a restart) -- but the
+        # JOB finishing is not the same as the STACK being gone. A delete that ended in
+        # DELETE_FAILED, or a job whose record vanished with the process, previously
+        # cleared the marker here and the banner went silent: the leftover MSK / NAT
+        # kept billing with nothing in the UI saying so. So before clearing, check the
+        # last probed stack status (cached -- no AWS call on this render path) and keep
+        # an actionable failed banner when the stack is still in a failed/rolled-back
+        # state.
+        if _stack_status_needs_cleanup(
+            getattr(migration_state, "cdc_stack_phase_status", None)
+        ):
+            return {
+                "state": "failed",
+                "kind": getattr(migration_state, "cdc_teardown_kind", None),
+                "stack": getattr(migration_state, "cdc_teardown_stack", None),
+            }
         migration_state.clear_cdc_teardown()
         return None
 

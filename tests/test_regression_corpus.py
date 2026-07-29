@@ -91,8 +91,12 @@ def _render_schema_conversion() -> str:
     for warning in result.warnings:
         target = warning.object_name
         column = f".{warning.column_name}" if warning.column_name else ""
+        # Record the note KIND too (LOSS vs RECOMMENDATION): the UI shows the two in
+        # separate sections with different severity, so a note silently flipping kind
+        # is a user-visible change the snapshot must catch.
         lines.append(
-            f"[{warning.classification.value}] {target}{column}: {warning.message}"
+            f"[{warning.classification.value}/{warning.kind.value}] "
+            f"{target}{column}: {warning.message}"
         )
     return "\n".join(lines) + "\n"
 

@@ -31,12 +31,12 @@ CREATE UNIQUE INDEX ASYNC "uq_users_email" ON "users" ("email");
 CREATE INDEX ASYNC "idx_orders_user" ON "orders" ("user_id");
 
 -- Warnings
-[MANUAL] users.is_active: TINYINT(1) is mapped to boolean by convention; values outside 0/1 would not be represented and require review.
-[MANUAL] users.status: ENUM is not supported by Aurora DSQL; mapped to text with a CHECK constraint. ENUM ordering semantics are not preserved.
-[MANUAL] users.roles: SET has no lossless mapping in Aurora DSQL; mapped to text. Multi-value set semantics must be handled in the application.
-[MANUAL] users.id: AUTO_INCREMENT column 'id' produces monotonic keys that cause hot partitions in Aurora DSQL; the integer key was kept. Consider a UUID/random key or a cached identity.
-[MANUAL] orders.id: AUTO_INCREMENT column 'id' produces monotonic keys that cause hot partitions in Aurora DSQL; the integer key was kept. Consider a UUID/random key or a cached identity.
-[MANUAL] orders: Foreign key constraints (fk_orders_user) are not supported by Aurora DSQL and were removed from the DDL. They are preserved as referential metadata; enforce referential integrity in the application layer.
-[UNSUPPORTED] events: Aurora DSQL requires every table to have a primary key. Add a primary key (e.g., a UUID/random key) before migrating the table.
-[UNSUPPORTED] trg_users_audit: Triggers are not supported by Aurora DSQL and are not auto-converted. Reimplement the trigger logic in the application or with event-driven processing.
-[UNSUPPORTED] sp_recalc_totals: Procedural stored procedures/functions are not auto-converted. Reimplement them as LANGUAGE SQL functions or move the logic to the application.
+[MANUAL/LOSS] users.is_active: TINYINT(1) is mapped to boolean by convention; values outside 0/1 would not be represented and require review.
+[MANUAL/LOSS] users.status: ENUM is not supported by Aurora DSQL; mapped to text with a CHECK constraint. ENUM ordering semantics are not preserved.
+[MANUAL/LOSS] users.roles: SET has no lossless mapping in Aurora DSQL; mapped to text. Multi-value set semantics must be handled in the application.
+[MANUAL/RECOMMENDATION] users.id: The integer key from AUTO_INCREMENT column 'id' was kept and converts cleanly. For higher insert throughput, consider a UUID/random key or a cached identity: DSQL stores rows in primary-key order, so a monotonically increasing key concentrates writes on one partition.
+[MANUAL/RECOMMENDATION] orders.id: The integer key from AUTO_INCREMENT column 'id' was kept and converts cleanly. For higher insert throughput, consider a UUID/random key or a cached identity: DSQL stores rows in primary-key order, so a monotonically increasing key concentrates writes on one partition.
+[MANUAL/LOSS] orders: Foreign key constraints (fk_orders_user) are not supported by Aurora DSQL and were removed from the DDL. They are preserved as referential metadata; enforce referential integrity in the application layer.
+[UNSUPPORTED/LOSS] events: Aurora DSQL requires every table to have a primary key. Add a primary key (e.g., a UUID/random key) before migrating the table.
+[UNSUPPORTED/LOSS] trg_users_audit: Triggers are not supported by Aurora DSQL and are not auto-converted. Reimplement the trigger logic in the application or with event-driven processing.
+[UNSUPPORTED/LOSS] sp_recalc_totals: Procedural stored procedures/functions are not auto-converted. Reimplement them as LANGUAGE SQL functions or move the logic to the application.

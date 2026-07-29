@@ -5,6 +5,122 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.151
+
+### Fixed
+
+- **A CDC teardown on customer-supplied subnets no longer strands a billable MSK
+  cluster.** The offset-seeder Lambda answers CloudFormation with an HTTPS PUT to S3, so
+  the connector security group must still permit 443 when the custom resource is
+  deleted. That rule was made **inline** on the security group for exactly this reason
+  (an inline rule cannot be deleted while the Lambda's ENI references the SG) — but it
+  was gated on the stack owning its own network. On a BYO-subnet deploy the SG fell back
+  to the *standalone* `ConnectorHttpsEgress` resource, which CloudFormation deletes in
+  parallel with the custom resource. Observed on `mysql-dsql-cdc-stack-0727`: the egress
+  rule was gone before the seeder's `Delete` ran, its response timed out three times
+  (5 min each), and the stack landed in `DELETE_FAILED` — leaving an **ACTIVE MSK
+  Serverless cluster billing**. The inline rule is now created on **both** network
+  modes, and the redundant standalone resource is removed so it cannot reintroduce the
+  race.
+
+## v0.1.150
+
+### Fixed
+
+- **A half-deleted CDC stack is no longer offered for "Attach", and no longer goes
+  silent.** After a teardown that ended in `DELETE_FAILED`, the Data Migration step
+  showed an inviting **"Attach to &lt;stack&gt; (DELETE_FAILED)"** button. Attaching to
+  such a stack cannot work — its resources are partly gone, so nothing can stream — and
+  the button buried the fact that actually mattered: the leftover **Amazon MSK / NAT was
+  still billing** with no session tracking it. Discovered stacks are now split by
+  status: failed / rolled-back / deleting ones get an **error** notice naming the
+  billing risk and telling the user to finish the delete, with **no** attach button;
+  only healthy stacks are attachable.
+  - The cross-view teardown banner no longer clears itself on a *job* that finished
+    while the *stack* is still broken. A `DELETE_FAILED` outcome — or a job record lost
+    to an app restart — used to clear the marker and hide the banner entirely. It now
+    also consults the last probed stack status, so leftover billable infrastructure
+    stays visible and actionable.
+
+- **A view's source DDL is now formatted instead of one endless line.** MySQL's
+  `SHOW CREATE VIEW` returns the whole definition on a single line prefixed with server
+  bookkeeping (`ALGORITHM=`, `DEFINER=`, `SQL SECURITY`), and it was shown raw — an
+  unreadable wall of text, and unusable in the side-by-side diff, where the target side
+  *is* pretty-printed so the two could never line up. The source is now re-rendered with
+  sqlglot in MySQL dialect and the server metadata is stripped (it has no bearing on the
+  conversion, and round-tripping `DEFINER=\`user\`@\`host\`` turned its backticks into
+  double quotes — invalid MySQL shown to the user). An unparseable definition is still
+  shown verbatim, which is exactly when the operator needs to see it as-is.
+- **The object browser is locked while a schema apply runs.** The apply worker is handed
+  a fixed object list when it starts, so re-ticking mid-run could not change what it
+  writes — it only desynchronized the screen from the target. Worse, "Generate DDL" or
+  "Reset all" during a run would swap or discard the DDL the in-flight apply is
+  executing. The tree, the bulk buttons, the filter, the source refresh, Generate and
+  Reset are all disabled with an explanation while the apply is in progress.
+
+### Changed
+
+- **The object browser's two panels now line up.** "Select all" / "Unselect all" moved
+  onto the **Source (MySQL)** header row (beside the refresh) and the primary-key legend
+  moved below the tree. Both used to sit above the source tree, pushing it down while
+  the target tree started right after its filter — so the side-by-side comparison read
+  as visibly misaligned.
+
+- **A failed "drop & replace" now says how to fix it, instead of repeating the
+  database's dangerous hint.** Replacing a table that a view still selects from failed
+  with the raw driver error — `cannot drop table … because other objects depend on it
+  … HINT: Use DROP ... CASCADE`. That hint is the wrong advice here: cascading would
+  silently delete a view this tool may not be able to recreate. The apply already
+  pre-drops every view **in the selection** before recreating tables, so a blocking
+  view simply was not selected (typically created by an earlier apply). The failure now
+  names the blocking view and says to select it in the object browser and re-run — the
+  pre-pass then drops it first and its own apply unit recreates it — while explicitly
+  steering away from `DROP ... CASCADE`. Dependency failures are no longer OCC-retried
+  either: a dependency is hard state, not a transient conflict.
+
+### Changed
+
+- **Schema Conversion now separates recommendations from real conversion gaps.**
+  Everything was listed under **"Conversion warnings"** with the same amber `MANUAL`
+  badge, so throughput advice looked like a defect: a kept `AUTO_INCREMENT` key
+  converts perfectly and works — moving to a UUID/random or cached-identity key is a
+  *performance* suggestion for DSQL's partitioning, not a problem to fix. It sat right
+  next to "foreign key constraints were removed from the DDL", which genuinely dropped
+  something. Conversion notes now carry a `kind` (`LOSS` / `RECOMMENDATION`) and the UI
+  renders two sections: **Conversion warnings** (something could not be carried over or
+  changed meaning — keeps the MANUAL/UNSUPPORTED severity) and **Recommendations**
+  (calm info-blue `RECOMMENDED` badge, with a line clarifying the conversion is
+  complete). The per-object header counts them separately too, so a table whose only
+  note is advice no longer reads as "Review needed · 1 warning".
+  - Notes default to `LOSS` — what every note historically meant — so only the
+    AUTO_INCREMENT key notes opt into `RECOMMENDATION`. The composite-key note stays a
+    `LOSS`: it really does change what the application must key on.
+  - The AUTO_INCREMENT messages were reworded to lead with what happened ("the integer
+    key was kept and converts cleanly") instead of with "causes hot partitions", which
+    described a risk as though it were a failure.
+- **The primary-key picker uses AWS-style tiles instead of a segmented control.**
+  Keep source PK vs Composite key is a design decision with lasting consequences (a
+  composite key changes every query, join and upsert, and DSQL keys are immutable once
+  created), so each option now gets a Cloudscape "Tiles" card explaining the trade-off
+  — the pattern AWS uses for consequential choices, where a segmented control is for
+  switching views. Added `radio_tiles` to `ui/design.py` as the single source of truth
+  for that look.
+- **The source/target DDL diff now uses the AWS Console code-surface treatment.** Every
+  changed line was filled with a solid red or green wash — and because a heterogeneous
+  MySQL→DSQL conversion rewrites nearly every line, that painted the whole panel. It
+  read as an error report rather than a review surface, and the saturated fill competed
+  with the monospace text. The code area is now **neutral** (white surface, quiet
+  header) and the change is carried by a narrow **`+` / `−` status gutter** plus a
+  barely-there row wash (a `-50` shade at 40% alpha). Color is no longer the only
+  signal, so the diff stays legible in a monochrome screenshot and for a colorblind
+  reader. Only the side that actually changed is marked, so a rewritten line is one
+  before/after pair instead of two loud blocks. The tokens moved into `ui/design.py`
+  (`CODE_*` / `DIFF_*`) as the single source of truth.
+- **The "Recommendations" explanation is a tooltip, not standing text.** The
+  "optional tuning suggestions, not problems to fix" line is now on a help glyph beside
+  the heading — the `RECOMMENDED` badge and the heading already carry the message, and
+  this block repeats for every object.
+
 ## v0.1.149
 
 ### Fixed

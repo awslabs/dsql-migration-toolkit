@@ -20,6 +20,7 @@ from __future__ import annotations
 import pytest
 
 from dsql_migrator.core.converter import (
+    ConversionNoteKind,
     ConversionWarning,
     SchemaConversionResult,
     SchemaConverter,
@@ -1608,6 +1609,13 @@ class _PickerEl:
     def tooltip(self, *_a, **_k):
         return self
 
+    def on(self, event, handler=None, *_a, **_k):
+        # The PK picker uses Cloudscape radio TILES (ui/design.radio_tiles), which
+        # register their selection as a click on the tile card -- not a toggle.
+        if event == "click" and handler is not None:
+            self._recorder.tile_clicks.append(handler)
+        return self
+
     def __enter__(self):
         return self
 
@@ -1616,9 +1624,10 @@ class _PickerEl:
 
 
 class _PickerUi:
-    """Minimal NiceGUI double capturing the picker's toggle + select + notices."""
+    """Minimal NiceGUI double capturing the picker's tiles + select + notices."""
 
     def __init__(self):
+        self.tile_clicks: list = []   # tile click handlers, in render order
         self.toggle_el = None
         self.select_el = None
         self.select_options = None
@@ -1628,6 +1637,9 @@ class _PickerUi:
 
     def card(self, *_a, **_k):
         return _PickerEl(self, "card")
+
+    def badge(self, *_a, **_k):
+        return _PickerEl(self, "badge")
 
     def row(self, *_a, **_k):
         return _PickerEl(self, "row")
@@ -1669,9 +1681,9 @@ def test_pk_picker_selecting_composite_stores_composite_ddl() -> None:
     refreshed: list[bool] = []
     _render_pk_strategy_picker(ui, table, state, lambda: refreshed.append(True))
 
-    # Simulate choosing "Composite key" in the segmented control.
-    assert ui.toggle_el is not None
-    ui.toggle_el.on_change(_event("COMPOSITE"))
+    # Simulate clicking the "Composite key" tile (order: Keep source PK, Composite).
+    assert len(ui.tile_clicks) == 2
+    ui.tile_clicks[1]()
 
     stored = state.get_edited_target_ddl("orders")
     assert stored is not None
@@ -1705,7 +1717,7 @@ def test_pk_picker_switching_back_to_keep_clears_override() -> None:
         "orders", render_target_ddl(build_composite_conversion(SchemaConverter(), table, "customer_id"))
     )
     _render_pk_strategy_picker(ui, table, state, lambda: None)
-    ui.toggle_el.on_change(_event("KEEP"))
+    ui.tile_clicks[0]()  # the "Keep source PK" tile
     # Reverting to Keep source PK drops the composite override entirely.
     assert state.get_edited_target_ddl("orders") is None
 
@@ -1722,9 +1734,9 @@ def test_pk_picker_disables_composite_when_no_eligible_leading() -> None:
         primary_key=["id"],
     )
     _render_pk_strategy_picker(ui, table, state, lambda: None)
-    # No NOT NULL non-PK column -> composite offered but the control is disabled,
-    # and no dropdown/notice is rendered.
-    assert ui.toggle_el is not None and ui.toggle_el.disabled
+    # No NOT NULL non-PK column -> the tiles render but the group is locked, so no
+    # click handler is wired and no dropdown/notice appears.
+    assert ui.tile_clicks == []
     assert ui.select_el is None
 
 
@@ -1738,7 +1750,8 @@ def test_pk_picker_not_rendered_for_table_without_primary_key() -> None:
     )
     _render_pk_strategy_picker(ui, keyless, state, lambda: None)
     # No PK -> no hot-partition concern -> the picker renders nothing.
-    assert ui.toggle_el is None
+    assert ui.tile_clicks == []
+    assert ui.select_el is None
 
 
 # ---------------------------------------------------------------------------
@@ -1953,3 +1966,388 @@ def test_cdc_apply_block_message_is_actionable() -> None:
     assert "Data Migration" in CDC_APPLY_BLOCK_BODY
     assert "DDL is not replicated" in CDC_APPLY_BLOCK_BODY
     assert "CDC is streaming to the target" in CDC_APPLY_BLOCK_HEADER
+
+
+# ---------------------------------------------------------------------------
+# Conversion notes — recommendations are separated from real conversion gaps
+# ---------------------------------------------------------------------------
+
+
+class _NotesUi:
+    """NiceGUI double recording the notes block's labels, badges, icons, tooltips."""
+
+    def __init__(self):
+        self.texts: list[str] = []
+        self.badges: list[str] = []
+        self.icons: list[str] = []
+        self.tooltips: list[str] = []
+
+    class _El:
+        def __init__(self, rec):
+            self._rec = rec
+
+        def classes(self, *_a, **_k):
+            return self
+
+        def props(self, *_a, **_k):
+            return self
+
+        def tooltip(self, text="", *_a, **_k):
+            self._rec.tooltips.append(str(text))
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def label(self, text="", *_a, **_k):
+        if text:
+            self.texts.append(str(text))
+        return self._El(self)
+
+    def badge(self, text="", *_a, **_k):
+        self.badges.append(str(text))
+        return self._El(self)
+
+    def icon(self, name="", *_a, **_k):
+        if name:
+            self.icons.append(str(name))
+        return self._El(self)
+
+    def row(self, *_a, **_k):
+        return self._El(self)
+
+    def column(self, *_a, **_k):
+        return self._El(self)
+
+
+def _loss_note(message="Foreign keys (fk) are not supported and were removed."):
+    return ConversionWarning(
+        object_name="t", classification=Classification.MANUAL, message=message
+    )
+
+
+def _recommendation_note(message="The integer key was kept; consider a UUID key."):
+    return ConversionWarning(
+        object_name="t",
+        column_name="id",
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.RECOMMENDATION,
+        message=message,
+    )
+
+
+def test_split_conversion_notes_defaults_to_loss() -> None:
+    # LOSS is what every note historically meant, so anything that does not opt into
+    # RECOMMENDATION -- including a payload restored from an older snapshot -- keeps
+    # its current (warning) treatment.
+    from dsql_migrator.ui.schema_conversion import split_conversion_notes
+
+    losses, recs = split_conversion_notes([_loss_note(), _recommendation_note()])
+    assert len(losses) == 1 and len(recs) == 1
+    assert losses[0].kind is ConversionNoteKind.LOSS  # implicit default
+    assert split_conversion_notes([]) == ([], [])
+
+
+def test_conversion_notes_render_recommendations_in_their_own_section() -> None:
+    """A recommendation must not wear the amber MANUAL warning badge.
+
+    A kept AUTO_INCREMENT key converts perfectly and works -- switching to a
+    UUID/random key is throughput advice, not a defect. It used to sit under
+    "Conversion warnings" with the same badge as a removed foreign key, which
+    overstated it.
+    """
+    from dsql_migrator.ui.schema_conversion import _render_conversion_warnings
+
+    ui = _NotesUi()
+    _render_conversion_warnings(ui, [_recommendation_note(), _loss_note()])
+
+    assert "Conversion warnings" in ui.texts
+    assert "Recommendations" in ui.texts
+    # The advice gets the calm RECOMMENDED badge; the real gap keeps its severity.
+    assert "RECOMMENDED" in ui.badges
+    assert "MANUAL" in ui.badges
+
+
+def test_conversion_notes_omit_the_warnings_heading_when_only_advice() -> None:
+    # A table whose ONLY note is advice must not show a "Conversion warnings" heading
+    # at all -- there is nothing wrong with it.
+    from dsql_migrator.ui.schema_conversion import _render_conversion_warnings
+
+    ui = _NotesUi()
+    _render_conversion_warnings(ui, [_recommendation_note()])
+    assert "Conversion warnings" not in ui.texts
+    assert "Recommendations" in ui.texts
+    assert "MANUAL" not in ui.badges
+
+
+def test_recommendations_explanation_is_a_tooltip_not_standing_text() -> None:
+    # The "optional, not problems to fix" wording belongs in a help tooltip: the badge
+    # and heading already carry it, and this block repeats per object, so a permanent
+    # paragraph is noise.
+    from dsql_migrator.ui.schema_conversion import _render_conversion_warnings
+
+    ui = _NotesUi()
+    _render_conversion_warnings(ui, [_recommendation_note()])
+    assert "help_outline" in ui.icons
+    assert any("not problems to fix" in t for t in ui.tooltips)
+    # It must NOT be rendered as a visible label.
+    assert not any("not problems to fix" in t for t in ui.texts)
+
+
+# ---------------------------------------------------------------------------
+# DDL diff rendering — AWS code-surface treatment
+# ---------------------------------------------------------------------------
+
+
+class _DiffCellUi:
+    """Double recording a diff cell's emitted labels and the classes applied."""
+
+    def __init__(self):
+        self.labels: list[str] = []
+        self.classes: list[str] = []
+
+    class _El:
+        def __init__(self, rec):
+            self._rec = rec
+
+        def classes(self, value="", *_a, **_k):
+            if value:
+                self._rec.classes.append(value)
+            return self
+
+        def props(self, *_a, **_k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def label(self, text="", *_a, **_k):
+        self.labels.append(str(text))
+        return self._El(self)
+
+    def row(self, *_a, **_k):
+        return self._El(self)
+
+
+def test_diff_cell_marks_the_changed_side_with_a_gutter_glyph() -> None:
+    """Change is carried by a +/- gutter, not by washing the code area.
+
+    A heterogeneous conversion rewrites nearly every line, so tinting each changed row
+    filled the whole panel red/green -- it read as an error report and made the
+    monospace text harder to read. Color is also never the only signal.
+    """
+    from dsql_migrator.ui.schema_conversion import DiffKind, _render_diff_cell
+
+    removed = _DiffCellUi()
+    _render_diff_cell(removed, "PRIMARY KEY (`id`),", DiffKind.REPLACE, "left")
+    assert removed.labels[0] == "−"  # the gutter mark comes first
+    assert removed.labels[1] == "PRIMARY KEY (`id`),"
+
+    added = _DiffCellUi()
+    _render_diff_cell(added, 'PRIMARY KEY ("id")', DiffKind.REPLACE, "right")
+    assert added.labels[0] == "+"
+
+    # An unchanged row carries no glyph and no tint.
+    same = _DiffCellUi()
+    _render_diff_cell(same, "  `depth` tinyint", DiffKind.EQUAL, "left")
+    assert same.labels[0] == " "
+    blob = " ".join(same.classes)
+    assert "rose" not in blob and "emerald" not in blob
+
+
+def test_diff_cell_code_text_stays_on_a_neutral_surface() -> None:
+    # The tint goes on the ROW; the code label itself must never carry a semantic fill,
+    # or the text sits on colored ground again.
+    from dsql_migrator.ui.schema_conversion import DiffKind, _render_diff_cell
+
+    ui = _DiffCellUi()
+    _render_diff_cell(ui, "some sql", DiffKind.INSERT, "right")
+    # The last classes() call belongs to the code label.
+    code_classes = ui.classes[-1]
+    assert "font-mono" in code_classes
+    assert "rose" not in code_classes and "emerald" not in code_classes
+
+
+def test_diff_only_the_side_that_changed_is_marked() -> None:
+    # A REPLACE is one before/after pair, not two loud blocks; DELETE marks only the
+    # source and INSERT only the target.
+    from dsql_migrator.ui.schema_conversion import DiffKind, _diff_side_role
+
+    assert _diff_side_role(DiffKind.REPLACE, "left") == "removed"
+    assert _diff_side_role(DiffKind.REPLACE, "right") == "added"
+    assert _diff_side_role(DiffKind.DELETE, "right") == "unchanged"
+    assert _diff_side_role(DiffKind.INSERT, "left") == "unchanged"
+    assert _diff_side_role(DiffKind.EQUAL, "left") == "unchanged"
+
+
+# ---------------------------------------------------------------------------
+# Object browser — layout + apply lock
+# ---------------------------------------------------------------------------
+
+
+def _browser_fn_source() -> str:
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+
+    return inspect.getsource(sc._render_browser_and_preview)
+
+
+def test_bulk_select_buttons_live_in_the_source_header() -> None:
+    """Select all / Unselect all belong on the "Source (MySQL)" header row.
+
+    On their own row below the header they pushed the source filter box down, so the
+    source and target panels started at different y-positions and the side-by-side
+    comparison read as misaligned.
+    """
+    src = _browser_fn_source()
+    header_at = src.index('"Source (MySQL)"')
+    select_all_at = src.index('"Select all"')
+    filter_at = src.index('placeholder="Filter objects by name"')
+    # The bulk buttons come AFTER the header label and BEFORE the filter input...
+    assert header_at < select_all_at < filter_at
+    # ...and inside the same header row, i.e. no separate full-width row is opened
+    # between the header label and the buttons.
+    between = src[header_at:select_all_at]
+    assert 'classes("items-center gap-1 w-full no-wrap")' not in between
+
+
+def test_pk_legend_is_below_the_tree_so_both_panels_align() -> None:
+    # The legend used to sit between the filter and the tree, pushing the SOURCE tree
+    # down while the target tree started right after its filter.
+    src = _browser_fn_source()
+    filter_at = src.index('placeholder="Filter objects by name"')
+    tree_at = src.index("tree = ui.tree(")
+    legend_at = src.index('"Table has a primary key"')
+    assert filter_at < tree_at < legend_at, (
+        "the PK legend must render after the tree, not between filter and tree"
+    )
+
+
+def test_object_browser_takes_an_apply_in_progress_flag() -> None:
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+
+    params = inspect.signature(sc._render_browser_and_preview).parameters
+    assert "apply_in_progress" in params
+    assert params["apply_in_progress"].default is False  # opt-in, never locks by accident
+
+
+def test_apply_in_progress_locks_every_selection_control() -> None:
+    """A running apply must freeze the selection AND the DDL it is executing.
+
+    The worker was handed a fixed object list at start, so re-ticking cannot change
+    what it writes -- it would only desynchronize the screen from the target. Worse,
+    "Generate DDL" or "Reset all" mid-run would swap or discard the DDL under the
+    in-flight apply.
+    """
+    src = _browser_fn_source()
+    # Each control is guarded by the flag.
+    for control in ("select_all_btn", "unselect_all_btn", "src_filter", "tree", "gen_btn"):
+        assert control in src, control
+    # The tree, filter and bulk buttons are disabled under the flag.
+    assert src.count("if apply_in_progress:") >= 4
+    # Quasar's q-tree has NO `disable` prop, so props("disable") is silently ignored
+    # and the tree would stay fully clickable. It must be blocked with
+    # pointer-events-none (the same way the Data Migration table picker does it).
+    assert 'tree.classes("pointer-events-none opacity-70")' in src
+    assert 'tree.props("disable")' not in src, (
+        "q-tree ignores the disable prop -- use pointer-events-none"
+    )
+    # q-input DOES accept disable, so the filter can use the prop.
+    assert 'src_filter.props("disable")' in src
+    # Generate and Reset are both blocked (they would change the applied DDL).
+    assert "gen_btn.disable()" in src
+    assert "reset_btn.disable()" in src
+    # And the user is told why, rather than facing silently dead controls.
+    assert "Selection is locked while the schema apply runs" in src
+
+
+def test_apply_in_progress_is_wired_from_the_step_status() -> None:
+    # The flag must come from the real in-progress signal, not be hardcoded.
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+
+    screen_src = inspect.getsource(sc.build_schema_conversion_screen)
+    assert "apply_in_progress=status is StepStatus.IN_PROGRESS" in screen_src
+
+
+# ---------------------------------------------------------------------------
+# View source DDL — readable, and diffable against the pretty-printed target
+# ---------------------------------------------------------------------------
+
+
+_RAW_VIEW = (
+    "CREATE ALGORITHM=UNDEFINED DEFINER=`dalyoung`@`%` SQL SECURITY DEFINER VIEW "
+    "`ecommerce_demo`.`customer_order_summary` AS select `c`.`customer_id` AS "
+    "`customer_id`,`co`.`country_name` AS `country_name`,count(distinct "
+    "`o`.`order_id`) AS `order_count` from ((`ecommerce_demo`.`customers` `c` join "
+    "`ecommerce_demo`.`countries` `co` on((`co`.`country_id` = `c`.`country_id`))) "
+    "left join `ecommerce_demo`.`orders` `o` on((`o`.`customer_id` = "
+    "`c`.`customer_id`))) group by `c`.`customer_id`,`co`.`country_name`"
+)
+
+
+def test_view_source_ddl_is_pretty_printed() -> None:
+    """MySQL returns SHOW CREATE VIEW on ONE line; the diff needs it formatted.
+
+    Shown raw it was an unreadable wall of text -- and unusable in the side-by-side
+    view, where the target side IS pretty-printed, so a one-line source could never
+    align with it.
+    """
+    from dsql_migrator.ui.schema_conversion import render_source_view_ddl
+
+    out = render_source_view_ddl(
+        ViewDef(name="ecommerce_demo.customer_order_summary", definition=_RAW_VIEW)
+    )
+    assert len(out.splitlines()) > 5, "the one-line definition must be broken up"
+    assert "CREATE VIEW" in out
+    # The SELECT list is on its own lines, not run together.
+    assert "SELECT\n" in out
+
+
+def test_view_source_ddl_drops_server_metadata() -> None:
+    # ALGORITHM/DEFINER/SQL SECURITY is server bookkeeping irrelevant to the
+    # conversion -- and sqlglot mangles DEFINER's backticks into double quotes when it
+    # round-trips them, which would show the user invalid MySQL.
+    from dsql_migrator.ui.schema_conversion import render_source_view_ddl
+
+    out = render_source_view_ddl(ViewDef(name="v", definition=_RAW_VIEW))
+    assert "DEFINER" not in out
+    assert "ALGORITHM" not in out
+    assert "SQL SECURITY" not in out
+    assert '"dalyoung"' not in out  # the mangled form must never appear
+
+
+def test_view_source_ddl_keeps_unparseable_definitions_verbatim() -> None:
+    # An unparseable definition is exactly when the user needs the source as-is.
+    from dsql_migrator.ui.schema_conversion import render_source_view_ddl
+
+    junk = "CREATE VIEW x AS SELECT ((( not sql at all %%%"
+    assert render_source_view_ddl(ViewDef(name="x", definition=junk)) == junk
+
+
+def test_view_source_ddl_wraps_a_bare_select_body() -> None:
+    # Some introspection paths return only the SELECT body; the CREATE VIEW header
+    # must survive pretty-printing or the source loses the object's identity.
+    from dsql_migrator.ui.schema_conversion import render_source_view_ddl
+
+    out = render_source_view_ddl(ViewDef(name="s.v", definition="select 1 as a"))
+    assert out.startswith("CREATE VIEW s.v")
+    assert "SELECT" in out
+
+
+def test_view_source_ddl_reports_a_missing_definition() -> None:
+    from dsql_migrator.ui.schema_conversion import render_source_view_ddl
+
+    out = render_source_view_ddl(ViewDef(name="s.v", definition=""))
+    assert "unavailable" in out.lower()
+    assert "s.v" in out

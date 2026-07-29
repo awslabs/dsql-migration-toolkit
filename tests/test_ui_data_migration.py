@@ -7303,3 +7303,104 @@ def test_worker_result_carries_index_failures_for_the_parent() -> None:
     )
     assert r.index_failures == ("ix_a: boom",)
     assert _TableWorkerResult(table_name="t", status="DONE").index_failures == ()
+
+
+# ---------------------------------------------------------------------------
+# Discovered cdc-stacks — a failed/deleting stack must not be offered for attach
+# ---------------------------------------------------------------------------
+
+
+def test_split_attachable_stacks_excludes_failed_and_deleting() -> None:
+    """A DELETE_FAILED stack must never be offered as "Attach to <stack>".
+
+    Its resources are partly gone, so attaching yields a dead session — and the
+    inviting Attach button hid the fact that actually matters: a teardown did not
+    finish, so the leftover Amazon MSK / NAT may still be BILLING. (Observed for real:
+    mysql-dsql-cdc-stack-0727 sat in DELETE_FAILED with an ACTIVE MSK Serverless
+    cluster while the UI offered to attach to it.)
+    """
+    from dsql_migrator.ui.data_migration import split_attachable_stacks
+
+    stacks = [
+        ("mysql-dsql-cdc-good", "CREATE_COMPLETE"),
+        ("mysql-dsql-cdc-stack-0727", "DELETE_FAILED"),
+        ("mysql-dsql-cdc-rolled", "ROLLBACK_COMPLETE"),
+        ("mysql-dsql-cdc-going", "DELETE_IN_PROGRESS"),
+        ("mysql-dsql-cdc-updated", "UPDATE_COMPLETE"),
+    ]
+    attachable, needs_cleanup = split_attachable_stacks(stacks)
+    assert [n for n, _ in attachable] == [
+        "mysql-dsql-cdc-good",
+        "mysql-dsql-cdc-updated",
+    ]
+    assert [n for n, _ in needs_cleanup] == [
+        "mysql-dsql-cdc-stack-0727",
+        "mysql-dsql-cdc-rolled",
+        "mysql-dsql-cdc-going",
+    ]
+    assert split_attachable_stacks([]) == ([], [])
+
+
+def test_split_attachable_stacks_is_case_insensitive() -> None:
+    from dsql_migrator.ui.data_migration import split_attachable_stacks
+
+    _ok, bad = split_attachable_stacks([("s", "delete_failed")])
+    assert [n for n, _ in bad] == ["s"]
+
+
+def test_stack_status_needs_cleanup_keeps_the_banner_alive() -> None:
+    """The JOB finishing is not the same as the STACK being gone.
+
+    A delete that ends in DELETE_FAILED (or a job record lost to an app restart)
+    previously cleared the teardown marker, so the cross-view banner went silent while
+    the leftover MSK / NAT kept billing with nothing in the UI saying so.
+    """
+    from dsql_migrator.ui.data_migration._status import stack_status_needs_cleanup
+
+    assert stack_status_needs_cleanup("DELETE_FAILED") is True
+    assert stack_status_needs_cleanup("ROLLBACK_COMPLETE") is True
+    assert stack_status_needs_cleanup("UPDATE_ROLLBACK_FAILED") is True
+    # A healthy or absent stack must NOT pin an alarming banner.
+    assert stack_status_needs_cleanup("CREATE_COMPLETE") is False
+    assert stack_status_needs_cleanup("UPDATE_COMPLETE") is False
+    assert stack_status_needs_cleanup(None) is False
+    assert stack_status_needs_cleanup("") is False
+
+
+def test_attach_banner_separates_cleanup_from_attachable(monkeypatch) -> None:
+    # The two situations need different treatment: cleanup is an ERROR (money is being
+    # spent), attach is a WARNING (a choice). A DELETE_FAILED stack must get NO button.
+    from dsql_migrator.ui.data_migration import (
+        _render_cdc_existing_infra_banner,
+        DataMigrationState,
+    )
+
+    state = DataMigrationState()
+    state.set_cdc_other_stacks(
+        [
+            ("mysql-dsql-cdc-stack-0727", "DELETE_FAILED"),
+            ("mysql-dsql-cdc-good", "CREATE_COMPLETE"),
+        ]
+    )
+
+    ui = _RecordingUi()
+    buttons: list[str] = []
+    orig_button = ui.button
+
+    def _button(text="", *a, **k):
+        buttons.append(str(text))
+        return orig_button(text, *a, **k)
+
+    ui.button = _button
+    _render_cdc_existing_infra_banner(ui, state, lambda: None)
+
+    joined = " ".join(ui.texts)
+    # The stuck stack is reported as needing cleanup, and names the billing risk.
+    assert "needs cleanup" in joined
+    assert "mysql-dsql-cdc-stack-0727" in joined
+    assert "billing" in joined.lower()
+    # Attach is offered ONLY for the healthy stack.
+    assert any("Attach to mysql-dsql-cdc-good" in b for b in buttons)
+    assert not any("0727" in b for b in buttons), (
+        "a DELETE_FAILED stack must not get an Attach button"
+    )

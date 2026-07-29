@@ -643,22 +643,28 @@ Resources:
       # STANDALONE egress resource has no such ordering and is deleted in parallel
       # with the custom-resource Delete (the ConnectorHttpsEgress 0.0.0.0/0 rule was
       # observed gone BEFORE the seeder Delete ran -> cfnresponse PUT timed out ->
-      # teardown hung ~1h then DELETE_FAILED). Scoped to the S3 prefix list so it
-      # grants only what the response needs. Created only on owned networks (the
-      # gateway endpoint exists only then); customer-subnet deploys reach S3 via
-      # their own egress.
+      # teardown hung ~1h then DELETE_FAILED).
+      #
+      # ALWAYS created, on BOTH network modes. It was previously gated on
+      # CreateOwnedNetwork, on the assumption that a customer-subnet deploy "reaches S3
+      # via their own egress" -- but the customer's NAT route is irrelevant if the SG
+      # no longer permits 443, and the SG's own standalone ConnectorHttpsEgress is
+      # exactly what CloudFormation deletes in parallel. So the BYO-subnet path kept
+      # failing the same way it was fixed for owned networks: observed on
+      # mysql-dsql-cdc-stack-0727 (ConnectorSubnetIds supplied ->
+      # ConnectorHttpsEgress DELETE_COMPLETE while CdcStartPrepResource was still
+      # waiting -> three 5-min urlopen timeouts -> DELETE_FAILED, leaving an ACTIVE
+      # MSK Serverless cluster billing).
       SecurityGroupEgress:
-        Fn::If:
-          - CreateOwnedNetwork
-          - - IpProtocol: tcp
-              FromPort: 443
-              ToPort: 443
-              CidrIp: 0.0.0.0/0
-              Description: >-
-                HTTPS egress for the offset-seeder CloudFormation response during
-                teardown (S3 via gateway endpoint, other 443 via NAT). Inline so it
-                outlives the custom-resource Delete (see SG comment above).
-          - Ref: "AWS::NoValue"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: >-
+            HTTPS egress for the offset-seeder CloudFormation response during
+            teardown (S3 via the gateway endpoint on an owned network, or via the
+            customer's own NAT on supplied subnets). Inline so it outlives the
+            custom-resource Delete (see SG comment above).
 
   # MSK Serverless and the connectors share this SG; allow intra-SG Kafka traffic.
   ConnectorSelfIngress:
@@ -704,18 +710,14 @@ Resources:
         Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
       Description: Egress to MSK brokers (IAM/TLS) within the security group.
 
-  ConnectorHttpsEgress:
-    Type: AWS::EC2::SecurityGroupEgress
-    Properties:
-      GroupId:
-        Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
-      IpProtocol: tcp
-      FromPort: 443
-      ToPort: 443
-      CidrIp: 0.0.0.0/0
-      Description: >-
-        HTTPS egress to AWS endpoints (Secrets Manager, Glue, CloudWatch, DSQL
-        IAM token signer, STS). Tighten to your VPC-endpoint/NAT CIDR in prod.
+  # NOTE: the 443 HTTPS egress rule (Secrets Manager, Glue, CloudWatch, the DSQL IAM
+  # token signer, STS -- and the offset-seeder's CloudFormation response) is INLINE on
+  # ConnectorSecurityGroup, not a standalone resource here. A standalone
+  # AWS::EC2::SecurityGroupEgress is deleted in parallel with the custom-resource
+  # Delete, which is exactly how teardown broke: the rule went away first, the seeder's
+  # cfnresponse PUT timed out, and the stack landed in DELETE_FAILED with a billable MSK
+  # cluster left behind. An inline rule is part of the SG, which CloudFormation cannot
+  # delete while the seeder Lambda's ENI still references it. See that SG's comment.
 
   ConnectorDsqlEgress:
     Type: AWS::EC2::SecurityGroupEgress

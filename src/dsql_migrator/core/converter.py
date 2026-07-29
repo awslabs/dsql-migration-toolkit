@@ -99,6 +99,29 @@ _DType = exp.DataType.Type
 # ---------------------------------------------------------------------------
 
 
+class ConversionNoteKind(str, Enum):
+    """Whether a conversion note is a real gap or just advice.
+
+    ``Classification`` answers "how much work" (MANUAL vs UNSUPPORTED) but not "is
+    anything actually wrong". Those are different questions, and conflating them
+    made advice look like a defect: a kept AUTO_INCREMENT key converts perfectly and
+    works -- switching to a UUID/random or cached-identity key is a *throughput*
+    recommendation for DSQL's partitioning, not a problem to fix. Presenting it with
+    the same amber "warning" treatment as a removed foreign key (which genuinely
+    dropped a constraint from the DDL) overstated it.
+
+    * ``LOSS`` -- the conversion could not carry something over, or changed
+      semantics: a removed foreign key, a dropped collation, an unmapped type, a
+      table that needs a primary key. Something is missing or different, and the
+      operator has to decide what to do about it.
+    * ``RECOMMENDATION`` -- the conversion is complete and correct; this is advice
+      about running well on DSQL. Ignoring it costs performance, not correctness.
+    """
+
+    LOSS = "LOSS"
+    RECOMMENDATION = "RECOMMENDATION"
+
+
 class ConversionWarning(BaseModel):
     """A structured warning emitted when a conversion is not lossless or safe.
 
@@ -127,6 +150,15 @@ class ConversionWarning(BaseModel):
     )
     classification: Classification = Field(
         description="Severity: MANUAL (review) or UNSUPPORTED (redesign)."
+    )
+    kind: "ConversionNoteKind" = Field(
+        default_factory=lambda: ConversionNoteKind.LOSS,
+        description=(
+            "Whether this note reports something the conversion could not carry "
+            "over (LOSS -- the default, and what every note historically meant) or "
+            "advice on an otherwise-complete conversion (RECOMMENDATION). The UI "
+            "shows the two in separate sections so advice is not styled as a problem."
+        ),
     )
     message: str = Field(min_length=1, description="Human-readable reason (English).")
 
@@ -1381,9 +1413,11 @@ def _apply_pk_strategy(
         if column_def is not None:
             column_def.set("kind", _build("uuid"))
         message = (
-            f"AUTO_INCREMENT column '{column_name}' produces monotonic keys that "
-            "cause hot partitions in Aurora DSQL; converted the primary key to "
-            "uuid. The application must generate UUID key values."
+            f"The primary key from AUTO_INCREMENT column '{column_name}' was "
+            "converted to uuid, which spreads inserts across Aurora DSQL partitions "
+            "(a monotonically increasing key concentrates writes on one, since DSQL "
+            "stores rows in primary-key order). The application must now generate "
+            "UUID key values."
         )
     elif strategy is PrimaryKeyStrategy.IDENTITY_WITH_CACHE:
         if column_def is not None:
@@ -1396,22 +1430,29 @@ def _apply_pk_strategy(
             constraints.append(exp.ColumnConstraint(kind=identity))
             column_def.set("constraints", constraints)
         message = (
-            f"AUTO_INCREMENT column '{column_name}' produces monotonic keys that "
-            "cause hot partitions in Aurora DSQL; converted the primary key to a "
-            f"cached identity (CACHE {_IDENTITY_CACHE_SIZE}) to spread inserts "
-            "across nodes."
+            f"The primary key from AUTO_INCREMENT column '{column_name}' was "
+            f"converted to a cached identity (CACHE {_IDENTITY_CACHE_SIZE}), which "
+            "spreads inserts across Aurora DSQL nodes (a monotonically increasing "
+            "key concentrates writes on one partition, since DSQL stores rows in "
+            "primary-key order)."
         )
     else:  # PrimaryKeyStrategy.KEEP_INTEGER
         message = (
-            f"AUTO_INCREMENT column '{column_name}' produces monotonic keys that "
-            "cause hot partitions in Aurora DSQL; the integer key was kept. "
-            "Consider a UUID/random key or a cached identity."
+            f"The integer key from AUTO_INCREMENT column '{column_name}' was kept and "
+            "converts cleanly. For higher insert throughput, consider a UUID/random "
+            "key or a cached identity: DSQL stores rows in primary-key order, so a "
+            "monotonically increasing key concentrates writes on one partition."
         )
 
+    # A RECOMMENDATION, not a LOSS: all three strategies produce a correct, complete
+    # target key -- nothing was dropped or changed in meaning. This is throughput
+    # advice about DSQL's partitioning, so it must not be styled like a removed
+    # foreign key (which genuinely lost a constraint).
     return ConversionWarning(
         object_name=table.name,
         column_name=column_name,
         classification=Classification.MANUAL,
+        kind=ConversionNoteKind.RECOMMENDATION,
         message=message,
     )
 

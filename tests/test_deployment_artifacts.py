@@ -1327,16 +1327,24 @@ def test_cdc_stack_sg_has_inline_443_egress_for_seeder_teardown(
     # MUST be INLINE on ConnectorSecurityGroup -- an inline rule is part of the SG
     # and cannot be deleted while the Lambda's ENI references the SG, which CFN can't
     # delete until the custom-resource Delete is handled. A standalone
-    # AWS::EC2::SecurityGroupEgress resource (which is what ConnectorHttpsEgress is
-    # for normal operation) has no such ordering and is deleted in parallel with the
-    # Delete -> PUT times out -> ~1h hang. So assert the SG carries an inline 443
-    # egress rule (owned-network only; 443 to 0.0.0.0/0, with S3 routing via the
-    # gateway endpoint).
+    # AWS::EC2::SecurityGroupEgress resource has no such ordering and is deleted in
+    # parallel with the Delete -> PUT times out -> ~1h hang, then DELETE_FAILED with a
+    # billable MSK cluster left behind.
+    #
+    # The rule must exist on BOTH network modes. It used to be gated on
+    # CreateOwnedNetwork ("customer subnets reach S3 via their own egress"), but the
+    # customer's NAT route is irrelevant once the SG stops permitting 443 -- so the
+    # BYO-subnet path failed exactly as the owned path had: observed on
+    # mysql-dsql-cdc-stack-0727 (ConnectorSubnetIds supplied), where the standalone
+    # egress rule was DELETE_COMPLETE while the custom resource was still waiting.
     sg = cdc_template["Resources"]["ConnectorSecurityGroup"]["Properties"]
     inline = sg.get("SecurityGroupEgress")
     assert inline is not None, "ConnectorSecurityGroup must have an inline egress rule"
-    # It's Fn::If(CreateOwnedNetwork, [<rules>], AWS::NoValue); pull the rule list.
-    rule_list = inline["Fn::If"][1] if isinstance(inline, dict) and "Fn::If" in inline else inline
+    assert not (isinstance(inline, dict) and "Fn::If" in inline), (
+        "the inline 443 egress must NOT be conditional on the network mode -- a "
+        "BYO-subnet deploy needs it for the seeder's teardown response too"
+    )
+    rule_list = inline
     https = [
         r
         for r in rule_list
@@ -1352,6 +1360,13 @@ def test_cdc_stack_sg_has_inline_443_egress_for_seeder_teardown(
     )
     assert "DestinationPrefixListId" not in https[0], (
         "must not reference a (nonexistent) AWS::EC2::VPCEndpoint PrefixListId"
+    )
+    # And the standalone duplicate must be GONE: keeping it would re-introduce the
+    # very resource whose parallel deletion broke the teardown (and it is now exactly
+    # redundant with the inline rule).
+    assert "ConnectorHttpsEgress" not in cdc_template["Resources"], (
+        "the standalone 443 egress resource must not come back -- it is deleted in "
+        "parallel with the custom-resource Delete"
     )
 
 

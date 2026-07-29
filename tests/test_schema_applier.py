@@ -739,3 +739,133 @@ def test_drop_object_retries_on_occ_conflict() -> None:
         jitter=_zero_jitter,
     )
     assert connection.executed == ['DROP VIEW IF EXISTS "v"']
+
+
+# ---------------------------------------------------------------------------
+# Dependent-object DROP failure — actionable message instead of "use CASCADE"
+# ---------------------------------------------------------------------------
+
+
+_REAL_DEPENDENCY_ERROR = (
+    "cannot drop table ecommerce_demo.countries because other objects depend on it\n"
+    "DETAIL:  view ecommerce_demo.customer_order_summary depends on table "
+    "ecommerce_demo.countries\n"
+    "HINT:  Use DROP ... CASCADE to drop the dependent objects too."
+)
+
+
+class _DependencyError(Exception):
+    """A psycopg-like ``dependent_objects_still_exist`` (SQLSTATE 2BP01)."""
+
+    def __init__(self, message: str = _REAL_DEPENDENCY_ERROR,
+                 sqlstate: str = "2BP01") -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+class _DependencyConnection(_FakeConnection):
+    """A fake connection that fails the DROP with a dependent-objects error."""
+
+    def handle_execute(self, statement: Any, _params) -> None:  # type: ignore[override]
+        text = statement if isinstance(statement, str) else statement.as_string(None)
+        if text.upper().startswith("DROP "):
+            raise _DependencyError()
+        self.executed.append(text)
+
+
+def test_is_dependent_objects_error_detects_2bp01_and_message_fallback() -> None:
+    from dsql_migrator.core.schema_applier import _is_dependent_objects_error
+
+    assert _is_dependent_objects_error(_DependencyError()) is True
+    # Message fallback when the SQLSTATE was lost (wrapped/re-raised).
+    assert _is_dependent_objects_error(
+        _DependencyError(sqlstate=None)
+    ) is True
+    assert _is_dependent_objects_error(RuntimeError("boom")) is False
+
+
+def test_dependent_objects_hint_names_the_blocking_view() -> None:
+    """The message must name the view and say to SELECT it, not to CASCADE.
+
+    The database's own HINT is "Use DROP ... CASCADE", which is wrong here: it would
+    silently destroy a view this tool may not be able to recreate. The apply pre-drops
+    every view IN THE SELECTION, so a blocking view simply was not selected.
+    """
+    from dsql_migrator.core.schema_applier import dependent_objects_hint
+
+    msg = dependent_objects_hint(_REAL_DEPENDENCY_ERROR)
+    assert "ecommerce_demo.customer_order_summary" in msg
+    assert "object browser" in msg  # tells the user WHERE to act
+    assert "re-run the apply" in msg
+    # It must actively steer AWAY from the database's CASCADE hint.
+    assert "Avoid DROP ... CASCADE" in msg
+    # Singular grammar for a single blocker.
+    assert "the view ecommerce_demo.customer_order_summary still depends on it" in msg
+
+
+def test_dependent_objects_hint_handles_several_blockers_and_none_named() -> None:
+    from dsql_migrator.core.schema_applier import dependent_objects_hint
+
+    two = (
+        _REAL_DEPENDENCY_ERROR
+        + "\nDETAIL:  view ecommerce_demo.v2 depends on table ecommerce_demo.countries"
+    )
+    msg = dependent_objects_hint(two)
+    assert "ecommerce_demo.customer_order_summary" in msg
+    assert "ecommerce_demo.v2" in msg
+    assert "still depend on it" in msg  # plural agreement
+    assert "those views" in msg
+
+    # No DETAIL line to parse -> still actionable, just unnamed.
+    generic = dependent_objects_hint(
+        "cannot drop table x because other objects depend on it"
+    )
+    assert "another object (usually a view)" in generic
+    assert "object browser" in generic
+
+
+def test_recreate_table_translates_dependency_failure() -> None:
+    # The raw driver error (and its misleading CASCADE hint) must never reach the UI.
+    connection = _DependencyConnection()
+
+    with pytest.raises(SchemaApplyError) as exc_info:
+        recreate_table(
+            [],
+            'CREATE TABLE "ecommerce_demo"."countries" ("id" integer PRIMARY KEY)',
+            connection_factory=lambda: connection,
+            occ_max_attempts=5,
+            sleep=_no_sleep,
+            jitter=_zero_jitter,
+        )
+    msg = str(exc_info.value)
+    assert "ecommerce_demo.customer_order_summary" in msg
+    assert "object browser" in msg
+    # The CREATE was never reached (the DROP failed first).
+    assert connection.executed == []
+
+
+def test_dependency_failure_is_not_occ_retried() -> None:
+    # A dependency is hard state, not a transient conflict: retrying only wastes time.
+    attempts = {"n": 0}
+
+    class _Counting(_DependencyConnection):
+        def handle_execute(self, statement: Any, _params) -> None:  # type: ignore[override]
+            text = (
+                statement if isinstance(statement, str)
+                else statement.as_string(None)
+            )
+            if text.upper().startswith("DROP "):
+                attempts["n"] += 1
+                raise _DependencyError()
+            self.executed.append(text)
+
+    with pytest.raises(SchemaApplyError):
+        recreate_table(
+            [],
+            'CREATE TABLE "s"."t" ("id" integer PRIMARY KEY)',
+            connection_factory=lambda: _Counting(),
+            occ_max_attempts=5,
+            sleep=_no_sleep,
+            jitter=_zero_jitter,
+        )
+    assert attempts["n"] == 1  # tried exactly once

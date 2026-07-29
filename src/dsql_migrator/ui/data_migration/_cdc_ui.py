@@ -96,6 +96,7 @@ from dsql_migrator.ui.data_migration._status import (
     _fetch_migration_row_counts,
     _format_eta_hint,
     _is_inflight_stack_status,
+    split_attachable_stacks,
     _migration_status_tables,
     _read_cdc_template_body,
     cdc_error_log_key,
@@ -1641,26 +1642,50 @@ def _render_cdc_adopt_or_deploy_choice(
     its monitoring view; starting fresh remains the explicit Stop/Delete path, never a
     side effect of adopting. A separate fresh deploy stays reachable but de-emphasized.
     """
-    listed = ", ".join(f"{name} ({status})" for name, status in other_stacks)
-    render_notice(
-        ui,
-        tone="warning",
-        header="Existing CDC infrastructure found",
-        body=(
-            f"This account already has CDC infrastructure: {listed}. Deploying a new "
-            "one would create a SEPARATE Amazon MSK cluster (ongoing cost). Attach to "
-            "the existing pipeline instead — the tool re-reads its live state from AWS "
-            "(if its connectors are already running, you go straight to monitoring)."
-        ),
-    )
-    with ui.row().classes("items-center gap-2 flex-wrap w-full"):  # type: ignore[attr-defined]
-        for name, _status in other_stacks:
-            def _adopt(_name=name) -> None:
-                if migration_state.adopt_cdc_stack(_name):
-                    refresh()
-            ui.button(  # type: ignore[attr-defined]
-                f"Attach to {name}", on_click=_adopt, icon="link"
-            ).props("color=primary")
+    # Failed / rolled-back / deleting stacks are NOT adoptable: their resources are
+    # partly gone, so attaching yields a dead session -- and the urgent fact ("a
+    # teardown did not finish, MSK/NAT may still be billing") was hidden behind an
+    # inviting "Attach to <stack> (DELETE_FAILED)" button.
+    attachable, needs_cleanup = split_attachable_stacks(other_stacks)
+
+    if needs_cleanup:
+        stuck = ", ".join(f"{name} ({status})" for name, status in needs_cleanup)
+        render_notice(
+            ui,
+            tone="error",
+            header="Leftover CDC infrastructure needs cleanup — it may still be billing",
+            body=(
+                f"{stuck}. A previous teardown did not finish, so this stack cannot be "
+                "used or attached to (it is partly deleted) — but its Amazon MSK / NAT "
+                "resources may still be incurring cost. Finish the delete first: use "
+                "'Delete CDC infrastructure' below, or delete the stack in the "
+                "CloudFormation console (a DELETE_FAILED stack usually needs 'Retain "
+                "resources' on whatever is stuck)."
+            ),
+        )
+
+    if attachable:
+        listed = ", ".join(f"{name} ({status})" for name, status in attachable)
+        render_notice(
+            ui,
+            tone="warning",
+            header="Existing CDC infrastructure found",
+            body=(
+                f"This account already has CDC infrastructure: {listed}. Deploying a "
+                "new one would create a SEPARATE Amazon MSK cluster (ongoing cost). "
+                "Attach to the existing pipeline instead — the tool re-reads its live "
+                "state from AWS (if its connectors are already running, you go "
+                "straight to monitoring)."
+            ),
+        )
+        with ui.row().classes("items-center gap-2 flex-wrap w-full"):  # type: ignore[attr-defined]
+            for name, _status in attachable:
+                def _adopt(_name=name) -> None:
+                    if migration_state.adopt_cdc_stack(_name):
+                        refresh()
+                ui.button(  # type: ignore[attr-defined]
+                    f"Attach to {name}", on_click=_adopt, icon="link"
+                ).props("color=primary")
     # A fresh, separate deploy stays available but de-emphasized (a duplicate MSK is
     # expensive and rarely intended). Reuses the standard deploy form + guard dialog.
     with ui.expansion(  # type: ignore[attr-defined]

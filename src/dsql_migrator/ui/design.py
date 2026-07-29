@@ -319,6 +319,103 @@ def segmented_control(
 
 
 # ---------------------------------------------------------------------------
+# Code surface + diff (Cloudscape "CodeEditor"-style)
+# ---------------------------------------------------------------------------
+
+# AWS Console renders code on a NEUTRAL surface and keeps semantic color to narrow
+# accents -- a status gutter, a border, a badge -- never a wash across the whole
+# reading area. A heterogeneous MySQL->DSQL conversion rewrites nearly every line, so
+# tinting each changed row filled the entire panel red/green: it read as an error
+# report, made the monospace text harder to read, and looked amateurish next to real
+# console surfaces. These tokens are the single source of truth for that treatment.
+CODE_SURFACE_CLASSES = "bg-white border border-slate-200 rounded-lg overflow-hidden"
+CODE_HEADER_CLASSES = "bg-slate-50 border-b border-slate-200"
+CODE_HEADER_LABEL_CLASSES = (
+    "text-xs font-semibold tracking-wide text-slate-600 uppercase"
+)
+CODE_TEXT_CLASSES = "font-mono text-xs leading-relaxed text-slate-800"
+
+# Per-change-kind styling for ONE side of a diff row, as
+# ``(gutter_mark, gutter_text_class, row_tint)``:
+# * ``gutter_mark``  -- the ``+``/``-`` glyph shown in a fixed-width gutter, so the
+#   change is legible without relying on color at all (accessibility: color is never
+#   the only signal, and it survives a monochrome screenshot).
+# * ``row_tint``     -- an almost-invisible wash (*-50/40 = 40% alpha) that groups a
+#   changed row without competing with the text. Deliberately far lighter than the
+#   previous solid *-50/*-100 fills.
+# Unchanged rows get no mark and no tint, so the eye lands only on real differences.
+DIFF_SIDE_STYLE: dict[str, tuple[str, str, str]] = {
+    "unchanged": ("", "text-slate-300", ""),
+    "removed": ("−", "text-rose-500", "bg-rose-50/40"),
+    "added": ("+", "text-emerald-600", "bg-emerald-50/40"),
+}
+DIFF_GUTTER_CLASSES = "w-4 shrink-0 select-none text-center font-mono text-xs"
+
+
+# ---------------------------------------------------------------------------
+# Radio tiles (Cloudscape "Tiles")
+# ---------------------------------------------------------------------------
+
+
+def radio_tiles(
+    ui,
+    options,
+    *,
+    selected,
+    on_select,
+    locked: bool = False,
+    compact: bool = False,
+) -> None:
+    """Render a Cloudscape "Tiles" group: bordered radio cards, one per choice.
+
+    AWS uses tiles (not a segmented control) when the choice is a *decision with
+    consequences* and each option needs a sentence of explanation -- the segmented
+    control is for switching views. This is the single source of truth for that look:
+    a bordered card per option, primary border + tint on the selected one, a
+    radio glyph, an optional leading icon, a bold label, and an optional description.
+
+    ``options`` is a sequence of ``(value, icon, label, description)`` tuples;
+    ``icon`` and ``description`` may be empty. ``selected`` is the currently chosen
+    value (compared by equality). ``on_select`` is called with the clicked value --
+    including when it is already selected, so a caller can treat re-selecting as
+    confirming a default. ``locked`` mutes the group and drops the click handlers.
+    ``compact`` drops the min-height and tightens padding for a small inline group.
+    """
+    with ui.row().classes("w-full gap-3 items-stretch no-wrap"):
+        for value, icon, label, description in options:
+            is_selected = value == selected
+            border = "border-blue-500" if is_selected else "border-gray-300"
+            bg = "bg-blue-50" if is_selected else "bg-white"
+            interactivity = (
+                "opacity-60 cursor-not-allowed"
+                if locked
+                else "cursor-pointer hover:border-blue-400"
+            )
+            padding = "p-2" if compact else "p-3"
+            tile = ui.card().classes(
+                f"flex-1 {padding} rounded-lg border {border} {bg} {interactivity} "
+                "transition-colors gap-1"
+            )
+            if not locked:
+                tile.on("click", lambda _e=None, _v=value: on_select(_v))
+            with tile:
+                with ui.row().classes("items-center gap-2 no-wrap"):
+                    ui.icon(
+                        "radio_button_checked"
+                        if is_selected
+                        else "radio_button_unchecked",
+                        color="primary" if is_selected else "grey-6",
+                    ).classes("text-lg")
+                    if icon:
+                        ui.icon(
+                            icon, color="primary" if is_selected else "grey-7"
+                        ).classes("text-lg")
+                    ui.label(label).classes("text-sm font-semibold")
+                if description:
+                    ui.label(description).classes("text-xs text-gray-600")
+
+
+# ---------------------------------------------------------------------------
 # Filter dropdown (Cloudscape collection "filtering" Select)
 # ---------------------------------------------------------------------------
 
