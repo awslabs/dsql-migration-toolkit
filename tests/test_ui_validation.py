@@ -2485,3 +2485,166 @@ def test_apply_column_exclusions_drops_excluded_but_keeps_pk() -> None:
     (out2,) = _apply_column_exclusions([t], {"products": {"id", "notes"}})
     assert "id" in [c.name for c in out2.columns]
     assert "notes" not in [c.name for c in out2.columns]
+
+
+# ---------------------------------------------------------------------------
+# Cancel copy: the stop is cooperative, so the running panel must say WHAT it is
+# waiting on instead of implying an immediate halt.
+# ---------------------------------------------------------------------------
+
+
+class _CopyUi:
+    """A minimal NiceGUI stand-in that records every emitted string.
+
+    ``_render_in_progress`` only needs row/column/label/button/spinner/
+    linear_progress; ``render_notice`` adds icon/badge. Buttons record their
+    tooltips separately so a test can assert the disabled-state explanation.
+    """
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+        self.tooltips: list[str] = []
+
+    class _El:
+        def __init__(self, owner) -> None:
+            self._owner = owner
+
+        def classes(self, *_a, **_k):
+            return self
+
+        def props(self, *_a, **_k):
+            return self
+
+        def tooltip(self, text="", *_a, **_k):
+            self._owner.tooltips.append(str(text))
+            return self
+
+        def disable(self, *_a, **_k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_e):
+            return False
+
+    def _record(self, text):
+        if text:
+            self.texts.append(str(text))
+        return self._El(self)
+
+    def label(self, text="", *_a, **_k):
+        return self._record(text)
+
+    def badge(self, text="", *_a, **_k):
+        return self._record(text)
+
+    def button(self, text="", *_a, **_k):
+        return self._record(text)
+
+    def row(self, *_a, **_k):
+        return self._El(self)
+
+    def column(self, *_a, **_k):
+        return self._El(self)
+
+    def spinner(self, *_a, **_k):
+        return self._El(self)
+
+    def icon(self, *_a, **_k):
+        return self._El(self)
+
+    def linear_progress(self, *_a, **_k):
+        return self._El(self)
+
+    def timer(self, *_a, **_k):
+        return self._El(self)
+
+    def body(self) -> str:
+        return "\n".join(self.texts)
+
+    def tooltip_body(self) -> str:
+        return "\n".join(self.tooltips)
+
+
+def _render_running(*, cancel_requested: bool):
+    from dsql_migrator.ui.validation import ValidationState, _render_in_progress
+
+    state = ValidationState()
+    state.set_progress("orders", 2, 7)
+    state.cancel_requested = cancel_requested
+
+    ui = _CopyUi()
+    _render_in_progress(ui, JobManager(), object(), state, lambda: None)
+    return ui
+
+
+def test_running_panel_before_cancel_reassures_it_can_be_left_alone() -> None:
+    ui = _render_running(cancel_requested=False)
+    body = ui.body()
+    assert "Cancel validation" in body
+    assert "safe to leave running" in body
+    # The pre-cancel tooltip sets the expectation BEFORE the click: already-running
+    # tables finish, so the stop is not instant.
+    assert "already running finish first" in ui.tooltip_body()
+
+
+def test_stopping_panel_says_what_the_cancel_is_waiting_for() -> None:
+    """A bare "Stopping…" read as a cancel that had been ignored.
+
+    The stop is cooperative and only polled before each table and every few thousand
+    merged rows, so a COUNT(*)/checksum already running on a large table finishes
+    first -- minutes, with concurrent tables doing the same. The copy has to say that,
+    or the user retries or assumes the button is broken.
+    """
+    ui = _render_running(cancel_requested=True)
+    body = ui.body()
+
+    # The label names what is being awaited, not just that it is stopping.
+    assert "waiting for the in-flight table comparisons to finish" in body
+    # The pre-cancel reassurance must be GONE -- it now describes the wind-down.
+    assert "safe to leave running" not in body
+    assert "Cancelling" in body
+    # And it explains the delay: an in-flight query cannot be interrupted.
+    assert "cannot be interrupted" in body
+    # Read-only is still stated, so a slow cancel never reads as risky.
+    assert "reads both engines" in body
+
+
+def test_stopping_tooltip_explains_the_delay_and_that_nothing_is_written() -> None:
+    tooltips = _render_running(cancel_requested=True).tooltip_body()
+    assert "Cancel already requested" in tooltips
+    # Names the two prompt cases and the one slow case, so the wait is predictable.
+    assert "not yet started are skipped" in tooltips
+    assert "no interruption point" in tooltips
+    assert "read-only" in tooltips
+
+
+def test_stopping_state_hides_the_progress_bar() -> None:
+    # The determinate bar tracks tables COMPLETING; during a wind-down it would keep
+    # advancing and contradict "Cancelling".
+    from dsql_migrator.ui.validation import ValidationState, _render_in_progress
+
+    calls = {"bars": 0}
+
+    class _Ui(_CopyUi):
+        def linear_progress(self, *a, **k):
+            calls["bars"] += 1
+            return super().linear_progress(*a, **k)
+
+    for cancel_requested, expected in ((False, 1), (True, 0)):
+        state = ValidationState()
+        state.set_progress("orders", 2, 7)
+        state.cancel_requested = cancel_requested
+        calls["bars"] = 0
+        _render_in_progress(_Ui(), JobManager(), object(), state, lambda: None)
+        assert calls["bars"] == expected, cancel_requested
+
+
+def test_cancel_button_keeps_its_name_while_stopping() -> None:
+    # The button used to relabel itself "Stopping…", which duplicated the adjacent
+    # status label and left nothing naming the requested action. It stays "Cancel
+    # validation" (disabled) -- the same shape as Full Load's "Stop Full Load".
+    body = _render_running(cancel_requested=True).body()
+    assert "Cancel validation" in body
+    assert body.count("Stopping…") == 1  # the status label only, not the button

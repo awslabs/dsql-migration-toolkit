@@ -2089,9 +2089,17 @@ def _render_in_progress(
 
     The Cancel button is a Cloudscape "normal/secondary" destructive-intent action
     (outlined, negative color) placed beside the spinner. It requests a
-    cooperative stop via the JobManager; the validator halts at the next table
-    boundary and the run ends CANCELLED. Once requested, the button switches to a
-    disabled "Stopping…" state so the click is acknowledged immediately.
+    cooperative stop via the JobManager and the run ends CANCELLED with no partial
+    report. Once requested, the button switches to a disabled "Stopping…" state so
+    the click is acknowledged immediately.
+
+    The stop is only as prompt as the validator's polling points: before each table,
+    and every few thousand merged rows inside a PK reconciliation. A ``COUNT(*)`` or
+    checksum already executing on a large table has NO interruption point, so it
+    runs to completion first (minutes), as does every table being compared
+    concurrently. The stopping copy therefore states what is being waited on rather
+    than implying an immediate halt -- a bare "Stopping…" beside the unchanged
+    "safe to leave running" panel read as a cancel that had been ignored.
     """
     stopping = (
         validation_state.cancel_requested
@@ -2112,8 +2120,15 @@ def _render_in_progress(
     with ui.column().classes("w-full gap-2"):  # type: ignore[attr-defined]
         with ui.row().classes("items-center gap-3 no-wrap"):  # type: ignore[attr-defined]
             ui.spinner(size="sm")  # type: ignore[attr-defined]
+            # Say what the stop is actually waiting for. A bare "Stopping…" looked
+            # like the cancel had not registered: the stop is COOPERATIVE and is only
+            # polled before each table and every few thousand merged rows during PK
+            # reconciliation -- so a single in-flight COUNT(*)/checksum on a large
+            # table has no polling point inside it and runs to completion first
+            # (minutes), with every concurrent table doing the same. Nothing is
+            # wedged, but the user cannot tell that from "Stopping…".
             ui.label(  # type: ignore[attr-defined]
-                "Stopping…"
+                "Stopping… waiting for the in-flight table comparisons to finish."
                 if stopping
                 else _in_progress_label(progress)
             ).classes("text-sm text-gray-700")
@@ -2126,13 +2141,31 @@ def _render_in_progress(
             # border and reads as a "spinning border" artifact. The in-progress
             # cue is the disabled state + the "Stopping…" label instead; the
             # surrounding spinner above already shows the run is active.
+            # The button keeps its own name while stopping (like Full Load's "Stop
+            # Full Load"): the label beside it already says "Stopping… waiting for
+            # …", so repeating "Stopping…" on the button said it twice and dropped
+            # the only mention of WHICH action was requested.
             cancel_button = ui.button(  # type: ignore[attr-defined]
-                "Stopping…" if stopping else "Cancel validation",
+                "Cancel validation",
                 icon="stop_circle",
                 on_click=_cancel,
             ).props("outline color=grey-8 no-caps")
             if stopping:
                 cancel_button.props("disable")  # type: ignore[attr-defined]
+                cancel_button.tooltip(  # type: ignore[attr-defined]
+                    "Cancel already requested — tables not yet started are skipped, "
+                    "and a long reconciliation stops within a few thousand rows. A "
+                    "COUNT(*) or checksum already running on a large table has no "
+                    "interruption point, so it finishes first (this can take "
+                    "minutes). Nothing is being written either way — validation is "
+                    "read-only."
+                )
+            else:
+                cancel_button.tooltip(  # type: ignore[attr-defined]
+                    "Stop the comparison. Tables not yet started are skipped; the "
+                    "ones already running finish first. Read-only, so nothing is "
+                    "left half-changed."
+                )
         # Determinate progress bar once the worker reports its first table, so the
         # user sees how far along a long multi-table run is (not just a spinner).
         if progress is not None and not stopping:
@@ -2144,16 +2177,35 @@ def _render_in_progress(
         # What this run is doing + the reassurances (background-safe, read-only,
         # cancellable) -- wrapped in an info notice so it reads as the calm "here is
         # what's happening" panel rather than loose gray text that gets skipped.
-        render_notice(
-            ui,
-            tone="info",
-            header="Comparison in progress — safe to leave running",
-            body=(
-                "Exact COUNT(*)/checksum + per-table PK reconciliation on both "
-                "engines — minutes for a large database. Runs in the background; "
-                "read-only (the target is never modified)."
-            ),
-        )
+        #
+        # Once a cancel is requested the panel must stop saying "in progress -- safe
+        # to leave running": that is the pre-cancel reassurance, and leaving it up
+        # made the requested stop look ignored. Explain the wind-down instead.
+        if stopping:
+            render_notice(
+                ui,
+                tone="info",
+                header="Cancelling — finishing the comparisons already running",
+                body=(
+                    "Tables not yet started are skipped. A COUNT(*) or checksum "
+                    "already running on a large table cannot be interrupted "
+                    "mid-query, so it completes first — minutes on a large table, "
+                    "and every table running concurrently does the same. No partial "
+                    "report is produced, and nothing is modified: validation only "
+                    "reads both engines."
+                ),
+            )
+        else:
+            render_notice(
+                ui,
+                tone="info",
+                header="Comparison in progress — safe to leave running",
+                body=(
+                    "Exact COUNT(*)/checksum + per-table PK reconciliation on both "
+                    "engines — minutes for a large database. Runs in the background; "
+                    "read-only (the target is never modified)."
+                ),
+            )
     _install_poll_timer(ui, job_manager, session, validation_state, refresh)
 
 

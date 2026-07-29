@@ -5,6 +5,26 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.158
+
+### Changed
+
+- **"Cancel validation" now says what it is waiting for.** The cancel is cooperative and
+  is only polled at two points — before each table, and every few thousand merged rows
+  inside a PK reconciliation — so a `COUNT(*)` or checksum already executing on a large
+  table has no interruption point and runs to completion first (minutes), as does every
+  table being compared concurrently. The screen showed only "Stopping…" next to an
+  unchanged "Comparison in progress — safe to leave running" panel, so a cancel that was
+  in fact winding down correctly looked like a click that had been ignored. The label now
+  reads *"Stopping… waiting for the in-flight table comparisons to finish."*, the panel
+  switches to explaining the wind-down (what is skipped, why an in-flight query cannot be
+  interrupted, and that no partial report is produced), and the button keeps its own name
+  instead of relabelling itself "Stopping…" — which duplicated the status label and left
+  nothing naming the requested action. The determinate progress bar is hidden while
+  stopping, since it tracks tables *completing* and would keep advancing against the
+  "Cancelling" message. Behavior is unchanged: this is honest feedback, not a new stop
+  mechanism, and validation remains read-only throughout.
+
 ## v0.1.157
 
 ### Fixed
