@@ -5,6 +5,27 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.149
+
+### Fixed
+
+- **Evaluation no longer opens with a migration type the user never chose.** With the
+  Migration plan step retired (v0.1.147), the journey header's migration-type banner
+  started rendering on every step — but `migration_type` always answers, because
+  full-load-only is its *default*. So the very first step greeted the user with
+  "Migration type: Full load only" and its full description, presenting an untouched
+  default as a settled decision three steps before the choice is even offered.
+  (Under the retired step this could not happen: the choice came first.) The session
+  now tracks whether the type was **explicitly chosen**, and the banner appears only
+  from that point on — the steps before it show just the progress stepper.
+  - Confirming the tile that is already selected now counts as a choice. The type has
+    a default, so clicking "Full load only" is how a user confirms it; the selector
+    previously bailed out on "no change" and left that user with no banner. The
+    sub-step reset stays scoped to a real change, so confirming disturbs nothing.
+  - The flag is persisted, so a reconnect keeps the banner for a session that had
+    already chosen — and does **not** invent a choice for one that had not. Older
+    snapshots restore as "not chosen", which is the safe direction.
+
 ## v0.1.148
 
 ### Changed

@@ -690,15 +690,67 @@ def _render_header_texts(step) -> list[str]:
     return ui.texts
 
 
-def test_journey_header_shows_the_type_banner_on_every_step() -> None:
-    # The retired Migration plan step was the ONE screen that had to suppress the
-    # banner (its two-value "Include CDC?" control contradicted the three-value
-    # label). With it gone the header is finally identical everywhere -- the
-    # "one consistent journey" the design system asks for.
+def test_journey_header_shows_the_type_banner_on_every_step_once_chosen() -> None:
+    # Once the user HAS chosen, the banner is identical on every step -- the "one
+    # consistent journey" the design system asks for. (The retired Migration plan step
+    # was the one screen that had to suppress it, because its two-value "Include CDC?"
+    # control contradicted the three-value label.)
     for step in ordered_steps():
         texts = _render_header_texts(step)
         assert "Migration type:" in texts, step
         assert "Full load + CDC" in texts, step
+
+
+def test_journey_header_hides_the_type_banner_until_a_real_choice() -> None:
+    """No banner before the user actually picks a type.
+
+    ``migration_type`` always answers -- it defaults to full-load-only -- so
+    rendering it unconditionally presented that default as a settled decision:
+    Evaluation opened with "Migration type: Full load only" plus its full blurb,
+    describing a migration nobody had chosen. Under the retired Migration plan step
+    this could not happen (the choice came first), which is why removing that step
+    exposed it.
+    """
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.workflow import _render_journey_header
+
+    fresh = SessionConnectionState()
+    assert fresh.migration_type_chosen() is False
+    assert fresh.migration_type.value == "full_load_only"  # the default still answers
+
+    for step in ordered_steps():
+        ui = _HeaderUi()
+        _render_journey_header(ui, fresh, step, lambda _s: None)
+        assert "Migration type:" not in ui.texts, step
+        assert "Full load only" not in ui.texts, step
+        # Band 1 (the stepper) still renders, so the header is not blank.
+        assert any("Evaluation" in t for t in ui.texts), step
+
+    # Choosing the type -- even choosing the value that was already the default --
+    # makes the banner appear.
+    chose_default = SessionConnectionState()
+    chose_default.set_migration_type("full_load_only")
+    ui = _HeaderUi()
+    _render_journey_header(ui, chose_default, ordered_steps()[0], lambda _s: None)
+    assert "Migration type:" in ui.texts
+    assert "Full load only" in ui.texts
+
+
+def test_journey_header_banner_gate_is_fail_closed() -> None:
+    # A state object without the flag (an older snapshot, a bare test double) must
+    # omit the banner rather than assert a choice that was never made.
+    from dsql_migrator.ui.workflow import _migration_type_chosen
+
+    class _NoFlag:
+        pass
+
+    class _Raises:
+        def migration_type_chosen(self):
+            raise RuntimeError("boom")
+
+    assert _migration_type_chosen(_NoFlag()) is False
+    assert _migration_type_chosen(_Raises()) is False
+    assert _migration_type_chosen(None) is False
 
 
 def test_retired_view_redirect_is_wired_for_the_migration_plan_step() -> None:

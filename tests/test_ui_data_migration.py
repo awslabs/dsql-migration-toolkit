@@ -3679,6 +3679,51 @@ class _StubJobManager:
         return self._jobs[job_id]
 
 
+def test_type_selector_records_a_choice_even_for_the_current_value() -> None:
+    """Clicking the already-selected tile must still record an explicit choice.
+
+    The type has a DEFAULT (Full load only), and the journey header hides its
+    migration-type banner until the user has actually chosen — so clicking that tile
+    is precisely how a user confirms the default. The selector used to bail out on
+    "no change", which left that user with no banner at all. Confirming must not
+    disturb the screen, so the sub-step reset stays scoped to a real change.
+    """
+    from dsql_migrator.ui.data_migration import (
+        DataMigrationState,
+        MigrationType,
+        _render_migration_type_selector,
+    )
+    from dsql_migrator.ui.session import SessionConnectionState
+
+    session = SessionConnectionState()
+    state = DataMigrationState()
+    state.bind_session(session)
+    state.set_active_substep("full_load")
+    assert session.migration_type_chosen() is False
+    assert state.migration_type is MigrationType.FULL_LOAD_ONLY  # the default
+
+    ui = _RecordingUi()
+    clicks: list = []
+    # Capture each tile's click handler in render order (Full load only first).
+    orig_card = ui.card
+
+    def _card(*a, **k):
+        el = orig_card(*a, **k)
+        el.on = lambda _evt, handler, *_a, **_k: (clicks.append(handler), el)[1]
+        return el
+
+    ui.card = _card
+    _render_migration_type_selector(
+        ui, state, status=StepStatus.NOT_STARTED, refresh=lambda: None, locked=False
+    )
+    assert clicks, "expected a click handler per tile"
+
+    clicks[0]()  # re-select the tile that is already active
+    assert session.migration_type_chosen() is True   # the choice IS recorded
+    assert state.migration_type is MigrationType.FULL_LOAD_ONLY  # value unchanged
+    assert state.active_substep == "full_load"  # not reset (no real change)
+
+
 def test_migration_type_unlocked_before_any_migration_starts() -> None:
     from dsql_migrator.ui.data_migration import DataMigrationState, migration_type_locked
 

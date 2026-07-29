@@ -103,6 +103,9 @@ def capture_session_snapshot(
             getattr(migration_state, "prereq_gated_mode", None)
         ),
         migration_type=migration_state.migration_type.value,  # type: ignore[attr-defined]
+        migration_type_chosen=bool(
+            getattr(session, "migration_type_chosen", lambda: False)()
+        ),
         cdc_start_mode=migration_state.cdc_start_mode(),  # type: ignore[attr-defined]
         cdc_start_gtid=migration_state._cdc_start_gtid,  # type: ignore[attr-defined]
         cdc_start_binlog_file=migration_state._cdc_start_binlog_file,  # type: ignore[attr-defined]
@@ -258,6 +261,14 @@ def apply_session_snapshot(
     # Also set directly on the session in case no migration_state is bound.
     if hasattr(session, "set_migration_type"):
         session.set_migration_type(restored_type)  # type: ignore[attr-defined]
+    # set_migration_type latches "the user chose this", so a session that never made
+    # a choice would come back from a restore looking as if it had. Re-assert the
+    # persisted flag afterwards (older snapshots carry False, which correctly hides
+    # the banner until the type is actually picked).
+    if hasattr(session, "set_migration_type_chosen"):
+        session.set_migration_type_chosen(  # type: ignore[attr-defined]
+            bool(getattr(snapshot, "migration_type_chosen", False))
+        )
 
     # Restore the CDC operator choices (start mode + manual position, LOB
     # exclusions, tracked connector names). All optional -- older snapshots leave
@@ -422,6 +433,7 @@ def session_signature(
         migration_state.active_substep,  # type: ignore[attr-defined]
         _mode_value(getattr(migration_state, "prereq_gated_mode", None)),
         migration_state.migration_type.value,  # type: ignore[attr-defined]
+        bool(getattr(session, "migration_type_chosen", lambda: False)()),
         migration_state.cdc_start_mode(),  # type: ignore[attr-defined]
         migration_state._cdc_start_gtid,  # type: ignore[attr-defined]
         migration_state._cdc_start_binlog_file,  # type: ignore[attr-defined]

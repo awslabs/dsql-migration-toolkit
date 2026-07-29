@@ -841,6 +841,27 @@ def _render_migration_diagram(
             _render_diagram_segment(ui, target)
 
 
+def _migration_type_chosen(state: "object") -> bool:
+    """Whether the session has an EXPLICITLY chosen migration type.
+
+    ``state.migration_type`` always returns a value (full-load-only is the default),
+    so it cannot distinguish "the user picked Full load only" from "the user has not
+    decided yet". The session latches a separate flag on
+    :meth:`~dsql_migrator.ui.session.SessionConnectionState.set_migration_type`.
+
+    Duck-typed and fail-closed: a state object without the flag (an older snapshot, a
+    test double) reports ``False``, so the banner is omitted rather than asserting a
+    choice that was never made.
+    """
+    getter = getattr(state, "migration_type_chosen", None)
+    if not callable(getter):
+        return False
+    try:
+        return bool(getter())
+    except Exception:  # noqa: BLE001 - decorative header; never break the page
+        return False
+
+
 def _migration_type_meta(state: "object"):
     """Return (label, icon, blurb) for the session's chosen migration type.
 
@@ -915,9 +936,16 @@ def _render_journey_header(
             if index < len(steps) - 1:
                 ui.icon("chevron_right", color="grey-5").classes("text-sm")  # type: ignore[attr-defined]
 
-    # Band 2: the migration-type banner (the choice made on Data Migration). Shown on
-    # every step -- the retired Migration plan step was the sole exception, because its
-    # two-value "Include CDC?" control read as conflicting with the three-value banner.
+    # Band 2: the migration-type banner -- only once the user has ACTUALLY chosen.
+    # ``migration_type`` always answers (it defaults to full-load-only), so rendering
+    # it unconditionally presented that default as a settled decision on the steps
+    # that come BEFORE the choice: Evaluation opened with "Migration type: Full load
+    # only" and its full blurb, describing a migration the user had never picked.
+    # (Under the retired Migration plan step this could not happen -- the choice came
+    # first.) The banner appears from the Data Migration step's selector onward, which
+    # is where the type becomes real.
+    if not _migration_type_chosen(state):
+        return
     # Layout: icon + "Migration type:" + the type name stay together on one line
     # (no-wrap), and the description wraps fully onto following lines (never
     # truncated/cut off). items-start so the icon aligns to the first line when

@@ -86,6 +86,12 @@ class SessionSnapshot(BaseModel):
     # "full_load_and_cdc"). Optional/string for forward+backward compatibility:
     # older snapshots lack it and restore as the Full-load-only default.
     migration_type: Optional[str] = None
+    # Whether the user EXPLICITLY chose that type (vs. still sitting on the
+    # default). ``migration_type`` always has a value, so this is the only way to
+    # tell the two apart; the journey header hides its migration-type banner until
+    # a real choice exists. Older snapshots lack it and restore as False, which is
+    # the safe direction (the banner reappears as soon as the type is re-picked).
+    migration_type_chosen: bool = False
     # CDC pipeline state (Phase 5). All optional with defaults so snapshots
     # written before CDC persistence restore cleanly. The manual start-position
     # override (GTID / binlog file:position) and the oversized-LOB exclusions are

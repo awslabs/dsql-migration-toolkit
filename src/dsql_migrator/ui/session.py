@@ -58,6 +58,7 @@ class SessionConnectionState:
         "aws_profile",
         "active_view",
         "_migration_type",
+        "_migration_type_chosen",
         "_cdc_infra_inputs",
         "source_secret_id",
     )
@@ -120,6 +121,10 @@ class SessionConnectionState:
         # value to keep this module free of a ``data_migration`` import (which
         # imports this module -- a cycle). Defaults to full-load-only.
         self._migration_type: str = "full_load_only"
+        # Whether the user EXPLICITLY chose the type (vs. sitting on the default).
+        # The journey header hides the migration-type banner until this is True, so
+        # the steps before the choice do not present the default as a decision.
+        self._migration_type_chosen: bool = False
         # BYO-VPC infrastructure inputs entered on the Data Migration step (its
         # Prerequisites or CDC sub-step): VpcId, subnets, plugin S3 keys, source host/secret,
         # DsqlClusterArn, etc. Filled values only; pre-seeded from the target/
@@ -264,9 +269,35 @@ class SessionConnectionState:
         """Record the chosen migration pattern (accepts a ``MigrationType`` or str).
 
         Stored as the enum's string value so this module stays import-cycle free.
+        Also latches :attr:`migration_type_chosen`: the type has a default
+        (full-load-only), so without this flag nothing could tell "the user picked
+        Full load only" apart from "the user has not decided yet".
         """
         value = getattr(migration_type, "value", migration_type)
         self._migration_type = str(value)
+        self._migration_type_chosen = True
+
+    def set_migration_type_chosen(self, chosen: bool) -> None:
+        """Set the explicit-choice latch directly (snapshot restore only).
+
+        :meth:`set_migration_type` latches it to ``True``, which is right for a real
+        user action but wrong for a restore: replaying a persisted type would make a
+        session that never chose look as if it had. The restore path re-asserts the
+        persisted value through this setter.
+        """
+        self._migration_type_chosen = bool(chosen)
+
+    def migration_type_chosen(self) -> bool:
+        """Whether the user has EXPLICITLY chosen a migration type yet.
+
+        ``migration_type`` always answers (it defaults to full-load-only), so this is
+        the only way to know the answer is real. Used to keep the journey header's
+        migration-type banner hidden on the steps that come BEFORE the choice
+        (Evaluation, Schema Conversion) -- otherwise the default was presented as a
+        settled decision the user never made. Set by :meth:`set_migration_type` and
+        restored from a session snapshot.
+        """
+        return self._migration_type_chosen
 
     def set_cdc_infra_inputs(self, inputs: dict[str, str]) -> None:
         """Replace the BYO-VPC infrastructure inputs entered for the CDC deploy."""
@@ -324,6 +355,7 @@ class SessionConnectionState:
         self.aws_profile = None
         self.active_view = None
         self._migration_type = "full_load_only"
+        self._migration_type_chosen = False
         self._cdc_infra_inputs = {}
         self.source_secret_id = None
 

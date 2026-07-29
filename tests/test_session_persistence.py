@@ -520,6 +520,72 @@ def test_cdc_start_mode_round_trips() -> None:
     assert m2.cdc_start_override() is not None
 
 
+def test_migration_type_chosen_round_trips() -> None:
+    # The journey header hides its migration-type banner until the user has actually
+    # chosen, so the "chosen" latch has to survive a restart -- otherwise a reconnect
+    # would drop the banner on a session that had already picked its type.
+    session, eval_state, conv_state, migration_state = _populated_states()
+    migration_state.bind_session(session)
+    session.set_migration_type("full_load_and_cdc")
+    assert session.migration_type_chosen() is True
+
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+    assert snapshot.migration_type_chosen is True
+
+    s2, m2 = SessionConnectionState(), DataMigrationState()
+    apply_session_snapshot(snapshot, s2, EvaluationState(), SchemaConversionState(), m2)
+    assert s2.migration_type_chosen() is True
+    assert s2.migration_type.value == "full_load_and_cdc"
+
+
+def test_restore_does_not_fake_a_choice_that_never_happened() -> None:
+    """A session that never chose must NOT come back looking as if it had.
+
+    ``apply_session_snapshot`` replays the persisted type through
+    ``set_migration_type``, which latches "the user chose this" -- so without
+    re-asserting the persisted flag afterwards, every restore would turn the
+    full-load-only DEFAULT into an apparent decision and the banner would reappear on
+    Evaluation. Older snapshots (no such field) restore as False for the same reason.
+    """
+    session, eval_state, conv_state, migration_state = _populated_states()
+    assert session.migration_type_chosen() is False  # untouched default
+
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+    assert snapshot.migration_type_chosen is False
+    assert snapshot.migration_type == "full_load_only"  # the type is still captured
+
+    s2, m2 = SessionConnectionState(), DataMigrationState()
+    apply_session_snapshot(snapshot, s2, EvaluationState(), SchemaConversionState(), m2)
+    assert s2.migration_type_chosen() is False
+    assert s2.migration_type.value == "full_load_only"
+
+    # An OLD snapshot payload lacking the field entirely behaves the same way.
+    legacy = snapshot.model_dump()
+    legacy.pop("migration_type_chosen")
+    from dsql_migrator.core.session_state_store import SessionSnapshot as _Snap
+
+    s3, m3 = SessionConnectionState(), DataMigrationState()
+    apply_session_snapshot(
+        _Snap.model_validate(legacy), s3, EvaluationState(), SchemaConversionState(), m3
+    )
+    assert s3.migration_type_chosen() is False
+
+
+def test_session_signature_changes_when_the_type_is_first_chosen() -> None:
+    # Choosing the value that was ALREADY the default still changes what the UI shows
+    # (the banner appears), so it must dirty the signature or the flag never persists.
+    session, eval_state, conv_state, migration_state = _populated_states()
+    migration_state.bind_session(session)
+    sig1 = session_signature(session, eval_state, conv_state, migration_state)
+    session.set_migration_type("full_load_only")  # same value, but now an explicit choice
+    sig2 = session_signature(session, eval_state, conv_state, migration_state)
+    assert sig2 != sig1
+
+
 def test_prereq_gated_mode_round_trips() -> None:
     # The prerequisite REPORTS are deliberately not persisted, so the run-guard
     # excuses an absent report once a run exists. That excuse must be scoped to the

@@ -1907,10 +1907,18 @@ def _render_migration_type_selector(
     selected = migration_state.migration_type
 
     def _select(new_type: MigrationType) -> None:
-        if running or new_type is selected:
+        if running:
             return
+        # Re-selecting the SAME tile still has to record the choice: the type has a
+        # default (Full load only), so clicking that tile is how a user confirms it --
+        # and the journey header keeps its migration-type banner hidden until an
+        # explicit choice exists. Bailing out on "no change" left that user with no
+        # banner at all. The substep reset / re-render stay scoped to a real change,
+        # so confirming the current type does not disturb the screen.
+        changed = new_type is not selected
         migration_state.set_migration_type(new_type)
-        migration_state.set_active_substep(None)  # default for the new type
+        if changed:
+            migration_state.set_active_substep(None)  # default for the new type
         refresh()
 
     ui.label("Migration type").classes("text-sm font-semibold")  # type: ignore[attr-defined]
