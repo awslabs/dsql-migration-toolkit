@@ -970,6 +970,34 @@ def _render_journey_header(
                 ui.label(blurb).classes("text-xs text-gray-600")  # type: ignore[attr-defined]
 
 
+def connection_nav_state(state: "object") -> str:
+    """Classify the Connect nav item's connection state for its status icon.
+
+    Three situations the nav used to render identically (the icon reflected only whether
+    Connect was the SELECTED view, so a session needing re-verification looked exactly
+    like a healthy one):
+
+    * ``"connected"``  -- both source and target verified in THIS process.
+    * ``"reconnect"``  -- restored progress but the connections are not verified:
+      credentials are never persisted (Property 7), so an app restart lands here.
+    * ``"unset"``      -- a fresh session that simply has not connected yet. Not a
+      problem, so it must not be flagged like one.
+
+    ``reconnect`` is amber, not red: the data is intact and re-entering credentials fixes
+    it, so per the design system's severity calibration it is a recoverable warning, not
+    a blocking error -- and it matches the amber reconnect banner describing the same
+    state. Pure/duck-typed so a test double works.
+    """
+    connected = bool(getattr(state, "source_verified", False)) and bool(
+        getattr(state, "target_verified", False)
+    )
+    if connected:
+        return "connected"
+    # Same "is there anything to resume" signal as the reconnect banner, so the icon and
+    # the banner can never disagree.
+    return "reconnect" if reconnect_notice(state) else "unset"
+
+
 def reconnect_notice(state: "object") -> Optional[str]:
     """Return a resume hint when restored progress needs the connections re-verified.
 
@@ -1702,13 +1730,37 @@ def build_workflow_sidebar(
                 ).classes(
                     "rounded-borders " + ("bg-blue-1" if connect_active else "")
                 ):
+                    # The icon carries the CONNECTION state, not just whether Connect
+                    # is the selected view: green = both verified, amber broken-link =
+                    # restored progress needing re-verification (a restart drops the
+                    # credentials -- Property 7), grey = not connected yet. Without this
+                    # all three looked identical, so after a restart nothing hinted that
+                    # Connect had to be revisited before anything could run.
+                    _conn = connection_nav_state(state)
+                    _icon, _color, _caption, _tip = {
+                        "connected": (
+                            "link", "positive", "Connected",
+                            "Source and target are verified.",
+                        ),
+                        "reconnect": (
+                            "link_off", "warning", "Reconnect to resume",
+                            "Credentials are not kept across a restart — re-verify "
+                            "the source and target to resume.",
+                        ),
+                    }.get(
+                        _conn,
+                        (
+                            "link",
+                            "primary" if connect_active else "grey",
+                            "Source / target",
+                            "Enter the source and target connections.",
+                        ),
+                    )
                     with ui.item_section().props("avatar"):
-                        ui.icon(
-                            "link", color="primary" if connect_active else "grey"
-                        )
+                        ui.icon(_icon, color=_color).tooltip(_tip)
                     with ui.item_section():
                         ui.item_label("Connect")
-                        ui.item_label("Source / target").props("caption")
+                        ui.item_label(_caption).props("caption")
 
                 ui.separator()
                 ui.item_label("Migration workflow").props("header").classes(

@@ -5687,6 +5687,9 @@ def test_cdc_infra_form_stack_name_field_uses_fixed_prefix_prop() -> None:
         def on(self, *_a, **_k):
             return self
 
+        def on_value_change(self, *_a, **_k):
+            return self
+
         def __enter__(self):
             return self
 
@@ -5757,6 +5760,9 @@ class _RecordingUi:
         def on(self, *_a, **_k):
             return self
 
+        def on_value_change(self, *_a, **_k):
+            return self
+
         def bind_value(self, *_a, **_k):
             return self
 
@@ -5764,6 +5770,9 @@ class _RecordingUi:
             return self
 
         def disable(self, *_a, **_k):
+            return self
+
+        def set_enabled(self, *_a, **_k):
             return self
 
         def set_text(self, *_a, **_k):
@@ -7438,6 +7447,12 @@ class _TableUi:
         def on(self, *_a, **_k):
             return self
 
+        def on_value_change(self, *_a, **_k):
+            return self
+
+        def set_enabled(self, *_a, **_k):
+            return self
+
         def __enter__(self):
             return self
 
@@ -7744,3 +7759,209 @@ def test_cdc_gate_call_sites_pass_the_escape_hatch() -> None:
     assert src.count("cdc_checks_already_passed=") == 2, (
         "both the deploy and start gates must pass cdc_checks_already_passed"
     )
+
+
+class _GateUi(_RecordingUi):
+    """A ``_RecordingUi`` that also tracks button enabled-state and input handlers.
+
+    The VPC-ID gate works IN PLACE (``set_enabled`` / ``set_text`` on elements created
+    earlier in the render, the way ``ui/connect.py`` gates its Next button) rather than
+    by re-rendering, so a test has to observe those calls and be able to fire an input's
+    saved handler -- neither of which the plain recorder exposes.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.buttons: list = []
+        self.inputs: list = []
+        self.hints: list = []
+
+    class _Btn(_RecordingUi._El):
+        def __init__(self, label: str) -> None:
+            self.label = label
+            self.enabled = True
+
+        def props(self, value="", *_a, **_k):
+            if "disable" in str(value):
+                self.enabled = False
+            return self
+
+        def set_enabled(self, value, *_a, **_k):
+            self.enabled = bool(value)
+            return self
+
+    class _Input(_RecordingUi._El):
+        def __init__(self, label: str, value: str) -> None:
+            self.label = label
+            self.value = value
+            self.handlers: dict = {}
+
+        def on(self, event, handler=None, *_a, **_k):
+            if handler is not None:
+                self.handlers[event] = handler
+            return self
+
+        def on_value_change(self, handler=None, *_a, **_k):
+            # Real NiceGUI fires this on every value change -- typing AND paste -- with a
+            # ValueChangeEventArguments; the double just keys it like any other event.
+            if handler is not None:
+                self.handlers["value_change"] = handler
+            return self
+
+        def enter(self, text: str, *, event: str = "value_change"):
+            """Simulate the user entering ``text``, then the resulting save."""
+            self.value = text
+            self.handlers[event](None)
+            return self
+
+    class _Hint(_RecordingUi._El):
+        def __init__(self) -> None:
+            self.text = ""
+
+        def set_text(self, text="", *_a, **_k):
+            self.text = str(text)
+            return self
+
+    def button(self, label="", *_a, **_k):
+        element = self._Btn(str(label))
+        self.buttons.append(element)
+        return element
+
+    def input(self, label="", *_a, value="", **_k):
+        element = self._Input(str(label), str(value or ""))
+        self.inputs.append(element)
+        return element
+
+    def label(self, text="", *_a, **_k):
+        # inline_hint() renders through ui.label and is then driven by set_text, so hand
+        # back a text-tracking element while still recording the initial text.
+        self.texts.append(str(text))
+        element = self._Hint()
+        self.hints.append(element)
+        return element
+
+    def deploy_button(self):
+        return next(b for b in self.buttons if "Deploy CDC infrastructure" in b.label)
+
+    def vpc_field(self):
+        return next(i for i in self.inputs if "VPC ID" in i.label)
+
+    def gate_hint(self) -> str:
+        return " ".join(h.text for h in self.hints if h.text)
+
+
+def _cdc_state_ready_for_deploy():
+    """A state whose CDC prerequisite checks have passed (so only the VPC ID can gate)."""
+    from dsql_migrator.core.models import (
+        MigrationMode,
+        PrerequisiteCheckId,
+        PrerequisiteReport,
+        PrerequisiteResult,
+        PrerequisiteStatus,
+    )
+
+    state = DataMigrationState()
+    state.set_prereq_report(
+        MigrationMode.CDC,
+        PrerequisiteReport.build(
+            MigrationMode.CDC,
+            [
+                PrerequisiteResult(
+                    check_id=PrerequisiteCheckId.BINLOG_ROW_FORMAT,
+                    title="Binlog row format",
+                    status=PrerequisiteStatus.PASS,
+                    required=True,
+                    detail="ROW",
+                )
+            ],
+        ),
+    )
+    return state
+
+
+def _render_deploy_action(state):
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    ui = _GateUi()
+    _cdc_ui._render_cdc_infra_deploy_action(
+        ui, state, _StubJobManager({}), lambda: None, inventory=None, session=None
+    )
+    return ui
+
+
+def test_deploy_cdc_infra_is_disabled_until_a_vpc_id_is_entered() -> None:
+    """VpcId is the one deploy input the tool cannot infer, so it must gate the button.
+
+    It was validated only in the submit path: the button looked ready, clicking it opened
+    the confirmation dialog (which runs a VPC network diagnosis and a cost estimate), and
+    only the final Deploy answered with an "Enter your VPC ID." toast. The requirement
+    has to be stated BEFORE the click.
+    """
+    ui = _render_deploy_action(_cdc_state_ready_for_deploy())
+    assert ui.deploy_button().enabled is False
+    # ...and it says what is missing rather than just going dead.
+    assert "VPC ID" in ui.gate_hint()
+
+    state = _cdc_state_ready_for_deploy()
+    state.set_cdc_infra_inputs({"vpc_id": "vpc-0123456789abcdef0"})
+    ready = _render_deploy_action(state)
+    assert ready.deploy_button().enabled is True
+    assert ready.gate_hint() == ""  # nothing missing -> no leftover hint
+
+
+def test_whitespace_only_vpc_id_still_counts_as_missing() -> None:
+    # A field focused and left holding only spaces is not a VPC ID. The submit-path check
+    # strips, so the gate must strip identically -- otherwise the button would invite a
+    # click that the dialog then rejects.
+    state = _cdc_state_ready_for_deploy()
+    state.set_cdc_infra_inputs({"vpc_id": "   "})
+    assert _render_deploy_action(state).deploy_button().enabled is False
+
+
+def test_entering_a_vpc_id_enables_deploy_without_rebuilding_the_form() -> None:
+    """The gate updates in place, so the first Deploy click is not swallowed.
+
+    Re-rendering the form from its own input handler would recreate the field being typed
+    in (losing focus) and could swap the button out from under the click.
+    """
+    ui = _render_deploy_action(_cdc_state_ready_for_deploy())
+    button = ui.deploy_button()
+    assert button.enabled is False
+
+    inputs_before = list(ui.inputs)
+    ui.vpc_field().enter("vpc-0123456789abcdef0")
+
+    assert button.enabled is True  # the SAME button object, not a replacement
+    assert ui.inputs == inputs_before  # nothing was re-created under the cursor
+    assert ui.gate_hint() == ""
+
+    # Clearing it re-locks the button instead of leaving a stale enabled state.
+    ui.vpc_field().enter("")
+    assert button.enabled is False
+    assert "VPC ID" in ui.gate_hint()
+
+
+def test_vpc_field_gates_on_value_change_and_on_blur() -> None:
+    # Blur alone is not enough: the next move after entering the ID is to click Deploy,
+    # and a click on a still-disabled button is swallowed, so the user would have to click
+    # twice. value_change (as the Connect step uses) also covers a paste, which fires no
+    # keystroke. Either event alone must open the gate.
+    ui = _render_deploy_action(_cdc_state_ready_for_deploy())
+    assert set(ui.vpc_field().handlers) >= {"blur", "value_change"}
+
+    ui.vpc_field().enter("vpc-0123456789abcdef0", event="blur")
+    assert ui.deploy_button().enabled is True
+
+    ui2 = _render_deploy_action(_cdc_state_ready_for_deploy())
+    ui2.vpc_field().enter("vpc-0123456789abcdef0", event="value_change")
+    assert ui2.deploy_button().enabled is True
+
+
+def test_prerequisite_block_takes_precedence_over_the_vpc_id_hint() -> None:
+    # Both unmet: name the prerequisite checks only. They come first in the flow, and two
+    # blocking reasons at once read as two separate problems.
+    ui = _render_deploy_action(DataMigrationState())
+    assert ui.deploy_button().enabled is False
+    body = "\n".join(ui.texts)
+    assert "Run the CDC prerequisite checks first" in body
+    assert "to enable the deploy" not in body

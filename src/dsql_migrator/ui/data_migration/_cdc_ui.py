@@ -1713,7 +1713,28 @@ def _render_cdc_infra_deploy_action(
     ).classes("text-xs text-gray-600")
 
     _render_cdc_least_privilege_note(ui, session=session)
-    _render_cdc_infra_form(ui, migration_state, session=session)
+    # The form renders BEFORE the button but drives its enabled state, so it flips the
+    # button in place (via this holder) instead of triggering a re-render, which would
+    # recreate the very field being typed in. Same approach the Connect step uses to gate
+    # its Next button from live input (``ui/connect.py``: ``update_next_state``).
+    _gate: dict = {"button": None, "hint": None}
+
+    def _sync_gate() -> None:
+        """Enable Deploy only once the VPC ID is filled in; else say what is missing."""
+        button, hint = _gate["button"], _gate["hint"]
+        if button is None or hint is None:
+            return  # a prerequisite check blocks first, so there is no gate to sync
+        if getattr(button, "is_deleted", False) or getattr(hint, "is_deleted", False):
+            return  # the panel was rebuilt while an input handler still held these
+        missing = not (migration_state.cdc_infra_inputs().get("vpc_id") or "").strip()
+        button.set_enabled(not missing)
+        hint.set_text(
+            "Enter your VPC ID above to enable the deploy." if missing else ""
+        )
+
+    _render_cdc_infra_form(
+        ui, migration_state, session=session, on_vpc_change=_sync_gate
+    )
 
     async def _confirm() -> None:
         await _open_cdc_infra_dialog(
@@ -1752,6 +1773,20 @@ def _render_cdc_infra_deploy_action(
             header="Run the CDC prerequisite checks first",
             body=_prereq_block,
         )
+        return
+
+    # VpcId is the one input the tool cannot infer (subnets/NAT, the plugin bucket, the
+    # DSQL cluster ARN, the source host and its secret are all resolved at deploy time),
+    # but it was validated only in the SUBMIT path: the button looked ready, the click
+    # opened the confirmation dialog (which runs a network diagnosis and a cost
+    # estimate), and only the final Deploy answered with an "Enter your VPC ID." toast.
+    # State the requirement before the click instead.
+    deploy_btn.tooltip(
+        "Deploy the CDC infrastructure (MSK Serverless, networking, plugins, IAM)."
+    )
+    _gate["button"] = deploy_btn
+    _gate["hint"] = inline_hint(ui, "", tone="info")
+    _sync_gate()
 
 def _render_cdc_least_privilege_note(ui, *, session=None) -> None:
     """Recommend a dedicated least-privilege CDC MySQL user before deploy.
@@ -1878,7 +1913,9 @@ def _cdc_infra_prefill(
                 pass
     return values
 
-def _render_cdc_infra_form(ui, migration_state, *, session=None) -> None:
+def _render_cdc_infra_form(
+    ui, migration_state, *, session=None, on_vpc_change=None
+) -> None:
     """Render the minimal infra inputs (just VpcId + an advanced subnet override).
 
     Everything else is resolved at deploy time: subnets/NAT from the VPC, the
@@ -1920,8 +1957,17 @@ def _render_cdc_infra_form(ui, migration_state, *, session=None) -> None:
                 current = migration_state.cdc_infra_inputs()
                 current[k] = (f.value or "").strip()
                 migration_state.set_cdc_infra_inputs(current)
+                # VpcId gates the Deploy button, so re-check it as the value changes.
+                if k == "vpc_id" and on_vpc_change is not None:
+                    on_vpc_change()
 
             field.on("blur", _save)
+            # Also gate as the value changes, not only on blur: the user's next move
+            # after entering the VPC ID is to click Deploy, and a click on a still-
+            # disabled button is swallowed. on_value_change (as the Connect step uses)
+            # covers a paste too, which fires no keystroke.
+            if key == "vpc_id":
+                field.on_value_change(_save)
 
         # Advanced: the cdc-stack name. The mandatory "mysql-dsql-cdc-" prefix is
         # rendered INSIDE the field via Quasar's built-in `prefix` prop (baseline-

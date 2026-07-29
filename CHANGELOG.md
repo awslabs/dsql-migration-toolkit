@@ -5,6 +5,40 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.155
+
+### Fixed
+
+- **"Deploy CDC infrastructure" no longer looks ready before you enter a VPC ID.** VpcId
+  is the one deploy input the tool cannot infer — subnets/NAT, the plugin S3 bucket, the
+  DSQL cluster ARN, the source host and its credentials secret are all resolved at deploy
+  time — but it was validated only in the submit path. So the button appeared enabled,
+  clicking it opened the confirmation dialog (which runs a VPC network diagnosis and a
+  cost estimate), and only after clicking Deploy did a toast say *"Enter your VPC ID."*
+  The button is now disabled until the field is filled, with a one-line hint saying what
+  is missing, and it enables as soon as you enter the ID. The gate is updated in place
+  rather than by re-rendering the form, so the field you are typing in is never recreated
+  under the cursor and the first Deploy click is not swallowed — which matters because the
+  next move after entering the ID is to click Deploy, and a click on a still-disabled
+  button is silently lost. A field holding only whitespace still counts as empty, matching
+  the submit-path check exactly, and an unmet prerequisite check still takes precedence,
+  so only one blocking reason is shown at a time.
+
+### Changed
+
+- **The sidebar Connect item now shows whether you are actually connected.** Its icon
+  reflected only whether Connect was the selected view, so a session whose credentials
+  had been dropped by an app restart (they are never persisted — Property 7) looked
+  exactly like a healthy one, and nothing hinted that Connect had to be revisited before
+  anything could run. The icon now carries the connection state: a green link with
+  "Connected" when both source and target are verified, an amber broken link with
+  "Reconnect to resume" when restored progress needs re-verification, and the neutral
+  grey link when a fresh session simply has not connected yet. Amber rather than red is
+  deliberate — the data is intact and re-entering credentials fixes it, so per the design
+  system's severity calibration it is a recoverable warning, not a blocking error, and it
+  matches the existing amber reconnect banner and diagram badge that describe the same
+  state. The icon is driven by the same signal as that banner, so the two cannot disagree.
+
 ## v0.1.154
 
 ### Fixed

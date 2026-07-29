@@ -1306,3 +1306,59 @@ def test_render_cdc_teardown_banner_failed_shows_retry_and_dismiss() -> None:
     by_label["Retry cleanup"]()
     by_label["Dismiss"]()
     assert calls == {"retry": 1, "dismiss": 1}
+
+
+# ---------------------------------------------------------------------------
+# Connect nav icon: shows the CONNECTION state, not just the selected view
+# ---------------------------------------------------------------------------
+
+
+def test_connection_nav_state_distinguishes_the_three_situations() -> None:
+    """The icon used to reflect only whether Connect was SELECTED.
+
+    So a session whose credentials had been dropped by an app restart looked exactly like
+    a healthy one, and nothing signalled that Connect had to be revisited before anything
+    could run.
+    """
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.workflow import connection_nav_state
+
+    # A fresh session is not connected, but that is normal -- not something to flag.
+    assert connection_nav_state(SessionConnectionState()) == "unset"
+
+    # Both verified in this process.
+    live = SessionConnectionState()
+    live.source_verified = True
+    live.target_verified = True
+    assert connection_nav_state(live) == "connected"
+
+    # Restored progress but unverified -> must be flagged for re-verification.
+    restored = SessionConnectionState()
+    restored.set_workflow(
+        with_status(restored.workflow, WorkflowStep.EVALUATION, StepStatus.DONE)
+    )
+    assert connection_nav_state(restored) == "reconnect"
+
+    # Half-verified still needs reconnection: both are required before anything runs.
+    half = SessionConnectionState()
+    half.source_verified = True
+    half.set_workflow(
+        with_status(half.workflow, WorkflowStep.EVALUATION, StepStatus.DONE)
+    )
+    assert connection_nav_state(half) == "reconnect"
+
+
+def test_connection_nav_state_agrees_with_the_reconnect_banner() -> None:
+    # The icon and the banner describe the same condition, so they are driven by the same
+    # signal -- otherwise one could say "reconnect" while the other stayed silent.
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.workflow import connection_nav_state, reconnect_notice
+
+    fresh = SessionConnectionState()
+    restored = SessionConnectionState()
+    restored.set_workflow(
+        with_status(restored.workflow, WorkflowStep.EVALUATION, StepStatus.DONE)
+    )
+    for state in (fresh, restored):
+        expects_reconnect = reconnect_notice(state) is not None
+        assert (connection_nav_state(state) == "reconnect") is expects_reconnect
