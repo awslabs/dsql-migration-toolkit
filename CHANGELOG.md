@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.159
+
+### Changed
+
+- **Validation's "Objects to validate" shortcuts now match every other object picker.**
+  Schema Conversion and Data Migration render their "Select all"/"Unselect all" with the
+  same treatment — primary + `done_all` for the affirmative action, grey + `remove_done`
+  for the clearing one — but Validation's "Include all"/"Exclude all" carried neither the
+  color nor the icon, so beside those screens they read as a different app. They now use
+  the shared convention, and a test asserts it against the other screens' source so the
+  three cannot drift apart again. Gating is unchanged: both stay disabled while a run is
+  in flight, and each is enabled only when it would actually change something.
+
 ## v0.1.158
 
 ### Changed

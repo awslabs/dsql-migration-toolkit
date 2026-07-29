@@ -2648,3 +2648,86 @@ def test_cancel_button_keeps_its_name_while_stopping() -> None:
     body = _render_running(cancel_requested=True).body()
     assert "Cancel validation" in body
     assert body.count("Stopping…") == 1  # the status label only, not the button
+
+
+def test_object_picker_shortcuts_match_the_other_screens_convention() -> None:
+    """The bulk include/exclude shortcuts must look like every other object picker.
+
+    Schema Conversion and Data Migration both render their "Select all"/"Unselect all"
+    with the same props -- primary + done_all for the affirmative action, grey-7 +
+    remove_done for the clearing one. Validation's equivalents carried only
+    "flat dense no-caps size=sm", so beside those screens they lost both the color and
+    the icon. Asserted against the OTHER screens' source, so changing the convention in
+    one place cannot silently leave Validation behind.
+    """
+    import inspect
+
+    from dsql_migrator.ui import data_migration, schema_conversion, validation
+
+    affirmative = "flat dense no-caps size=sm color=primary icon=done_all"
+    clearing = "flat dense no-caps size=sm color=grey-7 icon=remove_done"
+
+    # The convention is what the other two screens actually use.
+    for module in (schema_conversion, data_migration):
+        src = inspect.getsource(module)
+        assert affirmative in src, module.__name__
+        assert clearing in src, module.__name__
+
+    # Validation now follows it.
+    validation_src = inspect.getsource(validation)
+    assert affirmative in validation_src
+    assert clearing in validation_src
+
+
+def test_object_picker_shortcuts_are_disabled_while_a_run_is_in_flight() -> None:
+    # Restyling must not change the gating: both shortcuts stay locked during a run,
+    # and each is only enabled when it would actually do something.
+    from dsql_migrator.core.models import StepStatus
+    from dsql_migrator.ui.validation import ValidationState, _render_object_filter
+
+    class _Btn(_CopyUi._El):
+        def __init__(self, owner, label) -> None:
+            super().__init__(owner)
+            self.label = label
+            self.enabled = True
+
+        def set_enabled(self, value, *_a, **_k):
+            self.enabled = bool(value)
+            return self
+
+    class _Ui(_CopyUi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.buttons: list = []
+
+        def button(self, text="", *_a, **_k):
+            self.texts.append(str(text))
+            element = _Btn(self, str(text))
+            self.buttons.append(element)
+            return element
+
+        def separator(self, *_a, **_k):
+            return self._El(self)
+
+        def space(self, *_a, **_k):
+            return self._El(self)
+
+        def element(self, *_a, **_k):
+            return self._El(self)
+
+    def _render(*, status, excluded):
+        state = ValidationState()
+        state.table_exclude = set(excluded)
+        ui = _Ui()
+        _render_object_filter(ui, ["app.a", "app.b"], state, status, lambda: None)
+        return {b.label: b.enabled for b in ui.buttons if "all" in b.label}
+
+    running = _render(status=StepStatus.IN_PROGRESS, excluded=["app.a"])
+    assert running["Include all"] is False and running["Exclude all"] is False
+
+    idle = _render(status=StepStatus.NOT_STARTED, excluded=["app.a"])
+    assert idle["Include all"] is True  # something to re-include
+    assert idle["Exclude all"] is True  # something still included
+
+    nothing_excluded = _render(status=StepStatus.NOT_STARTED, excluded=[])
+    assert nothing_excluded["Include all"] is False  # already all included

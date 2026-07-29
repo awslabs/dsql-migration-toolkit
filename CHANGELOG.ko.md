@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.159
+
+### Changed
+
+- **Validation의 "Objects to validate" 단축 버튼이 다른 객체 선택 화면과 일치하게 되었습니다.**
+  Schema Conversion과 Data Migration은 "Select all"/"Unselect all"을 동일한 방식으로 —
+  긍정 동작은 primary + `done_all`, 해제 동작은 grey + `remove_done` — 렌더링하는데,
+  Validation의 "Include all"/"Exclude all"에는 색상도 아이콘도 없어서 다른 화면과 나란히 두면
+  다른 앱처럼 보였습니다. 이제 공용 규약을 따르며, 세 화면이 다시 어긋나지 않도록 다른 화면의
+  소스와 비교해 검증하는 테스트를 추가했습니다. 활성화 조건은 그대로입니다 — 실행 중에는 둘 다
+  비활성이고, 각 버튼은 실제로 무언가를 바꿀 수 있을 때만 활성화됩니다.
+
 ## v0.1.158
 
 ### Changed

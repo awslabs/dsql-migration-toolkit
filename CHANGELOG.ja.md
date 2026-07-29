@@ -5,6 +5,18 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.159
+
+### Changed
+
+- **Validation の「Objects to validate」ショートカットが他のオブジェクト選択画面と揃いました。**
+  Schema Conversion と Data Migration は「Select all」/「Unselect all」を同じ扱い —
+  肯定的な操作は primary + `done_all`、解除する操作は grey + `remove_done` — で描画して
+  いますが、Validation の「Include all」/「Exclude all」には色もアイコンもなく、それらの画面と
+  並べると別のアプリのように見えていました。現在は共通の規約に従い、3 つの画面が再びずれない
+  よう他画面のソースと突き合わせて検証するテストを追加しました。有効化の条件は変更していません —
+  実行中は両方とも無効で、各ボタンは実際に何かを変更できるときにのみ有効になります。
+
 ## v0.1.158
 
 ### Changed

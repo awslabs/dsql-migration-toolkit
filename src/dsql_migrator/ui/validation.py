@@ -2340,16 +2340,22 @@ def _render_object_filter(
         with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
             _kv_label(ui, "Objects to validate")
             ui.space()  # type: ignore[attr-defined]
+            # Same props as the identical shortcuts on the other object pickers
+            # (Schema Conversion's and Data Migration's "Select all"/"Unselect all"):
+            # the affirmative action is primary + done_all, the clearing one grey-7 +
+            # remove_done. These carried only "flat dense no-caps size=sm", so beside
+            # those screens they lost both the color and the icon and read as a
+            # different app.
             ui.button(  # type: ignore[attr-defined]
                 "Include all", on_click=_set_excluded(set())
-            ).props("flat dense no-caps size=sm").set_enabled(
-                not disabled and bool(excluded)
-            )
+            ).props(
+                "flat dense no-caps size=sm color=primary icon=done_all"
+            ).set_enabled(not disabled and bool(excluded))
             ui.button(  # type: ignore[attr-defined]
                 "Exclude all", on_click=_set_excluded(set(in_scope))
-            ).props("flat dense no-caps size=sm").set_enabled(
-                not disabled and included_count > 0
-            )
+            ).props(
+                "flat dense no-caps size=sm color=grey-7 icon=remove_done"
+            ).set_enabled(not disabled and included_count > 0)
 
         # One chip row per schema. A chip is ON (included) unless excluded; clicking
         # toggles it. Schema heading shown only for a multi-schema scope.
