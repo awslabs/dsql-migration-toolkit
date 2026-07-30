@@ -348,7 +348,7 @@ aws cloudformation deploy \
 ```
 
 > **AI アシスト（推奨）。** `EnableAiAssist=true` + `BedrockRegion` で Schema
-> Conversion と Query Playground の AI DBA を有効にします — オプトインかつ助言専用の
+> Conversion と Query Converter の AI DBA を有効にします — オプトインかつ助言専用の
 > 機能で、選択したモデルに対する `bedrock:InvokeModel` のみにスコープされます。
 > `BedrockModelId`（デフォルト `us.anthropic.claude-sonnet-4-6`）について、その
 > リージョンの Bedrock コンソールで**モデルアクセスを有効化**する必要があり、タスクが
@@ -486,7 +486,7 @@ Schema Conversion → Data Migration → Validation → Cut over）に移動す�
 
 デプロイは意図的にパラメータを最小限にしています: **ログレベルとアクティビティログの
 CloudWatch ミラーリングは CloudFormation パラメータではありません** — これらはアプリの
-**Diagnostics** コントロール（サイドバーのフッター）からランタイムで調整します。
+**Settings → Diagnostics**（サイドバーのフッターの歯車）からランタイムで調整します。
 再デプロイは不要です:
 
 - **ログレベル** — トラブルシューティング中に `INFO`/`DEBUG` を切り替えます（DEBUG は
@@ -495,13 +495,13 @@ CloudWatch ミラーリングは CloudFormation パラメータではありま�
 - **Send to CloudWatch (stdout)** — オンにするとアクティビティログを stdout に
   ストリーミングし、コンテナの `awslogs` ドライバーがそれをこのスタックの CloudWatch
   ロググループに転送します（タスクの置き換えを乗り越えて残る、耐久性のある監査コピー）。
-- **Download activity log** — 同じフッターから、完全な UTC のイベントごとに 1 行の
+- **Download activity log** — 同じダイアログの **Activity log** タブから、完全な UTC のイベントごとに 1 行の
   タイムライン（接続 / 評価 / スキーマ適用 / Full Load / CDC）を取得します。ファイルは
   `/tmp` 上でサイズ上限が設けられローテーションされます。
 
 変更はアプリ全体（単一タスク）に適用され、再起動時に起動時のデフォルトにリセット
 されます。上級の運用者は `DSQL_MIGRATOR_LOG_LEVEL` / `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT`
-環境変数で起動時のデフォルトを設定できますが、Diagnostics コントロールが意図された
+環境変数で起動時のデフォルトを設定できますが、Settings ダイアログが意図された
 経路です。
 
 ### 新しいイメージバージョンへの更新
@@ -618,7 +618,7 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 | アプリがソース DB に到達できない | ソース DB の SG がタスク SG から `SourceDbPort` のインバウンドを許可する必要がある。`SourceDbSecurityGroupId`/`SourceDbCidr` を確認。 |
 | DSQL 認証エラー | `DsqlClusterArn` のスコープ、リージョン（`DSQL_MIGRATOR_AWS_REGION`）、タスクロールの `dsql:DbConnect`。 |
 | AI オン時の Bedrock エラー | `BedrockModelArns` のスコープ、`BedrockRegion` でのモデル有効化、Bedrock エンドポイントへの egress。 |
-| 失敗の診断にさらに詳細が必要 | アプリの **Diagnostics** コントロール（サイドバーのフッター）でログレベルを `DEBUG` に設定して、アクティビティログの失敗イベントに Python スタックトレースを追加。「Send to CloudWatch (stdout)」をトグルして耐久性のあるコピーを取得。再デプロイ不要。 |
+| 失敗の診断にさらに詳細が必要 | **Settings → Diagnostics**（サイドバーのフッターの歯車）でログレベルを `DEBUG` に設定して、アクティビティログの失敗イベントに Python スタックトレースを追加。「Send to CloudWatch (stdout)」をトグルして耐久性のあるコピーを取得。再デプロイ不要。 |
 
 ### セキュリティに関する注記
 

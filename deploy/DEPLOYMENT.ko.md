@@ -314,7 +314,7 @@ aws cloudformation deploy \
 ```
 
 > **AI 어시스트(권장).** `EnableAiAssist=true` + `BedrockRegion`으로 Schema
-> Conversion과 Query Playground의 AI DBA를 켭니다 — 옵트인·자문 전용 기능이며,
+> Conversion과 Query Converter의 AI DBA를 켭니다 — 옵트인·자문 전용 기능이며,
 > 선택한 모델에 대한 `bedrock:InvokeModel`로만 범위가 제한됩니다. `BedrockModelId`
 > (기본 `us.anthropic.claude-sonnet-4-6`)에 대해 해당 리전 Bedrock 콘솔에서 **모델
 > 액세스를 활성화**해야 하고, 태스크가 Bedrock 엔드포인트로 egress할 수 있어야 합니다.
@@ -444,19 +444,19 @@ Evaluation → Schema Conversion → Data Migration → Validation → Cut over)
 #### 관측성 & 런타임 진단
 
 배포는 의도적으로 파라미터를 최소화합니다: **로그 레벨과 활동 로그의 CloudWatch 미러링은
-CloudFormation 파라미터가 아닙니다** — 앱의 **Diagnostics** 컨트롤(사이드바 푸터)에서 런타임에
+CloudFormation 파라미터가 아닙니다** — 앱의 **Settings → Diagnostics**(사이드바 푸터의 톱니)에서 런타임에
 조정하세요, 재배포 불필요:
 
 - **로그 레벨** — 문제 해결 중 `INFO`/`DEBUG` 전환(DEBUG는 실패 이벤트에 Python 스택트레이스 추가;
   행 값이나 자격증명은 절대 없음).
 - **Send to CloudWatch (stdout)** — 켜면 활동 로그를 stdout으로 스트리밍하고, 컨테이너의 `awslogs`
   드라이버가 이 스택의 CloudWatch 로그 그룹으로 전달(태스크 교체에도 살아남는 내구성 감사 사본).
-- **Download activity log** — 같은 푸터에서 전체 UTC, 이벤트당 한 줄 타임라인(연결 / 평가 / 스키마
-  적용 / Full Load / CDC)을 받기. 파일은 `/tmp`에서 크기 제한·회전됨.
+- **Download activity log** — 같은 다이얼로그의 **Activity log** 탭에서 전체 UTC, 이벤트당 한 줄
+  타임라인(연결 / 평가 / 스키마 적용 / Full Load / CDC)을 받기. 파일은 `/tmp`에서 크기 제한·회전됨.
 
 변경은 앱 전체(단일 태스크)에 적용되고 재시작 시 시작 기본값으로 리셋됩니다. 고급 운영자는
 `DSQL_MIGRATOR_LOG_LEVEL` / `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` 환경 변수로 시작 기본값을 설정할 수
-있지만, Diagnostics 컨트롤이 의도된 경로입니다.
+있지만, Settings 다이얼로그가 의도된 경로입니다.
 
 ### 새 이미지 버전으로 업데이트
 
@@ -563,7 +563,7 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 | 앱이 소스 DB에 도달 못 함 | 소스 DB SG가 태스크 SG로부터 `SourceDbPort` 인바운드를 허용해야 함; `SourceDbSecurityGroupId`/`SourceDbCidr` 확인. |
 | DSQL 인증 에러 | `DsqlClusterArn` 범위, 리전(`DSQL_MIGRATOR_AWS_REGION`), task-role `dsql:DbConnect`. |
 | AI 켰을 때 Bedrock 에러 | `BedrockModelArns` 범위, `BedrockRegion`에서 모델 활성화, Bedrock 엔드포인트 egress. |
-| 실패 진단에 더 상세히 필요 | 앱 **Diagnostics** 컨트롤(사이드바 푸터)에서 로그 레벨을 `DEBUG`로 설정해 활동 로그 실패 이벤트에 Python 스택트레이스 추가; "Send to CloudWatch (stdout)"를 토글해 내구성 사본. 재배포 불필요. |
+| 실패 진단에 더 상세히 필요 | **Settings → Diagnostics**(사이드바 푸터의 톱니)에서 로그 레벨을 `DEBUG`로 설정해 활동 로그 실패 이벤트에 Python 스택트레이스 추가; "Send to CloudWatch (stdout)"를 토글해 내구성 사본. 재배포 불필요. |
 
 ### 보안 노트
 

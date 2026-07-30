@@ -274,7 +274,7 @@ this.** The full environment-variable reference (for automation / tuning) is bel
 Read from environment variables (no config file, no persisted credentials). On
 Fargate, set these in the ECS task definition. The four Full Load / Validation
 parallelism knobs can also be retuned **at runtime** from the sidebar's
-**Performance tuning** control (no redeploy; resets on restart).
+**Settings → Performance** tab (no redeploy; resets on restart).
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -294,8 +294,8 @@ parallelism knobs can also be retuned **at runtime** from the sidebar's
 | `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1` (off, ≤8) | Split one large single-integer-PK table's read across K concurrent readers. Rarely worth it (the reader is GIL-bound) — see manual §7.2. |
 | `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | Minimum estimated rows for a table to be reader-sharded; smaller tables always use one reader. |
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4` (≤32) | Tables compared concurrently in Validation. `1` = sequential. |
-| `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | Startup log level; `DEBUG` adds a stacktrace (call stack only) to failure events. Also changeable at runtime via **Diagnostics**. |
-| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | Mirror activity-log events to stdout (→ CloudWatch on ECS). Also toggleable at runtime via **Diagnostics**. |
+| `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | Startup log level; `DEBUG` adds a stacktrace (call stack only) to failure events. Also changeable at runtime via **Settings → Diagnostics**. |
+| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | Mirror activity-log events to stdout (→ CloudWatch on ECS). Also toggleable at runtime via **Settings → Diagnostics**. |
 | `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | Bedrock model / inference-profile id for AI assist. The `global.*` profile is reachable from any commercial region; a `us.*` profile is US-only. |
 | `BEDROCK_REGION` | _(unset)_ | Region for Amazon Bedrock calls. |
 

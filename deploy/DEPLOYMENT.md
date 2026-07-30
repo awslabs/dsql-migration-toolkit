@@ -347,7 +347,7 @@ aws cloudformation deploy \
 ```
 
 > **AI assist (recommended).** `EnableAiAssist=true` + `BedrockRegion` turns on the
-> AI DBA for Schema Conversion and the Query Playground — an opt-in, advisory-only
+> AI DBA for Schema Conversion and the Query Converter — an opt-in, advisory-only
 > feature scoped to `bedrock:InvokeModel` for the selected model. You **must still
 > enable model access** for `BedrockModelId` (default
 > `us.anthropic.claude-sonnet-4-6`) in the Bedrock console for that region, and the
@@ -482,7 +482,8 @@ Conversion → Data Migration → Validation → Cut over).
 
 Deployment is deliberately parameter-light: **log level and CloudWatch
 mirroring of the activity log are not CloudFormation parameters** — adjust them
-at runtime from the app's **Diagnostics** control (sidebar footer), no redeploy:
+at runtime from **Settings → Diagnostics** in the app (the gear in the sidebar
+footer), no redeploy:
 
 - **Log level** — flip `INFO`/`DEBUG` while troubleshooting (DEBUG adds Python
   stacktraces to failure events; never row values or credentials).
@@ -490,13 +491,14 @@ at runtime from the app's **Diagnostics** control (sidebar footer), no redeploy:
   stdout, which the container's `awslogs` driver forwards to this stack's
   CloudWatch log group (a durable audit copy that survives task replacement).
 - **Download activity log** — pull the full UTC, one-line-per-event timeline
-  (connection / assessment / schema apply / Full Load / CDC) from the same
-  footer. The file is size-capped and rotated on `/tmp`.
+  (connection / assessment / schema apply / Full Load / CDC) from the
+  **Activity log** tab of the same dialog. The file is size-capped and rotated
+  on `/tmp`.
 
 Changes apply app-wide (single task) and reset to startup defaults on restart;
 advanced operators can set the startup defaults via the
 `DSQL_MIGRATOR_LOG_LEVEL` / `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` environment
-variables, but the Diagnostics control is the intended path.
+variables, but the Settings dialog is the intended path.
 
 ### Update to a new image version
 
@@ -611,7 +613,7 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 | App cannot reach the source DB | Source DB SG must allow inbound on `SourceDbPort` from the task SG; verify `SourceDbSecurityGroupId`/`SourceDbCidr`. |
 | DSQL auth errors | `DsqlClusterArn` scope, region (`DSQL_MIGRATOR_AWS_REGION`), and task-role `dsql:DbConnect`. |
 | Bedrock errors when AI on | `BedrockModelArns` scope, model enabled in `BedrockRegion`, and egress to the Bedrock endpoint. |
-| Need more detail when diagnosing a failure | Set log level to `DEBUG` in the app's **Diagnostics** control (sidebar footer) to add Python stacktraces to activity-log failure events; toggle "Send to CloudWatch (stdout)" for a durable copy. No redeploy. |
+| Need more detail when diagnosing a failure | Set log level to `DEBUG` under **Settings → Diagnostics** (the gear in the sidebar footer) to add Python stacktraces to activity-log failure events; toggle "Send to CloudWatch (stdout)" for a durable copy. No redeploy. |
 
 ### Security notes
 

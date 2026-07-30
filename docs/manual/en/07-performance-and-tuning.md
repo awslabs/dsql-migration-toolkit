@@ -305,8 +305,8 @@ own task definition) and redeploy. The CDC knobs are cdc-stack CloudFormation
 parameters, passed when the tool deploys the cdc-stack.
 
 > **Retune between runs without redeploying.** For iterating on these Full Load /
-> Validation values, use the **Performance tuning** control in the sidebar footer
-> (next to Diagnostics): the loader and validator re-read the config on every run,
+> Validation values, open **Settings** in the sidebar footer and go to the
+> **Performance** tab: the loader and validator re-read the config on every run,
 > so a value you set there applies to the **next** Full Load / Validation
 > immediately — no task-definition edit or redeploy. It is app-wide (single-task
 > app) and resets to the deploy/startup values on restart, so set the
@@ -349,8 +349,8 @@ and `BATCH_ROWS` raise **DSQL write** pressure, not source read load; leave them
 unless DSQL is the bottleneck. (The source read **page size is fixed at 1000 rows**
 and is not tunable — table parallelism is your only source-read throttle.)
 
-> Set it in the **Performance tuning** sidebar control to experiment between runs,
-> or as the env var to persist it (see §7.2).
+> Set it under **Settings → Performance** to experiment between runs, or as the env
+> var to persist it (see §7.2).
 
 ### Start conservative, then tune under observation
 
