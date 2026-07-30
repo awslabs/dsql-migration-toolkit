@@ -1364,7 +1364,7 @@ _CHART_CLASS_COLORS: dict[Classification, str] = {
 def classification_stats_by_kind(
     report: AssessmentReport,
 ) -> list[tuple[str, dict[Classification, int], int]]:
-    """Per-kind counts split by CLASSIFICATION, most-blocked kind first.
+    """Per-kind counts split by CLASSIFICATION, largest kind first.
 
     This is what both the UI chart and the HTML export are built from, so the two always
     agree. Classification rather than effort, because the chart sits beside the
@@ -1373,8 +1373,12 @@ def classification_stats_by_kind(
     vocabularies to reconcile them. Effort is still reported, in its own summary and per
     object; it is just not what this chart answers.
 
-    Ordered by the share of objects that are UNSUPPORTED, then MANUAL, then total count,
-    so the kind in most trouble is on top.
+    Ordered by TOTAL OBJECT COUNT descending (ties broken by kind name), so the bars step
+    down in length and the chart reads as a size ranking -- TABLE, then PROCEDURE, and so
+    on. Ordering by trouble-share instead put a single unsupported TRIGGER above 200
+    tables: it made short bars float above long ones, which reads as a broken chart, and
+    the "most blocked" reading was already carried by each bar's own red segment and its
+    "% need attention" caption.
     """
     counts: dict[str, dict[Classification, int]] = {}
     for item in report.items:
@@ -1383,13 +1387,7 @@ def classification_stats_by_kind(
 
     def sort_key(entry: tuple[str, dict[Classification, int]]):
         kind, by_class = entry
-        total = sum(by_class.values()) or 1
-        return (
-            -by_class[Classification.UNSUPPORTED] / total,
-            -by_class[Classification.MANUAL] / total,
-            -total,
-            kind,
-        )
+        return (-sum(by_class.values()), kind)
 
     return [
         (kind, by_class, sum(by_class.values()))

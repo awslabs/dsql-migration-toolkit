@@ -5,6 +5,26 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.171
+
+### Changed
+
+- **The compatibility chart now ranks object kinds by size, largest first.** Ordering by
+  trouble-share put a single unsupported `TRIGGER` above two hundred tables, so a stub bar
+  floated on top of the long ones — which reads as a broken chart rather than as a
+  priority. Bars now step down in length (`TABLE`, `PROCEDURE`, …), and each bar still
+  carries its own red segment and its "*n*% need attention" caption, so nothing about the
+  severity signal was lost. The HTML export is built from the same aggregation and so
+  reorders identically; a test now pins the two orders together.
+- **Each Evaluation finding labels its problem and its fix as two distinct blocks.** The
+  risk was a bare sentence and the recommendation a fainter one below it, marked only by a
+  small arrow — the pair read as a single wrapped paragraph, and the fix was easy to skim
+  past. Both now sit on their own tinted panel with a leading glyph and caption: amber
+  **Risk**, green **Recommendation**, matching the amber = be-aware / green = resolved
+  tones used across the app. The text and HTML exports already labelled the two (`Risk:` /
+  `Fix:`, and their own table columns), so this brings the screen up to the level the
+  exports were already at.
+
 ## v0.1.170
 
 ### Changed

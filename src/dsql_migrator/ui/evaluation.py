@@ -262,8 +262,8 @@ class AssessmentChartData:
 def build_assessment_chart_data(report: AssessmentReport) -> AssessmentChartData:
     """Aggregate an assessment report into per-kind classification counts.
 
-    Kinds are ordered most-blocked first (share UNSUPPORTED, then MANUAL, then total),
-    reusing the shared core aggregation so the UI chart and the HTML export agree.
+    Kinds are ordered by total object count descending, reusing the shared core
+    aggregation so the UI chart and the HTML export agree.
     """
     from dsql_migrator.core.assessor import classification_stats_by_kind
 
@@ -1485,6 +1485,36 @@ def _render_assessment(
                         )
 
 
+def _render_concern_line(
+    ui: object,
+    *,
+    icon: str,
+    label: str,
+    text: str,
+    icon_class: str,
+    label_class: str,
+    panel_class: str = "",
+) -> None:
+    """Render one labeled line of a concern card -- its risk or its recommendation.
+
+    A leading glyph + a small uppercase caption name the line ("RISK" / "RECOMMENDATION")
+    so the reader never has to infer which is which, and the caption sits ABOVE the text
+    rather than inline so a long sentence wraps flush instead of indenting under the
+    label. ``panel_class`` optionally tints the block, which is what separates the
+    recommendation from the risk at a glance.
+    """
+    container = ui.column().classes(  # type: ignore[attr-defined]
+        f"gap-0.5 w-full {panel_class}".strip()
+    )
+    with container:
+        with ui.row().classes("items-center gap-1 no-wrap"):  # type: ignore[attr-defined]
+            ui.icon(icon).classes(f"text-sm {icon_class}")  # type: ignore[attr-defined]
+            ui.label(label).classes(  # type: ignore[attr-defined]
+                f"text-xs font-semibold uppercase tracking-wide {label_class}"
+            )
+        ui.label(text).classes("text-sm text-gray-900")  # type: ignore[attr-defined]
+
+
 def _render_assessment_item(
     ui: object,
     item: "AssessmentItem",
@@ -1537,7 +1567,7 @@ def _render_assessment_item(
                 ):
                     for concern in concerns:
                         with ui.column().classes(  # type: ignore[attr-defined]
-                            "gap-1 w-full rounded-md border border-gray-200 "
+                            "gap-2 w-full rounded-md border border-gray-200 "
                             "bg-gray-50 p-3"
                         ):
                             with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
@@ -1561,20 +1591,41 @@ def _render_assessment_item(
                                     ui.badge(  # type: ignore[attr-defined]
                                         f"effort: {concern.effort.value}"
                                     ).props("color=blue-grey-6 outline")
+                            # Problem and fix are LABELED and visually separated. A bare
+                            # sentence followed by a fainter arrowed sentence read as one
+                            # wrapped paragraph -- the arrow was the only cue that the
+                            # second line was the remedy, and it was easy to skim past.
+                            # Each now carries its own leading chip (amber "Risk" /
+                            # green "Recommendation"), matching the amber=be-aware,
+                            # green=resolution tones the notice palette uses, with the
+                            # fix on a tinted panel so problem and solution are two
+                            # distinct blocks rather than two lines of prose.
                             if concern.risk:
-                                ui.label(concern.risk).classes(  # type: ignore[attr-defined]
-                                    "text-sm text-gray-900"
+                                _render_concern_line(
+                                    ui,
+                                    icon="warning",
+                                    label="Risk",
+                                    text=concern.risk,
+                                    icon_class="text-amber-600",
+                                    label_class="text-amber-700",
+                                    panel_class=(
+                                        "rounded border border-amber-200 bg-amber-50 "
+                                        "px-2 py-1.5"
+                                    ),
                                 )
                             if concern.recommendation:
-                                with ui.row().classes(  # type: ignore[attr-defined]
-                                    "items-start gap-1 no-wrap w-full"
-                                ):
-                                    ui.icon("subdirectory_arrow_right").classes(  # type: ignore[attr-defined]
-                                        "text-gray-400 text-sm mt-0.5"
-                                    )
-                                    ui.label(concern.recommendation).classes(  # type: ignore[attr-defined]
-                                        "text-sm text-gray-700"
-                                    )
+                                _render_concern_line(
+                                    ui,
+                                    icon="lightbulb",
+                                    label="Recommendation",
+                                    text=concern.recommendation,
+                                    icon_class="text-green-600",
+                                    label_class="text-green-700",
+                                    panel_class=(
+                                        "rounded border border-green-200 bg-green-50 "
+                                        "px-2 py-1.5"
+                                    ),
+                                )
             else:
                 ui.label(f"Rule: {item.rule_id}").classes(  # type: ignore[attr-defined]
                     "text-xs text-gray-500"

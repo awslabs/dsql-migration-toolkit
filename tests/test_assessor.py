@@ -1165,3 +1165,102 @@ def test_html_filter_counts_objects_not_findings() -> None:
     )
     assert "tr[data-kind]:not([data-concern])" in markup
     assert "if(ok&&!r.dataset.concern)shown++" in markup
+
+
+def test_classification_stats_by_kind_orders_by_total_count_desc() -> None:
+    """The chart is a size ranking, so bars must step down in length.
+
+    Ordering by trouble-share instead floated a single unsupported TRIGGER above a
+    hundred tables -- a short bar sitting on top of long ones reads as a broken chart.
+    Each bar already carries its own red segment and "% need attention" caption, so the
+    severity signal does not depend on the row order.
+    """
+    from dsql_migrator.core.assessor import classification_stats_by_kind
+    from dsql_migrator.core.models import AssessmentItem
+
+    items = [
+        AssessmentItem(
+            object_name=f"t{i}",
+            rule_id="COMPATIBLE",
+            classification=Classification.AUTO,
+            kind="TABLE",
+        )
+        for i in range(5)
+    ] + [
+        AssessmentItem(
+            object_name="v1",
+            rule_id="VIEW_REVIEW",
+            classification=Classification.MANUAL,
+            kind="VIEW",
+        ),
+        AssessmentItem(
+            object_name="v2",
+            rule_id="VIEW_REVIEW",
+            classification=Classification.MANUAL,
+            kind="VIEW",
+        ),
+        # 100% UNSUPPORTED but only one object: it must NOT outrank the five tables.
+        AssessmentItem(
+            object_name="trg",
+            rule_id="TRIGGER_UNSUPPORTED",
+            classification=Classification.UNSUPPORTED,
+            kind="TRIGGER",
+        ),
+    ]
+    stats = classification_stats_by_kind(AssessmentReport.from_items(items))
+    assert [kind for kind, _by_class, _total in stats] == ["TABLE", "VIEW", "TRIGGER"]
+    assert [total for _kind, _by_class, total in stats] == [5, 2, 1]
+    # Totals are non-increasing, which is the property that keeps the chart readable.
+    totals = [total for _kind, _by_class, total in stats]
+    assert totals == sorted(totals, reverse=True)
+
+
+def test_classification_stats_by_kind_breaks_count_ties_by_name() -> None:
+    # A stable order matters: the same report must not shuffle its bars between renders.
+    from dsql_migrator.core.assessor import classification_stats_by_kind
+    from dsql_migrator.core.models import AssessmentItem
+
+    items = [
+        AssessmentItem(
+            object_name="z",
+            rule_id="ROUTINE_UNSUPPORTED",
+            classification=Classification.UNSUPPORTED,
+            kind="PROCEDURE",
+        ),
+        AssessmentItem(
+            object_name="a",
+            rule_id="COMPATIBLE",
+            classification=Classification.AUTO,
+            kind="FUNCTION",
+        ),
+    ]
+    stats = classification_stats_by_kind(AssessmentReport.from_items(items))
+    assert [kind for kind, _by_class, _total in stats] == ["FUNCTION", "PROCEDURE"]
+
+
+def test_html_chart_lists_kinds_largest_first() -> None:
+    # The export follows the UI, so its bar rows must come out in the same order.
+    import re
+
+    from dsql_migrator.core.assessor import render_html_report
+    from dsql_migrator.core.models import AssessmentItem
+
+    items = [
+        AssessmentItem(
+            object_name=f"t{i}",
+            rule_id="COMPATIBLE",
+            classification=Classification.AUTO,
+            kind="TABLE",
+        )
+        for i in range(4)
+    ] + [
+        AssessmentItem(
+            object_name="trg",
+            rule_id="TRIGGER_UNSUPPORTED",
+            classification=Classification.UNSUPPORTED,
+            kind="TRIGGER",
+        ),
+    ]
+    markup = render_html_report(AssessmentReport.from_items(items))
+    labels = re.findall(r'<div class="bar-label">([^<]+)</div>', markup)
+    assert labels == ["TABLE", "TRIGGER"]

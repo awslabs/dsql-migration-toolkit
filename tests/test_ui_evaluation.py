@@ -366,12 +366,12 @@ def test_build_assessment_chart_data_groups_by_kind_and_classification() -> None
         ]
     )
     data = build_assessment_chart_data(report)
-    # Kinds are ordered most-blocked first: TRIGGER is 100% MANUAL (1/1) vs TABLE
-    # 50% (1/2), so TRIGGER comes first.
-    assert data.kinds == ["TRIGGER", "TABLE"]
+    # Kinds are ordered by TOTAL COUNT descending, so the bars step down in length:
+    # TABLE (2 objects) outranks TRIGGER (1), even though TRIGGER is 100% MANUAL.
+    assert data.kinds == ["TABLE", "TRIGGER"]
     # Split by CLASSIFICATION, not effort -- the SIMPLE/SIGNIFICANT efforts above
     # are both MANUAL and so land in the same series.
-    assert data.auto == [0, 1]
+    assert data.auto == [1, 0]
     assert data.manual == [1, 1]
     assert data.unsupported == [0, 0]
 
@@ -1034,10 +1034,17 @@ def test_each_rendered_concern_shows_its_own_class_and_fix() -> None:
 
     label = classification_label(item.classification.value)
     assert ui.badges.count(label) >= len(item.concerns)
-    # A child-arrow glyph marks each recommendation, pairing it with the risk above it.
-    assert ui.icons.count("subdirectory_arrow_right") == len(
-        [c for c in item.concerns if c.recommendation]
-    )
+    # Problem and fix are LABELED, not merely arrowed: each carries its own caption and
+    # glyph so the reader never has to infer which line is the remedy.
+    risks = [c for c in item.concerns if c.risk]
+    fixes = [c for c in item.concerns if c.recommendation]
+    assert ui.texts.count("Risk") == len(risks)
+    assert ui.texts.count("Recommendation") == len(fixes)
+    assert ui.icons.count("warning") == len(risks)
+    assert ui.icons.count("lightbulb") == len(fixes)
+    # The fix sits on its own tinted panel, which is what separates it from the risk at
+    # a glance rather than relying on a fainter text color.
+    assert sum("bg-green-50" in c for c in ui.classes) == len(fixes)
 
 
 def test_row_falls_back_to_joined_text_for_a_pre_concerns_report() -> None:
@@ -1059,3 +1066,47 @@ def test_row_falls_back_to_joined_text_for_a_pre_concerns_report() -> None:
     body = "\n".join(ui.texts)
     assert "a; b" in body
     assert "fix a; fix b" in body
+
+
+def test_ui_chart_and_html_export_agree_on_kind_order() -> None:
+    """The exported report must not order its bars differently from the screen.
+
+    Both are built from ``classification_stats_by_kind``, so this pins the contract: if
+    someone re-sorts one side, this fails instead of the two silently drifting apart.
+    """
+    import re
+
+    from dsql_migrator.core.assessor import render_html_report
+    from dsql_migrator.core.models import AssessmentItem, AssessmentReport
+    from dsql_migrator.ui.evaluation import build_assessment_chart_data
+
+    items = [
+        AssessmentItem(
+            object_name=f"t{i}",
+            rule_id="COMPATIBLE",
+            classification=Classification.AUTO,
+            kind="TABLE",
+        )
+        for i in range(6)
+    ] + [
+        AssessmentItem(
+            object_name=f"sp{i}",
+            rule_id="ROUTINE_UNSUPPORTED",
+            classification=Classification.UNSUPPORTED,
+            kind="PROCEDURE",
+        )
+        for i in range(2)
+    ] + [
+        AssessmentItem(
+            object_name="trg",
+            rule_id="TRIGGER_UNSUPPORTED",
+            classification=Classification.UNSUPPORTED,
+            kind="TRIGGER",
+        ),
+    ]
+    report = AssessmentReport.from_items(items)
+    ui_order = build_assessment_chart_data(report).kinds
+    html_order = re.findall(
+        r'<div class="bar-label">([^<]+)</div>', render_html_report(report)
+    )
+    assert ui_order == html_order == ["TABLE", "PROCEDURE", "TRIGGER"]
