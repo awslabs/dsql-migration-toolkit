@@ -982,3 +982,147 @@ def test_clean_table_index_count_is_not_flagged() -> None:
     assert TooManyIndexesRule().evaluate(
         SourceInventory(tables=[_table_with_indexes(5)])
     ) == []
+
+
+# ---------------------------------------------------------------------------
+# Per-concern reporting. An object matching several rules used to collapse into
+# ONE semicolon-joined risk string and ONE joined recommendation string, so the
+# Nth risk sat in one paragraph and its fix in another, unpaired.
+# ---------------------------------------------------------------------------
+
+
+def _multi_rule_table() -> TableDef:
+    """A table that trips five independent rules at once -- the reported case."""
+    return TableDef(
+        name="orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="int", nullable=False),
+            ColumnDef(name="user_id", mysql_type="int", nullable=False),
+            ColumnDef(
+                name="status",
+                mysql_type="enum('pending','shipped')",
+                collation="utf8mb4_general_ci",
+            ),
+            ColumnDef(
+                name="updated_at",
+                mysql_type="datetime",
+                auto_update_timestamp=True,
+            ),
+        ],
+        primary_key=["id"],
+        auto_increment_column="id",
+        foreign_keys=[
+            ForeignKeyDef(
+                name="fk_orders_users",
+                columns=["user_id"],
+                referenced_table="users",
+                referenced_columns=["id"],
+            )
+        ],
+    )
+
+
+def test_each_matched_rule_becomes_its_own_concern() -> None:
+    """Five rules -> five concerns, each risk paired with its own recommendation."""
+    report = CompatibilityAssessor().assess(
+        SourceInventory(tables=[_multi_rule_table()])
+    )
+    item = next(i for i in report.items if i.object_name == "orders")
+
+    rule_ids = [c.rule_id for c in item.concerns]
+    assert len(item.concerns) >= 5, rule_ids
+    for expected in (
+        "FK_UNSUPPORTED",
+        "AUTO_INCREMENT",
+        "CI_COLLATION",
+        "ENUM_SET_TYPE",
+        "ON_UPDATE_TIMESTAMP",
+    ):
+        assert expected in rule_ids, (expected, rule_ids)
+
+    # Every concern carries BOTH halves, so no fix is orphaned from its risk.
+    for concern in item.concerns:
+        assert concern.risk, concern.rule_id
+        assert concern.recommendation, concern.rule_id
+        # ...and no concern is itself a joined multi-finding string.
+        assert "; " not in concern.risk or concern.risk.count("; ") < 2
+
+
+def test_concerns_are_ordered_most_severe_first() -> None:
+    # The governing (most severe) classification must lead, so the worst problem is read
+    # first rather than buried at position four.
+    from dsql_migrator.core.models import Classification
+
+    severity = {
+        Classification.UNSUPPORTED: 2,
+        Classification.MANUAL: 1,
+        Classification.AUTO: 0,
+    }
+    report = CompatibilityAssessor().assess(
+        SourceInventory(tables=[_multi_rule_table()])
+    )
+    item = next(i for i in report.items if i.object_name == "orders")
+    ranks = [severity[c.classification] for c in item.concerns]
+    assert ranks == sorted(ranks, reverse=True), ranks
+    # The item's own class is the governing one.
+    assert item.classification is item.concerns[0].classification
+
+
+def test_joined_strings_still_carry_every_finding() -> None:
+    """The flat strings stay for back-compat and CSV-style exports.
+
+    Concerns are the presentation surface, but nothing may DROP a finding from the
+    joined text -- a downstream consumer reading only `risk` must still see all of it.
+    """
+    report = CompatibilityAssessor().assess(
+        SourceInventory(tables=[_multi_rule_table()])
+    )
+    item = next(i for i in report.items if i.object_name == "orders")
+    for concern in item.concerns:
+        assert concern.risk in item.risk
+        assert concern.recommendation in item.recommendation
+
+
+def test_auto_object_has_no_concerns_and_keeps_its_reassurance() -> None:
+    # Nothing matched, so there is nothing to enumerate -- and the "no issues" line must
+    # not disappear with the change.
+    report = CompatibilityAssessor().assess(
+        SourceInventory(
+            tables=[
+                TableDef(
+                    name="users",
+                    columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                    primary_key=["id"],
+                )
+            ]
+        )
+    )
+    item = next(i for i in report.items if i.object_name == "users")
+    assert item.concerns == []
+    assert "No DSQL compatibility issues detected." in render_text_report(report)
+
+
+def test_text_report_numbers_each_concern_with_its_fix() -> None:
+    """The text export must enumerate, not concatenate."""
+    report = CompatibilityAssessor().assess(
+        SourceInventory(tables=[_multi_rule_table()])
+    )
+    text = render_text_report(report)
+    assert "    1. [MANUAL] FK_UNSUPPORTED" in text
+    assert "       Risk: Foreign key constraints" in text
+    assert "       Fix:  Remove the foreign key" in text
+    # The old single run-on Risk line is gone for a multi-rule object.
+    assert "Aurora DSQL.; AUTO_INCREMENT column" not in text
+
+
+def test_html_report_lists_concerns_instead_of_one_run_on_cell() -> None:
+    from dsql_migrator.core.assessor import render_html_report
+
+    report = CompatibilityAssessor().assess(
+        SourceInventory(tables=[_multi_rule_table()])
+    )
+    markup = render_html_report(report)
+    # A <ul> per cell keeps the Nth risk aligned with the Nth fix across the two columns.
+    assert "<ul style=" in markup
+    assert "<li>Foreign key constraints" in markup
+    assert "<li>Remove the foreign key" in markup

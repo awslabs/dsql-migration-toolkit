@@ -1531,18 +1531,61 @@ def _render_assessment_item(
                     ui.badge(f"effort: {effort}").props(  # type: ignore[attr-defined]
                         "color=blue-grey-6 outline"
                     )
-        with ui.column().classes("gap-1 p-3 w-full"):  # type: ignore[attr-defined]
-            ui.label(f"Rule: {item.rule_id}").classes(  # type: ignore[attr-defined]
-                "text-xs text-gray-500"
-            )
-            if item.risk:
-                ui.label("Risk").classes("text-sm font-semibold")  # type: ignore[attr-defined]
-                ui.label(item.risk).classes("text-sm")  # type: ignore[attr-defined]
-            if item.recommendation:
-                ui.label("Recommendation").classes(  # type: ignore[attr-defined]
-                    "text-sm font-semibold"
+        with ui.column().classes("gap-3 p-3 w-full"):  # type: ignore[attr-defined]
+            # One block per matched rule, each pairing a risk with ITS OWN
+            # recommendation. Previously every rule's text was semicolon-joined into a
+            # single Risk paragraph and a single Recommendation paragraph, so a table
+            # matching five rules (FK + AUTO_INCREMENT + CI collation + ENUM + ON UPDATE)
+            # produced two run-on sentences and left the reader to guess which fix went
+            # with which problem. `concerns` is empty only for a report persisted before
+            # it existed, which falls back to the joined text below.
+            concerns = list(getattr(item, "concerns", None) or [])
+            if concerns:
+                for index, concern in enumerate(concerns):
+                    if index:
+                        ui.separator().classes("my-1")  # type: ignore[attr-defined]
+                    with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+                        # Per-concern class: the item's badge shows only the governing
+                        # (most severe) one, which says nothing about the others.
+                        ui.badge(  # type: ignore[attr-defined]
+                            classification_label(concern.classification.value)
+                        ).props(
+                            "color="
+                            + _CLASS_BADGE_COLOR.get(
+                                concern.classification.value, "grey"
+                            )
+                            + " outline"
+                        )
+                        ui.label(concern.rule_id).classes(  # type: ignore[attr-defined]
+                            "text-xs text-gray-500 font-mono"
+                        )
+                        if concern.effort is not None:
+                            ui.space()  # type: ignore[attr-defined]
+                            ui.badge(  # type: ignore[attr-defined]
+                                f"effort: {concern.effort.value}"
+                            ).props("color=blue-grey-6 outline")
+                    if concern.risk:
+                        ui.label(concern.risk).classes("text-sm")  # type: ignore[attr-defined]
+                    if concern.recommendation:
+                        with ui.row().classes("items-start gap-1 no-wrap w-full"):  # type: ignore[attr-defined]
+                            ui.icon("arrow_forward").classes(  # type: ignore[attr-defined]
+                                "text-gray-400 text-sm mt-0.5"
+                            )
+                            ui.label(concern.recommendation).classes(  # type: ignore[attr-defined]
+                                "text-sm text-gray-700"
+                            )
+            else:
+                ui.label(f"Rule: {item.rule_id}").classes(  # type: ignore[attr-defined]
+                    "text-xs text-gray-500"
                 )
-                ui.label(item.recommendation).classes("text-sm")  # type: ignore[attr-defined]
+                if item.risk:
+                    ui.label("Risk").classes("text-sm font-semibold")  # type: ignore[attr-defined]
+                    ui.label(item.risk).classes("text-sm")  # type: ignore[attr-defined]
+                if item.recommendation:
+                    ui.label("Recommendation").classes(  # type: ignore[attr-defined]
+                        "text-sm font-semibold"
+                    )
+                    ui.label(item.recommendation).classes("text-sm")  # type: ignore[attr-defined]
             # On-demand AI guidance for objects that need attention. AUTO objects
             # convert automatically and have nothing to remediate, so the
             # affordance is offered only on non-AUTO objects (matches the schema

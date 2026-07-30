@@ -38,6 +38,7 @@ from typing import Callable, ClassVar, Optional
 
 from dsql_migrator.core.models import (
     AiAssessmentReport,
+    AssessmentConcern,
     AssessmentItem,
     AssessmentReport,
     Classification,
@@ -1186,6 +1187,20 @@ def _aggregate(key: ObjectKey, findings: list[Finding]) -> AssessmentItem:
     # Stable sort by descending severity keeps declaration order for ties.
     ordered = sorted(findings, key=lambda f: -_SEVERITY[f.classification])
     governing = ordered[0]
+    # Keep each finding as its own concern, paired with ITS recommendation. The joined
+    # strings below stay for back-compat and flat CSV-style exports, but a table that
+    # matches five rules produced one 400-character run-on sentence in which no risk was
+    # matched to its own fix -- so anything rendering to a human uses `concerns`.
+    concerns = [
+        AssessmentConcern(
+            rule_id=f.rule_id,
+            classification=f.classification,
+            risk=f.risk,
+            recommendation=f.recommendation,
+            effort=f.effort,
+        )
+        for f in ordered
+    ]
     risk = "; ".join(f.risk for f in ordered if f.risk)
     recommendation = "; ".join(f.recommendation for f in ordered if f.recommendation)
     # The most demanding effort across all matched rules governs the estimate.
@@ -1199,6 +1214,7 @@ def _aggregate(key: ObjectKey, findings: list[Finding]) -> AssessmentItem:
         recommendation=recommendation,
         effort=effort,
         kind=key.kind.upper(),
+        concerns=concerns,
     )
 
 
@@ -1271,10 +1287,25 @@ def render_text_report(report: AssessmentReport) -> str:
             f"- {item.object_name} [{item.classification.value}] "
             f"(effort: {effort}) ({item.rule_id})"
         )
-        if item.risk:
-            lines.append(f"    Risk: {item.risk}")
-        if item.recommendation:
-            lines.append(f"    Recommendation: {item.recommendation}")
+        # One numbered block per matched rule, each risk beside its own fix. The joined
+        # item.risk/item.recommendation are a single run-on sentence once an object
+        # matches more than one rule, which is exactly when the report matters most.
+        concerns = list(item.concerns or [])
+        if concerns:
+            for number, concern in enumerate(concerns, start=1):
+                head = f"    {number}. [{concern.classification.value}] {concern.rule_id}"
+                if concern.effort is not None:
+                    head += f" (effort: {concern.effort.value})"
+                lines.append(head)
+                if concern.risk:
+                    lines.append(f"       Risk: {concern.risk}")
+                if concern.recommendation:
+                    lines.append(f"       Fix:  {concern.recommendation}")
+        else:
+            if item.risk:
+                lines.append(f"    Risk: {item.risk}")
+            if item.recommendation:
+                lines.append(f"    Recommendation: {item.recommendation}")
     return "\n".join(lines)
 
 
@@ -1553,6 +1584,25 @@ def _render_target_html_section(
     return "\n".join(parts)
 
 
+def _html_concern_cell(item: AssessmentItem, field: str, esc) -> str:
+    """Render one table cell as a LIST when the object matched several rules.
+
+    The semicolon-joined ``item.risk`` / ``item.recommendation`` read as one run-on
+    sentence for an object matching five rules -- and put the Nth risk in one cell with
+    the Nth fix in another, leaving the reader to line them up. A ``<ul>`` keeps them
+    enumerated and in the same order in both columns. Falls back to the joined string for
+    a report persisted before ``concerns`` existed.
+    """
+    concerns = list(item.concerns or [])
+    if not concerns:
+        return esc(getattr(item, field))
+    values = [getattr(c, field) for c in concerns]
+    if len([v for v in values if v]) <= 1:
+        return esc(next((v for v in values if v), ""))
+    listed = "".join(f"<li>{esc(v)}</li>" for v in values if v)
+    return f'<ul style="margin:0;padding-left:1.1em">{listed}</ul>'
+
+
 def render_html_report(
     report: AssessmentReport,
     *,
@@ -1596,8 +1646,8 @@ def render_html_report(
             f'<td style="background:{color}">{esc(item.classification.value)}</td>'
             f"<td>{esc(effort)}</td>"
             f"<td>{esc(item.rule_id)}</td>"
-            f"<td>{esc(item.risk)}</td>"
-            f"<td>{esc(item.recommendation)}</td>"
+            f"<td>{_html_concern_cell(item, 'risk', esc)}</td>"
+            f"<td>{_html_concern_cell(item, 'recommendation', esc)}</td>"
             "</tr>"
         )
     table_rows = "\n".join(rows) if rows else (

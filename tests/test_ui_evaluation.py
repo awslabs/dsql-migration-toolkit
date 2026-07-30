@@ -877,3 +877,178 @@ def test_kind_section_label_friendly_names() -> None:
     assert kind_section_label("ROUTINE") == "Routines"
     # Unknown kinds fall back to a title-cased label.
     assert kind_section_label("SEQUENCE") == "Sequence"
+
+
+# ---------------------------------------------------------------------------
+# The Evaluation row renders ONE block per matched rule. The joined
+# risk/recommendation strings made a five-rule table unreadable: two run-on
+# paragraphs, with the Nth risk in one and its fix in the other.
+# ---------------------------------------------------------------------------
+
+
+class _ItemUi:
+    """A NiceGUI stand-in that records emitted text, badges, and separators."""
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+        self.badges: list[str] = []
+        self.separators = 0
+        self.icons: list[str] = []
+
+    class _El:
+        def __init__(self, owner) -> None:
+            self._owner = owner
+
+        def classes(self, *_a, **_k):
+            return self
+
+        def props(self, *_a, **_k):
+            return self
+
+        def tooltip(self, *_a, **_k):
+            return self
+
+        def add_slot(self, *_a, **_k):
+            return self
+
+        def set_enabled(self, *_a, **_k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_e):
+            return False
+
+        def __getattr__(self, _name):
+            # Any other chainable no-op (disable/enable/style/on/...). Keeps the double
+            # from having to mirror NiceGUI's whole element surface.
+            return lambda *_a, **_k: self
+
+    def _el(self):
+        return self._El(self)
+
+    def label(self, text="", *_a, **_k):
+        if text:
+            self.texts.append(str(text))
+        return self._el()
+
+    def badge(self, text="", *_a, **_k):
+        if text:
+            self.badges.append(str(text))
+            self.texts.append(str(text))
+        return self._el()
+
+    def separator(self, *_a, **_k):
+        self.separators += 1
+        return self._el()
+
+    def icon(self, name="", *_a, **_k):
+        if name:
+            self.icons.append(str(name))
+        return self._el()
+
+    def __getattr__(self, _name):
+        return lambda *_a, **_k: self._el()
+
+
+def _five_rule_item():
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.core.models import (
+        ColumnDef,
+        ForeignKeyDef,
+        SourceInventory,
+        TableDef,
+    )
+
+    table = TableDef(
+        name="orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="int", nullable=False),
+            ColumnDef(name="user_id", mysql_type="int", nullable=False),
+            ColumnDef(
+                name="status",
+                mysql_type="enum('pending','shipped')",
+                collation="utf8mb4_general_ci",
+            ),
+            ColumnDef(name="updated_at", mysql_type="datetime", auto_update_timestamp=True),
+        ],
+        primary_key=["id"],
+        auto_increment_column="id",
+        foreign_keys=[
+            ForeignKeyDef(
+                name="fk_orders_users",
+                columns=["user_id"],
+                referenced_table="users",
+                referenced_columns=["id"],
+            )
+        ],
+    )
+    report = CompatibilityAssessor().assess(SourceInventory(tables=[table]))
+    return next(i for i in report.items if i.object_name == "orders")
+
+
+def test_assessment_row_renders_one_block_per_concern() -> None:
+    from dsql_migrator.ui.evaluation import _render_assessment_item
+
+    item = _five_rule_item()
+    ui = _ItemUi()
+    _render_assessment_item(ui, item)
+
+    body = "\n".join(ui.texts)
+    # Every rule id is shown, so the reader can see WHICH rules fired.
+    for rule_id in ("FK_UNSUPPORTED", "AUTO_INCREMENT", "CI_COLLATION",
+                    "ENUM_SET_TYPE", "ON_UPDATE_TIMESTAMP"):
+        assert rule_id in body, rule_id
+    # Separated visually: n concerns -> n-1 separators between them.
+    assert ui.separators == len(item.concerns) - 1
+    # The joined run-on string is NOT what gets rendered.
+    assert "Aurora DSQL.; AUTO_INCREMENT column" not in body
+
+
+def test_each_rendered_concern_shows_its_own_class_and_fix() -> None:
+    """The header badge shows only the GOVERNING class, which hides the others.
+
+    A per-concern badge is what lets a reader see that (say) one finding is UNSUPPORTED
+    while the rest are MANUAL, instead of inferring it from the single worst-case badge.
+    """
+    from dsql_migrator.ui.evaluation import _render_assessment_item
+
+    item = _five_rule_item()
+    ui = _ItemUi()
+    _render_assessment_item(ui, item)
+
+    body = "\n".join(ui.texts)
+    for concern in item.concerns:
+        assert concern.risk in body, concern.rule_id
+        assert concern.recommendation in body, concern.rule_id
+    # One class badge per concern, plus the header's own badge and the kind badge.
+    from dsql_migrator.ui.evaluation import classification_label
+
+    label = classification_label(item.classification.value)
+    assert ui.badges.count(label) >= len(item.concerns)
+    # An arrow marks each recommendation, pairing it with the risk above it.
+    assert ui.icons.count("arrow_forward") == len(
+        [c for c in item.concerns if c.recommendation]
+    )
+
+
+def test_row_falls_back_to_joined_text_for_a_pre_concerns_report() -> None:
+    # A session persisted before `concerns` existed must still render its guidance
+    # rather than showing an empty body.
+    from dsql_migrator.core.models import AssessmentItem, Classification
+    from dsql_migrator.ui.evaluation import _render_assessment_item
+
+    legacy = AssessmentItem(
+        object_name="orders",
+        rule_id="FK_UNSUPPORTED",
+        classification=Classification.MANUAL,
+        risk="a; b",
+        recommendation="fix a; fix b",
+        kind="TABLE",
+    )
+    ui = _ItemUi()
+    _render_assessment_item(ui, legacy)
+    body = "\n".join(ui.texts)
+    assert "a; b" in body
+    assert "fix a; fix b" in body

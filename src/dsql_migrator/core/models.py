@@ -447,6 +447,35 @@ class AssessmentItem(BaseModel):
         min_length=1,
         description="Object kind (e.g. TABLE/VIEW/TRIGGER/ROUTINE) for grouping.",
     )
+    concerns: list["AssessmentConcern"] = Field(
+        default_factory=list,
+        description=(
+            "The individual findings behind this item, one per matched rule, most "
+            "severe first. ``risk``/``recommendation`` remain the semicolon-joined "
+            "summary of these for back-compat and for flat exports; anything that "
+            "presents the item to a human should render THESE instead, because a "
+            "table matching five rules produced one unreadable run-on sentence."
+        ),
+    )
+
+
+class AssessmentConcern(BaseModel):
+    """One finding about an object: what the risk is and what to do about it.
+
+    An object commonly matches several independent rules -- a foreign key, an
+    AUTO_INCREMENT key, a CI collation, an ENUM column and an ON UPDATE timestamp are
+    five separate decisions with five separate fixes. Collapsing them into a single
+    ``"a; b; c; d; e"`` string made the report unreadable exactly when it had the most to
+    say, and pairing each risk with its own recommendation was left to the reader.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    rule_id: str = Field(min_length=1)
+    classification: Classification
+    risk: str = ""
+    recommendation: str = ""
+    effort: Optional[EffortLevel] = None
 
 
 class AssessmentReport(BaseModel):

@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.169
+
+### Changed
+
+- **Evaluation now lists each risk with its own fix, instead of one run-on sentence.** An
+  object commonly trips several independent rules — a foreign key, an `AUTO_INCREMENT`
+  key, a case-insensitive collation, an `ENUM` column and an `ON UPDATE` timestamp are
+  five separate decisions with five separate remedies. Every rule's text was joined into a
+  single **Risk** paragraph and a single **Recommendation** paragraph, so the report became
+  unreadable exactly when it had the most to say, and matching the *n*-th risk to the
+  *n*-th fix was left to the reader. Each matched rule is now its own block — carrying its
+  own rule id, classification and effort — in the Evaluation screen, the text export, and
+  the HTML report (where the two columns become aligned lists). A per-concern
+  classification badge also makes it visible when one finding is `UNSUPPORTED` while the
+  rest are `MANUAL`; the row header shows only the governing class, which used to hide
+  that. The joined `risk`/`recommendation` strings are still populated for back-compat and
+  flat exports, and a report persisted before this change falls back to rendering them.
+
 ## v0.1.168
 
 ### Changed
