@@ -5,6 +5,16 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.168
+
+### Changed
+
+- **The published ECR Public default now points at `0.1.167`.** That is the image a fresh
+  CloudFormation deploy pulls, so it has to track the shipped version — it carries the
+  column-`DEFAULT` preservation and the three DDL-rejection fixes from v0.1.166/v0.1.167,
+  without which a new deployment would silently produce schemas the cluster rejects (or
+  accepts while dropping every default).
+
 ## v0.1.167
 
 ### Fixed
