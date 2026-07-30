@@ -5,6 +5,54 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.166
+
+### Fixed
+
+- **Column `DEFAULT` values were dropped during Schema Conversion, silently.** Aurora DSQL
+  supports column defaults (`DEFAULT default_expr` is in its documented `CREATE TABLE`
+  grammar, and literals, expressions, `CURRENT_TIMESTAMP`/`now()`, `gen_random_uuid()` and
+  `NOT NULL DEFAULT` were all confirmed on a live cluster) — the converter simply never
+  emitted them: `ColumnDef.default` was populated by the introspector and read by nothing.
+  Migrated rows were unaffected (the loader writes explicit values), but rows the
+  **application** writes after cut-over were not: MySQL accepts an `INSERT` that omits a
+  `NOT NULL` column *with* a default, and the target rejects that same `INSERT` with a
+  not-null violation. Every one of the 22 defaulted columns in the reference schema is
+  `NOT NULL`, so this was not a corner case. Defaults are now carried across, with three
+  translations that a pass-through would get wrong: `tinyint(1) DEFAULT '1'` becomes
+  `DEFAULT TRUE` (`DEFAULT 1` on a boolean is a hard error on DSQL), the `AUTO_INCREMENT`
+  column gets no default (an identity column carrying one is rejected), and a generated
+  column gets none (its value is computed). A default that genuinely cannot be translated
+  (MySQL `UUID()`, or a `tinyint(1)` default outside 0/1) is dropped **with a warning** that
+  spells out the post-cut-over consequence — previously nothing was reported at all.
+- **Identity primary keys produced DDL that Aurora DSQL rejected outright.** Two separate
+  defects, both on the `IDENTITY_WITH_CACHE` strategy and both invisible to the tests
+  because they assert on generated DDL *text*:
+  - `CACHE 100` — DSQL requires `CACHE` to be stated explicitly and accepts only `1` or
+    `>= 65536` (*"CACHE (100) must be greater than or equal to 65536 or equal to 1"*). Now
+    65536, the smallest cached value, which is also the point of the strategy.
+  - an `INT` identity column — DSQL sequences are BIGINT-only (*"datatype integer not
+    supported, identity column type must be bigint"*), and MySQL `int AUTO_INCREMENT` is the
+    most common primary key there is, so this broke the typical table. Narrow integer
+    identity columns are now widened to `BIGINT` (lossless).
+- **`DECIMAL` past Aurora DSQL's precision ceiling failed to apply.** MySQL allows
+  `DECIMAL(65,30)`; DSQL caps precision at 38 and scale at 37. The spec is now clamped —
+  with a warning, since clamping loses range — and a reduced precision drags an over-large
+  scale down with it (`scale > precision` is itself an error).
+
+### Added
+
+- **`scripts/verify_conversion_on_dsql.py`** — applies the converter's own output to a live
+  Aurora DSQL cluster and reports anything the cluster rejects. This is the check that was
+  missing: the unit tests assert on generated DDL text (so a snapshot happily pinned the
+  broken `CACHE 100`), and the end-to-end run exercises one hand-built schema that contains
+  none of the shapes above. It sweeps a 49-case synthetic matrix over the *long tail* of the
+  MySQL dialect (`SET`, `BIT`, spatial, wide `DECIMAL`, quoted/empty/negative literal
+  defaults, generated columns, …) plus, optionally, every table in a real source schema —
+  under every primary-key strategy, since two of the three defects were only reachable
+  through a non-default one. Read-only against the source; on the target it creates and
+  drops tables in a scratch schema. Exits non-zero, so it can gate a release.
+
 ## v0.1.165
 
 ### Fixed

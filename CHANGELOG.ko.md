@@ -5,6 +5,50 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.166
+
+### Fixed
+
+- **스키마 변환에서 컬럼 `DEFAULT` 값이 조용히 사라지던 문제를 수정했습니다.** Aurora DSQL은
+  컬럼 기본값을 지원합니다(`DEFAULT default_expr`가 문서화된 `CREATE TABLE` 문법에 있고,
+  리터럴·표현식·`CURRENT_TIMESTAMP`/`now()`·`gen_random_uuid()`·`NOT NULL DEFAULT`를 실제
+  클러스터에서 모두 확인) — 컨버터가 그것을 생성하지 않았을 뿐입니다: `ColumnDef.default`는
+  introspector가 채우지만 읽는 코드가 없었습니다. 마이그레이션된 행은 영향이 없지만(로더가 명시적
+  값을 씀), 컷오버 후 **애플리케이션**이 쓰는 행은 다릅니다: MySQL은 기본값이 있는 `NOT NULL`
+  컬럼을 생략한 `INSERT`를 받아주지만, 타깃은 같은 `INSERT`를 not-null 위반으로 거부합니다.
+  참조 스키마에서 기본값을 가진 22개 컬럼이 **전부** `NOT NULL`이었으므로 코너 케이스가 아닙니다.
+  이제 기본값이 보존되며, 단순 통과로는 틀리는 세 가지를 변환합니다:
+  `tinyint(1) DEFAULT '1'`은 `DEFAULT TRUE`로(boolean에 `DEFAULT 1`은 DSQL에서 오류),
+  `AUTO_INCREMENT` 컬럼에는 기본값을 넣지 않고(identity 컬럼의 DEFAULT는 거부됨), generated
+  컬럼에도 넣지 않습니다(값이 계산됨). 정말로 번역할 수 없는 기본값(MySQL `UUID()`,
+  0/1을 벗어난 `tinyint(1)` 기본값)은 **경고와 함께** 드롭하며, 컷오버 후 어떤 결과가 되는지
+  명시합니다 — 기존에는 아무 보고도 없었습니다.
+- **Identity 기본 키가 Aurora DSQL이 거부하는 DDL을 생성하던 문제를 수정했습니다.** 두 개의
+  별개 결함이며, 둘 다 `IDENTITY_WITH_CACHE` 전략에서 발생하고 테스트가 생성된 DDL *텍스트*를
+  검사하기 때문에 보이지 않았습니다:
+  - `CACHE 100` — DSQL은 `CACHE`를 명시하도록 요구하며 `1` 또는 `>= 65536`만 받습니다
+    (*"CACHE (100) must be greater than or equal to 65536 or equal to 1"*). 이제 65536이며,
+    이는 허용되는 최소 캐시값이자 이 전략의 목적에도 맞습니다.
+  - `INT` identity 컬럼 — DSQL 시퀀스는 BIGINT 전용이며(*"datatype integer not supported,
+    identity column type must be bigint"*), MySQL `int AUTO_INCREMENT`는 가장 흔한 기본 키라
+    전형적인 테이블이 깨졌습니다. 좁은 정수 identity 컬럼은 이제 `BIGINT`로 확장됩니다(무손실).
+- **Aurora DSQL 정밀도 상한을 넘는 `DECIMAL`이 적용되지 않던 문제를 수정했습니다.** MySQL은
+  `DECIMAL(65,30)`까지 허용하지만 DSQL은 정밀도 38, 소수 자릿수 37이 상한입니다. 이제 스펙을
+  클램프하며 — 범위가 손실되므로 경고와 함께 — 정밀도가 줄면 과대한 소수 자릿수도 함께
+  줄입니다(`scale > precision`은 그 자체로 오류).
+
+### Added
+
+- **`scripts/verify_conversion_on_dsql.py`** — 컨버터의 출력을 실제 Aurora DSQL 클러스터에
+  적용해 클러스터가 거부하는 것을 보고합니다. 빠져 있던 바로 그 검증입니다: 단위 테스트는 생성된
+  DDL 텍스트를 검사하므로(그래서 스냅샷이 잘못된 `CACHE 100`을 그대로 고정하고 있었습니다)
+  E2E는 위 형태들을 하나도 포함하지 않는 손으로 만든 스키마 하나만 돕니다. MySQL 방언의 *롱테일*
+  49 케이스(`SET`, `BIT`, 공간 타입, 넓은 `DECIMAL`, 따옴표/빈/음수 리터럴 기본값, generated
+  컬럼 등)를 훑고, 선택적으로 실제 소스 스키마의 모든 테이블도 훑습니다 — 세 결함 중 둘이
+  비기본 전략에서만 닿았으므로 모든 기본 키 전략에 대해 수행합니다. 소스는 읽기 전용이며,
+  타깃에서는 스크래치 스키마에 테이블을 만들고 삭제합니다. 실패 시 non-zero로 종료하므로
+  릴리스 게이트로 쓸 수 있습니다.
+
 ## v0.1.165
 
 ### Fixed

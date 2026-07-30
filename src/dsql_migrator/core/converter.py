@@ -80,7 +80,76 @@ from dsql_migrator.core.models import (
 # Cache size applied to an identity primary key under the IDENTITY_WITH_CACHE
 # strategy. A per-node cache hands out blocks of values so concurrent inserts do
 # not contend on a single hot key range in DSQL.
-_IDENTITY_CACHE_SIZE = 100
+#
+# MUST be 1 or >= 65536: Aurora DSQL requires CACHE to be stated explicitly and accepts
+# only those two ranges (documented on CREATE SEQUENCE, and confirmed live -- CACHE 100
+# fails with "CACHE (100) must be greater than or equal to 65536 or equal to 1"). The
+# previous value of 100 was in neither range, so every table converted with this strategy
+# produced DDL that Aurora DSQL rejected outright. 65536 is the smallest accepted cached
+# value, which is also the right pick here: the whole point of the strategy is to spread
+# concurrent inserts, and CACHE 1 is the non-cached behavior it exists to avoid.
+_IDENTITY_CACHE_SIZE = 65536
+
+# Aurora DSQL numeric limits, confirmed live: "NUMERIC precision 39 must be between 1 and
+# 38" and "NUMERIC scale 38 must be between 0 and 37". MySQL allows DECIMAL up to
+# precision 65 / scale 30, so a wide source column produces DDL that DSQL rejects
+# outright unless it is clamped here.
+_DSQL_NUMERIC_MAX_PRECISION = 38
+_DSQL_NUMERIC_MAX_SCALE = 37
+
+
+def _clamp_numeric_spec(params: list) -> tuple[str, Optional[str]]:
+    """Clamp a DECIMAL(p[,s]) spec to what Aurora DSQL accepts.
+
+    Returns ``(spec_text, warning)``. Clamping the PRECISION loses range and clamping the
+    SCALE loses decimal places, so either change is reported -- the alternative is DDL
+    that fails to apply, which is strictly worse, but the operator still has to know the
+    column can no longer hold every source value.
+    """
+    values: list[int] = []
+    for param in params:
+        text = param.sql(dialect=_MYSQL).strip()
+        try:
+            values.append(int(text))
+        except ValueError:
+            # Not a plain integer (unexpected); leave the spec untouched.
+            return ", ".join(p.sql(dialect=_MYSQL) for p in params), None
+    if not values:
+        return "", None
+
+    precision = values[0]
+    scale = values[1] if len(values) > 1 else None
+    notes: list[str] = []
+
+    if precision > _DSQL_NUMERIC_MAX_PRECISION:
+        notes.append(
+            f"precision {precision} exceeds the Aurora DSQL maximum of "
+            f"{_DSQL_NUMERIC_MAX_PRECISION} and was reduced"
+        )
+        precision = _DSQL_NUMERIC_MAX_PRECISION
+    if scale is not None:
+        if scale > _DSQL_NUMERIC_MAX_SCALE:
+            notes.append(
+                f"scale {scale} exceeds the Aurora DSQL maximum of "
+                f"{_DSQL_NUMERIC_MAX_SCALE} and was reduced"
+            )
+            scale = _DSQL_NUMERIC_MAX_SCALE
+        # The scale can never exceed the (possibly reduced) precision.
+        if scale > precision:
+            notes.append(f"scale was further reduced to {precision} to fit the precision")
+            scale = precision
+
+    spec = f"{precision}" if scale is None else f"{precision}, {scale}"
+    warning = None
+    if notes:
+        warning = (
+            "DECIMAL "
+            + "; ".join(notes)
+            + ". Values needing the original precision/scale will not fit -- review this "
+            "column before migrating."
+        )
+    return spec, warning
+
 
 # Aurora DSQL hard limits on primary/secondary keys (see the DSQL quotas docs).
 # Used to validate a COMPOSITE_KEY request so the converter never emits DDL that
@@ -639,13 +708,19 @@ def map_data_type(data_type: exp.DataType) -> Optional[_Mapping]:
         # DOUBLE UNSIGNED -> UDOUBLE is handled by ``_FLOAT_TARGET`` above.)
         return _Mapping(target=_build("double precision"))
 
-    if kind is _DType.UDECIMAL:
-        # DECIMAL(p,s) UNSIGNED -> sqlglot ``UDECIMAL(p,s)`` (nonexistent). Map to
-        # numeric, preserving precision/scale; unsigned-ness is not representable.
+    if kind in (_DType.UDECIMAL, _DType.DECIMAL):
+        # DECIMAL(p,s) UNSIGNED -> sqlglot ``UDECIMAL(p,s)`` (nonexistent), so it must be
+        # mapped to numeric here; unsigned-ness is not representable. SIGNED DECIMAL
+        # renders correctly on its own, but is routed through the same branch so the
+        # DSQL precision/scale ceiling is applied to both -- MySQL allows DECIMAL(65,30)
+        # and DSQL rejects anything past (38,37).
         params = data_type.expressions
         if params:
-            spec = ", ".join(p.sql(dialect=_MYSQL) for p in params)
-            return _Mapping(target=_build(f"numeric({spec})"))
+            spec, clamp_warning = _clamp_numeric_spec(list(params))
+            if spec:
+                return _Mapping(
+                    target=_build(f"numeric({spec})"), message=clamp_warning
+                )
         return _Mapping(target=_build("numeric"))
 
     if kind is _DType.DATETIME:
@@ -923,6 +998,114 @@ def _normalize_mysql_type(mysql_type: str) -> str:
     return re.sub(r"\s+zerofill\b", "", mysql_type, flags=re.IGNORECASE).strip()
 
 
+# MySQL default values that are FUNCTIONS, not literals. SQLAlchemy reflection returns
+# a literal already single-quoted (``"'0'"``) but a function bare (``"CURRENT_TIMESTAMP"``),
+# which is exactly the signal needed to tell them apart -- see _column_default_sql.
+# CURRENT_TIMESTAMP / NOW() carry straight to PostgreSQL; DSQL accepts both (verified on
+# a live cluster). ``CURRENT_TIMESTAMP(n)`` (fractional-second precision) is matched by
+# the prefix check because PostgreSQL accepts the same spelling.
+_MYSQL_FUNCTION_DEFAULTS: frozenset[str] = frozenset(
+    {"CURRENT_TIMESTAMP", "NOW()", "CURRENT_DATE", "CURRENT_TIME", "LOCALTIME",
+     "LOCALTIMESTAMP", "UTC_TIMESTAMP()", "UUID()", "CURRENT_TIMESTAMP()"}
+)
+
+# MySQL functions with no PostgreSQL/DSQL equivalent spelling. Emitting these verbatim
+# would make the CREATE TABLE fail, so the default is dropped and a warning raised
+# instead -- a failed DDL is worse than a reported gap.
+_UNTRANSLATABLE_FUNCTION_DEFAULTS: frozenset[str] = frozenset({"UUID()", "UTC_TIMESTAMP()"})
+
+
+def _mysql_default_is_function(default: str) -> bool:
+    """Whether a reflected MySQL default is a function call rather than a literal.
+
+    SQLAlchemy's MySQL reflection keeps the source's quoting: a literal default comes
+    back WITH its quotes (``"'0'"``, ``"'consumer'"``) while a function default comes
+    back bare (``"CURRENT_TIMESTAMP"``). That distinction is what makes a safe
+    translation possible without re-parsing MySQL's grammar.
+    """
+    stripped = default.strip()
+    if stripped.startswith("'") or stripped.startswith('"'):
+        return False
+    upper = stripped.upper()
+    return (
+        upper in _MYSQL_FUNCTION_DEFAULTS
+        # CURRENT_TIMESTAMP(3) etc.
+        or upper.startswith("CURRENT_TIMESTAMP(")
+        or upper.startswith("NOW(")
+    )
+
+
+def _column_default_sql(column: ColumnDef, data_type: str) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(default_sql, warning)`` for a column's MySQL default.
+
+    ``default_sql`` is the text to put after ``DEFAULT`` in the generated MySQL DDL
+    (sqlglot then transpiles the whole statement to PostgreSQL). ``None`` means emit no
+    default; ``warning`` is a message when something had to be dropped or reshaped, so a
+    change in insert behavior is never silent.
+
+    Aurora DSQL DOES support column defaults -- ``DEFAULT default_expr`` is in its
+    documented ``CREATE TABLE`` column_constraint grammar, and literals, expressions,
+    ``CURRENT_TIMESTAMP``/``now()``, ``gen_random_uuid()`` and ``NOT NULL DEFAULT`` were
+    all verified working on a live cluster. Dropping them was a gap in this converter,
+    not a platform limit. It mattered most for a **NOT NULL column with a default**:
+    MySQL accepts an INSERT that omits it, but the target then rejects that same INSERT
+    with a not-null violation -- an application break that only shows up after cut-over.
+
+    The cases, and why each is handled the way it is:
+
+    * **No default** -> nothing to emit.
+    * **Generated column** -> a default is meaningless (the value is computed); skipped
+      silently, since nothing is lost.
+    * **AUTO_INCREMENT** -> becomes ``GENERATED BY DEFAULT AS IDENTITY``, and PostgreSQL
+      rejects an identity column that also carries a DEFAULT. Skipped.
+    * **TINYINT(1) -> BOOLEAN** -> MySQL stores the default as ``'0'``/``'1'``, and
+      ``DEFAULT 1`` on a boolean column is a hard error on DSQL ("default expression is
+      of type integer"). Translated to ``TRUE``/``FALSE``.
+    * **Function default** -> passed through when PostgreSQL spells it the same way;
+      dropped with a warning when it does not (e.g. MySQL ``UUID()``).
+    * **Literal default** -> already quoted by reflection, so it is emitted as-is. The
+      quotes come from MySQL's own metadata, not from user input at runtime, and any
+      embedded quote is already escaped in that form.
+    """
+    raw = (column.default or "").strip()
+    if not raw:
+        return None, None
+    if column.generated:
+        return None, None  # computed value; a default cannot apply
+
+    if _mysql_default_is_function(raw):
+        if raw.upper() in _UNTRANSLATABLE_FUNCTION_DEFAULTS:
+            return None, (
+                f"MySQL default {raw} has no Aurora DSQL equivalent, so the column is "
+                "created without a default. Set the value explicitly in the "
+                "application, or use a DSQL expression default (e.g. "
+                "gen_random_uuid()) if the semantics match."
+            )
+        return raw, None
+
+    # tinyint(1) becomes BOOLEAN, whose default must be a boolean literal.
+    if _is_tinyint_bool_type(data_type):
+        unquoted = raw.strip().strip("'\"")
+        if unquoted in ("0", "1"):
+            return ("TRUE" if unquoted == "1" else "FALSE"), None
+        return None, (
+            f"TINYINT(1) default {raw} is not 0 or 1, so it cannot be mapped to a "
+            "boolean default; the column is created without one."
+        )
+
+    return raw, None
+
+
+def _is_tinyint_bool_type(mysql_type: str) -> bool:
+    """Whether a raw MySQL type string is the ``TINYINT(1)`` boolean convention.
+
+    A string-level check (the sibling :func:`_is_tinyint_one` works on a parsed sqlglot
+    type) because the default is decided while building the MySQL DDL text.
+    """
+    normalized = mysql_type.strip().lower().replace(" ", "")
+    return normalized.startswith("tinyint(1)")
+
+
 def _build_source_ddl(table: TableDef) -> str:
     """Build a MySQL ``CREATE TABLE`` string for ``table`` (columns + PK).
 
@@ -945,6 +1128,15 @@ def _build_source_ddl(table: TableDef) -> str:
         )
         if not column.nullable:
             clause += " NOT NULL"
+        # Carry the source DEFAULT across. It is emitted into the MySQL DDL and
+        # transpiled with the rest of the statement, so sqlglot handles the dialect
+        # rendering instead of this building PostgreSQL text by hand. Skipped for the
+        # AUTO_INCREMENT column, which becomes GENERATED BY DEFAULT AS IDENTITY -- an
+        # identity column carrying a DEFAULT is rejected by PostgreSQL.
+        if column.name != table.auto_increment_column:
+            default_sql, _warning = _column_default_sql(column, column.mysql_type)
+            if default_sql is not None:
+                clause += f" DEFAULT {default_sql}"
         column_clauses.append(clause)
 
     if table.primary_key:
@@ -1421,6 +1613,21 @@ def _apply_pk_strategy(
         )
     elif strategy is PrimaryKeyStrategy.IDENTITY_WITH_CACHE:
         if column_def is not None:
+            # Aurora DSQL identity columns must be BIGINT: its sequences are BIGINT-only,
+            # so an INT/SMALLINT identity is rejected outright ("datatype integer not
+            # supported, identity column type must be bigint" -- confirmed live). A MySQL
+            # `int AUTO_INCREMENT` primary key is extremely common, so without this
+            # widening the whole CREATE TABLE failed for the typical table. Widening is
+            # safe: BIGINT holds every INT value, and the sequence only ever generates
+            # values going forward.
+            data_type = column_def.args.get("kind")
+            if isinstance(data_type, exp.DataType) and data_type.this in (
+                exp.DataType.Type.INT,
+                exp.DataType.Type.SMALLINT,
+                exp.DataType.Type.TINYINT,
+                exp.DataType.Type.MEDIUMINT,
+            ):
+                column_def.set("kind", exp.DataType.build("BIGINT"))
             # sqlglot cannot render an identity CACHE clause, so the constraint
             # text is injected as a fixed (non-user) constant.
             identity = exp.var(
@@ -1584,6 +1791,38 @@ class SchemaConverter:
 
         source_types = {column.name: column.mysql_type for column in table.columns}
         warnings: list[ConversionWarning] = []
+
+        # A source DEFAULT that could NOT be carried across must be reported. Aurora DSQL
+        # supports column defaults, so most are preserved (see _column_default_sql) -- but
+        # when one has to be dropped, saying nothing would hide a change in INSERT
+        # behavior that only surfaces after cut-over. The severity is deliberately split:
+        # a NOT NULL column losing its default is a functional break (an application
+        # INSERT that omits the column succeeds on MySQL and is REJECTED on the target),
+        # whereas a nullable column merely starts defaulting to NULL.
+        for column in table.columns:
+            if not column.default or column.generated:
+                continue
+            if column.name == table.auto_increment_column:
+                continue
+            _emitted, default_warning = _column_default_sql(column, column.mysql_type)
+            if default_warning is None:
+                continue
+            if not column.nullable:
+                default_warning += (
+                    " This column is NOT NULL, so an INSERT that omits it succeeds on "
+                    "MySQL but will be REJECTED on Aurora DSQL -- set the value "
+                    "explicitly in the application before cutting over."
+                )
+            warnings.append(
+                ConversionWarning(
+                    object_name=table.name,
+                    column_name=column.name,
+                    source_type=column.mysql_type,
+                    target_type=column.mysql_type,
+                    classification=Classification.MANUAL,
+                    message=default_warning,
+                )
+            )
 
         for column_def in create.find_all(exp.ColumnDef):
             # Drop any MySQL column COLLATE clause: DSQL/PostgreSQL does not have

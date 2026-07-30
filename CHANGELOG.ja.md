@@ -5,6 +5,53 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.166
+
+### Fixed
+
+- **スキーマ変換で列の `DEFAULT` 値が黙って失われる問題を修正しました。** Aurora DSQL は列の
+  デフォルト値をサポートしています(`DEFAULT default_expr` は文書化された `CREATE TABLE` の
+  文法に含まれ、リテラル・式・`CURRENT_TIMESTAMP`/`now()`・`gen_random_uuid()`・
+  `NOT NULL DEFAULT` を実クラスターで確認済み) — コンバーターがそれを出力していなかっただけ
+  です: `ColumnDef.default` は introspector が設定していましたが、読む箇所がありませんでした。
+  移行済みの行には影響しません(ローダーが明示的な値を書き込むため)が、カットオーバー後に
+  **アプリケーション** が書き込む行は違います: MySQL はデフォルト値を持つ `NOT NULL` 列を省略
+  した `INSERT` を受け付けますが、ターゲットは同じ `INSERT` を not-null 違反で拒否します。
+  参照スキーマでデフォルト値を持つ 22 列は **すべて** `NOT NULL` だったため、例外的な事例では
+  ありません。現在はデフォルト値が引き継がれ、単純な受け渡しでは誤りとなる 3 つを変換します:
+  `tinyint(1) DEFAULT '1'` は `DEFAULT TRUE` へ(boolean に `DEFAULT 1` は DSQL でエラー)、
+  `AUTO_INCREMENT` 列にはデフォルトを付けず(identity 列の DEFAULT は拒否される)、generated
+  列にも付けません(値が計算されるため)。本当に翻訳できないデフォルト(MySQL の `UUID()`、
+  0/1 以外の `tinyint(1)` デフォルト)は **警告付きで** 破棄し、カットオーバー後にどうなるかを
+  明記します — 従来は何も報告されませんでした。
+- **Identity 主キーが Aurora DSQL に拒否される DDL を生成する問題を修正しました。** 2 つの
+  別個の欠陥で、いずれも `IDENTITY_WITH_CACHE` 戦略で発生し、テストが生成された DDL の
+  *テキスト* を検証するため見えていませんでした:
+  - `CACHE 100` — DSQL は `CACHE` の明示を要求し、`1` または `>= 65536` のみを受け付けます
+    (*"CACHE (100) must be greater than or equal to 65536 or equal to 1"*)。現在は 65536 で、
+    これは許容される最小のキャッシュ値であり、この戦略の目的にも合致します。
+  - `INT` の identity 列 — DSQL のシーケンスは BIGINT 専用であり(*"datatype integer not
+    supported, identity column type must be bigint"*)、MySQL の `int AUTO_INCREMENT` は
+    最も一般的な主キーなので、典型的なテーブルが壊れていました。狭い整数の identity 列は
+    `BIGINT` に拡張されます(可逆)。
+- **Aurora DSQL の精度上限を超える `DECIMAL` が適用できない問題を修正しました。** MySQL は
+  `DECIMAL(65,30)` まで許容しますが、DSQL は精度 38・スケール 37 が上限です。現在は仕様を
+  クランプし — 範囲が失われるため警告付きで — 精度が縮小された場合は過大なスケールも一緒に
+  縮小します(`scale > precision` はそれ自体がエラー)。
+
+### Added
+
+- **`scripts/verify_conversion_on_dsql.py`** — コンバーターの出力を実際の Aurora DSQL
+  クラスターに適用し、クラスターが拒否したものを報告します。欠けていたのはまさにこの検証です:
+  単体テストは生成された DDL テキストを検証するため(スナップショットが壊れた `CACHE 100` を
+  そのまま固定していました)、E2E は上記の形状をどれも含まない手作りのスキーマ 1 つしか実行
+  しません。MySQL 方言の *ロングテール* 49 ケース(`SET`、`BIT`、空間型、広い `DECIMAL`、
+  引用符付き/空/負のリテラルデフォルト、generated 列など)を網羅し、任意で実際のソース
+  スキーマの全テーブルも対象にします — 3 つの欠陥のうち 2 つが非デフォルト戦略でのみ到達
+  可能だったため、すべての主キー戦略について実行します。ソースは読み取り専用で、ターゲットでは
+  スクラッチスキーマにテーブルを作成して削除します。失敗時は非ゼロで終了するため、リリースの
+  ゲートとして使えます。
+
 ## v0.1.165
 
 ### Fixed
