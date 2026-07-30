@@ -1335,140 +1335,116 @@ _HTML_CLASS_COLOR: dict[Classification, str] = {
     Classification.UNSUPPORTED: "#ffebee",
 }
 
-# Solid bar colors for the conversion-statistics chart (UI and HTML match).
-# A single severity ramp so the bars match the effort badges (green-6 / orange-8
-# / red-8): auto (deep green) -> simple (green) -> medium (orange) -> significant
-# (red). The earlier green->blue scheme clashed with the orange/red effort badges.
-_CHART_BUCKET_COLORS: dict[str, str] = {
-    "auto": "#2e7d32",
-    "simple": "#43a047",
-    "medium": "#ef6c00",
-    "significant": "#c62828",
+# Solid bar colors per CLASSIFICATION for the HTML chart. The _HTML_CLASS_COLOR values
+# above are pale table-cell backgrounds; a bar needs full-strength fills to be legible at
+# 18px. Same green/amber/red severity ramp as the classification badges in the UI.
+# Fixed order for the chart: best outcome first, so a bar reads left-to-right from
+# "converts by itself" to "cannot be converted".
+_CHART_ORDER: tuple[Classification, ...] = (
+    Classification.AUTO,
+    Classification.MANUAL,
+    Classification.UNSUPPORTED,
+)
+
+# Chart labels. "Review needed" rather than the raw MANUAL, matching the wording the UI
+# badges use, so the exported report and the screen agree.
+_CLASS_CHART_LABELS: dict[Classification, str] = {
+    Classification.AUTO: "Auto-converted",
+    Classification.MANUAL: "Review needed",
+    Classification.UNSUPPORTED: "Unsupported",
+}
+
+_CHART_CLASS_COLORS: dict[Classification, str] = {
+    Classification.AUTO: "#2e7d32",
+    Classification.MANUAL: "#ef6c00",
+    Classification.UNSUPPORTED: "#c62828",
 }
 
 
-@dataclass(frozen=True)
-class KindConversionStat:
-    """Per-object-kind conversion counts for the assessment chart.
+def classification_stats_by_kind(
+    report: AssessmentReport,
+) -> list[tuple[str, dict[Classification, int], int]]:
+    """Per-kind counts split by CLASSIFICATION, most-blocked kind first.
 
-    Buckets each object as automatically convertible (``auto``) or, for
-    non-automatic objects, by estimated effort (``simple``/``medium``/
-    ``significant``). ``manual_share`` is the fraction of objects of this kind
-    that need manual work, used to order kinds by impact.
+    This is what both the UI chart and the HTML export are built from, so the two always
+    agree. Classification rather than effort, because the chart sits beside the
+    classification summary and a table whose Classification column uses the same three
+    words -- splitting the bars by effort instead made the reader translate between two
+    vocabularies to reconcile them. Effort is still reported, in its own summary and per
+    object; it is just not what this chart answers.
+
+    Ordered by the share of objects that are UNSUPPORTED, then MANUAL, then total count,
+    so the kind in most trouble is on top.
     """
-
-    kind: str
-    auto: int
-    simple: int
-    medium: int
-    significant: int
-
-    @property
-    def total(self) -> int:
-        """Total assessed objects of this kind."""
-        return self.auto + self.simple + self.medium + self.significant
-
-    @property
-    def non_auto(self) -> int:
-        """Objects of this kind that need manual work (non-AUTO)."""
-        return self.simple + self.medium + self.significant
-
-    @property
-    def manual_share(self) -> float:
-        """Fraction (0..1) of this kind's objects that need manual work."""
-        return self.non_auto / self.total if self.total else 0.0
-
-
-def kind_conversion_stats(report: AssessmentReport) -> list[KindConversionStat]:
-    """Aggregate per-kind conversion counts, ordered by manual-work share desc.
-
-    Each object is bucketed as automatically convertible (AUTO) or, for
-    non-automatic objects, by effort (Simple/Medium/Significant; a non-automatic
-    item with no effort estimate counts as Simple, the smallest). Kinds are
-    ordered so the kind with the highest share of objects needing manual work
-    comes first (most impactful), breaking ties by total count (desc) then kind
-    name (asc).
-    """
-    counts: dict[str, dict[str, int]] = {}
+    counts: dict[str, dict[Classification, int]] = {}
     for item in report.items:
-        bucket = counts.setdefault(
-            item.kind, {"auto": 0, "simple": 0, "medium": 0, "significant": 0}
-        )
-        if item.classification is Classification.AUTO:
-            bucket["auto"] += 1
-        elif item.effort is EffortLevel.SIMPLE:
-            bucket["simple"] += 1
-        elif item.effort is EffortLevel.MEDIUM:
-            bucket["medium"] += 1
-        elif item.effort is EffortLevel.SIGNIFICANT:
-            bucket["significant"] += 1
-        else:
-            bucket["simple"] += 1
+        bucket = counts.setdefault(item.kind, {c: 0 for c in Classification})
+        bucket[item.classification] += 1
 
-    stats = [
-        KindConversionStat(
-            kind=kind,
-            auto=bucket["auto"],
-            simple=bucket["simple"],
-            medium=bucket["medium"],
-            significant=bucket["significant"],
+    def sort_key(entry: tuple[str, dict[Classification, int]]):
+        kind, by_class = entry
+        total = sum(by_class.values()) or 1
+        return (
+            -by_class[Classification.UNSUPPORTED] / total,
+            -by_class[Classification.MANUAL] / total,
+            -total,
+            kind,
         )
-        for kind, bucket in counts.items()
+
+    return [
+        (kind, by_class, sum(by_class.values()))
+        for kind, by_class in sorted(counts.items(), key=sort_key)
     ]
-    stats.sort(key=lambda stat: (-stat.manual_share, -stat.total, stat.kind))
-    return stats
 
 
 def _render_html_chart(report: AssessmentReport) -> str:
-    """Render the conversion-statistics chart as a self-contained HTML/CSS block.
+    """Render the per-kind chart as a self-contained HTML/CSS block.
 
-    Produces a horizontal stacked bar per object kind (auto / simple / medium /
-    significant), ordered most-impactful first, scaled to the largest kind so
-    bar lengths reflect counts -- no external scripts, so the exported report
-    stays portable.
+    Split by CLASSIFICATION (auto / review needed / unsupported), not by effort. The chart
+    sits directly above the classification summary and a table whose third column is
+    Classification, so an effort-based split made the reader translate between two
+    vocabularies to reconcile them. Effort is still reported -- in its own summary list
+    and per row -- it is just not what this bar answers.
+
+    Bars are scaled to the largest kind so lengths reflect counts, and no external script
+    is used, so the exported report stays portable.
     """
-    stats = kind_conversion_stats(report)
-    max_total = max((stat.total for stat in stats), default=0)
+    stats = classification_stats_by_kind(report)
+    max_total = max((total for _kind, _by_class, total in stats), default=0)
     if not stats or max_total == 0:
         return ""
 
-    legend_items = [
-        ("Auto-converted", _CHART_BUCKET_COLORS["auto"]),
-        ("Simple actions", _CHART_BUCKET_COLORS["simple"]),
-        ("Medium actions", _CHART_BUCKET_COLORS["medium"]),
-        ("Significant actions", _CHART_BUCKET_COLORS["significant"]),
-    ]
     legend = "".join(
-        f'<span class="chip"><i style="background:{color}"></i>{label}</span>'
-        for label, color in legend_items
+        f'<span class="chip"><i style="background:{_CHART_CLASS_COLORS[cls]}"></i>'
+        f"{html.escape(_CLASS_CHART_LABELS[cls])}</span>"
+        for cls in _CHART_ORDER
     )
 
     rows: list[str] = []
-    for stat in stats:
-        segments = [
-            (stat.auto, _CHART_BUCKET_COLORS["auto"]),
-            (stat.simple, _CHART_BUCKET_COLORS["simple"]),
-            (stat.medium, _CHART_BUCKET_COLORS["medium"]),
-            (stat.significant, _CHART_BUCKET_COLORS["significant"]),
-        ]
+    for kind, by_class, total in stats:
         bars = "".join(
-            f'<span style="width:{count / max_total * 100:.2f}%;background:{color}"'
-            f' title="{count}"></span>'
-            for count, color in segments
-            if count > 0
+            f'<span style="width:{by_class[cls] / max_total * 100:.2f}%;'
+            f'background:{_CHART_CLASS_COLORS[cls]}"'
+            f' title="{_CLASS_CHART_LABELS[cls]}: {by_class[cls]}"></span>'
+            for cls in _CHART_ORDER
+            if by_class[cls] > 0
         )
-        manual_pct = round(stat.manual_share * 100)
+        # "needs attention" = anything not AUTO, which is the number an operator plans
+        # around; the per-class counts are on the segment tooltips.
+        attention = total - by_class[Classification.AUTO]
+        meta = f"{total} object{'s' if total != 1 else ''}"
+        if attention:
+            meta += f" &middot; {round(attention / total * 100)}% need attention"
         rows.append(
             '<div class="bar-row">'
-            f'<div class="bar-label">{html.escape(stat.kind)}</div>'
+            f'<div class="bar-label">{html.escape(kind)}</div>'
             f'<div class="bar">{bars}</div>'
-            f'<div class="bar-meta">{stat.total} objects &middot; '
-            f"{manual_pct}% manual</div>"
+            f'<div class="bar-meta">{meta}</div>'
             "</div>"
         )
 
     return (
-        "<h2>Conversion statistics by object kind</h2>\n"
+        "<h2>Compatibility by object kind</h2>\n"
         f'<div class="legend">{legend}</div>\n'
         f'<div class="chart">{"".join(rows)}</div>\n'
     )
@@ -1584,25 +1560,6 @@ def _render_target_html_section(
     return "\n".join(parts)
 
 
-def _html_concern_cell(item: AssessmentItem, field: str, esc) -> str:
-    """Render one table cell as a LIST when the object matched several rules.
-
-    The semicolon-joined ``item.risk`` / ``item.recommendation`` read as one run-on
-    sentence for an object matching five rules -- and put the Nth risk in one cell with
-    the Nth fix in another, leaving the reader to line them up. A ``<ul>`` keeps them
-    enumerated and in the same order in both columns. Falls back to the joined string for
-    a report persisted before ``concerns`` existed.
-    """
-    concerns = list(item.concerns or [])
-    if not concerns:
-        return esc(getattr(item, field))
-    values = [getattr(c, field) for c in concerns]
-    if len([v for v in values if v]) <= 1:
-        return esc(next((v for v in values if v), ""))
-    listed = "".join(f"<li>{esc(v)}</li>" for v in values if v)
-    return f'<ul style="margin:0;padding-left:1.1em">{listed}</ul>'
-
-
 def render_html_report(
     report: AssessmentReport,
     *,
@@ -1635,21 +1592,54 @@ def render_html_report(
     for item in report.items:
         color = _HTML_CLASS_COLOR.get(item.classification, "#ffffff")
         effort = item.effort.value if item.effort is not None else "-"
-        rows.append(
-            "<tr "
+        # ONE ROW PER CONCERN, with the object/kind cells spanning them. A single row
+        # holding a <ul> of risks beside a <ul> of fixes still asked the reader to count
+        # list positions across two cells to pair them; a row per finding puts each risk
+        # physically beside its own fix, its own rule id, class and effort. The object
+        # name is not repeated -- rowspan keeps the grouping visible.
+        concerns = list(item.concerns or [])
+        # Filter attributes go on EVERY row of the group so hiding an object hides all of
+        # its findings; ``data-concern`` marks the continuation rows so the "n of m shown"
+        # counter still counts OBJECTS, not findings.
+        attrs = (
             f'data-kind="{esc(item.kind)}" '
             f'data-classification="{esc(item.classification.value)}" '
             f'data-effort="{esc(effort)}" '
-            f'data-name="{esc(item.object_name.lower())}">'
-            f"<td>{esc(item.object_name)}</td>"
-            f"<td>{esc(item.kind)}</td>"
-            f'<td style="background:{color}">{esc(item.classification.value)}</td>'
-            f"<td>{esc(effort)}</td>"
-            f"<td>{esc(item.rule_id)}</td>"
-            f"<td>{_html_concern_cell(item, 'risk', esc)}</td>"
-            f"<td>{_html_concern_cell(item, 'recommendation', esc)}</td>"
-            "</tr>"
+            f'data-name="{esc(item.object_name.lower())}"'
         )
+        if not concerns:
+            rows.append(
+                f"<tr {attrs}>"
+                f"<td>{esc(item.object_name)}</td>"
+                f"<td>{esc(item.kind)}</td>"
+                f'<td style="background:{color}">{esc(item.classification.value)}</td>'
+                f"<td>{esc(effort)}</td>"
+                f"<td>{esc(item.rule_id)}</td>"
+                f"<td>{esc(item.risk)}</td>"
+                f"<td>{esc(item.recommendation)}</td>"
+                "</tr>"
+            )
+            continue
+        span = f' rowspan="{len(concerns)}"' if len(concerns) > 1 else ""
+        for index, concern in enumerate(concerns):
+            concern_color = _HTML_CLASS_COLOR.get(concern.classification, "#ffffff")
+            concern_effort = (
+                concern.effort.value if concern.effort is not None else "-"
+            )
+            cells = ""
+            if index == 0:
+                cells += f"<td{span}>{esc(item.object_name)}</td>"
+                cells += f"<td{span}>{esc(item.kind)}</td>"
+            cells += (
+                f'<td style="background:{concern_color}">'
+                f"{esc(concern.classification.value)}</td>"
+                f"<td>{esc(concern_effort)}</td>"
+                f"<td>{esc(concern.rule_id)}</td>"
+                f"<td>{esc(concern.risk)}</td>"
+                f"<td>{esc(concern.recommendation)}</td>"
+            )
+            marker = "" if index == 0 else ' data-concern="1"'
+            rows.append(f"<tr {attrs}{marker}>{cells}</tr>")
     table_rows = "\n".join(rows) if rows else (
         '<tr><td colspan="7">No objects were assessed.</td></tr>'
     )
@@ -1687,9 +1677,15 @@ def render_html_report(
         "var ok=(!k||r.dataset.kind===k)&&(!c||r.dataset.classification===c)"
         "&&(!e||r.dataset.effort===e)"
         "&&(!q||(r.dataset.name||'').indexOf(q)>=0);\n"
-        "r.style.display=ok?'':'none';if(ok)shown++;});\n"
+        # An object with several findings now spans several rows: hide/show them all
+        # together, but count only the FIRST row of each group so the counter keeps
+        # reading "n of m objects" rather than jumping to the number of findings.
+        "r.style.display=ok?'':'none';\n"
+        "if(ok&&!r.dataset.concern)shown++;});\n"
+        "var total=document.querySelectorAll("
+        "'#assessed-objects tbody tr[data-kind]:not([data-concern])').length;\n"
         "var cnt=document.getElementById('f-count');\n"
-        "if(cnt)cnt.textContent=shown+' of '+rows.length+' shown';\n"
+        "if(cnt)cnt.textContent=shown+' of '+total+' shown';\n"
         "}\n"
         "['f-kind','f-class','f-effort'].forEach(function(id){\n"
         "var el=document.getElementById(id);if(el)el.addEventListener('change',apply);});\n"
@@ -1804,8 +1800,7 @@ __all__ = [
     "render_text_report",
     "render_html_report",
     "export_report",
-    "KindConversionStat",
-    "kind_conversion_stats",
+    "classification_stats_by_kind",
     "KIND_TABLE",
     "KIND_VIEW",
     "KIND_TRIGGER",

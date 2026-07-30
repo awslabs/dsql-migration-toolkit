@@ -739,15 +739,19 @@ def test_export_report_html_escapes_content() -> None:
     assert "t&lt;x&gt;" in markup
 
 
-def test_export_report_html_includes_conversion_chart() -> None:
+def test_export_report_html_includes_compatibility_chart() -> None:
     report = _assess(_representative_inventory())
     markup = export_report(report, "html")
-    # The HTML export embeds the conversion-statistics chart (self-contained,
-    # no external scripts) with its legend.
-    assert "Conversion statistics by object kind" in markup
+    # The HTML export embeds the per-kind chart (self-contained, no external
+    # scripts) with its legend. Split by CLASSIFICATION, matching the UI chart --
+    # the export follows the screen so the two never disagree.
+    assert "Compatibility by object kind" in markup
     assert 'class="chart"' in markup
-    assert "% manual" in markup
-    assert "Auto-converted" in markup
+    assert "% need attention" in markup
+    for label in ("Auto-converted", "Review needed", "Unsupported"):
+        assert label in markup
+    # Effort words belong to the effort summary, not to this chart's legend.
+    assert "Simple actions" not in markup
 
 
 def test_export_report_html_has_client_side_filters() -> None:
@@ -1115,14 +1119,49 @@ def test_text_report_numbers_each_concern_with_its_fix() -> None:
     assert "Aurora DSQL.; AUTO_INCREMENT column" not in text
 
 
-def test_html_report_lists_concerns_instead_of_one_run_on_cell() -> None:
+def test_html_report_gives_each_concern_its_own_row() -> None:
+    """One row per finding, so each risk sits physically beside its own fix.
+
+    Listing the risks in one cell and the fixes in another still asked the reader to
+    count list positions across two columns to pair them. A row per finding also lets
+    each carry its own rule id, classification and effort -- the object-level row could
+    only show the governing (worst) one.
+    """
     from dsql_migrator.core.assessor import render_html_report
 
     report = CompatibilityAssessor().assess(
         SourceInventory(tables=[_multi_rule_table()])
     )
+    item = next(i for i in report.items if i.object_name == "orders")
     markup = render_html_report(report)
-    # A <ul> per cell keeps the Nth risk aligned with the Nth fix across the two columns.
-    assert "<ul style=" in markup
-    assert "<li>Foreign key constraints" in markup
-    assert "<li>Remove the foreign key" in markup
+
+    # The object cell spans its findings instead of being repeated.
+    assert f'rowspan="{len(item.concerns)}"' in markup
+    # Continuation rows are marked so the filter counter still counts OBJECTS.
+    assert markup.count('data-concern="1"') == len(item.concerns) - 1
+    # Every risk and its own fix are present as plain cells (no <ul> pairing game).
+    # Compared against the ESCAPED text: the cells go through html.escape, so a risk
+    # naming a column as 'id' arrives as &#x27;id&#x27; -- asserting on the raw string
+    # would fail for a reason that has nothing to do with the layout.
+    import html as _html
+
+    for concern in item.concerns:
+        assert f"<td>{_html.escape(concern.risk)}</td>" in markup, concern.rule_id
+        assert (
+            f"<td>{_html.escape(concern.recommendation)}</td>" in markup
+        ), concern.rule_id
+        assert f"<td>{concern.rule_id}</td>" in markup
+    # Per-concern effort, not just the item's governing one.
+    assert "<td>SIMPLE</td>" in markup and "<td>MEDIUM</td>" in markup
+
+
+def test_html_filter_counts_objects_not_findings() -> None:
+    # With a row per finding, a naive counter would report "9 of 9 shown" for one object
+    # with five findings. The script must exclude the continuation rows.
+    from dsql_migrator.core.assessor import render_html_report
+
+    markup = render_html_report(
+        CompatibilityAssessor().assess(SourceInventory(tables=[_multi_rule_table()]))
+    )
+    assert "tr[data-kind]:not([data-concern])" in markup
+    assert "if(ok&&!r.dataset.concern)shown++" in markup

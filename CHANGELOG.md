@@ -5,6 +5,31 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.170
+
+### Changed
+
+- **The Evaluation chart now bars objects by compatibility, not by effort, and the exported
+  report follows the screen.** The bar sat directly above a classification summary and a
+  list whose badges read Auto-converted / Review needed / Unsupported, yet split its own
+  segments into Simple / Medium / Significant actions — two vocabularies for one picture,
+  so answering "how much of my schema actually moves?" meant translating between them. The
+  stack is now the three classifications in that order, so a bar reads left-to-right from
+  "moves by itself" to "cannot move", and per-kind rows are ordered most-blocked first.
+  The HTML export renders the same aggregation with the same labels and colors, retitled
+  **Compatibility by object kind** to match, and its per-bar caption now reads
+  "*n*% need attention" (everything not auto-converted). Effort is unchanged and still
+  reported — in its own summary badges, in the filters, and per object.
+- **Each expanded Evaluation finding is now a bordered card behind a single indent
+  spine.** Findings were separated by flat rules, so with two objects expanded the blocks
+  ran together and it was not obvious which object a given finding belonged to. The spine
+  plus card is the same containment idiom the Schema Conversion object tree uses.
+- **The HTML report gives each finding its own table row.** The previous revision put a
+  list of risks in one cell beside a list of fixes in another, which still asked the reader
+  to count list positions to pair them. Each finding is now a row carrying its own rule id,
+  classification and effort, with the object and kind cells spanning the group; the filter
+  controls hide a whole group together and the counter still counts objects.
+
 ## v0.1.169
 
 ### Changed

@@ -337,7 +337,7 @@ def test_run_evaluation_propagates_introspection_failure() -> None:
         )
 
 
-def test_build_assessment_chart_data_groups_by_kind_and_bucket() -> None:
+def test_build_assessment_chart_data_groups_by_kind_and_classification() -> None:
     from dsql_migrator.core.models import AssessmentItem, AssessmentReport
     from dsql_migrator.ui.evaluation import build_assessment_chart_data
 
@@ -366,13 +366,14 @@ def test_build_assessment_chart_data_groups_by_kind_and_bucket() -> None:
         ]
     )
     data = build_assessment_chart_data(report)
-    # Kinds are ordered most-impactful first (highest manual-work share):
-    # TRIGGER is 100% manual (1/1) vs TABLE 50% (1/2), so TRIGGER comes first.
+    # Kinds are ordered most-blocked first: TRIGGER is 100% MANUAL (1/1) vs TABLE
+    # 50% (1/2), so TRIGGER comes first.
     assert data.kinds == ["TRIGGER", "TABLE"]
+    # Split by CLASSIFICATION, not effort -- the SIMPLE/SIGNIFICANT efforts above
+    # are both MANUAL and so land in the same series.
     assert data.auto == [0, 1]
-    assert data.simple == [0, 1]
-    assert data.medium == [0, 0]
-    assert data.significant == [1, 0]
+    assert data.manual == [1, 1]
+    assert data.unsupported == [0, 0]
 
 
 def test_build_assessment_chart_data_empty_report() -> None:
@@ -894,12 +895,15 @@ class _ItemUi:
         self.badges: list[str] = []
         self.separators = 0
         self.icons: list[str] = []
+        self.classes: list[str] = []
 
     class _El:
         def __init__(self, owner) -> None:
             self._owner = owner
 
-        def classes(self, *_a, **_k):
+        def classes(self, value="", *_a, **_k):
+            if value:
+                self._owner.classes.append(str(value))
             return self
 
         def props(self, *_a, **_k):
@@ -1000,8 +1004,11 @@ def test_assessment_row_renders_one_block_per_concern() -> None:
     for rule_id in ("FK_UNSUPPORTED", "AUTO_INCREMENT", "CI_COLLATION",
                     "ENUM_SET_TYPE", "ON_UPDATE_TIMESTAMP"):
         assert rule_id in body, rule_id
-    # Separated visually: n concerns -> n-1 separators between them.
-    assert ui.separators == len(item.concerns) - 1
+    # Each concern is its own bordered card, indented behind one vertical spine, so the
+    # body reads as children of the row above rather than as a flat run of text.
+    boxed = [c for c in ui.classes if "rounded-md" in c and "border" in c]
+    assert len(boxed) == len(item.concerns), (len(boxed), len(item.concerns))
+    assert any("border-l-2" in c for c in ui.classes), "needs the tree spine"
     # The joined run-on string is NOT what gets rendered.
     assert "Aurora DSQL.; AUTO_INCREMENT column" not in body
 
@@ -1027,8 +1034,8 @@ def test_each_rendered_concern_shows_its_own_class_and_fix() -> None:
 
     label = classification_label(item.classification.value)
     assert ui.badges.count(label) >= len(item.concerns)
-    # An arrow marks each recommendation, pairing it with the risk above it.
-    assert ui.icons.count("arrow_forward") == len(
+    # A child-arrow glyph marks each recommendation, pairing it with the risk above it.
+    assert ui.icons.count("subdirectory_arrow_right") == len(
         [c for c in item.concerns if c.recommendation]
     )
 

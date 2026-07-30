@@ -56,6 +56,7 @@ from dsql_migrator.core.models import (
     AiAssistConfig,
     AssessmentItem,
     AssessmentReport,
+    Classification,
     SourceConnectionConfig,
     SourceInventory,
     StepStatus,
@@ -240,38 +241,38 @@ def _find_target_conflicts(
 
 @dataclass(frozen=True)
 class AssessmentChartData:
-    """Conversion statistics for a stacked bar chart, grouped by object kind.
+    """Per-kind object counts split by CLASSIFICATION, for a stacked bar chart.
 
-    Each list is parallel to ``kinds``: per kind, the count of objects that are
-    automatically convertible (``AUTO``) and the counts of non-automatic objects
-    by estimated effort (``SIMPLE``/``MEDIUM``/``SIGNIFICANT``). This mirrors the
-    AWS SCT "conversion statistics" chart (auto / simple / medium / complex).
+    Each list is parallel to ``kinds``: per kind, how many objects are AUTO, MANUAL and
+    UNSUPPORTED.
+
+    Classification rather than effort, because the chart sits beside the classification
+    summary and a list whose badges read Auto / Review needed / Unsupported -- splitting
+    the bars by effort instead made the reader translate between two vocabularies to
+    reconcile the two. Effort is still reported, in its own summary and per object; it is
+    just not what this bar answers.
     """
 
     kinds: list[str]
     auto: list[int]
-    simple: list[int]
-    medium: list[int]
-    significant: list[int]
+    manual: list[int]
+    unsupported: list[int]
 
 
 def build_assessment_chart_data(report: AssessmentReport) -> AssessmentChartData:
-    """Aggregate an assessment report into per-kind conversion statistics.
+    """Aggregate an assessment report into per-kind classification counts.
 
-    ``AUTO`` objects count as automatically convertible; non-automatic objects
-    are bucketed by their effort estimate. Kinds are ordered most-impactful
-    first -- by the share of objects needing manual work (descending) -- reusing
-    the shared core aggregation so the UI chart and the HTML export agree.
+    Kinds are ordered most-blocked first (share UNSUPPORTED, then MANUAL, then total),
+    reusing the shared core aggregation so the UI chart and the HTML export agree.
     """
-    from dsql_migrator.core.assessor import kind_conversion_stats
+    from dsql_migrator.core.assessor import classification_stats_by_kind
 
-    stats = kind_conversion_stats(report)
+    stats = classification_stats_by_kind(report)
     return AssessmentChartData(
-        kinds=[stat.kind for stat in stats],
-        auto=[stat.auto for stat in stats],
-        simple=[stat.simple for stat in stats],
-        medium=[stat.medium for stat in stats],
-        significant=[stat.significant for stat in stats],
+        kinds=[kind for kind, _by_class, _total in stats],
+        auto=[by_class[Classification.AUTO] for _k, by_class, _t in stats],
+        manual=[by_class[Classification.MANUAL] for _k, by_class, _t in stats],
+        unsupported=[by_class[Classification.UNSUPPORTED] for _k, by_class, _t in stats],
     )
 
 
@@ -1273,68 +1274,52 @@ def _build_guidance_drawer(
 
 
 def _render_assessment_chart(ui: object, report: AssessmentReport) -> None:
-    """Render an SCT-style stacked horizontal bar chart of conversion stats.
+    """Render a stacked horizontal bar chart of per-kind compatibility.
 
-    Per object kind, the bar stacks: automatically convertible (AUTO) plus
-    non-automatic objects by effort (Simple/Medium/Significant). Nothing is
-    rendered for an empty report.
+    Per object kind, the bar stacks the three classifications -- Auto-converted /
+    Review needed / Unsupported -- in that order, so it reads left-to-right from
+    "moves by itself" to "cannot move" and uses the same three words as the
+    classification badges above it and the table below. Nothing is rendered for an
+    empty report.
     """
     data = build_assessment_chart_data(report)
     if not data.kinds:
         return
 
-    # Reuse the canonical bucket colors so the UI chart, the HTML export, and the
-    # effort badges all agree (single source of truth in core.assessor).
-    from dsql_migrator.core.assessor import _CHART_BUCKET_COLORS
+    # Reuse the canonical classification order/labels/colors so the UI chart, the HTML
+    # export and the classification badges all agree (source of truth in core.assessor).
+    from dsql_migrator.core.assessor import (
+        _CHART_CLASS_COLORS,
+        _CHART_ORDER,
+        _CLASS_CHART_LABELS,
+    )
 
+    counts_by_class = {
+        Classification.AUTO: data.auto,
+        Classification.MANUAL: data.manual,
+        Classification.UNSUPPORTED: data.unsupported,
+    }
+    labels = [_CLASS_CHART_LABELS[cls] for cls in _CHART_ORDER]
     option = {
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
         # Legend at the top of the chart; the grid drops below it so the bars
         # never overlap the legend.
-        "legend": {
-            "top": 0,
-            "data": [
-                "Auto-converted",
-                "Simple actions",
-                "Medium actions",
-                "Significant actions",
-            ],
-        },
+        "legend": {"top": 0, "data": labels},
         "grid": {"left": 110, "right": 30, "top": 40, "bottom": 30},
         "xAxis": {"type": "value", "minInterval": 1},
         "yAxis": {"type": "category", "data": data.kinds, "inverse": True},
         "series": [
             {
-                "name": "Auto-converted",
+                "name": _CLASS_CHART_LABELS[cls],
                 "type": "bar",
                 "stack": "total",
-                "itemStyle": {"color": _CHART_BUCKET_COLORS["auto"]},
-                "data": data.auto,
-            },
-            {
-                "name": "Simple actions",
-                "type": "bar",
-                "stack": "total",
-                "itemStyle": {"color": _CHART_BUCKET_COLORS["simple"]},
-                "data": data.simple,
-            },
-            {
-                "name": "Medium actions",
-                "type": "bar",
-                "stack": "total",
-                "itemStyle": {"color": _CHART_BUCKET_COLORS["medium"]},
-                "data": data.medium,
-            },
-            {
-                "name": "Significant actions",
-                "type": "bar",
-                "stack": "total",
-                "itemStyle": {"color": _CHART_BUCKET_COLORS["significant"]},
-                "data": data.significant,
-            },
+                "itemStyle": {"color": _CHART_CLASS_COLORS[cls]},
+                "data": counts_by_class[cls],
+            }
+            for cls in _CHART_ORDER
         ],
     }
-    ui.label("Conversion statistics by object kind").classes("text-md font-semibold")  # type: ignore[attr-defined]
+    ui.label("Compatibility by object kind").classes("text-md font-semibold")  # type: ignore[attr-defined]
     ui.echart(option).classes("w-full").style("height: 320px")  # type: ignore[attr-defined]
 
 
@@ -1387,8 +1372,8 @@ def _render_assessment(
                 f"color={color}"
             ).classes("text-sm q-px-sm q-py-xs")
 
-    # Wrap the chart in solid separators so "Conversion statistics by object
-    # kind" reads as a distinct section between the summary badges above and the
+    # Wrap the chart in solid separators so "Compatibility by object kind" reads as
+    # a distinct section between the summary badges above and the
     # per-object list below. Only when there is a chart to show (non-empty
     # report), so an empty report does not render stray rules.
     if report.items:
@@ -1541,39 +1526,55 @@ def _render_assessment_item(
             # it existed, which falls back to the joined text below.
             concerns = list(getattr(item, "concerns", None) or [])
             if concerns:
-                for index, concern in enumerate(concerns):
-                    if index:
-                        ui.separator().classes("my-1")  # type: ignore[attr-defined]
-                    with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
-                        # Per-concern class: the item's badge shows only the governing
-                        # (most severe) one, which says nothing about the others.
-                        ui.badge(  # type: ignore[attr-defined]
-                            classification_label(concern.classification.value)
-                        ).props(
-                            "color="
-                            + _CLASS_BADGE_COLOR.get(
-                                concern.classification.value, "grey"
-                            )
-                            + " outline"
-                        )
-                        ui.label(concern.rule_id).classes(  # type: ignore[attr-defined]
-                            "text-xs text-gray-500 font-mono"
-                        )
-                        if concern.effort is not None:
-                            ui.space()  # type: ignore[attr-defined]
-                            ui.badge(  # type: ignore[attr-defined]
-                                f"effort: {concern.effort.value}"
-                            ).props("color=blue-grey-6 outline")
-                    if concern.risk:
-                        ui.label(concern.risk).classes("text-sm")  # type: ignore[attr-defined]
-                    if concern.recommendation:
-                        with ui.row().classes("items-start gap-1 no-wrap w-full"):  # type: ignore[attr-defined]
-                            ui.icon("arrow_forward").classes(  # type: ignore[attr-defined]
-                                "text-gray-400 text-sm mt-0.5"
-                            )
-                            ui.label(concern.recommendation).classes(  # type: ignore[attr-defined]
-                                "text-sm text-gray-700"
-                            )
+                # Each concern is a bordered card indented behind ONE vertical spine, so
+                # the expanded body reads as children of the row above it. Flat
+                # separators (the previous treatment) gave no such cue: at two expanded
+                # tables the findings ran together and it was not obvious which object a
+                # given block belonged to. The spine + card is the same containment
+                # idiom as the object tree on the Schema Conversion screen.
+                with ui.column().classes(  # type: ignore[attr-defined]
+                    "gap-2 w-full pl-4 ml-1 border-l-2 border-gray-200"
+                ):
+                    for concern in concerns:
+                        with ui.column().classes(  # type: ignore[attr-defined]
+                            "gap-1 w-full rounded-md border border-gray-200 "
+                            "bg-gray-50 p-3"
+                        ):
+                            with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+                                # Per-concern class: the item's badge shows only the
+                                # governing (most severe) one, which says nothing about
+                                # the others.
+                                ui.badge(  # type: ignore[attr-defined]
+                                    classification_label(concern.classification.value)
+                                ).props(
+                                    "color="
+                                    + _CLASS_BADGE_COLOR.get(
+                                        concern.classification.value, "grey"
+                                    )
+                                    + " outline"
+                                )
+                                ui.label(concern.rule_id).classes(  # type: ignore[attr-defined]
+                                    "text-xs text-gray-500 font-mono"
+                                )
+                                if concern.effort is not None:
+                                    ui.space()  # type: ignore[attr-defined]
+                                    ui.badge(  # type: ignore[attr-defined]
+                                        f"effort: {concern.effort.value}"
+                                    ).props("color=blue-grey-6 outline")
+                            if concern.risk:
+                                ui.label(concern.risk).classes(  # type: ignore[attr-defined]
+                                    "text-sm text-gray-900"
+                                )
+                            if concern.recommendation:
+                                with ui.row().classes(  # type: ignore[attr-defined]
+                                    "items-start gap-1 no-wrap w-full"
+                                ):
+                                    ui.icon("subdirectory_arrow_right").classes(  # type: ignore[attr-defined]
+                                        "text-gray-400 text-sm mt-0.5"
+                                    )
+                                    ui.label(concern.recommendation).classes(  # type: ignore[attr-defined]
+                                        "text-sm text-gray-700"
+                                    )
             else:
                 ui.label(f"Rule: {item.rule_id}").classes(  # type: ignore[attr-defined]
                     "text-xs text-gray-500"
