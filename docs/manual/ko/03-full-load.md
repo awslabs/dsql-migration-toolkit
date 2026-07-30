@@ -170,7 +170,7 @@ quarantine됐는지 정확히 나열합니다.
 
 ---
 
-## 3.7 멀티프로세스 병렬화 (GIL 우회)
+## 3.8 멀티프로세스 병렬화 (GIL 우회)
 
 Python의 GIL(Global Interpreter Lock)은 단일 프로세스를 CPU 1코어로 제한합니다.
 Full Load의 행별 타입 변환과 배치 조립은 CPU-bound Python이므로, 이전에는 8 vCPU
@@ -196,26 +196,14 @@ ProcessPoolExecutor(max_workers=table_parallelism)
                                     8 workers = 8 cores
 ```
 
-### 설정
+### 튜닝
 
-| 변수 | 기본값 | 설명 |
-|---|---|---|
-| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | 4 | 최대 동시 worker 프로세스 수. vCPU 수에 맞추면 전체 활용. |
-| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | worker당 동시 DSQL 연결 수 (프로세스 내 쓰기 병렬도). |
-| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1,000,000 | PK shard 적용 최소 예상 행 수. 미만이면 shard 오버헤드가 불필요. |
-
-**대규모 마이그레이션 권장:** `TABLE_PARALLELISM`을 태스크 vCPU 수로 설정 (예: 8 vCPU
-태스크면 8). 로더가 자동으로 pool slot을 whole-table worker와 shard worker에 배분합니다.
-
-### 측정 성능 (ECS Fargate 8 vCPU)
-
-| 시나리오 | rows/s | CPU | 200GB 예상 |
-|---|---|---|---|
-| ThreadPool (GIL, v0.1.68 이전) | 12,277 | 110% | ~46시간 |
-| ProcessPool, 4 테이블 혼합, tp=8 | 34,800 | 561% | ~5시간 |
-| ProcessPool, 단일 대형 테이블, tp=8 | 51,000 | 777% | **~2.5시간** |
-
-전체 측정 이력은 [Appendix: 성능 테스트 결과](12-performance-test-results.md) 참고.
+대규모 마이그레이션에서는 worker 수를 태스크의 vCPU 수에 맞추세요 — pool slot을
+whole-table worker와 shard worker에 배분하는 일은 로더가 알아서 합니다. 관련 설정
+(`TABLE_PARALLELISM`, `BATCH_PARALLELISM`, `SHARD_MIN_ROWS`)과 각각의 한도, 그리고 소스
+부하와의 관계는 [7장 §7.2 — 병렬도 튜닝](07-performance-and-tuning.md#72-tuning-parallelism)에
+모여 있습니다. 이 설계가 실제로 낸 처리량(그리고 이것이 대체한 ThreadPool 기준선)은
+[Appendix: 성능 테스트 결과](12-performance-test-results.md)에 있습니다.
 
 ---
 

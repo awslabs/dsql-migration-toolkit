@@ -206,27 +206,14 @@ ProcessPoolExecutor(max_workers=table_parallelism)
                                     8 workers = 8 cores
 ```
 
-### 設定
+### チューニング
 
-| 変数 | デフォルト | 説明 |
-|---|---|---|
-| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | 4 | 最大同時ワーカープロセス数。vCPU 数に合わせると全活用。 |
-| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | ワーカーあたり同時 DSQL 接続数（プロセス内書き込み並列度）。 |
-| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1,000,000 | PK シャード適用最小推定行数。未満ではシャードオーバーヘッド不要。 |
-
-**大規模マイグレーション推奨：** `TABLE_PARALLELISM` をタスクの vCPU 数に設定
-（例: 8 vCPU タスクなら 8）。ローダーが自動的に pool スロットをテーブルワーカーと
-シャードワーカーに配分します。
-
-### 測定性能（ECS Fargate 8 vCPU）
-
-| シナリオ | rows/s | CPU | 200GB 推定 |
-|---|---|---|---|
-| ThreadPool（GIL、v0.1.68 以前） | 12,277 | 110% | 約 46 時間 |
-| ProcessPool、4 テーブル混合、tp=8 | 34,800 | 561% | 約 5 時間 |
-| ProcessPool、単一大規模テーブル、tp=8 | 51,000 | 777% | **約 2.5 時間** |
-
-全測定履歴は [Appendix: パフォーマンステスト結果](12-performance-test-results.md) を参照。
+大規模な移行では worker 数をタスクの vCPU 数に合わせてください — pool slot を
+whole-table worker と shard worker に配分するのはローダーが自動で行います。関連する設定
+(`TABLE_PARALLELISM`、`BATCH_PARALLELISM`、`SHARD_MIN_ROWS`)とその上限、そしてソース負荷との
+関係は [第 7 章 §7.2 — 並列度のチューニング](07-performance-and-tuning.md#72-tuning-parallelism)
+にまとまっています。この設計が実際に達成したスループット(および置き換えられた ThreadPool の
+ベースライン)は [付録: パフォーマンステスト結果](12-performance-test-results.md) にあります。
 
 ---
 

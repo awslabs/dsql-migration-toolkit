@@ -192,7 +192,7 @@ or lose the CDC handoff point.
 
 ---
 
-## 3.7 Multi-process parallelism (GIL bypass)
+## 3.8 Multi-process parallelism (GIL bypass)
 
 Python's GIL (Global Interpreter Lock) limits a single process to one CPU core
 regardless of how many threads it uses. Since Full Load's per-row type conversion
@@ -222,28 +222,15 @@ ProcessPoolExecutor(max_workers=table_parallelism)
                                     8 workers = 8 cores
 ```
 
-### Configuration
+### Tuning it
 
-| Variable | Default | Description |
-|---|---|---|
-| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | 4 | Max concurrent worker processes. Set to vCPU count for full utilization. |
-| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | Concurrent DSQL connections per worker (write parallelism within one process). |
-| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1,000,000 | Minimum estimated rows for a table to be PK-sharded. Below this, sharding overhead isn't worth it. |
-
-**Recommendation for large migrations:** set `TABLE_PARALLELISM` to the task's
-vCPU count (e.g. 8 for an 8-vCPU Fargate task). The loader automatically
-distributes the pool slots between whole-table workers and shard workers.
-
-### Measured performance (ECS Fargate 8 vCPU)
-
-| Scenario | rows/s | CPU | 200GB estimate |
-|---|---|---|---|
-| ThreadPool (GIL-bound, pre-v0.1.68) | 12,277 | 110% | ~46 hours |
-| ProcessPool, 4 tables mixed, tp=8 | 34,800 | 561% | ~5 hours |
-| ProcessPool, single large table, tp=8 | 51,000 | 777% | **~2.5 hours** |
-
-See [Appendix: Performance test results](12-performance-test-results.md) for the
-full measurement history.
+For a large migration, set the worker count to the task's vCPU count — the loader
+distributes the pool slots between whole-table workers and shard workers itself. The
+knobs (`TABLE_PARALLELISM`, `BATCH_PARALLELISM`, `SHARD_MIN_ROWS`), their limits, and how
+they interact with source load live together in
+[Chapter 7 §7.2 — Tuning parallelism](07-performance-and-tuning.md#72-tuning-parallelism);
+the measured throughput this design achieves (and the ThreadPool baseline it replaced) is
+in [Appendix: Performance test results](12-performance-test-results.md).
 
 ---
 
