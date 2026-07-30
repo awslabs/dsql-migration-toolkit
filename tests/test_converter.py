@@ -1016,11 +1016,14 @@ def test_literal_defaults_are_preserved() -> None:
     """
     # Reflection returns a literal WITH its quotes, which is how a literal is told
     # apart from a function default.
+    # Defaults arrive UNQUOTED from information_schema.COLUMN_DEFAULT (see
+    # introspector.enrich_columns), so the converter re-quotes them -- and leaves a
+    # number bare so the target keeps its native type instead of coercing a string.
     for mysql_type, default, expected in (
-        ("INT", "'0'", "DEFAULT '0'"),
-        ("VARCHAR(10)", "'abc'", "DEFAULT 'abc'"),
-        ("CHAR(3)", "'USD'", "DEFAULT 'USD'"),
-        ("DECIMAL(10,2)", "'0.00'", "DEFAULT '0.00'"),
+        ("INT", "0", "DEFAULT 0"),
+        ("VARCHAR(10)", "abc", "DEFAULT 'abc'"),
+        ("CHAR(3)", "USD", "DEFAULT 'USD'"),
+        ("DECIMAL(10,2)", "0.00", "DEFAULT 0.00"),
     ):
         ddl = _convert_table(
             _single_column_table("t", mysql_type, default=default)
@@ -1032,9 +1035,14 @@ def test_current_timestamp_default_is_preserved() -> None:
     # A function default comes back from reflection BARE (no quotes) -- and PostgreSQL
     # spells CURRENT_TIMESTAMP the same way, so it carries straight across.
     ddl = _convert_table(
-        _single_column_table("t", "DATETIME", default="CURRENT_TIMESTAMP")
+        _single_column_table(
+            "t", "DATETIME", default="CURRENT_TIMESTAMP", default_is_expression=True
+        )
     ).target_ddl
-    assert "DEFAULT CURRENT_TIMESTAMP" in ddl
+    # DATETIME maps to a no-timezone TIMESTAMP, and the loader normalizes migrated rows
+    # to naive UTC -- so the default is pinned to UTC too, rather than inheriting the
+    # session TimeZone the way a bare CURRENT_TIMESTAMP would.
+    assert "AT TIME ZONE 'UTC'" in ddl
     # ...and it must NOT be quoted into a string literal.
     assert "DEFAULT 'CURRENT_TIMESTAMP'" not in ddl
 
@@ -1047,15 +1055,24 @@ def test_tinyint_bool_default_becomes_a_boolean_literal() -> None:
     would make the whole CREATE TABLE fail.
     """
     on = _convert_table(
-        _single_column_table("t", "TINYINT(1)", default="'1'")
+        _single_column_table("t", "TINYINT(1)", default="1")
     ).target_ddl
     assert "DEFAULT TRUE" in on
-    assert "DEFAULT '1'" not in on
+    assert "DEFAULT 1" not in on
 
     off = _convert_table(
-        _single_column_table("t", "TINYINT(1)", default="'0'")
+        _single_column_table("t", "TINYINT(1)", default="0")
     ).target_ddl
     assert "DEFAULT FALSE" in off
+
+    # tinyint(1) UNSIGNED maps to SMALLINT, not boolean, so its default must stay
+    # numeric -- deciding from the source string alone got this wrong.
+    unsigned = _convert_table(
+        _single_column_table("t", "TINYINT(1) UNSIGNED", default="1")
+    ).target_ddl
+    assert "SMALLINT" in unsigned
+    assert "DEFAULT 1" in unsigned
+    assert "DEFAULT TRUE" not in unsigned
 
 
 def test_not_null_column_keeps_its_default() -> None:
@@ -1067,9 +1084,9 @@ def test_not_null_column_keeps_its_default() -> None:
     so this was not a corner case.
     """
     ddl = _convert_table(
-        _single_column_table("t", "INT", nullable=False, default="'0'")
+        _single_column_table("t", "INT", nullable=False, default="0")
     ).target_ddl
-    assert "NOT NULL DEFAULT '0'" in ddl
+    assert "NOT NULL DEFAULT 0" in ddl
 
 
 def test_auto_increment_column_gets_no_default() -> None:
@@ -1083,12 +1100,12 @@ def test_auto_increment_column_gets_no_default() -> None:
 
     table = TableDef(
         name="t",
-        columns=[ColumnDef(name="id", mysql_type="BIGINT", nullable=False, default="'0'")],
+        columns=[ColumnDef(name="id", mysql_type="BIGINT", nullable=False, default="0")],
         primary_key=["id"],
         auto_increment_column="id",
     )
     # Default strategy: still no DEFAULT on the key column.
-    assert "DEFAULT '0'" not in _convert_table(table).target_ddl
+    assert "DEFAULT 0" not in _convert_table(table).target_ddl
 
     # And with the identity strategy, where a DEFAULT would be an outright error.
     identity_ddl = SchemaConverter().convert_table(
@@ -1096,14 +1113,14 @@ def test_auto_increment_column_gets_no_default() -> None:
         SchemaConvertOptions(primary_key_strategy=PrimaryKeyStrategy.IDENTITY_WITH_CACHE),
     ).target_ddl
     assert "IDENTITY" in identity_ddl
-    assert "DEFAULT '0'" not in identity_ddl
+    assert "DEFAULT 0" not in identity_ddl
 
 
 def test_generated_column_gets_no_default() -> None:
     # The value is computed, so a default can never apply -- and it is not a loss,
     # so it must not raise a warning either.
     result = _convert_table(
-        _single_column_table("t", "INT", generated=True, default="'0'")
+        _single_column_table("t", "INT", generated=True, default="0")
     )
     assert "DEFAULT" not in result.target_ddl
     assert not [w for w in result.warnings if "default" in w.message.lower()]
@@ -1115,24 +1132,29 @@ def test_untranslatable_function_default_is_dropped_with_a_warning() -> None:
     Dropping it is correct -- but silently dropping it is not, which is the half of
     this bug that mattered most: the user could not tell the behavior had changed.
     """
+    # MySQL UUID() now translates to gen_random_uuid(), so use a genuinely
+    # untranslatable expression: one referencing another column.
     result = _convert_table(
-        _single_column_table("t", "CHAR(36)", nullable=False, default="UUID()")
+        _single_column_table(
+            "t", "INT", nullable=False, default="(`id` + 1)",
+            default_is_expression=True,
+        )
     )
-    assert "DEFAULT UUID()" not in result.target_ddl
-    messages = [w.message for w in result.warnings if "UUID()" in w.message]
+    assert "DEFAULT" not in result.target_ddl
+    messages = [w.message for w in result.warnings if "no Aurora DSQL equivalent" in w.message]
     assert messages, result.warnings
     # And it must spell out the post-cut-over consequence for a NOT NULL column.
     assert "REJECTED on Aurora DSQL" in messages[0]
     assert all(
         w.classification is Classification.MANUAL
         for w in result.warnings
-        if "UUID()" in w.message
+        if "no Aurora DSQL equivalent" in w.message
     )
 
 
 def test_out_of_range_tinyint_bool_default_is_dropped_with_a_warning() -> None:
     result = _convert_table(
-        _single_column_table("t", "TINYINT(1)", default="'7'")
+        _single_column_table("t", "TINYINT(1)", default="7")
     )
     assert "DEFAULT" not in result.target_ddl
     assert any("not 0 or 1" in w.message for w in result.warnings), result.warnings
@@ -1142,9 +1164,12 @@ def test_nullable_dropped_default_warning_omits_the_not_null_consequence() -> No
     # Severity calibration: a nullable column losing its default just starts defaulting
     # to NULL -- it does not break an INSERT, so it must not claim it does.
     result = _convert_table(
-        _single_column_table("t", "CHAR(36)", nullable=True, default="UUID()")
+        _single_column_table(
+            "t", "INT", nullable=True, default="(`id` + 1)",
+            default_is_expression=True,
+        )
     )
-    dropped = [w.message for w in result.warnings if "UUID()" in w.message]
+    dropped = [w.message for w in result.warnings if "no Aurora DSQL equivalent" in w.message]
     assert dropped
     assert "REJECTED" not in dropped[0]
 
@@ -1156,20 +1181,91 @@ def test_columns_without_a_default_are_unchanged() -> None:
     assert not [w for w in result.warnings if "default" in w.message.lower()]
 
 
-def test_mysql_default_is_function_distinguishes_literals_from_functions() -> None:
-    """The whole translation hinges on this: reflection quotes literals, not functions.
+def test_expression_defaults_are_identified_by_mysqls_own_flag() -> None:
+    """MySQL tells us whether a default is an expression; we no longer guess.
 
-    SQLAlchemy's MySQL reflection returns "'0'" for a literal and "CURRENT_TIMESTAMP"
-    for a function, which is what makes a safe translation possible without
-    re-implementing MySQL's grammar.
+    ``information_schema.COLUMN_DEFAULT`` returns a default UNQUOTED, so the old
+    quoting heuristic could not tell the literal string "CURRENT_TIMESTAMP" from the
+    function call. EXTRA's ``DEFAULT_GENERATED`` flag is MySQL's own answer, carried on
+    ``ColumnDef.default_is_expression``.
     """
-    from dsql_migrator.core.converter import _mysql_default_is_function
+    # Flagged as an expression -> emitted as an expression.
+    expression = _convert_table(
+        _single_column_table(
+            "t", "DATETIME", default="CURRENT_TIMESTAMP", default_is_expression=True
+        )
+    ).target_ddl
+    assert "DEFAULT '" not in expression  # not quoted into a string
 
-    for function in ("CURRENT_TIMESTAMP", "current_timestamp", "NOW()",
-                     "CURRENT_TIMESTAMP(3)", "now(6)"):
-        assert _mysql_default_is_function(function) is True, function
-    for literal in ("'0'", "'CURRENT_TIMESTAMP'", "'now()'", '"0"', "'abc'"):
-        assert _mysql_default_is_function(literal) is False, literal
+    # NOT flagged -> the same text is a literal string, and must be quoted.
+    literal = _convert_table(
+        _single_column_table("t", "VARCHAR(40)", default="CURRENT_TIMESTAMP")
+    ).target_ddl
+    assert "DEFAULT 'CURRENT_TIMESTAMP'" in literal
+
+
+def test_only_the_enriched_inventory_shape_is_supported() -> None:
+    """One supported input shape, with no heuristic fallback -- by design.
+
+    The converter reads defaults in the shape ``introspector.enrich_columns`` produces
+    (unquoted value from information_schema.COLUMN_DEFAULT + the DEFAULT_GENERATED flag),
+    and every MySQL source goes through that enrichment unconditionally. Supporting the
+    raw SQLAlchemy-reflected shape as well meant inferring expression-vs-literal from
+    quoting, which cannot tell the literal string "CURRENT_TIMESTAMP" from the function
+    call -- so the fallback was removed rather than left to guess.
+    """
+    import inspect as _inspect
+
+    from dsql_migrator.core import converter
+
+    source = _inspect.getsource(converter)
+    # The guessing helpers are gone, and nothing may reintroduce them.
+    assert "_looks_like_expression" not in source
+    assert "_inventory_has_expression_flag" not in source
+    # The decision is MySQL's own flag.
+    assert "if column.default_is_expression:" in source
+
+
+def test_enrichment_is_unconditional_for_a_mysql_source() -> None:
+    """The single supported shape only holds if enrichment always runs.
+
+    If a code path reflected without enriching, defaults would arrive quoted and
+    expression flags unset -- exactly the shape the converter no longer accepts.
+    """
+    import inspect as _inspect
+
+    from dsql_migrator.core import introspector
+
+    source = _inspect.getsource(introspector)
+    reflect_index = source.index("tables = _reflect_tables(inspector")
+    enrich_index = source.index("enrich_columns(connection", reflect_index)
+    between = source[reflect_index:enrich_index]
+    # Enrichment follows reflection in the same loop iteration, gated only on the source
+    # being MySQL (the sole dialect this tool migrates from).
+    assert "if is_mysql:" in between
+
+
+def test_on_update_is_never_emitted_into_the_target_ddl() -> None:
+    """`ON UPDATE CURRENT_TIMESTAMP` folded into the default broke the CREATE TABLE.
+
+    SQLAlchemy's regex reflection returns the whole clause as ONE default string, and
+    emitting it verbatim fails on the target with `syntax error at or near "ON"` -- on the
+    single most common audit column there is. information_schema keeps the clause in EXTRA
+    (so it never arrives here), and this strips it anyway for any inventory that still
+    carries the reflected form. Nothing is lost: the ON UPDATE fact rides on
+    ``auto_update_timestamp`` and the assessor already reports it MANUAL, since DSQL has
+    neither an ON UPDATE clause nor triggers.
+    """
+    ddl = _convert_table(
+        _single_column_table(
+            "t", "DATETIME",
+            default="CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+            default_is_expression=True,
+        )
+    ).target_ddl
+    assert "ON UPDATE" not in ddl.upper()
+    # The usable half of the default is still carried across.
+    assert "DEFAULT" in ddl
 
 
 # ---------------------------------------------------------------------------

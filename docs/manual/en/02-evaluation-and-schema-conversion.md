@@ -171,6 +171,18 @@ handles the dialect and constraint bridging automatically:
 - **Type mapping** — the full MySQL → DSQL type table (`TINYINT(1)` → `boolean`,
   `BIT(n)` → integer, `ENUM` → `text` + `CHECK`, `BLOB`/`BINARY` → `bytea`, etc.;
   see [Chapter 4 §4.6](04-cdc-and-dsql-constraints.md#46-mysql--dsql-type-and-constraint-handling-reference)).
+- **Column defaults** — a source `DEFAULT` is carried across (Aurora DSQL supports
+  them), including `DEFAULT CURRENT_TIMESTAMP`. Two translations happen for you:
+  a `TINYINT(1)` default becomes `TRUE`/`FALSE` for the `boolean` target, and a
+  `DATETIME` default is pinned to UTC so it matches the naive-UTC values the loader
+  writes. This matters most for a **`NOT NULL` column with a default**: MySQL accepts
+  an `INSERT` that omits it, and without the default the target would reject that same
+  statement — an application break that would only show up after cut-over. Where a
+  default genuinely has no DSQL equivalent (MySQL's `UUID()` translates, but an
+  expression referencing another column does not), it is dropped and **reported** rather
+  than silently lost. `ON UPDATE CURRENT_TIMESTAMP` cannot be reproduced at all — DSQL
+  has no `ON UPDATE` clause and no triggers — so it is flagged **MANUAL** for the
+  application to handle.
 - **Foreign-key removal** — FKs are stripped from the DDL but **preserved in the
   report**, with a note to enforce referential integrity in the application.
 - **Primary-key strategies** — keep the integer PK, convert to UUID, or use an

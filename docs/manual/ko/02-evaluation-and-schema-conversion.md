@@ -144,6 +144,15 @@ SCT 같은 단계입니다:
 - **타입 매핑** — 전체 MySQL → DSQL 타입 표(`TINYINT(1)` → `boolean`, `BIT(n)` → 정수, `ENUM` →
   `text` + `CHECK`, `BLOB`/`BINARY` → `bytea` 등.
   [4장 §4.6](04-cdc-and-dsql-constraints.md#46-mysql--dsql-타입과-제약-처리-참조) 참조).
+- **컬럼 기본값** — 소스 `DEFAULT`를 그대로 가져옵니다(Aurora DSQL이 지원하며,
+  `DEFAULT CURRENT_TIMESTAMP`도 포함). 두 가지는 자동 변환됩니다: `TINYINT(1)` 기본값은 `boolean`
+  타깃에 맞게 `TRUE`/`FALSE`로, `DATETIME` 기본값은 로더가 쓰는 naive UTC 값과 일치하도록 UTC로
+  고정됩니다. 이것이 가장 중요한 경우는 **기본값이 있는 `NOT NULL` 컬럼**입니다: MySQL은 그 컬럼을
+  생략한 `INSERT`를 받아주지만, 기본값이 없으면 타깃은 같은 문장을 거부합니다 — 컷오버 후에야
+  드러나는 애플리케이션 장애입니다. DSQL에 대응이 정말 없는 기본값은(MySQL `UUID()`는 변환되지만
+  다른 컬럼을 참조하는 표현식은 불가) 조용히 사라지지 않고 드롭 + **보고**됩니다.
+  `ON UPDATE CURRENT_TIMESTAMP`는 아예 재현할 수 없습니다 — DSQL에는 `ON UPDATE` 절도 트리거도
+  없습니다 — 따라서 애플리케이션이 처리하도록 **MANUAL**로 표시됩니다.
 - **외래 키 제거** — FK는 DDL에서 제거되지만 **리포트에 보존**되며, 참조 무결성을 앱에서 강제하라는
   안내가 함께 붙습니다.
 - **기본 키 전략** — 정수 PK를 그대로 유지하거나, UUID로 변환하거나, 캐싱을 적용한 identity 컬럼을

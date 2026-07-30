@@ -96,6 +96,7 @@ scripts/*
 !scripts/_common.py
 !scripts/_e2e_tables.py
 !scripts/compare_rows.py
+!scripts/verify_conversion_on_dsql.py
 !scripts/measure_performance.py
 !scripts/run_full_load.py
 !scripts/cdc_consistency_check.py

@@ -5,6 +5,60 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.167
+
+### Fixed
+
+- **`ON UPDATE CURRENT_TIMESTAMP` により生成された `CREATE TABLE` が失敗する問題を修正しました。**
+  v0.1.166 で列のデフォルト値を出力し始めましたが、SQLAlchemy の MySQL リフレクションは
+  `ON UPDATE` 句をデフォルト値の *中に* 折り込みます —
+  `datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP` は
+  `"CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"` という 1 つの文字列として返されます —
+  そのためそのまま出力され、ターゲットが *`syntax error at or near "ON"`* で拒否しました。
+  最も一般的な監査列において、デフォルト値の欠落が変換失敗に変わっていたことになります。
+  根本原因をソース側で修正しました: 列のデフォルト値は
+  **`information_schema.COLUMN_DEFAULT`** から読み取るようになり、`ON UPDATE` の部分は `EXTRA` に
+  残って `auto_update_timestamp` がすでに読み取っています(そして assessor がすでに MANUAL として
+  報告しています — DSQL には `ON UPDATE` 句もトリガーもありません)。
+- **同じリフレクション経路が引き起こしていた欠陥 2 件。** MySQL 8 は *式* のデフォルト値を括弧付きで
+  報告するため、`DEFAULT (uuid())` は `"(uuid())"` として到着しリテラルと誤認されていました。また
+  `bit(1) DEFAULT b'1'` はリフレクションの正規表現によって **黙って破棄** されていました。
+  `information_schema` は両方とも正確に報告します。式かリテラルかの判定は、引用符からの推測ではなく
+  MySQL 自身の `DEFAULT_GENERATED` フラグが決定するようになりました — 推測ではリテラル文字列
+  `'CURRENT_TIMESTAMP'` と関数呼び出しを区別できませんでした。
+- **identity 戦略で `bigint unsigned AUTO_INCREMENT` キーが失敗する問題を修正しました。** 符号なし
+  整数キーは範囲を保つため `DECIMAL(20,0)` にマップされますが、DSQL の identity 列は `BIGINT` で
+  なければなりません — そのため参照スキーマの 11 テーブルのうち 6 つが *`identity column type must
+  be bigint`* で拒否されていました。現在は狭い整数型とともに `DECIMAL` も拡張します。DSQL の
+  identity シーケンスはいずれにせよ BIGINT の範囲なので、生成可能な値が失われることはありません。
+- **`DATETIME` の `CURRENT_TIMESTAMP` デフォルトを UTC に固定します。** `DATETIME` はタイムゾーン
+  なしの `timestamp` にマップされ、ローダーは移行行を意図的に naive UTC に正規化します。裸の
+  `CURRENT_TIMESTAMP` デフォルトはセッションの `TimeZone` に従うため、カットオーバー後に
+  アプリケーションが書き込んだ行が移行済みの行と数時間ずれる可能性がありました。
+
+### Changed
+
+- **サポートするインベントリの形は 1 つ、ヒューリスティックはなし。** コンバーターは
+  `introspector.enrich_columns` が生成する形(引用符なしの値 + `DEFAULT_GENERATED` フラグ)のみを
+  読み取ります。すべての MySQL ソースはこの補完を無条件に通過します。引用符ベースのフォール
+  バックは推測に委ねるのではなく削除しました。検証スクリプトも補完を行うようになりました —
+  それがないとアプリが決して通らないコードパスを試すことになり、実際にそこだけで存在する失敗を
+  報告していました。
+- **まれなリテラル/ターゲットの不一致には意図的に専用分岐を設けていません。** 整数ターゲットへの
+  ビット文字列デフォルト、`bytea` への バイナリデフォルト、MySQL の `0000-00-00` ゼロ日付 —
+  実際のスキーマには 1 つもなく、それぞれ誰も遭遇しないケースのためにコードパスとテストを増やし
+  ます。一般規則に流すことで、拒否が起きた場合は変換時に静かでない形で明らかになります。
+- **マニュアルにデフォルト値の扱いを記載しました**(EN/KO/JA) — 第 2 章の「変換が行うこと」の
+  一覧にデフォルト値が欠けており、第 4 章の制約表には DSQL がデフォルト値を *サポートする* 一方
+  `ON UPDATE CURRENT_TIMESTAMP` は再現不可であることを記録しました。
+
+### Added
+
+- **`scripts/verify_conversion_on_dsql.py` を配布対象に含めました**(`scripts/*` の無視ルールで
+  除外されていました)。`scripts/README.md` に顧客向けの読み取り専用チェックとして記載しました:
+  自分のスキーマを変換し、移行の *前に* Aurora DSQL が何を拒否するかを確認できます。合成マトリクス
+  は上記のすべてのデフォルト形式を含む 53 ケースに増えました。
+
 ## v0.1.166
 
 ### Fixed

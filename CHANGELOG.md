@@ -5,6 +5,63 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.167
+
+### Fixed
+
+- **`ON UPDATE CURRENT_TIMESTAMP` made the generated `CREATE TABLE` fail.** v0.1.166 began
+  emitting column defaults, but SQLAlchemy's MySQL reflection folds the `ON UPDATE` clause
+  *into* the default — `datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`
+  reflects as the single string `"CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"` — so it
+  was passed through verbatim and the target rejected it with *`syntax error at or near
+  "ON"`*. On the most common audit column there is, that turned a missing default into a
+  failed conversion. The root cause is fixed at the source: column defaults now come from
+  **`information_schema.COLUMN_DEFAULT`**, which keeps the `ON UPDATE` half in `EXTRA`
+  where `auto_update_timestamp` already reads it (and the assessor already reports it
+  MANUAL — DSQL has neither an `ON UPDATE` clause nor triggers).
+- **Two more defects the same reflection path caused.** MySQL 8 reports an *expression*
+  default parenthesized, so `DEFAULT (uuid())` arrived as `"(uuid())"` and was misread as a
+  literal; and a `bit(1) DEFAULT b'1'` was **silently dropped** by the reflection regex.
+  `information_schema` reports both correctly. Expression-vs-literal is now decided by
+  MySQL's own `DEFAULT_GENERATED` flag rather than inferred from quoting, which could not
+  tell the literal string `'CURRENT_TIMESTAMP'` from the function call.
+- **`bigint unsigned AUTO_INCREMENT` keys failed under the identity strategy.** An unsigned
+  integer key maps to `DECIMAL(20,0)` to preserve its range, and DSQL identity columns must
+  be `BIGINT` — so 6 of the 11 tables in the reference schema were rejected with *`identity
+  column type must be bigint`*. `DECIMAL` is now widened along with the narrow integer
+  types; an identity sequence is BIGINT-bounded on DSQL anyway, so no generatable value is
+  lost.
+- **A `DATETIME` default of `CURRENT_TIMESTAMP` now pins to UTC.** `DATETIME` maps to a
+  no-timezone `timestamp`, and the loader deliberately normalizes migrated rows to naive
+  UTC; a bare `CURRENT_TIMESTAMP` default would have inherited the session `TimeZone`
+  instead, so rows written by the application after cut-over could disagree with the
+  migrated ones by hours.
+
+### Changed
+
+- **One supported inventory shape, no heuristics.** The converter reads defaults only in
+  the form `introspector.enrich_columns` produces (unquoted value + `DEFAULT_GENERATED`
+  flag), which every MySQL source goes through unconditionally. The quoting-based fallback
+  was removed rather than left to guess. The verification script now enriches too — without
+  it, it was exercising a code path the app never takes, and duly reported failures that
+  only existed there.
+- **Rarer literal/target mismatches deliberately have no special-case branch.** A
+  bit-string default on an integer target, a binary default on `bytea`, MySQL's
+  `0000-00-00` zero date: none occurs in a real schema, and each would add a code path plus
+  tests for a case nobody hits. They fall through to the general rule, where a rejection is
+  loud at conversion time rather than silent.
+- **The manual now documents default handling** (EN/KO/JA) — chapter 2's "what the
+  conversion does for you" list was silent on defaults, and chapter 4's constraint table
+  now records that DSQL *does* support them while `ON UPDATE CURRENT_TIMESTAMP` is
+  unreproducible.
+
+### Added
+
+- **`scripts/verify_conversion_on_dsql.py` is now published** (it was excluded by the
+  `scripts/*` ignore rule) and documented in `scripts/README.md` as a customer-facing
+  read-only check: convert your own schema and find out what Aurora DSQL rejects *before*
+  migrating. Its synthetic matrix grew to 53 cases, including every default form above.
+
 ## v0.1.166
 
 ### Fixed

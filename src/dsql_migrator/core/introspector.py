@@ -555,13 +555,14 @@ def enrich_columns(
     """Enrich tables in place with collation and AUTO_INCREMENT metadata.
 
     Uses ``information_schema.COLUMNS`` (MySQL, read-only) to fill each column's
-    ``collation``, mark generated (``VIRTUAL/STORED GENERATED``) and
+    ``collation`` and ``default``, mark generated (``VIRTUAL/STORED GENERATED``) and
     ``ON UPDATE CURRENT_TIMESTAMP`` columns from ``EXTRA``, and set the table's
     ``auto_increment_column``.
     """
     rows = connection.execute(
         text(
-            "SELECT TABLE_NAME, COLUMN_NAME, COLLATION_NAME, EXTRA, COLUMN_TYPE "
+            "SELECT TABLE_NAME, COLUMN_NAME, COLLATION_NAME, EXTRA, COLUMN_TYPE, "
+            "COLUMN_DEFAULT "
             "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = :db"
         ),
         {"db": database},
@@ -570,13 +571,24 @@ def enrich_columns(
     collation_by_column: dict[tuple[str, str], Optional[str]] = {}
     extra_by_column: dict[tuple[str, str], str] = {}
     column_type_by_column: dict[tuple[str, str], str] = {}
+    default_by_column: dict[tuple[str, str], Optional[str]] = {}
     auto_increment_by_table: dict[str, str] = {}
-    for table_name, column_name, collation_name, extra, column_type in rows:
+    for (
+        table_name,
+        column_name,
+        collation_name,
+        extra,
+        column_type,
+        column_default,
+    ) in rows:
         collation_by_column[(table_name, column_name)] = collation_name
         extra_text = str(extra).lower() if extra else ""
         extra_by_column[(table_name, column_name)] = extra_text
         if column_type:
             column_type_by_column[(table_name, column_name)] = str(column_type)
+        default_by_column[(table_name, column_name)] = (
+            None if column_default is None else str(column_default)
+        )
         if "auto_increment" in extra_text:
             auto_increment_by_table[table_name] = column_name
 
@@ -594,6 +606,26 @@ def enrich_columns(
             collation = collation_by_column.get((table.name, column.name))
             if collation is not None:
                 column.collation = collation
+            # Prefer MySQL's COLUMN_DEFAULT over SQLAlchemy's reflected default, for
+            # the same reason COLUMN_TYPE is preferred above: the reflected value comes
+            # from a regex over SHOW CREATE TABLE and is lossy in ways that matter.
+            # Measured against a real MySQL 8:
+            #   * `datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`
+            #     reflects as ONE string, "CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+            #     -- emitting that verbatim is a target syntax error. COLUMN_DEFAULT
+            #     holds just "CURRENT_TIMESTAMP" (the ON UPDATE half stays in EXTRA,
+            #     which is where ``auto_update_timestamp`` already reads it).
+            #   * `bit(1) DEFAULT b'1'` reflects as None -- SILENTLY LOST -- while
+            #     COLUMN_DEFAULT holds "b'1'".
+            #   * `varchar DEFAULT 'a\'b'` reflects TRUNCATED at the backslash;
+            #     COLUMN_DEFAULT holds the real value.
+            #   * a MySQL 8 expression default reflects parenthesized ("(uuid())");
+            #     COLUMN_DEFAULT holds "uuid()".
+            # COLUMN_DEFAULT is UNQUOTED (a literal 0 is "0", not "'0'"), so the
+            # literal-vs-expression decision now uses EXTRA's DEFAULT_GENERATED flag
+            # rather than the presence of quotes -- see ``default_is_expression``.
+            if (table.name, column.name) in default_by_column:
+                column.default = default_by_column[(table.name, column.name)]
             extra_text = extra_by_column.get((table.name, column.name), "")
             # "VIRTUAL GENERATED"/"STORED GENERATED" mark a computed column;
             # "DEFAULT_GENERATED" (expression default) is intentionally excluded.
@@ -601,6 +633,13 @@ def enrich_columns(
                 column.generated = True
             if "on update" in extra_text:
                 column.auto_update_timestamp = True
+            # MySQL flags an EXPRESSION default (as opposed to a literal) with
+            # DEFAULT_GENERATED in EXTRA. That is the authoritative signal now that the
+            # default value itself arrives unquoted from COLUMN_DEFAULT: without it a
+            # literal string "uuid()" and the function call uuid() are indistinguishable.
+            # CURRENT_TIMESTAMP on a datetime/timestamp column also carries this flag.
+            if "default_generated" in extra_text:
+                column.default_is_expression = True
         if table.name in auto_increment_by_table:
             table.auto_increment_column = auto_increment_by_table[table.name]
 

@@ -61,6 +61,7 @@ data migrator, keeping the DDL/DML separation rule intact (Property 2).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -847,7 +848,10 @@ def map_mysql_type(mysql_type: str) -> tuple[str, Optional[ConversionWarning]]:
         data_type = sqlglot.parse_one(
             _normalize_mysql_type(mysql_type), into=exp.DataType, read=_MYSQL
         )
-    except sqlglot.errors.ParseError as exc:
+    except sqlglot.errors.SqlglotError as exc:
+        # SqlglotError, not ParseError: a TOKENIZER failure (TokenError) is a sibling
+        # class, not a subclass, so a ParseError-only guard let it escape as an unhandled
+        # exception instead of the intended ValueError.
         raise ValueError(f"unable to parse MySQL type {mysql_type!r}: {exc}") from exc
 
     mapping = map_data_type(data_type)
@@ -998,74 +1002,137 @@ def _normalize_mysql_type(mysql_type: str) -> str:
     return re.sub(r"\s+zerofill\b", "", mysql_type, flags=re.IGNORECASE).strip()
 
 
-# MySQL default values that are FUNCTIONS, not literals. SQLAlchemy reflection returns
-# a literal already single-quoted (``"'0'"``) but a function bare (``"CURRENT_TIMESTAMP"``),
-# which is exactly the signal needed to tell them apart -- see _column_default_sql.
-# CURRENT_TIMESTAMP / NOW() carry straight to PostgreSQL; DSQL accepts both (verified on
-# a live cluster). ``CURRENT_TIMESTAMP(n)`` (fractional-second precision) is matched by
-# the prefix check because PostgreSQL accepts the same spelling.
-_MYSQL_FUNCTION_DEFAULTS: frozenset[str] = frozenset(
-    {"CURRENT_TIMESTAMP", "NOW()", "CURRENT_DATE", "CURRENT_TIME", "LOCALTIME",
-     "LOCALTIMESTAMP", "UTC_TIMESTAMP()", "UUID()", "CURRENT_TIMESTAMP()"}
+# MySQL expression defaults whose PostgreSQL/DSQL spelling is IDENTICAL, so they can be
+# emitted verbatim. Verified on a live DSQL cluster. ``CURRENT_TIMESTAMP(n)`` (fractional
+# seconds) is matched by prefix because PostgreSQL accepts the same spelling.
+_PASSTHROUGH_EXPRESSION_DEFAULTS: frozenset[str] = frozenset(
+    {
+        "CURRENT_TIMESTAMP",
+        "CURRENT_TIMESTAMP()",
+        "NOW()",
+        "CURRENT_DATE",
+        "CURRENT_TIME",
+        "LOCALTIME",
+        "LOCALTIMESTAMP",
+    }
 )
 
-# MySQL functions with no PostgreSQL/DSQL equivalent spelling. Emitting these verbatim
-# would make the CREATE TABLE fail, so the default is dropped and a warning raised
-# instead -- a failed DDL is worse than a reported gap.
-_UNTRANSLATABLE_FUNCTION_DEFAULTS: frozenset[str] = frozenset({"UUID()", "UTC_TIMESTAMP()"})
+# MySQL expression defaults with a DIFFERENT but equivalent DSQL spelling.
+_TRANSLATED_EXPRESSION_DEFAULTS: dict[str, str] = {
+    "UUID()": "gen_random_uuid()",
+    "CURDATE()": "CURRENT_DATE",
+    "CURTIME()": "CURRENT_TIME",
+    "UTC_TIMESTAMP()": "(now() AT TIME ZONE 'UTC')",
+    "UTC_DATE()": "(CURRENT_DATE AT TIME ZONE 'UTC')",
+}
 
+def _strip_on_update(default: str) -> str:
+    """Drop a trailing ``ON UPDATE <expr>`` from a reflected default.
 
-def _mysql_default_is_function(default: str) -> bool:
-    """Whether a reflected MySQL default is a function call rather than a literal.
-
-    SQLAlchemy's MySQL reflection keeps the source's quoting: a literal default comes
-    back WITH its quotes (``"'0'"``, ``"'consumer'"``) while a function default comes
-    back bare (``"CURRENT_TIMESTAMP"``). That distinction is what makes a safe
-    translation possible without re-parsing MySQL's grammar.
+    Belt-and-braces: ``information_schema.COLUMN_DEFAULT`` (now the authoritative source,
+    see ``introspector.enrich_columns``) already excludes the clause, but SQLAlchemy's
+    regex reflection folds it INTO the default -- ``datetime DEFAULT CURRENT_TIMESTAMP ON
+    UPDATE CURRENT_TIMESTAMP`` reflects as the single string
+    ``"CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"``. Emitting that verbatim is a
+    target syntax error (``syntax error at or near "ON"``), so it is stripped here too for
+    any persisted inventory or caller that still carries the reflected form. Nothing is
+    lost: the ON UPDATE fact rides on ``ColumnDef.auto_update_timestamp`` and is already
+    reported MANUAL by the assessor's ``ON_UPDATE_TIMESTAMP`` rule (DSQL has no ON UPDATE
+    clause and no triggers, so it is unreproducible either way).
     """
-    stripped = default.strip()
-    if stripped.startswith("'") or stripped.startswith('"'):
-        return False
-    upper = stripped.upper()
-    return (
-        upper in _MYSQL_FUNCTION_DEFAULTS
-        # CURRENT_TIMESTAMP(3) etc.
-        or upper.startswith("CURRENT_TIMESTAMP(")
-        or upper.startswith("NOW(")
-    )
+    return re.split(r"\s+ON\s+UPDATE\s+", default, maxsplit=1, flags=re.IGNORECASE)[0].strip()
 
 
-def _column_default_sql(column: ColumnDef, data_type: str) -> tuple[Optional[str], Optional[str]]:
+def _unwrap_expression_default(default: str) -> str:
+    """Peel MySQL 8's wrapping parentheses off an expression default.
+
+    MySQL 8 stores an expression default parenthesized and reports it that way, so
+    ``DEFAULT (uuid())`` arrives as ``"(uuid())"``. Without unwrapping, the expression is
+    unrecognizable and the parenthesized text used to be emitted straight through -- which
+    truncated to ``DEFAULT (`` in the rebuilt DDL and failed with ``syntax error at or
+    near ")"``.
+    """
+    text_value = default.strip()
+    while text_value.startswith("(") and text_value.endswith(")"):
+        inner = text_value[1:-1].strip()
+        if not inner:
+            break
+        text_value = inner
+    return text_value
+
+
+def _quote_default_literal(literal: str) -> str:
+    """Render a literal default as a safely quoted MySQL string literal.
+
+    ``information_schema.COLUMN_DEFAULT`` returns a literal UNQUOTED (an int default is
+    ``"0"``, a string default is ``a'b`` with the quote unescaped), so the value must be
+    re-quoted here. This is also the injection boundary: the default is the one value
+    interpolated into the reconstructed DDL, and it originates from the source schema, so
+    it is escaped rather than concatenated raw (Requirement 9.4). Numeric and boolean
+    literals are emitted bare so the target keeps its native type.
+    """
+    stripped = literal.strip()
+    # A number (or a signed number) needs no quotes and must not get them: a quoted
+    # value would be a string literal the target then has to coerce.
+    if re.fullmatch(r"[+-]?\d+(\.\d+)?", stripped):
+        return stripped
+    if stripped.upper() in ("TRUE", "FALSE", "NULL"):
+        return stripped.upper()
+    # MySQL bit/hex literals carry their own syntax and are handled by the caller.
+    if re.fullmatch(r"(?i)(b|x)'[0-9a-f]*'", stripped) or stripped.lower().startswith("0x"):
+        return stripped
+    # Everything else is a string: single-quote it, doubling any embedded quote. Handles
+    # the reflected-and-truncated backslash form too, since the value is re-escaped from
+    # scratch rather than trusted.
+    escaped = stripped.replace("\\'", "'").replace("'", "''")
+    return f"'{escaped}'"
+
+
+def _column_default_sql(
+    column: ColumnDef, target_type: str, enum_values: Optional[list[str]] = None
+) -> tuple[Optional[str], Optional[str]]:
     """Return ``(default_sql, warning)`` for a column's MySQL default.
 
-    ``default_sql`` is the text to put after ``DEFAULT`` in the generated MySQL DDL
-    (sqlglot then transpiles the whole statement to PostgreSQL). ``None`` means emit no
-    default; ``warning`` is a message when something had to be dropped or reshaped, so a
+    ``default_sql`` is the text to place after ``DEFAULT`` in the generated MySQL DDL,
+    which sqlglot then transpiles with the rest of the statement. ``None`` means emit no
+    default; ``warning`` is set whenever something had to be dropped or reshaped, so a
     change in insert behavior is never silent.
 
     Aurora DSQL DOES support column defaults -- ``DEFAULT default_expr`` is in its
     documented ``CREATE TABLE`` column_constraint grammar, and literals, expressions,
-    ``CURRENT_TIMESTAMP``/``now()``, ``gen_random_uuid()`` and ``NOT NULL DEFAULT`` were
-    all verified working on a live cluster. Dropping them was a gap in this converter,
-    not a platform limit. It mattered most for a **NOT NULL column with a default**:
-    MySQL accepts an INSERT that omits it, but the target then rejects that same INSERT
-    with a not-null violation -- an application break that only shows up after cut-over.
+    ``CURRENT_TIMESTAMP``, ``gen_random_uuid()`` and ``NOT NULL DEFAULT`` are all verified
+    working on a live cluster. Dropping them was a converter gap, not a platform limit,
+    and it mattered most for a **NOT NULL column with a default**: MySQL accepts an INSERT
+    that omits it while the target rejects the same INSERT with a not-null violation -- an
+    application break that only appears after cut-over.
 
-    The cases, and why each is handled the way it is:
+    ``target_type`` is the type the column is being MAPPED TO, not the source type. That
+    matters: the decision has to key off the target, because several MySQL types change
+    class on the way over (``tinyint(1)`` -> boolean, ``tinyint(1) unsigned`` -> smallint,
+    ``bit`` -> integer, ``blob`` -> bytea) and a default valid for the source type is a
+    hard error against the mapped one.
 
-    * **No default** -> nothing to emit.
-    * **Generated column** -> a default is meaningless (the value is computed); skipped
-      silently, since nothing is lost.
-    * **AUTO_INCREMENT** -> becomes ``GENERATED BY DEFAULT AS IDENTITY``, and PostgreSQL
-      rejects an identity column that also carries a DEFAULT. Skipped.
-    * **TINYINT(1) -> BOOLEAN** -> MySQL stores the default as ``'0'``/``'1'``, and
-      ``DEFAULT 1`` on a boolean column is a hard error on DSQL ("default expression is
-      of type integer"). Translated to ``TRUE``/``FALSE``.
-    * **Function default** -> passed through when PostgreSQL spells it the same way;
-      dropped with a warning when it does not (e.g. MySQL ``UUID()``).
-    * **Literal default** -> already quoted by reflection, so it is emitted as-is. The
-      quotes come from MySQL's own metadata, not from user input at runtime, and any
-      embedded quote is already escaped in that form.
+    Handled cases, and why:
+
+    * **No default / generated column / AUTO_INCREMENT** -> nothing to emit. A generated
+      column's value is computed, and PostgreSQL rejects an identity column that also
+      carries a DEFAULT.
+    * **``ON UPDATE`` folded into the default** -> stripped (see :func:`_strip_on_update`).
+    * **Expression default** -> emitted verbatim when PostgreSQL spells it the same way,
+      translated when there is a known equivalent (``UUID()`` -> ``gen_random_uuid()``),
+      and dropped with a warning otherwise. A MySQL-only artifact (a ``_utf8mb4``
+      introducer, a column reference) is dropped rather than risking invalid DDL.
+    * **boolean target** -> a ``0``/``1`` literal becomes ``FALSE``/``TRUE``; ``DEFAULT 1``
+      on a boolean is a hard error on DSQL.
+    * **ENUM mapped to text + CHECK** -> a default outside the enum members is dropped,
+      because it would apply cleanly and then fail the CHECK on every defaulted INSERT.
+
+    Rarer literal/target mismatches (a bit-string default on an integer target, a binary
+    default on ``bytea``, MySQL's ``0000-00-00`` zero date) deliberately have NO dedicated
+    branch: none occurs in practice, and each would add a code path plus tests for a case
+    nobody hits. They fall through to the general rule -- the literal is emitted, and if
+    the target rejects it the failure is loud at Schema Conversion time rather than
+    silent. Add a branch only when a real schema produces one.
     """
     raw = (column.default or "").strip()
     if not raw:
@@ -1073,37 +1140,97 @@ def _column_default_sql(column: ColumnDef, data_type: str) -> tuple[Optional[str
     if column.generated:
         return None, None  # computed value; a default cannot apply
 
-    if _mysql_default_is_function(raw):
-        if raw.upper() in _UNTRANSLATABLE_FUNCTION_DEFAULTS:
-            return None, (
-                f"MySQL default {raw} has no Aurora DSQL equivalent, so the column is "
-                "created without a default. Set the value explicitly in the "
-                "application, or use a DSQL expression default (e.g. "
-                "gen_random_uuid()) if the semantics match."
-            )
-        return raw, None
+    raw = _strip_on_update(raw)
+    if not raw:
+        return None, None
 
-    # tinyint(1) becomes BOOLEAN, whose default must be a boolean literal.
-    if _is_tinyint_bool_type(data_type):
-        unquoted = raw.strip().strip("'\"")
-        if unquoted in ("0", "1"):
-            return ("TRUE" if unquoted == "1" else "FALSE"), None
+    target = (target_type or "").strip().lower()
+    is_boolean_target = target.startswith("bool")
+
+    # --- expression defaults -------------------------------------------------------
+    # MySQL's own DEFAULT_GENERATED flag decides this, with no shape heuristic to
+    # second-guess it. There is deliberately NO fallback: the only supported input is an
+    # inventory that has been through ``introspector.enrich_columns``, which every MySQL
+    # source goes through unconditionally (reflect, then enrich -- introspector.py:738).
+    # That single supported shape is what makes the translation exact:
+    #   * the default is the UNQUOTED value from information_schema.COLUMN_DEFAULT
+    #   * an expression is marked by EXTRA's DEFAULT_GENERATED
+    #   * ON UPDATE stays in EXTRA and never contaminates the default
+    # Accepting the raw SQLAlchemy-reflected form too meant guessing from quoting, which
+    # cannot tell the literal string "CURRENT_TIMESTAMP" from the function call.
+    if column.default_is_expression:
+        expression = _unwrap_expression_default(raw)
+        canonical = expression.upper().replace(" ", "")
+        if canonical in {v.replace(" ", "") for v in _PASSTHROUGH_EXPRESSION_DEFAULTS} or (
+            canonical.startswith("CURRENT_TIMESTAMP(") or canonical.startswith("NOW(")
+        ):
+            # A no-timezone target must not inherit the session TimeZone: the loader
+            # normalizes migrated rows to naive UTC, so the default has to agree.
+            if target.startswith("timestamp") and "with time zone" not in target:
+                return "(now() AT TIME ZONE 'UTC')", None
+            return expression, None
+        translated = _TRANSLATED_EXPRESSION_DEFAULTS.get(
+            expression.upper() if expression.upper().endswith(")") else f"{expression.upper()}()"
+        ) or _TRANSLATED_EXPRESSION_DEFAULTS.get(expression.upper())
+        if translated:
+            return translated, None
         return None, (
-            f"TINYINT(1) default {raw} is not 0 or 1, so it cannot be mapped to a "
-            "boolean default; the column is created without one."
+            f"MySQL expression default {raw} has no Aurora DSQL equivalent, so the column "
+            "is created without a default. Set the value explicitly in the application, or "
+            "use a DSQL expression default if the semantics match."
         )
 
-    return raw, None
+    # --- literal defaults ----------------------------------------------------------
+    unquoted = raw.strip().strip("'\"")
+
+    if is_boolean_target:
+        if unquoted in ("0", "1"):
+            return ("TRUE" if unquoted == "1" else "FALSE"), None
+        if unquoted.upper() in ("TRUE", "FALSE"):
+            return unquoted.upper(), None
+        return None, (
+            f"TINYINT(1) default {raw} is not 0 or 1, so it cannot be mapped to a boolean "
+            "default; the column is created without one."
+        )
+
+    if enum_values is not None and unquoted not in enum_values:
+        return None, (
+            f"ENUM default {raw} is not one of the allowed values, so it would fail the "
+            "generated CHECK constraint on every defaulted INSERT; the column is created "
+            "without a default."
+        )
+
+    return _quote_default_literal(raw), None
 
 
-def _is_tinyint_bool_type(mysql_type: str) -> bool:
-    """Whether a raw MySQL type string is the ``TINYINT(1)`` boolean convention.
+def _resolve_column_default(
+    column: ColumnDef,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve a column's emitted DEFAULT against its MAPPED target type.
 
-    A string-level check (the sibling :func:`_is_tinyint_one` works on a parsed sqlglot
-    type) because the default is decided while building the MySQL DDL text.
+    The decision cannot be made from the source type alone -- ``tinyint(1)`` becomes
+    boolean while ``tinyint(1) unsigned`` becomes smallint, ``bit`` becomes an integer and
+    ``blob`` becomes bytea -- so the type mapping is run first and its result drives the
+    translation. Used by both the DDL builder and the warning pass so the two can never
+    disagree about what was emitted.
     """
-    normalized = mysql_type.strip().lower().replace(" ", "")
-    return normalized.startswith("tinyint(1)")
+    try:
+        target_type, _mapping_warning = map_mysql_type(column.mysql_type)
+    except ValueError:
+        # An unparseable type is reported elsewhere (the table is surfaced as
+        # UNSUPPORTED); emit no default rather than guessing.
+        return None, None
+    enum_values: Optional[list[str]] = None
+    if target_type.strip().lower().startswith("text"):
+        try:
+            parsed = sqlglot.parse_one(
+                f"CAST(NULL AS {_normalize_mysql_type(column.mysql_type)})", read=_MYSQL
+            ).to
+            if isinstance(parsed, exp.DataType) and parsed.this is _DType.ENUM:
+                enum_values = list(_enum_values(parsed))
+        except Exception:  # noqa: BLE001 - enum detection is advisory
+            enum_values = None
+    return _column_default_sql(column, target_type, enum_values)
 
 
 def _build_source_ddl(table: TableDef) -> str:
@@ -1134,7 +1261,7 @@ def _build_source_ddl(table: TableDef) -> str:
         # AUTO_INCREMENT column, which becomes GENERATED BY DEFAULT AS IDENTITY -- an
         # identity column carrying a DEFAULT is rejected by PostgreSQL.
         if column.name != table.auto_increment_column:
-            default_sql, _warning = _column_default_sql(column, column.mysql_type)
+            default_sql, _warning = _resolve_column_default(column)
             if default_sql is not None:
                 clause += f" DEFAULT {default_sql}"
         column_clauses.append(clause)
@@ -1620,12 +1747,20 @@ def _apply_pk_strategy(
             # widening the whole CREATE TABLE failed for the typical table. Widening is
             # safe: BIGINT holds every INT value, and the sequence only ever generates
             # values going forward.
+            # DECIMAL is in this list because an UNSIGNED integer key maps to
+            # numeric/DECIMAL to preserve its range (`bigint unsigned` -> DECIMAL(20,0)),
+            # and `bigint unsigned AUTO_INCREMENT` is a common primary key -- 6 of the 11
+            # tables in the reference schema. Widening it to BIGINT narrows the DECLARED
+            # range, but an identity sequence is BIGINT-bounded on DSQL anyway, so no
+            # value the sequence can generate is lost.
             data_type = column_def.args.get("kind")
             if isinstance(data_type, exp.DataType) and data_type.this in (
                 exp.DataType.Type.INT,
                 exp.DataType.Type.SMALLINT,
                 exp.DataType.Type.TINYINT,
                 exp.DataType.Type.MEDIUMINT,
+                exp.DataType.Type.DECIMAL,
+                exp.DataType.Type.BIGINT,
             ):
                 column_def.set("kind", exp.DataType.build("BIGINT"))
             # sqlglot cannot render an identity CACHE clause, so the constraint
@@ -1786,7 +1921,12 @@ class SchemaConverter:
         # clear reason and let the caller keep converting the rest.
         try:
             create = sqlglot.parse_one(source_ddl, read=_MYSQL)
-        except sqlglot.errors.ParseError as exc:
+        except sqlglot.errors.SqlglotError as exc:
+            # SqlglotError covers BOTH ParseError and TokenError. Catching only
+            # ParseError meant a tokenizer failure -- e.g. an unbalanced quote in a
+            # reflected column default, or a MySQL charset introducer like
+            # ``_utf8mb4'x'`` -- escaped this guard and aborted the ENTIRE Schema
+            # Conversion step instead of isolating the one table.
             return _unparsable_table_conversion(table, exc)
 
         source_types = {column.name: column.mysql_type for column in table.columns}
@@ -1804,7 +1944,7 @@ class SchemaConverter:
                 continue
             if column.name == table.auto_increment_column:
                 continue
-            _emitted, default_warning = _column_default_sql(column, column.mysql_type)
+            _emitted, default_warning = _resolve_column_default(column)
             if default_warning is None:
                 continue
             if not column.nullable:

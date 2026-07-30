@@ -5,6 +5,56 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.167
+
+### Fixed
+
+- **`ON UPDATE CURRENT_TIMESTAMP`가 생성된 `CREATE TABLE`을 실패시키던 문제를 수정했습니다.**
+  v0.1.166에서 컬럼 기본값을 생성하기 시작했지만, SQLAlchemy의 MySQL 리플렉션은 `ON UPDATE` 절을
+  기본값 *안에* 접어 넣습니다 — `datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`가
+  `"CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"` 하나의 문자열로 반환됩니다 — 그래서 그대로
+  통과되어 타깃이 *`syntax error at or near "ON"`* 으로 거부했습니다. 가장 흔한 감사 컬럼에서
+  기본값 누락이 변환 실패로 바뀐 셈입니다. 근본 원인을 소스에서 수정했습니다: 컬럼 기본값을
+  이제 **`information_schema.COLUMN_DEFAULT`** 에서 읽으며, `ON UPDATE` 부분은 `EXTRA`에 남아
+  `auto_update_timestamp`가 이미 읽고 있습니다(그리고 assessor가 이미 MANUAL로 보고합니다 —
+  DSQL에는 `ON UPDATE` 절도 트리거도 없습니다).
+- **같은 리플렉션 경로가 유발한 결함 2건.** MySQL 8은 *표현식* 기본값을 괄호로 감싸 보고하므로
+  `DEFAULT (uuid())`가 `"(uuid())"`로 도착해 리터럴로 오판되었고, `bit(1) DEFAULT b'1'`은
+  리플렉션 정규식이 **조용히 버렸습니다**. `information_schema`는 둘 다 정확히 보고합니다.
+  표현식/리터럴 판별은 이제 따옴표 추론이 아니라 MySQL의 `DEFAULT_GENERATED` 플래그가 결정합니다 —
+  추론으로는 리터럴 문자열 `'CURRENT_TIMESTAMP'`와 함수 호출을 구분할 수 없었습니다.
+- **identity 전략에서 `bigint unsigned AUTO_INCREMENT` 키가 실패하던 문제를 수정했습니다.**
+  unsigned 정수 키는 범위 보존을 위해 `DECIMAL(20,0)`으로 매핑되는데 DSQL identity 컬럼은
+  `BIGINT`여야 합니다 — 그래서 참조 스키마 11개 테이블 중 6개가 *`identity column type must be
+  bigint`* 로 거부되었습니다. 이제 좁은 정수 타입과 함께 `DECIMAL`도 확장합니다. DSQL의 identity
+  시퀀스는 어차피 BIGINT 범위이므로 생성 가능한 값의 손실은 없습니다.
+- **`DATETIME`의 `CURRENT_TIMESTAMP` 기본값을 UTC로 고정합니다.** `DATETIME`은 타임존 없는
+  `timestamp`로 매핑되고 로더는 의도적으로 마이그레이션 행을 naive UTC로 정규화합니다. 맨몸
+  `CURRENT_TIMESTAMP` 기본값은 세션 `TimeZone`을 따르므로, 컷오버 후 애플리케이션이 쓴 행이
+  마이그레이션된 행과 몇 시간씩 어긋날 수 있었습니다.
+
+### Changed
+
+- **지원하는 인벤토리 형식은 하나, 휴리스틱은 없습니다.** 컨버터는 `introspector.enrich_columns`가
+  만드는 형식(따옴표 없는 값 + `DEFAULT_GENERATED` 플래그)만 읽습니다. 모든 MySQL 소스는 이
+  보강을 무조건 거칩니다. 따옴표 기반 폴백은 추측에 맡기는 대신 제거했습니다. 검증 스크립트도
+  이제 보강을 수행합니다 — 그것이 없으면 앱이 결코 쓰지 않는 코드 경로를 시험하게 되고, 실제로
+  거기서만 존재하는 실패를 보고했습니다.
+- **드문 리터럴/타깃 불일치에는 의도적으로 전용 분기를 두지 않았습니다.** 정수 타깃의 비트 문자열
+  기본값, `bytea`의 이진 기본값, MySQL의 `0000-00-00` 제로 날짜 — 실제 스키마에는 하나도 없으며,
+  각각 아무도 겪지 않는 케이스를 위해 코드 경로와 테스트를 늘립니다. 일반 규칙으로 흘려보내
+  거부가 발생하면 변환 시점에 조용하지 않게 드러납니다.
+- **매뉴얼에 기본값 처리를 문서화했습니다**(EN/KO/JA) — 2장의 "변환이 해주는 일" 목록에 기본값이
+  빠져 있었고, 4장 제약 표에는 DSQL이 기본값을 *지원한다*는 사실과 `ON UPDATE CURRENT_TIMESTAMP`는
+  재현 불가라는 점을 기록했습니다.
+
+### Added
+
+- **`scripts/verify_conversion_on_dsql.py`를 이제 배포에 포함합니다**(`scripts/*` 무시 규칙에
+  제외돼 있었습니다). `scripts/README.md`에 고객용 읽기 전용 검증 도구로 문서화했습니다: 자신의
+  스키마를 변환해 마이그레이션 *전에* Aurora DSQL이 무엇을 거부하는지 확인합니다. 합성 매트릭스는
+  위의 모든 기본값 형태를 포함해 53 케이스로 늘었습니다.
+
 ## v0.1.166
 
 ### Fixed

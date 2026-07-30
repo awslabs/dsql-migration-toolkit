@@ -11,6 +11,7 @@ the web UI. The source MySQL is always accessed **read-only**.
 | [`run_full_load.py`](run_full_load.py) | **Runs a Full Load** for your schema/tables: keyset-streamed export from MySQL → batched idempotent load into Aurora DSQL (the tool's own bulk loader). | Yes (target only). Needs `--yes`; prints a plan otherwise. |
 | [`compare_rows.py`](compare_rows.py) | **Row-count check:** do source vs target counts (and PK min/max) match, per table? | No — read-only. |
 | [`cdc_consistency_check.py`](cdc_consistency_check.py) | **Zero-data-loss check:** loads the full primary-key set from both sides and names the exact PKs **missing on target** (lost rows) and **extra on target** (a source delete not yet applied). | No — read-only. |
+| [`verify_conversion_on_dsql.py`](verify_conversion_on_dsql.py) | **Will my schema convert?** Converts every table in your MySQL schema and applies the generated DDL to your Aurora DSQL cluster, reporting anything the cluster rejects — before you migrate. Also sweeps a built-in matrix of MySQL types/defaults. | Creates and drops tables in a **scratch schema** on the target; touches nothing else. Source is read-only. |
 
 The two verification scripts are **read-only on both sides**, print a per-table
 report, and **exit `0` only when everything matches / is consistent** (non-zero

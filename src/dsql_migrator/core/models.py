@@ -131,6 +131,16 @@ class ColumnDef(BaseModel):
         default=False,
         description="True when the column uses ON UPDATE CURRENT_TIMESTAMP.",
     )
+    default_is_expression: bool = Field(
+        default=False,
+        description=(
+            "True when ``default`` is a MySQL EXPRESSION (function call, computed "
+            "expression, CURRENT_TIMESTAMP) rather than a literal value. Sourced from "
+            "information_schema EXTRA's DEFAULT_GENERATED flag, because COLUMN_DEFAULT "
+            "arrives unquoted -- so a literal string 'uuid()' and the call uuid() are "
+            "otherwise indistinguishable."
+        ),
+    )
 
 
 class IndexDef(BaseModel):

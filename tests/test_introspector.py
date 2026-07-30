@@ -309,9 +309,9 @@ def test_enrich_columns_sets_collation_and_auto_increment() -> None:
         )
     ]
     rows = [
-        # (TABLE_NAME, COLUMN_NAME, COLLATION_NAME, EXTRA, COLUMN_TYPE)
-        ("orders", "id", None, "auto_increment", "int unsigned"),
-        ("orders", "code", "utf8mb4_general_ci", "", "varchar(20)"),
+        # (TABLE_NAME, COLUMN_NAME, COLLATION_NAME, EXTRA, COLUMN_TYPE, COLUMN_DEFAULT)
+        ("orders", "id", None, "auto_increment", "int unsigned", None),
+        ("orders", "code", "utf8mb4_general_ci", "", "varchar(20)", "AB"),
     ]
     enrich_columns(_FakeConnection(rows), "app", tables)
 
@@ -322,6 +322,10 @@ def test_enrich_columns_sets_collation_and_auto_increment() -> None:
     # COLUMN_TYPE overrides the (lossy) reflected mysql_type, preserving unsigned.
     id_column = next(c for c in table.columns if c.name == "id")
     assert id_column.mysql_type == "int unsigned"
+    # COLUMN_DEFAULT is the authoritative default source (see the test below for why),
+    # and it arrives UNQUOTED -- "AB", not "'AB'".
+    assert code_column.default == "AB"
+    assert id_column.default is None
 
 
 def test_enrich_columns_restores_unsigned_and_tinyint1_from_column_type() -> None:
@@ -340,9 +344,10 @@ def test_enrich_columns_restores_unsigned_and_tinyint1_from_column_type() -> Non
         )
     ]
     rows = [
-        ("t", "flag", None, "", "tinyint(1)"),
-        ("t", "qty", None, "", "smallint unsigned"),
-        ("t", "big", None, "", "int unsigned"),
+        # (TABLE_NAME, COLUMN_NAME, COLLATION_NAME, EXTRA, COLUMN_TYPE, COLUMN_DEFAULT)
+        ("t", "flag", None, "", "tinyint(1)", "1"),
+        ("t", "qty", None, "", "smallint unsigned", "0"),
+        ("t", "big", None, "", "int unsigned", None),
     ]
     enrich_columns(_FakeConnection(rows), "app", tables)
     by_name = {c.name: c for c in tables[0].columns}
@@ -364,13 +369,17 @@ def test_enrich_columns_marks_generated_and_on_update_columns() -> None:
         )
     ]
     rows = [
-        # (TABLE_NAME, COLUMN_NAME, COLLATION_NAME, EXTRA, COLUMN_TYPE)
-        ("orders", "id", None, "auto_increment", "int"),
-        ("orders", "total", None, "STORED GENERATED", "decimal(10,2)"),
+        # (TABLE_NAME, COLUMN_NAME, COLLATION_NAME, EXTRA, COLUMN_TYPE, COLUMN_DEFAULT)
+        ("orders", "id", None, "auto_increment", "int", None),
+        ("orders", "total", None, "STORED GENERATED", "decimal(10,2)", None),
+        # Note what information_schema gives us here that SHOW CREATE TABLE does not:
+        # the ON UPDATE clause stays in EXTRA, so COLUMN_DEFAULT is just the default.
         ("orders", "updated_at", None,
-         "DEFAULT_GENERATED on update CURRENT_TIMESTAMP", "timestamp"),
+         "DEFAULT_GENERATED on update CURRENT_TIMESTAMP", "timestamp",
+         "CURRENT_TIMESTAMP"),
         # DEFAULT_GENERATED alone (expression default) must NOT be a generated col.
-        ("orders", "created_at", None, "DEFAULT_GENERATED", "timestamp"),
+        ("orders", "created_at", None, "DEFAULT_GENERATED", "timestamp",
+         "CURRENT_TIMESTAMP"),
     ]
     enrich_columns(_FakeConnection(rows), "app", tables)
 
@@ -379,6 +388,16 @@ def test_enrich_columns_marks_generated_and_on_update_columns() -> None:
     assert by_name["updated_at"].auto_update_timestamp is True
     assert by_name["created_at"].generated is False
     assert by_name["created_at"].auto_update_timestamp is False
+    # DEFAULT_GENERATED marks the default as an EXPRESSION, which is what tells a bare
+    # CURRENT_TIMESTAMP apart from the literal string "CURRENT_TIMESTAMP" now that
+    # COLUMN_DEFAULT arrives unquoted.
+    assert by_name["created_at"].default_is_expression is True
+    assert by_name["created_at"].default == "CURRENT_TIMESTAMP"
+    assert by_name["total"].default_is_expression is False
+    # And the ON UPDATE half is NOT folded into the default -- emitting it verbatim
+    # would be a target syntax error.
+    assert by_name["updated_at"].default == "CURRENT_TIMESTAMP"
+    assert "ON UPDATE" not in (by_name["updated_at"].default or "")
 
 
 def test_enrich_index_types_records_index_type() -> None:
