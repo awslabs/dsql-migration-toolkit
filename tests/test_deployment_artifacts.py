@@ -1031,6 +1031,11 @@ def test_one_deploy_convenience_defaults(template: dict) -> None:
     assert params["AlbScheme"]["Default"] == "internal"
     # No image build required: defaults to the published ECR Public image.
     assert params["ContainerImageUri"]["Default"].startswith("public.ecr.aws/")
+    # ...and that default must be PINNED to a real tag, not "latest": a floating tag
+    # makes a "same template" deploy irreproducible.
+    default_tag = params["ContainerImageUri"]["Default"].rsplit(":", 1)[-1]
+    assert default_tag != "latest", params["ContainerImageUri"]["Default"]
+    assert default_tag[0].isdigit(), default_tag
     # Safety net: Cognito is still REQUIRED when ingress is open to the internet.
     rule = template["Rules"]["CognitoRequiredWhenIngressOpen"]
     assert rule["RuleCondition"] == {"Fn::Equals": [{"Ref": "AllowedIngressCidr"}, "0.0.0.0/0"]}
@@ -1447,3 +1452,42 @@ def test_cdc_stack_declares_watermark_and_seeder_params(cdc_template: dict) -> N
         assert p in params, p
         # All default to empty so a deploy without a watermark is valid (no seeder).
         assert params[p].get("Default", None) == "", p
+
+
+def test_public_image_default_is_not_left_behind_the_app_version(template: dict) -> None:
+    """The ECR Public default tag must track the shipped version.
+
+    This is what a NEW customer gets: CloudFormation pulls this exact tag, so a stale
+    default silently hands them an old build. It had drifted to 0.1.34 while the app was
+    at 0.1.164 -- 130 releases behind, missing every fix in between -- because publishing
+    to ECR Public is an opt-in extra step (PUBLIC_IMAGE_URI) that is easy to skip.
+
+    Enforced as "not far behind" rather than "exactly equal": a patch release does not
+    have to be republished, but the default must not be allowed to rot.
+    """
+    import pathlib
+    import re
+
+    pyproject = (
+        pathlib.Path(__file__).resolve().parents[1] / "pyproject.toml"
+    ).read_text(encoding="utf-8")
+    app_version = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE).group(1)
+
+    default_uri = template["Parameters"]["ContainerImageUri"]["Default"]
+    default_tag = default_uri.rsplit(":", 1)[-1]
+
+    def _patch(v: str) -> int:
+        return int(v.split(".")[-1])
+
+    # Same major.minor line...
+    assert default_tag.rsplit(".", 1)[0] == app_version.rsplit(".", 1)[0], (
+        f"published default {default_tag} is on a different line to {app_version}"
+    )
+    # ...and within a reasonable window of the shipped patch level.
+    drift = _patch(app_version) - _patch(default_tag)
+    assert 0 <= drift <= 20, (
+        f"ECR Public default is {drift} patch releases behind the app "
+        f"({default_tag} vs {app_version}) -- republish with "
+        f"PUBLIC_IMAGE_URI=public.ecr.aws/<alias>/mysql-dsql-migrator and bump the "
+        f"ContainerImageUri default in deploy/cloudformation.yaml"
+    )

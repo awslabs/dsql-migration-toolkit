@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.165
+
+### Fixed
+
+- **The published ECR Public image — what a new deploy actually pulls — was 130 releases
+  stale.** `deploy/cloudformation.yaml` defaults `ContainerImageUri` to
+  `public.ecr.aws/.../mysql-dsql-migrator:<tag>` so a normal deploy needs no image build,
+  but that tag still read `0.1.34` (2026-07-02) while the app was at `0.1.164`. Anyone
+  deploying from the template got a July 2 build — without the Query Converter rename,
+  the Settings dialog, the CDC security-group fix, or anything else since. Publishing to
+  ECR Public is an opt-in extra step (`PUBLIC_IMAGE_URI=…` on the build script) that is
+  easy to skip, and nothing checked the result. `0.1.164` is now published and the
+  default points at it, and a test asserts the default stays on the shipped major.minor
+  line and within 20 patch releases of it — with the republish command in the failure
+  message. The default is also asserted to be a pinned numeric tag, never `latest`, so a
+  redeploy of "the same template" cannot silently change images.
+
 ## v0.1.164
 
 ### Changed
