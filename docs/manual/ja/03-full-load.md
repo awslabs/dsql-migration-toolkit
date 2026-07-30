@@ -55,7 +55,7 @@ LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 1000
 
 **主キーが必須です。** PK を持たないテーブルは keyset ページネーションできないため拒否されます(DSQL も
 PK を要求するため、Evaluation でも `UNSUPPORTED` としてフラグ付けされます)。単一列 PK と複合 PK の
-どちらもサポートされます — そして複合キーは単に許容されるだけでなく、単調増加するキーによる書き込みホットパーティションに対してツールが推奨する解決策です([第 7 章 §7.1](07-performance-and-tuning.md#primary-key-strategy--avoid-hot-partitions) 参照)。
+どちらもサポートされます — そして複合キーは単に許容されるだけでなく、単調増加するキーによる書き込みホットパーティションに対してツールが推奨する解決策です([第 7 章 §7.1](07-performance-and-tuning.md#プライマリキー戦略--ホットパーティションの回避) 参照)。
 
 > **ビジーな本番ソースへの読み取り負荷が心配ですか?** 多数のテーブルを一度にロードしても 1 つのレバー
 > (テーブル並列度)で制限され、ソースを健全に保つ具体的な手順があります —
@@ -211,7 +211,7 @@ ProcessPoolExecutor(max_workers=table_parallelism)
 大規模な移行では worker 数をタスクの vCPU 数に合わせてください — pool slot を
 whole-table worker と shard worker に配分するのはローダーが自動で行います。関連する設定
 (`TABLE_PARALLELISM`、`BATCH_PARALLELISM`、`SHARD_MIN_ROWS`)とその上限、そしてソース負荷との
-関係は [第 7 章 §7.2 — 並列度のチューニング](07-performance-and-tuning.md#72-tuning-parallelism)
+関係は [第 7 章 §7.2 — 並列度のチューニング](07-performance-and-tuning.md#72-並列度のチューニング)
 にまとまっています。この設計が実際に達成したスループット(および置き換えられた ThreadPool の
 ベースライン)は [付録: パフォーマンステスト結果](12-performance-test-results.md) にあります。
 

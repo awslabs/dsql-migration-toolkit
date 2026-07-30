@@ -131,7 +131,7 @@ CDC 인계는 각 테이블이 **단일 시점**으로 일관되다는 전제에
 클러스터의 연결 쿼터 안에 들어오도록 주의하세요. 상한을 넘거나 숫자가 아닌 값을 넣으면 **적용되지 않고
 오류로 막히므로**(잘못된 설정이 조용히 무시되지 않음) 안심하고 조정해도 됩니다. 값을 바꾼 뒤에는
 앱/태스크를 **다시 시작**하면 반영됩니다. 자세한 내용은
-[7장 §7.2](07-performance-and-tuning.md#72-tuning-parallelism)를 참조하세요.
+[7장 §7.2](07-performance-and-tuning.md#72-병렬수-튜닝)를 참조하세요.
 
 
 **Q11. 병렬도를 올려도 왜 빨라지지 않을 때가 있나요?**
@@ -142,7 +142,7 @@ DSQL은 데이터를 **기본 키 기준으로** 여러 노드에 나눠 저장�
 그만큼 재시도가 발생해 처리량이 더 이상 늘지 않고 정체됩니다. 그래서 Evaluation 단계에서
 `AUTO_INCREMENT`를 미리 짚어 주고, Schema Conversion에서 **PK 전략**(정수 그대로 유지 / UUID로 변환 /
 캐싱 적용 identity 컬럼)을 선택할 수 있게 해 줍니다.
-[7장 §7.1](07-performance-and-tuning.md#71-why-this-design-the-technical-case) 참조.
+[7장 §7.1](07-performance-and-tuning.md#71-이-설계의-이유-기술적-근거) 참조.
 
 ---
 
@@ -159,8 +159,8 @@ CDC를 쓰려면 소스에 다음이 준비돼 있어야 합니다.
 
 RDS/Aurora에서는 이 설정들을 `my.cnf`가 아니라 **파라미터 그룹**과 `mysql.rds_set_configuration`으로
 바꿉니다. 도구는 이 조건들이 갖춰지기 전까지는 **CDC 시작을 막아** 주므로, 준비가 안 된 채로 진행되는
-일은 없습니다. [§1.1](01-setup.md#11-prerequisites)과
-[6장 §6.2](06-limitations.md#62-migration-process-limits)를 참조하세요.
+일은 없습니다. [§1.1](01-setup.md#11-사전-요구사항)과
+[6장 §6.2](06-limitations.md#62-마이그레이션-프로세스-한계)를 참조하세요.
 
 
 **Q13. Full Load에서 CDC로 넘어갈 때 어떻게 누락 없이 이어지나요?**
@@ -184,7 +184,7 @@ CDC가 복제하는 것은 **행 데이터가 실제로 어떻게 바뀌었는�
 
 만약 타깃 테이블 구조와 더 이상 맞지 않는 행이 들어오면, 그 행은 조용히 사라지지 않고 **DLQ(데드레터
 큐)로 격리**됩니다.
-[4장 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)를 참조하세요.
+[4장 §4.2](04-cdc-and-dsql-constraints.md#42-cdc는-스키마가-아니라-데이터를-복제--중요)를 참조하세요.
 
 
 **Q15. 왜 표준 JDBC 싱크가 아니라 커스텀 DSQL 싱크 커넥터인가요?**
@@ -196,7 +196,7 @@ CDC가 복제하는 것은 **행 데이터가 실제로 어떻게 바뀌었는�
 2. 짧은 수명의 **IAM 토큰을 발급·갱신**해, 수 시간짜리 스트림이 인증 만료 때문에 멈추지 않게 합니다.
 3. DSQL의 **3000행 / 1 MiB 한도**를 강제로 지키고, 처리 불가한(poison) 행은 DLQ로 보냅니다.
 
-자세한 내용은 [4장 §4.1](04-cdc-and-dsql-constraints.md#41-the-pipeline)을 참조하세요.
+자세한 내용은 [4장 §4.1](04-cdc-and-dsql-constraints.md#41-파이프라인)을 참조하세요.
 
 
 **Q16. CDC를 일시정지할 수 있나요? 비용이 드나요?**
@@ -205,7 +205,7 @@ CDC 스트리밍 파이프라인(MSK Serverless + MSK Connect, 도구가 만들�
 있는 동안 계속 비용이 발생**하며, 비용 없이 잠시 멈춰 두는 "일시정지" 기능은 없습니다. 그러니 컷오버가
 끝나면 CDC 스택을 내려 주세요(**Cut over** 단계의 *Delete all CDC infrastructure*). 참고로 **Full
 Load만** 쓰는 경우에는 이런 스트리밍 인프라를 **아예 만들지 않으므로** 상시 비용이 없습니다.
-[6장 §6.2](06-limitations.md#62-migration-process-limits)를 참조하세요.
+[6장 §6.2](06-limitations.md#62-마이그레이션-프로세스-한계)를 참조하세요.
 
 
 **Q17. CDC 단계들은 얼마나 걸리고, 왜 그렇게 오래 걸리나요?**
@@ -292,7 +292,7 @@ DSQL에는 이 기능들이 없어서, 각각 다음과 같이 처리됩니다.
 - **트리거, 저장 프로시저/함수, 예약 이벤트**: 자동 변환이 안 되므로 **UNSUPPORTED**로 표시됩니다.
   애플리케이션에서 다시 구현하세요(예약 이벤트는 EventBridge / Lambda로 대체할 수 있습니다).
 
-[6장 §6.1](06-limitations.md#61-aurora-dsql-feature-limits-your-schema-must-fit-these)을 참조하세요.
+[6장 §6.1](06-limitations.md#61-aurora-dsql-기능-한계-스키마가-이에-맞아야-함)을 참조하세요.
 
 
 **Q21. 테이블에 기본 키가 없습니다. 이전할 수 있나요?**
@@ -361,7 +361,7 @@ drift**)를 함께 보고합니다. 그래서 행 수 차이가 **마이그레�
 
 파이프라인을 통과조차 못 하는 값(> ~8 MiB)은 Evaluation의 `OVERSIZED_LOB` 플래그에 따라 **캡처 단계에서
 제외**됩니다.
-[6장 §6.1](06-limitations.md#61-aurora-dsql-feature-limits-your-schema-must-fit-these) 참조.
+[6장 §6.1](06-limitations.md#61-aurora-dsql-기능-한계-스키마가-이에-맞아야-함) 참조.
 
 
 **Q25. "문제가 생기면 조용히 넘어가지 않고 알린다(loud over silent)"는 게 실제로 무슨 뜻인가요?**
@@ -476,7 +476,7 @@ AWS에 배포하는 형태는 **ECS Fargate 태스크 하나로 동작**하며, 
 
 그래서 이 상태를 **공유 저장소**(예: 중단 없이 이어서 재개하려면 EFS 마운트)로 옮기지 않는 한, **태스크를
 두 개 이상 늘려 실행하지 마세요.** 즉 지금 형태에서는 한 번에 하나의 마이그레이션을 다루는 것을 전제로
-합니다. [6장 §6.3](06-limitations.md#63-deployment-limits-the-aws-hosted-form) 참조.
+합니다. [6장 §6.3](06-limitations.md#63-배포-한계-aws-호스팅-형태) 참조.
 
 
 **Q31. AWS 인프라를 전부 제거하고 완전히 처음부터 다시 시작하려면 어떻게 하나요?**

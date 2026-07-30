@@ -53,7 +53,7 @@ LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 1000
 - 실행 중인 소스가 계속 바뀌어도 읽기는 **단일 일관 스냅샷**으로 유지됨.
 
 **기본 키가 필요합니다.** PK 없는 테이블은 keyset 페이지네이션이 불가능해 거부됩니다(Evaluation에서도
-`UNSUPPORTED`로 플래그됨 — DSQL도 PK를 요구). 단일·복합 PK 모두 지원합니다 — 복합 키는 단순히 허용되는 수준을 넘어, 단조 증가 키에서 발생하는 쓰기 핫 파티션에 대한 이 도구의 권장 해결책입니다([7장 §7.1](07-performance-and-tuning.md#primary-key-strategy--avoid-hot-partitions) 참조).
+`UNSUPPORTED`로 플래그됨 — DSQL도 PK를 요구). 단일·복합 PK 모두 지원합니다 — 복합 키는 단순히 허용되는 수준을 넘어, 단조 증가 키에서 발생하는 쓰기 핫 파티션에 대한 이 도구의 권장 해결책입니다([7장 §7.1](07-performance-and-tuning.md#기본-키-전략--핫-파티션-회피) 참조).
 
 > **바쁜 프로덕션 소스의 읽기 부하가 걱정되나요?** 여러 테이블을 한꺼번에 로드해도 하나의 레버(테이블
 > 병렬수)로 제한되며, 소스를 건강하게 유지하는 구체적 단계가 있습니다 —
@@ -201,7 +201,7 @@ ProcessPoolExecutor(max_workers=table_parallelism)
 대규모 마이그레이션에서는 worker 수를 태스크의 vCPU 수에 맞추세요 — pool slot을
 whole-table worker와 shard worker에 배분하는 일은 로더가 알아서 합니다. 관련 설정
 (`TABLE_PARALLELISM`, `BATCH_PARALLELISM`, `SHARD_MIN_ROWS`)과 각각의 한도, 그리고 소스
-부하와의 관계는 [7장 §7.2 — 병렬도 튜닝](07-performance-and-tuning.md#72-tuning-parallelism)에
+부하와의 관계는 [7장 §7.2 — 병렬도 튜닝](07-performance-and-tuning.md#72-병렬수-튜닝)에
 모여 있습니다. 이 설계가 실제로 낸 처리량(그리고 이것이 대체한 ThreadPool 기준선)은
 [Appendix: 성능 테스트 결과](12-performance-test-results.md)에 있습니다.
 

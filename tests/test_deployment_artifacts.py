@@ -1491,3 +1491,82 @@ def test_public_image_default_is_not_left_behind_the_app_version(template: dict)
         f"PUBLIC_IMAGE_URI=public.ecr.aws/<alias>/mysql-dsql-migrator and bump the "
         f"ContainerImageUri default in deploy/cloudformation.yaml"
     )
+
+
+# ---------------------------------------------------------------------------
+# Manual cross-links. The KO/JA chapters had 16 links pointing at ENGLISH
+# anchors, which can never resolve: a GitHub anchor is derived from the heading
+# text, so a translated page has no English slug. They were silently dead.
+# ---------------------------------------------------------------------------
+
+
+def _github_anchor_slugs(path) -> set:
+    """Return the anchor slugs GitHub generates for a markdown file's headings.
+
+    GitHub lowercases the heading, drops everything that is not a word character,
+    whitespace or hyphen (so `§`, `*`, `(`, `.` and `—` all vanish), then turns runs of
+    whitespace into hyphens. ``re.UNICODE`` matters: `\\w` must keep Hangul and Kana, or
+    every translated heading would collapse to an empty slug and the check would pass
+    vacuously.
+    """
+    import re
+
+    slugs = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("#"):
+            heading = line.lstrip("#").strip()
+            cleaned = re.sub(r"[^\w\s-]", "", heading.lower(), flags=re.UNICODE)
+            slugs.add(re.sub(r"\s", "-", cleaned))
+    return slugs
+
+
+def test_every_manual_anchor_link_resolves() -> None:
+    """Each `](file.md#anchor)` in the manual must point at a heading that exists.
+
+    Catches two failure modes that are invisible in review: a translated page linking to
+    an English anchor, and a link left behind when a section is renamed or moved between
+    chapters (which is exactly what happened moving the type reference from chapter 4 to
+    chapter 2).
+    """
+    import pathlib
+    import re
+    import urllib.parse
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    broken: list[str] = []
+    checked = 0
+
+    for md in sorted(manual.rglob("*.md")):
+        for match in re.finditer(
+            r"\]\((0[0-9][^)#]*\.md)?#([^)]+)\)", md.read_text(encoding="utf-8")
+        ):
+            checked += 1
+            target = md.parent / match.group(1) if match.group(1) else md
+            anchor = urllib.parse.unquote(match.group(2))
+            where = md.relative_to(manual)
+            if not target.exists():
+                broken.append(f"{where}: {match.group(0)} (no such file)")
+            elif anchor not in _github_anchor_slugs(target):
+                broken.append(f"{where}: {match.group(0)} (no such anchor)")
+
+    # Guard the guard: if the scan found nothing, it would pass vacuously.
+    assert checked > 50, f"only {checked} anchor links found -- is the scan still right?"
+    assert not broken, "broken manual links:\n  " + "\n  ".join(broken)
+
+
+def test_anchor_slug_helper_matches_github_for_a_known_heading() -> None:
+    # The whole check rests on this slug rule, so pin it against real headings in all
+    # three languages -- including a Korean and a Japanese one, since a `\w` without
+    # re.UNICODE would silently drop those characters.
+    import pathlib
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+
+    en = _github_anchor_slugs(manual / "en" / "03-full-load.md")
+    assert "35-the-watermark--the-bridge-to-cdc" in en
+
+    ko = _github_anchor_slugs(manual / "ko" / "01-setup.md")
+    assert "11-사전-요구사항" in ko
+
+    ja = _github_anchor_slugs(manual / "ja" / "01-setup.md")
+    assert "11-前提条件" in ja
