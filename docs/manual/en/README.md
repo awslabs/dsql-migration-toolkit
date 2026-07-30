@@ -39,7 +39,7 @@ application to DSQL once Validation passes.
 |---|---|---|
 | 0 | [Before you begin](00-before-you-begin.md) | The pre-flight checklist — the must-know facts (same-region only, read-only source, DSQL's omitted features, CDC is optional/billable) that shape your plan from step one. **Start here.** |
 | 1 | [Set up](01-setup.md) | Prerequisites, how to run the tool (local or on AWS), and how to connect to your source and target. |
-| 2 | [Evaluation and Schema Conversion](02-evaluation-and-schema-conversion.md) | How the tool assesses what will/won't move to DSQL (AUTO / MANUAL / UNSUPPORTED, effort estimates, name conflicts) and converts + applies the schema. |
+| 2 | [Evaluation and Schema Conversion](02-evaluation-and-schema-conversion.md) | How the tool assesses what will/won't move to DSQL (AUTO / MANUAL / UNSUPPORTED, effort estimates, name conflicts) and converts + applies the schema. Includes the complete **MySQL → DSQL type and constraint reference**. |
 | 3 | [Full Load](03-full-load.md) | How the bulk snapshot load works: streaming export, batched idempotent load, the watermark, and how failures are isolated. |
 | 4 | [CDC and DSQL constraints](04-cdc-and-dsql-constraints.md) | How streaming CDC works, the gapless Full Load → CDC handoff, and how DSQL's constraints (no FK, 1 MiB values, OCC, IAM auth) are handled in the data path. |
 | 5 | [Validation](05-validation.md) | How the tool proves the target matches the source: row counts, checksums, full PK reconciliation, and live-source drift. |

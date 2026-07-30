@@ -278,7 +278,7 @@ Evaluation 단계가 **모든 객체**를 세 등급으로 분류해 알려 줍�
 | `JSON` | `json` | |
 
 **모든 타입의 전체 매핑표**(대상 DSQL 타입 + 저장 값 형태 포함)는
-[4장 §4.6](04-cdc-and-dsql-constraints.md#46-mysql--dsql-type-and-constraint-handling-reference)에
+[2장 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-타입과-제약-처리-참조)에
 있습니다. **Full Load 로더와 CDC 싱크가 동일한 매핑을 따르므로**(공유 write-contract 테스트로 강제),
 어느 경로로 옮겨도 같은 행이 동일하게 적재됩니다.
 

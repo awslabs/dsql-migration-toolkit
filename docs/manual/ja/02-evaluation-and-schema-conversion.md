@@ -150,7 +150,7 @@ AI アシストは **オプトイン・デフォルト無効** の補強機能�
 
 - **型マッピング** — 完全な MySQL → DSQL 型テーブル(`TINYINT(1)` → `boolean`、`BIT(n)` → 整数、
   `ENUM` → `text` + `CHECK`、`BLOB`/`BINARY` → `bytea` など。
-  [第 4 章 §4.6](04-cdc-and-dsql-constraints.md#46-mysql--dsql-の型と制約の処理-リファレンス) を参照)。
+  下記 [§2.3](#23-mysql--dsql-の型と制約の処理-リファレンス) を参照)。
 - **列のデフォルト値** — ソースの `DEFAULT` を引き継ぎます(Aurora DSQL がサポートしており、
   `DEFAULT CURRENT_TIMESTAMP` も含みます)。2 つは自動的に変換されます: `TINYINT(1)` のデフォルトは
   `boolean` ターゲット向けに `TRUE`/`FALSE` へ、`DATETIME` のデフォルトはローダーが書き込む naive
@@ -189,6 +189,88 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 自分で再適用する必要があります
 ([第 4 章 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-は-スキーマ-ではなく-データ-を複製する--重要) を参照)。
 
+## 2.3 MySQL → DSQL の型と制約の処理 (リファレンス)
+
+これは、Schema Conversion とデータパスが SQL 方言の違いを橋渡しするために行う処理です。Full Load の値コンバーターと CDC sink の両方が従う同一のマッピングであり、共有の「write contract」がこの 2 つを一致させます。
+
+### 型マッピング (完全なリファレンス)
+
+以下のすべての MySQL データ型について、Schema Conversion がターゲット DDL 型として出力するもの、**および** その値が Aurora DSQL 上でどのように格納されるかを示します。両方のマイグレーション経路 — Full Load バルクローダー (Python) と CDC sink (Java) — が同一のマッピングに従い、共有の **write-contract** パリティテストによって強制されるため、どちらの経路でマイグレーションしても同じソース行が同一に着地します。分類: **AUTO** = 自動・ロスレス、**MANUAL** = 変換されるが検討・判断が必要、**UNSUPPORTED** = 自動変換なし (再設計)。
+
+#### 整数型
+
+| MySQL 型 | Aurora DSQL 型 | 格納される値の形式 | 分類 | 備考 |
+|---|---|---|---|---|
+| `TINYINT` | `smallint` | `smallint` | AUTO | 符号付き 8 ビット。 |
+| `TINYINT(1)` | `boolean` | `boolean` (`true`/`false`) | MANUAL | MySQL の boolean 慣例。`0/1`→`false/true`。`{0,1}` **の範囲外の値は明示的に失敗** します (サイレントな平坦化はありません)。 |
+| `SMALLINT` | `smallint` | `smallint` | AUTO | 符号付き 16 ビット。 |
+| `MEDIUMINT` | `integer` | `integer` | AUTO | PostgreSQL には 3 バイト整数がありません。`integer` が符号付き 24 ビット範囲をカバーします。 |
+| `INT` / `INTEGER` | `integer` | `integer` | AUTO | 符号付き 32 ビット。 |
+| `BIGINT` | `bigint` | `bigint` | AUTO | 符号付き 64 ビット。 |
+| `TINYINT UNSIGNED` | `smallint` | `smallint` | AUTO | `0..255` を保持するために拡幅。 |
+| `SMALLINT UNSIGNED` | `integer` | `integer` | AUTO | `0..65535` を保持するために拡幅。 |
+| `MEDIUMINT UNSIGNED` | `integer` | `integer` | AUTO | `0..16M` を保持するために拡幅。 |
+| `INT UNSIGNED` | `bigint` | `bigint` | AUTO | `0..4.29B` を保持するために拡幅。 |
+| `BIGINT UNSIGNED` | `numeric(20,0)` | `numeric(20,0)` | AUTO | より幅の広い整数型は存在しません。`2^64-1` の全範囲を保持します。(CDC は `bigint.unsigned.handling.mode=precise` が必要です。) |
+| `INT(11)`、`BIGINT(20)`、… (表示幅) | bare `smallint`/`integer`/`bigint` | `smallint`/`integer`/`bigint` | AUTO | `(N)` 表示幅は **ドロップ** されます (MySQL では表示用。PostgreSQL の整数は幅を取りません)。 |
+| `BIT(n)` | `smallint` (n≤15) / `integer` (≤31) / `bigint` (≤63) / `numeric(20,0)` (64) | `smallint`/`integer`/`bigint`/`numeric(20,0)` | MANUAL | DSQL には **`BIT` 型がありません**。ビットパターンはそれが表す符号なし整数として格納されます。 |
+
+#### 固定小数点 & 浮動小数点
+
+| MySQL 型 | Aurora DSQL 型 | 格納される値の形式 | 分類 | 備考 |
+|---|---|---|---|---|
+| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 精度/スケールを保持。**精度 > 38 は UNSUPPORTED** です (DSQL は NUMERIC を 38 に制限)。 |
+| `DECIMAL(p,s) UNSIGNED` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 符号なしは表現できず、格納上の意味を持ちません。 |
+| `FLOAT` | `real` | `real` | AUTO | 単精度 float。 |
+| `FLOAT(M,D)` | `real` | `real` | AUTO | `(M,D)` 表示仕様はドロップされます (PostgreSQL の `float` はスケールではなく 1 つの精度を取ります)。 |
+| `DOUBLE` / `DOUBLE UNSIGNED` | `double precision` | `double precision` | AUTO | 倍精度 float。 |
+
+#### 日付 & 時刻
+
+| MySQL 型 | Aurora DSQL 型 | 格納される値の形式 | 分類 | 備考 |
+|---|---|---|---|---|
+| `DATE` | `date` | `date` | AUTO | |
+| `DATETIME` | `timestamp` (タイムゾーンなし) | `timestamp` (UTC wall-clock) | AUTO | **UTC** として扱われ/正規化されます。 |
+| `DATETIME(6)` | `timestamp` | `timestamp` (UTC, microsecond precision) | AUTO | 小数秒はマイクロ秒まで保持されます。 |
+| `TIMESTAMP` | `timestamptz` | `timestamptz` (UTC instant) | AUTO | 絶対的な UTC 時点として格納されます。 |
+| `TIME` | `time` (タイムゾーンなし) | `time` | AUTO | 範囲内は `00:00:00..23:59:59`。**範囲外** の MySQL `TIME` (負の値または `> 24h`、MySQL の範囲は `-838:59:59..838:59:59`) は `time` として表現できないため **明示的に失敗** します (代わりに `interval` 列が必要です)。 |
+| `YEAR` | `smallint` | `smallint` (integer year) | MANUAL | DSQL には `YEAR` 型がありません。`1901–2155` は `smallint` に収まり、整数の年として格納されます (`YEAR` の表示セマンティクスは保持されません)。 |
+
+#### 文字列、バイナリ、構造化
+
+| MySQL 型 | Aurora DSQL 型 | 格納される値の形式 | 分類 | 備考 |
+|---|---|---|---|---|
+| `CHAR(n)` | `char(n)` | `char(n)` | AUTO | |
+| `VARCHAR(n)` | `varchar(n)` | `varchar(n)` | AUTO | |
+| `TINYTEXT`/`TEXT`/`MEDIUMTEXT`/`LONGTEXT` | `text` | `text` | AUTO | 単一の値が **> 約 1 MiB** の場合は DSQL に拒否されます → 行単位の隔離 (Full Load) / DLQ (CDC)。特大サイズの LOB 列は Evaluation でフラグ付けされます。 |
+| `COLLATE` 付きの `CHAR`/`VARCHAR`/`TEXT` (例: `utf8mb4_*_ci`) | 同一、**照合順序はドロップ** | `text` (collation dropped) | MANUAL | DSQL はデフォルトの照合順序を使用します。大文字小文字を区別しない照合順序は保持されないため MANUAL としてフラグ付けされます。 |
+| `BINARY(n)` / `VARBINARY(n)` | `bytea` | `bytea` (raw bytes) | AUTO | 長さ修飾子はドロップされます (PostgreSQL の `bytea` は取りません)。 |
+| `TINYBLOB`/`BLOB`/`MEDIUMBLOB`/`LONGBLOB` | `bytea` | `bytea` (raw bytes) | AUTO | バイナリペイロードをバイト単位で保持します。 |
+| `ENUM('a','b',…)` | `text` + `CHECK (col IN ('a','b',…))` | `text` | MANUAL | DSQL には `ENUM` がありません。順序のセマンティクスは保持されません。 |
+| `SET('x','y',…)` | `text` | `text` (comma-joined) | MANUAL | ロスレスなマッピングはありません。複数値の set セマンティクスはアプリケーションで処理します。 |
+| `JSON` | `json` | `json` | AUTO | (CDC は JSON テキストを `PGobject(type=json)` でラップし、`json` 列をターゲットにします。) |
+| 空間型 (`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL には空間型がありません。データは生の WKB バイトとして **保持** されます (Full Load は `ST_AsBinary(col)` を読み取り、CDC は Debezium の geometry の `.wkb` を抽出します。**SRID はドロップ** されます)。`geometry` の *列型* 自体は UNSUPPORTED としてフラグ付けされますが、値は失われません。 |
+
+### 構造上の制約
+
+| DSQL のルール | ツールの動作 |
+|---|---|
+| **外部キーなし** | FK 定義は DDL から削除されますが、参照整合性をアプリケーションで強制するよう促す MANUAL の注記とともに **レポートには保持** されます。 |
+| **主キー必須** | PK のないテーブルは **UNSUPPORTED** としてフラグ付けされます (ロードできません)。 |
+| **`TRUNCATE` なし** | 「置換」ロードでは `TRUNCATE` ではなく **DROP + 再作成** を使用します。 |
+| **トランザクションあたり 1 つの DDL** | Schema Conversion は実行単位ごとに正確に 1 つの DDL 文を出力します。 |
+| **`CREATE INDEX ASYNC`** | セカンダリインデックスはデータの後に非同期で作成されます。 |
+| **楽観的並行性制御** | すべてのバッチと DDL は `40001` リトライでラップされます。 |
+| **列のデフォルト値はサポートされます** | ソースの `DEFAULT` を引き継ぎます(`DEFAULT CURRENT_TIMESTAMP` を含む)。`TINYINT(1)` のデフォルトは `TRUE`/`FALSE` に変換され(`boolean` 列は `DEFAULT 1` を拒否します)、`DATETIME` のデフォルトはローダーが書き込む naive UTC の値と一致するよう UTC に固定され、`UUID()` は `gen_random_uuid()` になります。DSQL に対応がないデフォルトは黙って失われるのではなく、破棄して **報告** します。デフォルトの保持が最も重要なのは `NOT NULL` 列です: MySQL はその列を省略した `INSERT` を受け付けますが、ターゲットは拒否します。 |
+| **`ON UPDATE CURRENT_TIMESTAMP` なし** | 再現不可: DSQL には `ON UPDATE` 句も、(PostgreSQL で通常用いる回避策の)トリガーもありません。列は挿入時のデフォルトを保持し **MANUAL** としてフラグ付けされます — 更新時のタイムスタンプはアプリケーションで明示的に設定してください。 |
+| **トリガー / ストアドプロシージャ / イベントなし** | **UNSUPPORTED** としてフラグ付け — アプリケーションで再実装します (スケジュールイベントは EventBridge/Lambda で)。 |
+| **ネイティブパーティショニングなし** | DSQL が自動分散します。パーティション化されたテーブルは MANUAL としてフラグ付けされます。 |
+| **クラスターあたり 1 つのデータベース** | 複数データベースのソースは MANUAL としてフラグ付けされます (スキーマに統合するか、クラスターを分割します)。 |
+
+上の表の **クラス** 列は、Evaluation がすべてのオブジェクトに適用するのと同じ
+AUTO / MANUAL / UNSUPPORTED の尺度です — 各クラスの意味と、複数のルールが一致した場合に
+最も厳しいクラスが優先される仕組みについては
+[§2.1](#すべてのオブジェクトが-1-つの分類を受け取る) を参照してください。
 ---
 
 **次へ:** [3. Full Load →](03-full-load.md)

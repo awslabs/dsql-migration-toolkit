@@ -72,7 +72,7 @@ LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 1000
 - `BLOB`/`BINARY`/`VARBINARY` 계열 → `bytea`.
 
 전체 매핑(및 "외래 키 없음" 같은 DSQL 제약 처리)은
-[4장 §4.6](04-cdc-and-dsql-constraints.md#46-mysql--dsql-타입과-제약-처리-참조)과 Schema Conversion
+[2장 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-타입과-제약-처리-참조)과 Schema Conversion
 단계에 있습니다.
 
 ---

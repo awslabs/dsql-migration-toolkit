@@ -273,7 +273,7 @@ Here are the highlights:
 | `JSON` | `json` | |
 
 The **complete mapping for every type** (target DSQL type + stored value form) is in
-[Chapter 4 §4.6](04-cdc-and-dsql-constraints.md#46-mysql--dsql-type-and-constraint-handling-reference).
+[Chapter 2 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-type-and-constraint-handling-reference).
 The **Full Load loader and the CDC sink honor the identical mapping** (a shared
 write-contract test enforces it), so a row lands the same whichever path migrates it.
 

@@ -75,7 +75,7 @@ PK を要求するため、Evaluation でも `UNSUPPORTED` としてフラグ付
 - `BLOB`/`BINARY`/`VARBINARY` 系 → `bytea`。
 
 マッピングの全体(および「外部キーなし」のような DSQL 制約の扱い方)は
-[第 4 章 §4.6](04-cdc-and-dsql-constraints.md#46-mysql--dsql-の型と制約の処理-リファレンス)と
+[第 2 章 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-の型と制約の処理-リファレンス)と
 Schema Conversion ステップにあります。
 
 ---

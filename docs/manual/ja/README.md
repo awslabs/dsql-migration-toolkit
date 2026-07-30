@@ -46,7 +46,7 @@ Data Migration は **Full Load**（ツール独自のバルクローダー）と
 |---|---|---|
 | 0 | [Before you begin](00-before-you-begin.md) | 事前チェックリスト — 最初のステップから計画を左右する、必ず知っておくべき事実（同一リージョン限定、読み取り専用ソース、DSQL が省いている機能、CDC は任意・課金対象）。**ここから始めてください。** |
 | 1 | [Set up](01-setup.md) | 前提条件、ツールの実行方法（ローカルまたは AWS）、ソースとターゲットへの接続方法。 |
-| 2 | [Evaluation and Schema Conversion](02-evaluation-and-schema-conversion.md) | DSQL に移せるもの／移せないものをツールがどう評価するか（AUTO / MANUAL / UNSUPPORTED、工数見積り、名前の衝突）と、スキーマの変換・適用。 |
+| 2 | [Evaluation and Schema Conversion](02-evaluation-and-schema-conversion.md) | DSQL に移せるもの／移せないものをツールがどう評価するか（AUTO / MANUAL / UNSUPPORTED、工数見積り、名前の衝突）と、スキーマの変換・適用。完全な **MySQL → DSQL の型・制約リファレンス** を含みます。 |
 | 3 | [Full Load](03-full-load.md) | バルクスナップショットロードの動作: ストリーミング export、冪等なバッチロード、ウォーターマーク（watermark）、そして失敗をどう隔離するか。 |
 | 4 | [CDC and DSQL constraints](04-cdc-and-dsql-constraints.md) | ストリーミング CDC の動作、隙間のない Full Load → CDC ハンドオフ、そして DSQL の制約（FK なし、値あたり 1 MiB、OCC、IAM 認証）をデータ経路でどう扱うか。 |
 | 5 | [Validation](05-validation.md) | ターゲットがソースと一致することをツールがどう証明するか: 行数、チェックサム、PK 全体の突き合わせ、ライブソースのドリフト。 |

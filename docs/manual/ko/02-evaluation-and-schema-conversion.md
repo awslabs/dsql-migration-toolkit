@@ -143,7 +143,7 @@ SCT 같은 단계입니다:
 
 - **타입 매핑** — 전체 MySQL → DSQL 타입 표(`TINYINT(1)` → `boolean`, `BIT(n)` → 정수, `ENUM` →
   `text` + `CHECK`, `BLOB`/`BINARY` → `bytea` 등.
-  [4장 §4.6](04-cdc-and-dsql-constraints.md#46-mysql--dsql-타입과-제약-처리-참조) 참조).
+  아래 [§2.3](#23-mysql--dsql-타입과-제약-처리-참조) 참조).
 - **컬럼 기본값** — 소스 `DEFAULT`를 그대로 가져옵니다(Aurora DSQL이 지원하며,
   `DEFAULT CURRENT_TIMESTAMP`도 포함). 두 가지는 자동 변환됩니다: `TINYINT(1)` 기본값은 `boolean`
   타깃에 맞게 `TRUE`/`FALSE`로, `DATETIME` 기본값은 로더가 쓰는 naive UTC 값과 일치하도록 UTC로
@@ -176,6 +176,93 @@ Schema Conversion 후에는 **DSQL 타깃 스키마가 고정**됩니다. 이것
 스키마입니다. 한 가지 중요한 점은, CDC는 이후 소스 DDL을 **전파하지 않는다는** 것입니다. 따라서 CDC
 도중에 소스 스키마를 바꾸면, 동일한 DDL을 여기서 직접 다시 적용해야 합니다
 ([4장 §4.2](04-cdc-and-dsql-constraints.md#42-cdc는-스키마가-아니라-데이터를-복제--중요) 참조).
+
+## 2.3 MySQL → DSQL 타입과 제약 처리 (참조)
+
+Schema Conversion과 데이터 경로가 SQL 방언 차이를 메우기 위해 하는 일입니다. Full Load 값 변환기와 CDC
+싱크가 모두 따르는 동일한 매핑이며, 공유 "write contract"가 이 둘을 일치시킵니다.
+
+### 타입 매핑 (전체 참조)
+
+아래의 모든 MySQL 데이터 타입에 대해, Schema Conversion이 생성하는 대상 DDL 타입 **및**
+Aurora DSQL에 저장되는 값의 형태를 정리합니다. 두 마이그레이션 경로 — Full Load 벌크 로더(Python)와
+CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract** 패리티 테스트로 강제되므로 어느
+경로로 옮겨도 같은 소스 행이 동일하게 적재됩니다. 분류: **AUTO** = 자동·무손실, **MANUAL** = 변환되나
+검토/결정 필요, **UNSUPPORTED** = 자동 변환 불가(재설계).
+
+#### 정수 타입
+
+| MySQL 타입 | Aurora DSQL 타입 | 저장 값 형태 | 분류 | 비고 |
+|---|---|---|---|---|
+| `TINYINT` | `smallint` | `smallint` | AUTO | 부호 있는 8비트. |
+| `TINYINT(1)` | `boolean` | `boolean` (`true`/`false`) | MANUAL | MySQL boolean 관례; `0/1`→`false/true`. `{0,1}` **범위 밖의 값은 시끄럽게 실패**(조용한 평탄화 없음). |
+| `SMALLINT` | `smallint` | `smallint` | AUTO | 부호 있는 16비트. |
+| `MEDIUMINT` | `integer` | `integer` | AUTO | PostgreSQL에 3바이트 정수 없음; `integer`가 부호 있는 24비트 범위를 커버. |
+| `INT` / `INTEGER` | `integer` | `integer` | AUTO | 부호 있는 32비트. |
+| `BIGINT` | `bigint` | `bigint` | AUTO | 부호 있는 64비트. |
+| `TINYINT UNSIGNED` | `smallint` | `smallint` | AUTO | `0..255` 보존을 위해 확장. |
+| `SMALLINT UNSIGNED` | `integer` | `integer` | AUTO | `0..65535` 보존을 위해 확장. |
+| `MEDIUMINT UNSIGNED` | `integer` | `integer` | AUTO | `0..16M` 보존을 위해 확장. |
+| `INT UNSIGNED` | `bigint` | `bigint` | AUTO | `0..4.29B` 보존을 위해 확장. |
+| `BIGINT UNSIGNED` | `numeric(20,0)` | `numeric(20,0)` | AUTO | 더 넓은 정수 타입이 없음; `2^64-1` 전 범위 보존. (CDC는 `bigint.unsigned.handling.mode=precise` 필요.) |
+| `INT(11)`, `BIGINT(20)`, … (표시 폭) | bare `smallint`/`integer`/`bigint` | `smallint`/`integer`/`bigint` | AUTO | `(N)` 표시 폭은 **드롭**(MySQL에서 표시용; PostgreSQL 정수는 폭을 받지 않음). |
+| `BIT(n)` | `smallint`(n≤15) / `integer`(≤31) / `bigint`(≤63) / `numeric(20,0)`(64) | `smallint`/`integer`/`bigint`/`numeric(20,0)` | MANUAL | DSQL에 **`BIT` 타입 없음**; 비트 패턴이 나타내는 부호 없는 정수로 저장. |
+
+#### 고정소수점 & 부동소수점
+
+| MySQL 타입 | Aurora DSQL 타입 | 저장 값 형태 | 분류 | 비고 |
+|---|---|---|---|---|
+| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 정밀도/스케일 보존. **정밀도 > 38은 UNSUPPORTED**(DSQL은 NUMERIC을 38로 제한). |
+| `DECIMAL(p,s) UNSIGNED` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 부호 없음은 표현 불가하며 저장상 의미 없음. |
+| `FLOAT` | `real` | `real` | AUTO | 단정밀도 float. |
+| `FLOAT(M,D)` | `real` | `real` | AUTO | `(M,D)` 표시 스펙 드롭(PostgreSQL `float`은 스케일이 아닌 정밀도 하나만 받음). |
+| `DOUBLE` / `DOUBLE UNSIGNED` | `double precision` | `double precision` | AUTO | 배정밀도 float. |
+
+#### 날짜 & 시간
+
+| MySQL 타입 | Aurora DSQL 타입 | 저장 값 형태 | 분류 | 비고 |
+|---|---|---|---|---|
+| `DATE` | `date` | `date` | AUTO | |
+| `DATETIME` | `timestamp`(시간대 없음) | `timestamp` (UTC wall-clock) | AUTO | **UTC**로 취급/정규화. |
+| `DATETIME(6)` | `timestamp` | `timestamp` (UTC, microsecond precision) | AUTO | 소수 초를 마이크로초까지 보존. |
+| `TIMESTAMP` | `timestamptz` | `timestamptz` (UTC instant) | AUTO | 절대 UTC 시각으로 저장. |
+| `TIME` | `time`(시간대 없음) | `time` | AUTO | 범위 내 `00:00:00..23:59:59`. **범위 밖** MySQL `TIME`(음수 또는 `> 24h`, MySQL 범위 `-838:59:59..838:59:59`)은 `time` 표현이 없어 **시끄럽게 실패**(대신 `interval` 컬럼 필요). |
+| `YEAR` | `smallint` | `smallint` (integer year) | MANUAL | DSQL에 `YEAR` 타입 없음; `1901–2155`가 `smallint`에 들어가며 정수 연도로 저장(`YEAR` 표시 의미는 보존 안 됨). |
+
+#### 문자열, 바이너리, 구조화
+
+| MySQL 타입 | Aurora DSQL 타입 | 저장 값 형태 | 분류 | 비고 |
+|---|---|---|---|---|
+| `CHAR(n)` | `char(n)` | `char(n)` | AUTO | |
+| `VARCHAR(n)` | `varchar(n)` | `varchar(n)` | AUTO | |
+| `TINYTEXT`/`TEXT`/`MEDIUMTEXT`/`LONGTEXT` | `text` | `text` | AUTO | 단일 값 **> ~1 MiB**는 DSQL이 거부 → 행 단위 격리(Full Load) / DLQ(CDC); 초대형 LOB 컬럼은 Evaluation에서 플래그. |
+| `COLLATE`(예: `utf8mb4_*_ci`)가 있는 `CHAR`/`VARCHAR`/`TEXT` | 동일, **collation 드롭** | `text` (collation dropped) | MANUAL | DSQL은 기본 collation 사용; 대소문자 무시 collation은 보존 안 됨 → MANUAL 플래그. |
+| `BINARY(n)` / `VARBINARY(n)` | `bytea` | `bytea` (raw bytes) | AUTO | 길이 수식어 드롭(PostgreSQL `bytea`는 받지 않음). |
+| `TINYBLOB`/`BLOB`/`MEDIUMBLOB`/`LONGBLOB` | `bytea` | `bytea` (raw bytes) | AUTO | 바이너리 페이로드를 바이트 단위로 보존. |
+| `ENUM('a','b',…)` | `text` + `CHECK (col IN ('a','b',…))` | `text` | MANUAL | DSQL에 `ENUM` 없음; 순서 의미 보존 안 됨. |
+| `SET('x','y',…)` | `text` | `text` (comma-joined) | MANUAL | 무손실 매핑 없음; 다중 값 set 의미는 앱에서 처리. |
+| `JSON` | `json` | `json` | AUTO | (CDC는 JSON 텍스트를 `PGobject(type=json)`로 감싸 `json` 컬럼을 타겟팅.) |
+| 공간(`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL에 공간 타입 없음; 데이터는 원시 WKB 바이트로 **보존**(Full Load는 `ST_AsBinary(col)`, CDC는 Debezium geometry의 `.wkb` 추출; **SRID는 드롭**). `geometry` *컬럼 타입* 자체는 UNSUPPORTED로 플래그되지만 값은 손실되지 않음. |
+
+### 구조적 제약
+
+| DSQL 규칙 | 도구 동작 |
+|---|---|
+| **외래 키 없음** | FK 정의는 DDL에서 제거하되 **리포트에 보존**, 무결성을 앱에서 강제하라는 MANUAL 노트. |
+| **기본 키 필수** | PK 없는 테이블은 **UNSUPPORTED**(적재 불가). |
+| **`TRUNCATE` 없음** | "교체" 적재는 **DROP + 재생성**, `TRUNCATE` 사용 안 함. |
+| **트랜잭션당 한 개 DDL** | 스키마 변환은 실행 단위당 정확히 한 개 DDL 문을 내보냄. |
+| **`CREATE INDEX ASYNC`** | 보조 인덱스를 데이터 적재 후 비동기로 생성. |
+| **낙관적 동시성** | 모든 배치·DDL을 `40001` 재시도로 감쌈. |
+| **컬럼 기본값은 지원됨** | 소스 `DEFAULT`를 그대로 가져옵니다(`DEFAULT CURRENT_TIMESTAMP` 포함). `TINYINT(1)` 기본값은 `TRUE`/`FALSE`로 변환하고(`boolean` 컬럼은 `DEFAULT 1`을 거부), `DATETIME` 기본값은 로더가 쓰는 naive UTC 값과 맞도록 UTC로 고정하며, `UUID()`는 `gen_random_uuid()`가 됩니다. DSQL에 대응이 없는 기본값은 조용히 사라지지 않고 드롭 + **보고**됩니다. 기본값 보존이 가장 중요한 경우는 `NOT NULL` 컬럼입니다: MySQL은 해당 컬럼을 생략한 `INSERT`를 받아주지만 타깃은 거부합니다. |
+| **`ON UPDATE CURRENT_TIMESTAMP` 없음** | 재현 불가: DSQL에는 `ON UPDATE` 절도, (PostgreSQL의 통상적 우회책인) 트리거도 없습니다. 컬럼은 삽입 시점 기본값을 유지하고 **MANUAL**로 표시됩니다 — 갱신 시 타임스탬프를 애플리케이션에서 명시적으로 설정하세요. |
+| **트리거/저장 프로시저/이벤트 없음** | **UNSUPPORTED** — 애플리케이션으로 재구현(스케줄 이벤트는 EventBridge/Lambda). |
+| **네이티브 파티셔닝 없음** | DSQL이 자동 분산; 파티션 테이블은 MANUAL. |
+| **클러스터당 하나의 DB** | 다중 DB 소스는 MANUAL(스키마로 통합하거나 클러스터 분리). |
+
+위 표의 **분류** 열은 Evaluation이 모든 객체에 적용하는 것과 같은 AUTO / MANUAL / UNSUPPORTED
+척도입니다 — 각 분류의 의미와, 여러 규칙이 겹칠 때 가장 엄격한 분류가 이기는 방식은
+[§2.1](#모든-객체가-하나의-분류를-받음)을 참고하세요.
 
 ---
 

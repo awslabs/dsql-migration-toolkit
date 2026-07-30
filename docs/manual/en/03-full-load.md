@@ -79,7 +79,7 @@ examples MySQL users should know:
 - `BLOB`/`BINARY`/`VARBINARY` family → `bytea`.
 
 The full mapping (and how DSQL constraints like "no foreign keys" are handled)
-lives in [Chapter 4 §4.6](04-cdc-and-dsql-constraints.md#46-mysql--dsql-type-and-constraint-handling-reference)
+lives in [Chapter 2 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-type-and-constraint-handling-reference)
 and the Schema Conversion step.
 
 ---

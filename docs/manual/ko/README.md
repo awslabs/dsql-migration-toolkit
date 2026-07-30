@@ -35,7 +35,7 @@ Data Migration은 **Full Load**(도구 자체의 벌크 로더)와, 선택적으
 |---|---|---|
 | 0 | [시작하기 전에](00-before-you-begin.md) | 사전 점검 체크리스트 — 첫 단계부터 계획을 좌우하는 반드시 알아야 할 사실(동일 리전 필수, 읽기 전용 소스, DSQL이 제외한 기능, CDC는 선택·과금). **여기서 시작하세요.** |
 | 1 | [설정](01-setup.md) | 사전 요구사항, 도구 실행 방법(로컬 또는 AWS), 소스/타깃 연결 방법. |
-| 2 | [Evaluation과 Schema Conversion](02-evaluation-and-schema-conversion.md) | DSQL로 옮길 수 있는 것/없는 것을 평가하는 방식(AUTO / MANUAL / UNSUPPORTED, 작업량 추정, 이름 충돌)과 스키마 변환·적용. |
+| 2 | [Evaluation과 Schema Conversion](02-evaluation-and-schema-conversion.md) | DSQL로 옮길 수 있는 것/없는 것을 평가하는 방식(AUTO / MANUAL / UNSUPPORTED, 작업량 추정, 이름 충돌)과 스키마 변환·적용. 완전한 **MySQL → DSQL 타입·제약 참조**를 포함합니다. |
 | 3 | [Full Load](03-full-load.md) | 벌크 스냅샷 로드 동작 방식: 스트리밍 export, 다시 적용해도 안전한 배치 로드, 워터마크, 실패 격리 방식. |
 | 4 | [CDC와 DSQL 제약](04-cdc-and-dsql-constraints.md) | 스트리밍 CDC 동작, 무손실 Full Load → CDC 핸드오프, 그리고 DSQL 제약(FK 없음, 1 MiB 값 한도, OCC, IAM 인증)을 데이터 경로에서 처리하는 방식. |
 | 5 | [Validation](05-validation.md) | 타깃이 소스와 일치함을 증명하는 방식: 행 수, 체크섬, 전체 PK 대조, 라이브 소스 드리프트. |

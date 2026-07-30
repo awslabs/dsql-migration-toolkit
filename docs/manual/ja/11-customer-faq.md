@@ -253,7 +253,7 @@ Evaluation は **すべてのオブジェクト** を、**AUTO**（自動的に�
 | `JSON` | `json` | |
 
 **すべての型についての完全なマッピング**（ターゲット DSQL 型 + 格納される値の形式）は、
-[第4章 §4.6](04-cdc-and-dsql-constraints.md#46-mysql--dsql-の型と制約の処理-リファレンス) にあります。
+[第 2 章 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-の型と制約の処理-リファレンス) にあります。
 **Full Load ローダーと CDC シンクは同一のマッピングに従う**（共有の write-contract テストがそれを強制）ため、
 どちらのパスで移行しても、行は同じように着地します。
 

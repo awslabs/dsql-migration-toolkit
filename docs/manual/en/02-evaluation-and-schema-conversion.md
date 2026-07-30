@@ -170,7 +170,7 @@ handles the dialect and constraint bridging automatically:
 
 - **Type mapping** — the full MySQL → DSQL type table (`TINYINT(1)` → `boolean`,
   `BIT(n)` → integer, `ENUM` → `text` + `CHECK`, `BLOB`/`BINARY` → `bytea`, etc.;
-  see [Chapter 4 §4.6](04-cdc-and-dsql-constraints.md#46-mysql--dsql-type-and-constraint-handling-reference)).
+  see [§2.3](#23-mysql--dsql-type-and-constraint-handling-reference) below).
 - **Column defaults** — a source `DEFAULT` is carried across (Aurora DSQL supports
   them), including `DEFAULT CURRENT_TIMESTAMP`. Two translations happen for you:
   a `TINYINT(1)` default becomes `TRUE`/`FALSE` for the `boolean` target, and a
@@ -219,6 +219,96 @@ Full Load writes into and the schema CDC streams into — and, importantly, CDC 
 **not** propagate later source DDL, so if you change the source schema during CDC
 you must re-apply the equivalent DDL here yourself (see
 [Chapter 4 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)).
+
+## 2.3 MySQL → DSQL type and constraint handling (reference)
+
+This is what Schema Conversion and the data path do to bridge the dialects. It's
+the same mapping the Full Load value converter and the CDC sink both honor (a
+shared "write contract" keeps them identical).
+
+### Type mapping (complete reference)
+
+Every MySQL data type below is what Schema Conversion emits as the target DDL
+type **and** how the value is stored on Aurora DSQL. Both migration paths honor
+the same mapping — the Full Load bulk loader (Python) and the CDC sink (Java) —
+enforced by a shared **write-contract** parity test, so the same source row lands
+identically whichever path migrates it. Class: **AUTO** = automatic, lossless;
+**MANUAL** = converts but review/decision needed; **UNSUPPORTED** = no automatic
+conversion (redesign).
+
+#### Integer types
+
+| MySQL type | Aurora DSQL type | Stored value form | Class | Note |
+|---|---|---|---|---|
+| `TINYINT` | `smallint` | `smallint` | AUTO | Signed 8-bit. |
+| `TINYINT(1)` | `boolean` | `boolean` (`true`/`false`) | MANUAL | MySQL boolean convention; `0/1`→`false/true`. A value **outside `{0,1}` fails loudly** (no silent flatten). |
+| `SMALLINT` | `smallint` | `smallint` | AUTO | Signed 16-bit. |
+| `MEDIUMINT` | `integer` | `integer` | AUTO | PostgreSQL has no 3-byte int; `integer` covers the signed 24-bit range. |
+| `INT` / `INTEGER` | `integer` | `integer` | AUTO | Signed 32-bit. |
+| `BIGINT` | `bigint` | `bigint` | AUTO | Signed 64-bit. |
+| `TINYINT UNSIGNED` | `smallint` | `smallint` | AUTO | Widened to preserve `0..255`. |
+| `SMALLINT UNSIGNED` | `integer` | `integer` | AUTO | Widened to preserve `0..65535`. |
+| `MEDIUMINT UNSIGNED` | `integer` | `integer` | AUTO | Widened to preserve `0..16M`. |
+| `INT UNSIGNED` | `bigint` | `bigint` | AUTO | Widened to preserve `0..4.29B`. |
+| `BIGINT UNSIGNED` | `numeric(20,0)` | `numeric(20,0)` | AUTO | No wider integer exists; full `2^64-1` range preserved. (CDC needs `bigint.unsigned.handling.mode=precise`.) |
+| `INT(11)`, `BIGINT(20)`, … (display width) | bare `smallint`/`integer`/`bigint` | `smallint`/`integer`/`bigint` | AUTO | The `(N)` display width is **dropped** (cosmetic in MySQL; PostgreSQL integers take no width). |
+| `BIT(n)` | `smallint` (n≤15) / `integer` (≤31) / `bigint` (≤63) / `numeric(20,0)` (64) | `smallint`/`integer`/`bigint`/`numeric(20,0)` | MANUAL | DSQL has **no `BIT` type**; the bit pattern is stored as the unsigned integer it represents. |
+
+#### Fixed-point & floating-point
+
+| MySQL type | Aurora DSQL type | Stored value form | Class | Note |
+|---|---|---|---|---|
+| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | Precision/scale preserved. **Precision > 38 is UNSUPPORTED** (DSQL caps NUMERIC at 38). |
+| `DECIMAL(p,s) UNSIGNED` | `numeric(p,s)` | `numeric(p,s)` | AUTO | Unsigned-ness is not representable and carries no storage meaning. |
+| `FLOAT` | `real` | `real` | AUTO | Single-precision float. |
+| `FLOAT(M,D)` | `real` | `real` | AUTO | The `(M,D)` display spec is dropped (PostgreSQL `float` takes one precision, not a scale). |
+| `DOUBLE` / `DOUBLE UNSIGNED` | `double precision` | `double precision` | AUTO | Double-precision float. |
+
+#### Date & time
+
+| MySQL type | Aurora DSQL type | Stored value form | Class | Note |
+|---|---|---|---|---|
+| `DATE` | `date` | `date` | AUTO | |
+| `DATETIME` | `timestamp` (without time zone) | `timestamp` (UTC wall-clock) | AUTO | Treated/normalized as **UTC**. |
+| `DATETIME(6)` | `timestamp` | `timestamp` (UTC, microsecond precision) | AUTO | Fractional seconds preserved to microseconds. |
+| `TIMESTAMP` | `timestamptz` | `timestamptz` (UTC instant) | AUTO | Stored as an absolute UTC instant. |
+| `TIME` | `time` (without time zone) | `time` | AUTO | In-range `00:00:00..23:59:59`. An **out-of-range** MySQL `TIME` (negative or `> 24h`, MySQL range `-838:59:59..838:59:59`) has no `time` representation → **fails loudly** (needs an `interval` column instead). |
+| `YEAR` | `smallint` | `smallint` (integer year) | MANUAL | DSQL has no `YEAR` type; `1901–2155` fits `smallint`, stored as the integer year (`YEAR` display semantics not preserved). |
+
+#### Strings, binary, and structured
+
+| MySQL type | Aurora DSQL type | Stored value form | Class | Note |
+|---|---|---|---|---|
+| `CHAR(n)` | `char(n)` | `char(n)` | AUTO | |
+| `VARCHAR(n)` | `varchar(n)` | `varchar(n)` | AUTO | |
+| `TINYTEXT`/`TEXT`/`MEDIUMTEXT`/`LONGTEXT` | `text` | `text` | AUTO | A single value **> ~1 MiB** is rejected by DSQL → per-row quarantine (Full Load) / DLQ (CDC); flag oversized LOB columns at Evaluation. |
+| `CHAR`/`VARCHAR`/`TEXT` with `COLLATE` (e.g. `utf8mb4_*_ci`) | same, **collation dropped** | `text` (collation dropped) | MANUAL | DSQL uses its default collation; a case-insensitive collation is not preserved → flagged MANUAL. |
+| `BINARY(n)` / `VARBINARY(n)` | `bytea` | `bytea` (raw bytes) | AUTO | The length modifier is dropped (PostgreSQL `bytea` takes none). |
+| `TINYBLOB`/`BLOB`/`MEDIUMBLOB`/`LONGBLOB` | `bytea` | `bytea` (raw bytes) | AUTO | Binary payload preserved byte-for-byte. |
+| `ENUM('a','b',…)` | `text` + `CHECK (col IN ('a','b',…))` | `text` | MANUAL | DSQL has no `ENUM`; ordering semantics not preserved. |
+| `SET('x','y',…)` | `text` | `text` (comma-joined) | MANUAL | No lossless mapping; multi-value set semantics handled in the app. |
+| `JSON` | `json` | `json` | AUTO | (CDC wraps the JSON text in a `PGobject(type=json)` so it targets the `json` column.) |
+| spatial (`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL has no spatial type; the data is **preserved** as raw WKB bytes (Full Load reads `ST_AsBinary(col)`, CDC extracts Debezium geometry's `.wkb`; **SRID is dropped**). The `geometry` *column type* itself is flagged UNSUPPORTED, but the values are not lost. |
+
+### Structural constraints
+
+| DSQL rule | What the tool does |
+|---|---|
+| **No foreign keys** | FK definitions are removed from the DDL but **preserved in the report**, with a MANUAL note to enforce referential integrity in your application. |
+| **Primary key required** | A table with no PK is flagged **UNSUPPORTED** (and can't be loaded). |
+| **No `TRUNCATE`** | "Replace" loads use **DROP + recreate**, never `TRUNCATE`. |
+| **One DDL per transaction** | Schema conversion emits exactly one DDL statement per execution unit. |
+| **`CREATE INDEX ASYNC`** | Secondary indexes are created asynchronously, after data. |
+| **Optimistic concurrency** | Every batch and DDL is wrapped in `40001` retry. |
+| **Column defaults ARE supported** | A source `DEFAULT` is carried across, including `DEFAULT CURRENT_TIMESTAMP`. `TINYINT(1)` defaults become `TRUE`/`FALSE` (a `boolean` column rejects `DEFAULT 1`), a `DATETIME` default is pinned to UTC to match the loader's naive-UTC values, and `UUID()` becomes `gen_random_uuid()`. A default with no DSQL equivalent is dropped and **reported**, never silently lost. Keeping the default matters most on a `NOT NULL` column: MySQL accepts an `INSERT` that omits it, the target would not. |
+| **No `ON UPDATE CURRENT_TIMESTAMP`** | Unreproducible: DSQL has neither an `ON UPDATE` clause nor triggers (the usual PostgreSQL workaround). The column keeps its insert-time default and is flagged **MANUAL** — set the timestamp explicitly on update in your application. |
+| **No triggers / stored procedures / events** | Flagged **UNSUPPORTED** — reimplement in the application (or EventBridge/Lambda for scheduled events). |
+| **No native partitioning** | DSQL auto-distributes; partitioned tables are flagged MANUAL. |
+| **One database per cluster** | A multi-database source is flagged MANUAL (consolidate into schemas or split clusters). |
+
+The **Class** column above uses the same AUTO / MANUAL / UNSUPPORTED scale Evaluation
+applies to every object — see [§2.1](#every-object-gets-one-classification) for what each
+one means and how the most demanding class wins when several rules match.
 
 ---
 
