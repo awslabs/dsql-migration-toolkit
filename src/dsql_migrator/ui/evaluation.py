@@ -47,7 +47,7 @@ from dsql_migrator.core.activity_log import (
     ActivityStatus,
     log_activity,
 )
-from dsql_migrator.core.assessor import CompatibilityAssessor
+from dsql_migrator.core.assessor import KIND_LABELS, CompatibilityAssessor
 from dsql_migrator.core.assessor import export_report as export_assessment_report
 from dsql_migrator.core.assessor import render_html_report
 from dsql_migrator.core.introspector import SourceIntrospector
@@ -522,16 +522,49 @@ _KIND_DISPLAY_ORDER = (
 )
 
 # Friendly, pluralized section labels for the known object kinds.
-_KIND_LABELS = {
-    "TABLE": "Tables",
-    "VIEW": "Views",
-    "TRIGGER": "Triggers",
-    "ROUTINE": "Routines",
-    "PROCEDURE": "Stored procedures",
-    "FUNCTION": "Functions",
-    "EVENT": "Events",
-    "DATABASE": "Database / cluster-level",
-}
+# Imported from core.assessor so the list headings, the UI chart axis and the HTML export
+# all read from one map; kept under the old name for the existing call sites.
+_KIND_LABELS = KIND_LABELS
+
+
+def source_inventory_tallies(inventory) -> list[tuple[str, int]]:
+    """Per-kind source object counts for the tally row, in the assessed list's vocabulary.
+
+    Routines are split into stored procedures and functions rather than counted as one
+    "Routines" tile. MySQL itself groups both under ``information_schema.ROUTINES``, so the
+    inventory field is named correctly -- but the assessment splits them (DSQL treats them
+    differently: a ``LANGUAGE SQL`` function can survive where plpgsql cannot), and the list
+    and chart below therefore say "Stored procedures" and "Functions". A tile reading
+    "3 Routines" left the reader hunting for a heading that does not exist.
+
+    Labels come from :data:`_KIND_LABELS`, the same source the group headings use, so the
+    two cannot drift. A kind with no objects is dropped -- an all-zero tile is noise --
+    except that Tables always shows, since a source with no tables is itself worth seeing.
+    """
+    routines = list(getattr(inventory, "routines", None) or [])
+    subtype_counts: dict[str, int] = {}
+    for routine in routines:
+        object_type = getattr(routine, "object_type", None)
+        value = getattr(object_type, "value", None) or "ROUTINE"
+        # Anything without a recognised subtype falls back to the generic ROUTINE kind,
+        # matching how the assessor categorises it.
+        key = value if value in ("PROCEDURE", "FUNCTION") else "ROUTINE"
+        subtype_counts[key] = subtype_counts.get(key, 0) + 1
+
+    tallies = [
+        ("TABLE", len(inventory.tables)),
+        ("VIEW", len(inventory.views)),
+        ("TRIGGER", len(inventory.triggers)),
+        ("PROCEDURE", subtype_counts.get("PROCEDURE", 0)),
+        ("FUNCTION", subtype_counts.get("FUNCTION", 0)),
+        ("ROUTINE", subtype_counts.get("ROUTINE", 0)),
+        ("EVENT", len(inventory.events)),
+    ]
+    return [
+        (kind_section_label(kind), count)
+        for kind, count in tallies
+        if count or kind == "TABLE"
+    ]
 
 
 def group_assessment_items_by_kind(items: list) -> list[tuple[str, list]]:
@@ -1229,13 +1262,7 @@ def _render_result(
         # Source object counts (moved here from a separate "Source inventory"
         # section): a compact per-kind tally above the assessed object list.
         with ui.row().classes("items-center gap-2 flex-wrap"):  # type: ignore[attr-defined]
-            for label, count in (
-                ("Tables", len(inventory.tables)),
-                ("Views", len(inventory.views)),
-                ("Triggers", len(inventory.triggers)),
-                ("Routines", len(inventory.routines)),
-                ("Events", len(inventory.events)),
-            ):
+            for label, count in source_inventory_tallies(inventory):
                 with ui.row().classes(  # type: ignore[attr-defined]
                     "items-baseline gap-1 rounded bg-gray-100 px-3 py-1"
                 ):
@@ -1378,7 +1405,14 @@ def _render_assessment_chart(ui: object, report: AssessmentReport) -> None:
         "legend": {"top": 0, "data": labels},
         "grid": {"left": 110, "right": 30, "top": 40, "bottom": 30},
         "xAxis": {"type": "value", "minInterval": 1},
-        "yAxis": {"type": "category", "data": data.kinds, "inverse": True},
+        # Friendly labels, matching the list headings below and the HTML export's chart --
+        # the axis used to show the raw enum ("PROCEDURE") beside a heading reading
+        # "Stored procedures".
+        "yAxis": {
+            "type": "category",
+            "data": [kind_section_label(kind) for kind in data.kinds],
+            "inverse": True,
+        },
         "series": [
             {
                 "name": _CLASS_CHART_LABELS[cls],
@@ -1913,6 +1947,7 @@ __all__ = [
     "chat_turns_remaining",
     "filter_assessment_items",
     "sort_assessment_items",
+    "source_inventory_tallies",
     "group_assessment_items_by_kind",
     "assessment_kind_summary",
     "assessment_concern_counts",

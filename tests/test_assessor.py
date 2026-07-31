@@ -1286,7 +1286,8 @@ def test_html_chart_lists_kinds_largest_first() -> None:
     ]
     markup = render_html_report(AssessmentReport.from_items(items))
     labels = re.findall(r'<div class="bar-label">([^<]+)</div>', markup)
-    assert labels == ["TABLE", "TRIGGER"]
+    # Friendly labels, the same words the Evaluation list headings use -- not the raw enum.
+    assert labels == ["Tables", "Triggers"]
 
 def test_advisory_finding_does_not_inflate_the_effort_estimate() -> None:
     """Effort answers "how much work must I do", so optional advice must not raise it.

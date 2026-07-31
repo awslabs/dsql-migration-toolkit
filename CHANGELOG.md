@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.180
+
+### Fixed
+
+- **One object kind is no longer named two ways on the same screen.** The source tally read
+  `3 Routines` while the list and chart below split the very same objects into
+  **Stored procedures** and **Functions** — so a reader counted three of something whose
+  heading does not exist. MySQL does group both under `information_schema.ROUTINES`, so the
+  inventory field is named correctly; the assessment splits them because DSQL treats them
+  differently (a `LANGUAGE SQL` function can survive where plpgsql cannot). The tally now
+  speaks the list's vocabulary: `2 Stored procedures · 1 Functions`, falling back to
+  `Routines` only when a subtype is genuinely unknown, and empty kinds are dropped instead of
+  showing a zero tile.
+- **The chart axes showed raw enum values.** Both the UI chart and the HTML export's chart
+  labeled their bars `PROCEDURE` / `FUNCTION` beside a list heading reading
+  `Stored procedures` — the same mismatch, one row lower. The label map moved from the UI
+  into `core/assessor.py` (`KIND_LABELS`), so the list headings, both charts and the tally
+  now read from a single source; a test asserts the UI holds the same object, not a copy.
+
 ## v0.1.179
 
 ### Changed

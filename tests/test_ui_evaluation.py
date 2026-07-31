@@ -1112,12 +1112,15 @@ def test_ui_chart_and_html_export_agree_on_kind_order() -> None:
             kind="TRIGGER",
         ),
     ]
+    from dsql_migrator.ui.evaluation import kind_section_label
+
     report = AssessmentReport.from_items(items)
-    ui_order = build_assessment_chart_data(report).kinds
+    # build_assessment_chart_data carries raw kinds; both charts label them for display.
+    ui_order = [kind_section_label(k) for k in build_assessment_chart_data(report).kinds]
     html_order = re.findall(
         r'<div class="bar-label">([^<]+)</div>', render_html_report(report)
     )
-    assert ui_order == html_order == ["TABLE", "PROCEDURE", "TRIGGER"]
+    assert ui_order == html_order == ["Tables", "Stored procedures", "Triggers"]
 
 
 def _mixed_effort_report():
@@ -1499,3 +1502,127 @@ def test_a_cluster_level_row_renders_like_every_table_row() -> None:
     assert any("bg-green-50" in c for c in ui.classes), "needs the fix panel"
     # NOT the legacy fallback, which emitted a bare "Rule: X" line.
     assert not any(t.startswith("Rule: ") for t in ui.texts), ui.texts
+
+
+def test_source_tallies_use_the_same_words_as_the_assessed_list() -> None:
+    """A tile reading "3 Routines" sent the reader hunting for a heading that never exists.
+
+    MySQL groups procedures and functions under information_schema.ROUTINES, so the
+    inventory field is named correctly -- but the assessment splits them (DSQL treats them
+    differently), and the list and chart below say "Stored procedures" and "Functions". The
+    tally row must speak the vocabulary of the list it summarises.
+    """
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.core.models import ObjectRef, ObjectType, SourceInventory
+    from dsql_migrator.ui.evaluation import (
+        group_assessment_items_by_kind,
+        kind_section_label,
+        source_inventory_tallies,
+        sort_assessment_items,
+    )
+
+    inventory = SourceInventory(
+        routines=[
+            ObjectRef(name="sp_a", object_type=ObjectType.PROCEDURE),
+            ObjectRef(name="sp_b", object_type=ObjectType.PROCEDURE),
+            ObjectRef(name="fn_x", object_type=ObjectType.FUNCTION),
+        ]
+    )
+    tiles = dict(source_inventory_tallies(inventory))
+    assert tiles.get("Stored procedures") == 2, tiles
+    assert tiles.get("Functions") == 1, tiles
+    # The generic term is gone when the subtypes are known.
+    assert "Routines" not in tiles, tiles
+
+    # Every tile label must match a heading the assessed list actually renders.
+    report = CompatibilityAssessor().assess(inventory)
+    headings = {
+        kind_section_label(kind)
+        for kind, _items in group_assessment_items_by_kind(
+            sort_assessment_items(report.items)
+        )
+    }
+    for label, count in source_inventory_tallies(inventory):
+        if count:
+            assert label in headings, (label, headings)
+
+
+def test_source_tallies_fall_back_to_routines_without_a_subtype() -> None:
+    # A routine collected without PROCEDURE/FUNCTION keeps the generic kind, matching how
+    # the assessor categorises it -- dropping it would hide an object.
+    from dsql_migrator.core.models import ObjectRef, ObjectType, SourceInventory
+    from dsql_migrator.ui.evaluation import source_inventory_tallies
+
+    tiles = dict(
+        source_inventory_tallies(
+            SourceInventory(
+                routines=[ObjectRef(name="r", object_type=ObjectType.ROUTINE)]
+            )
+        )
+    )
+    assert tiles.get("Routines") == 1, tiles
+
+
+def test_source_tallies_drop_empty_kinds_but_always_show_tables() -> None:
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef
+    from dsql_migrator.ui.evaluation import source_inventory_tallies
+
+    # Nothing but tables: no zero tiles for views/triggers/routines/events.
+    only_tables = SourceInventory(
+        tables=[
+            TableDef(
+                name="t",
+                columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                primary_key=["id"],
+            )
+        ]
+    )
+    assert source_inventory_tallies(only_tables) == [("Tables", 1)]
+    # An empty source still says so, rather than rendering an empty row.
+    assert source_inventory_tallies(SourceInventory()) == [("Tables", 0)]
+
+
+def test_one_kind_label_map_serves_the_list_the_chart_and_the_export() -> None:
+    """The same object must not be named two ways on one screen.
+
+    The map was UI-only, so the chart axes showed the raw enum ("PROCEDURE") beside a list
+    heading reading "Stored procedures", and the HTML export's chart did the same. It now
+    lives in core.assessor and all three read from it.
+    """
+    from dsql_migrator.core import assessor
+    from dsql_migrator.ui import evaluation
+
+    # Not a copy -- the same object, so an edit cannot reach one surface and miss another.
+    assert evaluation._KIND_LABELS is assessor.KIND_LABELS
+    # Both label helpers agree, including the fallback for an unknown kind.
+    for kind in list(assessor.KIND_LABELS) + ["SEQUENCE"]:
+        assert evaluation.kind_section_label(kind) == assessor.kind_label(kind), kind
+    # The label that motivated this: MySQL's ROUTINES splits into these two.
+    assert assessor.KIND_LABELS["PROCEDURE"] == "Stored procedures"
+    assert assessor.KIND_LABELS["FUNCTION"] == "Functions"
+
+
+def test_ui_chart_axis_uses_friendly_kind_labels() -> None:
+    from dsql_migrator.core.models import AssessmentItem, AssessmentReport
+    from dsql_migrator.ui.evaluation import _render_assessment_chart
+
+    report = AssessmentReport.from_items(
+        [
+            AssessmentItem(
+                object_name="sp",
+                rule_id="PROC_PLPGSQL",
+                classification=Classification.UNSUPPORTED,
+                kind="PROCEDURE",
+            )
+        ]
+    )
+
+    captured = {}
+
+    class _ChartUi(_ItemUi):
+        def echart(self, option, *_a, **_k):
+            captured["option"] = option
+            return self._el()
+
+    _render_assessment_chart(_ChartUi(), report)
+    assert captured["option"]["yAxis"]["data"] == ["Stored procedures"], captured

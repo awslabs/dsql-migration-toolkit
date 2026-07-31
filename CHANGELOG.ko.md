@@ -5,6 +5,23 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.180
+
+### Fixed
+
+- **같은 화면에서 한 객체 종류를 두 가지로 부르지 않습니다.** 상단 집계는 `3 Routines`인데 아래
+  목록과 차트는 바로 그 객체들을 **Stored procedures**와 **Functions**로 나눠 보여줬습니다 — 존재
+  하지 않는 헤딩의 개수를 세게 만든 셈입니다. MySQL은 실제로 둘을
+  `information_schema.ROUTINES`로 묶으므로 인벤토리 필드명은 정확합니다. 평가 쪽이 나누는 이유는
+  DSQL이 둘을 다르게 다루기 때문입니다(`LANGUAGE SQL` 함수는 살아남을 수 있지만 plpgsql은 불가).
+  이제 집계가 목록의 어휘를 씁니다 — `2 Stored procedures · 1 Functions`. 서브타입을 정말 알 수
+  없을 때만 `Routines`로 표시하고, 개수가 0인 종류는 타일을 만들지 않습니다.
+- **차트 축이 원시 enum 값을 보여줬습니다.** UI 차트와 HTML 내보내기 차트 모두 막대를
+  `PROCEDURE` / `FUNCTION`으로 표시하면서 바로 아래 목록 헤딩은 `Stored procedures`였습니다 —
+  같은 불일치가 한 줄 아래에 있었던 것입니다. 라벨 맵을 UI에서 `core/assessor.py`
+  (`KIND_LABELS`)로 옮겨, 목록 헤딩·두 차트·집계가 모두 하나의 출처를 읽습니다. UI가 복사본이
+  아니라 같은 객체를 갖는다는 것도 테스트로 고정했습니다.
+
 ## v0.1.179
 
 ### Changed

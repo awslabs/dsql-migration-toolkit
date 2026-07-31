@@ -74,6 +74,28 @@ KIND_PROCEDURE = "procedure"
 KIND_FUNCTION = "function"
 KIND_EVENT = "event"
 
+# User-facing label per object kind. Lives here, beside the KIND_* constants, because all
+# three surfaces need it: the Evaluation list headings, the UI chart axis and the HTML
+# export's chart. It was UI-only, so the chart axes showed the raw enum ("PROCEDURE") while
+# the list beside them said "Stored procedures" -- the same object named two ways on one
+# screen.
+KIND_LABELS: dict[str, str] = {
+    "TABLE": "Tables",
+    "VIEW": "Views",
+    "TRIGGER": "Triggers",
+    "ROUTINE": "Routines",
+    "PROCEDURE": "Stored procedures",
+    "FUNCTION": "Functions",
+    "EVENT": "Events",
+    "DATABASE": "Database / cluster-level",
+}
+
+
+def kind_label(kind: str) -> str:
+    """Return the friendly label for an object ``kind`` (unknown kinds title-case)."""
+    return KIND_LABELS.get(kind, kind.title())
+
+
 # Map a collected routine's subtype to the assessment kind so stored procedures
 # and functions are categorized separately (a generic routine falls back).
 _ROUTINE_KIND_BY_TYPE: dict[ObjectType, str] = {
@@ -1525,7 +1547,7 @@ def _render_html_chart(report: AssessmentReport) -> str:
             meta += f" &middot; {round(attention / total * 100)}% need attention"
         rows.append(
             '<div class="bar-row">'
-            f'<div class="bar-label">{html.escape(kind)}</div>'
+            f'<div class="bar-label">{html.escape(kind_label(kind))}</div>'
             f'<div class="bar">{bars}</div>'
             f'<div class="bar-meta">{meta}</div>'
             "</div>"
@@ -1900,6 +1922,8 @@ __all__ = [
     "render_html_report",
     "export_report",
     "classification_stats_by_kind",
+    "KIND_LABELS",
+    "kind_label",
     "KIND_TABLE",
     "KIND_VIEW",
     "KIND_TRIGGER",
