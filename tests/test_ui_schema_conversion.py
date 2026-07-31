@@ -2397,3 +2397,95 @@ def test_ddl_comparison_shows_the_edited_ddl_not_the_generated_one() -> None:
     # The read-only branch renders `current`, which is `edited if edited is not None`.
     assert "current = edited if edited is not None else preview.target_ddl" in source
     assert "_render_ddl_diff(ui, preview.source_ddl, current)" in source
+
+
+def _editable_target_ui():
+    """A ``_DdlPaneUi`` that also records buttons, so both modes can be inspected."""
+
+    class _Ui(_DdlPaneUi):
+        def __init__(self):
+            super().__init__()
+            self.buttons: list[str] = []
+            self.badges: list[str] = []
+
+        def button(self, text="", *_a, **_k):
+            if text:
+                self.buttons.append(str(text))
+            return self._El(self)
+
+        def badge(self, text="", *_a, **_k):
+            if text:
+                self.badges.append(str(text))
+            return self._El(self)
+
+    return _Ui()
+
+
+class _StubConvState:
+    def __init__(self, edited=None):
+        self._edited = edited
+
+    def get_edited_target_ddl(self, _name):
+        return self._edited
+
+    def set_edited_target_ddl(self, _name, _value):
+        pass
+
+    def clear_edited_target_ddl(self, _name):
+        pass
+
+    def get_apply_result(self, _name):
+        return None
+
+
+class _StubPreview:
+    object_name = "ecommerce.orders"
+    source_ddl = "CREATE TABLE `orders` (`id` int)"
+    target_ddl = 'CREATE TABLE "orders" ("id" INT)'
+
+
+def test_edit_mode_labels_the_pane_as_the_target() -> None:
+    """Entering Edit must not leave an unlabeled code box.
+
+    The editor used to render bare: both headers disappeared, so nothing said it is the
+    TARGET being changed. Since the source pane is read-only by design, mistaking one for
+    the other is a plausible misread of a screen whose whole point is source-vs-target.
+    """
+    from dsql_migrator.ui.schema_conversion import _render_editable_target
+
+    ui = _editable_target_ui()
+    _render_editable_target(ui, _StubPreview(), _StubConvState())
+    # Read-only mode names both sides.
+    assert "Source — MySQL" in ui.labels
+    assert "Target — Aurora DSQL" in ui.labels
+
+    # The editing branch is only reachable through the Edit button's handler, which a
+    # double cannot click, so assert on that branch's source.
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion
+
+    src = inspect.getsource(schema_conversion._render_editable_target)
+    editing_branch = src.split("else:", 1)[1]
+    assert "_render_ddl_header(" in editing_branch, editing_branch[:400]
+    assert 'title="Target — Aurora DSQL"' in editing_branch
+    # The Editing badge rides on that header band, not loose below the editor.
+    assert 'trailing=lambda: ui.badge("Editing")' in editing_branch
+
+
+def test_edit_mode_editor_matches_the_target_pane_treatment() -> None:
+    # Same dialect highlighting and no wrapping as the read-only target pane, so switching
+    # into Edit does not change how the SQL reads.
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion
+
+    editing = inspect.getsource(schema_conversion._render_editable_target).split(
+        "else:", 1
+    )[1]
+    assert 'language="PostgreSQL"' in editing, editing[:400]
+    assert "line_wrapping=False" in editing
+    assert "ddl-pane" in editing
+    # It IS editable -- unlike the comparison panes, this one writes to the buffer.
+    assert "on_change=on_edit" in editing
+    assert '.props("disable")' not in editing

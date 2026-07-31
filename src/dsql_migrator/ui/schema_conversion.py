@@ -3843,6 +3843,39 @@ def _render_ddl_pane(
         ).classes("w-full h-full ddl-pane").props("disable")
 
 
+def _render_ddl_header(
+    ui: object,
+    *,
+    icon: str,
+    title: str,
+    copy_ddl: str,
+    copy_label: str,
+    width: str = "w-1/2",
+    divider: bool = False,
+    trailing: Optional[Callable[[], None]] = None,
+) -> None:
+    """Render one header band naming a DDL pane, with its copy button.
+
+    Shared by the read-only comparison and the editor, so the editor is never an unlabeled
+    box: on entering Edit the two headers used to disappear, leaving a bare code area with
+    no indication that it is the TARGET being changed -- which matters because the source is
+    read-only by design and editing the wrong side is a plausible misread.
+
+    ``trailing`` renders extra content after the copy button (the editor uses it for its
+    "Editing" badge, keeping the state on the same band as the title it qualifies).
+    """
+    classes = f"{width} items-center gap-2 px-3 py-1.5 no-wrap"
+    if divider:
+        classes += " border-r border-slate-200"
+    with ui.row().classes(classes):  # type: ignore[attr-defined]
+        ui.icon(icon, color="blue-grey-5").classes("text-sm")  # type: ignore[attr-defined]
+        ui.label(title).classes(CODE_HEADER_LABEL_CLASSES)  # type: ignore[attr-defined]
+        ui.space()  # type: ignore[attr-defined]
+        _render_copy_ddl_button(ui, copy_ddl, label=copy_label)
+        if trailing is not None:
+            trailing()
+
+
 def _render_ddl_diff(ui: object, source_ddl: str, target_ddl: str) -> None:
     """Render the Source vs Target DDL side by side, each in a code editor.
 
@@ -3868,22 +3901,21 @@ def _render_ddl_diff(ui: object, source_ddl: str, target_ddl: str) -> None:
         with ui.row().classes(  # type: ignore[attr-defined]
             f"w-full gap-0 no-wrap {CODE_HEADER_CLASSES}"
         ):
-            with ui.row().classes(  # type: ignore[attr-defined]
-                "w-1/2 items-center gap-2 px-3 py-1.5 border-r border-slate-200 no-wrap"
-            ):
-                ui.icon("storage", color="blue-grey-5").classes("text-sm")  # type: ignore[attr-defined]
-                ui.label("Source — MySQL").classes(CODE_HEADER_LABEL_CLASSES)  # type: ignore[attr-defined]
-                ui.space()  # type: ignore[attr-defined]
-                _render_copy_ddl_button(ui, source_ddl, label="Source DDL")
-            with ui.row().classes(  # type: ignore[attr-defined]
-                "w-1/2 items-center gap-2 px-3 py-1.5 no-wrap"
-            ):
-                ui.icon("cloud_queue", color="blue-grey-5").classes("text-sm")  # type: ignore[attr-defined]
-                ui.label("Target — Aurora DSQL").classes(  # type: ignore[attr-defined]
-                    CODE_HEADER_LABEL_CLASSES
-                )
-                ui.space()  # type: ignore[attr-defined]
-                _render_copy_ddl_button(ui, target_ddl, label="Target DDL")
+            _render_ddl_header(
+                ui,
+                icon="storage",
+                title="Source — MySQL",
+                copy_ddl=source_ddl,
+                copy_label="Source DDL",
+                divider=True,
+            )
+            _render_ddl_header(
+                ui,
+                icon="cloud_queue",
+                title="Target — Aurora DSQL",
+                copy_ddl=target_ddl,
+                copy_label="Target DDL",
+            )
         with ui.row().classes("w-full gap-0 no-wrap items-stretch"):  # type: ignore[attr-defined]
             _render_ddl_pane(ui, source_ddl, language="MySQL", divider=True)
             _render_ddl_pane(ui, target_ddl, language="PostgreSQL", divider=False)
@@ -3986,11 +4018,38 @@ def _render_editable_target(
                         preview.object_name, getattr(event, "value", "") or ""
                     )
 
-                ui.codemirror(  # type: ignore[attr-defined]
-                    current, language="SQL", line_wrapping=True, on_change=on_edit
-                ).classes("w-full rounded-lg shadow-sm").style(
-                    "max-height: 360px; border: 1px solid #e2e8f0"
-                )
+                # SAME header band as the read-only comparison, so the editor is never an
+                # unlabeled box. Entering Edit used to drop both headers, leaving a bare code
+                # area with nothing saying it is the TARGET being changed -- and since the
+                # source pane is read-only by design, mistaking one for the other is a
+                # plausible misread. Only the target header shows here (full width): the
+                # source is not on screen to be confused with, and repeating it would imply
+                # it is editable too.
+                ui.add_css(_DDL_PANE_CSS)  # type: ignore[attr-defined]
+                with ui.column().classes(  # type: ignore[attr-defined]
+                    f"w-full gap-0 {CODE_SURFACE_CLASSES}"
+                ):
+                    with ui.row().classes(  # type: ignore[attr-defined]
+                        f"w-full gap-0 no-wrap {CODE_HEADER_CLASSES}"
+                    ):
+                        _render_ddl_header(
+                            ui,
+                            icon="cloud_queue",
+                            title="Target — Aurora DSQL",
+                            copy_ddl=current,
+                            copy_label="Target DDL",
+                            width="w-full",
+                            trailing=lambda: ui.badge("Editing").props(  # type: ignore[attr-defined]
+                                "color=amber-7"
+                            ),
+                        )
+                    ui.codemirror(  # type: ignore[attr-defined]
+                        current,
+                        language="PostgreSQL",
+                        theme="basicLight",
+                        line_wrapping=False,
+                        on_change=on_edit,
+                    ).classes("w-full ddl-pane")
                 with ui.row().classes("items-center gap-2 w-full no-wrap"):  # type: ignore[attr-defined]
                     ui.button(  # type: ignore[attr-defined]
                         "Done", on_click=lambda: render(editing=False)
@@ -4002,7 +4061,6 @@ def _render_editable_target(
                         ui.space()  # type: ignore[attr-defined]
                         extra_actions()
                     ui.space()  # type: ignore[attr-defined]
-                    ui.badge("Editing").props("color=amber-7")  # type: ignore[attr-defined]
                     if on_apply_object is not None:
                         _apply_btn_edit = ui.button(  # type: ignore[attr-defined]
                             "Apply to target"

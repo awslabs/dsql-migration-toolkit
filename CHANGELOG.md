@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.184
+
+### Fixed
+
+- **The DDL editor now says which side you are editing.** Pressing **Edit** dropped both
+  header bands, leaving a bare code box with nothing naming it — and since the source pane is
+  read-only by design, "which one am I changing?" was a fair question on a screen whose whole
+  point is source-vs-target. The editor now carries the same **Target — Aurora DSQL** header
+  band as the read-only comparison, with its copy button, and the `Editing` badge moved onto
+  that band beside the title it qualifies. Only the target header appears (full width): the
+  source is not on screen to be confused with, and repeating it would imply it is editable
+  too. The header is now one shared helper, so the two modes cannot drift apart.
+- **The editor matches the comparison pane's treatment.** It was highlighted as generic
+  `SQL` with wrapping on, while the pane beside it used `PostgreSQL` without wrapping — so
+  switching into Edit changed how the same DDL read. Both now use the target dialect and
+  keep one logical line on one line.
+
 ## v0.1.183
 
 ### Changed
