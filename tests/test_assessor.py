@@ -59,6 +59,14 @@ def _table_with_pk(name: str, **kwargs) -> TableDef:
     return TableDef(name=name, **kwargs)
 
 
+# Severity ranking used by the ordering assertions, mirroring assessor._SEVERITY.
+_CONCERN_SEVERITY = {
+    Classification.UNSUPPORTED: 2,
+    Classification.MANUAL: 1,
+    Classification.AUTO: 0,
+}
+
+
 # ---------------------------------------------------------------------------
 # Per-rule tests
 # ---------------------------------------------------------------------------
@@ -1371,3 +1379,72 @@ def test_html_export_marks_an_advisory_finding_outside_the_severity_ramp() -> No
     # on amber, so the exported table draws the same distinction as the screen.
     assert f'<td style="background:{_HTML_ADVISORY_COLOR}">RECOMMENDED</td>' in markup
     assert "<td>MEDIUM (if taken)</td>" in markup
+
+
+def test_advisory_findings_sort_after_every_real_gap() -> None:
+    """Priority order: what must be acted on now first, "you could also tune this" last.
+
+    Sorting by severity alone interleaved them -- the advisory AUTO_INCREMENT finding is
+    MANUAL, so it landed above a genuine MANUAL gap purely by rule declaration order, and
+    the reader met an optional throughput note before the foreign key they actually have
+    to deal with.
+    """
+    inventory = SourceInventory(tables=[_multi_rule_table()])
+    item = _item_for(_assess(inventory), "orders")
+    flags = [c.is_advisory for c in item.concerns]
+    assert any(flags) and not all(flags), "fixture must mix gaps and advice"
+    # Every gap precedes every piece of advice: no True may appear before a False.
+    assert flags == sorted(flags), [c.rule_id for c in item.concerns]
+    # Gaps remain ranked by severity among themselves.
+    gap_ranks = [
+        _CONCERN_SEVERITY[c.classification] for c in item.concerns if not c.is_advisory
+    ]
+    assert gap_ranks == sorted(gap_ranks, reverse=True), gap_ranks
+
+
+def test_unsupported_gap_outranks_a_manual_gap_which_outranks_advice() -> None:
+    # All three tiers in one object, to pin the full ordering rather than just the split.
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="wide",
+                columns=[
+                    ColumnDef(name="id", mysql_type="int", nullable=False),
+                    # Past DSQL's numeric ceiling -> UNSUPPORTED.
+                    ColumnDef(name="amt", mysql_type="decimal(65,30)"),
+                    ColumnDef(
+                        name="sku",
+                        mysql_type="varchar(40)",
+                        collation="utf8mb4_general_ci",
+                    ),
+                ],
+                primary_key=["id"],
+                auto_increment_column="id",
+            )
+        ]
+    )
+    item = _item_for(_assess(inventory), "wide")
+    assert [(c.rule_id, c.classification.value, c.is_advisory) for c in item.concerns] == [
+        ("NUMERIC_PRECISION", "UNSUPPORTED", False),
+        ("CI_COLLATION", "MANUAL", False),
+        ("AUTO_INCREMENT", "MANUAL", True),
+    ]
+
+
+def test_governing_rule_is_a_real_gap_when_the_object_has_one() -> None:
+    # The row header must not advertise an optional recommendation as the headline: an
+    # operator scanning the list would read "AUTO_INCREMENT" and miss the foreign key.
+    inventory = SourceInventory(tables=[_multi_rule_table()])
+    item = _item_for(_assess(inventory), "orders")
+    assert item.rule_id != "AUTO_INCREMENT"
+    assert not item.concerns[0].is_advisory
+
+
+def test_an_advice_only_object_still_reports_that_advice_as_its_rule() -> None:
+    # With nothing else to show, the recommendation IS the finding -- it must not vanish.
+    inventory = SourceInventory(
+        tables=[_table_with_pk("users", auto_increment_column="id")]
+    )
+    item = _item_for(_assess(inventory), "users")
+    assert item.rule_id == "AUTO_INCREMENT"
+    assert [c.is_advisory for c in item.concerns] == [True]

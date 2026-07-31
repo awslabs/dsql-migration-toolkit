@@ -1207,8 +1207,23 @@ def _aggregate(key: ObjectKey, findings: list[Finding]) -> AssessmentItem:
             kind=key.kind.upper(),
         )
 
-    # Stable sort by descending severity keeps declaration order for ties.
-    ordered = sorted(findings, key=lambda f: -_SEVERITY[f.classification])
+    # Order: real gaps before advice, then by descending severity. A stable sort keeps
+    # rule declaration order for ties.
+    #
+    # Advice sinks to the bottom regardless of its classification. Sorting by severity
+    # alone interleaved them -- an advisory MANUAL finding landed above a genuine MANUAL
+    # gap purely by declaration order, so the reader met an optional throughput note
+    # before the foreign key they actually have to deal with. What must be acted on now
+    # belongs first; "you could also tune this" belongs last.
+    ordered = sorted(
+        findings,
+        key=lambda f: (
+            f.note_kind is ConversionNoteKind.RECOMMENDATION,
+            -_SEVERITY[f.classification],
+        ),
+    )
+    # The governing rule is therefore a real gap whenever the object has one, so the row
+    # header never advertises an optional recommendation as the object's headline.
     governing = ordered[0]
     # Keep each finding as its own concern, paired with ITS recommendation. The joined
     # strings below stay for back-compat and flat CSV-style exports, but a table that

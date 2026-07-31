@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.174
+
+### Changed
+
+- **An object's findings are now ordered by priority: real gaps first, advice last.**
+  Sorting by severity alone interleaved the two — the advisory `AUTO_INCREMENT` finding is
+  classified `MANUAL`, so it landed above a genuine `MANUAL` gap purely by rule
+  declaration order, and a reader expanding a table met an optional throughput note before
+  the foreign key they actually have to deal with. Gaps now sort ahead of every
+  recommendation and stay ranked by severity among themselves (`UNSUPPORTED` before
+  `MANUAL`), so the list reads top-to-bottom as "act on this now" down to "you could also
+  tune this". A consequence worth having: the row header's governing rule is now a real
+  gap whenever the object has one, instead of sometimes advertising a recommendation as
+  the object's headline. An object whose only finding is advice still reports it. The
+  screen, the text export and the HTML export all render the same list, so all three
+  reorder together.
+
 ## v0.1.173
 
 ### Changed
