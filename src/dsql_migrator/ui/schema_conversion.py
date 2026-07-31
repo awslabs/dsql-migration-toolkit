@@ -3800,9 +3800,15 @@ _DDL_PANE_CSS = """
 /* The WRAPPER needs the height too. Sizing only the scroller left the outer element at
    its 256px default, so a 540px scroller overflowed it and the dialog showed a tall blank
    band under a clipped editor -- the same trap as the pane, one element further out. */
-.ddl-expanded { height: 82vh; }
-.ddl-expanded .cm-editor { height: 100%; }
-.ddl-expanded .cm-scroller { max-height: 82vh; min-height: 100%; overflow: auto; }
+/* Grows WITH the DDL up to a cap, instead of a fixed box: 29 lines is the longest real DDL
+   measured and ~44rem holds it, while a 4-line object gets a small dialog rather than the
+   same tall one. ``height: auto`` on the wrapper is what allows that -- CodeMirror falls
+   back to a fixed 256px otherwise, which pinned a 29-line DDL to the same height as a
+   4-line one. ``max-height`` (not ``height``) is then what keeps a huge DDL from running
+   off the screen, and the vh term keeps a short window usable. */
+.ddl-expanded { height: auto; max-height: min(44rem, 74vh); }
+.ddl-expanded .cm-editor { height: auto; max-height: min(44rem, 74vh); }
+.ddl-expanded .cm-scroller { max-height: min(44rem, 74vh); min-height: 6rem; overflow: auto; }
 """
 
 
@@ -3866,8 +3872,13 @@ def _render_expand_ddl_button(
     """
 
     def _open() -> None:
-        with ui.dialog().props("maximized") as dialog, ui.card().classes(  # type: ignore[attr-defined]
-            "w-full h-full gap-2"
+        # Sized to the CONTENT, not to the screen. Measured across a real source, the widest
+        # DDL line is 144 characters and the longest is 29 lines -- roughly 1060 x 800px at
+        # this font -- so a maximized dialog covered a 1440x900 display to show a panel with
+        # room to spare. The caps stay in viewport units so a small window still gets a
+        # usable dialog, and the surrounding page remains visible as context.
+        with ui.dialog() as dialog, ui.card().classes("gap-2").style(  # type: ignore[attr-defined]
+            "width: min(1100px, 92vw); max-width: 92vw"
         ):
             with ui.row().classes("items-center gap-2 w-full no-wrap"):  # type: ignore[attr-defined]
                 ui.label(title).classes("text-sm font-semibold")  # type: ignore[attr-defined]

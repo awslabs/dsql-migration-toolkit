@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.186
+
+### Changed
+
+- **The expanded DDL now opens as a dialog over the page, sized to its content, instead of
+  taking the whole screen.** Maximized covered a 1440x900 display to show a panel that needs
+  about **1060x800 at its widest** — measured across a real source, the longest line is 144
+  characters and the longest DDL 29 lines — and losing the page behind it also lost the
+  context the comparison sat in. The dialog is now `min(1100px, 92vw)` wide and grows with the
+  DDL up to `min(44rem, 74vh)`: a 29-line object gets a 679px-tall editor, a 4-line one gets
+  160px, neither clipped. `height: auto` on the wrapper is what makes that work — CodeMirror
+  falls back to a fixed 256px otherwise, which pinned every DDL to the same height regardless
+  of length.
+
 ## v0.1.185
 
 ### Added

@@ -2491,7 +2491,7 @@ def test_edit_mode_editor_matches_the_target_pane_treatment() -> None:
     assert '.props("disable")' not in editing
 
 
-def test_each_ddl_pane_offers_a_full_screen_expand() -> None:
+def test_each_ddl_pane_offers_an_expand_to_a_content_sized_dialog() -> None:
     """A split view gives each pane half the window, which the DDL often outgrows.
 
     Measured against a real source: 14 of 18 tables had a line too long for a half-width
@@ -2510,9 +2510,12 @@ def test_each_ddl_pane_offers_a_full_screen_expand() -> None:
     assert 'expand_language="PostgreSQL"' in src, src
 
     expand = inspect.getsource(schema_conversion._render_expand_ddl_button)
-    # Full-screen, because WIDTH is the binding constraint -- a taller pane would address
-    # the smaller half of the problem.
-    assert '.props("maximized")' in expand, expand
+    # Sized to the CONTENT, over the page rather than replacing it. A maximized dialog
+    # covered a 1440x900 display to show a panel that needs ~1060x800 at its widest
+    # (144-char line, 29 lines measured across a real source), and losing the page behind it
+    # costs the context the comparison sat in.
+    assert '.props("maximized")' not in expand, expand
+    assert "width: min(1100px, 92vw)" in expand, expand
     # Read-only, like the pane it expands.
     assert '.props("disable")' in expand, expand
     # Its own height class, or it would inherit the 26rem cap it exists to escape. Check
@@ -2532,8 +2535,17 @@ def test_expanded_ddl_css_sizes_the_wrapper_and_the_scroller() -> None:
     assert ".ddl-expanded {" in _DDL_PANE_CSS, _DDL_PANE_CSS
     assert ".ddl-expanded .cm-editor" in _DDL_PANE_CSS
     assert ".ddl-expanded .cm-scroller" in _DDL_PANE_CSS
-    # Taller than the inline pane, which is the whole point.
-    assert "82vh" in _DDL_PANE_CSS
+    # ``height: auto`` on the WRAPPER is what lets the dialog track the DDL: CodeMirror
+    # falls back to a fixed 256px otherwise, which pinned a 29-line DDL to the same height
+    # as a 4-line one. Check that rule specifically -- ``.cm-editor`` carries the same
+    # declaration, so searching the whole sheet for the string would pass without it.
+    wrapper_rule = next(
+        line for line in _DDL_PANE_CSS.splitlines()
+        if line.strip().startswith(".ddl-expanded {")
+    )
+    assert "height: auto" in wrapper_rule, wrapper_rule
+    # A cap still keeps a huge DDL on screen, and it is taller than the inline pane.
+    assert "min(44rem, 74vh)" in _DDL_PANE_CSS
     assert "26rem" in _DDL_PANE_CSS  # the pane cap is still there for the inline view
 
 
