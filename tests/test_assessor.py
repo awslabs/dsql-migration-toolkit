@@ -1279,3 +1279,95 @@ def test_html_chart_lists_kinds_largest_first() -> None:
     markup = render_html_report(AssessmentReport.from_items(items))
     labels = re.findall(r'<div class="bar-label">([^<]+)</div>', markup)
     assert labels == ["TABLE", "TRIGGER"]
+
+def test_advisory_finding_does_not_inflate_the_effort_estimate() -> None:
+    """Effort answers "how much work must I do", so optional advice must not raise it.
+
+    A table needing only a foreign-key workaround (SIMPLE, under two hours) was reported
+    as MEDIUM (two to six) purely because it ALSO carried the AUTO_INCREMENT throughput
+    recommendation -- and since MySQL tables overwhelmingly have an AUTO_INCREMENT key,
+    that inflated the estimate for the most common table shape there is. Measured on a
+    real 7-table schema, this moved two tables from MEDIUM back to SIMPLE.
+    """
+    from dsql_migrator.core.models import ConversionNoteKind
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="orders",
+                columns=[
+                    ColumnDef(name="id", mysql_type="int", nullable=False),
+                    ColumnDef(name="customer_id", mysql_type="int"),
+                ],
+                primary_key=["id"],
+                auto_increment_column="id",
+                foreign_keys=[
+                    ForeignKeyDef(
+                        name="fk_customer",
+                        columns=["customer_id"],
+                        referenced_table="customers",
+                        referenced_columns=["id"],
+                    )
+                ],
+            )
+        ]
+    )
+    item = _item_for(_assess(inventory), "orders")
+    by_rule = {c.rule_id: c for c in item.concerns}
+    # The advisory finding is present and still carries its OWN effort, so the cost of
+    # taking the advice remains visible on the finding itself.
+    advisory = by_rule["AUTO_INCREMENT"]
+    assert advisory.note_kind is ConversionNoteKind.RECOMMENDATION
+    assert advisory.is_advisory
+    assert advisory.effort is EffortLevel.MEDIUM
+    # The real gap is SIMPLE, and that -- not the advice's MEDIUM -- governs the object.
+    assert by_rule["FK_UNSUPPORTED"].note_kind is ConversionNoteKind.LOSS
+    assert not by_rule["FK_UNSUPPORTED"].is_advisory
+    assert item.effort is EffortLevel.SIMPLE
+
+
+def test_an_object_whose_only_finding_is_advice_carries_no_effort() -> None:
+    # Nothing is required of the operator, so the object must not borrow the advice's
+    # estimate and appear in the effort summary as work to schedule.
+    inventory = SourceInventory(
+        tables=[_table_with_pk("users", auto_increment_column="id")]
+    )
+    report = _assess(inventory)
+    item = _item_for(report, "users")
+    assert [c.rule_id for c in item.concerns] == ["AUTO_INCREMENT"]
+    assert all(c.is_advisory for c in item.concerns)
+    assert item.effort is None
+    assert report.effort_summary[EffortLevel.MEDIUM] == 0
+
+
+def test_findings_default_to_loss_so_every_other_rule_is_unchanged() -> None:
+    # LOSS is what every rule historically meant; only AUTO_INCREMENT opts out. A rule
+    # that silently became advisory would quietly drop out of the effort estimate.
+    inventory = SourceInventory(tables=[_multi_rule_table()])
+    item = _item_for(_assess(inventory), "orders")
+    advisory = {c.rule_id for c in item.concerns if c.is_advisory}
+    assert advisory == {"AUTO_INCREMENT"}, advisory
+
+
+def test_text_export_labels_an_advisory_finding_as_recommended() -> None:
+    # The export must not call an optional throughput change a MANUAL risk; a reader
+    # planning the migration needs to see which findings are required work.
+    inventory = SourceInventory(tables=[_multi_rule_table()])
+    text = render_text_report(_assess(inventory))
+    assert "[RECOMMENDED] AUTO_INCREMENT" in text
+    assert "effort if you take it: MEDIUM" in text
+    # It is captioned Note, not Risk, and the gaps keep their Risk caption.
+    assert "Note: The integer key" in text
+    assert "Risk: Foreign key" in text
+
+
+def test_html_export_marks_an_advisory_finding_outside_the_severity_ramp() -> None:
+    from dsql_migrator.core.assessor import _HTML_ADVISORY_COLOR, render_html_report
+
+    markup = render_html_report(
+        CompatibilityAssessor().assess(SourceInventory(tables=[_multi_rule_table()]))
+    )
+    # The advisory row reads RECOMMENDED on the info-blue background rather than MANUAL
+    # on amber, so the exported table draws the same distinction as the screen.
+    assert f'<td style="background:{_HTML_ADVISORY_COLOR}">RECOMMENDED</td>' in markup
+    assert "<td>MEDIUM (if taken)</td>" in markup

@@ -72,6 +72,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from dsql_migrator.core.models import (
     Classification,
+    ConversionNoteKind,
     ForeignKeyDef,
     SourceInventory,
     TableDef,
@@ -165,31 +166,12 @@ _DType = exp.DataType.Type
 
 
 # ---------------------------------------------------------------------------
-# Conversion result models (converter-local; not yet shared across components)
+# Conversion result models
 # ---------------------------------------------------------------------------
 
-
-class ConversionNoteKind(str, Enum):
-    """Whether a conversion note is a real gap or just advice.
-
-    ``Classification`` answers "how much work" (MANUAL vs UNSUPPORTED) but not "is
-    anything actually wrong". Those are different questions, and conflating them
-    made advice look like a defect: a kept AUTO_INCREMENT key converts perfectly and
-    works -- switching to a UUID/random or cached-identity key is a *throughput*
-    recommendation for DSQL's partitioning, not a problem to fix. Presenting it with
-    the same amber "warning" treatment as a removed foreign key (which genuinely
-    dropped a constraint from the DDL) overstated it.
-
-    * ``LOSS`` -- the conversion could not carry something over, or changed
-      semantics: a removed foreign key, a dropped collation, an unmapped type, a
-      table that needs a primary key. Something is missing or different, and the
-      operator has to decide what to do about it.
-    * ``RECOMMENDATION`` -- the conversion is complete and correct; this is advice
-      about running well on DSQL. Ignoring it costs performance, not correctness.
-    """
-
-    LOSS = "LOSS"
-    RECOMMENDATION = "RECOMMENDATION"
+# ``ConversionNoteKind`` now lives in core.models because Evaluation needs it too; it is
+# imported above and re-exported here so existing ``from ...converter import
+# ConversionNoteKind`` call sites keep working.
 
 
 class ConversionWarning(BaseModel):
@@ -2176,6 +2158,8 @@ class SchemaConverter:
 
 
 __all__ = [
+    # Re-exported from core.models so existing imports keep working.
+    "ConversionNoteKind",
     "ConversionWarning",
     "TableConversion",
     "ViewConversion",

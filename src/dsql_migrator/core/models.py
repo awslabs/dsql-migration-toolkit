@@ -397,6 +397,35 @@ class ApplyResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class ConversionNoteKind(str, Enum):
+    """Whether a finding is a real gap or just advice. Shared by BOTH assessments.
+
+    ``Classification`` answers "how much work" (MANUAL vs UNSUPPORTED) but not "is
+    anything actually wrong". Those are different questions, and conflating them made
+    advice look like a defect: a kept AUTO_INCREMENT key converts perfectly and works --
+    switching to a UUID/random or cached-identity key is a *throughput* recommendation
+    for DSQL's partitioning, not a problem to fix. Presenting it with the same amber
+    "warning" treatment as a removed foreign key (which genuinely dropped a constraint
+    from the DDL) overstated it.
+
+    * ``LOSS`` -- the conversion could not carry something over, or changed
+      semantics: a removed foreign key, a dropped collation, an unmapped type, a
+      table that needs a primary key. Something is missing or different, and the
+      operator has to decide what to do about it.
+    * ``RECOMMENDATION`` -- the conversion is complete and correct; this is advice
+      about running well on DSQL. Ignoring it costs performance, not correctness.
+
+    This lives here, not in ``core.converter``, because Schema Conversion and Evaluation
+    both need it. It was converter-local when introduced (v0.1.151), so only Schema
+    Conversion got the distinction and Evaluation kept calling an AUTO_INCREMENT key a
+    risk -- the two screens contradicted each other about the same key for 20 releases.
+    One shared enum makes that class of drift impossible rather than merely fixed once.
+    """
+
+    LOSS = "LOSS"
+    RECOMMENDATION = "RECOMMENDATION"
+
+
 class Classification(str, Enum):
     """Migration classification for a source object."""
 
@@ -476,6 +505,20 @@ class AssessmentConcern(BaseModel):
     risk: str = ""
     recommendation: str = ""
     effort: Optional[EffortLevel] = None
+    note_kind: ConversionNoteKind = Field(
+        default=ConversionNoteKind.LOSS,
+        description=(
+            "Whether this finding reports a real gap (LOSS -- the default, and what "
+            "every finding historically meant) or advice on an otherwise-correct "
+            "conversion (RECOMMENDATION). Named ``note_kind`` because ``kind`` on the "
+            "owning AssessmentItem already means the OBJECT kind (TABLE/VIEW/...)."
+        ),
+    )
+
+    @property
+    def is_advisory(self) -> bool:
+        """True when ignoring this finding costs performance, not correctness."""
+        return self.note_kind is ConversionNoteKind.RECOMMENDATION
 
 
 class AssessmentReport(BaseModel):
@@ -1271,6 +1314,7 @@ __all__ = [
     "ApplyStatus",
     "DdlPreview",
     "ApplyResult",
+    "ConversionNoteKind",
     "Classification",
     "AssessmentItem",
     "AssessmentReport",

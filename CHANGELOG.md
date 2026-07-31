@@ -5,6 +5,44 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.173
+
+### Changed
+
+- **Evaluation now separates recommendations from real conversion gaps.** `Classification`
+  answers "how much work" but not "is anything actually wrong", and conflating the two made
+  advice look like a defect. A finding now also carries a **note kind**: a `LOSS` (something
+  could not be carried over or changed meaning) or a `RECOMMENDATION` (the conversion is
+  complete and correct; ignoring it costs performance, not correctness). `AUTO_INCREMENT` is
+  the recommendation — such a key converts cleanly, and switching to a UUID/random or
+  cached-identity key buys insert throughput.
+  - The enum is `ConversionNoteKind`, moved from `core/converter.py` into `core/models.py`
+    so **both** assessments share it. It was converter-local when introduced in v0.1.151,
+    which is exactly why only Schema Conversion got the distinction while Evaluation kept
+    calling an `AUTO_INCREMENT` key a risk — the two screens contradicted each other about
+    the same key for 20 releases. One shared enum makes that class of drift impossible
+    rather than merely fixed once. `core.converter` re-exports it, so existing imports work.
+  - **A recommendation no longer inflates an object's effort estimate.** Effort answers
+    "how much work must I do to migrate this", and optional throughput advice is not work
+    the migration requires. A table needing only a foreign-key workaround (`SIMPLE`, under
+    two hours) was reported as `MEDIUM` (two to six) purely because it *also* had an
+    `AUTO_INCREMENT` key — and since MySQL tables overwhelmingly do, this inflated the
+    estimate for the most common table shape there is. Measured against a real 7-table
+    schema, two tables moved from `MEDIUM` back to `SIMPLE`. An object whose findings are
+    *all* advisory now carries no effort at all. The advice still shows what taking it
+    would cost ("effort if you take it"), so the choice stays informed.
+  - Advisory findings render in the calm info-blue treatment — `RECOMMENDED` badge, a
+    `Note` caption instead of `Risk` — on the screen, in the text export (`[RECOMMENDED]`)
+    and in the HTML export (info-blue cell, deliberately outside the green/amber/red
+    severity ramp). Findings default to `LOSS`, so every other rule is untouched and a
+    report persisted before this change renders exactly as before.
+
+### Fixed
+
+- **Three more dead KO manual links.** `ko/11-customer-faq.md` still pointed at
+  `10-conclusion.md` with English anchors, which the v0.1.166 sweep of 16 links missed.
+  Every cross-chapter anchor in `docs/manual/` now resolves.
+
 ## v0.1.172
 
 ### Fixed

@@ -33,13 +33,34 @@ types, primary keys, indexes, foreign keys, views, triggers, routines,
 | Class | Meaning | Examples |
 |---|---|---|
 | **AUTO** | Converts automatically, no human action. | Ordinary tables/columns with mappable types and a PK. |
-| **MANUAL** | Converts, but needs a decision or an app-side change. | Foreign keys, `AUTO_INCREMENT`, case-insensitive collation, partitioned tables, oversized LOB columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, multi-database sources. |
+| **MANUAL** | Converts, but needs a decision or an app-side change. | Foreign keys, case-insensitive collation, partitioned tables, oversized LOB columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, multi-database sources. |
 | **UNSUPPORTED** | No automatic conversion — redesign needed. | Triggers, stored procedures/functions, scheduled events, tables with no PK, spatial/geometry types, `DECIMAL` precision > 38, > 255 columns/table, > 1000 tables/database, FULLTEXT/SPATIAL indexes. |
 
 Nothing is left unclassified — an object matched by no rule defaults to **AUTO**.
 When several rules match one object, the **most demanding** classification wins
 (`UNSUPPORTED` > `MANUAL` > `AUTO`) and the reasons/recommendations of all matched
 rules are combined, so no finding is hidden.
+
+### Gaps versus recommendations
+
+Not every finding is a problem. A finding is one of two things, and the report marks
+which:
+
+- a **gap** — something could not be carried over or changed meaning (a removed
+  foreign key, a dropped collation). You have to decide what to do about it.
+- a **recommendation** (`RECOMMENDED`, info-blue) — the conversion is complete and
+  correct; this is advice about *running well* on DSQL. Ignoring it costs performance,
+  not correctness.
+
+`AUTO_INCREMENT` is the main recommendation. Such a key converts cleanly and works:
+moving to a UUID/random or cached-identity key buys **insert throughput**, because DSQL
+stores rows in primary-key order so a monotonic key concentrates writes on one partition
+(see [Chapter 7 §7.1](07-performance-and-tuning.md#primary-key-strategy--avoid-hot-partitions)).
+
+Because a recommendation is optional, **it does not count toward an object's estimated
+effort** — otherwise nearly every MySQL table would be inflated to `MEDIUM` by its
+`AUTO_INCREMENT` key alone. The finding still shows what taking the advice would cost
+("effort if you take it"), so the choice stays informed.
 
 ### What each report item tells you
 

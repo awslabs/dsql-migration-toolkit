@@ -1566,30 +1566,60 @@ def _render_assessment_item(
                     "gap-2 w-full pl-4 ml-1 border-l-2 border-gray-200"
                 ):
                     for concern in concerns:
+                        # An ADVISORY finding is not a defect: the conversion is complete
+                        # and correct and ignoring it costs throughput, not correctness.
+                        # It therefore gets the calm info-blue treatment instead of the
+                        # amber warning one, so a reader can tell at a glance which of an
+                        # object's five findings they MUST act on. Same distinction
+                        # Schema Conversion has drawn since v0.1.151.
+                        advisory = getattr(concern, "is_advisory", False)
                         with ui.column().classes(  # type: ignore[attr-defined]
-                            "gap-2 w-full rounded-md border border-gray-200 "
-                            "bg-gray-50 p-3"
+                            "gap-2 w-full rounded-md border p-3 "
+                            + (
+                                "border-sky-200 bg-sky-50"
+                                if advisory
+                                else "border-gray-200 bg-gray-50"
+                            )
                         ):
                             with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
                                 # Per-concern class: the item's badge shows only the
                                 # governing (most severe) one, which says nothing about
-                                # the others.
-                                ui.badge(  # type: ignore[attr-defined]
-                                    classification_label(concern.classification.value)
-                                ).props(
-                                    "color="
-                                    + _CLASS_BADGE_COLOR.get(
-                                        concern.classification.value, "grey"
+                                # the others. An advisory finding says "RECOMMENDED"
+                                # rather than repeating the object's severity, because
+                                # its classification is about how much work the CHANGE
+                                # would be, not about anything being wrong.
+                                if advisory:
+                                    ui.badge("RECOMMENDED").props(  # type: ignore[attr-defined]
+                                        "color=info outline"
                                     )
-                                    + " outline"
-                                )
+                                else:
+                                    ui.badge(  # type: ignore[attr-defined]
+                                        classification_label(
+                                            concern.classification.value
+                                        )
+                                    ).props(
+                                        "color="
+                                        + _CLASS_BADGE_COLOR.get(
+                                            concern.classification.value, "grey"
+                                        )
+                                        + " outline"
+                                    )
                                 ui.label(concern.rule_id).classes(  # type: ignore[attr-defined]
                                     "text-xs text-gray-500 font-mono"
                                 )
                                 if concern.effort is not None:
                                     ui.space()  # type: ignore[attr-defined]
+                                    # "if you take it" makes clear the estimate is the
+                                    # cost of OPTING IN, not required migration work --
+                                    # it is excluded from the object's effort for exactly
+                                    # that reason.
                                     ui.badge(  # type: ignore[attr-defined]
-                                        f"effort: {concern.effort.value}"
+                                        (
+                                            f"effort if you take it: "
+                                            f"{concern.effort.value}"
+                                        )
+                                        if advisory
+                                        else f"effort: {concern.effort.value}"
                                     ).props("color=blue-grey-6 outline")
                             # Problem and fix are LABELED and visually separated. A bare
                             # sentence followed by a fainter arrowed sentence read as one
@@ -1603,14 +1633,25 @@ def _render_assessment_item(
                             if concern.risk:
                                 _render_concern_line(
                                     ui,
-                                    icon="warning",
-                                    label="Risk",
+                                    # Advisory: the text describes the situation, not a
+                                    # hazard, so neither the word "Risk" nor the amber
+                                    # warning palette applies to it.
+                                    icon="info" if advisory else "warning",
+                                    label="Note" if advisory else "Risk",
                                     text=concern.risk,
-                                    icon_class="text-amber-600",
-                                    label_class="text-amber-700",
+                                    icon_class=(
+                                        "text-sky-600" if advisory else "text-amber-600"
+                                    ),
+                                    label_class=(
+                                        "text-sky-700" if advisory else "text-amber-700"
+                                    ),
                                     panel_class=(
-                                        "rounded border border-amber-200 bg-amber-50 "
-                                        "px-2 py-1.5"
+                                        "rounded border px-2 py-1.5 "
+                                        + (
+                                            "border-sky-200 bg-white"
+                                            if advisory
+                                            else "border-amber-200 bg-amber-50"
+                                        )
                                     ),
                                 )
                             if concern.recommendation:

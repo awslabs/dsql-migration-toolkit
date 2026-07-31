@@ -42,6 +42,7 @@ from dsql_migrator.core.models import (
     AssessmentItem,
     AssessmentReport,
     Classification,
+    ConversionNoteKind,
     EffortLevel,
     ObjectType,
     SourceInventory,
@@ -167,6 +168,10 @@ class Finding:
     risk: str
     recommendation: str
     effort: Optional[EffortLevel] = None
+    # Defaults to LOSS -- a real gap -- which is what every rule historically reported.
+    # A rule whose finding is throughput advice on an otherwise-correct conversion opts
+    # into RECOMMENDATION; see AutoIncrementRule.
+    note_kind: ConversionNoteKind = ConversionNoteKind.LOSS
 
 
 def _base_type(mysql_type: str) -> str:
@@ -440,6 +445,7 @@ class AutoIncrementRule(Rule):
                             "an identity/sequence with cache tuning."
                         ),
                         effort=EffortLevel.MEDIUM,
+                        note_kind=ConversionNoteKind.RECOMMENDATION,
                     )
                 )
         return findings
@@ -1215,14 +1221,28 @@ def _aggregate(key: ObjectKey, findings: list[Finding]) -> AssessmentItem:
             risk=f.risk,
             recommendation=f.recommendation,
             effort=f.effort,
+            note_kind=f.note_kind,
         )
         for f in ordered
     ]
     risk = "; ".join(f.risk for f in ordered if f.risk)
     recommendation = "; ".join(f.recommendation for f in ordered if f.recommendation)
-    # The most demanding effort across all matched rules governs the estimate.
-    efforts = [f.effort for f in findings if f.effort is not None]
-    effort = max(efforts, key=lambda e: _EFFORT_ORDER[e]) if efforts else None
+    # The most demanding effort across REAL GAPS governs the estimate -- advisory
+    # findings are excluded. Effort answers "how much work must I do to migrate this
+    # object", and optional throughput advice is not work the migration requires: a
+    # table needing only a foreign-key workaround (SIMPLE, under two hours) was being
+    # reported as MEDIUM (two to six) purely because it also carried the AUTO_INCREMENT
+    # recommendation, inflating the estimate for the most common table shape there is.
+    # Advisory findings keep their own per-concern effort, so the cost of taking the
+    # advice is still visible on the finding itself.
+    gap_efforts = [
+        f.effort
+        for f in findings
+        if f.effort is not None and f.note_kind is not ConversionNoteKind.RECOMMENDATION
+    ]
+    # An object whose findings are ALL advisory has no required work, so it carries no
+    # effort at all rather than borrowing the advice's estimate.
+    effort = max(gap_efforts, key=lambda e: _EFFORT_ORDER[e]) if gap_efforts else None
     return AssessmentItem(
         object_name=key.name,
         rule_id=governing.rule_id,
@@ -1310,12 +1330,24 @@ def render_text_report(report: AssessmentReport) -> str:
         concerns = list(item.concerns or [])
         if concerns:
             for number, concern in enumerate(concerns, start=1):
-                head = f"    {number}. [{concern.classification.value}] {concern.rule_id}"
+                # An advisory finding is labeled RECOMMENDED rather than by severity: the
+                # conversion is complete and correct, so its classification describes how
+                # big the optional change would be, not that anything is wrong. Its
+                # effort is likewise excluded from the object's estimate above, so the
+                # text spells out that it is the cost of opting in.
+                advisory = concern.is_advisory
+                tag = "RECOMMENDED" if advisory else concern.classification.value
+                head = f"    {number}. [{tag}] {concern.rule_id}"
                 if concern.effort is not None:
-                    head += f" (effort: {concern.effort.value})"
+                    head += (
+                        f" (effort if you take it: {concern.effort.value})"
+                        if advisory
+                        else f" (effort: {concern.effort.value})"
+                    )
                 lines.append(head)
                 if concern.risk:
-                    lines.append(f"       Risk: {concern.risk}")
+                    label = "Note" if advisory else "Risk"
+                    lines.append(f"       {label}: {concern.risk}")
                 if concern.recommendation:
                     lines.append(f"       Fix:  {concern.recommendation}")
         else:
@@ -1351,6 +1383,11 @@ _HTML_CLASS_COLOR: dict[Classification, str] = {
     Classification.MANUAL: "#fff8e1",
     Classification.UNSUPPORTED: "#ffebee",
 }
+
+# Background for an ADVISORY finding's cell -- a calm info-blue, deliberately outside the
+# green/amber/red severity ramp above, because such a finding reports no defect at all.
+# Matches the sky tone the Evaluation screen uses for the same finding.
+_HTML_ADVISORY_COLOR = "#e1f5fe"
 
 # Solid bar colors per CLASSIFICATION for the HTML chart. The _HTML_CLASS_COLOR values
 # above are pale table-cell backgrounds; a bar needs full-strength fills to be legible at
@@ -1645,9 +1682,20 @@ def render_html_report(
             if index == 0:
                 cells += f"<td{span}>{esc(item.object_name)}</td>"
                 cells += f"<td{span}>{esc(item.kind)}</td>"
+            # An advisory finding reads RECOMMENDED on the calm info-blue background
+            # instead of a severity on amber/red: the conversion is complete and correct,
+            # so nothing about it is a defect. Its effort is marked as the cost of opting
+            # in, matching its exclusion from the object's own estimate.
+            if concern.is_advisory:
+                concern_color = _HTML_ADVISORY_COLOR
+                class_cell = "RECOMMENDED"
+                if concern_effort != "-":
+                    concern_effort = f"{concern_effort} (if taken)"
+            else:
+                class_cell = concern.classification.value
             cells += (
                 f'<td style="background:{concern_color}">'
-                f"{esc(concern.classification.value)}</td>"
+                f"{esc(class_cell)}</td>"
                 f"<td>{esc(concern_effort)}</td>"
                 f"<td>{esc(concern.rule_id)}</td>"
                 f"<td>{esc(concern.risk)}</td>"

@@ -1029,22 +1029,30 @@ def test_each_rendered_concern_shows_its_own_class_and_fix() -> None:
     for concern in item.concerns:
         assert concern.risk in body, concern.rule_id
         assert concern.recommendation in body, concern.rule_id
-    # One class badge per concern, plus the header's own badge and the kind badge.
+    # One class badge per NON-ADVISORY concern (an advisory one says RECOMMENDED
+    # instead), plus the header's own badge and the kind badge.
     from dsql_migrator.ui.evaluation import classification_label
 
+    gaps = [c for c in item.concerns if not c.is_advisory]
+    advice = [c for c in item.concerns if c.is_advisory]
+    assert gaps and advice, "fixture must cover both kinds"
     label = classification_label(item.classification.value)
-    assert ui.badges.count(label) >= len(item.concerns)
+    assert ui.badges.count(label) >= len(gaps)
+    assert ui.badges.count("RECOMMENDED") == len(advice)
     # Problem and fix are LABELED, not merely arrowed: each carries its own caption and
-    # glyph so the reader never has to infer which line is the remedy.
-    risks = [c for c in item.concerns if c.risk]
+    # glyph so the reader never has to infer which line is the remedy. An advisory
+    # finding is captioned "Note", not "Risk" -- nothing is wrong with the object.
     fixes = [c for c in item.concerns if c.recommendation]
-    assert ui.texts.count("Risk") == len(risks)
+    assert ui.texts.count("Risk") == len([c for c in gaps if c.risk])
+    assert ui.texts.count("Note") == len([c for c in advice if c.risk])
     assert ui.texts.count("Recommendation") == len(fixes)
-    assert ui.icons.count("warning") == len(risks)
+    assert ui.icons.count("warning") == len([c for c in gaps if c.risk])
     assert ui.icons.count("lightbulb") == len(fixes)
     # The fix sits on its own tinted panel, which is what separates it from the risk at
     # a glance rather than relying on a fainter text color.
     assert sum("bg-green-50" in c for c in ui.classes) == len(fixes)
+    # Advisory cards use the calm info-blue surface, not the neutral/amber problem one.
+    assert sum("bg-sky-50" in c for c in ui.classes) == len(advice)
 
 
 def test_row_falls_back_to_joined_text_for_a_pre_concerns_report() -> None:
