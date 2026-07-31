@@ -336,6 +336,43 @@ def test_copy_ddl_button_writes_text_and_confirms() -> None:
     assert ui.notifications == [("Target DDL copied.", "positive")]
 
 
+def test_copy_ddl_button_reads_a_callable_at_click_time() -> None:
+    """The editor's Copy must reflect the user's typing, not the DDL at build time.
+
+    In Edit mode the header captured ``current`` -- the DDL when the editor was built -- so
+    after typing, Copy handed back the pre-edit text (with a positive "copied" toast) while
+    Apply sent the edited text: copy and apply disagreeing on the same button row. A callable
+    read at click time fixes it.
+    """
+    buffer = {"ddl": "CREATE TABLE t (id INT);"}
+    ui = _CopyUi()
+    _render_copy_ddl_button(ui, lambda: buffer["ddl"], label="Target DDL")
+
+    # The user types; the buffer changes AFTER the button was rendered.
+    buffer["ddl"] = "CREATE TABLE t (id INT); -- edited"
+    ui.on_click()
+    assert ui.clipboard.written == ["CREATE TABLE t (id INT); -- edited"], ui.clipboard.written
+
+
+def test_edit_mode_copy_passes_a_live_buffer_reader_not_a_string() -> None:
+    """The edit header must hand Copy a callable over the buffer, not a build-time string.
+
+    Pairs with test_copy_ddl_button_reads_a_callable_at_click_time (which proves the button
+    honours a callable); this proves the edit branch actually passes one.
+    """
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion
+
+    editing = inspect.getsource(schema_conversion._render_editable_target).split(
+        "else:", 1
+    )[1]
+    assert "copy_ddl=lambda:" in editing, editing[:600]
+    assert "get_edited_target_ddl(preview.object_name)" in editing
+    # NOT the stale build-time string.
+    assert "copy_ddl=current" not in editing
+
+
 def test_copy_ddl_button_falls_back_when_clipboard_unavailable() -> None:
     ui = _CopyUi(clipboard_fails=True)
     _render_copy_ddl_button(ui, "CREATE TABLE t (id INT);", label="Source DDL")
@@ -1922,7 +1959,7 @@ def test_cdc_apply_block_message_is_actionable() -> None:
 
 
 class _NotesUi:
-    """NiceGUI double recording the notes block's labels, badges, icons, tooltips."""
+    """NiceGUI double for the notes block. ``cards`` pairs each tinted card surface with the badges rendered inside it, so a test can assert which note got which surface/colour."""
 
     def __init__(self):
         self.texts: list[str] = []
@@ -1930,17 +1967,25 @@ class _NotesUi:
         self.icons: list[str] = []
         self.tooltips: list[str] = []
         self.classes: list[str] = []
+        self.cards: list[dict] = []
 
     class _El:
-        def __init__(self, rec):
+        def __init__(self, rec, badge=None):
             self._rec = rec
+            self._badge = badge
 
         def classes(self, value="", *_a, **_k):
             if value:
                 self._rec.classes.append(str(value))
+                if "rounded-md" in str(value) and "border" in str(value):
+                    self._rec.cards.append({"surface": str(value), "badges": []})
             return self
 
-        def props(self, *_a, **_k):
+        def props(self, value="", *_a, **_k):
+            if self._badge is not None and "color=" in str(value):
+                self._badge["color"] = str(value).split("color=", 1)[1].split()[0]
+                if self._rec.cards:
+                    self._rec.cards[-1]["badges"].append(self._badge)
             return self
 
         def tooltip(self, text="", *_a, **_k):
@@ -1960,7 +2005,7 @@ class _NotesUi:
 
     def badge(self, text="", *_a, **_k):
         self.badges.append(str(text))
-        return self._El(self)
+        return self._El(self, badge={"text": str(text), "color": None})
 
     def icon(self, name="", *_a, **_k):
         if name:
@@ -2260,6 +2305,8 @@ class _DdlPaneUi:
         self.labels: list[str] = []
         self.editors: list[dict] = []
         self.css: list[str] = []
+        self.clicks: list = []
+        self.dialogs_opened: int = 0
 
     class _El:
         def __init__(self, rec):
@@ -2275,12 +2322,12 @@ class _DdlPaneUi:
             return lambda *_a, **_k: self
 
     def codemirror(self, value="", **kwargs):
-        entry = {"value": value, **kwargs, "props": []}
+        entry = {"value": value, **kwargs, "props": [], "classes": []}
         self.editors.append(entry)
         return self._PropEl(self, entry)
 
     class _PropEl:
-        """Element double that records ``.props()`` on the editor it came from."""
+        """Element double recording ``.props()`` and ``.classes()`` on its editor."""
 
         def __init__(self, rec, entry):
             self._rec = rec
@@ -2289,6 +2336,11 @@ class _DdlPaneUi:
         def props(self, value="", *_a, **_k):
             if value:
                 self._entry["props"].append(str(value))
+            return self
+
+        def classes(self, value="", *_a, **_k):
+            if value:
+                self._entry["classes"].append(str(value))
             return self
 
         def __enter__(self):
@@ -2306,6 +2358,35 @@ class _DdlPaneUi:
 
     def add_css(self, css="", *_a, **_k):
         self.css.append(str(css))
+
+    def button(self, *_a, on_click=None, **_k):
+        # Record every button's click handler so a test can invoke expand and see what it
+        # does, instead of only grepping the source for the button's existence.
+        if on_click is not None:
+            self.clicks.append(on_click)
+        return self._El(self)
+
+    class _Dialog:
+        def __init__(self, rec):
+            self._rec = rec
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def open(self):
+            self._rec.dialogs_opened += 1
+
+        def close(self, *_a, **_k):
+            return None
+
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: self
+
+    def dialog(self, *_a, **_k):
+        return _DdlPaneUi._Dialog(self)
 
     def __getattr__(self, _name):
         return lambda *_a, **_k: self._El(self)
@@ -2351,14 +2432,28 @@ def test_ddl_pane_height_css_targets_the_editor_not_the_wrapper() -> None:
     A ``max-height`` on the outer element left ``.cm-editor`` at its default 256px and the
     taller pane was cut off mid-statement with no scrollbar to reveal it.
     """
-    from dsql_migrator.ui.schema_conversion import _render_ddl_diff
+    from dsql_migrator.ui.schema_conversion import _DDL_PANE_CSS, _render_ddl_diff
 
+    # The INLINE pane rules must exist in their own right, not be satisfied by the unrelated
+    # .ddl-expanded rules that carry the same substrings. Deleting the .ddl-pane block sent
+    # the comparison panes back to CodeMirror's 256px default with no scroller cap -- the
+    # clipping bug these rules fix -- yet a whole-sheet substring search still passed.
+    pane_rules = [
+        line for line in _DDL_PANE_CSS.splitlines()
+        if line.strip().startswith(".ddl-pane")
+    ]
+    assert any(".ddl-pane .cm-editor" in r for r in pane_rules), _DDL_PANE_CSS
+    scroller = next((r for r in pane_rules if ".ddl-pane .cm-scroller" in r), "")
+    assert scroller, _DDL_PANE_CSS
+    assert "max-height" in scroller and "overflow: auto" in scroller, scroller
+
+    # And the inline panes actually carry the ddl-pane class, or the rules apply to nothing.
     ui = _DdlPaneUi()
     _render_ddl_diff(ui, "a", "b")
-    css = "\n".join(ui.css)
-    assert ".cm-editor" in css, css
-    assert ".cm-scroller" in css, css
-    assert "overflow: auto" in css, css
+    assert ui.editors, "expected both panes to render"
+    for editor in ui.editors:
+        assert any("ddl-pane" in c for c in editor["classes"]), editor
+    assert _DDL_PANE_CSS in ui.css, "the pane stylesheet was not injected"
 
 
 def test_ddl_comparison_panes_are_not_editable() -> None:
@@ -2386,20 +2481,23 @@ def test_ddl_comparison_panes_are_not_editable() -> None:
 
 
 def test_ddl_comparison_shows_the_edited_ddl_not_the_generated_one() -> None:
-    """Apply uses the edited buffer, so the comparison must show what will be applied.
+    """The comparison must show the edited DDL, since that is what Apply sends.
 
-    The renderer takes whatever DDL its caller passes; this pins that the caller passes the
-    per-object edit when one exists, which is what keeps "what you see" and "what Apply
-    sends" the same string.
+    Rendered, not grepped: an earlier version asserted the two source lines exist, so a later
+    line that clobbered ``current`` back to the generated DDL passed while the saved edit
+    vanished from view. This checks the target pane actually receives the edit.
     """
-    import inspect
+    from dsql_migrator.ui.schema_conversion import _render_editable_target
 
-    from dsql_migrator.ui import schema_conversion
+    edited = 'CREATE TABLE "t" ("id" INT); -- my edit'
+    ui = _editable_target_ui()
+    _render_editable_target(ui, _StubPreview(), _StubConvState(edited=edited))
 
-    source = inspect.getsource(schema_conversion._render_editable_target)
-    # The read-only branch renders `current`, which is `edited if edited is not None`.
-    assert "current = edited if edited is not None else preview.target_ddl" in source
-    assert "_render_ddl_diff(ui, preview.source_ddl, current)" in source
+    # Read-only mode renders two editors: source (left) and the effective target (right).
+    targets = [e["value"] for e in ui.editors if e.get("language") == "PostgreSQL"]
+    assert targets == [edited], (targets, edited)
+    # The generated DDL is NOT what is shown when an edit exists.
+    assert _StubPreview.target_ddl not in targets, targets
 
 
 def _editable_target_ui():
@@ -2411,9 +2509,11 @@ def _editable_target_ui():
             self.buttons: list[str] = []
             self.badges: list[str] = []
 
-        def button(self, text="", *_a, **_k):
+        def button(self, text="", *_a, on_click=None, **_k):
             if text:
                 self.buttons.append(str(text))
+            if on_click is not None:
+                self.clicks.append(on_click)
             return self._El(self)
 
         def badge(self, text="", *_a, **_k):
@@ -2577,21 +2677,44 @@ def test_conversion_note_cards_match_the_evaluation_finding_treatment() -> None:
 
     ui = _NotesUi()
     _render_conversion_warnings(ui, [_loss_note(), _recommendation_note()])
-    blob = " ".join(ui.classes)
 
-    # No uncolored border anywhere in the block.
+    # No uncolored border anywhere -- a bare `border` is Tailwind's near-black default.
     assert not any(
-        c.split() and "border" in c.split() and not any(
-            t.startswith("border-") for t in c.split()
-        )
+        "border" in c.split() and not any(t.startswith("border-") for t in c.split())
         for c in ui.classes
     ), ui.classes
-    # A real gap gets the neutral card, advice the calm sky one -- the same two surfaces
-    # Evaluation uses for a finding and a recommendation.
-    assert "border-gray-200 bg-gray-50" in blob, ui.classes
-    assert "border-sky-200 bg-sky-50" in blob, ui.classes
-    # Same corner radius as the Evaluation card, not the tighter `rounded`.
-    assert "rounded-md" in blob, ui.classes
+
+    # WHICH note gets WHICH surface, not merely that both surfaces appear. A LOSS is the
+    # neutral card, a RECOMMENDATION the calm sky one -- the pair Evaluation uses. Asserting
+    # only that both strings exist let a severity inversion (LOSS painted sky, advice gray)
+    # pass; this pins each card to its note.
+    by_badge = {}
+    for card in ui.cards:
+        assert "rounded-md" in card["surface"], card  # not the tighter `rounded`
+        for badge in card["badges"]:
+            by_badge[badge["text"]] = card["surface"]
+    # The loss note badges MANUAL; the recommendation badges RECOMMENDED.
+    assert "border-gray-200 bg-gray-50" in by_badge.get("MANUAL", ""), ui.cards
+    assert "border-sky-200 bg-sky-50" in by_badge.get("RECOMMENDED", ""), ui.cards
+
+
+def test_conversion_note_badge_colors_track_severity() -> None:
+    """A LOSS badge is amber/red; a RECOMMENDATION badge is calm info -- never inverted.
+
+    The only prior assertion was ``"RECOMMENDED" in ui.badges`` (text), so flipping the
+    advisory badge to ``negative`` (red advice) passed. This checks the colour each note's
+    badge actually carries.
+    """
+    from dsql_migrator.ui.schema_conversion import _render_conversion_warnings
+
+    ui = _NotesUi()
+    _render_conversion_warnings(ui, [_loss_note(), _recommendation_note()])
+    color_of = {
+        b["text"]: b["color"] for card in ui.cards for b in card["badges"]
+    }
+    # A real gap is warning-toned; advice is the calm info tone, not a severity colour.
+    assert color_of.get("MANUAL") == "warning", color_of
+    assert color_of.get("RECOMMENDED") == "info", color_of
 
 
 def test_conversion_note_surfaces_come_from_the_same_tokens_evaluation_uses() -> None:
@@ -2606,3 +2729,48 @@ def test_conversion_note_surfaces_come_from_the_same_tokens_evaluation_uses() ->
     for surface in ("border-gray-200 bg-gray-50", "border-sky-200 bg-sky-50"):
         assert surface in notes, surface
         assert surface in concern, surface
+
+
+def test_expand_button_opens_a_dialog_with_an_expanded_editor() -> None:
+    """The expand affordance must actually open something.
+
+    Every prior assertion about expand was an inspect.getsource() grep, so deleting
+    dialog.open(), inverting the render guard, or making the handler raise all left the suite
+    green. This calls the button's handler directly and checks a dialog opened and rendered
+    the DDL in the EXPANDED editor surface (not the inline-capped one).
+    """
+    from dsql_migrator.ui.schema_conversion import _render_expand_ddl_button
+
+    ui = _DdlPaneUi()
+    _render_expand_ddl_button(
+        ui, 'CREATE TABLE "t" ("id" INT)', title="Target — Aurora DSQL",
+        language="PostgreSQL",
+    )
+    # The button registered a click handler; nothing has opened yet.
+    assert ui.clicks, "expand button has no click handler"
+    assert ui.dialogs_opened == 0
+    assert ui.editors == []
+
+    ui.clicks[-1]()  # click Expand
+
+    assert ui.dialogs_opened == 1, "expand click did not open a dialog"
+    # The dialog rendered the DDL in an editor, in the expanded surface, read-only.
+    assert len(ui.editors) == 1, ui.editors
+    editor = ui.editors[0]
+    assert editor["value"] == 'CREATE TABLE "t" ("id" INT)'
+    assert editor["language"] == "PostgreSQL"
+    assert "disable" in editor["props"], editor
+
+
+def test_ddl_diff_wires_an_expand_handler_to_each_pane() -> None:
+    # Both comparison panes get an expand handler (over the copy handlers), so neither side
+    # is left without the affordance.
+    from dsql_migrator.ui.schema_conversion import _render_ddl_diff
+
+    ui = _DdlPaneUi()
+    _render_ddl_diff(ui, "CREATE TABLE `t` (`id` int)", 'CREATE TABLE "t" ("id" INT)')
+    # Clicking every registered handler must open exactly two dialogs -- one per pane's
+    # expand button (the copy handlers open none).
+    for click in ui.clicks:
+        click()
+    assert ui.dialogs_opened == 2, (ui.dialogs_opened, len(ui.clicks))

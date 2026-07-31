@@ -5,6 +5,35 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.190
+
+### Fixed
+
+- **Edit mode's Copy button copied the pre-edit DDL.** The editor header captured the DDL
+  string as it was when the editor was built, so after typing a fix, "Copy Target DDL"
+  handed back the original — with a positive "copied" toast — while "Apply to target" sent
+  the edited version. The same button row disagreed with itself. `_render_copy_ddl_button`
+  now accepts a callable read at click time, and the editor header passes one that reads the
+  live edit buffer. Verified in a browser: typing then copying now yields the edited DDL.
+
+### Tests
+
+- **Closed five gaps a code review found by mutation testing** — behaviours that could
+  regress with the suite still green, because the tests asserted on `inspect.getsource(...)`
+  substrings rather than rendered output, and the `_NotesUi` / `_DdlPaneUi` doubles discarded
+  `props()`/`classes()`/`on_click`. Now caught, each confirmed by re-running the mutation:
+  - inverting the conversion-note tints (a real `LOSS` shown calm sky-blue, an optional
+    recommendation neutral-gray — the severity inversion this series existed to fix);
+  - flipping the advisory badge to `negative` (red advice);
+  - deleting `dialog.open()` / inverting the render guard / raising in the expand handler
+    (the whole expand feature made a no-op);
+  - clobbering `current` back to the generated DDL (the saved edit vanishing from view while
+    Apply still sends it);
+  - deleting the inline `.ddl-pane` height rules (the comparison panes falling back to
+    CodeMirror's 256px default with no scroller cap).
+  The `_NotesUi` and `_DdlPaneUi` doubles now record card-to-badge pairing, editor classes,
+  button clicks and dialog opens, so these assert on what renders rather than on source text.
+
 ## v0.1.189
 
 ### Changed

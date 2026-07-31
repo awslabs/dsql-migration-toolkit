@@ -3781,18 +3781,24 @@ def _render_conversion_warnings(
         )
 
 
-def _render_copy_ddl_button(ui: object, text: str, *, label: str) -> None:
+def _render_copy_ddl_button(ui: object, text, *, label: str) -> None:
     """Render a small copy-to-clipboard icon button for a DDL block.
 
     ``label`` names what is copied (e.g. "Source DDL") so the confirmation toast
     and the button tooltip are specific. Mirrors the copy pattern used elsewhere
     (``ui.clipboard.write`` + a positive toast, with a graceful fallback when the
     browser clipboard is unavailable, e.g. non-HTTPS or denied permission).
+
+    ``text`` may be a string OR a zero-arg callable read at click time. The editor
+    header passes a callable: its DDL changes as the user types, and capturing the
+    string at build time copied the pre-edit version while "Apply to target" sent the
+    edited one -- copy and apply disagreeing on the same button row.
     """
 
     def _copy() -> None:
+        value = text() if callable(text) else text
         try:
-            ui.clipboard.write(text)  # type: ignore[attr-defined]
+            ui.clipboard.write(value)  # type: ignore[attr-defined]
             ui.notify(f"{label} copied.", type="positive", position="top")  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001 - clipboard may be unavailable
             ui.notify(  # type: ignore[attr-defined]
@@ -3924,7 +3930,7 @@ def _render_ddl_header(
     *,
     icon: str,
     title: str,
-    copy_ddl: str,
+    copy_ddl,  # str | Callable[[], str]: a callable is read at click time
     copy_label: str,
     width: str = "w-1/2",
     divider: bool = False,
@@ -4119,7 +4125,14 @@ def _render_editable_target(
                             ui,
                             icon="cloud_queue",
                             title="Target — Aurora DSQL",
-                            copy_ddl=current,
+                            # A callable, read at click time, so Copy reflects the user's
+                            # typing. on_edit writes each keystroke to the buffer; copying
+                            # ``current`` (the string at build time) handed back the pre-edit
+                            # DDL while Apply sent the edited one.
+                            copy_ddl=lambda: (
+                                conv_state.get_edited_target_ddl(preview.object_name)
+                                or preview.target_ddl
+                            ),
                             copy_label="Target DDL",
                             width="w-full",
                             # No expand here: the dialog is read-only, and offering it
