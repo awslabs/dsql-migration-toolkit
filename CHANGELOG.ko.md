@@ -5,6 +5,14 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.189
+
+### Changed
+
+- **공개된 ECR Public 기본값이 `0.1.188`을 가리킵니다.** 두 리전 ECR(`ap-northeast-2`,
+  `us-east-1`)과 ECR Public 모두 `0.1.188`을 갖고 있으며, 신규 배포가 사용하는 익명 pull 경로까지
+  확인했습니다.
+
 ## v0.1.188
 
 ### Fixed
