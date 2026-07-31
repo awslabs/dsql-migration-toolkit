@@ -1776,10 +1776,13 @@ def _render_cdc_infra_deploy_action(
     # connector failure later.
     _prereq_block = cdc_prerequisite_block_reason(
         migration_state.get_prereq_report(MigrationMode.CDC),
-        # The reports are never persisted and the Full Load clears them when it
-        # starts, so a finished Full-load-+-CDC run legitimately has none. The run
-        # could only have STARTED once the CDC-superset checks passed, and THAT is
-        # recorded durably -- use it instead of re-demanding the checks.
+        # The reports are never persisted, so a reconnected Full-load-+-CDC run
+        # legitimately has none. (Nothing CLEARS them either -- an earlier version of
+        # this comment said the Full Load does, which was never true: the start path
+        # only records prereq_gated_mode. A report therefore outlives the selection it
+        # covered, which is why the run guard also checks its scope.) The run could
+        # only have STARTED once the CDC-superset checks passed, and THAT is recorded
+        # durably -- use it instead of re-demanding the checks.
         cdc_checks_already_passed=(
             getattr(migration_state, "prereq_gated_mode", None) is MigrationMode.CDC
         ),

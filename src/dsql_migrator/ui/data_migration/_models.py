@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Optional, Sequence
+from typing import Iterable, Optional, Sequence
 
 from dsql_migrator.core.assessor import (
     _OVERSIZED_LOB_BASES,
@@ -732,6 +732,55 @@ def summarize_table_states(
 # ---------------------------------------------------------------------------
 # Prerequisite gating & error-log summary (NiceGUI-agnostic)
 # ---------------------------------------------------------------------------
+
+
+def prereq_report_covered_tables(report: Optional[PrerequisiteReport]) -> set[str]:
+    """Return the table names a prerequisite report actually covered.
+
+    Derived from the report itself rather than tracked as new state: the checker emits one
+    ``TABLE_PRIMARY_KEY`` and one ``TARGET_SCHEMA_READY`` result per selected table, each
+    carrying that table in ``target`` (``core/prerequisites.py``), so the covered set is
+    already in the object. That matters because the reports are never persisted and nothing
+    clears them -- a report outlives the selection it was run for, and recording the scope
+    separately would add a second thing to keep in sync.
+
+    Returns an empty set for ``None`` or a report with no per-table results (a mode whose
+    checks are all table-independent), which callers must read as "scope unknown", not as
+    "nothing was covered".
+    """
+    if report is None:
+        return set()
+    per_table = (
+        PrerequisiteCheckId.TABLE_PRIMARY_KEY,
+        PrerequisiteCheckId.TARGET_SCHEMA_READY,
+    )
+    return {
+        result.target
+        for result in report.results
+        if result.check_id in per_table and result.target
+    }
+
+
+def prereq_scope_gap(
+    report: Optional[PrerequisiteReport], selected: Iterable[str]
+) -> list[str]:
+    """Return selected tables the report never checked, sorted; empty when in scope.
+
+    ASYMMETRIC ON PURPOSE. Removing a table from the selection leaves the report a
+    superset -- everything still selected was checked and passed -- so that is not a gap and
+    must not block. Adding one is different: it never saw ``TARGET_SCHEMA_READY``, and
+    ``run_full_load`` raises ``FullLoadIncompleteError`` on any per-table failure, so an
+    unchecked table can fail the whole job rather than just itself.
+
+    Returns ``[]`` when the report is absent or carries no per-table results, so a
+    table-independent report (or a reconnected session with no report at all) is left to the
+    guards that already handle an absent report -- this helper only reports a gap it can
+    actually prove.
+    """
+    covered = prereq_report_covered_tables(report)
+    if not covered:
+        return []
+    return sorted(name for name in selected if name and name not in covered)
 
 
 def prerequisite_block_reason(report: PrerequisiteReport) -> Optional[str]:
@@ -1532,8 +1581,10 @@ def cdc_prerequisite_block_reason(
     guard already owns and which do not make streaming impossible.
 
     ``cdc_checks_already_passed`` excuses an ABSENT report. The reports live in process
-    memory only and are deliberately never persisted, so they vanish on an app restart
-    -- and the Full Load itself clears them when it starts. Without this the gate
+    memory only and are deliberately never persisted, so they vanish on an app restart.
+    (Nothing clears them otherwise -- this docstring used to claim the Full Load does,
+    which was never true; the start path only records the gated mode.) Without this the
+    gate
     punished the normal Full-load-+-CDC flow: run the CDC prerequisites, let the load
     finish, and "Deploy CDC infrastructure" was blocked telling you to run checks you
     had already run. Callers pass the recorded gated mode (the load could only have

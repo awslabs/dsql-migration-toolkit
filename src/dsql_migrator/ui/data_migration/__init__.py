@@ -163,6 +163,7 @@ from dsql_migrator.ui.data_migration._models import (
     build_migration_table_status,
     _LOAD_STATE_ORDER,
     summarize_table_states,
+    prereq_scope_gap,
     prerequisite_block_reason,
     PrereqCategory,
     _PREREQ_CATEGORY_BY_CHECK,
@@ -784,26 +785,27 @@ def build_data_migration_screen(
                 ui.notify("Object browser refreshed.", type="positive")
                 refresh()
 
-            # Lock the table picker once prerequisite checks have run for the
-            # selected mode: the checks (and any CDC start offset / connector
-            # config) are scoped to that exact table set, so changing it
-            # afterwards would silently invalidate them. The user re-runs checks
-            # to change the selection. Also lock once CDC has started: the running
-            # source connector's table set is fixed (changing the picker cannot
-            # add/remove streamed tables on the live pipeline).
-            selection_locked = (
-                migration_state.get_prereq_report(prereq_mode) is not None
-                or cdc_streaming_started(migration_state, job_manager)
-            )
-
             job = _current_job(job_manager, migration_state.job_id)
+
+            # Why the table picker is frozen (None = still editable). Single source for
+            # both the boolean and the lock tooltip's wording, so the control and its
+            # explanation can never drift apart.
+            selection_lock = selection_lock_reason(
+                migration_state,
+                job_manager,
+                status=status,
+                migration_type=migration_type,
+                has_job=job is not None,
+            )
+            selection_locked = selection_lock is not None
 
             # When locked because CDC is actually streaming, reflect the REAL set of
             # tables the connectors were deployed with (watermark-covered / confirmed
             # selection), not the generic "everything on the target" default -- so a
             # reconnect shows what CDC is truly replicating instead of every table
-            # ticked-and-frozen. Only for the live-CDC lock; a prereq-only lock keeps
-            # the normal selection view.
+            # ticked-and-frozen. Only for the live-CDC lock -- the other lock causes
+            # (a finished Full Load, deployed-but-not-started CDC infra) have no
+            # connector table list to reflect, so they keep the normal selection view.
             locked_selection: Optional[list[str]] = None
             if selection_locked and cdc_streaming_started(migration_state, job_manager):
                 cdc_wm = getattr(job, "watermark", None) if job is not None else None
@@ -834,6 +836,7 @@ def build_data_migration_screen(
                     ),
                     on_refresh=refresh_browser,
                     locked=selection_locked,
+                    lock_reason=selection_lock,
                     locked_selection=locked_selection,
                 )
 
@@ -1602,6 +1605,20 @@ def full_load_run_guard_reason(
                 "wasn't lost, but the results aren't kept across an app restart."
             )
         return "Run the prerequisite checks first (Prerequisites tab)."
+    # A report can outlive the selection it covered: nothing clears it, and (since the lock
+    # only holds once inputs are committed) the picker is editable while the checks are just
+    # a preview. Block on tables ADDED since -- they never saw TARGET_SCHEMA_READY, and
+    # run_full_load raises FullLoadIncompleteError on any per-table failure, so one unchecked
+    # table fails the whole job. Removing tables is NOT a gap: the report is then a superset,
+    # so everything still selected was checked and passed.
+    added = prereq_scope_gap(report, state.selection.selected_tables)
+    if added:
+        listed = ", ".join(added[:3]) + (" and more" if len(added) > 3 else "")
+        return (
+            f"Re-run the prerequisite checks — {listed} "
+            f"{'were' if len(added) > 1 else 'was'} added to the selection after the "
+            "checks ran, so they were never checked."
+        )
     return prerequisite_block_reason(report)
 
 
@@ -1854,6 +1871,70 @@ def migration_type_lock_reason(migration_state, *, status) -> Optional[str]:
             "Locked because CDC connectors from a previous run are still deployed "
             "(Start over does not delete them). To change the type, use 'Delete "
             "CDC infrastructure' on the CDC step first."
+        )
+    return None
+
+
+def selection_lock_reason(
+    migration_state,
+    job_manager,
+    *,
+    status,
+    migration_type: MigrationType,
+    has_job: bool,
+) -> Optional[str]:
+    """Why the table picker is frozen, or ``None`` while the selection can still change.
+
+    The picker locks once the selection has been COMMITTED to something irreversible --
+    not merely once the read-only prerequisite checks have run. It used to lock on "a
+    prerequisite report exists", which was both too early and a dead end. Too early: the
+    checks are a preview, so locking on them froze the scope before any migration began.
+    A dead end: the lock's tooltip told the user to "re-run the checks to change which
+    tables are migrated", but ``run_checks`` pins the checked set via ``set_selection``
+    and then re-reads that pinned set (``touched=True``), so a re-run yields the SAME
+    set -- and nothing clears a report. The only real exits were Start over or an
+    undocumented migration-type flip (``prereq_mode`` is type-derived, so switching the
+    type unlocked the picker and left a stale-scoped report satisfying the run guard).
+    A late edit is instead caught by :func:`prereq_scope_gap` on the run guard.
+
+    The three commits that DO fix the table set, each with its own remedy:
+
+    * **A Full Load exists or finished** -- the export ran against this set (the job
+      survives as ``status DONE`` even after the job record is pruned).
+    * **CDC is streaming** -- the running source connector's table list is fixed;
+      ticking the picker cannot add or remove a streamed table.
+    * **CDC infrastructure is deployed or deploying** -- the subtle one. The immutable
+      topic-partition plan is baked at infra create (``core/cdc.py``), and the deploy
+      button lives on the PREREQUISITES step so the ~15-20 min MSK create can overlap
+      the load. A table added after that gets its topic created with 1 partition,
+      permanently. :func:`cdc_streaming_started` deliberately excludes an in-flight
+      ``kind="infra"`` job (counting it once froze this picker for 20 minutes), so
+      without this clause that whole window would be unguarded. Scoped to CDC-bearing
+      types so a Full-load-only run is not frozen by a CDC stack that merely exists in
+      the account.
+
+    Pure: reads ``status`` plus already-populated state (``job_manager`` is only used for
+    the job-id lookups the CDC helpers already do) -- no AWS I/O, so it is safe during
+    render and unit-testable.
+    """
+    if has_job or status is StepStatus.DONE:
+        return (
+            "Locked — a Full Load has already run for this table set. Use 'Start over' "
+            "to migrate a different set of tables."
+        )
+    if cdc_streaming_started(migration_state, job_manager):
+        return (
+            "Locked — CDC is running and its source connector streams a fixed table "
+            "set. To change it, stop CDC on the CDC step first."
+        )
+    if "cdc" in substeps_for_type(migration_type) and cdc_infra_prep_state(
+        migration_state, job_manager
+    ) in ("ready", "deploying"):
+        return (
+            "Locked — CDC infrastructure is deployed for this table set, and each "
+            "table's Kafka topic partitions are fixed when it is created. A table "
+            "added now would stream on a single partition. To change the set, delete "
+            "the CDC infrastructure on the CDC step first."
         )
     return None
 
@@ -2135,6 +2216,7 @@ def _render_table_selection(
     target_existing: Sequence[str] = (),
     on_refresh: Optional[Callable[[], object]] = None,
     locked: bool = False,
+    lock_reason: Optional[str] = None,
     locked_selection: Optional[Sequence[str]] = None,
 ) -> None:
     """Render the hierarchical table picker scoped to migratable tables (Req 5.9).
@@ -2152,6 +2234,12 @@ def _render_table_selection(
     run over exactly the chosen tables (Property 16). ``on_refresh``, when given,
     re-introspects this session's source/target so the browser reflects the
     latest schema (e.g. tables just created on the target in Step 2).
+
+    ``locked`` freezes the picker; ``lock_reason`` (from
+    :func:`selection_lock_reason`) is the cause + remedy shown on the lock icon's
+    tooltip. The causes differ materially -- a finished Full Load, live CDC, and
+    deployed CDC infrastructure each need a different remedy -- so the caller passes
+    the reason rather than this renderer guessing one.
     """
     with ui.row().classes("items-center gap-1"):
         ui.label("Tables to migrate").classes("text-sm font-semibold")
@@ -2163,18 +2251,21 @@ def _render_table_selection(
             "routines have no data of their own; they are created in Schema "
             "Conversion, not migrated in this step."
         )
-        # The refresh button is hidden once locked: re-introspecting could change
-        # the migratable set out from under the prerequisite checks/config.
+        # The refresh button is hidden once locked: re-introspecting could change the
+        # migratable set out from under a committed migration (a running/finished load,
+        # or the connector + partition plan CDC was deployed with).
         if on_refresh is not None and not locked:
             ui.button(on_click=on_refresh).props(
                 "flat dense round size=sm icon=refresh"
             ).tooltip("Refresh source/target objects")
         if locked:
             # The lock icon's tooltip carries the reason + how to change it, so no
-            # separate standing "Locked — …" paragraph is needed below.
+            # separate standing "Locked — …" paragraph is needed below. The reason is
+            # per-cause (see selection_lock_reason); the fallback only covers a caller
+            # that passes locked=True without one.
             ui.icon("lock", color="grey").classes("text-sm").tooltip(
-                "Locked — prerequisite checks ran for this selection. Re-run the "
-                "checks (Prerequisites step) to change which tables are migrated."
+                lock_reason
+                or "Locked — this table set is already committed to a migration."
             )
     if not migratable:
         render_notice(
@@ -2196,12 +2287,13 @@ def _render_table_selection(
 
     migratable_order = list(migratable)
     if locked and locked_selection is not None:
-        # Locked because CDC is live (or prereqs ran): the connectors stream a
-        # FIXED table set, so the browser must reflect THAT set -- not the generic
-        # "everything on the target" default. Without this, a reconnect (which
-        # resets selection_touched paths) shows every migratable table ticked and
-        # frozen, misrepresenting what CDC is actually replicating. Intersect with
-        # the migratable universe so only real, tickable leaves are marked.
+        # Locked because CDC is live: the connectors stream a FIXED table set, so the
+        # browser must reflect THAT set -- not the generic "everything on the target"
+        # default. Without this, a reconnect (which resets selection_touched paths)
+        # shows every migratable table ticked and frozen, misrepresenting what CDC is
+        # actually replicating. Intersect with the migratable universe so only real,
+        # tickable leaves are marked. (Only the caller's live-CDC branch passes this;
+        # the other lock causes keep the normal selection view.)
         locked_set = set(locked_selection)
         effective = [name for name in migratable_order if name in locked_set]
     else:
@@ -3788,6 +3880,26 @@ def _render_prerequisites_panel(
             ui.label(running_text).classes("text-sm text-gray-600")
     report = migration_state.get_prereq_report(mode)
     if report is not None:
+        # A report can outlive the selection it covered (nothing clears it, and the
+        # picker stays editable until a migration commits). If tables were ADDED since,
+        # the verdict below is stale for them -- they were never checked -- and the run
+        # guard blocks on exactly this. Surface it here too so the reason sits next to
+        # the results the user is reading, not only on a disabled button elsewhere.
+        added = prereq_scope_gap(report, migration_state.selection.selected_tables)
+        if added:
+            listed = ", ".join(added[:6]) + (
+                f" +{len(added) - 6} more" if len(added) > 6 else ""
+            )
+            render_notice(
+                ui,
+                tone="warning",
+                header="These results don't cover your current selection",
+                body=(
+                    f"{listed} {'were' if len(added) > 1 else 'was'} added after these "
+                    "checks ran, so they were never checked. Re-run the checks to cover "
+                    "the full selection before migrating."
+                ),
+            )
         _render_prereq_results(ui, mode, report, combined=combined)
 
 

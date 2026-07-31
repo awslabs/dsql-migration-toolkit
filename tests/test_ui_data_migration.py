@@ -65,6 +65,7 @@ from dsql_migrator.ui.data_migration import (
     group_prereq_results,
     job_status_to_step_status,
     migratable_table_names,
+    MigrationType,
     prerequisite_block_reason,
     run_data_migration,
     run_full_load,
@@ -6306,6 +6307,316 @@ def test_migration_type_lock_reason_none_when_idle() -> None:
     state = DataMigrationState()
     assert migration_type_lock_reason(state, status=StepStatus.NOT_STARTED) is None
     assert migration_type_locked(state, None, status=StepStatus.NOT_STARTED) is False
+
+
+# ---------------------------------------------------------------------------
+# Table-picker lock: selection_lock_reason (the pure "why is it frozen" source)
+# and the rendered picker (tooltip carries the reason; editable while a report is
+# just a preview). See selection_lock_reason's docstring for the design.
+# ---------------------------------------------------------------------------
+
+
+def _fl_report(*names: str) -> PrerequisiteReport:
+    """A passing FULL_LOAD report that COVERED exactly ``names`` (one
+    TARGET_SCHEMA_READY per table, matching what core/prerequisites.py emits)."""
+    results = [_result(PrerequisiteCheckId.SOURCE_REACHABLE, PrerequisiteStatus.PASS)]
+    for name in names:
+        results.append(
+            _result(
+                PrerequisiteCheckId.TABLE_PRIMARY_KEY,
+                PrerequisiteStatus.PASS,
+                target=name,
+                title="Table has a primary key",
+            )
+        )
+        results.append(
+            _result(
+                PrerequisiteCheckId.TARGET_SCHEMA_READY,
+                PrerequisiteStatus.PASS,
+                target=name,
+                title="Target schema is ready for the table",
+            )
+        )
+    return PrerequisiteReport.build(MigrationMode.FULL_LOAD, results)
+
+
+def test_selection_editable_with_a_report_but_no_committed_migration() -> None:
+    # The whole point of the rewrite: a prerequisite report is a PREVIEW, not a
+    # commit. The picker must stay editable while only a report exists -- locking on
+    # it (the old behavior) froze the scope before any migration began, and its own
+    # "re-run the checks to change it" remedy was a dead end (a re-run re-pins the
+    # SAME set). Late edits are instead caught by the run guard's scope check.
+    from dsql_migrator.ui.data_migration import selection_lock_reason
+
+    state = DataMigrationState()
+    state.set_prereq_report(MigrationMode.FULL_LOAD, _fl_report("orders", "customers"))
+    assert (
+        selection_lock_reason(
+            state,
+            _StubJobManager({}),
+            status=StepStatus.NOT_STARTED,
+            migration_type=MigrationType.FULL_LOAD_ONLY,
+            has_job=False,
+        )
+        is None
+    )
+
+
+def test_selection_locks_once_a_full_load_job_exists() -> None:
+    # A running/finished Full Load exported against this exact set, so it is frozen.
+    from dsql_migrator.ui.data_migration import selection_lock_reason
+
+    reason = selection_lock_reason(
+        DataMigrationState(),
+        _StubJobManager({}),
+        status=StepStatus.IN_PROGRESS,
+        migration_type=MigrationType.FULL_LOAD_ONLY,
+        has_job=True,
+    )
+    assert reason is not None
+    assert "Full Load" in reason
+    assert "Start over" in reason  # the actual remedy, not "re-run the checks"
+
+
+def test_selection_locks_when_step_is_done_even_if_the_job_record_is_pruned() -> None:
+    # The job record can be pruned while the workflow's Full Load step stays DONE
+    # across a session restore. The lock must survive that (has_job=False), keyed off
+    # the DONE status -- otherwise a reconnect after a finished load re-opens the
+    # picker over an already-loaded table set.
+    from dsql_migrator.ui.data_migration import selection_lock_reason
+
+    reason = selection_lock_reason(
+        DataMigrationState(),
+        _StubJobManager({}),
+        status=StepStatus.DONE,
+        migration_type=MigrationType.FULL_LOAD_ONLY,
+        has_job=False,
+    )
+    assert reason is not None
+    assert "Full Load" in reason
+
+
+def test_selection_locks_while_cdc_is_streaming() -> None:
+    # The live source connector's table list is fixed; ticking cannot add/remove a
+    # streamed table. The remedy is to stop CDC, not Start over.
+    from dsql_migrator.ui.data_migration import selection_lock_reason
+
+    state = DataMigrationState()
+    state.set_cdc_stack_phase("running")
+    reason = selection_lock_reason(
+        state,
+        _StubJobManager({}),
+        status=StepStatus.NOT_STARTED,
+        migration_type=MigrationType.CDC_ONLY,
+        has_job=False,
+    )
+    assert reason is not None
+    assert "CDC is running" in reason
+    assert "stop CDC" in reason
+
+
+def test_selection_locks_once_cdc_infra_is_deployed_because_partitions_are_immutable() -> None:
+    # THE irreversible-partition-plan lock. Kafka topic partitions are baked when the
+    # topic is created at infra deploy; a table added afterwards streams on a single
+    # partition, permanently. The deploy button sits on the Prerequisites step so the
+    # ~15-20 min MSK create can overlap the Full Load, and cdc_streaming_started
+    # deliberately excludes the in-flight infra job -- so WITHOUT this clause that
+    # entire window is unguarded. Do not "simplify" this lock away.
+    from dsql_migrator.ui.data_migration import selection_lock_reason
+
+    state = DataMigrationState()
+    state.set_cdc_stack_name("mysql-dsql-cdc-orders")
+    state.set_cdc_stack_phase("infra")  # deployed, not yet streaming
+    reason = selection_lock_reason(
+        state,
+        _StubJobManager({}),
+        status=StepStatus.NOT_STARTED,
+        migration_type=MigrationType.FULL_LOAD_AND_CDC,
+        has_job=False,
+    )
+    assert reason is not None
+    assert "partition" in reason
+    assert "delete the cdc infrastructure" in reason.lower()
+
+
+def test_selection_locks_while_cdc_infra_is_still_deploying() -> None:
+    # The lock has to hold DURING the ~15-20 min create too, not only after it lands
+    # -- that overlap window is exactly when the user is tempted to keep editing.
+    from dsql_migrator.ui.data_migration import selection_lock_reason
+
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("infra-1", kind="infra")
+    mgr = _StubJobManager({"infra-1": _StubJob("RUNNING")})
+    reason = selection_lock_reason(
+        state,
+        mgr,
+        status=StepStatus.NOT_STARTED,
+        migration_type=MigrationType.FULL_LOAD_AND_CDC,
+        has_job=False,
+    )
+    assert reason is not None
+    assert "partition" in reason  # the infra-clause message, not the cdc-live one
+
+
+def test_cdc_infra_lock_is_scoped_to_cdc_bearing_types() -> None:
+    # A Full-load-only run must not be frozen by a CDC stack that merely exists in the
+    # account (e.g. left by another migration): its topic-partition plan is irrelevant
+    # to a load that will never stream.
+    from dsql_migrator.ui.data_migration import selection_lock_reason
+
+    state = DataMigrationState()
+    state.set_cdc_stack_name("mysql-dsql-cdc-orders")
+    state.set_cdc_stack_phase("infra")
+    assert (
+        selection_lock_reason(
+            state,
+            _StubJobManager({}),
+            status=StepStatus.NOT_STARTED,
+            migration_type=MigrationType.FULL_LOAD_ONLY,
+            has_job=False,
+        )
+        is None
+    )
+
+
+class _PickerUi(_RecordingUi):
+    """_RecordingUi that also captures every tooltip string and button label, so a
+    test can assert the lock icon's tooltip and the editable-only controls."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tooltips: list[str] = []
+        self.buttons: list[str] = []
+
+    class _El(_RecordingUi._El):
+        def __init__(self, ui):
+            self._ui = ui
+
+        def tooltip(self, text="", *_a, **_k):
+            if text:
+                self._ui.tooltips.append(str(text))
+            return self
+
+        def __getattr__(self, _name):
+            # Any other element method (tree.expand/tick, bind_value_to, add_slot,
+            # on, ...) is a chainable no-op.
+            return lambda *_a, **_k: self
+
+    def _record(self, text):
+        if text is not None:
+            self.texts.append(str(text))
+        return self._El(self)
+
+    def icon(self, *_a, **_k):
+        return self._El(self)
+
+    def button(self, text="", *_a, **_k):
+        if text:
+            self.buttons.append(str(text))
+        return self._El(self)
+
+    def row(self, *_a, **_k):
+        return self._El(self)
+
+    def column(self, *_a, **_k):
+        return self._El(self)
+
+    def card(self, *_a, **_k):
+        return self._El(self)
+
+    def scroll_area(self, *_a, **_k):
+        return self._El(self)
+
+    def tree(self, *_a, **_k):
+        return self._El(self)
+
+    def input(self, label="", *_a, **_k):
+        return self._El(self)
+
+
+def test_render_table_selection_editable_shows_controls_and_no_lock_icon() -> None:
+    from dsql_migrator.ui.data_migration import _render_table_selection
+
+    ui = _PickerUi()
+    _render_table_selection(
+        ui,
+        _inventory(),
+        DataMigrationState(),
+        ["orders", "customers"],
+        target_existing=["orders"],
+        on_refresh=lambda: None,
+        locked=False,
+        lock_reason=None,
+    )
+    # Editable: the filter/bulk controls render and no lock tooltip appears.
+    assert "Select all" in ui.buttons
+    assert "Unselect all" in ui.buttons
+    assert not any("Locked" in t for t in ui.tooltips)
+
+
+def test_render_table_selection_locked_shows_the_reason_on_the_tooltip() -> None:
+    # The rendered lock tooltip must carry the caller's per-cause reason verbatim, not
+    # the old hardcoded "re-run the checks" string (which was wrong for CDC locks).
+    from dsql_migrator.ui.data_migration import _render_table_selection
+
+    ui = _PickerUi()
+    _render_table_selection(
+        ui,
+        _inventory(),
+        DataMigrationState(),
+        ["orders", "customers"],
+        target_existing=["orders"],
+        locked=True,
+        lock_reason="Locked — CDC is running and its source connector streams a fixed set.",
+        locked_selection=None,
+    )
+    assert (
+        "Locked — CDC is running and its source connector streams a fixed set."
+        in ui.tooltips
+    )
+    # Locked hides the editable-only controls.
+    assert "Select all" not in ui.buttons
+    assert not any("re-run the checks" in t.lower() for t in ui.tooltips)
+
+
+def test_prereq_scope_gap_ignores_removed_tables_but_flags_added_ones() -> None:
+    # Asymmetric on purpose (see prereq_scope_gap): removing a table leaves the report
+    # a superset -> no gap; adding one was never checked -> a gap that must block.
+    from dsql_migrator.ui.data_migration._models import prereq_scope_gap
+
+    report = _fl_report("orders", "customers")
+    # Removed one -> still fully covered.
+    assert prereq_scope_gap(report, ["orders"]) == []
+    # Same set -> no gap.
+    assert prereq_scope_gap(report, ["orders", "customers"]) == []
+    # Added one -> the new table is the gap.
+    assert prereq_scope_gap(report, ["orders", "customers", "app.audit"]) == [
+        "app.audit"
+    ]
+    # No report / a table-independent report -> "unknown", left to the absent-report
+    # guards; never a false gap.
+    assert prereq_scope_gap(None, ["orders"]) == []
+
+
+def test_run_guard_blocks_on_a_table_added_after_the_checks_but_not_on_a_removal() -> None:
+    # End-to-end through the run guard: an ADDED table (never saw TARGET_SCHEMA_READY,
+    # and run_full_load fails the whole job on any per-table failure) blocks; a
+    # REMOVED table does not (still a superset).
+    state = DataMigrationState()
+    state.set_prereq_report(MigrationMode.FULL_LOAD, _fl_report("orders", "customers"))
+
+    # Removed 'customers' -> still runnable.
+    state.set_selection(TableSelection(selected_tables=["orders"]))
+    assert full_load_run_guard_reason(state, _inventory()) is None
+
+    # Added 'app.audit' -> blocked, and the message names the unchecked table.
+    state.set_selection(
+        TableSelection(selected_tables=["orders", "customers", "app.audit"])
+    )
+    reason = full_load_run_guard_reason(state, _inventory())
+    assert reason is not None
+    assert "app.audit" in reason
+    assert "never checked" in reason
 
 
 def test_apply_cdc_status_logs_dlq_events_to_activity_log() -> None:

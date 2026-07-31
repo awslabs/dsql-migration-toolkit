@@ -5,6 +5,41 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.191
+
+### Fixed
+
+- **The Data Migration table picker locked too early, with a dead-end remedy.** It froze
+  the moment the prerequisite checks ran — but the checks are a *preview*, not a commitment,
+  so the scope was locked before any migration began. Worse, the lock's tooltip told you to
+  "re-run the checks to change which tables are migrated", yet re-running re-pins the same
+  set, so there was no way out but Start over. The picker now stays editable until the
+  selection is actually committed to something irreversible, and each lock explains its own
+  cause and remedy:
+  - a Full Load has run for this set (remedy: Start over);
+  - CDC is streaming, so the source connector's table list is fixed (remedy: stop CDC);
+  - CDC infrastructure is deployed or deploying — each table's Kafka topic partitions are
+    fixed when the topic is created, so a table added afterwards would stream on a single
+    partition forever (remedy: delete the CDC infrastructure). This lock covers the
+    ~15-20 min window the MSK create overlaps the Full Load, which was previously unguarded.
+- **A table added after the prerequisite checks could silently fail the whole Full Load.**
+  A prerequisite report outlives the selection it covered (nothing clears it, and the picker
+  is now editable). A table added since was never checked for a target schema, and one
+  per-table failure fails the entire job. The Run button now blocks with the unchecked
+  table named, and the Prerequisites panel shows a matching notice, until the checks are
+  re-run. Removing a table is not treated as a gap — the report is then a superset, so
+  everything still selected was already checked.
+
+### Tests
+
+- Added coverage for the table-picker lock, which previously had none: the pure
+  `selection_lock_reason` across every commit state (editable with only a report; locked by
+  a running/finished Full Load, live CDC, or deployed/deploying CDC infrastructure; scoped
+  so a Full-load-only run is not frozen by an unrelated CDC stack), the rendered lock tooltip
+  carrying the per-cause reason, and the asymmetric `prereq_scope_gap` (a removal is fine, an
+  addition blocks). Every test was confirmed by mutation testing — nine mutations, including
+  reintroducing the old too-early lock, each killed.
+
 ## v0.1.190
 
 ### Fixed
