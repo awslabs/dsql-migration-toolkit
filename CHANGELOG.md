@@ -5,6 +5,48 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.192
+
+### Fixed
+
+- **A table using the recommended Composite key strategy could not be loaded into an
+  empty target.** Choosing "Composite key" in Schema Conversion (the hot-partition
+  remedy the tool itself recommends), applying it, and then running the first Full Load
+  failed the table with *"configured with a changed primary key … Load it fresh (Drop &
+  reload)"*. The guard assumed that an append means "the target still has its original
+  key" — but Schema Conversion had just applied the composite key, so the target really
+  did have it. A safe load was refused as unsafe.
+
+  The suggested remedy was also unreachable: the "Drop & reload" choice only renders for
+  tables that already contain data, and the replace set is *derived* from that same set —
+  so on an empty target there was no way to select it. **Full load + CDC** was worse
+  still: it forces the append path regardless (a DROP would race the live sink), so no
+  path existed at all.
+
+  Full Load now resolves the key against the live target instead of assuming: an **empty
+  target** loads with the applied key (nothing exists to conflict with, and rows unique
+  on the source key stay unique under a composite key containing it); a **populated
+  target** is checked against its *actual* primary key, read from the catalog, and used
+  when it matches. It still refuses — with a message naming the real key — when the
+  target genuinely disagrees, or when its key cannot be read at all ("unknown" is never
+  treated as safe). Tables whose target key equals the source key are unaffected and
+  never incur a target probe.
+
+### Added
+
+- `target_primary_key_columns()` — a read-only catalog probe returning a target table's
+  actual primary-key columns in key order (schema and table travel as bound parameters).
+  Returns `None` for "cannot determine", which callers must treat as unsafe.
+
+### Tests
+
+- Covered every branch of the append key decision (empty target, Full-load-+-CDC, a
+  populated target that matches, one that still has the old key, an unreadable key, and
+  the unchanged-key path asserting the target is never probed) plus the new probe's key
+  ordering, bare-name resolution, injection-safety, and unknown paths. Eight mutations —
+  including restoring the old blanket refusal and treating an unknown key as agreement —
+  each killed.
+
 ## v0.1.191
 
 ### Fixed

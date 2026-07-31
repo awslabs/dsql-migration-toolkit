@@ -373,6 +373,77 @@ def count_target_rows(
     return counts
 
 
+def target_primary_key_columns(
+    table_name: str,
+    *,
+    connection_factory: Callable[[], Any],
+) -> Optional[list[str]]:
+    """Return the target table's ACTUAL primary-key columns, in key order (read-only).
+
+    The ground truth for "what key does the live target really have", read from
+    ``pg_index``/``pg_attribute`` rather than inferred from the DDL the tool believes
+    it applied. Full Load needs this on the append path: the applied conversion may
+    ask for a composite ``(leading, id)`` key, and whether the target already has it
+    decides between keying the idempotent load on those columns and refusing the load.
+    Guessing either way is wrong -- assuming the target still has the source key
+    blocks a correctly-migrated table, and assuming it has the new key could
+    skip-wrong.
+
+    ``table_name`` is ``schema.table`` (or bare, resolved against the search path) and
+    is quoted via :class:`psycopg.sql.Identifier` -- never interpolated. Returns
+    ``None`` when the key cannot be determined (table missing, no primary key, or any
+    error), which callers MUST treat as "unknown" and not as "no key": an inability to
+    read the catalog must never be mistaken for a definite answer.
+    """
+    # Resolve schema.table into the catalog's own terms. Both halves are passed as
+    # BOUND PARAMETERS (never interpolated), so no identifier quoting is needed and
+    # the query stays injection-safe (Requirement 9.4). A bare name is matched
+    # against the current search path via pg_table_is_visible, mirroring how an
+    # unqualified INSERT would resolve.
+    #
+    # ``indkey`` is ordered by key position, so unnesting WITH ORDINALITY and
+    # ordering by it preserves the real key order -- (user_id, id) must not come back
+    # as (id, user_id), since the leading column is the whole point of the
+    # composite-key strategy.
+    parts = table_name.split(".", 1)
+    if len(parts) == 2:
+        schema, relname = parts
+        where_relation = "n.nspname = %(schema)s AND c.relname = %(table)s"
+        params: dict[str, object] = {"schema": schema, "table": relname}
+    else:
+        where_relation = (
+            "c.relname = %(table)s AND pg_catalog.pg_table_is_visible(c.oid)"
+        )
+        params = {"table": parts[0]}
+    statement = (
+        "SELECT a.attname "
+        "FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "JOIN pg_catalog.pg_index ix ON ix.indrelid = c.oid AND ix.indisprimary "
+        "JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
+        "JOIN pg_catalog.pg_attribute a "
+        "  ON a.attrelid = c.oid AND a.attnum = k.attnum "
+        f"WHERE {where_relation} "
+        "ORDER BY k.ord"
+    )
+    try:
+        connection = connection_factory()
+    except Exception:  # noqa: BLE001 - cannot connect -> unknown
+        return None
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        cursor.execute(statement, params)
+        columns = [str(row[0]) for row in cursor.fetchall() if row and row[0]]
+        return columns or None
+    except Exception:  # noqa: BLE001 - unreadable catalog -> unknown, never a guess
+        return None
+    finally:
+        if cursor is not None:
+            _safe_close(cursor)
+        _safe_close(connection)
+
+
 def max_pk_target(
     pk_by_table: dict[str, str],
     *,
@@ -423,6 +494,7 @@ __all__ = [
     "count_target_rows",
     "max_pk_target",
     "tables_with_rows",
+    "target_primary_key_columns",
     "SYSTEM_SCHEMAS",
     "RELATIONS_QUERY",
     "COLUMNS_QUERY",

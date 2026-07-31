@@ -2032,6 +2032,9 @@ class BatchedTableMigrator:
         importer_factory: ImporterFactory = _default_importer_factory,
         table_recreator: Optional[TableRecreator] = None,
         target_counter: Optional[Callable[[TableDef], Optional[int]]] = None,
+        target_pk_reader: Optional[
+            Callable[[TableDef], Optional[list[str]]]
+        ] = None,
     ) -> None:
         """Build a migrator bound to one run's ``inputs``."""
         self._inputs = inputs
@@ -2054,6 +2057,10 @@ class BatchedTableMigrator:
         # Post-load completeness verifier for clean-replace loads (injectable for
         # tests). Defaults to a read-only target COUNT(*).
         self._target_counter = target_counter or self._default_count_target_rows
+        # Reads the target's ACTUAL primary key (injectable for tests). Used only on
+        # the append path when the applied conversion asks for a different key than
+        # the source, to decide against the live target instead of assuming.
+        self._target_pk_reader = target_pk_reader or self._default_target_pk
 
     def capture_watermark(self, tables: Sequence[TableDef]) -> Watermark:
         """Capture the export consistency point for the selected ``tables``.
@@ -2211,24 +2218,62 @@ class BatchedTableMigrator:
             # multi-row ON CONFLICT that silently drops rows). Works for single- or
             # composite-column keys.
             load_on_conflict = OnConflictMode.SKIP_EXISTING
-            # APPEND path does NOT recreate the target (no DDL applied), so the
-            # target still has whatever PK it was created with. If the applied
-            # conversion asks for a DIFFERENT (e.g. composite) PK than the source,
-            # we cannot safely key the append against a constraint the live target
-            # may not have -- probing/insert would skip-wrong or hit a missing
-            # constraint. Guard: only trust target_key_columns on append when it
-            # equals the source PK; otherwise refuse and require a fresh (replace)
-            # load so the composite DDL is actually applied first.
+            # APPEND path does not recreate the target, so the key we load against
+            # must match the key the LIVE TARGET actually has. When the applied
+            # conversion asks for a different (e.g. composite ``(leading, id)``) PK
+            # than the source, that has to be resolved against the target itself --
+            # not assumed.
+            #
+            # This used to assume the target "still has its original key" and refuse
+            # outright. That assumption is false on the primary path it blocked: the
+            # user picks a Composite key in Schema Conversion, applies it (so the
+            # target really does have ``(user_id, id)``), then runs the first Full
+            # Load -- an APPEND, because append is the default and the derived
+            # ``replace_tables`` is empty when the target holds no rows. The refusal
+            # named "Drop & reload" as the fix, but that control only renders for
+            # tables that already contain data, and ``replace_targets`` is derived
+            # from that same set -- so on an empty target the remedy did not exist.
+            # It also blocked Full-load-+-CDC unconditionally, where a replace is
+            # forbidden anyway (it would race the live sink), leaving no path at all.
+            #
+            # Resolve it in order of certainty:
+            #   1. an EMPTY target makes the key choice irrelevant -- there is no
+            #      existing row to skip-wrong, and rows unique on the source PK stay
+            #      unique under a composite key that contains it, so the load is
+            #      provably safe whichever key the target has;
+            #   2. otherwise read the target's REAL primary key and use it when it
+            #      matches the applied DDL;
+            #   3. only refuse when the target genuinely disagrees, or when its key
+            #      cannot be read at all (unknown is not "safe").
             source_pk = list(table.primary_key)
+            load_key_columns = None  # default: the target's existing (source) PK
             if target_key_columns and target_key_columns != source_pk:
-                raise RuntimeError(
-                    f"Table '{table.name}' is configured with a changed primary key "
-                    f"{tuple(target_key_columns)} but is being APPENDED (not "
-                    "recreated), so the target still has its original key. Load it "
-                    "fresh (Drop & reload) to apply the new primary key before "
-                    "appending."
-                )
-            load_key_columns = None  # append: use the target's existing (source) PK
+                target_rows = self._target_counter(table)
+                if target_rows == 0:
+                    # Empty target: nothing to conflict with. Key on the applied PK so
+                    # a later re-run of this same load stays idempotent against the
+                    # rows written now.
+                    load_key_columns = target_key_columns
+                else:
+                    actual = self._target_pk_reader(table)
+                    if actual is None:
+                        raise RuntimeError(
+                            f"Table '{table.name}' is configured with a changed "
+                            f"primary key {tuple(target_key_columns)}, but the "
+                            "target's actual primary key could not be read, so an "
+                            "idempotent append cannot be keyed safely. Check the "
+                            "target connection and retry this table."
+                        )
+                    if actual != target_key_columns:
+                        raise RuntimeError(
+                            f"Table '{table.name}' is configured with a changed "
+                            f"primary key {tuple(target_key_columns)}, but the target "
+                            f"table's primary key is {tuple(actual)}. Apply the "
+                            "converted schema for this table in Step 2 (Schema "
+                            "Conversion), or load it fresh (Drop & reload), so the "
+                            "target key matches before appending."
+                        )
+                    load_key_columns = actual
         importer = self._importer_factory(self._inputs)
         try:
             result = importer.import_rows(
@@ -2309,6 +2354,25 @@ class BatchedTableMigrator:
             value = counts.get(table.name)
             return value if isinstance(value, int) else None
         except Exception:  # noqa: BLE001 - verification is best-effort, never fatal
+            return None
+
+    def _default_target_pk(self, table: TableDef) -> Optional[list[str]]:
+        """Return the target table's real primary-key columns (None if unreadable).
+
+        Read-only catalog probe, used on the append path to decide against the live
+        target rather than assume its key. ``None`` means "could not determine", which
+        the caller treats as unsafe -- never as agreement.
+        """
+        from dsql_migrator.core.target_introspector import target_primary_key_columns
+
+        try:
+            connector = DsqlConnector(
+                self._inputs.target_config, aws_profile=self._inputs.aws_profile
+            )
+            return target_primary_key_columns(
+                table.name, connection_factory=connector.connect
+            )
+        except Exception:  # noqa: BLE001 - unknown, decided by the caller
             return None
 
     def _dependent_view_ddls_for_replace(self) -> list[str]:

@@ -512,3 +512,111 @@ def test_max_pk_target_missing_table_is_none() -> None:
         connection_factory=lambda: connection,
     )
     assert out == {"app.gone": None, "app.orders": 5}
+
+
+# ---------------------------------------------------------------------------
+# target_primary_key_columns: the target's ACTUAL primary key
+#
+# Full Load's append path uses this to decide against the live target instead of
+# assuming its key -- assuming "the target still has its original key" is what
+# blocked a correctly-applied composite PK from loading at all.
+# ---------------------------------------------------------------------------
+
+
+class _PkCursor:
+    """Returns pre-canned pg_index rows, recording the statement + bound params."""
+
+    def __init__(self, connection: "_PkConnection") -> None:
+        self._connection = connection
+        self._rows: list = []
+
+    def execute(self, statement: object, parameters: object = None) -> None:
+        text = statement if isinstance(statement, str) else statement.as_string(None)
+        self._connection.executed.append((text, parameters))
+        if self._connection.raises:
+            raise RuntimeError("catalog unreadable")
+        self._rows = list(self._connection.rows)
+
+    def fetchall(self) -> list:
+        return self._rows
+
+    def close(self) -> None:
+        self._connection.closed_cursors += 1
+
+
+class _PkConnection:
+    def __init__(self, *, rows: list, raises: bool = False) -> None:
+        self.rows = rows
+        self.raises = raises
+        self.executed: list[tuple] = []
+        self.closed = False
+        self.closed_cursors = 0
+
+    def cursor(self) -> _PkCursor:
+        return _PkCursor(self)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_target_primary_key_columns_preserves_composite_key_order() -> None:
+    # Key ORDER is the whole point of the composite strategy -- (user_id, id) must
+    # not come back as (id, user_id) -- so the query orders by the indkey ordinal.
+    from dsql_migrator.core.target_introspector import target_primary_key_columns
+
+    connection = _PkConnection(rows=[("user_id",), ("id",)])
+
+    columns = target_primary_key_columns(
+        "ecommerce.orders", connection_factory=lambda: connection
+    )
+
+    assert columns == ["user_id", "id"]
+    statement, params = connection.executed[0]
+    assert "ORDER BY k.ord" in statement
+    # schema/table travel as BOUND PARAMETERS, never interpolated (Requirement 9.4).
+    assert params == {"schema": "ecommerce", "table": "orders"}
+    assert "ecommerce" not in statement
+    assert connection.closed is True
+
+
+def test_target_primary_key_columns_resolves_a_bare_name_via_search_path() -> None:
+    from dsql_migrator.core.target_introspector import target_primary_key_columns
+
+    connection = _PkConnection(rows=[("id",)])
+
+    columns = target_primary_key_columns(
+        "orders", connection_factory=lambda: connection
+    )
+
+    assert columns == ["id"]
+    statement, params = connection.executed[0]
+    assert "pg_table_is_visible" in statement
+    assert params == {"table": "orders"}
+
+
+def test_target_primary_key_columns_returns_none_when_undeterminable() -> None:
+    # Every "cannot determine" route must yield None (unknown) -- the caller treats
+    # that as unsafe, so it must never be confused with a definite answer.
+    from dsql_migrator.core.target_introspector import target_primary_key_columns
+
+    # No primary key / table absent -> no rows.
+    empty = _PkConnection(rows=[])
+    assert (
+        target_primary_key_columns("app.t", connection_factory=lambda: empty) is None
+    )
+    assert empty.closed is True
+
+    # Catalog query raises.
+    broken = _PkConnection(rows=[], raises=True)
+    assert (
+        target_primary_key_columns("app.t", connection_factory=lambda: broken) is None
+    )
+    assert broken.closed is True  # still closed on the error path
+
+    # Cannot even connect.
+    def _no_connection():
+        raise RuntimeError("connect failed")
+
+    assert (
+        target_primary_key_columns("app.t", connection_factory=_no_connection) is None
+    )

@@ -759,41 +759,150 @@ def test_replace_load_passes_target_composite_pk_to_importer() -> None:
     assert importer.key_columns_by_table["orders"] == ["customer_id", "id"]
 
 
-def test_append_with_changed_target_pk_is_refused() -> None:
-    # Phase 0 guard: appending (no recreate) into a target whose applied DDL asks
-    # for a DIFFERENT (composite) PK than the source must fail loudly -- the live
-    # target still has its original key, so keying the append on the new columns
-    # would skip-wrong or hit a missing constraint. Force a fresh reload instead.
-    import dataclasses
-
+def _composite_applied():
+    """An applied conversion whose target PK is (customer_id, id) -- the Composite
+    key strategy the tool recommends -- against a source PK of (id)."""
     from dsql_migrator.core.converter import TableConversion
 
-    exporter = _FakeExporter()
-    importer = _FakeImporter()
-    applied = TableConversion(
+    return TableConversion(
         table="orders",
         target_ddl=(
             'CREATE TABLE "orders" ("id" bigint NOT NULL, '
             '"customer_id" bigint NOT NULL, PRIMARY KEY ("customer_id", "id"))'
         ),
     )
-    # orders NOT in replace_tables -> append path.
+
+
+def _append_migrator(importer, *, target_rows, target_pk, **input_overrides):
+    """A migrator on the APPEND path with the composite conversion applied and both
+    target probes stubbed (``target_rows`` = COUNT(*), ``target_pk`` = real key)."""
+    import dataclasses
+
     inputs = dataclasses.replace(
         _inputs(),
-        replace_tables=frozenset(),
-        table_conversions={"orders": applied},
+        replace_tables=input_overrides.pop("replace_tables", frozenset()),
+        table_conversions={"orders": _composite_applied()},
+        **input_overrides,
     )
-    migrator = BatchedTableMigrator(
+    return BatchedTableMigrator(
         inputs,
-        exporter=exporter,  # type: ignore[arg-type]
+        exporter=_FakeExporter(),  # type: ignore[arg-type]
         watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
         importer_factory=lambda _i: importer,  # type: ignore[arg-type,return-value]
         table_recreator=lambda _t: [],
-        target_counter=lambda _t: None,
+        target_counter=lambda _t: target_rows,
+        target_pk_reader=lambda _t: target_pk,
     )
 
-    with pytest.raises(RuntimeError, match="changed primary key"):
-        migrator.migrate_table(_tables()[0])  # orders -> append, refused
+
+def test_append_into_an_empty_target_loads_with_the_composite_key() -> None:
+    """The workshop path: Composite key applied in Schema Conversion, then the FIRST
+    Full Load -- which is an APPEND (append is the default, and the derived
+    replace_tables is empty because the target holds no rows).
+
+    This used to raise "changed primary key ... Load it fresh (Drop & reload)", which
+    was both wrong and impossible to act on: the target really did have the composite
+    key, and the Drop & reload control only renders for tables that already contain
+    data. An empty target makes the key choice moot -- there is no row to skip-wrong,
+    and rows unique on the source PK stay unique under a key containing it -- so the
+    load proceeds, keyed on the applied PK so a re-run stays idempotent.
+    """
+    importer = _FakeImporter()
+    migrator = _append_migrator(importer, target_rows=0, target_pk=None)
+
+    migrator.migrate_table(_tables()[0])
+
+    assert importer.key_columns_by_table["orders"] == ["customer_id", "id"]
+
+
+def test_append_into_empty_target_works_for_full_load_plus_cdc() -> None:
+    """Full-load-+-CDC was the worse case: cdc_coexisting forces the append path
+    REGARDLESS of replace_tables (a DROP would race the live sink), so the old
+    refusal left no path at all -- its suggested remedy was forbidden by design."""
+    importer = _FakeImporter()
+    migrator = _append_migrator(
+        importer,
+        target_rows=0,
+        target_pk=None,
+        replace_tables=frozenset({"orders"}),  # ignored while CDC coexists
+        cdc_coexisting=True,
+    )
+
+    migrator.migrate_table(_tables()[0])
+
+    assert importer.key_columns_by_table["orders"] == ["customer_id", "id"]
+
+
+def test_append_into_populated_target_uses_the_targets_real_composite_key() -> None:
+    # Target already holds rows AND genuinely has the composite key (e.g. a resumed
+    # load). Keying on it is correct and idempotent -- no reason to refuse.
+    importer = _FakeImporter()
+    migrator = _append_migrator(
+        importer, target_rows=500, target_pk=["customer_id", "id"]
+    )
+
+    migrator.migrate_table(_tables()[0])
+
+    assert importer.key_columns_by_table["orders"] == ["customer_id", "id"]
+
+
+def test_append_is_refused_when_the_target_still_has_the_old_key() -> None:
+    # The case the guard SHOULD catch: the target holds rows under the original (id)
+    # key while the applied conversion asks for (customer_id, id). Keying the append
+    # on the new columns could skip-wrong, so refuse -- and point at applying the
+    # schema, not only at a Drop & reload.
+    importer = _FakeImporter()
+    migrator = _append_migrator(importer, target_rows=500, target_pk=["id"])
+
+    with pytest.raises(RuntimeError, match="primary key is"):
+        migrator.migrate_table(_tables()[0])
+
+
+def test_append_is_refused_when_the_targets_key_cannot_be_read() -> None:
+    # "Unknown" must never be treated as agreement: a populated target whose real key
+    # cannot be read is not provably safe, so it refuses rather than guessing.
+    importer = _FakeImporter()
+    migrator = _append_migrator(importer, target_rows=500, target_pk=None)
+
+    with pytest.raises(RuntimeError, match="could not be read"):
+        migrator.migrate_table(_tables()[0])
+
+
+def test_unchanged_target_pk_never_probes_the_target_on_append() -> None:
+    """The common case (target PK == source PK) must stay probe-free -- the catalog
+    read exists only to resolve a CHANGED key, and adding a per-table round-trip to
+    every append would tax the large-scale path for nothing."""
+    import dataclasses
+
+    from dsql_migrator.core.converter import TableConversion
+
+    def _must_not_probe(_table):
+        raise AssertionError("target must not be probed when the PK is unchanged")
+
+    plain = TableConversion(
+        table="orders",
+        target_ddl=(
+            'CREATE TABLE "orders" ("id" bigint NOT NULL, '
+            '"customer_id" bigint, PRIMARY KEY ("id"))'
+        ),
+    )
+    importer = _FakeImporter()
+    migrator = BatchedTableMigrator(
+        dataclasses.replace(
+            _inputs(), replace_tables=frozenset(), table_conversions={"orders": plain}
+        ),
+        exporter=_FakeExporter(),  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _i: importer,  # type: ignore[arg-type,return-value]
+        table_recreator=lambda _t: [],
+        target_counter=_must_not_probe,
+        target_pk_reader=_must_not_probe,
+    )
+
+    migrator.migrate_table(_tables()[0])
+
+    # Append keeps key_columns=None so the importer falls back to the source PK.
+    assert importer.key_columns_by_table["orders"] is None
 
 
 def test_batched_table_migrator_cdc_coexisting_skips_drop_uses_skip_existing() -> None:
