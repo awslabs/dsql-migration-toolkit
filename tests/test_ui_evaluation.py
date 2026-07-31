@@ -1118,3 +1118,110 @@ def test_ui_chart_and_html_export_agree_on_kind_order() -> None:
         r'<div class="bar-label">([^<]+)</div>', render_html_report(report)
     )
     assert ui_order == html_order == ["TABLE", "PROCEDURE", "TRIGGER"]
+
+
+def _mixed_effort_report():
+    """A report where some objects need work and some do not.
+
+    ``t4``/``t5`` match only the AUTO_INCREMENT recommendation, which v0.1.173 excluded
+    from the effort estimate -- so they carry no effort and land in no effort bucket.
+    """
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.core.models import (
+        ColumnDef,
+        ForeignKeyDef,
+        SourceInventory,
+        TableDef,
+    )
+
+    tables = []
+    for i in range(6):
+        tables.append(
+            TableDef(
+                name=f"t{i}",
+                columns=[
+                    ColumnDef(name="id", mysql_type="int", nullable=False),
+                    ColumnDef(
+                        name="s",
+                        mysql_type="varchar(20)",
+                        collation="utf8mb4_general_ci" if i < 3 else None,
+                    ),
+                ],
+                primary_key=["id"],
+                auto_increment_column="id",
+                foreign_keys=(
+                    [
+                        ForeignKeyDef(
+                            name=f"fk{i}",
+                            columns=["id"],
+                            referenced_table="o",
+                            referenced_columns=["id"],
+                        )
+                    ]
+                    if i < 4
+                    else []
+                ),
+            )
+        )
+    return CompatibilityAssessor().assess(SourceInventory(tables=tables))
+
+
+def test_effort_summary_sits_with_the_object_list_not_with_the_chart() -> None:
+    """The chart splits by classification, so only classification belongs above it.
+
+    The effort row used to sit directly under the classification row, which put a summary
+    the chart says nothing about beside the one the chart is built from -- and the two
+    looked identical yet did not add up to the same total. Effort is a tool for working the
+    object list, so it belongs with that list and its effort filter.
+    """
+    from dsql_migrator.ui.evaluation import _render_assessment
+
+    report = _mixed_effort_report()
+    ui = _ItemUi()
+    _render_assessment(ui, report)
+
+    order = ui.texts
+    chart_title = order.index("Compatibility by object kind")
+    effort_label = order.index("Estimated manual effort")
+    list_heading = next(
+        i for i, t in enumerate(order) if t.startswith("Objects by importance")
+    )
+    assert order.index("Classification") < chart_title, "classification stays above chart"
+    assert chart_title < list_heading < effort_label, order[:12]
+
+
+def test_effort_summary_states_how_many_objects_need_work() -> None:
+    # The buckets do not sum to the object total, so the row says so itself rather than
+    # leaving the reader to wonder which objects went missing.
+    from dsql_migrator.ui.evaluation import _render_assessment
+
+    report = _mixed_effort_report()
+    needing = sum(report.effort_summary.values())
+    assert needing < len(report.items), "fixture must include effort-less objects"
+
+    ui = _ItemUi()
+    _render_assessment(ui, report)
+    assert f"({needing} of {len(report.items)} objects need work)" in ui.texts
+
+
+def test_effort_summary_is_omitted_when_no_object_needs_work() -> None:
+    # An all-clean schema has nothing to estimate; an empty bucket row would be noise.
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef
+    from dsql_migrator.ui.evaluation import _render_assessment
+
+    report = CompatibilityAssessor().assess(
+        SourceInventory(
+            tables=[
+                TableDef(
+                    name="clean",
+                    columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                    primary_key=["id"],
+                )
+            ]
+        )
+    )
+    assert all(item.effort is None for item in report.items)
+    ui = _ItemUi()
+    _render_assessment(ui, report)
+    assert "Estimated manual effort" not in ui.texts

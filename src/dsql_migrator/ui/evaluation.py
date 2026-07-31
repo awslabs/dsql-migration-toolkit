@@ -1351,8 +1351,17 @@ def _render_assessment(
             "text-lg font-semibold"
         )
 
-    # Classification + effort summaries as impactful, color-coded badges so the
-    # at-a-glance counts stand out instead of reading as plain gray text.
+    # Classification counts as impactful, color-coded badges so the at-a-glance numbers
+    # stand out instead of reading as plain gray text. These sit here, above the chart,
+    # because the chart splits by exactly these three categories -- header and picture
+    # answer the same question in the same words.
+    #
+    # The effort summary deliberately does NOT sit here. It used to, and that put a row
+    # the chart says nothing about directly beside one the chart is built from; worse, the
+    # two rows looked identical but did not add up to the same total (effort counts only
+    # objects that need work, so an advice-only or AUTO object appears in neither bucket),
+    # which read as missing objects rather than as a different question. Effort is a tool
+    # for working the object list, so it now sits with that list and its filters below.
     with ui.row().classes("items-center gap-2 flex-wrap"):  # type: ignore[attr-defined]
         ui.label("Classification").classes(  # type: ignore[attr-defined]
             "text-sm font-semibold text-gray-700"
@@ -1362,15 +1371,6 @@ def _render_assessment(
             ui.badge(  # type: ignore[attr-defined]
                 f"{classification_label(classification.value)}: {count}"
             ).props(f"color={color}").classes("text-sm q-px-sm q-py-xs")
-    with ui.row().classes("items-center gap-2 flex-wrap"):  # type: ignore[attr-defined]
-        ui.label("Estimated manual effort").classes(  # type: ignore[attr-defined]
-            "text-sm font-semibold text-gray-700"
-        )
-        for level, count in report.effort_summary.items():
-            color = _EFFORT_BADGE_COLOR.get(level.value, "blue-grey-6")
-            ui.badge(f"{level.value}: {count}").props(  # type: ignore[attr-defined]
-                f"color={color}"
-            ).classes("text-sm q-px-sm q-py-xs")
 
     # Wrap the chart in solid separators so "Compatibility by object kind" reads as
     # a distinct section between the summary badges above and the
@@ -1405,6 +1405,24 @@ def _render_assessment(
     ui.label(  # type: ignore[attr-defined]
         f"Objects by importance — showing {len(visible)} of {len(report.items)}"
     ).classes("text-md font-semibold")
+    # Effort distribution, beside the list and the effort filter it describes. The count
+    # is spelled out as "objects needing work" because it is NOT the object total: an
+    # object with no required work (all-AUTO, or only a recommendation) carries no effort
+    # estimate and so appears in none of these buckets.
+    if any(item.effort is not None for item in report.items):
+        with ui.row().classes("items-center gap-2 flex-wrap"):  # type: ignore[attr-defined]
+            ui.label("Estimated manual effort").classes(  # type: ignore[attr-defined]
+                "text-sm font-semibold text-gray-700"
+            )
+            for level, count in report.effort_summary.items():
+                color = _EFFORT_BADGE_COLOR.get(level.value, "blue-grey-6")
+                ui.badge(f"{level.value}: {count}").props(  # type: ignore[attr-defined]
+                    f"color={color}"
+                ).classes("text-sm q-px-sm q-py-xs")
+            needing = sum(report.effort_summary.values())
+            ui.label(  # type: ignore[attr-defined]
+                f"({needing} of {len(report.items)} objects need work)"
+            ).classes("text-xs text-gray-500")
     if eval_state is not None and refresh is not None:
 
         def on_class(event: object) -> None:

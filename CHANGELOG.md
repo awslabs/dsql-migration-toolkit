@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.175
+
+### Changed
+
+- **The effort summary moved out of the report header and down beside the object list.**
+  It sat directly under the classification row, above a chart that splits by
+  classification — so a summary the chart says nothing about sat beside the one the chart
+  is built from. Worse, the two rows looked identical but did not add up to the same total
+  (`SIMPLE 1 · MEDIUM 3 · SIGNIFICANT 2` = 6 against 8 objects), because an object with no
+  required work — all-`AUTO`, or carrying only a recommendation since v0.1.174 — has no
+  effort estimate and lands in no bucket. Read beside a classification row that does total
+  every object, that looked like missing objects rather than a different question. Effort
+  is a tool for working the list, so it now sits with that list and its effort filter, and
+  spells out "(*n* of *m* objects need work)". It is omitted entirely when nothing needs
+  work. The header keeps only the classification counts, matching the chart word for word.
+
 ## v0.1.174
 
 ### Changed
