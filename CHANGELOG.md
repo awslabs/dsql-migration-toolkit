@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.185
+
+### Added
+
+- **Each DDL pane can be expanded full-screen.** The comparison is a split view, so every
+  pane gets half the window — and measured against a real source, **14 of 18 tables had a line
+  too long for that width** and 4 exceeded the pane's height. Both scroll, but reading a
+  144-character `CHECK` constraint through a half-width porthole is what makes an operator
+  copy the DDL out to an editor instead of reviewing it here. An expand icon beside each
+  pane's copy button opens that DDL in a maximized dialog: full width, ~82vh tall, same
+  dialect highlighting, read-only. Full-screen rather than a taller pane because **width** is
+  the binding constraint. Opt-in, so the default two-pane view is unchanged for the objects
+  that already fit. Edit mode deliberately has none — the dialog is read-only, and offering
+  it beside a live editor would invite edits into a copy that is discarded on close.
+
 ## v0.1.184
 
 ### Fixed

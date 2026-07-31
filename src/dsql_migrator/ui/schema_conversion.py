@@ -3797,6 +3797,12 @@ def _render_copy_ddl_button(ui: object, text: str, *, label: str) -> None:
 _DDL_PANE_CSS = """
 .ddl-pane .cm-editor { height: 100%; }
 .ddl-pane .cm-scroller { max-height: 26rem; min-height: 8rem; overflow: auto; }
+/* The WRAPPER needs the height too. Sizing only the scroller left the outer element at
+   its 256px default, so a 540px scroller overflowed it and the dialog showed a tall blank
+   band under a clipped editor -- the same trap as the pane, one element further out. */
+.ddl-expanded { height: 82vh; }
+.ddl-expanded .cm-editor { height: 100%; }
+.ddl-expanded .cm-scroller { max-height: 82vh; min-height: 100%; overflow: auto; }
 """
 
 
@@ -3843,6 +3849,49 @@ def _render_ddl_pane(
         ).classes("w-full h-full ddl-pane").props("disable")
 
 
+def _render_expand_ddl_button(
+    ui: object, ddl: str, *, title: str, language: str
+) -> None:
+    """Render an expand icon that opens the DDL full-screen in a maximized dialog.
+
+    The comparison is a split view, so each pane gets half the window: measured against a
+    real source, 14 of 18 tables had a line too long for that width and 4 exceeded the
+    pane's height. Both scroll, but reading a 144-character CHECK constraint through a
+    half-width porthole is the kind of friction that makes an operator copy the DDL out to
+    an editor instead of reviewing it here.
+
+    Full-screen because the pane's limit is WIDTH first: simply making the pane taller
+    would address the smaller half of the problem. Opt-in, so the default screen keeps its
+    two-pane comparison and nothing moves for the objects that already fit.
+    """
+
+    def _open() -> None:
+        with ui.dialog().props("maximized") as dialog, ui.card().classes(  # type: ignore[attr-defined]
+            "w-full h-full gap-2"
+        ):
+            with ui.row().classes("items-center gap-2 w-full no-wrap"):  # type: ignore[attr-defined]
+                ui.label(title).classes("text-sm font-semibold")  # type: ignore[attr-defined]
+                ui.space()  # type: ignore[attr-defined]
+                _render_copy_ddl_button(ui, ddl, label=title)
+                ui.button(on_click=dialog.close).props(  # type: ignore[attr-defined]
+                    "flat dense round size=sm icon=close color=grey-7"
+                ).tooltip("Close")
+            # ``ddl-expanded`` (not ``ddl-pane``) so this editor fills the dialog instead
+            # of inheriting the pane's 26rem cap -- the cap is the very thing being escaped.
+            ui.codemirror(  # type: ignore[attr-defined]
+                ddl,
+                language=language,
+                theme="basicLight",
+                line_wrapping=False,
+            ).classes("w-full ddl-expanded").props("disable")
+        dialog.open()
+
+    btn = ui.button(on_click=_open).props(  # type: ignore[attr-defined]
+        "flat dense round size=sm icon=open_in_full color=grey-7"
+    )
+    btn.tooltip(f"Expand {title}")  # type: ignore[attr-defined]
+
+
 def _render_ddl_header(
     ui: object,
     *,
@@ -3852,6 +3901,7 @@ def _render_ddl_header(
     copy_label: str,
     width: str = "w-1/2",
     divider: bool = False,
+    expand_language: Optional[str] = None,
     trailing: Optional[Callable[[], None]] = None,
 ) -> None:
     """Render one header band naming a DDL pane, with its copy button.
@@ -3872,6 +3922,10 @@ def _render_ddl_header(
         ui.label(title).classes(CODE_HEADER_LABEL_CLASSES)  # type: ignore[attr-defined]
         ui.space()  # type: ignore[attr-defined]
         _render_copy_ddl_button(ui, copy_ddl, label=copy_label)
+        if expand_language is not None:
+            _render_expand_ddl_button(
+                ui, copy_ddl, title=title, language=expand_language
+            )
         if trailing is not None:
             trailing()
 
@@ -3908,6 +3962,7 @@ def _render_ddl_diff(ui: object, source_ddl: str, target_ddl: str) -> None:
                 copy_ddl=source_ddl,
                 copy_label="Source DDL",
                 divider=True,
+                expand_language="MySQL",
             )
             _render_ddl_header(
                 ui,
@@ -3915,6 +3970,7 @@ def _render_ddl_diff(ui: object, source_ddl: str, target_ddl: str) -> None:
                 title="Target — Aurora DSQL",
                 copy_ddl=target_ddl,
                 copy_label="Target DDL",
+                expand_language="PostgreSQL",
             )
         with ui.row().classes("w-full gap-0 no-wrap items-stretch"):  # type: ignore[attr-defined]
             _render_ddl_pane(ui, source_ddl, language="MySQL", divider=True)
@@ -4039,6 +4095,9 @@ def _render_editable_target(
                             copy_ddl=current,
                             copy_label="Target DDL",
                             width="w-full",
+                            # No expand here: the dialog is read-only, and offering it
+                            # beside a live editor would invite edits into a copy that is
+                            # discarded on close. In Edit the pane is already full width.
                             trailing=lambda: ui.badge("Editing").props(  # type: ignore[attr-defined]
                                 "color=amber-7"
                             ),

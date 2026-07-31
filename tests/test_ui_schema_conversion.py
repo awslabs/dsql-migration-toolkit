@@ -2489,3 +2489,62 @@ def test_edit_mode_editor_matches_the_target_pane_treatment() -> None:
     # It IS editable -- unlike the comparison panes, this one writes to the buffer.
     assert "on_change=on_edit" in editing
     assert '.props("disable")' not in editing
+
+
+def test_each_ddl_pane_offers_a_full_screen_expand() -> None:
+    """A split view gives each pane half the window, which the DDL often outgrows.
+
+    Measured against a real source: 14 of 18 tables had a line too long for a half-width
+    pane and 4 exceeded its height. Both scroll, but reading a 144-character CHECK
+    constraint through a half-width porthole is what makes an operator copy the DDL out to
+    an editor instead of reviewing it here.
+    """
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion
+
+    src = inspect.getsource(schema_conversion._render_ddl_diff)
+    # Both panes opt in, each with its own dialect so the expanded view highlights the same
+    # way the pane did.
+    assert 'expand_language="MySQL"' in src, src
+    assert 'expand_language="PostgreSQL"' in src, src
+
+    expand = inspect.getsource(schema_conversion._render_expand_ddl_button)
+    # Full-screen, because WIDTH is the binding constraint -- a taller pane would address
+    # the smaller half of the problem.
+    assert '.props("maximized")' in expand, expand
+    # Read-only, like the pane it expands.
+    assert '.props("disable")' in expand, expand
+    # Its own height class, or it would inherit the 26rem cap it exists to escape. Check
+    # the class actually applied, not prose: the docstring mentions ``ddl-pane`` by name.
+    assert '.classes("w-full ddl-expanded")' in expand, expand
+    assert '.classes("w-full ddl-pane")' not in expand, expand
+
+
+def test_expanded_ddl_css_sizes_the_wrapper_and_the_scroller() -> None:
+    """Sizing only the scroller leaves the wrapper at CodeMirror's 256px default.
+
+    That produced a clipped editor under a tall blank band -- the same trap as the pane,
+    one element further out.
+    """
+    from dsql_migrator.ui.schema_conversion import _DDL_PANE_CSS
+
+    assert ".ddl-expanded {" in _DDL_PANE_CSS, _DDL_PANE_CSS
+    assert ".ddl-expanded .cm-editor" in _DDL_PANE_CSS
+    assert ".ddl-expanded .cm-scroller" in _DDL_PANE_CSS
+    # Taller than the inline pane, which is the whole point.
+    assert "82vh" in _DDL_PANE_CSS
+    assert "26rem" in _DDL_PANE_CSS  # the pane cap is still there for the inline view
+
+
+def test_edit_mode_offers_no_expand() -> None:
+    # The dialog is read-only; offering it beside a live editor would invite edits into a
+    # copy that is discarded on close. In Edit the pane is already full width anyway.
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion
+
+    editing = inspect.getsource(schema_conversion._render_editable_target).split(
+        "else:", 1
+    )[1]
+    assert "expand_language" not in editing, editing[:500]
