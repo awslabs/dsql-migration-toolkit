@@ -5,6 +5,14 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.187
+
+### Changed
+
+- **The published ECR Public default now points at `0.1.186`**, so a fresh clone deploys the
+  code-editor DDL comparison and the aligned Bedrock defaults without building an image. Both
+  regional ECRs (`ap-northeast-2`, `us-east-1`) and ECR Public carry `0.1.186`.
+
 ## v0.1.186
 
 ### Changed

@@ -5,6 +5,14 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.187
+
+### Changed
+
+- **공개된 ECR Public 기본값이 `0.1.186`을 가리킵니다.** 새로 clone한 사용자가 이미지를 빌드하지
+  않고도 코드 에디터 기반 DDL 비교와 정렬된 Bedrock 기본값으로 배포됩니다. 두 리전 ECR
+  (`ap-northeast-2`, `us-east-1`)과 ECR Public 모두 `0.1.186`을 갖고 있습니다.
+
 ## v0.1.186
 
 ### Changed
