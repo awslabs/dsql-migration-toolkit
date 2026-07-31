@@ -1349,13 +1349,21 @@ def test_collapsed_row_shows_no_object_level_effort_badge() -> None:
     assert len(per_finding) == len(expected), (per_finding, len(expected))
 
 
-def test_concern_summary_is_omitted_when_it_would_repeat_the_badge() -> None:
-    # A lone finding of the governing class adds nothing; a redundant line is noise.
+def test_a_single_finding_still_gets_its_own_labeled_badge() -> None:
+    """With no separate governing badge, the one finding IS the row's badge.
+
+    An earlier revision suppressed the breakdown when it would repeat a governing badge.
+    That badge is gone -- the categories replaced it -- so suppressing anything here would
+    leave the row with only a name.
+    """
     from dsql_migrator.core.assessor import CompatibilityAssessor
     from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef
-    from dsql_migrator.ui.evaluation import assessment_concern_summary
+    from dsql_migrator.ui.evaluation import (
+        assessment_concern_counts,
+        _render_assessment_item,
+    )
 
-    report = CompatibilityAssessor().assess(
+    item = CompatibilityAssessor().assess(
         SourceInventory(
             tables=[
                 TableDef(
@@ -1372,12 +1380,26 @@ def test_concern_summary_is_omitted_when_it_would_repeat_the_badge() -> None:
                 )
             ]
         )
-    )
-    item = report.items[0]
+    ).items[0]
     assert len(item.concerns) == 1
-    assert assessment_concern_summary(item) == ""
-    # And a clean object has nothing to summarise at all.
-    clean = CompatibilityAssessor().assess(
+    assert assessment_concern_counts(item) == [("Review needed", 1, "warning")]
+
+    ui = _ItemUi()
+    _render_assessment_item(ui, item)
+    assert "1 Review needed" in ui.badges, ui.badges
+
+
+def test_a_clean_object_falls_back_to_its_classification_badge() -> None:
+    # No findings to count, so the row would otherwise carry nothing but a name.
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef
+    from dsql_migrator.ui.evaluation import (
+        assessment_concern_counts,
+        classification_label,
+        _render_assessment_item,
+    )
+
+    item = CompatibilityAssessor().assess(
         SourceInventory(
             tables=[
                 TableDef(
@@ -1388,24 +1410,92 @@ def test_concern_summary_is_omitted_when_it_would_repeat_the_badge() -> None:
             ]
         )
     ).items[0]
-    assert assessment_concern_summary(clean) == ""
+    assert assessment_concern_counts(item) == []
+
+    ui = _ItemUi()
+    _render_assessment_item(ui, item)
+    assert classification_label(item.classification.value) in ui.badges, ui.badges
 
 
-def test_concern_summary_orders_by_severity_and_labels_advice_as_recommended() -> None:
-    from dsql_migrator.ui.evaluation import assessment_concern_summary
+def test_every_category_badge_carries_its_label_not_a_bare_count() -> None:
+    """Color must not be the only signal -- a bare "1" needs the chart legend to decode.
+
+    Same rule the diff gutter follows: a monochrome screenshot and a colorblind reader must
+    both still be able to read the row.
+    """
+    from dsql_migrator.ui.evaluation import assessment_concern_counts
 
     item = _five_rule_item()
-    summary = assessment_concern_summary(item)
-    # Advisory findings are MANUAL by classification but read "Recommended" -- the word
-    # their own badge uses inside the card.
-    assert "Recommended" in summary, summary
-    # Same "N Label · M Label" shape the kind-group heading above the row uses.
-    assert " \u00b7 " in summary, summary
-    # Severity first: the line opens with the class that governs the object.
-    from dsql_migrator.ui.evaluation import classification_label
+    entries = assessment_concern_counts(item)
+    assert entries, "fixture must produce findings"
+    for label, count, color in entries:
+        assert label and not label.isdigit(), entries
+        assert isinstance(count, int) and count > 0, entries
+        assert color, entries
+    # Advisory findings take the calm info tone, outside the severity ramp.
+    advisory = [e for e in entries if e[0] == "Recommended"]
+    assert advisory and advisory[0][2] == "info", entries
 
+
+def test_category_badges_lead_with_the_governing_classification() -> None:
+    """Worst-first, so the leading badge is what the old single governing badge showed."""
+    from dsql_migrator.ui.evaluation import (
+        assessment_concern_counts,
+        classification_label,
+    )
+
+    item = _five_rule_item()
+    entries = assessment_concern_counts(item)
     governing = classification_label(item.classification.value)
-    assert summary.startswith(f"{len(
-        [c for c in item.concerns
-         if not c.is_advisory and c.classification is item.classification]
-    )} {governing}"), summary
+    assert entries[0][0] == governing, entries
+    # Its count is the number of non-advisory findings of that class -- advisory ones are
+    # counted separately under "Recommended" even though they carry the same classification.
+    expected = len(
+        [
+            c
+            for c in item.concerns
+            if not c.is_advisory and c.classification is item.classification
+        ]
+    )
+    assert entries[0][1] == expected, entries
+    # Advice sorts after every real gap, matching the order inside the expanded card.
+    labels = [label for label, _count, _color in entries]
+    assert labels.index("Recommended") == len(labels) - 1, labels
+
+
+def test_a_cluster_level_row_renders_like_every_table_row() -> None:
+    """One finding is still a finding -- the list must not change shape for it.
+
+    The database-level row used to fall through to the pre-concerns rendering (bare "Risk"
+    and "Recommendation" labels, no card, no spine) purely because its item shipped with an
+    empty concerns list, so it looked like a different application beside the tables.
+    """
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef
+    from dsql_migrator.ui.evaluation import _render_assessment_item
+
+    report = CompatibilityAssessor().assess(
+        SourceInventory(
+            tables=[
+                TableDef(
+                    name=f"{schema}.t",
+                    columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                    primary_key=["id"],
+                )
+                for schema in ("ecommerce", "ecommerce_demo")
+            ]
+        )
+    )
+    cluster = next(i for i in report.items if i.kind == "DATABASE")
+
+    ui = _ItemUi()
+    _render_assessment_item(ui, cluster)
+    # The category badge treatment, same as a table row.
+    assert "1 Review needed" in ui.badges, ui.badges
+    # The card treatment: labeled Risk / Recommendation panels behind a spine. (The caps
+    # in the rendered UI come from a `uppercase` class, not from the label text.)
+    assert "Risk" in ui.texts and "Recommendation" in ui.texts, ui.texts
+    assert any("border-l-2" in c for c in ui.classes), "needs the tree spine"
+    assert any("bg-green-50" in c for c in ui.classes), "needs the fix panel"
+    # NOT the legacy fallback, which emitted a bare "Rule: X" line.
+    assert not any(t.startswith("Rule: ") for t in ui.texts), ui.texts

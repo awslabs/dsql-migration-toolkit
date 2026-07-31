@@ -561,6 +561,15 @@ _CONCERN_SUMMARY_LABEL = {
     "RECOMMENDED": "Recommended",
 }
 
+# Badge color per findings category. The three classifications reuse the classification
+# palette so a row, the chart and the expanded findings all agree; advisory findings take
+# the calm ``info`` tone their own badge uses inside the card, deliberately outside the
+# green/amber/red severity ramp because they report no defect.
+_CONCERN_BADGE_COLOR = {
+    **_CLASS_BADGE_COLOR,
+    "RECOMMENDED": "info",
+}
+
 
 def assessment_kind_summary(items: list) -> str:
     """Return a one-line per-classification count for a kind group.
@@ -587,48 +596,52 @@ def assessment_kind_summary(items: list) -> str:
     return " · ".join(parts)
 
 
-def assessment_concern_summary(item) -> str:
-    """Return a one-line breakdown of an object's findings, most severe first.
+def assessment_concern_counts(item) -> list[tuple[str, int, str]]:
+    """Break an object's findings into ``(label, count, badge_color)``, most severe first.
 
-    The row header shows only the GOVERNING classification, which says nothing about the
-    rest: measured on the Seoul source, 16 of 18 tables carried a mix (typically a real gap
-    plus the AUTO_INCREMENT recommendation) yet advertised a single badge. Worst case, a
-    header reading "Unsupported" hid six findings of which four were merely review-needed
-    and one was optional advice -- so the object looked wholly blocked when most of it was
-    not.
+    This is what the collapsed object row renders instead of a single governing badge. That
+    badge stated only the most severe classification and was silent about the rest:
+    measured on a real source, 16 of 18 tables carried a mix -- typically a real gap plus
+    the AUTO_INCREMENT recommendation -- behind one badge, and a row reading "Unsupported"
+    could hide six findings of which four were merely review-needed and one was optional
+    advice, so the object looked wholly blocked when most of it was not.
 
-    Uses the same ``N Label · M Label`` shape as :func:`assessment_kind_summary` so the
-    object row and the kind-group heading above it read alike, and counts advisory findings
-    as ``Recommended`` rather than by their classification -- that is the word their badge
-    uses inside. Returns ``""`` when there is nothing to add (no concerns, or a lone
-    finding that the header badge already states).
+    Every entry carries its own label, so severity is never conveyed by color alone: a bare
+    count badge would need the chart legend, or a hover, to decode.  Advisory findings are
+    labeled ``Recommended`` -- the word their own badge uses inside the expanded card --
+    rather than the ``MANUAL`` they technically carry.
+
+    Ordered UNSUPPORTED, MANUAL, RECOMMENDED, AUTO, so the leading badge is the one the
+    governing classification used to show. Returns ``[]`` for an object with no findings.
     """
     concerns = list(getattr(item, "concerns", None) or [])
     if not concerns:
-        return ""
+        return []
     counts: dict[str, int] = {}
     for concern in concerns:
-        label = (
+        key = (
             "RECOMMENDED"
             if getattr(concern, "is_advisory", False)
             else concern.classification.value
         )
-        counts[label] = counts.get(label, 0) + 1
-    # A single finding of the governing class adds nothing the badge does not already say.
-    if len(concerns) == 1 and item.classification.value in counts:
-        return ""
+        counts[key] = counts.get(key, 0) + 1
     order = ["UNSUPPORTED", "MANUAL", "RECOMMENDED", "AUTO"]
-    parts = [
-        f"{counts[value]} {_CONCERN_SUMMARY_LABEL.get(value, classification_label(value))}"
-        for value in order
-        if counts.get(value)
+    entries = [
+        (
+            _CONCERN_SUMMARY_LABEL.get(key, classification_label(key)),
+            counts[key],
+            _CONCERN_BADGE_COLOR.get(key, "grey"),
+        )
+        for key in order
+        if counts.get(key)
     ]
-    parts += [
-        f"{count} {classification_label(value)}"
-        for value, count in counts.items()
-        if value not in order
+    # Anything unrecognised still shows rather than being silently dropped.
+    entries += [
+        (classification_label(key), count, _CONCERN_BADGE_COLOR.get(key, "grey"))
+        for key, count in counts.items()
+        if key not in order
     ]
-    return " \u00b7 ".join(parts)
+    return entries
 
 
 def kind_section_label(kind: str) -> str:
@@ -1611,26 +1624,39 @@ def _render_assessment_item(
     with ui.expansion().classes("w-full").props("expand-separator") as exp:  # type: ignore[attr-defined]
         with exp.add_slot("header"):
             with ui.row().classes("items-center gap-2 w-full no-wrap"):  # type: ignore[attr-defined]
-                ui.badge(  # type: ignore[attr-defined]
-                    classification_label(item.classification.value)
-                ).props(f"color={color}")
                 ui.label(item.object_name).classes("font-medium")  # type: ignore[attr-defined]
                 ui.badge(item.kind).props("color=grey-6 outline")  # type: ignore[attr-defined]
-                # The badge above states only the GOVERNING classification, which is
-                # silent about the rest -- measured on a real source, 16 of 18 tables
-                # carried a mix (a real gap plus the AUTO_INCREMENT recommendation) behind
-                # a single badge, and a header reading "Unsupported" could hide six
-                # findings of which four were merely review-needed and one optional. The
-                # breakdown makes the collapsed row honest about what is inside.
+                # ONE BADGE PER FINDINGS CATEGORY, not a single governing badge. That badge
+                # named only the most severe classification and was silent about the rest:
+                # measured on a real source, 16 of 18 tables carried a mix -- typically a
+                # real gap plus the AUTO_INCREMENT recommendation -- behind one badge, and a
+                # row reading "Unsupported" could hide six findings of which four were
+                # merely review-needed and one was optional advice. The object looked wholly
+                # blocked when most of it was not.
+                #
+                # Each badge keeps its label rather than showing a bare count, so severity
+                # never rests on color alone (a colorblind reader, or a monochrome
+                # screenshot, would otherwise need the chart legend to decode it). The
+                # leading badge is the classification the old single badge showed, so the
+                # row still reads worst-first at a glance.
                 #
                 # The per-object effort badge is deliberately NOT here. It described the
                 # object as a whole while this row now summarises its findings, and each
                 # finding carries its own effort inside -- which is the number to act on,
                 # since one SIMPLE fix and one SIGNIFICANT one do not average. The effort
                 # distribution for the whole schema stays in the summary above the list.
-                summary = assessment_concern_summary(item)
-                if summary:
-                    ui.label(summary).classes("text-xs text-gray-500")  # type: ignore[attr-defined]
+                counts = assessment_concern_counts(item)
+                if counts:
+                    for label, count, badge_color in counts:
+                        ui.badge(f"{count} {label}").props(  # type: ignore[attr-defined]
+                            f"color={badge_color}"
+                        )
+                else:
+                    # No findings at all (a clean AUTO object): still say so, rather than
+                    # leaving the row with nothing but a name.
+                    ui.badge(  # type: ignore[attr-defined]
+                        classification_label(item.classification.value)
+                    ).props(f"color={color}")
         with ui.column().classes("gap-3 p-3 w-full"):  # type: ignore[attr-defined]
             # One block per matched rule, each pairing a risk with ITS OWN
             # recommendation. Previously every rule's text was semicolon-joined into a
@@ -1889,7 +1915,7 @@ __all__ = [
     "sort_assessment_items",
     "group_assessment_items_by_kind",
     "assessment_kind_summary",
-    "assessment_concern_summary",
+    "assessment_concern_counts",
     "classification_label",
     "kind_section_label",
     "job_status_to_step_status",

@@ -5,6 +5,35 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.178
+
+### Changed
+
+- **A collapsed object row now carries one labeled badge per findings category, replacing the
+  single governing badge.** That badge named only the most severe classification and was
+  silent about the rest, so a row reading `Unsupported` could hide six findings of which four
+  were merely review-needed and one was optional advice — the object looked wholly blocked
+  when most of it was not. Each row now reads
+  `1 Unsupported · 4 Review needed · 1 Recommended` as colored badges: red, amber, and the
+  calm info-blue that advisory findings already use inside. Every badge keeps its label
+  rather than showing a bare count, so severity never rests on color alone — a monochrome
+  screenshot or a colorblind reader would otherwise need the chart legend to decode it. The
+  leading badge is the classification the old single badge showed, so the row still reads
+  worst-first, and the separate gray breakdown line it replaces is gone.
+
+### Fixed
+
+- **A cluster-level finding rendered in the old, pre-`concerns` style.** The
+  `Database / cluster-level` row (multiple source databases, table-count limit) showed bare
+  **Risk** / **Recommendation** paragraphs while every table beside it used the labeled card
+  treatment — one row in the list looked like a different application. The cause was data,
+  not styling: inventory-level checks build their `AssessmentItem` directly instead of going
+  through the aggregation that populates `concerns`, and left it empty. They now carry their
+  finding as a concern, so the row gets the same category badge, spine and Risk/Recommendation
+  panels as any table — and the text and HTML exports pick it up for free, since all three
+  render the same list. A report-wide test now asserts that only an `AUTO` object may have no
+  concerns.
+
 ## v0.1.177
 
 ### Changed

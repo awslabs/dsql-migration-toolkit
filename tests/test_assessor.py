@@ -1448,3 +1448,79 @@ def test_an_advice_only_object_still_reports_that_advice_as_its_rule() -> None:
     item = _item_for(_assess(inventory), "users")
     assert item.rule_id == "AUTO_INCREMENT"
     assert [c.is_advisory for c in item.concerns] == [True]
+
+
+def test_inventory_level_items_carry_their_finding_as_a_concern() -> None:
+    """Cluster-level checks build their item directly, so they must populate concerns too.
+
+    Leaving it empty made the UI fall back to its pre-concerns rendering: the cluster row
+    showed bare "Risk"/"Recommendation" paragraphs while every table beside it used the
+    labeled card treatment, so one row in the list looked like a different application.
+    """
+    from dsql_migrator.core.assessor import (
+        check_multiple_source_databases,
+        check_table_count,
+    )
+
+    spanning = SourceInventory(
+        tables=[
+            TableDef(
+                name="a.t",
+                columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                primary_key=["id"],
+            ),
+            TableDef(
+                name="b.t",
+                columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                primary_key=["id"],
+            ),
+        ]
+    )
+    items = check_multiple_source_databases(spanning)
+    assert items, "fixture must span two databases"
+    for item in items:
+        assert len(item.concerns) == 1, item
+        concern = item.concerns[0]
+        # The concern mirrors the item, so both renderings agree.
+        assert concern.rule_id == item.rule_id
+        assert concern.classification is item.classification
+        assert concern.risk == item.risk
+        assert concern.recommendation == item.recommendation
+        assert concern.effort is item.effort
+        # A cluster-level gap is never advisory.
+        assert not concern.is_advisory
+
+    # The sibling check behaves the same way; both go through one helper.
+    many = SourceInventory(
+        tables=[
+            TableDef(
+                name=f"t{i}",
+                columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                primary_key=["id"],
+            )
+            for i in range(1001)
+        ]
+    )
+    over = check_table_count(many)
+    assert over and len(over[0].concerns) == 1, over
+
+
+def test_every_assessed_item_has_at_least_one_concern_unless_clean() -> None:
+    # A whole-report invariant: only an AUTO object may have none. Anything else with an
+    # empty list would silently render in the legacy style.
+    inventory = SourceInventory(
+        tables=[_multi_rule_table()]
+        + [
+            TableDef(
+                name="other.t",
+                columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                primary_key=["id"],
+            )
+        ],
+        triggers=[ObjectRef(name="trg", object_type=ObjectType.TRIGGER)],
+    )
+    report = _assess(inventory)
+    for item in report.items:
+        if item.classification is Classification.AUTO:
+            continue
+        assert item.concerns, f"{item.object_name} ({item.kind}) has no concerns"

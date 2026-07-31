@@ -1073,6 +1073,25 @@ def _source_databases(inventory: SourceInventory) -> list[str]:
     return databases
 
 
+# Inventory-level checks build their AssessmentItem directly rather than going through
+# _aggregate, so they must populate ``concerns`` themselves. Leaving it empty made the UI
+# fall back to its pre-concerns rendering: a cluster-level finding showed bare "Risk" /
+# "Recommendation" paragraphs while every table beside it used the labeled card treatment,
+# so one row in the list looked like a different application. One finding is still a
+# finding -- the list should not change shape because there is only one.
+def _single_concern(item: AssessmentItem) -> list[AssessmentConcern]:
+    """Wrap an item's own risk/recommendation as its single concern."""
+    return [
+        AssessmentConcern(
+            rule_id=item.rule_id,
+            classification=item.classification,
+            risk=item.risk,
+            recommendation=item.recommendation,
+            effort=item.effort,
+        )
+    ]
+
+
 def check_multiple_source_databases(
     inventory: SourceInventory,
 ) -> list[AssessmentItem]:
@@ -1081,7 +1100,7 @@ def check_multiple_source_databases(
     if len(databases) <= 1:
         return []
     names = ", ".join(databases)
-    return [
+    items = [
         AssessmentItem(
             object_name=f"{len(databases)} source databases",
             rule_id="MULTIPLE_DATABASES",
@@ -1099,6 +1118,7 @@ def check_multiple_source_databases(
             kind=KIND_DATABASE.upper(),
         )
     ]
+    return [item.model_copy(update={"concerns": _single_concern(item)}) for item in items]
 
 
 def check_table_count(inventory: SourceInventory) -> list[AssessmentItem]:
@@ -1106,7 +1126,7 @@ def check_table_count(inventory: SourceInventory) -> list[AssessmentItem]:
     count = len(inventory.tables)
     if count <= _MAX_TABLES_PER_DATABASE:
         return []
-    return [
+    items = [
         AssessmentItem(
             object_name=f"{count} tables",
             rule_id="TABLE_COUNT_LIMIT",
@@ -1123,6 +1143,7 @@ def check_table_count(inventory: SourceInventory) -> list[AssessmentItem]:
             kind=KIND_DATABASE.upper(),
         )
     ]
+    return [item.model_copy(update={"concerns": _single_concern(item)}) for item in items]
 
 
 def default_inventory_rules() -> list[InventoryRule]:
