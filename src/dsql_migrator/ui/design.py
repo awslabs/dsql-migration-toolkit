@@ -348,21 +348,6 @@ CODE_HEADER_LABEL_CLASSES = (
 )
 CODE_TEXT_CLASSES = "font-mono text-xs leading-relaxed text-slate-800"
 
-# Per-change-kind styling for ONE side of a diff row, as
-# ``(gutter_mark, gutter_text_class, row_tint)``:
-# * ``gutter_mark``  -- the ``+``/``-`` glyph shown in a fixed-width gutter, so the
-#   change is legible without relying on color at all (accessibility: color is never
-#   the only signal, and it survives a monochrome screenshot).
-# * ``row_tint``     -- an almost-invisible wash (*-50/40 = 40% alpha) that groups a
-#   changed row without competing with the text. Deliberately far lighter than the
-#   previous solid *-50/*-100 fills.
-# Unchanged rows get no mark and no tint, so the eye lands only on real differences.
-DIFF_SIDE_STYLE: dict[str, tuple[str, str, str]] = {
-    "unchanged": ("", "text-slate-300", ""),
-    "removed": ("−", "text-rose-500", "bg-rose-50/40"),
-    "added": ("+", "text-emerald-600", "bg-emerald-50/40"),
-}
-DIFF_GUTTER_CLASSES = "w-4 shrink-0 select-none text-center font-mono text-xs"
 
 
 # ---------------------------------------------------------------------------

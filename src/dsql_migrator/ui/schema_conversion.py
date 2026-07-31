@@ -108,8 +108,6 @@ from dsql_migrator.ui.design import (
     CODE_HEADER_LABEL_CLASSES,
     CODE_SURFACE_CLASSES,
     CODE_TEXT_CLASSES,
-    DIFF_GUTTER_CLASSES,
-    DIFF_SIDE_STYLE,
     inline_hint,
     radio_tiles,
     render_notice,
@@ -1420,68 +1418,6 @@ def build_view_preview(
         warnings=tuple(conversion.warnings) if conversion is not None else (),
         exists_on_target=exists_on_target,
     )
-
-
-class DiffKind(str, Enum):
-    """How one aligned source/target line pair differs in a DDL diff."""
-
-    EQUAL = "equal"
-    REPLACE = "replace"
-    DELETE = "delete"  # present in source only (removed by conversion)
-    INSERT = "insert"  # present in target only (added by conversion)
-
-
-@dataclass(frozen=True)
-class DiffRow:
-    """One aligned row of a side-by-side DDL diff.
-
-    ``left``/``right`` are the source/target line for the row, or ``None`` when
-    that side has no line (an inserted target line has no source; a deleted
-    source line has no target). ``kind`` classifies the row for highlighting.
-    """
-
-    left: Optional[str]
-    right: Optional[str]
-    kind: DiffKind
-
-
-def diff_ddl_lines(source_ddl: str, target_ddl: str) -> list[DiffRow]:
-    """Align source and target DDL into highlighted side-by-side rows (Req 10.2).
-
-    Uses a line-level :class:`difflib.SequenceMatcher` so the user can see what
-    the conversion changed: a line only in the source (e.g. a removed FOREIGN
-    KEY) is ``DELETE``, a line only in the target (e.g. a ``CREATE INDEX ASYNC``)
-    is ``INSERT``, a changed line (e.g. a remapped column type) is ``REPLACE``,
-    and an unchanged line is ``EQUAL``. The two dialects differ in identifier
-    quoting, so some lines read as changed; the alignment keeps the comparison
-    scannable instead of two unaligned blocks.
-    """
-    left_lines = source_ddl.splitlines()
-    right_lines = target_ddl.splitlines()
-    matcher = difflib.SequenceMatcher(a=left_lines, b=right_lines, autojunk=False)
-    rows: list[DiffRow] = []
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
-            for offset in range(i2 - i1):
-                rows.append(
-                    DiffRow(
-                        left_lines[i1 + offset], right_lines[j1 + offset], DiffKind.EQUAL
-                    )
-                )
-        elif tag == "replace":
-            left_block = left_lines[i1:i2]
-            right_block = right_lines[j1:j2]
-            for offset in range(max(len(left_block), len(right_block))):
-                left = left_block[offset] if offset < len(left_block) else None
-                right = right_block[offset] if offset < len(right_block) else None
-                rows.append(DiffRow(left, right, DiffKind.REPLACE))
-        elif tag == "delete":
-            for offset in range(i1, i2):
-                rows.append(DiffRow(left_lines[offset], None, DiffKind.DELETE))
-        elif tag == "insert":
-            for offset in range(j1, j2):
-                rows.append(DiffRow(None, right_lines[offset], DiffKind.INSERT))
-    return rows
 
 
 def preview_for_selection(
@@ -3829,69 +3765,6 @@ def _render_conversion_warnings(
         _rows(recommendations, badge_text="RECOMMENDED", badge_color="info")
 
 
-# Tailwind background classes for a diff cell, keyed by (DiffKind value, side),
-# tuned for a calm "editor" surface (slate base): removed (source-only) lines get
-# a soft rose tint, added (target-only) lines a soft emerald tint, a changed line
-# is gently tinted on both sides, and an unchanged line stays on the base surface.
-# Which change a given (kind, side) represents, as a DIFF_SIDE_STYLE key. Only the
-# side that actually changed is marked: on a REPLACE the source shows "removed" and the
-# target "added", so a rewritten line is one clear before/after pair rather than two
-# loud blocks. DELETE marks only the source, INSERT only the target.
-_DIFF_SIDE_ROLE: dict[tuple[str, str], str] = {
-    (DiffKind.EQUAL.value, "left"): "unchanged",
-    (DiffKind.EQUAL.value, "right"): "unchanged",
-    (DiffKind.REPLACE.value, "left"): "removed",
-    (DiffKind.REPLACE.value, "right"): "added",
-    (DiffKind.DELETE.value, "left"): "removed",
-    (DiffKind.DELETE.value, "right"): "unchanged",
-    (DiffKind.INSERT.value, "left"): "unchanged",
-    (DiffKind.INSERT.value, "right"): "added",
-}
-
-
-def _diff_side_role(kind: DiffKind, side: str) -> str:
-    """Return the DIFF_SIDE_STYLE role ("unchanged"/"removed"/"added") for a cell."""
-    return _DIFF_SIDE_ROLE.get((kind.value, side), "unchanged")
-
-
-def _diff_cell_bg(kind: DiffKind, side: str) -> str:
-    """Return the row tint for one diff cell (empty when unchanged).
-
-    Kept as the historical name/signature so existing callers and tests keep working;
-    the styling itself now comes from ``ui.design.DIFF_SIDE_STYLE``.
-    """
-    _mark, _mark_class, tint = DIFF_SIDE_STYLE[_diff_side_role(kind, side)]
-    return tint
-
-
-def _render_diff_cell(
-    ui: object, text: Optional[str], kind: DiffKind, side: str
-) -> None:
-    """Render one cell (one side of one diff row): status gutter + code text.
-
-    Follows the AWS Console code-surface treatment (``ui.design`` CODE_*/DIFF_* tokens):
-    a narrow ``+``/``\u2212`` gutter carries the change, the code itself stays on a neutral
-    surface with only a barely-there row wash. Color is never the sole signal, and the
-    monospace text is not competing with a saturated fill -- which is what made a
-    full-file rewrite look like an error report.
-    """
-    mark, mark_class, tint = DIFF_SIDE_STYLE[_diff_side_role(kind, side)]
-    # A subtle divider on the left cell separates the two sides like an editor's
-    # split view.
-    divider = "border-r border-slate-200" if side == "left" else ""
-    with ui.row().classes(  # type: ignore[attr-defined]
-        f"w-1/2 min-w-0 gap-0 no-wrap items-start pr-3 {divider} {tint}"
-    ):
-        ui.label(mark or "\u00a0").classes(  # type: ignore[attr-defined]
-            f"{DIFF_GUTTER_CLASSES} {mark_class} py-0.5"
-        )
-        # A non-breaking space keeps an empty cell's height equal to a text cell so
-        # the two sides stay row-aligned.
-        ui.label(text if text else "\u00a0").classes(  # type: ignore[attr-defined]
-            f"flex-1 min-w-0 py-0.5 {CODE_TEXT_CLASSES} whitespace-pre-wrap break-all"
-        )
-
-
 def _render_copy_ddl_button(ui: object, text: str, *, label: str) -> None:
     """Render a small copy-to-clipboard icon button for a DDL block.
 
@@ -3917,20 +3790,80 @@ def _render_copy_ddl_button(ui: object, text: str, *, label: str) -> None:
     btn.tooltip(f"Copy {label}")  # type: ignore[attr-defined]
 
 
-def _render_ddl_diff(ui: object, source_ddl: str, target_ddl: str) -> None:
-    """Render a side-by-side, change-highlighted Source vs Target DDL diff.
+# CodeMirror renders its own DOM, so its height cannot be set from the wrapper: a
+# ``max-height`` there left ``.cm-editor`` at its default 256px and the taller pane was cut
+# off mid-statement with no scrollbar. These rules target the editor and its scroller
+# directly. Injected once per page (``ui.add_css`` de-duplicates by content).
+_DDL_PANE_CSS = """
+.ddl-pane .cm-editor { height: 100%; }
+.ddl-pane .cm-scroller { max-height: 26rem; min-height: 8rem; overflow: auto; }
+"""
 
-    Rows are aligned by :func:`diff_ddl_lines` and drawn as left/right cells in
-    one row each (so the two sides stay vertically aligned). Removed source lines
-    are red, added target lines are green, and changed lines are tinted on both
-    sides, so the user sees exactly what the conversion changed (removed foreign
-    keys, async indexes, remapped types).
+
+def _render_ddl_pane(
+    ui: object,
+    ddl: str,
+    *,
+    language: str,
+    divider: bool,
+) -> None:
+    """Render one side of the DDL comparison in a real code editor.
+
+    ``language`` is a CodeMirror language name (``"MySQL"`` / ``"PostgreSQL"``), so each
+    side is highlighted in ITS OWN dialect -- backtick identifiers and MySQL types on the
+    left, double-quoted identifiers and PostgreSQL types on the right.
     """
-    rows = diff_ddl_lines(source_ddl, target_ddl)
-    # An AWS-Console code surface: a white, bordered panel with a quiet header bar
-    # naming each side, then the aligned diff in a monospace split view. The code area
-    # stays NEUTRAL -- change is carried by the per-row +/- gutter, not by washing the
-    # panel in red/green (see ui.design CODE_*/DIFF_* tokens).
+    classes = "w-1/2 min-w-0"
+    if divider:
+        classes += " border-r border-slate-200"
+    with ui.element("div").classes(classes):  # type: ignore[attr-defined]
+        # line_wrapping=False: one logical line stays one line and the editor scrolls
+        # horizontally, the way a Markdown fence and every editor behave. The hand-rolled
+        # view this replaces wrapped with ``break-all``, which split mid-token (an ENUM list
+        # came out as ``'cancel`` / ``led')``) and turned one line into several rows.
+        # ``disable``, NOT ``readonly``: NiceGUI's CodeMirror has no readonly prop, and
+        # passing one is silently ignored -- the pane stayed editable, so a user could type
+        # into this read-only comparison and see their change vanish on the next re-render
+        # while "Apply to target" still sent the unedited DDL. ``disable`` reconfigures
+        # CodeMirror's ``editable`` compartment, which actually blocks input (verified:
+        # contenteditable=false and typing does nothing). Editing has its own mode, entered
+        # with the Edit button, whose editor writes to the per-object buffer.
+        #
+        # The height has to land on CodeMirror's own scroller, not on the wrapper: a
+        # ``max-height`` on the outer element left ``.cm-editor`` at its default 256px, so
+        # the taller side was silently cut off mid-statement with no scrollbar to reveal it.
+        # ``h-full`` makes both panes share the row's height so neither shows dead space,
+        # and the min/max keep a one-line object readable without letting a large table run
+        # off the page.
+        ui.codemirror(  # type: ignore[attr-defined]
+            ddl,
+            language=language,
+            theme="basicLight",
+            line_wrapping=False,
+        ).classes("w-full h-full ddl-pane").props("disable")
+
+
+def _render_ddl_diff(ui: object, source_ddl: str, target_ddl: str) -> None:
+    """Render the Source vs Target DDL side by side, each in a code editor.
+
+    Uses NiceGUI's bundled CodeMirror rather than a hand-built diff table. That table
+    aligned the two sides line-for-line via ``difflib``, which reads well until a line is
+    long: it wrapped with ``break-all`` and split mid-token, and every attempt to stop
+    wrapping traded one defect for another -- a fixed-width cell let unwrapped text print
+    on top of the other column, and a content-sized cell made the divider zig-zag because
+    each row sized independently. An editor solves all of that as a matter of course, and
+    brings what the table never had: real SQL syntax highlighting per dialect, line numbers,
+    code folding, and text selection that copies clean lines.
+
+    What is given up is the line-for-line alignment: each pane starts at line 1, so a
+    changed line is no longer physically beside its counterpart. The panes are short DDL for
+    ONE object, and the conversion notes below already name what changed (removed foreign
+    keys, async indexes, remapped types), so the pairing that mattered is stated in words
+    rather than inferred from row positions.
+    """
+    ui.add_css(_DDL_PANE_CSS)  # type: ignore[attr-defined]
+    # An AWS-Console code surface: a white, bordered panel with a quiet header bar naming
+    # each side, then the two editors.
     with ui.column().classes(f"w-full gap-0 {CODE_SURFACE_CLASSES}"):  # type: ignore[attr-defined]
         with ui.row().classes(  # type: ignore[attr-defined]
             f"w-full gap-0 no-wrap {CODE_HEADER_CLASSES}"
@@ -3951,12 +3884,9 @@ def _render_ddl_diff(ui: object, source_ddl: str, target_ddl: str) -> None:
                 )
                 ui.space()  # type: ignore[attr-defined]
                 _render_copy_ddl_button(ui, target_ddl, label="Target DDL")
-        for row in rows:
-            with ui.row().classes(  # type: ignore[attr-defined]
-                "w-full gap-0 no-wrap items-stretch"
-            ):
-                _render_diff_cell(ui, row.left, row.kind, "left")
-                _render_diff_cell(ui, row.right, row.kind, "right")
+        with ui.row().classes("w-full gap-0 no-wrap items-stretch"):  # type: ignore[attr-defined]
+            _render_ddl_pane(ui, source_ddl, language="MySQL", divider=True)
+            _render_ddl_pane(ui, target_ddl, language="PostgreSQL", divider=False)
 
 
 def _render_editable_target(
@@ -4459,9 +4389,6 @@ __all__ = [
     "job_status_to_step_status",
     "build_object_tree",
     "DdlPreview",
-    "DiffKind",
-    "DiffRow",
-    "diff_ddl_lines",
     "render_source_table_ddl",
     "render_target_ddl",
     "build_table_preview",

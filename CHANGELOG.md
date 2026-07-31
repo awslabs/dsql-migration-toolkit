@@ -5,6 +5,34 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.183
+
+### Changed
+
+- **The Schema Conversion DDL comparison is now a real code editor on each side.** It was a
+  hand-built diff table that aligned the two DDLs line-for-line, which reads well until a
+  line is long: it wrapped with `break-all` and split mid-token — an `ENUM` list came out as
+  `'cancel` / `led')` across two visual rows — and one logical line occupying several rows
+  pushed the two sides out of the vertical alignment the table existed to provide. Each pane
+  is now NiceGUI's bundled CodeMirror, which brings what the table never had: **real SQL
+  highlighting in each dialect** (MySQL on the left, PostgreSQL on the right, so backtick and
+  double-quoted identifiers are each lexed correctly), line numbers, code folding, and
+  selection that copies clean lines. Long lines stay on one line and scroll horizontally,
+  like a Markdown fence.
+  - What is given up is the line-for-line pairing: each pane starts at line 1, so a changed
+    line is no longer physically beside its counterpart. The panes hold the DDL for one
+    object and the conversion notes below already name what changed (removed foreign keys,
+    async indexes, remapped types), so that pairing is stated in words rather than inferred
+    from row positions.
+  - The panes are `disable`d, not `readonly`: NiceGUI's CodeMirror has no readonly prop and
+    silently ignores one, which left the comparison editable — a user could type into it,
+    watch the change vanish on the next re-render, and have **Apply to target** still send
+    the unedited DDL. Editing still has its own mode behind the **Edit** button, and Apply
+    still sends that buffer; both were verified end-to-end in a browser.
+  - The diff engine behind the old view (`diff_ddl_lines`, `DiffRow`, `DiffKind`, the cell
+    renderer and its `DIFF_*` design tokens) had no other caller and is gone — a net 139
+    fewer lines.
+
 ## v0.1.182
 
 ### Changed

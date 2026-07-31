@@ -71,9 +71,6 @@ from dsql_migrator.ui.schema_conversion import (
     build_table_preview,
     build_target_object_tree,
     ddl_equivalent,
-    diff_ddl_lines,
-    DiffKind,
-    DiffRow,
     generate_previews,
     job_status_to_step_status,
     override_apply_objects,
@@ -347,55 +344,6 @@ def test_copy_ddl_button_falls_back_when_clipboard_unavailable() -> None:
     assert ui.clipboard.written == []
     assert ui.notifications[0][1] == "info"
     assert "source ddl" in ui.notifications[0][0].lower()
-
-
-def test_diff_ddl_lines_classifies_equal_and_replace() -> None:
-    rows = diff_ddl_lines("a\nb\nc", "a\nB\nd")
-    assert rows == [
-        DiffRow("a", "a", DiffKind.EQUAL),
-        DiffRow("b", "B", DiffKind.REPLACE),
-        DiffRow("c", "d", DiffKind.REPLACE),
-    ]
-
-
-def test_diff_ddl_lines_handles_pure_insert_and_delete() -> None:
-    inserted = diff_ddl_lines("x", "x\ny")
-    assert inserted == [
-        DiffRow("x", "x", DiffKind.EQUAL),
-        DiffRow(None, "y", DiffKind.INSERT),
-    ]
-    deleted = diff_ddl_lines("x\ny", "x")
-    assert deleted == [
-        DiffRow("x", "x", DiffKind.EQUAL),
-        DiffRow("y", None, DiffKind.DELETE),
-    ]
-
-
-def test_diff_ddl_lines_removed_foreign_key_only_on_source_side() -> None:
-    # DSQL removes foreign keys: the FK line must appear on the source side only
-    # and never on the target side of any aligned row (Requirement 3.3 / 10.2).
-    table = _inventory().tables[0]
-    conversion = _converted().tables[0]
-    preview = build_table_preview(table, conversion)
-
-    rows = diff_ddl_lines(preview.source_ddl, preview.target_ddl)
-
-    assert any(r.left and "FOREIGN KEY" in r.left for r in rows)
-    assert all("FOREIGN KEY" not in (r.right or "") for r in rows)
-
-
-def test_diff_ddl_lines_async_index_added_on_target_side() -> None:
-    # The converted secondary index is emitted as CREATE INDEX ASYNC on the
-    # target side and has no source-side counterpart (insert or replace).
-    table = _inventory().tables[0]
-    conversion = _converted().tables[0]
-    preview = build_table_preview(table, conversion)
-
-    rows = diff_ddl_lines(preview.source_ddl, preview.target_ddl)
-    async_rows = [r for r in rows if r.right and "CREATE INDEX ASYNC" in r.right]
-
-    assert async_rows
-    assert all(r.kind in (DiffKind.INSERT, DiffKind.REPLACE) for r in async_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -2135,57 +2083,6 @@ class _DiffCellUi:
         return self._El(self)
 
 
-def test_diff_cell_marks_the_changed_side_with_a_gutter_glyph() -> None:
-    """Change is carried by a +/- gutter, not by washing the code area.
-
-    A heterogeneous conversion rewrites nearly every line, so tinting each changed row
-    filled the whole panel red/green -- it read as an error report and made the
-    monospace text harder to read. Color is also never the only signal.
-    """
-    from dsql_migrator.ui.schema_conversion import DiffKind, _render_diff_cell
-
-    removed = _DiffCellUi()
-    _render_diff_cell(removed, "PRIMARY KEY (`id`),", DiffKind.REPLACE, "left")
-    assert removed.labels[0] == "−"  # the gutter mark comes first
-    assert removed.labels[1] == "PRIMARY KEY (`id`),"
-
-    added = _DiffCellUi()
-    _render_diff_cell(added, 'PRIMARY KEY ("id")', DiffKind.REPLACE, "right")
-    assert added.labels[0] == "+"
-
-    # An unchanged row carries no glyph and no tint.
-    same = _DiffCellUi()
-    _render_diff_cell(same, "  `depth` tinyint", DiffKind.EQUAL, "left")
-    assert same.labels[0] == " "
-    blob = " ".join(same.classes)
-    assert "rose" not in blob and "emerald" not in blob
-
-
-def test_diff_cell_code_text_stays_on_a_neutral_surface() -> None:
-    # The tint goes on the ROW; the code label itself must never carry a semantic fill,
-    # or the text sits on colored ground again.
-    from dsql_migrator.ui.schema_conversion import DiffKind, _render_diff_cell
-
-    ui = _DiffCellUi()
-    _render_diff_cell(ui, "some sql", DiffKind.INSERT, "right")
-    # The last classes() call belongs to the code label.
-    code_classes = ui.classes[-1]
-    assert "font-mono" in code_classes
-    assert "rose" not in code_classes and "emerald" not in code_classes
-
-
-def test_diff_only_the_side_that_changed_is_marked() -> None:
-    # A REPLACE is one before/after pair, not two loud blocks; DELETE marks only the
-    # source and INSERT only the target.
-    from dsql_migrator.ui.schema_conversion import DiffKind, _diff_side_role
-
-    assert _diff_side_role(DiffKind.REPLACE, "left") == "removed"
-    assert _diff_side_role(DiffKind.REPLACE, "right") == "added"
-    assert _diff_side_role(DiffKind.DELETE, "right") == "unchanged"
-    assert _diff_side_role(DiffKind.INSERT, "left") == "unchanged"
-    assert _diff_side_role(DiffKind.EQUAL, "left") == "unchanged"
-
-
 # ---------------------------------------------------------------------------
 # Object browser — layout + apply lock
 # ---------------------------------------------------------------------------
@@ -2351,3 +2248,152 @@ def test_view_source_ddl_reports_a_missing_definition() -> None:
     out = render_source_view_ddl(ViewDef(name="s.v", definition=""))
     assert "unavailable" in out.lower()
     assert "s.v" in out
+
+
+class _DdlPaneUi:
+    """Double recording what the DDL comparison renders (codemirror calls, labels)."""
+
+    def __init__(self):
+        self.labels: list[str] = []
+        self.editors: list[dict] = []
+        self.css: list[str] = []
+
+    class _El:
+        def __init__(self, rec):
+            self._rec = rec
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: self
+
+    def codemirror(self, value="", **kwargs):
+        entry = {"value": value, **kwargs, "props": []}
+        self.editors.append(entry)
+        return self._PropEl(self, entry)
+
+    class _PropEl:
+        """Element double that records ``.props()`` on the editor it came from."""
+
+        def __init__(self, rec, entry):
+            self._rec = rec
+            self._entry = entry
+
+        def props(self, value="", *_a, **_k):
+            if value:
+                self._entry["props"].append(str(value))
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: self
+
+    def label(self, text="", *_a, **_k):
+        self.labels.append(str(text))
+        return self._El(self)
+
+    def add_css(self, css="", *_a, **_k):
+        self.css.append(str(css))
+
+    def __getattr__(self, _name):
+        return lambda *_a, **_k: self._El(self)
+
+
+def test_ddl_comparison_renders_each_side_in_its_own_dialect() -> None:
+    """Each pane is a real editor highlighted in ITS dialect, not one generic code block.
+
+    The hand-built diff table this replaces had no syntax highlighting at all, and wrapped
+    long lines with ``break-all`` -- an ENUM list came out split mid-token across two visual
+    rows, which also pushed the two sides out of vertical alignment.
+    """
+    from dsql_migrator.ui.schema_conversion import _render_ddl_diff
+
+    ui = _DdlPaneUi()
+    _render_ddl_diff(ui, "CREATE TABLE `t` (`id` int)", 'CREATE TABLE "t" ("id" INT)')
+
+    assert len(ui.editors) == 2, ui.editors
+    source, target = ui.editors
+    assert source["language"] == "MySQL", source
+    assert target["language"] == "PostgreSQL", target
+    assert source["value"] == "CREATE TABLE `t` (`id` int)"
+    assert target["value"] == 'CREATE TABLE "t" ("id" INT)'
+    # Both sides are still named, so the panes are never ambiguous.
+    assert "Source — MySQL" in ui.labels
+    assert "Target — Aurora DSQL" in ui.labels
+
+
+def test_ddl_panes_do_not_wrap_lines() -> None:
+    # One logical line stays one line and the editor scrolls horizontally, as a Markdown
+    # fence and every editor do. Wrapping is what split ``'cancelled')`` mid-token before.
+    from dsql_migrator.ui.schema_conversion import _render_ddl_diff
+
+    ui = _DdlPaneUi()
+    _render_ddl_diff(ui, "a", "b")
+    for editor in ui.editors:
+        assert editor["line_wrapping"] is False, editor
+
+
+def test_ddl_pane_height_css_targets_the_editor_not_the_wrapper() -> None:
+    """CodeMirror renders its own DOM, so a height on the wrapper does not reach it.
+
+    A ``max-height`` on the outer element left ``.cm-editor`` at its default 256px and the
+    taller pane was cut off mid-statement with no scrollbar to reveal it.
+    """
+    from dsql_migrator.ui.schema_conversion import _render_ddl_diff
+
+    ui = _DdlPaneUi()
+    _render_ddl_diff(ui, "a", "b")
+    css = "\n".join(ui.css)
+    assert ".cm-editor" in css, css
+    assert ".cm-scroller" in css, css
+    assert "overflow: auto" in css, css
+
+
+def test_ddl_comparison_panes_are_not_editable() -> None:
+    """The comparison is read-only; editing has its own mode behind the Edit button.
+
+    ``readonly`` is the obvious guess and NiceGUI's CodeMirror silently ignores it -- the
+    pane stayed editable (verified in a browser: contenteditable=true, typing worked), so a
+    user could change the DDL here, watch it vanish on the next re-render, and have
+    "Apply to target" still send the unedited version. ``disable`` reconfigures CodeMirror's
+    ``editable`` compartment and actually blocks input.
+    """
+    from dsql_migrator.ui.schema_conversion import _render_ddl_diff
+
+    ui = _DdlPaneUi()
+    _render_ddl_diff(ui, "CREATE TABLE `t` (`id` int)", 'CREATE TABLE "t" ("id" INT)')
+
+    assert ui.editors, "expected both panes to render"
+    for editor in ui.editors:
+        props = " ".join(editor["props"])
+        assert "disable" in props, editor
+        # A no-op prop must not stand in for the one that works.
+        assert "readonly" not in props, editor
+        # A read-only pane never writes back, so it takes no change handler.
+        assert editor.get("on_change") is None, editor
+
+
+def test_ddl_comparison_shows_the_edited_ddl_not_the_generated_one() -> None:
+    """Apply uses the edited buffer, so the comparison must show what will be applied.
+
+    The renderer takes whatever DDL its caller passes; this pins that the caller passes the
+    per-object edit when one exists, which is what keeps "what you see" and "what Apply
+    sends" the same string.
+    """
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion
+
+    source = inspect.getsource(schema_conversion._render_editable_target)
+    # The read-only branch renders `current`, which is `edited if edited is not None`.
+    assert "current = edited if edited is not None else preview.target_ddl" in source
+    assert "_render_ddl_diff(ui, preview.source_ddl, current)" in source

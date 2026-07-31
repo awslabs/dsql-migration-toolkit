@@ -585,32 +585,6 @@ def test_code_surface_is_neutral_not_tinted() -> None:
     assert "font-mono" in CODE_TEXT_CLASSES
 
 
-def test_diff_side_style_marks_change_without_relying_on_color() -> None:
-    # Color must never be the ONLY signal: each changed side carries a +/- glyph, so
-    # the diff survives a monochrome screenshot and is legible to a colorblind reader.
-    from dsql_migrator.ui.design import DIFF_SIDE_STYLE
-
-    assert set(DIFF_SIDE_STYLE) == {"unchanged", "removed", "added"}
-    removed_mark, removed_class, removed_tint = DIFF_SIDE_STYLE["removed"]
-    added_mark, added_class, added_tint = DIFF_SIDE_STYLE["added"]
-    assert removed_mark and added_mark and removed_mark != added_mark
-    assert "rose" in removed_class and "emerald" in added_class
-    # An unchanged row is completely unmarked, so the eye lands only on differences.
-    mark, _cls, tint = DIFF_SIDE_STYLE["unchanged"]
-    assert mark == "" and tint == ""
-
-
-def test_diff_row_tints_are_barely_there() -> None:
-    # The wash groups a changed row without competing with the text: a *-50 shade at
-    # reduced alpha, never a solid *-100 fill (which is what looked unprofessional).
-    from dsql_migrator.ui.design import DIFF_SIDE_STYLE
-
-    for role in ("removed", "added"):
-        _mark, _cls, tint = DIFF_SIDE_STYLE[role]
-        assert "-50/" in tint, f"{role} tint should be a -50 shade with alpha: {tint}"
-        assert "-100" not in tint and "-200" not in tint
-
-
 # ---------------------------------------------------------------------------
 # Sidebar footer: one "Settings" entry whose modal groups the utilities in tabs.
 # ---------------------------------------------------------------------------
