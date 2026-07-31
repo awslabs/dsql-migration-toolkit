@@ -296,7 +296,7 @@ parallelism knobs can also be retuned **at runtime** from the sidebar's
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4` (≤32) | Tables compared concurrently in Validation. `1` = sequential. |
 | `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | Startup log level; `DEBUG` adds a stacktrace (call stack only) to failure events. Also changeable at runtime via **Settings → Diagnostics**. |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | Mirror activity-log events to stdout (→ CloudWatch on ECS). Also toggleable at runtime via **Settings → Diagnostics**. |
-| `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | Bedrock model / inference-profile id for AI assist. The `global.*` profile is reachable from any commercial region; a `us.*` profile is US-only. |
+| `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-5` | Bedrock model / inference-profile id for AI assist. Always a `global.*` profile: those are reachable from any commercial region, while a `us.*` profile only resolves from us-east-1/us-east-2/us-west-2. |
 | `BEDROCK_REGION` | _(unset)_ | Region for Amazon Bedrock calls. |
 
 AI assist is off by default and enabled in the UI, which also offers a **Verify AI

@@ -308,7 +308,7 @@ aws cloudformation deploy \
     SourceDbSecurityGroupId="$SOURCE_DB_SG" \
     EnableAiAssist=true \
     BedrockRegion="$AWS_REGION" \
-    BedrockModelId=us.anthropic.claude-sonnet-4-6
+    BedrockModelId=global.anthropic.claude-sonnet-5
     # BedrockModelId 기본값 표시; 다른 모델 선택지는 §8 참조
     # SourceSecretArn=...   # 옵션 — 기존 소스 시크릿을 재사용할 때만
 ```
@@ -316,7 +316,7 @@ aws cloudformation deploy \
 > **AI 어시스트(권장).** `EnableAiAssist=true` + `BedrockRegion`으로 Schema
 > Conversion과 Query Converter의 AI DBA를 켭니다 — 옵트인·자문 전용 기능이며,
 > 선택한 모델에 대한 `bedrock:InvokeModel`로만 범위가 제한됩니다. `BedrockModelId`
-> (기본 `us.anthropic.claude-sonnet-4-6`)에 대해 해당 리전 Bedrock 콘솔에서 **모델
+> (기본 `global.anthropic.claude-sonnet-5`)에 대해 해당 리전 Bedrock 콘솔에서 **모델
 > 액세스를 활성화**해야 하고, 태스크가 Bedrock 엔드포인트로 egress할 수 있어야 합니다.
 > 둘 다 생략하면 AI 없이 배포됩니다(결정론적 경로는 그대로). 자세한 내용·모델 선택은
 > §8을 보세요.
@@ -386,7 +386,7 @@ Schema Conversion → Data Migration → Validation → Cut over). UI가 보이�
 | `EnableAiAssist` | no | `false` | opt-in; 범위 제한된 `bedrock:InvokeModel` 부여. |
 | `BedrockModelArns` | no | `""` | **선택적 override**; 비우면 `BedrockModelId`에서 자동 도출. |
 | `BedrockRegion` | no | `""` | 앱의 `BEDROCK_REGION`. |
-| `BedrockModelId` | no | `us.anthropic.claude-sonnet-4-6` | Anthropic 모델(드롭다운); IAM 스코프 자동 도출. |
+| `BedrockModelId` | no | `global.anthropic.claude-sonnet-5` | Anthropic 모델(드롭다운); IAM 스코프 자동 도출. |
 
 ### DNS를 ALB로 지정 — Optional (커스텀 도메인만)
 
@@ -491,22 +491,23 @@ AI 보조는 opt-in이며 **범위 제한된** `bedrock:InvokeModel`을 부여�
 aws cloudformation deploy ... \
   --parameter-overrides \
     EnableAiAssist=true \
-    BedrockModelId=us.anthropic.claude-sonnet-4-6 \
+    BedrockModelId=global.anthropic.claude-sonnet-5 \
     BedrockRegion=$AWS_REGION
 ```
 
 **AI 보조는 Amazon Bedrock에서만 동작합니다.** Bedrock이 유일한 AI 백엔드이며 —
 이 도구에는 Anthropic/OpenAI(또는 그 외) API 키를 직접 입력하는 칸이 없습니다. 따라서
 선택할 수 있는 모델은 AWS 자격증명으로 호출하는 Bedrock 파운데이션 모델뿐입니다.
-모델은 `BedrockModelId`로 지정합니다(기본값 `us.anthropic.claude-sonnet-4-6`).
+모델은 `BedrockModelId`로 지정합니다(기본값 `global.anthropic.claude-sonnet-5`).
 
 **권장 모델 — 최신 Anthropic Claude Opus 또는 Sonnet:**
 
 | 모델 | Bedrock 모델 id (`BedrockModelId`) | 사용 시점 |
 |---|---|---|
-| Claude Opus 4.8 | `us.anthropic.claude-opus-4-8` | 가장 어려운 `MANUAL` / `UNSUPPORTED` 변환; 최고 품질. |
-| Claude Opus 4.6 | `us.anthropic.claude-opus-4-6-v1` | 고품질; 4.8보다 한 단계 아래. |
-| Claude Sonnet 4.6 (기본값) | `us.anthropic.claude-sonnet-4-6` | 대부분의 스키마에서 품질·속도·비용의 최적 균형. |
+| Claude Sonnet 5 (기본값) | `global.anthropic.claude-sonnet-5` | 대부분의 스키마에서 품질·속도·비용의 최적 균형. |
+| Claude Opus 5 | `global.anthropic.claude-opus-5` | 가장 어려운 `MANUAL` / `UNSUPPORTED` 변환; 최고 품질. |
+| Claude Opus 4.8 | `global.anthropic.claude-opus-4-8` | 고품질; Opus 5보다 한 단계 아래. |
+| Claude Sonnet 4.6 | `global.anthropic.claude-sonnet-4-6` | 이전 세대 Sonnet. |
 
 `BedrockModelId`는 위 `us.` cross-region inference profile들의 **드롭다운**이고, 태스크
 역할의 `bedrock:InvokeModel` 스코프는 여기서 **자동 도출**됩니다 — 따라서 `BedrockModelArns`는

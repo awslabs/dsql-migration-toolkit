@@ -5,6 +5,39 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.181
+
+### Fixed
+
+- **AI Assist failed with `AccessDenied` on a default deploy.** The CloudFormation template
+  defaulted `BedrockModelId` to `us.anthropic.claude-sonnet-4-6` while the app's own default
+  was `global.anthropic.claude-sonnet-4-6`. The task role's `bedrock:InvokeModel` scope is
+  **derived** from the template value, but the app falls back to *its* default whenever the
+  Connect form's Model ID is left blank — so a stock deploy invoked a profile whose ARN the
+  policy never allowed, and "Verify AI access" reported a permissions error that looked like
+  a broken IAM policy rather than two defaults out of step. A test now asserts the two
+  cannot drift, and that the default is one of the `AllowedValues`.
+- **`BEDROCK_MODEL_ID` stopped reaching the form once AI Assist was enabled.** The prefill
+  compared the *whole* config to a pristine `AiAssistConfig()`, so merely flipping the Enable
+  switch made it unequal and silently skipped the seed on every later render — leaving the
+  app on its built-in default while IAM was scoped to the deployment's. The check is now
+  per-field: the model id seeds while it still holds the built-in default, the region while
+  it is unset, and a value the user typed is never overwritten.
+
+### Changed
+
+- **The default model is now Claude Sonnet 5** (`global.anthropic.claude-sonnet-5`), with
+  Opus 5 offered alongside it. Verified live: the profile is `ACTIVE` and invokes
+  successfully from `ap-northeast-2`, and the IAM scope the template derives from it
+  (`inference-profile/global.anthropic.claude-sonnet-5` plus
+  `foundation-model/anthropic.claude-sonnet-5`) resolves to a real model.
+- **Only `global.` inference profiles are offered now.** The `us.` variants resolved from
+  just `us-east-1` / `us-east-2` / `us-west-2` and failed everywhere else, while `global.`
+  works in all of them — verified against `us-east-1`, `us-west-2` and `ap-northeast-2`. They
+  were a trap rather than a choice, and having two geo prefixes is what let the template
+  default drift from the app's in the first place. No `us.` model id remains anywhere in the
+  repo; the deployment guides and manual (EN/KO/JA) and the README were updated to match.
+
 ## v0.1.180
 
 ### Fixed

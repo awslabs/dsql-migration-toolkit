@@ -932,7 +932,7 @@ class AiAssistConfig(BaseModel):
     replaces it. It is opt-in: ``enabled`` defaults to ``False`` so the workflow
     runs the deterministic-only path unless the user explicitly turns it on
     (Requirements 11.1, 11.2). ``model_id`` maps to the ``BEDROCK_MODEL_ID``
-    setting (default ``global.anthropic.claude-sonnet-4-6``) and ``region`` to
+    setting (default ``global.anthropic.claude-sonnet-5``) and ``region`` to
     ``BEDROCK_REGION`` (Requirements 11.3, 11.4); neither carries any credential
     value. The default must be a real Bedrock model / inference-profile id (it is
     passed verbatim as ``modelId`` to ``invoke_model``), not a display name.
@@ -942,7 +942,7 @@ class AiAssistConfig(BaseModel):
 
     enabled: bool = False
     model_id: str = Field(
-        default="global.anthropic.claude-sonnet-4-6",
+        default="global.anthropic.claude-sonnet-5",
         min_length=1,
         description="Bedrock model id to use (config key: BEDROCK_MODEL_ID).",
     )

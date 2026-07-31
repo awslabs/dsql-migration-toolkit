@@ -62,6 +62,7 @@ from dsql_migrator.ui.design import (
     section_header,
 )
 from dsql_migrator.ui.ai_assist import (
+    DEFAULT_BEDROCK_MODEL_ID,
     build_ai_assist_config,
     map_access_check_display,
     run_verify_ai_access,
@@ -462,19 +463,23 @@ def build_connect_page(
     tgt_username = _eff(getattr(_tc, "username", None), d.target_username or "admin")
 
     # Seed the AI-assist model id / region from the environment default
-    # (BEDROCK_MODEL_ID / BEDROCK_REGION) on a pristine session, so the form
-    # shows the configured default without overriding any user change.
-    if (d.bedrock_model_id or d.bedrock_region) and state.ai_assist == AiAssistConfig():
+    # (BEDROCK_MODEL_ID / BEDROCK_REGION), so the form shows what the deployment
+    # configured without overriding any user change.
+    #
+    # The test is per-FIELD: the model id is seeded while it still holds the app's built-in
+    # default, and the region while it is unset. Comparing the whole config to
+    # AiAssistConfig() instead -- as this did -- meant that merely flipping the Enable
+    # switch made the config unequal and silently blocked the seed on every later render,
+    # so a deployment that set BEDROCK_MODEL_ID could still end up invoking the app's
+    # built-in default. That is invisible until Bedrock rejects the call, because the IAM
+    # scope is derived from the deployment's value, not the app's.
+    if d.bedrock_model_id and state.ai_assist.model_id == DEFAULT_BEDROCK_MODEL_ID:
         state.set_ai_assist(
-            build_ai_assist_config(
-                enabled=state.ai_assist.enabled,
-                model_id=d.bedrock_model_id or state.ai_assist.model_id,
-                region=(
-                    d.bedrock_region
-                    if d.bedrock_region is not None
-                    else state.ai_assist.region
-                ),
-            )
+            state.ai_assist.model_copy(update={"model_id": d.bedrock_model_id})
+        )
+    if d.bedrock_region and state.ai_assist.region is None:
+        state.set_ai_assist(
+            state.ai_assist.model_copy(update={"region": d.bedrock_region})
         )
 
     # The Next button/hint are created at the bottom; these closures update the
@@ -1081,10 +1086,10 @@ def build_connect_page(
                 ai_model = ui.input(
                     "Model ID (BEDROCK_MODEL_ID)",
                     value=state.ai_assist.model_id,
-                    placeholder="global.anthropic.claude-sonnet-4-6",
+                    placeholder="global.anthropic.claude-sonnet-5",
                 ).props(
                     "hint=\"Use the exact model / inference-profile ID, not the "
-                    "display name (e.g. global.anthropic.claude-sonnet-4-6).\""
+                    "display name (e.g. global.anthropic.claude-sonnet-5).\""
                 ).classes("w-full")
                 ai_region = ui.input(
                     "Region (BEDROCK_REGION, optional)",

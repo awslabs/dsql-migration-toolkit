@@ -5,6 +5,35 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.181
+
+### Fixed
+
+- **기본 설정으로 배포하면 AI Assist가 `AccessDenied`로 실패했습니다.** CloudFormation 템플릿의
+  `BedrockModelId` 기본값은 `us.anthropic.claude-sonnet-4-6`인데 앱 자체 기본값은
+  `global.anthropic.claude-sonnet-4-6`이었습니다. 태스크 역할의 `bedrock:InvokeModel` 범위는
+  템플릿 값에서 **파생**되지만, Connect 폼의 Model ID를 비워 두면 앱은 *자기* 기본값으로
+  호출합니다 — 그래서 기본 배포는 정책이 허용하지 않는 프로필을 호출했고, "Verify AI access"는
+  두 기본값이 어긋난 문제를 IAM 정책 결함처럼 보이게 하는 권한 오류를 냈습니다. 두 값이 어긋날 수
+  없다는 것과 기본값이 `AllowedValues`에 포함된다는 것을 테스트로 고정했습니다.
+- **AI Assist를 켠 뒤에는 `BEDROCK_MODEL_ID`가 폼에 반영되지 않았습니다.** prefill이 설정 *전체*를
+  깨끗한 `AiAssistConfig()`와 비교했기 때문에, Enable 스위치를 켜기만 해도 값이 달라져 이후 모든
+  렌더에서 seed가 조용히 건너뛰어졌습니다 — IAM은 배포 값으로 범위가 잡혀 있는데 앱은 내장 기본값을
+  쓰는 상태가 됩니다. 이제 필드별로 검사합니다: 모델 ID는 아직 내장 기본값일 때, 리전은 설정되지
+  않았을 때만 seed하며, 사용자가 입력한 값은 절대 덮지 않습니다.
+
+### Changed
+
+- **기본 모델이 Claude Sonnet 5**(`global.anthropic.claude-sonnet-5`)가 되었고 Opus 5도 함께
+  제공합니다. 실제로 검증했습니다 — 프로필이 `ACTIVE`이고 `ap-northeast-2`에서 호출이 성공하며,
+  템플릿이 파생하는 IAM 범위(`inference-profile/global.anthropic.claude-sonnet-5` +
+  `foundation-model/anthropic.claude-sonnet-5`)가 실재하는 모델로 연결됩니다.
+- **이제 `global.` 추론 프로필만 제공합니다.** `us.` 계열은 `us-east-1` / `us-east-2` /
+  `us-west-2`에서만 동작하고 그 밖에서는 실패하는데, `global.`은 그 세 리전에서도 동작합니다 —
+  `us-east-1`, `us-west-2`, `ap-northeast-2`에서 확인했습니다. 선택지가 아니라 함정이었고, 애초에
+  템플릿 기본값이 앱과 어긋난 원인도 지역 접두어가 둘이었기 때문입니다. 저장소 어디에도 `us.`
+  모델 ID가 남아 있지 않으며, 배포 가이드·매뉴얼(EN/KO/JA)과 README도 함께 갱신했습니다.
+
 ## v0.1.180
 
 ### Fixed

@@ -7,7 +7,7 @@ These cover the parts of the Step 2 AI-assist integration that do not touch
 NiceGUI:
 
 - Building :class:`AiAssistConfig` from the settings form: opt-in default
-  (disabled) and default model id ``global.anthropic.claude-sonnet-4-6`` (Requirements 11.1-11.4).
+  (disabled) and default model id ``global.anthropic.claude-sonnet-5`` (Requirements 11.1-11.4).
 - Per-session AI config state isolation (Requirement 9.2 pattern).
 - Suggestion review status transitions (edit / approve / reject) and the
   invariant that editing revokes any prior approval.
@@ -69,7 +69,7 @@ def _suggestion(
         kind=kind,  # type: ignore[arg-type]
         suggested_sql_or_expr=sql,
         rationale="example",
-        model_id="global.anthropic.claude-sonnet-4-6",
+        model_id="global.anthropic.claude-sonnet-5",
         status=status,  # type: ignore[arg-type]
         approved_by_user=approved,
     )
@@ -83,7 +83,7 @@ def _suggestion(
 def test_ai_assist_config_defaults_disabled_and_default_model() -> None:
     config = AiAssistConfig()
     assert config.enabled is False
-    assert config.model_id == "global.anthropic.claude-sonnet-4-6"
+    assert config.model_id == "global.anthropic.claude-sonnet-5"
     assert config.region is None
 
 
@@ -143,7 +143,7 @@ def test_session_ai_assist_defaults_disabled() -> None:
     store = SessionStore()
     state = store.get_or_create("session-a")
     assert state.ai_assist.enabled is False
-    assert state.ai_assist.model_id == "global.anthropic.claude-sonnet-4-6"
+    assert state.ai_assist.model_id == "global.anthropic.claude-sonnet-5"
 
 
 def test_session_ai_assist_is_isolated_per_session() -> None:
@@ -157,7 +157,7 @@ def test_session_ai_assist_is_isolated_per_session() -> None:
     assert a.ai_assist.model_id == "model-x"
     # Session B is unaffected and keeps the opt-in default.
     assert b.ai_assist.enabled is False
-    assert b.ai_assist.model_id == "global.anthropic.claude-sonnet-4-6"
+    assert b.ai_assist.model_id == "global.anthropic.claude-sonnet-5"
 
 
 def test_session_clear_resets_ai_assist_to_default() -> None:
@@ -168,7 +168,7 @@ def test_session_clear_resets_ai_assist_to_default() -> None:
     state.clear()
 
     assert state.ai_assist.enabled is False
-    assert state.ai_assist.model_id == "global.anthropic.claude-sonnet-4-6"
+    assert state.ai_assist.model_id == "global.anthropic.claude-sonnet-5"
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +377,7 @@ def _access_result(
     ok: bool,
     reason: str,
     detail: str = "actionable next step",
-    model_id: str = "global.anthropic.claude-sonnet-4-6",
+    model_id: str = "global.anthropic.claude-sonnet-5",
     region: str | None = "us-east-1",
 ) -> AiAccessCheckResult:
     return AiAccessCheckResult(
@@ -505,3 +505,75 @@ def test_run_verify_ai_access_default_profile_is_none() -> None:
     # No profile selected -> None -> standard AWS credential chain (Req 9.6).
     assert captured["aws_profile"] is None
     assert captured["config"] is config
+
+
+def test_template_default_model_matches_the_app_default() -> None:
+    """A drift here surfaces as AccessDenied, not as a config error.
+
+    The CloudFormation template derives the task role's bedrock:InvokeModel scope from
+    BedrockModelId, while the app falls back to DEFAULT_BEDROCK_MODEL_ID when the Connect
+    form's Model ID is left blank. When the two disagreed (`us.` in the template against
+    `global.` in the app), a default deploy invoked a profile whose ARN the policy never
+    allowed, and "Verify AI access" failed with a permissions error that looked like a
+    broken IAM policy rather than two defaults out of step.
+    """
+    import pathlib as _pathlib
+    import re
+
+    from dsql_migrator.ui.ai_assist import DEFAULT_BEDROCK_MODEL_ID
+
+    template = _pathlib.Path(__file__).resolve().parents[1] / "deploy/cloudformation.yaml"
+    body = template.read_text()
+    block = re.search(
+        r"^  BedrockModelId:\n(?:.*\n)*?    Default: (\S+)$", body, re.M
+    )
+    assert block, "BedrockModelId Default not found in the template"
+    assert block.group(1) == DEFAULT_BEDROCK_MODEL_ID, (
+        block.group(1),
+        DEFAULT_BEDROCK_MODEL_ID,
+    )
+    # And the default must be selectable, or CloudFormation rejects the stack outright.
+    allowed = re.search(
+        r"^  BedrockModelId:\n(?:.*\n)*?    AllowedValues:\n((?:      [-#].*\n)+)",
+        body,
+        re.M,
+    )
+    assert allowed, "BedrockModelId AllowedValues not found"
+    values = re.findall(r"^      - (\S+)$", allowed.group(1), re.M)
+    assert DEFAULT_BEDROCK_MODEL_ID in values, (DEFAULT_BEDROCK_MODEL_ID, values)
+
+
+def test_env_model_id_seeds_the_form_even_after_ai_assist_is_enabled() -> None:
+    """The seed is per-field, so flipping Enable must not silently block it.
+
+    The guard used to compare the WHOLE config to AiAssistConfig(); merely turning AI assist
+    on made it unequal, so every later render skipped the seed and the app fell back to its
+    own built-in default. Since the IAM scope is derived from the deployment's value, that
+    only showed up as a Bedrock rejection.
+    """
+    from dsql_migrator.ui.ai_assist import DEFAULT_BEDROCK_MODEL_ID
+
+    deployment_model = "global.anthropic.claude-opus-4-8"
+    assert deployment_model != DEFAULT_BEDROCK_MODEL_ID, "fixture must differ from default"
+
+    def seed(config: AiAssistConfig, *, model=None, region=None) -> AiAssistConfig:
+        # The guard as it stands in ui/connect.py.
+        if model and config.model_id == DEFAULT_BEDROCK_MODEL_ID:
+            config = config.model_copy(update={"model_id": model})
+        if region and config.region is None:
+            config = config.model_copy(update={"region": region})
+        return config
+
+    # Pristine, and with Enable already on: both take the deployment's value.
+    assert seed(AiAssistConfig(), model=deployment_model).model_id == deployment_model
+    assert (
+        seed(AiAssistConfig(enabled=True), model=deployment_model).model_id
+        == deployment_model
+    )
+    # A model the user chose is never overwritten.
+    chosen = AiAssistConfig(enabled=True, model_id="global.anthropic.claude-opus-5")
+    assert seed(chosen, model=deployment_model).model_id == chosen.model_id
+    # Region seeds only while unset.
+    assert seed(AiAssistConfig(), region="us-west-2").region == "us-west-2"
+    fixed = AiAssistConfig(region="eu-west-1")
+    assert seed(fixed, region="us-west-2").region == "eu-west-1"

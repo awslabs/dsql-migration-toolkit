@@ -341,7 +341,7 @@ aws cloudformation deploy \
     SourceDbSecurityGroupId="$SOURCE_DB_SG" \
     EnableAiAssist=true \
     BedrockRegion="$AWS_REGION" \
-    BedrockModelId=us.anthropic.claude-sonnet-4-6
+    BedrockModelId=global.anthropic.claude-sonnet-5
     # BedrockModelId default shown; other model choices in §8
     # SourceSecretArn=...   # optional — only to reuse an existing source secret
 ```
@@ -350,7 +350,7 @@ aws cloudformation deploy \
 > AI DBA for Schema Conversion and the Query Converter — an opt-in, advisory-only
 > feature scoped to `bedrock:InvokeModel` for the selected model. You **must still
 > enable model access** for `BedrockModelId` (default
-> `us.anthropic.claude-sonnet-4-6`) in the Bedrock console for that region, and the
+> `global.anthropic.claude-sonnet-5`) in the Bedrock console for that region, and the
 > task needs egress to the Bedrock endpoint. Omit both to deploy without AI (the
 > deterministic path is unchanged). Full details + model choices in §8.
 
@@ -421,7 +421,7 @@ credentials at **Connect** to begin.
 | `EnableAiAssist` | no | `false` | Opt-in; grants scoped `bedrock:InvokeModel`. |
 | `BedrockModelArns` | no | `""` | **Optional override** of the invoke scope; blank = auto-derived from `BedrockModelId`. |
 | `BedrockRegion` | no | `""` | `BEDROCK_REGION` for the app. |
-| `BedrockModelId` | no | `us.anthropic.claude-sonnet-4-6` | Anthropic model (dropdown); IAM scope auto-derived from it. |
+| `BedrockModelId` | no | `global.anthropic.claude-sonnet-5` | Anthropic model (dropdown); IAM scope auto-derived from it. |
 
 ### Point DNS at the ALB — optional (custom domain only)
 
@@ -535,7 +535,7 @@ AI assist is opt-in and grants a **scoped** `bedrock:InvokeModel`:
 aws cloudformation deploy ... \
   --parameter-overrides \
     EnableAiAssist=true \
-    BedrockModelId=us.anthropic.claude-sonnet-4-6 \
+    BedrockModelId=global.anthropic.claude-sonnet-5 \
     BedrockRegion=$AWS_REGION
 ```
 
@@ -543,17 +543,19 @@ aws cloudformation deploy ... \
 tool has no field for a direct Anthropic/OpenAI (or any other) API key, so the
 only model you can select is a Bedrock foundation model invoked with your AWS
 credentials. Set the model with `BedrockModelId` (default
-`us.anthropic.claude-sonnet-4-6`).
+`global.anthropic.claude-sonnet-5`).
 
 **Recommended models — the latest Anthropic Claude Opus or Sonnet:**
 
 | Model | Bedrock model id (`BedrockModelId`) | When to use |
 |---|---|---|
-| Claude Opus 4.8 | `us.anthropic.claude-opus-4-8` | Hardest `MANUAL` / `UNSUPPORTED` conversions; highest quality. |
-| Claude Opus 4.6 | `us.anthropic.claude-opus-4-6-v1` | High quality; a step below 4.8. |
-| Claude Sonnet 4.6 (default) | `us.anthropic.claude-sonnet-4-6` | Best balance of quality, speed, and cost for most schemas. |
+| Claude Sonnet 5 (default) | `global.anthropic.claude-sonnet-5` | Best balance of quality, speed, and cost for most schemas. |
+| Claude Opus 5 | `global.anthropic.claude-opus-5` | Hardest `MANUAL` / `UNSUPPORTED` conversions; highest quality. |
+| Claude Opus 4.8 | `global.anthropic.claude-opus-4-8` | High quality; a step below Opus 5. |
+| Claude Sonnet 4.6 | `global.anthropic.claude-sonnet-4-6` | Previous-generation Sonnet. |
 
-`BedrockModelId` is a **dropdown** of these `us.` cross-region inference profiles,
+`BedrockModelId` is a **dropdown** of these `global.` cross-region inference profiles
+(they resolve from every commercial region, so one list serves any deploy),
 and the task role's `bedrock:InvokeModel` scope is **derived from it
 automatically** — so you do **not** set `BedrockModelArns` (use it only to
 override with a different model/ARNs). You **must still enable model access** for

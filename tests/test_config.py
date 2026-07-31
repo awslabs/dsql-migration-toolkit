@@ -262,11 +262,11 @@ def test_load_connect_defaults_reads_source_from_db_vars() -> None:
 def test_load_connect_defaults_reads_bedrock_model_id() -> None:
     defaults = load_connect_defaults(
         env={
-            "BEDROCK_MODEL_ID": "us.anthropic.claude-opus-4-8",
+            "BEDROCK_MODEL_ID": "global.anthropic.claude-opus-4-8",
             "BEDROCK_REGION": "us-east-1",
         }
     )
-    assert defaults.bedrock_model_id == "us.anthropic.claude-opus-4-8"
+    assert defaults.bedrock_model_id == "global.anthropic.claude-opus-4-8"
     assert defaults.bedrock_region == "us-east-1"
 
 

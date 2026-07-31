@@ -122,7 +122,7 @@ AI アシストは **オプトイン・デフォルト無効** の補強機能�
   `BedrockRegion` も設定し、タスクの送信(egress)トラフィックが Bedrock ランタイムエンドポイントに
   到達できる必要があります(NAT または Bedrock VPC エンドポイント)。
   [`deploy/DEPLOYMENT.md` §9](../../../deploy/DEPLOYMENT.ja.md) を参照してください。
-- **モデル:** デフォルトは `us.anthropic.claude-sonnet-4-6`(汎用的でコスト効率の良い選択)です。
+- **モデル:** デフォルトは `global.anthropic.claude-sonnet-5`(汎用的でコスト効率の良い選択)です。
   `BedrockModelId`(デプロイ時)または Connect 画面の Bedrock 設定で変更します。
 
 **有効化する方法:**

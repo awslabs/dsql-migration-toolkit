@@ -132,7 +132,7 @@ never touches.
   (least privilege — it can invoke only those models). You also set `BedrockRegion`
   and the task's egress must be able to reach the Bedrock runtime endpoint (NAT or
   a Bedrock VPC endpoint). See [`deploy/DEPLOYMENT.md` §9](../../../deploy/DEPLOYMENT.md).
-- **Model:** the default is `us.anthropic.claude-sonnet-4-6` (a general,
+- **Model:** the default is `global.anthropic.claude-sonnet-5` (a general,
   cost-effective choice); override it with `BedrockModelId` (deploy) or in the
   Connect screen's Bedrock settings.
 

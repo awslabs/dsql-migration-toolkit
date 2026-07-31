@@ -78,7 +78,7 @@ class _FakeSession:
 def test_ai_assist_config_defaults_are_opt_in() -> None:
     config = AiAssistConfig()
     assert config.enabled is False
-    assert config.model_id == "global.anthropic.claude-sonnet-4-6"
+    assert config.model_id == "global.anthropic.claude-sonnet-5"
     assert config.region is None
 
 
@@ -108,7 +108,7 @@ def test_ai_conversion_suggestion_defaults() -> None:
         object_name="audit_trigger",
         kind="SCHEMA",
         suggested_sql_or_expr="CREATE TABLE t (id int PRIMARY KEY)",
-        model_id="global.anthropic.claude-sonnet-4-6",
+        model_id="global.anthropic.claude-sonnet-5",
     )
     assert suggestion.status == "PENDING_REVIEW"
     assert suggestion.approved_by_user is False
@@ -123,7 +123,7 @@ def test_ai_conversion_suggestion_serialization_round_trip() -> None:
         suggested_sql_or_expr="SELECT 1",
         rationale="rewrite",
         confidence=0.5,
-        model_id="global.anthropic.claude-sonnet-4-6",
+        model_id="global.anthropic.claude-sonnet-5",
         status="APPROVED",
         approved_by_user=True,
     )
@@ -137,7 +137,7 @@ def test_ai_conversion_suggestion_rejects_invalid_kind() -> None:
             object_name="t",
             kind="TABLE",  # not one of SCHEMA/DATA/QUERY
             suggested_sql_or_expr="x",
-            model_id="global.anthropic.claude-sonnet-4-6",
+            model_id="global.anthropic.claude-sonnet-5",
         )
 
 
@@ -147,7 +147,7 @@ def test_ai_conversion_suggestion_rejects_invalid_status() -> None:
             object_name="t",
             kind="SCHEMA",
             suggested_sql_or_expr="x",
-            model_id="global.anthropic.claude-sonnet-4-6",
+            model_id="global.anthropic.claude-sonnet-5",
             status="DONE",  # not a valid review status
         )
 
@@ -170,7 +170,7 @@ def test_ai_conversion_suggestion_requires_model_id() -> None:
 def test_load_ai_assist_config_uses_defaults_when_env_empty() -> None:
     config = load_ai_assist_config(env={})
     assert config.enabled is False
-    assert config.model_id == "global.anthropic.claude-sonnet-4-6"
+    assert config.model_id == "global.anthropic.claude-sonnet-5"
     assert config.region is None
 
 
@@ -189,7 +189,7 @@ def test_load_ai_assist_config_reads_model_id_and_region() -> None:
 def test_load_ai_assist_config_treats_blank_values_as_unset() -> None:
     env = {ENV_BEDROCK_MODEL_ID: "   ", ENV_BEDROCK_REGION: "  "}
     config = load_ai_assist_config(env=env)
-    assert config.model_id == "global.anthropic.claude-sonnet-4-6"
+    assert config.model_id == "global.anthropic.claude-sonnet-5"
     assert config.region is None
 
 
@@ -199,7 +199,7 @@ def test_load_ai_assist_config_keys_are_not_prefixed() -> None:
     assert ENV_BEDROCK_REGION == "BEDROCK_REGION"
     env = {"DSQL_MIGRATOR_BEDROCK_MODEL_ID": "ignored"}
     config = load_ai_assist_config(env=env)
-    assert config.model_id == "global.anthropic.claude-sonnet-4-6"
+    assert config.model_id == "global.anthropic.claude-sonnet-5"
 
 
 # ---------------------------------------------------------------------------
@@ -710,14 +710,14 @@ def test_apply_gate_refuses_unapproved_and_passes_only_approved_safe() -> None:
         object_name="pending",
         kind="SCHEMA",
         suggested_sql_or_expr="CREATE TABLE pending (id int PRIMARY KEY)",
-        model_id="global.anthropic.claude-sonnet-4-6",
+        model_id="global.anthropic.claude-sonnet-5",
     )
     approved = approve_suggestion(
         AiConversionSuggestion(
             object_name="approved",
             kind="SCHEMA",
             suggested_sql_or_expr="CREATE TABLE approved (id int PRIMARY KEY)",
-            model_id="global.anthropic.claude-sonnet-4-6",
+            model_id="global.anthropic.claude-sonnet-5",
         )
     )
 
@@ -739,7 +739,7 @@ def test_apply_gate_refuses_approved_but_forbidden_suggestion() -> None:
             object_name="dangerous",
             kind="SCHEMA",
             suggested_sql_or_expr="DROP DATABASE prod",
-            model_id="global.anthropic.claude-sonnet-4-6",
+            model_id="global.anthropic.claude-sonnet-5",
             status="APPROVED",
             approved_by_user=True,
         )

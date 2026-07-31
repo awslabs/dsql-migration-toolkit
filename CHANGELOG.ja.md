@@ -5,6 +5,38 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.181
+
+### Fixed
+
+- **既定の設定でデプロイすると AI Assist が `AccessDenied` で失敗していました。** CloudFormation
+  テンプレートの `BedrockModelId` の既定値は `us.anthropic.claude-sonnet-4-6` でしたが、アプリ
+  自身の既定値は `global.anthropic.claude-sonnet-4-6` でした。タスクロールの
+  `bedrock:InvokeModel` のスコープはテンプレートの値から **導出** されますが、Connect フォームの
+  Model ID を空にするとアプリは *自身の* 既定値で呼び出します — そのため既定のデプロイはポリシーが
+  許可していないプロファイルを呼び出し、「Verify AI access」は 2 つの既定値のずれを IAM ポリシーの
+  不備のように見せる権限エラーを返していました。2 つがずれ得ないこと、および既定値が
+  `AllowedValues` に含まれることをテストで固定しました。
+- **AI Assist を有効にすると `BEDROCK_MODEL_ID` がフォームに反映されなくなっていました。**
+  prefill が設定 *全体* をまだ手を付けていない `AiAssistConfig()` と比較していたため、Enable
+  スイッチを入れるだけで不一致となり、以降のすべての描画で seed が静かにスキップされていました —
+  IAM はデプロイ時の値でスコープされているのに、アプリは組み込みの既定値を使う状態になります。現在は
+  フィールドごとに判定します。モデル ID は組み込み既定値のままのとき、リージョンは未設定のときのみ
+  seed し、利用者が入力した値は決して上書きしません。
+
+### Changed
+
+- **既定モデルが Claude Sonnet 5**(`global.anthropic.claude-sonnet-5`)になり、Opus 5 も併せて
+  提供します。実際に検証しました — プロファイルは `ACTIVE` で `ap-northeast-2` から呼び出しに成功し、
+  テンプレートが導出する IAM スコープ(`inference-profile/global.anthropic.claude-sonnet-5` と
+  `foundation-model/anthropic.claude-sonnet-5`)は実在するモデルに解決されます。
+- **提供するのは `global.` の推論プロファイルのみになりました。** `us.` 系は `us-east-1` /
+  `us-east-2` / `us-west-2` からのみ解決され、それ以外では失敗しますが、`global.` はその 3
+  リージョンでも動作します — `us-east-1`、`us-west-2`、`ap-northeast-2` で確認済みです。選択肢と
+  いうより罠であり、そもそもテンプレートの既定値がアプリとずれた原因も geo プレフィックスが 2 つ
+  あったことでした。リポジトリのどこにも `us.` のモデル ID は残っておらず、デプロイガイド・
+  マニュアル(EN/KO/JA)と README も併せて更新しました。
+
 ## v0.1.180
 
 ### Fixed

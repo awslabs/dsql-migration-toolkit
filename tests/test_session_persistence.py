@@ -466,7 +466,7 @@ def test_ai_assist_preference_round_trips_for_reconnect() -> None:
     session, eval_state, conv_state, migration_state = _populated_states()
     session.set_ai_assist(
         build_ai_assist_config(
-            enabled=True, model_id="us.anthropic.claude-opus-4-8", region="us-west-2"
+            enabled=True, model_id="global.anthropic.claude-opus-4-8", region="us-west-2"
         )
     )
 
@@ -474,14 +474,14 @@ def test_ai_assist_preference_round_trips_for_reconnect() -> None:
         "s1", session, eval_state, conv_state, migration_state
     )
     assert snapshot.ai_assist_enabled is True
-    assert snapshot.ai_assist_model_id == "us.anthropic.claude-opus-4-8"
+    assert snapshot.ai_assist_model_id == "global.anthropic.claude-opus-4-8"
     assert snapshot.ai_assist_region == "us-west-2"
 
     s2 = SessionConnectionState()
     apply_session_snapshot(snapshot, s2, EvaluationState(),
                            SchemaConversionState(), DataMigrationState())
     assert s2.ai_assist.enabled is True
-    assert s2.ai_assist.model_id == "us.anthropic.claude-opus-4-8"
+    assert s2.ai_assist.model_id == "global.anthropic.claude-opus-4-8"
     assert s2.ai_assist.region == "us-west-2"
 
 

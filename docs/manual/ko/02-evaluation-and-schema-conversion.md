@@ -114,7 +114,7 @@ AI 어시스트는 **옵트인·기본 꺼짐** 보강 기능으로, **Amazon Be
   이 부여됩니다(최소 권한 — 그 모델만 호출 가능). `BedrockRegion`도 설정해야 하고, 태스크의 아웃바운드
   트래픽(egress)이 Bedrock 런타임 엔드포인트에 도달할 수 있어야 합니다(NAT 또는 Bedrock VPC 엔드포인트).
   [`deploy/DEPLOYMENT.md` §9](../../../deploy/DEPLOYMENT.md) 참조.
-- **모델:** 기본은 `us.anthropic.claude-sonnet-4-6`(범용·비용 효율 선택). `BedrockModelId`(배포) 또는
+- **모델:** 기본은 `global.anthropic.claude-sonnet-5`(범용·비용 효율 선택). `BedrockModelId`(배포) 또는
   Connect 화면의 Bedrock 설정에서 변경.
 
 **켜는 방법:**

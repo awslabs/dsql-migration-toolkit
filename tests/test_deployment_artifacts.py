@@ -1150,14 +1150,12 @@ def test_bedrock_model_id_is_curated_dropdown_with_auto_scope(template: dict) ->
     spec = template["Parameters"]["BedrockModelId"]
     allowed = spec["AllowedValues"]
     assert spec["Default"] in allowed
-    # Curated Anthropic profiles across geos: us. (US regions) + global. (any region,
-    # e.g. Seoul/eu). Every value is an anthropic cross-region inference profile id.
-    assert allowed and all(
-        v.startswith(("us.anthropic.", "global.anthropic.")) for v in allowed
-    )
-    # Both a US-only and a portable global profile must be offered.
-    assert any(v.startswith("us.anthropic.") for v in allowed)
-    assert any(v.startswith("global.anthropic.") for v in allowed)
+    # GLOBAL profiles only. A `global.` profile resolves from every commercial region
+    # (verified against us-east-1, us-west-2 and ap-northeast-2), so offering the `us.`
+    # equivalents alongside them added a value that fails outside three US regions -- a
+    # trap, not a choice -- and let the template default drift from the app's.
+    assert allowed and all(v.startswith("global.anthropic.") for v in allowed)
+    assert not any(v.startswith("us.anthropic.") for v in allowed)
     assert template["Conditions"]["HasBedrockModelArnsOverride"] == {
         "Fn::Not": [{"Fn::Equals": [{"Fn::Join": ["", {"Ref": "BedrockModelArns"}]}, ""]}]
     }

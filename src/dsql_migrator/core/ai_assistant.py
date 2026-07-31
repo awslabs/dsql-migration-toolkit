@@ -7,7 +7,7 @@ Task 16.1 scope. The AI data models (:class:`~dsql_migrator.core.models.AiAssist
 and :class:`~dsql_migrator.core.models.AiConversionSuggestion`) live in
 ``core/models.py``; this module adds the two remaining pieces of 16.1:
 
-- loading the ``BEDROCK_MODEL_ID`` (default ``global.anthropic.claude-sonnet-4-6``) and
+- loading the ``BEDROCK_MODEL_ID`` (default ``global.anthropic.claude-sonnet-5``) and
   ``BEDROCK_REGION`` settings from the environment into an ``AiAssistConfig``
   (Requirements 11.3, 11.4), and
 - constructing the ``bedrock-runtime`` ``boto3`` client used to call Bedrock
@@ -108,7 +108,7 @@ def _read(env: Mapping[str, str], name: str) -> Optional[str]:
 def load_ai_assist_config(env: Optional[Mapping[str, str]] = None) -> AiAssistConfig:
     """Load AI-assist settings from ``BEDROCK_MODEL_ID`` / ``BEDROCK_REGION``.
 
-    ``model_id`` defaults to ``global.anthropic.claude-sonnet-4-6`` (the model's own
+    ``model_id`` defaults to ``global.anthropic.claude-sonnet-5`` (the model's own
     default, kept as the single source of truth) when ``BEDROCK_MODEL_ID`` is unset or blank,
     and ``region`` comes from ``BEDROCK_REGION`` (``None`` when unset). AI assist
     is opt-in, so ``enabled`` is always ``False`` here; the user turns it on in
