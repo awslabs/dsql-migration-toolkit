@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.176
+
+### Changed
+
+- **Effort badges now render the same neutral outline everywhere.** The summary row colored
+  each level on the green/amber/red ramp while the object rows and finding cards drew the
+  same value in gray — one value, two treatments. The ramp is also the wrong signal: on this
+  screen it means *compatibility* (the chart, the classification badges, the
+  Risk/Recommendation panels all use it), whereas effort is an ordered scale of hours, not a
+  severity. Coloring it both diluted that meaning and collided on the object rows, where an
+  amber `Review needed` badge sat beside an amber `effort: MEDIUM` and a red `Unsupported`
+  beside a red `effort: SIGNIFICANT`. All three surfaces now share one constant, so colour
+  stays reserved for compatibility and cannot drift apart again.
+
 ## v0.1.175
 
 ### Changed

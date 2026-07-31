@@ -1225,3 +1225,54 @@ def test_effort_summary_is_omitted_when_no_object_needs_work() -> None:
     ui = _ItemUi()
     _render_assessment(ui, report)
     assert "Estimated manual effort" not in ui.texts
+
+
+def test_every_effort_badge_uses_the_same_neutral_color() -> None:
+    """Effort must not borrow the compatibility ramp, and must not vary by surface.
+
+    The green/amber/red ramp means COMPATIBILITY on this screen -- the chart, the
+    classification badges and the Risk/Recommendation panels all use it. Effort is a
+    different axis (ordered hours, not severity), and a per-level ramp both diluted that
+    meaning and collided on object rows: an amber "Review needed" badge sat beside an amber
+    "effort: MEDIUM", a red "Unsupported" beside a red "effort: SIGNIFICANT". It was also
+    applied inconsistently -- colored in the summary row, gray on the rows and cards.
+    """
+    from dsql_migrator.ui import evaluation
+
+    # A single constant, not a per-level map: nothing can diverge per level again.
+    assert isinstance(evaluation._EFFORT_BADGE_COLOR, str)
+    # Outside the severity ramp used by classification.
+    assert evaluation._EFFORT_BADGE_COLOR not in set(
+        evaluation._CLASS_BADGE_COLOR.values()
+    )
+    for ramp_color in ("green", "amber", "red", "orange"):
+        assert ramp_color not in evaluation._EFFORT_BADGE_COLOR
+
+    # No surface may hard-code the color: the literal must appear EXACTLY ONCE in the
+    # module -- at the constant's definition. Every badge then references the constant, so
+    # changing it once changes all three. (Grepping badge lines for the literal instead
+    # would pass while the hard-coded value happens to match, then drift silently.)
+    import pathlib
+
+    source = pathlib.Path(evaluation.__file__).read_text()
+    literal = f'"{evaluation._EFFORT_BADGE_COLOR}"'
+    assert source.count(literal) == 1, (
+        f"{literal} appears {source.count(literal)}x; it must only be the constant's "
+        "definition, with every badge referencing _EFFORT_BADGE_COLOR"
+    )
+    # And the badges do reference it, on all three surfaces.
+    assert source.count("color={_EFFORT_BADGE_COLOR} outline") == 3, source.count(
+        "color={_EFFORT_BADGE_COLOR} outline"
+    )
+
+
+def test_effort_summary_badges_render_without_a_severity_color() -> None:
+    from dsql_migrator.ui import evaluation
+    from dsql_migrator.ui.evaluation import _render_assessment
+
+    report = _mixed_effort_report()
+    ui = _ItemUi()
+    _render_assessment(ui, report)
+    # The summary row still renders its counts -- it just does so neutrally.
+    assert any(b.startswith("MEDIUM: ") for b in ui.badges), ui.badges
+    assert evaluation._EFFORT_BADGE_COLOR == "blue-grey-6"

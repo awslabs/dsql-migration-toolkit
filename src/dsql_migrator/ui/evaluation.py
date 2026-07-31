@@ -434,12 +434,18 @@ def classification_label(value: str) -> str:
     """
     return _CLASS_DISPLAY_LABEL.get(value, value)
 
-# Quasar badge colors for each effort level (impact cue).
-_EFFORT_BADGE_COLOR = {
-    "SIMPLE": "green-6",
-    "MEDIUM": "amber-8",
-    "SIGNIFICANT": "red-8",
-}
+# Quasar badge color for EVERY effort badge -- one neutral outline, no per-level ramp.
+#
+# Effort deliberately does not use the green/amber/red ramp. In this screen that ramp means
+# COMPATIBILITY: the chart, the classification badges and the Risk/Recommendation panels all
+# use it for "does this move, and how badly is it blocked". Effort is a different axis -- an
+# ordered scale of hours, not a severity -- so painting it with the same three colors both
+# dilutes what the ramp means and collides on the object rows, where an amber "Review
+# needed" badge sat beside an amber "effort: MEDIUM" one and a red "Unsupported" beside a
+# red "effort: SIGNIFICANT". The per-level map that used to live here was applied to the
+# summary badges only, so the same value was colored in one place and gray in the two others
+# (object rows, finding cards); one constant keeps all three consistent.
+_EFFORT_BADGE_COLOR = "blue-grey-6"
 
 
 
@@ -1415,9 +1421,8 @@ def _render_assessment(
                 "text-sm font-semibold text-gray-700"
             )
             for level, count in report.effort_summary.items():
-                color = _EFFORT_BADGE_COLOR.get(level.value, "blue-grey-6")
                 ui.badge(f"{level.value}: {count}").props(  # type: ignore[attr-defined]
-                    f"color={color}"
+                    f"color={_EFFORT_BADGE_COLOR} outline"
                 ).classes("text-sm q-px-sm q-py-xs")
             needing = sum(report.effort_summary.values())
             ui.label(  # type: ignore[attr-defined]
@@ -1562,7 +1567,7 @@ def _render_assessment_item(
                 ui.badge(item.kind).props("color=grey-6 outline")  # type: ignore[attr-defined]
                 if effort:
                     ui.badge(f"effort: {effort}").props(  # type: ignore[attr-defined]
-                        "color=blue-grey-6 outline"
+                        f"color={_EFFORT_BADGE_COLOR} outline"
                     )
         with ui.column().classes("gap-3 p-3 w-full"):  # type: ignore[attr-defined]
             # One block per matched rule, each pairing a risk with ITS OWN
@@ -1638,7 +1643,7 @@ def _render_assessment_item(
                                         )
                                         if advisory
                                         else f"effort: {concern.effort.value}"
-                                    ).props("color=blue-grey-6 outline")
+                                    ).props(f"color={_EFFORT_BADGE_COLOR} outline")
                             # Problem and fix are LABELED and visually separated. A bare
                             # sentence followed by a fainter arrowed sentence read as one
                             # wrapped paragraph -- the arrow was the only cue that the
