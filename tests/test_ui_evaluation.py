@@ -1260,8 +1260,11 @@ def test_every_effort_badge_uses_the_same_neutral_color() -> None:
         f"{literal} appears {source.count(literal)}x; it must only be the constant's "
         "definition, with every badge referencing _EFFORT_BADGE_COLOR"
     )
-    # And the badges do reference it, on all three surfaces.
-    assert source.count("color={_EFFORT_BADGE_COLOR} outline") == 3, source.count(
+    # And the badges do reference it. Two surfaces carry an effort badge: the summary row
+    # above the object list, and each finding inside an expanded object. The collapsed
+    # object row deliberately has none -- see
+    # test_collapsed_row_shows_no_object_level_effort_badge.
+    assert source.count("color={_EFFORT_BADGE_COLOR} outline") == 2, source.count(
         "color={_EFFORT_BADGE_COLOR} outline"
     )
 
@@ -1276,3 +1279,133 @@ def test_effort_summary_badges_render_without_a_severity_color() -> None:
     # The summary row still renders its counts -- it just does so neutrally.
     assert any(b.startswith("MEDIUM: ") for b in ui.badges), ui.badges
     assert evaluation._EFFORT_BADGE_COLOR == "blue-grey-6"
+
+
+def test_collapsed_row_summarises_the_findings_the_badge_hides() -> None:
+    """The header badge names only the governing class, which is silent about the rest.
+
+    Measured on a real source, 16 of 18 tables carried a mix (a real gap plus the
+    AUTO_INCREMENT recommendation) behind one badge, and a header reading "Unsupported"
+    could hide six findings of which four were merely review-needed and one optional -- so
+    the object looked wholly blocked when most of it was not.
+    """
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef
+    from dsql_migrator.ui.evaluation import _render_assessment_item
+
+    item = CompatibilityAssessor().assess(
+        SourceInventory(
+            tables=[
+                TableDef(
+                    name="wide",
+                    columns=[
+                        ColumnDef(name="id", mysql_type="int", nullable=False),
+                        # Past DSQL's numeric ceiling -> UNSUPPORTED, so it governs.
+                        ColumnDef(name="amt", mysql_type="decimal(65,30)"),
+                        ColumnDef(
+                            name="sku",
+                            mysql_type="varchar(40)",
+                            collation="utf8mb4_general_ci",
+                        ),
+                    ],
+                    primary_key=["id"],
+                    auto_increment_column="id",
+                )
+            ]
+        )
+    ).items[0]
+    assert item.classification.value == "UNSUPPORTED"
+
+    ui = _ItemUi()
+    _render_assessment_item(ui, item)
+    joined = "\n".join(ui.texts)
+    # Every class present is named with its count, advisory findings included.
+    assert "1 Unsupported" in joined, joined
+    assert "1 Review needed" in joined, joined
+    assert "1 Recommended" in joined, joined
+
+
+def test_collapsed_row_shows_no_object_level_effort_badge() -> None:
+    """Effort belongs to each finding, not to the collapsed row.
+
+    A per-object estimate described the object as a whole while the row now summarises its
+    findings; and one SIMPLE fix beside one SIGNIFICANT one does not average into a single
+    useful number. Each finding carries its own effort inside, and the schema-wide
+    distribution sits in the summary above the list.
+    """
+    from dsql_migrator.ui.evaluation import _render_assessment_item
+
+    item = _five_rule_item()
+    assert item.effort is not None, "fixture must have an object-level effort to omit"
+
+    ui = _ItemUi()
+    _render_assessment_item(ui, item)
+    # Exactly one effort badge per finding that has an estimate -- no extra one for the
+    # object itself. Counting is what catches a re-added row badge: the object's governing
+    # effort equals some finding's, so checking for the text alone would still pass.
+    per_finding = [b for b in ui.badges if b.startswith("effort")]
+    expected = [c for c in item.concerns if c.effort is not None]
+    assert expected, "fixture must have findings carrying an effort"
+    assert len(per_finding) == len(expected), (per_finding, len(expected))
+
+
+def test_concern_summary_is_omitted_when_it_would_repeat_the_badge() -> None:
+    # A lone finding of the governing class adds nothing; a redundant line is noise.
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef
+    from dsql_migrator.ui.evaluation import assessment_concern_summary
+
+    report = CompatibilityAssessor().assess(
+        SourceInventory(
+            tables=[
+                TableDef(
+                    name="one",
+                    columns=[
+                        ColumnDef(name="id", mysql_type="int", nullable=False),
+                        ColumnDef(
+                            name="s",
+                            mysql_type="varchar(9)",
+                            collation="utf8mb4_general_ci",
+                        ),
+                    ],
+                    primary_key=["id"],
+                )
+            ]
+        )
+    )
+    item = report.items[0]
+    assert len(item.concerns) == 1
+    assert assessment_concern_summary(item) == ""
+    # And a clean object has nothing to summarise at all.
+    clean = CompatibilityAssessor().assess(
+        SourceInventory(
+            tables=[
+                TableDef(
+                    name="clean",
+                    columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                    primary_key=["id"],
+                )
+            ]
+        )
+    ).items[0]
+    assert assessment_concern_summary(clean) == ""
+
+
+def test_concern_summary_orders_by_severity_and_labels_advice_as_recommended() -> None:
+    from dsql_migrator.ui.evaluation import assessment_concern_summary
+
+    item = _five_rule_item()
+    summary = assessment_concern_summary(item)
+    # Advisory findings are MANUAL by classification but read "Recommended" -- the word
+    # their own badge uses inside the card.
+    assert "Recommended" in summary, summary
+    # Same "N Label · M Label" shape the kind-group heading above the row uses.
+    assert " \u00b7 " in summary, summary
+    # Severity first: the line opens with the class that governs the object.
+    from dsql_migrator.ui.evaluation import classification_label
+
+    governing = classification_label(item.classification.value)
+    assert summary.startswith(f"{len(
+        [c for c in item.concerns
+         if not c.is_advisory and c.classification is item.classification]
+    )} {governing}"), summary

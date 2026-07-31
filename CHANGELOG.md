@@ -5,6 +5,26 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.177
+
+### Changed
+
+- **A collapsed object row now breaks down the findings its badge hides.** The header badge
+  states only the *governing* classification, which is silent about the rest: measured on a
+  real source, 16 of 18 tables carried a mix — typically a real gap plus the
+  `AUTO_INCREMENT` recommendation — behind a single badge, and a row reading `Unsupported`
+  could hide six findings of which four were merely review-needed and one was optional
+  advice. The object looked wholly blocked when most of it was not. Each row now adds
+  `1 Unsupported · 3 Review needed · 1 Recommended`, in the same `N Label · M Label` shape
+  the kind-group heading above it already uses, with advisory findings counted as
+  `Recommended` — the word their own badge uses inside. It is omitted when it would merely
+  repeat the badge (a lone finding of the governing class, or a clean object).
+- **The per-object effort badge is gone from the collapsed row.** It described the object as
+  a whole while the row now summarises its findings, and one `SIMPLE` fix beside one
+  `SIGNIFICANT` one does not average into a useful number. Each finding still carries its
+  own estimate when expanded, and the schema-wide distribution stays in the summary above
+  the list.
+
 ## v0.1.176
 
 ### Changed

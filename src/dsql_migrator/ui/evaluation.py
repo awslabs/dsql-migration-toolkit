@@ -554,6 +554,14 @@ def group_assessment_items_by_kind(items: list) -> list[tuple[str, list]]:
     return [(kind, buckets[kind]) for kind in ordered]
 
 
+# Display labels for the per-object findings breakdown. Advisory findings read
+# "Recommended" -- the word their own badge uses inside the expanded card -- rather than the
+# MANUAL classification they technically carry.
+_CONCERN_SUMMARY_LABEL = {
+    "RECOMMENDED": "Recommended",
+}
+
+
 def assessment_kind_summary(items: list) -> str:
     """Return a one-line per-classification count for a kind group.
 
@@ -577,6 +585,50 @@ def assessment_kind_summary(items: list) -> str:
         if value not in order
     ]
     return " · ".join(parts)
+
+
+def assessment_concern_summary(item) -> str:
+    """Return a one-line breakdown of an object's findings, most severe first.
+
+    The row header shows only the GOVERNING classification, which says nothing about the
+    rest: measured on the Seoul source, 16 of 18 tables carried a mix (typically a real gap
+    plus the AUTO_INCREMENT recommendation) yet advertised a single badge. Worst case, a
+    header reading "Unsupported" hid six findings of which four were merely review-needed
+    and one was optional advice -- so the object looked wholly blocked when most of it was
+    not.
+
+    Uses the same ``N Label · M Label`` shape as :func:`assessment_kind_summary` so the
+    object row and the kind-group heading above it read alike, and counts advisory findings
+    as ``Recommended`` rather than by their classification -- that is the word their badge
+    uses inside. Returns ``""`` when there is nothing to add (no concerns, or a lone
+    finding that the header badge already states).
+    """
+    concerns = list(getattr(item, "concerns", None) or [])
+    if not concerns:
+        return ""
+    counts: dict[str, int] = {}
+    for concern in concerns:
+        label = (
+            "RECOMMENDED"
+            if getattr(concern, "is_advisory", False)
+            else concern.classification.value
+        )
+        counts[label] = counts.get(label, 0) + 1
+    # A single finding of the governing class adds nothing the badge does not already say.
+    if len(concerns) == 1 and item.classification.value in counts:
+        return ""
+    order = ["UNSUPPORTED", "MANUAL", "RECOMMENDED", "AUTO"]
+    parts = [
+        f"{counts[value]} {_CONCERN_SUMMARY_LABEL.get(value, classification_label(value))}"
+        for value in order
+        if counts.get(value)
+    ]
+    parts += [
+        f"{count} {classification_label(value)}"
+        for value, count in counts.items()
+        if value not in order
+    ]
+    return " \u00b7 ".join(parts)
 
 
 def kind_section_label(kind: str) -> str:
@@ -1554,7 +1606,6 @@ def _render_assessment_item(
     button is shown disabled with a hint, so the affordance is discoverable
     rather than silently missing.
     """
-    effort = item.effort.value if item.effort is not None else None
     is_auto = item.classification.value == "AUTO"
     color = _CLASS_BADGE_COLOR.get(item.classification.value, "grey")
     with ui.expansion().classes("w-full").props("expand-separator") as exp:  # type: ignore[attr-defined]
@@ -1565,10 +1616,21 @@ def _render_assessment_item(
                 ).props(f"color={color}")
                 ui.label(item.object_name).classes("font-medium")  # type: ignore[attr-defined]
                 ui.badge(item.kind).props("color=grey-6 outline")  # type: ignore[attr-defined]
-                if effort:
-                    ui.badge(f"effort: {effort}").props(  # type: ignore[attr-defined]
-                        f"color={_EFFORT_BADGE_COLOR} outline"
-                    )
+                # The badge above states only the GOVERNING classification, which is
+                # silent about the rest -- measured on a real source, 16 of 18 tables
+                # carried a mix (a real gap plus the AUTO_INCREMENT recommendation) behind
+                # a single badge, and a header reading "Unsupported" could hide six
+                # findings of which four were merely review-needed and one optional. The
+                # breakdown makes the collapsed row honest about what is inside.
+                #
+                # The per-object effort badge is deliberately NOT here. It described the
+                # object as a whole while this row now summarises its findings, and each
+                # finding carries its own effort inside -- which is the number to act on,
+                # since one SIMPLE fix and one SIGNIFICANT one do not average. The effort
+                # distribution for the whole schema stays in the summary above the list.
+                summary = assessment_concern_summary(item)
+                if summary:
+                    ui.label(summary).classes("text-xs text-gray-500")  # type: ignore[attr-defined]
         with ui.column().classes("gap-3 p-3 w-full"):  # type: ignore[attr-defined]
             # One block per matched rule, each pairing a risk with ITS OWN
             # recommendation. Previously every rule's text was semicolon-joined into a
@@ -1827,6 +1889,7 @@ __all__ = [
     "sort_assessment_items",
     "group_assessment_items_by_kind",
     "assessment_kind_summary",
+    "assessment_concern_summary",
     "classification_label",
     "kind_section_label",
     "job_status_to_step_status",
