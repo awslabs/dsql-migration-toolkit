@@ -723,6 +723,108 @@ def test_migrate_shard_in_process_maps_rows_skipped_from_conflicts(monkeypatch) 
     assert result.rows_skipped == 3  # mapped from BatchedImportResult.conflicts
 
 
+def test_shard_worker_keys_on_the_target_composite_pk(monkeypatch) -> None:
+    """A sharded append must key its skip-filter on the TARGET's key, not the source's.
+
+    Sharding is chosen off the SOURCE PK (a single integer ``id`` is shardable), so a
+    table whose TARGET key is a composite ``(customer_id, id)`` reaches this path too --
+    and the shard worker used to pass no ``key_columns`` at all. The importer then fell
+    back to the source PK, so a SKIP_EXISTING filter ran ``WHERE (id) IN (...)`` against
+    a target keyed ``(customer_id, id)``, where ``id`` alone is not unique: the filter
+    can match a DIFFERENT row and wrongly skip a source row (silent loss). Only large
+    tables shard, so this hit exactly the loads least likely to be row-counted by hand.
+    """
+    import dataclasses
+
+    from dsql_migrator.ui.data_migration import _engine
+
+    table = _tables()[0]  # orders, source PK (id)
+    inputs = dataclasses.replace(
+        _inputs(),
+        replace_tables=frozenset(),  # append path
+        table_conversions={"orders": _composite_applied()},
+    )
+    seen: dict[str, object] = {}
+
+    class _KeyRecordingImporter:
+        def import_rows(self, rows, _table, *, on_batch_loaded=None,
+                        should_cancel=None, on_conflict=None, key_columns=None, **_kw):
+            list(rows)
+            seen["key_columns"] = key_columns
+            seen["on_conflict"] = on_conflict
+            return BatchedImportResult(rows_loaded=1, failures=0)
+
+    monkeypatch.setattr(
+        _engine,
+        "BatchedTableMigrator",
+        lambda inp: BatchedTableMigrator(
+            inp,
+            exporter=_FakeExporter(),
+            watermark_capturer=_FakeWatermarkCapturer(_watermark()),
+            importer_factory=lambda _i: _KeyRecordingImporter(),
+            target_counter=lambda _t: None,
+        ),
+    )
+
+    result = _engine._migrate_shard_in_process(
+        _engine._ShardWorkerArgs(
+            job_id="j", table=table, inputs=inputs,
+            pk_lower=None, pk_upper=None, shard_index=0,
+        )
+    )
+
+    assert result.status == "DONE"
+    assert seen["on_conflict"] is OnConflictMode.SKIP_EXISTING
+    assert seen["key_columns"] == ["customer_id", "id"]
+
+
+def test_shard_worker_leaves_an_unchanged_pk_to_the_source_fallback(monkeypatch) -> None:
+    # When the target key equals the source key there is nothing to override, so the
+    # worker passes None and the importer keeps its existing source-PK fallback.
+    import dataclasses
+
+    from dsql_migrator.core.converter import TableConversion
+    from dsql_migrator.ui.data_migration import _engine
+
+    table = _tables()[0]
+    plain = TableConversion(
+        table="orders",
+        target_ddl='CREATE TABLE "orders" ("id" bigint NOT NULL, PRIMARY KEY ("id"))',
+    )
+    inputs = dataclasses.replace(
+        _inputs(), replace_tables=frozenset(), table_conversions={"orders": plain}
+    )
+    seen: dict[str, object] = {}
+
+    class _KeyRecordingImporter:
+        def import_rows(self, rows, _table, *, on_batch_loaded=None,
+                        should_cancel=None, on_conflict=None, key_columns=None, **_kw):
+            list(rows)
+            seen["key_columns"] = key_columns
+            return BatchedImportResult(rows_loaded=1, failures=0)
+
+    monkeypatch.setattr(
+        _engine,
+        "BatchedTableMigrator",
+        lambda inp: BatchedTableMigrator(
+            inp,
+            exporter=_FakeExporter(),
+            watermark_capturer=_FakeWatermarkCapturer(_watermark()),
+            importer_factory=lambda _i: _KeyRecordingImporter(),
+            target_counter=lambda _t: None,
+        ),
+    )
+
+    _engine._migrate_shard_in_process(
+        _engine._ShardWorkerArgs(
+            job_id="j", table=table, inputs=inputs,
+            pk_lower=None, pk_upper=None, shard_index=0,
+        )
+    )
+
+    assert seen["key_columns"] is None
+
+
 def test_replace_load_passes_target_composite_pk_to_importer() -> None:
     # Phase 0: on a fresh (replace) load, migrate_table parses the PK out of the
     # APPLIED target DDL and passes it to the importer as key_columns, so a
@@ -773,10 +875,31 @@ def _composite_applied():
     )
 
 
-def _append_migrator(importer, *, target_rows, target_pk, **input_overrides):
+def _append_migrator(
+    importer, *, target_rows, target_pk, recreated=None, **input_overrides
+):
     """A migrator on the APPEND path with the composite conversion applied and both
-    target probes stubbed (``target_rows`` = COUNT(*), ``target_pk`` = real key)."""
+    target probes stubbed (``target_rows`` = COUNT(*) before the load, ``target_pk`` =
+    the target's real key). ``recreated`` (a list) records DROP+recreate calls.
+
+    The counter is stateful on purpose: a replace load probes it BEFORE loading (is the
+    target empty?) and again AFTER (completeness check), so a constant 0 would trip the
+    post-load "silent row loss" guard and mask what the test means to assert.
+    """
     import dataclasses
+
+    state = {"loaded": False}
+    calls = recreated if recreated is not None else []
+    # _FakeExporter yields one canned row per table by default.
+    loaded_rows = 1
+
+    def _counter(_table):
+        return loaded_rows if state["loaded"] else target_rows
+
+    def _recreate(table):
+        calls.append(table.name)
+        state["loaded"] = True
+        return ["CREATE INDEX ASYNC ix_orders ON orders (id)"]
 
     inputs = dataclasses.replace(
         _inputs(),
@@ -789,48 +912,100 @@ def _append_migrator(importer, *, target_rows, target_pk, **input_overrides):
         exporter=_FakeExporter(),  # type: ignore[arg-type]
         watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
         importer_factory=lambda _i: importer,  # type: ignore[arg-type,return-value]
-        table_recreator=lambda _t: [],
-        target_counter=lambda _t: target_rows,
+        table_recreator=_recreate,
+        target_counter=_counter,
         target_pk_reader=lambda _t: target_pk,
     )
 
 
-def test_append_into_an_empty_target_loads_with_the_composite_key() -> None:
+def test_empty_target_with_a_changed_pk_is_recreated_from_the_applied_ddl() -> None:
     """The workshop path: Composite key applied in Schema Conversion, then the FIRST
-    Full Load -- which is an APPEND (append is the default, and the derived
-    replace_tables is empty because the target holds no rows).
+    Full Load -- an APPEND, because append is the default and the derived
+    replace_tables is empty when the target holds no rows.
 
-    This used to raise "changed primary key ... Load it fresh (Drop & reload)", which
-    was both wrong and impossible to act on: the target really did have the composite
-    key, and the Drop & reload control only renders for tables that already contain
-    data. An empty target makes the key choice moot -- there is no row to skip-wrong,
-    and rows unique on the source PK stay unique under a key containing it -- so the
-    load proceeds, keyed on the applied PK so a re-run stays idempotent.
+    A changed primary key is a SCHEMA change, so appending can never deliver it. When
+    the target is EMPTY, recreating it is non-destructive, so the table is promoted to
+    the replace path and created from the applied DDL -- the user actually gets the key
+    they chose. The alternative (appending into whatever shape the target happens to
+    have) silently loaded 500 rows under the OLD single-column key while the user
+    believed they had the hot-partition remedy, and left the table populated so
+    correcting it needed a destructive reload.
     """
     importer = _FakeImporter()
-    migrator = _append_migrator(importer, target_rows=0, target_pk=None)
+    recreated: list[str] = []
+    migrator = _append_migrator(
+        importer, target_rows=0, target_pk=None, recreated=recreated
+    )
 
     migrator.migrate_table(_tables()[0])
 
+    assert recreated == ["orders"]  # schema created from the applied DDL
+    assert importer.key_columns_by_table["orders"] == ["customer_id", "id"]
+    # A freshly created target cannot conflict, so it loads with a plain INSERT.
+    assert importer.on_conflict_by_table["orders"] is OnConflictMode.NONE
+    # ...and the post-load secondary indexes still come from the same conversion.
+    assert importer.index_ddls_by_table["orders"]
+
+
+def test_empty_target_still_on_the_old_key_is_recreated_not_appended_into() -> None:
+    """The case that made "just append into an empty target" wrong: the target exists
+    and is empty, but still carries the ORIGINAL single-column key (e.g. the composite
+    choice was made after the table was created, and never applied).
+
+    Appending would succeed and report success while keying the data the old way. The
+    load must recreate the schema instead, so the chosen key is real."""
+    importer = _FakeImporter()
+    recreated: list[str] = []
+    migrator = _append_migrator(
+        importer, target_rows=0, target_pk=["id"], recreated=recreated
+    )
+
+    migrator.migrate_table(_tables()[0])
+
+    assert recreated == ["orders"]
     assert importer.key_columns_by_table["orders"] == ["customer_id", "id"]
 
 
-def test_append_into_empty_target_works_for_full_load_plus_cdc() -> None:
-    """Full-load-+-CDC was the worse case: cdc_coexisting forces the append path
-    REGARDLESS of replace_tables (a DROP would race the live sink), so the old
-    refusal left no path at all -- its suggested remedy was forbidden by design."""
+def test_cdc_coexisting_empty_target_appends_when_the_key_already_matches() -> None:
+    """Full-load-+-CDC cannot recreate anything (a DROP would race the live sink), so
+    the promotion above must not apply. With the target's real key already matching the
+    applied DDL, the idempotent append is correct and proceeds keyed on it."""
     importer = _FakeImporter()
+    recreated: list[str] = []
     migrator = _append_migrator(
         importer,
         target_rows=0,
-        target_pk=None,
+        target_pk=["customer_id", "id"],
+        recreated=recreated,
         replace_tables=frozenset({"orders"}),  # ignored while CDC coexists
         cdc_coexisting=True,
     )
 
     migrator.migrate_table(_tables()[0])
 
+    assert recreated == []  # never recreated under a live sink
     assert importer.key_columns_by_table["orders"] == ["customer_id", "id"]
+    assert importer.on_conflict_by_table["orders"] is OnConflictMode.SKIP_EXISTING
+
+
+def test_cdc_coexisting_key_mismatch_refuses_without_offering_drop_reload() -> None:
+    # While CDC streams, "Drop & reload" is not an available remedy -- recreating the
+    # table would race the live sink -- so the message must not suggest it.
+    importer = _FakeImporter()
+    migrator = _append_migrator(
+        importer,
+        target_rows=0,
+        target_pk=["id"],
+        replace_tables=frozenset({"orders"}),
+        cdc_coexisting=True,
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        migrator.migrate_table(_tables()[0])
+
+    message = str(excinfo.value)
+    assert "Stop CDC" in message
+    assert "Drop & reload" not in message
 
 
 def test_append_into_populated_target_uses_the_targets_real_composite_key() -> None:

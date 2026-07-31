@@ -786,6 +786,19 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             and table.name in args.inputs.replace_tables
         )
         conflict_mode = OnConflictMode.NONE if is_replace else OnConflictMode.SKIP_EXISTING
+        # The TARGET's primary key, from the applied DDL -- the same conflict key
+        # ``migrate_table`` resolves. Sharding is chosen off the SOURCE PK (a single
+        # integer ``id`` is shardable), so a table whose TARGET key is a composite
+        # ``(leading, id)`` reaches this path too. Passing it is required: without it
+        # the importer falls back to the source PK, and a SKIP_EXISTING filter keyed
+        # on a column that is not unique on the target can match a different row and
+        # wrongly skip a source row (silent loss). ``None`` when the applied DDL has
+        # no parseable key, which keeps the source-PK fallback for the common case.
+        shard_key_columns = (
+            parse_target_primary_key(applied.target_ddl) if applied else []
+        ) or None
+        if shard_key_columns == list(table.primary_key):
+            shard_key_columns = None  # unchanged key: keep the existing fallback
         importer = migrator._importer_factory(args.inputs)
 
         # First attempt uses the planned mode; any retry downgrades to SKIP_EXISTING
@@ -814,6 +827,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
                 on_batch_loaded=_on_rows,
                 should_cancel=_is_cancelled,
                 on_conflict=_shard_conflict_mode[0],
+                key_columns=shard_key_columns,
             )
 
         def _attempt():
@@ -2126,6 +2140,28 @@ class BatchedTableMigrator:
             not self._inputs.cdc_coexisting
             and table.name in self._inputs.replace_tables
         )
+        # A CHANGED target PK (e.g. the composite (leading, id) recommended to avoid
+        # hot partitions) is a SCHEMA change, so it can only be honored by creating
+        # the target from the applied DDL -- appending cannot retrofit a key onto an
+        # existing table. When the target is EMPTY, recreating it is non-destructive
+        # (there is nothing to lose), so promote this table to the replace path and
+        # give the user the schema they actually chose.
+        #
+        # Without this the load "succeeded" into whatever shape the target happened to
+        # have: an empty table still carrying the OLD single-column key accepted all
+        # the rows, so the user believed they had the hot-partition remedy while the
+        # table was in fact keyed the old way -- and now populated, so correcting it
+        # required a destructive reload. Silently loading data in the wrong shape is
+        # worse than either refusing or recreating.
+        if (
+            not is_replace
+            and not self._inputs.cdc_coexisting
+            and target_key_columns
+            and target_key_columns != list(table.primary_key)
+            and not pre_recreated
+            and self._target_counter(table) == 0
+        ):
+            is_replace = True
 
         # Reader range sharding: for a LARGE single-integer-PK table, split the read
         # into K disjoint PK ranges streamed concurrently (each its own snapshot), so
@@ -2233,47 +2269,53 @@ class BatchedTableMigrator:
             # named "Drop & reload" as the fix, but that control only renders for
             # tables that already contain data, and ``replace_targets`` is derived
             # from that same set -- so on an empty target the remedy did not exist.
-            # It also blocked Full-load-+-CDC unconditionally, where a replace is
-            # forbidden anyway (it would race the live sink), leaving no path at all.
             #
-            # Resolve it in order of certainty:
-            #   1. an EMPTY target makes the key choice irrelevant -- there is no
-            #      existing row to skip-wrong, and rows unique on the source PK stay
-            #      unique under a composite key that contains it, so the load is
-            #      provably safe whichever key the target has;
-            #   2. otherwise read the target's REAL primary key and use it when it
-            #      matches the applied DDL;
-            #   3. only refuse when the target genuinely disagrees, or when its key
-            #      cannot be read at all (unknown is not "safe").
+            # An empty target normally does not reach here: it was promoted to the
+            # replace path above, which recreates the table from the applied DDL so the
+            # key is right by construction. Two cases still land here with a changed
+            # key -- a target that HOLDS ROWS (a DROP would destroy data the user never
+            # agreed to lose) and a CDC-coexisting load (a DROP would race the live
+            # sink, so replace is forbidden however empty the target is). Both are
+            # decided against the target's REAL key rather than an assumption:
+            #   * it matches the applied DDL -> key the idempotent append on it;
+            #   * it disagrees, or cannot be read -> refuse (unknown is not "safe"),
+            #     naming the real key and the ways forward.
             source_pk = list(table.primary_key)
             load_key_columns = None  # default: the target's existing (source) PK
             if target_key_columns and target_key_columns != source_pk:
-                target_rows = self._target_counter(table)
-                if target_rows == 0:
-                    # Empty target: nothing to conflict with. Key on the applied PK so
-                    # a later re-run of this same load stays idempotent against the
-                    # rows written now.
-                    load_key_columns = target_key_columns
-                else:
-                    actual = self._target_pk_reader(table)
-                    if actual is None:
-                        raise RuntimeError(
-                            f"Table '{table.name}' is configured with a changed "
-                            f"primary key {tuple(target_key_columns)}, but the "
-                            "target's actual primary key could not be read, so an "
-                            "idempotent append cannot be keyed safely. Check the "
-                            "target connection and retry this table."
+                actual = self._target_pk_reader(table)
+                if actual is None:
+                    raise RuntimeError(
+                        f"Table '{table.name}' is configured with a changed "
+                        f"primary key {tuple(target_key_columns)}, but the "
+                        "target's actual primary key could not be read, so an "
+                        "idempotent append cannot be keyed safely. Check the "
+                        "target connection and retry this table."
+                    )
+                if actual != target_key_columns:
+                    # Name the remedy that is actually available. While CDC streams
+                    # into the target, "Drop & reload" is not one: recreating the
+                    # table would race the live sink, so the schema has to be fixed
+                    # before CDC starts.
+                    remedy = (
+                        "Stop CDC, apply the converted schema for this table in "
+                        "Step 2 (Schema Conversion), then re-run the load — while "
+                        "CDC is streaming the table cannot be recreated."
+                        if self._inputs.cdc_coexisting
+                        else (
+                            "Apply the converted schema in Step 2 (Schema "
+                            'Conversion), or choose "Drop & reload" for this table '
+                            "to recreate it from the converted DDL (its existing "
+                            "rows are permanently lost)."
                         )
-                    if actual != target_key_columns:
-                        raise RuntimeError(
-                            f"Table '{table.name}' is configured with a changed "
-                            f"primary key {tuple(target_key_columns)}, but the target "
-                            f"table's primary key is {tuple(actual)}. Apply the "
-                            "converted schema for this table in Step 2 (Schema "
-                            "Conversion), or load it fresh (Drop & reload), so the "
-                            "target key matches before appending."
-                        )
-                    load_key_columns = actual
+                    )
+                    raise RuntimeError(
+                        f"Table '{table.name}' is configured with a changed primary "
+                        f"key {tuple(target_key_columns)}, but the target table's "
+                        f"primary key is {tuple(actual)} — a primary key cannot be "
+                        f"changed by appending. {remedy}"
+                    )
+                load_key_columns = actual
         importer = self._importer_factory(self._inputs)
         try:
             result = importer.import_rows(

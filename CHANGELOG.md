@@ -5,6 +5,47 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.193
+
+### Fixed
+
+- **A changed primary key is now delivered by recreating the schema, not by appending
+  into whatever shape the target has.** v0.1.192 let an *empty* target load on the
+  reasoning that "nothing exists to conflict with", which was true about row conflicts
+  but missed the point: a changed primary key is a **schema** change, and appending
+  cannot retrofit a key onto an existing table. An empty target still carrying the
+  original single-column key therefore accepted every row and reported success — so a
+  user who chose the Composite key strategy to avoid hot partitions got a table keyed
+  the old way, now populated, correctable only by a destructive reload. Loading data in
+  the wrong shape silently is worse than refusing.
+
+  A table whose applied DDL asks for a different key and whose target is **empty** is
+  now promoted to the replace path: the target is recreated from the applied DDL (which
+  destroys nothing) and loaded with a plain `INSERT`, so the chosen key is real by
+  construction. A **populated** target is unchanged from v0.1.192 — decided against its
+  actual key, and refused when it disagrees, since a `DROP` there would destroy data the
+  user never agreed to lose. The refusal now names the remedy that is actually
+  available: `Drop & reload` normally, but "stop CDC first" while a sink is streaming,
+  where recreating the table is impossible.
+- **A sharded load keyed its skip-filter on the wrong columns.** Sharding is chosen from
+  the *source* primary key, so a table with a single integer `id` shards even when its
+  *target* key is a composite `(leading, id)` — and the shard worker passed no
+  `key_columns` at all. The importer fell back to the source key, so an idempotent
+  re-load filtered on `WHERE (id) IN (…)` against a target keyed `(leading, id)`, where
+  `id` alone is not unique: the filter could match a different row and skip a source row
+  that was never written. Only tables above the shard threshold (1M rows by default)
+  were affected — the loads least likely to be verified by hand. The shard worker now
+  passes the target key, and still defers to the source-key fallback when the key is
+  unchanged.
+
+### Tests
+
+- Covered schema recreation on an empty target (including one still on the old key),
+  CDC-coexisting appends and their distinct refusal wording, and both shard-worker key
+  paths. Six mutations killed, including removing the recreate promotion, applying it to
+  a populated target (destructive), applying it under a live sink, and dropping the shard
+  key.
+
 ## v0.1.192
 
 ### Fixed
