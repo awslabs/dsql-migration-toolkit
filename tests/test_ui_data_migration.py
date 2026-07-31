@@ -723,6 +723,101 @@ def test_migrate_shard_in_process_maps_rows_skipped_from_conflicts(monkeypatch) 
     assert result.rows_skipped == 3  # mapped from BatchedImportResult.conflicts
 
 
+def _recreate_inventory():
+    """orders (source PK id) + customers (source PK id), both migratable."""
+    return _inventory()
+
+
+def test_schema_recreate_tables_lists_only_empty_tables_with_a_changed_key() -> None:
+    """Drives the confirm dialog's disclosure: which EMPTY targets will be dropped and
+    recreated to apply a primary key that differs from the source.
+
+    The recreate happens without asking (an empty table has nothing to lose, and a key
+    cannot be applied by appending), so the dialog has to SAY it -- a target DDL the user
+    edited by hand after Schema Conversion is replaced.
+    """
+    from dsql_migrator.core.converter import TableConversion
+    from dsql_migrator.ui.data_migration import schema_recreate_tables
+
+    conversions = {
+        "orders": _composite_applied(),  # target PK (customer_id, id) != source (id)
+        "customers": TableConversion(
+            table="customers",
+            target_ddl='CREATE TABLE "customers" ("id" bigint NOT NULL, '
+            'PRIMARY KEY ("id"))',  # unchanged
+        ),
+    }
+    names = ["orders", "customers"]
+
+    assert schema_recreate_tables(
+        names,
+        table_conversions=conversions,
+        inventory=_recreate_inventory(),
+        tables_with_data=[],
+    ) == ["orders"]
+
+
+def test_schema_recreate_tables_excludes_a_populated_table() -> None:
+    # A populated table is NEVER silently recreated -- it goes through the explicit
+    # "Drop & reload" choice -- so it must not appear in this disclosure, or the dialog
+    # would claim a destructive action the load will not take.
+    from dsql_migrator.ui.data_migration import schema_recreate_tables
+
+    assert schema_recreate_tables(
+        ["orders"],
+        table_conversions={"orders": _composite_applied()},
+        inventory=_recreate_inventory(),
+        tables_with_data=["orders"],
+    ) == []
+
+
+def test_schema_recreate_tables_is_silent_without_a_conversion_or_inventory() -> None:
+    from dsql_migrator.ui.data_migration import schema_recreate_tables
+
+    # No applied conversion for the table -> nothing is known to change.
+    assert schema_recreate_tables(
+        ["orders"],
+        table_conversions={},
+        inventory=_recreate_inventory(),
+        tables_with_data=[],
+    ) == []
+    # No inventory -> the source key is unknown, so claim nothing.
+    assert schema_recreate_tables(
+        ["orders"],
+        table_conversions={"orders": _composite_applied()},
+        inventory=None,
+        tables_with_data=[],
+    ) == []
+
+
+def test_full_load_step_passes_recreate_candidates_into_the_confirm_dialog() -> None:
+    """The disclosure must reach the dialog through a PARAMETER.
+
+    It was first written to read ``conv_state``/``inventory`` directly inside the dialog
+    closure -- names that are not in that scope -- so every Start click would have raised
+    NameError. Nothing caught it because no test opens the dialog, hence this structural
+    check that the value is threaded in and closed over.
+    """
+    from dsql_migrator.ui import data_migration as dm
+
+    code = dm._render_full_load_step.__code__
+    dialog = next(
+        c for c in code.co_consts
+        if getattr(c, "co_name", None) == "_open_confirm_dialog_now"
+    )
+    build = next(
+        c for c in dialog.co_consts if getattr(c, "co_name", None) == "_build"
+    )
+    # The dialog closes over the caller-supplied list...
+    assert "schema_recreate_candidates" in dialog.co_freevars
+    # ...and the rendering body closes over the narrowed result.
+    assert "recreate_now" in build.co_freevars
+    # The stale, unresolvable names must NOT come back.
+    dialog_names = set(dialog.co_names) | set(dialog.co_freevars) | set(dialog.co_varnames)
+    assert "conv_state" not in dialog_names
+    assert "inventory" not in dialog_names
+
+
 def test_shard_worker_keys_on_the_target_composite_pk(monkeypatch) -> None:
     """A sharded append must key its skip-filter on the TARGET's key, not the source's.
 

@@ -761,6 +761,51 @@ def prereq_report_covered_tables(report: Optional[PrerequisiteReport]) -> set[st
     }
 
 
+def schema_recreate_tables(
+    table_names: Iterable[str],
+    *,
+    table_conversions,
+    inventory: Optional[SourceInventory],
+    tables_with_data: Iterable[str],
+) -> list[str]:
+    """Return the EMPTY target tables whose primary key the load will have to recreate.
+
+    A changed target primary key (e.g. the composite ``(leading, id)`` chosen to avoid
+    hot partitions) is a **schema** change: appending cannot retrofit a key onto an
+    existing table, so the load recreates the target from the applied DDL. That is
+    non-destructive only because the table is empty — which is exactly why it happens
+    without asking — but the user must still be TOLD, since a target DDL they edited by
+    hand after Schema Conversion is replaced.
+
+    Scoped to tables NOT in ``tables_with_data``: a populated table is never silently
+    recreated (it goes through the explicit Drop & reload choice instead), so it must not
+    appear in this disclosure.
+
+    Pure and UI-free (no target I/O): it compares the APPLIED conversion's key against
+    the SOURCE key, which is what the engine's promotion test does. It therefore lists
+    the tables that *will* be recreated when their target is empty; a target that already
+    carries the new key is recreated too (same DDL, same key), so naming it is accurate,
+    not a false alarm.
+    """
+    from dsql_migrator.core.converter import parse_target_primary_key
+
+    if inventory is None:
+        return []
+    source_pk = {table.name: list(table.primary_key) for table in inventory.tables}
+    populated = set(tables_with_data)
+    out: list[str] = []
+    for name in table_names:
+        if name in populated:
+            continue
+        applied = (table_conversions or {}).get(name)
+        if applied is None:
+            continue
+        target_key = parse_target_primary_key(applied.target_ddl)
+        if target_key and target_key != source_pk.get(name, []):
+            out.append(name)
+    return sorted(out)
+
+
 def prereq_scope_gap(
     report: Optional[PrerequisiteReport], selected: Iterable[str]
 ) -> list[str]:

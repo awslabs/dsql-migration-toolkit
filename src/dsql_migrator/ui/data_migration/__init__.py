@@ -164,6 +164,7 @@ from dsql_migrator.ui.data_migration._models import (
     _LOAD_STATE_ORDER,
     summarize_table_states,
     prereq_scope_gap,
+    schema_recreate_tables,
     prerequisite_block_reason,
     PrereqCategory,
     _PREREQ_CATEGORY_BY_CHECK,
@@ -1342,6 +1343,23 @@ def build_data_migration_screen(
                             stop_full_load=stop_full_load,
                             refresh=refresh,
                             ai_error_opener=ai_error_opener,
+                            # Tables the load will recreate to apply a primary key that
+                            # differs from the source. Resolved here (the inventory and
+                            # the applied conversions live in this scope) so the confirm
+                            # dialog can disclose the DDL step before it runs.
+                            schema_recreate_candidates=schema_recreate_tables(
+                                selected_names,
+                                table_conversions=(
+                                    applied_table_conversions(
+                                        SchemaConverter().convert(inventory),
+                                        conv_state.edited_target_ddls,
+                                    )
+                                    if inventory is not None
+                                    else {}
+                                ),
+                                inventory=inventory,
+                                tables_with_data=migration_state.tables_with_data,
+                            ),
                         )
                         with ui.row().classes(
                             "!flex w-full justify-between items-center"
@@ -2432,6 +2450,7 @@ def _render_full_load_step(
     refresh,
     retry_tables=None,
     ai_error_opener=None,
+    schema_recreate_candidates: Optional[Sequence[str]] = None,
 ) -> None:
     """Render the Full Load step: confirm the selected workloads, then run it.
 
@@ -2443,6 +2462,12 @@ def _render_full_load_step(
     percent vs the source snapshot count), retry of only the failed tables, a
     source-vs-loaded completeness verdict, and the downloadable error log are
     shown here.
+
+    ``schema_recreate_candidates`` names the tables whose target the load will DROP and
+    recreate to apply a primary key that differs from the source (see
+    :func:`schema_recreate_tables`). Passed in because resolving it needs the inventory
+    and the applied conversions, which the caller owns; the confirm dialog discloses
+    whichever of them the current action covers.
     """
     ui.label("Workloads to migrate").classes("text-sm font-semibold")
     ui.label(format_selected_workloads(selected_names)).classes(
@@ -2489,6 +2514,19 @@ def _render_full_load_step(
         client = _ctx.client
         tables_with_data_now = sorted(migration_state.tables_with_data)
         cdc_live_now = cdc_streaming_started(migration_state, job_manager)
+        # Empty targets whose primary key the load will RECREATE from the applied DDL.
+        # A changed key is a schema change, so appending cannot deliver it; recreating an
+        # empty table destroys nothing, which is why the load does it without asking --
+        # but it must still be disclosed here, because a target DDL the user edited by
+        # hand after Schema Conversion is replaced. Never includes a populated table:
+        # those go through the explicit Drop & reload choice below. Resolved by the
+        # caller (which owns the inventory + applied conversions) and narrowed to the
+        # tables THIS dialog is about; a live sink forbids recreating anything.
+        recreate_now = (
+            []
+            if cdc_live_now
+            else [n for n in (schema_recreate_candidates or ()) if n in set(action_tables)]
+        )
         selectable = table_reasons is not None
         # Live set of checked tables (mutated by the per-row checkboxes). Starts as
         # the full action set (all pre-checked) -- the common "retry everything".
@@ -2555,6 +2593,37 @@ def _render_full_load_step(
                     with ui.row().classes("items-center gap-1 flex-wrap"):
                         for name in action_tables:
                             ui.badge(name).props("color=blue-grey-6 outline")
+                # Disclose the empty targets whose schema will be recreated to deliver
+                # the primary key chosen in Schema Conversion. No choice is offered --
+                # the table is empty, so there is nothing to lose and nothing to decide,
+                # and appending simply cannot apply a new key -- but doing it silently
+                # would hide that a hand-edited target DDL is about to be replaced.
+                if recreate_now:
+                    listed = ", ".join(recreate_now[:6]) + (
+                        f" +{len(recreate_now) - 6} more"
+                        if len(recreate_now) > 6
+                        else ""
+                    )
+                    _noun = "table" if len(recreate_now) == 1 else "tables"
+                    _verb = "uses" if len(recreate_now) == 1 else "use"
+                    render_notice(
+                        ui,
+                        tone="info",
+                        header=(
+                            f"{len(recreate_now)} empty {_noun} will be recreated to "
+                            "apply the chosen primary key"
+                        ),
+                        body=(
+                            f"{listed} {_verb} a primary key that differs from the "
+                            "source (for example the composite key chosen to avoid hot "
+                            "partitions). A primary key cannot be applied by appending, "
+                            "so each of these tables is dropped and recreated from your "
+                            "applied Schema Conversion before loading. They hold no rows "
+                            "on the target, so no data is lost — but any manual change "
+                            "made to the target table outside Schema Conversion is "
+                            "replaced."
+                        ),
+                    )
                 # When selected targets already hold data (and CDC is not live),
                 # let the user choose the run-wide behavior: append (keep existing
                 # rows, load only the missing ones -- the non-destructive default)
@@ -2617,6 +2686,11 @@ def _render_full_load_step(
                             "Drop, recreate and load" if drop_chosen
                             else "Append and load"
                         )
+                    elif recreate_now:
+                        # Name the DDL step in the button too, so the action is visible
+                        # without relying on the notice above being read. Stays
+                        # primary-coloured: these targets are empty, so nothing is lost.
+                        confirm_label = "Recreate and load"
                     else:
                         confirm_label = "Confirm and start"
                     confirm_color = (

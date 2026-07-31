@@ -5,6 +5,36 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.194
+
+### Fixed
+
+- **The Full Load confirm dialog now discloses the tables whose schema it will
+  recreate.** v0.1.193 recreates an empty target when its applied primary key differs
+  from the source, but that decision was made inside the engine — *after* the
+  confirmation dialog — so the dialog said only "Confirm and start" and never mentioned
+  that a table would be dropped and recreated. Nothing is lost (the tables are empty,
+  and the DDL is the one already approved in Schema Conversion), but a manual change made
+  to a target table outside Schema Conversion is replaced, so it must be stated before
+  the run. The dialog now lists those tables in an informational notice and labels the
+  button "Recreate and load". A **populated** table is unaffected and still goes through
+  the existing Append / Drop & reload choice, with its destructive label and red button.
+
+### Added
+
+- `schema_recreate_tables()` — a pure helper naming the empty targets whose primary key
+  the load will recreate, so the dialog and the engine agree on the same set.
+
+### Tests
+
+- Covered the disclosure helper (changed key on an empty target, exclusion of populated
+  tables, silence with no conversion or inventory) and a structural check that the list
+  is threaded into the dialog as a parameter and closed over. That last test exists
+  because the disclosure was first written to read `conv_state`/`inventory` from inside
+  the dialog closure — names not in that scope — which would have raised `NameError` on
+  every Start click with the whole suite still green, since no test opens the dialog.
+  Four mutations killed, including restoring that fault.
+
 ## v0.1.193
 
 ### Fixed
