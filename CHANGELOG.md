@@ -5,6 +5,16 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.179
+
+### Changed
+
+- **The published ECR Public default now points at `0.1.178`.** That is the image a fresh
+  `git clone` deploys without building anything, and it had been pinned at `0.1.167` for
+  eleven releases — so a new deployment shipped none of the Evaluation work from `0.1.168`
+  onwards. Both regional ECRs (`ap-northeast-2`, `us-east-1`) and ECR Public now carry
+  `0.1.178`.
+
 ## v0.1.178
 
 ### Changed
