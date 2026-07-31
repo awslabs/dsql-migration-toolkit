@@ -5,6 +5,21 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.172
+
+### Fixed
+
+- **Evaluation が `AUTO_INCREMENT` キーを欠陥として提示しなくなりました。** 従来は琥珀色の
+  **Risk** 見出しの下に *"AUTO_INCREMENT column 'id' produces monotonic keys that cause hot
+  partitions in Aurora DSQL"* と表示されていましたが、このキーは問題なく変換され正しく動作します
+  — 失われるものはなく、クエリの結果が変わることもありません。UUID/ランダムキーやキャッシュ付き
+  identity への変更は **挿入スループット** を得るための選択です(DSQL は行を主キー順に格納する
+  ため、単調増加キーは書き込みを 1 つのパーティションに集中させます)。現在はテーブルについて
+  事実であることから述べ("converts cleanly and works as-is")、変更が任意であることを明示します
+  — Schema Conversion が v0.1.151 で既に適用した修正
+  (`ConversionNoteKind.RECOMMENDATION`)と同じ方針であり、当時このルールが漏れていたため
+  2 つの画面が同じキーについて矛盾したことを述べていました。
+
 ## v0.1.171
 
 ### Changed

@@ -399,7 +399,22 @@ class EventRule(Rule):
 
 
 class AutoIncrementRule(Rule):
-    """Flag tables that rely on an AUTO_INCREMENT primary key."""
+    """Note tables whose AUTO_INCREMENT key is worth revisiting for throughput.
+
+    This is THROUGHPUT ADVICE, not a compatibility gap. An AUTO_INCREMENT integer key
+    converts cleanly and works correctly on DSQL -- nothing is dropped and no query
+    returns a different answer. Moving to a UUID/random or cached-identity key buys
+    insert throughput, because DSQL stores rows in primary-key order so a monotonic key
+    concentrates writes on one partition.
+
+    The wording therefore leads with what is true of the table ("converts cleanly")
+    rather than with a consequence ("causes hot partitions"), which described a tuning
+    opportunity as though it were a failure. Schema Conversion already made exactly this
+    correction in v0.1.151 -- see ``ConversionNoteKind.RECOMMENDATION`` in
+    ``core/converter.py``, which files the same condition as advice rather than a loss --
+    and this rule was missed at the time, so the two screens contradicted each other
+    about the same key.
+    """
 
     rule_id = "AUTO_INCREMENT"
 
@@ -414,13 +429,15 @@ class AutoIncrementRule(Rule):
                         rule_id=self.rule_id,
                         classification=Classification.MANUAL,
                         risk=(
-                            f"AUTO_INCREMENT column '{column}' produces "
-                            "monotonic keys that cause hot partitions in "
-                            "Aurora DSQL."
+                            f"The integer key from AUTO_INCREMENT column '{column}' "
+                            "converts cleanly and works as-is. For higher insert "
+                            "throughput, consider a different key: DSQL stores rows in "
+                            "primary-key order, so a monotonically increasing key "
+                            "concentrates writes on one partition."
                         ),
                         recommendation=(
-                            "Use a UUID/random key, or an identity/sequence "
-                            "with cache tuning."
+                            "Optional, for throughput only: use a UUID/random key, or "
+                            "an identity/sequence with cache tuning."
                         ),
                         effort=EffortLevel.MEDIUM,
                     )

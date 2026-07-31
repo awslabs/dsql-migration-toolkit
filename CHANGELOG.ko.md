@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.172
+
+### Fixed
+
+- **Evaluation이 `AUTO_INCREMENT` 키를 결함처럼 표시하지 않습니다.** 기존에는 호박색 **Risk**
+  제목 아래에 *"AUTO_INCREMENT column 'id' produces monotonic keys that cause hot partitions
+  in Aurora DSQL"*로 나왔지만, 이 키는 깨끗하게 변환되고 정상 동작합니다 — 누락되는 것도 없고
+  쿼리 결과가 달라지지도 않습니다. UUID/랜덤 키나 캐시된 identity로 바꾸는 것은 **insert
+  처리량**을 얻기 위한 선택입니다(DSQL은 행을 기본 키 순서로 저장하므로 단조 증가 키는 쓰기를
+  한 파티션에 집중시킵니다). 이제 문구가 테이블에 대해 사실인 것부터 말하고("converts cleanly
+  and works as-is") 변경이 선택 사항임을 명시합니다 — Schema Conversion이 v0.1.151에서 이미
+  적용한 수정(`ConversionNoteKind.RECOMMENDATION`)과 같은 방향이며, 당시 이 룰이 누락되어 두
+  화면이 같은 키에 대해 서로 다르게 말하고 있었습니다.
+
 ## v0.1.171
 
 ### Changed

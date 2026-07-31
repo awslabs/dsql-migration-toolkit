@@ -121,14 +121,29 @@ def test_procedures_and_functions_are_categorized_separately() -> None:
     assert "function" in func.risk.lower()
 
 
-def test_auto_increment_rule_classifies_table_manual() -> None:
+def test_auto_increment_rule_reads_as_throughput_advice_not_a_failure() -> None:
+    """An AUTO_INCREMENT key converts cleanly; changing it is a throughput choice.
+
+    Schema Conversion already made this correction (``ConversionNoteKind.RECOMMENDATION``
+    in ``core/converter.py``, v0.1.151) while this rule kept saying the key "causes hot
+    partitions in Aurora DSQL" -- so the two screens contradicted each other about the
+    same key, and advice was worded like a defect.
+    """
     inventory = SourceInventory(
         tables=[_table_with_pk("users", auto_increment_column="id")]
     )
     item = _item_for(_assess(inventory), "users")
     assert item.rule_id == "AUTO_INCREMENT"
     assert item.classification is Classification.MANUAL
-    assert "hot partition" in item.risk.lower()
+    text = item.risk.lower()
+    # Leads with what is TRUE of the table, not with a consequence.
+    assert "converts cleanly" in text
+    assert "throughput" in text
+    # The partitioning mechanism is still explained -- that is the actionable part.
+    assert "primary-key order" in text
+    # But it is no longer asserted as a failure the operator has to fix.
+    assert "cause hot partitions" not in text
+    assert "optional" in item.recommendation.lower()
 
 
 def test_no_primary_key_rule_classifies_table_unsupported() -> None:

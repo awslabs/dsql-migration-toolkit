@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.172
+
+### Fixed
+
+- **Evaluation no longer presents an `AUTO_INCREMENT` key as a defect.** It read
+  *"AUTO_INCREMENT column 'id' produces monotonic keys that cause hot partitions in Aurora
+  DSQL"* under an amber **Risk** heading — but such a key converts cleanly and works
+  correctly: nothing is dropped and no query returns a different answer. Moving to a
+  UUID/random or cached-identity key buys **insert throughput**, because DSQL stores rows
+  in primary-key order so a monotonic key concentrates writes on one partition. The text
+  now leads with what is true of the table ("converts cleanly and works as-is") and marks
+  the change as optional, matching the correction Schema Conversion already made in
+  v0.1.151 (`ConversionNoteKind.RECOMMENDATION`) — that pass missed this rule, so the two
+  screens contradicted each other about the same key.
+
 ## v0.1.171
 
 ### Changed
