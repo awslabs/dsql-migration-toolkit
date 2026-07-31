@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.188
+
+### Fixed
+
+- **Schema Conversion's note cards now match the Evaluation findings.** Each conversion
+  warning and recommendation carried a bare `border`, which renders Tailwind's default
+  near-black — it read as an outlined table cell rather than one of this app's cards, and put a
+  harder line around an optional recommendation than Evaluation puts around an `UNSUPPORTED`
+  finding. Both screens now use the same tinted surface with a matching `*-200` border: neutral
+  gray for a real gap, the calm sky tone for advice (the same pair Evaluation uses), with
+  `rounded-md` corners and the same padding. A test pins the two together, so restyling one
+  screen surfaces the other being left behind.
+
 ## v0.1.187
 
 ### Changed

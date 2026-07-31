@@ -3724,14 +3724,25 @@ def _render_conversion_warnings(
     """
     losses, recommendations = split_conversion_notes(warnings)
 
-    def _rows(notes, *, badge_text=None, badge_color=None) -> None:
-        with ui.column().classes("w-full gap-1"):  # type: ignore[attr-defined]
+    def _rows(notes, *, badge_text=None, badge_color=None, advisory=False) -> None:
+        with ui.column().classes("w-full gap-2"):  # type: ignore[attr-defined]
             for note in notes:
                 color = badge_color or _WARNING_BADGE_COLOR.get(
                     note.classification.value, "grey"
                 )
+                # Same card treatment the Evaluation findings use: a tinted surface with a
+                # matching *-200 border, tone chosen by what the note IS. A bare ``border``
+                # renders Tailwind's default near-black, which read as an outlined table
+                # cell rather than as one of this app's notice cards -- and put a harder
+                # line around a recommendation than Evaluation puts around an UNSUPPORTED
+                # finding. Advisory notes take the calm sky tone they already use there.
+                surface = (
+                    "border-sky-200 bg-sky-50"
+                    if advisory
+                    else "border-gray-200 bg-gray-50"
+                )
                 with ui.row().classes(  # type: ignore[attr-defined]
-                    "items-start gap-2 w-full no-wrap border rounded p-2"
+                    "items-start gap-2 w-full no-wrap rounded-md border p-3 " + surface
                 ):
                     ui.badge(badge_text or note.classification.value).props(  # type: ignore[attr-defined]
                         f"color={color}"
@@ -3762,7 +3773,12 @@ def _render_conversion_warnings(
                 "The conversion is complete — these are optional tuning suggestions "
                 "for Aurora DSQL, not problems to fix."
             )
-        _rows(recommendations, badge_text="RECOMMENDED", badge_color="info")
+        _rows(
+            recommendations,
+            badge_text="RECOMMENDED",
+            badge_color="info",
+            advisory=True,
+        )
 
 
 def _render_copy_ddl_button(ui: object, text: str, *, label: str) -> None:

@@ -1929,12 +1929,15 @@ class _NotesUi:
         self.badges: list[str] = []
         self.icons: list[str] = []
         self.tooltips: list[str] = []
+        self.classes: list[str] = []
 
     class _El:
         def __init__(self, rec):
             self._rec = rec
 
-        def classes(self, *_a, **_k):
+        def classes(self, value="", *_a, **_k):
+            if value:
+                self._rec.classes.append(str(value))
             return self
 
         def props(self, *_a, **_k):
@@ -2560,3 +2563,46 @@ def test_edit_mode_offers_no_expand() -> None:
         "else:", 1
     )[1]
     assert "expand_language" not in editing, editing[:500]
+
+
+def test_conversion_note_cards_match_the_evaluation_finding_treatment() -> None:
+    """A note is one of this app's cards, not an outlined table cell.
+
+    The rows carried a bare ``border``, which renders Tailwind's default near-black: it read
+    as a table and put a harder line around a recommendation than Evaluation puts around an
+    UNSUPPORTED finding. Both screens now use the same tinted surface with a matching *-200
+    border.
+    """
+    from dsql_migrator.ui.schema_conversion import _render_conversion_warnings
+
+    ui = _NotesUi()
+    _render_conversion_warnings(ui, [_loss_note(), _recommendation_note()])
+    blob = " ".join(ui.classes)
+
+    # No uncolored border anywhere in the block.
+    assert not any(
+        c.split() and "border" in c.split() and not any(
+            t.startswith("border-") for t in c.split()
+        )
+        for c in ui.classes
+    ), ui.classes
+    # A real gap gets the neutral card, advice the calm sky one -- the same two surfaces
+    # Evaluation uses for a finding and a recommendation.
+    assert "border-gray-200 bg-gray-50" in blob, ui.classes
+    assert "border-sky-200 bg-sky-50" in blob, ui.classes
+    # Same corner radius as the Evaluation card, not the tighter `rounded`.
+    assert "rounded-md" in blob, ui.classes
+
+
+def test_conversion_note_surfaces_come_from_the_same_tokens_evaluation_uses() -> None:
+    # Pin the pairing itself: if Evaluation restyles its cards, this assertion is what
+    # surfaces that Schema Conversion was left behind.
+    import inspect
+
+    from dsql_migrator.ui import evaluation, schema_conversion
+
+    notes = inspect.getsource(schema_conversion._render_conversion_warnings)
+    concern = inspect.getsource(evaluation._render_assessment_item)
+    for surface in ("border-gray-200 bg-gray-50", "border-sky-200 bg-sky-50"):
+        assert surface in notes, surface
+        assert surface in concern, surface
