@@ -414,6 +414,49 @@ class ValidationSummary:
         return max(0, self.mismatched_tables - len(self.quarantine_explained_tables))
 
 
+def cutover_release_state(
+    summary: "Optional[ValidationSummary]", *, gap_accepted: bool = False
+) -> str:
+    """Whether the cut-over runbook is released, and if not, why. Pure.
+
+    Returns one of:
+
+    * ``"clean"``     -- validation matched outright; nothing to acknowledge.
+    * ``"accepted"``  -- the only remaining differences are rows the migration already
+      reported dropping, AND the operator has explicitly accepted that gap.
+    * ``"acceptable"`` -- same difference profile, but not yet accepted: offer the
+      acknowledgement rather than a dead end.
+    * ``"blocked"``   -- something is unexplained (or there is no result yet), so
+      cut-over must stay shut.
+
+    Why ``"acceptable"`` has to exist: the gate previously released on ``is_match``
+    alone, while its own copy promised cut-over was possible when "every difference is
+    explained". No such path existed, so a run whose sole finding was a permanently
+    quarantined row could never reach cut-over -- and reloading cannot fix it, because
+    the value is one DSQL is unable to store. That made the step unreachable by design
+    rather than by any operator decision.
+
+    The acknowledgement is still required (never auto-released): rows really are absent
+    from the target, and that is a call the operator owns. ``gap_accepted`` is ignored
+    unless the difference profile genuinely qualifies, so an old acceptance cannot leak
+    onto a later run that has a real mismatch.
+    """
+    if summary is None:
+        return "blocked"
+    if summary.ready_for_cutover:
+        return "clean"
+    # Nothing acknowledged-able: there must be a KNOWN gap to sign off on. Strictly this
+    # is implied by the unexplained/errored test below (with no explained tables, every
+    # mismatch is unexplained), but it is kept as the explicit statement of the
+    # precondition -- "acceptable" is only ever about rows the migration already reported
+    # dropping, never about a difference nobody has accounted for.
+    if not summary.quarantine_explained_tables:
+        return "blocked"
+    if summary.unexplained_mismatched_tables or summary.errored_tables:
+        return "blocked"
+    return "accepted" if gap_accepted else "acceptable"
+
+
 def summarize_validation(report: ValidationReport) -> ValidationSummary:
     """Summarize ``report`` into match counts and the three readiness checks."""
     matched = sum(1 for item in report.items if item.matched)
@@ -1064,6 +1107,15 @@ class ValidationState:
         # Set when the user requested a cancel of the current/last run, so the UI
         # can show a "cancelled" notice once the worker stops. Cleared on a new run.
         self.cancel_requested: bool = False
+        # Whether the operator has explicitly accepted a validation whose ONLY
+        # remaining differences are rows the migration already reported dropping
+        # (quarantined), so the cut-over runbook is released. Mirrors Full Load's
+        # ``accept_quarantined_rows``: the gap is real and permanent, so the tool must
+        # not wave it through on its own -- but nor can it be the reason cut-over is
+        # unreachable forever, because reloading cannot fix a value DSQL is unable to
+        # store. Only ever settable when every difference is accounted for (see
+        # ``cutover_release_state``). Set on the UI thread.
+        self.accept_explained_gap: bool = False
         self._result: Optional[ValidationReport] = None
         self._error: Optional[str] = None
         # Per-table RE-CHECK track (the same single job slot as a full run --
@@ -2054,17 +2106,61 @@ def build_cutover_screen(
             )
             return
 
-        if summary is None or not summary.ready_for_cutover:
+        release = cutover_release_state(
+            summary, gap_accepted=validation_state.accept_explained_gap
+        )
+
+        # The gate's own copy has always promised cut-over is reachable when "every
+        # difference is explained" -- but the gate tested ``ready_for_cutover``, which is
+        # a bare match. So a run whose ONLY finding was a permanently quarantined row
+        # could never reach cut-over, and no amount of reloading would change that: the
+        # value is one DSQL cannot store. The step was unreachable by design rather than
+        # by any decision the operator made. Offer the acknowledgement instead.
+        if release == "acceptable":
+            rows = summary.quarantine_explained_rows  # type: ignore[union-attr]
+            tables = summary.quarantine_explained_tables  # type: ignore[union-attr]
+            row_noun = "row" if rows == 1 else "rows"
+            table_noun = "table" if len(tables) == 1 else "tables"
+            with _section(ui, icon="fact_check", title="Acknowledge the known gap"):
+                render_notice(
+                    ui,
+                    tone="warning",
+                    header="Every difference is explained — cut-over needs your sign-off",
+                    body=(
+                        f"Validation found no unexplained difference. The {rows} "
+                        f"{row_noun} missing from {len(tables)} {table_noun} "
+                        f"({', '.join(tables)}) are exactly the rows the migration "
+                        "already reported dropping, because DSQL could not store those "
+                        "values — reloading will not change that. Cutting over means "
+                        f"accepting that those {row_noun} will not exist on the target. "
+                        "Confirm below to unlock the runbook, or fix the source value(s) "
+                        "and re-run Validation for a full match instead."
+                    ),
+                )
+
+                def _accept() -> None:
+                    validation_state.accept_explained_gap = True
+                    refresh()
+
+                ui.button(  # type: ignore[attr-defined]
+                    f"Accept the {rows}-{row_noun} gap and continue to cut-over",
+                    icon="check",
+                    on_click=_accept,
+                ).props("no-caps color=primary")
+            return
+
+        if release == "blocked":
             with _section(ui, icon="fact_check", title="Validate first"):
                 render_notice(
                     ui,
                     tone="warning",
                     header="Get a clean validation before you cut over",
                     body=(
-                        "Cut over only when Validation reports a clean MATCH (or "
-                        "every difference is explained). Go to the Validation step "
-                        "and run it; once the verdict is green, the cut-over runbook "
-                        "appears here."
+                        "Cut over only when Validation reports a clean MATCH, or when "
+                        "every difference is explained by rows the migration already "
+                        "reported dropping (you can then acknowledge that gap here). Go "
+                        "to the Validation step and run it; the cut-over runbook appears "
+                        "here once there is nothing unexplained left."
                         if summary is not None
                         else
                         "No validation result yet. Run the Validation step first — "
@@ -2073,6 +2169,24 @@ def build_cutover_screen(
                     ),
                 )
             return
+
+        # Released with an accepted gap: the runbook follows, but it must not read as a
+        # clean match -- the operator is cutting over to a target that is knowingly short.
+        if release == "accepted":
+            rows = summary.quarantine_explained_rows  # type: ignore[union-attr]
+            tables = summary.quarantine_explained_tables  # type: ignore[union-attr]
+            row_noun = "row" if rows == 1 else "rows"
+            render_notice(
+                ui,
+                tone="warning",
+                header="Cutting over with an accepted gap",
+                body=(
+                    f"You accepted that {rows} {row_noun} could not be migrated "
+                    f"({', '.join(tables)}). Everything else matched. Those {row_noun} "
+                    "will be absent on DSQL after cut-over — keep the source available "
+                    "if you may still need them."
+                ),
+            )
 
         # Go path: the verdict is clean — show the tailored runbook + an explicit
         # acknowledgement that marks the step (and the whole journey) Done.

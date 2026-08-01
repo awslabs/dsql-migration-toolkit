@@ -3497,3 +3497,308 @@ def test_verdict_says_what_is_outstanding_instead_of_review_the_failures() -> No
         _drift_na(),
     )
     assert "Not ready for cut-over" in partial.body()
+
+
+# ---------------------------------------------------------------------------
+# Cut-over must be reachable when every difference is already explained
+# ---------------------------------------------------------------------------
+
+
+def _release_summary(*, is_match, explained=(), rows=0, mismatched=0, errored=0):
+    from dsql_migrator.ui.validation import ValidationSummary
+
+    return ValidationSummary(
+        total_tables=8,
+        matched_tables=8 - mismatched,
+        mismatched_tables=mismatched,
+        orphan_count=0,
+        is_match=is_match,
+        mode="CHECKSUM",
+        as_of="2026-08-01 02:55 UTC",
+        reconcile_performed=True,
+        reconciled_tables=8,
+        inconsistent_tables=mismatched,
+        missing_on_target=rows,
+        extra_on_target=0,
+        errored_tables=errored,
+        ready_for_cutover=is_match,
+        quarantine_explained_tables=explained,
+        quarantine_explained_rows=rows,
+    )
+
+
+def test_cutover_release_state_covers_every_situation() -> None:
+    """The gate's copy promised cut-over when "every difference is explained", but the
+    gate tested ``ready_for_cutover`` -- a bare match. No such path existed, so a run
+    whose only finding was a permanently quarantined row could never reach cut-over. And
+    reloading cannot fix it: the value is one DSQL is unable to store. The step was
+    unreachable by design rather than by any operator decision.
+    """
+    from dsql_migrator.ui.validation import cutover_release_state
+
+    # No result / clean match: unchanged behaviour.
+    assert cutover_release_state(None) == "blocked"
+    assert cutover_release_state(_release_summary(is_match=True)) == "clean"
+
+    explained = _release_summary(
+        is_match=False, explained=("ecommerce.product_media",), rows=3, mismatched=1
+    )
+    # Offer the acknowledgement instead of a dead end...
+    assert cutover_release_state(explained) == "acceptable"
+    # ...and release only once the operator has actually signed off.
+    assert cutover_release_state(explained, gap_accepted=True) == "accepted"
+
+    # A genuinely unexplained mismatch stays shut, accepted or not. Critically it must not
+    # even be OFFERED a sign-off: "acceptable" here would invite the operator to wave
+    # through a difference nobody has accounted for, which is the opposite of the point.
+    unexplained = _release_summary(is_match=False, mismatched=1)
+    assert cutover_release_state(unexplained) == "blocked"
+    assert cutover_release_state(unexplained, gap_accepted=True) == "blocked"
+    # Nothing quarantined at all -> there is no "known gap" to acknowledge.
+    assert unexplained.quarantine_explained_tables == ()
+
+    # THE leak this must not allow: an acceptance from an earlier run must not release a
+    # later run that has a real mismatch beside the explained one.
+    mixed = _release_summary(
+        is_match=False, explained=("ecommerce.product_media",), rows=3, mismatched=2
+    )
+    assert cutover_release_state(mixed, gap_accepted=True) == "blocked"
+
+    # An errored table means something could not be compared at all -- never acceptable.
+    errored = _release_summary(
+        is_match=False,
+        explained=("ecommerce.product_media",),
+        rows=3,
+        mismatched=1,
+        errored=1,
+    )
+    assert cutover_release_state(errored, gap_accepted=True) == "blocked"
+
+
+def test_explained_gap_offers_a_sign_off_instead_of_a_dead_end() -> None:
+    """Behavioural: the screen must offer the acknowledgement, and only unlock after it.
+
+    Asserted through cutover_release_state + the gap-acceptance flag rather than the
+    rendered tree, because the cut-over content builder closes over the NiceGUI module
+    import; the release decision is the whole behaviour under test and is pure.
+    """
+    from dsql_migrator.ui.validation import ValidationState, cutover_release_state
+
+    summary = _release_summary(
+        is_match=False, explained=("ecommerce.product_media",), rows=3, mismatched=1
+    )
+    state = ValidationState()
+    # Default: not accepted -> offer the sign-off (NOT a dead end, NOT auto-released).
+    assert state.accept_explained_gap is False
+    assert cutover_release_state(summary, gap_accepted=state.accept_explained_gap) == (
+        "acceptable"
+    )
+    # The operator signs off -> released.
+    state.accept_explained_gap = True
+    assert cutover_release_state(summary, gap_accepted=state.accept_explained_gap) == (
+        "accepted"
+    )
+    # ...but that same sign-off must not release a later run with a real mismatch.
+    worse = _release_summary(
+        is_match=False, explained=("ecommerce.product_media",), rows=3, mismatched=2
+    )
+    assert cutover_release_state(worse, gap_accepted=True) == "blocked"
+
+
+class _ScreenUi:
+    """Records the whole cut-over screen: text, and every button's click handler.
+
+    Wider than ``_CopyUi`` (which only covers the in-progress panel) because the cut-over
+    screen builds cards, expansions, separators and links. Click handlers are captured so
+    a test can press Accept and observe the state change -- a button whose handler is a
+    no-op is indistinguishable from a working one by text alone.
+    """
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+        self.clicks: list[tuple[str, object]] = []
+
+    class _El:
+        def __init__(self, ui):
+            self._ui = ui
+
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def _record(self, text):
+        if text:
+            self.texts.append(str(text))
+        return self._El(self)
+
+    def label(self, text="", *_a, **_k):
+        return self._record(text)
+
+    def markdown(self, text="", *_a, **_k):
+        return self._record(text)
+
+    def html(self, text="", *_a, **_k):
+        return self._record(text)
+
+    def badge(self, text="", *_a, **_k):
+        return self._record(text)
+
+    def button(self, text="", *_a, on_click=None, **_k):
+        if on_click is not None:
+            self.clicks.append((str(text), on_click))
+        return self._record(text)
+
+    def link(self, text="", *_a, **_k):
+        return self._record(text)
+
+    def expansion(self, text="", *_a, **_k):
+        return self._record(text)
+
+    def tooltip(self, text="", *_a, **_k):
+        return self._El(self)
+
+    def __getattr__(self, _name):
+        # row/column/card/icon/separator/space/timer/... -> chainable no-op container.
+        return lambda *_a, **_k: self._El(self)
+
+    def body(self) -> str:
+        return "\n".join(self.texts)
+
+
+def _render_cutover_screen(*, summary_kind, accepted=False):
+    """Render the REAL cut-over screen and return (recorder, validation_state).
+
+    ``build_cutover_screen`` does ``from nicegui import ui`` at call time, so injecting a
+    double into sys.modules exercises the actual gate branches -- which is what the
+    AST-literal check cannot do (it passes even when a whole branch is unreachable).
+    """
+    import sys
+    import types
+
+    from dsql_migrator.core.models import (
+        ReconcileResult,
+        TableValidationResult,
+        ValidationMode,
+        ValidationReport,
+    )
+    from dsql_migrator.ui.session import SessionStore
+
+    def _table(name, src_n, tgt_n, q=0, miss=0):
+        return TableValidationResult(
+            table=name,
+            source_row_count=src_n,
+            target_row_count=tgt_n,
+            row_count_match=(src_n == tgt_n),
+            checksum_match=(src_n == tgt_n),
+            matched=(src_n == tgt_n),
+            rows_quarantined=q,
+            reconcile=ReconcileResult(
+                pk_column="id",
+                source_count=src_n,
+                target_count=tgt_n,
+                missing_on_target=miss,
+                extra_on_target=0,
+                consistent=(miss == 0),
+            ),
+        )
+
+    if summary_kind == "explained":
+        items = [
+            _table("ecommerce.ok", 100, 100),
+            _table("ecommerce.product_media", 15, 12, q=3, miss=3),
+        ]
+    elif summary_kind == "unexplained":
+        items = [_table("ecommerce.ok", 100, 100), _table("ecommerce.orders", 500, 495, miss=5)]
+    else:  # clean
+        items = [_table("ecommerce.ok", 100, 100)]
+    report = ValidationReport(
+        items=items, mode=ValidationMode.CHECKSUM, snapshot_timestamp=None
+    )
+
+    recorder = _ScreenUi()
+    fake = types.ModuleType("nicegui")
+    fake.ui = recorder  # type: ignore[attr-defined]
+    saved = sys.modules.get("nicegui")
+    sys.modules["nicegui"] = fake
+    try:
+        from dsql_migrator.ui.validation import ValidationStore, build_cutover_screen
+
+        store = SessionStore()
+        val_store = ValidationStore()
+        sid = f"sess-{summary_kind}-{accepted}"
+        content, _runner = build_cutover_screen(store, sid, validation_store=val_store)
+        state = val_store.get_or_create(sid)
+        state.set_result(report)
+        state.accept_explained_gap = accepted
+        content(lambda: None)
+    finally:
+        if saved is None:
+            sys.modules.pop("nicegui", None)
+        else:
+            sys.modules["nicegui"] = saved
+    return recorder, state
+
+
+def test_cutover_screen_offers_the_sign_off_and_unlocks_only_after_it() -> None:
+    """Renders the real branches: dead end -> sign-off -> released-with-a-warning."""
+    ui, state = _render_cutover_screen(summary_kind="explained", accepted=False)
+    body = ui.body()
+    # Not the old dead end: the acknowledgement is offered...
+    assert "Every difference is explained" in body
+    assert "gap and continue to cut-over" in body
+    # ...and the alternative (reach a real match) is named.
+    assert "fix the source value(s)" in body
+    # The runbook itself is NOT released yet.
+    assert "Cutting over with an accepted gap" not in body
+
+    # Clicking Accept must actually set the flag -- a no-op button would leave the
+    # operator permanently stuck with no way to tell why.
+    assert state.accept_explained_gap is False
+    accepted_ui, _ = _render_cutover_screen(summary_kind="explained", accepted=True)
+    accepted_body = accepted_ui.body()
+    # Released -- but it must still read as a knowingly-short target, not a clean match.
+    assert "Cutting over with an accepted gap" in accepted_body
+    assert "will be absent on DSQL after cut-over" in accepted_body
+    assert "Every difference is explained" not in accepted_body
+
+
+def test_cutover_screen_button_actually_records_the_acceptance() -> None:
+    """The Accept button's handler must set the flag, not merely exist."""
+    ui, state = _render_cutover_screen(summary_kind="explained", accepted=False)
+    handlers = [
+        h for label, h in getattr(ui, "clicks", []) if "continue to cut-over" in label
+    ]
+    assert handlers, f"no accept handler captured: {getattr(ui, 'clicks', [])}"
+    assert state.accept_explained_gap is False
+    handlers[0]()
+    assert state.accept_explained_gap is True
+
+
+def test_cutover_screen_stays_shut_on_an_unexplained_mismatch() -> None:
+    """A real mismatch must neither release the runbook nor be offered a sign-off.
+
+    Checked with the flag BOTH unset and set: unset proves the sign-off is not offered for
+    a difference nobody has accounted for (offering it would invite waving through exactly
+    what the gate exists to catch), and set proves an earlier acceptance cannot leak
+    forward onto a later, worse run.
+    """
+    for accepted in (False, True):
+        ui, _ = _render_cutover_screen(summary_kind="unexplained", accepted=accepted)
+        body = ui.body()
+        assert "Get a clean validation before you cut over" in body, accepted
+        # The blocked copy promises only what the gate can actually deliver.
+        assert "acknowledge that gap here" in body, accepted
+        assert "Cutting over with an accepted gap" not in body, accepted
+        assert "gap and continue to cut-over" not in body, accepted
+        assert "Every difference is explained" not in body, accepted
+
+
+def test_validation_state_defaults_to_not_accepting_the_gap() -> None:
+    from dsql_migrator.ui.validation import ValidationState
+
+    assert ValidationState().accept_explained_gap is False

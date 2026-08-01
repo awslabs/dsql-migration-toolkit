@@ -5,6 +5,35 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.221
+
+### Fixed
+
+- **Cut-over was unreachable when the only remaining difference was a row DSQL cannot
+  store — while the gate's own copy promised otherwise.** The message read *"Cut over only
+  when Validation reports a clean MATCH (**or every difference is explained**)"*, but the
+  gate tested `ready_for_cutover`, which is a bare match. No "explained" path existed
+  anywhere. So a migration whose sole finding was a permanently quarantined row (a value
+  over DSQL's ~1 MiB per-value limit) could never finish the workflow — and reloading could
+  never fix it, because DSQL is unable to store that value at all. The step was unreachable
+  by design rather than by any decision the operator made.
+
+  The promised path now exists, as an explicit sign-off: when every difference is exactly
+  the rows the migration already reported dropping, the step offers **"Accept the N-row gap
+  and continue to cut-over"**, naming the tables, the row count, and the fact that
+  reloading will not change it. Accepting unlocks the runbook; the alternative (fix the
+  source value(s) and re-run Validation for a full match) is offered alongside.
+
+  Deliberately **not** auto-released — the rows really are absent from the target, and that
+  is the operator's call — and once accepted the runbook still leads with **"Cutting over
+  with an accepted gap"** rather than reading as a clean match, so the sign-off is not
+  quietly forgotten at the moment it matters most.
+
+  The sign-off is only ever offered when the shortfall is **entirely** accounted for. An
+  unexplained mismatch, a table that could not be compared at all, or one explained table
+  beside a genuinely wrong one all keep cut-over shut — and an acceptance cannot leak
+  forward onto a later, worse run.
+
 ## v0.1.220
 
 ### Fixed
