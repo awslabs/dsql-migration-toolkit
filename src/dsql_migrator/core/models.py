@@ -578,6 +578,15 @@ class ChunkState(BaseModel):
     # every source row is either newly loaded OR already present, instead of
     # falsely flagging a "row-count mismatch" for a table whose rows pre-existed.
     rows_skipped: int = Field(default=0, ge=0)
+    # Rows PERMANENTLY DROPPED from this table's load -- a non-retryable per-row
+    # error such as a value over DSQL's ~1 MiB per-value limit. Unlike
+    # ``rows_skipped`` (already present on the target) these rows are NOT on the
+    # target and never will be without fixing the source, so they are a real data
+    # gap. Tracked here because the completeness verdict was structurally blind to
+    # them: it compared loaded-vs-estimate only, and the estimate's sampling
+    # tolerance silently absorbed the shortfall, so a run that dropped rows still
+    # reported "All N tables loaded every source row".
+    rows_quarantined: int = Field(default=0, ge=0)
     attempts: int = Field(default=0, ge=0)
     # Wall-clock timing for per-table ETA (while running) and total elapsed (when
     # finished). Set when the chunk starts and reaches a terminal state.

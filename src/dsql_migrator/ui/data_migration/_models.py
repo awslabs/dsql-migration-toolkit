@@ -12,7 +12,7 @@ surface is unchanged.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Iterable, Optional, Sequence
@@ -144,6 +144,13 @@ class FullLoadTableRow:
     # table whose rows pre-existed is not falsely reported as a row-count
     # mismatch (loaded + skipped == source).
     rows_skipped: int = 0
+    # Rows PERMANENTLY DROPPED for this table (a non-retryable per-row error, e.g. a
+    # value over DSQL's ~1 MiB per-value limit). A real data gap -- unlike
+    # ``rows_skipped``, these rows are NOT on the target. Held here so completeness
+    # can distinguish a confirmed loss from the source ESTIMATE's sampling noise; the
+    # estimate tolerance previously absorbed the shortfall and reported a run that
+    # dropped rows as "loaded every source row".
+    rows_quarantined: int = 0
     # The most recent failure reason for this table (cause), shown inline so the
     # user can see why it failed without downloading the log. None when no error.
     error_message: Optional[str] = None
@@ -199,6 +206,13 @@ class FullLoadTableRow:
         """
         if self.state != "DONE":
             return None
+        # A quarantined row is a CONFIRMED loss, not estimate noise: the loader saw the
+        # row, could not write it, and dropped it permanently. It must never be absorbed
+        # by the sampling tolerance below -- that is exactly how a run that dropped a row
+        # still reported "loaded every source row" beside its own amber warning saying
+        # the row was permanently dropped.
+        if self.rows_quarantined > 0:
+            return False
         if self.expected_rows is None or self.expected_rows <= 0:
             return True
         shortfall = self.expected_rows - self.rows_present
@@ -250,6 +264,7 @@ def build_full_load_table_rows(
             attempts=chunk.attempts,
             errors=by_table.get(chunk.chunk_id, 0),
             rows_skipped=chunk.rows_skipped,
+            rows_quarantined=getattr(chunk, "rows_quarantined", 0) or 0,
             error_message=messages.get(chunk.chunk_id),
             started_at=chunk.started_at,
             finished_at=chunk.finished_at,
@@ -371,6 +386,11 @@ class FullLoadCompleteness:
     failed: int
     mismatched: list[str]
     unknown: int
+    # Rows permanently DROPPED across the run, and the tables that dropped them. A
+    # confirmed data gap, so it must NOT be presented as estimate noise however
+    # approximate the baseline is.
+    quarantined_rows: int = 0
+    quarantined_tables: list[str] = field(default_factory=list)
 
     @property
     def all_complete(self) -> bool:
@@ -380,6 +400,7 @@ class FullLoadCompleteness:
             and self.failed == 0
             and not self.mismatched
             and self.unknown == 0
+            and self.quarantined_rows == 0
         )
 
 
@@ -400,6 +421,8 @@ def full_load_completeness(rows: Sequence[FullLoadTableRow]) -> FullLoadComplete
     unknown = sum(
         1 for r in rows if r.state == "DONE" and r.expected_rows is None
     )
+    quarantined_rows = sum(r.rows_quarantined for r in rows)
+    quarantined_tables = [r.table for r in rows if r.rows_quarantined > 0]
     return FullLoadCompleteness(
         total=total,
         settled=settled,
@@ -407,6 +430,8 @@ def full_load_completeness(rows: Sequence[FullLoadTableRow]) -> FullLoadComplete
         failed=failed,
         mismatched=mismatched,
         unknown=unknown,
+        quarantined_rows=quarantined_rows,
+        quarantined_tables=quarantined_tables,
     )
 
 

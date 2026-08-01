@@ -5,6 +5,36 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.201
+
+### Fixed
+
+- **A Full Load that permanently dropped rows still reported "loaded every source row".**
+  Reported from a real run: an amber "Quarantined rows (1) — these rows were permanently
+  dropped" box sat directly above a green "Full Load complete — All 8 tables loaded every
+  source row", with the table itself showing `12 / 15`. Two causes, both now fixed:
+  - The per-table `complete` check compared loaded-vs-source-estimate only and never saw
+    the drop, and the estimate's 20% sampling tolerance (there because
+    `information_schema` counts are sampled and drift either way) silently absorbed the
+    3-row shortfall on a 15-row table. A quarantined row is a **confirmed** loss, not
+    estimate noise, so it now fails the check outright — before any baseline comparison,
+    so it is caught even when there is no estimate at all.
+  - The row count never reached the verdict: `ChunkState`/`FullLoadTableRow` had no
+    quarantine field, so the run-level summary was structurally blind to it. The engine
+    already recorded the drop to the error log and treated it as an incomplete load; it
+    now also records the count on the chunk, which the completeness summary reads.
+- **The dropped rows were reportable as expected estimate drift.** With an approximate
+  baseline, count differences are (correctly) shown as a calm "counts differ from the
+  pre-load estimate … This is expected" note. Quarantined rows can never belong there —
+  nothing about a sampled estimate explains a row the loader could not write — so they
+  now always surface as "Full Load finished with issues", named with their table and
+  count, and are not double-reported as a separate row-count mismatch.
+- **The remedy no longer points at a control that does not apply.** A quarantining table
+  finishes `DONE`, so it is not in the retry set; the banner said "Retry the failed
+  tables" even when nothing failed. It now tells the user to fix the source value and
+  Reload that table (or accept the gap), and only mentions retrying when a table really
+  did fail.
+
 ## v0.1.200
 
 ### Fixed

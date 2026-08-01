@@ -242,14 +242,24 @@ def _start_chunk(job: MigrationJob, chunk_id: str) -> None:
 
 
 def _complete_chunk(
-    job: MigrationJob, chunk_id: str, rows_loaded: int, rows_skipped: int = 0
+    job: MigrationJob,
+    chunk_id: str,
+    rows_loaded: int,
+    rows_skipped: int = 0,
+    rows_quarantined: int = 0,
 ) -> None:
-    """Mark ``chunk_id`` ``DONE``; record loaded/skipped rows and stamp finish."""
+    """Mark ``chunk_id`` ``DONE``; record loaded/skipped/quarantined rows and finish.
+
+    ``rows_quarantined`` are rows permanently DROPPED (a non-retryable per-row error),
+    recorded on the chunk so the run-level completeness verdict can see the gap instead
+    of inferring completeness from a row count the estimate's tolerance absorbs.
+    """
     chunk = _find_chunk(job, chunk_id)
     if chunk is not None:
         chunk.status = "DONE"
         chunk.rows_loaded = rows_loaded
         chunk.rows_skipped = rows_skipped
+        chunk.rows_quarantined = rows_quarantined
         chunk.finished_at = datetime.now(timezone.utc)
     _recompute_progress(job)
 
@@ -1209,8 +1219,9 @@ def _migrate_one_table(
             ),
         )
         handle.update(
-            lambda job, n=name, r=outcome.rows_loaded, s=outcome.rows_skipped: (
-                _complete_chunk(job, n, r, s)
+            lambda job, n=name, r=outcome.rows_loaded, s=outcome.rows_skipped,
+            q=quarantined: (
+                _complete_chunk(job, n, r, s, q)
             )
         )
         # A table that dropped rows is reported as an incomplete load even though
@@ -1511,8 +1522,9 @@ def _migrate_tables_in_parallel(
                                 status=ActivityStatus.FAILURE if had_q else ActivityStatus.SUCCESS,
                                 target=name,
                                 detail=f"{total_loaded:,} rows loaded across {expected_shards} shards")
-                            handle.update(lambda job, n=name, r=total_loaded, s=total_skipped:
-                                _complete_chunk(job, n, r, s))
+                            handle.update(lambda job, n=name, r=total_loaded, s=total_skipped,
+                                q=len(all_quarantine):
+                                _complete_chunk(job, n, r, s, q))
                             _tally(_TableLoadOutcome.QUARANTINED if had_q else _TableLoadOutcome.LOADED)
                     else:
                         # Single-table worker result (same as before).
@@ -1532,8 +1544,9 @@ def _migrate_tables_in_parallel(
                                 status=ActivityStatus.FAILURE if had_quarantine else ActivityStatus.SUCCESS,
                                 target=name,
                                 detail=f"{result.rows_loaded:,} rows newly loaded")
-                            handle.update(lambda job, n=name, r=result.rows_loaded, s=result.rows_skipped:
-                                _complete_chunk(job, n, r, s))
+                            handle.update(lambda job, n=name, r=result.rows_loaded, s=result.rows_skipped,
+                                q=len(result.quarantine_records):
+                                _complete_chunk(job, n, r, s, q))
                             _tally(_TableLoadOutcome.QUARANTINED if had_quarantine else _TableLoadOutcome.LOADED)
                         elif result.status == "STOPPED":
                             log_activity(ActivityCategory.FULL_LOAD, "load table",

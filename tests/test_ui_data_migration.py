@@ -9161,3 +9161,207 @@ def test_prereq_nav_row_left_aligns_the_guard_message_and_right_aligns_the_butto
     assert expr.index("justify-end") < expr.index("justify-start"), (
         f"alignment is inverted: {expr}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Quarantined rows must never be reported as a complete load
+# ---------------------------------------------------------------------------
+
+
+def _screenshot_rows(quarantined: int):
+    """The reported run: product_media loaded 12 of an estimated 15 with 1 row dropped."""
+    from dsql_migrator.ui.data_migration import FullLoadTableRow
+
+    return [
+        FullLoadTableRow(table="ecommerce.categories", state="DONE", rows_loaded=5,
+                         expected_rows=5, attempts=1, errors=0),
+        FullLoadTableRow(table="ecommerce.orders", state="DONE", rows_loaded=500,
+                         expected_rows=500, attempts=1, errors=0),
+        FullLoadTableRow(table="ecommerce.product_media", state="DONE", rows_loaded=12,
+                         expected_rows=15, attempts=1, errors=3,
+                         rows_quarantined=quarantined),
+        FullLoadTableRow(table="ecommerce_demo.categories", state="DONE",
+                         rows_loaded=630, expected_rows=629, attempts=1, errors=0),
+    ]
+
+
+def test_a_quarantined_row_makes_the_table_incomplete() -> None:
+    """A dropped row is a CONFIRMED loss and must not be absorbed by the estimate
+    tolerance.
+
+    Reported from a real run: the screen showed an amber "Quarantined rows (1) — these
+    rows were permanently dropped" box directly above a green "All 8 tables loaded every
+    source row". `complete` compared loaded-vs-estimate only, and the 20% sampling
+    tolerance swallowed the 3-row shortfall on a 15-row table, so the verdict contradicted
+    the warning beside it.
+    """
+    from dsql_migrator.ui.data_migration import FullLoadTableRow
+
+    dropped = FullLoadTableRow(
+        table="t", state="DONE", rows_loaded=12, expected_rows=15, attempts=1,
+        errors=3, rows_quarantined=1,
+    )
+    assert dropped.complete is False
+
+    # Without the drop, the same shortfall stays within the estimate tolerance.
+    noise = FullLoadTableRow(
+        table="t", state="DONE", rows_loaded=12, expected_rows=15, attempts=1, errors=0
+    )
+    assert noise.complete is True
+
+
+def test_completeness_reports_dropped_rows_and_is_not_all_complete() -> None:
+    from dsql_migrator.ui.data_migration import full_load_completeness
+
+    c = full_load_completeness(_screenshot_rows(1))
+    assert c.all_complete is False
+    assert c.quarantined_rows == 1
+    assert c.quarantined_tables == ["ecommerce.product_media"]
+
+    # The identical run WITHOUT a drop is still a clean completion.
+    clean = full_load_completeness(_screenshot_rows(0))
+    assert clean.all_complete is True
+    assert clean.quarantined_rows == 0
+
+
+class _BannerUi:
+    """Collects the completeness banner's rendered header/body text."""
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+
+    class _El:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: self
+
+    def label(self, text="", *_a, **_k):
+        if text:
+            self.texts.append(str(text))
+        return self._El()
+
+    def __getattr__(self, _name):
+        return lambda *_a, **_k: _BannerUi._El()
+
+
+def _banner_text(rows, *, approximate=True) -> str:
+    from dsql_migrator.ui.data_migration import (
+        full_load_completeness,
+        _render_completeness_banner,
+    )
+
+    ui = _BannerUi()
+    _render_completeness_banner(ui, full_load_completeness(rows), approximate=approximate)
+    return " ".join(ui.texts)
+
+
+def test_banner_never_claims_every_row_loaded_when_rows_were_dropped() -> None:
+    body = _banner_text(_screenshot_rows(1))
+
+    assert "loaded every source row" not in body
+    assert "1 row permanently dropped" in body
+    assert "ecommerce.product_media" in body
+
+
+def test_banner_does_not_soften_dropped_rows_as_estimate_noise() -> None:
+    # The approximate baseline routes count differences to a calm "counts differ from the
+    # pre-load estimate" INFO note. A dropped row is not estimate drift, so it must not
+    # be filed there -- nothing about a scan-free estimate explains a row the loader
+    # could not write.
+    body = _banner_text(_screenshot_rows(1), approximate=True)
+
+    assert "counts differ from the pre-load estimate" not in body
+    assert "This is expected" not in body
+    assert "finished with issues" in body
+
+
+def test_banner_remedy_matches_the_problem() -> None:
+    # A quarantining table is DONE, so it is NOT in the retry set: telling the user to
+    # "retry the failed tables" when nothing failed is a dead end.
+    from dsql_migrator.ui.data_migration import FullLoadTableRow
+
+    only_dropped = _banner_text(_screenshot_rows(1))
+    assert "Retry the failed tables" not in only_dropped
+    assert "Reload that table" in only_dropped
+
+    with_failure = _banner_text(
+        _screenshot_rows(1)
+        + [
+            FullLoadTableRow(table="x", state="FAILED", rows_loaded=0,
+                             expected_rows=10, attempts=2, errors=1)
+        ]
+    )
+    assert "Retry the failed tables" in with_failure
+
+
+def test_a_quarantined_table_is_not_double_reported_as_a_mismatch() -> None:
+    # The table's shortfall IS the dropped rows, so naming it twice would read as two
+    # separate problems.
+    body = _banner_text(_screenshot_rows(1))
+    assert body.count("ecommerce.product_media") == 1
+    assert "row-count mismatch" not in body
+
+
+def test_quarantine_blocks_completion_even_with_no_estimate_to_compare() -> None:
+    """A drop must sink the verdict on its own, not via a row-count comparison.
+
+    Covers the case where the count check cannot help: ``expected_rows`` is ``None``
+    (no source estimate), which previously short-circuited straight to
+    ``complete = True``. The quarantine guard now runs FIRST, so the loss is caught
+    without any baseline to compare against.
+
+    (Note on layering: because that guard forces ``complete = False``, the table also
+    lands in ``mismatched`` -- so ``all_complete``'s own ``quarantined_rows == 0``
+    clause is defence-in-depth rather than separately reachable today. It is kept so a
+    future change to ``complete`` cannot silently restore the green verdict.)
+    """
+    from dsql_migrator.ui.data_migration import (
+        FullLoadTableRow,
+        full_load_completeness,
+    )
+
+    no_estimate = [
+        FullLoadTableRow(table="t", state="DONE", rows_loaded=10, expected_rows=None,
+                         attempts=1, errors=1, rows_quarantined=2)
+    ]
+    row = no_estimate[0]
+    assert row.complete is False  # would have been True before the guard
+
+    c = full_load_completeness(no_estimate)
+    assert c.quarantined_rows == 2
+    assert c.all_complete is False
+
+    body = _banner_text(no_estimate)
+    assert "loaded every source row" not in body
+    assert "2 rows permanently dropped" in body
+
+
+def test_quarantine_count_reaches_the_row_from_the_job_chunk() -> None:
+    """The engine records the drop on the chunk; the view-model must carry it through.
+
+    A mutation dropping `rows_quarantined=` from `build_full_load_table_rows` survived --
+    every completeness test built rows by hand, so nothing covered the engine -> UI hop
+    where the count is actually read. That is the whole path the reported bug travelled.
+    """
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import build_full_load_table_rows
+
+    job = MigrationJob(job_id="j1")
+    job.chunks = [
+        ChunkState(chunk_id="ecommerce.product_media", status="DONE", rows_loaded=12,
+                   rows_quarantined=1, attempts=1),
+        ChunkState(chunk_id="ecommerce.orders", status="DONE", rows_loaded=500,
+                   attempts=1),
+    ]
+
+    rows = {r.table: r for r in build_full_load_table_rows(job)}
+
+    assert rows["ecommerce.product_media"].rows_quarantined == 1
+    assert rows["ecommerce.orders"].rows_quarantined == 0
+    # ...and that is enough to make the run incomplete.
+    assert rows["ecommerce.product_media"].complete is False

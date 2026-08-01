@@ -3835,7 +3835,14 @@ def _render_completeness_banner(
     # informational note, not a failure: the counts simply differ from the
     # scan-free estimate. Surface it calmly (AWS-style info box) and defer to
     # Validation for the exact truth.
-    estimate_only = approximate and completeness.failed == 0
+    # Quarantined rows are a CONFIRMED loss, so they can never be the calm
+    # "counts differ from the estimate" note however approximate the baseline is --
+    # nothing about a scan-free estimate explains a row the loader dropped.
+    estimate_only = (
+        approximate
+        and completeness.failed == 0
+        and completeness.quarantined_rows == 0
+    )
     if estimate_only:
         notes: list[str] = []
         if completeness.mismatched:
@@ -3865,24 +3872,52 @@ def _render_completeness_banner(
     problems: list[str] = []
     if completeness.failed:
         problems.append(f"{completeness.failed} failed")
-    if completeness.mismatched:
+    # Lead with the dropped rows: it is the one certainty in this list, and stating it
+    # as its own item stops it hiding inside a generic "row-count mismatch".
+    if completeness.quarantined_rows:
+        row_noun = "row" if completeness.quarantined_rows == 1 else "rows"
         problems.append(
-            f"{len(completeness.mismatched)} row-count mismatch "
-            f"({', '.join(completeness.mismatched)})"
+            f"{completeness.quarantined_rows} {row_noun} permanently dropped "
+            f"({', '.join(completeness.quarantined_tables)})"
+        )
+    # Don't double-report a table already named as quarantined: its shortfall IS the
+    # dropped rows, so listing it again as a "mismatch" reads like a second problem.
+    _mismatched_only = [
+        name
+        for name in completeness.mismatched
+        if name not in set(completeness.quarantined_tables)
+    ]
+    if _mismatched_only:
+        problems.append(
+            f"{len(_mismatched_only)} row-count mismatch "
+            f"({', '.join(_mismatched_only)})"
         )
     if completeness.unknown:
         problems.append(
             f"{completeness.unknown} without a source count to compare"
         )
+    # Tailor the remedy to the problems actually present. "Retry the failed tables" is
+    # dead-end advice when nothing FAILED -- a quarantining table is DONE, so it is not
+    # in the retry set; the way to recover those rows is to fix the source value and
+    # reload that table.
+    if completeness.failed:
+        remedy = (
+            "Retry the failed tables, or run Validation (Step 4) for a full "
+            "row-count/checksum check."
+        )
+    elif completeness.quarantined_rows:
+        remedy = (
+            "The dropped rows are listed above with their reason: fix the source "
+            "value(s) and Reload that table to load them, or accept the gap to "
+            "continue (Validation reports it)."
+        )
+    else:
+        remedy = "Run Validation (Step 4) for a full row-count/checksum check."
     _render_notice(
         ui,
         tone="warning",
         header="Full Load finished with issues",
-        body=(
-            "; ".join(problems)
-            + ". Retry the failed tables, or run Validation (Step 4) for a full "
-            "row-count/checksum check."
-        ),
+        body="; ".join(problems) + ". " + remedy,
     )
 
 
