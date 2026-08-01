@@ -1501,6 +1501,9 @@ def _render_cdc_start_button(
     full_load_ran = _full_load_committed(job, migration_state)
     started_before = bool(getattr(migration_state, "cdc_connector_names", None))
     if started_before:
+        # A REAL caution: repeated start/stop has already begun consuming MSK's
+        # non-reclaimed partition capacity, and enough cycles wedge the cluster into a
+        # delete-and-redeploy. Worth its own amber box.
         render_notice(
             ui,
             tone="warning",
@@ -1515,25 +1518,32 @@ def _render_cdc_start_button(
             ),
         )
     else:
-        render_notice(
-            ui,
-            tone="info",
-            icon="playlist_add_check",
-            header="This table set is now fixed",
-            body=(
-                f"{selection_line} Each table's Kafka topic partitions were sized when "
+        # On the FIRST start this is not a warning at all -- it is the "which tables?"
+        # answer plus a fact about why it is fixed. It used to be a second full-width
+        # blue box directly under "Ready to start CDC", which gave a normal happy-path
+        # state two equal-weight notices and buried the one line the operator actually
+        # scans for (WHICH tables will stream) inside a paragraph about MSK partition
+        # accounting. So: the table set is plain text (the verifiable fact, kept visible
+        # -- it must not become hover-only), and the immutability rationale moves to an
+        # info glyph beside it, since it is background the operator needs at most once.
+        with ui.row().classes("items-center gap-1.5 no-wrap w-full"):  # type: ignore[attr-defined]
+            ui.icon("playlist_add_check", color="primary").classes("text-base")  # type: ignore[attr-defined]
+            ui.label(selection_line).classes("text-sm text-gray-700")  # type: ignore[attr-defined]
+            ui.icon("info_outline").classes(  # type: ignore[attr-defined]
+                "text-gray-400 text-sm cursor-help shrink-0"
+            ).tooltip(
+                "This set is fixed. Each table's Kafka topic partitions were sized when "
                 "the infrastructure was created and cannot be changed, and MSK does not "
-                "reclaim that capacity — so the set is locked from here. "
+                "reclaim that capacity.\n\n"
                 + (
                     "It matches the Full Load snapshot, which is what makes the handoff "
-                    "gapless. Streaming a different set means a fresh migration: use "
+                    "gapless — streaming a different set means a fresh migration, via "
                     "'Start over' (top right)."
                     if full_load_ran
-                    else "To stream a different set, delete the CDC infrastructure "
-                    "below and deploy it again for the tables you want."
+                    else "To stream a different set, delete the CDC infrastructure below "
+                    "and deploy it again for the tables you want."
                 )
-            ),
-        )
+            )
 
     # _open_cdc_start_dialog is async (it runs the read-only binlog-retention
     # pre-flight via run.io_bound), so it MUST be awaited -- otherwise the dialog

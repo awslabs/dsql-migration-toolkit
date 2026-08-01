@@ -1061,11 +1061,14 @@ def test_form_field_info_tooltip_supplements_a_visible_description() -> None:
     assert plain.tooltips == []
 
 
-def test_activity_log_tab_matches_the_other_settings_tabs() -> None:
-    """The Activity log panel is a form row, not a loose paragraph plus a button.
+def test_activity_log_tab_presents_its_action_at_full_size() -> None:
+    """This tab is an ACTION, so the button is NOT wedged into a form-field slot.
 
-    It previously rendered as a sentence with a button beneath it, which made the tab look
-    like a different kind of screen from the four beside it.
+    Routing it through ``form_field`` (as an earlier pass did) put the button in the
+    right-hand control slot, which is sized for a number input and right-aligned so a
+    COLUMN of inputs lines up -- meaningless for a single button. The result was a small
+    button stranded far from the text it belongs to, with the description wrapping beneath
+    it. It now reads as a described section with the action below it at full size.
     """
     import sys
     import types
@@ -1088,20 +1091,64 @@ def test_activity_log_tab_matches_the_other_settings_tabs() -> None:
     blob = " ".join(ui.texts)
     # Same lead-in shape as every other tab (states when/what, up front).
     assert "Downloads the log as it stands right now." in blob
-    # A labelled form row describing the artifact...
+    # A labelled section describing the artifact...
     assert "Activity log" in blob
     assert "One UTC line per event" in blob
-    # ...whose control is just the verb (the row already says what it is).
-    assert "Download" in ui.texts
-    assert "Download activity log" not in ui.texts
-    # A button is far wider than the number fields the default width is sized for, so the
-    # row must not clamp it to w-24 (that truncates the label to an ellipsis).
-    import inspect
-
-    src = inspect.getsource(app._render_activity_log_download)
-    assert 'control_width="w-auto"' in src, (
-        "the button row must not inherit the number-field control width"
-    )
+    # ...and the action NAMES what it downloads, matching the Full Load error-log button
+    # ("Download" alone left the verb to be paired with a heading by eye).
+    assert "Download activity log" in ui.texts
     # The ephemeral-storage caveat is available without leaving the dialog.
     tooltips = [t for t in ui.texts if t.startswith("[tooltip]")]
     assert tooltips and "CloudWatch" in tooltips[0]
+
+    import inspect
+    import re
+
+    src = inspect.getsource(app._render_activity_log_download)
+    # Not a form row: form_field would shrink and right-align the button.
+    assert "form_field(" not in src, (
+        "an action panel must not put its button in a form-field control slot"
+    )
+    # Full-size primary action -- not shrunk by dense/size=sm, since nothing on this tab
+    # competes with it.
+    button_props = re.search(r'ui\.button\(\s*"Download activity log".*?\.props\(\s*"([^"]*)"', src, re.S)
+    assert button_props is not None, "expected a props() call on the download button"
+    props = button_props.group(1)
+    assert "color=primary" in props
+    assert "dense" not in props and "size=sm" not in props, (
+        f"the tab's only action should not be styled down: {props}"
+    )
+
+
+def test_settings_header_warns_that_values_do_not_persist() -> None:
+    """The non-persistence caveat must be a notice, not gray micro-text.
+
+    It prevents a real mistake: an operator who tunes here and walks away assumes the
+    value sticks, but any restart -- including a Fargate task replacement they did not
+    initiate -- silently reverts it to the deploy-time default, so a carefully tuned run
+    behaves differently next time with no sign why. As a caption under the title it read as
+    boilerplate. It also must NOT claim "changes apply to the next run", which is true only
+    of the Full Load / Validation groups (each panel states its own timing).
+    """
+    import inspect
+
+    from dsql_migrator.ui import app
+
+    src = inspect.getsource(app._render_footer_tools)
+    # Rendered through the shared notice component (box + border + icon carry the weight).
+    assert "render_notice(" in src
+    assert '"These settings are not permanent"' in src
+    # Leads with the consequence and names the durable alternative.
+    assert "revert to the" in src and "restarts" in src
+    assert "DSQL_MIGRATOR_*" in src
+    # The dialog-wide line must not assert a per-group timing. Check the STRING LITERALS
+    # only -- the prose above explains why that wording was dropped, and matching the
+    # whole source would flag the explanation as the thing it warns against.
+    import ast
+
+    literals = " ".join(
+        node.value
+        for node in ast.walk(ast.parse(src.lstrip()))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ).lower()
+    assert "changes apply to the next run" not in literals

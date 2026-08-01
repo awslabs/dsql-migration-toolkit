@@ -5,6 +5,37 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.217
+
+### Changed
+
+- **The Activity log tab's Download button is a full-size primary action again.** The
+  previous release routed it through the shared form-field row, which put it in the
+  right-hand *control* slot — a slot sized for a number input and right-aligned so that a
+  COLUMN of inputs lines up, which is meaningless for a single button. The result was a
+  small button stranded at the far right with the description wrapping beneath it. This tab
+  is an action, not a set of fields, so it now reads as a described section with the action
+  below it, named ("Download activity log") rather than a bare verb.
+
+- **The Settings header caveat is now an info notice instead of gray micro-text.** It is
+  worth keeping — it prevents a real mistake: an operator who tunes a value and walks away
+  assumes it persists, but any restart (including a Fargate task replacement they did not
+  initiate) silently reverts it to the deploy-time default, so a carefully tuned run
+  behaves differently next time with no sign why. As a caption under the title it read as
+  boilerplate and was skipped. It now leads with the consequence ("These settings are not
+  permanent") and names the durable alternative (set the `DSQL_MIGRATOR_*` environment
+  variable in the deployment).
+
+- **Start CDC no longer stacks two equal-weight notices on the happy path.** Under "Ready
+  to start CDC" sat a second full-width blue box whose header was "This table set is now
+  fixed" — so a normal first start showed two notices, and the one line an operator
+  actually scans for (WHICH tables will stream) was buried inside a paragraph about MSK
+  partition accounting. The table list is now plain text beside a check glyph — still fully
+  visible, since it is the verifiable fact — with the immutability rationale and the
+  re-scoping remedy moved to an info tooltip, as background needed at most once. The
+  re-start caution (amber) is unchanged: that one is a real warning, because repeated
+  start/stop really does consume MSK capacity that is never reclaimed.
+
 ## v0.1.216
 
 ### Changed

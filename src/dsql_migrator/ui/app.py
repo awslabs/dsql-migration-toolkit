@@ -817,7 +817,7 @@ def _render_footer_tools(activity_log_path: str) -> None:
     from nicegui import ui
 
     from dsql_migrator.config import tunable_groups
-    from dsql_migrator.ui.design import section_header
+    from dsql_migrator.ui.design import render_notice, section_header
 
     # Material icon per tuning group. A group with no entry falls back to the generic
     # tune glyph, so a newly added group still renders (just without a bespoke icon).
@@ -834,13 +834,27 @@ def _render_footer_tools(activity_log_path: str) -> None:
             ui.button(icon="close", on_click=dialog.close).props(
                 "flat dense round size=sm color=grey-7"
             ).tooltip("Close")
+        # Worth keeping -- it prevents a real mistake: an operator who tunes here and
+        # walks away would otherwise assume the value persists, and on a Fargate task
+        # replacement (or any restart) it silently reverts to the deploy-time default,
+        # so a carefully-tuned run behaves differently the next time with no sign why.
+        # But as gray micro-text under the title it read as boilerplate and was skipped.
+        # Promoted to an info notice (the app's standard treatment for a fact the user
+        # must register) and reworded to lead with the consequence, "not permanent",
+        # rather than the abstract "app-wide and live".
+        #
         # NOT "changes apply to the next run" -- that is only true of the Full Load /
-        # Validation groups; each panel states its own timing. This line carries only
-        # what holds for everything here.
-        ui.label(
-            "App-wide and live: nothing here is a deploy-time parameter, and every "
-            "value resets when the app restarts."
-        ).classes("text-xs text-gray-500 -mt-1 mb-2")
+        # Validation groups; each panel states its own timing.
+        render_notice(
+            ui,
+            tone="info",
+            header="These settings are not permanent",
+            body=(
+                "They apply app-wide, take effect without a redeploy, and revert to the "
+                "deploy-time defaults whenever the app restarts. To make a value stick, "
+                "set its DSQL_MIGRATOR_* environment variable in the deployment."
+            ),
+        )
         # Tabs, not stacked sections: the categories are unrelated -- you come here to
         # change ONE of them -- so stacking made the reader scroll past the others, and
         # the modal grew with every added knob. Same ui.tabs/tab_panels shape the Schema
@@ -1077,7 +1091,6 @@ def _render_activity_log_download(activity_log_path: str) -> None:
     from nicegui import ui
 
     from dsql_migrator.core.activity_log import read_activity_log
-    from dsql_migrator.ui.design import form_field
 
     def _download() -> None:
         data = read_activity_log(activity_log_path, "text")
@@ -1086,36 +1099,38 @@ def _render_activity_log_download(activity_log_path: str) -> None:
             return
         ui.download(data, "migration_activity.log")
 
-    # Same shape as every other Settings tab: the timing lead-in, then a form_field row
-    # whose control happens to be a button rather than an input. Previously this panel was
-    # a loose paragraph with a button under it, which made the tab look like a different
-    # kind of screen from the four beside it. The row's label/description carry what the
-    # file is, so the button itself only needs the verb -- and control_width is widened
-    # because a button is far wider than a number field.
+    # This tab is an ACTION, not a set of fields -- so it does not use form_field. Wedging
+    # the button into a form row's right-hand control slot made it small and stranded it
+    # far from the text it belongs to, with the description wrapping underneath it: the
+    # slot is sized for a number input, and right-aligning is what makes a COLUMN of
+    # inputs line up, which is meaningless for a single button. Instead: a described
+    # section (same label/description/info structure the other tabs read as) with the
+    # action beneath it at full button size, left-aligned where reading ends.
     ui.label("Downloads the log as it stands right now.").classes(
         "text-xs text-gray-500 mb-2"
     )
     with ui.column().classes("gap-3 w-full pt-1"):
-        with form_field(
-            ui,
-            label="Activity log",
-            description=(
-                "One UTC line per event across the whole session — connections, "
-                "assessment, schema apply, Full Load, CDC — independent of which step "
-                "is open."
-            ),
-            help_text=(
+        with ui.row().classes("items-center gap-1 no-wrap"):
+            ui.label("Activity log").classes("text-sm font-medium text-gray-900")
+            ui.icon("info_outline").classes(
+                "text-gray-400 text-sm cursor-help shrink-0"
+            ).tooltip(
                 "The human-readable rendering of the audit trail. The raw NDJSON file "
                 "stays on disk for tooling.\n\n"
                 "On ECS the file lives on ephemeral task storage, so it is lost when the "
                 "task is replaced — enable Diagnostics → Mirror to stdout for a durable "
                 "copy in CloudWatch Logs."
-            ),
-            control_width="w-auto",
-        ):
-            ui.button("Download", on_click=_download).props(
-                "outline dense icon=download no-caps size=sm color=primary"
             )
+        ui.label(
+            "One UTC line per event across the whole session — connections, assessment, "
+            "schema apply, Full Load, CDC — independent of which step is open."
+        ).classes("text-xs text-gray-500 leading-snug")
+        # The tab's one action: primary-coloured and unstyled-down (no `dense`/`size=sm`),
+        # since nothing here competes with it. Names the artifact rather than a bare verb,
+        # matching the Full Load error-log button.
+        ui.button("Download activity log", on_click=_download, icon="download").props(
+            "no-caps color=primary"
+        )
 
 
 def main() -> None:

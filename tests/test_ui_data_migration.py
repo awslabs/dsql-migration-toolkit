@@ -6371,15 +6371,31 @@ class _RecordingUi:
 
     def __init__(self) -> None:
         self.texts: list[str] = []
+        # Hover-only text, recorded APART from `texts`: several design rules turn on the
+        # difference (guidance must not live only in a tooltip), so conflating the two
+        # would make a hover-only regression indistinguishable from visible copy.
+        self.tooltips: list[str] = []
 
     class _El:
+        # Class-level default: subclasses below (_Btn, _Input, ...) define their own
+        # __init__ without calling super(), so an instance attribute would be missing on
+        # them and every .tooltip() call would raise AttributeError. A class attribute is
+        # always resolvable, so a subclass that does not wire up the recorder simply
+        # drops tooltips instead of breaking the render.
+        _ui = None
+
+        def __init__(self, ui=None):
+            self._ui = ui
+
         def classes(self, *_a, **_k):
             return self
 
         def props(self, *_a, **_k):
             return self
 
-        def tooltip(self, *_a, **_k):
+        def tooltip(self, text="", *_a, **_k):
+            if text and self._ui is not None:
+                self._ui.tooltips.append(str(text))
             return self
 
         def style(self, *_a, **_k):
@@ -6418,10 +6434,10 @@ class _RecordingUi:
     def _record(self, text):
         if text is not None:
             self.texts.append(str(text))
-        return self._El()
+        return self._El(self)
 
     def expansion(self, *_a, **_k):
-        return self._El()
+        return self._El(self)
 
     def label(self, text="", *_a, **_k):
         return self._record(text)
@@ -6430,47 +6446,47 @@ class _RecordingUi:
         return self._record(text)
 
     def icon(self, *_a, **_k):
-        return self._El()
+        return self._El(self)
 
     def button(self, *_a, **_k):
-        return self._El()
+        return self._El(self)
 
     def row(self, *_a, **_k):
-        return self._El()
+        return self._El(self)
 
     def column(self, *_a, **_k):
-        return self._El()
+        return self._El(self)
 
     def card(self, *_a, **_k):
-        return self._El()
+        return self._El(self)
 
     # --- extras needed by the CDC infra-prep section -----------------------
     def separator(self, *_a, **_k):
-        return self._El()
+        return self._El(self)
 
     def space(self, *_a, **_k):
-        return self._El()
+        return self._El(self)
 
     def badge(self, text="", *_a, **_k):
         return self._record(text)
 
     def spinner(self, *_a, **_k):
-        return self._El()
+        return self._El(self)
 
     def timer(self, *_a, **_k):
-        return self._El()
+        return self._El(self)
 
     def notify(self, *_a, **_k):
         return None
 
     def element(self, *_a, **_k):
-        return self._El()
+        return self._El(self)
 
     def input(self, label="", *_a, **_k):
         return self._record(label)
 
     def select(self, *_a, **_k):
-        return self._El()
+        return self._El(self)
 
     def checkbox(self, text="", *_a, **_k):
         return self._record(text)
@@ -11423,11 +11439,18 @@ def test_full_load_committed_tracks_the_lock_clause_that_start_over_owns() -> No
         assert _full_load_committed(_Job(), state) is expected, mtype
 
 
-def test_start_cdc_notice_points_at_start_over_after_a_full_load() -> None:
-    """Renders the REAL notice and asserts on the emitted text, not the source.
+def test_start_cdc_shows_the_table_set_plainly_with_the_why_on_hover() -> None:
+    """On the FIRST start this is not a warning -- it is the "which tables?" answer.
 
-    Two situations, two remedies: after a Full Load only Start over re-scopes, while a
-    CDC-only session can delete + redeploy the infrastructure.
+    It used to be a second full-width blue notice directly under "Ready to start CDC",
+    giving a normal happy-path state two equal-weight boxes and burying the one line the
+    operator scans for (WHICH tables stream) inside a paragraph about MSK partition
+    accounting. The table set must stay VISIBLE (it is the verifiable fact, and hiding it
+    would be the hover-only anti-pattern); the immutability rationale is background needed
+    at most once, so it moves to an info tooltip.
+
+    The remedy in that tooltip still differs by situation, because the two locks are not
+    interchangeable: after a Full Load only Start over re-scopes.
     """
     from dsql_migrator.ui.data_migration import _cdc_ui
     from dsql_migrator.ui.data_migration._models import MigrationType
@@ -11436,7 +11459,15 @@ def test_start_cdc_notice_points_at_start_over_after_a_full_load() -> None:
         status = "DONE"
         watermark = None
 
-    def _render(*, job, mtype):
+    class _Table:
+        def __init__(self, name):
+            self.name = name
+
+    class _Inventory:
+        def __init__(self, tables):
+            self.tables = tables
+
+    def _render(*, job, mtype, inventory=None):
         ui = _RecordingUi()
         state = DataMigrationState()
         state.migration_type = mtype
@@ -11444,25 +11475,61 @@ def test_start_cdc_notice_points_at_start_over_after_a_full_load() -> None:
         state.job_id = "job-1" if job is not None else None
         jm = _StubJobManager({"job-1": job} if job is not None else {})
         _cdc_ui._render_cdc_start_button(
-            ui, state, jm, lambda: None, inventory=None, session=None
+            ui, state, jm, lambda: None, inventory=inventory, session=None
         )
-        return " ".join(ui.texts)
+        return ui
 
-    # Full Load + CDC, load finished -> Start over is the only real exit.
-    after_load = _render(job=_Job(), mtype=MigrationType.FULL_LOAD_AND_CDC)
-    assert "This table set is now fixed" in after_load
-    assert "Start over" in after_load
-    assert "delete the CDC infrastructure" not in after_load
-    # It also explains WHY the set matches the snapshot (the gapless handoff).
-    assert "gapless" in after_load
+    # A real watermark + inventory, so the table line actually resolves (with None the
+    # branch renders a generic fallback and the invariant below would be vacuous).
+    from datetime import datetime, timezone
 
-    # CDC-only, no Full Load -> deleting the infrastructure genuinely re-scopes.
+    from dsql_migrator.core.models import Watermark
+
+    covered = {f"ecommerce.t{i}": 100 for i in range(8)}
+    inventory = _Inventory([_Table(name) for name in covered])
+
+    class _LoadedJob:
+        status = "DONE"
+        # Built inline: a class body cannot read the enclosing function's locals.
+        watermark = Watermark(
+            binlog_file="mysql-bin.000042",
+            binlog_position=120,
+            snapshot_timestamp=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            table_row_counts={f"ecommerce.t{i}": 100 for i in range(8)},
+        )
+
+    # --- Full Load + CDC, load finished -> Start over is the only real exit ---
+    after = _render(
+        job=_LoadedJob(), mtype=MigrationType.FULL_LOAD_AND_CDC, inventory=inventory
+    )
+    visible = " ".join(after.texts)
+    hover = " ".join(after.tooltips)
+
+    # No second notice competing with "Ready to start CDC".
+    assert "Ready to start CDC" in visible
+    assert "This table set is now fixed" not in visible
+    # THE key invariant: the table set stays VISIBLE. It is the one line the operator
+    # scans for and the only verifiable claim here, so it must never move to hover.
+    assert "Will stream 8 tables" in visible
+    assert "ecommerce.t0" in visible
+    assert "Will stream" not in hover
+    # The rationale is available, but on hover -- not as a paragraph.
+    assert "This set is fixed" in hover
+    assert "partitions" in hover
+    # After a Full Load: Start over, and it says WHY the set is what it is.
+    assert "Start over" in hover
+    assert "gapless" in hover
+    assert "delete the CDC infrastructure" not in hover
+
+    # --- CDC-only, no Full Load -> delete + redeploy genuinely re-scopes ---
     cdc_only = _render(job=None, mtype=MigrationType.CDC_ONLY)
-    assert "This table set is now fixed" in cdc_only
-    assert "delete the CDC infrastructure" in cdc_only
-    assert "Start over" not in cdc_only
+    cdc_hover = " ".join(cdc_only.tooltips)
+    assert "delete the CDC infrastructure" in cdc_hover
+    assert "Start over" not in cdc_hover
 
     # Neither variant tells the operator to go pick tables (the picker is locked).
-    for blob in (after_load, cdc_only):
+    for blob in (visible, hover, " ".join(cdc_only.texts), cdc_hover):
         assert "Pick all your tables" not in blob
         assert "up front" not in blob
+
+
