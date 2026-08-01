@@ -10888,3 +10888,273 @@ def test_attach_is_offered_when_the_candidate_tables_are_unknown() -> None:
 
     assert "Attach to mysql-dsql-cdc-stack-0729-new" in ui.buttons
     assert "not safe to attach" not in " ".join(ui.labels)
+
+
+# ---------------------------------------------------------------------------
+# "Automatic — gapless from Full Load" must only be claimed when it is TRUE
+# ---------------------------------------------------------------------------
+
+
+def _wm(*, binlog=True, gtid=True):
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.models import Watermark
+
+    return Watermark(
+        binlog_file="mysql-bin.000123" if binlog else None,
+        binlog_position=45678 if binlog else None,
+        gtid_executed="3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5" if gtid else None,
+        snapshot_timestamp=datetime(2026, 8, 1, tzinfo=timezone.utc),
+    )
+
+
+def test_can_seed_offset_requires_the_binlog_position() -> None:
+    """A GTID set alone cannot give a gapless start.
+
+    The handoff works by writing the Full Load's position into MSK's connect-offsets
+    topic, and that record is keyed on binlog file + pos: the in-VPC seeder REJECTS a
+    watermark without them, and ``build_watermark_params`` returns all-empty values so the
+    template skips the seeder and the connector starts from the CURRENT binlog. GTID is
+    optional reinforcement the seeder adds when present, not a substitute.
+    """
+    from dsql_migrator.core.cdc import CdcResumePoint
+
+    both = CdcResumePoint.from_watermark(_wm())
+    assert both.can_seed_offset() is True
+
+    gtid_only = CdcResumePoint.from_watermark(_wm(binlog=False))
+    # The BROAD test still passes -- which is exactly how the UI came to promise gapless.
+    assert gtid_only.has_coordinates() is True
+    assert gtid_only.can_seed_offset() is False
+
+    binlog_only = CdcResumePoint.from_watermark(_wm(gtid=False))
+    assert binlog_only.can_seed_offset() is True
+
+    nothing = CdcResumePoint.from_watermark(_wm(binlog=False, gtid=False))
+    assert nothing.can_seed_offset() is False
+
+
+def test_gapless_claim_matches_what_the_seeder_would_actually_do() -> None:
+    """The UI's Automatic-availability must equal whether the seeder gets deployed.
+
+    This is the invariant the bug broke: a GTID-only watermark showed "Automatic — gapless
+    from Full Load (recommended)" and Ready, while the seeder was skipped entirely and
+    every change made during the Full Load was lost.
+    """
+    from dsql_migrator.core.cdc import CdcResumePoint, build_watermark_params
+
+    for binlog in (True, False):
+        for gtid in (True, False):
+            watermark = _wm(binlog=binlog, gtid=gtid)
+            ui_says_gapless = CdcResumePoint.from_watermark(
+                watermark
+            ).can_seed_offset()
+            params = dict(build_watermark_params(watermark))
+            seeder_deployed = bool(params["WatermarkBinlogFile"])
+            assert ui_says_gapless == seeder_deployed, (
+                f"binlog={binlog} gtid={gtid}: UI says gapless={ui_says_gapless} "
+                f"but seeder deployed={seeder_deployed}"
+            )
+
+
+def _start_card(watermark):
+    from dsql_migrator.core.cdc import CdcResumePoint
+    from dsql_migrator.ui.data_migration._cdc_ui import _render_cdc_start_point_card
+
+    resume = CdcResumePoint.from_watermark(watermark) if watermark else None
+    usable = resume is not None and resume.can_seed_offset()
+    gtid_only = (
+        resume is not None and not resume.can_seed_offset()
+        and bool(resume.gtid_executed)
+    )
+
+    ui = _DetailRowUi()
+    ui.radios: list[dict] = []
+    _orig_getattr = None
+
+    def _radio(options=None, *_a, **_k):
+        if isinstance(options, dict):
+            ui.radios.append(options)
+        return ui._El(ui)
+
+    ui.radio = _radio
+    _render_cdc_start_point_card(
+        ui,
+        DataMigrationState(),
+        lambda: None,
+        wm_resume=resume,
+        wm_usable=usable,
+        effective_resume=resume if usable else None,
+        mode="auto",
+        locked=False,
+        wm_gtid_only=gtid_only,
+    )
+    return ui
+
+
+def test_gtid_only_watermark_does_not_claim_gapless() -> None:
+    ui = _start_card(_wm(binlog=False))
+
+    labels = " ".join(v for options in ui.radios for v in options.values())
+    assert "gapless from Full Load" not in labels
+    assert "has no binlog position" in labels
+    # It must NOT claim the Full Load never ran -- there IS a watermark.
+    assert "needs a Full Load watermark" not in labels
+
+    body = " ".join(ui.labels)
+    assert "cannot give a gapless start" in body
+    assert "CURRENT" in body  # says where streaming WOULD start
+    assert "REPLICATION CLIENT" in body  # names the actual fix
+    assert "re-run the Full Load" in body
+
+
+def test_usable_watermark_still_claims_gapless() -> None:
+    ui = _start_card(_wm())
+
+    labels = " ".join(v for options in ui.radios for v in options.values())
+    assert "gapless from Full Load (recommended)" in labels
+    assert "has no binlog position" not in labels
+    assert "cannot give a gapless start" not in " ".join(ui.labels)
+
+
+def test_absent_watermark_keeps_the_generic_wording() -> None:
+    # No watermark at all is a different situation (no Full Load in this session), so the
+    # GTID-specific guidance must not appear.
+    ui = _start_card(None)
+
+    labels = " ".join(v for options in ui.radios for v in options.values())
+    assert "needs a Full Load watermark" in labels
+    assert "REPLICATION CLIENT" not in " ".join(ui.labels)
+
+
+# ---------------------------------------------------------------------------
+# CDC step: when attach is wrong, DEPLOY must look like the way forward
+# ---------------------------------------------------------------------------
+
+
+class _CdcPanelUi(_DetailRowUi):
+    """Adds expansion capture (title/icon/open-state) and button labels."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.buttons: list[str] = []
+        self.expansions: list[tuple[str, object, object]] = []
+
+    def button(self, text="", *_a, **_k):
+        if text:
+            self.buttons.append(str(text))
+        return self._El(self)
+
+    def expansion(self, text="", *_a, **kwargs):
+        self.expansions.append((str(text), kwargs.get("icon"), kwargs.get("value")))
+        return self._El(self)
+
+
+def _cdc_prep_panel(*, streamed, selected):
+    from dsql_migrator.core.models import TableSelection
+    from dsql_migrator.ui.data_migration._cdc_ui import _render_cdc_infra_prep_section
+
+    state = DataMigrationState()
+    state.set_cdc_stack_phase(None)  # no stack of our own -> the adopt branch
+    state.set_cdc_other_stacks([("mysql-dsql-cdc-stack-0729-new", "UPDATE_COMPLETE")])
+    state.set_cdc_other_stack_tables(
+        {"mysql-dsql-cdc-stack-0729-new": list(streamed)}
+    )
+    state.set_selection(TableSelection(selected_tables=list(selected)))
+
+    ui = _CdcPanelUi()
+    _render_cdc_infra_prep_section(
+        ui, state, _StubJobManager({}), lambda: None, inventory=None, session=None
+    )
+    return ui
+
+
+def _deploy_expansion(ui):
+    return next(e for e in ui.expansions if "Deploy" in e[0])
+
+
+def test_cdc_step_hides_attach_and_leads_with_deploy_on_a_scope_mismatch() -> None:
+    """When attaching is wrong, deploying is the ONLY way forward — so it must lead.
+
+    Reported (v0.1.210): the panel showed a prominent blue "Attach to
+    mysql-dsql-cdc-stack-0729-new" the operator must NOT press, while the correct action
+    sat collapsed behind a warning-triangle expansion labelled "Deploy a separate CDC
+    pipeline instead" — so the right step looked like the risky one and was hidden.
+    """
+    ui = _cdc_prep_panel(
+        streamed=["ecommerce_demo.orders"],
+        selected=["ecommerce.orders", "ecommerce.users"],
+    )
+
+    # The attach button is gone, replaced by the reason.
+    assert not any("Attach to" in b for b in ui.buttons), ui.buttons
+    body = " ".join(ui.labels)
+    assert "streams a different set of tables" in body
+    assert "not safe to attach" in body
+
+    title, icon, opened = _deploy_expansion(ui)
+    assert title == "Deploy a CDC pipeline for this table set"
+    assert "instead" not in title  # it is not an alternative; it is the path
+    assert icon == "rocket_launch"  # no warning glyph on the correct action
+    assert opened is True  # and it is not hidden behind a fold
+
+
+def test_cdc_step_keeps_deploy_de_emphasised_when_attach_is_valid() -> None:
+    # A second MSK cluster is expensive and rarely intended, so when attaching IS
+    # appropriate the deploy path stays collapsed and flagged.
+    ui = _cdc_prep_panel(
+        streamed=["ecommerce.orders", "ecommerce.users"], selected=["ecommerce.orders"]
+    )
+
+    assert "Attach to mysql-dsql-cdc-stack-0729-new" in ui.buttons
+    title, icon, opened = _deploy_expansion(ui)
+    assert title == "Deploy a separate CDC pipeline instead"
+    assert icon == "warning"
+    assert not opened
+
+
+def test_cdc_step_mismatch_notice_points_at_the_deploy_and_the_cost() -> None:
+    ui = _cdc_prep_panel(
+        streamed=["ecommerce_demo.orders"], selected=["ecommerce.orders"]
+    )
+
+    body = " ".join(ui.labels)
+    # Says what to do...
+    assert "Deploy a pipeline for this table set below" in body
+    # ...and that the useless stack is still costing money.
+    assert "keeps billing" in body
+
+
+def test_cdc_step_gates_automatic_on_can_seed_offset_not_has_coordinates() -> None:
+    """The CDC step must gate Automatic on what the SEEDER needs.
+
+    A mutation swapping ``can_seed_offset()`` back to ``has_coordinates()`` passed every
+    other test here, because they call the card directly with a pre-computed flag -- the
+    WIRING was untested. That is the same class of gap as the earlier restored-session and
+    detail=None bugs, and here it silently restores the exact defect: a GTID-only watermark
+    would again claim "gapless from Full Load" while the seeder was skipped.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    tree = ast.parse(inspect.getsource(_cdc_ui._render_cdc_source_config_card))
+    assigns = [
+        ast.unparse(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id in ("wm_usable", "wm_gtid_only")
+            for t in node.targets
+        )
+    ]
+    joined = " ".join(assigns)
+    assert "can_seed_offset()" in joined, (
+        "Automatic availability must key off can_seed_offset(), not has_coordinates()"
+    )
+    assert "wm_usable = wm_resume is not None and wm_resume.has_coordinates()" not in (
+        joined
+    )
+    # And the GTID-only case must be derived, so the card can explain the real cause.
+    assert "gtid_executed" in joined

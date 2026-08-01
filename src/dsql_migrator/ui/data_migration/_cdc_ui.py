@@ -96,6 +96,7 @@ from dsql_migrator.ui.data_migration._status import (
     _fetch_migration_row_counts,
     _format_eta_hint,
     _is_inflight_stack_status,
+    cdc_attach_scope_mismatch,
     split_attachable_stacks,
     _migration_status_tables,
     _read_cdc_template_body,
@@ -369,7 +370,25 @@ def _render_cdc_source_config_card(
     wm_resume = (
         CdcResumePoint.from_watermark(watermark) if watermark is not None else None
     )
-    wm_usable = wm_resume is not None and wm_resume.has_coordinates()
+    # Gate on what the SEEDER actually needs (binlog file:pos), not on the broad
+    # "has any coordinate" test. A GTID-only watermark passed has_coordinates(), so the
+    # card claimed "Automatic -- gapless from Full Load (recommended)" and showed Ready --
+    # while build_watermark_params returned all-empty values, the template skipped the
+    # seeder, and the connector started from the CURRENT binlog, losing every change made
+    # during the load. The failure was silent until Validation, or after cut over.
+    #
+    # Reachable, not theoretical: the coordinates come from SEPARATE queries that degrade
+    # independently -- SHOW MASTER STATUS needs REPLICATION CLIENT (commonly restricted on
+    # RDS/Aurora) while @@GLOBAL.gtid_executed is a plain global read.
+    wm_usable = wm_resume is not None and wm_resume.can_seed_offset()
+    # A GTID set with NO file:pos: there IS a watermark and it looks usable, but it cannot
+    # seed the offset. Called out separately so the reason is explicit instead of the
+    # generic "no watermark" wording, which would be wrong here.
+    wm_gtid_only = (
+        wm_resume is not None
+        and not wm_resume.can_seed_offset()
+        and bool(wm_resume.gtid_executed)
+    )
     # Effective start position: in manual mode an entered override wins; in auto
     # mode the watermark is used.
     if mode == "manual" and override is not None and override.has_coordinates():
@@ -397,6 +416,7 @@ def _render_cdc_source_config_card(
         mode=mode,
         locked=started,
         session=session,
+        wm_gtid_only=wm_gtid_only,
     )
 
     if effective_resume is None:
@@ -637,6 +657,11 @@ def _render_cdc_start_point_card(
     mode: str,
     locked: bool = False,
     session: object = None,
+    # A watermark that HAS a GTID set but no binlog file:position -- present, yet unable
+    # to seed the CDC start offset. Distinguished from "no watermark" so the card can name
+    # the actual cause and its fix (the REPLICATION CLIENT grant) instead of implying the
+    # Full Load never ran.
+    wm_gtid_only: bool = False,
 ) -> None:
     """Render the PRIMARY 'CDC start point' card with an Automatic/Manual choice.
 
@@ -679,11 +704,18 @@ def _render_cdc_start_point_card(
             else:
                 ui.badge("Action needed", color="warning").props("outline")  # type: ignore[attr-defined]
 
-        auto_label = (
-            "Automatic — gapless from Full Load (recommended)"
-            if wm_usable
-            else "Automatic — needs a Full Load watermark (unavailable)"
-        )
+        if wm_usable:
+            auto_label = "Automatic — gapless from Full Load (recommended)"
+        elif wm_gtid_only:
+            # Do NOT say "needs a Full Load watermark": there IS one. It simply lacks the
+            # binlog file:position the offset seed is keyed on, so the honest label names
+            # what is missing rather than implying the load never ran.
+            auto_label = (
+                "Automatic — unavailable (the Full Load watermark has no binlog "
+                "position)"
+            )
+        else:
+            auto_label = "Automatic — needs a Full Load watermark (unavailable)"
 
         def _on_mode(value: str) -> None:
             migration_state.set_cdc_start_mode(value)
@@ -705,13 +737,35 @@ def _render_cdc_start_point_card(
                 "opacity-50 pointer-events-none cursor-not-allowed"
             )
         if not wm_usable and mode == "auto" and not locked:
-            # Steer to manual: auto is not usable here.
-            inline_hint(  # type: ignore[attr-defined]
-                ui,
-                "No usable Full Load watermark in this session "
-                "(run a Full Load first, or choose Manual).",
-                tone="warning",
-            )
+            if wm_gtid_only:
+                # Name the cause AND the fix. This is the one case where the operator can
+                # get a real gapless handoff by changing something on the source, so a
+                # generic "no watermark" message would send them to Manual with a GTID
+                # that cannot seed the offset either -- still not gapless.
+                render_notice(
+                    ui,
+                    tone="warning",
+                    header="This Full Load's watermark cannot give a gapless start",
+                    body=(
+                        "The watermark recorded a GTID set but no binlog "
+                        "file:position, and the CDC start offset is keyed on that "
+                        "position — so streaming would begin from the source's CURRENT "
+                        "binlog and skip every change made during the Full Load. "
+                        "SHOW MASTER STATUS is what supplies it; on RDS/Aurora it needs "
+                        "the REPLICATION CLIENT grant. Grant it to the source user and "
+                        "re-run the Full Load for a gapless handoff, or enter a binlog "
+                        "position manually if you know the coordinate the load started "
+                        "from."
+                    ),
+                )
+            else:
+                # Steer to manual: auto is not usable here.
+                inline_hint(  # type: ignore[attr-defined]
+                    ui,
+                    "No usable Full Load watermark in this session "
+                    "(run a Full Load first, or choose Manual).",
+                    tone="warning",
+                )
 
         if mode == "manual":
             _render_cdc_manual_inputs(
@@ -1690,8 +1744,42 @@ def _render_cdc_adopt_or_deploy_choice(
             ),
         )
 
-    if attachable:
-        listed = ", ".join(f"{name} ({status})" for name, status in attachable)
+    # Split the candidates by whether they actually cover THIS session's tables. Attaching
+    # promotes Data Migration to DONE and unlocks Validation, so a pipeline streaming a
+    # different table set would report the migration complete while every loaded table
+    # received no ongoing changes at all. (The same guard as the plan-level banner; this
+    # panel is a separate render path and had none.)
+    loaded_tables = list(migration_state.selection.selected_tables)
+    tables_by_stack = getattr(migration_state, "cdc_other_stack_tables", None) or {}
+    in_scope: "list[tuple[str, str]]" = []
+    out_of_scope: "list[tuple[str, str, list[str]]]" = []
+    for name, status in attachable:
+        missing = cdc_attach_scope_mismatch(
+            tables_by_stack.get(name, ()), loaded_tables
+        )
+        (out_of_scope.append((name, status, missing)) if missing
+         else in_scope.append((name, status)))
+
+    for name, _status, missing in out_of_scope:
+        listed = ", ".join(missing[:6]) + (
+            f" +{len(missing) - 6} more" if len(missing) > 6 else ""
+        )
+        noun = "table" if len(missing) == 1 else "tables"
+        render_notice(
+            ui,
+            tone="warning",
+            header=f"{name} streams a different set of tables — not safe to attach",
+            body=(
+                f"It does not replicate {len(missing)} {noun} this session loaded "
+                f"({listed}), so attaching would mark the migration complete while those "
+                "tables received no ongoing changes. Deploy a pipeline for this table set "
+                "below. That existing stack keeps billing meanwhile — delete it below if "
+                "it is no longer needed."
+            ),
+        )
+
+    if in_scope:
+        listed = ", ".join(f"{name} ({status})" for name, status in in_scope)
         render_notice(
             ui,
             tone="warning",
@@ -1705,17 +1793,32 @@ def _render_cdc_adopt_or_deploy_choice(
             ),
         )
         with ui.row().classes("items-center gap-2 flex-wrap w-full"):  # type: ignore[attr-defined]
-            for name, _status in attachable:
+            for name, _status in in_scope:
                 def _adopt(_name=name) -> None:
                     if migration_state.adopt_cdc_stack(_name):
                         refresh()
                 ui.button(  # type: ignore[attr-defined]
                     f"Attach to {name}", on_click=_adopt, icon="link"
                 ).props("color=primary")
-    # A fresh, separate deploy stays available but de-emphasized (a duplicate MSK is
-    # expensive and rarely intended). Reuses the standard deploy form + guard dialog.
+
+    # Present the deploy path according to whether attaching is actually an option.
+    #
+    # When every candidate is out of scope, deploying is not the "risky alternative" -- it
+    # is the ONLY correct way forward. Keeping it collapsed behind a warning-triangle
+    # expansion labelled "instead" made the right action look like the dangerous one, and
+    # hid it: the operator saw a prominent blue Attach button they must not press and a
+    # folded warning they should. So it renders EXPANDED, titled as the way forward, with
+    # no warning glyph.
+    #
+    # When a candidate IS attachable, a second MSK cluster is expensive and rarely
+    # intended, so the deploy stays collapsed and de-emphasised as before.
+    deploy_is_the_way = bool(out_of_scope) and not in_scope
     with ui.expansion(  # type: ignore[attr-defined]
-        "Deploy a separate CDC pipeline instead", icon="warning"
+        "Deploy a CDC pipeline for this table set"
+        if deploy_is_the_way
+        else "Deploy a separate CDC pipeline instead",
+        icon="rocket_launch" if deploy_is_the_way else "warning",
+        value=deploy_is_the_way,
     ).classes("w-full"):
         _render_cdc_infra_deploy_action(
             ui, migration_state, job_manager, refresh,

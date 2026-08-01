@@ -5,6 +5,47 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.212
+
+### Fixed
+
+- **"Automatic — gapless from Full Load" was offered for a watermark that cannot give a
+  gapless start.** The option was gated on "has any resume coordinate", but the handoff
+  works by seeding MSK's `connect-offsets` with a record keyed on the binlog
+  **file:position** — the in-VPC seeder rejects a watermark without it, and
+  `build_watermark_params` returns all-empty values so the template skips the seeder and
+  the connector starts from the source's **current** binlog. A GTID set alone therefore
+  showed "gapless (recommended)" and *Ready* while every change made during the Full Load
+  was silently lost, undetected until Validation or after cut over.
+
+  This is reachable, not theoretical: the two coordinates come from separate queries that
+  degrade independently — `SHOW MASTER STATUS` needs the `REPLICATION CLIENT` grant
+  (commonly restricted on RDS/Aurora) while `@@GLOBAL.gtid_executed` is a plain global
+  read. Automatic is now gated on `can_seed_offset()`, and the GTID-only case gets its own
+  wording — it does **not** claim "needs a Full Load watermark" (there is one) but names
+  the missing binlog position, what would happen, and the fix (grant `REPLICATION CLIENT`,
+  re-run the Full Load).
+- **The CDC step still offered Attach for a pipeline streaming other tables.** v0.1.211
+  guarded the plan-level banner; this panel is a separate render path and had no check at
+  all. It now withholds Attach with the same scope test.
+
+### Changed
+
+- **When attaching is not safe, deploying is presented as the way forward.** The deploy
+  form sat collapsed behind a warning triangle labelled "Deploy a separate CDC pipeline
+  instead" — so with a mismatched candidate the operator saw a prominent blue Attach button
+  they must not press, and the correct action looked like the risky one *and* was hidden.
+  With no attachable candidate it now renders expanded, titled "Deploy a CDC pipeline for
+  this table set", with no warning glyph. When attaching **is** valid it stays collapsed
+  and flagged, since a second MSK cluster is expensive and rarely intended.
+
+### Tests
+
+- Includes an invariant test that the UI's gapless claim equals whether the seeder would
+  actually be deployed, across all four watermark shapes. Four mutations killed; one
+  initially survived — swapping `can_seed_offset()` back to `has_coordinates()` — because
+  every other test passes the flag in pre-computed, leaving the wiring untested.
+
 ## v0.1.211
 
 ### Fixed

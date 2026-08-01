@@ -5,6 +5,42 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.212
+
+### Fixed
+
+- **gapless 시작이 불가능한 워터마크에도 "Automatic — gapless from Full Load"를 제시했습니다.** 이
+  옵션이 "재개 좌표가 하나라도 있는가"로 판정됐는데, 핸드오프는 MSK `connect-offsets`에 binlog
+  **file:position**으로 키가 잡힌 레코드를 시드하는 방식입니다 — in-VPC seeder는 그것이 없는 워터마크를
+  거부하고, `build_watermark_params`가 전부 빈 값을 반환해 템플릿이 seeder를 건너뛰며 커넥터가 소스의
+  **현재** binlog부터 시작합니다. 따라서 GTID만 있으면 "gapless (recommended)" + *Ready*로 표시되면서
+  Full Load 중의 모든 변경이 조용히 유실되고, Validation이나 컷오버 후에야 드러났습니다.
+
+  이는 이론적 상황이 아닙니다: 두 좌표는 독립적으로 degrade하는 별개 쿼리에서 나옵니다 —
+  `SHOW MASTER STATUS`는 `REPLICATION CLIENT` 권한이 필요한데(RDS/Aurora에서 흔히 제한됨)
+  `@@GLOBAL.gtid_executed`는 일반 전역 읽기입니다. 이제 Automatic은 `can_seed_offset()`으로 판정하고,
+  GTID만 있는 경우는 별도 문구를 씁니다 — "needs a Full Load watermark"라고 하지 않고(워터마크는 있음)
+  빠진 binlog 위치와 그 결과, 그리고 해결책(`REPLICATION CLIENT` 부여 후 Full Load 재실행)을 명시합니다.
+- **CDC 스텝은 여전히 다른 테이블을 스트리밍하는 파이프라인에 Attach를 제안했습니다.** v0.1.211은
+  플랜 단계 배너를 보호했는데, 이 패널은 별개 렌더 경로여서 검사가 전혀 없었습니다. 이제 같은 범위
+  검사로 Attach를 보류합니다.
+
+### Changed
+
+- **attach가 안전하지 않을 때는 배포를 진행 경로로 제시합니다.** 배포 폼이 "Deploy a separate CDC
+  pipeline instead"라는 이름으로 경고 삼각형 뒤에 접혀 있었습니다 — 그래서 후보가 불일치일 때 운영자는
+  누르면 안 되는 파란 Attach 버튼을 크게 보고, 올바른 액션은 위험한 것처럼 보이면서 **숨겨져** 있었습니다.
+  attach 가능한 후보가 없으면 이제 펼쳐진 상태로 "Deploy a CDC pipeline for this table set" 제목과
+  경고 글리프 없이 표시됩니다. attach가 **유효할** 때는 접힌 채 경고를 유지합니다 — 두 번째 MSK
+  클러스터는 비싸고 의도된 경우가 드물기 때문입니다.
+
+### Tests
+
+- UI의 gapless 주장이 seeder가 실제로 배포되는지와 일치하는지를 워터마크 4가지 형태 전부에 대해
+  검증하는 불변식 테스트를 포함합니다. 변이 4개 검출, 처음 하나는 통과했습니다 —
+  `can_seed_offset()`을 `has_coordinates()`로 되돌리는 변이 — 다른 모든 테스트가 플래그를 미리 계산해
+  넘기므로 배선이 미검증이었습니다.
+
 ## v0.1.211
 
 ### Fixed

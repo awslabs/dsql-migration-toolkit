@@ -127,9 +127,36 @@ class CdcResumePoint(BaseModel):
         A real CDC run requires either a GTID set or a binlog ``file:position``
         to know where to start; without them the source's binlog/GTID metadata
         was unavailable at export time and CDC cannot resume.
+
+        NOTE: this is the broad "something to resume from" test. It is NOT sufficient
+        for the automatic gapless handoff -- see :meth:`can_seed_offset`.
         """
         has_binlog = self.binlog_file is not None and self.binlog_position is not None
         return bool(self.gtid_executed) or has_binlog
+
+    def can_seed_offset(self) -> bool:
+        """True when these coordinates can actually seed the CDC start offset.
+
+        The gapless handoff works by writing the Full Load's position into MSK's
+        ``connect-offsets`` topic before the source connector starts. That offset record
+        is keyed on the binlog ``file`` + ``pos`` -- the in-VPC seeder REJECTS a watermark
+        without them (``"watermark has no binlog file:position; cannot seed offset"``),
+        and ``build_watermark_params`` returns all-empty parameters, which makes the
+        template skip the seeder entirely so the connector starts from the CURRENT binlog.
+
+        A GTID set alone therefore does NOT give a gapless start: it is optional
+        reinforcement the seeder adds to the offset when present, not a substitute for the
+        coordinate it is keyed on. Keeping this distinct from
+        :meth:`has_coordinates` is what stops the UI promising "gapless from Full Load"
+        for a watermark that would silently resume from the live binlog and lose every
+        change made during the load.
+
+        This case is reachable, not theoretical: the two coordinates are read by SEPARATE
+        queries that degrade independently -- ``SHOW MASTER STATUS`` needs
+        ``REPLICATION CLIENT`` (commonly restricted on RDS/Aurora) while
+        ``@@GLOBAL.gtid_executed`` is a plain global read.
+        """
+        return self.binlog_file is not None and self.binlog_position is not None
 
 
 class CdcOptions(BaseModel):
