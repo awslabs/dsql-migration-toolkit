@@ -8887,3 +8887,146 @@ def test_prerequisite_block_takes_precedence_over_the_vpc_id_hint() -> None:
     body = "\n".join(ui.texts)
     assert "Run the CDC prerequisite checks first" in body
     assert "to enable the deploy" not in body
+
+
+# ---------------------------------------------------------------------------
+# Default table selection: this session's Schema Conversion choice must win
+# ---------------------------------------------------------------------------
+
+
+def _dm_target_inventory(*names: str):
+    from dsql_migrator.core.models import (
+        TargetInventory,
+        TargetObjectKind,
+        TargetRelation,
+        TargetSchemaNode,
+    )
+
+    return TargetInventory(
+        schemas=[
+            TargetSchemaNode(
+                name="source",
+                tables=[
+                    TargetRelation(
+                        schema_name="source", name=n, kind=TargetObjectKind.TABLE
+                    )
+                    for n in names
+                ],
+            )
+        ]
+    )
+
+
+def test_default_selection_prefers_this_sessions_schema_conversion_choice() -> None:
+    """Ticking 3 tables in Step 2 must not arrive in Step 3 with everything ticked.
+
+    Reported from a real session: the picker showed ALL tables checked. The default was
+    "every table that exists on the target", so a target still carrying tables from
+    earlier runs silently re-selected them all and discarded the deliberate Step 2
+    choice -- defaulting to migrating MORE than asked, the wrong direction for a
+    long-running load.
+    """
+    from dsql_migrator.ui.data_migration import default_migration_selection
+
+    target = _dm_target_inventory("orders", "customers")  # both already on target
+    generated = [f"{TABLE_PREFIX}orders"]  # ...but only `orders` was picked here
+
+    assert default_migration_selection(_inventory(), generated, target) == ["orders"]
+
+
+def test_default_selection_falls_back_to_target_tables_when_nothing_generated() -> None:
+    # The reconnect / applied-out-of-band case: with no Step 2 selection in THIS session
+    # the choice is genuinely unknown, and an empty default would leave the user staring
+    # at zero ticked tables. Falling back to the target set keeps that flow working.
+    from dsql_migrator.ui.data_migration import default_migration_selection
+
+    target = _dm_target_inventory("orders", "customers")
+
+    assert default_migration_selection(_inventory(), None, target) == [
+        "orders",
+        "customers",
+    ]
+    assert default_migration_selection(_inventory(), [], target) == [
+        "orders",
+        "customers",
+    ]
+
+
+class _PickerTickUi(_RecordingUi):
+    """Captures the ids passed to tree.tick() plus the rendered caption text."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ticked: list[str] = []
+
+    class _El(_RecordingUi._El):
+        # _RecordingUi._El whitelists methods, so any NiceGUI call it does not list
+        # (bind_value_to, expand, ...) raises AttributeError mid-render. The picker
+        # uses several, and the point of these tests is the ticked set -- not which
+        # chainable calls the double happens to enumerate.
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: self
+
+    def scroll_area(self, *_a, **_k):
+        return self._El()
+
+    def input(self, *_a, **_k):
+        return self._El()
+
+    def tree(self, *_a, **_k):
+        outer = self
+
+        class _Tree(_RecordingUi._El):
+            def tick(self, ids=None):
+                if ids is not None:
+                    outer.ticked = list(ids)
+                return self
+
+            def __getattr__(self, _name):
+                return lambda *_a, **_k: self
+
+        return _Tree()
+
+
+def _render_picker(generated, target):
+    from dsql_migrator.ui.data_migration import (
+        default_migration_selection,
+        migratable_table_names,
+        target_existing_table_names,
+        _render_table_selection,
+    )
+
+    inventory = _inventory()
+    ui = _PickerTickUi()
+    _render_table_selection(
+        ui,
+        inventory,
+        DataMigrationState(),
+        migratable_table_names(inventory, generated, target),
+        target_existing=target_existing_table_names(inventory, target),
+        default_selection=default_migration_selection(inventory, generated, target),
+    )
+    return ui
+
+
+def test_picker_ticks_only_the_schema_conversion_selection() -> None:
+    target = _dm_target_inventory("orders", "customers")
+    ui = _render_picker([f"{TABLE_PREFIX}orders"], target)
+
+    assert ui.ticked == [f"{TABLE_PREFIX}orders"]
+    caption = next(t for t in ui.texts if t.startswith("Pre-selected"))
+    assert "1 of 2" in caption
+    assert "selected in Schema Conversion" in caption
+
+
+def test_picker_caption_says_target_when_that_is_where_the_default_came_from() -> None:
+    # The fallback must NOT claim a Schema Conversion choice the user never made in this
+    # session -- the origin is derived from the sets differing, not from the parameter
+    # merely being supplied.
+    target = _dm_target_inventory("orders", "customers")
+    ui = _render_picker(None, target)
+
+    assert len(ui.ticked) == 2
+    caption = next(t for t in ui.texts if t.startswith("Pre-selected"))
+    assert "already on the target" in caption
+    assert "Schema Conversion" not in caption

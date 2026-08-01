@@ -412,7 +412,9 @@ def build_data_migration_screen(
             generated,
             migration_state.selection,
             touched=migration_state.selection_touched,
-            default=target_existing_table_names(inventory, _target_inventory()),
+            default=default_migration_selection(
+                inventory, conv_state.generated_node_ids, _target_inventory()
+            ),
         )
         if not names:
             migration_state.set_error("Select at least one table to migrate.")
@@ -542,7 +544,9 @@ def build_data_migration_screen(
                 generated,
                 migration_state.selection,
                 touched=migration_state.selection_touched,
-                default=target_existing_table_names(inventory, _target_inventory()),
+                default=default_migration_selection(
+                    inventory, conv_state.generated_node_ids, _target_inventory()
+                ),
             )
             if not names:
                 migration_state.set_error("Select at least one table to check.")
@@ -835,6 +839,12 @@ def build_data_migration_screen(
                     target_existing=target_existing_table_names(
                         inventory, _target_inventory()
                     ),
+                    # Pre-tick this session's Schema Conversion selection (falling back
+                    # to the target-existing set only when nothing was generated here),
+                    # so picking 3 tables in Step 2 does not arrive with 11 ticked.
+                    default_selection=default_migration_selection(
+                        inventory, conv_state.generated_node_ids, _target_inventory()
+                    ),
                     on_refresh=refresh_browser,
                     locked=selection_locked,
                     lock_reason=selection_lock,
@@ -850,7 +860,9 @@ def build_data_migration_screen(
                 migratable,
                 migration_state.selection,
                 touched=migration_state.selection_touched,
-                default=target_existing_table_names(inventory, _target_inventory()),
+                default=default_migration_selection(
+                    inventory, conv_state.generated_node_ids, _target_inventory()
+                ),
             )
             # A Full Load that already ran (live job, or the step reached DONE --
             # both survive a session restore) is proof its prerequisites passed at
@@ -2131,6 +2143,32 @@ def format_selected_workloads(names: Sequence[str]) -> str:
     return f"{count} {noun} selected for Full Load"
 
 
+def default_migration_selection(
+    inventory: SourceInventory,
+    generated_node_ids: Optional[Sequence[str]],
+    target: Optional[TargetInventory],
+) -> list[str]:
+    """Return the tables to pre-tick in the picker before the user touches it.
+
+    **This session's Schema Conversion choice wins when there is one.** Picking three
+    tables in Step 2 and finding all eleven ticked in Step 3 is wrong: the default used
+    to be "every table that exists on the target", so a target carrying tables from
+    earlier runs (or a full E2E reset) silently re-selected them all, and the deliberate
+    Step 2 selection was discarded. Worse, it defaults to migrating MORE than asked --
+    the wrong direction for a destructive-ish, long-running operation.
+
+    Falls back to the target-existing set only when this session generated nothing
+    (``generated_node_ids`` empty/absent) -- the reconnected or
+    schema-applied-out-of-band case, where the Step 2 selection is genuinely unknown and
+    an empty default would leave the user staring at zero ticked tables with no
+    explanation. Intersected with the migratable universe by the caller.
+    """
+    generated = generated_table_names(inventory, generated_node_ids)
+    if generated:
+        return generated
+    return target_existing_table_names(inventory, target)
+
+
 def effective_migration_selection(
     migratable: Sequence[str],
     selection: TableSelection,
@@ -2232,6 +2270,7 @@ def _render_table_selection(
     migratable: Sequence[str],
     *,
     target_existing: Sequence[str] = (),
+    default_selection: Optional[Sequence[str]] = None,
     on_refresh: Optional[Callable[[], object]] = None,
     locked: bool = False,
     lock_reason: Optional[str] = None,
@@ -2244,10 +2283,13 @@ def _render_table_selection(
     DDL was generated this session or already exists on the target (Schema
     Conversion run earlier) -- are listed and tickable; tables with no target
     table are omitted entirely (and a schema with none does not appear).
-    By default only ``target_existing`` (tables whose DDL has actually been
-    created on the target DSQL) are pre-ticked, since only those have a
-    destination table to load into; any other migratable table stays available
-    but unticked. Pre-selected tables can be unticked. The ticked set is
+    ``default_selection`` (from :func:`default_migration_selection`) is the set to
+    pre-tick before the user touches the picker: this session's Schema Conversion
+    choice when there is one, else the tables already on the target. When it is
+    ``None`` the renderer falls back to ``target_existing`` (the pre-existing
+    behaviour, kept so a caller that only knows the target set still works).
+    ``target_existing`` remains the "has a destination table" universe. Pre-selected
+    tables can be unticked. The ticked set is
     persisted to the session selection so Full Load / CDC / prerequisite checks
     run over exactly the chosen tables (Property 16). ``on_refresh``, when given,
     re-introspects this session's source/target so the browser reflects the
@@ -2297,10 +2339,29 @@ def _render_table_selection(
         )
         return
 
-    pre_selected_count = sum(1 for n in migratable if n in set(target_existing))
+    # Describe the ACTUAL pre-tick set, and say where it came from. This used to count
+    # ``target_existing`` and always claim "already on the target", which stopped being
+    # true once the default became this session's Schema Conversion selection -- and was
+    # misleading even before, since it described the default rather than what was ticked.
+    default_set = set(
+        default_selection if default_selection is not None else target_existing
+    )
+    pre_selected = [n for n in migratable if n in default_set]
+    # Name the real origin. ``default_migration_selection`` FALLS BACK to the
+    # target-existing set when this session generated nothing (a reconnect / schema
+    # applied out of band), so "came from Schema Conversion" cannot be inferred from
+    # the parameter merely being present -- it has to differ from the target set.
+    # Claiming otherwise told a reconnected user their 11 ticked tables were a Step 2
+    # choice they never made in this session.
+    origin = (
+        "selected in Schema Conversion"
+        if default_selection is not None
+        and set(default_selection) != set(target_existing)
+        else "already on the target"
+    )
     ui.label(
-        f"Pre-selected: {pre_selected_count} table(s) already on the target — "
-        "untick any to skip."
+        f"Pre-selected: {len(pre_selected)} of {len(migratable)} table(s) "
+        f"{origin} — tick or untick to change."
     ).classes("text-xs text-gray-400")
 
     migratable_order = list(migratable)
@@ -2319,7 +2380,7 @@ def _render_table_selection(
             migratable_order,
             migration_state.selection,
             touched=migration_state.selection_touched,
-            default=list(target_existing),
+            default=list(default_set),
         )
     # Object-browser tree (schema -> Tables -> leaf, leaf checkboxes), styled to
     # match the app's AWS/Cloudscape look: a live name filter + selection counter

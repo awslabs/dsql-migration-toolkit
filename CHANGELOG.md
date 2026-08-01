@@ -5,6 +5,30 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.198
+
+### Fixed
+
+- **"Tables to migrate" pre-ticked every table instead of the ones chosen in Schema
+  Conversion.** The default was "every table that already exists on the target", so a
+  target still carrying tables from earlier runs silently re-selected all of them and
+  discarded the deliberate Step 2 selection — reported from a real session as picking 3
+  tables and finding 11 ticked. It also defaulted to migrating *more* than asked, the
+  wrong direction for a long-running load.
+
+  The pre-tick set is now this session's Schema Conversion selection when there is one,
+  falling back to the target-existing set only when nothing was generated in this session
+  (a reconnect, or the schema applied out of band) — where the Step 2 choice is genuinely
+  unknown and an empty default would leave the picker with nothing ticked and no
+  explanation. All four call sites share one `default_migration_selection()` helper so
+  they cannot drift.
+- **The picker's caption described the default rather than what was ticked.** It always
+  read "Pre-selected: N table(s) already on the target", which stopped being true once
+  the default followed Schema Conversion. It now reports the actual pre-ticked count out
+  of the total and names where the set came from ("selected in Schema Conversion" vs
+  "already on the target"), derived from the sets differing — so a reconnected user is
+  never told their tables were a Step 2 choice they did not make in this session.
+
 ## v0.1.197
 
 ### Fixed
