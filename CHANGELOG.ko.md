@@ -5,6 +5,32 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.220
+
+### 수정
+
+- **Validation이 마이그레이션에서 이미 드롭한 행을 설명되지 않은 실패로 보고하며, 같은 화면에서 스스로
+  모순되던 문제.** 한 테이블이 격리된 행 수만큼 정확히 부족한 상황에서 패널은 **Not ready for cut-over —
+  "1 of 8 table(s) did not pass. Review the failing checks"**와 그 행들을 세는 빨간 **Failed** 검사
+  2개를 표시했습니다 — 바로 아래 테이블별 항목은 *"Fully explained: 3 rows were permanently dropped …
+  this deficit is expected, not new data loss."*라고 적혀 있었는데도요. 검토자는 이미 발견되고 보고되고
+  Full Load 단계에서 명시적으로 수락된 결함을 조사하도록 내몰렸습니다.
+
+  테이블별 모델은 이미 이를 알고 있었지만(`deficit_explained_by_quarantine`) 집계하는 곳이 없어 요약과
+  준비 상태 검사가 그것을 보지 못했습니다. 이제 봅니다:
+
+  - **판정**이 실제로 남은 것을 말합니다 — *"Cut-over blocked only by rows dropped during the
+    migration … Nothing unexplained"* — 그리고 실제 선택지 두 개를 제시합니다: 소스 값을 고쳐 재적재,
+    또는 갭을 의도적으로 수락.
+  - **준비 상태 검사**가 원인을 문구에 담고 **Failed**에서 **Heads-up**으로 내려갑니다.
+
+  의도적으로 **통과로 보고하지 않습니다**: 그 행들은 실제로 대상에 없으므로, cut-over는 툴이 통과시켜 줄
+  것이 아니라 운영자가 내려야 할 결정으로 남습니다.
+
+  완화는 부족분이 **전부** 설명될 때만 적용됩니다. 1행을 드롭했는데 3행이 부족한 테이블은 강한 실패로
+  유지되고, 설명된 테이블 하나가 진짜 불일치 테이블과 함께 있는 실행도 빨갛게 남습니다 — 알려진 손실 뒤에
+  실제 손실을 숨기는 것은 이 귀속 로직이 절대 만들어서는 안 되는 결과입니다.
+
 ## v0.1.219
 
 ### 수정

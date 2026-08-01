@@ -394,6 +394,24 @@ class ValidationSummary:
     # Names of the tables that did NOT pass (mismatch or error), in report order,
     # so the UI can list/jump to exactly the tables needing attention.
     failed_tables: tuple[str, ...] = ()
+    # Tables whose ENTIRE shortfall is rows the migration is known to have dropped
+    # (quarantined), i.e. deficit == rows_quarantined exactly. Already-explained
+    # findings, not new data loss -- so the readiness panel can say so instead of
+    # reporting them as unexplained mismatches beside a per-table blurb that says the
+    # opposite. A table with any unaccounted-for shortfall is deliberately NOT here.
+    quarantine_explained_tables: tuple[str, ...] = ()
+    # Rows dropped across those tables (the size of the explained shortfall).
+    quarantine_explained_rows: int = 0
+
+    @property
+    def unexplained_mismatched_tables(self) -> int:
+        """Mismatched tables whose shortfall is NOT fully explained by dropped rows.
+
+        This is the number a reviewer must actually investigate. ``mismatched_tables``
+        counts every non-matching table, so on a run whose only finding is a known
+        quarantine it reported work that does not exist.
+        """
+        return max(0, self.mismatched_tables - len(self.quarantine_explained_tables))
 
 
 def summarize_validation(report: ValidationReport) -> ValidationSummary:
@@ -407,6 +425,18 @@ def summarize_validation(report: ValidationReport) -> ValidationSummary:
     errored = [item for item in report.items if item.error is not None]
     missing = sum(item.reconcile.missing_on_target for item in reconciled)  # type: ignore[union-attr]
     extra = sum(item.reconcile.extra_on_target for item in reconciled)  # type: ignore[union-attr]
+    # Tables whose whole shortfall is rows the migration already reported as dropped.
+    # ``deficit_explained_by_quarantine`` requires an EXACT match (deficit ==
+    # rows_quarantined), so a table 4 rows short having dropped 1 stays unexplained --
+    # that strictness is what keeps a real loss from hiding behind a known one.
+    quarantine_explained = tuple(
+        item.table for item in report.items if item.deficit_explained_by_quarantine
+    )
+    quarantine_rows = sum(
+        item.rows_quarantined
+        for item in report.items
+        if item.deficit_explained_by_quarantine
+    )
     return ValidationSummary(
         total_tables=len(report.items),
         matched_tables=matched,
@@ -426,6 +456,8 @@ def summarize_validation(report: ValidationReport) -> ValidationSummary:
         # the report can phrase it as a go/no-go for cut-over.
         ready_for_cutover=report.is_match,
         failed_tables=failed_table_names(report),
+        quarantine_explained_tables=quarantine_explained,
+        quarantine_explained_rows=quarantine_rows,
     )
 
 
@@ -2877,6 +2909,33 @@ def _render_verdict(
         _elapsed_caption()
         return
 
+    # When EVERY non-matching table is short by exactly the rows the migration already
+    # reported dropping, "N of M did not pass — review the failing checks" sends the
+    # reviewer hunting for a defect that was already found, reported and (in the Full Load
+    # step) explicitly accepted. Say what is actually outstanding instead. Still not a
+    # "Ready" verdict: rows really are absent from the target, so this stays a hold that
+    # asks for a decision rather than an investigation.
+    explained_tables = summary.quarantine_explained_tables
+    if explained_tables and summary.unexplained_mismatched_tables == 0:
+        rows = summary.quarantine_explained_rows
+        noun = "table" if len(explained_tables) == 1 else "tables"
+        row_noun = "row" if rows == 1 else "rows"
+        render_notice(
+            ui,
+            tone="warning",
+            header="Cut-over blocked only by rows dropped during the migration",
+            body=(
+                f"Nothing unexplained: every difference is in {len(explained_tables)} "
+                f"{noun} ({', '.join(explained_tables)}) and is exactly the {rows} "
+                f"{row_noun} the migration could not store — already reported, not new "
+                "data loss. Either fix the source value(s) and reload those tables to "
+                "reach a full match, or accept the gap deliberately and cut over knowing "
+                f"those {row_noun} will be absent from the target."
+            ),
+        )
+        _elapsed_caption()
+        return
+
     render_notice(
         ui,
         tone="error",
@@ -2885,6 +2944,12 @@ def _render_verdict(
             f"{summary.mismatched_tables} of {summary.total_tables} table(s) "
             "did not pass. Review the failing checks and tables below before "
             "switching over."
+            + (
+                f" ({len(explained_tables)} of those is short by exactly the rows "
+                "dropped during the migration — already reported.)"
+                if explained_tables
+                else ""
+            )
         ),
     )
     _elapsed_caption()
@@ -3138,6 +3203,29 @@ def _render_readiness_checks(
     3. No table errors -- every table could be compared.
     4. No source drift -- the source has not advanced since the snapshot.
     """
+    # Rows the migration is KNOWN to have dropped are not an unexplained difference, and
+    # the readiness panel used to report them as one: two red "Failed" rows counting the
+    # very rows the per-table entry beside them called "expected, not new data loss". That
+    # is the one place a reviewer looks for "is anything unaccounted for?", so a
+    # self-contradicting answer is worse than a blunt one. Name the cause in the detail
+    # and, when the difference is ENTIRELY explained, drop the alarm to a warning -- never
+    # to a pass: rows really are missing on the target, the operator accepted that, and
+    # cut-over readiness must keep saying so.
+    explained_tables = summary.quarantine_explained_tables
+    explained_rows = summary.quarantine_explained_rows
+    fully_explained = bool(explained_tables) and summary.unexplained_mismatched_tables == 0
+    if explained_tables:
+        noun = "table" if len(explained_tables) == 1 else "tables"
+        row_noun = "row" if explained_rows == 1 else "rows"
+        explained_note = (
+            f" The difference in {len(explained_tables)} {noun} "
+            f"({', '.join(explained_tables)}) is exactly the {explained_rows} "
+            f"{row_noun} dropped during the migration — already reported, not new "
+            "data loss."
+        )
+    else:
+        explained_note = ""
+
     # Check 1: data identical.
     _render_check_row(
         ui,
@@ -3151,7 +3239,9 @@ def _render_readiness_checks(
                 else ""
             )
             + f" (mode: {summary.mode})."
+            + explained_note
         ),
+        warn_on_fail=fully_explained,
     )
 
     # Check 2: no mismatched records (only meaningful when reconciliation ran).
@@ -3164,7 +3254,9 @@ def _render_readiness_checks(
                 f"{summary.reconciled_tables} table(s) reconciled; "
                 f"{summary.missing_on_target:,} record(s) missing on target, "
                 f"{summary.extra_on_target:,} extra on target."
+                + explained_note
             ),
+            warn_on_fail=fully_explained,
         )
     else:
         _render_check_row(

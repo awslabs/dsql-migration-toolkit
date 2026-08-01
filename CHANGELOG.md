@@ -5,6 +5,36 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.220
+
+### Fixed
+
+- **Validation reported rows the migration had already dropped as unexplained failures,
+  contradicting itself on the same screen.** With one table short by exactly its quarantined
+  rows, the panel showed **Not ready for cut-over — "1 of 8 table(s) did not pass. Review
+  the failing checks"** plus two red **Failed** checks counting those rows — directly above
+  a per-table entry that read *"Fully explained: 3 rows were permanently dropped … this
+  deficit is expected, not new data loss."* The reviewer was sent to investigate a defect
+  that had already been found, reported, and explicitly accepted in the Full Load step.
+
+  The per-table model already knew this (`deficit_explained_by_quarantine`), but nothing
+  aggregated it, so the summary and the readiness checks never saw it. They do now:
+
+  - **The verdict** states what is actually outstanding — *"Cut-over blocked only by rows
+    dropped during the migration … Nothing unexplained"* — and offers the two real choices:
+    fix the source value(s) and reload, or accept the gap deliberately.
+  - **The readiness checks** name the cause inline and drop from **Failed** to
+    **Heads-up**.
+
+  It is deliberately *not* reported as passing: those rows really are absent from the
+  target, so cut-over stays a decision the operator must make rather than something the
+  tool waves through.
+
+  The softening requires the shortfall to be **entirely** accounted for. A table that
+  dropped 1 row but is 3 short stays a hard failure, and a run with one explained table
+  beside a genuinely mismatched one stays red — hiding a real loss behind a known one is
+  the one outcome this attribution must never produce.
+
 ## v0.1.219
 
 ### Fixed

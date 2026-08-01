@@ -3288,3 +3288,212 @@ def test_quarantined_rows_by_table_reads_the_job_chunks() -> None:
 
     assert quarantined_rows_by_table(job) == {"ecommerce.product_media": 1}
     assert quarantined_rows_by_table(None) == {}
+
+
+# ---------------------------------------------------------------------------
+# Quarantined rows must not read as an unexplained validation failure
+# ---------------------------------------------------------------------------
+
+
+def _quarantine_report(*, dropped: int, missing: int, source=15, target=12):
+    from dsql_migrator.core.models import (
+        ReconcileResult,
+        TableValidationResult,
+        ValidationMode,
+        ValidationReport,
+    )
+
+    def _table(name, src, tgt, q=0, miss=0):
+        return TableValidationResult(
+            table=name,
+            source_row_count=src,
+            target_row_count=tgt,
+            row_count_match=(src == tgt),
+            checksum_match=(src == tgt),
+            matched=(src == tgt),
+            rows_quarantined=q,
+            reconcile=ReconcileResult(
+                pk_column="id",
+                source_count=src,
+                target_count=tgt,
+                missing_on_target=miss,
+                extra_on_target=0,
+                consistent=(miss == 0),
+            ),
+        )
+
+    items = [_table(f"ecommerce.ok{i}", 100, 100) for i in range(7)]
+    items.append(
+        _table("ecommerce.product_media", source, target, q=dropped, miss=missing)
+    )
+    return ValidationReport(
+        items=items, mode=ValidationMode.CHECKSUM, snapshot_timestamp=None
+    )
+
+
+def _drift_na():
+    from dsql_migrator.ui.validation import DriftDisplay
+
+    return DriftDisplay(
+        available=False,
+        determinable=False,
+        drifted=False,
+        summary="No watermark available.",
+        watermark_gtid=None,
+        current_gtid=None,
+        detail="",
+    )
+
+
+def test_summary_separates_quarantine_explained_tables_from_real_mismatches() -> None:
+    """The summary must know which differences are already accounted for.
+
+    ``deficit_explained_by_quarantine`` existed on the per-table model but nothing
+    aggregated it, so the readiness panel counted rows the migration had already reported
+    dropping as unexplained mismatches -- directly contradicting the per-table entry
+    beside them ("expected, not new data loss").
+    """
+    from dsql_migrator.ui.validation import summarize_validation
+
+    explained = summarize_validation(_quarantine_report(dropped=3, missing=3))
+    assert explained.mismatched_tables == 1
+    assert explained.quarantine_explained_tables == ("ecommerce.product_media",)
+    assert explained.quarantine_explained_rows == 3
+    assert explained.unexplained_mismatched_tables == 0
+    # Rows ARE absent from the target, so this is never "ready".
+    assert explained.ready_for_cutover is False
+
+    # Dropped 1 but 3 short -> 2 rows unaccounted for. That must stay unexplained: it is
+    # exactly how a real loss would hide behind a known one.
+    partial = summarize_validation(_quarantine_report(dropped=1, missing=3))
+    assert partial.quarantine_explained_tables == ()
+    assert partial.unexplained_mismatched_tables == 1
+
+
+def test_readiness_checks_name_the_cause_and_soften_only_when_fully_explained() -> None:
+    from dsql_migrator.ui.validation import (
+        _render_readiness_checks,
+        summarize_validation,
+    )
+
+    ui = _CopyUi()
+    _render_readiness_checks(
+        ui, summarize_validation(_quarantine_report(dropped=3, missing=3)), _drift_na()
+    )
+    body = ui.body()
+    # The cause is stated on the checks themselves, where the reviewer reads the verdict.
+    assert "dropped during the migration" in body
+    assert "already reported, not new data loss" in body
+    assert "ecommerce.product_media" in body
+    # Softened to a heads-up -- but NOT passed: rows really are missing on the target.
+    assert "Heads-up" in body
+    assert "Failed" not in body
+
+    # A partially-explained shortfall keeps the hard failure.
+    partial = _CopyUi()
+    _render_readiness_checks(
+        partial,
+        summarize_validation(_quarantine_report(dropped=1, missing=3)),
+        _drift_na(),
+    )
+    partial_body = partial.body()
+    assert "Failed" in partial_body
+    assert "already reported, not new data loss" not in partial_body
+
+
+def test_one_explained_table_does_not_soften_a_run_with_a_real_mismatch() -> None:
+    """The mixed case: one table explained, ANOTHER genuinely wrong.
+
+    Softening on "any explained table exists" would hide a real failure behind a known
+    one -- the single most costly mistake this whole attribution could make. The checks
+    must stay red, while still crediting the part that is accounted for so the reviewer
+    knows which table to investigate.
+    """
+    from dsql_migrator.core.models import (
+        ReconcileResult,
+        TableValidationResult,
+        ValidationMode,
+        ValidationReport,
+    )
+    from dsql_migrator.ui.validation import (
+        _render_readiness_checks,
+        _render_verdict,
+        summarize_validation,
+    )
+
+    def _table(name, src, tgt, q=0, miss=0):
+        return TableValidationResult(
+            table=name,
+            source_row_count=src,
+            target_row_count=tgt,
+            row_count_match=(src == tgt),
+            checksum_match=(src == tgt),
+            matched=(src == tgt),
+            rows_quarantined=q,
+            reconcile=ReconcileResult(
+                pk_column="id",
+                source_count=src,
+                target_count=tgt,
+                missing_on_target=miss,
+                extra_on_target=0,
+                consistent=(miss == 0),
+            ),
+        )
+
+    report = ValidationReport(
+        items=[
+            _table("ecommerce.ok", 100, 100),
+            # Fully explained by dropped rows.
+            _table("ecommerce.product_media", 15, 12, q=3, miss=3),
+            # NOT explained: nothing was dropped here, rows are simply absent.
+            _table("ecommerce.orders", 500, 495, q=0, miss=5),
+        ],
+        mode=ValidationMode.CHECKSUM,
+        snapshot_timestamp=None,
+    )
+    summary = summarize_validation(report)
+    assert summary.quarantine_explained_tables == ("ecommerce.product_media",)
+    assert summary.unexplained_mismatched_tables == 1
+
+    checks = _CopyUi()
+    _render_readiness_checks(checks, summary, _drift_na())
+    checks_body = checks.body()
+    assert "Failed" in checks_body, "a real mismatch must not be softened"
+    # The explained part is still credited, so the reviewer looks at the right table.
+    assert "ecommerce.product_media" in checks_body
+
+    verdict = _CopyUi()
+    _render_verdict(verdict, summary, _drift_na())
+    verdict_body = verdict.body()
+    assert "Not ready for cut-over" in verdict_body
+    assert "Nothing unexplained" not in verdict_body
+    # It points out the known part rather than leaving all of it to be re-investigated.
+    assert "already reported" in verdict_body
+
+
+def test_verdict_says_what_is_outstanding_instead_of_review_the_failures() -> None:
+    """"1 of 8 did not pass — review the failing checks" sent the reviewer hunting for a
+    defect that was already found, reported, and accepted in the Full Load step."""
+    from dsql_migrator.ui.validation import _render_verdict, summarize_validation
+
+    ui = _CopyUi()
+    _render_verdict(
+        ui, summarize_validation(_quarantine_report(dropped=3, missing=3)), _drift_na()
+    )
+    body = ui.body()
+    assert "Not ready for cut-over" not in body
+    assert "Nothing unexplained" in body
+    assert "3 rows the migration could not store" in body
+    # Both real options are offered: close the gap, or accept it knowingly.
+    assert "reload those tables" in body
+    assert "accept the gap" in body
+
+    # Partially explained -> still the blunt hold, but it points out the known part so the
+    # reviewer is not re-investigating it.
+    partial = _CopyUi()
+    _render_verdict(
+        partial,
+        summarize_validation(_quarantine_report(dropped=1, missing=3)),
+        _drift_na(),
+    )
+    assert "Not ready for cut-over" in partial.body()
