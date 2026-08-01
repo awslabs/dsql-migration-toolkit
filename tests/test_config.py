@@ -325,6 +325,7 @@ def test_tunable_knobs_bounds_match_appconfig_fields() -> None:
         "full_load_batch_parallelism": (1, 32),
         "full_load_batch_rows": (1, 3000),
         "validate_max_workers": (1, 32),
+        "cdc_sink_mcu_count": (1, 8),
     }
     got = {k.field: (k.minimum, k.maximum) for k in TUNABLE_KNOBS}
     assert got == expected
@@ -351,6 +352,106 @@ def test_tunable_knob_label_is_derived_from_group_and_short_label() -> None:
     assert len(set(groups)) < len(groups)  # at least one group has >1 knob
 
 
+def test_cdc_knob_declares_its_own_apply_timing_not_the_full_load_one() -> None:
+    """A CDC knob must NOT claim it applies to "the next run".
+
+    Full Load / Validation knobs are re-read by ``load_config()`` on every run, so a
+    change lands on the next run all by itself. A CDC knob is a cdc-stack
+    CloudFormation PARAMETER: nothing re-reads it, and a sink connector that is
+    already RUNNING keeps its capacity until Start CDC updates the connector. Telling
+    the operator "the next run" would promise an effect that never arrives.
+    """
+    from dsql_migrator.config import group_applies
+
+    by_field = {k.field: k for k in TUNABLE_KNOBS}
+    cdc = by_field["cdc_sink_mcu_count"]
+    assert cdc.group == "CDC"
+    assert "Start CDC" in cdc.applies
+    assert cdc.applies != by_field["full_load_batch_rows"].applies
+    # Per-group timing is what the UI renders, and it must agree with the knobs.
+    assert group_applies("CDC") == cdc.applies
+    assert group_applies("Full Load") == by_field["full_load_batch_rows"].applies
+
+
+def test_group_applies_rejects_unknown_and_mixed_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-section timing must be a real, UNAMBIGUOUS fact.
+
+    If a group ever mixed timings, showing one arbitrary member's value as the
+    section header would silently mislabel the others -- so that is an error, not a
+    coin flip.
+    """
+    from dsql_migrator import config as cfg
+
+    with pytest.raises(cfg.TuningValueError):
+        cfg.group_applies("No Such Group")
+
+    mixed = cfg.TUNABLE_KNOBS + (
+        cfg.TunableKnob(
+            "validate_max_workers",
+            "VALIDATE_MAX_WORKERS",
+            "CDC",  # same group as the sink MCU knob...
+            "Bogus",
+            "...but a different apply timing.",
+            applies="never",
+        ),
+    )
+    monkeypatch.setattr(cfg, "TUNABLE_KNOBS", mixed)
+    with pytest.raises(cfg.TuningValueError):
+        cfg.group_applies("CDC")
+
+
+def test_tunable_groups_keeps_each_group_whole_and_in_order() -> None:
+    """Grouping is a property of the registry, not of the render loop.
+
+    The UI used to emit a header whenever the group CHANGED while walking the tuple,
+    which silently split a group across two headers if its knobs were not contiguous.
+    Grouping here makes that impossible.
+    """
+    from dsql_migrator.config import tunable_groups
+
+    groups = tunable_groups()
+    names = [name for name, _ in groups]
+    assert names == list(dict.fromkeys(k.group for k in TUNABLE_KNOBS))
+    assert len(set(names)) == len(names)  # each group appears exactly once
+    # Every knob is present exactly once, and under its own group.
+    flat = [k for _, knobs in groups for k in knobs]
+    assert len(flat) == len(TUNABLE_KNOBS)
+    for name, knobs in groups:
+        assert knobs and all(k.group == name for k in knobs)
+
+
+def test_set_tuning_value_rejects_a_value_off_the_allowed_enum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """3 MCU is inside 1..8 but is NOT a CloudFormation AllowedValue.
+
+    The cdc-stack declares ``SinkMcuCount`` with ``AllowedValues: [1, 2, 4, 8]``. A
+    range-only check would store 3, and the operator would only find out when the
+    cdc-stack update failed -- minutes into a billable Start CDC. So it must be
+    rejected here, and must not touch the environment.
+    """
+    key = f"{ENV_PREFIX}CDC_SINK_MCU_COUNT"
+    # setenv, NOT delenv: monkeypatch only records an undo for a key that EXISTS, so
+    # delenv on an unset key records nothing and this test's set_tuning_value writes
+    # would leak into every later test in the session (they did -- a leaked 8 broke the
+    # Settings-form render test). Seeding the key first gives monkeypatch something to
+    # restore, and it deletes the key at teardown.
+    monkeypatch.setenv(key, "4")
+    for bad in (3, 5, 6, 7):
+        with pytest.raises(TuningValueError):
+            set_tuning_value("cdc_sink_mcu_count", bad)
+        # The rejected value must not be written -- the previous one stands.
+        assert os.environ[key] == "4"
+    # Out-of-range is still rejected, and every allowed value is accepted.
+    with pytest.raises(TuningValueError):
+        set_tuning_value("cdc_sink_mcu_count", 16)
+    for good in (1, 2, 4, 8):
+        assert set_tuning_value("cdc_sink_mcu_count", good) == good
+        assert load_config().cdc_sink_mcu_count == good
+
+
 def test_current_tuning_values_reflect_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     for k in TUNABLE_KNOBS:
         monkeypatch.delenv(k.env_key, raising=False)
@@ -359,6 +460,7 @@ def test_current_tuning_values_reflect_defaults(monkeypatch: pytest.MonkeyPatch)
         "full_load_batch_parallelism": 8,
         "full_load_batch_rows": 2000,
         "validate_max_workers": 4,
+        "cdc_sink_mcu_count": 4,
     }
 
 

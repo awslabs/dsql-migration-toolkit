@@ -467,6 +467,15 @@ CDC_SINK_SUFFIX = "-dsql-sink"
 #     the parallelism, so 1 partition each suffices.
 CDC_MAX_SINK_PARALLELISM = 8  # effective sink-task ceiling before DSQL contention
 CDC_DEFAULT_MCU_COUNT = 2  # MSK Connect MCUs per worker (cost-conscious default)
+# Sink MCUs, sized SEPARATELY from the source (CDC_DEFAULT_MCU_COUNT above). The sink
+# is the CPU-bound half -- once the per-row round-trips were removed it ran ~80% CPU /
+# ~21,000 rows/s at 4 MCU -- while the single-task Debezium source has spare CPU. This
+# must stay equal to the cdc-stack template's ``SinkMcuCount`` default: for a stack
+# deployed before the tool began passing the parameter, CloudFormation reports the
+# template default, and any other value here would read as a config change and bounce
+# both RUNNING connectors on the next Start CDC. Unlike the source's, this one IS
+# operator-tunable (config.cdc_sink_mcu_count / Settings -> Performance -> CDC).
+CDC_DEFAULT_SINK_MCU_COUNT = 4
 # Env overrides (read fresh, DSQL_MIGRATOR_ prefix). Empty/invalid -> smart default.
 CDC_ENV_SINK_TASKS_MAX = "DSQL_MIGRATOR_CDC_SINK_TASKS_MAX"
 CDC_ENV_MCU_COUNT = "DSQL_MIGRATOR_CDC_MCU_COUNT"
@@ -1191,6 +1200,7 @@ def build_cdc_stack_params(
     stack_name: str = CDC_DEFAULT_STACK_NAME,
     topic_prefix: str = CDC_DEFAULT_TOPIC_PREFIX,
     deploy_sink: bool = True,
+    sink_mcu_count: int = CDC_DEFAULT_SINK_MCU_COUNT,
 ) -> CdcStackParams:
     """Map tool-built source/sink configs + known values to a deployable param set.
 
@@ -1204,6 +1214,15 @@ def build_cdc_stack_params(
     parameter: the cdc-stack seeds it via the ``connect-offsets`` topic, not a
     connector config key, so the UI surfaces it as a separate "offset seeding"
     note rather than a CFN parameter.
+
+    ``sink_mcu_count`` is the sink connector's MSK Connect compute. It belongs on
+    THIS (Start CDC) path, not only the infra create, because the sink connector is
+    created here -- the stack's ``DsqlSinkConnector`` is gated on
+    ``DeploySink=true`` -- and ``AWS::KafkaConnect::Connector.Capacity`` updates
+    with "No interruption", so an operator can also RESIZE a deployed sink by
+    changing this and running Start CDC again. Must be one of 1 / 2 / 4 / 8 (the
+    template's ``AllowedValues``); the caller validates (see
+    ``config.set_tuning_value``).
     """
     sink_topics = ",".join(f"{topic_prefix}.{t}" for t in sink_config.topics)
     filled: list[tuple[str, str]] = [
@@ -1224,6 +1243,11 @@ def build_cdc_stack_params(
         # the gapless path (offset seeded; recovery rebuilds schema-history from
         # the live source — it does not need the topic pre-populated).
         ("SnapshotMode", source_config.snapshot_mode),
+        # Sink connector compute. Set on this path (not just infra create) because
+        # the sink connector itself is created by Start CDC, and Capacity is an
+        # in-place ("No interruption") connector update -- so re-running Start CDC
+        # with a new value resizes a deployed sink instead of forcing a redeploy.
+        ("SinkMcuCount", str(sink_mcu_count)),
         # Whether to create the sink connector. The cdc-stack deploys the source
         # first (DeploySink=false) on a fresh stack so the data topic exists before
         # the sink subscribes; an update (the tool's deploy path) sets true since
@@ -1370,6 +1394,10 @@ def build_cdc_infra_params(
     # even load falls back to the uniform partition default. Set at create because
     # partition counts are fixed for the life of the topic.
     row_counts_by_table: Optional[Mapping[str, int]] = None,
+    # Sink connector MSK Connect compute (operator-tunable; 1/2/4/8). Carried on the
+    # create path too so a fresh stack records the operator's value from the start,
+    # rather than only picking it up at the first Start CDC.
+    sink_mcu_count: int = CDC_DEFAULT_SINK_MCU_COUNT,
 ) -> CdcInfraParams:
     """Build the full cdc-stack parameter set for a first-time ``create_stack``.
 
@@ -1450,6 +1478,8 @@ def build_cdc_infra_params(
         # (TopicCreationGroups / TopicGroupInclude2 / TopicGroupInclude4).
         *scaling_params,
         ("ConnectorMcuCount", str(scaling.mcu_count)),
+        # Sink compute: operator-tunable, unlike the source's inferred value above.
+        ("SinkMcuCount", str(sink_mcu_count)),
         # No connectors on the first deploy -- Start CDC sets these two later.
         ("MskBootstrapServers", ""),
         ("DeploySink", "false"),
@@ -1517,6 +1547,7 @@ __all__ = [
     "CDC_PARTITION_TIERS",
     "CDC_MAX_SINK_PARALLELISM",
     "CDC_DEFAULT_MCU_COUNT",
+    "CDC_DEFAULT_SINK_MCU_COUNT",
     "CDC_ENV_SINK_TASKS_MAX",
     "CDC_ENV_MCU_COUNT",
     "CDC_ENV_TOPIC_PARTITIONS",

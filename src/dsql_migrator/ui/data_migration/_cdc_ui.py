@@ -474,6 +474,9 @@ def _render_cdc_source_config_card(
         target_username=getattr(target, "username", "admin") if target else "admin",
         stack_name=getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME),
         topic_prefix=CDC_DEFAULT_TOPIC_PREFIX,
+        # Same value the deploy would send, so this preview cannot show a
+        # SinkMcuCount the actual Start CDC then contradicts.
+        sink_mcu_count=_sink_mcu_count(),
     )
 
     # SECONDARY (collapsed): connector configuration to hand to the cdc-stack.
@@ -2544,6 +2547,26 @@ def _open_cdc_delete_dialog(ui, migration_state, on_confirm, *, session=None) ->
             ui.button("Cancel", on_click=dialog.close).props("flat")  # type: ignore[attr-defined]
     dialog.open()
 
+def _sink_mcu_count() -> int:
+    """The operator's configured sink MCU count, read FRESH at deploy time.
+
+    Read here rather than captured at import/render so a change made in Settings ->
+    Performance -> CDC is picked up by the very next Start CDC without a restart
+    (``load_config`` re-reads the environment, which is where ``set_tuning_value``
+    writes). Falls back to the template-matching default if the config cannot be
+    read, so a config problem can never block a deploy or silently resize a
+    connector.
+    """
+    from dsql_migrator.core.cdc import CDC_DEFAULT_SINK_MCU_COUNT
+
+    try:
+        from dsql_migrator.config import load_config
+
+        return int(load_config().cdc_sink_mcu_count)
+    except Exception:  # noqa: BLE001 - never block a deploy on a config read
+        return CDC_DEFAULT_SINK_MCU_COUNT
+
+
 def _cdc_target_region(ui, session):
     """Return (target_config, region) or notify + return (None, None) if missing."""
     target = getattr(session, "target_config", None)
@@ -2632,6 +2655,7 @@ def _start_cdc_deploy(
         target_username=getattr(target, "username", "admin") if target else "admin",
         stack_name=migration_state.cdc_stack_name,
         topic_prefix=CDC_DEFAULT_TOPIC_PREFIX,
+        sink_mcu_count=_sink_mcu_count(),
     )
     deployer = build_cdc_stack_deployer(
         region,
@@ -3003,6 +3027,7 @@ async def _start_cdc_infra_deploy(
         stack_name=migration_state.cdc_stack_name,
         topic_prefix=CDC_DEFAULT_TOPIC_PREFIX,
         row_counts_by_table=row_counts_by_table,
+        sink_mcu_count=_sink_mcu_count(),
     )
     deployer = build_cdc_stack_deployer(
         region,

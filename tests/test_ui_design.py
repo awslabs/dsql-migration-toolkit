@@ -649,3 +649,140 @@ def test_settings_modal_panels_are_bounded_but_not_padded() -> None:
     # Persistent + an explicit close, so an outside click cannot lose a half-typed value.
     assert '.props("persistent")' in src
     assert 'icon="close"' in src
+
+
+def test_settings_performance_form_sections_state_their_own_apply_timing() -> None:
+    """Each group's timing must come from the registry, per section.
+
+    The form holds two kinds of knob: Full Load / Validation values are re-read by
+    ``load_config()`` on the next run, while the CDC value is a cdc-stack
+    CloudFormation parameter read at the next Start CDC. One blanket "applies to the
+    next run" caption would be a false promise for the CDC section -- nothing re-reads
+    it, and a sink already RUNNING keeps its capacity until the connector is updated.
+    So the renderer must call ``group_applies`` per group rather than hard-coding a
+    phrase, and the notification must repeat the knob's OWN timing.
+    """
+    import inspect
+
+    from dsql_migrator.ui import app
+
+    src = inspect.getsource(app._render_performance_tuning_controls)
+    # Sections come from the registry's grouping, with the per-group timing rendered.
+    assert "tunable_groups()" in src
+    assert "group_applies(group)" in src
+    # The confirmation names the knob's own timing, not a hard-coded "next run".
+    assert "{k.applies}" in src
+    assert "applies to the next run)" not in src
+    # An enum-valued knob renders as a select (only legal values), not a spinner.
+    assert "if knob.allowed" in src
+    assert "ui.select(" in src and "ui.number(" in src
+
+
+def test_settings_performance_form_renders_a_cdc_section_with_the_mcu_select() -> None:
+    """End-to-end through the real renderer with a NiceGUI double.
+
+    Asserting on the registry alone would not catch a renderer that ignores a group,
+    which is exactly how a "state exists but is never rendered" gap hides.
+    """
+    from dsql_migrator.config import TUNABLE_KNOBS
+    from dsql_migrator.ui import app
+
+    class _El:
+        def __init__(self, ui):
+            self._ui = ui
+
+        def classes(self, *_a, **_k):
+            return self
+
+        def props(self, *_a, **_k):
+            return self
+
+        def style(self, *_a, **_k):
+            return self
+
+        def tooltip(self, text="", *_a, **_k):
+            self._ui.tooltips.append(str(text))
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    class _Ui:
+        def __init__(self):
+            self.texts: list[str] = []
+            self.tooltips: list[str] = []
+            self.selects: list[tuple] = []
+            self.numbers: list[dict] = []
+
+        def label(self, text="", *_a, **_k):
+            self.texts.append(str(text))
+            return _El(self)
+
+        def select(self, options, value=None, **_k):
+            self.selects.append((tuple(options), value))
+            return _El(self)
+
+        def number(self, **kw):
+            self.numbers.append(kw)
+            return _El(self)
+
+        def icon(self, *_a, **_k):
+            return _El(self)
+
+        def row(self, *_a, **_k):
+            return _El(self)
+
+        def column(self, *_a, **_k):
+            return _El(self)
+
+        def spinner(self, *_a, **_k):
+            return _El(self)
+
+        def badge(self, *_a, **_k):
+            return _El(self)
+
+        def notify(self, *_a, **_k):
+            return None
+
+    ui = _Ui()
+    import os
+    import sys
+    import types
+
+    from dsql_migrator.config import ENV_PREFIX
+
+    fake = types.ModuleType("nicegui")
+    fake.ui = ui  # type: ignore[attr-defined]
+    saved = sys.modules.get("nicegui")
+    sys.modules["nicegui"] = fake
+    # Pin the MCU value rather than inheriting whatever the ambient environment holds:
+    # the form shows the CURRENTLY effective value, so a stray env var (or a leaked
+    # write from another test) would otherwise decide what this test sees.
+    mcu_key = f"{ENV_PREFIX}CDC_SINK_MCU_COUNT"
+    saved_mcu = os.environ.get(mcu_key)
+    os.environ[mcu_key] = "4"
+    try:
+        app._render_performance_tuning_controls()
+    finally:
+        if saved is None:
+            sys.modules.pop("nicegui", None)
+        else:
+            sys.modules["nicegui"] = saved
+        if saved_mcu is None:
+            os.environ.pop(mcu_key, None)
+        else:
+            os.environ[mcu_key] = saved_mcu
+
+    # Every group in the registry got a section header -- none silently dropped.
+    for group in {k.group for k in TUNABLE_KNOBS}:
+        assert group in ui.texts, f"no section rendered for {group}"
+    # CDC's section says Start CDC, and Full Load's does not.
+    assert any("applies to the next Start CDC" in t for t in ui.texts)
+    assert any("applies to the next run" in t for t in ui.texts)
+    # The MCU knob is a select over exactly the CloudFormation AllowedValues.
+    assert ((1, 2, 4, 8), 4) in ui.selects
+    # The range-valued knobs stay numeric inputs (one per non-enum knob).
+    assert len(ui.numbers) == len([k for k in TUNABLE_KNOBS if not k.allowed])

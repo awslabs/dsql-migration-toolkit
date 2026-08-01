@@ -5,6 +5,50 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.213
+
+### Added
+
+- **The CDC sink's compute is now tunable from the UI — Settings → Performance → CDC →
+  "Sink compute (MCU)".** The manual has long advised raising `SinkMcuCount` (not the
+  source's MCUs) when the sink can't keep up, because the sink is the CPU-bound half of
+  the pipeline while the single-task Debezium source has spare CPU. But the app never
+  sent that parameter: `grep SinkMcuCount src/` found nothing, so every deploy silently
+  used the template default and `submit_update` carried it forward as
+  `UsePreviousValue`. The only way to act on the manual's advice was to edit stack
+  parameters in the CloudFormation console — which conflicts with "everything core is
+  reachable from the browser". The tool now passes `SinkMcuCount` on all three paths
+  (infra create, Start CDC, and the read-only parameter preview, so the preview cannot
+  advertise a value the deploy contradicts).
+
+  Only 1 / 2 / 4 / 8 are offered, rendered as a dropdown rather than a number field:
+  those are the MSK Connect API's valid values for `mcuCount` (max 8 per worker), so a
+  spinner would happily accept 3 and CloudFormation would reject it minutes into a
+  billable Start CDC. The value is validated against that exact set before it is stored.
+
+  The tool's default deliberately equals the template's (4). A different default would
+  read as a real config change against any stack deployed before the tool sent this
+  parameter, needlessly recreating both RUNNING connectors on the next Start CDC and
+  burning MSK partition quota that is never reclaimed.
+
+### Changed
+
+- **The Settings → Performance form is now split into sections that each state their own
+  apply timing.** It previously reported "applies to the next run" for everything, which
+  is true only for the Full Load / Validation knobs (the loader and validator call
+  `load_config()` per run). A CDC knob is a CloudFormation parameter: nothing re-reads
+  it, and a sink already streaming keeps its capacity until Start CDC updates the
+  connector. So the CDC section reads "applies to the next Start CDC", and the
+  confirmation toast repeats each knob's own timing. Grouping moved into the config
+  registry, which also removes a latent rendering bug: the old loop emitted a header
+  whenever the group changed while walking the tuple, so a group whose knobs were not
+  contiguous would have been split across two headers.
+
+- **Manual §7 (Performance and tuning) now documents when the sink MCU change takes
+  effect**, including that re-running Start CDC purely to resize the sink is safe:
+  connector `Capacity` is an in-place update, so the sink is resized rather than
+  recreated — no partition-quota cost and no replication gap, unlike a table-set change.
+
 ## v0.1.212
 
 ### Fixed

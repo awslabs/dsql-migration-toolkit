@@ -276,17 +276,40 @@ cdc-stack (blank/invalid values fall back to the smart default):
 |---|---|---|
 | `DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` | partitions per per-table topic | **Irreversible** once the topic exists. Also **forces a uniform count** — disables the size-proportional allocation above. |
 | `DSQL_MIGRATOR_CDC_SINK_TASKS_MAX` | sink connector `tasks.max` | Capped in effect by the partition count. |
-| `DSQL_MIGRATOR_CDC_MCU_COUNT` | MSK Connect MCUs per worker | Must be one of 1 / 2 / 4 / 8. |
+| `DSQL_MIGRATOR_CDC_MCU_COUNT` | MSK Connect MCUs per worker, **source** connector | Must be one of 1 / 2 / 4 / 8. |
 
 Two related cdc-stack parameters are fixed, not inferred: `SourceTasksMax` = 1
 (MySQL is single-task per server) and `SinkBatchMaxRows` = 3000 (DSQL's
 per-transaction row limit — **do not exceed 3000**).
 
-The sink's compute is sized separately from the source: `ConnectorMcuCount`
+#### Sink compute (the knob to reach for first)
+
+The sink's compute is sized **separately** from the source: `ConnectorMcuCount`
 applies to the source connector, `SinkMcuCount` (default 4) to the sink. The sink
 is CPU-bound under heavy load once its apply path was optimized, whereas the
-single-task source has spare CPU — so raise `SinkMcuCount` (not the source's) if
-the sink can't keep up. See the appendix (§12) for the measured curve.
+single-task source has spare CPU — so raise the **sink's** MCUs, not the source's,
+if the sink can't keep up. See the appendix (§12) for the measured curve.
+
+Unlike everything else in this section, this one is in the UI:
+**Settings → Performance → CDC → "Sink compute (MCU)"** (or
+`DSQL_MIGRATOR_CDC_SINK_MCU_COUNT`). Only 1 / 2 / 4 / 8 are offered — those are the
+MSK Connect API's valid values (`mcuCount`), so 8 MCUs per worker is the ceiling.
+1 MCU = 1 vCPU + 4 GiB.
+
+**When it takes effect.** This is *not* like the Full Load knobs, which the loader
+re-reads on its next run. It is a cdc-stack CloudFormation parameter, applied when
+Start CDC creates or updates the sink connector:
+
+| Pipeline state | Effect of changing it |
+|---|---|
+| No CDC deployed yet | Used by the next infrastructure deploy and Start CDC. |
+| Infra deployed, not started | Used by the next Start CDC. |
+| **Already streaming** | **Nothing changes until you run Start CDC again.** |
+
+Re-running Start CDC on a streaming pipeline is safe for this purpose: connector
+`Capacity` is an in-place update (no replacement), so the sink is resized rather
+than recreated — it does **not** consume MSK partition quota the way a table-set
+change does, and there is no gap in replication.
 
 > **Source reboots are handled automatically.** The source connector sets
 > `errors.retry.timeout=600000` (10 min), so a source RDS/Aurora reboot

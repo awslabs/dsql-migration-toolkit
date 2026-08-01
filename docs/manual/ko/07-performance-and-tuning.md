@@ -206,15 +206,35 @@ UI 필드가 아니라 추론·숨김으로 둔 이유:
 |---|---|---|
 | `DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` | 테이블별 토픽 파티션 수 | 토픽 생성 후 **비가역적**. 또한 **균등 파티션 수를 강제** — 위의 크기비례 배분을 비활성화합니다. |
 | `DSQL_MIGRATOR_CDC_SINK_TASKS_MAX` | 싱크 커넥터 `tasks.max` | 실효값은 파티션 수로 상한. |
-| `DSQL_MIGRATOR_CDC_MCU_COUNT` | 워커당 MSK Connect MCU | 1 / 2 / 4 / 8 중 하나여야 함. |
+| `DSQL_MIGRATOR_CDC_MCU_COUNT` | 워커당 MSK Connect MCU, **소스** 커넥터 | 1 / 2 / 4 / 8 중 하나여야 함. |
 
 관련된 두 cdc-stack 파라미터는 추론이 아니라 고정입니다: `SourceTasksMax` = 1(MySQL은 서버당 단일 태스크),
 `SinkBatchMaxRows` = 3000(DSQL 트랜잭션당 행 한도 — **3000 초과 금지**).
 
-싱크의 컴퓨트는 소스와 별도로 산정합니다: `ConnectorMcuCount`는 소스 커넥터에,
+#### 싱크 컴퓨트 (가장 먼저 손댈 노브)
+
+싱크의 컴퓨트는 소스와 **별도로** 산정합니다: `ConnectorMcuCount`는 소스 커넥터에,
 `SinkMcuCount`(기본 4)는 싱크에 적용됩니다. 적용 경로를 최적화한 뒤로 싱크는 고부하에서 CPU에
 묶이는 반면 단일 태스크인 소스는 CPU에 여유가 있으므로, 싱크가 따라오지 못하면 (소스가 아니라)
-`SinkMcuCount`를 올리세요. 측정 곡선은 부록(§12)을 참고하세요.
+**싱크의** MCU를 올리세요. 측정 곡선은 부록(§12)을 참고하세요.
+
+이 절의 다른 항목과 달리 이것은 UI에 있습니다:
+**Settings → Performance → CDC → "Sink compute (MCU)"**
+(또는 `DSQL_MIGRATOR_CDC_SINK_MCU_COUNT`). 1 / 2 / 4 / 8만 제공되며, 이는 MSK Connect API가
+정한 유효값(`mcuCount`)입니다 — 즉 **워커당 8 MCU가 상한**입니다. 1 MCU = 1 vCPU + 4 GiB.
+
+**언제 적용되나.** 이건 다음 실행 때 로더가 다시 읽는 Full Load 노브들과 **다릅니다**. cdc-stack
+CloudFormation 파라미터이고, Start CDC가 싱크 커넥터를 생성/업데이트할 때 적용됩니다:
+
+| 파이프라인 상태 | 값 변경 시 |
+|---|---|
+| CDC 미배포 | 다음 인프라 배포와 Start CDC에 사용됩니다. |
+| 인프라만 배포, 미시작 | 다음 Start CDC에 사용됩니다. |
+| **이미 스트리밍 중** | **Start CDC를 다시 실행할 때까지 아무것도 바뀌지 않습니다.** |
+
+이 목적으로 스트리밍 중인 파이프라인에 Start CDC를 다시 실행하는 것은 안전합니다: 커넥터 `Capacity`는
+in-place 업데이트(교체 없음)이므로 싱크가 재생성이 아니라 리사이즈됩니다 — 테이블 집합 변경과 달리
+**MSK 파티션 쿼터를 소모하지 않고**, 복제에 gap도 생기지 않습니다.
 
 > **소스 재부팅은 자동 처리됩니다.** 소스 커넥터가 `errors.retry.timeout=600000`(10분)을 설정하므로
 > 소스 RDS/Aurora 재부팅(유지보수, 페일오버, 리사이즈)이 흡수됩니다: 커넥터가 재부팅 구간 내내

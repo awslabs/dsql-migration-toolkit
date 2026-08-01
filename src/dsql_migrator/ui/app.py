@@ -830,28 +830,40 @@ def _render_footer_tools(activity_log_path: str) -> None:
 
 
 def _render_performance_tuning_controls() -> None:
-    """Render runtime Full Load / Validation parallelism controls in the footer.
+    """Render the runtime performance knobs, in one labelled section per group.
 
-    Like Diagnostics, these are NOT deploy-time inputs: the loader and validator
-    re-read the config on every run, so an operator can retune parallelism between
-    runs from here -- no redeploy/restart. Changes apply to the NEXT Full Load /
-    Validation, are app-wide (single-task app), and reset to the deploy/startup
-    values on restart. Each field is bounded by the same limits as the config.
+    Like Diagnostics, these are NOT deploy-time inputs, but the two kinds of knob here
+    reach their consumer differently and the UI must not blur that:
+
+    * **Full Load / Validation** -- the loader and validator call ``load_config()`` on
+      every run, so a change lands on the NEXT run of that step.
+    * **CDC** -- the value is a cdc-stack CloudFormation PARAMETER, read when Start CDC
+      creates/updates the connectors. So it lands at the next Start CDC, and for a
+      pipeline already streaming, only after Stop + Start. Saying "applies to the next
+      run" here would promise something that never happens: nothing re-reads it, and a
+      running sink keeps its current capacity until the connector is updated.
+
+    Each section therefore states its OWN timing (``group_applies``) instead of one
+    blanket caption. A knob whose legal values are an enum rather than a range
+    (``allowed``, e.g. the template's ``AllowedValues: [1,2,4,8]`` for SinkMcuCount)
+    renders as a dropdown -- a spinner would happily offer 3, which CloudFormation
+    rejects minutes into a billable deploy.
     """
     from nicegui import ui
 
     from dsql_migrator.config import (
-        TUNABLE_KNOBS,
         TuningValueError,
         current_tuning_values,
+        group_applies,
         set_tuning_value,
+        tunable_groups,
     )
     from dsql_migrator.ui.design import render_notice
 
     current = current_tuning_values()
 
     # Cloudscape "form" treatment: the knobs are grouped form fields -- one dense row
-    # per knob (label + allowed range + bounded input), with the longer description on a
+    # per knob (label + allowed values + bounded input), with the longer description on a
     # hover tooltip (Cloudscape's "info" idiom) so each field stays a single line.
     # Rendered into the Settings modal, which already states the live/app-wide caveat,
     # so only the knob-specific note is repeated here.
@@ -872,46 +884,59 @@ def _render_performance_tuning_controls() -> None:
         except TuningValueError as exc:
             ui.notify(str(exc), type="warning", position="top")
             return
+        # Name the knob's OWN timing: a CDC knob that reported "the next run" read as
+        # though a streaming pipeline would pick it up on its own.
         ui.notify(
-            f"{k.label} = {applied} (applies to the next run).",
+            f"{k.label} = {applied} (applies to {k.applies}).",
             type="info",
         )
 
-    current_group: str | None = None
-    for knob in TUNABLE_KNOBS:
-        # Emit a Cloudscape-style section subheader when the group changes
-        # (knobs are ordered by group, so this groups them into "Full Load"
-        # / "Validation" sections without re-sorting).
-        if knob.group != current_group:
-            ui.label(knob.group).classes(
-                "text-xs uppercase tracking-wide text-gray-500 font-medium "
-                "mt-2 mb-0"
+    for group, knobs in tunable_groups():
+        # Cloudscape-style section subheader + the timing that applies to every knob
+        # in it, so the "when does this take effect" answer sits with the fields it
+        # governs rather than in one caption that can only be right for some of them.
+        with ui.row().classes("items-baseline gap-2 no-wrap w-full mt-2"):
+            ui.label(group).classes(
+                "text-xs uppercase tracking-wide text-gray-500 font-medium"
             )
-            current_group = knob.group
+            ui.label(f"applies to {group_applies(group)}").classes(
+                "text-xs text-gray-400"
+            )
 
-        # One compact Cloudscape "form field" per row: label (+ range hint)
-        # on the left, a small info glyph carrying the description tooltip,
-        # and the bounded input on the right.
-        with ui.row().classes("items-center gap-1 no-wrap w-full"):
-            with ui.column().classes("gap-0 flex-1 min-w-0"):
-                with ui.row().classes("items-center gap-1 no-wrap"):
-                    ui.label(knob.short_label).classes(
-                        "text-sm text-gray-900 truncate"
-                    )
-                    ui.icon("info").classes(
-                        "text-gray-400 text-xs cursor-help"
-                    ).tooltip(knob.description)
-                ui.label(f"{knob.minimum}–{knob.maximum}").classes(
-                    "text-xs text-gray-400 leading-none"
-                )
-            ui.number(
-                value=current[knob.field],
-                min=knob.minimum,
-                max=knob.maximum,
-                step=1,
-                format="%d",
-                on_change=lambda e, k=knob: _on_change(e, k),
-            ).props("dense outlined").classes("w-20 text-sm")
+        for knob in knobs:
+            # One compact Cloudscape "form field" per row: label (+ allowed values)
+            # on the left, a small info glyph carrying the description tooltip,
+            # and the bounded input on the right.
+            with ui.row().classes("items-center gap-1 no-wrap w-full"):
+                with ui.column().classes("gap-0 flex-1 min-w-0"):
+                    with ui.row().classes("items-center gap-1 no-wrap"):
+                        ui.label(knob.short_label).classes(
+                            "text-sm text-gray-900 truncate"
+                        )
+                        ui.icon("info").classes(
+                            "text-gray-400 text-xs cursor-help"
+                        ).tooltip(knob.description)
+                    ui.label(
+                        " / ".join(str(v) for v in knob.allowed)
+                        if knob.allowed
+                        else f"{knob.minimum}–{knob.maximum}"
+                    ).classes("text-xs text-gray-400 leading-none")
+                if knob.allowed:
+                    # Enum-valued: offer ONLY the legal values.
+                    ui.select(
+                        list(knob.allowed),
+                        value=current[knob.field],
+                        on_change=lambda e, k=knob: _on_change(e, k),
+                    ).props("dense outlined options-dense").classes("w-20 text-sm")
+                else:
+                    ui.number(
+                        value=current[knob.field],
+                        min=knob.minimum,
+                        max=knob.maximum,
+                        step=1,
+                        format="%d",
+                        on_change=lambda e, k=knob: _on_change(e, k),
+                    ).props("dense outlined").classes("w-20 text-sm")
 
 
 def _render_diagnostics_controls() -> None:

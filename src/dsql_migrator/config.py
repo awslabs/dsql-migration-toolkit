@@ -370,6 +370,22 @@ class AppConfig(BaseModel):
             "DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS."
         ),
     )
+    cdc_sink_mcu_count: int = Field(
+        default=4,
+        ge=1,
+        le=8,
+        description=(
+            "MSK Connect MCUs (1 vCPU + 4 GiB each) per worker for the CDC SINK "
+            "connector -- the cdc-stack's SinkMcuCount parameter. Must be one of "
+            "1 / 2 / 4 / 8 (the template's AllowedValues). Unlike the Full Load "
+            "knobs this is NOT re-read per run: the value is passed to "
+            "CloudFormation when Start CDC creates/updates the sink connector, so "
+            "a change applies at the next Start CDC. The sink is the CPU-bound half "
+            "of the pipeline (the single-task Debezium source has spare CPU), so "
+            "this is the knob to raise when the sink cannot keep up. Config key: "
+            "DSQL_MIGRATOR_CDC_SINK_MCU_COUNT."
+        ),
+    )
     activity_log_to_stdout: bool = Field(
         default=False,
         description=(
@@ -450,6 +466,8 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> AppConfig:
         values["full_load_reader_shards"] = int(fl_shards)
     if (fl_shard_min := _read(source, "FULL_LOAD_SHARD_MIN_ROWS")) is not None:
         values["full_load_shard_min_rows"] = int(fl_shard_min)
+    if (cdc_sink_mcu := _read(source, "CDC_SINK_MCU_COUNT")) is not None:
+        values["cdc_sink_mcu_count"] = int(cdc_sink_mcu)
     if (to_stdout := _read(source, "ACTIVITY_LOG_STDOUT")) is not None:
         # Accept the common truthy spellings; anything else is treated as false.
         values["activity_log_to_stdout"] = to_stdout.lower() in (
@@ -463,12 +481,24 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> AppConfig:
 
 
 # --- Runtime-tunable performance knobs -------------------------------------
-# These four integer knobs are read FRESH from the environment on every Full
-# Load / Validation run (via load_config()), so an operator can retune them at
-# runtime -- no redeploy/restart -- by setting the corresponding os.environ key.
-# The UI's "Performance tuning" control uses these helpers so the same bounds
-# (the AppConfig field ge/le) are the single source of truth. Bounds are read
-# from the Pydantic field metadata rather than duplicated here.
+# Integer knobs an operator can retune at runtime -- no redeploy/restart -- by
+# setting the corresponding os.environ key. The UI's "Performance tuning" control
+# uses these helpers so the same bounds (the AppConfig field ge/le) are the single
+# source of truth; bounds are read from the Pydantic field metadata rather than
+# duplicated here.
+#
+# Two DIFFERENT kinds of knob live here, which is why ``applies`` exists:
+#   * Full Load / Validation -- read FRESH from the environment on every run (via
+#     load_config()), so a change lands on the next run of that step.
+#   * CDC -- NOT re-read per run. The value is a CloudFormation parameter passed
+#     when Start CDC creates/updates the connectors, so a change lands at the next
+#     Start CDC (and, for a pipeline already streaming, only after Stop + Start).
+# Presenting both as "applies to the next run" would be wrong for the CDC group,
+# so each knob states its own timing and the UI renders it per section.
+_APPLIES_NEXT_RUN = "the next run"
+_APPLIES_NEXT_CDC_START = "the next Start CDC"
+
+
 @dataclass(frozen=True)
 class TunableKnob:
     """A runtime-adjustable integer performance knob (env-backed).
@@ -479,13 +509,25 @@ class TunableKnob:
     is the one-line helper text under the label. ``label`` (the fully-qualified
     name used in notifications / error messages) is derived from the two so the
     UI and the messages can never drift apart.
+
+    ``applies`` is when a change takes effect (see the module note above) -- the
+    UI shows it per section and the confirmation notification repeats it, so a CDC
+    knob never implies it will affect a run already in progress.
+
+    ``allowed``, when non-empty, is the EXACT set of legal values (not just a
+    range): the cdc-stack declares ``SinkMcuCount`` with CloudFormation
+    ``AllowedValues: [1, 2, 4, 8]``, so 3 would pass a 1..8 range check here and
+    then be rejected by CloudFormation minutes into a billable deploy. The UI
+    renders these as a dropdown instead of a free number field.
     """
 
     field: str  # AppConfig attribute name
     env_suffix: str  # env key sans the DSQL_MIGRATOR_ prefix
-    group: str  # form section this knob belongs to ("Full Load" / "Validation")
+    group: str  # form section this knob belongs to ("Full Load" / "CDC" / ...)
     short_label: str  # field label within its group, e.g. "Tables in parallel"
     description: str  # one-line Cloudscape form-field helper text
+    applies: str = _APPLIES_NEXT_RUN  # when a change takes effect
+    allowed: tuple[int, ...] = ()  # exact legal values ( () = any in range )
 
     @property
     def label(self) -> str:
@@ -538,6 +580,16 @@ TUNABLE_KNOBS: tuple[TunableKnob, ...] = (
         "Tables in parallel",
         "How many tables are checksummed at the same time.",
     ),
+    TunableKnob(
+        "cdc_sink_mcu_count",
+        "CDC_SINK_MCU_COUNT",
+        "CDC",
+        "Sink compute (MCU)",
+        "MSK Connect units per sink worker (1 MCU = 1 vCPU + 4 GiB). The sink is "
+        "the CPU-bound half of CDC — raise this, not the source, when it lags.",
+        applies=_APPLIES_NEXT_CDC_START,
+        allowed=(1, 2, 4, 8),
+    ),
 )
 
 _TUNABLE_BY_FIELD = {k.field: k for k in TUNABLE_KNOBS}
@@ -554,7 +606,7 @@ def _field_bound(field: str, kind: str, fallback: int) -> int:
 
 
 class TuningValueError(ValueError):
-    """A proposed tuning value is out of range or not an integer."""
+    """A proposed tuning value is out of range, not allowed, or not an integer."""
 
 
 def current_tuning_values() -> dict[str, int]:
@@ -563,13 +615,48 @@ def current_tuning_values() -> dict[str, int]:
     return {k.field: int(getattr(cfg, k.field)) for k in TUNABLE_KNOBS}
 
 
+def tunable_groups() -> tuple[tuple[str, tuple[TunableKnob, ...]], ...]:
+    """Group :data:`TUNABLE_KNOBS` into ``(group_name, knobs)`` in declared order.
+
+    The UI renders one labelled section per group. Grouping here (rather than in the
+    render loop) keeps the sections a property of the registry: adding a knob to a
+    new group makes the section appear with no UI change, and a group's knobs cannot
+    be split across two headers by a mis-ordered tuple -- the previous "emit a header
+    when the group changes" loop silently did exactly that.
+    """
+    grouped: dict[str, list[TunableKnob]] = {}
+    for knob in TUNABLE_KNOBS:
+        grouped.setdefault(knob.group, []).append(knob)
+    return tuple((name, tuple(knobs)) for name, knobs in grouped.items())
+
+
+def group_applies(group: str) -> str:
+    """When a change to any knob in ``group`` takes effect (e.g. ``"the next run"``).
+
+    Every knob in a group must agree, so the UI can state the timing ONCE per
+    section instead of per field. Raises :class:`TuningValueError` for an unknown
+    group, or when a group mixes timings (a registry mistake that would otherwise
+    show one arbitrary knob's timing as if it covered the whole section).
+    """
+    timings = {k.applies for k in TUNABLE_KNOBS if k.group == group}
+    if not timings:
+        raise TuningValueError(f"unknown tuning group: {group}")
+    if len(timings) > 1:
+        raise TuningValueError(
+            f"tuning group '{group}' mixes apply-timings: {sorted(timings)}"
+        )
+    return timings.pop()
+
+
 def set_tuning_value(field: str, value: int) -> int:
     """Validate ``value`` against the knob's bounds and set it in ``os.environ``.
 
-    Because load_config() re-reads the environment per run, the new value applies
-    to the NEXT Full Load / Validation without a restart. App-wide (single-task)
-    and reset to the deploy/startup value on restart. Returns the value set.
-    Raises :class:`TuningValueError` if out of range / not an integer.
+    The new value is picked up without a restart, but WHEN depends on the knob (see
+    ``TunableKnob.applies``): a Full Load / Validation knob is re-read by the next
+    run, while a CDC knob is a CloudFormation parameter read at the next Start CDC.
+    App-wide (single-task) and reset to the deploy/startup value on restart. Returns
+    the value set. Raises :class:`TuningValueError` if not an integer, out of range,
+    or -- for a knob with an ``allowed`` set -- not one of those exact values.
     """
     knob = _TUNABLE_BY_FIELD.get(field)
     if knob is None:
@@ -581,6 +668,14 @@ def set_tuning_value(field: str, value: int) -> int:
     if ivalue < knob.minimum or ivalue > knob.maximum:
         raise TuningValueError(
             f"{knob.label}: must be between {knob.minimum} and {knob.maximum}"
+        )
+    # An enum-valued knob (CloudFormation AllowedValues) must be rejected HERE. A
+    # value inside the range but off the enum (e.g. 3 MCU) would otherwise be stored,
+    # then fail the cdc-stack update minutes into a billable Start CDC.
+    if knob.allowed and ivalue not in knob.allowed:
+        raise TuningValueError(
+            f"{knob.label}: must be one of "
+            + " / ".join(str(v) for v in knob.allowed)
         )
     os.environ[knob.env_key] = str(ivalue)
     return ivalue

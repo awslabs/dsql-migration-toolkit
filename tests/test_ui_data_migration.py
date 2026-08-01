@@ -11158,3 +11158,95 @@ def test_cdc_step_gates_automatic_on_can_seed_offset_not_has_coordinates() -> No
     )
     # And the GTID-only case must be derived, so the card can explain the real cause.
     assert "gtid_executed" in joined
+
+
+# ---------------------------------------------------------------------------
+# Sink MCU knob: config -> CFN parameter wiring
+# ---------------------------------------------------------------------------
+
+
+def test_every_cdc_param_build_passes_the_configured_sink_mcu() -> None:
+    """Each param-builder call site must pass ``sink_mcu_count``.
+
+    The builders DEFAULT this argument, so a forgotten call site is silently wrong
+    rather than a TypeError: the Settings knob would appear to work while that path
+    kept deploying the template default. The three sites matter for different reasons
+    -- the infra create records the value on a fresh stack, Start CDC is what actually
+    creates/updates the sink connector, and the read-only params preview must not
+    advertise a value the deploy then contradicts. This is the "state exists but was
+    never wired into the render/deploy" gap, so it is asserted structurally.
+    """
+    import ast
+    import pathlib
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    tree = ast.parse(pathlib.Path(_cdc_ui.__file__).read_text(encoding="utf-8"))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in ("build_cdc_stack_params", "build_cdc_infra_params")
+    ]
+    # Two Start-CDC-path builds (preview + deploy) and one infra create.
+    assert len(calls) == 3, f"expected 3 param builds, found {len(calls)}"
+    for call in calls:
+        kwargs = {kw.arg for kw in call.keywords if kw.arg}
+        assert "sink_mcu_count" in kwargs, (
+            f"{call.func.id} at line {call.lineno} does not pass sink_mcu_count"
+        )
+
+
+def test_sink_mcu_is_read_fresh_per_deploy_not_captured_once() -> None:
+    """A change in Settings must reach the NEXT Start CDC without a restart.
+
+    ``_sink_mcu_count`` calls ``load_config()`` per invocation because that is what
+    re-reads the environment ``set_tuning_value`` writes to. Reading the config once
+    at import/render would pin the value for the process lifetime, so the knob would
+    appear to save and then do nothing until a restart.
+    """
+    import os
+
+    from dsql_migrator.config import ENV_PREFIX
+    from dsql_migrator.core.cdc import CDC_DEFAULT_SINK_MCU_COUNT
+    from dsql_migrator.ui.data_migration._cdc_ui import _sink_mcu_count
+
+    key = f"{ENV_PREFIX}CDC_SINK_MCU_COUNT"
+    previous = os.environ.get(key)
+    try:
+        os.environ.pop(key, None)
+        assert _sink_mcu_count() == CDC_DEFAULT_SINK_MCU_COUNT
+        # A later change is observed by the very next call -- no restart, no re-import.
+        os.environ[key] = "8"
+        assert _sink_mcu_count() == 8
+        os.environ[key] = "2"
+        assert _sink_mcu_count() == 2
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
+def test_sink_mcu_falls_back_instead_of_blocking_a_deploy() -> None:
+    """An unreadable config must not break Start CDC.
+
+    Raising here would abort the deploy over a settings problem; returning some other
+    number would silently resize the connector. The template-matching default is the
+    only safe answer.
+    """
+    import dsql_migrator.config as cfg
+    from dsql_migrator.core.cdc import CDC_DEFAULT_SINK_MCU_COUNT
+    from dsql_migrator.ui.data_migration._cdc_ui import _sink_mcu_count
+
+    original = cfg.load_config
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("config unreadable")
+
+    cfg.load_config = _boom  # type: ignore[assignment]
+    try:
+        assert _sink_mcu_count() == CDC_DEFAULT_SINK_MCU_COUNT
+    finally:
+        cfg.load_config = original  # type: ignore[assignment]

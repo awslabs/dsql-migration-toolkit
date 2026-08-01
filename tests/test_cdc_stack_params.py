@@ -628,8 +628,83 @@ def test_infra_params_scaling_knobs_are_declared_in_template() -> None:
     import pathlib
 
     template = pathlib.Path("deploy/cdc-stack/cdc-stack.yaml").read_text()
-    for key in ("TopicDefaultPartitions", "SinkTasksMax", "ConnectorMcuCount"):
+    for key in (
+        "TopicDefaultPartitions",
+        "SinkTasksMax",
+        "ConnectorMcuCount",
+        "SinkMcuCount",
+    ):
         assert f"\n  {key}:" in template, key
+
+
+# ---------------------------------------------------------------------------
+# SinkMcuCount — the operator-tunable sink compute knob
+# ---------------------------------------------------------------------------
+
+
+def test_start_cdc_params_carry_sink_mcu_so_the_knob_can_reach_the_connector() -> None:
+    """The Start CDC pass must SEND SinkMcuCount, not just the infra create.
+
+    This is the whole reason the knob works. ``DsqlSinkConnector`` is gated on
+    ``DeploySink=true``, so the sink connector is created by Start CDC -- and
+    ``submit_update`` forwards every parameter the tool does NOT override as
+    ``UsePreviousValue=True``. Omitting it here would silently pin the sink to the
+    template default forever, no matter what the operator configured.
+    """
+    from dsql_migrator.core.cdc import CDC_DEFAULT_SINK_MCU_COUNT
+
+    by_key = dict(_params().filled)
+    assert by_key["SinkMcuCount"] == str(CDC_DEFAULT_SINK_MCU_COUNT)
+    # An operator-raised value reaches the parameter set unchanged.
+    assert dict(_params(sink_mcu_count=8).filled)["SinkMcuCount"] == "8"
+
+
+def test_infra_params_carry_sink_mcu_separately_from_the_source_mcu() -> None:
+    """Sink and source compute are INDEPENDENT parameters.
+
+    The sink is the CPU-bound half; the single-task Debezium source has spare CPU. A
+    single shared MCU value would force the operator to pay for source compute they
+    do not need in order to give the sink what it does.
+    """
+    from dsql_migrator.core.cdc import CDC_DEFAULT_SINK_MCU_COUNT
+
+    by_key = dict(_infra(tables=("app.orders", "app.customers")).filled)
+    assert by_key["SinkMcuCount"] == str(CDC_DEFAULT_SINK_MCU_COUNT)
+    assert by_key["ConnectorMcuCount"] == str(CDC_DEFAULT_MCU_COUNT)
+    # They are genuinely different knobs, not one value written twice.
+    assert by_key["SinkMcuCount"] != by_key["ConnectorMcuCount"]
+
+
+def test_sink_mcu_default_equals_the_template_default() -> None:
+    """A mismatch here would bounce both RUNNING connectors on the next Start CDC.
+
+    For a cdc-stack deployed BEFORE the tool passed this parameter, CloudFormation
+    reports the template's default. ``run_cdc_start`` compares the desired connector
+    overrides against the deployed parameters to decide whether anything changed, so
+    a tool default that differed from the template default would read as a real
+    config change on every Start CDC and needlessly recreate the connectors --
+    burning MSK partition quota that is never reclaimed.
+    """
+    import pathlib
+    import re
+
+    from dsql_migrator.core.cdc import CDC_DEFAULT_SINK_MCU_COUNT
+
+    template = pathlib.Path("deploy/cdc-stack/cdc-stack.yaml").read_text()
+    block = template.split("\n  SinkMcuCount:", 1)[1]
+    default = re.search(r"\n\s+Default:\s*(\d+)", block)
+    assert default is not None, "SinkMcuCount has no Default in the template"
+    assert int(default.group(1)) == CDC_DEFAULT_SINK_MCU_COUNT
+    # And the tool only ever sends a value the template will accept.
+    allowed = re.search(r"\n\s+AllowedValues:\s*\[([^\]]*)\]", block)
+    assert allowed is not None
+    legal = {int(v.strip()) for v in allowed.group(1).split(",")}
+    assert CDC_DEFAULT_SINK_MCU_COUNT in legal
+    # The config knob's enum must match the template's AllowedValues exactly.
+    from dsql_migrator.config import TUNABLE_KNOBS
+
+    knob = {k.field: k for k in TUNABLE_KNOBS}["cdc_sink_mcu_count"]
+    assert set(knob.allowed) == legal
 
 
 # ---------------------------------------------------------------------------
