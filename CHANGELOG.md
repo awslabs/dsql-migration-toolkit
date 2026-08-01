@@ -5,6 +5,40 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.205
+
+### Fixed
+
+- **The quarantine header counted tables, not rows.** It read "Quarantined rows (1)"
+  directly above a banner saying "3 rows permanently dropped" — two boxes on one screen
+  disagreeing about the same number. The list it measured holds one entry per *table*
+  (each carrying that table's latest message). The header now reports rows and tables
+  separately: *"3 rows permanently dropped across 1 table — the rest of each table
+  loaded"*.
+
+### Changed
+
+- **A dropped row now reads as three labelled facts instead of one run-on line.** It
+  rendered as raw log text — `quarantined row pk[id=3]: datatype limit greater than
+  1048576 bytes not supported for bytea` — with the table name in a badge above and the
+  primary key buried mid-sentence. The entry is now an amber card: the table name in
+  prominent text, the **primary key as its own monospace chip** (it is the actionable
+  handle — what you search the source with), a "dropped" badge, and the technical reason
+  below without the redundant `quarantined row pk[...]` stem. An unparseable message is
+  still shown verbatim rather than mangled.
+- **The Attempts column says what the number means.** `1 · 3 err` read like a retry count
+  and gave no hint that it meant *rows the target will never hold*. It now shows
+  `1 · 3 rows dropped` for permanently quarantined rows and `1 · 3 errors` otherwise.
+- **Removed the duplicate caption beside "Accept quarantined rows & continue".** It
+  repeated the completeness banner's own remedy ("fix the source value(s) and Reload that
+  table … or accept the gap to continue"), so the same advice appeared twice on one
+  screen. The banner keeps it — it states the verdict and the remedy together.
+
+### Tests
+
+- Five mutations killed, including restoring the table-count header, reverting the
+  cryptic `err` marker, and letting a malformed message yield a bogus primary key.
+
 ## v0.1.204
 
 ### Fixed

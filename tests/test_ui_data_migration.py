@@ -5485,13 +5485,32 @@ def test_rows_target_source_cell_and_attempts_cell() -> None:
     # Exact figures live in the tooltip.
     tip = _rows_breakdown_tooltip(row)
     assert "1,180,000 on target" in tip and "33,585,832 source rows" in tip
-    # Attempts alone when no errors; with an error marker otherwise.
+    # Attempts alone when no errors; with a plain-language marker otherwise. "1 err"
+    # read like a retry count and never hinted that the number could mean rows the
+    # target will never hold.
     assert _format_attempts_cell(row) == "6"
     row_err = FullLoadTableRow(
         table="t", state="FAILED", rows_loaded=0, expected_rows=10,
         attempts=5, errors=1,
     )
-    assert _format_attempts_cell(row_err) == "5 · 1 err"
+    assert _format_attempts_cell(row_err) == "5 · 1 error"
+    row_errs = FullLoadTableRow(
+        table="t", state="FAILED", rows_loaded=0, expected_rows=10,
+        attempts=5, errors=3,
+    )
+    assert _format_attempts_cell(row_errs) == "5 · 3 errors"
+    # Permanently dropped rows say so explicitly -- that is the fact a reader scanning
+    # this column has to notice, and it outranks the generic error count.
+    row_dropped = FullLoadTableRow(
+        table="t", state="DONE", rows_loaded=12, expected_rows=15,
+        attempts=1, errors=3, rows_quarantined=3,
+    )
+    assert _format_attempts_cell(row_dropped) == "1 · 3 rows dropped"
+    row_one_dropped = FullLoadTableRow(
+        table="t", state="DONE", rows_loaded=14, expected_rows=15,
+        attempts=1, errors=1, rows_quarantined=1,
+    )
+    assert _format_attempts_cell(row_one_dropped) == "1 · 1 row dropped"
 
 
 def test_failed_table_names_lists_only_failed_chunks() -> None:
@@ -9778,3 +9797,164 @@ def test_connector_failure_transition_actually_logs_the_detail() -> None:
     assert any(ast.unparse(kw.value) == "detail" for kw in logged), (
         "the built detail must be passed through, not dropped"
     )
+
+
+def test_accept_quarantine_button_has_no_duplicate_caption() -> None:
+    """The button must not repeat guidance the completeness banner already gives.
+
+    Both sat on the same screen saying the same thing: the caption beside
+    "Accept quarantined rows & continue" ("Fix the source value(s) and Reload to load
+    them, or accept the gap to proceed to CDC ...") duplicated the banner's own remedy
+    ("fix the source value(s) and Reload that table ... or accept the gap to continue
+    (Validation reports it)"). The banner keeps it -- it is the one place that states the
+    verdict AND the remedy together.
+    """
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    render_src = inspect.getsource(dm._render_full_load_progress)
+    assert "Accept quarantined rows & continue" in render_src  # the button stays
+    assert "Reload to load them" not in render_src, (
+        "the duplicate caption beside the accept button is back"
+    )
+
+    # ...and the guidance still exists exactly once, in the banner.
+    banner_src = inspect.getsource(dm._render_completeness_banner)
+    assert "Reload that table" in banner_src
+    assert "accept the gap" in banner_src
+
+
+# ---------------------------------------------------------------------------
+# Presenting a dropped row: which table, which row, why
+# ---------------------------------------------------------------------------
+
+
+_QUAR_MSG = (
+    "quarantined row pk[id=3]: datatype limit greater than 1048576 bytes "
+    "not supported for bytea"
+)
+
+
+class _DetailRowUi:
+    """Records labels/badges/icons emitted by the quarantine detail row."""
+
+    def __init__(self) -> None:
+        self.labels: list[str] = []
+        self.badges: list[str] = []
+        self.icons: list[str] = []
+
+    class _El:
+        def __init__(self, ui):
+            self._ui = ui
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: self
+
+    def label(self, text="", *_a, **_k):
+        if text:
+            self.labels.append(str(text))
+        return self._El(self)
+
+    def badge(self, text="", *_a, **_k):
+        if text:
+            self.badges.append(str(text))
+        return self._El(self)
+
+    def icon(self, text="", *_a, **_k):
+        if text:
+            self.icons.append(str(text))
+        return self._El(self)
+
+    def __getattr__(self, _name):
+        return lambda *_a, **_k: _DetailRowUi._El(self)
+
+
+def test_quarantine_message_is_split_into_table_pk_and_reason() -> None:
+    """The raw one-liner buried the two facts the operator acts on.
+
+    It rendered as a single run-on line -- "quarantined row pk[id=3]: datatype limit
+    greater than 1048576 bytes not supported for bytea" -- with the table name in a
+    separate badge above and the primary key mid-sentence. The PK is the actionable
+    handle (it is what you search the source with), so it now gets its own chip.
+    """
+    from dsql_migrator.ui.data_migration import (
+        FullLoadTableRow,
+        _quarantine_detail_row,
+    )
+
+    row = FullLoadTableRow(
+        table="ecommerce.product_media", state="DONE", rows_loaded=12,
+        expected_rows=15, attempts=1, errors=3, rows_quarantined=3,
+        error_message=_QUAR_MSG,
+    )
+    ui = _DetailRowUi()
+
+    _quarantine_detail_row(ui, row=row)
+
+    assert "ecommerce.product_media" in ui.labels  # WHICH table, given prominence
+    assert "id=3" in ui.badges  # WHICH row, as its own chip
+    assert "dropped" in ui.badges
+    # WHY -- the technical reason, without the redundant "quarantined row pk[...]" stem.
+    reason = next(l for l in ui.labels if "1048576" in l)
+    assert not reason.startswith("quarantined row pk[")
+    assert "not supported for bytea" in reason
+
+
+def test_quarantine_message_parsing_falls_back_for_unexpected_text() -> None:
+    # An unparseable message must be shown verbatim rather than mangled or dropped.
+    from dsql_migrator.ui.data_migration import (
+        _parse_quarantined_pk,
+        _quarantined_reason,
+    )
+
+    assert _parse_quarantined_pk(_QUAR_MSG) == "id=3"
+    assert _quarantined_reason(_QUAR_MSG).startswith("datatype limit")
+
+    assert _parse_quarantined_pk("some other failure") is None
+    assert _quarantined_reason("some other failure") == "some other failure"
+    # Malformed (no closing bracket) -> no PK claimed.
+    assert _parse_quarantined_pk("quarantined row pk[id=3 oops") is None
+
+
+def test_quarantine_header_counts_rows_not_tables() -> None:
+    """The header said "Quarantined rows (1)" while the banner below said 3 rows.
+
+    ``quarantined`` holds one entry per TABLE (each with that table's latest message), so
+    len() counted tables. Two boxes on the same screen disagreed about the same number.
+    """
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import (
+        _render_full_load_progress,
+        build_full_load_table_rows,
+    )
+
+    job = MigrationJob(job_id="j1")
+    job.status = "FAILED"
+    job.progress_pct = 100.0
+    job.chunks = [
+        ChunkState(chunk_id="ecommerce.product_media", status="DONE", rows_loaded=12,
+                   rows_quarantined=3, attempts=1)
+    ]
+    rows = build_full_load_table_rows(
+        job, None, {"ecommerce.product_media": _QUAR_MSG}
+    )
+
+    ui = _DetailRowUi()
+    _render_full_load_progress(
+        ui, job, rows, reload_table=lambda _n: None,
+        accept_quarantine_and_continue=lambda: None, quarantine_only=True,
+    )
+
+    joined = " ".join(ui.labels + ui.badges)
+    # The old header counted table ENTRIES, not rows.
+    assert "Quarantined rows (1)" not in joined
+    # It now agrees with the banner: 3 rows, across 1 table.
+    header = next(l for l in ui.labels if "permanently dropped across" in l)
+    assert header.startswith("3 rows permanently dropped across 1 table")

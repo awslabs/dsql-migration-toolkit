@@ -5,6 +5,34 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.205
+
+### Fixed
+
+- **격리 헤더가 행이 아니라 테이블 수를 셌습니다.** 바로 아래 배너가 "3 rows permanently dropped"라고
+  하는데 헤더는 "Quarantined rows (1)"로 표시돼, 한 화면의 두 박스가 같은 숫자를 다르게 말했습니다.
+  헤더가 센 목록은 *테이블*당 한 항목(해당 테이블의 최신 메시지)입니다. 이제 행 수와 테이블 수를 구분해
+  보고합니다: *"3 rows permanently dropped across 1 table — the rest of each table loaded"*.
+
+### Changed
+
+- **드롭된 행이 한 줄 로그가 아니라 라벨이 붙은 세 가지 사실로 읽힙니다.** 이전에는 원시 로그 텍스트
+  (`quarantined row pk[id=3]: datatype limit greater than 1048576 bytes not supported for bytea`)로
+  표시되고, 테이블명은 위쪽 배지에, PK는 문장 중간에 묻혀 있었습니다. 이제 앰버 카드로 표시됩니다:
+  테이블명을 눈에 띄는 텍스트로, **PK를 독립된 monospace 칩으로**(소스에서 찾을 때 쓰는 실행 가능한
+  핸들이므로), "dropped" 배지, 그리고 그 아래에 중복되는 `quarantined row pk[...]` 접두를 뗀 기술적
+  이유. 파싱할 수 없는 메시지는 변형하지 않고 그대로 보여 줍니다.
+- **Attempts 열이 그 숫자의 의미를 말해 줍니다.** `1 · 3 err`는 재시도 횟수처럼 읽히고, 그것이 *대상이
+  영구히 갖지 못할 행 수*라는 힌트가 전혀 없었습니다. 이제 영구 격리 행은 `1 · 3 rows dropped`,
+  그 외에는 `1 · 3 errors`로 표시합니다.
+- **"Accept quarantined rows & continue" 옆의 중복 문구를 제거했습니다.** 완전성 배너의 조치 안내와
+  같은 내용("소스 값을 고쳐 해당 테이블을 Reload하거나 갭을 수락")이어서 한 화면에 같은 조언이 두 번
+  나왔습니다. 배너가 판정과 조치를 함께 담고 있으므로 배너 쪽을 유지합니다.
+
+### Tests
+
+- 변이 5개 검출 — 테이블 수 헤더 복원, 난해한 `err` 표기 복원, 비정형 메시지에서 잘못된 PK 추출 포함.
+
 ## v0.1.204
 
 ### Fixed

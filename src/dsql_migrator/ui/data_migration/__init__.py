@@ -3522,11 +3522,77 @@ def _rows_breakdown_tooltip(row: "FullLoadTableRow") -> str:
 
 
 def _format_attempts_cell(row: "FullLoadTableRow") -> str:
-    """Attempts, with a trailing error marker so a separate Errors column isn't
-    needed: ``"5"`` clean, ``"5 · 1 err"`` when the table logged errors."""
+    """Attempts, with a plain-language error marker so no Errors column is needed.
+
+    ``"1"`` clean, ``"1 · 3 rows dropped"`` when rows were permanently quarantined, and
+    ``"1 · 3 errors"`` for other logged errors. "3 err" was cryptic -- it read like a
+    retry count and gave no hint that the number meant *rows the target will never
+    hold*, which is the one thing a reader scanning this column needs to notice.
+    """
+    if row.rows_quarantined:
+        noun = "row" if row.rows_quarantined == 1 else "rows"
+        return f"{row.attempts} · {row.rows_quarantined} {noun} dropped"
     if row.errors:
-        return f"{row.attempts} · {row.errors} err"
+        noun = "error" if row.errors == 1 else "errors"
+        return f"{row.attempts} · {row.errors} {noun}"
     return str(row.attempts)
+
+
+def _parse_quarantined_pk(message: str) -> "Optional[str]":
+    """Extract the primary key from a ``quarantined row pk[...]: reason`` message.
+
+    Returns ``None`` when the message is not in that shape, so a caller falls back to
+    showing it verbatim rather than mangling an unexpected format.
+    """
+    prefix = "quarantined row pk["
+    text = str(message or "")
+    if not text.startswith(prefix):
+        return None
+    end = text.find("]", len(prefix))
+    if end == -1:
+        return None
+    return text[len(prefix) : end] or None
+
+
+def _quarantined_reason(message: str) -> str:
+    """Return just the reason from a ``quarantined row pk[...]: reason`` message."""
+    text = str(message or "")
+    marker = "]: "
+    index = text.find(marker)
+    if text.startswith("quarantined row pk[") and index != -1:
+        return text[index + len(marker) :].strip()
+    return text.strip()
+
+
+def _quarantine_detail_row(ui, *, row, action=None) -> None:
+    """Render one dropped-row entry: table, primary key, and the reason.
+
+    Replaces a single run-on line ("quarantined row pk[id=3]: datatype limit greater
+    than 1048576 bytes not supported for bytea") in which the table name sat in a badge
+    above and the PK was buried mid-sentence. The three facts a reader needs -- WHICH
+    table, WHICH row, WHY -- are now separately labelled, with the table name given
+    prominence and the raw driver text kept last as the technical reason.
+    """
+    pk = _parse_quarantined_pk(row.error_message)
+    reason = _quarantined_reason(row.error_message)
+    with ui.row().classes(
+        "items-start gap-3 w-full no-wrap rounded-md border border-amber-200 "
+        "bg-amber-50 p-3"
+    ):
+        ui.icon("report_problem").classes("text-amber-600 text-lg")
+        with ui.column().classes("gap-1 flex-1 min-w-0"):
+            with ui.row().classes("items-center gap-2 flex-wrap"):
+                ui.label(row.table).classes("text-sm font-semibold text-gray-900")
+                if pk:
+                    # The PK is the actionable handle -- it is what you search the
+                    # source with -- so it gets its own monospace chip instead of
+                    # being buried mid-sentence.
+                    ui.badge(pk).props("color=amber-8 outline").classes("font-mono")
+                ui.badge("dropped").props("color=amber-8")
+            ui.label(reason).classes("text-xs text-gray-700 break-words")
+        if action is not None:
+            with ui.row().classes("items-center gap-1 no-wrap shrink-0"):
+                action()
 
 
 # Friendly labels for each load state, used by the status-distribution chips.
@@ -3895,26 +3961,36 @@ def _render_full_load_progress(
                 )
 
     if quarantined:
+        # Count ROWS, not table entries. ``quarantined`` holds one entry per TABLE (each
+        # carrying that table's latest message), so len() said "Quarantined rows (1)"
+        # for a table that dropped 3 -- contradicting the banner right below it, which
+        # counts rows. The per-chunk totals are the authority.
+        dropped_rows = sum(r.rows_quarantined for r in rows) or len(quarantined)
+        row_noun = "row" if dropped_rows == 1 else "rows"
+        table_noun = "table" if len(quarantined) == 1 else "tables"
         with ui.column().classes("w-full gap-2"):
             render_notice(
                 ui,
                 tone="warning",
                 header=(
-                    f"Quarantined rows ({len(quarantined)}) — the table loaded; "
-                    "these rows were permanently dropped (e.g. a value over DSQL's "
-                    "~1 MiB per-value limit)"
+                    f"{dropped_rows} {row_noun} permanently dropped across "
+                    f"{len(quarantined)} {table_noun} — the rest of each table loaded"
                 ),
             )
             for row in quarantined:
-                _failure_row(
-                    table_name=f"{row.table} · Done — quarantined",
-                    message=row.error_message,
-                    tone="warning",
+                _quarantine_detail_row(
+                    ui,
+                    row=row,
                     action=_quar_reload(row.table),
                 )
             # When the ONLY incompleteness is quarantine, offer to accept the gap
             # and unblock CDC (Validation still reports it). Real failures suppress
             # this -- they must be retried/reloaded first.
+            #
+            # No caption beside the button: the completeness banner below already gives
+            # exactly this guidance ("fix the source value(s) and Reload that table ...
+            # or accept the gap to continue (Validation reports it)"), so repeating it
+            # here made the same advice appear twice on one screen.
             if (
                 quarantine_only
                 and terminal
@@ -3926,10 +4002,6 @@ def _render_full_load_progress(
                         on_click=accept_quarantine_and_continue,
                         icon="check",
                     ).props("unelevated no-caps color=warning")
-                    ui.label(
-                        "Fix the source value(s) and Reload to load them, or accept "
-                        "the gap to proceed to CDC (the gap is reported in Validation)."
-                    ).classes("text-xs text-gray-500")
 
 
 def _render_completeness_banner(
