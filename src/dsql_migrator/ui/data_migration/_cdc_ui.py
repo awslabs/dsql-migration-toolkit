@@ -4172,9 +4172,19 @@ def _render_cdc_error_download(ui, migration_state, log_key: str) -> None:
                 f"Could not generate the error log: {exc}", type="negative"
             )
 
+    # Named the same way as the Full Load download: WHAT it is and HOW MUCH, not the file
+    # format. Saying "CDC" also matters here -- both steps offer a download, and
+    # "Download error log" alone gave no way to tell which one you were getting.
+    noun = "error" if summary.total_errors == 1 else "errors"
     ui.button(  # type: ignore[attr-defined]
-        "Download error log (NDJSON)", on_click=_download_log
-    ).props("outline dense")
+        f"Download CDC error log ({summary.total_errors} {noun})",
+        on_click=_download_log,
+        icon="download",
+    ).props("outline dense no-caps").tooltip(  # type: ignore[attr-defined]
+        "One line per error with the table, primary key, reason and timestamp — never "
+        "row values. Saved as NDJSON (one JSON object per line), readable in any text "
+        "editor."
+    )
 
 def _render_cdc_lob_exclusion_panel(
     ui, migration_state, inventory: Optional[SourceInventory], refresh

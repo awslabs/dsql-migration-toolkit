@@ -5,6 +5,58 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.207
+
+### Changed
+
+- **The accept-the-gap action now sits below the verdict it carries out.** It rendered
+  inside the quarantine panel, which comes *before* the completeness banner — so the
+  operator was asked to decide before reading the conclusion they were deciding on. The
+  order is now: per-row detail → verdict → the action the verdict describes → download.
+- **The "Data errors" heading and count are gone.** With errors, every one was already
+  listed above with its table, primary key and reason, so a heading restating the count
+  was the same fact a fourth time; with none, it printed a section header over "No data
+  errors recorded." — a block asserting an absence. What the section uniquely offers is
+  the download, so it is now just that button.
+- **The download button is named for the reader, not the file format.** "Download error
+  log (NDJSON)" led with a format nobody asked about and never said which step's errors it
+  held, though both Full Load and CDC offer one. They now read "Download Full Load error
+  log (3 errors)" / "Download CDC error log (N errors)", with the format and the
+  per-line contents moved to the tooltip.
+
+### Fixed
+
+- **"Accept quarantined rows & continue" looked like it did nothing.** The click DID work
+  — it marked the step complete, unblocked the next step, and wrote an activity entry —
+  but no render path read the accepted flag (it was only consumed when a *new* load runs),
+  so the panel and its button re-rendered identically. The button is now replaced by a
+  green "Gap accepted — Full Load marked complete" notice that also says what is now
+  possible, rather than leaving a control that invites a second, equally invisible click.
+- **An accepted gap was still reported as a problem.** The amber "Full Load finished with
+  issues" banner sat directly below the green confirmation, re-flagging the very thing the
+  operator had just resolved by explicit decision. It now reads "Full Load complete — with
+  an accepted gap", naming the dropped rows and pointing at Validation — while never
+  claiming every row loaded, because they did not. A run with a **real** failure keeps the
+  warning even when the flag is set, so accepting a gap can never paper over retryable
+  work.
+
+### Changed
+
+- **The snapshot row counts now match the watermark panel.** They hung *below* the panel
+  as a full-width expansion wrapping a bordered `ui.table` with its own sortable headers —
+  a second visual container in a style nothing else on the screen uses. They are one value
+  per table, so they are now labelled rows inside the panel, in the same shape as the
+  coordinates above it, with right-aligned monospace thousands-separated counts that line
+  up on the digits. Still collapsed by default (the list can be long).
+
+### Tests
+
+- Six mutations killed. One initially survived — deleting
+  `quarantine_accepted=migration_state.accept_quarantined_rows` from the render call —
+  because every other test passes the flag directly, leaving the **wiring** untested. That
+  is the third time this session a state→render wiring gap slipped past otherwise-green
+  tests, so it now has a structural assertion covering both render calls.
+
 ## v0.1.206
 
 ### Changed

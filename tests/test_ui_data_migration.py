@@ -9810,7 +9810,7 @@ def test_accept_quarantine_button_has_no_duplicate_caption() -> None:
 
     from dsql_migrator.ui import data_migration as dm
 
-    render_src = inspect.getsource(dm._render_full_load_progress)
+    render_src = inspect.getsource(dm._render_accept_quarantine_action)
     assert "Accept quarantined rows & continue" in render_src  # the button stays
     assert "Reload to load them" not in render_src, (
         "the duplicate caption beside the accept button is back"
@@ -9949,7 +9949,7 @@ def test_quarantine_section_has_no_duplicate_header() -> None:
     ui = _DetailRowUi()
     _render_full_load_progress(
         ui, job, rows, reload_table=lambda _n: None,
-        accept_quarantine_and_continue=lambda: None, quarantine_only=True,
+        quarantine_only=True,
     )
 
     joined = " ".join(ui.labels + ui.badges)
@@ -10061,16 +10061,26 @@ def test_watermark_renders_labelled_fields_not_a_four_row_table() -> None:
     assert "Export watermark" in ui.labels
 
 
-def test_watermark_keeps_the_row_counts_expansion_separate() -> None:
-    # Per-table snapshot counts are genuinely tabular and can be long, so they stay a
-    # collapsed table -- the compaction targets the four fixed fields only.
+def test_watermark_row_counts_match_the_panel_style() -> None:
+    """The per-table counts belong to the watermark panel, styled like its other fields.
+
+    They used to hang below it as a full-width expansion wrapping a bordered ``ui.table``
+    with its own sortable headers -- a second visual container in a style nothing else on
+    the screen uses. They are one value per table, so labelled monospace rows (the same
+    shape as the coordinates above) read as more of this panel's detail.
+    """
     from dsql_migrator.ui.data_migration import _render_watermark
 
     ui = _WatermarkUi()
-    _render_watermark(ui, _watermark_job(counts={"a": 5, "b": 45}))
+    _render_watermark(ui, _watermark_job(counts={"orders": 500, "items": 1500}))
 
-    assert ui.tables == 1  # the counts table, inside the expansion
-    assert any("Snapshot row counts" in e for e in ui.expansions)
+    # No nested data grid at all now.
+    assert ui.tables == 0
+    # Still collapsed behind an expansion (it can be long), with the count in the label.
+    assert any("Per-table snapshot rows (2" in e for e in ui.expansions)
+    # Each table is a labelled row with a thousands-separated count.
+    assert "orders" in ui.labels
+    assert "1,500" in ui.labels
 
 
 def test_watermark_without_a_capture_explains_itself() -> None:
@@ -10129,3 +10139,237 @@ def test_watermark_renders_after_the_progress_table() -> None:
     assert "_render_watermark" not in ast.unparse(live), (
         "the watermark must not be inside the polled region"
     )
+
+
+# ---------------------------------------------------------------------------
+# Accepting the gap must be VISIBLE on the screen that offered it
+# ---------------------------------------------------------------------------
+
+
+def test_accepting_the_gap_replaces_the_button_with_confirmation() -> None:
+    """The click worked but looked dead: nothing on this screen changed.
+
+    Accepting sets the workflow step to DONE, unblocks Validation, and writes an activity
+    entry -- but no render path read ``accept_quarantined_rows`` (it is only consumed when
+    a NEW load runs), so the panel and its button re-rendered identically. A button that
+    invites a second, equally invisible click is worse than none: the state is replaced by
+    a success notice that also says where to go next.
+    """
+    from dsql_migrator.ui.data_migration import _render_accept_quarantine_action
+
+    def _render(accepted: bool):
+        ui = _DetailRowUi()
+        ui.buttons: list[str] = []
+        _orig_button = ui.button
+
+        def _button(text="", *a, **k):
+            if text:
+                ui.buttons.append(str(text))
+            return _orig_button(text, *a, **k)
+
+        ui.button = _button
+        _render_accept_quarantine_action(
+            ui,
+            quarantine_only=True,
+            terminal=True,
+            quarantine_accepted=accepted,
+            accept_quarantine_and_continue=lambda: None,
+        )
+        return ui
+
+    before = _render(False)
+    assert any("Accept quarantined rows" in b for b in before.buttons)
+    assert not any("Gap accepted" in l for l in before.labels)
+
+    after = _render(True)
+    # The button is gone -- no invitation to re-click an action already taken.
+    assert not any("Accept quarantined rows" in b for b in after.buttons)
+    # ...and the outcome is stated, including what is now possible.
+    confirmation = next(l for l in after.labels if "Gap accepted" in l)
+    assert "Full Load marked complete" in confirmation
+    assert any("Validation" in l for l in after.labels)
+
+
+def test_completeness_banner_stops_calling_an_accepted_gap_an_issue() -> None:
+    """Green "Gap accepted" sat directly above amber "Full Load finished with issues".
+
+    The operator had just resolved that gap by explicit decision, so re-flagging it as a
+    problem contradicted the confirmation one box away. The banner now reports it as
+    complete-with-a-gap -- without ever claiming every row loaded, because they did not.
+    """
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import (
+        _render_completeness_banner,
+        build_full_load_table_rows,
+        full_load_completeness,
+    )
+
+    job = MigrationJob(job_id="j1")
+    job.status = "FAILED"
+    job.chunks = [
+        ChunkState(chunk_id="ecommerce.product_media", status="DONE", rows_loaded=12,
+                   rows_quarantined=3, attempts=1)
+    ]
+    completeness = full_load_completeness(build_full_load_table_rows(job, None, {}))
+
+    unaccepted = _BannerUi()
+    _render_completeness_banner(unaccepted, completeness, quarantine_accepted=False)
+    assert any("finished with issues" in t for t in unaccepted.texts)
+
+    accepted = _BannerUi()
+    _render_completeness_banner(accepted, completeness, quarantine_accepted=True)
+    body = " ".join(accepted.texts)
+    assert "finished with issues" not in body
+    assert "Full Load complete — with an accepted gap" in body
+    assert "3 rows could not be stored" in body
+    assert "you accepted that gap" in body
+    # Must never claim a clean load.
+    assert "loaded every source row" not in body
+    # Validation still owns the gap.
+    assert "Validation" in body
+
+
+def test_an_unaccepted_or_failed_run_never_reads_as_complete() -> None:
+    # Guard the precondition: the softened verdict applies ONLY to an accepted,
+    # quarantine-only run. A real failure must keep the warning even if the flag is set,
+    # or accepting a gap would paper over a retryable failure.
+    from dsql_migrator.ui.data_migration import FullLoadTableRow, full_load_completeness
+    from dsql_migrator.ui.data_migration import _render_completeness_banner
+
+    with_failure = full_load_completeness([
+        FullLoadTableRow(table="a", state="DONE", rows_loaded=12, expected_rows=15,
+                         attempts=1, errors=3, rows_quarantined=3),
+        FullLoadTableRow(table="b", state="FAILED", rows_loaded=0, expected_rows=10,
+                         attempts=2, errors=1),
+    ])
+
+    ui = _BannerUi()
+    _render_completeness_banner(ui, with_failure, quarantine_accepted=True)
+    body = " ".join(ui.texts)
+    assert "finished with issues" in body
+    assert "accepted gap" not in body
+
+
+def test_accept_flag_is_threaded_from_state_into_both_renders() -> None:
+    """The flag must reach BOTH the panel and the banner from session state.
+
+    A mutation deleting `quarantine_accepted=migration_state.accept_quarantined_rows`
+    from the render call passed every other test here -- they all pass the flag directly,
+    so the WIRING was untested. That is the same class of gap that shipped the
+    restored-session table-selection bug and the CDC connector detail=None bug earlier in
+    this series, so assert it structurally.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    src = inspect.getsource(dm._render_full_load_step)
+    tree = ast.parse(src)
+
+    wired = {
+        node.func.id: {
+            kw.arg: ast.unparse(kw.value) for kw in node.keywords
+        }
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id
+        in ("_render_accept_quarantine_action", "_render_completeness_banner")
+    }
+
+    for fn in ("_render_accept_quarantine_action", "_render_completeness_banner"):
+        assert fn in wired, f"{fn} is not called from _render_full_load_step"
+        assert wired[fn].get("quarantine_accepted") == (
+            "migration_state.accept_quarantined_rows"
+        ), f"{fn} must receive the accepted flag from session state, got {wired[fn]}"
+
+
+def test_accept_action_renders_after_the_completeness_verdict() -> None:
+    """The action must follow the verdict it acts on.
+
+    The accept button lived inside the quarantine panel, which renders BEFORE the
+    completeness banner -- so the operator was asked to decide before reading the
+    conclusion they were deciding on. It is now its own call, placed after the banner.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm._render_full_load_step))
+
+    def _line(name: str) -> int:
+        lines = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == name
+        ]
+        assert lines, f"no call to {name}()"
+        return max(lines)
+
+    assert _line("_render_completeness_banner") < _line(
+        "_render_accept_quarantine_action"
+    ), "the accept action must render after the verdict it carries out"
+
+    # ...and it must no longer be buried in the progress panel.
+    assert "Accept quarantined rows" not in inspect.getsource(
+        dm._render_full_load_progress
+    )
+
+
+def test_error_log_download_is_named_for_the_user_not_the_file_format() -> None:
+    """"Download error log (NDJSON)" led with a format nobody asked about.
+
+    It also never said WHICH step's errors it held, though both Full Load and CDC offer
+    one. The label now names the step and the count; the format moves to the tooltip.
+    """
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.models import DataErrorRecord, MigrationJob
+    from dsql_migrator.ui.data_migration import _render_error_log
+
+    state = DataMigrationState()
+    for pk in (3, 7, 9):
+        state.error_log.record("j1", DataErrorRecord(
+            table="ecommerce.product_media", chunk_id="x",
+            message=f"quarantined row pk[id={pk}]: too big",
+            occurred_at=datetime.now(timezone.utc)))
+
+    ui = _DetailRowUi()
+    ui.buttons: list[str] = []
+    _orig = ui.button
+
+    def _button(text="", *a, **k):
+        if text:
+            ui.buttons.append(str(text))
+        return _orig(text, *a, **k)
+
+    ui.button = _button
+    _render_error_log(ui, state, MigrationJob(job_id="j1"))
+
+    (label,) = ui.buttons
+    assert label == "Download Full Load error log (3 errors)"
+    assert "NDJSON" not in label  # the format belongs in the tooltip
+    # The redundant "Data errors" heading + count line is gone -- every error is already
+    # listed above with its table, primary key and reason.
+    assert not any("Data errors" in l for l in ui.labels)
+    assert not any("data errors across" in l for l in ui.labels)
+
+
+def test_error_log_download_is_hidden_with_no_errors() -> None:
+    # With zero errors the section used to print a heading over "No data errors
+    # recorded." -- a whole block asserting an absence.
+    from dsql_migrator.core.models import MigrationJob
+    from dsql_migrator.ui.data_migration import _render_error_log
+
+    ui = _DetailRowUi()
+    ui.buttons: list[str] = []
+    ui.button = lambda text="", *a, **k: ui.buttons.append(str(text)) or ui._El(ui)
+
+    _render_error_log(ui, DataMigrationState(), MigrationJob(job_id="j1"))
+
+    assert ui.buttons == []
+    assert ui.labels == []

@@ -1728,36 +1728,41 @@ def _render_watermark(ui: object, job: MigrationJob) -> None:
                     + ("text-gray-400 italic" if unavailable else "text-gray-800")
                 )
 
-    if display.table_row_counts:
-        approximate = getattr(job.watermark, "row_counts_approximate", False)
-        heading = (
-            f"Snapshot row counts (estimated, {len(display.table_row_counts)})"
-            if approximate
-            else f"Snapshot row counts ({len(display.table_row_counts)})"
-        )
-        count_columns = [
-            {"name": "table", "label": "Table", "field": "table", "align": "left"},
-            {
-                "name": "rows",
-                "label": "Snapshot rows (est.)" if approximate else "Snapshot rows",
-                "field": "rows",
-            },
-        ]
-        count_rows = [
-            {"table": table, "rows": count}
-            for table, count in display.table_row_counts.items()
-        ]
-        # Collapsed by default so the watermark stays compact; the per-table
-        # counts are detail the user can expand on demand.
-        with ui.expansion(heading, icon="numbers").classes("w-full"):  # type: ignore[attr-defined]
-            if approximate:
-                ui.label(  # type: ignore[attr-defined]
-                    "Estimates from the source catalog (no COUNT(*) scan) to "
-                    "minimize source load; exact counts are verified in Validation."
-                ).classes("text-xs text-gray-400")
-            ui.table(  # type: ignore[attr-defined]
-                columns=count_columns, rows=count_rows, row_key="table"
-            ).classes("w-full")
+        if display.table_row_counts:
+            approximate = getattr(job.watermark, "row_counts_approximate", False)
+            count = len(display.table_row_counts)
+            heading = (
+                f"Per-table snapshot rows ({count}, estimated)"
+                if approximate
+                else f"Per-table snapshot rows ({count})"
+            )
+            # INSIDE the watermark panel and styled like its other fields. It used to sit
+            # outside as a full-width Quasar expansion wrapping a bordered ``ui.table``
+            # with its own sortable headers -- a second visual container hanging below the
+            # panel it belongs to, in a style nothing else on the screen uses. The counts
+            # are one value per table, so labelled monospace rows (the same shape as the
+            # coordinates above) read as more of this panel's detail rather than a
+            # separate data grid.
+            with ui.expansion(heading, icon="numbers").classes(  # type: ignore[attr-defined]
+                "w-full text-xs"
+            ).props("dense header-class=text-gray-600"):
+                if approximate:
+                    ui.label(  # type: ignore[attr-defined]
+                        "Estimated from the source catalog (no COUNT(*) scan) to spare "
+                        "the source; exact counts are verified in Validation."
+                    ).classes("text-xs text-gray-400 pb-1")
+                for table, rows_count in display.table_row_counts.items():
+                    with ui.row().classes(  # type: ignore[attr-defined]
+                        "items-baseline gap-2 no-wrap w-full"
+                    ):
+                        ui.label(table).classes(  # type: ignore[attr-defined]
+                            "text-xs text-gray-500 flex-1 min-w-0 truncate"
+                        )
+                        # Right-aligned monospace so a column of counts lines up on the
+                        # digits and is comparable at a glance.
+                        ui.label(f"{rows_count:,}").classes(  # type: ignore[attr-defined]
+                            "text-xs font-mono text-gray-800 shrink-0 text-right"
+                        )
 
 
 def _render_load_status(ui, view: LoadStatusView) -> None:
@@ -3002,10 +3007,6 @@ def _render_full_load_step(
             rows,
             reload_table=reload_table,
             reload_confirm=_open_reload_confirm,
-            accept_quarantine_and_continue=accept_quarantine_and_continue,
-            quarantine_only=_incomplete_is_quarantine_only(
-                current, migration_state.error_log
-            ),
             ai_error_opener=ai_error_opener,
             page_state=_progress_page,
         )
@@ -3019,7 +3020,20 @@ def _render_full_load_step(
             else False
         )
         _render_completeness_banner(
-            ui, full_load_completeness(rows), approximate=approximate
+            ui,
+            full_load_completeness(rows),
+            approximate=approximate,
+            quarantine_accepted=migration_state.accept_quarantined_rows,
+        )
+        # The action the banner just described, directly beneath its verdict.
+        _render_accept_quarantine_action(
+            ui,
+            quarantine_only=_incomplete_is_quarantine_only(
+                current, migration_state.error_log
+            ),
+            terminal=current.status in ("DONE", "FAILED", "CANCELLED"),
+            quarantine_accepted=migration_state.accept_quarantined_rows,
+            accept_quarantine_and_continue=accept_quarantine_and_continue,
         )
         _render_error_log(ui, migration_state, current)
         if running:
@@ -3690,7 +3704,11 @@ def _render_full_load_progress(
     *,
     reload_table=None,
     reload_confirm=None,
-    accept_quarantine_and_continue=None,
+    # The accept-the-gap action moved OUT of this function: it now renders after the
+    # completeness banner (see _render_accept_quarantine_action), so the button that
+    # carries out the banner's remedy sits directly beneath the verdict rather than
+    # above it. ``quarantine_only`` is kept because the panel still gates the per-row
+    # Reload on a settled, quarantine-only run.
     quarantine_only: bool = False,
     ai_error_opener=None,
     page_state=None,
@@ -4019,29 +4037,58 @@ def _render_full_load_progress(
                     row=row,
                     action=_quar_reload(row.table),
                 )
-            # When the ONLY incompleteness is quarantine, offer to accept the gap
-            # and unblock CDC (Validation still reports it). Real failures suppress
-            # this -- they must be retried/reloaded first.
-            #
-            # No caption beside the button: the completeness banner below already gives
-            # exactly this guidance ("fix the source value(s) and Reload that table ...
-            # or accept the gap to continue (Validation reports it)"), so repeating it
-            # here made the same advice appear twice on one screen.
-            if (
-                quarantine_only
-                and terminal
-                and accept_quarantine_and_continue is not None
-            ):
-                with ui.row().classes("items-center gap-2 w-full"):
-                    ui.button(
-                        "Accept quarantined rows & continue",
-                        on_click=accept_quarantine_and_continue,
-                        icon="check",
-                    ).props("unelevated no-caps color=warning")
+
+def _render_accept_quarantine_action(
+    ui,
+    *,
+    quarantine_only: bool,
+    terminal: bool,
+    quarantine_accepted: bool,
+    accept_quarantine_and_continue=None,
+) -> None:
+    """Render the accept-the-gap action (or its accepted state), or nothing.
+
+    Rendered AFTER the completeness banner, not inside the quarantine panel: the banner
+    states the verdict and names the remedy, so the button that carries out that remedy
+    belongs directly beneath it. Sitting above the verdict, it asked the operator to
+    decide before reading the conclusion they were deciding on.
+
+    Only offered when quarantine is the ONLY incompleteness -- a retryable failure must be
+    retried or reloaded first, never waved past.
+    """
+    if not (quarantine_only and terminal and accept_quarantine_and_continue is not None):
+        return
+    with ui.row().classes("items-center gap-2 w-full"):
+        if quarantine_accepted:
+            # ACKNOWLEDGE the click. Accepting sets the workflow step to DONE and
+            # unblocks Validation/CDC, but none of that was visible HERE -- the panel and
+            # its button re-rendered unchanged, so the button looked dead even though it
+            # had worked. Show the accepted state (and what is now possible) instead of a
+            # control that invites a second, equally invisible click.
+            render_notice(
+                ui,
+                tone="success",
+                header="Gap accepted — Full Load marked complete",
+                body=(
+                    "The dropped rows are an acknowledged gap, so the next step is "
+                    "unblocked. Validation (Step 4) reports the gap against the source; "
+                    "reloading a table after fixing its source value still closes it."
+                ),
+            )
+        else:
+            ui.button(
+                "Accept quarantined rows & continue",
+                on_click=accept_quarantine_and_continue,
+                icon="check",
+            ).props("unelevated no-caps color=warning")
 
 
 def _render_completeness_banner(
-    ui, completeness: "FullLoadCompleteness", *, approximate: bool = False
+    ui,
+    completeness: "FullLoadCompleteness",
+    *,
+    approximate: bool = False,
+    quarantine_accepted: bool = False,
 ) -> None:
     """Render the source-vs-loaded completeness verdict once the load settles.
 
@@ -4064,6 +4111,31 @@ def _render_completeness_banner(
             body=(
                 f"All {completeness.total} tables loaded every source row "
                 "(loaded rows match the source snapshot count)."
+            ),
+        )
+        return
+
+    # The gap was explicitly ACCEPTED and nothing else is wrong: the run is complete by
+    # the operator's own decision, so keeping the amber "finished with issues" contradicted
+    # the green "Gap accepted" notice directly above it. State the gap plainly, but do not
+    # re-flag as a problem something the operator has already resolved -- while never
+    # claiming every row loaded, because they did not.
+    if (
+        quarantine_accepted
+        and completeness.failed == 0
+        and completeness.quarantined_rows
+    ):
+        row_noun = "row" if completeness.quarantined_rows == 1 else "rows"
+        _render_notice(
+            ui,
+            tone="success",
+            header="Full Load complete — with an accepted gap",
+            body=(
+                f"{completeness.quarantined_rows} {row_noun} could not be stored and "
+                f"were permanently dropped ({', '.join(completeness.quarantined_tables)}"
+                "); you accepted that gap, so the next step is unblocked. Every other "
+                "row loaded. Validation (Step 4) still reports the gap against the "
+                "source."
             ),
         )
         return
@@ -4497,8 +4569,12 @@ def _render_error_log(ui, migration_state, job: MigrationJob) -> None:
     """
     job_id = job.job_id
     summary = migration_state.error_log.summary(job_id)
-    ui.label("Data errors").classes("text-sm font-semibold")
-    ui.label(format_error_summary(summary)).classes("text-sm text-gray-600")
+    # NO "Data errors" heading + count when there is nothing to download: with zero
+    # errors it printed a section header over "No data errors recorded." -- a whole block
+    # asserting an absence. And when there ARE errors, every one of them is already shown
+    # above with its table, primary key and reason, so a heading restating the count was
+    # the same fact a fourth time. What this section uniquely offers is the DOWNLOAD, so
+    # it is now just that button (its label already names what it contains).
     if summary.total_errors > 0:
         def _download_log() -> None:
             try:
@@ -4512,9 +4588,21 @@ def _render_error_log(ui, migration_state, job: MigrationJob) -> None:
                     f"Could not generate the error log: {exc}", type="negative"
                 )
 
-        ui.button(
-            "Download error log (NDJSON)", on_click=_download_log
-        ).props("outline")
+        with ui.row().classes("items-center gap-2 w-full"):
+            # Name it in the user's terms: WHAT it is ("Full Load error log") and HOW MUCH
+            # ("3 errors"). "Download error log (NDJSON)" led with a file format nobody
+            # asked about and never said which step's errors it held.
+            noun = "error" if summary.total_errors == 1 else "errors"
+            ui.button(
+                f"Download Full Load error log ({summary.total_errors} {noun})",
+                on_click=_download_log,
+                icon="download",
+            ).props("outline no-caps size=sm").tooltip(
+                format_error_summary(summary)
+                + " One line per error with the table, primary key, reason and "
+                "timestamp — never row values. Saved as NDJSON (one JSON object per "
+                "line), readable in any text editor."
+            )
 
 
 
