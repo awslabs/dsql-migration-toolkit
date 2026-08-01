@@ -5,6 +5,33 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.209
+
+### Fixed
+
+- **Each dropped row offered its own "Reload" button, but Reload acts on the whole
+  table.** Three dropped rows produced three cards, each with a Reload that did exactly
+  the same thing while looking like it acted on that row alone. The dropped rows are now
+  **grouped into one card per table**, with a single Reload.
+
+### Changed
+
+- **A table's dropped rows are listed compactly instead of one card each.** Every card
+  repeated the table name and the same reason, so three dropped rows filled the screen
+  with three near-identical boxes. One card per table now states the table and the reason
+  once, shows the count ("3 rows dropped"), and lists the primary keys as monospace chips
+  — which stays readable as the count grows. Beyond 12 chips the list truncates with a
+  "+N more" marker; the count badge always reports the real total, and the full list is in
+  the downloadable error log. Genuinely different reasons within one table are all kept —
+  deduplication must not hide a second cause — and a row whose message has no parseable
+  primary key still contributes its reason rather than vanishing.
+
+### Tests
+
+- Six mutations killed, including removing the grouping, collapsing two different reasons
+  into one, dropping the chip limit, and letting the count badge report the truncated
+  number instead of the true total.
+
 ## v0.1.208
 
 ### Fixed

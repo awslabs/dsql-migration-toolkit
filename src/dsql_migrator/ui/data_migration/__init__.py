@@ -3654,17 +3654,59 @@ def _quarantined_reason(message: str) -> str:
     return text.strip()
 
 
-def _quarantine_detail_row(ui, *, table: str, message: str, action=None) -> None:
-    """Render one dropped-row entry: table, primary key, and the reason.
+_QUARANTINE_PK_CHIP_LIMIT = 12
 
-    Replaces a single run-on line ("quarantined row pk[id=3]: datatype limit greater
-    than 1048576 bytes not supported for bytea") in which the table name sat in a badge
-    above and the PK was buried mid-sentence. The three facts a reader needs -- WHICH
-    table, WHICH row, WHY -- are now separately labelled, with the table name given
-    prominence and the raw driver text kept last as the technical reason.
+
+def _group_quarantine_entries(
+    entries: "Sequence[tuple[str, str]]",
+) -> "list[tuple[str, list[str], list[str]]]":
+    """Group ``(table, message)`` entries into ``(table, primary_keys, reasons)``.
+
+    One group per TABLE, in first-seen order, because the shared facts (the table and --
+    almost always -- the reason) belong stated once, and because Reload acts on the whole
+    table: a per-row card offered one identical Reload button per row.
+
+    ``reasons`` is deduplicated while preserving order: a table usually drops rows for the
+    same reason (one oversized column), so this collapses to a single line; when the
+    reasons genuinely differ they are all kept rather than picking one. A row whose message
+    carries no parseable primary key contributes only its reason, so an unexpected format
+    still surfaces instead of vanishing.
     """
-    pk = _parse_quarantined_pk(message)
-    reason = _quarantined_reason(message)
+    grouped: "dict[str, tuple[list[str], list[str]]]" = {}
+    for table, message in entries:
+        pks, reasons = grouped.setdefault(table, ([], []))
+        pk = _parse_quarantined_pk(message)
+        if pk:
+            pks.append(pk)
+        reason = _quarantined_reason(message)
+        if reason and reason not in reasons:
+            reasons.append(reason)
+    return [(table, pks, reasons) for table, (pks, reasons) in grouped.items()]
+
+
+def _quarantine_detail_row(
+    ui,
+    *,
+    table: str,
+    primary_keys: "Sequence[str]" = (),
+    reasons: "Sequence[str]" = (),
+    action=None,
+) -> None:
+    """Render one table's dropped rows: the table, every primary key, and the reason(s).
+
+    Replaces a run-on log line ("quarantined row pk[id=3]: datatype limit greater than
+    1048576 bytes not supported for bytea") in which the table name sat in a badge above
+    and the PK was buried mid-sentence. The facts a reader acts on -- WHICH table, WHICH
+    rows, WHY -- are separately labelled, with the primary keys as monospace chips because
+    they are the handles you search the source with.
+
+    One card per table keeps this compact as the count grows: 12 chips instead of 12 cards
+    each repeating the same table name, reason and Reload button. Beyond that the chips are
+    truncated with a "+N more" marker -- the full list is always in the downloadable error
+    log, so the screen does not need to be exhaustive.
+    """
+    shown = list(primary_keys[:_QUARANTINE_PK_CHIP_LIMIT])
+    hidden = max(0, len(primary_keys) - len(shown))
     with ui.row().classes(
         "items-start gap-3 w-full no-wrap rounded-md border border-amber-200 "
         "bg-amber-50 p-3"
@@ -3673,13 +3715,26 @@ def _quarantine_detail_row(ui, *, table: str, message: str, action=None) -> None
         with ui.column().classes("gap-1 flex-1 min-w-0"):
             with ui.row().classes("items-center gap-2 flex-wrap"):
                 ui.label(table).classes("text-sm font-semibold text-gray-900")
-                if pk:
-                    # The PK is the actionable handle -- it is what you search the
-                    # source with -- so it gets its own monospace chip instead of
-                    # being buried mid-sentence.
-                    ui.badge(pk).props("color=amber-8 outline").classes("font-mono")
-                ui.badge("dropped").props("color=amber-8")
-            ui.label(reason).classes("text-xs text-gray-700 break-words")
+                # Count first: with many chips the number is what you read, and it also
+                # covers the truncated case where the chips alone under-report.
+                if primary_keys:
+                    noun = "row" if len(primary_keys) == 1 else "rows"
+                    ui.badge(f"{len(primary_keys)} {noun} dropped").props("color=amber-8")
+                else:
+                    ui.badge("dropped").props("color=amber-8")
+            if shown:
+                with ui.row().classes("items-center gap-1 flex-wrap"):
+                    for pk in shown:
+                        ui.badge(pk).props("color=amber-8 outline").classes("font-mono")
+                    if hidden:
+                        ui.label(f"+{hidden} more").classes(
+                            "text-xs text-gray-500"
+                        ).tooltip(
+                            "The full list of dropped primary keys is in the "
+                            "downloadable Full Load error log."
+                        )
+            for reason in reasons:
+                ui.label(reason).classes("text-xs text-gray-700 break-words")
         if action is not None:
             with ui.row().classes("items-center gap-1 no-wrap shrink-0"):
                 action()
@@ -4073,14 +4128,23 @@ def _render_full_load_progress(
         # NO header notice here. The completeness banner below already states the verdict
         # ("N rows permanently dropped (table)") and the remedy, and the summary chip +
         # per-row Status badge state the count above -- a header repeating it made a
-        # 3-row drop announced in four boxes on one screen. This section's job is the
+        # 3-run drop announced in four boxes on one screen. This section's job is the
         # per-row DETAIL (which row, why, and Reload), which nothing else provides.
+        #
+        # GROUPED BY TABLE, one card per table. A card per ROW repeated the table name and
+        # the reason once per row, and -- worse -- showed a "Reload" button per row when
+        # Reload is per-TABLE: three identical buttons doing the same thing, each looking
+        # like it acted on its own row. Grouping states the shared facts once and lists the
+        # primary keys as chips, which stays compact when a table drops many rows.
         with ui.column().classes("w-full gap-2"):
-            for table_name, message in quarantine_entries:
+            for table_name, pks, reasons in _group_quarantine_entries(
+                quarantine_entries
+            ):
                 _quarantine_detail_row(
                     ui,
                     table=table_name,
-                    message=message,
+                    primary_keys=pks,
+                    reasons=reasons,
                     action=_quar_reload(table_name),
                 )
 

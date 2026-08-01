@@ -9881,17 +9881,23 @@ def test_quarantine_message_is_split_into_table_pk_and_reason() -> None:
     separate badge above and the primary key mid-sentence. The PK is the actionable
     handle (it is what you search the source with), so it now gets its own chip.
     """
-    from dsql_migrator.ui.data_migration import _quarantine_detail_row
+    from dsql_migrator.ui.data_migration import (
+        _quarantine_detail_row,
+        _quarantined_reason,
+    )
 
     ui = _DetailRowUi()
 
     _quarantine_detail_row(
-        ui, table="ecommerce.product_media", message=_QUAR_MSG
+        ui,
+        table="ecommerce.product_media",
+        primary_keys=["id=3"],
+        reasons=[_quarantined_reason(_QUAR_MSG)],
     )
 
     assert "ecommerce.product_media" in ui.labels  # WHICH table, given prominence
     assert "id=3" in ui.badges  # WHICH row, as its own chip
-    assert "dropped" in ui.badges
+    assert "1 row dropped" in ui.badges  # the count leads (it covers truncation too)
     # WHY -- the technical reason, without the redundant "quarantined row pk[...]" stem.
     reason = next(l for l in ui.labels if "1048576" in l)
     assert not reason.startswith("quarantined row pk[")
@@ -10416,8 +10422,12 @@ def test_every_dropped_row_is_listed_not_one_per_table() -> None:
 
     shown = [b for b in ui.badges if b.startswith("id=")]
     assert shown == ["id=3", "id=7", "id=9"], shown
-    # The table name repeats per entry, which is what makes each row self-contained.
-    assert ui.labels.count("ecommerce.product_media") == 3
+    # GROUPED into one card per table: the table name and the shared reason are stated
+    # ONCE, not repeated per row. A card per row also meant three identical "Reload"
+    # buttons, since Reload acts on the whole table.
+    assert ui.labels.count("ecommerce.product_media") == 1
+    assert len([l for l in ui.labels if "1048576" in l]) == 1
+    assert "3 rows dropped" in ui.badges
 
 
 def test_quarantine_detail_falls_back_to_per_table_without_records() -> None:
@@ -10557,3 +10567,118 @@ def test_watermark_counts_share_the_panel_font_and_two_column_shape() -> None:
     # The heavy default header is stripped: no leading glyph, no grey fill.
     assert "numbers" not in ui.icons
     assert any("header-class" in p for p in ui.props)
+
+
+# ---------------------------------------------------------------------------
+# Grouping dropped rows by table (compact, and one Reload per table)
+# ---------------------------------------------------------------------------
+
+
+def _quar_entries(table: str, pks, reason: str = "datatype limit exceeded"):
+    return [(table, f"quarantined row pk[id={pk}]: {reason}") for pk in pks]
+
+
+def test_grouping_collapses_a_table_to_one_group() -> None:
+    from dsql_migrator.ui.data_migration import _group_quarantine_entries
+
+    grouped = _group_quarantine_entries(_quar_entries("t", (1, 2, 3)))
+
+    assert len(grouped) == 1
+    table, pks, reasons = grouped[0]
+    assert table == "t"
+    assert pks == ["id=1", "id=2", "id=3"]
+    # A table usually drops rows for the SAME reason (one oversized column), so the
+    # reason collapses to a single line instead of being repeated per row.
+    assert reasons == ["datatype limit exceeded"]
+
+
+def test_grouping_keeps_genuinely_different_reasons() -> None:
+    # Deduplication must not hide a second, different cause -- that would mislead about
+    # what needs fixing.
+    from dsql_migrator.ui.data_migration import _group_quarantine_entries
+
+    entries = _quar_entries("t", (1,), "too big") + _quar_entries("t", (2,), "bad type")
+    (_table, pks, reasons) = _group_quarantine_entries(entries)[0]
+
+    assert pks == ["id=1", "id=2"]
+    assert reasons == ["too big", "bad type"]
+
+
+def test_grouping_preserves_table_order_and_separates_tables() -> None:
+    from dsql_migrator.ui.data_migration import _group_quarantine_entries
+
+    grouped = _group_quarantine_entries(
+        _quar_entries("b", (1,)) + _quar_entries("a", (2,)) + _quar_entries("b", (3,))
+    )
+
+    assert [t for t, _p, _r in grouped] == ["b", "a"]  # first-seen order
+    assert grouped[0][1] == ["id=1", "id=3"]  # b's rows merged
+
+
+def test_grouping_keeps_a_row_whose_message_has_no_parseable_pk() -> None:
+    # An unexpected message format must still surface its reason rather than vanish.
+    from dsql_migrator.ui.data_migration import _group_quarantine_entries
+
+    (_table, pks, reasons) = _group_quarantine_entries([("t", "some other failure")])[0]
+
+    assert pks == []
+    assert reasons == ["some other failure"]
+
+
+def test_grouped_card_offers_one_reload_per_table_not_per_row() -> None:
+    """Reload acts on the whole TABLE, so a card per row offered N identical buttons.
+
+    Reported from the screen: three cards, each repeating the table name and the same
+    reason, each with its own "Reload" that did exactly the same thing -- while looking
+    like it acted on that row alone.
+    """
+    from dsql_migrator.ui.data_migration import (
+        _group_quarantine_entries,
+        _quarantine_detail_row,
+    )
+
+    ui = _DetailRowUi()
+    ui.buttons: list[str] = []
+    _orig = ui.button
+
+    def _button(text="", *a, **k):
+        if text:
+            ui.buttons.append(str(text))
+        return _orig(text, *a, **k)
+
+    ui.button = _button
+    for table, pks, reasons in _group_quarantine_entries(_quar_entries("t", (1, 2, 3))):
+        _quarantine_detail_row(
+            ui, table=table, primary_keys=pks, reasons=reasons,
+            action=lambda: ui.button("Reload"),
+        )
+
+    assert ui.buttons == ["Reload"]  # ONE, not three
+    assert ui.labels.count("t") == 1
+    assert "3 rows dropped" in ui.badges
+
+
+def test_grouped_card_truncates_a_long_primary_key_list() -> None:
+    """Many dropped rows must not produce an unbounded wall of chips.
+
+    The count badge still reports the true total, and the full list is always in the
+    downloadable error log -- so truncating the chips loses nothing.
+    """
+    from dsql_migrator.ui.data_migration import (
+        _QUARANTINE_PK_CHIP_LIMIT,
+        _group_quarantine_entries,
+        _quarantine_detail_row,
+    )
+
+    total = _QUARANTINE_PK_CHIP_LIMIT + 8
+    ui = _DetailRowUi()
+    for table, pks, reasons in _group_quarantine_entries(
+        _quar_entries("t", range(1, total + 1))
+    ):
+        _quarantine_detail_row(ui, table=table, primary_keys=pks, reasons=reasons)
+
+    chips = [b for b in ui.badges if b.startswith("id=")]
+    assert len(chips) == _QUARANTINE_PK_CHIP_LIMIT
+    assert f"+{total - _QUARANTINE_PK_CHIP_LIMIT} more" in ui.labels
+    # The badge reports the REAL total, so the truncation cannot under-report.
+    assert f"{total} rows dropped" in ui.badges
