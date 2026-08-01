@@ -3408,6 +3408,25 @@ def _rows_target_source_cell(row: "FullLoadTableRow") -> str:
     return f"{_abbrev_count(row.rows_present)} / {_abbrev_count(row.expected_rows)}"
 
 
+def _quarantined_cell_tooltip(row: "FullLoadTableRow") -> str:
+    """Hover text for a table's "N dropped" badge (empty when nothing was dropped).
+
+    Says what happened, that the rest of the table DID load (a quarantining table is
+    ``DONE``, not failed), and where to act -- so the badge is self-explanatory instead
+    of sending the reader hunting for the panel below the table.
+    """
+    dropped = row.rows_quarantined
+    if dropped <= 0:
+        return ""
+    noun = "row was" if dropped == 1 else "rows were"
+    return (
+        f"{dropped:,} {noun} permanently dropped — a value Aurora DSQL could not "
+        "store (e.g. over its ~1 MiB per-value limit). The rest of this table loaded "
+        "normally. See the quarantine panel below for each row's primary key and "
+        "reason; fix the source value and Reload this table to close the gap."
+    )
+
+
 def _rows_breakdown_tooltip(row: "FullLoadTableRow") -> str:
     """Exact figures + new/already-there split for the Rows cell's hover tooltip.
 
@@ -3450,8 +3469,16 @@ _LOAD_STATE_LABELS: dict[str, str] = {
 
 
 def _render_table_state_summary(ui, rows: "Sequence[FullLoadTableRow]") -> None:
-    """Render colored chips with the table count in each load state (O(tables))."""
+    """Render colored chips with the table count in each load state (O(tables)).
+
+    A quarantining table settles as ``DONE``, so the state chips alone read "Done: 8" on
+    a run that permanently dropped rows -- the at-a-glance summary looked clean. An amber
+    chip is appended whenever anything was dropped so the loss is visible in the same
+    glance, before the reader scrolls to the table.
+    """
     counts = summarize_table_states(rows)
+    dropped_rows = sum(row.rows_quarantined for row in rows)
+    dropped_tables = sum(1 for row in rows if row.rows_quarantined > 0)
     with ui.row().classes("items-center gap-2 flex-wrap"):
         for state in _LOAD_STATE_ORDER:
             count = counts.get(state, 0)
@@ -3461,6 +3488,19 @@ def _render_table_state_summary(ui, rows: "Sequence[FullLoadTableRow]") -> None:
             ui.badge(f"{_LOAD_STATE_LABELS[state]}: {count}").props(
                 f"color={color}"
             ).classes("text-sm q-px-sm q-py-xs")
+        if dropped_rows:
+            row_noun = "row" if dropped_rows == 1 else "rows"
+            table_noun = "table" if dropped_tables == 1 else "tables"
+            verb = "could not be stored and was" if dropped_rows == 1 else (
+                "could not be stored and were"
+            )
+            ui.badge(f"Dropped: {dropped_rows} {row_noun}").props(
+                "color=amber-8 outline"
+            ).classes("text-sm q-px-sm q-py-xs").tooltip(
+                f"{dropped_rows} {row_noun} across {dropped_tables} {table_noun} "
+                f"{verb} permanently dropped. Those tables are marked in the Status "
+                "column; the rest of their rows loaded normally."
+            )
 
 
 def _render_full_load_progress(
@@ -3516,6 +3556,12 @@ def _render_full_load_progress(
             "state": row.state,
             "state_label": _LOAD_STATE_LABELS.get(row.state, row.state),
             "state_color": _LOAD_STATE_COLORS.get(row.state, "grey"),
+            # Rows permanently dropped for this table. A quarantining table finishes
+            # DONE, so its status badge was identical to a clean table's -- the only
+            # hint was one amber panel below the whole table, which does not say WHICH
+            # row it belongs to once the table is paginated. 0 renders no badge.
+            "quarantined": row.rows_quarantined,
+            "quarantined_tooltip": _quarantined_cell_tooltip(row),
             "rows": _rows_target_source_cell(row),
             "rows_tooltip": _rows_breakdown_tooltip(row),
             "progress": _format_progress_cell(row),
@@ -3566,12 +3612,24 @@ def _render_full_load_progress(
         pagination={"rowsPerPage": _rows_per_page, "page": _saved_page},
         on_pagination_change=_on_pagination_change,
     ).props("wrap-cells dense").classes("w-full")
-    # Colored status badge per row (visualizes each table's load state).
+    # Colored status badge per row (visualizes each table's load state), plus an amber
+    # "N dropped" badge when rows were permanently quarantined. A quarantining table
+    # finishes DONE, so without this it is indistinguishable from a clean one in the
+    # Status column -- the amber panel below the table says a drop happened but not on
+    # which row, and it scrolls out of view / the row can be on another page.
     table.add_slot(
         "body-cell-state",
         r"""
         <q-td :props="props">
-          <q-badge :color="props.row.state_color" :label="props.row.state_label" />
+          <div class="row items-center no-wrap" style="gap:4px">
+            <q-badge :color="props.row.state_color" :label="props.row.state_label" />
+            <q-badge v-if="props.row.quarantined > 0" color="amber-8" outline
+                     class="items-center">
+              <q-icon name="report_problem" size="12px" class="q-mr-xs" />
+              {{ props.row.quarantined }} dropped
+              <q-tooltip>{{ props.row.quarantined_tooltip }}</q-tooltip>
+            </q-badge>
+          </div>
         </q-td>
         """,
     )

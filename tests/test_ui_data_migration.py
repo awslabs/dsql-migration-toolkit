@@ -9365,3 +9365,136 @@ def test_quarantine_count_reaches_the_row_from_the_job_chunk() -> None:
     assert rows["ecommerce.orders"].rows_quarantined == 0
     # ...and that is enough to make the run incomplete.
     assert rows["ecommerce.product_media"].complete is False
+
+
+# ---------------------------------------------------------------------------
+# Marking the tables that dropped rows (badge in Status + summary chip)
+# ---------------------------------------------------------------------------
+
+
+class _SummaryChipUi:
+    """Records badge labels and their tooltips for the state-summary row."""
+
+    def __init__(self) -> None:
+        self.badges: list[str] = []
+        self.tooltips: list[str] = []
+
+    class _El:
+        def __init__(self, ui):
+            self._ui = ui
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def tooltip(self, text="", *_a, **_k):
+            if text:
+                self._ui.tooltips.append(str(text))
+            return self
+
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: self
+
+    def badge(self, text="", *_a, **_k):
+        if text:
+            self.badges.append(str(text))
+        return self._El(self)
+
+    def __getattr__(self, _name):
+        return lambda *_a, **_k: _SummaryChipUi._El(self)
+
+
+def _summary_chips(rows):
+    from dsql_migrator.ui.data_migration import _render_table_state_summary
+
+    ui = _SummaryChipUi()
+    _render_table_state_summary(ui, rows)
+    return ui
+
+
+def test_state_summary_chips_flag_dropped_rows() -> None:
+    """"Done: 8" alone made a run that permanently dropped rows look clean.
+
+    A quarantining table settles as DONE, so the at-a-glance chips were identical to a
+    flawless run's -- the reported screenshot showed exactly that. An amber chip now
+    appears whenever anything was dropped.
+    """
+    ui = _summary_chips(_screenshot_rows(1))
+
+    assert any(b.startswith("Done:") for b in ui.badges)
+    assert "Dropped: 1 row" in ui.badges
+    tip = " ".join(ui.tooltips)
+    assert "permanently dropped" in tip
+    assert "the rest of their rows loaded normally" in tip
+
+
+def test_state_summary_chips_are_unchanged_on_a_clean_run() -> None:
+    ui = _summary_chips(_screenshot_rows(0))
+
+    assert any(b.startswith("Done:") for b in ui.badges)
+    assert not any(b.startswith("Dropped:") for b in ui.badges)
+
+
+def test_state_summary_chip_pluralizes_rows_and_tables() -> None:
+    from dsql_migrator.ui.data_migration import FullLoadTableRow
+
+    many = [
+        FullLoadTableRow(table="a", state="DONE", rows_loaded=1, expected_rows=5,
+                         attempts=1, errors=1, rows_quarantined=2),
+        FullLoadTableRow(table="b", state="DONE", rows_loaded=1, expected_rows=5,
+                         attempts=1, errors=1, rows_quarantined=3),
+    ]
+    ui = _summary_chips(many)
+
+    assert "Dropped: 5 rows" in ui.badges
+    assert "across 2 tables" in " ".join(ui.tooltips)
+
+
+def test_progress_row_carries_the_dropped_badge_data() -> None:
+    """The Status cell needs per-row data, because the amber panel below the table does
+    not say WHICH row dropped rows -- and that row may be on another page."""
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import (
+        _quarantined_cell_tooltip,
+        build_full_load_table_rows,
+    )
+
+    job = MigrationJob(job_id="j1")
+    job.chunks = [
+        ChunkState(chunk_id="ecommerce.product_media", status="DONE", rows_loaded=12,
+                   rows_quarantined=1, attempts=1),
+        ChunkState(chunk_id="ecommerce.orders", status="DONE", rows_loaded=500,
+                   attempts=1),
+    ]
+    rows = {r.table: r for r in build_full_load_table_rows(job)}
+
+    dropped = _quarantined_cell_tooltip(rows["ecommerce.product_media"])
+    assert "1 row was permanently dropped" in dropped
+    assert "rest of this table loaded normally" in dropped
+    assert "Reload this table" in dropped
+    # No badge (and no tooltip) for a clean table.
+    assert _quarantined_cell_tooltip(rows["ecommerce.orders"]) == ""
+
+
+def test_status_cell_slot_renders_the_dropped_badge_from_row_data() -> None:
+    # The badge lives in a Quasar slot template, so a wrong row key renders nothing at
+    # runtime with the suite still green. Pin the template's contract: it must be
+    # conditional on the count and read only keys the row mapping supplies.
+    import inspect
+    import re
+
+    from dsql_migrator.ui import data_migration as dm
+
+    src = inspect.getsource(dm._render_full_load_progress)
+    start = src.index('"body-cell-state"')
+    template = src[start : start + 800]
+
+    assert 'v-if="props.row.quarantined > 0"' in template, (
+        "the dropped badge must be conditional, not always rendered"
+    )
+    assert "props.row.quarantined_tooltip" in template
+    # Every row key the template reads must be produced by the row mapping above.
+    for key in set(re.findall(r"props\.row\.(\w+)", template)):
+        assert f'"{key}":' in src, f"slot reads props.row.{key} but no row supplies it"

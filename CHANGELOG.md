@@ -5,6 +5,32 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.203
+
+### Added
+
+- **The Full Load table now marks which tables dropped rows.** A quarantining table
+  finishes `DONE`, so its Status badge was identical to a clean table's — the only signal
+  was one amber panel below the whole table, which does not say *which* row it belongs to
+  and scrolls out of view (the affected row can even be on another page). Two markers,
+  both amber and both explaining themselves on hover:
+  - an outlined **"N dropped"** badge beside the row's `Done` badge, whose tooltip says
+    what happened, that the rest of the table loaded normally (it is `DONE`, not failed),
+    and how to close the gap (fix the source value, Reload that table);
+  - a **"Dropped: N rows"** chip in the state summary above the table, so the loss is
+    visible in the same glance as `Done: 8` instead of only after scrolling — the exact
+    summary that made the reported run look flawless.
+
+  Both render only when something was actually dropped; a clean run is unchanged.
+
+### Tests
+
+- Covered the summary chip (present/absent/pluralized), the per-row tooltip, and a
+  contract check on the Quasar slot template — every `props.row.*` key it reads must be
+  supplied by the row mapping. That last one matters because a wrong key in a slot
+  renders **blank at runtime with the suite still green**; the mutation that renamed a key
+  is now caught. Four mutations killed.
+
 ## v0.1.202
 
 ### Added
