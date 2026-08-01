@@ -528,6 +528,7 @@ class TunableKnob:
     description: str  # one-line Cloudscape form-field helper text
     applies: str = _APPLIES_NEXT_RUN  # when a change takes effect
     allowed: tuple[int, ...] = ()  # exact legal values ( () = any in range )
+    help_text: str = ""  # optional deeper guidance for the field's info tooltip
 
     @property
     def label(self) -> str:
@@ -573,13 +574,11 @@ TUNABLE_KNOBS: tuple[TunableKnob, ...] = (
         "Rows per batch",
         "Rows per INSERT batch (DSQL caps a transaction at 3000 rows).",
     ),
-    TunableKnob(
-        "validate_max_workers",
-        "VALIDATE_MAX_WORKERS",
-        "Validation",
-        "Tables in parallel",
-        "How many tables are checksummed at the same time.",
-    ),
+    # CDC before Validation: this tuple's group order IS the Settings tab order, and it
+    # should follow the migration journey the operator is working through (Full Load ->
+    # CDC -> Validation), not the order the knobs happened to be added. CDC also pairs
+    # with Full Load -- both are data-movement throughput -- while Validation is the
+    # after-the-fact check.
     TunableKnob(
         "cdc_sink_mcu_count",
         "CDC_SINK_MCU_COUNT",
@@ -589,6 +588,32 @@ TUNABLE_KNOBS: tuple[TunableKnob, ...] = (
         "the CPU-bound half of CDC — raise this, not the source, when it lags.",
         applies=_APPLIES_NEXT_CDC_START,
         allowed=(1, 2, 4, 8),
+        # The one knob here whose guidance does not fit a one-line description: it is a
+        # CloudFormation parameter (so the timing is unlike every other knob), it costs
+        # money, its ceiling is an AWS API limit rather than our choice, and raising it is
+        # only the right move for a specific symptom. Kept out of `description` so the
+        # row stays scannable, and out of the manual-only so it is answerable in place.
+        help_text=(
+            "When to raise it: the sink is behind (CDC lag growing) while the source "
+            "keeps up. The sink is CPU-bound; the single-task Debezium source has spare "
+            "CPU, so raising the SOURCE MCUs instead buys nothing.\n\n"
+            "1 MCU = 1 vCPU + 4 GiB per worker. 8 is the ceiling — the MSK Connect API "
+            "accepts only 1 / 2 / 4 / 8 — and each step up increases the MSK Connect "
+            "bill for as long as the connector runs.\n\n"
+            "Takes effect at the next Start CDC, because it is a cdc-stack "
+            "CloudFormation parameter rather than something the app re-reads. A pipeline "
+            "already streaming keeps its current capacity until you run Start CDC again; "
+            "doing so purely to resize is safe — connector capacity updates in place, so "
+            "the sink is resized rather than recreated, with no gap in replication and no "
+            "MSK partition-quota cost."
+        ),
+    ),
+    TunableKnob(
+        "validate_max_workers",
+        "VALIDATE_MAX_WORKERS",
+        "Validation",
+        "Tables in parallel",
+        "How many tables are checksummed at the same time.",
     ),
 )
 

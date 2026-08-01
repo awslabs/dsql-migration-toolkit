@@ -524,6 +524,7 @@ def form_field(
     label: str,
     description: str = "",
     constraint: str = "",
+    help_text: str = "",
     control_width: str = "w-24",
 ):
     """Render one AWS Console (Cloudscape "FormField") settings row.
@@ -539,6 +540,12 @@ def form_field(
     second line. That keeps a dense settings list scannable while still showing the
     guidance inline.
 
+    ``help_text`` is Cloudscape's "info" affordance: a small glyph after the label whose
+    tooltip carries the deeper explanation -- when to change the value, what it costs,
+    when it takes effect. This is NOT the old anti-pattern: ``description`` stays visible,
+    so the field is still fully readable without hovering, and the tooltip only holds the
+    detail that would bloat the row. Use it for a knob whose guidance is genuinely long.
+
     Returns the **control container** so the caller places the input via ``with``::
 
         with form_field(ui, label="Rows per batch", description="…", constraint="1–3000"):
@@ -546,9 +553,20 @@ def form_field(
     """
     with ui.column().classes("gap-0.5 w-full"):
         with ui.row().classes("items-center gap-3 no-wrap w-full"):
-            ui.label(label).classes(
-                "text-sm font-medium text-gray-900 flex-1 min-w-0 truncate"
-            )
+            if help_text:
+                # Label + glyph must sit together, so wrap them; without this the glyph
+                # is pushed to the far right by the label's flex-1.
+                with ui.row().classes("items-center gap-1 no-wrap flex-1 min-w-0"):
+                    ui.label(label).classes(
+                        "text-sm font-medium text-gray-900 truncate"
+                    )
+                    ui.icon("info_outline").classes(
+                        "text-gray-400 text-sm cursor-help shrink-0"
+                    ).tooltip(help_text)
+            else:
+                ui.label(label).classes(
+                    "text-sm font-medium text-gray-900 flex-1 min-w-0 truncate"
+                )
             slot = ui.row().classes(
                 f"items-center justify-end no-wrap shrink-0 {control_width}"
             )

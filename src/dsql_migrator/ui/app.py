@@ -854,11 +854,16 @@ def _render_footer_tools(activity_log_path: str) -> None:
             activity_tab = ui.tab("Activity log", icon="download")
         first_tab = group_tabs[0] if group_tabs else diagnostics_tab
         with ui.tab_panels(tabs, value=first_tab).classes("w-full").style(
-            # A small floor keeps the tab strip from jumping between panels of very
-            # different heights, without padding a short panel (Validation is one
-            # control) with a screen of empty space -- 22rem did exactly that. The cap
-            # makes a long panel scroll instead of pushing the dialog off-viewport.
-            "min-height: 9rem; max-height: 68vh; overflow-y: auto"
+            # FIXED height, not a min/max range: with a range the dialog resized on every
+            # tab switch (Full Load has three knobs, Validation one), so the card grew and
+            # shrank and -- because a centred dialog is positioned from its middle -- the
+            # tab strip itself moved under the pointer. Clicking through the tabs made the
+            # whole panel jump. A single height keeps the strip anchored so only the
+            # content changes. Sized to the tallest panel (Full Load: notice + 3 fields)
+            # so nothing scrolls in the normal case; the vh cap keeps a small viewport
+            # from pushing the dialog off-screen, and overflow-y auto means a panel that
+            # does exceed it scrolls inside instead of resizing the card.
+            "height: 21rem; max-height: 68vh; overflow-y: auto"
         ):
             for name, tab in zip(groups, group_tabs):
                 with ui.tab_panel(tab).classes("p-0 pt-3"):
@@ -964,6 +969,9 @@ def _render_tuning_group_controls(group: str) -> None:
                     if knob.allowed
                     else f"{knob.minimum}–{knob.maximum}"
                 ),
+                # Optional info tooltip for a knob whose full guidance (when to raise it,
+                # what it costs, when it lands) would not fit the visible description.
+                help_text=knob.help_text,
             )
             with slot:
                 if knob.allowed:
@@ -1069,6 +1077,7 @@ def _render_activity_log_download(activity_log_path: str) -> None:
     from nicegui import ui
 
     from dsql_migrator.core.activity_log import read_activity_log
+    from dsql_migrator.ui.design import form_field
 
     def _download() -> None:
         data = read_activity_log(activity_log_path, "text")
@@ -1077,16 +1086,36 @@ def _render_activity_log_download(activity_log_path: str) -> None:
             return
         ui.download(data, "migration_activity.log")
 
-    # In the Settings modal there is room to say WHAT the file contains, which the
-    # bare sidebar button could not. Outlined (not flat) so it reads as the section's
-    # action rather than a link.
-    ui.label(
-        "One UTC line per event across the whole session — connections, assessment, "
-        "schema apply, Full Load, CDC — independent of which step is open."
-    ).classes("text-xs text-gray-500")
-    ui.button("Download activity log", on_click=_download).props(
-        "outline dense icon=download no-caps size=sm color=primary"
+    # Same shape as every other Settings tab: the timing lead-in, then a form_field row
+    # whose control happens to be a button rather than an input. Previously this panel was
+    # a loose paragraph with a button under it, which made the tab look like a different
+    # kind of screen from the four beside it. The row's label/description carry what the
+    # file is, so the button itself only needs the verb -- and control_width is widened
+    # because a button is far wider than a number field.
+    ui.label("Downloads the log as it stands right now.").classes(
+        "text-xs text-gray-500 mb-2"
     )
+    with ui.column().classes("gap-3 w-full pt-1"):
+        with form_field(
+            ui,
+            label="Activity log",
+            description=(
+                "One UTC line per event across the whole session — connections, "
+                "assessment, schema apply, Full Load, CDC — independent of which step "
+                "is open."
+            ),
+            help_text=(
+                "The human-readable rendering of the audit trail. The raw NDJSON file "
+                "stays on disk for tooling.\n\n"
+                "On ECS the file lives on ephemeral task storage, so it is lost when the "
+                "task is replaced — enable Diagnostics → Mirror to stdout for a durable "
+                "copy in CloudWatch Logs."
+            ),
+            control_width="w-auto",
+        ):
+            ui.button("Download", on_click=_download).props(
+                "outline dense icon=download no-caps size=sm color=primary"
+            )
 
 
 def main() -> None:

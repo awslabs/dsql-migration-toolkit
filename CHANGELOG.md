@@ -5,6 +5,37 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.216
+
+### Changed
+
+- **The Settings dialog no longer resizes when you switch tabs.** The panel container used
+  a min/max height range, so it took each tab's natural height (Full Load has three knobs,
+  Validation one) — the card grew and shrank on every switch and, because a centred dialog
+  is positioned from its middle, the tab strip itself moved under the pointer. Clicking
+  through the tabs made the whole panel jump. It is now a fixed height sized to the tallest
+  panel, so the strip stays anchored and only the content changes (the viewport cap and
+  internal scrolling remain, so a small screen still can't push the dialog off-screen).
+
+- **Tab order now follows the migration journey: Full Load → CDC → Validation.** CDC pairs
+  with Full Load (both are data-movement throughput) while Validation is the after-the-fact
+  check; CDC previously sat last only because that knob was added later. The order is a
+  property of the config registry, which is what the tab strip derives from.
+
+- **"Sink compute (MCU)" has an info tooltip with the guidance that doesn't fit one line:**
+  when to raise it (sink lag while the source keeps up — raising the *source* MCUs buys
+  nothing), what it costs (each step up bills for as long as the connector runs, 8 is the
+  MSK Connect API ceiling), and when it lands (next Start CDC; re-running it purely to
+  resize is safe because connector capacity updates in place — no replication gap, no MSK
+  partition-quota cost). The visible label, description and accepted values are unchanged,
+  so this is added depth rather than a return to hover-only guidance.
+
+- **The Activity log tab matches the other tabs.** It was a loose paragraph with a button
+  underneath, which made it look like a different kind of screen; it is now the same form
+  row (label + description + control), with the button reduced to "Download" since the row
+  already says what the file is. Its tooltip notes that on ECS the file lives on ephemeral
+  task storage, pointing at Diagnostics → Mirror to stdout for a durable CloudWatch copy.
+
 ## v0.1.215
 
 ### Changed

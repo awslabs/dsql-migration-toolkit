@@ -53,6 +53,13 @@ class _El:
             self._recorder.clicks.append(handler)
         return self
 
+    def tooltip(self, text="", *_a, **_k):
+        # Recorded separately from `texts`: tooltip content is NOT visible text, and the
+        # design rule is that guidance must not live only here.
+        if text:
+            self._recorder.tooltips.append(str(text))
+        return self
+
     def __enter__(self):
         return self
 
@@ -70,6 +77,7 @@ class _RecordingUi:
         self.props: list[str] = []
         self.spinner_colors: list[str] = []
         self.clicks: list = []  # radio_tiles click handlers, in render order
+        self.tooltips: list[str] = []  # hover-only text, kept apart from `texts`
 
     def spinner(self, *_a, color=None, **_k):
         self.spinner_colors.append(str(color))
@@ -672,20 +680,33 @@ def test_settings_modal_gives_each_tuning_group_its_own_tab() -> None:
     )
 
 
-def test_settings_modal_panels_are_bounded_but_not_padded() -> None:
-    """A short panel must not be padded out to a tall one's height.
+def test_settings_modal_panel_height_is_fixed_so_tabs_do_not_move() -> None:
+    """Switching tabs must not resize the dialog.
 
-    A 22rem floor gave Diagnostics (two controls) a screen of empty space; the cap is
-    what keeps a long panel scrolling instead of pushing the dialog off-viewport.
+    With a min/max range the panel took each tab's natural height (Full Load has three
+    knobs, Validation one), so the card grew and shrank on every switch -- and because a
+    centred dialog is positioned from its middle, the tab strip itself moved under the
+    pointer, making the whole panel jump as you clicked through. A single fixed height
+    anchors the strip so only the content changes.
     """
     import inspect
+    import re
 
     from dsql_migrator.ui import app
 
     src = inspect.getsource(app._render_footer_tools)
-    assert "min-height: 9rem" in src
-    assert "max-height: 68vh" in src
-    assert "overflow-y: auto" in src
+    style = re.search(r'"(height:[^"]*)"', src)
+    assert style is not None, "the panel container must set an explicit height"
+    declared = style.group(1)
+    # A FIXED height, not a floor that lets the panel grow with its content.
+    assert re.search(r"(^|;\s*)height:\s*\d", declared), declared
+    assert "min-height" not in declared, (
+        f"a min-height lets the tallest tab stretch the dialog: {declared}"
+    )
+    # Still capped against a small viewport, and a panel that exceeds it scrolls
+    # internally rather than resizing the card.
+    assert "max-height: 68vh" in declared
+    assert "overflow-y: auto" in declared
     # Persistent + an explicit close, so an outside click cannot lose a half-typed value.
     assert '.props("persistent")' in src
     assert 'icon="close"' in src
@@ -852,7 +873,24 @@ def test_cdc_tab_shows_the_mcu_dropdown_and_its_own_timing() -> None:
     assert "Sink compute (MCU)" in blob
     assert "CPU-bound" in blob
     assert "1 / 2 / 4 / 8" in blob
-    assert not [t for t in ui.texts if t.startswith("[tooltip]")]
+    # An info tooltip is allowed -- and here expected -- but ONLY as extra depth on top of
+    # a visible description. The regression to guard is the old anti-pattern: guidance
+    # available *only* on hover (unreachable on touch). So require that the visible text
+    # already explains the field, and that the tooltip adds detail rather than repeating
+    # the description as its sole home.
+    tooltips = [t[len("[tooltip]") :] for t in ui.texts if t.startswith("[tooltip]")]
+    assert len(tooltips) == 1, "the MCU field should carry exactly one info tooltip"
+    help_text = tooltips[0]
+    assert "When to raise it" in help_text
+    # The three facts that do not fit a one-line description: the symptom, the cost, and
+    # the fact a running pipeline needs Start CDC re-run.
+    assert "lag" in help_text
+    assert "bill" in help_text
+    assert "Start CDC" in help_text
+    # The tooltip is NOT just a copy of the visible description.
+    assert help_text.strip() != next(
+        t for t in ui.texts if "CPU-bound" in t and not t.startswith("[tooltip]")
+    ).strip()
     # The connection-product notice belongs to Full Load only.
     assert "Connections" not in blob
 
@@ -972,3 +1010,98 @@ def test_form_field_control_width_is_overridable_and_right_aligned() -> None:
     blob = " ".join(ui.classes)
     assert "w-40" in blob
     assert "justify-end" in blob
+
+
+def test_settings_tab_order_follows_the_migration_journey() -> None:
+    """Tabs follow Full Load -> CDC -> Validation, the order the work happens in.
+
+    The tab strip is derived from TUNABLE_KNOBS' group order, so this is a property of the
+    registry, not of the render loop. CDC pairs with Full Load (both are data-movement
+    throughput); Validation is the after-the-fact check and comes last. Previously CDC sat
+    after Validation purely because that knob was added later.
+    """
+    from dsql_migrator.config import tunable_groups
+
+    assert [name for name, _knobs in tunable_groups()] == [
+        "Full Load",
+        "CDC",
+        "Validation",
+    ]
+
+
+def test_form_field_info_tooltip_supplements_a_visible_description() -> None:
+    """The info glyph is EXTRA depth, never the only home for the guidance.
+
+    The regression it must not reintroduce: guidance available only on hover, which is
+    unreadable at a glance and unreachable on touch. So the glyph is additive -- the
+    label, description and constraint all still render as visible text.
+    """
+    from dsql_migrator.ui.design import form_field
+
+    ui = _RecordingUi()
+    form_field(
+        ui,
+        label="Sink compute (MCU)",
+        description="Visible one-liner.",
+        constraint="1 / 2 / 4 / 8",
+        help_text="The long version.",
+    )
+    # Everything visible is still emitted as text -- the tooltip is NOT among it.
+    assert ui.texts == ["Sink compute (MCU)", "Visible one-liner.", "1 / 2 / 4 / 8"]
+    # Plus an info glyph carrying the deeper guidance on hover.
+    assert "info_outline" in ui.icons
+    assert ui.tooltips == ["The long version."]
+    blob = " ".join(ui.classes)
+    assert "cursor-help" in blob
+
+    # Without help_text there is no glyph at all (no empty tooltip target).
+    plain = _RecordingUi()
+    form_field(plain, label="Rows per batch", description="Visible.")
+    assert "info_outline" not in plain.icons
+    assert plain.tooltips == []
+
+
+def test_activity_log_tab_matches_the_other_settings_tabs() -> None:
+    """The Activity log panel is a form row, not a loose paragraph plus a button.
+
+    It previously rendered as a sentence with a button beneath it, which made the tab look
+    like a different kind of screen from the four beside it.
+    """
+    import sys
+    import types
+
+    from dsql_migrator.ui import app
+
+    ui = _FormUi()
+    fake = types.ModuleType("nicegui")
+    fake.ui = ui  # type: ignore[attr-defined]
+    saved = sys.modules.get("nicegui")
+    sys.modules["nicegui"] = fake
+    try:
+        app._render_activity_log_download("/tmp/does-not-matter.ndjson")
+    finally:
+        if saved is None:
+            sys.modules.pop("nicegui", None)
+        else:
+            sys.modules["nicegui"] = saved
+
+    blob = " ".join(ui.texts)
+    # Same lead-in shape as every other tab (states when/what, up front).
+    assert "Downloads the log as it stands right now." in blob
+    # A labelled form row describing the artifact...
+    assert "Activity log" in blob
+    assert "One UTC line per event" in blob
+    # ...whose control is just the verb (the row already says what it is).
+    assert "Download" in ui.texts
+    assert "Download activity log" not in ui.texts
+    # A button is far wider than the number fields the default width is sized for, so the
+    # row must not clamp it to w-24 (that truncates the label to an ellipsis).
+    import inspect
+
+    src = inspect.getsource(app._render_activity_log_download)
+    assert 'control_width="w-auto"' in src, (
+        "the button row must not inherit the number-field control width"
+    )
+    # The ephemeral-storage caveat is available without leaving the dialog.
+    tooltips = [t for t in ui.texts if t.startswith("[tooltip]")]
+    assert tooltips and "CloudWatch" in tooltips[0]
