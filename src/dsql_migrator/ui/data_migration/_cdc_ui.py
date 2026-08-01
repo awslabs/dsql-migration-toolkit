@@ -406,6 +406,13 @@ def _render_cdc_source_config_card(
     # already seeded into connect-offsets and cannot change the live pipeline, so
     # the radio + manual inputs are locked (read-only) to avoid misleading edits.
     started = cdc_streaming_started(migration_state, job_manager)
+    # A stopped-but-previously-streamed pipeline resumes from its own committed offset, so
+    # there is no start point left to choose. Without this the card contradicted the
+    # button beneath it: "Action needed" / "needs a Full Load watermark" while Start CDC
+    # was enabled and would have worked.
+    resumes_from_offset = bool(
+        getattr(migration_state, "cdc_has_committed_offset", False)
+    )
     _render_cdc_start_point_card(
         ui,
         migration_state,
@@ -417,9 +424,13 @@ def _render_cdc_source_config_card(
         locked=started,
         session=session,
         wm_gtid_only=wm_gtid_only,
+        resumes_from_offset=resumes_from_offset,
     )
 
-    if effective_resume is None:
+    # On a restart the connector config below is not what decides the start position (the
+    # committed offset is), so an absent effective_resume must not hide the rest of the
+    # card -- it is exactly the state a resume renders in.
+    if effective_resume is None and not resumes_from_offset:
         return
 
     # Build the connector config (pure -- no AWS calls). Restrict the table list
@@ -665,6 +676,10 @@ def _render_cdc_start_point_card(
     # the actual cause and its fix (the REPLICATION CLIENT grant) instead of implying the
     # Full Load never ran.
     wm_gtid_only: bool = False,
+    # This stack streamed before, so its resume offset is already committed and there is
+    # no start point left to choose -- the card reports the resume instead of demanding a
+    # coordinate it does not need.
+    resumes_from_offset: bool = False,
 ) -> None:
     """Render the PRIMARY 'CDC start point' card with an Automatic/Manual choice.
 
@@ -702,10 +717,30 @@ def _render_cdc_start_point_card(
                     "CDC has started — the start point is locked. To change it, "
                     "stop CDC first."
                 )
-            elif effective_resume is not None:
+            elif resumes_from_offset or effective_resume is not None:
                 ui.badge("Ready", color="positive").props("outline")  # type: ignore[attr-defined]
             else:
                 ui.badge("Action needed", color="warning").props("outline")  # type: ignore[attr-defined]
+
+        # Resuming: there is no choice to present. The position lives in the connector's
+        # offsets topic, not in anything this card can set, so offering Automatic/Manual
+        # here would imply the operator must pick one -- and "Automatic — needs a Full
+        # Load watermark (unavailable)" would be actively wrong, since no watermark is
+        # needed. State the fact and stop.
+        if resumes_from_offset and not locked:
+            render_notice(
+                ui,
+                tone="success",
+                icon="restart_alt",
+                header="Resuming from the last streamed position",
+                body=(
+                    "This pipeline has streamed before, so its resume position is already "
+                    "committed on MSK (stopping CDC deleted the connectors, not the "
+                    "position). Streaming continues from there — no start point to "
+                    "choose, no Full Load watermark required, and nothing re-applied."
+                ),
+            )
+            return
 
         if wm_usable:
             auto_label = "Automatic — gapless from Full Load (recommended)"
@@ -1448,20 +1483,58 @@ def _render_cdc_start_button(
     wm_resume = (
         CdcResumePoint.from_watermark(watermark) if watermark is not None else None
     )
-    ready = (override is not None and override.has_coordinates()) or (
-        wm_resume is not None and wm_resume.has_coordinates()
+    # A RESTART needs no start point. When this stack has streamed before, its resume
+    # offset is already committed to the source connector's offsets topic -- which is
+    # pinned to a fixed name and survives a Stop (a Stop only deletes the connectors) --
+    # and the seeder skips re-seeding an offset that is at/past the watermark. So
+    # streaming resumes exactly where it stopped.
+    #
+    # Gating `ready` on a watermark alone was wrong here, and wrong in the case that
+    # matters most: the watermark is read off the Full Load JOB record, so after an app
+    # restart (job record gone) or in a CDC-only session there is none -- and Start CDC
+    # went disabled with "Set the CDC start point above first" even though the pipeline
+    # could resume perfectly. The operator was pushed toward re-entering coordinates by
+    # hand, or worse, re-running the Full Load, to recover something the connector had
+    # not lost.
+    resumes_from_offset = bool(
+        getattr(migration_state, "cdc_has_committed_offset", False)
     )
-    render_notice(
-        ui,
-        tone="info",
-        icon="rocket_launch",
-        header="Ready to start CDC",
-        body=(
-            "Infrastructure is deployed. Start CDC creates the connectors for your "
-            "selected tables (source first, then sink) and begins streaming. It "
-            "takes a few minutes; progress appears below."
-        ),
+    ready = (
+        resumes_from_offset
+        or (override is not None and override.has_coordinates())
+        or (wm_resume is not None and wm_resume.has_coordinates())
     )
+    # A restart is a materially different operation from a first start -- it resumes an
+    # existing position rather than establishing one -- so it must not be described with
+    # the first-start copy. Saying only "begins streaming" left the operator to guess
+    # whether stopping had cost them their place (and the answer, "no", is the one thing
+    # they need before pressing this).
+    if resumes_from_offset:
+        render_notice(
+            ui,
+            tone="info",
+            icon="restart_alt",
+            header="Ready to resume CDC",
+            body=(
+                "This pipeline streamed before and its resume position is still recorded "
+                "on MSK — stopping CDC removed only the connectors, not that position. "
+                "Start CDC re-creates them and continues from exactly where streaming "
+                "stopped: no gap, no re-load, and no need to re-enter a start point. It "
+                "takes a few minutes; progress appears below."
+            ),
+        )
+    else:
+        render_notice(
+            ui,
+            tone="info",
+            icon="rocket_launch",
+            header="Ready to start CDC",
+            body=(
+                "Infrastructure is deployed. Start CDC creates the connectors for your "
+                "selected tables (source first, then sink) and begins streaming. It "
+                "takes a few minutes; progress appears below."
+            ),
+        )
 
     # Show WHICH tables will stream right here, so the "pick your tables first"
     # advice is verifiable at a glance instead of asking the user to scroll up.
@@ -2487,11 +2560,20 @@ def _open_cdc_stop_dialog(ui, migration_state, on_confirm, *, partial: bool = Fa
         confirm_label = "Clean up connector"
     else:
         title = "Stop CDC — remove connectors"
+        # Spell out that the POSITION survives, not just the infrastructure. "You can
+        # restart with Start CDC" left the operator to guess whether stopping cost them
+        # their place in the binlog -- and the reasonable guess (that it does, since the
+        # connectors are deleted) is wrong. That guess is expensive: it invites re-entering
+        # coordinates by hand, or re-running the Full Load, to recover something the
+        # connector never lost.
         body = (
             f"This updates the cdc-stack '{stack_name}' to delete the two CDC "
-            "connectors and stop streaming. MSK, the VPC wiring and the plugins "
-            "are kept, so you can restart with Start CDC. MSK Connect has no pause, "
-            "so stopping means deleting the connectors."
+            "connectors and stop streaming. MSK Connect has no pause, so stopping means "
+            "deleting the connectors — but MSK, the VPC wiring and the plugins are kept, "
+            "and so is the recorded stream position. Start CDC re-creates the connectors "
+            "and continues from exactly where streaming stopped: no gap, nothing "
+            "re-applied, and no Full Load or start point needed again. You can stop and "
+            "restart as often as you like."
         )
         confirm_label = "Stop CDC"
     with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 460px"):  # type: ignore[attr-defined]

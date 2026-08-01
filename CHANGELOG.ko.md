@@ -5,6 +5,39 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.218
+
+### 수정
+
+- **Full Load 작업 레코드가 사라진 상태에서 Stop 후 Start CDC가 비활성 — 실제로는 완벽히 이어갈 수 있는데도.**
+  버튼의 준비 조건이 시작 지점(Full Load 워터마크 또는 수동 입력 좌표)을 요구했는데, 워터마크는 Full Load
+  **작업 레코드**에서 읽습니다. 그래서 앱 재시작(작업 레코드 소멸) 후나 CDC 전용 세션에서는 워터마크가 없어
+  Start CDC가 *"Set the CDC start point above first"*와 함께 비활성화됐습니다.
+
+  실제로 잃은 것은 없었습니다. CDC 중지는 커넥터 2개만 삭제합니다: 소스 커넥터의 오프셋 토픽은 인스턴스별
+  UUID 토픽이 아니라 고정 이름(`<stack>-debezium-source-offsets`)으로 핀되어 있어 Stop을 넘어 살아남고,
+  다음 Start에서 seeder가 그 오프셋을 읽어 워터마크 이상이면 재시딩을 *건너뜁니다*. 중지된 바로 그 지점부터
+  스트리밍이 재개됩니다. 즉 게이트가 백엔드는 이미 지원하는 재시작을 막고 있었고, 운영자를 binlog 좌표
+  수동 입력이나 Full Load 전체 재실행으로 몰아넣고 있었습니다 — 커넥터가 여전히 갖고 있던 위치를 되찾기 위해.
+
+  이제 스택에 커밋된 재개 오프셋이 있으면 Start CDC가 함께 해제됩니다. 신호는 `MskBootstrapServers`가 빈
+  값이면서 `DeploySink=true`인 조합이고, 이는 모호하지 않습니다: 인프라 생성은 `DeploySink=false`로 고정하고,
+  `true`로 바꾸는 것은 Start CDC뿐이며, Stop은 *부트스트랩만* 덮어씁니다(나머지는 `UsePreviousValue`로
+  전달) — 따라서 그 조합은 "시작했다가 중지함"으로만 도달합니다. 한 번도 스트리밍하지 않은 스택은 여전히
+  시작 지점을 요구하며, 이것이 최초 시작이 소스의 현재 binlog부터 시작해 Full Load 구간 전체를 조용히
+  잃는 것을 막습니다.
+
+- **재시작을 재시작으로 표현합니다.** 패널이 최초 시작 문구("…begins streaming")를 보여주고, 시작 지점 카드는
+  **Action needed** 배지와 *"Automatic — needs a Full Load watermark (unavailable)"*를 제시했습니다 —
+  그 아래 버튼은 활성이고 정상 동작하는데도. 재개 시에는 선택할 시작 지점이 없으므로(위치는 그 카드가 설정할
+  수 없는 오프셋 토픽에 있음) 이제 재개 사실을 표시합니다: *"Resuming from the last streamed position"*.
+
+- **Stop CDC 다이얼로그가 스트림 위치 보존을 명시합니다.** 기존에는 MSK와 플러그인이 유지되어 "so you can
+  restart with Start CDC"라고만 했는데, 이는 **인프라**를 말하고 **위치**는 말하지 않아 운영자가 추측하게
+  됩니다. 그 합리적 추측(커넥터를 삭제하면 위치도 사라진다)은 틀렸고, 그대로 행동하면 재적재 비용이 듭니다.
+  이제 Start CDC가 중지된 바로 그 지점부터 이어지며 갭도, 재적용도, Full Load나 시작 지점 재입력도 없다는
+  것을 명시하고, 중지/재시작을 자유롭게 반복할 수 있다고 안내합니다.
+
 ## v0.1.217
 
 ### 변경

@@ -5,6 +5,49 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.218
+
+### Fixed
+
+- **Start CDC was dead after a Stop whenever the Full Load job record was gone — even
+  though the pipeline could resume perfectly.** The button's readiness gate required a
+  start point (a Full Load watermark or a manually entered coordinate), but the watermark
+  is read off the Full Load **job record**. So after an app restart (job record pruned) or
+  in a CDC-only session there was none, and Start CDC went disabled with *"Set the CDC
+  start point above first"*.
+
+  Nothing had actually been lost. Stopping CDC deletes only the two connectors: the source
+  connector's offsets topic is pinned to a fixed name (`<stack>-debezium-source-offsets`,
+  not a per-instance UUID topic), so it survives a Stop, and on the next Start the seeder
+  reads that offset and *skips* re-seeding when it is at/past the watermark. Streaming
+  resumes exactly where it stopped. The gate was therefore blocking a restart that the
+  backend already supported — and pushing the operator toward re-entering binlog
+  coordinates by hand, or re-running the entire Full Load, to recover a position the
+  connector still had.
+
+  Start CDC now also unlocks when the stack holds a committed resume offset. The signal is
+  `DeploySink=true` while `MskBootstrapServers` is blank, which is unambiguous: the infra
+  create pins `DeploySink=false`, only Start CDC sets it `true`, and Stop overrides *only*
+  the bootstrap (everything else carries through as `UsePreviousValue`) — so that
+  combination is reachable only by "started, then stopped". A stack that has never streamed
+  still requires a start point, which is what prevents a first start from beginning at the
+  source's current binlog and silently losing the whole Full Load window.
+
+- **A restart is now described as a restart.** The panel showed the first-start copy
+  ("…begins streaming"), and the start-point card badged **Action needed** and offered
+  *"Automatic — needs a Full Load watermark (unavailable)"* — while the button beneath it
+  was enabled and would have worked. On a resume there is no start point left to choose
+  (the position lives in the offsets topic, which that card cannot set), so it now states
+  the resume instead: *"Resuming from the last streamed position"*.
+
+- **The Stop CDC dialog now says the stream position survives.** It said MSK and the
+  plugins are kept "so you can restart with Start CDC" — which describes the
+  infrastructure but never the *position*, leaving the operator to guess. The reasonable
+  guess (that deleting the connectors loses it) is wrong, and acting on it costs a
+  re-load. It now states plainly that Start CDC continues from exactly where streaming
+  stopped, with no gap, nothing re-applied, and no Full Load or start point needed again —
+  and that stop/restart can be repeated freely.
+
 ## v0.1.217
 
 ### Changed

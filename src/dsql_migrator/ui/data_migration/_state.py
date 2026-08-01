@@ -240,6 +240,12 @@ class DataMigrationState:
         self.cdc_stack_phase: Optional[str] = None
         self.cdc_stack_phase_status: Optional[str] = None
         self.cdc_stack_phase_checked: bool = False
+        # True when the probed cdc-stack has ALREADY streamed, so its resume offset is
+        # committed to the (Stop-surviving, fixed-name) offsets topic and Start CDC needs
+        # NO watermark -- streaming resumes where it stopped. See
+        # ``_status.cdc_has_committed_offset``. False until probed, so an unread stack
+        # falls back to requiring a start point rather than claiming a resume point.
+        self.cdc_has_committed_offset: bool = False
         # Other ``mysql-dsql-cdc-*`` stacks discovered in the account that the
         # current session does NOT target (name != ``cdc_stack_name``). Populated
         # best-effort by the render-time probe so the CDC screen can offer to ADOPT
@@ -471,6 +477,16 @@ class DataMigrationState:
             self.cdc_stack_phase = phase
             self.cdc_stack_phase_status = status
             self.cdc_stack_phase_checked = True
+
+    def set_cdc_has_committed_offset(self, value: bool) -> None:
+        """Cache whether the probed cdc-stack already holds a committed resume offset.
+
+        Set from the SAME describe as the phase (see ``_probe_cdc_stack_phase``) so the
+        two can never describe different stacks. When True, Start CDC must NOT require a
+        watermark: the connector resumes from its own offsets topic.
+        """
+        with self._lock:
+            self.cdc_has_committed_offset = bool(value)
 
     def set_cdc_other_stacks(self, stacks: list[tuple[str, str]]) -> None:
         """Cache other ``mysql-dsql-cdc-*`` stacks found in the account whose name is

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from dsql_migrator.core.cdc import (
     CDC_DEFAULT_STACK_NAME,
@@ -709,6 +709,36 @@ def _classify_cdc_stack_phase(discovery) -> tuple[str, Optional[str]]:
     return "infra", status
 
 
+def cdc_has_committed_offset(parameters: "Optional[Mapping[str, str]]") -> bool:
+    """True when this cdc-stack has ALREADY streamed, so its resume offset exists.
+
+    Start CDC does not need a watermark in that case: the source connector's compacted
+    offsets topic (pinned to a FIXED name, ``<stack>-debezium-source-offsets``, so it is
+    not a per-instance UUID topic) survives a Stop -- a Stop only blanks
+    ``MskBootstrapServers``, which deletes the two connectors and leaves MSK, the topics
+    and the seeder Lambda in place. On the next Start the seeder reads that offset and
+    SKIPS the seed when it is at/past the watermark (``seeder.py`` no-clobber guard), so
+    streaming resumes exactly where it stopped. A watermark is only ever needed for the
+    FIRST start, when the offsets topic is empty and the connector would otherwise begin
+    at the source's current binlog and silently lose everything since the Full Load.
+
+    The signal is ``DeploySink == "true"`` while the bootstrap is blank, and it is
+    unambiguous because of how the two writes differ: the infra create pins
+    ``DeploySink="false"``, only Start CDC sets it to ``"true"``, and Stop overrides ONLY
+    ``MskBootstrapServers`` (everything else is carried forward as
+    ``UsePreviousValue``). So that combination is reachable only by "started, then
+    stopped" -- never by a fresh infra-only deploy.
+
+    Pure (reads already-fetched CloudFormation parameters); ``None``/missing -> False, so
+    an unreadable probe falls back to requiring a start point rather than claiming a
+    resume point that may not exist.
+    """
+    params = parameters or {}
+    bootstrap = str(params.get("MskBootstrapServers", "") or "").strip()
+    deploy_sink = str(params.get("DeploySink", "") or "").strip().lower()
+    return not bootstrap and deploy_sink == "true"
+
+
 def _probe_cdc_stack_phase(migration_state, session) -> None:
     """Probe the cdc-stack's lifecycle phase once and cache it on the state.
 
@@ -743,6 +773,13 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
     phase, status = _classify_cdc_stack_phase(discovery)
     migration_state.set_cdc_stack_phase(phase, status=status)
     migration_state.set_cdc_other_stacks(others)
+    # Has this stack streamed before? If so its resume offset is already committed to
+    # the (fixed-name, Stop-surviving) offsets topic, so Start CDC needs no watermark --
+    # see cdc_has_committed_offset. Read from the SAME describe as the phase so the two
+    # can never disagree about the stack they describe.
+    migration_state.set_cdc_has_committed_offset(
+        cdc_has_committed_offset(getattr(discovery, "current_parameters", None))
+    )
     # Reconcile the replicated table set from the live stack's TableIncludeList
     # (source connector's table.include.list = each table's ``.name``), so an
     # ADOPTED / out-of-band pipeline resolves its tables even when this session

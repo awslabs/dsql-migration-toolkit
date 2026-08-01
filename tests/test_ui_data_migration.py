@@ -6425,6 +6425,14 @@ class _RecordingUi:
         def add_slot(self, *_a, **_k):
             return self
 
+        def open(self, *_a, **_k):
+            return self
+
+        def close(self, *_a, **_k):
+            # Dialogs wire Cancel/confirm to `dialog.close`, so the element the double
+            # returns for ui.dialog() must expose it or the whole body fails to build.
+            return self
+
         def __enter__(self):
             return self
 
@@ -6461,6 +6469,12 @@ class _RecordingUi:
         return self._El(self)
 
     # --- extras needed by the CDC infra-prep section -----------------------
+    def dialog(self, *_a, **_k):
+        # The confirm dialogs (Stop CDC / Delete infra) build their body inside
+        # `with ui.dialog()`, so a double without this cannot render -- and their COPY is
+        # exactly where the operator forms expectations, so it needs asserting.
+        return self._El(self)
+
     def separator(self, *_a, **_k):
         return self._El(self)
 
@@ -11533,3 +11547,290 @@ def test_start_cdc_shows_the_table_set_plainly_with_the_why_on_hover() -> None:
         assert "up front" not in blob
 
 
+
+
+# ---------------------------------------------------------------------------
+# CDC restart: a stopped-but-previously-streamed pipeline needs NO watermark
+# ---------------------------------------------------------------------------
+
+
+def test_cdc_committed_offset_signal_distinguishes_stopped_from_fresh() -> None:
+    """``DeploySink=true`` + blank bootstrap == "streamed, then stopped".
+
+    Unambiguous because of how the three writes differ: the infra create pins
+    ``DeploySink="false"``, only Start CDC sets it ``"true"``, and Stop overrides ONLY
+    ``MskBootstrapServers`` (everything else rides through as ``UsePreviousValue``). So
+    that combination is unreachable by a fresh infra-only deploy.
+
+    It matters because the resume position lives in the source connector's offsets topic,
+    which is pinned to a FIXED name and therefore survives a Stop -- so a restart needs no
+    watermark at all.
+    """
+    from dsql_migrator.ui.data_migration._status import cdc_has_committed_offset
+
+    # Fresh infra: nothing has streamed, so a start point IS required.
+    assert cdc_has_committed_offset(
+        {"MskBootstrapServers": "", "DeploySink": "false"}
+    ) is False
+    # Currently streaming: not a resume situation (the Start button is not shown).
+    assert cdc_has_committed_offset(
+        {"MskBootstrapServers": "b-1:9098", "DeploySink": "true"}
+    ) is False
+    # THE case: stopped after a real start -> resume offset exists.
+    assert cdc_has_committed_offset(
+        {"MskBootstrapServers": "", "DeploySink": "true"}
+    ) is True
+    # A whitespace-only bootstrap is still "blank" (CFN round-trips empty strings).
+    assert cdc_has_committed_offset(
+        {"MskBootstrapServers": "   ", "DeploySink": "true"}
+    ) is True
+    assert cdc_has_committed_offset(
+        {"MskBootstrapServers": "", "DeploySink": "True"}
+    ) is True
+    # Unprobed / unreadable -> False, i.e. fall back to REQUIRING a start point rather
+    # than claiming a resume point that may not exist.
+    assert cdc_has_committed_offset(None) is False
+    assert cdc_has_committed_offset({}) is False
+
+
+def test_probe_records_the_committed_offset_signal_on_state() -> None:
+    """The probe must WRITE the signal, or every reader stays False.
+
+    This is the "state exists but is never populated" gap: each render test passes the
+    flag in directly, so a probe that computed it and dropped it would leave the real UI
+    permanently on the first-start path -- Start CDC dead after a Stop -- with a fully
+    green suite. Asserted through the real probe, from a fake describe.
+    """
+    from dsql_migrator.ui.data_migration import _status
+
+    class _Discovery:
+        def __init__(self, params):
+            self.stack_status = "UPDATE_COMPLETE"
+            self.current_parameters = params
+            self.is_stable = True
+
+    class _Deployer:
+        def __init__(self, params):
+            self._params = params
+
+        def describe_stack_or_none(self, _name):
+            return _Discovery(self._params)
+
+        def list_cdc_stacks(self):
+            return []
+
+    class _Target:
+        region = "us-east-1"
+
+    class _Session:
+        target_config = _Target()
+        aws_profile = None
+
+    def _probe(params):
+        state = DataMigrationState()
+        import dsql_migrator.core.cdc_deployer as deployer_mod
+
+        original = deployer_mod.build_cdc_stack_deployer
+        deployer_mod.build_cdc_stack_deployer = lambda *_a, **_k: _Deployer(params)
+        try:
+            _status._probe_cdc_stack_phase(state, _Session())
+        finally:
+            deployer_mod.build_cdc_stack_deployer = original
+        return state
+
+    # Stopped after a start -> the signal must land on the state.
+    stopped = _probe({"MskBootstrapServers": "", "DeploySink": "true"})
+    assert stopped.cdc_has_committed_offset is True
+    assert stopped.cdc_stack_phase == "infra"  # same describe drove both
+
+    # Fresh infra -> stays False, so the start-point guard still applies.
+    fresh = _probe({"MskBootstrapServers": "", "DeploySink": "false"})
+    assert fresh.cdc_has_committed_offset is False
+
+    # Default before any probe: False (never claim a resume point that may not exist).
+    assert DataMigrationState().cdc_has_committed_offset is False
+
+
+def test_start_cdc_enabled_on_restart_without_any_watermark() -> None:
+    """The reported bug: Start CDC was dead after a Stop with no Full Load job.
+
+    The watermark is read off the Full Load JOB record, so after an app restart (job
+    record pruned) or in a CDC-only session there is none -- and Start CDC went disabled
+    with "Set the CDC start point above first", even though the connector's committed
+    offset would have resumed streaming perfectly. That pushed the operator toward
+    re-entering binlog coordinates by hand, or re-running the whole Full Load, to recover
+    something nothing had lost.
+    """
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    def _render(*, committed: bool):
+        ui = _RecordingUi()
+        state = DataMigrationState()
+        state.set_cdc_stack_phase("infra", status="UPDATE_COMPLETE")
+        state.set_cdc_has_committed_offset(committed)
+        # No job at all -> no watermark, the situation that used to dead-end.
+        state.job_id = None
+        _cdc_ui._render_cdc_start_button(
+            ui, state, _StubJobManager({}), lambda: None, inventory=None, session=None
+        )
+        return ui
+
+    resumed = _render(committed=True)
+    blob = " ".join(resumed.texts)
+    # Enabled, and framed as a RESUME rather than a first start.
+    assert "Set the CDC start point above first." not in blob
+    assert "Ready to resume CDC" in blob
+    assert "continues from exactly where streaming stopped" in blob
+    # It must state the two things the operator needs: no gap and no re-load.
+    assert "no gap" in blob
+    assert "no re-load" in blob
+
+    # Without a committed offset (a genuinely fresh stack) it stays the FIRST-start copy.
+    # That distinction is what keeps the real guard intact: a fresh stack with no
+    # watermark must not start, because the connector would begin at the source's CURRENT
+    # binlog and silently lose every change made during the Full Load. (Which of the two
+    # blocking hints shows -- prerequisites or start point -- depends on the prereq
+    # report; the invariant asserted here is that it is not framed as a resume.)
+    fresh = _render(committed=False)
+    fresh_blob = " ".join(fresh.texts)
+    assert "Ready to start CDC" in fresh_blob
+    assert "Ready to resume CDC" not in fresh_blob
+    assert "continues from exactly where streaming stopped" not in fresh_blob
+
+
+def test_start_cdc_button_is_actually_enabled_on_restart() -> None:
+    """The BUTTON state, not just the copy -- this is the defect itself.
+
+    Asserting on wording alone would pass even if the button stayed disabled, which was
+    the whole bug: Start CDC was dead after a Stop whenever the Full Load job record was
+    gone (app restart) or never existed (CDC-only session).
+    """
+    from dsql_migrator.core.models import MigrationMode
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    class _El:
+        def __init__(self, ui, label=""):
+            self._ui = ui
+            self._label = label
+
+        def props(self, value="", *_a, **_k):
+            if self._label == "Start CDC" and "disable" in str(value):
+                self._ui.start_disabled = True
+            return self
+
+        def __getattr__(self, _name):
+            # Everything else (classes/tooltip/style/on/open/close/...) is a chainable
+            # no-op; only `props` on the Start button carries signal.
+            return lambda *_a, **_k: self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    class _Ui:
+        def __init__(self):
+            self.texts: list[str] = []
+            self.start_disabled = False
+
+        def button(self, text="", *_a, **_k):
+            self.texts.append(str(text))
+            return _El(self, str(text))
+
+        def label(self, text="", *_a, **_k):
+            self.texts.append(str(text))
+            return _El(self)
+
+        def badge(self, text="", *_a, **_k):
+            self.texts.append(str(text))
+            return _El(self)
+
+        def notify(self, *_a, **_k):
+            return None
+
+        def refreshable(self, fn):
+            def _w(*a, **k):
+                return fn(*a, **k)
+
+            _w.refresh = lambda *a, **k: None
+            return _w
+
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: _El(self)
+
+    def _render(*, committed):
+        ui = _Ui()
+        state = DataMigrationState()
+        state.set_cdc_stack_phase("infra", status="UPDATE_COMPLETE")
+        state.set_cdc_has_committed_offset(committed)
+        state.job_id = None  # no Full Load job -> no watermark
+        # Prereqs already passed, so the ONLY thing that could disable the button is the
+        # start-point gate under test.
+        state.set_prereq_gated_mode(MigrationMode.CDC)
+        _cdc_ui._render_cdc_start_button(
+            ui, state, _StubJobManager({}), lambda: None, inventory=None, session=None
+        )
+        return ui
+
+    resumed = _render(committed=True)
+    assert resumed.start_disabled is False, "Start CDC must be pressable on a restart"
+    assert "Set the CDC start point above first." not in " ".join(resumed.texts)
+
+    # The guard still holds for a genuinely fresh stack: starting there with no watermark
+    # would begin at the source's CURRENT binlog and silently lose the Full Load window.
+    fresh = _render(committed=False)
+    assert fresh.start_disabled is True
+    assert "Set the CDC start point above first." in " ".join(fresh.texts)
+
+
+def test_start_point_card_reports_the_resume_instead_of_demanding_a_watermark() -> None:
+    """The card must not contradict the button beneath it.
+
+    On a restart it used to badge "Action needed" and offer "Automatic — needs a Full Load
+    watermark (unavailable)" while Start CDC was enabled and would have worked. Both are
+    wrong on a resume: no watermark is needed, and there is no start point left to choose
+    (the position is in the offsets topic, which this card cannot set).
+    """
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_start_point_card(
+        ui,
+        DataMigrationState(),
+        lambda: None,
+        wm_resume=None,
+        wm_usable=False,
+        effective_resume=None,
+        mode="auto",
+        locked=False,
+        session=None,
+        wm_gtid_only=False,
+        resumes_from_offset=True,
+    )
+    blob = " ".join(ui.texts)
+    assert "Resuming from the last streamed position" in blob
+    assert "Ready" in ui.texts
+    assert "Action needed" not in ui.texts
+    # The now-irrelevant choice is not offered at all.
+    assert "needs a Full Load watermark" not in blob
+    assert "Manual — enter a GTID or binlog position" not in blob
+
+
+def test_stop_dialog_promises_the_position_survives() -> None:
+    """The operator forms the expectation HERE, before pressing Stop.
+
+    "MSK ... are kept, so you can restart with Start CDC" said the infrastructure
+    survives but never that the stream POSITION does -- and the reasonable guess (that
+    deleting the connectors loses it) is wrong and expensive.
+    """
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    ui = _RecordingUi()
+    state = DataMigrationState()
+    _cdc_ui._open_cdc_stop_dialog(ui, state, lambda: None)
+    blob = " ".join(ui.texts)
+    assert "the recorded stream position" in blob
+    assert "continues from exactly where streaming stopped" in blob
+    assert "no Full Load or start point needed again" in blob
+    assert "stop and restart as often as you like" in blob
