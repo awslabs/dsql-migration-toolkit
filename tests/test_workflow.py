@@ -1165,6 +1165,9 @@ class _BannerUi:
         def style(self, *_a, **_k):
             return self
 
+        def tooltip(self, *_a, **_k):
+            return self
+
         def __enter__(self):
             return self
 
@@ -1417,3 +1420,248 @@ def test_start_over_tiles_name_the_stacks_they_would_delete() -> None:
     assert "cdc-solo" in solo_notice
 
 
+
+
+# ---------------------------------------------------------------------------
+# Multi-stack teardown: the banner must follow EVERY stack, then report the result
+# ---------------------------------------------------------------------------
+
+
+class _QJob:
+    def __init__(self, status: str) -> None:
+        self.status = status
+
+
+class _QueueJobManager:
+    def __init__(self, statuses: dict) -> None:
+        self._statuses = statuses
+
+    def get_status(self, job_id):
+        # JobNotFoundError, NOT KeyError: that is what the real JobManager raises and the
+        # only exception _current_job catches. A KeyError-raising double would make an
+        # unknown job crash the banner instead of reading as "settled" -- exactly the
+        # pruned-record case this must tolerate.
+        from dsql_migrator.core.job_manager import JobNotFoundError
+
+        if job_id not in self._statuses:
+            raise JobNotFoundError(job_id)
+        return _QJob(self._statuses[job_id])
+
+
+def test_banner_advances_through_every_stack_in_a_multi_stack_teardown() -> None:
+    """Start over can tear down several cdc-stacks, but the durable marker is ONE slot.
+
+    Only the first stack claims it (``should_replace_teardown_marker`` refuses the rest
+    while it runs), so the banner followed stack 1 and vanished the instant it settled --
+    while the others were still deleting and still billing for MSK / NAT, with nothing on
+    screen. The queue lets the banner move to the next unfinished stack.
+    """
+    from dsql_migrator.ui.data_migration._status import next_unfinished_teardown
+
+    queue = [("j1", "cdc-a"), ("j2", "cdc-b"), ("j3", "cdc-c")]
+
+    # First stack running -> follow it, and report its position.
+    jm = _QueueJobManager({"j1": "RUNNING", "j2": "PENDING", "j3": "PENDING"})
+    assert next_unfinished_teardown(jm, queue) == ("j1", "cdc-a", 1, 3)
+
+    # It finishes -> advance to the next, do NOT go silent.
+    jm = _QueueJobManager({"j1": "DONE", "j2": "RUNNING", "j3": "PENDING"})
+    assert next_unfinished_teardown(jm, queue) == ("j2", "cdc-b", 2, 3)
+
+    jm = _QueueJobManager({"j1": "DONE", "j2": "DONE", "j3": "RUNNING"})
+    assert next_unfinished_teardown(jm, queue) == ("j3", "cdc-c", 3, 3)
+
+    # Only when every one has settled is there nothing to follow.
+    jm = _QueueJobManager({"j1": "DONE", "j2": "DONE", "j3": "DONE"})
+    assert next_unfinished_teardown(jm, queue) is None
+
+    # A job whose record is gone (pruned / lost across a restart) counts as settled,
+    # matching how the single-stack path already treats an unknown job.
+    jm = _QueueJobManager({"j2": "RUNNING"})
+    assert next_unfinished_teardown(jm, queue) == ("j2", "cdc-b", 2, 3)
+    assert next_unfinished_teardown(_QueueJobManager({}), queue) is None
+    # Empty queue is the single-stack case -> nothing to advance to.
+    assert next_unfinished_teardown(_QueueJobManager({}), []) is None
+
+
+def test_running_banner_states_which_stack_of_how_many() -> None:
+    """Naming one stack made a multi-stack teardown look like a single one -- so it
+    appeared to finish early while the rest were still going."""
+    from dsql_migrator.ui.workflow import _cdc_teardown_banner_copy
+
+    _tone, _header, body = _cdc_teardown_banner_copy(
+        {"state": "running", "kind": "delete", "stack": "cdc-a", "index": 1, "total": 3}
+    )
+    assert "1 of 3" in body
+    assert "the rest follow" in body
+
+    # On the LAST stack "the rest follow" would be false -- and this is exactly where the
+    # operator decides whether it is worth waiting.
+    _t, _h, last = _cdc_teardown_banner_copy(
+        {"state": "running", "kind": "delete", "stack": "cdc-c", "index": 3, "total": 3}
+    )
+    assert "3 of 3" in last
+    assert "the rest follow" not in last
+    assert "the last one" in last
+
+    # A single stack says nothing about position (the old, correct wording).
+    _t2, _h2, single = _cdc_teardown_banner_copy(
+        {"state": "running", "kind": "delete", "stack": "cdc-a"}
+    )
+    assert "of 1" not in single
+
+
+def test_finished_teardown_reports_a_result_that_survives_a_refresh() -> None:
+    """Completion was signalled ONLY by a ui.notify toast, which hangs off a ui.timer and
+    so is gone after a refresh -- leaving nothing to distinguish "the 45-minute teardown
+    finished" from "it never ran", for an operation designed to be walked away from."""
+    from dsql_migrator.ui.workflow import _cdc_teardown_banner_copy
+
+    tone, header, body = _cdc_teardown_banner_copy(
+        {"state": "done", "kind": "delete", "stacks": ["cdc-a", "cdc-b"]}
+    )
+    assert tone == "success"
+    assert "deleted" in header.lower()
+    # Names EVERY stack (a multi-stack teardown previously surfaced only one) and the
+    # thing the operator cares about: billing stopped.
+    assert "cdc-a" in body and "cdc-b" in body
+    assert "billing has stopped" in body
+
+    # A stop reports what it kept, and that a restart resumes rather than re-loads.
+    tone, header, body = _cdc_teardown_banner_copy(
+        {"state": "done", "kind": "stop", "stacks": ["cdc-a"]}
+    )
+    assert tone == "success"
+    assert "connectors" in header.lower()
+    assert "resumes from where streaming left off" in body
+
+
+def test_completion_notice_is_dismissed_by_the_user_not_a_timer() -> None:
+    """Rendered with a close button and NO self-poll: auto-hiding is what made
+    "finished" indistinguishable from "never ran"."""
+    from dsql_migrator.ui.workflow import _render_cdc_teardown_banner
+
+    dismissed: list[bool] = []
+    ui = _BannerUi()
+    _render_cdc_teardown_banner(
+        ui,
+        lambda: None,  # nothing in flight
+        done_getter=lambda: {"kind": "delete", "stacks": ["cdc-a"]},
+        on_done_dismiss=lambda: dismissed.append(True),
+    )
+    blob = " ".join(ui.texts)
+    assert "CDC infrastructure deleted" in blob
+    # A close affordance exists, and it clears the notice.
+    assert ui.buttons, "expected a dismiss button"
+    _label, handler = ui.buttons[0]
+    assert handler is not None
+    handler()
+    assert dismissed == [True]
+    # No poll timer: the notice is terminal until the user acts. Auto-hiding is what made
+    # "finished" indistinguishable from "never ran".
+    assert not ui.timer_armed, "the completion notice must not self-poll away"
+
+
+def test_in_flight_teardown_wins_over_a_stale_completion_notice() -> None:
+    """While a teardown runs, an earlier run's completion notice is stale."""
+    from dsql_migrator.ui.workflow import _render_cdc_teardown_banner
+
+    ui = _BannerUi()
+    _render_cdc_teardown_banner(
+        ui,
+        lambda: {"state": "running", "kind": "delete", "stack": "cdc-new"},
+        done_getter=lambda: {"kind": "delete", "stacks": ["cdc-old"]},
+        on_done_dismiss=lambda: None,
+    )
+    blob = " ".join(ui.texts)
+    assert "teardown in progress" in blob
+    assert "CDC infrastructure deleted" not in blob
+    # The running banner DOES self-poll (so it flips when the job settles).
+    assert ui.timer_armed
+
+
+def test_teardown_queue_progress_and_finished_stacks() -> None:
+    """The two pure decisions the banner getter delegates to.
+
+    Both were previously inline in ``build_page``'s closure, where no test could reach
+    them -- so "queue never recorded", "banner goes silent", and "no durable completion"
+    all survived mutation testing.
+    """
+    from dsql_migrator.ui.data_migration._status import (
+        finished_teardown_stacks,
+        teardown_queue_progress,
+    )
+
+    queue = [("j1", "cdc-a"), ("j2", "cdc-b"), ("j3", "cdc-c")]
+    # Position within a multi-stack teardown, so the banner can say "2 of 3".
+    assert teardown_queue_progress(queue, "j1") == (1, 3)
+    assert teardown_queue_progress(queue, "j3") == (3, 3)
+    # A single stack has nothing to disambiguate -> no "1 of 1" noise.
+    assert teardown_queue_progress([("j1", "cdc-a")], "j1") is None
+    assert teardown_queue_progress([], "j1") is None
+    # A job outside the queue (or none) contributes no position rather than guessing.
+    assert teardown_queue_progress(queue, "unknown") is None
+    assert teardown_queue_progress(queue, None) is None
+
+    # The completion notice must name EVERY stack that was torn down; a multi-stack
+    # teardown previously surfaced only the tracked one, understating what happened.
+    assert finished_teardown_stacks(queue, "cdc-a") == ["cdc-a", "cdc-b", "cdc-c"]
+    # Single-stack path: fall back to the tracked stack.
+    assert finished_teardown_stacks([], "cdc-solo") == ["cdc-solo"]
+    assert finished_teardown_stacks([], None) == []
+
+
+def test_banner_getter_wires_the_queue_advance_and_completion() -> None:
+    """Structural guard for the three behaviours that live in build_page's closure.
+
+    They cannot be called directly (the closure needs a live session + stores), and each
+    failure mode is SILENT -- the banner simply stops mentioning stacks that are still
+    deleting and still billing. So assert the wiring: the queue is recorded, the advance
+    is consulted, and completion is persisted before the marker is cleared.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import app as app_module
+
+    tree = ast.parse(inspect.getsource(app_module))
+    by_name = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+    }
+
+    # 1. Every launched teardown is recorded, or the banner has nothing to advance to.
+    teardown = ast.unparse(by_name["_cdc_teardown_on_reset"])
+    assert "set_cdc_teardown_queue(" in teardown
+    assert "track_in_queue=launched_queue" in teardown
+
+    # 2. On settle the banner advances to the next unfinished stack instead of clearing.
+    banner = ast.unparse(by_name["_cdc_teardown_banner"])
+    assert "next_unfinished_teardown(" in banner
+    assert "advance_cdc_teardown(" in banner
+    # The advance must be REACHED, not merely present: gating it on a constant-false test
+    # (or dropping the branch body) puts the banner straight back to going silent while
+    # later stacks are still deleting. Assert the guard tests the resolver's result.
+    advance_guard = [
+        node
+        for node in ast.walk(by_name["_cdc_teardown_banner"])
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Name)
+        and node.test.left.id == "following"
+    ]
+    assert advance_guard, (
+        "the queue-advance must be guarded on `following is not None`, not a constant"
+    )
+    assert "advance_cdc_teardown(" in ast.unparse(advance_guard[0])
+    # 3. ...and records a durable completion notice before clearing the marker, so a
+    #    refresh can still tell "finished" from "never ran".
+    assert "set_cdc_teardown_done(" in banner
+    done_at = banner.index("set_cdc_teardown_done(")
+    cleared_at = banner.index("clear_cdc_teardown()")
+    assert done_at < cleared_at, "completion must be recorded BEFORE the marker is cleared"
+    # The dismiss path exists for the close button.
+    assert "dismiss_cdc_teardown_done" in ast.unparse(
+        by_name["_cdc_teardown_done_dismiss"]
+    )

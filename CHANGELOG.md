@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.222
+
+### Fixed
+
+- **A multi-stack Start-over teardown reported only the first stack, then went silent while
+  the rest were still deleting.** v0.1.214 made Start over tear down *every* discovered
+  cdc-stack, but the durable teardown marker is a single slot and only the first job claims
+  it — so the banner tracked stack 1 and disappeared the moment it finished, while the
+  others were still deleting and still billing for MSK / NAT with nothing on screen. The
+  banner now follows a queue of every launched teardown: when the tracked stack settles it
+  advances to the next unfinished one, and while several are pending it says which
+  (*"Deleting 'cdc-b' (2 of 3; the rest follow)"* — and *"(3 of 3, the last one)"* on the
+  final stack, where the operator is deciding whether to wait).
+
+- **A finished teardown left no trace after a page refresh.** Completion was signalled only
+  by a `ui.notify` toast, which hangs off a `ui.timer` and dies with the page — so an
+  operation that takes 15–45 minutes and is explicitly designed to be walked away from left
+  nothing to distinguish *"it finished"* from *"it never ran"*. The banner now reports the
+  result durably (**"CDC infrastructure deleted — MSK / NAT billing has stopped"**, naming
+  every stack) and keeps it until the operator closes it with the **✕** button. It never
+  auto-hides, and an in-flight teardown takes precedence over a stale completion notice.
+
 ## v0.1.221
 
 ### Fixed

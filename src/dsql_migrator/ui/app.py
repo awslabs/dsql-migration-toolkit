@@ -449,11 +449,44 @@ def build_page(
             return None
         state = cdc_teardown_banner_state(JOB_MANAGER, job_id)
         if state in ("running", "failed"):
-            return {
+            info = {
                 "state": state,
                 "kind": getattr(migration_state, "cdc_teardown_kind", None),
                 "stack": getattr(migration_state, "cdc_teardown_stack", None),
             }
+            # With several stacks, say WHICH one of how many is being torn down -- the
+            # banner names a single stack, so without this it looked like the only one.
+            from dsql_migrator.ui.data_migration._status import (
+                teardown_queue_progress,
+            )
+
+            progress = teardown_queue_progress(
+                getattr(migration_state, "cdc_teardown_queue", None) or [], job_id
+            )
+            if progress is not None:
+                info["index"], info["total"] = progress
+            return info
+
+        # The tracked stack settled -- but with several stacks the others may still be
+        # deleting. Re-point the marker at the next unfinished one instead of clearing,
+        # which is what made the banner vanish while MSK / NAT kept billing.
+        queue = list(getattr(migration_state, "cdc_teardown_queue", None) or [])
+        if len(queue) > 1:
+            from dsql_migrator.ui.data_migration._status import (
+                next_unfinished_teardown,
+            )
+
+            following = next_unfinished_teardown(JOB_MANAGER, queue)
+            if following is not None:
+                next_job, next_stack, index, total = following
+                migration_state.advance_cdc_teardown(next_job, next_stack)
+                return {
+                    "state": "running",
+                    "kind": getattr(migration_state, "cdc_teardown_kind", None),
+                    "stack": next_stack,
+                    "index": index,
+                    "total": total,
+                }
         # The job settled OK (DONE) or is unknown (lost across a restart) -- but the
         # JOB finishing is not the same as the STACK being gone. A delete that ended in
         # DELETE_FAILED, or a job whose record vanished with the process, previously
@@ -470,8 +503,32 @@ def build_page(
                 "kind": getattr(migration_state, "cdc_teardown_kind", None),
                 "stack": getattr(migration_state, "cdc_teardown_stack", None),
             }
+        # Everything finished cleanly. Record it as a DISMISSABLE completion notice before
+        # clearing the marker: a 15-45 min teardown is meant to be left unattended, and
+        # the only completion signal was a toast that a refresh throws away -- so the
+        # operator came back to an empty screen with no way to tell whether it finished or
+        # never ran. Names every stack, since a multi-stack teardown showed only one.
+        from dsql_migrator.ui.data_migration._status import finished_teardown_stacks
+
+        migration_state.set_cdc_teardown_done(
+            kind=getattr(migration_state, "cdc_teardown_kind", None),
+            stacks=finished_teardown_stacks(
+                getattr(migration_state, "cdc_teardown_queue", None) or [],
+                getattr(migration_state, "cdc_teardown_stack", None),
+            ),
+        )
         migration_state.clear_cdc_teardown()
         return None
+
+    def _cdc_teardown_done() -> Optional[dict]:
+        """A finished-but-undismissed teardown for the completion banner, else ``None``."""
+        migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
+        done = dict(getattr(migration_state, "cdc_teardown_done", None) or {})
+        return done or None
+
+    def _cdc_teardown_done_dismiss() -> None:
+        """Close the completion banner (the operator acknowledged the result)."""
+        DATA_MIGRATION_STORE.get_or_create(session_id).dismiss_cdc_teardown_done()
 
     def _cdc_op_in_flight() -> Optional[str]:
         """Kind (``"infra"``/``"start"``) of a NON-teardown CDC lifecycle job still
@@ -525,6 +582,7 @@ def build_page(
         role_arn,
         aws_profile,
         cleanup_secret,
+        track_in_queue: Optional[list] = None,
     ) -> Optional[str]:
         """Build the deployer and submit a CDC teardown (stop/delete) as a background
         job, recording the durable marker + the retry context ({region, role_arn,
@@ -568,10 +626,16 @@ def build_page(
                 )
 
         job_id = JOB_MANAGER.submit(work)
+        # Record it in the caller's queue REGARDLESS of who wins the marker below: with
+        # several stacks only the first claims the single marker, so the queue is the only
+        # thing that keeps the rest tracked (and lets the banner advance to them).
+        if track_in_queue is not None:
+            track_in_queue.append((job_id, stack_name))
         # Durable marker (survives the Start-over reset) + the retry context so the
         # banner can re-launch this teardown even after the session is wiped. Ownership
-        # guard: don't clobber a DIFFERENT teardown still tracked+running (rare two-tab
-        # race) -- keep the first, longer-lived one.
+        # guard: don't clobber a DIFFERENT teardown still tracked+running -- keep the
+        # first, longer-lived one. This is the normal case for a multi-stack Start-over
+        # teardown (stack 2+ is refused), not just a two-tab race.
         if should_replace_teardown_marker(
             JOB_MANAGER, getattr(migration_state, "cdc_teardown_job_id", None), job_id
         ):
@@ -627,6 +691,7 @@ def build_page(
         from dsql_migrator.ui.data_migration._status import cdc_teardown_plan
 
         job_id = None
+        launched_queue: list[tuple[str, str]] = []
         for stack_name, stack_cleanup_secret in cdc_teardown_plan(
             stack_names, cleanup_secret=cleanup_secret
         ):
@@ -638,9 +703,18 @@ def build_page(
                 role_arn=role_arn,
                 aws_profile=aws_profile,
                 cleanup_secret=stack_cleanup_secret,
+                # Only the first claims the single durable marker; the queue below is
+                # what keeps the rest visible.
+                track_in_queue=launched_queue,
             )
             if job_id is None:
                 job_id = launched
+        # Record EVERY launched teardown so the banner can advance to the next unfinished
+        # stack when the tracked one settles. Without this the banner followed only the
+        # first stack and went silent while the others were still deleting -- MSK / NAT
+        # billing on, nothing on screen.
+        if launched_queue:
+            migration_state.set_cdc_teardown_queue(launched_queue)
         # The teardown runs in the background after the session resets; surface a
         # completion toast (the persistent banner also tracks it). If the marker was
         # not claimed (another teardown already running), poll whatever is tracked.
@@ -770,6 +844,8 @@ def build_page(
         cdc_teardown_banner_getter=_cdc_teardown_banner,
         cdc_teardown_retry=_cdc_teardown_retry,
         cdc_teardown_dismiss=_cdc_teardown_dismiss,
+        cdc_teardown_done_getter=_cdc_teardown_done,
+        cdc_teardown_done_dismiss=_cdc_teardown_done_dismiss,
         cdc_op_in_flight_getter=_cdc_op_in_flight,
         cdc_probe=_cdc_probe,
         optional_tools={

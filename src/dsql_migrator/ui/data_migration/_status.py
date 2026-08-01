@@ -513,6 +513,67 @@ def cdc_teardown_stack_names(
     return names
 
 
+def next_unfinished_teardown(
+    job_manager: JobManager, queue: "Sequence[tuple[str, str]]"
+) -> "Optional[tuple[str, str, int, int]]":
+    """The teardown the banner should follow, as ``(job_id, stack, index, total)``.
+
+    ``queue`` is every ``(job_id, stack)`` one Start-over teardown launched, in order.
+    Returns the FIRST entry still PENDING/RUNNING, with its 1-based position and the
+    queue length so the banner can say "2 of 3" -- or ``None`` when every entry has
+    settled (the caller then clears the marker).
+
+    Needed because the durable marker is a single slot: it was claimed by the first stack
+    and never re-pointed, so the banner vanished as soon as that stack finished even
+    though the others were still deleting -- MSK / NAT still billing, nothing on screen.
+    A job unknown to the manager (record pruned / lost across a restart) counts as
+    settled, matching how the single-stack path already treats it.
+
+    Pure apart from the JobManager status reads.
+    """
+    entries = [(str(j), str(s)) for j, s in (queue or []) if j]
+    total = len(entries)
+    for index, (job_id, stack) in enumerate(entries, start=1):
+        job = _current_job(job_manager, job_id)
+        if job is not None and getattr(job, "status", None) in ("PENDING", "RUNNING"):
+            return job_id, stack, index, total
+    return None
+
+
+def teardown_queue_progress(
+    queue: "Sequence[tuple[str, str]]", job_id: "Optional[str]"
+) -> "Optional[tuple[int, int]]":
+    """``(position, total)`` of ``job_id`` in a multi-stack teardown queue, else ``None``.
+
+    Returns ``None`` for a single-stack teardown (nothing to disambiguate) or a job that is
+    not in the queue. The banner names ONE stack, so without this a multi-stack teardown
+    read as if that stack were the only one -- and appeared to finish early while the rest
+    were still deleting and still billing. Pure.
+    """
+    entries = [(str(j), str(s)) for j, s in (queue or []) if j]
+    if len(entries) <= 1 or not job_id:
+        return None
+    for index, (queued_job, _stack) in enumerate(entries, start=1):
+        if queued_job == str(job_id):
+            return index, len(entries)
+    return None
+
+
+def finished_teardown_stacks(
+    queue: "Sequence[tuple[str, str]]", tracked_stack: "Optional[str]"
+) -> "list[str]":
+    """Every stack a just-finished teardown covered, for the completion notice.
+
+    Prefers the full queue (a multi-stack teardown surfaced only the tracked stack, so the
+    notice would have understated what was torn down) and falls back to the single tracked
+    stack. Pure.
+    """
+    from_queue = [str(s) for _job, s in (queue or []) if s]
+    if from_queue:
+        return from_queue
+    return [str(tracked_stack)] if tracked_stack else []
+
+
 def cdc_teardown_plan(
     stack_names: "Sequence[str]", *, cleanup_secret: bool
 ) -> "list[tuple[str, bool]]":

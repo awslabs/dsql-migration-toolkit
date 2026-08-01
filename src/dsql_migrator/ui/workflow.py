@@ -1413,6 +1413,28 @@ def _cdc_teardown_banner_copy(
     state = info.get("state", "running")
     kind = info.get("kind")
     stack = info.get("stack") or "the cdc-stack"
+    # A FINISHED teardown, held until the operator closes it. Completion used to be a
+    # ui.notify toast, which dies with the page -- so after a refresh there was nothing
+    # separating "the 45-minute teardown finished" from "it never ran", for an operation
+    # explicitly designed to be walked away from.
+    if state == "done":
+        stacks = [s for s in (info.get("stacks") or []) if s] or [stack]
+        listed = ", ".join(stacks)
+        if kind == "delete":
+            noun = "stack" if len(stacks) == 1 else "stacks"
+            return (
+                "success",
+                "CDC infrastructure deleted",
+                f"Teardown of the cdc-{noun} ({listed}) finished — MSK / NAT billing has "
+                "stopped. Deploying CDC again later takes ~45 min from scratch.",
+            )
+        return (
+            "success",
+            "CDC connectors removed",
+            f"The CDC connectors on {listed} are gone and streaming has stopped. MSK, "
+            "the VPC wiring and the plugins were kept, so Start CDC can restart quickly "
+            "— and it resumes from where streaming left off.",
+        )
     if kind == "infra" and state != "failed":
         # An infrastructure create is the one CDC operation the user is meant to walk
         # AWAY from: it takes ~15-20 min and is supposed to overlap the Full Load. So
@@ -1434,19 +1456,30 @@ def _cdc_teardown_banner_copy(
             "DELETE_FAILED). MSK / NAT may still be billing. Retry the cleanup, or "
             "dismiss this to finish in the AWS console.",
         )
+    # Several stacks in one teardown: say which of how many, or the banner names a single
+    # stack and reads as if it were the only one (it then appeared to finish early while
+    # the rest were still deleting and still billing).
+    index, total = info.get("index"), info.get("total")
+    if index and total and total > 1:
+        # "the rest follow" only while some actually do -- on the last stack it would be
+        # wrong, and it is the one point where the operator is deciding whether to wait.
+        progress = f" ({index} of {total}"
+        progress += "; the rest follow)" if index < total else ", the last one)"
+    else:
+        progress = ""
     if kind == "delete":
         return (
             "info",
             "CDC infrastructure teardown in progress",
-            f"Deleting '{stack}' in the background (~15–45 min). MSK / NAT keep "
-            "billing until it completes. You can keep working — this banner clears "
-            "itself automatically when the teardown finishes.",
+            f"Deleting '{stack}'{progress} in the background (~15–45 min). MSK / NAT "
+            "keep billing until it completes. You can keep working — this banner "
+            "reports the result when the teardown finishes.",
         )
     return (
         "info",
         "Removing CDC connectors",
-        f"Removing the CDC connectors from '{stack}' in the background. This banner "
-        "clears itself automatically when it finishes.",
+        f"Removing the CDC connectors from '{stack}'{progress} in the background. This "
+        "banner reports the result when it finishes.",
     )
 
 
@@ -1456,6 +1489,8 @@ def _render_cdc_teardown_banner(
     *,
     on_retry: "Optional[Callable[[], None]]" = None,
     on_dismiss: "Optional[Callable[[], None]]" = None,
+    done_getter: "Optional[Callable[[], Optional[dict]]]" = None,
+    on_done_dismiss: "Optional[Callable[[], None]]" = None,
 ) -> None:
     """Persistent, cross-view banner for a CDC teardown (stop/delete).
 
@@ -1474,20 +1509,47 @@ def _render_cdc_teardown_banner(
       (``on_dismiss``, stop tracking here). No self-poll -- it is terminal until the
       user acts, then a refresh re-reads the state.
     """
-    if banner_getter is None:
+    if banner_getter is None and done_getter is None:
         return
 
     @ui.refreshable  # type: ignore[attr-defined,misc]
     def _banner() -> None:
         try:
-            info = banner_getter()
+            info = banner_getter() if banner_getter is not None else None
         except Exception:  # noqa: BLE001 - a banner must never break the page render
             info = None
+        # An in-flight teardown wins: while one is running the completion notice from an
+        # earlier one is stale. Only when nothing is in flight does the finished-but-
+        # undismissed result show.
+        if not info and done_getter is not None:
+            try:
+                done = done_getter()
+            except Exception:  # noqa: BLE001 - never break the page render
+                done = None
+            if done:
+                info = {**done, "state": "done"}
         copy = _cdc_teardown_banner_copy(info)
         if copy is None:
             return  # nothing in flight (or just settled) → render nothing, stop polling
         tone, header, body = copy
         state = (info or {}).get("state", "running")
+        # A finished teardown is reported until the operator closes it -- never auto-hidden
+        # and never self-polled. Auto-hiding is what left "finished" indistinguishable
+        # from "never ran" after a refresh.
+        if state == "done":
+            with ui.row().classes("items-start gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+                with ui.column().classes("flex-1 min-w-0"):  # type: ignore[attr-defined]
+                    render_notice(ui, tone=tone, header=header, body=body)
+                if on_done_dismiss is not None:
+
+                    def _close(_e=None) -> None:
+                        on_done_dismiss()
+                        _banner.refresh()  # type: ignore[attr-defined]
+
+                    ui.button(icon="close", on_click=_close).props(  # type: ignore[attr-defined]
+                        "flat dense round size=sm color=grey-7"
+                    ).tooltip("Dismiss")
+            return
         # A running teardown/deploy is a LIVE operation that takes ~15-45 min, so mark
         # the notice busy: an animated spinner + "In progress" badge make it obvious the
         # work is still moving. With only a static icon the banner read as an inert
@@ -1549,6 +1611,10 @@ def build_workflow_sidebar(
     cdc_teardown_banner_getter: Optional[Callable[[], Optional[dict]]] = None,
     cdc_teardown_retry: Optional[Callable[[], None]] = None,
     cdc_teardown_dismiss: Optional[Callable[[], None]] = None,
+    # A FINISHED teardown, reported until the operator closes it (the toast that used to
+    # be the only completion signal does not survive a refresh).
+    cdc_teardown_done_getter: Optional[Callable[[], Optional[dict]]] = None,
+    cdc_teardown_done_dismiss: Optional[Callable[[], None]] = None,
     cdc_op_in_flight_getter: Optional[Callable[[], Optional[str]]] = None,
     cdc_probe: Optional[Callable[[], None]] = None,
     optional_tools: Optional[dict[str, "OptionalTool"]] = None,
@@ -1968,6 +2034,8 @@ def build_workflow_sidebar(
                 cdc_teardown_banner_getter,
                 on_retry=cdc_teardown_retry,
                 on_dismiss=cdc_teardown_dismiss,
+                done_getter=cdc_teardown_done_getter,
+                on_done_dismiss=cdc_teardown_done_dismiss,
             )
             if view == _CONNECT_VIEW:
                 # Refresh only the nav (not main) so verifying a connection

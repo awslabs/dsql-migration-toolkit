@@ -216,6 +216,21 @@ class DataMigrationState:
         self.cdc_teardown_job_id: Optional[str] = None
         self.cdc_teardown_kind: Optional[str] = None  # "stop"|"delete"
         self.cdc_teardown_stack: Optional[str] = None
+        # EVERY (job_id, stack) the current Start-over teardown launched, in teardown
+        # order. Start over can target several cdc-stacks at once (see
+        # ``cdc_teardown_plan``), but the marker above is a single slot -- so the banner
+        # followed only the FIRST stack and vanished the moment it settled, while the
+        # others were still deleting and still billing for MSK / NAT with nothing on
+        # screen. This list lets the banner advance to the next unfinished stack and
+        # report "2 of 3". Preserved across a Start-over reset, like the marker.
+        self.cdc_teardown_queue: list[tuple[str, str]] = []
+        # A FINISHED teardown the operator has not dismissed yet: {"kind", "stacks"}.
+        # Completion used to be signalled only by a ui.notify toast, which hangs off a
+        # ui.timer and so is gone after a refresh -- leaving no way to tell "finished"
+        # from "never ran", for an operation that takes 15-45 min and is expected to be
+        # left unattended. Held durably so the banner can report the result until it is
+        # explicitly closed. Preserved across a Start-over reset, like the marker.
+        self.cdc_teardown_done: dict = {}
         # Everything a one-click "Retry cleanup" needs to re-launch this teardown
         # AFTER a Start-over session reset has wiped the session config (region /
         # deploy-role / profile / whether to also delete the tool-managed secret).
@@ -419,6 +434,50 @@ class DataMigrationState:
             self.cdc_teardown_stack = stack if job_id is not None else None
             self.cdc_teardown_ctx = dict(ctx) if (job_id is not None and ctx) else {}
 
+    def set_cdc_teardown_queue(self, entries: "list[tuple[str, str]]") -> None:
+        """Record every ``(job_id, stack)`` this teardown launched, in teardown order.
+
+        Start over can tear down several cdc-stacks at once, but the durable marker is a
+        single slot -- so the banner tracked only the first and disappeared when it
+        settled, leaving the rest deleting (and billing) unannounced. Keeping the full
+        list lets the banner move to the next unfinished stack and show overall progress.
+        """
+        with self._lock:
+            self.cdc_teardown_queue = [
+                (str(job_id), str(stack)) for job_id, stack in entries if job_id
+            ]
+
+    def advance_cdc_teardown(self, job_id: str, stack: str) -> None:
+        """Re-point the durable marker at another still-running teardown in the queue.
+
+        Used when the tracked stack finishes while later ones are still going: the marker
+        (and therefore the banner + the Start-over race guard) follows the next unfinished
+        stack instead of being cleared. Deliberately keeps ``kind``/``ctx`` -- the same
+        operation and the same retry context apply to every stack in one teardown.
+        """
+        with self._lock:
+            self.cdc_teardown_job_id = job_id
+            self.cdc_teardown_stack = stack
+
+    def set_cdc_teardown_done(self, *, kind: Optional[str], stacks: "list[str]") -> None:
+        """Record a teardown that FINISHED, so the banner can report it until dismissed.
+
+        The completion signal was a ``ui.notify`` toast, which dies with the page: after a
+        refresh there was nothing distinguishing "the 45-minute teardown finished" from
+        "it never ran". This survives a refresh and is cleared only by
+        :meth:`dismiss_cdc_teardown_done` (the banner's close button).
+        """
+        with self._lock:
+            self.cdc_teardown_done = {
+                "kind": kind,
+                "stacks": [str(s) for s in stacks if s],
+            }
+
+    def dismiss_cdc_teardown_done(self) -> None:
+        """Clear the finished-teardown notice (the operator closed the banner)."""
+        with self._lock:
+            self.cdc_teardown_done = {}
+
     def clear_cdc_teardown(self) -> None:
         """Clear the in-flight teardown marker (the stop/delete job settled or a
         failed one was dismissed)."""
@@ -427,6 +486,7 @@ class DataMigrationState:
             self.cdc_teardown_kind = None
             self.cdc_teardown_stack = None
             self.cdc_teardown_ctx = {}
+            self.cdc_teardown_queue = []
 
     def set_cdc_infra_inputs(self, inputs: dict[str, str]) -> None:
         """Replace the BYO-VPC infrastructure inputs (read-through to session)."""
