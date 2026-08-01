@@ -790,6 +790,158 @@ def test_schema_recreate_tables_is_silent_without_a_conversion_or_inventory() ->
     ) == []
 
 
+class _ConfirmDialogUi:
+    """Records label/badge/radio text and button labels, and captures on_click handlers
+    so a test can actually OPEN the Full Load confirm dialog and read what it renders."""
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+        self.buttons: list[str] = []
+        self.opened = 0
+        self.handlers: list[tuple[str, object]] = []
+
+    class _El:
+        def __init__(self, ui):
+            self._ui = ui
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def open(self):
+            self._ui.opened += 1
+            return self
+
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: self
+
+    def _record(self, text):
+        if text:
+            self.texts.append(str(text))
+        return self._El(self)
+
+    def label(self, text="", *_a, **_k):
+        return self._record(text)
+
+    def badge(self, text="", *_a, **_k):
+        return self._record(text)
+
+    def button(self, text="", *_a, on_click=None, **_k):
+        if text:
+            self.buttons.append(str(text))
+        if on_click is not None:
+            self.handlers.append((str(text), on_click))
+        return self._El(self)
+
+    def radio(self, options=None, *_a, **_k):
+        if isinstance(options, dict):
+            self.texts.extend(str(v) for v in options.values())
+        return self._El(self)
+
+    def notify(self, *_a, **_k):
+        return None
+
+    def __getattr__(self, _name):
+        return lambda *_a, **_k: _ConfirmDialogUi._El(self)
+
+
+def _open_full_load_confirm_dialog(monkeypatch, *, recreate_candidates):
+    """Render the Full Load step, click Start, and return the UI double.
+
+    Drives the REAL dialog builder (not a source-text check): NiceGUI's ``context.client``
+    is a read-only property on a Context instance, and the pre-dialog target probe runs
+    via ``run.io_bound`` -- both are patched so the dialog builds in-process with no AWS
+    or database access.
+    """
+    import asyncio
+
+    import nicegui.context as ctxobj
+    import nicegui.run as nrun
+
+    from dsql_migrator.ui import data_migration as dm
+
+    class _Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        type(ctxobj), "client", property(lambda _self: _Client()), raising=False
+    )
+
+    async def _io_bound(fn, *a, **k):
+        return fn(*a, **k)
+
+    monkeypatch.setattr(nrun, "io_bound", _io_bound)
+
+    ui = _ConfirmDialogUi()
+    noop = lambda *_a, **_k: None  # noqa: E731
+
+    class _NoJobs:
+        def get_status(self, job_id):
+            from dsql_migrator.core.job_manager import JobNotFoundError
+
+            raise JobNotFoundError(job_id)
+
+    dm._render_full_load_step(
+        ui,
+        DataMigrationState(),
+        _NoJobs(),
+        None,  # session: no target_config -> the probe is skipped entirely
+        job=None,
+        status=StepStatus.NOT_STARTED,
+        selected_names=["ecommerce.orders"],
+        guard_reason=None,
+        start_full_load=noop,
+        retry_failed_load=noop,
+        reload_table=noop,
+        accept_quarantine_and_continue=noop,
+        stop_full_load=noop,
+        refresh=noop,
+        schema_recreate_candidates=recreate_candidates,
+    )
+    start = [h for (label, h) in ui.handlers if "Start" in label]
+    assert start, f"no Start handler captured; buttons={ui.buttons}"
+    asyncio.run(start[0]())
+    return ui
+
+
+def test_confirm_dialog_discloses_the_schema_recreate_before_starting(monkeypatch) -> None:
+    """Opening the dialog must SAY that an empty target will be dropped and recreated.
+
+    The recreate is decided in the engine, after this dialog, so the dialog used to show
+    only "Confirm and start" -- the user began a run that replaced a target table's DDL
+    with no mention of it. Nothing is lost (the table is empty and the DDL was approved in
+    Schema Conversion), but a hand-edit made outside Schema Conversion is replaced.
+    """
+    ui = _open_full_load_confirm_dialog(
+        monkeypatch, recreate_candidates=["ecommerce.orders"]
+    )
+
+    assert ui.opened == 1
+    body = " ".join(ui.texts)
+    assert "will be recreated to apply the chosen primary key" in body
+    assert "ecommerce.orders" in body
+    assert "no data is lost" in body  # says why it is safe, not just that it happens
+    # The button names the DDL step, so the action is visible without reading the notice.
+    assert "Recreate and load" in ui.buttons
+    assert "Confirm and start" not in ui.buttons
+
+
+def test_confirm_dialog_is_unchanged_when_nothing_will_be_recreated(monkeypatch) -> None:
+    # The ordinary load must not gain a scary notice or a renamed button.
+    ui = _open_full_load_confirm_dialog(monkeypatch, recreate_candidates=[])
+
+    assert ui.opened == 1
+    assert "will be recreated to apply" not in " ".join(ui.texts)
+    assert "Confirm and start" in ui.buttons
+    assert "Recreate and load" not in ui.buttons
+
+
 def test_full_load_step_passes_recreate_candidates_into_the_confirm_dialog() -> None:
     """The disclosure must reach the dialog through a PARAMETER.
 

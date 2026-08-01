@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.195
+
+### Tests
+
+- **The Full Load confirm dialog is now verified by actually opening it.** v0.1.194's
+  disclosure was covered only by its pure helper plus a structural check on the closure,
+  because the dialog builds lazily inside the Start handler. It is now driven for real:
+  NiceGUI's `context.client` (a read-only property on a Context instance) and the
+  pre-dialog `run.io_bound` target probe are patched, the captured Start handler is
+  awaited, and the rendered text and button label are asserted — the disclosure naming
+  the table and explaining that no data is lost, and the unchanged "Confirm and start"
+  path when nothing will be recreated. Both mutations (removing the notice, not renaming
+  the button) are caught by rendered output rather than source text.
+
 ## v0.1.194
 
 ### Fixed
