@@ -137,6 +137,34 @@ without exposing data. A record that can be neither applied nor dead-lettered
 makes the task **fail loudly** rather than silently skip — visible over silent
 loss.
 
+### What CDC does with later changes to a row that Full Load quarantined
+
+If Full Load quarantined a row (its oversized value could not be written), the row
+is **absent from the target** while still present on the source. What happens when
+that same row changes later depends on the operation:
+
+| Source operation on the missing row | What CDC does | Result |
+|---|---|---|
+| `DELETE` | `DELETE … WHERE pk = ?` matches **0 rows**. The sink does not treat a 0-row delete as an error, so it is applied and committed silently. | **Correct.** The intended end state — "the row is not on the target" — already holds. Treating this as a failure would break idempotency: a replayed or retried delete must stay safe. |
+| `UPDATE` that shrinks the value below 1 MiB | Debezium sends the **full after-image** and the sink writes `INSERT … ON CONFLICT (pk) DO UPDATE`. With no existing row, `ON CONFLICT` never fires and the row is **inserted**. | **The gap heals itself.** No action needed. |
+| `UPDATE` where the value is still oversized | The sink measures values **before** writing, so the record is quarantined to the **DLQ** for the same reason. | Gap persists, and it is **visible** (DLQ depth / "Quarantined" in the monitor). |
+| `INSERT` of a *different* row | Unaffected. | Normal. |
+
+Two consequences worth planning around:
+
+- **A quarantine gap is not self-announcing after Full Load.** If the source never
+  touches that row again, the gap simply persists — CDC has nothing to replicate.
+  It is **Validation (Step 4)** that reports it, which is why the Full Load
+  completeness verdict points you there.
+- **A 0-row delete is indistinguishable from a normal replay.** The sink cannot tell
+  "this delete found nothing because the row was quarantined" from "this delete was
+  simply reprocessed". That is a deliberate trade-off in favour of idempotency;
+  gap accounting belongs to Validation, not to the delete path.
+
+The practical guidance is unchanged: fix the oversized source value and **Reload**
+that table before cutting over, or exclude the oversized LOB column at capture
+(§4.5) so it never enters the pipeline.
+
 ---
 
 ## 4.6 Monitoring CDC progress (the migration monitor)

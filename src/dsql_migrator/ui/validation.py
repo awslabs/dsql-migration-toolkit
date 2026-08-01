@@ -167,6 +167,11 @@ class ValidationInputs:
     # column. run_validation drops these from each table's column list before the
     # checksum builds its per-row concatenation.
     excluded_columns: dict[str, set[str]] = field(default_factory=dict)
+    # Rows the migration PERMANENTLY DROPPED, per table (Full Load per-row quarantine).
+    # Passed through so a target deficit can be attributed to a known drop instead of
+    # leaving the operator to cross-check the error log by hand. Never changes a
+    # verdict -- the rows really are missing -- it only explains the shortfall.
+    quarantined_by_table: dict[str, int] = field(default_factory=dict)
 
 
 # Builds a :class:`_ValidationRunner` bound to the run's inputs.
@@ -258,6 +263,7 @@ def run_validation(
         on_progress=on_progress,
         max_workers=workers,
         deep_only_on_count_mismatch=deep_only_on_count_mismatch,
+        quarantined_by_table=inputs.quarantined_by_table,
     )
 
 
@@ -1365,6 +1371,24 @@ def build_validation_screen(
             return None
         return job.watermark
 
+    def _migration_quarantined() -> dict[str, int]:
+        """Per-table rows the Full Load permanently dropped, for deficit attribution.
+
+        Same seam as :func:`_migration_watermark`: read from the live job. Empty after a
+        reconnect (the job is gone and the counts are not persisted), which makes
+        Validation report the deficit as unexplained rather than assuming it away.
+        """
+        from dsql_migrator.ui.data_migration import quarantined_rows_by_table
+
+        job_id = migration_state.job_id
+        if job_id is None:
+            return {}
+        try:
+            job = job_manager.get_status(job_id)
+        except JobNotFoundError:
+            return {}
+        return quarantined_rows_by_table(job)
+
     def _run_prerequisite_error() -> Optional[str]:
         """Return why a comparison cannot start right now, or ``None`` if it can.
 
@@ -1453,6 +1477,7 @@ def build_validation_screen(
             # column that was never written to the target can't cause a false checksum
             # mismatch. Empty for a migration that excluded nothing.
             excluded_columns=migration_state.cdc_lob_exclusions(),
+            quarantined_by_table=_migration_quarantined(),
         )
 
         validation_state.clear_outputs()
@@ -1558,6 +1583,7 @@ def build_validation_screen(
             # Always deep-check a re-check (see docstring).
             deep_only_on_count_mismatch=False,
             excluded_columns=migration_state.cdc_lob_exclusions(),
+            quarantined_by_table=_migration_quarantined(),
         )
 
         validation_state.start_recheck([t.name for t in scoped])
@@ -3418,6 +3444,27 @@ def _failure_reasons(item: TableValidationResult) -> list[str]:
             f"Row count differs — source {item.source_row_count:,}, "
             f"target {item.target_row_count:,}."
         )
+        # ATTRIBUTE the shortfall when the migration is known to have dropped exactly
+        # that many rows. Without this the operator was told (by the manual, no less) to
+        # cross-check the deficit against the Full Load error log by hand -- information
+        # the tool already had. Requires an EXACT match: a table 4 rows short that
+        # dropped 1 still has 3 rows unaccounted for, and calling that "expected" would
+        # let real loss through the one check meant to catch it.
+        if item.deficit_explained_by_quarantine:
+            row_noun = "row was" if item.rows_quarantined == 1 else "rows were"
+            reasons.append(
+                f"Fully explained: {item.rows_quarantined:,} {row_noun} permanently "
+                "dropped during the migration (a value DSQL could not store, e.g. over "
+                "its ~1 MiB per-value limit) — this deficit is expected, not new data "
+                "loss. Fix the source value(s) and reload that table to close it."
+            )
+        elif item.rows_quarantined > 0 and item.deficit > item.rows_quarantined:
+            unexplained = item.deficit - item.rows_quarantined
+            reasons.append(
+                f"Partly explained: {item.rows_quarantined:,} row(s) were permanently "
+                f"dropped during the migration, but {unexplained:,} more are missing "
+                "and are NOT accounted for — investigate those."
+            )
     if item.checksum_match is False:
         reasons.append("Checksum differs (row counts equal, but data is not).")
     reconcile = item.reconcile

@@ -1201,6 +1201,34 @@ class TableValidationResult(BaseModel):
     # full record-level match. ``matched`` then means "counts equal", not "rows
     # proven identical".
     deep_checks_skipped: bool = False
+    # Rows the migration PERMANENTLY DROPPED for this table (Full Load per-row
+    # quarantine / CDC DLQ) -- 0 when none or unknown. Carried here so a target
+    # deficit can be attributed instead of leaving the operator to reconstruct it by
+    # hand from the error log: the manual previously told them to "cross-check the
+    # deficit against the Full Load error log / CDC DLQ", which is information the
+    # tool already had. Never changes ``matched`` -- the rows really are absent -- it
+    # only explains WHY, so an expected gap is distinguishable from unexplained loss.
+    rows_quarantined: int = Field(default=0, ge=0)
+
+    @property
+    def deficit(self) -> int:
+        """Rows the target is short of the source (0 when equal or in surplus)."""
+        return max(0, self.source_row_count - self.target_row_count)
+
+    @property
+    def deficit_explained_by_quarantine(self) -> bool:
+        """True when the target's shortfall is EXACTLY the rows known to be dropped.
+
+        Requires an exact match, not merely "some rows were quarantined": a table that
+        dropped 1 row but is 4 rows short has 3 rows unaccounted for, and calling that
+        "expected" is how a real loss would slip through the one check meant to catch
+        it. Only meaningful when the table did not match and something was dropped.
+        """
+        return (
+            not self.matched
+            and self.rows_quarantined > 0
+            and self.deficit == self.rows_quarantined
+        )
 
 
 class OrphanFinding(BaseModel):

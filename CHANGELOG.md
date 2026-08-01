@@ -5,6 +5,46 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.202
+
+### Added
+
+- **Validation now attributes a target deficit to rows the migration dropped.** A table
+  whose rows were quarantined (a value DSQL cannot store) is short on the target, so
+  Validation reported a bare `MISMATCH` / "investigate" — and the manual told the
+  operator to *"cross-check the deficit against the Full Load error log / CDC DLQ"*,
+  which is information the tool already had. Validation had **no** knowledge of
+  quarantine at all. Now:
+  - when the deficit is **exactly** the number of dropped rows, the table reads *"Fully
+    explained: N rows were permanently dropped during the migration … this deficit is
+    expected, not new data loss"*;
+  - when the deficit is **larger**, it reads *"Partly explained: … but N more are missing
+    and are NOT accounted for"* — naming precisely what still needs investigating. The
+    exact-match requirement is the safeguard: a table 4 rows short that dropped 1 has 3
+    unaccounted for, and calling that "expected" is how real loss would slip past the one
+    check meant to catch it.
+  - The verdict deliberately still **fails**. The rows really are absent, so the
+    attribution explains the gap rather than excusing it — a quarantine can never flip a
+    table to `matched` and unlock cut-over on missing data.
+  - After an app restart the per-table counts are gone (they are not persisted), so the
+    deficit is reported unexplained rather than guessed at.
+
+  Counts flow from the Full Load job's chunks (`quarantined_rows_by_table`) and are
+  attached once to the finished report, keeping the source-vs-target comparison a pure
+  function of the two databases.
+
+### Docs
+
+- Manual §4.5 documents what CDC does with later changes to a row Full Load quarantined:
+  a `DELETE` matches 0 rows and is applied silently (correct — the intended end state
+  already holds, and treating it as an error would break idempotency); an `UPDATE` that
+  shrinks the value below 1 MiB **heals the gap** via the sink's upsert; an `UPDATE` still
+  over the limit is re-quarantined to the DLQ. Also states the two consequences: the gap
+  is not self-announcing (Validation is what reports it) and a 0-row delete is
+  indistinguishable from a normal replay, a deliberate trade-off for idempotency.
+- Manual §5 replaced the manual cross-checking instruction with the new attribution
+  (en/ko/ja).
+
 ## v0.1.201
 
 ### Fixed

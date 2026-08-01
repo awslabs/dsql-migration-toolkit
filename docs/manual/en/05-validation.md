@@ -84,10 +84,19 @@ The report is **exportable** so you can attach it to a cut-over decision.
 
 - **MATCH** on every table (and no orphans) → safe to cut over.
 - A small **target deficit** is usually either (a) **drift** — the source advanced
-  since the watermark (check the drift flag), or (b) **intentional** — rows you
-  expected to be quarantined (e.g. values over DSQL's 1 MiB limit). Cross-check
-  the deficit against the **Full Load error log** / **CDC DLQ** before treating it
-  as a real mismatch.
+  since the watermark (check the drift flag), or (b) **intentional** — rows that were
+  quarantined (e.g. values over DSQL's 1 MiB limit). You no longer have to work out
+  which by hand: when the deficit is **exactly** the number of rows the migration
+  permanently dropped, the table says so — *"Fully explained: N rows were permanently
+  dropped during the migration … this deficit is expected, not new data loss"*. When
+  the deficit is **larger** than the drop, it says *"Partly explained: … but N more
+  are missing and are NOT accounted for"* — those are the rows to investigate.
+  The table still reports **MISMATCH**, deliberately: the rows really are absent, so
+  the attribution explains the gap rather than excusing it. Close it by fixing the
+  source value and reloading that table, or accept it as a known gap before cut over.
+  (After an app restart the per-table drop counts are gone — they are not persisted —
+  so the deficit is reported unexplained rather than guessed at. Cross-check the
+  **Full Load error log** / **CDC DLQ** in that case.)
 - A **target surplus** (extra PKs on the target) during CDC usually means a source
   **delete** that the stream hasn't applied yet — re-check after it converges.
 

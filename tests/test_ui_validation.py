@@ -150,6 +150,7 @@ class _FakeValidator:
         on_progress=None,
         max_workers: int = 1,
         deep_only_on_count_mismatch: bool = False,
+        quarantined_by_table: dict[str, int] | None = None,
     ) -> ValidationReport:
         # Drive the progress callback like the real validator (before each table),
         # so a test can assert progress is reported.
@@ -167,6 +168,7 @@ class _FakeValidator:
                 "on_progress": on_progress,
                 "max_workers": max_workers,
                 "deep_only_on_count_mismatch": deep_only_on_count_mismatch,
+                "quarantined_by_table": quarantined_by_table,
             }
         )
         return self.report
@@ -3132,3 +3134,136 @@ def test_cancel_tooltip_text_is_swapped_not_recreated() -> None:
     assert len(tips) == 1
     # And it ends up holding the running-state wording.
     assert "Tables not yet started are skipped" in tips[0].text
+
+
+# ---------------------------------------------------------------------------
+# Attributing a target deficit to rows the migration permanently dropped
+# ---------------------------------------------------------------------------
+
+
+def _quarantine_item(*, source: int, target: int, dropped: int):
+    from dsql_migrator.core.models import TableValidationResult
+
+    return TableValidationResult(
+        table="ecommerce.product_media",
+        source_row_count=source,
+        target_row_count=target,
+        row_count_match=(source == target),
+        matched=(source == target),
+        rows_quarantined=dropped,
+    )
+
+
+def test_deficit_matching_the_dropped_rows_is_reported_as_explained() -> None:
+    """The operator must be told a shortfall is the known quarantine, not new loss.
+
+    Validation had no knowledge of quarantine at all, so a table that dropped a row
+    simply read as MISMATCH / "investigate" -- and the manual instructed the operator to
+    "cross-check the deficit against the Full Load error log / CDC DLQ" by hand,
+    information the tool already had. Worst case that trains people to wave off
+    mismatches, which is what Validation exists to catch.
+    """
+    from dsql_migrator.ui.validation import _failure_reasons
+
+    item = _quarantine_item(source=15, target=14, dropped=1)
+
+    assert item.deficit == 1
+    assert item.deficit_explained_by_quarantine is True
+    reasons = " ".join(_failure_reasons(item))
+    assert "Fully explained" in reasons
+    assert "permanently dropped" in reasons
+    assert "not new data loss" in reasons
+    # Still reports the raw counts -- the attribution adds context, never hides it.
+    assert "source 15, target 14" in reasons
+
+
+def test_a_deficit_larger_than_the_drop_is_only_partly_explained() -> None:
+    # The critical guard: 4 rows short with 1 dropped leaves 3 unaccounted for. Calling
+    # that "expected" would let real loss through the one check meant to catch it.
+    from dsql_migrator.ui.validation import _failure_reasons
+
+    item = _quarantine_item(source=15, target=11, dropped=1)
+
+    assert item.deficit_explained_by_quarantine is False
+    reasons = " ".join(_failure_reasons(item))
+    assert "Partly explained" in reasons
+    assert "3 more are missing" in reasons
+    assert "NOT accounted for" in reasons
+    assert "Fully explained" not in reasons
+
+
+def test_a_deficit_with_no_known_drop_stays_unexplained() -> None:
+    from dsql_migrator.ui.validation import _failure_reasons
+
+    item = _quarantine_item(source=15, target=14, dropped=0)
+
+    assert item.deficit_explained_by_quarantine is False
+    reasons = " ".join(_failure_reasons(item))
+    assert "explained" not in reasons.lower()
+
+
+def test_quarantine_never_flips_a_table_to_matched() -> None:
+    # The rows really are absent from the target, so the verdict must keep failing --
+    # the attribution explains WHY, it does not excuse it. (A future change that made
+    # this "expected" gap pass would silently unlock cut-over on missing data.)
+    item = _quarantine_item(source=15, target=14, dropped=1)
+
+    assert item.matched is False
+    assert item.row_count_match is False
+
+
+def test_count_match_despite_a_drop_is_not_claimed_as_explained() -> None:
+    # Source drift can offset a drop so the counts happen to agree. There is no deficit
+    # to attribute, so nothing may claim the gap is "expected" -- that would be false
+    # reassurance about a table whose rows are provably not identical.
+    item = _quarantine_item(source=15, target=15, dropped=1)
+
+    assert item.deficit == 0
+    assert item.deficit_explained_by_quarantine is False
+
+
+def test_quarantine_counts_are_attached_to_a_finished_report() -> None:
+    """The validator's seam: counts come from the job, not from comparing databases."""
+    from dsql_migrator.core.models import ValidationMode, ValidationReport
+    from dsql_migrator.core.validator import _with_quarantine_counts
+
+    report = ValidationReport.build(
+        mode=ValidationMode.ROW_COUNT,
+        items=[
+            _quarantine_item(source=15, target=14, dropped=0),
+            TableValidationResult(
+                table="ecommerce.orders", source_row_count=500, target_row_count=500,
+                row_count_match=True, matched=True,
+            ),
+        ],
+    )
+
+    updated = _with_quarantine_counts(report, {"ecommerce.product_media": 1})
+    by_table = {i.table: i for i in updated.items}
+
+    assert by_table["ecommerce.product_media"].rows_quarantined == 1
+    assert by_table["ecommerce.product_media"].deficit_explained_by_quarantine is True
+    # A table with no drop is untouched.
+    assert by_table["ecommerce.orders"].rows_quarantined == 0
+    # No counts to attach -> the report is returned as-is.
+    assert _with_quarantine_counts(report, {}) is report
+    assert _with_quarantine_counts(report, None) is report
+
+
+def test_quarantined_rows_by_table_reads_the_job_chunks() -> None:
+    # The engine records the drop on the chunk; this is what carries it to Validation.
+    # Empty for an absent job (a reconnect -- the counts are not persisted), so the
+    # deficit is reported unexplained rather than assumed away.
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import quarantined_rows_by_table
+
+    job = MigrationJob(job_id="j1")
+    job.chunks = [
+        ChunkState(chunk_id="ecommerce.product_media", status="DONE", rows_loaded=12,
+                   rows_quarantined=1, attempts=1),
+        ChunkState(chunk_id="ecommerce.orders", status="DONE", rows_loaded=500,
+                   attempts=1),
+    ]
+
+    assert quarantined_rows_by_table(job) == {"ecommerce.product_media": 1}
+    assert quarantined_rows_by_table(None) == {}

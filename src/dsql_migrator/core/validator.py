@@ -64,7 +64,7 @@ best-effort prototype.
 from __future__ import annotations
 
 import threading
-from typing import Any, Callable, Iterator, Optional, Protocol
+from typing import Any, Callable, Iterator, Mapping, Optional, Protocol
 
 from psycopg import sql
 from sqlalchemy import text
@@ -1028,6 +1028,7 @@ class Validator:
         on_progress: Optional[ProgressCallback] = None,
         max_workers: int = 1,
         deep_only_on_count_mismatch: bool = False,
+        quarantined_by_table: Optional[Mapping[str, int]] = None,
     ) -> ValidationReport:
         """Compare ``tables`` between source and target and return a report.
 
@@ -1081,12 +1082,15 @@ class Validator:
         cancel = should_cancel or (lambda: False)
         workers = max(1, int(max_workers))
         if workers > 1 and len(tables) > 1:
-            return self._validate_parallel(
-                source, target, tables, mode,
-                watermark=watermark, check_orphans=check_orphans,
-                reconcile=reconcile, cancel=cancel, on_progress=on_progress,
-                max_workers=workers,
-                deep_only_on_count_mismatch=deep_only_on_count_mismatch,
+            return _with_quarantine_counts(
+                self._validate_parallel(
+                    source, target, tables, mode,
+                    watermark=watermark, check_orphans=check_orphans,
+                    reconcile=reconcile, cancel=cancel, on_progress=on_progress,
+                    max_workers=workers,
+                    deep_only_on_count_mismatch=deep_only_on_count_mismatch,
+                ),
+                quarantined_by_table,
             )
 
         def _report_progress(table_name: str, index: int, total: int) -> None:
@@ -1158,13 +1162,16 @@ class Validator:
         snapshot_timestamp = (
             watermark.snapshot_timestamp if watermark is not None else None
         )
-        return ValidationReport.build(
-            mode=mode,
-            items=items,
-            orphan_findings=orphan_findings,
-            orphan_check_performed=check_orphans,
-            drift=drift,
-            snapshot_timestamp=snapshot_timestamp,
+        return _with_quarantine_counts(
+            ValidationReport.build(
+                mode=mode,
+                items=items,
+                orphan_findings=orphan_findings,
+                orphan_check_performed=check_orphans,
+                drift=drift,
+                snapshot_timestamp=snapshot_timestamp,
+            ),
+            quarantined_by_table,
         )
 
     def _validate_parallel(
@@ -1559,6 +1566,35 @@ def binlog_advanced(
         return current_position != watermark_position
     # Different files -> the log rotated (or was reset), which means writes happened.
     return True
+
+
+def _with_quarantine_counts(
+    report: ValidationReport, quarantined_by_table: Optional[Mapping[str, int]]
+) -> ValidationReport:
+    """Attach per-table permanently-dropped row counts to a finished report.
+
+    Applied once at the end of :meth:`Validator.validate` (both the serial and parallel
+    paths) rather than threaded through every comparison layer: the counts come from the
+    migration job, not from comparing the databases, so they are metadata ABOUT the run
+    rather than an input to it. Keeping them out of the comparison also keeps
+    ``_compare_table`` a pure source-vs-target function.
+
+    Deliberately does NOT touch ``matched`` or the report's own verdict: the rows really
+    are missing from the target, so a table that dropped rows must keep failing. This
+    only records WHY, so the UI can separate an expected gap from unexplained loss --
+    the operator previously had to reconstruct that by hand from the error log.
+
+    Returns the report unchanged when there are no counts to attach.
+    """
+    if not quarantined_by_table:
+        return report
+    updated = [
+        item.model_copy(
+            update={"rows_quarantined": quarantined_by_table.get(item.table, 0) or 0}
+        )
+        for item in report.items
+    ]
+    return report.model_copy(update={"items": updated})
 
 
 def _build_drift(

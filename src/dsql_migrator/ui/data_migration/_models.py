@@ -273,6 +273,26 @@ def build_full_load_table_rows(
     ]
 
 
+def quarantined_rows_by_table(job: Optional[MigrationJob]) -> dict[str, int]:
+    """Return ``{table: rows permanently dropped}`` for a Full Load job, dropping zeros.
+
+    Lets Validation ATTRIBUTE a target deficit to rows the migration is known to have
+    dropped, instead of the operator cross-checking the Full Load error log by hand
+    (which is what the manual used to instruct). Empty for a job that dropped nothing,
+    or when there is no job -- e.g. a reconnected session, where the counts are not
+    persisted; Validation then reports the deficit as unexplained, which is the honest
+    answer rather than a guess.
+    """
+    if job is None:
+        return {}
+    counts: dict[str, int] = {}
+    for chunk in job.chunks:
+        dropped = getattr(chunk, "rows_quarantined", 0) or 0
+        if dropped:
+            counts[chunk.chunk_id] = dropped
+    return counts
+
+
 def failed_table_names(job: MigrationJob) -> list[str]:
     """Return the names of the tables whose Full Load chunk is ``FAILED``."""
     return [chunk.chunk_id for chunk in job.chunks if chunk.status == "FAILED"]

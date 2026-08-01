@@ -5,6 +5,39 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.202
+
+### Added
+
+- **Validation이 타깃 부족분을 마이그레이션이 드롭한 행에 귀속시킵니다.** 행이 격리된 테이블(DSQL이
+  저장할 수 없는 값)은 타깃이 부족하므로 Validation은 그냥 `MISMATCH` / "investigate"로 보고했고,
+  매뉴얼은 운영자에게 *"부족분을 Full Load 에러 로그 / CDC DLQ와 교차 확인하라"*고 안내했습니다 —
+  도구가 이미 갖고 있던 정보인데도 말입니다. Validation에는 격리에 대한 지식이 **전혀** 없었습니다.
+  이제:
+  - 부족분이 드롭된 행 수와 **정확히** 일치하면 *"Fully explained: N rows were permanently dropped
+    during the migration … this deficit is expected, not new data loss"*로 표시됩니다;
+  - 부족분이 **더 크면** *"Partly explained: … but N more are missing and are NOT accounted for"*로
+    표시되어 조사가 필요한 부분을 정확히 지목합니다. 정확히 일치할 것을 요구하는 것이 안전장치입니다:
+    4행 부족한데 1행을 드롭했다면 3행이 미해명이며, 그것을 "예상됨"으로 부르는 것이 바로 진짜 손실이
+    이 검사를 통과하는 경로입니다.
+  - 판정은 의도적으로 여전히 **실패**입니다. 그 행들은 실제로 없으므로, 이 귀속은 갭을 해명하는 것이지
+    면제하는 것이 아닙니다 — 격리가 테이블을 `matched`로 뒤집어 손실된 데이터 위에서 컷오버를 열어
+    줄 수는 없습니다.
+  - 앱 재시작 후에는 테이블별 건수가 사라지므로(영속되지 않음), 부족분을 추측하지 않고 미해명으로
+    보고합니다.
+
+  건수는 Full Load 작업의 chunk(`quarantined_rows_by_table`)에서 흘러와 완성된 리포트에 한 번 부착되며,
+  소스-타깃 비교는 두 데이터베이스만의 순수 함수로 유지됩니다.
+
+### Docs
+
+- 매뉴얼 §4.5에 Full Load가 격리한 행이 이후 변경될 때 CDC 동작을 문서화했습니다: `DELETE`는 0행에
+  매칭되어 조용히 적용되고(정상 — 의도한 최종 상태가 이미 성립하며, 에러로 취급하면 멱등성이 깨짐),
+  값을 1 MiB 아래로 줄이는 `UPDATE`는 싱크의 upsert로 **갭을 치유**하며, 여전히 초과하는 `UPDATE`는
+  DLQ로 재격리됩니다. 두 가지 귀결도 명시: 갭은 스스로 알려 주지 않으며(Validation이 보고), 0행 delete는
+  정상 재생과 구분할 수 없다(멱등성을 위한 의도적 트레이드오프).
+- 매뉴얼 §5의 수작업 교차 확인 안내를 새 귀속 설명으로 교체(en/ko/ja).
+
 ## v0.1.201
 
 ### Fixed
