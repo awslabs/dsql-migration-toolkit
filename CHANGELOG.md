@@ -5,6 +5,29 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.199
+
+### Fixed
+
+- **A restored session still pre-ticked every target table.** v0.1.198 keyed the default
+  off `generated_node_ids`, which is only set by pressing "Generate DDL for selected" — so
+  a session that applied without it (or pressed Clear afterwards) restored with that field
+  empty and fell straight through to "every table on the target", re-ticking them all.
+  "Start over" appeared to fix it only because a fresh session repopulates the generated
+  ids. The default now resolves the Step 2 scope the same way Schema Conversion's own
+  apply does (`_selected_apply_names`): the committed generated ids when present, **else
+  the ticked ids** — both persisted, so it survives a restart. The target-existing
+  fallback is now reached only when neither is known.
+
+### Tests
+
+- Added the wiring assertion that was missing: a mutation removing `ticked_node_ids` from
+  a call site passed every test, which is exactly how this shipped broken — the pure
+  helper was correct and tested while the UI still over-ticked. The new test parses the
+  screen's `default_migration_selection(...)` calls and fails if any omits the ticked
+  scope. Three mutations killed (dropping the ticked fallback, preferring ticked over
+  generated, and un-wiring a call site).
+
 ## v0.1.198
 
 ### Fixed

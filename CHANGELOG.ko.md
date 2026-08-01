@@ -5,6 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.199
+
+### Fixed
+
+- **복원된 세션에서는 여전히 모든 대상 테이블이 체크됐습니다.** v0.1.198은 기본값을
+  `generated_node_ids`에 맞췄는데, 이 필드는 "Generate DDL for selected"를 눌러야만 설정됩니다 — 그래서
+  그것 없이 Apply만 한 세션(또는 이후 Clear를 누른 세션)은 이 필드가 빈 상태로 복원되어 곧바로 "대상의
+  모든 테이블" 폴백으로 떨어지며 전부 다시 체크했습니다. "Start over"가 해결해 보인 것은 새 세션이
+  generated ids를 다시 채우기 때문일 뿐입니다. 이제 기본값은 Schema Conversion의 apply가 쓰는 것과 같은
+  방식(`_selected_apply_names`)으로 2단계 범위를 결정합니다: 커밋된 generated ids가 있으면 그것,
+  **없으면 ticked ids** — 둘 다 영속되므로 재시작을 견딥니다. 대상 존재 폴백은 둘 다 없을 때만 쓰입니다.
+
+### Tests
+
+- 빠져 있던 배선 검증을 추가했습니다: 호출 지점에서 `ticked_node_ids`를 제거하는 변이가 모든 테스트를
+  통과했는데, 이게 바로 이 버그가 배포된 경로입니다 — 순수 헬퍼는 맞고 테스트도 있었지만 UI는 여전히
+  과다 체크했습니다. 새 테스트는 화면의 `default_migration_selection(...)` 호출을 파싱해 ticked 범위를
+  빠뜨리면 실패합니다. 변이 3개 검출(ticked 폴백 제거, generated보다 ticked 우선, 호출 지점 배선 해제).
+
 ## v0.1.198
 
 ### Fixed

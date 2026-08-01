@@ -9030,3 +9030,93 @@ def test_picker_caption_says_target_when_that_is_where_the_default_came_from() -
     caption = next(t for t in ui.texts if t.startswith("Pre-selected"))
     assert "already on the target" in caption
     assert "Schema Conversion" not in caption
+
+
+def test_default_selection_uses_the_ticked_set_when_nothing_was_generated() -> None:
+    """The restored-session case the first cut of this fix missed.
+
+    Reported after v0.1.198: the picker STILL over-ticked, and "Start over" fixed it --
+    the tell that it was a restored session. ``generated_node_ids`` is only set by
+    pressing "Generate DDL for selected", so a session that applied without it (or
+    pressed Clear afterwards) restores with that field empty while ``ticked_node_ids``
+    -- also persisted -- still holds the real Step 2 selection. Falling straight through
+    to the target-existing set then re-ticked every table the target happened to carry.
+
+    Schema Conversion's own apply already resolves its scope as "generated else ticked"
+    (``_selected_apply_names``); this mirrors it so the two steps agree.
+    """
+    from dsql_migrator.ui.data_migration import default_migration_selection
+
+    target = _dm_target_inventory("orders", "customers")  # both already on target
+    ticked = [f"{TABLE_PREFIX}orders"]  # ...but only `orders` was ticked in Step 2
+
+    assert default_migration_selection(_inventory(), None, target, ticked) == ["orders"]
+    # An explicit empty generated list (Clear was pressed) must behave the same.
+    assert default_migration_selection(_inventory(), [], target, ticked) == ["orders"]
+
+
+def test_default_selection_prefers_generated_over_ticked_when_both_exist() -> None:
+    # Generated is the COMMITTED, reviewed scope, so it wins over a tick set the user
+    # may have changed since generating.
+    from dsql_migrator.ui.data_migration import default_migration_selection
+
+    target = _dm_target_inventory("orders", "customers")
+
+    assert default_migration_selection(
+        _inventory(),
+        [f"{TABLE_PREFIX}customers"],  # generated
+        target,
+        [f"{TABLE_PREFIX}orders"],  # ticked since
+    ) == ["customers"]
+
+
+def test_default_selection_falls_back_only_when_neither_scope_is_known() -> None:
+    # A reconnect into a session that never ticked anything: the Step 2 choice is
+    # genuinely unknown, so the target set keeps the flow usable rather than showing
+    # zero ticked tables with no explanation.
+    from dsql_migrator.ui.data_migration import default_migration_selection
+
+    target = _dm_target_inventory("orders", "customers")
+
+    assert default_migration_selection(_inventory(), None, target, None) == [
+        "orders",
+        "customers",
+    ]
+    assert default_migration_selection(_inventory(), [], target, []) == [
+        "orders",
+        "customers",
+    ]
+
+
+def test_all_default_selection_call_sites_pass_the_ticked_scope() -> None:
+    """Every call site must thread ``ticked_node_ids``, not just the generated ids.
+
+    The helper can be perfectly correct and the UI still over-tick if a call site omits
+    the argument -- which is exactly how this shipped broken once: the pure function was
+    fixed and tested, the picker still selected every table, and only "Start over"
+    appeared to help (because a fresh session repopulates the generated ids). Assert the
+    wiring, since a unit test of the helper alone cannot see it.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "default_migration_selection"
+    ]
+    assert calls, "expected the screen to resolve the default selection"
+    for call in calls:
+        passed = [
+            ast.unparse(arg) for arg in call.args
+        ] + [f"{kw.arg}={ast.unparse(kw.value)}" for kw in call.keywords]
+        joined = " ".join(passed)
+        assert "ticked_node_ids" in joined, (
+            "a default_migration_selection() call omits the ticked scope, so a restored "
+            f"session would re-tick every target table: {joined}"
+        )

@@ -413,7 +413,10 @@ def build_data_migration_screen(
             migration_state.selection,
             touched=migration_state.selection_touched,
             default=default_migration_selection(
-                inventory, conv_state.generated_node_ids, _target_inventory()
+                inventory,
+                conv_state.generated_node_ids,
+                _target_inventory(),
+                conv_state.ticked_node_ids,
             ),
         )
         if not names:
@@ -545,7 +548,10 @@ def build_data_migration_screen(
                 migration_state.selection,
                 touched=migration_state.selection_touched,
                 default=default_migration_selection(
-                    inventory, conv_state.generated_node_ids, _target_inventory()
+                    inventory,
+                    conv_state.generated_node_ids,
+                    _target_inventory(),
+                    conv_state.ticked_node_ids,
                 ),
             )
             if not names:
@@ -843,7 +849,10 @@ def build_data_migration_screen(
                     # to the target-existing set only when nothing was generated here),
                     # so picking 3 tables in Step 2 does not arrive with 11 ticked.
                     default_selection=default_migration_selection(
-                        inventory, conv_state.generated_node_ids, _target_inventory()
+                        inventory,
+                        conv_state.generated_node_ids,
+                        _target_inventory(),
+                        conv_state.ticked_node_ids,
                     ),
                     on_refresh=refresh_browser,
                     locked=selection_locked,
@@ -861,7 +870,10 @@ def build_data_migration_screen(
                 migration_state.selection,
                 touched=migration_state.selection_touched,
                 default=default_migration_selection(
-                    inventory, conv_state.generated_node_ids, _target_inventory()
+                    inventory,
+                    conv_state.generated_node_ids,
+                    _target_inventory(),
+                    conv_state.ticked_node_ids,
                 ),
             )
             # A Full Load that already ran (live job, or the step reached DONE --
@@ -2147,25 +2159,37 @@ def default_migration_selection(
     inventory: SourceInventory,
     generated_node_ids: Optional[Sequence[str]],
     target: Optional[TargetInventory],
+    ticked_node_ids: Optional[Sequence[str]] = None,
 ) -> list[str]:
     """Return the tables to pre-tick in the picker before the user touches it.
 
-    **This session's Schema Conversion choice wins when there is one.** Picking three
-    tables in Step 2 and finding all eleven ticked in Step 3 is wrong: the default used
-    to be "every table that exists on the target", so a target carrying tables from
-    earlier runs (or a full E2E reset) silently re-selected them all, and the deliberate
-    Step 2 selection was discarded. Worse, it defaults to migrating MORE than asked --
-    the wrong direction for a destructive-ish, long-running operation.
+    **The Schema Conversion selection wins whenever one is known.** Picking three tables
+    in Step 2 and finding all eleven ticked in Step 3 is wrong: the default used to be
+    "every table that exists on the target", so a target carrying tables from earlier
+    runs (or a full E2E reset) silently re-selected them all and discarded the deliberate
+    Step 2 selection. Worse, it defaults to migrating MORE than asked -- the wrong
+    direction for a long-running load.
 
-    Falls back to the target-existing set only when this session generated nothing
-    (``generated_node_ids`` empty/absent) -- the reconnected or
-    schema-applied-out-of-band case, where the Step 2 selection is genuinely unknown and
-    an empty default would leave the user staring at zero ticked tables with no
-    explanation. Intersected with the migratable universe by the caller.
+    Resolves the Step 2 scope exactly the way Schema Conversion's own apply does
+    (``_selected_apply_names``): the committed ``generated_node_ids`` when DDL was
+    generated, **else the live ``ticked_node_ids``**. Both are persisted, so this holds
+    across a restart. Using only the generated ids (the first cut of this fix) still
+    over-ticked every real flow that applies without pressing "Generate DDL for
+    selected", or that pressed Clear afterwards -- ``generated_node_ids`` is empty there
+    while the user's tick set is right there in state.
+
+    Falls back to the target-existing set only when NEITHER is known -- a reconnect into
+    a session that never ticked anything, or a schema applied out of band -- where the
+    Step 2 choice is genuinely unknown and an empty default would leave the user staring
+    at zero ticked tables with no explanation. Intersected with the migratable universe
+    by the caller.
     """
     generated = generated_table_names(inventory, generated_node_ids)
     if generated:
         return generated
+    ticked = generated_table_names(inventory, ticked_node_ids)
+    if ticked:
+        return ticked
     return target_existing_table_names(inventory, target)
 
 
