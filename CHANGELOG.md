@@ -5,6 +5,47 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.204
+
+### Fixed
+
+- **"Accept quarantined rows & continue" disappeared in a restored session — a complete
+  dead end.** Full Load ends with `FullLoadIncompleteError`, whose message tells the
+  operator to use that button; after an app restart the button was not rendered. The
+  quarantine-only gate counted rows in `ErrorLogStore`, which is **in-memory**, so a
+  restart made the count 0 and the gate `False`. Nothing else could recover the run
+  either — a permanently-rejected value never loads on retry — leaving only "Start over".
+  The count now comes from the **job's chunks** (the job store is durable), falling back
+  to scanning the error log so a job written by an older version still works. The
+  guard that withholds the override while any table is genuinely unfinished is unchanged.
+
+### Added
+
+- **Failures now carry diagnostic detail on the durable activity log.** The activity log
+  is the record that outlives the session, and three of its failure entries could not be
+  troubleshot from:
+  - **Each quarantined row** was recorded only to the in-memory error log, so after a
+    restart nothing said *which* rows were lost — only a count. Every dropped row now logs
+    its primary key, the rejection reason, and that the rest of the table loaded. Wired
+    into all three load paths (in-process, sharded worker, single-table worker) via one
+    shared helper — a sharded table is a large one, exactly the case least likely to be
+    checked by hand.
+  - **"1 of 8 table(s) did not fully load"** was a count, not a diagnosis. The run summary
+    now names the affected tables with their reasons, deduplicated and capped at 8 (with a
+    "+N more" note) so a large run cannot flood the rotated log.
+  - **"connector X failed"** named no cause. The entry now carries the peer connectors'
+    states (which side of the pipeline broke), the DLQ depth, the per-table error counts,
+    and a pointer to the connector's CloudWatch log group for the stack trace. Degrades
+    gracefully when a poll has not gathered diagnostics yet, and never reports a DLQ depth
+    it did not actually read.
+
+### Tests
+
+- Six mutations killed. One initially survived and is now covered: the connector
+  transition passing `detail=None` — every other test called the detail builder directly,
+  so the *wiring* was untested, which is the same class of gap that shipped the
+  restored-session table-selection bug earlier.
+
 ## v0.1.203
 
 ### Added

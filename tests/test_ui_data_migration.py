@@ -9498,3 +9498,283 @@ def test_status_cell_slot_renders_the_dropped_badge_from_row_data() -> None:
     # Every row key the template reads must be produced by the row mapping above.
     for key in set(re.findall(r"props\.row\.(\w+)", template)):
         assert f'"{key}":' in src, f"slot reads props.row.{key} but no row supplies it"
+
+
+# ---------------------------------------------------------------------------
+# "Accept quarantined rows & continue" must survive a restart
+# ---------------------------------------------------------------------------
+
+
+def _quarantine_job(*, dropped: int, status: str = "DONE"):
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+
+    job = MigrationJob(job_id="j1")
+    job.status = "FAILED"  # FullLoadIncompleteError
+    job.chunks = [
+        ChunkState(chunk_id="ecommerce.product_media", status=status, rows_loaded=12,
+                   rows_quarantined=dropped, attempts=1),
+        ChunkState(chunk_id="ecommerce.orders", status="DONE", rows_loaded=500,
+                   attempts=1),
+    ]
+    return job
+
+
+def _log_with_quarantine_rows(job_id: str, pks) -> "ErrorLogStore":
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.error_log import ErrorLogStore
+    from dsql_migrator.core.models import DataErrorRecord
+
+    log = ErrorLogStore()
+    for pk in pks:
+        log.record(
+            job_id,
+            DataErrorRecord(
+                table="ecommerce.product_media", chunk_id="ecommerce.product_media",
+                error_code="22001",
+                message=f"quarantined row pk[id={pk}]: datatype limit exceeded",
+                occurred_at=datetime.now(timezone.utc),
+            ),
+        )
+    return log
+
+
+def test_accept_quarantine_stays_available_after_a_restart() -> None:
+    """The escape hatch must not vanish with the in-memory error log.
+
+    Reported from a real run: Full Load ended with FullLoadIncompleteError, whose message
+    tells the operator to use "Accept quarantined rows & continue" — and in a RESTORED
+    session that button was gone. The quarantine-only gate counted rows in
+    ``ErrorLogStore``, which is in-memory, so a restart made the count 0 and the gate
+    False. A complete dead end: the run cannot be retried into success (a
+    permanently-rejected value never loads), so the only escape left was Start over.
+
+    The job store IS durable, so the per-chunk count is the signal that survives.
+    """
+    from dsql_migrator.core.error_log import ErrorLogStore
+    from dsql_migrator.ui.data_migration import (
+        _incomplete_is_quarantine_only,
+        _quarantined_row_count,
+    )
+
+    job = _quarantine_job(dropped=3)
+    fresh_log = ErrorLogStore()  # a new process: the records are gone
+
+    assert not fresh_log.records("j1")
+    assert _quarantined_row_count(job, fresh_log) == 3
+    assert _incomplete_is_quarantine_only(job, fresh_log) is True
+
+
+def test_quarantine_count_is_not_double_counted_within_a_session() -> None:
+    # Same session: the chunk count and the log entries describe the SAME rows, so the
+    # count must be 3, not 6.
+    from dsql_migrator.ui.data_migration import _quarantined_row_count
+
+    job = _quarantine_job(dropped=3)
+    log = _log_with_quarantine_rows("j1", (3, 7, 9))
+
+    assert _quarantined_row_count(job, log) == 3
+
+
+def test_quarantine_count_falls_back_to_the_error_log_for_an_older_job() -> None:
+    # A job written before the per-chunk count existed has rows_quarantined == 0; the
+    # log-scanning fallback keeps the escape hatch working for it.
+    from dsql_migrator.ui.data_migration import (
+        _incomplete_is_quarantine_only,
+        _quarantined_row_count,
+    )
+
+    job = _quarantine_job(dropped=0)
+    log = _log_with_quarantine_rows("j1", (3, 7))
+
+    assert _quarantined_row_count(job, log) == 2
+    assert _incomplete_is_quarantine_only(job, log) is True
+
+
+def test_accept_quarantine_is_withheld_when_there_is_retryable_work() -> None:
+    # An UNFINISHED table is retryable work and must still block: the override exists
+    # only for rows that can never load, not to wave past a table that simply failed.
+    from dsql_migrator.core.error_log import ErrorLogStore
+    from dsql_migrator.ui.data_migration import _incomplete_is_quarantine_only
+
+    job = _quarantine_job(dropped=3, status="FAILED")
+
+    assert _incomplete_is_quarantine_only(job, ErrorLogStore()) is False
+
+
+def test_accept_quarantine_is_withheld_when_nothing_was_dropped() -> None:
+    from dsql_migrator.core.error_log import ErrorLogStore
+    from dsql_migrator.ui.data_migration import _incomplete_is_quarantine_only
+
+    job = _quarantine_job(dropped=0)
+
+    assert _incomplete_is_quarantine_only(job, ErrorLogStore()) is False
+
+
+# ---------------------------------------------------------------------------
+# Failures must be diagnosable from the DURABLE activity log
+# ---------------------------------------------------------------------------
+
+
+def test_each_quarantined_row_is_recorded_on_the_activity_log(monkeypatch) -> None:
+    """A permanently dropped row must leave a durable trace, not only an in-memory one.
+
+    The per-row detail (primary key + reason) went ONLY to ``ErrorLogStore``, which is
+    in-memory: after a restart nothing said WHICH rows were lost, just a count. A row the
+    migration can never recover on its own is exactly what an audit trail is for.
+    """
+    from dsql_migrator.ui.data_migration import _engine
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        _engine, "log_activity",
+        lambda category, action, **kw: captured.append({"action": action, **kw}),
+    )
+
+    _engine._log_quarantined_row(
+        "ecommerce.product_media", "id=3",
+        "datatype limit greater than 1048576 bytes not supported for bytea", "22001",
+    )
+
+    (entry,) = captured
+    assert entry["action"] == "row quarantined"
+    assert entry["target"] == "ecommerce.product_media"
+    assert entry["error_code"] == "22001"
+    assert "pk[id=3]" in entry["detail"]  # the PK is what you need to fix the source
+    assert "PERMANENTLY DROPPED" in entry["detail"]
+    assert "1048576" in entry["detail"]  # the actual reason, not a generic label
+    assert "rest of the table loaded" in entry["detail"]  # not a whole-table failure
+
+
+def test_every_load_path_logs_quarantined_rows(monkeypatch) -> None:
+    # Three load paths record quarantine (in-process, sharded worker, single-table
+    # worker). A sharded table is a LARGE one -- least likely to be checked by hand --
+    # so a path that skipped the audit entry would hide the worst cases.
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _engine
+
+    src = inspect.getsource(_engine)
+    # One definition + one call per load path.
+    assert src.count("_log_quarantined_row(") == 4, (
+        "expected the helper plus a call in each of the three load paths"
+    )
+
+
+def test_run_incomplete_names_the_tables_and_reasons(monkeypatch) -> None:
+    """"1 of 8 table(s) did not fully load" is a count, not a diagnosis.
+
+    Read weeks later it says a run failed but not which table or why -- and the per-table
+    reasons lived only in the in-memory error log.
+    """
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.error_log import ErrorLogStore
+    from dsql_migrator.core.models import DataErrorRecord
+    from dsql_migrator.ui.data_migration import _engine
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        _engine, "log_activity",
+        lambda category, action, **kw: captured.append({"action": action, **kw}),
+    )
+
+    log = ErrorLogStore()
+    log.record("j1", DataErrorRecord(
+        table="ecommerce.product_media", chunk_id="x", error_code="22001",
+        message="quarantined row pk[id=3]: datatype limit greater than 1048576 bytes",
+        occurred_at=datetime.now(timezone.utc)))
+
+    class _Handle:
+        cancelled = False
+
+    with pytest.raises(Exception):
+        _engine._finalize_run(
+            _Handle(), "j1", ["t"] * 8,
+            _engine._RunCounts(real_failed=0, quarantined=1), log,
+            accept_quarantined_rows=False,
+        )
+
+    entry = next(e for e in captured if e["action"] == "run incomplete")
+    assert "1 of 8 table(s) did not fully load" in entry["detail"]
+    assert "ecommerce.product_media" in entry["detail"]  # WHICH table
+    assert "1048576" in entry["detail"]  # WHY
+
+
+def test_cdc_connector_failure_detail_localizes_the_fault() -> None:
+    """A bare "connector X failed" cannot be troubleshot: it names no cause.
+
+    The reason lived only in CloudWatch and the in-memory error summary. The durable
+    entry now carries the peer connectors' states (which side of the pipeline broke), the
+    DLQ depth, the per-table error counts, and where to find the stack trace.
+    """
+    from dsql_migrator.core.models import ErrorLogSummary, LoadStatusView
+    from dsql_migrator.ui.data_migration import _connector_failure_detail
+
+    view = LoadStatusView(
+        kind="CDC",
+        connector_states={"cdc-source": "RUNNING", "cdc-sink": "FAILED"},
+        dlq_depth=4,
+        error_summary=ErrorLogSummary(
+            total_errors=4, errors_by_table={"product_media": 3, "orders": 1},
+            log_available=True,
+        ),
+    )
+
+    detail = _connector_failure_detail(object(), view, "cdc-sink")
+
+    # The source still running localizes the fault to the sink side.
+    assert "cdc-source=RUNNING" in detail
+    assert "cdc-sink" not in detail.split("other connectors:")[1].split(";")[0]
+    assert "4 record(s) in the DLQ" in detail
+    assert "product_media=3" in detail
+    assert "CloudWatch" in detail
+
+
+def test_cdc_connector_failure_detail_degrades_without_diagnostics() -> None:
+    # A poll may fire before CloudWatch/DLQ data exists. The entry must still point
+    # somewhere useful rather than being dropped or claiming false detail.
+    from dsql_migrator.core.models import LoadStatusView
+    from dsql_migrator.ui.data_migration import _connector_failure_detail
+
+    detail = _connector_failure_detail(
+        object(), LoadStatusView(kind="CDC", connector_states={"cdc-sink": "FAILED"}),
+        "cdc-sink",
+    )
+
+    assert "CloudWatch" in detail
+    assert "DLQ" not in detail  # never invents a depth it did not read
+
+
+def test_connector_failure_transition_actually_logs_the_detail() -> None:
+    # The helper can be perfect and the log still bare if the transition site passes
+    # detail=None -- a mutation doing exactly that survived every other test here,
+    # because they all called the helper directly. Assert the wiring.
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm._log_cdc_connector_transitions))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_connector_failure_detail"
+    ]
+    assert calls, "the FAILED transition must build a troubleshooting detail"
+    # ...and that value must reach the log call as `detail=`.
+    logged = [
+        kw
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_log_cdc_event"
+        for kw in node.keywords
+        if kw.arg == "detail"
+    ]
+    assert logged, "_log_cdc_event must receive the detail"
+    assert any(ast.unparse(kw.value) == "detail" for kw in logged), (
+        "the built detail must be passed through, not dropped"
+    )

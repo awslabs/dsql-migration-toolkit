@@ -933,6 +933,33 @@ def _drain_progress_queue(
         )
 
 
+def _log_quarantined_row(name: str, primary_key: object, message: object,
+                         error_code: object = None) -> None:
+    """Record one permanently-dropped row on the DURABLE activity log.
+
+    The per-row error log is in-memory, so after an app restart nothing said WHICH rows
+    were lost -- only a count. A permanently dropped row is precisely what an audit trail
+    is for: it is the one outcome the migration cannot recover by itself, and the operator
+    needs the primary key to fix the source value. PK + reason only, never row values
+    (Property 7).
+
+    Shared by all three load paths (in-process, sharded worker, single-table worker) so a
+    sharded table -- the large ones, least likely to be checked by hand -- cannot silently
+    skip the audit entry.
+    """
+    log_activity(
+        ActivityCategory.FULL_LOAD,
+        "row quarantined",
+        status=ActivityStatus.FAILURE,
+        target=name,
+        error_code=error_code,
+        detail=(
+            f"row pk[{primary_key}] PERMANENTLY DROPPED: {message}. The rest of the "
+            "table loaded; fix the source value and reload this table to close the gap."
+        ),
+    )
+
+
 def _record_index_failures(
     error_log: ErrorLogStore, job_id: str, table_name: str, failures
 ) -> None:
@@ -1176,6 +1203,10 @@ def _migrate_one_table(
                     ),
                     occurred_at=datetime.now(timezone.utc),
                 ),
+            )
+            _log_quarantined_row(
+                name, record.primary_key, record.message,
+                getattr(record, "error_code", None),
             )
         # Indexes that could not be created. Recorded so the operator sees WHICH
         # index is missing, but deliberately NOT treated as a table failure: every
@@ -1512,6 +1543,10 @@ def _migrate_tables_in_parallel(
                                     message=f"quarantined row pk[{rec.get('primary_key')}]: {rec.get('message')}",
                                     occurred_at=datetime.now(timezone.utc),
                                 ))
+                                _log_quarantined_row(
+                                    name, rec.get("primary_key"), rec.get("message"),
+                                    rec.get("error_code"),
+                                )
                             _record_index_failures(
                                 error_log, job_id, name,
                                 [f for r in shard_results[name]
@@ -1537,6 +1572,10 @@ def _migrate_tables_in_parallel(
                                     message=f"quarantined row pk[{rec.get('primary_key')}]: {rec.get('message')}",
                                     occurred_at=datetime.now(timezone.utc),
                                 ))
+                                _log_quarantined_row(
+                                    name, rec.get("primary_key"), rec.get("message"),
+                                    rec.get("error_code"),
+                                )
                             _record_index_failures(
                                 error_log, job_id, name, result.index_failures
                             )
@@ -1633,14 +1672,36 @@ def _finalize_run(
             ),
         )
         return
+    # Name the affected tables and their reasons. "1 of 8 table(s) did not fully load"
+    # is a count, not a diagnosis: reading it later tells you a run failed but not which
+    # table or why, and the per-row detail lives only in the in-memory error log (gone
+    # after a restart). Roll the per-table reasons into the durable entry, deduplicated
+    # and bounded so a 500-table run cannot flood the rotated log.
+    detail_parts = [
+        f"{incomplete} of {total} table(s) did not fully load"
+        + (f"; {quarantined_rows} row(s) quarantined" if quarantined_rows else "")
+    ]
+    reasons_by_table: dict[str, str] = {}
+    for record in error_log.records(job_id):
+        table = str(getattr(record, "table", "") or "?")
+        message = str(getattr(record, "message", "") or "").strip()
+        if not message or table in reasons_by_table:
+            continue  # first reason per table is the representative one
+        reasons_by_table[table] = message[:200]
+    if reasons_by_table:
+        listed = "; ".join(
+            f"{table}: {reason}"
+            for table, reason in sorted(reasons_by_table.items())[:8]
+        )
+        more = max(0, len(reasons_by_table) - 8)
+        detail_parts.append(
+            f"reasons — {listed}" + (f" (+{more} more table(s))" if more else "")
+        )
     log_activity(
         ActivityCategory.FULL_LOAD,
         "run incomplete",
         status=ActivityStatus.FAILURE,
-        detail=(
-            f"{incomplete} of {total} table(s) did not fully load"
-            + (f"; {quarantined_rows} row(s) quarantined" if quarantined_rows else "")
-        ),
+        detail=". ".join(detail_parts),
     )
     if quarantine_only:
         guidance = (

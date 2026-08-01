@@ -3307,6 +3307,14 @@ def _log_cdc_connector_transitions(migration_state, job_manager) -> None:
         if last.get(name) == norm:
             continue
         if norm in ("RUNNING", "FAILED"):
+            # A bare "connector X failed" is useless for troubleshooting -- it says a
+            # failure happened but nothing about WHY, and the reason lives only in
+            # CloudWatch/the in-memory error summary (gone after a restart). Attach the
+            # per-connector task trace / DLQ context when the poll captured it, so the
+            # durable log carries the cause and where to look next.
+            detail = None
+            if norm == "FAILED":
+                detail = _connector_failure_detail(migration_state, view, name)
             _log_cdc_event(
                 f"connector {name} {norm.lower()}",
                 status=(
@@ -3314,16 +3322,78 @@ def _log_cdc_connector_transitions(migration_state, job_manager) -> None:
                     if norm == "RUNNING"
                     else ActivityStatus.FAILURE
                 ),
+                detail=detail,
             )
     migration_state._last_logged_connector_states = {
         n: str(s).upper() for n, s in states.items()
     }
 
 
+def _connector_failure_detail(migration_state, view, name: str) -> str:
+    """Build the troubleshooting detail for a FAILED connector activity entry.
+
+    Gathers whatever the last poll captured -- the connector's task error trace, the DLQ
+    depth, and the latest per-table data errors -- into one durable line. Best-effort by
+    design: every source is optional (a poll may not have reached CloudWatch yet), so a
+    missing piece degrades the message instead of dropping the entry. Credential-free
+    (Property 7): reasons and counts only, never row values.
+    """
+    parts: list[str] = []
+    # Peer connector states: a sink failure while the source still runs (or vice versa)
+    # localizes the fault to one side of the pipeline, which is the first thing you want
+    # to know when reading this entry weeks later.
+    peers = {
+        peer: str(state).upper()
+        for peer, state in (getattr(view, "connector_states", None) or {}).items()
+        if peer != name
+    }
+    if peers:
+        parts.append(
+            "other connectors: "
+            + ", ".join(f"{p}={s}" for p, s in sorted(peers.items()))
+        )
+    depth = getattr(view, "dlq_depth", None)
+    if depth:
+        parts.append(
+            f"{depth} record(s) in the DLQ (rejected permanently, e.g. a value over "
+            "DSQL's ~1 MiB per-value limit)"
+        )
+    summary = getattr(view, "error_summary", None)
+    by_table = dict(getattr(summary, "errors_by_table", None) or {})
+    if by_table:
+        listed = ", ".join(
+            f"{table}={count}" for table, count in sorted(by_table.items())[:5]
+        )
+        parts.append(f"data errors by table: {listed}")
+    parts.append(
+        "see the connector's CloudWatch log group (linked on the CDC step) for the "
+        "task stack trace"
+    )
+    return "; ".join(parts)
+
+
 def _quarantined_row_count(job: "MigrationJob", error_log: "ErrorLogStore") -> int:
-    """Count permanently-quarantined rows recorded for ``job`` in the error log."""
+    """Count permanently-quarantined rows for ``job``.
+
+    Prefers the count recorded on the JOB's chunks, because that is what survives an app
+    restart: the job store is durable while :class:`ErrorLogStore` is in-memory only.
+    Reading the log alone made this return 0 for a restored session, which flipped
+    :func:`_incomplete_is_quarantine_only` to ``False`` and hid the
+    "Accept quarantined rows & continue" button -- the exact action the failure message
+    tells the operator to use. That was a complete dead end: the run cannot be retried
+    into success (a permanently-rejected value never loads) and the only escape left was
+    Start over.
+
+    Falls back to counting the log's ``quarantined row pk[...]`` entries so a job written
+    by an older version (no per-chunk count) still works.
+    """
     if job is None:
         return 0
+    from_chunks = sum(
+        getattr(chunk, "rows_quarantined", 0) or 0 for chunk in job.chunks
+    )
+    if from_chunks:
+        return from_chunks
     return sum(
         1
         for record in error_log.records(job.job_id)
