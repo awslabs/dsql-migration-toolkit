@@ -973,6 +973,85 @@ def test_genuine_in_progress_validation_without_report_is_not_marked_done() -> N
     assert get_status(s2.workflow, WorkflowStep.VALIDATION) is StepStatus.IN_PROGRESS
 
 
+def test_reconnect_clears_a_schema_apply_left_spinning_by_a_restart() -> None:
+    """A restart mid-apply must not leave the step spinning forever.
+
+    Reported from a real session: the UI was restarted while "Applying converted DDL to
+    the target..." was running, and after reconnecting the spinner never stopped. The
+    apply runs IN-PROCESS and its job id is deliberately never persisted, so a restart
+    kills the work AND loses the handle: the step still restores as IN_PROGRESS (which
+    renders the spinner), while ``_install_poll_timer`` -- the only thing that finalizes
+    the status -- returns immediately because ``job_id is None``. Nothing could ever
+    clear it, and the Apply controls stayed locked behind it.
+
+    Reconciled to FAILED rather than DONE: unlike Validation there is no restored report
+    proving completion, and the run demonstrably did NOT finish. FAILED is honest and
+    re-enables Apply; the apply is idempotent per object, so re-running finishes the
+    remainder.
+    """
+    from dsql_migrator.ui.workflow import get_status
+
+    session, eval_state, conv_state, migration_state = _populated_states()
+    session.set_workflow(
+        with_status(
+            session.workflow, WorkflowStep.SCHEMA_CONVERSION, StepStatus.IN_PROGRESS
+        )
+    )
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+    assert getattr(snapshot.workflow, "schema_conversion") is StepStatus.IN_PROGRESS
+
+    s2 = SessionConnectionState()
+    c2 = SchemaConversionState()
+    assert c2.job_id is None  # a fresh process has no handle on the dead job
+
+    apply_session_snapshot(
+        snapshot, s2, EvaluationState(), c2, DataMigrationState(), None
+    )
+
+    assert (
+        get_status(s2.workflow, WorkflowStep.SCHEMA_CONVERSION) is StepStatus.FAILED
+    )
+    # The user is told what happened, that already-created objects are on the target,
+    # and that re-running with "Skip if exists" is the safe way to finish.
+    assert c2.error is not None
+    assert "restarted" in c2.error
+    assert "Skip if exists" in c2.error
+
+
+def test_a_live_schema_apply_is_not_reconciled_away() -> None:
+    # Guard the precondition: when a real apply job IS in flight (job_id present, e.g.
+    # a same-process reconnect), the step must stay IN_PROGRESS so the spinner and the
+    # poll timer keep tracking it -- the reconcile must key off the LOST handle, not
+    # merely off the IN_PROGRESS status.
+    from dsql_migrator.ui.workflow import get_status
+
+    session, eval_state, conv_state, migration_state = _populated_states()
+    session.set_workflow(
+        with_status(
+            session.workflow, WorkflowStep.SCHEMA_CONVERSION, StepStatus.IN_PROGRESS
+        )
+    )
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+
+    s2 = SessionConnectionState()
+    c2 = SchemaConversionState()
+    c2.job_id = "apply-job-still-running"
+
+    apply_session_snapshot(
+        snapshot, s2, EvaluationState(), c2, DataMigrationState(), None
+    )
+
+    assert (
+        get_status(s2.workflow, WorkflowStep.SCHEMA_CONVERSION)
+        is StepStatus.IN_PROGRESS
+    )
+    assert c2.error is None
+
+
 def test_validation_signature_changes_when_result_recorded() -> None:
     from dsql_migrator.core.models import (
         TableValidationResult,

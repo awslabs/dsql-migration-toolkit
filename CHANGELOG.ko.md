@@ -5,6 +5,40 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.197
+
+### Fixed
+
+- **스키마 적용 중 앱을 재시작하면 해당 단계가 영원히 스피닝했습니다.** 실제 세션에서 보고됨:
+  "Applying converted DDL to the target..." 진행 중에 UI를 재시작했고, 다시 연결한 뒤 스피너가
+  멈추지 않고 Apply 컨트롤이 계속 잠겨 있었습니다. 적용은 in-process로 실행되고 그 job id는 의도적으로
+  영속되지 않으므로, 재시작은 작업을 죽이면서 **핸들까지 잃어버립니다** — 단계는 스냅샷에서 여전히
+  `IN_PROGRESS`로 복원되어(스피너를 그림) 있는데, 상태를 마무리해줄 폴 타이머는 job id가 없으면 즉시
+  반환했습니다. 그래서 무엇도 이걸 해제할 수 없었습니다.
+
+  이제 살아있는 적용 핸들이 없는 재연결은 단계를 `FAILED`로 조정하고(`DONE`이 아님: 완료를 증명하는
+  리포트가 없고, 실제로 끝나지 않았으므로) 무슨 일이 있었는지 설명합니다 — 재시작 전에 생성된 객체는
+  이미 대상에 있고, "Skip if exists"로 재실행하면 기존 객체를 건드리지 않고 나머지를 마칩니다. job id를
+  여전히 들고 있는 **진짜 진행 중인** 적용은 그대로 둡니다. 4단계(Validation)에는 이미 있던 조정이
+  2단계에는 없었습니다.
+
+### Changed
+
+- **일괄 Apply가 이제 위쪽 Generated DDL 목록에 대한 액션으로 읽힙니다.** 이 카드는 목록 아래에 있고
+  제목이 문자 그대로 "Apply to target" — 각 행의 개별 버튼과 같은 세 단어 — 이어서 별개 기능처럼
+  보였고, 안내문이 "…in the Generated DDL list above"로 두 번이나 위를 가리켜야 했습니다. 이제 카드
+  제목은 "Apply generated DDL to target"이고, 본문이 실시간 개수로 범위를 명시하며("Applies the 7
+  objects from the Generated DDL list above"), 버튼도 무엇을 적용하는지 이름을 밝힙니다
+  ("Apply all 7 generated objects to target" — 범위가 모호했던 "Apply all to target (7)" 대체).
+  범위가 객체 1개일 때는 개별 적용 안내문을 생략합니다 — 버튼이 이미 하는 일을 지시할 뿐이므로.
+
+### Docs
+
+- `CLAUDE.md`: UI가 **표시하는** 버전은 `pyproject.toml`이 아니라 설치된 패키지 메타데이터
+  (`importlib.metadata`)에서 온다는 점을 기록했습니다 — editable 설치는 코드 편집은 즉시 반영하지만
+  버전은 갱신하지 않으므로, 버전 범프 후 재시작 전에 **`uv sync`**(`uv lock`만으로는 부족)가 필요합니다.
+  이 문제로 로컬 UI가 6개 릴리스 뒤처져 있었습니다.
+
 ## v0.1.196
 
 ### Fixed

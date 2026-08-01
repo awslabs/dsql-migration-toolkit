@@ -208,6 +208,39 @@ def apply_session_snapshot(
                 )
             )
 
+    # Step 2 (Schema Conversion): the same stale-IN_PROGRESS trap, and here it had no
+    # escape at all. The apply runs IN-PROCESS, and its job id is deliberately never
+    # persisted -- so a restart mid-apply kills the work AND loses the handle. On
+    # reconnect the step still reads IN_PROGRESS from the snapshot, which renders the
+    # "Applying converted DDL to the target..." spinner; the poll timer that would
+    # normally finalize the status returns immediately when ``job_id is None`` (and
+    # would raise JobNotFoundError even if it were set), so nothing ever clears it. The
+    # spinner span forever with the Apply button locked behind it.
+    #
+    # Reconcile to FAILED, not DONE: unlike Validation there is no restored report
+    # proving the run finished, and it demonstrably did NOT -- the process that was
+    # applying DDL is gone. FAILED is the honest state and re-enables the Apply
+    # controls; the apply is idempotent per object (SKIP_IF_EXISTS skips what already
+    # landed), so re-running is safe and finishes whatever was interrupted.
+    if (
+        get_status(session.workflow, WorkflowStep.SCHEMA_CONVERSION)
+        is StepStatus.IN_PROGRESS
+        and getattr(conv_state, "job_id", None) is None
+    ):
+        session.set_workflow(
+            with_status(
+                session.workflow, WorkflowStep.SCHEMA_CONVERSION, StepStatus.FAILED
+            )
+        )
+        set_error = getattr(conv_state, "set_error", None)
+        if callable(set_error):
+            set_error(
+                "The app restarted while converted DDL was being applied, so the "
+                "apply was interrupted. Objects created before the restart are "
+                "already on the target. Re-run the apply to finish the rest — with "
+                '"Skip if exists" it leaves existing objects untouched.'
+            )
+
     # Reopen the last-viewed step on reconnect (app.py applies a back-compat
     # redirect for the retired standalone "cdc" view afterwards).
     if snapshot.active_view and hasattr(session, "set_active_view"):

@@ -4352,11 +4352,23 @@ def _render_apply_controls(
     via a sticky checkbox). ``table_count`` shows how many objects are in that
     apply scope; ``in_progress`` disables the button while an apply job is running.
     """
-    ui.label("Apply to target").classes("text-lg font-semibold")  # type: ignore[attr-defined]
+    # Title names the OBJECT of the action ("generated DDL"), not just the action, so
+    # this card reads as the bulk action ON the list above rather than a separate
+    # feature. It also stops colliding with the per-object "Apply to target" button
+    # label -- the same three words for two different scopes, one card apart, is what
+    # made the bulk action feel unrelated to the DDL it applies.
+    ui.label("Apply generated DDL to target").classes(  # type: ignore[attr-defined]
+        "text-lg font-semibold"
+    )
+    # Restate the scope with its COUNT. The count is the concrete tie back to the list:
+    # it moves with the user's selection, so the two sections visibly describe the same
+    # set -- which is what the old "...in the Generated DDL list above" pointer was
+    # trying (and failing) to do with words alone.
+    noun = "object" if table_count == 1 else "objects"
     ui.label(  # type: ignore[attr-defined]
-        "Choose how to handle objects that already exist on the target, then "
-        "apply all converted objects below, or apply a single object with its "
-        "\"Apply to target\" button in the Generated DDL list above."
+        f"Applies the {table_count} {noun} from the Generated DDL list above "
+        "(plus any approved AI suggestions) — not the whole schema. Choose how to "
+        "handle objects that already exist on the target, then apply."
     ).classes("text-sm text-gray-500")
 
     def on_mode_change(event: object) -> None:
@@ -4396,10 +4408,13 @@ def _render_apply_controls(
             # instead of Quasar's ``loading`` prop, which replaces the label with a
             # bare spinner (an empty-looking spinning button). The dedicated
             # progress panel below already shows the spinner and "(N of M)" count.
+            # Say WHAT is being applied, not just "all": "Apply all 7 generated
+            # objects" is unambiguous about scope, where a bare "Apply all to target
+            # (7)" reads as "everything on the source".
             apply_label = (
                 "Applying…"
                 if in_progress
-                else f"Apply all to target ({table_count})"
+                else f"Apply all {table_count} generated {noun} to target"
             )
             apply_button = ui.button(  # type: ignore[attr-defined]
                 apply_label,
@@ -4407,12 +4422,15 @@ def _render_apply_controls(
             ).props("unelevated no-caps color=primary icon=cloud_upload")
             if in_progress:
                 apply_button.props("disable")  # type: ignore[attr-defined]
-        ui.label(  # type: ignore[attr-defined]
-            "Applies the objects you generated/selected above (plus any approved "
-            "AI suggestions) -- not the whole schema. Existing objects follow the "
-            "rule selected here. You can also apply a single object with its "
-            "\"Apply to target\" button in the Generated DDL list above."
-        ).classes("text-xs text-gray-500")
+        # The scope is now carried by the header + button label, so this line only adds
+        # what neither says: the single-object alternative. Pointless when the scope IS
+        # one object -- the button already applies exactly that -- so it is omitted
+        # rather than telling the user to do what they are about to do.
+        if table_count != 1:
+            ui.label(  # type: ignore[attr-defined]
+                "To apply just one object instead, use its \"Apply to target\" button "
+                "in the Generated DDL list above."
+            ).classes("text-xs text-gray-500")
 
 
 def _render_apply_results(

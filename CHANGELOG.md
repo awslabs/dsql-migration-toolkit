@@ -5,6 +5,45 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.197
+
+### Fixed
+
+- **Restarting the app during a schema apply left the step spinning forever.** Reported
+  from a real session: the UI was restarted while "Applying converted DDL to the
+  target..." was running, and after reconnecting the spinner never stopped and the Apply
+  controls stayed locked behind it. The apply runs in-process and its job id is
+  deliberately never persisted, so a restart killed the work *and* lost the handle — the
+  step still restored as `IN_PROGRESS` (which draws the spinner) while the poll timer
+  that finalizes the status returned immediately on a missing job id. Nothing could ever
+  clear it.
+
+  A reconnect with no live apply handle now reconciles the step to `FAILED` (not `DONE`:
+  there is no report proving completion, and the run demonstrably did not finish) and
+  explains what happened — objects created before the restart are already on the target,
+  and re-running with "Skip if exists" finishes the rest without touching them. A
+  genuinely live apply, which still holds its job id, is left alone. Step 4 (Validation)
+  already had this reconciliation; Step 2 never got it.
+
+### Changed
+
+- **The bulk apply now reads as the action on the Generated DDL list above it.** Its card
+  sits below that list, and its title was the literal string "Apply to target" — the same
+  three words as each row's per-object button — so the bulk action looked like a separate
+  feature; the copy even had to point back with "…in the Generated DDL list above" twice.
+  The card is now titled "Apply generated DDL to target", the body states the scope with
+  its live count ("Applies the 7 objects from the Generated DDL list above"), and the
+  button names what it applies ("Apply all 7 generated objects to target") instead of the
+  scope-ambiguous "Apply all to target (7)". The single-object pointer is dropped when
+  the scope is one object, where it only told the user to do what the button already does.
+
+### Docs
+
+- `CLAUDE.md`: recorded that the version the UI **displays** comes from installed package
+  metadata (`importlib.metadata`), not `pyproject.toml` — the editable install picks up
+  code edits but not the version, so a bump needs **`uv sync`** (not just `uv lock`)
+  before restarting. The local UI had drifted six releases behind this way.
+
 ## v0.1.196
 
 ### Fixed

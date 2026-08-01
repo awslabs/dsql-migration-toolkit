@@ -2774,3 +2774,102 @@ def test_ddl_diff_wires_an_expand_handler_to_each_pane() -> None:
     for click in ui.clicks:
         click()
     assert ui.dialogs_opened == 2, (ui.dialogs_opened, len(ui.clicks))
+
+
+# ---------------------------------------------------------------------------
+# Apply controls: the bulk action must read as the action ON the Generated DDL
+# list above it, not as a separate feature one card away.
+# ---------------------------------------------------------------------------
+
+
+class _ApplyControlsUi:
+    """Records label text, button labels and select options for the apply card."""
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+        self.buttons: list[str] = []
+
+    class _El:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: self
+
+    def label(self, text="", *_a, **_k):
+        if text:
+            self.texts.append(str(text))
+        return self._El()
+
+    def button(self, text="", *_a, **_k):
+        if text:
+            self.buttons.append(str(text))
+        return self._El()
+
+    def __getattr__(self, _name):
+        return lambda *_a, **_k: _ApplyControlsUi._El()
+
+
+def _render_apply_card(count: int, *, in_progress: bool = False):
+    from dsql_migrator.ui.schema_conversion import (
+        SchemaConversionState,
+        _render_apply_controls,
+    )
+
+    ui = _ApplyControlsUi()
+    _render_apply_controls(
+        ui,
+        SchemaConversionState(),
+        lambda: None,
+        on_apply_all=lambda: None,
+        table_count=count,
+        in_progress=in_progress,
+    )
+    return ui
+
+
+def test_apply_card_names_the_generated_ddl_it_applies() -> None:
+    """The header and button must name their OBJECT, and the count must tie them to the
+    list above.
+
+    Reported in review: the bulk apply sits in a separate card below the Generated DDL
+    list, so it read as a different feature -- and its title was the literal string
+    "Apply to target", identical to each row's per-object button label. The copy even
+    had to point back with "...in the Generated DDL list above" twice, which is the tell
+    that the layout wasn't carrying the relationship.
+    """
+    ui = _render_apply_card(7)
+
+    assert "Apply generated DDL to target" in ui.texts
+    # Not the bare, scope-ambiguous old title.
+    assert "Apply to target" not in ui.texts
+    # The count is the concrete tie to the list (it moves with the selection).
+    assert any("7 objects from the Generated DDL list above" in t for t in ui.texts)
+    assert "Apply all 7 generated objects to target" in ui.buttons
+    # Still says it is not the whole schema.
+    assert any("not the whole schema" in t for t in ui.texts)
+
+
+def test_apply_card_uses_singular_and_drops_the_redundant_pointer() -> None:
+    # With exactly one object in scope, "use its Apply to target button instead" would
+    # tell the user to do what the button already does, so it is omitted.
+    ui = _render_apply_card(1)
+
+    assert "Apply all 1 generated object to target" in ui.buttons
+    assert any("the 1 object from the Generated DDL list" in t for t in ui.texts)
+    assert not any("To apply just one object instead" in t for t in ui.texts)
+
+
+def test_apply_card_keeps_the_single_object_pointer_for_a_multi_object_scope() -> None:
+    ui = _render_apply_card(7)
+    assert any("To apply just one object instead" in t for t in ui.texts)
+
+
+def test_apply_card_button_shows_progress_label_while_applying() -> None:
+    # The label stays visible while applying (Quasar's `loading` would blank it).
+    ui = _render_apply_card(7, in_progress=True)
+    assert "Applying…" in ui.buttons
+    assert not any(b.startswith("Apply all") for b in ui.buttons)
