@@ -5,6 +5,38 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.215
+
+### Changed
+
+- **Settings now has a tab per tuning category — Full Load, Validation, CDC — instead of
+  one "Performance" tab holding all of them.** "Performance" is not a category an operator
+  thinks in: they arrive wanting to change the Full Load or the CDC sink. The combined
+  panel made them read past the other groups, and each group's apply-timing caption ("the
+  next run" vs "the next Start CDC") sat mid-list where it read as a note on whichever
+  field came next. Each tab now leads with its own timing, and the Full Load
+  connection-product caution is scoped to the tab it applies to (it is meaningless beside
+  a single Validation or CDC field). The tab strip is derived from the config registry, so
+  a knob added in a new group grows it automatically.
+
+- **Every settings control is now an AWS-style (Cloudscape) form field: visible label,
+  description, and constraint text listing the accepted values.** The descriptions were
+  previously hidden behind a hover-only info glyph so each knob could stay on one line —
+  which made the form unreadable at a glance (you had to hover five fields in turn to
+  learn what any of them did) and inaccessible on touch, where there is no hover. Controls
+  are right-aligned so a column of inputs lines up down the panel, and constraints render
+  in monospace so accepted values read as data. Added as `form_field` in
+  `ui/design.py` (the single source of truth) rather than styled inline.
+
+- **The Diagnostics tab uses the same form rows.** A floating-label select beside a bare
+  switch read as two unrelated widgets rather than one form; both now carry a label and a
+  description explaining what they do (including that the stdout mirror is what reaches
+  CloudWatch, because the log file itself lives on ephemeral task storage).
+
+- **The modal's header no longer claims "changes apply to the next run"** — that is true
+  only of the Full Load / Validation knobs. It now states only what holds for everything
+  in the dialog: nothing here is a deploy-time parameter, and values reset on restart.
+
 ## v0.1.214
 
 ### Fixed

@@ -513,6 +513,60 @@ def definition_row(ui, term, description: str = "", *, term_width: str = "min-w-
     return desc
 
 
+# ---------------------------------------------------------------------------
+# Form field (Cloudscape "FormField")
+# ---------------------------------------------------------------------------
+
+
+def form_field(
+    ui,
+    *,
+    label: str,
+    description: str = "",
+    constraint: str = "",
+    control_width: str = "w-24",
+):
+    """Render one AWS Console (Cloudscape "FormField") settings row.
+
+    Cloudscape pairs every control with a VISIBLE label, a description explaining what
+    it does, and constraint text stating the accepted values. This app previously hid
+    the description behind a hover-only info glyph to keep each knob on one line, which
+    made the form unreadable at a glance: you had to hover five fields in turn to learn
+    what any of them did, and hover text is unavailable on touch.
+
+    Layout: label and control share the top line (control right-aligned, so a column of
+    inputs aligns down the panel), with the description and constraint on a quieter
+    second line. That keeps a dense settings list scannable while still showing the
+    guidance inline.
+
+    Returns the **control container** so the caller places the input via ``with``::
+
+        with form_field(ui, label="Rows per batch", description="…", constraint="1–3000"):
+            ui.number(...)
+    """
+    with ui.column().classes("gap-0.5 w-full"):
+        with ui.row().classes("items-center gap-3 no-wrap w-full"):
+            ui.label(label).classes(
+                "text-sm font-medium text-gray-900 flex-1 min-w-0 truncate"
+            )
+            slot = ui.row().classes(
+                f"items-center justify-end no-wrap shrink-0 {control_width}"
+            )
+        if description or constraint:
+            with ui.row().classes("items-baseline gap-2 no-wrap w-full"):
+                if description:
+                    ui.label(description).classes(
+                        "text-xs text-gray-500 leading-snug flex-1 min-w-0"
+                    )
+                if constraint:
+                    # Monospace so the accepted values read as data, and right-aligned
+                    # under the control they constrain.
+                    ui.label(constraint).classes(
+                        "text-xs text-gray-400 font-mono shrink-0"
+                    )
+    return slot
+
+
 __all__ = [
     "NOTICE_STYLE",
     "render_notice",
@@ -536,5 +590,6 @@ __all__ = [
     "filter_bar",
     "filter_select",
     "definition_row",
+    "form_field",
     "section_header",
 ]

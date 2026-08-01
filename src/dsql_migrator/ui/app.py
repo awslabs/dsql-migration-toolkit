@@ -805,39 +805,64 @@ def _render_footer_tools(activity_log_path: str) -> None:
     The sidebar now shows a single gear + "Settings"; the modal groups the details into
     labelled categories. The body is built ONCE (not per click), so anything the user
     typed survives closing and reopening.
+
+    One tab per TUNING GROUP (Full Load / Validation / CDC), not a single "Performance"
+    tab holding all of them. "Performance" was a category the operator does not think in:
+    they arrive wanting to change the Full Load or the CDC sink, and a combined panel made
+    them read past the other groups -- while each group's timing caption ("applies to the
+    next run" vs "the next Start CDC") sat mid-list where it read as a note on whichever
+    field was next. The tabs come from ``tunable_groups()``, so adding a knob in a new
+    group grows the tab strip with no change here.
     """
     from nicegui import ui
 
+    from dsql_migrator.config import tunable_groups
     from dsql_migrator.ui.design import section_header
 
+    # Material icon per tuning group. A group with no entry falls back to the generic
+    # tune glyph, so a newly added group still renders (just without a bespoke icon).
+    group_icons = {
+        "Full Load": "cloud_upload",
+        "Validation": "fact_check",
+        "CDC": "stream",
+    }
+
     dialog = ui.dialog().props("persistent")
-    with dialog, ui.card().classes("gap-0").style("width: 42rem; max-width: 94vw"):
+    with dialog, ui.card().classes("gap-0").style("width: 44rem; max-width: 94vw"):
         with ui.row().classes("items-center gap-2 w-full no-wrap"):
             section_header(ui, icon="settings", title="Settings")
             ui.button(icon="close", on_click=dialog.close).props(
                 "flat dense round size=sm color=grey-7"
             ).tooltip("Close")
+        # NOT "changes apply to the next run" -- that is only true of the Full Load /
+        # Validation groups; each panel states its own timing. This line carries only
+        # what holds for everything here.
         ui.label(
-            "App-wide and live: changes apply to the next run and reset when the app "
-            "restarts. Nothing here is a deploy-time parameter."
+            "App-wide and live: nothing here is a deploy-time parameter, and every "
+            "value resets when the app restarts."
         ).classes("text-xs text-gray-500 -mt-1 mb-2")
-        # Tabs, not stacked sections: the three categories are unrelated -- you come
-        # here to change ONE of them -- so stacking made the reader scroll past two
-        # groups to reach the third, and the modal grew with every added knob. Same
-        # ui.tabs/tab_panels shape the Schema Conversion screen uses.
+        # Tabs, not stacked sections: the categories are unrelated -- you come here to
+        # change ONE of them -- so stacking made the reader scroll past the others, and
+        # the modal grew with every added knob. Same ui.tabs/tab_panels shape the Schema
+        # Conversion screen uses.
+        groups = [name for name, _knobs in tunable_groups()]
         with ui.tabs().props("dense align=left").classes("w-full") as tabs:
-            performance_tab = ui.tab("Performance", icon="speed")
-            diagnostics_tab = ui.tab("Diagnostics", icon="tune")
+            group_tabs = [
+                ui.tab(name, icon=group_icons.get(name, "tune")) for name in groups
+            ]
+            diagnostics_tab = ui.tab("Diagnostics", icon="bug_report")
             activity_tab = ui.tab("Activity log", icon="download")
-        with ui.tab_panels(tabs, value=performance_tab).classes("w-full").style(
+        first_tab = group_tabs[0] if group_tabs else diagnostics_tab
+        with ui.tab_panels(tabs, value=first_tab).classes("w-full").style(
             # A small floor keeps the tab strip from jumping between panels of very
-            # different heights, without padding a short panel (Diagnostics is two
-            # controls) with a screen of empty space -- 22rem did exactly that. The cap
+            # different heights, without padding a short panel (Validation is one
+            # control) with a screen of empty space -- 22rem did exactly that. The cap
             # makes a long panel scroll instead of pushing the dialog off-viewport.
             "min-height: 9rem; max-height: 68vh; overflow-y: auto"
         ):
-            with ui.tab_panel(performance_tab).classes("p-0 pt-3"):
-                _render_performance_tuning_controls()
+            for name, tab in zip(groups, group_tabs):
+                with ui.tab_panel(tab).classes("p-0 pt-3"):
+                    _render_tuning_group_controls(name)
             with ui.tab_panel(diagnostics_tab).classes("p-0 pt-3"):
                 _render_diagnostics_controls()
             with ui.tab_panel(activity_tab).classes("p-0 pt-3"):
@@ -854,25 +879,31 @@ def _render_footer_tools(activity_log_path: str) -> None:
             ui.item_label("Tuning · logging").props("caption")
 
 
-def _render_performance_tuning_controls() -> None:
-    """Render the runtime performance knobs, in one labelled section per group.
+def _render_tuning_group_controls(group: str) -> None:
+    """Render ONE tuning group's knobs as an AWS-style (Cloudscape) form section.
 
-    Like Diagnostics, these are NOT deploy-time inputs, but the two kinds of knob here
-    reach their consumer differently and the UI must not blur that:
+    Called once per Settings tab, so each knob category (Full Load / Validation / CDC)
+    gets its own tab rather than being stacked under a single "Performance" panel. The
+    groups differ in what they affect AND in when a change lands, so they are separate
+    destinations, not sections of one list -- you come here to change one category.
+
+    The two timings must not be blurred:
 
     * **Full Load / Validation** -- the loader and validator call ``load_config()`` on
       every run, so a change lands on the NEXT run of that step.
     * **CDC** -- the value is a cdc-stack CloudFormation PARAMETER, read when Start CDC
       creates/updates the connectors. So it lands at the next Start CDC, and for a
-      pipeline already streaming, only after Stop + Start. Saying "applies to the next
-      run" here would promise something that never happens: nothing re-reads it, and a
-      running sink keeps its current capacity until the connector is updated.
+      pipeline already streaming, only after re-running it. "Applies to the next run"
+      would promise something that never happens: nothing re-reads it, and a running
+      sink keeps its capacity until the connector is updated.
 
-    Each section therefore states its OWN timing (``group_applies``) instead of one
-    blanket caption. A knob whose legal values are an enum rather than a range
-    (``allowed``, e.g. the template's ``AllowedValues: [1,2,4,8]`` for SinkMcuCount)
-    renders as a dropdown -- a spinner would happily offer 3, which CloudFormation
-    rejects minutes into a billable deploy.
+    Each panel therefore leads with its own timing (``group_applies``). Every knob is a
+    Cloudscape ``FormField``: visible label, description, and constraint text listing the
+    accepted values -- previously the description was hover-only, so the form could not
+    be read without hovering each field in turn (and not at all on touch). A knob whose
+    legal values are an enum rather than a range (``allowed``, e.g. the template's
+    ``AllowedValues: [1,2,4,8]`` for SinkMcuCount) renders as a dropdown; a spinner would
+    happily offer 3, which CloudFormation rejects minutes into a billable deploy.
     """
     from nicegui import ui
 
@@ -880,27 +911,33 @@ def _render_performance_tuning_controls() -> None:
         TuningValueError,
         current_tuning_values,
         group_applies,
-        set_tuning_value,
         tunable_groups,
+        set_tuning_value,
     )
-    from dsql_migrator.ui.design import render_notice
+    from dsql_migrator.ui.design import form_field, render_notice
 
     current = current_tuning_values()
+    knobs = dict(tunable_groups()).get(group, ())
 
-    # Cloudscape "form" treatment: the knobs are grouped form fields -- one dense row
-    # per knob (label + allowed values + bounded input), with the longer description on a
-    # hover tooltip (Cloudscape's "info" idiom) so each field stays a single line.
-    # Rendered into the Settings modal, which already states the live/app-wide caveat,
-    # so only the knob-specific note is repeated here.
-    render_notice(
-        ui,
-        tone="info",
-        header="Connections ≈ tables in parallel × batches per table",
-        body=(
-            "Raise these together carefully: the product is how many DSQL connections "
-            "a run opens at once."
-        ),
+    # Lead with WHEN a change takes effect -- the first thing an operator needs in order
+    # to trust the field, and the one fact that differs per group.
+    ui.label(f"Changes apply to {group_applies(group)}.").classes(
+        "text-xs text-gray-500 mb-2"
     )
+
+    # Full Load's two parallelism knobs MULTIPLY into the connection count, which is the
+    # one way to misconfigure this panel into a failing run. Scoped to that group: it is
+    # meaningless beside a single Validation or CDC field.
+    if group == "Full Load":
+        render_notice(
+            ui,
+            tone="info",
+            header="Connections ≈ tables in parallel × batches per table",
+            body=(
+                "Raise these together carefully: the product is how many DSQL "
+                "connections a run opens at once."
+            ),
+        )
 
     def _on_change(event: object, k) -> None:
         raw = getattr(event, "value", None)
@@ -916,43 +953,26 @@ def _render_performance_tuning_controls() -> None:
             type="info",
         )
 
-    for group, knobs in tunable_groups():
-        # Cloudscape-style section subheader + the timing that applies to every knob
-        # in it, so the "when does this take effect" answer sits with the fields it
-        # governs rather than in one caption that can only be right for some of them.
-        with ui.row().classes("items-baseline gap-2 no-wrap w-full mt-2"):
-            ui.label(group).classes(
-                "text-xs uppercase tracking-wide text-gray-500 font-medium"
-            )
-            ui.label(f"applies to {group_applies(group)}").classes(
-                "text-xs text-gray-400"
-            )
-
+    with ui.column().classes("gap-3 w-full pt-1"):
         for knob in knobs:
-            # One compact Cloudscape "form field" per row: label (+ allowed values)
-            # on the left, a small info glyph carrying the description tooltip,
-            # and the bounded input on the right.
-            with ui.row().classes("items-center gap-1 no-wrap w-full"):
-                with ui.column().classes("gap-0 flex-1 min-w-0"):
-                    with ui.row().classes("items-center gap-1 no-wrap"):
-                        ui.label(knob.short_label).classes(
-                            "text-sm text-gray-900 truncate"
-                        )
-                        ui.icon("info").classes(
-                            "text-gray-400 text-xs cursor-help"
-                        ).tooltip(knob.description)
-                    ui.label(
-                        " / ".join(str(v) for v in knob.allowed)
-                        if knob.allowed
-                        else f"{knob.minimum}–{knob.maximum}"
-                    ).classes("text-xs text-gray-400 leading-none")
+            slot = form_field(
+                ui,
+                label=knob.short_label,
+                description=knob.description,
+                constraint=(
+                    " / ".join(str(v) for v in knob.allowed)
+                    if knob.allowed
+                    else f"{knob.minimum}–{knob.maximum}"
+                ),
+            )
+            with slot:
                 if knob.allowed:
                     # Enum-valued: offer ONLY the legal values.
                     ui.select(
                         list(knob.allowed),
                         value=current[knob.field],
                         on_change=lambda e, k=knob: _on_change(e, k),
-                    ).props("dense outlined options-dense").classes("w-20 text-sm")
+                    ).props("dense outlined options-dense").classes("w-24 text-sm")
                 else:
                     ui.number(
                         value=current[knob.field],
@@ -961,7 +981,7 @@ def _render_performance_tuning_controls() -> None:
                         step=1,
                         format="%d",
                         on_change=lambda e, k=knob: _on_change(e, k),
-                    ).props("dense outlined").classes("w-20 text-sm")
+                    ).props("dense outlined").classes("w-24 text-sm")
 
 
 def _render_diagnostics_controls() -> None:
@@ -986,24 +1006,21 @@ def _render_diagnostics_controls() -> None:
         set_activity_log_level,
     )
 
+    from dsql_migrator.ui.design import form_field
+
     levels = ["DEBUG", "INFO", "WARNING", "ERROR"]
     current = logging.getLevelName(current_activity_log_level())
     if current not in levels:
         current = "INFO"
 
-    ui.label(
-        "DEBUG adds failure stacktraces. The stdout mirror is what reaches CloudWatch "
-        "when the app runs on ECS."
-    ).classes("text-xs text-gray-500")
+    # Same "when does this take effect" lead-in as the tuning panels, so every Settings
+    # tab opens with the same fact in the same place.
+    ui.label("Changes apply immediately.").classes("text-xs text-gray-500 mb-2")
 
     def _on_level(event: object) -> None:
         value = str(getattr(event, "value", "INFO"))
         set_activity_log_level(getattr(logging, value, logging.INFO))
         ui.notify(f"Log level set to {value}.", type="info")
-
-    ui.select(
-        levels, value=current, label="Log level", on_change=_on_level
-    ).props("dense outlined").classes("w-full text-xs")
 
     def _on_toggle(event: object) -> None:
         if bool(getattr(event, "value", False)):
@@ -1016,11 +1033,29 @@ def _render_diagnostics_controls() -> None:
             disable_activity_stdout_log()
             ui.notify("Stopped mirroring activity log to stdout.", type="info")
 
-    ui.switch(
-        "Send to CloudWatch (stdout)",
-        value=activity_stdout_enabled(),
-        on_change=_on_toggle,
-    ).props("dense").classes("text-xs")
+    # Same Cloudscape FormField rows as the tuning tabs (label + description + control),
+    # rather than a floating-label select beside a bare switch: two controls of different
+    # shapes in one short panel read as unrelated widgets instead of one form.
+    with ui.column().classes("gap-3 w-full pt-1"):
+        with form_field(
+            ui,
+            label="Log level",
+            description="DEBUG adds failure stacktraces to the activity log.",
+        ):
+            ui.select(levels, value=current, on_change=_on_level).props(
+                "dense outlined options-dense"
+            ).classes("w-24 text-sm")
+        with form_field(
+            ui,
+            label="Mirror to stdout",
+            description=(
+                "What reaches CloudWatch Logs when the app runs on ECS — the log file "
+                "itself lives on ephemeral task storage."
+            ),
+        ):
+            ui.switch(
+                value=activity_stdout_enabled(), on_change=_on_toggle
+            ).props("dense")
 
 
 def _render_activity_log_download(activity_log_path: str) -> None:

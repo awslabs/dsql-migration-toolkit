@@ -608,28 +608,68 @@ def test_footer_is_one_settings_entry_not_three_inline_panels() -> None:
     assert 'ui.item_label("Settings")' in src
     # No inline expansions for these utilities any more.
     for module_fn in (
-        app._render_performance_tuning_controls,
+        app._render_tuning_group_controls,
         app._render_diagnostics_controls,
     ):
         body = inspect.getsource(module_fn)
         assert 'ui.expansion(' not in body, module_fn.__name__
 
 
-def test_settings_modal_groups_the_categories_in_tabs() -> None:
-    # Tabs, not stacked sections: you come here to change ONE category, so stacking made
-    # the reader scroll past two groups to reach the third.
+def test_settings_modal_gives_each_tuning_group_its_own_tab() -> None:
+    """One tab per tuning GROUP, not one "Performance" tab holding all of them.
+
+    "Performance" is not a category the operator thinks in: they arrive wanting to change
+    the Full Load or the CDC sink. A combined panel made them read past the other groups,
+    and each group's timing caption ("the next run" vs "the next Start CDC") sat mid-list
+    where it read as a note on whichever field came next. The tabs are DERIVED from the
+    registry, so a knob added in a new group grows the tab strip on its own.
+    """
     import inspect
 
+    from dsql_migrator.config import tunable_groups
     from dsql_migrator.ui import app
 
     src = inspect.getsource(app._render_footer_tools)
     assert "ui.tabs(" in src and "ui.tab_panels(" in src
-    for label in ('"Performance"', '"Diagnostics"', '"Activity log"'):
+    # Group tabs come from the registry rather than a hard-coded list.
+    assert "tunable_groups()" in src
+    # No catch-all Performance TAB (the prose may still mention why it went away, so
+    # match the ui.tab(...) call rather than the bare string).
+    assert 'ui.tab("Performance"' not in src, "the catch-all Performance tab is gone"
+    # The two non-tuning utilities keep their own explicit tabs + panels.
+    for label in ('"Diagnostics"', '"Activity log"'):
         assert f"ui.tab({label}" in src, label
-    # Each utility renders into its own panel.
-    assert "_render_performance_tuning_controls()" in src
+    assert "_render_tuning_group_controls(name)" in src
     assert "_render_diagnostics_controls()" in src
     assert "_render_activity_log_download(activity_log_path)" in src
+
+    # The tab list must be DERIVED, not a literal that happens to match today's
+    # registry: hard-coding it would silently drop a group's tab (its knobs would be
+    # unreachable from the UI while still existing in config) -- so assert on the
+    # assignment itself, and that no group name is spelled out as a literal.
+    import ast
+
+    tree = ast.parse(src.lstrip())
+    assigns = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == "groups" for t in node.targets
+        )
+    ]
+    assert len(assigns) == 1, "expected exactly one `groups = ...` assignment"
+    rhs = ast.unparse(assigns[0].value)
+    assert "tunable_groups()" in rhs, f"tab list must come from the registry: {rhs}"
+    literals = {
+        node.value
+        for node in ast.walk(assigns[0].value)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    registry_groups = {name for name, _knobs in tunable_groups()}
+    assert not (literals & registry_groups), (
+        f"group names must not be hard-coded in the tab list: {literals & registry_groups}"
+    )
 
 
 def test_settings_modal_panels_are_bounded_but_not_padded() -> None:
@@ -651,41 +691,42 @@ def test_settings_modal_panels_are_bounded_but_not_padded() -> None:
     assert 'icon="close"' in src
 
 
-def test_settings_performance_form_sections_state_their_own_apply_timing() -> None:
-    """Each group's timing must come from the registry, per section.
+def test_tuning_panel_leads_with_its_own_apply_timing() -> None:
+    """Each tab must state ITS timing, taken from the registry.
 
-    The form holds two kinds of knob: Full Load / Validation values are re-read by
-    ``load_config()`` on the next run, while the CDC value is a cdc-stack
-    CloudFormation parameter read at the next Start CDC. One blanket "applies to the
-    next run" caption would be a false promise for the CDC section -- nothing re-reads
-    it, and a sink already RUNNING keeps its capacity until the connector is updated.
-    So the renderer must call ``group_applies`` per group rather than hard-coding a
-    phrase, and the notification must repeat the knob's OWN timing.
+    The panel holds two kinds of knob: Full Load / Validation values are re-read by
+    ``load_config()`` on the next run, while the CDC value is a cdc-stack CloudFormation
+    parameter read at the next Start CDC. One blanket "applies to the next run" would be a
+    false promise for CDC -- nothing re-reads it, and a sink already RUNNING keeps its
+    capacity until the connector is updated. So the renderer must call ``group_applies``
+    rather than hard-code a phrase, and the toast must repeat the knob's OWN timing.
     """
     import inspect
 
     from dsql_migrator.ui import app
 
-    src = inspect.getsource(app._render_performance_tuning_controls)
-    # Sections come from the registry's grouping, with the per-group timing rendered.
-    assert "tunable_groups()" in src
+    src = inspect.getsource(app._render_tuning_group_controls)
     assert "group_applies(group)" in src
     # The confirmation names the knob's own timing, not a hard-coded "next run".
     assert "{k.applies}" in src
-    assert "applies to the next run)" not in src
+    # Cloudscape FormField rows: label + description + constraint are all VISIBLE.
+    assert "form_field(" in src
+    assert "description=knob.description" in src
+    # The description must not be hidden behind a hover-only glyph again.
+    assert "tooltip(knob.description)" not in src
     # An enum-valued knob renders as a select (only legal values), not a spinner.
     assert "if knob.allowed" in src
     assert "ui.select(" in src and "ui.number(" in src
 
 
-def test_settings_performance_form_renders_a_cdc_section_with_the_mcu_select() -> None:
-    """End-to-end through the real renderer with a NiceGUI double.
+class _FormUi:
+    """NiceGUI double for the Settings form: records text, selects, numbers, switches."""
 
-    Asserting on the registry alone would not catch a renderer that ignores a group,
-    which is exactly how a "state exists but is never rendered" gap hides.
-    """
-    from dsql_migrator.config import TUNABLE_KNOBS
-    from dsql_migrator.ui import app
+    def __init__(self):
+        self.texts: list[str] = []
+        self.selects: list[tuple] = []
+        self.numbers: list[dict] = []
+        self.switches: list[dict] = []
 
     class _El:
         def __init__(self, ui):
@@ -701,7 +742,7 @@ def test_settings_performance_form_renders_a_cdc_section_with_the_mcu_select() -
             return self
 
         def tooltip(self, text="", *_a, **_k):
-            self._ui.tooltips.append(str(text))
+            self._ui.texts.append(f"[tooltip]{text}")
             return self
 
         def __enter__(self):
@@ -710,79 +751,224 @@ def test_settings_performance_form_renders_a_cdc_section_with_the_mcu_select() -
         def __exit__(self, *_exc):
             return False
 
-    class _Ui:
-        def __init__(self):
-            self.texts: list[str] = []
-            self.tooltips: list[str] = []
-            self.selects: list[tuple] = []
-            self.numbers: list[dict] = []
-
-        def label(self, text="", *_a, **_k):
+    def label(self, text="", *_a, **_k):
+        if text:
             self.texts.append(str(text))
-            return _El(self)
+        return self._El(self)
 
-        def select(self, options, value=None, **_k):
-            self.selects.append((tuple(options), value))
-            return _El(self)
+    def select(self, options=None, value=None, label=None, **_k):
+        self.selects.append((tuple(options or ()), value))
+        # Quasar renders a select's `label` as a floating caption INSIDE the control, so
+        # it is user-visible text and must be recorded -- otherwise a control that
+        # duplicates its form_field row label looks identical to one that does not.
+        if label:
+            self.texts.append(str(label))
+        return self._El(self)
 
-        def number(self, **kw):
-            self.numbers.append(kw)
-            return _El(self)
+    def number(self, **kw):
+        self.numbers.append(kw)
+        return self._El(self)
 
-        def icon(self, *_a, **_k):
-            return _El(self)
+    def switch(self, *_a, **kw):
+        self.switches.append(kw)
+        return self._El(self)
 
-        def row(self, *_a, **_k):
-            return _El(self)
+    def icon(self, name="", *_a, **_k):
+        return self._El(self)
 
-        def column(self, *_a, **_k):
-            return _El(self)
+    def row(self, *_a, **_k):
+        return self._El(self)
 
-        def spinner(self, *_a, **_k):
-            return _El(self)
+    def column(self, *_a, **_k):
+        return self._El(self)
 
-        def badge(self, *_a, **_k):
-            return _El(self)
+    def spinner(self, *_a, **_k):
+        return self._El(self)
 
-        def notify(self, *_a, **_k):
-            return None
+    def badge(self, *_a, **_k):
+        return self._El(self)
 
-    ui = _Ui()
-    import os
+    def button(self, text="", *_a, **_k):
+        if text:
+            self.texts.append(str(text))
+        return self._El(self)
+
+    def notify(self, *_a, **_k):
+        return None
+
+
+def _render_tuning_tab(group: str, ui):
+    """Render one tuning tab through the REAL renderer with a NiceGUI double."""
     import sys
     import types
 
-    from dsql_migrator.config import ENV_PREFIX
+    from dsql_migrator.ui import app
 
     fake = types.ModuleType("nicegui")
     fake.ui = ui  # type: ignore[attr-defined]
     saved = sys.modules.get("nicegui")
     sys.modules["nicegui"] = fake
-    # Pin the MCU value rather than inheriting whatever the ambient environment holds:
-    # the form shows the CURRENTLY effective value, so a stray env var (or a leaked
-    # write from another test) would otherwise decide what this test sees.
-    mcu_key = f"{ENV_PREFIX}CDC_SINK_MCU_COUNT"
-    saved_mcu = os.environ.get(mcu_key)
-    os.environ[mcu_key] = "4"
     try:
-        app._render_performance_tuning_controls()
+        app._render_tuning_group_controls(group)
     finally:
         if saved is None:
             sys.modules.pop("nicegui", None)
         else:
             sys.modules["nicegui"] = saved
-        if saved_mcu is None:
-            os.environ.pop(mcu_key, None)
-        else:
-            os.environ[mcu_key] = saved_mcu
 
-    # Every group in the registry got a section header -- none silently dropped.
-    for group in {k.group for k in TUNABLE_KNOBS}:
-        assert group in ui.texts, f"no section rendered for {group}"
-    # CDC's section says Start CDC, and Full Load's does not.
-    assert any("applies to the next Start CDC" in t for t in ui.texts)
-    assert any("applies to the next run" in t for t in ui.texts)
+
+def test_cdc_tab_shows_the_mcu_dropdown_and_its_own_timing() -> None:
+    """End-to-end through the real renderer.
+
+    Asserting on the registry alone would not catch a renderer that ignores a group --
+    exactly how a "state exists but is never rendered" gap hides.
+    """
+    import os
+
+    from dsql_migrator.config import ENV_PREFIX
+
+    # Pin the value rather than inheriting the ambient environment: the form shows the
+    # CURRENTLY effective value, so a stray env var would decide what this test sees.
+    key = f"{ENV_PREFIX}CDC_SINK_MCU_COUNT"
+    saved = os.environ.get(key)
+    os.environ[key] = "4"
+    try:
+        ui = _FormUi()
+        _render_tuning_tab("CDC", ui)
+    finally:
+        if saved is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = saved
+
+    blob = " ".join(ui.texts)
+    # Leads with the CDC timing -- never the Full Load one.
+    assert "Changes apply to the next Start CDC." in blob
+    assert "the next run" not in blob
     # The MCU knob is a select over exactly the CloudFormation AllowedValues.
     assert ((1, 2, 4, 8), 4) in ui.selects
-    # The range-valued knobs stay numeric inputs (one per non-enum knob).
-    assert len(ui.numbers) == len([k for k in TUNABLE_KNOBS if not k.allowed])
+    assert not ui.numbers, "an enum knob must not render as a free number field"
+    # Label, description and the accepted values are all visible (not hover-only).
+    assert "Sink compute (MCU)" in blob
+    assert "CPU-bound" in blob
+    assert "1 / 2 / 4 / 8" in blob
+    assert not [t for t in ui.texts if t.startswith("[tooltip]")]
+    # The connection-product notice belongs to Full Load only.
+    assert "Connections" not in blob
+
+
+def test_full_load_tab_shows_ranges_and_the_connection_product_warning() -> None:
+    ui = _FormUi()
+    _render_tuning_tab("Full Load", ui)
+    blob = " ".join(ui.texts)
+
+    assert "Changes apply to the next run." in blob
+    # The one way to misconfigure this panel into a failing run is called out here.
+    assert "Connections ≈ tables in parallel × batches per table" in blob
+    # Range-valued knobs stay numeric inputs, with their bounds shown as constraints.
+    assert len(ui.numbers) == 3
+    assert not ui.selects
+    assert "1–3000" in blob  # rows per batch (DSQL's per-transaction cap)
+    assert "Rows per batch" in blob
+
+
+def test_validation_tab_is_rendered_without_the_full_load_notice() -> None:
+    ui = _FormUi()
+    _render_tuning_tab("Validation", ui)
+    blob = " ".join(ui.texts)
+
+    assert "Changes apply to the next run." in blob
+    assert "Tables in parallel" in blob
+    assert len(ui.numbers) == 1
+    # Scoped notice: meaningless beside a single field, so it must not appear.
+    assert "Connections" not in blob
+
+
+def test_diagnostics_tab_uses_the_same_form_field_rows() -> None:
+    """Two controls of different shapes in one short panel read as unrelated widgets.
+
+    Routing both through ``form_field`` gives them the same label/description structure as
+    every tuning tab, and states its timing in the same place.
+    """
+    import sys
+    import types
+
+    from dsql_migrator.ui import app
+
+    ui = _FormUi()
+    fake = types.ModuleType("nicegui")
+    fake.ui = ui  # type: ignore[attr-defined]
+    saved = sys.modules.get("nicegui")
+    sys.modules["nicegui"] = fake
+    try:
+        app._render_diagnostics_controls()
+    finally:
+        if saved is None:
+            sys.modules.pop("nicegui", None)
+        else:
+            sys.modules["nicegui"] = saved
+
+    blob = " ".join(ui.texts)
+    assert "Changes apply immediately." in blob
+    assert "Log level" in blob and "Mirror to stdout" in blob
+    assert ui.selects and ui.selects[0][0] == ("DEBUG", "INFO", "WARNING", "ERROR")
+    assert ui.switches
+    assert "CloudWatch" in blob
+    # The form_field row supplies the label, so the control must NOT carry a floating
+    # one too -- Quasar would render "Log level" twice, stacked, in the same row.
+    assert ui.texts.count("Log level") == 1, (
+        f"the label is duplicated by the control: {ui.texts}"
+    )
+
+
+
+
+# ---------------------------------------------------------------------------
+# form_field (Cloudscape "FormField")
+# ---------------------------------------------------------------------------
+
+
+def test_form_field_shows_label_description_and_constraint_visibly() -> None:
+    """Cloudscape pairs every control with a visible label, description and constraint.
+
+    The app previously hid the description behind a hover-only info glyph to keep each
+    knob on one line, which made the form unreadable at a glance -- you had to hover each
+    field in turn to learn what it did, and hover text is unavailable on touch.
+    """
+    from dsql_migrator.ui.design import form_field
+
+    ui = _RecordingUi()
+    slot = form_field(
+        ui,
+        label="Rows per batch",
+        description="Rows per INSERT batch.",
+        constraint="1–3000",
+    )
+    assert ui.texts == ["Rows per batch", "Rows per INSERT batch.", "1–3000"]
+    # The returned value is a container the caller puts the control into.
+    assert hasattr(slot, "__enter__")
+    blob = " ".join(ui.classes)
+    # The label is the prominent one; description/constraint are quieter.
+    assert "text-sm font-medium text-gray-900" in blob
+    assert "text-xs text-gray-500" in blob
+    # Constraint text is monospace so accepted values read as data.
+    assert "font-mono" in blob
+
+
+def test_form_field_omits_the_second_line_when_there_is_nothing_to_say() -> None:
+    from dsql_migrator.ui.design import form_field
+
+    ui = _RecordingUi()
+    form_field(ui, label="Just a label")
+    assert ui.texts == ["Just a label"]
+
+
+def test_form_field_control_width_is_overridable_and_right_aligned() -> None:
+    """Controls right-align so a column of inputs lines up down the panel."""
+    from dsql_migrator.ui.design import form_field
+
+    ui = _RecordingUi()
+    form_field(ui, label="Wide", control_width="w-40")
+    blob = " ".join(ui.classes)
+    assert "w-40" in blob
+    assert "justify-end" in blob
