@@ -5,6 +5,18 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.200
+
+### Fixed
+
+- **Prerequisites のガードメッセージが右寄せで表示されていました。** 事前チェック後にテーブルを追加すると
+  「Re-run the prerequisite checks — … was added to the selection after the checks ran…」が右端に
+  張り付いて表示されていました。この行は本来 primary の「Continue」ボタンだけを収めるため
+  `justify-end` になっており(デザインシステム上、primary アクションは右)、そのボタンを**置き換える**
+  ガード文がその配置を継承していたのです。ボタンがある場合にのみ右寄せし、メッセージは左寄せするように
+  なりました — 説明対象の内容の横で文章として読めます。Data Migration・Schema Conversion・Validation の
+  他の `justify-end` 行も確認しましたが、いずれもボタンのみを収めており同じ欠陥はありませんでした。
+
 ## v0.1.199
 
 ### Fixed

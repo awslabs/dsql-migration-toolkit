@@ -1297,7 +1297,17 @@ def build_data_migration_screen(
                             status is StepStatus.IN_PROGRESS or _cdc_deploying
                         ),
                     )
-                    with ui.row().classes("!flex w-full justify-end items-center"):
+                    # Right-align ONLY when this row holds the primary action (design
+                    # system: primary actions sit on the right of a button row). The
+                    # guard message that replaces it is a full sentence, and inheriting
+                    # justify-end ragged it against the right edge, away from the
+                    # content it explains -- prose reads left.
+                    _nav_justify = (
+                        "justify-end" if guard_reason is None else "justify-start"
+                    )
+                    with ui.row().classes(
+                        f"!flex w-full {_nav_justify} items-center"
+                    ):
                         if guard_reason is None:
                             ui.button(
                                 first_phase_label,

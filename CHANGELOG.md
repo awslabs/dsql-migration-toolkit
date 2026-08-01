@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.200
+
+### Fixed
+
+- **The Prerequisites guard message was right-aligned.** Adding a table after the checks
+  ran showed "Re-run the prerequisite checks — … was added to the selection after the
+  checks ran…" ragged against the right edge. The nav row is `justify-end` because it
+  normally holds only the primary "Continue" button (per the design system, primary
+  actions sit on the right), and the guard sentence that *replaces* that button inherited
+  the alignment. The row now right-aligns only when it holds the button and left-aligns
+  the message, which reads as prose beside the content it explains. Checked the other
+  `justify-end` rows in Data Migration, Schema Conversion and Validation — all hold
+  buttons only, so none had the same defect.
+
 ## v0.1.199
 
 ### Fixed

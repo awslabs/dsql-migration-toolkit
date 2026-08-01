@@ -9120,3 +9120,44 @@ def test_all_default_selection_call_sites_pass_the_ticked_scope() -> None:
             "a default_migration_selection() call omits the ticked scope, so a restored "
             f"session would re-tick every target table: {joined}"
         )
+
+
+def test_prereq_nav_row_left_aligns_the_guard_message_and_right_aligns_the_button() -> None:
+    """The Prerequisites nav row must not right-align the guard sentence.
+
+    Reported from a real session: after adding a table post-check, "Re-run the
+    prerequisite checks — ecommerce_demo.categories was added…" appeared right-aligned.
+    The row is `justify-end` because it normally holds only the primary "Continue"
+    button (design system: primary actions sit right), and the guard message that
+    REPLACES that button inherited the alignment -- ragging a full sentence against the
+    right edge, away from the content it explains.
+
+    Asserted on the row's classes rather than a source substring, so it fails if the
+    alignment is hardcoded back.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    src = inspect.getsource(dm.build_data_migration_screen)
+    tree = ast.parse(src)
+
+    # Find the conditional that picks the nav row's justification.
+    picks = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.IfExp)
+        and "justify-end" in ast.unparse(node)
+        and "justify-start" in ast.unparse(node)
+    ]
+    assert picks, (
+        "the Prerequisites nav row must choose its justification: justify-end for the "
+        "primary button, justify-start for the guard sentence"
+    )
+    expr = ast.unparse(picks[0])
+    # justify-end only when there is NO guard reason (i.e. the button is shown).
+    assert "guard_reason is None" in expr
+    assert expr.index("justify-end") < expr.index("justify-start"), (
+        f"alignment is inverted: {expr}"
+    )

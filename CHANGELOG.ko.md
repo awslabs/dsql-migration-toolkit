@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.200
+
+### Fixed
+
+- **Prerequisites의 가드 메시지가 우측 정렬로 표시됐습니다.** 사전검사 이후 테이블을 추가하면
+  "Re-run the prerequisite checks — … was added to the selection after the checks ran…"가 오른쪽
+  끝에 붙어 나타났습니다. 이 행은 원래 primary "Continue" 버튼만 담기 때문에 `justify-end`이고
+  (디자인 시스템상 primary 액션은 오른쪽), 그 버튼을 **대체하는** 가드 문장이 정렬을 그대로 물려받은
+  것입니다. 이제 버튼이 있을 때만 우측 정렬하고 메시지는 좌측 정렬해, 설명하는 내용 옆에서 산문으로
+  읽히게 했습니다. Data Migration·Schema Conversion·Validation의 다른 `justify-end` 행도 확인했고
+  모두 버튼만 담고 있어 같은 결함은 없었습니다.
+
 ## v0.1.199
 
 ### Fixed
