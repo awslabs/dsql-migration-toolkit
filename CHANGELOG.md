@@ -5,6 +5,15 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.223
+
+### Changed
+
+- **The CloudFormation template's default app image is now `0.1.222`** (was `0.1.209`, 13
+  releases behind). It is the default a fresh `git clone` deploys with, so leaving it stale
+  meant a new deployment silently shipped an old app — including without the Start-CDC
+  restart fix and the validation/cut-over corrections from 0.1.218–0.1.222.
+
 ## v0.1.222
 
 ### Fixed
