@@ -9881,19 +9881,13 @@ def test_quarantine_message_is_split_into_table_pk_and_reason() -> None:
     separate badge above and the primary key mid-sentence. The PK is the actionable
     handle (it is what you search the source with), so it now gets its own chip.
     """
-    from dsql_migrator.ui.data_migration import (
-        FullLoadTableRow,
-        _quarantine_detail_row,
-    )
+    from dsql_migrator.ui.data_migration import _quarantine_detail_row
 
-    row = FullLoadTableRow(
-        table="ecommerce.product_media", state="DONE", rows_loaded=12,
-        expected_rows=15, attempts=1, errors=3, rows_quarantined=3,
-        error_message=_QUAR_MSG,
-    )
     ui = _DetailRowUi()
 
-    _quarantine_detail_row(ui, row=row)
+    _quarantine_detail_row(
+        ui, table="ecommerce.product_media", message=_QUAR_MSG
+    )
 
     assert "ecommerce.product_media" in ui.labels  # WHICH table, given prominence
     assert "id=3" in ui.badges  # WHICH row, as its own chip
@@ -10184,10 +10178,16 @@ def test_accepting_the_gap_replaces_the_button_with_confirmation() -> None:
     after = _render(True)
     # The button is gone -- no invitation to re-click an action already taken.
     assert not any("Accept quarantined rows" in b for b in after.buttons)
-    # ...and the outcome is stated, including what is now possible.
+    # ...replaced by a ONE-LINE confirmation, not a second success notice: the
+    # completeness banner directly above already states the count, the table, that the
+    # next step is unblocked and that Validation reports the gap. Two green boxes saying
+    # nearly the same words is what this replaced.
     confirmation = next(l for l in after.labels if "Gap accepted" in l)
-    assert "Full Load marked complete" in confirmation
-    assert any("Validation" in l for l in after.labels)
+    assert "still closes it" in confirmation  # the one fact the banner does not carry
+    assert "Full Load marked complete" not in confirmation  # the banner's job
+    assert not any("acknowledged gap, so the next step is unblocked" in l
+                   for l in after.labels)
+    assert "check_circle" in after.icons  # the click is still acknowledged visually
 
 
 def test_completeness_banner_stops_calling_an_accepted_gap_an_issue() -> None:
@@ -10373,3 +10373,187 @@ def test_error_log_download_is_hidden_with_no_errors() -> None:
 
     assert ui.buttons == []
     assert ui.labels == []
+
+
+def test_every_dropped_row_is_listed_not_one_per_table() -> None:
+    """3 dropped rows must produce 3 entries, not 1.
+
+    Reported: the count said "3 rows permanently dropped" but the list below showed only
+    one. The panel was built from ``latest_messages()``, which keeps ONE message per table
+    (last write wins), so a table that dropped N rows listed exactly one -- and the two
+    numbers on the same screen disagreed. The primary key is the actionable part of each
+    entry (it is what you search the source with), so every row has to appear.
+    """
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import (
+        _render_full_load_progress,
+        build_full_load_table_rows,
+    )
+
+    job = MigrationJob(job_id="j1")
+    job.status = "FAILED"
+    job.progress_pct = 100.0
+    job.chunks = [
+        ChunkState(chunk_id="ecommerce.product_media", status="DONE", rows_loaded=12,
+                   rows_quarantined=3, attempts=1)
+    ]
+    records = [
+        (
+            "ecommerce.product_media",
+            f"quarantined row pk[id={pk}]: datatype limit greater than 1048576 bytes",
+        )
+        for pk in (3, 7, 9)
+    ]
+    rows = build_full_load_table_rows(
+        job, None, {"ecommerce.product_media": records[-1][1]}
+    )
+
+    ui = _DetailRowUi()
+    _render_full_load_progress(
+        ui, job, rows, reload_table=lambda _n: None, quarantine_only=True,
+        quarantine_records=records,
+    )
+
+    shown = [b for b in ui.badges if b.startswith("id=")]
+    assert shown == ["id=3", "id=7", "id=9"], shown
+    # The table name repeats per entry, which is what makes each row self-contained.
+    assert ui.labels.count("ecommerce.product_media") == 3
+
+
+def test_quarantine_detail_falls_back_to_per_table_without_records() -> None:
+    # A caller that passes no records (older call site, or a restored session whose
+    # in-memory log is gone) still gets the per-table view -- one entry beats none, and
+    # the count above stays authoritative.
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import (
+        _render_full_load_progress,
+        build_full_load_table_rows,
+    )
+
+    job = MigrationJob(job_id="j1")
+    job.status = "FAILED"
+    job.progress_pct = 100.0
+    job.chunks = [
+        ChunkState(chunk_id="ecommerce.product_media", status="DONE", rows_loaded=12,
+                   rows_quarantined=3, attempts=1)
+    ]
+    rows = build_full_load_table_rows(
+        job, None, {"ecommerce.product_media": _QUAR_MSG}
+    )
+
+    ui = _DetailRowUi()
+    _render_full_load_progress(
+        ui, job, rows, reload_table=lambda _n: None, quarantine_only=True,
+    )
+
+    assert [b for b in ui.badges if b.startswith("id=")] == ["id=3"]
+
+
+def test_error_log_download_sits_with_the_detail_not_under_the_accept_button() -> None:
+    # Immediately below "Accept quarantined rows & continue" it read as that decision's
+    # secondary option, when it just takes the same per-row information away with you.
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm._render_full_load_step))
+
+    def _line(name: str) -> int:
+        lines = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == name
+        ]
+        assert lines, f"no call to {name}()"
+        return max(lines)
+
+    assert _line("_render_error_log") < _line("_render_accept_quarantine_action"), (
+        "the download must not sit directly under the accept decision"
+    )
+
+
+def test_watermark_counts_share_the_panel_font_and_two_column_shape() -> None:
+    """The counts must look like the coordinates above them, not a separate list.
+
+    Quasar's default expansion header is a grey full-bleed bar with a large leading glyph
+    -- a heavy band across an otherwise flat panel. And the count rows used a
+    flex-1/right-aligned layout while the coordinates used a fixed label column, so the
+    two groups aligned differently. Both now use the same label-then-monospace-value
+    shape; only the label WIDTH differs, because a table name needs more room than
+    "GTID set".
+    """
+    from dsql_migrator.ui.data_migration import _render_watermark
+
+    class _StyleUi(_WatermarkUi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.styled: list[tuple[str, str]] = []
+            self.props: list[str] = []
+
+        def label(self, text="", *_a, **_k):
+            outer = self
+            recorded = str(text) if text else ""
+            if recorded:
+                outer.labels.append(recorded)
+
+            class _L:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+                def classes(self, *a, **_k):
+                    if a and recorded:
+                        outer.styled.append((recorded, a[0]))
+                    return self
+
+                def __getattr__(self, _n):
+                    return lambda *_a, **_k: self
+
+            return _L()
+
+        def expansion(self, text="", *_a, **_k):
+            if text:
+                self.expansions.append(str(text))
+            outer = self
+
+            class _E:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+                def classes(self, *_a, **_k):
+                    return self
+
+                def props(self, *a, **_k):
+                    if a:
+                        outer.props.append(a[0])
+                    return self
+
+                def __getattr__(self, _n):
+                    return lambda *_a, **_k: self
+
+            return _E()
+
+    ui = _StyleUi()
+    _render_watermark(ui, _watermark_job(counts={"ecommerce.order_items": 1500}))
+
+    styles = dict(ui.styled)
+    # Values -- coordinate and count alike -- are monospace at the same size.
+    assert "font-mono" in styles["mysql-bin.000123:45678"]
+    assert "font-mono" in styles["1,500"]
+    assert "text-xs" in styles["1,500"]
+    # Labels -- field name and table name alike -- are the same muted size, in a fixed
+    # column (the width differs: a table name needs more room than "GTID set").
+    for label in ("Binlog file:pos", "ecommerce.order_items"):
+        assert "text-xs text-gray-500" in styles[label]
+        assert "shrink-0" in styles[label]
+    # The heavy default header is stripped: no leading glyph, no grey fill.
+    assert "numbers" not in ui.icons
+    assert any("header-class" in p for p in ui.props)

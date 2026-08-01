@@ -1743,25 +1743,37 @@ def _render_watermark(ui: object, job: MigrationJob) -> None:
             # are one value per table, so labelled monospace rows (the same shape as the
             # coordinates above) read as more of this panel's detail rather than a
             # separate data grid.
-            with ui.expansion(heading, icon="numbers").classes(  # type: ignore[attr-defined]
-                "w-full text-xs"
-            ).props("dense header-class=text-gray-600"):
+            # Quasar's default expansion header is a grey full-bleed bar with a large
+            # leading glyph -- a heavy band across an otherwise flat panel, in the one
+            # place that should read as a quiet "more detail" affordance. Strip the fill
+            # and the icon and size the header like the field labels above it, so opening
+            # it feels like unfolding more of the same panel.
+            with ui.expansion(heading).classes(  # type: ignore[attr-defined]
+                "w-full"
+            ).props(
+                "dense dense-toggle expand-separator=false "
+                "header-class='text-xs text-gray-500 px-0'"
+            ):
                 if approximate:
                     ui.label(  # type: ignore[attr-defined]
                         "Estimated from the source catalog (no COUNT(*) scan) to spare "
                         "the source; exact counts are verified in Validation."
                     ).classes("text-xs text-gray-400 pb-1")
                 for table, rows_count in display.table_row_counts.items():
+                    # SAME two-column shape as the coordinates above: a fixed-width label
+                    # column then the value, so the table names and the counts each line
+                    # up with the fields they sit under instead of forming a second,
+                    # differently-aligned list.
                     with ui.row().classes(  # type: ignore[attr-defined]
                         "items-baseline gap-2 no-wrap w-full"
                     ):
                         ui.label(table).classes(  # type: ignore[attr-defined]
-                            "text-xs text-gray-500 flex-1 min-w-0 truncate"
+                            "text-xs text-gray-500 shrink-0 w-64 truncate"
                         )
-                        # Right-aligned monospace so a column of counts lines up on the
-                        # digits and is comparable at a glance.
+                        # Monospace, matching the coordinate values -- a column of counts
+                        # then lines up on the digits and is comparable at a glance.
                         ui.label(f"{rows_count:,}").classes(  # type: ignore[attr-defined]
-                            "text-xs font-mono text-gray-800 shrink-0 text-right"
+                            "text-xs font-mono text-gray-800"
                         )
 
 
@@ -2607,11 +2619,15 @@ def _render_full_load_step(
         with ui.row().classes("items-center gap-1 flex-wrap"):
             for name in selected_names:
                 ui.badge(name).props("color=blue-grey-6 outline")
-    ui.label(
-        "These tables (ticked in the object browser above) are exported from the "
-        "source as of one consistency watermark and bulk-loaded into the target. "
-        "The source is read only."
-    ).classes("text-xs text-gray-400")
+    # No explanatory caption here. Its three claims are each already stated somewhere the
+    # reader is better served:
+    #   * "ticked in the object browser above" -- the picker's own caption says where the
+    #     selection came from, and the badges listing it sit directly above this line;
+    #   * "as of one consistency watermark" -- the Export watermark panel shows the actual
+    #     coordinate, not just the promise of one;
+    #   * "the source is read only" -- the confirm dialog says it at the moment the user
+    #     commits, which is where a reassurance about writes actually matters.
+    # Restating all three as standing grey text taught nothing on the second read.
 
     # Explicit confirmation before the (target-writing) Full Load begins. Tables
     # that already hold data offer a Drop-vs-Append choice; CDC-live is a hard
@@ -3007,9 +3023,24 @@ def _render_full_load_step(
             rows,
             reload_table=reload_table,
             reload_confirm=_open_reload_confirm,
+            quarantine_only=_incomplete_is_quarantine_only(
+                current, migration_state.error_log
+            ),
+            # EVERY dropped row, not one per table: ``latest_messages()`` keeps only the
+            # last message per table, so a table that dropped 3 rows listed exactly 1 --
+            # and the count above it disagreed with the list below.
+            quarantine_records=[
+                (str(record.table), str(record.message))
+                for record in migration_state.error_log.records(current.job_id)
+            ],
             ai_error_opener=ai_error_opener,
             page_state=_progress_page,
         )
+        # The error-log download belongs with the DETAIL it serializes, not under the
+        # accept button: sitting immediately below "Accept quarantined rows & continue" it
+        # read as that decision's secondary option, when it is just a way to take the same
+        # per-row information away with you.
+        _render_error_log(ui, migration_state, current)
         # The completeness baseline (expected_rows) comes from the watermark's
         # per-table counts, which are scan-free information_schema ESTIMATES
         # (row_counts_approximate) -- not exact. So a "row-count mismatch" against
@@ -3035,7 +3066,6 @@ def _render_full_load_step(
             quarantine_accepted=migration_state.accept_quarantined_rows,
             accept_quarantine_and_continue=accept_quarantine_and_continue,
         )
-        _render_error_log(ui, migration_state, current)
         if running:
             # Re-arm a single-shot poll: it fires once, refreshes only this live
             # region (not the whole page), and the refresh renders a fresh timer.
@@ -3624,7 +3654,7 @@ def _quarantined_reason(message: str) -> str:
     return text.strip()
 
 
-def _quarantine_detail_row(ui, *, row, action=None) -> None:
+def _quarantine_detail_row(ui, *, table: str, message: str, action=None) -> None:
     """Render one dropped-row entry: table, primary key, and the reason.
 
     Replaces a single run-on line ("quarantined row pk[id=3]: datatype limit greater
@@ -3633,8 +3663,8 @@ def _quarantine_detail_row(ui, *, row, action=None) -> None:
     table, WHICH row, WHY -- are now separately labelled, with the table name given
     prominence and the raw driver text kept last as the technical reason.
     """
-    pk = _parse_quarantined_pk(row.error_message)
-    reason = _quarantined_reason(row.error_message)
+    pk = _parse_quarantined_pk(message)
+    reason = _quarantined_reason(message)
     with ui.row().classes(
         "items-start gap-3 w-full no-wrap rounded-md border border-amber-200 "
         "bg-amber-50 p-3"
@@ -3642,7 +3672,7 @@ def _quarantine_detail_row(ui, *, row, action=None) -> None:
         ui.icon("report_problem").classes("text-amber-600 text-lg")
         with ui.column().classes("gap-1 flex-1 min-w-0"):
             with ui.row().classes("items-center gap-2 flex-wrap"):
-                ui.label(row.table).classes("text-sm font-semibold text-gray-900")
+                ui.label(table).classes("text-sm font-semibold text-gray-900")
                 if pk:
                     # The PK is the actionable handle -- it is what you search the
                     # source with -- so it gets its own monospace chip instead of
@@ -3710,6 +3740,12 @@ def _render_full_load_progress(
     # above it. ``quarantine_only`` is kept because the panel still gates the per-row
     # Reload on a settled, quarantine-only run.
     quarantine_only: bool = False,
+    # EVERY quarantined row, as ``(table, message)`` in log order. The panel used to be
+    # built from ``latest_messages()``, which keeps one message per TABLE (last write
+    # wins) -- so a table that dropped 3 rows listed exactly 1, and the count above it
+    # disagreed with the list below. The primary key is the actionable part of each
+    # entry, so every row has to appear.
+    quarantine_records: "Sequence[tuple[str, str]]" = (),
     ai_error_opener=None,
     page_state=None,
 ) -> None:
@@ -4024,18 +4060,28 @@ def _render_full_load_progress(
                     tone="info",
                 )
 
-    if quarantined:
+    # Prefer the FULL per-row records: one entry per dropped row. Falls back to the
+    # per-table view when the caller passed none (an older call site, or a restored
+    # session whose in-memory log is gone) -- one entry per table is still better than
+    # nothing, and the count above remains authoritative either way.
+    quarantine_entries: "list[tuple[str, str]]" = [
+        (table, message)
+        for table, message in (quarantine_records or ())
+        if str(message).startswith(quar_prefix)
+    ] or [(r.table, str(r.error_message)) for r in quarantined]
+    if quarantine_entries:
         # NO header notice here. The completeness banner below already states the verdict
         # ("N rows permanently dropped (table)") and the remedy, and the summary chip +
         # per-row Status badge state the count above -- a header repeating it made a
         # 3-row drop announced in four boxes on one screen. This section's job is the
         # per-row DETAIL (which row, why, and Reload), which nothing else provides.
         with ui.column().classes("w-full gap-2"):
-            for row in quarantined:
+            for table_name, message in quarantine_entries:
                 _quarantine_detail_row(
                     ui,
-                    row=row,
-                    action=_quar_reload(row.table),
+                    table=table_name,
+                    message=message,
+                    action=_quar_reload(table_name),
                 )
 
 def _render_accept_quarantine_action(
@@ -4060,21 +4106,19 @@ def _render_accept_quarantine_action(
         return
     with ui.row().classes("items-center gap-2 w-full"):
         if quarantine_accepted:
-            # ACKNOWLEDGE the click. Accepting sets the workflow step to DONE and
-            # unblocks Validation/CDC, but none of that was visible HERE -- the panel and
-            # its button re-rendered unchanged, so the button looked dead even though it
-            # had worked. Show the accepted state (and what is now possible) instead of a
-            # control that invites a second, equally invisible click.
-            render_notice(
-                ui,
-                tone="success",
-                header="Gap accepted — Full Load marked complete",
-                body=(
-                    "The dropped rows are an acknowledged gap, so the next step is "
-                    "unblocked. Validation (Step 4) reports the gap against the source; "
-                    "reloading a table after fixing its source value still closes it."
-                ),
-            )
+            # A one-line confirmation, NOT a second success notice. Accepting flips the
+            # completeness banner directly above to "Full Load complete — with an accepted
+            # gap", which already states the count, the table, that the next step is
+            # unblocked, and that Validation reports the gap. A full notice here repeated
+            # all of that in a second green box -- two boxes, nearly the same words. What
+            # the banner does NOT say is that the gap remains closable, so that is all
+            # this line adds; the checkmark alone acknowledges the click.
+            with ui.row().classes("items-center gap-1 no-wrap"):
+                ui.icon("check_circle").classes("text-green-600 text-base")
+                ui.label(
+                    "Gap accepted — reloading a table after fixing its source value "
+                    "still closes it."
+                ).classes("text-xs text-gray-600")
         else:
             ui.button(
                 "Accept quarantined rows & continue",

@@ -5,6 +5,42 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.208
+
+### Fixed
+
+- **Only one dropped row was listed even when several were dropped.** The count said "3
+  rows permanently dropped" while the list below showed exactly one — the panel was built
+  from `latest_messages()`, which keeps one message per **table** (last write wins), so a
+  table that dropped N rows listed one and the two numbers on the same screen disagreed.
+  Every dropped row is now listed with its own primary key, which is the actionable part
+  of each entry (it is what you search the source with). A caller with no per-row records
+  — an older call site, or a restored session whose in-memory log is gone — still gets the
+  per-table view rather than nothing.
+
+### Changed
+
+- **Accepting the gap no longer shows two near-identical green boxes.** The confirmation
+  notice repeated what the completeness banner directly above it already says (the count,
+  the table, that the next step is unblocked, that Validation reports the gap). It is now
+  a single line carrying only the fact the banner lacks — that reloading a table after
+  fixing its source value still closes the gap — with a checkmark to acknowledge the
+  click.
+- **The error-log download moved out from under the accept button.** Sitting immediately
+  below "Accept quarantined rows & continue" it read as that decision's secondary option,
+  when it just takes the same per-row information away with you. It now sits with the
+  detail it serializes.
+- **The watermark's per-table counts match the panel around them.** Quasar's default
+  expansion header — a grey full-bleed bar with a large leading glyph — was a heavy band
+  across an otherwise flat panel, and the count rows used a different alignment from the
+  coordinates above them. Both now use the same label-then-monospace-value shape, with the
+  header sized like the field labels.
+- **Removed the standing caption under "Workloads to migrate".** Each of its three claims
+  is already made where it serves the reader better: the picker's caption says where the
+  selection came from (with the badges listing it right above), the Export watermark panel
+  shows the actual coordinate rather than the promise of one, and the confirm dialog states
+  the source is read-only at the moment the user commits.
+
 ## v0.1.207
 
 ### Changed
