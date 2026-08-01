@@ -10779,3 +10779,112 @@ def test_start_over_teardown_targets_the_stack_it_offered() -> None:
     assert "getattr(migration_state, 'cdc_stack_name', None)" not in teardown_body, (
         "the teardown must not fall back to the session's own name directly"
     )
+
+
+# ---------------------------------------------------------------------------
+# Attach must be withheld when the pipeline does not cover this session's tables
+# ---------------------------------------------------------------------------
+
+
+def test_attach_scope_mismatch_is_asymmetric() -> None:
+    """Only a LOADED table the pipeline ignores is a gap.
+
+    Attaching promotes Data Migration to DONE and unlocks Validation, so it is sound only
+    when the pipeline covers what this session loaded. A pipeline that is BROADER is fine:
+    it may serve another table set in parallel and nothing this session owns is left
+    uncovered.
+    """
+    from dsql_migrator.ui.data_migration._status import cdc_attach_scope_mismatch
+
+    streamed = ["ecommerce_demo.orders", "ecommerce_demo.products"]
+
+    # The reported situation: the live pipeline streams a different SCHEMA entirely.
+    assert cdc_attach_scope_mismatch(
+        streamed, ["ecommerce.orders", "ecommerce.users"]
+    ) == ["ecommerce.orders", "ecommerce.users"]
+    # Exact cover -> no gap.
+    assert cdc_attach_scope_mismatch(streamed, streamed) == []
+    # Pipeline broader than the selection -> NOT a gap (asymmetric on purpose).
+    assert cdc_attach_scope_mismatch(streamed, ["ecommerce_demo.orders"]) == []
+    # Case-insensitive, matching how table.include.list is written.
+    assert cdc_attach_scope_mismatch(["ECOMMERCE.ORDERS"], ["ecommerce.orders"]) == []
+
+
+def test_attach_scope_mismatch_never_blocks_on_unknowns() -> None:
+    # An un-probed candidate has no TableIncludeList, and a session with no confirmed
+    # selection has nothing to compare -- neither may be reported as a mismatch, or a
+    # readable-but-unprobed stack would become permanently unattachable.
+    from dsql_migrator.ui.data_migration._status import cdc_attach_scope_mismatch
+
+    assert cdc_attach_scope_mismatch([], ["ecommerce.orders"]) == []
+    assert cdc_attach_scope_mismatch(["ecommerce.orders"], []) == []
+    assert cdc_attach_scope_mismatch([], []) == []
+
+
+def _infra_banner(*, streamed, selected):
+    from dsql_migrator.core.models import TableSelection
+    from dsql_migrator.ui.data_migration import _render_cdc_existing_infra_banner
+
+    state = DataMigrationState()
+    state.set_cdc_other_stacks([("mysql-dsql-cdc-stack-0729-new", "UPDATE_COMPLETE")])
+    state.set_cdc_other_stack_tables({"mysql-dsql-cdc-stack-0729-new": list(streamed)})
+    state.set_selection(TableSelection(selected_tables=list(selected)))
+
+    ui = _DetailRowUi()
+    ui.buttons: list[str] = []
+    _orig = ui.button
+
+    def _button(text="", *a, **k):
+        if text:
+            ui.buttons.append(str(text))
+        return _orig(text, *a, **k)
+
+    ui.button = _button
+    _render_cdc_existing_infra_banner(ui, state, lambda: None)
+    return ui
+
+
+def test_attach_is_withheld_for_a_pipeline_streaming_other_tables() -> None:
+    """Reported: a live pipeline on the account streamed a completely different table set.
+
+    Verified against the real stack: ``mysql-dsql-cdc-stack-0729-new`` replicates 11
+    ``ecommerce_demo.*`` tables while the session had just loaded ``ecommerce.*``.
+    Attaching would have marked the migration complete and unlocked cut-over while every
+    loaded table had NO CDC -- losing each source change after the watermark.
+    """
+    ui = _infra_banner(
+        streamed=["ecommerce_demo.orders", "ecommerce_demo.products"],
+        selected=["ecommerce.orders", "ecommerce.users"],
+    )
+
+    assert not any("Attach to" in b for b in ui.buttons), ui.buttons
+    body = " ".join(ui.labels)
+    assert "streams a different set of tables" in body
+    assert "not safe to attach" in body
+    # Names what is uncovered, and why attaching would be wrong.
+    assert "ecommerce.orders" in body
+    assert "no ongoing changes" in body
+    # Still tells the operator the idle infrastructure is costing money.
+    assert "billing" in body
+
+
+def test_attach_is_offered_when_the_pipeline_covers_the_selection() -> None:
+    ui = _infra_banner(
+        streamed=["ecommerce.orders", "ecommerce.users"],
+        selected=["ecommerce.orders"],
+    )
+
+    assert "Attach to mysql-dsql-cdc-stack-0729-new" in ui.buttons
+    body = " ".join(ui.labels)
+    assert "Existing CDC infrastructure found" in body
+    assert "not safe to attach" not in body
+
+
+def test_attach_is_offered_when_the_candidate_tables_are_unknown() -> None:
+    # A candidate whose parameters could not be read must stay attachable: the duplicate
+    # -MSK warning is the whole point of the banner, and blocking on an unprobed stack
+    # would push the operator toward deploying a second costly cluster.
+    ui = _infra_banner(streamed=[], selected=["ecommerce.orders"])
+
+    assert "Attach to mysql-dsql-cdc-stack-0729-new" in ui.buttons
+    assert "not safe to attach" not in " ".join(ui.labels)

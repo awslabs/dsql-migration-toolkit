@@ -1204,13 +1204,27 @@ def _open_start_over_dialog(
         cdc_choice = {"mode": "none"}
         if cdc_deployed and on_reset_cdc is not None:
             cdc_choice["mode"] = "stop"
+            # NAME the stack, and do not imply this session deployed it. The pipeline may
+            # equally have been left by an earlier session or be in use by another window
+            # onto the same account (e.g. a local UI beside the deployed app) -- the stack
+            # carries no owner tag, so the tool genuinely cannot tell. "A CDC pipeline is
+            # currently deployed" read as "yours", which makes "Leave CDC untouched" feel
+            # like the wrong answer even when it is the right one. Naming it lets the
+            # operator recognise a pipeline something else is using and leave it alone
+            # deliberately.
+            named = f" ({cdc_stack_name})" if cdc_stack_name else ""
             render_notice(
                 ui,
                 tone="warning",
-                header="CDC is deployed — choose what to do with it",
+                header="A CDC pipeline is running on this account — what should happen "
+                "to it?",
                 body=(
-                    "Start over wipes only the tool's session, but a CDC pipeline "
-                    "is currently deployed. Pick how to handle it:"
+                    f"Start over only wipes this tool's session, but the cdc-stack"
+                    f"{named} keeps running on AWS (and billing). It may be the one this "
+                    "session deployed, or one left by an earlier session or in use by "
+                    "another window onto this account — the stack carries no owner, so "
+                    "the tool cannot tell. Leave it untouched if something else is using "
+                    "it."
                 ),
             )
             cdc_tiles_def = {
@@ -1226,8 +1240,9 @@ def _open_start_over_dialog(
                 ),
                 "none": (
                     "Leave CDC untouched",
-                    "Connectors keep running; the migration type stays locked until "
-                    "you remove them.",
+                    "Nothing on AWS changes — the right choice when another window (e.g. "
+                    "the deployed app) is using this pipeline. Billing continues, and "
+                    "the migration type stays locked until the connectors are removed.",
                 ),
             }
 

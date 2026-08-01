@@ -445,6 +445,37 @@ def stack_status_needs_cleanup(status: Optional[str]) -> bool:
     return bool(status) and str(status).upper() in _UNATTACHABLE_STACK_STATUSES
 
 
+def cdc_attach_scope_mismatch(
+    streamed_tables: "Sequence[str]", loaded_tables: "Sequence[str]"
+) -> "list[str]":
+    """Return the loaded tables a candidate stack does NOT stream, sorted; ``[]`` if fine.
+
+    Attaching points the session at a live pipeline and, because the pipeline is streaming,
+    promotes Data Migration to ``DONE`` and unlocks Validation. That is only sound when the
+    pipeline actually covers what this session loaded. A stack streaming a DIFFERENT table
+    set (e.g. ``ecommerce_demo.*`` while this session loaded ``ecommerce.*``) would leave
+    every loaded table with no CDC at all -- silently losing every source change after the
+    watermark -- while the UI reported the migration as complete and let the operator
+    proceed to cut over.
+
+    Asymmetric on purpose. Tables the stack streams but this session did NOT load are NOT
+    a mismatch: the pipeline is simply broader (it may serve another table set in parallel),
+    and nothing this session owns is left uncovered. Only the reverse -- a loaded table the
+    pipeline ignores -- is a real gap.
+
+    Returns ``[]`` when either side is unknown (an un-probed stack has no
+    ``TableIncludeList``; a session with no confirmed selection has nothing to check), so
+    this only blocks a mismatch it can actually prove. Comparison is case-insensitive on
+    the qualified ``schema.table`` name, matching how the connector's
+    ``table.include.list`` is written.
+    """
+    streamed = {str(name).strip().lower() for name in streamed_tables if str(name).strip()}
+    loaded = [str(name).strip() for name in loaded_tables if str(name).strip()]
+    if not streamed or not loaded:
+        return []
+    return sorted(name for name in loaded if name.lower() not in streamed)
+
+
 def split_attachable_stacks(
     stacks: "Sequence[tuple[str, str]]",
 ) -> "tuple[list[tuple[str, str]], list[tuple[str, str]]]":
@@ -662,6 +693,28 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
     migration_state.set_cdc_reconciled_table_names(
         [n for n in includes_raw.split(",") if n.strip()]
     )
+    # Also read each ATTACH CANDIDATE's replicated table set, so the attach offer can be
+    # withheld when the pipeline does not cover what this session loaded. ``list_stacks``
+    # returns no parameters, so this needs one describe per candidate -- bounded by the
+    # number of cdc-* stacks in the account (normally 0-2) and only on the throttled
+    # discovery, not per render. Best-effort per stack: a candidate whose parameters
+    # cannot be read maps to an empty set, which the scope check treats as "unknown" and
+    # therefore does NOT block.
+    candidate_tables: "dict[str, list[str]]" = {}
+    for name, _status in others:
+        try:
+            candidate = deployer.describe_stack_or_none(name)
+        except Exception:  # noqa: BLE001 - one unreadable candidate must not break others
+            candidate = None
+        raw = (
+            (getattr(candidate, "current_parameters", None) or {}).get(
+                "TableIncludeList", ""
+            )
+            if candidate is not None
+            else ""
+        )
+        candidate_tables[name] = [n.strip() for n in raw.split(",") if n.strip()]
+    migration_state.set_cdc_other_stack_tables(candidate_tables)
 
 
 def _ensure_cdc_controller(migration_state, session) -> None:

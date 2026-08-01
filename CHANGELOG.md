@@ -5,6 +5,36 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.211
+
+### Fixed
+
+- **"Attach" was offered for a CDC pipeline that streams a different set of tables.**
+  Attaching points the session at a live pipeline and — because the pipeline is streaming —
+  promotes Data Migration to `DONE` and unlocks Validation. Verified against a live
+  account: a stack was replicating 11 `ecommerce_demo.*` tables while the session had just
+  loaded 8 `ecommerce.*` tables. Attaching would have reported the migration complete and
+  let the operator proceed toward cut over, while **every table this session loaded had no
+  CDC at all** — silently losing each source change after the watermark.
+
+  Attach is now withheld when a candidate pipeline does not replicate the tables this
+  session loaded, replaced by a notice naming exactly which tables it would leave
+  uncovered, both ways forward (deploy CDC for this table set, or change the selection to
+  match), and a reminder that the idle infrastructure is still billing. Deliberately
+  asymmetric: a pipeline that is **broader** than the selection is not a mismatch — it may
+  serve another table set in parallel and leaves nothing this session owns uncovered. And a
+  candidate whose table set cannot be read stays attachable, because blocking on an
+  unprobed stack would push the operator toward deploying a second, costly MSK cluster —
+  the very thing this banner exists to prevent.
+
+### Changed
+
+- **Start over no longer implies the running CDC pipeline is this session's.** It now names
+  the stack and says plainly that it may have been left by an earlier session or be in use
+  by another window onto the same account — the stack carries no owner tag, so the tool
+  cannot tell. "Leave CDC untouched" is described as the right choice when something else
+  is using the pipeline, instead of reading as a deferral.
+
 ## v0.1.210
 
 ### Fixed

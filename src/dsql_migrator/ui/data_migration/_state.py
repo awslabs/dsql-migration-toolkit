@@ -246,6 +246,12 @@ class DataMigrationState:
         # an existing pipeline instead of showing a fresh deploy -- and never
         # silently create a second, costly MSK stack. List of (name, StackStatus).
         self.cdc_other_stacks: list[tuple[str, str]] = []
+        # Each attach-candidate stack's replicated table set (stack name ->
+        # TableIncludeList). Used to withhold the attach offer when a candidate pipeline
+        # does not cover the tables this session loaded -- attaching promotes Data
+        # Migration to DONE, so a mismatched pipeline would report the migration complete
+        # while the loaded tables had no CDC. Missing/empty == unknown (does not block).
+        self.cdc_other_stack_tables: dict[str, list[str]] = {}
         # Monotonic timestamp of the last render-time CDC discovery (describe +
         # list connectors); throttles those AWS reads across rapid re-renders.
         # Reset to None here so a Start-over (reset_in_place re-runs __init__)
@@ -472,6 +478,20 @@ class DataMigrationState:
         existing pipeline instead of deploying a duplicate."""
         with self._lock:
             self.cdc_other_stacks = list(stacks)
+
+    def set_cdc_other_stack_tables(self, tables_by_stack: "dict[str, list[str]]") -> None:
+        """Cache each attach-candidate stack's replicated table set (``TableIncludeList``).
+
+        Lets the attach offer be withheld when a candidate pipeline does not cover the
+        tables this session loaded: attaching promotes Data Migration to DONE and unlocks
+        Validation, so attaching a pipeline that streams a different table set would report
+        the migration complete while every loaded table had no CDC at all. An entry missing
+        or empty means "unknown", which the scope check treats as not-a-mismatch.
+        """
+        with self._lock:
+            self.cdc_other_stack_tables = {
+                name: list(tables) for name, tables in (tables_by_stack or {}).items()
+            }
 
     def adopt_cdc_stack(self, name: str) -> bool:
         """Adopt an existing cdc-stack: point the session at ``name`` and force a

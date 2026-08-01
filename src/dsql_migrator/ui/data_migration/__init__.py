@@ -218,6 +218,7 @@ from dsql_migrator.ui.data_migration._status import (
     _filter_mine,
     _is_inflight_stack_status,
     is_infra_create_stack_status,
+    cdc_attach_scope_mismatch,
     split_attachable_stacks,
     _classify_cdc_stack_phase,
     _probe_cdc_stack_phase,
@@ -2079,8 +2080,51 @@ def _render_cdc_existing_infra_banner(ui, migration_state, refresh) -> None:
             ),
         )
 
-    if attachable:
-        listed = ", ".join(f"{name} ({status})" for name, status in attachable)
+    # Withhold attach for a pipeline that does not cover THIS session's tables. Attaching
+    # promotes Data Migration to DONE and unlocks Validation, so attaching a stack that
+    # streams a different table set would report the migration complete while every table
+    # this session loaded had no CDC at all -- silently losing each source change after the
+    # watermark, and letting the operator proceed to cut over on that. Scope is checked
+    # against the loaded/selected set; an unknown set on either side does not block (see
+    # cdc_attach_scope_mismatch).
+    loaded_tables = list(migration_state.selection.selected_tables)
+    tables_by_stack = getattr(migration_state, "cdc_other_stack_tables", None) or {}
+    in_scope: "list[tuple[str, str]]" = []
+    out_of_scope: "list[tuple[str, str, list[str]]]" = []
+    for name, status in attachable:
+        missing = cdc_attach_scope_mismatch(
+            tables_by_stack.get(name, ()), loaded_tables
+        )
+        if missing:
+            out_of_scope.append((name, status, missing))
+        else:
+            in_scope.append((name, status))
+
+    if out_of_scope:
+        for name, status, missing in out_of_scope:
+            listed = ", ".join(missing[:6]) + (
+                f" +{len(missing) - 6} more" if len(missing) > 6 else ""
+            )
+            noun = "table" if len(missing) == 1 else "tables"
+            _render_notice(
+                ui,
+                tone="warning",
+                header=(
+                    f"{name} streams a different set of tables — not safe to attach"
+                ),
+                body=(
+                    f"That pipeline does not replicate {len(missing)} {noun} this "
+                    f"session loaded ({listed}). Attaching would mark the migration "
+                    "complete while those tables received no ongoing changes at all. "
+                    "Either deploy CDC for this table set, or (if that pipeline is the "
+                    "one you want) change the table selection to match it. Its "
+                    "infrastructure is still billing meanwhile — delete it from the CDC "
+                    "step if it is no longer needed."
+                ),
+            )
+
+    if in_scope:
+        listed = ", ".join(f"{name} ({status})" for name, status in in_scope)
         _render_notice(
             ui,
             tone="warning",
@@ -2093,7 +2137,7 @@ def _render_cdc_existing_infra_banner(ui, migration_state, refresh) -> None:
             ),
         )
         with ui.row().classes("items-center gap-2 flex-wrap"):  # type: ignore[attr-defined]
-            for name, _status in attachable:
+            for name, _status in in_scope:
                 def _adopt(_name=name) -> None:
                     if migration_state.adopt_cdc_stack(_name):
                         refresh()
