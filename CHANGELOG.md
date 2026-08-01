@@ -5,6 +5,30 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.219
+
+### Fixed
+
+- **The Validation in-progress panel rendered the Cancel button's tooltip as its label.**
+  The whole sentence — *"Stop the comparison. Tables not yet started are skipped; the ones
+  already running finish first. Read-only, so nothing is left half-changed."* — became the
+  button's caption, so the button stretched across the panel and the actual verb ("Cancel
+  validation") disappeared.
+
+  Cause: NiceGUI's `Element.tooltip()` creates the tooltip and returns **`self`** (the
+  owning element) for chaining — it does not hand back the tooltip. So binding its result
+  and calling `set_text()` on it to swap the tooltip between the running and stopping
+  wording was setting the **button's** text instead. The handle now comes from
+  `ui.tooltip()` created inside the button's context, which does return the tooltip
+  element; the text still swaps in place, so a hovered tooltip is never destroyed by the
+  poll.
+
+  This was invisible to the test suite because the NiceGUI double modelled
+  `Element.tooltip()` as returning a tooltip object — the opposite of the real API — so the
+  mistaken call looked correct in tests while being broken on screen. The double now
+  mirrors the real return value, and the regression test asserts the tooltip copy never
+  appears as button text. Verified by re-introducing the bug: three tests fail.
+
 ## v0.1.218
 
 ### Fixed

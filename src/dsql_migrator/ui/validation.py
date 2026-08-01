@@ -2221,7 +2221,16 @@ def _render_in_progress(
             ).props("outline color=grey-8 no-caps")
             # ONE tooltip element whose TEXT is swapped, so the anchor survives the
             # poll and the tooltip stays open while hovered.
-            cancel_tip = cancel_button.tooltip("")  # type: ignore[attr-defined]
+            #
+            # Build it as a CHILD element -- NOT via ``cancel_button.tooltip(...)``.
+            # NiceGUI's Element.tooltip() constructs the Tooltip and then returns
+            # ``self`` (the button) for chaining, so binding its result and calling
+            # set_text() on it rewrote the BUTTON'S OWN LABEL: the whole tooltip
+            # sentence rendered as the button caption, blowing the row out to the full
+            # panel width. Entering the tooltip's context and creating ui.tooltip()
+            # inside gives a handle on the tooltip element itself.
+            with cancel_button:
+                cancel_tip = ui.tooltip("")  # type: ignore[attr-defined]
         # Determinate progress bar once the worker reports its first table, so the
         # user sees how far along a long multi-table run is (not just a spinner).
         # Created up front and shown/hidden, since creating it later would mean

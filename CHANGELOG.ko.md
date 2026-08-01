@@ -5,6 +5,26 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.219
+
+### 수정
+
+- **Validation 진행 중 패널에서 Cancel 버튼의 툴팁이 레이블로 렌더링되던 문제.** 문장 전체 —
+  *"Stop the comparison. Tables not yet started are skipped; the ones already running finish
+  first. Read-only, so nothing is left half-changed."* — 가 버튼 캡션이 되어 버튼이 패널 전체로
+  늘어나고, 실제 동작을 나타내는 문구("Cancel validation")는 사라졌습니다.
+
+  원인: NiceGUI의 `Element.tooltip()`은 툴팁을 생성한 뒤 체이닝을 위해 **`self`**(소유 엘리먼트)를
+  반환합니다 — 툴팁을 돌려주지 않습니다. 따라서 그 반환값을 받아 `set_text()`로 실행 중/중지 중 문구를
+  교체하려던 코드가 실제로는 **버튼의** 텍스트를 바꾸고 있었습니다. 이제 버튼 컨텍스트 안에서
+  `ui.tooltip()`으로 핸들을 얻습니다(이쪽은 툴팁 엘리먼트를 반환). 텍스트는 여전히 제자리에서
+  교체되므로 폴링이 hover 중인 툴팁을 파괴하지 않습니다.
+
+  이 문제가 테스트에서 보이지 않았던 이유는 NiceGUI 더블이 `Element.tooltip()`을 툴팁 객체를 반환하는
+  것으로 모델링했기 때문입니다 — 실제 API와 정반대입니다. 그래서 잘못된 호출이 테스트에서는 올바르게
+  보이면서 화면에서는 깨져 있었습니다. 이제 더블이 실제 반환값을 반영하고, 회귀 테스트가 툴팁 문구가
+  버튼 텍스트로 절대 나타나지 않음을 검증합니다. 버그를 되살려 확인: 테스트 3개가 실패합니다.
+
 ## v0.1.218
 
 ### 수정

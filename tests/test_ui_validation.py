@@ -2549,9 +2549,16 @@ class _CopyUi:
             return self
 
         def tooltip(self, text="", *_a, **_k):
-            # NiceGUI returns the tooltip ELEMENT, so the caller can swap its text in
-            # place; every text it is ever given is recorded.
-            return _Tip(self._owner, text)
+            # NiceGUI's Element.tooltip() creates the Tooltip and returns ``self`` (the
+            # OWNING element) for chaining -- it does NOT hand back the tooltip. This
+            # double used to return a _Tip, which made ``x = btn.tooltip("")`` followed by
+            # ``x.set_text(...)`` look like it retargeted the tooltip when in the real UI
+            # it rewrites the BUTTON'S LABEL. That fiction hid a visible bug (the whole
+            # tooltip sentence rendered as the button caption). Mirroring the real return
+            # value means such a call now shows up as a label change, where it is caught.
+            if text:
+                self._owner.tooltips.append(str(text))
+            return self
 
         def set_text(self, text="", *_a, **_k):
             self.text = str(text)
@@ -2579,6 +2586,12 @@ class _CopyUi:
 
         def __exit__(self, *_e):
             return False
+
+    def tooltip(self, text="", *_a, **_k):
+        # ui.tooltip() (the standalone factory) DOES return the tooltip element, which is
+        # the supported way to get a handle whose text can be swapped later. Distinct from
+        # Element.tooltip() above, which returns the owning element.
+        return _Tip(self, text)
 
     def _record(self, text):
         if text:
@@ -3109,31 +3122,39 @@ def test_poll_updates_the_panel_in_place_so_a_hovered_tooltip_survives() -> None
 def test_cancel_tooltip_text_is_swapped_not_recreated() -> None:
     # One tooltip element whose text changes, rather than a new tooltip per state: a new
     # element would again mean the hovered one is gone.
+    #
+    # The handle must come from ui.tooltip() (the standalone factory, which returns the
+    # TOOLTIP), not from button.tooltip() (which returns the BUTTON). Tracking the factory
+    # is what keeps this test honest: hooking button.tooltip would pass even if the code
+    # went back to swapping the button's own label.
     from dsql_migrator.ui.validation import ValidationState, _render_in_progress
 
     tips: list = []
 
     class _Ui(_PanelUi):
-        def button(self, text="", *_a, **_k):
-            element = super().button(text)
-            make_tip = element.tooltip
-
-            def _tooltip(t="", *a, **k):
-                tip = make_tip(t, *a, **k)
-                tips.append(tip)
-                return tip
-
-            element.tooltip = _tooltip
-            return element
+        def tooltip(self, text="", *_a, **_k):
+            tip = super().tooltip(text)
+            tips.append(tip)
+            return tip
 
     state = ValidationState()
     state.set_progress("orders", 2, 7)
-    _render_in_progress(_Ui(), JobManager(), object(), state, lambda: None)
+    ui = _Ui()
+    _render_in_progress(ui, JobManager(), object(), state, lambda: None)
 
     # Exactly one tooltip element for the Cancel button.
     assert len(tips) == 1
     # And it ends up holding the running-state wording.
     assert "Tables not yet started are skipped" in tips[0].text
+    # THE regression: that wording must live in the tooltip ONLY -- never become the
+    # button's caption. (It did: the whole sentence rendered as the button label and blew
+    # the row out to the full panel width.) The button's own text -- its creation label
+    # plus any later set_text -- is recorded in `texts`, so the tooltip copy must be absent
+    # from every one of them.
+    assert "Cancel validation" in ui.texts
+    for rendered in ui.texts:
+        assert "Tables not yet started are skipped" not in rendered, rendered
+        assert "Cancel already requested" not in rendered, rendered
 
 
 # ---------------------------------------------------------------------------
