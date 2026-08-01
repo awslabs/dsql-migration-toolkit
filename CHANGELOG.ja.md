@@ -5,6 +5,35 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.196
+
+### Fixed
+
+- **ターゲットの主キー照会が、実際の Aurora DSQL では全テーブルの全カラムを返していました。**
+  v0.1.192 で追加した `target_primary_key_columns()` は `pg_index.indkey` 全体を unnest して
+  いましたが、実際のキーは先頭の `indnkeyatts` 個のみで、残りはインデックスの非キー stored/included
+  カラムです。DSQL ではこれは例外ではありません: すべての primary index がテーブルの残りのカラムを
+  ペイロードとして保持しており、11 テーブルのスキーマで `indnatts` が最大 14 に対し `indnkeyatts` は
+  全て 1 で、この関数は `information_schema.key_column_usage` と **11 件中 11 件**で不一致でした。
+
+  結果は v0.1.192 の意図と正反対でした: 全カラムのリストが適用済みの複合キーと一致することはないため、
+  データがあるターゲットへのキー変更を伴う append は**すべて拒否**され、ありえない「実際の主キー」が
+  メッセージに引用される状態でした。unnest を `indnkeyatts` で制限して修正し、同じクラスタで再検証して
+  11/11 一致、存在しないテーブルは引き続き `None` を返します。
+
+  ライブクラスタ(`ap-northeast-2`)に対し**読み取り専用**で検証: `unnest … WITH ORDINALITY`、
+  `JOIN LATERAL`、`pg_index.indisprimary/indkey/indnkeyatts`、`pg_table_is_visible`、
+  `pg_attribute` はいずれも DSQL で動作し、`indkey` が `'2 1'` の実在する 2 キーインデックスが
+  カラムを**インデックス順**で返すことを確認しました — 複合キー戦略が依拠する保証そのものです。
+
+### Tests
+
+- `_PkCursor` のダブルが、あらかじめ用意した主キーをそのまま返すのではなく、クエリのキーカラム制限を
+  実際に反映するようになりました。つまり statement に `indnkeyatts` が無ければ stored カラムまで返し、
+  ライブクラスタの形状を再現します。新規テスト 2 件(ペイロード除外、複合キーの順序維持とペイロード除去)は
+  制限を外すと失敗します。以前の fake では、実在する全テーブルで誤っている関数のまま 2394 件すべてが
+  通過していました。
+
 ## v0.1.195
 
 ### Tests

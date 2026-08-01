@@ -5,6 +5,34 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.196
+
+### Fixed
+
+- **대상 PK 조회가 실제 Aurora DSQL에서 모든 테이블의 모든 컬럼을 반환했습니다.**
+  v0.1.192에서 추가한 `target_primary_key_columns()`가 `pg_index.indkey` 전체를 unnest했지만,
+  실제 키는 앞쪽 `indnkeyatts`개뿐이고 나머지는 인덱스의 비-키 stored/included 컬럼입니다. DSQL에서는
+  이것이 예외 상황이 아닙니다: 모든 primary index가 테이블의 남은 컬럼을 payload로 싣고 있어서, 11개
+  테이블 스키마에서 `indnatts`가 최대 14인데 `indnkeyatts`는 전부 1이었고, 이 함수는
+  `information_schema.key_column_usage`와 **11개 중 11개** 테이블에서 불일치했습니다.
+
+  결과는 v0.1.192의 의도와 정반대였습니다: 전체 컬럼 목록은 적용된 복합 키와 결코 같아질 수 없으므로,
+  데이터가 있는 대상에 키가 변경된 append는 **모두 거부**되고 터무니없는 "실제 PK"가 메시지에 인용될
+  상황이었습니다. unnest를 `indnkeyatts`로 제한해 수정했고, 같은 클러스터로 재검증해 11/11 일치,
+  없는 테이블은 여전히 `None`을 반환합니다.
+
+  라이브 클러스터(`ap-northeast-2`)에 **읽기 전용**으로 검증: `unnest … WITH ORDINALITY`,
+  `JOIN LATERAL`, `pg_index.indisprimary/indkey/indnkeyatts`, `pg_table_is_visible`,
+  `pg_attribute`가 모두 DSQL에서 동작하며, `indkey`가 `'2 1'`인 실제 2-키 인덱스가 컬럼을
+  **인덱스 순서**로 반환함을 확인했습니다 — 복합 키 전략이 의존하는 바로 그 보장입니다.
+
+### Tests
+
+- `_PkCursor` 더블이 미리 정해둔 PK를 그대로 돌려주는 대신 쿼리의 키 컬럼 제한을 실제로 반영합니다.
+  즉 statement에 `indnkeyatts`가 없으면 stored 컬럼까지 반환해 라이브 클러스터의 형태를 재현합니다.
+  새 테스트 2개(payload 제외, 복합 키 순서 유지 + payload 제거)는 제한을 없애면 실패합니다. 이전
+  fake로는 실제 모든 테이블에서 틀린 함수를 두고도 2394개가 전부 통과했습니다.
+
 ## v0.1.195
 
 ### Tests

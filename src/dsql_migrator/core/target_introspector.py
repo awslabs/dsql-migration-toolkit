@@ -401,10 +401,21 @@ def target_primary_key_columns(
     # against the current search path via pg_table_is_visible, mirroring how an
     # unqualified INSERT would resolve.
     #
-    # ``indkey`` is ordered by key position, so unnesting WITH ORDINALITY and
-    # ordering by it preserves the real key order -- (user_id, id) must not come back
-    # as (id, user_id), since the leading column is the whole point of the
-    # composite-key strategy.
+    # ``indkey`` is ordered by key position, so unnesting WITH ORDINALITY and ordering
+    # by it preserves the real key order -- (user_id, id) must not come back as
+    # (id, user_id), since the leading column is the whole point of the composite-key
+    # strategy.
+    #
+    # ``k.ord <= ix.indnkeyatts`` is REQUIRED, not a refinement. ``indkey`` lists the
+    # index's KEY columns followed by its non-key "included"/stored columns, and only
+    # the first ``indnkeyatts`` of them form the constraint. Aurora DSQL's primary
+    # indexes routinely carry the remaining columns as stored payload (verified on a
+    # live cluster: a 2-column table reported indnatts=2 with indnkeyatts=1, and an
+    # 11-table schema reported EVERY column for EVERY table). Without this bound the
+    # function returned the full column list, which then never equals the applied
+    # composite key -- so every append with a changed key would be refused with a
+    # message naming an absurd "actual" key. Cross-checked against
+    # information_schema.key_column_usage on the same cluster: 11/11 tables now agree.
     parts = table_name.split(".", 1)
     if len(parts) == 2:
         schema, relname = parts
@@ -423,7 +434,7 @@ def target_primary_key_columns(
         "JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
         "JOIN pg_catalog.pg_attribute a "
         "  ON a.attrelid = c.oid AND a.attnum = k.attnum "
-        f"WHERE {where_relation} "
+        f"WHERE {where_relation} AND k.ord <= ix.indnkeyatts "
         "ORDER BY k.ord"
     )
     try:

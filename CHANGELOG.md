@@ -5,6 +5,39 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.196
+
+### Fixed
+
+- **The target primary-key probe returned every column of every table on real Aurora
+  DSQL.** `target_primary_key_columns()` (added in v0.1.192) unnested the whole of
+  `pg_index.indkey`, but only its first `indnkeyatts` entries are the key — the rest are
+  the index's non-key stored/included columns. On DSQL that is not an edge case: every
+  primary index carries the table's remaining columns as payload, so an 11-table schema
+  reported `indnatts` of up to 14 against `indnkeyatts = 1` throughout, and the function
+  disagreed with `information_schema.key_column_usage` on **11 of 11** tables.
+
+  The consequence was the opposite of the v0.1.192 intent: since a full column list never
+  equals the applied composite key, every append into a populated target with a changed
+  key would have been refused, quoting an absurd "actual" primary key. Bounding the
+  unnest to `indnkeyatts` fixes it — re-verified against the same cluster, 11/11 tables
+  now agree, and a missing table still returns `None`.
+
+  Verified read-only against a live cluster (`ap-northeast-2`): `unnest … WITH
+  ORDINALITY`, `JOIN LATERAL`, `pg_index.indisprimary/indkey/indnkeyatts`,
+  `pg_table_is_visible` and `pg_attribute` all work on DSQL, and a real two-key index
+  whose `indkey` is `'2 1'` returns its columns in **index** order — the guarantee the
+  composite-key strategy depends on.
+
+### Tests
+
+- The `_PkCursor` double now honors the query's key-column bound instead of echoing a
+  canned primary key, so it returns the stored columns whenever the statement omits
+  `indnkeyatts` — reproducing the live-cluster shape. Two new tests (payload excluded;
+  composite key kept in order with payload dropped) fail if the bound is removed. With
+  the previous fake, all 2394 tests passed against a function that was wrong on every
+  real table.
+
 ## v0.1.195
 
 ### Tests

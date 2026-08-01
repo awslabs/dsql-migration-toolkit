@@ -524,7 +524,18 @@ def test_max_pk_target_missing_table_is_none() -> None:
 
 
 class _PkCursor:
-    """Returns pre-canned pg_index rows, recording the statement + bound params."""
+    """A pg_index stand-in that actually HONORS the query's key-column bound.
+
+    ``rows`` is the index's full ``indkey`` expansion -- key columns first, then the
+    non-key "included"/stored columns -- paired with ``indnkeyatts``. The cursor returns
+    the slice the statement asks for, so a query that forgets ``k.ord <= indnkeyatts``
+    gets the stored columns too, exactly as a real cluster returns them.
+
+    That fidelity matters: with a cursor that ignored the SQL and echoed a canned PK,
+    the suite passed while the function returned every column of every table on a live
+    Aurora DSQL cluster (every DSQL primary index carries the remaining columns as
+    payload, so ``indnatts`` > ``indnkeyatts`` universally, not occasionally).
+    """
 
     def __init__(self, connection: "_PkConnection") -> None:
         self._connection = connection
@@ -535,7 +546,12 @@ class _PkCursor:
         self._connection.executed.append((text, parameters))
         if self._connection.raises:
             raise RuntimeError("catalog unreadable")
-        self._rows = list(self._connection.rows)
+        rows = list(self._connection.rows)
+        # Emulate `WHERE ... k.ord <= ix.indnkeyatts`: without that predicate a real
+        # index hands back its stored columns as well.
+        if "indnkeyatts" in text:
+            rows = rows[: self._connection.indnkeyatts]
+        self._rows = rows
 
     def fetchall(self) -> list:
         return self._rows
@@ -545,8 +561,14 @@ class _PkCursor:
 
 
 class _PkConnection:
-    def __init__(self, *, rows: list, raises: bool = False) -> None:
+    def __init__(
+        self, *, rows: list, raises: bool = False, indnkeyatts: int | None = None
+    ) -> None:
         self.rows = rows
+        # How many leading entries of ``rows`` are actual KEY columns; the rest are the
+        # index's stored/included payload. Defaults to "all of them" for tables whose
+        # index carries no payload.
+        self.indnkeyatts = len(rows) if indnkeyatts is None else indnkeyatts
         self.raises = raises
         self.executed: list[tuple] = []
         self.closed = False
@@ -577,6 +599,53 @@ def test_target_primary_key_columns_preserves_composite_key_order() -> None:
     assert params == {"schema": "ecommerce", "table": "orders"}
     assert "ecommerce" not in statement
     assert connection.closed is True
+
+
+def test_target_primary_key_columns_excludes_the_indexes_stored_columns() -> None:
+    """The primary key is the first ``indnkeyatts`` entries of ``indkey`` -- the rest are
+    the index's non-key stored/included columns.
+
+    Measured on a live Aurora DSQL cluster: EVERY primary index carries the table's
+    remaining columns as payload (e.g. a 2-column table reports indnatts=2 with
+    indnkeyatts=1; an 11-table schema reported indnatts up to 14 with indnkeyatts=1
+    throughout). Omitting the bound made this function return every column of every
+    table -- 11/11 tables disagreed with information_schema.key_column_usage -- which in
+    turn would refuse every append with a changed key while naming an absurd "actual"
+    key. This shape reproduces that: 'order_id' is the key, the rest is payload.
+    """
+    from dsql_migrator.core.target_introspector import target_primary_key_columns
+
+    connection = _PkConnection(
+        rows=[("order_id",), ("customer_id",), ("total_amount",), ("order_ts",)],
+        indnkeyatts=1,
+    )
+
+    columns = target_primary_key_columns(
+        "ecommerce_demo.orders", connection_factory=lambda: connection
+    )
+
+    assert columns == ["order_id"]
+    statement, _params = connection.executed[0]
+    assert "indnkeyatts" in statement, (
+        "the query must bound indkey to the index's KEY columns"
+    )
+
+
+def test_target_primary_key_columns_keeps_a_composite_key_and_drops_payload() -> None:
+    # The case the whole feature exists for: a composite (leading, id) key must come back
+    # in index order AND without the stored columns that follow it in indkey.
+    from dsql_migrator.core.target_introspector import target_primary_key_columns
+
+    connection = _PkConnection(
+        rows=[("user_id",), ("id",), ("amount",), ("created_at",)],
+        indnkeyatts=2,
+    )
+
+    columns = target_primary_key_columns(
+        "ecommerce.orders", connection_factory=lambda: connection
+    )
+
+    assert columns == ["user_id", "id"]
 
 
 def test_target_primary_key_columns_resolves_a_bare_name_via_search_path() -> None:
