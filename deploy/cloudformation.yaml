@@ -158,7 +158,7 @@ Parameters:
 
   ContainerImageUri:
     Type: String
-    Default: public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.188
+    Default: public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.209
     Description: >
       App container image URI. Defaults to the published ECR Public image, so a
       normal deploy needs NO image build -- Fargate pulls it directly (works from

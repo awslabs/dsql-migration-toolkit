@@ -10682,3 +10682,100 @@ def test_grouped_card_truncates_a_long_primary_key_list() -> None:
     assert f"+{total - _QUARANTINE_PK_CHIP_LIMIT} more" in ui.labels
     # The badge reports the REAL total, so the truncation cannot under-report.
     assert f"{total} rows dropped" in ui.badges
+
+
+# ---------------------------------------------------------------------------
+# Start over must see a cdc-stack under a name this session does not target
+# ---------------------------------------------------------------------------
+
+
+def test_start_over_offers_teardown_for_a_stack_under_another_name() -> None:
+    """Start over said "no CDC" while Data Migration offered to ATTACH to a real stack.
+
+    Reported from a live session: Start over showed no CDC-teardown option, then moving to
+    the CDC step offered "Existing CDC infrastructure found —
+    mysql-dsql-cdc-stack-0729-new". Confirmed in the account: that stack exists
+    (UPDATE_COMPLETE) under a name the session does not target. Both of Start over's
+    signals (``cdc_stack_phase``, ``cdc_connector_names``) are scoped to
+    ``cdc_stack_name``, so a stack from an earlier session or with a custom suffix was
+    invisible to it -- and the silent prompt is the one that would have stopped the
+    MSK / NAT billing.
+
+    Asserted on ``app.py``'s source because the callbacks are per-session closures: the
+    contract is that the offer consults ``cdc_other_stacks``, not just the session's own
+    name.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import app as app_module
+
+    src = inspect.getsource(app_module)
+    tree = ast.parse(src)
+    deployed = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_cdc_deployed"
+    )
+    # Strip the docstring: it NAMES cdc_other_stacks while explaining the bug, so
+    # matching the whole function passed even with the check deleted (verified by
+    # mutation). Only executable statements count.
+    statements = [
+        node
+        for node in deployed.body
+        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))
+    ]
+    body = "\n".join(ast.unparse(node) for node in statements)
+
+    assert "cdc_other_stacks" in body, (
+        "Start over must offer teardown for a discovered stack under another name"
+    )
+    # The original two signals must remain -- this ADDS a case, it does not replace them.
+    assert "cdc_connector_names" in body
+    assert "cdc_stack_phase" in body
+
+
+def test_start_over_teardown_targets_the_stack_it_offered() -> None:
+    """The offer and the teardown must resolve the SAME stack.
+
+    Keying the offer off ``cdc_other_stacks`` while the teardown kept reading
+    ``cdc_stack_name`` would offer to delete a stack and then target a name that does not
+    exist -- a silent no-op that leaves the MSK / NAT running. Both now go through one
+    resolver.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import app as app_module
+
+    tree = ast.parse(inspect.getsource(app_module))
+    resolver = next(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_cdc_teardown_stack_name"
+        ),
+        None,
+    )
+    assert resolver is not None, "expected a single stack resolver"
+    resolved = ast.unparse(resolver)
+    # It prefers the session's own stack, and falls back to a discovered one.
+    assert "cdc_stack_phase" in resolved
+    assert "cdc_other_stacks" in resolved
+    # With SEVERAL discovered stacks it must not pick one -- that is the operator's
+    # choice on the CDC step, since each may be a separate pipeline.
+    assert "len(others) == 1" in resolved
+
+    teardown = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_cdc_teardown_on_reset"
+    )
+    teardown_body = ast.unparse(teardown)
+    assert "_cdc_teardown_stack_name()" in teardown_body, (
+        "the teardown must resolve the stack the same way the offer did"
+    )
+    assert "getattr(migration_state, 'cdc_stack_name', None)" not in teardown_body, (
+        "the teardown must not fall back to the session's own name directly"
+    )

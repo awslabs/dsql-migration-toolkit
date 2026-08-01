@@ -5,6 +5,32 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.210
+
+### Fixed
+
+- **Start over did not offer to tear down a cdc-stack deployed under another name.** It
+  reported no CDC at all, and then moving to the CDC step offered to *attach* to
+  `mysql-dsql-cdc-stack-0729-new` — the two prompts contradicting each other about a stack
+  that really did exist in the account. Both of Start over's signals
+  (`cdc_stack_phase`, `cdc_connector_names`) are scoped to the name **this** session
+  targets, so a stack from an earlier session, or with a custom suffix, was invisible to
+  it — and the silent prompt was the one that would have stopped the MSK / NAT billing.
+  Start over now also consults the discovered stacks, and the teardown resolves the **same**
+  stack the offer was made about (keying only the offer off the discovery would have
+  offered to delete a stack and then targeted a name that does not exist — a silent no-op
+  that leaves the infrastructure billing). With several discovered stacks it offers but
+  does not choose: each may be a separate pipeline, so which to delete stays the
+  operator's call on the CDC step.
+
+### Deployment
+
+- Published `0.1.209` to ECR Public and pointed the template's `ContainerImageUri` default
+  at it. The default had drifted to `0.1.188` — 21 releases behind — which is what a fresh
+  `git clone` deploys, so the guard test that enforces this now passes again. The Seoul
+  Fargate stack was updated to the same build (change set: TaskDefinition + Service only,
+  all 24 parameters retained).
+
 ## v0.1.209
 
 ### Fixed

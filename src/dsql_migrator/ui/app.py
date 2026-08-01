@@ -335,18 +335,54 @@ def build_page(
         ``absent`` -- i.e. ``running`` / ``infra`` / ``unstable`` (a stuck/rolled-
         back stack is still deployed). Only ``absent`` (no stack at all) is safe.
         This matches the CDC step, which already offers Delete for the ``unstable``
-        phase."""
+        phase.
+
+        (c) covers the case the first two MISS: a cdc-stack under a name this session
+        does not target (``cdc_other_stacks``). Both signals above are scoped to
+        ``cdc_stack_name``, so a stack deployed by an earlier session -- or with a
+        custom suffix -- left Start over reporting no CDC at all while the Data
+        Migration screen simultaneously offered to ATTACH to that very stack. The two
+        prompts contradicted each other about the same resource, and the one that
+        stayed silent is the one that would have offered to stop the MSK / NAT
+        billing. Existence in the account is what matters for a teardown offer, not
+        whether this session happens to own the name."""
         migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
         if getattr(migration_state, "cdc_connector_names", None):
             return True
         phase = getattr(migration_state, "cdc_stack_phase", None)
-        return phase is not None and phase != "absent"
+        if phase is not None and phase != "absent":
+            return True
+        return bool(getattr(migration_state, "cdc_other_stacks", None))
+
+    def _cdc_teardown_stack_name() -> Optional[str]:
+        """The cdc-stack a Start-over teardown would act on.
+
+        Prefers a stack this session actually targets (its own name, when the probe found
+        one), and otherwise falls back to a discovered stack under a DIFFERENT name. Both
+        the offer (:func:`_cdc_deployed`) and the teardown must resolve the SAME stack:
+        keying the offer off ``cdc_other_stacks`` while the teardown kept using
+        ``cdc_stack_name`` would have offered to delete a stack and then targeted a name
+        that does not exist -- a silent no-op that leaves MSK / NAT billing.
+
+        Only ONE discovered stack is adopted for teardown. With several, which to delete
+        is a real choice the operator has to make on the CDC step (each may be a separate
+        pipeline), so Start over must not pick for them.
+        """
+        migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
+        phase = getattr(migration_state, "cdc_stack_phase", None)
+        own = getattr(migration_state, "cdc_stack_name", None)
+        if phase is not None and phase != "absent":
+            return own
+        if getattr(migration_state, "cdc_connector_names", None):
+            return own
+        others = list(getattr(migration_state, "cdc_other_stacks", None) or [])
+        if len(others) == 1:
+            return others[0][0]
+        return own
 
     def _cdc_stack_name() -> Optional[str]:
-        """The session's current cdc-stack name, so Start over's warning can name a
-        custom (non-default) stack that a fresh session would not re-discover."""
-        migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
-        return getattr(migration_state, "cdc_stack_name", None)
+        """Back-compat alias for :func:`_cdc_teardown_stack_name` (same resolution)."""
+        return _cdc_teardown_stack_name()
 
     def _cdc_teardown_in_flight() -> bool:
         """True when a CDC stop/delete is CURRENTLY running, so Start over must not
@@ -560,7 +596,11 @@ def build_page(
             endpoint = getattr(target, "cluster_endpoint", "") or ""
             if ".dsql." in endpoint and ".on.aws" in endpoint:
                 region = endpoint.split(".dsql.")[1].split(".on.aws")[0]
-        stack_name = getattr(migration_state, "cdc_stack_name", None)
+        # Resolve the SAME stack the offer was made about -- including a discovered
+        # stack under a name this session does not target. Reading cdc_stack_name
+        # directly here would target a non-existent name for exactly the case the
+        # offer now covers, i.e. delete nothing and leave MSK / NAT billing.
+        stack_name = _cdc_teardown_stack_name()
         if not region or not stack_name:
             return
         aws_profile = getattr(session, "aws_profile", None)
