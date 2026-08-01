@@ -1676,28 +1676,57 @@ def full_load_run_guard_reason(
 
 
 def _render_watermark(ui: object, job: MigrationJob) -> None:
-    """Render the export watermark for ``job`` (Requirement 8.5 / Property 11)."""
-    ui.label("Export watermark").classes("text-lg font-semibold")  # type: ignore[attr-defined]
+    """Render the export watermark for ``job`` (Requirement 8.5 / Property 11).
+
+    Compact by design: this is provenance the operator reads once (or copies into a
+    runbook), not something to watch, so it must not occupy the height a 4-row
+    two-column ``ui.table`` did -- complete with sortable "Field"/"Value" headers for
+    four fixed rows. Each coordinate is now a labelled monospace line inside one bordered
+    panel: the label identifies the field, the monospace value is scannable and
+    copy-pasteable, and unavailable fields are muted so the eye skips them instead of
+    reading "unavailable" as an error.
+    """
     if job.watermark is None:
+        ui.label("Export watermark").classes(  # type: ignore[attr-defined]
+            "text-sm font-semibold text-gray-700"
+        )
         ui.label(  # type: ignore[attr-defined]
             "The export consistency point is captured when the migration starts."
         ).classes("text-sm text-gray-500")
         return
 
     display = format_watermark(job.watermark)
-    ui.label(display.summary).classes("text-sm text-gray-700")  # type: ignore[attr-defined]
-
-    columns = [
-        {"name": "field", "label": "Field", "field": "field", "align": "left"},
-        {"name": "value", "label": "Value", "field": "value", "align": "left"},
-    ]
-    rows = [
-        {"field": "Binlog coordinate (file:position)", "value": display.coordinate},
-        {"field": "GTID set", "value": display.gtid},
-        {"field": "Server UUID", "value": display.server_uuid},
-        {"field": "Snapshot timestamp (UTC)", "value": display.snapshot_timestamp},
-    ]
-    ui.table(columns=columns, rows=rows).classes("w-full")  # type: ignore[attr-defined]
+    with ui.element("div").classes(  # type: ignore[attr-defined]
+        "w-full rounded-md border border-gray-200 bg-gray-50 p-3"
+    ):
+        with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+            ui.icon("bookmark").classes("text-gray-500 text-base")  # type: ignore[attr-defined]
+            ui.label("Export watermark").classes(  # type: ignore[attr-defined]
+                "text-sm font-semibold text-gray-800"
+            )
+            # The summary IS the identifying line (snapshot time + coordinate), so it
+            # sits on the header row rather than as a separate paragraph.
+            ui.label(display.summary).classes(  # type: ignore[attr-defined]
+                "text-xs text-gray-500 truncate"
+            )
+        for label, value in (
+            ("Snapshot (UTC)", display.snapshot_timestamp),
+            ("Binlog file:pos", display.coordinate),
+            ("GTID set", display.gtid),
+            ("Server UUID", display.server_uuid),
+        ):
+            # An unavailable coordinate is normal (binary logging off, or SHOW MASTER
+            # STATUS restricted on RDS/Aurora), so it is muted -- not styled like a
+            # missing required value.
+            unavailable = str(value).strip().lower() == _UNAVAILABLE
+            with ui.row().classes("items-baseline gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+                ui.label(label).classes(  # type: ignore[attr-defined]
+                    "text-xs text-gray-500 shrink-0 w-32"
+                )
+                ui.label(value).classes(  # type: ignore[attr-defined]
+                    "text-xs font-mono break-all "
+                    + ("text-gray-400 italic" if unavailable else "text-gray-800")
+                )
 
     if display.table_row_counts:
         approximate = getattr(job.watermark, "row_counts_approximate", False)
@@ -3116,11 +3145,18 @@ def _render_full_load_step(
 
     if job is not None:
         ui.separator()
-        # Static: captured once at run start, so its snapshot-row-counts expansion
-        # is not collapsed by the poll.
-        _render_watermark(ui, job)
-        # Live: per-table progress, caption, completeness, error log.
+        # Live FIRST: per-table progress, caption, completeness, error log. This is what
+        # the operator is watching, so it leads -- the watermark used to sit above it and
+        # pushed the progress table (and, on a finished run, the completeness verdict and
+        # any quarantine detail) below a block of static reference data.
         _live_detail()
+        # Static reference AFTER: the watermark is captured once at run start and never
+        # changes, so it reads as provenance/audit detail rather than something to watch.
+        # It stays OUTSIDE the refreshable region (only _live_detail re-renders on each
+        # ~1.5s poll tick), so its snapshot-row-counts expansion is still never collapsed
+        # by the poll -- the reason it was hoisted out in the first place holds either
+        # way, because order within the parent does not affect what the poll rebuilds.
+        _render_watermark(ui, job)
 
         # Terminal-only affordances (shown after the job finishes, on the full
         # refresh the poll triggers): the job-level failure reason and retry.
@@ -3130,7 +3166,17 @@ def _render_full_load_step(
                 job_error = job_manager.get_error(job.job_id)
             except JobNotFoundError:
                 job_error = None
-            if job_error:
+            # Suppress the raw job error when the ONLY problem is quarantine: the
+            # completeness banner above already gives the same facts and remedy in plain
+            # language, so this box added a third telling of "3 rows were dropped" -- in
+            # red, with an exception class name, contradicting the amber "the rest
+            # loaded" framing. A red "Load failed" also overstates a run whose only
+            # incompleteness is rows that can never load. Any REAL failure still shows
+            # it: that is a retryable error whose exact text matters.
+            _quarantine_only_error = _incomplete_is_quarantine_only(
+                job, migration_state.error_log
+            )
+            if job_error and not _quarantine_only_error:
                 render_notice(
                     ui,
                     tone="error",
@@ -3524,14 +3570,14 @@ def _rows_breakdown_tooltip(row: "FullLoadTableRow") -> str:
 def _format_attempts_cell(row: "FullLoadTableRow") -> str:
     """Attempts, with a plain-language error marker so no Errors column is needed.
 
-    ``"1"`` clean, ``"1 · 3 rows dropped"`` when rows were permanently quarantined, and
-    ``"1 · 3 errors"`` for other logged errors. "3 err" was cryptic -- it read like a
-    retry count and gave no hint that the number meant *rows the target will never
-    hold*, which is the one thing a reader scanning this column needs to notice.
+    ``"1"`` clean, ``"1 · 3 errors"`` when the table logged errors ("3 err" was cryptic --
+    it read like part of the retry count).
+
+    Quarantined rows are deliberately NOT repeated here: the same row's Status cell
+    already carries a "3 dropped" badge with the full explanation on hover, so saying it
+    again one column over was the same fact twice in one table row. A quarantine also
+    logs an error per dropped row, so those rows still surface here as an error count.
     """
-    if row.rows_quarantined:
-        noun = "row" if row.rows_quarantined == 1 else "rows"
-        return f"{row.attempts} · {row.rows_quarantined} {noun} dropped"
     if row.errors:
         noun = "error" if row.errors == 1 else "errors"
         return f"{row.attempts} · {row.errors} {noun}"
@@ -3961,22 +4007,12 @@ def _render_full_load_progress(
                 )
 
     if quarantined:
-        # Count ROWS, not table entries. ``quarantined`` holds one entry per TABLE (each
-        # carrying that table's latest message), so len() said "Quarantined rows (1)"
-        # for a table that dropped 3 -- contradicting the banner right below it, which
-        # counts rows. The per-chunk totals are the authority.
-        dropped_rows = sum(r.rows_quarantined for r in rows) or len(quarantined)
-        row_noun = "row" if dropped_rows == 1 else "rows"
-        table_noun = "table" if len(quarantined) == 1 else "tables"
+        # NO header notice here. The completeness banner below already states the verdict
+        # ("N rows permanently dropped (table)") and the remedy, and the summary chip +
+        # per-row Status badge state the count above -- a header repeating it made a
+        # 3-row drop announced in four boxes on one screen. This section's job is the
+        # per-row DETAIL (which row, why, and Reload), which nothing else provides.
         with ui.column().classes("w-full gap-2"):
-            render_notice(
-                ui,
-                tone="warning",
-                header=(
-                    f"{dropped_rows} {row_noun} permanently dropped across "
-                    f"{len(quarantined)} {table_noun} — the rest of each table loaded"
-                ),
-            )
             for row in quarantined:
                 _quarantine_detail_row(
                     ui,

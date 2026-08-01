@@ -5,6 +5,43 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.206
+
+### Changed
+
+- **Stopped announcing the same drop in eight places.** A 3-row quarantine was reported by
+  the summary chip, the row's Status badge, the Attempts cell, a section header, the
+  per-row card, the completeness banner, the data-error count *and* a red "Load failed"
+  box. Each box now owns one job:
+  - the **Attempts** cell no longer repeats it — the same row's Status badge already
+    carries a "3 dropped" chip with the explanation on hover, so it said the same fact
+    twice in one table row (other errors still show `1 · 3 errors`);
+  - the quarantine section's **count header** is gone; the section shows the per-row
+    detail (which row, why, Reload) that nothing else provides, and the banner states the
+    verdict;
+  - the red **"Load failed"** box is suppressed when quarantine is the *only*
+    incompleteness. It restated the banner in red with an exception class name and
+    contradicted the amber "the rest loaded" framing — and "failed" overstates a run whose
+    only gap is rows that can never load. A real failure still shows it, with its exact
+    text.
+- **The export watermark moved below the progress table and is now compact.** It sat
+  between the separator and the per-table progress, pushing the progress (and, on a
+  finished run, the completeness verdict and quarantine detail) below static reference
+  data. It is provenance read once, so it now follows the live detail — while still
+  rendering *outside* the refreshable region, so the ~1.5s poll cannot collapse its
+  row-counts expansion. The four fixed coordinates were a sortable two-column `ui.table`
+  with "Field"/"Value" headers for four rows; they are now labelled monospace lines in one
+  bordered panel, with the identifying summary on the header row and unavailable
+  coordinates muted rather than styled like a missing value. The per-table snapshot
+  counts stay a collapsed table — they are genuinely tabular.
+
+### Tests
+
+- Four mutations killed. One initially survived: the render-order assertion used
+  `src.index("_live_detail()")`, which matches the `def` line first and therefore passed
+  with the two calls swapped. It now compares the **call** line numbers via AST, verified
+  by swapping them.
+
 ## v0.1.205
 
 ### Fixed

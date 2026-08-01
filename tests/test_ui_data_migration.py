@@ -5499,18 +5499,15 @@ def test_rows_target_source_cell_and_attempts_cell() -> None:
         attempts=5, errors=3,
     )
     assert _format_attempts_cell(row_errs) == "5 · 3 errors"
-    # Permanently dropped rows say so explicitly -- that is the fact a reader scanning
-    # this column has to notice, and it outranks the generic error count.
+    # Quarantine is NOT repeated here: the same row's Status cell already carries a
+    # "3 dropped" badge, so naming it again one column over was the same fact twice in
+    # one table row. The error count still surfaces the rows.
     row_dropped = FullLoadTableRow(
         table="t", state="DONE", rows_loaded=12, expected_rows=15,
         attempts=1, errors=3, rows_quarantined=3,
     )
-    assert _format_attempts_cell(row_dropped) == "1 · 3 rows dropped"
-    row_one_dropped = FullLoadTableRow(
-        table="t", state="DONE", rows_loaded=14, expected_rows=15,
-        attempts=1, errors=1, rows_quarantined=1,
-    )
-    assert _format_attempts_cell(row_one_dropped) == "1 · 1 row dropped"
+    assert _format_attempts_cell(row_dropped) == "1 · 3 errors"
+    assert "dropped" not in _format_attempts_cell(row_dropped)
 
 
 def test_failed_table_names_lists_only_failed_chunks() -> None:
@@ -9923,11 +9920,14 @@ def test_quarantine_message_parsing_falls_back_for_unexpected_text() -> None:
     assert _parse_quarantined_pk("quarantined row pk[id=3 oops") is None
 
 
-def test_quarantine_header_counts_rows_not_tables() -> None:
-    """The header said "Quarantined rows (1)" while the banner below said 3 rows.
+def test_quarantine_section_has_no_duplicate_header() -> None:
+    """The quarantine section shows per-row DETAIL only -- no count header.
 
-    ``quarantined`` holds one entry per TABLE (each with that table's latest message), so
-    len() counted tables. Two boxes on the same screen disagreed about the same number.
+    A 3-row drop was announced in four boxes on one screen: the summary chip, the row's
+    Status badge, this section's header, and the completeness banner. The header was the
+    redundant one (it also once said "Quarantined rows (1)" for 3 rows, because the list
+    it measured holds one entry per TABLE). The banner owns the verdict + remedy; this
+    section owns what nothing else provides: which row, why, and Reload.
     """
     from dsql_migrator.core.models import ChunkState, MigrationJob
     from dsql_migrator.ui.data_migration import (
@@ -9953,8 +9953,179 @@ def test_quarantine_header_counts_rows_not_tables() -> None:
     )
 
     joined = " ".join(ui.labels + ui.badges)
-    # The old header counted table ENTRIES, not rows.
+    # No header notice -- neither the old table-count wording nor a row-count restatement.
     assert "Quarantined rows (1)" not in joined
-    # It now agrees with the banner: 3 rows, across 1 table.
-    header = next(l for l in ui.labels if "permanently dropped across" in l)
-    assert header.startswith("3 rows permanently dropped across 1 table")
+    assert "permanently dropped across" not in joined
+    # The per-row detail (the section's actual job) is still there.
+    assert "ecommerce.product_media" in joined
+    assert "id=3" in joined
+    # The verdict is NOT this function's job at all -- it belongs to the completeness
+    # banner, which is a sibling call. Assert it states it exactly once, so removing the
+    # header did not remove the count from the screen entirely.
+    from dsql_migrator.ui.data_migration import (
+        _render_completeness_banner,
+        full_load_completeness,
+    )
+
+    banner = _BannerUi()
+    _render_completeness_banner(banner, full_load_completeness(rows), approximate=False)
+    stated = [t for t in banner.texts if "3 rows permanently dropped" in t]
+    assert len(stated) == 1, stated
+
+
+# ---------------------------------------------------------------------------
+# Export watermark: compact provenance, not a sortable 4-row table
+# ---------------------------------------------------------------------------
+
+
+class _WatermarkUi:
+    """Records labels/icons and whether a ui.table was used for the fixed fields."""
+
+    def __init__(self) -> None:
+        self.labels: list[str] = []
+        self.icons: list[str] = []
+        self.tables = 0
+        self.expansions: list[str] = []
+
+    class _El:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: self
+
+    def label(self, text="", *_a, **_k):
+        if text:
+            self.labels.append(str(text))
+        return self._El()
+
+    def icon(self, text="", *_a, **_k):
+        if text:
+            self.icons.append(str(text))
+        return self._El()
+
+    def table(self, *_a, **_k):
+        self.tables += 1
+        return self._El()
+
+    def expansion(self, text="", *_a, **_k):
+        if text:
+            self.expansions.append(str(text))
+        return self._El()
+
+    def __getattr__(self, _name):
+        return lambda *_a, **_k: _WatermarkUi._El()
+
+
+def _watermark_job(*, gtid=None, counts=None):
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.models import MigrationJob, Watermark
+
+    job = MigrationJob(job_id="j1")
+    job.watermark = Watermark(
+        binlog_file="mysql-bin.000123", binlog_position=45678,
+        gtid_executed=gtid,
+        server_uuid="3E11FA47-71CA-11E1-9E33-C80AA9429562",
+        snapshot_timestamp=datetime(2026, 8, 1, 2, 30, 15, tzinfo=timezone.utc),
+        table_row_counts=counts or {},
+    )
+    return job
+
+
+def test_watermark_renders_labelled_fields_not_a_four_row_table() -> None:
+    """The watermark is provenance read once, so it must be compact.
+
+    It used a 4-row two-column ``ui.table`` -- complete with sortable "Field"/"Value"
+    headers for four fixed rows -- which took the height of a data grid to show four
+    values. Each field is now a labelled monospace line, so the label identifies it and
+    the value stays scannable and copy-pasteable.
+    """
+    from dsql_migrator.ui.data_migration import _render_watermark
+
+    ui = _WatermarkUi()
+    _render_watermark(ui, _watermark_job())
+
+    # No table for the fixed fields (the row-counts expansion is separate; absent here).
+    assert ui.tables == 0
+    # Every coordinate is present with its own label.
+    for label in ("Snapshot (UTC)", "Binlog file:pos", "GTID set", "Server UUID"):
+        assert label in ui.labels
+    assert "mysql-bin.000123:45678" in ui.labels
+    assert "3E11FA47-71CA-11E1-9E33-C80AA9429562" in ui.labels
+    # A leading icon + heading identify the section at a glance.
+    assert "bookmark" in ui.icons
+    assert "Export watermark" in ui.labels
+
+
+def test_watermark_keeps_the_row_counts_expansion_separate() -> None:
+    # Per-table snapshot counts are genuinely tabular and can be long, so they stay a
+    # collapsed table -- the compaction targets the four fixed fields only.
+    from dsql_migrator.ui.data_migration import _render_watermark
+
+    ui = _WatermarkUi()
+    _render_watermark(ui, _watermark_job(counts={"a": 5, "b": 45}))
+
+    assert ui.tables == 1  # the counts table, inside the expansion
+    assert any("Snapshot row counts" in e for e in ui.expansions)
+
+
+def test_watermark_without_a_capture_explains_itself() -> None:
+    from dsql_migrator.core.models import MigrationJob
+    from dsql_migrator.ui.data_migration import _render_watermark
+
+    ui = _WatermarkUi()
+    _render_watermark(ui, MigrationJob(job_id="j1"))
+
+    assert "Export watermark" in ui.labels
+    assert any("captured when the migration starts" in l for l in ui.labels)
+    assert ui.tables == 0
+
+
+def test_watermark_renders_after_the_progress_table() -> None:
+    """Provenance belongs below the live detail, not above it.
+
+    The watermark used to sit between the separator and the progress table, pushing the
+    per-table progress -- and on a finished run the completeness verdict and quarantine
+    detail -- below a block of static reference data. It must still stay OUTSIDE the
+    refreshable region, or the ~1.5s poll would collapse its row-counts expansion.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    src = inspect.getsource(dm._render_full_load_step)
+    tree = ast.parse(src)
+
+    # Compare the CALL sites, by line number. A naive src.index("_live_detail()") matches
+    # the `def _live_detail()` definition first, so it passed no matter which order the
+    # calls were in -- verified by swapping them.
+    def _call_line(name: str) -> int:
+        lines = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == name
+            # Exclude the call inside the nested poll handler (_live_detail.refresh()
+            # is an Attribute, not a Name, so only real invocations match here).
+        ]
+        assert lines, f"no call to {name}()"
+        return max(lines)  # the top-level render call is the last one
+
+    assert _call_line("_live_detail") < _call_line("_render_watermark"), (
+        "the watermark must render AFTER the live progress detail"
+    )
+
+    live = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_live_detail"
+    )
+    assert "_render_watermark" not in ast.unparse(live), (
+        "the watermark must not be inside the polled region"
+    )
