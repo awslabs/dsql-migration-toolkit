@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from enum import Enum
 import os
 import re
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 from dsql_migrator.core.models import StepStatus, WorkflowState
 from dsql_migrator.ui.design import (
@@ -1120,6 +1120,7 @@ def _open_start_over_dialog(
     cdc_deployed: bool = False,
     on_reset_cdc: Optional[Callable[[str], None]] = None,
     cdc_stack_name: Optional[str] = None,
+    cdc_stack_names: Optional[Sequence[str]] = None,
     cdc_teardown_in_flight: bool = False,
     cdc_op_in_flight: Optional[str] = None,
 ) -> None:
@@ -1212,37 +1213,74 @@ def _open_start_over_dialog(
             # like the wrong answer even when it is the right one. Naming it lets the
             # operator recognise a pipeline something else is using and leave it alone
             # deliberately.
-            named = f" ({cdc_stack_name})" if cdc_stack_name else ""
+            # Resolve the stack name(s) the teardown will really act on. The caller
+            # passes the full list; fall back to the single name for older callers.
+            targets = [str(n) for n in (cdc_stack_names or []) if str(n).strip()]
+            if not targets and cdc_stack_name:
+                targets = [cdc_stack_name]
+            plural = len(targets) > 1
+            named = f" ({', '.join(targets)})" if targets else ""
+            noun = "cdc-stacks" if plural else "cdc-stack"
             render_notice(
                 ui,
                 tone="warning",
-                header="A CDC pipeline is running on this account — what should happen "
-                "to it?",
+                header=(
+                    f"{len(targets)} CDC pipelines are running on this account — what "
+                    "should happen to them?"
+                    if plural
+                    else "A CDC pipeline is running on this account — what should happen "
+                    "to it?"
+                ),
                 body=(
-                    f"Start over only wipes this tool's session, but the cdc-stack"
-                    f"{named} keeps running on AWS (and billing). It may be the one this "
-                    "session deployed, or one left by an earlier session or in use by "
-                    "another window onto this account — the stack carries no owner, so "
-                    "the tool cannot tell. Leave it untouched if something else is using "
-                    "it."
+                    f"Start over only wipes this tool's session, but the {noun}"
+                    f"{named} keep{'' if plural else 's'} running on AWS (and billing). "
+                    + (
+                        "They may include the one this session deployed, plus others left "
+                        "by an earlier session or in use by another window onto this "
+                        "account"
+                        if plural
+                        else "It may be the one this session deployed, or one left by an "
+                        "earlier session or in use by another window onto this account"
+                    )
+                    + " — the stack carries no owner, so the tool cannot tell. Leave "
+                    + ("them" if plural else "it")
+                    + " untouched if something else is using "
+                    + ("them." if plural else "it.")
                 ),
             )
+            # NAME the stacks in the destructive tiles, not just in the notice above.
+            # "Delete all CDC infrastructure" does not say WHAT it deletes, and the one
+            # thing an operator needs in order to answer safely is which pipeline is
+            # about to be torn down -- especially when the account holds one they must
+            # not touch. The notice's name alone is easy to read as context for the
+            # question rather than as the delete target.
+            listed = ", ".join(targets)
+            scope = f" ({listed})" if targets else ""
             cdc_tiles_def = {
                 "stop": (
                     "Remove connectors, keep infrastructure",
-                    "Deletes only the 2 MSK connectors; MSK / VPC / IAM stay for a "
-                    "fast restart (idle billing continues). Recommended.",
+                    f"Deletes only the MSK connectors on {listed or 'the cdc-stack'}; "
+                    "MSK / VPC / IAM stay for a fast restart (idle billing continues). "
+                    "Recommended.",
                 ),
                 "delete": (
-                    "Delete all CDC infrastructure",
-                    "Tears down the whole stack — stops MSK / NAT billing, but it "
-                    "takes ~45 min to recreate later.",
+                    (
+                        f"Delete all CDC infrastructure{scope}"
+                        if not plural
+                        else f"Delete all {len(targets)} CDC stacks{scope}"
+                    ),
+                    "Tears down "
+                    + ("every stack listed" if plural else "the whole stack")
+                    + " — stops MSK / NAT billing, but it takes ~45 min to recreate "
+                    "later.",
                 ),
                 "none": (
                     "Leave CDC untouched",
                     "Nothing on AWS changes — the right choice when another window (e.g. "
-                    "the deployed app) is using this pipeline. Billing continues, and "
-                    "the migration type stays locked until the connectors are removed.",
+                    "the deployed app) is using "
+                    + ("these pipelines" if plural else "this pipeline")
+                    + ". Billing continues, and the migration type stays locked until "
+                    "the connectors are removed.",
                 ),
             }
 
@@ -1506,6 +1544,7 @@ def build_workflow_sidebar(
     on_reset_cdc: Optional[Callable[[str], None]] = None,
     cdc_deployed_getter: Optional[Callable[[], bool]] = None,
     cdc_stack_name_getter: Optional[Callable[[], Optional[str]]] = None,
+    cdc_stack_names_getter: Optional[Callable[[], Sequence[str]]] = None,
     cdc_teardown_in_flight_getter: Optional[Callable[[], bool]] = None,
     cdc_teardown_banner_getter: Optional[Callable[[], Optional[dict]]] = None,
     cdc_teardown_retry: Optional[Callable[[], None]] = None,
@@ -1707,6 +1746,9 @@ def build_workflow_sidebar(
                         on_reset_cdc=on_reset_cdc,
                         cdc_stack_name=(
                             cdc_stack_name_getter() if cdc_stack_name_getter else None
+                        ),
+                        cdc_stack_names=(
+                            cdc_stack_names_getter() if cdc_stack_names_getter else None
                         ),
                         cdc_teardown_in_flight=(
                             bool(cdc_teardown_in_flight_getter())

@@ -476,6 +476,69 @@ def cdc_attach_scope_mismatch(
     return sorted(name for name in loaded if name.lower() not in streamed)
 
 
+def cdc_teardown_stack_names(
+    *,
+    own_stack_name: "Optional[str]",
+    stack_phase: "Optional[str]",
+    connector_names: "Sequence[str]" = (),
+    other_stacks: "Sequence[tuple[str, str]]" = (),
+) -> "list[str]":
+    """The cdc-stack name(s) a Start-over teardown would act on, in order.
+
+    One list, used by BOTH the offer and the teardown, so the two can never disagree
+    about which stacks exist. Start over previously resolved a SINGLE name and adopted a
+    discovered stack only when there was exactly one: with two or more it fell back to
+    this session's own name, which in that branch does not exist -- so the dialog offered
+    "Delete all CDC infrastructure", the delete found nothing, and the operator was left
+    with MSK / NAT billing and a success toast. Returning every name it would really
+    touch removes that whole class of mismatch and lets the tiles NAME them, which is
+    the only way an operator can tell a pipeline they must not delete from one they can.
+
+    ``own_stack_name`` is included when this session actually targets a live stack --
+    i.e. the probe found a non-``absent`` phase, or connectors exist under that name.
+    Discovered stacks under other names (``other_stacks``) follow, de-duplicated and
+    order-stable so the UI listing and the teardown iterate identically. Pure.
+    """
+    names: list[str] = []
+    own = (own_stack_name or "").strip()
+    own_is_live = (stack_phase is not None and stack_phase != "absent") or bool(
+        [n for n in connector_names if n]
+    )
+    if own and own_is_live:
+        names.append(own)
+    for name, _status in other_stacks:
+        candidate = str(name).strip()
+        if candidate and candidate not in names:
+            names.append(candidate)
+    return names
+
+
+def cdc_teardown_plan(
+    stack_names: "Sequence[str]", *, cleanup_secret: bool
+) -> "list[tuple[str, bool]]":
+    """Per-stack teardown plan: ``[(stack_name, cleanup_secret), ...]``.
+
+    One entry per stack the offer covered -- tearing down only the first would contradict
+    the dialog, which now LISTS the stacks by name for the operator to confirm.
+
+    ``cleanup_secret`` is applied to the FIRST stack only. The tool-managed source
+    credentials secret is shared across stacks (it is created out-of-band, so
+    CloudFormation cannot own it); scheduling its deletion once per stack would retry a
+    delete on an already-scheduled secret for every extra stack. Pure.
+    """
+    plan: list[tuple[str, bool]] = []
+    for name in stack_names:
+        cleaned = str(name).strip()
+        if not cleaned:
+            continue
+        # Index into the KEPT entries, not the raw input: a leading blank/whitespace name
+        # would otherwise consume position 0 and the shared secret cleanup would be
+        # dropped entirely (nothing else ever schedules it, so the source credentials
+        # would linger in Secrets Manager).
+        plan.append((cleaned, cleanup_secret and not plan))
+    return plan
+
+
 def split_attachable_stacks(
     stacks: "Sequence[tuple[str, str]]",
 ) -> "tuple[list[tuple[str, str]], list[tuple[str, str]]]":

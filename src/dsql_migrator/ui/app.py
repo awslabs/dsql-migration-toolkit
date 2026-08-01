@@ -354,31 +354,41 @@ def build_page(
             return True
         return bool(getattr(migration_state, "cdc_other_stacks", None))
 
-    def _cdc_teardown_stack_name() -> Optional[str]:
-        """The cdc-stack a Start-over teardown would act on.
+    def _cdc_teardown_stack_names() -> list:
+        """EVERY cdc-stack a Start-over teardown would act on, in teardown order.
 
-        Prefers a stack this session actually targets (its own name, when the probe found
-        one), and otherwise falls back to a discovered stack under a DIFFERENT name. Both
-        the offer (:func:`_cdc_deployed`) and the teardown must resolve the SAME stack:
-        keying the offer off ``cdc_other_stacks`` while the teardown kept using
-        ``cdc_stack_name`` would have offered to delete a stack and then targeted a name
-        that does not exist -- a silent no-op that leaves MSK / NAT billing.
+        Delegates to the pure :func:`cdc_teardown_stack_names` so the offer
+        (:func:`_cdc_deployed`), the dialog's tile listing, and the teardown itself all
+        read one resolution -- they must never disagree about which stacks exist.
 
-        Only ONE discovered stack is adopted for teardown. With several, which to delete
-        is a real choice the operator has to make on the CDC step (each may be a separate
-        pipeline), so Start over must not pick for them.
+        This used to resolve a SINGLE name and adopt a discovered stack only when there
+        was exactly one; with two or more it fell back to this session's own name, which
+        in that branch does not exist. So the dialog offered "Delete all CDC
+        infrastructure", the delete found nothing, and the operator kept paying for MSK /
+        NAT behind a success toast. Every discovered stack is now returned and torn down.
         """
+        from dsql_migrator.ui.data_migration._status import cdc_teardown_stack_names
+
         migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
-        phase = getattr(migration_state, "cdc_stack_phase", None)
-        own = getattr(migration_state, "cdc_stack_name", None)
-        if phase is not None and phase != "absent":
-            return own
-        if getattr(migration_state, "cdc_connector_names", None):
-            return own
-        others = list(getattr(migration_state, "cdc_other_stacks", None) or [])
-        if len(others) == 1:
-            return others[0][0]
-        return own
+        return cdc_teardown_stack_names(
+            own_stack_name=getattr(migration_state, "cdc_stack_name", None),
+            stack_phase=getattr(migration_state, "cdc_stack_phase", None),
+            connector_names=getattr(migration_state, "cdc_connector_names", None) or [],
+            other_stacks=getattr(migration_state, "cdc_other_stacks", None) or [],
+        )
+
+    def _cdc_teardown_stack_name() -> Optional[str]:
+        """The FIRST cdc-stack a teardown would act on (or the session's own name).
+
+        Kept for the single-stack callers (the orphan-billing caution's custom-name
+        wording). Prefer :func:`_cdc_teardown_stack_names` anywhere the full set matters.
+        """
+        names = _cdc_teardown_stack_names()
+        if names:
+            return names[0]
+        return getattr(
+            DATA_MIGRATION_STORE.get_or_create(session_id), "cdc_stack_name", None
+        )
 
     def _cdc_stack_name() -> Optional[str]:
         """Back-compat alias for :func:`_cdc_teardown_stack_name` (same resolution)."""
@@ -596,27 +606,41 @@ def build_page(
             endpoint = getattr(target, "cluster_endpoint", "") or ""
             if ".dsql." in endpoint and ".on.aws" in endpoint:
                 region = endpoint.split(".dsql.")[1].split(".on.aws")[0]
-        # Resolve the SAME stack the offer was made about -- including a discovered
-        # stack under a name this session does not target. Reading cdc_stack_name
-        # directly here would target a non-existent name for exactly the case the
-        # offer now covers, i.e. delete nothing and leave MSK / NAT billing.
-        stack_name = _cdc_teardown_stack_name()
-        if not region or not stack_name:
+        # Act on EVERY stack the offer was made about -- the dialog now lists them by
+        # name, so tearing down only the first would contradict what the operator just
+        # read and confirmed. Reading cdc_stack_name directly here (or resolving a single
+        # name) targeted a non-existent stack whenever two or more were discovered:
+        # delete nothing, leave MSK / NAT billing, report success.
+        stack_names = _cdc_teardown_stack_names()
+        if not region or not stack_names:
             return
         aws_profile = getattr(session, "aws_profile", None)
         role_arn = getattr(migration_state, "cdc_deploy_role_arn", None)
         cleanup_secret = mode == "delete" and not getattr(
             session, "source_secret_id", None
         )
-        job_id = _launch_cdc_teardown(
-            migration_state,
-            mode=mode,
-            stack_name=stack_name,
-            region=region,
-            role_arn=role_arn,
-            aws_profile=aws_profile,
-            cleanup_secret=cleanup_secret,
-        )
+        # The durable marker tracks ONE teardown, so the banner follows the first stack
+        # and the rest are launched behind it. Only the first claims the marker (the
+        # ownership guard declines the others while it is still running); each still runs
+        # to completion as its own background job. The per-stack plan (including where the
+        # shared source-secret cleanup belongs) comes from the pure cdc_teardown_plan.
+        from dsql_migrator.ui.data_migration._status import cdc_teardown_plan
+
+        job_id = None
+        for stack_name, stack_cleanup_secret in cdc_teardown_plan(
+            stack_names, cleanup_secret=cleanup_secret
+        ):
+            launched = _launch_cdc_teardown(
+                migration_state,
+                mode=mode,
+                stack_name=stack_name,
+                region=region,
+                role_arn=role_arn,
+                aws_profile=aws_profile,
+                cleanup_secret=stack_cleanup_secret,
+            )
+            if job_id is None:
+                job_id = launched
         # The teardown runs in the background after the session resets; surface a
         # completion toast (the persistent banner also tracks it). If the marker was
         # not claimed (another teardown already running), poll whatever is tracked.
@@ -741,6 +765,7 @@ def build_page(
         on_reset_cdc=_cdc_teardown_on_reset,
         cdc_deployed_getter=_cdc_deployed,
         cdc_stack_name_getter=_cdc_stack_name,
+        cdc_stack_names_getter=_cdc_teardown_stack_names,
         cdc_teardown_in_flight_getter=_cdc_teardown_in_flight,
         cdc_teardown_banner_getter=_cdc_teardown_banner,
         cdc_teardown_retry=_cdc_teardown_retry,

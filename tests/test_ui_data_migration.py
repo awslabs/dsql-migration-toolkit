@@ -10735,13 +10735,88 @@ def test_start_over_offers_teardown_for_a_stack_under_another_name() -> None:
     assert "cdc_stack_phase" in body
 
 
-def test_start_over_teardown_targets_the_stack_it_offered() -> None:
-    """The offer and the teardown must resolve the SAME stack.
+def test_start_over_teardown_acts_on_every_stack_it_offered() -> None:
+    """The offer, the tile listing, and the teardown must resolve the SAME stacks.
 
-    Keying the offer off ``cdc_other_stacks`` while the teardown kept reading
-    ``cdc_stack_name`` would offer to delete a stack and then target a name that does not
-    exist -- a silent no-op that leaves the MSK / NAT running. Both now go through one
-    resolver.
+    The previous resolver returned a SINGLE name and adopted a discovered stack only when
+    there was exactly one. With two or more it fell back to this session's own name --
+    which, in that branch, is precisely the name that does NOT exist (the branch is
+    reached only when the probe found no stack under it). So Start over offered "Delete
+    all CDC infrastructure", the delete found nothing, and the operator was left paying
+    for MSK / NAT behind a success toast.
+    """
+    from dsql_migrator.ui.data_migration._status import cdc_teardown_stack_names
+
+    # The regression case: two discovered stacks, none under this session's own name.
+    two = cdc_teardown_stack_names(
+        own_stack_name="mysql-dsql-cdc-stack",
+        stack_phase=None,
+        connector_names=[],
+        other_stacks=[("cdc-a", "CREATE_COMPLETE"), ("cdc-b", "CREATE_COMPLETE")],
+    )
+    assert two == ["cdc-a", "cdc-b"], "both discovered stacks must be torn down"
+    assert "mysql-dsql-cdc-stack" not in two, (
+        "must not target a name the probe did not find"
+    )
+
+    # This session's own stack is included only when it is genuinely live, and comes
+    # first (the durable teardown marker/banner follows it).
+    assert cdc_teardown_stack_names(
+        own_stack_name="own", stack_phase="infra", connector_names=[],
+        other_stacks=[("cdc-a", "CREATE_COMPLETE")],
+    ) == ["own", "cdc-a"]
+    assert cdc_teardown_stack_names(
+        own_stack_name="own", stack_phase=None, connector_names=["own-debezium-source"],
+        other_stacks=[],
+    ) == ["own"]
+    # Nothing deployed -> nothing to tear down (so no offer, and no no-op delete).
+    assert cdc_teardown_stack_names(
+        own_stack_name="own", stack_phase="absent", connector_names=[], other_stacks=[],
+    ) == []
+    # A discovered stack that happens to match the own name is not listed twice.
+    assert cdc_teardown_stack_names(
+        own_stack_name="own", stack_phase="running", connector_names=[],
+        other_stacks=[("own", "CREATE_COMPLETE")],
+    ) == ["own"]
+
+
+def test_cdc_teardown_plan_covers_every_stack_and_cleans_the_secret_once() -> None:
+    """Behavioral cover for the two survivors of the structural guard above.
+
+    Two distinct mistakes, both invisible to a grep-style assertion:
+    * tearing down only the FIRST stack -- the operator confirmed a named list, so the
+      others would keep billing behind a success toast (the very bug being fixed);
+    * repeating the shared source-secret cleanup per stack -- it is created out-of-band
+      so CloudFormation cannot own it, and re-scheduling an already-scheduled secret
+      delete fails for every extra stack.
+    """
+    from dsql_migrator.ui.data_migration._status import cdc_teardown_plan
+
+    plan = cdc_teardown_plan(["cdc-a", "cdc-b", "cdc-c"], cleanup_secret=True)
+    # EVERY stack is torn down, in the offered order.
+    assert [name for name, _ in plan] == ["cdc-a", "cdc-b", "cdc-c"]
+    # The shared secret is cleaned exactly once, with the first stack.
+    assert [cleanup for _, cleanup in plan] == [True, False, False]
+
+    # cleanup_secret=False (e.g. the source used Secrets Manager) never turns it on.
+    assert cdc_teardown_plan(["cdc-a", "cdc-b"], cleanup_secret=False) == [
+        ("cdc-a", False),
+        ("cdc-b", False),
+    ]
+    # Blank/whitespace names are dropped rather than submitted as a delete of "".
+    assert cdc_teardown_plan(["", "  ", "cdc-a"], cleanup_secret=True) == [
+        ("cdc-a", True)
+    ]
+    assert cdc_teardown_plan([], cleanup_secret=True) == []
+
+
+def test_start_over_offer_and_teardown_share_one_resolver() -> None:
+    """Structural guard: both paths must call the shared resolver.
+
+    The offer (``_cdc_deployed``) and the teardown are in different functions, so a change
+    to one can silently desynchronise them -- which is how the no-op delete arose. The
+    teardown must also iterate ALL names, since the dialog now lists them by name and the
+    operator confirmed that list.
     """
     import ast
     import inspect
@@ -10749,34 +10824,40 @@ def test_start_over_teardown_targets_the_stack_it_offered() -> None:
     from dsql_migrator.ui import app as app_module
 
     tree = ast.parse(inspect.getsource(app_module))
-    resolver = next(
-        (
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_cdc_teardown_stack_name"
-        ),
-        None,
-    )
-    assert resolver is not None, "expected a single stack resolver"
-    resolved = ast.unparse(resolver)
-    # It prefers the session's own stack, and falls back to a discovered one.
-    assert "cdc_stack_phase" in resolved
-    assert "cdc_other_stacks" in resolved
-    # With SEVERAL discovered stacks it must not pick one -- that is the operator's
-    # choice on the CDC step, since each may be a separate pipeline.
-    assert "len(others) == 1" in resolved
-
-    teardown = next(
-        node
+    by_name = {
+        node.name: node
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_cdc_teardown_on_reset"
+        if isinstance(node, ast.FunctionDef)
+    }
+
+    resolver = ast.unparse(by_name["_cdc_teardown_stack_names"])
+    # It reads all three signals the offer reads, and delegates to the pure helper.
+    for signal in ("cdc_stack_phase", "cdc_connector_names", "cdc_other_stacks"):
+        assert signal in resolver, signal
+    assert "cdc_teardown_stack_names(" in resolver
+
+    teardown = ast.unparse(by_name["_cdc_teardown_on_reset"])
+    assert "_cdc_teardown_stack_names()" in teardown, (
+        "the teardown must resolve stacks the same way the offer did"
     )
-    teardown_body = ast.unparse(teardown)
-    assert "_cdc_teardown_stack_name()" in teardown_body, (
-        "the teardown must resolve the stack the same way the offer did"
+    # It must hand the WHOLE resolved list to the plan builder. This lives inside
+    # build_page's closure, so it cannot be called directly -- and the failure mode is
+    # silent (extra stacks keep billing behind a success toast), so assert on the call
+    # shape: cdc_teardown_plan(stack_names, ...) with stack_names passed unsliced.
+    plan_calls = [
+        node
+        for node in ast.walk(by_name["_cdc_teardown_on_reset"])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "cdc_teardown_plan"
+    ]
+    assert len(plan_calls) == 1, "expected exactly one cdc_teardown_plan call"
+    first_arg = plan_calls[0].args[0]
+    assert isinstance(first_arg, ast.Name) and first_arg.id == "stack_names", (
+        "the teardown must pass every resolved stack to the plan, unsliced "
+        f"(got {ast.unparse(first_arg)})"
     )
-    assert "getattr(migration_state, 'cdc_stack_name', None)" not in teardown_body, (
+    assert "getattr(migration_state, 'cdc_stack_name', None)" not in teardown, (
         "the teardown must not fall back to the session's own name directly"
     )
 
@@ -11250,3 +11331,138 @@ def test_sink_mcu_falls_back_instead_of_blocking_a_deploy() -> None:
         assert _sink_mcu_count() == CDC_DEFAULT_SINK_MCU_COUNT
     finally:
         cfg.load_config = original  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# Start CDC notice: the table set is already locked, so the copy must not tell
+# the user to go pick tables -- and must name the remedy that actually works.
+# ---------------------------------------------------------------------------
+
+
+def test_start_cdc_button_only_renders_when_the_picker_is_already_locked() -> None:
+    """Establishes the premise behind the notice copy: the set is ALWAYS frozen here.
+
+    ``_render_cdc_start_button`` is called only for card phase ``"infra"``, which needs a
+    probed ``cdc_stack_phase == "infra"``; that makes ``cdc_infra_prep_state`` return
+    ``"ready"``, which is exactly what ``selection_lock_reason``'s CDC clause locks on.
+    The clause is scoped to types with a ``"cdc"`` sub-step -- and those are the only
+    types that can reach this button. So "pick all your tables before you start" was
+    advice the operator could not act on: the checkboxes were disabled while the tip
+    pointed at them.
+    """
+    from dsql_migrator.ui.data_migration import selection_lock_reason
+    from dsql_migrator.ui.data_migration._cdc_ui import (
+        cdc_infra_prep_state,
+        classify_cdc_card_phase,
+    )
+    from dsql_migrator.ui.data_migration._models import MigrationType, substeps_for_type
+    from dsql_migrator.ui.workflow import StepStatus
+
+    state = DataMigrationState()
+    state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+    jm = _StubJobManager({})
+
+    assert (
+        classify_cdc_card_phase(
+            [], state.cdc_stack_name, state.cdc_stack_phase,
+            running_names=[], failed_names=[],
+        )
+        == "infra"
+    )
+    assert cdc_infra_prep_state(state, jm) == "ready"
+
+    cdc_types = [t for t in MigrationType if "cdc" in substeps_for_type(t)]
+    assert cdc_types
+    for mtype in cdc_types:
+        assert selection_lock_reason(
+            state, jm, status=StepStatus.NOT_STARTED,
+            migration_type=mtype, has_job=False,
+        ), f"picker unexpectedly unlocked for {mtype}"
+
+
+def test_full_load_committed_tracks_the_lock_clause_that_start_over_owns() -> None:
+    """Which remedy the notice may offer depends on WHICH lock applies.
+
+    ``selection_lock_reason``'s Full-Load clause takes precedence and -- unlike the CDC
+    clause -- deleting the cdc-stack does NOT release it, because the export really did
+    run against this set. Verified directly below, since this is the fact that makes the
+    two remedies non-interchangeable.
+    """
+    from dsql_migrator.ui.data_migration import selection_lock_reason
+    from dsql_migrator.ui.data_migration._cdc_ui import _full_load_committed
+    from dsql_migrator.ui.data_migration._models import MigrationType
+    from dsql_migrator.ui.workflow import StepStatus
+
+    jm = _StubJobManager({})
+
+    # Deleting the CDC infra (phase back to absent) does NOT unlock a session whose
+    # Full Load already finished -- so "delete the infrastructure to re-scope" would be
+    # a ~45 min teardown that changes nothing about the picker.
+    torn_down = DataMigrationState()
+    assert selection_lock_reason(
+        torn_down, jm, status=StepStatus.DONE,
+        migration_type=MigrationType.FULL_LOAD_AND_CDC, has_job=False,
+    ), "a finished Full Load must stay locked after a CDC teardown"
+
+    # ... whereas a CDC-only session IS released by that teardown.
+    assert selection_lock_reason(
+        torn_down, jm, status=StepStatus.NOT_STARTED,
+        migration_type=MigrationType.CDC_ONLY, has_job=False,
+    ) is None
+
+    # The helper the notice branches on agrees, and never claims a Full Load for a
+    # migration type that has no Full Load step.
+    class _Job:
+        pass
+
+    for mtype in MigrationType:
+        state = DataMigrationState()
+        state.migration_type = mtype
+        assert _full_load_committed(None, state) is False
+        expected = mtype is not MigrationType.CDC_ONLY
+        assert _full_load_committed(_Job(), state) is expected, mtype
+
+
+def test_start_cdc_notice_points_at_start_over_after_a_full_load() -> None:
+    """Renders the REAL notice and asserts on the emitted text, not the source.
+
+    Two situations, two remedies: after a Full Load only Start over re-scopes, while a
+    CDC-only session can delete + redeploy the infrastructure.
+    """
+    from dsql_migrator.ui.data_migration import _cdc_ui
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    class _Job:
+        status = "DONE"
+        watermark = None
+
+    def _render(*, job, mtype):
+        ui = _RecordingUi()
+        state = DataMigrationState()
+        state.migration_type = mtype
+        state.set_cdc_stack_phase("infra", status="CREATE_COMPLETE")
+        state.job_id = "job-1" if job is not None else None
+        jm = _StubJobManager({"job-1": job} if job is not None else {})
+        _cdc_ui._render_cdc_start_button(
+            ui, state, jm, lambda: None, inventory=None, session=None
+        )
+        return " ".join(ui.texts)
+
+    # Full Load + CDC, load finished -> Start over is the only real exit.
+    after_load = _render(job=_Job(), mtype=MigrationType.FULL_LOAD_AND_CDC)
+    assert "This table set is now fixed" in after_load
+    assert "Start over" in after_load
+    assert "delete the CDC infrastructure" not in after_load
+    # It also explains WHY the set matches the snapshot (the gapless handoff).
+    assert "gapless" in after_load
+
+    # CDC-only, no Full Load -> deleting the infrastructure genuinely re-scopes.
+    cdc_only = _render(job=None, mtype=MigrationType.CDC_ONLY)
+    assert "This table set is now fixed" in cdc_only
+    assert "delete the CDC infrastructure" in cdc_only
+    assert "Start over" not in cdc_only
+
+    # Neither variant tells the operator to go pick tables (the picker is locked).
+    for blob in (after_load, cdc_only):
+        assert "Pick all your tables" not in blob
+        assert "up front" not in blob

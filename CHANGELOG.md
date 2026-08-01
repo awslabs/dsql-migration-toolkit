@@ -5,6 +5,44 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.214
+
+### Fixed
+
+- **Start over offered "Delete all CDC infrastructure" and then deleted nothing when the
+  account held two or more cdc-stacks.** The offer counted every discovered stack, but the
+  teardown resolved a *single* name and adopted a discovered stack only when there was
+  exactly one — with several it fell back to this session's own stack name, which in that
+  branch is precisely the name the probe did **not** find. So the delete found no stack,
+  reported success, and the operator kept paying for MSK / NAT with nothing in the tool
+  pointing at it. The offer, the dialog's listing and the teardown now share one resolver
+  and act on **every** stack. The shared source-credentials secret is still cleaned up
+  exactly once (it is created out-of-band, so re-scheduling its delete per stack would
+  fail for each extra one).
+
+- **The Start over teardown tiles now name the cdc-stacks they would delete.** "Delete all
+  CDC infrastructure" did not say *what* it deletes. Because a stack carries no owner tag,
+  the account may hold a pipeline another window is using — and the tool cannot tell — so
+  the name is the only thing that lets an operator answer safely. The name appeared in the
+  notice above the tiles, but there it reads as context for the question rather than as
+  the delete target. Both destructive tiles now carry the names (and the count, when there
+  is more than one), and the wording switches to plural throughout.
+
+- **The Start CDC tip told the operator to pick their tables at a point where the picker is
+  already locked.** "Pick all your tables before you start … Choosing everything you need
+  up front keeps this smooth" rendered only for card phase `infra`, which requires a probed
+  `cdc_stack_phase` of `infra` — exactly the condition `selection_lock_reason` freezes the
+  table picker on, for every migration type that can reach the button. The checkboxes were
+  disabled while the tip pointed at them.
+
+  It now states the fact and the remedy that actually works, which differs by situation:
+  after a Full Load, only **Start over** re-scopes (the Full-Load lock clause takes
+  precedence and is *not* released by deleting the cdc-stack, so the previous draft of this
+  fix would have sent the operator through a ~45 min teardown that left the picker just as
+  locked); for a CDC-only session, deleting and redeploying the infrastructure genuinely
+  does. The after-a-Full-Load wording also explains *why* the set is fixed — it matches the
+  snapshot, which is what makes the handoff gapless.
+
 ## v0.1.213
 
 ### Added

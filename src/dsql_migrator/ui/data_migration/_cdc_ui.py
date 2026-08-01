@@ -1479,11 +1479,26 @@ def _render_cdc_start_button(
             "current selection."
         )
 
-    # Escalate the "pick your tables first" guidance ONLY once connectors have
-    # actually existed before (a prior Start/Stop this session or a restored run):
-    # that is when repeated create/delete has begun consuming MSK's non-reclaimed
-    # partition capacity, so the caution is real. On the FIRST start after a fresh
-    # deploy it is just a calm heads-up (info) -- not an alarm on the happy path.
+    # State the CONFIRMED table set and the remedy that ACTUALLY works -- do NOT advise
+    # "pick all your tables up front". By the time this button renders the set is
+    # already frozen: the button only appears for card phase "infra", which requires a
+    # probed cdc_stack_phase of "infra", which makes cdc_infra_prep_state() "ready",
+    # which is exactly what selection_lock_reason's CDC clause locks the picker on (the
+    # CDC-bearing types are the only ones with a "cdc" sub-step, so there is no
+    # reachable state where this renders with the picker still open). Telling the
+    # operator to choose everything up front was advice they could not act on -- the
+    # checkboxes were disabled while the tip pointed at them.
+    #
+    # The remedy depends on WHICH lock applies, and the two are not interchangeable:
+    #   * Full Load already ran -> its clause wins and is NOT released by deleting the
+    #     CDC stack (the export ran against this set; that fact is permanent). Only
+    #     Start over clears it. Saying "delete the CDC infrastructure to re-scope" here
+    #     would send the operator through a ~45 min teardown that leaves the picker
+    #     exactly as locked as before.
+    #   * CDC-only (no Full Load) -> the CDC clause is the only one, and deleting the
+    #     infrastructure genuinely does release it.
+    # So mirror selection_lock_reason's own precedence rather than assuming one exit.
+    full_load_ran = _full_load_committed(job, migration_state)
     started_before = bool(getattr(migration_state, "cdc_connector_names", None))
     if started_before:
         render_notice(
@@ -1495,22 +1510,28 @@ def _render_cdc_start_button(
                 f"{selection_line} Each restart re-creates connectors, and MSK's "
                 "limited capacity isn't freed up between runs — so repeated "
                 "start/stop cycles can eventually require deleting and redeploying "
-                "the CDC infrastructure. Confirm the table set is final before "
-                "starting again."
+                "the CDC infrastructure. Check the set above is the one you want "
+                "before starting again."
             ),
         )
     else:
         render_notice(
             ui,
             tone="info",
-            icon="tips_and_updates",
-            header="Pick all your tables before you start",
+            icon="playlist_add_check",
+            header="This table set is now fixed",
             body=(
-                f"{selection_line} Changing the set later means re-creating "
-                "connectors, and each connector uses some of MSK's limited "
-                "capacity that isn't freed up again — so many restarts can "
-                "eventually require redeploying the CDC infrastructure. Choosing "
-                "everything you need up front keeps this smooth."
+                f"{selection_line} Each table's Kafka topic partitions were sized when "
+                "the infrastructure was created and cannot be changed, and MSK does not "
+                "reclaim that capacity — so the set is locked from here. "
+                + (
+                    "It matches the Full Load snapshot, which is what makes the handoff "
+                    "gapless. Streaming a different set means a fresh migration: use "
+                    "'Start over' (top right)."
+                    if full_load_ran
+                    else "To stream a different set, delete the CDC infrastructure "
+                    "below and deploy it again for the tables you want."
+                )
             ),
         )
 
@@ -2546,6 +2567,34 @@ def _open_cdc_delete_dialog(ui, migration_state, on_confirm, *, session=None) ->
         with ui.row().classes("justify-end gap-2 w-full"):  # type: ignore[attr-defined]
             ui.button("Cancel", on_click=dialog.close).props("flat")  # type: ignore[attr-defined]
     dialog.open()
+
+def _full_load_committed(job, migration_state) -> bool:
+    """True when a Full Load has run for this table set (so its lock clause wins).
+
+    Mirrors ``selection_lock_reason``'s FIRST clause (``has_job or status is DONE``),
+    which takes precedence over the CDC-infrastructure clause -- and, unlike it, is NOT
+    released by deleting the cdc-stack. The distinction decides which remedy the CDC
+    notices may offer: telling an operator who has already loaded to "delete the CDC
+    infrastructure to re-scope" would cost a ~45 min teardown and leave the picker just
+    as locked, because the export really did run against this set (only Start over
+    clears that).
+
+    ``job`` is the current Full Load job (the caller already resolved it) -- its mere
+    existence is the lock's ``has_job``. A migration type without a ``"full_load"``
+    sub-step can never trip that clause, so CDC-only is excluded outright rather than
+    inferred. Deliberately conservative: when unsure this returns False, which offers
+    the cheaper (delete-and-redeploy) remedy -- wrong-but-recoverable, versus sending
+    someone to Start over who did not need it.
+    """
+    from dsql_migrator.ui.data_migration._models import substeps_for_type
+
+    try:
+        if "full_load" not in substeps_for_type(migration_state.migration_type):
+            return False
+    except Exception:  # noqa: BLE001 - unknown type: fall through to the job check
+        pass
+    return job is not None
+
 
 def _sink_mcu_count() -> int:
     """The operator's configured sink MCU count, read FRESH at deploy time.

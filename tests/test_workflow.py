@@ -1002,6 +1002,17 @@ class _DialogUi:
     def dialog(self, *_a, **_k):
         return self._El(self)
 
+    def refreshable(self, fn):
+        # The CDC teardown tiles render inside an @ui.refreshable. NiceGUI's decorator
+        # returns a wrapper that renders when CALLED and carries .refresh(); mirror that
+        # so the tile text is actually emitted (without this the whole tiles branch was
+        # unreachable from tests -- an AttributeError, not a silent skip).
+        def _wrapper(*a, **k):
+            return fn(*a, **k)
+
+        _wrapper.refresh = lambda *a, **k: None  # type: ignore[attr-defined]
+        return _wrapper
+
     def open(self):  # dialog.open() is called on the returned _El in real code;
         self.dialog_opened = True  # our _El has no open(), so this is unused — kept
 
@@ -1362,3 +1373,47 @@ def test_connection_nav_state_agrees_with_the_reconnect_banner() -> None:
     for state in (fresh, restored):
         expects_reconnect = reconnect_notice(state) is not None
         assert (connection_nav_state(state) == "reconnect") is expects_reconnect
+def test_start_over_tiles_name_the_stacks_they_would_delete() -> None:
+    """"Delete all CDC infrastructure" must say WHAT it deletes.
+
+    The account can hold a pipeline the operator must NOT touch (another window's), and
+    the stack carries no owner tag, so the tool cannot decide for them. The name is the
+    only thing that lets them answer safely -- and in the notice alone it reads as context
+    for the question rather than as the delete target.
+    """
+    ui = _render_start_over_dialog(
+        cdc_deployed=True,
+        on_reset_cdc=lambda _mode: None,
+        cdc_stack_name="cdc-a",
+        cdc_stack_names=["cdc-a", "cdc-b"],
+    )
+    blob = " ".join(ui.texts)
+    # Both names appear on the destructive choice itself, not only in the notice.
+    delete_tile = next(t for t in ui.texts if t.startswith("Delete all"))
+    assert "cdc-a" in delete_tile and "cdc-b" in delete_tile
+    # The count is stated rather than a bare "all".
+    assert "2" in delete_tile
+    # Plural wording throughout, and the reset is still executable.
+    assert "2 CDC pipelines are running" in blob
+    assert ui.click_wired
+    # The notice above the tiles also names them: it is what explains that a pipeline may
+    # belong to another window, so it cannot fall back to a generic "the cdc-stack".
+    notice = next(t for t in ui.texts if "keeps running on AWS" in t or "keep running on AWS" in t)
+    assert "cdc-a" in notice and "cdc-b" in notice
+
+    # Single stack: named, singular wording.
+    one = _render_start_over_dialog(
+        cdc_deployed=True,
+        on_reset_cdc=lambda _mode: None,
+        cdc_stack_name="cdc-solo",
+        cdc_stack_names=["cdc-solo"],
+    )
+    solo_blob = " ".join(one.texts)
+    solo_tile = next(t for t in one.texts if t.startswith("Delete all"))
+    assert "cdc-solo" in solo_tile
+    assert "A CDC pipeline is running" in solo_blob
+    assert "2 CDC pipelines" not in solo_blob
+    solo_notice = next(t for t in one.texts if "keeps running on AWS" in t)
+    assert "cdc-solo" in solo_notice
+
+
