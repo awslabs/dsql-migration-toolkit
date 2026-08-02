@@ -452,6 +452,7 @@ def build_data_migration_screen(
                 migrator=migrator,
                 error_log=error_log,
                 accept_quarantined_rows=migration_state.accept_quarantined_rows,
+                inputs=inputs,
             )
 
         migration_state.job_id = job_manager.submit(work)
@@ -1051,6 +1052,7 @@ def build_data_migration_screen(
                         error_log=error_log,
                         watermark=watermark,
                         accept_quarantined_rows=accept_quarantined,
+                        inputs=retry_inputs,
                     )
 
                 migration_state.job_id = job_manager.submit(work)
