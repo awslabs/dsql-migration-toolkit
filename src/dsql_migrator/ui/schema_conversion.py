@@ -1522,6 +1522,16 @@ class SchemaConversionState:
         # Generation is gated: previews render only for ``generated_node_ids``.
         self.ticked_node_ids: list[str] = []
         self.generated_node_ids: Optional[list[str]] = None
+        # Which OBJECT-BROWSER tree nodes are expanded. The tree is rebuilt on every
+        # render (Generate DDL, an apply, the progress poll), and NiceGUI's tree keeps
+        # its open/closed state client-side -- so without restoring it the whole tree
+        # snapped shut the moment the user pressed "Generate DDL for selected", hiding
+        # the very tables they had just drilled into and ticked. Ticks were already
+        # carried across; expansion was the missing half.
+        self.expanded_node_ids: list[str] = []
+        # Same, for the TARGET browser pane: it is what the operator compares against
+        # while working, so a Generate/apply must not discard where they navigated to.
+        self.target_expanded_node_ids: list[str] = []
         # Whether the generated-object expansions render expanded (Expand all /
         # Collapse all toggle). UI-only; defaults to collapsed so a long list is
         # scannable via each header's status summary before opening one.
@@ -3091,12 +3101,20 @@ def _render_browser_and_preview(
                     value = getattr(event, "value", None)
                     conv_state.ticked_node_ids = list(value) if value else []
 
+                def on_expand(event: object) -> None:
+                    # Record the open nodes so the next render can restore them. The
+                    # tree is rebuilt on Generate / apply / poll, and its open state
+                    # lives client-side, so anything not restored here collapses.
+                    value = getattr(event, "value", None)
+                    conv_state.expanded_node_ids = list(value) if value else []
+
                 tree = ui.tree(  # type: ignore[attr-defined]
                     source_nodes,
                     label_key="label",
                     node_key="id",
                     tick_strategy="leaf",
                     on_tick=on_tick,
+                    on_expand=on_expand,
                 )
                 tree.props("no-connectors")  # type: ignore[attr-defined]
                 src_filter.bind_value_to(tree, "filter")  # type: ignore[attr-defined]
@@ -3123,6 +3141,12 @@ def _render_browser_and_preview(
                 # the ticked set across refreshes (the tree is rebuilt on Generate).
                 if conv_state.ticked_node_ids:
                     tree.tick(list(conv_state.ticked_node_ids))
+                # Restore the OPEN nodes for the same reason. Pressing "Generate DDL for
+                # selected" re-renders the screen, so without this the tree snapped back
+                # to fully collapsed and hid the tables the user had just drilled into --
+                # exactly the rows they were working with.
+                if conv_state.expanded_node_ids:
+                    tree.expand(list(conv_state.expanded_node_ids))
                 if apply_in_progress:
                     # Freeze the selection: the apply worker was handed a fixed
                     # object list at start, so re-ticking cannot change what it
@@ -3178,11 +3202,28 @@ def _render_browser_and_preview(
                 "w-full bg-white rounded-md border border-gray-200"
             ).style("height: 340px"):
                 if target_nodes:
+
+                    def on_target_expand(event: object) -> None:
+                        value = getattr(event, "value", None)
+                        conv_state.target_expanded_node_ids = (
+                            list(value) if value else []
+                        )
+
                     tgt_tree = ui.tree(  # type: ignore[attr-defined]
-                        target_nodes, label_key="label", node_key="id"
+                        target_nodes,
+                        label_key="label",
+                        node_key="id",
+                        on_expand=on_target_expand,
                     )
                     tgt_tree.props("no-connectors")  # type: ignore[attr-defined]
                     tgt_filter.bind_value_to(tgt_tree, "filter")  # type: ignore[attr-defined]
+                    # Same rebuild-collapses-it problem as the source tree: this pane is
+                    # for comparing against the target while working, so a Generate or an
+                    # apply must not throw away where the operator had navigated to.
+                    if conv_state.target_expanded_node_ids:
+                        tgt_tree.expand(  # type: ignore[attr-defined]
+                            list(conv_state.target_expanded_node_ids)
+                        )
                 else:
                     ui.label(  # type: ignore[attr-defined]
                         "No target objects to browse yet. Run Step 1 "

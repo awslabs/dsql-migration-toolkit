@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.225
+
+### Fixed
+
+- **The object browser collapsed to its initial state when you pressed "Generate DDL for
+  selected".** Expanding a schema to find and tick its tables, then generating, threw the
+  tree shut — hiding the very rows you had just been working with. The tree is rebuilt on
+  every render (Generate, an apply, the progress poll) and NiceGUI keeps its open/closed
+  state client-side, so anything not restored in Python snaps back to collapsed. The ticked
+  set was already carried across renders; expansion was the missing half. Both browser
+  panes (source and target) now record and restore it. "Clear" still discards the generated
+  DDL, edits and AI suggestions — but not where you had navigated to, which is not analysis.
+
 ## v0.1.224
 
 ### Fixed

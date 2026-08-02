@@ -2873,3 +2873,72 @@ def test_apply_card_button_shows_progress_label_while_applying() -> None:
     ui = _render_apply_card(7, in_progress=True)
     assert "Applying…" in ui.buttons
     assert not any(b.startswith("Apply all") for b in ui.buttons)
+
+
+# ---------------------------------------------------------------------------
+# Object browser: expansion must survive a re-render (Generate DDL / apply / poll)
+# ---------------------------------------------------------------------------
+
+
+def test_object_browser_trees_restore_their_expansion_after_a_rerender() -> None:
+    """Pressing "Generate DDL for selected" collapsed the whole tree.
+
+    The tree is rebuilt on every render (Generate, an apply, the progress poll) and
+    NiceGUI's tree keeps open/closed state CLIENT-side, so anything not restored in Python
+    snaps shut -- hiding the very tables the operator had just drilled into and ticked.
+    Ticks were already carried across; expansion was the missing half. The target pane has
+    the same problem: it is what the operator compares against while working.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as module
+
+    src = inspect.getsource(module)
+    tree = ast.parse(src)
+
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "tree"
+    ]
+    assert len(calls) == 2, f"expected the source + target trees, found {len(calls)}"
+    # BOTH trees record their open nodes...
+    for call in calls:
+        kwargs = {kw.arg for kw in call.keywords if kw.arg}
+        assert "on_expand" in kwargs, (
+            f"ui.tree at line {call.lineno} does not record expansion"
+        )
+    # ...and both restore them on the next render.
+    expands = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "expand"
+    ]
+    assert len(expands) == 2, f"expected two .expand() restores, found {len(expands)}"
+
+
+def test_expansion_state_defaults_empty_and_survives_clear() -> None:
+    """Fresh state starts collapsed; "Clear" discards ANALYSIS, not navigation.
+
+    reset_generation() drops the generated DDL, edits and AI suggestions -- but where the
+    operator had navigated to in the browser is not analysis, and collapsing the tree on
+    Clear would repeat the bug this fixes.
+    """
+    from dsql_migrator.ui.schema_conversion import SchemaConversionState
+
+    state = SchemaConversionState()
+    assert state.expanded_node_ids == []
+    assert state.target_expanded_node_ids == []
+
+    state.expanded_node_ids = ["ecommerce", "ecommerce.orders"]
+    state.target_expanded_node_ids = ["public"]
+    state.generated_node_ids = ["ecommerce.orders"]
+    state.reset_generation()
+    assert state.generated_node_ids is None  # analysis discarded
+    assert state.expanded_node_ids == ["ecommerce", "ecommerce.orders"]
+    assert state.target_expanded_node_ids == ["public"]
