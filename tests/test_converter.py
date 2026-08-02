@@ -1350,3 +1350,337 @@ def test_decimal_scale_is_clamped_and_never_exceeds_the_precision() -> None:
     clamped_both, warning_both = spec("DECIMAL(65,60)")
     precision, scale = (int(x) for x in clamped_both.split(","))
     assert precision == 38 and scale <= precision and warning_both is not None
+
+
+# ---------------------------------------------------------------------------
+# Conversion must not silently drop what Evaluation rated most severe
+# ---------------------------------------------------------------------------
+
+
+def test_fulltext_index_conversion_reports_the_lost_capability() -> None:
+    """A FULLTEXT index converted to the SAME DDL as an ordinary one, with no note.
+
+    Every secondary index is emitted as ``CREATE INDEX ASYNC``, which for FULLTEXT is not
+    an equivalent -- it is a plain B-tree on the same column, and the ``MATCH ... AGAINST``
+    queries the index existed for cannot use it. Evaluation rates this UNSUPPORTED /
+    SIGNIFICANT (its most severe), so an operator reading only the conversion screen had no
+    sign that a full-text search feature had just been dropped.
+    """
+    from dsql_migrator.core.converter import (
+        ConversionNoteKind,
+        SchemaConverter,
+        SchemaConvertOptions,
+    )
+    from dsql_migrator.core.models import Classification, ColumnDef, IndexDef, TableDef
+
+    table = TableDef(
+        name="ecommerce.products",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="body", mysql_type="text", nullable=True),
+        ],
+        primary_key=["id"],
+        indexes=[
+            IndexDef(name="ft_body", columns=["body"], unique=False, index_type="FULLTEXT"),
+        ],
+    )
+    result = SchemaConverter().convert_table(table, SchemaConvertOptions())
+    notes = [w for w in result.warnings if "FULLTEXT" in w.message]
+    assert notes, "a FULLTEXT index must not convert silently"
+    note = notes[0]
+    # LOSS, not RECOMMENDATION: there is no target-side substitute, unlike partitioning
+    # (where DSQL's own distribution replaces the mechanism).
+    assert note.kind is ConversionNoteKind.LOSS
+    assert note.classification is Classification.UNSUPPORTED
+    assert "ft_body" in note.message
+    # It says what actually happens (the index IS created) and what to do instead.
+    assert "not an equivalent" in note.message.lower() or "NOT an equivalent" in note.message
+    assert "OpenSearch" in note.message
+    # The DDL is unchanged -- this adds a note, it does not alter output.
+    assert any("ft_body" in ddl for ddl in result.index_ddls)
+
+
+def test_spatial_index_is_reported_too_and_plain_indexes_are_not() -> None:
+    """SPATIAL shares the gap; BTREE (MySQL's default) must not raise a false alarm."""
+    from dsql_migrator.core.converter import SchemaConverter, SchemaConvertOptions
+    from dsql_migrator.core.models import ColumnDef, IndexDef, TableDef
+
+    def _convert(index_type):
+        table = TableDef(
+            name="t.x",
+            columns=[
+                ColumnDef(name="id", mysql_type="bigint", nullable=False),
+                ColumnDef(name="c", mysql_type="varchar(20)", nullable=True),
+            ],
+            primary_key=["id"],
+            indexes=[
+                IndexDef(name="i", columns=["c"], unique=False, index_type=index_type)
+            ],
+        )
+        return SchemaConverter().convert_table(table, SchemaConvertOptions())
+
+    assert any("SPATIAL" in w.message for w in _convert("SPATIAL").warnings)
+    for benign in ("BTREE", None, ""):
+        messages = " ".join(w.message for w in _convert(benign).warnings)
+        assert "FULLTEXT or SPATIAL" not in messages, benign
+
+
+def test_unsupported_index_types_come_from_one_shared_definition() -> None:
+    """The Evaluation rule and the conversion warning must agree on the SET.
+
+    Restating the literal in both places is how two screens drift apart -- the same
+    failure mode as the Routines / Stored procedures mismatch.
+    """
+    from dsql_migrator.core import converter
+    from dsql_migrator.core.assessor import _UNSUPPORTED_INDEX_TYPES
+
+    assert converter._UNSUPPORTED_INDEX_TYPES is _UNSUPPORTED_INDEX_TYPES
+
+
+def test_partitioned_table_conversion_reports_the_dropped_partitioning() -> None:
+    """A partitioned source converted to a silently-plain table.
+
+    The target DDL is right (DSQL distributes by primary key and has no PARTITION BY), but
+    the conversion said nothing -- while Evaluation reported it MANUAL / MEDIUM. What the
+    operator needs to know is that partition-SCOPED operations do not carry over.
+    """
+    from dsql_migrator.core.converter import (
+        ConversionNoteKind,
+        SchemaConverter,
+        SchemaConvertOptions,
+    )
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    table = TableDef(
+        name="ecommerce.events",
+        columns=[ColumnDef(name="id", mysql_type="bigint", nullable=False)],
+        primary_key=["id"],
+        partitioned=True,
+    )
+    result = SchemaConverter().convert_table(table, SchemaConvertOptions())
+    notes = [w for w in result.warnings if "partitioning" in w.message]
+    assert notes, "a partitioned source must not convert silently"
+    note = notes[0]
+    # RECOMMENDATION: no data or key changed, and DSQL distributes automatically -- this is
+    # not a dropped constraint like a foreign key.
+    assert note.kind is ConversionNoteKind.RECOMMENDATION
+    # Names the consequences that actually bite: partition-scoped SQL and maintenance.
+    assert "PARTITION (p1)" in note.message
+    assert "TRUNCATE" in note.message
+    # No PARTITION BY leaks into the target.
+    assert "PARTITION" not in result.target_ddl
+
+    # A non-partitioned table gets no such note.
+    plain = TableDef(
+        name="ecommerce.plain",
+        columns=[ColumnDef(name="id", mysql_type="bigint", nullable=False)],
+        primary_key=["id"],
+    )
+    plain_result = SchemaConverter().convert_table(plain, SchemaConvertOptions())
+    assert not any("partitioning" in w.message for w in plain_result.warnings)
+
+
+def test_every_table_level_assessor_rule_has_a_conversion_note() -> None:
+    """The audit invariant: what Evaluation flags, conversion must also surface.
+
+    Six rules were silent on the conversion screen -- FULLTEXT/SPATIAL indexes,
+    partitioning, the column/index limits, oversized LOBs, generated columns, CI
+    collations and ON UPDATE. Each was reported by Evaluation and then invisible on the one
+    screen that shows the DDL, which is how the workshop found the AUTO_INCREMENT case.
+    This drives BOTH engines over the same table and fails if a rule fires with no
+    corresponding conversion note -- so a newly added assessor rule cannot regress into the
+    same gap.
+    """
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.core.converter import SchemaConverter, SchemaConvertOptions
+    from dsql_migrator.core.models import (
+        ColumnDef,
+        IndexDef,
+        SourceInventory,
+        TableDef,
+    )
+
+    pk = ColumnDef(name="id", mysql_type="bigint", nullable=False)
+
+    def _wide():
+        return [pk] + [
+            ColumnDef(name=f"c{i}", mysql_type="int", nullable=True) for i in range(400)
+        ]
+
+    def _many_idx_cols():
+        return [pk] + [
+            ColumnDef(name=f"c{i}", mysql_type="int", nullable=True) for i in range(30)
+        ]
+
+    cases = {
+        "BIT_TYPE": TableDef(
+            name="t.a",
+            columns=[pk, ColumnDef(name="f", mysql_type="bit(8)", nullable=True)],
+            primary_key=["id"],
+        ),
+        "ENUM_SET_TYPE": TableDef(
+            name="t.b",
+            columns=[pk, ColumnDef(name="s", mysql_type="enum('a')", nullable=True)],
+            primary_key=["id"],
+        ),
+        "TINYINT_BOOLEAN": TableDef(
+            name="t.c",
+            columns=[pk, ColumnDef(name="b", mysql_type="tinyint(1)", nullable=True)],
+            primary_key=["id"],
+        ),
+        "YEAR_TYPE": TableDef(
+            name="t.d",
+            columns=[pk, ColumnDef(name="y", mysql_type="year", nullable=True)],
+            primary_key=["id"],
+        ),
+        "NUMERIC_PRECISION": TableDef(
+            name="t.e",
+            columns=[pk, ColumnDef(name="n", mysql_type="decimal(65,30)", nullable=True)],
+            primary_key=["id"],
+        ),
+        "SPATIAL_TYPE": TableDef(
+            name="t.f",
+            columns=[pk, ColumnDef(name="g", mysql_type="geometry", nullable=True)],
+            primary_key=["id"],
+        ),
+        "OVERSIZED_LOB": TableDef(
+            name="t.g",
+            columns=[pk, ColumnDef(name="l", mysql_type="longblob", nullable=True)],
+            primary_key=["id"],
+        ),
+        "CI_COLLATION": TableDef(
+            name="t.h",
+            columns=[
+                pk,
+                ColumnDef(
+                    name="e",
+                    mysql_type="varchar(20)",
+                    nullable=True,
+                    collation="utf8mb4_0900_ai_ci",
+                ),
+            ],
+            primary_key=["id"],
+        ),
+        "GENERATED_COLUMN": TableDef(
+            name="t.i",
+            columns=[pk, ColumnDef(name="m", mysql_type="int", nullable=True, generated=True)],
+            primary_key=["id"],
+        ),
+        "ON_UPDATE_TIMESTAMP": TableDef(
+            name="t.j",
+            columns=[
+                pk,
+                ColumnDef(
+                    name="u",
+                    mysql_type="datetime",
+                    nullable=True,
+                    auto_update_timestamp=True,
+                ),
+            ],
+            primary_key=["id"],
+        ),
+        "AUTO_INCREMENT": TableDef(
+            name="t.k", columns=[pk], primary_key=["id"], auto_increment_column="id"
+        ),
+        "PARTITIONED_TABLE": TableDef(
+            name="t.l", columns=[pk], primary_key=["id"], partitioned=True
+        ),
+        "UNSUPPORTED_INDEX_TYPE": TableDef(
+            name="t.m",
+            columns=[pk],
+            primary_key=["id"],
+            indexes=[
+                IndexDef(name="ft", columns=["id"], unique=False, index_type="FULLTEXT")
+            ],
+        ),
+        "NO_PRIMARY_KEY": TableDef(name="t.n", columns=[pk], primary_key=[]),
+        "TOO_MANY_COLUMNS": TableDef(name="t.o", columns=_wide(), primary_key=["id"]),
+        "TOO_MANY_INDEXES": TableDef(
+            name="t.p",
+            columns=_many_idx_cols(),
+            primary_key=["id"],
+            indexes=[
+                IndexDef(name=f"i{i}", columns=[f"c{i}"], unique=False)
+                for i in range(30)
+            ],
+        ),
+    }
+
+    converter = SchemaConverter()
+    assessor = CompatibilityAssessor()
+    silent: list[str] = []
+    for rule, table in cases.items():
+        fired = {
+            item.rule_id
+            for item in assessor.assess(SourceInventory(tables=[table])).items
+        }
+        assert rule in fired, f"fixture for {rule} no longer triggers that rule"
+        notes = converter.convert_table(table, SchemaConvertOptions()).warnings
+        if not notes:
+            silent.append(rule)
+    assert not silent, (
+        "Evaluation flags these but Schema Conversion says nothing: "
+        f"{sorted(silent)}"
+    )
+
+
+def test_case_sensitive_collation_is_not_reported_as_a_change() -> None:
+    """Only ``_ci`` collations change behaviour on the target.
+
+    A ``_cs`` or ``_bin`` collation already matches PostgreSQL's case-sensitive comparison,
+    so warning about it would be a false alarm -- and false alarms on this screen train the
+    reader to skip the notes that matter.
+    """
+    from dsql_migrator.core.converter import SchemaConverter, SchemaConvertOptions
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    for collation in ("utf8mb4_0900_as_cs", "utf8mb4_bin", None):
+        table = TableDef(
+            name="t.x",
+            columns=[
+                ColumnDef(name="id", mysql_type="bigint", nullable=False),
+                ColumnDef(
+                    name="e", mysql_type="varchar(20)", nullable=True, collation=collation
+                ),
+            ],
+            primary_key=["id"],
+        )
+        messages = " ".join(
+            w.message
+            for w in SchemaConverter().convert_table(table, SchemaConvertOptions()).warnings
+        )
+        assert "case-INSENSITIVE" not in messages, collation
+
+
+def test_generated_and_on_update_notes_name_the_drift_risk() -> None:
+    """Both start CORRECT after Full Load and drift on the first application write.
+
+    That is what makes them dangerous and why the wording has to say it: the target looks
+    right, every count and checksum matches, and the divergence begins later.
+    """
+    from dsql_migrator.core.converter import SchemaConverter, SchemaConvertOptions
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    table = TableDef(
+        name="t.x",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="margin", mysql_type="int", nullable=True, generated=True),
+            ColumnDef(
+                name="updated_at",
+                mysql_type="datetime",
+                nullable=True,
+                auto_update_timestamp=True,
+            ),
+        ],
+        primary_key=["id"],
+    )
+    messages = {
+        w.message for w in SchemaConverter().convert_table(table, SchemaConvertOptions()).warnings
+    }
+    generated = next(m for m in messages if "GENERATED" in m)
+    assert "ORDINARY columns" in generated
+    assert "drift" in generated
+    on_update = next(m for m in messages if "ON UPDATE CURRENT_TIMESTAMP" in m)
+    assert "no triggers" in on_update
+    assert "stale" in on_update

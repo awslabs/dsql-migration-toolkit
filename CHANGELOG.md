@@ -5,6 +5,47 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.227
+
+### Fixed
+
+- **The Schema Conversion screen was silent about things Evaluation had already flagged.**
+  Reported from a workshop for `AUTO_INCREMENT`; auditing every captured field and every
+  assessor rule against the conversion output found **nine** cases of the same shape — the
+  tool told you about a problem in Evaluation, then showed a conversion that looked clean.
+
+  The reconstructed **source DDL** now shows what the target cannot reproduce:
+  `AUTO_INCREMENT`, `ON UPDATE CURRENT_TIMESTAMP`, `COLLATE`, `FULLTEXT`/`SPATIAL` index
+  kinds, and markers for generated columns and native partitioning (both of which only
+  have a boolean captured — they are noted, never invented as syntax). A plain table renders
+  exactly as before.
+
+  The **conversion notes** now cover the six rules that produced no note at all:
+
+  - **FULLTEXT / SPATIAL index** → emitted as an ordinary `CREATE INDEX ASYNC` on the same
+    column, i.e. identical DDL to a normal index. The index is created but `MATCH …
+    AGAINST` cannot use it. Evaluation rates this UNSUPPORTED / SIGNIFICANT.
+  - **Native partitioning** → correctly dropped (DSQL distributes by primary key), but
+    partition-scoped SQL and `DROP`/`TRUNCATE PARTITION` archiving do not carry over.
+  - **255-column limit** and **24-index limit** (the primary key counts) → these are hard
+    limits, so the DDL is *rejected at apply*; the index case fails after the table
+    succeeds, leaving a partially-indexed target.
+  - **Oversized LOB/TEXT** → the DDL is fine; the ~1 MiB cap bites per row during
+    migration, where oversized values are permanently dropped.
+  - **Generated column** → becomes an ordinary column. Full Load copies the values the
+    source computed, so the target starts correct and drifts on the first write that does
+    not supply one.
+  - **Case-insensitive collation** → DSQL compares case-sensitively, so equality, `LIKE`,
+    `ORDER BY` and `UNIQUE` behaviour change while every row count and checksum still
+    matches. Only `_ci` collations are reported; `_cs`/`_bin` already match the target.
+  - **`ON UPDATE CURRENT_TIMESTAMP`** → the `DEFAULT` survives, but nothing refreshes the
+    value on an `UPDATE`, so `updated_at` freezes at insert time.
+
+  No generated DDL changed — these are notes. Limits and type sets are imported from the
+  assessor instead of restated, and a new test drives both engines over the same tables and
+  fails if any rule fires with no conversion note, so a future rule cannot regress into the
+  same gap.
+
 ## v0.1.226
 
 ### Fixed

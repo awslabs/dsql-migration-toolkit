@@ -1802,6 +1802,273 @@ def _foreign_key_warning(table: TableDef) -> Optional[ConversionWarning]:
     )
 
 
+# Aurora DSQL limits + type sets, imported from the assessor rather than restated, so the
+# Evaluation rule and the matching conversion warning can never disagree. Restating a
+# literal in both places is exactly how the two screens drifted apart before.
+from dsql_migrator.core.assessor import (  # noqa: E402 - avoids duplicate literals
+    _MAX_COLUMNS_PER_TABLE,
+    _MAX_INDEXES_PER_TABLE,
+    _MAX_SECONDARY_INDEXES_PER_TABLE,
+    _OVERSIZED_LOB_BASES,
+    _UNSUPPORTED_INDEX_TYPES,
+    _base_type,
+)
+
+
+def _generated_column_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Warn that a MySQL generated column becomes an ordinary column on the target.
+
+    The conversion looks harmless -- the column is there with the right type -- but the
+    computation is gone: MySQL maintained the value, and DSQL will not. Full Load copies
+    whatever the source had computed, so the target starts CORRECT and then silently drifts
+    the first time the application inserts or updates a row without supplying the value.
+    Evaluation reports it (``GENERATED_COLUMN``); conversion said nothing, and the target
+    DDL looks identical to a plain column, so there was no way to see it here.
+
+    The expression itself is not in the inventory (only the boolean), which is why this
+    names the columns and points at the source rather than quoting the formula.
+    """
+    columns = [column.name for column in table.columns if column.generated]
+    if not columns:
+        return None
+    names = ", ".join(columns)
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            f"Columns ({names}) are MySQL GENERATED (computed) columns; Aurora DSQL has "
+            "no equivalent, so they are created as ORDINARY columns. Full Load copies the "
+            "values the source already computed, so the target starts correct — but "
+            "nothing maintains them afterwards, so any insert/update that does not supply "
+            "the value will drift. Compute it in the application (or in the query) before "
+            "cut over. The generating expression is not captured here; read it from the "
+            "source with SHOW CREATE TABLE."
+        ),
+    )
+
+
+def _collation_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Warn about case-INSENSITIVE collations, which change query results on the target.
+
+    The quietest change in the whole conversion: nothing in the DDL looks different, no row
+    is lost, and every count and checksum matches -- but ``WHERE email = 'A@x.com'`` stops
+    matching ``a@x.com``, and a UNIQUE index that rejected ``Bob`` beside ``bob`` now
+    accepts both. Evaluation flags it (``CI_COLLATION``); conversion was silent, so the one
+    screen showing the DDL side by side gave no hint.
+
+    Only ``_ci`` collations are reported: a case-SENSITIVE (``_cs``) or binary (``_bin``)
+    collation already matches PostgreSQL's default comparison, so it is not a change.
+    """
+    columns = [
+        column.name
+        for column in table.columns
+        if column.collation and column.collation.strip().lower().endswith("_ci")
+    ]
+    if not columns:
+        return None
+    names = ", ".join(columns)
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            f"Columns ({names}) use a case-INSENSITIVE MySQL collation. Aurora DSQL "
+            "compares text case-SENSITIVELY, so equality, LIKE, ORDER BY and UNIQUE "
+            "behaviour change even though the data migrates exactly and every row count "
+            "and checksum will match. Queries that relied on case-insensitive matching "
+            "need LOWER(...) on both sides (with a matching expression index), and a "
+            "UNIQUE column that rejected 'Bob' beside 'bob' will now accept both."
+        ),
+    )
+
+
+def _on_update_timestamp_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Warn that ``ON UPDATE CURRENT_TIMESTAMP`` auto-maintenance is not reproduced.
+
+    The DEFAULT survives, so the column looks fully converted -- and it is, for INSERTs.
+    What is gone is the UPDATE half: MySQL refreshed the value on every row change, and
+    DSQL has neither an ON UPDATE clause nor triggers to do it. So ``updated_at`` freezes
+    at its insert time and every consumer of it (cache invalidation, incremental syncs,
+    audit trails, "recently changed" queries) quietly reads stale data. Evaluation reports
+    it (``ON_UPDATE_TIMESTAMP``); the conversion screen did not.
+    """
+    columns = [column.name for column in table.columns if column.auto_update_timestamp]
+    if not columns:
+        return None
+    names = ", ".join(columns)
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            f"Columns ({names}) use MySQL ON UPDATE CURRENT_TIMESTAMP. The DEFAULT is "
+            "kept, so inserts still stamp them, but Aurora DSQL has no ON UPDATE clause "
+            "and no triggers — nothing refreshes the value on an UPDATE. The application "
+            "must set it explicitly on every write, or the column freezes at insert time "
+            "and anything reading it (cache invalidation, incremental syncs, audit "
+            "trails) silently goes stale."
+        ),
+    )
+
+
+def _too_many_columns_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Warn when the table exceeds Aurora DSQL's hard 255-column limit.
+
+    This is a HARD limit, so the generated CREATE TABLE is rejected at apply -- the
+    conversion looks clean, then the apply fails. Evaluation rates it UNSUPPORTED /
+    SIGNIFICANT; conversion said nothing, which is the worst combination for a limit the
+    operator cannot discover any other way until the apply errors.
+    """
+    count = len(table.columns)
+    if count <= _MAX_COLUMNS_PER_TABLE:
+        return None
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.UNSUPPORTED,
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            f"This table has {count} columns; Aurora DSQL allows at most "
+            f"{_MAX_COLUMNS_PER_TABLE} per table. The generated CREATE TABLE will be "
+            "REJECTED as-is — split the table (vertical partitioning by access pattern, "
+            "sharing the primary key) or drop unused columns before applying."
+        ),
+    )
+
+
+def _too_many_indexes_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Warn when the table's secondary indexes exceed DSQL's per-table budget.
+
+    DSQL allows 24 indexes per table and the PRIMARY KEY counts toward that budget
+    (verified on a live cluster), so a migrated table can carry at most 23 secondary
+    indexes. Past that the ``CREATE INDEX ASYNC`` statements fail with error 54000 -- and
+    because indexes are applied AFTER the table, the table itself succeeds first, leaving a
+    partially-indexed target. Nothing on the conversion screen said so.
+    """
+    count = len(table.indexes)
+    if count <= _MAX_SECONDARY_INDEXES_PER_TABLE:
+        return None
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            f"This table has {count} secondary indexes; with the required primary key "
+            f"that is {count + 1} against Aurora DSQL's limit of "
+            f"{_MAX_INDEXES_PER_TABLE} per table, so at most "
+            f"{_MAX_SECONDARY_INDEXES_PER_TABLE} can be created. The extra CREATE INDEX "
+            "ASYNC statements will fail (error 54000) after the table itself is created, "
+            "leaving the target partially indexed — drop the indexes you no longer need "
+            "before applying, keeping the ones your queries actually use."
+        ),
+    )
+
+
+def _oversized_lob_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Warn about LOB/TEXT columns whose values can exceed DSQL's 1 MiB per-value cap.
+
+    The DDL converts and applies fine; the failure lands later, per ROW, during Full Load
+    or CDC -- which is why it belongs on this screen too. Those rows are quarantined
+    (Full Load) or dead-lettered (CDC), so the migration reports a gap that cannot be
+    fixed by reloading: the value simply does not fit. Naming the columns here is what lets
+    the operator act before the load rather than triage dropped rows afterwards.
+    """
+    columns = [
+        column.name
+        for column in table.columns
+        if _base_type(column.mysql_type) in _OVERSIZED_LOB_BASES
+    ]
+    if not columns:
+        return None
+    names = ", ".join(columns)
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.RECOMMENDATION,
+        message=(
+            f"Columns ({names}) are MySQL LOB/TEXT types that can hold more than Aurora "
+            "DSQL's ~1 MiB per-value limit. The DDL itself is fine — the limit bites per "
+            "ROW during migration: any oversized value is permanently dropped "
+            "(quarantined in Full Load, dead-lettered in CDC) and reloading cannot fix "
+            "it. Check the largest values now; if any exceed 1 MiB, move that content to "
+            "Amazon S3 and store a reference instead."
+        ),
+    )
+
+
+def _unsupported_index_type_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Warn that a FULLTEXT / SPATIAL index becomes an ordinary B-tree index.
+
+    The converter emits every secondary index as ``CREATE INDEX ASYNC``, which for a
+    FULLTEXT index is not an equivalent -- it is a plain B-tree on the same column, and
+    the ``MATCH ... AGAINST`` queries that index existed for cannot run against it at all.
+    Yet the conversion produced the SAME DDL as an ordinary index with no note, while
+    Evaluation rates this UNSUPPORTED with SIGNIFICANT effort (``UNSUPPORTED_INDEX_TYPE``)
+    -- its most severe rating. An operator reading only the conversion screen had no
+    indication that a full-text search feature had just been silently dropped.
+
+    Classified LOSS, not RECOMMENDATION: unlike a partitioned table (where DSQL's own
+    distribution replaces the mechanism), there is no target-side substitute -- the
+    capability is gone and the queries must be rebuilt elsewhere.
+    """
+    flagged = [
+        f"{index.name} ({index.index_type})"
+        for index in table.indexes
+        if index.index_type and index.index_type.strip().lower() in _UNSUPPORTED_INDEX_TYPES
+    ]
+    if not flagged:
+        return None
+    names = ", ".join(flagged)
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.UNSUPPORTED,
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            f"Aurora DSQL has no FULLTEXT or SPATIAL index type, so {names} is emitted as "
+            "an ordinary CREATE INDEX ASYNC on the same column(s). The index is created, "
+            "but it is NOT an equivalent: MATCH ... AGAINST / spatial-operator queries "
+            "cannot use it and will fail or table-scan. Move that search outside the "
+            "database (e.g. Amazon OpenSearch Service) or redesign the query, and drop "
+            "the index if nothing else uses those columns."
+        ),
+    )
+
+
+def _partitioned_table_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Return a warning that the source table's native partitioning was dropped.
+
+    The TARGET DDL is already correct -- DSQL has no user-visible partitioning (it
+    distributes by primary key internally), so emitting no ``PARTITION BY`` is right. But
+    the conversion screen said NOTHING about it, so a partitioned source converted to a
+    silently-plain table: the operator saw a clean conversion with no note, even though
+    Evaluation had reported it MANUAL (``PARTITIONED_TABLE``) with MEDIUM effort. Same
+    inconsistency as the source DDL omitting AUTO_INCREMENT -- one screen names it, the
+    next does not.
+
+    A RECOMMENDATION, not a LOSS: nothing about the data or the key changed, and DSQL
+    distributes automatically, so this is not a dropped constraint like a foreign key.
+    What matters to the operator is that partition-specific SQL and operations do not
+    carry over.
+    """
+    if not table.partitioned:
+        return None
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.RECOMMENDATION,
+        message=(
+            "The source table uses MySQL native partitioning, which Aurora DSQL does "
+            "not have — DSQL distributes rows automatically by primary key, so no "
+            "PARTITION BY clause is emitted and no data is lost. Review anything that "
+            "depended on the partitions themselves: partition-scoped SQL "
+            "(PARTITION (p1)), partition pruning assumptions, and partition-level "
+            "maintenance such as DROP/TRUNCATE PARTITION for archiving — the last one "
+            "needs a different approach on DSQL (deleting by range), since it has no "
+            "TRUNCATE."
+        ),
+    )
+
+
 def _no_primary_key_warning(table: TableDef) -> Optional[ConversionWarning]:
     """Return a warning when the table has no primary key (DSQL requires one)."""
     if table.primary_key:
@@ -2042,6 +2309,14 @@ class SchemaConverter:
             pk_strategy_warning,
             _no_primary_key_warning(table),
             _foreign_key_warning(table),
+            _partitioned_table_warning(table),
+            _unsupported_index_type_warning(table),
+            _too_many_columns_warning(table),
+            _too_many_indexes_warning(table),
+            _oversized_lob_warning(table),
+            _generated_column_warning(table),
+            _collation_warning(table),
+            _on_update_timestamp_warning(table),
         ):
             if optional_warning is not None:
                 warnings.append(optional_warning)
