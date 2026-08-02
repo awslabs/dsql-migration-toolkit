@@ -5,6 +5,22 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.228
+
+### 수정
+
+- **재구성된 소스 DDL이 문자열 DEFAULT를 인용부호 없이 렌더해 유효하지 않은 SQL이 되던 문제.**
+  `information_schema.COLUMN_DEFAULT`는 값을 인용부호 없이 저장하는데 그것을 그대로 출력해서, MySQL이
+  `DEFAULT 'pending'`으로 표시하는 컬럼이 `DEFAULT pending`으로 나왔습니다. 이 패널에는 **Copy Source
+  DDL** 버튼이 있으므로 복사해 준 텍스트를 실행할 수 없었습니다 — MySQL은 인용 없는 `pending`을 컬럼 참조로
+  해석합니다. 최초 공개 릴리스부터 있던 문제입니다.
+
+  이제 인용 여부를 `default_is_expression`으로 결정합니다 — 컨버터가 쓰는 것과 같은 신호입니다. MySQL의
+  `DEFAULT_GENERATED` 플래그에서 오며, 리터럴 문자열 `'CURRENT_TIMESTAMP'`와 같은 이름의 함수 호출을
+  구분할 수 있는 유일한 근거입니다(값의 모양으로는 구분 불가). 값에 포함된 인용부호도 이스케이프합니다.
+  라이브 소스로 검증했습니다: 재구성된 `ecommerce.orders` DDL이 이제 MySQL에서 실행되고 컬럼이 동일하게
+  라운드트립됩니다.
+
 ## v0.1.227
 
 ### 수정

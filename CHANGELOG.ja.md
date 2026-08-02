@@ -5,6 +5,21 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.228
+
+### 修正
+
+- **再構成されたソース DDL が文字列 DEFAULT を引用符なしで描画し、無効な SQL になっていた問題。**
+  `information_schema.COLUMN_DEFAULT` は値を引用符なしで格納しており、それをそのまま出力していたため、
+  MySQL が `DEFAULT 'pending'` と表示するカラムが `DEFAULT pending` になっていました。このペインには
+  **Copy Source DDL** ボタンがあるため、渡されたテキストは実行できませんでした — MySQL は引用符なしの
+  `pending` をカラム参照として解釈します。初回公開リリースから存在していた問題です。
+
+  引用の判断は `default_is_expression` によるようになりました — コンバータが使用するものと同じシグナルです。
+  MySQL の `DEFAULT_GENERATED` フラグ由来で、リテラル文字列 `'CURRENT_TIMESTAMP'` と同名の関数呼び出しを
+  区別できる唯一の根拠です(値の形状からは判別不可能)。値に含まれる引用符もエスケープします。ライブソースで
+  検証済み: 再構成された `ecommerce.orders` DDL が MySQL で実行でき、カラムが同一にラウンドトリップします。
+
 ## v0.1.227
 
 ### 修正

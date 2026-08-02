@@ -74,6 +74,7 @@ from dsql_migrator.core.models import (
     AiConversionSuggestion,
     AssessmentReport,
     Classification,
+    ColumnDef,
     ObjectType,
     SourceInventory,
     StepStatus,
@@ -1308,6 +1309,33 @@ def _quote_mysql(name: str) -> str:
     return f"`{escaped}`"
 
 
+def _render_source_default(column: ColumnDef) -> str:
+    """Render a column's DEFAULT the way MySQL itself writes it.
+
+    ``information_schema.COLUMN_DEFAULT`` stores the value UNQUOTED, so emitting it raw
+    produced ``DEFAULT pending`` where MySQL's own ``SHOW CREATE TABLE`` says
+    ``DEFAULT 'pending'``. That made the reconstruction invalid SQL -- and this pane has a
+    "Copy Source DDL" button, so what it hands over could not be run: MySQL reads a bare
+    ``pending`` as a column reference. Present since the initial release.
+
+    ``default_is_expression`` is the same signal the converter keys on
+    (``_column_default_sql``): it comes from ``EXTRA``'s ``DEFAULT_GENERATED`` flag, which
+    is the only thing that can tell the literal string ``'CURRENT_TIMESTAMP'`` from the
+    function call ``CURRENT_TIMESTAMP``. Guessing from the value's shape cannot, which is
+    why the flag exists -- so an expression is emitted verbatim and everything else is
+    quoted as a string literal.
+
+    Numeric and boolean-ish literals are quoted too, deliberately: MySQL accepts
+    ``DEFAULT '0'`` for an int column and prints defaults quoted in SHOW CREATE TABLE, so
+    quoting is faithful and needs no per-type branch here (this is display text, never
+    executed against the target -- the converter owns the target's typed default).
+    """
+    raw = column.default or ""
+    if column.default_is_expression:
+        return raw
+    return "'" + raw.replace("'", "''") + "'"
+
+
 def render_source_table_ddl(table: TableDef) -> str:
     """Reconstruct a readable MySQL ``CREATE TABLE`` for ``table`` (display only).
 
@@ -1346,7 +1374,7 @@ def render_source_table_ddl(table: TableDef) -> str:
         if not column.nullable:
             clause += " NOT NULL"
         if column.default is not None:
-            clause += f" DEFAULT {column.default}"
+            clause += f" DEFAULT {_render_source_default(column)}"
         # MySQL's own SHOW CREATE TABLE order: DEFAULT then ON UPDATE, then the
         # AUTO_INCREMENT marker -- so the reconstruction reads like the real thing.
         if column.auto_update_timestamp:

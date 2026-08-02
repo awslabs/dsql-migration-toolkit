@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.228
+
+### Fixed
+
+- **The reconstructed source DDL rendered string defaults unquoted, producing invalid SQL.**
+  `information_schema.COLUMN_DEFAULT` stores the value without quotes and it was emitted
+  raw, so a column MySQL prints as `DEFAULT 'pending'` appeared as `DEFAULT pending`. The
+  pane has a **Copy Source DDL** button, so what it handed over could not be run — MySQL
+  reads a bare `pending` as a column reference. Present since the initial release.
+
+  Quoting is now decided by `default_is_expression`, the same signal the converter uses:
+  it comes from MySQL's `DEFAULT_GENERATED` flag, the only thing that can tell the literal
+  string `'CURRENT_TIMESTAMP'` from the function call of the same name (a shape heuristic
+  cannot). Embedded apostrophes are escaped. Verified against the live source: the
+  reconstructed `ecommerce.orders` DDL now executes on MySQL and the column round-trips
+  identically.
+
 ## v0.1.227
 
 ### Fixed

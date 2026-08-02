@@ -3216,3 +3216,80 @@ def test_source_ddl_omits_markers_for_a_plain_table() -> None:
     ):
         assert token not in ddl, f"{token} leaked into a plain table's DDL:\n{ddl}"
     assert "KEY `idx_label`" in ddl
+
+
+def test_source_ddl_quotes_literal_defaults_but_not_expressions() -> None:
+    """The rendered DDL was invalid SQL: ``DEFAULT pending`` instead of ``'pending'``.
+
+    ``information_schema.COLUMN_DEFAULT`` stores the value UNQUOTED, and it was emitted
+    raw -- so the pane's "Copy Source DDL" button handed over text MySQL cannot run (a bare
+    ``pending`` reads as a column reference). Present since the initial release.
+
+    ``default_is_expression`` is the discriminator, the same one the converter keys on: it
+    comes from EXTRA's DEFAULT_GENERATED flag, the only thing that can distinguish the
+    literal string 'CURRENT_TIMESTAMP' from the function call. Verified against the live
+    source: the reconstructed orders DDL now executes on MySQL and round-trips identically.
+    """
+    from dsql_migrator.core.models import ColumnDef, TableDef
+    from dsql_migrator.ui.schema_conversion import render_source_table_ddl
+
+    table = TableDef(
+        name="ecommerce.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            # An expression: emitted verbatim, or the target would default to a string.
+            ColumnDef(
+                name="created_at",
+                mysql_type="datetime",
+                nullable=True,
+                default="CURRENT_TIMESTAMP",
+                default_is_expression=True,
+            ),
+            # A literal that LOOKS like an expression -- the case the flag exists for.
+            ColumnDef(
+                name="label",
+                mysql_type="varchar(30)",
+                nullable=True,
+                default="CURRENT_TIMESTAMP",
+                default_is_expression=False,
+            ),
+            ColumnDef(
+                name="status", mysql_type="varchar(20)", nullable=True, default="pending"
+            ),
+            # An embedded apostrophe must be escaped, not left to break the statement.
+            ColumnDef(
+                name="owner", mysql_type="varchar(30)", nullable=True, default="O'Brien"
+            ),
+        ],
+        primary_key=["id"],
+    )
+    lines = {
+        line.strip().split("`")[1]: line
+        for line in render_source_table_ddl(table).splitlines()
+        if "DEFAULT" in line
+    }
+    assert "DEFAULT CURRENT_TIMESTAMP" in lines["created_at"]
+    assert "DEFAULT 'CURRENT_TIMESTAMP'" not in lines["created_at"]
+    # ...and the identically-valued LITERAL is quoted.
+    assert "DEFAULT 'CURRENT_TIMESTAMP'" in lines["label"]
+    assert "DEFAULT 'pending'" in lines["status"]
+    assert "DEFAULT 'O''Brien'" in lines["owner"]
+
+
+def test_source_default_rendering_matches_the_converters_discriminator() -> None:
+    """Display and conversion must decide quoting from the SAME signal.
+
+    Two places deciding "is this an expression?" by different means is how they drift; the
+    converter's ``_column_default_sql`` reads ``default_is_expression``, so the renderer
+    must not fall back to a shape heuristic (which cannot tell a literal 'NOW()' from the
+    call).
+    """
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as module
+
+    src = inspect.getsource(module._render_source_default)
+    assert "default_is_expression" in src
+    # No guessing from the value's shape.
+    for heuristic in ("upper()", "startswith(", "endswith(", "CURRENT_TIMESTAMP\""):
+        assert heuristic not in src, f"shape heuristic leaked in: {heuristic}"
