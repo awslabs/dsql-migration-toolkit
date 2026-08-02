@@ -68,11 +68,13 @@ from dsql_migrator.core.converter import (
     parse_target_primary_key,
     validate_composite_leading_column,
 )
+from dsql_migrator.core.assessor import kind_label
 from dsql_migrator.core.models import (
     AiAssistConfig,
     AiConversionSuggestion,
     AssessmentReport,
     Classification,
+    ObjectType,
     SourceInventory,
     StepStatus,
     TableDef,
@@ -1102,7 +1104,21 @@ def build_object_tree(
 
     def bucket(schema: str) -> dict[str, list[dict]]:
         if schema not in buckets:
-            buckets[schema] = {"tables": [], "views": [], "triggers": [], "routines": []}
+            buckets[schema] = {
+                "tables": [],
+                "views": [],
+                "triggers": [],
+                # Routines are split by KIND, not lumped under one "Routines" heading:
+                # Evaluation reports them as "Stored procedures" / "Functions" (its
+                # KIND_LABELS), so a single "Routines (n)" node made the same objects
+                # appear under a different name on the next screen -- reported from a
+                # workshop, where attendees could not match one screen's list to the
+                # other's. The introspector already distinguishes PROCEDURE from FUNCTION
+                # (see ObjectType), so the tree was discarding information it had.
+                "procedures": [],
+                "functions": [],
+                "routines": [],
+            }
             order.append(schema)
         return buckets[schema]
 
@@ -1132,7 +1148,16 @@ def build_object_tree(
         bucket(schema)["triggers"].append(_node(f"{TRIGGER_PREFIX}{trigger.name}", obj))
     for routine in inventory.routines:
         schema, obj = _split_schema(routine.name, schema_label)
-        bucket(schema)["routines"].append(_node(f"{ROUTINE_PREFIX}{routine.name}", obj))
+        # The node ID keeps ROUTINE_PREFIX regardless of kind: it is parsed back by
+        # _OBJECT_NODE_PREFIXES (and the ticked/generated sets persist across renders), so
+        # only the DISPLAY grouping changes here. An untyped routine (the introspector's
+        # fallback when ROUTINE_TYPE is neither) still lands in the generic bucket rather
+        # than being forced into one of the two named ones.
+        key = {
+            ObjectType.PROCEDURE: "procedures",
+            ObjectType.FUNCTION: "functions",
+        }.get(routine.object_type, "routines")
+        bucket(schema)[key].append(_node(f"{ROUTINE_PREFIX}{routine.name}", obj))
 
     schema_nodes: list[dict] = []
     for schema in order:
@@ -1149,14 +1174,23 @@ def build_object_tree(
                     b["triggers"],
                 )
             )
-        if b["routines"]:
-            categories.append(
-                _node(
-                    f"category:routines:{schema}",
-                    f"Routines ({len(b['routines'])})",
-                    b["routines"],
+        # Headings come from the assessor's KIND_LABELS -- the SAME mapping the Evaluation
+        # report, the UI chart axis and the HTML export use. Hard-coding them here is how
+        # "Routines (n)" drifted from Evaluation's "Stored procedures" / "Functions" in the
+        # first place, so the label is looked up rather than restated.
+        for key, kind in (
+            ("procedures", "PROCEDURE"),
+            ("functions", "FUNCTION"),
+            ("routines", "ROUTINE"),
+        ):
+            if b[key]:
+                categories.append(
+                    _node(
+                        f"category:{key}:{schema}",
+                        f"{kind_label(kind)} ({len(b[key])})",
+                        b[key],
+                    )
                 )
-            )
         schema_nodes.append(_node(f"schema:{schema}", f"Schema: {schema}", categories))
     return schema_nodes
 

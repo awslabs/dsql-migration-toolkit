@@ -2942,3 +2942,94 @@ def test_expansion_state_defaults_empty_and_survives_clear() -> None:
     assert state.generated_node_ids is None  # analysis discarded
     assert state.expanded_node_ids == ["ecommerce", "ecommerce.orders"]
     assert state.target_expanded_node_ids == ["public"]
+
+
+# ---------------------------------------------------------------------------
+# One vocabulary across screens: the tree must not rename Evaluation's objects
+# ---------------------------------------------------------------------------
+
+
+def test_object_tree_uses_evaluations_vocabulary_for_routines() -> None:
+    """Reported from a workshop: two screens named the same objects differently.
+
+    Evaluation reports "Stored procedures" / "Functions" (assessor.KIND_LABELS); the
+    conversion tree lumped both under "Routines (n)", so attendees could not match one
+    screen's list to the other's. The introspector already distinguishes PROCEDURE from
+    FUNCTION, so the tree was discarding information it had.
+    """
+    from dsql_migrator.core.assessor import kind_label
+    from dsql_migrator.core.models import (
+        ObjectRef,
+        ObjectType,
+        SourceInventory,
+        TableDef,
+    )
+    from dsql_migrator.ui.schema_conversion import build_object_tree
+
+    inventory = SourceInventory(
+        tables=[TableDef(name="ecommerce.orders", columns=[], primary_key=["id"])],
+        routines=[
+            ObjectRef(name="ecommerce.sp_reorder", object_type=ObjectType.PROCEDURE),
+            ObjectRef(name="ecommerce.sp_audit", object_type=ObjectType.PROCEDURE),
+            ObjectRef(name="ecommerce.fn_total", object_type=ObjectType.FUNCTION),
+        ],
+    )
+    tree = build_object_tree(inventory)
+    labels = [cat["label"] for cat in tree[0]["children"]]
+
+    # The headings are Evaluation's, and come from the shared mapping rather than being
+    # restated here -- restating them is how the two screens drifted apart.
+    assert f"{kind_label('PROCEDURE')} (2)" in labels
+    assert f"{kind_label('FUNCTION')} (1)" in labels
+    # ...and the generic heading is gone when every routine has a kind.
+    assert not any(label.startswith("Routines") for label in labels)
+
+
+def test_object_tree_keeps_routine_node_ids_stable_across_the_split() -> None:
+    """The node ID must stay ``routine:<name>`` whatever the kind.
+
+    IDs are parsed back via _OBJECT_NODE_PREFIXES and are what the ticked / generated sets
+    persist across renders -- so re-keying them by kind would silently invalidate a
+    restored selection (and the DDL-generation scope with it). Only the DISPLAY grouping
+    changed.
+    """
+    from dsql_migrator.core.models import ObjectRef, ObjectType, SourceInventory
+    from dsql_migrator.ui.schema_conversion import ROUTINE_PREFIX, build_object_tree
+
+    inventory = SourceInventory(
+        routines=[
+            ObjectRef(name="ecommerce.sp_x", object_type=ObjectType.PROCEDURE),
+            ObjectRef(name="ecommerce.fn_y", object_type=ObjectType.FUNCTION),
+        ],
+    )
+    ids = [
+        leaf["id"]
+        for cat in build_object_tree(inventory)[0]["children"]
+        for leaf in cat.get("children", [])
+    ]
+    assert sorted(ids) == [
+        f"{ROUTINE_PREFIX}ecommerce.fn_y",
+        f"{ROUTINE_PREFIX}ecommerce.sp_x",
+    ]
+
+
+def test_object_tree_still_groups_an_untyped_routine() -> None:
+    """An untyped routine keeps the generic heading rather than being mislabelled.
+
+    ``ObjectType.ROUTINE`` is the introspector's fallback when MySQL's ROUTINE_TYPE is
+    neither PROCEDURE nor FUNCTION; forcing it into one of the named buckets would state
+    something the catalog did not say.
+    """
+    from dsql_migrator.core.assessor import kind_label
+    from dsql_migrator.core.models import ObjectRef, ObjectType, SourceInventory
+    from dsql_migrator.ui.schema_conversion import build_object_tree
+
+    inventory = SourceInventory(
+        routines=[
+            ObjectRef(name="ecommerce.mystery", object_type=ObjectType.ROUTINE),
+        ],
+    )
+    labels = [cat["label"] for cat in build_object_tree(inventory)[0]["children"]]
+    assert f"{kind_label('ROUTINE')} (1)" in labels
+    assert not any(label.startswith("Stored procedures") for label in labels)
+    assert not any(label.startswith("Functions") for label in labels)

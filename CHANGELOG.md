@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.226
+
+### Fixed
+
+- **The Schema Conversion tree renamed objects the Evaluation report had already named.**
+  Evaluation lists **Stored procedures** and **Functions** (its `KIND_LABELS`), while the
+  object browser lumped both under a single **Routines (n)** node — so the same objects
+  appeared under a different name on the next screen, and there was no way to line one
+  screen's list up against the other's. Found in a workshop.
+
+  The tree now splits them and takes its headings from `assessor.KIND_LABELS`, the same
+  mapping the Evaluation list, the UI chart axis and the HTML export already share —
+  hard-coding the label here is how the two drifted apart. The introspector had always
+  distinguished `PROCEDURE` from `FUNCTION`, so the tree was discarding information it
+  already had. A routine MySQL reports as neither still groups under **Routines**, rather
+  than being asserted into one of the named kinds.
+
+  Node IDs are unchanged (`routine:<name>` regardless of kind): they are parsed back when
+  resolving a selection and are what the ticked / generated sets persist across renders, so
+  re-keying them by kind would have silently invalidated a restored selection and the DDL
+  generation scope with it.
+
 ## v0.1.225
 
 ### Fixed
