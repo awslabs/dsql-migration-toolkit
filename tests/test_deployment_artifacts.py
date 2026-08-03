@@ -201,6 +201,86 @@ def test_alb_is_named_so_its_dns_name_is_lower_case(template: dict) -> None:
     )
 
 
+def test_target_group_is_named_so_an_alb_replacement_can_be_upgraded(
+    template: dict,
+) -> None:
+    """Naming the ALB replaces it, and an UNNAMED target group makes that unupgradeable.
+
+    CloudFormation replacement is create-new -> repoint -> delete-old. An unnamed target
+    group has no changed property, so CFN reuses the same physical group and attaches it
+    to the NEW listener while the OLD ALB still holds it -- and ELBv2 allows a target
+    group on only one load balancer:
+
+        The following target groups cannot be associated with more than one load balancer
+        (HandlerErrorCode: ServiceLimitExceeded)
+
+    That rolled back the first 0.1.229 upgrade of a live stack. TargetGroup ``Name`` is
+    create-only (confirmed against the CloudFormation registry), so naming it replaces
+    the group in the same update and the new listener gets an unattached one.
+    """
+    tg = template["Resources"]["TargetGroup"]["Properties"]
+    assert "Name" in tg, (
+        "TargetGroup must set Name. Without it the group is REUSED across an ALB "
+        "replacement and the new listener cannot attach it while the old ALB holds it, "
+        "so upgrading an existing stack fails with ServiceLimitExceeded."
+    )
+    assert tg["Name"] == {"Fn::Sub": "${AWS::StackName}-tg"}, (
+        f"unexpected TargetGroup Name {tg['Name']!r}; derive it from the stack name so "
+        "it inherits the documented <=28-char, lower-case budget"
+    )
+
+
+def test_alb_and_target_group_are_named_together(template: dict) -> None:
+    # The coupling IS the fix: a named ALB with an unnamed target group is the broken
+    # upgrade path, and an unnamed ALB re-breaks Cognito login. Pin them as a pair so
+    # removing either one fails here rather than during someone's production upgrade.
+    resources = template["Resources"]
+    lb_named = "Name" in resources["LoadBalancer"]["Properties"]
+    tg_named = "Name" in resources["TargetGroup"]["Properties"]
+    assert lb_named == tg_named, (
+        f"LoadBalancer Name={lb_named} but TargetGroup Name={tg_named} -- these must be "
+        "named together: naming only the ALB breaks upgrades of existing stacks "
+        "(target group reused across the replacement), and naming neither breaks Cognito "
+        "login (mixed-case DNS name vs the lower-cased redirect_uri the ALB sends)."
+    )
+
+
+def test_listener_forwards_to_the_target_group_by_ref(template: dict) -> None:
+    # Why the fix works at all: the listener references the group with Ref, making the
+    # NEW group a dependency of the NEW listener, so CFN must create it first. If this
+    # ever became a hard-coded ARN or an import, the ordering guarantee would be gone
+    # and naming the group would no longer save the upgrade.
+    def _refs(node) -> int:
+        """Count {"Ref": "TargetGroup"} occurrences anywhere under ``node``."""
+        if isinstance(node, dict):
+            if node.get("Ref") == "TargetGroup":
+                return 1
+            return sum(_refs(v) for v in node.values())
+        if isinstance(node, list):
+            return sum(_refs(v) for v in node)
+        return 0
+
+    # DefaultActions is an Fn::If (Cognito on/off), each branch ending in a forward, so
+    # BOTH branches must use the Ref: a hard-coded ARN in one branch would break that
+    # branch's ordering guarantee while the other kept a laxer test green.
+    actions = template["Resources"]["HttpsListener"]["Properties"]["DefaultActions"]
+    branches = _refs(actions)
+    assert branches >= 2, (
+        f"expected the Ref in BOTH Fn::If branches (Cognito on and off), found "
+        f"{branches}. A hard-coded ARN or an import in either branch removes the "
+        "dependency that forces CloudFormation to create the replacement target group "
+        "before the replacement listener -- which is what avoids the "
+        "one-ALB-per-target-group conflict."
+    )
+    # The ECS service must point at the same logical group, or it would keep registering
+    # into the old one after a replacement.
+    service = template["Resources"]["Service"]["Properties"]
+    assert _refs(service.get("LoadBalancers", [])) >= 1, (
+        "Service.LoadBalancers must reference TargetGroup by Ref so it re-points at the "
+        "replacement group in the same update"
+    )
+
+
 def test_cognito_callback_url_is_built_from_the_alb_dns_name(template: dict) -> None:
     # The pairing that makes the test above matter: the callback is GetAtt DNSName, so
     # DNSName's casing IS the callback's casing. If this ever switches to a hand-built

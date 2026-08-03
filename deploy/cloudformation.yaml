@@ -161,7 +161,7 @@ Parameters:
 
   ContainerImageUri:
     Type: String
-    Default: public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.229
+    Default: public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.230
     Description: >
       App container image URI. Defaults to the published ECR Public image, so a
       normal deploy needs NO image build -- Fargate pulls it directly (works from
@@ -1248,8 +1248,10 @@ Resources:
       # live pool -- only the run with a lower-case CallbackURL returned an auth code;
       # /oauth2/authorize tolerates the mismatch, so the login PAGE renders and only
       # the submit fails). Since DNSName casing follows the ALB name, a lower-case name
-      # makes DNSName lower case and the two match. See the StackNameFitsAlbName rule
-      # for the 32-char budget this imposes on the stack name.
+      # makes DNSName lower case and the two match. The 32-char ELBv2 name cap this puts
+      # on the stack name (lower case, <=28 chars) is documented in deploy/DEPLOYMENT.md
+      # and guarded by tests/test_deployment_artifacts.py -- it cannot be a template
+      # Rule, since Rules cannot reference ${AWS::StackName} or measure string length.
       Name:
         Fn::Sub: ${AWS::StackName}-alb
       Type: application
@@ -1271,6 +1273,32 @@ Resources:
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
+      # Named for the same reason the ALB is named, plus one more: it is what makes an
+      # ALB replacement UPGRADEABLE. The ALB's Name is create-only, so setting it
+      # replaces the ALB, and CloudFormation replacement is create-new -> repoint
+      # references -> delete-old in a later cleanup phase (that order is not
+      # configurable; DependsOn only sequences within a phase). An UNNAMED target group
+      # has no changed property, so CFN REUSES the same physical target group and points
+      # the NEW listener at it while the OLD ALB still holds it -- and an ELBv2 target
+      # group may be associated with only one load balancer at a time:
+      #   "The following target groups cannot be associated with more than one load
+      #    balancer"  (HandlerErrorCode: ServiceLimitExceeded)
+      # That is exactly what rolled back the first 0.1.229 upgrade of an existing stack:
+      # HttpsListener CREATE_FAILED, with TargetGroup absent from the change set.
+      # TargetGroup Name is create-only too, so naming it makes the target group replace
+      # in the SAME update -- the new listener forwards to a brand-new group no load
+      # balancer holds, and the old ALB/listener/group are torn down together.
+      #
+      # KEEP THIS COUPLED TO THE ALB Name. Dropping either one silently restores the
+      # broken upgrade path, so a test asserts the two are named together.
+      #
+      # Budget: ELBv2 caps both names at 32 chars and "-tg" is shorter than "-alb", so
+      # the documented <=28-char stack-name limit already covers it. Trade-off accepted
+      # (the same one the named ALB accepts): with a fixed name, later changing a
+      # create-only property -- Port/AppPort, VpcId, TargetType, ProtocolVersion,
+      # IpAddressType -- fails with DuplicateTargetGroupName instead of replacing.
+      Name:
+        Fn::Sub: ${AWS::StackName}-tg
       VpcId:
         Ref: VpcId
       Port:

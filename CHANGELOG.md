@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.230
+
+### Fixed
+
+- **v0.1.229 could not be applied to an existing stack.** Naming the ALB (the Cognito
+  login fix) replaces it, and CloudFormation replacement is create-new → repoint →
+  delete-old. The target group had no name, so nothing about it changed and it was
+  *reused*: the new listener tried to attach a group the old ALB still held, and ELBv2
+  allows a target group on only one load balancer, so the update failed with
+  `The following target groups cannot be associated with more than one load balancer`
+  (`ServiceLimitExceeded`) and rolled back — leaving fresh deploys working but every
+  existing stack stuck on the old release. The target group is now named
+  `${AWS::StackName}-tg`, which is also create-only, so it is replaced in the same
+  update and the new listener attaches a group no load balancer holds. Verified by
+  upgrading a live stack: `TargetGroup` now appears in the change set (it was absent
+  before), the listener that previously failed within 3 seconds completed, and the stack
+  reached `UPDATE_COMPLETE`. This is the structural fix, not a one-off — any future ALB
+  replacement (e.g. flipping `AlbScheme`, also create-only) would have hit the same wall.
+  Note that a named target group means later changing a create-only property of it
+  (`AppPort`, `VpcId`, `TargetType`) fails with `DuplicateTargetGroupName` rather than
+  replacing — the same trade already accepted for the named ALB.
+
 ## v0.1.229
 
 ### Fixed

@@ -5,6 +5,28 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.230
+
+### 수정
+
+- **v0.1.229를 기존 스택에 적용할 수 없었습니다.** ALB에 이름을 지정하면(Cognito 로그인 수정)
+  ALB가 교체되는데, CloudFormation의 교체는 "새로 만들기 → 참조 재지정 → 옛것 삭제" 순서로
+  진행됩니다. 타깃 그룹에는 이름이 없어 변경 사항이 없었으므로 **재사용**되었고, 새 리스너가
+  옛 ALB에 아직 붙어 있는 그룹을 붙이려 했습니다. ELBv2는 타깃 그룹을 하나의 로드 밸런서에만
+  연결할 수 있으므로
+  `The following target groups cannot be associated with more than one load balancer`
+  (`ServiceLimitExceeded`)로 실패하고 롤백됐습니다 — 신규 배포는 되지만 기존 스택은 모두 옛
+  릴리스에 갇히는 상태였습니다. 이제 타깃 그룹에 `${AWS::StackName}-tg` 이름을 지정합니다.
+  이 속성도 create-only이므로 같은 업데이트에서 타깃 그룹이 함께 교체되고, 새 리스너는 어떤
+  로드 밸런서도 갖고 있지 않은 그룹을 붙입니다. 실제 스택을 업그레이드해 검증했습니다 —
+  변경 세트에 `TargetGroup`이 나타나고(이전에는 아예 없었습니다), 3초 만에 실패하던 리스너가
+  통과해 스택이 `UPDATE_COMPLETE`에 도달했습니다. 일회성 대응이 아니라 구조적 수정입니다 —
+  앞으로 ALB가 교체되는 어떤 변경(예: 역시 create-only인 `AlbScheme` 변경)도 같은 벽에
+  부딪혔을 것입니다. 다만 타깃 그룹에 고정 이름이 붙으므로, 이후 그룹의 create-only 속성
+  (`AppPort`, `VpcId`, `TargetType`)을 바꾸면 교체되는 대신
+  `DuplicateTargetGroupName`으로 실패합니다 — 이름을 지정한 ALB에서 이미 받아들인 것과 같은
+  트레이드오프입니다.
+
 ## v0.1.229
 
 ### 수정
