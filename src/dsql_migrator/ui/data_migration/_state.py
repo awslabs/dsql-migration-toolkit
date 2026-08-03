@@ -21,7 +21,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from dsql_migrator.core.cdc import (
     CDC_DEFAULT_STACK_NAME,
@@ -110,6 +110,11 @@ class DataMigrationState:
         # read-only probe when the user clicks Start). Drives the Start-dialog
         # choice below; NOT itself the drop set.
         self._tables_with_data: frozenset[str] = frozenset()
+        # Target PK per selected table, cached from the SAME pre-dialog probe that
+        # fills _tables_with_data (one target round trip, not one per render). A value
+        # of None means "probed, could not read" -- distinct from an absent key, which
+        # means "not probed". Both are treated conservatively downstream.
+        self._target_primary_keys: dict[str, Optional[list[str]]] = {}
         # The user's run-wide choice for those pre-existing tables: "append"
         # (keep existing rows, load only the missing ones -- idempotent
         # SKIP_EXISTING, the non-destructive default) or "drop" (DROP+recreate
@@ -737,6 +742,23 @@ class DataMigrationState:
         """Return the pre-existing (non-empty) selected target tables."""
         with self._lock:
             return self._tables_with_data
+
+    def set_target_primary_keys(
+        self, keys: Mapping[str, Optional[list[str]]]
+    ) -> None:
+        """Record each selected target's ACTUAL primary key from the pre-dialog probe.
+
+        ``None`` for a table means it was probed and the key could not be read; a table
+        missing entirely means it was never probed. Callers must treat both as unknown.
+        """
+        with self._lock:
+            self._target_primary_keys = dict(keys)
+
+    @property
+    def target_primary_keys(self) -> dict[str, Optional[list[str]]]:
+        """Return the probed target primary keys (empty before the first probe)."""
+        with self._lock:
+            return dict(self._target_primary_keys)
 
     def set_reload_mode(self, mode: str) -> None:
         """Set the run-wide reload choice for pre-existing tables.

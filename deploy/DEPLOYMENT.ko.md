@@ -294,6 +294,14 @@ export DSQL_CLUSTER_ARN=arn:aws:dsql:us-east-1:<account>:cluster/xxxx
 export SOURCE_DB_SG=sg-source
 # -----------------------------------------------------------------------------
 
+> **스택 이름은 소문자로, 28자 이내로 지정하십시오.** 스택은 ALB를 `<스택이름>-alb`로
+> 만들고 ALB 서비스는 이 이름을 32자로 제한합니다. 더 길면 약 2분간 롤백한 뒤
+> `The load balancer name '<스택이름>-alb' cannot be longer than '32' characters`로
+> 배포가 실패합니다. 소문자도 중요합니다 — ALB의 DNS 이름은 ALB 이름의 대소문자를 그대로
+> 물려받고, Cognito 로그인은 이 DNS 이름이 소문자일 때만 동작합니다. ALB가 OAuth
+> `redirect_uri`의 호스트를 소문자로 변환해 보내는데 Cognito는 두 문자열을 정확히
+> 비교하기 때문입니다.
+
 aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator \

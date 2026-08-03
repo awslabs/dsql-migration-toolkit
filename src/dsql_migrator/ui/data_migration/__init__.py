@@ -64,7 +64,10 @@ from dsql_migrator.core.job_manager import (
     JobNotFoundError,
 )
 from dsql_migrator.core.target_connection import DsqlConnector
-from dsql_migrator.core.target_introspector import tables_with_rows
+from dsql_migrator.core.target_introspector import (
+    target_primary_key_columns,
+    tables_with_rows,
+)
 from dsql_migrator.core.models import (
     ChunkState,
     ErrorLogSummary,
@@ -1382,10 +1385,15 @@ def build_data_migration_screen(
                             refresh=refresh,
                             ai_error_opener=ai_error_opener,
                             # Tables the load will recreate to apply a primary key that
-                            # differs from the source. Resolved here (the inventory and
-                            # the applied conversions live in this scope) so the confirm
-                            # dialog can disclose the DDL step before it runs.
-                            schema_recreate_candidates=schema_recreate_tables(
+                            # differs from the source, so the confirm dialog can disclose
+                            # the DDL step before it runs. Passed as a THUNK, not a list:
+                            # the inventory and applied conversions live in this scope,
+                            # but the answer also depends on the targets' REAL primary
+                            # keys, which are only known after the dialog's pre-open
+                            # probe. Calling it there (not here) is what stops the dialog
+                            # announcing a recreate for a table that already carries the
+                            # applied key.
+                            schema_recreate_candidates=lambda: schema_recreate_tables(
                                 selected_names,
                                 table_conversions=(
                                     applied_table_conversions(
@@ -1397,6 +1405,8 @@ def build_data_migration_screen(
                                 ),
                                 inventory=inventory,
                                 tables_with_data=migration_state.tables_with_data,
+                                # Cached by the pre-dialog probe, so no target I/O here.
+                                target_keys=migration_state.target_primary_keys,
                             ),
                         )
                         with ui.row().classes(
@@ -2714,10 +2724,26 @@ def _render_full_load_step(
         # those go through the explicit Drop & reload choice below. Resolved by the
         # caller (which owns the inventory + applied conversions) and narrowed to the
         # tables THIS dialog is about; a live sink forbids recreating anything.
+        #
+        # ``schema_recreate_candidates`` MUST be a callable, resolved here -- after the
+        # pre-dialog probe has read the targets' real primary keys -- because a target
+        # that already carries the applied key needs no recreate, and announcing one
+        # contradicts what the user just did in Schema Conversion. Evaluating it at
+        # render time (as a plain list) can only compare the applied DDL against the
+        # SOURCE key, which is exactly what produced the false disclosure.
+        #
+        # Rejected rather than tolerated: accepting a list too would let a caller
+        # silently regress to render-time evaluation, and the dialog would still look
+        # correct while disclosing a recreate that does not happen.
+        if not callable(schema_recreate_candidates):
+            raise TypeError(
+                "schema_recreate_candidates must be a callable resolved after the "
+                "target probe, not a pre-computed list -- a list can only have been "
+                "built before any target primary key was read."
+            )
+        _candidates = schema_recreate_candidates() or ()
         recreate_now = (
-            []
-            if cdc_live_now
-            else [n for n in (schema_recreate_candidates or ()) if n in set(action_tables)]
+            [] if cdc_live_now else [n for n in _candidates if n in set(action_tables)]
         )
         selectable = table_reasons is not None
         # Live set of checked tables (mutated by the per-row checkboxes). Starts as
@@ -2979,26 +3005,41 @@ def _render_full_load_step(
             # choice to "append" (non-destructive); the confirm dialog lets the
             # user switch to "drop" for a clean reload.
             migration_state.set_tables_with_data(frozenset())
+            migration_state.set_target_primary_keys({})
             migration_state.set_reload_mode("append")
             target_config = getattr(session, "target_config", None)
             if target_config is not None and action_tables:
                 from nicegui import run
 
-                def _probe() -> frozenset[str]:
+                def _probe() -> tuple[frozenset[str], dict]:
                     connector = DsqlConnector(
                         target_config, aws_profile=session.aws_profile
                     )
-                    return frozenset(
-                        tables_with_rows(
-                            list(action_tables), connection_factory=connector.connect
-                        )
+                    names = list(action_tables)
+                    found = frozenset(
+                        tables_with_rows(names, connection_factory=connector.connect)
                     )
+                    # Read each target's REAL primary key on the same trip. The dialog
+                    # needs it to avoid announcing a recreate for a table that already
+                    # carries the applied key (the state right after "Apply all to
+                    # target"), and doing it here keeps the render path I/O-free.
+                    keys = {
+                        name: target_primary_key_columns(
+                            name, connection_factory=connector.connect
+                        )
+                        for name in names
+                    }
+                    return found, keys
 
                 try:
-                    found = await run.io_bound(_probe)
+                    found, keys = await run.io_bound(_probe)
                     migration_state.set_tables_with_data(found)
+                    migration_state.set_target_primary_keys(keys)
                 except Exception:  # noqa: BLE001 - on probe failure, warn-less confirm
                     migration_state.set_tables_with_data(frozenset())
+                    # Leave the key map EMPTY, not partially filled: an unprobed table
+                    # is treated as unknown, so the disclosure stays conservative.
+                    migration_state.set_target_primary_keys({})
             _open_confirm_dialog_now(
                 action_tables=action_tables,
                 on_confirm=confirm_action,

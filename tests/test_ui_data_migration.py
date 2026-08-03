@@ -757,6 +757,56 @@ def test_schema_recreate_tables_lists_only_empty_tables_with_a_changed_key() -> 
     ) == ["orders"]
 
 
+def test_schema_recreate_tables_excludes_a_target_that_already_has_the_key() -> None:
+    """The workshop complaint: after "Apply all to target" the empty target ALREADY
+    carries the composite key, yet the confirm dialog announced "1 empty table will be
+    recreated to apply the chosen primary key" -- claiming a recreate is needed to apply
+    a key that is already applied. With the target's real key known and equal, there is
+    nothing to apply, so the table must not be disclosed (and the engine skips the
+    DROP+CREATE to match).
+    """
+    from dsql_migrator.ui.data_migration import schema_recreate_tables
+
+    assert (
+        schema_recreate_tables(
+            ["orders"],
+            table_conversions={"orders": _composite_applied()},
+            inventory=_recreate_inventory(),
+            tables_with_data=[],
+            target_keys={"orders": ["customer_id", "id"]},
+        )
+        == []
+    )
+
+
+def test_schema_recreate_tables_keeps_a_target_whose_key_is_stale_or_unknown() -> None:
+    """The conservative half of the same rule. The engine promotes on the source-vs-
+    applied comparison, so anything this function drops is a recreate the user is never
+    told about -- only a definitely-EQUAL key may clear it.
+    """
+    from dsql_migrator.ui.data_migration import schema_recreate_tables
+
+    def listed(target_keys):
+        return schema_recreate_tables(
+            ["orders"],
+            table_conversions={"orders": _composite_applied()},
+            inventory=_recreate_inventory(),
+            tables_with_data=[],
+            target_keys=target_keys,
+        )
+
+    # Target still on the OLD key -> the recreate really happens, so disclose it.
+    assert listed({"orders": ["id"]}) == ["orders"]
+    # Key could not be read: unknown is NOT "safe" -- the engine recreates, so say so.
+    assert listed({"orders": None}) == ["orders"]
+    # Never probed (table absent from the mapping) -> same conservative answer.
+    assert listed({}) == ["orders"]
+    assert listed(None) == ["orders"]
+    # Right columns, WRONG order: (id, customer_id) is a different key -- the leading
+    # column is the entire point of the composite strategy -- so it is not a match.
+    assert listed({"orders": ["id", "customer_id"]}) == ["orders"]
+
+
 def test_schema_recreate_tables_excludes_a_populated_table() -> None:
     # A populated table is NEVER silently recreated -- it goes through the explicit
     # "Drop & reload" choice -- so it must not appear in this disclosure, or the dialog
@@ -847,13 +897,37 @@ class _ConfirmDialogUi:
         return lambda *_a, **_k: _ConfirmDialogUi._El(self)
 
 
-def _open_full_load_confirm_dialog(monkeypatch, *, recreate_candidates):
+class _StubConnector:
+    """Stands in for DsqlConnector: the probe only needs ``.connect`` to exist."""
+
+    def connect(self):  # pragma: no cover - never called; introspectors are faked
+        raise AssertionError("the probe's introspector calls must be patched")
+
+
+class _StubSession:
+    """A session with a target_config, so the pre-dialog probe actually runs."""
+
+    target_config = object()
+    aws_profile = None
+
+
+def _open_full_load_confirm_dialog(
+    monkeypatch,
+    *,
+    recreate_candidates,
+    migration_state=None,
+    session=None,
+    selected_names=("ecommerce.orders",),
+):
     """Render the Full Load step, click Start, and return the UI double.
 
     Drives the REAL dialog builder (not a source-text check): NiceGUI's ``context.client``
     is a read-only property on a Context instance, and the pre-dialog target probe runs
     via ``run.io_bound`` -- both are patched so the dialog builds in-process with no AWS
     or database access.
+
+    ``session`` defaults to None, which has no ``target_config`` and so skips the probe
+    entirely -- pass :class:`_StubSession` (with the introspectors patched) to exercise it.
     """
     import asyncio
 
@@ -889,12 +963,12 @@ def _open_full_load_confirm_dialog(monkeypatch, *, recreate_candidates):
 
     dm._render_full_load_step(
         ui,
-        DataMigrationState(),
+        migration_state if migration_state is not None else DataMigrationState(),
         _NoJobs(),
-        None,  # session: no target_config -> the probe is skipped entirely
+        session,  # None -> no target_config -> the probe is skipped entirely
         job=None,
         status=StepStatus.NOT_STARTED,
-        selected_names=["ecommerce.orders"],
+        selected_names=list(selected_names),
         guard_reason=None,
         start_full_load=noop,
         retry_failed_load=noop,
@@ -902,7 +976,13 @@ def _open_full_load_confirm_dialog(monkeypatch, *, recreate_candidates):
         accept_quarantine_and_continue=noop,
         stop_full_load=noop,
         refresh=noop,
-        schema_recreate_candidates=recreate_candidates,
+        # The step passes a THUNK (resolved after the probe); accept a plain list here
+        # for the tests that only care about what the dialog renders.
+        schema_recreate_candidates=(
+            recreate_candidates
+            if callable(recreate_candidates)
+            else (lambda: recreate_candidates)
+        ),
     )
     start = [h for (label, h) in ui.handlers if "Start" in label]
     assert start, f"no Start handler captured; buttons={ui.buttons}"
@@ -968,6 +1048,151 @@ def test_full_load_step_passes_recreate_candidates_into_the_confirm_dialog() -> 
     dialog_names = set(dialog.co_names) | set(dialog.co_freevars) | set(dialog.co_varnames)
     assert "conv_state" not in dialog_names
     assert "inventory" not in dialog_names
+
+
+def test_recreate_disclosure_is_resolved_after_the_probe_not_at_render_time(
+    monkeypatch,
+) -> None:
+    """The ordering bug that made the first fix useless.
+
+    ``schema_recreate_candidates`` used to be a LIST, evaluated while the step rendered
+    -- before any target had been read -- so it could only compare the applied DDL to the
+    SOURCE key and always claimed a recreate. The probe that learns each target's REAL
+    key runs later, when Start is clicked. Passing a THUNK instead moves the decision
+    after the probe, which is the whole point: a target that already carries the applied
+    key must not be announced as needing a recreate.
+
+    Asserted behaviourally: the dialog must not call the thunk until the probe has run.
+    """
+    calls: list[str] = []
+
+    def _candidates():
+        calls.append("resolved")
+        return []
+
+    ui = _open_full_load_confirm_dialog(monkeypatch, recreate_candidates=_candidates)
+
+    assert ui.opened == 1
+    assert calls == ["resolved"], (
+        "the dialog must resolve schema_recreate_candidates exactly once, when it opens "
+        "(after the probe) -- not at render time, when no target key is known yet"
+    )
+
+
+def test_full_load_step_feeds_the_probed_target_keys_into_the_disclosure() -> None:
+    """The thunk is only useful if it actually consults the probed keys.
+
+    The thunk is built inside ``build_data_migration_screen``'s ``content`` closure,
+    which needs a session, inventory and converter to drive -- so this checks the call
+    site's AST instead: ``schema_recreate_tables`` must be invoked with a ``target_keys``
+    keyword whose value reads ``migration_state.target_primary_keys``. Structural, but
+    pinned to the parse tree rather than to a source substring, so reformatting or a
+    reworded comment cannot satisfy it.
+
+    Without this the step can pass ``target_keys=None`` (or drop the argument) while all
+    the other plumbing stays in place, and the dialog silently reverts to "everything
+    with a changed key is recreated" -- the workshop bug.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "schema_recreate_tables"
+    ]
+    assert calls, "build_data_migration_screen no longer calls schema_recreate_tables"
+
+    for call in calls:
+        kwargs = {kw.arg: kw.value for kw in call.keywords}
+        assert "target_keys" in kwargs, (
+            "the schema_recreate_tables call must pass target_keys, or the disclosure "
+            "cannot tell an already-applied key from a stale one"
+        )
+        assert (
+            ast.unparse(kwargs["target_keys"])
+            == "migration_state.target_primary_keys"
+        ), (
+            "target_keys must be the probe's cache on the migration state; got "
+            f"{ast.unparse(kwargs['target_keys'])!r}"
+        )
+
+    lambdas = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Lambda)
+        and any(
+            isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Name)
+            and c.func.id == "schema_recreate_tables"
+            for c in ast.walk(node)
+        )
+    ]
+    assert lambdas, (
+        "schema_recreate_tables must be wrapped in a lambda so it is resolved after the "
+        "dialog's target probe, not while the step renders"
+    )
+
+
+def test_pre_dialog_probe_caches_each_targets_real_primary_key(monkeypatch) -> None:
+    """The probe that counts rows must ALSO read each target's real primary key.
+
+    Everything downstream is fed from that one cache, so if the probe stops filling it
+    the map is empty, every table falls back to "unknown", and the disclosure reverts to
+    announcing a recreate for tables that need none -- with the thunk and the
+    ``target_keys`` argument both still wired up, so no other test notices.
+
+    Runs the real probe body with the connector and both introspector calls faked, and
+    asserts the keys land on the migration state.
+    """
+    from dsql_migrator.ui import data_migration as dm
+
+    monkeypatch.setattr(dm, "DsqlConnector", lambda *a, **k: _StubConnector())
+    monkeypatch.setattr(dm, "tables_with_rows", lambda names, **k: ["ecommerce.other"])
+    real_keys = {
+        "ecommerce.orders": ["customer_id", "id"],
+        "ecommerce.other": ["id"],
+    }
+    monkeypatch.setattr(
+        dm,
+        "target_primary_key_columns",
+        lambda name, **k: real_keys.get(name),
+    )
+
+    state = DataMigrationState()
+    _open_full_load_confirm_dialog(
+        monkeypatch,
+        recreate_candidates=lambda: [],
+        migration_state=state,
+        session=_StubSession(),
+        selected_names=["ecommerce.orders", "ecommerce.other"],
+    )
+
+    assert state.target_primary_keys == real_keys, (
+        "the pre-dialog probe must cache every probed target's real primary key; got "
+        f"{state.target_primary_keys!r}"
+    )
+    assert state.tables_with_data == frozenset({"ecommerce.other"})
+
+
+def test_migration_state_distinguishes_unreadable_from_unprobed_target_keys() -> None:
+    # The conservative fallback rests on this: None ("probed, unreadable") and absent
+    # ("never probed") must both survive the round trip, and the getter must not hand
+    # out the internal dict for a caller to mutate.
+    state = DataMigrationState()
+    assert state.target_primary_keys == {}
+
+    state.set_target_primary_keys({"a": ["x", "id"], "b": None})
+    assert state.target_primary_keys == {"a": ["x", "id"], "b": None}
+    assert "c" not in state.target_primary_keys  # unprobed stays absent
+
+    state.target_primary_keys["a"] = ["mutated"]
+    assert state.target_primary_keys["a"] == ["x", "id"]
 
 
 def test_shard_worker_keys_on_the_target_composite_pk(monkeypatch) -> None:
@@ -1211,6 +1436,36 @@ def test_empty_target_still_on_the_old_key_is_recreated_not_appended_into() -> N
 
     assert recreated == ["orders"]
     assert importer.key_columns_by_table["orders"] == ["customer_id", "id"]
+
+
+def test_empty_target_already_carrying_the_new_key_is_not_recreated() -> None:
+    """The ACTUAL workshop path, and the gap the two tests above left open: the user
+    picks the composite key in Step 2 AND clicks "Apply all to target", so the empty
+    target already HAS ("customer_id", "id") before the first Full Load.
+
+    Promoting here would DROP and CREATE an identical table to "apply" a key it already
+    carries -- a wasted DDL round trip (DSQL allows one DDL per transaction), disclosed
+    to the user as "1 empty table will be recreated to apply the chosen primary key",
+    which reads as a contradiction against the table they just created. The load must
+    append instead, keyed on the real composite key.
+    """
+    importer = _FakeImporter()
+    recreated: list[str] = []
+    migrator = _append_migrator(
+        importer,
+        target_rows=0,
+        target_pk=["customer_id", "id"],  # already the applied key
+        recreated=recreated,
+    )
+
+    migrator.migrate_table(_tables()[0])
+
+    assert recreated == []  # nothing to apply -> no DROP+CREATE
+    # Still keyed on the composite key, so the append stays idempotent on the real PK.
+    assert importer.key_columns_by_table["orders"] == ["customer_id", "id"]
+    # An existing (empty) table CAN conflict on a retry, so the append keeps ON CONFLICT
+    # -- unlike the recreate path, which uses a plain INSERT into a fresh table.
+    assert importer.on_conflict_by_table["orders"] is not OnConflictMode.NONE
 
 
 def test_cdc_coexisting_empty_target_appends_when_the_key_already_matches() -> None:

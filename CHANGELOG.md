@@ -5,6 +5,56 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.229
+
+### Fixed
+
+- **An empty target that already carried the chosen primary key was still dropped and
+  recreated "to apply" it.** After picking a composite key in Schema Conversion and
+  running Apply all to target, the first Full Load's confirm dialog announced
+  `1 empty table will be recreated to apply the chosen primary key` for a table that had
+  just been created with exactly that key — a contradiction, plus a wasted DROP+CREATE
+  round trip (DSQL permits one DDL per transaction, so it is its own trip per table).
+  Both the disclosure and the engine's promotion decided on the applied DDL vs the
+  *source* key alone and never read the target's real key, even though the append path
+  right below already did. Both now consult the target's actual primary key and skip the
+  recreate when it already matches; the key is read once by the probe that already runs
+  before the dialog opens, so the render path stays free of target I/O. Deliberately
+  asymmetric: only a definitely-equal key skips the recreate — a key that cannot be read
+  is unknown, not safe, and still recreates.
+
+- **Cognito login never succeeded: the ALB and the app client disagreed on the callback
+  URL's letter case.** With `EnableCognitoAuth=true`, signing in always failed — the
+  hosted UI bounced back with `Client is not enabled for OAuth2.0 flows.`, even though
+  `AllowedOAuthFlowsUserPoolClient` was `true` the whole time. Left unnamed, the ALB got
+  a CloudFormation-generated mixed-case name (`mysql--LoadB-u9DQdeKlckt9`) and its
+  `DNSName` inherited that casing, so the app client's `CallbackURLs` — built from
+  `GetAtt DNSName` — were mixed case. But the ALB sends the OAuth `redirect_uri` with
+  the host lower-cased, and Cognito compares the two exactly. `/oauth2/authorize`
+  tolerates the mismatch, which is why the login page rendered and only the submit
+  failed, and why a first sign-in appeared to "change the password, then error out":
+  the password change had already been applied when the redirect was rejected. The ALB
+  is now named `${AWS::StackName}-alb`, so its DNS name follows the (lower-case) stack
+  name and the two strings match.
+
+### Added
+
+- **The stack now creates the first Cognito login user.** The user pool sets
+  `AllowAdminCreateUserOnly`, so with no user a `EnableCognitoAuth=true` deploy
+  succeeded and handed back an app nobody could sign in to. A new required parameter
+  `CognitoAdminEmail` creates that user and Cognito emails it a temporary password; a
+  template `Rules` assertion rejects the deploy up-front when it is missing. The pool ID
+  is also exported (`CognitoUserPoolId`) so further users can be added, and
+  `CognitoHostedUiDomain` is now the full sign-in URL instead of the bare prefix.
+
+### Changed
+
+- **The deployment guides now state the stack-name constraints.** Because the ALB is
+  named after the stack, the stack name must be lower case and 28 characters or fewer —
+  a longer name fails the deploy with
+  `The load balancer name '<stack>-alb' cannot be longer than '32' characters` only
+  after a ~2 minute rollback, and a mixed-case name breaks Cognito login as above.
+
 ## v0.1.228
 
 ### Fixed

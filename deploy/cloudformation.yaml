@@ -51,6 +51,7 @@ Metadata:
         Parameters:
           - EnableCognitoAuth
           - CognitoDomainPrefix
+          - CognitoAdminEmail
           - AppDomainName
       - Label:
           default: "5. Container image & sizing — defaults work, no image build needed"
@@ -97,6 +98,8 @@ Metadata:
         default: "Enable Cognito login  [Optional, default off] — OIDC login at the ALB"
       CognitoDomainPrefix:
         default: "Cognito domain prefix  [Optional] — required only if Cognito login is enabled"
+      CognitoAdminEmail:
+        default: "First login user's email  [Optional] — required only if Cognito login is enabled; gets a temporary password by email"
       AppDomainName:
         default: "Custom domain  [Optional] — blank = use the ALB DNS name"
       ContainerImageUri:
@@ -158,7 +161,7 @@ Parameters:
 
   ContainerImageUri:
     Type: String
-    Default: public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.228
+    Default: public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.229
     Description: >
       App container image URI. Defaults to the published ECR Public image, so a
       normal deploy needs NO image build -- Fargate pulls it directly (works from
@@ -289,6 +292,19 @@ Parameters:
       (https://<prefix>.auth.<region>.amazoncognito.com). Required when
       EnableCognitoAuth=true.
 
+  CognitoAdminEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Email address of the FIRST login user, created by this stack when
+      EnableCognitoAuth=true. Cognito emails a temporary password to it; the hosted
+      UI then asks for a new one on first sign-in. Required with Cognito, because the
+      user pool disables self sign-up (AllowAdminCreateUserOnly) -- without this the
+      deploy succeeds and produces an app NOBODY CAN LOG IN TO. Add more users later
+      with: aws cognito-idp admin-create-user --user-pool-id <UserPoolId output>
+      --username <email> --user-attributes Name=email,Value=<email>
+      Name=email_verified,Value=true --desired-delivery-mediums EMAIL
+
   EnableAiAssist:
     Type: String
     Default: "false"
@@ -370,6 +386,29 @@ Rules:
           EnableCognitoAuth=true, because the app has no auth of its own. Either
           enable Cognito, or tighten AllowedIngressCidr to your own network/IP CIDR
           (a scoped CIDR is a sufficient gate and needs no Cognito).
+
+  # Cognito needs BOTH a hosted-UI domain and a first user. The pool sets
+  # AllowAdminCreateUserOnly (no self sign-up), so with no user the deploy SUCCEEDS and
+  # hands back a URL that redirects to a login screen with no account to use -- an app
+  # nobody can log in to, discovered only when someone tries. Assert both here so that
+  # is a deploy-time error instead.
+  CognitoNeedsDomainAndFirstUser:
+    RuleCondition:
+      Fn::Equals: [Ref: EnableCognitoAuth, "true"]
+    Assertions:
+      - Assert:
+          Fn::Not:
+            - Fn::Equals: [Ref: CognitoDomainPrefix, ""]
+        AssertDescription: >-
+          EnableCognitoAuth=true requires CognitoDomainPrefix (the globally-unique
+          hosted-UI domain prefix users are redirected to for sign-in).
+      - Assert:
+          Fn::Not:
+            - Fn::Equals: [Ref: CognitoAdminEmail, ""]
+        AssertDescription: >-
+          EnableCognitoAuth=true requires CognitoAdminEmail. The user pool disables
+          self sign-up, so without a first user the deploy would produce an app nobody
+          can log in to. Cognito emails a temporary password to this address.
 
   # The Fargate task must have an egress path to the source MySQL on SourceDbPort,
   # or it can never connect (the UI's source connection times out). That path is
@@ -1168,10 +1207,51 @@ Resources:
       UserPoolId:
         Ref: UserPool
 
+  # The FIRST login user, created by the stack. The pool sets
+  # AllowAdminCreateUserOnly, so nobody can sign themselves up -- and without this
+  # resource the deploy handed back a working URL that redirected to a login screen
+  # with no account to use. Creating it here keeps the whole thing ONE deploy: no
+  # follow-up admin-create-user, and no need to hunt for the pool id first.
+  #
+  # DesiredDeliveryMediums=EMAIL makes Cognito send the temporary password; the hosted
+  # UI then forces a new one on first sign-in (the user starts in
+  # FORCE_CHANGE_PASSWORD). email_verified is set so that flow is not additionally
+  # gated on verifying the address.
+  InitialUser:
+    Type: AWS::Cognito::UserPoolUser
+    Condition: CognitoEnabled
+    Properties:
+      UserPoolId:
+        Ref: UserPool
+      Username:
+        Ref: CognitoAdminEmail
+      DesiredDeliveryMediums:
+        - EMAIL
+      UserAttributes:
+        - Name: email
+          Value:
+            Ref: CognitoAdminEmail
+        - Name: email_verified
+          Value: "true"
+
   # --- Load balancer ----------------------------------------------------------
   LoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
+      # Name the ALB explicitly, in lower case. Left unnamed, CloudFormation
+      # auto-generates a MIXED-CASE name (e.g. "mysql--LoadB-u9DQdeKlckt9") and the
+      # ALB's DNSName inherits that casing verbatim -- but the ALB itself sends the
+      # Cognito redirect_uri with the host LOWER-CASED. The Cognito app client's
+      # CallbackURLs are built from GetAtt DNSName (mixed case), so the two strings
+      # differ and the hosted UI rejects the sign-in with the misleading message
+      # "Client is not enabled for OAuth2.0 flows." (verified: A/B/A/B crossover on a
+      # live pool -- only the run with a lower-case CallbackURL returned an auth code;
+      # /oauth2/authorize tolerates the mismatch, so the login PAGE renders and only
+      # the submit fails). Since DNSName casing follows the ALB name, a lower-case name
+      # makes DNSName lower case and the two match. See the StackNameFitsAlbName rule
+      # for the 32-char budget this imposes on the stack name.
+      Name:
+        Fn::Sub: ${AWS::StackName}-alb
       Type: application
       Scheme:
         Ref: AlbScheme
@@ -1425,6 +1505,28 @@ Outputs:
 
   CognitoHostedUiDomain:
     Condition: CognitoEnabled
-    Description: Cognito hosted-UI domain prefix (create users in this pool).
+    Description: Cognito hosted-UI domain users are redirected to for sign-in.
     Value:
-      Ref: CognitoDomainPrefix
+      Fn::Sub: https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com
+
+  # The pool id was NOT an output, while CognitoHostedUiDomain's description said
+  # "create users in this pool" -- so adding a second user meant hunting for the id in
+  # the console or via list-user-pools. admin-create-user needs exactly this value.
+  CognitoUserPoolId:
+    Condition: CognitoEnabled
+    Description: >-
+      Cognito user pool id. The first user is created by this stack
+      (CognitoAdminEmail); add more with: aws cognito-idp admin-create-user
+      --user-pool-id <this> --username <email> --user-attributes
+      Name=email,Value=<email> Name=email_verified,Value=true
+      --desired-delivery-mediums EMAIL
+    Value:
+      Ref: UserPool
+
+  CognitoFirstUser:
+    Condition: CognitoEnabled
+    Description: >-
+      Email the stack created as the first login user. Cognito emailed it a temporary
+      password; the hosted UI asks for a new one on first sign-in.
+    Value:
+      Ref: CognitoAdminEmail

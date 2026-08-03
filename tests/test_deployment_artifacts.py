@@ -182,6 +182,63 @@ def test_cloudformation_parses_as_yaml(template: dict) -> None:
     assert "Resources" in template
 
 
+def test_alb_is_named_so_its_dns_name_is_lower_case(template: dict) -> None:
+    # An unnamed ALB gets a CloudFormation-generated MIXED-CASE name
+    # ("mysql--LoadB-u9DQdeKlckt9") and its DNSName inherits that casing. The ALB
+    # sends the Cognito OAuth redirect_uri with the host LOWER-CASED, while the app
+    # client's CallbackURLs come from GetAtt DNSName -- so the strings differ and
+    # sign-in fails with the misleading "Client is not enabled for OAuth2.0 flows."
+    # Naming the ALB from the (lower-case) stack name keeps DNSName lower case.
+    props = template["Resources"]["LoadBalancer"]["Properties"]
+    assert "Name" in props, (
+        "LoadBalancer must set Name; without it CloudFormation generates a mixed-case "
+        "name, DNSName inherits the casing, and Cognito rejects the login because the "
+        "ALB lower-cases the redirect_uri host it sends."
+    )
+    assert props["Name"] == {"Fn::Sub": "${AWS::StackName}-alb"}, (
+        f"unexpected ALB Name {props['Name']!r}; it must derive from the stack name so "
+        "the operator controls the casing (documented as lower-case, <=28 chars)."
+    )
+
+
+def test_cognito_callback_url_is_built_from_the_alb_dns_name(template: dict) -> None:
+    # The pairing that makes the test above matter: the callback is GetAtt DNSName, so
+    # DNSName's casing IS the callback's casing. If this ever switches to a hand-built
+    # string, the ALB Name guard above no longer protects the login flow.
+    client = template["Resources"]["UserPoolClient"]["Properties"]
+    rendered = json.dumps(client["CallbackURLs"])
+    assert "LoadBalancer" in rendered and "DNSName" in rendered, (
+        "UserPoolClient.CallbackURLs no longer derives from the ALB DNSName; re-check "
+        "that the callback host still matches what the ALB sends as redirect_uri."
+    )
+
+
+def test_deployment_docs_state_the_stack_name_constraint(template: dict) -> None:
+    # The 32-char ALB name cap is only discoverable via a ~2 minute rollback, and the
+    # lower-case requirement is invisible until Cognito login fails. Both must be
+    # documented up-front, in every language, next to the deploy command.
+    # Assert on the ALB error text itself, not a bare "32" -- these docs already say
+    # "32" for /32 CIDRs and token_urlsafe(32), so a loose substring check passes even
+    # after the constraint paragraph is deleted (confirmed by mutation).
+    for name in ("DEPLOYMENT.md", "DEPLOYMENT.ko.md", "DEPLOYMENT.ja.md"):
+        text = (DEPLOY_DIR / name).read_text(encoding="utf-8")
+        assert "-alb" in text, f"{name} must say the ALB is named <stack-name>-alb"
+        assert "cannot be longer than '32' characters" in text, (
+            f"{name} must quote the actual ALB failure text so an operator can match "
+            "it: The load balancer name '<stack>-alb' cannot be longer than '32' "
+            "characters. Without it, the 32-char cap is only discoverable by a "
+            "~2 minute rollback."
+        )
+        assert "28" in text, (
+            f"{name} must state the resulting stack-name budget (28 characters)."
+        )
+        assert "redirect_uri" in text, (
+            f"{name} must explain WHY the stack name has to be lower case -- the ALB "
+            "lower-cases the redirect_uri host it sends to Cognito, so a mixed-case "
+            "ALB DNS name breaks login."
+        )
+
+
 def test_cloudformation_provisions_fargate_app_stack(template: dict) -> None:
     types = {res["Type"] for res in template["Resources"].values()}
     assert "AWS::ECS::Cluster" in types

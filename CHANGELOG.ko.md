@@ -5,6 +5,52 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.229
+
+### 수정
+
+- **이미 선택한 프라이머리 키를 가진 빈 대상 테이블을 "키를 적용하려고" 다시 만들었습니다.**
+  Schema Conversion에서 복합 키를 선택하고 Apply all to target을 실행한 뒤 첫 Full Load를
+  시작하면, 방금 그 키로 만들어진 테이블에 대해 확인 대화 상자가
+  `1 empty table will be recreated to apply the chosen primary key`라고 안내했습니다.
+  모순인 데다 불필요한 DROP+CREATE가 실행됩니다(DSQL은 트랜잭션당 DDL이 1문장이므로 테이블마다
+  별도 왕복입니다). 대화 상자의 안내와 엔진의 승격 판정이 모두 적용된 DDL과 **소스** 키만
+  비교하고 대상의 실제 키는 읽지 않았습니다 — 바로 아래 append 경로는 이미 읽고 있었는데도
+  그랬습니다. 이제 둘 다 대상의 실제 프라이머리 키를 확인해 이미 일치하면 재생성을
+  건너뜁니다. 키는 대화 상자가 열리기 전에 이미 실행되는 프로브가 한 번에 함께 읽으므로 화면을
+  그리는 경로에는 대상 조회가 추가되지 않습니다. 의도적으로 비대칭입니다 — 확실히 일치할 때만
+  건너뛰고, 키를 읽을 수 없으면 "안전"이 아니라 "알 수 없음"으로 보아 재생성합니다.
+
+- **Cognito 로그인이 아예 되지 않았습니다 — ALB와 앱 클라이언트가 콜백 URL의 대소문자를
+  서로 다르게 봤습니다.** `EnableCognitoAuth=true`로 배포하면 로그인이 항상 실패하고
+  hosted UI가 `Client is not enabled for OAuth2.0 flows.` 메시지와 함께 되돌려보냈습니다.
+  `AllowedOAuthFlowsUserPoolClient`는 처음부터 끝까지 `true`였는데도 그랬습니다. ALB에
+  이름을 지정하지 않으면 CloudFormation이 대소문자 섞인 이름
+  (`mysql--LoadB-u9DQdeKlckt9`)을 만들고 `DNSName`이 그 대소문자를 그대로 물려받습니다.
+  앱 클라이언트의 `CallbackURLs`는 `GetAtt DNSName`으로 만들어지니 역시 대소문자가
+  섞입니다. 그런데 ALB는 OAuth `redirect_uri`의 호스트를 소문자로 변환해 보내고, Cognito는
+  두 문자열을 정확히 비교합니다. `/oauth2/authorize`는 이 불일치를 허용하기 때문에 로그인
+  화면은 정상 표시되고 제출만 실패했으며, 최초 로그인에서는 "비밀번호는 변경됐는데 에러가
+  뜨는" 것처럼 보였습니다 — 리다이렉트가 거부된 시점에 비밀번호 변경은 이미 적용된
+  뒤였기 때문입니다. 이제 ALB 이름을 `${AWS::StackName}-alb`로 지정하므로 DNS 이름이
+  (소문자인) 스택 이름을 따라가고 두 문자열이 일치합니다.
+
+### 추가
+
+- **스택이 첫 Cognito 로그인 사용자를 생성합니다.** 사용자 풀은 `AllowAdminCreateUserOnly`를
+  설정하므로, 사용자가 없으면 `EnableCognitoAuth=true` 배포가 성공하고도 아무도 로그인할 수
+  없는 앱을 돌려줬습니다. 새 필수 파라미터 `CognitoAdminEmail`이 그 사용자를 만들고 Cognito가
+  임시 비밀번호를 이메일로 보냅니다. 값이 없으면 템플릿 `Rules` 단정문이 배포 전에 거부합니다.
+  사용자를 더 추가할 수 있도록 풀 ID도 출력하며(`CognitoUserPoolId`),
+  `CognitoHostedUiDomain`은 접두사만이 아니라 전체 로그인 URL로 바뀌었습니다.
+
+### 변경
+
+- **배포 가이드에 스택 이름 제약을 명시했습니다.** ALB 이름이 스택 이름에서 파생되므로 스택
+  이름은 소문자로 28자 이내여야 합니다. 더 길면 약 2분간 롤백한 뒤에야
+  `The load balancer name '<스택이름>-alb' cannot be longer than '32' characters`로
+  실패하고, 대문자가 섞이면 위와 같이 Cognito 로그인이 깨집니다.
+
 ## v0.1.228
 
 ### 수정

@@ -327,6 +327,15 @@ export DSQL_CLUSTER_ARN=arn:aws:dsql:us-east-1:<account>:cluster/xxxx
 export SOURCE_DB_SG=sg-source
 # -----------------------------------------------------------------------------
 
+> **Stack name: use lower case, 28 characters or fewer.** The stack provisions its
+> ALB as `<stack-name>-alb`, which the ALB service caps at 32 characters — a longer
+> stack name fails the deploy, after a ~2 minute rollback, with
+> `The load balancer name '<stack-name>-alb' cannot be longer than '32' characters`.
+> Lower case matters too:
+> the ALB's DNS name inherits the casing of its name, and Cognito login (if you enable
+> it) only works when that DNS name is lower case, because the ALB sends the OAuth
+> `redirect_uri` with the host lower-cased and Cognito compares the two exactly.
+
 aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator \

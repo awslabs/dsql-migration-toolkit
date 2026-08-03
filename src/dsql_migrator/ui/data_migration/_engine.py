@@ -2349,7 +2349,16 @@ class BatchedTableMigrator:
             and not pre_recreated
             and self._target_counter(table) == 0
         ):
-            is_replace = True
+            # ...unless the empty target ALREADY carries that key -- the normal state
+            # right after "Apply all to target" in Step 2. Recreating it would DROP and
+            # CREATE the identical table to "apply" a key it already has: a wasted DDL
+            # round trip (DSQL permits one DDL per transaction) that the confirm dialog
+            # has to announce as a recreate, which reads as a contradiction. Only an
+            # EQUAL key skips the promotion; a key that cannot be read (None) is
+            # unknown, not safe, so it still recreates -- matching the append path
+            # below, which refuses rather than assumes when the catalog won't answer.
+            if self._target_pk_reader(table) != target_key_columns:
+                is_replace = True
 
         # Reader range sharding: for a LARGE single-integer-PK table, split the read
         # into K disjoint PK ranges streamed concurrently (each its own snapshot), so

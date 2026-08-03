@@ -328,6 +328,14 @@ export DSQL_CLUSTER_ARN=arn:aws:dsql:us-east-1:<account>:cluster/xxxx
 export SOURCE_DB_SG=sg-source
 # -----------------------------------------------------------------------------
 
+> **スタック名は小文字で、28 文字以内にしてください。** スタックは ALB を
+> `<スタック名>-alb` として作成し、ALB サービスはこの名前を 32 文字に制限します。
+> これを超えると約 2 分のロールバックの後、`The load balancer name '<スタック名>-alb'
+> cannot be longer than '32' characters` でデプロイが失敗します。小文字であることも
+> 重要です。ALB の DNS 名は ALB 名の大文字小文字をそのまま継承し、Cognito ログインは
+> この DNS 名が小文字のときのみ動作します。ALB が OAuth `redirect_uri` のホストを
+> 小文字に変換して送信する一方、Cognito は 2 つの文字列を厳密に比較するためです。
+
 aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator \

@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Mapping, Optional, Sequence
 
 from dsql_migrator.core.assessor import (
     _OVERSIZED_LOB_BASES,
@@ -812,6 +812,7 @@ def schema_recreate_tables(
     table_conversions,
     inventory: Optional[SourceInventory],
     tables_with_data: Iterable[str],
+    target_keys: Optional[Mapping[str, Optional[list[str]]]] = None,
 ) -> list[str]:
     """Return the EMPTY target tables whose primary key the load will have to recreate.
 
@@ -826,11 +827,21 @@ def schema_recreate_tables(
     recreated (it goes through the explicit Drop & reload choice instead), so it must not
     appear in this disclosure.
 
-    Pure and UI-free (no target I/O): it compares the APPLIED conversion's key against
-    the SOURCE key, which is what the engine's promotion test does. It therefore lists
-    the tables that *will* be recreated when their target is empty; a target that already
-    carries the new key is recreated too (same DDL, same key), so naming it is accurate,
-    not a false alarm.
+    ``target_keys`` maps table name -> the target's ACTUAL primary-key columns (as read
+    by :func:`~dsql_migrator.core.target_introspector.target_primary_key_columns`), and
+    is what keeps this honest. A user who applies the composite key in Step 2 has a
+    target that ALREADY carries it, and recreating it would be a no-op DROP+CREATE
+    announced as "recreated to apply the chosen primary key" -- a contradiction, plus a
+    wasted DDL round trip (DSQL allows one DDL per transaction). When the real key
+    already equals the applied key, the table is dropped from this list.
+
+    The mapping stays OPTIONAL and the fallback is deliberately conservative: a missing
+    entry, or an explicit ``None`` (the key could not be read), keeps the table listed.
+    Unknown is not "safe" -- the engine promotes on the same source-vs-applied
+    comparison, so under-reporting here would hide a recreate that still happens. Do NOT
+    make this function read the target itself: it renders inside the confirm dialog, and
+    the caller already probes the target once (alongside ``tables_with_data``) and
+    passes the cached answer in.
     """
     from dsql_migrator.core.converter import parse_target_primary_key
 
@@ -838,6 +849,7 @@ def schema_recreate_tables(
         return []
     source_pk = {table.name: list(table.primary_key) for table in inventory.tables}
     populated = set(tables_with_data)
+    keys = target_keys or {}
     out: list[str] = []
     for name in table_names:
         if name in populated:
@@ -846,8 +858,14 @@ def schema_recreate_tables(
         if applied is None:
             continue
         target_key = parse_target_primary_key(applied.target_ddl)
-        if target_key and target_key != source_pk.get(name, []):
-            out.append(name)
+        if not target_key or target_key == source_pk.get(name, []):
+            continue
+        # The target already has exactly the key the conversion asks for, so there is
+        # nothing for a recreate to apply. Only an EQUAL key clears it -- absent (not
+        # probed) or None (unreadable) both stay listed.
+        if name in keys and keys[name] == target_key:
+            continue
+        out.append(name)
     return sorted(out)
 
 
