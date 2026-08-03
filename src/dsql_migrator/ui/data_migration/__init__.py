@@ -146,6 +146,8 @@ from dsql_migrator.ui.data_migration._models import (
     MigrationType,
     _SUBSTEPS,
     prereq_mode_for_type,
+    migration_status_label,
+    stale_error_notice,
     substeps_for_type,
     resolve_active_substep_for_type,
     resolve_active_substep,
@@ -702,7 +704,14 @@ def build_data_migration_screen(
                 # Outline chip to match the CDC table's status badges (Full Load /
                 # Consistency / DLQ are all outline) — one consistent status-chip style
                 # across both stats tables, per the design system.
-                ui.badge(status.value).props(f"color={_STATUS_COLORS[status]} outline")
+                # Prefix the phase the status belongs to. Bare "DONE" is ambiguous once
+                # the type selector moves: after a finished Full Load a user can switch
+                # to CDC only, and this badge -- backed by the same underlying step --
+                # then reads as if CDC had completed when none has run.
+                ui.badge(
+                    f"{migration_status_label(migration_type, cdc_streaming=cdc_pipeline_live(migration_state))}"
+                    f": {status.value}"
+                ).props(f"color={_STATUS_COLORS[status]} outline")
 
             if inventory is None:
                 render_notice(
@@ -733,12 +742,19 @@ def build_data_migration_screen(
 
             error = migration_state.error
             if error and status is not StepStatus.IN_PROGRESS:
-                render_notice(
-                    ui,
-                    tone="error",
-                    header="Migration failed",
-                    body=error,
+                # An error recorded under a DIFFERENT migration type is carried-over
+                # context, not a live failure of the current selection: it stays (the
+                # gap it reports is real, and CDC does not backfill a Full Load gap) but
+                # is demoted from error to warning, so the screen no longer shows
+                # "Migration failed" beside a "Success" header and a DONE status.
+                notice = stale_error_notice(
+                    error,
+                    migration_type=migration_type,
+                    error_migration_type=migration_state.error_migration_type,
                 )
+                if notice is not None:
+                    _tone, _header, _body = notice
+                    render_notice(ui, tone=_tone, header=_header, body=_body)
 
             async def refresh_browser() -> None:
                 """Re-introspect this session's source + target for the picker.

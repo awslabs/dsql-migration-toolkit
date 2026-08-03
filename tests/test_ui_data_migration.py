@@ -4484,6 +4484,111 @@ def test_prereq_mode_for_type() -> None:
     )
 
 
+def test_status_badge_names_the_phase_its_status_belongs_to() -> None:
+    """A bare "DONE" lies once the type selector moves.
+
+    The badge is backed by one underlying step for every migration type, so after a
+    finished Full Load a switch to CDC only left it reading as though CDC had completed
+    when none had run. Naming the phase keeps the value honest.
+    """
+    from dsql_migrator.ui.data_migration import MigrationType, migration_status_label
+
+    assert migration_status_label(MigrationType.FULL_LOAD_ONLY) == "Full Load"
+    assert migration_status_label(MigrationType.CDC_ONLY) == "CDC"
+    # Combined: the step is promoted to DONE only once CDC is genuinely live, so before
+    # that the status is still describing the Full Load.
+    assert migration_status_label(MigrationType.FULL_LOAD_AND_CDC) == "Full Load"
+    assert (
+        migration_status_label(MigrationType.FULL_LOAD_AND_CDC, cdc_streaming=True)
+        == "CDC"
+    )
+    # CDC-only never describes the Full Load, streaming or not.
+    assert (
+        migration_status_label(MigrationType.CDC_ONLY, cdc_streaming=True) == "CDC"
+    )
+
+
+def test_stale_error_is_demoted_not_deleted_after_a_type_switch() -> None:
+    """The reported bug: a red "Migration failed" banner beside a "Success" header.
+
+    A Full Load that quarantined rows recorded an error, nothing cleared it on a type
+    switch, and the CDC-only screen then showed three verdicts at once -- header
+    "Success", status DONE, banner "Migration failed". Dropping the message would be
+    worse than leaving it: it reports rows genuinely missing from the target, and CDC
+    streams ongoing changes without backfilling a Full Load gap. So it is kept and
+    demoted.
+    """
+    from dsql_migrator.ui.data_migration import MigrationType, stale_error_notice
+
+    err = "FullLoadIncompleteError: 1 of 7 table(s) did not fully load."
+
+    # Same type -> a live failure, unchanged.
+    assert stale_error_notice(
+        err,
+        migration_type=MigrationType.FULL_LOAD_ONLY,
+        error_migration_type=MigrationType.FULL_LOAD_ONLY,
+    ) == ("error", "Migration failed", err)
+
+    # Switched to CDC only -> demoted to a warning, re-framed, message still carried.
+    tone, header, body = stale_error_notice(
+        err,
+        migration_type=MigrationType.CDC_ONLY,
+        error_migration_type=MigrationType.FULL_LOAD_ONLY,
+    )
+    assert tone == "warning", "a carried-over error must not keep the error tone"
+    assert "Migration failed" not in header
+    assert err in body, "the original detail must survive -- the gap it reports is real"
+    assert "not backfill" in body, "must say CDC will not close a Full Load gap"
+
+    # No error at all -> no notice.
+    assert (
+        stale_error_notice(
+            None,
+            migration_type=MigrationType.CDC_ONLY,
+            error_migration_type=MigrationType.FULL_LOAD_ONLY,
+        )
+        is None
+    )
+    assert (
+        stale_error_notice(
+            "",
+            migration_type=MigrationType.CDC_ONLY,
+            error_migration_type=None,
+        )
+        is None
+    )
+
+    # Unknown provenance (an older session) must NOT be softened -- silently demoting a
+    # failure we cannot attribute would hide a real one.
+    assert stale_error_notice(
+        err,
+        migration_type=MigrationType.CDC_ONLY,
+        error_migration_type=None,
+    ) == ("error", "Migration failed", err)
+
+
+def test_set_error_stamps_the_migration_type_and_clear_resets_it() -> None:
+    # The demotion above is only possible if provenance is recorded, so pin the stamp.
+    from dsql_migrator.ui.data_migration import DataMigrationState, MigrationType
+
+    state = DataMigrationState()
+    assert state.error_migration_type is None
+
+    state.set_migration_type(MigrationType.FULL_LOAD_ONLY)
+    state.set_error("boom")
+    assert state.error == "boom"
+    assert state.error_migration_type is MigrationType.FULL_LOAD_ONLY
+
+    # Switching type must NOT rewrite the stamp -- that is what makes it provenance.
+    state.set_migration_type(MigrationType.CDC_ONLY)
+    assert state.error_migration_type is MigrationType.FULL_LOAD_ONLY
+
+    # A re-run clears both, so the next failure is attributed afresh.
+    state.clear_outputs()
+    assert state.error is None
+    assert state.error_migration_type is None
+
+
 def test_substeps_for_type() -> None:
     from dsql_migrator.ui.data_migration import MigrationType, substeps_for_type
 

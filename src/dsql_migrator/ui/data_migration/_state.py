@@ -60,6 +60,9 @@ class DataMigrationState:
         self._session: object = None
         self.job_id: Optional[str] = None
         self._error: Optional[str] = None
+        # The migration type selected when _error was recorded, so the screen can tell
+        # a live failure from one carried over across a type switch. None = unknown.
+        self._error_migration_type: "Optional[MigrationType]" = None
         # Multi-table selection; empty selected_tables => all (inferred default).
         self.selection: TableSelection = TableSelection()
         # Whether the user has explicitly changed the table picker. Until then
@@ -891,9 +894,22 @@ class DataMigrationState:
             return mode in self._prereq_running
 
     def set_error(self, message: str) -> None:
-        """Record a failure message for display."""
+        """Record a failure message for display.
+
+        Stamps the CURRENTLY selected migration type alongside it. Without that stamp
+        the screen cannot tell a live failure from one carried over: after a Full Load
+        that quarantined rows, switching to CDC only kept rendering a red "Migration
+        failed" banner beside a "Success" header. The renderer uses the stamp to demote
+        such a message to carried-over context instead of dropping it (the gap it
+        reports is real and CDC will not backfill it).
+
+        Read ``migration_type`` OUTSIDE the lock: the property reads through to the
+        bound session, and taking this lock around foreign code invites a deadlock.
+        """
+        recorded_type = self.migration_type
         with self._lock:
             self._error = message
+            self._error_migration_type = recorded_type
 
     @property
     def error(self) -> Optional[str]:
@@ -901,10 +917,21 @@ class DataMigrationState:
         with self._lock:
             return self._error
 
+    @property
+    def error_migration_type(self) -> "Optional[MigrationType]":
+        """The migration type selected when :meth:`set_error` recorded the message.
+
+        ``None`` when no error is held, or when one was restored from a session that
+        predates this stamp -- callers must treat that as "unknown", not as "differs".
+        """
+        with self._lock:
+            return self._error_migration_type
+
     def clear_outputs(self) -> None:
         """Discard the previous error before a (re-)run."""
         with self._lock:
             self._error = None
+            self._error_migration_type = None
 
 
 @dataclass

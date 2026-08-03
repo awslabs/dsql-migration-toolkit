@@ -5,6 +5,31 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.231
+
+### Fixed
+
+- **Switching migration type left a red "Migration failed" banner beside a "Success"
+  header.** After a Full Load that quarantined rows, selecting CDC only showed three
+  verdicts at once: the header said `Success`, the status said `DONE`, and the banner
+  still said `Migration failed` -- so the screen gave no answer to "did this work?" The
+  banner was rendered from the last error message alone, and nothing cleared it on a
+  type switch. The message is not noise, though: it reports rows genuinely missing from
+  the target, which is exactly what someone about to start CDC needs to know, since CDC
+  streams ongoing changes and does not backfill a Full Load gap. So an error recorded
+  under a different migration type is now kept but demoted from error to warning and
+  re-framed as carried-over context, naming the remedy (re-run Full Load). An error
+  whose provenance is unknown -- restored from an older session -- stays an error rather
+  than being silently softened.
+
+### Changed
+
+- **The Data Migration status badge now names the phase it describes**, e.g.
+  `Full Load: DONE` instead of a bare `DONE`. One underlying step backs every migration
+  type, so after a finished Full Load a switch to CDC only made the badge read as though
+  CDC had completed when none had run. For Full load + CDC the label follows the actual
+  progress, becoming `CDC` only once the pipeline is genuinely streaming.
+
 ## v0.1.230
 
 ### Fixed

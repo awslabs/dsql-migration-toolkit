@@ -1522,6 +1522,64 @@ def substeps_for_type(migration_type: MigrationType) -> tuple[str, ...]:
     return ("prerequisites", "full_load", "cdc")
 
 
+def migration_status_label(
+    migration_type: MigrationType, *, cdc_streaming: bool = False
+) -> str:
+    """Return what the Data Migration status badge is describing, e.g. "Full Load".
+
+    A bare "DONE" is ambiguous the moment the type selector moves. After a finished
+    Full Load the user can switch to CDC only, and the badge -- still backed by the
+    same underlying step -- then reads as "CDC: DONE" when no CDC has run at all.
+    Naming the phase the status belongs to keeps it honest without changing the value.
+
+    ``cdc_streaming`` matters for the combined type: the step is promoted to DONE once
+    CDC is genuinely live, so before that the status still describes the Full Load.
+    """
+    if migration_type is MigrationType.FULL_LOAD_ONLY:
+        return "Full Load"
+    if migration_type is MigrationType.CDC_ONLY:
+        return "CDC"
+    return "CDC" if cdc_streaming else "Full Load"
+
+
+def stale_error_notice(
+    error: Optional[str],
+    *,
+    migration_type: MigrationType,
+    error_migration_type: Optional[MigrationType],
+) -> Optional[tuple[str, str, str]]:
+    """Return ``(tone, header, body)`` for the failure notice, or None to hide it.
+
+    The bug this exists for: the notice was rendered from ``migration_state.error``
+    alone, and nothing cleared that on a type switch. So after a Full Load that
+    quarantined rows, switching to CDC only left a red "Migration failed" banner on a
+    screen whose own header said "Success" and whose status said DONE -- three verdicts
+    at once, and the user cannot tell which is true.
+
+    Deleting the message would be worse: it reports rows that are genuinely missing
+    from the target, which is exactly what someone about to start CDC needs to know
+    (CDC replicates ongoing changes; it does not backfill a Full Load gap). So when the
+    error belongs to a DIFFERENT migration type than the one now selected, it is kept
+    but demoted to a warning and re-framed as carried-over context rather than a live
+    failure of the current selection.
+
+    ``error_migration_type`` is the type that was selected when the error was recorded;
+    ``None`` means unknown (an older session), which is treated as "same type" so the
+    behaviour is unchanged rather than silently softened.
+    """
+    if not error:
+        return None
+    if error_migration_type is None or error_migration_type is migration_type:
+        return ("error", "Migration failed", error)
+    return (
+        "warning",
+        "Carried over from the previous Full Load",
+        "This did not happen in the migration type now selected, but the target still "
+        "reflects it -- CDC streams ongoing changes and will not backfill a Full Load "
+        f"gap. Re-run Full Load to close it before relying on the target. {error}",
+    )
+
+
 def resolve_active_substep_for_type(
     active: Optional[str],
     *,
