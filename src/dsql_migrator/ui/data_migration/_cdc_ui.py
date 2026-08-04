@@ -107,6 +107,7 @@ from dsql_migrator.ui.data_migration._status import (
     should_replace_teardown_marker,
 )
 from dsql_migrator.ui.design import (
+    EXPANSION_PANEL_CLASSES,
     NOTICE_STYLE,
     definition_row,
     inline_hint,
@@ -555,7 +556,7 @@ def _render_cdc_source_config_card(
     ]
     with ui.expansion(  # type: ignore[attr-defined]
         "Connector configuration (hand to cdc-stack)", icon="settings"
-    ).classes("w-full").props("expand-separator"):
+    ).classes(f"w-full {EXPANSION_PANEL_CLASSES}").props("expand-separator"):
         ui.label("Debezium source connector").classes(  # type: ignore[attr-defined]
             "text-xs font-semibold text-gray-600"
         )
@@ -582,7 +583,7 @@ def _render_cdc_params_file(ui, params) -> None:
     n_placeholder = len(params.placeholders)
     with ui.expansion(  # type: ignore[attr-defined]
         "cdc-stack parameter file (JSON)", icon="description"
-    ).classes("w-full mt-2").props("expand-separator"):
+    ).classes(f"w-full mt-2 {EXPANSION_PANEL_CLASSES}").props("expand-separator"):
         inline_hint(  # type: ignore[attr-defined]
             ui,
             f"Replace every value starting with {CDC_PLACEHOLDER_PREFIX} "
@@ -1544,7 +1545,7 @@ def _render_cdc_start_action(
                 )
             with ui.expansion("Danger zone — delete all CDC infrastructure").props(
                 "dense"
-            ).classes("w-full mt-2 text-red-700"):
+            ).classes(f"w-full mt-2 text-red-700 {EXPANSION_PANEL_CLASSES}"):
                 render_notice(ui, tone="warning", header=danger_header, body=danger_body)
                 _render_cdc_delete_action(
                     ui, migration_state, job_manager, refresh, session=session
@@ -2093,7 +2094,7 @@ def _render_cdc_adopt_or_deploy_choice(
         else "Deploy a separate CDC pipeline instead",
         icon="rocket_launch" if deploy_is_the_way else "warning",
         value=deploy_is_the_way,
-    ).classes("w-full"):
+    ).classes(f"w-full {EXPANSION_PANEL_CLASSES}"):
         _render_cdc_infra_deploy_action(
             ui, migration_state, job_manager, refresh,
             inventory=inventory, session=session,
@@ -2207,7 +2208,7 @@ def _render_cdc_least_privilege_note(ui, *, session=None) -> None:
         "Recommended: use a dedicated least-privilege CDC user",
         icon="security",
         value=False,
-    ).classes("w-full").props("expand-separator"):
+    ).classes(f"w-full {EXPANSION_PANEL_CLASSES}").props("expand-separator"):
         ui.label(  # type: ignore[attr-defined]
             "The username/password you connected with will be stored in AWS "
             "Secrets Manager and used by the CDC connector. Avoid using an "
@@ -2235,7 +2236,9 @@ def _render_cdc_delete_action(
     ui, migration_state, job_manager, refresh, *, session=None
 ) -> None:
     """A guarded 'Delete CDC infrastructure' (full stack teardown) action."""
-    with ui.expansion("Delete CDC infrastructure", icon="delete_forever").classes("w-full"):  # type: ignore[attr-defined]
+    with ui.expansion("Delete CDC infrastructure", icon="delete_forever").classes(  # type: ignore[attr-defined]
+        f"w-full {EXPANSION_PANEL_CLASSES}"
+    ):
         inline_hint(  # type: ignore[attr-defined]
             ui,
             "Deletes the entire cdc-stack — MSK, VPC wiring, plugins, IAM role and "
@@ -2334,7 +2337,9 @@ def _render_cdc_infra_form(
     # Persist the prefill so a deploy submitted without edits still has the host.
     migration_state.set_cdc_infra_inputs(values)
 
-    with ui.expansion("Infrastructure inputs", icon="lan", value=True).classes("w-full"):  # type: ignore[attr-defined]
+    with ui.expansion("Infrastructure inputs", icon="lan", value=True).classes(  # type: ignore[attr-defined]
+        f"w-full {EXPANSION_PANEL_CLASSES}"
+    ):
         ui.label(  # type: ignore[attr-defined]
             "Enter your VPC ID. Subnets, the plugin S3 bucket, the DSQL cluster "
             "ARN, the source host, and the source-credentials secret are all "
@@ -3672,7 +3677,7 @@ def _render_deploy_log(ui, log_lines, log_state=None) -> None:
         icon="terminal",
         value=log_state["open"],
         on_value_change=_remember,
-    ).classes("w-full"):
+    ).classes(f"w-full {EXPANSION_PANEL_CLASSES}"):
         # ASCII-only separator ("-"), and sanitize each message, so the monospace
         # ui.code font never renders a missing-glyph box (tofu) for punctuation
         # like the em-dash / ellipsis some deploy messages contained.
@@ -4179,7 +4184,18 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
     self-perpetuating single-shot chain that avoids the "parent slot deleted"
     crash a repeating timer causes. Meaningful only once streaming, so it is
     placed after the start action.
+
+    Hidden entirely until CDC has STARTED. Before that there is no pipeline to report
+    on -- the whole section (the "Live status" header, the empty stream-lag chart, and
+    the "appears once connectors are detected" placeholder) was just dead space on the
+    deploy screen, with the header sitting borderless above nothing. Gated on
+    :func:`cdc_streaming_started` (not ``cdc_pipeline_live``) so it appears the moment
+    Start CDC is pressed and stays through the connectors' ~10-20 min ramp -- which is
+    exactly when the operator wants to watch them come up. Matches the per-table table
+    below, which uses the same gate.
     """
+    if not cdc_streaming_started(migration_state, job_manager):
+        return
     ui.label("Live status").classes("text-sm font-semibold")  # type: ignore[attr-defined]
 
     # --- Live "Stream lag" chart -------------------------------------------------
@@ -4269,10 +4285,20 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
             controller = getattr(migration_state, "cdc_controller", None)
             names = getattr(migration_state, "cdc_connector_names", [])
             if controller is None or not names:
-                ui.label(  # type: ignore[attr-defined]
-                    "Live connector health and replication lag appear here once "
-                    "the cdc-stack connectors are detected."
-                ).classes("text-xs text-gray-500")
+                # Wrap the waiting message in an info notice, not a bare label: every
+                # other section on this screen is a bordered card/notice, so a loose
+                # grey line here read as an unstyled gap. This is a normal pre-CDC
+                # state (connectors not yet detected), so it is info, not a warning.
+                render_notice(
+                    ui,
+                    tone="info",
+                    icon="hourglass_empty",
+                    header="No live pipeline yet",
+                    body=(
+                        "Live connector health and replication lag appear here once "
+                        "the cdc-stack connectors are detected."
+                    ),
+                )
         if _cdc_is_streaming(migration_state):
             ui.timer(_CDC_POLL_INTERVAL_SECONDS, _poll_cdc, once=True)  # type: ignore[attr-defined]
 
@@ -4845,7 +4871,7 @@ def _render_cdc_handling_panel(ui) -> None:
         # text is long -- showing it expanded on every visit adds noise and can
         # confuse the operator. They open it when they want the contract details.
         with ui.expansion("CDC behavior & limits", icon="info").classes(  # type: ignore[attr-defined]
-            "w-full"
+            f"w-full {EXPANSION_PANEL_CLASSES}"
         ):
             with ui.column().classes("w-full gap-3 mt-1"):  # type: ignore[attr-defined]
                 if handled:

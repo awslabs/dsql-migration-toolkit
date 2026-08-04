@@ -306,6 +306,15 @@ SEGMENTED_TOGGLE_PROPS = (
 SEGMENTED_TOGGLE_CLASSES = "rounded-md border border-gray-300 overflow-hidden"
 
 
+# Border/shape for a collapsible ``ui.expansion`` so it reads as its own panel like
+# the bordered ``ui.card`` sections around it. A bare expansion draws no border, so
+# collapsible items (connector config, deploy log, Delete CDC infrastructure, ...) sat
+# as borderless headers that looked unstyled next to every carded section. Apply this
+# (usually with ``w-full``) to keep every collapsible panel matching the cards. Kept
+# here as the single source of truth so the shade cannot drift per screen.
+EXPANSION_PANEL_CLASSES = "rounded-md border border-gray-200"
+
+
 def segmented_control(
     ui,
     options,
@@ -602,6 +611,7 @@ __all__ = [
     "schema_chip_classes",
     "SEGMENTED_TOGGLE_PROPS",
     "SEGMENTED_TOGGLE_CLASSES",
+    "EXPANSION_PANEL_CLASSES",
     "segmented_control",
     "FILTER_SELECT_PROPS",
     "FILTER_SELECT_CLASSES",

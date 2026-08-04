@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.248
+
+### 수정
+
+- **CDC 단계 시각 요소: "Live status" 섹션과 펼침 패널들에 테두리가 없었습니다.** CDC 시작 전
+  "Live status"는 빈 차트와 "커넥터가 감지되면 표시됩니다"라는 맨 회색 문구 위에 테두리 없는
+  제목으로 렌더되어, 주변의 테두리 카드들과 어울리지 않는 빈 공간이었습니다. 이제 CDC가 시작될
+  때까지 섹션 전체를 숨기며(테이블별 표와 동일), 표시된 뒤 아직 준비 중인 상태의 안내는 제대로 된
+  테두리 info notice로 나옵니다. 또한 펼침 패널들(Connector configuration, cdc-stack 파라미터
+  파일, Delete CDC infrastructure, Infrastructure inputs, 배포 로그 등)에 테두리가 없어 카드
+  섹션 옆에서 스타일 없는 제목처럼 보였는데, 이제 design system의 단일 `EXPANSION_PANEL_CLASSES`
+  테두리 토큰을 공유합니다.
+
 ## v0.1.247
 
 ### 수정

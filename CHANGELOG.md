@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.248
+
+### Fixed
+
+- **CDC step visuals: the "Live status" section and the collapsible panels were unboxed.**
+  Before CDC started, "Live status" rendered as a borderless header above an empty chart and
+  a loose grey "appears once connectors are detected" line — dead space that did not match
+  the bordered cards around it. The whole section is now hidden until CDC has started
+  (matching the per-table table), and once shown, the still-ramping placeholder is a proper
+  bordered info notice. Separately, the collapsible panels (Connector configuration, the
+  cdc-stack parameter file, Delete CDC infrastructure, Infrastructure inputs, the deploy
+  log, and the others) drew no border, so they read as unstyled headers next to every carded
+  section; they now share one `EXPANSION_PANEL_CLASSES` border token from the design system.
+
 ## v0.1.247
 
 ### Fixed

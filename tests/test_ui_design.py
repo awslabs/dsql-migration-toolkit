@@ -17,6 +17,7 @@ from dsql_migrator.ui.design import (
     INLINE_HINT_TEXT,
     NOTICE_STYLE,
     SEGMENTED_TOGGLE_CLASSES,
+    EXPANSION_PANEL_CLASSES,
     SEGMENTED_TOGGLE_PROPS,
     badge_classes,
     chip_group_index,
@@ -327,6 +328,14 @@ def test_inline_hint_defaults_to_neutral_and_unknown_tone_falls_back() -> None:
 # ---------------------------------------------------------------------------
 # segmented_control
 # ---------------------------------------------------------------------------
+
+
+def test_expansion_panel_border_token_matches_the_card_palette() -> None:
+    # Collapsible panels must read as bordered panels like the cards around them,
+    # using the one palette (Tailwind border-*-200, rounded).
+    assert "border" in EXPANSION_PANEL_CLASSES
+    assert "rounded" in EXPANSION_PANEL_CLASSES
+    assert "border-gray-200" in EXPANSION_PANEL_CLASSES
 
 
 def test_segmented_control_tokens_are_aws_style() -> None:

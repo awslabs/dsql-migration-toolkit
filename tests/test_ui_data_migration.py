@@ -7254,6 +7254,9 @@ class _RecordingUi:
         def set_enabled(self, *_a, **_k):
             return self
 
+        def set_visibility(self, *_a, **_k):
+            return self
+
         def set_text(self, *_a, **_k):
             return self
 
@@ -7335,6 +7338,9 @@ class _RecordingUi:
 
     def notify(self, *_a, **_k):
         return None
+
+    def echart(self, *_a, **_k):
+        return self._El(self)
 
     def element(self, *_a, **_k):
         return self._El(self)
@@ -14340,3 +14346,88 @@ def test_per_table_status_appears_during_the_connector_ramp() -> None:
 
     ui = _render_per_table_with(state, cdc_jobs={"start-1": _StubJob("RUNNING")})
     assert any("Per-table migration status" in t for t in ui.texts)
+
+
+def _render_live_monitoring(state, *, cdc_jobs=None):
+    """Render the CDC live-status section and return the UI double."""
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_live_monitoring(ui, state, _StubJobManager(cdc_jobs or {}))
+    return ui
+
+
+def test_live_status_is_hidden_before_cdc_starts() -> None:
+    """The whole "Live status" section must be gone until CDC has started.
+
+    Before that there is no pipeline to report on, and the borderless "Live status"
+    header sat above an empty chart and a grey placeholder -- dead space on the deploy
+    screen (and inconsistent with every other bordered section).
+    """
+    state = DataMigrationState()
+    # Infra deployed but CDC not started: connectors do not exist yet.
+    state.set_cdc_stack_phase("infra")
+
+    ui = _render_live_monitoring(state)
+    assert not any("Live status" in t for t in ui.texts), (
+        "the Live status section must not render before CDC starts"
+    )
+
+
+def test_live_status_appears_once_cdc_starts() -> None:
+    # The control: a live pipeline must show the section, which is its purpose.
+    state = DataMigrationState()
+    state.set_cdc_stack_phase("running")
+
+    ui = _render_live_monitoring(state)
+    assert any("Live status" in t for t in ui.texts)
+
+
+def test_live_status_appears_during_the_connector_ramp() -> None:
+    """From the moment Start CDC is pressed, not only once connectors are RUNNING.
+
+    Connectors take ~10-20 min to come up and the operator wants to watch them -- hence
+    cdc_streaming_started, not cdc_pipeline_live.
+    """
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("start-1", kind="start")
+
+    ui = _render_live_monitoring(state, cdc_jobs={"start-1": _StubJob("RUNNING")})
+    assert any("Live status" in t for t in ui.texts)
+
+
+def test_ramp_placeholder_is_a_bordered_notice_not_a_bare_label() -> None:
+    """During the ramp (started, no connectors yet) the waiting message must be boxed.
+
+    Once the section is shown its placeholder is the only remaining pre-connector state,
+    and a loose grey line there was the original styling complaint. It is a normal
+    waiting state, so info (not warning).
+    """
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("start-1", kind="start")
+
+    classes_seen: list = []
+
+    class _ClassUi(_RecordingUi):
+        class _El(_RecordingUi._El):
+            def classes(self, value="", *_a, **_k):
+                classes_seen.append(str(value))
+                return self
+
+        def row(self, *_a, **_k):
+            return self._El(self)
+
+    ui = _ClassUi()
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    _cdc_ui._render_cdc_live_monitoring(
+        ui, state, _StubJobManager({"start-1": _StubJob("RUNNING")})
+    )
+    joined = " ".join(ui.texts)
+    assert "appear here once" in joined, "the waiting message must still be shown"
+    # The waiting message must be inside a BORDERED notice, not a loose label. render_notice
+    # puts the border on a row; assert a bordered/rounded container was emitted.
+    assert any("rounded-md border" in c for c in classes_seen), (
+        "the placeholder must be wrapped in a bordered notice, not a bare label"
+    )
+    assert "No live pipeline yet" in joined
