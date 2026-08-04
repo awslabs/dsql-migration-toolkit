@@ -239,6 +239,26 @@ def _render_cdc_step(
         ui, phase=getattr(migration_state, "cdc_stack_phase", None)
     )
 
+    # 1b. PROVISION (CDC only): the infrastructure card lives here rather than under
+    #     Prerequisites. Its Prerequisites placement exists so the ~15-20 min MSK create
+    #     can OVERLAP the Full Load -- a reason that does not apply to CDC only, which
+    #     has no Full Load to overlap. Keeping it there split one continuous task across
+    #     two sections: the operator deployed under Prerequisites and then had to find
+    #     Start CDC in a different (collapsed) section. It precedes the start-point
+    #     decision because nothing downstream can run without the stack.
+    #
+    #     Full load + CDC keeps the Prerequisites placement -- the overlap is the whole
+    #     point there, and it must be reachable before the load starts.
+    if migration_type is MigrationType.CDC_ONLY:
+        _render_cdc_infra_prep_section(
+            ui,
+            migration_state,
+            job_manager,
+            refresh,
+            inventory=inventory,
+            session=session,
+        )
+
     # 2. DECIDE: the CDC start point (Automatic/Manual). This is the central
     #    decision, so it comes first -- the source/sink connector config it
     #    produces is rendered (collapsed) inside this card.
@@ -1726,15 +1746,22 @@ def cdc_infra_prep_state(migration_state, job_manager) -> str:
 def _render_cdc_infra_prep_section(
     ui, migration_state, job_manager, refresh, *, inventory=None, session=None
 ) -> None:
-    """CDC infrastructure prep, rendered at the BOTTOM of the Prerequisites sub-step.
+    """CDC infrastructure prep. Rendered in ONE place, which depends on the type.
 
-    Why here and not beside the migration-type tiles: the ~15-20 min MSK create should
-    OVERLAP the Full Load, so it has to be offered before the load starts -- but it
-    also needs a real table set (the connector's ``TableIncludeList`` and the topic
-    partition plan). Prerequisites is the first point where both hold: running the
-    checks pins and locks the confirmed selection, and this sub-step still precedes
-    Full Load. Beside the tiles the picker is typically untouched, so the table set
-    would resolve to "none".
+    * **Full load + CDC** -- at the bottom of the Prerequisites sub-step. The ~15-20 min
+      MSK create should OVERLAP the Full Load, so it has to be offered before the load
+      starts, and it also needs a real table set (the connector's ``TableIncludeList``
+      and the topic partition plan). Prerequisites is the first point where both hold:
+      running the checks pins and locks the confirmed selection, and that sub-step still
+      precedes Full Load. Beside the migration-type tiles the picker is typically
+      untouched, so the table set would resolve to "none".
+    * **CDC only** -- near the top of the CDC sub-step. There is no Full Load to overlap,
+      so the reason above does not apply, and keeping it under Prerequisites split one
+      continuous task across two sections: the operator provisioned there, then had to
+      find Start CDC in a different (collapsed) section.
+
+    The caller decides; this function does not branch on the type. Never render it in
+    both places -- that would show a billable deploy form twice.
 
     Deliberately does NOT duplicate the CDC sub-step's lifecycle card: only the
     first-deploy affordance lives here. Start CDC, monitoring, Stop and Delete stay on

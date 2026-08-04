@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.235
+
+### Changed
+
+- **For CDC only, the CDC infrastructure card now lives in the CDC step instead of
+  Prerequisites.** Its Prerequisites placement exists so the ~15-20 min MSK create can
+  overlap the Full Load — a reason that does not apply to CDC only, which has no Full
+  Load to overlap. Keeping it there split one continuous task across two sections: the
+  operator provisioned under Prerequisites, then had to find Start CDC in a different
+  section. It now sits ahead of the start-point decision, since nothing downstream can
+  run without the stack. Full load + CDC is unchanged: it keeps the Prerequisites
+  placement and the overlap that motivates it. The card renders in exactly one place per
+  migration type — never both, which would show a billable deploy form twice.
+
 ## v0.1.234
 
 ### Fixed

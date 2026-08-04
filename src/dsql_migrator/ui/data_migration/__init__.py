@@ -1368,7 +1368,13 @@ def build_data_migration_screen(
                     # create should overlap the Full Load, so it must be reachable
                     # before the load starts -- and by this point the checks have
                     # pinned a real table set for the connector/partition plan.
-                    if has_cdc:
+                    #
+                    # EXCEPT for CDC only, where the CDC step renders it instead: with no
+                    # Full Load there is nothing to overlap, and splitting one continuous
+                    # task across two sections meant the operator deployed here and then
+                    # had to hunt for Start CDC in a different section. Rendering it in
+                    # both places would duplicate a billable deploy form.
+                    if has_cdc and migration_type is not MigrationType.CDC_ONLY:
                         _render_cdc_infra_prep_section(
                             ui,
                             migration_state,

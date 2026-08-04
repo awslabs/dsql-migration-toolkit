@@ -3669,6 +3669,79 @@ def test_cdc_infra_prep_section_is_rendered_from_the_prerequisites_substep() -> 
             assert "_render_cdc_infra_prep_section" not in _calls(bodies[other])
 
 
+def test_prerequisites_placement_is_skipped_for_cdc_only() -> None:
+    """The Prerequisites call must be gated OFF for CDC only.
+
+    CDC only renders the card inside the CDC step instead (there is no Full Load to
+    overlap), so leaving the Prerequisites call unconditional would show a billable
+    deploy form twice in the same session.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
+    guards = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Name)
+            and c.func.id == "_render_cdc_infra_prep_section"
+            for c in ast.walk(node)
+        )
+    ]
+    assert guards, "the Prerequisites render must sit behind a guard"
+    condition = ast.unparse(guards[0].test)
+    assert "has_cdc" in condition
+    assert "CDC_ONLY" in condition, (
+        f"the guard must exclude CDC only, got: {condition}"
+    )
+
+
+def test_cdc_step_renders_the_infra_card_for_cdc_only_before_the_start_point() -> None:
+    """CDC only must render the card in the CDC step, ahead of the start-point card.
+
+    Ordering matters: nothing downstream (start point, Start CDC) can run without the
+    stack, so provisioning has to come first in the journey. Guarded on the type so the
+    combined type keeps its Prerequisites placement and its Full Load overlap.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    tree = ast.parse(inspect.getsource(_cdc_ui._render_cdc_step).strip())
+    guards = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Name)
+            and c.func.id == "_render_cdc_infra_prep_section"
+            for c in ast.walk(node)
+        )
+    ]
+    assert guards, "the CDC step must render the infra card behind a type guard"
+    assert "CDC_ONLY" in ast.unparse(guards[0].test)
+
+    # Provisioning precedes the start-point decision. Compared by LINE NUMBER, not by
+    # ast.walk order -- walk is breadth-first, so a call nested inside an `if` sorts
+    # after top-level calls regardless of where it appears in the source.
+    lines = {
+        node.func.id: node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert (
+        lines["_render_cdc_infra_prep_section"]
+        < lines["_render_cdc_source_config_card"]
+    ), "provisioning must come before the start-point decision"
+
+
 def test_cdc_discovery_is_armed_before_the_substeps_render() -> None:
     """The account probe must be armed before any sub-step body renders.
 
