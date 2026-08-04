@@ -136,6 +136,26 @@ class ErrorLogStore:
             return self._render_csv(records)
         return self._render_ndjson(records)
 
+    def render_records(
+        self,
+        records: list[DataErrorRecord],
+        fmt: Literal["ndjson", "csv"] = "ndjson",
+    ) -> bytes:
+        """Serialize an ALREADY-SELECTED set of records, bypassing the key lookup.
+
+        :meth:`render_log` serializes everything under a job id, which is wrong when a
+        caller must download a subset. The CDC dead-letter panel is that case: its
+        error-log key is the Full Load job id whenever one ran, so both sources share
+        one key and a whole-key download filled a file labelled "CDC error log" with
+        Full Load quarantines. Callers filter first, then render through this.
+
+        Same formats and the same credential-free guarantees as
+        :meth:`render_log` (Property 7).
+        """
+        if fmt == "csv":
+            return self._render_csv(records)
+        return self._render_ndjson(records)
+
     @staticmethod
     def _render_ndjson(records: list[DataErrorRecord]) -> bytes:
         lines = [record.model_dump_json() for record in records]

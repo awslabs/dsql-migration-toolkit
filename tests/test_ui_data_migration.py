@@ -7188,6 +7188,8 @@ class _RecordingUi:
         # Rendered buttons, so a test can drive a click (``.on_click``) instead of only
         # asserting the label text.
         self.buttons: list = []
+        # Rendered ui.table() payloads ({"rows": [...], "columns": [...]}).
+        self.tables: list = []
 
     class _El:
         # Class-level default: subclasses below (_Btn, _Input, ...) define their own
@@ -7345,6 +7347,16 @@ class _RecordingUi:
         def enable(self, *_a, **_k):
             self.enabled = True
             return self
+
+    def table(self, *_a, rows=None, columns=None, **_k):
+        # Record the ROWS, not just that a table was drawn: the DLQ record table is
+        # where a "filtered count over an unfiltered list" regression would show up.
+        self.tables.append({"rows": list(rows or []), "columns": list(columns or [])})
+        for row in rows or []:
+            for value in row.values():
+                if value is not None:
+                    self.texts.append(str(value))
+        return self._El(self)
 
     def checkbox(self, text="", *_a, on_change=None, **_k):
         if text is not None:
@@ -13495,3 +13507,267 @@ def test_cdc_step_drops_back_on_a_freshly_built_controller_too() -> None:
 
     assert state.cdc_controller is not None, "the controller must still be cached"
     assert get_status(sess.workflow, WorkflowStep.CDC) is StepStatus.NOT_STARTED
+
+
+def _mixed_error_log(state, *, full_load: int = 3, cdc: int = 0):
+    """Seed the session error log the way the workshop session did.
+
+    Full Load quarantines carry ``chunk_id`` (the table name); CDC's ``surface_errors``
+    never sets it. Returns the shared log key both sources use.
+    """
+    from dsql_migrator.core.models import DataErrorRecord
+    from dsql_migrator.ui.data_migration._status import cdc_error_log_key
+
+    key = cdc_error_log_key(state)
+    for i in range(full_load):
+        state.error_log.record(
+            key,
+            DataErrorRecord(
+                table="ecommerce.product_media",
+                chunk_id="ecommerce.product_media",
+                error_code="54000",
+                message=f"quarantined row pk[id={i + 1}]: datatype limit greater than "
+                "1048576 bytes not supported",
+                occurred_at=datetime(2026, 8, 4, 10, 14, 3, tzinfo=timezone.utc),
+            ),
+        )
+    for i in range(cdc):
+        state.error_log.record(
+            key,
+            DataErrorRecord(
+                table="ecommerce.orders",
+                error_code="54000",
+                message=f"dead-lettered record {i + 1}",
+                occurred_at=datetime(2026, 8, 4, 21, 6, 0, tzinfo=timezone.utc),
+            ),
+        )
+    return key
+
+
+def test_full_load_quarantines_are_not_counted_as_dead_letter_records() -> None:
+    """The workshop defect: Full Load rows showed up as "3 quarantined" in the DLQ.
+
+    Both sources share ONE error-log key (it IS the Full Load job id whenever one ran),
+    so the DLQ card counted batch-loader quarantines. Full Load has no DLQ, and a user
+    who had just excluded the oversized column read the non-zero count as "the exclusion
+    failed" -- when a zero CDC count is the proof that it worked.
+    """
+    from dsql_migrator.ui.data_migration._status import cdc_dlq_summary
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"  # a Full Load ran this session
+    key = _mixed_error_log(state, full_load=3, cdc=0)
+
+    # The raw log still holds all three (nothing is lost)...
+    assert len(state.error_log.records(key)) == 3
+    # ...but the DLQ view reports none of them.
+    summary = cdc_dlq_summary(state, key)
+    assert summary.total_errors == 0
+    assert summary.errors_by_table == {}
+
+
+def test_real_dead_letter_records_are_still_counted() -> None:
+    # The control: filtering must not hide genuine CDC quarantines, which is the whole
+    # purpose of the panel.
+    from dsql_migrator.ui.data_migration._status import cdc_dlq_summary
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    key = _mixed_error_log(state, full_load=3, cdc=2)
+
+    summary = cdc_dlq_summary(state, key)
+    assert summary.total_errors == 2
+    assert summary.errors_by_table == {"ecommerce.orders": 2}
+
+
+def test_dlq_record_list_shows_only_cdc_rows() -> None:
+    """The rows beneath the count must agree with it.
+
+    A filtered count over an unfiltered list would be worse than the original bug: the
+    badge would say 0 while three rows sat underneath it.
+    """
+    from dsql_migrator.ui.data_migration._status import cdc_dlq_records
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    key = _mixed_error_log(state, full_load=3, cdc=1)
+
+    records = cdc_dlq_records(state, key)
+    assert [r.table for r in records] == ["ecommerce.orders"]
+
+
+def test_cdc_error_download_label_and_payload_exclude_full_load_rows() -> None:
+    """"Download CDC error log (3 errors)" handed over three Full Load quarantines."""
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    key = _mixed_error_log(state, full_load=3, cdc=1)
+
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_error_download(ui, state, key)
+
+    joined = " ".join(ui.texts)
+    assert "Download CDC error log (1 error)" in joined, (
+        f"label must count CDC records only; got {joined!r}"
+    )
+    # And the bytes the button would produce carry no Full Load row.
+    from dsql_migrator.ui.data_migration._status import cdc_dlq_records
+
+    payload = state.error_log.render_records(cdc_dlq_records(state, key)).decode()
+    assert "product_media" not in payload
+    assert payload.count("\n") == 1
+
+
+def test_download_is_not_offered_when_only_full_load_rows_exist() -> None:
+    # Nothing was dead-lettered, so there is no CDC error log to download.
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    key = _mixed_error_log(state, full_load=3, cdc=0)
+
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_error_download(ui, state, key)
+
+    assert not any("Download CDC error log" in t for t in ui.texts)
+
+
+def test_dlq_panel_points_at_the_full_load_for_its_own_quarantines() -> None:
+    """Filtering must not make the Full Load's rows vanish from view.
+
+    They are rows that never reached the target, so cut-over depends on knowing about
+    them -- the panel cross-references them instead of silently dropping them.
+    """
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    key = _mixed_error_log(state, full_load=3, cdc=0)
+
+    ui = _RecordingUi()
+    _cdc_ui._render_full_load_quarantine_pointer(ui, state, key)
+
+    joined = " ".join(ui.texts)
+    assert "Full Load also set 3 rows aside" in joined
+    assert "never entered the stream" in joined
+
+
+def test_no_full_load_pointer_when_every_record_is_cdc() -> None:
+    # Don't mention a Full Load that set nothing aside.
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    state = DataMigrationState()
+    key = _mixed_error_log(state, full_load=0, cdc=2)
+
+    ui = _RecordingUi()
+    _cdc_ui._render_full_load_quarantine_pointer(ui, state, key)
+
+    assert not any("Full Load also set" in t for t in ui.texts)
+
+
+def test_dlq_record_table_rows_come_from_the_filtered_set() -> None:
+    """Renders the real record table: the rows on screen must be CDC-only.
+
+    A filtered count over an unfiltered list is worse than the original bug (badge says
+    0, three rows sit underneath). ``cdc_dlq_records`` covers the helper; this covers
+    what ``_render_cdc_dlq_records`` actually puts in the table.
+    """
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    key = _mixed_error_log(state, full_load=3, cdc=1)
+
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_dlq_records(ui, state, key)
+
+    joined = " ".join(ui.texts)
+    assert "product_media" not in joined, (
+        "the Full Load's quarantined table must not appear in the DLQ record table"
+    )
+    assert "Quarantined records (1)" in joined, (
+        f"the list heading must count the filtered rows; got {joined!r}"
+    )
+
+
+def test_dlq_record_table_is_empty_when_only_full_load_rows_exist() -> None:
+    # Nothing was dead-lettered -> no record table at all (not a table of Full Load rows).
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    key = _mixed_error_log(state, full_load=3, cdc=0)
+
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_dlq_records(ui, state, key)
+
+    assert not any("Quarantined records" in t for t in ui.texts)
+    assert not any("product_media" in t for t in ui.texts)
+
+
+def test_cdc_download_payload_is_driven_by_the_buttons_own_handler() -> None:
+    """Click the button and inspect the bytes it actually emits.
+
+    Asserting a separately-recomputed payload let a "render_log(log_key)" regression
+    survive: the label said 1 error while the file carried all four rows.
+    """
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    key = _mixed_error_log(state, full_load=3, cdc=1)
+
+    downloaded: dict = {}
+
+    class _Dl:
+        @staticmethod
+        def content(payload, filename, mime):
+            downloaded["payload"] = payload
+            downloaded["filename"] = filename
+
+    ui = _RecordingUi()
+    ui.download = _Dl()
+    _cdc_ui._render_cdc_error_download(ui, state, key)
+
+    handlers = [b.on_click for b in ui.buttons if b.on_click is not None]
+    assert handlers, "the download button must be wired"
+    handlers[0]()
+
+    text = downloaded["payload"].decode()
+    assert "product_media" not in text, "the CDC log must not contain Full Load rows"
+    assert text.count("\n") == 1, f"expected exactly one CDC record; got {text!r}"
+
+
+def test_full_load_pointer_is_rendered_by_the_dlq_panel() -> None:
+    """Wiring: the panel itself must emit the cross-reference.
+
+    The helper can be correct while nothing calls it -- which would silently drop the
+    Full Load's quarantines from the screen entirely.
+    """
+    from dsql_migrator.core.cdc import (
+        ConnectorState,
+        ConnectorStatus,
+        build_cdc_status_view,
+    )
+    from dsql_migrator.ui.data_migration import _cdc_ui
+    from dsql_migrator.ui.data_migration._status import cdc_dlq_summary
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    key = _mixed_error_log(state, full_load=3, cdc=0)
+
+    view = build_cdc_status_view(
+        [ConnectorStatus(name="src", state=ConnectorState.RUNNING)],
+        cdc_dlq_summary(state, key),
+        dlq_depth=0,
+    )
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_dlq_panel(ui, state, _StubJobManager({}), view)
+
+    joined = " ".join(ui.texts)
+    # The DLQ itself is clean...
+    assert "0 quarantined" in joined
+    assert "No records quarantined" in joined
+    # ...and the Full Load's rows are still accounted for.
+    assert "Full Load also set 3 rows aside" in joined

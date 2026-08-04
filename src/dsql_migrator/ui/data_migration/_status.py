@@ -1124,6 +1124,70 @@ def cdc_error_log_key(migration_state) -> str:
     return f"cdc:{stack}"
 
 
+def is_cdc_error_record(record) -> bool:
+    """True when this error record came from the CDC stream, not the Full Load.
+
+    ``cdc_error_log_key`` returns the Full Load ``job_id`` whenever one exists, so both
+    sources share ONE error-log key -- which put Full Load quarantines inside the
+    "Dead-letter queue (poison records)" card. That is wrong three ways: Full Load has
+    no DLQ (its batch loader sets a row aside; no message ever reaches a broker), the
+    card's copy then claims those rows were "isolated to the DLQ (the pipeline keeps
+    running)" when no pipeline existed at the time, and -- worst -- a user who has just
+    excluded an oversized column sees a non-zero count and concludes the exclusion
+    failed, when a zero CDC count is exactly the proof that it worked.
+
+    The discriminator already exists in the data: the Full Load writers set
+    ``chunk_id`` to the table name (``_engine.py``), while CDC's ``surface_errors``
+    (``core/cdc.py``) never sets it. So ``chunk_id is None`` means "not from the Full
+    Load". Keyed on that rather than on a timestamp cut-off: a "since CDC started"
+    filter depends on a start time that a restored session loses, and Full Load
+    quarantines minutes before a CDC start would be indistinguishable anyway.
+
+    Pure; a record whose ``chunk_id`` is absent entirely counts as CDC.
+    """
+    return getattr(record, "chunk_id", None) is None
+
+
+def cdc_dlq_records(migration_state, log_key: str) -> list:
+    """Read the error log for ``log_key`` and keep only the CDC-sourced records.
+
+    The one place the CDC/Full-Load split is applied. Every DLQ surface -- the depth
+    badge, the per-table chips, the record list and the download -- must go through
+    this, because they all read the same key: filtering one of them alone would make
+    the count disagree with the rows beneath it.
+
+    Best-effort: an unreadable log yields ``[]`` rather than breaking the panel.
+    """
+    if not log_key:
+        return []
+    try:
+        records = migration_state.error_log.records(log_key)
+    except Exception:  # noqa: BLE001 - advisory list; never break the panel
+        return []
+    return [r for r in records or () if is_cdc_error_record(r)]
+
+
+def cdc_dlq_summary(migration_state, log_key: str):
+    """Summarize ONLY the CDC-sourced records under ``log_key``.
+
+    Same shape as ``ErrorLogStore.summary`` (total + per-table counts +
+    ``log_available``) so it drops into the DLQ panel's existing consumers, but built
+    from :func:`cdc_dlq_records` so Full Load quarantines never inflate the DLQ depth
+    or add a table chip. See :func:`is_cdc_error_record` for why they were mixed.
+    """
+    from dsql_migrator.core.models import ErrorLogSummary
+
+    records = cdc_dlq_records(migration_state, log_key)
+    by_table: dict[str, int] = {}
+    for record in records:
+        by_table[record.table] = by_table.get(record.table, 0) + 1
+    return ErrorLogSummary(
+        total_errors=len(records),
+        errors_by_table=by_table,
+        log_available=bool(records),
+    )
+
+
 def _apply_cdc_status(migration_state, fetched) -> None:
     """Build the CDC status view from a fetched ``(statuses, health)`` and store it.
 
@@ -1222,7 +1286,10 @@ def _apply_cdc_status(migration_state, fetched) -> None:
                 error_code=getattr(err, "error_code", None),
                 detail=getattr(err, "message", None),
             )
-    error_summary = migration_state.error_log.summary(job_id)
+    # CDC-sourced records ONLY. The key is shared with the Full Load (it IS the Full
+    # Load job id whenever one ran), so an unfiltered summary put batch-loader
+    # quarantines into the DLQ card -- see is_cdc_error_record.
+    error_summary = cdc_dlq_summary(migration_state, job_id)
     # DLQ depth: MSK Connect publishes no DLQ-topic depth metric, so we use the
     # quarantined-record count from the single error log (the rows the sink set
     # aside as poison) as the depth signal. That is exactly the "what did not reach

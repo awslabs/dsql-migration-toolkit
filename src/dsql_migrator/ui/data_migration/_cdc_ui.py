@@ -100,7 +100,9 @@ from dsql_migrator.ui.data_migration._status import (
     split_attachable_stacks,
     _migration_status_tables,
     _read_cdc_template_body,
+    cdc_dlq_records,
     cdc_error_log_key,
+    is_cdc_error_record,
     should_replace_teardown_marker,
 )
 from dsql_migrator.ui.design import (
@@ -4475,6 +4477,36 @@ def _render_cdc_dlq_panel(
         _render_cdc_dlq_records(ui, migration_state, log_key)
         if health.depth > 0:
             _render_cdc_error_download(ui, migration_state, log_key)
+        _render_full_load_quarantine_pointer(ui, migration_state, log_key)
+
+def _render_full_load_quarantine_pointer(ui, migration_state, log_key: str) -> None:
+    """Note that the Full Load set rows aside too, and where to see them.
+
+    The DLQ panel now counts CDC records only, which is correct -- but the Full Load's
+    quarantines must not simply vanish from view: they are rows that never reached the
+    target, and cut-over depends on knowing about them. So when this session's error log
+    also holds Full Load records, say so in one neutral line that points at the Full
+    Load section rather than folding them back into a DLQ count they do not belong to.
+
+    Deliberately NOT a warning: the Full Load already reported these where they belong,
+    and this line is a cross-reference, not a new problem.
+    """
+    if not log_key:
+        return
+    try:
+        records = migration_state.error_log.records(log_key) or []
+    except Exception:  # noqa: BLE001 - advisory line; never break the panel
+        return
+    full_load = [r for r in records if not is_cdc_error_record(r)]
+    if not full_load:
+        return
+    noun = "row" if len(full_load) == 1 else "rows"
+    ui.label(  # type: ignore[attr-defined]
+        f"The Full Load also set {len(full_load)} {noun} aside. Those are separate from "
+        "this dead-letter queue (the batch loader isolated them; they never entered the "
+        "stream) — see the Full Load section above for the details."
+    ).classes("text-xs text-gray-500")
+
 
 def _render_cdc_dlq_breakdown(ui, status_view: LoadStatusView) -> None:
     """Show which tables produced DLQ/error records, so a poison source is found.
@@ -4519,12 +4551,9 @@ def _render_cdc_dlq_records(ui, migration_state, log_key: str) -> None:
     ``?`` placeholders, never row values -- Property 7). Nothing is shown when there
     are no records yet (clean stream).
     """
-    if not log_key:
-        return
-    try:
-        records = migration_state.error_log.records(log_key)
-    except Exception:  # noqa: BLE001 - advisory list; never break the panel
-        records = []
+    # CDC-sourced records only: the log key is shared with the Full Load, so an
+    # unfiltered read listed batch-loader quarantines under "Dead-letter queue".
+    records = cdc_dlq_records(migration_state, log_key)
     if not records:
         return
     ordered = sorted(
@@ -4578,16 +4607,23 @@ def _render_cdc_dlq_records(ui, migration_state, log_key: str) -> None:
         ).bind_value(table, "filter")
 
 def _render_cdc_error_download(ui, migration_state, log_key: str) -> None:
-    """Offer the single error log (DLQ-sourced rows included) as a download."""
-    summary = migration_state.error_log.summary(log_key)
-    if summary.total_errors <= 0:
+    """Offer the CDC-sourced error records as a download.
+
+    Both the COUNT in the label and the file contents are filtered to CDC. The log key
+    is shared with the Full Load, so this button used to say "Download CDC error log
+    (3 errors)" and hand over three Full Load quarantines -- see is_cdc_error_record.
+    """
+    records = cdc_dlq_records(migration_state, log_key)
+    if not records:
         return
     # A filesystem-safe slug for the filename (the CDC fallback key is "cdc:<stack>").
     safe = log_key.replace(":", "_").replace("/", "_")
 
     def _download_log() -> None:
         try:
-            payload = migration_state.error_log.render_log(log_key)
+            # Serialize the FILTERED records; render_log(log_key) would re-read the
+            # whole key and put Full Load rows back into a file labelled CDC.
+            payload = migration_state.error_log.render_records(records)
             ui.download.content(  # type: ignore[attr-defined]
                 payload, f"cdc_error_log_{safe}.ndjson", "application/x-ndjson"
             )
@@ -4600,9 +4636,9 @@ def _render_cdc_error_download(ui, migration_state, log_key: str) -> None:
     # Named the same way as the Full Load download: WHAT it is and HOW MUCH, not the file
     # format. Saying "CDC" also matters here -- both steps offer a download, and
     # "Download error log" alone gave no way to tell which one you were getting.
-    noun = "error" if summary.total_errors == 1 else "errors"
+    noun = "error" if len(records) == 1 else "errors"
     ui.button(  # type: ignore[attr-defined]
-        f"Download CDC error log ({summary.total_errors} {noun})",
+        f"Download CDC error log ({len(records)} {noun})",
         on_click=_download_log,
         icon="download",
     ).props("outline dense no-caps").tooltip(  # type: ignore[attr-defined]

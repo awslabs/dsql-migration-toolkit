@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.241
+
+### Fixed
+
+- **The CDC dead-letter queue card counted Full Load quarantines as dead-lettered
+  records.** The DLQ panel's error-log key is the Full Load job id whenever one ran, so
+  both sources shared one key and batch-loader quarantines appeared under "Dead-letter
+  queue (poison records)" — with copy claiming they were "isolated to the DLQ (the
+  pipeline keeps running)" for rows that never entered a stream and were set aside hours
+  before any connector existed. Full Load has no DLQ. The damaging case is a user who has
+  just excluded an oversized LOB column: they saw a non-zero quarantine count and
+  concluded the exclusion had failed, when a zero CDC count is precisely the proof that it
+  worked. Every DLQ surface — the depth badge, the per-table chips, the record table, and
+  the download's label *and* file contents — now reports CDC-sourced records only, all
+  through one filter so the count can never disagree with the rows beneath it. The Full
+  Load's own quarantines are not hidden: the panel cross-references them in a neutral line
+  pointing at the Full Load section, since rows that never reached the target still matter
+  at cut-over.
+
 ## v0.1.240
 
 ### Fixed
