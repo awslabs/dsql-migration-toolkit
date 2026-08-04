@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.237
+
+### Fixed
+
+- **The migration type could still be switched while CDC connectors were being
+  created.** Toggling it then locked a moment later, once the connectors appeared. Two
+  lock conditions existed and both miss an in-flight connector start: the connectors do
+  not exist yet (so the discovered-connectors check is empty and the stack phase is not
+  yet `running`), and on a CDC-only plan the `full_load` step is not `IN_PROGRESS`
+  either. The start point and table set are committed the moment Start CDC is pressed,
+  so the choice now freezes then — using the same `cdc_streaming_started` signal the
+  table picker already locks on. An infrastructure create deliberately does NOT lock:
+  `create_stack` provisions MSK, networking and plugins but makes no connectors, so
+  nothing is committed and nothing streams for the ~15-20 minutes it runs, and the
+  operator can still change the plan. Also fixed alongside it: the lock explanation was
+  recomputed separately without the job manager, so the new case would have disabled the
+  tiles while showing no reason at all — the disabled state and its explanation now come
+  from one evaluation and cannot disagree.
+
 ## v0.1.236
 
 ### Fixed

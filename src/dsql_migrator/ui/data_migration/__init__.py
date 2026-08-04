@@ -650,14 +650,23 @@ def build_data_migration_screen(
             # Migration-type selector (AWS DMS-style): Full load only / CDC only /
             # Full load + CDC. The combined type runs Full Load then auto-advances
             # to the CDC step (gapless handoff from the watermark).
+            #
+            # job_manager is required: without it an IN-FLIGHT connector start is
+            # invisible (no connectors yet, phase not "running", and on a CDC-only
+            # plan the full_load step is not IN_PROGRESS), which left the tiles
+            # switchable while Start CDC was already running.
+            _type_lock_reason = migration_type_lock_reason(
+                migration_state, status=status, job_manager=job_manager
+            )
             _render_migration_type_selector(
                 ui,
                 migration_state,
                 status=status,
                 refresh=refresh,
-                locked=migration_type_locked(
-                    migration_state, job_manager, status=status
-                ),
+                # One evaluation drives BOTH the disabled state and the explanation,
+                # so a lock can never appear without its reason.
+                locked=_type_lock_reason is not None,
+                lock_reason=_type_lock_reason,
             )
             # Plan-level CDC discovery surfacing: the moment the plan includes CDC,
             # the discovery (armed below on has_cdc) populates cdc_other_stacks. Show
@@ -2010,17 +2019,24 @@ def migratable_table_names(
 
 
 def migration_type_locked(migration_state, job_manager, *, status) -> bool:
-    """True only once CDC streaming has STARTED, so the type must not change.
+    """True once CDC has been committed/started, so the type must not change.
 
     Thin boolean over :func:`migration_type_lock_reason` (the single source of
-    truth for *why* the type is locked). ``job_manager`` is accepted for caller
-    signature compatibility but unused — the decision is a pure function of the
-    workflow status and the migration state.
+    truth for *why* the type is locked). ``job_manager`` is needed to see an
+    IN-FLIGHT connector start: the connectors do not exist yet and the stack phase
+    is not "running", so state alone cannot tell that CDC is already committed.
     """
-    return migration_type_lock_reason(migration_state, status=status) is not None
+    return (
+        migration_type_lock_reason(
+            migration_state, status=status, job_manager=job_manager
+        )
+        is not None
+    )
 
 
-def migration_type_lock_reason(migration_state, *, status) -> Optional[str]:
+def migration_type_lock_reason(
+    migration_state, *, status, job_manager=None
+) -> Optional[str]:
     """Why the migration type is locked, or ``None`` if it can still be changed.
 
     Separates two distinct sources so the UI can explain the lock clearly:
@@ -2030,15 +2046,32 @@ def migration_type_lock_reason(migration_state, *, status) -> Optional[str]:
     * **Discovered** — CDC connectors / a running cdc-stack were found on AWS
       (possibly deployed in a previous session; ``cdc_connector_names`` survives a
       restore). Switching the type would orphan/break that live pipeline.
+    * **Starting** — a connector start is IN FLIGHT (``kind="start"``). This is the
+      gap the first two miss: the connectors do not exist yet (so
+      ``cdc_connector_names`` is empty and the phase is not yet "running"), and on a
+      CDC-only plan the ``full_load`` step is not IN_PROGRESS either -- so the type
+      selector stayed live while Start CDC was already running. The user could switch
+      to Full load + CDC and watch it lock immediately afterwards, once the connectors
+      appeared. The start point and table set are committed the moment Start is
+      pressed, so the choice must freeze then, not when the connectors finish.
 
     Both legitimately freeze the choice, but the reason (and the remedy) differ.
-    Pure: reads only ``status`` and already-populated state — no AWS I/O — so it is
-    safe to call during render and is unit-testable.
+    Reads ``status`` and already-populated state; ``job_manager`` (optional) is only
+    consulted to see the in-flight start job. No AWS I/O, so it is safe to call during
+    render and is unit-testable. An in-flight ``kind="infra"`` job deliberately does
+    NOT lock -- the infrastructure create makes no connectors and streams nothing (see
+    :func:`cdc_streaming_started`), so the type is still legitimately changeable while
+    MSK provisions.
     """
     if status is StepStatus.IN_PROGRESS:
         return (
             "Locked while a migration is in progress — finish or cancel it to "
             "change the type."
+        )
+    if job_manager is not None and cdc_streaming_started(migration_state, job_manager):
+        return (
+            "Locked because CDC is starting — the start point and table set are "
+            "already committed. Stop CDC on the CDC step to change the type."
         )
     if getattr(migration_state, "cdc_stack_phase", None) == "running" or getattr(
         migration_state, "cdc_connector_names", None
@@ -2223,7 +2256,13 @@ def _render_cdc_existing_infra_banner(ui, migration_state, refresh) -> None:
 
 
 def _render_migration_type_selector(
-    ui, migration_state, *, status, refresh, locked: Optional[bool] = None
+    ui,
+    migration_state,
+    *,
+    status,
+    refresh,
+    locked: Optional[bool] = None,
+    lock_reason: Optional[str] = None,
 ) -> None:
     """Render the migration type as AWS-console-style radio tiles.
 
@@ -2255,9 +2294,13 @@ def _render_migration_type_selector(
 
     ui.label("Migration type").classes("text-sm font-semibold")  # type: ignore[attr-defined]
     # Explain WHY the choice is locked (a dead, silently-disabled control looked
-    # like a bug). The reason comes from the single pure source so the message and
-    # the lock can never drift apart.
-    lock_reason = migration_type_lock_reason(migration_state, status=status)
+    # like a bug). Prefer the reason the CALLER computed alongside ``locked``: it is
+    # the same evaluation that produced the lock, so the message and the disabled
+    # state cannot drift. Recomputing here without the caller's job_manager would
+    # miss an in-flight connector start and leave the tiles locked with no
+    # explanation. The local fallback keeps older callers working.
+    if lock_reason is None:
+        lock_reason = migration_type_lock_reason(migration_state, status=status)
     if running and lock_reason:
         ui.label(lock_reason).classes(  # type: ignore[attr-defined]
             "text-xs text-amber-700 mb-1"

@@ -7681,6 +7681,129 @@ def test_migration_type_lock_reason_discovered_connectors() -> None:
     assert migration_type_locked(state, None, status=StepStatus.NOT_STARTED) is True
 
 
+class _StartJobManager:
+    """A job manager whose single job is PENDING/RUNNING."""
+
+    def __init__(self, status: str = "RUNNING") -> None:
+        self._status = status
+
+    def get_status(self, job_id):
+        class _J:
+            pass
+
+        j = _J()
+        j.status = self._status
+        return j
+
+
+def test_migration_type_locks_while_a_connector_start_is_in_flight() -> None:
+    """The reported bug: the type was switchable while Start CDC was already running.
+
+    The existing two reasons both miss it -- the connectors do not exist yet (so
+    cdc_connector_names is empty and the phase is not "running"), and on a CDC-only
+    plan the full_load step is not IN_PROGRESS. The user could switch to Full load +
+    CDC and watch it lock a moment later, once the connectors appeared. The start point
+    and table set are committed the instant Start is pressed, so the choice must freeze
+    then.
+    """
+    from dsql_migrator.ui.data_migration import (
+        migration_type_lock_reason,
+        migration_type_locked,
+    )
+    from dsql_migrator.ui.workflow import StepStatus
+
+    state = DataMigrationState()
+    state.set_cdc_stack_phase("infra")  # stack exists, no connectors yet
+    state.set_cdc_deploy_job_id("job-1", kind="start")
+    jm = _StartJobManager()
+
+    reason = migration_type_lock_reason(
+        state, status=StepStatus.NOT_STARTED, job_manager=jm
+    )
+    assert reason is not None and "starting" in reason
+    assert migration_type_locked(state, jm, status=StepStatus.NOT_STARTED) is True
+
+
+def test_migration_type_stays_changeable_while_only_infrastructure_deploys() -> None:
+    """An infra create must NOT lock the type.
+
+    ``create_stack`` provisions MSK/networking/plugins and makes no connectors, so
+    nothing is committed and nothing streams for the ~15-20 min it runs -- the operator
+    can still legitimately change their mind about the plan.
+    """
+    from dsql_migrator.ui.data_migration import migration_type_locked
+    from dsql_migrator.ui.workflow import StepStatus
+
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("job-1", kind="infra")
+
+    assert (
+        migration_type_locked(state, _StartJobManager(), status=StepStatus.NOT_STARTED)
+        is False
+    )
+
+
+def test_migration_type_lock_needs_the_job_manager_to_see_a_start() -> None:
+    # Without job_manager the in-flight start is invisible -- which is exactly why the
+    # render path must pass it. Pinning this keeps the omission from looking harmless.
+    from dsql_migrator.ui.data_migration import migration_type_lock_reason
+    from dsql_migrator.ui.workflow import StepStatus
+
+    state = DataMigrationState()
+    state.set_cdc_stack_phase("infra")
+    state.set_cdc_deploy_job_id("job-1", kind="start")
+
+    assert (
+        migration_type_lock_reason(state, status=StepStatus.NOT_STARTED) is None
+    ), "state alone cannot see the start job"
+    assert (
+        migration_type_lock_reason(
+            state, status=StepStatus.NOT_STARTED, job_manager=_StartJobManager()
+        )
+        is not None
+    )
+
+
+def test_type_selector_gets_the_lock_reason_from_the_same_evaluation() -> None:
+    """The disabled state and its explanation must come from one call.
+
+    The selector used to recompute the reason itself, without the caller's
+    job_manager -- so with the fix above the tiles would lock while showing no reason
+    at all (a dead control that looks like a bug). Pinned on the parse tree.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_render_migration_type_selector"
+    ]
+    assert calls, "the screen must render the type selector"
+    kwargs = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}
+    assert "lock_reason" in kwargs, "the reason must be passed in, not recomputed"
+    # Both derive from the same computed value, so they cannot disagree.
+    assert kwargs["locked"].startswith("_type_lock_reason")
+    assert kwargs["lock_reason"] == "_type_lock_reason"
+
+    reason_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "migration_type_lock_reason"
+    ]
+    assert reason_calls, "the screen must compute the lock reason"
+    assert "job_manager" in {kw.arg for kw in reason_calls[0].keywords}, (
+        "job_manager must be passed, or an in-flight connector start is invisible"
+    )
+
+
 def test_migration_type_lock_reason_none_when_idle() -> None:
     from dsql_migrator.ui.data_migration import (
         migration_type_lock_reason,
