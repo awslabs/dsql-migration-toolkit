@@ -41,13 +41,31 @@ AI_STATUS_REJECTED = "REJECTED"
 
 # Default Bedrock model id used when the model input is left blank (Req 11.3).
 # This MUST be a real Bedrock model / inference-profile id (it is passed verbatim
-# as ``modelId`` to ``invoke_model``), not a display name. Sonnet 4.6 is the
+# as ``modelId`` to ``invoke_model``), not a display name. Sonnet 5 is the
 # general, cost-effective default; AI assist is opt-in and every suggestion
 # passes the human-review gate (Property 13) before it can touch the schema.
 # The ``global.`` (not ``us.``) cross-region-inference profile is used so the
 # default is reachable from any commercial region -- a ``us.*`` profile is
 # US-geography-scoped and fails InvokeModel in e.g. ap-northeast-2 (Seoul).
 DEFAULT_BEDROCK_MODEL_ID = "global.anthropic.claude-sonnet-5"
+
+# Fallback used when the default model is not enabled for THIS account/region.
+# A `global.` profile existing in a region does not mean the account may invoke
+# it -- model access is granted per account, so a fresh account can have the
+# profile ACTIVE and still get a model-not-enabled error. Rather than leaving the
+# operator on a dead preflight, the check retries the next entry and reports which
+# model it settled on.
+#
+# Sonnet 4.6, not 4.5: it is already an accepted BedrockModelId value (so the
+# derived IAM scope and the deploy-time AllowedValues already cover it) and it is
+# the newer model. Adding 4.5 would mean a new allowed value whose only effect is
+# a worse fallback.
+#
+# Kept to ONE alternative on purpose. Each attempt is a real InvokeModel round
+# trip, so a long chain turns a quick preflight into a slow one -- and a chain
+# that silently walks several tiers hides from the operator which model their
+# suggestions actually came from.
+BEDROCK_MODEL_FALLBACKS: tuple[str, ...] = ("global.anthropic.claude-sonnet-4-6",)
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +220,9 @@ ACCESS_CHECK_NOTIFY_TYPES: dict[str, str] = {
 }
 
 
-def map_access_check_display(result: AiAccessCheckResult) -> AiAccessDisplay:
+def map_access_check_display(
+    result: AiAccessCheckResult, *, configured_model_id: Optional[str] = None
+) -> AiAccessDisplay:
     """Map an :class:`AiAccessCheckResult` to a ``(message, notify_type)`` pair.
 
     The message is the result's ``detail`` (already actionable and
@@ -210,8 +230,25 @@ def map_access_check_display(result: AiAccessCheckResult) -> AiAccessDisplay:
     :data:`ACCESS_CHECK_NOTIFY_TYPES` by ``reason`` (defaulting to ``warning``
     for any unrecognized reason). This mapping never reads or echoes
     credentials.
+
+    Pass ``configured_model_id`` (the model the operator selected) to have a pass
+    that landed on a fallback shown as a warning rather than a clean success --
+    without it the fallback is indistinguishable from a normal pass. Optional so
+    existing callers keep their behaviour.
     """
     notify_type = ACCESS_CHECK_NOTIFY_TYPES.get(result.reason, "warning")
+    # A preflight that passed on a FALLBACK is reason="OK", but showing it in the
+    # same green as a clean pass would read as "your configured model works" when it
+    # does not. AI assist is usable, so this is not an error -- it is the design
+    # system's definition of a warning: a real but non-blocking issue the operator
+    # should know about. Detected by the model that answered differing from the one
+    # configured, which is exactly what the fallback path reports.
+    if (
+        result.reason == "OK"
+        and configured_model_id is not None
+        and result.model_id != configured_model_id
+    ):
+        notify_type = "warning"
     return AiAccessDisplay(message=result.detail, notify_type=notify_type)
 
 

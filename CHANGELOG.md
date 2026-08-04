@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.232
+
+### Added
+
+- **AI assist now falls back to Claude Sonnet 4.6 when the configured model is not
+  enabled for the account.** A `global.` Bedrock inference profile being `ACTIVE` in a
+  region does not mean the account may invoke it — model access is granted per account,
+  so a fresh account can see `global.anthropic.claude-sonnet-5` as active and still get
+  a model-not-enabled error, leaving "Verify AI access" at a dead end with nothing to do
+  but edit the model id by hand. The preflight now retries the fallback and reports
+  which model actually answered, naming both models and how to restore the chosen one.
+  Deliberately narrow: the retry fires only for a model-not-enabled failure — a missing
+  IAM permission, a throttle, or a connectivity error is a property of the caller or the
+  network, so retrying another model would only add latency and bury the real cause. A
+  fallback pass is shown as a warning rather than a green success, since reporting a
+  clean pass would imply the operator's chosen model works when it does not.
+
 ## v0.1.231
 
 ### Fixed

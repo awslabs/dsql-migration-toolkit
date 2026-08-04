@@ -821,6 +821,182 @@ def test_verify_access_returns_ok_on_success() -> None:
     assert body["max_tokens"] == 1
 
 
+class _PerModelBedrockRuntimeClient:
+    """A fake client that succeeds only for an allowlisted set of model ids.
+
+    Models outside ``enabled`` raise a model-not-enabled error, mirroring an account
+    that can see a `global.` inference profile as ACTIVE but has not been granted
+    access to invoke it -- the exact case the preflight fallback exists for.
+    """
+
+    def __init__(self, enabled: set[str]) -> None:
+        self._enabled = enabled
+        self.calls: list[dict[str, Any]] = []
+
+    def invoke_model(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        if kwargs["modelId"] not in self._enabled:
+            raise _client_error("ValidationException")
+        return _FakeBedrockRuntimeClient("pong").invoke_model(**kwargs)
+
+    @property
+    def model_ids(self) -> list[str]:
+        return [call["modelId"] for call in self.calls]
+
+
+def test_verify_access_falls_back_when_the_configured_model_is_not_enabled() -> None:
+    """The reported gap: a preflight that dead-ends when the default isn't enabled.
+
+    A `global.` profile being ACTIVE in a region does not mean this account may invoke
+    it -- model access is per account. Rather than reporting only failure, the check
+    retries the fallback and reports which model actually answered.
+    """
+    from dsql_migrator.ui.ai_assist import (
+        BEDROCK_MODEL_FALLBACKS,
+        DEFAULT_BEDROCK_MODEL_ID,
+    )
+
+    fallback = BEDROCK_MODEL_FALLBACKS[0]
+    client = _PerModelBedrockRuntimeClient(enabled={fallback})
+    assistant = AiConversionAssistant(
+        AiAssistConfig(
+            enabled=True, model_id=DEFAULT_BEDROCK_MODEL_ID, region="ap-northeast-2"
+        ),
+        client=client,
+    )
+
+    result = assistant.verify_access()
+
+    assert result.ok is True
+    # model_id echoes what ANSWERED, not what was configured -- otherwise the screen
+    # would name a model the suggestions cannot come from.
+    assert result.model_id == fallback
+    assert client.model_ids == [DEFAULT_BEDROCK_MODEL_ID, fallback]
+    # The substitution is disclosed, naming both models and how to restore the choice.
+    assert fallback in result.detail
+    assert DEFAULT_BEDROCK_MODEL_ID in result.detail
+    assert "not enabled" in result.detail
+
+
+def test_verify_access_does_not_fall_back_on_access_denied() -> None:
+    # ACCESS_DENIED is a missing IAM permission on the caller, not a property of the
+    # model, so another model cannot fix it. Retrying would add latency and bury the
+    # real cause behind a fallback's error.
+    client = _RaisingBedrockRuntimeClient(_client_error("AccessDeniedException"))
+    assistant = AiConversionAssistant(
+        AiAssistConfig(enabled=True, region="us-east-1"), client=client
+    )
+
+    result = assistant.verify_access()
+
+    assert result.ok is False
+    assert result.reason == "ACCESS_DENIED"
+    assert len(client.calls) == 1, "must not retry a fallback on an IAM failure"
+
+
+def test_verify_access_reports_the_configured_models_reason_not_the_fallbacks() -> None:
+    """A fallback's own failure must not be misreported as the operator's problem.
+
+    Configured model not enabled (retryable) but the fallback is IAM-denied: the
+    verdict has to name the configured model and its reason, or the operator chases
+    an IAM gap on a model they never chose.
+    """
+    from dsql_migrator.ui.ai_assist import (
+        BEDROCK_MODEL_FALLBACKS,
+        DEFAULT_BEDROCK_MODEL_ID,
+    )
+
+    fallback = BEDROCK_MODEL_FALLBACKS[0]
+
+    class _MixedClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def invoke_model(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append(kwargs)
+            if kwargs["modelId"] == fallback:
+                raise _client_error("AccessDeniedException")
+            raise _client_error("ValidationException")
+
+    client = _MixedClient()
+    assistant = AiConversionAssistant(
+        AiAssistConfig(enabled=True, model_id=DEFAULT_BEDROCK_MODEL_ID),
+        client=client,
+    )
+
+    result = assistant.verify_access()
+
+    assert result.ok is False
+    assert result.reason == "MODEL_NOT_ENABLED"
+    assert result.model_id == DEFAULT_BEDROCK_MODEL_ID
+    assert fallback not in result.detail
+
+
+def test_verify_access_never_probes_the_same_model_twice() -> None:
+    # Configuring the fallback explicitly must not cost two identical InvokeModel
+    # round trips -- the preflight is meant to be the cheapest possible check.
+    from dsql_migrator.ui.ai_assist import BEDROCK_MODEL_FALLBACKS
+
+    fallback = BEDROCK_MODEL_FALLBACKS[0]
+    client = _PerModelBedrockRuntimeClient(enabled=set())
+    assistant = AiConversionAssistant(
+        AiAssistConfig(enabled=True, model_id=fallback), client=client
+    )
+
+    result = assistant.verify_access()
+
+    assert result.ok is False
+    assert client.model_ids == [fallback]
+
+
+def test_verify_access_reports_failure_when_every_candidate_is_unavailable() -> None:
+    # Exhausting the chain must still produce the actionable MODEL_NOT_ENABLED
+    # verdict against the configured model, not a fallback-flavoured one.
+    from dsql_migrator.ui.ai_assist import DEFAULT_BEDROCK_MODEL_ID
+
+    client = _PerModelBedrockRuntimeClient(enabled=set())
+    assistant = AiConversionAssistant(
+        AiAssistConfig(enabled=True, model_id=DEFAULT_BEDROCK_MODEL_ID), client=client
+    )
+
+    result = assistant.verify_access()
+
+    assert result.ok is False
+    assert result.reason == "MODEL_NOT_ENABLED"
+    assert result.model_id == DEFAULT_BEDROCK_MODEL_ID
+
+
+def test_fallback_model_is_an_accepted_deploy_parameter_value() -> None:
+    """The fallback must be deployable, or it fails on IAM rather than model access.
+
+    The task role's bedrock:InvokeModel scope is derived from BedrockModelId's
+    AllowedValues, so a fallback outside that list would be denied by IAM in a real
+    deploy even though the preflight chose it.
+    """
+    import pathlib
+
+    import yaml
+
+    deploy_dir = pathlib.Path(__file__).resolve().parents[1] / "deploy"
+    template = yaml.safe_load(
+        (deploy_dir / "cloudformation.yaml").read_text(encoding="utf-8")
+    )
+    allowed = template["Parameters"]["BedrockModelId"]["AllowedValues"]
+
+    from dsql_migrator.ui.ai_assist import (
+        BEDROCK_MODEL_FALLBACKS,
+        DEFAULT_BEDROCK_MODEL_ID,
+    )
+
+    assert DEFAULT_BEDROCK_MODEL_ID in allowed
+    for fallback in BEDROCK_MODEL_FALLBACKS:
+        assert fallback in allowed, (
+            f"fallback {fallback} is not an accepted BedrockModelId value, so the "
+            "derived IAM scope would not cover it"
+        )
+    assert DEFAULT_BEDROCK_MODEL_ID not in BEDROCK_MODEL_FALLBACKS
+
+
 def test_verify_access_maps_access_denied() -> None:
     client = _RaisingBedrockRuntimeClient(_client_error("AccessDeniedException"))
     assistant = AiConversionAssistant(

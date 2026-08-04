@@ -1147,7 +1147,11 @@ def build_connect_page(
                 result = await run.io_bound(
                     verify_runner, config, state.aws_profile
                 )
-                display = map_access_check_display(result)
+                # Pass the configured model so a pass that landed on a fallback is
+                # shown as a warning, not as a clean green success.
+                display = map_access_check_display(
+                    result, configured_model_id=config.model_id
+                )
                 # Skip UI updates if the page was rebuilt while awaiting
                 # (NiceGUI #3028): the element/slot may have been deleted.
                 if ai_status.is_deleted:

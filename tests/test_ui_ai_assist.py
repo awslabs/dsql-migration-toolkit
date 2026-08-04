@@ -397,6 +397,73 @@ def test_map_access_check_display_ok_is_positive() -> None:
     assert display.message == "AI access verified."
 
 
+def test_map_access_check_display_fallback_pass_is_a_warning_not_a_success() -> None:
+    """A pass on a fallback must not look like a clean pass.
+
+    The preflight returns reason="OK" either way, so without the configured-model
+    comparison a green "verified" is shown while the operator's chosen model is in
+    fact unavailable. Per the design system this is a warning: real but non-blocking
+    (AI assist works, just on a different model).
+    """
+    result = _access_result(
+        ok=True,
+        reason="OK",
+        detail="Verified, but using the fallback model.",
+        model_id="global.anthropic.claude-sonnet-4-6",
+    )
+
+    display = map_access_check_display(
+        result, configured_model_id="global.anthropic.claude-sonnet-5"
+    )
+
+    assert display.notify_type == "warning"
+    assert display.message == "Verified, but using the fallback model."
+
+
+def test_map_access_check_display_ok_on_the_configured_model_stays_positive() -> None:
+    # The warning must be scoped to an actual substitution -- a normal pass, and a
+    # caller that supplies no configured model, both keep the clean green verdict.
+    result = _access_result(
+        ok=True, reason="OK", detail="Verified.", model_id="model-a"
+    )
+
+    assert (
+        map_access_check_display(result, configured_model_id="model-a").notify_type
+        == "positive"
+    )
+    assert map_access_check_display(result).notify_type == "positive"
+
+
+def test_connect_screen_passes_the_configured_model_to_the_display_mapping() -> None:
+    """The tone fix only reaches users if the screen supplies the configured model.
+
+    Asserted on the parse tree rather than a source substring so reformatting or a
+    reworded comment cannot satisfy it. Without the keyword the call silently falls
+    back to the optional default and every fallback pass renders green.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import connect as connect_mod
+
+    tree = ast.parse(inspect.getsource(connect_mod.build_connect_page))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "map_access_check_display"
+    ]
+    assert calls, "the connect screen no longer calls map_access_check_display"
+    for call in calls:
+        kwargs = {kw.arg: kw.value for kw in call.keywords}
+        assert "configured_model_id" in kwargs, (
+            "map_access_check_display must receive configured_model_id, or a "
+            "fallback pass is rendered as a clean success"
+        )
+        assert ast.unparse(kwargs["configured_model_id"]) == "config.model_id"
+
+
 def test_map_access_check_display_access_denied_is_negative() -> None:
     result = _access_result(ok=False, reason="ACCESS_DENIED", detail="Add permission.")
     display = map_access_check_display(result)

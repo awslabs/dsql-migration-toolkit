@@ -525,6 +525,26 @@ _MODEL_NOT_ENABLED_CODES = frozenset(
 )
 
 
+def _fallback_ok_detail(*, configured: str, used: str) -> str:
+    """Detail for a preflight that passed on a fallback rather than the configured model.
+
+    Says so explicitly rather than reporting a plain success: the operator picked a
+    model, and silently answering with a different one would leave them believing
+    suggestions come from a model that is not actually reachable. Names both ids and
+    the one action that restores their choice.
+
+    Contains only the two model ids and fixed prose -- no exception text, endpoint,
+    or credential (Requirement 11.15 / Property 7).
+    """
+    return (
+        f"Amazon Bedrock access verified, but using {used} instead of the "
+        f"configured {configured}, which is not enabled for this account in this "
+        "region. AI assist works and suggestions will come from the fallback model. "
+        f"To use {configured}, enable its model access in the Amazon Bedrock console "
+        "for this account and region, then verify again."
+    )
+
+
 def _classify_access_check_error(exc: BaseException) -> AccessCheckReason:
     """Map a boto/Bedrock exception to a verify_access failure reason.
 
@@ -831,31 +851,77 @@ class AiConversionAssistant:
         (Requirement 11.16). It only checks connectivity/permission and does not
         change the AI suggestion review gate (Property 13).
         """
-        try:
-            self._get_client().invoke_model(
-                modelId=self._config.model_id,
-                body=_build_invoke_body(
-                    _ACCESS_CHECK_PROMPT, max_tokens=_ACCESS_CHECK_MAX_TOKENS
-                ),
-                contentType="application/json",
-                accept="application/json",
-            )
-        except Exception as exc:  # noqa: BLE001 - never raise into the workflow
-            reason = _classify_access_check_error(exc)
+        # Try the configured model, then the fallback chain -- but ONLY for
+        # MODEL_NOT_ENABLED. A `global.` inference profile can be ACTIVE in a region
+        # while this account still lacks access to it, which is the one failure a
+        # different model can actually fix. ACCESS_DENIED (missing IAM), THROTTLED,
+        # and UNKNOWN (connectivity) are properties of the caller or the network, so
+        # retrying another model would only add latency and bury the real cause.
+        first_reason: Optional[AccessCheckReason] = None
+        for candidate in self._access_check_candidates():
+            try:
+                self._get_client().invoke_model(
+                    modelId=candidate,
+                    body=_build_invoke_body(
+                        _ACCESS_CHECK_PROMPT, max_tokens=_ACCESS_CHECK_MAX_TOKENS
+                    ),
+                    contentType="application/json",
+                    accept="application/json",
+                )
+            except Exception as exc:  # noqa: BLE001 - never raise into the workflow
+                reason = _classify_access_check_error(exc)
+                if first_reason is None:
+                    first_reason = reason
+                if reason == "MODEL_NOT_ENABLED":
+                    continue
+                # Report the reason for the model the OPERATOR configured, not a
+                # fallback's -- an IAM gap on the fallback is not their problem.
+                return AiAccessCheckResult(
+                    ok=False,
+                    reason=first_reason,
+                    detail=_ACCESS_CHECK_DETAILS[first_reason],
+                    model_id=self._config.model_id,
+                    region=self._config.region,
+                )
+            # ``model_id`` echoes what actually answered, so the screen never claims
+            # a model the suggestions won't come from.
             return AiAccessCheckResult(
-                ok=False,
-                reason=reason,
-                detail=_ACCESS_CHECK_DETAILS[reason],
-                model_id=self._config.model_id,
+                ok=True,
+                reason="OK",
+                detail=(
+                    _ACCESS_CHECK_DETAILS["OK"]
+                    if candidate == self._config.model_id
+                    else _fallback_ok_detail(
+                        configured=self._config.model_id, used=candidate
+                    )
+                ),
+                model_id=candidate,
                 region=self._config.region,
             )
+
+        # Every candidate reported not-enabled.
+        reason = first_reason or "MODEL_NOT_ENABLED"
         return AiAccessCheckResult(
-            ok=True,
-            reason="OK",
-            detail=_ACCESS_CHECK_DETAILS["OK"],
+            ok=False,
+            reason=reason,
+            detail=_ACCESS_CHECK_DETAILS[reason],
             model_id=self._config.model_id,
             region=self._config.region,
         )
+
+    def _access_check_candidates(self) -> list[str]:
+        """Return the configured model followed by any distinct fallbacks.
+
+        The configured model is always tried first, and a fallback equal to it is
+        dropped so the preflight never pays for the same InvokeModel twice.
+        """
+        from dsql_migrator.ui.ai_assist import BEDROCK_MODEL_FALLBACKS
+
+        candidates = [self._config.model_id]
+        for fallback in BEDROCK_MODEL_FALLBACKS:
+            if fallback not in candidates:
+                candidates.append(fallback)
+        return candidates
 
     def _build_suggestion(
         self,
