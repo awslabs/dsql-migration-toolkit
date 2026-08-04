@@ -2882,8 +2882,15 @@ def build_schema_conversion_screen(
                 ui.notify("Source browser refreshed.", type="positive")  # type: ignore[attr-defined]
                 refresh()
 
-            async def refresh_target() -> None:
-                """Re-introspect the target DSQL catalog and refresh the tree."""
+            async def refresh_target(*, announce: bool = True) -> None:
+                """Re-introspect the target DSQL catalog and refresh the tree.
+
+                ``announce=False`` is used when this runs as a STEP of another action
+                (Generate re-browses first, so the diffs' "exists on target" verdicts are
+                current): there the "Target browser refreshed." toast and the extra
+                re-render are noise, because the caller renders once it has committed its
+                own state. The manual refresh button keeps both.
+                """
                 from nicegui import run as _run
 
                 from dsql_migrator.ui.evaluation import (
@@ -2921,8 +2928,9 @@ def build_schema_conversion_screen(
                             ),
                         )
                     )
-                ui.notify("Target browser refreshed.", type="positive")  # type: ignore[attr-defined]
-                refresh()
+                if announce:
+                    ui.notify("Target browser refreshed.", type="positive")  # type: ignore[attr-defined]
+                    refresh()
 
             # Shared AI chat drawer (same component/look as the Evaluation
             # screen), opened per object to chat about converting it. Advisory
@@ -2970,6 +2978,7 @@ def build_schema_conversion_screen(
                     on_apply_object=apply_object_confirmed,
                     on_refresh_source=refresh_source,
                     on_refresh_target=refresh_target,
+                    on_sync_target=lambda: refresh_target(announce=False),
                     on_ai_chat=(
                         open_conversion_chat
                         if session.ai_assist.enabled
@@ -3100,6 +3109,48 @@ def _install_poll_timer(
     ui.timer(_POLL_INTERVAL_SECONDS, poll)  # type: ignore[attr-defined]
 
 
+async def generate_selected_ddl(
+    conv_state: "SchemaConversionState",
+    refresh: Callable[[], None],
+    *,
+    sync_target: Optional[Callable[[], object]] = None,
+) -> None:
+    """Re-read the target catalog, then commit the ticked objects as the DDL scope.
+
+    Backs the "Generate DDL for selected" button. The re-read is the fix for a stale
+    verdict: each diff's "already exists on target" comes from the cached
+    ``TargetInventory`` snapshot (:class:`_InventoryExistenceChecker` answers from memory
+    and issues no SQL), and that snapshot is only filled by Evaluation's browse or the
+    manual "Refresh target" button. So a target emptied since then still warned "'x'
+    already exists on the target. Choose SKIP ... or REPLACE (destructive)" about objects
+    that were gone, pushing the user toward a destructive choice for nothing. The reverse
+    is worse: an object created since the snapshot drew NO warning, and the user met an
+    unexpected SKIP.
+
+    The re-read is read-only (``information_schema`` SELECTs) and happens off the UI
+    thread inside ``sync_target``, so the freshest catalog backs every diff without the
+    user having to remember a refresh step first -- inferring what can be inferred rather
+    than asking.
+
+    A refresh failure is deliberately NOT fatal: the generation still proceeds, because
+    the DDL diff is the point and a stale existence verdict cannot misroute the actual
+    apply (``_build_core_applier`` browses the target again and ``apply()`` decides from
+    that live read).
+    """
+    if sync_target is not None:
+        try:
+            outcome = sync_target()
+            if inspect.isawaitable(outcome):
+                await outcome
+        except Exception:  # noqa: BLE001 - advisory; never block generation
+            logger.exception(
+                "Target re-browse before Generate failed; "
+                "using the cached target snapshot"
+            )
+    conv_state.generated_node_ids = list(conv_state.ticked_node_ids)
+    refresh()
+
+
 def _render_browser_and_preview(
     ui: object,
     inventory: SourceInventory,
@@ -3114,6 +3165,10 @@ def _render_browser_and_preview(
     on_apply_object: Optional[Callable[[str], None]] = None,
     on_refresh_source: Optional[Callable[[], object]] = None,
     on_refresh_target: Optional[Callable[[], object]] = None,
+    # Re-read the target catalog as a silent STEP of Generate (no toast, no extra
+    # re-render) so each diff's "exists on target" verdict is current. Separate from
+    # on_refresh_target, which is the user-facing button and announces itself.
+    on_sync_target: Optional[Callable[[], object]] = None,
     on_ai_chat: Optional[Callable[[str, str, str], None]] = None,
     apply_in_progress: bool = False,
 ) -> None:
@@ -3344,9 +3399,10 @@ def _render_browser_and_preview(
                     ).classes("text-sm text-gray-500")
 
     # --- Generate DDL for the ticked objects ------------------------------
-    def on_generate() -> None:
-        conv_state.generated_node_ids = list(conv_state.ticked_node_ids)
-        refresh()
+    async def on_generate() -> None:
+        await generate_selected_ddl(
+            conv_state, refresh, sync_target=on_sync_target
+        )
 
     def on_clear() -> None:
         # Full reset: discard the generated DDL, per-object edits, AI

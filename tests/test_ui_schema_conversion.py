@@ -3293,3 +3293,132 @@ def test_source_default_rendering_matches_the_converters_discriminator() -> None
     # No guessing from the value's shape.
     for heuristic in ("upper()", "startswith(", "endswith(", "CURRENT_TIMESTAMP\""):
         assert heuristic not in src, f"shape heuristic leaked in: {heuristic}"
+
+
+def test_generate_rereads_the_target_before_committing_the_scope() -> None:
+    """The reported defect: "already exists on target" survived deleting the target.
+
+    The verdict comes from the cached TargetInventory snapshot (no SQL), filled only by
+    Evaluation's browse or the manual "Refresh target" button -- so a target emptied
+    since then still pushed the user toward REPLACE (destructive) for objects that were
+    gone. Generate must re-read the catalog first, and must do so BEFORE it commits the
+    scope, or the diffs render against the stale snapshot anyway.
+    """
+    import asyncio
+
+    from dsql_migrator.ui.schema_conversion import (
+        SchemaConversionState,
+        generate_selected_ddl,
+    )
+
+    calls: list[str] = []
+    state = SchemaConversionState()
+    state.ticked_node_ids = ["table:ecommerce.orders"]
+
+    seen: dict = {}
+
+    async def _sync() -> None:
+        calls.append("sync")
+        # RECORD the scope rather than asserting here: generate_selected_ddl swallows
+        # exceptions from this hook (a refresh failure must not block generation), so an
+        # inline assert would be caught and the ordering check would silently pass.
+        seen["scope_at_sync"] = state.generated_node_ids
+
+    asyncio.run(
+        generate_selected_ddl(state, lambda: calls.append("refresh"), sync_target=_sync)
+    )
+
+    assert calls == ["sync", "refresh"]
+    assert seen["scope_at_sync"] is None, (
+        "the target must be re-read BEFORE the generation scope is committed, "
+        "or the diffs render against the stale snapshot anyway"
+    )
+    assert state.generated_node_ids == ["table:ecommerce.orders"]
+
+
+def test_generate_still_produces_ddl_when_the_target_reread_fails() -> None:
+    """A refresh failure must not block generation.
+
+    The diff is the point, and a stale verdict cannot misroute the apply (the apply path
+    browses the target again and decides from that live read). Failing closed here would
+    turn a transient AWS blip into "the button does nothing".
+    """
+    import asyncio
+
+    from dsql_migrator.ui.schema_conversion import (
+        SchemaConversionState,
+        generate_selected_ddl,
+    )
+
+    state = SchemaConversionState()
+    state.ticked_node_ids = ["table:ecommerce.orders"]
+    refreshed: list[str] = []
+
+    async def _boom() -> None:
+        raise RuntimeError("DSQL unreachable")
+
+    asyncio.run(
+        generate_selected_ddl(
+            state, lambda: refreshed.append("refresh"), sync_target=_boom
+        )
+    )
+
+    assert state.generated_node_ids == ["table:ecommerce.orders"]
+    assert refreshed == ["refresh"], "the screen must still re-render"
+
+
+def test_generate_works_without_a_target_sync_hook() -> None:
+    # Tests (and any caller with no target configured) pass no hook; generation must
+    # still commit the scope rather than raising.
+    import asyncio
+
+    from dsql_migrator.ui.schema_conversion import (
+        SchemaConversionState,
+        generate_selected_ddl,
+    )
+
+    state = SchemaConversionState()
+    state.ticked_node_ids = ["table:a"]
+    asyncio.run(generate_selected_ddl(state, lambda: None))
+    assert state.generated_node_ids == ["table:a"]
+
+
+def test_generate_accepts_a_synchronous_sync_hook() -> None:
+    # The hook is awaited only when awaitable, so a plain callable must work too.
+    import asyncio
+
+    from dsql_migrator.ui.schema_conversion import (
+        SchemaConversionState,
+        generate_selected_ddl,
+    )
+
+    calls: list[str] = []
+    state = SchemaConversionState()
+    state.ticked_node_ids = ["table:a"]
+    asyncio.run(
+        generate_selected_ddl(
+            state, lambda: None, sync_target=lambda: calls.append("sync")
+        )
+    )
+    assert calls == ["sync"]
+    assert state.generated_node_ids == ["table:a"]
+
+
+def test_silent_target_sync_does_not_toast_or_double_render() -> None:
+    """The Generate-time re-read must be silent; the manual button still announces.
+
+    Generate renders once after committing its own state, so a toast plus an extra
+    re-render from the refresh helper is noise mid-action.
+    """
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+
+    src = inspect.getsource(sc.build_schema_conversion_screen)
+    # The announce flag gates BOTH the toast and the helper's own refresh().
+    assert "async def refresh_target(*, announce: bool = True)" in src
+    gated = src[src.index("if announce:"):]
+    assert "Target browser refreshed." in gated.split("\n\n")[0]
+    # Generate is wired to the silent variant; the button keeps the announcing one.
+    assert "on_sync_target=lambda: refresh_target(announce=False)" in src
+    assert "on_refresh_target=refresh_target," in src

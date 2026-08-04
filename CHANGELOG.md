@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.244
+
+### Fixed
+
+- **"Generate DDL for selected" judged target existence from a stale snapshot.** Each
+  diff's "'x' already exists on the target — choose SKIP or REPLACE (destructive)" warning
+  was answered from the cached target inventory, which issues no SQL and is only filled by
+  Evaluation's browse or the manual "Refresh target" button. So after emptying the target,
+  Generate still warned about objects that were gone and pushed the user toward a
+  destructive choice for nothing; the reverse case was worse, since an object created
+  since the snapshot drew no warning at all and produced an unexpected SKIP. Generate now
+  re-reads the target catalog first — read-only, off the UI thread, and silent (no toast,
+  no double render) — so every verdict reflects the live target without the user having to
+  remember a refresh step. A failed re-read does not block generation: the DDL diff is
+  still produced, and the apply path independently re-checks existence against a live
+  browse, so a stale verdict could never have misrouted the actual DDL.
+
 ## v0.1.243
 
 ### Fixed
