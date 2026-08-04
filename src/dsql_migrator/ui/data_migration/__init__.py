@@ -2103,13 +2103,26 @@ def migration_type_lock_reason(
       appeared. The start point and table set are committed the moment Start is
       pressed, so the choice must freeze then, not when the connectors finish.
 
-    Both legitimately freeze the choice, but the reason (and the remedy) differ.
+    * **Provisioning** — a cdc-stack CREATE is IN FLIGHT (``kind="infra"``). This one
+      used to be deliberately excluded, on the grounds that the create makes no
+      connectors and streams nothing (see :func:`cdc_streaming_started`, which still
+      excludes it for exactly that reason -- it answers "are the inputs committed?").
+      But "nothing is streaming" is not the same as "the choice is free". The create is
+      a ~15-20 min CloudFormation run that provisions a BILLABLE MSK Serverless cluster,
+      and every way to watch or undo it (the stage progress, the event log, Delete CDC
+      infrastructure) lives on the CDC sub-step. Switching to Full load only removes
+      that sub-step outright (:func:`substeps_for_type`), so the user is left with an
+      MSK cluster building in their account with no progress, no completion signal and
+      no teardown control on screen. The tool also already treats this moment as
+      committed elsewhere: the oversized-LOB exclusions lock during an ``infra`` job
+      because ``ColumnExcludeList`` is baked into the stack at create time -- and those
+      exclusions are a CDC-only setting, so freezing them while leaving the type itself
+      switchable was internally inconsistent.
+
+    Each legitimately freezes the choice, but the reason (and the remedy) differ.
     Reads ``status`` and already-populated state; ``job_manager`` (optional) is only
-    consulted to see the in-flight start job. No AWS I/O, so it is safe to call during
-    render and is unit-testable. An in-flight ``kind="infra"`` job deliberately does
-    NOT lock -- the infrastructure create makes no connectors and streams nothing (see
-    :func:`cdc_streaming_started`), so the type is still legitimately changeable while
-    MSK provisions.
+    consulted to see the in-flight job. No AWS I/O, so it is safe to call during render
+    and is unit-testable.
     """
     if status is StepStatus.IN_PROGRESS:
         return (
@@ -2128,6 +2141,17 @@ def migration_type_lock_reason(
             "Locked because CDC connectors from a previous run are still deployed "
             "(Start over does not delete them). To change the type, use 'Delete "
             "CDC infrastructure' on the CDC step first."
+        )
+    # A cdc-stack CREATE in flight: billable MSK is provisioning, and the only progress
+    # view / teardown control lives on the CDC sub-step that a type switch would remove.
+    if job_manager is not None and cdc_infra_deploy_in_flight(
+        migration_state, job_manager
+    ):
+        return (
+            "Locked while the CDC streaming infrastructure is being created — it is "
+            "provisioning a billable Amazon MSK cluster, and its progress and 'Delete "
+            "CDC infrastructure' control live on the CDC step. Wait for it to finish "
+            "(or delete it there) to change the type."
         )
     return None
 
@@ -5236,6 +5260,7 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     cdc_deploy_connection_blocker,
     cdc_live_running_names,
     cdc_pipeline_live,
+    cdc_infra_deploy_in_flight,
     cdc_streaming_started,
     cdc_unstable_message,
     classify_cdc_card_phase,

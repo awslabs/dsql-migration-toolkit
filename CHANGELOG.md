@@ -5,6 +5,29 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.247
+
+### Fixed
+
+- **The migration type stayed switchable while CDC infrastructure was being created.** It
+  was excluded on the grounds that the create makes no connectors and streams nothing, but
+  that is not the same as the choice being free: it is a ~15-20 min run provisioning a
+  billable Amazon MSK cluster, and its progress view and "Delete CDC infrastructure"
+  control both live on the CDC sub-step — which switching to "Full load only" removes
+  outright, leaving the cluster building in the account with no progress, no completion
+  signal and no teardown control on screen. The tool was also inconsistent with itself: the
+  oversized-LOB exclusions already lock during an infrastructure create. The type now locks
+  for the duration of that run, naming the cost and where the controls are, and unlocks
+  again when it finishes (idle infrastructure is a trade-off the user still owns).
+- **The CDC step's "Per-table migration status" table appeared before CDC started.** It
+  showed up as soon as the CDC sub-step did — including throughout the infrastructure
+  create — where every CDC column (Stream lag, Quarantined, Inserts/Updates/Deletes,
+  Consistency) is necessarily empty because no connector exists yet, so it read as "CDC is
+  running and replicating nothing". It now appears once CDC is actually started, matching
+  the live-status panel above it, and from the moment Start CDC is pressed rather than only
+  once the connectors finish their ~10-20 min ramp. Nothing is lost: the Full Load's own
+  per-table table stays on the Full Load step.
+
 ## v0.1.246
 
 ### Fixed

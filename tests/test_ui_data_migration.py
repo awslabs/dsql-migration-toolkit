@@ -5174,14 +5174,34 @@ def test_migration_type_unlocked_while_full_load_job_running() -> None:
     assert migration_type_locked(state, mgr, status=StepStatus.NOT_STARTED) is False
 
 
-def test_migration_type_unlocked_while_cdc_infra_deploying() -> None:
-    # Deploying (or having deployed) CDC infrastructure does NOT lock the type:
-    # idle infra is a billable trade-off the user owns; they can still switch.
+def test_migration_type_locked_while_cdc_infra_is_being_created() -> None:
+    """An in-flight cdc-stack CREATE must lock the type.
+
+    It used to be excluded because the create streams nothing. But it is a ~15-20 min
+    run provisioning a BILLABLE MSK cluster, and its progress view and "Delete CDC
+    infrastructure" control both live on the CDC sub-step -- which switching to Full
+    load only removes, leaving the cluster building with nothing on screen.
+    """
     from dsql_migrator.ui.data_migration import DataMigrationState, migration_type_locked
 
     state = DataMigrationState()
     state.set_cdc_deploy_job_id("infra-1", kind="infra")
     mgr = _StubJobManager({"infra-1": _StubJob("PENDING")})
+    assert migration_type_locked(state, mgr, status=StepStatus.NOT_STARTED) is True
+
+
+def test_migration_type_unlocks_once_the_infra_job_finishes() -> None:
+    """The lock is scoped to the RUN, not to the infrastructure existing.
+
+    A finished create with no connectors leaves idle infra -- a billable trade-off the
+    user owns and can still change their mind about (the CDC step is reachable and offers
+    Delete). Locking forever would strand them.
+    """
+    from dsql_migrator.ui.data_migration import DataMigrationState, migration_type_locked
+
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("infra-1", kind="infra")
+    mgr = _StubJobManager({"infra-1": _StubJob("DONE")})
     assert migration_type_locked(state, mgr, status=StepStatus.NOT_STARTED) is False
 
 
@@ -7777,23 +7797,40 @@ def test_migration_type_locks_while_a_connector_start_is_in_flight() -> None:
     assert migration_type_locked(state, jm, status=StepStatus.NOT_STARTED) is True
 
 
-def test_migration_type_stays_changeable_while_only_infrastructure_deploys() -> None:
-    """An infra create must NOT lock the type.
+def test_infra_create_lock_names_the_cost_and_the_remedy() -> None:
+    """The message must say WHY (billable MSK) and WHERE the controls are.
 
-    ``create_stack`` provisions MSK/networking/plugins and makes no connectors, so
-    nothing is committed and nothing streams for the ~15-20 min it runs -- the operator
-    can still legitimately change their mind about the plan.
+    A dead, silently-disabled tile reads as a bug -- and the remedy is not obvious here,
+    because the progress and teardown controls are on a different sub-step.
     """
-    from dsql_migrator.ui.data_migration import migration_type_locked
+    from dsql_migrator.ui.data_migration import migration_type_lock_reason
     from dsql_migrator.ui.workflow import StepStatus
 
     state = DataMigrationState()
     state.set_cdc_deploy_job_id("job-1", kind="infra")
 
-    assert (
-        migration_type_locked(state, _StartJobManager(), status=StepStatus.NOT_STARTED)
-        is False
+    reason = migration_type_lock_reason(
+        state, status=StepStatus.NOT_STARTED, job_manager=_StartJobManager()
     )
+    assert reason is not None
+    assert "billable" in reason
+    assert "Delete CDC infrastructure" in reason
+
+
+def test_infra_create_does_not_count_as_streaming_started() -> None:
+    """The two predicates must stay distinct.
+
+    ``cdc_streaming_started`` answers "are CDC's inputs committed / is anything
+    streaming?" and must keep EXCLUDING an infra job -- it gates things like promoting
+    the step to DONE, which an infra create must never do (that once unlocked Validation
+    with zero rows loaded). The new type lock asks a different question.
+    """
+    from dsql_migrator.ui.data_migration._cdc_ui import cdc_streaming_started
+
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("job-1", kind="infra")
+
+    assert cdc_streaming_started(state, _StartJobManager()) is False
 
 
 def test_migration_type_lock_needs_the_job_manager_to_see_a_start() -> None:
@@ -13886,6 +13923,9 @@ def _render_cdc_per_table(state, *, job_id="job-fullload-1"):
         target_config = None
         aws_profile = None
 
+    # The table only renders once CDC has STARTED (it is a CDC-status view), so put
+    # the session in that state -- detected connectors are the narrow signal.
+    state.set_cdc_stack_phase("running")
     # The table set comes from the Full Load job's chunk ids
     # (_migration_status_tables), so the job needs a chunk per listed table.
     job = MigrationJob(
@@ -14221,3 +14261,82 @@ def test_screen_passes_the_acceptance_flag_to_the_banner() -> None:
             assert "accept_quarantined_rows" in kwargs["quarantine_accepted"]
             return
     raise AssertionError("stale_error_notice call not found in the screen")
+
+
+def _render_per_table_with(state, *, job_id="job-fullload-1", cdc_jobs=None):
+    """Render the per-table status view against ``state`` and return the UI double.
+
+    ``cdc_jobs`` registers extra jobs (e.g. an in-flight connector start) so the
+    started-CDC predicate can see them through the job manager.
+    """
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    class _Sess:
+        target_config = None
+        aws_profile = None
+
+    ui = _RecordingUi()
+    jobs = {
+        job_id: MigrationJob(
+            job_id=job_id,
+            status="DONE",
+            chunks=[ChunkState(chunk_id="ecommerce.product_media", status="DONE")],
+        )
+    }
+    jobs.update(cdc_jobs or {})
+    _cdc_ui._render_migration_table_status(
+        ui, state, _StubJobManager(jobs), _Sess(), inventory=None
+    )
+    return ui
+
+
+def test_per_table_status_is_hidden_while_cdc_infra_is_still_deploying() -> None:
+    """The table must not appear during the ~15-20 min infrastructure create.
+
+    Every CDC column (Stream lag, Quarantined, I/U/D, Consistency) is necessarily empty
+    then -- no connector exists yet -- so it read as "CDC is running and replicating
+    nothing", the opposite of the truth.
+    """
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    state.set_cdc_deploy_job_id("infra-1", kind="infra")
+    state.set_cdc_stack_phase("provisioning")
+
+    ui = _render_per_table_with(state)
+    assert not any("Per-table migration status" in t for t in ui.texts)
+
+
+def test_per_table_status_is_hidden_before_cdc_starts_even_with_infra_ready() -> None:
+    # Deployed-but-not-started is the other pre-CDC state: the stack exists, no
+    # connectors do, so the CDC columns are still empty.
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    state.set_cdc_stack_phase("infra")
+
+    ui = _render_per_table_with(state)
+    assert not any("Per-table migration status" in t for t in ui.texts)
+
+
+def test_per_table_status_appears_once_cdc_starts() -> None:
+    # The control: it must show for a live pipeline, which is its whole purpose.
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    state.set_cdc_stack_phase("running")
+
+    ui = _render_per_table_with(state)
+    assert any("Per-table migration status" in t for t in ui.texts)
+
+
+def test_per_table_status_appears_during_the_connector_ramp() -> None:
+    """Visible from the moment Start CDC is pressed, not only once RUNNING.
+
+    Connectors take ~10-20 min to come up and the operator wants the per-table view
+    during that ramp -- hence cdc_streaming_started, not cdc_pipeline_live.
+    """
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    state.set_cdc_deploy_job_id("start-1", kind="start")  # start job in flight
+
+    ui = _render_per_table_with(state, cdc_jobs={"start-1": _StubJob("RUNNING")})
+    assert any("Per-table migration status" in t for t in ui.texts)

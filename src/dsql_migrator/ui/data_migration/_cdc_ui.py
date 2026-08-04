@@ -319,6 +319,25 @@ def cdc_pipeline_live(migration_state) -> bool:
     return getattr(migration_state, "cdc_stack_phase", None) == "running"
 
 
+def cdc_infra_deploy_in_flight(migration_state, job_manager) -> bool:
+    """True while this session's cdc-stack CREATE job is PENDING/RUNNING.
+
+    Deliberately DISTINCT from :func:`cdc_streaming_started`, which excludes an ``infra``
+    job: that predicate answers "are CDC's inputs committed / is anything streaming?"
+    (it gates promoting the step to DONE, which an infra create must never do). This one
+    answers "is a long, billable provisioning run under way?" -- the question the
+    migration-type lock and the oversized-LOB exclusion lock both need, since
+    ``ColumnExcludeList`` is baked into the stack at create time and the create's only
+    progress/teardown controls live on the CDC sub-step.
+
+    Pure apart from reading the job's status through ``job_manager``; no AWS I/O.
+    """
+    if getattr(migration_state, "cdc_action_kind", None) != "infra":
+        return False
+    job = _current_job(job_manager, getattr(migration_state, "cdc_deploy_job_id", None))
+    return job is not None and job.status in ("PENDING", "RUNNING")
+
+
 def cdc_streaming_started(migration_state, job_manager) -> bool:
     """True once CDC has been started, so its inputs must no longer change.
 
@@ -1836,14 +1855,7 @@ def cdc_infra_prep_state(migration_state, job_manager) -> str:
 
     Pure (reads already-populated state; no AWS I/O) so it is safe during render.
     """
-    deploy_job = _current_job(
-        job_manager, getattr(migration_state, "cdc_deploy_job_id", None)
-    )
-    if (
-        getattr(migration_state, "cdc_action_kind", None) == "infra"
-        and deploy_job is not None
-        and deploy_job.status in ("PENDING", "RUNNING")
-    ):
+    if cdc_infra_deploy_in_flight(migration_state, job_manager):
         return "deploying"
     phase = getattr(migration_state, "cdc_stack_phase", None)
     if phase in ("infra", "running", "unstable", "provisioning", "partial"):
@@ -3686,9 +3698,25 @@ def _render_migration_table_status(
     metrics (DMS-style cumulative counters, refreshed each CDC poll), so they need no
     COUNT(*). The source/target-count columns still come from
     a direct COUNT(*) on each side, which scans the source, so those remain an
-    explicit "Refresh counts" action (not an auto-poll). Shown once a Full Load job
-    exists (the CDC step is reached only after Full Load in the combined flow).
+    explicit "Refresh counts" action (not an auto-poll).
+
+    Rendered only once CDC has actually STARTED. It used to appear as soon as the CDC
+    sub-step did -- i.e. during the ~15-20 min infrastructure create -- where every
+    CDC-specific column (Stream lag, Quarantined, Inserts/Updates/Deletes, Consistency)
+    is necessarily empty because no connector exists yet. That read as "CDC is running
+    and replicating nothing", the opposite of the truth, and it padded the deploy screen
+    with a table that could not answer its own question. Nothing is lost by waiting: the
+    Full Load's own per-table table (Table / Status / Rows / Progress / Time / Attempts)
+    stays on the Full Load step, so its results remain visible there.
+
+    Matches ``_render_cdc_live_monitoring`` directly above it, which is likewise
+    "meaningful only once streaming".
     """
+    # cdc_streaming_started (not cdc_pipeline_live) so the table appears the moment
+    # Start CDC is pressed: the connectors take ~10-20 min to reach RUNNING and the
+    # operator wants the per-table view during that ramp, not only after it.
+    if not cdc_streaming_started(migration_state, job_manager):
+        return
     table_names = _migration_status_tables(migration_state, job_manager)
     if not table_names:
         return
@@ -4677,14 +4705,7 @@ def lob_exclusion_lock(migration_state, job_manager) -> tuple[bool, Optional[str
         )
     # An infra create is in flight: the parameter went out with the stack, but the
     # operator was just here choosing, so say what happened.
-    deploy_job = _current_job(
-        job_manager, getattr(migration_state, "cdc_deploy_job_id", None)
-    )
-    if (
-        getattr(migration_state, "cdc_action_kind", None) == "infra"
-        and deploy_job is not None
-        and deploy_job.status in ("PENDING", "RUNNING")
-    ):
+    if cdc_infra_deploy_in_flight(migration_state, job_manager):
         return True, (
             "Locked while the CDC infrastructure is being created — the excluded "
             "columns are part of the stack's parameters and were submitted with it."
