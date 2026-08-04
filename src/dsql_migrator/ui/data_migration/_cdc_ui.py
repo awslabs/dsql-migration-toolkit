@@ -3596,22 +3596,37 @@ def _render_deploy_stages(ui, job, kind: str = "start", on_refresh=None) -> None
     force an immediate poll; the caption reassures them it updates on its own.
     """
     labels = _CDC_STAGE_LABELS.get(kind, _CDC_STAGE_LABELS["start"])
-    etas = _CDC_STAGE_ETA_SECONDS.get(kind, {})
+    # Delete shows no per-stage ETA: its dominant stage (stack_delete) waits on
+    # unpredictable ENI reclamation, so a "~5 min" hint on it is misleading. The
+    # upper-bound line under the title carries the expectation instead. An empty map
+    # makes every _format_eta_hint(...) below return "" for delete.
+    etas = {} if kind == "delete" else _CDC_STAGE_ETA_SECONDS.get(kind, {})
     now = datetime.now(timezone.utc)
     running = job.status in ("PENDING", "RUNNING")
     with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
         ui.label(_CDC_ACTION_TITLE.get(kind, "Progress")).classes(  # type: ignore[attr-defined]
             "text-sm font-semibold"
         )
-        # Sum the estimates of stages not yet DONE for a whole-operation hint.
-        remaining_total = sum(
-            etas.get(c.chunk_id, 0) for c in job.chunks if c.status != "DONE"
-        )
-        total_hint = _format_eta_hint(remaining_total)
-        if total_hint and running:
-            ui.label(f"est. {total_hint} remaining").classes(  # type: ignore[attr-defined]
-                "text-xs text-gray-400"
-            )
+        # Whole-operation hint. Delete is special: its wall-clock is dominated by
+        # AWS reclaiming the in-VPC seeder Lambda's ENIs before the MSK cluster can go,
+        # which is unpredictable and has been measured at ~20+ min against the old
+        # ~5 min estimate. A precise-looking "est. ~5 min remaining" that overshoots by
+        # 4x reads as a stuck UI, so for a delete show an honest UPPER BOUND ("up to
+        # ~20 min") instead of a countdown. Other operations keep the summed ETA.
+        if running:
+            if kind == "delete":
+                ui.label("can take up to ~20 min").classes(  # type: ignore[attr-defined]
+                    "text-xs text-gray-400"
+                )
+            else:
+                remaining_total = sum(
+                    etas.get(c.chunk_id, 0) for c in job.chunks if c.status != "DONE"
+                )
+                total_hint = _format_eta_hint(remaining_total)
+                if total_hint:
+                    ui.label(f"est. {total_hint} remaining").classes(  # type: ignore[attr-defined]
+                        "text-xs text-gray-400"
+                    )
         if running and on_refresh is not None:
             # Manual refresh button only (the header's spinning icon + deploying
             # badge already signals the operation is live; a redundant spinner +

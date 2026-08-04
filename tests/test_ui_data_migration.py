@@ -14503,3 +14503,91 @@ def test_per_table_notice_reflects_whether_counts_were_fetched() -> None:
             "counts_fetched must be computed from row_counts_fetched_at, not a literal; "
             f"got {arg_expr} = {assign}"
         )
+
+
+def _render_deploy_stages_for(kind, *, running_stage="stack_delete"):
+    """Render the CDC stage-progress card for ``kind`` mid-run and return the double."""
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import _cdc_ui
+    from dsql_migrator.ui.data_migration._status import _CDC_STAGE_LABELS
+
+    stage_ids = list(_CDC_STAGE_LABELS[kind].keys())
+    chunks = []
+    for sid in stage_ids:
+        status = (
+            "IN_PROGRESS" if sid == running_stage
+            else "DONE" if stage_ids.index(sid) < stage_ids.index(running_stage)
+            else "PENDING"
+        )
+        chunks.append(ChunkState(chunk_id=sid, status=status))
+    job = MigrationJob(job_id="j", status="RUNNING", chunks=chunks)
+    ui = _RecordingUi()
+    _cdc_ui._render_deploy_stages(ui, job, kind=kind)
+    return ui
+
+
+def test_delete_progress_shows_an_upper_bound_not_a_countdown() -> None:
+    """CDC delete waits on unpredictable ENI reclamation, so a precise ETA overshoots.
+
+    Reported: "est. ~5 min remaining" while it actually took far longer. Show an honest
+    upper bound instead of a countdown that reads as a stuck UI.
+    """
+    ui = _render_deploy_stages_for("delete")
+    joined = " ".join(ui.texts)
+    assert "up to ~20 min" in joined, "delete must show an upper-bound wait"
+    assert "remaining" not in joined, (
+        "delete must not show a precise 'est. N remaining' countdown"
+    )
+
+
+def test_delete_stages_show_no_per_stage_eta_hint() -> None:
+    # The dominant stage (stack_delete, a 5-min estimate) is the unpredictable one; a
+    # "~5 min" hint on it is exactly the misleading number. Run with an EARLIER stage
+    # in progress so stack_delete is a PENDING stage whose ETA hint would otherwise
+    # render, and assert it does not.
+    ui = _render_deploy_stages_for("delete", running_stage="submit_delete")
+    joined = " ".join(ui.texts)
+    assert "~5 min" not in joined, "the pending stack_delete stage must show no ETA"
+    assert "/ ~" not in joined, "the running delete stage must not append an ETA"
+
+
+def test_delete_running_stage_shows_no_eta_suffix() -> None:
+    # Even the IN-PROGRESS delete stage (with a started_at, so the elapsed path runs)
+    # must not append "/ ~N min": that suffix is the misleading estimate.
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    job = MigrationJob(
+        job_id="j",
+        status="RUNNING",
+        chunks=[
+            ChunkState(chunk_id="discover_stack", status="DONE"),
+            ChunkState(chunk_id="submit_delete", status="DONE"),
+            ChunkState(
+                chunk_id="stack_delete",
+                status="IN_PROGRESS",
+                started_at=datetime(2026, 8, 5, 0, 0, 0, tzinfo=timezone.utc),
+            ),
+            ChunkState(chunk_id="cleanup_secret", status="PENDING"),
+            ChunkState(chunk_id="deleted", status="PENDING"),
+        ],
+    )
+    ui = _RecordingUi()
+    _cdc_ui._render_deploy_stages(ui, job, kind="delete")
+    joined = " ".join(ui.texts)
+    assert "elapsed" in joined, "the running stage must still show live elapsed time"
+    assert "/ ~" not in joined, "but not an ETA suffix on a delete"
+
+
+def test_start_progress_still_shows_the_estimated_remaining() -> None:
+    """The control: non-delete operations keep the summed ETA countdown.
+
+    Connector creation has a stable ~10-20 min estimate worth showing, so the change
+    must be scoped to delete only.
+    """
+    ui = _render_deploy_stages_for("start", running_stage="stack_connectors")
+    joined = " ".join(ui.texts)
+    assert "remaining" in joined and "est." in joined
+    assert "up to ~20 min" not in joined

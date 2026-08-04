@@ -5,6 +5,17 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.250
+
+### Fixed
+
+- **CDC infrastructure delete showed a precise ETA it kept overshooting.** The stage-progress
+  card read "est. ~5 min remaining", but a delete is dominated by AWS reclaiming the in-VPC
+  seeder Lambda's ENIs before the MSK cluster can go — unpredictable, and measured well past
+  the estimate — so a 4x-short countdown read as a stuck UI. Delete now shows an honest upper
+  bound ("can take up to ~20 min") with no per-stage ETA hints; the countdown stays for the
+  other operations, whose timings are stable.
+
 ## v0.1.249
 
 ### Changed
