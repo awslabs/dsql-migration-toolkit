@@ -7182,6 +7182,9 @@ class _RecordingUi:
         # difference (guidance must not live only in a tooltip), so conflating the two
         # would make a hover-only regression indistinguishable from visible copy.
         self.tooltips: list[str] = []
+        # Rendered tick boxes, kept as objects (not just their text) so a test can ask
+        # whether one is actually enabled and what handler it carries.
+        self.checkboxes: list = []
 
     class _El:
         # Class-level default: subclasses below (_Btn, _Input, ...) define their own
@@ -7309,8 +7312,35 @@ class _RecordingUi:
     def select(self, *_a, **_k):
         return self._El(self)
 
-    def checkbox(self, text="", *_a, **_k):
-        return self._record(text)
+    class _Checkbox(_El):
+        """A checkbox that remembers whether it can actually be ticked.
+
+        Both halves of "locked" have to be observable from the rendered widget: a
+        greyed box that still fires its handler is the bug this records. ``enabled``
+        follows disable()/enable(), and ``on_change`` keeps whatever handler was
+        wired (``None`` when suppressed).
+        """
+
+        def __init__(self, ui=None, *, label="", on_change=None):
+            super().__init__(ui)
+            self.label = label
+            self.on_change = on_change
+            self.enabled = True
+
+        def disable(self, *_a, **_k):
+            self.enabled = False
+            return self
+
+        def enable(self, *_a, **_k):
+            self.enabled = True
+            return self
+
+    def checkbox(self, text="", *_a, on_change=None, **_k):
+        if text is not None:
+            self.texts.append(str(text))
+        box = self._Checkbox(self, label=str(text), on_change=on_change)
+        self.checkboxes.append(box)
+        return box
 
     def refreshable(self, fn):
         # NiceGUI's @ui.refreshable returns a wrapper that renders when CALLED (not at
@@ -12878,3 +12908,276 @@ def test_identity_sequence_sync_is_wired_into_both_load_paths() -> None:
     # And the finalize only syncs on the success branch.
     finalize = ast.unparse(by_name["_finalize_run"])
     assert "_log_identity_sequence_sync(" in finalize
+
+
+# ---------------------------------------------------------------------------
+# LOB exclusion lock + undetermined CDC state (restart recovery)
+# ---------------------------------------------------------------------------
+
+
+class _LockJobManager:
+    """Job manager whose single job has a fixed status, or is missing."""
+
+    def __init__(self, status=None) -> None:
+        self._status = status
+
+    def get_status(self, job_id):
+        if self._status is None:
+            from dsql_migrator.core.job_manager import JobNotFoundError
+
+            raise JobNotFoundError(job_id)
+
+        class _J:
+            pass
+
+        j = _J()
+        j.status = self._status
+        return j
+
+
+def test_lob_exclusion_is_editable_before_anything_is_committed() -> None:
+    # Nothing deployed and nothing running -> the operator can still choose.
+    from dsql_migrator.ui.data_migration._cdc_ui import lob_exclusion_lock
+
+    state = DataMigrationState()
+
+    assert lob_exclusion_lock(state, _LockJobManager()) == (False, None)
+
+
+def test_lob_exclusion_locks_while_infrastructure_is_being_created() -> None:
+    """The reported gap: the tick boxes stayed live during an infra create.
+
+    ColumnExcludeList is a create-time stack parameter, so it was submitted with the
+    stack -- a later tick changed state nothing would read, and the box silently lied
+    about what CDC captures. This case DOES explain itself: the operator was just
+    here choosing, so the transition needs naming.
+    """
+    from dsql_migrator.ui.data_migration._cdc_ui import lob_exclusion_lock
+
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("job-1", kind="infra")
+
+    locked, reason = lob_exclusion_lock(state, _LockJobManager("RUNNING"))
+    assert locked
+    assert reason is not None and "being created" in reason
+
+
+def test_lob_exclusion_locks_silently_once_infrastructure_exists() -> None:
+    """Deployed infrastructure locks the choice but says NOTHING about it.
+
+    The parameter is fixed on the stack, so the boxes must not be tickable. But a
+    deployed CDC stack is the NORMAL state of a CDC run, and the greyed-out boxes
+    already convey that the choice is closed -- a warning line there would flag an
+    ordinary situation as a problem (severity calibration). So: locked, reason None.
+    Phase ``running`` is excluded here on purpose: that IS a live pipeline, so it
+    falls to the streaming branch below, whose remedy (Stop CDC) does need saying.
+    """
+    from dsql_migrator.ui.data_migration._cdc_ui import lob_exclusion_lock
+
+    for phase in ("infra", "provisioning", "partial"):
+        state = DataMigrationState()
+        state.set_cdc_stack_phase(phase)
+        assert lob_exclusion_lock(state, _LockJobManager()) == (True, None), (
+            f"phase {phase} must lock the exclusion without a warning line"
+        )
+
+
+def test_lob_exclusion_lock_names_cdc_start_when_streaming_started() -> None:
+    # The remedy differs: with connectors up the fix is Stop CDC, not deleting the
+    # infrastructure, so the message must say so.
+    from dsql_migrator.ui.data_migration._cdc_ui import lob_exclusion_lock
+
+    state = DataMigrationState()
+    state.set_cdc_connector_names(["mysql-source"])
+    state.set_cdc_stack_phase("running")
+
+    locked, reason = lob_exclusion_lock(state, _LockJobManager())
+    assert locked
+    assert reason is not None and "Stop CDC" in reason
+
+
+def _render_lob_panel(*, locked: bool, lock_reason=None):
+    """Render the LOB panel with one exclusion candidate and return the UI double."""
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="docs",
+                columns=[
+                    ColumnDef(name="id", mysql_type="int", nullable=False),
+                    ColumnDef(name="payload", mysql_type="longtext"),
+                ],
+                primary_key=["id"],
+            )
+        ]
+    )
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_lob_exclusion_panel(
+        ui,
+        DataMigrationState(),
+        inventory,
+        lambda: None,
+        locked=locked,
+        lock_reason=lock_reason,
+    )
+    return ui
+
+
+def test_lob_panel_boxes_are_live_when_not_locked() -> None:
+    # The control point of the two tests below: unlocked really is tickable, so a
+    # "always disabled" regression cannot pass by accident.
+    ui = _render_lob_panel(locked=False)
+
+    assert ui.checkboxes, "the panel must render a tick box for the candidate"
+    assert all(b.enabled for b in ui.checkboxes)
+    assert all(b.on_change is not None for b in ui.checkboxes)
+
+
+def test_lob_panel_disables_the_boxes_and_drops_the_handler_when_locked() -> None:
+    """Greying alone is not enough -- the click must not register either.
+
+    Before this the boxes were fully live: the state changed and was then discarded.
+    Asserted on the RENDERED widgets, so a cosmetic-only "grey but still clickable"
+    version fails.
+    """
+    ui = _render_lob_panel(locked=True, lock_reason="Locked — CDC started.")
+
+    assert ui.checkboxes, "the panel must still render the tick boxes when locked"
+    assert not any(b.enabled for b in ui.checkboxes), "locked boxes must be disabled"
+    assert all(b.on_change is None for b in ui.checkboxes), (
+        "on_change must be dropped while locked, not just greyed"
+    )
+
+
+def test_lob_panel_shows_the_lock_reason_when_one_is_given() -> None:
+    """A transient lock must actually say why, in visible copy (not a tooltip).
+
+    The two transient cases (infra create in flight, CDC started) are the ones where
+    the operator may be mid-decision and needs the remedy named, so the reason has to
+    reach the screen rather than being computed and dropped.
+    """
+    ui = _render_lob_panel(
+        locked=True,
+        lock_reason="Locked — the excluded columns were handed to the connector.",
+    )
+
+    joined = " ".join(ui.texts)
+    assert "handed to the connector" in joined, (
+        "the lock reason must be rendered as visible text"
+    )
+
+
+def test_lob_panel_shows_no_lock_line_when_the_lock_has_no_reason() -> None:
+    """A silent lock renders no warning text -- the greyed boxes carry it.
+
+    Deployed CDC infrastructure is the normal state, and a warning line there read as
+    though something had gone wrong. The boxes must still be frozen.
+    """
+    ui = _render_lob_panel(locked=True, lock_reason=None)
+
+    assert not any(b.enabled for b in ui.checkboxes), "a silent lock still locks"
+    joined = " ".join(ui.texts)
+    assert "Locked" not in joined
+    assert "Delete the CDC infrastructure" not in joined
+
+
+def test_cdc_state_undetermined_distinguishes_unprobed_from_absent() -> None:
+    """The restart-recovery bug: a blank CDC pipeline card.
+
+    The card lumped "not yet probed" in with "absent" and offered a deploy form -- for
+    infrastructure that may already be streaming. The probe needs a target region and
+    returns silently without one, and a restored session's connections are untrusted
+    until re-verified, so after a restart the phase is None with a live pipeline.
+    """
+    from dsql_migrator.ui.data_migration._cdc_ui import cdc_state_is_undetermined
+
+    unprobed = DataMigrationState()
+    assert cdc_state_is_undetermined(unprobed) is True, "not looked yet -> unknown"
+
+    # The probe reporting "absent" sets the checked flag, which is a real answer.
+    probed_absent = DataMigrationState()
+    probed_absent.set_cdc_stack_phase(None)
+    assert cdc_state_is_undetermined(probed_absent) is False
+
+    known = DataMigrationState()
+    known.set_cdc_stack_phase("running")
+    assert cdc_state_is_undetermined(known) is False
+
+
+def test_cdc_card_shows_the_unknown_notice_instead_of_a_deploy_form() -> None:
+    """The unknown branch must precede the absent branch, or it is unreachable.
+
+    Offering the deploy form for an unprobed session risks a duplicate, billable MSK
+    cluster for a pipeline that already exists.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    src = inspect.getsource(_cdc_ui._render_cdc_start_action)
+    tree = ast.parse(src.strip())
+    lines = {
+        node.func.id: node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "cdc_state_is_undetermined" in lines, (
+        "the card must distinguish unknown from absent"
+    )
+    assert "_render_cdc_state_unknown_notice" in lines
+    # The unknown check gates a branch that comes before the deploy action.
+    assert lines["cdc_state_is_undetermined"] < lines["_render_cdc_infra_deploy_action"]
+
+
+def test_unknown_notice_says_the_pipeline_is_unaffected_and_names_the_remedy() -> None:
+    """Asserted on the RENDERED text, not the source.
+
+    The operator must not re-run Start CDC on a live pipeline, and must know the one
+    action that recovers the display. Checking the rendered body also survives the
+    string being re-wrapped across source lines.
+    """
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    captured: list = []
+
+    class _El:
+        def classes(self, *a, **k):
+            return self
+
+        def props(self, *a, **k):
+            return self
+
+        def style(self, *a, **k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _Ui:
+        def label(self, text="", *a, **k):
+            captured.append(str(text))
+            return _El()
+
+        def __getattr__(self, _name):
+            def _any(*a, **k):
+                for arg in a:
+                    if isinstance(arg, str):
+                        captured.append(arg)
+                for arg in k.values():
+                    if isinstance(arg, str):
+                        captured.append(arg)
+                return _El()
+
+            return _any
+
+    _cdc_ui._render_cdc_state_unknown_notice(_Ui())
+    body = " ".join(captured)
+
+    assert "keeps streaming" in body, "must say the running pipeline is unaffected"
+    assert "Re-verify the target connection" in body, "must name the remedy"
+    assert "do not start cdc again" in body.lower()

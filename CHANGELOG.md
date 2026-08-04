@@ -5,6 +5,31 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.238
+
+### Fixed
+
+- **The oversized-LOB exclusion tick boxes stayed clickable after the choice was already
+  committed.** They were never locked at all: a tick registered and the state really
+  changed, but `column.exclude.list` is baked into the cdc-stack's `ColumnExcludeList`
+  parameter at infrastructure-create time and handed to the source connector at Start
+  CDC — so any later change was silently discarded while the box claimed otherwise. The
+  boxes are now genuinely disabled — greyed *and* click-blocked, so the appearance and
+  the behaviour agree. The two transient cases also say why, because the operator may be
+  mid-decision and needs the remedy named: submitted with the stack while infrastructure
+  is being created, or handed to the connector once CDC started (stop CDC to change it).
+  Deployed infrastructure locks silently — that is the normal state of a CDC run, and the
+  greyed-out boxes already convey that the choice is closed.
+- **After an app restart the CDC pipeline card came back blank and offered a fresh deploy
+  form.** The card treated "not yet probed" and "no stack exists" as the same state. The
+  read-only AWS probe that reads the live CDC state needs a target region and returns
+  silently without one, and a restored session does not trust its old connections until
+  re-verified — so the phase was unknown while a real pipeline was streaming, and the card
+  invited a duplicate, billable MSK cluster. The two states are now distinguished: when
+  the state has genuinely not been determined, the card says so, states that any running
+  pipeline is unaffected, and names the one action that recovers it (re-verify the target
+  connection) instead of showing a deploy form.
+
 ## v0.1.237
 
 ### Fixed

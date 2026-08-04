@@ -262,7 +262,15 @@ def _render_cdc_step(
 
     # 3. PREPARE: oversized-LOB exclusion influences the captured columns, so it
     #    sits with the start-point decision (it feeds column.exclude.list).
-    _render_cdc_lob_exclusion_panel(ui, migration_state, inventory, refresh)
+    lob_locked, lob_lock_reason = lob_exclusion_lock(migration_state, job_manager)
+    _render_cdc_lob_exclusion_panel(
+        ui,
+        migration_state,
+        inventory,
+        refresh,
+        locked=lob_locked,
+        lock_reason=lob_lock_reason,
+    )
 
     # 4. START: actually deploy the connectors (cloudformation update_stack) and
     #    show step-by-step progress.
@@ -1191,6 +1199,55 @@ def cdc_deploy_card_superseded(
         and phase in ("running", "provisioning", "partial")
     )
 
+
+def cdc_state_is_undetermined(migration_state) -> bool:
+    """True when the CDC state is UNKNOWN rather than known-absent.
+
+    The lifecycle card treats a ``None`` phase as "absent / not yet probed" and offers
+    the deploy form. Those are not the same thing. The AWS phase probe needs a target
+    region (``session.target_config``) and returns silently without one -- and a
+    restored session deliberately does not trust its old connections, so after an app
+    restart the probe has not run and the phase is ``None`` while a real pipeline may be
+    streaming. The card then showed a fresh-deploy form for infrastructure that already
+    exists, with nothing on screen saying the state was simply unknown. (Observed: the
+    app was restarted during Start CDC; both connectors reached RUNNING on AWS, but the
+    CDC pipeline card came back blank.)
+
+    ``cdc_stack_phase_checked`` is the discriminator: the probe sets it whenever it
+    reports, including when it reports "absent". So an unset flag means "we have not
+    looked", which is what this reports -- distinct from "we looked and there is
+    nothing".
+
+    Pure (reads already-populated state; no AWS I/O), so it is safe during render.
+    """
+    if getattr(migration_state, "cdc_stack_phase_checked", False):
+        return False  # the probe reported -- absent is then a real answer
+    return getattr(migration_state, "cdc_stack_phase", None) is None
+
+
+def _render_cdc_state_unknown_notice(ui) -> None:
+    """Say the CDC state is unknown, and how to recover it.
+
+    Without this the operator gets a deploy form for a pipeline that may already be
+    running -- there is no way to tell from the screen that the tool simply has not
+    looked yet. Names the one action that recovers it (re-verify the target, which is
+    what the probe needs) and states plainly that nothing was broken by the restart, so
+    nobody re-runs Start CDC on a live pipeline.
+    """
+    render_notice(
+        ui,
+        tone="warning",
+        header="CDC state not determined yet",
+        body=(
+            "This session was restored, so its connections are not trusted until "
+            "re-verified and the read-only AWS check that reads the live CDC state has "
+            "not run. Any pipeline you already started is unaffected and keeps "
+            "streaming. Re-verify the target connection on the Connect step to recover "
+            "the real state here — do not start CDC again until it shows."
+        ),
+    )
+
+
 def _render_cdc_start_action(
     ui, migration_state, job_manager, refresh, *, inventory=None, session=None
 ) -> None:
@@ -1355,7 +1412,13 @@ def _render_cdc_start_action(
                 getattr(migration_state, "cdc_stack_phase_status", None)
             ):
                 ui.timer(_CDC_POLL_INTERVAL_SECONDS, refresh, once=True)  # type: ignore[attr-defined]
-        else:  # absent / not yet probed
+        elif cdc_state_is_undetermined(migration_state):
+            # NOT the same as absent: the probe has not run (a restored session's
+            # connections are untrusted until re-verified), so offering a deploy form
+            # here would invite a duplicate, billable MSK cluster for a pipeline that
+            # may already be streaming.
+            _render_cdc_state_unknown_notice(ui)
+        else:  # absent -- the probe reported, and there really is nothing
             # Account-scoped discovery: if CDC infra already exists under a name this
             # (reset) session does not target, offer to ADOPT it rather than deploy a
             # duplicate (a second, costly MSK cluster). Adoption re-reads the live
@@ -4483,8 +4546,64 @@ def _render_cdc_error_download(ui, migration_state, log_key: str) -> None:
         "editor."
     )
 
+def lob_exclusion_lock(migration_state, job_manager) -> tuple[bool, Optional[str]]:
+    """Return ``(locked, reason)`` for the LOB-exclusion tick boxes.
+
+    The selection is not a live setting: it is baked into the cdc-stack's
+    ``ColumnExcludeList`` parameter when the infrastructure is created, and handed to
+    the source connector at Start CDC. So once either operation is under way -- or the
+    connectors exist -- a further tick changes state that nothing will read, and the box
+    silently lies about what CDC captures. The boxes previously had no lock at all: a
+    tick registered and the state really changed, it just never reached the pipeline.
+
+    ``locked`` and ``reason`` are deliberately separate. Deployed infrastructure is the
+    NORMAL state for a CDC run, and the greyed-out boxes already say the choice is
+    closed -- adding a warning line there flags an ordinary situation as a problem
+    (severity calibration: an expected, no-action-needed state is not a warning). So
+    that case locks with no message. The two cases that a message genuinely helps with
+    are the transient ones, where the operator may be mid-decision and needs the remedy
+    named: a create still in flight, and a started CDC (stop it to change them).
+
+    Pure apart from reading the job's status through ``job_manager``; no AWS I/O.
+    """
+    if cdc_streaming_started(migration_state, job_manager):
+        return True, (
+            "Locked — the excluded columns were handed to the source connector when "
+            "CDC started. Stop CDC to change them."
+        )
+    # An infra create is in flight: the parameter went out with the stack, but the
+    # operator was just here choosing, so say what happened.
+    deploy_job = _current_job(
+        job_manager, getattr(migration_state, "cdc_deploy_job_id", None)
+    )
+    if (
+        getattr(migration_state, "cdc_action_kind", None) == "infra"
+        and deploy_job is not None
+        and deploy_job.status in ("PENDING", "RUNNING")
+    ):
+        return True, (
+            "Locked while the CDC infrastructure is being created — the excluded "
+            "columns are part of the stack's parameters and were submitted with it."
+        )
+    if getattr(migration_state, "cdc_stack_phase", None) in (
+        "infra",
+        "running",
+        "provisioning",
+        "partial",
+    ):
+        # Locked, but silent: the disabled boxes carry the message on their own.
+        return True, None
+    return False, None
+
+
 def _render_cdc_lob_exclusion_panel(
-    ui, migration_state, inventory: Optional[SourceInventory], refresh
+    ui,
+    migration_state,
+    inventory: Optional[SourceInventory],
+    refresh,
+    *,
+    locked: bool,
+    lock_reason: Optional[str] = None,
 ) -> None:
     """Render the explicit, opt-in oversized-LOB column exclusion (H13).
 
@@ -4536,6 +4655,13 @@ def _render_cdc_lob_exclusion_panel(
             "all, so exclude such columns here to keep CDC from stalling. "
             "Nothing is excluded unless you tick it."
         ).classes("text-xs text-gray-500")
+        # A reason line only when one was given. Deployed infrastructure is the
+        # normal state of a CDC run, so it locks silently -- the greyed-out boxes
+        # already say the choice is closed, and a warning there would flag an
+        # ordinary situation as a problem. The transient cases still explain
+        # themselves, since the operator may have just been choosing.
+        if locked and lock_reason:
+            inline_hint(ui, lock_reason, tone="warning")  # type: ignore[attr-defined]
         for candidate in candidates:
             excluded = selection.get(candidate.table, set())
             for column in candidate.columns:
@@ -4548,11 +4674,16 @@ def _render_cdc_lob_exclusion_panel(
                     if callable(refresh):
                         refresh()
 
-                ui.checkbox(  # type: ignore[attr-defined]
+                _box = ui.checkbox(  # type: ignore[attr-defined]
                     f"{candidate.table}.{column}",
                     value=column in excluded,
-                    on_change=_toggle,
+                    on_change=None if locked else _toggle,
                 ).props("dense")
+                if locked:
+                    # disable() greys the box AND stops the click, so the visual state
+                    # and the actual behaviour agree -- greying alone would still let
+                    # the tick through.
+                    _box.disable()
         exclude_value = format_column_exclude_list(
             {table: sorted(cols) for table, cols in selection.items()}
         )
