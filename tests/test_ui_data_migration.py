@@ -4441,6 +4441,152 @@ def test_group_rollup_passes_when_all_pass() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_cdc_only_pins_the_cdc_substep_once_infrastructure_is_ready() -> None:
+    """Reported gap 1: "CDC infrastructure is ready" appeared under Prerequisites
+    while Start CDC sat inside a COLLAPSED CDC section.
+
+    No connectors exist yet at that point, so the original connectors-only pin did not
+    fire and the resolver fell back to "prerequisites" -- collapsing the very section
+    holding the operator's next action.
+    """
+    from dsql_migrator.ui.data_migration import MigrationType, should_pin_cdc_substep
+
+    assert (
+        should_pin_cdc_substep(
+            migration_type=MigrationType.CDC_ONLY,
+            has_connectors=False,
+            infra_prep_state="ready",
+        )
+        is True
+    )
+
+
+def test_pins_the_cdc_substep_while_an_infra_create_or_teardown_is_in_flight() -> None:
+    """Reported gap 2: submitting "Delete CDC infrastructure" bounced the view back to
+    a collapsed Prerequisites mid-operation.
+
+    A teardown (or create) is CDC work with no connectors, so the connectors-only pin
+    missed it. Applies to the combined type too -- the operator is acting on CDC
+    infrastructure either way.
+    """
+    from dsql_migrator.ui.data_migration import MigrationType, should_pin_cdc_substep
+
+    for kind in ("infra", "delete", "stop"):
+        for mtype in (MigrationType.CDC_ONLY, MigrationType.FULL_LOAD_AND_CDC):
+            assert (
+                should_pin_cdc_substep(
+                    migration_type=mtype,
+                    has_connectors=False,
+                    infra_action_kind=kind,
+                    infra_action_running=True,
+                )
+                is True
+            ), f"{mtype} / {kind} must pin"
+    # A FINISHED action must not pin -- otherwise the view is stuck on CDC forever.
+    assert (
+        should_pin_cdc_substep(
+            migration_type=MigrationType.CDC_ONLY,
+            has_connectors=False,
+            infra_action_kind="delete",
+            infra_action_running=False,
+        )
+        is False
+    )
+
+
+def test_combined_type_is_not_pinned_to_cdc_merely_because_infra_is_ready() -> None:
+    """The regression guard on the widened pin.
+
+    For Full load + CDC, a finished Full Load deliberately keeps its results on screen
+    and the operator advances via "Continue to CDC". Pinning on infra-ready would yank
+    the snapshot's row counts and watermark out of view -- the exact behaviour
+    resolve_active_substep_for_type was written to avoid.
+    """
+    from dsql_migrator.ui.data_migration import MigrationType, should_pin_cdc_substep
+
+    assert (
+        should_pin_cdc_substep(
+            migration_type=MigrationType.FULL_LOAD_AND_CDC,
+            has_connectors=False,
+            infra_prep_state="ready",
+        )
+        is False
+    )
+    # Connectors existing still pins for the combined type (unchanged behaviour).
+    assert (
+        should_pin_cdc_substep(
+            migration_type=MigrationType.FULL_LOAD_AND_CDC, has_connectors=True
+        )
+        is True
+    )
+
+
+def test_full_load_only_is_never_pinned_to_a_cdc_substep_it_does_not_have() -> None:
+    # Guard against pinning a sub-step that is not in the type's stepper at all.
+    from dsql_migrator.ui.data_migration import MigrationType, should_pin_cdc_substep
+
+    assert (
+        should_pin_cdc_substep(
+            migration_type=MigrationType.FULL_LOAD_ONLY,
+            has_connectors=True,
+            infra_prep_state="ready",
+            infra_action_kind="delete",
+            infra_action_running=True,
+        )
+        is False
+    )
+
+
+def test_render_path_pins_the_cdc_substep_via_the_shared_helper() -> None:
+    """The fix only reaches users if the screen consults the helper.
+
+    Asserted on the parse tree so a reworded comment cannot satisfy it, and pinned to
+    the keywords -- passing only has_connectors would silently restore the old
+    narrower behaviour with all the plumbing still in place.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "should_pin_cdc_substep"
+    ]
+    assert calls, "the screen must decide the CDC pin via should_pin_cdc_substep"
+    kwargs = {kw.arg for kw in calls[0].keywords}
+    for required in (
+        "migration_type",
+        "has_connectors",
+        "infra_prep_state",
+        "infra_action_kind",
+        "infra_action_running",
+    ):
+        assert required in kwargs, f"{required} must be passed, or the gap reopens"
+
+
+def test_ready_notice_does_not_reference_a_full_load_that_cdc_only_lacks() -> None:
+    """CDC only has no Full Load, so "start streaming ... after the Full Load" names a
+    step that does not exist -- it reads as an unmet prerequisite.
+
+    Checks the source of the ready branch carries both wordings, keyed on the
+    migration type, since rendering it needs the whole Prerequisites sub-step.
+    """
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    src = inspect.getsource(_cdc_ui._render_cdc_infra_prep_section)
+    assert "Start CDC on the CDC step below" in src, (
+        "the CDC-only branch must point at Start CDC, not at a Full Load"
+    )
+    assert "CDC_ONLY" in src, "the wording must be keyed on the migration type"
+
+
 def test_resolve_active_substep_defaults_to_prerequisites_without_job() -> None:
     from dsql_migrator.ui.data_migration import resolve_active_substep
 

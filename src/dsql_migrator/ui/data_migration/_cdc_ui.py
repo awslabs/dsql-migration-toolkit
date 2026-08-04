@@ -1774,13 +1774,26 @@ def _render_cdc_infra_prep_section(
 
     if prep == "ready":
         stack = getattr(migration_state, "cdc_stack_name", "the cdc-stack")
+        # "after the Full Load" is false for CDC only -- there is no Full Load in that
+        # plan, and the operator's next action is Start CDC on the (now-expanded) CDC
+        # step. Naming a step that does not exist reads as a missing prerequisite.
+        from dsql_migrator.ui.data_migration._models import MigrationType
+
+        _cdc_only = (
+            getattr(migration_state, "migration_type", None) is MigrationType.CDC_ONLY
+        )
+        _next_step = (
+            "You start streaming with Start CDC on the CDC step below."
+            if _cdc_only
+            else "You start streaming on the CDC step after the Full Load."
+        )
         render_notice(
             ui,
             tone="success",
             header="CDC infrastructure is ready",
             body=(
                 f"'{stack}' is already deployed, so there is nothing to provision "
-                "here. You start streaming on the CDC step after the Full Load."
+                f"here. {_next_step}"
             ),
         )
         return

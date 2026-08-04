@@ -151,6 +151,7 @@ from dsql_migrator.ui.data_migration._models import (
     substeps_for_type,
     resolve_active_substep_for_type,
     resolve_active_substep,
+    should_pin_cdc_substep,
     _MigrationTypeMeta,
     _MIGRATION_TYPE_META,
     MigrationProgress,
@@ -922,9 +923,30 @@ def build_data_migration_screen(
             # includes CDC and connectors exist, CDC is unambiguously the active step;
             # persist it so retries/re-renders stay put. (Only when it would otherwise
             # drift off "cdc", to avoid needless writes on steady-state polls.)
+            # Widened beyond "connectors exist": an infra create/teardown in flight, and
+            # a CDC-only session whose infrastructure is ready but not yet started, are
+            # both CDC work with no connectors yet -- and both used to collapse the CDC
+            # section right after the operator acted on it.
+            _infra_job = _current_job(
+                job_manager, getattr(migration_state, "cdc_deploy_job_id", None)
+            )
             if (
-                "cdc" in substeps_for_type(migration_type)
-                and getattr(migration_state, "cdc_connector_names", None)
+                should_pin_cdc_substep(
+                    migration_type=migration_type,
+                    has_connectors=bool(
+                        getattr(migration_state, "cdc_connector_names", None)
+                    ),
+                    infra_prep_state=cdc_infra_prep_state(
+                        migration_state, job_manager
+                    ),
+                    infra_action_kind=getattr(
+                        migration_state, "cdc_action_kind", None
+                    ),
+                    infra_action_running=(
+                        _infra_job is not None
+                        and _infra_job.status in ("PENDING", "RUNNING")
+                    ),
+                )
                 and active != "cdc"
             ):
                 active = "cdc"

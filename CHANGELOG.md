@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.234
+
+### Fixed
+
+- **The CDC section collapsed right after the operator acted on CDC infrastructure,
+  hiding the next action.** The infrastructure card sits at the bottom of
+  Prerequisites, so deploying or deleting a cdc-stack happens there — but the CDC
+  section only opens when the active sub-step is `cdc`, and nothing moved it. Two cases
+  hit this: **CDC only with infrastructure ready**, where "CDC infrastructure is ready"
+  appeared under Prerequisites while Start CDC sat inside a collapsed CDC section; and
+  **immediately after submitting a teardown**, which bounced the view back to
+  Prerequisites mid-operation. An existing pin already handled the live-CDC case but was
+  gated on connectors existing, which neither of these has yet. The pin now also fires
+  while an infrastructure create/teardown is in flight, and for a CDC-only session whose
+  infrastructure is ready. Deliberately not for Full load + CDC on readiness alone: a
+  finished Full Load keeps its results on screen and the operator advances with
+  "Continue to CDC", so pinning there would yank the snapshot's row counts and watermark
+  out of view.
+- **The ready notice told CDC-only operators to start streaming "after the Full Load".**
+  There is no Full Load in that plan, so it read as an unmet prerequisite. It now points
+  at Start CDC on the CDC step.
+
 ## v0.1.233
 
 ### Added

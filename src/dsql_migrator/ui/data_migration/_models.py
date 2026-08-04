@@ -1580,6 +1580,52 @@ def stale_error_notice(
     )
 
 
+def should_pin_cdc_substep(
+    *,
+    migration_type: MigrationType,
+    has_connectors: bool,
+    infra_prep_state: Optional[str] = None,
+    infra_action_kind: Optional[str] = None,
+    infra_action_running: bool = False,
+) -> bool:
+    """Return whether the view should be pinned to the CDC sub-step.
+
+    The sub-step resolver falls back to ``prerequisites`` (or ``full_load``) whenever
+    nothing explicitly stored ``"cdc"``, so any re-render can collapse the CDC section
+    and snap the operator back to Prerequisites even though CDC is what they are
+    working on. Pinning was originally gated on ``has_connectors`` alone, which left
+    two gaps the operator actually hits -- in both, the CDC infrastructure card lives
+    at the bottom of Prerequisites, so the work happens there and then the next action
+    silently collapses out of view:
+
+    * **Infrastructure ready, streaming not started.** No connectors exist yet, so the
+      old gate did not fire: the "CDC infrastructure is ready" notice appeared under
+      Prerequisites while Start CDC sat inside a collapsed CDC section.
+    * **Infrastructure delete just submitted.** Also no connectors, so submitting the
+      teardown bounced the view back to Prerequisites mid-operation.
+
+    ``infra_action_kind`` is the in-flight CDC action (``"infra"`` / ``"delete"`` /
+    ``"stop"`` / ``"start"``) and ``infra_action_running`` whether it is still
+    PENDING/RUNNING; ``infra_prep_state`` is
+    :func:`~dsql_migrator.ui.data_migration._cdc_ui.cdc_infra_prep_state`.
+
+    Scoped to types that HAVE a CDC step, and the infra-readiness arm is scoped to
+    ``CDC_ONLY``: for the combined type a finished Full Load deliberately keeps its
+    results on screen and the operator advances with "Continue to CDC" (see
+    :func:`resolve_active_substep_for_type`), so pinning on infra-ready would yank the
+    snapshot's stats out of view -- exactly the regression that resolver avoids.
+    """
+    if "cdc" not in substeps_for_type(migration_type):
+        return False
+    if has_connectors:
+        return True
+    # An in-flight infra create/teardown IS the CDC work; don't bounce away from it.
+    if infra_action_running and infra_action_kind in ("infra", "delete", "stop"):
+        return True
+    # Ready but not started: Start CDC is the next action, so show it.
+    return migration_type is MigrationType.CDC_ONLY and infra_prep_state == "ready"
+
+
 def resolve_active_substep_for_type(
     active: Optional[str],
     *,
