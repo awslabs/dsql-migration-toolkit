@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.249
+
+### Changed
+
+- **Per-table Consistency column: linked it to the Refresh button that fills it.** The
+  Consistency verdict is computed from the source/target row counts and high-water PKs,
+  which come only from the explicit "Refresh source/target counts" action (a source-scanning
+  COUNT(*) that is deliberately never auto-polled). Until it is pressed, every row's
+  Consistency reads "refresh to check" — a prompt that pointed at a button the user had to
+  connect to on their own. The info notice above the table now names that link before the
+  first read ("the Consistency column reads 'refresh to check' until you press 'Refresh
+  source/target counts'") and drops the prompt afterwards. Reviewed whether the column and
+  button are worth keeping at all: the column is a live cut-over signal distinct from
+  Validation's exact check, and it is the button that feeds it — the two are one feature, so
+  both stay, with the relationship now made explicit rather than removed.
+
 ## v0.1.248
 
 ### Fixed

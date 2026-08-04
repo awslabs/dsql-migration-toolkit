@@ -78,6 +78,7 @@ from dsql_migrator.ui.data_migration._models import (
     format_column_exclude_list,
     format_duration,
     lob_exclusion_candidates,
+    per_table_counts_notice_body,
 )
 from dsql_migrator.ui.data_migration._status import (
     _CDC_ACTION_NOUN,
@@ -4101,17 +4102,18 @@ def _render_migration_table_status(
         # Top: the one thing to know before reading the numbers -- the source side
         # is a scan-free estimate, so it adds no load on a large-scale source but is
         # approximate (Validation does the exact reconciliation).
+        # Before the first refresh the Consistency column reads "refresh to check" on
+        # every row; the notice body then names the button that fills it (the column
+        # and the action are otherwise only linked by a coincidence of wording). After
+        # a refresh it drops the prompt and states the estimate caveat.
+        _counts_fetched = (
+            getattr(migration_state, "row_counts_fetched_at", None) is not None
+        )
         render_notice(
             ui,
             tone="info",
             header="Source rows are an estimate (no load on the source)",
-            body=(
-                "Refresh reads the source row counts from information_schema "
-                "(table_rows) — a scan-free estimate, so it adds no load even on a "
-                "large-scale source, but it can drift from the exact count under heavy "
-                "writes. The target counts are exact. For an authoritative row/"
-                "checksum reconciliation, run Validation (Step 4)."
-            ),
+            body=per_table_counts_notice_body(counts_fetched=_counts_fetched),
         )
         refresh_btn = ui.button(  # type: ignore[attr-defined]
             "Refresh source/target counts",

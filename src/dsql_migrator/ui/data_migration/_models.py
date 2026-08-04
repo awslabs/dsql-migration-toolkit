@@ -680,6 +680,36 @@ class MigrationTableStatus:
         return shortfall > self.source_rows * _ESTIMATE_TOLERANCE
 
 
+def per_table_counts_notice_body(*, counts_fetched: bool) -> str:
+    """Body for the per-table table's info notice, keyed on whether counts were read.
+
+    The Consistency verdict needs the source/target row counts and high-water PKs, and
+    those come only from the explicit "Refresh source/target counts" action (a COUNT(*)
+    / MAX(pk) that scans the source, so it is never auto-polled). Until it is pressed,
+    every row's Consistency reads "refresh to check" -- which points at a button the
+    user has to connect to on their own. So before the first refresh the notice names
+    that link ("Refresh ... to fill the Consistency column"); afterwards it drops the
+    prompt and just states the estimate caveat. The exact reconciliation still lives in
+    Validation either way.
+    """
+    tail = (
+        "The target counts are exact. For an authoritative row/checksum "
+        "reconciliation, run Validation (Step 4)."
+    )
+    if not counts_fetched:
+        return (
+            "The Consistency column reads “refresh to check” until you press "
+            "“Refresh source/target counts” below — that reads the source count from "
+            "information_schema (table_rows), a scan-free estimate that adds no load "
+            "even on a large-scale source. " + tail
+        )
+    return (
+        "Refresh reads the source row counts from information_schema (table_rows) — a "
+        "scan-free estimate, so it adds no load even on a large-scale source, but it "
+        "can drift from the exact count under heavy writes. " + tail
+    )
+
+
 def build_migration_table_status(
     table_names: "Sequence[str]",
     *,

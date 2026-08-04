@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.249
+
+### 변경
+
+- **테이블별 Consistency 컬럼: 이를 채우는 Refresh 버튼과 연결했습니다.** Consistency 판정은
+  source/target 행 수와 high-water PK로 계산되며, 이 값은 오직 명시적 "Refresh source/target
+  counts" 액션(의도적으로 자동 폴하지 않는, 소스를 스캔하는 COUNT(*))에서만 옵니다. 버튼을 누르기
+  전까지 각 행의 Consistency는 "refresh to check"로 표시되는데, 이는 사용자가 스스로 연결해야 하는
+  버튼을 가리켰습니다. 이제 표 위 info 안내가 첫 조회 전에는 그 연결을 명시하고("Consistency
+  컬럼은 'Refresh source/target counts'를 누를 때까지 'refresh to check'로 표시됩니다") 조회 후에는
+  그 안내를 뺍니다. 컬럼과 버튼을 유지할 가치가 있는지 검토했습니다: 이 컬럼은 Validation의 정밀
+  검증과는 구별되는 실시간 컷오버 신호이고, 그것을 채우는 것이 이 버튼이므로 — 둘은 하나의 기능이라
+  둘 다 유지하되, 그 관계를 제거하는 대신 명시적으로 드러냈습니다.
+
 ## v0.1.248
 
 ### 수정

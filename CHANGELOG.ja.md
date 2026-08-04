@@ -5,6 +5,20 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.249
+
+### 変更
+
+- **テーブル別 Consistency 列: それを埋める Refresh ボタンと結び付けました。** Consistency 判定は
+  source/target の行数と high-water PK から計算され、それらは明示的な「Refresh source/target
+  counts」操作 (意図的に自動ポーリングしない、ソースをスキャンする COUNT(*)) からのみ得られます。
+  ボタンを押すまで各行の Consistency は「refresh to check」と表示され、これは利用者が自分で結び
+  付ける必要のあるボタンを指していました。現在は表の上の info 通知が、最初の読み取り前にはその
+  リンクを明示し (「Consistency 列は『Refresh source/target counts』を押すまで『refresh to check』と
+  表示されます」)、読み取り後はその案内を外します。列とボタンを残す価値があるか検討しました:
+  この列は Validation の厳密な検査とは異なるリアルタイムのカットオーバー信号であり、それを埋めるのが
+  このボタンです — 2 つは 1 つの機能なので両方を残し、その関係を削除せずに明示しました。
+
 ## v0.1.248
 
 ### 修正

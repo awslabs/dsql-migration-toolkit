@@ -14431,3 +14431,75 @@ def test_ramp_placeholder_is_a_bordered_notice_not_a_bare_label() -> None:
         "the placeholder must be wrapped in a bordered notice, not a bare label"
     )
     assert "No live pipeline yet" in joined
+
+
+def test_counts_notice_prompts_the_refresh_before_the_first_read() -> None:
+    """Before counts are read, the notice must link Consistency to the Refresh button.
+
+    Every row's Consistency shows "refresh to check" until the counts are fetched, and
+    that only means something if the user connects it to the button that fills it.
+    """
+    from dsql_migrator.ui.data_migration._models import per_table_counts_notice_body
+
+    body = per_table_counts_notice_body(counts_fetched=False)
+    assert "Consistency" in body
+    assert "Refresh source/target counts" in body
+    assert "Validation (Step 4)" in body, "the exact check must still be named"
+
+
+def test_counts_notice_drops_the_prompt_once_counts_are_read() -> None:
+    # After a refresh the prompt is noise; state the estimate caveat instead.
+    from dsql_migrator.ui.data_migration._models import per_table_counts_notice_body
+
+    body = per_table_counts_notice_body(counts_fetched=True)
+    assert "refresh to check" not in body.lower()
+    assert "Press" not in body and "press" not in body
+    assert "estimate" in body
+    assert "Validation (Step 4)" in body
+
+
+def test_per_table_notice_reflects_whether_counts_were_fetched() -> None:
+    """Wiring: the screen must key the notice body on row_counts_fetched_at.
+
+    The helper is useless if the screen always passes the same value, so pin that the
+    call reads the fetched-at state.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    src = inspect.getsource(_cdc_ui._render_migration_table_status)
+    tree = ast.parse(src.strip())
+    found = False
+    arg_expr = None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "per_table_counts_notice_body"
+        ):
+            kwargs = {kw.arg: ast.unparse(kw.value) for kw in node.keywords}
+            assert "counts_fetched" in kwargs
+            arg_expr = kwargs["counts_fetched"]
+            found = True
+    assert found, "the notice body must be built from per_table_counts_notice_body"
+    # The arg may be an intermediate local; resolve it to its assignment and require
+    # THAT expression to read the fetched-at state, so a hard-coded True/False (or a
+    # local bound to a literal) cannot pass just because the caption elsewhere also
+    # reads row_counts_fetched_at.
+    if "row_counts_fetched_at" not in arg_expr:
+        assign = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(tgt, ast.Name) and tgt.id == arg_expr
+                for tgt in node.targets
+            ):
+                assign = ast.unparse(node.value)
+        assert assign is not None, (
+            f"counts_fetched arg {arg_expr!r} must be a local assigned in the function"
+        )
+        assert "row_counts_fetched_at" in assign, (
+            "counts_fetched must be computed from row_counts_fetched_at, not a literal; "
+            f"got {arg_expr} = {assign}"
+        )
