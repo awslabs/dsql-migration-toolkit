@@ -101,6 +101,7 @@ from dsql_migrator.ui.data_migration._status import (
     _migration_status_tables,
     _read_cdc_template_body,
     cdc_dlq_records,
+    cdc_dlq_summary,
     cdc_error_log_key,
     is_cdc_error_record,
     should_replace_teardown_marker,
@@ -3712,17 +3713,19 @@ def _render_migration_table_status(
 
         def _status_table() -> None:  # type: ignore[misc]
             job = _current_job(job_manager, migration_state.job_id)
-            # Per-table quarantined (DLQ) counts from the single error log: change
-            # events that did NOT reach the target -- the "missing" the customer
-            # cares about for consistency.
-            dlq_counts: dict[str, int] = {}
-            if job is not None:
-                try:
-                    dlq_counts = dict(
-                        migration_state.error_log.summary(job.job_id).errors_by_table
-                    )
-                except Exception:  # noqa: BLE001 - best-effort, never break the table
-                    dlq_counts = {}
+            # Per-table quarantined (DLQ) counts: change events that did NOT reach the
+            # target -- the "missing" the customer cares about for consistency.
+            # CDC-sourced ONLY. The error log is keyed by the Full Load job id (both
+            # phases write under it -- cdc_error_log_key), so an unfiltered summary put
+            # Full Load quarantines in a column headed "Quarantined" on the CDC table,
+            # AND disagreed with the DLQ card right below it: the card read "0
+            # quarantined" while this column read 3 for the same session. Same key, same
+            # filter, so the two now always agree.
+            dlq_counts = dict(
+                cdc_dlq_summary(
+                    migration_state, cdc_error_log_key(migration_state)
+                ).errors_by_table
+            )
             rows_model = build_migration_table_status(
                 table_names,
                 full_load_job=job,

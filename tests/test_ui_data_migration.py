@@ -13873,3 +13873,130 @@ def test_full_load_latest_messages_ignores_cdc_records() -> None:
     messages = full_load_latest_messages(state.error_log, key)
     assert "dead-lettered" not in messages.get("ecommerce.product_media", "")
     assert "quarantined row pk[" in messages["ecommerce.product_media"]
+
+
+def _render_cdc_per_table(state, *, job_id="job-fullload-1"):
+    """Render the CDC step's per-table status table and return the UI double."""
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    ui = _RecordingUi()
+
+    class _Sess:
+        target_config = None
+        aws_profile = None
+
+    # The table set comes from the Full Load job's chunk ids
+    # (_migration_status_tables), so the job needs a chunk per listed table.
+    job = MigrationJob(
+        job_id=job_id,
+        status="DONE",
+        chunks=[ChunkState(chunk_id="ecommerce.product_media", status="DONE")],
+    )
+    _cdc_ui._render_migration_table_status(
+        ui,
+        state,
+        _StubJobManager({job_id: job}),
+        _Sess(),
+        inventory=SourceInventory(
+            tables=[
+                TableDef(
+                    name="ecommerce.product_media",
+                    columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                    primary_key=["id"],
+                ),
+            ]
+        ),
+    )
+    return ui
+
+
+def _quarantined_cells(ui) -> list:
+    """The values rendered in the per-table table's "Quarantined" column."""
+    return [
+        row.get("dlq")
+        for payload in ui.tables
+        for row in payload["rows"]
+        if "dlq" in row
+    ]
+
+
+def test_per_table_quarantined_column_excludes_full_load_rows() -> None:
+    """The CDC table's "Quarantined" column must not count Full Load quarantines.
+
+    Worse than the original defect: the DLQ card below it already reported "0
+    quarantined" after v0.1.241, so the same screen showed two contradictory numbers
+    for one session (card 0, column 3).
+    """
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    _mixed_error_log(state, full_load=3, cdc=0)
+
+    cells = _quarantined_cells(_render_cdc_per_table(state))
+    assert cells, "the per-table table must render a Quarantined cell"
+    assert all(str(c) == "0" for c in cells), (
+        f"Full Load quarantines must not appear in the CDC Quarantined column; got {cells}"
+    )
+
+
+def test_per_table_quarantined_column_still_counts_real_dlq_rows() -> None:
+    # The control: genuine dead-lettered rows must still be reported per table, or the
+    # column would be useless.
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    _mixed_error_log(state, full_load=3, cdc=0)
+    # Two dead-lettered rows for the table the table lists (no chunk_id -> CDC).
+    from dsql_migrator.core.models import DataErrorRecord
+    from dsql_migrator.ui.data_migration._status import cdc_error_log_key
+
+    for i in range(2):
+        state.error_log.record(
+            cdc_error_log_key(state),
+            DataErrorRecord(
+                table="ecommerce.product_media",
+                error_code="54000",
+                message=f"dead-lettered {i + 1}",
+                occurred_at=datetime(2026, 8, 4, 21, 6, 0, tzinfo=timezone.utc),
+            ),
+        )
+
+    cells = _quarantined_cells(_render_cdc_per_table(state))
+    assert any(str(c) == "2" for c in cells), (
+        f"real DLQ rows must still be counted per table; got {cells}"
+    )
+
+
+def test_per_table_column_and_dlq_card_agree() -> None:
+    """One screen, one number: the column and the card must never disagree.
+
+    They read the same key, so the invariant is that both go through the same filter.
+    """
+    from dsql_migrator.ui.data_migration._status import (
+        cdc_dlq_summary,
+        cdc_error_log_key,
+    )
+
+    from dsql_migrator.core.models import DataErrorRecord
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    key = _mixed_error_log(state, full_load=3, cdc=0)
+    # A dead-lettered row for the table the per-table view actually lists, so the
+    # column and the card are summing over the same table set.
+    state.error_log.record(
+        key,
+        DataErrorRecord(
+            table="ecommerce.product_media",
+            error_code="54000",
+            message="dead-lettered by the sink",
+            occurred_at=datetime(2026, 8, 4, 21, 6, 0, tzinfo=timezone.utc),
+        ),
+    )
+
+    card_total = cdc_dlq_summary(state, cdc_error_log_key(state)).total_errors
+    column_total = sum(
+        int(c)
+        for c in _quarantined_cells(_render_cdc_per_table(state))
+        if str(c).isdigit()
+    )
+    assert column_total == card_total == 1

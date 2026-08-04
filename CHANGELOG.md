@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.243
+
+### Fixed
+
+- **The CDC step's per-table "Quarantined" column still counted Full Load quarantines.**
+  v0.1.241 filtered the dead-letter card and v0.1.242 the Full Load log, but this column
+  was missed — so one screen showed two contradictory numbers for the same session: the
+  card read "0 quarantined" while the column right above it read 3. It now shares the
+  card's filter, so the two always agree. Also filtered the Full Load activity log's
+  per-table failure reasons, which could otherwise attribute a dead-lettered row's reason
+  to a table in a FULL_LOAD log line. Every remaining raw read of the shared error log was
+  audited: the two that stay unfiltered are the reads immediately feeding the filters
+  themselves, and the quarantine counters were already safe (they key on a message prefix
+  only the Full Load writers emit).
+
 ## v0.1.242
 
 ### Fixed

@@ -1784,7 +1784,13 @@ def _finalize_run(
         + (f"; {quarantined_rows} row(s) quarantined" if quarantined_rows else "")
     ]
     reasons_by_table: dict[str, str] = {}
-    for record in error_log.records(job_id):
+    # Full Load records only: CDC writes under this same job id (cdc_error_log_key), so
+    # an unfiltered read could attribute a dead-lettered row's reason to a table in a
+    # FULL_LOAD activity-log line. The quarantine count above is already safe (it keys
+    # on the "quarantined row pk[" prefix, which only the Full Load writers emit).
+    from dsql_migrator.ui.data_migration._status import full_load_error_records
+
+    for record in full_load_error_records(error_log, job_id):
         table = str(getattr(record, "table", "") or "?")
         message = str(getattr(record, "message", "") or "").strip()
         if not message or table in reasons_by_table:
