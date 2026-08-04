@@ -239,25 +239,13 @@ def _render_cdc_step(
         ui, phase=getattr(migration_state, "cdc_stack_phase", None)
     )
 
-    # 1b. PROVISION (CDC only): the infrastructure card lives here rather than under
-    #     Prerequisites. Its Prerequisites placement exists so the ~15-20 min MSK create
-    #     can OVERLAP the Full Load -- a reason that does not apply to CDC only, which
-    #     has no Full Load to overlap. Keeping it there split one continuous task across
-    #     two sections: the operator deployed under Prerequisites and then had to find
-    #     Start CDC in a different (collapsed) section. It precedes the start-point
-    #     decision because nothing downstream can run without the stack.
-    #
-    #     Full load + CDC keeps the Prerequisites placement -- the overlap is the whole
-    #     point there, and it must be reachable before the load starts.
-    if migration_type is MigrationType.CDC_ONLY:
-        _render_cdc_infra_prep_section(
-            ui,
-            migration_state,
-            job_manager,
-            refresh,
-            inventory=inventory,
-            session=session,
-        )
+    # NOTE: provisioning is NOT rendered here. The lifecycle card in step 4
+    # (_render_cdc_start_action) already owns it: on an absent stack it renders the
+    # same BYO-VPC deploy form (or the adopt choice), so adding a second call here
+    # showed the identical form twice on one screen. The Prerequisites copy is the
+    # *extra* entry point -- offered there only so the ~15-20 min MSK create can
+    # overlap a Full Load -- and it is suppressed for CDC only, which has no Full Load
+    # to overlap. See _render_cdc_infra_prep_section.
 
     # 2. DECIDE: the CDC start point (Automatic/Manual). This is the central
     #    decision, so it comes first -- the source/sink connector config it
@@ -1746,26 +1734,26 @@ def cdc_infra_prep_state(migration_state, job_manager) -> str:
 def _render_cdc_infra_prep_section(
     ui, migration_state, job_manager, refresh, *, inventory=None, session=None
 ) -> None:
-    """CDC infrastructure prep. Rendered in ONE place, which depends on the type.
+    """An EXTRA CDC-infrastructure entry point, at the bottom of Prerequisites.
 
-    * **Full load + CDC** -- at the bottom of the Prerequisites sub-step. The ~15-20 min
-      MSK create should OVERLAP the Full Load, so it has to be offered before the load
-      starts, and it also needs a real table set (the connector's ``TableIncludeList``
-      and the topic partition plan). Prerequisites is the first point where both hold:
-      running the checks pins and locks the confirmed selection, and that sub-step still
-      precedes Full Load. Beside the migration-type tiles the picker is typically
-      untouched, so the table set would resolve to "none".
-    * **CDC only** -- near the top of the CDC sub-step. There is no Full Load to overlap,
-      so the reason above does not apply, and keeping it under Prerequisites split one
-      continuous task across two sections: the operator provisioned there, then had to
-      find Start CDC in a different (collapsed) section.
+    Not the only way to provision: the CDC step's lifecycle card
+    (:func:`_render_cdc_start_action`) already renders the same BYO-VPC deploy form (or
+    the adopt choice) whenever the stack is absent. This one exists purely so the
+    ~15-20 min MSK create can be started EARLY and OVERLAP the Full Load, instead of
+    waiting until the operator reaches the CDC step after the load. It also needs a real
+    table set (the connector's ``TableIncludeList`` and the topic partition plan), and
+    Prerequisites is the first point where both hold: running the checks pins and locks
+    the confirmed selection, and that sub-step still precedes Full Load. Beside the
+    migration-type tiles the picker is typically untouched, so the table set would
+    resolve to "none".
 
-    The caller decides; this function does not branch on the type. Never render it in
-    both places -- that would show a billable deploy form twice.
+    **Rendered only for types that HAVE a Full Load to overlap.** For CDC only the
+    caller suppresses it: with no Full Load there is nothing to overlap, so it would be
+    a second copy of the CDC step's own form on the same screen. Do not add a call to
+    this from the CDC step -- that duplicates a billable deploy form.
 
-    Deliberately does NOT duplicate the CDC sub-step's lifecycle card: only the
-    first-deploy affordance lives here. Start CDC, monitoring, Stop and Delete stay on
-    the CDC sub-step, which remains reachable with no infrastructure deployed.
+    Scoped to the first-deploy affordance only: Start CDC, monitoring, Stop and Delete
+    stay on the CDC sub-step, which remains reachable with no infrastructure deployed.
     """
     prep = cdc_infra_prep_state(migration_state, job_manager)
     if prep == "unknown":

@@ -147,6 +147,7 @@ from dsql_migrator.ui.data_migration._models import (
     _SUBSTEPS,
     prereq_mode_for_type,
     migration_status_label,
+    migration_status_badge,
     stale_error_notice,
     substeps_for_type,
     resolve_active_substep_for_type,
@@ -229,6 +230,7 @@ from dsql_migrator.ui.data_migration._status import (
     _classify_cdc_stack_phase,
     _probe_cdc_stack_phase,
     _ensure_cdc_controller,
+    cdc_discovery_fingerprint,
     _CDC_DISCOVERY_THROTTLE_SECONDS,
     _CDC_IDLE_RATE_THRESHOLD,
     CdcActivitySummary,
@@ -705,14 +707,20 @@ def build_data_migration_screen(
                 # Outline chip to match the CDC table's status badges (Full Load /
                 # Consistency / DLQ are all outline) — one consistent status-chip style
                 # across both stats tables, per the design system.
-                # Prefix the phase the status belongs to. Bare "DONE" is ambiguous once
-                # the type selector moves: after a finished Full Load a user can switch
-                # to CDC only, and this badge -- backed by the same underlying step --
-                # then reads as if CDC had completed when none has run.
+                # Name the phase AND read that phase's own status. A bare "DONE" was
+                # ambiguous once the type selector moved; labelling it while still
+                # showing the shared full_load value was worse -- a restored session
+                # that had once run a Full Load came back reading "CDC: DONE" with CDC
+                # never having run, because the whole workflow is persisted.
+                _badge_label, _badge_status = migration_status_badge(
+                    migration_type,
+                    full_load_status=status,
+                    cdc_status=get_status(session.workflow, WorkflowStep.CDC),
+                    cdc_streaming=cdc_pipeline_live(migration_state),
+                )
                 ui.badge(
-                    f"{migration_status_label(migration_type, cdc_streaming=cdc_pipeline_live(migration_state))}"
-                    f": {status.value}"
-                ).props(f"color={_STATUS_COLORS[status]} outline")
+                    "{}: {}".format(_badge_label, _badge_status.value)
+                ).props(f"color={_STATUS_COLORS[_badge_status]} outline")
 
             if inventory is None:
                 render_notice(
@@ -1250,6 +1258,14 @@ def build_data_migration_screen(
                 ):
 
                     async def _discover_cdc() -> None:
+                        # Refresh only when discovery actually changed something. This
+                        # used to refresh unconditionally, which rebuilt every widget
+                        # ~0.05s+ after the screen appeared -- so a click on Start /
+                        # Re-run Full Load in that window hit an element that no longer
+                        # existed and was dropped, and the button appeared to need a
+                        # second press. On a revisit discovery usually finds the same
+                        # stack and connectors, so the rebuild bought nothing.
+                        _before = cdc_discovery_fingerprint(migration_state)
                         try:
                             await _disc_run.io_bound(
                                 _ensure_cdc_controller, migration_state, session
@@ -1258,7 +1274,11 @@ def build_data_migration_screen(
                             pass
                         # Log any connector RUNNING/FAILED transition (on change).
                         _log_cdc_connector_transitions(migration_state, job_manager)
-                        refresh()
+                        # A real change (first probe reporting, a new stack found, a
+                        # connector appearing/going away) still refreshes, so the
+                        # duplicate-MSK adopt guard shows up as soon as it is known.
+                        if cdc_discovery_fingerprint(migration_state) != _before:
+                            refresh()
 
                     ui.timer(0.05, _discover_cdc, once=True)  # type: ignore[attr-defined]
 

@@ -1226,3 +1226,38 @@ _CDC_TONE_STYLE = {
     "bad": ("border-red-300", "bg-red-50", "negative", "error"),
     "alarm": ("border-red-300", "bg-red-50", "negative", "error"),
 }
+
+
+def cdc_discovery_fingerprint(migration_state) -> tuple:
+    """Snapshot the state CDC discovery can change, for change detection.
+
+    Discovery runs ~0.05s after the Data Migration screen renders, reads AWS on a
+    worker thread, and used to call the screen's full ``refresh()`` unconditionally
+    when it finished. That rebuilds every widget -- including Start Full Load -- so a
+    click landing in the window between render and refresh went to an element that no
+    longer existed and was silently dropped. The operator saw a button that "only
+    works on the second press", on every revisit, even though discovery had found
+    nothing new (the common case: the same stack, the same connectors).
+
+    Comparing this fingerprint before and after lets the caller skip the rebuild when
+    nothing actually changed, while still refreshing when it did -- so the duplicate-MSK
+    guard (adopt an existing pipeline instead of deploying a second, billable cluster)
+    still appears as soon as discovery reports it.
+
+    Covers every field ``_ensure_cdc_controller`` / ``_probe_cdc_stack_phase`` write:
+    controller presence, connector names, running-connector names, stack phase, the
+    other-stacks list, and whether the phase probe has reported. Presence (not identity)
+    for the controller: it is rebuilt on each probe, so comparing the object would
+    always look changed.
+    """
+    return (
+        getattr(migration_state, "cdc_controller", None) is not None,
+        tuple(getattr(migration_state, "cdc_connector_names", ()) or ()),
+        tuple(getattr(migration_state, "cdc_connector_running_names", ()) or ()),
+        getattr(migration_state, "cdc_stack_phase", None),
+        tuple(
+            tuple(entry) if isinstance(entry, (list, tuple)) else entry
+            for entry in (getattr(migration_state, "cdc_other_stacks", ()) or ())
+        ),
+        bool(getattr(migration_state, "cdc_stack_phase_checked", False)),
+    )

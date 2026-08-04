@@ -5,6 +5,35 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.236
+
+### Fixed
+
+- **Start / Re-run Full Load appeared to need a second click.** On any plan that
+  includes CDC, an account-wide CDC discovery fires ~0.05s after the Data Migration
+  screen renders, reads AWS on a worker thread, and used to call the screen's full
+  refresh unconditionally when it returned. That rebuilt every widget, so a click landing
+  in the window between render and refresh went to an element that no longer existed and
+  was silently dropped. The refresh now happens only when discovery actually changed
+  something — on a revisit it usually finds the same stack and connectors, so the rebuild
+  bought nothing. A real change still refreshes, so the duplicate-MSK adopt guard appears
+  as soon as it is known. Full load only was never affected (discovery does not run).
+- **A restored CDC-only session showed "CDC: DONE" with CDC never having run.** The
+  badge's status came from the single `full_load` workflow step that every migration type
+  shares, and the whole workflow is persisted and restored — so a session that had once
+  completed a Full Load came back labelled "CDC" carrying that Full Load's DONE. Naming
+  one phase while showing another's value is worse than the bare "DONE" the label
+  replaced in v0.1.231. For CDC only the badge now reads the independently-maintained
+  `cdc` step, so it moves between NOT_STARTED and IN_PROGRESS — which is what CDC does,
+  since continuous replication has no completion and ends only via an explicit
+  Stop/Delete. Display only: the `full_load` step remains the Validation gate.
+- **The CDC infrastructure card rendered twice on the CDC step.** v0.1.235 added a call
+  to the prep section there, but the step's lifecycle card already renders the same
+  BYO-VPC deploy form (or the adopt choice) whenever the stack is absent, so the
+  identical form appeared twice. The prep section is the *extra* entry point — offered
+  under Prerequisites only so the ~15-20 min MSK create can overlap a Full Load — and it
+  stays suppressed for CDC only, which has no Full Load to overlap.
+
 ## v0.1.235
 
 ### Changed

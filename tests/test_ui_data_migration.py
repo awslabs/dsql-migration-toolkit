@@ -3701,12 +3701,13 @@ def test_prerequisites_placement_is_skipped_for_cdc_only() -> None:
     )
 
 
-def test_cdc_step_renders_the_infra_card_for_cdc_only_before_the_start_point() -> None:
-    """CDC only must render the card in the CDC step, ahead of the start-point card.
+def test_cdc_step_does_not_add_a_second_infra_prep_card() -> None:
+    """The CDC step must NOT call _render_cdc_infra_prep_section.
 
-    Ordering matters: nothing downstream (start point, Start CDC) can run without the
-    stack, so provisioning has to come first in the journey. Guarded on the type so the
-    combined type keeps its Prerequisites placement and its Full Load overlap.
+    Its lifecycle card (_render_cdc_start_action) already renders the same BYO-VPC
+    deploy form -- or the adopt choice -- whenever the stack is absent, so adding a
+    prep-section call there put the identical form on screen twice (observed in the UI).
+    Provisioning inside the CDC step belongs to the lifecycle card alone.
     """
     import ast
     import inspect
@@ -3714,32 +3715,153 @@ def test_cdc_step_renders_the_infra_card_for_cdc_only_before_the_start_point() -
     from dsql_migrator.ui.data_migration import _cdc_ui
 
     tree = ast.parse(inspect.getsource(_cdc_ui._render_cdc_step).strip())
-    guards = [
+    called = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "_render_cdc_infra_prep_section" not in called, (
+        "the CDC step already provisions via _render_cdc_start_action; calling the "
+        "prep section here duplicates a billable deploy form"
+    )
+    # The lifecycle card, which owns provisioning inside this step, is still rendered.
+    assert "_render_cdc_start_action" in called
+
+
+def test_lifecycle_card_owns_provisioning_when_no_stack_exists() -> None:
+    """Why the CDC step needs no separate prep card: the lifecycle card covers it.
+
+    Pins that _render_cdc_start_action still reaches the deploy form and the adopt
+    choice. If that ever moved out, CDC only would have no way to provision at all --
+    its Prerequisites entry point is deliberately suppressed.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    tree = ast.parse(inspect.getsource(_cdc_ui._render_cdc_start_action).strip())
+    called = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "_render_cdc_infra_deploy_action" in called
+    assert "_render_cdc_adopt_or_deploy_choice" in called
+
+
+def test_discovery_fingerprint_tracks_every_field_discovery_writes() -> None:
+    """Change detection is only sound if the fingerprint covers all mutated fields.
+
+    A field left out would make a real change look like "nothing happened", and the
+    refresh that reveals it (e.g. the duplicate-MSK adopt guard) would be skipped.
+    """
+    from dsql_migrator.ui.data_migration._status import cdc_discovery_fingerprint
+
+    class _S:
+        pass
+
+    state = _S()
+    base = cdc_discovery_fingerprint(state)
+    # Each mutation must move the fingerprint.
+    for attr, value in (
+        ("cdc_controller", object()),
+        ("cdc_connector_names", ["src"]),
+        ("cdc_connector_running_names", ["src"]),
+        ("cdc_stack_phase", "running"),
+        ("cdc_other_stacks", [("other-stack", "CREATE_COMPLETE")]),
+        ("cdc_stack_phase_checked", True),
+    ):
+        fresh = _S()
+        setattr(fresh, attr, value)
+        assert cdc_discovery_fingerprint(fresh) != base, f"{attr} must be tracked"
+
+
+def test_discovery_fingerprint_is_stable_when_nothing_changed() -> None:
+    # The whole point: a re-probe that finds the same stack/connectors must compare
+    # equal, so no rebuild happens and an in-flight click survives.
+    from dsql_migrator.ui.data_migration._status import cdc_discovery_fingerprint
+
+    class _S:
+        cdc_connector_names = ["mysql-source", "mysql-sink"]
+        cdc_connector_running_names = ["mysql-source"]
+        cdc_stack_phase = "running"
+        cdc_other_stacks: list = []
+        cdc_stack_phase_checked = True
+
+    assert cdc_discovery_fingerprint(_S()) == cdc_discovery_fingerprint(_S())
+
+
+def test_discovery_fingerprint_compares_a_rebuilt_controller_as_unchanged() -> None:
+    # The controller object is rebuilt on every probe, so comparing identity would
+    # always look changed and defeat the skip entirely. Presence is what matters.
+    from dsql_migrator.ui.data_migration._status import cdc_discovery_fingerprint
+
+    class _S:
+        pass
+
+    a, b = _S(), _S()
+    a.cdc_controller = object()
+    b.cdc_controller = object()  # different instance, same meaning
+    assert cdc_discovery_fingerprint(a) == cdc_discovery_fingerprint(b)
+
+
+def test_discovery_refresh_is_conditional_on_a_real_change() -> None:
+    """The reported symptom: Start / Re-run Full Load needing a second click.
+
+    Discovery fires ~0.05s after the screen renders and used to call the full
+    ``refresh()`` unconditionally when it finished, rebuilding every widget -- so a
+    click in that window went to a destroyed element and was dropped. The refresh must
+    now sit behind a fingerprint comparison.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
+    discover = next(
         node
         for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_discover_cdc"
+    )
+    refresh_calls = [
+        node
+        for node in ast.walk(discover)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "refresh"
+    ]
+    assert refresh_calls, "discovery must still refresh when something changed"
+    # Every refresh has to be inside a conditional -- an unguarded one at the function
+    # body's top level is exactly the bug.
+    top_level = [
+        stmt
+        for stmt in discover.body
+        if isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Name)
+        and stmt.value.func.id == "refresh"
+    ]
+    assert not top_level, (
+        "refresh() must not run unconditionally after discovery -- that rebuilds the "
+        "Start Full Load button and swallows an in-flight click"
+    )
+    guards = [
+        node
+        for node in ast.walk(discover)
         if isinstance(node, ast.If)
         and any(
             isinstance(c, ast.Call)
             and isinstance(c.func, ast.Name)
-            and c.func.id == "_render_cdc_infra_prep_section"
+            and c.func.id == "refresh"
             for c in ast.walk(node)
         )
     ]
-    assert guards, "the CDC step must render the infra card behind a type guard"
-    assert "CDC_ONLY" in ast.unparse(guards[0].test)
-
-    # Provisioning precedes the start-point decision. Compared by LINE NUMBER, not by
-    # ast.walk order -- walk is breadth-first, so a call nested inside an `if` sorts
-    # after top-level calls regardless of where it appears in the source.
-    lines = {
-        node.func.id: node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
-    assert (
-        lines["_render_cdc_infra_prep_section"]
-        < lines["_render_cdc_source_config_card"]
-    ), "provisioning must come before the start-point decision"
+    assert guards, "the refresh must be guarded"
+    assert "cdc_discovery_fingerprint" in ast.unparse(guards[0].test), (
+        "the guard must compare the discovery fingerprint"
+    )
 
 
 def test_cdc_discovery_is_armed_before_the_substeps_render() -> None:
@@ -4724,6 +4846,112 @@ def test_status_badge_names_the_phase_its_status_belongs_to() -> None:
     # CDC-only never describes the Full Load, streaming or not.
     assert (
         migration_status_label(MigrationType.CDC_ONLY, cdc_streaming=True) == "CDC"
+    )
+
+
+def test_cdc_only_badge_reads_the_cdc_step_not_the_shared_full_load_step() -> None:
+    """The reported bug: "CDC: DONE" in a restored session where CDC never ran.
+
+    The badge's status came from the single `full_load` workflow step every type shares,
+    and the whole workflow is persisted -- so a session that had once completed a Full
+    Load came back labelled "CDC" with that Full Load's DONE. Naming one phase while
+    showing another's value is worse than the bare "DONE" the label replaced.
+    """
+    from dsql_migrator.ui.data_migration import MigrationType, migration_status_badge
+    from dsql_migrator.ui.workflow import StepStatus
+
+    label, status = migration_status_badge(
+        MigrationType.CDC_ONLY,
+        full_load_status=StepStatus.DONE,  # restored from an earlier Full Load
+        cdc_status=StepStatus.NOT_STARTED,  # CDC genuinely never ran
+    )
+
+    assert label == "CDC"
+    assert status is StepStatus.NOT_STARTED, (
+        "CDC only must show the cdc step's status, not the restored full_load DONE"
+    )
+
+
+def test_cdc_only_badge_follows_the_cdc_step_once_streaming() -> None:
+    # The other half: when CDC is actually live the badge must say so, or the fix would
+    # just pin it to NOT_STARTED forever.
+    from dsql_migrator.ui.data_migration import MigrationType, migration_status_badge
+    from dsql_migrator.ui.workflow import StepStatus
+
+    label, status = migration_status_badge(
+        MigrationType.CDC_ONLY,
+        full_load_status=StepStatus.DONE,
+        cdc_status=StepStatus.IN_PROGRESS,
+        cdc_streaming=True,
+    )
+
+    assert (label, status) == ("CDC", StepStatus.IN_PROGRESS)
+
+
+def test_other_types_keep_reading_the_full_load_step() -> None:
+    """Regression guard: only CDC only changes source.
+
+    For Full load only, and for the combined type before CDC goes live, the label and
+    the value describe the same phase -- so they must keep reading `full_load`. Reading
+    the cdc step there would show NOT_STARTED for a finished Full Load.
+    """
+    from dsql_migrator.ui.data_migration import MigrationType, migration_status_badge
+    from dsql_migrator.ui.workflow import StepStatus
+
+    for mtype in (MigrationType.FULL_LOAD_ONLY, MigrationType.FULL_LOAD_AND_CDC):
+        label, status = migration_status_badge(
+            mtype,
+            full_load_status=StepStatus.DONE,
+            cdc_status=StepStatus.NOT_STARTED,
+        )
+        assert status is StepStatus.DONE, f"{mtype} must read the full_load step"
+        assert label == "Full Load"
+
+
+def test_badge_returns_the_status_object_so_text_and_colour_cannot_disagree() -> None:
+    # The caller renders `.value` and indexes _STATUS_COLORS with the SAME object. If
+    # this returned a bare string the colour would have to be derived separately and
+    # could drift (green "NOT STARTED").
+    from dsql_migrator.ui.data_migration import (
+        _STATUS_COLORS,
+        MigrationType,
+        migration_status_badge,
+    )
+    from dsql_migrator.ui.workflow import StepStatus
+
+    _, status = migration_status_badge(
+        MigrationType.CDC_ONLY,
+        full_load_status=StepStatus.DONE,
+        cdc_status=StepStatus.NOT_STARTED,
+    )
+    assert status in _STATUS_COLORS, "the returned status must key the colour map"
+    assert _STATUS_COLORS[status] != _STATUS_COLORS[StepStatus.DONE]
+
+
+def test_render_path_feeds_the_badge_both_workflow_steps() -> None:
+    """The fix only reaches users if the screen passes the cdc step in.
+
+    Pinned on the parse tree: passing only full_load_status would silently restore the
+    old behaviour with the helper in place.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    tree = ast.parse(inspect.getsource(dm.build_data_migration_screen))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "migration_status_badge"
+    ]
+    assert calls, "the screen must build the badge via migration_status_badge"
+    kwargs = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}
+    assert "full_load_status" in kwargs and "cdc_status" in kwargs
+    assert "WorkflowStep.CDC" in kwargs["cdc_status"], (
+        f"cdc_status must come from the cdc workflow step, got {kwargs['cdc_status']}"
     )
 
 

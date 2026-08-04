@@ -1542,6 +1542,43 @@ def migration_status_label(
     return "CDC" if cdc_streaming else "Full Load"
 
 
+def migration_status_badge(
+    migration_type: MigrationType,
+    *,
+    full_load_status,
+    cdc_status,
+    cdc_streaming: bool = False,
+) -> tuple:
+    """Return ``(label, status)`` for the Data Migration status badge.
+
+    The label alone was not enough. The badge's status has always come from the single
+    ``full_load`` workflow step that every migration type shares, so a CDC-only session
+    labelled it "CDC" while showing a value that belonged to a Full Load -- and because
+    the whole workflow is persisted and restored, a session that once ran a Full Load
+    came back reading "CDC: DONE" without CDC ever having run. Naming a phase and then
+    showing another phase's value is worse than the bare "DONE" this replaced.
+
+    So for CDC only the status is read from the ``cdc`` workflow step instead, which is
+    maintained independently (set to IN_PROGRESS when connectors are detected). That step
+    never reaches DONE by design -- CDC is continuous replication with no completion, and
+    it ends only through an explicit Stop/Delete -- so this badge moves between
+    NOT_STARTED and IN_PROGRESS, which is what CDC actually does.
+
+    Full load only, and the combined type before CDC goes live, keep reading the
+    ``full_load`` step: there the label and the value describe the same phase.
+
+    Both statuses are passed in (not read off a session) to keep this pure, and the
+    chosen one is returned as-is -- the caller renders its value AND picks its colour
+    from the same object, so the text and the colour cannot disagree. This decides
+    DISPLAY only: the ``full_load`` step remains the Validation gate, so changing what
+    the badge shows must not change what is reachable.
+    """
+    label = migration_status_label(migration_type, cdc_streaming=cdc_streaming)
+    if migration_type is MigrationType.CDC_ONLY:
+        return label, cdc_status
+    return label, full_load_status
+
+
 def stale_error_notice(
     error: Optional[str],
     *,
