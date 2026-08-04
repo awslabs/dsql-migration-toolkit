@@ -236,6 +236,9 @@ from dsql_migrator.ui.data_migration._status import (
     CdcActivitySummary,
     cdc_activity_summary,
     cdc_error_log_key,
+    full_load_error_records,
+    full_load_error_summary,
+    full_load_latest_messages,
     _fetch_cdc_status,
     _apply_cdc_status,
     _refresh_cdc_status,
@@ -3205,11 +3208,13 @@ def _render_full_load_step(
             ui.label(full_load_progress_caption(current)).classes(
                 "text-sm text-gray-500"
             )
-        summary = migration_state.error_log.summary(current.job_id)
+        # Full Load records ONLY: CDC writes under this same job_id (cdc_error_log_key),
+        # so an unfiltered read counts dead-lettered rows as Full Load failures.
+        summary = full_load_error_summary(migration_state.error_log, current.job_id)
         rows = build_full_load_table_rows(
             current,
             summary,
-            migration_state.error_log.latest_messages(current.job_id),
+            full_load_latest_messages(migration_state.error_log, current.job_id),
         )
         _render_full_load_progress(
             ui,
@@ -3225,7 +3230,9 @@ def _render_full_load_step(
             # and the count above it disagreed with the list below.
             quarantine_records=[
                 (str(record.table), str(record.message))
-                for record in migration_state.error_log.records(current.job_id)
+                for record in full_load_error_records(
+                    migration_state.error_log, current.job_id
+                )
             ],
             ai_error_opener=ai_error_opener,
             page_state=_progress_page,
@@ -3497,8 +3504,8 @@ def _render_full_load_step(
                     # retry it now. FAILED tables carry their error-log message; a
                     # still-PENDING table was never attempted (the run ended first),
                     # so it gets a plain "not yet loaded" note.
-                    _failure_reasons = migration_state.error_log.latest_messages(
-                        job.job_id
+                    _failure_reasons = full_load_latest_messages(
+                        migration_state.error_log, job.job_id
                     )
                     _pending_names = {
                         c.chunk_id for c in job.chunks if c.status == "PENDING"
@@ -4870,7 +4877,10 @@ def _render_error_log(ui, migration_state, job: MigrationJob) -> None:
     button is hidden when there are no errors.
     """
     job_id = job.job_id
-    summary = migration_state.error_log.summary(job_id)
+    # Full Load records only -- CDC shares this key, and its dead-lettered rows belong
+    # to the CDC panel's own download (see full_load_error_records).
+    records = full_load_error_records(migration_state.error_log, job_id)
+    summary = full_load_error_summary(migration_state.error_log, job_id)
     # NO "Data errors" heading + count when there is nothing to download: with zero
     # errors it printed a section header over "No data errors recorded." -- a whole block
     # asserting an absence. And when there ARE errors, every one of them is already shown
@@ -4880,7 +4890,9 @@ def _render_error_log(ui, migration_state, job: MigrationJob) -> None:
     if summary.total_errors > 0:
         def _download_log() -> None:
             try:
-                payload = migration_state.error_log.render_log(job_id)
+                # Serialize the FILTERED records; render_log(job_id) would re-read the
+                # whole key and put CDC rows into a file labelled Full Load.
+                payload = migration_state.error_log.render_records(records)
                 ui.download.content(  # type: ignore[attr-defined]
                     payload, f"error_log_{job_id}.ndjson", "application/x-ndjson"
                 )

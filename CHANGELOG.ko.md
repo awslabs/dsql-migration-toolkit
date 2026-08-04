@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.242
+
+### 수정
+
+- **Full Load 오류 로그가 CDC dead-letter 행을 Full Load 실패로 집계했습니다.** v0.1.241의
+  거울상으로, 방향만 반대입니다: Full Load가 실행된 세션에서는 CDC가 그 job id 아래에 기록하므로,
+  필터 없이 읽으면 Full Load 격리 3건과 dead-letter 2건이 합쳐져 "Download Full Load error log
+  (5 errors)"가 되고 파일에 CDC 행이 섞였습니다. 컷오버 시점에는 실제로 3행을 잃었는데 "Full
+  Load가 5행을 잃었다"로 읽힙니다. 테이블별 실패 원인에도 같은 결함이 있었습니다 — 테이블별로
+  마지막 메시지만 보관하므로, dead-letter 행이 Full Load가 정상 적재한 테이블의 "원인"을 제공할 수
+  있었습니다. 이제 Full Load 표시(건수, 테이블별 행과 원인, 격리 목록, 다운로드의 라벨 *및* 파일
+  내용)가 자신의 레코드만 보고하므로 두 화면이 오류 로그를 정확히 분할합니다: Full Load + CDC가
+  전체와 일치하며, 누락도 중복 집계도 없습니다.
+
 ## v0.1.241
 
 ### 수정

@@ -1167,6 +1167,61 @@ def cdc_dlq_records(migration_state, log_key: str) -> list:
     return [r for r in records or () if is_cdc_error_record(r)]
 
 
+def full_load_error_records(error_log, job_id: str) -> list:
+    """Read ``job_id``'s error records and keep only the Full Load's own.
+
+    The mirror of :func:`cdc_dlq_records`, and needed for the same reason: CDC records
+    under the Full Load's ``job_id`` whenever one ran (see :func:`cdc_error_log_key`),
+    so an unfiltered read here counts DEAD-LETTERED rows as Full Load failures. That
+    inflates "Download Full Load error log (N errors)" and puts CDC rows in the file --
+    the same defect as the DLQ card, pointing the other way, and it reads at cut-over as
+    "the Full Load lost N rows" when it did not.
+
+    Filtering both directions is what makes the two screens add up to the whole log.
+
+    Best-effort: an unreadable log yields ``[]`` rather than breaking the panel.
+    """
+    if not job_id:
+        return []
+    try:
+        records = error_log.records(job_id)
+    except Exception:  # noqa: BLE001 - advisory; never break the panel
+        return []
+    return [r for r in records or () if not is_cdc_error_record(r)]
+
+
+def full_load_error_summary(error_log, job_id: str):
+    """Summarize ONLY the Full Load's own error records under ``job_id``.
+
+    Same shape as ``ErrorLogStore.summary`` so it drops into the existing Full Load
+    consumers (count badge, per-table rows, download label). See
+    :func:`full_load_error_records`.
+    """
+    from dsql_migrator.core.models import ErrorLogSummary
+
+    records = full_load_error_records(error_log, job_id)
+    by_table: dict[str, int] = {}
+    for record in records:
+        by_table[record.table] = by_table.get(record.table, 0) + 1
+    return ErrorLogSummary(
+        total_errors=len(records),
+        errors_by_table=by_table,
+        log_available=bool(records),
+    )
+
+
+def full_load_latest_messages(error_log, job_id: str) -> dict:
+    """Latest message per table, from the Full Load's own records only.
+
+    Drives the per-table failure reason in the Full Load table; without the filter a
+    dead-lettered CDC row could supply the "why" for a table the Full Load loaded fine.
+    """
+    messages: dict[str, str] = {}
+    for record in full_load_error_records(error_log, job_id):
+        messages[record.table] = record.message
+    return messages
+
+
 def cdc_dlq_summary(migration_state, log_key: str):
     """Summarize ONLY the CDC-sourced records under ``log_key``.
 

@@ -13771,3 +13771,105 @@ def test_full_load_pointer_is_rendered_by_the_dlq_panel() -> None:
     assert "No records quarantined" in joined
     # ...and the Full Load's rows are still accounted for.
     assert "Full Load also set 3 rows aside" in joined
+
+
+def test_full_load_error_log_excludes_dead_lettered_cdc_rows() -> None:
+    """The mirror defect: CDC rows counted as Full Load failures.
+
+    CDC records under the Full Load's job_id whenever one ran, so an unfiltered read
+    made "Download Full Load error log (5 errors)" out of 3 Full Load quarantines and 2
+    dead-lettered rows -- reading at cut-over as "the Full Load lost 5 rows".
+    """
+    from dsql_migrator.ui.data_migration._status import full_load_error_summary
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    key = _mixed_error_log(state, full_load=3, cdc=2)
+
+    summary = full_load_error_summary(state.error_log, key)
+    assert summary.total_errors == 3
+    assert summary.errors_by_table == {"ecommerce.product_media": 3}
+
+
+def test_the_two_screens_partition_the_error_log_exactly() -> None:
+    """Full Load + CDC must add up to the whole log -- nothing lost, nothing double-counted.
+
+    This is the property that makes filtering both directions correct rather than just
+    moving the miscount around.
+    """
+    from dsql_migrator.ui.data_migration._status import (
+        cdc_dlq_summary,
+        full_load_error_summary,
+    )
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    key = _mixed_error_log(state, full_load=3, cdc=2)
+
+    whole = state.error_log.summary(key).total_errors
+    full_load = full_load_error_summary(state.error_log, key).total_errors
+    cdc = cdc_dlq_summary(state, key).total_errors
+
+    assert (full_load, cdc) == (3, 2)
+    assert full_load + cdc == whole == 5
+
+
+def test_full_load_download_label_and_payload_exclude_cdc_rows() -> None:
+    """Click the real button: label counts, and bytes contain, Full Load rows only."""
+    from dsql_migrator.core.models import MigrationJob
+    from dsql_migrator.ui.data_migration import _render_error_log
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    key = _mixed_error_log(state, full_load=3, cdc=2)
+
+    downloaded: dict = {}
+
+    class _Dl:
+        @staticmethod
+        def content(payload, filename, mime):
+            downloaded["payload"] = payload
+
+    ui = _RecordingUi()
+    ui.download = _Dl()
+    _render_error_log(ui, state, MigrationJob(job_id=key))
+
+    joined = " ".join(ui.texts)
+    assert "Download Full Load error log (3 errors)" in joined, (
+        f"label must count Full Load rows only; got {joined!r}"
+    )
+
+    handlers = [b.on_click for b in ui.buttons if b.on_click is not None]
+    assert handlers, "the download button must be wired"
+    handlers[0]()
+    text = downloaded["payload"].decode()
+    assert "ecommerce.orders" not in text, "a Full Load log must not carry CDC rows"
+    assert text.count("\n") == 3
+
+
+def test_full_load_latest_messages_ignores_cdc_records() -> None:
+    """A dead-lettered row must not supply the "why" for a table the Full Load loaded.
+
+    ``latest_messages`` keeps the last message per table, so an unfiltered read let a
+    CDC record become a Full Load table's displayed failure reason.
+    """
+    from dsql_migrator.core.models import DataErrorRecord
+    from dsql_migrator.ui.data_migration._status import full_load_latest_messages
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    key = _mixed_error_log(state, full_load=1, cdc=0)
+    # A CDC record for the SAME table, recorded later than the Full Load's.
+    state.error_log.record(
+        key,
+        DataErrorRecord(
+            table="ecommerce.product_media",
+            error_code="54000",
+            message="dead-lettered by the sink",
+            occurred_at=datetime(2026, 8, 4, 21, 6, 0, tzinfo=timezone.utc),
+        ),
+    )
+
+    messages = full_load_latest_messages(state.error_log, key)
+    assert "dead-lettered" not in messages.get("ecommerce.product_media", "")
+    assert "quarantined row pk[" in messages["ecommerce.product_media"]

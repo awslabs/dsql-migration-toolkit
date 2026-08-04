@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.242
+
+### Fixed
+
+- **The Full Load error log counted dead-lettered CDC rows as Full Load failures.** The
+  mirror of v0.1.241, pointing the other way: CDC records under the Full Load's job id
+  whenever one ran, so an unfiltered read turned 3 Full Load quarantines plus 2
+  dead-lettered rows into "Download Full Load error log (5 errors)" and put the CDC rows
+  in the file. At cut-over that reads as "the Full Load lost 5 rows" when it lost 3. The
+  per-table failure reason had the same flaw — because only the latest message per table
+  is kept, a dead-lettered row could supply the "why" for a table the Full Load had loaded
+  fine. The Full Load surfaces (count, per-table rows and reasons, the quarantine list,
+  and the download's label *and* file contents) now report its own records only, so the
+  two screens partition the error log exactly: Full Load + CDC adds up to the whole log,
+  with nothing lost and nothing double-counted.
+
 ## v0.1.241
 
 ### Fixed
