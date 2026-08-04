@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.233
+
+### Added
+
+- **A Full Load prerequisite now catches a target NOT NULL column the source cannot
+  fill, before the load instead of partway through it.** Full Load builds its INSERT
+  column list from the source table, so a column present only on the target — e.g. one
+  added while editing the target DDL in Schema Conversion — is never named in an INSERT.
+  That is harmless when the column is nullable, has a DEFAULT, or is an identity column
+  (verified on a live cluster: the load fills it with NULL / the default). It is fatal
+  for a `NOT NULL` column with no default: the row has nothing to put there and the load
+  fails with a not-null violation after the target already holds partial data. The new
+  `TARGET_COLUMNS_LOADABLE` check (required) reads the target's value-required columns,
+  subtracts the source columns, and fails only on the remainder — a column that also
+  exists on the source is filled by the INSERT and is not flagged. It defers to
+  `TARGET_SCHEMA_READY` (passes) when the target table is missing or unreadable, so it
+  never double-reports the same cause.
+
 ## v0.1.232
 
 ### Added

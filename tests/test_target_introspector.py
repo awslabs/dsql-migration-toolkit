@@ -819,3 +819,131 @@ def test_sync_identity_sequences_reports_per_table_and_is_injection_safe() -> No
     # interpolated (Requirement 9.4).
     assert '"ecommerce"."orders"' in conn.restarts[0]
     assert '"id"' in conn.restarts[0]
+
+
+# ---------------------------------------------------------------------------
+# target_required_columns_without_default: value-required target columns
+# ---------------------------------------------------------------------------
+
+
+class _RequiredColsCursor:
+    """Answers the existence probe, then the value-required-columns query.
+
+    The function issues two statements: `SELECT 1 ...` to confirm the relation
+    exists, then the `attnotnull AND NOT atthasdef AND attidentity = ''` list. This
+    cursor distinguishes them by SQL text so a test can model a missing table
+    (existence returns nothing) independently of the column list.
+    """
+
+    def __init__(self, connection: "_RequiredColsConnection") -> None:
+        self._connection = connection
+        self._rows: list = []
+        self._one: object = None
+
+    def execute(self, statement: object, parameters: object = None) -> None:
+        text = statement if isinstance(statement, str) else statement.as_string(None)
+        self._connection.executed.append((text, parameters))
+        if self._connection.raises:
+            raise RuntimeError("catalog unreadable")
+        if text.strip().startswith("SELECT 1"):
+            self._one = (1,) if self._connection.exists else None
+        else:
+            self._rows = list(self._connection.columns)
+
+    def fetchone(self) -> object:
+        return self._one
+
+    def fetchall(self) -> list:
+        return self._rows
+
+    def close(self) -> None:
+        self._connection.closed_cursors += 1
+
+
+class _RequiredColsConnection:
+    def __init__(
+        self, *, columns: list, exists: bool = True, raises: bool = False
+    ) -> None:
+        self.columns = columns
+        self.exists = exists
+        self.raises = raises
+        self.executed: list[tuple] = []
+        self.closed = False
+        self.closed_cursors = 0
+
+    def cursor(self) -> _RequiredColsCursor:
+        return _RequiredColsCursor(self)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_required_columns_without_default_lists_value_required_columns() -> None:
+    from dsql_migrator.core.target_introspector import (
+        target_required_columns_without_default,
+    )
+
+    conn = _RequiredColsConnection(columns=[("id",), ("added_notnull",)])
+
+    result = target_required_columns_without_default(
+        "ecommerce.orders", connection_factory=lambda: conn
+    )
+
+    assert result == ["id", "added_notnull"]
+    # The list query filters on all three conditions -- nullable, defaulted, and
+    # identity columns are excluded at the SQL level, not client-side.
+    list_stmt = conn.executed[-1][0]
+    assert "a.attnotnull" in list_stmt
+    assert "NOT a.atthasdef" in list_stmt
+    assert "a.attidentity = ''" in list_stmt
+    # schema/table travel as bound parameters (Requirement 9.4).
+    assert conn.executed[0][1] == {"schema": "ecommerce", "table": "orders"}
+    assert conn.closed is True
+
+
+def test_required_columns_without_default_returns_empty_for_a_clean_table() -> None:
+    from dsql_migrator.core.target_introspector import (
+        target_required_columns_without_default,
+    )
+
+    # The table exists and every value-required column is coverable -> [], NOT None.
+    conn = _RequiredColsConnection(columns=[])
+
+    result = target_required_columns_without_default(
+        "t", connection_factory=lambda: conn
+    )
+
+    assert result == []
+
+
+def test_required_columns_without_default_returns_none_for_a_missing_table() -> None:
+    from dsql_migrator.core.target_introspector import (
+        target_required_columns_without_default,
+    )
+
+    # Existence probe returns nothing -> None (unknown), NOT [] -- a missing table
+    # must never look like "exists with no required columns".
+    conn = _RequiredColsConnection(columns=[("x",)], exists=False)
+
+    result = target_required_columns_without_default(
+        "t", connection_factory=lambda: conn
+    )
+
+    assert result is None
+    # The column list query is not even run once existence fails.
+    assert len(conn.executed) == 1
+
+
+def test_required_columns_without_default_returns_none_on_catalog_error() -> None:
+    from dsql_migrator.core.target_introspector import (
+        target_required_columns_without_default,
+    )
+
+    conn = _RequiredColsConnection(columns=[], raises=True)
+
+    result = target_required_columns_without_default(
+        "t", connection_factory=lambda: conn
+    )
+
+    assert result is None
+    assert conn.closed is True

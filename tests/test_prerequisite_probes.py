@@ -138,3 +138,35 @@ def test_unavailable_probe_always_false() -> None:
     probe = UnavailableMskProbe()
     assert probe.cluster_available() is False
     assert probe.connect_available() is False
+
+
+def test_session_target_probe_reads_value_required_columns_via_introspector() -> None:
+    """The wiring the columns check depends on: the probe must delegate to the
+    live-catalog reader with the connector's connect factory.
+
+    Asserted on the parse tree (not a source substring) so reformatting can't
+    satisfy it. Without this delegation the prerequisite check has no data and the
+    NOT-NULL-column gap goes unchecked.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import prerequisite_probes as probes_mod
+
+    src = inspect.getsource(
+        probes_mod.SessionTargetProbe.required_columns_without_default
+    )
+    tree = ast.parse(src.strip())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "target_required_columns_without_default"
+    ]
+    assert calls, "probe must call target_required_columns_without_default"
+    call = calls[0]
+    # Table name forwarded positionally; connection_factory is the connector's connect.
+    assert call.args, "the qualified table name must be forwarded"
+    kwargs = {kw.arg: ast.unparse(kw.value) for kw in call.keywords}
+    assert kwargs.get("connection_factory") == "self._connector.connect"

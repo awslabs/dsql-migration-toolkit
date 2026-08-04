@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.233
+
+### 추가
+
+- **Full Load 사전 검사가, 소스가 채울 수 없는 target의 NOT NULL 컬럼을 로드 중이 아니라
+  로드 전에 잡습니다.** Full Load는 INSERT 컬럼 목록을 소스 테이블에서 만들므로, target에만
+  있는 컬럼(예: Schema Conversion에서 target DDL을 편집하며 추가한 컬럼)은 INSERT에 포함되지
+  않습니다. 그 컬럼이 nullable이거나 DEFAULT가 있거나 identity면 문제없습니다(라이브 클러스터로
+  확인: 로드가 NULL/기본값으로 채웁니다). 하지만 DEFAULT 없는 `NOT NULL` 컬럼이면 치명적입니다 —
+  넣을 값이 없어 target에 일부 데이터가 적재된 뒤 not-null 위반으로 실패합니다. 새 검사
+  `TARGET_COLUMNS_LOADABLE`(필수)는 target의 값-필수 컬럼에서 소스 컬럼을 뺀 나머지에만
+  실패합니다 — 소스에도 있는 컬럼은 INSERT가 채우므로 걸리지 않습니다. target 테이블이
+  없거나 읽을 수 없으면 `TARGET_SCHEMA_READY`에 맡기고 통과시켜, 같은 원인을 이중으로 보고하지
+  않습니다.
+
 ## v0.1.232
 
 ### 추가

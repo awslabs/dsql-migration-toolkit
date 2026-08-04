@@ -5,6 +5,21 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.233
+
+### 追加
+
+- **Full Load の事前チェックが、ソースで埋められない target の NOT NULL 列を、ロード中では
+  なくロード前に検出します。** Full Load は INSERT の列リストをソーステーブルから作るため、
+  target にのみ存在する列 (例: Schema Conversion で target DDL を編集して追加した列) は INSERT
+  に含まれません。その列が nullable、DEFAULT あり、または identity なら問題ありません (ライブ
+  クラスターで確認: ロードが NULL / デフォルトで埋めます)。しかし DEFAULT のない `NOT NULL` 列
+  の場合は致命的です — 入れる値がなく、target に一部データが投入された後に not-null 違反で失敗
+  します。新しいチェック `TARGET_COLUMNS_LOADABLE` (必須) は target の値必須列からソース列を
+  引いた残りにのみ失敗します — ソースにも存在する列は INSERT が埋めるため対象外です。target
+  テーブルが存在しない、または読み取れない場合は `TARGET_SCHEMA_READY` に委ね通過させ、同じ
+  原因を二重に報告しません。
+
 ## v0.1.232
 
 ### 追加

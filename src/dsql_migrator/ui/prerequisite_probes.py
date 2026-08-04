@@ -30,7 +30,7 @@ as a non-blocking advisory ``WARN`` (see ``check_msk_available``), not a failure
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 from sqlalchemy import text
 
@@ -43,7 +43,10 @@ from dsql_migrator.core.models import (
 )
 from dsql_migrator.core.prerequisites import PrerequisiteChecker
 from dsql_migrator.core.target_connection import DsqlConnector
-from dsql_migrator.core.target_introspector import TargetIntrospector
+from dsql_migrator.core.target_introspector import (
+    TargetIntrospector,
+    target_required_columns_without_default,
+)
 from dsql_migrator.ui.connect import make_source_engine_factory
 
 # MSK Serverless/provisioned cluster states that mean the broker is usable.
@@ -145,6 +148,19 @@ class SessionTargetProbe:
             return self._introspector.object_exists(qualified_name)
         except Exception:  # noqa: BLE001 - treated as "not present"
             return False
+
+    def required_columns_without_default(
+        self, qualified_name: str
+    ) -> Optional[Sequence[str]]:
+        """Return the target's NOT NULL / no-default / non-identity columns.
+
+        Read live from the DSQL catalog (not the browsed inventory, which does not
+        carry column defaults). ``None`` on any error or a missing table, so the
+        columns check defers to TARGET_SCHEMA_READY instead of false-failing.
+        """
+        return target_required_columns_without_default(
+            qualified_name, connection_factory=self._connector.connect
+        )
 
 
 class SessionMskProbe:

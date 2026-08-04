@@ -455,6 +455,87 @@ def target_primary_key_columns(
         _safe_close(connection)
 
 
+def target_required_columns_without_default(
+    table_name: str,
+    *,
+    connection_factory: Callable[[], Any],
+) -> Optional[list[str]]:
+    """Return the target columns that MUST be given a value on INSERT (read-only).
+
+    Full Load builds its INSERT column list from the SOURCE table, so any column
+    present only on the target is left out of every INSERT. That is fine when the
+    column can take an absent value -- it is nullable, or has a DEFAULT (including a
+    generated/identity column, which supplies its own value). It is NOT fine for a
+    ``NOT NULL`` column with no default: the row has nothing to put there and the
+    load fails with a not-null violation partway through (verified on a live DSQL
+    cluster). This lists exactly those columns so the prerequisite check can compare
+    them against the source and fail before the load starts rather than mid-run.
+
+    A column is EXCLUDED (can take an absent value) when any of these holds:
+    ``NOT attnotnull`` (nullable), ``atthasdef`` (an explicit ``DEFAULT``), or
+    ``attidentity <> ''`` (a ``GENERATED``/identity column). The last is not
+    redundant: verified on a live DSQL cluster, an identity column reports
+    ``atthasdef = false`` -- DSQL records identity in ``attidentity``, not
+    ``pg_attrdef`` -- so an ``atthasdef``-only test wrongly flags every identity
+    column as value-required. ``attnum > 0`` skips system columns and
+    ``NOT attisdropped`` skips dropped ones.
+
+    ``table_name`` is ``schema.table`` (or bare, resolved against the search path)
+    and both halves are passed as BOUND PARAMETERS -- never interpolated
+    (Requirement 9.4). Returns ``None`` when the set cannot be determined -- the
+    table does not exist, or any error -- which callers MUST treat as "unknown",
+    distinct from ``[]`` ("the table exists and every extra column can take an
+    absent value"). Existence is checked separately so a genuinely empty result on
+    a real table is never conflated with a missing table.
+    """
+    parts = table_name.split(".", 1)
+    if len(parts) == 2:
+        schema, relname = parts
+        where_relation = "n.nspname = %(schema)s AND c.relname = %(table)s"
+        params: dict[str, object] = {"schema": schema, "table": relname}
+    else:
+        where_relation = (
+            "c.relname = %(table)s AND pg_catalog.pg_table_is_visible(c.oid)"
+        )
+        params = {"table": parts[0]}
+    # Two queries over one connection: first confirm the relation exists (so a
+    # missing table is `None`, not a misleading empty list), then list the
+    # value-required columns.
+    exists_statement = (
+        "SELECT 1 FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        f"WHERE {where_relation}"
+    )
+    statement = (
+        "SELECT a.attname "
+        "FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+        f"WHERE {where_relation} "
+        "AND a.attnum > 0 AND NOT a.attisdropped "
+        "AND a.attnotnull AND NOT a.atthasdef AND a.attidentity = '' "
+        "ORDER BY a.attnum"
+    )
+    try:
+        connection = connection_factory()
+    except Exception:  # noqa: BLE001 - cannot connect -> unknown
+        return None
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        cursor.execute(exists_statement, params)
+        if cursor.fetchone() is None:
+            return None  # relation not found -> unknown, not "no required columns"
+        cursor.execute(statement, params)
+        return [str(row[0]) for row in cursor.fetchall() if row and row[0]]
+    except Exception:  # noqa: BLE001 - unreadable catalog -> unknown, never a guess
+        return None
+    finally:
+        if cursor is not None:
+            _safe_close(cursor)
+        _safe_close(connection)
+
+
 def max_pk_target(
     pk_by_table: dict[str, str],
     *,

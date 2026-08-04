@@ -21,12 +21,14 @@ from dsql_migrator.core.models import (
     PrerequisiteStatus,
     TableDef,
 )
+from dsql_migrator.core.models import ColumnDef
 from dsql_migrator.core.prerequisites import (
     PrerequisiteChecker,
     check_binlog_row_format,
     check_gtid_mode,
     check_replication_grants,
     check_table_primary_key,
+    check_target_columns_loadable,
 )
 
 
@@ -64,11 +66,19 @@ class _FakeSource:
 
 class _FakeTarget:
     def __init__(
-        self, *, reachable: bool = True, iam_ok: bool = True, existing: set[str] | None = None
+        self,
+        *,
+        reachable: bool = True,
+        iam_ok: bool = True,
+        existing: set[str] | None = None,
+        required_without_default: dict[str, list[str]] | None = None,
     ) -> None:
         self._reachable = reachable
         self._iam_ok = iam_ok
         self._existing = existing if existing is not None else set()
+        # Per-table value-required columns (NOT NULL, no default, non-identity).
+        # Default empty so existing tests see a clean columns check.
+        self._required_without_default = required_without_default or {}
 
     def reachable(self) -> bool:
         return self._reachable
@@ -78,6 +88,9 @@ class _FakeTarget:
 
     def relation_exists(self, qualified_name: str) -> bool:
         return qualified_name in self._existing
+
+    def required_columns_without_default(self, qualified_name: str):
+        return self._required_without_default.get(qualified_name, [])
 
 
 class _FakeMsk:
@@ -94,6 +107,100 @@ class _FakeMsk:
 
 def _table(name: str, *, pk: bool = True) -> TableDef:
     return TableDef(name=name, primary_key=["id"] if pk else [])
+
+
+def _table_with_columns(name: str, columns: list[str]) -> TableDef:
+    return TableDef(
+        name=name,
+        primary_key=["id"],
+        columns=[ColumnDef(name=c, mysql_type="int") for c in columns],
+    )
+
+
+def test_columns_loadable_fails_only_for_a_required_column_absent_from_source() -> None:
+    """The core rule: flag only columns the source cannot fill.
+
+    A user added `added_notnull` to the target DDL in Schema Conversion. It is NOT
+    NULL with no default and does not exist on the source, so Full Load -- which
+    inserts only source columns -- would hit a not-null violation partway through.
+    That must FAIL before the load; `id`/`name`, which the source supplies, must not.
+    """
+    table = _table_with_columns("ecommerce.orders", ["id", "name"])
+
+    result = check_target_columns_loadable(
+        table,
+        # Target's value-required columns: id (from source, fine) + added_notnull
+        # (target-only, unfillable).
+        target_required_without_default=["id", "added_notnull"],
+    )
+
+    assert result.status is PrerequisiteStatus.FAIL
+    assert result.required is True
+    assert "added_notnull" in result.detail
+    # A source-backed required column must never be named as the problem.
+    assert "`id`" not in result.detail and "`name`" not in result.detail
+
+
+def test_columns_loadable_passes_when_extra_columns_can_take_an_absent_value() -> None:
+    # Nullable / defaulted / identity target-only columns are NOT value-required, so
+    # they never reach this check's input -- the load fills them with NULL/default.
+    # Only source-backed required columns remain, which are fine.
+    table = _table_with_columns("t", ["id", "name"])
+
+    result = check_target_columns_loadable(
+        table, target_required_without_default=["id"]
+    )
+
+    assert result.status is PrerequisiteStatus.PASS
+
+
+def test_columns_loadable_passes_when_target_is_unreadable() -> None:
+    # None = target missing/unreadable. That is TARGET_SCHEMA_READY's failure to
+    # report; this check must not double-fail on the same cause.
+    table = _table_with_columns("t", ["id"])
+
+    result = check_target_columns_loadable(table, target_required_without_default=None)
+
+    assert result.status is PrerequisiteStatus.PASS
+
+
+def test_columns_loadable_runs_per_selected_table_in_the_full_report() -> None:
+    """End to end through the checker: the new check appears per table and gates.
+
+    orders has a target-only NOT NULL column; users does not. The report must FAIL
+    orders' TARGET_COLUMNS_LOADABLE and PASS users', and the overall report must not
+    be proceed-able.
+    """
+    tables = [
+        _table_with_columns("ecommerce.orders", ["id"]),
+        _table_with_columns("ecommerce.users", ["id"]),
+    ]
+    target = _FakeTarget(
+        existing={"ecommerce.orders", "ecommerce.users"},
+        required_without_default={
+            "ecommerce.orders": ["id", "added_notnull"],  # added_notnull unfillable
+            "ecommerce.users": ["id"],  # source-backed only
+        },
+    )
+    checker = PrerequisiteChecker(source_probe=_FakeSource(), target_probe=target)
+
+    report = checker.check(
+        PrerequisiteCheckRequest(
+            mode=MigrationMode.FULL_LOAD,
+            tables=[t.name for t in tables],
+        ),
+        tables=tables,
+    )
+
+    orders = _result(
+        report, PrerequisiteCheckId.TARGET_COLUMNS_LOADABLE, "ecommerce.orders"
+    )
+    users = _result(
+        report, PrerequisiteCheckId.TARGET_COLUMNS_LOADABLE, "ecommerce.users"
+    )
+    assert orders.status is PrerequisiteStatus.FAIL
+    assert users.status is PrerequisiteStatus.PASS
+    assert report.can_proceed is False
 
 
 def _result(report, check_id: PrerequisiteCheckId, target: str | None = None):

@@ -80,6 +80,17 @@ class TargetProbe(Protocol):
     def relation_exists(self, qualified_name: str) -> bool:
         """Return whether the target relation for ``qualified_name`` exists."""
 
+    def required_columns_without_default(
+        self, qualified_name: str
+    ) -> Optional[Sequence[str]]:
+        """Return the target's value-required columns, or ``None`` if unreadable.
+
+        Value-required = ``NOT NULL``, no ``DEFAULT``, not an identity column. Used
+        by :func:`check_target_columns_loadable`. ``None`` means the target could not
+        be read (missing table / catalog error), which the check treats as "not my
+        failure to own" (TARGET_SCHEMA_READY reports it).
+        """
+
 
 class MskProbe(Protocol):
     """Read-only availability probe for the CDC infrastructure (CDC mode only)."""
@@ -214,6 +225,75 @@ def check_target_schema_ready(table: TableDef, exists: bool) -> PrerequisiteResu
         remediation=""
         if exists
         else f"Apply converted DDL for `{table.name}` in Step 2 (Schema Conversion) first.",
+    )
+
+
+def check_target_columns_loadable(
+    table: TableDef, target_required_without_default: Optional[Sequence[str]]
+) -> PrerequisiteResult:
+    """FAIL when a target column is value-required but the source can't fill it.
+
+    Full Load builds its INSERT column list from the SOURCE table, so a column that
+    exists ONLY on the target (e.g. one the user added while editing the target DDL
+    in Schema Conversion) is never named in an INSERT. That is fine unless the column
+    is ``NOT NULL`` with no default -- then the row has no value for it and the load
+    fails with a not-null violation partway through, after the target already holds
+    partial data. This check moves that certain failure to a pre-load gate.
+
+    ``target_required_without_default`` is the target's value-required columns (NOT
+    NULL, no DEFAULT, not identity) from
+    :func:`~dsql_migrator.core.target_introspector.target_required_columns_without_default`.
+    The blocking set is those MINUS the source columns: a value-required column that
+    also exists on the source is filled by the INSERT and is fine; only ones absent
+    from the source are unfillable. ``None`` means the target could not be read
+    (missing table or catalog error) -- that is TARGET_SCHEMA_READY's job to report,
+    so this check PASSes rather than double-failing on the same cause.
+
+    Nullable or defaulted extra columns are deliberately NOT flagged: verified on a
+    live DSQL cluster, the load succeeds and they take NULL or their default.
+    """
+    if target_required_without_default is None:
+        # Unknown target (missing/unreadable) -> not this check's failure to own.
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.TARGET_COLUMNS_LOADABLE,
+            title="Target columns can be loaded from the source",
+            status=PrerequisiteStatus.PASS,
+            required=True,
+            target=table.name,
+            detail="Target columns not checked (target schema not readable yet).",
+            remediation="",
+        )
+    source_columns = {column.name for column in table.columns}
+    unfillable = [
+        name for name in target_required_without_default if name not in source_columns
+    ]
+    if not unfillable:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.TARGET_COLUMNS_LOADABLE,
+            title="Target columns can be loaded from the source",
+            status=PrerequisiteStatus.PASS,
+            required=True,
+            target=table.name,
+            detail="Every value-required target column is present on the source.",
+            remediation="",
+        )
+    listed = ", ".join(f"`{name}`" for name in unfillable)
+    return PrerequisiteResult(
+        check_id=PrerequisiteCheckId.TARGET_COLUMNS_LOADABLE,
+        title="Target columns can be loaded from the source",
+        status=PrerequisiteStatus.FAIL,
+        required=True,
+        target=table.name,
+        detail=(
+            f"Target has NOT NULL column(s) with no default the source cannot fill: "
+            f"{listed}. Full Load inserts only source columns, so the load would fail "
+            "with a not-null violation partway through."
+        ),
+        remediation=(
+            f"For `{table.name}`, make each of these columns nullable or give it a "
+            "DEFAULT in Step 2 (Schema Conversion), or drop the column if it is not "
+            "needed on the target. Columns present on the source are unaffected."
+        ),
     )
 
 
@@ -395,10 +475,18 @@ class PrerequisiteChecker:
         results.append(check_target_dsql_reachable(self._target.reachable()))
         results.append(check_target_iam_auth(self._target.iam_auth()))
         for table in tables:
+            exists = self._target.relation_exists(table.name)
+            results.append(check_target_schema_ready(table, exists))
+            # Only meaningful once the table exists; when it does not, pass None so
+            # the columns check defers to TARGET_SCHEMA_READY rather than repeating
+            # the same "apply DDL first" failure.
+            required_without_default = (
+                self._target.required_columns_without_default(table.name)
+                if exists
+                else None
+            )
             results.append(
-                check_target_schema_ready(
-                    table, self._target.relation_exists(table.name)
-                )
+                check_target_columns_loadable(table, required_without_default)
             )
 
         # CDC-only checks (SKIP in Full Load).
