@@ -535,6 +535,52 @@ class CdcStackDeployer:
         out.sort(key=lambda x: x[0])
         return out
 
+    def seeder_eni_count(self, stack_name: str) -> Optional[int]:
+        """Count the in-VPC seeder Lambda's still-present ENIs, or ``None`` if unknown.
+
+        During a cdc-stack DELETE, ``MskCluster`` cannot go until AWS reclaims the
+        offset-seeder Lambda's ENIs on the connector security group, which takes
+        ~15-20 min and produces NO CloudFormation events -- so the deploy log looks
+        frozen through the longest part of the teardown. Counting these ENIs each poll
+        lets the progress loop report what it is actually waiting on ("still reclaiming
+        N seeder network interface(s)") and detect when they clear.
+
+        Resolves the connector security group from the stack's own resources (the
+        stack still exists while the delete runs), then counts interface-type
+        ``lambda`` ENIs on it. Read-only and best-effort: ``None`` on any error (the
+        caller simply skips the line that poll), ``0`` when the SG is resolvable but
+        holds no seeder ENI (reclaimed / never created).
+        """
+        try:
+            cfn = self._client("cloudformation")
+            resources = cfn.describe_stack_resources(StackName=stack_name).get(
+                "StackResources", []
+            ) or []
+        except Exception:  # noqa: BLE001 - stack may be gone / transient read
+            return None
+        sg_id = next(
+            (
+                r.get("PhysicalResourceId")
+                for r in resources
+                if r.get("LogicalResourceId") == "ConnectorSecurityGroup"
+                and r.get("PhysicalResourceId")
+            ),
+            None,
+        )
+        if not sg_id:
+            return None
+        try:
+            ec2 = self._client("ec2")
+            enis = ec2.describe_network_interfaces(
+                Filters=[
+                    {"Name": "group-id", "Values": [sg_id]},
+                    {"Name": "interface-type", "Values": ["lambda"]},
+                ]
+            ).get("NetworkInterfaces", []) or []
+        except Exception:  # noqa: BLE001 - ENI read is advisory
+            return None
+        return len(enis)
+
     def find_unsupported_azs(self, stack_name: str) -> set[str]:
         """Scan stack events for an MSK "unsupported availability zones" failure.
 
@@ -1030,6 +1076,7 @@ def _wait_stack_settles(
     interval: float,
     vanish_ok: bool = False,
     connector_for_log: Optional[str] = None,
+    watch_seeder_enis: bool = False,
 ) -> Optional[str]:
     """Stream stack events to the log and block until the stack settles.
 
@@ -1049,6 +1096,10 @@ def _wait_stack_settles(
     deadline = _monotonic_deadline(timeout)
     seen_until = since
     saw_partition_quota = False
+    # Last-reported seeder-ENI count, so the delete path logs only on CHANGE (a line
+    # every 30s poll would drown the stack events). ``-2`` is an unused sentinel so the
+    # first real reading (including 0) always prints.
+    last_eni_count = -2
     while True:
         if driver.cancelled:
             return None
@@ -1062,6 +1113,22 @@ def _wait_stack_settles(
             seen_until = ts
             if _is_partition_quota_message(msg):
                 saw_partition_quota = True
+        # Delete only: report the seeder-ENI reclamation that CloudFormation is silent
+        # about, so the long tail of the teardown does not look frozen. Logged on
+        # change: "still reclaiming N …" while any remain, then "released" at zero.
+        if watch_seeder_enis:
+            count = deployer.seeder_eni_count(stack_name)
+            if count is not None and count != last_eni_count:
+                if count > 0:
+                    noun = "interface" if count == 1 else "interfaces"
+                    driver.log(
+                        f"Waiting for AWS to reclaim {count} seeder network "
+                        f"{noun} (no CloudFormation event until done)…"
+                    )
+                elif last_eni_count > 0:
+                    # Only announce release if we had previously seen some pending.
+                    driver.log("Seeder network interfaces released.")
+                last_eni_count = count
         status = deployer.stack_status(stack_name)
         if status is None:
             if vanish_ok:
@@ -1712,6 +1779,7 @@ def run_cdc_delete(
                 deployer, stack_name, driver=driver, since=since,
                 timeout=delete_timeout_seconds, interval=poll_interval_seconds,
                 vanish_ok=True,
+                watch_seeder_enis=True,
             )
         except CdcDeployError:
             # DELETE_FAILED is usually the in-VPC offset-seeder Lambda's leftover

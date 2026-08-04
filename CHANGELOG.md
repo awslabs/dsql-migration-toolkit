@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.251
+
+### Added
+
+- **The CDC infrastructure delete now reports seeder network-interface reclamation in the
+  deploy log.** The longest part of a teardown is AWS releasing the in-VPC offset-seeder
+  Lambda's ENIs before the MSK cluster can go — ~15-20 min during which CloudFormation emits
+  no events, so the log looked frozen. The delete wait now polls those ENIs (read-only) and
+  logs on change: "Waiting for AWS to reclaim N seeder network interface(s)…" while any
+  remain, then "Seeder network interfaces released." once they clear — so the quiet stretch
+  shows what it is actually waiting on. The app stack's CDC deploy role gains
+  `ec2:DescribeNetworkInterfaces` (read-only) for this; no CDC-infrastructure redeploy is
+  needed.
+
 ## v0.1.250
 
 ### Fixed

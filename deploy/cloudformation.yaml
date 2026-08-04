@@ -161,7 +161,7 @@ Parameters:
 
   ContainerImageUri:
     Type: String
-    Default: public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.250
+    Default: public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.251
     Description: >
       App container image URI. Defaults to the published ECR Public image, so a
       normal deploy needs NO image build -- Fargate pulls it directly (works from
@@ -627,6 +627,14 @@ Resources:
                   - ec2:DescribeSubnets
                   - ec2:DescribeRouteTables
                   - ec2:DescribeVpcs
+                  # DescribeNetworkInterfaces: during a CDC infrastructure DELETE, the
+                  # in-VPC offset-seeder Lambda's ENIs are reclaimed by AWS over
+                  # ~15-20 min before MskCluster can be removed, and CloudFormation
+                  # emits no events for that wait -- so the deploy log looks frozen.
+                  # Reading the seeder's ENIs lets the delete progress report "still
+                  # reclaiming N ENIs" / "ENIs released" and fill that gap. Read-only,
+                  # no resource-level scoping (like the other Describe* above).
+                  - ec2:DescribeNetworkInterfaces
                 Resource: "*"
               - Sid: CallerIdentity
                 Effect: Allow

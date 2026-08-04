@@ -92,6 +92,9 @@ class _FakeDeployer:
         events=None,
         # find_unsupported_azs: AZ names MSK rejected (reactive-retry trigger)
         unsupported_azs=None,
+        # seeder_eni_count: list of counts consumed left-to-right (last sticks); the
+        # delete wait logs the seeder-ENI reclamation from these.
+        seeder_eni_counts=None,
     ):
         self._discover_error = discover_error
         self._discovery_params = discovery_params or {}
@@ -110,6 +113,7 @@ class _FakeDeployer:
         self._events = list(events or [])
         self._events_emitted = False
         self._unsupported_azs = set(unsupported_azs or set())
+        self._seeder_eni_counts = list(seeder_eni_counts or [])
         self.calls: list[str] = []
         self.updates: list[list[tuple[str, str]]] = []
         self.created: list[tuple[str, list[tuple[str, str]]]] = []
@@ -175,6 +179,14 @@ class _FakeDeployer:
         if len(self._stack_statuses) > 1:
             return self._stack_statuses.pop(0)
         return self._stack_statuses[0]
+
+    def seeder_eni_count(self, stack_name):
+        # Default: unknown (None) so the delete wait logs no ENI line unless a test
+        # opts in by setting self._seeder_eni_counts to a drainable sequence.
+        seq = getattr(self, "_seeder_eni_counts", None)
+        if not seq:
+            return None
+        return seq.pop(0) if len(seq) > 1 else seq[0]
 
     def connector_state(self, connector_name):
         seq = self._connector_states.get(connector_name)
@@ -749,6 +761,91 @@ def test_delete_when_already_deleting_skips_submit_and_waits() -> None:
     assert all(s == "DONE" for s in _statuses(handle).values())
     assert "delete_stack" not in deployer.calls  # already in flight -> no re-submit
     assert any("already in progress" in m for m in logs)
+
+
+def test_delete_logs_seeder_eni_reclamation() -> None:
+    """The delete wait must report seeder-ENI reclamation, which CFN is silent about.
+
+    CloudFormation emits no event during the ~15-20 min AWS spends releasing the
+    in-VPC seeder Lambda's ENIs before MskCluster can go, so the log looked frozen. The
+    wait now polls the count and logs the wait, then the release.
+    """
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    existing = CdcStackDiscovery("CREATE_COMPLETE", {}, True)
+    # Two ENIs pending for two polls, then released, then the stack vanishes.
+    deployer = _FakeDeployer(
+        existing=existing,
+        stack_statuses=("DELETE_IN_PROGRESS", "DELETE_IN_PROGRESS", None),
+        seeder_eni_counts=[2, 2, 0],
+    )
+    run_cdc_delete(
+        handle, stack_name=STACK, deployer=deployer, on_log=on_log,
+        sleep=lambda _s: None, delete_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    joined = " ".join(logs)
+    assert "reclaim 2 seeder network interfaces" in joined
+    assert "Seeder network interfaces released." in joined
+
+
+def test_delete_eni_wait_logged_once_per_change_not_every_poll() -> None:
+    # A line every 30s poll would drown the stack events; log only on CHANGE.
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    existing = CdcStackDiscovery("CREATE_COMPLETE", {}, True)
+    deployer = _FakeDeployer(
+        existing=existing,
+        stack_statuses=("DELETE_IN_PROGRESS",) * 4 + (None,),
+        seeder_eni_counts=[1, 1, 1, 1, 0],
+    )
+    run_cdc_delete(
+        handle, stack_name=STACK, deployer=deployer, on_log=on_log,
+        sleep=lambda _s: None, delete_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    waiting_lines = [m for m in logs if "reclaim 1 seeder network interface" in m]
+    assert len(waiting_lines) == 1, f"expected one waiting line, got {waiting_lines}"
+
+
+def test_delete_no_release_line_when_enis_were_never_pending() -> None:
+    """"Released" must only fire after we actually saw some pending.
+
+    If the count is 0 from the first poll (a stack with no seeder, or already
+    reclaimed), announcing "released" would be a message about something that never
+    happened. The line is gated on having previously seen a positive count.
+    """
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    existing = CdcStackDiscovery("CREATE_COMPLETE", {}, True)
+    deployer = _FakeDeployer(
+        existing=existing,
+        stack_statuses=("DELETE_IN_PROGRESS", None),
+        seeder_eni_counts=[0, 0],  # never any pending
+    )
+    run_cdc_delete(
+        handle, stack_name=STACK, deployer=deployer, on_log=on_log,
+        sleep=lambda _s: None, delete_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    assert not any("released" in m.lower() for m in logs), (
+        "must not claim ENIs were released when none were ever pending"
+    )
+
+
+def test_delete_without_eni_data_logs_no_eni_line() -> None:
+    # seeder_eni_count returning None (SG unresolved / read error) must not emit a
+    # line at all -- absence of data is not "released".
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    existing = CdcStackDiscovery("CREATE_COMPLETE", {}, True)
+    deployer = _FakeDeployer(
+        existing=existing,
+        stack_statuses=("DELETE_IN_PROGRESS", None),
+        seeder_eni_counts=None,  # -> seeder_eni_count returns None
+    )
+    run_cdc_delete(
+        handle, stack_name=STACK, deployer=deployer, on_log=on_log,
+        sleep=lambda _s: None, delete_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    assert not any("seeder network interface" in m for m in logs)
 
 
 def test_delete_cleans_up_source_secret_when_region_given(monkeypatch) -> None:

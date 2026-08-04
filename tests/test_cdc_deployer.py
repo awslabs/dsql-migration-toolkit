@@ -788,3 +788,71 @@ def test_cdc_wait_heartbeats_so_watchdog_does_not_reap_healthy_job() -> None:
     assert job.status == "DONE"
     assert manager.get_error(job_id) is None
     manager.shutdown()
+
+
+def test_seeder_eni_count_counts_lambda_enis_on_the_connector_sg() -> None:
+    """Resolve ConnectorSecurityGroup from the stack, count its lambda ENIs.
+
+    This is what lets the delete wait report the seeder-ENI reclamation CloudFormation
+    is silent about.
+    """
+    client = _FakeClient(
+        {
+            "describe_stack_resources": {
+                "StackResources": [
+                    {
+                        "LogicalResourceId": "ConnectorSecurityGroup",
+                        "ResourceType": "AWS::EC2::SecurityGroup",
+                        "PhysicalResourceId": "sg-xyz",
+                        "ResourceStatus": "DELETE_IN_PROGRESS",
+                    },
+                ]
+            },
+            "describe_network_interfaces": {
+                "NetworkInterfaces": [
+                    {"NetworkInterfaceId": "eni-1"},
+                    {"NetworkInterfaceId": "eni-2"},
+                ]
+            },
+        }
+    )
+    assert _dep(client).seeder_eni_count("mysql-dsql-cdc-stack") == 2
+    # The ENI read is scoped to the SG AND to lambda interfaces only.
+    dni = next(c for c in client.calls if c[0] == "describe_network_interfaces")
+    filters = {f["Name"]: f["Values"] for f in dni[1]["Filters"]}
+    assert filters["group-id"] == ["sg-xyz"]
+    assert filters["interface-type"] == ["lambda"]
+
+
+def test_seeder_eni_count_is_zero_once_reclaimed() -> None:
+    client = _FakeClient(
+        {
+            "describe_stack_resources": {
+                "StackResources": [
+                    {
+                        "LogicalResourceId": "ConnectorSecurityGroup",
+                        "ResourceType": "AWS::EC2::SecurityGroup",
+                        "PhysicalResourceId": "sg-xyz",
+                        "ResourceStatus": "DELETE_IN_PROGRESS",
+                    },
+                ]
+            },
+            "describe_network_interfaces": {"NetworkInterfaces": []},
+        }
+    )
+    assert _dep(client).seeder_eni_count("mysql-dsql-cdc-stack") == 0
+
+
+def test_seeder_eni_count_is_none_when_sg_unresolved() -> None:
+    # No ConnectorSecurityGroup in the stack (or stack gone) -> unknown, not 0, so the
+    # wait loop does not mistake "can't tell" for "released".
+    client = _FakeClient({"describe_stack_resources": {"StackResources": []}})
+    assert _dep(client).seeder_eni_count("mysql-dsql-cdc-stack") is None
+
+
+def test_seeder_eni_count_is_none_on_read_error() -> None:
+    client = _FakeClient(
+        {},
+        raise_on={"describe_stack_resources": RuntimeError("throttled")},
+    )
+    assert _dep(client).seeder_eni_count("mysql-dsql-cdc-stack") is None

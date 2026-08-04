@@ -5,6 +5,19 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.251
+
+### 追加
+
+- **CDC インフラ削除時に seeder ネットワークインターフェースの回収状況を deploy log に表示します。**
+  削除で最も時間がかかる区間は、MSK クラスターが消える前に AWS が VPC 内 offset-seeder Lambda の
+  ENI を解放する時間 (約 15-20 分) で、その間 CloudFormation はイベントを出さないため、ログが停止
+  したように見えていました。現在は削除待機中にその ENI を読み取り専用でポーリングし、変化時のみ
+  ログ出力します — 残っている間は「Waiting for AWS to reclaim N seeder network interface(s)…」、
+  すべて解放されると「Seeder network interfaces released.」— そのため静かな区間でも何を待っているかが
+  分かります。このためアプリスタックの CDC deploy role に `ec2:DescribeNetworkInterfaces`
+  (読み取り専用) を追加しました。CDC インフラの再デプロイは不要です。
+
 ## v0.1.250
 
 ### 修正
