@@ -1562,7 +1562,10 @@ def migration_status_badge(
     maintained independently (set to IN_PROGRESS when connectors are detected). That step
     never reaches DONE by design -- CDC is continuous replication with no completion, and
     it ends only through an explicit Stop/Delete -- so this badge moves between
-    NOT_STARTED and IN_PROGRESS, which is what CDC actually does.
+    NOT_STARTED and IN_PROGRESS, which is what CDC actually does. Both directions are
+    real: ``_sync_cdc_step_status`` tracks the step to whether the connectors currently
+    exist, so a Stop CDC / infrastructure Delete drops it back to NOT_STARTED instead of
+    leaving "CDC: IN_PROGRESS" pinned on a pipeline that no longer has any connectors.
 
     Full load only, and the combined type before CDC goes live, keep reading the
     ``full_load`` step: there the label and the value describe the same phase.

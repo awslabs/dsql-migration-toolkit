@@ -13359,3 +13359,139 @@ def test_lifecycle_card_shows_the_deploy_form_once_redeploy_is_confirmed() -> No
     assert "Provide your VPC" in joined, (
         "confirming redeploy must reveal the infrastructure form"
     )
+
+
+class _WorkflowSess:
+    """Session double that holds a real WorkflowState so status writes are observable."""
+
+    target_config = None
+    aws_profile = None
+
+    def __init__(self, cdc_status=None):
+        from dsql_migrator.core.models import WorkflowState
+        from dsql_migrator.ui.workflow import WorkflowStep, with_status
+
+        self.workflow = WorkflowState()
+        if cdc_status is not None:
+            self.workflow = with_status(self.workflow, WorkflowStep.CDC, cdc_status)
+
+    def set_workflow(self, workflow) -> None:
+        self.workflow = workflow
+
+
+def _discover_with_connectors(names, *, cdc_status):
+    """Run the pre-wired discovery branch with ``names`` present on AWS."""
+    from dsql_migrator.ui.data_migration._status import _ensure_cdc_controller
+
+    state = DataMigrationState()
+
+    class _Ctl:
+        def list_connectors(self):
+            return [{"connectorName": n, "connectorState": "RUNNING"} for n in names]
+
+    state.set_cdc_controller(_Ctl())
+    state._cdc_discovery_monotonic = None
+    sess = _WorkflowSess(cdc_status)
+    _ensure_cdc_controller(state, sess)
+    return sess, state
+
+
+def test_cdc_step_drops_back_to_not_started_when_the_connectors_are_gone() -> None:
+    """A Stop CDC / infrastructure Delete must move the badge off IN_PROGRESS.
+
+    Promotion was one-way: detected connectors set NOT_STARTED -> IN_PROGRESS and
+    nothing moved it back, so after a teardown the Data Migration badge kept reading
+    "CDC: IN_PROGRESS" for a pipeline with no connectors -- and since the workflow is
+    persisted, the stale value returned on every restore.
+    """
+    from dsql_migrator.ui.workflow import WorkflowStep, get_status
+
+    # Was streaming; AWS now reports no connectors of mine (post Stop/Delete).
+    sess, state = _discover_with_connectors([], cdc_status=StepStatus.IN_PROGRESS)
+
+    assert state.cdc_connector_names == []
+    assert get_status(sess.workflow, WorkflowStep.CDC) is StepStatus.NOT_STARTED
+
+
+def test_cdc_step_is_promoted_while_connectors_exist() -> None:
+    # The control for the test above: detection must still promote, or the downgrade
+    # would just be a badge that never lights up.
+    from dsql_migrator.core.cdc import cdc_expected_connector_names
+    from dsql_migrator.ui.workflow import WorkflowStep, get_status
+
+    src, sink = cdc_expected_connector_names(DataMigrationState().cdc_stack_name)
+    sess, state = _discover_with_connectors(
+        [src, sink], cdc_status=StepStatus.NOT_STARTED
+    )
+
+    assert state.cdc_connector_names == [src, sink]
+    assert get_status(sess.workflow, WorkflowStep.CDC) is StepStatus.IN_PROGRESS
+
+
+def test_cdc_step_downgrade_does_not_clobber_a_recorded_failure() -> None:
+    """A deliberate FAILED must survive a routine discovery pass.
+
+    The downgrade exists to undo this function's OWN promotion, not to overwrite a
+    terminal status some other path recorded -- otherwise a failed CDC start would be
+    quietly relabelled "not started" on the next render.
+    """
+    from dsql_migrator.ui.workflow import WorkflowStep, get_status
+
+    sess, _ = _discover_with_connectors([], cdc_status=StepStatus.FAILED)
+
+    assert get_status(sess.workflow, WorkflowStep.CDC) is StepStatus.FAILED
+
+
+def test_cdc_only_badge_follows_the_step_back_down_after_a_teardown() -> None:
+    """End-to-end on the badge itself: CDC only must not read IN_PROGRESS post-Stop.
+
+    The badge is what the user actually sees, so pin the pairing of label and value
+    rather than only the underlying step.
+    """
+    from dsql_migrator.ui.data_migration._models import migration_status_badge
+
+    label, status = migration_status_badge(
+        MigrationType.CDC_ONLY,
+        # A Full Load ran earlier in this session and is DONE; that must not leak in.
+        full_load_status=StepStatus.DONE,
+        cdc_status=StepStatus.NOT_STARTED,
+        cdc_streaming=False,
+    )
+
+    assert label == "CDC"
+    assert status is StepStatus.NOT_STARTED
+
+
+def test_cdc_step_drops_back_on_a_freshly_built_controller_too() -> None:
+    """The downgrade must also happen on the path that BUILDS the controller.
+
+    A restored session has no controller yet, so its first render takes the
+    build-then-list branch -- exactly when a stale persisted "CDC: IN_PROGRESS" is on
+    screen. Covering only the pre-wired branch left that case broken.
+    """
+    from dsql_migrator.ui.data_migration import _status
+    from dsql_migrator.ui.workflow import WorkflowStep, get_status
+
+    class _Ctl:
+        def list_connectors(self):
+            return []  # nothing of mine on AWS (post Stop/Delete)
+
+    class _Target:
+        region = "ap-northeast-2"
+
+    state = DataMigrationState()
+    state._cdc_discovery_monotonic = None
+    sess = _WorkflowSess(StepStatus.IN_PROGRESS)
+    sess.target_config = _Target()
+
+    import dsql_migrator.core.msk_connect_controller as _mcc
+
+    original = _mcc.build_msk_connect_controller
+    _mcc.build_msk_connect_controller = lambda *_a, **_k: _Ctl()
+    try:
+        _status._ensure_cdc_controller(state, sess)
+    finally:
+        _mcc.build_msk_connect_controller = original
+
+    assert state.cdc_controller is not None, "the controller must still be cached"
+    assert get_status(sess.workflow, WorkflowStep.CDC) is StepStatus.NOT_STARTED

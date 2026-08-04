@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.240
+
+### Fixed
+
+- **The Data Migration badge stayed on "CDC: IN_PROGRESS" after Stop CDC or an
+  infrastructure Delete.** Detecting connectors promoted the CDC workflow step
+  NOT_STARTED → IN_PROGRESS, but nothing ever moved it back, so once the connectors were
+  gone the badge still claimed CDC was running — and because the workflow is persisted,
+  the stale value came back on every session restore. The step now tracks whether the
+  connectors actually exist, in both directions: a teardown drops it to NOT_STARTED,
+  which is the honest resting state (nothing is streaming, and Start CDC is on offer
+  again). CDC still has no terminal DONE — it is continuous replication that ends only
+  by an explicit Stop/Delete. A FAILED recorded elsewhere is left alone rather than
+  being relabelled by a routine discovery pass.
+
 ## v0.1.239
 
 ### Fixed

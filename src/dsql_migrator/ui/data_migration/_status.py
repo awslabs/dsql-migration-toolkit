@@ -921,6 +921,9 @@ def _ensure_cdc_controller(migration_state, session) -> None:
             )
         migration_state.set_cdc_connector_names(names)
         migration_state.set_cdc_connector_running_names(running)
+        # This is the path a Stop/Delete lands on (the controller is already wired), so
+        # it is where the step status has to be able to go back DOWN.
+        _sync_cdc_step_status(session, streaming=bool(names))
         return
     target = getattr(session, "target_config", None)
     if target is None:
@@ -944,20 +947,46 @@ def _ensure_cdc_controller(migration_state, session) -> None:
     # controller existing -- so an empty match keeps the Start action visible.
     migration_state.set_cdc_controller(controller)
     if not names:
+        # No connectors of mine: this is also how a Stop/Delete reads once it lands,
+        # so the step status must follow (see _sync_cdc_step_status).
+        _sync_cdc_step_status(session, streaming=False)
         return
     migration_state.set_cdc_connector_names(names)
     migration_state.set_cdc_connector_running_names(running)
-    # My connectors are deployed and detected -> the CDC step is underway. Advance
-    # the workflow stepper to IN_PROGRESS once. CDC is continuous so it has no
-    # terminal DONE here -- "stop" (delete) is a later explicit action.
+    _sync_cdc_step_status(session, streaming=True)
+
+
+def _sync_cdc_step_status(session, *, streaming: bool) -> None:
+    """Track the CDC workflow step to whether MY connectors currently exist.
+
+    Promotion used to be one-way: detected connectors moved the step
+    NOT_STARTED -> IN_PROGRESS and nothing ever moved it back, so after a Stop CDC (or
+    a full infrastructure Delete) the Data Migration badge kept reading "CDC:
+    IN_PROGRESS" for a pipeline with no connectors at all -- and because the workflow
+    is persisted, that stale value came back on every restore. The badge's own contract
+    is that it moves BETWEEN NOT_STARTED and IN_PROGRESS, which needs both directions.
+
+    CDC has no terminal DONE (it is continuous replication that ends only by an
+    explicit Stop/Delete), so the honest resting state after a teardown is NOT_STARTED:
+    nothing is streaming, and Start CDC is the action on offer again.
+
+    Only ever moves between those two values -- a FAILED or DONE recorded elsewhere is
+    left alone rather than being overwritten by a routine discovery pass. Best-effort:
+    a workflow write must never break a render.
+    """
+    want = StepStatus.IN_PROGRESS if streaming else StepStatus.NOT_STARTED
     try:
-        if get_status(session.workflow, WorkflowStep.CDC) is StepStatus.NOT_STARTED:
-            session.set_workflow(
-                with_status(
-                    session.workflow, WorkflowStep.CDC, StepStatus.IN_PROGRESS
-                )
-            )
-    except Exception:  # noqa: BLE001 - workflow advance is best-effort
+        current = get_status(session.workflow, WorkflowStep.CDC)
+        if current is want:
+            return
+        # Downgrade only from the status this function itself sets; never clobber a
+        # FAILED/DONE that some other path recorded deliberately.
+        if not streaming and current is not StepStatus.IN_PROGRESS:
+            return
+        if streaming and current is not StepStatus.NOT_STARTED:
+            return
+        session.set_workflow(with_status(session.workflow, WorkflowStep.CDC, want))
+    except Exception:  # noqa: BLE001 - workflow sync is best-effort
         pass
 
 
