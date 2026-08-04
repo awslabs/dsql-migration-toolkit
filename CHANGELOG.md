@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.246
+
+### Fixed
+
+- **"Accept quarantined rows & continue" left the red "Migration failed" banner on screen.**
+  Accepting the gap is the operator resolving that exact error — it marks Full Load DONE and
+  the step then reports "Full Load complete — with an accepted gap" — yet the raw
+  `FullLoadIncompleteError` stayed pinned above it. One screen carried three verdicts at once
+  (failed / complete-with-gap / DONE) and re-flagged as a problem something the operator had
+  already dealt with, including the instruction to "choose 'Accept quarantined rows &
+  continue'" they had just followed. The banner is now hidden once the gap is accepted, and
+  stays hidden across a migration-type switch (a resolved error is not carried-over context
+  either). Nothing is lost: the accepted-gap notice already names the dropped row count, the
+  affected tables and that Validation still reports the gap, and the error log still lists
+  every dropped row by primary key. Before acceptance the banner is unchanged — that is a
+  live failure and stays loud.
+
 ## v0.1.245
 
 ### Added

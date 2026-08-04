@@ -14125,3 +14125,99 @@ def test_cdc_notice_body_points_at_the_link_not_a_direction() -> None:
     assert "change the migration type above to " not in src, (
         "the copy should not tell the user to scroll up and find it themselves"
     )
+
+
+_QUARANTINE_ERROR = (
+    "FullLoadIncompleteError: Full Load incomplete: 1 of 7 table(s) did not fully "
+    "load. The target holds partial data -- 3 row(s) were QUARANTINED ..."
+)
+
+
+def test_accepting_the_quarantine_clears_the_migration_failed_banner() -> None:
+    """Accepting the gap RESOLVES this error, so the red banner must go.
+
+    Reported: after "Accept quarantined rows & continue" the step said "Full Load
+    complete — with an accepted gap" and the status said DONE, while the banner above
+    still said "Migration failed" — three verdicts on one screen, and the button's own
+    decision contradicted.
+    """
+    from dsql_migrator.ui.data_migration._models import stale_error_notice
+
+    assert (
+        stale_error_notice(
+            _QUARANTINE_ERROR,
+            migration_type=MigrationType.FULL_LOAD_AND_CDC,
+            error_migration_type=MigrationType.FULL_LOAD_AND_CDC,
+            quarantine_accepted=True,
+        )
+        is None
+    )
+
+
+def test_the_banner_still_shows_before_the_gap_is_accepted() -> None:
+    # The control: until the operator accepts, this IS a live failure and must be loud.
+    from dsql_migrator.ui.data_migration._models import stale_error_notice
+
+    notice = stale_error_notice(
+        _QUARANTINE_ERROR,
+        migration_type=MigrationType.FULL_LOAD_AND_CDC,
+        error_migration_type=MigrationType.FULL_LOAD_AND_CDC,
+        quarantine_accepted=False,
+    )
+    assert notice is not None
+    assert notice[0] == "error" and notice[1] == "Migration failed"
+
+
+def test_acceptance_hides_the_banner_even_across_a_type_switch() -> None:
+    """Accepted takes precedence over the carried-over demotion.
+
+    A resolved error is not "context from another type" either -- it is done. Without
+    this the user would switch to CDC only and meet the amber "Carried over from the
+    previous Full Load" for a gap they had already acknowledged.
+    """
+    from dsql_migrator.ui.data_migration._models import stale_error_notice
+
+    assert (
+        stale_error_notice(
+            _QUARANTINE_ERROR,
+            migration_type=MigrationType.CDC_ONLY,
+            error_migration_type=MigrationType.FULL_LOAD_AND_CDC,
+            quarantine_accepted=True,
+        )
+        is None
+    )
+
+
+def test_acceptance_defaults_to_false_so_the_banner_is_never_hidden_by_accident() -> None:
+    # Callers that predate the flag must keep the loud banner.
+    from dsql_migrator.ui.data_migration._models import stale_error_notice
+
+    notice = stale_error_notice(
+        _QUARANTINE_ERROR,
+        migration_type=MigrationType.FULL_LOAD_AND_CDC,
+        error_migration_type=MigrationType.FULL_LOAD_AND_CDC,
+    )
+    assert notice is not None and notice[0] == "error"
+
+
+def test_screen_passes_the_acceptance_flag_to_the_banner() -> None:
+    """Wiring: the predicate is useless if the screen never tells it about acceptance."""
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    src = inspect.getsource(dm.build_data_migration_screen)
+    tree = ast.parse(src.strip())
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and "stale_error_notice" in ast.unparse(node.func)
+        ):
+            kwargs = {kw.arg: ast.unparse(kw.value) for kw in node.keywords}
+            assert "quarantine_accepted" in kwargs, (
+                "the screen must pass the acceptance state to the banner"
+            )
+            assert "accept_quarantined_rows" in kwargs["quarantine_accepted"]
+            return
+    raise AssertionError("stale_error_notice call not found in the screen")

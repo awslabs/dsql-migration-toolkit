@@ -1587,6 +1587,7 @@ def stale_error_notice(
     *,
     migration_type: MigrationType,
     error_migration_type: Optional[MigrationType],
+    quarantine_accepted: bool = False,
 ) -> Optional[tuple[str, str, str]]:
     """Return ``(tone, header, body)`` for the failure notice, or None to hide it.
 
@@ -1606,8 +1607,21 @@ def stale_error_notice(
     ``error_migration_type`` is the type that was selected when the error was recorded;
     ``None`` means unknown (an older session), which is treated as "same type" so the
     behaviour is unchanged rather than silently softened.
+
+    ``quarantine_accepted`` hides the notice outright. "Accept quarantined rows &
+    continue" is the operator RESOLVING this exact error: it marks Full Load DONE and the
+    step then reports "Full Load complete -- with an accepted gap", which already names
+    the dropped row count, the affected tables, and that Validation still reports the gap.
+    Leaving the raw ``FullLoadIncompleteError`` above that as a red "Migration failed"
+    contradicted the very decision the button records -- three verdicts on one screen
+    (failed / complete-with-gap / DONE) -- and re-flagged as a problem something the
+    operator had already dealt with. Nothing is lost by hiding it: the accepted-gap
+    notice carries the same facts in the resolved framing, and the error log still lists
+    every dropped row by primary key.
     """
     if not error:
+        return None
+    if quarantine_accepted:
         return None
     if error_migration_type is None or error_migration_type is migration_type:
         return ("error", "Migration failed", error)

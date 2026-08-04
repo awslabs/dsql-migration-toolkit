@@ -772,6 +772,9 @@ def build_data_migration_screen(
                     error,
                     migration_type=migration_type,
                     error_migration_type=migration_state.error_migration_type,
+                    # Accepting the quarantine RESOLVES this error; the step's own
+                    # "complete -- with an accepted gap" notice carries the facts.
+                    quarantine_accepted=migration_state.accept_quarantined_rows,
                 )
                 if notice is not None:
                     _tone, _header, _body = notice
