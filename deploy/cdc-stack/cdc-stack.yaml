@@ -605,6 +605,20 @@ Resources:
   # NOTE: no Glue Schema Registry -- the pipeline uses the built-in JSON converter
   # (schemas.enable=true), the spike's proven configuration. The Glue Avro converter
   # was dropped (it bloated the plugin by ~59 MiB x2 and pulled a conflicting SDK).
+  #
+  # TEARDOWN ORDERING: IAM policies must NOT reach the cluster ARN with
+  # `Fn::GetAtt: [MskCluster, Arn]`. CloudFormation reads that as a dependency and
+  # deletes in reverse, so the cluster waits for every role that names it. The
+  # in-VPC OffsetSeederFunction sits at the head of one such chain
+  # (OffsetSeederFunction -> OffsetSeederRole -> MskCluster) and its Lambda-managed
+  # ENIs take ~15-20 min to be reclaimed -- so a measured teardown spent 18m30s
+  # parked on the seeder before the cluster's own delete (93s) even STARTED.
+  # Nothing in those policies is needed at teardown: the connectors are already gone
+  # and IAM is only evaluated at call time, so an orphaned ARN in a doomed policy is
+  # harmless. Roles therefore build the ARN with `Fn::Sub` + a wildcard for the
+  # cluster UUID suffix (see MSK_CLUSTER_ARN_PATTERN comments below), which keeps the
+  # same authorization but lets the cluster and the seeder tear down in PARALLEL.
+  # Creation order is unaffected -- the connectors still `DependsOn: MskCluster`.
   MskCluster:
     Type: AWS::MSK::ServerlessCluster
     Properties:
@@ -942,8 +956,14 @@ Resources:
                   - kafka-cluster:Connect
                   - kafka-cluster:DescribeCluster
                   - kafka-cluster:AlterCluster
+                # MSK_CLUSTER_ARN_PATTERN: built by name, NOT Fn::GetAtt, so this
+                # role does not become a delete-time dependency of MskCluster (see
+                # the MskCluster comment). The trailing `/*` covers the UUID suffix
+                # MSK appends (.../<name>/<uuid>-s3); the cluster NAME is already
+                # unique per stack, so this grants no broader access.
                 Resource:
-                  Fn::GetAtt: [MskCluster, Arn]
+                  Fn::Sub: >-
+                    arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:cluster/${AWS::StackName}-msk/*
               - Sid: MskTopics
                 Effect: Allow
                 Action:
@@ -1177,8 +1197,14 @@ Resources:
                   # transactional seed path can't silently fail the gapless handoff
                   # again. This action is cluster-scoped (not topic-scoped).
                   - kafka-cluster:WriteDataIdempotently
+                # MSK_CLUSTER_ARN_PATTERN: built by name, NOT Fn::GetAtt. This is the
+                # site that actually caused the slow teardown -- via Fn::GetAtt the
+                # chain OffsetSeederFunction -> OffsetSeederRole -> MskCluster made
+                # the cluster wait ~18 min for the seeder's Lambda ENIs. See the
+                # MskCluster comment.
                 Resource:
-                  Fn::GetAtt: [MskCluster, Arn]
+                  Fn::Sub: >-
+                    arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:cluster/${AWS::StackName}-msk/*
               - Sid: MskSeedTopic
                 Effect: Allow
                 Action:

@@ -211,6 +211,14 @@ class DataMigrationState:
         self.cdc_action_kind: Optional[str] = None  # "infra"|"start"|"stop"|"delete"
         self.cdc_stack_name: str = CDC_DEFAULT_STACK_NAME
         self._cdc_deploy_log: list[tuple[datetime, str]] = []
+        # Set when the operator explicitly asks to (re)deploy CDC infrastructure after
+        # a teardown, so the ~20-line BYO-VPC form is not thrust at them the instant a
+        # delete finishes -- at that moment "it's gone" is the answer they want, and a
+        # deploy form reads as though the tool were about to rebuild the MSK cluster
+        # they just paid to remove. Only gates the FORM; a first-ever deploy (no
+        # teardown in this session) still shows it directly. See
+        # ``cdc_redeploy_needs_confirmation``.
+        self.cdc_redeploy_confirmed: bool = False
         # Durable marker for an in-flight CDC *teardown* (stop/delete). Distinct from
         # ``cdc_deploy_job_id`` above (which drives the in-CDC-step stage-progress card
         # and IS wiped by a Start-over reset): this triple feeds the cross-view
@@ -414,6 +422,15 @@ class DataMigrationState:
         with self._lock:
             self.cdc_deploy_job_id = job_id
             self.cdc_action_kind = kind if job_id is not None else None
+
+    def set_cdc_redeploy_confirmed(self, confirmed: bool) -> None:
+        """Record that the operator asked to (re)deploy CDC infrastructure.
+
+        Latches the answer to the post-teardown "redeploy?" prompt so the form stays
+        open across the card's refreshes; reset it to hide the form again.
+        """
+        with self._lock:
+            self.cdc_redeploy_confirmed = bool(confirmed)
 
     def set_cdc_teardown(
         self,

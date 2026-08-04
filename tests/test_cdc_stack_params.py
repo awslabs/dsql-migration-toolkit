@@ -961,3 +961,69 @@ def test_security_group_rule_descriptions_are_within_the_length_limit() -> None:
         if len(text) > 255
     }
     assert not too_long, f"SG rule descriptions over 255 chars: {too_long}"
+
+
+def test_no_iam_role_makes_the_msk_cluster_wait_on_teardown() -> None:
+    """No IAM role may reach the cluster ARN with ``Fn::GetAtt: [MskCluster, Arn]``.
+
+    CloudFormation treats that as a dependency and deletes in reverse, so MskCluster
+    waits for every role that names it. The in-VPC OffsetSeederFunction heads one such
+    chain (OffsetSeederFunction -> OffsetSeederRole -> MskCluster) and its
+    Lambda-managed ENIs take ~15-20 min to reclaim: a measured teardown sat 18m30s on
+    the seeder before the cluster's own delete (93s) even started, and the UI showed
+    "Deleting infrastructure" the whole time. Roles must build the ARN by NAME
+    (Fn::Sub + a wildcard for the UUID suffix) instead -- same authorization, but the
+    cluster and the seeder tear down in parallel.
+
+    Outputs are exempt: they are not evaluated at delete time.
+    """
+    import json
+
+    doc = _load_cdc_template()
+    offenders = []
+    for name, resource in doc["Resources"].items():
+        if resource.get("Type") != "AWS::IAM::Role":
+            continue
+        blob = json.dumps(resource)
+        if '"MskCluster"' in blob:
+            offenders.append(name)
+    assert not offenders, (
+        "these IAM roles reference MskCluster, forcing the cluster to wait for them "
+        f"on delete (build the ARN with Fn::Sub instead): {offenders}"
+    )
+
+
+def test_roles_still_authorize_cluster_level_msk_actions() -> None:
+    """Dropping the Fn::GetAtt must not drop the grant it carried.
+
+    The control for the test above: cluster-level actions (Connect/DescribeCluster,
+    and the seeder's WriteDataIdempotently) still need a cluster-scoped Resource, so
+    each role must name the cluster ARN by pattern. A "fix" that simply deleted the
+    statement would break every connector start.
+    """
+    import json
+
+    doc = _load_cdc_template()
+    for role in ("ConnectorExecutionRole", "OffsetSeederRole"):
+        blob = json.dumps(doc["Resources"][role])
+        assert "kafka-cluster:Connect" in blob, f"{role} lost its MSK Connect grant"
+        assert ":cluster/${AWS::StackName}-msk/*" in blob, (
+            f"{role} must scope cluster-level actions to this stack's cluster ARN "
+            "(built by name, with a wildcard for the UUID suffix)"
+        )
+
+
+def test_connectors_still_wait_for_the_cluster_at_create_time() -> None:
+    """Creation order must be unaffected -- only the DELETE order changes.
+
+    The connectors cannot be created before the cluster exists, and that ordering was
+    NOT provided by the IAM Fn::GetAtt (it comes from an explicit DependsOn). Pinned
+    so a later cleanup of "redundant" DependsOn entries cannot silently reintroduce
+    the race the removed reference never guarded against.
+    """
+    doc = _load_cdc_template()
+    for connector in ("DebeziumSourceConnector", "DsqlSinkConnector"):
+        depends = doc["Resources"][connector].get("DependsOn") or []
+        assert "MskCluster" in depends, (
+            f"{connector} must DependsOn MskCluster so it is created after the cluster"
+        )

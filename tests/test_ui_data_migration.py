@@ -7185,6 +7185,9 @@ class _RecordingUi:
         # Rendered tick boxes, kept as objects (not just their text) so a test can ask
         # whether one is actually enabled and what handler it carries.
         self.checkboxes: list = []
+        # Rendered buttons, so a test can drive a click (``.on_click``) instead of only
+        # asserting the label text.
+        self.buttons: list = []
 
     class _El:
         # Class-level default: subclasses below (_Btn, _Input, ...) define their own
@@ -7266,8 +7269,16 @@ class _RecordingUi:
     def icon(self, *_a, **_k):
         return self._El(self)
 
-    def button(self, *_a, **_k):
-        return self._El(self)
+    def button(self, text="", *_a, on_click=None, **_k):
+        # A button's LABEL is user-visible copy, so record it like any other text --
+        # it was previously dropped, which made the action a card offers unassertable.
+        # The handler is kept so a test can drive the click.
+        if text:
+            self.texts.append(str(text))
+        el = self._El(self)
+        el.on_click = on_click
+        self.buttons.append(el)
+        return el
 
     def row(self, *_a, **_k):
         return self._El(self)
@@ -13181,3 +13192,170 @@ def test_unknown_notice_says_the_pipeline_is_unaffected_and_names_the_remedy() -
     assert "keeps streaming" in body, "must say the running pipeline is unaffected"
     assert "Re-verify the target connection" in body, "must name the remedy"
     assert "do not start cdc again" in body.lower()
+
+
+def test_redeploy_prompt_gates_the_form_only_after_a_teardown() -> None:
+    """A finished delete must ASK before the deploy form reappears.
+
+    A CDC delete takes ~20 min and removes a billable MSK cluster; showing the ~20-line
+    BYO-VPC form the instant it lands reads as though the tool were about to rebuild
+    what the operator just paid to remove. A first-ever deploy is NOT gated -- there the
+    form is the next step.
+    """
+    from dsql_migrator.ui.data_migration._cdc_ui import (
+        cdc_redeploy_needs_confirmation,
+    )
+
+    fresh = DataMigrationState()
+    assert not cdc_redeploy_needs_confirmation(fresh), (
+        "a first-ever deploy must not be gated behind an extra click"
+    )
+
+    after_infra = DataMigrationState()
+    after_infra.set_cdc_deploy_job_id("job-1", kind="infra")
+    assert not cdc_redeploy_needs_confirmation(after_infra), (
+        "only a teardown gates the form, not any CDC lifecycle action"
+    )
+
+    after_delete = DataMigrationState()
+    after_delete.set_cdc_deploy_job_id("job-2", kind="delete")
+    assert cdc_redeploy_needs_confirmation(after_delete)
+
+
+def test_redeploy_confirmation_latches_so_the_form_survives_refreshes() -> None:
+    # The card re-renders on a timer, so a non-latching answer would bounce the
+    # operator back to the prompt mid-typing.
+    from dsql_migrator.ui.data_migration._cdc_ui import (
+        cdc_redeploy_needs_confirmation,
+    )
+
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("job-2", kind="delete")
+    state.set_cdc_redeploy_confirmed(True)
+
+    assert not cdc_redeploy_needs_confirmation(state)
+
+
+def test_a_second_teardown_prompts_again() -> None:
+    """deploy -> delete -> delete must not reuse the first "yes".
+
+    Otherwise the second delete lands straight on the deploy form, which is the exact
+    behaviour this gate exists to prevent.
+    """
+    from dsql_migrator.ui.data_migration._cdc_ui import (
+        cdc_redeploy_needs_confirmation,
+    )
+
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("job-2", kind="delete")
+    state.set_cdc_redeploy_confirmed(True)  # first prompt answered
+    assert not cdc_redeploy_needs_confirmation(state)
+
+    # A fresh delete is submitted; the submit path clears the latch.
+    state.set_cdc_deploy_job_id("job-3", kind="delete")
+    state.set_cdc_redeploy_confirmed(False)
+    assert cdc_redeploy_needs_confirmation(state)
+
+
+def test_delete_submit_clears_a_previously_confirmed_redeploy() -> None:
+    """Pin the clear at the SUBMIT site, not just in the test above.
+
+    The predicate cannot see a stale latch on its own -- whoever submits the delete has
+    to reset it, so assert the source of truth for that ordering.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    src = inspect.getsource(_cdc_ui)
+    tree = ast.parse(src)
+    # Find the statement that submits a delete job and the reset that must follow it.
+    set_delete_line = None
+    reset_line = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        rendered = ast.unparse(node)
+        if "set_cdc_deploy_job_id" in rendered and "delete" in rendered:
+            set_delete_line = node.lineno
+        if "set_cdc_redeploy_confirmed(False)" in rendered:
+            reset_line = node.lineno
+    assert set_delete_line is not None, "the delete submit site must exist"
+    assert reset_line is not None, (
+        "submitting a delete must clear any latched redeploy confirmation"
+    )
+    assert reset_line > set_delete_line, (
+        "the reset must follow the delete submit so the new teardown re-prompts"
+    )
+
+
+def test_redeploy_prompt_leads_with_the_deletion_outcome() -> None:
+    """The operator waited ~20 min for this: say it's gone and no longer billing.
+
+    Rendered output, so a version that only shows a bare button fails.
+    """
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    ui = _RecordingUi()
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("job-2", kind="delete")
+    _cdc_ui._render_cdc_redeploy_prompt(ui, state, lambda: None)
+
+    joined = " ".join(ui.texts)
+    assert "CDC infrastructure deleted" in joined
+    assert "no longer" in joined, "say the cluster stopped costing money"
+    # Redeploy is offered, but as an explicit opt-in that states the cost.
+    assert "Redeploy CDC infrastructure" in joined
+    assert "15-20 minutes" in joined and "billable" in joined
+    # And it must NOT dump the BYO-VPC form here.
+    assert "Provide your VPC" not in joined
+
+
+def _render_start_action_after_delete(*, confirmed: bool):
+    """Render the whole CDC lifecycle card in the "absent, just deleted" state."""
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    ui = _RecordingUi()
+    state = DataMigrationState()
+    # The probe has reported and found nothing -> the real "absent" branch (not the
+    # undetermined one), which is where the deploy form used to appear immediately.
+    state.set_cdc_stack_phase(None)
+    state.set_cdc_deploy_job_id("job-del", kind="delete")
+    if confirmed:
+        state.set_cdc_redeploy_confirmed(True)
+    _cdc_ui._render_cdc_start_action(
+        ui,
+        state,
+        _StubJobManager({}),  # the delete job is finished/unknown -> not in flight
+        lambda: None,
+        inventory=None,
+        session=None,
+    )
+    return ui
+
+
+def test_lifecycle_card_asks_before_reoffering_the_deploy_form_after_a_delete() -> None:
+    """Wiring test: the absent branch must route through the redeploy prompt.
+
+    The predicate and the prompt can both be correct while the card never calls them --
+    which is exactly the state the CDC step was in. Renders the real card.
+    """
+    joined = " ".join(_render_start_action_after_delete(confirmed=False).texts)
+
+    assert "CDC infrastructure deleted" in joined, (
+        "the card must confirm the teardown instead of jumping to a deploy form"
+    )
+    assert "Provide your VPC" not in joined, (
+        "the BYO-VPC deploy form must wait behind the explicit redeploy prompt"
+    )
+
+
+def test_lifecycle_card_shows_the_deploy_form_once_redeploy_is_confirmed() -> None:
+    # The control: saying yes must actually get the operator to the form, or the gate
+    # would be a dead end.
+    joined = " ".join(_render_start_action_after_delete(confirmed=True).texts)
+
+    assert "Provide your VPC" in joined, (
+        "confirming redeploy must reveal the infrastructure form"
+    )

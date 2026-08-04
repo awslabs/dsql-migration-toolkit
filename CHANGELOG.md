@@ -5,6 +5,31 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.239
+
+### Fixed
+
+- **Deleting the CDC infrastructure took ~24 minutes, almost all of it spent not
+  deleting the MSK cluster.** Two IAM roles scoped their cluster-level MSK grants with
+  `Fn::GetAtt: [MskCluster, Arn]`. CloudFormation reads that as a dependency and deletes
+  in reverse, so the cluster had to wait for every role naming it — including the
+  offset-seeder's, whose in-VPC Lambda leaves ENIs that AWS takes ~15-20 minutes to
+  reclaim. A measured teardown sat 18m30s on the seeder before the cluster's own delete
+  (93 seconds) even started, with the UI showing "Deleting infrastructure" throughout.
+  Nothing in those policies is needed at teardown — the connectors are already gone and
+  IAM is only evaluated at call time — so the roles now build the cluster ARN by name
+  (`Fn::Sub`, with a wildcard for the UUID suffix AWS appends). Identical authorization,
+  but the cluster and the seeder tear down in parallel. Creation order is unchanged: the
+  connectors still `DependsOn` the cluster.
+- **The moment a teardown finished, the CDC card offered the deploy form again.** After
+  ~20 minutes of waiting for a billable MSK cluster to be removed, the answer the
+  operator wants is "it's gone" — not a 20-line BYO-VPC form implying the tool is about
+  to rebuild it. The card now confirms the deletion (and that it stopped costing money,
+  and that the migration's data is untouched), then offers rebuilding as an explicit
+  opt-in that states what saying yes costs (~15-20 min, billable). A first-ever deploy
+  is not gated — there the form is the next step — and a second teardown asks again
+  rather than reusing the first answer.
+
 ## v0.1.238
 
 ### Fixed

@@ -1225,6 +1225,63 @@ def cdc_state_is_undetermined(migration_state) -> bool:
     return getattr(migration_state, "cdc_stack_phase", None) is None
 
 
+def cdc_redeploy_needs_confirmation(migration_state) -> bool:
+    """True when the deploy form should wait behind an explicit "redeploy?" prompt.
+
+    Only after a teardown IN THIS SESSION (``cdc_action_kind == "delete"``, which
+    outlives the finished job) and only until the operator says yes. A CDC delete takes
+    ~20 min and removes a billable MSK cluster; the moment it lands, the answer the
+    operator wants is "it's gone", not a ~20-line BYO-VPC form implying the tool is
+    about to rebuild what they just removed.
+
+    A first-ever deploy is deliberately NOT gated: there the form IS the next step, and
+    an extra click to reach it would be pure friction.
+
+    Pure (reads already-populated state); safe during render.
+    """
+    if getattr(migration_state, "cdc_redeploy_confirmed", False):
+        return False
+    return getattr(migration_state, "cdc_action_kind", None) == "delete"
+
+
+def _render_cdc_redeploy_prompt(ui, migration_state, refresh) -> None:
+    """Confirm the teardown, then offer redeploy as a choice rather than a form.
+
+    Leads with the outcome the operator was waiting for (the infrastructure is gone and
+    is no longer billing), and makes rebuilding an explicit opt-in that states the real
+    cost of saying yes (~15-20 min, billable). Answering yes latches
+    ``cdc_redeploy_confirmed`` so the form stays open across refreshes.
+    """
+    render_notice(
+        ui,
+        tone="success",
+        icon="task_alt",
+        header="CDC infrastructure deleted",
+        body=(
+            "The cdc-stack and its MSK Serverless cluster are gone, so they no longer "
+            "incur charges. Nothing else in this migration was affected — the target "
+            "data and the Full Load results are untouched."
+        ),
+    )
+
+    def _confirm() -> None:
+        migration_state.set_cdc_redeploy_confirmed(True)
+        if callable(refresh):
+            refresh()
+
+    with ui.row().classes("items-center gap-2 no-wrap flex-wrap"):  # type: ignore[attr-defined]
+        ui.label(  # type: ignore[attr-defined]
+            "Deploy CDC infrastructure again?"
+        ).classes("text-xs text-gray-600")
+        ui.button(  # type: ignore[attr-defined]
+            "Redeploy CDC infrastructure", on_click=_confirm
+        ).props("outline size=sm").classes("normal-case")
+    ui.label(  # type: ignore[attr-defined]
+        "Rebuilding creates a new MSK Serverless cluster and takes ~15-20 minutes; "
+        "it is billable. Leave this alone if you are done with CDC."
+    ).classes("text-xs text-gray-500")
+
+
 def _render_cdc_state_unknown_notice(ui) -> None:
     """Say the CDC state is unknown, and how to recover it.
 
@@ -1429,6 +1486,10 @@ def _render_cdc_start_action(
                     ui, migration_state, job_manager, refresh, other_stacks,
                     inventory=inventory, session=session,
                 )
+            elif cdc_redeploy_needs_confirmation(migration_state):
+                # Straight after a teardown, confirm the deletion and ASK before
+                # showing the deploy form again (see the predicate's docstring).
+                _render_cdc_redeploy_prompt(ui, migration_state, refresh)
             else:
                 _render_cdc_infra_deploy_action(
                     ui, migration_state, job_manager, refresh,
@@ -3384,6 +3445,10 @@ def _start_cdc_delete(
         _logged_cdc_lifecycle(_action, detail=_detail, work=work)
     )
     migration_state.set_cdc_deploy_job_id(job_id, kind="delete")
+    # Clear any latched redeploy answer: this teardown must prompt again when it lands,
+    # otherwise a deploy -> delete -> delete sequence silently reuses the earlier "yes"
+    # and drops the operator straight back onto the deploy form.
+    migration_state.set_cdc_redeploy_confirmed(False)
     # Durable marker → the persistent cross-view "teardown in progress" banner (the
     # delete runs ~15–45 min; the banner keeps it visible on every step, not just
     # the CDC card the user may navigate away from). Ownership guard: don't clobber a
