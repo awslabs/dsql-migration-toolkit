@@ -1542,10 +1542,11 @@ def build_data_migration_screen(
                                 ) in ("infra", "running", "unstable")
                                 body = (
                                     "To keep the target in sync with ongoing source "
-                                    "changes, change the migration type above to "
+                                    "changes, set the migration type to "
                                     "\"CDC only\" — it streams from this Full Load's "
                                     "watermark onto the already-loaded target (no "
-                                    "re-snapshot)."
+                                    "re-snapshot). Use the link below to jump to that "
+                                    "setting."
                                 )
                                 if not infra_ready:
                                     body += (
@@ -1560,6 +1561,12 @@ def build_data_migration_screen(
                                     "replication (CDC) next?",
                                     body=body,
                                 )
+                                # The selector this refers to is at the top of the
+                                # page; after a Full Load the notice can sit well below
+                                # the fold, so "change the migration type above" asked
+                                # the user to go find a control they could not see.
+                                # Jump to it instead of only naming it.
+                                _scroll_to_migration_type_button(ui)
 
                     _substep(
                         "full_load",
@@ -2020,6 +2027,41 @@ def migratable_table_names(
 # view-models. _migration_resumed_committed / migration_type_locked stay here
 # (they read migration_state / job_manager).
 
+# CSS marker on the "Migration type" heading, used as a scroll target. The
+# post-Full-Load "want CDC next?" notice renders far below the selector it refers to
+# ("change the migration type above"), which on a long Data Migration page can be off
+# screen -- so the notice offers a jump link instead of leaving the user to scroll and
+# find it. Kept as a named constant so the anchor and the querySelector cannot drift.
+MIGRATION_TYPE_ANCHOR = "dm-migration-type-anchor"
+
+
+def _scroll_to_migration_type_button(
+    ui, *, label: str = "Change migration type"
+) -> None:
+    """Render a link-style button that scrolls to the migration-type selector.
+
+    Mirrors the sub-step scroll already used on this screen (querySelector on a CSS
+    marker + ``scrollIntoView``) so the behaviour is consistent. A brief ring is drawn
+    around the heading after the scroll: landing at the top of a long page without it,
+    the user still has to work out WHICH control the notice meant.
+
+    Purely navigational -- it changes no migration state, so the type is still chosen by
+    deliberately clicking a tile.
+    """
+    ui.button(  # type: ignore[attr-defined]
+        label,
+        icon="arrow_upward",
+        on_click=lambda: ui.run_javascript(  # type: ignore[attr-defined]
+            f"const el=document.querySelector('.{MIGRATION_TYPE_ANCHOR}');"
+            "if(el){el.scrollIntoView({behavior:'smooth',block:'center'});"
+            # Tailwind ring utilities, added then removed, so the highlight needs no
+            # stylesheet and leaves no residue on the element.
+            "el.classList.add('ring-2','ring-blue-400','rounded');"
+            "setTimeout(()=>el.classList.remove("
+            "'ring-2','ring-blue-400','rounded'),2000);}"
+        ),
+    ).props("flat dense no-caps color=primary")
+
 
 def migration_type_locked(migration_state, job_manager, *, status) -> bool:
     """True once CDC has been committed/started, so the type must not change.
@@ -2295,7 +2337,12 @@ def _render_migration_type_selector(
             migration_state.set_active_substep(None)  # default for the new type
         refresh()
 
-    ui.label("Migration type").classes("text-sm font-semibold")  # type: ignore[attr-defined]
+    # Scroll anchor: the post-Full-Load "want CDC next?" notice sits far below this
+    # selector and tells the user to change the type "above". Its jump-link targets this
+    # class (see MIGRATION_TYPE_ANCHOR) so they do not have to hunt for the control.
+    ui.label("Migration type").classes(  # type: ignore[attr-defined]
+        f"text-sm font-semibold {MIGRATION_TYPE_ANCHOR}"
+    )
     # Explain WHY the choice is locked (a dead, silently-disabled control looked
     # like a bug). Prefer the reason the CALLER computed alongside ``locked``: it is
     # the same evaluation that produced the lock, so the message and the disabled

@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.245
+
+### Added
+
+- **A jump link on the post-Full-Load "want CDC next?" notice.** The notice told the user
+  to "change the migration type above", but after a Full Load that selector is at the top
+  of a long page and usually off screen — so the one action the notice asks for was left
+  for the user to go hunt. It now offers a "Change migration type" link that scrolls
+  straight to the selector and briefly rings it, so the right control is unmistakable on
+  arrival. The copy points at the link instead of naming a direction. Purely
+  navigational: the type is still changed by deliberately clicking a tile.
+
 ## v0.1.244
 
 ### Fixed

@@ -14000,3 +14000,128 @@ def test_per_table_column_and_dlq_card_agree() -> None:
         if str(c).isdigit()
     )
     assert column_total == card_total == 1
+
+
+def test_scroll_to_migration_type_button_targets_the_selector_anchor() -> None:
+    """The jump link must scroll to the migration-type heading and mark it.
+
+    Without the highlight the user lands at the top of a long page and still has to work
+    out WHICH control the notice meant.
+    """
+    from dsql_migrator.ui.data_migration import (
+        MIGRATION_TYPE_ANCHOR,
+        _scroll_to_migration_type_button,
+    )
+
+    ui = _RecordingUi()
+    scripts: list[str] = []
+    ui.run_javascript = lambda code: scripts.append(code)
+
+    _scroll_to_migration_type_button(ui)
+
+    assert any("Change migration type" in t for t in ui.texts), (
+        "the action must be labelled, not a bare icon"
+    )
+    handlers = [b.on_click for b in ui.buttons if b.on_click is not None]
+    assert handlers, "the jump link must be wired"
+    handlers[0]()
+
+    assert scripts, "clicking must run the scroll script"
+    code = scripts[0]
+    assert f".{MIGRATION_TYPE_ANCHOR}" in code, (
+        "the script must target the same anchor class the selector renders"
+    )
+    assert "scrollIntoView" in code
+    # The highlight must be ADDED and then cleaned up -- a permanent ring would leave
+    # the heading looking selected for the rest of the session.
+    assert "classList.add('ring-2'" in code, (
+        "the landed-on control must be highlighted, or the user still has to work out "
+        "which control the notice meant"
+    )
+    assert "classList.remove(" in code and "setTimeout" in code, (
+        "the highlight must be temporary"
+    )
+
+
+def test_migration_type_selector_renders_the_scroll_anchor() -> None:
+    """The other half of the pair: the anchor must actually exist in the DOM.
+
+    A correct script plus a missing anchor is a link that silently does nothing, so pin
+    that the selector emits the class the script queries.
+    """
+    from dsql_migrator.ui.data_migration import (
+        MIGRATION_TYPE_ANCHOR,
+        _render_migration_type_selector,
+    )
+
+    classes_seen: list[str] = []
+
+    class _ClassCapturingUi(_RecordingUi):
+        class _El(_RecordingUi._El):
+            def classes(self, value="", *_a, **_k):
+                classes_seen.append(str(value))
+                return self
+
+    ui = _ClassCapturingUi()
+    _render_migration_type_selector(
+        ui,
+        DataMigrationState(),
+        status=StepStatus.DONE,
+        refresh=lambda: None,
+    )
+
+    assert any(MIGRATION_TYPE_ANCHOR in c for c in classes_seen), (
+        f"the selector must carry the {MIGRATION_TYPE_ANCHOR} scroll anchor"
+    )
+
+
+def test_full_load_only_cdc_notice_offers_the_jump_link() -> None:
+    """Wiring: the "want CDC next?" notice must render the jump link with it.
+
+    The anchor and the link can both be correct while nothing puts the link on screen --
+    which leaves the notice telling the user to change a setting it never helps them
+    reach. Pinned on source order (the notice is rendered deep inside the sub-step
+    closure, so it cannot be called directly) by asserting the call follows the notice
+    that motivates it.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    src = inspect.getsource(dm.build_data_migration_screen)
+    tree = ast.parse(src.strip())
+    notice_line = None
+    link_line = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        rendered = ast.unparse(node)
+        if "want continuous" in rendered and "render_notice" in rendered:
+            notice_line = node.lineno
+        if "_scroll_to_migration_type_button" in rendered:
+            link_line = node.lineno
+    assert notice_line is not None, "the post-Full-Load CDC notice must exist"
+    assert link_line is not None, (
+        "the notice must be accompanied by the migration-type jump link"
+    )
+    assert link_line > notice_line, (
+        "the jump link belongs directly after the notice that references the setting"
+    )
+
+
+def test_cdc_notice_body_points_at_the_link_not_a_direction() -> None:
+    """"change the migration type above" made the user hunt for an off-screen control.
+
+    With a jump link present the copy should send them to the link instead of naming a
+    direction that may be several screens away.
+    """
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    src = inspect.getsource(dm.build_data_migration_screen)
+    assert "Use the link below to jump to that " in src
+    assert "change the migration type above to " not in src, (
+        "the copy should not tell the user to scroll up and find it themselves"
+    )
