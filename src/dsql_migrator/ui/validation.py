@@ -3422,7 +3422,12 @@ def _render_readiness_checks(
             f"'Heads-up' item below is the same {explained_rows} {row_noun} the "
             "migration already reported dropping, not a new problem."
         ).classes("text-xs text-gray-600")
-    if explained_tables:
+    # Per-check "…is exactly the N rows dropped…" tail. Only when the gap is PARTIALLY
+    # explained: there is no lead-in in that case, so each affected check must carry its
+    # own cause. When it is FULLY explained the lead-in above already says every Heads-up
+    # item is those same rows, so repeating it on Data identical AND No mismatched records
+    # would state the one fact three times in one card. Suppressed there.
+    if explained_tables and not fully_explained:
         noun = "table" if len(explained_tables) == 1 else "tables"
         row_noun = "row" if explained_rows == 1 else "rows"
         explained_note = (

@@ -3393,16 +3393,14 @@ def test_readiness_checks_name_the_cause_and_soften_only_when_fully_explained() 
         ui, summarize_validation(_quarantine_report(dropped=3, missing=3)), _drift_na()
     )
     body = ui.body()
-    # The cause is stated on the checks themselves, where the reviewer reads the verdict.
-    assert "dropped during the migration" in body
-    assert "already reported, not new data loss" in body
-    assert "ecommerce.product_media" in body
+    # Fully explained: the cause is stated ONCE, in the lead-in -- the per-check tails
+    # are suppressed (change E) so the one fact is not repeated three times in the card.
+    assert "Same conclusion as the verdict above" in body
+    assert body.count("already reported, not new data loss") == 0
+    assert "dropped during the migration" not in body  # only the lead-in phrasing remains
     # Softened to a heads-up -- but NOT passed: rows really are missing on the target.
     assert "Heads-up" in body
     assert "Failed" not in body
-    # Lead-in ties the panel back to the verdict (the panel renders LAST since 0.1.255,
-    # far below the verdict), so a 'Heads-up' row is not read as a new, weaker signal.
-    assert "Same conclusion as the verdict above" in body
 
     # A partially-explained shortfall keeps the hard failure -- and shows NO "same
     # conclusion" lead-in, because something IS still unexplained.
@@ -3483,6 +3481,10 @@ def test_one_explained_table_does_not_soften_a_run_with_a_real_mismatch() -> Non
     # separates the fully_explained gate from a mere "any explained table" gate: one
     # table is exactly explained while another is a real loss.)
     assert "Same conclusion as the verdict above" not in checks_body
+    # With no lead-in, the per-check explained-note tail MUST stay so the explained part
+    # still carries its cause on the check itself (change E only drops the tail when the
+    # lead-in already covers it, i.e. fully explained).
+    assert "already reported, not new data loss" in checks_body
 
     verdict = _CopyUi()
     _render_verdict(verdict, summary, _drift_na())

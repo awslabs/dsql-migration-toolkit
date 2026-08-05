@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.261
+
+### Changed
+
+- **The Cut-over readiness card no longer repeats the same explanation three times.** When
+  the gap is fully explained, the card's lead-in already says every "Heads-up" item below
+  is the rows the migration reported dropping — yet the "Data identical" and "No mismatched
+  records" checks each re-appended "…is exactly the N rows dropped during the migration —
+  already reported, not new data loss". The per-check tail is now suppressed when the
+  lead-in covers it (fully explained), leaving each check with just its numbers. A
+  partially-explained run has no lead-in, so the checks keep the tail there to carry the
+  cause themselves. Cross-section repetition (verdict, per-table, etc.) is left as-is —
+  that redundancy keeps each section independently readable.
+
 ## v0.1.260
 
 ### Changed

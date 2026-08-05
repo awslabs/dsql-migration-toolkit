@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.261
+
+### 변경
+
+- **Cut-over readiness 카드가 같은 설명을 세 번 반복하지 않습니다.** 격차가 완전히 설명된 경우, 카드
+  상단 리드인이 이미 "아래 Heads-up 항목은 모두 마이그레이션이 보고한 드롭 행"이라고 밝히는데,
+  "Data identical"과 "No mismatched records" 체크가 각각 "…is exactly the N rows dropped during
+  the migration — already reported, not new data loss" 꼬리를 다시 붙였습니다. 이제 리드인이 커버할
+  때(완전 설명)는 체크별 꼬리를 생략하고 각 체크에 숫자 사실만 남깁니다. 부분 설명 런은 리드인이
+  없으므로 체크가 꼬리를 유지해 원인을 직접 담습니다. 섹션 간 반복(판정, 테이블별 등)은 그대로 —
+  그 중복은 각 섹션의 독립 판독성을 위한 것입니다.
+
 ## v0.1.260
 
 ### 변경
