@@ -5,6 +5,27 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.258
+
+### Fixed
+
+- **The "How to recover" section sent an acceptable (fully-explained) gap through the wrong
+  fix.** When every missing row is one the migration already reported dropping — a value
+  over a permanent Aurora DSQL limit (e.g. the ~1 MiB per-value cap) — re-running Full Load
+  just isolates it again, yet the recovery section rendered "Re-run Full Load + CDC to
+  backfill the gap. The Full Load only fills missing rows" plus the Stop-CDC → reload →
+  resume runbook. That is false for these rows and contradicted the verdict banner directly
+  above it. The section now branches on whether the gap is fully explained: for a
+  permanently-quarantined gap it says the rows can't be stored as-is and gives the two real
+  paths — reduce the source value below the limit (e.g. move a large object to Amazon S3)
+  then reload, or accept the gap and cut over — and omits the reload runbook. A genuinely
+  unexplained (loadable) gap, including the mixed case where one table is explained and
+  another is a real loss, still gets the reload runbook.
+- **The verdict banner body carried the same "reload reaches a full match" implication.**
+  Its remediation now leads with "reloading alone will not help, since DSQL still cannot
+  store the original values" before pointing to reducing the source value or accepting the
+  gap, matching the recovery section and the Cut over step.
+
 ## v0.1.257
 
 ### Changed

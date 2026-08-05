@@ -3060,8 +3060,10 @@ def _render_verdict(
                 f"Nothing unexplained: every difference is in {len(explained_tables)} "
                 f"{noun} ({', '.join(explained_tables)}) and is exactly the {rows} "
                 f"{row_noun} the migration could not store — already reported, not new "
-                "data loss. Either fix the source value(s) and reload those tables to "
-                "reach a full match, or accept the gap deliberately and cut over knowing "
+                "data loss. Two paths: reduce the offending source value(s) below the "
+                "limit first and then reload those tables to reach a full match — "
+                "reloading alone will not help, since DSQL still cannot store the "
+                "original values — or accept the gap deliberately and cut over knowing "
                 f"those {row_noun} will be absent from the target."
             ),
         )
@@ -3148,55 +3150,85 @@ def _render_recovery_section(
     FIRST → re-run Full Load → resume CDC → re-validate), the quiesce-source
     caveat, and an optional "Diagnose with AI" action.
     """
+    # Two genuinely different recoveries share this "no-go" gate, and conflating them
+    # is the defect. When the WHOLE shortfall is rows the migration already reported
+    # dropping (fully_explained -> release state "acceptable"), those rows hit a
+    # PERMANENT limit -- e.g. a value over DSQL's ~1 MiB cap -- so re-running Full Load
+    # just re-quarantines them: "backfill by re-running the migration, the Full Load
+    # only fills missing rows" is false for them, and it contradicts the verdict banner
+    # right above ("accept the gap or fix the source and reload"). The idempotent-reload
+    # runbook is only correct for an UNEXPLAINED mismatch (rows that CAN load but did
+    # not). So branch on fully_explained.
+    fully_explained = bool(
+        summary.quarantine_explained_tables
+        and summary.unexplained_mismatched_tables == 0
+    )
     with _section(ui, icon="build", title="How to recover"):  # type: ignore[misc]
-        render_notice(
-            ui,
-            tone="info",
-            header="Re-run Full Load + CDC to backfill the gap",
-            body=(
-                "These differences do not shrink over time, so they are a standing "
-                "gap (rows CDC won't re-deliver), not lag. Backfill them by "
-                "re-running the migration. The Full Load is idempotent "
-                "(INSERT ... ON CONFLICT) — it only fills missing rows and never "
-                "creates duplicates."
-            ),
-        )
-        # The exact, ordered click-path. STOP CDC FIRST is the critical step (a live
-        # CDC sink + a fresh Full Load collide; CDC resumes from the old watermark).
-        steps = (
-            ("1", "Go to the Data Migration step (left nav)."),
-            ("2", "Open the CDC sub-step and click Stop CDC — do this FIRST. "
-             "Re-running Full Load while CDC is live collides with the stream and "
-             "leaves a gap/overlap (CDC would resume from the old snapshot point)."),
-            ("3", "In the Full Load sub-step, click Start/Re-run to backfill the "
-             "missing rows (safe and duplicate-free)."),
-            ("4", "When it finishes, click Continue to CDC and start CDC again — it "
-             "resumes gaplessly from the new snapshot."),
-            ("5", "Come back here and click Re-run validation to confirm a clean "
-             "match."),
-        )
-        ui.label("Steps to recover").classes(  # type: ignore[attr-defined]
-            "text-sm font-semibold text-gray-900 mt-1"
-        )
-        with ui.column().classes("w-full gap-1.5"):  # type: ignore[attr-defined]
-            for num, text in steps:
-                with ui.row().classes("items-start gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
-                    ui.label(num).classes(  # type: ignore[attr-defined]
-                        "shrink-0 w-5 h-5 rounded-full bg-blue-100 text-blue-700 "
-                        "text-[11px] font-semibold flex items-center justify-center"
-                    )
-                    ui.label(text).classes("text-xs text-gray-700 leading-snug")  # type: ignore[attr-defined]
+        if fully_explained:
+            render_notice(
+                ui,
+                tone="info",
+                header="These rows can't be stored as-is — shrink the value or accept the gap",
+                body=(
+                    "Every missing row was isolated because its value exceeds a "
+                    "permanent Aurora DSQL limit (e.g. the ~1 MiB per-value cap), so "
+                    "re-running Full Load alone just isolates them again — a plain "
+                    "reload cannot bring them in. Two real paths: reduce the offending "
+                    "source value(s) below the limit first — for example move a large "
+                    "object out to Amazon S3 and store a reference — then reload those "
+                    "tables; or accept the gap deliberately and cut over knowing those "
+                    "rows will be absent from the target."
+                ),
+            )
+        else:
+            render_notice(
+                ui,
+                tone="info",
+                header="Re-run Full Load + CDC to backfill the gap",
+                body=(
+                    "These differences do not shrink over time, so they are a standing "
+                    "gap (rows CDC won't re-deliver), not lag. Backfill them by "
+                    "re-running the migration. The Full Load is idempotent "
+                    "(INSERT ... ON CONFLICT) — it only fills missing rows and never "
+                    "creates duplicates."
+                ),
+            )
+            # The exact, ordered click-path. STOP CDC FIRST is the critical step (a
+            # live CDC sink + a fresh Full Load collide; CDC resumes from the old
+            # watermark). Only shown for an unexplained gap -- the reload is what fixes
+            # THAT case; for permanently-quarantined rows it would not help.
+            steps = (
+                ("1", "Go to the Data Migration step (left nav)."),
+                ("2", "Open the CDC sub-step and click Stop CDC — do this FIRST. "
+                 "Re-running Full Load while CDC is live collides with the stream and "
+                 "leaves a gap/overlap (CDC would resume from the old snapshot point)."),
+                ("3", "In the Full Load sub-step, click Start/Re-run to backfill the "
+                 "missing rows (safe and duplicate-free)."),
+                ("4", "When it finishes, click Continue to CDC and start CDC again — it "
+                 "resumes gaplessly from the new snapshot."),
+                ("5", "Come back here and click Re-run validation to confirm a clean "
+                 "match."),
+            )
+            ui.label("Steps to recover").classes(  # type: ignore[attr-defined]
+                "text-sm font-semibold text-gray-900 mt-1"
+            )
+            with ui.column().classes("w-full gap-1.5"):  # type: ignore[attr-defined]
+                for num, text in steps:
+                    with ui.row().classes("items-start gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+                        ui.label(num).classes(  # type: ignore[attr-defined]
+                            "shrink-0 w-5 h-5 rounded-full bg-blue-100 text-blue-700 "
+                            "text-[11px] font-semibold flex items-center justify-center"
+                        )
+                        ui.label(text).classes("text-xs text-gray-700 leading-snug")  # type: ignore[attr-defined]
 
-        # Only when the source has ACTUALLY advanced since the snapshot. This is the
-        # recovery ("How to recover") section for a no-go, so the outstanding issue is
-        # a real, unexplained mismatch -- and the fix is the ordered Full-Load-reload
-        # steps above, not "quiesce the source". The quiesce advice is only relevant
-        # here when live drift means part of the mismatch may be in-flight (so a reload
-        # could chase a moving target); it warns to freeze + re-validate before trusting
-        # the result. The old unconditional ``info`` fallback fired even with no drift,
-        # adding a generic cut-over aside to a screen about fixing a concrete gap -- and
-        # the drift section + the Cut over step already carry the quiesce guidance for
-        # the no-drift case, so dropping it here removes a duplicate, not the advice.
+        # Applies to both recovery paths above, but only when the source has ACTUALLY
+        # advanced since the snapshot: live drift means part of the difference may be
+        # in-flight, so whichever fix the reader takes, they must freeze the source and
+        # re-validate before trusting a clean result. The old unconditional ``info``
+        # fallback fired even with no drift, adding a generic cut-over aside to a screen
+        # about fixing a concrete gap -- and the source-changes section and the Cut over
+        # step already carry the quiesce guidance for the no-drift case, so dropping it
+        # here removes a duplicate, not the advice.
         source_live = bool(drift.available and drift.determinable and drift.drifted)
         if source_live:
             render_notice(

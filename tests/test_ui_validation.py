@@ -3513,6 +3513,11 @@ def test_verdict_says_what_is_outstanding_instead_of_review_the_failures() -> No
     # Both real options are offered: close the gap, or accept it knowingly.
     assert "reload those tables" in body
     assert "accept the gap" in body
+    # The body must not imply a plain reload fills the gap: these rows hit a permanent
+    # limit, so it says reloading alone won't help and the source value must change
+    # first (change B -- same root as the recovery-section fix).
+    assert "reloading alone will not help" in body
+    assert "reduce the offending source value" in body
 
     # Partially explained -> still the blunt hold, but it points out the known part so the
     # reviewer is not re-investigating it.
@@ -3953,3 +3958,96 @@ def test_recovery_quiesce_notice_shows_only_when_the_source_has_drifted() -> Non
     assert "quiesce the source first" not in quiet_body
     assert "moving target" not in quiet_body  # the removed info fallback
     assert "Re-run Full Load + CDC to backfill the gap" in quiet_body
+
+
+def test_recovery_fully_explained_gap_does_not_offer_the_full_load_reload_runbook() -> None:
+    """A permanently-quarantined gap must NOT be sent through "re-run Full Load".
+
+    When the whole shortfall is rows the migration already reported dropping, those rows
+    hit a permanent DSQL limit (e.g. >1 MiB), so a plain reload re-quarantines them. The
+    old recovery notice claimed "the Full Load only fills missing rows" and printed the
+    Stop-CDC -> reload -> resume runbook -- false for these rows, and contradicting the
+    verdict banner's "accept the gap or fix the source and reload" right above it.
+    """
+    from dsql_migrator.ui.validation import _render_recovery_section, summarize_validation
+
+    ui = _CopyUi()
+    _render_recovery_section(
+        ui, summarize_validation(_quarantine_report(dropped=3, missing=3)), _drift_na()
+    )
+    body = ui.body()
+    # Names the real nature and the two real paths.
+    assert "can't be stored as-is" in body or "cannot bring them in" in body
+    assert "exceeds a permanent Aurora DSQL limit" in body
+    assert "Amazon S3" in body           # the "shrink the value" path (workshop 077)
+    assert "accept the gap" in body
+    # The idempotent-reload runbook must be gone for this case.
+    assert "Re-run Full Load + CDC to backfill the gap" not in body
+    assert "only fills missing rows" not in body
+    assert "Steps to recover" not in body
+
+
+def test_recovery_mixed_gap_keeps_the_reload_runbook_not_the_shrink_notice() -> None:
+    """One table permanently-quarantined AND another a real loadable loss = unexplained.
+
+    fully_explained must require unexplained_mismatched_tables == 0, not merely "some
+    explained table exists": here product_media is exactly explained but orders is a real
+    gap the Full Load CAN close, so the reload runbook is correct and the shrink-or-accept
+    notice would wrongly tell the operator a loadable gap is unrecoverable.
+    """
+    from dsql_migrator.core.models import (
+        ReconcileResult,
+        TableValidationResult,
+        ValidationMode,
+        ValidationReport,
+    )
+    from dsql_migrator.ui.validation import _render_recovery_section, summarize_validation
+
+    def _t(name, src, tgt, q=0, miss=0):
+        return TableValidationResult(
+            table=name, source_row_count=src, target_row_count=tgt,
+            row_count_match=(src == tgt), checksum_match=(src == tgt),
+            matched=(src == tgt), rows_quarantined=q,
+            reconcile=ReconcileResult(
+                pk_column="id", source_count=src, target_count=tgt,
+                missing_on_target=miss, extra_on_target=0, consistent=(miss == 0),
+            ),
+        )
+
+    report = ValidationReport(
+        items=[
+            _t("ecommerce.product_media", 15, 12, q=3, miss=3),  # fully explained
+            _t("ecommerce.orders", 500, 495, q=0, miss=5),       # real, loadable gap
+        ],
+        mode=ValidationMode.CHECKSUM,
+        snapshot_timestamp=None,
+    )
+    summary = summarize_validation(report)
+    assert summary.unexplained_mismatched_tables == 1  # not fully explained
+
+    ui = _CopyUi()
+    _render_recovery_section(ui, summary, _drift_na())
+    body = ui.body()
+    assert "Re-run Full Load + CDC to backfill the gap" in body
+    assert "Steps to recover" in body
+    assert "exceeds a permanent Aurora DSQL limit" not in body
+
+
+def test_recovery_unexplained_gap_keeps_the_full_load_reload_runbook() -> None:
+    """The control: a gap of rows that CAN load still gets the reload runbook.
+
+    Dropped 1 but 3 short -> 2 rows unaccounted for (unexplained). Those are rows the
+    Full Load can bring in, so the Stop-CDC -> reload -> resume path is the right fix and
+    must stay.
+    """
+    from dsql_migrator.ui.validation import _render_recovery_section, summarize_validation
+
+    ui = _CopyUi()
+    _render_recovery_section(
+        ui, summarize_validation(_quarantine_report(dropped=1, missing=3)), _drift_na()
+    )
+    body = ui.body()
+    assert "Re-run Full Load + CDC to backfill the gap" in body
+    assert "Steps to recover" in body
+    # And it must NOT mis-apply the permanent-limit language to a loadable gap.
+    assert "exceeds a permanent Aurora DSQL limit" not in body
