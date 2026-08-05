@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.252
+
+### Fixed
+
+- **Deleting the CDC infrastructure left the pipeline looking like it was still streaming.**
+  Pressing "Delete CDC infrastructure" started the teardown, but CloudFormation does not
+  remove the connectors instantly — so discovery kept reporting both as RUNNING for the
+  whole ~20 minute delete. The card body said "Deleting infrastructure" while a green
+  **"Streaming"** badge sat next to it, and the Live status panel, its dead-letter queue,
+  and the per-table migration status table all stayed on screen showing replication figures
+  for a pipeline being dismantled. A teardown the operator asked for now outranks a
+  connector state that is only true for another minute: the badge reads "Deleting…" (or
+  "Stopping…" for Stop CDC, which leaves the MSK cluster behind), and the three monitoring
+  views hide until the teardown finishes. They share one visibility predicate so they cannot
+  diverge, and a Start CDC in flight still shows them — that ramp is when they matter most.
+
 ## v0.1.251
 
 ### Added

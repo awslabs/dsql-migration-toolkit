@@ -1136,6 +1136,63 @@ def classify_cdc_card_phase(
         return "provisioning"
     return "running"
 
+def cdc_teardown_badge(migration_state, job_manager) -> Optional[tuple[str, str]]:
+    """``(badge_text, color)`` while a teardown is in flight, else ``None``.
+
+    The CDC pipeline card derives its badge from the live connector phase, and a
+    teardown does not remove the connectors instantly: CloudFormation is still
+    deleting them, so discovery keeps reporting both as RUNNING and
+    :func:`classify_cdc_card_phase` keeps returning ``"running"``. Because the badge
+    chain tested ``phase == "running"`` FIRST, pressing "Delete CDC infrastructure"
+    left a green **"Streaming"** pinned next to a card whose body already said
+    "Deleting infrastructure" -- two contradictory verdicts, and the reassuring one
+    was the wrong one (nothing will be streaming shortly).
+
+    A teardown is therefore checked BEFORE the phase: the operator's own committed
+    action outranks a connector state that is only true for another minute or two.
+    Names which teardown it is, since Stop CDC (connectors only, MSK kept) and Delete
+    infrastructure (everything) leave very different systems behind.
+
+    Pure apart from reading the job's status through ``job_manager``; no AWS I/O.
+    """
+    kind = getattr(migration_state, "cdc_action_kind", None)
+    if kind not in ("delete", "stop"):
+        return None
+    job = _current_job(job_manager, getattr(migration_state, "cdc_deploy_job_id", None))
+    if job is None or job.status not in ("PENDING", "RUNNING"):
+        return None
+    # "primary" (not positive/warning): a teardown the operator asked for is a normal
+    # in-progress operation, not a fault.
+    return ("Deleting…", "primary") if kind == "delete" else ("Stopping…", "primary")
+
+
+def cdc_monitoring_visible(migration_state, job_manager) -> bool:
+    """Whether the CDC monitoring surfaces should render at all.
+
+    One predicate for the three views that only make sense against a live pipeline --
+    **Live status** (connector health + stream-lag chart), the **dead-letter queue**
+    panel nested inside it, and the **per-table migration status** table. They read the
+    same signals, so a divergent gate would leave the screen self-contradictory.
+
+    Two conditions, both required:
+
+    * CDC has STARTED (:func:`cdc_streaming_started`) -- true from the moment Start CDC
+      is pressed, so the views are present through the connectors' ~10-20 min ramp,
+      which is exactly when the operator wants to watch them come up.
+    * No teardown is in flight (:func:`cdc_teardown_badge`). This is the gap: a Delete
+      (or Stop) does not remove the connectors instantly, so discovery keeps reporting
+      them and ``cdc_streaming_started`` stays true for the whole ~20 min teardown --
+      leaving a live stream-lag chart, connector health, and per-table replication
+      figures on screen for a pipeline being dismantled. Those numbers are about to
+      become meaningless, and the delete progress is what the operator needs instead.
+
+    Pure apart from reading the job's status through ``job_manager``; no AWS I/O.
+    """
+    if not cdc_streaming_started(migration_state, job_manager):
+        return False
+    return cdc_teardown_badge(migration_state, job_manager) is None
+
+
 def cdc_unstable_message(status: Optional[str]) -> tuple[str, str, str, str]:
     """Message for the ``unstable`` CDC card, keyed on the raw stack status.
 
@@ -1404,8 +1461,14 @@ def _render_cdc_start_action(
                 )
             )
             _unstable_badge_color = "primary" if _unstable_tone == "info" else "warning"
+            # A teardown in flight outranks the connector phase: CloudFormation has not
+            # removed the connectors yet, so discovery still reports "running" and the
+            # badge read a green "Streaming" beside a body saying "Deleting
+            # infrastructure". See cdc_teardown_badge.
+            _teardown = cdc_teardown_badge(migration_state, job_manager)
             badge_text, badge_color, icon_color = (
-                ("Streaming", "positive", "positive") if phase == "running"
+                (_teardown[0], _teardown[1], _teardown[1]) if _teardown is not None
+                else ("Streaming", "positive", "positive") if phase == "running"
                 else ("Provisioning…", "primary", "primary") if phase == "provisioning"
                 else ("Working…", "primary", "primary") if deploying
                 else ("Incomplete", "warning", "warning") if phase == "partial"
@@ -3733,10 +3796,11 @@ def _render_migration_table_status(
     Matches ``_render_cdc_live_monitoring`` directly above it, which is likewise
     "meaningful only once streaming".
     """
-    # cdc_streaming_started (not cdc_pipeline_live) so the table appears the moment
-    # Start CDC is pressed: the connectors take ~10-20 min to reach RUNNING and the
-    # operator wants the per-table view during that ramp, not only after it.
-    if not cdc_streaming_started(migration_state, job_manager):
+    # cdc_monitoring_visible: appears the moment Start CDC is pressed (the connectors
+    # take ~10-20 min to reach RUNNING and the operator wants the per-table view during
+    # that ramp), and disappears again while a teardown is in flight -- replication
+    # figures for a pipeline being dismantled are about to be meaningless.
+    if not cdc_monitoring_visible(migration_state, job_manager):
         return
     table_names = _migration_status_tables(migration_state, job_manager)
     if not table_names:
@@ -4209,9 +4273,11 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
     :func:`cdc_streaming_started` (not ``cdc_pipeline_live``) so it appears the moment
     Start CDC is pressed and stays through the connectors' ~10-20 min ramp -- which is
     exactly when the operator wants to watch them come up. Matches the per-table table
-    below, which uses the same gate.
+    below, which uses the same gate. The dead-letter panel is rendered INSIDE this
+    section, so it inherits the same visibility -- see :func:`cdc_monitoring_visible`,
+    which also hides all of it while a teardown is in flight.
     """
-    if not cdc_streaming_started(migration_state, job_manager):
+    if not cdc_monitoring_visible(migration_state, job_manager):
         return
     ui.label("Live status").classes("text-sm font-semibold")  # type: ignore[attr-defined]
 

@@ -14591,3 +14591,261 @@ def test_start_progress_still_shows_the_estimated_remaining() -> None:
     joined = " ".join(ui.texts)
     assert "remaining" in joined and "est." in joined
     assert "up to ~20 min" not in joined
+
+
+class _TeardownJobManager:
+    """Job manager returning one canned status, or raising for an unknown id."""
+
+    def __init__(self, status=None):
+        self._status = status
+
+    def get_status(self, job_id):
+        from dsql_migrator.core.job_manager import JobNotFoundError
+
+        if self._status is None:
+            raise JobNotFoundError(job_id)
+
+        class _J:
+            pass
+
+        j = _J()
+        j.status = self._status
+        return j
+
+
+def test_delete_in_flight_replaces_the_streaming_badge() -> None:
+    """The reported defect: "Delete CDC infrastructure" left a green "Streaming".
+
+    CloudFormation does not remove the connectors instantly, so discovery keeps
+    reporting both as RUNNING and the card phase stays "running" -- while the card body
+    already says "Deleting infrastructure". Two contradictory verdicts, and the
+    reassuring one was wrong.
+    """
+    from dsql_migrator.ui.data_migration._cdc_ui import cdc_teardown_badge
+
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("job-del", kind="delete")
+
+    assert cdc_teardown_badge(state, _TeardownJobManager("RUNNING")) == (
+        "Deleting…",
+        "primary",
+    )
+
+
+def test_stop_in_flight_is_named_distinctly_from_delete() -> None:
+    # Stop CDC (connectors only, MSK kept) and Delete (everything) leave very
+    # different systems behind, so the badge must not conflate them.
+    from dsql_migrator.ui.data_migration._cdc_ui import cdc_teardown_badge
+
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("job-stop", kind="stop")
+
+    assert cdc_teardown_badge(state, _TeardownJobManager("RUNNING")) == (
+        "Stopping…",
+        "primary",
+    )
+
+
+def test_teardown_badge_clears_once_the_job_finishes() -> None:
+    """Scoped to the RUN. Once the job ends, the live phase must speak again.
+
+    Otherwise the card would be stuck on "Deleting…" forever after a teardown, instead
+    of falling through to "Not deployed".
+    """
+    from dsql_migrator.ui.data_migration._cdc_ui import cdc_teardown_badge
+
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("job-del", kind="delete")
+
+    assert cdc_teardown_badge(state, _TeardownJobManager("DONE")) is None
+
+
+def test_non_teardown_jobs_do_not_claim_the_badge() -> None:
+    # Start / infra have their own badges ("Provisioning…", "Working…"); a teardown
+    # check that swallowed them would be a regression in the other direction.
+    from dsql_migrator.ui.data_migration._cdc_ui import cdc_teardown_badge
+
+    for kind in ("start", "infra"):
+        state = DataMigrationState()
+        state.set_cdc_deploy_job_id("job-1", kind=kind)
+        assert cdc_teardown_badge(state, _TeardownJobManager("RUNNING")) is None, (
+            f"{kind} must not be reported as a teardown"
+        )
+
+
+def test_teardown_badge_is_checked_before_the_running_phase() -> None:
+    """Wiring: the ORDER is the bug. The teardown must outrank phase == "running".
+
+    The helper can be correct while the badge chain still tests "running" first --
+    which is exactly the state the card was in.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    src = inspect.getsource(_cdc_ui._render_cdc_start_action)
+    tree = ast.parse(src.strip())
+    # Locate the badge tuple assignment and read its conditional chain in order.
+    chain = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Tuple)
+            and any(
+                isinstance(e, ast.Name) and e.id == "badge_text" for e in t.elts
+            )
+            for t in node.targets
+        ):
+            chain = ast.unparse(node.value)
+    assert chain is not None, "the badge chain assignment must exist"
+    teardown_at = chain.find("_teardown")
+    streaming_at = chain.find("'Streaming'")
+    assert teardown_at != -1, "the badge chain must consult the teardown state"
+    assert streaming_at != -1, "the Streaming badge must still exist"
+    assert teardown_at < streaming_at, (
+        "the teardown check must come BEFORE phase == 'running', or a live delete "
+        "keeps showing a green Streaming badge"
+    )
+
+
+def _live_cdc_state(*, kind=None):
+    """State for a streaming pipeline, optionally with a lifecycle job in flight."""
+    from dsql_migrator.core.cdc import cdc_expected_connector_names
+
+    state = DataMigrationState()
+    src, sink = cdc_expected_connector_names(state.cdc_stack_name)
+    state.set_cdc_connector_names([src, sink])
+    state.set_cdc_controller(object())
+    if kind is not None:
+        state.set_cdc_deploy_job_id("job-1", kind=kind)
+    return state
+
+
+def test_monitoring_hidden_while_the_infrastructure_is_being_deleted() -> None:
+    """Reported: Live status / per-table / DLQ stayed up during a delete.
+
+    A teardown does not remove the connectors instantly, so discovery keeps reporting
+    them and cdc_streaming_started stays true for the whole ~20 min delete -- leaving a
+    live stream-lag chart and per-table replication figures on screen for a pipeline
+    being dismantled.
+    """
+    from dsql_migrator.ui.data_migration._cdc_ui import cdc_monitoring_visible
+
+    assert (
+        cdc_monitoring_visible(
+            _live_cdc_state(kind="delete"), _TeardownJobManager("RUNNING")
+        )
+        is False
+    )
+
+
+def test_monitoring_hidden_while_stopping_cdc() -> None:
+    # Stop CDC removes the connectors too, so the live views are equally moot.
+    from dsql_migrator.ui.data_migration._cdc_ui import cdc_monitoring_visible
+
+    assert (
+        cdc_monitoring_visible(
+            _live_cdc_state(kind="stop"), _TeardownJobManager("RUNNING")
+        )
+        is False
+    )
+
+
+def test_monitoring_visible_for_a_streaming_pipeline() -> None:
+    # The control: with no teardown in flight the views must show, which is their point.
+    from dsql_migrator.ui.data_migration._cdc_ui import cdc_monitoring_visible
+
+    assert cdc_monitoring_visible(_live_cdc_state(), _TeardownJobManager()) is True
+
+
+def test_monitoring_still_visible_during_the_connector_ramp() -> None:
+    """A Start CDC in flight must NOT hide the views -- that is when they matter most.
+
+    Scoping the hide to teardowns only is what keeps the ramp observable.
+    """
+    from dsql_migrator.ui.data_migration._cdc_ui import cdc_monitoring_visible
+
+    state = DataMigrationState()
+    state.set_cdc_deploy_job_id("job-start", kind="start")
+
+    assert cdc_monitoring_visible(state, _TeardownJobManager("RUNNING")) is True
+
+
+def test_live_status_section_hidden_during_a_delete_including_its_dlq_panel() -> None:
+    """Renders the real section: header, chart and the nested DLQ panel all go.
+
+    The DLQ panel lives INSIDE the Live status section, so it must vanish with its
+    parent rather than needing its own gate.
+    """
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    state = _live_cdc_state(kind="delete")
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_live_monitoring(ui, state, _TeardownJobManager("RUNNING"))
+
+    joined = " ".join(ui.texts)
+    assert "Live status" not in joined
+    assert "Stream lag" not in joined
+    assert "Dead-letter queue" not in joined, (
+        "the DLQ panel must disappear with the Live status section it sits inside"
+    )
+
+
+def test_per_table_status_hidden_during_a_delete() -> None:
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    state = _live_cdc_state()
+    state.job_id = "fullload-1"
+    # Distinct ids: the Full Load job supplies the table set, while the CDC lifecycle
+    # job is the in-flight teardown.
+    state.set_cdc_deploy_job_id("cdc-del", kind="delete")
+
+    class _Sess:
+        target_config = None
+        aws_profile = None
+
+    class _JM:
+        def get_status(self, job_id):
+            from dsql_migrator.core.job_manager import JobNotFoundError
+
+            if job_id == "fullload-1":
+                return MigrationJob(
+                    job_id="fullload-1",
+                    status="DONE",
+                    chunks=[ChunkState(chunk_id="ecommerce.orders", status="DONE")],
+                )
+            if job_id == "cdc-del":
+                class _J:
+                    status = "RUNNING"
+
+                return _J()
+            raise JobNotFoundError(job_id)
+
+    ui = _RecordingUi()
+    _cdc_ui._render_migration_table_status(
+        ui, state, _JM(), _Sess(), inventory=None
+    )
+    assert not any("Per-table migration status" in t for t in ui.texts)
+
+
+def test_both_monitoring_views_share_one_visibility_gate() -> None:
+    """Wiring: a divergent gate would leave the screen self-contradictory.
+
+    Pins that neither call site reverted to the bare cdc_streaming_started check.
+    """
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    for fn in (
+        _cdc_ui._render_cdc_live_monitoring,
+        _cdc_ui._render_migration_table_status,
+    ):
+        src = inspect.getsource(fn)
+        assert "if not cdc_monitoring_visible(" in src, (
+            f"{fn.__name__} must gate on the shared cdc_monitoring_visible predicate"
+        )
+        assert "if not cdc_streaming_started(" not in src, (
+            f"{fn.__name__} must not bypass the shared gate with the raw predicate"
+        )
