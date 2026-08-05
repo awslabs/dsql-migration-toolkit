@@ -821,14 +821,16 @@ def included_from_exclusions(
 class ValidationScope:
     """Human-facing description of WHAT a validation run covers (for the UI).
 
-    Surfaces the run's identity before/independently of results: the migration
-    type, the source and target endpoints, the table scope (count + whether it is
-    a migration-selected subset + a short name sample), and the as-of consistency
-    point. All fields are display strings/derived counts so the render helper
-    stays trivial.
+    Surfaces the run's identity before/independently of results: the source and
+    target endpoints, the table scope (count + whether it is a migration-selected
+    subset + a short name sample), and the as-of consistency point. Migration type
+    is deliberately NOT here: validation is a pure source-vs-target comparison that
+    behaves identically however the rows arrived (Full Load vs CDC), and a session
+    only records the LAST-chosen type, so showing it here (e.g. "CDC only" after a
+    Full Load → CDC run) was both irrelevant and misleading. All fields are display
+    strings/derived counts so the render helper stays trivial.
     """
 
-    migration_type: str
     source_label: str
     source_detail: str
     target_label: str
@@ -850,7 +852,6 @@ _SCOPE_SAMPLE_LIMIT = 8
 
 def build_validation_scope(
     *,
-    migration_type: str,
     source_config: Optional[SourceConnectionConfig],
     target_config: Optional[TargetConnectionConfig],
     target_cluster_name: Optional[str],
@@ -892,7 +893,6 @@ def build_validation_scope(
         target_detail = "not connected"
 
     return ValidationScope(
-        migration_type=migration_type,
         source_label=source_label,
         source_detail=source_detail,
         target_label=target_label,
@@ -914,25 +914,6 @@ def _dsql_cluster_id(endpoint: str) -> str:
         return "Aurora DSQL"
     head, marker, _rest = endpoint.partition(".dsql.")
     return head if marker else endpoint.split(".", 1)[0]
-
-
-def _migration_type_label(session: object) -> str:
-    """Return the chosen migration type's human label (e.g. 'Full load + CDC').
-
-    Resolved via the Data Migration metadata so the Validation card names the same
-    pattern the user picked on Data Migration. Lazily imported (data_migration
-    imports nothing from here, but keeps this module import-light) and degrades to
-    a neutral label if it cannot be resolved.
-    """
-    try:
-        from dsql_migrator.ui.data_migration import _MIGRATION_TYPE_META
-
-        meta = _MIGRATION_TYPE_META.get(getattr(session, "migration_type", None))
-        if meta is not None:
-            return meta.label
-    except Exception:  # noqa: BLE001 - decorative; never break the page
-        pass
-    return "Migration"
 
 
 def _cdc_in_use(session: object) -> bool:
@@ -1764,7 +1745,6 @@ def build_validation_screen(
                     inventory, migration_state.selection
                 )
                 scope_view = build_validation_scope(
-                    migration_type=_migration_type_label(session),
                     source_config=session.source_config,
                     target_config=session.target_config,
                     target_cluster_name=getattr(
@@ -2448,12 +2428,13 @@ def _render_scope_card(
 ) -> None:
     """Render the "Validating" context card: WHAT this run covers, with a filter.
 
-    A Cloudscape "Container" with the migration type in the header band and a body
-    that identifies source -> target, the table scope (count + subset/filtered
-    note + a short chip sample), the as-of consistency point, and an object filter
-    picker so the user can validate only specific tables within the migration
-    scope. ``scope_tables`` is the full migration scope (the filter's option
-    list); the filter narrows it.
+    A Cloudscape "Container" whose body identifies source -> target, the table
+    scope (count + subset/filtered note + a short chip sample), the as-of
+    consistency point, and an object filter picker so the user can validate only
+    specific tables within the migration scope. Migration type is intentionally not
+    shown: it does not affect the source-vs-target comparison and would only
+    misreport the last-chosen type. ``scope_tables`` is the full migration scope
+    (the filter's option list); the filter narrows it.
     """
     # Table scope summary line (count + whether it is filtered / a migration subset).
     if scope.is_filtered:
@@ -2474,7 +2455,6 @@ def _render_scope_card(
         with ui.element("div").classes(  # type: ignore[attr-defined]
             "grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-5 w-full"
         ):
-            _kv(ui, "Migration type", scope.migration_type)
             _kv(ui, "As-of (consistency point)", scope.as_of)
             _kv(ui, scope.source_label, scope.source_detail, mono=True)
             _kv(ui, scope.target_label, scope.target_detail, mono=True)

@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.264
+
+### Changed
+
+- **The Validation "Validating" card no longer shows a "Migration type" row.** Validation
+  is a pure source-vs-target comparison — the engine (`validator.validate`) takes no
+  migration type and behaves identically however the rows arrived (Full Load vs CDC), so
+  the type never changed what this screen does. Worse, a session records only the
+  last-chosen type, so a Full Load → CDC-only run displayed just "CDC only", which
+  misrepresented what was actually migrated. The type is already conveyed on the Data
+  Migration step and the migration-type banner, so it was removed here. (The cut-over
+  runbook and drift verdict still branch on whether CDC is in use — that logic is
+  unchanged.)
+
 ## v0.1.263
 
 ### Changed

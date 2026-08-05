@@ -586,7 +586,6 @@ def test_build_validation_scope_labels_source_target_and_subset() -> None:
         _inventory(), TableSelection(selected_tables=["customers"])
     )
     view = build_validation_scope(
-        migration_type="Full load + CDC",
         source_config=SourceConnectionConfig(
             host="db.abc.us-east-1.rds.amazonaws.com", database="app"
         ),
@@ -597,7 +596,6 @@ def test_build_validation_scope_labels_source_target_and_subset() -> None:
         scope=scope,
         watermark=_watermark(),
     )
-    assert view.migration_type == "Full load + CDC"
     assert "app" in view.source_label
     assert view.source_detail == "db.abc.us-east-1.rds.amazonaws.com"
     # Cluster id derived from the endpoint when no friendly name is set.
@@ -615,7 +613,6 @@ def test_build_validation_scope_labels_source_target_and_subset() -> None:
 def test_build_validation_scope_prefers_cluster_name_and_live_as_of() -> None:
     scope = resolve_validation_tables(_inventory(), TableSelection())
     view = build_validation_scope(
-        migration_type="Full load only",
         source_config=SourceConnectionConfig(host="h", database="app"),
         target_config=TargetConnectionConfig(
             cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"
@@ -644,7 +641,6 @@ def test_build_validation_scope_samples_and_overflows_many_tables() -> None:
     )
     scope = resolve_validation_tables(many, TableSelection())
     view = build_validation_scope(
-        migration_type="Full load only",
         source_config=SourceConnectionConfig(host="h", database="app"),
         target_config=TargetConnectionConfig(
             cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"
@@ -715,7 +711,6 @@ def test_included_from_exclusions_semantics() -> None:
 def test_build_validation_scope_reports_filtered_counts() -> None:
     scope = resolve_validation_tables(_inventory(), TableSelection())  # 2 tables
     view = build_validation_scope(
-        migration_type="Full load only",
         source_config=SourceConnectionConfig(host="h", database="app"),
         target_config=TargetConnectionConfig(
             cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"
@@ -734,7 +729,6 @@ def test_build_validation_scope_reports_filtered_counts() -> None:
 def test_build_validation_scope_not_filtered_when_filter_covers_scope() -> None:
     scope = resolve_validation_tables(_inventory(), TableSelection())
     view = build_validation_scope(
-        migration_type="Full load only",
         source_config=SourceConnectionConfig(host="h", database="app"),
         target_config=TargetConnectionConfig(
             cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"
@@ -747,6 +741,36 @@ def test_build_validation_scope_not_filtered_when_filter_covers_scope() -> None:
     # Selecting everything is not a "filtered" subset.
     assert view.is_filtered is False
     assert view.table_count == 2
+
+
+def test_validation_scope_does_not_carry_or_show_migration_type() -> None:
+    """The "Validating" card must not surface a migration type.
+
+    Validation is a pure source-vs-target comparison -- ``validator.validate`` takes no
+    migration type and behaves identically however the rows arrived (Full Load vs CDC).
+    A session also records only the LAST-chosen type, so "CDC only" after a Full Load ->
+    CDC run was both irrelevant and misleading. So the field is gone from ValidationScope,
+    build_validation_scope takes no such kwarg, and the scope card renders no "Migration
+    type" pair.
+    """
+    import inspect
+
+    from dsql_migrator.ui.validation import (
+        ValidationScope,
+        _render_scope_card,
+        build_validation_scope,
+    )
+
+    # The dataclass no longer has the field, and the builder no longer accepts the kwarg.
+    assert "migration_type" not in ValidationScope.__dataclass_fields__
+    assert "migration_type" not in inspect.signature(build_validation_scope).parameters
+
+    # The card body does not render a "Migration type" key-value pair (and the removed
+    # _migration_type_label helper is gone from the module).
+    card_src = inspect.getsource(_render_scope_card)
+    assert '"Migration type"' not in card_src
+    module_src = inspect.getsource(inspect.getmodule(_render_scope_card))
+    assert "_migration_type_label" not in module_src
 
 
 # ---------------------------------------------------------------------------
