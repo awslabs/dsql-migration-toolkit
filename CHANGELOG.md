@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.253
+
+### Fixed
+
+- **The seeder-ENI wait during a CDC delete still left the log silent for ~18 minutes.**
+  v0.1.251 added the reporting but logged only when the interface count *changed*, so an
+  observed teardown went "MskCluster DELETE_COMPLETE" (02:46) → nothing → "Seeder network
+  interfaces released." (03:05). The operator learned what was happening only after it
+  finished — the same "looks frozen" symptom the reporting was meant to cure. The wait is
+  now re-reported every ~2 minutes while the count is unchanged, carrying elapsed minutes
+  ("Waiting for AWS to reclaim 2 seeder network interfaces — 6 min so far"), so a long
+  reclamation reads as progressing. Rapid polls inside that window still emit one line, so
+  the stack events are not drowned.
+
 ## v0.1.252
 
 ### Fixed

@@ -967,6 +967,12 @@ class _StageDriver:
 # so repeated Start/iterate cycles can exhaust the quota and wedge the cluster --
 # unrecoverable in place. We detect the signature in CloudFormation/MSK event text
 # and turn the otherwise-opaque failure into an actionable recovery instruction.
+# How often to re-report an unchanged seeder-ENI wait during a delete. The wait has no
+# CloudFormation events and routinely runs ~15-20 min, so a change-only line leaves the
+# log silent for that whole stretch and the teardown reads as hung. 2 min is frequent
+# enough to prove liveness without drowning the stack events (polls are ~30s).
+_ENI_REPORT_INTERVAL_SECONDS = 120.0
+
 _PARTITION_QUOTA_GUIDANCE = (
     "Stack operation ended in '{status}' because the MSK Serverless partition "
     "quota is exhausted. Each connector create/delete consumes partitions that "
@@ -1093,13 +1099,19 @@ def _wait_stack_settles(
     plugin defect, …) becomes actionable guidance instead of an opaque
     "Stack operation ended in 'UPDATE_ROLLBACK_COMPLETE'".
     """
+    import time as _time
+
     deadline = _monotonic_deadline(timeout)
     seen_until = since
     saw_partition_quota = False
-    # Last-reported seeder-ENI count, so the delete path logs only on CHANGE (a line
-    # every 30s poll would drown the stack events). ``-2`` is an unused sentinel so the
-    # first real reading (including 0) always prints.
+    # Seeder-ENI reporting state. ``-2`` is an unused sentinel so the first real
+    # reading (including 0) always prints. ``eni_wait_started`` / ``eni_last_logged``
+    # drive the periodic re-report: logging ONLY on change left an observed 18m30s gap
+    # between "MskCluster DELETE_COMPLETE" and "Seeder network interfaces released.",
+    # which reads as a hung teardown -- the very symptom this reporting exists to cure.
     last_eni_count = -2
+    eni_wait_started: Optional[float] = None
+    eni_last_logged: Optional[float] = None
     while True:
         if driver.cancelled:
             return None
@@ -1114,20 +1126,40 @@ def _wait_stack_settles(
             if _is_partition_quota_message(msg):
                 saw_partition_quota = True
         # Delete only: report the seeder-ENI reclamation that CloudFormation is silent
-        # about, so the long tail of the teardown does not look frozen. Logged on
-        # change: "still reclaiming N …" while any remain, then "released" at zero.
+        # about, so the long tail of the teardown does not look frozen. Reported on
+        # CHANGE *and* periodically while the count is unchanged -- the wait routinely
+        # runs ~15-20 min with no stack event, so a change-only line leaves a silent gap
+        # that reads as a hang (observed: 18m30s between the last CFN event and
+        # "released"). The re-report carries elapsed minutes so the operator can see it
+        # is progressing rather than stuck.
         if watch_seeder_enis:
             count = deployer.seeder_eni_count(stack_name)
-            if count is not None and count != last_eni_count:
+            if count is not None:
+                now_mono = _time.monotonic()
+                changed = count != last_eni_count
                 if count > 0:
-                    noun = "interface" if count == 1 else "interfaces"
-                    driver.log(
-                        f"Waiting for AWS to reclaim {count} seeder network "
-                        f"{noun} (no CloudFormation event until done)…"
+                    if eni_wait_started is None:
+                        eni_wait_started = now_mono
+                    due = (
+                        eni_last_logged is None
+                        or (now_mono - eni_last_logged) >= _ENI_REPORT_INTERVAL_SECONDS
                     )
-                elif last_eni_count > 0:
+                    if changed or due:
+                        noun = "interface" if count == 1 else "interfaces"
+                        waited = int((now_mono - eni_wait_started) // 60)
+                        # Only mention elapsed time once there is some to mention, so
+                        # the first line stays clean.
+                        elapsed = f" — {waited} min so far" if waited >= 1 else ""
+                        driver.log(
+                            f"Waiting for AWS to reclaim {count} seeder network "
+                            f"{noun}{elapsed} (no CloudFormation event until done)…"
+                        )
+                        eni_last_logged = now_mono
+                elif changed and last_eni_count > 0:
                     # Only announce release if we had previously seen some pending.
                     driver.log("Seeder network interfaces released.")
+                    eni_wait_started = None
+                    eni_last_logged = None
                 last_eni_count = count
         status = deployer.stack_status(stack_name)
         if status is None:

@@ -788,8 +788,13 @@ def test_delete_logs_seeder_eni_reclamation() -> None:
     assert "Seeder network interfaces released." in joined
 
 
-def test_delete_eni_wait_logged_once_per_change_not_every_poll() -> None:
-    # A line every 30s poll would drown the stack events; log only on CHANGE.
+def test_delete_eni_wait_not_logged_on_every_poll() -> None:
+    """Rapid polls within the re-report interval must not each emit a line.
+
+    The wait reports on CHANGE plus at most every _ENI_REPORT_INTERVAL_SECONDS, so a
+    burst of polls (as here, with no wall-clock advance) yields ONE line rather than one
+    per poll -- otherwise the ENI reporting would drown the stack events.
+    """
     handle = _FakeHandle()
     logs, on_log = _logs()
     existing = CdcStackDiscovery("CREATE_COMPLETE", {}, True)
@@ -804,6 +809,53 @@ def test_delete_eni_wait_logged_once_per_change_not_every_poll() -> None:
     )
     waiting_lines = [m for m in logs if "reclaim 1 seeder network interface" in m]
     assert len(waiting_lines) == 1, f"expected one waiting line, got {waiting_lines}"
+
+
+def test_delete_eni_wait_is_re_reported_while_it_drags_on() -> None:
+    """The reported defect: an 18m30s silent gap before "released".
+
+    Logging only on CHANGE meant that during the ~15-20 min reclamation -- which emits
+    no CloudFormation events -- the log went completely silent, so the teardown read as
+    hung and the user only learned what happened after it finished. The wait must
+    re-report periodically, with elapsed minutes, while the count is unchanged.
+    """
+    import itertools
+    import time
+
+    import dsql_migrator.core.cdc_deployer as cdc_deployer
+
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    existing = CdcStackDiscovery("CREATE_COMPLETE", {}, True)
+    # ENIs stay pending for many polls, then clear.
+    deployer = _FakeDeployer(
+        existing=existing,
+        stack_statuses=("DELETE_IN_PROGRESS",) * 20 + (None,),
+        seeder_eni_counts=[2] * 20 + [0],
+    )
+    # Advance the monotonic clock 30s per read, mirroring the real 30s poll interval.
+    clock = itertools.count(0.0, 30.0)
+    original = time.monotonic
+    time.monotonic = lambda: next(clock)
+    try:
+        run_cdc_delete(
+            handle, stack_name=STACK, deployer=deployer, on_log=on_log,
+            sleep=lambda _s: None,
+            delete_timeout_seconds=1e9, poll_interval_seconds=0.0,
+        )
+    finally:
+        time.monotonic = original
+
+    waiting = [m for m in logs if "seeder network interface" in m]
+    assert len(waiting) > 1, (
+        f"the wait must be re-reported while it drags on, got {len(waiting)}: {waiting}"
+    )
+    # And the re-reports must carry elapsed time, so it reads as progressing.
+    assert any("min so far" in m for m in waiting), (
+        f"re-reports must include elapsed minutes; got {waiting}"
+    )
+    # The first line stays clean (no "0 min so far").
+    assert "min so far" not in waiting[0]
 
 
 def test_delete_no_release_line_when_enis_were_never_pending() -> None:

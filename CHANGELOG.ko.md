@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.253
+
+### 수정
+
+- **CDC 삭제 중 seeder ENI 대기 구간의 로그가 여전히 약 18분간 비어 있었습니다.** v0.1.251에서
+  보고 기능을 넣었지만 인터페이스 개수가 *변할 때만* 기록했기 때문에, 실제 관측된 삭제에서는
+  "MskCluster DELETE_COMPLETE"(02:46) → 아무것도 없음 → "Seeder network interfaces
+  released."(03:05) 순으로 나타났습니다. 사용자는 상황을 끝난 뒤에야 알게 되어, 이 기능이 없애려던
+  "멈춘 것처럼 보이는" 증상이 그대로 남았습니다. 이제 개수가 그대로여도 약 2분마다 다시 보고하며
+  경과 시간을 함께 표시합니다("Waiting for AWS to reclaim 2 seeder network interfaces —
+  6 min so far"). 그래서 회수가 오래 걸려도 진행 중임이 드러납니다. 그 간격 안의 빠른 폴링은
+  여전히 한 줄만 남기므로 스택 이벤트가 묻히지 않습니다.
+
 ## v0.1.252
 
 ### 수정
