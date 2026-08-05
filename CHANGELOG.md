@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.257
+
+### Changed
+
+- **The "quiesce the source first" caveat in the validation recovery section now shows
+  only when the source has actually drifted.** "How to recover" is the no-go section: the
+  outstanding issue is a real, unexplained mismatch, and the fix is the ordered
+  Full-Load-reload steps. Advising the reader to freeze the source belongs here only when
+  live drift means part of the mismatch may be in-flight (so a reload could chase a moving
+  target). The notice used to render unconditionally — with an `info` fallback even when
+  nothing had drifted — adding a generic cut-over aside to a screen about fixing a concrete
+  gap. That fallback is dropped; the source-changes section and the Cut over step already
+  carry the quiesce guidance for the no-drift case, so this removes a duplicate, not the
+  advice.
+
 ## v0.1.256
 
 ### Changed

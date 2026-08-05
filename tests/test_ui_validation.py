@@ -2613,6 +2613,15 @@ class _CopyUi:
     def column(self, *_a, **_k):
         return self._El(self)
 
+    def card(self, *_a, **_k):
+        # A titled _section() opens `ui.card()` as a context manager; _El already
+        # supports __enter__/__exit__, so a section's header + body land in self.texts.
+        return self._El(self)
+
+    def space(self, *_a, **_k):
+        # section_header() emits a spacer between title and badge.
+        return self._El(self)
+
     def spinner(self, *_a, **_k):
         return self._El(self)
 
@@ -3898,3 +3907,49 @@ def test_validation_section_order_puts_evidence_before_the_readiness_rollup() ->
     assert drift < readiness, labels
     # ...and Export stays last.
     assert readiness < export, labels
+
+
+def _drift_advanced():
+    """A DriftDisplay where the source HAS advanced since the snapshot."""
+    from dsql_migrator.ui.validation import DriftDisplay
+
+    return DriftDisplay(
+        available=True,
+        determinable=True,
+        drifted=True,
+        summary="Source advanced since the snapshot.",
+        watermark_gtid="a:1-10",
+        current_gtid="a:1-25",
+        detail="",
+    )
+
+
+def test_recovery_quiesce_notice_shows_only_when_the_source_has_drifted() -> None:
+    """The quiesce-source caveat belongs in recovery only under live drift.
+
+    "How to recover" is the no-go section: the outstanding issue is a real mismatch and
+    the fix is the ordered Full-Load reload steps. "Quiesce the source" is relevant here
+    only when the source has actually advanced (part of the mismatch may be in-flight, so
+    a reload could chase a moving target). The old unconditional info fallback fired even
+    with no drift -- a generic cut-over aside on a screen about fixing a concrete gap;
+    the drift section and the Cut over step already cover the no-drift case.
+    """
+    from dsql_migrator.ui.validation import _render_recovery_section
+
+    summary = _release_summary(is_match=False, mismatched=1)
+
+    # Drift present -> the warning appears.
+    drifted = _CopyUi()
+    _render_recovery_section(drifted, summary, _drift_advanced())
+    drifted_body = drifted.body()
+    assert "quiesce the source first" in drifted_body
+    # The core recovery guidance is there regardless.
+    assert "Re-run Full Load + CDC to backfill the gap" in drifted_body
+
+    # No drift -> no quiesce aside (but the recovery steps still render).
+    quiet = _CopyUi()
+    _render_recovery_section(quiet, summary, _drift_na())
+    quiet_body = quiet.body()
+    assert "quiesce the source first" not in quiet_body
+    assert "moving target" not in quiet_body  # the removed info fallback
+    assert "Re-run Full Load + CDC to backfill the gap" in quiet_body

@@ -3187,23 +3187,29 @@ def _render_recovery_section(
                     )
                     ui.label(text).classes("text-xs text-gray-700 leading-snug")  # type: ignore[attr-defined]
 
+        # Only when the source has ACTUALLY advanced since the snapshot. This is the
+        # recovery ("How to recover") section for a no-go, so the outstanding issue is
+        # a real, unexplained mismatch -- and the fix is the ordered Full-Load-reload
+        # steps above, not "quiesce the source". The quiesce advice is only relevant
+        # here when live drift means part of the mismatch may be in-flight (so a reload
+        # could chase a moving target); it warns to freeze + re-validate before trusting
+        # the result. The old unconditional ``info`` fallback fired even with no drift,
+        # adding a generic cut-over aside to a screen about fixing a concrete gap -- and
+        # the drift section + the Cut over step already carry the quiesce guidance for
+        # the no-drift case, so dropping it here removes a duplicate, not the advice.
         source_live = bool(drift.available and drift.determinable and drift.drifted)
-        render_notice(
-            ui,
-            tone="warning" if source_live else "info",
-            header="For a definitive zero-loss verdict, quiesce the source first",
-            body=(
-                "The source has changed since the snapshot, so some difference may "
-                "be in-flight. Before the FINAL cut-over check, stop source writes "
-                "and let CDC drain (or Stop CDC from the Data Migration step), then "
-                "re-validate — a clean match then truly means no data was lost."
-                if source_live
-                else
-                "For the FINAL cut-over check, make sure source writes are quiesced "
-                "and CDC has caught up (Stop CDC from the Data Migration step) "
-                "before re-validating, so the target is not a moving target."
-            ),
-        )
+        if source_live:
+            render_notice(
+                ui,
+                tone="warning",
+                header="For a definitive zero-loss verdict, quiesce the source first",
+                body=(
+                    "The source has changed since the snapshot, so some difference may "
+                    "be in-flight. Before the FINAL cut-over check, stop source writes "
+                    "and let CDC drain (or Stop CDC from the Data Migration step), then "
+                    "re-validate — a clean match then truly means no data was lost."
+                ),
+            )
         if diagnose_provider is not None:
             with ui.row().classes("w-full mt-1"):  # type: ignore[attr-defined]
                 ui.button(  # type: ignore[attr-defined]
