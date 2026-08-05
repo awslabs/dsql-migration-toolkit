@@ -2917,12 +2917,18 @@ def _render_result(
     # verdict (how to fix it + ordered steps + the AI diagnosis action). The go
     # path's "how to actually cut over" runbook lives on the dedicated Cut over
     # step (step 6), reached via the Next button — it is not duplicated here.
+    # Section order follows the reader's questions: the verdict (above) answers "can I
+    # cut over?"; on a no-go the recovery path answers "what do I do now?" right under
+    # it (the two are a pair); THEN the evidence answers "why?" -- the failing tables,
+    # the full per-table comparison, orphans, and source drift. "Cut-over readiness" is
+    # a checklist SUMMARISED from that evidence, so it now sits AFTER it (just before
+    # Export), not above it: leading with a summary of numbers the reader has not seen
+    # yet -- and which the top verdict already condenses -- made the recovery advice
+    # arrive before its own justification.
     if not summary.ready_for_cutover:
         _render_recovery_section(
             ui, summary, drift, diagnose_provider=diagnose_provider
         )
-    with _section(ui, icon="fact_check", title="Cut-over readiness"):
-        _render_readiness_checks(ui, summary, drift)
     _render_failing_tables(
         ui, report, summary, drift,
         diagnose_provider=diagnose_provider,
@@ -2941,6 +2947,11 @@ def _render_result(
     # source keep changing while/after we compared?", so it is titled that way.
     with _section(ui, icon="schedule", title="Source changes since the comparison"):
         _render_drift(ui, drift, cdc_in_use=cdc_in_use)
+    # The readiness checklist is a roll-up of everything above (row-count parity,
+    # orphans, drift), so it reads as a final tally right before Export rather than a
+    # preamble before the evidence exists on screen.
+    with _section(ui, icon="fact_check", title="Cut-over readiness"):
+        _render_readiness_checks(ui, summary, drift)
     with _section(ui, icon="download", title="Export report"):
         _render_downloads(ui, report)
 

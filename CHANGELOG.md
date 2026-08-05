@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.255
+
+### Changed
+
+- **Validation section order now leads with the evidence, not the roll-up.** On a no-go the
+  page showed "How to recover" and then the "Cut-over readiness" checklist *above* the
+  comparison results that justify them, so the fix and the summary arrived before the "why".
+  The verdict (top banner) and its recovery advice stay together as the headline answer, but
+  the readiness checklist — which is summarised from the evidence — now renders after it:
+  verdict → how to recover → tables needing attention → per-table results → orphan records →
+  source changes → **cut-over readiness** → export. Reading top-to-bottom now answers "can I
+  cut over?", "what do I do?", "why?", then the final tally.
+
 ## v0.1.254
 
 ### Fixed

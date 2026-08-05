@@ -3802,3 +3802,82 @@ def test_validation_state_defaults_to_not_accepting_the_gap() -> None:
     from dsql_migrator.ui.validation import ValidationState
 
     assert ValidationState().accept_explained_gap is False
+
+
+def test_validation_section_order_puts_evidence_before_the_readiness_rollup() -> None:
+    """Verdict -> recovery -> EVIDENCE -> readiness roll-up -> export.
+
+    The reported UX defect: "Cut-over readiness" (a checklist summarised FROM the
+    comparison) and the recovery advice rendered ABOVE the evidence that justifies
+    them, so a reader on a no-go met the fix and the summary before the "why". The
+    verdict/recovery pair stays at the top (the verdict is already the headline
+    answer), but the readiness roll-up now sits after the evidence, just before
+    Export. Pinned on source order because the sections render top-to-bottom in
+    build_validation_screen and nothing else asserted their sequence.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui import validation as v
+
+    # The sections render inside the nested ``_render_result`` closure, not the top
+    # build_validation_screen body -- so parse the whole module and target that def.
+    module_src = inspect.getsource(inspect.getmodule(v.build_validation_screen))
+    module_tree = ast.parse(module_src)
+    tree = next(
+        n
+        for n in ast.walk(module_tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_render_result"
+    )
+
+    # Record, in source order, each section as it is rendered. A _section(...) call
+    # names a titled card; the recovery / failing-tables / orphans helpers are their
+    # own sections rendered by dedicated functions.
+    order: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        rendered = ast.unparse(node)
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "_section":
+            title = next(
+                (kw.value.value for kw in node.keywords if kw.arg == "title"),
+                None,
+            )
+            if title:
+                order.append(("_section", node.lineno, title))
+        elif isinstance(func, ast.Name) and func.id in (
+            "_render_recovery_section",
+            "_render_failing_tables",
+            "_render_orphans",
+        ):
+            order.append((func.id, node.lineno, func.id))
+
+    # Sort by line number = render order, then reduce to a comparable label sequence.
+    labels = [
+        label if kind == "_section" else kind
+        for kind, _line, label in sorted(order, key=lambda t: t[1])
+    ]
+
+    def pos(needle: str) -> int:
+        for i, lbl in enumerate(labels):
+            if needle in lbl:
+                return i
+        raise AssertionError(f"{needle!r} not rendered; got {labels}")
+
+    recovery = pos("_render_recovery_section")
+    failing = pos("_render_failing_tables")
+    per_table = pos("Per-table results")
+    orphans = pos("_render_orphans")
+    drift = pos("Source changes since the comparison")
+    readiness = pos("Cut-over readiness")
+    export = pos("Export report")
+
+    # Recovery (the verdict's action pair) comes before the evidence.
+    assert recovery < failing, labels
+    # Evidence block, in order.
+    assert failing < per_table < orphans < drift, labels
+    # The readiness roll-up now follows ALL the evidence...
+    assert drift < readiness, labels
+    # ...and Export stays last.
+    assert readiness < export, labels
