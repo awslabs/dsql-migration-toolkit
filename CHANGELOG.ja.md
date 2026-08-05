@@ -5,6 +5,26 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.256
+
+### 変更
+
+- **Validation の判定が、acceptable なギャップを「blocked」と呼ばなくなりました。** すべての差分が
+  マイグレーションが既に報告した削除行と正確に一致する場合、ツールはこの状態を *acceptable*
+  (ギャップ承認後カットオーバー可能) と分類しますが、黄色い判定ヘッダーは「Cut-over blocked only
+  by rows dropped during the migration」と表示していました。「blocked」は赤レベルの「完全停止」を
+  意味する語で、ツール自身のゲートと矛盾し、実際の赤い「Not ready」判定より深刻に読め、同じ状態を
+  「Every difference is explained」と呼ぶ Cut over ステップとも食い違っていました。現在ヘッダーは
+  決定を明示します —「Every difference is explained — accept the gap or fix the source and
+  reload」— Cut over ステップと揃え、2 つの画面が同じ状況として読めます。緑の「Ready for
+  cut-over」と赤の「Not ready for cut-over」ヘッダーは変更ありません。
+- **Cut-over readiness パネルが、判定と結び付けるリードイン 1 行で始まります。** v0.1.255 以降、
+  このパネルは最後 (証拠の後) に描画されるため、「Heads-up」の行が新しい弱い信号のように読める
+  可能性がありました。すべての差分が既知の削除行である場合、パネルは「Same conclusion as the
+  verdict above — nothing unexplained. Each 'Heads-up' item below is the same rows the
+  migration already reported dropping, not a new problem.」で始まります。(未説明の差分がない場合
+  のみ表示)
+
 ## v0.1.255
 
 ### 変更

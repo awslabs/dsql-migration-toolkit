@@ -5,6 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.256
+
+### 변경
+
+- **Validation 판정이 더 이상 acceptable 격차를 "blocked"라고 부르지 않습니다.** 모든 차이가
+  마이그레이션이 이미 보고한 드롭 행과 정확히 일치할 때 툴은 이 상태를 *acceptable*(격차 인정 후
+  cut-over 진행 가능)로 분류하는데, 노란 판정 헤더는 "Cut-over blocked only by rows dropped
+  during the migration"으로 표시됐습니다. "blocked"는 빨강급 "완전 정지" 단어라 툴 자신의 게이트와
+  모순되고 실제 빨강 "Not ready" 판정보다 더 심각하게 읽혔으며, 같은 상태를 "Every difference is
+  explained"로 부르는 Cut over 단계와도 어긋났습니다. 이제 헤더가 결정을 명시합니다 — "Every
+  difference is explained — accept the gap or fix the source and reload" — Cut over 단계와
+  맞춰 두 화면이 같은 상황으로 읽힙니다. 초록 "Ready for cut-over"와 빨강 "Not ready for cut-over"
+  헤더는 그대로입니다.
+- **Cut-over readiness 패널이 판정과 연결하는 리드인 한 줄로 시작합니다.** v0.1.255부터 이 패널이
+  맨 아래(증거 뒤)에 렌더되어 "Heads-up" 행이 새로운 약한 신호처럼 읽힐 수 있었습니다. 모든 차이가
+  알려진 드롭 행일 때, 이제 패널이 "Same conclusion as the verdict above — nothing unexplained.
+  Each 'Heads-up' item below is the same rows the migration already reported dropping, not a
+  new problem."로 시작합니다. (설명 안 된 차이가 없을 때만 표시)
+
 ## v0.1.255
 
 ### 변경

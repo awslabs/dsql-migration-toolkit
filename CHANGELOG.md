@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.256
+
+### Changed
+
+- **Validation verdict no longer calls an acceptable gap "blocked".** When every
+  difference is exactly the rows the migration already reported dropping, the tool
+  classifies the state as *acceptable* (cut-over proceeds once the gap is acknowledged),
+  yet the amber verdict header read "Cut-over blocked only by rows dropped during the
+  migration". "blocked" is a red-tier, full-stop word — it contradicted the tool's own
+  gate and read as more severe than the actual red "Not ready" verdict, and it clashed
+  with the Cut over step, which calls the same state "Every difference is explained". The
+  header now names the decision — "Every difference is explained — accept the gap or fix
+  the source and reload" — matching the Cut over step so the two screens read as one
+  situation. The green "Ready for cut-over" and red "Not ready for cut-over" headers are
+  unchanged.
+- **The Cut-over readiness panel now leads with a line tying it back to the verdict.**
+  Since v0.1.255 the panel renders last (after the evidence), so a "Heads-up" row could
+  read as a new, weaker signal. When the whole difference is the known dropped rows, the
+  panel now opens with "Same conclusion as the verdict above — nothing unexplained. Each
+  'Heads-up' item below is the same rows the migration already reported dropping, not a
+  new problem." (Shown only when nothing is unexplained.)
+
 ## v0.1.255
 
 ### Changed

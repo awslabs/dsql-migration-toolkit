@@ -3048,7 +3048,14 @@ def _render_verdict(
         render_notice(
             ui,
             tone="warning",
-            header="Cut-over blocked only by rows dropped during the migration",
+            # NOT "blocked": the tool classifies this exact state as "acceptable" --
+            # cut-over can proceed once the gap is acknowledged (cutover_release_state).
+            # "blocked" is a red-tier, full-stop word reserved for unexplained/errored
+            # mismatches, so using it here contradicted the tool's own gate and read as
+            # more severe than the actual "Not ready" red verdict. The header now names
+            # the DECISION, and matches the Cut over step's "Every difference is
+            # explained" wording so the two screens read as the same situation.
+            header="Every difference is explained — accept the gap or fix the source and reload",
             body=(
                 f"Nothing unexplained: every difference is in {len(explained_tables)} "
                 f"{noun} ({', '.join(explained_tables)}) and is exactly the {rows} "
@@ -3339,6 +3346,18 @@ def _render_readiness_checks(
     explained_tables = summary.quarantine_explained_tables
     explained_rows = summary.quarantine_explained_rows
     fully_explained = bool(explained_tables) and summary.unexplained_mismatched_tables == 0
+    # Lead-in tying this panel back to the verdict. Since 0.1.255 the readiness panel
+    # renders LAST (after the evidence, before Export), so a reader arriving here has
+    # left the verdict far above -- and a "Heads-up" row could read as a new, weaker
+    # signal. When the whole difference is the known dropped rows, say up front that the
+    # conclusion is unchanged and the Heads-up items are those same rows, not a new find.
+    if fully_explained:
+        row_noun = "row" if explained_rows == 1 else "rows"
+        ui.label(  # type: ignore[attr-defined]
+            "Same conclusion as the verdict above — nothing unexplained. Each "
+            f"'Heads-up' item below is the same {explained_rows} {row_noun} the "
+            "migration already reported dropping, not a new problem."
+        ).classes("text-xs text-gray-600")
     if explained_tables:
         noun = "table" if len(explained_tables) == 1 else "tables"
         row_noun = "row" if explained_rows == 1 else "rows"

@@ -3388,8 +3388,12 @@ def test_readiness_checks_name_the_cause_and_soften_only_when_fully_explained() 
     # Softened to a heads-up -- but NOT passed: rows really are missing on the target.
     assert "Heads-up" in body
     assert "Failed" not in body
+    # Lead-in ties the panel back to the verdict (the panel renders LAST since 0.1.255,
+    # far below the verdict), so a 'Heads-up' row is not read as a new, weaker signal.
+    assert "Same conclusion as the verdict above" in body
 
-    # A partially-explained shortfall keeps the hard failure.
+    # A partially-explained shortfall keeps the hard failure -- and shows NO "same
+    # conclusion" lead-in, because something IS still unexplained.
     partial = _CopyUi()
     _render_readiness_checks(
         partial,
@@ -3399,6 +3403,7 @@ def test_readiness_checks_name_the_cause_and_soften_only_when_fully_explained() 
     partial_body = partial.body()
     assert "Failed" in partial_body
     assert "already reported, not new data loss" not in partial_body
+    assert "Same conclusion as the verdict above" not in partial_body
 
 
 def test_one_explained_table_does_not_soften_a_run_with_a_real_mismatch() -> None:
@@ -3461,6 +3466,11 @@ def test_one_explained_table_does_not_soften_a_run_with_a_real_mismatch() -> Non
     assert "Failed" in checks_body, "a real mismatch must not be softened"
     # The explained part is still credited, so the reviewer looks at the right table.
     assert "ecommerce.product_media" in checks_body
+    # But the "same conclusion as the verdict" lead-in must NOT appear: something IS
+    # unexplained here, so the panel must not claim nothing is. (This is the case that
+    # separates the fully_explained gate from a mere "any explained table" gate: one
+    # table is exactly explained while another is a real loss.)
+    assert "Same conclusion as the verdict above" not in checks_body
 
     verdict = _CopyUi()
     _render_verdict(verdict, summary, _drift_na())
@@ -3482,6 +3492,13 @@ def test_verdict_says_what_is_outstanding_instead_of_review_the_failures() -> No
     )
     body = ui.body()
     assert "Not ready for cut-over" not in body
+    # The header must NOT call this "blocked": the tool classifies this exact state as
+    # "acceptable" (cutover_release_state), so "blocked" -- a red-tier full-stop word --
+    # contradicted the gate and out-shouted the actual red "Not ready" verdict.
+    assert "blocked" not in body.lower()
+    # It names the decision and matches the Cut over step's wording so the two screens
+    # read as the same situation.
+    assert "Every difference is explained" in body
     assert "Nothing unexplained" in body
     assert "3 rows the migration could not store" in body
     # Both real options are offered: close the gap, or accept it knowingly.
