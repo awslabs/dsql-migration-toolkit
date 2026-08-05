@@ -3934,35 +3934,76 @@ def _drift_advanced():
     )
 
 
-def test_recovery_quiesce_notice_shows_only_when_the_source_has_drifted() -> None:
-    """The quiesce-source caveat belongs in recovery only under live drift.
+def test_recovery_section_carries_no_quiesce_notice_in_any_drift_state() -> None:
+    """The quiesce-source caveat no longer lives in the recovery card.
 
-    "How to recover" is the no-go section: the outstanding issue is a real mismatch and
-    the fix is the ordered Full-Load reload steps. "Quiesce the source" is relevant here
-    only when the source has actually advanced (part of the mismatch may be in-flight, so
-    a reload could chase a moving target). The old unconditional info fallback fired even
-    with no drift -- a generic cut-over aside on a screen about fixing a concrete gap;
-    the drift section and the Cut over step already cover the no-drift case.
+    Whether the source drifted since the snapshot -- and what to do about it -- is the
+    subject of the dedicated "Source changes since the comparison" section, which already
+    tells the reader to freeze source writes / let CDC drain and re-validate. Carrying a
+    freeze/re-validate box in this gap-recovery card too was a cross-section duplicate, so
+    it was removed: the notice must now be absent whether or not the source has drifted,
+    while the core recovery guidance still renders.
     """
     from dsql_migrator.ui.validation import _render_recovery_section
 
     summary = _release_summary(is_match=False, mismatched=1)
 
-    # Drift present -> the warning appears.
-    drifted = _CopyUi()
-    _render_recovery_section(drifted, summary, _drift_advanced())
-    drifted_body = drifted.body()
-    assert "quiesce the source first" in drifted_body
-    # The core recovery guidance is there regardless.
-    assert "Re-run Full Load + CDC to backfill the gap" in drifted_body
+    for drift in (_drift_advanced(), _drift_na()):
+        ui = _CopyUi()
+        _render_recovery_section(ui, summary, drift)
+        body = ui.body()
+        assert "quiesce the source first" not in body
+        assert "zero-loss verdict" not in body
+        # The core recovery guidance is there regardless of drift.
+        assert "Re-run Full Load + CDC to backfill the gap" in body
 
-    # No drift -> no quiesce aside (but the recovery steps still render).
-    quiet = _CopyUi()
-    _render_recovery_section(quiet, summary, _drift_na())
-    quiet_body = quiet.body()
-    assert "quiesce the source first" not in quiet_body
-    assert "moving target" not in quiet_body  # the removed info fallback
-    assert "Re-run Full Load + CDC to backfill the gap" in quiet_body
+
+def test_verdict_shows_no_completed_in_elapsed_caption() -> None:
+    """The verdict no longer prints a "Completed in Xs" caption under itself.
+
+    The small elapsed-time line read as between-section noise on the small databases the
+    tool is demoed with. It was dropped for every verdict branch (ready / explained-gap /
+    not-ready); the run's duration is no longer surfaced in the UI.
+    """
+    from dsql_migrator.ui.validation import _render_verdict, summarize_validation
+
+    # ready-for-cut-over branch
+    ok = _CopyUi()
+    _render_verdict(ok, _release_summary(is_match=True), _drift_na())
+    assert "Completed in" not in ok.body()
+
+    # explained-gap ("acceptable") branch
+    explained = _CopyUi()
+    _render_verdict(
+        explained, summarize_validation(_quarantine_report(dropped=3, missing=3)),
+        _drift_na(),
+    )
+    assert "Completed in" not in explained.body()
+
+    # not-ready (unexplained mismatch) branch
+    bad = _CopyUi()
+    _render_verdict(bad, _release_summary(is_match=False, mismatched=1), _drift_na())
+    assert "Completed in" not in bad.body()
+
+
+def test_options_section_has_no_post_run_next_run_caption() -> None:
+    """After a report is on screen, the options block shows no "applies on the next run".
+
+    The options block is plainly a pre-run config area and the Re-run button sits top
+    right, so the reminder line was noise. The IN-PROGRESS greyed-out variant ("Options
+    apply to the next run.") stays -- it explains why the toggles are inert mid-run -- so
+    the guard is specific to the post-run caption text.
+    """
+    import inspect
+
+    from dsql_migrator.ui import validation as v
+
+    src = inspect.getsource(v._render_options)
+    # The post-run reminder is gone...
+    assert "Changing options applies on the next run" not in src
+    assert "use Re-run (top right)" not in src
+    # ...but the in-flight explanation for the disabled toggles remains.
+    assert "Options apply to the next run." in src
 
 
 def test_recovery_fully_explained_gap_does_not_offer_the_full_load_reload_runbook() -> None:
@@ -4074,58 +4115,6 @@ def test_recovery_unexplained_gap_keeps_the_full_load_reload_runbook() -> None:
     assert "fact_check" not in ui.icons
     # And it must NOT mis-apply the permanent-limit language to a loadable gap.
     assert "exceeds a permanent Aurora DSQL limit" not in body
-
-
-def test_quiesce_notice_tail_differs_by_branch_under_drift() -> None:
-    """change D: the quiesce warning must not promise a clean match on a permanent gap.
-
-    The quiesce warning is gated on live drift and applies to both recovery branches.
-    But for a fully-explained gap, freezing + re-validating can never reach a clean
-    match (those rows exceed a permanent DSQL limit), so promising "a clean match then
-    truly means no data was lost" contradicts the card's own "shrink the value or accept
-    the gap". The unexplained branch keeps that promise -- there a reload really can
-    reach a clean match.
-    """
-    from dsql_migrator.ui.validation import _render_recovery_section, summarize_validation
-
-    # Fully explained (dropped==missing) + live drift.
-    explained = _CopyUi()
-    _render_recovery_section(
-        explained, summarize_validation(_quarantine_report(dropped=3, missing=3)),
-        _drift_advanced(),
-    )
-    eb = explained.body()
-    # The quiesce warning still appears (drift is live)...
-    assert "quiesce the source first" in eb
-    # ...but reframed: no "clean match = no data lost" promise here.
-    assert "a clean match then truly means no data was lost" not in eb
-    assert "confirm no other rows drifted in" in eb
-    assert "the explained gap will remain" in eb
-
-    # Unexplained (dropped < missing) + live drift -> original promise kept.
-    unexplained = _CopyUi()
-    _render_recovery_section(
-        unexplained, summarize_validation(_quarantine_report(dropped=1, missing=3)),
-        _drift_advanced(),
-    )
-    ub = unexplained.body()
-    assert "quiesce the source first" in ub
-    assert "a clean match then truly means no data was lost" in ub
-    assert "the explained gap will remain" not in ub
-
-
-def test_quiesce_notice_absent_without_drift_in_both_branches() -> None:
-    # change D changes only the WORDING; the source_live gate (v0.1.257) is unchanged --
-    # no drift, no quiesce notice, in either branch.
-    from dsql_migrator.ui.validation import _render_recovery_section, summarize_validation
-
-    for dropped, missing in ((3, 3), (1, 3)):
-        ui = _CopyUi()
-        _render_recovery_section(
-            ui, summarize_validation(_quarantine_report(dropped=dropped, missing=missing)),
-            _drift_na(),
-        )
-        assert "quiesce the source first" not in ui.body(), (dropped, missing)
 
 
 def test_table_row_result_payload_carries_a_badge_and_a_sort_key() -> None:

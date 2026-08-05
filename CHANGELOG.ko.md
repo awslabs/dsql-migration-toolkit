@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.263
+
+### 변경
+
+- **Validation 결과 화면의 섹션 사이에 작게 표시되던, 불필요한 문구 두 가지를 제거했습니다.** (1) "For a
+  definitive zero-loss verdict, quiesce the source first" 경고를 격차 복구 카드에서 제거했습니다 —
+  스냅샷 이후 소스가 변경되었는지, 그리고 소스 쓰기 중단 / CDC 드레인 후 재검증하라는 안내는 전용 "Source
+  changes since the comparison" 섹션이 이미 다루고 있어, 복구 카드에도 넣는 것은 섹션 간 중복이었습니다.
+  (2) 옵션 블록 아래의 "Changing options applies on the next run — use Re-run (top right) to apply
+  them." 문구를 제거했습니다 — 옵션 블록은 명백히 실행 전 설정 영역이고 Re-run 버튼은 우측 상단에 항상
+  보입니다. (3) 검증 결과 아래의 "Completed in Xs" 실행 시간 문구를 제거했습니다. 실행 중일 때 표시되는
+  회색의 "Options apply to the next run." 안내는 유지됩니다 — 실행 중 토글이 비활성인 이유를 설명하기
+  때문입니다.
+
 ## v0.1.262
 
 ### 수정

@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.263
+
+### Changed
+
+- **Removed two small between-section captions on the Validation result that read as
+  noise.** (1) The "For a definitive zero-loss verdict, quiesce the source first" alert
+  no longer appears in the gap-recovery card — whether the source drifted since the
+  snapshot, and the freeze-source-writes / let-CDC-drain-then-re-validate guidance, is
+  the whole subject of the dedicated "Source changes since the comparison" section, so
+  carrying it in the recovery card too was a cross-section duplicate. (2) The "Changing
+  options applies on the next run — use Re-run (top right) to apply them." line under the
+  options block is gone: the options block is plainly a pre-run config area and the
+  Re-run button is always visible. (3) The "Completed in Xs" run-duration caption under
+  the verdict is gone. The greyed-out "Options apply to the next run." note shown while a
+  run is in flight stays — it explains why the toggles are inert mid-run.
+
 ## v0.1.262
 
 ### Fixed

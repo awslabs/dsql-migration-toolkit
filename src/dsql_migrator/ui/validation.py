@@ -69,7 +69,7 @@ from dsql_migrator.core.validator import ValidationCancelled, Validator
 from dsql_migrator.core.validator import export_report as export_validation_report
 from dsql_migrator.ui.ai_chat_drawer import build_chat_drawer
 from dsql_migrator.ui.connect import make_source_engine_factory
-from dsql_migrator.ui.data_migration import DataMigrationStore, format_duration
+from dsql_migrator.ui.data_migration import DataMigrationStore
 from dsql_migrator.ui.design import (
     badge_classes,
     chip_group_quasar_color,
@@ -1795,7 +1795,6 @@ def build_validation_screen(
                     ui,
                     validation_state,
                     status,
-                    has_result=validation_state.result is not None,
                     refresh=refresh,
                 )
 
@@ -1954,7 +1953,6 @@ def build_validation_screen(
                 _render_result(
                     ui, result,
                     diagnose_provider=diagnose_provider,
-                    elapsed_seconds=validation_state.elapsed_seconds,
                     restored=validation_state.restored,
                     completed_at=validation_state.completed_at,
                     recheck_provider=None if busy else _start_recheck,
@@ -2740,7 +2738,6 @@ def _render_options(
     validation_state: ValidationState,
     status: StepStatus,
     *,
-    has_result: bool = False,
     refresh: Optional[Callable[[], None]] = None,
 ) -> None:
     """Render the validation mode select, reconcile, and orphan-check switches."""
@@ -2780,16 +2777,13 @@ def _render_options(
             "tables whose counts disagree. A count-matched table is reported as "
             "verified by row count (deep checks not run) — never a false match."
         )
-    # Make clear that toggling options does not change the report on screen until
-    # the next run -- both while a run is in flight and after a report is shown.
+    # While a run is IN FLIGHT the toggles are greyed out; say why they're inert
+    # (they'll apply to the next run). When a report is already on screen no caption
+    # is shown: the options block is plainly a pre-run config area and Re-run sits
+    # top-right, so a "changing options applies on the next run" line was just noise.
     if disabled:
         ui.label(  # type: ignore[attr-defined]
             "Options apply to the next run."
-        ).classes("text-xs text-gray-400")
-    elif has_result:
-        ui.label(  # type: ignore[attr-defined]
-            "Changing options applies on the next run — use Re-run (top right) to "
-            "apply them."
         ).classes("text-xs text-gray-400")
 
 
@@ -2860,7 +2854,6 @@ def _render_result(
     report: ValidationReport,
     *,
     diagnose_provider=None,
-    elapsed_seconds: Optional[float] = None,
     restored: bool = False,
     completed_at: "Optional[datetime]" = None,
     recheck_provider=None,
@@ -2874,7 +2867,6 @@ def _render_result(
     ``diagnose_provider`` (when given -- AI Assist on) opens the AI chat drawer
     for a mismatch; it is threaded to the verdict (run-level "Diagnose with AI")
     and to the failing-tables section (per-table "Explain with AI").
-    ``elapsed_seconds`` (when known) shows how long the run took under the verdict.
     ``restored`` shows a "restored from a saved session" note (the result was
     re-hydrated on reconnect, not run now), with its ``completed_at`` time, so a
     stale verdict prompts a re-validate. The go-path "how to cut over" runbook
@@ -2907,7 +2899,7 @@ def _render_result(
         )
     summary = summarize_validation(report)
     drift = format_drift(report)
-    _render_verdict(ui, summary, drift, elapsed_seconds=elapsed_seconds)
+    _render_verdict(ui, summary, drift)
     # Mixed as-of honesty: when part of this report came from a later per-table
     # re-check, say which tables and when, right under the verdict -- the verdict
     # above is computed over BOTH vintages, so the reader must know that before
@@ -2992,8 +2984,7 @@ def _section(ui: object, *, icon: str, title: str) -> _Section:
 
 
 def _render_verdict(
-    ui: object, summary: ValidationSummary, drift: DriftDisplay, *,
-    elapsed_seconds: Optional[float] = None,
+    ui: object, summary: ValidationSummary, drift: DriftDisplay,
 ) -> None:
     """Render the overall go/no-go cut-over verdict as a Cloudscape notice (hero).
 
@@ -3001,17 +2992,9 @@ def _render_verdict(
     ``ready_for_cutover`` flag does not capture on its own: record-level
     reconciliation being off (so "ready" is count/checksum-only), and the source
     having advanced since the snapshot (fine under live CDC, but a re-verify
-    signal otherwise). ``elapsed_seconds`` (when known) is shown as a small
-    "Completed in …" caption. The recovery guidance on a no-go is a separate
-    section (:func:`_render_recovery_section`), not part of the verdict.
+    signal otherwise). The recovery guidance on a no-go is a separate section
+    (:func:`_render_recovery_section`), not part of the verdict.
     """
-    def _elapsed_caption() -> None:
-        if elapsed_seconds is None:
-            return
-        ui.label(  # type: ignore[attr-defined]
-            f"Completed in {format_duration(elapsed_seconds)}."
-        ).classes("text-xs text-gray-500")
-
     if summary.ready_for_cutover:
         body = (
             f"All {summary.total_tables} table(s) match and no issues were found. "
@@ -3031,7 +3014,6 @@ def _render_verdict(
         if caveats:
             body += " Note: " + "; ".join(caveats) + "."
         render_notice(ui, tone="success", header="Ready for cut-over", body=body)
-        _elapsed_caption()
         return
 
     # When EVERY non-matching table is short by exactly the rows the migration already
@@ -3067,7 +3049,6 @@ def _render_verdict(
                 f"those {row_noun} will be absent from the target."
             ),
         )
-        _elapsed_caption()
         return
 
     render_notice(
@@ -3086,7 +3067,6 @@ def _render_verdict(
             )
         ),
     )
-    _elapsed_caption()
 
 
 # How many re-checked table names to spell out in the mixed-as-of note before
@@ -3231,43 +3211,12 @@ def _render_recovery_section(
                         )
                         ui.label(text).classes("text-xs text-gray-700 leading-snug")  # type: ignore[attr-defined]
 
-        # Applies to both recovery paths above, but only when the source has ACTUALLY
-        # advanced since the snapshot: live drift means part of the difference may be
-        # in-flight, so whichever fix the reader takes, they must freeze the source and
-        # re-validate before trusting a clean result. The old unconditional ``info``
-        # fallback fired even with no drift, adding a generic cut-over aside to a screen
-        # about fixing a concrete gap -- and the source-changes section and the Cut over
-        # step already carry the quiesce guidance for the no-drift case, so dropping it
-        # here removes a duplicate, not the advice.
-        source_live = bool(drift.available and drift.determinable and drift.drifted)
-        if source_live:
-            render_notice(
-                ui,
-                tone="warning",
-                header="For a definitive zero-loss verdict, quiesce the source first",
-                # The tail differs by branch. For a fully-explained gap, freezing +
-                # re-validating will NOT produce a clean match -- those rows exceed a
-                # permanent DSQL limit and stay absent whatever you do, so promising
-                # "a clean match means no data was lost" here contradicts this card's
-                # own "can't be stored as-is -- shrink or accept" message. There the
-                # quiesce is only to confirm nothing ELSE drifted in; the explained gap
-                # remains until the value is shrunk or the gap accepted. The unexplained
-                # branch keeps the original promise -- there a reload really can reach a
-                # clean match, so it is the right goal.
-                body=(
-                    "The source has changed since the snapshot, so some difference may "
-                    "be in-flight. Before the FINAL cut-over check, stop source writes "
-                    "and let CDC drain (or Stop CDC from the Data Migration step), then "
-                    + (
-                        "re-validate to confirm no other rows drifted in — the "
-                        "explained gap will remain until you shrink those values or "
-                        "accept it."
-                        if fully_explained
-                        else
-                        "re-validate — a clean match then truly means no data was lost."
-                    )
-                ),
-            )
+        # No quiesce/freeze caveat here: whether the source has drifted since the
+        # snapshot -- and what to do about it -- is the whole subject of the dedicated
+        # "Source changes since the comparison" section below, which already tells the
+        # reader to freeze source writes / let CDC drain and re-validate before cut-over.
+        # Repeating it in this gap-recovery card was a cross-section duplicate; the drift
+        # section is where that guidance belongs.
         if diagnose_provider is not None:
             with ui.row().classes("w-full mt-1"):  # type: ignore[attr-defined]
                 ui.button(  # type: ignore[attr-defined]

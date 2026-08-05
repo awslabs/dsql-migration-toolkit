@@ -5,6 +5,20 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.263
+
+### 変更
+
+- **Validation 結果画面のセクション間に小さく表示されていた、不要なキャプションを 2 つ削除しました。** (1)
+  「For a definitive zero-loss verdict, quiesce the source first」アラートをギャップ復旧カードから
+  削除しました — スナップショット以降にソースが変化したか、およびソースの書き込みを止めて CDC をドレインして
+  から再検証するという案内は、専用の「Source changes since the comparison」セクションが既に扱っているため、
+  復旧カードにも載せるのはセクション間の重複でした。(2) オプションブロック下部の「Changing options applies
+  on the next run — use Re-run (top right) to apply them.」の行を削除しました — オプションブロックは
+  明らかに実行前の設定エリアで、Re-run ボタンは常に右上に表示されています。(3) 検証結果の下の「Completed in
+  Xs」実行時間キャプションを削除しました。実行中に表示されるグレーの「Options apply to the next run.」の
+  注記は残します — 実行中にトグルが無効である理由を説明するためです。
+
 ## v0.1.262
 
 ### 修正
