@@ -2532,6 +2532,7 @@ class _CopyUi:
     def __init__(self) -> None:
         self.texts: list[str] = []
         self.tooltips: list[str] = []
+        self.icons: list[str] = []
 
     class _El:
         def __init__(self, owner) -> None:
@@ -2625,7 +2626,9 @@ class _CopyUi:
     def spinner(self, *_a, **_k):
         return self._El(self)
 
-    def icon(self, *_a, **_k):
+    def icon(self, name="", *_a, **_k):
+        if name:
+            self.icons.append(str(name))
         return self._El(self)
 
     def linear_progress(self, *_a, **_k):
@@ -3985,6 +3988,14 @@ def test_recovery_fully_explained_gap_does_not_offer_the_full_load_reload_runboo
     assert "Re-run Full Load + CDC to backfill the gap" not in body
     assert "only fills missing rows" not in body
     assert "Steps to recover" not in body
+    # The section title matches the Cut over step ("Acknowledge the known gap"), not the
+    # repair-framed "How to recover" -- these rows can't be fixed, only accepted (or the
+    # source shrunk). (change C)
+    assert "Acknowledge the known gap" in body
+    assert "How to recover" not in body
+    # ...and the section icon is the acknowledge glyph, not the repair wrench.
+    assert "fact_check" in ui.icons
+    assert "build" not in ui.icons
 
 
 def test_recovery_mixed_gap_keeps_the_reload_runbook_not_the_shrink_notice() -> None:
@@ -4031,6 +4042,10 @@ def test_recovery_mixed_gap_keeps_the_reload_runbook_not_the_shrink_notice() -> 
     assert "Re-run Full Load + CDC to backfill the gap" in body
     assert "Steps to recover" in body
     assert "exceeds a permanent Aurora DSQL limit" not in body
+    # Mixed == unexplained, so the title stays "How to recover" (change C): gating the
+    # title on "any explained table" would wrongly flip it to acknowledge-the-gap here.
+    assert "How to recover" in body
+    assert "Acknowledge the known gap" not in body
 
 
 def test_recovery_unexplained_gap_keeps_the_full_load_reload_runbook() -> None:
@@ -4049,5 +4064,11 @@ def test_recovery_unexplained_gap_keeps_the_full_load_reload_runbook() -> None:
     body = ui.body()
     assert "Re-run Full Load + CDC to backfill the gap" in body
     assert "Steps to recover" in body
+    # A loadable gap IS something to repair, so the section keeps the "How to recover"
+    # title and the wrench icon, not the acknowledge-the-gap heading. (change C)
+    assert "How to recover" in body
+    assert "Acknowledge the known gap" not in body
+    assert "build" in ui.icons
+    assert "fact_check" not in ui.icons
     # And it must NOT mis-apply the permanent-limit language to a loadable gap.
     assert "exceeds a permanent Aurora DSQL limit" not in body

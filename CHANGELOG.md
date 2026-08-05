@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.259
+
+### Changed
+
+- **The recovery section's title and icon now match its content for an acceptable gap.**
+  v0.1.258 branched the section's body on whether the gap is fully explained, but the
+  heading stayed "How to recover" with a wrench icon. For a fully-explained gap the rows
+  can't be stored at all and accepting them is a legitimate final choice, so "recover" /
+  wrench framed a decision as a repair — fighting the verdict banner and the section's own
+  "shrink the value or accept the gap" body. The fully-explained case now uses the Cut over
+  step's exact heading and icon, "Acknowledge the known gap" / fact_check, so the two
+  screens speak with one voice; a genuinely unexplained (loadable) gap — including the
+  mixed case where one table is explained and another is a real loss — keeps "How to
+  recover" and the wrench.
+
 ## v0.1.258
 
 ### Fixed

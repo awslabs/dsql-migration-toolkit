@@ -3163,7 +3163,17 @@ def _render_recovery_section(
         summary.quarantine_explained_tables
         and summary.unexplained_mismatched_tables == 0
     )
-    with _section(ui, icon="build", title="How to recover"):  # type: ignore[misc]
+    # Title + icon follow the same branch as the content. "How to recover" with a wrench
+    # (build) frames the state as something to REPAIR -- correct for an unexplained,
+    # loadable gap, but wrong for a fully-explained one, where the rows can't be stored
+    # at all and "accept the gap and cut over" is a legitimate final choice. Naming that
+    # "recover" fought the verdict banner and this section's own body ("shrink the value
+    # or accept the gap"). For the fully-explained case reuse the Cut over step's exact
+    # heading/icon ("Acknowledge the known gap" / fact_check), the same alignment
+    # v0.1.256 made for the banner header, so the two screens speak with one voice.
+    _title = "Acknowledge the known gap" if fully_explained else "How to recover"
+    _icon = "fact_check" if fully_explained else "build"
+    with _section(ui, icon=_icon, title=_title):  # type: ignore[misc]
         if fully_explained:
             render_notice(
                 ui,
