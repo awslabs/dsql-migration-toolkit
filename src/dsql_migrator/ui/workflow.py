@@ -896,11 +896,17 @@ def _render_journey_header(
        Validation -> Cut over) with each step's real status icon/color and the
        current step highlighted; clicking a step navigates to it (the sidebar's lock
        rules still apply via ``select``).
-    2. A compact migration-type banner showing the type chosen on Data Migration, so
-       the choice stays visible through the whole flow. Now shown on EVERY step: the
-       retired Migration plan step was the one screen that had to suppress it (its
-       two-value "Include CDC?" control contradicted the three-value banner), so with
-       that gone the header is finally identical everywhere.
+    2. A compact migration-type banner showing the type chosen on Data Migration.
+       Shown ONLY on the Data Migration step (``WorkflowStep.CDC``), next to the
+       selector that owns the choice. It used to render on every step for "one
+       journey" continuity, but the single ``session.migration_type`` cannot describe
+       a session that ran Full Load and THEN switched to "CDC only" (the guided
+       post-Full-Load path): later steps -- Validation especially -- then showed
+       "CDC only" with a blurb saying "no Full Load in this session", contradicting
+       what the user had just done. Rather than assert a stale, sometimes-false
+       summary on screens that cannot correct it, the banner stays where the choice
+       is actually made and current. The journey stepper (band 1) still carries the
+       cross-step continuity on every step.
     """
     steps = ordered_steps()
     # Band 1: the journey stepper.
@@ -936,14 +942,15 @@ def _render_journey_header(
             if index < len(steps) - 1:
                 ui.icon("chevron_right", color="grey-5").classes("text-sm")  # type: ignore[attr-defined]
 
-    # Band 2: the migration-type banner -- only once the user has ACTUALLY chosen.
-    # ``migration_type`` always answers (it defaults to full-load-only), so rendering
-    # it unconditionally presented that default as a settled decision on the steps
-    # that come BEFORE the choice: Evaluation opened with "Migration type: Full load
-    # only" and its full blurb, describing a migration the user had never picked.
-    # (Under the retired Migration plan step this could not happen -- the choice came
-    # first.) The banner appears from the Data Migration step's selector onward, which
-    # is where the type becomes real.
+    # Band 2: the migration-type banner. Two gates:
+    #  - Only on the Data Migration step (WorkflowStep.CDC), where the selector lives
+    #    and the type is current -- see the docstring for why it no longer rides along
+    #    to Validation/Cut over, where a Full-Load-then-CDC-only session read wrong.
+    #  - Only once the user has ACTUALLY chosen (``migration_type`` defaults to
+    #    full-load-only, so an unconditional render would present that default as a
+    #    settled decision before the user picked anything).
+    if current_step is not WorkflowStep.CDC:
+        return
     if not _migration_type_chosen(state):
         return
     # Layout: icon + "Migration type:" + the type name stay together on one line

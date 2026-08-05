@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.254
+
+### Fixed
+
+- **The migration-type banner showed "CDC only" on Validation/Cut over after a Full Load.**
+  The banner rode the "one journey" header on every step, but a session has a single
+  migration type — so the guided post-Full-Load path (run Full load only, then switch to
+  "CDC only" to stream onto the loaded target) left later steps asserting "Migration type:
+  CDC only" with a blurb reading "no Full Load in this session", contradicting what the user
+  had just done, on screens with no way to correct it. The banner now appears only on the
+  Data Migration step, right beside the selector that owns the choice, where the label is
+  always current (Full load only while that runs, CDC only once switched). The journey
+  stepper still carries cross-step continuity on every step.
+
 ## v0.1.253
 
 ### Fixed

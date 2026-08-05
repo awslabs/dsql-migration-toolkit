@@ -690,15 +690,27 @@ def _render_header_texts(step) -> list[str]:
     return ui.texts
 
 
-def test_journey_header_shows_the_type_banner_on_every_step_once_chosen() -> None:
-    # Once the user HAS chosen, the banner is identical on every step -- the "one
-    # consistent journey" the design system asks for. (The retired Migration plan step
-    # was the one screen that had to suppress it, because its two-value "Include CDC?"
-    # control contradicted the three-value label.)
+def test_journey_header_shows_the_type_banner_only_on_data_migration() -> None:
+    # The banner rides only on the Data Migration step (WorkflowStep.CDC), next to the
+    # selector that owns the choice. It used to render on every step, but a single
+    # session.migration_type cannot describe a session that ran Full Load and THEN
+    # switched to "CDC only": Validation/Cut over then showed a stale, sometimes-false
+    # summary they could not correct. On the Data Migration step the banner and the
+    # selector are always consistent.
+    from dsql_migrator.ui.workflow import WorkflowStep
+
+    on_step = _render_header_texts(WorkflowStep.CDC)
+    assert "Migration type:" in on_step
+    assert "Full load + CDC" in on_step
+
     for step in ordered_steps():
+        if step is WorkflowStep.CDC:
+            continue
         texts = _render_header_texts(step)
-        assert "Migration type:" in texts, step
-        assert "Full load + CDC" in texts, step
+        assert "Migration type:" not in texts, step
+        assert "Full load + CDC" not in texts, step
+        # Band 1 (the stepper) still renders, so the header is not blank.
+        assert any("Evaluation" in t for t in texts), step
 
 
 def test_journey_header_hides_the_type_banner_until_a_real_choice() -> None:
@@ -712,26 +724,26 @@ def test_journey_header_hides_the_type_banner_until_a_real_choice() -> None:
     exposed it.
     """
     from dsql_migrator.ui.session import SessionConnectionState
-    from dsql_migrator.ui.workflow import _render_journey_header
+    from dsql_migrator.ui.workflow import WorkflowStep, _render_journey_header
 
     fresh = SessionConnectionState()
     assert fresh.migration_type_chosen() is False
     assert fresh.migration_type.value == "full_load_only"  # the default still answers
 
-    for step in ordered_steps():
-        ui = _HeaderUi()
-        _render_journey_header(ui, fresh, step, lambda _s: None)
-        assert "Migration type:" not in ui.texts, step
-        assert "Full load only" not in ui.texts, step
-        # Band 1 (the stepper) still renders, so the header is not blank.
-        assert any("Evaluation" in t for t in ui.texts), step
+    # On the Data Migration step (where the banner now lives), an unchosen type still
+    # shows no banner -- the default must not read as a settled decision.
+    ui = _HeaderUi()
+    _render_journey_header(ui, fresh, WorkflowStep.CDC, lambda _s: None)
+    assert "Migration type:" not in ui.texts
+    assert "Full load only" not in ui.texts
+    assert any("Evaluation" in t for t in ui.texts)  # band 1 still renders
 
     # Choosing the type -- even choosing the value that was already the default --
-    # makes the banner appear.
+    # makes the banner appear (on the Data Migration step).
     chose_default = SessionConnectionState()
     chose_default.set_migration_type("full_load_only")
     ui = _HeaderUi()
-    _render_journey_header(ui, chose_default, ordered_steps()[0], lambda _s: None)
+    _render_journey_header(ui, chose_default, WorkflowStep.CDC, lambda _s: None)
     assert "Migration type:" in ui.texts
     assert "Full load only" in ui.texts
 

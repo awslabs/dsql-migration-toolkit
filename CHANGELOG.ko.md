@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.254
+
+### 수정
+
+- **Full Load 후 Validation/Cut over 단계에서 migration-type 배너가 "CDC only"로 표시됐습니다.**
+  배너가 "one journey" 헤더를 따라 모든 단계에 표시됐지만, 세션의 migration type은 하나뿐입니다 —
+  그래서 안내된 경로(Full load only 실행 후 "CDC only"로 전환해 적재된 대상에 스트리밍)를 따르면
+  이후 단계에서 "Migration type: CDC only" + "no Full Load in this session" 설명이 떠, 방금 한 일과
+  모순되는데도 그 화면에서는 바로잡을 방법이 없었습니다. 이제 배너는 선택기가 있는 Data Migration
+  단계에서만 표시되며, 그곳에서는 라벨이 항상 현재 상태와 일치합니다(Full Load 중에는 Full load
+  only, 전환 후에는 CDC only). 단계별 진행 스테퍼는 모든 단계에서 계속 연속성을 제공합니다.
+
 ## v0.1.253
 
 ### 수정
