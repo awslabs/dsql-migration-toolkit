@@ -4126,3 +4126,77 @@ def test_quiesce_notice_absent_without_drift_in_both_branches() -> None:
             _drift_na(),
         )
         assert "quiesce the source first" not in ui.body(), (dropped, missing)
+
+
+def test_table_row_result_payload_carries_a_badge_and_a_sort_key() -> None:
+    """The row dict must expose BOTH the Result badge payload and its int sort key.
+
+    The Result column sorts on ``result_sort`` (int, failures-first) but the badge is
+    rendered from the ``result`` payload -- the bug was the column pointing the badge at
+    the sort key. Guard the payload here (pytest can run it); the slot wiring is guarded
+    separately below.
+    """
+    from dsql_migrator.core.models import TableValidationResult
+    from dsql_migrator.ui.validation import _table_row
+
+    match = _table_row(
+        TableValidationResult(
+            table="ok", source_row_count=10, target_row_count=10,
+            row_count_match=True, matched=True,
+        )
+    )
+    assert match["result"]["text"] == "match"
+    assert match["result"]["color"].startswith("green")  # a green (ok) badge
+    assert match["result_sort"] == 1
+
+    mismatch = _table_row(
+        TableValidationResult(
+            table="product_media", source_row_count=15, target_row_count=12,
+            row_count_match=False, matched=False,
+        )
+    )
+    assert mismatch["result"]["text"] == "mismatch"
+    assert mismatch["result"]["color"].startswith("red")
+    assert mismatch["result_sort"] == 0  # failures sort first
+
+    errored = _table_row(
+        TableValidationResult(
+            table="broken", source_row_count=0, target_row_count=0,
+            row_count_match=False, matched=False,
+            error='relation "broken" does not exist',
+        )
+    )
+    assert errored["result"]["text"] == "ERROR"
+    assert errored["result"]["color"].startswith("red")
+    assert errored["result_sort"] == 0
+
+
+def test_result_badge_slot_reads_the_payload_not_the_sort_key() -> None:
+    """The Result badge slot must read props.row.result, and the column keep result_sort.
+
+    The bug: the shared badge slot reads ``props.value`` (the column's field value), but
+    the Result column's field is ``result_sort`` (an int) so ``props.value.text`` was
+    always undefined and the badge fell through to "—" for every row. Result now has its
+    own slot reading the ``result`` payload off ``props.row``; row_count/checksum keep the
+    shared props.value slot; and the column still sorts on result_sort. A Vue template in
+    a string can't be run by pytest, so this is asserted at the source level.
+    """
+    import inspect
+
+    from dsql_migrator.ui import validation as v
+
+    src = inspect.getsource(v._render_tables)
+
+    # The Result column still sorts on the int key (failures-first ordering intact).
+    assert '"name": "result", "label": "Result", "field": "result_sort"' in src
+    assert "sort-by=result_sort" in src
+
+    # The result slot reads the PAYLOAD off the row, not the (int) column value.
+    assert "body-cell-result" in src
+    assert "props.row.result && props.row.result.text" in src
+    assert 'props.row.result.color' in src
+
+    # Regression guard: row_count/checksum still use the shared props.value slot, and
+    # the result slot is no longer part of that props.value loop.
+    assert 'for col in ("row_count", "checksum"):' in src
+    assert 'for col in ("row_count", "checksum", "result"):' not in src

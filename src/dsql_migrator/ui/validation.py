@@ -3897,8 +3897,14 @@ def _render_tables(
         ui.input(placeholder="Filter tables…").props(  # type: ignore[attr-defined]
             "dense outlined clearable"
         ).classes("min-w-64").bind_value(table, "filter")
-    # Colored status badges (match/mismatch/error) instead of plain text.
-    for col in ("row_count", "checksum", "result"):
+    # Colored status badges (match/mismatch/error) instead of plain text. The slot
+    # reads props.value, i.e. the column's ``field`` value -- fine for row_count /
+    # checksum, whose field IS the {text,color} badge payload. The Result column is
+    # different: its field is ``result_sort`` (an int, so "failures first" sorting
+    # works), NOT the payload, so props.value has no ``.text`` and the badge always
+    # fell through to "—". Result therefore gets its OWN slot that reads the payload
+    # off ``props.row.result`` directly, leaving the sort key untouched.
+    for col in ("row_count", "checksum"):
         table.add_slot(  # type: ignore[attr-defined]
             f"body-cell-{col}",
             r"""
@@ -3909,6 +3915,16 @@ def _render_tables(
             </q-td>
             """,
         )
+    table.add_slot(  # type: ignore[attr-defined]
+        "body-cell-result",
+        r"""
+        <q-td :props="props">
+          <q-badge v-if="props.row.result && props.row.result.text"
+                   :color="props.row.result.color" :label="props.row.result.text" />
+          <span v-else>—</span>
+        </q-td>
+        """,
+    )
     # Footnote: explain the "n/a" missing/extra cells when reconciliation ran but
     # could not cover every table (composite / non-integer PK).
     skipped = reconcile_skipped_tables(report)

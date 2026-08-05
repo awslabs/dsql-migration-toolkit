@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.262
+
+### Fixed
+
+- **The Validation per-table results table now shows the match / mismatch / ERROR badge in
+  the Result column instead of always showing a dash (—).** The Result column sorts
+  failures-first on an integer key (`result_sort`), but the colored-badge slot was reading
+  that column's field value — the integer — as if it were the `{text, color}` badge payload.
+  An integer has no `.text`, so every row fell through to the "—" placeholder. Result now
+  has its own cell slot that reads the badge payload off the row directly, while the column
+  keeps sorting on `result_sort` (failing/errored rows still sort to the top). The
+  row-count and checksum columns are unchanged.
+
 ## v0.1.261
 
 ### Changed
