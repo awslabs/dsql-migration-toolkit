@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.260
+
+### Changed
+
+- **The "quiesce the source first" caveat no longer promises a clean match on a
+  permanent gap.** The caveat (shown under live source drift) applies to both recovery
+  branches, but its tail — "re-validate — a clean match then truly means no data was
+  lost" — is only true for an unexplained, loadable gap. For a fully-explained gap those
+  rows exceed a permanent Aurora DSQL limit and stay absent whatever you do, so freezing
+  and re-validating can never reach a clean match; the promise contradicted the same
+  card's "these rows can't be stored as-is — shrink the value or accept the gap". The
+  tail is now branch-aware: fully-explained → "re-validate to confirm no other rows
+  drifted in — the explained gap will remain until you shrink those values or accept it";
+  unexplained → the original clean-match wording, which is the right goal there. The
+  drift gate itself is unchanged.
+
 ## v0.1.259
 
 ### Changed

@@ -3245,11 +3245,27 @@ def _render_recovery_section(
                 ui,
                 tone="warning",
                 header="For a definitive zero-loss verdict, quiesce the source first",
+                # The tail differs by branch. For a fully-explained gap, freezing +
+                # re-validating will NOT produce a clean match -- those rows exceed a
+                # permanent DSQL limit and stay absent whatever you do, so promising
+                # "a clean match means no data was lost" here contradicts this card's
+                # own "can't be stored as-is -- shrink or accept" message. There the
+                # quiesce is only to confirm nothing ELSE drifted in; the explained gap
+                # remains until the value is shrunk or the gap accepted. The unexplained
+                # branch keeps the original promise -- there a reload really can reach a
+                # clean match, so it is the right goal.
                 body=(
                     "The source has changed since the snapshot, so some difference may "
                     "be in-flight. Before the FINAL cut-over check, stop source writes "
                     "and let CDC drain (or Stop CDC from the Data Migration step), then "
-                    "re-validate — a clean match then truly means no data was lost."
+                    + (
+                        "re-validate to confirm no other rows drifted in — the "
+                        "explained gap will remain until you shrink those values or "
+                        "accept it."
+                        if fully_explained
+                        else
+                        "re-validate — a clean match then truly means no data was lost."
+                    )
                 ),
             )
         if diagnose_provider is not None:

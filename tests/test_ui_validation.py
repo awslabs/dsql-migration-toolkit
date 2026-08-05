@@ -4072,3 +4072,55 @@ def test_recovery_unexplained_gap_keeps_the_full_load_reload_runbook() -> None:
     assert "fact_check" not in ui.icons
     # And it must NOT mis-apply the permanent-limit language to a loadable gap.
     assert "exceeds a permanent Aurora DSQL limit" not in body
+
+
+def test_quiesce_notice_tail_differs_by_branch_under_drift() -> None:
+    """change D: the quiesce warning must not promise a clean match on a permanent gap.
+
+    The quiesce warning is gated on live drift and applies to both recovery branches.
+    But for a fully-explained gap, freezing + re-validating can never reach a clean
+    match (those rows exceed a permanent DSQL limit), so promising "a clean match then
+    truly means no data was lost" contradicts the card's own "shrink the value or accept
+    the gap". The unexplained branch keeps that promise -- there a reload really can
+    reach a clean match.
+    """
+    from dsql_migrator.ui.validation import _render_recovery_section, summarize_validation
+
+    # Fully explained (dropped==missing) + live drift.
+    explained = _CopyUi()
+    _render_recovery_section(
+        explained, summarize_validation(_quarantine_report(dropped=3, missing=3)),
+        _drift_advanced(),
+    )
+    eb = explained.body()
+    # The quiesce warning still appears (drift is live)...
+    assert "quiesce the source first" in eb
+    # ...but reframed: no "clean match = no data lost" promise here.
+    assert "a clean match then truly means no data was lost" not in eb
+    assert "confirm no other rows drifted in" in eb
+    assert "the explained gap will remain" in eb
+
+    # Unexplained (dropped < missing) + live drift -> original promise kept.
+    unexplained = _CopyUi()
+    _render_recovery_section(
+        unexplained, summarize_validation(_quarantine_report(dropped=1, missing=3)),
+        _drift_advanced(),
+    )
+    ub = unexplained.body()
+    assert "quiesce the source first" in ub
+    assert "a clean match then truly means no data was lost" in ub
+    assert "the explained gap will remain" not in ub
+
+
+def test_quiesce_notice_absent_without_drift_in_both_branches() -> None:
+    # change D changes only the WORDING; the source_live gate (v0.1.257) is unchanged --
+    # no drift, no quiesce notice, in either branch.
+    from dsql_migrator.ui.validation import _render_recovery_section, summarize_validation
+
+    for dropped, missing in ((3, 3), (1, 3)):
+        ui = _CopyUi()
+        _render_recovery_section(
+            ui, summarize_validation(_quarantine_report(dropped=dropped, missing=missing)),
+            _drift_na(),
+        )
+        assert "quiesce the source first" not in ui.body(), (dropped, missing)
