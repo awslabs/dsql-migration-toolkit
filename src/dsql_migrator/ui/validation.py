@@ -1196,25 +1196,28 @@ class ValidationState:
         # not run (e.g. count-only path or a restored report). Written by the worker,
         # read by the UI poller, so lock-guarded.
         self._identity_sync: Optional[dict[str, int]] = None
-        # One-shot latch: True once the cut-over screen has kicked off its identity
-        # sequence re-sync (which runs when the cut-over runbook opens, before the
-        # operator repoints the app). content() re-renders on every poll, so without
-        # this the sync would be resubmitted on each render. Cleared by a fresh
-        # validation run (a new run means a new pre-cut-over state to re-sync).
-        self._cutover_identity_synced: bool = False
+        # Result of the operator-triggered "Sync identity sequences" action in the
+        # cut-over runbook (an explicit button, NOT a render side-effect). ``None`` until
+        # the operator clicks it; then a dict of {table: RESTART WITH value} (empty ==
+        # ran, nothing to advance). Written by the button's background job, read by the
+        # cut-over render to show the outcome. Lock-guarded for the cross-thread handoff;
+        # cleared by a fresh validation run (a new verdict is a new pre-cut-over state).
+        self._cutover_identity_sync: Optional[dict[str, int]] = None
 
-    def begin_cutover_identity_sync(self) -> bool:
-        """Latch the cut-over identity re-sync to run ONCE; return True if we should run.
-
-        Returns True on the first call after a (re-)validation and False thereafter,
-        so the cut-over screen submits the background sync exactly once per verdict
-        rather than on every content() re-render.
-        """
+    def set_cutover_identity_sync(self, advanced: "Optional[dict[str, int]]") -> None:
+        """Record the cut-over identity-sync button's outcome (see ``cutover_identity_sync``)."""
         with self._lock:
-            if self._cutover_identity_synced:
-                return False
-            self._cutover_identity_synced = True
-            return True
+            self._cutover_identity_sync = advanced
+
+    @property
+    def cutover_identity_sync(self) -> "Optional[dict[str, int]]":
+        """The cut-over identity-sync button's last outcome, or ``None`` if not yet run."""
+        with self._lock:
+            return (
+                dict(self._cutover_identity_sync)
+                if self._cutover_identity_sync is not None
+                else None
+            )
 
     def mark_run_started(self) -> None:
         """Stamp the start of a run (clears any prior elapsed time)."""
@@ -1312,9 +1315,9 @@ class ValidationState:
             self._restored = False  # a freshly-run result, not a restored one
             self._rechecked_tables = ()
             self._rechecked_at = None
-            # A new verdict re-arms the cut-over screen's one-shot identity re-sync:
-            # the target may have advanced since the previous cut-over view.
-            self._cutover_identity_synced = False
+            # A new verdict supersedes any earlier cut-over identity-sync outcome (the
+            # target may have advanced since), so the runbook button offers a fresh run.
+            self._cutover_identity_sync = None
 
     def set_identity_sync(self, advanced: "Optional[dict[str, int]]") -> None:
         """Record the identity-sequence re-sync outcome for the last full run.
@@ -1442,8 +1445,7 @@ class ValidationState:
             self._rechecked_at = None
             self._recheck_error = None
             self._identity_sync = None
-            self._cutover_identity_synced = False
-            self._identity_sync = None
+            self._cutover_identity_sync = None
 
 
 @dataclass
@@ -2148,30 +2150,35 @@ def _cutover_summary_for_preview() -> "ValidationSummary":
     )
 
 
-def _maybe_resync_identity_for_cutover(
+def _run_cutover_identity_sync(
     session: object,
     validation_state: "ValidationState",
     report: "Optional[ValidationReport]",
     *,
     job_manager: "Optional[JobManager]" = None,
     sync: "Optional[Callable[..., dict]]" = None,
+    refresh: "Optional[Callable[[], None]]" = None,
 ) -> None:
-    """Re-sync identity sequences once when the cut-over runbook opens (safety net).
+    """Advance identity sequences past the current target ``MAX(pk)`` (operator action).
 
-    Keyed off the CURRENT target ``MAX(pk)`` over the validated tables, so any rows CDC
-    delivered after the last Validation are covered before the operator repoints the
-    app. One-shot per verdict (``begin_cutover_identity_sync``) and never blocks: it is
-    submitted to ``job_manager`` when available (production) and otherwise run inline
-    (tests inject ``sync``). Best-effort -- ``resync_identity_sequences`` never raises.
+    Invoked by the explicit "Sync identity sequences" button in the cut-over runbook --
+    NOT on render, so viewing the screen never writes to the target. Keyed off the
+    CURRENT ``MAX(pk)`` over the validated tables, so any rows CDC delivered after the
+    last Validation are covered before the operator repoints the app (the app's first
+    insert would otherwise collide, 23505). Runs in the background (a target write) so
+    the click never blocks the UI; the outcome is stored on ``validation_state`` and the
+    screen refreshes to show it. Best-effort -- ``resync_identity_sequences`` never
+    raises; the ``is_identity`` catalog filter skips non-identity tables.
     """
     target_config = getattr(session, "target_config", None)
-    if target_config is None or report is None:
+    table_names = [item.table for item in report.items] if report is not None else []
+    if target_config is None or not table_names:
+        # Nothing to sync (no target / no tables): record an empty result so the button
+        # reflects "ran, nothing to do" rather than staying in the un-run state.
+        validation_state.set_cutover_identity_sync({})
+        if refresh is not None:
+            refresh()
         return
-    table_names = [item.table for item in report.items]
-    if not table_names:
-        return
-    if not validation_state.begin_cutover_identity_sync():
-        return  # already kicked off for this verdict
     aws_profile = getattr(session, "aws_profile", None)
 
     def _work(_handle: object = None) -> None:
@@ -2189,10 +2196,13 @@ def _maybe_resync_identity_for_cutover(
                 status=ActivityStatus.SUCCESS,
                 detail=(
                     f"{len(advanced)} identity primary key(s) advanced past the current "
-                    "target rows as the cut-over runbook opened, so the application's "
-                    f"first insert after cut-over cannot collide: {detail}"
+                    "target rows before cut-over, so the application's first insert "
+                    f"after cut-over cannot collide: {detail}"
                 ),
             )
+        validation_state.set_cutover_identity_sync(advanced)
+        if refresh is not None:
+            refresh()
 
     if job_manager is not None:
         job_manager.submit(_work)
@@ -2251,6 +2261,15 @@ def build_cutover_screen(
         report = validation_state.result
         summary = summarize_validation(report) if report is not None else None
         drift = format_drift(report) if report is not None else None
+
+        # The runbook's "Sync identity sequences" button calls this: advance identity
+        # keys past the current target MAX(pk), in the background, then refresh to show
+        # the outcome. Defined here so it closes over this render's report/refresh.
+        def _identity_sync_provider() -> None:
+            _run_cutover_identity_sync(
+                session, validation_state, report,
+                job_manager=job_manager, sync=sync_sequences, refresh=refresh,
+            )
 
         # Dev-only UI review: with no clean verdict, synthesize a ready summary so
         # the runbook itself can be reviewed without running the whole workflow.
@@ -2354,25 +2373,16 @@ def build_cutover_screen(
                 ),
             )
 
-        # Safety net: the cut-over runbook is now open (release is clean or accepted),
-        # which is the moment just BEFORE the operator repoints the app -- and the last
-        # point the tool controls before the app's first insert. Validation already
-        # re-syncs identity sequences (v0.1.266), but only if the operator ran it after
-        # the final CDC drain; rows CDC delivered AFTER that last validation would leave
-        # the sequence lagging MAX(pk) and the app's first insert would collide (23505).
-        # Re-sync once more here, keyed off the current target MAX(pk), so reaching the
-        # runbook is itself sufficient -- no dependence on remembering to re-validate.
-        # One-shot per verdict (content() re-renders on poll) and idempotent; run in the
-        # background (a target write) so the render never blocks.
-        _maybe_resync_identity_for_cutover(
-            session, validation_state, report,
-            job_manager=job_manager, sync=sync_sequences,
-        )
-
         # Go path: the verdict is clean — show the tailored runbook + an explicit
-        # acknowledgement that marks the step (and the whole journey) Done.
+        # acknowledgement that marks the step (and the whole journey) Done. The runbook
+        # includes an explicit "Sync identity sequences" action (an operator step, not a
+        # render side-effect): identity keys must be advanced past the current target
+        # MAX(pk) BEFORE the app repoints, or its first insert collides (23505).
         _render_cutover_section(
-            ui, summary, drift, cdc_in_use=_cdc_in_use(session)
+            ui, summary, drift,
+            cdc_in_use=_cdc_in_use(session),
+            identity_sync_provider=_identity_sync_provider,
+            identity_sync_result=validation_state.cutover_identity_sync,
         )
 
         done = get_status(session.workflow, WorkflowStep.CUT_OVER) is StepStatus.DONE
@@ -3444,6 +3454,8 @@ def _render_recovery_section(
 def _render_cutover_section(
     ui: object, summary: ValidationSummary, drift: DriftDisplay, *,
     cdc_in_use: bool = False,
+    identity_sync_provider: "Optional[Callable[[], None]]" = None,
+    identity_sync_result: "Optional[dict[str, int]]" = None,
 ) -> None:
     """Render the go-path cut-over runbook as its OWN titled section card.
 
@@ -3456,6 +3468,13 @@ def _render_cutover_section(
     needs a brief source write-freeze. Rollback is called out either way, because
     once the application writes to DSQL those rows live only on DSQL (this tool
     replicates MySQL -> DSQL, not the reverse).
+
+    ``identity_sync_provider`` (when given) wires an explicit "Sync identity
+    sequences" button, shown just before the repoint step: it advances identity keys
+    past the current target MAX(pk) so the app's first insert after cut-over cannot
+    collide. It is a deliberate operator action (a target write), never a render
+    side-effect. ``identity_sync_result`` is the last outcome to display ({} == ran,
+    nothing to advance; a dict names the advanced sequences; None == not run yet).
     """
     with _section(ui, icon="rocket_launch", title="How to cut over"):  # type: ignore[misc]
         render_notice(
@@ -3527,6 +3546,51 @@ def _render_cutover_section(
                         "text-xs font-semibold flex items-center justify-center"
                     )
                     ui.label(text).classes("text-sm text-gray-700 leading-snug")  # type: ignore[attr-defined]
+
+        # Explicit identity-sequence sync: an OPERATOR ACTION, not a render side-effect.
+        # Identity (AUTO_INCREMENT) keys are loaded/replicated with explicit ids, which do
+        # not advance a GENERATED BY DEFAULT sequence, so before repointing the app the
+        # sequence must be moved past the current target MAX(pk) or the app's first insert
+        # collides (23505). The button does that on demand (idempotent, safe to re-click);
+        # do it after the final drain (CDC) / reload (Full Load) and before repointing.
+        if identity_sync_provider is not None:
+            with ui.column().classes(  # type: ignore[attr-defined]
+                "w-full gap-1 mt-1 pt-2 border-t border-gray-100"
+            ):
+                ui.label(  # type: ignore[attr-defined]
+                    "Before you repoint: sync identity sequences"
+                ).classes("text-sm font-semibold text-gray-900")
+                ui.label(  # type: ignore[attr-defined]
+                    "If any table uses a server-generated (AUTO_INCREMENT / IDENTITY) "
+                    "key, advance its sequence past the migrated rows so your "
+                    "application's first insert after cut-over does not hit a duplicate "
+                    "key. Run this after the final drain/reload and before repointing. "
+                    "Safe to run more than once."
+                ).classes("text-xs text-gray-600 leading-snug")
+                with ui.row().classes("items-center gap-3 mt-1"):  # type: ignore[attr-defined]
+                    ui.button(  # type: ignore[attr-defined]
+                        "Sync identity sequences",
+                        icon="sync",
+                        on_click=lambda: identity_sync_provider(),
+                    ).props("color=primary outline no-caps")
+                    if identity_sync_result is not None:
+                        if identity_sync_result:
+                            advanced = ", ".join(
+                                f"{name} → {value}"
+                                for name, value in sorted(identity_sync_result.items())
+                            )
+                            inline_hint(
+                                ui,
+                                f"Advanced {len(identity_sync_result)} sequence(s): "
+                                f"{advanced}.",
+                                tone="success",
+                            )
+                        else:
+                            inline_hint(
+                                ui,
+                                "Done — no server-generated key needed advancing.",
+                                tone="success",
+                            )
 
         # Rollback caveat: once the app writes to DSQL, those rows exist only there
         # (this tool does not replicate DSQL -> MySQL), so keep the source as a

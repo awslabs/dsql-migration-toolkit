@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.271
+
+### Changed
+
+- **The pre-cut-over identity-sequence sync is now an explicit "Sync identity sequences"
+  button in the Cut-over runbook, not an automatic action on render.** v0.1.270 ran the
+  sync as a side-effect of the Cut-over screen rendering — viewing the page issued
+  `ALTER TABLE … RESTART WITH` to the target without any click, which is a poor design
+  (a read/view causing a write) and out of step with this step's principle that cut-over
+  is the operator's explicit act. The runbook now shows a **"Sync identity sequences"**
+  button, placed just before the repoint step, that the operator clicks after the final
+  drain/reload and before repointing. It advances every identity key past the current
+  target `MAX(pk)` (idempotent, safe to re-click), runs in the background so the click
+  never blocks, and shows the outcome (which sequences advanced, or "nothing needed
+  advancing"). This keeps the safety net v0.1.270 aimed for — reaching the runbook and
+  pressing one button covers rows CDC delivered after the last Validation, with no
+  dependence on remembering to re-validate — while removing the render-time target write.
+  (v0.1.270 was never deployed; this supersedes it.)
+
 ## v0.1.270
 
 ### Fixed
