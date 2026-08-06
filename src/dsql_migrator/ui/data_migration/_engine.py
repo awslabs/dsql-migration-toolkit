@@ -1697,6 +1697,12 @@ def _log_identity_sequence_sync(
     if inputs is None:
         return {}
     synced = _sync_identity_sequences_after_load(inputs, table_names, sync=sync)
+    _log_identity_sequence_sync_outcome(synced)
+    return synced
+
+
+def _log_identity_sequence_sync_outcome(synced: "Mapping[str, object]") -> None:
+    """Record the identity-sequence sync result in the activity log (advanced tables)."""
     advanced = {name: value for name, value in synced.items() if value is not None}
     if advanced:
         detail = ", ".join(
@@ -1712,6 +1718,52 @@ def _log_identity_sequence_sync(
                 f"{detail}"
             ),
         )
+
+
+def sync_identity_sequences_for_tables(
+    target_config: "TargetConnectionConfig",
+    table_names: "Sequence[str]",
+    *,
+    aws_profile: "Optional[str]" = None,
+    sync: "Optional[Callable[..., dict]]" = None,
+) -> dict:
+    """Sync target identity sequences off the CURRENT ``MAX(pk)`` and log the outcome.
+
+    Config-based sibling of :func:`_log_identity_sequence_sync` (which needs a full
+    :class:`DataMigrationInputs`). Used by the "Accept quarantined rows & continue"
+    action: accepting the gap is the moment a quarantined load becomes COMPLETE, but it
+    happens AFTER ``_finalize_run`` (which saw the run as incomplete and skipped the
+    sync). Without this, an accept-after-load flow left the identity sequence at its
+    start (``nextval`` = 1) and the app's first insert after cut-over collided with a
+    migrated id (23505). Quarantined rows are permanently dropped, so ``MAX(pk)`` is
+    final and syncing off it is correct. Never raises (best-effort follow-up).
+    """
+    if not table_names:
+        return {}
+    try:
+        if sync is None:
+            from dsql_migrator.core.target_introspector import (
+                sync_identity_sequences as sync,
+            )
+
+        def _factory():
+            return DsqlConnector(target_config, aws_profile=aws_profile).connect()
+
+        synced = sync(list(table_names), connection_factory=_factory) or {}
+    except Exception as exc:  # noqa: BLE001 - never fail the accept on this follow-up
+        log_activity(
+            ActivityCategory.FULL_LOAD,
+            "identity sequence sync failed",
+            status=ActivityStatus.FAILURE,
+            detail=(
+                f"Could not advance target identity sequences after accepting the gap: "
+                f"{exc}. If any target table uses an identity primary key, run "
+                "ALTER TABLE <t> ALTER COLUMN <pk> RESTART WITH <max(pk)+1> before "
+                "cut-over, or re-run Validation to sync them."
+            ),
+        )
+        return {}
+    _log_identity_sequence_sync_outcome(synced)
     return synced
 
 

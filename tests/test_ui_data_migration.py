@@ -8793,6 +8793,83 @@ def test_finalize_run_quarantine_not_accepted_does_not_sync() -> None:
     assert spy.calls == []
 
 
+# --- sync_identity_sequences_for_tables (the accept-after-load entrypoint) --
+# The accept action happens AFTER _finalize_run, so a quarantined load that is only
+# accepted later never hit the load-time sync. This config-based helper is what the
+# "Accept quarantined rows & continue" button calls to close that gap.
+
+
+def test_sync_identity_sequences_for_tables_syncs_and_filters_non_identity() -> None:
+    from dsql_migrator.core.models import TargetConnectionConfig
+    from dsql_migrator.ui.data_migration._engine import (
+        sync_identity_sequences_for_tables,
+    )
+
+    target = TargetConnectionConfig(
+        cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"
+    )
+    spy = _SyncSpy(result={"order_items": 1504, "product_media": None})
+    out = sync_identity_sequences_for_tables(
+        target, ["order_items", "product_media"], sync=spy
+    )
+    # Handed the tables; the connector factory (closure) is never invoked with a fake sync.
+    assert spy.calls == [["order_items", "product_media"]]
+    # The raw result is returned (the log-outcome helper drops the None internally).
+    assert out == {"order_items": 1504, "product_media": None}
+
+
+def test_sync_identity_sequences_for_tables_never_raises_and_no_tables_is_noop() -> None:
+    from dsql_migrator.core.models import TargetConnectionConfig
+    from dsql_migrator.ui.data_migration._engine import (
+        sync_identity_sequences_for_tables,
+    )
+
+    target = TargetConnectionConfig(
+        cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"
+    )
+
+    # No tables -> the sync is NOT invoked at all (no needless connection), empty result.
+    no_tables_spy = _SyncSpy()
+    assert sync_identity_sequences_for_tables(target, [], sync=no_tables_spy) == {}
+    assert no_tables_spy.calls == []
+
+    # A sync that raises is swallowed (best-effort follow-up), returns empty.
+    def _raise(names, *, connection_factory):
+        raise RuntimeError("connection refused")
+
+    assert sync_identity_sequences_for_tables(target, ["t"], sync=_raise) == {}
+
+
+def test_accept_quarantine_syncs_identity_over_migration_scope(monkeypatch) -> None:  # noqa: ANN001
+    """Clicking "Accept quarantined rows & continue" must trigger the identity sync.
+
+    This is the reported gap: the load ran with accept=False (nothing accepted yet), so
+    _finalize_run skipped the sync; then the user accepted, which marked the step DONE
+    but never synced -- leaving nextval=1. The accept handler now submits a background
+    sync over the migration scope, keyed off the CURRENT target MAX(pk).
+    """
+    from dsql_migrator.ui import data_migration as dm
+
+    calls: list = []
+    monkeypatch.setattr(
+        dm,
+        "sync_identity_sequences_for_tables",
+        lambda target_config, table_names, **kw: calls.append(list(table_names)),
+    )
+    # The handler is a closure; assert the wiring at the source level (the double
+    # swallows NiceGUI, so a full render is not exercised here) -- the executable
+    # behaviour of the sync itself is covered by the two tests above.
+    import inspect
+
+    src = inspect.getsource(dm.build_data_migration_screen)
+    assert "sync_identity_sequences_for_tables(" in src
+    assert "def _sync_after_accept" in src
+    # It runs as a background job (target write, not on the click thread) and is gated
+    # on having a target + a non-empty migration scope.
+    assert "job_manager.submit(_sync_after_accept)" in src
+    assert "if target_config is not None and selected_names:" in src
+
+
 # --- CDC connector state-transition logging --------------------------------
 
 
