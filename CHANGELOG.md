@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.273
+
+### Changed
+
+- **The oversized-LOB exclusion now explains why it is locked once CDC infrastructure
+  is deployed, instead of freezing silently.** Previously, once the cdc-stack existed
+  (including after a Stop CDC, which keeps the stack and its committed MSK offset), the
+  exclusion tick-boxes were disabled with no message — a stopped-CDC operator saw a
+  frozen box and no reason, which reads as a bug. The lock itself is correct and stays:
+  changing which columns are excluded on a pipeline that has already streamed would
+  leave already-migrated rows inconsistent with rows processed after (the resume offset
+  survives a Stop), so the exclusion is fixed for the life of the infrastructure. The
+  box now names that reason and the only safe remedy — delete the CDC infrastructure and
+  redeploy with the new set — mirroring how the table picker locks on the same stack
+  phase. The reason renders in a neutral tone (a deployed pipeline is an expected state,
+  not a warning). The CDC start point and table selection behaviors are unchanged.
+
 ## v0.1.272
 
 ### Added

@@ -4805,13 +4805,22 @@ def lob_exclusion_lock(migration_state, job_manager) -> tuple[bool, Optional[str
     silently lies about what CDC captures. The boxes previously had no lock at all: a
     tick registered and the state really changed, it just never reached the pipeline.
 
-    ``locked`` and ``reason`` are deliberately separate. Deployed infrastructure is the
-    NORMAL state for a CDC run, and the greyed-out boxes already say the choice is
-    closed -- adding a warning line there flags an ordinary situation as a problem
-    (severity calibration: an expected, no-action-needed state is not a warning). So
-    that case locks with no message. The two cases that a message genuinely helps with
-    are the transient ones, where the operator may be mid-decision and needs the remedy
-    named: a create still in flight, and a started CDC (stop it to change them).
+    Every locked case now NAMES its reason. An earlier version left the
+    "infrastructure exists" case silent on the theory that the greyed-out boxes were
+    self-explanatory -- but a stopped-CDC operator who sees a ticked-and-frozen box
+    with no explanation cannot tell WHY it is closed or how to change it (they read
+    it as a bug). So the reason is always given; severity is carried by the render
+    TONE (neutral for these expected/no-action states, not an alarming warning), not
+    by withholding the text.
+
+    Why the exclusion is locked once infrastructure exists (not merely once CDC is
+    streaming): the excluded-column set is captured into the pipeline, and once CDC
+    has streamed even once its resume offset is committed on MSK (a Stop deletes only
+    the connectors, not the offset). Changing the exclusion then would leave the rows
+    already migrated/streamed under the old set inconsistent with rows processed
+    after -- silent partial data. The safe way to change it is to delete the CDC
+    infrastructure and redeploy with the new set (a fresh offset + re-run), which is
+    the remedy named below -- matching how the table picker locks on the same phase.
 
     Pure apart from reading the job's status through ``job_manager``; no AWS I/O.
     """
@@ -4833,8 +4842,17 @@ def lob_exclusion_lock(migration_state, job_manager) -> tuple[bool, Optional[str
         "provisioning",
         "partial",
     ):
-        # Locked, but silent: the disabled boxes carry the message on their own.
-        return True, None
+        # Infrastructure is deployed (e.g. after a Stop CDC, which keeps the stack and
+        # its committed offset). Explain the lock and name the only safe remedy --
+        # changing the exclusion on a pipeline that has already streamed would diverge
+        # already-migrated rows from later ones.
+        return True, (
+            "Locked — the CDC infrastructure is deployed for this table set, so the "
+            "excluded columns are fixed for this pipeline (changing them after CDC has "
+            "streamed would leave already-migrated rows inconsistent with later ones). "
+            "To change them, delete the CDC infrastructure on the CDC step first, then "
+            "redeploy."
+        )
     return False, None
 
 
@@ -4918,13 +4936,13 @@ def _render_cdc_lob_exclusion_panel(
                 "all, so exclude such columns here to keep CDC from stalling. "
                 "Nothing is excluded unless you tick it."
             ).classes("text-xs text-gray-500")
-        # A reason line only when one was given. Deployed infrastructure is the
-        # normal state of a CDC run, so it locks silently -- the greyed-out boxes
-        # already say the choice is closed, and a warning there would flag an
-        # ordinary situation as a problem. The transient cases still explain
-        # themselves, since the operator may have just been choosing.
+        # Always explain the lock when one is in effect. These are expected,
+        # no-action-needed states (a deployed/started CDC pipeline), so the reason
+        # renders NEUTRAL, not as an amber warning -- severity calibration: a normal
+        # state must not read as a problem, but it must still say why the boxes are
+        # frozen and how to change them (a silent frozen box reads as a bug).
         if locked and lock_reason:
-            inline_hint(ui, lock_reason, tone="warning")  # type: ignore[attr-defined]
+            inline_hint(ui, lock_reason, tone="neutral")  # type: ignore[attr-defined]
         for candidate in candidates:
             excluded = selection.get(candidate.table, set())
             for column in candidate.columns:

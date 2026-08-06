@@ -13356,23 +13356,26 @@ def test_lob_exclusion_locks_while_infrastructure_is_being_created() -> None:
     assert reason is not None and "being created" in reason
 
 
-def test_lob_exclusion_locks_silently_once_infrastructure_exists() -> None:
-    """Deployed infrastructure locks the choice but says NOTHING about it.
+def test_lob_exclusion_locks_and_explains_once_infrastructure_exists() -> None:
+    """Deployed infrastructure locks the choice AND explains why + the remedy.
 
-    The parameter is fixed on the stack, so the boxes must not be tickable. But a
-    deployed CDC stack is the NORMAL state of a CDC run, and the greyed-out boxes
-    already convey that the choice is closed -- a warning line there would flag an
-    ordinary situation as a problem (severity calibration). So: locked, reason None.
-    Phase ``running`` is excluded here on purpose: that IS a live pipeline, so it
-    falls to the streaming branch below, whose remedy (Stop CDC) does need saying.
+    The exclusion is fixed for the pipeline once the stack exists (e.g. after a Stop
+    CDC, which keeps the stack and its committed offset), so the boxes must not be
+    tickable. An earlier version left this silent on the theory the greyed boxes were
+    self-explanatory, but a stopped-CDC operator reads a frozen box with no reason as
+    a bug. So the lock now names its reason and the remedy (delete + redeploy). The
+    reason is rendered NEUTRAL (not warning) by the panel -- severity calibration --
+    but the text itself must be present.
     """
     from dsql_migrator.ui.data_migration._cdc_ui import lob_exclusion_lock
 
     for phase in ("infra", "provisioning", "partial"):
         state = DataMigrationState()
         state.set_cdc_stack_phase(phase)
-        assert lob_exclusion_lock(state, _LockJobManager()) == (True, None), (
-            f"phase {phase} must lock the exclusion without a warning line"
+        locked, reason = lob_exclusion_lock(state, _LockJobManager())
+        assert locked, f"phase {phase} must lock the exclusion"
+        assert reason is not None and "delete the CDC infrastructure" in reason, (
+            f"phase {phase} must explain the lock and name the delete+redeploy remedy"
         )
 
 
