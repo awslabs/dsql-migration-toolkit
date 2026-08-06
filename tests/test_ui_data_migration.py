@@ -8677,6 +8677,122 @@ def test_finalize_run_clean_completes() -> None:
     )
 
 
+# --- identity-sequence sync gate on _finalize_run --------------------------
+# The sequence sync must run on EVERY completed load (clean OR accepted-quarantine),
+# because quarantined rows are permanently dropped so MAX(pk) is final; it must NOT
+# run on a partial/failed load, whose retries could still fill the gap.
+
+
+class _SyncSpy:
+    """Records the (table_names) each sync call was handed; returns a canned result."""
+
+    def __init__(self, result=None):
+        self.calls: list = []
+        self._result = result or {}
+
+    def __call__(self, table_names, *, connection_factory):
+        self.calls.append(list(table_names))
+        return dict(self._result)
+
+
+def _sentinel_inputs():
+    # _log_identity_sequence_sync only needs a non-None ``inputs``; with an injected
+    # ``sync`` the DsqlConnector factory closure is never invoked, so no real config
+    # is required. A bare object stands in for DataMigrationInputs here.
+    return object()
+
+
+def test_finalize_run_accepted_quarantine_syncs_identity_sequence() -> None:
+    # THE BUG: an accepted-quarantine run is a COMPLETED load, so its identity
+    # sequence must be advanced past MAX(pk) -- previously this branch returned without
+    # syncing, leaving the sequence at nextval=1 and colliding after cut-over.
+    from dsql_migrator.ui.data_migration._engine import _finalize_run, _RunCounts
+
+    log = ErrorLogStore()
+    _record_quarantine(log, "jq", 1)
+    spy = _SyncSpy(result={"order_items": 1504})
+    _finalize_run(
+        _FinalizeHandleStub(),
+        "jq",
+        ["order_items"],
+        _RunCounts(real_failed=0, quarantined=1),
+        log,
+        accept_quarantined_rows=True,
+        inputs=_sentinel_inputs(),
+        sync_sequences=spy,
+    )
+    assert spy.calls == [["order_items"]]
+
+
+def test_finalize_run_clean_still_syncs_identity_sequence() -> None:
+    # Regression guard: the clean path must keep syncing (no change).
+    from dsql_migrator.ui.data_migration._engine import _finalize_run, _RunCounts
+
+    spy = _SyncSpy()
+    _finalize_run(
+        _FinalizeHandleStub(),
+        "jc",
+        ["t"],
+        _RunCounts(real_failed=0, quarantined=0),
+        ErrorLogStore(),
+        accept_quarantined_rows=False,
+        inputs=_sentinel_inputs(),
+        sync_sequences=spy,
+    )
+    assert spy.calls == [["t"]]
+
+
+def test_finalize_run_real_failure_does_not_sync_identity_sequence() -> None:
+    # A partial/failed load must NOT sync: a later retry can still add rows, so MAX(pk)
+    # is not yet final and syncing off it could let the remaining rows collide.
+    from dsql_migrator.ui.data_migration._engine import (
+        FullLoadIncompleteError,
+        _finalize_run,
+        _RunCounts,
+    )
+
+    log = ErrorLogStore()
+    _record_failure(log, "jf")
+    spy = _SyncSpy()
+    with pytest.raises(FullLoadIncompleteError):
+        _finalize_run(
+            _FinalizeHandleStub(),
+            "jf",
+            ["t"],
+            _RunCounts(real_failed=1, quarantined=0),
+            log,
+            accept_quarantined_rows=True,
+            inputs=_sentinel_inputs(),
+            sync_sequences=spy,
+        )
+    assert spy.calls == []
+
+
+def test_finalize_run_quarantine_not_accepted_does_not_sync() -> None:
+    # Not accepted => the run RAISES (incomplete), so nothing is "completed" to sync.
+    from dsql_migrator.ui.data_migration._engine import (
+        FullLoadIncompleteError,
+        _finalize_run,
+        _RunCounts,
+    )
+
+    log = ErrorLogStore()
+    _record_quarantine(log, "jn", 1)
+    spy = _SyncSpy()
+    with pytest.raises(FullLoadIncompleteError):
+        _finalize_run(
+            _FinalizeHandleStub(),
+            "jn",
+            ["t"],
+            _RunCounts(real_failed=0, quarantined=1),
+            log,
+            accept_quarantined_rows=False,
+            inputs=_sentinel_inputs(),
+            sync_sequences=spy,
+        )
+    assert spy.calls == []
+
+
 # --- CDC connector state-transition logging --------------------------------
 
 

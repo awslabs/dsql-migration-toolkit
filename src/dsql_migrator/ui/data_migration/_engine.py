@@ -1746,10 +1746,13 @@ def _finalize_run(
                 status=ActivityStatus.SUCCESS,
                 detail=f"{len(table_names)} table(s) loaded",
             )
-            # Only after a COMPLETE load: MAX(pk) is the value the sequence must clear,
-            # so syncing a partial load would set it from an incomplete high-water mark
-            # and the remaining rows could still collide. A cancelled run is skipped for
-            # the same reason.
+            # Sync the identity sequence off the loaded MAX(pk). Safe here because the
+            # load is COMPLETE: a PARTIAL load (a real failure leaves a gap that a later
+            # retry fills) would set the sequence from an incomplete high-water mark and
+            # the remaining rows could still collide, so that path is NOT synced. A
+            # cancelled run is skipped for the same reason. (The accepted-quarantine
+            # branch below is ALSO a completed load and syncs too -- quarantined rows are
+            # permanently dropped, so MAX(pk) is final there as well.)
             _log_identity_sequence_sync(inputs, table_names, sync=sync_sequences)
         return
     total = len(table_names)
@@ -1773,6 +1776,16 @@ def _finalize_run(
                 "completed with accepted gaps -- the gap is reported in Validation."
             ),
         )
+        # This IS a completed load, so the identity sequence must be synced here too
+        # -- exactly as on the clean path above. The clean-path comment warns against
+        # syncing a PARTIAL load (a real failure leaves a gap that later retries fill,
+        # so MAX(pk) is not yet final). Quarantined rows are the opposite: they are
+        # PERMANENTLY dropped and never backfilled, so the current MAX(pk) IS final and
+        # syncing off it is correct. Skipping it here left the sequence at its start
+        # (nextval=1) after an accepted-gap load, so the app's first insert after
+        # cut-over collided with a migrated id (duplicate key 23505) -- and only if the
+        # operator happened to run Validation (v0.1.266 re-sync) was it repaired.
+        _log_identity_sequence_sync(inputs, table_names, sync=sync_sequences)
         return
     # Name the affected tables and their reasons. "1 of 8 table(s) did not fully load"
     # is a count, not a diagnosis: reading it later tells you a run failed but not which
