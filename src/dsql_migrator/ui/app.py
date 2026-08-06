@@ -185,6 +185,7 @@ def build_page(
         SESSION_STORE,
         session_id,
         validation_store=VALIDATION_STORE,
+        job_manager=JOB_MANAGER,
     )
     # Optional tool (not a workflow step): the Query Playground — convert a MySQL
     # statement to DSQL and non-destructively test whether it runs on the target.

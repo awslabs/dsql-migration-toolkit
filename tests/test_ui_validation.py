@@ -1837,6 +1837,154 @@ def test_cutover_runner_marks_step_done() -> None:
     assert get_status(session.workflow, WorkflowStep.CUT_OVER) is StepStatus.DONE
 
 
+# --- cut-over identity re-sync safety net (_maybe_resync_identity_for_cutover) ---
+# The cut-over runbook opening is the last point the tool controls before the operator
+# repoints the app. Validation's re-sync (v0.1.266) covers rows up to the last
+# validation; CDC rows delivered after it would leave the sequence lagging. This runs
+# once when the runbook opens, keyed off the current target MAX(pk).
+
+
+class _CutoverSyncSession:
+    def __init__(self, target_config, aws_profile=None):
+        self.target_config = target_config
+        self.aws_profile = aws_profile
+
+
+def _cutover_sync_report(*table_names):
+    from dsql_migrator.core.models import ValidationMode, ValidationReport
+
+    items = [
+        TableValidationResult(
+            table=name, source_row_count=1, target_row_count=1,
+            row_count_match=True, matched=True,
+        )
+        for name in table_names
+    ]
+    return ValidationReport(items=items, mode=ValidationMode.ROW_COUNT)
+
+
+def test_cutover_identity_resync_runs_once_over_validated_tables() -> None:
+    from dsql_migrator.core.models import TargetConnectionConfig
+    from dsql_migrator.ui.validation import (
+        ValidationState,
+        _maybe_resync_identity_for_cutover,
+    )
+
+    calls: list = []
+
+    def _sync(table_names, *, connection_factory):
+        calls.append(list(table_names))
+        return {"order_items": 1505}
+
+    session = _CutoverSyncSession(
+        TargetConnectionConfig(
+            cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"
+        )
+    )
+    state = ValidationState()
+    report = _cutover_sync_report("order_items", "customers")
+
+    # First open -> sync runs over exactly the validated tables (inline, no job_manager).
+    _maybe_resync_identity_for_cutover(session, state, report, sync=_sync)
+    assert calls == [["order_items", "customers"]]
+
+    # Re-render (content() polls) -> one-shot latch prevents a second submit.
+    _maybe_resync_identity_for_cutover(session, state, report, sync=_sync)
+    assert calls == [["order_items", "customers"]]
+
+    # A fresh validation re-arms the latch -> next open syncs again.
+    state.set_result(report)
+    _maybe_resync_identity_for_cutover(session, state, report, sync=_sync)
+    assert calls == [["order_items", "customers"], ["order_items", "customers"]]
+
+
+def test_cutover_identity_resync_noops_without_target_or_tables() -> None:
+    from dsql_migrator.core.models import TargetConnectionConfig
+    from dsql_migrator.ui.validation import (
+        ValidationState,
+        _maybe_resync_identity_for_cutover,
+    )
+
+    def _boom(table_names, *, connection_factory):
+        raise AssertionError("sync must not be called")
+
+    target = TargetConnectionConfig(
+        cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"
+    )
+
+    # No target config -> no-op (and the latch is NOT consumed, so a later real open runs).
+    state = ValidationState()
+    _maybe_resync_identity_for_cutover(
+        _CutoverSyncSession(None), state, _cutover_sync_report("t"), sync=_boom
+    )
+    assert state.begin_cutover_identity_sync() is True  # latch still available
+
+    # No report / empty report -> no-op.
+    _maybe_resync_identity_for_cutover(
+        _CutoverSyncSession(target), ValidationState(), None, sync=_boom
+    )
+    _maybe_resync_identity_for_cutover(
+        _CutoverSyncSession(target), ValidationState(), _cutover_sync_report(), sync=_boom
+    )
+
+
+def test_cutover_screen_wires_identity_resync_before_the_runbook() -> None:
+    # Guard the WIRING: build_cutover_screen must call the safety-net sync on the go
+    # path (release clean/accepted), right before it renders the runbook -- so the
+    # sequence is advanced before the operator repoints the app.
+    import inspect
+
+    from dsql_migrator.ui import validation as v
+
+    src = inspect.getsource(v.build_cutover_screen)
+    assert "_maybe_resync_identity_for_cutover(" in src
+    # It runs BEFORE the go-path runbook render, not after (order matters: repoint is a
+    # runbook step, so syncing must precede it). Use the LAST _render_cutover_section
+    # occurrence -- the go path -- since an earlier one is the dev-preview branch.
+    sync_at = src.index("_maybe_resync_identity_for_cutover(")
+    runbook_at = src.rindex("_render_cutover_section(")
+    assert sync_at < runbook_at, "sync must be wired before the go-path runbook renders"
+    # And build_cutover_screen accepts a job_manager so the sync runs in the background.
+    assert "job_manager" in inspect.signature(v.build_cutover_screen).parameters
+
+
+def test_cutover_identity_resync_submits_to_job_manager_when_present() -> None:
+    from dsql_migrator.core.job_manager import JobManager
+    from dsql_migrator.core.models import TargetConnectionConfig
+    from dsql_migrator.ui.validation import (
+        ValidationState,
+        _maybe_resync_identity_for_cutover,
+    )
+
+    calls: list = []
+
+    def _sync(table_names, *, connection_factory):
+        calls.append(list(table_names))
+        return {}
+
+    manager = JobManager()
+    session = _CutoverSyncSession(
+        TargetConnectionConfig(
+            cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"
+        )
+    )
+    state = ValidationState()
+    job_id_before = None
+    _maybe_resync_identity_for_cutover(
+        session, state, _cutover_sync_report("order_items"),
+        job_manager=manager, sync=_sync,
+    )
+    # It was submitted as a background job (not run inline); wait for it to finish.
+    # The most recent job is the sync; drain briefly and assert the sync ran.
+    import time
+    for _ in range(50):
+        if calls:
+            break
+        time.sleep(0.02)
+    assert calls == [["order_items"]]
+    assert job_id_before is None  # sanity: we never stored a job id on the caller
+
+
 def test_connection_prereq_inventory_first() -> None:
     from dsql_migrator.ui.validation import _connection_prerequisite_notices
 

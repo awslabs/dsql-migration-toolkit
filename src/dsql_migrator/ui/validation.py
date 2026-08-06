@@ -1196,6 +1196,25 @@ class ValidationState:
         # not run (e.g. count-only path or a restored report). Written by the worker,
         # read by the UI poller, so lock-guarded.
         self._identity_sync: Optional[dict[str, int]] = None
+        # One-shot latch: True once the cut-over screen has kicked off its identity
+        # sequence re-sync (which runs when the cut-over runbook opens, before the
+        # operator repoints the app). content() re-renders on every poll, so without
+        # this the sync would be resubmitted on each render. Cleared by a fresh
+        # validation run (a new run means a new pre-cut-over state to re-sync).
+        self._cutover_identity_synced: bool = False
+
+    def begin_cutover_identity_sync(self) -> bool:
+        """Latch the cut-over identity re-sync to run ONCE; return True if we should run.
+
+        Returns True on the first call after a (re-)validation and False thereafter,
+        so the cut-over screen submits the background sync exactly once per verdict
+        rather than on every content() re-render.
+        """
+        with self._lock:
+            if self._cutover_identity_synced:
+                return False
+            self._cutover_identity_synced = True
+            return True
 
     def mark_run_started(self) -> None:
         """Stamp the start of a run (clears any prior elapsed time)."""
@@ -1293,6 +1312,9 @@ class ValidationState:
             self._restored = False  # a freshly-run result, not a restored one
             self._rechecked_tables = ()
             self._rechecked_at = None
+            # A new verdict re-arms the cut-over screen's one-shot identity re-sync:
+            # the target may have advanced since the previous cut-over view.
+            self._cutover_identity_synced = False
 
     def set_identity_sync(self, advanced: "Optional[dict[str, int]]") -> None:
         """Record the identity-sequence re-sync outcome for the last full run.
@@ -1419,6 +1441,8 @@ class ValidationState:
             self._rechecked_tables = ()
             self._rechecked_at = None
             self._recheck_error = None
+            self._identity_sync = None
+            self._cutover_identity_synced = False
             self._identity_sync = None
 
 
@@ -2124,11 +2148,65 @@ def _cutover_summary_for_preview() -> "ValidationSummary":
     )
 
 
+def _maybe_resync_identity_for_cutover(
+    session: object,
+    validation_state: "ValidationState",
+    report: "Optional[ValidationReport]",
+    *,
+    job_manager: "Optional[JobManager]" = None,
+    sync: "Optional[Callable[..., dict]]" = None,
+) -> None:
+    """Re-sync identity sequences once when the cut-over runbook opens (safety net).
+
+    Keyed off the CURRENT target ``MAX(pk)`` over the validated tables, so any rows CDC
+    delivered after the last Validation are covered before the operator repoints the
+    app. One-shot per verdict (``begin_cutover_identity_sync``) and never blocks: it is
+    submitted to ``job_manager`` when available (production) and otherwise run inline
+    (tests inject ``sync``). Best-effort -- ``resync_identity_sequences`` never raises.
+    """
+    target_config = getattr(session, "target_config", None)
+    if target_config is None or report is None:
+        return
+    table_names = [item.table for item in report.items]
+    if not table_names:
+        return
+    if not validation_state.begin_cutover_identity_sync():
+        return  # already kicked off for this verdict
+    aws_profile = getattr(session, "aws_profile", None)
+
+    def _work(_handle: object = None) -> None:
+        advanced = resync_identity_sequences(
+            target_config, table_names, aws_profile=aws_profile, sync=sync
+        )
+        if advanced:
+            detail = ", ".join(
+                f"{name} -> RESTART WITH {value}"
+                for name, value in sorted(advanced.items())
+            )
+            log_activity(
+                ActivityCategory.VALIDATION,
+                "identity sequences re-synced (cut-over)",
+                status=ActivityStatus.SUCCESS,
+                detail=(
+                    f"{len(advanced)} identity primary key(s) advanced past the current "
+                    "target rows as the cut-over runbook opened, so the application's "
+                    f"first insert after cut-over cannot collide: {detail}"
+                ),
+            )
+
+    if job_manager is not None:
+        job_manager.submit(_work)
+    else:
+        _work()
+
+
 def build_cutover_screen(
     store: SessionStore,
     session_id: str,
     *,
     validation_store: ValidationStore,
+    job_manager: Optional[JobManager] = None,
+    sync_sequences: "Optional[Callable[..., dict]]" = None,
 ) -> tuple[Callable[[Callable[[], None]], None], Callable[[], None]]:
     """Build the Cut over step (step 6), returning ``(content_builder, runner)``.
 
@@ -2275,6 +2353,21 @@ def build_cutover_screen(
                     "if you may still need them."
                 ),
             )
+
+        # Safety net: the cut-over runbook is now open (release is clean or accepted),
+        # which is the moment just BEFORE the operator repoints the app -- and the last
+        # point the tool controls before the app's first insert. Validation already
+        # re-syncs identity sequences (v0.1.266), but only if the operator ran it after
+        # the final CDC drain; rows CDC delivered AFTER that last validation would leave
+        # the sequence lagging MAX(pk) and the app's first insert would collide (23505).
+        # Re-sync once more here, keyed off the current target MAX(pk), so reaching the
+        # runbook is itself sufficient -- no dependence on remembering to re-validate.
+        # One-shot per verdict (content() re-renders on poll) and idempotent; run in the
+        # background (a target write) so the render never blocks.
+        _maybe_resync_identity_for_cutover(
+            session, validation_state, report,
+            job_manager=job_manager, sync=sync_sequences,
+        )
 
         # Go path: the verdict is clean — show the tailored runbook + an explicit
         # acknowledgement that marks the step (and the whole journey) Done.
