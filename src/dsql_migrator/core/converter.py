@@ -1696,19 +1696,25 @@ def _composite_unique_index_ddl(table: TableDef) -> str:
 
 def _apply_pk_strategy(
     create: exp.Expression, table: TableDef, strategy: PrimaryKeyStrategy
-) -> Optional[ConversionWarning]:
+) -> list[ConversionWarning]:
     """Apply the primary-key strategy to a monotonic AUTO_INCREMENT key.
 
     Rewrites the auto-increment column in ``create`` according to ``strategy``
-    and returns a single hot-partition warning describing the risk and the
-    applied strategy (Requirement 3.5). Returns ``None`` when the table has no
-    AUTO_INCREMENT column (no hot-partition concern).
+    and returns the warnings describing the applied strategy (Requirement 3.5):
+    always a hot-partition RECOMMENDATION, plus -- for ``IDENTITY_WITH_CACHE`` on a
+    key whose mapped type is wider than signed BIGINT (``bigint unsigned`` ->
+    ``numeric(20,0)``) -- a range-narrowing LOSS warning, because DSQL identity
+    columns must be BIGINT and any existing source value above 2^63-1 would then fail
+    to load. Returns ``[]`` when the table has no AUTO_INCREMENT column.
     """
     column_name = table.auto_increment_column
     if not column_name:
-        return None
+        return []
 
     column_def = _find_column_def(create, column_name)
+    # Set when the identity widening NARROWED the declared range (see below), so the
+    # caller can add a LOSS warning alongside the throughput recommendation.
+    narrowed_from: Optional[str] = None
 
     if strategy is PrimaryKeyStrategy.CONVERT_TO_UUID:
         if column_def is not None:
@@ -1726,15 +1732,17 @@ def _apply_pk_strategy(
             # so an INT/SMALLINT identity is rejected outright ("datatype integer not
             # supported, identity column type must be bigint" -- confirmed live). A MySQL
             # `int AUTO_INCREMENT` primary key is extremely common, so without this
-            # widening the whole CREATE TABLE failed for the typical table. Widening is
-            # safe: BIGINT holds every INT value, and the sequence only ever generates
-            # values going forward.
-            # DECIMAL is in this list because an UNSIGNED integer key maps to
-            # numeric/DECIMAL to preserve its range (`bigint unsigned` -> DECIMAL(20,0)),
-            # and `bigint unsigned AUTO_INCREMENT` is a common primary key -- 6 of the 11
-            # tables in the reference schema. Widening it to BIGINT narrows the DECLARED
-            # range, but an identity sequence is BIGINT-bounded on DSQL anyway, so no
-            # value the sequence can generate is lost.
+            # widening the whole CREATE TABLE failed for the typical table. For the
+            # signed integer types the widening is LOSSLESS (BIGINT holds every INT value).
+            #
+            # DECIMAL is here because an UNSIGNED integer key maps to numeric/DECIMAL to
+            # preserve its range (`bigint unsigned` -> numeric(20,0)), and
+            # `bigint unsigned AUTO_INCREMENT` is a common primary key. For future
+            # sequence-GENERATED values this is safe (a DSQL identity is BIGINT-bounded
+            # anyway). BUT it NARROWS the declared range for EXISTING rows: a source
+            # `bigint unsigned` value above 2^63-1 (up to 2^64-1) does not fit BIGINT and
+            # would fail to load (SQLSTATE 22003). That is not silent -- we flag it as a
+            # LOSS warning via ``narrowed_from`` so the operator can decide.
             data_type = column_def.args.get("kind")
             if isinstance(data_type, exp.DataType) and data_type.this in (
                 exp.DataType.Type.INT,
@@ -1744,6 +1752,10 @@ def _apply_pk_strategy(
                 exp.DataType.Type.DECIMAL,
                 exp.DataType.Type.BIGINT,
             ):
+                # numeric/DECIMAL is the only source kind whose range EXCEEDS signed
+                # BIGINT, so it is the only one the BIGINT widening actually narrows.
+                if data_type.this is exp.DataType.Type.DECIMAL:
+                    narrowed_from = data_type.sql(dialect=_POSTGRES)
                 column_def.set("kind", exp.DataType.build("BIGINT"))
             # sqlglot cannot render an identity CACHE clause, so the constraint
             # text is injected as a fixed (non-user) constant.
@@ -1768,17 +1780,45 @@ def _apply_pk_strategy(
             "monotonically increasing key concentrates writes on one partition."
         )
 
-    # A RECOMMENDATION, not a LOSS: all three strategies produce a correct, complete
-    # target key -- nothing was dropped or changed in meaning. This is throughput
-    # advice about DSQL's partitioning, so it must not be styled like a removed
-    # foreign key (which genuinely lost a constraint).
-    return ConversionWarning(
-        object_name=table.name,
-        column_name=column_name,
-        classification=Classification.MANUAL,
-        kind=ConversionNoteKind.RECOMMENDATION,
-        message=message,
-    )
+    # A RECOMMENDATION, not a LOSS: every strategy produces a correct, complete target
+    # key -- this is throughput advice about DSQL's partitioning, so it must not be
+    # styled like a removed foreign key (which genuinely lost a constraint).
+    warnings = [
+        ConversionWarning(
+            object_name=table.name,
+            column_name=column_name,
+            classification=Classification.MANUAL,
+            kind=ConversionNoteKind.RECOMMENDATION,
+            message=message,
+        )
+    ]
+    # The identity widening narrowed the declared range (a `bigint unsigned` key mapped
+    # to numeric(20,0), which DSQL cannot use for an identity, so it became BIGINT). New
+    # generated ids are unaffected, but an EXISTING source value above 2^63-1 will not
+    # fit and would fail Full Load with a numeric-out-of-range error -- a real, possible
+    # data-load failure, hence a LOSS the operator must weigh, not silent advice.
+    if narrowed_from is not None:
+        warnings.append(
+            ConversionWarning(
+                object_name=table.name,
+                column_name=column_name,
+                source_type=narrowed_from,
+                target_type="bigint",
+                classification=Classification.MANUAL,
+                kind=ConversionNoteKind.LOSS,
+                message=(
+                    f"The identity key '{column_name}' was narrowed from "
+                    f"{narrowed_from} to bigint. Aurora DSQL identity columns must be "
+                    "bigint, so an unsigned/large-decimal key cannot keep its full "
+                    "range. Newly generated ids are unaffected, but any EXISTING source "
+                    "value above 9223372036854775807 (2^63-1) will not fit and that row "
+                    "would fail to load. If this key never exceeds that value the "
+                    "conversion is safe; otherwise keep the source PK (no identity) or "
+                    "move to a uuid key instead."
+                ),
+            )
+        )
+    return warnings
 
 
 def _foreign_key_warning(table: TableDef) -> Optional[ConversionWarning]:
@@ -2291,22 +2331,25 @@ class SchemaConverter:
         # Schema Conversion step, so an invalid choice is isolated as UNSUPPORTED
         # (mirrors the unparsable-table fallback), never raised.
         extra_index_ddls: list[str] = []
+        pk_strategy_warnings: list[ConversionWarning] = []
         if options.primary_key_strategy is PrimaryKeyStrategy.COMPOSITE_KEY:
             leading = options.composite_leading_column or ""
             try:
-                pk_strategy_warning: Optional[ConversionWarning] = _apply_composite_key(
-                    create, table, leading
-                )
+                composite_warning = _apply_composite_key(create, table, leading)
             except CompositeKeyError as exc:
                 return _invalid_composite_conversion(table, str(exc))
+            if composite_warning is not None:
+                pk_strategy_warnings.append(composite_warning)
             # Preserve the original key's uniqueness, which a composite key drops.
             extra_index_ddls.append(_composite_unique_index_ddl(table))
         else:
-            pk_strategy_warning = _apply_pk_strategy(
-                create, table, options.primary_key_strategy
+            # _apply_pk_strategy returns 0..2 warnings: the throughput RECOMMENDATION
+            # and (for an identity widening that narrows the range) a LOSS warning.
+            pk_strategy_warnings.extend(
+                _apply_pk_strategy(create, table, options.primary_key_strategy)
             )
+        warnings.extend(pk_strategy_warnings)
         for optional_warning in (
-            pk_strategy_warning,
             _no_primary_key_warning(table),
             _foreign_key_warning(table),
             _partitioned_table_warning(table),

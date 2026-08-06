@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.267
+
+### Fixed
+
+- **Converting a `bigint unsigned` AUTO_INCREMENT key to a server-generated IDENTITY now
+  warns that its range is narrowed, instead of doing it silently.** Aurora DSQL identity
+  columns must be `bigint`, but `bigint unsigned` maps to `numeric(20,0)` to preserve its
+  full `0..2^64-1` range — so making it an identity narrows it to `bigint`'s `0..2^63-1`.
+  Newly generated ids are unaffected, but any *existing* source value above 2^63-1
+  (9223372036854775807) would no longer fit and that row would fail Full Load with a
+  numeric-out-of-range error (SQLSTATE 22003) — a real, silent-until-load failure. The
+  conversion now emits a distinct LOSS warning naming the exact threshold and the safe
+  alternatives (keep the source PK, or use a UUID key), shown in the Schema Conversion
+  "gaps" section rather than mixed in with throughput advice. The lossless widenings
+  (`int`/`bigint`/`int unsigned` → `bigint`) are unchanged and emit no such warning, and
+  keeping the source PK leaves `bigint unsigned` as `numeric(20,0)` with its full range.
+
 ## v0.1.266
 
 ### Fixed

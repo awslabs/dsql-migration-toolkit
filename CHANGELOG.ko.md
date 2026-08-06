@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.267
+
+### 수정
+
+- **`bigint unsigned` AUTO_INCREMENT 키를 서버 생성 IDENTITY로 변환할 때, 범위가 축소된다는 경고를
+  이제 표시합니다(조용히 처리하지 않음).** Aurora DSQL identity 컬럼은 `bigint`여야 하는데, `bigint
+  unsigned`는 전체 `0..2^64-1` 범위를 보존하려고 `numeric(20,0)`로 매핑됩니다 — 따라서 이를 identity로
+  만들면 `bigint`의 `0..2^63-1`로 좁혀집니다. 새로 생성되는 id는 영향이 없지만, *기존* 소스 값이 2^63-1
+  (9223372036854775807)을 초과하면 더 이상 들어가지 않아 해당 행이 Full Load에서 numeric 범위 초과
+  오류(SQLSTATE 22003)로 실패합니다 — 로드 시점까지 드러나지 않는 실질적 실패입니다. 이제 변환은 정확한
+  임계값과 안전한 대안(소스 PK 유지, 또는 UUID 키 사용)을 명시하는 별도의 LOSS 경고를 내며, 처리량 조언과
+  섞이지 않고 Schema Conversion의 "gaps" 섹션에 표시됩니다. 무손실 확장(`int`/`bigint`/`int unsigned`
+  → `bigint`)은 변경 없이 이 경고를 내지 않으며, 소스 PK를 유지하면 `bigint unsigned`는 전체 범위를 가진
+  `numeric(20,0)`로 남습니다.
+
 ## v0.1.266
 
 ### 수정
