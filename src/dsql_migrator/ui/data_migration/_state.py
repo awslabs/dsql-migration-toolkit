@@ -95,6 +95,12 @@ class DataMigrationState:
         self.error_log: ErrorLogStore = ErrorLogStore()
         # Last prerequisite report per mode (set when the user runs checks).
         self._prereq_reports: dict[MigrationMode, PrerequisiteReport] = {}
+        # The LOB exclusion each mode's report was checked against, so the run guard
+        # can block a load whose exclusion changed after the checks (the exclusion
+        # analogue of a late table add caught by prereq_scope_gap). Keyed by mode.
+        self._prereq_report_lob_exclusions: dict[
+            MigrationMode, dict[str, frozenset[str]]
+        ] = {}
         # The prerequisite MODE that actually gated the most recent started Full
         # Load. The reports themselves are deliberately not persisted (a restored
         # connection can't be trusted), so ``full_load_run_guard_reason`` excuses an
@@ -127,11 +133,16 @@ class DataMigrationState:
         # One-shot flag: open the Full Load confirm dialog on the next render
         # (set after the async non-empty-target check completes).
         self.pending_full_load_confirm: bool = False
-        # CDC oversized-LOB columns the user opted to EXCLUDE at capture (H13),
+        # Oversized-LOB columns the user opted to EXCLUDE from the migration (H13),
         # keyed by table name -> set of column names. Empty => exclude nothing.
-        # Feeds the connector template's ColumnExcludeList (Debezium
-        # column.exclude.list); an explicit, opt-in choice (no silent data loss).
-        self._cdc_excluded_lob_columns: dict[str, set[str]] = {}
+        # A SINGLE, migration-wide selection: it drops the column from BOTH the Full
+        # Load INSERT list (the exporter/importer derive columns from the effective
+        # TableDef) AND CDC capture (the connector template's ColumnExcludeList /
+        # Debezium column.exclude.list). One source of truth keeps Full Load and CDC
+        # in lockstep -- a column excluded from one but not the other would leave
+        # silent partial data across the gapless handoff. An explicit, opt-in choice
+        # (no silent data loss); nothing is excluded unless the user ticks it.
+        self._excluded_lob_columns: dict[str, set[str]] = {}
         # Composite-PK record-key override for CDC, keyed by db.table -> target key
         # columns [leading, pk...]. Set from the applied Schema Conversion when a
         # table's DSQL target has a composite key, so Debezium re-keys the change
@@ -303,23 +314,27 @@ class DataMigrationState:
         # (process config, threaded at screen-build time). None -> default key.
         self.cdc_secret_kms_key_id: Optional[str] = None
 
-    def set_cdc_lob_exclusion(self, table: str, column: str, exclude: bool) -> None:
-        """Toggle whether one oversized-LOB column is excluded from CDC (H13)."""
+    def set_lob_exclusion(self, table: str, column: str, exclude: bool) -> None:
+        """Toggle whether one oversized-LOB column is excluded from the migration.
+
+        The selection is migration-wide (H13): it drops the column from both the
+        Full Load INSERT list and CDC capture, so the two paths never disagree.
+        """
         with self._lock:
-            current = self._cdc_excluded_lob_columns.setdefault(table, set())
+            current = self._excluded_lob_columns.setdefault(table, set())
             if exclude:
                 current.add(column)
             else:
                 current.discard(column)
                 if not current:
-                    self._cdc_excluded_lob_columns.pop(table, None)
+                    self._excluded_lob_columns.pop(table, None)
 
-    def cdc_lob_exclusions(self) -> dict[str, set[str]]:
+    def lob_exclusions(self) -> dict[str, set[str]]:
         """Return a copy of the per-table excluded-LOB-column selection (H13)."""
         with self._lock:
             return {
                 table: set(columns)
-                for table, columns in self._cdc_excluded_lob_columns.items()
+                for table, columns in self._excluded_lob_columns.items()
             }
 
     def set_cdc_message_key_columns(
@@ -875,14 +890,36 @@ class DataMigrationState:
     def set_prereq_report(
         self, mode: MigrationMode, report: PrerequisiteReport
     ) -> None:
-        """Record the latest prerequisite report for ``mode``."""
+        """Record the latest prerequisite report for ``mode``.
+
+        Also snapshots the LOB exclusion the checks ran against, so the run guard
+        can detect a column excluded AFTER the checks (which could turn a passed
+        loadability check into a mid-load failure) -- the exclusion analogue of
+        ``prereq_scope_gap`` for a late table add. The snapshot is a plain
+        ``{table: frozenset(cols)}`` copy so a later toggle cannot mutate it.
+        """
         with self._lock:
             self._prereq_reports[mode] = report
+            self._prereq_report_lob_exclusions[mode] = {
+                table: frozenset(cols)
+                for table, cols in self._excluded_lob_columns.items()
+            }
 
     def get_prereq_report(self, mode: MigrationMode) -> Optional[PrerequisiteReport]:
         """Return the last prerequisite report for ``mode``, if any."""
         with self._lock:
             return self._prereq_reports.get(mode)
+
+    def prereq_report_lob_exclusions(
+        self, mode: MigrationMode
+    ) -> dict[str, frozenset[str]]:
+        """Return the LOB exclusion the last ``mode`` report was checked against.
+
+        Empty when no report has been recorded for the mode. Used by the run guard
+        to catch an exclusion changed after the checks ran.
+        """
+        with self._lock:
+            return dict(self._prereq_report_lob_exclusions.get(mode, {}))
 
     def set_prereq_gated_mode(self, mode: Optional[MigrationMode]) -> None:
         """Record which prerequisite mode gated the most recent started Full Load."""

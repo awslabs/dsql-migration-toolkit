@@ -267,15 +267,23 @@ def _render_cdc_step(
 
     # 3. PREPARE: oversized-LOB exclusion influences the captured columns, so it
     #    sits with the start-point decision (it feeds column.exclude.list).
-    lob_locked, lob_lock_reason = lob_exclusion_lock(migration_state, job_manager)
-    _render_cdc_lob_exclusion_panel(
-        ui,
-        migration_state,
-        inventory,
-        refresh,
-        locked=lob_locked,
-        lock_reason=lob_lock_reason,
-    )
+    #
+    # Only for CDC ONLY: any type that also runs a Full Load renders this same
+    # migration-wide selection on the Full Load screen (before the load, so the
+    # load and prerequisite gate honor it), and locks it once the load's checks
+    # run. Re-rendering it here would double the card and, worse, let the operator
+    # think a post-Full-Load tick still changes what the completed load wrote. CDC
+    # only has no Full Load screen, so this is its single home.
+    if migration_type is MigrationType.CDC_ONLY:
+        lob_locked, lob_lock_reason = lob_exclusion_lock(migration_state, job_manager)
+        _render_cdc_lob_exclusion_panel(
+            ui,
+            migration_state,
+            inventory,
+            refresh,
+            locked=lob_locked,
+            lock_reason=lob_lock_reason,
+        )
 
     # 4. START: actually deploy the connectors (cloudformation update_stack) and
     #    show step-by-step progress.
@@ -476,7 +484,7 @@ def _render_cdc_source_config_card(
     # Build the connector config (pure -- no AWS calls). Restrict the table list
     # to what the watermark covered when inventory + watermark exist; otherwise
     # fall back to the user's confirmed selection (manual seed).
-    exclusions = migration_state.cdc_lob_exclusions()
+    exclusions = migration_state.lob_exclusions()
     exclude_value = format_column_exclude_list(
         {table: sorted(cols) for table, cols in exclusions.items()}
     )
@@ -2964,7 +2972,7 @@ def _start_cdc_deploy(
     job = _current_job(job_manager, migration_state.job_id)
     watermark = getattr(job, "watermark", None) if job is not None else None
     override = migration_state.cdc_start_override()
-    exclusions = migration_state.cdc_lob_exclusions()
+    exclusions = migration_state.lob_exclusions()
     exclude_value = format_column_exclude_list(
         {table: sorted(cols) for table, cols in exclusions.items()}
     )
@@ -3313,7 +3321,7 @@ async def _start_cdc_infra_deploy(
     job = _current_job(job_manager, migration_state.job_id)
     watermark = getattr(job, "watermark", None) if job is not None else None
     override = migration_state.cdc_start_override()
-    exclusions = migration_state.cdc_lob_exclusions()
+    exclusions = migration_state.lob_exclusions()
     exclude_value = format_column_exclude_list(
         {table: sorted(cols) for table, cols in exclusions.items()}
     )
@@ -4838,15 +4846,24 @@ def _render_cdc_lob_exclusion_panel(
     *,
     locked: bool,
     lock_reason: Optional[str] = None,
+    migration_wide: bool = False,
 ) -> None:
     """Render the explicit, opt-in oversized-LOB column exclusion (H13).
 
     Lists the columns the evaluation flagged as able to exceed the DSQL 1 MiB
-    per-value limit and lets the user exclude them from capture (Debezium
-    ``column.exclude.list``). Excluding is the only safe handling for values that
-    can also exceed the broker limit -- runtime isolation can't recover those.
-    No silent loss: nothing is excluded unless the
-    user ticks it, and the resulting list is shown verbatim.
+    per-value limit and lets the user exclude them. The selection is
+    migration-wide: a ticked column is dropped from BOTH the Full Load INSERT list
+    and CDC capture (Debezium ``column.exclude.list``) -- one choice, so the two
+    data paths never disagree across the gapless handoff. Excluding is the only
+    safe handling for values that can also exceed the broker limit -- runtime
+    isolation can't recover those. No silent loss: nothing is excluded unless the
+    user ticks it, and (in the CDC context) the resulting list is shown verbatim.
+
+    ``migration_wide`` switches the copy: when True the card is rendered on the
+    Full Load screen (before the load), so it speaks of "this migration"; when
+    False it renders inside the CDC sub-flow and speaks of CDC capture (keeping the
+    familiar wording and the ``column.exclude.list`` preview there). The underlying
+    selection is the same either way.
 
     When no oversized-LOB column qualifies (the common case), there is nothing to
     configure -- so instead of a full section the panel collapses to a single calm
@@ -4861,7 +4878,7 @@ def _render_cdc_lob_exclusion_panel(
         if selected_tables
         else all_candidates
     )
-    selection = migration_state.cdc_lob_exclusions()
+    selection = migration_state.lob_exclusions()
     if not candidates:
         # Nothing to exclude -> a lightweight info notice, not a heavy settings card.
         render_notice(
@@ -4872,7 +4889,8 @@ def _render_cdc_lob_exclusion_panel(
             body=(
                 "No MySQL LOB/TEXT columns in the selected tables can exceed the "
                 f"Aurora DSQL {_DSQL_VALUE_LIMIT_MIB} MiB value limit — nothing "
-                "needs excluding from CDC capture."
+                "needs excluding from "
+                + ("this migration." if migration_wide else "CDC capture.")
             ),
         )
         return
@@ -4882,13 +4900,24 @@ def _render_cdc_lob_exclusion_panel(
             ui.label("Oversized LOB columns (optional exclusion)").classes(  # type: ignore[attr-defined]
                 "text-sm font-semibold"
             )
-        ui.label(  # type: ignore[attr-defined]
-            "These MySQL LOB/TEXT columns can hold values over the Aurora DSQL "
-            f"{_DSQL_VALUE_LIMIT_MIB} MiB limit. A value over the "
-            f"{_BROKER_MESSAGE_LIMIT_MIB} MiB broker limit can't be streamed at "
-            "all, so exclude such columns here to keep CDC from stalling. "
-            "Nothing is excluded unless you tick it."
-        ).classes("text-xs text-gray-500")
+        if migration_wide:
+            ui.label(  # type: ignore[attr-defined]
+                "These MySQL LOB/TEXT columns can hold values over the Aurora DSQL "
+                f"{_DSQL_VALUE_LIMIT_MIB} MiB limit. Ticking one drops it from this "
+                "migration entirely — the Full Load never writes it and (if CDC is "
+                "used) capture excludes it too, so the two stay in lockstep. Leave a "
+                "column ticked-off to load it normally; any single value that then "
+                "exceeds the limit is quarantined per-row instead. Nothing is "
+                "excluded unless you tick it."
+            ).classes("text-xs text-gray-500")
+        else:
+            ui.label(  # type: ignore[attr-defined]
+                "These MySQL LOB/TEXT columns can hold values over the Aurora DSQL "
+                f"{_DSQL_VALUE_LIMIT_MIB} MiB limit. A value over the "
+                f"{_BROKER_MESSAGE_LIMIT_MIB} MiB broker limit can't be streamed at "
+                "all, so exclude such columns here to keep CDC from stalling. "
+                "Nothing is excluded unless you tick it."
+            ).classes("text-xs text-gray-500")
         # A reason line only when one was given. Deployed infrastructure is the
         # normal state of a CDC run, so it locks silently -- the greyed-out boxes
         # already say the choice is closed, and a warning there would flag an
@@ -4902,7 +4931,7 @@ def _render_cdc_lob_exclusion_panel(
                 def _toggle(
                     event, _table=candidate.table, _column=column
                 ) -> None:
-                    migration_state.set_cdc_lob_exclusion(
+                    migration_state.set_lob_exclusion(
                         _table, _column, bool(event.value)
                     )
                     if callable(refresh):
@@ -4918,15 +4947,20 @@ def _render_cdc_lob_exclusion_panel(
                     # and the actual behaviour agree -- greying alone would still let
                     # the tick through.
                     _box.disable()
-        exclude_value = format_column_exclude_list(
-            {table: sorted(cols) for table, cols in selection.items()}
-        )
-        if exclude_value:
-            with ui.row().classes("items-center gap-1 no-wrap flex-wrap"):  # type: ignore[attr-defined]
-                ui.label("column.exclude.list:").classes(  # type: ignore[attr-defined]
-                    "text-xs text-gray-500"
-                )
-                ui.label(exclude_value).classes("text-xs font-mono")  # type: ignore[attr-defined]
+        # The Debezium ``column.exclude.list`` preview is a CDC-connector detail, so
+        # show it only in the CDC context. On the Full Load screen the same
+        # selection just means "not written", so the raw connector value would be
+        # noise there.
+        if not migration_wide:
+            exclude_value = format_column_exclude_list(
+                {table: sorted(cols) for table, cols in selection.items()}
+            )
+            if exclude_value:
+                with ui.row().classes("items-center gap-1 no-wrap flex-wrap"):  # type: ignore[attr-defined]
+                    ui.label("column.exclude.list:").classes(  # type: ignore[attr-defined]
+                        "text-xs text-gray-500"
+                    )
+                    ui.label(exclude_value).classes("text-xs font-mono")  # type: ignore[attr-defined]
 
 def _render_cdc_handling_panel(ui) -> None:
     """Render the CDC behavior & limits section: what's handled vs. what to watch.

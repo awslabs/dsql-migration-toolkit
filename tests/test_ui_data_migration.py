@@ -408,6 +408,9 @@ class _FakeExporter:
         self._rows_by_table = rows_by_table or {}
         # Tests default to no sharding (one reader), matching an unsharded table.
         self.shard_ranges_by_table: dict[str, list] = {}
+        # The column names of the table each stream_converted_rows call received, so a
+        # test can assert the LOB exclusion filtered the SELECT column set.
+        self.stream_columns_by_table: dict[str, list[str]] = {}
 
     def plan_pk_shard_ranges(
         self, conn, table: TableDef, shards: int, *, min_rows: int = 0
@@ -429,6 +432,7 @@ class _FakeExporter:
     ) -> list[dict]:
         self.streamed.append(table.name)
         self.target_types_by_table[table.name] = target_types
+        self.stream_columns_by_table[table.name] = [c.name for c in table.columns]
         # When sharded, serve only the rows whose id falls in [pk_lower, pk_upper)
         # so a K-shard read reconstructs exactly the table (no overlap, no gap).
         rows = self._rows_by_table.get(table.name, [{"id": 1}])
@@ -463,6 +467,9 @@ class _FakeImporter:
         self.index_ddls_by_table: dict[str, object] = {}
         self.on_conflict_by_table: dict[str, object] = {}
         self.key_columns_by_table: dict[str, object] = {}
+        # The column names of the TableDef each import_rows call received, so a test
+        # can assert the LOB exclusion filtered the INSERT column list too.
+        self.import_columns_by_table: dict[str, list[str]] = {}
         self._rows = rows
         self._failures = failures
         self._first_error = first_error
@@ -480,6 +487,7 @@ class _FakeImporter:
         self.index_ddls_by_table[table.name] = index_ddls
         self.on_conflict_by_table[table.name] = on_conflict
         self.key_columns_by_table[table.name] = key_columns
+        self.import_columns_by_table[table.name] = [c.name for c in table.columns]
         self.received.append((table.name, materialized))
         loaded = self._rows if self._rows else len(materialized)
         if on_batch_loaded is not None and not self._failures and loaded:
@@ -536,6 +544,80 @@ def test_batched_table_migrator_streams_then_loads() -> None:
     assert exporter.streamed == ["orders"]
     assert importer.received == [("orders", [{"id": 1}, {"id": 2}])]
     assert rows.rows_loaded == 2
+
+
+def test_migrate_table_excludes_lob_columns_from_read_and_write() -> None:
+    # A migration-wide LOB exclusion drops the column from BOTH the source SELECT
+    # (exporter) and the target INSERT (importer), because both derive their column
+    # list from the effective TableDef -- but never the primary key, and the row
+    # count is unaffected.
+    import dataclasses
+
+    table = TableDef(
+        name="docs",
+        columns=[
+            ColumnDef(name="id", mysql_type="int", nullable=False),
+            ColumnDef(name="title", mysql_type="varchar(200)"),
+            ColumnDef(name="blob_doc", mysql_type="longtext"),
+        ],
+        primary_key=["id"],
+    )
+    exporter = _FakeExporter(rows_by_table={"docs": [{"id": 1}, {"id": 2}]})
+    importer = _FakeImporter()
+    inputs = dataclasses.replace(
+        _inputs(),
+        inventory=SourceInventory(tables=[table]),
+        # Exclude the LOB column AND (defensively) the PK; the PK must survive.
+        excluded_lob_columns={"docs": frozenset({"blob_doc", "id"})},
+    )
+
+    migrator = BatchedTableMigrator(
+        inputs,
+        exporter=exporter,  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _inputs: importer,  # type: ignore[arg-type,return-value]
+    )
+
+    result = migrator.migrate_table(table)
+
+    # Read side: the excluded LOB column is gone; the PK is kept (never dropped).
+    assert exporter.stream_columns_by_table["docs"] == ["id", "title"]
+    # Write side: the same filtered column set reaches the importer's INSERT list.
+    assert importer.import_columns_by_table["docs"] == ["id", "title"]
+    # Rows still flow -- exclusion drops a column, not rows.
+    assert result.rows_loaded == 2
+
+
+def test_migrate_table_keeps_all_columns_when_nothing_excluded() -> None:
+    # Control: with no exclusion the full column set flows through unchanged, so the
+    # exclusion path cannot silently drop columns on a normal load.
+    table = TableDef(
+        name="docs",
+        columns=[
+            ColumnDef(name="id", mysql_type="int", nullable=False),
+            ColumnDef(name="title", mysql_type="varchar(200)"),
+            ColumnDef(name="blob_doc", mysql_type="longtext"),
+        ],
+        primary_key=["id"],
+    )
+    exporter = _FakeExporter(rows_by_table={"docs": [{"id": 1}]})
+    importer = _FakeImporter()
+    import dataclasses
+
+    inputs = dataclasses.replace(
+        _inputs(), inventory=SourceInventory(tables=[table])
+    )
+    migrator = BatchedTableMigrator(
+        inputs,
+        exporter=exporter,  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _inputs: importer,  # type: ignore[arg-type,return-value]
+    )
+
+    migrator.migrate_table(table)
+
+    assert exporter.stream_columns_by_table["docs"] == ["id", "title", "blob_doc"]
+    assert importer.import_columns_by_table["docs"] == ["id", "title", "blob_doc"]
 
 
 def test_batched_table_migrator_shards_the_read_into_k_streams() -> None:
@@ -893,6 +975,14 @@ class _ConfirmDialogUi:
     def notify(self, *_a, **_k):
         return None
 
+    def timer(self, _interval, callback=None, *_a, **_k):
+        # The dialog is opened via ui.timer(delay, dialog.open, once=True) so the
+        # element registers before the false->true transition. Fire the one-shot
+        # callback immediately here so the test still observes the open.
+        if callable(callback):
+            callback()
+        return _ConfirmDialogUi._El(self)
+
     def __getattr__(self, _name):
         return lambda *_a, **_k: _ConfirmDialogUi._El(self)
 
@@ -1158,10 +1248,12 @@ def test_pre_dialog_probe_caches_each_targets_real_primary_key(monkeypatch) -> N
         "ecommerce.orders": ["customer_id", "id"],
         "ecommerce.other": ["id"],
     }
+    # The probe now reads every target's key in ONE bulk call (target_primary_keys),
+    # not a per-table target_primary_key_columns loop.
     monkeypatch.setattr(
         dm,
-        "target_primary_key_columns",
-        lambda name, **k: real_keys.get(name),
+        "target_primary_keys",
+        lambda names, **k: {name: real_keys.get(name) for name in names},
     )
 
     state = DataMigrationState()
@@ -8222,6 +8314,49 @@ def test_run_guard_blocks_on_a_table_added_after_the_checks_but_not_on_a_removal
     assert "never checked" in reason
 
 
+def test_lob_exclusion_scope_gap_flags_newly_excluded_but_not_unexcluded() -> None:
+    # Asymmetric, mirroring prereq_scope_gap: excluding a column AFTER the checks is a
+    # gap (it could flip loadability to FAIL unseen); un-excluding one only adds a
+    # checked column back, so it is not a gap.
+    from dsql_migrator.ui.data_migration._models import lob_exclusion_scope_gap
+
+    checked = {"orders": frozenset({"notes"})}
+    # Same selection -> no gap.
+    assert lob_exclusion_scope_gap(checked, {"orders": frozenset({"notes"})}) == []
+    # Un-excluded 'notes' -> not a gap (column added back to the checked load).
+    assert lob_exclusion_scope_gap(checked, {}) == []
+    # Newly excluded 'blob' (a different table too) -> both are gaps, sorted+qualified.
+    assert lob_exclusion_scope_gap(
+        checked, {"orders": frozenset({"notes", "blob"}), "docs": frozenset({"body"})}
+    ) == ["docs.body", "orders.blob"]
+
+
+def test_run_guard_blocks_when_a_column_is_excluded_after_the_checks() -> None:
+    # End-to-end: the checks ran with no exclusion (report PASSes); excluding a column
+    # afterwards must block the run and name the column, because the reduced column set
+    # was never re-verified against the target's requirements. Un-excluding is fine.
+    state = DataMigrationState()
+    state.set_selection(TableSelection(selected_tables=["orders"]))
+    # Checks ran against NO exclusion.
+    state.set_prereq_report(MigrationMode.FULL_LOAD, _fl_report("orders"))
+    assert full_load_run_guard_reason(state, _inventory()) is None
+
+    # Exclude a column after the checks -> blocked, message names it.
+    state.set_lob_exclusion("orders", "big_blob", True)
+    reason = full_load_run_guard_reason(state, _inventory())
+    assert reason is not None
+    assert "orders.big_blob" in reason
+    assert "excluded after the checks" in reason
+
+    # Re-running the checks with the exclusion in place clears the gap.
+    state.set_prereq_report(MigrationMode.FULL_LOAD, _fl_report("orders"))
+    assert full_load_run_guard_reason(state, _inventory()) is None
+
+    # Removing the exclusion after that is not a gap either (column added back).
+    state.set_lob_exclusion("orders", "big_blob", False)
+    assert full_load_run_guard_reason(state, _inventory()) is None
+
+
 def test_apply_cdc_status_logs_dlq_events_to_activity_log() -> None:
     # Each NEW DLQ event must also land in the durable activity-log file as a CDC
     # FAILURE line (auditable outside the live UI), credential-free. The activity
@@ -13281,6 +13416,74 @@ def _render_lob_panel(*, locked: bool, lock_reason=None):
         lock_reason=lock_reason,
     )
     return ui
+
+
+def _render_lob_panel_migration_wide(*, state=None):
+    """Render the panel in migration-wide (Full Load) mode with one LOB candidate."""
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="docs",
+                columns=[
+                    ColumnDef(name="id", mysql_type="int", nullable=False),
+                    ColumnDef(name="payload", mysql_type="longtext"),
+                ],
+                primary_key=["id"],
+            )
+        ]
+    )
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_lob_exclusion_panel(
+        ui,
+        state or DataMigrationState(),
+        inventory,
+        lambda: None,
+        locked=False,
+        lock_reason=None,
+        migration_wide=True,
+    )
+    return ui
+
+
+def test_lob_panel_migration_wide_wording_and_no_connector_preview() -> None:
+    # On the Full Load screen the card speaks of "this migration" (not CDC capture)
+    # and omits the Debezium column.exclude.list preview (a connector-only detail).
+    ui = _render_lob_panel_migration_wide()
+    joined = " ".join(ui.texts)
+
+    assert ui.checkboxes, "candidates must still render tick boxes"
+    assert "this migration" in joined
+    assert "column.exclude.list" not in joined
+
+
+def test_lob_panel_migration_wide_no_candidates_says_this_migration() -> None:
+    # The "nothing to exclude" info notice also uses the migration-wide wording.
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="plain",
+                columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                primary_key=["id"],
+            )
+        ]
+    )
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_lob_exclusion_panel(
+        ui,
+        DataMigrationState(),
+        inventory,
+        lambda: None,
+        locked=False,
+        lock_reason=None,
+        migration_wide=True,
+    )
+    joined = " ".join(ui.texts)
+    assert "this migration" in joined
+    assert "CDC capture" not in joined
 
 
 def test_lob_panel_boxes_are_live_when_not_locked() -> None:

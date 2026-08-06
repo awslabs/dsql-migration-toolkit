@@ -376,8 +376,8 @@ def test_cdc_state_round_trips() -> None:
     migration_state.set_cdc_start_position(
         gtid="3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5"
     )
-    migration_state.set_cdc_lob_exclusion("app.orders", "notes", True)
-    migration_state.set_cdc_lob_exclusion("app.orders", "avatar", True)
+    migration_state.set_lob_exclusion("app.orders", "notes", True)
+    migration_state.set_lob_exclusion("app.orders", "avatar", True)
     migration_state.set_cdc_connector_names(["src", "sink"])
 
     snapshot = capture_session_snapshot(
@@ -393,7 +393,7 @@ def test_cdc_state_round_trips() -> None:
     override = m2.cdc_start_override()
     assert override is not None
     assert override.gtid_executed == "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5"
-    assert m2.cdc_lob_exclusions() == {"app.orders": {"notes", "avatar"}}
+    assert m2.lob_exclusions() == {"app.orders": {"notes", "avatar"}}
     assert m2.cdc_connector_names == ["src", "sink"]
 
 
@@ -794,7 +794,7 @@ def test_old_snapshot_without_cdc_fields_restores_clean() -> None:
     apply_session_snapshot(snapshot, SessionConnectionState(), EvaluationState(),
                            SchemaConversionState(), m2)
     assert m2.cdc_start_override() is None
-    assert m2.cdc_lob_exclusions() == {}
+    assert m2.lob_exclusions() == {}
 
 
 def test_session_signature_changes_on_cdc_start_position() -> None:

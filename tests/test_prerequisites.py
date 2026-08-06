@@ -384,3 +384,108 @@ def test_per_table_results_one_per_selected_table() -> None:
         if r.check_id == PrerequisiteCheckId.TABLE_PRIMARY_KEY
     ]
     assert {r.target for r in pk_results} == {"app.a", "app.b"}
+
+
+# ---------------------------------------------------------------------------
+# Migration-wide LOB exclusion feeds the loadability gate
+# ---------------------------------------------------------------------------
+
+
+def _lob_table(name: str) -> TableDef:
+    """A table with a PK, a normal column, and an oversized-LOB column."""
+    return TableDef(
+        name=name,
+        primary_key=["id"],
+        columns=[
+            ColumnDef(name="id", mysql_type="int"),
+            ColumnDef(name="name", mysql_type="varchar(100)"),
+            ColumnDef(name="blob_doc", mysql_type="longtext"),
+        ],
+    )
+
+
+def test_excluding_a_notnull_target_column_flips_loadable_to_fail() -> None:
+    """Excluding a column the target REQUIRES turns a PASS into a FAIL.
+
+    Without an exclusion the source supplies ``blob_doc``, so a NOT NULL/no-default
+    target column of that name is filled and the gate PASSes. Once the user excludes
+    ``blob_doc`` from the migration it is no longer in the load's column set, so it
+    becomes unfillable -- the gate must FAIL before the load, not after every batch
+    hits a not-null violation mid-load.
+    """
+    table = _lob_table("app.docs")
+    target = _FakeTarget(
+        existing={"app.docs"},
+        required_without_default={"app.docs": ["id", "blob_doc"]},
+    )
+    checker = PrerequisiteChecker(source_probe=_FakeSource(), target_probe=target)
+    request = PrerequisiteCheckRequest(
+        mode=MigrationMode.FULL_LOAD, tables=["app.docs"]
+    )
+
+    # No exclusion: blob_doc is source-backed, so loadable PASSes.
+    clean = checker.check(request, tables=[table])
+    assert (
+        _result(
+            clean, PrerequisiteCheckId.TARGET_COLUMNS_LOADABLE, "app.docs"
+        ).status
+        is PrerequisiteStatus.PASS
+    )
+    assert clean.can_proceed is True
+
+    # Exclude blob_doc: now it cannot fill the required target column -> FAIL + block.
+    excluded = checker.check(
+        request,
+        tables=[table],
+        excluded_columns={"app.docs": ["blob_doc"]},
+    )
+    result = _result(
+        excluded, PrerequisiteCheckId.TARGET_COLUMNS_LOADABLE, "app.docs"
+    )
+    assert result.status is PrerequisiteStatus.FAIL
+    assert "blob_doc" in result.detail
+    assert excluded.can_proceed is False
+
+
+def test_excluding_a_nullable_column_stays_loadable() -> None:
+    # A nullable/defaulted target column is never in required_without_default, so
+    # excluding its source counterpart leaves the gate PASSing -- the target takes
+    # NULL/default for the column the load no longer writes.
+    table = _lob_table("app.docs")
+    target = _FakeTarget(
+        existing={"app.docs"},
+        required_without_default={"app.docs": ["id"]},
+    )
+    checker = PrerequisiteChecker(source_probe=_FakeSource(), target_probe=target)
+    report = checker.check(
+        PrerequisiteCheckRequest(mode=MigrationMode.FULL_LOAD, tables=["app.docs"]),
+        tables=[table],
+        excluded_columns={"app.docs": ["blob_doc"]},
+    )
+    assert (
+        _result(
+            report, PrerequisiteCheckId.TARGET_COLUMNS_LOADABLE, "app.docs"
+        ).status
+        is PrerequisiteStatus.PASS
+    )
+    assert report.can_proceed is True
+
+
+def test_exclusion_never_drops_a_pk_from_the_primary_key_check() -> None:
+    # Even if a PK column is (wrongly) listed for exclusion, the filter preserves it,
+    # so the PK check still sees a keyed table and PASSes -- the exclusion cannot
+    # accidentally strip the key that anchors keyset streaming / ON CONFLICT.
+    table = _lob_table("app.docs")
+    checker = PrerequisiteChecker(
+        source_probe=_FakeSource(),
+        target_probe=_FakeTarget(existing={"app.docs"}),
+    )
+    report = checker.check(
+        PrerequisiteCheckRequest(mode=MigrationMode.FULL_LOAD, tables=["app.docs"]),
+        tables=[table],
+        excluded_columns={"app.docs": ["id", "blob_doc"]},
+    )
+    assert (
+        _result(report, PrerequisiteCheckId.TABLE_PRIMARY_KEY, "app.docs").status
+        is PrerequisiteStatus.PASS
+    )

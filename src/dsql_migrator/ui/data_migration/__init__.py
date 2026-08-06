@@ -65,7 +65,7 @@ from dsql_migrator.core.job_manager import (
 )
 from dsql_migrator.core.target_connection import DsqlConnector
 from dsql_migrator.core.target_introspector import (
-    target_primary_key_columns,
+    target_primary_keys,
     tables_with_rows,
 )
 from dsql_migrator.core.models import (
@@ -173,6 +173,7 @@ from dsql_migrator.ui.data_migration._models import (
     _LOAD_STATE_ORDER,
     summarize_table_states,
     prereq_scope_gap,
+    lob_exclusion_scope_gap,
     schema_recreate_tables,
     prerequisite_block_reason,
     PrereqCategory,
@@ -406,6 +407,13 @@ def build_data_migration_screen(
             dependent_view_ddls=applied_view_ddls(
                 _conversion, conv_state.edited_target_ddls
             ),
+            # The migration-wide oversized-LOB exclusion: drops these columns from
+            # the Full Load INSERT list too (the same selection that feeds CDC's
+            # column.exclude.list, so the two paths stay in lockstep).
+            excluded_lob_columns={
+                table: frozenset(columns)
+                for table, columns in migration_state.lob_exclusions().items()
+            },
         )
         # Full Load runs over the tables the user selected in the picker. A
         # table is migratable when it has a target table to load into: either its
@@ -597,8 +605,17 @@ def build_data_migration_screen(
             migration_state.set_prereq_running(mode)
             refresh()
             try:
+                # Feed the migration-wide LOB exclusion into the gate so a column
+                # excluded from the load is judged against the target as it will be
+                # written: an excluded NOT NULL/no-default target column FAILs
+                # loadability here instead of failing every batch mid-load.
+                _prereq_exclusions = migration_state.lob_exclusions()
                 report = await run.io_bound(
-                    lambda: checker.check(request, tables=tables)
+                    lambda: checker.check(
+                        request,
+                        tables=tables,
+                        excluded_columns=_prereq_exclusions,
+                    )
                 )
             except Exception as exc:  # noqa: BLE001 - surface as inline feedback
                 migration_state.clear_prereq_running(mode)
@@ -907,6 +924,35 @@ def build_data_migration_screen(
                     locked_selection=locked_selection,
                 )
 
+            # Migration-wide oversized-LOB exclusion, offered for any type that
+            # includes a Full Load -- right after the picker, BEFORE the checks, so
+            # the operator can drop a column before the load that would carry it and
+            # the prerequisite gate then judges the exact post-exclusion column set.
+            # (CDC-only keeps its copy inside the CDC sub-flow, next to the
+            # column.exclude.list preview it feeds.)
+            #
+            # Editable up until the migration is COMMITTED, using the SAME lock as
+            # the table picker (``selection_locked``): a prerequisite report existing
+            # is a preview, not a commitment, so it must NOT freeze the choice (the
+            # picker was explicitly changed away from that "too early and a dead end"
+            # behavior). The exclusion is baked only once a Full Load has run, CDC is
+            # streaming, or the CDC stack (with its column.exclude.list) is deployed
+            # -- exactly ``selection_locked``. A change made after the checks ran but
+            # before the load is caught at the Run button (see
+            # ``full_load_run_guard_reason``), so a stale PASS never starts a load
+            # against an unchecked column set. The lock is silent: the greyed picker
+            # beside it already explains why inputs are frozen.
+            if migration_type is not MigrationType.CDC_ONLY:
+                _render_cdc_lob_exclusion_panel(
+                    ui,
+                    migration_state,
+                    inventory,
+                    refresh,
+                    locked=selection_locked,
+                    lock_reason=None,
+                    migration_wide=True,
+                )
+
             # The tables a Full Load will migrate (same logic the run uses), so
             # the Full Load step can re-surface them for an explicit confirmation.
             migratable = migratable_table_names(
@@ -1090,6 +1136,10 @@ def build_data_migration_screen(
                         _retry_conversion,
                         conv_state.edited_target_ddls,
                     ),
+                    excluded_lob_columns={
+                        table: frozenset(columns)
+                        for table, columns in migration_state.lob_exclusions().items()
+                    },
                 )
                 retry_tables = TableSelector().resolve(
                     inventory, TableSelection(selected_tables=names)
@@ -1791,6 +1841,29 @@ def full_load_run_guard_reason(
             f"{'were' if len(added) > 1 else 'was'} added to the selection after the "
             "checks ran, so they were never checked."
         )
+    # Same idea for the LOB exclusion: a column excluded AFTER the checks removes it
+    # from the load's column set, so a NOT NULL/no-default target column could turn
+    # the passed loadability check into a mid-load failure the stale report can't
+    # show. Block until the checks are re-run against the new exclusion. Asymmetric:
+    # un-excluding a column only adds it back to the (already-checked) load, so it is
+    # not a gap. Scoped to the mode the report is for (the exclusion is migration-wide).
+    newly_excluded = lob_exclusion_scope_gap(
+        state.prereq_report_lob_exclusions(prereq_mode),
+        {
+            table: frozenset(cols)
+            for table, cols in state.lob_exclusions().items()
+        },
+    )
+    if newly_excluded:
+        listed = ", ".join(newly_excluded[:3]) + (
+            " and more" if len(newly_excluded) > 3 else ""
+        )
+        return (
+            f"Re-run the prerequisite checks — {listed} "
+            f"{'were' if len(newly_excluded) > 1 else 'was'} excluded after the checks "
+            "ran, so the target's requirements were never re-verified against the "
+            "reduced column set."
+        )
     return prerequisite_block_reason(report)
 
 
@@ -2083,7 +2156,7 @@ def _scroll_to_migration_type_button(
             "setTimeout(()=>el.classList.remove("
             "'ring-2','ring-blue-400','rounded'),2000);}"
         ),
-    ).props("flat dense no-caps color=primary")
+    ).props("outline no-caps color=primary")
 
 
 def migration_type_locked(migration_state, job_manager, *, status) -> bool:
@@ -3146,7 +3219,15 @@ def _render_full_load_step(
                         )
                     if tables_with_data_now:
                         reload_choice.on_value_change(_sync_btn)
-            confirm_dialog.open()
+            # Open on the NEXT tick, not this one. The dialog element was just
+            # created; opening it in the same update batches "create element" and
+            # "value=True" into one client message, and Quasar's QDialog needs the
+            # element registered first and then a SEPARATE false->true transition to
+            # animate open -- so the first open is silently dropped and only a second
+            # click (element already registered) shows it. A one-shot timer defers
+            # the open to a fresh tick so the transition fires on the first click.
+            # (Same ui.timer(once=True) deferral pattern already used in this file.)
+            ui.timer(0.05, confirm_dialog.open, once=True)
 
         with client:  # type: ignore[attr-defined]
             _build()
@@ -3223,16 +3304,18 @@ def _render_full_load_step(
                     found = frozenset(
                         tables_with_rows(names, connection_factory=connector.connect)
                     )
-                    # Read each target's REAL primary key on the same trip. The dialog
-                    # needs it to avoid announcing a recreate for a table that already
-                    # carries the applied key (the state right after "Apply all to
-                    # target"), and doing it here keeps the render path I/O-free.
-                    keys = {
-                        name: target_primary_key_columns(
-                            name, connection_factory=connector.connect
-                        )
-                        for name in names
-                    }
+                    # Read every target's REAL primary key on the same trip, over a
+                    # SINGLE connection (target_primary_keys, not a per-table
+                    # target_primary_key_columns loop): each DSQL connect mints an IAM
+                    # token + does a cross-region TLS handshake, so the per-table loop
+                    # cost N+1 handshakes and made this probe take several seconds
+                    # before the confirm dialog could open. The dialog needs the key to
+                    # avoid announcing a recreate for a table that already carries the
+                    # applied key (the state right after "Apply all to target"), and
+                    # doing it here keeps the render path I/O-free.
+                    keys = target_primary_keys(
+                        names, connection_factory=connector.connect
+                    )
                     return found, keys
 
                 try:

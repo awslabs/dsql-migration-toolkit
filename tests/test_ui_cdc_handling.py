@@ -266,25 +266,25 @@ def test_cdc_handling_facts_cover_handled_and_caveats() -> None:
 
 def test_state_lob_exclusion_toggle_on_and_off() -> None:
     state = DataMigrationState()
-    assert state.cdc_lob_exclusions() == {}
+    assert state.lob_exclusions() == {}
 
-    state.set_cdc_lob_exclusion("db.t", "doc", True)
-    state.set_cdc_lob_exclusion("db.t", "blob", True)
-    assert state.cdc_lob_exclusions() == {"db.t": {"doc", "blob"}}
+    state.set_lob_exclusion("db.t", "doc", True)
+    state.set_lob_exclusion("db.t", "blob", True)
+    assert state.lob_exclusions() == {"db.t": {"doc", "blob"}}
 
     # Unticking the last column drops the table key entirely (clean empty state).
-    state.set_cdc_lob_exclusion("db.t", "doc", False)
-    state.set_cdc_lob_exclusion("db.t", "blob", False)
-    assert state.cdc_lob_exclusions() == {}
+    state.set_lob_exclusion("db.t", "doc", False)
+    state.set_lob_exclusion("db.t", "blob", False)
+    assert state.lob_exclusions() == {}
 
 
 def test_state_lob_exclusion_returns_a_copy() -> None:
     state = DataMigrationState()
-    state.set_cdc_lob_exclusion("db.t", "doc", True)
-    snapshot = state.cdc_lob_exclusions()
+    state.set_lob_exclusion("db.t", "doc", True)
+    snapshot = state.lob_exclusions()
     snapshot["db.t"].add("mutated")
     # Mutating the returned copy must not affect the stored selection.
-    assert state.cdc_lob_exclusions() == {"db.t": {"doc"}}
+    assert state.lob_exclusions() == {"db.t": {"doc"}}
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,58 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.272
+
+### Added
+
+- **Oversized-LOB column exclusion is now migration-wide — Full Load honors it too,
+  not just CDC.** The opt-in "Oversized LOB columns" control (which drops a MySQL
+  `mediumtext`/`longtext`/`mediumblob`/`longblob` column whose values can exceed Aurora
+  DSQL's ~1 MiB per-value limit) previously fed only CDC capture (Debezium
+  `column.exclude.list`). It is now a single, migration-wide selection: a ticked column
+  is dropped from **both** the Full Load INSERT column list and CDC capture, so the two
+  data paths can never disagree across the gapless handoff (a column excluded from one
+  but not the other would leave silent partial data). For any migration that includes a
+  Full Load, the card now renders on the Full Load screen **right after table selection
+  and before the prerequisite check**, so the operator can exclude a column before the
+  load that would carry it. CDC-only keeps the card in the CDC sub-flow (with its
+  `column.exclude.list` preview). The exclusion is applied by dropping the column from
+  the effective table before streaming — the exporter's `SELECT` list and the importer's
+  `INSERT` list both derive from it — so the source is never read for the column and the
+  target is never written; the target schema still keeps the column (recreated from the
+  applied DDL), which simply takes its default/NULL. A **primary-key column is never
+  excluded**, and the **loadability prerequisite now evaluates the post-exclusion column
+  set**: excluding a column that is `NOT NULL` with no default on the target correctly
+  fails the pre-load gate (it can no longer be filled) instead of failing every batch
+  mid-load. The card stays **editable right up until the load is committed** (it locks
+  on the same points as the table picker — a Full Load has started, CDC is streaming, or
+  CDC infra is deployed — not merely because the read-only checks have run); if the
+  exclusion is changed after the checks pass, the Run button blocks with a "re-run the
+  prerequisite checks" prompt naming the newly-excluded column, so a stale pass can never
+  start a load against an unchecked column set (the same asymmetric guard the table
+  picker uses — un-excluding a column is never blocked). The default is unchanged —
+  nothing is excluded unless you tick it, and an oversized single value is still
+  quarantined per-row.
+
+### Fixed
+
+- **The "Start Full Load" confirmation dialog now opens on the first click.** It was
+  built and opened in the same client update, so Quasar's `QDialog` never saw the
+  `false→true` transition it needs to animate open and the first click was silently
+  dropped — only a second click (with the element already registered) showed it. The
+  open is now deferred one tick, so the dialog appears on the first click.
+- **The "Change migration type" jump link now has the same outlined border as the other
+  navigation buttons** (Back / Next / Continue), instead of rendering flat and
+  border-less.
+- **The pre-"Start Full Load" target probe is much faster (fewer DSQL connections).** It
+  read each selected table's real primary key on its own connection, so an N-table
+  selection opened N+1 connections — and every DSQL connect mints an IAM token and does a
+  (cross-region) TLS handshake (~1s each), which is what made the confirm dialog take
+  several seconds to appear. The primary keys are now read for all tables over a **single
+  connection** (new `target_primary_keys`), cutting the probe to 2 connections regardless
+  of table count. Measured against a 7-table schema in Seoul: the PK read dropped from
+  ~9.5s to ~2.8s.
+
 ## v0.1.271
 
 ### Changed

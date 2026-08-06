@@ -35,6 +35,7 @@ from dsql_migrator.core.models import (
     ViewDef,
     Watermark,
     WorkflowState,
+    apply_lob_exclusions,
 )
 
 
@@ -195,3 +196,49 @@ def test_workflow_state_defaults_to_not_started() -> None:
     assert state.schema_conversion == StepStatus.NOT_STARTED
     assert state.data_migration == StepStatus.NOT_STARTED
     assert state.validation == StepStatus.NOT_STARTED
+
+
+# ---------------------------------------------------------------------------
+# apply_lob_exclusions: the single migration-wide LOB-exclusion rule
+# ---------------------------------------------------------------------------
+
+
+def _lob_table() -> TableDef:
+    return TableDef(
+        name="app.docs",
+        primary_key=["id"],
+        columns=[
+            ColumnDef(name="id", mysql_type="int"),
+            ColumnDef(name="name", mysql_type="varchar(100)"),
+            ColumnDef(name="blob_doc", mysql_type="longtext"),
+        ],
+    )
+
+
+def test_apply_lob_exclusions_drops_only_the_named_columns() -> None:
+    filtered = apply_lob_exclusions(_lob_table(), ["blob_doc"])
+    assert [c.name for c in filtered.columns] == ["id", "name"]
+    # Name and PK are preserved so downstream name-/PK-based lookups still resolve.
+    assert filtered.name == "app.docs"
+    assert filtered.primary_key == ["id"]
+
+
+def test_apply_lob_exclusions_never_drops_a_pk_column() -> None:
+    # A PK anchors keyset streaming + ON CONFLICT, so it is kept even if listed.
+    filtered = apply_lob_exclusions(_lob_table(), ["id", "blob_doc"])
+    assert [c.name for c in filtered.columns] == ["id", "name"]
+    assert filtered.primary_key == ["id"]
+
+
+def test_apply_lob_exclusions_returns_same_object_when_nothing_to_drop() -> None:
+    table = _lob_table()
+    # None, empty, and PK-only exclusions are all no-ops -> identity (no copy).
+    assert apply_lob_exclusions(table, None) is table
+    assert apply_lob_exclusions(table, []) is table
+    assert apply_lob_exclusions(table, ["id"]) is table
+
+
+def test_apply_lob_exclusions_ignores_unknown_column_names() -> None:
+    # A stale/unknown name simply matches nothing; the table is unchanged.
+    filtered = apply_lob_exclusions(_lob_table(), ["not_a_column", "blob_doc"])
+    assert [c.name for c in filtered.columns] == ["id", "name"]

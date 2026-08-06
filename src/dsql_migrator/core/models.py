@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Literal, Optional
+from typing import Iterable, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -209,6 +209,34 @@ class TableDef(BaseModel):
         default=False,
         description="True when the source table uses MySQL native partitioning.",
     )
+
+
+def apply_lob_exclusions(
+    table: "TableDef", excluded: "Optional[Iterable[str]]"
+) -> "TableDef":
+    """Return ``table`` with the user-excluded LOB columns dropped from its columns.
+
+    This is the single rule for the migration-wide oversized-LOB exclusion. Both
+    the Full Load engine (whose exporter SELECT list and importer INSERT list derive
+    from ``table.columns``) and the loadability prerequisite (which compares the
+    target's value-required columns against the source columns) filter the table
+    through this function, so the pre-load gate judges exactly the column set the
+    load will write -- an excluded ``NOT NULL``/no-default target column correctly
+    flips the gate to FAIL instead of passing and then failing every batch.
+
+    A PRIMARY-KEY column is never dropped, even if listed in ``excluded`` (the
+    candidate list already excludes PKs): the PK anchors keyset streaming and the
+    ON CONFLICT key. Returns ``table`` unchanged when there is nothing to exclude
+    (the common case -- no copy).
+    """
+    if not excluded:
+        return table
+    pk = set(table.primary_key)
+    drop = {name for name in excluded if name not in pk}
+    if not drop:
+        return table
+    kept = [column for column in table.columns if column.name not in drop]
+    return table.model_copy(update={"columns": kept})
 
 
 class ViewDef(BaseModel):
@@ -1338,6 +1366,7 @@ __all__ = [
     "IndexDef",
     "ForeignKeyDef",
     "TableDef",
+    "apply_lob_exclusions",
     "ViewDef",
     "ObjectType",
     "ObjectRef",

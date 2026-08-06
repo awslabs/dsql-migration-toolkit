@@ -1647,7 +1647,7 @@ def build_validation_screen(
             # Skip columns the migration excluded (CDC oversized-LOB exclusion), so a
             # column that was never written to the target can't cause a false checksum
             # mismatch. Empty for a migration that excluded nothing.
-            excluded_columns=migration_state.cdc_lob_exclusions(),
+            excluded_columns=migration_state.lob_exclusions(),
             quarantined_by_table=_migration_quarantined(),
         )
 
@@ -1782,7 +1782,7 @@ def build_validation_screen(
             reconcile=options.reconcile,
             # Always deep-check a re-check (see docstring).
             deep_only_on_count_mismatch=False,
-            excluded_columns=migration_state.cdc_lob_exclusions(),
+            excluded_columns=migration_state.lob_exclusions(),
             quarantined_by_table=_migration_quarantined(),
         )
 

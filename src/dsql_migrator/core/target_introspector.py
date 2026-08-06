@@ -455,6 +455,71 @@ def target_primary_key_columns(
         _safe_close(connection)
 
 
+def target_primary_keys(
+    table_names: Sequence[str],
+    *,
+    connection_factory: Callable[[], Any],
+) -> dict[str, Optional[list[str]]]:
+    """Return each table's ACTUAL primary-key columns, over ONE connection.
+
+    The bulk twin of :func:`target_primary_key_columns`: same per-table catalog
+    query and identical semantics (``None`` == unknown / unreadable, never a
+    guess), but every table is resolved on a SINGLE reused connection instead of
+    one connect per table. Opening a DSQL connection mints an IAM token and does a
+    full TLS handshake to a distributed endpoint (~0.5-1s each, cross-region), so
+    the per-table-connect version made the pre-Full-Load probe cost N+1 handshakes
+    -- seconds of latency before the confirm dialog could open. Mirrors how
+    :func:`count_target_rows` / :func:`tables_with_rows` already loop over one
+    connection.
+
+    A connection failure maps every table to ``None`` (all unknown); a per-table
+    query error maps just that table to ``None``, so one bad relation never hides
+    the rest.
+    """
+    result: dict[str, Optional[list[str]]] = {}
+    try:
+        connection = connection_factory()
+    except Exception:  # noqa: BLE001 - cannot connect -> every table unknown
+        return {name: None for name in table_names}
+    try:
+        for table_name in table_names:
+            parts = table_name.split(".", 1)
+            if len(parts) == 2:
+                schema, relname = parts
+                where_relation = "n.nspname = %(schema)s AND c.relname = %(table)s"
+                params: dict[str, object] = {"schema": schema, "table": relname}
+            else:
+                where_relation = (
+                    "c.relname = %(table)s AND pg_catalog.pg_table_is_visible(c.oid)"
+                )
+                params = {"table": parts[0]}
+            statement = (
+                "SELECT a.attname "
+                "FROM pg_catalog.pg_class c "
+                "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                "JOIN pg_catalog.pg_index ix ON ix.indrelid = c.oid AND ix.indisprimary "
+                "JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
+                "JOIN pg_catalog.pg_attribute a "
+                "  ON a.attrelid = c.oid AND a.attnum = k.attnum "
+                f"WHERE {where_relation} AND k.ord <= ix.indnkeyatts "
+                "ORDER BY k.ord"
+            )
+            cursor = None
+            try:
+                cursor = connection.cursor()
+                cursor.execute(statement, params)
+                columns = [str(row[0]) for row in cursor.fetchall() if row and row[0]]
+                result[table_name] = columns or None
+            except Exception:  # noqa: BLE001 - unreadable catalog -> unknown for this one
+                result[table_name] = None
+            finally:
+                if cursor is not None:
+                    _safe_close(cursor)
+    finally:
+        _safe_close(connection)
+    return result
+
+
 def target_required_columns_without_default(
     table_name: str,
     *,
@@ -700,6 +765,7 @@ __all__ = [
     "sync_identity_sequences",
     "tables_with_rows",
     "target_primary_key_columns",
+    "target_primary_keys",
     "SYSTEM_SCHEMAS",
     "RELATIONS_QUERY",
     "COLUMNS_QUERY",

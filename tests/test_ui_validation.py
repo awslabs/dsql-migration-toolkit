@@ -2770,7 +2770,7 @@ class _RestoreMigrationState:
     def set_cdc_start_mode(self, _m):
         pass
 
-    def set_cdc_lob_exclusion(self, *_a):
+    def set_lob_exclusion(self, *_a):
         pass
 
 

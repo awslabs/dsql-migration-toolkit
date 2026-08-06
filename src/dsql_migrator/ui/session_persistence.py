@@ -69,7 +69,7 @@ def _restore_lob_exclusions(migration_state: object, flat: list) -> None:
     for entry in flat or []:
         table, sep, column = entry.partition(":")
         if sep and table and column:
-            migration_state.set_cdc_lob_exclusion(table, column, True)  # type: ignore[attr-defined]
+            migration_state.set_lob_exclusion(table, column, True)  # type: ignore[attr-defined]
 
 
 def capture_session_snapshot(
@@ -111,7 +111,7 @@ def capture_session_snapshot(
         cdc_start_binlog_file=migration_state._cdc_start_binlog_file,  # type: ignore[attr-defined]
         cdc_start_binlog_pos=migration_state._cdc_start_binlog_pos,  # type: ignore[attr-defined]
         cdc_lob_exclusions=_flatten_lob_exclusions(
-            migration_state.cdc_lob_exclusions()  # type: ignore[attr-defined]
+            migration_state.lob_exclusions()  # type: ignore[attr-defined]
         ),
         cdc_connector_names=list(
             getattr(migration_state, "cdc_connector_names", []) or []
@@ -447,7 +447,7 @@ def session_signature(
     generated_sig = tuple(generated) if generated is not None else None
     selection = tuple(migration_state.selection.selected_tables)  # type: ignore[attr-defined]
     lob_sig = tuple(
-        _flatten_lob_exclusions(migration_state.cdc_lob_exclusions())  # type: ignore[attr-defined]
+        _flatten_lob_exclusions(migration_state.lob_exclusions())  # type: ignore[attr-defined]
     )
     target = getattr(session, "target_config", None)  # type: ignore[attr-defined]
     target_sig = (

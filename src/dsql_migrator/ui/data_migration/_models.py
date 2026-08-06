@@ -921,6 +921,34 @@ def prereq_scope_gap(
     return sorted(name for name in selected if name and name not in covered)
 
 
+def lob_exclusion_scope_gap(
+    checked: "Mapping[str, frozenset[str]]",
+    current: "Mapping[str, frozenset[str]]",
+) -> list[str]:
+    """Return ``table.column`` columns EXCLUDED since the checks ran, sorted.
+
+    ASYMMETRIC ON PURPOSE, mirroring :func:`prereq_scope_gap`. ``checked`` is the
+    exclusion the last prerequisite report was validated against; ``current`` is the
+    live selection. Only newly-EXCLUDED columns are a gap: excluding a column after
+    the checks removes it from the load's column set, so a column that is ``NOT
+    NULL``/no-default on the target could flip loadability from PASS to FAIL --
+    which the stale report would not show, letting a doomed load start. UN-excluding
+    a column (present in ``checked`` but not ``current``) only adds a column back to
+    the load, which the checks already covered, so it is never a gap.
+
+    Returns the offending fully-qualified columns (``table.column``); empty means the
+    live exclusion is within what the report checked (identical, or a strict subset).
+    Pure.
+    """
+    added: list[str] = []
+    for table, cols in current.items():
+        prior = checked.get(table, frozenset())
+        for col in cols:
+            if col not in prior:
+                added.append(f"{table}.{col}")
+    return sorted(added)
+
+
 def prerequisite_block_reason(report: PrerequisiteReport) -> Optional[str]:
     """Return a run-guard disable reason when prerequisites block the mode.
 

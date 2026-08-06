@@ -31,7 +31,7 @@ never include credential or token values.
 
 from __future__ import annotations
 
-from typing import Optional, Protocol, Sequence
+from typing import Iterable, Mapping, Optional, Protocol, Sequence
 
 from dsql_migrator.core.models import (
     ConnectionResult,
@@ -42,6 +42,7 @@ from dsql_migrator.core.models import (
     PrerequisiteResult,
     PrerequisiteStatus,
     TableDef,
+    apply_lob_exclusions,
 )
 
 # Privileges required on the source MySQL user, by mode. Full Load needs read
@@ -452,6 +453,7 @@ class PrerequisiteChecker:
         request: PrerequisiteCheckRequest,
         *,
         tables: Sequence[TableDef],
+        excluded_columns: Optional[Mapping[str, Iterable[str]]] = None,
     ) -> PrerequisiteReport:
         """Run all checks for ``request.mode`` over the resolved ``tables``.
 
@@ -460,23 +462,41 @@ class PrerequisiteChecker:
         the binlog/GTID/MSK checks; Full Load reports those as ``SKIP``. Returns a
         :class:`PrerequisiteReport` whose ``can_proceed`` is ``True`` only when no
         required check failed (Property 14). All probe access is read-only.
+
+        ``excluded_columns`` (optional, table name -> column names) is the
+        migration-wide oversized-LOB exclusion. Each table is filtered through
+        :func:`~dsql_migrator.core.models.apply_lob_exclusions` before the per-table
+        checks, so the gate judges the EXACT columns the load will write: an
+        excluded column that is ``NOT NULL`` with no default on the target then
+        correctly FAILs :func:`check_target_columns_loadable` (it can no longer be
+        filled) instead of passing here and failing every batch mid-load. A PK is
+        never excluded (the filter guards), so ``check_table_primary_key`` is
+        unaffected. Empty/omitted => no filtering (the common case).
         """
+        exclusions = excluded_columns or {}
         results: list[PrerequisiteResult] = []
 
         # Source-side checks
         results.append(check_source_reachable(self._source.reachable()))
         results.append(check_replication_grants(self._source.grants(), request.mode))
 
-        # Per-table checks
+        # Per-table checks. Filter each table through the migration-wide LOB
+        # exclusion so the pre-load gate sees the columns the load will actually
+        # write (never the PK, which the filter preserves).
+        effective = {
+            table.name: apply_lob_exclusions(table, exclusions.get(table.name))
+            for table in tables
+        }
         for table in tables:
-            results.append(check_table_primary_key(table))
+            results.append(check_table_primary_key(effective[table.name]))
 
         # Target-side checks
         results.append(check_target_dsql_reachable(self._target.reachable()))
         results.append(check_target_iam_auth(self._target.iam_auth()))
         for table in tables:
+            eff_table = effective[table.name]
             exists = self._target.relation_exists(table.name)
-            results.append(check_target_schema_ready(table, exists))
+            results.append(check_target_schema_ready(eff_table, exists))
             # Only meaningful once the table exists; when it does not, pass None so
             # the columns check defers to TARGET_SCHEMA_READY rather than repeating
             # the same "apply DDL first" failure.
@@ -486,7 +506,7 @@ class PrerequisiteChecker:
                 else None
             )
             results.append(
-                check_target_columns_loadable(table, required_without_default)
+                check_target_columns_loadable(eff_table, required_without_default)
             )
 
         # CDC-only checks (SKIP in Full Load).

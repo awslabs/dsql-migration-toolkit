@@ -68,6 +68,7 @@ from dsql_migrator.core.models import (
     TableDef,
     TargetConnectionConfig,
     Watermark,
+    apply_lob_exclusions,
 )
 from dsql_migrator.core.watermark import WatermarkCapturer
 from dsql_migrator.ui.connect import make_source_engine_factory
@@ -132,6 +133,16 @@ class DataMigrationInputs:
     # DROP ... CASCADE and the user's views survive. Empty on an append run or when
     # nothing is being replaced.
     dependent_view_ddls: Mapping[str, str] = field(default_factory=dict)
+    # Oversized-LOB columns the user opted to EXCLUDE from the migration, keyed by
+    # qualified table name -> the set of column names to drop. The SAME selection
+    # that feeds CDC's column.exclude.list (single source of truth, so Full Load
+    # and CDC never disagree). Applied by dropping the column from the effective
+    # TableDef before streaming: the exporter's SELECT list and the importer's
+    # INSERT list both derive from ``table.columns``, so the column is read from
+    # neither the source nor written to the target. A primary-key column is never
+    # excluded (candidates exclude PKs; the engine also guards). Empty => nothing
+    # is dropped (the default; oversized rows are quarantined per-row instead).
+    excluded_lob_columns: Mapping[str, frozenset[str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -2370,6 +2381,20 @@ class BatchedTableMigrator:
         rows loaded; raises if any batch ultimately failed so the caller records
         a per-table failure with the underlying cause.
         """
+        # Drop the user-excluded LOB columns up front so EVERY downstream use --
+        # the keyset read, the INSERT column list, and shard planning -- sees the
+        # same column-filtered view. The target still carries the column (it is
+        # recreated from the applied DDL, which is untouched); the load simply never
+        # writes to it, and the column takes its default / NULL. Name and PK are
+        # preserved, so target-PK parsing and target lookups below are unaffected.
+        # ``original_table`` keeps the full column set for target RECREATION only:
+        # dropping the column from the load must not drop it from the target schema
+        # (that would diverge from CDC and from the schema the user applied in Step
+        # 2), so the recreator is always handed the unfiltered table.
+        original_table = table
+        table = apply_lob_exclusions(
+            table, self._inputs.excluded_lob_columns.get(table.name)
+        )
         applied = self._inputs.table_conversions.get(table.name)
         target_types = (
             parse_target_column_types(applied.target_ddl)
@@ -2509,7 +2534,10 @@ class BatchedTableMigrator:
                     list(applied.index_ddls) if applied is not None else []
                 )
             else:
-                index_ddls = self._table_recreator(table)
+                # Recreate from the UNFILTERED table so the target keeps the excluded
+                # column (only its data is skipped, matching CDC); the fallback
+                # deterministic conversion would otherwise omit a dropped column.
+                index_ddls = self._table_recreator(original_table)
             # Clean load into a freshly-emptied target: plain INSERT (no ON
             # CONFLICT) -- DSQL never silently drops a non-conflicting row. The
             # target was just recreated from the applied DDL, so target_key_columns

@@ -691,6 +691,49 @@ def test_target_primary_key_columns_returns_none_when_undeterminable() -> None:
     )
 
 
+def test_target_primary_keys_reads_every_table_over_one_connection() -> None:
+    # The whole point of the bulk reader: N tables must cost ONE connect, not N
+    # (each DSQL connect is an IAM token + cross-region TLS handshake). The double
+    # returns the same key rows for each query, which is enough to prove reuse.
+    from dsql_migrator.core.target_introspector import target_primary_keys
+
+    connects = {"count": 0}
+    connection = _PkConnection(rows=[("id",)])
+
+    def _factory():
+        connects["count"] += 1
+        return connection
+
+    keys = target_primary_keys(
+        ["ecommerce.orders", "ecommerce.customers", "app.audit"],
+        connection_factory=_factory,
+    )
+
+    # One connection served all three tables (was N+... before).
+    assert connects["count"] == 1
+    # One catalog query per table, each with its own bound params (never interpolated).
+    assert len(connection.executed) == 3
+    assert keys == {
+        "ecommerce.orders": ["id"],
+        "ecommerce.customers": ["id"],
+        "app.audit": ["id"],
+    }
+    assert connection.closed is True
+
+
+def test_target_primary_keys_maps_all_tables_to_none_when_connect_fails() -> None:
+    # A connection failure is "unknown" for EVERY table -- never a false "no key".
+    from dsql_migrator.core.target_introspector import target_primary_keys
+
+    def _no_connection():
+        raise RuntimeError("connect failed")
+
+    keys = target_primary_keys(
+        ["a", "b"], connection_factory=_no_connection
+    )
+    assert keys == {"a": None, "b": None}
+
+
 # ---------------------------------------------------------------------------
 # sync_identity_sequences: advance an identity PK past the loaded rows
 # ---------------------------------------------------------------------------
