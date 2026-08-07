@@ -155,6 +155,16 @@ class IndexDef(BaseModel):
         default=None,
         description="MySQL index type (e.g. BTREE, FULLTEXT, SPATIAL), if known.",
     )
+    prefix_lengths: dict[str, int] = Field(
+        default_factory=dict,
+        description=(
+            "MySQL prefix-index lengths, column -> N for a ``KEY (col(N))`` prefix "
+            "index. DSQL has no prefix-index equivalent, so the converter indexes the "
+            "FULL column and warns; a prefixed variable-length column whose full value "
+            "exceeds DSQL's key-byte limit would otherwise fail CREATE INDEX ASYNC only "
+            "after the load. Empty for a normal (non-prefix) index."
+        ),
+    )
 
 
 class ForeignKeyDef(BaseModel):

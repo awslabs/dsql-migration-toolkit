@@ -418,12 +418,23 @@ def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[Tab
         for index in inspector.get_indexes(table_name, schema=schema):  # type: ignore[attr-defined]
             index_columns = [c for c in index.get("column_names", []) if c]
             index_name = index.get("name")
+            # MySQL prefix-index lengths (``KEY (col(N))``) live under the reflected
+            # index's dialect_options["mysql_length"] = {column: N}. Carry them so the
+            # converter can warn that DSQL indexes the FULL column (no prefix support).
+            prefix_lengths = {
+                str(col): int(length)
+                for col, length in (
+                    (index.get("dialect_options") or {}).get("mysql_length") or {}
+                ).items()
+                if col in index_columns
+            }
             if index_name and index_columns:
                 indexes.append(
                     IndexDef(
                         name=index_name,
                         columns=index_columns,
                         unique=bool(index.get("unique")),
+                        prefix_lengths=prefix_lengths,
                     )
                 )
 

@@ -969,6 +969,19 @@ def _quote_mysql_qualified(name: str) -> str:
     return _quote_mysql_identifier(obj)
 
 
+# FLOAT/REAL base types whose ``UNSIGNED`` sqlglot's MySQL dialect cannot parse as a
+# standalone type (``FLOAT UNSIGNED``/``FLOAT(M,D) UNSIGNED`` -> ParseError), unlike
+# ``DOUBLE UNSIGNED`` (parses to UDOUBLE). Unsigned-ness on an APPROXIMATE numeric is
+# not representable in PostgreSQL and carries no storage meaning (same rationale as the
+# _FLOAT_TARGET UDOUBLE mapping), so stripping it is lossless and lets the type parse.
+# Restricted to float/real so an INTEGER ``unsigned`` (whose range-widening the mapping
+# DOES handle, e.g. ``int unsigned`` -> bigint) is never touched here.
+_FLOAT_UNSIGNED_RE = re.compile(
+    r"^(\s*(?:float|real)\b[^,]*?(?:\([^)]*\))?)\s+unsigned\b(.*)$",
+    re.IGNORECASE,
+)
+
+
 def _normalize_mysql_type(mysql_type: str) -> str:
     """Strip MySQL display-only attributes that leak invalid tokens into DSQL DDL.
 
@@ -978,10 +991,17 @@ def _normalize_mysql_type(mysql_type: str) -> str:
     standalone type parser. It always implies UNSIGNED in MySQL, so dropping only
     ZEROFILL preserves the unsigned-ness (which the type mapping handles). Matched
     case-insensitively as a whole word.
-    """
-    import re
 
-    return re.sub(r"\s+zerofill\b", "", mysql_type, flags=re.IGNORECASE).strip()
+    ``FLOAT UNSIGNED`` / ``FLOAT(M,D) UNSIGNED`` additionally has its ``UNSIGNED``
+    stripped: sqlglot's MySQL dialect cannot parse it as a standalone type (it raises
+    ParseError, which used to abort the WHOLE table to an UNSUPPORTED placeholder while
+    Evaluation still reported it AUTO/compatible). Unsigned-ness is not representable on
+    an approximate numeric and carries no storage meaning, so dropping it maps the column
+    to ``real`` -- the same treatment ``DOUBLE UNSIGNED`` already gets.
+    """
+    normalized = re.sub(r"\s+zerofill\b", "", mysql_type, flags=re.IGNORECASE).strip()
+    normalized = _FLOAT_UNSIGNED_RE.sub(r"\1\2", normalized).strip()
+    return normalized
 
 
 # MySQL expression defaults whose PostgreSQL/DSQL spelling is IDENTICAL, so they can be
@@ -2074,6 +2094,44 @@ def _unsupported_index_type_warning(table: TableDef) -> Optional[ConversionWarni
     )
 
 
+def _prefix_index_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Warn that a MySQL prefix index (``KEY (col(N))``) becomes a FULL-column index.
+
+    MySQL indexes only the first N bytes/chars of a long column; DSQL has no prefix-
+    index equivalent, so the converter emits ``CREATE INDEX ASYNC`` on the WHOLE column.
+    Two consequences the operator must see BEFORE a multi-hour load:
+
+    - a variable-length column whose full value exceeds DSQL's ~255-byte key limit makes
+      the ``CREATE INDEX ASYNC`` fail (after the table + data are already applied), and
+    - even when it fits, indexing the full value is a semantic change from the prefix.
+
+    Without this the only signal was the per-value OVERSIZED_LOB note (about row size,
+    not the index), so the index failure surfaced only post-load. RECOMMENDATION, not a
+    hard LOSS: the index is still created for columns within the key limit.
+    """
+    flagged: list[str] = []
+    for index in table.indexes:
+        for column, length in sorted(index.prefix_lengths.items()):
+            flagged.append(f"{index.name}({column}({length}))")
+    if not flagged:
+        return None
+    names = ", ".join(flagged)
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.RECOMMENDATION,
+        message=(
+            f"Prefix index(es) {names} index only the first N characters/bytes in MySQL, "
+            "but Aurora DSQL has no prefix index — the converter indexes the FULL "
+            "column. If a value exceeds DSQL's ~255-byte index-key limit the "
+            "CREATE INDEX ASYNC fails AFTER the table and its data are loaded, leaving "
+            "the table without that index. Before loading, confirm the column's values "
+            "fit the key limit, or replace the prefix index with an expression index on "
+            "a bounded substring (e.g. on left(col, N)) / drop it if unused."
+        ),
+    )
+
+
 def _partitioned_table_warning(table: TableDef) -> Optional[ConversionWarning]:
     """Return a warning that the source table's native partitioning was dropped.
 
@@ -2354,6 +2412,7 @@ class SchemaConverter:
             _foreign_key_warning(table),
             _partitioned_table_warning(table),
             _unsupported_index_type_warning(table),
+            _prefix_index_warning(table),
             _too_many_columns_warning(table),
             _too_many_indexes_warning(table),
             _oversized_lob_warning(table),

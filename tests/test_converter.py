@@ -92,6 +92,24 @@ def test_bigint_unsigned_widens_to_numeric_preserving_range() -> None:
     assert warning is None
 
 
+def test_float_unsigned_maps_to_real_instead_of_aborting_the_table() -> None:
+    # sqlglot's MySQL dialect cannot parse "float unsigned" as a standalone type, which
+    # used to abort the whole table to an UNSUPPORTED placeholder while Evaluation still
+    # rated it AUTO. Unsigned-ness is storage-irrelevant on an approximate numeric, so it
+    # is stripped and maps to real (audit finding B1).
+    for src in ("FLOAT UNSIGNED", "float(10,2) unsigned", "REAL UNSIGNED",
+                "float unsigned zerofill"):
+        target, warning = map_mysql_type(src)
+        assert target.lower() == "real", f"{src!r} -> {target!r}"
+
+
+def test_float_unsigned_does_not_disturb_integer_or_double_unsigned() -> None:
+    # The float-unsigned strip must not touch integer unsigned (range-widened) or
+    # double unsigned (mapped to double precision).
+    assert map_mysql_type("INT UNSIGNED")[0].lower() == "bigint"
+    assert map_mysql_type("DOUBLE UNSIGNED")[0].lower() == "double precision"
+
+
 def test_datetime_maps_to_timestamp() -> None:
     target, warning = map_mysql_type("DATETIME")
     assert target.lower() == "timestamp"
@@ -335,6 +353,45 @@ def test_convert_table_collects_warning_with_table_and_column_context() -> None:
     assert warning.column_name == "value"
     assert warning.source_type == "ENUM('a','b')"
     assert warning.target_type is not None and warning.target_type.lower() == "text"
+
+
+def test_prefix_index_warns_that_dsql_indexes_the_full_column() -> None:
+    # A MySQL prefix index KEY (body(100)) has no DSQL equivalent: the converter indexes
+    # the FULL column, which can exceed the ~255-byte key limit and fail CREATE INDEX
+    # ASYNC after the load. The operator must be warned at planning time (audit B2).
+    table = TableDef(
+        name="articles",
+        columns=[
+            ColumnDef(name="id", mysql_type="INT", nullable=False),
+            ColumnDef(name="body", mysql_type="LONGTEXT"),
+        ],
+        primary_key=["id"],
+        indexes=[
+            IndexDef(name="idx_body", columns=["body"], prefix_lengths={"body": 100}),
+        ],
+    )
+    result = _convert_table(table)
+    prefix_warnings = [w for w in result.warnings if "prefix index" in w.message.lower()]
+    assert len(prefix_warnings) == 1
+    w = prefix_warnings[0]
+    assert "idx_body" in w.message and "body(100)" in w.message
+    assert "255-byte" in w.message or "255 byte" in w.message
+    # The index DDL is still emitted (on the full column) -- the warning is advisory.
+    assert any("idx_body" in ddl for ddl in result.index_ddls)
+
+
+def test_non_prefix_index_produces_no_prefix_warning() -> None:
+    table = TableDef(
+        name="t",
+        columns=[
+            ColumnDef(name="id", mysql_type="INT", nullable=False),
+            ColumnDef(name="name", mysql_type="VARCHAR(50)"),
+        ],
+        primary_key=["id"],
+        indexes=[IndexDef(name="idx_name", columns=["name"])],  # no prefix_lengths
+    )
+    result = _convert_table(table)
+    assert not any("prefix index" in w.message.lower() for w in result.warnings)
 
 
 def test_lossless_columns_produce_no_warnings() -> None:

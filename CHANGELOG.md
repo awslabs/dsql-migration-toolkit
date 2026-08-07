@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.277
+
+### Fixed
+
+- **`FLOAT UNSIGNED` / `FLOAT(M,D) UNSIGNED` columns no longer abort the whole table's
+  conversion.** sqlglot's MySQL dialect cannot parse `float unsigned` as a standalone
+  type, so a table containing one fell to the "could not auto-convert" placeholder (no
+  `CREATE TABLE`) — while Evaluation still rated it AUTO/compatible, a contradiction the
+  operator could not diagnose (audit finding B1). Unsigned-ness is not representable on an
+  approximate numeric and carries no storage meaning, so it is now stripped and the column
+  maps to `real` — the same treatment `DOUBLE UNSIGNED` already gets. Integer `UNSIGNED`
+  (range-widened) and `DECIMAL UNSIGNED` are untouched.
+- **MySQL prefix indexes (`KEY (col(N))`) are now surfaced instead of silently becoming a
+  full-column index that fails after the load.** Aurora DSQL has no prefix-index
+  equivalent, so the converter indexes the whole column; a variable-length column whose
+  full value exceeds DSQL's ~255-byte index-key limit then fails `CREATE INDEX ASYNC`
+  *after* the table and its data are already loaded, with no earlier signal (audit finding
+  B2). The prefix length is now reflected from the source (`IndexDef.prefix_lengths`) and
+  Schema Conversion emits a warning naming the index and column, so the operator can
+  confirm the values fit — or replace it with an expression index on a bounded substring —
+  before a multi-hour load. The index DDL is still emitted (the warning is advisory).
+
 ## v0.1.276
 
 ### Fixed

@@ -5,6 +5,24 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.277
+
+### 수정
+
+- **`FLOAT UNSIGNED` / `FLOAT(M,D) UNSIGNED` 컬럼이 더 이상 테이블 전체 변환을 중단시키지 않습니다.**
+  sqlglot의 MySQL dialect가 `float unsigned`를 독립 타입으로 파싱하지 못해, 이를 포함한 테이블이
+  "auto-convert 불가" 플레이스홀더(CREATE TABLE 없음)로 떨어졌고 — 그런데 Evaluation은 여전히
+  AUTO/호환으로 평가해, 운영자가 진단할 수 없는 모순이었습니다(감사 B1). 근사 수치형의 unsigned는
+  표현 불가하고 저장 의미도 없어, 이제 제거하고 `real`로 매핑합니다 — `DOUBLE UNSIGNED`와 동일한 처리.
+  정수 `UNSIGNED`(범위 확장)와 `DECIMAL UNSIGNED`는 건드리지 않습니다.
+- **MySQL prefix 인덱스(`KEY (col(N))`)가 조용히 full-column 인덱스가 되어 로드 후 실패하는 대신 표면화됩니다.**
+  Aurora DSQL엔 prefix 인덱스 등가물이 없어 변환기가 컬럼 전체를 인덱싱하는데, 값이 DSQL의 ~255바이트
+  인덱스 키 한계를 넘는 가변 길이 컬럼은 테이블과 데이터가 이미 로드된 **후에** `CREATE INDEX ASYNC`가
+  실패하며 사전 신호가 없었습니다(감사 B2). 이제 소스에서 prefix 길이를 반영하고
+  (`IndexDef.prefix_lengths`), Schema Conversion이 인덱스와 컬럼을 지목하는 경고를 표시해, 운영자가 값이
+  맞는지 확인하거나 — 경계 있는 substring 표현식 인덱스로 교체 — 할 수 있게 합니다. 인덱스 DDL은 여전히
+  발행됩니다(경고는 권고).
+
 ## v0.1.276
 
 ### 수정
