@@ -5,6 +5,19 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.282
+
+### 修正
+
+- **ソースの `CHECK` 制約が黙って削除されなくなり、Evaluation で表面化されるようになりました(監査で発見)。**
+  introspector が CHECK 制約を反映していなかったため、DSQL 関連の特徴が CHECK だけのテーブルが
+  `AUTO`/「互換性の問題なし」と分類され、制約がターゲットで失われていました。今後は CHECK 制約を反映し
+  (`TableDef.check_constraints`、SQLAlchemy の `get_check_constraints` 経由)、新しい
+  `CHECK_CONSTRAINT_DROPPED` 評価ルールがそのテーブルを `MANUAL` としてフラグし、制約名を挙げて、ターゲット
+  への手動再作成(式が DSQL 互換の場合)またはアプリケーション層での強制を推奨します。変換器は任意の CHECK
+  式を自動変換しません(MySQL の式は DSQL と異なる関数/演算子を使う可能性があり、無条件のコピーは不正な DDL
+  のリスク) — 目的は完全性です:ソース制約を表面化せずに削除しないこと(Property 8)。
+
 ## v0.1.281
 
 ### 修正

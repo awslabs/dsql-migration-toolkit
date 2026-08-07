@@ -204,6 +204,24 @@ class ForeignKeyDef(BaseModel):
         return bool(actions & {"CASCADE", "SET NULL", "SET DEFAULT"})
 
 
+class CheckConstraintDef(BaseModel):
+    """A MySQL ``CHECK`` constraint reflected from the source table.
+
+    The converter does not re-emit arbitrary CHECK expressions (a MySQL expression can
+    use functions/operators that differ in PostgreSQL/DSQL, so a blind copy risks
+    invalid DDL); this exists so a source-enforced CHECK is at least SURFACED (assessor
+    flags the table MANUAL) rather than silently dropped -- a Property 8 completeness
+    requirement.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    # The constraint's SQL text as reflected (``sqltext``), e.g. ``price > 0``. Kept for
+    # display so the operator can re-create the check on the target by hand if needed.
+    expression: str = ""
+
+
 class TableDef(BaseModel):
     """A source table definition."""
 
@@ -214,6 +232,7 @@ class TableDef(BaseModel):
     primary_key: list[str] = Field(default_factory=list)
     indexes: list[IndexDef] = Field(default_factory=list)
     foreign_keys: list[ForeignKeyDef] = Field(default_factory=list)
+    check_constraints: list[CheckConstraintDef] = Field(default_factory=list)
     auto_increment_column: Optional[str] = None
     partitioned: bool = Field(
         default=False,
@@ -1375,6 +1394,7 @@ __all__ = [
     "ColumnDef",
     "IndexDef",
     "ForeignKeyDef",
+    "CheckConstraintDef",
     "TableDef",
     "apply_lob_exclusions",
     "ViewDef",

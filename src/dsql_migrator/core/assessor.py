@@ -283,6 +283,45 @@ class ForeignKeyRule(Rule):
         return findings
 
 
+class CheckConstraintRule(Rule):
+    """Flag tables with a CHECK constraint (not re-emitted by the converter).
+
+    Aurora DSQL supports CHECK, but the converter does not translate an arbitrary
+    source expression (it may use MySQL-only functions/operators), so a source-enforced
+    CHECK would otherwise be silently dropped -- the table would read AUTO/"no issues"
+    while losing a constraint. Flagging it MANUAL surfaces the loss (Property 8) so the
+    operator can re-create the check on the target by hand where the expression is
+    DSQL-compatible.
+    """
+
+    rule_id = "CHECK_CONSTRAINT_DROPPED"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            if table.check_constraints:
+                names = ", ".join(c.name for c in table.check_constraints)
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            f"CHECK constraint(s) ({names}) are not carried over by the "
+                            "converter, so the source's value rules would be lost on the "
+                            "target."
+                        ),
+                        recommendation=(
+                            "Re-create the CHECK on the target by hand if its expression "
+                            "is Aurora DSQL-compatible, or enforce the rule in the "
+                            "application layer."
+                        ),
+                        effort=EffortLevel.SIMPLE,
+                    )
+                )
+        return findings
+
+
 class CascadeForeignKeyRule(Rule):
     """Flag foreign keys whose referential ACTION cannot survive CDC.
 
@@ -1194,6 +1233,7 @@ def default_rules() -> list[Rule]:
     """
     return [
         ForeignKeyRule(),
+        CheckConstraintRule(),
         CascadeForeignKeyRule(),
         TriggerRule(),
         ProcedureRule(),

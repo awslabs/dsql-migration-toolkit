@@ -31,6 +31,7 @@ from sqlalchemy.engine.url import URL
 
 from dsql_migrator.config import SecretValue, resolve_secret
 from dsql_migrator.core.models import (
+    CheckConstraintDef,
     ColumnDef,
     ConnectionResult,
     ForeignKeyDef,
@@ -478,6 +479,27 @@ def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[Tab
                 )
             )
 
+        # CHECK constraints (MySQL 8.0.16+). DSQL supports CHECK, but the converter does
+        # not re-emit an arbitrary source expression (it may use MySQL-only functions);
+        # reflecting them lets the assessor SURFACE the table (MANUAL) rather than
+        # silently dropping a source-enforced constraint (Property 8 completeness).
+        check_constraints: list[CheckConstraintDef] = []
+        try:
+            for ck in inspector.get_check_constraints(table_name, schema=schema):  # type: ignore[attr-defined]
+                ck_name = ck.get("name")
+                if not ck_name:
+                    continue
+                check_constraints.append(
+                    CheckConstraintDef(
+                        name=str(ck_name),
+                        expression=str(ck.get("sqltext") or ""),
+                    )
+                )
+        except Exception:  # noqa: BLE001 - reflection of checks is best-effort
+            # An older MySQL (< 8.0.16) or a dialect quirk: absence of CHECK reflection
+            # must never fail the whole introspection.
+            check_constraints = []
+
         tables.append(
             TableDef(
                 name=table_name,
@@ -485,6 +507,7 @@ def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[Tab
                 primary_key=primary_key,
                 indexes=indexes,
                 foreign_keys=foreign_keys,
+                check_constraints=check_constraints,
                 auto_increment_column=None,
             )
         )

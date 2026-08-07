@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.282
+
+### Fixed
+
+- **A source `CHECK` constraint is no longer silently dropped — it is now surfaced in
+  Evaluation (audit finding).** The introspector never reflected CHECK constraints, so a
+  table whose only DSQL-relevant feature was a CHECK was classified `AUTO` / "no
+  compatibility issues" while the constraint was lost on the target. CHECK constraints
+  are now reflected (`TableDef.check_constraints`, via SQLAlchemy's
+  `get_check_constraints`) and a new `CHECK_CONSTRAINT_DROPPED` assessment rule flags
+  such a table `MANUAL`, naming the constraint(s) and recommending re-creating the CHECK
+  on the target by hand (where its expression is DSQL-compatible) or enforcing it in the
+  application. The converter deliberately does not auto-translate an arbitrary CHECK
+  expression (a MySQL expression can use functions/operators that differ in DSQL, so a
+  blind copy risks invalid DDL) — the goal here is completeness: never drop a
+  source-enforced constraint without surfacing it (Property 8).
+
 ## v0.1.281
 
 ### Fixed

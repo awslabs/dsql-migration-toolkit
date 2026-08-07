@@ -486,6 +486,7 @@ def test_default_rules_contains_all_documented_rule_ids() -> None:
     rule_ids = {rule.rule_id for rule in default_rules()}
     assert rule_ids == {
         "FK_UNSUPPORTED",
+        "CHECK_CONSTRAINT_DROPPED",
         "FK_CASCADE_CDC_GAP",
         "TRIGGER_UNSUPPORTED",
         "PROC_PLPGSQL",
@@ -924,6 +925,26 @@ def test_cascade_fk_rule_is_separate_from_the_plain_fk_finding() -> None:
     assert [f.rule_id for f in CascadeForeignKeyRule().evaluate(inventory)] == [
         "FK_CASCADE_CDC_GAP"
     ]
+
+
+def test_check_constraint_rule_flags_a_table_manual() -> None:
+    # Audit finding: a source CHECK is not re-emitted by the converter, so it must be
+    # SURFACED (MANUAL) instead of a table reading AUTO/"no issues" while dropping it.
+    from dsql_migrator.core.assessor import CheckConstraintRule
+    from dsql_migrator.core.models import CheckConstraintDef
+
+    clean = _table_with_pk("plain")
+    assert CheckConstraintRule().evaluate(SourceInventory(tables=[clean])) == []
+
+    checked = _table_with_pk(
+        "products",
+        check_constraints=[CheckConstraintDef(name="ck_price", expression="price > 0")],
+    )
+    findings = CheckConstraintRule().evaluate(SourceInventory(tables=[checked]))
+    assert len(findings) == 1
+    assert findings[0].rule_id == "CHECK_CONSTRAINT_DROPPED"
+    assert findings[0].classification is Classification.MANUAL
+    assert "ck_price" in findings[0].risk
 
 
 def test_foreign_key_def_defaults_keep_actions_optional() -> None:

@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.282
+
+### 수정
+
+- **소스 `CHECK` 제약이 더 이상 조용히 드롭되지 않고 Evaluation에서 표면화됩니다(감사 발견).** introspector가
+  CHECK 제약을 반영하지 않아, DSQL 관련 특징이 CHECK뿐인 테이블이 `AUTO`/"호환성 문제 없음"으로 분류되면서
+  제약이 타깃에서 사라졌습니다. 이제 CHECK 제약을 반영하고(`TableDef.check_constraints`, SQLAlchemy
+  `get_check_constraints` 경유), 신규 `CHECK_CONSTRAINT_DROPPED` 평가 룰이 해당 테이블을 `MANUAL`로
+  플래그하며 제약 이름을 지목하고 타깃에 수동 재생성(표현식이 DSQL 호환일 때)이나 애플리케이션 계층 시행을
+  권고합니다. 변환기는 임의의 CHECK 표현식을 자동 변환하지 않습니다(MySQL 표현식이 DSQL과 다른 함수/연산자를
+  쓸 수 있어 무조건 복사는 잘못된 DDL 위험) — 목표는 완전성: 소스 제약을 표면화 없이 드롭하지 않는 것(Property 8).
+
 ## v0.1.281
 
 ### 수정
