@@ -48,6 +48,7 @@ from dsql_migrator.core.batched_import import (
     BatchedImporter,
     BatchedImportOptions,
     OnConflictMode,
+    safe_error_message,
 )
 from dsql_migrator.core.target_connection import DsqlConnector
 from dsql_migrator.core.converter import (
@@ -1227,7 +1228,14 @@ def _migrate_one_table(
         handle.update(lambda job, n=name: _fail_chunk(job, n))
         return _TableLoadOutcome.STOPPED
     except Exception as exc:  # noqa: BLE001 - recorded as a per-table failure
-        message = f"{type(exc).__name__}: {exc}"
+        # safe_error_message, not f"{exc}": this text is written to the durable
+        # error log + activity log (+ CloudWatch). A raw psycopg exception keeps its
+        # DETAIL/"Failing row contains (...)" line, which carries the row's column
+        # values -- a Property 7 leak. First-line-only drops the values while keeping
+        # the actionable primary message. (A RuntimeError from the batch loop already
+        # carries a pre-sanitized first_error; this also covers a raw driver
+        # exception raised outside that loop, e.g. a DDL/connection failure.)
+        message = safe_error_message(exc)
         # A dropped SOURCE connection (Aurora failover) is an EXPECTED event on a
         # multi-hour load, and the raw driver text ("(2013, 'Lost connection to MySQL
         # server during query')") tells the operator nothing about what to do. Append

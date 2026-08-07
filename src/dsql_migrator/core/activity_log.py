@@ -144,9 +144,11 @@ def log_activity(
     ``exc`` is the caught exception (when any): its full traceback is attached as
     a ``stacktrace`` field **only when DEBUG logging is enabled**
     (``DSQL_MIGRATOR_LOG_LEVEL=DEBUG``), so routine logs stay clean while a
-    debugging run captures the failing call stack. The traceback never includes
-    row values or credentials (it is the Python call stack, not data); ``detail``
-    remains the credential-free summary message in all cases.
+    debugging run captures the failing call stack. Only the stack FRAMES are kept
+    plus a value-free ``Type: first-line`` tail -- the exception message's DETAIL /
+    "Failing row contains (...)" line (which carries the offending row's column
+    values) is dropped, so the traceback leaks neither row values nor credentials
+    (Property 7); ``detail`` remains the credential-free summary message in all cases.
     """
     cat = category.value if isinstance(category, ActivityCategory) else str(category)
     st = status.value if isinstance(status, ActivityStatus) else str(status)
@@ -164,8 +166,19 @@ def log_activity(
     # detailed call stack is available on demand without bloating routine logs.
     stacktrace: Optional[str] = None
     if exc is not None and logger.isEnabledFor(logging.DEBUG):
-        stacktrace = "".join(
-            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        # The STACK FRAMES (file/line/func) are value-free and useful; the exception
+        # MESSAGE line that format_exception appends is NOT -- a psycopg error keeps
+        # its DETAIL/"Failing row contains (...)" values there. So format the frames
+        # only and append a value-free "Type: first-line" tail (Property 7). Chained
+        # causes' frames are included; their message lines are likewise reduced.
+        frames = "".join(traceback.format_tb(exc.__traceback__)).rstrip()
+        first_line = str(exc).strip().splitlines()
+        head = first_line[0].strip() if first_line else ""
+        tail = f"{type(exc).__name__}: {head}" if head else type(exc).__name__
+        stacktrace = (
+            f"Traceback (most recent call last):\n{frames}\n{tail}"
+            if frames
+            else tail
         ).strip()
     logger.log(
         level,

@@ -5,6 +5,22 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.274
+
+### 修正
+
+- **Full Load のエラーログが、失敗した行の列値をディスクに書き込まなくなりました (Property 7)。**
+  ドライバ(psycopg)エラーの `str()` はサーバの `DETAIL:` / `Failing row contains (...)` 行を保持し、
+  この行には問題となった行の列値(重複メール、トークンなど)が含まれます。この生テキストが quarantine
+  レコード、テーブル単位の失敗メッセージ、永続 NDJSON アクティビティログ、そして(ミラーされる)
+  CloudWatch にそのまま保存されていました。今後はすべてのロード失敗箇所(quarantine レコード、バッチ結果の
+  `first_error`、テーブル単位の失敗ハンドラ)で単一行のサニタイザ(`safe_error_message`)を通します —
+  実行可能な主メッセージ(`duplicate key value violates unique constraint "…"`)と SQLSTATE は保持し、
+  値を含む `DETAIL` 行を除去します。従来の `" ".join(str(exc).split())` では不十分でした — DETAIL 行を
+  1 行に折りたたむだけで値はそのまま残っていました。DEBUG 専用のアクティビティログのスタックトレースも
+  同様に修正 — (値を含まない)スタックフレームと `Type: 先頭行` の末尾のみを保持し、`format_exception` の
+  値を含むメッセージ行を除きます。
+
 ## v0.1.273
 
 ### 変更

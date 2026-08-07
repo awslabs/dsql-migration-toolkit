@@ -1432,3 +1432,51 @@ def test_index_name_is_extracted_for_the_failure_message() -> None:
     assert _index_name_of("CREATE INDEX ix_c ON t (c)") == "ix_c"
     # Unexpected shape degrades to a truncated DDL rather than raising.
     assert _index_name_of("SOMETHING ELSE") == "SOMETHING ELSE"
+
+
+# --- Property 7: driver error text must not leak the failing row's values -------
+
+class _FakePsycopgError(Exception):
+    """A psycopg-style error whose str() keeps the server DETAIL line (row values)."""
+
+    def __init__(self, sqlstate: str = "23505") -> None:
+        super().__init__(
+            'duplicate key value violates unique constraint "users_email_key"\n'
+            "DETAIL:  Key (email)=(alice@example.com) already exists, "
+            "Failing row contains (1, alice@example.com, secrettoken123)."
+        )
+        self.sqlstate = sqlstate
+
+
+def test_safe_error_message_drops_the_detail_row_values() -> None:
+    # The whole point of the sanitizer (Property 7): keep the actionable primary
+    # line, drop the DETAIL / "Failing row contains (...)" line that carries the
+    # offending row's column values (an email, a token here).
+    from dsql_migrator.core.batched_import import safe_error_message
+
+    rendered = safe_error_message(_FakePsycopgError())
+    assert 'unique constraint "users_email_key"' in rendered  # actionable, value-free
+    assert "alice@example.com" not in rendered
+    assert "secrettoken123" not in rendered
+    assert "Failing row" not in rendered and "DETAIL" not in rendered
+    # And it is a single line (no embedded newline that could carry the dump).
+    assert "\n" not in rendered
+
+
+def test_quarantine_record_message_is_value_free() -> None:
+    # At the quarantine sink: a poison row's QuarantineRecord.message must carry the
+    # sqlstate + primary message, never the DETAIL row values. Mirrors how
+    # _quarantine_one builds the record (safe_error(exc), error_code=sqlstate).
+    from dsql_migrator.core.batched_import import QuarantineRecord, safe_error_message
+
+    exc = _FakePsycopgError()
+    rec = QuarantineRecord(
+        table="app.users",
+        primary_key="id=1",
+        error_code=exc.sqlstate,
+        message=safe_error_message(exc),
+    )
+    assert rec.error_code == "23505"
+    assert "alice@example.com" not in rec.message
+    assert "secrettoken123" not in rec.message
+    assert 'unique constraint "users_email_key"' in rec.message

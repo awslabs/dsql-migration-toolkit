@@ -1063,7 +1063,10 @@ class BatchedImporter:
             table=work.table_name,
             primary_key=primary_key,
             error_code=getattr(exc, "sqlstate", None),
-            message=str(exc)[:500],
+            # _safe_error, not str(exc): the raw driver text carries the failing
+            # row's column values in its DETAIL line (Property 7). The sqlstate is
+            # kept separately in error_code for triage.
+            message=_safe_error(exc),
         )
         with self._quarantine_lock:
             self._quarantine.append(record)
@@ -1364,11 +1367,24 @@ def _index_name_of(ddl: str) -> str:
 
 
 def _safe_error(exc: BaseException) -> str:
-    """Render an exception as a short, credential-free single line."""
-    message = " ".join(str(exc).split())
-    if len(message) > 300:
-        message = message[:297] + "..."
-    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+    """Render an exception as a short, credential- and VALUE-free single line.
+
+    Keeps only the exception type and the FIRST line of its message. A psycopg
+    error's ``str(exc)`` preserves the server ``DETAIL:``/``Failing row contains
+    (...)`` lines, which carry the offending row's COLUMN VALUES (e.g. a duplicate
+    email, a token) -- writing those to the error log / activity log / CloudWatch
+    would violate Property 7. The primary line ("duplicate key value violates
+    unique constraint ...") is the actionable part and is value-free, so taking the
+    first line alone both explains the failure and drops the value dump. Mirrors
+    :func:`dsql_migrator.core.validator._safe_error_message` (kept local to avoid a
+    cross-module import). Collapsing with ``" ".join(str(exc).split())`` was NOT
+    enough -- it merely folds the DETAIL line onto the same line, values intact.
+    """
+    first_line = str(exc).strip().splitlines()[0].strip() if str(exc).strip() else ""
+    if len(first_line) > 300:
+        first_line = first_line[:297] + "..."
+    name = type(exc).__name__
+    return f"{name}: {first_line}" if first_line else name
 
 
 def _execute_ddl(connection: Any, ddl: str) -> None:
@@ -1500,7 +1516,10 @@ def _resolve_outcome(
     try:
         inserted, conflicts = future.result()
     except Exception as exc:  # noqa: BLE001 - recorded as a per-batch failure
-        return _BatchOutcome(chunk_id=chunk_id, status="FAILED", error=str(exc))
+        # _safe_error, not str(exc): this text becomes result.first_error and flows
+        # into the per-table failure message / error log / activity log, so it must
+        # not carry the driver DETAIL line's row values (Property 7).
+        return _BatchOutcome(chunk_id=chunk_id, status="FAILED", error=_safe_error(exc))
     return _BatchOutcome(
         chunk_id=chunk_id,
         status="DONE",
@@ -1602,4 +1621,11 @@ __all__ = [
     "BatchedImporter",
     "batch_chunk_id",
     "build_insert_statement",
+    "safe_error_message",
 ]
+
+
+# Public alias for the value-free error renderer, so callers outside this module
+# (e.g. the Full Load engine's per-table failure handler) sanitize driver
+# exceptions the same way before logging them (Property 7).
+safe_error_message = _safe_error

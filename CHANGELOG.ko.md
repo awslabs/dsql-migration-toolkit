@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.274
+
+### 수정
+
+- **Full Load 에러 로깅이 더 이상 실패한 행의 컬럼 값을 디스크에 기록하지 않습니다 (Property 7).**
+  드라이버(psycopg) 에러의 `str()`은 서버 `DETAIL:` / `Failing row contains (...)` 줄을 보존하는데,
+  이 줄은 문제가 된 행의 컬럼 값(중복 이메일, 토큰 등)을 담고 있습니다. 이 raw 텍스트가 quarantine
+  레코드, 테이블별 실패 메시지, 디스크 NDJSON activity log, 그리고 (미러링된) CloudWatch에 그대로
+  저장되고 있었습니다. 이제 모든 로드 실패 지점(quarantine 레코드, 배치 결과의 `first_error`, 테이블별
+  실패 핸들러)에서 단일 라인 sanitizer(`safe_error_message`)를 거칩니다 — 실행 가능한 주 메시지
+  (`duplicate key value violates unique constraint "…"`)와 SQLSTATE는 유지하고, 값이 담긴 `DETAIL`
+  줄은 제거합니다. 기존 `" ".join(str(exc).split())` 방식은 도움이 안 됐습니다 — DETAIL 줄을 한 줄로
+  접을 뿐 값은 그대로 남았습니다. DEBUG 전용 activity-log 스택트레이스도 같은 방식으로 수정 — 이제
+  (값이 없는) 스택 프레임 + `Type: 첫줄` 꼬리만 유지하고 `format_exception`의 값 포함 메시지 줄은 뺍니다.
+
 ## v0.1.273
 
 ### 변경

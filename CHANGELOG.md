@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.274
+
+### Fixed
+
+- **Full Load error logging no longer writes the failing row's column values to disk
+  (Property 7).** A driver (psycopg) error's `str()` keeps the server `DETAIL:` /
+  `Failing row contains (...)` line, which carries the offending row's column values
+  (e.g. a duplicate email, a token). That raw text was stored verbatim in the
+  quarantine record, the per-table failure message, the durable NDJSON activity log,
+  and (mirrored) CloudWatch. It is now passed through a single-line sanitizer
+  (`safe_error_message`) at every load-failure site — the quarantine record, the batch
+  outcome's `first_error`, and the per-table failure handler — which keeps the
+  actionable primary message (`duplicate key value violates unique constraint "…"`)
+  and the SQLSTATE while dropping the value-bearing `DETAIL` line. The prior
+  `" ".join(str(exc).split())` collapse did NOT help — it merely folded the DETAIL
+  line onto one line with the values intact. The DEBUG-only activity-log stacktrace is
+  fixed the same way: it now keeps the (value-free) stack frames plus a
+  `Type: first-line` tail instead of `format_exception`'s value-bearing message line.
+
 ## v0.1.273
 
 ### Changed

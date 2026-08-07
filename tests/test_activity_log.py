@@ -288,6 +288,41 @@ def test_failure_stacktrace_only_when_debug(tmp_path) -> None:
     assert any(line.startswith("    ") and "ValueError" in line for line in text)
 
 
+def test_debug_stacktrace_does_not_leak_exception_detail_row_values(tmp_path) -> None:
+    # Property 7: even the DEBUG-only stacktrace must not carry a driver error's
+    # DETAIL / "Failing row contains (...)" line (row column values). We keep the
+    # stack FRAMES + a value-free "Type: first-line" tail, dropping the value dump.
+    _reset_activity_logger()
+    path = tmp_path / "activity_debug.log"
+
+    try:
+        raise ValueError(
+            'duplicate key value violates unique constraint "users_email_key"\n'
+            "DETAIL:  Key (email)=(alice@example.com) already exists, "
+            "Failing row contains (1, alice@example.com, secrettoken123)."
+        )
+    except ValueError as exc:
+        captured = exc
+
+    configure_activity_file_log(path, level=logging.DEBUG)
+    log_activity(
+        ActivityCategory.FULL_LOAD,
+        "load table",
+        status=ActivityStatus.FAILURE,
+        target="app.users",
+        detail="UniqueViolation",
+        exc=captured,
+    )
+    obj = json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
+    trace = obj["stacktrace"]
+    # The actionable primary line survives; the row values do not.
+    assert 'unique constraint "users_email_key"' in trace
+    assert "Traceback" in trace  # still a readable traceback
+    assert "alice@example.com" not in trace
+    assert "secrettoken123" not in trace
+    assert "Failing row" not in trace and "DETAIL" not in trace
+
+
 def test_render_activity_text_passes_through_non_json_lines() -> None:
     out = render_activity_text(b"not json\n")
     assert out == b"not json\n"
