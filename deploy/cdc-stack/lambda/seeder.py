@@ -272,13 +272,31 @@ def _read_existing_offset(bootstrap, region, topic, key_json):
     return latest
 
 
+def _binlog_seq(file_name):
+    """Return the integer sequence in a binlog file name ('mysql-bin.000123' -> 123).
+
+    MySQL binlog names are ``basename.NNNNNN`` and the numeric suffix is monotonic,
+    but it GROWS in width at rollover (``.999999`` -> ``.1000000``). A lexicographic
+    compare is therefore wrong across the width change ('1000000' < '999999'), which
+    made the no-clobber guard mis-classify an ADVANCED connector as behind and rewind
+    it. Comparing the parsed integer is correct across the rollover. Returns ``None``
+    when the suffix is not a plain integer (unexpected name), so the caller can fall
+    back to a lexicographic compare rather than crash.
+    """
+    if not file_name or "." not in file_name:
+        return None
+    suffix = file_name.rsplit(".", 1)[-1]
+    return int(suffix) if suffix.isdigit() else None
+
+
 def _offset_already_at_or_past(existing, wm):
     """True when the connector's live offset is already at/past the watermark.
 
-    Compares the same binlog file (lexicographic, since rotated binlog file names
-    are zero-padded and monotonic) and position. When the files differ, the larger
-    file name is later. Skipping the seed in this case is the no-clobber guard: a
-    legitimately-advanced connector must never be rewound by a re-deploy.
+    Compares the binlog file by its NUMERIC sequence (not lexicographically -- the
+    suffix widens at the .999999 -> .1000000 rollover, where a string compare
+    inverts) and, within the same file, by position. Skipping the seed here is the
+    no-clobber guard: a legitimately-advanced connector must never be rewound by a
+    re-deploy.
     """
     if not existing:
         return False
@@ -288,6 +306,11 @@ def _offset_already_at_or_past(existing, wm):
         return False
     wm_file, wm_pos = wm["file"], int(wm["pos"])
     if cur_file != wm_file:
+        cur_seq, wm_seq = _binlog_seq(cur_file), _binlog_seq(wm_file)
+        if cur_seq is not None and wm_seq is not None:
+            return cur_seq > wm_seq
+        # Unparseable suffix (unexpected name): fall back to the old lexicographic
+        # compare rather than guess -- still correct while both files are same-width.
         return cur_file > wm_file
     return int(cur_pos) >= wm_pos
 

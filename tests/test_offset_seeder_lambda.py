@@ -316,9 +316,30 @@ def test_offset_compare_same_file_higher_pos_is_past(seeder_env) -> None:
 def test_offset_compare_later_file_is_past(seeder_env) -> None:
     module, _ = seeder_env
     wm = {"file": "mysql-bin.000042", "pos": 100}
-    # A later (lexicographically greater) binlog file is past, regardless of pos.
+    # A later binlog file is past, regardless of pos.
     assert module._offset_already_at_or_past({"file": "mysql-bin.000099", "pos": 1}, wm)
     assert not module._offset_already_at_or_past({"file": "mysql-bin.000001", "pos": 999}, wm)
+
+
+def test_offset_compare_survives_the_binlog_width_rollover(seeder_env) -> None:
+    # Audit C9: at the .999999 -> .1000000 rollover the suffix WIDENS, so a
+    # lexicographic compare inverts ('1000000' < '999999') and would rewind an
+    # advanced connector. The numeric-sequence compare must classify .1000000 as
+    # LATER than .999999.
+    module, _ = seeder_env
+    wm = {"file": "mysql-bin.999999", "pos": 500}
+    # Connector genuinely advanced across the rollover -> at/past, must NOT re-seed.
+    assert module._offset_already_at_or_past({"file": "mysql-bin.1000000", "pos": 1}, wm)
+    assert module._offset_already_at_or_past({"file": "mysql-bin.1000042", "pos": 1}, wm)
+    # And the reverse: a connector still on the pre-rollover file is behind a
+    # post-rollover watermark.
+    wm2 = {"file": "mysql-bin.1000000", "pos": 10}
+    assert not module._offset_already_at_or_past({"file": "mysql-bin.999999", "pos": 999}, wm2)
+    # _binlog_seq parses the numeric suffix; a non-numeric suffix -> None (lexicographic
+    # fallback, never a crash).
+    assert module._binlog_seq("mysql-bin.1000000") == 1000000
+    assert module._binlog_seq("mysql-bin.000042") == 42
+    assert module._binlog_seq("weird-name") is None
 
 
 # --------------------------------------------------------------------------- #

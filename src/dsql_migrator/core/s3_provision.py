@@ -51,6 +51,13 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v23 rebuilds the offset-seeder Lambda zip: the no-clobber offset guard
+#    (_offset_already_at_or_past) compared binlog file names LEXICOGRAPHICALLY, which
+#    inverts at the .999999 -> .1000000 rollover ('1000000' < '999999'), so a
+#    genuinely-advanced connector was mis-classified as behind and REWOUND on a
+#    re-deploy. It now compares the parsed numeric binlog sequence (falling back to
+#    lexicographic only for an unparseable suffix). Seeder-zip change only; neither
+#    connector plugin changed.
 # v22 rebuilds the DSQL sink jar: the per-table CloudWatch monitor now emits a
 #    change BREAKDOWN -- InsertsApplied / UpdatesApplied / DeletesApplied (COUNT per
 #    Stack+Table) -- instead of the single NetRowsApplied. Critically it counts
@@ -195,7 +202,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v22"
+PLUGIN_VERSION = "v23"
 
 
 class S3ProvisionError(RuntimeError):

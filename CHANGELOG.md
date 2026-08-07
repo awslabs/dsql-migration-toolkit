@@ -5,6 +5,30 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.280
+
+### Fixed
+
+- **The CDC offset-seeder no longer rewinds an advanced connector at the binlog
+  filename rollover (audit finding C9).** The no-clobber guard that skips re-seeding a
+  connector already at/past the watermark compared binlog file names
+  *lexicographically*. MySQL binlog suffixes are zero-padded but WIDEN at rollover
+  (`mysql-bin.999999` → `mysql-bin.1000000`), where a string compare inverts
+  (`'1000000' < '999999'`) — so a genuinely-advanced connector was mis-classified as
+  behind and rewound on a re-deploy, replaying already-streamed changes. The guard now
+  compares the parsed numeric binlog sequence (falling back to lexicographic only for an
+  unparseable suffix). The offset-seeder Lambda zip is rebuilt and `PLUGIN_VERSION` is
+  bumped to `v23` accordingly (a `PLUGIN_VERSION` bump requires a Delete + redeploy of
+  CDC infrastructure to take effect).
+
+### Notes
+
+- Audit finding C10 (composite-key re-keying could duplicate a row if the leading
+  column is mutated) needed no code change: the composite-key strategy already emits a
+  UNIQUE index on the original primary key, so a mutating update surfaces as a
+  unique-violation / DLQ event rather than a silent duplicate, and the immutability
+  requirement is already warned at opt-in time.
+
 ## v0.1.279
 
 ### Fixed

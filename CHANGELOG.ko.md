@@ -5,6 +5,24 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.280
+
+### 수정
+
+- **CDC offset-seeder가 binlog 파일명 롤오버에서 전진한 커넥터를 되감지 않습니다(감사 C9).** 이미
+  워터마크 이상으로 전진한 커넥터의 재-seed를 건너뛰는 no-clobber 가드가 binlog 파일명을 사전식으로
+  비교했습니다. MySQL binlog suffix는 zero-pad이지만 롤오버 시 자릿수가 늘어(`mysql-bin.999999` →
+  `mysql-bin.1000000`), 여기서 문자열 비교가 뒤집혀(`'1000000' < '999999'`) 전진한 커넥터를 뒤처진
+  것으로 오판해 재배포 시 되감아 이미 스트리밍한 변경을 재생했습니다. 이제 파싱된 숫자 binlog 시퀀스로
+  비교합니다(파싱 불가 suffix만 사전식 fallback). offset-seeder Lambda zip을 재빌드하고 `PLUGIN_VERSION`
+  을 `v23`으로 bump했습니다(`PLUGIN_VERSION` bump은 CDC 인프라 Delete + 재배포가 있어야 반영됨).
+
+### 비고
+
+- 감사 C10(composite-key re-keying이 leading 컬럼 변경 시 행 중복 가능)은 코드 변경 불필요: composite-key
+  전략이 이미 원본 PK에 UNIQUE 인덱스를 발행하므로, 변경 UPDATE는 조용한 중복이 아니라 unique-violation /
+  DLQ 이벤트로 표면화되고, immutability 요건은 opt-in 시점에 이미 경고됨.
+
 ## v0.1.279
 
 ### 수정
