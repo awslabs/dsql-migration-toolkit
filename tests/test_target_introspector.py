@@ -830,6 +830,59 @@ def test_sync_identity_sequences_skips_tables_without_an_identity_column() -> No
     assert not any("MAX(" in stmt for stmt in conn.executed)
 
 
+class _RestartFailsCursor(_SeqCursor):
+    """A cursor whose RESTART WITH raises (simulates a 40001 / token-expiry DDL)."""
+
+    def execute(self, statement: object, parameters: object = None) -> None:
+        text = statement if isinstance(statement, str) else statement.as_string(None)
+        if "RESTART WITH" in text:
+            raise RuntimeError("OC001: schema updated by another transaction")
+        super().execute(statement, parameters)
+
+
+class _RestartFailsConnection(_SeqConnection):
+    def cursor(self) -> _RestartFailsCursor:
+        return _RestartFailsCursor(self)
+
+
+def test_sync_identity_sequences_reports_a_failed_restart_as_a_string() -> None:
+    """A failed RESTART WITH must be a STRING reason, distinct from a None no-op.
+
+    The DDL runs under DSQL OCC (can raise 40001 / concurrent-DDL) and the IAM token
+    can expire mid-session. Swallowing that as None (indistinguishable from "no
+    identity column") is a silent post-cut-over duplicate-key outage (audit D2).
+    """
+    from dsql_migrator.core.target_introspector import (
+        partition_identity_sync,
+        sync_identity_sequences,
+    )
+
+    conn = _RestartFailsConnection(identity_by_table={"orders": "id"}, max_pk=742)
+    out = sync_identity_sequences(
+        ["ecommerce.orders"], connection_factory=lambda: conn
+    )
+    reason = out["ecommerce.orders"]
+    assert isinstance(reason, str)  # NOT None -> the failure is visible
+    assert "OC001" in reason or "RuntimeError" in reason
+    # And it must not leak row values / be multi-line.
+    assert "\n" not in reason
+
+    advanced, failed = partition_identity_sync(out)
+    assert advanced == {}
+    assert failed == {"ecommerce.orders": reason}
+
+
+def test_partition_identity_sync_splits_int_str_none() -> None:
+    from dsql_migrator.core.target_introspector import partition_identity_sync
+
+    advanced, failed = partition_identity_sync(
+        {"a": 10, "b": None, "c": "OperationalError: boom"}
+    )
+    assert advanced == {"a": 10}
+    assert failed == {"c": "OperationalError: boom"}
+    assert "b" not in advanced and "b" not in failed  # None no-op dropped
+
+
 def test_sync_identity_sequences_leaves_an_empty_table_alone() -> None:
     """An empty table's sequence is already correct at its start.
 

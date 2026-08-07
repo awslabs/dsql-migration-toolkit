@@ -1478,28 +1478,32 @@ def test_validation_run_resyncs_identity_sequences_and_records_outcome() -> None
     assert advanced == {"orders": 1501, "order_items": 1502}
 
 
-def test_resync_identity_sequences_drops_non_identity_and_never_raises() -> None:
+def test_resync_identity_sequences_partitions_advanced_failed_and_never_raises() -> None:
     from dsql_migrator.ui.validation import resync_identity_sequences
 
     target = TargetConnectionConfig(
         cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"
     )
 
-    # Non-identity tables (None) are dropped; only advanced tables remain.
+    # Returns (advanced, failed): int -> advanced, str -> failed, None -> dropped.
+    # A FAILED RESTART WITH (str) must be surfaced separately, never mistaken for a
+    # no-op (audit finding D2).
     def _sync(names, *, connection_factory):
-        return {"a": 10, "b": None}
+        return {"a": 10, "b": None, "c": "OperationalError: OCC conflict"}
 
-    assert resync_identity_sequences(target, ["a", "b"], sync=_sync) == {"a": 10}
+    advanced, failed = resync_identity_sequences(target, ["a", "b", "c"], sync=_sync)
+    assert advanced == {"a": 10}
+    assert failed == {"c": "OperationalError: OCC conflict"}
 
     # A sync that raises must NOT propagate (a completed comparison is not failed by
-    # this follow-up): it returns an empty dict instead.
+    # this follow-up): it returns empty advanced + empty failed.
     def _boom(names, *, connection_factory):
         raise RuntimeError("connection refused")
 
-    assert resync_identity_sequences(target, ["a"], sync=_boom) == {}
+    assert resync_identity_sequences(target, ["a"], sync=_boom) == ({}, {})
 
     # No tables -> no work, no connection attempt.
-    assert resync_identity_sequences(target, [], sync=_boom) == {}
+    assert resync_identity_sequences(target, [], sync=_boom) == ({}, {})
 
 
 def test_render_result_shows_identity_sync_notice_only_when_advanced() -> None:
@@ -1912,6 +1916,49 @@ def test_run_cutover_identity_sync_records_empty_when_nothing_to_advance() -> No
     # A ran-with-nothing-to-do result is {} (distinct from None = not run), so the button
     # can show "done, nothing to advance".
     assert state.cutover_identity_sync == {}
+
+
+def test_run_cutover_identity_sync_records_a_failed_restart_as_failed() -> None:
+    # A failed RESTART WITH must land in cutover_identity_sync_failed (surfaced as an
+    # error), NOT be swallowed as "nothing to advance" (audit finding D2).
+    from dsql_migrator.core.models import TargetConnectionConfig
+    from dsql_migrator.ui.validation import ValidationState, _run_cutover_identity_sync
+
+    def _sync(table_names, *, connection_factory):
+        # int advanced + str failure, mixed.
+        return {"order_items": 1505, "orders": "OperationalError: OCC conflict"}
+
+    session = _CutoverSyncSession(
+        TargetConnectionConfig(
+            cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"
+        )
+    )
+    state = ValidationState()
+    _run_cutover_identity_sync(
+        session, state, _cutover_sync_report("order_items", "orders"), sync=_sync
+    )
+    assert state.cutover_identity_sync == {"order_items": 1505}
+    assert state.cutover_identity_sync_failed == {
+        "orders": "OperationalError: OCC conflict"
+    }
+
+
+def test_cutover_section_renders_error_when_a_sync_failed() -> None:
+    # The runbook must NOT paint a failed sync as "done": a failed RESTART renders an
+    # error notice (do-not-cut-over), never the green success line (audit finding D2).
+    import inspect
+
+    from dsql_migrator.ui import validation as val
+
+    src = inspect.getsource(val._render_cutover_section)
+    # The success "no key needed advancing" line is now gated on there being NO failures.
+    assert "elif not identity_sync_failed:" in src
+    # And a failed sync renders an error notice with a do-not-cut-over header.
+    assert "do not cut over yet" in src
+    assert 'tone="error"' in src
+    # The screen threads the failed map into the render.
+    module_src = inspect.getsource(val)
+    assert "identity_sync_failed=validation_state.cutover_identity_sync_failed" in module_src
 
 
 def test_run_cutover_identity_sync_noops_without_target_or_tables() -> None:

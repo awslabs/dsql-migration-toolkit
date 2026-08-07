@@ -279,10 +279,11 @@ def _sync_identity_sequences_after_load(
             # the load itself succeeded.
             status=ActivityStatus.FAILURE,
             detail=(
-                f"Could not advance target identity sequences: {exc}. If any target "
-                "table uses an identity primary key, run "
-                "ALTER TABLE <t> ALTER COLUMN <pk> RESTART WITH <max(pk)+1> before "
-                "cut-over, or the application's first insert will hit a duplicate key."
+                f"Could not advance target identity sequences: "
+                f"{safe_error_message(exc)}. If any target table uses an identity "
+                "primary key, run ALTER TABLE <t> ALTER COLUMN <pk> RESTART WITH "
+                "<max(pk)+1> before cut-over, or the application's first insert will "
+                "hit a duplicate key."
             ),
         )
         return {}
@@ -1721,8 +1722,15 @@ def _log_identity_sequence_sync(
 
 
 def _log_identity_sequence_sync_outcome(synced: "Mapping[str, object]") -> None:
-    """Record the identity-sequence sync result in the activity log (advanced tables)."""
-    advanced = {name: value for name, value in synced.items() if value is not None}
+    """Record the identity-sequence sync result in the activity log.
+
+    Partitions the raw result: advanced (int) tables are logged as SUCCESS; FAILED
+    (str) tables are logged as FAILURE so a swallowed RESTART WITH is never silent
+    (audit finding D2). ``None`` no-ops are omitted.
+    """
+    from dsql_migrator.core.target_introspector import partition_identity_sync
+
+    advanced, failed = partition_identity_sync(synced)
     if advanced:
         detail = ", ".join(
             f"{name} -> RESTART WITH {value}" for name, value in sorted(advanced.items())
@@ -1735,6 +1743,20 @@ def _log_identity_sequence_sync_outcome(synced: "Mapping[str, object]") -> None:
                 f"{len(advanced)} identity primary key(s) advanced past the loaded "
                 f"rows so the application's first insert after cut-over cannot collide: "
                 f"{detail}"
+            ),
+        )
+    if failed:
+        fdetail = ", ".join(
+            f"{name}: {reason}" for name, reason in sorted(failed.items())
+        )
+        log_activity(
+            ActivityCategory.FULL_LOAD,
+            "identity sequence sync failed",
+            status=ActivityStatus.FAILURE,
+            detail=(
+                f"{len(failed)} identity sequence(s) could NOT be advanced past the "
+                f"loaded rows; the application's first insert after cut-over may "
+                f"collide — advance them manually before cut-over: {fdetail}"
             ),
         )
 
@@ -1776,9 +1798,9 @@ def sync_identity_sequences_for_tables(
             status=ActivityStatus.FAILURE,
             detail=(
                 f"Could not advance target identity sequences after accepting the gap: "
-                f"{exc}. If any target table uses an identity primary key, run "
-                "ALTER TABLE <t> ALTER COLUMN <pk> RESTART WITH <max(pk)+1> before "
-                "cut-over, or re-run Validation to sync them."
+                f"{safe_error_message(exc)}. If any target table uses an identity "
+                "primary key, run ALTER TABLE <t> ALTER COLUMN <pk> RESTART WITH "
+                "<max(pk)+1> before cut-over, or re-run Validation to sync them."
             ),
         )
         return {}

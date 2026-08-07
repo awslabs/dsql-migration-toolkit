@@ -292,14 +292,18 @@ def resync_identity_sequences(
     surfaces post-cut-over), so re-running the idempotent ``RESTART WITH max+1`` here,
     where the tool knows the target and the load has settled, closes it.
 
-    Returns ``{table: restart_value}`` for the identity tables actually advanced
-    (empty when none are identity / all already correct). Never raises: this is a
-    follow-up to a completed comparison and must not turn a good report into an error;
-    a failure is left for the caller to surface. ``sync`` is an injectable seam
-    (tests pass a fake; production uses the introspector over a DSQL connection).
+    Returns ``(advanced, failed)``: ``advanced`` = ``{table: restart_value}`` for the
+    identity tables actually advanced (empty when none are identity / all already
+    correct); ``failed`` = ``{table: reason}`` for tables whose ``RESTART WITH`` errored
+    (empty when none did). Never raises: this is a follow-up to a completed comparison
+    and must not turn a good report into an error -- but a FAILED sync must be surfaced
+    by the caller (a swallowed one is a silent post-cut-over duplicate-key outage, audit
+    finding D2), which the separate ``failed`` map makes possible. ``sync`` is an
+    injectable seam (tests pass a fake; production uses the introspector over a DSQL
+    connection).
     """
     if not table_names:
-        return {}
+        return {}, {}
     try:
         if sync is None:
             from dsql_migrator.core.target_introspector import (
@@ -312,10 +316,12 @@ def resync_identity_sequences(
 
         result = sync(list(table_names), connection_factory=_factory) or {}
     except Exception:  # noqa: BLE001 - never fail a completed validation on this
-        return {}
-    # Keep only the tables actually advanced (identity columns with rows); a
-    # non-identity table yields None and is dropped so the UI reports only real work.
-    return {name: value for name, value in result.items() if value is not None}
+        return {}, {}
+    # Split advanced (int) from failed (str); None no-ops (no identity column / empty /
+    # unreadable) belong to neither. This is the one place the raw result is classified.
+    from dsql_migrator.core.target_introspector import partition_identity_sync
+
+    return partition_identity_sync(result)
 
 
 def _connection_prerequisite_notices(
@@ -1203,11 +1209,21 @@ class ValidationState:
         # cut-over render to show the outcome. Lock-guarded for the cross-thread handoff;
         # cleared by a fresh validation run (a new verdict is a new pre-cut-over state).
         self._cutover_identity_sync: Optional[dict[str, int]] = None
+        # Tables whose RESTART WITH FAILED on the last cut-over sync (table -> reason).
+        # Distinct from the advanced dict so a failed ALTER is surfaced as an error
+        # instead of being painted as "nothing to advance" (audit finding D2). None
+        # until the button runs; then a dict (empty == every table advanced/no-op'd).
+        self._cutover_identity_sync_failed: Optional[dict[str, str]] = None
 
-    def set_cutover_identity_sync(self, advanced: "Optional[dict[str, int]]") -> None:
-        """Record the cut-over identity-sync button's outcome (see ``cutover_identity_sync``)."""
+    def set_cutover_identity_sync(
+        self,
+        advanced: "Optional[dict[str, int]]",
+        failed: "Optional[dict[str, str]]" = None,
+    ) -> None:
+        """Record the cut-over identity-sync button's outcome (advanced + any failures)."""
         with self._lock:
             self._cutover_identity_sync = advanced
+            self._cutover_identity_sync_failed = failed
 
     @property
     def cutover_identity_sync(self) -> "Optional[dict[str, int]]":
@@ -1218,6 +1234,12 @@ class ValidationState:
                 if self._cutover_identity_sync is not None
                 else None
             )
+
+    @property
+    def cutover_identity_sync_failed(self) -> "dict[str, str]":
+        """Tables whose RESTART WITH failed on the last cut-over sync (empty if none)."""
+        with self._lock:
+            return dict(self._cutover_identity_sync_failed or {})
 
     def mark_run_started(self) -> None:
         """Stamp the start of a run (clears any prior elapsed time)."""
@@ -1692,7 +1714,7 @@ def build_validation_screen(
             # step just before cut-over (after CDC drains), so closing it here is the
             # right moment. Read-only comparison stays read-only; this is a separate,
             # reported target write that never fails the report.
-            advanced = resync_identity_sequences(
+            advanced, failed = resync_identity_sequences(
                 target_config,
                 [table.name for table in scoped_tables],
                 aws_profile=session.aws_profile,
@@ -1712,6 +1734,23 @@ def build_validation_screen(
                         f"{len(advanced)} identity primary key(s) advanced past the "
                         f"current target rows so the application's first insert after "
                         f"cut-over cannot collide: {detail}"
+                    ),
+                )
+            if failed:
+                # A failed RESTART WITH is a post-cut-over duplicate-key risk, so log it
+                # as an ERROR (never swallowed / painted as success). Reasons are
+                # value-free (Property 7).
+                fdetail = ", ".join(
+                    f"{name}: {reason}" for name, reason in sorted(failed.items())
+                )
+                log_activity(
+                    ActivityCategory.VALIDATION,
+                    "identity sequence sync failed",
+                    status=ActivityStatus.FAILURE,
+                    detail=(
+                        f"{len(failed)} identity sequence(s) could NOT be advanced; the "
+                        f"application's first insert after cut-over may collide — retry "
+                        f"the sync or advance them manually: {fdetail}"
                     ),
                 )
 
@@ -2182,7 +2221,7 @@ def _run_cutover_identity_sync(
     aws_profile = getattr(session, "aws_profile", None)
 
     def _work(_handle: object = None) -> None:
-        advanced = resync_identity_sequences(
+        advanced, failed = resync_identity_sequences(
             target_config, table_names, aws_profile=aws_profile, sync=sync
         )
         if advanced:
@@ -2200,7 +2239,24 @@ def _run_cutover_identity_sync(
                     f"after cut-over cannot collide: {detail}"
                 ),
             )
-        validation_state.set_cutover_identity_sync(advanced)
+        if failed:
+            # Surface a failed RESTART WITH as an ERROR — the cut-over runbook renders it
+            # so the operator cannot repoint the app believing the sequences are safe
+            # (audit finding D2). Reasons are value-free (Property 7).
+            fdetail = ", ".join(
+                f"{name}: {reason}" for name, reason in sorted(failed.items())
+            )
+            log_activity(
+                ActivityCategory.VALIDATION,
+                "identity sequence sync failed (cut-over)",
+                status=ActivityStatus.FAILURE,
+                detail=(
+                    f"{len(failed)} identity sequence(s) could NOT be advanced before "
+                    f"cut-over; the application's first insert may collide — retry the "
+                    f"sync or advance them manually before repointing: {fdetail}"
+                ),
+            )
+        validation_state.set_cutover_identity_sync(advanced, failed)
         if refresh is not None:
             refresh()
 
@@ -2383,6 +2439,7 @@ def build_cutover_screen(
             cdc_in_use=_cdc_in_use(session),
             identity_sync_provider=_identity_sync_provider,
             identity_sync_result=validation_state.cutover_identity_sync,
+            identity_sync_failed=validation_state.cutover_identity_sync_failed,
         )
 
         done = get_status(session.workflow, WorkflowStep.CUT_OVER) is StepStatus.DONE
@@ -3456,6 +3513,7 @@ def _render_cutover_section(
     cdc_in_use: bool = False,
     identity_sync_provider: "Optional[Callable[[], None]]" = None,
     identity_sync_result: "Optional[dict[str, int]]" = None,
+    identity_sync_failed: "Optional[dict[str, str]]" = None,
 ) -> None:
     """Render the go-path cut-over runbook as its OWN titled section card.
 
@@ -3585,12 +3643,38 @@ def _render_cutover_section(
                                 f"{advanced}.",
                                 tone="success",
                             )
-                        else:
+                        elif not identity_sync_failed:
+                            # Genuinely nothing to advance (no server-generated keys, or
+                            # all already correct) AND nothing failed -> the reassuring
+                            # success line. Only reachable when the sync had no failures.
                             inline_hint(
                                 ui,
                                 "Done — no server-generated key needed advancing.",
                                 tone="success",
                             )
+                # A FAILED RESTART WITH must never read as done: surface it as an ERROR
+                # so the operator does not repoint the app onto lagging sequences (the
+                # app's first insert would collide, 23505). Audit finding D2 — this used
+                # to be swallowed and painted as the success line above.
+                if identity_sync_failed:
+                    failed_detail = "; ".join(
+                        f"{name} ({reason})"
+                        for name, reason in sorted(identity_sync_failed.items())
+                    )
+                    render_notice(
+                        ui,
+                        tone="error",
+                        header="Identity sequence sync failed — do not cut over yet",
+                        body=(
+                            f"{len(identity_sync_failed)} identity sequence(s) could "
+                            "NOT be advanced past the migrated rows, so your "
+                            "application's first insert after cut-over may hit a "
+                            "duplicate key. Retry the sync (it is idempotent); if it "
+                            "keeps failing, advance the sequence(s) manually with "
+                            "ALTER TABLE … ALTER COLUMN … RESTART WITH before "
+                            f"repointing. Affected: {failed_detail}."
+                        ),
+                    )
 
         # Rollback caveat: once the app writes to DSQL, those rows exist only there
         # (this tool does not replicate DSQL -> MySQL), so keep the source as a
