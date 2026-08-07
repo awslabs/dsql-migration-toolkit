@@ -710,6 +710,24 @@ def map_data_type(data_type: exp.DataType) -> Optional[_Mapping]:
         # Lossless value mapping; values are treated as UTC.
         return _Mapping(target=_build("timestamp"))
 
+    if kind is _DType.TIME:
+        # MySQL TIME is a DURATION spanning -838:59:59..838:59:59, but PostgreSQL/DSQL
+        # `time` is a time-of-day in 00:00:00..24:00:00. The DDL converts cleanly, but a
+        # value outside [0, 24h) has NO `time` representation and fails PER ROW during
+        # Full Load (ValueConversionError) -- so warn up front (matching the ENUM/BIT/
+        # YEAR pattern) instead of surfacing only mid-load on the offending row.
+        return _Mapping(
+            target=data_type,
+            message=(
+                "MySQL TIME is a duration (-838:59:59..838:59:59); Aurora DSQL 'time' is "
+                "a time-of-day (00:00:00..24:00:00). In-range values convert cleanly, but "
+                "any value outside that range has no 'time' representation and fails per "
+                "row during Full Load. If this column stores durations, remap it to "
+                "interval or text (the converted DDL is editable) before loading."
+            ),
+            classification=Classification.MANUAL,
+        )
+
     if kind in _BLOB_TYPES:
         return _Mapping(target=_build("bytea"))
 
@@ -1166,9 +1184,21 @@ def _column_default_sql(
         if canonical in {v.replace(" ", "") for v in _PASSTHROUGH_EXPRESSION_DEFAULTS} or (
             canonical.startswith("CURRENT_TIMESTAMP(") or canonical.startswith("NOW(")
         ):
-            # A no-timezone target must not inherit the session TimeZone: the loader
-            # normalizes migrated rows to naive UTC, so the default has to agree.
-            if target.startswith("timestamp") and "with time zone" not in target:
+            # A no-timezone target (MySQL DATETIME -> `timestamp`) must not inherit the
+            # session TimeZone: the loader normalizes migrated rows to naive UTC, so the
+            # default is the naive-UTC wall-clock `now() AT TIME ZONE 'UTC'`.
+            #
+            # A timestamptz target (MySQL TIMESTAMP) must NOT get that: `now() AT TIME
+            # ZONE 'UTC'` is a naive value, which a timestamptz column re-interprets in
+            # the session TimeZone -- shifting a defaulted insert by the offset. It wants
+            # plain CURRENT_TIMESTAMP/now() (an instant). The guard must therefore fire
+            # ONLY for the naive `timestamp`/`timestamp(n)` target, never `timestamptz`
+            # or `timestamp with time zone`.
+            is_naive_timestamp = (
+                target == "timestamp"
+                or target.startswith("timestamp(")
+            ) and "tz" not in target and "with time zone" not in target
+            if is_naive_timestamp:
                 return "(now() AT TIME ZONE 'UTC')", None
             return expression, None
         translated = _TRANSLATED_EXPRESSION_DEFAULTS.get(
@@ -1996,7 +2026,9 @@ def _too_many_columns_warning(table: TableDef) -> Optional[ConversionWarning]:
     )
 
 
-def _too_many_indexes_warning(table: TableDef) -> Optional[ConversionWarning]:
+def _too_many_indexes_warning(
+    table: TableDef, extra_secondary_indexes: int = 0
+) -> Optional[ConversionWarning]:
     """Warn when the table's secondary indexes exceed DSQL's per-table budget.
 
     DSQL allows 24 indexes per table and the PRIMARY KEY counts toward that budget
@@ -2004,8 +2036,14 @@ def _too_many_indexes_warning(table: TableDef) -> Optional[ConversionWarning]:
     indexes. Past that the ``CREATE INDEX ASYNC`` statements fail with error 54000 -- and
     because indexes are applied AFTER the table, the table itself succeeds first, leaving a
     partially-indexed target. Nothing on the conversion screen said so.
+
+    ``extra_secondary_indexes`` counts index(es) the CONVERSION adds beyond the source's
+    own -- notably the 1 UNIQUE index the COMPOSITE_KEY strategy emits to preserve the
+    original key's uniqueness. Omitting it undercounted by one, so a table with exactly
+    23 source indexes converted with COMPOSITE_KEY produced 25 total (> 24) yet passed
+    this gate silently and failed the extra CREATE INDEX ASYNC after the load.
     """
-    count = len(table.indexes)
+    count = len(table.indexes) + extra_secondary_indexes
     if count <= _MAX_SECONDARY_INDEXES_PER_TABLE:
         return None
     return ConversionWarning(
@@ -2414,7 +2452,7 @@ class SchemaConverter:
             _unsupported_index_type_warning(table),
             _prefix_index_warning(table),
             _too_many_columns_warning(table),
-            _too_many_indexes_warning(table),
+            _too_many_indexes_warning(table, len(extra_index_ddls)),
             _oversized_lob_warning(table),
             _generated_column_warning(table),
             _collation_warning(table),

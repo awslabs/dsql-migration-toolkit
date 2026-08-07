@@ -5,6 +5,31 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.281
+
+### Fixed
+
+- **Schema-conversion accuracy fixes (audit findings C11, U1, U2, U3).**
+  - *C11 — `TIMESTAMP DEFAULT CURRENT_TIMESTAMP` timezone.* A MySQL `TIMESTAMP` maps to
+    DSQL `timestamptz`, but the `CURRENT_TIMESTAMP` default was wrapped as
+    `now() AT TIME ZONE 'UTC'` — a naive value a `timestamptz` column re-interprets in
+    the session TimeZone, shifting a defaulted insert by the session's UTC offset. The
+    naive-UTC wrapper now applies ONLY to the DATETIME → plain `timestamp` target;
+    `timestamptz` keeps the plain instant.
+  - *U1 — `TINYINT(1) UNSIGNED` mislabelled.* Evaluation flagged it as "mapped to
+    boolean" (warning of a 0/1-load failure that never happens), but the converter maps
+    it to `smallint`. The assessor now excludes the unsigned form, matching the
+    converter.
+  - *U2 — `TIME` range.* MySQL `TIME` is a duration (−838:59:59..838:59:59); DSQL `time`
+    is a time-of-day. An out-of-range value failed per-row mid-load with no earlier
+    signal. Schema Conversion now warns up front (remap to interval/text if the column
+    stores durations), matching the ENUM/BIT/YEAR pattern.
+  - *U3 — 24-index cap off by one under COMPOSITE_KEY.* The per-table index-limit warning
+    ignored the extra UNIQUE index the COMPOSITE_KEY strategy adds, so a table with 23
+    source indexes converted with a composite key produced 25 indexes (> DSQL's 24) yet
+    passed the pre-apply check and failed the extra `CREATE INDEX ASYNC` after the load.
+    The warning now counts the conversion-added index.
+
 ## v0.1.280
 
 ### Fixed

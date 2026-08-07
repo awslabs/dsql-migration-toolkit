@@ -5,6 +5,27 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.281
+
+### 修正
+
+- **スキーマ変換の正確性修正(監査 C11, U1, U2, U3)。**
+  - *C11 — `TIMESTAMP DEFAULT CURRENT_TIMESTAMP` のタイムゾーン.* MySQL `TIMESTAMP` は DSQL
+    `timestamptz` にマッピングされますが、`CURRENT_TIMESTAMP` の既定値が `now() AT TIME ZONE 'UTC'`
+    (naive)で包まれ、timestamptz 列がセッション TimeZone で再解釈して、既定値による挿入がオフセット分
+    ずれていました。naive-UTC ラッパーは今後 DATETIME → plain `timestamp` ターゲットにのみ適用し、
+    timestamptz は素の instant を保ちます。
+  - *U1 — `TINYINT(1) UNSIGNED` の誤ラベル.* Evaluation が「boolean にマッピング」と表示(発生しない
+    0/1 ロード失敗を警告)していましたが、変換器は `smallint` にマッピングします。assessor が unsigned
+    形を除外し、変換器と一致させました。
+  - *U2 — `TIME` の範囲.* MySQL `TIME` は継続時間(−838:59:59..838:59:59)、DSQL `time` は時刻です。
+    範囲外の値は事前シグナルなくロード中に行単位で失敗していました。Schema Conversion が事前に警告する
+    ようになりました(継続時間を格納する列は interval/text に再マッピング)。ENUM/BIT/YEAR と同じパターン。
+  - *U3 — COMPOSITE_KEY での 24 インデックス上限の off-by-one.* インデックス上限の警告が COMPOSITE_KEY
+    が追加する UNIQUE インデックスを無視していたため、ソースインデックス 23 個を composite key で変換すると
+    25 個(> 24)になるのに事前チェックを通過し、ロード後に追加の CREATE INDEX ASYNC が失敗していました。
+    変換で追加されるインデックスを数えるようにしました。
+
 ## v0.1.280
 
 ### 修正

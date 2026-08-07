@@ -171,6 +171,10 @@ _DECIMAL_PRECISION_RE = re.compile(r"\(\s*(\d+)")
 # small integer. Matches an explicit ``(1)`` display width only.
 _TINYINT_ONE_RE = re.compile(r"^\s*tinyint\s*\(\s*1\s*\)", re.IGNORECASE)
 
+# A trailing UNSIGNED attribute (also implied by ZEROFILL). Used to keep the boolean
+# convention for SIGNED tinyint(1) only -- tinyint(1) unsigned maps to smallint.
+_UNSIGNED_RE = re.compile(r"\b(unsigned|zerofill)\b", re.IGNORECASE)
+
 
 @dataclass(frozen=True)
 class ObjectKey:
@@ -216,8 +220,17 @@ def _is_case_insensitive_collation(collation: str | None) -> bool:
 
 
 def _is_tinyint_one(mysql_type: str) -> bool:
-    """Return ``True`` for ``TINYINT(1)`` (MySQL's boolean convention / BOOL)."""
-    return bool(_TINYINT_ONE_RE.match(mysql_type or ""))
+    """Return ``True`` for ``TINYINT(1)`` (MySQL's boolean convention / BOOL).
+
+    ``TINYINT(1) UNSIGNED`` is EXCLUDED to match the converter: an unsigned tinyint(1)
+    parses to UTINYINT and is range-widened to smallint (not boolean), so flagging it
+    as "mapped to boolean" would warn about a 0/1-load-failure that never happens and
+    misdescribe the real smallint mapping. Signed ``tinyint(1)`` is the boolean case.
+    """
+    text = mysql_type or ""
+    if _UNSIGNED_RE.search(text):
+        return False
+    return bool(_TINYINT_ONE_RE.match(text))
 
 
 # ---------------------------------------------------------------------------

@@ -1104,6 +1104,69 @@ def test_current_timestamp_default_is_preserved() -> None:
     assert "DEFAULT 'CURRENT_TIMESTAMP'" not in ddl
 
 
+def test_timestamp_default_on_timestamptz_target_keeps_the_instant(tmp_path=None) -> None:
+    # Audit C11: MySQL TIMESTAMP maps to timestamptz. CURRENT_TIMESTAMP there must stay a
+    # plain instant, NOT `now() AT TIME ZONE 'UTC'` (a naive value a timestamptz column
+    # re-interprets in the session TimeZone, shifting a defaulted insert). The naive-UTC
+    # form is only for the DATETIME -> plain `timestamp` target.
+    ddl = _convert_table(
+        _single_column_table(
+            "t", "TIMESTAMP", default="CURRENT_TIMESTAMP", default_is_expression=True
+        )
+    ).target_ddl
+    assert "TIMESTAMPTZ" in ddl.upper()
+    # timestamptz default must NOT carry the naive AT TIME ZONE 'UTC' wrapper.
+    assert "AT TIME ZONE 'UTC'" not in ddl
+    assert "CURRENT_TIMESTAMP" in ddl or "now()" in ddl
+
+
+def test_tinyint_one_unsigned_is_not_flagged_as_boolean_by_assessor() -> None:
+    # Audit U1: the assessor must agree with the converter -- tinyint(1) unsigned maps to
+    # smallint (UTINYINT), not boolean, so it must NOT be flagged as a boolean column.
+    from dsql_migrator.core.assessor import _is_tinyint_one
+
+    assert _is_tinyint_one("tinyint(1)") is True  # signed -> boolean convention
+    assert _is_tinyint_one("tinyint(1) unsigned") is False
+    assert _is_tinyint_one("tinyint(1) zerofill") is False
+    assert map_mysql_type("tinyint(1) unsigned")[0].lower() == "smallint"
+
+
+def test_time_column_warns_about_the_duration_range() -> None:
+    # Audit U2: MySQL TIME (-838:59:59..838:59:59) exceeds PG time-of-day; an out-of-range
+    # value fails per row during Full Load, so the conversion must warn up front.
+    for src in ("TIME", "TIME(6)"):
+        target, warning = map_mysql_type(src)
+        assert target.lower().startswith("time")
+        assert warning is not None and "duration" in warning.message.lower()
+
+
+def test_too_many_indexes_counts_the_composite_key_unique_index() -> None:
+    # Audit U3: the 24-index cap warning must count the extra UNIQUE index COMPOSITE_KEY
+    # adds. 23 source indexes + composite PK + 1 preservation index = 25 > 24, so it must
+    # warn even though len(table.indexes) alone is within the 23-secondary budget.
+    from dsql_migrator.core.converter import (
+        PrimaryKeyStrategy,
+        SchemaConvertOptions,
+        _too_many_indexes_warning,
+    )
+
+    table = TableDef(
+        name="wide",
+        columns=[
+            ColumnDef(name="id", mysql_type="INT", nullable=False),
+            ColumnDef(name="tenant", mysql_type="INT", nullable=False),
+        ],
+        primary_key=["id"],
+        indexes=[
+            IndexDef(name=f"ix_{i}", columns=["tenant"]) for i in range(23)
+        ],
+    )
+    # Without the composite extra index: 23 secondary -> within budget, no warning.
+    assert _too_many_indexes_warning(table, 0) is None
+    # With COMPOSITE_KEY's +1 unique index: 24 -> over the 23-secondary budget -> warn.
+    assert _too_many_indexes_warning(table, 1) is not None
+
+
 def test_tinyint_bool_default_becomes_a_boolean_literal() -> None:
     """`DEFAULT 1` on a BOOLEAN column is a hard error on DSQL.
 

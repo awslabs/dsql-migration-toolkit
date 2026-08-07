@@ -5,6 +5,24 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.281
+
+### 수정
+
+- **스키마 변환 정확성 수정(감사 C11, U1, U2, U3).**
+  - *C11 — `TIMESTAMP DEFAULT CURRENT_TIMESTAMP` 타임존.* MySQL `TIMESTAMP`는 DSQL `timestamptz`로
+    매핑되는데, `CURRENT_TIMESTAMP` 기본값이 `now() AT TIME ZONE 'UTC'`(naive)로 감싸져 timestamptz
+    컬럼에서 세션 TimeZone으로 재해석되어 defaulted insert가 offset만큼 이동했습니다. naive-UTC 래퍼는
+    이제 DATETIME → plain `timestamp` 타깃에만 적용; timestamptz는 plain instant 유지.
+  - *U1 — `TINYINT(1) UNSIGNED` 오표기.* Evaluation이 "boolean 매핑"으로 표시(발생하지 않는 0/1 로드
+    실패 경고)했으나 변환기는 `smallint`로 매핑. assessor가 이제 unsigned 형을 제외해 변환기와 일치.
+  - *U2 — `TIME` 범위.* MySQL `TIME`은 duration(−838:59:59..838:59:59), DSQL `time`은 time-of-day.
+    범위 초과 값이 사전 신호 없이 로드 중 행 단위로 실패했습니다. Schema Conversion이 이제 사전 경고
+    (duration 저장 시 interval/text로 remap), ENUM/BIT/YEAR 패턴과 일치.
+  - *U3 — COMPOSITE_KEY에서 24-index cap off-by-one.* 인덱스 한계 경고가 COMPOSITE_KEY가 추가하는
+    UNIQUE 인덱스를 무시해, 소스 인덱스 23개를 composite key로 변환하면 25개(> 24)인데도 사전 체크를
+    통과하고 로드 후 추가 CREATE INDEX ASYNC가 실패했습니다. 이제 변환-추가 인덱스를 계산에 포함.
+
 ## v0.1.280
 
 ### 수정
