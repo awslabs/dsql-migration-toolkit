@@ -5,6 +5,33 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.278
+
+### Fixed
+
+- **Validation soundness: several ways a "match" could be reported over non-identical
+  data are closed or disclosed (audit findings C1–C6, U4).**
+  - *Checksum token collisions (C4).* Each column value is now escaped (`~`→`~~`,
+    `|`→`~|`) before it is joined with the `|` separator, so a value containing `|` can
+    no longer shift a delimiter across a column boundary (`CONCAT_WS('|','a|','b')` and
+    `CONCAT_WS('|','a','|b')` both used to yield `a||b`). The NULL sentinel is now the
+    un-forgeable `~N` (a real escaped value can never produce it), closing the old
+    literal-`<NULL>`-vs-SQL-NULL collision. The escaping is byte-identical on both
+    engines and backslash-free (a backslash scheme diverged between MySQL and PG
+    before).
+  - *DATETIME timezone (C3).* The plain-`timestamp` (DATETIME) checksum term is now
+    rendered directly instead of via `AT TIME ZONE 'UTC'`, which is NOT a no-op on
+    `timestamp without time zone` (it converts through the session TimeZone and shifts
+    the wall-clock); `timestamptz` still uses it. The DSQL connection also pins
+    `TimeZone=UTC` so the comparison no longer depends on an unpinned session default.
+  - *Honest labels/disclosure (C5, C1/C2, C6, U4).* The readiness check is labelled
+    "Row counts match" in ROW_COUNT mode (it does not compare column values) and only
+    "Data identical" in CHECKSUM mode, which now also discloses that FLOAT/DOUBLE and
+    JSON columns are not value-compared. The PK-reconciliation check is renamed "No
+    missing or extra records" (it verifies the key set, not row-value equality), and the
+    composite/non-integer-PK footnote states "row count only" in ROW_COUNT mode instead
+    of overstating "count/checksum".
+
 ## v0.1.277
 
 ### Fixed

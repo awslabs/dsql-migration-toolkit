@@ -298,6 +298,14 @@ class DsqlConnector:
             password=token.reveal(),
             sslmode="require",
             autocommit=True,
+            # Pin the session TimeZone to UTC. Validation renders a DATETIME->timestamp
+            # column with to_char(... AT TIME ZONE 'UTC') / to_char(...), both of which
+            # depend on the session TimeZone; the source side is TZ-independent, so an
+            # unpinned non-UTC default here would make EVERY datetime column false-
+            # mismatch. DSQL's default happens to be UTC, but relying on an undocumented
+            # default is fragile -- pin it (mirrors the source introspector's
+            # SET time_zone='+00:00').
+            options="-c TimeZone=UTC",
             # Bound the TCP connect so an unreachable endpoint (wrong host, VPC the
             # tool can't egress to, security-group filtered) fails fast instead of
             # blocking the UI "Test connection" / prerequisite probe indefinitely on

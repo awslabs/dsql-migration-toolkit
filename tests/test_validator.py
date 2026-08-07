@@ -1003,11 +1003,18 @@ def _all_four_rendered(table: TableDef):
 def test_checksum_null_sentinel_is_backslash_free_and_identical() -> None:
     # The old '\0' sentinel parsed to a single NUL on MySQL but the two-char
     # string 0x5C30 on PG, so a NULL-bearing row hashed differently on each
-    # engine. The new '<NULL>' sentinel is backslash-free and identical text on
-    # both engines, and must appear (inside COALESCE) in ALL FOUR builders.
+    # engine. The sentinel '~N' is backslash-free and identical text on both
+    # engines, and must appear (inside COALESCE) in ALL FOUR builders. It is also
+    # UN-forgeable: the per-value escape turns every '~' into '~~', so no real value
+    # can produce a lone '~N' (closing the old '<NULL>'-vs-literal collision).
     for rendered in _all_four_rendered(_typed_table()):
-        assert "<NULL>" in rendered
+        assert "~N" in rendered
         assert "\\0" not in rendered
+    # The separator escape ('~'->'~~', '|'->'~|') must be applied on BOTH engines so
+    # a value containing '|' cannot shift a delimiter across a column boundary.
+    mysql_sql, pg_sql, _t1, _t2 = _all_four_rendered(_typed_table())
+    assert "REPLACE(REPLACE(" in mysql_sql and "'~', '~~'" in mysql_sql
+    assert "replace(replace(" in pg_sql and "'~', '~~'" in pg_sql
 
 
 def test_checksum_binary_columns_render_lower_hex() -> None:
@@ -1039,9 +1046,12 @@ def test_checksum_temporal_columns_fixed_fraction_no_zone() -> None:
     # MySQL: fixed 6-digit fraction, no zone.
     assert "DATE_FORMAT(`created_at`, '%Y-%m-%d %H:%i:%s.%f')" in mysql_sql
     assert "DATE_FORMAT(`t_of_day`, '%H:%i:%s.%f')" in mysql_sql
-    # PG: AT TIME ZONE 'UTC' pins timestamptz (drops the +00) and no-ops a plain
-    # timestamp; fixed 6-digit micros; time uses HH24:MI:SS.US.
-    assert "to_char(\"created_at\" AT TIME ZONE 'UTC'" in pg_sql
+    # PG: a plain timestamp (DATETIME -> created_at) renders DIRECTLY -- AT TIME ZONE
+    # 'UTC' is NOT a no-op on `timestamp without time zone` (it converts through the
+    # session TimeZone and shifts the wall-clock), so it must NOT be applied here.
+    assert "to_char(\"created_at\", 'YYYY-MM-DD HH24:MI:SS.US')" in pg_sql
+    assert "\"created_at\" AT TIME ZONE" not in pg_sql
+    # timestamptz (TIMESTAMP -> ts) DOES use AT TIME ZONE 'UTC' to match the UTC instant.
     assert "to_char(\"ts\" AT TIME ZONE 'UTC'" in pg_sql
     assert "to_char(\"t_of_day\", 'HH24:MI:SS.US')" in pg_sql
 
@@ -1164,8 +1174,8 @@ def test_all_float_table_renders_constant_term() -> None:
     )
     mysql_only = build_mysql_checksum_sql(only_float)
     pg_only = build_pg_checksum_sql(only_float).as_string(None)
-    assert "CONCAT_WS('|', '<NULL>')" in mysql_only
-    assert "concat_ws('|', '<NULL>')" in pg_only
+    assert "CONCAT_WS('|', '~N')" in mysql_only
+    assert "concat_ws('|', '~N')" in pg_only
 
 
 def test_orphan_count_sql_quotes_identifiers_and_joins_keys() -> None:

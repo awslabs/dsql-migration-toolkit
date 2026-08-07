@@ -884,7 +884,7 @@ def test_validation_download_text_includes_readiness_and_reconciliation() -> Non
     # missing/extra reconciliation detail.
     download = validation_download(_reconciled_report(missing=2, extra=1), "text")
     assert "Cut-over readiness:" in download.content
-    assert "No mismatched records: NO" in download.content
+    assert "No missing or extra records: NO" in download.content
     assert "missing on target" in download.content
     assert "extra on target" in download.content
 
@@ -3850,6 +3850,52 @@ def test_one_explained_table_does_not_soften_a_run_with_a_real_mismatch() -> Non
     assert "Nothing unexplained" not in verdict_body
     # It points out the known part rather than leaving all of it to be re-investigated.
     assert "already reported" in verdict_body
+
+
+def test_readiness_match_label_is_mode_aware_and_discloses_uncompared_columns() -> None:
+    # ROW_COUNT mode never reads non-PK column VALUES, so the headline must say
+    # "Row counts match", not "Data identical" (which overstates it). CHECKSUM mode
+    # value-compares, so it earns "Data identical" AND discloses the float/json
+    # columns it cannot value-compare. Audit findings C5 / C1 / C2.
+    from dsql_migrator.core.models import (
+        ReconcileResult,
+        TableValidationResult,
+        ValidationMode,
+        ValidationReport,
+    )
+    from dsql_migrator.ui.validation import (
+        _render_readiness_checks,
+        summarize_validation,
+    )
+
+    def _report(mode):
+        item = TableValidationResult(
+            table="ecommerce.orders",
+            source_row_count=100,
+            target_row_count=100,
+            row_count_match=True,
+            checksum_match=(mode is ValidationMode.CHECKSUM),
+            matched=True,
+        )
+        return ValidationReport(items=[item], mode=mode, snapshot_timestamp=None)
+
+    row_count = _CopyUi()
+    _render_readiness_checks(
+        row_count, summarize_validation(_report(ValidationMode.ROW_COUNT)), _drift_na()
+    )
+    rc_body = row_count.body()
+    assert "Row counts match" in rc_body
+    assert "Data identical" not in rc_body
+    # ROW_COUNT does not run the checksum, so it makes no float/json claim.
+    assert "not value-compared" not in rc_body
+
+    checksum = _CopyUi()
+    _render_readiness_checks(
+        checksum, summarize_validation(_report(ValidationMode.CHECKSUM)), _drift_na()
+    )
+    cs_body = checksum.body()
+    assert "Data identical" in cs_body
+    assert "FLOAT/DOUBLE and JSON columns are not value-compared" in cs_body
 
 
 def test_verdict_says_what_is_outstanding_instead_of_review_the_failures() -> None:

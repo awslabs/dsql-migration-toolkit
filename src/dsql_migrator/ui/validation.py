@@ -3744,11 +3744,26 @@ def _render_readiness_checks(
     else:
         explained_note = ""
 
-    # Check 1: data identical.
+    # Check 1: data match. The LABEL is mode-aware -- in ROW_COUNT mode only row
+    # counts are compared (non-PK column VALUES are never read), so calling that
+    # "Data identical" overstates what was verified; it is "Row counts match". Only
+    # CHECKSUM mode actually value-compares, so only it earns "Data identical".
+    _is_checksum_mode = str(summary.mode).upper().endswith("CHECKSUM")
+    _match_label = "Data identical" if _is_checksum_mode else "Row counts match"
+    # In CHECKSUM mode, FLOAT/DOUBLE and JSON columns have no byte-identical
+    # cross-engine text form and are EXCLUDED from the checksum. Disclose it so a
+    # "match" is not read as "every column value verified" (generic -- the per-table
+    # column types are not carried on the report).
+    _excluded_note = (
+        " FLOAT/DOUBLE and JSON columns are not value-compared (no byte-identical "
+        "cross-engine form); their row counts are still checked."
+        if _is_checksum_mode
+        else ""
+    )
     _render_check_row(
         ui,
         passed=summary.is_match,
-        label="Data identical",
+        label=_match_label,
         detail=(
             f"{summary.matched_tables}/{summary.total_tables} tables matched"
             + (
@@ -3758,6 +3773,7 @@ def _render_readiness_checks(
             )
             + f" (mode: {summary.mode})."
             + explained_note
+            + _excluded_note
         ),
         warn_on_fail=fully_explained,
     )
@@ -3767,7 +3783,7 @@ def _render_readiness_checks(
         _render_check_row(
             ui,
             passed=summary.inconsistent_tables == 0,
-            label="No mismatched records",
+            label="No missing or extra records",
             detail=(
                 f"{summary.reconciled_tables} table(s) reconciled; "
                 f"{summary.missing_on_target:,} record(s) missing on target, "
@@ -3780,7 +3796,7 @@ def _render_readiness_checks(
         _render_check_row(
             ui,
             passed=True,
-            label="No mismatched records",
+            label="No missing or extra records",
             detail="Record-level reconciliation was turned off for this run.",
             neutral=True,
         )
@@ -4234,9 +4250,17 @@ def _render_tables(
     # could not cover every table (composite / non-integer PK).
     skipped = reconcile_skipped_tables(report)
     if skipped:
+        # Mode-aware: in ROW_COUNT mode no checksum runs, so those tables are verified
+        # by COUNT ALONE -- saying "count/checksum" would overstate what was checked
+        # (audit finding C6). Only CHECKSUM mode value-compares them.
+        _by = (
+            "count and checksum"
+            if str(report.mode).upper().endswith("CHECKSUM")
+            else "row count ONLY (no value comparison in this mode)"
+        )
         ui.label(  # type: ignore[attr-defined]
             f"“n/a” in Missing/Extra: {len(skipped)} table(s) have a composite or "
-            "non-integer primary key, so they are compared by count/checksum only "
+            f"non-integer primary key, so they are compared by {_by} "
             "(record-level reconciliation needs a single integer key)."
         ).classes("text-xs text-gray-500")
     # Fast sweep honesty: tables whose counts matched were NOT deep-checked, so the

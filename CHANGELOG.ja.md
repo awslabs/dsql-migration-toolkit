@@ -5,6 +5,26 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.278
+
+### 修正
+
+- **検証の健全性:「match」なのに実際は異なるデータを通してしまう複数の経路を、閉じるか明示しました(監査 C1〜C6, U4)。**
+  - *checksum トークン衝突(C4).* 各列の値を `|` セパレータで連結する前にエスケープ(`~`→`~~`, `|`→`~|`)し、
+    `|` を含む値が列境界を越えて区切りをずらせないようにしました(`CONCAT_WS('|','a|','b')` と
+    `CONCAT_WS('|','a','|b')` が両方 `a||b` になっていた問題)。NULL センチネルは偽造不能な `~N`
+    (エスケープ済みの実値では決して生成できない)にし、旧 literal-`<NULL>` 対 SQL NULL の衝突を閉じました。
+    エスケープは両エンジンでバイト一致し backslash-free です(以前 backslash 方式が MySQL/PG 間で食い違った)。
+  - *DATETIME タイムゾーン(C3).* plain `timestamp`(DATETIME)の checksum 項を `AT TIME ZONE 'UTC'` なしで
+    直接レンダーするようにしました — `timestamp without time zone` ではそれは no-op ではなく(セッション
+    TimeZone を介して変換され wall-clock がずれる)、シフトを起こしていました。`timestamptz` は引き続き使用します。
+    DSQL 接続に `TimeZone=UTC` も固定し、比較がセッション既定値に依存しないようにしました。
+  - *正直なラベル/明示(C5, C1/C2, C6, U4).* readiness チェックは ROW_COUNT モードでは「Row counts match」
+    (値は未比較)、CHECKSUM モードでのみ「Data identical」と表示し、後者では FLOAT/DOUBLE・JSON が値比較
+    されないことを明示します。PK reconcile チェックは「No missing or extra records」に改名(値の同一性ではなく
+    キー集合の検証)、composite/非整数 PK の脚注は ROW_COUNT モードで「row count only」と表示(旧「count/checksum」
+    の過大表現を是正)。
+
 ## v0.1.277
 
 ### 修正

@@ -153,7 +153,36 @@ def _pg_table_identifier(name: str) -> "sql.Identifier":
 # two-char string 0x5C30 on PG, so any NULL-bearing row hashed differently on
 # each engine -- the confirmed migration_edge.edge_text false-mismatch. NUL is
 # also invalid in PG text, so it is correctly avoided.
-_NULL_SENTINEL = "<NULL>"
+# NULL sentinel. Must be UN-forgeable by a real (escaped) value: the per-value
+# escape below turns every '~' into '~~', so an escaped real value never contains a
+# LONE '~' followed by a non-'~'/non-'|' char. '~N' is exactly that shape, so no real
+# value can produce it -- closing the old '<NULL>'-vs-literal-'<NULL>' collision.
+# Backslash-free and NUL-free so it is byte-identical under MySQL backslash-escaping
+# AND PostgreSQL standard_conforming_strings (see the history note that motivated it).
+_NULL_SENTINEL = "~N"
+
+# Concat-separator escape. CONCAT_WS('|', ...) joins with '|', so a value CONTAINING
+# '|' could shift a delimiter across a column boundary -- CONCAT_WS('|','a|','b') and
+# CONCAT_WS('|','a','|b') both yield 'a||b', a within-row token collision (false MATCH
+# over unequal data). Escaping each value ('~'->'~~' then '|'->'~|') leaves the
+# separator as the ONLY unescaped '|', making the concatenation injective. Backslash-
+# free by design (a backslash scheme diverged between MySQL and PG before -- see the
+# sentinel note). Applied IDENTICALLY on both engines so equal data still hashes equally.
+
+
+def _mysql_concat_term(expr: str) -> str:
+    """Wrap a MySQL render expr: escape the separator, then COALESCE NULL -> sentinel."""
+    return (
+        f"COALESCE(REPLACE(REPLACE({expr}, '~', '~~'), '|', '~|'), "
+        f"'{_NULL_SENTINEL}')"
+    )
+
+
+def _pg_concat_term(expr: "sql.Composed") -> "sql.Composed":
+    """PG counterpart of :func:`_mysql_concat_term` (byte-identical escaping)."""
+    return sql.SQL(
+        "COALESCE(replace(replace({e}, '~', '~~'), '|', '~|'), {s})"
+    ).format(e=expr, s=sql.Literal(_NULL_SENTINEL))
 
 
 def _decimal_scale(mysql_type: str) -> int:
@@ -301,11 +330,20 @@ def _pg_checksum_expr(column: "ColumnDef") -> "Optional[sql.Composed]":
         return sql.SQL("{col}::text").format(col=ident)
     if kind == "boolean":
         return sql.SQL("{col}::text").format(col=ident)  # PG boolean -> 'true'/'false'
-    if kind in ("timestamp", "timestamptz"):
-        # AT TIME ZONE 'UTC' pins timestamptz rendering (drops the +00 suffix) and
-        # is a no-op for a plain timestamp; fixed 6-digit micros.
+    if kind == "timestamptz":
+        # timestamptz: AT TIME ZONE 'UTC' converts the instant to a UTC wall-clock
+        # (dropping the zone) so it matches the MySQL TIMESTAMP side rendered as UTC.
         return sql.SQL(
             "to_char({col} AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')"
+        ).format(col=ident)
+    if kind == "timestamp":
+        # Plain timestamp (from DATETIME): render DIRECTLY. AT TIME ZONE 'UTC' is NOT
+        # a no-op here -- on a `timestamp without time zone` it CONVERTS to timestamptz
+        # and back through the session TimeZone, shifting the wall-clock under a non-UTC
+        # session. The MySQL DATE_FORMAT side is TZ-independent, so render the stored
+        # wall-clock as-is (the connection also pins TimeZone=UTC as belt-and-suspenders).
+        return sql.SQL(
+            "to_char({col}, 'YYYY-MM-DD HH24:MI:SS.US')"
         ).format(col=ident)
     if kind == "time":
         return sql.SQL("to_char({col}, 'HH24:MI:SS.US')").format(col=ident)
@@ -342,9 +380,7 @@ def build_mysql_checksum_sql(table: TableDef) -> str:
     """
     rendered = [_mysql_checksum_expr(column) for column in table.columns]
     columns = ", ".join(
-        f"COALESCE({expr}, '{_NULL_SENTINEL}')"
-        for expr in rendered
-        if expr is not None
+        _mysql_concat_term(expr) for expr in rendered if expr is not None
     )
     # Edge case: an all-float (all-omitted) table -> one constant term so the
     # SQL stays valid and identical on both engines (row count still catches drift).
@@ -371,11 +407,7 @@ def build_pg_checksum_sql(table: TableDef) -> sql.Composed:
     """
     rendered_pg = [_pg_checksum_expr(column) for column in table.columns]
     terms = [
-        sql.SQL("COALESCE({expr}, {sent})").format(
-            expr=expr, sent=sql.Literal(_NULL_SENTINEL)
-        )
-        for expr in rendered_pg
-        if expr is not None
+        _pg_concat_term(expr) for expr in rendered_pg if expr is not None
     ]
     # Edge case: an all-float (all-omitted) table -> one constant sentinel term so
     # the SQL stays valid and hashes identically to the MySQL side.
@@ -402,9 +434,7 @@ def build_mysql_pk_token_sql(table: TableDef, pk_column: str) -> str:
     """
     rendered = [_mysql_checksum_expr(column) for column in table.columns]
     columns = ", ".join(
-        f"COALESCE({expr}, '{_NULL_SENTINEL}')"
-        for expr in rendered
-        if expr is not None
+        _mysql_concat_term(expr) for expr in rendered if expr is not None
     )
     # Edge case: an all-float (all-omitted) table -> one constant term (matches
     # build_mysql_checksum_sql so the per-row token stays identical).
@@ -431,11 +461,7 @@ def build_pg_pk_token_sql(table: TableDef, pk_column: str, sample_size: int) -> 
     """
     rendered_pg = [_pg_checksum_expr(column) for column in table.columns]
     terms = [
-        sql.SQL("COALESCE({expr}, {sent})").format(
-            expr=expr, sent=sql.Literal(_NULL_SENTINEL)
-        )
-        for expr in rendered_pg
-        if expr is not None
+        _pg_concat_term(expr) for expr in rendered_pg if expr is not None
     ]
     # Edge case: an all-float (all-omitted) table -> one constant sentinel term
     # (matches build_pg_checksum_sql so the per-row token stays identical).
@@ -1814,11 +1840,13 @@ def render_text_report(report: ValidationReport) -> str:
         total_missing = sum(i.reconcile.missing_on_target for i in reconciled)  # type: ignore[union-attr]
         total_extra = sum(i.reconcile.extra_on_target for i in reconciled)  # type: ignore[union-attr]
         lines.append(
-            f"- No mismatched records: {'yes' if not inconsistent else 'NO'} "
+            f"- No missing or extra records: {'yes' if not inconsistent else 'NO'} "
             f"({total_missing} missing on target, {total_extra} extra on target)"
         )
     else:
-        lines.append("- No mismatched records: not checked (reconciliation off)")
+        lines.append(
+            "- No missing or extra records: not checked (reconciliation off)"
+        )
     lines.append(
         f"- No table errors: {'yes' if not errored else 'NO'} "
         f"({len(errored)} table(s) errored)"
