@@ -1824,10 +1824,15 @@ def _apply_pk_strategy(
         )
     else:  # PrimaryKeyStrategy.KEEP_INTEGER
         message = (
-            f"The integer key from AUTO_INCREMENT column '{column_name}' was kept and "
-            "converts cleanly. For higher insert throughput, consider a UUID/random "
-            "key or a cached identity: DSQL stores rows in primary-key order, so a "
-            "monotonically increasing key concentrates writes on one partition."
+            f"The integer key from AUTO_INCREMENT column '{column_name}' was kept as a "
+            "plain integer. IMPORTANT: Aurora DSQL will NOT auto-generate this key after "
+            "cut-over (there is no AUTO_INCREMENT/identity on it), so the application "
+            "must supply the value on every insert — an app that relied on the database "
+            "generating it will fail or collide. Choose the 'Server-generated (IDENTITY)' "
+            "strategy instead if you want DSQL to fill the key. For higher insert "
+            "throughput, consider a UUID/random key or a cached identity: DSQL stores "
+            "rows in primary-key order, so a monotonically increasing key concentrates "
+            "writes on one partition."
         )
 
     # A RECOMMENDATION, not a LOSS: every strategy produces a correct, complete target

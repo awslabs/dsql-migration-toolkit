@@ -50,7 +50,7 @@ from dsql_migrator.core.batched_import import (
     OnConflictMode,
     safe_error_message,
 )
-from dsql_migrator.core.target_connection import DsqlConnector
+from dsql_migrator.core.target_connection import DsqlConnector, target_error_hint
 from dsql_migrator.core.converter import (
     SchemaConverter,
     SchemaConvertOptions,
@@ -1243,7 +1243,11 @@ def _migrate_one_table(
         # the what-happened/what-next explanation so the error log, the activity log,
         # and the inline per-table message all explain it the same way. Only added
         # when the retries above were exhausted -- a recovered failover never gets here.
-        hint = source_error_hint(exc)
+        # Prefer the source-side hint (dropped connection, too-many-connections); fall
+        # back to the DSQL target-side hint (OCC exhaustion, per-table limit, constraint
+        # / data rejection) so a target failure also explains what to do next, not just
+        # the bare driver text.
+        hint = source_error_hint(exc) or target_error_hint(exc)
         if hint:
             message = f"{message} — {hint}"
         _LOGGER.warning("Full Load failed for table %s: %s", name, message)

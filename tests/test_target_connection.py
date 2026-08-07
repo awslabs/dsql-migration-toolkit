@@ -27,6 +27,7 @@ from dsql_migrator.core.target_connection import (
     DEFAULT_REFRESH_MARGIN_SECONDS,
     DEFAULT_TOKEN_EXPIRY_SECONDS,
     DsqlConnector,
+    target_error_hint,
 )
 
 
@@ -453,3 +454,38 @@ def test_refresh_margin_must_be_smaller_than_expiry() -> None:
             token_expiry_seconds=60,
             refresh_margin_seconds=60,
         )
+
+
+# ---------------------------------------------------------------------------
+# target_error_hint — actionable hint for a DSQL-side load/DDL failure (audit U6)
+# ---------------------------------------------------------------------------
+
+
+class _TargetError(Exception):
+    """A driver-like error exposing an optional ``sqlstate`` (like psycopg)."""
+
+    def __init__(self, message: str, sqlstate: str | None = None) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+def test_target_error_hint_keys_off_sqlstate() -> None:
+    assert "optimistic-concurrency" in target_error_hint(_TargetError("x", "40001"))
+    assert "per-table limit" in target_error_hint(_TargetError("x", "54000"))
+    assert "target constraint" in target_error_hint(_TargetError("x", "23505"))
+    assert "could not be stored" in target_error_hint(_TargetError("x", "22001"))
+
+
+def test_target_error_hint_falls_back_to_message_text() -> None:
+    # A RuntimeError wrapping the sanitized first_error has no sqlstate attr, so the
+    # hint must also recognize the text.
+    assert "target constraint" in target_error_hint(
+        RuntimeError("1 batch(es) failed loading 't': duplicate key value violates "
+                     "unique constraint \"u\"")
+    )
+    assert "optimistic-concurrency" in target_error_hint(RuntimeError("OC001 conflict"))
+
+
+def test_target_error_hint_none_for_unrecognized() -> None:
+    assert target_error_hint(_TargetError("some opaque failure")) is None
+    assert target_error_hint(RuntimeError("nothing recognizable here")) is None

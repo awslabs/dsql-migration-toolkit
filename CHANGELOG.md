@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.283
+
+### Changed
+
+- **A DSQL target-side Full Load failure now explains what to do next, not just the raw
+  driver text (audit finding U6).** The per-table failure path only appended a
+  source-side hint (dropped connection, too-many-connections), so a *target* error — an
+  optimistic-concurrency budget exhaustion (`40001`), a per-table structural limit
+  (`54000`, e.g. >24 indexes), or a constraint / data rejection (`23xxx` / `22xxx`) —
+  reached the error log, activity log, and inline per-table message as a bare driver
+  message. A new `target_error_hint` keys off the SQLSTATE (falling back to recognizable,
+  already value-free message text) and appends the same "what happened / what to do next"
+  guidance the source path gives — e.g. "OCC retries exhausted → lower parallelism/batch
+  size and re-run; the load is idempotent". No row values are ever surfaced (Property 7).
+- **The `KEEP_INTEGER` primary-key recommendation now warns that DSQL will not
+  auto-generate the key after cut-over (audit finding U5).** Keeping the integer key from
+  an `AUTO_INCREMENT` column converts cleanly, but Aurora DSQL puts no identity/default on
+  it — so an application that relied on the database generating the key will fail or
+  collide on insert after cut-over. The Schema Conversion message now says this plainly
+  and points to the "Server-generated (IDENTITY)" strategy for callers that want DSQL to
+  fill the key, instead of only offering the throughput note.
+
 ## v0.1.282
 
 ### Fixed

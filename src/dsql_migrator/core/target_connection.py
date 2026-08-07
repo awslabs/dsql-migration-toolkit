@@ -438,10 +438,59 @@ def _failure_hint(reason: str) -> str:
     return ""
 
 
+def target_error_hint(exc: BaseException) -> Optional[str]:
+    """Return an actionable hint for a DSQL-side LOAD/DDL failure, or ``None``.
+
+    The Full Load per-table failure path already appends ``source_error_hint`` (which
+    only recognizes MySQL source conditions), so a DSQL TARGET error -- an OCC-budget
+    exhaustion, a per-table limit, or a constraint/type rejection -- reached the error
+    log and UI as a bare driver message with no "what to do next". This is the target
+    counterpart: it keys off the SQLSTATE when present, else recognizable text in the
+    (already value-free) message, so every surface explains a target failure the same
+    way. Returns ``None`` when the cause is unclear (the message already shows).
+
+    ``exc`` may be the driver exception (``sqlstate`` set) OR a ``RuntimeError`` whose
+    text embeds the sanitized ``first_error``, so both the code and the text are checked.
+    """
+    code = str(getattr(exc, "sqlstate", "") or "")
+    low = str(exc).lower()
+    # 40001 -- optimistic-concurrency conflict the retry budget could not clear.
+    if code == "40001" or "40001" in low or "oc001" in low or "concurrency" in low:
+        return (
+            "Aurora DSQL optimistic-concurrency retries were exhausted for this table. "
+            "Lower full_load_table_parallelism / batch size and re-run — the load is "
+            "idempotent (INSERT ... ON CONFLICT), so a re-run is safe"
+        )
+    # 54000 -- a per-table structural limit (too many indexes/columns, or a batch that
+    # exceeded the row/parameter/time cap).
+    if code == "54000" or "54000" in low:
+        return (
+            "the table hit an Aurora DSQL per-table limit (e.g. >24 indexes, the column "
+            "count, or a per-transaction cap). Review the Schema Conversion warnings and "
+            "drop what the target does not need, then re-run"
+        )
+    # Constraint violations (unique/not-null/check) -- a source value the target rejects.
+    if code.startswith("23") or "violates" in low or "constraint" in low:
+        return (
+            "a row violates a target constraint (unique / not-null / check). Fix the "
+            "offending source value, or adjust the target schema in Schema Conversion, "
+            "then re-run — the reload is idempotent"
+        )
+    # Data errors (value too long, out of range, invalid text/type).
+    if code.startswith("22") or "value too long" in low or "out of range" in low:
+        return (
+            "a value could not be stored on the target (too long, out of range, or a "
+            "type mismatch). Check the column's Schema Conversion mapping (e.g. an "
+            "oversized LOB, a TIME duration, or a narrowed numeric) and re-run"
+        )
+    return None
+
+
 __all__ = [
     "DsqlConnector",
     "TokenGenerator",
     "ConnectFactory",
+    "target_error_hint",
     "ADMIN_USERNAME",
     "DEFAULT_TOKEN_EXPIRY_SECONDS",
     "DEFAULT_REFRESH_MARGIN_SECONDS",
