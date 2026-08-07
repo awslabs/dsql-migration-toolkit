@@ -1204,6 +1204,27 @@ def test_iter_batches_without_byte_cap_uses_row_count_only() -> None:
     assert [len(b) for b in batches] == [2, 2, 1]
 
 
+def test_iter_batches_byte_cap_holds_when_first_row_is_tiny(monkeypatch) -> None:
+    # Audit C7/P1: a batch whose FIRST row is tiny but whose later rows are large
+    # must still split on the byte budget. The old first-row-extrapolation shortcut
+    # skipped per-row checks for the whole batch, letting it blow past max_bytes.
+    from dsql_migrator.core import batched_import as bi
+
+    # Row 0 is ~1 byte; rows 1..N are ~1000 bytes each.
+    rows = [{"v": ""}] + [{"v": "x" * 1000} for _ in range(5)]
+    batches = list(bi._iter_batches(rows, batch_size=100, max_bytes=2500))
+
+    # No batch may exceed the byte budget (a single oversized row is exempt -- it
+    # cannot be split -- but here every row is under 2500, so ALL must hold).
+    for b in batches:
+        total = sum(bi._estimate_row_bytes(r) for r in b)
+        assert total <= 2500, f"batch of {len(b)} rows = {total} bytes > 2500"
+    # And it actually split (the row-count cap of 100 was never the reason).
+    assert len(batches) > 1
+    # No row was lost or duplicated.
+    assert sum(len(b) for b in batches) == len(rows)
+
+
 # ---------------------------------------------------------------------------
 # Failure handling: transient retry / reconnect, permanent error, pool eviction
 # ---------------------------------------------------------------------------

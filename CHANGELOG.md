@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.279
+
+### Fixed
+
+- **The Full Load batch byte-cap now holds for a size-skewed batch (audit findings
+  C7/P1).** A batch is split so a single write transaction stays under DSQL's 10 MiB
+  limit. The splitter sampled only the FIRST row of each batch and, if that
+  extrapolation was under budget, skipped the per-row byte check for the rest of the
+  batch — so a batch whose first row was tiny (empty/NULL text) but whose later rows
+  were large (BLOB/JSON) accumulated far past the cap. It was recovered downstream by a
+  costly recursive split, but the advertised cap was silently unenforced. The splitter
+  now keeps a true running byte sum (every row estimated once and added) and flushes the
+  moment the next row would exceed the budget; a single oversized row still forms its
+  own batch. Memory stays bounded (one batch at a time).
+
 ## v0.1.278
 
 ### Fixed

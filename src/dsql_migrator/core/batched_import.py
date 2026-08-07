@@ -1433,40 +1433,30 @@ def _iter_batches(
     only one batch is materialized at a time, keeping memory bounded regardless of
     table size.
 
-    Optimization: byte estimation is expensive (per-row O(cols) scan). For a
-    typical OLTP table, the row-count cap fires long before the byte cap. So we
-    sample-estimate from the FIRST row of each batch and only check per-row once
-    the extrapolated total nears the byte budget (within 20% headroom). This
-    eliminates ~90%+ of ``_estimate_row_bytes`` calls for normal-width tables.
+    Byte estimation is O(cols) per row, but it MUST run for every row: a batch whose
+    first row is small but whose later rows are large would otherwise blow past
+    ``max_bytes`` unchecked. So ``batch_bytes`` is a true running sum (every row
+    estimated once and added), and a batch flushes the moment adding the next row
+    would exceed the budget. There is no first-row extrapolation shortcut -- an
+    earlier version sampled only the first row and skipped the rest when the
+    extrapolation was under budget, which silently let a size-skewed batch exceed
+    the DSQL 10 MiB per-transaction limit (recovered only by a costly recursive
+    split downstream). Memory stays bounded (one batch at a time); the estimate is a
+    cheap arithmetic sum, not a re-serialization.
     """
     batch: list[Mapping[str, object]] = []
     batch_bytes = 0
-    # Per-batch estimated bytes-per-row (from the first row); used to decide
-    # when we need to start checking per-row.
-    avg_row_bytes = 0
-    # Once extrapolated total exceeds this fraction of max_bytes, switch to
-    # per-row estimation for the remainder of the batch.
-    _HEADROOM_THRESHOLD = 0.80
     for row in rows:
         if max_bytes is not None:
-            if not batch:
-                # First row of a new batch: always estimate (sets the average).
-                row_bytes = _estimate_row_bytes(row)
-                avg_row_bytes = row_bytes
-                batch_bytes = row_bytes
-            elif avg_row_bytes * batch_size < max_bytes * _HEADROOM_THRESHOLD:
-                # Extrapolated full batch is well under budget — skip per-row check.
-                pass
-            else:
-                # Near budget — check this row.
-                row_bytes = _estimate_row_bytes(row)
-                if batch_bytes + row_bytes > max_bytes:
-                    yield batch
-                    batch = []
-                    batch_bytes = _estimate_row_bytes(row)
-                    avg_row_bytes = batch_bytes
-                else:
-                    batch_bytes += row_bytes
+            row_bytes = _estimate_row_bytes(row)
+            # Flush BEFORE appending when this row would push a non-empty batch over
+            # the budget. A single oversized row still forms its own batch (a row
+            # cannot be split); the downstream loader splits/handles it.
+            if batch and batch_bytes + row_bytes > max_bytes:
+                yield batch
+                batch = []
+                batch_bytes = 0
+            batch_bytes += row_bytes
         batch.append(row)
         if len(batch) >= batch_size:
             yield batch
