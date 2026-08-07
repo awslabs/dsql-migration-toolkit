@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.276
+
+### Fixed
+
+- **Full Load no longer reader-shards a table that has nothing to reconcile a torn read
+  — closing a cross-shard torn-read data-loss window on the production path.** Reader
+  sharding splits a large table's read into K disjoint PK ranges streamed concurrently,
+  each opening its OWN independently-timed `START TRANSACTION WITH CONSISTENT SNAPSHOT`.
+  If the source is written to during the load, a multi-row source transaction can be torn
+  across shards (one row in shard A's snapshot, its sibling not yet in shard B's). That is
+  only safe when a CDC stream will reconcile the post-snapshot write; a clean **replace**
+  (plain INSERT, no CDC) or a **non-CDC append** has nothing to reconcile it, so it must
+  be read by a single reader (one snapshot = one point-in-time cut). The single-process
+  path guarded the replace case but still allowed sharding a non-CDC append, and — more
+  seriously — the **multiprocess path (the production default whenever table parallelism
+  > 1)** decided sharding purely on "has a single integer PK", ignoring both the
+  replace/CDC state and the `full_load_reader_shards` off-switch/ceiling, so it sharded
+  replaces and non-CDC appends outright (audit finding D1, plus C12). Both paths now shard
+  **only** when the load is CDC-coexisting, and the multiprocess planner derives its shard
+  count from the clamped `full_load_reader_shards` (bounded by the source-connection
+  ceiling) instead of the worker-pool budget. Non-sharded loads are unchanged.
+
 ## v0.1.275
 
 ### Fixed

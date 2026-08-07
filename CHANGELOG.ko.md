@@ -5,6 +5,24 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.276
+
+### 수정
+
+- **Full Load가 torn read를 재조정할 수단이 없는 테이블을 더 이상 reader 샤딩하지 않습니다 — 프로덕션
+  경로의 cross-shard torn-read 데이터 손실 창을 닫음.** reader 샤딩은 큰 테이블의 읽기를 K개의 disjoint
+  PK 범위로 나눠 동시 스트리밍하는데, 각 샤드가 자신만의 독립 타이밍 `START TRANSACTION WITH CONSISTENT
+  SNAPSHOT`을 엽니다. 로드 중 소스에 쓰기가 일어나면 다중 행 소스 트랜잭션이 샤드 간에 찢어질 수 있습니다
+  (한 행은 샤드 A의 스냅샷에, 그 형제 행은 아직 샤드 B에 없음). 이는 CDC 스트림이 스냅샷 이후 쓰기를
+  재조정할 때만 안전합니다. 깨끗한 **replace**(plain INSERT, CDC 없음)나 **비-CDC append**는 재조정할
+  것이 없으므로 단일 reader로 읽어야 합니다(스냅샷 하나 = 한 시점 컷). 단일프로세스 경로는 replace만
+  가드했고 비-CDC append 샤딩은 여전히 허용했으며, 더 심각하게 **멀티프로세스 경로(테이블 병렬 > 1일 때의
+  프로덕션 기본)**는 순전히 "단일 정수 PK 있음"만으로 샤딩을 결정해 replace/CDC 상태와
+  `full_load_reader_shards` off-switch/상한을 모두 무시하고 replace와 비-CDC append를 그대로 샤딩했습니다
+  (감사 D1 + C12). 이제 두 경로 모두 **CDC-coexisting일 때만** 샤딩하고, 멀티프로세스 플래너는 샤드 수를
+  워커 풀 예산이 아니라 (소스 연결 상한으로 클램프된) `full_load_reader_shards`에서 도출합니다. 샤딩하지
+  않는 로드는 동작 변화 없음.
+
 ## v0.1.275
 
 ### 수정

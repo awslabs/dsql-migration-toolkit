@@ -624,6 +624,8 @@ def test_batched_table_migrator_shards_the_read_into_k_streams() -> None:
     # When plan_pk_shard_ranges returns K ranges, migrate_table opens K shard
     # streams and passes them to the importer as shard_sources -- together
     # reconstructing the whole table (disjoint ranges, no overlap or gap).
+    import dataclasses
+
     exporter = _FakeExporter(
         rows_by_table={"orders": [{"id": i} for i in range(1, 7)]}
     )
@@ -631,8 +633,11 @@ def test_batched_table_migrator_shards_the_read_into_k_streams() -> None:
     exporter.shard_ranges_by_table["orders"] = [(None, 3), (3, 5), (5, None)]
     importer = _FakeImporter()
 
+    # Sharding is only safe on the CDC-coexisting path (a CDC stream reconciles any
+    # post-snapshot write across the independently-timed per-shard snapshots).
+    inputs = dataclasses.replace(_inputs(), cdc_coexisting=True)
     migrator = BatchedTableMigrator(
-        _inputs(),
+        inputs,
         exporter=exporter,  # type: ignore[arg-type]
         watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
         importer_factory=lambda _inputs: importer,  # type: ignore[arg-type,return-value]
@@ -647,6 +652,29 @@ def test_batched_table_migrator_shards_the_read_into_k_streams() -> None:
     assert loaded_table == "orders"
     assert sorted(r["id"] for r in loaded_rows) == [1, 2, 3, 4, 5, 6]
     assert result.rows_loaded == 6
+
+
+def test_non_cdc_append_is_never_sharded_even_when_ranges_available() -> None:
+    # A NON-CDC append (existing data, no CDC to reconcile) must NOT shard: like the
+    # replace path, K independently-timed snapshots could torn-read a concurrently
+    # written source with nothing to backfill it. Only cdc_coexisting is safe to shard.
+    exporter = _FakeExporter(
+        rows_by_table={"orders": [{"id": i} for i in range(1, 7)]}
+    )
+    exporter.shard_ranges_by_table["orders"] = [(None, 3), (3, 5), (5, None)]
+    importer = _FakeImporter()
+
+    migrator = BatchedTableMigrator(
+        _inputs(),  # cdc_coexisting=False, no replace -> a plain append
+        exporter=exporter,  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _inputs: importer,  # type: ignore[arg-type,return-value]
+    )
+
+    migrator.migrate_table(_tables()[0])  # orders (append, no CDC)
+
+    # Exactly ONE stream opened (single snapshot), not three shards.
+    assert exporter.streamed == ["orders"]
 
 
 def test_replace_path_is_never_sharded_even_when_ranges_available() -> None:
@@ -9990,6 +10018,31 @@ def test_cleanup_sentinel_is_also_nonblocking() -> None:
 
     src = inspect.getsource(_engine._migrate_tables_in_parallel)
     assert "_report_progress(progress_queue, _PROGRESS_SENTINEL)" in src
+
+
+def test_multiprocess_planner_shards_only_cdc_coexisting_and_honors_reader_shards() -> None:
+    # The production multiprocess planner must mirror the single-process sharding
+    # invariant (audit D1): shard ONLY when cdc_coexisting (never a REPLACE or a
+    # non-CDC append -> torn read with nothing to reconcile), and cap the shard count
+    # by cfg.full_load_reader_shards clamped to the source-connection ceiling -- NOT
+    # the pool budget (remaining_slots), which ignored the off-switch and the ceiling.
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _engine
+
+    src = inspect.getsource(_engine._migrate_tables_in_parallel)
+    process_path = src[src.index("# Unified process-parallel path"):]
+    # Gated on cdc_coexisting (the only safe sharding condition).
+    assert "_shardable_ok = bool(migrator._inputs.cdc_coexisting)" in process_path
+    assert "not table_is_replace" in process_path
+    # Shard count comes from the clamped reader-shards budget, not the pool slots.
+    assert "effective_reader_shards" in process_path
+    assert "_MAX_SOURCE_READERS // tp" in process_path
+    # The old unsafe allocation must be gone from the CODE (the word may survive only
+    # in a comment explaining why): no assignment or arithmetic on remaining_slots.
+    assert "remaining_slots =" not in process_path
+    assert "remaining_slots //" not in process_path
+    assert "table_parallelism - non_shardable_count" not in process_path
 
 
 # ---------------------------------------------------------------------------

@@ -1415,32 +1415,49 @@ def _migrate_tables_in_parallel(
         from dsql_migrator.core.exporter import shardable_int_pk
 
         # Plan work units: for each table, decide if it should be sharded.
-        # A shardable large table gets K shard workers (K = remaining pool slots
-        # allocated proportionally). Small/non-shardable tables get 1 worker each.
-        work_units: list[tuple] = []  # ("table", table) or ("shard", table, lo, hi, idx)
-        non_shardable_count = 0
-        shardable_tables: list[TableDef] = []
-        for table in tables:
-            if shardable_int_pk(table) is not None:
-                shardable_tables.append(table)
-            else:
-                non_shardable_count += 1
-                work_units.append(("table", table))
+        # Small/non-shardable tables get 1 worker each; an eligible large table gets
+        # K shard workers.
+        #
+        # SHARDING SAFETY -- must mirror the single-process migrate_table invariant
+        # (see the "NOT sharded on the REPLACE path" block below), or the production
+        # multiprocess path silently reintroduces a torn read the single-process path
+        # forbids. Each shard opens its OWN independently-timed CONSISTENT SNAPSHOT, so
+        # a source written to DURING the load can land a cross-shard torn read (one row
+        # of a multi-row source txn in shard A's snapshot, its sibling not yet in shard
+        # B's). That is only provably safe when the load is idempotent AND a CDC stream
+        # will reconcile post-snapshot writes -- i.e. cdc_coexisting. A REPLACE (clean
+        # plain-INSERT, no CDC) or a non-CDC append has nothing to reconcile it, so such
+        # a table must be read by a SINGLE reader (one snapshot = one point-in-time cut).
+        _shardable_ok = bool(migrator._inputs.cdc_coexisting)
 
-        # Allocate shard counts: distribute remaining pool slots among shardable
-        # tables. Each shardable table gets at least 1 shard; the rest of the
-        # pool budget goes to the largest tables proportionally.
-        remaining_slots = max(1, table_parallelism - non_shardable_count)
-        for table in shardable_tables:
-            # Each shardable table gets a share of remaining slots (at least 1).
-            if len(shardable_tables) == 1:
-                shards_for_table = remaining_slots
-            else:
-                shards_for_table = max(1, remaining_slots // len(shardable_tables))
+        # Shard count is capped exactly like single-process: cfg.full_load_reader_shards
+        # clamped so table_parallelism x shards stays under the source max_connections
+        # ceiling. NOT the pool budget (remaining_slots) -- that ignored the off-switch
+        # (reader_shards=1) and the source-connection guardrail.
+        tp = max(1, cfg.full_load_table_parallelism)
+        effective_reader_shards = max(
+            1, min(cfg.full_load_reader_shards, _MAX_SOURCE_READERS // tp)
+        )
+
+        work_units: list[tuple] = []  # ("table", table) or ("shard", table, lo, hi, idx)
+        for table in tables:
+            table_is_replace = (
+                not migrator._inputs.cdc_coexisting
+                and table.name in migrator._inputs.replace_tables
+            )
+            shardable = (
+                _shardable_ok
+                and not table_is_replace
+                and shardable_int_pk(table) is not None
+                and effective_reader_shards > 1
+            )
+            if not shardable:
+                work_units.append(("table", table))
+                continue
             shard_ranges = migrator._exporter.plan_pk_shard_ranges(
                 migrator._inputs.source_config,
                 table,
-                shards_for_table,
+                effective_reader_shards,
                 min_rows=cfg.full_load_shard_min_rows,
             )
             if len(shard_ranges) > 1:
@@ -2492,19 +2509,20 @@ class BatchedTableMigrator:
         # returns one (None, None) range -- i.e. the original single reader -- for
         # small tables, composite/non-integer PKs, or when sharding is off (K<=1).
         #
-        # NOT sharded on the REPLACE path (plain INSERT, no CDC): the K shards each
-        # open an independently-timed CONSISTENT SNAPSHOT, so a source written to
-        # DURING the load could land a cross-shard torn read (one row of a
-        # multi-row source txn in shard A's snapshot, its sibling not yet in shard
-        # B's) -- and with no CDC there is nothing to reconcile it. A single reader
-        # takes ONE snapshot = one point-in-time cut. Sharding is therefore limited
-        # to the idempotent SKIP_EXISTING path (existing data / CDC-coexisting),
-        # where the pre-load watermark + idempotent re-load make per-shard snapshot
-        # skew provably safe. (Snapshot skew across shards never double-loads a row:
-        # the ranges are disjoint.)
+        # Sharded ONLY on the CDC-coexisting path. The K shards each open an
+        # independently-timed CONSISTENT SNAPSHOT, so a source written to DURING the
+        # load could land a cross-shard torn read (one row of a multi-row source txn
+        # in shard A's snapshot, its sibling not yet in shard B's). That is only
+        # provably safe when a CDC stream will reconcile any post-snapshot write:
+        # SKIP_EXISTING makes the re-load idempotent (disjoint ranges never
+        # double-load) and CDC backfills the torn sibling. Neither a REPLACE (plain
+        # INSERT, no CDC) NOR a NON-CDC append has anything to reconcile it, so both
+        # must use a SINGLE reader (one snapshot = one point-in-time cut). Requiring
+        # cdc_coexisting -- not merely "not is_replace" -- is what closes the non-CDC
+        # append torn-read hole; it matches the multiprocess planner's _shardable_ok.
         cfg = load_config()
         shard_ranges: list = [(None, None)]
-        if not is_replace:
+        if not is_replace and self._inputs.cdc_coexisting:
             # Source-connection guardrail: total concurrent source snapshot readers
             # = table_parallelism x reader_shards. Clamp the effective shard count so
             # that product stays under a safe ceiling (each reader holds a long-lived
