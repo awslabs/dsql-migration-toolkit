@@ -1308,6 +1308,10 @@ def _migrate_one_table(
         )
         quarantined = getattr(outcome, "rows_quarantined", 0) or 0
         quarantine_note = f", {quarantined:,} quarantined" if quarantined else ""
+        # Surface any oversized-LOB column excluded from THIS table's load in the
+        # per-table detail too (the run-level "column excluded" events are the audit
+        # record; this is the at-a-glance echo on the table's own line).
+        excluded_note = _lob_excluded_note(migrator, name)
         # Quarantined rows are permanently DROPPED from the target (e.g. a value
         # over DSQL's ~1 MiB per-value limit, or another non-retryable row error),
         # so the table did NOT fully load. Report it as a FAILURE -- not SUCCESS --
@@ -1324,7 +1328,7 @@ def _migrate_one_table(
             target=name,
             detail=(
                 f"{outcome.rows_loaded:,} rows newly loaded"
-                f"{skipped_note}{quarantine_note}"
+                f"{skipped_note}{quarantine_note}{excluded_note}"
                 + (
                     " -- quarantined rows were DROPPED (e.g. a value over DSQL's "
                     "~1 MiB per-value limit); see the error log and re-run after "
@@ -1658,7 +1662,8 @@ def _migrate_tables_in_parallel(
                             log_activity(ActivityCategory.FULL_LOAD, "load table",
                                 status=ActivityStatus.FAILURE if had_q else ActivityStatus.SUCCESS,
                                 target=name,
-                                detail=f"{total_loaded:,} rows loaded across {expected_shards} shards")
+                                detail=f"{total_loaded:,} rows loaded across {expected_shards} shards"
+                                + _lob_excluded_note(migrator, name))
                             handle.update(lambda job, n=name, r=total_loaded, s=total_skipped,
                                 q=len(all_quarantine):
                                 _complete_chunk(job, n, r, s, q))
@@ -1684,7 +1689,8 @@ def _migrate_tables_in_parallel(
                             log_activity(ActivityCategory.FULL_LOAD, "load table",
                                 status=ActivityStatus.FAILURE if had_quarantine else ActivityStatus.SUCCESS,
                                 target=name,
-                                detail=f"{result.rows_loaded:,} rows newly loaded")
+                                detail=f"{result.rows_loaded:,} rows newly loaded"
+                                + _lob_excluded_note(migrator, name))
                             handle.update(lambda job, n=name, r=result.rows_loaded, s=result.rows_skipped,
                                 q=len(result.quarantine_records):
                                 _complete_chunk(job, n, r, s, q))
@@ -1998,6 +2004,56 @@ def _recreate_dependent_views(migrator: DataMigrator) -> None:
             _LOGGER.warning("Dependent-view recreate pass failed", exc_info=True)
 
 
+def _log_excluded_lob_columns(
+    inputs: "Optional[DataMigrationInputs]",
+    scope: Optional[set[str]] = None,
+) -> None:
+    """Record one activity event per oversized-LOB column excluded from this run.
+
+    Excluding a column is a deliberate decision to NOT migrate certain data -- the
+    column is dropped from the load and arrives NULL on the target -- so it belongs in
+    the activity log, which is the migration's audit trail (row-level quarantine is
+    already logged; column-level exclusion should be too). Logged at ``INFO``: it is an
+    expected, user-chosen omission, not a fault. Value-free (only names the column), so
+    no Property-7 concern. ``scope`` (a retry's table subset) filters the events so a
+    retry logs only the exclusions for the tables it actually re-ran; ``None`` = all.
+    """
+    if inputs is None:
+        return
+    for table_name in sorted(inputs.excluded_lob_columns):
+        if scope is not None and table_name not in scope:
+            continue
+        for column in sorted(inputs.excluded_lob_columns[table_name]):
+            log_activity(
+                ActivityCategory.FULL_LOAD,
+                "column excluded",
+                status=ActivityStatus.INFO,
+                target=f"{table_name}.{column}",
+                detail=(
+                    "oversized LOB column excluded from the load by user; the column "
+                    "is left NULL on the target (its data is not migrated)"
+                ),
+            )
+
+
+def _lob_excluded_note(migrator: "DataMigrator", table_name: str) -> str:
+    """Return the per-table `` (N column(s) excluded: ...)`` suffix, or ``""``.
+
+    The at-a-glance echo appended to a table's ``load table`` detail so the affected
+    table's own line shows which oversized-LOB columns were dropped (the run-level
+    ``column excluded`` events are the audit record). Reads ``migrator._inputs``
+    defensively -- it is optional for legacy callers/tests. Shared by the single- and
+    multi-process success sites so the note is identical on every path.
+    """
+    inputs = getattr(migrator, "_inputs", None)
+    excluded = sorted(
+        getattr(inputs, "excluded_lob_columns", {}).get(table_name, ()) if inputs else ()
+    )
+    if not excluded:
+        return ""
+    return f" ({len(excluded)} column(s) excluded: {', '.join(excluded)})"
+
+
 def run_full_load(
     handle: JobHandle,
     tables: Sequence[TableDef],
@@ -2041,6 +2097,7 @@ def run_full_load(
         status=ActivityStatus.STARTED,
         detail=f"{len(table_names)} table(s) selected",
     )
+    _log_excluded_lob_columns(inputs)
 
     watermark = migrator.capture_watermark(tables)
     handle.update(lambda job: setattr(job, "watermark", watermark))
@@ -2119,6 +2176,7 @@ def run_full_load_retry(
     job_id = handle.job_id
     retry_names = {table.name for table in tables_to_retry}
     handle.update(lambda job: _seed_retry_chunks(job, prior_chunks, retry_names))
+    _log_excluded_lob_columns(inputs, scope=retry_names)
     if watermark is not None:
         handle.update(lambda job: setattr(job, "watermark", watermark))
 

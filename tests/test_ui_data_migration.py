@@ -11154,6 +11154,106 @@ def test_run_incomplete_names_the_tables_and_reasons(monkeypatch) -> None:
     assert "1048576" in entry["detail"]  # WHY
 
 
+# ---------------------------------------------------------------------------
+# Oversized-LOB column exclusion is recorded on the activity log (audit trail)
+# ---------------------------------------------------------------------------
+
+
+def test_excluded_lob_columns_are_logged_one_event_per_column(monkeypatch) -> None:
+    """Excluding a column is an intentional data omission -- it must be auditable.
+
+    The exclusion dropped the column from the load but wrote NOTHING to the activity
+    log, so a reviewer reading the downloaded log could not tell a column arrived NULL
+    on purpose. Row-level quarantine is already logged; column-level exclusion now is
+    too. Value-free (names only the column), logged at INFO (an expected, user choice).
+    """
+    import dataclasses
+
+    from dsql_migrator.ui.data_migration import _engine
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        _engine, "log_activity",
+        lambda category, action, **kw: captured.append({"action": action, **kw}),
+    )
+
+    inputs = dataclasses.replace(_inputs(), excluded_lob_columns={
+        "ecommerce.product_media": frozenset({"content", "thumbnail"}),
+        "ecommerce.orders": frozenset({"notes"}),
+    })
+    _engine._log_excluded_lob_columns(inputs)
+
+    events = [e for e in captured if e["action"] == "column excluded"]
+    # One event per column, across all tables (2 + 1).
+    assert len(events) == 3
+    targets = {e["target"] for e in events}
+    assert targets == {
+        "ecommerce.product_media.content",
+        "ecommerce.product_media.thumbnail",
+        "ecommerce.orders.notes",
+    }
+    one = events[0]
+    assert one["status"].value == "info"  # expected, user-chosen -- not a fault
+    assert "left NULL on the target" in one["detail"]
+    assert "not migrated" in one["detail"]
+
+
+def test_excluded_lob_columns_retry_logs_only_scoped_tables(monkeypatch) -> None:
+    # A retry re-runs a subset of tables, so it should log exclusions ONLY for the
+    # tables it actually re-ran -- not re-announce exclusions for untouched tables.
+    import dataclasses
+
+    from dsql_migrator.ui.data_migration import _engine
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        _engine, "log_activity",
+        lambda category, action, **kw: captured.append({"action": action, **kw}),
+    )
+
+    inputs = dataclasses.replace(_inputs(), excluded_lob_columns={
+        "ecommerce.product_media": frozenset({"content"}),
+        "ecommerce.orders": frozenset({"notes"}),
+    })
+    _engine._log_excluded_lob_columns(inputs, scope={"ecommerce.product_media"})
+
+    targets = {e["target"] for e in captured if e["action"] == "column excluded"}
+    assert targets == {"ecommerce.product_media.content"}  # orders.notes NOT logged
+
+
+def test_log_excluded_lob_columns_noop_without_inputs_or_exclusions(monkeypatch) -> None:
+    # Legacy callers pass no inputs; a run with no exclusions logs nothing.
+    from dsql_migrator.ui.data_migration import _engine
+
+    captured: list[str] = []
+    monkeypatch.setattr(
+        _engine, "log_activity",
+        lambda category, action, **kw: captured.append(action),
+    )
+
+    _engine._log_excluded_lob_columns(None)  # legacy caller: no inputs
+    _engine._log_excluded_lob_columns(_inputs())  # default inputs: no exclusions
+    assert captured == []
+
+
+def test_lob_excluded_note_echoes_columns_on_the_table_line() -> None:
+    """The per-table ``load table`` detail echoes which columns were excluded."""
+    import dataclasses
+
+    from dsql_migrator.ui.data_migration import _engine
+
+    class _M:
+        _inputs = dataclasses.replace(_inputs(), excluded_lob_columns={
+            "ecommerce.product_media": frozenset({"content"})
+        })
+
+    note = _engine._lob_excluded_note(_M(), "ecommerce.product_media")
+    assert note == " (1 column(s) excluded: content)"
+    # A table with no exclusion gets no note; a migrator without _inputs is safe.
+    assert _engine._lob_excluded_note(_M(), "ecommerce.orders") == ""
+    assert _engine._lob_excluded_note(object(), "ecommerce.product_media") == ""
+
+
 def test_cdc_connector_failure_detail_localizes_the_fault() -> None:
     """A bare "connector X failed" cannot be troubleshot: it names no cause.
 

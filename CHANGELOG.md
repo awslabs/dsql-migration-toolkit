@@ -5,7 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
-## v0.1.283
+## v0.1.284
+
+### Added
+
+- **An excluded oversized-LOB column is now recorded in the activity log — an intentional
+  data omission belongs in the migration's audit trail.** Ticking a column in the
+  "Oversized LOB columns" card drops that column's data from the Full Load (it arrives
+  `NULL` on the target), but nothing was written to the activity log, so the downloaded
+  `migration_activity.log` had no record that a column was left out on purpose — a
+  governance gap, since the log is the artifact teams attach to a change ticket. Row-level
+  quarantine was already logged; column-level exclusion now is too. A Full Load run (and a
+  retry, scoped to the tables it re-ran) now emits one `[full_load] column excluded` event
+  per excluded column at `INFO` (an expected, user-chosen omission — not a fault), naming
+  the `table.column` and stating the column is left `NULL` on the target. The affected
+  table's `load table` line also echoes it — e.g. `15 rows newly loaded (1 column
+  excluded: content)`. The event names only the column (no row values — Property 7).
 
 ### Changed
 

@@ -5,7 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
-## v0.1.283
+## v0.1.284
+
+### 추가
+
+- **제외된 대형 LOB 컬럼이 이제 활동 로그에 기록됩니다 — 의도적 데이터 누락은 마이그레이션 감사 추적에
+  남아야 합니다.** "Oversized LOB columns" 카드에서 컬럼을 체크하면 그 컬럼 데이터가 Full Load에서
+  빠지지만(타깃에는 `NULL`로 도착), 활동 로그에는 아무것도 기록되지 않아 다운로드한
+  `migration_activity.log`만 봐서는 어떤 컬럼이 의도적으로 제외됐는지 알 수 없었습니다 — 로그가 변경
+  티켓에 첨부하는 산출물인 만큼 거버넌스 공백입니다. 행 단위 quarantine은 이미 로깅되고 있었고, 컬럼
+  단위 제외도 이제 로깅됩니다. Full Load 실행(및 재실행은 재실행한 테이블로 범위 한정)이 이제 제외된
+  컬럼마다 `[full_load] column excluded` 이벤트를 `INFO`로(예상된, 사용자가 선택한 누락 — 결함 아님)
+  기록하며, `table.column`을 지목하고 그 컬럼이 타깃에서 `NULL`로 남음을 명시합니다. 해당 테이블의
+  `load table` 라인에도 반영됩니다 — 예: `15 rows newly loaded (1 column excluded: content)`. 이벤트는
+  컬럼 이름만 담습니다(행 값 없음 — Property 7).
 
 ### 변경
 
