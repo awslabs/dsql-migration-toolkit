@@ -5,6 +5,15 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.287
+
+### Changed
+
+- **The deploy template's default `ContainerImageUri` is bumped to the current release
+  (`public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.287`).** The default had drifted many
+  releases behind the published image, so a fresh `aws cloudformation deploy` with no
+  override pulled a stale app. It now points at the current published ECR Public tag.
+
 ## v0.1.286
 
 ### Added

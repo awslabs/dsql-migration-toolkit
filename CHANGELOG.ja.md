@@ -5,6 +5,15 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.287
+
+### 変更
+
+- **デプロイテンプレートのデフォルト `ContainerImageUri` を現行リリースに更新しました
+  (`public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.287`)。** デフォルトが公開イメージより数リリース遅れて
+  いたため、override なしで新規に `aws cloudformation deploy` すると古いアプリを pull していました。現在
+  公開されている ECR Public タグを指すようになりました。
+
 ## v0.1.286
 
 ### 追加
