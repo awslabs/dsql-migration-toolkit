@@ -2036,6 +2036,42 @@ def _log_excluded_lob_columns(
             )
 
 
+def _log_captured_watermark(watermark: "Optional[Watermark]") -> None:
+    """Record the Full Load consistency point (watermark) in the activity log.
+
+    The watermark pins the exact source position the snapshot reflects and is where a
+    later CDC catch-up resumes -- the core of the gapless Full Load -> CDC handoff. It
+    was persisted only on the in-memory job record, so the downloaded
+    ``migration_activity.log`` (the artifact teams attach to a change ticket) carried no
+    record of which source point-in-time the migration captured. It is now logged at
+    ``INFO`` right after capture: the GTID when present, else the ``binlog_file:pos``,
+    the snapshot UTC timestamp, and whether the per-table row counts are approximate
+    ``information_schema`` estimates. Only a log POSITION and a timestamp -- never a row
+    value -- so there is no Property-7 concern. ``None`` (legacy caller) is a no-op.
+    """
+    if watermark is None:
+        return
+    # Prefer the GTID (the portable resume coordinate); fall back to binlog file:pos;
+    # else say it plainly (binary logging may be disabled / SHOW MASTER STATUS blocked).
+    if watermark.gtid_executed:
+        coord = f"GTID {watermark.gtid_executed}"
+    elif watermark.binlog_file:
+        coord = f"binlog {watermark.binlog_file}:{watermark.binlog_position}"
+    else:
+        coord = "no binlog/GTID coordinate available (binary logging off or restricted)"
+    ts = watermark.snapshot_timestamp.isoformat().replace("+00:00", "Z")
+    approx = " (row counts are approximate estimates)" if watermark.row_counts_approximate else ""
+    log_activity(
+        ActivityCategory.FULL_LOAD,
+        "watermark captured",
+        status=ActivityStatus.INFO,
+        detail=(
+            f"consistency point for the gapless CDC handoff: {coord}; "
+            f"snapshot={ts}; {len(watermark.table_row_counts)} table(s) counted{approx}"
+        ),
+    )
+
+
 def _lob_excluded_note(migrator: "DataMigrator", table_name: str) -> str:
     """Return the per-table `` (N column(s) excluded: ...)`` suffix, or ``""``.
 
@@ -2101,6 +2137,7 @@ def run_full_load(
 
     watermark = migrator.capture_watermark(tables)
     handle.update(lambda job: setattr(job, "watermark", watermark))
+    _log_captured_watermark(watermark)
 
     # On a "drop & reload" run, drop views that depend on the replaced tables
     # BEFORE the per-table DROP+recreate (a view can span several tables loaded in
@@ -2179,6 +2216,9 @@ def run_full_load_retry(
     _log_excluded_lob_columns(inputs, scope=retry_names)
     if watermark is not None:
         handle.update(lambda job: setattr(job, "watermark", watermark))
+        # A retry reuses the ORIGINAL watermark (no new snapshot); record which
+        # consistency point it resumed against so the audit trail is complete.
+        _log_captured_watermark(watermark)
 
     # Same run-level view pre-drop / recreate as run_full_load, so a retry that
     # DROP+recreates a table whose view dependency blocked the first attempt now

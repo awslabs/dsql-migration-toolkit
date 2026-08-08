@@ -11254,6 +11254,93 @@ def test_lob_excluded_note_echoes_columns_on_the_table_line() -> None:
     assert _engine._lob_excluded_note(object(), "ecommerce.product_media") == ""
 
 
+# ---------------------------------------------------------------------------
+# The Full Load watermark (CDC-handoff consistency point) is recorded in the log
+# ---------------------------------------------------------------------------
+
+
+def test_captured_watermark_is_logged_prefers_gtid(monkeypatch) -> None:
+    """The watermark is the gapless-handoff consistency point -- it belongs in the log.
+
+    It was persisted only on the in-memory job record, so the downloaded
+    migration_activity.log had no record of which source point-in-time the migration
+    captured (the coordinate a later CDC catch-up resumes from). It is now logged at
+    INFO right after capture, preferring the GTID as the resume coordinate.
+    """
+    from dsql_migrator.ui.data_migration import _engine
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        _engine, "log_activity",
+        lambda category, action, **kw: captured.append({"action": action, **kw}),
+    )
+
+    _engine._log_captured_watermark(_watermark())
+
+    (entry,) = [e for e in captured if e["action"] == "watermark captured"]
+    assert entry["status"].value == "info"
+    assert "GTID 3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5" in entry["detail"]
+    assert "2026-01-02T03:04:05Z" in entry["detail"]  # snapshot UTC timestamp
+    assert "2 table(s) counted" in entry["detail"]
+    # A resume coordinate + timestamp, never a row value (Property 7).
+    assert "handoff" in entry["detail"]
+
+
+def test_captured_watermark_falls_back_to_binlog_and_flags_approx(monkeypatch) -> None:
+    from dsql_migrator.core.models import Watermark
+    from dsql_migrator.ui.data_migration import _engine
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        _engine, "log_activity",
+        lambda category, action, **kw: captured.append({"action": action, **kw}),
+    )
+
+    wm = Watermark(
+        binlog_file="mysql-bin.000999",
+        binlog_position=1234,
+        snapshot_timestamp=datetime(2026, 3, 4, 5, 6, 7, tzinfo=timezone.utc),
+        table_row_counts={"orders": 7},
+        row_counts_approximate=True,
+    )
+    _engine._log_captured_watermark(wm)
+
+    (entry,) = captured
+    assert "binlog mysql-bin.000999:1234" in entry["detail"]  # no GTID -> binlog:pos
+    assert "approximate estimates" in entry["detail"]
+
+
+def test_captured_watermark_none_is_noop(monkeypatch) -> None:
+    from dsql_migrator.ui.data_migration import _engine
+
+    captured: list = []
+    monkeypatch.setattr(
+        _engine, "log_activity",
+        lambda category, action, **kw: captured.append(action),
+    )
+    _engine._log_captured_watermark(None)  # legacy caller / retry without a watermark
+    assert captured == []
+
+
+def test_run_full_load_logs_the_captured_watermark(monkeypatch) -> None:
+    # End-to-end: a real run emits a "watermark captured" event after "run started".
+    from dsql_migrator.ui.data_migration import _engine
+
+    captured: list[str] = []
+    monkeypatch.setattr(
+        _engine, "log_activity",
+        lambda category, action, **kw: captured.append(action),
+    )
+
+    migrator = _FakeMigrator(rows_by_table={"orders": 10, "customers": 3})
+    _run_full_load_job(migrator, _tables())
+
+    assert "run started" in captured
+    assert "watermark captured" in captured
+    # It comes after "run started" (captured once, right after the snapshot).
+    assert captured.index("watermark captured") > captured.index("run started")
+
+
 def test_cdc_connector_failure_detail_localizes_the_fault() -> None:
     """A bare "connector X failed" cannot be troubleshot: it names no cause.
 

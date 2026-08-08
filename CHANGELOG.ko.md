@@ -5,7 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
-## v0.1.284
+## v0.1.285
+
+### 추가
+
+- **Full Load 워터마크(무손실 CDC 핸드오프의 정합성 지점)가 이제 활동 로그에 기록됩니다.** 워터마크는
+  스냅샷이 반영하는 정확한 소스 위치 — 이후 CDC 캐치업이 재개하는 좌표 — 를 고정하지만, 그동안 메모리상
+  job 레코드에만 저장돼서 다운로드한 `migration_activity.log`(변경 티켓에 첨부하는 산출물)에는 마이그레이션이
+  어느 소스 시점을 캡처했는지 기록이 없었습니다. 이제 Full Load가 스냅샷 직후 `[full_load] watermark
+  captured` 이벤트를 `INFO`로 기록합니다: GTID가 있으면 GTID(없으면 `binlog_file:position`, 그것도
+  없으면 바이너리 로깅 off/제한 시 "no coordinate available"), 스냅샷 UTC 타임스탬프, 카운트된 테이블 수,
+  그리고 그 카운트가 근사치 `information_schema` 추정인지 여부. 재실행도 재개한 원본 워터마크를 기록하므로
+  재실행에 걸쳐 감사 추적이 완전합니다. 이벤트는 로그 위치와 타임스탬프만 담습니다 — 행 값은 없음(Property 7).
 
 ### 추가
 

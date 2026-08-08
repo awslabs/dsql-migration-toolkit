@@ -5,7 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
-## v0.1.284
+## v0.1.285
+
+### Added
+
+- **The Full Load watermark (the gapless CDC-handoff consistency point) is now recorded
+  in the activity log.** The watermark pins the exact source position the snapshot
+  reflects — the coordinate a later CDC catch-up resumes from — but it was persisted only
+  on the in-memory job record, so the downloaded `migration_activity.log` (the artifact
+  teams attach to a change ticket) had no record of which source point-in-time the
+  migration captured. A Full Load now emits a `[full_load] watermark captured` event at
+  `INFO` right after the snapshot: the GTID when present (else the `binlog_file:position`,
+  else a plain "no coordinate available" when binary logging is off/restricted), the
+  snapshot UTC timestamp, the number of tables counted, and whether those counts are
+  approximate `information_schema` estimates. A retry logs the original watermark it
+  resumed against too, so the audit trail is complete across retries. The event carries
+  only a log position and a timestamp — never a row value (Property 7).
 
 ### Added
 
