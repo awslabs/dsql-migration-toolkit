@@ -988,6 +988,12 @@ def build_evaluation_screen(
         )
 
         def work(_handle: object) -> None:
+            log_activity(
+                ActivityCategory.ASSESSMENT,
+                "run assessment",
+                status=ActivityStatus.STARTED,
+                detail="assessing the source schema against Aurora DSQL",
+            )
             try:
                 result = run_evaluation(
                     inputs,

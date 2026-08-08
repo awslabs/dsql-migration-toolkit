@@ -5,7 +5,30 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
-## v0.1.285
+## v0.1.286
+
+### 추가
+
+- **활동 로그가 이제 Full Load 데이터 경로뿐 아니라 모든 단계에 걸쳐 여정의 핵심 결정과 판정을 기록합니다.**
+  다운로드한 `migration_activity.log`가 무엇을 담는지 감사한 결과, 마이그레이션을 *증명하고 종결하는* 단계가
+  대부분 빠져 있었습니다 — 로그는 적재는 기록했지만 결과가 검증됐는지, 운영자가 사인오프했는지는 남기지
+  않았습니다. 네 가지 갭을 메웁니다:
+  - **Validation 판정(4단계).** 검증 실행이 이제 `[validation] validation started` 이벤트(모드 + 테이블 수)와
+    `[validation] validation completed` 판정 — `MATCH`/`MISMATCH`, 모드(ROW_COUNT vs CHECKSUM), 일치/불일치
+    테이블 수(reconcile 시 errored/missing/extra 포함), 실패 테이블, cut-over 준비 여부 — 을 기록합니다. 깨끗한
+    일치는 `SUCCESS`, 불일치는 `FAILURE`로 기록해 no-go가 분명히 드러납니다. 이전엔 identity-sync만 로깅되고
+    판정 자체는 UI에만 있었습니다.
+  - **Cut-over 확인(5단계).** "I've cut over" 클릭이 이제 운영자가 사인오프한 release 상태를 지목하는
+    `[validation] cut over acknowledged` 이벤트를 기록합니다 — 깨끗한 일치, 또는 명시적으로 ACCEPT한 갭(영구
+    드롭된 행을 알고서 없이 마이그레이션). 마이그레이션의 결론이 이전엔 기록되지 않았습니다.
+  - **Schema apply 실행 요약(2단계).** 기존 객체별 라인에 더해, 이제 `[schema_conversion] schema apply started`와
+    `schema apply completed`에 롤업 — "N of M object(s) applied (C created, S skipped), F failed" — 을 기록합니다
+    (Full Load의 run started/completed 브래킷과 동일).
+  - **Assessment 시작 + migration type.** Evaluation이 이제 `STARTED` "run assessment" 이벤트를 기록하고(이전엔
+    성공/실패만), migration-type 선택(Full Load only / CDC only / both)이 선택 시점에 `[full_load] migration type
+    selected`로 기록됩니다 — 실제 변경 시에만이라 refresh로 재기록되지 않습니다.
+
+  모든 이벤트는 값이 없습니다(카운트·모드·테이블 이름만, 행 값은 없음 — Property 7).
 
 ### 추가
 

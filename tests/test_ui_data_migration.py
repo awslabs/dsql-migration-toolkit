@@ -11341,6 +11341,23 @@ def test_run_full_load_logs_the_captured_watermark(monkeypatch) -> None:
     assert captured.index("watermark captured") > captured.index("run started")
 
 
+def test_migration_type_selection_is_logged_on_a_real_change_only() -> None:
+    # The migration-type choice shapes the whole journey (Full Load only / CDC only /
+    # both) and is logged when it CHANGES -- but not re-logged when a refresh re-confirms
+    # the current tile (that would spam the log).
+    import inspect
+
+    from dsql_migrator.ui import data_migration as _dm
+
+    src = inspect.getsource(_dm)
+    assert '"migration type selected"' in src
+    # The log call sits inside the `if changed:` block (only a real change logs).
+    idx_changed = src.index("if changed:")
+    idx_log = src.index('"migration type selected"')
+    idx_refresh = src.index("refresh()", idx_changed)
+    assert idx_changed < idx_log < idx_refresh  # logged within the changed branch
+
+
 def test_cdc_connector_failure_detail_localizes_the_fault() -> None:
     """A bare "connector X failed" cannot be troubleshot: it names no cause.
 

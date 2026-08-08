@@ -2455,6 +2455,17 @@ def _render_migration_type_selector(
         migration_state.set_migration_type(new_type)
         if changed:
             migration_state.set_active_substep(None)  # default for the new type
+            # Record the migration-type choice in the audit trail: it is the decision
+            # that shapes the whole journey (Full Load only / CDC only / both), and it
+            # is chosen HERE, not at assessment time (where the default is not yet a
+            # real choice). Logged only on an actual change, so re-confirming the
+            # current tile on a refresh never spams the log.
+            log_activity(
+                ActivityCategory.FULL_LOAD,
+                "migration type selected",
+                status=ActivityStatus.INFO,
+                detail=f"migration type set to {new_type.value}",
+            )
         refresh()
 
     # Scroll anchor: the post-Full-Load "want CDC next?" notice sits far below this

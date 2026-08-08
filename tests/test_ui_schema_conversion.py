@@ -777,6 +777,44 @@ def test_run_schema_apply_surfaces_per_statement_detail() -> None:
     assert not result.detail.startswith("RuntimeError")
 
 
+def test_apply_summary_rolls_up_created_skipped_failed() -> None:
+    """The run-level "schema apply completed" summary counts and flags failures.
+
+    The per-object apply lines were logged, but nothing rolled them up -- so a 45-object
+    apply had no "42 of 45 applied, 3 failed" line the reader could see at a glance.
+    """
+    from dsql_migrator.ui.schema_conversion import _apply_summary
+
+    results = [
+        ObjectApplyResult(object_name="orders", status=ObjectApplyStatus.CREATED),
+        ObjectApplyResult(object_name="customers", status=ObjectApplyStatus.SKIPPED),
+        ObjectApplyResult(object_name="idx_x", status=ObjectApplyStatus.FAILED,
+                          detail="already exists"),
+    ]
+    any_failed, detail = _apply_summary(results)
+    assert any_failed is True  # -> the completed event is logged at FAILURE
+    assert detail == "2 of 3 object(s) applied (1 created, 1 skipped), 1 failed"
+
+    # An all-clean apply is not a failure.
+    clean = [ObjectApplyResult(object_name="t", status=ObjectApplyStatus.CREATED)]
+    any_failed2, detail2 = _apply_summary(clean)
+    assert any_failed2 is False
+    assert detail2 == "1 of 1 object(s) applied (1 created, 0 skipped), 0 failed"
+
+
+def test_schema_apply_brackets_the_run_with_start_and_summary_events() -> None:
+    # The apply work() logs a run-level "schema apply started" and "schema apply
+    # completed" around the per-object stream (mirrors Full Load's run started/completed).
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as _sc
+
+    src = inspect.getsource(_sc)
+    assert '"schema apply started"' in src
+    assert '"schema apply completed"' in src
+    assert "_apply_summary(results)" in src  # summary drives the completed event
+
+
 def test_edited_target_ddl_state_set_get_clear() -> None:
     state = SchemaConversionState()
     assert state.get_edited_target_ddl("orders") is None

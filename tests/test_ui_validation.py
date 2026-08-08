@@ -1478,6 +1478,113 @@ def test_validation_run_resyncs_identity_sequences_and_records_outcome() -> None
     assert advanced == {"orders": 1501, "order_items": 1502}
 
 
+def test_validation_run_logs_started_and_verdict(monkeypatch) -> None:
+    """Validation PROVES source == target -- its verdict belongs in the audit trail.
+
+    The verdict lived only in the UI, so the downloaded activity log had no record of
+    whether the migration was validated. A run now logs a "validation started" event and
+    a "validation completed" verdict (mode + match/mismatch + table counts).
+    """
+    from dsql_migrator.ui import validation as _v
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        _v, "log_activity",
+        lambda category, action, **kw: captured.append({"action": action, **kw}),
+    )
+
+    runner, state, manager = _build_runner_with_session(
+        source_verified=True, target_verified=True
+    )
+    runner()
+    assert state.job_id is not None
+    assert manager.wait(state.job_id, timeout=5.0) is True
+
+    actions = [e["action"] for e in captured]
+    assert "validation started" in actions
+    (verdict,) = [e for e in captured if e["action"] == "validation completed"]
+    # _report() is a clean match -> SUCCESS verdict, both tables matched.
+    assert verdict["status"].value == "success"
+    assert "MATCH" in verdict["detail"]
+    assert "2/2 table(s) matched" in verdict["detail"]
+    assert "ready for cut-over" in verdict["detail"]
+
+
+def test_validation_verdict_is_failure_on_mismatch(monkeypatch) -> None:
+    # A mismatch verdict is logged at FAILURE so a no-go reads loud in the log.
+    from dsql_migrator.core.models import AssessmentReport, TargetInventory
+    from dsql_migrator.ui import validation as _v
+    from dsql_migrator.ui.data_migration import DataMigrationStore
+    from dsql_migrator.ui.evaluation import EvaluationResult, EvaluationStore
+    from dsql_migrator.ui.session import SessionStore
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        _v, "log_activity",
+        lambda category, action, **kw: captured.append({"action": action, **kw}),
+    )
+
+    session_id = "mismatch1"
+    store = SessionStore()
+    eval_store = EvaluationStore()
+    validation_store = ValidationStore()
+    manager = JobManager()
+    session = store.get_or_create(session_id)
+    session.set_source(SourceConnectionConfig(host="db", database="app"), SecretValue("pw"))
+    session.set_target(TargetConnectionConfig(
+        cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"))
+    session.set_source_verified(True)
+    session.set_target_verified(True)
+    eval_store.get_or_create(session_id).set_result(EvaluationResult(
+        inventory=_inventory(), assessment=AssessmentReport.from_items([]),
+        target_inventory=TargetInventory(), target_conflicts=[]))
+
+    _content, runner = build_validation_screen(
+        store, session_id, job_manager=manager, eval_store=eval_store,
+        migration_store=DataMigrationStore(), validation_store=validation_store,
+        validator_factory=lambda _i: _FakeValidator(_report(matched=False)),
+    )
+    runner()
+    state = validation_store.get_or_create(session_id)
+    assert state.job_id is not None
+    assert manager.wait(state.job_id, timeout=5.0) is True
+
+    (verdict,) = [e for e in captured if e["action"] == "validation completed"]
+    assert verdict["status"].value == "failure"
+    assert "MISMATCH" in verdict["detail"]
+    assert "1 mismatched" in verdict["detail"]
+
+
+def test_cut_over_acknowledgement_is_logged(monkeypatch) -> None:
+    """Clicking "I've cut over" records the journey's conclusion + release state."""
+    from dsql_migrator.ui import validation as _v
+    from dsql_migrator.ui.session import SessionStore
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        _v, "log_activity",
+        lambda category, action, **kw: captured.append({"action": action, **kw}),
+    )
+
+    session_id = "cutover1"
+    store = SessionStore()
+    validation_store = ValidationStore()
+    manager = JobManager()
+
+    # A clean-match validation result so the release state is "clean".
+    vstate = validation_store.get_or_create(session_id)
+    vstate.set_result(_report(matched=True))
+
+    _content, runner = _v.build_cutover_screen(
+        store, session_id, validation_store=validation_store, job_manager=manager,
+    )
+    runner()
+
+    (ack,) = [e for e in captured if e["action"] == "cut over acknowledged"]
+    assert ack["status"].value == "success"
+    assert "clean match" in ack["detail"]
+
+
 def test_resync_identity_sequences_partitions_advanced_failed_and_never_raises() -> None:
     from dsql_migrator.ui.validation import resync_identity_sequences
 

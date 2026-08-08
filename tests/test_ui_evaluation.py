@@ -786,6 +786,19 @@ def test_background_run_finishes_done_and_records_result() -> None:
     assert len(eval_state.result.assessment.items) == 2
 
 
+def test_assessment_logs_a_started_event_before_running() -> None:
+    # The assessment logged only success/failure; a "started" event now brackets the run
+    # so the audit trail shows when it began (mirrors the other stages' started events).
+    import inspect
+
+    from dsql_migrator.ui import evaluation as _e
+
+    src = inspect.getsource(_e)
+    # A STARTED "run assessment" event exists in the work() closure.
+    assert 'status=ActivityStatus.STARTED' in src
+    assert src.count('"run assessment"') >= 3  # started + success + failure
+
+
 def test_background_run_failure_maps_to_failed_status() -> None:
     manager = JobManager()
 

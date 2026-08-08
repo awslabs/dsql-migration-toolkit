@@ -5,7 +5,33 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
-## v0.1.285
+## v0.1.286
+
+### 追加
+
+- **アクティビティログが、Full Load のデータ経路だけでなく、すべてのステージにわたって旅程の重要な決定と
+  判定を記録するようになりました。** ダウンロードした `migration_activity.log` が何を記録しているか監査した
+  ところ、マイグレーションを*証明し締めくくる*ステージがほとんど欠けていました — ログは読み込みは記録して
+  いましたが、結果が検証されたか、オペレーターが承認したかは残していませんでした。4 つのギャップを埋めます:
+  - **Validation の判定(ステップ 4)。** 検証の実行が `[validation] validation started` イベント(モード +
+    テーブル数)と `[validation] validation completed` 判定 — `MATCH`/`MISMATCH`、モード(ROW_COUNT vs
+    CHECKSUM)、一致/不一致のテーブル数(reconcile 時は errored/missing/extra を含む)、失敗テーブル、
+    cut-over 可否 — を記録するようになりました。クリーンな一致は `SUCCESS`、不一致は `FAILURE` で記録し、
+    no-go がはっきり分かります。以前は identity-sync のみが記録され、判定自体は UI にしかありませんでした。
+  - **Cut-over の確認(ステップ 5)。**「I've cut over」のクリックが、オペレーターが承認した release 状態を示す
+    `[validation] cut over acknowledged` イベントを記録するようになりました — クリーンな一致、または明示的に
+    ACCEPT したギャップ(恒久的に削除された行を承知の上で移行)。マイグレーションの結論は以前は記録されて
+    いませんでした。
+  - **Schema apply の実行サマリー(ステップ 2)。** 既存のオブジェクト単位の行に加えて、
+    `[schema_conversion] schema apply started` と `schema apply completed` にロールアップ — 「N of M object(s)
+    applied (C created, S skipped), F failed」 — を記録します(Full Load の run started/completed のブラケットと
+    同じ)。
+  - **Assessment の開始 + migration type。** Evaluation が `STARTED`「run assessment」イベントを記録するように
+    なり(以前は成功/失敗のみ)、migration-type の選択(Full Load only / CDC only / both)が選択された時点で
+    `[full_load] migration type selected` として記録されます — 実際の変更時のみで、リフレッシュでは再記録され
+    ません。
+
+  すべてのイベントは値を含みません(カウント・モード・テーブル名のみ、行の値はなし — Property 7)。
 
 ### 追加
 

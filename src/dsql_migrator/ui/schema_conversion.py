@@ -242,6 +242,24 @@ def format_statement_summary(statements: Sequence[StatementApplyResult]) -> str:
     return "; ".join(parts)
 
 
+def _apply_summary(results: Sequence[ObjectApplyResult]) -> tuple[bool, str]:
+    """Roll a per-object apply result list into ``(any_failed, summary_detail)``.
+
+    The run-level "schema apply completed" line: "N of M object(s) applied (C created,
+    S skipped), F failed". ``any_failed`` drives the event's SUCCESS/FAILURE status so a
+    run with any failure reads loud. Pure, so it is unit-tested without a screen harness.
+    """
+    created = sum(1 for r in results if r.status is ObjectApplyStatus.CREATED)
+    skipped = sum(1 for r in results if r.status is ObjectApplyStatus.SKIPPED)
+    failed = sum(1 for r in results if r.status is ObjectApplyStatus.FAILED)
+    total = len(results)
+    detail = (
+        f"{created + skipped} of {total} object(s) applied "
+        f"({created} created, {skipped} skipped), {failed} failed"
+    )
+    return failed > 0, detail
+
+
 class ObjectApplyError(RuntimeError):
     """Raised when one or more statements of an object failed to apply.
 
@@ -2325,6 +2343,16 @@ def build_schema_conversion_screen(
 
         def work(_handle: object) -> None:
             conv_state.start_apply(len(objects))
+            # Bracket the per-object stream with a run-level start/summary so the
+            # downloadable log has a "42 of 45 applied, 3 failed" roll-up (mirroring
+            # Full Load's run started/completed), not just an unbracketed list of
+            # per-object lines the reader must tally by hand.
+            log_activity(
+                ActivityCategory.SCHEMA_CONVERSION,
+                "schema apply started" if not merge else "schema apply retry started",
+                status=ActivityStatus.STARTED,
+                detail=f"applying {len(objects)} object(s) to the target",
+            )
 
             def _record_and_log(result: ObjectApplyResult) -> None:
                 # Record live progress, then log the per-object outcome to the
@@ -2359,6 +2387,16 @@ def build_schema_conversion_screen(
                 conv_state.merge_apply_results(results)
             else:
                 conv_state.set_apply_results(results)
+
+            any_failed, summary_detail = _apply_summary(results)
+            log_activity(
+                ActivityCategory.SCHEMA_CONVERSION,
+                "schema apply completed",
+                # A failed object already logged its own FAILURE line; the summary is
+                # FAILURE when any object failed so the run-level verdict is loud too.
+                status=ActivityStatus.FAILURE if any_failed else ActivityStatus.SUCCESS,
+                detail=summary_detail,
+            )
 
         conv_state.job_id = job_manager.submit(work)
 

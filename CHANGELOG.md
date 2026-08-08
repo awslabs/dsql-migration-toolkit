@@ -5,7 +5,39 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
-## v0.1.285
+## v0.1.286
+
+### Added
+
+- **The activity log now records the journey's key decisions and verdicts across every
+  stage, not just the Full Load data path.** An audit of what the downloadable
+  `migration_activity.log` captured found that the stages proving and concluding a
+  migration were largely absent — the log recorded the load, but not whether the result
+  was validated or that the operator signed off. Four gaps are closed:
+  - **Validation verdict (Step 4).** A validation run now logs a `[validation] validation
+    started` event (mode + table count) and a `[validation] validation completed` verdict
+    — `MATCH`/`MISMATCH`, the mode (ROW_COUNT vs CHECKSUM), how many tables matched vs
+    mismatched (plus errored / missing / extra where reconciled), the failing tables, and
+    whether it is ready for cut-over. Logged `SUCCESS` on a clean match, `FAILURE` on a
+    mismatch, so a no-go reads loud. Previously only the identity-sequence re-sync was
+    logged; the verdict itself lived only in the UI.
+  - **Cut-over acknowledgement (Step 5).** Clicking "I've cut over" now logs a
+    `[validation] cut over acknowledged` event naming the release state the operator
+    signed off on — a clean match, or an explicitly ACCEPTED gap (rows permanently
+    dropped and knowingly migrated without). The migration's conclusion was previously
+    unrecorded.
+  - **Schema apply run summary (Step 2).** In addition to the existing per-object lines,
+    a schema apply now logs `[schema_conversion] schema apply started` and
+    `schema apply completed` with a roll-up — "N of M object(s) applied (C created, S
+    skipped), F failed" — mirroring Full Load's run started/completed bracketing.
+  - **Assessment start + migration type.** Evaluation now logs a `STARTED` "run
+    assessment" event (it previously logged only success/failure), and the migration-type
+    choice (Full Load only / CDC only / both) is logged as `[full_load] migration type
+    selected` at the point it is chosen — only on an actual change, so a refresh never
+    re-logs it.
+
+  All events are value-free (counts, modes, and table names — never a row value,
+  Property 7).
 
 ### Added
 
