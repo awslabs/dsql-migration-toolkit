@@ -419,6 +419,28 @@ def _classify_vpc_subnets(
     return classified, cidrs, _extract_routed_cidrs(route_tables)
 
 
+def _vpc_exists(ec2_client: BotoSessionLike, vpc_id: str) -> bool:
+    """Return whether ``vpc_id`` resolves to a VPC in this account/region.
+
+    Used only to sharpen the "no subnets" diagnosis: a nonexistent id (the typical
+    wrong-VpcId typo) vs a real VPC with no subnets. AWS signals "not found" two ways
+    for ``describe_vpcs`` -- an ``InvalidVpcID.NotFound`` error for a well-formed id
+    that isn't there, or an empty ``Vpcs`` list -- and both mean "does not exist" here,
+    so both return ``False``. A genuinely uncertain answer (a permissions error, a
+    throttle) is treated as "exists" (returns ``True``) so this NEVER turns an
+    unrelated API failure into a misleading "VPC not found" -- the caller then falls
+    through to the real-VPC message, and the blocking submit path surfaces the API
+    error on its own. Read-only.
+    """
+    try:
+        resp = ec2_client.describe_vpcs(VpcIds=[vpc_id])  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001
+        # "Not found" for a well-formed-but-absent id is the one error that means
+        # "does not exist"; anything else is uncertainty -> assume it exists.
+        return "NotFound" not in f"{type(exc).__name__}{exc}"
+    return bool(resp.get("Vpcs") or [])
+
+
 def _vpc_cidr_blocks(ec2_client: BotoSessionLike, vpc_id: str) -> list[str]:
     """Return a VPC's associated IPv4 CIDR blocks (primary + secondary)."""
     try:
@@ -495,11 +517,26 @@ def diagnose_cdc_network(
 
     classified, cidrs, routed_cidrs = _classify_vpc_subnets(ec2_client, vpc_id)
     if not classified:
+        # No subnets can mean two very different things, and conflating them
+        # misdirects the fix. The most common cause is a mistyped/pasted-wrong VpcId
+        # (the VPC simply does not exist in this account/region) -- telling that user
+        # to "check the region" sends them the wrong way. So distinguish: a VPC that
+        # cannot be found gets a "check the VPC ID" message; a real VPC that genuinely
+        # has no subnets gets the "add subnets / check region" message.
+        if not _vpc_exists(ec2_client, vpc_id):
+            return CdcNetworkDiagnosis(
+                mode="blocked",
+                reason=(
+                    f"VPC '{vpc_id}' was not found in this account and region — "
+                    "check the VPC ID (a typo is the usual cause), and confirm it is "
+                    "in the same region as your Aurora DSQL cluster."
+                ),
+            )
         return CdcNetworkDiagnosis(
             mode="blocked",
             reason=(
-                f"No subnets found in VPC '{vpc_id}'. Ensure the VPC is in the "
-                "same region as your Aurora DSQL cluster."
+                f"VPC '{vpc_id}' exists but has no subnets. Add subnets (in >=2 AZs "
+                "for MSK Serverless), or enter connector subnet ids manually."
             ),
         )
 

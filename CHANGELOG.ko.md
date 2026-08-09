@@ -5,7 +5,22 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
-## v0.1.289
+## v0.1.290
+
+### 변경
+
+- **CDC 인프라 배포에서 잘못된 VpcId를 넣었을 때, 리전으로 오도하지 않고 VPC ID를 가리키는 메시지를 줍니다.**
+  VpcId는 툴이 추론할 수 없는 유일한 값이라 오타가 흔한 실수이며, 이미 프리플라이트 네트워크 진단(VpcId에서
+  subnet을 해석)이 과금되는 CloudFormation 생성 전에 일찍 잡아냅니다. 그러나 존재하지 않는 VPC와 실재하지만
+  subnet이 없는 VPC가 똑같이 "No subnets found in VPC 'X'. Ensure the VPC is in the same region…" 문구를 냈고,
+  이는 VPC가 존재한다고 전제해 단순히 id를 잘못 친 사용자를 엉뚱한 방향으로 보냈습니다. 이제
+  `diagnose_cdc_network`이 둘을 구분합니다: VpcId가 subnet을 하나도 못 찾으면 VPC 존재 여부를
+  확인(`describe_vpcs`)해 "VPC 'X' was not found in this account and region — check the VPC ID (a typo is the
+  usual cause)…" 또는 "VPC 'X' exists but has no subnets. Add subnets (in >=2 AZs…)" 중 하나를 반환합니다.
+  진짜로 불확실한 조회(`describe_vpcs`의 권한 오류/스로틀)는 "존재함"으로 처리해, 무관한 API 실패가 "VPC 없음"
+  으로 위장하지 않게 합니다 — 그 경우 real-VPC 메시지로 흘러가고 차단형 submit 경로가 API 오류 자체를 표시합니다.
+  (프리플라이트 게이트, 배포 중 실패 표면화, `ROLLBACK_COMPLETE` delete-후-재배포 복구는 이미 갖춰져 있었고,
+  이번엔 가장 흔한 잘못된-VpcId 메시지만 정교화합니다.)
 
 ### 변경
 

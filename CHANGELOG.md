@@ -5,7 +5,27 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
-## v0.1.289
+## v0.1.290
+
+### Changed
+
+- **A wrong VpcId in the CDC-infrastructure deploy now gets a message that points at the
+  VPC ID, instead of misdirecting toward the region.** VpcId is the one value the tool
+  cannot infer, so a typo is a common mistake — and it is already caught early (before
+  any billable CloudFormation create) by the pre-flight network diagnosis, which resolves
+  subnets from the VpcId. But a nonexistent VPC and a real-but-empty VPC both produced the
+  same "No subnets found in VPC 'X'. Ensure the VPC is in the same region…" text, which
+  implies the VPC exists and sends a user who simply mistyped the id to check the wrong
+  thing. `diagnose_cdc_network` now distinguishes the two: when a VpcId resolves to no
+  subnets it checks whether the VPC exists (`describe_vpcs`) and returns either "VPC 'X'
+  was not found in this account and region — check the VPC ID (a typo is the usual
+  cause)…" or "VPC 'X' exists but has no subnets. Add subnets (in >=2 AZs…)". A genuinely
+  uncertain lookup (a permissions error / throttle on `describe_vpcs`) is treated as
+  "exists" so an unrelated API failure can never masquerade as "VPC not found" — that case
+  falls through to the real-VPC message and the blocking submit path still surfaces the
+  API error itself. (The pre-flight gate, the deploy-time failure surfacing, and the
+  `ROLLBACK_COMPLETE` delete-and-redeploy recovery were already in place — this only
+  sharpens the most common wrong-VpcId message.)
 
 ### Changed
 

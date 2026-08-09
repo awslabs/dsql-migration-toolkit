@@ -5,7 +5,23 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
-## v0.1.289
+## v0.1.290
+
+### 変更
+
+- **CDC インフラのデプロイで誤った VpcId を入力したとき、リージョンへ誤誘導せず、VPC ID を指すメッセージを
+  返すようになりました。** VpcId はツールが推論できない唯一の値なので入力ミスがよくある間違いで、既に
+  プリフライトのネットワーク診断(VpcId から subnet を解決)が課金対象の CloudFormation 作成の前に早期に
+  捕捉します。しかし、存在しない VPC と実在するが subnet のない VPC が同じ「No subnets found in VPC 'X'.
+  Ensure the VPC is in the same region…」という文言を出しており、VPC が存在する前提で、単に id を打ち間違えた
+  ユーザーを誤った方向へ導いていました。今後 `diagnose_cdc_network` は両者を区別します:VpcId が subnet を
+  1 つも見つけられない場合、VPC の存在を確認(`describe_vpcs`)し、「VPC 'X' was not found in this account and
+  region — check the VPC ID (a typo is the usual cause)…」または「VPC 'X' exists but has no subnets. Add
+  subnets (in >=2 AZs…)」のいずれかを返します。本当に不確実な照会(`describe_vpcs` の権限エラー/スロットル)は
+  「存在する」として扱い、無関係な API 障害が「VPC が見つからない」に化けないようにします — その場合は
+  real-VPC メッセージへ進み、ブロッキングの submit 経路が API エラー自体を表示します。(プリフライトゲート、
+  デプロイ時の失敗表面化、`ROLLBACK_COMPLETE` の削除→再デプロイ復旧は既に備わっており、今回は最も一般的な
+  誤 VpcId のメッセージを精緻化するだけです。)
 
 ### 変更
 

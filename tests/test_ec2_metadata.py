@@ -285,10 +285,32 @@ def test_diagnose_create_uses_secondary_cidr_when_primary_full() -> None:
     assert d.private_subnet_cidrs[0].startswith("10.1.")
 
 
-def test_diagnose_empty_vpc_blocked() -> None:
-    d = diagnose_cdc_network(_FakeEc2Vpc([], [], []), "vpc-1")
+def test_diagnose_nonexistent_vpc_says_not_found() -> None:
+    # No subnets AND describe_vpcs returns no VPC -> the typical wrong-VpcId typo.
+    # The message must point at the VPC ID, not misdirect toward "wrong region".
+    d = diagnose_cdc_network(_FakeEc2Vpc([], [], []), "vpc-typo")
     assert d.mode == "blocked"
-    assert "No subnets" in d.reason
+    assert "was not found" in d.reason
+    assert "check the VPC ID" in d.reason
+    assert "vpc-typo" in d.reason
+
+
+def test_diagnose_real_vpc_with_no_subnets_says_add_subnets() -> None:
+    # No subnets BUT the VPC exists -> a real-but-empty VPC; distinct guidance.
+    d = diagnose_cdc_network(_FakeEc2Vpc([], [], [_vpc("10.0.0.0/16")]), "vpc-1")
+    assert d.mode == "blocked"
+    assert "exists but has no subnets" in d.reason
+    assert "not found" not in d.reason
+
+
+def test_vpc_exists_treats_api_uncertainty_as_exists() -> None:
+    # A permissions/throttle error on describe_vpcs must NOT masquerade as "not found"
+    # (that would send a user with a correct VpcId to fix a non-problem). Uncertain =>
+    # assume it exists, so the diagnosis falls through to the real-VPC message.
+    from dsql_migrator.core.ec2_metadata import _vpc_exists
+
+    client = _FakeEc2Vpc([], [], [], raise_on={"describe_vpcs"})  # raises RuntimeError
+    assert _vpc_exists(client, "vpc-1") is True
 
 
 def test_diagnose_api_error_raises() -> None:
