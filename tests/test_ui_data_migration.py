@@ -13650,6 +13650,34 @@ def test_lob_exclusion_lock_names_cdc_start_when_streaming_started() -> None:
     assert reason is not None and "Stop CDC" in reason
 
 
+def test_lob_exclusion_locks_once_a_full_load_committed_under_the_set() -> None:
+    """The full_load_only -> cdc_only split-brain gap: a completed Full Load's exclusion
+    must not be editable after switching to cdc_only to add replication.
+
+    A full_load_only run excludes a column and loads (rows land NULL). The tool then
+    invites the user to switch to cdc_only and stream onto the already-loaded target. In
+    that state nothing is deployed/streaming, so the CDC-step LOB card was editable --
+    un-excluding the column would make CDC populate it for post-snapshot changes while
+    loaded rows stay NULL (silent split-brain). The lock now fires on the committed load
+    (via full_load_committed), NOT released by deleting the stack; remedy is Start over.
+    """
+    from dsql_migrator.ui.data_migration._cdc_ui import lob_exclusion_lock
+
+    # Nothing deployed, nothing streaming -- the pre-deploy window that used to be open.
+    state = DataMigrationState()
+    locked, reason = lob_exclusion_lock(
+        state, _LockJobManager(), full_load_committed=True
+    )
+    assert locked
+    assert reason is not None
+    assert "Full Load has already loaded data" in reason
+    assert "Start over" in reason  # the correct re-scope remedy (not delete+redeploy)
+
+    # Without the committed-load signal the same pre-deploy state stays editable
+    # (a genuine fresh cdc_only run has nothing loaded yet).
+    assert lob_exclusion_lock(state, _LockJobManager()) == (False, None)
+
+
 def _render_lob_panel(*, locked: bool, lock_reason=None):
     """Render the LOB panel with one exclusion candidate and return the UI double."""
     from dsql_migrator.ui.data_migration import _cdc_ui

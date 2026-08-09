@@ -1664,6 +1664,10 @@ def build_data_migration_screen(
                             migration_type=migration_type,
                             run_checks=run_checks,
                             session=session,
+                            # So the CDC-step LOB card can lock once a Full Load has
+                            # committed data under an exclusion set (survives a switch
+                            # to cdc_only): FULL_LOAD stays DONE across the switch.
+                            full_load_status=status,
                         )
                         with ui.row().classes(
                             "!flex w-full justify-start items-center"

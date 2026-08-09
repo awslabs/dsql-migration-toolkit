@@ -5,7 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
-## v0.1.287
+## v0.1.288
+
+### 수정
+
+- **Full Load이 이미 특정 제외 셋으로 데이터를 적재한 뒤에는 oversized-LOB 제외를 더 이상 편집할 수 없습니다
+  — `full_load_only` → `cdc_only` 경로의 조용한 split-brain을 차단합니다.** 이 제외는 Full Load과 CDC가
+  공유하는 마이그레이션 전역 단일 선택입니다. Full Load 화면에서는 적재 후 올바르게 잠깁니다
+  (`selection_lock_reason`의 `has_job or status is DONE`). 그러나 `full_load_only` 마이그레이션이 어떤 컬럼을
+  제외한 채 완료되고(그 컬럼은 `NULL`로 적재됨) 운영자가 복제를 추가하려고 migration type을 `cdc_only`로
+  전환하면 — full-load-only 완료 후 툴이 직접 권하는 경로 — 카드가 CDC 단계의 자리로 옮겨가는데, 그쪽 잠금
+  (`lob_exclusion_lock`)은 CDC 스트리밍/인프라 배포 상태만 확인하고 "Full Load이 이미 이 셋으로 커밋함"
+  조건이 **없었습니다**. 그래서 배포 전 창에서 운영자가 그 컬럼을 **제외 해제**할 수 있었고, 그러면 CDC가
+  스냅샷 이후 변경 행에 대해 그 컬럼을 채우는 동안 이미 적재된 행은 `NULL`로 남거나(조용한 부분 데이터),
+  반대로 적재된 컬럼에 **제외를 추가**하면 CDC가 그 갱신을 버려 타깃이 stale해졌습니다. 이제
+  `lob_exclusion_lock`이 `full_load_committed` 신호(`FULL_LOAD` 스텝이 `DONE`이거나 job 존재 — 둘 다 type
+  전환에도 유지)를 받아, 적재가 커밋됐으면 **양방향** 모두 카드를 잠그고 유일한 올바른 재스코프로 *Start over*를
+  안내합니다(CDC 스택 삭제로는 해제되지 않음 — 적재가 실제로 이 셋으로 실행됨). 아무것도 적재하지 않은 순수
+  `cdc_only` 실행은 영향 없고(배포 전까지 편집 가능), 단일 `full_load_and_cdc` 실행도 원래 영향 없었습니다(카드가
+  Full Load 화면에 남아 잠김). 커밋된-적재 잠금에 대한 회귀 테스트를 추가했습니다.
 
 ### 변경
 

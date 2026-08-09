@@ -5,7 +5,31 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
-## v0.1.287
+## v0.1.288
+
+### Fixed
+
+- **The oversized-LOB exclusion can no longer be edited after a Full Load already loaded
+  data under it — closing a silent split-brain in the `full_load_only` → `cdc_only`
+  path.** The exclusion is a single migration-wide selection shared by Full Load and CDC.
+  On the Full Load screen it correctly locks once the load has run (`selection_lock_reason`'s
+  `has_job or status is DONE`). But when a `full_load_only` migration completed with a
+  column excluded (rows loaded with that column `NULL`) and the operator then switched the
+  migration type to `cdc_only` to add replication — a path the tool itself suggests after a
+  full-load-only run — the card moved to its CDC-step home, whose lock
+  (`lob_exclusion_lock`) only checked CDC-streaming / infra-deployed state and had **no**
+  "a Full Load already committed under this set" clause. So in the pre-deploy window the
+  operator could **un-exclude** the column: CDC would then capture it for rows changed
+  after the snapshot while the already-loaded rows stayed `NULL` (silent partial data) —
+  or, symmetrically, **add** an exclusion for a column the load populated, so CDC dropped
+  its updates and the target went stale. `lob_exclusion_lock` now takes a
+  `full_load_committed` signal (the `FULL_LOAD` step is `DONE` or a job exists — both
+  survive the type switch) and locks the card in **both** tick directions when a load has
+  committed, naming *Start over* as the only correct re-scope (deleting the CDC stack does
+  not release it — the load really ran against this set). A genuine fresh `cdc_only` run
+  with nothing loaded is unaffected (still editable until deploy), and a single
+  `full_load_and_cdc` run was never affected (its card stays on the Full Load screen,
+  locked). Adds a regression test for the committed-load lock.
 
 ### Changed
 

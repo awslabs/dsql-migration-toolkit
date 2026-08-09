@@ -225,6 +225,7 @@ def _render_cdc_step(
     migration_type: "MigrationType" = MigrationType.CDC_ONLY,
     run_checks=None,
     session: object = None,
+    full_load_status: "Optional[StepStatus]" = None,
 ) -> None:
     """Render the CDC step in user-journey order: decide -> prepare -> start ->
     monitor -> reference.
@@ -275,7 +276,18 @@ def _render_cdc_step(
     # think a post-Full-Load tick still changes what the completed load wrote. CDC
     # only has no Full Load screen, so this is its single home.
     if migration_type is MigrationType.CDC_ONLY:
-        lob_locked, lob_lock_reason = lob_exclusion_lock(migration_state, job_manager)
+        # A Full Load committed under an exclusion set survives a switch to cdc_only:
+        # the FULL_LOAD workflow step stays DONE (even after the job record is pruned)
+        # and job_id persists. Either signal means the exclusion is baked into loaded
+        # data and must not change now (silent split-brain) -- so lock the card, exactly
+        # as selection_lock_reason locks the Full Load screen's copy on `has_job or DONE`.
+        full_load_committed = (
+            full_load_status is StepStatus.DONE
+            or getattr(migration_state, "job_id", None) is not None
+        )
+        lob_locked, lob_lock_reason = lob_exclusion_lock(
+            migration_state, job_manager, full_load_committed=full_load_committed
+        )
         _render_cdc_lob_exclusion_panel(
             ui,
             migration_state,
@@ -4795,7 +4807,9 @@ def _render_cdc_error_download(ui, migration_state, log_key: str) -> None:
         "editor."
     )
 
-def lob_exclusion_lock(migration_state, job_manager) -> tuple[bool, Optional[str]]:
+def lob_exclusion_lock(
+    migration_state, job_manager, *, full_load_committed: bool = False
+) -> tuple[bool, Optional[str]]:
     """Return ``(locked, reason)`` for the LOB-exclusion tick boxes.
 
     The selection is not a live setting: it is baked into the cdc-stack's
@@ -4822,8 +4836,29 @@ def lob_exclusion_lock(migration_state, job_manager) -> tuple[bool, Optional[str
     infrastructure and redeploy with the new set (a fresh offset + re-run), which is
     the remedy named below -- matching how the table picker locks on the same phase.
 
+    ``full_load_committed`` is the FIRST and strongest clause: a Full Load has already
+    committed rows to the target under a specific exclusion set (a completed
+    ``full_load_only`` run, whose ``WorkflowStep.FULL_LOAD`` status stays ``DONE`` and
+    whose ``job_id`` survives even after the type is switched to ``cdc_only`` to add
+    replication). Editing the exclusion THEN is silent split-brain in EITHER direction:
+    UN-excluding a column CDC then captures for post-snapshot changes while the loaded
+    rows stay NULL; ADDING one makes CDC drop updates to a column the load populated,
+    going stale. This clause is NOT released by deleting the cdc-stack (the load really
+    ran against this set), so the only re-scope is Start over -- exactly like
+    ``selection_lock_reason``'s ``has_job or status is DONE`` clause, which governs the
+    Full Load screen's copy of this card. Without it, switching to ``cdc_only`` after a
+    load moved the card to this (pre-deploy, weakly-locked) home and left it editable.
+
     Pure apart from reading the job's status through ``job_manager``; no AWS I/O.
     """
+    if full_load_committed:
+        return True, (
+            "Locked — a Full Load has already loaded data using this exclusion set, so "
+            "the excluded columns are fixed for this migration (changing them now would "
+            "leave the already-loaded rows inconsistent with what CDC captures — the "
+            "un-excluded column would be NULL on loaded rows but populated on later "
+            "changes, or vice versa). To migrate a different column set, use 'Start over'."
+        )
     if cdc_streaming_started(migration_state, job_manager):
         return True, (
             "Locked — the excluded columns were handed to the source connector when "
