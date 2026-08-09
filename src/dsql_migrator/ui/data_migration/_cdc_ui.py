@@ -1378,7 +1378,7 @@ def _render_cdc_redeploy_prompt(ui, migration_state, refresh) -> None:
             "Redeploy CDC infrastructure", on_click=_confirm
         ).props("outline size=sm").classes("normal-case")
     ui.label(  # type: ignore[attr-defined]
-        "Rebuilding creates a new MSK Serverless cluster and takes ~15-20 minutes; "
+        "Rebuilding creates a new MSK Serverless cluster and takes ~10-15 minutes; "
         "it is billable. Leave this alone if you are done with CDC."
     ).classes("text-xs text-gray-500")
 
@@ -2002,7 +2002,7 @@ def _render_cdc_infra_prep_section(
             busy=True,  # ~15-20 min live operation: spinner + "In progress" badge
             header="Deploying in the background — start your Full Load now",
             body=(
-                "Amazon MSK takes ~15-20 minutes to provision. Nothing is streaming "
+                "Amazon MSK takes ~10-15 minutes to provision. Nothing is streaming "
                 "yet, so this does not hold up the snapshot: continue to Full Load "
                 "and let the two run together. You can leave this screen; progress "
                 "is kept and shown when you return."
@@ -2055,7 +2055,7 @@ def _render_cdc_infra_prep_section(
         icon="schedule",
         header="Deploy now so it is ready when the Full Load finishes",
         body=(
-            "CDC needs Amazon MSK, which takes ~15-20 minutes to provision and bills "
+            "CDC needs Amazon MSK, which takes ~10-15 minutes to provision and bills "
             "while it exists. Deploying it here lets it run WHILE your Full Load "
             "does, instead of waiting afterwards — the snapshot is unaffected, and "
             "no data streams until you explicitly start CDC. You can also skip this "
@@ -2192,7 +2192,7 @@ def _render_cdc_infra_deploy_action(
     ui.label(  # type: ignore[attr-defined]
         "No cdc-stack is deployed yet. Provide your VPC and the plugin/source "
         "details below, then deploy the infrastructure (MSK Serverless, the "
-        "connector networking, plugins and IAM role). This takes ~15-20 minutes "
+        "connector networking, plugins and IAM role). This takes ~10-15 minutes "
         "and creates billable AWS resources; connectors are created later by "
         "Start CDC."
     ).classes("text-xs text-gray-600")
@@ -2588,7 +2588,7 @@ async def _open_cdc_infra_dialog(ui, migration_state, on_confirm, *, session=Non
         ui.label(  # type: ignore[attr-defined]
             f"This creates the cdc-stack '{stack_name}' (CloudFormation): an MSK "
             "Serverless cluster, connector networking in your VPC, the plugins and "
-            "an IAM role. It takes about 15-20 minutes and creates billable AWS "
+            "an IAM role. It takes about 10-15 minutes and creates billable AWS "
             "resources. No connectors are created yet — run Start CDC afterwards."
         ).classes("text-sm text-gray-700")
         # Pre-flight connection check: surface a not-ready source/target up front
@@ -3453,7 +3453,7 @@ async def _start_cdc_infra_deploy(
     )
     migration_state.set_cdc_deploy_job_id(job_id, kind="infra")
     _log_cdc_event(_action, detail=_detail)
-    ui.notify("Infrastructure deploy started (~15-20 min).", type="positive", position="top")  # type: ignore[attr-defined]
+    ui.notify("Infrastructure deploy started (~10-15 min).", type="positive", position="top")  # type: ignore[attr-defined]
     refresh()
 
 def _start_cdc_stop(

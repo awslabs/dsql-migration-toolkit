@@ -1624,7 +1624,7 @@ def build_data_migration_screen(
                                 if not infra_ready:
                                     body += (
                                         " CDC streaming infrastructure isn't deployed "
-                                        "yet, so you'll deploy it first (~15–20 min) "
+                                        "yet, so you'll deploy it first (~10–15 min) "
                                         "on the CDC step."
                                     )
                                 render_notice(

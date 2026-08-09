@@ -1451,7 +1451,7 @@ def _cdc_teardown_banner_copy(
         return (
             "info",
             "CDC infrastructure is deploying in the background",
-            f"Provisioning '{stack}' (Amazon MSK, ~15–20 min). Nothing is streaming "
+            f"Provisioning '{stack}' (Amazon MSK, ~10–15 min). Nothing is streaming "
             "yet, so this does not block the Full Load — start it now and let the two "
             "run together. This banner clears itself when the deploy finishes.",
         )

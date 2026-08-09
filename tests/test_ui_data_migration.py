@@ -7538,7 +7538,7 @@ def test_cdc_infra_prep_section_renders_the_overlap_guidance() -> None:
     assert "CDC streaming infrastructure" in joined
     assert "Not deployed" in joined
     assert "WHILE your Full Load" in joined
-    assert "15-20 minutes" in joined
+    assert "10-15 minutes" in joined
     # Says it is skippable (the CDC step remains a valid place to deploy later).
     assert "deploy later from the CDC step" in joined
 
@@ -14046,7 +14046,7 @@ def test_redeploy_prompt_leads_with_the_deletion_outcome() -> None:
     assert "no longer" in joined, "say the cluster stopped costing money"
     # Redeploy is offered, but as an explicit opt-in that states the cost.
     assert "Redeploy CDC infrastructure" in joined
-    assert "15-20 minutes" in joined and "billable" in joined
+    assert "10-15 minutes" in joined and "billable" in joined
     # And it must NOT dump the BYO-VPC form here.
     assert "Provide your VPC" not in joined
 

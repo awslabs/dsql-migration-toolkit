@@ -5,7 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
-## v0.1.288
+## v0.1.289
+
+### Changed
+
+- **The CDC-infrastructure deploy time estimate is corrected from "~15-20 minutes" to
+  "~10-15 minutes" to match observed runs.** Repeated live deploys finished the whole
+  `infra` create (MSK Serverless provisioning-dominated) in ~10 minutes, but the deploy
+  confirmation dialog, the prerequisite/overlap guidance, the provisioning banners and
+  the redeploy prompt all quoted ~15-20 minutes — an over-estimate that made the wait
+  read as longer than it is. All operator-facing copy now says ~10-15 minutes, and the
+  per-stage progress ETA model (`_CDC_STAGE_ETA_SECONDS["infra"]["stack_create"]`) is
+  lowered from 18 to 9 minutes so the stage hints and total ETA agree with the dialog.
+  It remains a ballpark (AWS provisioning varies by account/region/time), so a slower
+  run simply overruns the hint rather than being misreported. Teardown estimates
+  (~15-25 min, a different code path with its own measured basis) are unchanged.
 
 ### Fixed
 

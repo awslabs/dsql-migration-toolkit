@@ -143,7 +143,7 @@ _CDC_ACTION_TITLE = {
 
 # Rough per-stage time estimates (seconds), shown beside each stage so the user
 # knows what to expect. Grounded in the orchestration timeouts/poll intervals in
-# core/cdc_deployer.py (connector creation polls up to 600s; stack ops ~15-20 min)
+# core/cdc_deployer.py (connector creation polls up to 600s; infra create ~10-15 min)
 # and the live spike timings. These are ballpark hints, not guarantees -- actual
 # time varies with AWS provisioning and table count. Stages absent from a kind's
 # map (or estimated at 0) show no hint.
@@ -158,7 +158,11 @@ _CDC_STAGE_ETA_SECONDS = {
         "check_existing": 5,
         "validate_params": 2,
         "create_stack": 10,
-        "stack_create": 18 * 60,  # MSK Serverless provisioning dominates
+        # MSK Serverless provisioning dominates. Lowered from 18 min after repeated
+        # live runs finished the whole infra create in ~10 min (the per-stage hints
+        # and the total ETA now match the ~10-15 min the deploy dialog states); it is
+        # a ballpark, so a slower AWS run simply overruns the hint rather than misleads.
+        "stack_create": 9 * 60,
         "infra_ready": 2,
     },
     "start": {
