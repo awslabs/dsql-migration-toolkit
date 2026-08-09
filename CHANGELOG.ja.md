@@ -5,7 +5,26 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
-## v0.1.290
+## v0.1.291
+
+### 追加
+
+- **Full Load がコンテナのメモリ圧迫をログに記録するようになり、ECS Fargate の OOM kill を無言で
+  見逃さず診断できるようになりました。** あるテスターが Full Load 中に OOM kill に遭遇しました:メモリが
+  安定していた後、約 1 分でタスクのハード制限まで急上昇し、カーネルがタスクを kill しましたが、**アプリ
+  ログが一切ありませんでした**(OOM kill は graceful shutdown ではない)。CloudWatch メトリクスのスパイクと
+  ELB「Request timed out」だけが残りました。マルチプロセスロードのメモリは cgroup 全体(親 + すべての
+  ワーカープロセス)であり、ワーカーごとの read-ahead キューと in-flight 書き込みバッチが広い/大きな LOB
+  行に当たると制限まで上昇し得ますが、何も計測されていませんでした。今後は親の progress-drain スレッドが
+  コンテナのメモリ cgroup(`/sys/fs/cgroup/memory.current` + `memory.max`、cgroup v2、v1 フォールバック;
+  Fargate 外(ローカル/macOS)では静かな no-op — 新規依存なし)をサンプリングします:新しいメモリ
+  high-water ごとに `INFO`(実行のピークを常に記録)、使用量が制限の約 80% を超えると `WARNING`(現在
+  ロード中のテーブル名 + 対処:`full_load_table_parallelism`/`full_load_batch_parallelism` を下げる、大きな
+  LOB カラムを除外する、メモリを増やして再デプロイ)を出します。80% の超過は **永続的なアクティビティログ**
+  (`[full_load] memory pressure` イベント)にも記録され、UI のアクティビティタイムラインとダウンロード
+  レポートに表示され、**タスクが死んでも残ります** — OOM kill はアプリと CloudWatch ワーカーログを一緒に
+  消しますが、アクティビティログは永続します。値は出力しません(Property 7);WARNING はメモリが約 70% を
+  下回った後にのみ再アームされ、しきい値付近を漂う実行がログを氾濫させません。
 
 ### 変更
 

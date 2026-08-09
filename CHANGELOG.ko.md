@@ -5,7 +5,24 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
-## v0.1.290
+## v0.1.291
+
+### 추가
+
+- **Full Load이 이제 컨테이너 메모리 압박을 로깅해, ECS Fargate OOM kill을 조용히 넘기지 않고 진단
+  가능하게 합니다.** 한 테스터가 Full Load 중 OOM kill을 겪었습니다: 메모리가 안정적이다가 약 1분 만에
+  태스크 hard limit까지 급등해 커널이 태스크를 죽였는데, **앱 로그가 전혀 없었습니다**(OOM kill은 graceful
+  shutdown이 아님). CloudWatch 메트릭 급등과 ELB "Request timed out"만 남았습니다. 멀티프로세스 로드의
+  메모리는 전체 cgroup(부모 + 모든 워커 프로세스)이며, 워커별 read-ahead 큐와 in-flight 쓰기 배치가 넓은/
+  대형 LOB 행을 만나면 한계까지 오를 수 있는데 아무것도 계측되지 않았습니다. 이제 부모의 progress-drain
+  스레드가 컨테이너 메모리 cgroup(`/sys/fs/cgroup/memory.current` + `memory.max`, cgroup v2, v1 폴백;
+  Fargate 밖(로컬/macOS)에선 조용한 no-op — 신규 의존성 없음)을 샘플링합니다: 새 메모리 high-water마다
+  `INFO`(실행 피크를 항상 기록), 사용량이 한계의 ~80%를 넘으면 `WARNING`(현재 로딩 중 테이블명 + 대응책:
+  `full_load_table_parallelism`/`full_load_batch_parallelism` 낮추기, 대형 LOB 컬럼 제외, 메모리 늘려
+  재배포)을 남깁니다. 80% 교차는 **durable 활동 로그**(`[full_load] memory pressure` 이벤트)에도 기록되어
+  UI 활동 타임라인·다운로드 리포트에 표시되고 **태스크가 죽어도 살아남습니다** — OOM kill은 앱과 CloudWatch
+  워커 로그를 함께 없애지만 활동 로그는 영속됩니다. 값 미노출(Property 7); WARNING은 메모리가 ~70% 아래로
+  내려간 뒤에만 재-arm되어, 임계 근처를 맴도는 실행이 로그를 도배하지 않습니다.
 
 ### 변경
 

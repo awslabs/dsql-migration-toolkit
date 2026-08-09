@@ -964,6 +964,160 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
         )
 
 
+# --- Container memory-pressure sampling (OOM diagnostics) -------------------
+# Paths for the container's memory cgroup (v2 first, then v1). On ECS Fargate the
+# task runs in a memory cgroup whose limit == the task's Memory -- the hard limit the
+# kernel OOM-kills on. Reading it from the PARENT (where the drain thread runs) sees
+# the WHOLE-cgroup total (every worker process), i.e. the exact number a kill trips.
+_CGROUP_V2_CURRENT = "/sys/fs/cgroup/memory.current"
+_CGROUP_V2_MAX = "/sys/fs/cgroup/memory.max"
+_CGROUP_V1_CURRENT = "/sys/fs/cgroup/memory/memory.usage_in_bytes"
+_CGROUP_V1_MAX = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+# A v1 "unlimited" limit is a huge page-aligned sentinel; treat anything this large as
+# "no enforced limit" so we never compute a meaningless ~0% utilization.
+_CGROUP_NO_LIMIT = 1 << 62
+_MEM_SAMPLE_INTERVAL_SECONDS = 5.0        # sample at most this often (drain wakes ~3x/s)
+_MEM_WARN_FRACTION = 0.80                 # WARNING once usage crosses this of the limit
+_MEM_WARN_REARM_FRACTION = 0.70           # re-arm the WARNING after usage drops below this
+_MEM_HIGHWATER_STEP_BYTES = 50 * 1024 * 1024  # only INFO-log a new high-water this much higher
+
+
+def _read_int_file(path: str) -> Optional[int]:
+    """Read a single integer from ``path``; ``None`` if absent/unreadable (dev/macOS)."""
+    try:
+        with open(path) as handle:
+            return int(handle.read().strip())
+    except Exception:  # noqa: BLE001 - file missing (non-Linux) or unreadable
+        return None
+
+
+def _read_cgroup_memory() -> Optional[tuple[int, Optional[int]]]:
+    """Return ``(used_bytes, limit_bytes|None)`` for the container's memory cgroup.
+
+    Reads cgroup v2 first, then v1. ``limit_bytes`` is ``None`` when there is no enforced
+    limit (v2 ``"max"`` or a v1 huge sentinel). Returns ``None`` when no cgroup memory
+    file is readable (e.g. macOS/dev), so the sampler simply no-ops off-Fargate. No new
+    dependency -- just ``/sys`` reads.
+    """
+    used = _read_int_file(_CGROUP_V2_CURRENT)
+    if used is not None:
+        try:
+            with open(_CGROUP_V2_MAX) as handle:
+                text = handle.read().strip()
+            raw = None if text == "max" else int(text)
+        except Exception:  # noqa: BLE001
+            raw = None
+        limit = raw if (raw is not None and raw < _CGROUP_NO_LIMIT) else None
+        return used, limit
+    used = _read_int_file(_CGROUP_V1_CURRENT)
+    if used is not None:
+        raw = _read_int_file(_CGROUP_V1_MAX)
+        limit = raw if (raw is not None and raw < _CGROUP_NO_LIMIT) else None
+        return used, limit
+    return None
+
+
+class _MemoryPressureLogger:
+    """Sample the container's whole-cgroup memory in the drain thread and log it.
+
+    Why this exists: a Full Load's memory can climb toward the Fargate task limit (the
+    read-ahead prefetch queue + in-flight write batches per worker, amplified by wide /
+    oversized-LOB rows), and when it crosses the hard limit the kernel OOM-kills the task
+    with NO app log -- the operator saw only a CloudWatch metric spike and an ELB
+    "Request timed out". This leaves a trail instead: an INFO line at each new memory
+    high-water (so the peak is always in the log) and a WARNING when usage crosses ~80%
+    of the limit, tagging the tables currently loading, with the actionable remedies.
+
+    Off-Fargate (no cgroup memory file) it is a silent no-op. Read-only ``/sys`` reads,
+    no new dependency; self-throttled so a busy progress queue never spams the log.
+    """
+
+    def __init__(self, handle: JobHandle) -> None:
+        self._handle = handle
+        self._enabled = _read_cgroup_memory() is not None
+        self._next_sample = 0.0
+        self._high_water = 0
+        self._warned = False
+
+    def sample(self) -> None:
+        """Read the cgroup usage once (throttled) and log a high-water / pressure line."""
+        if not self._enabled:
+            return
+        now = _time.monotonic()
+        if now < self._next_sample:
+            return
+        self._next_sample = now + _MEM_SAMPLE_INTERVAL_SECONDS
+        reading = _read_cgroup_memory()
+        if reading is None:
+            return
+        used, limit = reading
+        used_mib = used / (1024 * 1024)
+        # New high-water -> INFO, so the run's peak memory is always captured in the log.
+        if used >= self._high_water + _MEM_HIGHWATER_STEP_BYTES:
+            self._high_water = used
+            pct = f" ({used / limit:.0%} of task limit)" if limit else ""
+            _LOGGER.info(
+                "Full Load memory high-water: %.0f MiB%s%s",
+                used_mib, pct, self._loading_suffix(),
+            )
+        if not limit:
+            return
+        frac = used / limit
+        # Crossed ~80% of the hard limit -> WARNING once (re-armed only after it recedes,
+        # so a run hovering near the threshold does not flap the log).
+        if not self._warned and frac >= _MEM_WARN_FRACTION:
+            self._warned = True
+            suffix = self._loading_suffix()
+            _LOGGER.warning(
+                "Full Load memory pressure: %.0f MiB (%.0f%% of the %.0f MiB task "
+                "limit)%s -- approaching the Fargate hard limit; an OOM kill would stop "
+                "the task with no further log. Reduce full_load_table_parallelism / "
+                "full_load_batch_parallelism, exclude oversized-LOB columns, or redeploy "
+                "the task with more memory.",
+                used_mib, frac * 100, limit / (1024 * 1024), suffix,
+            )
+            # Also record it on the DURABLE activity log so it surfaces in the UI's
+            # activity timeline / downloadable report and SURVIVES the task -- an OOM
+            # kill (the very risk this warns about) tears down the app and its logs, so a
+            # note only in the CloudWatch worker log or the in-memory job is easily lost.
+            # No row values (Property 7). INFO because the run has NOT failed yet; the
+            # detail carries the severity (ActivityStatus has no WARNING tier).
+            log_activity(
+                ActivityCategory.FULL_LOAD,
+                "memory pressure",
+                status=ActivityStatus.INFO,
+                detail=(
+                    f"container memory reached {frac * 100:.0f}% of the "
+                    f"{limit / (1024 * 1024):.0f} MiB task limit ({used_mib:.0f} MiB)"
+                    f"{suffix} — approaching the Fargate hard limit, beyond which an OOM "
+                    "kill stops the task with no further log. Lower "
+                    "full_load_table_parallelism / full_load_batch_parallelism, exclude "
+                    "oversized-LOB columns, or redeploy the task with more memory."
+                ),
+            )
+        elif self._warned and frac < _MEM_WARN_REARM_FRACTION:
+            self._warned = False
+
+    def _loading_suffix(self) -> str:
+        """`` while loading: t1, t2`` for the tables currently IN_PROGRESS, or ``""``.
+
+        Read under the manager lock via ``handle.update`` (the only thread-safe path to
+        the live job), so the memory line names the likely culprit table(s).
+        """
+        names: list[str] = []
+        try:
+            self._handle.update(
+                lambda job: names.extend(
+                    chunk.chunk_id
+                    for chunk in job.chunks
+                    if chunk.status == "IN_PROGRESS"
+                )
+            )
+        except Exception:  # noqa: BLE001 - sampling must never break the drain thread
+            return ""
+        return f" while loading: {', '.join(sorted(names))}" if names else ""
+
+
 def _drain_progress_queue(
     progress_queue: "multiprocessing.Queue[object]",
     handle: JobHandle,
@@ -972,10 +1126,14 @@ def _drain_progress_queue(
 ) -> None:
     """Drain thread: reads progress from worker processes → handle.update().
 
-    Also mirrors handle.cancelled → cancel_event so workers stop cooperatively.
+    Also mirrors handle.cancelled → cancel_event so workers stop cooperatively, and
+    samples the container's memory each wake so a run approaching the Fargate limit
+    leaves a diagnostic trail before an OOM kill (which otherwise leaves no app log).
     Runs until ``stop_event`` is set AND the queue is empty.
     """
+    mem_logger = _MemoryPressureLogger(handle)
     while not stop_event.is_set():
+        mem_logger.sample()
         # Mirror cancellation into the multiprocessing Event.
         if handle.cancelled and not cancel_event.is_set():
             cancel_event.set()

@@ -5,7 +5,30 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
-## v0.1.290
+## v0.1.291
+
+### Added
+
+- **Full Load now logs container memory pressure, so an ECS Fargate OOM kill is
+  diagnosable instead of silent.** A tester hit an OOM kill mid-Full-Load: memory sat
+  steady, then climbed to the task's hard limit in about a minute and the kernel killed
+  the task — with NO app log (an OOM kill is not a graceful shutdown), leaving only a
+  CloudWatch metric spike and an ELB "Request timed out". The multiprocess load's memory
+  is the whole cgroup (parent + all worker processes) and can climb toward the limit when
+  the per-worker read-ahead queue and in-flight write batches meet wide / oversized-LOB
+  rows — none of which was metered. The parent's progress-drain thread now samples the
+  container's memory cgroup (`/sys/fs/cgroup/memory.current` + `memory.max`, cgroup v2
+  with a v1 fallback; a silent no-op off-Fargate, e.g. local/macOS — no new dependency):
+  it logs an `INFO` line at each new memory high-water (so the run's peak is always
+  captured) and, when usage crosses ~80% of the limit, a `WARNING` naming the tables
+  currently loading and the remedies (lower `full_load_table_parallelism` /
+  `full_load_batch_parallelism`, exclude oversized-LOB columns, or redeploy with more
+  memory). The 80% crossing is also recorded on the **durable activity log** (a
+  `[full_load] memory pressure` event) so it surfaces in the UI activity timeline and the
+  downloadable report and **survives the task** — an OOM kill tears down the app and its
+  CloudWatch worker log, but the activity log is persisted. Value-free (Property 7); the
+  warning re-arms only after memory recedes below ~70%, so a run hovering near the
+  threshold does not flood the log.
 
 ### Changed
 

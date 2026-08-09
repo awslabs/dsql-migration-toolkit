@@ -15533,3 +15533,128 @@ def test_both_monitoring_views_share_one_visibility_gate() -> None:
         assert "if not cdc_streaming_started(" not in src, (
             f"{fn.__name__} must not bypass the shared gate with the raw predicate"
         )
+
+
+# ---------------------------------------------------------------------------
+# Container memory-pressure logging (OOM diagnostics; the user's feedback)
+# ---------------------------------------------------------------------------
+
+
+class _MemHandle:
+    """JobHandle double whose update() exposes a live job with IN_PROGRESS chunks."""
+
+    def __init__(self, in_progress: list[str]) -> None:
+        from dsql_migrator.core.models import ChunkState, MigrationJob
+
+        self.job_id = "mem-job"
+        self._job = MigrationJob(
+            job_id="mem-job",
+            chunks=[ChunkState(chunk_id=n, status="IN_PROGRESS") for n in in_progress],
+        )
+
+    def update(self, fn):
+        return fn(self._job)
+
+
+def test_memory_pressure_logger_noop_off_fargate(monkeypatch, caplog) -> None:
+    # No cgroup memory file (macOS/dev) -> disabled, samples nothing, never logs.
+    from dsql_migrator.ui.data_migration import _engine
+
+    monkeypatch.setattr(_engine, "_read_cgroup_memory", lambda: None)
+    logger = _engine._MemoryPressureLogger(_MemHandle([]))
+    assert logger._enabled is False
+    with caplog.at_level("INFO", logger="dsql_migrator.ui.data_migration._engine"):
+        logger.sample()
+        logger.sample()
+    assert not [r for r in caplog.records if "memory" in r.getMessage().lower()]
+
+
+def test_memory_pressure_logger_high_water_info_and_80pct_warning(monkeypatch, caplog) -> None:
+    # A climbing usage logs a new high-water at INFO, then a single WARNING once it
+    # crosses 80% of the limit, tagging the currently-loading table.
+    from dsql_migrator.ui.data_migration import _engine
+
+    limit = 1024 * 1024 * 1024  # 1 GiB task limit
+    readings = iter([
+        (270 * 1024 * 1024, limit),   # consumed by __init__'s enable probe
+        (270 * 1024 * 1024, limit),   # 270 MiB — first high-water (INFO)
+        (270 * 1024 * 1024, limit),   # same — no new high-water, below 80%
+        (900 * 1024 * 1024, limit),   # 900 MiB ≈ 88% — new high-water INFO + WARNING
+    ])
+    monkeypatch.setattr(_engine, "_read_cgroup_memory", lambda: next(readings))
+    # Capture the DURABLE activity-log event (surfaces in the UI timeline / download).
+    activity: list[dict] = []
+    monkeypatch.setattr(
+        _engine, "log_activity",
+        lambda category, action, **kw: activity.append({"action": action, **kw}),
+    )
+    logger = _engine._MemoryPressureLogger(_MemHandle(["ecommerce.product_media"]))
+    assert logger._enabled is True
+    # Defeat the 5 s sample throttle so each sample() actually reads (set AFTER __init__
+    # so the probe above doesn't consume a tick).
+    ticks = iter([0.0, 1000.0, 2000.0, 3000.0])
+    monkeypatch.setattr(_engine._time, "monotonic", lambda: next(ticks))
+    with caplog.at_level("INFO", logger="dsql_migrator.ui.data_migration._engine"):
+        logger.sample()  # 270 -> INFO high-water
+        logger.sample()  # 270 -> nothing
+        logger.sample()  # 900 -> INFO high-water + WARNING
+
+    infos = [r for r in caplog.records if r.levelname == "INFO" and "high-water" in r.getMessage()]
+    warns = [r for r in caplog.records if r.levelname == "WARNING" and "memory pressure" in r.getMessage()]
+    assert len(infos) == 2                     # 270 and 900, not the middle repeat
+    assert len(warns) == 1                     # crossed 80% exactly once
+    w = warns[0].getMessage()
+    assert "ecommerce.product_media" in w      # names the culprit table
+    assert "88%" in w or "87%" in w            # 900/1024 ≈ 88%
+    assert "task limit" in w
+
+    # The durable activity-log event fires exactly once, at INFO, naming the table.
+    mem_events = [e for e in activity if e["action"] == "memory pressure"]
+    assert len(mem_events) == 1
+    assert mem_events[0]["status"].value == "info"
+    assert "ecommerce.product_media" in mem_events[0]["detail"]
+    assert "task limit" in mem_events[0]["detail"]
+
+
+def test_memory_pressure_warning_rearms_only_after_receding(monkeypatch, caplog) -> None:
+    # The WARNING fires once, does not repeat while still high, and re-arms after usage
+    # drops below the re-arm threshold (so a run hovering near the limit doesn't flap).
+    from dsql_migrator.ui.data_migration import _engine
+
+    limit = 1000 * 1024 * 1024
+    readings = iter([
+        (500 * 1024 * 1024, limit),   # consumed by __init__'s enable probe
+        (850 * 1024 * 1024, limit),   # 85% -> WARNING
+        (860 * 1024 * 1024, limit),   # still high -> no repeat
+        (600 * 1024 * 1024, limit),   # 60% < 70% re-arm -> silent, re-arms
+        (900 * 1024 * 1024, limit),   # 90% -> WARNING again
+    ])
+    monkeypatch.setattr(_engine, "_read_cgroup_memory", lambda: next(readings))
+    logger = _engine._MemoryPressureLogger(_MemHandle([]))
+    # AFTER __init__ so the probe doesn't consume a tick.
+    ticks = iter([0.0, 100.0, 200.0, 300.0, 400.0])
+    monkeypatch.setattr(_engine._time, "monotonic", lambda: next(ticks))
+    with caplog.at_level("WARNING", logger="dsql_migrator.ui.data_migration._engine"):
+        for _ in range(4):
+            logger.sample()
+
+    warns = [r for r in caplog.records if "memory pressure" in r.getMessage()]
+    assert len(warns) == 2  # once at 85%, silent at 86% and 60%, again at 90%
+
+
+def test_read_cgroup_memory_prefers_v2_and_handles_max(monkeypatch, tmp_path) -> None:
+    # v2 "max" (unlimited) -> limit None; a numeric max -> that limit.
+    from dsql_migrator.ui.data_migration import _engine
+
+    cur = tmp_path / "memory.current"
+    mx = tmp_path / "memory.max"
+    cur.write_text("123456\n")
+    monkeypatch.setattr(_engine, "_CGROUP_V2_CURRENT", str(cur))
+    monkeypatch.setattr(_engine, "_CGROUP_V2_MAX", str(mx))
+
+    mx.write_text("max\n")
+    assert _engine._read_cgroup_memory() == (123456, None)
+
+    mx.write_text(str(2 * 1024 * 1024 * 1024) + "\n")
+    used, limit = _engine._read_cgroup_memory()
+    assert used == 123456 and limit == 2 * 1024 * 1024 * 1024
