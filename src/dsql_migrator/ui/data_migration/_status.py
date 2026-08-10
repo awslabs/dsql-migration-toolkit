@@ -1005,6 +1005,16 @@ def _sync_cdc_step_status(session, *, streaming: bool) -> None:
 # still producing, sink not sending) is NOT mislabelled idle.
 _CDC_IDLE_RATE_THRESHOLD = 0.1
 
+# Consecutive polls the source-flowing-but-sink-silent divergence must hold before it
+# is reported as a stall. The CDC poll runs every ~5s (_CDC_POLL_INTERVAL_SECONDS), so
+# 3 polls is ~10-15s of sustained divergence. Why persistence is required: both rates
+# are CloudWatch averages over a trailing window, so the moment a burst of writes ends
+# the source still shows its residual while the sink has correctly gone quiet -- a
+# one-poll divergence that is indistinguishable from a real stall. A real stall is
+# permanent (an ejected consumer never rejoins by itself), so waiting a few polls loses
+# no detection while removing the false alarm.
+_SINK_STALL_CONFIRM_POLLS = 3
+
 
 @dataclass(frozen=True)
 class CdcActivitySummary:
@@ -1016,21 +1026,37 @@ class CdcActivitySummary:
     ~0 -- an unknown rate yields ``idle=None`` (never asserted idle), so the UI
     never tells the operator "no changes flowing" when it actually cannot tell.
 
-    ``sink_stalled`` is the DIVERGENCE signal: the source is producing real change
-    traffic while the sink applies nothing. It is deliberately a separate field from
-    ``idle`` rather than a change to it -- ``idle`` gates the cut-over "drained"
-    judgement and must keep reading False here (a stalled pipeline is not drained),
-    which is exactly why the stall was invisible: not-idle renders as the reassuring
-    "Streaming -- changes are flowing".
+    ``sink_stalled`` is the DIVERGENCE signal for THIS poll: the source is producing
+    real change traffic while the sink applies nothing. It is deliberately a separate
+    field from ``idle`` rather than a change to it -- ``idle`` gates the cut-over
+    "drained" judgement and must keep reading False here (a stalled pipeline is not
+    drained), which is exactly why the stall was invisible: not-idle renders as the
+    reassuring "Streaming -- changes are flowing".
+
+    ``sink_stall_confirmed`` is what the UI acts on: the divergence seen on
+    :data:`_SINK_STALL_CONFIRM_POLLS` CONSECUTIVE polls. A single-poll divergence is
+    NOT a stall -- both rates are CloudWatch averages over a trailing 5-minute window,
+    and just after a burst of writes finishes the source still carries its residual
+    (plus a Debezium heartbeat every 5 min, which is why the idle threshold is 0.1 and
+    not 0) while the sink has legitimately gone quiet with nothing left to apply. That
+    transient looks identical to a real stall for a poll or two, and it fired a false
+    "Sink stalled" alarm on a healthy pipeline during demo testing. A REAL stall is
+    permanent (an ejected consumer does not rejoin on its own), so requiring
+    persistence costs nothing in detection and removes the false positive.
     """
 
     source_poll_rate: Optional[float] = None
     sink_send_rate: Optional[float] = None
     idle: Optional[bool] = None
     sink_stalled: Optional[bool] = None
+    sink_stall_confirmed: bool = False
+    # Consecutive polls the divergence has held, carried forward by _apply_cdc_status.
+    sink_stall_polls: int = 0
 
 
-def cdc_activity_summary(health: dict) -> CdcActivitySummary:
+def cdc_activity_summary(
+    health: dict, *, previous: Optional[CdcActivitySummary] = None
+) -> CdcActivitySummary:
     """Summarize per-connector health into an aggregate activity signal (pure).
 
     Takes the max known rate across connectors for each metric (the worst-case
@@ -1044,6 +1070,12 @@ def cdc_activity_summary(health: dict) -> CdcActivitySummary:
     writing to DSQL -- e.g. a consumer ejected from its group, which keeps the
     connector at RUNNING with no errored task, so no other signal here catches it.
     Both rates must be known; otherwise it is None (never asserted).
+
+    ``previous`` (the prior poll's summary) carries the consecutive-divergence count
+    forward, so ``sink_stall_confirmed`` only becomes True once the divergence has held
+    for :data:`_SINK_STALL_CONFIRM_POLLS` polls. Pass ``None`` for the first poll. The
+    count resets the moment the sink sends anything -- and also when a rate becomes
+    unknown, because an unreadable metric is not evidence of a stall.
     """
     polls = [h.poll_rate for h in health.values() if getattr(h, "poll_rate", None) is not None]
     sends = [h.send_rate for h in health.values() if getattr(h, "send_rate", None) is not None]
@@ -1058,11 +1090,16 @@ def cdc_activity_summary(health: dict) -> CdcActivitySummary:
             source_poll > _CDC_IDLE_RATE_THRESHOLD
             and sink_send <= _CDC_IDLE_RATE_THRESHOLD
         )
+    # Only a TRUE divergence extends the streak; False or None (unknown rate) clears it.
+    prior_polls = getattr(previous, "sink_stall_polls", 0) or 0
+    streak = prior_polls + 1 if sink_stalled else 0
     return CdcActivitySummary(
         source_poll_rate=source_poll,
         sink_send_rate=sink_send,
         idle=idle,
         sink_stalled=sink_stalled,
+        sink_stall_polls=streak,
+        sink_stall_confirmed=streak >= _SINK_STALL_CONFIRM_POLLS,
     )
 
 
@@ -1383,9 +1420,10 @@ def _apply_cdc_status(migration_state, fetched) -> None:
     view = build_cdc_status_view(adjusted, error_summary, dlq_depth=dlq_depth)
     migration_state.set_cdc_status_view(view)
     # Aggregate throughput so the UI can show "no changes flowing" (cutover
-    # signal) without re-deriving it on every render.
-    activity = cdc_activity_summary(health)
+    # signal) without re-deriving it on every render. The prior summary is passed in
+    # so the consecutive-divergence streak behind sink_stall_confirmed carries over.
     previous = getattr(migration_state, "cdc_activity", None)
+    activity = cdc_activity_summary(health, previous=previous)
     migration_state.set_cdc_activity(activity)
     _log_sink_stall_transition(previous, activity)
 
@@ -1399,10 +1437,15 @@ def _log_sink_stall_transition(previous, current) -> None:
     RUNNING with no errored task, so nothing else in the log would show that
     replication stopped, and the activity-log file survives the task that produced it.
 
+    Keys off ``sink_stall_confirmed``, not the raw per-poll ``sink_stalled``: a
+    single-poll divergence is a normal post-burst artefact of the trailing-window
+    rates, and logging it would put a FAILURE line in the durable log for a healthy
+    pipeline (which is exactly what happened before the confirm threshold existed).
+
     Best-effort: a logging failure must never break the status poll.
     """
-    was = bool(getattr(previous, "sink_stalled", False))
-    now = bool(getattr(current, "sink_stalled", False))
+    was = bool(getattr(previous, "sink_stall_confirmed", False))
+    now = bool(getattr(current, "sink_stall_confirmed", False))
     if was == now:
         return
     from dsql_migrator.core.activity_log import (

@@ -4371,7 +4371,7 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
         card, chart, empty = lag["card"], lag["chart"], lag["empty"]
         stalled_row = lag.get("stalled")
         activity = getattr(migration_state, "cdc_activity", None)
-        stalled = bool(getattr(activity, "sink_stalled", False))
+        stalled = bool(getattr(activity, "sink_stall_confirmed", False))
         if card is None or chart is None:
             return
         if option is not None:
@@ -4542,7 +4542,7 @@ def _render_change_flow_status(ui, activity: "CdcActivitySummary") -> None:
             ui.label("No changes flowing — pipeline idle").classes(  # type: ignore[attr-defined]
                 "text-sm text-gray-700"
             )
-        elif activity.sink_stalled:
+        elif activity.sink_stall_confirmed:
             # Checked BEFORE the "streaming" branch: a stalled sink is not idle, so it
             # used to fall through to "Streaming — changes are flowing" — asserting the
             # pipeline was healthy off the SOURCE rate alone while nothing reached DSQL.
@@ -4558,7 +4558,7 @@ def _render_change_flow_status(ui, activity: "CdcActivitySummary") -> None:
         else:
             ui.icon("help_outline", color="grey").classes("text-base")  # type: ignore[attr-defined]
             ui.label("Activity unknown").classes("text-sm text-gray-500")  # type: ignore[attr-defined]
-    if activity.sink_stalled:
+    if activity.sink_stall_confirmed:
         # The divergence is already on screen as two bars (source > 0, sink 0) -- what
         # was missing is reading it. Say what it means and what to do, per the project's
         # "what happened, what to do next" rule: the connector will still show RUNNING,
@@ -4660,7 +4660,7 @@ def _render_cdc_dlq_panel(
     if health is None:
         return
     _activity = getattr(migration_state, "cdc_activity", None)
-    _stalled = bool(getattr(_activity, "sink_stalled", False))
+    _stalled = bool(getattr(_activity, "sink_stall_confirmed", False))
     tone = _dlq_panel_tone(health, sink_stalled=_stalled)
     bg, border, icon_color, default_icon = NOTICE_STYLE.get(tone, NOTICE_STYLE["info"])
     with ui.column().classes(  # type: ignore[attr-defined]

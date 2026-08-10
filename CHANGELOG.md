@@ -5,6 +5,29 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.301
+
+### Fixed
+
+- **The "Sink stalled" warning no longer fires on a healthy pipeline that has just
+  finished a burst of writes.** The signal added in `0.1.296` compared the source and
+  sink rates on a SINGLE poll, but both are CloudWatch averages over a trailing window:
+  the moment a burst ends, the source still carries its residual (plus the Debezium
+  heartbeat, which is why the idle threshold is `0.1` and not `0`) while the sink has
+  legitimately gone quiet with nothing left to apply. That transient is indistinguishable
+  from a real stall, and it raised the red "changes are NOT reaching DSQL" alert — plus a
+  `FAILURE` line in the durable activity log — on a pipeline that was replicating
+  correctly (seen live while generating CDC demo load; target row counts kept rising and
+  no `Commit of offsets timed out` ever appeared).
+
+  The divergence must now hold for **3 consecutive polls** (~10–15 s at the ~5 s CDC
+  poll) before it is reported: `sink_stalled` stays as the per-poll observation, and a
+  new `sink_stall_confirmed` is what the UI and the activity log act on. Detection is
+  unaffected — a real stall is permanent, because an ejected consumer never rejoins by
+  itself — so waiting a few polls costs nothing. The streak resets as soon as the sink
+  sends anything, and also when a rate becomes unknown (an unreadable metric is a
+  monitoring failure, not a data one).
+
 ## v0.1.300
 
 ### Changed

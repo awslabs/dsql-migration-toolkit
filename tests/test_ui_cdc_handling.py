@@ -374,19 +374,70 @@ def test_activity_not_idle_when_sink_stalled() -> None:
     assert cdc_activity_summary(health).idle is False
 
 
+def _diverged(previous=None):
+    """One poll of the stall signature: source producing, sink applying nothing."""
+    return cdc_activity_summary(
+        {
+            "src": ConnectorHealth(poll_rate=5.0),
+            "sink": ConnectorHealth(send_rate=0.0),
+        },
+        previous=previous,
+    )
+
+
 def test_sink_stall_is_reported_separately_from_idle() -> None:
     # The reported failure: source producing, sink applying nothing. `idle` must stay
     # False (a stalled pipeline is NOT drained -- that guards cut-over), which is
     # exactly why the stall was invisible: not-idle rendered as "Streaming — changes
     # are flowing". `sink_stalled` is the signal that names the divergence.
-    summary = cdc_activity_summary(
-        {
-            "src": ConnectorHealth(poll_rate=5.0),
-            "sink": ConnectorHealth(send_rate=0.0),
-        }
-    )
+    summary = _diverged()
     assert summary.idle is False
     assert summary.sink_stalled is True
+
+
+def test_a_single_poll_divergence_is_not_reported_as_a_stall() -> None:
+    # Regression (hit live on a healthy pipeline): both rates are CloudWatch averages
+    # over a trailing window, so right after a burst of writes ends the source still
+    # shows its residual while the sink has legitimately gone quiet. That one-poll
+    # divergence is indistinguishable from a real stall, and it raised a red "Sink
+    # stalled" alarm on a pipeline that was replicating fine. Only a SUSTAINED
+    # divergence may be reported.
+    first = _diverged()
+    assert first.sink_stalled is True          # the observation stands
+    assert first.sink_stall_confirmed is False  # ...but it is not yet a verdict
+    second = _diverged(previous=first)
+    assert second.sink_stall_confirmed is False
+
+
+def test_a_sustained_divergence_is_confirmed_as_a_stall() -> None:
+    # A real stall is permanent (an ejected consumer never rejoins by itself), so
+    # persistence costs nothing in detection.
+    s = None
+    for _ in range(3):
+        s = _diverged(previous=s)
+    assert s.sink_stall_polls == 3
+    assert s.sink_stall_confirmed is True
+
+
+def test_the_stall_streak_resets_as_soon_as_the_sink_sends() -> None:
+    s = _diverged(previous=_diverged())          # 2 polls of divergence
+    assert s.sink_stall_polls == 2
+    healthy = cdc_activity_summary(
+        {"src": ConnectorHealth(poll_rate=5.0), "sink": ConnectorHealth(send_rate=4.8)},
+        previous=s,
+    )
+    assert healthy.sink_stall_polls == 0
+    assert healthy.sink_stall_confirmed is False
+
+
+def test_an_unknown_rate_clears_the_stall_streak() -> None:
+    # An unreadable CloudWatch metric is a monitoring failure, not a data one -- it
+    # must never accumulate toward a stall verdict.
+    s = _diverged(previous=_diverged())
+    unknown = cdc_activity_summary({"src": ConnectorHealth(poll_rate=5.0)}, previous=s)
+    assert unknown.sink_stalled is None
+    assert unknown.sink_stall_polls == 0
+    assert unknown.sink_stall_confirmed is False
 
 
 def test_drained_pipeline_is_idle_but_not_stalled() -> None:
@@ -449,9 +500,11 @@ def test_sink_stall_and_recovery_each_log_once_on_transition() -> None:
     healthy = cdc_activity_summary(
         {"src": ConnectorHealth(poll_rate=5.0), "sink": ConnectorHealth(send_rate=5.0)}
     )
-    stalled = cdc_activity_summary(
-        {"src": ConnectorHealth(poll_rate=5.0), "sink": ConnectorHealth(send_rate=0.0)}
-    )
+    # A CONFIRMED stall: the log event keys off sink_stall_confirmed, so a one-poll
+    # blip must not write a FAILURE line (see the single-poll test above).
+    stalled = None
+    for _ in range(3):
+        stalled = _diverged(previous=stalled)
 
     import dsql_migrator.core.activity_log as real_log
 
@@ -476,6 +529,28 @@ def test_sink_stall_and_recovery_each_log_once_on_transition() -> None:
     assert "cut over" in stall_detail.lower()
 
 
+def test_an_unconfirmed_divergence_writes_no_activity_log_event() -> None:
+    # The regression: a post-burst one-poll divergence put a FAILURE line in the
+    # durable log for a healthy pipeline. Only a confirmed stall may be recorded.
+    from dsql_migrator.ui.data_migration import _status as status_mod
+    import dsql_migrator.core.activity_log as real_log
+
+    logged: list = []
+    healthy = cdc_activity_summary(
+        {"src": ConnectorHealth(poll_rate=5.0), "sink": ConnectorHealth(send_rate=5.0)}
+    )
+    blip = _diverged(previous=healthy)  # 1 poll only -> not confirmed
+    assert blip.sink_stalled is True and blip.sink_stall_confirmed is False
+
+    original = real_log.log_activity
+    real_log.log_activity = lambda *a, **k: logged.append(a)  # type: ignore[assignment]
+    try:
+        status_mod._log_sink_stall_transition(healthy, blip)
+    finally:
+        real_log.log_activity = original  # type: ignore[assignment]
+    assert logged == []
+
+
 def test_change_flow_renders_the_stall_instead_of_streaming_all_clear() -> None:
     # The regression this closes: with source 5 rec/s and sink 0, `idle is False` fell
     # through to "Streaming — changes are flowing", asserting health off the SOURCE rate
@@ -483,9 +558,12 @@ def test_change_flow_renders_the_stall_instead_of_streaming_all_clear() -> None:
     from tests.test_ui_data_migration import _RecordingUi
     from dsql_migrator.ui.data_migration._cdc_ui import _render_change_flow_status
 
-    stalled = cdc_activity_summary(
-        {"src": ConnectorHealth(poll_rate=5.0), "sink": ConnectorHealth(send_rate=0.0)}
-    )
+    # A CONFIRMED stall (the divergence held for the required consecutive polls) --
+    # a single-poll blip must not render this, which the test above covers.
+    stalled = None
+    for _ in range(3):
+        stalled = _diverged(previous=stalled)
+    assert stalled.sink_stall_confirmed is True
     ui = _RecordingUi()
     _render_change_flow_status(ui, stalled)
     text = " ".join(ui.texts)
