@@ -171,10 +171,13 @@ stack; see **Parameter reference** below.
 1. **CloudFormation → Create stack → With new resources (standard).** Check the
    Region (top-right) matches your Aurora DSQL cluster.
 2. **Upload a template file** → pick `deploy/cloudformation.yaml` → **Next**.
-3. **Stack name** `mysql-dsql-migrator`, then fill the **5 required fields** —
-   `VpcId`, `AlbSubnetIds` (2 subnets, 2 AZs), `ServiceSubnetIds` (2 private
-   subnets, 2 AZs), `CertificateArn`, `DsqlClusterArn`. Leave everything else at its
-   default → **Next**.
+3. **Stack name** `mysql-dsql-migrator`, then fill the **5 fields that have no
+   default** — `VpcId`, `AlbSubnetIds` (2 subnets, 2 AZs), `ServiceSubnetIds`
+   (2 private subnets, 2 AZs), `CertificateArn`, `DsqlClusterArn` — **plus one of
+   `SourceDbSecurityGroupId` (preferred) or `SourceDbCidr`**, which the template
+   enforces on every deploy: with both empty the task has no route to the source
+   MySQL and the connection times out. Leave everything else at its default →
+   **Next**.
 4. **Next** (stack options) → tick the **IAM-capabilities acknowledgement** →
    **Create stack**.
 5. Wait for **CREATE_COMPLETE** → open the **Outputs** tab → copy **`AppUrl`** →
@@ -306,7 +309,10 @@ otherwise the task can't pull its image or reach DSQL and fails to start. → **
 > [Set up](../docs/manual/en/01-setup.md) → Connect).
 
 For a **Prod profile**, additionally set `EnableCognitoAuth=true`,
-`CognitoDomainPrefix`, and `AppDomainName` in step 3 (then do sections 4–5).
+`CognitoDomainPrefix`, **and `CognitoAdminEmail`** in step 3 (then do sections 4–5).
+`CognitoAdminEmail` is not optional here — the template rejects Cognito without it,
+because the user pool has no self sign-up and you would get an app with no way in.
+`AppDomainName` stays optional: leave it empty to use the ALB's own DNS name.
 
 #### AWS CLI
 
@@ -364,7 +370,9 @@ aws cloudformation deploy \
 > deterministic path is unchanged). Full details + model choices in §8.
 
 For a **Prod profile**, add: `EnableCognitoAuth=true`, `CognitoDomainPrefix=...`,
-`AppDomainName=...` (and optionally `ContainerImageUri=...` for your own image).
+`CognitoAdminEmail=...` (all three are required together — the template enforces it),
+plus optionally `AppDomainName=...` for a custom domain and `ContainerImageUri=...`
+for your own image.
 
 > **Test shortcuts / overrides**
 >
@@ -424,9 +432,10 @@ credentials at **Connect** to begin.
 | `SourceDbCidr` | no* | `""` | Source DB CIDR (use if no SG id). *One of this / `SourceDbSecurityGroupId` is required. |
 | `SourceDbPort` | no | `3306` | Source MySQL port. |
 | `HttpsEgressCidr` | no | `0.0.0.0/0` | Destination CIDR for the task's outbound 443 (AWS APIs: DSQL token, Secrets Manager, ECR, CloudWatch, Bedrock) and 5432 (DSQL). **Recommended: leave the `0.0.0.0/0` default** — the task reaches public AWS endpoints via NAT/IGW. Only tighten (e.g. to your VPC CIDR) when you front *all* those services with interface VPC endpoints (PrivateLink); tightening without them blocks image pull / DSQL and the task fails to start. |
-| `EnableCognitoAuth` | no | `false` | ALB authenticates via Cognito (OIDC). Defaults to `false`: an internal ALB (or one scoped to your CIDR) is the access gate and the operator already holds the IAM/DB permissions, so no login is needed. **Required (enforced) only when `AllowedIngressCidr=0.0.0.0/0`.** Needs `CognitoDomainPrefix` when `true`. |
-| `AppDomainName` | if Cognito | `""` | DNS name fronting the ALB (matches the cert). |
-| `CognitoDomainPrefix` | if Cognito | `""` | Globally-unique Cognito hosted-UI prefix. |
+| `EnableCognitoAuth` | no | `false` | ALB authenticates via Cognito (OIDC). Defaults to `false`: an internal ALB (or one scoped to your CIDR) is the access gate and the operator already holds the IAM/DB permissions, so no login is needed. **Required (enforced) only when `AllowedIngressCidr=0.0.0.0/0`.** Needs **both** `CognitoDomainPrefix` and `CognitoAdminEmail` when `true`. |
+| `AppDomainName` | no | `""` | DNS name fronting the ALB (must match the cert). Leave **empty** to use the ALB's own DNS name as the Cognito callback host — then no custom domain or Route 53 record is needed. |
+| `CognitoDomainPrefix` | if Cognito | `""` | Globally-unique Cognito hosted-UI prefix (`https://<prefix>.auth.<region>.amazoncognito.com`). |
+| `CognitoAdminEmail` | if Cognito | `""` | Email of the **first login user**, created by the stack. Cognito mails it a temporary password; the hosted UI asks for a new one on first sign-in. **Required with Cognito** — the user pool disables self sign-up, so without it the deploy succeeds and produces an app nobody can log in to (the template rejects that combination). Add more users later — see [§Create operator users](#create-operator-users-cognito--only-with-cognito). |
 | `EnableAiAssist` | no | `false` | Opt-in; grants scoped `bedrock:InvokeModel`. |
 | `BedrockModelArns` | no | `""` | **Optional override** of the invoke scope; blank = auto-derived from `BedrockModelId`. |
 | `BedrockRegion` | no | `""` | `BEDROCK_REGION` for the app. |
@@ -485,23 +494,33 @@ aws elbv2 describe-load-balancers \
 Use the returned DNS name + hosted-zone id to create the alias record (console
 or `aws route53 change-resource-record-sets`).
 
-### Create operator users (Cognito) — optional
+### Create operator users (Cognito) — only with Cognito
 
-Only when you enabled Cognito (`EnableCognitoAuth=true`, i.e. a public ALB).
-Skip this with the default `internal` ALB. Create users in the stack's user pool:
+Only when you enabled Cognito (`EnableCognitoAuth=true`). Skip this with the default
+`internal` ALB and no Cognito.
+
+**The first user already exists** — the stack created it from `CognitoAdminEmail`, and
+Cognito emailed a temporary password to that address. Check the **`CognitoFirstUser`**
+stack output for which address it went to. To log in, open `AppUrl`, sign in with that
+email + the temporary password, and set a new password when prompted.
+
+To add **more** users, use the `CognitoUserPoolId` stack output:
 
 ```bash
-POOL_ID=$(aws cognito-idp list-user-pools --max-results 60 \
-  --query "UserPools[?Name=='mysql-dsql-migrator-users'].Id | [0]" --output text)
+POOL_ID=$(aws cloudformation describe-stacks --stack-name mysql-dsql-migrator \
+  --query "Stacks[0].Outputs[?OutputKey=='CognitoUserPoolId'].OutputValue | [0]" \
+  --output text)
 
 aws cognito-idp admin-create-user \
   --user-pool-id "$POOL_ID" \
   --username operator@example.com \
-  --user-attributes Name=email,Value=operator@example.com Name=email_verified,Value=true
+  --user-attributes Name=email,Value=operator@example.com Name=email_verified,Value=true \
+  --desired-delivery-mediums EMAIL
 ```
 
-The user receives a temporary password and is prompted to set a new one on first
-sign-in via the Cognito hosted UI (triggered by the ALB).
+Each user receives a temporary password and is prompted to set a new one on first
+sign-in via the Cognito hosted UI (triggered by the ALB). The pool has **self sign-up
+disabled**, so every user must be created this way.
 
 ### Verify
 

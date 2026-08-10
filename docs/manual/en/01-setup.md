@@ -173,7 +173,7 @@ CloudFormation parameter in [`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.
 | Setting | Recommended | Why |
 |---|---|---|
 | `AlbScheme` | **`internal`** (Recommended) | Keeps the tool off the public internet — reach it over VPN / Direct Connect / VPC peering. Use `internet-facing` only with Cognito on. |
-| `EnableCognitoAuth` | **`true`** (Recommended; **required** if internet-facing) | The app has no authentication of its own; Cognito is the gate. |
+| `EnableCognitoAuth` | **`true`** (Recommended; **required** if internet-facing) | The app has no authentication of its own; Cognito is the gate. Set `CognitoDomainPrefix` **and `CognitoAdminEmail`** with it — the template requires all three together, because the user pool has no self sign-up and without a first user the deploy would hand you an app nobody can log in to. |
 | `AllowedIngressCidr` | **scoped to your network** (Recommended) | Restrict who can reach the ALB; don't leave it wide open (`0.0.0.0/0`). |
 | `AssignPublicIp` | **`DISABLED` + NAT gateway or VPC endpoints** (Recommended for production) | `ENABLED` in public subnets is a **test-only** shortcut to skip a NAT. |
 | Task egress | **VPC endpoints** (Recommended where practical) | Reach DSQL / Secrets Manager / ECR / Logs (/ Bedrock) privately, with no public path; otherwise a NAT gateway. |

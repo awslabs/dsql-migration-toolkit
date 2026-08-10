@@ -167,7 +167,7 @@ AWS_REGION=us-east-1 deploy/build_in_codebuild.sh      # イメージ URI を出
 | 設定 | 推奨値 | 理由 |
 |---|---|---|
 | `AlbScheme` | **`internal`**(推奨) | ツールをパブリックインターネットから切り離す — VPN / Direct Connect / VPC ピアリング経由でアクセスします。`internet-facing` は Cognito を有効にした場合のみ使用してください。 |
-| `EnableCognitoAuth` | **`true`**(推奨。インターネット向けの場合は **必須**) | アプリは自身の認証を持たないため、Cognito が唯一のゲートです。 |
+| `EnableCognitoAuth` | **`true`**(推奨。インターネット向けの場合は **必須**) | アプリは自身の認証を持たないため、Cognito が唯一のゲートです。`CognitoDomainPrefix` と **`CognitoAdminEmail`** を併せて設定してください — テンプレートは 3 つをセットで要求します。ユーザープールにセルフサインアップがなく、最初のユーザーがいないと誰もログインできないアプリになるためです。 |
 | `AllowedIngressCidr` | **自分のネットワークに限定**(推奨) | ALB に到達できる範囲を制限します。`0.0.0.0/0` のように全開放しないでください。 |
 | `AssignPublicIp` | **`DISABLED` + NAT ゲートウェイまたは VPC エンドポイント**(本番環境で推奨) | パブリックサブネットでの `ENABLED` は NAT を省くための **テスト専用** の近道です。 |
 | タスクの egress | **VPC エンドポイント**(現実的な場合は推奨) | DSQL / Secrets Manager / ECR / Logs (/ Bedrock) にパブリック経路なしでプライベートに到達します。そうでなければ NAT ゲートウェイを使用します。 |

@@ -152,7 +152,7 @@ CloudFormation 파라미터에 대응합니다:
 | 설정 | 권장값 | 이유 |
 |---|---|---|
 | `AlbScheme` | **`internal`** (권장) | 도구를 공용 인터넷에서 떼어 놓음 — VPN / Direct Connect / VPC 피어링으로 접속. `internet-facing`은 Cognito를 켰을 때만. |
-| `EnableCognitoAuth` | **`true`** (권장; 인터넷 노출 시 **필수**) | 앱 자체 인증이 없으므로 Cognito가 유일한 게이트. |
+| `EnableCognitoAuth` | **`true`** (권장; 인터넷 노출 시 **필수**) | 앱 자체 인증이 없으므로 Cognito가 유일한 게이트. `CognitoDomainPrefix`와 **`CognitoAdminEmail`**을 함께 설정하세요 — 템플릿이 셋을 함께 요구합니다. 유저풀에 self sign-up이 없어 첫 사용자가 없으면 아무도 로그인할 수 없는 앱이 되기 때문입니다. |
 | `AllowedIngressCidr` | **내 네트워크로 한정** (권장) | ALB 접근 범위를 제한. `0.0.0.0/0`로 열어 두지 말 것. |
 | `AssignPublicIp` | **`DISABLED` + NAT 게이트웨이 또는 VPC 엔드포인트** (운영 권장) | 퍼블릭 서브넷의 `ENABLED`는 NAT를 생략하는 **테스트 전용** 지름길. |
 | 태스크 egress | **VPC 엔드포인트** (가능하면 권장) | DSQL / Secrets Manager / ECR / Logs (/ Bedrock)에 공용 경로 없이 프라이빗으로 도달. 아니면 NAT 게이트웨이. |

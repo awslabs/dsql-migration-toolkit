@@ -171,9 +171,12 @@ DSQL リージョンへのアウトバウンド HTTPS + AWS 認証情報が必�
 1. **CloudFormation → Create stack → With new resources (standard).** 右上のリージョンが
    Aurora DSQL クラスターと同じか確認。
 2. **Upload a template file** → `deploy/cloudformation.yaml` を選択 → **Next**。
-3. **Stack name** に `mysql-dsql-migrator` を入力し、**必須 5 フィールド**だけ埋めます —
+3. **Stack name** に `mysql-dsql-migrator` を入力し、**既定値のない 5 フィールド**を埋めます —
    `VpcId`、`AlbSubnetIds`（サブネット 2 個、2 AZ）、`ServiceSubnetIds`（プライベート
-   サブネット 2 個、2 AZ）、`CertificateArn`、`DsqlClusterArn`。他はすべて既定値のまま → **Next**。
+   サブネット 2 個、2 AZ）、`CertificateArn`、`DsqlClusterArn` — **さらに
+   `SourceDbSecurityGroupId`（推奨）か `SourceDbCidr` のどちらか一方**。後者はテンプレートが
+   すべてのデプロイで強制します: 両方空だとタスクからソース MySQL への経路がなく、接続が
+   タイムアウトします。他はすべて既定値のまま → **Next**。
 4. **Next**（スタックオプション）→ **IAM 権限の承認にチェック** → **Create stack**。
 5. **CREATE_COMPLETE** を待つ → **Outputs** タブ → **`AppUrl`** をコピー → VPC 内部から
    アクセス。完了。
@@ -307,7 +310,10 @@ internet-facing ALB で `AllowedIngressCidr` をデフォルトの `10.0.0.0/8` 
 > → Connect から開始）。
 
 **Prod プロファイル**の場合は、step 3 で追加で `EnableCognitoAuth=true`、
-`CognitoDomainPrefix`、`AppDomainName` を設定してください（その後 **DNS を ALB に向ける** ・ **Cognito** セクションを実施）。
+`CognitoDomainPrefix`、**および `CognitoAdminEmail`** を設定してください（その後 **DNS を ALB に向ける** ・ **Cognito** セクションを実施）。
+`CognitoAdminEmail` は任意ではありません — ユーザープールにセルフサインアップがないため、これなしで
+Cognito を有効にするとログイン手段のないアプリになり、テンプレートが拒否します。`AppDomainName` は
+任意で、空のままにすると ALB 自身の DNS 名を使用します。
 
 #### AWS CLI
 
@@ -364,8 +370,9 @@ aws cloudformation deploy \
 > デプロイされます（決定論的パスは変わりません）。詳細とモデル選択は §8 を参照。
 
 **Prod プロファイル**の場合は次を追加します: `EnableCognitoAuth=true`、
-`CognitoDomainPrefix=...`、`AppDomainName=...`（および自前イメージの場合は任意で
-`ContainerImageUri=...`）。
+`CognitoDomainPrefix=...`、`CognitoAdminEmail=...`（この 3 つは常にセットで必要 —
+テンプレートが強制します）。任意で、カスタムドメインなら `AppDomainName=...`、自前イメージなら
+`ContainerImageUri=...`。
 
 > **テストのショートカット / オーバーライド**
 >
@@ -425,9 +432,10 @@ Data Migration → Validation → Cut over）です。UI が表示されれば�
 | `SourceDbCidr` | no* | `""` | ソース DB の CIDR（SG id がない場合に使用）。*これ / `SourceDbSecurityGroupId` のいずれか一方が必須。 |
 | `SourceDbPort` | no | `3306` | ソース MySQL のポート。 |
 | `HttpsEgressCidr` | no | `0.0.0.0/0` | タスクのアウトバウンド 443（AWS API: DSQL トークン、Secrets Manager、ECR、CloudWatch、Bedrock）および 5432（DSQL）の宛先 CIDR。**推奨: デフォルトの `0.0.0.0/0` のまま**にする — タスクは NAT/IGW 経由でパブリックな AWS エンドポイントに到達します。絞り込み（例: ご自身の VPC CIDR へ）は、それらのサービス*すべて*をインターフェース VPC エンドポイント（PrivateLink）でフロントする場合にのみ行ってください。エンドポイントなしで絞り込むとイメージの取得 / DSQL がブロックされ、タスクは起動に失敗します。 |
-| `EnableCognitoAuth` | no | `false` | ALB が Cognito (OIDC) で認証します。デフォルトは `false`: internal ALB（またはご自身の CIDR に絞り込んだ ALB）がアクセスゲートであり、運用者はすでに IAM/DB の権限を保持しているため、ログインは不要です。**`AllowedIngressCidr=0.0.0.0/0` の場合にのみ必須（強制されます）。** `true` の場合は `CognitoDomainPrefix` が必要です。 |
-| `AppDomainName` | Cognito 時 | `""` | ALB をフロントする DNS 名（証明書と一致）。 |
-| `CognitoDomainPrefix` | Cognito 時 | `""` | グローバルに一意な Cognito hosted-UI プレフィックス。 |
+| `EnableCognitoAuth` | no | `false` | ALB が Cognito (OIDC) で認証します。デフォルトは `false`: internal ALB（またはご自身の CIDR に絞り込んだ ALB）がアクセスゲートであり、運用者はすでに IAM/DB の権限を保持しているため、ログインは不要です。**`AllowedIngressCidr=0.0.0.0/0` の場合にのみ必須（強制されます）。** `true` の場合は `CognitoDomainPrefix` と `CognitoAdminEmail` の **両方**が必要です。 |
+| `AppDomainName` | no | `""` | ALB をフロントする DNS 名（証明書と一致する必要があります）。**空のままにすると** ALB 自身の DNS 名を Cognito のコールバックホストとして使用します — カスタムドメインや Route 53 レコードは不要です。 |
+| `CognitoDomainPrefix` | Cognito 時 | `""` | グローバルに一意な Cognito hosted-UI プレフィックス（`https://<prefix>.auth.<region>.amazoncognito.com`）。 |
+| `CognitoAdminEmail` | Cognito 時 | `""` | スタックが作成する**最初のログインユーザー**のメールアドレス。Cognito がこのアドレスに一時パスワードを送信し、hosted UI が初回サインイン時に新しいパスワードを求めます。**Cognito を有効にする場合は必須** — ユーザープールはセルフサインアップを無効にしているため、この値がないとデプロイは成功しても誰もログインできないアプリになります（テンプレートがその組み合わせを拒否します）。ユーザーの追加は [§運用者ユーザーの作成](#運用者ユーザーの作成-cognito--cognito-を有効にした場合のみ) を参照。 |
 | `EnableAiAssist` | no | `false` | opt-in。スコープが絞られた `bedrock:InvokeModel` を付与。 |
 | `BedrockModelArns` | no | `""` | invoke スコープの**オプションのオーバーライド**。空欄 = `BedrockModelId` から自動導出。 |
 | `BedrockRegion` | no | `""` | アプリの `BEDROCK_REGION`。 |
@@ -484,24 +492,33 @@ aws elbv2 describe-load-balancers \
 返された DNS 名 + ホストゾーン id を使ってエイリアスレコードを作成します
 （コンソールまたは `aws route53 change-resource-record-sets`）。
 
-### 運用者ユーザーの作成 (Cognito) — オプション
+### 運用者ユーザーの作成 (Cognito) — Cognito を有効にした場合のみ
 
-Cognito を有効化した場合のみです（`EnableCognitoAuth=true`、すなわち公開 ALB）。
-デフォルトの `internal` ALB ではこれをスキップします。スタックのユーザープールに
-ユーザーを作成します:
+Cognito を有効化した場合のみです（`EnableCognitoAuth=true`）。デフォルトの `internal` ALB で
+Cognito を使わない場合はスキップします。
+
+**最初のユーザーはすでに存在します** — スタックが `CognitoAdminEmail` から作成し、Cognito が
+そのアドレスに一時パスワードを送信しています。どのアドレスに送られたかはスタック出力
+**`CognitoFirstUser`** で確認できます。ログインは `AppUrl` を開き、そのメールアドレスと一時
+パスワードでサインインし、求められたら新しいパスワードを設定します。
+
+**追加**のユーザーを作成するには、スタック出力 `CognitoUserPoolId` を使います:
 
 ```bash
-POOL_ID=$(aws cognito-idp list-user-pools --max-results 60 \
-  --query "UserPools[?Name=='mysql-dsql-migrator-users'].Id | [0]" --output text)
+POOL_ID=$(aws cloudformation describe-stacks --stack-name mysql-dsql-migrator \
+  --query "Stacks[0].Outputs[?OutputKey=='CognitoUserPoolId'].OutputValue | [0]" \
+  --output text)
 
 aws cognito-idp admin-create-user \
   --user-pool-id "$POOL_ID" \
   --username operator@example.com \
-  --user-attributes Name=email,Value=operator@example.com Name=email_verified,Value=true
+  --user-attributes Name=email,Value=operator@example.com Name=email_verified,Value=true \
+  --desired-delivery-mediums EMAIL
 ```
 
-ユーザーは一時パスワードを受け取り、（ALB がトリガーする）Cognito hosted UI 経由の
-初回サインイン時に新しいパスワードを設定するよう求められます。
+各ユーザーは一時パスワードを受け取り、（ALB がトリガーする）Cognito hosted UI 経由の
+初回サインイン時に新しいパスワードを設定するよう求められます。ユーザープールは**セルフ
+サインアップが無効**なため、すべてのユーザーをこの方法で作成する必要があります。
 
 ### 検証
 
