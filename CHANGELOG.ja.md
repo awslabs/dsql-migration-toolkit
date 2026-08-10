@@ -5,6 +5,33 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.296
+
+### 修正
+
+- **停止した CDC シンクを正常として描画せず、報告するようになりました。** ソースが変更を生成しているのに
+  シンクが何も適用していない状態で、3 つのパネルがそれぞれ「正常」を主張していました — テスターがターゲットの
+  行数を直接照会しないとレプリケーション停止に気づけなかった、まさにその原因です:
+  - **Pipeline health** が "Streaming — changes are flowing" と表示していました。この判定は `idle` から
+    来ており、`idle` は 2 つのレートの*どちらか*が 0 でなければ False になるため、ソース側のレートだけで
+    正常と読まれていました。実はこの乖離はすでに画面上にありました(2 本のバー、"Source poll 5.00 rec/s" /
+    "Sink send 0.00 rec/s") — その差を解釈するコードがなかっただけです。新しい `sink_stalled` シグナルが
+    これを明示します: "Sink stalled — changes are NOT reaching DSQL"。さらに、この状況でもコネクタが
+    `RUNNING` と報告されうること、シンクログで繰り返される `Commit of offsets timed out` を確認すること、
+    送信レートが回復するまで切り替えないことを述べた error 通知を併せて表示します。`idle` は意図的に
+    変更していません — cut-over の「drained」判定を担うため、この状況では False であり続ける必要があります。
+  - **Stream lag** が緑色の "Caught up — no replication lag in the recent window." を表示していました。
+    シンクは適用中のみ `ReplicationLagMs` を emit するため、*死んだ*シンクはデータポイントを生成せず、
+    最も強い all-clear を受けていました。同じ入力が現在は "No lag data because the sink is applying
+    nothing — this is a stall, not being caught up." と描画されます。
+  - **Dead-letter queue** が depth 0 で緑の success バンドを表示していました。停止したシンクは隔離すべき
+    レコードに到達すらしないため、0 は「何も失われていない」ではなく「何も試行されていない」を意味します —
+    トーンを下げ、停止中は 0 が想定される値であることを明示します。
+
+  停止は永続的なアクティビティログのイベントも記録します(`sink stalled` FAILURE に両方のレートを含め、
+  復旧時に `sink recovered` SUCCESS)。数秒間隔のポーリングがログを溢れさせないよう、**状態遷移時のみ**
+  記録します。新しい AWS 呼び出しはありません — すべて既に読み取っているメトリクスから導出されます。
+
 ## v0.1.295
 
 ### 修正

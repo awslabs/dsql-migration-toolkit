@@ -1015,11 +1015,19 @@ class CdcActivitySummary:
     CloudWatch unreachable). ``idle`` is True ONLY when both rates are known AND
     ~0 -- an unknown rate yields ``idle=None`` (never asserted idle), so the UI
     never tells the operator "no changes flowing" when it actually cannot tell.
+
+    ``sink_stalled`` is the DIVERGENCE signal: the source is producing real change
+    traffic while the sink applies nothing. It is deliberately a separate field from
+    ``idle`` rather than a change to it -- ``idle`` gates the cut-over "drained"
+    judgement and must keep reading False here (a stalled pipeline is not drained),
+    which is exactly why the stall was invisible: not-idle renders as the reassuring
+    "Streaming -- changes are flowing".
     """
 
     source_poll_rate: Optional[float] = None
     sink_send_rate: Optional[float] = None
     idle: Optional[bool] = None
+    sink_stalled: Optional[bool] = None
 
 
 def cdc_activity_summary(health: dict) -> CdcActivitySummary:
@@ -1029,6 +1037,13 @@ def cdc_activity_summary(health: dict) -> CdcActivitySummary:
     "still flowing" signal). ``idle`` is True only when BOTH the source poll rate
     and the sink send rate are known and at/below the idle threshold; if either
     is unknown, ``idle`` is None (cannot confirm caught up). Pure: no AWS/NiceGUI.
+
+    ``sink_stalled`` inverts that pairing: True when the source is above the
+    threshold (real changes are being produced) and the sink is at/below it (nothing
+    is being applied). That combination is the signature of a sink that has stopped
+    writing to DSQL -- e.g. a consumer ejected from its group, which keeps the
+    connector at RUNNING with no errored task, so no other signal here catches it.
+    Both rates must be known; otherwise it is None (never asserted).
     """
     polls = [h.poll_rate for h in health.values() if getattr(h, "poll_rate", None) is not None]
     sends = [h.send_rate for h in health.values() if getattr(h, "send_rate", None) is not None]
@@ -1036,10 +1051,18 @@ def cdc_activity_summary(health: dict) -> CdcActivitySummary:
     sink_send = max(sends) if sends else None
     if source_poll is None or sink_send is None:
         idle: Optional[bool] = None
+        sink_stalled: Optional[bool] = None
     else:
         idle = source_poll <= _CDC_IDLE_RATE_THRESHOLD and sink_send <= _CDC_IDLE_RATE_THRESHOLD
+        sink_stalled = (
+            source_poll > _CDC_IDLE_RATE_THRESHOLD
+            and sink_send <= _CDC_IDLE_RATE_THRESHOLD
+        )
     return CdcActivitySummary(
-        source_poll_rate=source_poll, sink_send_rate=sink_send, idle=idle
+        source_poll_rate=source_poll,
+        sink_send_rate=sink_send,
+        idle=idle,
+        sink_stalled=sink_stalled,
     )
 
 
@@ -1361,7 +1384,62 @@ def _apply_cdc_status(migration_state, fetched) -> None:
     migration_state.set_cdc_status_view(view)
     # Aggregate throughput so the UI can show "no changes flowing" (cutover
     # signal) without re-deriving it on every render.
-    migration_state.set_cdc_activity(cdc_activity_summary(health))
+    activity = cdc_activity_summary(health)
+    previous = getattr(migration_state, "cdc_activity", None)
+    migration_state.set_cdc_activity(activity)
+    _log_sink_stall_transition(previous, activity)
+
+
+def _log_sink_stall_transition(previous, current) -> None:
+    """Record a sink stall (and its recovery) in the durable activity log.
+
+    Only on a TRANSITION: the CDC poll runs every few seconds, so logging the state
+    itself would write hundreds of identical lines. The event matters because the
+    stall is otherwise invisible outside the live screen -- the connector stays
+    RUNNING with no errored task, so nothing else in the log would show that
+    replication stopped, and the activity-log file survives the task that produced it.
+
+    Best-effort: a logging failure must never break the status poll.
+    """
+    was = bool(getattr(previous, "sink_stalled", False))
+    now = bool(getattr(current, "sink_stalled", False))
+    if was == now:
+        return
+    from dsql_migrator.core.activity_log import (
+        ActivityCategory,
+        ActivityStatus,
+        log_activity,
+    )
+
+    source_rate = getattr(current, "source_poll_rate", None)
+    sink_rate = getattr(current, "sink_send_rate", None)
+    rates = (
+        f"source {source_rate:.2f} rec/s, sink {sink_rate:.2f} rec/s"
+        if source_rate is not None and sink_rate is not None
+        else "rates unavailable"
+    )
+    try:
+        if now:
+            log_activity(
+                ActivityCategory.CDC,
+                "sink stalled",
+                status=ActivityStatus.FAILURE,
+                detail=(
+                    "The source is producing changes but the sink has applied none "
+                    f"({rates}), so changes are not reaching DSQL. The connector can "
+                    "still report RUNNING with no errored task while this happens. Do "
+                    "not cut over until the sink send rate recovers."
+                ),
+            )
+        else:
+            log_activity(
+                ActivityCategory.CDC,
+                "sink recovered",
+                status=ActivityStatus.SUCCESS,
+                detail=f"The sink is applying changes again ({rates}).",
+            )
+    except Exception:  # pragma: no cover - monitoring must never break the poll
+        pass
 
 
 def _refresh_cdc_status(migration_state) -> None:

@@ -4308,7 +4308,7 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
     # every 5s (which flickered). The card is hidden until there are >=2 points (a
     # single dot is not a trend). The rolling series behind it is a hybrid: seeded
     # from CloudWatch's 1-min history (survives reload) then extended each poll.
-    lag = {"card": None, "chart": None, "empty": None}
+    lag = {"card": None, "chart": None, "empty": None, "stalled": None}
     with ui.card().classes("w-full") as _lag_card:  # type: ignore[attr-defined]
         with ui.row().classes("items-center gap-1.5 no-wrap w-full"):  # type: ignore[attr-defined]
             ui.icon("show_chart", color="primary").classes("text-base")  # type: ignore[attr-defined]
@@ -4344,17 +4344,34 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
                 "Caught up — no replication lag in the recent window."
             ).classes("text-sm text-gray-700")
         lag["empty"] = _lag_empty  # type: ignore[assignment]
+        # The SAME "no datapoints" input means the opposite thing when the sink has
+        # stalled: the sink emits ReplicationLagMs only while applying, so a DEAD sink
+        # produces no datapoint and rendered the green "Caught up" line above -- a total
+        # replication outage shown as the strongest possible all-clear. This row
+        # replaces it in that case (see _update_lag_chart).
+        with ui.row().classes("items-center gap-1.5 no-wrap") as _lag_stalled:  # type: ignore[attr-defined]
+            ui.icon("error").classes("text-red-600 text-base")  # type: ignore[attr-defined]
+            ui.label(  # type: ignore[attr-defined]
+                "No lag data because the sink is applying nothing — this is a stall, "
+                "not being caught up."
+            ).classes("text-sm font-semibold text-red-700")
+        lag["stalled"] = _lag_stalled  # type: ignore[assignment]
     lag["card"] = _lag_card  # type: ignore[assignment]
 
     def _update_lag_chart() -> None:
         """Push the latest rolling series into the persistent echart IN PLACE and
-        toggle the card's three states: the trend chart (>=2 points), a "caught up"
-        line (CDC live but no trend to plot -- e.g. right after a session restore of a
-        drained pipeline), or fully hidden (CDC not streaming)."""
+        toggle the card's states: the trend chart (>=2 points), a "caught up" line (CDC
+        live but no trend to plot -- e.g. right after a session restore of a drained
+        pipeline), the STALLED line instead of that (no datapoints because the sink is
+        applying nothing -- the same input, opposite meaning), or fully hidden (CDC not
+        streaming)."""
         option = build_lag_chart_option(
             getattr(migration_state, "cdc_replication_lag_series", None) or []
         )
         card, chart, empty = lag["card"], lag["chart"], lag["empty"]
+        stalled_row = lag.get("stalled")
+        activity = getattr(migration_state, "cdc_activity", None)
+        stalled = bool(getattr(activity, "sink_stalled", False))
         if card is None or chart is None:
             return
         if option is not None:
@@ -4364,12 +4381,18 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
             chart.set_visibility(True)  # type: ignore[attr-defined]
             if empty is not None:
                 empty.set_visibility(False)  # type: ignore[attr-defined]
+            if stalled_row is not None:
+                stalled_row.set_visibility(False)  # type: ignore[attr-defined]
             card.set_visibility(True)  # type: ignore[attr-defined]
         elif _cdc_is_streaming(migration_state):
-            # No trend, but the pipeline is live -> caught up. Keep the panel visible.
+            # No trend, and the pipeline is live. Which line to show depends on WHY
+            # there is no datapoint: caught up (sink applied everything) or stalled
+            # (sink applied nothing) -- never claim the former when it is the latter.
             chart.set_visibility(False)  # type: ignore[attr-defined]
             if empty is not None:
-                empty.set_visibility(True)  # type: ignore[attr-defined]
+                empty.set_visibility(not stalled)  # type: ignore[attr-defined]
+            if stalled_row is not None:
+                stalled_row.set_visibility(stalled)  # type: ignore[attr-defined]
             card.set_visibility(True)  # type: ignore[attr-defined]
         else:
             card.set_visibility(False)  # type: ignore[attr-defined]
@@ -4519,6 +4542,14 @@ def _render_change_flow_status(ui, activity: "CdcActivitySummary") -> None:
             ui.label("No changes flowing — pipeline idle").classes(  # type: ignore[attr-defined]
                 "text-sm text-gray-700"
             )
+        elif activity.sink_stalled:
+            # Checked BEFORE the "streaming" branch: a stalled sink is not idle, so it
+            # used to fall through to "Streaming — changes are flowing" — asserting the
+            # pipeline was healthy off the SOURCE rate alone while nothing reached DSQL.
+            ui.icon("error", color="negative").classes("text-base")  # type: ignore[attr-defined]
+            ui.label("Sink stalled — changes are NOT reaching DSQL").classes(  # type: ignore[attr-defined]
+                "text-sm font-semibold text-red-700"
+            )
         elif activity.idle is False:
             ui.icon("sync", color="primary").classes("text-base")  # type: ignore[attr-defined]
             ui.label("Streaming — changes are flowing").classes(  # type: ignore[attr-defined]
@@ -4527,6 +4558,27 @@ def _render_change_flow_status(ui, activity: "CdcActivitySummary") -> None:
         else:
             ui.icon("help_outline", color="grey").classes("text-base")  # type: ignore[attr-defined]
             ui.label("Activity unknown").classes("text-sm text-gray-500")  # type: ignore[attr-defined]
+    if activity.sink_stalled:
+        # The divergence is already on screen as two bars (source > 0, sink 0) -- what
+        # was missing is reading it. Say what it means and what to do, per the project's
+        # "what happened, what to do next" rule: the connector will still show RUNNING,
+        # so the operator needs to be told not to trust that.
+        render_notice(
+            ui,
+            tone="error",
+            header="The sink is not applying changes",
+            body=(
+                "The source is producing changes but the sink has applied none, so the "
+                "target is falling behind and the gap will not close on its own. The "
+                "connector can still report RUNNING and no errored task while this is "
+                "happening (a sink consumer ejected from its group keeps its thread "
+                "alive), so RUNNING is not evidence that replication works — compare "
+                "target row counts. Check the sink connector log for repeating "
+                '"Commit of offsets timed out"; if you see it, Stop CDC and Start CDC '
+                "to rejoin the group, and do NOT cut over until the sink send rate "
+                "recovers."
+            ),
+        )
     # Visual rate gauges: source poll vs sink send on the SAME scale, so at a glance
     # you can see whether the sink is keeping up with the source (matched bars) or
     # falling behind (shorter sink bar). Unknown rates show "unknown" with no bar.
@@ -4573,15 +4625,22 @@ _DLQ_LEVEL_TONE: dict[str, str] = {
     "alarm": "error",
 }
 
-def _dlq_panel_tone(health) -> str:
+def _dlq_panel_tone(health, *, sink_stalled: bool = False) -> str:
     """Map a :class:`DlqHealth` to a notice tone.
 
     ``ok`` with a non-zero depth is downgraded to ``info`` (sporadic, isolated
     poison is an FYI, not a success), while a truly clean stream (depth 0) stays
     ``success``. Calibrated to the project's severity rules (info/warning/error).
+
+    ``sink_stalled`` blocks the ``success`` upgrade: depth is counted from quarantine
+    log lines, and a sink that has stopped applying never reaches a record to
+    quarantine -- so depth 0 means "nothing was even attempted", not "nothing went
+    wrong". Painting that green made the panel assert an all-clear during total data
+    loss. Downgraded to ``info`` (the stall itself is reported, loudly, by the change-
+    flow signal; this panel just must not contradict it).
     """
     if health.level == "ok":
-        return "success" if health.depth == 0 else "info"
+        return "success" if health.depth == 0 and not sink_stalled else "info"
     return _DLQ_LEVEL_TONE.get(health.level, "info")
 
 def _render_cdc_dlq_panel(
@@ -4600,7 +4659,9 @@ def _render_cdc_dlq_panel(
     health = assess_dlq_health(status_view.dlq_depth)
     if health is None:
         return
-    tone = _dlq_panel_tone(health)
+    _activity = getattr(migration_state, "cdc_activity", None)
+    _stalled = bool(getattr(_activity, "sink_stalled", False))
+    tone = _dlq_panel_tone(health, sink_stalled=_stalled)
     bg, border, icon_color, default_icon = NOTICE_STYLE.get(tone, NOTICE_STYLE["info"])
     with ui.column().classes(  # type: ignore[attr-defined]
         f"w-full gap-2 rounded-md border {border} {bg} p-3"
@@ -4629,6 +4690,14 @@ def _render_cdc_dlq_panel(
                     "flat dense round size=sm icon=refresh"
                 ).tooltip("Refresh dead-letter records from CloudWatch")
         ui.label(health.message).classes("text-xs text-gray-700")  # type: ignore[attr-defined]
+        if _stalled and health.depth == 0:
+            # "No records quarantined." is literally true but reads as reassurance, so
+            # say why it proves nothing right now: a stalled sink never reaches a record
+            # to quarantine, so a zero depth is the EXPECTED reading during a stall.
+            ui.label(  # type: ignore[attr-defined]
+                "A zero count is expected while the sink is stalled — it never reaches "
+                "a record to quarantine, so this is not evidence that nothing was lost."
+            ).classes("text-xs font-semibold text-red-700")
         _render_cdc_dlq_breakdown(ui, status_view)
         # CDC commonly has no Full Load job_id this session, so key the record list /
         # download off the same stable CDC key the fold used (cdc_error_log_key) --

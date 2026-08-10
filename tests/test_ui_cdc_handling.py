@@ -372,3 +372,167 @@ def test_activity_not_idle_when_sink_stalled() -> None:
         "sink": ConnectorHealth(send_rate=0.0),  # sink not keeping up
     }
     assert cdc_activity_summary(health).idle is False
+
+
+def test_sink_stall_is_reported_separately_from_idle() -> None:
+    # The reported failure: source producing, sink applying nothing. `idle` must stay
+    # False (a stalled pipeline is NOT drained -- that guards cut-over), which is
+    # exactly why the stall was invisible: not-idle rendered as "Streaming — changes
+    # are flowing". `sink_stalled` is the signal that names the divergence.
+    summary = cdc_activity_summary(
+        {
+            "src": ConnectorHealth(poll_rate=5.0),
+            "sink": ConnectorHealth(send_rate=0.0),
+        }
+    )
+    assert summary.idle is False
+    assert summary.sink_stalled is True
+
+
+def test_drained_pipeline_is_idle_but_not_stalled() -> None:
+    # Both rates at ~0 = drained/caught up. That must NOT read as a stall, or every
+    # quiet pipeline would raise a false alarm (the source's 5-min heartbeat leaves an
+    # irreducible ~0.03/s floor, so "source quiet" is a small non-zero rate).
+    summary = cdc_activity_summary(
+        {
+            "src": ConnectorHealth(poll_rate=0.03),
+            "sink": ConnectorHealth(send_rate=0.0),
+        }
+    )
+    assert summary.idle is True
+    assert summary.sink_stalled is False
+
+
+def test_healthy_streaming_is_neither_idle_nor_stalled() -> None:
+    summary = cdc_activity_summary(
+        {
+            "src": ConnectorHealth(poll_rate=5.0),
+            "sink": ConnectorHealth(send_rate=4.8),
+        }
+    )
+    assert summary.idle is False
+    assert summary.sink_stalled is False
+
+
+def test_sink_stall_is_never_asserted_on_an_unknown_rate() -> None:
+    # Same honesty rule as `idle`: an unreadable CloudWatch metric must not be
+    # reported as a stall (that would alarm on a monitoring failure, not a data one).
+    only_source = cdc_activity_summary({"src": ConnectorHealth(poll_rate=5.0)})
+    assert only_source.sink_stalled is None
+    only_sink = cdc_activity_summary({"sink": ConnectorHealth(send_rate=0.0)})
+    assert only_sink.sink_stalled is None
+
+
+def test_dlq_zero_depth_is_not_painted_green_while_the_sink_is_stalled() -> None:
+    # A stalled sink never reaches a record to quarantine, so depth is 0 -- which the
+    # panel used to paint as a green "success" all-clear during total data loss.
+    from dsql_migrator.ui.data_migration._cdc_ui import _dlq_panel_tone
+    from dsql_migrator.ui.data_migration._models import assess_dlq_health
+
+    clean = assess_dlq_health(0)
+    assert _dlq_panel_tone(clean) == "success"  # genuinely clean stream: unchanged
+    assert _dlq_panel_tone(clean, sink_stalled=True) == "info"  # proves nothing now
+
+
+def test_sink_stall_and_recovery_each_log_once_on_transition() -> None:
+    # The CDC poll runs every few seconds, so the event must fire on the STATE CHANGE
+    # only -- otherwise the durable activity log fills with identical lines.
+    from dsql_migrator.ui.data_migration import _status as status_mod
+
+    logged: list[tuple] = []
+
+    class _FakeLog:
+        @staticmethod
+        def log_activity(category, action, **kwargs):
+            logged.append((action, kwargs.get("status"), kwargs.get("detail") or ""))
+
+    healthy = cdc_activity_summary(
+        {"src": ConnectorHealth(poll_rate=5.0), "sink": ConnectorHealth(send_rate=5.0)}
+    )
+    stalled = cdc_activity_summary(
+        {"src": ConnectorHealth(poll_rate=5.0), "sink": ConnectorHealth(send_rate=0.0)}
+    )
+
+    import dsql_migrator.core.activity_log as real_log
+
+    original = real_log.log_activity
+    real_log.log_activity = _FakeLog.log_activity  # type: ignore[assignment]
+    try:
+        # healthy -> stalled: one FAILURE event.
+        status_mod._log_sink_stall_transition(healthy, stalled)
+        # stalled -> stalled (repeated polls): silent.
+        status_mod._log_sink_stall_transition(stalled, stalled)
+        status_mod._log_sink_stall_transition(stalled, stalled)
+        # stalled -> healthy: one recovery event.
+        status_mod._log_sink_stall_transition(stalled, healthy)
+        status_mod._log_sink_stall_transition(healthy, healthy)
+    finally:
+        real_log.log_activity = original  # type: ignore[assignment]
+
+    assert [action for action, _, _ in logged] == ["sink stalled", "sink recovered"]
+    stall_detail = logged[0][2]
+    # Says what happened, with the rates, and what NOT to do next.
+    assert "5.00 rec/s" in stall_detail and "0.00 rec/s" in stall_detail
+    assert "cut over" in stall_detail.lower()
+
+
+def test_change_flow_renders_the_stall_instead_of_streaming_all_clear() -> None:
+    # The regression this closes: with source 5 rec/s and sink 0, `idle is False` fell
+    # through to "Streaming — changes are flowing", asserting health off the SOURCE rate
+    # while nothing reached DSQL. The stall branch must win, and must say what to do.
+    from tests.test_ui_data_migration import _RecordingUi
+    from dsql_migrator.ui.data_migration._cdc_ui import _render_change_flow_status
+
+    stalled = cdc_activity_summary(
+        {"src": ConnectorHealth(poll_rate=5.0), "sink": ConnectorHealth(send_rate=0.0)}
+    )
+    ui = _RecordingUi()
+    _render_change_flow_status(ui, stalled)
+    text = " ".join(ui.texts)
+    assert "changes are flowing" not in text  # the misleading all-clear is gone
+    assert "Sink stalled" in text
+    assert "NOT reaching DSQL" in text
+    # Actionable, per the project's "what happened, what to do next" rule.
+    assert "RUNNING is not evidence" in text
+    assert "Commit of offsets timed out" in text
+    assert "do NOT cut over" in text or "not cut over" in text.lower()
+    # Both rate bars still render, so the operator sees the numbers behind the verdict.
+    assert "5.00 rec/s" in text and "0.00 rec/s" in text
+
+
+def test_change_flow_still_shows_streaming_when_the_sink_keeps_up() -> None:
+    from tests.test_ui_data_migration import _RecordingUi
+    from dsql_migrator.ui.data_migration._cdc_ui import _render_change_flow_status
+
+    ui = _RecordingUi()
+    _render_change_flow_status(
+        ui,
+        cdc_activity_summary(
+            {
+                "src": ConnectorHealth(poll_rate=5.0),
+                "sink": ConnectorHealth(send_rate=4.8),
+            }
+        ),
+    )
+    text = " ".join(ui.texts)
+    assert "Streaming — changes are flowing" in text
+    assert "Sink stalled" not in text
+
+
+def test_change_flow_shows_idle_for_a_drained_pipeline() -> None:
+    from tests.test_ui_data_migration import _RecordingUi
+    from dsql_migrator.ui.data_migration._cdc_ui import _render_change_flow_status
+
+    ui = _RecordingUi()
+    _render_change_flow_status(
+        ui,
+        cdc_activity_summary(
+            {
+                "src": ConnectorHealth(poll_rate=0.03),
+                "sink": ConnectorHealth(send_rate=0.0),
+            }
+        ),
+    )
+    text = " ".join(ui.texts)
+    assert "pipeline idle" in text
+    assert "Sink stalled" not in text

@@ -5,6 +5,38 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.296
+
+### Fixed
+
+- **A stalled CDC sink is now reported instead of being rendered as healthy.** With the
+  source producing changes and the sink applying none, three separate panels asserted
+  an all-clear — the exact reason the tester could not tell replication had stopped
+  without querying target row counts:
+  - **Pipeline health** said "Streaming — changes are flowing". That verdict came from
+    `idle`, which is False whenever *either* rate is non-zero, so a source-only rate
+    read as healthy. The divergence was already on screen (two bars, "Source poll 5.00
+    rec/s" / "Sink send 0.00 rec/s") — nothing interpreted the gap. A new
+    `sink_stalled` signal now names it: "Sink stalled — changes are NOT reaching DSQL",
+    plus an error notice saying the connector can still report `RUNNING` while this
+    happens, to check the sink log for repeating `Commit of offsets timed out`, and not
+    to cut over until the send rate recovers. `idle` is deliberately unchanged — it
+    gates the cut-over "drained" judgement and must keep reading False here.
+  - **Stream lag** showed the green "Caught up — no replication lag in the recent
+    window." The sink emits `ReplicationLagMs` only while applying, so a *dead* sink
+    produces no datapoint and got the strongest possible all-clear. The same input now
+    renders "No lag data because the sink is applying nothing — this is a stall, not
+    being caught up."
+  - **Dead-letter queue** rendered a green success band at depth 0. A stalled sink never
+    reaches a record to quarantine, so 0 means "nothing was attempted", not "nothing was
+    lost" — the tone is downgraded and the panel says a zero count is expected during a
+    stall.
+
+  The stall also writes a durable activity-log event (`sink stalled` FAILURE with both
+  rates, and a `sink recovered` SUCCESS on the way back), fired on the state
+  **transition** only so the few-second poll cannot flood the log. No new AWS calls: all
+  of this is derived from metrics already being read.
+
 ## v0.1.295
 
 ### Fixed

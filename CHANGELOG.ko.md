@@ -5,6 +5,33 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.296
+
+### 수정
+
+- **정지한 CDC 싱크를 정상으로 렌더링하지 않고 이제 보고합니다.** 소스는 변경을 생산하는데 싱크가 아무것도
+  적용하지 않는 상태에서, 세 개의 패널이 각각 "정상"을 단정했습니다 — 테스터가 타깃 행 수를 직접 조회하지
+  않고는 복제 정지를 알 수 없었던 바로 그 이유입니다:
+  - **Pipeline health**가 "Streaming — changes are flowing"이라고 표시했습니다. 이 판정은 `idle`에서 나오고,
+    `idle`은 두 rate 중 *하나라도* 0이 아니면 False이므로 소스 rate만으로 정상으로 읽혔습니다. 사실 이
+    divergence는 이미 화면에 있었습니다(바 두 개, "Source poll 5.00 rec/s" / "Sink send 0.00 rec/s") —
+    간극을 해석하는 코드가 없었을 뿐입니다. 새 `sink_stalled` 신호가 이를 명시합니다:
+    "Sink stalled — changes are NOT reaching DSQL", 그리고 이 상황에서도 커넥터가 `RUNNING`으로 보고될 수
+    있다는 점, 싱크 로그의 반복되는 `Commit of offsets timed out`을 확인하라는 점, send rate가 회복되기
+    전에는 전환하지 말라는 점을 담은 error 노티스를 함께 표시합니다. `idle`은 의도적으로 그대로 뒀습니다 —
+    cut-over의 "drained" 판정을 담당하므로 이 상황에서 계속 False로 읽혀야 합니다.
+  - **Stream lag**이 초록색 "Caught up — no replication lag in the recent window."를 표시했습니다. 싱크는
+    적용 중에만 `ReplicationLagMs`를 emit하므로 *죽은* 싱크는 데이터포인트를 만들지 않아 가장 강한 형태의
+    all-clear를 받았습니다. 이제 같은 입력이 "No lag data because the sink is applying nothing — this is a
+    stall, not being caught up."로 렌더됩니다.
+  - **Dead-letter queue**가 depth 0에서 초록 success 밴드를 표시했습니다. 정지한 싱크는 격리할 레코드에
+    도달조차 못 하므로 0은 "아무것도 잃지 않았다"가 아니라 "아무것도 시도되지 않았다"입니다 — 톤을 낮추고,
+    정지 중에는 0이 예상되는 값이라고 명시합니다.
+
+  정지는 durable 활동 로그 이벤트도 남깁니다(`sink stalled` FAILURE에 두 rate 포함, 복구 시
+  `sink recovered` SUCCESS). 수초 간격 폴링이 로그를 범람시키지 않도록 **상태 전환 시에만** 기록합니다.
+  새 AWS 호출은 없습니다 — 모두 이미 읽고 있던 메트릭에서 파생됩니다.
+
 ## v0.1.295
 
 ### 수정
