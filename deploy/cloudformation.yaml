@@ -1143,6 +1143,28 @@ Resources:
         Fn::GetAtt: [ServiceSecurityGroup, GroupId]
       Description: ALB to Fargate task on the app port.
 
+  # HTTPS egress for the ALB itself, required ONLY by authenticate-cognito: to
+  # complete the OIDC code exchange the ALB calls the Cognito hosted-UI domain
+  # (/oauth2/token, /oauth2/userInfo) from its own ENIs. Declaring a
+  # SecurityGroupEgress on the ALB SG replaces the default allow-all egress, so
+  # without this rule the ALB could reach the task on the app port and NOTHING
+  # else -- the login flow got as far as the callback and then failed the token
+  # exchange with a bare "500 Internal Server Error" on /oauth2/idpresponse, with
+  # no app log at all (the request never reaches the app). Only created when
+  # Cognito is enabled: a no-auth ALB needs no outbound internet.
+  AlbHttpsEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: CognitoEnabled
+    Properties:
+      GroupId:
+        Fn::GetAtt: [AlbSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp:
+        Ref: HttpsEgressCidr
+      Description: ALB to the Cognito hosted UI for the OIDC token exchange.
+
   SourceDbEgressBySg:
     Type: AWS::EC2::SecurityGroupEgress
     Condition: UseSourceDbSecurityGroup

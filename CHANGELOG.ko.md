@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.299
+
+### 수정
+
+- **Cognito 로그인이 `/oauth2/idpresponse`에서 아무 설명 없는 `500`으로 실패했습니다: ALB에 아웃바운드
+  HTTPS가 없어 OIDC 토큰 교환을 완료할 수 없었습니다.** `EnableCognitoAuth=true`이면 ALB가 자체 ENI에서
+  Cognito hosted UI(`/oauth2/token`, `/oauth2/userInfo`)를 직접 호출합니다. 그런데 ALB 보안그룹에
+  `SecurityGroupEgress`를 **하나라도** 선언하면 기본 allow-all egress가 대체되는데, 템플릿에는
+  "ALB → 태스크 앱 포트" 규칙만 있었습니다. 그래서 로그인 흐름이 콜백까지 도달한 뒤
+  `500 Internal Server Error`로 죽고, **앱 로그는 전혀 남지 않았습니다** — 요청이 앱에 도달하지조차
+  못하기 때문입니다. (첫 실제 Cognito 배포에서 "새 비밀번호 설정" 단계에서 발생) 이제 템플릿이
+  `AlbHttpsEgress` 규칙(443 → `HttpsEgressCidr`)을 추가하며, Cognito가 켜진 경우에만 생성됩니다 —
+  인증 없는 ALB는 아웃바운드 인터넷이 필요 없기 때문입니다. 테스트로 고정했습니다.
+
 ## v0.1.298
 
 ### 변경

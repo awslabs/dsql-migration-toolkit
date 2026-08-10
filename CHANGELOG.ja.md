@@ -5,6 +5,21 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.299
+
+### 修正
+
+- **Cognito ログインが `/oauth2/idpresponse` で説明のない `500` として失敗していました: ALB に
+  アウトバウンド HTTPS がなく、OIDC のトークン交換を完了できませんでした。**
+  `EnableCognitoAuth=true` の場合、ALB は自身の ENI から Cognito ホスト UI
+  (`/oauth2/token`、`/oauth2/userInfo`) を直接呼び出します。しかし ALB のセキュリティグループに
+  `SecurityGroupEgress` を **1 つでも**宣言すると既定の allow-all egress が置き換えられるため、
+  テンプレートに「ALB → タスクのアプリポート」のみを定義していた結果、ログインはコールバックまで
+  進んだ後 `500 Internal Server Error` で失敗し、**アプリログは一切残りませんでした** — リクエストが
+  アプリに到達すらしないためです。(初回の実 Cognito デプロイで「新しいパスワードの設定」段階で発生)
+  テンプレートに `AlbHttpsEgress` ルール(443 → `HttpsEgressCidr`)を追加し、Cognito 有効時のみ作成
+  します — 認証なしの ALB にアウトバウンド接続は不要です。テストで固定しました。
+
 ## v0.1.298
 
 ### 変更

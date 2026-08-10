@@ -1156,6 +1156,23 @@ def test_alb_security_group_allows_only_https_ingress(template: dict) -> None:
     assert ingress[0]["FromPort"] == 443 and ingress[0]["ToPort"] == 443
 
 
+def test_alb_can_reach_cognito_for_the_oidc_token_exchange(template: dict) -> None:
+    # Regression: authenticate-cognito makes the ALB itself call the Cognito hosted UI
+    # (/oauth2/token, /oauth2/userInfo) from its own ENIs. Declaring ANY
+    # SecurityGroupEgress on the ALB SG replaces the default allow-all egress, so with
+    # only the app-port rule the login flow reached the callback and then died in the
+    # token exchange with a bare 500 on /oauth2/idpresponse -- and no app log at all,
+    # because the request never reaches the app. Observed live before this rule existed.
+    egress = template["Resources"]["AlbHttpsEgress"]
+    assert egress["Type"] == "AWS::EC2::SecurityGroupEgress"
+    # Only needed with Cognito: a no-auth ALB needs no outbound internet.
+    assert egress["Condition"] == "CognitoEnabled"
+    props = egress["Properties"]
+    assert props["GroupId"] == {"Fn::GetAtt": ["AlbSecurityGroup", "GroupId"]}
+    assert props["FromPort"] == 443 and props["ToPort"] == 443
+    assert props["CidrIp"] == {"Ref": "HttpsEgressCidr"}
+
+
 def test_service_only_accepts_traffic_from_alb(template: dict) -> None:
     sg = template["Resources"]["ServiceSecurityGroup"]["Properties"]
     ingress = sg["SecurityGroupIngress"]

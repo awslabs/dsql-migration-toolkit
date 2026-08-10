@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.299
+
+### Fixed
+
+- **Cognito login failed with a bare `500` on `/oauth2/idpresponse`: the ALB had no
+  outbound HTTPS, so it could never complete the OIDC token exchange.** With
+  `EnableCognitoAuth=true` the ALB itself calls the Cognito hosted UI
+  (`/oauth2/token`, `/oauth2/userInfo`) from its own ENIs. But declaring *any*
+  `SecurityGroupEgress` on the ALB security group replaces the default allow-all
+  egress, and the template declared only "ALB → task on the app port" — so the login
+  flow got as far as the callback and then died with `500 Internal Server Error` and
+  **no app log at all**, because the request never reaches the app. (Hit live on the
+  first real Cognito deploy, at the "set a new password" step.) The template now adds
+  an `AlbHttpsEgress` rule (443 to `HttpsEgressCidr`), created only when Cognito is
+  enabled — a no-auth ALB needs no outbound internet. Pinned by a test.
+
 ## v0.1.298
 
 ### Changed
