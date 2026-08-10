@@ -43,7 +43,7 @@ Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 *분산* 데이터베이�
 - **스키마 변환** — MySQL → DSQL DDL 변환·적용(타입 매핑, FK 제거, 비동기 인덱스, PK 전략),
   객체 트리에서 검토 후 적용.
 - **Full Load** — 일관성 스냅샷을 스트리밍으로 벌크 적재. 재개 가능, 대용량 대응.
-- **CDC**(선택) — 거의 무중단 전환을 위한 연속 변경 복제.
+- **CDC** — 거의 무중단 전환을 위한 연속 변경 복제.
 - **Validation** — 행 수·체크섬·PK 대조로 소스↔타깃 일치 검증, 드리프트 보고.
 - **AI 보조**(선택, 기본 off) — 어려운 항목의 변환 제안(검토 후에만 적용).
 
@@ -144,7 +144,7 @@ Dev/Test vs Prod, DNS·Cognito, teardown, 문제 해결).
 - **AI 보조는 컨트롤 플레인만** — 켜면 Amazon Bedrock이 변환 제안·CDC 준비도·DLQ 분류를 더해
   주지만, Full Load / CDC 행 데이터는 보지도 건드리지도 않고 스키마/DDL/플랜 메타데이터만
   사용합니다. 기본 off, 서드파티 API 키 없음(범위 제한된 `bedrock:InvokeModel`).
-- **CDC는 선택적 별도 경로**(`cdc-stack`) — Amazon MSK + Debezium → 관리형 MSK Connect 위의
+- **CDC는 별도 경로**(`cdc-stack`) — Amazon MSK + Debezium → 관리형 MSK Connect 위의
   **커스텀 Aurora DSQL 싱크 커넥터**([`connectors/dsql-sink/`](connectors/dsql-sink)). 표준
   JDBC 싱크로는 DSQL의 단기 IAM 토큰·구문 단위 OCC 재시도·≤3,000행 배치를 감당할 수 없어 직접
   만들었습니다. 이 도구는 컨트롤 플레인만 맡고 싱크 실행 자원은 직접 운영하지 않습니다.

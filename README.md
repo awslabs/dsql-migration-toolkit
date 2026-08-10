@@ -44,7 +44,7 @@ binlog/GTID watermark bridges the two for a gapless handoff.
 - **Schema conversion** — converts and applies DDL MySQL → DSQL (type mapping, FK
   removal, async indexes, PK strategies), review-and-apply from an object tree.
 - **Full Load** — bulk-loads a consistent snapshot by streaming; resumable, large-scale.
-- **CDC** (optional) — continuous replication for near-zero-downtime cut-over.
+- **CDC** — continuous replication for near-zero-downtime cut-over.
 - **Validation** — proves source ↔ target match by row count, checksum, and PK
   reconciliation, and reports drift.
 - **AI assist** (optional, off by default) — conversion suggestions for hard items,
@@ -152,7 +152,7 @@ an **HTTPS ALB** (`internal` by default, optional Cognito), pulling the image fr
   suggestions, CDC-readiness assessment, and DLQ triage. It never sees Full Load /
   CDC row data — only schema/DDL/plan metadata. Off by default; no third-party API
   keys (scoped `bedrock:InvokeModel`).
-- **CDC is an optional, separate path** (`cdc-stack`) — Amazon MSK + Debezium → a
+- **CDC is a separate path** (`cdc-stack`) — Amazon MSK + Debezium → a
   **custom Aurora DSQL sink connector**
   ([`connectors/dsql-sink/`](connectors/dsql-sink)) on managed MSK Connect. A stock
   JDBC sink can't handle DSQL's short-lived IAM tokens, statement-level OCC retry,
