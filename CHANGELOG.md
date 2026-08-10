@@ -5,6 +5,15 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.298
+
+### Changed
+
+- **The app stack's default image is now `0.1.297`** (was `0.1.287`, ten releases
+  behind). `ContainerImageUri` defaults to the published ECR Public image so a normal
+  deploy needs no build — which also means a stale default silently shipped old code to
+  anyone who deployed without overriding it, including every fix from `0.1.288` onward.
+
 ## v0.1.297
 
 ### Fixed
