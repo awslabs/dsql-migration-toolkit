@@ -357,8 +357,8 @@ def test_convert_table_collects_warning_with_table_and_column_context() -> None:
 
 def test_prefix_index_warns_that_dsql_indexes_the_full_column() -> None:
     # A MySQL prefix index KEY (body(100)) has no DSQL equivalent: the converter indexes
-    # the FULL column, which can exceed the ~255-byte key limit and fail CREATE INDEX
-    # ASYNC after the load. The operator must be warned at planning time (audit B2).
+    # the FULL column, whose value can exceed DSQL's 1 KiB key budget and fail with
+    # error 54000. The operator must be warned at planning time (audit B2).
     table = TableDef(
         name="articles",
         columns=[
@@ -375,7 +375,10 @@ def test_prefix_index_warns_that_dsql_indexes_the_full_column() -> None:
     assert len(prefix_warnings) == 1
     w = prefix_warnings[0]
     assert "idx_body" in w.message and "body(100)" in w.message
-    assert "255-byte" in w.message or "255 byte" in w.message
+    # Cites the documented key limit and error, not an invented per-column cap: DSQL
+    # publishes a 1 KiB combined key budget (54000) and no 255-byte column cap.
+    assert "1024-byte" in w.message
+    assert "54000" in w.message
     # The index DDL is still emitted (on the full column) -- the warning is advisory.
     assert any("idx_body" in ddl for ddl in result.index_ddls)
 
@@ -1253,6 +1256,151 @@ def test_index_budget_ignores_indexes_the_converter_skips() -> None:
     )
     assert len(table.indexes) == 25  # over the budget by raw count
     assert _too_many_indexes_warning(table) is None  # but only 23 are emitted
+
+
+# ---------------------------------------------------------------------------
+# 1 KiB combined key-size budget (error 54000 "key size too large"). Unlike the
+# 8-column cap this is enforced on the VALUE at INSERT/UPDATE time, so it can only
+# ever be a WARNING -- a wide declared type holding short values migrates fine.
+# ---------------------------------------------------------------------------
+
+
+def _key_warning(table: TableDef):
+    """The key-size note from converting ``table``, or None."""
+    conversion = _convert_table(table)
+    hits = [w for w in conversion.warnings if "key size too large" in w.message]
+    return hits[0] if hits else None
+
+
+def _keyed_table(specs: dict[str, str], pk: list[str], indexes=None) -> TableDef:
+    return TableDef(
+        name="t",
+        columns=[
+            ColumnDef(name=name, mysql_type=mysql_type, nullable=False)
+            for name, mysql_type in specs.items()
+        ],
+        primary_key=pk,
+        indexes=list(indexes or []),
+    )
+
+
+def test_narrow_multi_column_key_is_not_falsely_flagged() -> None:
+    # Regression: every varchar column used to be counted at a flat 255 bytes, so
+    # 5 x varchar(10) scored 1275 and warned about a key that cannot exceed ~200.
+    assert _key_warning(_keyed_table(
+        {f"c{i}": "VARCHAR(10)" for i in range(1, 6)},
+        [f"c{i}" for i in range(1, 6)],
+    )) is None
+
+
+def test_single_wide_varchar_key_is_flagged() -> None:
+    # The other half of the same regression: one varchar(2000) key column also scored
+    # 255, so a key that alone can be 8 KiB passed silently.
+    warning = _key_warning(_keyed_table({"c": "VARCHAR(2000)"}, ["c"]))
+    assert warning is not None
+    assert "8000 bytes" in warning.message  # 2000 chars x 4 bytes (utf8mb4)
+
+
+def test_key_size_budget_boundary_counts_utf8mb4_bytes() -> None:
+    # varchar(256) x 4 bytes = exactly 1024 -> at the limit, clean.
+    assert _key_warning(_keyed_table({"c": "VARCHAR(256)"}, ["c"])) is None
+    # One more character crosses it.
+    assert _key_warning(_keyed_table({"c": "VARCHAR(257)"}, ["c"])) is not None
+
+
+def test_unbounded_text_key_is_flagged() -> None:
+    # TEXT has no declared length and can exhaust the budget by itself.
+    assert _key_warning(_keyed_table({"c": "TEXT"}, ["c"])) is not None
+
+
+def test_wide_secondary_index_key_size_is_flagged_and_named() -> None:
+    warning = _key_warning(_keyed_table(
+        {"id": "INT", "d": "VARCHAR(500)"},
+        ["id"],
+        [IndexDef(name="ix_d", columns=["d"])],
+    ))
+    assert warning is not None
+    assert "index ix_d" in warning.message
+    # The PK itself is a 4-byte int, so it must not be listed as at risk (the phrase
+    # "a primary key" appears in the shared explanation, hence the specific form).
+    assert "the primary key (" not in warning.message
+
+
+def test_key_size_note_is_a_recommendation_not_a_block() -> None:
+    # Enforced on the VALUE at INSERT time, so a wide declared type whose real values
+    # are short migrates fine -- this must never be UNSUPPORTED, and the DDL must
+    # still be emitted.
+    conversion = _convert_table(_keyed_table({"c": "VARCHAR(2000)"}, ["c"]))
+    warning = _key_warning(_keyed_table({"c": "VARCHAR(2000)"}, ["c"]))
+    assert warning.classification is Classification.MANUAL
+    assert warning.kind is ConversionNoteKind.RECOMMENDATION
+    assert 'PRIMARY KEY ("c")' in conversion.target_ddl
+    # Names the error and that it lands per ROW, not at apply.
+    assert "54000" in warning.message
+    assert "INSERT" in warning.message
+
+
+def test_ordinary_keys_produce_no_key_size_note() -> None:
+    assert _key_warning(_keyed_table({"id": "BIGINT"}, ["id"])) is None
+    assert _key_warning(_keyed_table({"id": "CHAR(36)"}, ["id"])) is None  # uuid-as-char
+    assert _key_warning(_keyed_table(
+        {"tenant": "INT", "id": "BIGINT"}, ["tenant", "id"]
+    )) is None
+
+
+def test_key_size_check_skips_an_index_the_converter_drops() -> None:
+    # A 9-column index is not emitted at all (8-column cap), so warning about its
+    # byte size too would be noise about DDL that does not exist.
+    warning = _key_warning(_keyed_table(
+        {f"c{i}": "VARCHAR(500)" for i in range(1, 10)},
+        ["c1"],
+        [IndexDef(name="ix_wide", columns=[f"c{i}" for i in range(1, 10)])],
+    ))
+    assert warning is None or "ix_wide" not in warning.message
+
+
+def test_key_size_measures_the_key_the_pk_strategy_produced() -> None:
+    # The estimate must read the EMITTED key, not TableDef.primary_key, so a strategy
+    # that rewrites the key is measured as converted. COMPOSITE_KEY is the strong case:
+    # a leading column that busts the budget is rejected outright by the picker's own
+    # validation (it is a deliberate user choice, so blocking is right there) --
+    table = _keyed_table({"code": "VARCHAR(400)", "id": "BIGINT"}, ["id"])
+    assert _key_warning(table) is None  # the source key alone (bigint) is tiny
+    blocked = SchemaConverter().convert_table(
+        table,
+        SchemaConvertOptions(
+            primary_key_strategy=PrimaryKeyStrategy.COMPOSITE_KEY,
+            composite_leading_column="code",
+        ),
+    )
+    (rejection,) = [w for w in blocked.warnings if "key limit" in w.message]
+    assert rejection.classification is Classification.UNSUPPORTED
+    assert "1608 bytes" in rejection.message  # 400x4 + 8, i.e. the composite key
+
+    # -- while a leading column that FITS is applied, and the resulting key is what
+    # gets measured (no note, because 4x64 + 8 is well under the budget).
+    ok = SchemaConverter().convert_table(
+        _keyed_table({"code": "VARCHAR(64)", "id": "BIGINT"}, ["id"]),
+        SchemaConvertOptions(
+            primary_key_strategy=PrimaryKeyStrategy.COMPOSITE_KEY,
+            composite_leading_column="code",
+        ),
+    )
+    assert 'PRIMARY KEY ("code", "id")' in ok.target_ddl
+    assert not [w for w in ok.warnings if "key size too large" in w.message]
+
+
+def test_key_size_estimate_reads_the_converted_target_type() -> None:
+    # The estimate must use the TARGET type: a CONVERT_TO_UUID key is a 16-byte uuid,
+    # not the source's char/int, so it must never be flagged.
+    from dsql_migrator.core.converter import _estimate_key_column_bytes, _target_key_columns
+    import sqlglot
+
+    create = sqlglot.parse_one(
+        'CREATE TABLE "t" ("id" UUID NOT NULL, PRIMARY KEY ("id"))', dialect="postgres"
+    )
+    assert _target_key_columns(create) == ["id"]
+    assert _estimate_key_column_bytes(create, "id") == 16
 
 
 def test_tinyint_bool_default_becomes_a_boolean_literal() -> None:

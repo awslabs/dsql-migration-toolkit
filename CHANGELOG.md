@@ -5,6 +5,32 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.294
+
+### Fixed
+
+- **The 1 KiB key-size budget is now estimated from declared column widths and warned
+  about, and the byte estimate no longer counts every string column as 255 bytes.**
+  Aurora DSQL limits a primary key — and each secondary index — to **1 KiB combined**
+  (error 54000 `key size too large`). Unlike the 8-column cap this is enforced on the
+  **value at `INSERT`/`UPDATE`**, not on the DDL, so a `varchar(2000)` key creates fine
+  and fails only for rows whose value is actually too long. Two problems:
+  - Nothing warned about it. A key whose declared widths could not possibly fit was
+    discovered per row, mid-migration: a too-large PK value quarantines that row in Full
+    Load (dead-letters it in CDC), and a too-large index value fails the post-load
+    `CREATE INDEX ASYNC`. Schema Conversion now emits a **MANUAL recommendation** naming
+    each at-risk key and its worst-case size. It never blocks — a wide declared type
+    holding short values migrates fine, so refusing to convert it would be a false alarm.
+  - The estimator assumed a **255-byte per-column key cap that Aurora DSQL does not
+    document** (it indexes `varchar` up to 65,535 bytes and `char` up to 4,096). That was
+    wrong in both directions: it under-counted one wide column (a `varchar(2000)` key
+    scored 255, so the composite-key picker allowed a key that cannot fit) and
+    over-counted several narrow ones (5 × `varchar(10)` scored 1,275 and was rejected
+    though it cannot exceed ~200 bytes). It now uses the **declared length at 4 bytes per
+    character** (utf8mb4's worst case), falling back to the full budget for an unbounded
+    `text`. The prefix-index warning, which cited the same non-existent 255-byte limit,
+    now cites the documented 1 KiB budget and error code.
+
 ## v0.1.293
 
 ### Fixed

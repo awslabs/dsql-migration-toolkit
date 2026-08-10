@@ -26,6 +26,7 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 | **테이블당 ≤ 255 컬럼, DB당 ≤ 1000 테이블** | 초과 시 미지원. | **UNSUPPORTED**(`TOO_MANY_COLUMNS` / `TABLE_COUNT_LIMIT`). |
 | **테이블당 ≤ 24 인덱스** (PK가 포함되므로 보조 인덱스는 ≤ 23; MySQL은 64) | 초과분 `CREATE INDEX ASYNC`가 Full Load로 모든 행을 쓴 **뒤에** 실패. | 계획 단계에서 **MANUAL**(`TOO_MANY_INDEXES`)로 표시하고 Schema Conversion에도 동일 노트. |
 | **기본 키·인덱스의 컬럼 수 ≤ 8** (MySQL은 16) | 더 넓은 키는 error 54011로 실패. | PK가 넓으면 **UNSUPPORTED**(`CREATE TABLE` 자체가 거부되어 아무 데이터도 적재되지 않음), 인덱스가 넓으면 **MANUAL**(`TOO_MANY_KEY_COLUMNS`). 변환은 적재 후 반드시 실패할 DDL을 내보내지 않고 그 인덱스를 **생략**하며, 어떤 인덱스인지 노트에 명시. |
+| **키 합산 크기 ≤ 1 KiB** (PK 각각, 인덱스 각각) | DDL이 아니라 **`INSERT`/`UPDATE` 시점의 값**에 대해 검사 — 따라서 실제 키가 너무 긴 행만 실패(error 54000 `key size too large`). | *선언된* 폭이 이를 넘을 수 있으면 변환이 경고(**MANUAL** 권장)하며, utf8mb4 기준 문자당 4바이트로 계산해 해당 키와 최악의 크기를 명시. 차단하지 않음 — 선언은 넓어도 실제 값이 짧으면 정상 마이그레이션되므로. |
 | **클러스터당 하나의 DB** | DSQL은 다중 DB가 아니라 스키마로 구성. | 다중 DB 소스 **MANUAL**(스키마로 통합 또는 클러스터 분리). |
 | **`TRUNCATE` 없음; 트랜잭션당 DDL 한 개; 낙관적 동시성** | MySQL과 다른 쓰기/DDL 의미. | 투명하게 처리: TRUNCATE 대신 DROP+재생성, 단일 DDL 단위, 필요한 곳마다 `40001` 재시도. |
 | **IAM 토큰 인증(비밀번호 없음); 단기 토큰** | 정적 DB 비밀번호 없음. | 도구(와 CDC 싱크)가 IAM 토큰을 자동 발급·갱신. |

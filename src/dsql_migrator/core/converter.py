@@ -1605,9 +1605,18 @@ _KEY_TYPE_BYTES: dict = {
     _T.TIMESTAMPTZ: 8,
     _T.UUID: 16,
 }
-# Per-column cap DSQL applies to a variable-length (char/varchar/text) column when
-# it participates in a key, regardless of the column's declared length.
-_DSQL_MAX_VARLEN_KEY_BYTES = 255
+# Assumed bytes for a variable-length key column with NO declared length (``text``,
+# or a type we cannot size). Not a DSQL cap: the docs list no per-column key cap --
+# varchar is indexable up to 65,535 bytes and char up to 4,096 -- so a declared
+# length is used when present (see _estimate_key_column_bytes) and this stands in
+# only for an unbounded/unknown one. Deliberately ABOVE the 1 KiB key budget, since
+# an unbounded text column in a key can exhaust it by itself; a value at or below the
+# budget would make such a key untestable against it.
+_UNBOUNDED_VARLEN_KEY_BYTES = _DSQL_MAX_KEY_BYTES + 1
+# Worst-case bytes per character for a declared length. MySQL reports VARCHAR(n) in
+# CHARACTERS, and utf8mb4 -- the modern default -- stores up to 4 bytes each, so a
+# VARCHAR(300) can hold 1,200 bytes and blow the 1 KiB key budget on its own.
+_MAX_BYTES_PER_CHAR = 4
 _VARLEN_KEY_TYPES = frozenset({_T.VARCHAR, _T.CHAR, _T.NCHAR, _T.NVARCHAR, _T.BPCHAR, _T.TEXT})
 
 
@@ -1616,14 +1625,28 @@ def _estimate_key_column_bytes(create: exp.Expression, column_name: str) -> int:
 
     Reads the post-type-mapping :class:`exp.DataType` from ``create`` so the
     estimate reflects the TARGET type (e.g. a MySQL ``INT`` widened to ``bigint``).
-    Variable-length string types are counted at the DSQL 255-byte key cap (their
-    per-column ceiling in a key); ``numeric(p, s)`` at roughly ``ceil(p/2) + 2``;
-    an unknown type conservatively at the 255-byte cap so we never under-count.
+    ``numeric(p, s)`` counts as roughly ``ceil(p/2) + 2``.
+
+    A variable-length string type counts its DECLARED length at
+    :data:`_MAX_BYTES_PER_CHAR` bytes per character -- ``varchar(n)`` is declared in
+    characters and utf8mb4 stores up to 4 bytes each -- because DSQL applies no
+    per-column key cap (it indexes ``varchar`` up to 65,535 bytes) and enforces the
+    1 KiB budget on the VALUE, at ``INSERT``/``UPDATE`` time. A previous version
+    counted every such column at a flat 255 bytes, which was wrong in both
+    directions: it under-counted a single wide column (a ``varchar(2000)`` key can
+    exceed 1 KiB on its own yet scored 255) and over-counted several narrow ones (5 x
+    ``varchar(10)`` scored 1,275 and failed a key that cannot exceed ~200 bytes).
+    An unbounded/unsizable type counts :data:`_UNBOUNDED_VARLEN_KEY_BYTES`.
+
+    This is an UPPER BOUND on the declared type, not a prediction about the data:
+    the actual values may be far shorter. Callers therefore use it to WARN (see
+    :func:`_key_size_warning`), and only the composite-key picker -- where the user
+    is actively choosing to add a column -- treats it as blocking.
     """
     column_def = _find_column_def(create, column_name)
     data_type = column_def.args.get("kind") if column_def is not None else None
     if not isinstance(data_type, exp.DataType):
-        return _DSQL_MAX_VARLEN_KEY_BYTES
+        return _UNBOUNDED_VARLEN_KEY_BYTES
     kind = data_type.this
     if kind in _KEY_TYPE_BYTES:
         return _KEY_TYPE_BYTES[kind]
@@ -1632,10 +1655,36 @@ def _estimate_key_column_bytes(create: exp.Expression, column_name: str) -> int:
         precision = params[0] if params else 38
         return (precision // 2) + 2
     if kind in _VARLEN_KEY_TYPES:
-        return _DSQL_MAX_VARLEN_KEY_BYTES
-    # Any other converted type (e.g. bytea fallback) -- count the key cap so a
-    # pathological choice is caught rather than silently under-counted.
-    return _DSQL_MAX_VARLEN_KEY_BYTES
+        length = _declared_length(data_type)
+        if length is None:
+            return _UNBOUNDED_VARLEN_KEY_BYTES  # e.g. text -- no declared bound
+        # NOT clamped to the key budget: the estimate has to be able to EXCEED it,
+        # since that is exactly what the caller tests for.
+        return length * _MAX_BYTES_PER_CHAR
+    # Any other converted type (e.g. bytea fallback) -- count the whole key budget so
+    # a pathological choice is caught rather than silently under-counted.
+    return _UNBOUNDED_VARLEN_KEY_BYTES
+
+
+def _declared_length(data_type: exp.DataType) -> Optional[int]:
+    """Return a string type's declared length (``varchar(n)`` -> ``n``), else ``None``."""
+    for expression in data_type.expressions:
+        if expression.name.isdigit():
+            return int(expression.name)
+    return None
+
+
+def _target_key_columns(create: exp.Expression) -> list[str]:
+    """Return the primary-key columns the converted DDL actually declares.
+
+    Read from the emitted ``PRIMARY KEY`` node rather than from ``TableDef`` so the
+    key measured is the one the PK strategy produced (COMPOSITE_KEY prepends a
+    column). Empty when the DDL declares no table-level primary key.
+    """
+    primary_key = next(iter(create.find_all(exp.PrimaryKey)), None)
+    if primary_key is None:
+        return []
+    return [expression.name for expression in primary_key.expressions]
 
 
 def _composite_key_columns(table: TableDef, leading: str) -> list[str]:
@@ -2151,6 +2200,75 @@ def _too_many_key_columns_warning(table: TableDef) -> Optional[ConversionWarning
     )
 
 
+def _key_size_warning(
+    table: TableDef, create: exp.Expression
+) -> Optional[ConversionWarning]:
+    """Warn when a key's declared column widths can exceed DSQL's 1 KiB key budget.
+
+    DSQL caps the combined size of a primary key -- and of each secondary index --
+    at 1 KiB (error 54000 ``key size too large``). Unlike the 8-column cap, this one
+    is enforced on the VALUE at ``INSERT``/``UPDATE`` time, not on the DDL: a
+    ``varchar(2000)`` key column creates fine and only fails for rows whose value is
+    actually too long. So this is a WARNING, never a block -- a wide declared type
+    whose real values are short migrates without trouble, and refusing to convert it
+    would be a false alarm.
+
+    It is worth surfacing anyway because of WHERE the failure lands: a too-large
+    primary-key value fails that row's INSERT during Full Load (quarantined to the
+    error log) or its apply during CDC (dead-lettered), and a too-large secondary
+    index value fails the post-load ``CREATE INDEX ASYNC``. Both are discovered
+    mid/post-migration, per row, on a limit that a look at the declared widths could
+    have flagged up front.
+
+    Estimated from the converted types via :func:`_estimate_key_column_bytes` (an
+    upper bound on the declared type, counting utf8mb4's 4 bytes per character), so
+    the note says the key CAN exceed the limit, not that it will.
+
+    The primary key is read from ``create`` rather than from ``table``, so the key the
+    PK strategy actually produced is the one measured -- COMPOSITE_KEY prepends a
+    column, and CONVERT_TO_UUID replaces the key's type.
+    """
+    at_risk: list[str] = []
+
+    def estimate(columns: list[str]) -> int:
+        return sum(_estimate_key_column_bytes(create, c) for c in columns)
+
+    target_pk = _target_key_columns(create) or table.primary_key
+    if target_pk:
+        pk_bytes = estimate(target_pk)
+        if pk_bytes > _DSQL_MAX_KEY_BYTES:
+            at_risk.append(
+                f"the primary key ({', '.join(target_pk)}) at up to ~{pk_bytes} bytes"
+            )
+    for index in table.indexes:
+        # Skip an index the converter does not emit anyway (over the 8-column cap).
+        if len(index.columns) > _DSQL_MAX_PK_COLUMNS:
+            continue
+        index_bytes = estimate(index.columns)
+        if index_bytes > _DSQL_MAX_KEY_BYTES:
+            at_risk.append(f"index {index.name} at up to ~{index_bytes} bytes")
+    if not at_risk:
+        return None
+
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.RECOMMENDATION,
+        message=(
+            f"Aurora DSQL limits a primary key — and each secondary index — to "
+            f"{_DSQL_MAX_KEY_BYTES} bytes combined, and the declared column widths "
+            f"allow {'; '.join(at_risk)} (counting 4 bytes per character, as utf8mb4 "
+            "can use). The DDL itself applies fine: DSQL checks the VALUE on INSERT, "
+            'so only rows whose actual key exceeds the limit fail (error 54000 "key '
+            'size too large") — a primary-key value during Full Load/CDC (that row is '
+            "quarantined or dead-lettered), or an index value in the post-load CREATE "
+            "INDEX ASYNC. If your real values are well under the limit, nothing "
+            "happens; if they are not, shorten the column(s) or drop them from the key "
+            "before loading."
+        ),
+    )
+
+
 def _oversized_lob_warning(table: TableDef) -> Optional[ConversionWarning]:
     """Warn about LOB/TEXT columns whose values can exceed DSQL's 1 MiB per-value cap.
 
@@ -2228,13 +2346,13 @@ def _prefix_index_warning(table: TableDef) -> Optional[ConversionWarning]:
     index equivalent, so the converter emits ``CREATE INDEX ASYNC`` on the WHOLE column.
     Two consequences the operator must see BEFORE a multi-hour load:
 
-    - a variable-length column whose full value exceeds DSQL's ~255-byte key limit makes
-      the ``CREATE INDEX ASYNC`` fail (after the table + data are already applied), and
+    - a value whose FULL length exceeds DSQL's 1 KiB index-key budget fails (the very
+      case the prefix existed to avoid -- the column is presumably long), and
     - even when it fits, indexing the full value is a semantic change from the prefix.
 
     Without this the only signal was the per-value OVERSIZED_LOB note (about row size,
     not the index), so the index failure surfaced only post-load. RECOMMENDATION, not a
-    hard LOSS: the index is still created for columns within the key limit.
+    hard LOSS: the index is still created, and values within the budget are fine.
     """
     flagged: list[str] = []
     for index in table.indexes:
@@ -2250,11 +2368,12 @@ def _prefix_index_warning(table: TableDef) -> Optional[ConversionWarning]:
         message=(
             f"Prefix index(es) {names} index only the first N characters/bytes in MySQL, "
             "but Aurora DSQL has no prefix index — the converter indexes the FULL "
-            "column. If a value exceeds DSQL's ~255-byte index-key limit the "
-            "CREATE INDEX ASYNC fails AFTER the table and its data are loaded, leaving "
-            "the table without that index. Before loading, confirm the column's values "
-            "fit the key limit, or replace the prefix index with an expression index on "
-            "a bounded substring (e.g. on left(col, N)) / drop it if unused."
+            f"column. A value whose full length exceeds DSQL's {_DSQL_MAX_KEY_BYTES}-byte "
+            'index-key limit then fails (error 54000 "key size too large") — which is '
+            "the case a prefix index usually exists for. Before loading, confirm the "
+            "column's values fit the key limit, or replace the prefix index with an "
+            "expression index on a bounded substring (e.g. on left(col, N)) / drop it "
+            "if unused."
         ),
     )
 
@@ -2543,6 +2662,10 @@ class SchemaConverter:
             _too_many_columns_warning(table),
             _too_many_indexes_warning(table, len(extra_index_ddls)),
             _too_many_key_columns_warning(table),
+            # Reads the post-conversion types off `create`, so it must run AFTER the
+            # PK strategy has rewritten the key (a UUID/identity conversion changes
+            # the key's byte estimate, and COMPOSITE_KEY changes its columns).
+            _key_size_warning(table, create),
             _oversized_lob_warning(table),
             _generated_column_warning(table),
             _collation_warning(table),
