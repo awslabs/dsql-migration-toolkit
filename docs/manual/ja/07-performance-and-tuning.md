@@ -223,6 +223,41 @@ OCC なので、**PK 戦略が最も重要です** (§7.1 参照)。
 関連する 2 つの cdc-stack パラメータは推論ではなく固定です: `SourceTasksMax` = 1 (MySQL はサーバーごとに
 シングルタスク)、`SinkBatchMaxRows` = 3000 (DSQL のトランザクションあたり行数上限 — **3000 を超えないこと**)。
 
+#### シンクのコンシューマータイムアウト (Kafka のデフォルトを使わない理由)
+
+シンクは Kafka の**コンシューマーグループ**メンバーであり、1 回の `put()` が正当に数分かかることが
+あります: 最大 `SinkMaxPollRecords`(3000)件のレコードを受け取り、チャンク内のいずれかの行が permanent な
+SQL エラーになると、コネクタはそのチャンクを**行単位で — それぞれ 1 つの DSQL トランザクションとして**
+再適用します(poison 行を隔離し、正常な行はそのまま反映するため)。ラウンドトリップ ~50 ms なら、その 1 回の
+呼び出しが ~450 秒に達することもあり、OCC リトライがさらに加算されます。
+
+Kafka のデフォルトでは、これは**正常に見える形で**致命的です: `max.poll.interval.ms`
+(デフォルト 300000、5 分)を超えるとグループコーディネーターがコンシューマーを追い出してパーティションを
+回収し、それ以降オフセットをコミットできなくなります。そしてシンクは `errors.tolerance=all` で動作し、
+Connect はコミット失敗を*警告するだけ*なので、タスクは死にません — `Commit of offsets timed out` を
+繰り返し記録する一方で、コネクタは依然として **RUNNING** と報告され、レプリケーションは恒久的に停止します。
+そのため cdc-stack はシンクの worker config に次を設定します:
+
+| パラメータ | デフォルト | Kafka のデフォルト | 理由 |
+|---|---|---|---|
+| `SinkMaxPollIntervalMs` | 900000 (15 分) | 300000 | 最悪ケースの `put()`(3000 行の行単位フォールバック)を超える必要があります。**`SinkMaxPollRecords` を上げるなら併せて上げてください。** |
+| `SinkSessionTimeoutMs` | 60000 | 45000 | ハートビートはバックグラウンドスレッドから送られるため、この値はワーカーの GC / スケジューリング停止を吸収するだけでよく、適用時間は関係ありません。 |
+| `SinkHeartbeatIntervalMs` | 20000 | 3000 | Kafka はセッションタイムアウトより小さいことを要求します(推奨は ≤ ⅓): 追い出しまでに 3 回のハートビート欠落を許容。 |
+| `SinkOffsetFlushTimeoutMs` | 120000 | 5000 | コミット経路がタスクの `flush()` を呼び、そこでモニターメトリクスを NAT ゲートウェイ経由で CloudWatch に送信します。5 秒では厳しすぎます。 |
+
+これらがすべて設定可能なのは、MSK Connect の **worker** レベルの許可リストに
+`consumer.max.poll.interval.ms`、`consumer.session.timeout.ms`、
+`consumer.heartbeat.interval.ms` が含まれているからです。MSK Connect が対応していないのは
+per-*connector* の `.override.` 形式です(`connector.client.config.override.policy` を除外) — だから
+これらは worker config に置かれています。変更すると worker configuration が置き換えられるため、
+`PLUGIN_VERSION` の bump と CDC インフラの **Delete + Deploy** が必要です。Start CDC だけでは反映されません。
+
+> **逆方向のほうが安価に上限を与えます。** `SinkMaxPollRecords` を下げると(例: 500〜1000)、1 回の
+> `put()` の最大所要時間が抑えられ、スループットの損失はありません: `put()` は `SinkBatchMaxRows` 単位の
+> チャンクで適用されるため、ポールが小さくても DSQL トランザクションは満たされます — 1 回の呼び出しで
+> 渡す作業量が減るだけです。どちらも cdc-stack の CloudFormation パラメータ(アプリ設定ではない)なので、
+> いずれの変更も再デプロイになります。
+
 #### シンクのコンピュート（最初に触るべきノブ）
 
 シンクのコンピュートはソースと**独立して**サイジングします: `ConnectorMcuCount` はソースコネクタに、

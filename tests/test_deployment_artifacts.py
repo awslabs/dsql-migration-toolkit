@@ -841,6 +841,44 @@ def test_cdc_stack_worker_configs_size_message_limits_for_oversized_records(
         assert not any(".override." in k for k in cfg), conn
 
 
+def test_cdc_sink_worker_config_sets_consumer_poll_and_commit_timeouts(
+    cdc_template: dict,
+) -> None:
+    # This sink's put() is slow and unbounded BY DESIGN: a permanent SQL error in a
+    # chunk makes DsqlSinkTask re-apply that chunk row by row (one DSQL transaction
+    # per row, up to SinkMaxPollRecords=3000 of them), and a transient failure is
+    # retried indefinitely. On Kafka's defaults (max.poll.interval.ms=300000,
+    # offset.flush.timeout.ms=5000) one long put() gets the consumer EJECTED from its
+    # group; offsets can then never commit, and since errors.tolerance=all and the
+    # resulting "Commit of offsets timed out" is only a WARN, the task never fails --
+    # the connector reports RUNNING while replication is permanently dead. So these
+    # four keys are load-bearing, not tuning, and must not silently disappear.
+    sink_wc = json.dumps(
+        cdc_template["Resources"]["SinkWorkerConfiguration"]["Properties"][
+            "PropertiesFileContent"
+        ]
+    )
+    assert "consumer.max.poll.interval.ms=" in sink_wc
+    assert "consumer.session.timeout.ms=" in sink_wc
+    assert "consumer.heartbeat.interval.ms=" in sink_wc
+    assert "offset.flush.timeout.ms=" in sink_wc
+
+    params = cdc_template["Parameters"]
+    # max.poll.interval must exceed Kafka's 300000 default -- that default is the bug.
+    assert params["SinkMaxPollIntervalMs"]["Default"] > 300000
+    # offset.flush.timeout must exceed Connect's 5000 default (flush() makes a
+    # synchronous CloudWatch call inside the commit budget).
+    assert params["SinkOffsetFlushTimeoutMs"]["Default"] > 5000
+    # Kafka requires heartbeat.interval.ms < session.timeout.ms (guidance: <= 1/3).
+    heartbeat = params["SinkHeartbeatIntervalMs"]["Default"]
+    session = params["SinkSessionTimeoutMs"]["Default"]
+    assert heartbeat * 3 <= session
+    # A slow put() must not be able to trip the session timeout on its own: the
+    # heartbeat runs on a background thread, so session.timeout covers worker pauses
+    # only and stays well below the poll interval.
+    assert session < params["SinkMaxPollIntervalMs"]["Default"]
+
+
 def test_cdc_stack_worker_config_names_carry_plugin_version(cdc_template: dict) -> None:
     # AWS::KafkaConnect::WorkerConfiguration is custom-named and immutable: changing
     # its PropertiesFileContent forces a replacement that collides on a fixed name

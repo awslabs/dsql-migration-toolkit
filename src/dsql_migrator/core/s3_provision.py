@@ -51,6 +51,18 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v24 does NOT change any artifact: it forces a fresh SinkWorkerConfiguration. That
+#    resource is custom-named ${AWS::StackName}-sink-worker-config-${PluginVersion}
+#    and immutable, so the new consumer poll/session timeouts
+#    (consumer.max.poll.interval.ms / session.timeout.ms / heartbeat.interval.ms and
+#    offset.flush.timeout.ms) can only reach a deployed stack behind a new token.
+#    Without them the sink ran on Kafka's 5-min max.poll.interval and 5-s offset-flush
+#    timeout: one slow put() (the row-by-row fallback re-applies up to 3,000 rows as
+#    individual DSQL transactions) got the consumer EJECTED from its group, after
+#    which offsets could never commit and the task logged "Commit of offsets timed
+#    out" forever while still reporting RUNNING -- replication permanently dead with
+#    no failure signal. Config-only change; both connector plugins and the seeder zip
+#    are byte-identical to v23.
 # v23 rebuilds the offset-seeder Lambda zip: the no-clobber offset guard
 #    (_offset_already_at_or_past) compared binlog file names LEXICOGRAPHICALLY, which
 #    inverts at the .999999 -> .1000000 rollover ('1000000' < '999999'), so a
@@ -202,7 +214,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v23"
+PLUGIN_VERSION = "v24"
 
 
 class S3ProvisionError(RuntimeError):

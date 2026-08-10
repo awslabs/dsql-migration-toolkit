@@ -211,6 +211,40 @@ UI 필드가 아니라 추론·숨김으로 둔 이유:
 관련된 두 cdc-stack 파라미터는 추론이 아니라 고정입니다: `SourceTasksMax` = 1(MySQL은 서버당 단일 태스크),
 `SinkBatchMaxRows` = 3000(DSQL 트랜잭션당 행 한도 — **3000 초과 금지**).
 
+#### 싱크의 컨슈머 타임아웃 (Kafka 기본값을 쓰지 않는 이유)
+
+싱크는 Kafka **컨슈머 그룹** 멤버이고, `put()` 한 번이 정당하게 수 분 걸릴 수 있습니다: 최대
+`SinkMaxPollRecords`(3000)개 레코드를 받는데, 청크 안의 어느 행이라도 permanent SQL 에러를 만나면
+커넥터가 그 청크를 **행 단위로 — 각각 하나의 DSQL 트랜잭션으로** 재적용합니다(poison 행을 격리하고
+정상 행은 그대로 적재하기 위해). 왕복 ~50 ms면 그 한 번의 호출이 ~450초까지 갈 수 있고, OCC 재시도가
+더 붙습니다.
+
+Kafka 기본값에서는 이것이 **정상처럼 보이는 방식으로** 치명적입니다: `max.poll.interval.ms`
+(기본 300000, 5분)를 넘기면 그룹 코디네이터가 컨슈머를 축출하고 파티션을 회수하며, 그 뒤로는 offset을
+커밋할 수 없습니다. 그리고 싱크가 `errors.tolerance=all`로 동작하고 Connect는 커밋 실패를 *경고만*
+하므로 태스크가 죽지 않습니다 — `Commit of offsets timed out`을 반복 기록하는 동안 커넥터는 여전히
+**RUNNING**으로 보고되고 복제는 영구 정지합니다. 그래서 cdc-stack이 싱크 worker config에 다음을
+설정합니다:
+
+| 파라미터 | 기본값 | Kafka 기본값 | 이유 |
+|---|---|---|---|
+| `SinkMaxPollIntervalMs` | 900000 (15분) | 300000 | 최악의 `put()`(3000행 행 단위 폴백)보다 커야 함. **`SinkMaxPollRecords`를 올리면 함께 올리세요.** |
+| `SinkSessionTimeoutMs` | 60000 | 45000 | 하트비트는 백그라운드 스레드에서 나가므로, 이 값은 워커 GC·스케줄링 지연만 흡수하면 됩니다(적재 시간이 아님). |
+| `SinkHeartbeatIntervalMs` | 20000 | 3000 | Kafka는 세션 타임아웃보다 작아야 함(권장 ≤ ⅓): 축출 전 3회 하트비트 누락 허용. |
+| `SinkOffsetFlushTimeoutMs` | 120000 | 5000 | 커밋 경로가 태스크의 `flush()`를 호출하고, 이때 모니터 메트릭을 NAT 게이트웨이 경유로 CloudWatch에 보냅니다. 5초는 너무 촉박합니다. |
+
+이 값들이 모두 설정 가능한 이유는 MSK Connect의 **worker** 레벨 allowlist에
+`consumer.max.poll.interval.ms`, `consumer.session.timeout.ms`,
+`consumer.heartbeat.interval.ms`가 포함되기 때문입니다. MSK Connect가 지원하지 않는 것은
+per-*connector* `.override.` 형식입니다(`connector.client.config.override.policy`를 제외) — 그래서
+이 값들이 worker config에 있습니다. 변경하면 worker configuration이 교체되므로 `PLUGIN_VERSION` bump와
+CDC 인프라 **Delete + Deploy**가 필요합니다. Start CDC만으로는 반영되지 않습니다.
+
+> **반대 방향이 더 값싸게 상한을 줍니다.** `SinkMaxPollRecords`를 낮추면(예: 500~1000) `put()` 한 번의
+> 최대 소요 시간이 제한되며 처리량 손실은 없습니다: `put()`은 `SinkBatchMaxRows` 크기의 청크로 적용되므로
+> 폴이 작아도 여전히 DSQL 트랜잭션을 꽉 채웁니다 — 호출당 넘기는 작업량만 줄어듭니다. 둘 다 cdc-stack
+> CloudFormation 파라미터(앱 설정이 아님)이므로, 어느 쪽이든 변경은 재배포입니다.
+
 #### 싱크 컴퓨트 (가장 먼저 손댈 노브)
 
 싱크의 컴퓨트는 소스와 **별도로** 산정합니다: `ConnectorMcuCount`는 소스 커넥터에,

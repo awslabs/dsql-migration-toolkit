@@ -5,6 +5,38 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.295
+
+### 수정
+
+- **CDC 싱크가 `RUNNING`으로 보고하면서 영구 정지하는 문제를 수정했습니다: 컨슈머 poll/session 타임아웃을
+  Kafka 기본값에 두지 않고 느린 DSQL 적재에 맞게 산정합니다.** 테스터가 Start CDC 후 ~15~20분에 복제가
+  완전히 멈추는 것을 관찰했습니다 — DSQL에 새 행이 전혀 늘지 않는데도 커넥터는 `RUNNING`이고 로그에는
+  `Commit of offsets timed out`만 반복됐습니다. 근본 원인: 싱크는 `SinkTask.put()` 한 번에 최대
+  `SinkMaxPollRecords`(3000)개 레코드를 받는데, 청크 안의 어느 행이라도 permanent SQL 에러를 만나면
+  커넥터가 의도적으로 그 청크를 **행 단위로, 각각 하나의 DSQL 트랜잭션으로** 재적용합니다(poison 행을
+  격리하고 정상 행은 그대로 적재하기 위해). 왕복 ~50 ms면 그 한 번의 호출이 ~450초가 되어 Kafka의
+  `max.poll.interval.ms` 기본값 300000(5분)을 넘고, 그룹 코디네이터가 **컨슈머를 축출**해 파티션을
+  회수하므로 이후 offset을 커밋할 수 없습니다. 싱크가 `errors.tolerance=all`로 동작하고 Connect는 커밋
+  실패를 *경고만* 하기 때문에 태스크가 죽지 않습니다: 커넥터는 `RUNNING`인 채 복제가 죽은 상태로
+  `Commit of offsets timed out`만 반복합니다. 이제 싱크 worker config가
+  `consumer.max.poll.interval.ms=900000`, `consumer.session.timeout.ms=60000`,
+  `consumer.heartbeat.interval.ms=20000`, `offset.flush.timeout.ms=120000`을 설정합니다(Connect의 5초
+  기본값도 지나치게 촉박했습니다 — 커밋 경로가 태스크의 `flush()`를 호출하고, 거기서 모니터 메트릭을 NAT
+  게이트웨이 경유로 CloudWatch에 보냅니다). 네 값 모두 cdc-stack 파라미터로 노출했고, 조용히 회귀하지
+  않도록 테스트로 고정했습니다.
+
+  이전에는 템플릿이 MSK Connect에서 `consumer.*` 튜닝이 불가능하다고 단정했습니다. 이는 per-*connector*
+  `.override.` 형식에만 해당합니다(MSK Connect가 `connector.client.config.override.policy`를 제외) —
+  **worker** 레벨 allowlist에는 `consumer.max.poll.interval.ms`, `consumer.session.timeout.ms`,
+  `consumer.heartbeat.interval.ms`가 명시적으로 포함됩니다. 반대로 적혀 있던 주석 2곳을 바로잡았습니다.
+
+  `PLUGIN_VERSION`을 **아티팩트 변경 없이** `v24`로 올립니다: `SinkWorkerConfiguration`은 플러그인 버전이
+  이름에 박힌 불변 리소스라, 새 설정이 배포된 스택에 도달하려면 새 토큰이 필요합니다 — 즉 이 수정은 Start
+  CDC만으로는 반영되지 않고 **CDC 인프라 Delete + Deploy**가 필요합니다. 매뉴얼 §7.2에 타임아웃 값들과
+  Kafka 기본값과 다른 이유, 그리고 `SinkMaxPollRecords`를 낮추면 처리량 손실 없이 `put()` 한 번의 상한을
+  줄 수 있다는 점을 문서화했습니다.
+
 ## v0.1.294
 
 ### 수정

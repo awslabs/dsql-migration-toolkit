@@ -5,6 +5,40 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.295
+
+### 修正
+
+- **CDC シンクが `RUNNING` と報告しながら恒久的に停止する問題を修正しました: コンシューマーの
+  poll/session タイムアウトを Kafka のデフォルトのままにせず、遅い DSQL 適用に合わせて設定します。**
+  テスターが Start CDC の ~15〜20 分後にレプリケーションが完全に停止するのを観測しました — DSQL の行が
+  まったく増えないのにコネクタは `RUNNING` で、ログには `Commit of offsets timed out` だけが繰り返され
+  ていました。根本原因: シンクは 1 回の `SinkTask.put()` に最大 `SinkMaxPollRecords`(3000)件を受け取り、
+  チャンク内のいずれかの行が permanent な SQL エラーになると、コネクタは意図的にそのチャンクを**行単位で、
+  それぞれ 1 つの DSQL トランザクションとして**再適用します(poison 行を隔離し、正常な行は反映するため)。
+  ラウンドトリップ ~50 ms ならその 1 回の呼び出しが ~450 秒になり、Kafka の `max.poll.interval.ms` の
+  デフォルト 300000(5 分)を超えます。するとグループコーディネーターが**コンシューマーを追い出して**
+  パーティションを回収するため、以降オフセットをコミットできません。シンクは `errors.tolerance=all` で
+  動作し、Connect はコミット失敗を*警告するだけ*なので、タスクは死にません: コネクタは `RUNNING` のまま
+  レプリケーションが死んだ状態で `Commit of offsets timed out` を繰り返します。シンクの worker config が
+  `consumer.max.poll.interval.ms=900000`、`consumer.session.timeout.ms=60000`、
+  `consumer.heartbeat.interval.ms=20000`、`offset.flush.timeout.ms=120000` を設定するようになりました
+  (Connect の 5 秒というデフォルトも厳しすぎました — コミット経路がタスクの `flush()` を呼び、そこで
+  モニターメトリクスを NAT ゲートウェイ経由で CloudWatch に送信します)。4 つはすべて cdc-stack の
+  パラメータとして公開し、静かに退行しないようテストで固定しました。
+
+  以前はテンプレートが、MSK Connect では `consumer.*` のチューニングができないと結論づけていました。それは
+  per-*connector* の `.override.` 形式にのみ当てはまります(MSK Connect は
+  `connector.client.config.override.policy` を除外)。**worker** レベルの許可リストには
+  `consumer.max.poll.interval.ms`、`consumer.session.timeout.ms`、
+  `consumer.heartbeat.interval.ms` が明示的に含まれます。逆のことを書いていた 2 か所のコメントを修正しました。
+
+  `PLUGIN_VERSION` を**アーティファクト変更なしで** `v24` に上げます: `SinkWorkerConfiguration` は
+  プラグインバージョンを名前に含む不変リソースであり、新しい設定がデプロイ済みスタックに届くには新しい
+  トークンが必要です — つまりこの修正は Start CDC だけでは反映されず、**CDC インフラの Delete + Deploy**
+  が必要です。マニュアル §7.2 に各タイムアウト値、Kafka のデフォルトと異なる理由、そして
+  `SinkMaxPollRecords` を下げればスループットを損なわずに 1 回の `put()` に上限を与えられることを記載しました。
+
 ## v0.1.294
 
 ### 修正

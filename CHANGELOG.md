@@ -5,6 +5,43 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.295
+
+### Fixed
+
+- **The CDC sink no longer stalls permanently while reporting `RUNNING`: its consumer
+  poll/session timeouts are now sized for a slow DSQL apply instead of left at Kafka's
+  defaults.** A tester saw replication stop for good ~15–20 min after Start CDC — no
+  new rows in DSQL — while the connector stayed `RUNNING` and the log repeated only
+  `Commit of offsets timed out`. Root cause: the sink hands one `SinkTask.put()` up to
+  `SinkMaxPollRecords` (3000) records, and when any row in a chunk hits a permanent SQL
+  error the connector deliberately re-applies that chunk **row by row, one DSQL
+  transaction each** (so the poison row is isolated and healthy rows still land). At
+  ~50 ms per round-trip that single call runs ~450 s — past Kafka's
+  `max.poll.interval.ms` default of 300000 (5 min) — so the group coordinator **ejects
+  the consumer** and revokes its partitions, after which offsets can never be
+  committed. Because the sink runs `errors.tolerance=all` and Connect only *warns* on a
+  failed commit, nothing ever fails the task: it logs `Commit of offsets timed out` on
+  a loop with the connector still `RUNNING` and replication dead. The sink worker config
+  now sets `consumer.max.poll.interval.ms=900000`, `consumer.session.timeout.ms=60000`,
+  `consumer.heartbeat.interval.ms=20000` and `offset.flush.timeout.ms=120000` (Connect's
+  5 s default was also far too tight, since the commit path calls the task's `flush()`,
+  which emits monitor metrics to CloudWatch over the NAT gateway). All four are exposed
+  as cdc-stack parameters, and a test now pins them so they cannot silently regress.
+
+  The template previously concluded that `consumer.*` tuning was undeployable on MSK
+  Connect. That is only true of the per-*connector* `.override.` form (MSK Connect
+  excludes `connector.client.config.override.policy`) — the **worker**-level allowlist
+  explicitly includes `consumer.max.poll.interval.ms`, `consumer.session.timeout.ms` and
+  `consumer.heartbeat.interval.ms`. The two comments saying otherwise are corrected.
+
+  `PLUGIN_VERSION` goes to `v24` with **no artifact change**: `SinkWorkerConfiguration`
+  is custom-named with the plugin version and immutable, so the new settings can only
+  reach a deployed stack behind a new token — which means this fix needs a **Delete +
+  Deploy of the CDC infrastructure**, not just Start CDC. Manual §7.2 documents the
+  timeouts, why they differ from Kafka's defaults, and that lowering
+  `SinkMaxPollRecords` bounds one `put()` at no throughput cost.
+
 ## v0.1.294
 
 ### Fixed

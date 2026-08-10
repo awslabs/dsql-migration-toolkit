@@ -254,8 +254,66 @@ Parameters:
       into a single JDBC executeBatch (one DSQL round-trip). The Kafka default
       (500) capped each batched apply well under the 3,000-row transaction limit,
       leaving the latency-bound sink under-batched. Matches SinkBatchMaxRows so a
-      full poll fills one transaction. Set in the sink worker config (per-connector
-      consumer.* overrides are unavailable on MSK Connect).
+      full poll fills one transaction. Raising this raises the WALL-CLOCK cost of one
+      put(), which must stay under SinkMaxPollIntervalMs — see that parameter. Set in
+      the sink worker config (per-CONNECTOR consumer.* ".override." keys are
+      unavailable on MSK Connect, but worker-level consumer.* keys are supported).
+
+  SinkMaxPollIntervalMs:
+    Type: Number
+    Default: 900000
+    MinValue: 60000
+    Description: >
+      consumer.max.poll.interval.ms for the sink worker: how long ONE
+      SinkTask.put() may take before Kafka considers the consumer dead, ejects it
+      from the group and revokes its partitions. Kafka's default is 300000 (5 min),
+      which this sink can exceed and then stall PERMANENTLY: put() is handed up to
+      SinkMaxPollRecords (3000) records, and on any permanent SQL error in a chunk
+      the connector falls back to applying that chunk ROW BY ROW, one DSQL
+      transaction each (~3 round-trips per row, plus up to ~21 s of OCC backoff per
+      unit). At 50 ms/round-trip that single put() is ~450 s — past the default — so
+      the consumer is ejected, offsets can no longer be committed, and the task keeps
+      logging "Commit of offsets timed out" forever WITHOUT failing (errors.tolerance
+      is all and that log is a WARN), leaving the connector RUNNING while replication
+      is dead. 900000 (15 min) covers that worst case with headroom. Raise it if you
+      raise SinkMaxPollRecords; the heartbeat is a background thread, so a slow put()
+      does not need session.timeout.ms to be this large.
+
+  SinkSessionTimeoutMs:
+    Type: Number
+    Default: 60000
+    MinValue: 6000
+    Description: >
+      consumer.session.timeout.ms for the sink worker: how long the group
+      coordinator waits for a HEARTBEAT before evicting the member. Heartbeats come
+      from a background thread (they are not blocked by a slow put()), so this only
+      needs to absorb worker GC / scheduling pauses — not apply time. Raised from
+      Kafka's 45000 default for a little more tolerance on a busy worker. Must stay
+      within the broker's group.min/max.session.timeout.ms.
+
+  SinkHeartbeatIntervalMs:
+    Type: Number
+    Default: 20000
+    MinValue: 1000
+    Description: >
+      consumer.heartbeat.interval.ms for the sink worker. Kafka requires this to be
+      lower than SinkSessionTimeoutMs (the guidance is at most one third of it):
+      20000 against a 60000 session timeout allows three missed heartbeats before
+      eviction.
+
+  SinkOffsetFlushTimeoutMs:
+    Type: Number
+    Default: 120000
+    MinValue: 5000
+    Description: >
+      offset.flush.timeout.ms for the sink worker: how long Connect waits for an
+      offset commit to complete before logging "Commit of offsets timed out" and
+      abandoning that attempt. Kafka Connect's default is 5000 (5 s), which is far
+      too tight here — the commit path calls the task's flush(), and this sink's
+      flush() emits its monitor metrics to CloudWatch synchronously (an SDK call
+      whose first invocation also resolves credentials/endpoints, over the NAT
+      gateway). A commit that times out is only WARNed, so a too-tight budget shows
+      up as a repeating log line rather than an error.
 
   SourceTasksMax:
     Type: Number
@@ -1083,7 +1141,7 @@ Resources:
             status.storage.partitions=1
             offset.storage.topic=${AWS::StackName}-debezium-source-offsets
 
-  # --- Worker configuration: sink connector (converters + H13 consumer fetch limits) ---
+  # --- Worker configuration: sink connector (converters + fetch limits + timeouts) ---
   # The sink plugin jar does NOT bundle the Secrets Manager config-provider class
   # (com.amazonaws.kafka.config.providers.SecretsManagerConfigProvider), so
   # declaring config.providers here would fail the sink with ClassNotFoundException
@@ -1092,6 +1150,23 @@ Resources:
   # deserializes exactly what the source serialized. Plus the H13 consumer fetch
   # limits and producer send limit (so an oversized record can be fetched and
   # dead-lettered up to the 8 MiB broker limit).
+  #
+  # CONSUMER TIMEOUTS (max.poll.interval / session / heartbeat + offset.flush.timeout)
+  # are set here because this sink's put() is SLOW and unbounded by design: a
+  # permanent SQL error in a chunk makes it re-apply that chunk row by row, one DSQL
+  # transaction per row, and a transient failure is retried indefinitely (see
+  # DsqlSinkTask.applyBatch). On Kafka's defaults (max.poll.interval.ms=300000,
+  # offset.flush.timeout.ms=5000) a long put() gets the consumer EJECTED from its
+  # group; offsets then can never commit, and because errors.tolerance=all and the
+  # resulting "Commit of offsets timed out" is only a WARN, the task never fails --
+  # the connector sits at RUNNING with replication permanently dead. These keys ARE
+  # supported at worker level (the MSK Connect "Supported worker configuration
+  # properties" allowlist names consumer.max.poll.interval.ms,
+  # consumer.session.timeout.ms and consumer.heartbeat.interval.ms; offset.flush.
+  # timeout.ms carries no producer./consumer. prefix and is not on the exclusion
+  # list). What MSK Connect does NOT support is the per-CONNECTOR ".override." form,
+  # because it excludes connector.client.config.override.policy -- that is why these
+  # live in the worker config and not in the connector config.
   SinkWorkerConfiguration:
     Type: AWS::KafkaConnect::WorkerConfiguration
     Properties:
@@ -1099,7 +1174,7 @@ Resources:
       # WorkerConfiguration above) so an update can replace it without a name clash.
       Name:
         Fn::Sub: ${AWS::StackName}-sink-worker-config-${PluginVersion}
-      Description: JSON converters (schemas.enable=true) and H13 consumer/producer fetch limits for the DSQL sink connector. No Secrets Manager provider (not bundled in the sink jar).
+      Description: JSON converters (schemas.enable=true), H13 consumer/producer fetch limits, and the consumer poll/session timeouts a slow DSQL apply needs. No Secrets Manager provider (not bundled in the sink jar).
       PropertiesFileContent:
         Fn::Base64:
           Fn::Sub: |
@@ -1110,6 +1185,10 @@ Resources:
             consumer.max.partition.fetch.bytes=${MaxMessageBytes}
             consumer.fetch.max.bytes=${MaxMessageBytes}
             consumer.max.poll.records=${SinkMaxPollRecords}
+            consumer.max.poll.interval.ms=${SinkMaxPollIntervalMs}
+            consumer.session.timeout.ms=${SinkSessionTimeoutMs}
+            consumer.heartbeat.interval.ms=${SinkHeartbeatIntervalMs}
+            offset.flush.timeout.ms=${SinkOffsetFlushTimeoutMs}
             producer.max.request.size=${MaxMessageBytes}
             offset.storage.partitions=1
             status.storage.partitions=1
@@ -1742,13 +1821,16 @@ Resources:
         # key.converter/value.converter are declared in SinkWorkerConfiguration.
         # They are intentionally absent here to avoid split authority. The H13
         # message-size limits (producer.max.request.size / consumer.fetch.max.bytes
-        # / consumer.max.partition.fetch.bytes) live in the SINK worker config:
-        # MSK Connect supports those producer.*/consumer.* keys at the worker level
-        # and applies them to the connector's task clients (per the MSK Connect
-        # "Supported worker configuration properties" doc). Per-connector
-        # ".override." keys are NOT available on MSK Connect (it excludes
-        # connector.client.config.override.policy), so the worker config is the
-        # only place these can be set.
+        # / consumer.max.partition.fetch.bytes) AND the consumer poll/session
+        # timeouts (consumer.max.poll.interval.ms / session.timeout.ms /
+        # heartbeat.interval.ms / offset.flush.timeout.ms) live in the SINK worker
+        # config: MSK Connect supports those producer.*/consumer.* keys at the worker
+        # level and applies them to the connector's task clients (per the MSK Connect
+        # "Supported worker configuration properties" doc, whose allowlist names each
+        # of them). What is NOT available is the per-connector ".override." FORM,
+        # because MSK Connect excludes connector.client.config.override.policy -- so
+        # the worker config is the only place these can be set, not a reason to leave
+        # them at Kafka's defaults.
 
   # ------------------------------------------------------------------------- #
   # Observability: alarm when a connector task errors out. Without this, recovery

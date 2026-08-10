@@ -282,6 +282,46 @@ Two related cdc-stack parameters are fixed, not inferred: `SourceTasksMax` = 1
 (MySQL is single-task per server) and `SinkBatchMaxRows` = 3000 (DSQL's
 per-transaction row limit — **do not exceed 3000**).
 
+#### The sink's consumer timeouts (why they are not Kafka's defaults)
+
+The sink is a Kafka **consumer group** member, and one `put()` call can legitimately
+take minutes: it is handed up to `SinkMaxPollRecords` (3000) records, and if any row
+in a chunk hits a permanent SQL error the connector re-applies that chunk **row by
+row — one DSQL transaction each** so the poison row is isolated and the healthy rows
+still land. At ~50 ms per round-trip that single call can run ~450 s, and OCC retry
+adds more.
+
+On Kafka's defaults that is fatal in a way that **looks healthy**: exceeding
+`max.poll.interval.ms` (default 300000, 5 min) makes the group coordinator eject the
+consumer and revoke its partitions, after which offsets can never be committed. And
+because the sink runs with `errors.tolerance=all` and Connect only *warns* on a failed
+commit, the task never dies — it logs `Commit of offsets timed out` on a loop while
+the connector still reports **RUNNING** and replication is permanently stopped. The
+cdc-stack therefore sets these on the sink worker config:
+
+| Parameter | Default | Kafka default | Why |
+|---|---|---|---|
+| `SinkMaxPollIntervalMs` | 900000 (15 min) | 300000 | Must exceed the worst-case `put()`, i.e. the 3000-row row-by-row fallback. **Raise it if you raise `SinkMaxPollRecords`.** |
+| `SinkSessionTimeoutMs` | 60000 | 45000 | Heartbeats come from a background thread, so this only absorbs worker GC/scheduling pauses — not apply time. |
+| `SinkHeartbeatIntervalMs` | 20000 | 3000 | Kafka requires it below the session timeout (≤ ⅓ is the guidance): three missed heartbeats before eviction. |
+| `SinkOffsetFlushTimeoutMs` | 120000 | 5000 | The commit path calls the task's `flush()`, which emits the monitor metrics to CloudWatch over the NAT gateway; 5 s is too tight for that. |
+
+These are all settable because MSK Connect's **worker**-level allowlist includes
+`consumer.max.poll.interval.ms`, `consumer.session.timeout.ms` and
+`consumer.heartbeat.interval.ms`. What MSK Connect does not support is the
+per-*connector* `.override.` form (it excludes
+`connector.client.config.override.policy`) — which is why they live in the worker
+config. Changing them replaces the worker configuration, so it needs a
+`PLUGIN_VERSION` bump and a **Delete + Deploy** of the CDC infrastructure; Start CDC
+alone will not pick it up.
+
+> **The other direction bounds it more cheaply.** Lowering `SinkMaxPollRecords`
+> (e.g. to 500–1000) caps how long one `put()` can ever run, at no throughput cost:
+> a `put()` is applied in `SinkBatchMaxRows`-sized chunks, so a smaller poll still
+> fills whole DSQL transactions — it just hands the task less work per call. Both are
+> cdc-stack CloudFormation parameters (not app settings), so either change is a
+> redeploy.
+
 #### Sink compute (the knob to reach for first)
 
 The sink's compute is sized **separately** from the source: `ConnectorMcuCount`
