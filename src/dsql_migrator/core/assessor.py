@@ -144,6 +144,14 @@ _MAX_COLUMNS_PER_TABLE = 255
 _MAX_INDEXES_PER_TABLE = 24
 _MAX_SECONDARY_INDEXES_PER_TABLE = _MAX_INDEXES_PER_TABLE - 1
 
+# DSQL hard limit: a primary key or secondary index may span at most 8 columns --
+# error 54011 "more than 8 column keys are not allowed". MySQL allows up to 16
+# columns per index, so a 9..16-column source key is a real schema the assessment
+# has to flag: the PK failure lands when the table DDL is applied, and a secondary
+# index failure lands only AFTER Full Load (indexes are built by post-load
+# CREATE INDEX ASYNC) -- the same late-failure shape as _MAX_INDEXES_PER_TABLE.
+_MAX_KEY_COLUMNS = 8
+
 # DSQL numeric maximum precision (numeric supports a precision of up to 38).
 _MAX_NUMERIC_PRECISION = 38
 
@@ -746,6 +754,107 @@ class TooManyIndexesRule(Rule):
         return findings
 
 
+class TooManyKeyColumnsRule(Rule):
+    """Flag primary keys / secondary indexes that span more than 8 columns.
+
+    Aurora DSQL caps a key at 8 columns (error 54011 "more than 8 column keys are
+    not allowed"); MySQL allows 16, so a 9..16-column key migrates from a perfectly
+    valid source. The two cases fail at different times, which is why both are
+    reported on one finding but described separately:
+
+    - a **primary key** over 8 columns fails when the table DDL is applied, so
+      nothing loads at all -- UNSUPPORTED, the table cannot migrate as-is;
+    - a **secondary index** over 8 columns fails its post-load
+      ``CREATE INDEX ASYNC``, i.e. only after Full Load has written every row --
+      the same late-failure shape as :class:`TooManyIndexesRule`, and the reason
+      this belongs at planning time rather than in the apply log.
+
+    Classified by the worst case present: UNSUPPORTED when the primary key itself
+    is over the limit (no data can land), MANUAL when only secondary indexes are
+    (the data lands; those indexes do not).
+    """
+
+    rule_id = "TOO_MANY_KEY_COLUMNS"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            pk_columns = len(table.primary_key)
+            pk_over = pk_columns > _MAX_KEY_COLUMNS
+            wide_indexes = [
+                (index.name, len(index.columns))
+                for index in table.indexes
+                if len(index.columns) > _MAX_KEY_COLUMNS
+            ]
+            if not pk_over and not wide_indexes:
+                continue
+
+            risk_parts: list[str] = []
+            fix_parts: list[str] = []
+            if pk_over:
+                risk_parts.append(
+                    f"The primary key spans {pk_columns} columns "
+                    f"({', '.join(table.primary_key)})"
+                )
+                fix_parts.append(
+                    "narrow the primary key to at most "
+                    f"{_MAX_KEY_COLUMNS} columns (the trailing columns are rarely "
+                    "needed for uniqueness -- move them to a secondary index)"
+                )
+            if wide_indexes:
+                listed = ", ".join(
+                    f"{name} ({count} columns)" for name, count in wide_indexes
+                )
+                risk_parts.append(
+                    f"{len(wide_indexes)} secondary "
+                    f"{'index' if len(wide_indexes) == 1 else 'indexes'} span more "
+                    f"than {_MAX_KEY_COLUMNS} columns: {listed}"
+                )
+                fix_parts.append(
+                    f"trim each wide index to at most {_MAX_KEY_COLUMNS} columns, "
+                    "keeping the most selective ones leftmost"
+                )
+
+            when = []
+            if pk_over:
+                when.append(
+                    "The primary key is rejected when the table DDL is applied, so "
+                    "the table -- and its data -- never migrates"
+                )
+            if wide_indexes:
+                when.append(
+                    "A wide secondary index fails its CREATE INDEX ASYNC, which runs "
+                    "AFTER Full Load, so the failure appears only once every row has "
+                    "already been written"
+                )
+
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, table.name),
+                    rule_id=self.rule_id,
+                    classification=(
+                        Classification.UNSUPPORTED if pk_over else Classification.MANUAL
+                    ),
+                    risk=(
+                        f"{'; '.join(risk_parts)}. Aurora DSQL allows at most "
+                        f"{_MAX_KEY_COLUMNS} columns in a primary key or secondary "
+                        "index (MySQL allows 16), so these fail with error 54011 "
+                        f'"more than {_MAX_KEY_COLUMNS} column keys are not allowed". '
+                        f"{'. '.join(when)}."
+                    ),
+                    recommendation=(
+                        f"Before converting, {' and '.join(fix_parts)}. Decide now: "
+                        "re-running the migration will not clear this, since the limit "
+                        "is not transient."
+                    ),
+                    effort=(
+                        EffortLevel.SIGNIFICANT if pk_over else EffortLevel.MEDIUM
+                    ),
+                )
+            )
+        return findings
+
+
 class OversizedLobRule(Rule):
     """Flag columns whose MySQL LOB/TEXT type can exceed the DSQL 1 MiB limit."""
 
@@ -1245,6 +1354,7 @@ def default_rules() -> list[Rule]:
         SpatialTypeRule(),
         TooManyColumnsRule(),
         TooManyIndexesRule(),
+        TooManyKeyColumnsRule(),
         OversizedLobRule(),
         DecimalPrecisionRule(),
         EnumSetRule(),

@@ -498,6 +498,7 @@ def test_default_rules_contains_all_documented_rule_ids() -> None:
         "SPATIAL_TYPE",
         "TOO_MANY_COLUMNS",
         "TOO_MANY_INDEXES",
+        "TOO_MANY_KEY_COLUMNS",
         "OVERSIZED_LOB",
         "NUMERIC_PRECISION",
         "ENUM_SET_TYPE",
@@ -1030,6 +1031,110 @@ def test_clean_table_index_count_is_not_flagged() -> None:
     assert TooManyIndexesRule().evaluate(
         SourceInventory(tables=[_table_with_indexes(5)])
     ) == []
+
+
+# ---------------------------------------------------------------------------
+# Key COLUMN-COUNT limit (distinct from the index COUNT limit above): DSQL caps a
+# primary key / secondary index at 8 columns (error 54011); MySQL allows 16, so a
+# 9..16-column key is a valid source schema that nothing used to flag.
+# ---------------------------------------------------------------------------
+
+
+def _table_with_key_widths(
+    *, pk_columns: int = 1, index_widths: tuple[int, ...] = (), name: str = "wide_key"
+) -> TableDef:
+    """A table whose PK spans ``pk_columns`` and whose indexes span ``index_widths``."""
+    total = max([pk_columns, *index_widths], default=1)
+    return TableDef(
+        name=name,
+        columns=[
+            ColumnDef(name=f"c{i}", mysql_type="INT", nullable=False)
+            for i in range(1, total + 1)
+        ],
+        primary_key=[f"c{i}" for i in range(1, pk_columns + 1)],
+        indexes=[
+            IndexDef(name=f"ix_{n}", columns=[f"c{i}" for i in range(1, width + 1)])
+            for n, width in enumerate(index_widths, start=1)
+        ],
+    )
+
+
+def test_key_column_limit_boundary_is_eight() -> None:
+    from dsql_migrator.core.assessor import TooManyKeyColumnsRule
+
+    rule = TooManyKeyColumnsRule()
+    # 8 is exactly at the DSQL limit -- for the PK and for a secondary index.
+    assert rule.evaluate(
+        SourceInventory(tables=[_table_with_key_widths(pk_columns=8)])
+    ) == []
+    assert rule.evaluate(
+        SourceInventory(tables=[_table_with_key_widths(index_widths=(8,))])
+    ) == []
+    # 9 is over it (MySQL allows up to 16, so this is a real source schema).
+    assert len(
+        rule.evaluate(SourceInventory(tables=[_table_with_key_widths(pk_columns=9)]))
+    ) == 1
+    assert len(
+        rule.evaluate(
+            SourceInventory(tables=[_table_with_key_widths(index_widths=(9,))])
+        )
+    ) == 1
+
+
+def test_wide_primary_key_is_unsupported_because_nothing_loads() -> None:
+    # A PK over the cap is rejected when the table DDL is applied, so no data lands.
+    from dsql_migrator.core.assessor import TooManyKeyColumnsRule
+
+    (finding,) = TooManyKeyColumnsRule().evaluate(
+        SourceInventory(tables=[_table_with_key_widths(pk_columns=12)])
+    )
+    assert finding.rule_id == "TOO_MANY_KEY_COLUMNS"
+    assert finding.classification is Classification.UNSUPPORTED
+    assert finding.effort is EffortLevel.SIGNIFICANT
+    assert "12 columns" in finding.risk
+    assert "54011" in finding.risk  # the error the user would otherwise hit
+    assert "MySQL allows 16" in finding.risk
+    assert "not transient" in finding.recommendation.lower()
+
+
+def test_wide_secondary_index_is_manual_and_names_the_post_load_timing() -> None:
+    # Data still loads; only the index fails -- and it fails AFTER Full Load, since
+    # secondary indexes are built by post-load CREATE INDEX ASYNC.
+    from dsql_migrator.core.assessor import TooManyKeyColumnsRule
+
+    (finding,) = TooManyKeyColumnsRule().evaluate(
+        SourceInventory(tables=[_table_with_key_widths(index_widths=(10, 3, 16))])
+    )
+    assert finding.classification is Classification.MANUAL
+    assert finding.effort is EffortLevel.MEDIUM
+    # Names each offending index with its width; the 3-column one is not flagged.
+    assert "ix_1 (10 columns)" in finding.risk
+    assert "ix_3 (16 columns)" in finding.risk
+    assert "ix_2" not in finding.risk
+    assert "AFTER Full Load" in finding.risk
+
+
+def test_wide_pk_and_wide_index_report_the_worst_case_once() -> None:
+    from dsql_migrator.core.assessor import TooManyKeyColumnsRule
+
+    findings = TooManyKeyColumnsRule().evaluate(
+        SourceInventory(tables=[_table_with_key_widths(pk_columns=9, index_widths=(11,))])
+    )
+    # One finding per table, classified by the worst case (the PK).
+    assert len(findings) == 1
+    assert findings[0].classification is Classification.UNSUPPORTED
+    assert "primary key" in findings[0].risk
+    assert "ix_1 (11 columns)" in findings[0].risk
+
+
+def test_wide_key_reported_through_the_full_assessment() -> None:
+    # End-to-end through the default rule set (the rule must be registered).
+    inventory = SourceInventory(
+        tables=[_table_with_key_widths(pk_columns=9, name="orders")]
+    )
+    item = _item_for(_assess(inventory), "orders")
+    assert item.classification is Classification.UNSUPPORTED
+    assert "TOO_MANY_KEY_COLUMNS" in item.rule_id or "54011" in item.risk
 
 
 # ---------------------------------------------------------------------------

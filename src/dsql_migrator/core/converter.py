@@ -1523,6 +1523,20 @@ def _quote_pg_qualified(name: str) -> str:
     return _quote_pg_identifier(obj)
 
 
+def _wide_indexes(table: TableDef) -> list[tuple[str, int]]:
+    """Return ``(index name, column count)`` for indexes over the DSQL key-column cap.
+
+    Shared by :func:`_build_index_ddls` (which skips them) and
+    :func:`_too_many_key_columns_warning` (which explains why), so the emitted DDL
+    and the note can never disagree about which indexes were dropped.
+    """
+    return [
+        (index.name, len(index.columns))
+        for index in table.indexes
+        if len(index.columns) > _DSQL_MAX_PK_COLUMNS
+    ]
+
+
 def _build_index_ddls(table: TableDef) -> list[str]:
     """Render the table's secondary indexes as ``CREATE INDEX ASYNC`` statements.
 
@@ -1531,10 +1545,19 @@ def _build_index_ddls(table: TableDef) -> list[str]:
     via ``sqlglot`` to avoid injection (Requirement 9.4). The index name stays
     unqualified (created in the table's schema); the table reference is
     schema-qualified when the table name is.
+
+    An index over DSQL's 8-column key limit is SKIPPED rather than emitted: MySQL
+    allows 16 columns per index, and DSQL rejects a 9+-column key with error 54011.
+    Because secondary indexes are built AFTER the data loads, emitting it anyway put
+    the guaranteed failure at the very end of a multi-hour Full Load. Skipping keeps
+    the applied script one that can actually succeed; the operator is told which
+    indexes were left out (and why) by :func:`_too_many_key_columns_warning`.
     """
     table_identifier = _quote_pg_qualified(table.name)
     statements: list[str] = []
     for index in table.indexes:
+        if len(index.columns) > _DSQL_MAX_PK_COLUMNS:
+            continue
         unique = "UNIQUE " if index.unique else ""
         columns = ", ".join(_quote_pg_identifier(column) for column in index.columns)
         statements.append(
@@ -2047,8 +2070,15 @@ def _too_many_indexes_warning(
     original key's uniqueness. Omitting it undercounted by one, so a table with exactly
     23 source indexes converted with COMPOSITE_KEY produced 25 total (> 24) yet passed
     this gate silently and failed the extra CREATE INDEX ASYNC after the load.
+
+    Counts only the indexes actually EMITTED: one over DSQL's 8-column key limit is
+    skipped by :func:`_build_index_ddls` (and reported by
+    :func:`_too_many_key_columns_warning`), so counting it here would claim a budget
+    overflow the applied script cannot hit.
     """
-    count = len(table.indexes) + extra_secondary_indexes
+    count = (
+        len(table.indexes) - len(_wide_indexes(table)) + extra_secondary_indexes
+    )
     if count <= _MAX_SECONDARY_INDEXES_PER_TABLE:
         return None
     return ConversionWarning(
@@ -2063,6 +2093,60 @@ def _too_many_indexes_warning(
             "ASYNC statements will fail (error 54000) after the table itself is created, "
             "leaving the target partially indexed — drop the indexes you no longer need "
             "before applying, keeping the ones your queries actually use."
+        ),
+    )
+
+
+def _too_many_key_columns_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Warn when the primary key or a secondary index exceeds DSQL's 8-column key cap.
+
+    MySQL allows 16 columns per index, Aurora DSQL only 8 (error 54011 "more than 8
+    column keys are not allowed"), so a 9..16-column key comes from a perfectly valid
+    source and must be surfaced here -- the conversion otherwise looked clean:
+
+    - a **primary key** over the cap makes the generated ``CREATE TABLE`` REJECTED at
+      apply, so the table and its data never migrate (UNSUPPORTED);
+    - a **secondary index** over the cap is now SKIPPED by :func:`_build_index_ddls`
+      (emitting it would guarantee a post-load ``CREATE INDEX ASYNC`` failure), so the
+      target is missing that index -- a real LOSS the operator has to know about, since
+      queries relying on it will fall back to scans.
+
+    Reported as one note per table, classified by the worst case present.
+    """
+    pk_columns = len(table.primary_key)
+    pk_over = pk_columns > _DSQL_MAX_PK_COLUMNS
+    wide = _wide_indexes(table)
+    if not pk_over and not wide:
+        return None
+
+    parts: list[str] = []
+    if pk_over:
+        parts.append(
+            f"the primary key spans {pk_columns} columns "
+            f"({', '.join(table.primary_key)}), so the generated CREATE TABLE will be "
+            "REJECTED as-is and neither the table nor its data migrates — narrow the "
+            f"key to at most {_DSQL_MAX_PK_COLUMNS} columns (move the trailing columns "
+            "to a secondary index) before applying"
+        )
+    if wide:
+        listed = ", ".join(f"{name} ({count} columns)" for name, count in wide)
+        parts.append(
+            f"secondary index(es) {listed} exceed the limit and were therefore NOT "
+            "emitted — the target will be missing them (emitting them would fail the "
+            "post-load CREATE INDEX ASYNC after every row was already written). Trim "
+            f"each to at most {_DSQL_MAX_PK_COLUMNS} columns, most selective leftmost, "
+            "and add it after the migration"
+        )
+    return ConversionWarning(
+        object_name=table.name,
+        classification=(
+            Classification.UNSUPPORTED if pk_over else Classification.MANUAL
+        ),
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            f"Aurora DSQL allows at most {_DSQL_MAX_PK_COLUMNS} columns in a primary "
+            "key or secondary index (MySQL allows 16): "
+            f"{'; also, '.join(parts)}."
         ),
     )
 
@@ -2458,6 +2542,7 @@ class SchemaConverter:
             _prefix_index_warning(table),
             _too_many_columns_warning(table),
             _too_many_indexes_warning(table, len(extra_index_ddls)),
+            _too_many_key_columns_warning(table),
             _oversized_lob_warning(table),
             _generated_column_warning(table),
             _collation_warning(table),

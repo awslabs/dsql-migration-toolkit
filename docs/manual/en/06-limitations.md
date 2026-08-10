@@ -25,6 +25,8 @@ fails **loudly** where it can't.
 | **Spatial / geometry types** | Not supported. | Flagged **UNSUPPORTED**. |
 | **FULLTEXT / SPATIAL indexes** | Not supported. | Flagged **UNSUPPORTED**. |
 | **≤ 255 columns per table, ≤ 1000 tables per database** | Beyond these, unsupported. | Flagged **UNSUPPORTED** (`TOO_MANY_COLUMNS` / `TABLE_COUNT_LIMIT`). |
+| **≤ 24 indexes per table** (the PK counts, so ≤ 23 secondary; MySQL allows 64) | The excess `CREATE INDEX ASYNC` fails **after** Full Load has written every row. | Flagged **MANUAL** (`TOO_MANY_INDEXES`) at planning time, with a matching Schema Conversion note. |
+| **≤ 8 columns in a primary key or index** (MySQL allows 16) | A wider key fails with error 54011. | Flagged **UNSUPPORTED** for a wide PK (the `CREATE TABLE` is rejected, so nothing loads) or **MANUAL** for a wide index (`TOO_MANY_KEY_COLUMNS`). Conversion **omits** the wide index rather than emitting DDL guaranteed to fail post-load, and names it in the notes. |
 | **One database per cluster** | DSQL organizes by schema, not multiple databases. | A multi-database source is flagged **MANUAL** (consolidate into schemas, or split clusters). |
 | **No `TRUNCATE`; one DDL per transaction; optimistic concurrency** | Different write/DDL semantics than MySQL. | Handled transparently: DROP+recreate instead of TRUNCATE, single-DDL units, `40001` retry everywhere. |
 | **IAM-token auth (no password); short-lived tokens** | No static DB password. | The tool (and the CDC sink) mint and refresh IAM tokens automatically. |

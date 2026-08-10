@@ -1167,6 +1167,94 @@ def test_too_many_indexes_counts_the_composite_key_unique_index() -> None:
     assert _too_many_indexes_warning(table, 1) is not None
 
 
+def _table_with_key_widths(
+    *, pk_columns: int = 1, index_widths: tuple[int, ...] = (), name: str = "wide_key"
+) -> TableDef:
+    """A table whose PK spans ``pk_columns`` and whose indexes span ``index_widths``."""
+    total = max([pk_columns, *index_widths], default=1)
+    return TableDef(
+        name=name,
+        columns=[
+            ColumnDef(name=f"c{i}", mysql_type="INT", nullable=False)
+            for i in range(1, total + 1)
+        ],
+        primary_key=[f"c{i}" for i in range(1, pk_columns + 1)],
+        indexes=[
+            IndexDef(name=f"ix_{n}", columns=[f"c{i}" for i in range(1, width + 1)])
+            for n, width in enumerate(index_widths, start=1)
+        ],
+    )
+
+
+def test_index_over_eight_columns_is_not_emitted() -> None:
+    # DSQL caps a key at 8 columns (error 54011); MySQL allows 16. Emitting a
+    # 9+-column CREATE INDEX ASYNC would guarantee a failure AFTER Full Load wrote
+    # every row, so the converter must leave it out of the applied script.
+    conversion = _convert_table(_table_with_key_widths(index_widths=(8, 9)))
+    ddl = " ".join(conversion.index_ddls)
+    assert "ix_1" in ddl  # exactly 8 columns -> still emitted
+    assert "ix_2" not in ddl  # 9 columns -> skipped
+
+
+def test_skipped_wide_index_is_reported_as_a_loss() -> None:
+    # Skipping silently would be worse than failing: the operator must learn the
+    # target is missing that index.
+    conversion = _convert_table(_table_with_key_widths(index_widths=(12,)))
+    (warning,) = [w for w in conversion.warnings if "54011" in w.message or "8 columns" in w.message]
+    assert warning.classification is Classification.MANUAL
+    assert warning.kind is ConversionNoteKind.LOSS
+    assert "ix_1 (12 columns)" in warning.message
+    assert "NOT emitted" in warning.message
+    assert "MySQL allows 16" in warning.message
+
+
+def test_primary_key_over_eight_columns_is_unsupported() -> None:
+    # A wide PK makes the CREATE TABLE itself rejected, so nothing migrates.
+    conversion = _convert_table(_table_with_key_widths(pk_columns=10))
+    (warning,) = [w for w in conversion.warnings if "primary key" in w.message]
+    assert warning.classification is Classification.UNSUPPORTED
+    assert "10 columns" in warning.message
+    assert "REJECTED" in warning.message
+
+
+def test_keys_within_the_eight_column_limit_produce_no_key_warning() -> None:
+    from dsql_migrator.core.converter import _too_many_key_columns_warning
+
+    # Exactly at the limit on both sides -> clean.
+    assert (
+        _too_many_key_columns_warning(
+            _table_with_key_widths(pk_columns=8, index_widths=(8, 1))
+        )
+        is None
+    )
+
+
+def test_index_budget_ignores_indexes_the_converter_skips() -> None:
+    # A table whose index COUNT is only over the 23-secondary budget because of
+    # indexes that are themselves skipped (over 8 columns) must not claim a budget
+    # overflow the applied script cannot hit.
+    from dsql_migrator.core.converter import _too_many_indexes_warning
+
+    table = TableDef(
+        name="wide",
+        columns=[
+            ColumnDef(name=f"c{i}", mysql_type="INT", nullable=False)
+            for i in range(1, 10)
+        ],
+        primary_key=["c1"],
+        indexes=(
+            [IndexDef(name=f"ix_{i}", columns=["c2"]) for i in range(23)]
+            # 2 more that are 9 columns wide -> skipped, so 23 are actually emitted.
+            + [
+                IndexDef(name=f"wide_{i}", columns=[f"c{c}" for c in range(1, 10)])
+                for i in range(2)
+            ]
+        ),
+    )
+    assert len(table.indexes) == 25  # over the budget by raw count
+    assert _too_many_indexes_warning(table) is None  # but only 23 are emitted
+
+
 def test_tinyint_bool_default_becomes_a_boolean_literal() -> None:
     """`DEFAULT 1` on a BOOLEAN column is a hard error on DSQL.
 

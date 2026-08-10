@@ -5,6 +5,32 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.293
+
+### Fixed
+
+- **A key over Aurora DSQL's 8-column limit is now caught in Evaluation and Schema
+  Conversion, instead of failing at apply — or, for an index, after Full Load had
+  written every row.** MySQL allows up to 16 columns in an index; DSQL allows **8**
+  (error 54011 `more than 8 column keys are not allowed`). Nothing checked this: the
+  8-column constant existed only inside the optional composite-key picker's validation,
+  so a source with a 9–16-column key passed Evaluation clean, converted clean, and then
+  failed — a wide **primary key** rejected the `CREATE TABLE` (nothing migrated), and a
+  wide **secondary index** failed its post-load `CREATE INDEX ASYNC`, i.e. at the worst
+  possible moment, after a multi-hour load. Now:
+  - Evaluation gains a `TOO_MANY_KEY_COLUMNS` rule — **UNSUPPORTED** when the primary key
+    is over the limit (no data can land) and **MANUAL** when only secondary indexes are —
+    naming each offending key with its column count, the error it would hit, and *when*.
+  - Schema Conversion emits a matching note and **omits** the wide `CREATE INDEX ASYNC`
+    rather than shipping DDL guaranteed to fail after the load, so the applied script is
+    one that can succeed and the operator is told which indexes were left out.
+  - The 24-indexes-per-table budget now counts only the indexes actually emitted, so a
+    table that is over the raw count solely because of skipped wide indexes no longer
+    warns about an overflow the applied script cannot hit.
+
+  Manual §6.1 (all three languages) documents both limits — the 8-column key cap and the
+  24-index-per-table cap, which was also undocumented.
+
 ## v0.1.292
 
 ### Changed
