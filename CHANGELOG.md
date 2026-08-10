@@ -5,6 +5,30 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.297
+
+### Fixed
+
+- **The CDC sink's CloudWatch monitor no longer runs on the offset-commit path, where it
+  could time out the commit it was only meant to observe.** Kafka Connect calls
+  `SinkTask.flush()` *inside* the offset commit and bounds that commit by
+  `offset.flush.timeout.ms`; the sink emitted its per-table metrics there
+  **synchronously**. `PutMetricData` is a network call — and its first invocation also
+  resolves credentials and endpoints, egressing through the cdc-stack's NAT gateway with
+  no monitoring VPC endpoint — so a slow CloudWatch could consume the whole commit budget
+  and surface as a repeating `Commit of offsets timed out`: a best-effort monitor
+  degrading replication, which is exactly backwards. `flush()` now hands the window to a
+  single daemon thread and returns immediately. At most one emission is in flight, so a
+  slow CloudWatch cannot build a backlog of windows — and nothing is lost by skipping
+  one, because each counter is read-and-cleared atomically, so skipped counts roll into
+  the next window. `stop()` still emits the final window inline (teardown is not the
+  commit path, and those counts would otherwise die with the daemon thread). Guarded by a
+  new Java test that fails if the emission goes back to being inline.
+
+  `PLUGIN_VERSION` → `v25` (sink jar rebuilt; the Debezium plugin and seeder zip are
+  unchanged). It also carries the v24 worker-config change, so one **Delete + Deploy of
+  the CDC infrastructure** picks up both.
+
 ## v0.1.296
 
 ### Fixed

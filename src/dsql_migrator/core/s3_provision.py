@@ -51,6 +51,17 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v25 rebuilds the DSQL sink jar: the per-table CloudWatch monitor no longer emits on
+#    the OFFSET-COMMIT path. Connect calls flush() inside the commit and bounds it by
+#    offset.flush.timeout.ms, so the synchronous PutMetricData there (whose first call
+#    also resolves credentials/endpoints, egressing via NAT with no monitoring VPC
+#    endpoint) could consume the commit budget and surface as a repeating "Commit of
+#    offsets timed out" -- a best-effort monitor degrading replication. flush() now
+#    queues the emission on a single daemon thread and returns immediately; at most one
+#    emission is in flight (a slow CloudWatch cannot build a backlog, and skipped counts
+#    roll into the next window because each counter is read-and-cleared atomically), and
+#    stop() emits the final window inline. Sink-jar change only; the debezium plugin and
+#    the seeder zip are unchanged.
 # v24 does NOT change any artifact: it forces a fresh SinkWorkerConfiguration. That
 #    resource is custom-named ${AWS::StackName}-sink-worker-config-${PluginVersion}
 #    and immutable, so the new consumer poll/session timeouts
@@ -214,7 +225,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v24"
+PLUGIN_VERSION = "v25"
 
 
 class S3ProvisionError(RuntimeError):

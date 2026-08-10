@@ -20,6 +20,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
@@ -104,10 +109,11 @@ public class DsqlSinkTask extends SinkTask {
   // The UI reads these instead of COUNT(*)-ing the source: the sink knows exactly
   // how many inserts / updates / deletes it applied per table (a DMS-style
   // change breakdown), a source-scan-free signal costing three running counters +
-  // one PutMetricData per offset-commit window. NOTE updates are counted too --
-  // the old single "net rows" counter (inserts - deletes) skipped them entirely
-  // (netRowDelta 0), so an update-heavy table looked idle. Emission is strictly
-  // best-effort: a CloudWatch error is logged and NEVER breaks apply.
+  // at most one PutMetricData per offset-commit window (queued, not inline -- see
+  // scheduleEmit). NOTE updates are counted too -- the old single "net rows" counter
+  // (inserts - deletes) skipped them entirely (netRowDelta 0), so an update-heavy table
+  // looked idle. Emission is strictly best-effort: a CloudWatch error is logged and
+  // NEVER breaks apply, and it never runs on the offset-commit path.
   private static final String METRIC_NAMESPACE = "MysqlDsqlMigrator/CDC";
   private static final String METRIC_INSERTS = "InsertsApplied";
   private static final String METRIC_UPDATES = "UpdatesApplied";
@@ -126,19 +132,54 @@ public class DsqlSinkTask extends SinkTask {
   // Per-table worst replication lag (ms) since the last emit (reset on emit).
   private final Map<String, AtomicLong> lagByTable = new ConcurrentHashMap<>();
   private volatile CloudWatchClient cloudWatch; // built lazily on first emit
+  // Emission runs OFF the Connect worker thread. flush() is called on the offset-COMMIT
+  // path, which Connect bounds by offset.flush.timeout.ms; PutMetricData is a network
+  // call (its first invocation also resolves credentials/endpoints, and in the cdc-stack
+  // it egresses via NAT with no monitoring VPC endpoint), so doing it inline let a slow
+  // CloudWatch consume the commit budget and surface as "Commit of offsets timed out" --
+  // a monitor degrading replication, which best-effort metrics must never do.
+  // Single-threaded so emissions stay ordered and at most one is in flight; the
+  // sum-then-reset in emitMetrics is what makes handing the window off safe (each datum
+  // is a delta owned by exactly one emission).
+  private ExecutorService metricsExecutor;
+  // Set while an emission is queued/running: skip queueing another (a slow CloudWatch
+  // must not build a backlog of windows). The skipped counts are not lost -- they stay
+  // in the counters and roll into the next window.
+  private final AtomicBoolean emitInFlight = new AtomicBoolean(false);
 
   @Override
   public String version() {
     return "0.1.0-SNAPSHOT";
   }
 
-  @Override
-  public void start(Map<String, String> props) {
+  /**
+   * Configure the metrics half of {@link #start} only.
+   *
+   * <p>Extracted so a unit test can exercise the emission plumbing (which is where the
+   * offset-commit hazard lives) without a Connect {@code context} — {@link #start}
+   * reads {@code context.errantRecordReporter()}, which no offline test can provide.
+   */
+  void startMetrics(Map<String, String> props) {
     this.config = new DsqlSinkConnectorConfig(props);
     // Net-rows metric is on only when a Stack dimension was supplied (the cdc-stack
     // connector config sets it); otherwise stay silent (e.g. local/unit runs).
     this.metricsStack = config.metricsStack();
     this.metricsEnabled = config.metricsEnabled() && !metricsStack.isEmpty();
+    if (metricsEnabled) {
+      // Daemon thread: it must never keep the JVM (or a task shutdown) waiting.
+      this.metricsExecutor =
+          Executors.newSingleThreadExecutor(
+              r -> {
+                Thread t = new Thread(r, "dsql-sink-metrics");
+                t.setDaemon(true);
+                return t;
+              });
+    }
+  }
+
+  @Override
+  public void start(Map<String, String> props) {
+    startMetrics(props);
     this.tokenProvider =
         new DsqlIamTokenProvider(config.clusterEndpoint(), config.region(), config.username());
     // The errant-record reporter is wired only when errors.deadletterqueue.* /
@@ -667,17 +708,28 @@ public class DsqlSinkTask extends SinkTask {
   }
 
   /**
-   * Called by Connect on each offset commit: emit the per-table net-row deltas
-   * accumulated since the last emit as a CloudWatch metric, then reset. Best-effort.
+   * Called by Connect on each offset commit: hand the per-table deltas accumulated
+   * since the last emit to the background metrics thread, then return immediately.
+   *
+   * <p><b>This must not block.</b> Connect calls {@code flush()} inside the offset
+   * commit, which it bounds by {@code offset.flush.timeout.ms}; a blocking
+   * PutMetricData here could exhaust that budget and produce a repeating "Commit of
+   * offsets timed out" — i.e. a best-effort monitor degrading replication. So the
+   * network call is queued, never awaited (see {@link #scheduleEmit}).
    */
   @Override
   public void flush(Map<TopicPartition, OffsetAndMetadata> offsets) {
-    emitMetrics();
+    scheduleEmit();
   }
 
   @Override
   public void stop() {
-    emitMetrics(); // flush any counts accumulated since the last offset commit
+    // Task teardown, no longer on the commit path -- emit the final window INLINE so
+    // counts accumulated since the last commit are not lost to a daemon thread dying
+    // with the JVM. Bounded by the SDK's own timeouts and swallowed like every other
+    // emission, so a slow CloudWatch delays only this shutdown, never replication.
+    shutdownMetricsExecutor();
+    emitMetrics();
     closeCloudWatchQuietly();
     try {
       if (connection != null && !connection.isClosed()) {
@@ -752,10 +804,21 @@ public class DsqlSinkTask extends SinkTask {
    * {@code UpdatesApplied} / {@code DeletesApplied}) and the worst replication lag
    * ({@code ReplicationLagMs}) accumulated since the last emit, then reset. A failure
    * is logged and swallowed: the metrics are a monitor, so emission must never fail
-   * replication. Called single-threaded by the Connect worker (put/flush/stop), so
-   * the sum-then-reset on each counter is not racing a concurrent apply.
+   * replication.
+   *
+   * <p><b>Runs on the background metrics thread</b> (queued by {@link #scheduleEmit}),
+   * concurrently with the Connect worker's {@code put()} — it is deliberately NOT on
+   * the offset-commit path. That is safe because each counter is read-and-cleared
+   * atomically ({@link LongAdder#sumThenReset()} / {@link AtomicLong#getAndSet}): an
+   * apply that increments during an emission lands either in this window or the next,
+   * never in both and never lost. {@link #scheduleEmit} keeps at most one emission in
+   * flight, so two windows cannot interleave their resets. The exception is
+   * {@link #stop()}, which emits inline after the executor is shut down.
+   *
+   * <p>Package-private and overridable so a test can substitute a slow emission and
+   * assert that {@code flush()} does not wait for it.
    */
-  private void emitMetrics() {
+  void emitMetrics() {
     if (!metricsEnabled) {
       return;
     }
@@ -800,6 +863,58 @@ public class DsqlSinkTask extends SinkTask {
           "Could not emit CDC monitor metrics (net-rows / replication-lag; best-effort; "
               + "replication unaffected): {}",
           ex.toString());
+    }
+  }
+
+  /**
+   * Queue one {@link #emitMetrics()} on the background thread, or skip it.
+   *
+   * <p>Skips when an emission is already queued/running: a slow CloudWatch must not
+   * build a backlog of windows. Nothing is lost by skipping — the counters are not
+   * read until the emission runs, so the skipped window's counts simply roll into the
+   * next one. Package-private so a test can drive it with an injected executor.
+   */
+  void scheduleEmit() {
+    if (!metricsEnabled) {
+      return;
+    }
+    ExecutorService executor = metricsExecutor;
+    if (executor == null) {
+      emitMetrics(); // no executor (e.g. a unit test): behave as before, inline
+      return;
+    }
+    if (!emitInFlight.compareAndSet(false, true)) {
+      return; // one already pending; its window will include these counts
+    }
+    try {
+      executor.execute(
+          () -> {
+            try {
+              emitMetrics();
+            } finally {
+              emitInFlight.set(false);
+            }
+          });
+    } catch (RejectedExecutionException e) {
+      // Executor already shut down (task stopping) -- drop this window; stop() emits
+      // the final one inline.
+      emitInFlight.set(false);
+    }
+  }
+
+  /** Stop accepting new emissions and give an in-flight one a bounded moment to finish. */
+  private void shutdownMetricsExecutor() {
+    ExecutorService executor = metricsExecutor;
+    this.metricsExecutor = null;
+    if (executor == null) {
+      return;
+    }
+    executor.shutdown();
+    try {
+      // Bounded: a hung PutMetricData must not hold up task shutdown.
+      executor.awaitTermination(5, TimeUnit.SECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
     }
   }
 

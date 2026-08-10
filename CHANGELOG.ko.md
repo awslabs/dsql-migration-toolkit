@@ -5,6 +5,26 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.297
+
+### 수정
+
+- **CDC 싱크의 CloudWatch 모니터가 더 이상 offset 커밋 경로에서 실행되지 않습니다 — 관찰만 해야 할 커밋을
+  타임아웃시킬 수 있었습니다.** Kafka Connect는 `SinkTask.flush()`를 offset 커밋 *안에서* 호출하고 그 커밋을
+  `offset.flush.timeout.ms`로 제한하는데, 싱크는 거기서 테이블별 메트릭을 **동기적으로** emit했습니다.
+  `PutMetricData`는 네트워크 호출이고 — 첫 호출은 자격증명·엔드포인트 해석까지 포함하며, cdc-stack에서는
+  모니터링 VPC 엔드포인트 없이 NAT 게이트웨이로 나갑니다 — 따라서 CloudWatch가 느리면 커밋 예산을 전부
+  소모해 반복되는 `Commit of offsets timed out`으로 나타날 수 있었습니다. 최선노력(best-effort) 모니터가
+  복제를 저해하는, 정확히 거꾸로 된 상황입니다. 이제 `flush()`는 해당 윈도를 단일 데몬 스레드에 넘기고 즉시
+  반환합니다. 동시에 진행 중인 emission은 최대 1개이므로 느린 CloudWatch가 윈도를 적체시킬 수 없고, 건너뛴
+  윈도가 있어도 손실은 없습니다 — 각 카운터는 원자적으로 read-and-clear되므로 건너뛴 값은 다음 윈도에
+  합산됩니다. `stop()`은 마지막 윈도를 여전히 인라인으로 emit합니다(teardown은 커밋 경로가 아니고, 그 값들은
+  데몬 스레드와 함께 사라질 것이기 때문). emission이 다시 인라인으로 돌아가면 실패하는 Java 테스트로
+  고정했습니다.
+
+  `PLUGIN_VERSION` → `v25`(싱크 jar 재빌드; Debezium 플러그인과 seeder zip은 변경 없음). v24의 worker-config
+  변경도 함께 실려 있으므로, **CDC 인프라 Delete + Deploy** 한 번으로 두 변경이 모두 반영됩니다.
+
 ## v0.1.296
 
 ### 수정
