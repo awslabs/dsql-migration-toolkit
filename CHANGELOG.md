@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.300
+
+### Changed
+
+- **The app stack's default image is now `0.1.299`**, published to all three registries
+  (ECR Public plus the private `us-east-1` / `ap-northeast-2` repos). `0.1.298` and
+  `0.1.299` only touched `deploy/cloudformation.yaml`, so no image had been built for
+  them and the default still pointed at `0.1.297` — code-identical, but it left the
+  deployed tag two releases behind the project version. Keeping the tag equal to the
+  release removes the "which code is actually running?" question that has already cost
+  time twice here (a Seoul stack 27 releases behind, and a UI showing a version 7
+  releases stale).
+
 ## v0.1.299
 
 ### Fixed
