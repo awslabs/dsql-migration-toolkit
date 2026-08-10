@@ -343,10 +343,23 @@ in a measured payments+orders load, **4 vCPU ran ~3.8× faster than the 0.5 vCPU
 (512) default** on the same data. Use **0.5–1 vCPU for evaluation**, but **2–4 vCPU
 for a real large-scale Full Load**. Beyond ~4 vCPU returns diminish for a single large
 table — the reader is one thread and tops out near one core, so the next lever is
-sharding the read across PK ranges (a future enhancement), not more vCPU. **Memory**
-(`ContainerMemory`) is bounded by `table_parallelism × batch_parallelism × ~8 MiB`
-of row buffers, not by table size — Fargate's CPU/memory pairing (≥ 4 GiB at 2 vCPU,
-≥ 8 GiB at 4 vCPU) already covers it.
+sharding the read across PK ranges (a future enhancement), not more vCPU.
+
+**Memory** (`ContainerMemory`) is a Fargate **hard limit** — exceed it and the kernel
+OOM-kills the task with *no app shutdown* (only a CloudWatch spike + an ELB timeout).
+It is bounded by the buffered pipeline, not by table size: roughly `table_parallelism ×
+(prefetch_depth + batch_parallelism) × per-batch-bytes`, **summed across the worker
+processes** (Full Load runs one process per table at `table_parallelism > 1`, and
+Fargate counts the whole task cgroup). The per-batch byte cap is ~8 MiB, but **wide rows
+— large `TEXT`/`BLOB` values — fill a batch to that cap**, so the default `512` CPU /
+`1024` MiB has OOM-killed a real load running with concurrent source writes. Size it:
+**`1024` MiB is fine for evaluation; use ≥ `2048` for a real Full Load, and ≥ `8192`
+(with CPU ≥ `2048`) when tables carry large LOBs or you raise the parallelism knobs.**
+Raising it is a redeploy — Fargate does not auto-scale a task's memory. The app logs a
+memory high-water and an ~80%-of-limit pressure warning (also to the activity log, which
+survives the task) so an approaching OOM is visible before the kill, and you can
+right-size from evidence. See [DEPLOYMENT.md → Task sizing](../../../deploy/DEPLOYMENT.md#task-sizing--containercpu--containermemory)
+for the full CPU↔memory pairing table.
 
 > **Local runs** read the same environment variables — set them in your shell or
 > `.env` before launching `mysql-dsql-migrator ui`.

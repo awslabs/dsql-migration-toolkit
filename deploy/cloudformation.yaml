@@ -105,9 +105,9 @@ Metadata:
       ContainerImageUri:
         default: "Container image URI  [Optional] — blank = published ECR Public image (no build needed)"
       ContainerCpu:
-        default: "Task CPU units  [Optional, default 512]"
+        default: "Task CPU units  [Optional, default 512] — 512 for evaluation; 1024+ (ideally 4096) for a real Full Load (CPU-bound)"
       ContainerMemory:
-        default: "Task memory (MiB)  [Optional, default 1024] — must be valid for the chosen CPU"
+        default: "Task memory (MiB)  [Optional, default 1024] — HARD limit (over it = OOM kill). 1024 eval; 2048+ real load; 8192+ for large TEXT/BLOB. Must be valid for the chosen CPU"
       AppPort:
         default: "Container listen port  [Optional, default 8080]"
       EnableAiAssist:
@@ -174,12 +174,20 @@ Parameters:
     Type: Number
     Default: 512
     AllowedValues: [256, 512, 1024, 2048, 4096, 8192, 16384]
-    Description: Fargate task CPU units (8192 = 8 vCPU, 16384 = 16 vCPU).
+    Description: >
+      Fargate task CPU units (1024 = 1 vCPU, 4096 = 4 vCPU, 16384 = 16 vCPU). Full Load
+      is CPU-bound (per-row type conversion): 512 is fine for evaluation, but use 1024+
+      (ideally 4096) for a real large-scale Full Load. Also gates the valid memory range.
 
   ContainerMemory:
     Type: Number
     Default: 1024
-    Description: Fargate task memory (MiB); must be valid for the chosen CPU.
+    Description: >
+      Fargate task memory (MiB) -- a HARD limit; exceeding it OOM-kills the task with no
+      app log. Memory scales with table_parallelism x batch_parallelism across worker
+      processes and with wide TEXT/BLOB rows, so 1024 can be tight for a real load: use
+      2048+ for a Full Load, 8192+ for large LOBs. Must be valid for the chosen CPU
+      (512->1-4GB, 1024->2-8GB, 2048->4-16GB, 4096->8-30GB).
 
   AppPort:
     Type: Number

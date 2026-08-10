@@ -261,9 +261,19 @@ GIL 점유) 변환하므로 처리량이 CPU에 비례합니다: payments+orders
 0.5 vCPU(512) 기본값보다 4 vCPU에서 약 3.8배 빨랐습니다**. **평가용은 0.5–1 vCPU**, **실제 대용량
 Full Load에는 2–4 vCPU**를 쓰세요. 단일 큰 테이블은 ~4 vCPU를 넘으면 수확체감입니다 — 리더가
 한 스레드라 한 코어 근처에서 한계에 이르므로, 다음 레버는 vCPU가 아니라 PK 범위로 읽기를 샤딩하는
-것(향후 개선)입니다. **메모리**(`ContainerMemory`)는 테이블 크기가 아니라 행 버퍼의
-`table_parallelism × batch_parallelism × 약 8 MiB`로 제한되며, Fargate의 CPU/메모리 짝(2 vCPU면
-≥ 4 GiB, 4 vCPU면 ≥ 8 GiB)이 이미 이를 충족합니다.
+것(향후 개선)입니다.
+
+**메모리**(`ContainerMemory`)는 Fargate **hard limit**입니다 — 초과하면 커널이 태스크를 OOM-kill하며
+*앱 종료 로그가 없습니다*(CloudWatch 급등 + ELB 타임아웃만). 테이블 크기가 아니라 버퍼링된 파이프라인으로
+제한됩니다: 대략 `table_parallelism × (prefetch_depth + batch_parallelism) × 배치당 바이트`를 **워커
+프로세스에 걸쳐 합산**한 값(Full Load는 `table_parallelism > 1`이면 테이블당 프로세스 1개, Fargate는 전체
+태스크 cgroup을 합산). 배치당 바이트 상한은 약 8 MiB지만 **넓은 행 — 큰 `TEXT`/`BLOB` 값 — 이 배치를 그
+상한까지 채우므로**, 기본 `512` CPU / `1024` MiB는 동시 소스 쓰기가 있는 실제 로드에서 OOM-kill된 사례가
+있습니다. 사이징: **평가용은 `1024` MiB로 충분, 실제 Full Load엔 ≥ `2048`, 큰 LOB이나 병렬도 상향 시
+≥ `8192`(CPU ≥ `2048`).** 상향은 재배포입니다 — Fargate는 태스크 메모리를 자동 스케일하지 않습니다. 앱이
+메모리 high-water와 한계의 ~80% 압박 경고를 로그(+태스크가 죽어도 살아남는 활동 로그)에 남겨 OOM 접근을
+kill 전에 볼 수 있고 근거로 적정 크기를 잡을 수 있습니다. 전체 CPU↔메모리 짝 표는
+[DEPLOYMENT.ko.md → 태스크 사이징](../../../deploy/DEPLOYMENT.ko.md#태스크-사이징--containercpu--containermemory) 참고.
 
 > **로컬 실행**도 동일 환경 변수를 읽습니다 — `mysql-dsql-migrator ui` 실행 전 셸이나 `.env`에 설정하세요.
 

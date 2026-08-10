@@ -378,7 +378,7 @@ Schema Conversion → Data Migration → Validation → Cut over). UI가 보이�
 | `CertificateArn` | yes | — | HTTPS(443) 리스너용 ACM 인증서 ARN. |
 | `ContainerImageUri` | no | 게시된 ECR Public 이미지 | ECR Public에 게시된 이미지가 기본 — 빌드 불필요. 제한된 네트워크(자체 프라이빗 ECR 사본 / pull-through 캐시)나 커스텀 빌드에만 오버라이드; immutable 태그 또는 digest 권장. |
 | `ContainerCpu` | no | `512` | Fargate 태스크 CPU 단위. **Full Load는 CPU-bound**(소스 리더가 행마다 Python 타입 변환 수행)이므로 대규모 마이그레이션에서는 올려야 함 — 동일 데이터의 payments+orders 로드 실측에서 **512(기본)보다 4096(4 vCPU)에서 약 3.8배 빨랐음**. 평가용은 기본 `512`로 충분, 실제 대용량 Full Load에는 **4096 이상** 권장. [매뉴얼 §7.2](../docs/manual/ko/07-performance-and-tuning.md#72-병렬수-튜닝) 참고. |
-| `ContainerMemory` | no | `1024` | Fargate 태스크 메모리(MiB), CPU에 유효한 값(Fargate는 CPU `2048`이면 메모리 ≥ 4096, `4096`이면 ≥ 8192 필요). 메모리는 테이블 크기가 아니라 `table_parallelism × batch_parallelism × ~8 MiB`로 제한됨. |
+| `ContainerMemory` | no | `1024` | Fargate 태스크 메모리(MiB) — **hard limit**: 초과하면 커널이 태스크를 OOM-kill(graceful shutdown 없음, CloudWatch 급등 + ELB 타임아웃만 남음). 메모리는 테이블 크기가 아니라 버퍼링된 파이프라인 — 대략 `table_parallelism × (prefetch + batch_parallelism) × 배치당 바이트`를 **워커 프로세스에 걸쳐 합산** — 으로 제한되며, **넓은/대형 LOB 행이 배치당 바이트를 키우므로** 동시 소스 쓰기가 있는 실제 로드에선 `1024` 기본이 빠듯할 수 있음. **사이징:** 평가/소형은 `1024`로 충분, 실제 Full Load엔 **≥ 2048**, 큰 `TEXT`/`BLOB`이나 병렬도 상향 시 **≥ 4096**(이땐 `ContainerCpu` ≥ 2048 필요). CPU에 유효해야 함(아래 사이징 표 참고). 앱이 메모리 high-water와 ~80% 압박 경고를 로그(+활동 로그)에 남겨 OOM 접근을 kill 전에 볼 수 있음. |
 | `AppPort` | no | `8080` | 컨테이너 수신 포트. |
 | `AssignPublicIp` | no | `DISABLED` | NAT 없이 퍼블릭 서브넷에서 태스크 실행하려면 `ENABLED`(테스트); **권장: 프로덕션은 `DISABLED` 유지**(NAT 게이트웨이 또는 VPC 엔드포인트). |
 | `AllowedIngressCidr` | no | `10.0.0.0/8` | ALB 443에 도달 허용 CIDR. **권장: 내 네트워크로 범위 제한**, `0.0.0.0/0` 아님. |
@@ -395,6 +395,35 @@ Schema Conversion → Data Migration → Validation → Cut over). UI가 보이�
 | `BedrockModelArns` | no | `""` | **선택적 override**; 비우면 `BedrockModelId`에서 자동 도출. |
 | `BedrockRegion` | no | `""` | 앱의 `BEDROCK_REGION`. |
 | `BedrockModelId` | no | `global.anthropic.claude-sonnet-5` | Anthropic 모델(드롭다운); IAM 스코프 자동 도출. |
+
+### 태스크 사이징 — `ContainerCpu` / `ContainerMemory`
+
+Fargate는 CPU와 메모리를 **독립적으로 못 고릅니다**: CPU 값마다 허용 메모리 범위가 고정이고,
+메모리는 **hard limit**(초과 시 OOM kill, 앱 종료 로그 없음). 유효한 조합에서 고르세요:
+
+| `ContainerCpu` (vCPU) | 허용 `ContainerMemory` | 증분 |
+| --- | --- | --- |
+| `256` (0.25) | 512, 1024, 2048 MiB | 고정 |
+| `512` (0.5) | 1–4 GB | 1 GB |
+| `1024` (1) | 2–8 GB | 1 GB |
+| `2048` (2) | 4–16 GB | 1 GB |
+| `4096` (4) | 8–30 GB | 1 GB |
+| `8192` (8) | 16–60 GB | 4 GB |
+| `16384` (16) | 32–120 GB | 8 GB |
+
+**워크로드별 권장:**
+
+- **평가 / 소형 테이블:** `512` / `1024` MiB 기본으로 충분.
+- **실제 Full Load:** **`1024` CPU / `2048` MiB** 이상. Full Load는 CPU-bound(행별 타입 변환)이고
+  메모리는 워커 프로세스에 걸쳐 `table_parallelism × batch_parallelism`로 증가 — 동시 소스 쓰기가
+  있는 로드에서 `512`/`1024` 기본이 OOM-kill된 사례가 있음.
+- **큰 `TEXT`/`BLOB` 테이블이나 병렬도 상향 시:** **`4096` CPU / `8192`+ MiB** — 넓은 행이 배치를
+  키움. (메모리 4 GB 초과는 CPU도 올려야: 4 GB는 CPU ≥ `1024`, 8 GB는 CPU ≥ `2048`.)
+
+> 메모리 상향은 **재배포**(스택이 태스크를 in-place 업데이트) — Fargate는 태스크 메모리를 자동
+> 스케일하지 않고, 단일 태스크 컨트롤 플레인이라 수평 스케일도 안 됨. 확신이 없으면 넉넉히: 과다
+> 프로비저닝은 비용이 조금 더 들 뿐이지만, 부족하면 마이그레이션 도중 OOM-kill됩니다. 앱이 메모리
+> high-water와 ~80% 압박 경고를 로그(+활동 로그)에 남기므로 근거를 보고 적정 크기를 잡을 수 있음.
 
 ### DNS를 ALB로 지정 — Optional (커스텀 도메인만)
 

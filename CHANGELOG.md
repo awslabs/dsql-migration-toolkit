@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.292
+
+### Changed
+
+- **The deploy guide and the CloudFormation parameters now tell you how to size the
+  Fargate task, instead of leaving the defaults to be discovered by an OOM kill.** The
+  `ContainerCpu` / `ContainerMemory` defaults (`512` / `1024` MiB) are sized for
+  evaluation, but nothing at deploy time said so — and `ContainerMemory` is a Fargate
+  **hard limit**: exceed it and the kernel kills the task with no app log. The template's
+  parameter descriptions (and console labels) now state that memory is a hard limit and
+  which workload each size fits, and `DEPLOYMENT.md` (+ `.ko` / `.ja`) gains a **Task
+  sizing** section with the valid CPU↔memory pairings and per-workload recommendations:
+  0.5–1 vCPU / 1 GiB for evaluation, 2–4 vCPU / ≥ 2 GiB for a real Full Load, ≥ 8 GiB
+  when loading large LOBs or raising parallelism. Manual §7.2 (`07-performance-and-tuning`,
+  all three languages) replaces its understated memory note with the same OOM-aware
+  guidance and links to that section. Resizing is a redeploy — Fargate does not scale a
+  running task's memory.
+
 ## v0.1.291
 
 ### Added

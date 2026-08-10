@@ -415,7 +415,7 @@ Data Migration → Validation → Cut over）です。UI が表示されれば�
 | `CertificateArn` | yes | — | HTTPS (443) リスナー用の ACM 証明書 ARN。 |
 | `ContainerImageUri` | no | 公開された ECR Public イメージ | デフォルトは ECR Public に公開されたイメージ — ビルド不要。制限されたネットワーク（ご自身のプライベート ECR コピー / pull-through キャッシュ）またはカスタムビルドの場合のみオーバーライド。イミュータブルなタグまたはダイジェストを推奨。 |
 | `ContainerCpu` | no | `512` | Fargate タスクの CPU ユニット。**Full Load は CPU バウンド**（ソースリーダーが行ごとに Python で型変換を行う）なので、大規模移行では引き上げること — 同一データの payments+orders ロード実測で **デフォルトの 512 より 4096（4 vCPU）で約 3.8 倍高速**だった。評価用途はデフォルト `512` で十分、実際の TB 級 Full Load には **4096 以上** を推奨。[マニュアル §7.2](../docs/manual/ja/07-performance-and-tuning.md#72-並列度のチューニング) 参照。 |
-| `ContainerMemory` | no | `1024` | Fargate タスクのメモリ（MiB）。CPU に対して有効な値（Fargate は CPU `2048` ならメモリ ≥ 4096、`4096` なら ≥ 8192 が必要）。メモリはテーブルサイズではなく `table_parallelism × batch_parallelism × ~8 MiB` で制限される。 |
+| `ContainerMemory` | no | `1024` | Fargate タスクのメモリ（MiB）— **ハード制限**: 超えるとカーネルがタスクを OOM-kill します（graceful shutdown なし、CloudWatch のスパイクと ELB タイムアウトのみ）。メモリはテーブルサイズではなくバッファされたパイプライン — おおよそ `table_parallelism × (prefetch + batch_parallelism) × バッチあたりバイト` を**ワーカープロセスにわたって合算** — で制限され、**広い / 大きな LOB 行がバッチあたりバイトを増やす**ため、同時にソース書き込みがある実運用ロードでは `1024` デフォルトが厳しいことがあります。**サイジング:** 評価/小規模は `1024` で十分、実運用の Full Load には **≥ 2048**、大きな `TEXT`/`BLOB` や並列度を上げる場合は **≥ 4096**（この場合 `ContainerCpu` ≥ 2048 が必要）。CPU に対して有効な値であること（下のサイジング表を参照）。アプリはメモリの high-water と約 80% の圧迫警告をログ（+アクティビティログ）に残すので、kill の前に OOM の接近が見えます。 |
 | `AppPort` | no | `8080` | コンテナのリッスンポート。 |
 | `AssignPublicIp` | no | `DISABLED` | NAT なしでタスクをパブリックサブネットで実行するには `ENABLED`（テスト）。**推奨: 本番では `DISABLED` のまま**（NAT ゲートウェイまたは VPC エンドポイント）。 |
 | `AllowedIngressCidr` | no | `10.0.0.0/8` | ALB の 443 に到達を許可する CIDR。**推奨: `0.0.0.0/0` ではなく、ご自身のネットワークに絞り込む**。 |
@@ -432,6 +432,36 @@ Data Migration → Validation → Cut over）です。UI が表示されれば�
 | `BedrockModelArns` | no | `""` | invoke スコープの**オプションのオーバーライド**。空欄 = `BedrockModelId` から自動導出。 |
 | `BedrockRegion` | no | `""` | アプリの `BEDROCK_REGION`。 |
 | `BedrockModelId` | no | `global.anthropic.claude-sonnet-5` | Anthropic モデル（ドロップダウン）。IAM スコープはこれから自動導出。 |
+
+### タスクのサイジング — `ContainerCpu` / `ContainerMemory`
+
+Fargate では CPU とメモリを**独立に選べません**: CPU 値ごとに許容メモリ範囲が固定で、メモリは
+**ハード制限**（超過で OOM kill、アプリの終了ログなし）です。有効な組み合わせから選びます:
+
+| `ContainerCpu` (vCPU) | 許容 `ContainerMemory` | 刻み |
+| --- | --- | --- |
+| `256` (0.25) | 512, 1024, 2048 MiB | 固定 |
+| `512` (0.5) | 1–4 GB | 1 GB |
+| `1024` (1) | 2–8 GB | 1 GB |
+| `2048` (2) | 4–16 GB | 1 GB |
+| `4096` (4) | 8–30 GB | 1 GB |
+| `8192` (8) | 16–60 GB | 4 GB |
+| `16384` (16) | 32–120 GB | 8 GB |
+
+**ワークロード別の推奨:**
+
+- **評価 / 小規模テーブル:** `512` / `1024` MiB のデフォルトで十分。
+- **実運用の Full Load:** **`1024` CPU / `2048` MiB** 以上。Full Load は CPU バウンド（行ごとの型変換）
+  で、メモリはワーカープロセスにわたって `table_parallelism × batch_parallelism` で増加します —
+  同時にソース書き込みがあるロードで `512`/`1024` デフォルトが OOM-kill された事例があります。
+- **大きな `TEXT`/`BLOB` テーブル、または並列度を上げる場合:** **`4096` CPU / `8192`+ MiB** — 広い行が
+  バッチを大きくします。（メモリ 4 GB 超は CPU も上げる必要: 4 GB は CPU ≥ `1024`、8 GB は CPU ≥ `2048`。）
+
+> メモリの引き上げは**再デプロイ**（スタックがタスクをインプレース更新）です — Fargate はタスクの
+> メモリを自動スケールせず、単一タスクのコントロールプレーンなので水平スケールもしません。迷ったら
+> 大きめに: 過剰プロビジョニングはコストがわずかに増えるだけですが、不足すると移行の途中で OOM-kill
+> されます。アプリはメモリの high-water と約 80% の圧迫警告をログ（+アクティビティログ）に残すので、
+> 根拠を見て適切なサイズを決められます。
 
 ### DNS を ALB に向ける — オプション (カスタムドメインのみ)
 

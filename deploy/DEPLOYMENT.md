@@ -414,7 +414,7 @@ credentials at **Connect** to begin.
 | `CertificateArn` | yes | — | ACM cert ARN for the HTTPS (443) listener. |
 | `ContainerImageUri` | no | published ECR Public image | Defaults to the image published on ECR Public — no build needed. Override only for a restricted network (your private ECR copy / pull-through cache) or a custom build; prefer an immutable tag or digest. |
 | `ContainerCpu` | no | `512` | Fargate task CPU units. **Full Load is CPU-bound** (the source reader does per-row type conversion in Python), so raise this for a large migration — a measured payments+orders load ran **~3.8× faster at 4096 (4 vCPU) than at the 512 default** on the same data. Default `512` is fine for evaluation; use **4096 or higher** for a real large-scale Full Load. See [manual §7.2](../docs/manual/en/07-performance-and-tuning.md#72-tuning-parallelism). |
-| `ContainerMemory` | no | `1024` | Fargate task memory (MiB), valid for the CPU (Fargate requires ≥ 4096 with `2048` CPU, ≥ 8192 with `4096`). Memory is bounded by `table_parallelism × batch_parallelism × ~8 MiB`, not by table size. |
+| `ContainerMemory` | no | `1024` | Fargate task memory (MiB) — a **hard limit**: exceed it and the kernel OOM-kills the task (no graceful shutdown, only a CloudWatch spike + ELB timeout). Memory is bounded by the buffered pipeline — roughly `table_parallelism × (prefetch + batch_parallelism) × per-batch-bytes` **summed across the worker processes**, not by table size — and **wide / oversized-LOB rows push per-batch bytes up**, so the `1024` default can be tight for a real load with concurrent source writes. **Sizing:** `1024` is fine for evaluation / small tables; use **≥ 2048** for a real Full Load, and **≥ 4096** (which also needs `ContainerCpu` ≥ 2048) when tables have large `TEXT`/`BLOB` values or you raise the parallelism settings. Must be valid for the CPU (Fargate pairs `512` CPU with 1–4 GB, `1024` with 2–8 GB, `2048` with 4–16 GB, `4096` with 8–30 GB — see the sizing table below). The app logs a memory high-water and an ~80% pressure warning (in the activity log too) so an approaching OOM is visible before the kill. |
 | `AppPort` | no | `8080` | Container listen port. |
 | `AssignPublicIp` | no | `DISABLED` | `ENABLED` to run the task in public subnets without a NAT (test); **recommended: keep `DISABLED`** for production (NAT gateway or VPC endpoints). |
 | `AllowedIngressCidr` | no | `10.0.0.0/8` | CIDR allowed to reach the ALB on 443. **Recommended: scope to your network**, not `0.0.0.0/0`. |
@@ -431,6 +431,39 @@ credentials at **Connect** to begin.
 | `BedrockModelArns` | no | `""` | **Optional override** of the invoke scope; blank = auto-derived from `BedrockModelId`. |
 | `BedrockRegion` | no | `""` | `BEDROCK_REGION` for the app. |
 | `BedrockModelId` | no | `global.anthropic.claude-sonnet-5` | Anthropic model (dropdown); IAM scope auto-derived from it. |
+
+### Task sizing — `ContainerCpu` / `ContainerMemory`
+
+Fargate does **not** let you pick CPU and memory independently: each CPU value allows
+only a fixed memory range, and memory is a **hard limit** (over it → OOM kill, no app
+shutdown). Pick a valid pair:
+
+| `ContainerCpu` (vCPU) | Allowed `ContainerMemory` | Step |
+| --- | --- | --- |
+| `256` (0.25) | 512, 1024, 2048 MiB | fixed |
+| `512` (0.5) | 1–4 GB | 1 GB |
+| `1024` (1) | 2–8 GB | 1 GB |
+| `2048` (2) | 4–16 GB | 1 GB |
+| `4096` (4) | 8–30 GB | 1 GB |
+| `8192` (8) | 16–60 GB | 4 GB |
+| `16384` (16) | 32–120 GB | 8 GB |
+
+**Recommended by workload:**
+
+- **Evaluation / small tables:** the `512` / `1024` MiB default is fine.
+- **Real Full Load:** **`1024` CPU / `2048` MiB** or higher. Full Load is CPU-bound
+  (per-row type conversion) and memory grows with `table_parallelism × batch_parallelism`
+  across worker processes — the `512`/`1024` default has OOM-killed a load that ran with
+  concurrent source writes.
+- **Large tables with big `TEXT`/`BLOB`, or raised parallelism:** **`4096` CPU /
+  `8192`+ MiB** — wide rows enlarge each buffered batch. (To go above 4 GB memory you
+  must also raise CPU: 4 GB needs CPU ≥ `1024`, 8 GB needs CPU ≥ `2048`.)
+
+> Memory to raise it is a **redeploy** (the stack updates the task in place) — Fargate
+> does not auto-scale a task's memory, and this single-task control plane does not scale
+> horizontally. If unsure, size up: an over-provisioned task only costs a little more,
+> an under-provisioned one OOM-kills mid-migration. The app logs a memory high-water and
+> an ~80% pressure warning (also on the activity log) so you can right-size from evidence.
 
 ### Point DNS at the ALB — optional (custom domain only)
 

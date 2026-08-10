@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.292
+
+### 변경
+
+- **배포 가이드와 CloudFormation 파라미터가 Fargate 태스크 크기를 어떻게 잡아야 하는지 알려줍니다 —
+  기본값의 의미를 OOM kill로 알게 되는 상황을 없앴습니다.** `ContainerCpu` / `ContainerMemory` 기본값
+  (`512` / `1024` MiB)은 평가용 크기인데 배포 시점에 그 사실을 알려주는 곳이 없었고,
+  `ContainerMemory`는 Fargate **hard limit**입니다 — 초과하면 커널이 앱 로그도 없이 태스크를
+  종료합니다. 이제 템플릿의 파라미터 설명(및 콘솔 라벨)이 메모리가 hard limit임과 각 크기가 어떤
+  워크로드에 맞는지 명시하고, `DEPLOYMENT.md`(+ `.ko` / `.ja`)에 유효한 CPU↔메모리 조합표와
+  워크로드별 권장을 담은 **태스크 사이징** 섹션을 추가했습니다: 평가용 0.5–1 vCPU / 1 GiB, 실제
+  Full Load 2–4 vCPU / ≥ 2 GiB, 큰 LOB 적재나 병렬도 상향 시 ≥ 8 GiB. 매뉴얼 §7.2
+  (`07-performance-and-tuning`, 3개 언어) 역시 축소된 메모리 설명을 같은 OOM 인지 안내로 교체하고 그
+  섹션을 링크합니다. 크기 변경은 재배포입니다 — Fargate는 실행 중 태스크의 메모리를 스케일하지 않습니다.
+
 ## v0.1.291
 
 ### 추가

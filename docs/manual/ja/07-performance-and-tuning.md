@@ -274,9 +274,20 @@ Fargate デプロイでは、これらは **ECS タスク定義のコンテナ `
 **同一データの 0.5 vCPU (512) デフォルトより 4 vCPU で約 3.8 倍高速** でした。**評価用途は 0.5–1 vCPU**、
 **実際の TB 級 Full Load には 2–4 vCPU** を使ってください。単一の大きなテーブルでは ~4 vCPU を超えると
 効果が逓減します — リーダーは 1 スレッドで 1 コア付近が上限になるため、次のレバーは vCPU 増ではなく
-PK 範囲での読み込みシャーディング（将来の拡張）です。**メモリ** (`ContainerMemory`) はテーブルサイズ
-ではなく行バッファの `table_parallelism × batch_parallelism × 約 8 MiB` で有界であり、Fargate の
-CPU/メモリの組み合わせ（2 vCPU で ≥ 4 GiB、4 vCPU で ≥ 8 GiB）が既にこれをカバーします。
+PK 範囲での読み込みシャーディング（将来の拡張）です。
+
+**メモリ** (`ContainerMemory`) は Fargate の**ハード制限**です — 超えるとカーネルがタスクを OOM-kill し、
+*アプリの終了ログはありません*（CloudWatch のスパイクと ELB タイムアウトのみ）。テーブルサイズではなく
+バッファされたパイプラインで有界です: おおよそ `table_parallelism × (prefetch_depth + batch_parallelism) ×
+バッチあたりバイト` を**ワーカープロセスにわたって合算**した値（Full Load は `table_parallelism > 1` で
+テーブルあたり 1 プロセス、Fargate はタスク cgroup 全体を合算）。バッチあたりバイトの上限は約 8 MiB ですが、
+**広い行 — 大きな `TEXT`/`BLOB` 値 — がバッチをその上限まで満たす**ため、デフォルトの `512` CPU / `1024` MiB
+は同時にソース書き込みがある実運用ロードで OOM-kill された事例があります。サイジング: **評価用途は `1024`
+MiB で十分、実運用の Full Load には ≥ `2048`、大きな LOB や並列度を上げる場合は ≥ `8192`（CPU ≥ `2048`）。**
+引き上げは再デプロイです — Fargate はタスクのメモリを自動スケールしません。アプリはメモリの high-water と
+上限の約 80% の圧迫警告をログ（+タスクが死んでも残るアクティビティログ）に残すので、kill の前に OOM の接近が
+見え、根拠を見て適切なサイズを決められます。CPU↔メモリの完全な組み合わせ表は
+[DEPLOYMENT.ja.md → タスクのサイジング](../../../deploy/DEPLOYMENT.ja.md#タスクのサイジング--containercpu--containermemory) を参照。
 
 > **ローカル実行** も同じ環境変数を読み取ります — `mysql-dsql-migrator ui` を起動する前に、シェルまたは `.env` に
 > 設定してください。
