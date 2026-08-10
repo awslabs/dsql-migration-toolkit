@@ -409,7 +409,11 @@ class CdcConnectorError(BaseModel):
     Credential-free (Property 7): ``table`` names the affected table/topic (or
     connector), ``message`` is an English reason, and ``error_code`` is an
     optional SQLSTATE-like code. ``occurred_at`` is provided by the source when
-    known; otherwise the orchestrator stamps the current time.
+    known; otherwise the orchestrator stamps the current time. For a DLQ record
+    the ``message`` may carry the failed row's primary key (``... | pk: id=14``):
+    PK column names always, surrogate PK values (integer / UUID) only, and any
+    natural-key value that may be sensitive withheld -- so still no arbitrary row
+    values.
     """
 
     model_config = ConfigDict(extra="forbid")

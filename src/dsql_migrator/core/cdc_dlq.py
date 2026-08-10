@@ -15,9 +15,17 @@ the topic, the failure reason, the Kafka offset, and an optional SQLSTATE). On a
 DSQL apply failure the sink appends the rendered SQL **template** to the reason
 (``... | sql: INSERT INTO ... VALUES (?, ?) ON CONFLICT ...``): column names with
 ``?`` placeholders only, so it still carries **no row values and no credentials**
-(Property 7) -- there is also no *source* SQL since CDC is row-based. The result
-feeds the single downloadable error log and the UI's DLQ depth / per-table
-"Quarantined" surface.
+(Property 7) -- there is also no *source* SQL since CDC is row-based.
+
+The reason may also carry the failed row's **primary key** (``... | pk: id=14``)
+so an engineer can locate the exact source row to fix (a quarantined event is
+never retried automatically -- see ``DsqlSinkTask``). PK **column names** are
+always included; PK **values** only for surrogate keys (integer / UUID). A natural
+key value that may be sensitive (e.g. an email or account-number PK) is withheld
+(``email=<withheld>``), so this still carries no arbitrary row values (Property 7).
+
+The result feeds the single downloadable error log and the UI's DLQ depth /
+per-table "Quarantined" surface.
 """
 
 from __future__ import annotations
@@ -67,8 +75,10 @@ def parse_dlq_log_message(
     the Kafka offset for traceability and the sink's reason, truncated to a sane
     length. The reason may carry the sink's rendered SQL TEMPLATE (``... | sql:
     INSERT INTO ... VALUES (?, ?) ON CONFLICT ...``) -- column names with ``?``
-    placeholders only, so it still carries no row values and no credentials
-    (Property 7).
+    placeholders only -- and/or the failed row's primary key (``... | pk: id=14``,
+    column names always, surrogate values only, natural-key values withheld). Both
+    ride through this parser inside the reason with no special handling, so it
+    still carries no arbitrary row values and no credentials (Property 7).
     """
     if not message:
         return None

@@ -5,6 +5,29 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.303
+
+### Added
+
+- **CDC DLQ quarantine logs now record the failed row's primary key**, so a
+  migration engineer can find and fix the exact source row a poison event came
+  from. This matters because a quarantined event is **never retried automatically**
+  — the sink does not re-consume the Kafka offset and Debezium does not re-emit the
+  binlog event, so the row is permanently set aside until someone re-touches it at
+  the source (e.g. shrinks an oversized LOB and `UPDATE`s it, producing a fresh
+  binlog event). The Kafka offset in the log cannot be mapped back to a source row;
+  the primary key can. (Events *after* a quarantined one keep replicating — a
+  permanent failure isolates only the poison row and the offset advances past it.)
+
+  To respect Property 7 (no sensitive row values in logs/reports), PK **column
+  names** are always shown, but PK **values** appear only for surrogate keys
+  (integers and UUIDs). A natural-key value that may be sensitive — e.g. an email
+  or account-number primary key — is withheld and rendered `email=<withheld>`; the
+  decision is made per column for composite keys. The PK rides inside the existing
+  quarantine reason string (like the SQL template already does), so it surfaces in
+  the DLQ panel and the durable activity log with no change to the reader. Requires
+  a CDC-connector redeploy (plugin `v26`) to take effect.
+
 ## v0.1.302
 
 ### Fixed

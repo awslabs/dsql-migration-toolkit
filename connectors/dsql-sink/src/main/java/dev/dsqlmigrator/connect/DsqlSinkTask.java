@@ -9,6 +9,8 @@
  */
 package dev.dsqlmigrator.connect;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -27,8 +29,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.regex.Pattern;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.errors.RetriableException;
@@ -486,13 +491,92 @@ public class DsqlSinkTask extends SinkTask {
     }
   }
 
+  // Canonical dashed UUID (8-4-4-4-12 hex). A CHAR(36)/VARCHAR UUID PK is a
+  // surrogate whose value is safe to log; an arbitrary string PK (e.g. an email or
+  // account number) is a natural key that may be PII and must be withheld.
+  private static final Pattern UUID_RE =
+      Pattern.compile(
+          "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
+
+  /**
+   * True if a PK value is a SURROGATE key whose value is safe to emit to the log
+   * (integers and UUIDs), false for a natural key whose value is withheld
+   * (Property 7). Decided on the value's runtime type -- NOT the Connect
+   * {@code Schema.Type} -- because Debezium encodes {@code BIGINT UNSIGNED} as a
+   * {@link BigDecimal} (Connect {@code BYTES}), which a type-based check would
+   * wrongly withhold. Package-private + static so a unit test can assert it
+   * without a live pipeline.
+   */
+  static boolean isSurrogate(Object value) {
+    if (value instanceof Byte
+        || value instanceof Short
+        || value instanceof Integer
+        || value instanceof Long
+        || value instanceof BigInteger) {
+      return true;
+    }
+    // Whole-number decimal (unsigned BIGINT and NUMERIC(n,0)) is a surrogate; a
+    // fractional decimal is not a key we render.
+    if (value instanceof BigDecimal bd) {
+      return bd.scale() <= 0;
+    }
+    // A UUID string is a surrogate; any other string is treated as a natural key.
+    return value instanceof String s && UUID_RE.matcher(s).matches();
+  }
+
+  /**
+   * Render parallel PK column/value lists as {@code col=value} (surrogate) /
+   * {@code col=<withheld>} (natural key), joined by {@code ", "}. Returns {@code ""}
+   * for empty or length-mismatched lists so the caller emits nothing. Static +
+   * package-private for unit testing.
+   */
+  static String formatPk(List<String> cols, List<Object> vals) {
+    if (cols == null || vals == null || cols.isEmpty() || cols.size() != vals.size()) {
+      return "";
+    }
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < cols.size(); i++) {
+      if (i > 0) {
+        sb.append(", ");
+      }
+      Object v = vals.get(i);
+      sb.append(cols.get(i)).append('=').append(isSurrogate(v) ? String.valueOf(v) : "<withheld>");
+    }
+    return sb.toString();
+  }
+
+  /**
+   * Render a Connect record key {@link Struct} (the PK, {@code pk.mode=record_key})
+   * the same way as {@link #formatPk(List, List)}. Returns {@code ""} when the key
+   * is absent or not a Struct.
+   */
+  static String formatPk(Object key) {
+    if (!(key instanceof Struct struct)) {
+      return "";
+    }
+    List<String> cols = new ArrayList<>();
+    List<Object> vals = new ArrayList<>();
+    for (Field field : struct.schema().fields()) {
+      cols.add(field.name());
+      vals.add(struct.get(field));
+    }
+    return formatPk(cols, vals);
+  }
+
+  /** Wrap a formatted PK as a {@code " | pk: ..."} log suffix; {@code ""} when empty. */
+  private static String pkSuffix(String formattedPk) {
+    return formattedPk.isEmpty() ? "" : " | pk: " + formattedPk;
+  }
+
   /**
    * Quarantine a permanently-rejected record to the DLQ and continue. If no
    * reporter is wired, log and skip rather than killing the task (the pipeline
    * keeps moving; the loss is visible in the log).
    */
   private void reportOrThrow(SinkRecord record, Exception cause) {
-    quarantine(record, cause, cause.getMessage());
+    // No ChangeEvent on this path (the envelope did not parse, or the size guard
+    // fired before batching), so read the PK straight off the Connect record key.
+    quarantine(record, cause, cause.getMessage() + pkSuffix(formatPk(record.key())));
   }
 
   /**
@@ -515,8 +599,16 @@ public class DsqlSinkTask extends SinkTask {
     } catch (RuntimeException e) {
       sql = null; // never let SQL rendering mask the real failure
     }
+    // PK BEFORE the SQL template: the Python parser truncates the surfaced message
+    // at a fixed length, so a long template must not push the (more actionable) PK
+    // out of the window. Source the PK from the event -- it is already
+    // type-converted and covers the delete before-image fallback where the record
+    // key is empty.
+    String pk = pkSuffix(formatPk(event.pkColumns(), event.pkValues()));
     String reason =
-        sql == null ? cause.getMessage() : cause.getMessage() + " | sql: " + sql;
+        sql == null
+            ? cause.getMessage() + pk
+            : cause.getMessage() + pk + " | sql: " + sql;
     quarantine(record, cause, reason);
   }
 

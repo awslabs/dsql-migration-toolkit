@@ -51,6 +51,16 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v26 rebuilds the DSQL sink jar so a quarantine log line records the failed row's
+#    PRIMARY KEY (`... | pk: id=14`) alongside the reason. A quarantined event is
+#    never retried automatically -- the sink does not re-consume the offset and
+#    Debezium does not re-emit the binlog event -- so the operator must fix the
+#    source row by hand, and the PK is what maps a DLQ entry back to that row (the
+#    Kafka offset cannot). PK column names are always logged; PK values only for
+#    surrogate keys (integer / UUID), while a natural-key value that may be
+#    sensitive is withheld (`email=<withheld>`), preserving Property 7. The PK rides
+#    inside the existing reason string, so the Python parser / UI need no change.
+#    Sink-jar change only; the debezium plugin and the seeder zip are unchanged.
 # v25 rebuilds the DSQL sink jar: the per-table CloudWatch monitor no longer emits on
 #    the OFFSET-COMMIT path. Connect calls flush() inside the commit and bounds it by
 #    offset.flush.timeout.ms, so the synchronous PutMetricData there (whose first call
@@ -225,7 +235,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v25"
+PLUGIN_VERSION = "v26"
 
 
 class S3ProvisionError(RuntimeError):

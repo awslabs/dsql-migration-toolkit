@@ -66,3 +66,33 @@ def test_parse_keeps_sql_template_in_message() -> None:
     assert "_dlq_probe" in rec.message
     # Placeholders only -- no row values leaked.
     assert "?" in rec.message
+
+
+def test_parse_keeps_surrogate_pk_in_message() -> None:
+    # The sink appends the failed row's PK so an engineer can locate the source
+    # row. A surrogate (integer) PK value is shown and must survive parsing; it
+    # rides inside the reason with no special handling (same as the SQL template).
+    msg = (
+        "Quarantined record to DLQ (topic=dsqlcdc.ecommerce.product_media, "
+        "partition=0, offset=3): Value for column 'full_description' exceeds "
+        "DSQL's 1048576-byte limit; quarantined. | pk: product_id=14"
+    )
+    rec = parse_dlq_log_message(msg)
+    assert rec is not None
+    assert rec.table == "product_media"
+    assert "pk: product_id=14" in rec.message
+    # A permanent-limit rejection carries no SQLSTATE.
+    assert rec.error_code is None
+
+
+def test_parse_keeps_withheld_natural_key_pk_in_message() -> None:
+    # A natural-key PK value that may be sensitive is withheld by the sink; the
+    # column name still appears so the engineer knows which key identifies the row.
+    msg = (
+        "Quarantined record to DLQ (topic=dsqlcdc.shop.accounts, partition=1, "
+        "offset=8): DSQL apply failed | pk: email=<withheld>"
+    )
+    rec = parse_dlq_log_message(msg)
+    assert rec is not None
+    assert rec.table == "accounts"
+    assert "pk: email=<withheld>" in rec.message

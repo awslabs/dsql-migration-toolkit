@@ -13,14 +13,21 @@
  */
 package dev.dsqlmigrator.connect;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.sql.SQLException;
 import java.sql.SQLNonTransientConnectionException;
 import java.sql.SQLRecoverableException;
+import java.util.List;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.RetriableException;
 import org.junit.jupiter.api.Test;
 
@@ -87,5 +94,67 @@ class DsqlSinkTaskTest {
     RetriableException wrapped = DsqlSinkTask.transientRetryException(adminShutdown);
     assertTrue(wrapped.getMessage().contains("57P01"));
     assertSame(adminShutdown, wrapped.getCause());
+  }
+
+  // --- DLQ log PK enrichment (surrogate value shown, natural key withheld) -----
+
+  @Test
+  void isSurrogateForIntegerTypes() {
+    // Every integral PK type Debezium can produce is a surrogate whose value is safe.
+    assertTrue(DsqlSinkTask.isSurrogate((byte) 1));
+    assertTrue(DsqlSinkTask.isSurrogate((short) 1));
+    assertTrue(DsqlSinkTask.isSurrogate(14));
+    assertTrue(DsqlSinkTask.isSurrogate(14L));
+    assertTrue(DsqlSinkTask.isSurrogate(BigInteger.valueOf(14)));
+    // BIGINT UNSIGNED arrives as a whole-number BigDecimal (Connect BYTES/Decimal).
+    assertTrue(DsqlSinkTask.isSurrogate(new BigDecimal("42")));
+  }
+
+  @Test
+  void isSurrogateForUuidStringOnly() {
+    // A canonical UUID string PK is a surrogate; any other string is a natural key.
+    assertTrue(DsqlSinkTask.isSurrogate("f47ac10b-58cc-4372-a567-0e02b2c3d479"));
+    assertFalse(DsqlSinkTask.isSurrogate("user@example.com"));
+    assertFalse(DsqlSinkTask.isSurrogate("ACME-000123"));
+    // A numeric-LOOKING natural key is still a string -> withheld.
+    assertFalse(DsqlSinkTask.isSurrogate("1234567890"));
+  }
+
+  @Test
+  void isSurrogateForNonKeyValues() {
+    // Fractional decimals and binary are never rendered as a key value.
+    assertFalse(DsqlSinkTask.isSurrogate(new BigDecimal("42.5")));
+    assertFalse(DsqlSinkTask.isSurrogate(new byte[] {1, 2, 3}));
+    assertFalse(DsqlSinkTask.isSurrogate(Boolean.TRUE));
+    assertFalse(DsqlSinkTask.isSurrogate(null));
+  }
+
+  @Test
+  void formatPkRendersSurrogateValueAndWithholdsNaturalKey() {
+    assertEquals("id=14", DsqlSinkTask.formatPk(List.of("id"), List.of(14L)));
+    assertEquals(
+        "email=<withheld>", DsqlSinkTask.formatPk(List.of("email"), List.of("a@b.com")));
+    // Composite PK: decided per column.
+    assertEquals(
+        "email=<withheld>, region=2",
+        DsqlSinkTask.formatPk(List.of("email", "region"), List.of("a@b.com", 2)));
+  }
+
+  @Test
+  void formatPkEmptyOrMismatchedListsYieldEmpty() {
+    assertEquals("", DsqlSinkTask.formatPk(List.of(), List.of()));
+    assertEquals("", DsqlSinkTask.formatPk(List.of("id"), List.of()));
+    assertEquals("", DsqlSinkTask.formatPk(null, null));
+  }
+
+  @Test
+  void formatPkFromStructKeyRendersAndNullYieldsEmpty() {
+    Schema keySchema =
+        SchemaBuilder.struct().name("Key").field("id", Schema.INT64_SCHEMA).build();
+    Struct key = new Struct(keySchema).put("id", 7L);
+    assertEquals("id=7", DsqlSinkTask.formatPk(key));
+    // A null or non-Struct key contributes nothing.
+    assertEquals("", DsqlSinkTask.formatPk((Object) null));
+    assertEquals("", DsqlSinkTask.formatPk("not-a-struct"));
   }
 }
