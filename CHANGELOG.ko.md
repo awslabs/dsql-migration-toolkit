@@ -5,6 +5,26 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.302
+
+### 수정
+
+- **CDC DLQ 깊이 / "격리된 레코드(Quarantined records)" 표시가 실제로 데드레터 큐에
+  poison 레코드가 쌓여도 항상 0(비어 있음)으로 표시되던 문제를 고쳤습니다.** Fargate
+  태스크 역할은 커넥터 워커 로그(`logs:DescribeLogStreams` + `logs:GetLogEvents`)는
+  읽을 수 있었지만, DLQ 읽기(`MskConnectController.dlq_errors`)는 같은
+  `/msk-connect/<cdc-stack>-cdc` 로그 그룹에 대해 `logs:FilterLogEvents`를 사용하는데
+  이 action이 부여돼 있지 않았습니다. 런타임에 이 호출이 `AccessDenied`를 받고, 리더가
+  이를 삼켜(`except Exception: return []`, 설계상 fail-closed) UI는 CloudWatch 실제
+  내용과 무관하게 DLQ 깊이를 0으로 보고했습니다. 라이브 Seoul 배포에서 IAM 정책
+  시뮬레이션으로 확인했습니다: `/msk-connect/mysql-dsql-cdc-stack-cdc`에 대한
+  `logs:FilterLogEvents`는 `implicitDeny`, 이미 부여된 두 action은 `allowed`였습니다.
+
+  배포 템플릿의 `ReadConnectorWorkerLogs` 구문에 `logs:FilterLogEvents`를 추가했습니다.
+  리소스 범위(`/msk-connect/mysql-dsql-cdc-*:*`)는 이미 CDC 로그 그룹을 포함하고 있어
+  ARN 패턴 변경 없이 빠진 action만 추가했습니다. 기존 배포에 반영하려면 스택 업데이트가
+  필요합니다.
+
 ## v0.1.301
 
 ### 수정

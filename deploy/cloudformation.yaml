@@ -681,12 +681,17 @@ Resources:
                   - cloudwatch:ListMetrics
                 Resource: "*"
               # Read connector worker logs to surface an actionable reason when a
-              # connector enters FAILED (worker-log-driven diagnosis in the UI).
+              # connector enters FAILED (worker-log-driven diagnosis in the UI) and
+              # to surface DLQ poison-record events in the data-migration status page.
+              # FilterLogEvents backs the DLQ depth / "Quarantined records" read
+              # (MskConnectController.dlq_errors); without it that read fails closed
+              # (AccessDenied is swallowed) and the UI always shows an empty DLQ.
               - Sid: ReadConnectorWorkerLogs
                 Effect: Allow
                 Action:
                   - logs:DescribeLogStreams
                   - logs:GetLogEvents
+                  - logs:FilterLogEvents
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/msk-connect/mysql-dsql-cdc-*:*
               # The tool manages a single per-account/region plugin bucket

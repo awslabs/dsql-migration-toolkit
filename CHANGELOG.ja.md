@@ -5,6 +5,28 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.302
+
+### 修正
+
+- **CDC の DLQ 件数 /「隔離されたレコード(Quarantined records)」表示が、実際にはデッド
+  レターキューに poison レコードが書き込まれていても、常に 0(空)と表示されていた問題を
+  修正しました。** Fargate タスクロールはコネクターのワーカーログ
+  (`logs:DescribeLogStreams` + `logs:GetLogEvents`)は読めましたが、DLQ の読み取り
+  (`MskConnectController.dlq_errors`)は同じ `/msk-connect/<cdc-stack>-cdc` ロググループ
+  に対して `logs:FilterLogEvents` を使用しており、その action が付与されていませんでした。
+  実行時にこの呼び出しは `AccessDenied` を受け取り、リーダーがそれを握りつぶすため
+  (`except Exception: return []`、設計上の fail-closed)、UI は CloudWatch の実際の内容に
+  関係なく DLQ 件数を 0 と報告していました。ライブの Seoul デプロイに対して IAM ポリシー
+  シミュレーションで確認済みです:`/msk-connect/mysql-dsql-cdc-stack-cdc` に対する
+  `logs:FilterLogEvents` は `implicitDeny`、既に付与済みの 2 つの action は `allowed`
+  でした。
+
+  デプロイテンプレートの `ReadConnectorWorkerLogs` ステートメントに
+  `logs:FilterLogEvents` を追加しました。リソース範囲(`/msk-connect/mysql-dsql-cdc-*:*`)
+  は既に CDC ロググループを含んでいるため、ARN パターンは変更せず、不足していた action の
+  みを追加しました。既存のデプロイに反映するにはスタックの更新が必要です。
+
 ## v0.1.301
 
 ### 修正

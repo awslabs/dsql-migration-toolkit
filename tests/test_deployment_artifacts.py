@@ -477,6 +477,26 @@ def test_task_role_provisions_cdc_source_secret_scoped_to_prefix(template: dict)
     assert resource != "*"
 
 
+def test_task_role_can_filter_connector_logs_for_dlq(template: dict) -> None:
+    # The data-migration status page surfaces DLQ depth / "Quarantined records" by
+    # running MskConnectController.dlq_errors, which calls logs:FilterLogEvents against
+    # the /msk-connect/<cdc-stack>-cdc log group. The reader fails closed (swallows
+    # AccessDenied and returns []), so a missing grant is INVISIBLE at runtime -- the UI
+    # just shows an empty DLQ regardless of what CloudWatch holds. Pin the action here so
+    # it can't be dropped again (it was absent through v0.1.301; added in v0.1.302).
+    stmt = _task_role_statements(template)["ReadConnectorWorkerLogs"]
+    actions = stmt["Action"]
+    actions = actions if isinstance(actions, list) else [actions]
+    assert "logs:FilterLogEvents" in actions
+    # The worker-log-tail read (connector FAILED diagnosis) still needs these two.
+    assert "logs:DescribeLogStreams" in actions
+    assert "logs:GetLogEvents" in actions
+    # Scoped to the CDC log-group family, never "*".
+    resource = str(stmt["Resource"])
+    assert "log-group:/msk-connect/mysql-dsql-cdc-*" in resource
+    assert stmt["Resource"] != "*"
+
+
 # --- Dedicated CDC deploy role (privilege separation) ------------------------
 
 

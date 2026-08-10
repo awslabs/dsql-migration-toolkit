@@ -5,6 +5,27 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.302
+
+### Fixed
+
+- **The CDC DLQ depth / "Quarantined records" surface always read empty, even when
+  poison records were being written to the dead-letter queue.** The Fargate task role
+  could read connector worker logs (`logs:DescribeLogStreams` + `logs:GetLogEvents`),
+  but the DLQ read (`MskConnectController.dlq_errors`) uses `logs:FilterLogEvents`
+  against the same `/msk-connect/<cdc-stack>-cdc` log group — and that action was not
+  granted. At runtime the call got `AccessDenied`, which the reader swallows
+  (`except Exception: return []`, fail-closed by design), so the UI reported a DLQ
+  depth of zero regardless of what CloudWatch actually held. Verified against the live
+  Seoul deployment with an IAM policy simulation: `logs:FilterLogEvents` on
+  `/msk-connect/mysql-dsql-cdc-stack-cdc` evaluated to `implicitDeny` while the two
+  already-granted actions were `allowed`.
+
+  `logs:FilterLogEvents` is now added to the `ReadConnectorWorkerLogs` statement in
+  the deploy template. The resource scope (`/msk-connect/mysql-dsql-cdc-*:*`) already
+  covered the CDC log group, so only the missing action was added — no change to the
+  ARN pattern. Requires a stack update to take effect on an existing deployment.
+
 ## v0.1.301
 
 ### Fixed
