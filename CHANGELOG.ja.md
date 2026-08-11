@@ -5,6 +5,24 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.306
+
+### 内部 (Internal)
+
+- **CDC の Kafka 準備段階における純粋な判定ロジックを、アプリ側の単一正本モジュールに抽出**
+  しました(`core/cdc_kafka_prep.py`)。これは近く追加予定の Lambda を使わない最小デプロイ
+  オプション(「EC2 + MSK のみ」)の土台です。VPC 内オフセットシーダー Lambda
+  (`deploy/cdc-stack/lambda/seeder.py`)は、純粋なヘルパー 3 種(`parse_partitions_map`、
+  `binlog_seq`、`offset_already_at_or_past`)とトピック整形の判定をインラインで重複保持して
+  きましたが、これらにアプリ側で単体テスト付きの単一正本(`TopicSpec` / `plan_topics()`
+  プランナーを含む)ができ、オフセットレコードビルダーは `core/cdc_offset_seed.py` から
+  re-export します(ビルダーの正本はそのまま)。この変更は**アプリ側のみ**です — Lambda の
+  ソース、コミット済みのコネクタ/シーダー ZIP、`PLUGIN_VERSION` は一切変更しないため、
+  **既存のデプロイはすべて同一に動作**します。ドリフトガードのテストが Lambda のインライン
+  コピーが正本モジュールと双方向で同一挙動であることを検証し、新しいパッケージングガードが
+  コミット済みオフセットシーダー ZIP が現在のディスク上の Lambda ソースを含んでいることを
+  検証します。
+
 ## v0.1.305
 
 ### 追加

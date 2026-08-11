@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.306
+
+### Internal
+
+- **Extracted the pure CDC Kafka-prep decision logic into one canonical app module**
+  (`core/cdc_kafka_prep.py`), the foundation for an upcoming Lambda-free ("EC2 + MSK
+  only") minimal deployment option. The in-VPC offset-seeder Lambda
+  (`deploy/cdc-stack/lambda/seeder.py`) has always duplicated three pure helpers
+  (`parse_partitions_map`, `binlog_seq`, `offset_already_at_or_past`) and the
+  topic-shaping decision inline; those now have a single, unit-tested home app-side
+  (plus a `TopicSpec` / `plan_topics()` planner), and the offset-record builders are
+  re-exported from `core/cdc_offset_seed.py` (kept as the one canonical builder). This
+  change is **app-side only**: the Lambda source, the committed connector/seeder ZIPs,
+  and `PLUGIN_VERSION` are untouched, so **every existing deployment behaves
+  identically**. A drift-guard test now asserts the Lambda's inline copies stay
+  behaviorally identical to the canonical module in both directions, and a new
+  packaging guard asserts the committed offset-seeder ZIP still embeds the current
+  on-disk Lambda sources.
+
 ## v0.1.305
 
 ### Added

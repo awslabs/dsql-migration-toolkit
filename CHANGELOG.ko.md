@@ -5,6 +5,22 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.306
+
+### 내부 (Internal)
+
+- **CDC Kafka 준비 단계의 순수 결정 로직을 앱의 단일 정본 모듈로 추출**했습니다
+  (`core/cdc_kafka_prep.py`). 이는 곧 추가될 Lambda 없는 최소 배포 옵션("EC2 + MSK만
+  사용")의 토대입니다. VPC 내부 오프셋 시더 Lambda(`deploy/cdc-stack/lambda/seeder.py`)는
+  순수 헬퍼 3종(`parse_partitions_map`, `binlog_seq`, `offset_already_at_or_past`)과
+  토픽 구성 결정을 인라인으로 중복 보유해 왔는데, 이제 앱 쪽에 단위 테스트가 붙은 단일
+  정본(`TopicSpec` / `plan_topics()` 플래너 포함)이 생겼고, 오프셋 레코드 빌더는
+  `core/cdc_offset_seed.py`에서 re-export합니다(빌더의 정본은 그대로 유지). 이 변경은
+  **앱 쪽 전용**입니다 — Lambda 소스, 커밋된 커넥터/시더 ZIP, `PLUGIN_VERSION`은 전혀
+  건드리지 않으므로 **기존 배포는 모두 동일하게 동작**합니다. drift 가드 테스트가 Lambda
+  인라인 복사본이 정본 모듈과 양방향으로 동일하게 동작함을 검증하고, 새 패키징 가드가
+  커밋된 오프셋 시더 ZIP이 현재 디스크의 Lambda 소스를 그대로 담고 있음을 검증합니다.
+
 ## v0.1.305
 
 ### 추가
