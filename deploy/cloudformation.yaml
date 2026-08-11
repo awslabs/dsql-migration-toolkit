@@ -60,6 +60,7 @@ Metadata:
           - ContainerCpu
           - ContainerMemory
           - AppPort
+          - EnableActivityLogCloudWatch
       - Label:
           default: "6. AI assist — optional, off by default"
         Parameters:
@@ -110,6 +111,8 @@ Metadata:
         default: "Task memory (MiB)  [Optional, default 1024] — HARD limit (over it = OOM kill). 1024 eval; 2048+ real load; 8192+ for large TEXT/BLOB. Must be valid for the chosen CPU"
       AppPort:
         default: "Container listen port  [Optional, default 8080]"
+      EnableActivityLogCloudWatch:
+        default: "Activity log to CloudWatch  [Optional, default off] — mirror the audit trail to the container log group so it survives task replacement"
       EnableAiAssist:
         default: "Enable AI assist  [Optional, default off] — AI-assisted schema conversion via Amazon Bedrock"
       BedrockModelArns:
@@ -312,6 +315,18 @@ Parameters:
       with: aws cognito-idp admin-create-user --user-pool-id <UserPoolId output>
       --username <email> --user-attributes Name=email,Value=<email>
       Name=email_verified,Value=true --desired-delivery-mediums EMAIL
+
+  EnableActivityLogCloudWatch:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      When true, the app mirrors each activity-log event to stdout as a JSON line,
+      which the container's awslogs driver forwards to this stack's CloudWatch log
+      group -- a durable, queryable audit trail that survives task replacement (the
+      rotating file lives on the task's ephemeral /tmp). Off by default; the local
+      rotating file remains regardless. No extra IAM or log group is needed (the
+      task already logs to CloudWatch via awslogs).
 
   EnableAiAssist:
     Type: String
@@ -1468,6 +1483,12 @@ Resources:
                 Fn::Sub: mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}
             - Name: DSQL_MIGRATOR_ACTIVITY_LOG_PATH
               Value: /tmp/migration_activity.log
+            # Mirror the activity log to stdout (-> awslogs -> this CloudWatch log
+            # group) when enabled, so the audit trail is durable across task
+            # replacement (the /tmp rotating file is ephemeral). Off by default.
+            - Name: DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT
+              Value:
+                Ref: EnableActivityLogCloudWatch
             - Name: BEDROCK_MODEL_ID
               Value:
                 Ref: BedrockModelId

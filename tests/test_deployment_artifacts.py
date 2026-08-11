@@ -352,13 +352,17 @@ def test_session_resume_wiring_storage_secret_and_state_path(template: dict) -> 
     # The activity log shares /tmp; it is size-capped + rotated in code so it
     # cannot grow without bound on the task's ephemeral storage.
     assert env["DSQL_MIGRATOR_ACTIVITY_LOG_PATH"] == "/tmp/migration_activity.log"
-    # Log level / CloudWatch mirroring are NOT deploy-time parameters (kept to a
-    # minimal parameter set); they are adjusted at runtime from the app's
-    # Diagnostics control. The template ships a safe default log level.
+    # Log level is NOT a deploy-time parameter (adjusted at runtime from the app's
+    # Diagnostics control); the template ships a safe default.
     assert env["DSQL_MIGRATOR_LOG_LEVEL"] == "INFO"
     assert "LogLevel" not in template["Parameters"]
-    assert "EnableActivityLogCloudWatch" not in template["Parameters"]
-    assert "DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT" not in env
+    # CloudWatch mirroring of the activity log IS a deploy-time parameter so the
+    # durable audit trail can be enabled from the start (the /tmp file is lost on
+    # task replacement); it defaults off and the env is driven by the parameter.
+    assert template["Parameters"]["EnableActivityLogCloudWatch"]["Default"] == "false"
+    assert env["DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT"] == {
+        "Ref": "EnableActivityLogCloudWatch"
+    }
 
 
 def test_service_is_fargate_single_task(template: dict) -> None:

@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.305
+
+### 추가
+
+- **활동 로그(audit trail)를 ECS에서 CloudWatch Logs로 보낼 수 있습니다.** 새 배포
+  파라미터 `EnableActivityLogCloudWatch`(기본 off)로 켭니다. 활동 로그는 태스크의
+  임시(ephemeral) `/tmp`에 rotating 파일로 남으므로, Fargate 태스크가 교체되면(재배포·
+  크래시·rebalance) 사라집니다. 이 옵션을 켜면 앱이 각 이벤트를 JSON 라인으로 stdout에도
+  미러링하고, 컨테이너의 `awslogs` 드라이버가 이를 스택의 기존 CloudWatch 로그 그룹
+  (`/ecs/<stack>-mysql-dsql-migrator`)으로 전달합니다 — 태스크 교체에도 살아남는 durable
+  하고 조회 가능한 사본입니다. 추가 IAM이나 로그 그룹은 필요 없습니다(태스크는 이미
+  CloudWatch로 로깅). 로컬 rotating 파일과 앱 Diagnostics 패널의 런타임 토글은 그대로이며,
+  이 변경은 그 미러를 배포 시점부터 켤 수 있게 한 것입니다(런타임 토글은 재시작 시 초기화됨).
+
 ## v0.1.304
 
 ### 수정

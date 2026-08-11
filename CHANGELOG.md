@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.305
+
+### Added
+
+- **The activity log (audit trail) can now be sent to CloudWatch Logs on ECS**, via a
+  new deploy parameter `EnableActivityLogCloudWatch` (default off). The activity log is
+  a rotating file on the task's ephemeral `/tmp`, so it is lost when a Fargate task is
+  replaced (a redeploy, crash, or rebalance). When this is enabled the app also mirrors
+  each event to stdout as a JSON line, which the container's `awslogs` driver forwards
+  to the stack's existing CloudWatch log group (`/ecs/<stack>-mysql-dsql-migrator`) —
+  a durable, queryable copy that survives task replacement. No extra IAM or log group
+  is needed (the task already logs to CloudWatch). The local rotating file and the
+  runtime toggle in the app's Diagnostics panel are unchanged; this just lets the
+  mirror be turned on from the start of a deployment rather than only at runtime (a
+  runtime toggle resets on restart).
+
 ## v0.1.304
 
 ### Fixed
