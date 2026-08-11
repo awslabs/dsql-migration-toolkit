@@ -5,6 +5,27 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.307
+
+### 추가 (Added)
+
+- **CDC 스택에 `SeedMode` 추가 — Lambda 없이("EC2 + MSK만") CDC Kafka 준비를 하는 opt-in
+  방식.** 무결점 Full Load → CDC 핸드오프에는 커넥터 생성 전에 VPC 안에서 Kafka 준비 3단계
+  (compact 오프셋 토픽 + 테이블별 데이터 토픽 + DLQ 토픽 사전 생성, connect-offsets 레코드
+  시드)가 필요합니다. 현재는 VPC 내부 시더 Lambda가 이를 수행합니다. 새 `SeedMode` 파라미터
+  (기본값 `Lambda` = 기존 동작, 변경 없음)에 `External` 모드가 추가되어, 이 모드에서는 배포
+  앱이 MSK IAM bootstrap을 통해 커넥터 생성 전에 준비 단계를 **인프로세스로** 수행합니다 —
+  즉 AWS Lambda를 쓸 수 없는 고객이 VPC 내부 호스트에서 CDC를 돌릴 수 있습니다. `External`
+  모드에서는 시더 Lambda·역할·`CdcStartPrepResource` 커스텀 리소스를 생성하지 않고,
+  `CdcStartPrepResource` 의존성이 없는 싱크 커넥터 변형을 선택합니다. 두 싱크 변형은 YAML
+  앵커로 본문을 공유해 서로 어긋날 수 없습니다. 인프로세스 Kafka 클라이언트(`kafka-python`
+  + MSK IAM SASL 서명자)는 **선택적 extra**(`pip install ".[cdc-external]"`)라 기본 설치와
+  컨테이너 이미지는 그대로입니다. **모두 기본값 뒤에 숨겨져 있습니다:** `SeedMode=Lambda`
+  (기본값)이면 앱 측 시드가 실행되지 않고 `SeedMode`도 전송되지 않으며, 배포되는 리소스
+  집합은 이전과 동일합니다 — 이번 릴리스는 기계장치만 추가합니다. 실제 호스트가 9098 포트로
+  클러스터에 도달하게 하는 보안 그룹 / IAM / VPC 동일 배치 설정은 EC2 호스트와 함께 별도로
+  적용됩니다. `PLUGIN_VERSION`은 변경 없음(커넥터/시더 아티팩트 무변경).
+
 ## v0.1.306
 
 ### 내부 (Internal)

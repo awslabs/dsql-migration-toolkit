@@ -118,6 +118,9 @@ class _FakeDeployer:
         self.updates: list[list[tuple[str, str]]] = []
         self.created: list[tuple[str, list[tuple[str, str]]]] = []
 
+    # The in-process External seed reads the deployer's region.
+    region = "us-east-1"
+
     def discover_stack(self, stack_name):
         self.calls.append("discover_stack")
         if self._discover_error:
@@ -527,6 +530,109 @@ def _connector_overrides() -> dict:
         for k, v in params.filled
         if k not in {"MskBootstrapServers", "DeploySink"}
     }
+
+
+# ---------------------------------------------------------------------------
+# run_cdc_start — SeedMode=External (Lambda-free in-process seed)
+# ---------------------------------------------------------------------------
+
+
+def _run_start_external(handle, deployer, seed_calls, logs=None):
+    """Run start in External mode with an injected seed_fn that records its call."""
+    def _seed_fn(**kwargs):
+        seed_calls.append(kwargs)
+        return "true"
+
+    captured = logs if logs is not None else []
+    run_cdc_start(
+        handle, stack_name=STACK, params=_start_params(), deployer=deployer,
+        on_log=lambda ts, msg: captured.append(msg), sleep=lambda _s: None,
+        connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
+        seed_mode="external", seed_fn=_seed_fn,
+    )
+    return captured
+
+
+def test_start_external_seeds_before_submit_and_appends_seedmode() -> None:
+    handle = _FakeHandle()
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]}
+    )
+    seed_calls: list[dict] = []
+    _run_start_external(handle, deployer, seed_calls)
+    assert all(s == "DONE" for s in _statuses(handle).values())
+    # The in-process seed ran exactly once, BEFORE the single connector-creating
+    # update (fake records order via deployer.calls: seed is not a deployer call, so
+    # assert the seed happened and the update carries SeedMode=external).
+    assert len(seed_calls) == 1
+    assert len(deployer.updates) == 1
+    only = dict(deployer.updates[0])
+    assert only["SeedMode"] == "external"
+    assert only["MskBootstrapServers"] == "b-1:9098"
+    # The seed used the fetched bootstrap + the fixed offset topic name.
+    call = seed_calls[0]
+    assert call["bootstrap"] == "b-1:9098"
+    assert call["offset_topic"] == f"{STACK}-debezium-source-offsets"
+    assert call["connector_name"] == SRC
+
+
+def test_start_default_lambda_does_not_seed_or_set_seedmode() -> None:
+    handle = _FakeHandle()
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]}
+    )
+    seed_calls: list[dict] = []
+
+    def _seed_fn(**kwargs):
+        seed_calls.append(kwargs)
+        return "true"
+
+    # Default seed_mode='lambda': the seed_fn must never be called and SeedMode must
+    # NOT appear in the update (the template keeps its Default=Lambda).
+    run_cdc_start(
+        handle, stack_name=STACK, params=_start_params(), deployer=deployer,
+        on_log=lambda ts, msg: None, sleep=lambda _s: None,
+        connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
+        seed_fn=_seed_fn,
+    )
+    assert seed_calls == []
+    only = dict(deployer.updates[0])
+    assert "SeedMode" not in only
+
+
+def test_start_external_fastpath_both_running_skips_seed() -> None:
+    handle = _FakeHandle()
+    # Both connectors RUNNING with matching config -> the whole else branch is
+    # skipped, so the in-process seed must NOT run (quota-safe idempotent no-op).
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["RUNNING"], SINK: ["RUNNING"]},
+        discovery_params=_connector_overrides(),
+    )
+    seed_calls: list[dict] = []
+    _run_start_external(handle, deployer, seed_calls)
+    assert deployer.updates == []
+    assert seed_calls == []  # seed skipped along with the update
+
+
+def test_start_external_seed_failure_raises_before_submit() -> None:
+    handle = _FakeHandle()
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]}
+    )
+
+    def _boom(**kwargs):
+        raise RuntimeError("cluster unreachable")
+
+    with pytest.raises(CdcDeployError) as exc:
+        run_cdc_start(
+            handle, stack_name=STACK, params=_start_params(), deployer=deployer,
+            on_log=lambda ts, msg: None, sleep=lambda _s: None,
+            connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
+            seed_mode="external", seed_fn=_boom,
+        )
+    # Fails loudly and NO connector-creating update was submitted (no silent gap).
+    assert "No connectors were created" in str(exc.value)
+    assert deployer.updates == []
 
 
 def test_start_idempotent_both_running_same_config_skips_updates() -> None:

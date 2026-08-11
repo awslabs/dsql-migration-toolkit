@@ -5,6 +5,31 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.307
+
+### Added
+
+- **`SeedMode` for the CDC stack — an opt-in, Lambda-free ("EC2 + MSK only") way to
+  do the CDC Kafka prep.** The gapless Full Load → CDC handoff needs three Kafka
+  steps done in-VPC before the connectors are created (pre-create the compacted
+  offset topic + per-table data topics + DLQ topic, and seed the connect-offsets
+  record). Today an in-VPC seeder Lambda does this. A new `SeedMode` parameter
+  (default `Lambda` = today's behavior, unchanged) adds an `External` mode in which
+  the deploying app does the prep **in-process** over the MSK IAM bootstrap before
+  the connectors are created — so a customer who cannot use AWS Lambda can run CDC
+  from an in-VPC host. In `External` mode the stack omits the seeder Lambda, its
+  role, and the `CdcStartPrepResource` custom resource, and selects a sink-connector
+  variant without the `CdcStartPrepResource` dependency; the two sink variants share
+  a single body via a YAML anchor so they cannot drift. The in-process Kafka client
+  (`kafka-python` + the MSK IAM SASL signer) is an **optional extra**
+  (`pip install ".[cdc-external]"`), so the default install and container image are
+  unchanged. **Everything is behind the default:** with `SeedMode=Lambda` (the
+  default) no app-side seed runs, no `SeedMode` is sent, and the set of deployed
+  resources is identical to before — this release only adds the machinery. The
+  security-group / IAM / VPC-co-location wiring that lets a real host reach the
+  cluster on port 9098 lands separately with the EC2 host. `PLUGIN_VERSION` is
+  unchanged (no connector/seeder artifact changed).
+
 ## v0.1.306
 
 ### Internal

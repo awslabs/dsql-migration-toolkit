@@ -211,6 +211,11 @@ class CdcStackDeployer:
         # for the connector artifacts) so the deployer can stage the template there.
         self.template_s3_bucket: Optional[str] = None
 
+    @property
+    def region(self) -> str:
+        """The AWS region this deployer targets (used by the in-process seed)."""
+        return self._region
+
     def _client(self, service_name: str) -> object:
         session = self._session or build_session(self._aws_profile)
         return session.client(service_name, region_name=self._region)
@@ -1450,6 +1455,85 @@ def run_cdc_infra_deploy(
         raise
 
 
+def _run_external_seed(
+    *,
+    stack_name: str,
+    bootstrap: str,
+    region: str,
+    params: CdcStackParams,
+    discovery: "CdcStackDiscovery",
+    watermark: Optional[Watermark],
+    src_name: str,
+    driver: "_StageDriver",
+    seed_fn: Optional[Callable[..., str]] = None,
+) -> None:
+    """Do the CDC Kafka prep in-process for SeedMode=External (the Lambda-free path).
+
+    Reads the same seed inputs the cdc-stack would have handed the in-VPC seeder
+    Lambda — the per-table topics + partition plan + DLQ + watermark — from the
+    connector params (``params.filled``) and the values carried forward on the
+    deployed stack (``discovery.current_parameters``: the partition plan +
+    ``MaxMessageBytes`` are set once at create), then calls
+    :func:`cdc_kafka_seed.seed_kafka_prep`. Fails LOUDLY (raises
+    :class:`CdcDeployError`) if the cluster is unreachable or the optional
+    ``cdc-external`` extra is missing — NEVER returns success on a failed seed,
+    which would let the connectors start with no seeded offset (a silent gap).
+
+    ``seed_fn`` is the injected test seam (defaults to the real seed function).
+    """
+    from dsql_migrator.core.cdc import CDC_DEFAULT_DLQ_TOPIC
+    from dsql_migrator.core.cdc_kafka_seed import CdcSeedError, seed_kafka_prep
+
+    filled = dict(params.filled)
+    current = discovery.current_parameters
+    # Prefer the freshly-computed connector params; fall back to the values the
+    # stack already carries (the partition plan + MaxMessageBytes are set at create
+    # and carried forward via UsePreviousValue, so they live on the deployed stack).
+    sink_topics_csv = filled.get("SinkTopics") or current.get("SinkTopics", "")
+    topic_prefix = filled.get("TopicPrefix") or current.get("TopicPrefix", "")
+    dlq_topic = (
+        filled.get("DlqTopicName")
+        or current.get("DlqTopicName")
+        or CDC_DEFAULT_DLQ_TOPIC
+    )
+    default_partitions = current.get("TopicDefaultPartitions", "1")
+    sink_topic_partitions_csv = current.get("SinkTopicPartitions", "")
+    max_message_bytes = current.get("MaxMessageBytes") or None
+    offset_topic = f"{stack_name}-debezium-source-offsets"
+    sink_topics = [t.strip() for t in sink_topics_csv.split(",") if t.strip()]
+
+    driver.log(
+        "SeedMode=External: preparing CDC topics + offset in-process over the MSK "
+        "IAM bootstrap (Lambda-free)."
+    )
+    run_seed = seed_fn or seed_kafka_prep
+    try:
+        outcome = run_seed(
+            bootstrap=bootstrap,
+            region=region,
+            offset_topic=offset_topic,
+            offset_partitions=1,
+            sink_topics=sink_topics,
+            default_partitions=default_partitions,
+            sink_topic_partitions_csv=sink_topic_partitions_csv,
+            max_message_bytes=max_message_bytes,
+            dlq_topic=dlq_topic,
+            connector_name=src_name,
+            topic_prefix=topic_prefix,
+            watermark=watermark,
+        )
+    except CdcSeedError as exc:
+        raise CdcDeployError(str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - surface any Kafka/network failure loudly
+        raise CdcDeployError(
+            "In-process CDC seed (SeedMode=External) failed before creating the "
+            f"connectors: {exc}. The app must run inside the cdc-stack VPC, be "
+            "admitted on MSK port 9098, and hold data-plane kafka-cluster IAM. No "
+            "connectors were created."
+        ) from exc
+    driver.log(f"In-process CDC prep complete (offset seed: {outcome}).")
+
+
 def run_cdc_start(
     handle,
     *,
@@ -1462,6 +1546,8 @@ def run_cdc_start(
     connector_timeout_seconds: float = 2700.0,
     poll_interval_seconds: float = 15.0,
     sleep: Callable[[float], None] = None,  # type: ignore[assignment]
+    seed_mode: str = "lambda",
+    seed_fn: Optional[Callable[..., str]] = None,
 ) -> None:
     """Start CDC with a SINGLE-pass update that creates both connectors at once.
 
@@ -1608,6 +1694,29 @@ def run_cdc_start(
                 *watermark_overrides,
                 *connector_overrides,
             ]
+            # SeedMode=External (Lambda-free): the app does the CDC Kafka prep
+            # IN-PROCESS here — pre-create the compacted offset topic + per-table
+            # data topics + DLQ topic, and seed the connect-offsets record from the
+            # watermark — BEFORE submit_update creates the connectors. This runs
+            # only in the else branch (so an idempotent both-running re-Start still
+            # skips it, doing zero Kafka I/O), and completes synchronously so the
+            # topics provably exist before either connector starts — replacing the
+            # in-VPC seeder Lambda's CdcStartPrepResource DependsOn with strict
+            # in-process topics-then-connectors ordering. The seed is itself
+            # idempotent (topic-already-exists swallowed; offset seed no-clobbered).
+            if seed_mode == "external":
+                start_pass.append(("SeedMode", "external"))
+                _run_external_seed(
+                    stack_name=stack_name,
+                    bootstrap=bootstrap,
+                    region=deployer.region,
+                    params=params,
+                    discovery=discovery,
+                    watermark=watermark,
+                    src_name=src_name,
+                    driver=driver,
+                    seed_fn=seed_fn,
+                )
             changed = deployer.submit_update(
                 stack_name, start_pass, template_body=template_body
             )

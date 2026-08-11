@@ -1,6 +1,6 @@
 [project]
 name = "mysql-dsql-migrator"
-version = "0.1.306"
+version = "0.1.307"
 description = "RDS/Aurora MySQL to Amazon Aurora DSQL migration toolkit"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,6 +14,18 @@ dependencies = [
     "pymysql==1.2.0",
     "sqlalchemy==2.0.50",
     "sqlglot==30.11.0",
+]
+
+[project.optional-dependencies]
+# In-process CDC Kafka client for the Lambda-free ("External") SeedMode. NOT a
+# core dependency: the default install / container image stays byte-identical for
+# the standard (Lambda) deployment. An operator opting into SeedMode=External on
+# an in-VPC host installs it explicitly:  pip install ".[cdc-external]".
+# Both wheels are pure-Python (py3-none-any) — no C-extension build step — and are
+# the exact versions vendored in the offset-seeder Lambda zip.
+cdc-external = [
+    "kafka-python==3.0.10",
+    "aws-msk-iam-sasl-signer-python==1.0.2",
 ]
 
 [project.scripts]
