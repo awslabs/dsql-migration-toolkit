@@ -99,3 +99,34 @@ def test_sink_output_refs_active_variant() -> None:
     assert out["Condition"] == "DeploySinkConnector"
     assert "Fn::If" in out["Value"]
     assert out["Value"]["Fn::If"][0] == "SeedByLambda"
+
+
+# --------------------------------------------------------------------------- #
+# Option 3 reachability: the Lambda-free EC2 host is admitted to MSK on 9098 by
+# subnet CIDR (mirroring the bastion rule), condition-gated + empty default so the
+# rule is absent (byte-identical) unless a host CIDR is supplied.
+# --------------------------------------------------------------------------- #
+def test_host_subnet_cidr_param_defaults_empty() -> None:
+    doc = _load_template()
+    p = doc["Parameters"]["HostSubnetCidr"]
+    assert p["Default"] == ""  # empty -> no ingress rule -> unchanged default deploy
+    assert "HasHostSubnetCidr" in doc["Conditions"]
+
+
+def test_host_diagnostics_ingress_is_9098_by_cidr_and_gated() -> None:
+    res = _load_template()["Resources"]
+    rule = res["ConnectorHostDiagnosticsIngress"]
+    assert rule["Type"] == "AWS::EC2::SecurityGroupIngress"
+    assert rule["Condition"] == "HasHostSubnetCidr"
+    props = rule["Properties"]
+    assert props["FromPort"] == 9098 and props["ToPort"] == 9098
+    assert props["IpProtocol"] == "tcp"
+    # By CIDR (the host subnet), NOT an SG id -> keeps the two stacks decoupled.
+    assert props["CidrIp"] == {"Ref": "HostSubnetCidr"}
+    assert props["GroupId"] == {"Fn::GetAtt": ["ConnectorSecurityGroup", "GroupId"]}
+
+
+def test_bastion_diagnostics_literal_cidr_unchanged() -> None:
+    # The pre-existing bastion rule's hardcoded /20 must NOT be touched or widened.
+    rule = _load_template()["Resources"]["ConnectorBastionDiagnosticsIngress"]
+    assert rule["Properties"]["CidrIp"] == "172.31.0.0/20"

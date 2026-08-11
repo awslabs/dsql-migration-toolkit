@@ -5,6 +5,29 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.308
+
+### Added
+
+- **A Lambda-free "EC2 + MSK only" deployment mode** for customers who cannot use AWS
+  Lambda, built on the `SeedMode=External` machinery from v0.1.307. A new deploy
+  template `deploy/cloudformation-ec2.yaml` runs the whole control plane (the web UI +
+  Full Load engine + in-process CDC seed) on a **single EC2 instance inside the CDC
+  VPC**, reached over **SSM port-forward** — no ALB, ACM certificate, or Cognito. State
+  (the job / session SQLite databases) lives on a **retained EBS volume** so it survives
+  instance replacement, instead of the S3 stores the Fargate stack uses. Because that
+  host runs inside the VPC it reaches MSK directly, so **"the host is the mode"**: the
+  EC2 host's user-data sets `DSQL_MIGRATOR_CDC_SEED_MODE=external` (a new config key) and
+  runs CDC Lambda-free, while the existing Fargate/local deployments leave it unset and
+  stay on the in-VPC seeder Lambda — unchanged. Supporting bits: a new
+  `DSQL_MIGRATOR_CDC_SEED_MODE` config key threaded into Start CDC (default `lambda`); an
+  additive, condition-gated `HostSubnetCidr` parameter on the CDC stack that admits the
+  host to MSK on port 9098 by subnet CIDR (empty default → no rule, so existing deploys
+  are unchanged); and the container image now bakes the `cdc-external` extra
+  (`kafka-python` + the MSK IAM SASL signer, both pure-Python and inert unless
+  `SeedMode=External`). The Fargate app-stack, the Lambda-mode default, and
+  `PLUGIN_VERSION` are all untouched.
+
 ## v0.1.307
 
 ### Added

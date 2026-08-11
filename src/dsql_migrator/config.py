@@ -225,6 +225,20 @@ class AppConfig(BaseModel):
             "DSQL_MIGRATOR_CDC_SECRET_KMS_KEY_ID."
         ),
     )
+    cdc_seed_mode: str = Field(
+        default="lambda",
+        description=(
+            "Who performs the CDC Kafka prep (pre-create topics + seed the "
+            "connect-offsets record) before the connectors are created. 'lambda' "
+            "(default) uses the in-VPC offset-seeder Lambda the cdc-stack deploys — "
+            "the behavior on Fargate and local runs. 'external' has the app do the "
+            "prep in-process over the MSK IAM bootstrap, for the Lambda-free "
+            "'EC2 + MSK only' host that runs INSIDE the cdc-stack VPC (its user-data "
+            "sets this). 'host is the mode': only that EC2 deployment sets "
+            "'external'; everything else stays 'lambda'. Config key: "
+            "DSQL_MIGRATOR_CDC_SEED_MODE."
+        ),
+    )
     log_level: str = Field(
         default="INFO",
         description="Logging level for the application.",
@@ -442,6 +456,9 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> AppConfig:
         values["cdc_deploy_role_arn"] = cdc_deploy_role_arn
     if (cdc_secret_kms := _read(source, "CDC_SECRET_KMS_KEY_ID")) is not None:
         values["cdc_secret_kms_key_id"] = cdc_secret_kms
+    if (cdc_seed_mode := _read(source, "CDC_SEED_MODE")) is not None:
+        # Normalize case so "External"/"EXTERNAL" match run_cdc_start's == "external".
+        values["cdc_seed_mode"] = cdc_seed_mode.lower()
     if (log_level := _read(source, "LOG_LEVEL")) is not None:
         values["log_level"] = log_level.upper()
     if (row_diff := _read(source, "VALIDATE_ROW_DIFF_SAMPLE_SIZE")) is not None:

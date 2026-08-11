@@ -5,6 +5,26 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.308
+
+### 追加 (Added)
+
+- **AWS Lambda を使えない顧客向けの「EC2 + MSK のみ」デプロイモード** — v0.1.307 の
+  `SeedMode=External` 機構の上に構築。新しいデプロイテンプレート
+  `deploy/cloudformation-ec2.yaml` が、コントロールプレーン全体(Web UI + Full Load エンジン +
+  インプロセス CDC シード)を **CDC VPC 内の単一 EC2 インスタンス**で実行し、**SSM ポート
+  フォワード**で接続します — ALB・ACM 証明書・Cognito は不要です。状態(job/session の SQLite)は
+  Fargate が使う S3 ストアではなく**保持される EBS ボリューム**に置くため、インスタンス置換後も
+  残ります。このホストは VPC 内にあるため MSK に直接到達でき、**「ホストがモードである」**:
+  EC2 ホストの user-data が `DSQL_MIGRATOR_CDC_SEED_MODE=external`(新しい設定キー)を設定して
+  Lambda なしで CDC を実行し、既存の Fargate/ローカルのデプロイはこれを設定しないため、そのまま
+  VPC 内シーダー Lambda を使います(変更なし)。補助要素: Start CDC に接続された新しい
+  `DSQL_MIGRATOR_CDC_SEED_MODE` 設定キー(既定 `lambda`);ホストを 9098 でサブネット CIDR により
+  MSK に許可する CDC スタックの追加・条件付き `HostSubnetCidr` パラメータ(空の既定値 → ルールなし、
+  既存デプロイは変更なし);コンテナイメージに `cdc-external` extra(`kafka-python` + MSK IAM SASL
+  署名者、いずれも pure-Python で `SeedMode=External` 以外では inert)を同梱。Fargate アプリ
+  スタック・Lambda 既定モード・`PLUGIN_VERSION` はすべて変更なし。
+
 ## v0.1.307
 
 ### 追加 (Added)

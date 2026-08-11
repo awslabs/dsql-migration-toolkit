@@ -3074,6 +3074,13 @@ def _start_cdc_deploy(
 
     template_body = _read_cdc_template_body()
 
+    # "Host is the mode": the in-VPC EC2 host sets DSQL_MIGRATOR_CDC_SEED_MODE=external
+    # so the app does the CDC Kafka prep in-process (Lambda-free); Fargate/local leave
+    # it unset -> "lambda" (the in-VPC seeder Lambda does the prep, unchanged).
+    from dsql_migrator.config import load_config as _load_config
+
+    seed_mode = _load_config().cdc_seed_mode
+
     def work(handle) -> None:
         run_cdc_start(
             handle,
@@ -3086,6 +3093,7 @@ def _start_cdc_deploy(
             # deployed and the source connector starts from the current binlog.
             watermark=watermark,
             template_body=template_body,
+            seed_mode=seed_mode,
         )
 
     _action = "start CDC connectors"

@@ -70,6 +70,19 @@ def test_load_config_reads_row_diff_sample_size() -> None:
     assert config.validate_row_diff_sample_size == 50
 
 
+def test_load_config_cdc_seed_mode_defaults_lambda() -> None:
+    # "Host is the mode": everything except the in-VPC EC2 host stays on the
+    # in-VPC seeder Lambda, so the default must be "lambda".
+    assert load_config(env={}).cdc_seed_mode == "lambda"
+
+
+def test_load_config_reads_cdc_seed_mode_lowercased() -> None:
+    # The EC2 host's user-data sets DSQL_MIGRATOR_CDC_SEED_MODE=external; case is
+    # normalized so run_cdc_start's == "external" comparison matches "External".
+    config = load_config(env={f"{ENV_PREFIX}CDC_SEED_MODE": "External"})
+    assert config.cdc_seed_mode == "external"
+
+
 def test_load_config_full_load_parallelism_defaults() -> None:
     config = load_config(env={})
     assert config.full_load_table_parallelism == 4

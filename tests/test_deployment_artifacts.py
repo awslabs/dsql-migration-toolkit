@@ -48,6 +48,15 @@ def test_dockerfile_installs_version_pinned_dependencies() -> None:
     assert "uv sync --frozen" in text
 
 
+def test_dockerfile_bakes_cdc_external_extra() -> None:
+    # The image must include the [cdc-external] extra (kafka-python + MSK IAM SASL
+    # signer) so the Lambda-free "EC2 + MSK only" host can run SeedMode=External.
+    # The wheels are pure-Python and imported lazily only under External, so they
+    # are inert for the default Fargate / Lambda-mode deployment.
+    text = _dockerfile_text()
+    assert "--extra cdc-external" in text
+
+
 def test_dockerfile_runs_nicegui_ui_entrypoint() -> None:
     text = _dockerfile_text()
     assert 'ENTRYPOINT ["mysql-dsql-migrator"]' in text

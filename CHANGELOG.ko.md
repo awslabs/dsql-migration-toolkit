@@ -5,6 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.308
+
+### 추가 (Added)
+
+- **AWS Lambda를 쓸 수 없는 고객을 위한 "EC2 + MSK만" 배포 모드** — v0.1.307의
+  `SeedMode=External` 기계장치 위에 구성. 새 배포 템플릿 `deploy/cloudformation-ec2.yaml`이
+  컨트롤 플레인 전체(웹 UI + Full Load 엔진 + 인프로세스 CDC 시드)를 **CDC VPC 내부의 단일
+  EC2 인스턴스**에서 실행하며, **SSM 포트포워드**로 접속합니다 — ALB·ACM 인증서·Cognito 없음.
+  상태(job/session SQLite)는 Fargate가 쓰는 S3 저장소 대신 **보존형 EBS 볼륨**에 두어 인스턴스
+  교체에도 살아남습니다. 이 호스트는 VPC 안에 있어 MSK에 직접 도달하므로 **"호스트가 곧
+  모드"**입니다: EC2 호스트의 user-data가 `DSQL_MIGRATOR_CDC_SEED_MODE=external`(새 설정 키)을
+  설정해 Lambda 없이 CDC를 실행하고, 기존 Fargate/로컬 배포는 이를 설정하지 않아 그대로 in-VPC
+  시더 Lambda를 씁니다(무변경). 부수 요소: Start CDC에 연결된 새 `DSQL_MIGRATOR_CDC_SEED_MODE`
+  설정 키(기본 `lambda`); 호스트를 9098 포트로 MSK에 서브넷 CIDR 기준으로 허용하는 CDC 스택의
+  추가·조건부 `HostSubnetCidr` 파라미터(빈 기본값 → 규칙 없음, 기존 배포 무변경); 컨테이너
+  이미지에 `cdc-external` extra(`kafka-python` + MSK IAM SASL 서명자, 둘 다 pure-Python이며
+  `SeedMode=External`이 아니면 inert)를 포함. Fargate 앱 스택·Lambda 기본 모드·`PLUGIN_VERSION`은
+  모두 무변경.
+
 ## v0.1.307
 
 ### 추가 (Added)

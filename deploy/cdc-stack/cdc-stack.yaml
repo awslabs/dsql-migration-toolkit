@@ -523,6 +523,16 @@ Parameters:
       the app to run inside this VPC (admitted on 9098, with data-plane
       kafka-cluster IAM) -- intended for the Lambda-free "EC2 + MSK only" host.
 
+  HostSubnetCidr:
+    Type: String
+    Default: ""
+    Description: >
+      Subnet CIDR of the Lambda-free "EC2 + MSK only" control-plane host, admitted
+      to MSK Serverless on 9098 so the app can do the CDC Kafka prep in-process
+      (SeedMode=External). Empty (default) adds NO ingress rule, so every Lambda-mode
+      / existing deploy is unchanged. Supplied by CIDR (not an SG id) to keep the
+      app-stack and cdc-stack teardown decoupled, mirroring the bastion rule.
+
   KafkaConnectVersion:
     Type: String
     Default: "3.7.x"
@@ -618,6 +628,12 @@ Conditions:
     Fn::Equals: [Ref: SeedMode, "Lambda"]
   SeedByExternal:
     Fn::Equals: [Ref: SeedMode, "External"]
+
+  # A Lambda-free EC2 host subnet CIDR was supplied -> add the 9098 ingress that lets
+  # that host reach MSK for in-process seeding. Empty default -> no rule (unchanged).
+  HasHostSubnetCidr:
+    Fn::Not:
+      - Fn::Equals: [Ref: HostSubnetCidr, ""]
 
   # Sink is created only when the bootstrap string is supplied AND DeploySink=true
   # (deploy the source first so it creates the topic, then the sink -- gotcha #11).
@@ -829,6 +845,27 @@ Resources:
       ToPort: 9098
       CidrIp: 172.31.0.0/20
       Description: Diagnostics - bastion subnet to MSK Serverless (IAM/TLS 9098).
+
+  # Lambda-free ("EC2 + MSK only", SeedMode=External) reachability: admit the in-VPC
+  # EC2 control-plane host to MSK on 9098 so the app can do the CDC Kafka prep
+  # in-process (create topics + seed the offset) instead of the seeder Lambda. Like
+  # the bastion rule above, allowed BY CIDR (the host's subnet), NOT by SG id, so the
+  # two stacks' teardown stays decoupled (an SG-id cross-reference previously blocked
+  # stack deletion). Condition-gated on a NON-EMPTY HostSubnetCidr with an empty
+  # default, so every existing deploy (and every Lambda-mode deploy) templates
+  # identically -- the rule simply does not exist unless a host CIDR is supplied.
+  ConnectorHostDiagnosticsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasHostSubnetCidr
+    Properties:
+      GroupId:
+        Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort: 9098
+      ToPort: 9098
+      CidrIp:
+        Ref: HostSubnetCidr
+      Description: Lambda-free EC2 host subnet to MSK Serverless (IAM/TLS 9098).
 
   ConnectorKafkaEgress:
     Type: AWS::EC2::SecurityGroupEgress
