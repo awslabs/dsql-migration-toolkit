@@ -1293,16 +1293,20 @@ Resources:
                   - kafka-cluster:WriteData
                   - kafka-cluster:DescribeTopicDynamicConfiguration
                   - kafka-cluster:AlterTopicDynamicConfiguration
-                # Two topic scopes: (1) the fixed compacted offsets topic (seeded on a
-                # gapless handoff); (2) the per-table data topics the seeder now
+                # Three topic scopes: (1) the fixed compacted offsets topic (seeded on
+                # a gapless handoff); (2) the per-table data topics the seeder now
                 # PRE-CREATES so both connectors deploy in parallel -- scoped to this
-                # capture's Debezium topic.prefix (<TopicPrefix>.<db>.<table>). Without
-                # (2) CreateTopic on the data topics is denied and every start fails.
+                # capture's Debezium topic.prefix (<TopicPrefix>.<db>.<table>); (3) the
+                # sink DLQ topic, which the seeder also PRE-CREATES at MaxMessageBytes
+                # (its name is DlqTopicName, NOT under TopicPrefix). Without (2)/(3)
+                # CreateTopic on those is denied and every start fails.
                 Resource:
                   - Fn::Sub: >-
                       arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/${AWS::StackName}-msk/*/${AWS::StackName}-debezium-source-offsets
                   - Fn::Sub: >-
                       arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/${AWS::StackName}-msk/*/${TopicPrefix}.*
+                  - Fn::Sub: >-
+                      arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/${AWS::StackName}-msk/*/${DlqTopicName}
 
   OffsetSeederFunction:
     Type: AWS::Lambda::Function
@@ -1409,6 +1413,13 @@ Resources:
       # worker's producer uses -- otherwise a >1 MiB change event RecordTooLarges.
       MaxMessageBytes:
         Ref: MaxMessageBytes
+      # Pre-create the sink DLQ topic at the same max.message.bytes: a record the
+      # sink dead-letters on DSQL's 1 MiB per-value limit is itself >1 MiB, so a DLQ
+      # topic left at the broker's ~1 MiB default rejects the quarantine
+      # (RecordTooLargeException) and kills the sink task. Without this the DLQ topic
+      # is lazily auto-created by Kafka Connect at the 1 MiB default.
+      DlqTopicName:
+        Ref: DlqTopicName
       WatermarkBinlogFile:
         Ref: WatermarkBinlogFile
       WatermarkBinlogPos:

@@ -497,6 +497,44 @@ def test_seed_data_topics_use_per_topic_partitions_and_max_bytes(seeder_env) -> 
     assert by_name["dsqlcdc.app.cold"][1].get("max.message.bytes") == "4194304"
 
 
+def test_seed_pre_creates_dlq_topic_with_raised_max_bytes(seeder_env) -> None:
+    # The sink dead-letters a record DSQL rejects on its 1 MiB per-value limit; that
+    # record is itself >1 MiB, so the DLQ topic must accept a message larger than the
+    # broker's ~1 MiB default or the quarantine RecordTooLarge's and the task dies.
+    # The seeder must pre-create the DLQ topic at the same max.message.bytes as the
+    # data topics (Kafka Connect would otherwise lazily auto-create it at 1 MiB).
+    module, recorder = seeder_env
+    recorder.topic_partitions = set()
+    module._seed(
+        _props(
+            WatermarkBinlogFile="", WatermarkBinlogPos="",  # CDC-only: topics only
+            SinkTopics="dsqlcdc.app.orders",
+            TopicPartitions="1",
+            MaxMessageBytes="4194304",
+            DlqTopicName="dsql-sink-dlq",
+        )
+    )
+    by_name = {name: (parts, cfg) for name, parts, cfg in recorder.created_topics}
+    assert "dsql-sink-dlq" in by_name, "DLQ topic was not pre-created"
+    assert by_name["dsql-sink-dlq"][1].get("max.message.bytes") == "4194304"
+
+
+def test_seed_skips_dlq_topic_when_name_absent(seeder_env) -> None:
+    # No DlqTopicName supplied (older param set / DLQ disabled): pre-creation is a
+    # no-op and must not raise, so the seeder stays backward-compatible.
+    module, recorder = seeder_env
+    recorder.topic_partitions = set()
+    module._seed(
+        _props(
+            WatermarkBinlogFile="", WatermarkBinlogPos="",
+            SinkTopics="dsqlcdc.app.orders", TopicPartitions="1",
+            MaxMessageBytes="4194304",
+        )
+    )
+    created = {name for name, _p, _c in recorder.created_topics}
+    assert not any("dlq" in n.lower() for n in created)
+
+
 def test_seed_pre_creates_data_topics_before_seeding(seeder_env) -> None:
     # A gapless handoff (watermark present) both pre-creates the per-table topics
     # AND seeds the offset.

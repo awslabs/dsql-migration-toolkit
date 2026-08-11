@@ -5,6 +5,26 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.304
+
+### 수정
+
+- **CDC sink가 초과 크기 행을 격리(dead-letter)할 때 죽던 문제를 고쳤습니다.** sink가
+  DSQL의 1 MiB 값 한계를 넘어 거부된 변경 이벤트를 격리하는데, 그 레코드 자체가 1 MiB보다
+  큽니다. 그런데 DLQ Kafka 토픽이 Kafka Connect에 의해 브로커 기본값(~1 MiB)으로 자동
+  생성되어, DLQ produce가 `RecordTooLargeException`으로 실패하고 sink **task가 죽었습니다**
+  (`Stopped — a task is not running`) — poison 행을 적용도 격리도 못 하는 상태. 그 뒤의
+  같은 파티션 이벤트가 전부 멈췄습니다. (라이브에서 `product_media.full_description`의 한계
+  초과 행 하나가 sink 전체를 세우는 것으로 확인.)
+
+  offset-seeder 커스텀 리소스(`CdcStartPrepResource`)가 이제 **sink DLQ 토픽을**
+  데이터 토픽과 동일한 `max.message.bytes`(기본 4 MiB, MSK Serverless 최대 8 MiB)로
+  **사전 생성**합니다. 그래서 1~4 MiB 격리 레코드가 들어갈 곳이 생기고, sink는 poison 행만
+  격리한 뒤 스트리밍을 계속합니다. seeder의 `CreateTopic` IAM 범위도 DLQ 토픽 이름을
+  포함하도록 넓혔습니다(DLQ 이름은 Debezium topic prefix 아래가 아님). 반영하려면 CDC
+  커넥터 재배포(plugin `v27`)가 필요합니다. 이미 실행 중인 스택은 기존 DLQ 토픽의
+  `max.message.bytes`를 직접 올려 즉시 복구할 수 있습니다.
+
 ## v0.1.303
 
 ### 추가

@@ -230,6 +230,42 @@ def _ensure_data_topics(
     )
 
 
+def _ensure_dlq_topic(bootstrap, region, dlq_topic, max_message_bytes):
+    """Pre-create the sink's dead-letter queue topic with a raised max.message.bytes.
+
+    The sink dead-letters a change event that DSQL permanently rejects -- including a
+    value OVER DSQL's 1 MiB per-value limit. That rejected record is itself >1 MiB, so
+    the DLQ topic must accept a message larger than the broker's ~1 MiB default or the
+    DLQ produce fails with RecordTooLargeException and the sink TASK DIES (it can
+    neither apply nor quarantine the row). Kafka Connect's DeadLetterQueueReporter
+    otherwise auto-creates the DLQ topic lazily at the broker default (~1 MiB), so we
+    pre-create it here at the same max.message.bytes the data topics use (matching the
+    band a rejected value can occupy). Idempotent: an existing DLQ topic is left as-is
+    (its config was already altered / created); replication_factor=-1 uses the broker
+    default (required for MSK Serverless).
+    """
+    if not dlq_topic:
+        print("no DlqTopicName supplied -> skipping DLQ topic pre-creation")
+        return
+    topic_configs = None
+    if max_message_bytes:
+        topic_configs = {"max.message.bytes": str(int(max_message_bytes))}
+    admin = KafkaAdminClient(bootstrap_servers=bootstrap, **_iam_sasl_args(region))
+    try:
+        admin.create_topics(
+            [NewTopic(name=dlq_topic, num_partitions=1,
+                      replication_factor=-1, topic_configs=topic_configs)]
+        )
+        print(
+            f"pre-created DLQ topic {dlq_topic} "
+            f"(max.message.bytes={max_message_bytes})"
+        )
+    except TopicAlreadyExistsError:
+        print(f"DLQ topic {dlq_topic} already exists -- reusing")
+    finally:
+        admin.close()
+
+
 def _read_existing_offset(bootstrap, region, topic, key_json):
     """Scan the compacted offsets topic for the latest value of ``key_json``.
 
@@ -392,6 +428,14 @@ def _seed(props):
         bootstrap, region, props.get("SinkTopics"), data_partitions,
         partitions_map_csv=props.get("SinkTopicPartitions"),
         max_message_bytes=props.get("MaxMessageBytes"),
+    )
+    # Pre-create the sink DLQ topic with the SAME raised max.message.bytes as the
+    # data topics: a record the sink dead-letters on the DSQL 1 MiB per-value limit
+    # is itself >1 MiB, so a DLQ topic left at the broker's ~1 MiB default rejects
+    # the quarantine (RecordTooLargeException) and KILLS the sink task. Pre-creating
+    # it here forestalls Kafka Connect's lazy auto-create at the 1 MiB default.
+    _ensure_dlq_topic(
+        bootstrap, region, props.get("DlqTopicName"), props.get("MaxMessageBytes")
     )
     _ensure_compact_topic(bootstrap, region, topic, partitions)
 

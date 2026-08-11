@@ -1633,6 +1633,9 @@ def test_cdc_start_prep_passes_partition_map_and_max_bytes(cdc_template: dict) -
     assert props["SinkTopicPartitions"] == {"Ref": "SinkTopicPartitions"}
     assert props["MaxMessageBytes"] == {"Ref": "MaxMessageBytes"}
     assert "SinkTopicPartitions" in cdc_template["Parameters"]
+    # The seeder also pre-creates the sink DLQ topic at MaxMessageBytes so a >1 MiB
+    # dead-lettered record isn't RecordTooLarge'd against a 1 MiB auto-created DLQ.
+    assert props["DlqTopicName"] == {"Ref": "DlqTopicName"}
 
 
 def test_cdc_stack_seeder_iam_covers_per_table_topics(cdc_template: dict) -> None:
@@ -1648,6 +1651,7 @@ def test_cdc_stack_seeder_iam_covers_per_table_topics(cdc_template: dict) -> Non
     blob = json.dumps(resources)
     assert "debezium-source-offsets" in blob  # the fixed offsets topic
     assert "${TopicPrefix}." in blob           # the per-table data topics
+    assert "${DlqTopicName}" in blob           # the pre-created sink DLQ topic
 
 
 def test_cdc_stack_declares_watermark_and_seeder_params(cdc_template: dict) -> None:

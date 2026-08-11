@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.304
+
+### Fixed
+
+- **The CDC sink no longer dies when it dead-letters an oversized row.** When the sink
+  quarantines a change event that DSQL rejects on its 1 MiB per-value limit, that
+  record is itself larger than 1 MiB — but the DLQ Kafka topic was being auto-created
+  by Kafka Connect at the broker's ~1 MiB default, so the DLQ produce failed with
+  `RecordTooLargeException` and the sink **task died** (`Stopped — a task is not
+  running`), unable to either apply *or* quarantine the poison row. Every event behind
+  it on that partition then stalled. (Seen live: a `product_media.full_description`
+  row over the limit stopped the whole sink.)
+
+  The offset-seeder custom resource (`CdcStartPrepResource`) now **pre-creates the
+  sink DLQ topic** at the same `max.message.bytes` as the data topics (4 MiB by
+  default, up to the 8 MiB MSK Serverless max), so a dead-lettered 1–4 MiB record has
+  somewhere to land and the sink isolates the poison row and keeps streaming. The
+  seeder's `CreateTopic` IAM scope is widened to cover the DLQ topic name (it is not
+  under the Debezium topic prefix). Requires a CDC-connector redeploy (plugin `v27`)
+  to take effect; an already-running stack can be unblocked by raising the existing
+  DLQ topic's `max.message.bytes` directly.
+
 ## v0.1.303
 
 ### Added

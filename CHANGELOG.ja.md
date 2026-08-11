@@ -5,6 +5,28 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.304
+
+### 修正
+
+- **CDC シンクがサイズ超過の行を隔離(dead-letter)する際に停止する問題を修正しました。**
+  シンクは DSQL の 1 MiB 値上限を超えて拒否された変更イベントを隔離しますが、そのレコード
+  自体が 1 MiB を超えています。ところが DLQ の Kafka トピックが Kafka Connect によって
+  ブローカー既定値(~1 MiB)で自動作成されていたため、DLQ への produce が
+  `RecordTooLargeException` で失敗し、シンクの**タスクが停止**しました
+  (`Stopped — a task is not running`)— poison 行を適用も隔離もできない状態です。その後、
+  同じパーティションの後続イベントがすべて滞留しました。(ライブで
+  `product_media.full_description` の上限超過行 1 件がシンク全体を止めることを確認。)
+
+  offset-seeder カスタムリソース(`CdcStartPrepResource`)が、**シンクの DLQ トピックを**
+  データトピックと同じ `max.message.bytes`(既定 4 MiB、MSK Serverless 最大 8 MiB)で
+  **事前作成**するようになりました。これにより 1〜4 MiB の隔離レコードの受け皿ができ、
+  シンクは poison 行だけを隔離してストリーミングを継続します。seeder の `CreateTopic` IAM
+  スコープも DLQ トピック名を含むよう拡張しました(DLQ 名は Debezium の topic prefix 配下
+  ではないため)。反映には CDC コネクターの再デプロイ(plugin `v27`)が必要です。すでに稼働
+  中のスタックは、既存の DLQ トピックの `max.message.bytes` を直接引き上げることで即時に
+  復旧できます。
+
 ## v0.1.303
 
 ### 追加

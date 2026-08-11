@@ -51,6 +51,16 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v27 rebuilds the offset-seeder Lambda zip so CdcStartPrepResource ALSO pre-creates
+#    the sink DLQ topic (DlqTopicName) at MaxMessageBytes. A record the sink
+#    dead-letters on DSQL's 1 MiB per-value limit is itself >1 MiB, but Kafka Connect
+#    lazily auto-creates the DLQ topic at the broker's ~1 MiB default -- so the DLQ
+#    produce RecordTooLarge'd and the sink TASK DIED ("Stopped -- a task is not
+#    running"), unable to either apply OR quarantine the poison row. Pre-creating the
+#    DLQ topic at the same max.message.bytes as the data topics forestalls that. Also
+#    widens the seeder's CreateTopic IAM scope to cover DlqTopicName (it is not under
+#    TopicPrefix). Seeder-zip + template (CdcStartPrepResource prop + seeder IAM)
+#    change; neither connector plugin jar changed.
 # v26 rebuilds the DSQL sink jar so a quarantine log line records the failed row's
 #    PRIMARY KEY (`... | pk: id=14`) alongside the reason. A quarantined event is
 #    never retried automatically -- the sink does not re-consume the offset and
@@ -235,7 +245,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v26"
+PLUGIN_VERSION = "v27"
 
 
 class S3ProvisionError(RuntimeError):
