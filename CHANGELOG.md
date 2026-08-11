@@ -9,7 +9,7 @@ All notable changes to this project are recorded here. This project follows
 
 ### Added
 
-- **The activity log (audit trail) can now be sent to CloudWatch Logs on ECS**, via a
+- **The activity log can now be sent to CloudWatch Logs on ECS**, via a
   new deploy parameter `EnableActivityLogCloudWatch` (default off). The activity log is
   a rotating file on the task's ephemeral `/tmp`, so it is lost when a Fargate task is
   replaced (a redeploy, crash, or rebalance). When this is enabled the app also mirrors

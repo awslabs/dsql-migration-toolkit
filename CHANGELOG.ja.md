@@ -9,7 +9,7 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 
 ### 追加
 
-- **アクティビティログ(監査証跡)を ECS で CloudWatch Logs に送れるようになりました。**
+- **アクティビティログ(activity log)を ECS で CloudWatch Logs に送れるようになりました。**
   新しいデプロイパラメータ `EnableActivityLogCloudWatch`(既定 off)で有効化します。
   アクティビティログはタスクの一時(ephemeral)`/tmp` 上のローテーションファイルなので、
   Fargate タスクが置き換わる(再デプロイ・クラッシュ・リバランス)と失われます。これを
