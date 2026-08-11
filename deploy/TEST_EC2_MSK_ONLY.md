@@ -1,5 +1,7 @@
 # Test procedure — Lambda-free "EC2 + MSK only" mode (SeedMode=External)
 
+_Language: **English** | [한국어](TEST_EC2_MSK_ONLY.ko.md)_
+
 Hands-on validation of Option ③: run the whole control plane on a single in-VPC
 EC2 host (`deploy/cloudformation-ec2.yaml`), reach it over SSM port-forward, and
 drive a CDC start that seeds Kafka **in-process** (no offset-seeder Lambda).
