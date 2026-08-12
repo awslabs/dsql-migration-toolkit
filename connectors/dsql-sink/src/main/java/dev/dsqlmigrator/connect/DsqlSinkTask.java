@@ -609,7 +609,26 @@ public class DsqlSinkTask extends SinkTask {
         sql == null
             ? cause.getMessage() + pk
             : cause.getMessage() + pk + " | sql: " + sql;
-    quarantine(record, cause, reason);
+    quarantine(record, cause, sqlStateTag(cause) + reason);
+  }
+
+  /**
+   * A leading {@code "sqlstate=<state> "} tag (or {@code ""} when the driver gave
+   * no SQLSTATE). Placed at the FRONT of the quarantine reason so it survives the
+   * Python parser's fixed-length truncation and is the first {@code sqlstate=}
+   * token the parser sees -- that lets the control plane classify a permanent
+   * rejection into a source-schema-drift kind (42703 = a source ADD COLUMN the
+   * target lacks, 23502 = a source DROP COLUMN of a target NOT NULL column,
+   * 42804/22xxx = a source TYPE CHANGE) purely from the CloudWatch log line, with
+   * no extra probe. pgjdbc's {@code getMessage()} does not include the SQLSTATE, so
+   * this is the only place it reaches the log; it carries no row values (Property 7).
+   *
+   * <p>Package-private + static so a unit test can assert the tag shape without a
+   * live JDBC connection (mirrors {@link #transientRetryException}).
+   */
+  static String sqlStateTag(SQLException cause) {
+    String state = cause.getSQLState();
+    return (state == null || state.isEmpty()) ? "" : "sqlstate=" + state + " ";
   }
 
   /**

@@ -78,6 +78,28 @@ class DsqlSinkTaskTest {
   }
 
   @Test
+  void sqlStateTagPrefixesTheStateForDriftClassification() {
+    // The quarantine reason is prefixed with "sqlstate=<state> " so the control
+    // plane can classify a source-schema-drift rejection (42703 = ADD COLUMN,
+    // 23502 = DROP COLUMN of a NOT NULL target col, 42804 = TYPE CHANGE) purely
+    // from the CloudWatch log line -- pgjdbc's getMessage() does not carry it.
+    assertEquals("sqlstate=42703 ", DsqlSinkTask.sqlStateTag(
+        new SQLException("column \"new_col\" does not exist", "42703")));
+    assertEquals("sqlstate=23502 ", DsqlSinkTask.sqlStateTag(
+        new SQLException("not null violation", "23502")));
+    assertEquals("sqlstate=42804 ", DsqlSinkTask.sqlStateTag(
+        new SQLException("datatype mismatch", "42804")));
+  }
+
+  @Test
+  void sqlStateTagIsEmptyWhenDriverGaveNoState() {
+    // A null/empty SQLSTATE (e.g. "This connection has been closed.") must yield no
+    // tag rather than "sqlstate=null ", so the parser does not mis-read a code.
+    assertEquals("", DsqlSinkTask.sqlStateTag(new SQLException("connection closed")));
+    assertEquals("", DsqlSinkTask.sqlStateTag(new SQLException("empty state", "")));
+  }
+
+  @Test
   void transientRetryExceptionIsRetriable() {
     // A transient SQLException must surface as a Kafka Connect RetriableException so
     // WorkerSinkTask redelivers the batch instead of killing the task. Assert on

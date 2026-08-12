@@ -5,6 +5,27 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.313
+
+### Added
+
+- **CDC now detects and surfaces a source schema change (DDL) instead of leaving it
+  as an opaque rising dead-letter count.** CDC does not propagate DDL: when the
+  source runs `ALTER TABLE`, the target is unchanged and the first row written under
+  the new schema is rejected by Aurora DSQL and quarantined to the DLQ. The sink now
+  prefixes each quarantine log line with `sqlstate=<state>`, and the control plane
+  classifies that SQLSTATE into a drift kind — `42703` → a column was **added** at the
+  source (the target lacks it), `23502` → a column was **dropped** at the source (the
+  target still requires it), `42804` / class `22xxx` → a column's **type changed**
+  incompatibly. The DLQ panel gains a "Source schema change detected" banner naming
+  the affected table(s), what changed, and the manual runbook (apply the matching
+  change to the target schema, then per-table Reload to backfill the set-aside rows;
+  stop CDC first for a drop/retype). **Detection only** — the tool never auto-alters
+  the target (Property 6, no silent schema mutation), and an ordinary poison row
+  (no drift SQLSTATE) is not surfaced as drift. This bumps `PLUGIN_VERSION` to `v28`
+  (sink jar change, the `sqlstate=` prefix); the Debezium/seeder artifacts are
+  unchanged, and a clean stream shows no banner.
+
 ## v0.1.312
 
 ### Fixed
@@ -22,6 +43,7 @@ All notable changes to this project are recorded here. This project follows
   dismissable "CDC infrastructure deleted" completion notice. A still-present stack
   (any state, including `DELETE_FAILED`) or any ambiguous/errored read leaves the
   failed banner untouched, so a genuinely still-billing failure is never hidden.
+
 ## v0.1.311
 
 ### Fixed

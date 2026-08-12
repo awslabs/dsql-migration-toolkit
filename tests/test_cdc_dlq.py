@@ -5,6 +5,7 @@
 
 from datetime import datetime, timezone
 
+from dsql_migrator.core.cdc import SchemaDriftKind
 from dsql_migrator.core.cdc_dlq import parse_dlq_log_message
 
 
@@ -96,3 +97,46 @@ def test_parse_keeps_withheld_natural_key_pk_in_message() -> None:
     assert rec is not None
     assert rec.table == "accounts"
     assert "pk: email=<withheld>" in rec.message
+
+
+def test_parse_reads_leading_sqlstate_tag_and_derives_drift_kind() -> None:
+    # v28 sink prefixes the quarantine reason with "sqlstate=<state> " so the
+    # parser can classify the drift. 42703 = a source ADD COLUMN the target lacks.
+    msg = (
+        "Quarantined record to DLQ (topic=dsqlcdc.shop.orders, partition=0, "
+        'offset=42): sqlstate=42703 ERROR: column "promo_code" does not exist '
+        '| pk: id=7 | sql: INSERT INTO "shop"."orders" ("id", "promo_code") '
+        'VALUES (?, ?) ON CONFLICT ("id") DO UPDATE SET "promo_code" = '
+        'EXCLUDED."promo_code"'
+    )
+    rec = parse_dlq_log_message(msg)
+    assert rec is not None
+    assert rec.table == "orders"
+    assert rec.error_code == "42703"
+    # The drift kind is derived from the SQLSTATE, not stored.
+    assert rec.drift_kind is SchemaDriftKind.ADD_COLUMN
+
+
+def test_parse_leading_sqlstate_takes_precedence_over_later_number() -> None:
+    # The tag is at the FRONT so it is the first sqlstate= token even when the SQL
+    # template or message later mentions other digits; 23502 = DROP of a NOT NULL col.
+    msg = (
+        "Quarantined record to DLQ (topic=a.b.line_items, partition=2, offset=99): "
+        "sqlstate=23502 ERROR: null value in column violates not-null constraint"
+    )
+    rec = parse_dlq_log_message(msg)
+    assert rec is not None
+    assert rec.error_code == "23502"
+    assert rec.drift_kind is SchemaDriftKind.DROP_COLUMN
+
+
+def test_parse_ordinary_poison_row_has_no_drift_kind() -> None:
+    # An oversized-value rejection carries no SQLSTATE tag -> not schema drift.
+    msg = (
+        "Quarantined record to DLQ (topic=dsqlcdc.shop.media, partition=0, offset=3): "
+        "Value for column 'blob' exceeds DSQL's 1048576-byte limit; quarantined."
+    )
+    rec = parse_dlq_log_message(msg)
+    assert rec is not None
+    assert rec.error_code is None
+    assert rec.drift_kind is None

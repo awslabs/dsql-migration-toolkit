@@ -1334,6 +1334,34 @@ def cdc_dlq_summary(migration_state, log_key: str):
     )
 
 
+def cdc_schema_drift_summary(migration_state, log_key: str) -> list:
+    """Group the CDC DLQ records that reveal a source schema change.
+
+    Reads the SAME CDC-filtered records as :func:`cdc_dlq_summary` (so the drift
+    banner and the DLQ depth agree), classifies each record's SQLSTATE via
+    :func:`~dsql_migrator.core.cdc.classify_schema_drift`, and returns one
+    :class:`SchemaDriftSummary` per (table, kind) that had at least one drift
+    record. Ordinary poison rows (no drift kind) are skipped, so an empty list
+    means "no source DDL detected". Built from the whole error log (not the
+    per-poll delta) so the count is cumulative and survives a restored session.
+    Best-effort and pure; never raises into the poller.
+    """
+    from dsql_migrator.core.cdc import classify_schema_drift
+    from dsql_migrator.core.models import SchemaDriftSummary
+
+    counts: dict[tuple[str, str], int] = {}
+    for record in cdc_dlq_records(migration_state, log_key):
+        kind = classify_schema_drift(getattr(record, "error_code", None))
+        if kind is None:
+            continue
+        key = (record.table, kind.value)
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        SchemaDriftSummary(table=table, kind=kind, count=count)
+        for (table, kind), count in sorted(counts.items())
+    ]
+
+
 def _apply_cdc_status(migration_state, fetched) -> None:
     """Build the CDC status view from a fetched ``(statuses, health)`` and store it.
 
@@ -1444,7 +1472,13 @@ def _apply_cdc_status(migration_state, fetched) -> None:
     # on a clean stream, so the panel always renders once streaming ("0 quarantined")
     # rather than silently disappearing.
     dlq_depth = error_summary.total_errors if error_summary is not None else 0
-    view = build_cdc_status_view(adjusted, error_summary, dlq_depth=dlq_depth)
+    # Classify the CDC DLQ into source-schema-drift groups (empty when none), so the
+    # monitor can flag "the source ran DDL the target hasn't caught up to" instead of
+    # an opaque quarantine count. Same records as the depth badge (cdc_dlq_records).
+    schema_drift = cdc_schema_drift_summary(migration_state, job_id)
+    view = build_cdc_status_view(
+        adjusted, error_summary, dlq_depth=dlq_depth, schema_drift=schema_drift
+    )
     migration_state.set_cdc_status_view(view)
     # Aggregate throughput so the UI can show "no changes flowing" (cutover
     # signal) without re-deriving it on every render. The prior summary is passed in

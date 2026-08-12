@@ -4660,6 +4660,69 @@ def _dlq_panel_tone(health, *, sink_stalled: bool = False) -> str:
         return "success" if health.depth == 0 and not sink_stalled else "info"
     return _DLQ_LEVEL_TONE.get(health.level, "info")
 
+# Source-schema-drift kinds (core.cdc.SchemaDriftKind values) -> a human label and
+# the reason DSQL rejected the row. Detection-only: CDC never propagates DDL, so a
+# source ALTER leaves the target behind and its rows dead-letter. The recovery is
+# always operator-driven (the tool never auto-alters the target -- Property 6).
+_DRIFT_LABELS: dict[str, tuple[str, str]] = {
+    "add-column": (
+        "column added at the source",
+        "the source added a column the target table does not have, so DSQL rejected "
+        "the new-schema rows (SQLSTATE 42703)",
+    ),
+    "drop-column": (
+        "column dropped at the source",
+        "the source dropped a column the target still requires (NOT NULL), so DSQL "
+        "rejected the rows (SQLSTATE 23502)",
+    ),
+    "type-change": (
+        "column type changed at the source",
+        "the source changed a column's type incompatibly, so DSQL rejected the rows "
+        "(SQLSTATE 42804 / 22xxx)",
+    ),
+}
+
+
+def _render_cdc_schema_drift_banner(ui, status_view: LoadStatusView) -> None:
+    """Flag source DDL the target has not caught up to (from the classified DLQ).
+
+    CDC does not propagate DDL: when the source alters a table, the first row under
+    the new schema is rejected by DSQL and dead-lettered. The control plane derives
+    the drift kind from the quarantine SQLSTATE (see ``classify_schema_drift``); this
+    band names the affected table(s) + what changed and points at the manual
+    recovery, so a reader is not left to reverse-engineer a rising DLQ count. Renders
+    nothing when no drift was detected (the common case), so it is inert on a healthy
+    stream.
+    """
+    drift = getattr(status_view, "schema_drift", None) or []
+    if not drift:
+        return
+    bg, border, icon_color, _icon = NOTICE_STYLE.get("warning", NOTICE_STYLE["info"])
+    with ui.column().classes(  # type: ignore[attr-defined]
+        f"w-full gap-1 rounded-md border {border} {bg} p-2"
+    ):
+        with ui.row().classes("w-full items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
+            ui.icon("schema").classes(f"{icon_color} text-lg")  # type: ignore[attr-defined]
+            ui.label("Source schema change detected").classes(  # type: ignore[attr-defined]
+                "text-sm font-semibold text-gray-900"
+            )
+        for group in drift:
+            label, why = _DRIFT_LABELS.get(
+                group.kind, (group.kind, "the source schema changed")
+            )
+            noun = "record" if group.count == 1 else "records"
+            ui.label(  # type: ignore[attr-defined]
+                f"{group.table}: {label} — {why}. {group.count} {noun} dead-lettered."
+            ).classes("text-xs text-gray-800")
+        # One shared runbook line: CDC cannot apply the DDL for you (Property 6).
+        ui.label(  # type: ignore[attr-defined]
+            "CDC does not replicate DDL. Apply the matching change to the target "
+            "schema (e.g. ALTER TABLE), then use per-table Reload to backfill the "
+            "rows that were set aside. Stop CDC first if a column was dropped or "
+            "retyped, since those may require recreating the table."
+        ).classes("text-xs italic text-gray-600")
+
+
 def _render_cdc_dlq_panel(
     ui, migration_state, job_manager, status_view: LoadStatusView, on_refresh=None
 ) -> None:
@@ -4715,6 +4778,7 @@ def _render_cdc_dlq_panel(
                 "A zero count is expected while the sink is stalled — it never reaches "
                 "a record to quarantine, so this is not evidence that nothing was lost."
             ).classes("text-xs font-semibold text-red-700")
+        _render_cdc_schema_drift_banner(ui, status_view)
         _render_cdc_dlq_breakdown(ui, status_view)
         # CDC commonly has no Full Load job_id this session, so key the record list /
         # download off the same stable CDC key the fold used (cdc_error_log_key) --

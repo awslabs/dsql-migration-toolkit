@@ -3151,6 +3151,64 @@ def test_apply_cdc_status_folds_dlq_errors_into_error_log_and_depth() -> None:
     assert state.error_log.summary("job-cdc").errors_by_table == {"orders": 2}
 
 
+def test_apply_cdc_status_surfaces_schema_drift_from_sqlstate() -> None:
+    # A source ADD COLUMN / TYPE CHANGE shows up as quarantines carrying the
+    # telltale SQLSTATE; _apply_cdc_status must classify them into the view's
+    # schema_drift groups (per table + kind) so the monitor can flag source DDL,
+    # while an ordinary poison row (no drift code) is NOT surfaced as drift.
+    from dsql_migrator.core.cdc import (
+        CdcConnectorError,
+        ConnectorState,
+        ConnectorStatus,
+    )
+    from dsql_migrator.core.msk_connect_controller import ConnectorHealth
+    from dsql_migrator.ui.data_migration import _apply_cdc_status
+
+    state = DataMigrationState()
+    state.job_id = "job-cdc"
+    statuses = [ConnectorStatus(name="sink", state=ConnectorState.RUNNING)]
+    health = {"sink": ConnectorHealth(running_tasks=1, errored_tasks=0)}
+    dlq_errors = [
+        CdcConnectorError(table="orders", message="add col", error_code="42703"),
+        CdcConnectorError(table="orders", message="add col", error_code="42703"),
+        CdcConnectorError(table="line_items", message="bad type", error_code="22001"),
+        # An ordinary poison row (oversized value): no SQLSTATE -> not drift.
+        CdcConnectorError(table="media", message="too big", error_code=None),
+    ]
+
+    _apply_cdc_status(state, (statuses, health, dlq_errors))
+
+    view = state.cdc_status_view
+    assert view is not None
+    # All four count toward DLQ depth, but only the three drift rows are grouped.
+    assert view.dlq_depth == 4
+    groups = {(g.table, g.kind): g.count for g in view.schema_drift}
+    assert groups == {
+        ("orders", "add-column"): 2,
+        ("line_items", "type-change"): 1,
+    }
+    # The non-drift poison row is absent from the drift groups.
+    assert not any(g.table == "media" for g in view.schema_drift)
+
+
+def test_apply_cdc_status_no_drift_on_clean_stream() -> None:
+    # No quarantines -> empty schema_drift (banner stays inert).
+    from dsql_migrator.core.cdc import ConnectorState, ConnectorStatus
+    from dsql_migrator.core.msk_connect_controller import ConnectorHealth
+    from dsql_migrator.ui.data_migration import _apply_cdc_status
+
+    state = DataMigrationState()
+    state.job_id = "job-cdc"
+    statuses = [ConnectorStatus(name="sink", state=ConnectorState.RUNNING)]
+    health = {"sink": ConnectorHealth(running_tasks=1, errored_tasks=0)}
+
+    _apply_cdc_status(state, (statuses, health, []))
+
+    view = state.cdc_status_view
+    assert view is not None
+    assert view.schema_drift == []
+
+
 def test_fetch_cdc_status_returns_none_without_controller() -> None:
     from dsql_migrator.ui.data_migration import _apply_cdc_status, _fetch_cdc_status
 
@@ -8661,6 +8719,58 @@ def test_render_cdc_dlq_panel_no_refresh_button_without_callback() -> None:
     assert any("Dead-letter queue" in t for t in ui.texts)
     assert not ui.click_handlers
     assert not ui.table_rows
+
+
+def _cdc_view_with_drift(groups):
+    from dsql_migrator.core.cdc import build_cdc_status_view
+    from dsql_migrator.core.models import ErrorLogSummary, SchemaDriftSummary
+
+    total = sum(c for _, _, c in groups)
+    summary = ErrorLogSummary(
+        total_errors=total, errors_by_table={t: c for t, _, c in groups}
+    )
+    drift = [SchemaDriftSummary(table=t, kind=k, count=c) for t, k, c in groups]
+    return build_cdc_status_view([], summary, dlq_depth=total, schema_drift=drift)
+
+
+def test_render_cdc_dlq_panel_shows_schema_drift_banner() -> None:
+    from dsql_migrator.core.models import MigrationJob
+    from dsql_migrator.ui.data_migration import _render_cdc_dlq_panel
+
+    state = DataMigrationState()
+    state.job_id = "job-cdc"
+    ui = _DlqUi()
+    _render_cdc_dlq_panel(
+        ui,
+        state,
+        _JobJM(MigrationJob(job_id="job-cdc")),
+        _cdc_view_with_drift([("orders", "add-column", 3)]),
+        on_refresh=None,
+    )
+    # The drift band names the change, the affected table, and the manual runbook
+    # (CDC does not replicate DDL) so the operator is not left reverse-engineering it.
+    assert any("Source schema change detected" in t for t in ui.texts)
+    assert any("orders" in t and "column added" in t for t in ui.texts)
+    assert any("does not replicate DDL" in t for t in ui.texts)
+
+
+def test_render_cdc_dlq_panel_no_drift_banner_when_none() -> None:
+    from dsql_migrator.core.models import MigrationJob
+    from dsql_migrator.ui.data_migration import _render_cdc_dlq_panel
+
+    state = DataMigrationState()
+    state.job_id = "job-cdc"
+    ui = _DlqUi()
+    # depth 1 but no classified drift -> DLQ panel renders, drift band does NOT.
+    _render_cdc_dlq_panel(
+        ui,
+        state,
+        _JobJM(MigrationJob(job_id="job-cdc")),
+        _cdc_view_with_dlq(1),
+        on_refresh=None,
+    )
+    assert any("Dead-letter queue" in t for t in ui.texts)
+    assert not any("Source schema change detected" in t for t in ui.texts)
 
 
 def test_migrate_table_passes_applied_target_types_to_exporter() -> None:

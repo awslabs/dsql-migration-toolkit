@@ -57,6 +57,7 @@ from dsql_migrator.core.models import (
     ErrorLogSummary,
     LoadKind,
     LoadStatusView,
+    SchemaDriftSummary,
     SourceConnectionConfig,
     TableDef,
     TableStatusRow,
@@ -403,6 +404,53 @@ class SinkConnectorConfig(BaseModel):
     dlq_topic: str = Field(min_length=1)
 
 
+class SchemaDriftKind(str, Enum):
+    """The kind of source-schema drift a permanent sink rejection reveals.
+
+    CDC does NOT propagate DDL: a source ``ALTER TABLE`` never changes the target,
+    and the DDL event itself never reaches the sink. What DOES reach the sink is
+    the first row written under the *new* source schema, whose column set no longer
+    matches the target -- DSQL rejects it with a telltale SQLSTATE and the sink
+    quarantines the row to the DLQ. Mapping that SQLSTATE back to a drift kind lets
+    the tool surface "the source schema changed" instead of an opaque quarantine.
+    Detection only -- the recovery (manual target ALTER, then per-table Reload to
+    backfill missing rows) stays operator-driven (the tool never auto-alters the
+    target: Property 6, no silent schema mutation).
+    """
+
+    ADD_COLUMN = "add-column"      # 42703 undefined_column: source added a column the target lacks
+    DROP_COLUMN = "drop-column"    # 23502 not_null_violation: source dropped a column the target requires
+    TYPE_CHANGE = "type-change"    # 42804 / 22xxx: source changed a column's type incompatibly
+
+
+# SQLSTATE -> drift kind. 22xxx (data exception) shares TYPE_CHANGE with 42804
+# (datatype_mismatch); it is matched by prefix below rather than enumerated.
+_DRIFT_BY_SQLSTATE: dict[str, SchemaDriftKind] = {
+    "42703": SchemaDriftKind.ADD_COLUMN,
+    "23502": SchemaDriftKind.DROP_COLUMN,
+    "42804": SchemaDriftKind.TYPE_CHANGE,
+}
+
+
+def classify_schema_drift(error_code: Optional[str]) -> Optional[SchemaDriftKind]:
+    """Map a sink-quarantine SQLSTATE to a source-schema-drift kind, else ``None``.
+
+    Pure: the single source of truth for "which SQLSTATE means which drift". A
+    ``None``/unknown code (an ordinary poison row -- bad value, oversized LOB,
+    etc.) returns ``None`` so it is NOT surfaced as schema drift. Class ``22``
+    (data exception, e.g. ``22001`` string-too-long / ``22003`` numeric range /
+    ``22007`` bad datetime) is treated as a type change alongside ``42804``.
+    """
+    if not error_code:
+        return None
+    code = error_code.strip().upper()
+    if code in _DRIFT_BY_SQLSTATE:
+        return _DRIFT_BY_SQLSTATE[code]
+    if code.startswith("22"):
+        return SchemaDriftKind.TYPE_CHANGE
+    return None
+
+
 class CdcConnectorError(BaseModel):
     """A read-only connector task failure or DLQ record for error surfacing.
 
@@ -422,6 +470,13 @@ class CdcConnectorError(BaseModel):
     message: str = Field(min_length=1)
     error_code: Optional[str] = None
     occurred_at: Optional[datetime] = None
+
+    @property
+    def drift_kind(self) -> Optional[SchemaDriftKind]:
+        """The source-schema-drift kind this error reveals (from ``error_code``),
+        or ``None`` for an ordinary quarantine. Derived, not stored -- the SQLSTATE
+        is the single source of truth (see :func:`classify_schema_drift`)."""
+        return classify_schema_drift(self.error_code)
 
 
 # Read-only suppliers of monitoring/error data. Injected so the control plane is
@@ -1080,6 +1135,7 @@ def build_cdc_status_view(
     error_summary: Optional[ErrorLogSummary] = None,
     *,
     dlq_depth: Optional[int] = None,
+    schema_drift: Optional[Sequence[SchemaDriftSummary]] = None,
 ) -> LoadStatusView:
     """Map CDC connector statuses + error summary to the unified LoadStatusView.
 
@@ -1088,7 +1144,9 @@ def build_cdc_status_view(
     (Req 13.5). ``lag_seconds`` is the worst (max) reported connector lag and
     ``caught_up_to`` the latest applied point across connectors; per-table rows
     come from the single :class:`ErrorLogSummary` (Req 13.2), since CDC status is
-    connector-centric rather than row-count-centric.
+    connector-centric rather than row-count-centric. ``schema_drift`` (when the
+    caller has classified the DLQ) surfaces source DDL the target has not caught up
+    to; see :func:`classify_schema_drift`.
     """
     connector_states = {status.name: status.state.value for status in statuses}
     lags = [s.lag_seconds for s in statuses if s.lag_seconds is not None]
@@ -1105,6 +1163,7 @@ def build_cdc_status_view(
         caught_up_to=max(caught) if caught else None,
         connector_states=connector_states,
         dlq_depth=dlq_depth,
+        schema_drift=list(schema_drift) if schema_drift else [],
         error_summary=error_summary,
     )
 
@@ -1539,6 +1598,8 @@ __all__ = [
     "DebeziumSourceConfig",
     "SinkConnectorConfig",
     "CdcConnectorError",
+    "SchemaDriftKind",
+    "classify_schema_drift",
     "StatusSource",
     "ErrorSource",
     "CdcPipelineOrchestrator",

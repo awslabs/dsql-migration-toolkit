@@ -916,6 +916,27 @@ class TableStatusRow(BaseModel):
     errors: int = Field(default=0, ge=0)
 
 
+class SchemaDriftSummary(BaseModel):
+    """One (table, drift-kind) group of quarantined CDC records that reveal a
+    source schema change (Req 12 CDC monitoring).
+
+    CDC does not propagate DDL: when the source alters a table, the target is
+    unchanged and the first row written under the new source schema is rejected by
+    DSQL and dead-lettered. Grouping those quarantines by the SQLSTATE-derived
+    ``kind`` turns an opaque DLQ count into an actionable "the source added/dropped
+    a column / changed a type on <table>" signal. ``kind`` is the string value of
+    ``core.cdc.SchemaDriftKind`` (this module cannot import cdc.py -- cdc imports
+    models -- so it is stored as its ``str`` value, which the UI maps to a label).
+    Detection only; recovery stays operator-driven (Property 6).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    table: str = Field(min_length=1)
+    kind: str = Field(min_length=1)
+    count: int = Field(ge=1)
+
+
 class LoadStatusView(BaseModel):
     """Normalized monitoring read-model rendered identically for Full Load/CDC.
 
@@ -940,6 +961,9 @@ class LoadStatusView(BaseModel):
     caught_up_to: Optional[datetime] = None
     connector_states: dict[str, str] = Field(default_factory=dict)
     dlq_depth: Optional[int] = Field(default=None, ge=0)
+    # Source-schema-drift groups derived from the CDC DLQ (empty = none detected).
+    # A non-empty list means the source ran DDL the target has not caught up to.
+    schema_drift: list[SchemaDriftSummary] = Field(default_factory=list)
     # Single error path shared by Full Load and CDC (Req 13.2)
     error_summary: Optional[ErrorLogSummary] = None
 
@@ -1431,6 +1455,7 @@ __all__ = [
     "ErrorLogSummary",
     "LoadKind",
     "TableStatusRow",
+    "SchemaDriftSummary",
     "LoadStatusView",
     "StepStatus",
     "WorkflowState",

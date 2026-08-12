@@ -30,14 +30,22 @@ from dsql_migrator.core.cdc import (
     CdcResumePoint,
     ConnectorState,
     ConnectorStatus,
+    SchemaDriftKind,
     build_cdc_status_view,
+    classify_schema_drift,
     composite_cdc_excluded_key_columns,
     composite_key_columns_for_cdc,
     format_message_key_columns,
 )
 from dsql_migrator.core.converter import TableConversion
 from dsql_migrator.core.error_log import ErrorLogStore
-from dsql_migrator.core.models import ErrorLogSummary, LoadKind, TableDef, Watermark
+from dsql_migrator.core.models import (
+    ErrorLogSummary,
+    LoadKind,
+    SchemaDriftSummary,
+    TableDef,
+    Watermark,
+)
 
 
 def _tables() -> list[TableDef]:
@@ -261,6 +269,59 @@ def test_build_cdc_status_view_empty() -> None:
     assert view.lag_seconds is None
     assert view.caught_up_to is None
     assert view.tables == []
+    # No drift by default -- inert on a healthy stream.
+    assert view.schema_drift == []
+
+
+# ---------------------------------------------------------------------------
+# Source-schema-drift classification (detection-only; recovery stays manual)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_schema_drift_maps_known_sqlstates() -> None:
+    assert classify_schema_drift("42703") is SchemaDriftKind.ADD_COLUMN
+    assert classify_schema_drift("23502") is SchemaDriftKind.DROP_COLUMN
+    assert classify_schema_drift("42804") is SchemaDriftKind.TYPE_CHANGE
+
+
+def test_classify_schema_drift_treats_class_22_as_type_change() -> None:
+    # Class 22 (data exception): string-too-long / numeric-range / bad-datetime all
+    # mean the source retyped a column incompatibly.
+    for code in ("22001", "22003", "22007", "22P02"):
+        assert classify_schema_drift(code) is SchemaDriftKind.TYPE_CHANGE
+
+
+def test_classify_schema_drift_is_case_and_whitespace_insensitive() -> None:
+    assert classify_schema_drift(" 42703 ") is SchemaDriftKind.ADD_COLUMN
+    assert classify_schema_drift("22001".lower()) is SchemaDriftKind.TYPE_CHANGE
+
+
+def test_classify_schema_drift_returns_none_for_non_drift_codes() -> None:
+    # An OCC conflict (40001), a size-limit rejection (54000), and no code at all are
+    # ordinary poison rows, NOT schema drift -- must not be surfaced as a source DDL.
+    assert classify_schema_drift("40001") is None
+    assert classify_schema_drift("54000") is None
+    assert classify_schema_drift(None) is None
+    assert classify_schema_drift("") is None
+
+
+def test_connector_error_drift_kind_is_derived_from_error_code() -> None:
+    add = CdcConnectorError(table="orders", message="x", error_code="42703")
+    assert add.drift_kind is SchemaDriftKind.ADD_COLUMN
+    plain = CdcConnectorError(table="orders", message="x", error_code=None)
+    assert plain.drift_kind is None
+
+
+def test_build_cdc_status_view_carries_schema_drift() -> None:
+    drift = [
+        SchemaDriftSummary(table="orders", kind="add-column", count=3),
+        SchemaDriftSummary(table="line_items", kind="type-change", count=1),
+    ]
+    view = build_cdc_status_view([], None, dlq_depth=4, schema_drift=drift)
+    assert [(g.table, g.kind, g.count) for g in view.schema_drift] == [
+        ("orders", "add-column", 3),
+        ("line_items", "type-change", 1),
+    ]
 
 
 # ---------------------------------------------------------------------------

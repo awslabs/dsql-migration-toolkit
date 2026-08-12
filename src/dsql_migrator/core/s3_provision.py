@@ -51,6 +51,14 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v28 rebuilds the DSQL sink jar so a DSQL-apply quarantine log line is PREFIXED with
+#    "sqlstate=<state> ". pgjdbc's getMessage() does not carry the SQLSTATE, so the
+#    control plane previously could not tell an ordinary poison row from a
+#    source-schema-drift rejection (42703 = source ADD COLUMN the target lacks,
+#    23502 = source DROP COLUMN of a target NOT NULL column, 42804/22xxx = source
+#    TYPE CHANGE). With the code in the reason, the CloudWatch DLQ parser classifies
+#    the drift kind and the UI surfaces a "source schema change detected" banner --
+#    no extra probe, no row values (Property 7). Sink-jar change only.
 # v27 rebuilds the offset-seeder Lambda zip so CdcStartPrepResource ALSO pre-creates
 #    the sink DLQ topic (DlqTopicName) at MaxMessageBytes. A record the sink
 #    dead-letters on DSQL's 1 MiB per-value limit is itself >1 MiB, but Kafka Connect
@@ -245,7 +253,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v27"
+PLUGIN_VERSION = "v28"
 
 
 class S3ProvisionError(RuntimeError):
