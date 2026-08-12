@@ -64,12 +64,16 @@ CDC_STACK=mysql-dsql-cdc-<yoursuffix>     # your existing cdc-stack name
 BUCKET=mysql-dsql-migrator-plugins-$ACCOUNT-$AWS_REGION
 aws s3 cp deploy/cdc-stack/cdc-stack.yaml "s3://$BUCKET/cdc-plugins/cdc-stack-test.yaml" --region "$AWS_REGION"
 
+# Note: SeedMode is a NEW parameter (not in the deployed stack), so it must be given
+# an explicit value (Lambda = the default/unchanged mode) — NOT UsePreviousValue.
+# HostSubnetCidr is also new but has a default (""), so it can be omitted. Do NOT
+# pass `--use-previous-template` (it is a value-less flag; adding `false` errors, and
+# it must be absent when supplying --template-url).
 aws cloudformation create-change-set \
   --stack-name "$CDC_STACK" \
   --change-set-name seedmode-nochange-$(date +%s) \
   --template-url "https://$BUCKET.s3.$AWS_REGION.amazonaws.com/cdc-plugins/cdc-stack-test.yaml" \
-  --use-previous-template false \
-  --parameters ParameterKey=SeedMode,UsePreviousValue=true \
+  --parameters ParameterKey=SeedMode,ParameterValue=Lambda \
                $(aws cloudformation describe-stacks --stack-name "$CDC_STACK" --region "$AWS_REGION" \
                  --query "Stacks[0].Parameters[?ParameterKey!='SeedMode'].ParameterKey" --output text \
                  | tr '\t' '\n' | sed 's/^/ParameterKey=/;s/$/,UsePreviousValue=true/') \

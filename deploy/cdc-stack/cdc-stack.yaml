@@ -1815,11 +1815,13 @@ Resources:
   # SeedMode=Lambda variant: keeps DependsOn: CdcStartPrepResource. The sink's
   # ordering edge to the topic pre-creation is a HARD DependsOn, which CloudFormation
   # forbids wrapping in Fn::If -- so the sink is SPLIT into two condition-gated
-  # variants that share ONE Properties body via a YAML anchor (&DsqlSinkProps /
-  # *DsqlSinkProps), so there is no duplication and the two cannot drift. Exactly one
-  # is created (the conditions are mutually exclusive). In the default (Lambda) mode
-  # DeploySinkConnectorLambda == DeploySinkConnector, so this resource is created
-  # identically to before and the External twin is absent.
+  # variants. Exactly one is created (the conditions are mutually exclusive). The two
+  # Properties bodies are IDENTICAL and MUST stay so; CloudFormation forbids YAML
+  # anchors/aliases (Template error: "YAML aliases are not allowed"), so the body is
+  # duplicated verbatim into DsqlSinkConnectorExternal below and a unit test asserts
+  # the two are byte-identical (tests/test_cdc_stack_seedmode.py). In the default
+  # (Lambda) mode DeploySinkConnectorLambda == DeploySinkConnector, so this resource
+  # is created identically to before and the External twin is absent.
   DsqlSinkConnector:
     Type: AWS::KafkaConnect::Connector
     Condition: DeploySinkConnectorLambda
@@ -1832,7 +1834,7 @@ Resources:
       # Previously this DependsOn DebeziumSourceConnector, forcing serial
       # source-then-sink creation (~2x the connector-creation wall time).
       - CdcStartPrepResource
-    Properties: &DsqlSinkProps
+    Properties:
       ConnectorName:
         Fn::Sub: ${AWS::StackName}-dsql-sink
       KafkaConnectVersion:
@@ -1949,20 +1951,137 @@ Resources:
         # the worker config is the only place these can be set, not a reason to leave
         # them at Kafka's defaults.
 
-  # SeedMode=External variant: byte-for-byte the same Properties body as
-  # DsqlSinkConnector (shared via the *DsqlSinkProps anchor), MINUS the
-  # DependsOn: CdcStartPrepResource -- because in External mode that resource is not
-  # created (the app pre-created the topics in-process before this update). Ordering
-  # is guaranteed by the app seeding topics BEFORE submitting this stack update, so
-  # the topics exist before this connector starts (no empty-partition-assignment
-  # race). Gated on DeploySinkConnectorExternal so it is absent in the default mode.
+  # SeedMode=External variant: the Properties body below is a VERBATIM copy of
+  # DsqlSinkConnector's (CloudFormation forbids YAML anchors, so it cannot be shared;
+  # a unit test asserts the two bodies are byte-identical). The ONLY difference is
+  # this variant OMITS DependsOn: CdcStartPrepResource -- in External mode that
+  # resource is not created (the app pre-created the topics in-process before this
+  # update). Ordering is guaranteed by the app seeding topics BEFORE submitting this
+  # stack update, so the topics exist before this connector starts (no
+  # empty-partition-assignment race). Gated on DeploySinkConnectorExternal so it is
+  # absent in the default (Lambda) mode.
   DsqlSinkConnectorExternal:
     Type: AWS::KafkaConnect::Connector
     Condition: DeploySinkConnectorExternal
     DependsOn:
       - MskCluster
       - ConnectorSelfIngress
-    Properties: *DsqlSinkProps
+    Properties:
+      ConnectorName:
+        Fn::Sub: ${AWS::StackName}-dsql-sink
+      KafkaConnectVersion:
+        Ref: KafkaConnectVersion
+      ServiceExecutionRoleArn:
+        Fn::GetAtt: [ConnectorExecutionRole, Arn]
+      Capacity:
+        ProvisionedCapacity:
+          McuCount:
+            Ref: SinkMcuCount
+          WorkerCount:
+            Ref: ConnectorWorkerCount
+      KafkaCluster:
+        ApacheKafkaCluster:
+          BootstrapServers:
+            Ref: MskBootstrapServers
+          Vpc:
+            SecurityGroups:
+              - Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+            Subnets:
+              Fn::If:
+                - CreateOwnedNetwork
+                - - Ref: ConnectorSubnetA
+                  - Ref: ConnectorSubnetB
+                - Ref: ConnectorSubnetIds
+      KafkaClusterClientAuthentication:
+        AuthenticationType: IAM
+      KafkaClusterEncryptionInTransit:
+        EncryptionType: TLS
+      WorkerConfiguration:
+        Revision:
+          Fn::GetAtt: [SinkWorkerConfiguration, Revision]
+        WorkerConfigurationArn:
+          Fn::GetAtt: [SinkWorkerConfiguration, WorkerConfigurationArn]
+      Plugins:
+        - CustomPlugin:
+            CustomPluginArn:
+              Fn::GetAtt: [DsqlSinkPlugin, CustomPluginArn]
+            Revision:
+              Fn::GetAtt: [DsqlSinkPlugin, Revision]
+      LogDelivery:
+        WorkerLogDelivery:
+          CloudWatchLogs:
+            Enabled: true
+            LogGroup:
+              Ref: ConnectorLogGroup
+      ConnectorConfiguration:
+        # Our custom connector (Task 23.2, connectors/dsql-sink). Package path
+        # matches DsqlSinkConnector.java in that subproject.
+        connector.class: dev.dsqlmigrator.connect.DsqlSinkConnector
+        tasks.max:
+          Fn::Sub: "${SinkTasksMax}"
+        # Explicit topic list (avoids the Fn::Sub backslash-escaping trap that
+        # turned topics.regex into a literal-backslash pattern matching nothing --
+        # gotcha). Per-table topic = <TopicPrefix>.<db>.<table>. The caller must
+        # construct SinkTopics as:
+        #   ','.join(f'{prefix}.{t}' for t in build_sink_config.topics)
+        topics:
+          Ref: SinkTopics
+        # Idempotent apply: this custom connector always derives the PK from the
+        # Debezium record key and applies INSERT ... ON CONFLICT upsert
+        # (build_sink_config: pk_mode=record_key, insert_mode=upsert), so pk.mode/
+        # insert.mode are implicit and not set here. delete.enabled toggles
+        # DELETE/tombstone apply. Keys below match DsqlSinkConnectorConfig.
+        delete.enabled: "true"
+        # DSQL connection: IAM token auth (no password). The connector generates
+        # the token and refreshes it before the 1-hour timeout (Task 23.2).
+        dsql.cluster.endpoint:
+          Ref: DsqlClusterEndpoint
+        dsql.database:
+          Ref: DsqlDatabaseName
+        dsql.username:
+          Ref: DsqlConnectUser
+        dsql.region:
+          Fn::If: [RegionProvided, Ref: AwsRegion, Ref: "AWS::Region"]
+        # DSQL constraint: <=3,000 rows per transaction.
+        batch.size:
+          Fn::Sub: "${SinkBatchMaxRows}"
+        # Per-table net-rows monitor metric (CloudWatch, best-effort): the sink emits
+        # NetRowsApplied per table under this Stack dimension so the UI shows CDC
+        # net-rows WITHOUT COUNT(*)-scanning the source. The stack name is the Stack
+        # dimension value the UI queries by; blank would disable emission.
+        metrics.stack:
+          Ref: AWS::StackName
+        # Dead-letter queue for poison change events (Req 12.4-12.6). The topic
+        # is auto-created at runtime; it is not a CloudFormation resource.
+        errors.tolerance: all
+        errors.deadletterqueue.topic.name:
+          Ref: DlqTopicName
+        errors.deadletterqueue.context.headers.enable: "true"
+        errors.deadletterqueue.topic.replication.factor: "3"
+        errors.log.enable: "true"
+        # Retry retriable errors (e.g. OCC SQLSTATE 40001 conflicts) for up to
+        # 10 min before dead-lettering, so transient conflicts are absorbed by the
+        # connector's statement-level retry instead of being dropped to the DLQ
+        # with zero retries (the original errors.retry.timeout=0 default caused
+        # contiguous-band data loss under concurrent DML -- see 2026-06 analysis).
+        errors.retry.timeout: "600000"
+        errors.retry.delay.max.ms: "60000"
+        # Log the failed record + exception (not just that an error occurred) so
+        # DLQ root-cause is visible in CloudWatch without consuming the DLQ topic.
+        errors.log.include.messages: "true"
+        # key.converter/value.converter are declared in SinkWorkerConfiguration.
+        # They are intentionally absent here to avoid split authority. The H13
+        # message-size limits (producer.max.request.size / consumer.fetch.max.bytes
+        # / consumer.max.partition.fetch.bytes) AND the consumer poll/session
+        # timeouts (consumer.max.poll.interval.ms / session.timeout.ms /
+        # heartbeat.interval.ms / offset.flush.timeout.ms) live in the SINK worker
+        # config: MSK Connect supports those producer.*/consumer.* keys at the worker
+        # level and applies them to the connector's task clients (per the MSK Connect
+        # "Supported worker configuration properties" doc, whose allowlist names each
+        # of them). What is NOT available is the per-connector ".override." FORM,
+        # because MSK Connect excludes connector.client.config.override.policy -- so
+        # the worker config is the only place these can be set, not a reason to leave
+        # them at Kafka's defaults.
 
   # ------------------------------------------------------------------------- #
   # Observability: alarm when a connector task errors out. Without this, recovery

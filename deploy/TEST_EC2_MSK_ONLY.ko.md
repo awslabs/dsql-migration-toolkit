@@ -59,12 +59,15 @@ CDC_STACK=mysql-dsql-cdc-<접미사>     # 기존 cdc-stack 이름
 BUCKET=mysql-dsql-migrator-plugins-$ACCOUNT-$AWS_REGION
 aws s3 cp deploy/cdc-stack/cdc-stack.yaml "s3://$BUCKET/cdc-plugins/cdc-stack-test.yaml" --region "$AWS_REGION"
 
+# 주의: SeedMode는 배포된 스택에 없는 NEW 파라미터라 명시 값(Lambda = 기본/불변 모드)을
+# 줘야 합니다 — UsePreviousValue 불가. HostSubnetCidr도 신규지만 기본값("")이 있어 생략 가능.
+# `--use-previous-template`는 값 없는 플래그라 `false`를 붙이면 에러; --template-url을 줄 때는
+# 아예 넣지 마세요.
 aws cloudformation create-change-set \
   --stack-name "$CDC_STACK" \
   --change-set-name seedmode-nochange-$(date +%s) \
   --template-url "https://$BUCKET.s3.$AWS_REGION.amazonaws.com/cdc-plugins/cdc-stack-test.yaml" \
-  --use-previous-template false \
-  --parameters ParameterKey=SeedMode,UsePreviousValue=true \
+  --parameters ParameterKey=SeedMode,ParameterValue=Lambda \
                $(aws cloudformation describe-stacks --stack-name "$CDC_STACK" --region "$AWS_REGION" \
                  --query "Stacks[0].Parameters[?ParameterKey!='SeedMode'].ParameterKey" --output text \
                  | tr '\t' '\n' | sed 's/^/ParameterKey=/;s/$/,UsePreviousValue=true/') \

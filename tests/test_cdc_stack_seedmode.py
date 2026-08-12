@@ -72,14 +72,41 @@ def test_sink_variants_share_one_body_and_differ_only_in_dependson() -> None:
     # Same condition family, mutually exclusive by SeedMode.
     assert lam["Condition"] == "DeploySinkConnectorLambda"
     assert ext["Condition"] == "DeploySinkConnectorExternal"
-    # The YAML anchor makes both Properties bodies the SAME object content -> they
-    # cannot drift.
+    # The two Properties bodies are duplicated verbatim (CloudFormation forbids YAML
+    # anchors, so they cannot be shared) and MUST stay byte-identical -> this guards
+    # against the two drifting.
     assert lam["Properties"] == ext["Properties"]
     # The ONLY structural difference is the Lambda variant's extra DependsOn on the
     # in-VPC prep resource.
     assert "CdcStartPrepResource" in lam["DependsOn"]
     assert "CdcStartPrepResource" not in ext["DependsOn"]
     assert set(ext["DependsOn"]) == {"MskCluster", "ConnectorSelfIngress"}
+
+
+def test_no_yaml_anchors_or_aliases_in_cfn_templates() -> None:
+    # CloudFormation REJECTS templates that use YAML anchors/aliases
+    # ("Template error: YAML aliases are not allowed in CloudFormation templates"),
+    # even though PyYAML resolves them fine -- so a structural (parsed) test cannot
+    # catch it. Scan the raw text of every deploy template for an anchor (`: &name`)
+    # or alias (`*name`) token so this deploy-blocker can never reintroduce itself.
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "deploy"
+    templates = [
+        root / "cdc-stack" / "cdc-stack.yaml",
+        root / "cloudformation.yaml",
+        root / "cloudformation-ec2.yaml",
+    ]
+    # Anchor definition: a mapping value that is just `&anchor`. Alias use: a value
+    # that is `*alias`. Ignore prose inside `#` comments (e.g. "*Include", "*S3*").
+    anchor_def = re.compile(r":\s+&[A-Za-z0-9_]+\s*$")
+    alias_use = re.compile(r":\s+\*[A-Za-z0-9_]+\s*$")
+    for tpl in templates:
+        for i, line in enumerate(tpl.read_text(encoding="utf-8").splitlines(), 1):
+            code = line.split("#", 1)[0]  # strip trailing comment
+            assert not anchor_def.search(code), f"{tpl.name}:{i} YAML anchor: {line}"
+            assert not alias_use.search(code), f"{tpl.name}:{i} YAML alias: {line}"
 
 
 def test_source_connector_offset_seed_tag_is_conditional() -> None:

@@ -5,6 +5,20 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.309
+
+### 修正 (Fixed)
+
+- **CDC スタックがデプロイできなかった問題** — `Template error: YAML aliases are not allowed
+  in CloudFormation templates`。v0.1.307 のシンクコネクタ分割で、Lambda/External の 2 バリアントが
+  本体を共有するために YAML アンカー/エイリアス(`&DsqlSinkProps` / `*DsqlSinkProps`)を使って
+  いました。PyYAML はアンカーを正しく解決するため構造の単体テストは通っていましたが、
+  **CloudFormation はアンカー/エイリアスを拒否する**ため、実際の `create-change-set`/デプロイが
+  ブロックされていました。共有本体を 2 つのバリアントにそのまま複製し(違いは External が
+  `CdcStartPrepResource` 依存を省く点のみ)、2 つの本体がバイト単位で同一であることをテストで
+  強制し、さらにすべてのデプロイテンプレートの原文を走査して YAML アンカー/エイリアスを拒否する
+  ガードを追加して、このデプロイブロッカーが再発しないようにしました。
+
 ## v0.1.308
 
 ### 追加 (Added)

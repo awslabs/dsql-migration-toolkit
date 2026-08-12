@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.309
+
+### 수정 (Fixed)
+
+- **CDC 스택이 배포되지 않던 문제** — `Template error: YAML aliases are not allowed in
+  CloudFormation templates`. v0.1.307의 싱크 커넥터 split이 Lambda/External 두 변형이 본문을
+  공유하도록 YAML 앵커/alias(`&DsqlSinkProps` / `*DsqlSinkProps`)를 썼습니다. PyYAML은 앵커를
+  정상 resolve 하므로 구조 단위 테스트는 통과했지만, **CloudFormation은 앵커/alias를 거부**하기
+  때문에 실제 `create-change-set`/배포가 차단됐습니다. 이제 공유 본문을 두 변형에 그대로
+  복제하고(차이는 External 변형이 `CdcStartPrepResource` 의존을 빼는 것뿐), 두 본문이
+  바이트 단위로 동일함을 테스트로 강제하며, 모든 배포 템플릿의 원문을 스캔해 YAML 앵커/alias를
+  거부하는 가드를 추가해 이 배포 차단이 재발하지 않게 했습니다.
+
 ## v0.1.308
 
 ### 추가 (Added)

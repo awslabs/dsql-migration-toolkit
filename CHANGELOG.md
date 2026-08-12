@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.309
+
+### Fixed
+
+- **The CDC stack failed to deploy** with `Template error: YAML aliases are not
+  allowed in CloudFormation templates`. The v0.1.307 sink-connector split used a YAML
+  anchor/alias (`&DsqlSinkProps` / `*DsqlSinkProps`) to share one body between the
+  Lambda and External sink variants. PyYAML resolves anchors fine (so the structural
+  unit tests passed), but **CloudFormation rejects any anchor/alias**, so a real
+  `create-change-set` / deploy against the cdc-stack was blocked. The shared body is
+  now duplicated verbatim into the two variants (the only difference is the External
+  variant's omitted `CdcStartPrepResource` dependency), a test asserts the two bodies
+  stay byte-identical, and a new guard scans every deploy template's raw text to
+  reject any YAML anchor/alias so this deploy-blocker cannot recur.
+
 ## v0.1.308
 
 ### Added
