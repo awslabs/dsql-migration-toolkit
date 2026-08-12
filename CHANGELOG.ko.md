@@ -9,7 +9,7 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 
 ### 추가
 
-- **활동 로그(audit trail)를 ECS에서 CloudWatch Logs로 보낼 수 있습니다.** 새 배포
+- **활동 로그(activity log)를 ECS에서 CloudWatch Logs로 보낼 수 있습니다.** 새 배포
   파라미터 `EnableActivityLogCloudWatch`(기본 off)로 켭니다. 활동 로그는 태스크의
   임시(ephemeral) `/tmp`에 rotating 파일로 남으므로, Fargate 태스크가 교체되면(재배포·
   크래시·rebalance) 사라집니다. 이 옵션을 켜면 앱이 각 이벤트를 JSON 라인으로 stdout에도
