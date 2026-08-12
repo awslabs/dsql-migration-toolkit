@@ -449,6 +449,33 @@ def stack_status_needs_cleanup(status: Optional[str]) -> bool:
     return bool(status) and str(status).upper() in _UNATTACHABLE_STACK_STATUSES
 
 
+def teardown_stack_confirmed_gone(deployer, stack_name: Optional[str]) -> bool:
+    """True ONLY when CloudFormation DEFINITIVELY reports the stack does not exist.
+
+    Self-heal for the stale "CDC teardown failed" banner: after a DELETE_FAILED the
+    marker is kept (job record / cached status both frozen at failed), so if the
+    operator finishes the cleanup out of band (e.g. terminates the ENI-pinning
+    bastion and re-runs delete-stack from the CLI) nothing in the UI ever re-reads
+    the live stack, and the banner lingers forever.
+
+    Reuses the existing read-only ``describe_stack_or_none`` probe (the same
+    ``cloudformation:DescribeStacks`` read behind the restored-session re-verify
+    notice), which returns ``None`` only for a true does-not-exist and RAISES on any
+    unexpected/permission/throttle error. This helper is deliberately conservative:
+    it returns ``True`` (safe to clear the failed banner) ONLY on that definitive
+    ``None``. A stack still present in ANY state (including ``DELETE_FAILED``), a
+    missing deployer/stack name, or ANY error -> ``False`` (keep the banner), so a
+    real, still-billing failure is never wrongly cleared. Pure aside from the one
+    injected read.
+    """
+    if deployer is None or not stack_name:
+        return False
+    try:
+        return deployer.describe_stack_or_none(stack_name) is None
+    except Exception:  # noqa: BLE001 - any ambiguous/errored read keeps the banner
+        return False
+
+
 def cdc_attach_scope_mismatch(
     streamed_tables: "Sequence[str]", loaded_tables: "Sequence[str]"
 ) -> "list[str]":

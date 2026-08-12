@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.312
+
+### 수정 (Fixed)
+
+- **"CDC teardown failed" 배너가 스택이 실제로 삭제된 뒤에도 계속 남던 문제.** `DELETE_FAILED`
+  teardown(예: 커넥터 보안그룹을 붙잡는 Lambda ENI 잔여물)은 백그라운드 잡 기록과 캐시된 스택
+  상태를 모두 "실패"로 고정하고, 이 배너는 self-poll을 하지 않습니다 — 그래서 운영자가 out of
+  band로 정리를 끝내도(막고 있던 리소스 종료, CLI/콘솔로 삭제 재실행), 일부 화면에서는 배너를
+  없앨 방법 없이 영원히 남았습니다. 이제 배너 getter는 "실패"를 보여주려 할 때마다 read-only
+  `DescribeStacks` 체크를 한 번 수행하며(복원 세션 re-verify 안내가 쓰는 것과 동일한 probe 재사용),
+  **CloudFormation이 스택이 존재하지 않는다고 확정할 때에만** 마커를 정리하고 dismiss 가능한
+  "CDC 인프라 삭제됨" 완료 알림을 표시합니다. 스택이 아직 존재하거나(어떤 상태든, `DELETE_FAILED`
+  포함) 애매한/에러 응답이면 실패 배너를 그대로 두어, 실제로 아직 과금 중인 실패를 절대 숨기지
+  않습니다.
 ## v0.1.311
 
 ### 수정 (Fixed)

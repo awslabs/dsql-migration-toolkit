@@ -449,6 +449,24 @@ def build_page(
                 }
             return None
         state = cdc_teardown_banner_state(JOB_MANAGER, job_id)
+        # Self-heal a stale FAILED banner: a DELETE_FAILED freezes both the job record
+        # (state=="failed") and the cached stack status, so an out-of-band cleanup
+        # (operator finished the delete via the console/CLI) would leave the banner up
+        # forever. When we WOULD show failed, do one best-effort read-only live check;
+        # only if CloudFormation DEFINITIVELY reports the stack gone do we neutralize
+        # BOTH failed sources -- the job-derived state here and the cached status below
+        # -- and fall through to the existing clean-completion path (which records the
+        # dismissable "deleted" notice and clears the marker). A still-present or
+        # ambiguous/errored read leaves the failed banner untouched (never hides a
+        # real, still-billing failure). This is the only self-poll-less banner, so the
+        # extra read fires only while a failure would be shown.
+        would_show_failed = state == "failed" or _stack_status_needs_cleanup(
+            getattr(migration_state, "cdc_stack_phase_status", None)
+        )
+        if would_show_failed and _cdc_teardown_stack_confirmed_gone(migration_state):
+            migration_state.set_cdc_stack_phase("absent", status=None)
+            if state == "failed":
+                state = None
         if state in ("running", "failed"):
             info = {
                 "state": state,
@@ -799,6 +817,38 @@ def build_page(
         finish cleanup in the console)."""
         migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
         migration_state.clear_cdc_teardown()
+
+    def _cdc_teardown_stack_confirmed_gone(migration_state) -> bool:
+        """Best-effort live check: is the tracked teardown stack DEFINITIVELY gone?
+
+        Self-heals the stale "CDC teardown failed" banner. A DELETE_FAILED freezes the
+        job record + cached status at failed, so if the operator finishes cleanup out
+        of band (e.g. terminates the ENI-pinning bastion, re-runs delete-stack) the
+        banner would otherwise linger forever. Rebuilds a deployer from the durable
+        marker's retry ctx (region/role/profile -- the session may have been wiped by
+        Start over, exactly as ``_cdc_teardown_retry`` does) and delegates to
+        ``teardown_stack_confirmed_gone``, which returns True ONLY on a definitive
+        does-not-exist. No ctx/region, or ANY error -> False (keep the banner).
+        """
+        stack_name = getattr(migration_state, "cdc_teardown_stack", None)
+        ctx = dict(getattr(migration_state, "cdc_teardown_ctx", {}) or {})
+        region = ctx.get("region")
+        if not stack_name or not region:
+            return False
+        try:
+            from dsql_migrator.core.cdc_deployer import build_cdc_stack_deployer
+            from dsql_migrator.ui.data_migration._status import (
+                teardown_stack_confirmed_gone,
+            )
+
+            deployer = build_cdc_stack_deployer(
+                region,
+                aws_profile=ctx.get("profile"),
+                assume_role_arn=ctx.get("role_arn"),
+            )
+            return teardown_stack_confirmed_gone(deployer, stack_name)
+        except Exception:  # noqa: BLE001 - never let the self-heal break the render
+            return False
 
     build_workflow_sidebar(
         SESSION_STORE,

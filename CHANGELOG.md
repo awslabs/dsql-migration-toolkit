@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.312
+
+### Fixed
+
+- **The "CDC teardown failed" banner no longer lingers after the stack is actually
+  gone.** A `DELETE_FAILED` teardown (e.g. leftover Lambda ENIs pinning the connector
+  security group) freezes both the background job record and the cached stack status
+  at "failed", and the banner does not self-poll — so if an operator finished the
+  cleanup out of band (terminated the blocking resource, re-ran the delete from the
+  CLI/console), the actionable banner stayed up forever with no way to clear it from
+  some views. The banner getter now does one best-effort, read-only
+  `DescribeStacks` check (reusing the same probe behind the restored-session
+  re-verify notice) whenever it would show "failed"; **only** when CloudFormation
+  definitively reports the stack does-not-exist does it settle the marker and show the
+  dismissable "CDC infrastructure deleted" completion notice. A still-present stack
+  (any state, including `DELETE_FAILED`) or any ambiguous/errored read leaves the
+  failed banner untouched, so a genuinely still-billing failure is never hidden.
 ## v0.1.311
 
 ### Fixed

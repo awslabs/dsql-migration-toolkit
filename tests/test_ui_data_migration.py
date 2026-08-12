@@ -2318,6 +2318,33 @@ def test_cdc_teardown_banner_state_tracks_job_status() -> None:
     assert cdc_teardown_banner_state(_MultiJobJM({}), "ghost") is None  # lost job
 
 
+def test_teardown_stack_confirmed_gone_only_on_definitive_absence() -> None:
+    # Self-heal for the stale "CDC teardown failed" banner: clears ONLY when
+    # CloudFormation definitively reports the stack does-not-exist (describe returns
+    # None). A present stack (any state, incl. DELETE_FAILED), a raising/errored read,
+    # or a missing deployer/name must NOT clear it (never hide a still-billing failure).
+    from dsql_migrator.ui.data_migration._status import teardown_stack_confirmed_gone
+
+    class _Gone:
+        def describe_stack_or_none(self, name):
+            return None  # definitive does-not-exist
+
+    class _Present:
+        def describe_stack_or_none(self, name):
+            return object()  # a discovery -> stack still there (e.g. DELETE_FAILED)
+
+    class _Raises:
+        def describe_stack_or_none(self, name):
+            raise RuntimeError("throttled / access denied / ambiguous")
+
+    assert teardown_stack_confirmed_gone(_Gone(), "mysql-dsql-cdc-stack") is True
+    assert teardown_stack_confirmed_gone(_Present(), "mysql-dsql-cdc-stack") is False
+    assert teardown_stack_confirmed_gone(_Raises(), "mysql-dsql-cdc-stack") is False
+    assert teardown_stack_confirmed_gone(_Gone(), "") is False  # no stack name
+    assert teardown_stack_confirmed_gone(_Gone(), None) is False
+    assert teardown_stack_confirmed_gone(None, "mysql-dsql-cdc-stack") is False
+
+
 def test_cdc_step_delete_and_stop_handlers_set_teardown_marker(monkeypatch) -> None:
     # The CDC-step Delete / Stop buttons must ALSO set the durable marker (not just
     # the Start-over path), so the persistent banner survives navigating away from
