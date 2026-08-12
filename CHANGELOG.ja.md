@@ -5,6 +5,25 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.310
+
+### 変更 (Changed)
+
+- **「EC2 + MSK のみ」デプロイモードがソースから直接実行するようになりました — Docker・ECR
+  なし。** コンテナレジストリを使えない顧客のために、`deploy/cloudformation-ec2.yaml` は
+  コンテナイメージを pull しなくなりました。代わりにホストが `git` + `uv` をインストールし、
+  アプリのソースを取得して `uv sync --extra cdc-external` を実行し、`systemd` サービス
+  (`dsql-migrator.service`)としてアプリを起動します — 接続方法(SSM ポートフォワード)、
+  保持される EBS の状態、`SeedMode=External` は同じです。ソースの取得は新しい `SourceMode`
+  パラメータで選択します: `git`(既定 — 公開リポジトリを HTTPS で `git clone`、または SSM の
+  読み取り専用デプロイキー(`DeployKeySsmParam`)で AWS GitLab の SSH URL を clone。この
+  キー関連の IAM 権限・ポート 22 の egress はリポジトリが公開されると自動的に消えます)または
+  `s3`(ソース tarball を `SourceS3Uri` から取得して展開 — リポジトリ公開前にローカルの作業
+  コピーを実行する簡単な方法)。`ContainerImageUri` パラメータとすべての Docker 手順は削除
+  されました。Fargate アプリスタック(`deploy/cloudformation.yaml`)は変更なしで、引き続き
+  イメージベースであり、Dockerfile は `--extra cdc-external` を維持します
+  (`SeedMode=External` でなければ inert)。
+
 ## v0.1.309
 
 ### 修正 (Fixed)

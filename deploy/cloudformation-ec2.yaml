@@ -53,9 +53,13 @@ Metadata:
           - KeyName
           - LatestAl2023Ami
       - Label:
-          default: "4. Container image & sizing — defaults work, no image build needed"
+          default: "4. App source & sizing — defaults clone the public repo; no build needed"
         Parameters:
-          - ContainerImageUri
+          - SourceMode
+          - SourceS3Uri
+          - SourceRepoUrl
+          - SourceRepoRef
+          - DeployKeySsmParam
           - AppPort
           - EnableActivityLogCloudWatch
       - Label:
@@ -92,12 +96,20 @@ Metadata:
         default: "SSH key  [Optional] — leave empty; SSM Session Manager is the primary access path"
       LatestAl2023Ami:
         default: "Base AMI  [Auto] — resolves the latest Amazon Linux 2023 x86_64 image"
-      ContainerImageUri:
-        default: "Container image URI  [Optional] — blank = published ECR Public image (no build needed)"
+      SourceMode:
+        default: "Source mode  [Optional, default git] — 'git' clone or 's3' tarball (run your local copy)"
+      SourceS3Uri:
+        default: "Source S3 URI  [Required if Source mode = s3] — s3:// tarball of the repo root"
+      SourceRepoUrl:
+        default: "Source repo URL  [Optional] — default = public GitHub HTTPS; use the GitLab SSH URL + a deploy key temporarily"
+      SourceRepoRef:
+        default: "Source ref  [Optional, default main] — branch or tag"
+      DeployKeySsmParam:
+        default: "Deploy-key SSM param  [Optional] — SecureString name for the temporary GitLab SSH clone; empty for public GitHub"
       AppPort:
-        default: "Container listen port  [Optional, default 8080]"
+        default: "App listen port  [Optional, default 8080] — bound on host loopback, reached via SSM port-forward"
       EnableActivityLogCloudWatch:
-        default: "Activity log to stdout  [Optional, default off] — mirror the audit trail to the container's stdout (docker logs)"
+        default: "Activity log to stdout  [Optional, default off] — mirror the audit trail to journald (journalctl -u dsql-migrator)"
       EnableAiAssist:
         default: "Enable AI assist  [Optional, default off] — AI-assisted schema conversion via Amazon Bedrock"
       BedrockModelArns:
@@ -157,16 +169,47 @@ Parameters:
     MaxValue: 65535
     Description: Source MySQL port (egress).
 
-  ContainerImageUri:
+  SourceMode:
     Type: String
-    Default: public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.303
+    Default: git
+    AllowedValues: ["git", "s3"]
     Description: >
-      App container image URI. Defaults to the published ECR Public image, so a
-      normal deploy needs NO image build -- the host pulls it directly (works from
-      a public subnet or a private subnet with NAT/egress). Restricted-network
-      customers override this with their own private ECR copy (e.g. mirrored via an
-      ECR pull-through cache of public.ecr.aws; see DEPLOYMENT.md), or build from
-      deploy/Dockerfile and pass that URI. Pin a tag or @sha256 digest per release.
+      How the host obtains the app source (NO Docker/ECR -- it runs from source).
+      "git" (default): git clone SourceRepoUrl@SourceRepoRef -- public HTTPS needs
+      no auth; the temporary AWS GitLab SSH path uses a deploy key (see
+      DeployKeySsmParam). "s3": download+extract a source tarball from SourceS3Uri --
+      the simplest TEMPORARY path to run YOUR LOCAL working copy before the repo is
+      public on GitHub (tar your checkout, upload it to S3, point SourceS3Uri at it).
+
+  SourceS3Uri:
+    Type: String
+    Default: ""
+    Description: >
+      s3:// URI of the app source tarball (.tar.gz of the repo root). Required when
+      SourceMode=s3; the host runs `aws s3 cp` then extracts with --strip-components=1.
+      Ignored when SourceMode=git.
+
+  SourceRepoUrl:
+    Type: String
+    Default: https://github.com/dalyoung/mysql-dsql-migration-tool.git
+    Description: >
+      Git repo to clone when SourceMode=git. Default is the (future) public GitHub
+      URL -- a no-auth HTTPS clone. For the temporary AWS GitLab path set this to the
+      SSH URL (git@ssh.gitlab.aws.dev:...) AND set DeployKeySsmParam.
+
+  SourceRepoRef:
+    Type: String
+    Default: main
+    Description: Branch or tag to clone (shallow --branch; not a bare commit SHA).
+
+  DeployKeySsmParam:
+    Type: String
+    Default: ""
+    Description: >
+      Name of an SSM Parameter Store SecureString holding a READ-ONLY SSH deploy key
+      (name WITHOUT a leading slash, e.g. mysql-dsql-migrator/deploy-key). Set ONLY
+      for the temporary AWS GitLab SSH clone; empty (the public-GitHub end state) =
+      no key, no IAM grant, no port-22 egress. Ignored when SourceMode=s3.
 
   HttpsEgressCidr:
     Type: String
@@ -356,6 +399,13 @@ Conditions:
     Fn::Not:
       - Fn::Equals: [Ref: KeyName, ""]
 
+  # A deploy-key SSM param was supplied -> the TEMPORARY GitLab SSH clone path.
+  # Gates the read-deploy-key IAM grant + the port-22 egress so BOTH exist only on
+  # that path; the public-GitHub end state (empty) auto-drops them.
+  HasDeployKey:
+    Fn::Not:
+      - Fn::Equals: [Ref: DeployKeySsmParam, ""]
+
 Resources:
   # Stable secret used to sign the UI's browser-session cookie
   # (DSQL_MIGRATOR_STORAGE_SECRET). Auto-generated once and held in Secrets
@@ -436,6 +486,26 @@ Resources:
                     Action: secretsmanager:GetSecretValue
                     Resource:
                       Ref: SourceSecretArn
+            - Ref: AWS::NoValue
+        # Read the SSH deploy key from SSM ONLY on the temporary GitLab clone path
+        # (DeployKeySsmParam set). Auto-drops to AWS::NoValue once the repo is public
+        # on GitHub (DeployKeySsmParam empty -> HasDeployKey false). KMS nuance: a
+        # SecureString on the default aws/ssm key needs no extra grant; a customer CMK
+        # additionally needs kms:Decrypt on that key (unknown at deploy time -> not
+        # added here, documented in the runbook).
+        - Fn::If:
+            - HasDeployKey
+            - PolicyName: read-deploy-key
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Sid: GetDeployKey
+                    Effect: Allow
+                    Action:
+                      - ssm:GetParameter
+                      - ssm:GetParameters
+                    Resource:
+                      Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DeployKeySsmParam}
             - Ref: AWS::NoValue
         - PolicyName: provision-cdc-source-secret
           PolicyDocument:
@@ -1069,9 +1139,27 @@ Resources:
         Ref: SourceDbCidr
       Description: Egress to source RDS/Aurora MySQL CIDR.
 
-  # The single control-plane host. Runs the app container; reached only via SSM
-  # port-forward. Bootstrap in UserData (install Docker, mount the retained state
-  # volume, fetch the cookie secret, run the container).
+  # TCP 22 egress for the TEMPORARY GitLab SSH clone (git@ssh.gitlab.aws.dev). Only
+  # created when a deploy key is supplied; the public-GitHub end state clones over
+  # HTTPS (443, already allowed) so this rule is absent then. Open to the internet on
+  # 22 because the GitLab host is a public endpoint reached via NAT; the SG still has
+  # NO inbound, so this is outbound-only.
+  GitSshEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: HasDeployKey
+    Properties:
+      GroupId:
+        Fn::GetAtt: [HostSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: 0.0.0.0/0
+      Description: Egress for the temporary GitLab SSH source clone (git over SSH).
+
+  # The single control-plane host. Runs the app FROM SOURCE (no Docker/ECR) as a
+  # systemd service; reached only via SSM port-forward. Bootstrap in UserData:
+  # install git+uv, mount the retained state volume, obtain the source (S3 tarball
+  # OR git clone), uv sync --extra cdc-external, write the runtime env, run systemd.
   AppHost:
     Type: AWS::EC2::Instance
     Properties:
@@ -1116,12 +1204,18 @@ Resources:
             set -euxo pipefail
             exec > /var/log/dsql-migrator-userdata.log 2>&1
 
-            # --- Docker + SSM agent ---------------------------------------------
-            dnf install -y docker
-            systemctl enable --now docker
+            # --- Base packages: git + uv + SSM agent (NO Docker) ----------------
+            dnf install -y git tar gzip
             # Amazon Linux 2023 ships the SSM agent; ensure it is running so Session
             # Manager + port-forward (the only access path) work immediately.
             systemctl enable --now amazon-ssm-agent
+            # uv (pinned, matches deploy/Dockerfile) installed system-wide. It
+            # auto-provisions CPython 3.12 (.python-version) during `uv sync`.
+            export UV_INSTALL_DIR=/usr/local/bin
+            curl -LsSf https://astral.sh/uv/0.9.2/install.sh | sh
+
+            # --- Dedicated non-root service user (replaces the container uid) ----
+            id dsqlapp &>/dev/null || useradd --system --home-dir /opt/dsql-migrator --shell /usr/sbin/nologin dsqlapp
 
             # --- Retained EBS state volume --------------------------------------
             # Wait for the data volume attachment (/dev/sdf, presented as an nvme
@@ -1142,40 +1236,99 @@ Resources:
             grep -q " /var/lib/dsql-migrator " /etc/fstab || \
               echo "${!DEV} /var/lib/dsql-migrator xfs defaults,nofail 0 2" >> /etc/fstab
             mount /var/lib/dsql-migrator
-            # The container runs as uid 10001; give it ownership of the state mount.
-            chown -R 10001:10001 /var/lib/dsql-migrator
+            # The systemd service runs as dsqlapp; give it ownership of the state mount.
+            chown -R dsqlapp:dsqlapp /var/lib/dsql-migrator
 
-            # --- Fetch the cookie-signing secret --------------------------------
+            # --- Obtain the app source (NO Docker/ECR) --------------------------
+            # SourceMode selects how the source lands at /opt/dsql-migrator:
+            #   s3   -> download+extract a source tarball from S3 (TEMPORARY: use your
+            #           LOCAL working copy now, before the repo is public on GitHub).
+            #   git  -> git clone (public HTTPS by default; SSH + a deploy key from SSM
+            #           when DeployKeySsmParam is set -- the temporary AWS GitLab path).
+            install -d -o dsqlapp -g dsqlapp -m 0755 /opt/dsql-migrator
+            SOURCE_MODE="${SourceMode}"
+            if [ "${!SOURCE_MODE}" = "s3" ]; then
+              aws s3 cp "${SourceS3Uri}" /tmp/dsql-src.tar.gz --region ${AWS::Region}
+              tar -xzf /tmp/dsql-src.tar.gz -C /opt/dsql-migrator --strip-components=1
+              chown -R dsqlapp:dsqlapp /opt/dsql-migrator
+            else
+              DEPLOY_KEY_PARAM="${DeployKeySsmParam}"
+              GIT_SSH_COMMAND=""
+              if [ -n "${!DEPLOY_KEY_PARAM}" ]; then
+                # TEMPORARY GitLab SSH path: fetch a read-only deploy key from SSM.
+                install -d -o dsqlapp -g dsqlapp -m 0700 /opt/dsql-migrator/.ssh
+                aws ssm get-parameter --with-decryption --name "${!DEPLOY_KEY_PARAM}" \
+                  --query Parameter.Value --output text --region ${AWS::Region} \
+                  > /opt/dsql-migrator/.ssh/id_deploy
+                chmod 600 /opt/dsql-migrator/.ssh/id_deploy
+                GIT_HOST=$(echo "${SourceRepoUrl}" | sed -E 's/^[^@]+@([^:]+):.*/\1/')
+                ssh-keyscan -H "${!GIT_HOST}" > /opt/dsql-migrator/.ssh/known_hosts 2>/dev/null
+                chmod 600 /opt/dsql-migrator/.ssh/known_hosts
+                chown -R dsqlapp:dsqlapp /opt/dsql-migrator/.ssh
+                GIT_SSH_COMMAND="ssh -i /opt/dsql-migrator/.ssh/id_deploy -o UserKnownHostsFile=/opt/dsql-migrator/.ssh/known_hosts -o IdentitiesOnly=yes"
+              fi
+              sudo -u dsqlapp -H env GIT_SSH_COMMAND="${!GIT_SSH_COMMAND}" \
+                git clone --depth 1 --branch ${SourceRepoRef} ${SourceRepoUrl} /opt/dsql-migrator
+            fi
+
+            # --- Sync the venv from the frozen lock WITH the CDC seed client -----
+            # --extra cdc-external is REQUIRED (SeedMode=External). Editable root install
+            # so __file__ resolves into the checkout (connectors/plugins/*.zip +
+            # deploy/cdc-stack/cdc-stack.yaml).
+            sudo -u dsqlapp -H /usr/local/bin/uv sync --frozen --no-dev \
+              --extra cdc-external --project /opt/dsql-migrator
+
+            # --- Fetch the cookie-signing secret + derive the CDC deploy-role ARN ---
             STORAGE_SECRET=$(aws secretsmanager get-secret-value --secret-id ${StorageSecret} --query SecretString --output text --region ${AWS::Region})
-
-            # Role the app assumes for cdc-stack CFN operations (privileges kept off
-            # the host role). Built by name to match CdcDeployRole's RoleName.
             CDC_DEPLOY_ROLE_ARN="arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-cdc-deploy"
 
-            # --- Run the app container ------------------------------------------
-            # Published to 127.0.0.1 only: the UI is reached via the SSM port-forward
-            # to this host port, never exposed on the host's network interface.
-            #
-            # JOB_STATE_BUCKET / SESSION_STATE_BUCKET are intentionally UNSET so the
-            # app uses its local SqliteJobStore / SqliteSessionStateStore on the EBS
-            # mount (durable across container restart AND instance replacement via the
-            # retained volume) -- no S3 round-trip needed for state in this mode.
-            docker run -d --restart=always --name dsql-migrator \
-              -p 127.0.0.1:${AppPort}:8080 \
-              -v /var/lib/dsql-migrator:/state \
-              -e DSQL_MIGRATOR_APP_HOST=0.0.0.0 \
-              -e DSQL_MIGRATOR_STORAGE_SECRET="${!STORAGE_SECRET}" \
-              -e DSQL_MIGRATOR_JOB_STATE_PATH=/state/job_state.sqlite \
-              -e DSQL_MIGRATOR_SESSION_STATE_PATH=/state/session_state.sqlite \
-              -e DSQL_MIGRATOR_ACTIVITY_LOG_PATH=/state/migration_activity.log \
-              -e DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT=${EnableActivityLogCloudWatch} \
-              -e DSQL_MIGRATOR_CDC_SEED_MODE=external \
-              -e AWS_STS_REGIONAL_ENDPOINTS=regional \
-              -e DSQL_MIGRATOR_AWS_REGION=${AWS::Region} \
-              -e DSQL_MIGRATOR_CDC_DEPLOY_ROLE_ARN="${!CDC_DEPLOY_ROLE_ARN}" \
-              -e BEDROCK_MODEL_ID=${BedrockModelId} \
-              -e BEDROCK_REGION=${BedrockRegion} \
-              ${ContainerImageUri}
+            # --- Runtime env (0600; read by the systemd unit) -------------------
+            # APP_HOST=127.0.0.1: bind loopback only; the UI is reached via the SSM
+            # port-forward to this host port, never exposed on a network interface
+            # (the SG also has no inbound). JOB_STATE_BUCKET / SESSION_STATE_BUCKET are
+            # intentionally UNSET so the app uses SqliteJobStore / SqliteSessionStateStore
+            # on the retained EBS mount -- durable across restart AND instance replacement.
+            cat > /etc/dsql-migrator.env <<EOF
+            DSQL_MIGRATOR_APP_HOST=127.0.0.1
+            DSQL_MIGRATOR_APP_PORT=${AppPort}
+            DSQL_MIGRATOR_STORAGE_SECRET=${!STORAGE_SECRET}
+            DSQL_MIGRATOR_JOB_STATE_PATH=/var/lib/dsql-migrator/job_state.sqlite
+            DSQL_MIGRATOR_SESSION_STATE_PATH=/var/lib/dsql-migrator/session_state.sqlite
+            DSQL_MIGRATOR_ACTIVITY_LOG_PATH=/var/lib/dsql-migrator/migration_activity.log
+            DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT=${EnableActivityLogCloudWatch}
+            DSQL_MIGRATOR_CDC_SEED_MODE=external
+            AWS_STS_REGIONAL_ENDPOINTS=regional
+            DSQL_MIGRATOR_AWS_REGION=${AWS::Region}
+            DSQL_MIGRATOR_CDC_DEPLOY_ROLE_ARN=${!CDC_DEPLOY_ROLE_ARN}
+            BEDROCK_MODEL_ID=${BedrockModelId}
+            BEDROCK_REGION=${BedrockRegion}
+            EOF
+            chmod 600 /etc/dsql-migrator.env
+
+            # --- systemd unit: run the venv console script as dsqlapp -----------
+            # ExecStart uses the venv entrypoint directly (not `uv run`) so start does
+            # no network/resolve; Restart=always mirrors the container's restart policy.
+            cat > /etc/systemd/system/dsql-migrator.service <<'EOF'
+            [Unit]
+            Description=MySQL -> Aurora DSQL migration tool (NiceGUI, run from source)
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            Type=simple
+            User=dsqlapp
+            Group=dsqlapp
+            WorkingDirectory=/opt/dsql-migrator
+            EnvironmentFile=/etc/dsql-migrator.env
+            ExecStart=/opt/dsql-migrator/.venv/bin/mysql-dsql-migrator ui
+            Restart=always
+            RestartSec=5
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl enable --now dsql-migrator.service
 
   # Durable state volume: job/session SQLite + activity log + Full Load CSV
   # spillover. Retain on BOTH delete and replace so the migration's state survives

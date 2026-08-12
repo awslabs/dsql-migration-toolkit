@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.310
+
+### Changed
+
+- **The "EC2 + MSK only" deploy mode now runs the app FROM SOURCE — no Docker, no
+  ECR.** For customers who cannot use a container registry, `deploy/cloudformation-ec2.yaml`
+  no longer pulls a container image; instead the host installs `git` + `uv`, obtains
+  the app source, runs `uv sync --extra cdc-external`, and starts the app as a
+  `systemd` service (`dsql-migrator.service`) — reached the same way (SSM
+  port-forward), with the same retained-EBS state and `SeedMode=External`. Source
+  acquisition is a new `SourceMode` parameter: `git` (default — `git clone` the
+  public repo over HTTPS, or the AWS GitLab SSH URL with a read-only deploy key from
+  SSM via the new `DeployKeySsmParam`, which auto-drops its IAM grant + port-22 egress
+  once the repo is public) or `s3` (download + extract a source tarball from
+  `SourceS3Uri` — the simple way to run a local working copy before the repo is
+  public). The `ContainerImageUri` parameter and all Docker steps are removed. The
+  Fargate app-stack (`deploy/cloudformation.yaml`) is unchanged and still image-based;
+  the Dockerfile keeps `--extra cdc-external` (inert unless `SeedMode=External`).
+
 ## v0.1.309
 
 ### Fixed

@@ -97,25 +97,38 @@ existing Lambda-mode stack. ❌ If any resource shows Modify/Remove, stop and re
 
 ---
 
-## 2. Publish an image that contains the `cdc-external` extra
+## 2. Stage the app source (NO Docker/ECR)
 
-`SeedMode=External` needs `kafka-python` + the MSK IAM SASL signer baked in. The
-default published image (`:0.1.303`) predates the `--extra cdc-external` Dockerfile
-change, so **build and push a fresh image** (or use CodeBuild if you have no local
-Docker):
+This mode runs the app **from source** (`git clone` + `uv sync` + systemd) — no
+container, no registry. The host obtains the source per `SourceMode`:
+
+- **`git`** (default): clones `SourceRepoUrl@SourceRepoRef`. Public HTTPS needs no
+  auth; the temporary AWS GitLab SSH path uses a deploy key (`DeployKeySsmParam`).
+- **`s3`**: downloads + extracts a source tarball from `SourceS3Uri` — the simplest
+  way to run **your local working copy now**, before the repo is public on GitHub.
+
+For this test use **`s3` with your local checkout**. Tar the repo root and upload it
+to the managed plugin bucket (already used for CDC artifacts, so no new bucket):
 
 ```bash
-# Local Docker → ECR Public (see deploy/build_and_push.sh for the full script):
-deploy/build_and_push.sh                 # builds from deploy/Dockerfile, pushes a tag
-# note the pushed image URI, e.g. public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.308
-export IMAGE_URI=public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.308
+export BUCKET=mysql-dsql-migrator-plugins-$ACCOUNT-$AWS_REGION
+# Tar the repo root (this worktree). --exclude keeps the tarball small; the app only
+# needs src/, pyproject.toml, uv.lock, connectors/, deploy/.
+tar -czf /tmp/dsql-src.tar.gz \
+  --exclude='.git' --exclude='.venv' --exclude='node_modules' --exclude='.claude' \
+  -C "$PWD" .
+export SOURCE_S3_URI="s3://$BUCKET/source/dsql-src.tar.gz"
+aws s3 cp /tmp/dsql-src.tar.gz "$SOURCE_S3_URI" --region "$AWS_REGION"
+echo "SOURCE_S3_URI=$SOURCE_S3_URI"
 ```
-Verify the extra is in the image:
-```bash
-docker run --rm --entrypoint python "$IMAGE_URI" -c "import kafka, aws_msk_iam_sasl_signer; print('cdc-external OK')"
-```
-✅ Pass = prints `cdc-external OK`. ❌ `ModuleNotFoundError` = the image lacks the
-extra; rebuild after confirming `deploy/Dockerfile` has `uv sync ... --extra cdc-external`.
+> The tarball must extract to the repo root with `--strip-components=1`, i.e. contain
+> a single top-level dir OR the files at top level — `tar -C "$PWD" .` above produces
+> files at the archive root, so the host's `--strip-components=1` strips the leading
+> `./`. (If you instead `tar` a parent dir, adjust accordingly.)
+>
+> The host installs `--extra cdc-external` during `uv sync`, so `kafka-python` + the
+> MSK IAM signer (needed for `SeedMode=External`) come from your `uv.lock` — no image
+> build, no `docker`.
 
 ---
 
@@ -146,9 +159,12 @@ aws cloudformation deploy \
     HostSubnetId="$HOST_SUBNET_ID" \
     DsqlClusterArn="$DSQL_CLUSTER_ARN" \
     SourceDbSecurityGroupId="$SOURCE_DB_SG" \
-    ContainerImageUri="$IMAGE_URI" \
+    SourceMode=s3 \
+    SourceS3Uri="$SOURCE_S3_URI" \
     MskEgressCidr="$HOST_SUBNET_CIDR"      # or the connector-subnet CIDR; narrows 9098 egress
 ```
+> `SourceMode=s3` + `SourceS3Uri` runs your uploaded local copy. For the final public
+> GitHub state, omit both (defaults to `SourceMode=git` cloning the public repo).
 > Stack name must **not** start with `mysql-dsql-cdc-` (that prefix falls into the
 > CdcDeployRole scope). `mysql-dsql-migrator-ec2` is fine.
 
@@ -164,14 +180,14 @@ Note `HostInstanceId` and `SsmPortForwardCommand`.
 INSTANCE_ID=$(aws cloudformation describe-stacks --stack-name mysql-dsql-migrator-ec2 \
   --region "$AWS_REGION" --query "Stacks[0].Outputs[?OutputKey=='HostInstanceId'].OutputValue" --output text)
 
-# Wait ~2-3 min for user-data, then check via SSM Run Command:
+# Wait ~3-4 min for user-data (git/uv install + uv sync), then check via SSM Run Command:
 aws ssm send-command --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript \
-  --parameters 'commands=["docker ps --format {{.Names}}\\ {{.Status}}","tail -n 20 /var/log/dsql-migrator-userdata.log","mount | grep dsql-migrator"]' \
+  --parameters 'commands=["systemctl is-active dsql-migrator.service","tail -n 30 /var/log/dsql-migrator-userdata.log","mount | grep dsql-migrator"]' \
   --region "$AWS_REGION" --query Command.CommandId --output text
 # then: aws ssm get-command-invocation --command-id <id> --instance-id $INSTANCE_ID --region $AWS_REGION --query StandardOutputContent --output text
 ```
-✅ Pass = `dsql-migrator  Up ...`, the EBS mount on `/var/lib/dsql-migrator`, no
-errors in the user-data log.
+✅ Pass = `active` (the systemd service is up), the EBS mount on
+`/var/lib/dsql-migrator`, no errors in the user-data log.
 
 ### 3b. Reach the UI via SSM port-forward
 Run the `SsmPortForwardCommand` output (or):
@@ -216,18 +232,18 @@ In the UI (over the port-forward), walk the normal journey: **Connect → Evalua
 container has `DSQL_MIGRATOR_CDC_SEED_MODE=external`, Start CDC runs the seed
 in-process.
 
-Confirm the mode actually took effect (host env + deploy log):
+Confirm the mode actually took effect (service env + deploy log):
 ```bash
-# The container env should show external:
+# The service env file should show external:
 aws ssm send-command --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript \
-  --parameters 'commands=["docker exec dsql-migrator printenv DSQL_MIGRATOR_CDC_SEED_MODE"]' \
+  --parameters 'commands=["grep DSQL_MIGRATOR_CDC_SEED_MODE /etc/dsql-migrator.env"]' \
   --region "$AWS_REGION" --query Command.CommandId --output text
-# expect: external
+# expect: DSQL_MIGRATOR_CDC_SEED_MODE=external
 ```
-In the CDC deploy log (UI, or `docker logs dsql-migrator`) you should see the
-in-process prep line: `SeedMode=External: preparing CDC topics + offset in-process
-…` followed by `In-process CDC prep complete (offset seed: true|skipped)`, then the
-connectors reaching RUNNING.
+In the CDC deploy log (UI, or `journalctl -u dsql-migrator` on the host) you should
+see the in-process prep line: `SeedMode=External: preparing CDC topics + offset
+in-process …` followed by `In-process CDC prep complete (offset seed: true|skipped)`,
+then the connectors reaching RUNNING.
 
 Confirm **no offset-seeder Lambda** was created in External mode:
 ```bash
@@ -284,9 +300,24 @@ aws ec2 describe-volumes --region "$AWS_REGION" \
 ## Known gaps to expect while testing (deferred, by design)
 - **`HostSubnetCidr` is a manual param** — the app doesn't auto-derive/inject it
   into the cdc-stack yet, so step 4 is a manual one-time add.
-- **Image republish needed** — the published `:0.1.303` default lacks the
-  `cdc-external` extra; step 2 builds `:0.1.308`. Point `ContainerImageUri` at it.
-- **`ContainerImageUri` default drift** — the template default still points at an
-  older tag; always pass your freshly-built image.
+- **Source is your LOCAL copy via S3 (temporary)** — until the repo is public on
+  GitHub, use `SourceMode=s3` + `SourceS3Uri` (step 2). Once public, switch to the
+  default `SourceMode=git` (public HTTPS clone, no S3, no auth). The AWS GitLab SSH
+  path (`DeployKeySsmParam`) is an alternative bridge but needs an out-of-band deploy
+  key (see below); the S3 path avoids that entirely.
+- **`uv sync` fetches deps at boot** — the host installs Python 3.12 + wheels over
+  443 during user-data, so first boot takes ~3-4 min and needs NAT/egress; failures
+  show in `/var/log/dsql-migrator-userdata.log`.
 - **Large-table Full Load staging** — `staging_bucket` is S3-only; for very large
   tables set `DSQL_MIGRATOR_STAGING_BUCKET` or size the EBS volume accordingly.
+
+### (Optional) temporary AWS GitLab SSH clone instead of S3
+If you prefer `git clone` from AWS GitLab now (instead of the S3 tarball):
+1. `ssh-keygen -t ecdsa -f deploy-key` (no passphrase); register `deploy-key.pub`
+   as a **read-only Deploy Key** on the GitLab project.
+2. `aws ssm put-parameter --name mysql-dsql-migrator/deploy-key --type SecureString
+   --value "$(cat deploy-key)" --region "$AWS_REGION"` (name **without** a leading `/`).
+3. Deploy with `SourceMode=git SourceRepoUrl=git@ssh.gitlab.aws.dev:dalyoung/mysql-dsql-migration-tool-public.git
+   DeployKeySsmParam=mysql-dsql-migrator/deploy-key` — this enables the read-deploy-key
+   IAM grant + the port-22 egress automatically. Delete the key + SSM param once the
+   repo is public on GitHub.

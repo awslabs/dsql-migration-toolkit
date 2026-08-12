@@ -5,6 +5,23 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.310
+
+### 변경 (Changed)
+
+- **"EC2 + MSK만" 배포 모드가 이제 소스에서 직접 실행됩니다 — Docker·ECR 없음.** 컨테이너
+  레지스트리를 쓸 수 없는 고객을 위해 `deploy/cloudformation-ec2.yaml`이 더 이상 컨테이너
+  이미지를 pull 하지 않습니다. 대신 호스트가 `git` + `uv`를 설치하고, 앱 소스를 받아
+  `uv sync --extra cdc-external`을 실행한 뒤 `systemd` 서비스(`dsql-migrator.service`)로
+  앱을 띄웁니다 — 접속 방식(SSM 포트포워드), 보존형 EBS 상태, `SeedMode=External`은 동일합니다.
+  소스 취득은 새 `SourceMode` 파라미터로 선택합니다: `git`(기본 — 공개 repo를 HTTPS로
+  `git clone`, 또는 SSM의 읽기전용 배포키(`DeployKeySsmParam`)로 AWS GitLab SSH URL clone;
+  이 키 관련 IAM 권한·22번 포트 egress는 repo가 공개되면 자동으로 사라짐) 또는 `s3`(소스
+  tarball을 `SourceS3Uri`에서 받아 전개 — repo 공개 전 로컬 작업본을 실행하는 간단한 방법).
+  `ContainerImageUri` 파라미터와 모든 Docker 단계는 제거됐습니다. Fargate 앱 스택
+  (`deploy/cloudformation.yaml`)은 무변경이며 여전히 이미지 기반이고, Dockerfile은
+  `--extra cdc-external`을 유지합니다(`SeedMode=External`이 아니면 inert).
+
 ## v0.1.309
 
 ### 수정 (Fixed)

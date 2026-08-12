@@ -133,20 +133,54 @@ def test_user_data_sets_external_seed_and_ebs_state() -> None:
     text = str(ud)
     assert "DSQL_MIGRATOR_CDC_SEED_MODE=external" in text
     assert "AWS_STS_REGIONAL_ENDPOINTS=regional" in text
-    assert "/state/job_state.sqlite" in text
-    assert "/state/session_state.sqlite" in text
-    # State buckets intentionally NOT passed as env (EBS-SQLite branch selected).
-    # (A comment may mention them; assert they are not SET as docker -e vars.)
-    assert "-e DSQL_MIGRATOR_JOB_STATE_BUCKET" not in text
-    assert "-e DSQL_MIGRATOR_SESSION_STATE_BUCKET" not in text
+    # State on the retained EBS mount (host paths, not the old container /state bind).
+    assert "/var/lib/dsql-migrator/job_state.sqlite" in text
+    assert "/var/lib/dsql-migrator/session_state.sqlite" in text
+    # State buckets intentionally NOT set (EBS-SQLite branch selected).
+    assert "DSQL_MIGRATOR_JOB_STATE_BUCKET" not in text
+    assert "DSQL_MIGRATOR_SESSION_STATE_BUCKET" not in text
 
 
-def test_params_add_ec2_and_drop_alb_cognito() -> None:
+def test_user_data_runs_from_source_not_docker() -> None:
+    # The minimal mode runs from source (git clone / S3 tarball) via uv + systemd,
+    # with NO Docker and NO ECR image.
+    ud = str(_load()["Resources"]["AppHost"]["Properties"]["UserData"])
+    assert "docker" not in ud  # no Docker install / run
+    assert "uv sync" in ud and "--extra cdc-external" in ud  # deps incl. seed client
+    assert "git clone" in ud
+    assert "dsql-migrator.service" in ud  # systemd unit
+    assert "/opt/dsql-migrator/.venv/bin/mysql-dsql-migrator ui" in ud  # ExecStart
+
+
+def test_user_data_source_mode_branches() -> None:
+    # SourceMode selects S3-tarball (run the local copy now) vs git clone.
+    ud = str(_load()["Resources"]["AppHost"]["Properties"]["UserData"])
+    assert 'if [ "${!SOURCE_MODE}" = "s3" ]' in ud  # S3 tarball branch
+    assert "aws s3 cp" in ud
+    # Temporary GitLab SSH deploy-key path is present but conditional (DeployKeySsmParam).
+    assert "get-parameter --with-decryption" in ud
+
+
+def test_deploy_key_grant_and_egress_are_conditional() -> None:
+    doc = _load()
+    assert "HasDeployKey" in doc["Conditions"]
+    # Port-22 egress exists only on the temporary GitLab SSH path.
+    git_egress = doc["Resources"]["GitSshEgress"]
+    assert git_egress["Condition"] == "HasDeployKey"
+    assert git_egress["Properties"]["FromPort"] == 22
+
+
+def test_params_source_model_dropped_and_added() -> None:
     params = _load()["Parameters"]
-    for added in ("InstanceType", "HostSubnetId", "StateVolumeSizeGiB", "MskEgressCidr",
-                  "LatestAl2023Ami"):
+    # New source-acquisition params.
+    for added in ("SourceMode", "SourceS3Uri", "SourceRepoUrl", "SourceRepoRef",
+                  "DeployKeySsmParam", "InstanceType", "HostSubnetId",
+                  "StateVolumeSizeGiB", "MskEgressCidr", "LatestAl2023Ami"):
         assert added in params, added
-    for dropped in ("CertificateArn", "AlbScheme", "AssignPublicIp",
-                    "EnableCognitoAuth", "ContainerCpu", "ContainerMemory"):
+    # Docker/ECR + ALB/Cognito/Fargate params gone.
+    for dropped in ("ContainerImageUri", "CertificateArn", "AlbScheme",
+                    "AssignPublicIp", "EnableCognitoAuth", "ContainerCpu",
+                    "ContainerMemory"):
         assert dropped not in params, dropped
     assert "VpcId" in params  # the one irreducible operator input, reused
+    assert params["SourceMode"]["Default"] == "git"
