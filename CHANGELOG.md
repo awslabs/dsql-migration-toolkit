@@ -5,6 +5,126 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.311
+
+### Fixed
+
+- **The `SeedMode=External` CDC path now actually deploys against CloudFormation, and
+  the EC2 host wires it end-to-end.** Two gaps from the v0.1.307/v0.1.310 work:
+  (1) `run_cdc_start` sent the lowercase `"external"` as the `SeedMode` parameter, which
+  CloudFormation rejects against the template's case-sensitive `AllowedValues`
+  `["Lambda","External"]` (the unit tests used a fake deployer that skips validation, so
+  it went unnoticed) — it now sends `"External"`. (2) The CDC **infra-create** pass never
+  carried `SeedMode` or `HostSubnetCidr`, so a UI-driven deploy from the EC2 host created
+  the stack in Lambda mode (making the in-VPC seeder Lambda, only to delete it on the
+  first Start) and never opened MSK port 9098 for the in-process seed. `build_cdc_infra_params`
+  now emits both at create time (mapping the lowercase config value to the capitalized
+  template token), sourced from a new `DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR` config key that
+  the EC2 user-data auto-resolves from the host's own subnet. Result: on the Lambda-free
+  host, "Deploy CDC infra" creates a `SeedMode=External` stack (no seeder Lambda) that
+  admits the host on 9098; Fargate/local default to Lambda with no ingress (unchanged).
+
+## v0.1.310
+
+### Changed
+
+- **The "EC2 + MSK only" deploy mode now runs the app FROM SOURCE — no Docker, no
+  ECR.** For customers who cannot use a container registry, `deploy/cloudformation-ec2.yaml`
+  no longer pulls a container image; instead the host installs `git` + `uv`, obtains
+  the app source, runs `uv sync --extra cdc-external`, and starts the app as a
+  `systemd` service (`dsql-migrator.service`) — reached the same way (SSM
+  port-forward), with the same retained-EBS state and `SeedMode=External`. Source
+  acquisition is a new `SourceMode` parameter: `git` (default — `git clone` the
+  public repo over HTTPS, or the AWS GitLab SSH URL with a read-only deploy key from
+  SSM via the new `DeployKeySsmParam`, which auto-drops its IAM grant + port-22 egress
+  once the repo is public) or `s3` (download + extract a source tarball from
+  `SourceS3Uri` — the simple way to run a local working copy before the repo is
+  public). The `ContainerImageUri` parameter and all Docker steps are removed. The
+  Fargate app-stack (`deploy/cloudformation.yaml`) is unchanged and still image-based;
+  the Dockerfile keeps `--extra cdc-external` (inert unless `SeedMode=External`).
+
+## v0.1.309
+
+### Fixed
+
+- **The CDC stack failed to deploy** with `Template error: YAML aliases are not
+  allowed in CloudFormation templates`. The v0.1.307 sink-connector split used a YAML
+  anchor/alias (`&DsqlSinkProps` / `*DsqlSinkProps`) to share one body between the
+  Lambda and External sink variants. PyYAML resolves anchors fine (so the structural
+  unit tests passed), but **CloudFormation rejects any anchor/alias**, so a real
+  `create-change-set` / deploy against the cdc-stack was blocked. The shared body is
+  now duplicated verbatim into the two variants (the only difference is the External
+  variant's omitted `CdcStartPrepResource` dependency), a test asserts the two bodies
+  stay byte-identical, and a new guard scans every deploy template's raw text to
+  reject any YAML anchor/alias so this deploy-blocker cannot recur.
+
+## v0.1.308
+
+### Added
+
+- **A Lambda-free "EC2 + MSK only" deployment mode** for customers who cannot use AWS
+  Lambda, built on the `SeedMode=External` machinery from v0.1.307. A new deploy
+  template `deploy/cloudformation-ec2.yaml` runs the whole control plane (the web UI +
+  Full Load engine + in-process CDC seed) on a **single EC2 instance inside the CDC
+  VPC**, reached over **SSM port-forward** — no ALB, ACM certificate, or Cognito. State
+  (the job / session SQLite databases) lives on a **retained EBS volume** so it survives
+  instance replacement, instead of the S3 stores the Fargate stack uses. Because that
+  host runs inside the VPC it reaches MSK directly, so **"the host is the mode"**: the
+  EC2 host's user-data sets `DSQL_MIGRATOR_CDC_SEED_MODE=external` (a new config key) and
+  runs CDC Lambda-free, while the existing Fargate/local deployments leave it unset and
+  stay on the in-VPC seeder Lambda — unchanged. Supporting bits: a new
+  `DSQL_MIGRATOR_CDC_SEED_MODE` config key threaded into Start CDC (default `lambda`); an
+  additive, condition-gated `HostSubnetCidr` parameter on the CDC stack that admits the
+  host to MSK on port 9098 by subnet CIDR (empty default → no rule, so existing deploys
+  are unchanged); and the container image now bakes the `cdc-external` extra
+  (`kafka-python` + the MSK IAM SASL signer, both pure-Python and inert unless
+  `SeedMode=External`). The Fargate app-stack, the Lambda-mode default, and
+  `PLUGIN_VERSION` are all untouched.
+
+## v0.1.307
+
+### Added
+
+- **`SeedMode` for the CDC stack — an opt-in, Lambda-free ("EC2 + MSK only") way to
+  do the CDC Kafka prep.** The gapless Full Load → CDC handoff needs three Kafka
+  steps done in-VPC before the connectors are created (pre-create the compacted
+  offset topic + per-table data topics + DLQ topic, and seed the connect-offsets
+  record). Today an in-VPC seeder Lambda does this. A new `SeedMode` parameter
+  (default `Lambda` = today's behavior, unchanged) adds an `External` mode in which
+  the deploying app does the prep **in-process** over the MSK IAM bootstrap before
+  the connectors are created — so a customer who cannot use AWS Lambda can run CDC
+  from an in-VPC host. In `External` mode the stack omits the seeder Lambda, its
+  role, and the `CdcStartPrepResource` custom resource, and selects a sink-connector
+  variant without the `CdcStartPrepResource` dependency; the two sink variants share
+  a single body via a YAML anchor so they cannot drift. The in-process Kafka client
+  (`kafka-python` + the MSK IAM SASL signer) is an **optional extra**
+  (`pip install ".[cdc-external]"`), so the default install and container image are
+  unchanged. **Everything is behind the default:** with `SeedMode=Lambda` (the
+  default) no app-side seed runs, no `SeedMode` is sent, and the set of deployed
+  resources is identical to before — this release only adds the machinery. The
+  security-group / IAM / VPC-co-location wiring that lets a real host reach the
+  cluster on port 9098 lands separately with the EC2 host. `PLUGIN_VERSION` is
+  unchanged (no connector/seeder artifact changed).
+
+## v0.1.306
+
+### Internal
+
+- **Extracted the pure CDC Kafka-prep decision logic into one canonical app module**
+  (`core/cdc_kafka_prep.py`), the foundation for an upcoming Lambda-free ("EC2 + MSK
+  only") minimal deployment option. The in-VPC offset-seeder Lambda
+  (`deploy/cdc-stack/lambda/seeder.py`) has always duplicated three pure helpers
+  (`parse_partitions_map`, `binlog_seq`, `offset_already_at_or_past`) and the
+  topic-shaping decision inline; those now have a single, unit-tested home app-side
+  (plus a `TopicSpec` / `plan_topics()` planner), and the offset-record builders are
+  re-exported from `core/cdc_offset_seed.py` (kept as the one canonical builder). This
+  change is **app-side only**: the Lambda source, the committed connector/seeder ZIPs,
+  and `PLUGIN_VERSION` are untouched, so **every existing deployment behaves
+  identically**. A drift-guard test now asserts the Lambda's inline copies stay
+  behaviorally identical to the canonical module in both directions, and a new
+  packaging guard asserts the committed offset-seeder ZIP still embeds the current
+  on-disk Lambda sources.
+
 ## v0.1.305
 
 ### Added

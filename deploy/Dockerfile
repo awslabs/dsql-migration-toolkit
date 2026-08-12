@@ -20,9 +20,14 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app
 
 # Install dependencies first (better layer caching), then the project itself.
+# --extra cdc-external bakes the in-process CDC Kafka client (kafka-python + the MSK
+# IAM SASL signer) into the image so the Lambda-free "EC2 + MSK only" host can run
+# SeedMode=External. Both are pure-Python wheels and are imported lazily + only under
+# SeedMode=External (cdc_kafka_seed.py), so they are INERT for the default Fargate /
+# Lambda-mode deployment — this does not change existing runtime behavior.
 COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --extra cdc-external
 
 # Bundle the three CDC deploy artifacts so the tool can upload them to the
 # customer's S3 bucket at deploy time (s3_provision._artifact_paths resolves these

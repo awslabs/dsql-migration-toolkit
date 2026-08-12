@@ -297,6 +297,88 @@ def test_vendored_record_omits_gtids_when_absent(seeder_env) -> None:
     assert "gtids" not in json.loads(value_json)
 
 
+def test_vendored_record_matches_canonical_with_base_offset(seeder_env) -> None:
+    # The PRODUCTION seed path is read-modify-write: seeder.py calls
+    # _build_connect_offset_record(..., base_offset=existing) where `existing` is the
+    # connector's LIVE offset. That branch (dict(base_offset); pop snapshot /
+    # snapshot_completed; pop-or-set gtids; preserve every other live key) is the
+    # intricate one and is duplicated in seeder.py and cdc_offset_seed.py. The
+    # from-scratch guards above never feed base_offset, so a one-sided edit to the RMW
+    # handling (e.g. dropping the snapshot_completed pop in only one copy) would
+    # mis-seed the connector with all guards still green. This guard closes that gap:
+    # the vendored and canonical builders must produce the SAME record for a live
+    # offset that carries snapshot/snapshot_completed + an extra connector-specific key.
+    module, _ = seeder_env
+    ts = datetime(2026, 6, 27, 12, 0, tzinfo=timezone.utc)
+    ts_sec = int(ts.timestamp())
+    base_offset = {
+        "file": "mysql-bin.000010",
+        "pos": 2,
+        "row": 0,
+        "server_id": 7,
+        "event": 0,
+        "ts_usec": 12345,            # extra live key -> must be preserved by both
+        "snapshot": True,            # in-progress markers -> must be popped by both
+        "snapshot_completed": True,
+        "gtids": "STALE:1-2",        # stale gtids -> overridden from the watermark
+    }
+    wm_dict = {
+        "file": "mysql-bin.000042",
+        "pos": 15324,
+        "gtids": "UUID:1-9",
+        "ts_sec": ts_sec,
+    }
+    vendored = module._build_connect_offset_record(
+        "mysql-dsql-cdc-stack-debezium-source", "dsqlcdc", wm_dict,
+        base_offset=dict(base_offset),
+    )
+    canonical = build_connect_offset_record(
+        "mysql-dsql-cdc-stack-debezium-source",
+        "dsqlcdc",
+        Watermark(
+            binlog_file="mysql-bin.000042",
+            binlog_position=15324,
+            gtid_executed="UUID:1-9",
+            snapshot_timestamp=ts,
+        ),
+        base_offset=dict(base_offset),
+    )
+    assert vendored == canonical
+    # And prove the RMW semantics actually fired (so the guard can't pass vacuously):
+    import json as _json
+
+    value = _json.loads(vendored[1])
+    assert value["ts_usec"] == 12345       # preserved
+    assert value["server_id"] == 7         # preserved
+    assert "snapshot" not in value          # popped
+    assert "snapshot_completed" not in value  # popped
+    assert value["gtids"] == "UUID:1-9"    # overridden from watermark
+
+
+def test_vendored_record_matches_canonical_base_offset_no_gtids(seeder_env) -> None:
+    # RMW branch, GTID-less source: a stale gtids in the live offset must be dropped
+    # (file:pos-only resume) identically by both copies.
+    module, _ = seeder_env
+    base_offset = {"file": "mysql-bin.000010", "pos": 2, "row": 0,
+                   "server_id": 7, "event": 0, "gtids": "STALE:1-2"}
+    ts = datetime(2026, 6, 27, 12, 0, tzinfo=timezone.utc)
+    wm_dict = {"file": "mysql-bin.000042", "pos": 15324, "gtids": None,
+               "ts_sec": int(ts.timestamp())}
+    vendored = module._build_connect_offset_record(
+        "c", "p", wm_dict, base_offset=dict(base_offset)
+    )
+    canonical = build_connect_offset_record(
+        "c", "p",
+        Watermark(binlog_file="mysql-bin.000042", binlog_position=15324,
+                  gtid_executed=None, snapshot_timestamp=ts),
+        base_offset=dict(base_offset),
+    )
+    assert vendored == canonical
+    import json as _json
+
+    assert "gtids" not in _json.loads(vendored[1])
+
+
 # --------------------------------------------------------------------------- #
 # _offset_already_at_or_past — the no-clobber comparison
 # --------------------------------------------------------------------------- #
@@ -671,3 +753,124 @@ def test_cfnresponse_gives_up_after_max_attempts_without_raising(monkeypatch) ->
     # retries and return quietly (never loop forever, never propagate).
     cfn.send(_cfn_event(), _CfnCtx(), cfn.FAILED, {}, "pid", reason="boom")
     assert calls["n"] == cfn._SEND_MAX_ATTEMPTS  # bounded (not 1, not infinite)
+
+
+# --------------------------------------------------------------------------- #
+# Drift guards: the Lambda's inline PURE logic must stay byte-behaviorally
+# identical to the canonical app module dsql_migrator.core.cdc_kafka_prep. The
+# builder trio is already guarded above (test_vendored_record_matches_canonical_builder);
+# these extend the guard to the three pure helpers the app absorbed AND to the
+# topic-shaping plan, so a change to EITHER copy that diverges fails CI.
+# --------------------------------------------------------------------------- #
+from dsql_migrator.core import cdc_kafka_prep  # noqa: E402
+
+
+_PARTITION_CSVS = [
+    "a:2,b:3", "", "bad,a:,c:x,d:4", " a : 2 , b : 3 ",
+    "pre.fix:host:5", "a:1,a:9", "dsqlcdc.app.orders:8,dsqlcdc.app.customers:2",
+]
+
+
+def test_vendored_parse_partitions_map_matches_canonical(seeder_env) -> None:
+    module, _ = seeder_env
+    for csv in _PARTITION_CSVS:
+        assert module._parse_partitions_map(csv) == cdc_kafka_prep.parse_partitions_map(csv), csv
+
+
+_BINLOG_NAMES = [
+    "mysql-bin.000042", "mysql-bin.999999", "mysql-bin.1000000",
+    "mysql-bin.1000042", "weird-name", "a.b", "",
+]
+
+
+def test_vendored_binlog_seq_matches_canonical(seeder_env) -> None:
+    module, _ = seeder_env
+    for name in _BINLOG_NAMES:
+        assert module._binlog_seq(name) == cdc_kafka_prep.binlog_seq(name), name
+
+
+_OFFSET_CASES = [
+    (None, {"file": "mysql-bin.000042", "pos": 100}),
+    ({"file": "mysql-bin.000042", "pos": 200}, {"file": "mysql-bin.000042", "pos": 100}),
+    ({"file": "mysql-bin.000042", "pos": 100}, {"file": "mysql-bin.000042", "pos": 100}),
+    ({"file": "mysql-bin.000042", "pos": 50}, {"file": "mysql-bin.000042", "pos": 100}),
+    ({"file": "mysql-bin.000099", "pos": 1}, {"file": "mysql-bin.000042", "pos": 100}),
+    ({"file": "mysql-bin.000001", "pos": 999}, {"file": "mysql-bin.000042", "pos": 100}),
+    ({"file": "mysql-bin.1000000", "pos": 1}, {"file": "mysql-bin.999999", "pos": 500}),
+    ({"file": "mysql-bin.999999", "pos": 999}, {"file": "mysql-bin.1000000", "pos": 10}),
+    ({"file": None, "pos": 5}, {"file": "mysql-bin.000042", "pos": 100}),
+    ({"file": "mysql-bin.000042", "pos": None}, {"file": "mysql-bin.000042", "pos": 100}),
+    ({"file": "weird-b", "pos": 1}, {"file": "weird-a", "pos": 1}),
+]
+
+
+def test_vendored_offset_compare_matches_canonical(seeder_env) -> None:
+    module, _ = seeder_env
+    for existing, wm in _OFFSET_CASES:
+        assert (
+            module._offset_already_at_or_past(existing, wm)
+            == cdc_kafka_prep.offset_already_at_or_past(existing, wm)
+        ), (existing, wm)
+
+
+def test_topic_plan_matches_seeder_created_topics(seeder_env) -> None:
+    # Run the real seeder (fake Kafka) and compare the topics it actually creates
+    # against the canonical plan_topics() computed from the same inputs. Any
+    # divergence in partition counts or topic_configs between the Lambda's inline
+    # _ensure_* shaping and the app's plan_topics fails here.
+    module, recorder = seeder_env
+    recorder.topic_partitions = set()
+    props = _props(
+        WatermarkBinlogFile="", WatermarkBinlogPos="",  # CDC-only: topic shaping only
+        SinkTopics="dsqlcdc.app.hot,dsqlcdc.app.cold",
+        TopicPartitions="1",
+        SinkTopicPartitions="dsqlcdc.app.hot:4",
+        MaxMessageBytes="4194304",
+        DlqTopicName="dsql-sink-dlq",
+    )
+    module._seed(props)
+    # What the Lambda created: {name: (partitions, configs)}
+    created = {name: (parts, cfg) for name, parts, cfg in recorder.created_topics}
+
+    # The canonical plan from the SAME inputs (offset topic + partitions from the
+    # env the seeder_env fixture sets).
+    import os
+
+    plan = cdc_kafka_prep.plan_topics(
+        offset_topic=os.environ["OFFSETS_TOPIC"],
+        offset_partitions=os.environ["OFFSET_PARTITIONS"],
+        sink_topics=props["SinkTopics"].split(","),
+        default_partitions=props["TopicPartitions"],
+        partitions_map=cdc_kafka_prep.parse_partitions_map(props["SinkTopicPartitions"]),
+        max_message_bytes=props["MaxMessageBytes"],
+        dlq_topic=props["DlqTopicName"],
+    )
+    planned = {s.name: (s.partitions, s.configs) for s in plan}
+    assert created == planned
+
+
+# --------------------------------------------------------------------------- #
+# Packaging guard: the COMMITTED offset-seeder zip must embed the CURRENT
+# on-disk seeder.py / cfnresponse.py. The drift guards above load seeder.py from
+# disk, so they'd pass on an edited source even if the shipped zip is stale; this
+# closes that gap (the zip is what actually ships -- s3_provision uploads it as-is).
+# --------------------------------------------------------------------------- #
+def test_committed_zip_embeds_current_lambda_sources() -> None:
+    import zipfile
+
+    zip_path = (
+        SEEDER_PATH.resolve().parent.parent.parent.parent
+        / "connectors" / "plugins" / "offset-seeder-lambda.zip"
+    )
+    assert zip_path.exists(), f"committed seeder zip missing: {zip_path}"
+    with zipfile.ZipFile(zip_path) as zf:
+        names = set(zf.namelist())
+        for src in ("seeder.py", "cfnresponse.py"):
+            assert src in names, f"{src} not in zip"
+            embedded = zf.read(src)
+            on_disk = (SEEDER_PATH.parent / src).read_bytes()
+            assert embedded == on_disk, (
+                f"{src} in committed zip differs from deploy/cdc-stack/lambda/{src} "
+                "-- rebuild connectors/plugins/offset-seeder-lambda.zip (and bump "
+                "PLUGIN_VERSION) so the shipped Lambda matches the source tree"
+            )

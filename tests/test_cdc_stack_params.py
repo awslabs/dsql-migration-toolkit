@@ -301,6 +301,24 @@ def test_infra_params_all_filled_no_placeholders() -> None:
         assert not str(value).startswith(CDC_PLACEHOLDER_PREFIX), key
 
 
+def test_infra_params_default_seedmode_lambda_no_host_cidr() -> None:
+    # Default (Fargate/local) create: SeedMode=Lambda, HostSubnetCidr empty -> the
+    # in-VPC seeder is created and no 9098 host-ingress rule is added (unchanged).
+    filled = dict(_infra().filled)
+    assert filled["SeedMode"] == "Lambda"
+    assert filled["HostSubnetCidr"] == ""
+
+
+def test_infra_params_external_seedmode_capitalized_and_host_cidr() -> None:
+    # The EC2 host (cdc_seed_mode="external") creates the stack as SeedMode=External
+    # -- the value MUST be the capitalized token the template's AllowedValues
+    # ["Lambda","External"] require (real CloudFormation validates case-sensitively)
+    # -- and carries its own subnet CIDR to open MSK 9098.
+    filled = dict(_infra(seed_mode="external", host_subnet_cidr="172.31.64.0/20").filled)
+    assert filled["SeedMode"] == "External"
+    assert filled["HostSubnetCidr"] == "172.31.64.0/20"
+
+
 def test_infra_params_pins_no_connectors() -> None:
     by_key = dict(_infra().filled)
     assert by_key["MskBootstrapServers"] == ""

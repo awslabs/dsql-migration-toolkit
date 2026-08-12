@@ -48,6 +48,15 @@ def test_dockerfile_installs_version_pinned_dependencies() -> None:
     assert "uv sync --frozen" in text
 
 
+def test_dockerfile_bakes_cdc_external_extra() -> None:
+    # The image must include the [cdc-external] extra (kafka-python + MSK IAM SASL
+    # signer) so the Lambda-free "EC2 + MSK only" host can run SeedMode=External.
+    # The wheels are pure-Python and imported lazily only under External, so they
+    # are inert for the default Fargate / Lambda-mode deployment.
+    text = _dockerfile_text()
+    assert "--extra cdc-external" in text
+
+
 def test_dockerfile_runs_nicegui_ui_entrypoint() -> None:
     text = _dockerfile_text()
     assert 'ENTRYPOINT ["mysql-dsql-migrator"]' in text
@@ -1467,21 +1476,28 @@ def test_cdc_stack_source_worker_pins_fixed_offset_topic_not_sink(
 def test_cdc_stack_seeder_function_persists_across_stop(
     cdc_template: dict,
 ) -> None:
-    # The seeder Role + Function are gated on DeploySeederFunction, which is now an
-    # Fn::Or (bootstrap present OR the code key supplied). The OR means the code key
-    # alone keeps the Function deployed when a Stop blanks MskBootstrapServers, so it
-    # PERSISTS across a Stop -- keeping the slow VPC-Lambda ENI teardown OFF the Stop
-    # path. It also makes HasBootstrapServers imply DeploySeederFunction, so the
-    # start-prep invoker (gated on HasBootstrapServers) can always reference it.
+    # The seeder Role + Function are gated on DeploySeederFunctionLambda = the
+    # existing DeploySeederFunction (Fn::Or: bootstrap present OR code key supplied)
+    # AND SeedByLambda. In the default (Lambda) mode SeedByLambda is true, so this
+    # equals the old DeploySeederFunction gate exactly: the OR still means the code
+    # key alone keeps the Function deployed when a Stop blanks MskBootstrapServers
+    # (persists across Stop, keeping the slow VPC-Lambda ENI teardown off the Stop
+    # path). SeedMode=External drops all three seeder resources instead.
     resources = cdc_template["Resources"]
     for name in ("OffsetSeederRole", "OffsetSeederFunction"):
         assert name in resources, name
-        assert resources[name].get("Condition") == "DeploySeederFunction", name
+        assert resources[name].get("Condition") == "DeploySeederFunctionLambda", name
     # The invoker (pre-creates topics + seeds the offset) is gated on
-    # HasBootstrapServers, so a Stop removes it (fast) and a Start re-creates + reruns it.
-    assert resources["CdcStartPrepResource"].get("Condition") == "HasBootstrapServers"
+    # DeployStartPrepResource = HasBootstrapServers AND SeedByLambda, so a Stop
+    # removes it (fast) and a Lambda-mode Start re-creates + reruns it.
+    assert resources["CdcStartPrepResource"].get("Condition") == "DeployStartPrepResource"
 
     conds = cdc_template["Conditions"]
+    # DeploySeederFunctionLambda ANDs the (unchanged) DeploySeederFunction with
+    # SeedByLambda. The underlying DeploySeederFunction is still the Fn::Or.
+    lambda_gate = json.dumps(conds["DeploySeederFunctionLambda"])
+    assert "DeploySeederFunction" in lambda_gate
+    assert "SeedByLambda" in lambda_gate
     deploy = conds["DeploySeederFunction"]
     assert "Fn::Or" in deploy  # bootstrap present OR key present
     deploy_text = json.dumps(deploy)
@@ -1615,15 +1631,20 @@ def test_cdc_stack_connectors_deploy_in_parallel_via_start_prep(
 ) -> None:
     # Both connectors depend on CdcStartPrepResource (pre-created topics), NOT on
     # each other, so they deploy in ONE parallel pass. The source expresses the
-    # ordering via the OffsetSeed tag's Fn::GetAtt (an implicit ref -- CdcStartPrepResource
-    # shares the source's HasBootstrapServers condition, so no Fn::If is needed); the
-    # sink via a hard DependsOn. Crucially the sink must NOT DependsOn the source
-    # connector -- that was the old serial source-then-sink ordering.
+    # ordering via the OffsetSeed tag's Fn::GetAtt; SeedMode gating wraps the whole
+    # Tags property in Fn::If [SeedByLambda, <the tag>, AWS::NoValue] so it resolves
+    # to today's exact tag in the default (Lambda) mode and drops in External. The
+    # sink expresses ordering via a hard DependsOn. Crucially the sink must NOT
+    # DependsOn the source connector -- that was the old serial ordering.
     resources = cdc_template["Resources"]
     src = resources["DebeziumSourceConnector"]["Properties"]
-    seed_tag = next(t for t in src["Tags"] if t["Key"] == "OffsetSeed")
+    tags = src["Tags"]
+    assert "Fn::If" in tags and tags["Fn::If"][0] == "SeedByLambda"
+    lambda_tags = tags["Fn::If"][1]  # the Lambda-mode Tags list
+    seed_tag = next(t for t in lambda_tags if t["Key"] == "OffsetSeed")
     assert seed_tag["Value"] == {"Fn::GetAtt": ["CdcStartPrepResource", "Seeded"]}
 
+    # The Lambda-mode sink variant keeps the hard DependsOn on CdcStartPrepResource.
     sink_depends = resources["DsqlSinkConnector"].get("DependsOn", [])
     assert "CdcStartPrepResource" in sink_depends
     assert "DebeziumSourceConnector" not in sink_depends

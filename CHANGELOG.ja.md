@@ -5,6 +5,118 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.311
+
+### 修正 (Fixed)
+
+- **`SeedMode=External` の CDC 経路が実際に CloudFormation にデプロイされ、EC2 ホストが
+  エンドツーエンドで配線されるようになりました。** v0.1.307/v0.1.310 の 2 つのギャップ:
+  (1) `run_cdc_start` が `SeedMode` パラメータに小文字の `"external"` を送っていましたが、
+  テンプレートの大文字小文字を区別する `AllowedValues` `["Lambda","External"]` により
+  CloudFormation が拒否します(単体テストは検証をスキップする fake deployer のため見逃されて
+  いた)— 現在は `"External"` を送ります。(2) CDC の**インフラ作成**パスが `SeedMode`/
+  `HostSubnetCidr` を渡していなかったため、EC2 ホストから UI でデプロイしてもスタックが Lambda
+  モードで作成され(シーダー Lambda を作ってから最初の Start で削除)、MSK の 9098 ポートも
+  開きませんでした。現在は `build_cdc_infra_params` が作成時に両方を出力し(小文字の config 値を
+  テンプレートの大文字トークンにマッピング)、値は EC2 の user-data がホスト自身のサブネットから
+  自動解決する新しい `DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR` 設定キーから取得します。結果として、
+  Lambda を使わないホストでは「CDC インフラのデプロイ」が `SeedMode=External` スタック
+  (シーダー Lambda なし)を作成し、ホストを 9098 で admit します;Fargate/ローカルは既定の
+  Lambda・ingress なし(変更なし)。
+
+## v0.1.310
+
+### 変更 (Changed)
+
+- **「EC2 + MSK のみ」デプロイモードがソースから直接実行するようになりました — Docker・ECR
+  なし。** コンテナレジストリを使えない顧客のために、`deploy/cloudformation-ec2.yaml` は
+  コンテナイメージを pull しなくなりました。代わりにホストが `git` + `uv` をインストールし、
+  アプリのソースを取得して `uv sync --extra cdc-external` を実行し、`systemd` サービス
+  (`dsql-migrator.service`)としてアプリを起動します — 接続方法(SSM ポートフォワード)、
+  保持される EBS の状態、`SeedMode=External` は同じです。ソースの取得は新しい `SourceMode`
+  パラメータで選択します: `git`(既定 — 公開リポジトリを HTTPS で `git clone`、または SSM の
+  読み取り専用デプロイキー(`DeployKeySsmParam`)で AWS GitLab の SSH URL を clone。この
+  キー関連の IAM 権限・ポート 22 の egress はリポジトリが公開されると自動的に消えます)または
+  `s3`(ソース tarball を `SourceS3Uri` から取得して展開 — リポジトリ公開前にローカルの作業
+  コピーを実行する簡単な方法)。`ContainerImageUri` パラメータとすべての Docker 手順は削除
+  されました。Fargate アプリスタック(`deploy/cloudformation.yaml`)は変更なしで、引き続き
+  イメージベースであり、Dockerfile は `--extra cdc-external` を維持します
+  (`SeedMode=External` でなければ inert)。
+
+## v0.1.309
+
+### 修正 (Fixed)
+
+- **CDC スタックがデプロイできなかった問題** — `Template error: YAML aliases are not allowed
+  in CloudFormation templates`。v0.1.307 のシンクコネクタ分割で、Lambda/External の 2 バリアントが
+  本体を共有するために YAML アンカー/エイリアス(`&DsqlSinkProps` / `*DsqlSinkProps`)を使って
+  いました。PyYAML はアンカーを正しく解決するため構造の単体テストは通っていましたが、
+  **CloudFormation はアンカー/エイリアスを拒否する**ため、実際の `create-change-set`/デプロイが
+  ブロックされていました。共有本体を 2 つのバリアントにそのまま複製し(違いは External が
+  `CdcStartPrepResource` 依存を省く点のみ)、2 つの本体がバイト単位で同一であることをテストで
+  強制し、さらにすべてのデプロイテンプレートの原文を走査して YAML アンカー/エイリアスを拒否する
+  ガードを追加して、このデプロイブロッカーが再発しないようにしました。
+
+## v0.1.308
+
+### 追加 (Added)
+
+- **AWS Lambda を使えない顧客向けの「EC2 + MSK のみ」デプロイモード** — v0.1.307 の
+  `SeedMode=External` 機構の上に構築。新しいデプロイテンプレート
+  `deploy/cloudformation-ec2.yaml` が、コントロールプレーン全体(Web UI + Full Load エンジン +
+  インプロセス CDC シード)を **CDC VPC 内の単一 EC2 インスタンス**で実行し、**SSM ポート
+  フォワード**で接続します — ALB・ACM 証明書・Cognito は不要です。状態(job/session の SQLite)は
+  Fargate が使う S3 ストアではなく**保持される EBS ボリューム**に置くため、インスタンス置換後も
+  残ります。このホストは VPC 内にあるため MSK に直接到達でき、**「ホストがモードである」**:
+  EC2 ホストの user-data が `DSQL_MIGRATOR_CDC_SEED_MODE=external`(新しい設定キー)を設定して
+  Lambda なしで CDC を実行し、既存の Fargate/ローカルのデプロイはこれを設定しないため、そのまま
+  VPC 内シーダー Lambda を使います(変更なし)。補助要素: Start CDC に接続された新しい
+  `DSQL_MIGRATOR_CDC_SEED_MODE` 設定キー(既定 `lambda`);ホストを 9098 でサブネット CIDR により
+  MSK に許可する CDC スタックの追加・条件付き `HostSubnetCidr` パラメータ(空の既定値 → ルールなし、
+  既存デプロイは変更なし);コンテナイメージに `cdc-external` extra(`kafka-python` + MSK IAM SASL
+  署名者、いずれも pure-Python で `SeedMode=External` 以外では inert)を同梱。Fargate アプリ
+  スタック・Lambda 既定モード・`PLUGIN_VERSION` はすべて変更なし。
+
+## v0.1.307
+
+### 追加 (Added)
+
+- **CDC スタックに `SeedMode` を追加 — Lambda を使わない(「EC2 + MSK のみ」)CDC Kafka 準備の
+  オプトイン方式。** ギャップレスな Full Load → CDC ハンドオフでは、コネクタ作成前に VPC 内で
+  Kafka 準備の 3 ステップ(compact オフセットトピック + テーブル別データトピック + DLQ トピックの
+  事前作成、connect-offsets レコードのシード)が必要です。現在は VPC 内シーダー Lambda がこれを
+  行います。新しい `SeedMode` パラメータ(既定値 `Lambda` = 従来の動作、変更なし)に `External`
+  モードを追加し、このモードではデプロイするアプリが MSK IAM ブートストラップ経由でコネクタ作成前に
+  準備を**インプロセスで**実行します — つまり AWS Lambda を使えない顧客が VPC 内ホストから CDC を
+  実行できます。`External` モードではシーダー Lambda・ロール・`CdcStartPrepResource` カスタム
+  リソースを作成せず、`CdcStartPrepResource` への依存を持たないシンクコネクタのバリアントを選択
+  します。2 つのシンクバリアントは YAML アンカーで本体を共有するため、互いにドリフトしません。
+  インプロセス Kafka クライアント(`kafka-python` + MSK IAM SASL 署名者)は**オプションの extra**
+  (`pip install ".[cdc-external]"`)であり、既定のインストールとコンテナイメージは変わりません。
+  **すべて既定値の背後にあります:** `SeedMode=Lambda`(既定)ではアプリ側シードは実行されず
+  `SeedMode` も送信されず、デプロイされるリソースの集合は従来と同一です — 本リリースは機構を追加
+  するだけです。実際のホストがポート 9098 でクラスタに到達できるようにするセキュリティグループ /
+  IAM / VPC 同一配置の設定は、EC2 ホストと共に別途対応します。`PLUGIN_VERSION` は変更なし
+  (コネクタ/シーダーのアーティファクトは無変更)。
+
+## v0.1.306
+
+### 内部 (Internal)
+
+- **CDC の Kafka 準備段階における純粋な判定ロジックを、アプリ側の単一正本モジュールに抽出**
+  しました(`core/cdc_kafka_prep.py`)。これは近く追加予定の Lambda を使わない最小デプロイ
+  オプション(「EC2 + MSK のみ」)の土台です。VPC 内オフセットシーダー Lambda
+  (`deploy/cdc-stack/lambda/seeder.py`)は、純粋なヘルパー 3 種(`parse_partitions_map`、
+  `binlog_seq`、`offset_already_at_or_past`)とトピック整形の判定をインラインで重複保持して
+  きましたが、これらにアプリ側で単体テスト付きの単一正本(`TopicSpec` / `plan_topics()`
+  プランナーを含む)ができ、オフセットレコードビルダーは `core/cdc_offset_seed.py` から
+  re-export します(ビルダーの正本はそのまま)。この変更は**アプリ側のみ**です — Lambda の
+  ソース、コミット済みのコネクタ/シーダー ZIP、`PLUGIN_VERSION` は一切変更しないため、
+  **既存のデプロイはすべて同一に動作**します。ドリフトガードのテストが Lambda のインライン
+  コピーが正本モジュールと双方向で同一挙動であることを検証し、新しいパッケージングガードが
+  コミット済みオフセットシーダー ZIP が現在のディスク上の Lambda ソースを含んでいることを
+  検証します。
+
 ## v0.1.305
 
 ### 追加

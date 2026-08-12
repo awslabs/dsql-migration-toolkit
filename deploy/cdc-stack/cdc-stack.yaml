@@ -508,6 +508,31 @@ Parameters:
       already exists. Avoids the sink-starts-before-topic race that crash-loops the
       sink task.
 
+  SeedMode:
+    Type: String
+    Default: "Lambda"
+    AllowedValues: ["Lambda", "External"]
+    Description: >
+      Who performs the CDC Kafka prep (pre-create the compacted offset topic + the
+      per-table data topics + the DLQ topic, and seed the connect-offsets record)
+      that must happen before the connectors are created. "Lambda" (default,
+      unchanged behavior) deploys the in-VPC offset-seeder Lambda + the
+      CdcStartPrepResource custom resource to do it. "External" omits those
+      resources; the deploying app does the prep IN-PROCESS over the MSK IAM
+      bootstrap before this stack update creates the connectors. External requires
+      the app to run inside this VPC (admitted on 9098, with data-plane
+      kafka-cluster IAM) -- intended for the Lambda-free "EC2 + MSK only" host.
+
+  HostSubnetCidr:
+    Type: String
+    Default: ""
+    Description: >
+      Subnet CIDR of the Lambda-free "EC2 + MSK only" control-plane host, admitted
+      to MSK Serverless on 9098 so the app can do the CDC Kafka prep in-process
+      (SeedMode=External). Empty (default) adds NO ingress rule, so every Lambda-mode
+      / existing deploy is unchanged. Supplied by CIDR (not an SG id) to keep the
+      app-stack and cdc-stack teardown decoupled, mirroring the bastion rule.
+
   KafkaConnectVersion:
     Type: String
     Default: "3.7.x"
@@ -594,6 +619,22 @@ Conditions:
     Fn::Not:
       - Fn::Equals: [Ref: MskBootstrapServers, ""]
 
+  # SeedMode selects who does the CDC Kafka prep. Default "Lambda" -> SeedByLambda
+  # true on every existing stack, so all the seeder gates below (which AND with
+  # SeedByLambda) collapse to their current value and the default path is unchanged.
+  # "External" -> the app did the prep in-process, so the in-VPC seeder resources are
+  # omitted and the sink uses its no-CdcStartPrepResource variant.
+  SeedByLambda:
+    Fn::Equals: [Ref: SeedMode, "Lambda"]
+  SeedByExternal:
+    Fn::Equals: [Ref: SeedMode, "External"]
+
+  # A Lambda-free EC2 host subnet CIDR was supplied -> add the 9098 ingress that lets
+  # that host reach MSK for in-process seeding. Empty default -> no rule (unchanged).
+  HasHostSubnetCidr:
+    Fn::Not:
+      - Fn::Equals: [Ref: HostSubnetCidr, ""]
+
   # Sink is created only when the bootstrap string is supplied AND DeploySink=true
   # (deploy the source first so it creates the topic, then the sink -- gotcha #11).
   DeploySinkConnector:
@@ -601,6 +642,23 @@ Conditions:
       - Fn::Not:
           - Fn::Equals: [Ref: MskBootstrapServers, ""]
       - Fn::Equals: [Ref: DeploySink, "true"]
+
+  # The sink connector's ordering edge to the in-VPC prep is a hard DependsOn, which
+  # CloudFormation forbids wrapping in Fn::If. So the sink is split into two variants
+  # gated by SeedMode: the Lambda variant keeps DependsOn: CdcStartPrepResource; the
+  # External variant drops it (the app pre-created the topics in-process before this
+  # update). Exactly one is created. Both AND with DeploySinkConnector so the
+  # bootstrap+DeploySink gate is unchanged; in the default (Lambda) mode
+  # DeploySinkConnectorLambda == DeploySinkConnector, so the original resource is
+  # created identically and the External variant is absent.
+  DeploySinkConnectorLambda:
+    Fn::And:
+      - Condition: DeploySinkConnector
+      - Condition: SeedByLambda
+  DeploySinkConnectorExternal:
+    Fn::And:
+      - Condition: DeploySinkConnector
+      - Condition: SeedByExternal
 
   # An SNS topic was supplied for connector-errored-task notifications. The alarms
   # are created regardless (visible in CloudWatch); this only gates the notify action.
@@ -639,6 +697,19 @@ Conditions:
           - Fn::Equals: [Ref: MskBootstrapServers, ""]
       - Fn::Not:
           - Fn::Equals: [Ref: LambdaSeederS3Key, ""]
+
+  # The in-VPC seeder Lambda (+ its role) and the CdcStartPrepResource that invokes
+  # it are created ONLY in SeedMode=Lambda. AND-ing SeedByLambda onto the existing
+  # gates keeps the default path identical (SeedByLambda is true by default) and
+  # omits all three resources when SeedMode=External (the app did the prep itself).
+  DeploySeederFunctionLambda:
+    Fn::And:
+      - Condition: DeploySeederFunction
+      - Condition: SeedByLambda
+  DeployStartPrepResource:
+    Fn::And:
+      - Condition: HasBootstrapServers
+      - Condition: SeedByLambda
 
   # When no ConnectorSubnetIds are supplied, the stack creates its OWN private
   # subnets + NAT gateway + route table inside the VPC (the customer's existing
@@ -774,6 +845,27 @@ Resources:
       ToPort: 9098
       CidrIp: 172.31.0.0/20
       Description: Diagnostics - bastion subnet to MSK Serverless (IAM/TLS 9098).
+
+  # Lambda-free ("EC2 + MSK only", SeedMode=External) reachability: admit the in-VPC
+  # EC2 control-plane host to MSK on 9098 so the app can do the CDC Kafka prep
+  # in-process (create topics + seed the offset) instead of the seeder Lambda. Like
+  # the bastion rule above, allowed BY CIDR (the host's subnet), NOT by SG id, so the
+  # two stacks' teardown stays decoupled (an SG-id cross-reference previously blocked
+  # stack deletion). Condition-gated on a NON-EMPTY HostSubnetCidr with an empty
+  # default, so every existing deploy (and every Lambda-mode deploy) templates
+  # identically -- the rule simply does not exist unless a host CIDR is supplied.
+  ConnectorHostDiagnosticsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasHostSubnetCidr
+    Properties:
+      GroupId:
+        Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort: 9098
+      ToPort: 9098
+      CidrIp:
+        Ref: HostSubnetCidr
+      Description: Lambda-free EC2 host subnet to MSK Serverless (IAM/TLS 9098).
 
   ConnectorKafkaEgress:
     Type: AWS::EC2::SecurityGroupEgress
@@ -1243,7 +1335,7 @@ Resources:
   # When neither applies the source connector simply starts from the current binlog.
   OffsetSeederRole:
     Type: AWS::IAM::Role
-    Condition: DeploySeederFunction
+    Condition: DeploySeederFunctionLambda
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -1310,7 +1402,7 @@ Resources:
 
   OffsetSeederFunction:
     Type: AWS::Lambda::Function
-    Condition: DeploySeederFunction
+    Condition: DeploySeederFunctionLambda
     Properties:
       FunctionName:
         Fn::Sub: ${AWS::StackName}-offset-seeder
@@ -1394,7 +1486,7 @@ Resources:
   # (and, when present, the seed) land before either connector is created.
   CdcStartPrepResource:
     Type: AWS::CloudFormation::CustomResource
-    Condition: HasBootstrapServers
+    Condition: DeployStartPrepResource
     DependsOn:
       - MskCluster
       - OffsetSeederRole
@@ -1479,13 +1571,19 @@ Resources:
         EncryptionType: TLS
       # Reference CdcStartPrepResource.Seeded so the connector is created AFTER the
       # start-prep resource (topics pre-created; offset seeded on a gapless handoff).
-      # CdcStartPrepResource shares this connector's condition (HasBootstrapServers),
-      # so the reference is always valid -- no Fn::If needed. The tag value
-      # "true"/"skipped" is benign metadata (whether an offset was seeded).
+      # The GetAtt is the source connector's ordering edge to the in-VPC prep.
+      # SeedMode=Lambda: CdcStartPrepResource exists (it shares this connector's
+      # bootstrap gate), so this resolves to today's exact tag -- byte-identical.
+      # SeedMode=External: CdcStartPrepResource is not created, so the whole Tags
+      # property is dropped (AWS::NoValue); ordering is enforced in-process by the
+      # app seeding the topics BEFORE this stack update creates the connector.
       Tags:
-        - Key: OffsetSeed
-          Value:
-            Fn::GetAtt: [CdcStartPrepResource, Seeded]
+        Fn::If:
+          - SeedByLambda
+          - - Key: OffsetSeed
+              Value:
+                Fn::GetAtt: [CdcStartPrepResource, Seeded]
+          - Ref: AWS::NoValue
       WorkerConfiguration:
         Revision:
           Fn::GetAtt: [WorkerConfiguration, Revision]
@@ -1714,9 +1812,19 @@ Resources:
   # creates the per-table data topic, then deploy the sink (DeploySink=true) so it
   # subscribes to an existing topic. Starting the sink before the topic exists
   # causes an empty consumer assignment that never recovers (gotcha #11).
+  # SeedMode=Lambda variant: keeps DependsOn: CdcStartPrepResource. The sink's
+  # ordering edge to the topic pre-creation is a HARD DependsOn, which CloudFormation
+  # forbids wrapping in Fn::If -- so the sink is SPLIT into two condition-gated
+  # variants. Exactly one is created (the conditions are mutually exclusive). The two
+  # Properties bodies are IDENTICAL and MUST stay so; CloudFormation forbids YAML
+  # anchors/aliases (Template error: "YAML aliases are not allowed"), so the body is
+  # duplicated verbatim into DsqlSinkConnectorExternal below and a unit test asserts
+  # the two are byte-identical (tests/test_cdc_stack_seedmode.py). In the default
+  # (Lambda) mode DeploySinkConnectorLambda == DeploySinkConnector, so this resource
+  # is created identically to before and the External twin is absent.
   DsqlSinkConnector:
     Type: AWS::KafkaConnect::Connector
-    Condition: DeploySinkConnector
+    Condition: DeploySinkConnectorLambda
     DependsOn:
       - MskCluster
       - ConnectorSelfIngress
@@ -1726,6 +1834,138 @@ Resources:
       # Previously this DependsOn DebeziumSourceConnector, forcing serial
       # source-then-sink creation (~2x the connector-creation wall time).
       - CdcStartPrepResource
+    Properties:
+      ConnectorName:
+        Fn::Sub: ${AWS::StackName}-dsql-sink
+      KafkaConnectVersion:
+        Ref: KafkaConnectVersion
+      ServiceExecutionRoleArn:
+        Fn::GetAtt: [ConnectorExecutionRole, Arn]
+      Capacity:
+        ProvisionedCapacity:
+          McuCount:
+            Ref: SinkMcuCount
+          WorkerCount:
+            Ref: ConnectorWorkerCount
+      KafkaCluster:
+        ApacheKafkaCluster:
+          BootstrapServers:
+            Ref: MskBootstrapServers
+          Vpc:
+            SecurityGroups:
+              - Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+            Subnets:
+              Fn::If:
+                - CreateOwnedNetwork
+                - - Ref: ConnectorSubnetA
+                  - Ref: ConnectorSubnetB
+                - Ref: ConnectorSubnetIds
+      KafkaClusterClientAuthentication:
+        AuthenticationType: IAM
+      KafkaClusterEncryptionInTransit:
+        EncryptionType: TLS
+      WorkerConfiguration:
+        Revision:
+          Fn::GetAtt: [SinkWorkerConfiguration, Revision]
+        WorkerConfigurationArn:
+          Fn::GetAtt: [SinkWorkerConfiguration, WorkerConfigurationArn]
+      Plugins:
+        - CustomPlugin:
+            CustomPluginArn:
+              Fn::GetAtt: [DsqlSinkPlugin, CustomPluginArn]
+            Revision:
+              Fn::GetAtt: [DsqlSinkPlugin, Revision]
+      LogDelivery:
+        WorkerLogDelivery:
+          CloudWatchLogs:
+            Enabled: true
+            LogGroup:
+              Ref: ConnectorLogGroup
+      ConnectorConfiguration:
+        # Our custom connector (Task 23.2, connectors/dsql-sink). Package path
+        # matches DsqlSinkConnector.java in that subproject.
+        connector.class: dev.dsqlmigrator.connect.DsqlSinkConnector
+        tasks.max:
+          Fn::Sub: "${SinkTasksMax}"
+        # Explicit topic list (avoids the Fn::Sub backslash-escaping trap that
+        # turned topics.regex into a literal-backslash pattern matching nothing --
+        # gotcha). Per-table topic = <TopicPrefix>.<db>.<table>. The caller must
+        # construct SinkTopics as:
+        #   ','.join(f'{prefix}.{t}' for t in build_sink_config.topics)
+        topics:
+          Ref: SinkTopics
+        # Idempotent apply: this custom connector always derives the PK from the
+        # Debezium record key and applies INSERT ... ON CONFLICT upsert
+        # (build_sink_config: pk_mode=record_key, insert_mode=upsert), so pk.mode/
+        # insert.mode are implicit and not set here. delete.enabled toggles
+        # DELETE/tombstone apply. Keys below match DsqlSinkConnectorConfig.
+        delete.enabled: "true"
+        # DSQL connection: IAM token auth (no password). The connector generates
+        # the token and refreshes it before the 1-hour timeout (Task 23.2).
+        dsql.cluster.endpoint:
+          Ref: DsqlClusterEndpoint
+        dsql.database:
+          Ref: DsqlDatabaseName
+        dsql.username:
+          Ref: DsqlConnectUser
+        dsql.region:
+          Fn::If: [RegionProvided, Ref: AwsRegion, Ref: "AWS::Region"]
+        # DSQL constraint: <=3,000 rows per transaction.
+        batch.size:
+          Fn::Sub: "${SinkBatchMaxRows}"
+        # Per-table net-rows monitor metric (CloudWatch, best-effort): the sink emits
+        # NetRowsApplied per table under this Stack dimension so the UI shows CDC
+        # net-rows WITHOUT COUNT(*)-scanning the source. The stack name is the Stack
+        # dimension value the UI queries by; blank would disable emission.
+        metrics.stack:
+          Ref: AWS::StackName
+        # Dead-letter queue for poison change events (Req 12.4-12.6). The topic
+        # is auto-created at runtime; it is not a CloudFormation resource.
+        errors.tolerance: all
+        errors.deadletterqueue.topic.name:
+          Ref: DlqTopicName
+        errors.deadletterqueue.context.headers.enable: "true"
+        errors.deadletterqueue.topic.replication.factor: "3"
+        errors.log.enable: "true"
+        # Retry retriable errors (e.g. OCC SQLSTATE 40001 conflicts) for up to
+        # 10 min before dead-lettering, so transient conflicts are absorbed by the
+        # connector's statement-level retry instead of being dropped to the DLQ
+        # with zero retries (the original errors.retry.timeout=0 default caused
+        # contiguous-band data loss under concurrent DML -- see 2026-06 analysis).
+        errors.retry.timeout: "600000"
+        errors.retry.delay.max.ms: "60000"
+        # Log the failed record + exception (not just that an error occurred) so
+        # DLQ root-cause is visible in CloudWatch without consuming the DLQ topic.
+        errors.log.include.messages: "true"
+        # key.converter/value.converter are declared in SinkWorkerConfiguration.
+        # They are intentionally absent here to avoid split authority. The H13
+        # message-size limits (producer.max.request.size / consumer.fetch.max.bytes
+        # / consumer.max.partition.fetch.bytes) AND the consumer poll/session
+        # timeouts (consumer.max.poll.interval.ms / session.timeout.ms /
+        # heartbeat.interval.ms / offset.flush.timeout.ms) live in the SINK worker
+        # config: MSK Connect supports those producer.*/consumer.* keys at the worker
+        # level and applies them to the connector's task clients (per the MSK Connect
+        # "Supported worker configuration properties" doc, whose allowlist names each
+        # of them). What is NOT available is the per-connector ".override." FORM,
+        # because MSK Connect excludes connector.client.config.override.policy -- so
+        # the worker config is the only place these can be set, not a reason to leave
+        # them at Kafka's defaults.
+
+  # SeedMode=External variant: the Properties body below is a VERBATIM copy of
+  # DsqlSinkConnector's (CloudFormation forbids YAML anchors, so it cannot be shared;
+  # a unit test asserts the two bodies are byte-identical). The ONLY difference is
+  # this variant OMITS DependsOn: CdcStartPrepResource -- in External mode that
+  # resource is not created (the app pre-created the topics in-process before this
+  # update). Ordering is guaranteed by the app seeding topics BEFORE submitting this
+  # stack update, so the topics exist before this connector starts (no
+  # empty-partition-assignment race). Gated on DeploySinkConnectorExternal so it is
+  # absent in the default (Lambda) mode.
+  DsqlSinkConnectorExternal:
+    Type: AWS::KafkaConnect::Connector
+    Condition: DeploySinkConnectorExternal
+    DependsOn:
+      - MskCluster
+      - ConnectorSelfIngress
     Properties:
       ConnectorName:
         Fn::Sub: ${AWS::StackName}-dsql-sink
@@ -1945,8 +2185,13 @@ Outputs:
   DsqlSinkConnectorArn:
     Condition: DeploySinkConnector
     Description: ARN of the custom DSQL sink connector (only present when DeploySink=true).
+    # Ref whichever sink variant exists for the active SeedMode. In the default
+    # (Lambda) mode this resolves to Ref DsqlSinkConnector -- byte-identical.
     Value:
-      Ref: DsqlSinkConnector
+      Fn::If:
+        - SeedByLambda
+        - Ref: DsqlSinkConnector
+        - Ref: DsqlSinkConnectorExternal
 
   ConnectorLogGroupName:
     Description: CloudWatch log group for connector worker logs (Req 12.9 monitoring).

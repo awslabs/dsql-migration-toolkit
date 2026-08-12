@@ -1,6 +1,6 @@
 [project]
 name = "mysql-dsql-migrator"
-version = "0.1.305"
+version = "0.1.311"
 description = "RDS/Aurora MySQL to Amazon Aurora DSQL migration toolkit"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,6 +14,24 @@ dependencies = [
     "pymysql==1.2.0",
     "sqlalchemy==2.0.50",
     "sqlglot==30.11.0",
+]
+
+[project.optional-dependencies]
+# In-process CDC Kafka client for the Lambda-free ("External") SeedMode. Kept out of
+# the CORE dependencies so a plain `pip install .` (and any non-container use) does
+# NOT pull it; a local/laptop run that never uses SeedMode=External needs nothing
+# extra. The published container image DOES bake this extra in (deploy/Dockerfile:
+# `uv sync ... --extra cdc-external`) because the EC2+MSK-only host runs
+# SeedMode=External and its docker-run user-data cannot pip-install into the
+# root-owned image venv. Baking it in is safe for the standard Fargate/Lambda
+# deployment: both wheels are pure-Python (py3-none-any, no C-extension build) and
+# are imported LAZILY, only inside core/cdc_kafka_seed.py, reached only when
+# seed_mode == "external" — so on Fargate/laptop (default "lambda") they stay inert.
+# Do NOT drop `--extra cdc-external` from the Dockerfile: External hosts rely on it.
+# These are the exact versions vendored in the offset-seeder Lambda zip.
+cdc-external = [
+    "kafka-python==3.0.10",
+    "aws-msk-iam-sasl-signer-python==1.0.2",
 ]
 
 [project.scripts]

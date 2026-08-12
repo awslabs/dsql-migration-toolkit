@@ -1402,6 +1402,13 @@ def build_cdc_infra_params(
     # create path too so a fresh stack records the operator's value from the start,
     # rather than only picking it up at the first Start CDC.
     sink_mcu_count: int = CDC_DEFAULT_SINK_MCU_COUNT,
+    # CDC seed mode + the host's subnet CIDR, both set at CREATE so a Lambda-free
+    # "EC2 + MSK only" host produces a SeedMode=External stack that admits the host
+    # on 9098 from the start. seed_mode is the lowercase config value ("lambda" /
+    # "external"); it is mapped to the template's capitalized token below.
+    # host_subnet_cidr is empty for the default (Lambda) path -> no 9098 ingress.
+    seed_mode: str = "lambda",
+    host_subnet_cidr: str = "",
 ) -> CdcInfraParams:
     """Build the full cdc-stack parameter set for a first-time ``create_stack``.
 
@@ -1487,6 +1494,17 @@ def build_cdc_infra_params(
         # No connectors on the first deploy -- Start CDC sets these two later.
         ("MskBootstrapServers", ""),
         ("DeploySink", "false"),
+        # SeedMode set at CREATE (not just Start) so the in-VPC seeder Lambda + role
+        # are NEVER created in External mode (they are gated on SeedByLambda at
+        # create time); flipping only at Start would create-then-delete them,
+        # incurring the slow ENI reclamation. Map the lowercase config value to the
+        # template's case-sensitive AllowedValues ["Lambda","External"].
+        ("SeedMode", "External" if seed_mode == "external" else "Lambda"),
+        # Host subnet CIDR -> the 9098 ingress (ConnectorHostDiagnosticsIngress) that
+        # the External in-process seed needs. Created here so the rule exists before
+        # the first Start's pre-update seed; rides UsePreviousValue to the Start pass.
+        # Empty (default/Lambda) -> no rule, unchanged.
+        ("HostSubnetCidr", host_subnet_cidr),
     ]
     return CdcInfraParams(
         filled=filled, stack_name=stack_name, topic_prefix=topic_prefix

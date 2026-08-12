@@ -1,0 +1,1404 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+AWSTemplateFormatVersion: "2010-09-09"
+
+# NOTE: the top-level Description below is capped by CloudFormation at 1024 bytes,
+# so it is kept short. The full rationale + placement prerequisites live in
+# deploy/TEST_EC2_MSK_ONLY.md and deploy/DEPLOYMENT.md. In brief:
+#   * Run this host in the SAME VPC as the CDC MSK (cdc-stack); CDC is seeded
+#     IN PROCESS here (DSQL_MIGRATOR_CDC_SEED_MODE=external, no seeder Lambda), so
+#     the host must reach MSK Serverless on 9098 -- deploy into a NAT-egress subnet
+#     co-located with the connectors and pass THIS host's subnet CIDR to the
+#     cdc-stack HostSubnetCidr parameter so MSK admits it on 9098.
+#   * The stack name MUST NOT start with "mysql-dsql-cdc-", or this stack's own
+#     resources fall inside the CdcDeployRole's "mysql-dsql-cdc-*" scope.
+Description: >
+  Lambda-free "EC2 + MSK only" deployment of the MySQL -> Aurora DSQL migration
+  tool (Option 3), for customers who cannot use AWS Lambda. Runs the same
+  control-plane app (UI + Full Load + in-process CDC offset seed) as one Docker
+  container on a single in-VPC EC2 host -- no ALB/ACM/Cognito/ECS -- reached over
+  an SSM port-forward (no inbound rule, no public IP). State lives on a retained
+  EBS volume. Must run in the same VPC as the CDC MSK and be admitted on 9098 (pass
+  this host's subnet CIDR to the cdc-stack HostSubnetCidr param). Stack name must
+  NOT start with "mysql-dsql-cdc-". See deploy/TEST_EC2_MSK_ONLY.md for details.
+
+# Console UX: group + label the parameters so uploading this template in the AWS
+# CloudFormation console renders an ordered, sectioned "Specify stack details"
+# form. The parameter TYPES drive native pickers (VpcId -> VPC dropdown,
+# HostSubnetId -> subnet selector). Ignored by the CLI; console-only.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "1. Network — where the host runs (must share the VPC with the CDC MSK)"
+        Parameters:
+          - VpcId
+          - HostSubnetId
+          - MskEgressCidr
+          - HttpsEgressCidr
+      - Label:
+          default: "2. Migration endpoints — DSQL target (required) + MySQL source (optional)"
+        Parameters:
+          - DsqlClusterArn
+          - SourceSecretArn
+          - SourceDbSecurityGroupId
+          - SourceDbCidr
+          - SourceDbPort
+      - Label:
+          default: "3. Host — instance size, retained state volume, access"
+        Parameters:
+          - InstanceType
+          - StateVolumeSizeGiB
+          - KeyName
+          - LatestAl2023Ami
+      - Label:
+          default: "4. App source & sizing — defaults clone the public repo; no build needed"
+        Parameters:
+          - SourceMode
+          - SourceS3Uri
+          - SourceRepoUrl
+          - SourceRepoRef
+          - DeployKeySsmParam
+          - AppPort
+          - EnableActivityLogCloudWatch
+      - Label:
+          default: "5. AI assist — optional, off by default"
+        Parameters:
+          - EnableAiAssist
+          - BedrockModelArns
+          - BedrockRegion
+          - BedrockModelId
+    ParameterLabels:
+      VpcId:
+        default: "VPC  [Required] — the VPC that hosts the source MySQL and the CDC MSK"
+      HostSubnetId:
+        default: "Host subnet  [Required] — a NAT-egress subnet, co-located with the CDC MSK; reached via SSM port-forward (no public IP needed)"
+      MskEgressCidr:
+        default: "MSK egress CIDR  [Optional, default 0.0.0.0/0] — CIDR the host may reach MSK Serverless on 9098; narrow to the connector subnet CIDR"
+      HttpsEgressCidr:
+        default: "Outbound HTTPS CIDR  [Optional] — tighten to your NAT/PrivateLink range"
+      DsqlClusterArn:
+        default: "DSQL cluster ARN  [Required] — the target Aurora DSQL cluster"
+      SourceSecretArn:
+        default: "Source DB secret ARN  [Optional] — set only to reuse an existing Secrets Manager secret; otherwise enter host/user/password in the UI"
+      SourceDbSecurityGroupId:
+        default: "Source DB security group  [Required — this OR 'Source DB CIDR'] — preferred way to let the host reach the source"
+      SourceDbCidr:
+        default: "Source DB CIDR  [Required — this OR 'Source DB security group'] — use when you have no source security group id"
+      SourceDbPort:
+        default: "Source MySQL port  [Optional, default 3306]"
+      InstanceType:
+        default: "Instance type  [Optional, default t3.large]"
+      StateVolumeSizeGiB:
+        default: "State volume size (GiB)  [Optional, default 20] — size up for large-table Full Load local CSV spillover"
+      KeyName:
+        default: "SSH key  [Optional] — leave empty; SSM Session Manager is the primary access path"
+      LatestAl2023Ami:
+        default: "Base AMI  [Auto] — resolves the latest Amazon Linux 2023 x86_64 image"
+      SourceMode:
+        default: "Source mode  [Optional, default git] — 'git' clone or 's3' tarball (run your local copy)"
+      SourceS3Uri:
+        default: "Source S3 URI  [Required if Source mode = s3] — s3:// tarball of the repo root"
+      SourceRepoUrl:
+        default: "Source repo URL  [Optional] — default = public GitHub HTTPS; use the GitLab SSH URL + a deploy key temporarily"
+      SourceRepoRef:
+        default: "Source ref  [Optional, default main] — branch or tag"
+      DeployKeySsmParam:
+        default: "Deploy-key SSM param  [Optional] — SecureString name for the temporary GitLab SSH clone; empty for public GitHub"
+      AppPort:
+        default: "App listen port  [Optional, default 8080] — bound on host loopback, reached via SSM port-forward"
+      EnableActivityLogCloudWatch:
+        default: "Activity log to stdout  [Optional, default off] — mirror the audit trail to journald (journalctl -u dsql-migrator)"
+      EnableAiAssist:
+        default: "Enable AI assist  [Optional, default off] — AI-assisted schema conversion via Amazon Bedrock"
+      BedrockModelArns:
+        default: "Bedrock model ARN(s)  [Optional] — blank = auto-derive from the model id"
+      BedrockRegion:
+        default: "Bedrock region  [Optional]"
+      BedrockModelId:
+        default: "Bedrock model id  [Optional] — Anthropic model for AI assist; IAM scope auto-derived"
+
+Parameters:
+  # --- Reused verbatim from deploy/cloudformation.yaml -----------------------
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC the tool runs in (must reach the source database privately).
+
+  DsqlClusterArn:
+    Type: String
+    Description: ARN of the target Aurora DSQL cluster (scopes dsql:DbConnect / dsql:DbConnectAdmin).
+    AllowedPattern: ^arn:aws[a-zA-Z-]*:dsql:[a-z0-9-]+:[0-9]{12}:cluster/.+$
+
+  SourceSecretArn:
+    Type: String
+    Default: ""
+    Description: >
+      OPTIONAL. Secrets Manager secret ARN holding the source DB credentials, to
+      REUSE an existing secret -- it scopes the task's secretsmanager:GetSecretValue
+      to this secret only. Leave EMPTY (the common case) to connect the source with
+      a username/password typed in the UI instead; the password stays in memory and
+      no secret is read. (For CDC with username/password, the tool creates its own
+      managed secret under mysql-dsql-migrator/cdc/* -- a separate scoped policy
+      already covers that, independent of this parameter.) When set, must be a
+      Secrets Manager secret ARN.
+    AllowedPattern: ^$|^arn:aws[a-zA-Z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$
+
+  SourceDbSecurityGroupId:
+    Type: String
+    Default: ""
+    Description: >
+      Security group id of the source RDS/Aurora MySQL. When set, the task's
+      egress on the source DB port is scoped to this security group only
+      (preferred). Provide this OR SourceDbCidr -- at least one is required so the
+      task can reach the source; with both empty there is no DB-port egress and
+      the source connection times out.
+
+  SourceDbCidr:
+    Type: String
+    Default: ""
+    Description: >
+      Source DB CIDR, used when SourceDbSecurityGroupId is empty -- the task's
+      egress on the source DB port is opened to this CIDR. Provide this OR
+      SourceDbSecurityGroupId (at least one is required to reach the source).
+
+  SourceDbPort:
+    Type: Number
+    Default: 3306
+    MinValue: 1
+    MaxValue: 65535
+    Description: Source MySQL port (egress).
+
+  SourceMode:
+    Type: String
+    Default: git
+    AllowedValues: ["git", "s3"]
+    Description: >
+      How the host obtains the app source (NO Docker/ECR -- it runs from source).
+      "git" (default): git clone SourceRepoUrl@SourceRepoRef -- public HTTPS needs
+      no auth; the temporary AWS GitLab SSH path uses a deploy key (see
+      DeployKeySsmParam). "s3": download+extract a source tarball from SourceS3Uri --
+      the simplest TEMPORARY path to run YOUR LOCAL working copy before the repo is
+      public on GitHub (tar your checkout, upload it to S3, point SourceS3Uri at it).
+
+  SourceS3Uri:
+    Type: String
+    Default: ""
+    Description: >
+      s3:// URI of the app source tarball (.tar.gz of the repo root). Required when
+      SourceMode=s3; the host runs `aws s3 cp` then extracts with --strip-components=1.
+      Ignored when SourceMode=git.
+
+  SourceRepoUrl:
+    Type: String
+    Default: https://github.com/dalyoung/mysql-dsql-migration-tool.git
+    Description: >
+      Git repo to clone when SourceMode=git. Default is the (future) public GitHub
+      URL -- a no-auth HTTPS clone. For the temporary AWS GitLab path set this to the
+      SSH URL (git@ssh.gitlab.aws.dev:...) AND set DeployKeySsmParam.
+
+  SourceRepoRef:
+    Type: String
+    Default: main
+    Description: Branch or tag to clone (shallow --branch; not a bare commit SHA).
+
+  DeployKeySsmParam:
+    Type: String
+    Default: ""
+    Description: >
+      Name of an SSM Parameter Store SecureString holding a READ-ONLY SSH deploy key
+      (name WITHOUT a leading slash, e.g. mysql-dsql-migrator/deploy-key). Set ONLY
+      for the temporary AWS GitLab SSH clone; empty (the public-GitHub end state) =
+      no key, no IAM grant, no port-22 egress. Ignored when SourceMode=s3.
+
+  HttpsEgressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >
+      CIDR for outbound HTTPS (443) to reach Aurora DSQL, Secrets Manager, ECR,
+      CloudWatch, and (when enabled) Bedrock via NAT. Tighten to your
+      VPC-endpoint/NAT CIDR when using PrivateLink.
+
+  AppPort:
+    Type: Number
+    Default: 8080
+    MinValue: 1
+    MaxValue: 65535
+    Description: Port the NiceGUI app listens on inside the container.
+
+  EnableActivityLogCloudWatch:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      When true, the app mirrors each activity-log event to stdout as a JSON line.
+      On this EC2 host stdout is captured by Docker's json-file log driver (view
+      with `docker logs dsql-migrator`), giving a queryable audit trail alongside
+      the rotating file on the EBS state volume. Off by default; the local rotating
+      file (on the durable state volume) remains regardless.
+
+  EnableAiAssist:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Opt-in AI-assisted conversion. When false, bedrock:InvokeModel is NOT
+      granted. When true, it is granted scoped to BedrockModelArns only.
+
+  BedrockModelArns:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      OPTIONAL override of the foundation-model/inference-profile ARN(s) the host
+      role may invoke when EnableAiAssist=true. Leave EMPTY (default) to have the
+      scope auto-derived from BedrockModelId. Set it only to use a model not in the
+      BedrockModelId list, or to scope differently (comma-separated ARNs).
+
+  BedrockRegion:
+    Type: String
+    Default: ""
+    Description: AWS region for Bedrock calls (BEDROCK_REGION). Optional.
+
+  BedrockModelId:
+    Type: String
+    # MUST match DEFAULT_BEDROCK_MODEL_ID in src/dsql_migrator/ui/ai_assist.py. The IAM
+    # scope below is derived from THIS value, while the app falls back to its own default
+    # when the Connect form's Model ID is left blank -- so a mismatch produces an
+    # AccessDenied on "Verify AI access" that looks like a permissions bug rather than a
+    # config drift. It was `us.` here against `global.` in the app for exactly that reason.
+    #
+    # Every allowed value is a `global.` profile, which resolves from any commercial
+    # region. The `us.` profiles this list used to offer only resolve from
+    # us-east-1/us-east-2/us-west-2, so they broke every non-US deploy out of the box
+    # while adding nothing for US ones -- `global.` works there too (verified).
+    Default: global.anthropic.claude-sonnet-5
+    AllowedValues:
+      # GLOBAL cross-region inference profiles ONLY. These resolve from every commercial
+      # region -- verified against us-east-1, us-west-2 and ap-northeast-2 -- so the `us.`
+      # equivalents this list used to carry bought nothing: they work in three US regions
+      # and fail everywhere else, which is a trap rather than a choice. One geo prefix also
+      # keeps the derived IAM scope and the app default from drifting per deploy region.
+      - global.anthropic.claude-sonnet-5
+      - global.anthropic.claude-opus-5
+      - global.anthropic.claude-opus-4-8
+      - global.anthropic.claude-sonnet-4-6
+    Description: >
+      Anthropic cross-region inference profile for AI-assisted conversion
+      (BEDROCK_MODEL_ID). Every option is a `global.` profile, which resolves from
+      any commercial region -- including ap-northeast-2/Seoul and eu-*.
+      When EnableAiAssist=true, the host role's bedrock:InvokeModel scope is
+      DERIVED from this automatically (the profile ARN in the deploy region +
+      the underlying anthropic foundation-model, region-agnostic) -- you do not
+      need to supply BedrockModelArns. The model must be access-enabled in your
+      account and region.
+
+  # --- New to the EC2 ("EC2 + MSK only") mode --------------------------------
+  InstanceType:
+    Type: String
+    Default: t3.large
+    Description: EC2 instance type for the single control-plane host.
+
+  HostSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >
+      A NAT-egress subnet of VpcId, co-located with the cdc-stack MSK. The host is
+      reached via SSM port-forward, so no public IP is needed -- a private subnet
+      with a route to a NAT gateway (or the VPC endpoints the SSM agent + AWS APIs
+      need) is the recommended placement.
+
+  StateVolumeSizeGiB:
+    Type: Number
+    Default: 20
+    MinValue: 8
+    Description: >
+      Size of the retained EBS state volume (job/session SQLite + activity log).
+      Size up for a large-table Full Load whose local CSV spillover is staged here.
+
+  MskEgressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >
+      CIDR the host may reach MSK Serverless on 9098 for the in-process CDC offset
+      seed (IAM/TLS SASL). Narrow to the connector subnet CIDR for least privilege.
+
+  KeyName:
+    # AWS::EC2::KeyPair::KeyName would force an existing key pair; a plain String
+    # with an empty default keeps the key OPTIONAL (SSM Session Manager is the
+    # primary access path), gated by the HasKeyName condition below.
+    Type: String
+    Default: ""
+    Description: >
+      OPTIONAL SSH key pair name. SSM Session Manager is the primary access path,
+      so this is usually left empty (no key, no inbound SSH -- the host has no
+      ingress rule at all). Set it only if you also add your own inbound access.
+
+  LatestAl2023Ami:
+    # SSM public-parameter-typed: CloudFormation resolves it to the latest Amazon
+    # Linux 2023 x86_64 AMI id at deploy time (the image is amd64).
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >
+      Base AMI. Defaults to the SSM public parameter that always resolves the
+      latest Amazon Linux 2023 x86_64 image -- no hard-coded, region-specific id.
+
+# Reject an unreachable-source deployment at create/update time (before any
+# resource is provisioned).
+Rules:
+  # The host must have an egress path to the source MySQL on SourceDbPort, or it
+  # can never connect (the UI's source connection times out). That path is opened
+  # by EITHER SourceDbSecurityGroupId (preferred -- host egress scoped to the
+  # source DB's security group) OR SourceDbCidr. If BOTH are left empty, no
+  # DB-port egress rule is created at all, so require at least one here -- a clear
+  # deploy-time failure instead of a silently unreachable source at runtime.
+  SourceReachabilityRequired:
+    Assertions:
+      - Assert:
+          Fn::Or:
+            - Fn::Not:
+                - Fn::Equals: [Ref: SourceDbSecurityGroupId, ""]
+            - Fn::Not:
+                - Fn::Equals: [Ref: SourceDbCidr, ""]
+        AssertDescription: >-
+          Provide SourceDbSecurityGroupId (preferred) or SourceDbCidr so the host
+          gets egress to the source MySQL on SourceDbPort. With both empty the host
+          has no route to the source DB and connections time out.
+
+Conditions:
+  # SourceSecretArn is optional: set only to reuse an existing Secrets Manager
+  # secret. When empty (username/password auth in the UI), the read-source-secret
+  # GetSecretValue policy below is omitted -- nothing to read.
+  HasSourceSecret:
+    Fn::Not:
+      - Fn::Equals: [Ref: SourceSecretArn, ""]
+
+  UseSourceDbSecurityGroup:
+    Fn::Not:
+      - Fn::Equals: [Ref: SourceDbSecurityGroupId, ""]
+
+  UseSourceDbCidr:
+    Fn::And:
+      - Fn::Equals: [Ref: SourceDbSecurityGroupId, ""]
+      - Fn::Not:
+          - Fn::Equals: [Ref: SourceDbCidr, ""]
+
+  AiAssistEnabled:
+    Fn::Equals: [Ref: EnableAiAssist, "true"]
+
+  # True when the operator supplied explicit BedrockModelArns; otherwise the IAM
+  # scope is auto-derived from BedrockModelId. BedrockModelArns is a
+  # CommaDelimitedList, so join it and compare to "" to detect the empty default.
+  HasBedrockModelArnsOverride:
+    Fn::Not:
+      - Fn::Equals:
+          - Fn::Join: ["", Ref: BedrockModelArns]
+          - ""
+
+  # Attach the optional SSH key only when one was supplied; SSM Session Manager is
+  # the primary access path, so the common case leaves this empty (no key).
+  HasKeyName:
+    Fn::Not:
+      - Fn::Equals: [Ref: KeyName, ""]
+
+  # A deploy-key SSM param was supplied -> the TEMPORARY GitLab SSH clone path.
+  # Gates the read-deploy-key IAM grant + the port-22 egress so BOTH exist only on
+  # that path; the public-GitHub end state (empty) auto-drops them.
+  HasDeployKey:
+    Fn::Not:
+      - Fn::Equals: [Ref: DeployKeySsmParam, ""]
+
+Resources:
+  # Stable secret used to sign the UI's browser-session cookie
+  # (DSQL_MIGRATOR_STORAGE_SECRET). Auto-generated once and held in Secrets
+  # Manager so the browser session id stays stable across container restarts
+  # -- this lets a reconnecting browser resume its persisted workbench state
+  # (workflow progress, Evaluation result, Full Load linkage) instead of
+  # re-running Step 1. It only signs the session cookie; no DB/user credentials
+  # are stored here. (On this host the per-session SQLite ALSO lives on the
+  # retained EBS volume, so restoration survives even a container recreate.)
+  StorageSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description:
+        Fn::Sub: "${AWS::StackName} UI session cookie signing secret."
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  # Host role: the app's own runtime permissions (least privilege). Identical to
+  # the Fargate task role's policies (dsql-connect, read-source-secret [when a
+  # source secret is reused], provision-cdc-source-secret, cdc-deploy-discovery),
+  # PLUS the two extras this EC2 mode needs: cdc-external-seed (the in-process MSK
+  # offset seed the Fargate stack delegated to an in-VPC seeder Lambda) and
+  # read-storage-secret (user-data fetches the cookie secret itself, since there is
+  # no ECS execution role to inject it). Trust is ec2.amazonaws.com (via the
+  # instance profile) instead of ecs-tasks.amazonaws.com.
+  HostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      # AmazonSSMManagedInstanceCore lets the SSM agent register the host and serve
+      # Session Manager + AWS-StartPortForwardingSession over its OUTBOUND channel
+      # (the sole access path -- there is no inbound rule / ALB).
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: dsql-connect
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DsqlConnect
+                Effect: Allow
+                # The app connects as the DSQL "admin" role by default, whose
+                # IAM auth token requires dsql:DbConnectAdmin; dsql:DbConnect
+                # covers connecting as a non-admin database role. Both are scoped
+                # to this cluster only.
+                Action:
+                  - dsql:DbConnect
+                  - dsql:DbConnectAdmin
+                Resource:
+                  Ref: DsqlClusterArn
+              - Sid: DsqlClusterMetadata
+                Effect: Allow
+                # Read-only metadata used by the overview diagram to show the
+                # cluster's "Name" tag (falls back to the cluster id without it).
+                # Scoped to this cluster only.
+                Action:
+                  - dsql:GetCluster
+                  - dsql:ListTagsForResource
+                Resource:
+                  Ref: DsqlClusterArn
+        # Only when an existing SourceSecretArn is provided (reuse path). With
+        # username/password auth the parameter is empty and this policy is omitted.
+        - Fn::If:
+            - HasSourceSecret
+            - PolicyName: read-source-secret
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Sid: GetSourceSecret
+                    Effect: Allow
+                    Action: secretsmanager:GetSecretValue
+                    Resource:
+                      Ref: SourceSecretArn
+            - Ref: AWS::NoValue
+        # Read the SSH deploy key from SSM ONLY on the temporary GitLab clone path
+        # (DeployKeySsmParam set). Auto-drops to AWS::NoValue once the repo is public
+        # on GitHub (DeployKeySsmParam empty -> HasDeployKey false). KMS nuance: a
+        # SecureString on the default aws/ssm key needs no extra grant; a customer CMK
+        # additionally needs kms:Decrypt on that key (unknown at deploy time -> not
+        # added here, documented in the runbook).
+        - Fn::If:
+            - HasDeployKey
+            - PolicyName: read-deploy-key
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Sid: GetDeployKey
+                    Effect: Allow
+                    Action:
+                      - ssm:GetParameter
+                      - ssm:GetParameters
+                    Resource:
+                      Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DeployKeySsmParam}
+            - Ref: AWS::NoValue
+        - PolicyName: provision-cdc-source-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # When the source was connected with username/password (no Secrets
+              # Manager reference to reuse), the tool creates/upserts a managed
+              # source-credentials secret for the CDC connector (Debezium can only
+              # read source creds from Secrets Manager). Names are deterministic
+              # (mysql-dsql-migrator/cdc/<stack-name>/source), so write access is scoped
+              # to that prefix only -- never the customer's other secrets.
+              - Sid: ProvisionCdcSourceSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:DescribeSecret
+                  # RestoreSecret so the upsert can recover a same-named secret that
+                  # a prior CDC teardown scheduled for deletion (still in its recovery
+                  # window): AWS rejects CreateSecret/PutSecretValue while it is
+                  # pending deletion, so secrets.py restores it first, then writes the
+                  # new value. Without this the app fails with AccessDenied on
+                  # RestoreSecret when re-provisioning after a teardown. Same prefix scope.
+                  - secretsmanager:RestoreSecret
+                  # DeleteSecret so a full CDC teardown removes the credentials the
+                  # tool stored (they do not belong to a CloudFormation resource, so
+                  # delete-stack cannot clean them up). Scoped to the same prefix.
+                  - secretsmanager:DeleteSecret
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:mysql-dsql-migrator/cdc/*
+              # NOTE: when DSQL_MIGRATOR_CDC_SECRET_KMS_KEY_ID is set to a customer-
+              # managed KMS key, that key's policy (or an additional grant) must let
+              # this HostRole kms:GenerateDataKey + kms:Decrypt. It is not granted
+              # here because the CMK ARN is not known at app-stack deploy time; with
+              # the default aws/secretsmanager key no extra grant is needed.
+        - PolicyName: cdc-deploy-discovery
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Subnet auto-select for the CDC infra deploy reads VPC topology.
+              # EC2 Describe* + sts:GetCallerIdentity do not support resource-level
+              # scoping, so they are "*" but are strictly read-only.
+              - Sid: DiscoverConnectorSubnets
+                Effect: Allow
+                Action:
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeVpcs
+                  # DescribeNetworkInterfaces: during a CDC infrastructure DELETE, the
+                  # in-VPC offset-seeder Lambda's ENIs are reclaimed by AWS over
+                  # ~15-20 min before MskCluster can be removed, and CloudFormation
+                  # emits no events for that wait -- so the deploy log looks frozen.
+                  # Reading the seeder's ENIs lets the delete progress report "still
+                  # reclaiming N ENIs" / "ENIs released" and fill that gap. Read-only,
+                  # no resource-level scoping (like the other Describe* above).
+                  - ec2:DescribeNetworkInterfaces
+                Resource: "*"
+              - Sid: CallerIdentity
+                Effect: Allow
+                Action: sts:GetCallerIdentity
+                Resource: "*"
+              # The host role itself (NOT the assumed deploy role) polls connector
+              # state to drive the CDC UI: it lists connectors to find one by name
+              # and waits for RUNNING before starting the sink pass. Without
+              # ListConnectors the read silently returns nothing (the call is
+              # AccessDenied and swallowed), so a connector that is actually RUNNING
+              # shows "creating…" forever and the sink pass never starts.
+              # ListConnectors has no resource-level support (Resource "*");
+              # DescribeConnector is scoped to the cdc connector family.
+              - Sid: DiscoverCdcConnectors
+                Effect: Allow
+                Action: kafkaconnect:ListConnectors
+                Resource: "*"
+              - Sid: DescribeCdcConnectors
+                Effect: Allow
+                Action: kafkaconnect:DescribeConnector
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector/mysql-dsql-cdc-*/*
+              # Read the pipeline's CloudWatch metrics for the live health panel:
+              # the built-in AWS/KafkaConnect throughput/task metrics
+              # (SinkRecordSendRate, SourceRecordPollRate, Running/ErroredTaskCount)
+              # AND the sink's per-table net-rows custom metric. ListMetrics discovers
+              # the sink's actual per-table dimension values (the sink emits the Table
+              # dimension schema-qualified, e.g. db.table) so the monitor matches them
+              # to the tool's table names regardless of single-db vs cluster naming.
+              # Neither API has resource-level scoping, so both are granted on "*"
+              # (like ListConnectors).
+              - Sid: ReadConnectorMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:ListMetrics
+                Resource: "*"
+              # Read connector worker logs to surface an actionable reason when a
+              # connector enters FAILED (worker-log-driven diagnosis in the UI) and
+              # to surface DLQ poison-record events in the data-migration status page.
+              # FilterLogEvents backs the DLQ depth / "Quarantined records" read
+              # (MskConnectController.dlq_errors); without it that read fails closed
+              # (AccessDenied is swallowed) and the UI always shows an empty DLQ.
+              - Sid: ReadConnectorWorkerLogs
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogStreams
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/msk-connect/mysql-dsql-cdc-*:*
+              # The tool manages a single per-account/region plugin bucket
+              # (mysql-dsql-migrator-plugins-<account>-<region>). It holds the two
+              # bundled connector artifacts, the durable per-session resume snapshots
+              # (sessions/ prefix), AND the durable Full Load job snapshots (jobs/
+              # prefix). CreateBucket makes it self-provisioning; ListBucket backs
+              # snapshot pruning; the object-level grant on /* covers both prefixes
+              # (incl. head_object via s3:GetObject). Scoped to that bucket only.
+              - Sid: ManagePluginBucket
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:ListBucket
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}
+              # PutObject/GetObject: upload plugins + read/write session snapshots.
+              # DeleteObject: remove a session on "Start over" and prune old ones.
+              - Sid: UploadPlugins
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}/*
+              # The privileged cdc-stack CloudFormation/MSK/IAM operations are NOT
+              # granted to this (long-running) host role. Instead the app assumes
+              # the dedicated CdcDeployRole only for the duration of a deploy. The
+              # resource is the role's known name (NOT a GetAtt) to avoid a circular
+              # dependency with CdcDeployRole's trust policy (which GetAtt's this role).
+              - Sid: AssumeCdcDeployRole
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-cdc-deploy
+        # NEW for the EC2 mode: the in-process CDC offset seed. The Fargate stack
+        # delegated the gapless-handoff seed to an in-VPC seeder Lambda the cdc-stack
+        # created (its OffsetSeederRole held these kafka-cluster permissions). This
+        # host has no Lambda, so it seeds MSK ITSELF in process
+        # (DSQL_MIGRATOR_CDC_SEED_MODE=external), and therefore needs the same
+        # cluster + topic data-plane grants directly on the host role. Mirrors the
+        # cdc-stack OffsetSeederRole msk policy (MskConnect + MskSeedTopic).
+        #
+        # WILDCARD SCOPE: the runtime cdc-stack's name, TopicPrefix, and DlqTopicName
+        # are all chosen at CDC-deploy time and are UNKNOWN when this app stack is
+        # deployed, so the resource ARNs cannot be pinned to a specific cluster/topic
+        # here. They are instead bounded to the tool's cdc-stack family
+        # ("mysql-dsql-cdc-*-msk"), which is exactly the family the CdcDeployRole may
+        # create -- so the seed can reach whatever cdc-stack this app later stands up,
+        # and nothing outside that family. No kafka-cluster group action is granted:
+        # the in-process seed uses consumer.assign() (manual partition assignment),
+        # never a consumer group, so no *Group permission is required.
+        - PolicyName: cdc-external-seed
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: MskConnect
+                Effect: Allow
+                Action:
+                  - kafka-cluster:Connect
+                  - kafka-cluster:DescribeCluster
+                  # WriteDataIdempotently covers a future idempotent/transactional
+                  # seed path (InitProducerId under acks=all); the current seed
+                  # disables idempotence, so it is a belt-and-suspenders grant. This
+                  # action is cluster-scoped (not topic-scoped).
+                  - kafka-cluster:WriteDataIdempotently
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:cluster/mysql-dsql-cdc-*-msk/*
+              - Sid: MskSeedTopic
+                Effect: Allow
+                Action:
+                  - kafka-cluster:CreateTopic
+                  - kafka-cluster:DescribeTopic
+                  - kafka-cluster:ReadData
+                  - kafka-cluster:WriteData
+                  - kafka-cluster:DescribeTopicDynamicConfiguration
+                  - kafka-cluster:AlterTopicDynamicConfiguration
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/mysql-dsql-cdc-*-msk/*/*
+        # NEW for the EC2 mode: user-data reads the auto-generated cookie-signing
+        # secret at boot to inject it into the container as
+        # DSQL_MIGRATOR_STORAGE_SECRET. On Fargate this was the EXECUTION role's job
+        # (Secrets injection into the task); with no ECS execution role here, the host
+        # role reads it directly. Scoped to this stack's StorageSecret only.
+        - PolicyName: read-storage-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: GetStorageSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  Ref: StorageSecret
+
+  # Instance profile so EC2 can assume the host role.
+  HostInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: HostRole
+
+  # Granted only when AI assist is enabled; scoped to the allowed model ARN(s).
+  # Attached to the HOST role (the Fargate stack attached the identical policy to
+  # its task role). Keeps EnableAiAssist / BedrockModelId functional in this mode.
+  BedrockInvokePolicy:
+    Type: AWS::IAM::Policy
+    Condition: AiAssistEnabled
+    Properties:
+      PolicyName: bedrock-invoke-model
+      Roles:
+        - Ref: HostRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: BedrockInvokeModel
+            Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource:
+              # Explicit BedrockModelArns override, else auto-derived scope,
+              # REGION-AGNOSTIC so it works for us. / global. (and apac.) profiles:
+              #   1) the inference profile in THIS deploy region/account, plus
+              #   2) the underlying anthropic foundation-model, scoped to the exact
+              #      model id but ANY region (`*`) -- a geo profile routes to a
+              #      geo-specific and/or region-less set (us: us-east/west; global:
+              #      region-less + calling region; apac: 8 ap-* regions), so we
+              #      cannot enumerate member regions per geo. The `*` is on the
+              #      REGION only; the model id stays exact (never a blanket `*`).
+              # Fm = model id minus its geo prefix: split on "anthropic." (present in
+              # every profile id: us./global./apac.anthropic.<model>) and re-prepend.
+              Fn::If:
+                - HasBedrockModelArnsOverride
+                - Ref: BedrockModelArns
+                - - Fn::Sub: arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}
+                  - Fn::Sub:
+                      - arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.${Fm}
+                      - Fm:
+                          Fn::Select: [1, Fn::Split: ["anthropic.", Ref: BedrockModelId]]
+
+  # Dedicated privileged role the app assumes ONLY for cdc-stack lifecycle (keeps
+  # CFN/MSK/iam:CreateRole/PassRole off the long-running host role). Explicit
+  # RoleName breaks the trust-policy cycle with HostRole. IAM is scoped to the
+  # "mysql-dsql-cdc-*" stack-name family so one role manages all cdc-stacks (names
+  # are validated to start with that prefix; see core/cdc.py). NOTE: the parent app
+  # stack must NOT use a "mysql-dsql-cdc-" name or its resources fall in scope.
+  # (Copied verbatim from the Fargate app-stack, except the trust principal is the
+  # HostRole instead of the ECS TaskRole.)
+  CdcDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: ${AWS::StackName}-cdc-deploy
+      Description: >-
+        Privileged role assumed by the app only for cdc-stack CloudFormation
+        lifecycle (create/update/delete). Holds CFN/MSK/KafkaConnect/Glue/EC2-SG/
+        Logs/IAM-create + scoped PassRole permissions that are intentionally NOT on
+        the host role.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowTaskRoleToAssume
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::GetAtt: [HostRole, Arn]
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cdc-stack-deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # CloudFormation: create/update/delete + poll the cdc-stack.
+              - Sid: CloudFormationStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/mysql-dsql-cdc-*/*
+                  - Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/mysql-dsql-cdc-*
+              # ValidateTemplate + ListStacks have no stack ARN (they are account/
+              # region-wide); read-only. ListStacks lets the CDC screen discover an
+              # existing mysql-dsql-cdc-* stack that a reset session no longer
+              # remembers, so it can adopt it instead of silently creating a second
+              # (costly) MSK stack. Names are filtered to the cdc family client-side.
+              - Sid: CloudFormationAccountReads
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:ListStacks
+                Resource: "*"
+              # Stage the oversize cdc-stack template in the plugin bucket: this role
+              # does the PutObject; CloudFormation reads it back (TemplateURL) too.
+              - Sid: StageCdcStackTemplate
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}/cdc-plugins/*
+              # MSK Serverless cluster (CFN AWS::MSK::ServerlessCluster) +
+              # GetBootstrapBrokers (called directly by the deployer at Start).
+              - Sid: MskServerlessCluster
+                Effect: Allow
+                Action:
+                  - kafka:CreateClusterV2
+                  - kafka:DeleteCluster
+                  - kafka:DescribeClusterV2
+                  - kafka:GetBootstrapBrokers
+                  - kafka:TagResource
+                  - kafka:UntagResource
+                  - kafka:ListTagsForResource
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:cluster/mysql-dsql-cdc-*-msk/*
+              # MSK Connect connector CREATE has NO resource-level support: at
+              # create time the connector ARN does not exist yet, so IAM evaluates
+              # kafkaconnect:CreateConnector against "*" -- a scoped connector ARN
+              # (like the operations below) makes CreateConnector fail with
+              # "Access denied for operation 'AWS::KafkaConnect::Connector'". Same
+              # class as CreateCustomPlugin / CreateWorkerConfiguration just below,
+              # which are already "*" for this reason. Tagging on create is covered
+              # by the TagResource here (also no resource-level support at create).
+              - Sid: KafkaConnectCreateConnector
+                Effect: Allow
+                Action:
+                  - kafkaconnect:CreateConnector
+                  - kafkaconnect:TagResource
+                Resource: "*"
+              # ListConnectors is an ACCOUNT-LEVEL list operation (authorized against
+              # .../v1/connectors), so it cannot be resource-scoped -- it must be "*"
+              # (same as the host role's DiscoverCdcConnectors grant). run_cdc_start /
+              # run_cdc_stop list connectors to read source/sink state during the
+              # two-pass start and the stop. A connector-ARN scope silently grants
+              # nothing, so the deployer got AccessDeniedException on ListConnectors.
+              - Sid: KafkaConnectListConnectors
+                Effect: Allow
+                Action: kafkaconnect:ListConnectors
+                Resource: "*"
+              # MSK Connect connector operations that DO support resource-level
+              # scoping (the connector ARN exists by then): scope to the cdc family.
+              - Sid: KafkaConnectConnector
+                Effect: Allow
+                Action:
+                  - kafkaconnect:DeleteConnector
+                  - kafkaconnect:DescribeConnector
+                  - kafkaconnect:UpdateConnector
+                  - kafkaconnect:UntagResource
+                  - kafkaconnect:ListTagsForResource
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector/mysql-dsql-cdc-*/*
+              # UpdateConnector is asynchronous: it returns a connector-operation id
+              # that the CFN handler polls with DescribeConnectorOperation. AWS
+              # authorizes that poll against BOTH ARN shapes depending on the call
+              # path -- the connector ARN (connector/<name>/<uuid>) AND the
+              # per-operation ARN (connector-operation/<name>/<uuid>/<op-uuid>) --
+              # so BOTH must be granted or the CDC retry rolls back with "not
+              # authorized to perform kafkaconnect:DescribeConnectorOperation"
+              # (observed on each shape in turn as the scope was narrowed).
+              - Sid: KafkaConnectConnectorOperation
+                Effect: Allow
+                Action:
+                  - kafkaconnect:DescribeConnectorOperation
+                  - kafkaconnect:ListConnectorOperations
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector/mysql-dsql-cdc-*/*
+                  - Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector-operation/mysql-dsql-cdc-*/*
+              # CustomPlugin + WorkerConfiguration: their create actions have NO
+              # resource-level support (must be "*"), and the CFN resource handlers
+              # tag + read tags on create, so TagResource/ListTagsForResource/
+              # UntagResource are required too -- else creation returns AccessDenied.
+              - Sid: KafkaConnectPlugin
+                Effect: Allow
+                Action:
+                  - kafkaconnect:CreateCustomPlugin
+                  - kafkaconnect:DeleteCustomPlugin
+                  - kafkaconnect:DescribeCustomPlugin
+                  - kafkaconnect:TagResource
+                  - kafkaconnect:UntagResource
+                  - kafkaconnect:ListTagsForResource
+                Resource: "*"
+              - Sid: KafkaConnectWorkerConfig
+                Effect: Allow
+                Action:
+                  - kafkaconnect:CreateWorkerConfiguration
+                  - kafkaconnect:DeleteWorkerConfiguration
+                  - kafkaconnect:DescribeWorkerConfiguration
+                  - kafkaconnect:TagResource
+                  - kafkaconnect:UntagResource
+                  - kafkaconnect:ListTagsForResource
+                Resource: "*"
+              # EC2 networking the cdc-stack creates (SG, and when ConnectorSubnetIds
+              # is empty its own subnets/NAT/route table). EC2 create/delete has no
+              # ARN-level conditions; the role is short-lived, so "*" is acceptable.
+              - Sid: Ec2NetworkResources
+                Effect: Allow
+                Action:
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:DescribeSecurityGroups
+                  - ec2:CreateSubnet
+                  - ec2:DeleteSubnet
+                  - ec2:ModifySubnetAttribute
+                  - ec2:DescribeSubnets
+                  - ec2:CreateRouteTable
+                  - ec2:DeleteRouteTable
+                  - ec2:CreateRoute
+                  - ec2:DeleteRoute
+                  - ec2:AssociateRouteTable
+                  - ec2:DisassociateRouteTable
+                  - ec2:DescribeRouteTables
+                  - ec2:AllocateAddress
+                  - ec2:ReleaseAddress
+                  - ec2:DescribeAddresses
+                  - ec2:CreateNatGateway
+                  - ec2:DeleteNatGateway
+                  - ec2:DescribeNatGateways
+                  - ec2:CreateVpcEndpoint
+                  - ec2:DeleteVpcEndpoints
+                  - ec2:DescribeVpcEndpoints
+                  - ec2:ModifyVpcEndpoint
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeVpcAttribute
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeInternetGateways
+                  # When MSK Connect creates the connector it places the connector's
+                  # ENIs in the connector subnets USING THE CALLER'S (this deploy
+                  # role's) credentials -- CloudTrail shows CreateNetworkInterface
+                  # called by kafkaconnect.amazonaws.com but authorized against
+                  # <stack>-cdc-deploy, not the connector's ServiceExecutionRole or
+                  # the MSK Connect service-linked role. Without these the connector
+                  # CREATE fails with "not authorized to perform
+                  # ec2:CreateNetworkInterface" (AWS::KafkaConnect::Connector
+                  # InvalidRequest). No resource-level support at create time (the
+                  # ENI does not exist yet), so Resource stays "*".
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:CreateNetworkInterfacePermission
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                Resource: "*"
+              # Connector worker log group (CFN AWS::Logs::LogGroup).
+              - Sid: ConnectorLogGroup
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:TagLogGroup
+                  - logs:TagResource
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/msk-connect/mysql-dsql-cdc-*-cdc:*
+              # logs:DescribeLogGroups has no resource-level support; CFN calls it to
+              # resolve the LogGroup Arn for !GetAtt. Scope to account/region log groups.
+              - Sid: LogGroupDescribe
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+              # The connector enables CloudWatch worker-log delivery
+              # (workerLogDelivery.cloudWatchLogs.enabled=true). MSK Connect sets that
+              # up via the CloudWatch Logs vended-logs *delivery* API using the
+              # CALLER'S (this deploy role's) credentials -- without these the
+              # connector goes to FAILED with InvalidInput.WorkerLogsError ("not
+              # authorized to perform logs:ListLogDeliveries"), and no worker logs are
+              # ever written. These delivery actions have no resource-level support,
+              # so Resource is "*" (the AWS-documented vended-logs set for a
+              # CloudWatch Logs destination).
+              - Sid: CloudWatchLogsLogDelivery
+                Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                Resource: "*"
+              # The cdc-stack creates a CloudWatch alarm per connector on
+              # AWS/KafkaConnect ErroredTaskCount (to surface a FAILED connector
+              # automatically). THIS deploy role creates/updates/deletes those alarms,
+              # so it needs the alarm actions -- without them the cdc-stack deploy
+              # fails creating the alarm with AccessDenied (cloudwatch:PutMetricAlarm)
+              # and its rollback fails on cloudwatch:DeleteAlarms. PutMetricAlarm /
+              # DeleteAlarms + tagging support resource-level scoping (alarm ARN, cdc
+              # family, matching the log-group scoping above); DescribeAlarms does not.
+              - Sid: CdcConnectorAlarms
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:TagResource
+                  - cloudwatch:UntagResource
+                  - cloudwatch:ListTagsForResource
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:mysql-dsql-cdc-*
+              # cloudwatch:DescribeAlarms has no resource-level support; CFN calls it to
+              # read the alarm's state on create/update. Scope to "*" (read-only).
+              - Sid: CdcConnectorAlarmsDescribe
+                Effect: Allow
+                Action: cloudwatch:DescribeAlarms
+                Resource: "*"
+              # IAM roles the cdc-stack auto-names (connector exec role + seeder role).
+              - Sid: IamCdcStackRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListAttachedRolePolicies
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/mysql-dsql-cdc-*
+              # PassRole each cdc-stack role only to its service (MSK Connect / Lambda).
+              - Sid: IamPassRoleToCdcServices
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/mysql-dsql-cdc-*
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - kafkaconnect.amazonaws.com
+                      - lambda.amazonaws.com
+              # Offset-seeder Lambda (SeedOffset only): in-VPC <stack>-offset-seeder,
+              # invoked by a custom resource to seed the Debezium offset.
+              - Sid: LambdaOffsetSeeder
+                Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:UpdateFunctionCode
+                  - lambda:InvokeFunction
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:ListTags
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:mysql-dsql-cdc-*
+              # CustomPlugin reads the plugin artifact from the managed bucket.
+              - Sid: ReadPluginArtifacts
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}/*
+
+  # Host security group. NO ingress: SSM Session Manager and its port-forward run
+  # entirely over the SSM agent's OUTBOUND channel (the agent dials out to the SSM
+  # service), so the host never needs an inbound rule -- the security win over the
+  # ALB model (no listener, no public attack surface, nothing to scope an ingress
+  # CIDR to). Egress is scoped to exactly what the app needs.
+  HostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Single-host SG: no inbound (SSM port-forward is outbound-only); egress to AWS endpoints, DSQL, MSK, and the source DB."
+      VpcId:
+        Ref: VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp:
+            Ref: HttpsEgressCidr
+          Description: HTTPS egress to AWS APIs (SSM, ECR, Secrets Manager, STS, DSQL token, CloudWatch) via NAT/PrivateLink.
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp:
+            Ref: HttpsEgressCidr
+          Description: Egress to Aurora DSQL (PostgreSQL wire protocol, port 5432).
+        - IpProtocol: tcp
+          FromPort: 9098
+          ToPort: 9098
+          CidrIp:
+            Ref: MskEgressCidr
+          Description: Egress to MSK Serverless (IAM/TLS SASL, port 9098) for the in-process CDC offset seed.
+
+  SourceDbEgressBySg:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: UseSourceDbSecurityGroup
+    Properties:
+      GroupId:
+        Fn::GetAtt: [HostSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort:
+        Ref: SourceDbPort
+      ToPort:
+        Ref: SourceDbPort
+      DestinationSecurityGroupId:
+        Ref: SourceDbSecurityGroupId
+      Description: Egress to source RDS/Aurora MySQL security group.
+
+  SourceDbEgressByCidr:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: UseSourceDbCidr
+    Properties:
+      GroupId:
+        Fn::GetAtt: [HostSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort:
+        Ref: SourceDbPort
+      ToPort:
+        Ref: SourceDbPort
+      CidrIp:
+        Ref: SourceDbCidr
+      Description: Egress to source RDS/Aurora MySQL CIDR.
+
+  # TCP 22 egress for the TEMPORARY GitLab SSH clone (git@ssh.gitlab.aws.dev). Only
+  # created when a deploy key is supplied; the public-GitHub end state clones over
+  # HTTPS (443, already allowed) so this rule is absent then. Open to the internet on
+  # 22 because the GitLab host is a public endpoint reached via NAT; the SG still has
+  # NO inbound, so this is outbound-only.
+  GitSshEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: HasDeployKey
+    Properties:
+      GroupId:
+        Fn::GetAtt: [HostSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: 0.0.0.0/0
+      Description: Egress for the temporary GitLab SSH source clone (git over SSH).
+
+  # The single control-plane host. Runs the app FROM SOURCE (no Docker/ECR) as a
+  # systemd service; reached only via SSM port-forward. Bootstrap in UserData:
+  # install git+uv, mount the retained state volume, obtain the source (S3 tarball
+  # OR git clone), uv sync --extra cdc-external, write the runtime env, run systemd.
+  AppHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType:
+        Ref: InstanceType
+      ImageId:
+        Ref: LatestAl2023Ami
+      SubnetId:
+        Ref: HostSubnetId
+      SecurityGroupIds:
+        - Fn::GetAtt: [HostSecurityGroup, GroupId]
+      IamInstanceProfile:
+        Ref: HostInstanceProfile
+      # Optional SSH key: attached only when KeyName was supplied. SSM Session
+      # Manager is the primary access path, so the common case has none.
+      KeyName:
+        Fn::If:
+          - HasKeyName
+          - Ref: KeyName
+          - Ref: AWS::NoValue
+      BlockDeviceMappings:
+        # Root volume only; the durable state lives on the separate retained volume.
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 20
+            DeleteOnTermination: true
+      MetadataOptions:
+        # Enforce IMDSv2 (token-required) -- blocks SSRF-style credential theft.
+        HttpTokens: required
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-host
+      UserData:
+        Fn::Base64:
+          # Fn::Sub: ${...} CloudFormation refs interpolate; shell variables we
+          # define are escaped as ${!VAR} so Fn::Sub leaves them literal. $(...)
+          # and bare $VAR are untouched by Fn::Sub (it only expands ${...}).
+          Fn::Sub: |
+            #!/bin/bash
+            set -euxo pipefail
+            exec > /var/log/dsql-migrator-userdata.log 2>&1
+
+            # --- Base packages: git + uv + SSM agent (NO Docker) ----------------
+            dnf install -y git tar gzip
+            # Amazon Linux 2023 ships the SSM agent; ensure it is running so Session
+            # Manager + port-forward (the only access path) work immediately.
+            systemctl enable --now amazon-ssm-agent
+            # uv (pinned, matches deploy/Dockerfile) installed system-wide. It
+            # auto-provisions CPython 3.12 (.python-version) during `uv sync`.
+            export UV_INSTALL_DIR=/usr/local/bin
+            curl -LsSf https://astral.sh/uv/0.9.2/install.sh | sh
+
+            # --- Dedicated non-root service user (replaces the container uid) ----
+            id dsqlapp &>/dev/null || useradd --system --home-dir /opt/dsql-migrator --shell /usr/sbin/nologin dsqlapp
+
+            # --- Retained EBS state volume --------------------------------------
+            # Wait for the data volume attachment (/dev/sdf, presented as an nvme
+            # device on Nitro; the ec2 udev rules create the /dev/sdf symlink).
+            for i in $(seq 1 60); do
+              if [ -e /dev/sdf ]; then break; fi
+              sleep 5
+            done
+            DEV=$(readlink -f /dev/sdf)
+            # Format ONLY if empty, so a RE-ATTACHED retained volume (carrying prior
+            # job/session state) is never reformatted -- integrity across instance
+            # replacement is the whole point of the retained volume.
+            if ! blkid "${!DEV}"; then
+              mkfs.xfs "${!DEV}"
+            fi
+            mkdir -p /var/lib/dsql-migrator
+            # nofail so a boot with a missing/late volume does not wedge the host.
+            grep -q " /var/lib/dsql-migrator " /etc/fstab || \
+              echo "${!DEV} /var/lib/dsql-migrator xfs defaults,nofail 0 2" >> /etc/fstab
+            mount /var/lib/dsql-migrator
+            # The systemd service runs as dsqlapp; give it ownership of the state mount.
+            chown -R dsqlapp:dsqlapp /var/lib/dsql-migrator
+
+            # --- Obtain the app source (NO Docker/ECR) --------------------------
+            # SourceMode selects how the source lands at /opt/dsql-migrator:
+            #   s3   -> download+extract a source tarball from S3 (TEMPORARY: use your
+            #           LOCAL working copy now, before the repo is public on GitHub).
+            #   git  -> git clone (public HTTPS by default; SSH + a deploy key from SSM
+            #           when DeployKeySsmParam is set -- the temporary AWS GitLab path).
+            install -d -o dsqlapp -g dsqlapp -m 0755 /opt/dsql-migrator
+            SOURCE_MODE="${SourceMode}"
+            if [ "${!SOURCE_MODE}" = "s3" ]; then
+              aws s3 cp "${SourceS3Uri}" /tmp/dsql-src.tar.gz --region ${AWS::Region}
+              tar -xzf /tmp/dsql-src.tar.gz -C /opt/dsql-migrator --strip-components=1
+              chown -R dsqlapp:dsqlapp /opt/dsql-migrator
+            else
+              DEPLOY_KEY_PARAM="${DeployKeySsmParam}"
+              GIT_SSH_COMMAND=""
+              if [ -n "${!DEPLOY_KEY_PARAM}" ]; then
+                # TEMPORARY GitLab SSH path: fetch a read-only deploy key from SSM.
+                install -d -o dsqlapp -g dsqlapp -m 0700 /opt/dsql-migrator/.ssh
+                aws ssm get-parameter --with-decryption --name "${!DEPLOY_KEY_PARAM}" \
+                  --query Parameter.Value --output text --region ${AWS::Region} \
+                  > /opt/dsql-migrator/.ssh/id_deploy
+                chmod 600 /opt/dsql-migrator/.ssh/id_deploy
+                GIT_HOST=$(echo "${SourceRepoUrl}" | sed -E 's/^[^@]+@([^:]+):.*/\1/')
+                ssh-keyscan -H "${!GIT_HOST}" > /opt/dsql-migrator/.ssh/known_hosts 2>/dev/null
+                chmod 600 /opt/dsql-migrator/.ssh/known_hosts
+                chown -R dsqlapp:dsqlapp /opt/dsql-migrator/.ssh
+                GIT_SSH_COMMAND="ssh -i /opt/dsql-migrator/.ssh/id_deploy -o UserKnownHostsFile=/opt/dsql-migrator/.ssh/known_hosts -o IdentitiesOnly=yes"
+              fi
+              sudo -u dsqlapp -H env GIT_SSH_COMMAND="${!GIT_SSH_COMMAND}" \
+                git clone --depth 1 --branch ${SourceRepoRef} ${SourceRepoUrl} /opt/dsql-migrator
+            fi
+
+            # --- Sync the venv from the frozen lock WITH the CDC seed client -----
+            # --extra cdc-external is REQUIRED (SeedMode=External). Editable root install
+            # so __file__ resolves into the checkout (connectors/plugins/*.zip +
+            # deploy/cdc-stack/cdc-stack.yaml).
+            sudo -u dsqlapp -H /usr/local/bin/uv sync --frozen --no-dev \
+              --extra cdc-external --project /opt/dsql-migrator
+
+            # --- Fetch the cookie-signing secret + derive the CDC deploy-role ARN ---
+            STORAGE_SECRET=$(aws secretsmanager get-secret-value --secret-id ${StorageSecret} --query SecretString --output text --region ${AWS::Region})
+            CDC_DEPLOY_ROLE_ARN="arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-cdc-deploy"
+
+            # Resolve THIS host's own subnet CIDR so the app can pass it to the
+            # cdc-stack HostSubnetCidr param (SeedMode=External needs MSK to admit
+            # this host on 9098). CloudFormation cannot turn a Subnet::Id into a
+            # CIDR, so resolve it at boot (HostRole already grants ec2:DescribeSubnets).
+            HOST_SUBNET_CIDR="$(aws ec2 describe-subnets --region ${AWS::Region} --subnet-ids ${HostSubnetId} --query 'Subnets[0].CidrBlock' --output text 2>/dev/null || true)"
+            [ "${!HOST_SUBNET_CIDR}" = "None" ] && HOST_SUBNET_CIDR=""
+
+            # --- Runtime env (0600; read by the systemd unit) -------------------
+            # APP_HOST=127.0.0.1: bind loopback only; the UI is reached via the SSM
+            # port-forward to this host port, never exposed on a network interface
+            # (the SG also has no inbound). JOB_STATE_BUCKET / SESSION_STATE_BUCKET are
+            # intentionally UNSET so the app uses SqliteJobStore / SqliteSessionStateStore
+            # on the retained EBS mount -- durable across restart AND instance replacement.
+            cat > /etc/dsql-migrator.env <<EOF
+            DSQL_MIGRATOR_APP_HOST=127.0.0.1
+            DSQL_MIGRATOR_APP_PORT=${AppPort}
+            DSQL_MIGRATOR_STORAGE_SECRET=${!STORAGE_SECRET}
+            DSQL_MIGRATOR_JOB_STATE_PATH=/var/lib/dsql-migrator/job_state.sqlite
+            DSQL_MIGRATOR_SESSION_STATE_PATH=/var/lib/dsql-migrator/session_state.sqlite
+            DSQL_MIGRATOR_ACTIVITY_LOG_PATH=/var/lib/dsql-migrator/migration_activity.log
+            DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT=${EnableActivityLogCloudWatch}
+            DSQL_MIGRATOR_CDC_SEED_MODE=external
+            DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR=${!HOST_SUBNET_CIDR}
+            AWS_STS_REGIONAL_ENDPOINTS=regional
+            DSQL_MIGRATOR_AWS_REGION=${AWS::Region}
+            DSQL_MIGRATOR_CDC_DEPLOY_ROLE_ARN=${!CDC_DEPLOY_ROLE_ARN}
+            BEDROCK_MODEL_ID=${BedrockModelId}
+            BEDROCK_REGION=${BedrockRegion}
+            EOF
+            chmod 600 /etc/dsql-migrator.env
+
+            # --- systemd unit: run the venv console script as dsqlapp -----------
+            # ExecStart uses the venv entrypoint directly (not `uv run`) so start does
+            # no network/resolve; Restart=always mirrors the container's restart policy.
+            cat > /etc/systemd/system/dsql-migrator.service <<'EOF'
+            [Unit]
+            Description=MySQL -> Aurora DSQL migration tool (NiceGUI, run from source)
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            Type=simple
+            User=dsqlapp
+            Group=dsqlapp
+            WorkingDirectory=/opt/dsql-migrator
+            EnvironmentFile=/etc/dsql-migrator.env
+            ExecStart=/opt/dsql-migrator/.venv/bin/mysql-dsql-migrator ui
+            Restart=always
+            RestartSec=5
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl enable --now dsql-migrator.service
+
+  # Durable state volume: job/session SQLite + activity log + Full Load CSV
+  # spillover. Retain on BOTH delete and replace so the migration's state survives
+  # an instance replacement -- the integrity guarantee that makes the single-host
+  # failure model acceptable (recreate the instance; re-attach; resume). Deleting
+  # the stack keeps this volume too (delete it manually once the migration is done).
+  StateVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VolumeType: gp3
+      Size:
+        Ref: StateVolumeSizeGiB
+      AvailabilityZone:
+        Fn::GetAtt: [AppHost, AvailabilityZone]
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-state
+
+  StateVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/sdf
+      InstanceId:
+        Ref: AppHost
+      VolumeId:
+        Ref: StateVolume
+
+Outputs:
+  HostInstanceId:
+    Description: EC2 instance id of the single control-plane host (SSM target).
+    Value:
+      Ref: AppHost
+
+  SsmPortForwardCommand:
+    Description: >-
+      Run this to reach the UI over SSM (no inbound rule, no public IP), then open
+      http://localhost:8080 in your browser. Requires the AWS CLI + the
+      session-manager-plugin locally, and ssm:StartSession on this instance.
+    Value:
+      Fn::Sub: "aws ssm start-session --target ${AppHost} --document-name AWS-StartPortForwardingSession --parameters '{\"portNumber\":[\"${AppPort}\"],\"localPortNumber\":[\"8080\"]}' --region ${AWS::Region}  # then open http://localhost:8080"
+
+  CdcDeployRoleArn:
+    Description: >-
+      Privileged role the app assumes for cdc-stack CloudFormation operations
+      (CFN/MSK/KafkaConnect/Glue/IAM-create). These privileges are intentionally
+      not on the host role.
+    Value:
+      Fn::GetAtt: [CdcDeployRole, Arn]
+
+  HostSecurityGroupId:
+    Description: Security group attached to the host (no inbound; scoped egress).
+    Value:
+      Fn::GetAtt: [HostSecurityGroup, GroupId]
+
+  HostSubnetCidrHint:
+    Description: >-
+      IMPORTANT: pass THIS host subnet's CIDR to the cdc-stack HostSubnetCidr
+      parameter so MSK Serverless admits this host on 9098 (the in-process CDC
+      offset seed connects from here). Look up the CIDR of the subnet id below.
+    Value:
+      Ref: HostSubnetId
