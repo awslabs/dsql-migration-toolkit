@@ -563,11 +563,13 @@ def test_start_external_seeds_before_submit_and_appends_seedmode() -> None:
     assert all(s == "DONE" for s in _statuses(handle).values())
     # The in-process seed ran exactly once, BEFORE the single connector-creating
     # update (fake records order via deployer.calls: seed is not a deployer call, so
-    # assert the seed happened and the update carries SeedMode=external).
+    # assert the seed happened and the update carries the CAPITALIZED SeedMode token
+    # the template's AllowedValues ["Lambda","External"] require -- real CFN
+    # validates case-sensitively, so this must be "External", not "external").
     assert len(seed_calls) == 1
     assert len(deployer.updates) == 1
     only = dict(deployer.updates[0])
-    assert only["SeedMode"] == "external"
+    assert only["SeedMode"] == "External"
     assert only["MskBootstrapServers"] == "b-1:9098"
     # The seed used the fetched bootstrap + the fixed offset topic name.
     call = seed_calls[0]

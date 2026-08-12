@@ -1705,7 +1705,11 @@ def run_cdc_start(
             # in-process topics-then-connectors ordering. The seed is itself
             # idempotent (topic-already-exists swallowed; offset seed no-clobbered).
             if seed_mode == "external":
-                start_pass.append(("SeedMode", "external"))
+                # The template's SeedMode AllowedValues are ["Lambda","External"]
+                # (case-sensitive) and SeedByExternal = Equals(SeedMode,"External"),
+                # so the value sent to CloudFormation MUST be the capitalized token
+                # "External" -- NOT the lowercase config value we compare on above.
+                start_pass.append(("SeedMode", "External"))
                 _run_external_seed(
                     stack_name=stack_name,
                     bootstrap=bootstrap,

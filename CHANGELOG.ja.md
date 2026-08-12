@@ -5,6 +5,25 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.311
+
+### 修正 (Fixed)
+
+- **`SeedMode=External` の CDC 経路が実際に CloudFormation にデプロイされ、EC2 ホストが
+  エンドツーエンドで配線されるようになりました。** v0.1.307/v0.1.310 の 2 つのギャップ:
+  (1) `run_cdc_start` が `SeedMode` パラメータに小文字の `"external"` を送っていましたが、
+  テンプレートの大文字小文字を区別する `AllowedValues` `["Lambda","External"]` により
+  CloudFormation が拒否します(単体テストは検証をスキップする fake deployer のため見逃されて
+  いた)— 現在は `"External"` を送ります。(2) CDC の**インフラ作成**パスが `SeedMode`/
+  `HostSubnetCidr` を渡していなかったため、EC2 ホストから UI でデプロイしてもスタックが Lambda
+  モードで作成され(シーダー Lambda を作ってから最初の Start で削除)、MSK の 9098 ポートも
+  開きませんでした。現在は `build_cdc_infra_params` が作成時に両方を出力し(小文字の config 値を
+  テンプレートの大文字トークンにマッピング)、値は EC2 の user-data がホスト自身のサブネットから
+  自動解決する新しい `DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR` 設定キーから取得します。結果として、
+  Lambda を使わないホストでは「CDC インフラのデプロイ」が `SeedMode=External` スタック
+  (シーダー Lambda なし)を作成し、ホストを 9098 で admit します;Fargate/ローカルは既定の
+  Lambda・ingress なし(変更なし)。
+
 ## v0.1.310
 
 ### 変更 (Changed)

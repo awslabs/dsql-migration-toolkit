@@ -3406,6 +3406,13 @@ async def _start_cdc_infra_deploy(
 
     # Plugin bucket + keys are left EMPTY here; the deploy job ensures the managed
     # bucket, uploads the bundled artifacts, and patches these in before create.
+    # "Host is the mode": the in-VPC EC2 host sets DSQL_MIGRATOR_CDC_SEED_MODE=external
+    # (and DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR to its own subnet) so the cdc-stack is
+    # CREATED as SeedMode=External (no in-VPC seeder Lambda) admitting the host on
+    # 9098. Fargate/local leave both unset -> Lambda mode, no ingress (unchanged).
+    from dsql_migrator.config import load_config as _load_config
+
+    _cfg = _load_config()
     params = build_cdc_infra_params(
         source_config, sink_config,
         vpc_id=fields["vpc_id"],
@@ -3433,6 +3440,8 @@ async def _start_cdc_infra_deploy(
         topic_prefix=CDC_DEFAULT_TOPIC_PREFIX,
         row_counts_by_table=row_counts_by_table,
         sink_mcu_count=_sink_mcu_count(),
+        seed_mode=_cfg.cdc_seed_mode,
+        host_subnet_cidr=_cfg.cdc_host_subnet_cidr,
     )
     deployer = build_cdc_stack_deployer(
         region,

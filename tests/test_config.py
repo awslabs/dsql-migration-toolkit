@@ -83,6 +83,16 @@ def test_load_config_reads_cdc_seed_mode_lowercased() -> None:
     assert config.cdc_seed_mode == "external"
 
 
+def test_load_config_cdc_host_subnet_cidr_defaults_empty() -> None:
+    # Only the EC2 host sets this; empty everywhere else -> no 9098 ingress rule.
+    assert load_config(env={}).cdc_host_subnet_cidr == ""
+
+
+def test_load_config_reads_cdc_host_subnet_cidr() -> None:
+    config = load_config(env={f"{ENV_PREFIX}CDC_HOST_SUBNET_CIDR": " 172.31.64.0/20 "})
+    assert config.cdc_host_subnet_cidr == "172.31.64.0/20"  # stripped
+
+
 def test_load_config_full_load_parallelism_defaults() -> None:
     config = load_config(env={})
     assert config.full_load_table_parallelism == 4

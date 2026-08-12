@@ -1282,6 +1282,13 @@ Resources:
             STORAGE_SECRET=$(aws secretsmanager get-secret-value --secret-id ${StorageSecret} --query SecretString --output text --region ${AWS::Region})
             CDC_DEPLOY_ROLE_ARN="arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-cdc-deploy"
 
+            # Resolve THIS host's own subnet CIDR so the app can pass it to the
+            # cdc-stack HostSubnetCidr param (SeedMode=External needs MSK to admit
+            # this host on 9098). CloudFormation cannot turn a Subnet::Id into a
+            # CIDR, so resolve it at boot (HostRole already grants ec2:DescribeSubnets).
+            HOST_SUBNET_CIDR="$(aws ec2 describe-subnets --region ${AWS::Region} --subnet-ids ${HostSubnetId} --query 'Subnets[0].CidrBlock' --output text 2>/dev/null || true)"
+            [ "${!HOST_SUBNET_CIDR}" = "None" ] && HOST_SUBNET_CIDR=""
+
             # --- Runtime env (0600; read by the systemd unit) -------------------
             # APP_HOST=127.0.0.1: bind loopback only; the UI is reached via the SSM
             # port-forward to this host port, never exposed on a network interface
@@ -1297,6 +1304,7 @@ Resources:
             DSQL_MIGRATOR_ACTIVITY_LOG_PATH=/var/lib/dsql-migrator/migration_activity.log
             DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT=${EnableActivityLogCloudWatch}
             DSQL_MIGRATOR_CDC_SEED_MODE=external
+            DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR=${!HOST_SUBNET_CIDR}
             AWS_STS_REGIONAL_ENDPOINTS=regional
             DSQL_MIGRATOR_AWS_REGION=${AWS::Region}
             DSQL_MIGRATOR_CDC_DEPLOY_ROLE_ARN=${!CDC_DEPLOY_ROLE_ARN}

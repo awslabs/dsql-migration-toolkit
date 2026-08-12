@@ -5,6 +5,23 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.311
+
+### 수정 (Fixed)
+
+- **`SeedMode=External` CDC 경로가 이제 실제 CloudFormation에 배포되고, EC2 호스트가
+  end-to-end로 배선됩니다.** v0.1.307/v0.1.310 작업의 두 갭: (1) `run_cdc_start`가 `SeedMode`
+  파라미터로 소문자 `"external"`을 보냈는데, 템플릿의 대소문자 구분 `AllowedValues`
+  `["Lambda","External"]`에 걸려 CloudFormation이 거부합니다(단위 테스트는 검증을 건너뛰는
+  fake deployer라 못 잡음) — 이제 `"External"`을 보냅니다. (2) CDC **인프라 생성** 패스가
+  `SeedMode`/`HostSubnetCidr`를 전혀 전달하지 않아, EC2 호스트에서 UI로 배포해도 스택이 Lambda
+  모드로 생성되고(시더 Lambda를 만들었다가 첫 Start에서 삭제) MSK 9098 포트도 안 열렸습니다.
+  이제 `build_cdc_infra_params`가 생성 시점에 둘 다 방출하며(소문자 config 값을 템플릿의 대문자
+  토큰으로 매핑), 값은 EC2 user-data가 호스트 자신의 서브넷에서 자동 해석하는 새
+  `DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR` 설정 키에서 옵니다. 결과: Lambda 없는 호스트에서 "CDC
+  인프라 배포"가 `SeedMode=External` 스택(시더 Lambda 없음)을 만들고 호스트를 9098에 admit
+  합니다; Fargate/로컬은 기본 Lambda·ingress 없음(무변경).
+
 ## v0.1.310
 
 ### 변경 (Changed)

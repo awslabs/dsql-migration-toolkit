@@ -239,6 +239,17 @@ class AppConfig(BaseModel):
             "DSQL_MIGRATOR_CDC_SEED_MODE."
         ),
     )
+    cdc_host_subnet_cidr: str = Field(
+        default="",
+        description=(
+            "Subnet CIDR of the Lambda-free 'EC2 + MSK only' host, passed to the "
+            "cdc-stack HostSubnetCidr parameter so MSK Serverless admits this host on "
+            "9098 for the in-process (SeedMode=External) CDC seed. Set by the EC2 "
+            "user-data (resolved from the host's subnet at boot); empty everywhere "
+            "else (Fargate/local), which adds no ingress rule. Config key: "
+            "DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR."
+        ),
+    )
     log_level: str = Field(
         default="INFO",
         description="Logging level for the application.",
@@ -459,6 +470,8 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> AppConfig:
     if (cdc_seed_mode := _read(source, "CDC_SEED_MODE")) is not None:
         # Normalize case so "External"/"EXTERNAL" match run_cdc_start's == "external".
         values["cdc_seed_mode"] = cdc_seed_mode.lower()
+    if (cdc_host_cidr := _read(source, "CDC_HOST_SUBNET_CIDR")) is not None:
+        values["cdc_host_subnet_cidr"] = cdc_host_cidr.strip()
     if (log_level := _read(source, "LOG_LEVEL")) is not None:
         values["log_level"] = log_level.upper()
     if (row_diff := _read(source, "VALIDATE_ROW_DIFF_SAMPLE_SIZE")) is not None:

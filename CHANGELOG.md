@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.311
+
+### Fixed
+
+- **The `SeedMode=External` CDC path now actually deploys against CloudFormation, and
+  the EC2 host wires it end-to-end.** Two gaps from the v0.1.307/v0.1.310 work:
+  (1) `run_cdc_start` sent the lowercase `"external"` as the `SeedMode` parameter, which
+  CloudFormation rejects against the template's case-sensitive `AllowedValues`
+  `["Lambda","External"]` (the unit tests used a fake deployer that skips validation, so
+  it went unnoticed) — it now sends `"External"`. (2) The CDC **infra-create** pass never
+  carried `SeedMode` or `HostSubnetCidr`, so a UI-driven deploy from the EC2 host created
+  the stack in Lambda mode (making the in-VPC seeder Lambda, only to delete it on the
+  first Start) and never opened MSK port 9098 for the in-process seed. `build_cdc_infra_params`
+  now emits both at create time (mapping the lowercase config value to the capitalized
+  template token), sourced from a new `DSQL_MIGRATOR_CDC_HOST_SUBNET_CIDR` config key that
+  the EC2 user-data auto-resolves from the host's own subnet. Result: on the Lambda-free
+  host, "Deploy CDC infra" creates a `SeedMode=External` stack (no seeder Lambda) that
+  admits the host on 9098; Fargate/local default to Lambda with no ingress (unchanged).
+
 ## v0.1.310
 
 ### Changed
