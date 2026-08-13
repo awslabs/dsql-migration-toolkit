@@ -5,6 +5,42 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.319
+
+### 변경 (Changed)
+
+- **권한이 높은 CDC 배포 역할이 더는 EC2 네트워크 쓰기 권한을 `Resource: "*"`로 갖지 않습니다.**
+  콘텐츠 보안 검토가 이 역할의 제약 없는 쓰기·권한 관리 접근을 지적했고(`CKV_AWS_111` /
+  `CKV_AWS_109`), 템플릿 주석에는 EC2 create/delete가 "ARN 레벨 조건이 없다"고 적혀 있었습니다.
+  **그 주석이 틀렸습니다.** AWS 머신리더블 service reference에는 해당 28개 액션 전부에 리소스
+  타입이 있습니다. 그래서 cdc-stack이 실제로 만들거나 건드리는 9개 타입 —
+  `security-group`, `security-group-rule`, `subnet`, `route-table`, `vpc`, `natgateway`,
+  `elastic-ip`, `vpc-endpoint`, `network-interface` — 의 이 계정·리전 ARN으로 고정했습니다.
+  리소스 레벨 형태가 정말 없는 `ec2:Describe*` 10개는 읽기 전용 문장으로 분리하고, ARN을 받는
+  `ec2:DescribeVpcAttribute`는 스코핑된 쓰기 쪽에 남겼습니다.
+
+  같은 점검에서 두 곳을 더 좁혔습니다: 커스텀 플러그인·워커 컨피그의
+  `kafkaconnect:Delete`/`Describe`가 `"*"` 대신
+  `custom-plugin|worker-configuration/mysql-dsql-cdc-*/*`를 향하고(**create** 액션과 CFN
+  핸들러가 create 중에 수행하는 태깅만 매칭할 ARN이 없습니다), `cloudwatch:DescribeAlarms`는
+  알람 쓰기가 이미 쓰던 `alarm:mysql-dsql-cdc-*` 패밀리를 향합니다.
+
+  추측이 아니라 검증했습니다: `iam:SimulateCustomPolicy` 결과 EC2 28개 액션 전부가 자신이
+  만드는 타입의 ARN에 대해 **allowed**, 다른 계정·다른 리전·다른 리소스 타입
+  (`ec2:DeleteVpc`, `ec2:RunInstances`)·cdc 패밀리 밖 플러그인·타인의 알람에 대해서는
+  **implicitDeny**였습니다. 역할의 와일드카드 문장은 12개 → **6개**로 줄었고, 남은 6개는
+  "이 API에 리소스 레벨 형태가 없다"는 이유와 함께 **명시적 allowlist로 테스트에 고정**되어
+  새 `"*"` 문장이 들어오면 스위트가 깨집니다. `cloudformation.yaml`과
+  `cloudformation-ec2.yaml`이 같은 역할을 부여하므로, 둘이 어긋나지 않도록 하는 테스트도
+  추가했습니다.
+
+  특정 VPC·서브넷 ARN은 여전히 고정할 수 없습니다 — VPC는 이 역할이 만들어진 뒤에 운영자가
+  cdc-stack 파라미터로 지정하므로, 역할 생성 시점에 가능한 가장 좁은 형태가 계정+리전+타입입니다.
+  의도적으로 제외한 타입(`ipam-pool`, `ipv4pool-ec2`, `ipv6pool-ec2`, `internet-gateway`,
+  `vpn-gateway`)은 이 스택이 절대 전달하지 않는 파라미터에서만 평가됩니다. `cdc-stack.yaml`에서
+  그중 하나를 쓰게 되면 여기에 ARN을 추가해야 하며, 그러지 않으면 배포가 `AccessDenied`로
+  실패합니다.
+
 ## v0.1.318
 
 ### 변경 (Changed)

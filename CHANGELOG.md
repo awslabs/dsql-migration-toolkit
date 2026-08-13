@@ -5,6 +5,46 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.319
+
+### Changed
+
+- **The privileged CDC deploy role no longer holds EC2 network writes on `Resource: "*"`.**
+  A content security review flagged the role for unconstrained write and
+  permissions-management access (`CKV_AWS_111` / `CKV_AWS_109`), and the template's own
+  comment claimed EC2 create/delete "has no ARN-level conditions". **That claim was
+  wrong.** AWS's machine-readable service reference lists resource types for every one
+  of those 28 actions, so they are now pinned to the nine types the cdc-stack actually
+  creates or touches — `security-group`, `security-group-rule`, `subnet`, `route-table`,
+  `vpc`, `natgateway`, `elastic-ip`, `vpc-endpoint`, `network-interface` — in this
+  account and region. The ten `ec2:Describe*` calls that genuinely have no
+  resource-level form moved to their own read-only statement, and
+  `ec2:DescribeVpcAttribute` (which does take an ARN) stayed with the scoped writes.
+
+  Two smaller scopings came out of the same audit: `kafkaconnect:Delete`/`Describe`
+  for custom plugins and worker configurations now target
+  `custom-plugin|worker-configuration/mysql-dsql-cdc-*/*` instead of `"*"` (only their
+  *create* actions, and the tagging the CFN handlers do during create, have no ARN to
+  match), and `cloudwatch:DescribeAlarms` targets the same `alarm:mysql-dsql-cdc-*`
+  family the alarm writes already used.
+
+  Verified rather than assumed: `iam:SimulateCustomPolicy` returns **allowed** for all
+  28 EC2 actions against an ARN of the type they create, and **implicitDeny** for the
+  same action in another account, another region, another resource type
+  (`ec2:DeleteVpc`, `ec2:RunInstances`), a plugin outside the cdc family, or another
+  account's alarm. Wildcard statements on the role drop from 12 to 6 — and the six that
+  remain are pinned by a test as an explicit allowlist, each with the reason its API
+  has no resource-level form, so a new `"*"` statement fails the suite. A second test
+  keeps `cloudformation.yaml` and `cloudformation-ec2.yaml` from drifting, since both
+  grant this same role.
+
+  A specific VPC or subnet ARN still cannot be pinned: the operator supplies the VPC as
+  a cdc-stack parameter long after this role is created, so account+region+type is the
+  narrowest form available at role-creation time. Deliberately omitted resource types
+  (`ipam-pool`, `ipv4pool-ec2`, `ipv6pool-ec2`, `internet-gateway`, `vpn-gateway`) are
+  only evaluated for parameters this stack never passes; using one in `cdc-stack.yaml`
+  means adding its ARN here, or the deploy fails with `AccessDenied`.
+
 ## v0.1.318
 
 ### Changed

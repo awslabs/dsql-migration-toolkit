@@ -5,6 +5,44 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.319
+
+### 変更 (Changed)
+
+- **権限の強い CDC デプロイロールが、EC2 ネットワークの書き込みを `Resource: "*"` で保持
+  しなくなりました。** コンテンツセキュリティレビューがこのロールの無制約な書き込み・権限管理
+  アクセスを指摘し (`CKV_AWS_111` / `CKV_AWS_109`)、テンプレートのコメントには EC2 の
+  create/delete には「ARN レベルの条件がない」と書かれていました。**そのコメントが誤りでした。**
+  AWS のマシンリーダブルな service reference には該当する 28 アクションすべてにリソースタイプが
+  記載されています。そこで cdc-stack が実際に作成・操作する 9 タイプ — `security-group`、
+  `security-group-rule`、`subnet`、`route-table`、`vpc`、`natgateway`、`elastic-ip`、
+  `vpc-endpoint`、`network-interface` — のこのアカウント・リージョンの ARN に固定しました。
+  リソースレベルの形式が本当に存在しない `ec2:Describe*` の 10 個は読み取り専用の別ステートメント
+  に分離し、ARN を受け取る `ec2:DescribeVpcAttribute` はスコープ済みの書き込み側に残しました。
+
+  同じ点検からさらに 2 箇所を絞りました:カスタムプラグインとワーカー設定の
+  `kafkaconnect:Delete`/`Describe` が `"*"` ではなく
+  `custom-plugin|worker-configuration/mysql-dsql-cdc-*/*` を対象にし (**create** アクションと、
+  CFN ハンドラーが create 中に行うタグ付けだけは一致させる ARN が存在しません)、
+  `cloudwatch:DescribeAlarms` はアラームの書き込みが既に使っていた `alarm:mysql-dsql-cdc-*`
+  ファミリーを対象にします。
+
+  推測ではなく検証しました:`iam:SimulateCustomPolicy` の結果、EC2 の 28 アクションすべてが
+  自身が作成するタイプの ARN に対して **allowed**、別アカウント・別リージョン・別リソースタイプ
+  (`ec2:DeleteVpc`、`ec2:RunInstances`)・cdc ファミリー外のプラグイン・他者のアラームに対しては
+  **implicitDeny** でした。ロールのワイルドカードステートメントは 12 個 → **6 個**に減り、残る
+  6 個は「この API にリソースレベルの形式が存在しない」理由とともに**明示的な allowlist として
+  テストで固定**したため、新しい `"*"` ステートメントが入るとスイートが失敗します。
+  `cloudformation.yaml` と `cloudformation-ec2.yaml` は同じロールを付与するので、両者が乖離
+  しないことを確認するテストも追加しました。
+
+  特定の VPC / サブネット ARN は依然として固定できません — VPC はこのロールが作られたあとに
+  オペレーターが cdc-stack のパラメーターとして指定するため、ロール作成時点で可能な最も狭い形式が
+  アカウント+リージョン+タイプです。意図的に除外したタイプ (`ipam-pool`、`ipv4pool-ec2`、
+  `ipv6pool-ec2`、`internet-gateway`、`vpn-gateway`) は、このスタックが決して渡さない
+  パラメーターでのみ評価されます。`cdc-stack.yaml` でそれらを使う場合はここに ARN を追加する
+  必要があり、さもなければデプロイは `AccessDenied` で失敗します。
+
 ## v0.1.318
 
 ### 変更 (Changed)

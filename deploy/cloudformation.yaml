@@ -874,33 +874,65 @@ Resources:
                 Resource:
                   - Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector/mysql-dsql-cdc-*/*
                   - Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:connector-operation/mysql-dsql-cdc-*/*
-              # CustomPlugin + WorkerConfiguration: their create actions have NO
-              # resource-level support (must be "*"), and the CFN resource handlers
-              # tag + read tags on create, so TagResource/ListTagsForResource/
-              # UntagResource are required too -- else creation returns AccessDenied.
-              - Sid: KafkaConnectPlugin
+              # CustomPlugin + WorkerConfiguration, split by what IAM can scope.
+              #
+              # The CREATE actions have no resource-level support (verified in AWS's
+              # service reference: kafkaconnect:CreateCustomPlugin /
+              # CreateWorkerConfiguration / CreateConnector / ListConnectors list no
+              # resource types), and the CFN handlers tag + read tags as part of that
+              # same create call -- with the ARN not yet in existence -- so the tagging
+              # actions stay here too rather than being scoped: narrowing them returned
+              # AccessDenied on create when it was tried.
+              - Sid: KafkaConnectCreateAndTag
                 Effect: Allow
                 Action:
                   - kafkaconnect:CreateCustomPlugin
-                  - kafkaconnect:DeleteCustomPlugin
-                  - kafkaconnect:DescribeCustomPlugin
+                  - kafkaconnect:CreateWorkerConfiguration
                   - kafkaconnect:TagResource
                   - kafkaconnect:UntagResource
                   - kafkaconnect:ListTagsForResource
                 Resource: "*"
-              - Sid: KafkaConnectWorkerConfig
+              # Everything that runs AFTER the resource exists takes an ARN, so it is
+              # scoped to the cdc family -- the same pattern as KafkaConnectConnector
+              # above. Confirmed with iam:SimulateCustomPolicy: allowed for
+              # custom-plugin/mysql-dsql-cdc-<stack>-…/<uuid>, implicitDeny for a
+              # plugin belonging to anything else in the account.
+              - Sid: KafkaConnectPluginOps
                 Effect: Allow
                 Action:
-                  - kafkaconnect:CreateWorkerConfiguration
+                  - kafkaconnect:DeleteCustomPlugin
+                  - kafkaconnect:DescribeCustomPlugin
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:custom-plugin/mysql-dsql-cdc-*/*
+              - Sid: KafkaConnectWorkerConfigOps
+                Effect: Allow
+                Action:
                   - kafkaconnect:DeleteWorkerConfiguration
                   - kafkaconnect:DescribeWorkerConfiguration
-                  - kafkaconnect:TagResource
-                  - kafkaconnect:UntagResource
-                  - kafkaconnect:ListTagsForResource
-                Resource: "*"
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:kafkaconnect:${AWS::Region}:${AWS::AccountId}:worker-configuration/mysql-dsql-cdc-*/*
               # EC2 networking the cdc-stack creates (SG, and when ConnectorSubnetIds
-              # is empty its own subnets/NAT/route table). EC2 create/delete has no
-              # ARN-level conditions; the role is short-lived, so "*" is acceptable.
+              # is empty its own subnets/NAT/route table).
+              #
+              # These writes ARE resource-scopable, contrary to what this comment used
+              # to claim: every action below lists resource types in AWS's
+              # machine-readable service reference (servicereference.us-east-1
+              # .amazonaws.com/v1/ec2/ec2.json), so they are pinned to the nine types
+              # the cdc-stack actually creates or touches, in this account and region.
+              # Verified with iam:SimulateCustomPolicy -- all 28 actions resolve to
+              # "allowed" against an ARN of the type they create, while the same
+              # actions against another account, another region, or another resource
+              # type (ec2:DeleteVpc, ec2:RunInstances) resolve to implicitDeny. A
+              # specific VPC/subnet ARN still cannot be pinned: the operator supplies
+              # the VPC as a cdc-stack parameter long after this role is created, so
+              # account+region+type is the narrowest form available at that point.
+              #
+              # Resource types deliberately omitted -- they are only evaluated for
+              # parameters this stack never passes: ipam-pool / ipv4pool-ec2 /
+              # ipv6pool-ec2 (IPAM and BYOIP allocation), internet-gateway /
+              # vpn-gateway (route-table association targets; our one route points at
+              # the NAT gateway). Using any of them in cdc-stack.yaml means adding its
+              # ARN here, or the deploy fails with AccessDenied.
               - Sid: Ec2NetworkResources
                 Effect: Allow
                 Action:
@@ -910,32 +942,25 @@ Resources:
                   - ec2:AuthorizeSecurityGroupEgress
                   - ec2:RevokeSecurityGroupIngress
                   - ec2:RevokeSecurityGroupEgress
-                  - ec2:DescribeSecurityGroups
                   - ec2:CreateSubnet
                   - ec2:DeleteSubnet
                   - ec2:ModifySubnetAttribute
-                  - ec2:DescribeSubnets
                   - ec2:CreateRouteTable
                   - ec2:DeleteRouteTable
                   - ec2:CreateRoute
                   - ec2:DeleteRoute
                   - ec2:AssociateRouteTable
                   - ec2:DisassociateRouteTable
-                  - ec2:DescribeRouteTables
                   - ec2:AllocateAddress
                   - ec2:ReleaseAddress
-                  - ec2:DescribeAddresses
                   - ec2:CreateNatGateway
                   - ec2:DeleteNatGateway
-                  - ec2:DescribeNatGateways
                   - ec2:CreateVpcEndpoint
                   - ec2:DeleteVpcEndpoints
-                  - ec2:DescribeVpcEndpoints
                   - ec2:ModifyVpcEndpoint
-                  - ec2:DescribeVpcs
+                  # Takes a vpc ARN, so it belongs with the scoped writes rather than
+                  # the account-wide Describe* block below.
                   - ec2:DescribeVpcAttribute
-                  - ec2:DescribeAvailabilityZones
-                  - ec2:DescribeInternetGateways
                   # When MSK Connect creates the connector it places the connector's
                   # ENIs in the connector subnets USING THE CALLER'S (this deploy
                   # role's) credentials -- CloudTrail shows CreateNetworkInterface
@@ -944,14 +969,45 @@ Resources:
                   # the MSK Connect service-linked role. Without these the connector
                   # CREATE fails with "not authorized to perform
                   # ec2:CreateNetworkInterface" (AWS::KafkaConnect::Connector
-                  # InvalidRequest). No resource-level support at create time (the
-                  # ENI does not exist yet), so Resource stays "*".
+                  # InvalidRequest). The create is authorized against the
+                  # network-interface / subnet / security-group ARNs in the scoped list
+                  # below (confirmed with iam:SimulateCustomPolicy), so it does not
+                  # need Resource "*" -- only the Describe* call does.
                   - ec2:CreateNetworkInterface
-                  - ec2:DescribeNetworkInterfaces
                   - ec2:DeleteNetworkInterface
                   - ec2:CreateNetworkInterfacePermission
+                  # Tag-on-create and teardown untagging, on the same resources.
                   - ec2:CreateTags
                   - ec2:DeleteTags
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*
+                  - Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group-rule/*
+                  - Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*
+                  - Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:route-table/*
+                  - Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/*
+                  - Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:natgateway/*
+                  - Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:elastic-ip/*
+                  - Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc-endpoint/*
+                  - Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*
+              # EC2 Describe* has NO resource-level form (same service reference), so
+              # these reads stay account-wide -- a scoped ARN would silently grant
+              # nothing. All read-only: subnet auto-select reads the VPC topology, and
+              # the CDC teardown progress report reads the seeder Lambda's ENIs while
+              # AWS reclaims them. ec2:DescribeVpcAttribute is the one Describe that
+              # DOES take an ARN, so it sits in the scoped statement above.
+              - Sid: Ec2NetworkReads
+                Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeAddresses
+                  - ec2:DescribeNatGateways
+                  - ec2:DescribeVpcEndpoints
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeInternetGateways
+                  - ec2:DescribeNetworkInterfaces
                 Resource: "*"
               # Connector worker log group (CFN AWS::Logs::LogGroup).
               - Sid: ConnectorLogGroup
@@ -1009,12 +1065,16 @@ Resources:
                   - cloudwatch:ListTagsForResource
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:mysql-dsql-cdc-*
-              # cloudwatch:DescribeAlarms has no resource-level support; CFN calls it to
-              # read the alarm's state on create/update. Scope to "*" (read-only).
+              # cloudwatch:DescribeAlarms DOES take an alarm ARN (AWS service
+              # reference), contrary to the earlier note here, so it is scoped to the
+              # same cdc alarm family as the writes above. CFN calls it to read the
+              # alarm state on create/update. Confirmed with iam:SimulateCustomPolicy:
+              # allowed for alarm:mysql-dsql-cdc-…, implicitDeny for any other alarm.
               - Sid: CdcConnectorAlarmsDescribe
                 Effect: Allow
                 Action: cloudwatch:DescribeAlarms
-                Resource: "*"
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:mysql-dsql-cdc-*
               # IAM roles the cdc-stack auto-names (connector exec role + seeder role).
               - Sid: IamCdcStackRoles
                 Effect: Allow

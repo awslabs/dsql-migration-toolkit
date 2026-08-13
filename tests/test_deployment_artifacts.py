@@ -706,6 +706,100 @@ def test_cdc_deploy_role_can_deploy_offset_seeder(template: dict) -> None:
     assert "kafkaconnect.amazonaws.com" in passed_to
 
 
+_EC2_SCOPED_TYPES = (
+    "security-group/*",
+    "security-group-rule/*",
+    "subnet/*",
+    "route-table/*",
+    "vpc/*",
+    "natgateway/*",
+    "elastic-ip/*",
+    "vpc-endpoint/*",
+    "network-interface/*",
+)
+
+# Every statement still on Resource "*" and the reason it has to be. Each entry was
+# checked against AWS's machine-readable service reference: these actions list NO
+# resource types, so a scoped ARN would silently grant nothing.
+_EXPECTED_UNSCOPED_SIDS = {
+    "CloudFormationAccountReads",   # ValidateTemplate / ListStacks: account-level
+    "KafkaConnectCreateConnector",  # create + tag-on-create: ARN does not exist yet
+    "KafkaConnectListConnectors",   # List*: authorized against .../v1/connectors
+    "KafkaConnectCreateAndTag",     # ditto for CustomPlugin / WorkerConfiguration
+    "Ec2NetworkReads",              # ec2:Describe*: no resource-level form
+    "CloudWatchLogsLogDelivery",    # logs:*LogDelivery / PutResourcePolicy
+}
+
+
+def test_cdc_deploy_role_ec2_writes_are_scoped_to_the_types_it_creates(
+    template: dict,
+) -> None:
+    """EC2 network writes must be pinned to resource-type ARNs, not "*".
+
+    Every action in this statement DOES support resource-level permissions (AWS
+    service reference), and iam:SimulateCustomPolicy confirms all of them resolve to
+    "allowed" against an ARN of the type they create while another account, another
+    region or another resource type resolves to implicitDeny. A specific VPC/subnet
+    ARN is impossible here -- the operator picks the VPC as a cdc-stack parameter long
+    after this role exists -- so account+region+type is the narrowest available form,
+    and dropping back to "*" would widen a privileged role by ~28 write actions.
+    """
+    stmts = [
+        s
+        for p in template["Resources"]["CdcDeployRole"]["Properties"]["Policies"]
+        for s in p["PolicyDocument"]["Statement"]
+    ]
+    by_sid = {s.get("Sid"): s for s in stmts}
+    writes = by_sid["Ec2NetworkResources"]
+    assert writes["Resource"] != "*", "EC2 network writes must not be account-wide"
+    rendered = json.dumps(writes["Resource"])
+    for suffix in _EC2_SCOPED_TYPES:
+        assert suffix in rendered, f"missing {suffix} -- the deploy would AccessDeny"
+    # No Describe* in the scoped statement except DescribeVpcAttribute, which is the
+    # only one that takes an ARN. Any other Describe here would never match.
+    describes = [a for a in writes["Action"] if a.startswith("ec2:Describe")]
+    assert describes == ["ec2:DescribeVpcAttribute"], describes
+    # ... and the account-wide statement carries ONLY reads.
+    reads = by_sid["Ec2NetworkReads"]
+    assert reads["Resource"] == "*"
+    assert all(a.startswith("ec2:Describe") for a in reads["Action"]), reads["Action"]
+
+
+def test_cdc_deploy_role_wildcard_statements_are_an_explicit_allowlist(
+    template: dict,
+) -> None:
+    # The blast radius of this privileged role is exactly "what is still on *". Pin
+    # that set so adding a wildcard statement is a deliberate, reviewed act rather
+    # than something a scanner finds later.
+    stmts = [
+        s
+        for p in template["Resources"]["CdcDeployRole"]["Properties"]["Policies"]
+        for s in p["PolicyDocument"]["Statement"]
+    ]
+    unscoped = {s.get("Sid") for s in stmts if s.get("Resource") == "*"}
+    assert unscoped == _EXPECTED_UNSCOPED_SIDS, (
+        f"unexpected wildcard statements: {unscoped ^ _EXPECTED_UNSCOPED_SIDS}. If an "
+        "action genuinely has no resource-level form, add it here with that reason; "
+        "otherwise scope it."
+    )
+
+
+def test_both_app_templates_share_one_cdc_deploy_role_policy() -> None:
+    # cloudformation.yaml (Fargate) and cloudformation-ec2.yaml (single host) grant
+    # the SAME privileged cdc-deploy role. They have drifted apart in review before;
+    # comparing the parsed policy keeps a scoping fix from landing in only one.
+    ec2_template = yaml.safe_load(
+        (DEPLOY_DIR / "cloudformation-ec2.yaml").read_text(encoding="utf-8")
+    )
+    fargate = yaml.safe_load(CFN_TEMPLATE.read_text(encoding="utf-8"))
+    a = fargate["Resources"]["CdcDeployRole"]["Properties"]["Policies"]
+    b = ec2_template["Resources"]["CdcDeployRole"]["Properties"]["Policies"]
+    assert json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True), (
+        "CdcDeployRole policies differ between cloudformation.yaml and "
+        "cloudformation-ec2.yaml -- apply the change to both"
+    )
+
+
 def test_cdc_deploy_role_logs_describe_unscoped_and_can_delete_msk(template: dict) -> None:
     # Two gaps that only surface on the assumed-role path (admin creds bypass them):
     # (1) logs:DescribeLogGroups has NO resource-level support -- CFN calls it to
