@@ -367,7 +367,11 @@ def ensure_plugin_bucket(
 
 
 def _local_md5(path: Path) -> str:
-    h = hashlib.md5()  # noqa: S324 - matching S3's non-multipart ETag, not security
+    # MD5 is not a security choice here: S3's non-multipart ETag *is* the MD5 of the
+    # object, so this is the only digest that can answer "is the local file already
+    # up there?". usedforsecurity=False says so to the interpreter (and to the
+    # scanners that flag hashlib.md5 on sight) and keeps it usable on FIPS builds.
+    h = hashlib.md5(usedforsecurity=False)  # noqa: S324 - S3 ETag match, not security
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             h.update(chunk)

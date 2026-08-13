@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.316
+
+### Changed
+
+- **Both `hashlib.md5` call sites now pass `usedforsecurity=False`.** Each one compares an
+  S3 **non-multipart ETag**, which *is* the object's MD5 — so the digest is a protocol
+  requirement, not a security primitive: `_local_md5` in `core/s3_provision.py` is how the
+  tool decides a connector plugin is already uploaded and skips re-uploading it. The flag
+  states that intent to the interpreter, keeps the call working on a FIPS-enabled build,
+  and clears the high-severity finding a content security review raises on every
+  `hashlib.md5` call site. The digest value is unchanged (verified identical), so the
+  skip-upload check still matches an existing object.
+
 ## v0.1.315
 
 ### Changed

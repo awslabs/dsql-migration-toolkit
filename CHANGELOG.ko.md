@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.316
+
+### 변경 (Changed)
+
+- **`hashlib.md5` 호출 두 곳에 `usedforsecurity=False`를 전달합니다.** 두 곳 모두 S3의
+  **non-multipart ETag**를 비교하는데, 그 ETag가 곧 객체의 MD5입니다 — 즉 이 다이제스트는
+  보안 프리미티브가 아니라 프로토콜 요구사항입니다(`core/s3_provision.py`의 `_local_md5`는
+  커넥터 플러그인이 이미 업로드돼 있는지 판단해 재업로드를 건너뛰는 데 씁니다). 이 플래그로
+  의도를 명시하면 FIPS 활성 인터프리터에서도 동작하고, 콘텐츠 보안 검토가 모든 `hashlib.md5`
+  호출 지점에 올리는 high 등급 finding도 해소됩니다. 다이제스트 값은 그대로이므로(동일함을
+  확인) 기존 객체에 대한 업로드 스킵 판정도 동일하게 동작합니다.
+
 ## v0.1.315
 
 ### 변경 (Changed)

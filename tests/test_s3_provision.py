@@ -124,7 +124,9 @@ def _write(tmp_path: Path, data: bytes) -> Path:
 def test_upload_skips_when_size_and_etag_match(tmp_path: Path) -> None:
     data = b"hello world"
     p = _write(tmp_path, data)
-    etag = hashlib.md5(data).hexdigest()  # noqa: S324
+    # Mirrors the ETag S3 reports for a non-multipart object (see _local_md5): the
+    # digest is the protocol, not a security primitive.
+    etag = hashlib.md5(data, usedforsecurity=False).hexdigest()  # noqa: S324
     s3 = _FakeS3(head_object={"ContentLength": len(data), "ETag": f'"{etag}"'})
     upload_plugin(s3, "b", "k", p)
     assert not any(c[0] == "put_object" for c in s3.calls)
