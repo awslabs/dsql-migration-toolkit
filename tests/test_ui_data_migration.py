@@ -8623,7 +8623,12 @@ class _DlqUi:
     def expansion(self, text="", *_a, **_k):
         return self._rec(text)
 
-    def button(self, *_a, on_click=None, **_k):
+    def button(self, text="", *_a, on_click=None, **_k):
+        # A button's LABEL is user-visible copy, so record it like any other text --
+        # dropping it made the action a panel offers unassertable (same reason the
+        # card double records it).
+        if text:
+            self.texts.append(str(text))
         if on_click is not None:
             self.click_handlers.append(on_click)
         return self._El(self)
@@ -8771,6 +8776,71 @@ def test_render_cdc_dlq_panel_no_drift_banner_when_none() -> None:
     )
     assert any("Dead-letter queue" in t for t in ui.texts)
     assert not any("Source schema change detected" in t for t in ui.texts)
+
+
+def _drift_session():
+    """A minimal session double: the fix action only needs the two configs present."""
+
+    class _S:
+        source_config = object()
+        target_config = object()
+        source_password = None
+        aws_profile = None
+
+    return _S()
+
+
+def test_drift_banner_offers_the_add_column_fix_only_when_a_session_is_wired() -> None:
+    # The opt-in ADD COLUMN recovery needs the source + target connections, which
+    # live on the session. With no session (e.g. a bare render) the banner must
+    # still show the drift + manual runbook, just without the action.
+    from dsql_migrator.core.models import MigrationJob
+    from dsql_migrator.ui.data_migration import _render_cdc_dlq_panel
+
+    def _render(session):
+        ui = _DlqUi()
+        state = DataMigrationState()
+        state.job_id = "job-cdc"
+        _render_cdc_dlq_panel(
+            ui,
+            state,
+            _JobJM(MigrationJob(job_id="job-cdc")),
+            _cdc_view_with_drift([("orders", "add-column", 3)]),
+            on_refresh=None,
+            session=session,
+        )
+        return ui
+
+    without = _render(None)
+    assert any("Source schema change detected" in t for t in without.texts)
+    assert not any("Fix target schema" in t for t in without.texts)
+
+    with_session = _render(_drift_session())
+    assert any("Fix target schema" in t for t in with_session.texts)
+
+
+def test_drift_banner_offers_no_fix_for_drop_or_type_change() -> None:
+    # ADD COLUMN is the only ADDITIVE drift, so it is the only one we offer to
+    # repair. A source DROP or an incompatible type change can rewrite or destroy
+    # target data, so those stay alert-only (the runbook tells the operator to stop
+    # CDC first) -- offering a one-click fix there would be unsafe.
+    from dsql_migrator.core.models import MigrationJob
+    from dsql_migrator.ui.data_migration import _render_cdc_dlq_panel
+
+    for kind in ("drop-column", "type-change"):
+        ui = _DlqUi()
+        state = DataMigrationState()
+        state.job_id = "job-cdc"
+        _render_cdc_dlq_panel(
+            ui,
+            state,
+            _JobJM(MigrationJob(job_id="job-cdc")),
+            _cdc_view_with_drift([("orders", kind, 2)]),
+            on_refresh=None,
+            session=_drift_session(),
+        )
+        assert any("Source schema change detected" in t for t in ui.texts), kind
+        assert not any("Fix target schema" in t for t in ui.texts), kind
 
 
 def test_migrate_table_passes_applied_target_types_to_exporter() -> None:

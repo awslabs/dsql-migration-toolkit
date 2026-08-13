@@ -5,6 +5,30 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.314
+
+### 추가 (Added)
+
+- **스키마 드리프트로 감지된 소스 `ADD COLUMN`을 DLQ 패널에서 타깃에 적용할 수 있습니다 —
+  실행할 DDL을 먼저 보여주고 승인받습니다.** `v0.1.313`은 **감지**까지만 했고, 어떤 컬럼이
+  빠졌는지 파악해 `ALTER TABLE`을 직접 작성하는 건 실무자 몫이었습니다. 이제 "Source schema
+  change detected" 배너의 `add-column` 항목에 **Fix target schema…** 액션이 붙습니다: 소스와
+  타깃의 컬럼 목록을 읽어 빠진 컬럼마다 `ALTER TABLE ... ADD COLUMN`을 한 문장씩,
+  스키마 변환과 **동일한 MySQL→DSQL 타입 매핑**으로 렌더링해 확인 다이얼로그에 그대로 보여줍니다.
+  그 다이얼로그를 승인하기 전까지는 아무것도 적용되지 않으며(Property 6 — 툴이 스스로 타깃
+  스키마를 바꾸는 일은 여전히 없습니다), Aurora DSQL이 한 트랜잭션의 DDL 두 개를 거부하므로
+  (`multiple ddl statements not supported in a transaction`, 라이브 확인) 각 문장을 **개별
+  트랜잭션**으로 실행합니다.
+
+  의도된 제약: 각 컬럼은 **NULL 허용·기본값 없음**으로 추가합니다 — 행이 있는 테이블에
+  기본값 없는 `NOT NULL`은 거부되고, 기본값을 임의로 만들면 CDC가 이미 적용한 행에 데이터를
+  날조하는 셈이기 때문입니다. 따라서 기존 행은 backfill 전까지 NULL로 읽힙니다. 컨버터가
+  매핑할 수 없는 소스 타입은 **건너뛰고 이름을 알려주며**(절대 근사하지 않음), 손실 있는
+  매핑(예: 공간 타입 → `bytea`)은 다이얼로그에 경고를 표시합니다. 이 액션은 `add-column`
+  **에만** 제공됩니다 — 소스 `DROP COLUMN`이나 비호환 타입 변경은 타깃 데이터를 재작성·파괴할
+  수 있어 계속 alert-only입니다. DDL 적용이 이미 격리된 행을 재생하지는 않으므로, 다이얼로그와
+  알림 모두 해당 backfill은 per-table Reload로 안내합니다.
+
 ## v0.1.313
 
 ### 추가 (Added)

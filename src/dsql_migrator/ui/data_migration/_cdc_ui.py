@@ -305,7 +305,9 @@ def _render_cdc_step(
     )
 
     # 5. MONITOR: live connector health + DLQ, meaningful only once streaming.
-    _render_cdc_live_monitoring(ui, migration_state, job_manager)
+    # session is threaded through so the drift banner can offer the opt-in
+    # ADD COLUMN fix (it needs the source + target connections).
+    _render_cdc_live_monitoring(ui, migration_state, job_manager, session=session)
 
     # 5b. PER-TABLE: Full Load outcome + live source/target row counts per selected
     #     table, so the operator can see Full Load completion and CDC replication
@@ -4294,7 +4296,7 @@ def _render_migration_table_status(
                     "not a proven exact match); Validation (step 4) is the exact check."
                 ).classes("text-xs text-gray-600")
 
-def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
+def _render_cdc_live_monitoring(ui, migration_state, job_manager, session=None) -> None:
     """Live connector health + DLQ, polled read-only from MSK Connect.
 
     Mirrors the Full Load poll chain: a refreshable region arms a one-shot timer
@@ -4422,7 +4424,12 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager) -> None:
                 ui, view, getattr(migration_state, "cdc_activity", None)
             )
             _render_cdc_dlq_panel(
-                ui, migration_state, job_manager, view, on_refresh=_poll_cdc
+                ui,
+                migration_state,
+                job_manager,
+                view,
+                on_refresh=_poll_cdc,
+                session=session,
             )
         else:
             controller = getattr(migration_state, "cdc_controller", None)
@@ -4683,7 +4690,166 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
 }
 
 
-def _render_cdc_schema_drift_banner(ui, status_view: LoadStatusView) -> None:
+async def _open_add_column_dialog(ui, session, table: str, on_refresh=None) -> None:
+    """Offer the operator the exact ADD COLUMN DDL the target is missing.
+
+    The recovery for the dominant drift kind (source ADD COLUMN), split so nothing
+    mutates the target without consent: this reads the source's and the target's
+    column lists, renders one ``ALTER TABLE ... ADD COLUMN`` per missing column via
+    the converter's own type mapping, shows them verbatim for approval, and only
+    then applies them -- one DDL per transaction, as Aurora DSQL requires.
+
+    Both reads and the apply are blocking I/O, so each is offloaded with
+    ``run.io_bound``; the render path itself stays I/O-free.
+    """
+    from nicegui import run
+
+    from dsql_migrator.core.cdc_schema_evolve import (
+        apply_add_columns,
+        plan_add_columns,
+        read_source_columns,
+        read_target_columns,
+    )
+    from dsql_migrator.core.target_connection import DsqlConnector
+    from dsql_migrator.ui.connect import make_source_engine_factory
+
+    source_config = getattr(session, "source_config", None)
+    target_config = getattr(session, "target_config", None)
+    if source_config is None or target_config is None:
+        ui.notify(  # type: ignore[attr-defined]
+            "Connect the source and target first (Step 1).", type="warning"
+        )
+        return
+
+    connector = DsqlConnector(
+        target_config, aws_profile=getattr(session, "aws_profile", None)
+    )
+
+    def _build_plan():
+        engine = make_source_engine_factory(getattr(session, "source_password", None))(
+            source_config
+        )
+        raw = engine.raw_connection()
+        try:
+            source_columns = read_source_columns(raw, table)
+        finally:
+            raw.close()
+        target = connector.connect()
+        try:
+            target_columns = read_target_columns(target, table)
+        finally:
+            target.close()
+        return plan_add_columns(table, source_columns, target_columns)
+
+    try:
+        plan = await run.io_bound(_build_plan)
+    except Exception as exc:  # noqa: BLE001 - surfaced, never crashes the monitor
+        ui.notify(f"Could not read the schemas: {exc}", type="negative")  # type: ignore[attr-defined]
+        return
+
+    if plan.is_empty and not plan.skipped:
+        # The target already matches: the DLQ rows are still set aside, so point at
+        # the backfill rather than implying there is nothing left to do.
+        ui.notify(  # type: ignore[attr-defined]
+            f"{table}: the target already has every source column. Use per-table "
+            "Reload to backfill the dead-lettered rows.",
+            type="info",
+        )
+        return
+
+    with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 560px"):  # type: ignore[attr-defined]
+        section_header(ui, icon="schema", title=f"Add missing columns to {table}")
+        if plan.steps:
+            ui.label(  # type: ignore[attr-defined]
+                "These statements will run on the target, one per transaction. Each "
+                "column is added NULLable with no default: existing rows read NULL "
+                "until you backfill them, and new change events carry the real value."
+            ).classes("text-xs text-gray-700")
+            ui.code(plan.ddl_text, language="sql").classes("w-full text-xs")  # type: ignore[attr-defined]
+            for step in plan.steps:
+                if step.warning:
+                    render_notice(
+                        ui,
+                        tone="warning",
+                        header=f"{step.column} ({step.source_type})",
+                        body=step.warning,
+                    )
+        for skipped in plan.skipped:
+            render_notice(
+                ui,
+                tone="warning",
+                header=f"{skipped.column} is not included",
+                body=(
+                    f"source type {skipped.source_type}: {skipped.reason}. Add this "
+                    "column by hand if you need it."
+                ),
+            )
+        render_notice(
+            ui,
+            tone="info",
+            header="After applying",
+            body=(
+                "CDC resumes applying new changes for this table on its own. The rows "
+                "already dead-lettered are NOT replayed -- use per-table Reload to "
+                "backfill them."
+            ),
+        )
+
+        async def _apply() -> None:
+            dialog.close()  # type: ignore[attr-defined]
+            try:
+                outcomes = await run.io_bound(
+                    apply_add_columns, plan, connector.connect
+                )
+            except Exception as exc:  # noqa: BLE001
+                ui.notify(f"Apply failed: {exc}", type="negative")  # type: ignore[attr-defined]
+                return
+            applied = [o for o in outcomes if o.applied]
+            failed = [o for o in outcomes if not o.applied]
+            from dsql_migrator.core.activity_log import (
+                ActivityCategory,
+                ActivityStatus,
+                log_activity,
+            )
+
+            for outcome in outcomes:
+                log_activity(
+                    ActivityCategory.CDC,
+                    "add column to target (schema drift)",
+                    status=(
+                        ActivityStatus.SUCCESS if outcome.applied
+                        else ActivityStatus.FAILURE
+                    ),
+                    target=f"{table}.{outcome.column}",
+                    detail=outcome.error or outcome.ddl,
+                )
+            if failed:
+                ui.notify(  # type: ignore[attr-defined]
+                    f"Added {len(applied)} column(s); {failed[0].column} failed: "
+                    f"{failed[0].error}",
+                    type="negative",
+                )
+            else:
+                ui.notify(  # type: ignore[attr-defined]
+                    f"Added {len(applied)} column(s) to {table}. Use per-table Reload "
+                    "to backfill the dead-lettered rows.",
+                    type="positive",
+                )
+            if on_refresh is not None:
+                on_refresh()
+
+        with ui.row().classes("w-full justify-end gap-2"):  # type: ignore[attr-defined]
+            ui.button("Cancel", on_click=dialog.close).props("flat no-caps")  # type: ignore[attr-defined]
+            if plan.steps:
+                ui.button(  # type: ignore[attr-defined]
+                    f"Apply {len(plan.steps)} statement(s)", on_click=_apply
+                ).props("no-caps color=primary")
+    dialog.open()  # type: ignore[attr-defined]
+
+
+def _render_cdc_schema_drift_banner(
+    ui, status_view: LoadStatusView, session=None, on_refresh=None
+) -> None:
     """Flag source DDL the target has not caught up to (from the classified DLQ).
 
     CDC does not propagate DDL: when the source alters a table, the first row under
@@ -4711,9 +4877,25 @@ def _render_cdc_schema_drift_banner(ui, status_view: LoadStatusView) -> None:
                 group.kind, (group.kind, "the source schema changed")
             )
             noun = "record" if group.count == 1 else "records"
-            ui.label(  # type: ignore[attr-defined]
-                f"{group.table}: {label} — {why}. {group.count} {noun} dead-lettered."
-            ).classes("text-xs text-gray-800")
+            with ui.row().classes("w-full items-center gap-2"):  # type: ignore[attr-defined]
+                ui.label(  # type: ignore[attr-defined]
+                    f"{group.table}: {label} — {why}. {group.count} {noun} dead-lettered."
+                ).classes("text-xs text-gray-800")
+                # ADD COLUMN is the only additive (non-destructive) drift, so it is
+                # the only one we offer to fix. A DROP/type change can rewrite or
+                # destroy target data, so those stay alert-only -- see the runbook
+                # line below. The action still requires an explicit approval of the
+                # rendered DDL (Property 6: never a silent schema mutation), and it
+                # is hidden entirely when no session is wired (e.g. unit tests).
+                if group.kind == "add-column" and session is not None:
+                    ui.button(  # type: ignore[attr-defined]
+                        "Fix target schema…",
+                        on_click=lambda _e=None, table=group.table: (
+                            _open_add_column_dialog(
+                                ui, session, table, on_refresh=on_refresh
+                            )
+                        ),
+                    ).props("flat dense no-caps size=sm color=primary")
         # One shared runbook line: CDC cannot apply the DDL for you (Property 6).
         ui.label(  # type: ignore[attr-defined]
             "CDC does not replicate DDL. Apply the matching change to the target "
@@ -4724,7 +4906,12 @@ def _render_cdc_schema_drift_banner(ui, status_view: LoadStatusView) -> None:
 
 
 def _render_cdc_dlq_panel(
-    ui, migration_state, job_manager, status_view: LoadStatusView, on_refresh=None
+    ui,
+    migration_state,
+    job_manager,
+    status_view: LoadStatusView,
+    on_refresh=None,
+    session=None,
 ) -> None:
     """Render the dead-letter queue as one cohesive, AWS-console-style card.
 
@@ -4778,7 +4965,9 @@ def _render_cdc_dlq_panel(
                 "A zero count is expected while the sink is stalled — it never reaches "
                 "a record to quarantine, so this is not evidence that nothing was lost."
             ).classes("text-xs font-semibold text-red-700")
-        _render_cdc_schema_drift_banner(ui, status_view)
+        _render_cdc_schema_drift_banner(
+            ui, status_view, session=session, on_refresh=on_refresh
+        )
         _render_cdc_dlq_breakdown(ui, status_view)
         # CDC commonly has no Full Load job_id this session, so key the record list /
         # download off the same stable CDC key the fold used (cdc_error_log_key) --

@@ -5,6 +5,33 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.314
+
+### Added
+
+- **A source `ADD COLUMN` detected as schema drift can now be applied to the target
+  from the DLQ panel, with the exact DDL shown for approval first.** `v0.1.313` only
+  *detected* drift — the operator then had to work out which columns were missing and
+  hand-write the `ALTER TABLE`. The "Source schema change detected" band now carries a
+  **Fix target schema…** action for `add-column` drift: it reads the source's and the
+  target's column lists, renders one `ALTER TABLE ... ADD COLUMN` per missing column
+  using the same MySQL→DSQL type mapping the schema conversion uses, and shows the
+  statements verbatim in a confirmation dialog. Nothing is applied until that dialog is
+  confirmed (Property 6 — the tool still never mutates the target schema on its own),
+  and each statement runs in its own transaction because Aurora DSQL rejects two DDL
+  statements in one transaction (`multiple ddl statements not supported in a
+  transaction`, verified live).
+
+  Deliberate limits: each column is added **NULLable with no default** — `NOT NULL`
+  without a default is rejected on a populated table, and a fabricated default would
+  invent data for the rows CDC already applied, so existing rows read NULL until they
+  are backfilled. A source type the converter cannot map is **skipped and named**, never
+  approximated, and a lossy mapping (e.g. a spatial type → `bytea`) shows its warning in
+  the dialog. The action is offered for `add-column` **only**: a source `DROP COLUMN` or
+  an incompatible type change can rewrite or destroy target data, so those stay
+  alert-only. Applying the DDL does not replay the rows already dead-lettered — the
+  dialog and the notification both point at per-table Reload for that backfill.
+
 ## v0.1.313
 
 ### Added
