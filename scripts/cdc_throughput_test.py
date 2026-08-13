@@ -157,14 +157,16 @@ def cmd_generate(args) -> None:
                 time.sleep(0.01)
                 continue
 
-            # Insert a batch
+            # Insert a batch. The row VALUES are BOUND, not formatted into the SQL
+            # text: PyMySQL's executemany collapses an INSERT into one multi-row
+            # statement (bounded by max_allowed_packet), so the batch is still a
+            # single round trip -- the property this throughput test depends on --
+            # without the generated payload ever becoming part of the statement.
             rows_this_batch = min(batch_size, deficit)
             payload = f"perf-{batch_id}-{uuid.uuid4().hex[:16]}"
-            values = ", ".join(
-                [f"('{batch_id}', '{payload}')"] * rows_this_batch
-            )
-            cur.execute(
-                f"INSERT INTO {PERF_TABLE} (batch_id, payload) VALUES {values}"
+            cur.executemany(
+                f"INSERT INTO {PERF_TABLE} (batch_id, payload) VALUES (%s, %s)",
+                [(batch_id, payload)] * rows_this_batch,
             )
             total_inserted += rows_this_batch
 

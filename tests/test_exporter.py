@@ -29,6 +29,8 @@ from typing import Optional
 import pytest
 
 from dsql_migrator.core.exporter import (
+    _quote_mysql_identifier,
+    _quote_mysql_table,
     CsvRowWriter,
     ExportCancelled,
     ExportError,
@@ -406,6 +408,54 @@ def test_compute_pk_shard_ranges_falls_back_for_small_or_empty_table() -> None:
     assert compute_pk_shard_ranges(_TinyConn(), _simple_table(), 4) == [(None, None)]
     # shards<=1 short-circuits without querying.
     assert compute_pk_shard_ranges(_EmptyConn(), _simple_table(), 1) == [(None, None)]
+
+
+# ---------------------------------------------------------------------------
+# Identifier quoting -- the escaping that makes the interpolated SQL safe
+# ---------------------------------------------------------------------------
+
+
+def test_quoting_escapes_embedded_backticks_and_splits_qualified_names() -> None:
+    # A table or column name CANNOT be a bind parameter (":col" would be a string
+    # literal, not a column), so every statement here interpolates the name and the
+    # quoting IS the protection. Static analysers flag those f-strings on sight, so
+    # pin the escaping rather than leaving it to a reviewer's reading.
+    assert _quote_mysql_identifier("id") == "`id`"
+    assert _quote_mysql_identifier("a`b") == "`a``b`"      # backtick doubled, not dropped
+    # Cluster-wide introspection yields "database.table"; each part is quoted
+    # separately, else MySQL reads `db.tbl` as ONE name in the unset current database.
+    assert _quote_mysql_table("db.tbl") == "`db`.`tbl`"
+    assert _quote_mysql_table("plain") == "`plain`"
+    # A dot inside an unqualified name is still one identifier, not a split point.
+    assert _quote_mysql_table("db.tbl.extra") == "`db`.`tbl.extra`"
+
+
+def test_shard_range_sql_keeps_a_hostile_identifier_inside_one_quoted_name() -> None:
+    # The end-to-end property: even if a source object were named to look like a SQL
+    # terminator, it reaches the statement only as a quoted identifier -- the backtick
+    # is doubled, so it cannot close the quote and start a new clause. (Names come from
+    # information_schema reflection, not free-text input; this is defence in depth.)
+    hostile = TableDef(
+        name="orders` WHERE 1=1 -- ",
+        columns=[ColumnDef(name="id` DROP", mysql_type="INT")],
+        primary_key=["id` DROP"],
+    )
+    seen: list[str] = []
+
+    class _CapturingConn:
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            seen.append(str(statement))
+            return _FakeResult([{"lo": 1, "hi": 1000}])
+
+    compute_pk_shard_ranges(_CapturingConn(), hostile, 4)
+    sql = seen[0]
+    # The payload survives verbatim INSIDE the quoted identifier ...
+    assert "`orders`` WHERE 1=1 -- `" in sql
+    assert "`id`` DROP`" in sql
+    # ... and never as an unescaped identifier terminator, which is what would let it
+    # become a clause of its own. This is the assertion that fails if quoting is lost.
+    assert "orders` WHERE" not in sql
+    assert "id` DROP" not in sql
 
 
 def test_compute_pk_shard_ranges_composite_pk_is_never_sharded() -> None:
