@@ -40,6 +40,7 @@ import sys
 
 # Reuse the proven connection + schema-resolution helpers from compare_rows.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _common import validate_identifier  # noqa: E402
 from compare_rows import source_connect, target_connect, source_stats, target_stats  # noqa: E402
 
 DEFAULT_SCHEMA = os.environ.get("CDC_WORKLOAD_SCHEMA", "customers_sample_new")
@@ -53,12 +54,20 @@ DEFAULT_TABLES = [
 
 
 def _src_pk_set(conn, schema, table, pk) -> set:
+    # Identifiers are interpolated (they cannot be bound), so validate first.
+    validate_identifier(schema, "schema")
+    validate_identifier(table, "table")
+    validate_identifier(pk, "pk column")
     with conn.cursor() as cur:
         cur.execute(f"SELECT `{pk}` FROM `{schema}`.`{table}`")
         return {r[0] for r in cur.fetchall()}
 
 
 def _tgt_pk_set(conn, sch, table, pk) -> set:
+    # Identifiers are interpolated (they cannot be bound), so validate first.
+    validate_identifier(sch, "target schema")
+    validate_identifier(table, "table")
+    validate_identifier(pk, "pk column")
     cur = conn.cursor()
     cur.execute(f'SELECT "{pk}" FROM "{sch}"."{table}"')
     return {r[0] for r in cur.fetchall()}

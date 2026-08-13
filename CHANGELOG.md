@@ -5,6 +5,46 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.315
+
+### Changed
+
+- **Content-security-review hardening: the ALB now drops malformed HTTP headers, and
+  the HTTPS listener pins a TLS 1.3 policy.** Both were silent AWS defaults. An ALB
+  forwards invalid header fields straight to the target — the HTTP desync /
+  request-smuggling vector, where the ALB and the app disagree about where one request
+  ends — and an HTTPS listener with no `SslPolicy` inherits `ELBSecurityPolicy-2016-08`,
+  which still negotiates TLS 1.0/1.1. `deploy/cloudformation.yaml` now sets
+  `routing.http.drop_invalid_header_fields.enabled=true` on the load balancer and
+  `SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06` on the listener (that policy keeps
+  TLS 1.2 as the fallback, so ordinary browsers still connect). The app itself is
+  unchanged and the workbench sends only ordinary browser + WebSocket headers, so
+  nothing user-visible changes; an existing stack picks both up on the next update.
+  `tests/test_deployment_artifacts.py` pins them, since neither shows up in normal use
+  and nothing else would notice them being removed.
+
+- **The command-line scripts validate every SQL identifier they interpolate.** A
+  schema, table or column name cannot be passed as a bind parameter, so
+  `scripts/compare_rows.py`, `scripts/cdc_consistency_check.py` and
+  `scripts/verify_conversion_on_dsql.py` have to build
+  ``... FROM `{schema}`.`{table}` `` — and, in the last one,
+  `DROP`/`CREATE SCHEMA "{scratch}"` — by interpolation, while taking those names from
+  `--table` / `--schema` / `--scratch-schema` on the command line. Every interpolated
+  name (including the PK column and target schema read back out of
+  `information_schema`, and the table name reflected from the source) now goes through
+  one shared `_common.validate_identifier()` allowlist — `[A-Za-z_][A-Za-z0-9_]*`,
+  deliberately stricter than what MySQL/PostgreSQL themselves accept — which raises
+  before any SQL is issued. PK *values* were already bound as parameters and stay
+  bound. The shipped app is unaffected: its own source reads go through the
+  introspector's bound queries.
+
+### Docs
+
+- Softened an absolute claim in the CDC chapter (§4.3, all three languages): the
+  gapless Full Load → CDC handoff is now described as **designed to ensure** no missed
+  changes and no duplicates, rather than guaranteeing it — the mechanism is unchanged,
+  the wording just no longer promises an outcome for every source.
+
 ## v0.1.314
 
 ### Added

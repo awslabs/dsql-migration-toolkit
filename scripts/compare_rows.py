@@ -32,7 +32,7 @@ import time
 import pymysql
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import load_dotenv, log  # noqa: E402
+from _common import load_dotenv, log, validate_identifier  # noqa: E402
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -98,6 +98,9 @@ def _split(table: str) -> tuple[str, str]:
 
 
 def source_stats(conn, schema: str, table: str) -> dict:
+    # Identifiers are interpolated (they cannot be bound), so validate first.
+    validate_identifier(schema, "schema")
+    validate_identifier(table, "table")
     with conn.cursor() as cur:
         cur.execute(
             "SELECT COUNT(*) FROM information_schema.tables "
@@ -113,12 +116,16 @@ def source_stats(conn, schema: str, table: str) -> dict:
         count = cur.fetchone()[0]
         mn = mx = None
         if len(pk) == 1:
+            validate_identifier(pk[0], "pk column")
             cur.execute(f"SELECT MIN(`{pk[0]}`), MAX(`{pk[0]}`) FROM `{schema}`.`{table}`")
             mn, mx = cur.fetchone()
     return {"exists": True, "pk": pk, "count": count, "min": mn, "max": mx}
 
 
 def target_stats(conn, schema: str, table: str, pk: list) -> dict:
+    # Identifiers are interpolated (they cannot be bound), so validate first.
+    validate_identifier(schema, "schema")
+    validate_identifier(table, "table")
     cur = conn.cursor()
     # The Full Load writes to the schema-qualified target; the sink may also have
     # used 'public' historically -- prefer the qualified schema, fall back to public.
@@ -129,11 +136,12 @@ def target_stats(conn, schema: str, table: str, pk: list) -> dict:
     rows = cur.fetchall()
     if not rows:
         return {"exists": False}
-    sch = rows[0][0]
+    sch = validate_identifier(rows[0][0], "target schema")
     cur.execute(f'SELECT COUNT(*) FROM "{sch}"."{table}"')
     count = cur.fetchone()[0]
     mn = mx = None
     if len(pk) == 1:
+        validate_identifier(pk[0], "pk column")
         cur.execute(f'SELECT MIN("{pk[0]}"), MAX("{pk[0]}") FROM "{sch}"."{table}"')
         mn, mx = cur.fetchone()
     return {"exists": True, "schema": sch, "count": count, "min": mn, "max": mx}

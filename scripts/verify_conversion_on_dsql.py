@@ -58,7 +58,7 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-from _common import load_dotenv, log  # noqa: E402
+from _common import load_dotenv, log, validate_identifier  # noqa: E402
 
 from dsql_migrator.config import SecretValue  # noqa: E402
 from dsql_migrator.core.converter import (  # noqa: E402
@@ -325,7 +325,9 @@ def _sweep(connection, tables: list[TableDef], scratch: str, label: str) -> list
                     Failure(strategy_name, str(subject), stage, message,
                             conversion.target_ddl)
                 )
-            bare = scratch_table.name.split(".")[-1]
+            # Interpolated into DROP TABLE (identifiers cannot be bound) and derived
+            # from a reflected source table name, so validate before it reaches SQL.
+            bare = validate_identifier(scratch_table.name.split(".")[-1], "table")
             with connection.cursor() as cursor:
                 cursor.execute(f'DROP TABLE IF EXISTS "{scratch}"."{bare}"')
         log(f"  [{label}/{strategy_name}] applied {applied}/{len(tables)}")
@@ -354,7 +356,10 @@ def main() -> int:
 
     env = load_dotenv(".env")
     connection = _target_connection(env)
-    scratch = args.scratch_schema
+    # The scratch schema name is interpolated into DROP/CREATE SCHEMA below (an
+    # identifier cannot be bound), so a --scratch-schema value is only ever allowed
+    # through as a plain identifier -- validate it at the boundary, once.
+    scratch = validate_identifier(args.scratch_schema, "scratch schema")
 
     log(f"scratch schema on the target: {scratch} (dropped at the end)")
     with connection.cursor() as cursor:

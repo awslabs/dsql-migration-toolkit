@@ -59,7 +59,7 @@ rather than lost — visible, not silent.
 
 ## 4.3 The gapless Full Load → CDC handoff
 
-This is the bit that guarantees **no missed changes and no duplicates** between
+This is the bit designed to ensure **no missed changes and no duplicates** between
 the bulk load and the stream.
 
 1. Full Load captured a **watermark** (binlog position + GTID) at the snapshot

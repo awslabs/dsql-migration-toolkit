@@ -5,6 +5,42 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.315
+
+### 変更 (Changed)
+
+- **コンテンツセキュリティレビュー対応の堅牢化:ALB が不正な形式の HTTP ヘッダーを破棄し、
+  HTTPS リスナーが TLS 1.3 ポリシーを明示します。** どちらも静かな AWS の既定値でした。ALB は
+  既定で無効なヘッダーフィールドをそのままターゲットへ転送します — これは ALB とアプリが
+  「1 つのリクエストがどこで終わるか」を食い違って解釈する HTTP desync / リクエスト
+  スマグリングの経路です。また `SslPolicy` を指定しない HTTPS リスナーは
+  `ELBSecurityPolicy-2016-08` を継承し、TLS 1.0/1.1 まで交渉します。`deploy/cloudformation.yaml`
+  はロードバランサーに `routing.http.drop_invalid_header_fields.enabled=true`、リスナーに
+  `SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06` を設定します(このポリシーは TLS 1.2 を
+  フォールバックとして残すため、通常のブラウザーはそのまま接続できます)。アプリ自体は変更なし、
+  ワークベンチは通常のブラウザー + WebSocket ヘッダーしか送らないためユーザーから見える変化は
+  なく、既存スタックは次回の更新で両方を取り込みます。普段は表に出ない設定で、外されても誰も
+  気づかないため `tests/test_deployment_artifacts.py` で固定しました。
+
+- **コマンドラインスクリプトが、SQL に埋め込む識別子をすべて検証します。** スキーマ・テーブル・
+  列の名前はバインドパラメーターとして渡せないため、`scripts/compare_rows.py`、
+  `scripts/cdc_consistency_check.py`、`scripts/verify_conversion_on_dsql.py` は
+  ``... FROM `{schema}`.`{table}` `` (最後のスクリプトでは `DROP`/`CREATE SCHEMA "{scratch}"`
+  も) を文字列補間で組み立てる必要があり、その名前をコマンドラインの `--table` / `--schema` /
+  `--scratch-schema` から受け取ります。補間されるすべての名前 (`information_schema` から読み戻す
+  PK 列・ターゲットスキーマ、ソースからリフレクションしたテーブル名を含む) が、共有の
+  `_common.validate_identifier()` の許可リストを通るようになりました — `[A-Za-z_][A-Za-z0-9_]*`
+  で、MySQL/PostgreSQL 自体が受け付ける範囲より意図的に厳しく、SQL を発行する前に例外を
+  投げます。PK の**値**はもともとパラメーターとしてバインドしており、そのままです。出荷される
+  アプリ自体には影響しません — アプリのソース参照は introspector のバインド済みクエリを使います。
+
+### ドキュメント (Docs)
+
+- CDC の章 (§4.3) の断定的な表現を緩めました (3 言語すべて):ギャップのない Full Load → CDC
+  ハンドオフを「変更の取りこぼしも重複もないことを**保証する**」ではなく「**ないように設計
+  された**」と記述します — 仕組みは変わらず、すべてのソースに対して結果を約束しない表現に
+  改めただけです。
+
 ## v0.1.314
 
 ### 追加 (Added)

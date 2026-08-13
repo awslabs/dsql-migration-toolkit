@@ -290,6 +290,36 @@ def test_listener_forwards_to_the_target_group_by_ref(template: dict) -> None:
     )
 
 
+def test_alb_drops_invalid_headers_and_pins_a_tls13_policy(template: dict) -> None:
+    """Both edge-hardening properties are OFF by default, so pin them here.
+
+    A content security review flagged them (CKV_AWS_103 and
+    ELBV2_LISTENER_SSL_POLICY_RULE): an ALB forwards malformed HTTP headers to the
+    target unless told not to (the HTTP desync / request-smuggling vector), and an
+    HTTPS listener with no ``SslPolicy`` inherits ``ELBSecurityPolicy-2016-08``,
+    which still negotiates TLS 1.0/1.1. Neither shows up in normal use, so nothing
+    but this test would notice them being removed.
+    """
+    attrs = {
+        a["Key"]: a["Value"]
+        for a in template["Resources"]["LoadBalancer"]["Properties"][
+            "LoadBalancerAttributes"
+        ]
+    }
+    assert attrs.get("routing.http.drop_invalid_header_fields.enabled") == "true", (
+        "LoadBalancerAttributes must keep routing.http.drop_invalid_header_fields."
+        "enabled=true; without it the ALB passes malformed headers straight to the "
+        f"container (found {attrs!r})"
+    )
+    listener = template["Resources"]["HttpsListener"]["Properties"]
+    policy = listener.get("SslPolicy", "")
+    assert policy.startswith("ELBSecurityPolicy-TLS13-"), (
+        f"HttpsListener SslPolicy is {policy!r}; pin an ELBSecurityPolicy-TLS13-* "
+        "policy, since omitting SslPolicy falls back to the 2016-08 default that "
+        "still allows TLS 1.0/1.1"
+    )
+
+
 def test_cognito_callback_url_is_built_from_the_alb_dns_name(template: dict) -> None:
     # The pairing that makes the test above matter: the callback is GetAtt DNSName, so
     # DNSName's casing IS the callback's casing. If this ever switches to a hand-built

@@ -5,6 +5,41 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.315
+
+### 변경 (Changed)
+
+- **콘텐츠 보안 검토(CSR) 하드닝: ALB가 잘못된 형식의 HTTP 헤더를 폐기하고, HTTPS 리스너가
+  TLS 1.3 정책을 명시합니다.** 둘 다 조용한 AWS 기본값이었습니다. ALB는 기본적으로 유효하지
+  않은 헤더 필드를 타깃까지 그대로 전달하는데, 이것이 ALB와 앱이 "한 요청이 어디서 끝나는지"를
+  다르게 해석하는 HTTP desync / request smuggling 경로입니다. 또 `SslPolicy`가 없는 HTTPS
+  리스너는 `ELBSecurityPolicy-2016-08`을 상속해 TLS 1.0/1.1까지 협상합니다. 이제
+  `deploy/cloudformation.yaml`이 로드 밸런서에
+  `routing.http.drop_invalid_header_fields.enabled=true`를, 리스너에
+  `SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06`을 설정합니다(이 정책은 TLS 1.2를 폴백으로
+  유지하므로 일반 브라우저는 그대로 접속됩니다). 앱 자체는 바뀌지 않고 워크벤치는 평범한
+  브라우저 + WebSocket 헤더만 보내므로 사용자에게 보이는 변화는 없으며, 기존 스택은 다음
+  업데이트에서 두 설정을 반영합니다. 평소에는 드러나지 않는 설정이라 누가 지워도 아무도 모르기
+  때문에 `tests/test_deployment_artifacts.py`로 고정했습니다.
+
+- **커맨드라인 스크립트가 SQL에 보간하는 식별자를 모두 검증합니다.** 스키마·테이블·컬럼
+  이름은 바인드 파라미터로 넘길 수 없어서 `scripts/compare_rows.py`,
+  `scripts/cdc_consistency_check.py`, `scripts/verify_conversion_on_dsql.py`는
+  ``... FROM `{schema}`.`{table}` `` (마지막 스크립트는 `DROP`/`CREATE SCHEMA "{scratch}"`
+  까지) 를 문자열 보간으로 만들어야 하고, 그 이름을 커맨드라인의 `--table` / `--schema` /
+  `--scratch-schema`에서 받습니다. 이제 보간되는 모든 이름(`information_schema`에서 다시
+  읽어오는 PK 컬럼·타깃 스키마, 소스에서 리플렉션한 테이블 이름까지)이 공용
+  `_common.validate_identifier()` 허용목록을 거칩니다 — `[A-Za-z_][A-Za-z0-9_]*`로,
+  MySQL/PostgreSQL이 실제로 허용하는 범위보다 의도적으로 더 엄격하며, SQL이 발행되기 전에
+  예외를 던집니다. PK **값**은 원래부터 파라미터로 바인딩됐고 그대로 유지됩니다. 배포되는 앱
+  자체는 영향이 없습니다 — 앱의 소스 조회는 인트로스펙터의 바인딩된 쿼리를 씁니다.
+
+### 문서 (Docs)
+
+- CDC 장(§4.3)의 단정적 표현을 완화했습니다(3개 언어 모두): 무손실 Full Load → CDC 핸드오프를
+  "누락된 변경도 중복도 없음을 **보장**한다"가 아니라 "**없도록 설계된**"으로 서술합니다 —
+  동작은 그대로이고, 모든 소스에 대해 결과를 약속하지 않도록 문구만 바꿨습니다.
+
 ## v0.1.314
 
 ### 추가 (Added)
