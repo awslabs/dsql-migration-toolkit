@@ -170,3 +170,75 @@ def test_session_target_probe_reads_value_required_columns_via_introspector() ->
     assert call.args, "the qualified table name must be forwarded"
     kwargs = {kw.arg: ast.unparse(kw.value) for kw in call.keywords}
     assert kwargs.get("connection_factory") == "self._connector.connect"
+
+
+# ---------------------------------------------------------------------------
+# SessionSourceProbe.variables: bound names, literal statement
+# ---------------------------------------------------------------------------
+
+
+class _FakeRows:
+    """Minimal SQLAlchemy result stand-in exposing ``fetchall``."""
+
+    def __init__(self, rows: list[tuple[str, str]]):
+        self._rows = rows
+
+    def fetchall(self) -> list[tuple[str, str]]:
+        return self._rows
+
+
+class _RecordingConnection:
+    """Records (statement, parameters) and returns canned variable rows."""
+
+    def __init__(self, rows: list[tuple[str, str]]):
+        self._rows = rows
+        self.calls: list[tuple[str, Any]] = []
+
+    def __enter__(self) -> "_RecordingConnection":
+        return self
+
+    def __exit__(self, *_exc: Any) -> bool:
+        return False
+
+    def execute(self, statement: Any, parameters: Any = None) -> _FakeRows:
+        self.calls.append((str(statement), parameters))
+        return _FakeRows(self._rows)
+
+
+def _source_probe(connection: _RecordingConnection) -> Any:
+    from dsql_migrator.core.models import SourceConnectionConfig
+    from dsql_migrator.ui.prerequisite_probes import SessionSourceProbe
+
+    probe = SessionSourceProbe(SourceConnectionConfig(host="db.example.com"), None)
+    # Replace the engine factory seam: no MySQL is reached in a unit test.
+    probe._engine_factory = lambda _config: type(  # noqa: SLF001
+        "_Engine", (), {"connect": lambda _self: connection}
+    )()
+    return probe
+
+
+def test_variables_binds_the_names_instead_of_formatting_them() -> None:
+    """The variable names must travel as bind parameters, not inside the SQL text.
+
+    They are a fixed module constant, so this is not an exploitable injection -- but
+    they are VALUES (a schema/table name, by contrast, cannot be bound at all), so
+    binding is possible and it keeps the statement a literal. Static analysers flag
+    every formatted SQL string, and this is one of the few the tool can simply not
+    have.
+    """
+    from dsql_migrator.ui.prerequisite_probes import _CDC_VARIABLES
+
+    connection = _RecordingConnection([("log_bin", "ON"), ("binlog_format", "ROW")])
+    result = _source_probe(connection).variables()
+    assert result == {"log_bin": "ON", "binlog_format": "ROW"}
+
+    statement, parameters = connection.calls[0]
+    # Every name is passed as a parameter value ...
+    assert set(parameters.values()) == set(_CDC_VARIABLES)
+    # ... and none of them appears in the statement text itself.
+    for name in _CDC_VARIABLES:
+        assert name not in statement, f"{name} leaked into the SQL text: {statement}"
+    # One placeholder per variable: adding a variable without a placeholder (or vice
+    # versa) would silently drop it from the query, so pin the count.
+    assert statement.count(":v") == len(_CDC_VARIABLES), statement
+    assert len(parameters) == len(_CDC_VARIABLES)

@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.318
+
+### Changed
+
+- **The CDC prerequisite probe binds the variable names it queries instead of
+  formatting them into the statement.** `SHOW GLOBAL VARIABLES WHERE Variable_name IN
+  (...)` built its list by string-formatting `_CDC_VARIABLES` into the SQL. Nothing
+  external can reach that list — it is a module constant — but the names are *values*,
+  and unlike a schema or table name (which cannot be a bind parameter at all) a value
+  can simply be bound. It now is, leaving the statement text a plain literal. A test
+  pins one placeholder per entry in `_CDC_VARIABLES`, so adding a variable cannot
+  silently drop it from the query. No behavior change: the same four variables are read.
+
 ## v0.1.317
 
 ### Changed

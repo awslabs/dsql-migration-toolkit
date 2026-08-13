@@ -92,12 +92,22 @@ class SessionSourceProbe:
 
     def variables(self) -> dict[str, str]:
         """Return the CDC-relevant ``SHOW GLOBAL VARIABLES`` (empty on error)."""
-        names = ", ".join(f"'{name}'" for name in _CDC_VARIABLES)
+        # The names are BOUND, not formatted into the statement. Nothing external can
+        # reach this list either way (it is a module constant), but these are VALUES --
+        # unlike a schema/table name, which cannot be a bind parameter at all -- so
+        # binding is possible here, and doing it keeps the statement text a plain
+        # literal. tests/test_prerequisite_probes.py pins the placeholder count to
+        # _CDC_VARIABLES, so adding a variable cannot silently drop it from the query.
+        params = {f"v{index}": name for index, name in enumerate(_CDC_VARIABLES)}
         try:
             engine = self._engine_factory(self._config)
             with engine.connect() as connection:
                 rows = connection.execute(
-                    text(f"SHOW GLOBAL VARIABLES WHERE Variable_name IN ({names})")
+                    text(
+                        "SHOW GLOBAL VARIABLES WHERE Variable_name "
+                        "IN (:v0, :v1, :v2, :v3)"
+                    ),
+                    params,
                 ).fetchall()
             return {str(row[0]): str(row[1]) for row in rows if len(row) >= 2}
         except Exception:  # noqa: BLE001 - treated as "variables unknown"
