@@ -415,6 +415,13 @@ Resources:
   # re-running Step 1. It only signs the session cookie; no DB/user credentials
   # are stored here. (On this host the per-session SQLite ALSO lives on the
   # retained EBS volume, so restoration survives even a container recreate.)
+  # No KmsKeyId, deliberately (CKV_AWS_149 / SECRETSMANAGER_USING_CMK) -- the same
+  # decision, for the same reasons, as the StorageSecret in cloudformation.yaml: a
+  # customer-managed key would cost ~$1/month, force a kms:Decrypt grant on the reader
+  # (without which the app cannot start), and require kms:CreateKey (unscopable) on the
+  # deploying principal, to protect 64 random characters that sign a session cookie.
+  # The credential-bearing secret the tool creates for CDC does support a CMK, via
+  # DSQL_MIGRATOR_CDC_SECRET_KMS_KEY_ID. Keep both templates' decision identical.
   StorageSecret:
     Type: AWS::SecretsManager::Secret
     Properties:

@@ -723,6 +723,21 @@ Conditions:
 
 Resources:
   # --- Observability ----------------------------------------------------------
+  # No KmsKeyId, deliberately (CKV_AWS_158 / CLOUDWATCH_LOG_GROUP_ENCRYPTED), and this
+  # instance has a technical reason on top of the cost one that declines it for the app
+  # stack's own log group. MSK Connect does not write here directly: worker logs arrive
+  # through the vended-log-delivery path, so the KMS key policy would have to admit that
+  # delivery principal as well as the connector's role, and MSK Connect's own logging
+  # documentation states no KMS requirement at all -- there is nothing to verify against
+  # short of a live deploy. If that grant were wrong, ingestion fails SILENTLY, and this
+  # group is load-bearing: the control plane reads it with FilterLogEvents for DLQ depth,
+  # quarantined-record counts and the source-schema-drift banner, and those reads fail
+  # closed (see the ReadConnectorWorkerLogs comment in cloudformation.yaml). A key
+  # shared from the app stack adds a second hazard: the CDC stack is created and deleted
+  # repeatedly inside one migration, so deleting the app stack first would schedule the
+  # key for deletion and make already-written logs permanently unreadable. The content
+  # is bounded anyway -- connector/task state plus Kafka coordinates and a sqlstate; a
+  # quarantined row's payload goes to the Kafka DLQ topic, never here.
   ConnectorLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
