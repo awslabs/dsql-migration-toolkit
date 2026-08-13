@@ -1476,6 +1476,52 @@ def test_codebuild_role_ecr_push_is_repo_scoped(codebuild_template: dict) -> Non
     assert push["Resource"] == {"Fn::GetAtt": ["EcrRepository", "Arn"]}
 
 
+def test_codebuild_role_public_push_is_repo_scoped(codebuild_template: dict) -> None:
+    # The ECR PUBLIC publish actions take a repository ARN just like their private
+    # ecr: counterparts above, so they must be scoped too -- a release build may push
+    # the release image and nothing else. Left on "*" this is an unconstrained write
+    # (the finding a content security review raises), and nothing but this test would
+    # notice it regressing: the release path works either way.
+    role = codebuild_template["Resources"]["CodeBuildServiceRole"]["Properties"]
+    statements = [
+        stmt
+        for policy in role["Policies"]
+        for stmt in policy["PolicyDocument"]["Statement"]
+    ]
+    publish = next(
+        s
+        for s in statements
+        if "ecr-public:PutImage"
+        in (s["Action"] if isinstance(s["Action"], list) else [s["Action"]])
+    )
+    resource = publish["Resource"]
+    assert resource != "*", "ecr-public publish must be scoped to the repository ARN"
+    rendered = json.dumps(resource)
+    assert "ecr-public" in rendered and "${EcrRepoName}" in rendered, rendered
+    # Only the two token APIs stay account-wide -- they have no resource-level form.
+    unscoped = {
+        action
+        for s in statements
+        if s["Resource"] == "*"
+        for action in (s["Action"] if isinstance(s["Action"], list) else [s["Action"]])
+    }
+    assert unscoped == {
+        "ecr:GetAuthorizationToken",
+        "ecr-public:GetAuthorizationToken",
+        "sts:GetServiceBearerToken",
+    }, f"unexpected unscoped actions: {unscoped}"
+
+
+def test_ecr_repository_is_kms_encrypted(codebuild_template: dict) -> None:
+    # ECR defaults to AES256; KMS (with no KmsKey, i.e. the AWS managed aws/ecr key)
+    # is what the review asks for and costs nothing. EncryptionConfiguration is
+    # immutable, so this is also a reminder that changing it replaces the repo.
+    repo = codebuild_template["Resources"]["EcrRepository"]["Properties"]
+    assert repo.get("EncryptionConfiguration") == {"EncryptionType": "KMS"}
+    # Replacement/teardown must stay possible: the repo empties itself on delete.
+    assert repo.get("EmptyOnDelete") is True
+
+
 def test_buildspec_builds_amd64_and_pushes() -> None:
     text = BUILDSPEC.read_text(encoding="utf-8")
     assert "docker build" in text

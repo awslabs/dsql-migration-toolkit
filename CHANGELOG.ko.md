@@ -5,6 +5,30 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.317
+
+### 변경 (Changed)
+
+- **클라우드 빌드 스택이 ECR 리포지토리를 KMS로 암호화하고, ECR Public 퍼블리시 권한을
+  리포지토리 하나로 스코핑합니다.** `deploy/codebuild.yaml`의 콘텐츠 보안 검토 지적 2건 중,
+  논쟁이 아니라 실제로 고칠 수 있었던 항목입니다. 리포지토리는 ECR 기본값 AES256을 쓰고
+  있었는데, `KmsKey` 없이 `EncryptionType: KMS`만 지정하면 AWS 관리형 키 `aws/ecr`를 쓰므로
+  만들 CMK도, 월 비용도 없습니다. 그리고 `ecr-public:*` 퍼블리시 문장이 `Resource: "*"`였는데,
+  이 액션들은 리포지토리 ARN을 받습니다 — 바로 옆 프라이빗 `ecr:` 블록의 동일한 액션 이름들은
+  이미 스코핑돼 있었습니다. 이제 릴리스 빌드는 릴리스 이미지만 푸시할 수 있습니다. 계정 전역으로
+  남는 것은 로그인 토큰 API(`ecr:GetAuthorizationToken`,
+  `ecr-public:GetAuthorizationToken`, `sts:GetServiceBearerToken`)뿐이며, 이들은 리소스
+  레벨 형태가 없고, 그 토큰으로 **무엇을 할 수 있는지**는 위의 스코핑된 권한이 정합니다.
+  `tests/test_deployment_artifacts.py`가 둘 다 고정하며, 스코핑 없이 남아도 되는 액션 집합까지
+  정확히 검증합니다.
+
+  **기존 빌드 스택 업데이트는 실패합니다** — 우리 규칙이 아니라 CloudFormation의 규칙 때문입니다:
+  `EncryptionConfiguration`은 immutable이라 이름이 고정된 리포지토리를 교체하려 합니다. 빌드
+  스택을 삭제하고 재배포하세요 — 상태를 갖지 않으며(`EmptyOnDelete: true`) 다음 빌드가 이미지를
+  다시 푸시합니다. 앱 스택과 `ContainerImageUri`는 영향이 없습니다. ECR Public 리포지토리는
+  프라이빗 리포지토리와 이름이 같아야 하며, 이는 `buildspec.yml`이 이미 문서화한 관례입니다
+  (`public.ecr.aws/<alias>/mysql-dsql-migrator`).
+
 ## v0.1.316
 
 ### 변경 (Changed)

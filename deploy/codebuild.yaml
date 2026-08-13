@@ -33,6 +33,15 @@ Resources:
       EmptyOnDelete: true
       ImageScanningConfiguration:
         ScanOnPush: true
+      # Encrypt with KMS rather than ECR's default AES256. No CMK is needed or
+      # created: omitting KmsKey uses the AWS managed aws/ecr key, which carries no
+      # monthly charge. NOTE for an EXISTING build stack: EncryptionConfiguration is
+      # immutable, so CloudFormation would try to REPLACE the repository -- and the
+      # name is fixed, so that update fails. Delete this build stack and redeploy it
+      # instead; it holds no state (EmptyOnDelete above) and images are rebuilt by
+      # the next build.
+      EncryptionConfiguration:
+        EncryptionType: KMS
 
   SourceBucket:
     Type: AWS::S3::Bucket
@@ -94,7 +103,14 @@ Resources:
                   - ecr-public:GetAuthorizationToken
                   - sts:GetServiceBearerToken
                 Resource: "*"
-              # Publish layers/manifests to ECR Public repositories (release path).
+              # Publish layers/manifests to the ECR Public repository (release path).
+              # These actions DO take a repository ARN (same action names as the
+              # private ecr: block below, which is already scoped), so scope them:
+              # a build may push the release image and nothing else. The public repo
+              # is created out of band and must share the private repo's name --
+              # the convention buildspec.yml documents
+              # (public.ecr.aws/<alias>/mysql-dsql-migrator). ECR Public ARNs are
+              # global, hence the empty region field.
               - Effect: Allow
                 Action:
                   - ecr-public:BatchCheckLayerAvailability
@@ -102,7 +118,8 @@ Resources:
                   - ecr-public:UploadLayerPart
                   - ecr-public:CompleteLayerUpload
                   - ecr-public:PutImage
-                Resource: "*"
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:ecr-public::${AWS::AccountId}:repository/${EcrRepoName}
               # Push/pull layers scoped to this repository only.
               - Effect: Allow
                 Action:

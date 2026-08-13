@@ -5,6 +5,31 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.317
+
+### 変更 (Changed)
+
+- **クラウドビルドスタックが ECR リポジトリを KMS で暗号化し、ECR Public への publish 権限を
+  リポジトリ 1 つにスコープします。** `deploy/codebuild.yaml` に対するコンテンツセキュリティ
+  レビューの指摘のうち、議論ではなく実際に修正できた 2 件です。リポジトリは ECR の既定値
+  AES256 のままでしたが、`KmsKey` を指定せず `EncryptionType: KMS` とすれば AWS 管理キー
+  `aws/ecr` が使われるため、作成する CMK も月額費用もありません。また `ecr-public:*` の
+  publish ステートメントが `Resource: "*"` でしたが、これらのアクションはリポジトリ ARN を
+  受け取ります — すぐ隣のプライベート `ecr:` ブロックにある同名のアクションはすでにスコープ済み
+  でした。これでリリースビルドはリリースイメージのみを push できます。アカウント全体に残るのは
+  ログイントークン API (`ecr:GetAuthorizationToken`、`ecr-public:GetAuthorizationToken`、
+  `sts:GetServiceBearerToken`) だけで、これらにはリソースレベルの形式が存在せず、そのトークンで
+  **何ができるか**は上記のスコープ済み権限が決めます。`tests/test_deployment_artifacts.py` が
+  両方を固定し、スコープなしで残ってよいアクションの集合まで検証します。
+
+  **既存のビルドスタックの更新は失敗します** — 当方の都合ではなく CloudFormation の仕様です:
+  `EncryptionConfiguration` は immutable なので、名前が固定されたリポジトリを置き換えようと
+  します。ビルドスタックを削除して再デプロイしてください — 状態を持たず
+  (`EmptyOnDelete: true`)、次のビルドがイメージを再 push します。アプリスタックと
+  `ContainerImageUri` は影響を受けません。ECR Public リポジトリはプライベートリポジトリと同じ
+  名前である必要があり、これは `buildspec.yml` が既に文書化している規約です
+  (`public.ecr.aws/<alias>/mysql-dsql-migrator`)。
+
 ## v0.1.316
 
 ### 変更 (Changed)

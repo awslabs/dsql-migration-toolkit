@@ -5,6 +5,32 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.317
+
+### Changed
+
+- **The cloud-build stack encrypts its ECR repository with KMS and scopes the ECR Public
+  publish grant to one repository.** Two content-security-review findings on
+  `deploy/codebuild.yaml` that were fixable rather than arguable. The repository was on
+  ECR's default AES256; `EncryptionType: KMS` with no `KmsKey` uses the AWS managed
+  `aws/ecr` key, so there is no CMK to create and no monthly charge. And the
+  `ecr-public:*` publish statement sat on `Resource: "*"` even though those actions take a
+  repository ARN — the same action names in the private `ecr:` block beside it were already
+  scoped — so a release build can now push the release image and nothing else. Only the
+  login-token APIs (`ecr:GetAuthorizationToken`, `ecr-public:GetAuthorizationToken`,
+  `sts:GetServiceBearerToken`) remain account-wide, because they have no resource-level
+  form; what such a token can *do* is bounded by the scoped grants above.
+  `tests/test_deployment_artifacts.py` pins both, including the exact set of actions
+  allowed to stay unscoped.
+
+  **Updating an existing build stack will fail**, by CloudFormation's rules rather than
+  ours: `EncryptionConfiguration` is immutable, so it tries to replace a repository whose
+  name is fixed. Delete the build stack and redeploy it — it holds no state
+  (`EmptyOnDelete: true`) and the next build re-pushes the image. The app stack and its
+  `ContainerImageUri` are untouched. The ECR Public repository must share the private
+  repository's name, which is the convention `buildspec.yml` already documents
+  (`public.ecr.aws/<alias>/mysql-dsql-migrator`).
+
 ## v0.1.316
 
 ### Changed
