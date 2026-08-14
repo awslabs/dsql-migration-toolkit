@@ -5,6 +5,61 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.320
+
+### 수정 (Fixed)
+
+- **CDC 배포 역할로 계정 관리자가 될 수 있던 경로를 막았습니다.** `iam:AttachRolePolicy`가
+  `role/mysql-dsql-cdc-*`에 대해 **어떤 정책을 붙일지 제약 없이** 허용돼 있었고, 같은 역할이
+  `iam:CreateRole`·`iam:PassRole`(Lambda 대상)·`lambda:CreateFunction`/`InvokeFunction`도
+  갖고 있었습니다. 완전한 상승 체인입니다: `mysql-dsql-cdc-<아무거나>` 역할을 만들고
+  **`AdministratorAccess`를 붙이고**, 이 역할이 만들 수 있는 Lambda에 PassRole해서 호출.
+  이제 Attach/Detach는 별도 문장으로 분리해 `iam:PolicyARN`이
+  `AWSLambdaVPCAccessExecutionRole`(= `deploy/cdc-stack/cdc-stack.yaml`의 **유일한**
+  `ManagedPolicyArns` 값)인 경우로 조건화했습니다. `iam:SimulateCustomPolicy`로 검증:
+  해당 정책 부착은 **allowed**, `AdministratorAccess`·`PowerUserAccess`는 **implicitDeny**,
+  `iam:CreateRole`은 영향 없음.
+
+  불편하지만 분명히 적어둡니다: 이 경로는 스코핑 작업 **이전부터** 있었고, **v0.1.319가
+  이것에 대한 스캐너 신호를 없앴습니다** — 와일드카드를 스코핑한 순간
+  `CKV_AWS_109`("permissions management without constraints")가 더 이상 발동하지 않는데
+  상승 경로는 남아 있었습니다. 어떤 룰도 잡아주지 않으므로 테스트로 조건을 고정했습니다.
+  의도적으로 남긴 잔여: `iam:PutRolePolicy`는 여전히 `mysql-dsql-cdc-*` 역할에 임의 내용의
+  인라인 정책을 쓸 수 있고, IAM에는 정책 내용 조건이 없습니다(`iam:PermissionsBoundary`만
+  존재) — 두 스택에 걸쳐 boundary를 도입해야 하는 작업이라 분리했습니다.
+
+- **모든 cdc-stack 배포에서 거부되던 읽기 권한 2개를 추가했습니다.** 라이브 스택의
+  CloudTrail에 `ec2:DescribeSecurityGroupRules`(`AWS::EC2::SecurityGroupIngress`/`Egress`
+  리소스마다 1회)와 `ec2:DescribeNetworkAcls`가 `Client.UnauthorizedOperation`으로,
+  `cloudformation.amazonaws.com` 호출로, create와 delete 양쪽에서 남아 있었습니다. 애초에
+  허용된 적이 없습니다. CloudFormation이 `Authorize*` 응답으로 대체하기 때문에 배포는
+  성공하지만, 고객 트레일에 AccessDenied가 쌓이고 그 비문서화된 관용에 의존하게 됩니다.
+  둘 다 읽기 전용이고 리소스 레벨 형태가 없어 `Ec2NetworkReads` 문장에 넣었습니다.
+
+- **CDC 워크로드 생성기가 보간하는 스키마 이름을 검증합니다.**
+  `scripts/cdc_workload_customers_sample_new.py`는 `--schema`(또는 `CDC_WORKLOAD_SCHEMA`)를
+  받아 `_q()` 헬퍼를 통해 모든 문장에 보간합니다. v0.1.315 스윕이 이 파일을 놓친 이유는
+  스윕이 **`execute()` 호출 지점의 f-string**만 grep했고 이 스크립트는 헬퍼에서 SQL을 먼저
+  만들기 때문입니다 — 올바른 스윕은 문법이 아니라 **데이터 흐름**을 따라야 한다는 교훈입니다.
+  행 값은 이미 바인딩돼 있었고, 스키마·테이블·PK 컬럼 식별자가 이제
+  `_common.validate_identifier()`를 거칩니다.
+
+### 변경 (Changed)
+
+- 위 v0.1.319 항목의 두 가지 서술을 정정했습니다: 와일드카드 문장은 **CDC 배포 역할에서
+  8개 → 6개**(태스크 역할의 읽기 전용 4개를 합치면 12개 → 10개, 그쪽은 변경 없음)이며
+  12개 → 6개가 아닙니다. 그리고 ALB의 잘못된 헤더 폐기 속성이 충족하는 룰은
+  **`CKV_AWS_131`**이고 `CKV_AWS_103`이 아닙니다 — 후자는 리스너의 TLS 버전 검사로
+  `SslPolicy`가 충족합니다. 템플릿 주석에도 같은 오표기가 있었습니다.
+
+### 문서 (Docs)
+
+- VPC와 서브넷은 배포하는 계정이 소유해야 합니다: RAM으로 공유된(교차 계정) 서브넷은
+  **지원하지 않습니다.** v0.1.319에서 배포 역할의 EC2 권한을 `${AWS::AccountId}` 리소스로
+  스코핑했기 때문에, 공유 서브넷에 커넥터의 네트워크 인터페이스를 만들면 `AccessDenied`로
+  실패합니다(타 계정 소유 서브넷 ARN으로 시뮬레이션해 확인). `deploy/DEPLOYMENT.md`와
+  3개 언어 매뉴얼 §1에 명시했습니다.
+
 ## v0.1.319
 
 ### 변경 (Changed)
@@ -28,7 +83,8 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
   추측이 아니라 검증했습니다: `iam:SimulateCustomPolicy` 결과 EC2 28개 액션 전부가 자신이
   만드는 타입의 ARN에 대해 **allowed**, 다른 계정·다른 리전·다른 리소스 타입
   (`ec2:DeleteVpc`, `ec2:RunInstances`)·cdc 패밀리 밖 플러그인·타인의 알람에 대해서는
-  **implicitDeny**였습니다. 역할의 와일드카드 문장은 12개 → **6개**로 줄었고, 남은 6개는
+  **implicitDeny**였습니다. 이 역할의 와일드카드 문장은 8개 → **6개**로 줄었고(태스크 역할의
+  읽기 전용 4개까지 합치면 12개 → 10개, 그쪽은 변경 없음), 남은 6개는
   "이 API에 리소스 레벨 형태가 없다"는 이유와 함께 **명시적 allowlist로 테스트에 고정**되어
   새 `"*"` 문장이 들어오면 스위트가 깨집니다. `cloudformation.yaml`과
   `cloudformation-ec2.yaml`이 같은 역할을 부여하므로, 둘이 어긋나지 않도록 하는 테스트도

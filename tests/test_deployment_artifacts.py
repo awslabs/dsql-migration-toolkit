@@ -765,6 +765,64 @@ def test_cdc_deploy_role_ec2_writes_are_scoped_to_the_types_it_creates(
     assert all(a.startswith("ec2:Describe") for a in reads["Action"]), reads["Action"]
 
 
+def test_cdc_deploy_role_cannot_attach_an_arbitrary_managed_policy(
+    template: dict,
+) -> None:
+    """The escalation path this closes is real, so pin it rather than trust review.
+
+    With `iam:AttachRolePolicy` unrestricted on `role/mysql-dsql-cdc-*`, this role could
+    create a role in that family, attach `AdministratorAccess`, pass it to a Lambda it may
+    also create (`IamPassRoleToCdcServices` + `LambdaOffsetSeeder`), and invoke it --
+    account administrator. The cdc-stack attaches exactly ONE managed policy
+    (`AWSLambdaVPCAccessExecutionRole`, the only `ManagedPolicyArns` in cdc-stack.yaml), so
+    the grant is conditioned on that policy ARN. No scanner rule flags this now that the
+    wildcards are scoped, which is precisely why it needs a test.
+    """
+    stmts = [
+        s
+        for p in template["Resources"]["CdcDeployRole"]["Properties"]["Policies"]
+        for s in p["PolicyDocument"]["Statement"]
+    ]
+    attach = [
+        s
+        for s in stmts
+        if "iam:AttachRolePolicy"
+        in (s["Action"] if isinstance(s["Action"], list) else [s["Action"]])
+    ]
+    assert len(attach) == 1, "iam:AttachRolePolicy must live in exactly one statement"
+    condition = attach[0].get("Condition") or {}
+    rendered = json.dumps(condition)
+    assert "iam:PolicyARN" in rendered, (
+        "iam:AttachRolePolicy must be conditioned on iam:PolicyARN, or this role can "
+        f"attach AdministratorAccess to a mysql-dsql-cdc-* role (condition={condition!r})"
+    )
+    assert "AWSLambdaVPCAccessExecutionRole" in rendered, rendered
+    # The unconditioned role-management statement must NOT carry Attach/Detach.
+    others = [s for s in stmts if s.get("Sid") == "IamCdcStackRoles"]
+    assert others, "IamCdcStackRoles statement missing"
+    for s in others:
+        actions = s["Action"] if isinstance(s["Action"], list) else [s["Action"]]
+        assert "iam:AttachRolePolicy" not in actions
+        assert "iam:DetachRolePolicy" not in actions
+
+
+def test_cdc_deploy_role_grants_the_reads_cloudformation_actually_makes(
+    template: dict,
+) -> None:
+    # CloudTrail on a live cdc-stack create+delete showed CloudFormation calling
+    # ec2:DescribeSecurityGroupRules (once per SecurityGroupIngress/Egress resource) and
+    # ec2:DescribeNetworkAcls, both denied because neither was granted. The deploy survives
+    # on a CFN fallback; granting them removes an AccessDenied from every customer's trail.
+    stmts = [
+        s
+        for p in template["Resources"]["CdcDeployRole"]["Properties"]["Policies"]
+        for s in p["PolicyDocument"]["Statement"]
+    ]
+    reads = next(s for s in stmts if s.get("Sid") == "Ec2NetworkReads")
+    for action in ("ec2:DescribeSecurityGroupRules", "ec2:DescribeNetworkAcls"):
+        assert action in reads["Action"], f"{action} was denied on every real deploy"
+
+
 def test_cdc_deploy_role_wildcard_statements_are_an_explicit_allowlist(
     template: dict,
 ) -> None:

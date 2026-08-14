@@ -1025,6 +1025,18 @@ Resources:
                   - ec2:DescribeAvailabilityZones
                   - ec2:DescribeInternetGateways
                   - ec2:DescribeNetworkInterfaces
+                  # CloudFormation reads back each security-group RULE it just authorized
+                  # (one call per AWS::EC2::SecurityGroupIngress/Egress) and the VPC's
+                  # network ACLs before creating the SG. Neither was ever granted, so both
+                  # were DENIED on every real deploy -- CloudTrail on the live Seoul stack
+                  # shows Client.UnauthorizedOperation for DescribeSecurityGroupRules and
+                  # DescribeNetworkAcls, invokedBy cloudformation.amazonaws.com, on both
+                  # create and delete. The deploy survives (CFN falls back to the
+                  # Authorize* response for the rule ids), but it leaves AccessDenied in
+                  # every customer's trail and depends on that undocumented tolerance.
+                  # Read-only, and neither has a resource-level form.
+                  - ec2:DescribeSecurityGroupRules
+                  - ec2:DescribeNetworkAcls
                 Resource: "*"
               # Connector worker log group (CFN AWS::Logs::LogGroup).
               - Sid: ConnectorLogGroup
@@ -1093,6 +1105,14 @@ Resources:
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:mysql-dsql-cdc-*
               # IAM roles the cdc-stack auto-names (connector exec role + seeder role).
+              # NOTE the deliberate absence of iam:AttachRolePolicy here -- see the next
+              # statement. Together with iam:PassRole below and lambda:CreateFunction /
+              # InvokeFunction further down, an unrestricted AttachRolePolicy on this role
+              # family was a privilege-escalation path to account administrator: create
+              # mysql-dsql-cdc-<anything>, attach AdministratorAccess, pass the role to a
+              # Lambda this role may also create, invoke it. Nothing in the product needs
+              # that, and no scanner rule flags it now that the wildcards are scoped, so it
+              # is closed here explicitly rather than left to be re-derived.
               - Sid: IamCdcStackRoles
                 Effect: Allow
                 Action:
@@ -1105,11 +1125,33 @@ Resources:
                   - iam:ListRolePolicies
                   - iam:TagRole
                   - iam:UntagRole
-                  - iam:AttachRolePolicy
-                  - iam:DetachRolePolicy
                   - iam:ListAttachedRolePolicies
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/mysql-dsql-cdc-*
+              # The cdc-stack attaches exactly ONE managed policy: the seeder Lambda's
+              # AWSLambdaVPCAccessExecutionRole (deploy/cdc-stack/cdc-stack.yaml, the only
+              # ManagedPolicyArns in the template). So Attach/DetachRolePolicy is granted
+              # only for that policy ARN. Verified with iam:SimulateCustomPolicy: attaching
+              # AWSLambdaVPCAccessExecutionRole -> allowed, while AdministratorAccess and
+              # PowerUserAccess -> implicitDeny. iam:PolicyARN is a documented condition key
+              # for both actions (AWS service reference).
+              # RESIDUAL, knowingly accepted for now: iam:PutRolePolicy above can still
+              # write an inline policy of any content onto a mysql-dsql-cdc-* role, and IAM
+              # offers no policy-content condition for it -- only iam:PermissionsBoundary.
+              # Closing that means giving the cdc-stack roles a boundary policy and
+              # conditioning CreateRole/PutRolePolicy on it, which spans both stacks; it is
+              # tracked separately rather than bolted on here.
+              - Sid: IamCdcStackManagedPolicy
+                Effect: Allow
+                Action:
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/mysql-dsql-cdc-*
+                Condition:
+                  ArnEquals:
+                    iam:PolicyARN:
+                      Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
               # PassRole each cdc-stack role only to its service (MSK Connect / Lambda).
               - Sid: IamPassRoleToCdcServices
                 Effect: Allow

@@ -46,6 +46,8 @@ import time
 import pymysql
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _common import validate_identifier  # noqa: E402
 
 
 def load_dotenv(path: str) -> dict:
@@ -119,7 +121,10 @@ class Workload:
     def __init__(self, conn, schema: str, *, dry_run: bool = False,
                  op_log=None) -> None:
         self.conn = conn
-        self.s = schema
+        # --schema / CDC_WORKLOAD_SCHEMA is the one identifier here that comes from
+        # outside: it is interpolated into every statement through _q() below, and a
+        # schema name cannot be a bind parameter. Validate it once, at the boundary.
+        self.s = validate_identifier(schema, "schema")
         self.dry_run = dry_run
         # Optional ground-truth op log: one JSON line per applied change
         # {ts, op, table, pk}. Used by the consistency harness to reconcile
@@ -128,7 +133,8 @@ class Workload:
 
     # -- helpers --
     def _q(self, table: str) -> str:
-        return f"`{self.s}`.`{table}`"
+        """Quote ``schema.table``; both parts are validated identifiers."""
+        return f"`{self.s}`.`{validate_identifier(table, 'table')}`"
 
     def _scalar(self, sql: str, args=()):
         cur = self.conn.cursor()
@@ -142,6 +148,7 @@ class Workload:
         Uses ``LIMIT 1 OFFSET rand`` over a bounded window (the max pk) so it
         never scans the whole table -- fine for a test source.
         """
+        validate_identifier(pk, "pk column")
         mx = self._scalar(f"SELECT MAX(`{pk}`) FROM {self._q(table)}")
         if mx is None:
             return None

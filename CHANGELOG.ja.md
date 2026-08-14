@@ -5,6 +5,64 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.320
+
+### 修正 (Fixed)
+
+- **CDC デプロイロールからアカウント管理者になれる経路を閉じました。**
+  `iam:AttachRolePolicy` が `role/mysql-dsql-cdc-*` に対して**どのポリシーを付けるかの制約なし**
+  で許可されており、同じロールが `iam:CreateRole`・`iam:PassRole` (Lambda 向け)・
+  `lambda:CreateFunction`/`InvokeFunction` も保持していました。これは完全な権限昇格の連鎖です:
+  `mysql-dsql-cdc-<任意>` ロールを作成し、**`AdministratorAccess` をアタッチ**し、このロールが
+  作成できる Lambda に PassRole して呼び出す。Attach/Detach は独立したステートメントに分離し、
+  `iam:PolicyARN` が `AWSLambdaVPCAccessExecutionRole`
+  (`deploy/cdc-stack/cdc-stack.yaml` にある**唯一の** `ManagedPolicyArns` の値) である場合に
+  条件付けました。`iam:SimulateCustomPolicy` で検証:当該ポリシーのアタッチは **allowed**、
+  `AdministratorAccess` と `PowerUserAccess` は **implicitDeny**、`iam:CreateRole` は影響なし。
+
+  居心地は悪いですが明記します:この経路はスコープ作業**以前から**存在し、**v0.1.319 は
+  それに対するスキャナーのシグナルを消しました** — ワイルドカードをスコープした時点で
+  `CKV_AWS_109`(「permissions management without constraints」) が発火しなくなり、昇格経路は
+  残っていました。どのルールも捕まえてくれないため、条件をテストで固定しました。
+  意図的に残した残件:`iam:PutRolePolicy` は依然として `mysql-dsql-cdc-*` ロールに任意内容の
+  インラインポリシーを書けます。IAM にはポリシー内容の条件がなく (`iam:PermissionsBoundary`
+  のみ)、両スタックにまたがる boundary の導入が必要なため分離しました。
+
+- **すべての cdc-stack デプロイで拒否されていた読み取り権限 2 つを追加しました。**
+  ライブスタックの CloudTrail に、`ec2:DescribeSecurityGroupRules`
+  (`AWS::EC2::SecurityGroupIngress`/`Egress` リソースごとに 1 回) と
+  `ec2:DescribeNetworkAcls` が `Client.UnauthorizedOperation` として、
+  `cloudformation.amazonaws.com` の呼び出しで、create と delete の双方に残っていました。
+  そもそも一度も許可されていませんでした。CloudFormation が `Authorize*` の応答で代替する
+  ためデプロイは成功しますが、顧客の trail に AccessDenied が蓄積し、その文書化されていない
+  寛容さに依存することになります。どちらも読み取り専用でリソースレベルの形式がないため、
+  `Ec2NetworkReads` ステートメントに含めました。
+
+- **CDC ワークロードジェネレーターが、埋め込むスキーマ名を検証します。**
+  `scripts/cdc_workload_customers_sample_new.py` は `--schema` (または
+  `CDC_WORKLOAD_SCHEMA`) を受け取り、`_q()` ヘルパー経由ですべての文に埋め込みます。
+  v0.1.315 のスイープがこのファイルを見落としたのは、スイープが **`execute()` 呼び出し位置の
+  f-string** だけを grep しており、このスクリプトはヘルパーで先に SQL を組み立てるためです —
+  正しいスイープは構文ではなく**データの流れ**を追うべきという教訓です。行の値はすでに
+  バインドされており、スキーマ・テーブル・PK 列の識別子が
+  `_common.validate_identifier()` を通るようになりました。
+
+### 変更 (Changed)
+
+- 上記 v0.1.319 の記述 2 点を訂正しました:ワイルドカードステートメントは **CDC デプロイ
+  ロールで 8 個 → 6 個** (タスクロールの読み取り専用 4 個を含めれば 12 個 → 10 個、そちらは
+  変更なし) であり、12 個 → 6 個ではありません。また ALB の不正ヘッダー破棄属性が満たすルールは
+  **`CKV_AWS_131`** で、`CKV_AWS_103` ではありません — 後者はリスナーの TLS バージョン検査で、
+  `SslPolicy` が満たします。テンプレートのコメントにも同じ誤記がありました。
+
+### ドキュメント (Docs)
+
+- VPC とサブネットはデプロイ先のアカウントが所有している必要があります:RAM で共有された
+  (クロスアカウントの) サブネットは**サポートしません**。v0.1.319 でデプロイロールの EC2 権限を
+  `${AWS::AccountId}` のリソースにスコープしたため、共有サブネットにコネクタのネットワーク
+  インターフェイスを作成すると `AccessDenied` で失敗します (他アカウント所有のサブネット ARN で
+  シミュレーションして確認)。`deploy/DEPLOYMENT.md` と 3 言語のマニュアル §1 に明記しました。
+
 ## v0.1.319
 
 ### 変更 (Changed)
@@ -30,7 +88,8 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
   推測ではなく検証しました:`iam:SimulateCustomPolicy` の結果、EC2 の 28 アクションすべてが
   自身が作成するタイプの ARN に対して **allowed**、別アカウント・別リージョン・別リソースタイプ
   (`ec2:DeleteVpc`、`ec2:RunInstances`)・cdc ファミリー外のプラグイン・他者のアラームに対しては
-  **implicitDeny** でした。ロールのワイルドカードステートメントは 12 個 → **6 個**に減り、残る
+  **implicitDeny** でした。このロールのワイルドカードステートメントは 8 個 → **6 個**に減り
+  (タスクロールの読み取り専用 4 個を含めれば 12 個 → 10 個、そちらは変更なし)、残る
   6 個は「この API にリソースレベルの形式が存在しない」理由とともに**明示的な allowlist として
   テストで固定**したため、新しい `"*"` ステートメントが入るとスイートが失敗します。
   `cloudformation.yaml` と `cloudformation-ec2.yaml` は同じロールを付与するので、両者が乖離

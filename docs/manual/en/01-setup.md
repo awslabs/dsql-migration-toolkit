@@ -158,6 +158,11 @@ needed), the tool provisions its own S3 bucket and uploads artifacts itself, and
 the optional CDC infrastructure is auto-discovered (you supply only what truly
 can't be inferred, such as the VpcId).
 
+> **The VPC and its subnets must belong to the account you deploy into.** RAM-shared
+> (cross-account) subnets are not supported: the CDC deploy role's EC2 permissions are
+> scoped to this account's resources, so creating the connector's network interface in a
+> shared subnet fails with `AccessDenied`.
+
 > **Security note:** the deployed app enforces **no authentication of its own** —
 > it relies on the ALB's optional Cognito gate. An internet-facing ALB **without**
 > Cognito would expose the full migration tool; the deploy template's `Rules`

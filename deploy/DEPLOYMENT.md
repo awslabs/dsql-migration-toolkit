@@ -130,7 +130,7 @@ expose it publicly, see the override note under **Deploy the app-stack**.
 
 | Required | Parameter | What it is |
 | --- | --- | --- |
-| **VPC** | `VpcId` | The VPC above — recommended: the source DB's VPC, same region as DSQL. |
+| **VPC** | `VpcId` | The VPC above — recommended: the source DB's VPC, same region as DSQL. **Must be owned by this account:** RAM-shared (cross-account) VPCs/subnets are not supported, because the CDC deploy role's EC2 permissions are scoped to resources in the deploying account, so the connector's ENI create would fail with `AccessDenied`. |
 | **ALB subnets** | `AlbSubnetIds` | 2 subnets **of that VPC**, distinct AZs — private for an `internal` ALB (recommended), public for internet-facing. |
 | **Task subnets** | `ServiceSubnetIds` | 2 private subnets **of that VPC**, distinct AZs, with **egress on 443** (NAT gateway or VPC endpoints) to reach DSQL / Secrets Manager / ECR / CloudWatch. |
 | **ACM certificate** | `CertificateArn` | The **ARN** of an ACM certificate in the **same region** (`arn:aws:acm:<region>:<account>:certificate/<id>`) for the HTTPS listener. **Prod:** request a public ACM cert for a domain you own. **Quick test (no domain):** run `AWS_REGION=<region> deploy/create_test_cert.sh` and paste the `CertificateArn` it prints (self-signed; browsers warn). Copy an existing ARN from the ACM console. |

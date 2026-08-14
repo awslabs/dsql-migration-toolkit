@@ -5,6 +5,65 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.320
+
+### Fixed
+
+- **The CDC deploy role could no longer be used to become account administrator.**
+  `iam:AttachRolePolicy` was granted on `role/mysql-dsql-cdc-*` with no restriction on
+  *which* policy, and the same role holds `iam:CreateRole`, `iam:PassRole` (to Lambda) and
+  `lambda:CreateFunction`/`InvokeFunction`. That is a complete escalation chain: create
+  `mysql-dsql-cdc-<anything>`, attach `AdministratorAccess`, pass the role to a Lambda this
+  role may also create, invoke it. Attach/Detach now sit in their own statement conditioned
+  on `iam:PolicyARN` equal to `AWSLambdaVPCAccessExecutionRole` — the **only**
+  `ManagedPolicyArns` value in `deploy/cdc-stack/cdc-stack.yaml`. Verified with
+  `iam:SimulateCustomPolicy`: attaching that policy is **allowed**, while
+  `AdministratorAccess` and `PowerUserAccess` are **implicitDeny**, and `iam:CreateRole` is
+  unaffected.
+
+  Worth stating plainly, because it is the uncomfortable part: this path predates the
+  scoping work, and **v0.1.319 removed the scanner signal for it** — `CKV_AWS_109`
+  ("permissions management without constraints") stopped firing once the wildcards were
+  scoped, while the escalation remained. A test now pins the condition, since no rule will.
+  Residual, knowingly deferred: `iam:PutRolePolicy` can still write an inline policy of any
+  content onto a `mysql-dsql-cdc-*` role, and IAM offers no policy-content condition for it
+  — only `iam:PermissionsBoundary`, which means giving the cdc-stack roles a boundary and
+  conditioning role creation on it across both stacks.
+
+- **Two reads CloudFormation makes on every cdc-stack deploy are no longer denied.**
+  CloudTrail on a live stack shows `ec2:DescribeSecurityGroupRules` (once per
+  `AWS::EC2::SecurityGroupIngress`/`Egress` resource) and `ec2:DescribeNetworkAcls` returning
+  `Client.UnauthorizedOperation`, invoked by `cloudformation.amazonaws.com`, on both create
+  and delete. Neither was ever granted. The deploy survives because CloudFormation falls back
+  to the `Authorize*` response for the rule ids, but every customer's trail collected
+  AccessDenied entries and the deploy depended on that undocumented tolerance. Both are
+  read-only and neither has a resource-level form, so they join the `Ec2NetworkReads`
+  statement.
+
+- **The CDC workload generator validates the schema name it interpolates.**
+  `scripts/cdc_workload_customers_sample_new.py` takes `--schema` (or
+  `CDC_WORKLOAD_SCHEMA`) and interpolates it into every statement through its `_q()` helper.
+  It was missed by the v0.1.315 sweep because that sweep grepped for f-strings **at the
+  `execute()` call**, and this script builds the SQL in a helper first — a reminder that the
+  right sweep follows the data, not the syntax. Row values were already bound; the schema,
+  table and PK-column identifiers now go through `_common.validate_identifier()`.
+
+### Changed
+
+- Corrected two claims in the v0.1.319 notes above: the wildcard-statement count went from
+  **8 to 6 on the CDC deploy role** (12 to 10 counting the task role's four read-only
+  statements, which did not change), not 12 to 6; and the ALB drop-invalid-headers attribute
+  satisfies **`CKV_AWS_131`**, not `CKV_AWS_103` — the latter is the listener's TLS-version
+  check, satisfied by `SslPolicy`. The template comment carried the same mislabel.
+
+### Docs
+
+- The VPC and its subnets must belong to the deploying account: RAM-shared (cross-account)
+  subnets are **not** supported, because v0.1.319 scoped the deploy role's EC2 permissions to
+  `${AWS::AccountId}` resources, so creating the connector's network interface in a shared
+  subnet fails with `AccessDenied` (confirmed by simulating against a foreign-owner subnet
+  ARN). Stated in `deploy/DEPLOYMENT.md` and §1 of the manual in all three languages.
+
 ## v0.1.319
 
 ### Changed
@@ -32,7 +91,8 @@ All notable changes to this project are recorded here. This project follows
   28 EC2 actions against an ARN of the type they create, and **implicitDeny** for the
   same action in another account, another region, another resource type
   (`ec2:DeleteVpc`, `ec2:RunInstances`), a plugin outside the cdc family, or another
-  account's alarm. Wildcard statements on the role drop from 12 to 6 — and the six that
+  account's alarm. Wildcard statements on this role drop from 8 to 6 (12 to 10 counting
+  the task role's four read-only ones, which are unchanged) — and the six that
   remain are pinned by a test as an explicit allowlist, each with the reason its API
   has no resource-level form, so a new `"*"` statement fails the suite. A second test
   keeps `cloudformation.yaml` and `cloudformation-ec2.yaml` from drifting, since both
