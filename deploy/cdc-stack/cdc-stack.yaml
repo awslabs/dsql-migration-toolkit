@@ -735,9 +735,14 @@ Resources:
   # closed (see the ReadConnectorWorkerLogs comment in cloudformation.yaml). A key
   # shared from the app stack adds a second hazard: the CDC stack is created and deleted
   # repeatedly inside one migration, so deleting the app stack first would schedule the
-  # key for deletion and make already-written logs permanently unreadable. The content
-  # is bounded anyway -- connector/task state plus Kafka coordinates and a sqlstate; a
-  # quarantined row's payload goes to the Kafka DLQ topic, never here.
+  # key for deletion and make already-written logs permanently unreadable.
+  # On content: connector/task state, Kafka coordinates, a sqlstate and the server's
+  # primary error message. An earlier version of this comment claimed a quarantined row's
+  # payload "goes to the Kafka DLQ topic, never here" -- that was WRONG until plugin v29:
+  # pgjdbc appends the server's DETAIL to getMessage(), and DETAIL is the failing row.
+  # DsqlSinkTask.safeCauseMessage now strips it (v0.1.321). What can still appear is a
+  # single offending literal for the SQLSTATEs where the server puts it in the primary
+  # message; the row itself cannot.
   ConnectorLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
