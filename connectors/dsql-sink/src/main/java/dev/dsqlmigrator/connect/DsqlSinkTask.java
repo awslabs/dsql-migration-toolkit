@@ -29,6 +29,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
+
+import org.postgresql.util.PSQLException;
+import org.postgresql.util.ServerErrorMessage;
 import java.util.regex.Pattern;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
@@ -576,13 +579,16 @@ public class DsqlSinkTask extends SinkTask {
   private void reportOrThrow(SinkRecord record, Exception cause) {
     // No ChangeEvent on this path (the envelope did not parse, or the size guard
     // fired before batching), so read the PK straight off the Connect record key.
-    quarantine(record, cause, cause.getMessage() + pkSuffix(formatPk(record.key())));
+    quarantine(record, cause, safeCauseMessage(cause) + pkSuffix(formatPk(record.key())));
   }
 
   /**
    * Quarantine a row whose DSQL write failed, annotating the reason with the
    * rendered SQL TEMPLATE (column names only; every value is a {@code ?}
-   * placeholder, so no row values or credentials are emitted — Property 7). The
+   * placeholder). The driver message goes through {@link #safeCauseMessage} first,
+   * because pgjdbc appends the server's DETAIL -- which carries row values -- to
+   * {@code getMessage()}; that was the one path by which a failing row could reach
+   * CloudWatch Logs (Property 7). The
    * SQL is re-rendered here, on the quarantine path only (not the hot path), so a
    * reader of the DLQ log / UI sees the exact statement shape DSQL rejected
    * (e.g. an {@code INSERT} referencing a column the target lacks) without a
@@ -605,11 +611,47 @@ public class DsqlSinkTask extends SinkTask {
     // type-converted and covers the delete before-image fallback where the record
     // key is empty.
     String pk = pkSuffix(formatPk(event.pkColumns(), event.pkValues()));
-    String reason =
-        sql == null
-            ? cause.getMessage() + pk
-            : cause.getMessage() + pk + " | sql: " + sql;
+    String message = safeCauseMessage(cause);
+    String reason = sql == null ? message + pk : message + pk + " | sql: " + sql;
     quarantine(record, cause, sqlStateTag(cause) + reason);
+  }
+
+  /**
+   * The driver's message with the server's VALUE-BEARING fields removed.
+   *
+   * <p>pgjdbc builds {@code SQLException.getMessage()} from
+   * {@code ServerErrorMessage.toString()}, which appends the server's {@code Detail},
+   * {@code Hint} and {@code Where} lines -- and DETAIL carries ROW VALUES: a not-null
+   * violation reports {@code Failing row contains (1, alice@example.com, ...)} and a unique
+   * violation reports {@code Key (id)=(42) already exists}. The quarantine reason is
+   * {@code log.warn}'d, so it lands in CloudWatch Logs, where the row is NOT otherwise
+   * present -- unlike the Kafka DLQ record, whose value already IS the row and which still
+   * receives the unmodified exception. So only the server's PRIMARY message is used here,
+   * plus the constraint name when the server named one (an identifier, not a value).
+   *
+   * <p>Honest limit: for a few SQLSTATEs the server puts the offending literal in the
+   * PRIMARY message itself ({@code 22P02: invalid input syntax for type integer: "abc"}), so
+   * this bounds the exposure to one value rather than eliminating it. A full failing row can
+   * no longer reach the log.
+   */
+  static String safeCauseMessage(Throwable cause) {
+    for (Throwable current = cause; current != null; current = current.getCause()) {
+      if (current instanceof PSQLException) {
+        ServerErrorMessage server = ((PSQLException) current).getServerErrorMessage();
+        if (server != null) {
+          String primary = server.getMessage();
+          if (primary != null && !primary.isEmpty()) {
+            String constraint = server.getConstraint();
+            return (constraint == null || constraint.isEmpty())
+                ? primary
+                : primary + " [constraint: " + constraint + "]";
+          }
+        }
+      }
+    }
+    // Client-side failures (connection closed, token expiry, driver errors) carry no row
+    // data, so their message is used as-is.
+    return cause == null ? "" : String.valueOf(cause.getMessage());
   }
 
   /**

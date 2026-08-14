@@ -5,6 +5,38 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.321
+
+### 수정 (Fixed)
+
+- **격리된 행의 값이 CloudWatch Logs로 갈 수 있었고, 이제 sink가 그것을 제거합니다.**
+  DSQL sink는 DLQ 격리 사유를 `SQLException.getMessage()`로 만들었는데, pgjdbc는 그것을
+  `ServerErrorMessage.toString()`으로 만들며 여기에 서버의 `DETAIL` 필드가 붙습니다.
+  not-null 위반에서 DETAIL은 **실패한 행 자체**이고
+  (`Failing row contains (42, alice@example.com, …)`), unique 위반에서는 충돌한 키 값입니다.
+  이 사유는 `log.warn`으로 남으므로 커넥터의 CloudWatch 로그 그룹에 들어갔습니다 — 그 행이
+  달리 존재하지 않는 곳입니다. Kafka DLQ 레코드는 애초에 문제가 아니었고(그 값이 이미 행
+  자체입니다) 지금도 원본 예외를 그대로 받습니다.
+
+  `DsqlSinkTask.safeCauseMessage()`가 cause 체인을 따라가며 서버 오류에 대해서는 **primary
+  메시지만** 취하고, 서버가 제약 이름을 준 경우 그것(값이 아니라 식별자)을 덧붙입니다.
+  클라이언트 측 실패(연결 종료, 토큰 만료)는 서버 메시지가 없으므로 그대로 통과시킵니다.
+  단위 테스트 2개로 고정했으며, 그중 하나는 **원본 드라이버 메시지가 실제로 행을 유출한다**는
+  전제까지 단정합니다 — pgjdbc가 DETAIL을 더 이상 붙이지 않게 되어 이 가드가 죽은 코드가 되면
+  테스트가 깨집니다.
+
+  이전 주석이 과잉 주장했으므로 정확히 적습니다: 이 조치는 노출을 **줄이는** 것이고 없애는 것이
+  아닙니다. 일부 SQLSTATE에서는 서버가 문제의 리터럴을 primary 메시지에 넣습니다
+  (`22P02: invalid input syntax for type integer: "abc"`). 즉 최대 한 개의 값은 여전히 나타날
+  수 있지만, 실패한 행 전체는 더 이상 로그에 도달하지 않습니다.
+
+  같은 변경에서 그 강한 거짓 주장을 담고 있던 주석 두 곳을 정정했습니다: 격리 사유 생성부의
+  Javadoc과 `core/cdc_dlq.py`의 `parse_dlq_log_message` 독스트링입니다.
+
+  **배포**: sink jar 변경이므로 `PLUGIN_VERSION`을 `v29`로 올렸습니다. MSK Connect 커스텀
+  플러그인은 immutable이라, 이미 배포된 CDC는 **Delete CDC infra → Deploy CDC infra**를 해야
+  반영됩니다(Start CDC만으로는 플러그인이 재등록되지 않습니다).
+
 ## v0.1.320
 
 ### 수정 (Fixed)

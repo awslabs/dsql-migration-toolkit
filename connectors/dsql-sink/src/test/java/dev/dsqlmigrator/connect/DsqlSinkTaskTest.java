@@ -24,6 +24,9 @@ import java.math.BigInteger;
 import java.sql.SQLException;
 import java.sql.SQLNonTransientConnectionException;
 import java.sql.SQLRecoverableException;
+
+import org.postgresql.util.PSQLException;
+import org.postgresql.util.ServerErrorMessage;
 import java.util.List;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
@@ -89,6 +92,42 @@ class DsqlSinkTaskTest {
         new SQLException("not null violation", "23502")));
     assertEquals("sqlstate=42804 ", DsqlSinkTask.sqlStateTag(
         new SQLException("datatype mismatch", "42804")));
+  }
+
+  @Test
+  void safeCauseMessageDropsTheServerDetailThatCarriesRowValues() throws Exception {
+    // pgjdbc's getMessage() is ServerErrorMessage.toString(), which appends the server's
+    // DETAIL -- and for a not-null violation DETAIL is the FAILING ROW. The quarantine
+    // reason is logged to CloudWatch, where the row is not otherwise present, so the
+    // reason must carry the primary message only (Property 7). Built from the wire format
+    // pgjdbc parses: field-type byte + value, NUL-separated.
+    String wire = "SERROR\u0000C23502\u0000M"
+        + "null value in column \"email\" of relation \"customers\" violates not-null constraint"
+        + "\u0000DFailing row contains (42, alice@example.com, 555-0100)."
+        + "\u0000ncustomers_email_not_null\u0000";
+    ServerErrorMessage server = new ServerErrorMessage(wire);
+    PSQLException cause = new PSQLException(server);
+
+    // Precondition: the raw driver message really does leak the row (else this test proves
+    // nothing) ...
+    assertTrue(cause.getMessage().contains("alice@example.com"),
+        "expected pgjdbc to append DETAIL to getMessage(); it did not: " + cause.getMessage());
+
+    String safe = DsqlSinkTask.safeCauseMessage(cause);
+    assertFalse(safe.contains("alice@example.com"), "row value leaked into the reason: " + safe);
+    assertFalse(safe.contains("Failing row"), "DETAIL leaked into the reason: " + safe);
+    // ... while the diagnostic value is kept: the primary message and the constraint name.
+    assertTrue(safe.contains("violates not-null constraint"), safe);
+    assertTrue(safe.contains("customers_email_not_null"), safe);
+  }
+
+  @Test
+  void safeCauseMessageFallsBackToTheDriverMessageForClientSideFailures() {
+    // A connection drop or token expiry has no ServerErrorMessage and carries no row data,
+    // so the message is used as-is rather than being blanked.
+    assertEquals("This connection has been closed.",
+        DsqlSinkTask.safeCauseMessage(new SQLException("This connection has been closed.")));
+    assertEquals("", DsqlSinkTask.safeCauseMessage(null));
   }
 
   @Test

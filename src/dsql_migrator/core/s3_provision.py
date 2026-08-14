@@ -51,6 +51,15 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v29 rebuilds the sink plugin so a quarantine reason carries the server's PRIMARY
+#    error message only. pgjdbc builds SQLException.getMessage() from
+#    ServerErrorMessage.toString(), which appends the server's DETAIL -- and DETAIL is
+#    the FAILING ROW for a not-null violation and the conflicting KEY VALUE for a unique
+#    violation. That reason is log.warn'd, so a row could reach CloudWatch Logs, where it
+#    is not otherwise present (the Kafka DLQ record, whose value already IS the row, still
+#    gets the unmodified exception). DsqlSinkTask.safeCauseMessage now takes the primary
+#    message plus the constraint name; a unit test asserts the raw driver message leaks
+#    and the sanitized one does not. Sink-jar change only.
 # v28 rebuilds the DSQL sink jar so a DSQL-apply quarantine log line is PREFIXED with
 #    "sqlstate=<state> ". pgjdbc's getMessage() does not carry the SQLSTATE, so the
 #    control plane previously could not tell an ordinary poison row from a
@@ -253,7 +262,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v28"
+PLUGIN_VERSION = "v29"
 
 
 class S3ProvisionError(RuntimeError):

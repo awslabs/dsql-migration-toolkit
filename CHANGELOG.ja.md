@@ -5,6 +5,39 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.321
+
+### 修正 (Fixed)
+
+- **隔離された行の値が CloudWatch Logs に到達し得ました。sink がそれを除去します。**
+  DSQL sink は DLQ 隔離理由を `SQLException.getMessage()` から組み立てていましたが、pgjdbc は
+  それを `ServerErrorMessage.toString()` から作り、そこにサーバーの `DETAIL` フィールドが
+  付加されます。not-null 違反では DETAIL は**失敗した行そのもの**
+  (`Failing row contains (42, alice@example.com, …)`)、unique 違反では衝突したキー値です。
+  この理由は `log.warn` されるため、コネクターの CloudWatch ロググループに入っていました —
+  その行が他には存在しない場所です。Kafka DLQ レコードは元から問題ではなく (その値がすでに行
+  そのものです)、今も未加工の例外を受け取ります。
+
+  `DsqlSinkTask.safeCauseMessage()` が cause チェーンを辿り、サーバーエラーについては
+  **primary メッセージのみ**を採り、サーバーが制約名を返した場合はそれ (値ではなく識別子) を
+  付けます。クライアント側の失敗 (接続切断、トークン失効) はサーバーメッセージを持たないため
+  そのまま通します。ユニットテスト 2 本で固定し、うち 1 本は**未加工のドライバーメッセージが
+  実際に行を漏らす**という前提まで検証します — pgjdbc が DETAIL を付加しなくなり、このガードが
+  デッドコードになればテストが失敗します。
+
+  以前のコメントが過剰に主張していたため、正確に記します:この対処は露出を**限定する**もので、
+  なくすものではありません。一部の SQLSTATE ではサーバーが問題のリテラルを primary メッセージ
+  自体に入れます (`22P02: invalid input syntax for type integer: "abc"`)。つまり最大 1 個の値は
+  依然として現れ得ますが、失敗した行の全体がログに到達することはなくなりました。
+
+  同じ変更で、その強い誤った主張を含んでいた 2 か所のコメントを訂正しました:隔離理由を組み立てる
+  箇所の Javadoc と、`core/cdc_dlq.py` の `parse_dlq_log_message` の docstring です。
+
+  **デプロイ**: sink jar の変更なので `PLUGIN_VERSION` を `v29` に上げました。MSK Connect の
+  カスタムプラグインは immutable なので、既存の CDC デプロイに反映するには
+  **Delete CDC infra → Deploy CDC infra** が必要です (Start CDC だけではプラグインは再登録
+  されません)。
+
 ## v0.1.320
 
 ### 修正 (Fixed)

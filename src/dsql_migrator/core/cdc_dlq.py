@@ -77,8 +77,15 @@ def parse_dlq_log_message(
     INSERT INTO ... VALUES (?, ?) ON CONFLICT ...``) -- column names with ``?``
     placeholders only -- and/or the failed row's primary key (``... | pk: id=14``,
     column names always, surrogate values only, natural-key values withheld). Both
-    ride through this parser inside the reason with no special handling, so it
-    still carries no arbitrary row values and no credentials (Property 7).
+    ride through this parser inside the reason with no special handling.
+
+    On row values (Property 7): the sink strips the server's ``DETAIL`` field from the
+    driver message before logging (``DsqlSinkTask.safeCauseMessage``, plugin v29),
+    because pgjdbc appends it to ``getMessage()`` and DETAIL is the FAILING ROW for a
+    not-null violation. Before v29 a row could arrive here. What can still appear is a
+    single offending literal for the few SQLSTATEs where the server puts it in the
+    PRIMARY message (``22P02: invalid input syntax for type integer: "abc"``), so this
+    parser bounds the message length rather than assuming it is value-free.
     """
     if not message:
         return None

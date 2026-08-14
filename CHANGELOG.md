@@ -5,6 +5,40 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.321
+
+### Fixed
+
+- **A quarantined row's values could reach CloudWatch Logs; the sink now strips them.**
+  The DSQL sink built its DLQ quarantine reason from `SQLException.getMessage()`, and pgjdbc
+  builds that from `ServerErrorMessage.toString()` — which appends the server's `DETAIL`
+  field. For a not-null violation DETAIL **is the failing row**
+  (`Failing row contains (42, alice@example.com, …)`); for a unique violation it is the
+  conflicting key value. That reason is `log.warn`'d, so it landed in the connector's
+  CloudWatch log group, where the row is not otherwise present. The Kafka DLQ record was
+  never the problem — its value already *is* the row — and it still receives the unmodified
+  exception.
+
+  `DsqlSinkTask.safeCauseMessage()` now walks the cause chain, and for a server error takes
+  the **primary message only**, plus the constraint name when the server named one (an
+  identifier, not a value). Client-side failures (connection closed, token expiry) have no
+  server message and are passed through unchanged. Two unit tests pin it, including a
+  precondition assertion that the *raw* driver message really does leak the row — so the test
+  fails if pgjdbc ever stops appending DETAIL and the guard becomes dead code.
+
+  Stated precisely, because the previous comment over-claimed: this bounds the exposure, it
+  does not eliminate it. For a few SQLSTATEs the server puts the offending literal in the
+  primary message itself (`22P02: invalid input syntax for type integer: "abc"`), so at most
+  one value can still appear. A full failing row can no longer reach the log.
+
+  Two comments that asserted the stronger, false claim are corrected in the same change:
+  the Javadoc beside the quarantine builder and the `parse_dlq_log_message` docstring in
+  `core/cdc_dlq.py`.
+
+  **Deployment**: sink-jar change, so `PLUGIN_VERSION` is bumped to `v29`. MSK Connect custom
+  plugins are immutable, so an existing CDC deployment needs **Delete CDC infra → Deploy CDC
+  infra** to pick it up; Start CDC alone will not re-register the plugin.
+
 ## v0.1.320
 
 ### Fixed
