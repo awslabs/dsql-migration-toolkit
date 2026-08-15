@@ -542,8 +542,15 @@ def test_keyset_stream_supports_composite_primary_key() -> None:
         sql for sql, _ in connection.executed if sql.strip().upper().startswith("SELECT")
     ]
     assert "WHERE" not in selects[0]
-    # Later pages use a row-value tuple comparison on the composite key.
-    assert any("(`tenant_id`, `id`) >" in sql for sql in selects[1:])
+    # Later pages use the index-friendly lexicographic keyset EXPANSION -- not the row-value
+    # tuple form, which only uses the PK index on MySQL 8.0.14+ (a 5.7-compatible source would
+    # full-scan per page).
+    assert any(
+        "`tenant_id` > :last_0" in sql
+        and "`tenant_id` = :last_0 AND `id` > :last_1" in sql
+        for sql in selects[1:]
+    )
+    assert not any("(`tenant_id`, `id`) >" in sql for sql in selects)  # no row-value form
     # The advanced bind params carry the previous page's last composite key.
     page_params = [params for sql, params in connection.executed if "WHERE" in sql]
     assert page_params[0]["last_0"] == 1 and page_params[0]["last_1"] == 5

@@ -5,6 +5,37 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.325
+
+### 수정 (Fixed)
+
+- **Full Load 리뷰 수정(정합성·효율성·메모리 상한).** Full Load 데이터 경로 리뷰 후속:
+  - *NONE 모드(clean-load) 배치가 재시도 시 잘못 quarantine될 수 있었습니다.* plain INSERT가 커밋됐지만
+    ack가 일시적 끊김으로 유실되면 OCC 재실행이 23505를 만나 이미 존재하는 배치 전체를 이진 분할·quarantine
+    (유령 데이터 손실)했습니다. 이제 NONE 모드의 23505는 SELECT-existing + insert-missing으로 멱등 복구합니다.
+  - *체계적 데이터 오류가 무한 quarantine될 수 있었습니다.* 컬럼 전체 실패(예: 모든 값이 DSQL 1 MiB 초과)가
+    매 배치를 단일 행까지 분할하며 행마다 quarantine 레코드를 무한 추가했습니다. 이제 보존 레코드를 캡하고,
+    캡 초과 시 loud 실패해 근본 원인을 고치도록 합니다(테이블 대부분을 조용히 드롭하지 않음).
+  - *복합 PK keyset 내보내기가 페이지마다 풀스캔으로 퇴화할 수 있었습니다.* row-value 커서
+    `(a, b) > (?, ?)`는 MySQL 8.0.14+에서만 PK 인덱스를 씁니다. 5.7 호환 소스(RDS MySQL 5.7 / Aurora MySQL 2)
+    에선 페이지마다 풀스캔(O(n²))이었습니다. 이제 커서는 모든 버전에서 인덱스를 쓰는 명시적 확장
+    `(a > ?) OR (a = ? AND b > ?) OR ...`입니다(바인드 파라미터 동일, lexicographic 동치).
+  - *SKIP_EXISTING가 배치마다 INSERT 문을 재구성했습니다.* 주요 append/resume/CDC 공존 경로가 이제 다른
+    모드처럼 캐시된 문을 재사용합니다(배치마다 ~4만 placeholder 재구성 제거).
+
+## v0.1.324
+
+### 수정 (Fixed)
+
+- **풀 커넥션 생성 중 일시적 연결 실패가 풀을 영구히 줄여 Full Load 전체를 교착시킬 수 있었습니다.**
+  `_ConnectionPool.lease`가 큐에서 슬롯 토큰을 꺼낸 뒤, 그것을 되채우는 try/finally **밖에서** 연결을
+  생성해, factory 예외(버스트 시 DSQL 신규 연결 rate-limit, IAM 토큰 mint blip)가 슬롯을 영구 유실시켰습니다.
+  연결 실패는 transient로 분류돼 재시도되므로 blip이 반복되면 모든 슬롯이 고갈되고, 다음 lease의 타임아웃
+  없는 `get()`이 영원히 블록 → 워커 스레드 전체가 에러도 진행도 없이 wedge. 이제 생성 실패 시 예외를
+  재-raise하기 전에 슬롯을 되채워, OCC 재시도가 다시 lease해 새 연결을 생성합니다. 생성-실패 경로 테스트 추가.
+- **ECR Public 기본 이미지 태그를 `0.1.303` → `0.1.314`로 갱신**(실제 게시된 최신 빌드)해, 신규 고객의
+  기본 CloudFormation 배포가 21 릴리스 낡은 빌드를 받지 않도록 했습니다.
+
 ## v0.1.323
 
 ### 수정 (Fixed)

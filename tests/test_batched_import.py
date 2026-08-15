@@ -1355,6 +1355,60 @@ def test_retryable_error_exhausted_fails_batch_not_quarantined() -> None:
     assert result.quarantined == 0
 
 
+def test_none_mode_recovers_from_post_commit_retry_conflict_without_quarantine() -> None:
+    # NONE (clean load into an empty target). If a batch commits but the ack is lost and the
+    # OCC retry replays the plain INSERT, the replay hits 23505 (all keys now exist). That must
+    # be recovered as "already applied" (SELECT-existing -> nothing missing), NOT binary-split
+    # and quarantined as phantom data loss.
+    store = _FakeStore()
+    columns, key_columns = ["id", "name"], ["id"]
+    rows = _rows(10)
+    store.seed(rows, key_columns)  # the batch already committed on a prior (un-acked) attempt
+    importer = _importer(
+        store,
+        columns,
+        key_columns,
+        options=BatchedImportOptions(on_conflict=OnConflictMode.NONE, batch_size=10),
+    )
+
+    result = importer.import_rows(
+        iter(rows), _table(columns=("id", "name")), key_columns=key_columns
+    )
+
+    assert result.quarantined == 0  # nothing falsely quarantined
+    assert result.failures == 0
+    assert result.rows_loaded == 0  # every row already present
+    assert len(store.rows) == 10  # no duplicates, no loss
+
+
+def test_quarantine_is_capped_and_a_systematic_error_fails_fast(monkeypatch) -> None:
+    # A systematically-bad batch must not binary-split down to single rows and quarantine every
+    # one without bound. Past the cap the load fails loudly and the retained records stay
+    # bounded, so a pathological column cannot exhaust memory or silently drop the table.
+    import dsql_migrator.core.batched_import as bi
+
+    monkeypatch.setattr(bi, "_MAX_QUARANTINE_RECORDS", 3)
+
+    store = _FakeStore()
+    columns, key_columns = ["id", "name"], ["id"]
+    rows = _rows(8)
+    store.poison_keys = {(row["id"],) for row in rows}  # every row permanently fails
+    importer = _importer(
+        store,
+        columns,
+        key_columns,
+        options=BatchedImportOptions(on_conflict=OnConflictMode.NONE, batch_size=8),
+    )
+
+    result = importer.import_rows(
+        iter(rows), _table(columns=("id", "name")), key_columns=key_columns
+    )
+
+    assert result.failures >= 1  # aborted loudly, not silently dropped
+    assert result.quarantined <= 3  # stopped at the cap, not all 8
+    assert len(result.quarantine_records) <= 3  # retained list bounded by the cap
+
+
 def test_pool_discards_connection_after_in_use_error() -> None:
     from dsql_migrator.core.batched_import import _ConnectionPool
 
@@ -1381,6 +1435,41 @@ def test_pool_discards_connection_after_in_use_error() -> None:
     with pool.lease() as conn2:
         assert conn2 is not created[0]
     assert len(created) == 2
+
+
+def test_pool_refills_slot_when_the_factory_raises_on_create() -> None:
+    # Regression: the slot token is pulled from the queue BEFORE the factory runs, and the
+    # create was outside the try/finally, so a factory exception (a transient connect failure
+    # -- which is retried) permanently lost the slot. Enough such blips drained the pool and
+    # the next lease's untimed get() blocked forever, deadlocking the whole load. A factory
+    # failure must refill the slot so the pool never shrinks.
+    from dsql_migrator.core.batched_import import _ConnectionPool
+
+    attempts = {"n": 0}
+
+    class _Conn:
+        def close(self) -> None:
+            pass
+
+    def flaky_factory():
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("connection timeout expired")  # transient connect blip
+        return _Conn()
+
+    pool = _ConnectionPool(flaky_factory, size=1)
+
+    # A create failure must NOT consume the only slot (checked via qsize so a regression
+    # surfaces here instead of hanging on the next lease's blocking get()).
+    with pytest.raises(RuntimeError):
+        with pool.lease():
+            pass  # unreachable: the factory raised before yield
+    assert pool._slots.qsize() == 1  # slot refilled -- pool did not shrink
+
+    # ...so the pool still leases once the factory recovers (no deadlock).
+    with pool.lease() as conn:
+        assert conn is not None
+    assert attempts["n"] == 2
 
 
 # ---------------------------------------------------------------------------

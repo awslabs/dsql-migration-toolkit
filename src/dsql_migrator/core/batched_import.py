@@ -526,7 +526,19 @@ class _ConnectionPool:
         """
         connection = self._slots.get()
         if connection is None:
-            connection = self._factory()
+            try:
+                connection = self._factory()
+            except BaseException:
+                # Creating the connection failed (e.g. DSQL's new-connection rate limit under
+                # a burst, or an IAM-token mint blip). The slot token was already pulled from
+                # the queue above, and this is BEFORE the try/finally that would refill it, so
+                # without putting an empty slot back the pool shrinks by one PERMANENTLY. A
+                # connect failure is classified transient and retried, so repeated blips would
+                # drain every slot until the next self._slots.get() blocks forever (no
+                # timeout) -- deadlocking the whole load. Refill the slot, then re-raise so the
+                # OCC retry can lease again and re-create a fresh connection.
+                self._slots.put(None)
+                raise
             with self._lock:
                 self._created.append(connection)
         ok = False
@@ -553,6 +565,14 @@ class _ConnectionPool:
             self._created.clear()
         for connection in created:
             _safe_close(connection)
+
+
+# Cap on quarantine records retained, and -- once exceeded -- the signal to STOP. A
+# systematic data error (e.g. a whole column over DSQL's 1 MiB per-value limit) would
+# otherwise binary-split every batch down to single rows (O(rows) transactions) and append a
+# QuarantineRecord per row without bound. Beyond the cap the load fails loudly so the operator
+# fixes the root cause instead of the tool silently quarantining a huge fraction of the table.
+_MAX_QUARANTINE_RECORDS = 1000
 
 
 class BatchedImporter:
@@ -602,6 +622,9 @@ class BatchedImporter:
         # parallel batch workers can append). Reset at the start of each
         # import_rows call so the result reflects only that call.
         self._quarantine: list[QuarantineRecord] = []
+        # Total poison rows seen this load (the retained list is capped at
+        # _MAX_QUARANTINE_RECORDS; this counts every one so the result reports the true total).
+        self._quarantine_total = 0
         self._quarantine_lock = threading.Lock()
         # Statement cache: identical (table, columns, num_rows, on_conflict,
         # key_columns) tuples reuse the same sql.Composed object. For a typical
@@ -697,6 +720,7 @@ class BatchedImporter:
         pool = _ConnectionPool(self._connection_factory, self._options.parallelism)
         with self._quarantine_lock:
             self._quarantine = []
+            self._quarantine_total = 0
         try:
             outcomes, stopped_early = self._run_data_batches(
                 work_iters, pool, on_batch_loaded, should_cancel
@@ -725,7 +749,9 @@ class BatchedImporter:
         result.index_failures = list(index_failures)
         with self._quarantine_lock:
             quarantined = list(self._quarantine)
-        result.quarantined = len(quarantined)
+            quarantined_total = self._quarantine_total
+        # Report the TRUE total (the retained records are capped at _MAX_QUARANTINE_RECORDS).
+        result.quarantined = quarantined_total
         result.quarantine_records = quarantined
         return result
 
@@ -1028,6 +1054,16 @@ class BatchedImporter:
         rows are accumulated on the importer's quarantine sink (read via
         :meth:`import_rows`'s result).
         """
+        if self._quarantine_total >= _MAX_QUARANTINE_RECORDS:
+            # A systematic data error has already quarantined the cap's worth of rows; stop
+            # binary-splitting and quarantining unboundedly and fail loudly so the operator
+            # fixes the root cause (see _MAX_QUARANTINE_RECORDS) instead of the tool silently
+            # dropping a huge fraction of the table.
+            raise BatchedImportError(
+                f"table '{work.table_name}': quarantine cap ({_MAX_QUARANTINE_RECORDS}) "
+                "reached -- too many rows failed with a permanent data error; aborting so the "
+                "systematic cause is fixed rather than silently dropping more rows."
+            )
         try:
             return self._execute_for_mode(work, pool)
         except Exception as exc:  # noqa: BLE001 - classify retryable vs poison
@@ -1051,7 +1087,13 @@ class BatchedImporter:
             return left_inserted + right_inserted, left_conflicts + right_conflicts
 
     def _quarantine_one(self, work: _BatchWork, exc: BaseException) -> None:
-        """Record one poison row (PK + reason only) to the quarantine sink."""
+        """Record one poison row (PK + reason only) to the quarantine sink.
+
+        Every poison row bumps ``_quarantine_total`` so the result reports the true count, but
+        the retained list is capped at ``_MAX_QUARANTINE_RECORDS`` (a systematic error must not
+        grow it without bound -- see :meth:`_load_batch`, which stops the load once the cap is
+        reached).
+        """
         row = work.rows[0]
         if work.key_columns:
             primary_key = ", ".join(
@@ -1069,7 +1111,9 @@ class BatchedImporter:
             message=_safe_error(exc),
         )
         with self._quarantine_lock:
-            self._quarantine.append(record)
+            self._quarantine_total += 1
+            if len(self._quarantine) < _MAX_QUARANTINE_RECORDS:
+                self._quarantine.append(record)
 
     def _execute_for_mode(
         self, work: _BatchWork, pool: _ConnectionPool
@@ -1130,7 +1174,23 @@ class BatchedImporter:
         def _counted_execute(pool_, statement_, params_, attempted_):
             nonlocal attempts
             attempts += 1
-            return self._execute_insert(pool_, statement_, params_, attempted_)
+            try:
+                return self._execute_insert(pool_, statement_, params_, attempted_)
+            except Exception as exc:  # noqa: BLE001 - inspect sqlstate
+                # A NONE-mode plain INSERT (clean load into an empty target) can only hit a
+                # unique violation (23505) on a RETRY after the batch already committed but the
+                # commit ack was lost to a transient connection drop. Recover idempotently via
+                # SELECT-existing + insert-missing instead of letting the 23505 reach
+                # _load_batch, which would binary-split and FALSELY quarantine rows that are
+                # actually present (phantom data-loss report). DO_NOTHING / DO_UPDATE carry an
+                # ON CONFLICT clause, so a 23505 is not expected there and is left to surface.
+                if (
+                    work.on_conflict is OnConflictMode.NONE
+                    and work.key_columns
+                    and getattr(exc, "sqlstate", None) == "23505"
+                ):
+                    return self._select_filter_insert(pool_, work)
+                raise
 
         retried = with_occ_retry(
             max_attempts=self._occ_max_attempts,
@@ -1209,18 +1269,25 @@ class BatchedImporter:
         if total == 0:
             return 0, 0
 
-        def _key_of(row: Mapping[str, object]) -> tuple:
-            return tuple(row[name] for name in key_columns)
-
         # Optimistic fast path: one plain INSERT of the whole batch, NO pre-SELECT.
         # On a no-overlap load -- the dominant large-scale initial CDC-coexisting case
         # -- this is a single round-trip per batch (as fast as a clean load). Only
         # when a key already exists (a concurrent CDC insert or a re-run) does DSQL
         # raise a unique violation (23505); we then fall through to the SELECT-
         # filter path, paying the extra read ONLY on real overlap, not every batch.
-        full_insert = build_insert_statement(
-            work.table_name, list(work.columns), total, OnConflictMode.NONE, key_columns
+        # The optimistic full-batch INSERT is cached (every full-size batch has the identical
+        # shape), exactly like the non-SKIP path. SKIP_EXISTING is the primary append / resume
+        # / CDC-coexist load path, so rebuilding a ~40k-placeholder Composed per batch was pure
+        # waste on the hot path.
+        cache_key = (
+            work.table_name, work.columns, total, OnConflictMode.NONE, work.key_columns,
         )
+        full_insert = self._statement_cache.get(cache_key)
+        if full_insert is None:
+            full_insert = build_insert_statement(
+                work.table_name, list(work.columns), total, OnConflictMode.NONE, key_columns
+            )
+            self._statement_cache[cache_key] = full_insert
         with pool.lease() as connection:
             cursor = connection.cursor()
             try:
@@ -1236,6 +1303,27 @@ class BatchedImporter:
                 # Overlap exists -> fall back to the SELECT-filter path below.
             finally:
                 _safe_close(cursor)
+
+        return self._select_filter_insert(pool, work)
+
+    def _select_filter_insert(
+        self, pool: _ConnectionPool, work: _BatchWork
+    ) -> tuple[int, int]:
+        """SELECT the batch's already-present keys, then plain-INSERT only the missing rows.
+
+        The idempotent recovery shared by SKIP_EXISTING (after its optimistic INSERT hits a
+        23505 on real key overlap) and the NONE clean-load path (when a retry after a lost
+        commit-ack re-runs an already-committed batch). Retries on a 23505 in the gap between
+        the SELECT and the INSERT (a concurrent insert won a missing key), re-deriving the
+        existing set until it converges; exhausting the bounded retries surfaces an error --
+        never a silent loss. Returns ``(inserted, skipped)``.
+        """
+        unique_violation_sqlstate = "23505"
+        key_columns = list(work.key_columns)
+        total = len(work.rows)
+
+        def _key_of(row: Mapping[str, object]) -> tuple:
+            return tuple(row[name] for name in key_columns)
 
         key_idents = sql.SQL(", ").join(sql.Identifier(name) for name in key_columns)
         row_placeholder = sql.SQL("({})").format(
@@ -1291,8 +1379,8 @@ class BatchedImporter:
                 finally:
                     _safe_close(cursor)
         raise BatchedImportError(
-            f"SKIP_EXISTING load for table '{work.table_name}' exhausted "
-            f"{max_attempts} attempts due to concurrent unique violations"
+            f"load for table '{work.table_name}' exhausted {max_attempts} attempts "
+            "due to concurrent unique violations"
         ) from last_error
 
     def _create_indexes(

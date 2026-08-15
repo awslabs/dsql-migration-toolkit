@@ -611,12 +611,25 @@ def keyset_stream(
         where_sql = f"{pk_sql} > :last"
         last_param_names = ["last"]
     else:
-        # Composite key: row-value (tuple) comparison, lexicographic and
-        # index-friendly: ``(k1, ..., kn) > (:last_0, ..., :last_n)``.
-        keys_sql = ", ".join(_quote_mysql_identifier(c) for c in pk_columns)
+        # Composite key: the EXPLICIT lexicographic keyset expansion
+        #   (k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR ...
+        # rather than the row-value form ``(k0, k1, ...) > (:last_0, ...)``. Both are
+        # lexicographically equivalent, but the row-value comparison only gets a PK index
+        # range scan on MySQL 8.0.14+; on a 5.7-compatible source (RDS MySQL 5.7 / Aurora
+        # MySQL 2 -- both supported) it degrades to a FULL TABLE SCAN per page, making the
+        # whole keyset export O(n^2). The disjunction uses the PK index on every version. The
+        # named params (:last_i) are REUSED across terms, so the bind set is unchanged (one
+        # value per key column) and the param binding below is untouched.
+        key_sql_cols = [_quote_mysql_identifier(c) for c in pk_columns]
         last_param_names = [f"last_{i}" for i in range(len(pk_columns))]
-        placeholders = ", ".join(f":{name}" for name in last_param_names)
-        where_sql = f"({keys_sql}) > ({placeholders})"
+        terms: list[str] = []
+        for i in range(len(pk_columns)):
+            prefix_eq = [
+                f"{key_sql_cols[j]} = :{last_param_names[j]}" for j in range(i)
+            ]
+            strict_gt = f"{key_sql_cols[i]} > :{last_param_names[i]}"
+            terms.append(" AND ".join([*prefix_eq, strict_gt]))
+        where_sql = "(" + " OR ".join(f"({term})" for term in terms) + ")"
 
     # The first page has no keyset cursor yet, so its WHERE is only the range
     # bound (if any); later pages AND the cursor with the range bound.

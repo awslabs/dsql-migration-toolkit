@@ -5,6 +5,47 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.325
+
+### Fixed
+
+- **Full Load review fixes (correctness, efficiency, and bounded memory).** Follow-up to the
+  Full Load data-path review:
+  - *A NONE-mode (clean-load) batch could be FALSELY quarantined on a retry.* When a plain
+    INSERT committed but the ack was lost to a transient drop, the OCC replay hit a 23505 and
+    the whole already-present batch was binary-split and quarantined as phantom data loss. A
+    NONE-mode 23505 now recovers idempotently via SELECT-existing + insert-missing.
+  - *A systematic data error could quarantine unboundedly.* A whole-column failure (e.g. every
+    value over DSQL's 1 MiB per-value limit) binary-split every batch down to single rows and
+    appended a quarantine record per row without bound. Retained records are now capped and,
+    past the cap, the load fails loudly so the systematic cause is fixed instead of silently
+    dropping most of the table.
+  - *A composite-PK keyset export could degrade to a full table scan per page.* The row-value
+    cursor `(a, b) > (?, ?)` only uses the PK index on MySQL 8.0.14+; on a 5.7-compatible
+    source (RDS MySQL 5.7 / Aurora MySQL 2) it full-scanned every page (O(n^2)). The cursor is
+    now the explicit index-friendly expansion `(a > ?) OR (a = ? AND b > ?) OR ...`, which uses
+    the PK index on every version (same bind params, lexicographically identical).
+  - *SKIP_EXISTING rebuilt its INSERT statement on every batch.* The primary append / resume /
+    CDC-coexist load path now reuses the cached statement (like the other modes) instead of
+    rebuilding a ~40k-placeholder statement per batch.
+
+## v0.1.324
+
+### Fixed
+
+- **A transient connection failure while creating a pooled load connection could permanently
+  shrink the pool and deadlock the whole Full Load.** `_ConnectionPool.lease` pulled a slot
+  token from the queue and then created the connection OUTSIDE the try/finally that refills
+  it, so a factory exception (DSQL's new-connection rate limit under a burst, or an IAM-token
+  mint blip) lost the slot for good. Because a connect failure is classified transient and
+  retried, repeated blips drained every slot until the next lease's untimed `get()` blocked
+  forever -- wedging every worker thread with no error and no progress. The slot is now
+  refilled on a create failure before the error is re-raised, so the OCC retry re-leases and
+  creates a fresh connection. Adds a test for the create-failure path.
+- **Refreshed the ECR Public default image tag from `0.1.303` to `0.1.314`** (the newest build
+  actually published to `public.ecr.aws/z0q0i9j0/mysql-dsql-migrator`), so a new customer's
+  default CloudFormation deploy no longer pulls a build that had fallen 21 releases behind.
+
 ## v0.1.323
 
 ### Fixed
