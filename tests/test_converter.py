@@ -1091,6 +1091,60 @@ def test_literal_defaults_are_preserved() -> None:
         assert expected in ddl, (mysql_type, default, ddl)
 
 
+def test_string_column_default_is_quoted_by_target_type_not_literal_shape() -> None:
+    """A textual-column default that merely LOOKS numeric/boolean/null must be quoted.
+
+    ``information_schema.COLUMN_DEFAULT`` returns the value unquoted, so a string default
+    like ``'00000'`` arrives as ``00000``. Deciding quoting from the literal's shape alone
+    emitted it bare (``DEFAULT 00000``), which PostgreSQL/DSQL parses as integer 0 and
+    coerces to text ``'0'`` -- a silent value change on every defaulted INSERT after
+    cut-over (``'NULL'`` became SQL NULL, ``'TRUE'`` became ``'true'``). Quoting must key
+    off the (textual) target type, not the literal shape.
+    """
+    for mysql_type, default, expected in (
+        ("VARCHAR(10)", "00000", "DEFAULT '00000'"),  # leading-zero string, not int 0
+        ("VARCHAR(10)", "007", "DEFAULT '007'"),
+        ("CHAR(4)", "NULL", "DEFAULT 'NULL'"),  # the 4-char string, not SQL NULL
+        ("VARCHAR(8)", "TRUE", "DEFAULT 'TRUE'"),  # the string, not boolean true
+        ("TEXT", "42", "DEFAULT '42'"),
+    ):
+        ddl = _convert_table(
+            _single_column_table("t", mysql_type, default=default)
+        ).target_ddl
+        assert expected in ddl, (mysql_type, default, ddl)
+        # the bare (value-changing) form must NOT appear
+        assert f"DEFAULT {default}" not in ddl, (mysql_type, default, ddl)
+
+    # A numeric target still emits the number bare -- no regression.
+    int_ddl = _convert_table(_single_column_table("t", "INT", default="0")).target_ddl
+    assert "DEFAULT 0" in int_ddl and "DEFAULT '0'" not in int_ddl
+
+
+def test_string_default_with_backslash_survives_the_mysql_reparse() -> None:
+    """A backslash in a literal default must be doubled for the MySQL re-embed.
+
+    The literal is re-embedded into a reconstructed MySQL CREATE TABLE that sqlglot
+    re-parses with the MySQL dialect, where backslash is an escape character. Doubling only
+    quotes (not backslashes) turned ``C:\\tmp`` into ``C:<TAB>mp`` and made a value ending in
+    a backslash escape the closing quote -> TokenError -> the whole otherwise-convertible
+    table was dropped to an UNSUPPORTED placeholder.
+    """
+    from dsql_migrator.core.converter import _quote_default_literal
+
+    assert _quote_default_literal("C:\\tmp", is_string_target=True) == "'C:\\\\tmp'"
+    assert _quote_default_literal("abc\\", is_string_target=True) == "'abc\\\\'"
+
+    # an interior backslash is kept as one char (no \t -> TAB corruption)
+    ddl = _convert_table(
+        _single_column_table("t", "VARCHAR(255)", default="C:\\tmp")
+    ).target_ddl
+    assert "DEFAULT 'C:\\tmp'" in ddl, ddl
+
+    # a value ending in a backslash no longer aborts the whole-table parse
+    trailing = _convert_table(_single_column_table("t", "VARCHAR(255)", default="abc\\"))
+    assert "UNSUPPORTED" not in trailing.target_ddl.upper(), trailing.target_ddl
+
+
 def test_current_timestamp_default_is_preserved() -> None:
     # A function default comes back from reflection BARE (no quotes) -- and PostgreSQL
     # spells CURRENT_TIMESTAMP the same way, so it carries straight across.

@@ -911,6 +911,24 @@ def build_ai_apply_objects(
     return objects
 
 
+def _dedupe_apply_objects(
+    objects: Sequence[ApplyObject], ai_objects: Sequence[ApplyObject]
+) -> list[ApplyObject]:
+    """Merge deterministic + AI/edited apply units, deduped by ``object_name``.
+
+    One object can yield BOTH a deterministic unit (e.g. an UNSUPPORTED ``skip_reason``
+    placeholder) and an approved AI SCHEMA suggestion for the same name. Without dedupe the
+    object is applied AND reported twice (a skip line plus a create line). The AI/edited unit
+    wins and replaces the deterministic one IN PLACE -- insertion order is preserved, so the
+    dependency-ordered position is kept -- and an AI unit for a name not already present is
+    appended.
+    """
+    by_name: dict[str, ApplyObject] = {obj.object_name: obj for obj in objects}
+    for ai_obj in ai_objects:
+        by_name[ai_obj.object_name] = ai_obj
+    return list(by_name.values())
+
+
 def _apply_success_detail(outcome: ApplyOutcome, mode: ApplyMode) -> str:
     """Explain a successful per-object apply outcome (Requirement 10.7).
 
@@ -2254,12 +2272,46 @@ def build_schema_conversion_screen(
     eval_state = eval_store.get_or_create(session_id)
     schema_converter = converter or SchemaConverter()
 
+    # An INJECTED existence checker (tests) always wins and is never rebuilt. A DERIVED one
+    # (built from the browsed target inventory) must be rebuilt when that snapshot changes --
+    # a "Refresh target" replaces the inventory, and a checker bound once to the first
+    # snapshot would answer existence from a stale catalog forever. ``_derived_checker_state``
+    # remembers the snapshot the current derived checker was built from so it rebuilds only
+    # on an actual change.
+    existence_checker_injected = existence_checker is not None
+    _derived_checker_state: dict[str, object] = {}
+
+    # The target applier is reused across applies. A DsqlSchemaApplier browses the target
+    # catalog once (lazily, on first apply) and caches it, so building a fresh one per inline
+    # "Apply to target" click re-browses the whole catalog every time (N applies = N browses).
+    # Cache it by target_config identity; a "Refresh target" clears it so a changed catalog is
+    # re-browsed. (Snapshot staleness between applies matches the bulk-apply path, which also
+    # browses once per run.)
+    _applier_cache: dict[str, object] = {}
+
     def _inventory() -> Optional[SourceInventory]:
         result = eval_state.result
         return result.inventory if result is not None else None
 
+    _conversion_cache: dict[str, object] = {}
+
     def _conversion(inventory: SourceInventory) -> SchemaConversionResult:
-        return schema_converter.convert(inventory, SchemaConvertOptions())
+        """Deterministic conversion of ``inventory``, memoized per inventory identity.
+
+        The conversion (sqlglot parse/transpile of every table + view) is deterministic for
+        a given source inventory, but ``content`` re-renders on every action -- including the
+        0.5s apply-progress poll -- and ``_all_apply_objects`` / ``_mark_schema_done_if_complete``
+        both call this each render. Recomputing the full-schema conversion every render does
+        not scale (thousands of tables). Cache it against the inventory object identity: a new
+        Evaluation yields a new inventory -> ``is not`` miss -> recompute, and only the current
+        inventory is ever held (one entry).
+        """
+        if _conversion_cache.get("inventory") is not inventory:
+            _conversion_cache["inventory"] = inventory
+            _conversion_cache["result"] = schema_converter.convert(
+                inventory, SchemaConvertOptions()
+            )
+        return _conversion_cache["result"]  # type: ignore[return-value]
 
     def _resolve_assistant() -> Optional[AiConversionAssistant]:
         """Return the AI assistant to use, building it per session when enabled.
@@ -2310,11 +2362,20 @@ def build_schema_conversion_screen(
             return None
         target_config = session.target_config
         assert target_config is not None  # guaranteed by has_target()
-        # Use the injected applier factory (tests) or the real DSQL-backed one
-        # built for this session's global AWS profile.
-        factory = applier_factory or default_applier_factory(session.aws_profile)
+        # Reuse the applier for this target_config so a per-object inline apply does not
+        # rebuild it (and re-browse the whole target catalog) on every click. Rebuilt only
+        # when target_config identity changes; refresh_target clears the cache explicitly.
+        if (
+            _applier_cache.get("config") is not target_config
+            or _applier_cache.get("applier") is None
+        ):
+            # Use the injected applier factory (tests) or the real DSQL-backed one
+            # built for this session's global AWS profile.
+            factory = applier_factory or default_applier_factory(session.aws_profile)
+            _applier_cache["config"] = target_config
+            _applier_cache["applier"] = factory(target_config)
         return (
-            factory(target_config),
+            _applier_cache["applier"],  # type: ignore[return-value]
             conv_state.apply_mode,
             conv_state.replace_confirmed,
         )
@@ -2429,8 +2490,13 @@ def build_schema_conversion_screen(
         objects = override_apply_objects(
             build_apply_objects(_conversion(inventory)), conv_state.edited_target_ddls
         )
-        objects.extend(build_ai_apply_objects(conv_state.all_suggestions()))
-        return [obj for obj in objects if obj.object_name in selected]
+        # Dedupe by object_name so an object with BOTH a deterministic unit (e.g. an
+        # UNSUPPORTED skip_reason placeholder) and an approved AI SCHEMA suggestion is applied
+        # once, not twice (the AI/edited unit wins).
+        merged = _dedupe_apply_objects(
+            objects, build_ai_apply_objects(conv_state.all_suggestions())
+        )
+        return [obj for obj in merged if obj.object_name in selected]
 
     def _refresh_view() -> None:
         """Re-render the screen via the refresh callback recorded by ``content``."""
@@ -2947,8 +3013,17 @@ def build_schema_conversion_screen(
             # This enables the per-object Apply to detect existing tables and show
             # the Replace/Skip dialog.
             nonlocal existence_checker
-            if existence_checker is None and target_inventory is not None:
+            # Rebuild the DERIVED checker whenever the target snapshot changes (a refresh
+            # replaces target_inventory); never touch an injected one. Binding only when
+            # None left the checker pinned to the first snapshot, so existence verdicts went
+            # stale after a "Refresh target".
+            if (
+                not existence_checker_injected
+                and target_inventory is not None
+                and _derived_checker_state.get("snapshot") is not target_inventory
+            ):
                 existence_checker = _InventoryExistenceChecker(target_inventory)
+                _derived_checker_state["snapshot"] = target_inventory
             # AI assistance is integrated per generated object (not a separate
             # section): for each object the deterministic conversion and the AI
             # suggestion are compared and shown as one view when identical, or as
@@ -3049,6 +3124,9 @@ def build_schema_conversion_screen(
                             ),
                         )
                     )
+                # The target catalog just changed, so drop the cached applier (its browsed
+                # existence snapshot is now stale) -- the next apply rebuilds and re-browses.
+                _applier_cache.clear()
                 if announce:
                     ui.notify("Target browser refreshed.", type="positive")  # type: ignore[attr-defined]
                     refresh()

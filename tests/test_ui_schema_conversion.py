@@ -869,6 +869,32 @@ def test_run_schema_apply_reports_per_object_created() -> None:
     assert len(applier.calls) == 3
 
 
+def test_dedupe_apply_objects_ai_suggestion_replaces_deterministic_placeholder() -> None:
+    # An UNSUPPORTED object yields a deterministic skip_reason placeholder; an approved AI
+    # SCHEMA suggestion for the SAME name yields a create unit. They must merge to ONE unit
+    # (AI wins), not be applied and reported twice (a skip line plus a create line).
+    from dsql_migrator.ui.schema_conversion import _dedupe_apply_objects
+
+    deterministic = [
+        ApplyObject(object_name="orders", ddls=('CREATE TABLE "orders" ("id" integer)',)),
+        ApplyObject(object_name="geo", ddls=(), skip_reason="MySQL spatial type unsupported"),
+    ]
+    ai = [
+        ApplyObject(
+            object_name="geo", ddls=('CREATE TABLE "geo" ("id" integer, "wkb" bytea)',)
+        )
+    ]
+
+    merged = _dedupe_apply_objects(deterministic, ai)
+
+    # exactly one 'geo', and the dependency-ordered position (after 'orders') is preserved
+    assert [o.object_name for o in merged] == ["orders", "geo"]
+    geo = next(o for o in merged if o.object_name == "geo")
+    # the AI create unit won over the skip placeholder
+    assert geo.skip_reason is None
+    assert geo.ddls == ('CREATE TABLE "geo" ("id" integer, "wkb" bytea)',)
+
+
 def test_run_schema_apply_skips_when_applier_returns_skipped() -> None:
     applier = _FakeApplier(ApplyOutcome.SKIPPED)
     results = run_schema_apply(

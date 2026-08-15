@@ -5,6 +5,47 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.322
+
+### Fixed
+
+- **A string-column DEFAULT that looked numeric/boolean/null was emitted unquoted, silently
+  changing the value on the target.** `_quote_default_literal` decided quoting from the
+  literal's shape alone, but `information_schema.COLUMN_DEFAULT` returns string defaults
+  UNQUOTED — so a `VARCHAR`/`CHAR`/`TEXT` (incl. ENUM/SET) column whose default was a string
+  like `'00000'`, `'007'`, `'NULL'` or `'TRUE'` converted to a bare `DEFAULT 00000` /
+  `DEFAULT NULL` / `DEFAULT TRUE`. The DDL applied cleanly, but PostgreSQL/DSQL then parsed
+  `00000` as integer 0 → text `'0'`, dropped the 4-char string `'NULL'` to SQL NULL, and
+  stored `'true'` — so every post-cut-over INSERT that omitted the column got the wrong
+  default, with no error raised. Quoting now keys off the mapped (textual) target type, not
+  the literal shape: a textual target always single-quotes the literal. Numeric/date/boolean
+  targets are unchanged (a number still emits bare).
+- **Schema Conversion review fixes (correctness, safety, and efficiency).** A focused review
+  of the Schema Conversion path (converter, applier, and UI) fixed:
+  - *A backslash in a literal default was re-interpreted on the MySQL re-parse.*
+    `_quote_default_literal` doubled only quotes, so `C:\tmp` became `C:<TAB>mp` and a value
+    ending in a backslash aborted the whole-table parse; backslashes are now doubled too.
+  - *A destructive REPLACE could silently lose an object.* DSQL commits each DDL immediately,
+    so a committed `DROP` followed by a failed `CREATE` left the object gone under a generic
+    "apply failed"; the applier now surfaces an explicit "dropped but not recreated" error.
+  - *Transient connection failures were retried only while opening the connection, not while
+    executing.* The REPLACE / `recreate_table` / drop paths now reconnect and replay the whole
+    idempotent unit on a mid-execute transient error, not just the connect (a 40001 is still
+    absorbed per-statement).
+  - *A destructive REPLACE of an unquoted mixed-case name dropped the wrong relation.* DSQL
+    folds an unquoted `CREATE TABLE Orders` to `orders`; the existence key and the `DROP` now
+    fold to match, so REPLACE targets the relation the server actually created.
+  - *An UNSUPPORTED object with an approved AI SCHEMA suggestion was applied and reported
+    twice.* Apply units are now deduped by object name (the AI/edited unit wins).
+  - *The full-schema conversion was recomputed on every render (including the 0.5s apply
+    poll).* It is now memoized per source inventory, so it runs at most once per inventory.
+  - *Each inline "Apply to target" click rebuilt the applier and re-browsed the whole target
+    catalog.* The applier is now reused per target connection; a "Refresh target" invalidates it.
+  - *The per-object existence checker went stale after a "Refresh target".* It is now rebuilt
+    whenever the target snapshot changes (an explicitly injected checker is still respected).
+  - *A column with no default still re-parsed its type.* `_resolve_column_default` now returns
+    early for a column with no default, skipping the wasted sqlglot parse.
+
 ## v0.1.321
 
 ### Fixed

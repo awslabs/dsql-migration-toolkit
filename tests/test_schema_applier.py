@@ -869,3 +869,111 @@ def test_dependency_failure_is_not_occ_retried() -> None:
             jitter=_zero_jitter,
         )
     assert attempts["n"] == 1  # tried exactly once
+
+
+# ---------------------------------------------------------------------------
+# Unquoted identifiers fold to lower case (DSQL/PostgreSQL CREATE folding)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_folds_unquoted_identifier_but_preserves_quoted() -> None:
+    # DSQL folds an unquoted CREATE identifier to lower case; a quoted one is verbatim.
+    assert parse_create_object('CREATE TABLE Orders ("id" uuid)') == ("orders", "TABLE")
+    assert parse_create_object('CREATE TABLE "Orders" ("id" uuid)') == ("Orders", "TABLE")
+    name, _ = parse_create_object('CREATE TABLE MySchema."Orders" ("id" uuid)')
+    assert name == "myschema.Orders"
+
+
+def test_replace_folds_unquoted_mixed_case_identifier_for_the_drop() -> None:
+    # Regression: a user-edited `CREATE TABLE Orders` creates the relation `orders` in DSQL,
+    # so a confirmed REPLACE must drop `orders` -- not the case-exact `"Orders"`, whose
+    # DROP ... IF EXISTS would silently no-op and leave the old table (or trip 42P07).
+    applier, connection, oracle = _applier(existing={"orders"})
+
+    result = applier.apply(
+        'CREATE TABLE Orders ("id" uuid PRIMARY KEY)', ApplyMode.REPLACE, confirmed=True
+    )
+
+    assert result.status is ApplyStatus.CREATED
+    assert oracle.queried == ["orders"]  # existence checked against the folded name
+    assert connection.executed[0] == 'DROP TABLE IF EXISTS "orders"'  # DROP folds too
+
+
+# ---------------------------------------------------------------------------
+# REPLACE: committed DROP + failed CREATE is surfaced as data loss, not generic
+# ---------------------------------------------------------------------------
+
+
+class _CreateFailsConnection(_FakeConnection):
+    """DROPs succeed; the CREATE raises a non-transient, non-OCC error."""
+
+    def handle_execute(self, statement: Any, _params) -> None:  # type: ignore[override]
+        text = statement if isinstance(statement, str) else statement.as_string(None)
+        if text.upper().startswith("CREATE"):
+            raise RuntimeError("syntax error at or near \"(\"")
+        self.executed.append(text)
+
+
+def test_replace_surfaces_dropped_but_not_recreated_when_create_fails() -> None:
+    # DSQL commits the DROP immediately, so a non-transient CREATE failure after it leaves the
+    # object gone. The result must say so explicitly (operator's signal to restore), not read
+    # as a generic "apply failed" that looks retryable.
+    oracle = _StubOracle({"orders"})
+    connection = _CreateFailsConnection()
+    applier = SchemaApplier(
+        oracle,
+        connection_factory=lambda: connection,
+        occ_max_attempts=1,
+        occ_base_delay=0.0,
+        sleep=_no_sleep,
+        jitter=_zero_jitter,
+    )
+
+    result = applier.apply(_CREATE_ORDERS, ApplyMode.REPLACE, confirmed=True)
+
+    assert result.status is ApplyStatus.FAILED
+    detail = result.detail.lower()
+    assert "dropped" in detail and "recreated" in detail
+    assert connection.executed == ['DROP TABLE IF EXISTS "orders"']  # the DROP did commit
+
+
+# ---------------------------------------------------------------------------
+# A transient failure DURING execute reconnects and replays the whole unit
+# ---------------------------------------------------------------------------
+
+
+class _ExecuteTransientOnceConnection(_FakeConnection):
+    """Raises a transient (no-sqlstate) error on its FIRST execute -- a socket dropped
+    mid-statement -- so the reconnect must open a fresh connection and replay."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._raised = False
+
+    def handle_execute(self, statement: Any, _params) -> None:  # type: ignore[override]
+        if not self._raised:
+            self._raised = True
+            raise _TransientConnectError("connection reset by peer")
+        text = statement if isinstance(statement, str) else statement.as_string(None)
+        self.executed.append(text)
+
+
+def test_recreate_table_replays_the_unit_on_a_transient_execute_failure() -> None:
+    # Regression: a transient failure was retried only while OPENING the connection, not
+    # while executing. A socket dropped mid-DROP now reconnects and replays the whole
+    # (idempotent) DROP+CREATE unit on a fresh connection.
+    good = _FakeConnection()
+    conns = iter([_ExecuteTransientOnceConnection(), good])
+
+    recreate_table(
+        [],
+        'CREATE TABLE "t" ("id" integer PRIMARY KEY)',
+        connection_factory=lambda: next(conns),
+        sleep=_no_sleep,
+        jitter=_zero_jitter,
+    )
+
+    assert good.executed == [
+        'DROP TABLE IF EXISTS "t"',
+        'CREATE TABLE "t" ("id" integer PRIMARY KEY)',
+    ]

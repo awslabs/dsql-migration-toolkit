@@ -1081,7 +1081,15 @@ def _unwrap_expression_default(default: str) -> str:
     return text_value
 
 
-def _quote_default_literal(literal: str) -> str:
+# PostgreSQL/DSQL character types a literal default must always be quoted for. The value
+# arrives UNQUOTED from information_schema, so a string default that merely looks numeric/
+# boolean/null must NOT be emitted bare. map_mysql_type renders these lower-cased as e.g.
+# ``varchar(10)`` / ``char(3)`` / ``character varying(10)`` / ``text`` (ENUM and SET both
+# map to ``text``).
+_TEXTUAL_TARGET_PREFIXES = ("char", "varchar", "text", "character", "bpchar", "citext")
+
+
+def _quote_default_literal(literal: str, *, is_string_target: bool = False) -> str:
     """Render a literal default as a safely quoted MySQL string literal.
 
     ``information_schema.COLUMN_DEFAULT`` returns a literal UNQUOTED (an int default is
@@ -1090,21 +1098,34 @@ def _quote_default_literal(literal: str) -> str:
     interpolated into the reconstructed DDL, and it originates from the source schema, so
     it is escaped rather than concatenated raw (Requirement 9.4). Numeric and boolean
     literals are emitted bare so the target keeps its native type.
+
+    ``is_string_target`` forces string-quoting regardless of the literal's shape and MUST
+    be set for a textual target (char/varchar/text, incl. ENUM/SET -> text). Because the
+    value arrives unquoted, a string default that only *looks* numeric/boolean/null
+    (``'00000'``, ``'007'``, ``'NULL'``, ``'TRUE'``) would otherwise be emitted bare and
+    silently change value on the target: ``DEFAULT 00000`` parses to integer 0 then coerces
+    to text ``'0'``, ``DEFAULT NULL`` drops the 4-char string, ``DEFAULT TRUE`` stores
+    ``'true'``. On a string target every literal is a string, so shape inference has no
+    place there.
     """
     stripped = literal.strip()
-    # A number (or a signed number) needs no quotes and must not get them: a quoted
-    # value would be a string literal the target then has to coerce.
-    if re.fullmatch(r"[+-]?\d+(\.\d+)?", stripped):
-        return stripped
-    if stripped.upper() in ("TRUE", "FALSE", "NULL"):
-        return stripped.upper()
-    # MySQL bit/hex literals carry their own syntax and are handled by the caller.
-    if re.fullmatch(r"(?i)(b|x)'[0-9a-f]*'", stripped) or stripped.lower().startswith("0x"):
-        return stripped
-    # Everything else is a string: single-quote it, doubling any embedded quote. Handles
-    # the reflected-and-truncated backslash form too, since the value is re-escaped from
-    # scratch rather than trusted.
-    escaped = stripped.replace("\\'", "'").replace("'", "''")
+    if not is_string_target:
+        # A number (or a signed number) needs no quotes and must not get them: a quoted
+        # value would be a string literal the target then has to coerce.
+        if re.fullmatch(r"[+-]?\d+(\.\d+)?", stripped):
+            return stripped
+        if stripped.upper() in ("TRUE", "FALSE", "NULL"):
+            return stripped.upper()
+        # MySQL bit/hex literals carry their own syntax and are handled by the caller.
+        if re.fullmatch(r"(?i)(b|x)'[0-9a-f]*'", stripped) or stripped.lower().startswith("0x"):
+            return stripped
+    # Everything else -- and every default on a textual target -- is a string: single-quote
+    # it, doubling any embedded backslash AND quote. The literal is re-embedded into a MySQL
+    # CREATE TABLE that sqlglot re-parses with the MySQL dialect, where backslash is an escape
+    # character -- so a raw backslash MUST be doubled or it silently corrupts the value
+    # (``C:\tmp`` -> ``C:<TAB>mp``) or, when it trails the value (``abc\``), escapes the
+    # closing quote and fails the whole-table parse (dropping an otherwise-convertible table).
+    escaped = stripped.replace("\\", "\\\\").replace("'", "''")
     return f"'{escaped}'"
 
 
@@ -1232,7 +1253,11 @@ def _column_default_sql(
             "without a default."
         )
 
-    return _quote_default_literal(raw), None
+    # A textual target must quote the literal even when it looks numeric/boolean/null:
+    # the value is a string that arrives unquoted, so emitting it bare would silently
+    # change its value (e.g. VARCHAR DEFAULT '00000' -> DEFAULT 00000 -> stored '0').
+    is_string_target = target.startswith(_TEXTUAL_TARGET_PREFIXES)
+    return _quote_default_literal(raw, is_string_target=is_string_target), None
 
 
 def _resolve_column_default(
@@ -1246,6 +1271,12 @@ def _resolve_column_default(
     translation. Used by both the DDL builder and the warning pass so the two can never
     disagree about what was emitted.
     """
+    # A column with no default (or a generated column, whose value is computed) resolves to
+    # nothing -- return before the type re-parse below. map_mysql_type parses the type via
+    # sqlglot, so without this guard a wide table with no defaults pays one wasted parse per
+    # column, twice (build pass + warning pass).
+    if column.generated or not (column.default or "").strip():
+        return None, None
     try:
         target_type, _mapping_warning = map_mysql_type(column.mysql_type)
     except ValueError:

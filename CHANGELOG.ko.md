@@ -5,6 +5,45 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.322
+
+### 수정 (Fixed)
+
+- **숫자/불리언/NULL처럼 보이는 문자열 컬럼 DEFAULT가 따옴표 없이 방출되어 타깃에서 값이 조용히 바뀌었습니다.**
+  `_quote_default_literal`이 리터럴의 "모양"만 보고 따옴표 여부를 정했는데,
+  `information_schema.COLUMN_DEFAULT`는 문자열 default를 따옴표 없이 돌려줍니다 — 그래서
+  default가 `'00000'`, `'007'`, `'NULL'`, `'TRUE'` 같은 문자열인 `VARCHAR`/`CHAR`/`TEXT`
+  (ENUM/SET 포함) 컬럼이 bare `DEFAULT 00000` / `DEFAULT NULL` / `DEFAULT TRUE`로 변환됐습니다.
+  DDL은 정상 적용되지만 PostgreSQL/DSQL은 `00000`을 정수 0 → 텍스트 `'0'`으로, 4글자 문자열
+  `'NULL'`을 SQL NULL로, `'TRUE'`를 `'true'`로 저장합니다 — cutover 후 해당 컬럼을 생략한 모든
+  INSERT가 에러 없이 틀린 default를 받았습니다. 이제 따옴표 여부는 리터럴 모양이 아니라 매핑된
+  (문자형) 타깃 타입을 기준으로 결정합니다: 문자형 타깃은 항상 리터럴을 single-quote합니다.
+  숫자/날짜/불리언 타깃은 그대로입니다(숫자는 여전히 bare).
+- **Schema Conversion 리뷰 수정(정합성·안전성·효율성).** Schema Conversion 경로(컨버터·적용기·UI)를
+  집중 리뷰해 다음을 수정했습니다:
+  - *리터럴 default의 백슬래시가 MySQL 재파싱에서 재해석됨.* `_quote_default_literal`이 따옴표만
+    이중화해 `C:\tmp`가 `C:<TAB>mp`가 되고, 백슬래시로 끝나는 값은 테이블 전체 파싱을 중단시켰습니다.
+    이제 백슬래시도 이중화합니다.
+  - *파괴적 REPLACE가 객체를 조용히 잃을 수 있었음.* DSQL은 각 DDL을 즉시 커밋하므로 커밋된 `DROP`
+    뒤 `CREATE` 실패 시 객체가 사라진 채 일반 "apply failed"로 보고됐습니다. 이제 "dropped but not
+    recreated"를 명시적으로 표면화합니다.
+  - *트랜지언트 연결 실패가 연결 open 중에만 재시도되고 실행 중에는 아니었음.* REPLACE /
+    `recreate_table` / drop 경로가 이제 실행 중 트랜지언트 오류에 대해 전체 idempotent 유닛을
+    재접속·재실행합니다(40001은 여전히 statement 단위로 흡수).
+  - *unquoted 대소문자 혼합 이름의 파괴적 REPLACE가 엉뚱한 relation을 drop함.* DSQL은 unquoted
+    `CREATE TABLE Orders`를 `orders`로 폴딩합니다. 이제 존재 키와 `DROP`도 폴딩해 REPLACE가 서버가
+    실제로 만든 relation을 대상으로 합니다.
+  - *UNSUPPORTED 객체 + 승인된 AI SCHEMA 제안이 두 번 적용/보고됨.* 이제 apply 유닛을 object 이름으로
+    dedupe합니다(AI/편집본 우선).
+  - *전체 스키마 변환이 매 렌더(0.5초 apply 폴링 포함)마다 재계산됨.* 이제 소스 인벤토리 기준으로
+    메모이제이션해 인벤토리당 최대 한 번만 실행합니다.
+  - *인라인 "Apply to target" 클릭마다 적용기를 재생성하고 타깃 카탈로그 전체를 재브라우즈함.* 이제
+    타깃 연결별로 적용기를 재사용하며 "Refresh target" 시 무효화합니다.
+  - *"Refresh target" 후 per-object 존재검사기가 stale해짐.* 이제 타깃 스냅샷이 바뀔 때마다
+    재생성합니다(명시적으로 주입된 검사기는 그대로 존중).
+  - *default가 없는 컬럼도 타입을 재파싱함.* `_resolve_column_default`가 default 없는 컬럼에 대해
+    조기 반환해 불필요한 sqlglot 파싱을 건너뜁니다.
+
 ## v0.1.321
 
 ### 수정 (Fixed)

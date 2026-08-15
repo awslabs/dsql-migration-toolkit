@@ -212,10 +212,16 @@ def _parse(target_ddl: str) -> _ParsedObject:
 def _split_identifier(raw: str) -> list[str]:
     """Split a possibly schema-qualified identifier, unquoting each part.
 
-    A double-quoted part is taken verbatim (minus the quotes); an unquoted part
-    is returned as written. The parts are recomposed safely with
-    :class:`psycopg.sql.Identifier` when building a DROP statement, so the name
-    can never break out into SQL (Requirement 9.4).
+    A double-quoted part is taken verbatim (minus the quotes); an UNQUOTED part is
+    folded to lower case, because PostgreSQL/DSQL case-fold an unquoted identifier
+    at ``CREATE`` time -- ``CREATE TABLE Orders`` creates the relation ``orders``.
+    Preserving the written case would make the existence key and the ``DROP`` target
+    the case-exact ``"Orders"``, which does not match the folded ``orders``: the
+    ``DROP ... IF EXISTS`` then silently no-ops and a destructive REPLACE fails to
+    replace (or the re-CREATE hits "relation already exists"). Folding here keeps the
+    parsed identity consistent with what the server actually stored. The parts are
+    recomposed safely with :class:`psycopg.sql.Identifier` when building a DROP
+    statement, so the name can never break out into SQL (Requirement 9.4).
     """
     parts: list[str] = []
     for part in re.findall(r'"[^"]+"|[^.]+', raw):
@@ -223,7 +229,7 @@ def _split_identifier(raw: str) -> list[str]:
         if token.startswith('"') and token.endswith('"'):
             parts.append(token[1:-1])
         else:
-            parts.append(token)
+            parts.append(token.lower())
     return parts
 
 
@@ -411,28 +417,46 @@ class SchemaApplier:
         recreated later by its own apply unit, so this only reorders the drop.
         """
         parsed = _parse(target_ddl)
-        connection = _open_connection_with_retry(
+        # DROP ... IF EXISTS is idempotent, so the whole unit can reconnect and replay if a
+        # transient connection failure hits mid-execute (not just at connect open).
+        _run_ddls_reconnecting(
             self._connection_factory,
+            [_build_drop_statement(parsed)],
             occ_max_attempts=self._occ_max_attempts,
             occ_base_delay=self._occ_base_delay,
             sleep=self._sleep,
             jitter=self._jitter,
         )
-        try:
-            self._run_ddl(connection, _build_drop_statement(parsed))
-        finally:
-            _safe_close(connection)
 
     def _execute(
         self, parsed: _ParsedObject, target_ddl: str, *, drop_first: bool
     ) -> None:
         """Run the DROP (when replacing) and the CREATE as single-DDL txns.
 
-        A single connection is opened for the call; because it is autocommit, each
-        ``execute`` is its own transaction, so the ``DROP`` and the ``CREATE`` are
-        never combined into one transaction (Property 2 / DDL separation). Each
-        statement is wrapped in OCC retry for OC001 idempotency (Property 5).
+        Each ``execute`` runs on an autocommit connection, so the ``DROP`` and the
+        ``CREATE`` are never combined into one transaction (Property 2 / DDL separation),
+        and each statement is wrapped in OC001 retry (Property 5).
+
+        A destructive REPLACE (``drop_first``) runs the ``DROP IF EXISTS`` + ``CREATE`` as
+        one replay-idempotent unit (:func:`_run_ddls_reconnecting`): a transient connection
+        failure reconnects and replays (the DROP makes the CREATE safe to re-run), and a
+        committed DROP followed by a NON-transient CREATE failure is surfaced as an explicit
+        "dropped but not recreated" error instead of silent data loss. A brand-new object
+        (no drop) runs the bare ``CREATE`` on a storm-retried connect but is NOT replayed on
+        a mid-execute transient -- a bare CREATE is not idempotent, so a replay could
+        spuriously hit "relation already exists".
         """
+        if drop_first:
+            _run_ddls_reconnecting(
+                self._connection_factory,
+                [_build_drop_statement(parsed), target_ddl],
+                occ_max_attempts=self._occ_max_attempts,
+                occ_base_delay=self._occ_base_delay,
+                sleep=self._sleep,
+                jitter=self._jitter,
+                recreated=parsed,
+            )
+            return
         connection = _open_connection_with_retry(
             self._connection_factory,
             occ_max_attempts=self._occ_max_attempts,
@@ -441,8 +465,6 @@ class SchemaApplier:
             jitter=self._jitter,
         )
         try:
-            if drop_first:
-                self._run_ddl(connection, _build_drop_statement(parsed))
             self._run_ddl(connection, target_ddl)
         finally:
             _safe_close(connection)
@@ -502,6 +524,78 @@ def _execute_single_ddl(connection: Any, statement: object) -> None:
         _safe_close(cursor)
 
 
+def _run_ddls_reconnecting(
+    connection_factory: ConnectionFactory,
+    statements: Sequence[object],
+    *,
+    occ_max_attempts: int,
+    occ_base_delay: float,
+    sleep: SleepFunc,
+    jitter: JitterFunc,
+    recreated: Optional[_ParsedObject] = None,
+) -> None:
+    """Run an idempotent DDL sequence on a fresh connection, reconnecting and replaying the
+    WHOLE sequence on a transient connection failure -- not merely the connect open.
+
+    A statement's connection can drop mid-execute during a connection storm (many workers
+    opening fresh DSQL connections at once when a wave of tables finishes -- tripping the
+    new-connection rate limit, a TLS teardown, or an expired token). Retrying the execute on
+    the now-dead connection is futile, so the unit re-opens a fresh connection and replays
+    from the start. Callers pass ONLY replay-safe statements: ``CREATE SCHEMA IF NOT EXISTS``,
+    ``DROP ... IF EXISTS``, or a ``CREATE`` that a preceding ``DROP IF EXISTS`` in the same
+    sequence makes safe to re-run. Each statement still carries its own OC001 (40001) retry;
+    only a connection-level transient (SQLSTATE class ``08`` / no-SQLSTATE) triggers the
+    whole-unit reconnect -- a 40001 is absorbed per-statement, exactly as before, so there is
+    no double retry.
+
+    When ``recreated`` is given, the LAST statement is the CREATE that follows a committed
+    DROP. DSQL commits each DDL immediately, so a NON-transient failure of that CREATE leaves
+    the object dropped and gone. It is re-raised as an explicit "dropped but not recreated"
+    error rather than a generic apply failure, so the operator knows to restore it (a generic
+    message reads as a harmless retryable hiccup and the loss goes unnoticed).
+    """
+    statements = list(statements)
+    run_one = with_occ_retry(
+        max_attempts=occ_max_attempts,
+        base_delay=occ_base_delay,
+        sleep=sleep,
+        jitter=jitter,
+    )(_execute_single_ddl)
+
+    def _unit() -> None:
+        connection = connection_factory()
+        try:
+            for index, statement in enumerate(statements):
+                is_recreate = recreated is not None and index == len(statements) - 1
+                try:
+                    run_one(connection, statement)
+                except Exception as exc:  # noqa: BLE001 - re-raised (loud for a lost object)
+                    if (
+                        is_recreate
+                        and not isinstance(exc, SchemaApplyError)
+                        and not is_transient_connection_error(exc)
+                    ):
+                        raise SchemaApplyError(
+                            f"{recreated.kind} {recreated.name} was DROPPED but could not be "
+                            "recreated, so it no longer exists on the target. Fix the CREATE "
+                            f"DDL and re-apply to restore it. Underlying error: {exc}"
+                        ) from exc
+                    raise
+        finally:
+            _safe_close(connection)
+
+    # Only a transient CONNECTION failure replays the unit; a SchemaApplyError (parse/schema
+    # limit/dependency/dropped-not-recreated) is terminal and must never be retried.
+    with_occ_retry(
+        max_attempts=occ_max_attempts,
+        base_delay=occ_base_delay,
+        sleep=sleep,
+        jitter=jitter,
+        retryable=lambda exc: not isinstance(exc, SchemaApplyError)
+        and is_transient_connection_error(exc),
+    )(_unit)()
+
+
 def drop_object(
     target_ddl: str,
     *,
@@ -521,23 +615,16 @@ def drop_object(
     autocommit DDL on a fresh connection, which is closed afterward.
     """
     parsed = _parse(target_ddl)
-    retried = with_occ_retry(
-        max_attempts=occ_max_attempts,
-        base_delay=occ_base_delay,
-        sleep=sleep,
-        jitter=jitter,
-    )(_execute_single_ddl)
-    connection = _open_connection_with_retry(
+    # DROP ... IF EXISTS is idempotent, so the unit reconnects and replays on a transient
+    # connection failure mid-execute, not merely at connect open.
+    _run_ddls_reconnecting(
         connection_factory,
+        [_build_drop_statement(parsed)],
         occ_max_attempts=occ_max_attempts,
         occ_base_delay=occ_base_delay,
         sleep=sleep,
         jitter=jitter,
     )
-    try:
-        retried(connection, _build_drop_statement(parsed))
-    finally:
-        _safe_close(connection)
 
 
 def recreate_table(
@@ -569,32 +656,23 @@ def recreate_table(
     connections.
     """
     parsed = _parse(target_ddl)
-    retried = with_occ_retry(
-        max_attempts=occ_max_attempts,
-        base_delay=occ_base_delay,
-        sleep=sleep,
-        jitter=jitter,
-    )(_execute_single_ddl)
-    # Opening the connection is itself retried on a transient connection failure:
-    # when many table workers finish together and the next wave all open fresh DSQL
-    # connections at once, DSQL's new-connection rate limit can reject/time-out a
-    # connect. Without this, that per-table DROP+recreate connect failed the table
-    # outright (0 rows, no batch ever ran); with it, the connect rides out the storm
-    # -- matching the batched loader's pool, which already leases inside a retry.
-    connection = _open_connection_with_retry(
+    # The schema ensure(s), the DROP, and the CREATE run as ONE replay-idempotent unit. A
+    # transient connection failure at any point -- the connection storm when a wave of table
+    # workers open fresh DSQL connections at once and trip the new-connection rate limit --
+    # reconnects and replays from the start, not just the connect open (without which the
+    # per-table DROP+recreate failed the table outright, 0 rows loaded). A committed DROP
+    # followed by a NON-transient CREATE failure is surfaced as an explicit "dropped but not
+    # recreated" error (recreated=parsed) instead of leaving the table gone under a generic
+    # message. Each statement keeps its own OC001 (40001) retry.
+    _run_ddls_reconnecting(
         connection_factory,
+        [*schema_ddls, _build_drop_statement(parsed), target_ddl],
         occ_max_attempts=occ_max_attempts,
         occ_base_delay=occ_base_delay,
         sleep=sleep,
         jitter=jitter,
+        recreated=parsed,
     )
-    try:
-        for schema_ddl in schema_ddls:
-            retried(connection, schema_ddl)
-        retried(connection, _build_drop_statement(parsed))
-        retried(connection, target_ddl)
-    finally:
-        _safe_close(connection)
 
 
 def _is_duplicate_object(exc: BaseException) -> bool:
