@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.341
+
+### Fixed
+
+- **Validation now scales to very large target tables — the target row count is bounded,
+  not a single `COUNT(*)`** (found by the Validation review). Aurora DSQL enforces a hard
+  300-second transaction limit, but Validation ran one `SELECT COUNT(*)` per table (every
+  table, every mode) — a full-table scan in a single transaction that, past a few minutes
+  of rows, failed with `transaction age limit of 300s exceeded`, so a large table could
+  never report MATCH. It was worst for a UUID/`varchar` PK (Aurora DSQL's recommended
+  shape), which also skips the keyset reconcile, leaving no path to confirm the table. The
+  target count now comes from the exact total the keyset reconcile already streams (integer
+  PK), or is keyset-paged directly for **any** single-column PK (int/uuid/varchar/binary) —
+  each page a bounded sub-300s statement, memory one page. A composite/missing PK still uses
+  `COUNT(*)` (a documented residual). The source count is unchanged (watermark snapshot /
+  live). Note: CHECKSUM mode's full-table checksum scan is a separate, still-unbounded
+  residual (a follow-up), so the default ROW_COUNT + reconcile path is now fully bounded
+  but CHECKSUM mode can still time out on a very large table.
+
 ## v0.1.340
 
 ### Fixed

@@ -584,6 +584,22 @@ def integer_pk_column(table: TableDef) -> Optional[str]:
     return pk if base in _INTEGER_BASE_TYPES else None
 
 
+def single_pk_column(table: TableDef) -> Optional[str]:
+    """Return ``table``'s single-column primary key of ANY type, or ``None``.
+
+    Unlike :func:`integer_pk_column` (restricted to integer PKs so a CROSS-engine
+    ascending merge order is well defined), this accepts any single-column PK
+    (uuid/varchar/binary/...), because COUNTING the target by bounded keyset paging
+    needs only a self-consistent order ON THE TARGET, not a cross-engine one. A
+    composite or missing PK returns ``None`` (the target count then falls back to a
+    single ``COUNT(*)``).
+    """
+    if len(table.primary_key) != 1:
+        return None
+    pk = table.primary_key[0]
+    return pk if any(c.name == pk for c in table.columns) else None
+
+
 def _norm_pk(value: object) -> str:
     """Canonical primary-key string for cross-engine set comparison (int-safe).
 
@@ -695,12 +711,63 @@ def _target_scalar(connection: Any, statement: Any) -> object:
 
 
 def _target_count(connection: Any, table_name: str) -> int:
-    """Return ``COUNT(*)`` for a target table (read-only ``SELECT``)."""
+    """Return ``COUNT(*)`` for a target table (read-only ``SELECT``).
+
+    A single unbounded scan: used ONLY as the fallback for a composite/missing PK
+    (see :func:`_bounded_target_count`); on a very large such table it can still hit
+    Aurora DSQL's 300s transaction limit -- a documented residual gap.
+    """
     statement = sql.SQL("SELECT COUNT(*) FROM {table}").format(
         table=_pg_table_identifier(table_name)
     )
     value = _target_scalar(connection, statement)
     return int(value) if value is not None else 0
+
+
+def _target_count_keyset(
+    connection: Any, table: TableDef, pk_column: str, page_size: int
+) -> int:
+    """Exact target row count via BOUNDED keyset paging on a single-column PK.
+
+    A single ``SELECT COUNT(*)`` scans the whole target in ONE transaction and, on a
+    large table, exceeds Aurora DSQL's hard 300s transaction limit ("transaction age
+    limit of 300s exceeded"), so a big table could otherwise never be validated. This
+    pages the PK index (``WHERE pk > :last ORDER BY pk LIMIT N`` -- the same keyset
+    stream reconciliation uses) and sums the per-page row counts, so every statement
+    stays well under the limit and memory stays at one page. Reads only the PK column
+    (Property 7); works for any orderable single-column PK (int/uuid/varchar/binary).
+    """
+    first_sql = build_pg_pk_first_page_sql(table, pk_column, page_size)
+    next_sql = build_pg_pk_next_page_sql(table, pk_column, page_size)
+    total = 0
+    last: object = None
+    while True:
+        cursor = connection.cursor()
+        try:
+            if last is None:
+                cursor.execute(first_sql)
+            else:
+                cursor.execute(next_sql, {"last": last})
+            rows = cursor.fetchall()
+        finally:
+            _safe_close(cursor)
+        total += len(rows)
+        if len(rows) < page_size:
+            return total
+        last = rows[-1][0]
+
+
+def _bounded_target_count(connection: Any, table: TableDef, page_size: int) -> int:
+    """Target row count, bounded (keyset) for a single-column PK; ``COUNT(*)`` else.
+
+    A composite/missing PK has no single keyset column, so it falls back to the
+    unbounded ``COUNT(*)`` (which can still time out on a very large composite-PK
+    table -- a residual gap not covered here).
+    """
+    pk_column = single_pk_column(table)
+    if pk_column is not None:
+        return _target_count_keyset(connection, table, pk_column, page_size)
+    return _target_count(connection, table.name)
 
 
 def _target_checksum(connection: Any, table: TableDef) -> str:
@@ -1450,8 +1517,21 @@ class Validator:
         source_row_count = self._source_row_count(
             source_connection, table, watermark
         )
-        target_row_count = _target_count(target_connection, table.name)
-        row_count_match = source_row_count == target_row_count
+        # The TARGET count must be BOUNDED on Aurora DSQL: a single COUNT(*) scans the
+        # whole table in one transaction and, at scale, exceeds DSQL's hard 300s limit,
+        # so a large table could never report MATCH. We prefer the exact count that
+        # reconciliation ALREADY streams (keyset-paged) for an integer PK; otherwise we
+        # keyset-page the count ourselves for any single-column PK; COUNT(*) is used only
+        # for a composite/missing PK. In deep-only mode the count is needed UP FRONT to
+        # decide whether to run the deep checks; otherwise it is deferred to after
+        # reconcile so reconcile's count is reused with no second scan.
+        target_row_count: Optional[int] = None
+        row_count_match: Optional[bool] = None
+        if deep_only_on_count_mismatch:
+            target_row_count = _bounded_target_count(
+                target_connection, table, self._reconcile_page_size
+            )
+            row_count_match = source_row_count == target_row_count
 
         # Fast path: when asked to deep-check only on a count mismatch, a table whose
         # counts agree skips the per-row checksum + reconciliation scans entirely.
@@ -1486,6 +1566,20 @@ class Validator:
                     ),
                     should_cancel=should_cancel,
                 )
+
+        # Default path: the target count was deferred so it could reuse reconcile's
+        # exact keyset-streamed count (no second scan); when reconcile did not run
+        # (non-integer PK, reconcile off, or CHECKSUM-only), keyset-page it directly --
+        # a single unbounded COUNT(*) is used only for a composite/missing PK.
+        if target_row_count is None:
+            target_row_count = (
+                reconcile_result.target_count
+                if reconcile_result is not None
+                else _bounded_target_count(
+                    target_connection, table, self._reconcile_page_size
+                )
+            )
+            row_count_match = source_row_count == target_row_count
 
         matched = (
             row_count_match

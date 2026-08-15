@@ -5,6 +5,24 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.341
+
+### Fixed
+
+- **検証(Validation)が非常に大きなターゲットテーブルでも動作するようになりました — ターゲット
+  行数を単一の `COUNT(*)` ではなく bounded な方法で数えます**(Validation レビューで発見)。
+  Aurora DSQL には 300 秒のハードなトランザクション制限がありますが、検証はテーブルごとに
+  (すべてのモードで)`SELECT COUNT(*)` を 1 回 — 単一トランザクションの全表スキャン — 実行して
+  いたため、数分ぶんの行を超えると `transaction age limit of 300s exceeded` で失敗し、大きな
+  テーブルは MATCH になり得ませんでした。UUID/`varchar` PK(Aurora DSQL の推奨形状)では特に
+  深刻で、keyset reconcile もスキップされるため確認する経路が皆無でした。今後はターゲット count を、
+  整数 PK なら keyset reconcile が既にストリーミングした正確な総数から再利用し、**任意の単一列 PK**
+  (int/uuid/varchar/binary)なら直接 keyset ページングします(各ページは 300 秒未満の bounded な
+  文、メモリは 1 ページ)。複合/欠落 PK は引き続き `COUNT(*)`(文書化された残存ギャップ)。ソース
+  count は変更なし(watermark スナップショット/ライブ)。注: CHECKSUM モードの全表チェックサム
+  スキャンは別の未解決の残存項目(フォローアップ)で、既定の ROW_COUNT+reconcile 経路は完全に
+  bounded になりましたが、CHECKSUM モードは非常に大きなテーブルでまだタイムアウトし得ます。
+
 ## v0.1.340
 
 ### Fixed

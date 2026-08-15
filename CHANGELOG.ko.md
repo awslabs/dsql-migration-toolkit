@@ -5,6 +5,23 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.341
+
+### Fixed
+
+- **검증(Validation)이 이제 초대형 타깃 테이블에서도 동작합니다 — 타깃 행 수를 단일 `COUNT(*)`가
+  아니라 bounded 방식으로 셉니다** (Validation 리뷰에서 발견). Aurora DSQL은 하드 300초 트랜잭션
+  한계가 있는데, 검증은 테이블마다(모든 모드에서) `SELECT COUNT(*)` 하나 — 단일 트랜잭션의 전체
+  스캔 — 를 실행해, 수 분 분량을 넘기면 `transaction age limit of 300s exceeded`로 실패했고,
+  큰 테이블은 절대 MATCH가 안 됐습니다. UUID/`varchar` PK(Aurora DSQL 권장 형태)에서 특히 심했는데,
+  이 경우 keyset reconcile도 건너뛰어 테이블을 확인할 경로가 아예 없었습니다. 이제 타깃 count는
+  정수 PK면 keyset reconcile가 이미 스트리밍한 정확한 총계를 재사용하고, **임의의 단일-컬럼 PK**
+  (int/uuid/varchar/binary)면 직접 keyset-페이징합니다 — 각 페이지가 300초 미만의 bounded 문장,
+  메모리는 한 페이지. 복합/누락 PK는 여전히 `COUNT(*)`(문서화된 잔여 갭). 소스 count는 그대로
+  (watermark 스냅샷/라이브). 참고: CHECKSUM 모드의 전체-테이블 체크섬 스캔은 별도의 아직-미해결
+  잔여 항목(후속)이라, 기본 ROW_COUNT+reconcile 경로는 이제 완전히 bounded지만 CHECKSUM 모드는
+  초대형 테이블에서 여전히 timeout날 수 있습니다.
+
 ## v0.1.340
 
 ### Fixed

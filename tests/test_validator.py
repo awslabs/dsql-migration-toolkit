@@ -98,6 +98,12 @@ class _FakeSourceConnection:
         self._pk_tokens = pk_tokens or {}
         # {table: [pk, ...]} (ascending) for the full reconciliation keyset stream.
         self._pk_sets = {t: sorted(pks) for t, pks in (pk_sets or {}).items()}
+        # Keep `counts` the single source of truth: a table given a count but no explicit
+        # pk_set gets a synthetic ascending PK set of that size, so the bounded
+        # keyset-paged count (which replaced the unbounded COUNT(*) for single-column-PK
+        # tables) and reconciliation see the same total. Explicit pk_sets win (setdefault).
+        for _t, _n in self._counts.items():
+            self._pk_sets.setdefault(_t, list(range(1, int(_n) + 1)))
         self._gtid = gtid
         self.executed: list[str] = []
         self.execution_options_calls: list[dict] = []
@@ -215,6 +221,11 @@ class _FakeTargetConnection:
         self._pk_tokens = pk_tokens or {}
         # {table: [pk, ...]} (ascending) for the full reconciliation keyset stream.
         self._pk_sets = {t: sorted(pks) for t, pks in (pk_sets or {}).items()}
+        # Keep `counts` the single source of truth (see _FakeSourceConnection): a table
+        # with a count but no explicit pk_set gets a synthetic ascending PK set of that
+        # size so the bounded keyset target count matches COUNT(*). Explicit pk_sets win.
+        for _t, _n in self._counts.items():
+            self._pk_sets.setdefault(_t, list(range(1, int(_n) + 1)))
         # Tables that raise when read on the target (per-table error isolation).
         self._missing_tables = missing_tables or set()
         self.executed: list[str] = []
@@ -1496,7 +1507,56 @@ def test_reconcile_off_issues_no_keyset_page() -> None:
         _SOURCE_CONFIG, _TARGET_CONFIG, [_table("orders")], reconcile=False
     )
     assert report.items[0].reconcile is None
+    # The SOURCE is never keyset-paged (its count comes from the watermark/COUNT(*)).
+    # (The TARGET is keyset-counted now -- see the H1 tests below.)
     assert not any("LIMIT :PAGE" in s.upper() for s in source.executed)
+
+
+def test_target_count_uses_bounded_keyset_not_count_star_for_single_pk() -> None:
+    """H1: a single-column-PK table's target count is BOUNDED (keyset-paged), never a
+    single COUNT(*) that would exceed DSQL's 300s limit at scale. Holds for a
+    non-integer PK too (the flagged UUID/varchar case, which reconciliation skips)."""
+    source = _FakeSourceConnection(counts={"orders": 3})
+    target = _FakeTargetConnection(counts={"orders": 3})
+    report = _validator(source, target).validate(
+        _SOURCE_CONFIG, _TARGET_CONFIG, [_table("orders")]
+    )
+    assert report.items[0].target_row_count == 3
+    assert report.items[0].matched is True
+    assert not any("COUNT(*)" in s for s in target.executed)
+
+    src2 = _FakeSourceConnection(counts={"t": 4})
+    tgt2 = _FakeTargetConnection(counts={"t": 4})
+    vt = _table("t", columns=("code",), primary_key=("code",))
+    vt.columns[0].mysql_type = "varchar(10)"
+    rep2 = _validator(src2, tgt2).validate(_SOURCE_CONFIG, _TARGET_CONFIG, [vt])
+    assert rep2.items[0].target_row_count == 4
+    assert not any("COUNT(*)" in s for s in tgt2.executed)
+
+
+def test_reconcile_reuses_streamed_count_no_count_star() -> None:
+    """When reconciliation runs (integer PK) the target count is the exact total it
+    already streamed keyset-paged -- no separate COUNT(*) scan is issued."""
+    source = _FakeSourceConnection(counts={"orders": 3}, pk_sets={"orders": [1, 2, 3]})
+    target = _FakeTargetConnection(counts={"orders": 3}, pk_sets={"orders": [1, 2, 3]})
+    report = _reconciling_validator(source, target).validate(
+        _SOURCE_CONFIG, _TARGET_CONFIG, [_table("orders")], reconcile=True
+    )
+    assert report.items[0].matched is True
+    assert report.items[0].target_row_count == 3
+    assert not any("COUNT(*)" in s for s in target.executed)
+
+
+def test_composite_pk_target_count_falls_back_to_count_star() -> None:
+    """A composite/missing PK has no single keyset column, so the target count still
+    uses COUNT(*) (a documented residual gap: it can time out on a huge composite-PK
+    table). Single-column PKs -- the common shape -- are always keyset-bounded."""
+    source = _FakeSourceConnection(counts={"t": 2})
+    target = _FakeTargetConnection(counts={"t": 2})
+    ct = _table("t", columns=("a", "b"), primary_key=("a", "b"))
+    report = _validator(source, target).validate(_SOURCE_CONFIG, _TARGET_CONFIG, [ct])
+    assert report.items[0].target_row_count == 2
+    assert any("COUNT(*)" in s for s in target.executed)
 
 
 def test_reconcile_pk_pages_are_read_only() -> None:

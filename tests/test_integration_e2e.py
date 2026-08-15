@@ -266,12 +266,19 @@ class _FakeValidationTargetCursor:
     def __init__(self, connection: "_FakeValidationTarget") -> None:
         self._connection = connection
         self._result: object = None
+        self._rows: Optional[list] = None
 
-    def execute(self, statement: Any) -> None:
-        self._result = self._connection.resolve(statement)
+    def execute(self, statement: Any, parameters: Any = None) -> None:
+        self._result = self._connection.resolve(statement, parameters)
+        self._rows = self._result if isinstance(self._result, list) else None
 
     def fetchone(self):  # noqa: ANN201
-        return None if self._result is None else (self._result,)
+        if self._result is None or isinstance(self._result, list):
+            return None
+        return (self._result,)
+
+    def fetchall(self) -> list:
+        return list(self._rows or [])
 
     def close(self) -> None:  # noqa: D401 - nothing to release
         return None
@@ -284,13 +291,25 @@ class _FakeValidationTarget:
     def cursor(self) -> _FakeValidationTargetCursor:
         return _FakeValidationTargetCursor(self)
 
-    def resolve(self, statement: Any) -> object:
+    def resolve(self, statement: Any, parameters: Any = None) -> object:
         import re
 
         text_sql = statement if isinstance(statement, str) else statement.as_string(None)
+        params = parameters or {}
+        match = re.findall(r'FROM "([^"]+)"', text_sql)
+        table = match[-1] if match else ""
         if "COUNT(*)" in text_sql:
-            match = re.findall(r'FROM "([^"]+)"', text_sql)
-            return self._counts.get(match[-1] if match else "", 0)
+            return self._counts.get(table, 0)
+        # Bounded keyset PK page (the target row-count path replaced the unbounded
+        # COUNT(*) for single-column-PK tables): synthesize ascending PKs 1..count and
+        # page them by the `last` keyset value + LIMIT.
+        if "AS pk" in text_sql and "md5(" not in text_sql:
+            n = self._counts.get(table, 0)
+            last = params.get("last")
+            start = 0 if last is None else int(last)
+            limit_match = re.search(r"LIMIT (\d+)", text_sql)
+            limit = int(limit_match.group(1)) if limit_match else n
+            return [(pk,) for pk in range(start + 1, n + 1)][:limit]
         return None
 
     def close(self) -> None:  # noqa: D401 - nothing to release
