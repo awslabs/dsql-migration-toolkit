@@ -160,6 +160,22 @@ def _is_terminal_read_error(exc: Exception) -> bool:
     return any(marker in text for marker in _TERMINAL_READ_ERROR_MARKERS)
 
 
+def _stack_absent_error(exc: Exception) -> bool:
+    """True when a ``describe_stacks`` failure means the stack does not EXIST (as
+    opposed to a read/credential error).
+
+    CloudFormation raises a ``ValidationError`` whose message is ``Stack with id
+    <name> does not exist`` when the named stack is gone. The Delete path treats that
+    as a successful vanish, so it must be told apart from a genuine read error
+    (ExpiredToken / throttle / access lost), which has to surface rather than read as
+    "the stack is gone" or "still in progress"."""
+    response = getattr(exc, "response", None)
+    code = ""
+    if isinstance(response, dict):
+        code = str(response.get("Error", {}).get("Code", ""))
+    return "does not exist" in (code + " " + str(exc)).lower()
+
+
 class CdcDeployError(RuntimeError):
     """A deploy precondition failed (bad stack state, unfilled placeholder, …)."""
 
@@ -604,13 +620,35 @@ class CdcStackDeployer:
             azs |= _parse_unsupported_azs(ev.get("ResourceStatusReason", ""))
         return azs
 
-    def stack_status(self, stack_name: str) -> Optional[str]:
-        """Return the stack's current StackStatus, or ``None`` on error."""
+    def stack_status_checked(self, stack_name: str) -> Optional[str]:
+        """Return the stack's current StackStatus, RAISING on a read error.
+
+        Returns ``None`` ONLY when the stack genuinely does not exist (a
+        CloudFormation ``ValidationError`` "… does not exist"). Any OTHER failure --
+        an expired/now-unauthorized credential, throttling, a transient network error
+        -- is RAISED so a wait loop can classify it (fail fast on a terminal auth
+        error, tolerate a few transient ones) instead of collapsing it to ``None``
+        and mistaking it for "still in progress". Mirrors :meth:`connector_state`,
+        which raises for the same reason; :meth:`stack_status` wraps this and swallows
+        for best-effort callers."""
+        client = self._client("cloudformation")
         try:
-            client = self._client("cloudformation")
             stacks = client.describe_stacks(StackName=stack_name).get("Stacks", [])
-            return str(stacks[0].get("StackStatus")) if stacks else None
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - distinguish "gone" from "read error"
+            if _stack_absent_error(exc):
+                return None  # genuinely gone (a Delete-path vanish is a success)
+            raise
+        return str(stacks[0].get("StackStatus")) if stacks else None
+
+    def stack_status(self, stack_name: str) -> Optional[str]:
+        """Return the stack's current StackStatus, or ``None`` on ANY error.
+
+        Best-effort snapshot for callers that only want the status if it is cheaply
+        readable (fast-path skips). A wait loop that must tell a terminal credential
+        error apart from "still in progress" uses :meth:`stack_status_checked`."""
+        try:
+            return self.stack_status_checked(stack_name)
+        except Exception:  # noqa: BLE001 - best-effort snapshot
             return None
 
     def connector_state(self, connector_name: str) -> Optional[str]:
@@ -1109,6 +1147,7 @@ def _wait_stack_settles(
     deadline = _monotonic_deadline(timeout)
     seen_until = since
     saw_partition_quota = False
+    status_read_failures = 0
     # Seeder-ENI reporting state. ``-2`` is an unused sentinel so the first real
     # reading (including 0) always prints. ``eni_wait_started`` / ``eni_last_logged``
     # drive the periodic re-report: logging ONLY on change left an observed 18m30s gap
@@ -1166,11 +1205,46 @@ def _wait_stack_settles(
                     eni_wait_started = None
                     eni_last_logged = None
                 last_eni_count = count
-        status = deployer.stack_status(stack_name)
+        try:
+            status = deployer.stack_status_checked(stack_name)
+        except Exception as exc:  # noqa: BLE001 - a status READ failure, not a state
+            # A read failure must NOT masquerade as "still in progress" and spin the
+            # wait to a false "Stack operation timed out." A credential/authorization
+            # error will not self-heal -> fail immediately with the cause. This is the
+            # observed failure mode: the deployer's single 1 h assumed-role session
+            # expires mid-op (connector waits run 45 min each; an AZ-retry
+            # delete+recreate passes an hour), every CFN read then raises ExpiredToken,
+            # stack_status swallowed it to None, the None was read as "transient, keep
+            # polling", and the loop burned the whole timeout before wrongly reporting
+            # a timeout on a stack that had actually reached CREATE_COMPLETE. A
+            # transient error is tolerated for a few consecutive polls, then surfaced.
+            # Mirrors _wait_connector_running's read-failure handling.
+            status_read_failures += 1
+            cause = str(exc).splitlines()[0]
+            terminal = _is_terminal_read_error(exc)
+            driver.log(
+                f"could not read stack status ({cause}) "
+                f"[{status_read_failures}/{_MAX_STATE_READ_FAILURES}]"
+            )
+            if terminal or status_read_failures >= _MAX_STATE_READ_FAILURES:
+                hint = (
+                    " Credentials may have expired or access was lost mid-deploy; the "
+                    "stack operation may still be running in AWS -- check the "
+                    "CloudFormation console, then retry."
+                    if terminal else ""
+                )
+                raise CdcDeployError(
+                    f"Could not read the status of stack '{stack_name}': {cause}.{hint}"
+                )
+            if _deadline_passed(deadline):
+                raise CdcDeployError("Stack operation timed out.")
+            driver.sleep(interval)
+            continue
+        status_read_failures = 0  # a successful read clears the transient streak
         if status is None:
             if vanish_ok:
                 return None  # stack is gone — delete succeeded
-            # transient read error mid-operation; keep polling
+            # genuinely absent but not a delete wait; keep polling
         elif "IN_PROGRESS" not in status:
             if "ROLLBACK" in status or "FAILED" in status:
                 if saw_partition_quota:

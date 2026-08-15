@@ -5,6 +5,80 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.333
+
+### 修正 (Fixed)
+
+- **1 時間の assumed-role 認証情報を超過した CDC のデプロイ/開始が、誤った「Stack operation timed out.」を報告し、課金対象の作りかけスタックを放置していました。**
+  デプロイヤは操作全体に対して単一の `sts:AssumeRole` セッション（静的な 1 時間の認証情報）を使いますが、1 回の実行が
+  1 時間を超えることがあります（コネクタの RUNNING 待ちは各最大 45 分、AZ リトライの delete + MSK 再作成は 1 時間超）。
+  認証情報が期限切れになると、すべての CloudFormation 読み取りが `ExpiredToken` を送出し、`stack_status` がそれを
+  `None` に握り潰し、スタック確定待ちがその `None` を「一時的なので継続ポーリング」と解釈して — スタックが実際には
+  `CREATE_COMPLETE` に到達していても — タイムアウト全体を消費した後に誤ったタイムアウトを報告していました。待機処理は
+  ステータスを raising プローブ（`stack_status_checked`）で読み取り、終端的（terminal）な認証情報/認可エラーでは
+  実行可能な原因（「認証情報が期限切れの可能性 … スタック操作は AWS でまだ実行中の可能性があるためコンソールを確認して
+  再試行」）とともに直ちに失敗し、一方で数回の一時的な読み取りブリップは引き続き許容します — コネクタの RUNNING 待ちの
+  既存処理と同じ方式です。`stack_status` は他の呼び出し元のために best-effort の握り潰しを維持します。（根本的な予防 —
+  長時間の操作が途中で期限切れにならないようデプロイロールの refreshable 認証情報 — は後続作業として追跡します。）
+
+## v0.1.332
+
+### 修正 (Fixed)
+
+- **マイグレーションが 500 を超えるテーブルを追跡すると、CDC のレプリケーション遅延（lag）モニターが全体的に空白になっていました。**
+  `applied_ops_by_table` は CloudWatch の `GetMetricData` クエリを ≤500 クエリ/リクエスト（API 上限）に
+  バッチ化しますが、`replication_lag_by_table` と `replication_lag_series` はバッチ化せず単一呼び出しを行っていました。
+  500 を超えるとその呼び出しが `ValidationError` を送出し、両メソッドの広い `except` がそれを `{}`/`[]` に握り潰して、
+  テーブル別「Stream lag」列と「Stream lag over time」トレンドチャートを *パイプライン全体* について（超過分だけでなく）
+  空白にし、オペレーターがレプリケーション遅延のシグナルが全く無い状態でカットオーバーを判断することになっていました。
+  両 lag メソッドとも ≤500 クエリのリクエストにバッチ化し、バッチ間でマージ（テーブル別の現在遅延は id で、トレンドは
+  タイムスタンプバケットの MAX で）するようになり、`applied_ops_by_table` と同様に lag 表示が大規模テーブルセットに
+  スケールします。
+
+## v0.1.331
+
+### 修正 (Fixed)
+
+- **「Fix target schema…」の ADD COLUMN ドリフト復旧が静かに no-op になっていました（主要ケースの復旧が到達不能）。**
+  DLQ ログパーサーが dead-letter レコードを *bare* テーブル名（`orders`）でキー付けしていましたが、ドリフト復旧の
+  `information_schema` 読み取りには db 修飾の `db.table` が必要です — bare 名は `schema='orders', name=''` に分割され
+  0 行にマッチするため、`plan_add_columns` が空のプランを生成し、ダイアログは「ターゲットには既に全ソース列がある」と
+  報告する一方、欠落した列は決して追加されず、そのテーブルは dead-letter され続けていました。`_table_from_topic` が
+  db 修飾の `db.table`（トピックの末尾 2 セグメント）を返すようになり、これにより DLQ のテーブル別表示が CloudWatch
+  モニターの `Table` ディメンション、コネクタの `table.include.list`、ターゲットのスキーマ修飾テーブル（すべて既に
+  `db.table`）と一致します。復旧ダイアログもガードします: ソース列の読み取りが空の場合、誤った「既に最新」ではなく明示的な
+  「could not read source columns for '<table>'」エラーを報告します。
+
+## v0.1.330
+
+### 修正 (Fixed)
+
+- **シード不能なウォーターマーク（GTID のみ）が、復旧すべきオフセットが無いのに `snapshot.mode=recovery` を選択していました — CDC 起動が壊れる問題。**
+  `build_source_config` はウォーターマークに binlog ファイル *または* GTID があれば `recovery` を選んでいましたが、ギャップレス・
+  ハンドオフは seeder が書き込む `connect-offsets` エントリから再開し、seeder は binlog の `file`+`pos` が**両方**揃った時のみ
+  それを書き込みます（`CdcResumePoint.can_seed_offset`）。GTID はあるが binlog 座標が無いウォーターマーク（`SHOW MASTER STATUS`
+  が制限され〔`REPLICATION CLIENT` 無し〕、`@@GLOBAL.gtid_executed` は読める場合に到達）は、seeder がスキップされたのに
+  `recovery` が選ばれ、ソースタスクが起動時に失敗する（復旧対象が無い）か、静かに *現在* の binlog から再開して Full Load 期間中の
+  全変更を失っていました。モード選択は seeder と同じ `can_seed_offset()` 前提条件を使うようになりました: シード不能な
+  ウォーターマークは `schema_only` にフォールバックします（コネクタはクリーンに起動）。そのようなウォーターマークでは元々
+  Full Load からのギャップレスは不可能であり、UI が別途それを提示します。
+
+## v0.1.329
+
+### 修正 (Fixed)
+
+- **CDC のギャップレス・ハンドオフのオフセットシードが再開位置で行をスキップし、サイレントなデータ損失を起こす可能性がありました。**
+  read-modify-write シード（本番経路: no-clobber ガードのためにコネクタのライブオフセットを読み取り、その後 `file`/`pos`
+  を Full Load ウォーターマークで上書きする）が、ライブオフセットの `row`/`event` スキップカウンタをそのまま残していました。
+  ウォーターマーク位置は常にイベント境界（`row=0`/`event=0`）ですが、ライブオフセットは（コネクタが複数行イベントの途中で
+  停止した場合）その旧位置でのみ意味を持つ非ゼロの `row`/`event` を持ち得るため、それをウォーターマーク位置へ引き継ぐと
+  Debezium が再開後の最初のイベントでその数だけ行/イベントをスキップしていました — Full Load にも CDC にも存在しない行です。
+  アプリ側ビルダー（`core/cdc_offset_seed.build_source_offset`）と VPC 内 Lambda のコピー
+  （`deploy/cdc-stack/lambda/seeder._build_source_offset`）の両方が、位置を上書きする際に `row`/`event` を `0` に
+  リセットするようになりました（`server_id` はスキップカウンタではなくソース識別子なので維持）。offset-seeder Lambda zip を
+  再ビルドし、コネクタプラグインの `PLUGIN_VERSION` を `v30` に更新します（`PLUGIN_VERSION` の更新は CDC インフラの
+  Delete + Deploy で反映されます）。
+
 ## v0.1.328
 
 ### 修正 (Fixed)

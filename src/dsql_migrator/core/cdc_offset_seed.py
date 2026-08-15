@@ -77,9 +77,18 @@ def build_source_offset(
     connector's offset value, which is binlog-coordinate based; ``gtids`` is
     added when present so GTID-aware resume is used). When ``base_offset`` is
     given (the live connector's current offset value read from ``connect-offsets``)
-    its shape is preserved and only ``ts_sec``/``file``/``pos``/``gtids`` are
-    overridden -- the safest seed because it mirrors exactly what the connector
-    writes for its own version.
+    its shape is preserved and only ``ts_sec``/``file``/``pos``/``gtids`` (plus the
+    position-relative ``row``/``event`` counters) are overridden -- the safest seed
+    because it mirrors exactly what the connector writes for its own version.
+
+    **Why ``row``/``event`` are reset.** A watermark position (from ``SHOW MASTER
+    STATUS``) is always an event boundary, so the resume point is ``row=0``/
+    ``event=0``. The live ``base_offset``, however, may carry a NON-zero ``row``/
+    ``event`` (the connector stopped mid multi-row event) that is only meaningful at
+    ITS old ``pos``. Copying those forward onto a DIFFERENT (watermark) position
+    would make Debezium skip that many rows/events in the first event after the
+    resume point -- rows that are in neither Full Load nor CDC (silent loss). So
+    when file/pos is overridden the counters are reset to the boundary.
     """
     if watermark.binlog_file is None or watermark.binlog_position is None:
         raise OffsetSeedError(
@@ -93,6 +102,12 @@ def build_source_offset(
     offset["ts_sec"] = ts_sec
     offset["file"] = watermark.binlog_file
     offset["pos"] = int(watermark.binlog_position)
+    # The new position is an event boundary; reset the position-relative skip
+    # counters so a stale row/event copied from base_offset can't make Debezium
+    # skip rows/events at the resume point (server_id is source identity, not a
+    # skip counter, so it is left as-is).
+    offset["row"] = 0
+    offset["event"] = 0
     if watermark.gtid_executed:
         offset["gtids"] = watermark.gtid_executed
     else:

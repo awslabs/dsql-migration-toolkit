@@ -5,6 +5,92 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.333
+
+### Fixed
+
+- **A CDC deploy/start that outran the 1-hour assumed-role credentials reported a false
+  "Stack operation timed out." and stranded a billable half-built stack.** The deployer runs a
+  single `sts:AssumeRole` session (static 1 h credentials) for the whole operation, but a run can
+  exceed an hour (each connector RUNNING-wait is up to 45 min; an AZ-retry delete + MSK recreate
+  passes an hour). Once the credentials expired, every CloudFormation read raised `ExpiredToken`,
+  which `stack_status` swallowed to `None`; the stack-settle wait read that `None` as "transient,
+  keep polling" and burned the entire timeout before wrongly reporting a timeout — even when the
+  stack had actually reached `CREATE_COMPLETE`. The wait now reads status through a raising probe
+  (`stack_status_checked`) and fails fast on a terminal credential/authorization error with an
+  actionable cause ("credentials may have expired … the stack operation may still be running in
+  AWS — check the console, then retry"), while still tolerating a few transient read blips —
+  mirroring the connector RUNNING-wait's existing handling. `stack_status` keeps its best-effort
+  swallow for other callers. (Root-cause prevention — refreshable deploy-role credentials so a
+  long op never expires mid-flight — is tracked as a follow-up.)
+
+## v0.1.332
+
+### Fixed
+
+- **The CDC replication-lag monitor blanked entirely once a migration tracked more than 500
+  tables.** `applied_ops_by_table` batches its CloudWatch `GetMetricData` queries into ≤500-query
+  requests (the API cap), but `replication_lag_by_table` and `replication_lag_series` issued a
+  single unbatched call. Past 500 tables that call raised `ValidationError`, which the methods'
+  broad `except` swallowed to `{}` / `[]` — blanking the per-table "Stream lag" column **and** the
+  "Stream lag over time" trend chart for the *entire* pipeline (not just the overflow tables), so
+  the operator faced the cutover decision with no replication-lag signal at all. Both lag methods
+  now batch into ≤500-query requests and merge across batches (by id for the per-table current
+  lag; by timestamp bucket, MAX, for the trend), matching `applied_ops_by_table` so the lag
+  surface scales to a large table set.
+
+## v0.1.331
+
+### Fixed
+
+- **The "Fix target schema…" ADD COLUMN drift recovery was a silent no-op (dominant-case
+  recovery unreachable).** The DLQ log parser keyed each dead-lettered record on the *bare*
+  table name (`orders`), but the drift recovery's `information_schema` reads need the
+  db-qualified `db.table` — a bare name splits to `schema='orders', name=''` and matches zero
+  rows, so `plan_add_columns` produced an empty plan and the dialog reported "the target already
+  has every source column" while the missing column was never added and the table kept
+  dead-lettering. `_table_from_topic` now returns the db-qualified `db.table` (the last two
+  topic segments), which also makes the DLQ per-table surface consistent with the CloudWatch
+  monitor's `Table` dimension, the connector's `table.include.list`, and the target's
+  schema-qualified tables (all already `db.table`). Also guards the recovery dialog: an empty
+  source-column read now reports an explicit "could not read source columns for '<table>'" error
+  instead of the false "already up to date".
+
+## v0.1.330
+
+### Fixed
+
+- **A non-seedable watermark (GTID-only) selected `snapshot.mode=recovery` with no offset to
+  recover from — a broken CDC start.** `build_source_config` chose `recovery` whenever the
+  watermark had a binlog file *or* a GTID, but the gapless handoff resumes from a seeded
+  `connect-offsets` entry that the seeder writes only when binlog `file`+`pos` are BOTH present
+  (`CdcResumePoint.can_seed_offset`). A watermark with a GTID set but no binlog coordinates —
+  reachable when `SHOW MASTER STATUS` is restricted (no `REPLICATION CLIENT`) while
+  `@@GLOBAL.gtid_executed` still reads — therefore got `recovery` while the seeder was skipped,
+  so the source task either failed at start (nothing to recover) or silently resumed from the
+  *current* binlog, losing every change made during the Full Load window. The mode gate now uses
+  the same `can_seed_offset()` precondition as the seeder: a non-seedable watermark falls back to
+  `schema_only` (which starts the connector cleanly). Gapless-from-Full-Load was never achievable
+  for such a watermark; the UI surfaces that separately.
+
+## v0.1.329
+
+### Fixed
+
+- **CDC gapless-handoff offset seed could make Debezium skip rows at the resume point (silent
+  loss).** The read-modify-write seed (the production path: it reads the connector's live
+  offset for the no-clobber guard, then overrides `file`/`pos` to the Full Load watermark) left
+  the live offset's `row`/`event` skip counters intact. A watermark position is always an event
+  boundary (`row=0`/`event=0`), but the live offset can carry a non-zero `row`/`event` (the
+  connector stopped mid multi-row event) that is meaningful only at its OLD position — so
+  carrying it onto the watermark position made Debezium skip that many rows/events in the first
+  event after the resume, rows present in neither Full Load nor CDC. Both the app builder
+  (`core/cdc_offset_seed.build_source_offset`) and the vendored in-VPC Lambda copy
+  (`deploy/cdc-stack/lambda/seeder._build_source_offset`) now reset `row`/`event` to `0` when
+  they override the position (`server_id` is source identity, not a skip counter, so it is left
+  as-is). Rebuilds the offset-seeder Lambda zip; connector plugin `PLUGIN_VERSION` → `v30`
+  (a `PLUGIN_VERSION` bump requires Delete + Deploy of the CDC infra to take effect).
+
 ## v0.1.328
 
 ### Fixed

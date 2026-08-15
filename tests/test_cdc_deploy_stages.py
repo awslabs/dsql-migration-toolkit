@@ -183,6 +183,12 @@ class _FakeDeployer:
             return self._stack_statuses.pop(0)
         return self._stack_statuses[0]
 
+    def stack_status_checked(self, stack_name):
+        # The raising variant _wait_stack_settles now uses. This fake never simulates
+        # a read error, so it just mirrors the best-effort sequence (a read error is
+        # exercised by a dedicated fake in test_cdc_deployer.py).
+        return self.stack_status(stack_name)
+
     def seeder_eni_count(self, stack_name):
         # Default: unknown (None) so the delete wait logs no ENI line unless a test
         # opts in by setting self._seeder_eni_counts to a drainable sequence.

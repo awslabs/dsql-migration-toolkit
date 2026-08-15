@@ -89,6 +89,41 @@ def test_build_source_config_without_coordinates() -> None:
     assert config.start_gtid is None
     assert config.start_binlog_file is None
     assert config.start_binlog_pos is None
+    # No coordinates at all -> nothing to seed -> schema_only (starts cleanly).
+    assert config.snapshot_mode == "schema_only"
+
+
+def test_build_source_config_gtid_only_watermark_uses_schema_only() -> None:
+    # A watermark with a GTID set but NO binlog file:pos cannot seed the
+    # connect-offsets entry (the seeder is keyed on binlog file+pos and rejects a
+    # GTID-only watermark). Reachable when SHOW MASTER STATUS is restricted
+    # (REPLICATION CLIENT missing on RDS/Aurora) but @@GLOBAL.gtid_executed reads.
+    # snapshot.mode MUST be schema_only, not recovery: recovery would resume from a
+    # seeded offset that was never written -> task-start failure or a silent resume
+    # from the live binlog (losing the Full-Load-window changes).
+    orch = CdcPipelineOrchestrator()
+    watermark = Watermark(
+        gtid_executed="3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5",
+        server_uuid="3E11FA47-71CA-11E1-9E33-C80AA9429562",
+        snapshot_timestamp=datetime(2026, 5, 6, 7, 8, 9, tzinfo=timezone.utc),
+    )
+    config = orch.build_source_config("src", _tables(), watermark)
+    assert config.snapshot_mode == "schema_only"
+    assert config.start_gtid == "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5"
+    assert config.start_binlog_file is None and config.start_binlog_pos is None
+
+
+def test_build_source_config_binlog_file_without_position_uses_schema_only() -> None:
+    # A watermark with a binlog file but no position also cannot seed an offset
+    # (can_seed_offset requires BOTH), so it must not select recovery either.
+    orch = CdcPipelineOrchestrator()
+    watermark = Watermark(
+        binlog_file="mysql-bin.000123",
+        binlog_position=None,
+        snapshot_timestamp=datetime(2026, 5, 6, 7, 8, 9, tzinfo=timezone.utc),
+    )
+    config = orch.build_source_config("src", _tables(), watermark)
+    assert config.snapshot_mode == "schema_only"
 
 
 def test_build_source_config_column_exclude_list_default_empty() -> None:

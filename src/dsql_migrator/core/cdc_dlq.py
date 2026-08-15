@@ -56,12 +56,24 @@ _MAX_MESSAGE_LEN = 2000
 
 
 def _table_from_topic(topic: str) -> str:
-    """Return the table name from a ``<prefix>.<db>.<table>`` Kafka topic.
+    """Return the ``db.table`` identity from a ``<prefix>.<db>.<table>`` Kafka topic.
 
-    Falls back to the whole topic when it is not dotted (so the record still
-    surfaces under a stable, non-empty key rather than being dropped).
+    The db-QUALIFIED name (not the bare table) is what the rest of the tool keys a
+    table on: the CloudWatch monitor's ``Table`` dimension, the connector's
+    ``table.include.list``, and the target's schema-qualified table (a source
+    ``db.table`` maps to a DSQL table in schema ``db``). Returning the bare table
+    here made the DLQ per-table surface inconsistent with those AND broke the
+    ADD COLUMN drift recovery, whose ``information_schema`` reads need ``db.table``
+    (a bare name splits to ``schema=<table>, name=""`` and matches zero rows).
+
+    The db + table are always the LAST two dot-segments regardless of how many
+    segments the prefix itself has, so take those. Falls back to the whole topic
+    when it is not dotted (so the record still surfaces under a stable, non-empty
+    key rather than being dropped).
     """
     parts = [segment for segment in topic.split(".") if segment]
+    if len(parts) >= 2:
+        return f"{parts[-2]}.{parts[-1]}"
     return parts[-1] if parts else topic
 
 

@@ -67,6 +67,11 @@ def _build_source_offset(wm, base_offset=None):
     offset["ts_sec"] = int(wm["ts_sec"])
     offset["file"] = wm["file"]
     offset["pos"] = int(wm["pos"])
+    # New position is an event boundary; reset the position-relative skip counters
+    # so a stale row/event from base_offset can't make Debezium skip rows/events at
+    # the resume point (silent loss). Mirrors cdc_offset_seed.build_source_offset.
+    offset["row"] = 0
+    offset["event"] = 0
     if wm.get("gtids"):
         offset["gtids"] = wm["gtids"]
     else:

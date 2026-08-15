@@ -496,6 +496,30 @@ def test_replication_lag_by_table_no_call_without_stack_or_tables() -> None:
     assert client.calls == []
 
 
+def test_replication_lag_by_table_batches_over_500_query_cap() -> None:
+    # GetMetricData caps at 500 MetricDataQueries/request and this builds ONE per
+    # table, so >500 tables would exceed it in a single call -> raise -> blanket except
+    # blanks the WHOLE lag surface (every table). The queries must be split into
+    # <=500-query batches and merged by id so a large table set scales instead of
+    # failing (mirrors applied_ops_by_table). echo -> 1 ms per query, no Timestamps ->
+    # kept (the freshness cutoff only drops datapoints that HAVE a stale timestamp).
+    tables = [f"cdc.t{i}" for i in range(600)]  # 600 tables -> 600 queries
+    client = _FakeClient(
+        {
+            "list_metrics": {"Metrics": [
+                {"Dimensions": [{"Name": "Stack", "Value": "stk"},
+                                {"Name": "Table", "Value": t}]} for t in tables]},
+            "get_metric_data": "echo",
+        }
+    )
+    got = _controller(client).replication_lag_by_table("stk", tables)
+    assert len(got) == 600  # every table surfaced; none dropped by an over-cap failure
+    assert got["cdc.t0"] == 1
+    gmd_calls = [c for c in client.calls if c[0] == "get_metric_data"]
+    assert len(gmd_calls) == 2  # ceil(600 / 500) = 2 batches
+    assert all(len(c[1]["MetricDataQueries"]) <= 500 for c in gmd_calls)  # cap respected
+
+
 def test_replication_lag_series_max_across_tables_ascending() -> None:
     # The trend series keeps the WHOLE window (not just values[0]) and collapses the
     # per-table series into one worst-case (MAX across tables) line per 1-min bucket,
@@ -533,6 +557,32 @@ def test_replication_lag_series_empty_on_error_or_no_input() -> None:
     assert _controller(client).replication_lag_series("", ["orders"]) == []
     assert _controller(client).replication_lag_series("stk", []) == []
     assert client.calls == []
+
+
+def test_replication_lag_series_batches_over_500_query_cap() -> None:
+    # Same 500-query cap as replication_lag_by_table: the trend chart builds ONE query
+    # per table, so >500 tables in a single get_metric_data would raise and blank the
+    # WHOLE chart. The queries must be batched <=500 and by_bucket accumulated across
+    # batches (MAX is associative, so merging batches is correct). The fake returns the
+    # same two datapoints for every batch; MAX-merging them is idempotent, so the trend
+    # is unchanged while proving the batching path runs.
+    tables = [f"cdc.t{i}" for i in range(600)]  # 600 tables -> 600 queries
+    client = _FakeClient(
+        {
+            "list_metrics": {"Metrics": [
+                {"Dimensions": [{"Name": "Stack", "Value": "stk"},
+                                {"Name": "Table", "Value": t}]} for t in tables]},
+            # Int epochs (the reader handles non-datetime timestamps); Ids are ignored
+            # by the series path (it accumulates by timestamp bucket, not by id).
+            "get_metric_data": {"MetricDataResults": [
+                {"Timestamps": [1000, 2000], "Values": [10.0, 20.0]}]},
+        }
+    )
+    got = _controller(client).replication_lag_series("stk", tables)
+    assert got == [(1000, 10), (2000, 20)]  # merged across both batches, ascending
+    gmd_calls = [c for c in client.calls if c[0] == "get_metric_data"]
+    assert len(gmd_calls) == 2  # ceil(600 / 500) = 2 batches
+    assert all(len(c[1]["MetricDataQueries"]) <= 500 for c in gmd_calls)  # cap respected
 
 
 def test_match_metric_tables_prefers_exact_then_unambiguous_bare() -> None:
@@ -678,7 +728,9 @@ def test_dlq_errors_parses_new_events_and_dedups() -> None:
     controller = _controller(client)
 
     first = controller.dlq_errors("/msk-connect/mysql-dsql-cdc-stack-cdc")
-    assert [e.table for e in first] == ["orders", "payments"]  # INFO noise skipped
+    # db-qualified (db.table): consistent with the monitor's Table dimension and
+    # what the ADD COLUMN drift recovery needs. INFO noise skipped.
+    assert [e.table for e in first] == ["shop.orders", "shop.payments"]
     assert first[0].error_code == "42804"
     assert "offset=42" in first[0].message
 

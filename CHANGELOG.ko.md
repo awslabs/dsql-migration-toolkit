@@ -5,6 +5,77 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.333
+
+### 수정 (Fixed)
+
+- **1시간짜리 assumed-role 크레덴셜을 초과하는 CDC 배포/시작이 거짓 "Stack operation timed out."을 보고하고 청구성 반쯤-만들어진 스택을 방치하던 문제.**
+  deployer는 작업 전체에 대해 단일 `sts:AssumeRole` 세션(정적 1시간 크레덴셜)을 사용하지만, 한 번의 실행이 1시간을
+  넘길 수 있습니다(커넥터 RUNNING 대기가 각 최대 45분, AZ 재시도 delete + MSK 재생성은 1시간 초과). 크레덴셜이
+  만료되면 모든 CloudFormation 읽기가 `ExpiredToken`을 던졌고, `stack_status`가 이를 `None`으로 삼켰으며,
+  스택-정착 대기는 그 `None`을 "일시적 오류, 계속 폴링"으로 읽어 — 스택이 실제로는 `CREATE_COMPLETE`에 도달했는데도 —
+  전체 타임아웃을 소진한 뒤 잘못된 타임아웃을 보고했습니다. 이제 대기는 상태를 raising 프로브(`stack_status_checked`)로
+  읽고, 종료성(terminal) 크레덴셜/인가 오류에서는 실행 가능한 원인("크레덴셜이 만료되었을 수 있음 … 스택 작업이 AWS에서
+  아직 실행 중일 수 있으니 콘솔을 확인 후 재시도")과 함께 즉시 실패하되, 몇 번의 일시적 읽기 blip은 계속 허용합니다 —
+  커넥터 RUNNING 대기의 기존 처리와 동일한 방식. `stack_status`는 다른 호출자를 위해 best-effort 삼킴을 유지합니다.
+  (근본 예방 — 장기 작업이 중간에 만료되지 않도록 배포-역할 refreshable 크레덴셜 — 은 후속 작업으로 추적.)
+
+## v0.1.332
+
+### 수정 (Fixed)
+
+- **마이그레이션이 500개를 초과하는 테이블을 추적하면 CDC 복제 지연(lag) 모니터가 전체적으로 비던 문제.**
+  `applied_ops_by_table`는 CloudWatch `GetMetricData` 쿼리를 ≤500개 요청(API 상한)으로 배치하지만,
+  `replication_lag_by_table`와 `replication_lag_series`는 배치 없이 단일 호출을 던졌습니다. 500개를 넘으면 그
+  호출이 `ValidationError`를 발생시키고, 두 메서드의 광범위한 `except`가 이를 `{}`/`[]`로 삼켜 — 테이블별 "Stream
+  lag" 컬럼과 "Stream lag over time" 추세 차트를 *전체* 파이프라인에 대해(초과분만이 아니라) 공백으로 만들어,
+  운영자가 복제-지연 신호가 전혀 없는 상태로 컷오버를 결정하게 했습니다. 이제 두 lag 메서드 모두 ≤500 쿼리 요청으로
+  배치하고 배치 간 병합(테이블별 현재 지연은 id로, 추세는 타임스탬프 버킷의 MAX로)하여, `applied_ops_by_table`처럼
+  lag 표면이 대규모 테이블 세트로 확장됩니다.
+
+## v0.1.331
+
+### 수정 (Fixed)
+
+- **"Fix target schema…" ADD COLUMN 드리프트 복구가 조용히 no-op이던 문제(주요 케이스 복구 도달 불가).**
+  DLQ 로그 파서가 dead-letter된 레코드를 *bare* 테이블명(`orders`)으로 키를 잡았지만, 드리프트 복구의
+  `information_schema` 조회는 db-수식된 `db.table`이 필요합니다 — bare 이름은 `schema='orders', name=''`로
+  분리되어 0행과 매칭되므로, `plan_add_columns`가 빈 계획을 만들고 다이얼로그는 "타깃에 이미 모든 소스 컬럼이 있음"이라고
+  보고하는 사이 누락 컬럼은 절대 추가되지 않고 해당 테이블은 계속 dead-letter되었습니다. 이제 `_table_from_topic`이
+  db-수식된 `db.table`(토픽의 마지막 두 세그먼트)을 반환하며, 이는 DLQ 테이블별 표면을 CloudWatch 모니터의 `Table`
+  차원, 커넥터의 `table.include.list`, 타깃의 스키마-수식 테이블(모두 이미 `db.table`)과 일치시킵니다. 복구
+  다이얼로그도 가드합니다: 소스 컬럼 조회가 비면 이제 거짓 "이미 최신" 대신 명시적인 "could not read source columns
+  for '<table>'" 오류를 보고합니다.
+
+## v0.1.330
+
+### 수정 (Fixed)
+
+- **시드 불가능한 워터마크(GTID만 있음)가 복구할 오프셋이 없는데도 `snapshot.mode=recovery`를 선택하던 문제 — 깨진 CDC 시작.**
+  `build_source_config`는 워터마크에 binlog 파일 *또는* GTID가 있으면 무조건 `recovery`를 골랐지만, 무중단 핸드오프는
+  seeder가 기록한 `connect-offsets` 항목에서 재개하며 seeder는 binlog `file`+`pos`가 **둘 다** 있을 때만 이를 기록합니다
+  (`CdcResumePoint.can_seed_offset`). GTID는 있으나 binlog 좌표가 없는 워터마크 — `SHOW MASTER STATUS`가 제한되고
+  (`REPLICATION CLIENT` 없음) `@@GLOBAL.gtid_executed`만 읽히는 경우 도달 가능 — 는 seeder가 건너뛰어졌는데도 `recovery`가
+  선택되어, 소스 태스크가 시작 시 실패(복구할 것 없음)하거나 조용히 *현재* binlog부터 재개해 Full Load 구간의 모든 변경을
+  유실했습니다. 이제 모드 게이트는 seeder와 동일한 `can_seed_offset()` 전제 조건을 사용합니다: 시드 불가능한 워터마크는
+  `schema_only`로 폴백(커넥터가 깨끗하게 시작). 그런 워터마크로는 애초에 Full Load 무중단이 불가능했으며, UI가 이를 별도로
+  안내합니다.
+
+## v0.1.329
+
+### 수정 (Fixed)
+
+- **CDC 무중단(gapless) 핸드오프의 오프셋 시드가 재개 지점에서 행을 건너뛰어 조용한 유실을 일으킬 수 있었습니다.**
+  read-modify-write 시드(운영 경로: no-clobber 가드를 위해 커넥터의 라이브 오프셋을 읽은 뒤 `file`/`pos`를 Full
+  Load 워터마크로 덮어씀)가 라이브 오프셋의 `row`/`event` 스킵 카운터를 그대로 남겨두었습니다. 워터마크 위치는 항상
+  이벤트 경계(`row=0`/`event=0`)이지만, 라이브 오프셋은 (커넥터가 다중 행 이벤트 중간에 멈춘 경우) 그 이전 위치에서만
+  의미 있는 0이 아닌 `row`/`event`를 가질 수 있어, 이를 워터마크 위치로 이월하면 Debezium이 재개 후 첫 이벤트에서 그
+  개수만큼 행/이벤트를 건너뛰었습니다 — Full Load에도 CDC에도 없는 행입니다. 앱 빌더(`core/cdc_offset_seed.build_source_offset`)와
+  인-VPC Lambda 사본(`deploy/cdc-stack/lambda/seeder._build_source_offset`) 모두 이제 위치를 덮어쓸 때 `row`/`event`를
+  `0`으로 초기화합니다(`server_id`는 스킵 카운터가 아닌 소스 식별자이므로 유지). offset-seeder Lambda zip을 재빌드하고
+  커넥터 플러그인 `PLUGIN_VERSION`을 `v30`으로 올립니다(`PLUGIN_VERSION` 범프는 CDC 인프라의 Delete + Deploy가
+  있어야 반영됩니다).
+
 ## v0.1.328
 
 ### 수정 (Fixed)

@@ -4734,6 +4734,17 @@ async def _open_add_column_dialog(ui, session, table: str, on_refresh=None) -> N
             source_columns = read_source_columns(raw, table)
         finally:
             raw.close()
+        if not source_columns:
+            # An empty source read is NOT "the target is already current" -- the
+            # drifting table demonstrably exists on the source (it is dead-lettering
+            # rows). Reading zero columns means the name did not resolve (renamed /
+            # dropped on the source, or a topic->table mapping mismatch), so report
+            # that explicitly rather than let the empty diff read as "nothing to do".
+            raise ValueError(
+                f"could not read source columns for '{table}' -- the table may have "
+                "been renamed or dropped on the source, or its CDC topic maps to a "
+                "different name. Verify the source table before adding columns."
+            )
         target = connector.connect()
         try:
             target_columns = read_target_columns(target, table)

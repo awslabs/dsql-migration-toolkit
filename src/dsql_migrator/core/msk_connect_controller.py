@@ -531,34 +531,43 @@ class MskConnectController:
                         "ReturnData": True,
                     }
                 )
-            # TimestampDescending -> Values[0] is the most recent minute.
-            response = client.get_metric_data(
-                MetricDataQueries=queries,
-                StartTime=start,
-                EndTime=now,
-                ScanBy="TimestampDescending",
-            )
             fresh_cutoff = now.timestamp() - _LAG_FRESHNESS_SECONDS
-            for item in response.get("MetricDataResults", []):
-                name = id_map.get(item.get("Id"))
-                values = item.get("Values", [])
-                if name is None or not values:
-                    continue
-                # Drop a stale "current lag": if the newest datapoint predates the
-                # freshness cutoff, the pipeline has drained (no recent applies) -> the
-                # table is caught up, so omit it rather than report the frozen last-event
-                # lag. Timestamps[0] aligns with Values[0] (TimestampDescending). When
-                # timestamps are absent (defensive / older shape), keep the value.
-                timestamps = item.get("Timestamps") or []
-                if timestamps:
-                    newest = timestamps[0]
-                    newest_ts = (
-                        newest.timestamp() if hasattr(newest, "timestamp")
-                        else float(newest)
-                    )
-                    if newest_ts < fresh_cutoff:
+            # get_metric_data caps at 500 MetricDataQueries/request (one per matched
+            # table here), so at >500 tables a single call would exceed the cap and
+            # raise -- which the outer except would swallow, blanking the WHOLE lag
+            # surface (every table, not just the overflow). Batch into <=500-query
+            # requests and merge by id, mirroring applied_ops_by_table, so the lag
+            # monitor scales to a large table set. TimestampDescending -> Values[0]
+            # is the most recent minute.
+            for offset in range(0, len(queries), _GMD_MAX_QUERIES):
+                batch = queries[offset : offset + _GMD_MAX_QUERIES]
+                response = client.get_metric_data(
+                    MetricDataQueries=batch,
+                    StartTime=start,
+                    EndTime=now,
+                    ScanBy="TimestampDescending",
+                )
+                for item in response.get("MetricDataResults", []):
+                    name = id_map.get(item.get("Id"))
+                    values = item.get("Values", [])
+                    if name is None or not values:
                         continue
-                result[name] = int(round(float(values[0])))
+                    # Drop a stale "current lag": if the newest datapoint predates the
+                    # freshness cutoff, the pipeline has drained (no recent applies) ->
+                    # the table is caught up, so omit it rather than report the frozen
+                    # last-event lag. Timestamps[0] aligns with Values[0]
+                    # (TimestampDescending). When timestamps are absent (defensive /
+                    # older shape), keep the value.
+                    timestamps = item.get("Timestamps") or []
+                    if timestamps:
+                        newest = timestamps[0]
+                        newest_ts = (
+                            newest.timestamp() if hasattr(newest, "timestamp")
+                            else float(newest)
+                        )
+                        if newest_ts < fresh_cutoff:
+                            continue
+                    result[name] = int(round(float(values[0])))
         except Exception:  # noqa: BLE001 - best-effort monitor signal only
             return {}
         return result
@@ -618,23 +627,32 @@ class MskConnectController:
                 }
                 for i, (_name, dim) in enumerate(by_dim.items())
             ]
-            response = client.get_metric_data(
-                MetricDataQueries=queries,
-                StartTime=start,
-                EndTime=now,
-                ScanBy="TimestampAscending",
-            )
             # Collapse every table's per-minute series into one worst-case line:
-            # MAX lag across tables per timestamp bucket.
+            # MAX lag across tables per timestamp bucket. get_metric_data caps at 500
+            # MetricDataQueries/request (one per matched table here), so at >500 tables
+            # a single call would raise -- which the outer except would swallow,
+            # blanking the WHOLE trend chart. Batch into <=500-query requests and
+            # accumulate by_bucket across batches (MAX is associative, so merging
+            # batches is correct), mirroring applied_ops_by_table.
             by_bucket: dict[int, float] = {}
-            for item in response.get("MetricDataResults", []):
-                timestamps = item.get("Timestamps", []) or []
-                values = item.get("Values", []) or []
-                for ts, val in zip(timestamps, values):
-                    epoch = int(ts.timestamp()) if hasattr(ts, "timestamp") else int(ts)
-                    fval = float(val)
-                    if epoch not in by_bucket or fval > by_bucket[epoch]:
-                        by_bucket[epoch] = fval
+            for offset in range(0, len(queries), _GMD_MAX_QUERIES):
+                batch = queries[offset : offset + _GMD_MAX_QUERIES]
+                response = client.get_metric_data(
+                    MetricDataQueries=batch,
+                    StartTime=start,
+                    EndTime=now,
+                    ScanBy="TimestampAscending",
+                )
+                for item in response.get("MetricDataResults", []):
+                    timestamps = item.get("Timestamps", []) or []
+                    values = item.get("Values", []) or []
+                    for ts, val in zip(timestamps, values):
+                        epoch = (
+                            int(ts.timestamp()) if hasattr(ts, "timestamp") else int(ts)
+                        )
+                        fval = float(val)
+                        if epoch not in by_bucket or fval > by_bucket[epoch]:
+                            by_bucket[epoch] = fval
             return [(epoch, int(round(by_bucket[epoch]))) for epoch in sorted(by_bucket)]
         except Exception:  # noqa: BLE001 - best-effort monitor signal only
             return []

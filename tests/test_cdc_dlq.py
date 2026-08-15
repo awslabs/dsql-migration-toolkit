@@ -6,7 +6,20 @@
 from datetime import datetime, timezone
 
 from dsql_migrator.core.cdc import SchemaDriftKind
-from dsql_migrator.core.cdc_dlq import parse_dlq_log_message
+from dsql_migrator.core.cdc_dlq import _table_from_topic, parse_dlq_log_message
+
+
+def test_table_from_topic_returns_db_qualified_name() -> None:
+    # <prefix>.<db>.<table> -> db.table (the key the monitor, table.include.list,
+    # and the ADD COLUMN drift recovery all use). The db + table are the LAST two
+    # segments regardless of how many segments the prefix has.
+    assert _table_from_topic("dsqlcdc.shop.orders") == "shop.orders"
+    assert _table_from_topic("a.b.customers") == "b.customers"
+    # A multi-segment prefix still yields just db.table (last two segments).
+    assert _table_from_topic("my.long.prefix.shop.orders") == "shop.orders"
+    # Non-dotted / degenerate topics fall back to a stable, non-empty key.
+    assert _table_from_topic("orders") == "orders"
+    assert _table_from_topic("") == ""
 
 
 def test_parse_quarantined_line_extracts_table_offset_and_sqlstate() -> None:
@@ -16,7 +29,9 @@ def test_parse_quarantined_line_extracts_table_offset_and_sqlstate() -> None:
     )
     rec = parse_dlq_log_message(msg)
     assert rec is not None
-    assert rec.table == "orders"
+    # db-qualified (db.table): the key the monitor / table.include.list / target
+    # schema all use, and what the ADD COLUMN drift recovery needs.
+    assert rec.table == "shop.orders"
     assert "offset=42" in rec.message
     assert rec.error_code == "42804"
 
@@ -28,7 +43,7 @@ def test_parse_dropping_line_without_dlq() -> None:
     )
     rec = parse_dlq_log_message(msg)
     assert rec is not None
-    assert rec.table == "payments"
+    assert rec.table == "shop.payments"
     assert "offset=7" in rec.message
     assert rec.error_code is None
 
@@ -47,7 +62,7 @@ def test_parse_carries_occurred_at_and_never_includes_row_values() -> None:
     )
     assert rec is not None
     assert rec.occurred_at == ts
-    assert rec.table == "customers"
+    assert rec.table == "b.customers"
 
 
 def test_parse_keeps_sql_template_in_message() -> None:
@@ -62,7 +77,7 @@ def test_parse_keeps_sql_template_in_message() -> None:
     )
     rec = parse_dlq_log_message(msg)
     assert rec is not None
-    assert rec.table == "products"
+    assert rec.table == "shop.products"
     assert "sql: INSERT INTO" in rec.message
     assert "_dlq_probe" in rec.message
     # Placeholders only -- no row values leaked.
@@ -80,7 +95,7 @@ def test_parse_keeps_surrogate_pk_in_message() -> None:
     )
     rec = parse_dlq_log_message(msg)
     assert rec is not None
-    assert rec.table == "product_media"
+    assert rec.table == "ecommerce.product_media"
     assert "pk: product_id=14" in rec.message
     # A permanent-limit rejection carries no SQLSTATE.
     assert rec.error_code is None
@@ -95,7 +110,7 @@ def test_parse_keeps_withheld_natural_key_pk_in_message() -> None:
     )
     rec = parse_dlq_log_message(msg)
     assert rec is not None
-    assert rec.table == "accounts"
+    assert rec.table == "shop.accounts"
     assert "pk: email=<withheld>" in rec.message
 
 
@@ -111,7 +126,7 @@ def test_parse_reads_leading_sqlstate_tag_and_derives_drift_kind() -> None:
     )
     rec = parse_dlq_log_message(msg)
     assert rec is not None
-    assert rec.table == "orders"
+    assert rec.table == "shop.orders"
     assert rec.error_code == "42703"
     # The drift kind is derived from the SQLSTATE, not stored.
     assert rec.drift_kind is SchemaDriftKind.ADD_COLUMN

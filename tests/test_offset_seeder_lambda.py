@@ -314,9 +314,9 @@ def test_vendored_record_matches_canonical_with_base_offset(seeder_env) -> None:
     base_offset = {
         "file": "mysql-bin.000010",
         "pos": 2,
-        "row": 0,
+        "row": 5,                    # non-zero skip counters -> must be RESET by both
         "server_id": 7,
-        "event": 0,
+        "event": 3,
         "ts_usec": 12345,            # extra live key -> must be preserved by both
         "snapshot": True,            # in-progress markers -> must be popped by both
         "snapshot_completed": True,
@@ -353,6 +353,9 @@ def test_vendored_record_matches_canonical_with_base_offset(seeder_env) -> None:
     assert "snapshot" not in value          # popped
     assert "snapshot_completed" not in value  # popped
     assert value["gtids"] == "UUID:1-9"    # overridden from watermark
+    # Position-relative skip counters reset to the watermark's event boundary, so a
+    # stale non-zero row/event can't make Debezium skip rows at the resume point.
+    assert value["row"] == 0 and value["event"] == 0
 
 
 def test_vendored_record_matches_canonical_base_offset_no_gtids(seeder_env) -> None:

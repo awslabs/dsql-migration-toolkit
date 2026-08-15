@@ -368,6 +368,25 @@ def test_stack_status_returns_value() -> None:
     assert _dep(client).stack_status("s") == "UPDATE_COMPLETE"
 
 
+def test_stack_status_checked_returns_none_only_when_stack_absent() -> None:
+    # A CloudFormation "does not exist" ValidationError means the stack is GONE (the
+    # Delete path's success signal) -> None, not an error.
+    client = _FakeClient({}, raise_on={"describe_stacks": RuntimeError(
+        "ValidationError: Stack with id s does not exist")})
+    assert _dep(client).stack_status_checked("s") is None
+
+
+def test_stack_status_checked_raises_on_read_error() -> None:
+    # A read/credential error (expired token, throttle, access lost) must PROPAGATE so
+    # a wait loop can fail fast on it, instead of being collapsed to None and mistaken
+    # for "still in progress" / "gone". The best-effort stack_status still swallows it.
+    client = _FakeClient({}, raise_on={"describe_stacks": RuntimeError(
+        "ExpiredToken: token expired")})
+    with pytest.raises(RuntimeError):
+        _dep(client).stack_status_checked("s")
+    assert _dep(client).stack_status("s") is None  # best-effort wrapper swallows
+
+
 def test_region_forwarded() -> None:
     client = _FakeClient({"describe_stacks": _stack()})
     session = _FakeSession(client)
@@ -738,6 +757,9 @@ class _SlowSettleDeployer:
             return "CREATE_IN_PROGRESS"
         return "CREATE_COMPLETE"
 
+    def stack_status_checked(self, stack_name: str) -> str:
+        return self.stack_status(stack_name)
+
 
 def test_cdc_wait_heartbeats_so_watchdog_does_not_reap_healthy_job() -> None:
     from dsql_migrator.core.cdc_deployer import _StageDriver, _wait_stack_settles
@@ -786,6 +808,114 @@ def test_cdc_wait_heartbeats_so_watchdog_does_not_reap_healthy_job() -> None:
     # provisioning wait.
     assert settled["status"] == "CREATE_COMPLETE"
     assert job.status == "DONE"
+    assert manager.get_error(job_id) is None
+
+
+class _ExpiredCredsDeployer:
+    """Fake whose stack-status read raises ExpiredToken every poll -- the deployer's
+    single 1 h assumed-role session expired mid-deploy, so every CloudFormation read
+    now fails. Emits no stack events."""
+
+    def poll_events(self, stack_name: str, since: datetime) -> list:
+        return []
+
+    def stack_status_checked(self, stack_name: str) -> str:
+        raise RuntimeError(
+            "ExpiredToken: The security token included in the request is expired"
+        )
+
+
+def test_wait_stack_settles_fails_fast_on_expired_credentials() -> None:
+    # The observed failure: 1 h assumed-role creds expire during a long op (connector
+    # waits run 45 min each; an AZ-retry delete+recreate passes an hour). Every CFN
+    # status read then raises ExpiredToken; the OLD code swallowed it to None, read the
+    # None as "transient, keep polling", and burned the whole timeout before wrongly
+    # reporting "Stack operation timed out." on a stack that had actually completed.
+    # The wait must now fail FAST with the real, credential-aware cause.
+    from dsql_migrator.core.cdc_deployer import (
+        CdcDeployError,
+        _StageDriver,
+        _wait_stack_settles,
+    )
+    from dsql_migrator.core.job_manager import JobManager
+
+    captured: dict = {}
+    manager = JobManager()
+
+    def work(handle) -> None:
+        driver = _StageDriver(
+            handle,
+            stages=(("stack_create", "Creating"),),
+            on_log=lambda ts, msg: None,
+            sleep=lambda _interval: None,
+        )
+        try:
+            _wait_stack_settles(
+                _ExpiredCredsDeployer(),
+                "mysql-dsql-cdc-stack",
+                driver=driver,
+                since=datetime.now(timezone.utc),
+                timeout=10_000.0,  # huge: proves it fails on the CAUSE, not the deadline
+                interval=1.0,
+            )
+        except CdcDeployError as exc:
+            captured["error"] = str(exc)
+
+    job_id = manager.submit(work)
+    assert manager.wait(job_id, timeout=5.0)
+    # Failed on the credential cause, NOT a timeout, and with actionable guidance.
+    assert "ExpiredToken" in captured["error"]
+    assert "expired" in captured["error"].lower()
+    assert "timed out" not in captured["error"].lower()
+
+
+class _FlakyReadDeployer:
+    """Fake whose status read raises a NON-terminal (throttle) error the first
+    ``blips`` polls, then reads CREATE_COMPLETE."""
+
+    def __init__(self, *, blips: int) -> None:
+        self._blips = blips
+        self._reads = 0
+
+    def poll_events(self, stack_name: str, since: datetime) -> list:
+        return []
+
+    def stack_status_checked(self, stack_name: str) -> str:
+        self._reads += 1
+        if self._reads <= self._blips:
+            raise RuntimeError("Throttling: Rate exceeded")
+        return "CREATE_COMPLETE"
+
+
+def test_wait_stack_settles_tolerates_transient_read_errors_then_settles() -> None:
+    # A non-terminal read error (throttle) must NOT fail the wait on the first blip:
+    # it is tolerated for a few consecutive polls (< _MAX_STATE_READ_FAILURES), and if
+    # the stack then reads a terminal state the wait settles normally.
+    from dsql_migrator.core.cdc_deployer import _StageDriver, _wait_stack_settles
+    from dsql_migrator.core.job_manager import JobManager
+
+    settled: dict = {}
+    manager = JobManager()
+
+    def work(handle) -> None:
+        driver = _StageDriver(
+            handle,
+            stages=(("stack_create", "Creating"),),
+            on_log=lambda ts, msg: None,
+            sleep=lambda _interval: None,
+        )
+        settled["status"] = _wait_stack_settles(
+            _FlakyReadDeployer(blips=2),  # 2 transient blips < the 5-failure budget
+            "mysql-dsql-cdc-stack",
+            driver=driver,
+            since=datetime.now(timezone.utc),
+            timeout=10_000.0,
+            interval=1.0,
+        )
+
+    job_id = manager.submit(work)
+    assert manager.wait(job_id, timeout=5.0)
+    assert settled["status"] == "CREATE_COMPLETE"
     assert manager.get_error(job_id) is None
     manager.shutdown()
 

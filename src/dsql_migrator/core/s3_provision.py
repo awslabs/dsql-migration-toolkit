@@ -51,6 +51,16 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v30 rebuilds the offset-seeder Lambda zip so the read-modify-write seed RESETS the
+#    position-relative row/event skip counters when it overrides file/pos to the
+#    watermark. A watermark position is always an event boundary (row=0/event=0), but
+#    the live base_offset it reads for the no-clobber guard can carry a NON-zero
+#    row/event (the connector stopped mid multi-row event) meaningful only at its OLD
+#    pos. Copying those forward onto the watermark pos made Debezium skip that many
+#    rows/events in the first event after the resume point -- rows in neither Full Load
+#    nor CDC (silent loss). Both copies (cdc_offset_seed.build_source_offset + the
+#    vendored seeder._build_source_offset) now zero the counters. Seeder-zip change
+#    only; neither connector plugin jar changed.
 # v29 rebuilds the sink plugin so a quarantine reason carries the server's PRIMARY
 #    error message only. pgjdbc builds SQLException.getMessage() from
 #    ServerErrorMessage.toString(), which appends the server's DETAIL -- and DETAIL is
@@ -262,7 +272,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v29"
+PLUGIN_VERSION = "v30"
 
 
 class S3ProvisionError(RuntimeError):

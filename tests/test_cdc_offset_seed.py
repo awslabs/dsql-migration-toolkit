@@ -62,7 +62,9 @@ def test_source_offset_without_gtid_omits_gtids() -> None:
 
 def test_source_offset_read_modify_write_preserves_base_and_overrides_position() -> None:
     # The live connector's existing offset value (its exact shape) is preserved;
-    # only ts_sec/file/pos/gtids are overridden, and snapshot markers stripped.
+    # ts_sec/file/pos/gtids are overridden and snapshot markers stripped. The
+    # position-relative row/event counters are RESET to the event boundary (see
+    # test_source_offset_rmw_resets_row_event_at_new_position).
     base = {
         "transaction_id": None, "ts_sec": 111, "file": "mysql-bin.000001",
         "pos": 10, "gtids": "old-uuid:1-5", "row": 2, "server_id": 99,
@@ -70,11 +72,24 @@ def test_source_offset_read_modify_write_preserves_base_and_overrides_position()
     }
     off = build_source_offset(_wm(gtid="abc-uuid:1-100"), base_offset=base)
     assert off["transaction_id"] is None       # preserved
-    assert off["server_id"] == 99 and off["event"] == 7  # preserved
+    assert off["server_id"] == 99              # preserved (source identity, not a counter)
     assert off["file"] == "mysql-bin.000123" and off["pos"] == 4567  # overridden
     assert off["gtids"] == "abc-uuid:1-100"     # overridden
     assert off["ts_sec"] == int(_TS.timestamp())
     assert "snapshot" not in off and "snapshot_completed" not in off  # stripped
+
+
+def test_source_offset_rmw_resets_row_event_at_new_position() -> None:
+    # A watermark position is an event boundary (row=0/event=0). A live base_offset
+    # that stopped mid multi-row event carries a non-zero row/event meaningful only
+    # at its OLD pos; carrying it onto the new (watermark) pos would make Debezium
+    # skip that many rows/events at the resume point -> silent row loss. So both
+    # counters must be reset when file/pos is overridden.
+    base = {"file": "mysql-bin.000001", "pos": 10, "row": 5, "event": 7, "server_id": 99}
+    off = build_source_offset(_wm(gtid=None), base_offset=base)
+    assert off["file"] == "mysql-bin.000123" and off["pos"] == 4567  # moved to watermark
+    assert off["row"] == 0 and off["event"] == 0  # reset to the boundary
+    assert off["server_id"] == 99  # source identity preserved
 
 
 def test_source_offset_rmw_drops_stale_gtids_when_source_has_none() -> None:
