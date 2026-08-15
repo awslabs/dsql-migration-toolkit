@@ -1391,6 +1391,28 @@ def is_spatial_mysql_type(mysql_type: str) -> bool:
     return base in _SPATIAL_TYPES
 
 
+# MySQL binary/blob families whose DSQL target is ``bytea``. Aurora DSQL cannot use a
+# ``bytea`` column in a KEY (primary key or secondary index): "datatype bytea is not
+# supported in a key" (verified live). Spatial types also land in bytea (see
+# _SPATIAL_TYPES / _substitute_unsupported_types), so they carry the same restriction.
+_BINARY_BASE_TYPES = frozenset(
+    {"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob"}
+)
+
+
+def _maps_to_bytea(column: ColumnDef) -> bool:
+    """Return True when ``column`` converts to DSQL ``bytea``.
+
+    That is the BINARY/VARBINARY/BLOB family and every MySQL spatial type. DSQL
+    rejects a ``bytea`` column used in a primary key or index, so a key/index over
+    such a column must be surfaced (PK -> the CREATE TABLE is rejected; index -> it
+    is not emitted).
+    """
+    tokens = column.mysql_type.strip().lower().replace("(", " ").split()
+    base = tokens[0] if tokens else ""
+    return base in _BINARY_BASE_TYPES or base in _SPATIAL_TYPES
+
+
 def _substitute_unsupported_types(table: TableDef) -> tuple[TableDef, list[str]]:
     """Retype DSQL-unsupported source columns to ``bytea`` (preserve, never NULL).
 
@@ -1585,9 +1607,16 @@ def _build_index_ddls(table: TableDef) -> list[str]:
     indexes were left out (and why) by :func:`_too_many_key_columns_warning`.
     """
     table_identifier = _quote_pg_qualified(table.name)
+    # DSQL cannot index a bytea column ("datatype bytea is not supported in a key"),
+    # so an index over a BINARY/VARBINARY/BLOB/spatial column is SKIPPED rather than
+    # emitted as a doomed post-load CREATE INDEX ASYNC. Reported by
+    # _bytea_key_warning (plain index) / _unsupported_index_type_warning (spatial).
+    bytea_columns = {column.name for column in table.columns if _maps_to_bytea(column)}
     statements: list[str] = []
     for index in table.indexes:
         if len(index.columns) > _DSQL_MAX_PK_COLUMNS:
+            continue
+        if any(column in bytea_columns for column in index.columns):
             continue
         unique = "UNIQUE " if index.unique else ""
         columns = ", ".join(_quote_pg_identifier(column) for column in index.columns)
@@ -2260,20 +2289,28 @@ def _key_size_warning(
     column, and CONVERT_TO_UUID replaces the key's type.
     """
     at_risk: list[str] = []
+    # A bytea key column is not a size problem but an outright DSQL rejection
+    # ("datatype bytea is not supported in a key"), reported by _bytea_key_warning.
+    # Skip those keys/indexes here so this note does not contradict it by claiming
+    # "the DDL itself applies fine" for a key DSQL refuses (and an index we do not emit).
+    bytea_columns = {column.name for column in table.columns if _maps_to_bytea(column)}
 
     def estimate(columns: list[str]) -> int:
         return sum(_estimate_key_column_bytes(create, c) for c in columns)
 
     target_pk = _target_key_columns(create) or table.primary_key
-    if target_pk:
+    if target_pk and not any(c in bytea_columns for c in target_pk):
         pk_bytes = estimate(target_pk)
         if pk_bytes > _DSQL_MAX_KEY_BYTES:
             at_risk.append(
                 f"the primary key ({', '.join(target_pk)}) at up to ~{pk_bytes} bytes"
             )
     for index in table.indexes:
-        # Skip an index the converter does not emit anyway (over the 8-column cap).
+        # Skip an index the converter does not emit anyway (over the 8-column cap, or
+        # on a bytea column).
         if len(index.columns) > _DSQL_MAX_PK_COLUMNS:
+            continue
+        if any(column in bytea_columns for column in index.columns):
             continue
         index_bytes = estimate(index.columns)
         if index_bytes > _DSQL_MAX_KEY_BYTES:
@@ -2360,12 +2397,13 @@ def _unsupported_index_type_warning(table: TableDef) -> Optional[ConversionWarni
         classification=Classification.UNSUPPORTED,
         kind=ConversionNoteKind.LOSS,
         message=(
-            f"Aurora DSQL has no FULLTEXT or SPATIAL index type, so {names} is emitted as "
-            "an ordinary CREATE INDEX ASYNC on the same column(s). The index is created, "
-            "but it is NOT an equivalent: MATCH ... AGAINST / spatial-operator queries "
-            "cannot use it and will fail or table-scan. Move that search outside the "
-            "database (e.g. Amazon OpenSearch Service) or redesign the query, and drop "
-            "the index if nothing else uses those columns."
+            f"Aurora DSQL has no FULLTEXT or SPATIAL index type ({names}). A FULLTEXT "
+            "index is emitted as an ordinary CREATE INDEX ASYNC on the same column(s), "
+            "which is created but is NOT equivalent (MATCH ... AGAINST cannot use it). A "
+            "SPATIAL index is on a geometry column, which converts to bytea — and DSQL "
+            "cannot index bytea — so it CANNOT be created and is NOT emitted at all. "
+            "Either way the original search capability is gone: move that search outside "
+            "the database (e.g. Amazon OpenSearch Service) or redesign the query."
         ),
     )
 
@@ -2444,16 +2482,215 @@ def _partitioned_table_warning(table: TableDef) -> Optional[ConversionWarning]:
     )
 
 
+_PG_NAMEDATALEN = 63  # PostgreSQL/DSQL identifiers are truncated to 63 BYTES.
+
+
+def _bytea_key_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Warn when a BINARY/VARBINARY/BLOB/spatial (``bytea``) column is used in a key.
+
+    Aurora DSQL rejects a ``bytea`` column in any key: "datatype bytea is not supported
+    in a key" (verified live). A PRIMARY KEY over such a column makes the generated
+    CREATE TABLE REJECTED (UNSUPPORTED -- neither the table nor its data migrates); a
+    plain SECONDARY index over one cannot be created either and is therefore NOT emitted
+    (LOSS). Spatial/FULLTEXT indexes are reported by :func:`_unsupported_index_type_warning`
+    instead, so they are excluded here to avoid a duplicate note.
+    """
+    bytea_columns = {column.name for column in table.columns if _maps_to_bytea(column)}
+    if not bytea_columns:
+        return None
+    pk_bytea = [c for c in table.primary_key if c in bytea_columns]
+    index_bytea = [
+        index.name
+        for index in table.indexes
+        if any(c in bytea_columns for c in index.columns)
+        and (index.index_type or "").strip().lower() not in _UNSUPPORTED_INDEX_TYPES
+    ]
+    if not pk_bytea and not index_bytea:
+        return None
+    parts: list[str] = []
+    if pk_bytea:
+        parts.append(
+            f"the primary key includes {', '.join(pk_bytea)} "
+            "(BINARY/VARBINARY/BLOB or spatial, which convert to bytea), so the generated "
+            "CREATE TABLE will be REJECTED as-is and neither the table nor its data "
+            "migrates — change the key column to a keyable type (store it as text, a uuid, "
+            "or a hash) before applying"
+        )
+    if index_bytea:
+        parts.append(
+            f"secondary index(es) {', '.join(index_bytea)} are on bytea column(s) and were "
+            "therefore NOT emitted (queries relying on them will fall back to a scan)"
+        )
+    return ConversionWarning(
+        object_name=table.name,
+        classification=(
+            Classification.UNSUPPORTED if pk_bytea else Classification.MANUAL
+        ),
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            "Aurora DSQL cannot use a bytea column in a key (\"datatype bytea is not "
+            f"supported in a key\"): {'; also, '.join(parts)}."
+        ),
+    )
+
+
+def _check_constraint_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Warn that source CHECK constraints are not re-emitted on the target.
+
+    Aurora DSQL supports CHECK, but a MySQL CHECK expression can use functions/operators
+    that differ on PostgreSQL, so the converter does not blindly copy it (a bad copy would
+    be invalid DDL). The result was a SILENT drop on the conversion screen: the constraint
+    is no longer enforced and nothing said so (Evaluation flags it, but the DDL screen did
+    not). The ENUM-derived ``CHECK ... IN (...)`` is emitted separately and is unaffected.
+    """
+    if not table.check_constraints:
+        return None
+    names = ", ".join(ck.name for ck in table.check_constraints)
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            f"CHECK constraint(s) ({names}) were NOT carried over. Aurora DSQL supports "
+            "CHECK, but a MySQL CHECK expression can use functions/operators that behave "
+            "differently on PostgreSQL, so the converter does not blindly re-emit it — the "
+            "rule is no longer enforced on the target. Re-add a DSQL-compatible CHECK by "
+            "hand (the expression is shown in Evaluation) or enforce it in the application."
+        ),
+    )
+
+
+def _identifier_length_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Warn about identifiers over 63 bytes, and column names that collide after truncation.
+
+    MySQL allows 64-character identifiers (more bytes in UTF-8); PostgreSQL/Aurora DSQL
+    silently truncate to 63 BYTES (NAMEDATALEN). Two column names that share the first 63
+    bytes collide after truncation, and the CREATE TABLE is REJECTED ("column specified
+    more than once") — a hard failure the conversion screen otherwise gave no hint of.
+    """
+    over_columns: list[str] = []
+    collisions: list[str] = []
+    groups: dict[bytes, str] = {}
+    for name in (column.name for column in table.columns):
+        encoded = name.encode("utf-8")
+        if len(encoded) > _PG_NAMEDATALEN:
+            over_columns.append(name)
+        truncated = encoded[:_PG_NAMEDATALEN]
+        if truncated in groups and groups[truncated] != name:
+            collisions.append(f"{groups[truncated]} / {name}")
+        else:
+            groups.setdefault(truncated, name)
+    over_indexes = [
+        index.name
+        for index in table.indexes
+        if len(index.name.encode("utf-8")) > _PG_NAMEDATALEN
+    ]
+    if not over_columns and not collisions and not over_indexes:
+        return None
+    parts: list[str] = []
+    if collisions:
+        parts.append(
+            "column names that collide after truncation to 63 bytes ("
+            + "; ".join(collisions)
+            + ') — the CREATE TABLE is REJECTED ("column specified more than once")'
+        )
+    if over_columns:
+        parts.append(
+            "column name(s) over 63 bytes (" + ", ".join(over_columns)
+            + ") that DSQL silently truncates"
+        )
+    if over_indexes:
+        parts.append(
+            "index name(s) over 63 bytes (" + ", ".join(over_indexes)
+            + ") that DSQL silently truncates"
+        )
+    return ConversionWarning(
+        object_name=table.name,
+        classification=(
+            Classification.UNSUPPORTED if collisions else Classification.MANUAL
+        ),
+        kind=(ConversionNoteKind.LOSS if collisions else ConversionNoteKind.RECOMMENDATION),
+        message=(
+            "PostgreSQL/Aurora DSQL limit identifiers to 63 bytes (MySQL allows 64 "
+            f"characters, and UTF-8 uses more bytes). This table has {'; also '.join(parts)}. "
+            "Rename the affected identifier(s) before applying."
+        ),
+    )
+
+
+def _expression_index_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Warn that a MySQL functional/expression index was not carried over.
+
+    A MySQL 8 functional index (``KEY ((LOWER(email)))``) indexes a computed expression.
+    The introspector reflects only plain column key-parts, so an all-expression index is
+    dropped entirely (a mixed index keeps only its column parts) -- previously with no
+    note at all, so the index simply vanished and queries relying on it silently fell back
+    to a scan. DSQL supports expression indexes, so it can be recreated by hand.
+    """
+    if not table.expression_indexes:
+        return None
+    names = ", ".join(table.expression_indexes)
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            f"Functional/expression index(es) ({names}) index a computed expression (e.g. "
+            "((LOWER(email)))). The converter reflects only plain column key-parts, so such "
+            "an index is NOT emitted (a mixed column+expression index keeps only its plain "
+            "columns). Queries relying on it fall back to a table scan — recreate it on the "
+            "target as a DSQL expression index (CREATE INDEX ASYNC ... ((expr))) after load."
+        ),
+    )
+
+
+def _comment_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Warn that MySQL table/column COMMENT metadata is dropped (cosmetic).
+
+    The converter neither captures nor emits COMMENTs, so they are lost silently. This is
+    cosmetic -- no data or constraint is affected -- but it is still a silent drop, so it
+    is surfaced as a RECOMMENDATION for operators who rely on schema comments.
+    """
+    commented_columns = [column.name for column in table.columns if column.comment]
+    if not table.comment and not commented_columns:
+        return None
+    bits: list[str] = []
+    if table.comment:
+        bits.append("the table comment")
+    if commented_columns:
+        bits.append(f"column comment(s) on {', '.join(commented_columns)}")
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.RECOMMENDATION,
+        message=(
+            f"MySQL COMMENT metadata ({' and '.join(bits)}) is not carried over to Aurora "
+            "DSQL and is dropped. This is cosmetic — no data or constraint is affected — "
+            "but if you rely on schema comments, re-add them with COMMENT ON after applying."
+        ),
+    )
+
+
 def _no_primary_key_warning(table: TableDef) -> Optional[ConversionWarning]:
-    """Return a warning when the table has no primary key (DSQL requires one)."""
+    """Return a warning when the table has no primary key.
+
+    Aurora DSQL will CREATE a table without a primary key (verified live), but this
+    migrator cannot migrate one: Full Load reads rows by primary-key keyset and CDC keys
+    on the primary key, so a PK-less table has no unit to paginate or a stable row identity
+    to replicate. It is also discouraged on DSQL (no stable identity for updates/deletes).
+    Classified UNSUPPORTED because the tool cannot migrate the table as-is.
+    """
     if table.primary_key:
         return None
     return ConversionWarning(
         object_name=table.name,
         classification=Classification.UNSUPPORTED,
         message=(
-            "Aurora DSQL requires every table to have a primary key. Add a "
-            "primary key (e.g., a UUID/random key) before migrating the table."
+            "This table has no primary key. Aurora DSQL can create a table without one, "
+            "but this migrator cannot migrate it: Full Load reads rows by primary-key "
+            "keyset and CDC replicates by primary key, so there is no unit to paginate or "
+            "stable row identity. Add a primary key (e.g. a UUID/random key) before "
+            "migrating the table."
         ),
     )
 
@@ -2686,7 +2923,12 @@ class SchemaConverter:
         warnings.extend(pk_strategy_warnings)
         for optional_warning in (
             _no_primary_key_warning(table),
+            _bytea_key_warning(table),
             _foreign_key_warning(table),
+            _check_constraint_warning(table),
+            _identifier_length_warning(table),
+            _expression_index_warning(table),
+            _comment_warning(table),
             _partitioned_table_warning(table),
             _unsupported_index_type_warning(table),
             _prefix_index_warning(table),

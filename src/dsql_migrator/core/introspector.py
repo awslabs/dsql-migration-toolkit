@@ -408,6 +408,8 @@ def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[Tab
                 nullable=bool(column.get("nullable", True)),
                 default=_default_to_str(column.get("default")),
                 collation=None,
+                # MySQL column COMMENT (dropped on conversion; captured to warn).
+                comment=(column.get("comment") or None),
             )
             for column in inspector.get_columns(table_name, schema=schema)  # type: ignore[attr-defined]
         ]
@@ -416,9 +418,18 @@ def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[Tab
         primary_key = list(pk_constraint.get("constrained_columns") or [])
 
         indexes: list[IndexDef] = []
+        expression_indexes: list[str] = []
         for index in inspector.get_indexes(table_name, schema=schema):  # type: ignore[attr-defined]
-            index_columns = [c for c in index.get("column_names", []) if c]
+            raw_columns = index.get("column_names", [])
+            index_columns = [c for c in raw_columns if c]
             index_name = index.get("name")
+            # A MySQL 8 functional/expression index (``KEY ((LOWER(email)))``) reflects
+            # its expression key-part(s) as None, and an ALL-expression index reflects
+            # with an EMPTY column_names list (SQLAlchemy drops the parts it cannot name).
+            # Either way it loses key columns; note it so the converter can warn it was
+            # not carried over rather than let it vanish silently below.
+            if index_name and (not index_columns or any(c is None for c in raw_columns)):
+                expression_indexes.append(str(index_name))
             # MySQL prefix-index lengths (``KEY (col(N))``) live under the reflected
             # index's dialect_options["mysql_length"] = {column: N}. Carry them so the
             # converter can warn that DSQL indexes the FULL column (no prefix support).
@@ -500,6 +511,17 @@ def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[Tab
             # must never fail the whole introspection.
             check_constraints = []
 
+        # MySQL table COMMENT (dropped on conversion; captured to warn). Best-effort:
+        # a dialect without table-comment reflection must not fail introspection.
+        table_comment: Optional[str] = None
+        try:
+            table_comment = (
+                inspector.get_table_comment(table_name, schema=schema).get("text")  # type: ignore[attr-defined]
+                or None
+            )
+        except Exception:  # noqa: BLE001 - table-comment reflection is best-effort
+            table_comment = None
+
         tables.append(
             TableDef(
                 name=table_name,
@@ -509,6 +531,8 @@ def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[Tab
                 foreign_keys=foreign_keys,
                 check_constraints=check_constraints,
                 auto_increment_column=None,
+                expression_indexes=expression_indexes,
+                comment=table_comment,
             )
         )
     return tables

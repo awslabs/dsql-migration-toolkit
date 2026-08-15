@@ -5,6 +5,43 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.335
+
+_컨버터 자체 출력을 실제 Aurora DSQL 클러스터에 종합 "까다로운 스키마"(BINARY/VARBINARY/
+공간 키, PK 없음, 복합/8열 초과/255열 초과, 예약어·유니코드·초과길이 식별자, CHECK,
+생성 컬럼, 표현식 인덱스, 주석, 파티션, collation)로 적용해 발견한 스키마 변환 정합성 수정._
+
+### Fixed
+
+- **키에 사용된 `bytea` 컬럼을 이제 조용히 넘기지 않고 명확히 경고합니다.** DSQL은 어떤
+  키에든 `bytea` 컬럼을 거부합니다("datatype bytea is not supported in a key", 라이브 확인).
+  BINARY/VARBINARY 기본 키(→ `bytea`)는 `CREATE TABLE`을 실패시키고, `bytea`(또는 geometry)
+  컬럼의 보조/공간 인덱스는 적재 후 `CREATE INDEX ASYNC`를 실패시키는데, 컨버터는 이를 그대로
+  뱉었고 유일하게 낸 경고(1 KiB 키 크기 권고)는 "The DDL itself applies fine"이라 잘못 단언했습니다.
+  이제 `bytea` **기본 키**는 UNSUPPORTED로 보고하고(text/uuid/hash로 키를 바꿔 마이그레이션),
+  `bytea` **보조 인덱스**는 실패할 문장을 내는 대신 **생략**하고 보고하며, 공간 인덱스 경고는
+  geometry 컬럼의 SPATIAL 인덱스가 생성 불가·미발행임을 정확히 알리고, 오해를 주던 키 크기
+  경고는 `bytea` 키에 대해 억제합니다.
+- **기본 키가 없는 테이블을 정확히 설명합니다.** Aurora DSQL은 실제로 기본 키 없는
+  `CREATE TABLE`을 **수락**합니다(라이브 확인). 그래서 경고는 더 이상 DSQL이 기본 키를
+  "요구"한다고 말하지 않고, 실제 차단 요인을 설명합니다 — 본 도구의 Full Load는 기본 키
+  keyset으로 행을 읽고 CDC는 기본 키로 복제하므로, PK 없는 테이블은 마이그레이션할 수
+  없습니다(여전히 UNSUPPORTED; 먼저 기본 키를 추가).
+
+### Added
+
+- **스키마 변환이 이제 기존에 조용히 누락되던 4가지를 경고합니다.** 변환 화면이 깨끗해
+  보이면서 무언가를 조용히 잃는 일이 없어집니다:
+  - **초과길이/충돌 식별자** — MySQL은 64자 이름을 허용하지만 PostgreSQL·DSQL은 63바이트로
+    자릅니다. 앞 63바이트가 같은 두 컬럼명은 충돌하여 `CREATE TABLE`이 거부됩니다("column
+    specified more than once") — UNSUPPORTED로 보고; 잘리기만 하는 단일 63바이트 초과 이름은 권고.
+  - **소스 CHECK 제약** — DSQL은 CHECK를 지원하지만 컨버터는 임의의 MySQL CHECK 표현식을
+    재발행하지 않아 변환 화면에서 경고 없이 드롭되었습니다(Evaluation만 표시). 이제 변환 화면에서도 경고.
+  - **함수/표현식 인덱스**(`KEY ((LOWER(email)))`) — 리플렉션이 일반 컬럼 키 파트만 유지해
+    전부-표현식 인덱스는 경고 없이 통째로 드롭되었습니다. 이제 경고(적재 후 DSQL 표현식
+    인덱스로 재생성).
+  - **테이블/컬럼 COMMENT** — 이제 소스에서 캡처해 드롭됨을 보고(외관용; 필요하면 `COMMENT ON`으로 재추가).
+
 ## v0.1.334
 
 _여러 CDC 리뷰 수정을 한 패치로 묶습니다 (ECR Public 이미지는 이 배치에 대해 한 번 재게시)._

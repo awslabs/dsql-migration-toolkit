@@ -5,6 +5,49 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.335
+
+_Schema-conversion fidelity fixes, found by applying the converter's own output to a
+live Aurora DSQL cluster over a comprehensive "tricky schema" (BINARY/VARBINARY/spatial
+keys, no-PK, composite/>8-col/>255-col, reserved/unicode/over-long identifiers, CHECK,
+generated columns, expression indexes, comments, partitioning, collations)._
+
+### Fixed
+
+- **`bytea` columns in a key now surface loudly instead of producing DDL Aurora DSQL
+  silently rejects.** DSQL rejects a `bytea` column in any key ("datatype bytea is not
+  supported in a key", verified live). A BINARY/VARBINARY primary key (which maps to
+  `bytea`) makes the `CREATE TABLE` fail, and a secondary or spatial index on a `bytea`
+  (or geometry) column makes the post-load `CREATE INDEX ASYNC` fail — yet the converter
+  emitted them anyway, and the only note it produced (the 1 KiB key-size recommendation)
+  wrongly said "the DDL itself applies fine." Now a `bytea` **primary key** is reported
+  UNSUPPORTED (re-key to text/uuid/hash before migrating); a `bytea` **secondary index**
+  is **skipped** rather than emitted as a doomed statement, and reported; the spatial-index
+  note is corrected to say a SPATIAL index on a geometry column cannot be created and is
+  not emitted; and the misleading key-size note is suppressed for a `bytea` key.
+- **A table with no primary key is described accurately.** Aurora DSQL actually *accepts*
+  a `CREATE TABLE` with no primary key (verified live), so the warning no longer claims
+  DSQL "requires" one — it now explains the real blocker: the migrator's Full Load reads
+  rows by primary-key keyset and CDC replicates by primary key, so a PK-less table cannot
+  be migrated (still UNSUPPORTED; add a primary key first).
+
+### Added
+
+- **Schema Conversion now warns about four previously-silent drops**, so the conversion
+  screen no longer looks clean while quietly losing something:
+  - **Over-long / colliding identifiers** — MySQL allows 64-character names; PostgreSQL
+    and DSQL truncate to 63 bytes. Two column names that share the first 63 bytes collide
+    and the `CREATE TABLE` is rejected ("column specified more than once") — reported
+    UNSUPPORTED; a single over-63-byte name that only truncates is a recommendation.
+  - **Source CHECK constraints** — DSQL supports CHECK, but the converter does not re-emit
+    an arbitrary MySQL CHECK expression, so it was dropped with no note on the conversion
+    screen (only Evaluation flagged it). Now warned there too.
+  - **Functional / expression indexes** (`KEY ((LOWER(email)))`) — reflection keeps only
+    plain column key-parts, so an all-expression index was dropped entirely with no note.
+    Now warned (recreate it as a DSQL expression index after the load).
+  - **Table / column COMMENTs** — now captured from the source and reported as dropped
+    (cosmetic; re-add with `COMMENT ON` if you rely on them).
+
 ## v0.1.334
 
 _Batches several CDC-review fixes under one patch (the ECR Public image is republished

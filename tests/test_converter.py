@@ -1875,10 +1875,12 @@ def test_fulltext_index_conversion_reports_the_lost_capability() -> None:
     assert note.kind is ConversionNoteKind.LOSS
     assert note.classification is Classification.UNSUPPORTED
     assert "ft_body" in note.message
-    # It says what actually happens (the index IS created) and what to do instead.
-    assert "not an equivalent" in note.message.lower() or "NOT an equivalent" in note.message
+    # It says what actually happens for FULLTEXT (the index IS created on a text column,
+    # just not equivalent) and what to do instead.
+    assert "not equivalent" in note.message.lower()
     assert "OpenSearch" in note.message
-    # The DDL is unchanged -- this adds a note, it does not alter output.
+    # The DDL is unchanged for a FULLTEXT index on a text column -- this adds a note, it
+    # does not alter output (only a bytea/spatial-column index is skipped).
     assert any("ft_body" in ddl for ddl in result.index_ddls)
 
 
@@ -1905,6 +1907,175 @@ def test_spatial_index_is_reported_too_and_plain_indexes_are_not() -> None:
     for benign in ("BTREE", None, ""):
         messages = " ".join(w.message for w in _convert(benign).warnings)
         assert "FULLTEXT or SPATIAL" not in messages, benign
+
+
+# --------------------------------------------------------------------------- #
+# bytea-in-key (B1) + warning-visibility gaps (G1-G4), found by the live
+# schema-conversion sweep against Aurora DSQL (a bytea column cannot be a key).
+# --------------------------------------------------------------------------- #
+def _mk(name, columns, primary_key, **kwargs):
+    from dsql_migrator.core.models import ColumnDef, TableDef
+    return TableDef(
+        name=name,
+        columns=[ColumnDef(**c) for c in columns],
+        primary_key=primary_key,
+        **kwargs,
+    )
+
+
+def test_binary_primary_key_maps_to_bytea_and_is_reported_unsupported() -> None:
+    """A BINARY/VARBINARY PK converts to bytea, which DSQL rejects in a key."""
+    from dsql_migrator.core.converter import SchemaConverter, SchemaConvertOptions
+    from dsql_migrator.core.models import Classification
+
+    table = _mk(
+        "t.binpk",
+        [{"name": "id", "mysql_type": "binary(16)", "nullable": False},
+         {"name": "v", "mysql_type": "varchar(20)", "nullable": True}],
+        ["id"],
+    )
+    result = SchemaConverter().convert_table(table, SchemaConvertOptions())
+    notes = [w for w in result.warnings
+             if "bytea" in w.message.lower() and "primary key" in w.message.lower()]
+    assert notes, "a bytea primary key must be reported"
+    assert notes[0].classification is Classification.UNSUPPORTED
+    # The 1 KiB key-size RECOMMENDATION must NOT also fire (it wrongly says "applies fine").
+    assert not any("applies fine" in w.message for w in result.warnings)
+
+
+def test_bytea_secondary_index_is_not_emitted_and_is_reported() -> None:
+    """A plain index on a VARBINARY(->bytea) column cannot be created; skip + warn."""
+    from dsql_migrator.core.converter import SchemaConverter, SchemaConvertOptions
+    from dsql_migrator.core.models import Classification, IndexDef
+
+    table = _mk(
+        "t.binidx",
+        [{"name": "id", "mysql_type": "bigint", "nullable": False},
+         {"name": "b", "mysql_type": "varbinary(255)", "nullable": True}],
+        ["id"],
+        indexes=[IndexDef(name="ix_b", columns=["b"], unique=False)],
+    )
+    result = SchemaConverter().convert_table(table, SchemaConvertOptions())
+    assert not any("ix_b" in ddl for ddl in result.index_ddls), "bytea index must be skipped"
+    note = next(w for w in result.warnings if "ix_b" in w.message and "bytea" in w.message.lower())
+    assert note.classification is Classification.MANUAL  # LOSS, not table-blocking
+
+
+def test_spatial_index_on_geometry_column_is_not_emitted() -> None:
+    """A SPATIAL index sits on a geometry(->bytea) column and cannot be created."""
+    from dsql_migrator.core.converter import SchemaConverter, SchemaConvertOptions
+    from dsql_migrator.core.models import IndexDef
+
+    table = _mk(
+        "t.geo",
+        [{"name": "id", "mysql_type": "bigint", "nullable": False},
+         {"name": "g", "mysql_type": "point", "nullable": False}],
+        ["id"],
+        indexes=[IndexDef(name="sp_g", columns=["g"], unique=False, index_type="SPATIAL")],
+    )
+    result = SchemaConverter().convert_table(table, SchemaConvertOptions())
+    assert not any("sp_g" in ddl for ddl in result.index_ddls)
+    assert any("SPATIAL" in w.message and "NOT emitted" in w.message for w in result.warnings)
+
+
+def test_source_check_constraint_drop_is_reported() -> None:
+    """A source CHECK is not re-emitted; that must be surfaced on the conversion screen."""
+    from dsql_migrator.core.converter import SchemaConverter, SchemaConvertOptions
+    from dsql_migrator.core.models import CheckConstraintDef, Classification
+
+    table = _mk(
+        "t.chk",
+        [{"name": "id", "mysql_type": "bigint", "nullable": False},
+         {"name": "qty", "mysql_type": "int", "nullable": False}],
+        ["id"],
+        check_constraints=[CheckConstraintDef(name="chk_qty", expression="qty >= 0")],
+    )
+    result = SchemaConverter().convert_table(table, SchemaConvertOptions())
+    notes = [w for w in result.warnings if "chk_qty" in w.message and "CHECK" in w.message]
+    assert notes and notes[0].classification is Classification.MANUAL
+    assert "CHECK (qty" not in result.target_ddl  # not re-emitted
+
+
+def test_over_long_identifier_collision_is_unsupported() -> None:
+    """Two column names sharing the first 63 bytes collide on DSQL (CREATE rejected)."""
+    from dsql_migrator.core.converter import SchemaConverter, SchemaConvertOptions
+    from dsql_migrator.core.models import Classification
+
+    base = "c" * 63
+    table = _mk(
+        "t.longid",
+        [{"name": "id", "mysql_type": "bigint", "nullable": False},
+         {"name": base + "A", "mysql_type": "int", "nullable": True},
+         {"name": base + "B", "mysql_type": "int", "nullable": True}],
+        ["id"],
+    )
+    result = SchemaConverter().convert_table(table, SchemaConvertOptions())
+    notes = [w for w in result.warnings if "63 bytes" in w.message]
+    assert notes and notes[0].classification is Classification.UNSUPPORTED
+    assert "collide" in notes[0].message.lower()
+
+
+def test_over_long_identifier_without_collision_is_recommendation() -> None:
+    """A single >63-byte name is silently truncated; warn (RECOMMENDATION), do not block."""
+    from dsql_migrator.core.converter import (
+        ConversionNoteKind, SchemaConverter, SchemaConvertOptions,
+    )
+    from dsql_migrator.core.models import Classification
+
+    table = _mk(
+        "t.longid2",
+        [{"name": "id", "mysql_type": "bigint", "nullable": False},
+         {"name": "x" * 70, "mysql_type": "int", "nullable": True}],
+        ["id"],
+    )
+    result = SchemaConverter().convert_table(table, SchemaConvertOptions())
+    notes = [w for w in result.warnings if "63 bytes" in w.message]
+    assert notes
+    assert notes[0].classification is Classification.MANUAL
+    assert notes[0].kind is ConversionNoteKind.RECOMMENDATION
+
+
+def test_expression_index_drop_is_reported() -> None:
+    """A functional index (dropped by reflection) must be surfaced, not vanish silently."""
+    from dsql_migrator.core.converter import SchemaConverter, SchemaConvertOptions
+
+    table = _mk(
+        "t.expridx",
+        [{"name": "id", "mysql_type": "bigint", "nullable": False},
+         {"name": "email", "mysql_type": "varchar(255)", "nullable": True}],
+        ["id"],
+        expression_indexes=["idx_email_lower"],
+    )
+    result = SchemaConverter().convert_table(table, SchemaConvertOptions())
+    notes = [w for w in result.warnings
+             if "idx_email_lower" in w.message and "expression" in w.message.lower()]
+    assert notes
+
+
+def test_dropped_comments_are_reported_and_absence_is_silent() -> None:
+    """Dropped table/column COMMENTs warn (RECOMMENDATION); a plain table does not."""
+    from dsql_migrator.core.converter import (
+        ConversionNoteKind, SchemaConverter, SchemaConvertOptions,
+    )
+
+    commented = _mk(
+        "t.commented",
+        [{"name": "id", "mysql_type": "bigint", "nullable": False, "comment": "surrogate key"}],
+        ["id"],
+        comment="audit log table",
+    )
+    result = SchemaConverter().convert_table(commented, SchemaConvertOptions())
+    notes = [w for w in result.warnings if "COMMENT" in w.message]
+    assert notes and notes[0].kind is ConversionNoteKind.RECOMMENDATION
+    assert "id" in notes[0].message
+
+    plain = _mk(
+        "t.plain",
+        [{"name": "id", "mysql_type": "bigint", "nullable": False}],
+        ["id"],
+    )
+    plain_result = SchemaConverter().convert_table(plain, SchemaConvertOptions())
+    assert not any("COMMENT" in w.message for w in plain_result.warnings)
 
 
 def test_unsupported_index_types_come_from_one_shared_definition() -> None:

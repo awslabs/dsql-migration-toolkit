@@ -59,6 +59,9 @@ typetest_failrows.json
 # (regenerated each run; PKs + binlog coordinates, not source — never commit).
 edge_landmarks.json
 resume_watermark.json
+# Table classification manifest written by scripts/seed_schema_edgecases.py
+# (regenerated each seed run; table names + generated long-identifier names, not source).
+schema_edge_manifest.json
 resume_partial_chunks.json
 # Working brief for a resumed session. Carries environment specifics (bastion /
 # security-group IDs, VPC, notes) that must NOT be committed; deleted when its

@@ -141,6 +141,13 @@ class ColumnDef(BaseModel):
             "otherwise indistinguishable."
         ),
     )
+    comment: Optional[str] = Field(
+        default=None,
+        description=(
+            "MySQL COLUMN_COMMENT, if any. Not carried to Aurora DSQL (the converter "
+            "does not emit COMMENT ON); captured so the conversion can warn it is dropped."
+        ),
+    )
 
 
 class IndexDef(BaseModel):
@@ -237,6 +244,18 @@ class TableDef(BaseModel):
     partitioned: bool = Field(
         default=False,
         description="True when the source table uses MySQL native partitioning.",
+    )
+    expression_indexes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Names of MySQL functional/expression indexes (e.g. KEY ((LOWER(email)))). "
+            "Reflection captures only plain column key-parts, so an all-expression index "
+            "is dropped; recorded here so the conversion can warn it was not carried over."
+        ),
+    )
+    comment: Optional[str] = Field(
+        default=None,
+        description="MySQL table COMMENT, if any. Not carried to Aurora DSQL (dropped).",
     )
 
 
