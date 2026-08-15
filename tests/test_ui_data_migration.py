@@ -510,6 +510,57 @@ def _inputs() -> DataMigrationInputs:
     )
 
 
+def test_slim_worker_inputs_keeps_only_this_tables_conversion_and_empty_inventory() -> None:
+    # A worker migrates ONE table; pickling the full inventory + every table's conversion into
+    # each of N worker submissions is O(N^2). The slimmed inputs must carry only this table's
+    # conversion and an empty inventory, while preserving the small fields.
+    import dataclasses
+
+    from dsql_migrator.core.models import SourceInventory
+    from dsql_migrator.ui.data_migration._engine import _slim_worker_inputs
+
+    full = dataclasses.replace(
+        _inputs(),  # inventory has multiple tables (orders + customers)
+        table_conversions={"orders": "conv-orders", "customers": "conv-customers"},
+    )
+    assert len(full.inventory.tables) >= 2
+
+    slim = _slim_worker_inputs(full, "orders")
+
+    assert dict(slim.table_conversions) == {"orders": "conv-orders"}  # only this table
+    assert isinstance(slim.inventory, SourceInventory) and slim.inventory.tables == []
+    # the small fields are preserved unchanged
+    assert slim.source_config is full.source_config
+    assert slim.target_config is full.target_config
+
+
+def test_start_chunk_if_pending_is_idempotent_for_worker_started_signals() -> None:
+    # The multiprocess path marks a chunk IN_PROGRESS when a worker signals it actually began
+    # (not at submission). Each shard of a table signals, and a straggler may signal after a
+    # sibling already started it -- the later signals must NOT re-stamp started_at or
+    # re-count the attempt (which would reset the table's elapsed/ETA).
+    from dsql_migrator.core.models import ChunkState
+    from dsql_migrator.ui.data_migration._engine import (
+        _find_chunk,
+        _start_chunk_if_pending,
+    )
+
+    job = MigrationJob(
+        job_id="j1", chunks=[ChunkState(chunk_id="orders", status="PENDING")]
+    )
+
+    _start_chunk_if_pending(job, "orders")
+    chunk = _find_chunk(job, "orders")
+    assert chunk.status == "IN_PROGRESS" and chunk.attempts == 1
+    started_at = chunk.started_at
+    assert started_at is not None
+
+    _start_chunk_if_pending(job, "orders")  # a second shard's signal: must be a no-op
+    assert chunk.attempts == 1
+    assert chunk.started_at == started_at
+    assert chunk.status == "IN_PROGRESS"
+
+
 def test_batched_table_migrator_captures_watermark_for_selected_tables() -> None:
     capturer = _FakeWatermarkCapturer(_watermark())
     migrator = BatchedTableMigrator(

@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.326
+
+### Fixed
+
+- **Full Load worker payload and progress accuracy (multiprocess path).** Two more Full Load
+  review fixes for the ProcessPool path:
+  - *Each worker submission pickled the whole SourceInventory + every table's converted DDL,
+    giving O(tables^2) serialization/IPC.* A worker migrates one table, so its inputs are now
+    slimmed to that table's conversion and an empty inventory (never read in the worker path),
+    making a many-thousand-table migration O(tables).
+  - *Every submitted table was marked IN_PROGRESS at submission time,* so with a bounded worker
+    pool a large run showed far more tables "in progress" than were actually running and
+    inflated per-table elapsed/ETA. A worker now signals when it actually begins its table and
+    the parent marks the chunk IN_PROGRESS then (idempotent across a table's shards); a
+    dropped start signal is covered by the first live progress message.
+
 ## v0.1.325
 
 ### Fixed

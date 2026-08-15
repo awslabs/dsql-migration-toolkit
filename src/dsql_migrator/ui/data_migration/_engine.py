@@ -24,7 +24,7 @@ from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
     as_completed,
 )
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import (
@@ -369,6 +369,30 @@ def _advance_chunk_rows(
         chunk.rows_skipped += delta_skipped
 
 
+def _start_chunk_if_pending(job: MigrationJob, chunk_id: str) -> None:
+    """Start ``chunk_id`` only if it is still ``PENDING`` -- idempotent for the multiprocess
+    'started' signal.
+
+    In the multiprocess path each worker signals when it ACTUALLY begins its table; several
+    shards of one table signal, and a straggler may signal after a sibling already started
+    it. This must not re-stamp ``started_at`` (which would reset the table's elapsed/ETA),
+    unlike :func:`_start_chunk`, which the single-process and retry paths call to deliberately
+    re-stamp per attempt.
+    """
+    chunk = _find_chunk(job, chunk_id)
+    if chunk is not None and chunk.status == "PENDING":
+        _start_chunk(job, chunk_id)
+
+
+def _start_then_advance(
+    job: MigrationJob, chunk_id: str, delta_loaded: int, delta_skipped: int
+) -> None:
+    """Ensure the chunk is started (in case its 'started' signal was dropped) then add the
+    live row deltas -- the drain applies both from one worker progress message."""
+    _start_chunk_if_pending(job, chunk_id)
+    _advance_chunk_rows(job, chunk_id, delta_loaded, delta_skipped)
+
+
 def _find_chunk(job: MigrationJob, chunk_id: str) -> Optional[ChunkState]:
     """Return the chunk named ``chunk_id`` on ``job``, if present."""
     return next((chunk for chunk in job.chunks if chunk.chunk_id == chunk_id), None)
@@ -530,6 +554,11 @@ _CANCEL_GRACE_SECONDS = 90.0
 
 # Sentinel put onto progress_queue to signal drain thread to stop.
 _PROGRESS_SENTINEL = None
+# Marker for a worker's "I actually started this table" signal, sent as
+# ``(_CHUNK_STARTED, table_name)``. The parent marks the chunk IN_PROGRESS when a bounded-pool
+# worker BEGINS the table, not at submission time (when every table would otherwise show
+# in-progress at once with inflated per-table elapsed/ETA).
+_CHUNK_STARTED = "\x00chunk-started"
 
 
 @dataclass(frozen=True)
@@ -578,6 +607,27 @@ class _TableWorkerResult:
     # either swallowing them or failing the table over an access path.
     index_failures: tuple = ()
     shard_index: int = -1
+
+
+def _slim_worker_inputs(
+    inputs: "DataMigrationInputs", table_name: str
+) -> "DataMigrationInputs":
+    """Return per-table inputs for a worker: drop the all-tables inventory + conversions.
+
+    A worker migrates ONE table (passed separately as ``args.table``) and reads only this
+    table's conversion via ``table_conversions.get(table.name)``; ``inventory`` is never read
+    in the worker/migrator path. Pickling the full ``SourceInventory`` + every table's DDL
+    into EACH of N worker submissions is O(tables^2) serialization/IPC (seconds-to-minutes of
+    parent-side pickling at a few thousand tables). Slim both to this one table so a many-
+    table migration is O(tables); the small fields (connection configs, flags, excluded-LOB
+    map, view DDLs) are preserved unchanged.
+    """
+    conv = inputs.table_conversions.get(table_name)
+    return replace(
+        inputs,
+        inventory=SourceInventory(),
+        table_conversions=({table_name: conv} if conv is not None else {}),
+    )
 
 
 # Per-worker-process globals, set by _init_worker (ProcessPoolExecutor initializer).
@@ -764,6 +814,9 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
     cancel_event = _worker_cancel_event
     table = args.table
     name = table.name
+    # Signal that this worker actually began the table, so the parent marks the chunk
+    # IN_PROGRESS now (a bounded pool runs only a few at once) rather than at submission.
+    _report_progress(progress_queue, (_CHUNK_STARTED, name))
     try:
         migrator = BatchedTableMigrator(args.inputs)
         pending_loaded = 0
@@ -841,6 +894,9 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
     cancel_event = _worker_cancel_event
     table = args.table
     name = table.name
+    # Signal that this worker actually began the table, so the parent marks the chunk
+    # IN_PROGRESS now (a bounded pool runs only a few at once) rather than at submission.
+    _report_progress(progress_queue, (_CHUNK_STARTED, name))
     try:
         migrator = BatchedTableMigrator(args.inputs)
         pending_loaded = 0
@@ -1143,10 +1199,15 @@ def _drain_progress_queue(
             continue
         if msg is _PROGRESS_SENTINEL:
             break
+        if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _CHUNK_STARTED:
+            # A worker actually began its table -> mark IN_PROGRESS now (not at submission).
+            # (== not is: the marker is pickled across the process boundary.)
+            handle.update(lambda job, n=msg[1]: _start_chunk_if_pending(job, n))
+            continue
         table_name, delta_loaded, delta_skipped = msg
         handle.update(
             lambda job, n=table_name, dl=delta_loaded, ds=delta_skipped: (
-                _advance_chunk_rows(job, n, dl, ds)
+                _start_then_advance(job, n, dl, ds)
             )
         )
     # Final drain (anything left after stop).
@@ -1157,10 +1218,13 @@ def _drain_progress_queue(
             break
         if msg is _PROGRESS_SENTINEL or msg is None:
             break
+        if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _CHUNK_STARTED:
+            handle.update(lambda job, n=msg[1]: _start_chunk_if_pending(job, n))
+            continue
         table_name, delta_loaded, delta_skipped = msg
         handle.update(
             lambda job, n=table_name, dl=delta_loaded, ds=delta_skipped: (
-                _advance_chunk_rows(job, n, dl, ds)
+                _start_then_advance(job, n, dl, ds)
             )
         )
 
@@ -1691,9 +1755,13 @@ def _migrate_tables_in_parallel(
 
                     if wu[0] == "table":
                         table = wu[1]
-                        handle.update(lambda job, n=table.name: _start_chunk(job, n))
+                        # The chunk is marked IN_PROGRESS when the WORKER signals it actually
+                        # started (see _CHUNK_STARTED), not here at submission -- a bounded
+                        # pool runs only a few tables at once, so marking every submitted
+                        # table in-progress inflated the "in progress" count and per-table ETA.
                         args = _TableWorkerArgs(
-                            job_id=job_id, table=table, inputs=migrator._inputs,
+                            job_id=job_id, table=table,
+                            inputs=_slim_worker_inputs(migrator._inputs, table.name),
                             pre_recreated=table.name in recreated_names,
                         )
                         f = pool.submit(_migrate_one_table_in_process, args)
@@ -1703,10 +1771,11 @@ def _migrate_tables_in_parallel(
                         # Start chunk only once per sharded table.
                         if table.name not in shard_results:
                             shard_results[table.name] = []
-                            handle.update(lambda job, n=table.name: _start_chunk(job, n))
+                            # Started when the first shard worker signals it began (see
+                            # _CHUNK_STARTED), not here at submission.
                         shard_args = _ShardWorkerArgs(
                             job_id=job_id, table=table,
-                            inputs=migrator._inputs,
+                            inputs=_slim_worker_inputs(migrator._inputs, table.name),
                             pk_lower=lo, pk_upper=hi, shard_index=shard_idx,
                         )
                         f = pool.submit(_migrate_shard_in_process, shard_args)
