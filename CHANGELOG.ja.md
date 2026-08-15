@@ -5,6 +5,19 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.338
+
+### Fixed
+
+- **CDC が 2^63 以上の `BIT(64)` 値を破損しなくなりました**(`BIT(1)` 修正でそれらの行が
+  複製されるようになった直後、厄介なスキーマ CDC E2E で発見)。シンクの `bitsToLong` が
+  Debezium のリトルエンディアン `Bits` バイトを**符号付き** `long` に累積していたため、
+  `BIT(64)` 値が 2^63 以上だと負にラップ(`2^64-1` → `-1`)し、Full Load が正しい符号なし
+  値を格納する一方で `numeric(20,0)` 列に `-1` が入っていました — 静かな CDC 値破損。
+  今後は `BigInteger` に累積し、`BIT(≤63)`(整数列)は `Long`、`Long.MAX_VALUE` を超える
+  `BIT(64)`(numeric 列)は `BigDecimal` を返します。DSQL シンクプラグインを再ビルド
+  (`PLUGIN_VERSION` v32→v33)。
+
 ## v0.1.337
 
 ### Fixed

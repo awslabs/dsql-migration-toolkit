@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.338
+
+### Fixed
+
+- **CDC가 2^63 이상의 `BIT(64)` 값을 더 이상 손상시키지 않습니다** (`BIT(1)` 수정으로 해당
+  행이 복제되기 시작한 직후, 까다로운-스키마 CDC E2E에서 발견). 싱크의 `bitsToLong`가
+  Debezium의 little-endian `Bits` 바이트를 **부호 있는** `long`에 누적해, `BIT(64)` 값이
+  2^63 이상이면 음수로 랩(`2^64-1` → `-1`)되어 `numeric(20,0)` 타깃에 `-1`로 저장되는 반면
+  Full Load는 올바른 부호 없는 값을 저장 — 조용한 CDC 값 손상. 이제 `BigInteger`로 누적해
+  `BIT(≤63)`(정수 타깃)은 `Long`, `Long.MAX_VALUE`를 넘는 `BIT(64)`(numeric 타깃)는
+  `BigDecimal`을 반환합니다. DSQL 싱크 플러그인 재빌드(`PLUGIN_VERSION` v32→v33).
+
 ## v0.1.337
 
 ### Fixed

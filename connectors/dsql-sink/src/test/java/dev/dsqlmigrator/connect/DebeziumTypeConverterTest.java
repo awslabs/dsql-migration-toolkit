@@ -142,6 +142,23 @@ class DebeziumTypeConverterTest {
   }
 
   @Test
+  void bitsFull64BitStaysUnsigned() {
+    // MySQL BIT(64) = 2^64-1 -> Debezium little-endian 8x 0xFF. A signed long would wrap
+    // to -1; the DSQL target is numeric(20,0), so it must keep the UNSIGNED value.
+    byte[] allOnes = new byte[] {
+        (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF,
+        (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF};
+    Object r = DebeziumTypeConverter.convert(DebeziumTypeConverter.BITS_TYPE, allOnes);
+    assertEquals(new java.math.BigDecimal("18446744073709551615"), r);
+    // BIT(63) max (0x7FFF...FFFF) still fits a signed long and stays a Long.
+    byte[] max63 = new byte[] {
+        (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF,
+        (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0x7F};
+    assertEquals(Long.MAX_VALUE,
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.BITS_TYPE, max63));
+  }
+
+  @Test
   void microTimeToLocalTime() {
     // 05:24:39 = 19479 s past midnight -> micros; converts to a java.time.LocalTime
     // (NOT java.sql.Time, which would drop any sub-second component).

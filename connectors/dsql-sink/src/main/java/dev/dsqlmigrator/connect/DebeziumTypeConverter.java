@@ -153,12 +153,22 @@ final class DebeziumTypeConverter {
       return value;
     }
     byte[] bytes = (byte[]) value;
-    long result = 0L;
-    // Debezium Bits is LITTLE-endian: byte[0] is the least-significant byte.
+    // Debezium Bits is LITTLE-endian: byte[0] is the least-significant byte. Accumulate
+    // into a BigInteger so a full 64-bit BIT(64) value keeps its UNSIGNED range: a signed
+    // long would WRAP (2^64-1 -> -1), and BIT(64) maps to a DSQL numeric(20,0) that must
+    // hold the unsigned value (mirrors the Full Load BIT bytes->unsigned-int handling).
+    java.math.BigInteger result = java.math.BigInteger.ZERO;
     for (int i = 0; i < bytes.length && i < 8; i++) {
-      result |= ((long) (bytes[i] & 0xFF)) << (8 * i);
+      result = result.or(
+          java.math.BigInteger.valueOf(bytes[i] & 0xFF).shiftLeft(8 * i));
     }
-    return result;
+    // BIT(<=63) fits a signed long (target bigint/integer/smallint) -> return a Long so
+    // pgjdbc binds it to the integer column. Only BIT(64) above Long.MAX_VALUE needs the
+    // BigDecimal (target numeric(20,0)); a Long there would be negative.
+    if (result.bitLength() <= 63) {
+      return result.longValue();
+    }
+    return new java.math.BigDecimal(result);
   }
 
   /**

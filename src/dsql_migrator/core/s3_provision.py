@@ -51,6 +51,13 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v33 rebuilds the DSQL sink jar so a MySQL BIT(64) value keeps its UNSIGNED range.
+#    DebeziumTypeConverter.bitsToLong accumulated the little-endian Debezium Bits bytes
+#    into a signed long, so BIT(64) >= 2^63 WRAPPED (2^64-1 -> -1) and landed as -1 in the
+#    numeric(20,0) column while Full Load stored the unsigned value -- diverging the paths
+#    and failing Validation. It now accumulates into a BigInteger and returns a Long for
+#    BIT(<=63) (target bigint/integer/smallint) or a BigDecimal for a BIT(64) value above
+#    Long.MAX_VALUE (target numeric(20,0)). Sink-jar change only.
 # v32 rebuilds the DSQL sink jar so a MySQL BIT(1) value binds to its integer target.
 #    Debezium serializes BIT(1) as a plain Kafka BOOLEAN (no logical schema name),
 #    but the schema converter maps BIT(n) to a DSQL integer (smallint), so the sink
@@ -290,7 +297,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v32"
+PLUGIN_VERSION = "v33"
 
 
 class S3ProvisionError(RuntimeError):

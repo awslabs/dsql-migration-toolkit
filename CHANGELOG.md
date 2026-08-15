@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.338
+
+### Fixed
+
+- **CDC no longer corrupts a `BIT(64)` value above 2^63** (found by the tricky-schema CDC
+  E2E, right after the `BIT(1)` fix let those rows replicate at all). The sink's
+  `bitsToLong` accumulated Debezium's little-endian `Bits` bytes into a **signed** `long`,
+  so a `BIT(64)` value ≥ 2^63 wrapped negative (`2^64-1` → `-1`) and landed as `-1` in the
+  `numeric(20,0)` target while Full Load stored the correct unsigned value — a silent
+  CDC value corruption. It now accumulates into a `BigInteger` and returns a `Long` for
+  `BIT(≤63)` (integer target) or a `BigDecimal` for a `BIT(64)` value above `Long.MAX_VALUE`
+  (numeric target). Rebuilds the DSQL sink plugin (`PLUGIN_VERSION` v32→v33).
+
 ## v0.1.337
 
 ### Fixed
