@@ -495,10 +495,16 @@ class MigrationTableStatus:
     # Per-op change counts the CDC SINK reports having applied since it started
     # streaming, from its ``InsertsApplied`` / ``UpdatesApplied`` / ``DeletesApplied``
     # CloudWatch metrics. A DMS-style breakdown: ``{"inserts": N, "updates": N,
-    # "deletes": N}``. Authoritative and scan-free (needs NO ``COUNT(*)`` on either
-    # side) and — unlike the old net-rows figure — makes UPDATE traffic visible.
-    # ``None`` when unavailable (sink not yet emitting / older plugin without the
-    # metrics).
+    # "deletes": N}``. Scan-free (needs NO ``COUNT(*)`` on either side) and — unlike
+    # the old net-rows figure — makes UPDATE traffic visible, but a best-effort
+    # MONITOR, not an exact figure: it is APPROXIMATE UNDER REPLAY. A transient
+    # reconnect / consumer rebalance makes Kafka Connect redeliver already-committed
+    # events and the sink re-counts them (apply stays idempotent, so only the counter
+    # over-states, never the data). The authoritative source↔target reconciliation is
+    # Validation (Step 4)'s exact ``COUNT(*)`` / checksum, which does NOT read these
+    # counters, and the consistency verdict is gated on the DLQ count + exact row delta
+    # + PK high-water mark, never on these. ``None`` when unavailable (sink not yet
+    # emitting / older plugin without the metrics).
     cdc_applied_ops: "Optional[dict[str, int]]" = None
     # End-to-end replication lag in milliseconds from the sink's ``ReplicationLagMs``
     # CloudWatch metric (apply time minus the event's source commit time). Time-based
