@@ -177,6 +177,13 @@ class ValidationInputs:
     # leaving the operator to cross-check the error log by hand. Never changes a
     # verdict -- the rows really are missing -- it only explains the shortfall.
     quarantined_by_table: dict[str, int] = field(default_factory=dict)
+    # Applied DSQL target types per table ({table: {column: target_type}}) in the
+    # converter's postgres vocabulary (parse_target_column_types of the APPLIED DDL).
+    # Set from the Schema-Conversion result so the CHECKSUM renders each column by how
+    # it was actually STORED -- honoring a target-type remap (e.g. TINYINT(1) kept as
+    # smallint). Empty (default) uses the source-derived default mapping. run_validation
+    # stamps these onto each column's ``target_type`` before comparing.
+    target_types: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 # Builds a :class:`_ValidationRunner` bound to the run's inputs.
@@ -223,6 +230,34 @@ def _apply_column_exclusions(
     return out
 
 
+def _apply_target_types(
+    tables: "list[TableDef]", target_types: "dict[str, dict[str, str]]"
+) -> "list[TableDef]":
+    """Stamp each column's APPLIED DSQL target type onto the TableDef (model copies).
+
+    ``target_types`` maps table -> {column: applied_target_type} (converter postgres
+    vocabulary, from parse_target_column_types of the applied DDL). The Validator's
+    CHECKSUM render prefers ``column.target_type``, so a Schema-Conversion target-type
+    remap (e.g. TINYINT(1) kept as smallint) is compared by how the value was STORED
+    instead of the default source-derived mapping -- which would else false-mismatch
+    every row. Pure; tables/columns absent from the map are returned unchanged.
+    """
+    if not target_types:
+        return tables
+    out: list[TableDef] = []
+    for table in tables:
+        types = target_types.get(table.name)
+        if not types:
+            out.append(table)
+            continue
+        cols = [
+            c.model_copy(update={"target_type": types[c.name]}) if c.name in types else c
+            for c in table.columns
+        ]
+        out.append(table.model_copy(update={"columns": cols}))
+    return out
+
+
 def run_validation(
     inputs: ValidationInputs,
     *,
@@ -256,6 +291,9 @@ def run_validation(
     tables = _apply_column_exclusions(
         list(inputs.inventory.tables), inputs.excluded_columns
     )
+    # Stamp the applied DSQL target types so the CHECKSUM honors a target-type remap
+    # (no-op when target_types is empty / mode is ROW_COUNT).
+    tables = _apply_target_types(tables, inputs.target_types)
     return validator.validate(
         inputs.source_config,
         inputs.target_config,
@@ -1531,6 +1569,7 @@ def build_validation_screen(
     validator_factory: ValidatorFactory = _default_validator_factory,
     strategist_factory: StrategistFactory = _default_strategist_factory,
     sync_sequences: "Optional[Callable[..., dict]]" = None,
+    conversion_store: "Optional[Any]" = None,
 ) -> tuple[Callable[[Callable[[], None]], None], Callable[[], None]]:
     """Build the Validation screen, returning ``(content_builder, runner)``.
 
@@ -1549,6 +1588,10 @@ def build_validation_screen(
     validation_state = validation_store.get_or_create(session_id)
     eval_state = eval_store.get_or_create(session_id)
     migration_state = migration_store.get_or_create(session_id)
+    # Schema-Conversion state (optional): lets Validation resolve the APPLIED target
+    # types so a CHECKSUM honors a target-type remap. None (e.g. no store wired / after a
+    # reconnect) degrades to the source-derived default mapping.
+    conv_state = conversion_store.get(session_id) if conversion_store is not None else None
 
     def _inventory() -> Optional[SourceInventory]:
         result = eval_state.result
@@ -1581,6 +1624,34 @@ def build_validation_screen(
         except JobNotFoundError:
             return {}
         return quarantined_rows_by_table(job)
+
+    def _applied_target_types(inv: "SourceInventory") -> dict[str, dict[str, str]]:
+        """Per-table ``{column: applied DSQL target type}`` from the Schema-Conversion
+        result, so the CHECKSUM renders each column by how it was actually STORED --
+        honoring a target-type remap (e.g. TINYINT(1) kept as smallint) instead of the
+        default source-derived mapping, which would else false-mismatch every row. Empty
+        when the conversion state is unavailable (no store / reconnect) -> default mapping.
+        """
+        if conv_state is None:
+            return {}
+        try:
+            from dsql_migrator.core.converter import (
+                SchemaConverter,
+                parse_target_column_types,
+            )
+            from dsql_migrator.ui.schema_conversion import applied_table_conversions
+
+            applied = applied_table_conversions(
+                SchemaConverter().convert(inv), conv_state.edited_target_ddls
+            )
+            out: dict[str, dict[str, str]] = {}
+            for name, conversion in applied.items():
+                types = parse_target_column_types(conversion.target_ddl)
+                if types:
+                    out[name] = types
+            return out
+        except Exception:  # noqa: BLE001 - never let target-type resolution break a run
+            return {}
 
     def _run_prerequisite_error() -> Optional[str]:
         """Return why a comparison cannot start right now, or ``None`` if it can.
@@ -1671,6 +1742,8 @@ def build_validation_screen(
             # mismatch. Empty for a migration that excluded nothing.
             excluded_columns=migration_state.lob_exclusions(),
             quarantined_by_table=_migration_quarantined(),
+            # Applied target types so a CHECKSUM honors a Schema-Conversion remap.
+            target_types=_applied_target_types(scoped_inventory),
         )
 
         validation_state.clear_outputs()
@@ -1867,6 +1940,10 @@ def build_validation_screen(
             deep_only_on_count_mismatch=False,
             excluded_columns=migration_state.lob_exclusions(),
             quarantined_by_table=_migration_quarantined(),
+            # Applied target types so a CHECKSUM honors a Schema-Conversion remap.
+            target_types=_applied_target_types(
+                inventory.model_copy(update={"tables": scoped})
+            ),
         )
 
         validation_state.start_recheck([t.name for t in scoped])

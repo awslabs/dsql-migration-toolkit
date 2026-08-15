@@ -249,11 +249,21 @@ def _checksum_kind(column: "ColumnDef") -> str:
     # BIT(n) maps to an integer target; the loader decoded the big-endian bytes.
     if base == "bit":
         return "bit"
-    try:
-        target_type, _ = map_mysql_type(mysql_type)
-    except ValueError:
-        return "plain"
-    kind = target_type.split("(", 1)[0].strip().lower()
+    # Prefer the APPLIED target type (set by Validation from the converted DDL) so the
+    # render matches how the value was STORED -- honoring a Schema-Conversion target-type
+    # remap (e.g. TINYINT(1) kept as smallint -> integer '0'/'1', not boolean
+    # 'true'/'false', which would false-mismatch every row). It is in the same postgres
+    # vocabulary map_mysql_type produces, so the branches below apply unchanged; falls
+    # back to the source-derived default mapping when no applied type is known.
+    applied = column.target_type
+    if applied:
+        kind = applied.split("(", 1)[0].strip().lower()
+    else:
+        try:
+            target_type, _ = map_mysql_type(mysql_type)
+        except ValueError:
+            return "plain"
+        kind = target_type.split("(", 1)[0].strip().lower()
     if kind == "bytea":
         return "binary"
     if kind == "boolean":

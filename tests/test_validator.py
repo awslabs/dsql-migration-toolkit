@@ -1066,6 +1066,33 @@ def test_checksum_boolean_null_routes_to_shared_sentinel() -> None:
     assert "WHEN `active` = 0 THEN 'false' ELSE 'true' END" in expr
 
 
+def test_checksum_kind_prefers_applied_target_type() -> None:
+    """M1: when the APPLIED DSQL target type is known, the checksum render family comes
+    from it (honoring a Schema-Conversion remap), not the default source-derived mapping.
+    A TINYINT(1) the operator kept as smallint must render as a plain integer on both
+    sides ('0'/'1'/'2'), not the default boolean ('true'/'false') that would false-mismatch
+    every row. The source-based spatial/BIT cases still take precedence over the applied
+    type (they need ST_AsBinary / CAST AS UNSIGNED regardless of the bytea/int target)."""
+    from dsql_migrator.core.validator import _checksum_kind, _mysql_checksum_expr
+
+    # Default (no applied type): TINYINT(1) -> boolean render.
+    default_col = ColumnDef(name="active", mysql_type="TINYINT(1)")
+    assert _checksum_kind(default_col) == "boolean"
+
+    # Applied remap TINYINT(1) -> smallint: render as a plain integer, not boolean.
+    remapped = ColumnDef(name="active", mysql_type="TINYINT(1)", target_type="smallint")
+    assert _checksum_kind(remapped) == "plain"
+    assert _mysql_checksum_expr(remapped) == "CAST(`active` AS CHAR)"
+
+    # Source-based special cases still win over the applied type.
+    assert _checksum_kind(ColumnDef(name="f", mysql_type="BIT(8)", target_type="smallint")) == "bit"
+    assert _checksum_kind(ColumnDef(name="g", mysql_type="POINT", target_type="bytea")) == "binary"
+
+    # An applied numeric / timestamptz classifies by the applied type.
+    assert _checksum_kind(ColumnDef(name="n", mysql_type="int", target_type="numeric(20, 0)")) == "numeric"
+    assert _checksum_kind(ColumnDef(name="t", mysql_type="datetime", target_type="timestamptz")) == "timestamptz"
+
+
 def test_checksum_zerofill_int_renders_plain_numeric() -> None:
     """A MySQL INT ZEROFILL migrates to a plain integer, so the checksum must render its
     numeric value ('42'), not the zero-padded display form ('00042') that

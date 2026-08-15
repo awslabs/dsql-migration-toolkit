@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.342
+
+### Fixed
+
+- **검증(Validation)의 CHECKSUM이 이제 Schema-Conversion 타깃 타입 리맵을 오탐하지 않고
+  존중합니다** (Validation 리뷰에서 발견). 컬럼별 체크섬 렌더링이 소스 타입 기준이라, 도구가
+  직접 권장하는 비기본 리맵(예: 0/1 밖 값 때문에 `TINYINT(1)`을 `smallint`로 유지)을 적용한 뒤엔
+  소스는 `'true'/'false'`, `smallint` 타깃은 `'0'/'1'`로 렌더링돼 **정상 이관된 컬럼의 모든 행이
+  CHECKSUM 모드에서 false MISMATCH**했습니다(cut-over를 막을 수 있는 오탐). 이제 Validator가
+  Schema-Conversion 결과에서 적용된 타깃 타입(컨버터 어휘)을 해석해 값이 실제로 저장된 방식대로
+  각 컬럼을 렌더링하며, 적용 타입을 알 수 없을 때(예: 재연결 후)는 소스 기반 매핑으로 폴백합니다.
+  공간/BIT 소스 기반 처리는 그대로입니다.
+
 ## v0.1.341
 
 ### Fixed

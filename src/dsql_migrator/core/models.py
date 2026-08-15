@@ -148,6 +148,18 @@ class ColumnDef(BaseModel):
             "does not emit COMMENT ON); captured so the conversion can warn it is dropped."
         ),
     )
+    target_type: Optional[str] = Field(
+        default=None,
+        description=(
+            "The APPLIED DSQL target type for this column (converter vocabulary, e.g. "
+            "'boolean' / 'smallint' / 'numeric' / 'timestamptz'), when known. Set only by "
+            "Validation so its per-cell CHECKSUM renders each side by how the value was "
+            "actually STORED on the target -- honoring a Schema-Conversion target-type "
+            "remap (e.g. TINYINT(1) kept as smallint) instead of re-deriving the kind from "
+            "the source type. None means 'use the default source-derived mapping'. Not "
+            "persisted from introspection; a transient validation hint."
+        ),
+    )
 
 
 class IndexDef(BaseModel):

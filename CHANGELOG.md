@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.342
+
+### Fixed
+
+- **Validation's CHECKSUM now honors a Schema-Conversion target-type remap instead of
+  false-mismatching it** (found by the Validation review). The per-column checksum render
+  was classified by the SOURCE type, so after the operator applied a non-default target
+  remap the tool itself recommends — e.g. keeping a `TINYINT(1)` as `smallint` for values
+  outside 0/1 — the source rendered `'true'/'false'` while the `smallint` target rendered
+  `'0'/'1'`, and **every row of a correctly-migrated column false-mismatched** in CHECKSUM
+  mode (a false alarm that can block cut-over). The Validator now resolves the APPLIED
+  target types from the Schema-Conversion result (converter vocabulary) and renders each
+  column by how it was actually stored, falling back to the source-derived mapping when
+  the applied types aren't available (e.g. after a reconnect). Source-based spatial/BIT
+  handling is unchanged.
+
 ## v0.1.341
 
 ### Fixed

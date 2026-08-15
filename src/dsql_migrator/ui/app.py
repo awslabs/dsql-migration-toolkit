@@ -176,6 +176,8 @@ def build_page(
         eval_store=EVALUATION_STORE,
         migration_store=DATA_MIGRATION_STORE,
         validation_store=VALIDATION_STORE,
+        # Lets a CHECKSUM run resolve the APPLIED target types (Schema-Conversion remaps).
+        conversion_store=SCHEMA_CONVERSION_STORE,
     )
     # Step 6 (Cut over): guidance for switching the application from MySQL to
     # DSQL. The tool cannot perform/verify the cut-over, so this step has no job —
