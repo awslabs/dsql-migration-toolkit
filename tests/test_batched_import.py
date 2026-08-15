@@ -1409,6 +1409,25 @@ def test_quarantine_is_capped_and_a_systematic_error_fails_fast(monkeypatch) -> 
     assert len(result.quarantine_records) <= 3  # retained list bounded by the cap
 
 
+def test_run_aggregate_folds_outcomes_into_running_totals() -> None:
+    # The per-batch outcomes are folded into a running aggregate as they resolve (so a
+    # billion-row load retains no per-batch list); the fold must produce exactly the totals
+    # the result used to compute over the full outcome list.
+    from dsql_migrator.core.batched_import import _BatchOutcome, _RunAggregate
+
+    agg = _RunAggregate()
+    agg.fold(_BatchOutcome(chunk_id="c0", status="DONE", rows_loaded=100, conflicts=5))
+    agg.fold(_BatchOutcome(chunk_id="c1", status="DONE", rows_loaded=50, conflicts=0))
+    agg.fold(_BatchOutcome(chunk_id="c2", status="FAILED", error="boom-1"))
+    agg.fold(_BatchOutcome(chunk_id="c3", status="FAILED", error="boom-2"))
+
+    assert agg.rows_loaded == 150
+    assert agg.conflicts == 5
+    assert agg.batches_completed == 2
+    assert agg.failures == 2
+    assert agg.first_error == "boom-1"  # the FIRST failure's message is kept
+
+
 def test_pool_discards_connection_after_in_use_error() -> None:
     from dsql_migrator.core.batched_import import _ConnectionPool
 

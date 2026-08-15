@@ -5,6 +5,17 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.327
+
+### Fixed
+
+- **Full Load retained one batch-outcome object per batch for the whole table load.** The
+  importer accumulated a `_BatchOutcome` per batch (~500k objects for a billion-row table) and
+  aggregated them only at the end. Outcomes are now folded into a running aggregate as each
+  batch resolves, so loader memory stays bounded regardless of row count. The per-batch list
+  is retained only when a job is passed (batch-level resume / small tables), where per-batch
+  chunk state is still upserted exactly as before — the reported result totals are unchanged.
+
 ## v0.1.326
 
 ### Fixed

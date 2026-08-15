@@ -276,6 +276,32 @@ class _BatchOutcome:
     error: Optional[str] = None
 
 
+@dataclass
+class _RunAggregate:
+    """Running fold of per-batch outcomes for one ``import_rows`` call.
+
+    Folding each outcome as it resolves means a whole-table load never retains one
+    ``_BatchOutcome`` per batch (O(rows / batch_size) objects -- ~500k for a billion-row
+    table). Every field the result needs is a foldable running total.
+    """
+
+    rows_loaded: int = 0
+    conflicts: int = 0
+    batches_completed: int = 0
+    failures: int = 0
+    first_error: Optional[str] = None
+
+    def fold(self, outcome: "_BatchOutcome") -> None:
+        if outcome.status == "DONE":
+            self.batches_completed += 1
+            self.rows_loaded += outcome.rows_loaded
+            self.conflicts += outcome.conflicts
+        else:  # FAILED
+            self.failures += 1
+            if self.first_error is None and outcome.error:
+                self.first_error = outcome.error
+
+
 class BatchedImportOptions(BaseModel):
     """Configuration for one built-in batched import invocation.
 
@@ -722,10 +748,14 @@ class BatchedImporter:
             self._quarantine = []
             self._quarantine_total = 0
         try:
-            outcomes, stopped_early = self._run_data_batches(
-                work_iters, pool, on_batch_loaded, should_cancel
+            # Retain the per-batch outcome list ONLY when a job is present (batch-level resume
+            # / small tables) so _apply_outcomes_to_job can upsert chunk state; the common
+            # large-table path (job is None) folds into `agg` with no unbounded per-batch list.
+            agg, outcomes, stopped_early = self._run_data_batches(
+                work_iters, pool, on_batch_loaded, should_cancel,
+                retain_outcomes=job is not None,
             )
-            failures = sum(1 for outcome in outcomes if outcome.status == "FAILED")
+            failures = agg.failures
             indexes_created = 0
             index_failures: list[str] = []
             # Skip post-load indexing when the table is incomplete (a stop) or
@@ -741,7 +771,7 @@ class BatchedImporter:
             _apply_outcomes_to_job(job, outcomes, skipped_ids)
 
         result = _aggregate_result(
-            outcomes, skipped_ids, indexes_created, cancelled=stopped_early
+            agg, skipped_ids, indexes_created, cancelled=stopped_early
         )
         # Indexes that could not be created. Reported alongside a SUCCESSFUL data
         # load: the rows are all present, so this is a missing access path to fix
@@ -954,7 +984,9 @@ class BatchedImporter:
         pool: _ConnectionPool,
         on_batch_loaded: Optional[Callable[[int, int], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> tuple[list[_BatchOutcome], bool]:
+        *,
+        retain_outcomes: bool = False,
+    ) -> "tuple[_RunAggregate, list[_BatchOutcome], bool]":
         """Execute batches concurrently with at most ``parallelism`` in flight.
 
         Submissions are throttled so no more than ``parallelism`` batches are
@@ -971,6 +1003,11 @@ class BatchedImporter:
         table. Returns the batch outcomes and whether the load stopped early
         (left unsubmitted work).
         """
+        # Fold each outcome into a running aggregate as it resolves; a whole-table load can be
+        # millions of batches, so the memory-critical path (job is None) retains NO per-batch
+        # list. Only when `job` was passed (batch-level resume / small tables) is the list kept
+        # so _apply_outcomes_to_job can upsert per-batch chunk state exactly as before.
+        agg = _RunAggregate()
         outcomes: list[_BatchOutcome] = []
         parallelism = self._options.parallelism
         in_flight: dict[Future[tuple[int, int]], str] = {}
@@ -981,7 +1018,9 @@ class BatchedImporter:
             for future in done:
                 chunk_id = in_flight.pop(future)
                 outcome = _resolve_outcome(future, chunk_id)
-                outcomes.append(outcome)
+                agg.fold(outcome)
+                if retain_outcomes:
+                    outcomes.append(outcome)
                 if (
                     on_batch_loaded is not None
                     and outcome.status == "DONE"
@@ -1033,7 +1072,7 @@ class BatchedImporter:
                 prefetched.close()
             while in_flight:
                 drain_one()
-        return outcomes, stopped_early
+        return agg, outcomes, stopped_early
 
     def _load_batch(
         self, work: _BatchWork, pool: _ConnectionPool
@@ -1650,30 +1689,24 @@ def _recompute_job_progress(job: MigrationJob) -> None:
 
 
 def _aggregate_result(
-    outcomes: list[_BatchOutcome],
+    agg: "_RunAggregate",
     skipped_ids: list[str],
     indexes_created: int,
     *,
     cancelled: bool = False,
 ) -> BatchedImportResult:
-    """Aggregate per-batch outcomes into a :class:`BatchedImportResult`."""
-    completed = [outcome for outcome in outcomes if outcome.status == "DONE"]
-    failures = sum(1 for outcome in outcomes if outcome.status == "FAILED")
-    first_error = next(
-        (
-            outcome.error
-            for outcome in outcomes
-            if outcome.status == "FAILED" and outcome.error
-        ),
-        None,
-    )
+    """Build a :class:`BatchedImportResult` from the run's folded aggregate.
+
+    The per-batch outcomes were folded into ``agg`` as they resolved (see _RunAggregate), so
+    no per-batch list is retained -- the result reads the same totals off the running fold.
+    """
     return BatchedImportResult(
-        rows_loaded=sum(outcome.rows_loaded for outcome in completed),
-        conflicts=sum(outcome.conflicts for outcome in completed),
-        batches_completed=len(completed),
+        rows_loaded=agg.rows_loaded,
+        conflicts=agg.conflicts,
+        batches_completed=agg.batches_completed,
         batches_skipped=len(skipped_ids),
-        failures=failures,
-        first_error=first_error,
+        failures=agg.failures,
+        first_error=agg.first_error,
         cancelled=cancelled,
         indexes_created=indexes_created,
     )
