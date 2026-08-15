@@ -1037,8 +1037,22 @@ def test_checksum_bit_column_renders_numeric() -> None:
 
 def test_checksum_boolean_column_renders_words() -> None:
     mysql_sql, pg_sql, _mysql_tok, _pg_tok = _all_four_rendered(_typed_table())
-    assert "CASE WHEN `active` = 0 THEN 'false' ELSE 'true' END" in mysql_sql
+    assert "WHEN `active` = 0 THEN 'false' ELSE 'true' END" in mysql_sql
     assert '"active"::text' in pg_sql
+
+
+def test_checksum_boolean_null_routes_to_shared_sentinel() -> None:
+    """A NULL boolean must render as SQL NULL on the MySQL side (-> the shared '~N'
+    sentinel), matching PG's NULL boolean. Without the IS NULL guard, MySQL's
+    `NULL = 0` is UNKNOWN and the CASE falls to ELSE -> 'true', which both
+    false-mismatches a correctly-migrated NULL->NULL row and false-matches a
+    source-NULL vs target-TRUE row (a soundness hole in CHECKSUM mode).
+    """
+    from dsql_migrator.core.validator import _mysql_checksum_expr
+
+    expr = _mysql_checksum_expr(ColumnDef(name="active", mysql_type="TINYINT(1)"))
+    assert "`active` IS NULL THEN NULL" in expr  # NULL -> NULL -> COALESCE sentinel
+    assert "WHEN `active` = 0 THEN 'false' ELSE 'true' END" in expr
 
 
 def test_checksum_zerofill_int_renders_plain_numeric() -> None:
@@ -1136,7 +1150,7 @@ def test_pk_token_matches_checksum_per_column_terms() -> None:
         "LOWER(HEX(`payload`))",
         "LOWER(HEX(ST_AsBinary(`geo`)))",
         "CAST(`flags` AS UNSIGNED)",
-        "CASE WHEN `active` = 0 THEN 'false' ELSE 'true' END",
+        "WHEN `active` = 0 THEN 'false' ELSE 'true' END",
         "DATE_FORMAT(`created_at`, '%Y-%m-%d %H:%i:%s.%f')",
         "CAST(`amount` AS DECIMAL(65, 4))",
     ):

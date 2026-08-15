@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.340
+
+### Fixed
+
+- **Validation no longer mishandles a NULL in a nullable boolean (`TINYINT(1)`) column in
+  CHECKSUM mode** (found by the Validation review). The MySQL-side checksum rendered a NULL
+  boolean as `'true'` — `NULL = 0` is UNKNOWN, so the `CASE` fell through to `ELSE` — while
+  the target renders a NULL boolean as SQL NULL (the shared `~N` sentinel). That both
+  (a) FALSE-MISMATCHED a correctly-migrated NULL→NULL row (a false alarm that can block a
+  clean cut-over on correct data) and (b) FALSE-MATCHED a source-NULL vs target-TRUE row
+  (hiding a genuine value corruption — a soundness hole in the exact case CHECKSUM mode
+  exists to catch). The MySQL render now returns SQL NULL for a NULL boolean (an `IS NULL`
+  guard), routing it through the same sentinel as every other type so both engines agree.
+
 ## v0.1.339
 
 ### Changed

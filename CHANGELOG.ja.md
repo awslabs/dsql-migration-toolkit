@@ -5,6 +5,20 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.340
+
+### Fixed
+
+- **検証(Validation)が CHECKSUM モードで nullable boolean(`TINYINT(1)`)列の NULL を
+  誤って扱わなくなりました**(Validation レビューで発見)。MySQL 側のチェックサムが NULL の
+  boolean を `'true'` としてレンダリングしていました(`NULL = 0` は UNKNOWN なので `CASE` が
+  `ELSE` に落ちる)が、ターゲットは NULL の boolean を SQL NULL(共有の `~N` センチネル)として
+  レンダリングします。このため (a) 正しく移行された NULL→NULL 行を **false MISMATCH**(正しい
+  データへの誤警告でクリーンなカットオーバーを妨げうる)し、(b) ソース NULL 対ターゲット TRUE の
+  行を **false MATCH**(実際の値破損を隠蔽 — CHECKSUM モードが存在するまさにそのケースの健全性の
+  穴)していました。今後は MySQL レンダーが NULL の boolean に SQL NULL を返し(`IS NULL` ガード)、
+  他のすべての型と同じセンチネルに流れて両エンジンが一致します。
+
 ## v0.1.339
 
 ### Changed

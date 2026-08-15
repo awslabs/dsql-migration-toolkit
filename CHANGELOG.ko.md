@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.340
+
+### Fixed
+
+- **검증(Validation)이 CHECKSUM 모드에서 nullable boolean(`TINYINT(1)`) 컬럼의 NULL을 더 이상
+  잘못 처리하지 않습니다** (Validation 리뷰에서 발견). MySQL 측 체크섬이 NULL boolean을
+  `'true'`로 렌더링했는데(`NULL = 0`은 UNKNOWN이라 `CASE`가 `ELSE`로 떨어짐), 타깃은 NULL
+  boolean을 SQL NULL(공유 `~N` 센티널)로 렌더링합니다. 이로 인해 (a) 정상 이관된 NULL→NULL
+  행을 **false MISMATCH**(정상 데이터에 알람 → cut-over 차단 가능)하고, (b) 소스 NULL vs
+  타깃 TRUE 행을 **false MATCH**(실제 값 손상 은폐 — CHECKSUM 모드가 존재하는 바로 그
+  케이스의 건전성 구멍)했습니다. 이제 MySQL 렌더가 NULL boolean에 SQL NULL을 반환(`IS NULL`
+  가드)해, 다른 모든 타입과 동일한 센티널로 흘러가 양쪽 엔진이 일치합니다.
+
 ## v0.1.339
 
 ### Changed

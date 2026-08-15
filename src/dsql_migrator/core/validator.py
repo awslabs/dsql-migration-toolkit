@@ -298,8 +298,13 @@ def _mysql_checksum_expr(column: "ColumnDef") -> Optional[str]:
         # BIT(n) target is an integer; render the numeric value (matches PG int text).
         return f"CAST({ident} AS UNSIGNED)"
     if kind == "boolean":
-        # TINYINT(1) target is boolean; render PG's 'true'/'false' words.
-        return f"CASE WHEN {ident} = 0 THEN 'false' ELSE 'true' END"
+        # TINYINT(1) target is boolean; render PG's 'true'/'false' words. The IS NULL
+        # guard is REQUIRED: without it a NULL renders 'true' (NULL = 0 is UNKNOWN, so
+        # the CASE falls to ELSE), which both (a) FALSE-MISMATCHES a correctly-migrated
+        # NULL->NULL row (PG col::text is NULL -> the '~N' sentinel) and (b) FALSE-MATCHES
+        # a source-NULL vs target-TRUE row (both 'true'). Returning NULL for a NULL input
+        # routes it through the shared COALESCE(..., '~N') sentinel like every other type.
+        return f"CASE WHEN {ident} IS NULL THEN NULL WHEN {ident} = 0 THEN 'false' ELSE 'true' END"
     if kind in ("timestamp", "timestamptz"):
         # Fixed 6-digit fraction, no zone -> matches PG to_char(... 'YYYY-MM-DD HH24:MI:SS.US').
         return f"DATE_FORMAT({ident}, '%Y-%m-%d %H:%i:%s.%f')"
