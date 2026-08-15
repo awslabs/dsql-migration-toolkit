@@ -136,6 +136,38 @@ class AssumeRoleError(RuntimeError):
     """An ``sts:AssumeRole`` for the CDC deploy role failed."""
 
 
+def _assume_role_credentials(
+    sts_client: Any,
+    role_arn: str,
+    role_session_name: str,
+    duration_seconds: int,
+) -> dict:
+    """Call ``sts:AssumeRole`` once and return botocore refresh metadata.
+
+    The returned dict (``access_key`` / ``secret_key`` / ``token`` / ``expiry_time``)
+    is exactly the shape :class:`botocore.credentials.RefreshableCredentials` expects,
+    so this same callable seeds the first credentials AND re-mints them on expiry.
+    ``expiry_time`` is the ISO-8601 string botocore parses (STS returns a datetime).
+    Raises the raw exception on failure; the caller wraps the FIRST call as
+    :class:`AssumeRoleError`. Pure of secret storage: values flow only into the
+    returned dict (Property 7). Package-private + separated so it is unit-testable
+    without a live STS.
+    """
+    response = sts_client.assume_role(
+        RoleArn=role_arn,
+        RoleSessionName=role_session_name,
+        DurationSeconds=duration_seconds,
+    )
+    creds = (response or {}).get("Credentials") or {}
+    expiry = creds.get("Expiration")
+    return {
+        "access_key": creds.get("AccessKeyId"),
+        "secret_key": creds.get("SecretAccessKey"),
+        "token": creds.get("SessionToken"),
+        "expiry_time": expiry.isoformat() if hasattr(expiry, "isoformat") else expiry,
+    }
+
+
 def build_assumed_role_session(
     role_arn: str,
     *,
@@ -149,25 +181,34 @@ def build_assumed_role_session(
     """Return a session whose credentials are from assuming ``role_arn``.
 
     Calls ``sts:AssumeRole`` with the caller's base credentials (the task role /
-    profile) and builds a new :class:`BotoSessionLike` from the returned temporary
-    credentials, so downstream clients act AS the assumed role. Used to run the
-    privileged cdc-stack CloudFormation operations under a dedicated deploy role
-    rather than on the long-running app's own identity.
+    profile) and builds a new :class:`BotoSessionLike` that acts AS the assumed role.
+    Used to run the privileged cdc-stack CloudFormation operations under a dedicated
+    deploy role rather than on the long-running app's own identity.
 
-    ``sts_client`` is the test seam: when ``None`` an STS client is built from
-    ``build_session(aws_profile, session_factory=...)``. ``session_factory`` is
-    forwarded to both that STS-client build and the final session construction
-    from the temporary credentials, so a fake factory + fake STS keep this fully
-    unit-testable without reaching AWS.
+    **Credentials auto-refresh (production path).** When no ``session_factory`` is
+    injected, the returned session carries botocore
+    :class:`~botocore.credentials.RefreshableCredentials` that re-run ``AssumeRole``
+    before the ~1 h temporary credentials expire. A single CDC operation can outrun
+    that 1 h -- each connector RUNNING-wait is up to 45 min, and an AZ-retry
+    delete+recreate passes an hour -- and the deployer reuses ONE session for the whole
+    op, so static creds expired mid-flight and every CloudFormation read then threw
+    ``ExpiredToken`` (the failure the ``_wait_stack_settles`` fail-fast surfaces).
+    Refreshing keeps the long op supplied with valid credentials; it chains off the
+    base identity (an auto-refreshing task role, or a long-lived profile/user), so it
+    renews for as long as the op runs. NOTE: this path uses botocore internals and
+    cannot be exercised end-to-end offline -- validate it against a live >1 h deploy
+    before relying on it; the deployer's fail-fast still surfaces any expiry cleanly.
 
-    Each call performs a FRESH ``AssumeRole``; the returned session's temporary
-    credentials expire after ``duration_seconds`` (default 1 h, ample for a single
-    ~20 min cdc-stack create). Do NOT cache the returned session across operations.
+    ``sts_client`` is the test seam (a fake STS records the AssumeRole call). When a
+    ``session_factory`` IS injected, the session is built STATICALLY from the first
+    temporary credentials via that factory -- preserving the injectable, botocore-free
+    unit-test contract (and any caller wanting the old one-shot behavior). Both paths
+    perform an eager first ``AssumeRole`` so an immediate failure raises
+    :class:`AssumeRoleError`.
 
-    Credential confidentiality (Property 7): the temporary credential values flow
-    only into the factory call; they are never stored on an attribute or logged.
-    Only the non-secret ``role_arn`` appears in any error message. Raises
-    :class:`AssumeRoleError` if the AssumeRole call fails.
+    Credential confidentiality (Property 7): the temporary credential values flow only
+    into the session's own credential store; they are never logged. Only the non-secret
+    ``role_arn`` appears in any error message.
     """
     if sts_client is None:
         # Pin the STS client to the deploy region. The global STS endpoint works in
@@ -177,26 +218,44 @@ def build_assumed_role_session(
         sts_client = build_session(
             aws_profile, session_factory=session_factory
         ).client("sts", region_name=region)
-    try:
-        response = sts_client.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName=role_session_name,
-            DurationSeconds=duration_seconds,
+
+    def _refresh() -> dict:
+        return _assume_role_credentials(
+            sts_client, role_arn, role_session_name, duration_seconds
         )
+
+    # Eager first mint so an AssumeRole failure surfaces here (not lazily on first use).
+    try:
+        metadata = _refresh()
     except Exception as exc:  # noqa: BLE001 - surface as a typed error
         raise AssumeRoleError(
             f"Could not assume the CDC deploy role {role_arn}: "
             f"{str(exc).splitlines()[0]}"
         ) from exc
-    creds = (response or {}).get("Credentials") or {}
-    factory = (
-        session_factory if session_factory is not None else _default_session_factory()
+
+    # Injected factory -> STATIC session from the temp creds (the unit-test seam and the
+    # legacy one-shot behavior). No secret is retained beyond the factory call.
+    if session_factory is not None:
+        return session_factory(
+            aws_access_key_id=metadata["access_key"],
+            aws_secret_access_key=metadata["secret_key"],
+            aws_session_token=metadata["token"],
+        )
+
+    # Production -> auto-refreshing credentials (see the docstring). botocore is imported
+    # lazily here (like _default_session_factory) so the module still imports without it.
+    import boto3
+    from botocore.credentials import RefreshableCredentials
+    from botocore.session import Session as _BotocoreSession
+
+    refreshable = RefreshableCredentials.create_from_metadata(
+        metadata, refresh_using=_refresh, method="sts-assume-role"
     )
-    return factory(
-        aws_access_key_id=creds.get("AccessKeyId"),
-        aws_secret_access_key=creds.get("SecretAccessKey"),
-        aws_session_token=creds.get("SessionToken"),
-    )
+    botocore_session = _BotocoreSession()
+    botocore_session._credentials = refreshable
+    if region:
+        botocore_session.set_config_variable("region", region)
+    return boto3.Session(botocore_session=botocore_session)
 
 
 __all__ = [

@@ -93,6 +93,18 @@ once for the batch)._
   now uses `render_notice(tone="warning", …)` so the box + amber border + leading icon carry the
   severity, per the design system.
 
+- **The CDC deploy-role session now auto-refreshes its credentials, so a long deploy no longer
+  expires mid-flight (H5 root-cause prevention).** `build_assumed_role_session` returned static
+  1-hour `sts:AssumeRole` credentials, but the deployer reuses one session for a whole operation
+  that can exceed an hour (each connector RUNNING-wait ≤45 min; an AZ-retry delete + recreate passes
+  an hour) — so the credentials expired mid-flight and every CloudFormation read threw
+  `ExpiredToken` (the case v0.1.333's fail-fast surfaces). The production path now builds botocore
+  `RefreshableCredentials` that re-run `AssumeRole` before expiry (chaining off the base identity),
+  keeping the long op supplied with valid credentials; the injected-`session_factory` test path
+  stays static (botocore-free), preserving the unit-test contract. The refreshable path uses
+  botocore internals and can't be exercised end-to-end offline — validate it against a live >1 h
+  deploy before relying on it; the deployer's fail-fast still surfaces any expiry cleanly regardless.
+
 ## v0.1.333
 
 ### Fixed

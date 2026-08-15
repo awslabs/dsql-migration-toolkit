@@ -395,6 +395,84 @@ def test_build_assumed_role_session_builds_sts_from_profile_when_not_injected() 
     assert sts.calls  # assume_role was reached
 
 
+class _ExpiringStsClient:
+    """Fake STS returning temp creds with a controllable Expiration per call.
+
+    ``expiries`` is one datetime per AssumeRole call (last sticks); each call yields a
+    fresh AccessKeyId (``AKID<n>``) so a refresh is observable."""
+
+    def __init__(self, expiries):
+        self._expiries = list(expiries)
+        self.calls = 0
+
+    def assume_role(self, **_kwargs):
+        self.calls += 1
+        exp = self._expiries[min(self.calls - 1, len(self._expiries) - 1)]
+        return {
+            "Credentials": {
+                "AccessKeyId": f"AKID{self.calls}",
+                "SecretAccessKey": "SEC",
+                "SessionToken": "TOK",
+                "Expiration": exp,
+            }
+        }
+
+
+def test_assume_role_credentials_returns_botocore_refresh_metadata() -> None:
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.aws_session import _assume_role_credentials
+
+    sts = _ExpiringStsClient([datetime(2026, 1, 1, tzinfo=timezone.utc)])
+    meta = _assume_role_credentials(sts, "arn:aws:iam::1:role/R", "sess", 3600)
+    assert meta == {
+        "access_key": "AKID1",
+        "secret_key": "SEC",
+        "token": "TOK",
+        "expiry_time": datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat(),
+    }
+
+
+def test_build_assumed_role_session_uses_refreshable_creds_without_factory() -> None:
+    # Production path (no injected session_factory): the session carries botocore
+    # RefreshableCredentials seeded from the eager first AssumeRole, with NO premature
+    # refresh (a far-future expiry).
+    from datetime import datetime, timedelta, timezone
+
+    from botocore.credentials import RefreshableCredentials
+
+    from dsql_migrator.core.aws_session import build_assumed_role_session
+
+    sts = _ExpiringStsClient([datetime.now(timezone.utc) + timedelta(hours=2)])
+    session = build_assumed_role_session(
+        "arn:aws:iam::1:role/R", sts_client=sts, region="us-east-1"
+    )
+    creds = session.get_credentials()
+    assert isinstance(creds, RefreshableCredentials)
+    assert creds.access_key == "AKID1"
+    assert sts.calls == 1  # only the eager mint; not yet due to refresh
+
+
+def test_build_assumed_role_session_refreshes_when_creds_expire() -> None:
+    # The point of the refreshable path: an expired credential re-runs AssumeRole so a
+    # CDC op that outruns the 1h session keeps valid creds. First mint expires
+    # immediately -> accessing the credential forces a re-AssumeRole.
+    from datetime import datetime, timedelta, timezone
+
+    from dsql_migrator.core.aws_session import build_assumed_role_session
+
+    sts = _ExpiringStsClient([
+        datetime.now(timezone.utc) - timedelta(minutes=1),   # mint 1: already expired
+        datetime.now(timezone.utc) + timedelta(hours=2),     # mint 2: fresh
+    ])
+    session = build_assumed_role_session(
+        "arn:aws:iam::1:role/R", sts_client=sts, region="us-east-1"
+    )
+    # Accessing the (expired) credential triggers the refresh callable -> re-AssumeRole.
+    assert session.get_credentials().access_key == "AKID2"
+    assert sts.calls == 2
+
+
 # ---------------------------------------------------------------------------
 # ensure_default_region (Fargate region floor)
 # ---------------------------------------------------------------------------

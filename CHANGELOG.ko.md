@@ -76,6 +76,16 @@ _여러 CDC 리뷰 수정을 한 패치로 묶습니다 (ECR Public 이미지는
   맨 `text-red-700` 라벨이었는데, 이제 `render_notice(tone="warning", …)`를 사용해 박스 + 앰버 테두리 + 선행
   아이콘이 심각도를 전달합니다(디자인시스템 준수).
 
+- **CDC 배포-역할 세션이 이제 크레덴셜을 자동 갱신하여, 장기 배포가 도중에 만료되지 않습니다(H5 근본 예방).**
+  `build_assumed_role_session`이 정적 1시간 `sts:AssumeRole` 크레덴셜을 반환했는데, deployer는 1시간을 넘길 수 있는
+  작업 전체(커넥터 RUNNING 대기 각 ≤45분, AZ 재시도 delete + recreate는 1시간 초과)에 대해 단일 세션을 재사용 —
+  그래서 크레덴셜이 도중에 만료되고 모든 CloudFormation 읽기가 `ExpiredToken`을 던졌습니다(v0.1.333의 fail-fast가
+  표면화하는 경우). 이제 운영 경로는 만료 전에 `AssumeRole`을 재실행하는 botocore `RefreshableCredentials`를 만들어
+  (기반 신원에서 체이닝) 장기 작업에 유효한 크레덴셜을 공급합니다. 주입된 `session_factory` 테스트 경로는 정적(botocore
+  비의존)으로 유지되어 유닛 테스트 계약을 보존합니다. 이 갱신 경로는 botocore 내부를 사용해 오프라인 end-to-end 검증이
+  불가능하므로 — 신뢰하기 전에 라이브 >1시간 배포로 검증하세요. deployer의 fail-fast가 어떤 만료든 여전히 깔끔하게
+  표면화합니다.
+
 ## v0.1.333
 
 ### 수정 (Fixed)
