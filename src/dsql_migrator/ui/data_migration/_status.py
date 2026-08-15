@@ -1247,15 +1247,40 @@ def cdc_dlq_records(migration_state, log_key: str) -> list:
     this, because they all read the same key: filtering one of them alone would make
     the count disagree with the rows beneath it.
 
+    Memoized on the log's append-only record COUNT: the CDC poll and the screen
+    re-render call this 4-5 times per ~5 s tick, and each call used to copy the whole
+    (uncapped, growing) error log and re-run the per-record CDC/Full-Load predicate --
+    O(records) work repeated 4-5x every tick, growing unbounded exactly during a drift
+    storm when the log is largest. Because the log is append-only, an unchanged count
+    means an unchanged view, so the expensive copy+filter runs only when a NEW record
+    arrived; a genuine reset drops the count to 0 and invalidates the cache. The
+    returned list is a shared READ-ONLY view (all callers iterate it or ``sorted()`` a
+    copy -- none mutate it in place).
+
     Best-effort: an unreadable log yields ``[]`` rather than breaking the panel.
     """
     if not log_key:
         return []
+    error_log = getattr(migration_state, "error_log", None)
+    if error_log is None:
+        return []
     try:
-        records = migration_state.error_log.records(log_key)
+        count = error_log.count(log_key)
     except Exception:  # noqa: BLE001 - advisory list; never break the panel
         return []
-    return [r for r in records or () if is_cdc_error_record(r)]
+    cache = getattr(migration_state, "_cdc_dlq_records_cache", None)
+    if cache is not None and cache[0] == log_key and cache[1] == count:
+        return cache[2]
+    try:
+        records = error_log.records(log_key)
+    except Exception:  # noqa: BLE001 - advisory list; never break the panel
+        return []
+    filtered = [r for r in records or () if is_cdc_error_record(r)]
+    try:
+        migration_state._cdc_dlq_records_cache = (log_key, count, filtered)
+    except Exception:  # noqa: BLE001 - caching is best-effort; correctness unaffected
+        pass
+    return filtered
 
 
 def full_load_error_records(error_log, job_id: str) -> list:

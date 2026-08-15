@@ -119,19 +119,26 @@ final class DebeziumTypeConverter {
   }
 
   /**
-   * Convert microseconds-since-midnight to a {@link java.sql.Time}. MySQL TIME can
-   * exceed 24h or be negative (range -838:59:59..838:59:59); such a value has no
+   * Convert microseconds-since-midnight to a {@link java.time.LocalTime}. MySQL TIME
+   * can exceed 24h or be negative (range -838:59:59..838:59:59); such a value has no
    * {@code time} representation, so it is left to bind as-is (failing loudly to the
    * DLQ) rather than being silently wrapped. In-range values bind cleanly.
+   *
+   * <p><b>Returns {@code LocalTime}, NOT {@code java.sql.Time}.</b>
+   * {@code java.sql.Time} holds only hour/minute/second -- {@code Time.valueOf(LocalTime)}
+   * DISCARDS the sub-second field per the JDK contract -- so a MySQL {@code TIME(1-6)}
+   * value silently lost its microseconds on the CDC path while the Full Load path
+   * (Python {@code datetime.time(microsecond=…)}) kept them, diverging the two writes
+   * and failing Validation. pgjdbc binds a {@link java.time.LocalTime} to a
+   * {@code time}/{@code time(n)} column with full microsecond precision, and it is
+   * timezone-independent (unlike {@code new java.sql.Time(millis)}, which would
+   * interpret the millis in the JVM's local zone).
    */
   private static Object microsToTime(long micros) {
     if (micros < 0 || micros >= 86_400L * MICROS_PER_SECOND) {
       return micros; // out of [0,24h): cannot represent as time — fail loudly
     }
-    // Build from the wall-clock nano-of-day so the value is timezone-independent
-    // (new java.sql.Time(millis) would interpret millis in the JVM's local zone).
-    return java.sql.Time.valueOf(
-        java.time.LocalTime.ofNanoOfDay(micros * NANOS_PER_MICRO));
+    return java.time.LocalTime.ofNanoOfDay(micros * NANOS_PER_MICRO);
   }
 
   /**

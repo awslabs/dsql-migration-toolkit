@@ -41,6 +41,19 @@ def test_summary_counts_match_records() -> None:
     assert summary.total_errors == sum(summary.errors_by_table.values())
 
 
+def test_count_tracks_appends_without_copying() -> None:
+    # count() is the cheap append-only length a hot DLQ-poll caller uses to detect
+    # whether new records arrived (so it can skip re-copying+re-filtering the whole
+    # log). It must match len(records) and stay 0 for an unknown key.
+    store = ErrorLogStore()
+    assert store.count("job1") == 0
+    store.record("job1", _rec("app.orders"))
+    store.record("job1", _rec("app.users"))
+    assert store.count("job1") == 2
+    assert store.count("job1") == len(store.records("job1"))
+    assert store.count("other") == 0  # jobs are isolated
+
+
 def test_latest_messages_returns_most_recent_per_table() -> None:
     store = ErrorLogStore()
     store.record("j", _rec("app.orders", message="first"))

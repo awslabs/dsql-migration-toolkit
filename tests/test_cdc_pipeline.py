@@ -319,16 +319,19 @@ def test_classify_schema_drift_maps_known_sqlstates() -> None:
     assert classify_schema_drift("42804") is SchemaDriftKind.TYPE_CHANGE
 
 
-def test_classify_schema_drift_treats_class_22_as_type_change() -> None:
-    # Class 22 (data exception): string-too-long / numeric-range / bad-datetime all
-    # mean the source retyped a column incompatibly.
+def test_classify_schema_drift_class_22_is_not_drift() -> None:
+    # Class 22 (data exception): string-too-long / numeric-range / bad-datetime / bad
+    # text are per-VALUE rejections ordinary bad data raises with NO source DDL change,
+    # so they must NOT be surfaced as a "source changed a column's type" drift (which
+    # fired that banner on every oversized/out-of-range poison row). They stay ordinary
+    # quarantines. Only 42804 (datatype_mismatch) is the type-change signal.
     for code in ("22001", "22003", "22007", "22P02"):
-        assert classify_schema_drift(code) is SchemaDriftKind.TYPE_CHANGE
+        assert classify_schema_drift(code) is None
 
 
 def test_classify_schema_drift_is_case_and_whitespace_insensitive() -> None:
     assert classify_schema_drift(" 42703 ") is SchemaDriftKind.ADD_COLUMN
-    assert classify_schema_drift("22001".lower()) is SchemaDriftKind.TYPE_CHANGE
+    assert classify_schema_drift("  42804  ") is SchemaDriftKind.TYPE_CHANGE
 
 
 def test_classify_schema_drift_returns_none_for_non_drift_codes() -> None:

@@ -25,9 +25,10 @@ guarded stop) and Property 7 (no credential value is read or logged) hold.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 from dsql_migrator.core.aws_session import BotoSessionLike, build_session
 from dsql_migrator.core.cdc import CdcConnectorError, ConnectorState, ConnectorStatus
@@ -105,6 +106,27 @@ _REPLICATION_LAG_METRIC = "ReplicationLagMs"
 # actively-streaming pipeline (which emits every offset-commit) is never falsely idled.
 _LAG_FRESHNESS_SECONDS = 180
 
+# TTL for the per-(stack, metric) Table-dimension discovery cache. Every CDC poll
+# (~5 s) reads applied-ops (3 metrics) + per-table lag + the lag trend, each of which
+# calls _list_metric_dimensions -- 5 ListMetrics-pagination passes per poll for data
+# ("which tables emit this metric") that changes only when a NEW table starts
+# emitting. Memoizing discovery collapses the 5 within a poll AND the re-discovery
+# across polls to at most one pagination per metric per window, cutting CloudWatch
+# ListMetrics calls ~6x at the 5 s poll rate (and the throttling risk with them). A
+# table that newly starts emitting appears within this window; the live get_metric_data
+# DATA reads are never cached (they must stay current).
+_METRIC_DIM_CACHE_TTL_SECONDS = 30
+
+# Initial DLQ look-back on the FIRST poll (before a cursor exists). CDC often runs
+# headless / as a resumed stream and dead-letters rows for a while BEFORE an operator
+# opens the UI and the monitor first reads the log; a 1 h look-back silently omitted
+# every quarantine older than that (and once the cursor moves forward they can never be
+# picked up). A wider first-read window captures a realistic late/headless attach's
+# backlog; the oldest-first read + forward cursor then drain it over subsequent polls.
+# Not unbounded: a per-call `limit` caps each read, and this is only the FIRST window
+# (later polls advance from the cursor), so it does not re-scan history every poll.
+_DLQ_INITIAL_LOOKBACK_SECONDS = 6 * 3600
+
 
 def _match_metric_tables(
     requested: Sequence[str], discovered: Sequence[str]
@@ -143,21 +165,30 @@ class MskConnectController:
         *,
         aws_profile: Optional[str] = None,
         session: Optional[BotoSessionLike] = None,
+        monotonic: Optional[Callable[[], float]] = None,
     ) -> None:
         """Bind the controller to the MSK Connect region + global AWS profile.
 
         ``session`` is an injection seam for tests (a fake ``boto3.Session``);
         when omitted the shared profile-aware session is built lazily on first
-        use so constructing the controller never reaches AWS.
+        use so constructing the controller never reaches AWS. ``monotonic`` is the
+        clock seam for the metric-dimension discovery cache (defaults to
+        :func:`time.monotonic`); tests inject a fake to exercise TTL expiry.
         """
         self._region = region
         self._aws_profile = aws_profile
         self._session = session
+        self._monotonic = monotonic or time.monotonic
         # Cursor + de-dup state for incremental DLQ log reads (see dlq_errors):
         # only events newer than the last seen are returned, and an eventId set
         # guards the timestamp boundary so a record is never surfaced twice.
         self._dlq_cursor_ms: Optional[int] = None
         self._dlq_seen_ids: set[str] = set()
+        # Short-TTL cache for _list_metric_dimensions, keyed on (stack, metric_name):
+        # {key: (expiry_monotonic, dims)}. Collapses the 5 per-poll discovery passes
+        # (and cross-poll re-discovery) so ListMetrics is not paged every 5 s for data
+        # that changes only when a new table starts emitting. See the TTL constant.
+        self._dim_cache: dict[tuple[str, str], tuple[float, list[str]]] = {}
 
     def _client(self, service_name: str) -> object:
         session = self._session or build_session(self._aws_profile)
@@ -169,7 +200,7 @@ class MskConnectController:
         *,
         now: Optional[datetime] = None,
         limit: int = 100,
-        window_seconds: int = 3600,
+        window_seconds: int = _DLQ_INITIAL_LOOKBACK_SECONDS,
     ) -> list[CdcConnectorError]:
         """Read NEW sink dead-letter (DLQ) events from the connector log group.
 
@@ -181,6 +212,11 @@ class MskConnectController:
         set de-dup across polls) and parses each into a credential-free
         :class:`CdcConnectorError` (no row values, no SQL). Returns ``[]`` on any
         access error (fail-closed) so the monitor degrades gracefully.
+
+        ``window_seconds`` is the FIRST-read look-back only (once a cursor exists,
+        reads are incremental from it). It defaults to
+        :data:`_DLQ_INITIAL_LOOKBACK_SECONDS` so a headless / late-attach run's earlier
+        quarantines are captured rather than silently dropped -- see that constant.
 
         Intended to be called on the CDC status poll's worker thread (it does
         blocking network I/O); the caller records the returned errors into the
@@ -666,7 +702,20 @@ class MskConnectController:
         Filters ``ListMetrics`` to that metric with this ``Stack`` dimension and returns
         each metric's ``Table`` value. Paginates over ``NextToken`` with a bounded loop
         (500 metrics/page) so a large schema is covered without an unbounded call chain.
+
+        Memoized per ``(stack, metric_name)`` for ``_METRIC_DIM_CACHE_TTL_SECONDS`` so
+        the 5 discovery passes a single CDC poll makes (3 op metrics + 2 lag readers),
+        and the re-discovery every poll, collapse to one pagination per metric per
+        window -- discovery ("which tables emit this metric") changes only when a new
+        table starts emitting, and the live get_metric_data DATA reads are never cached.
+        Only successful reads are cached; an error propagates (uncached) to the caller's
+        best-effort handler, so a transient failure is retried on the next poll.
         """
+        key = (stack, metric_name)
+        now = self._monotonic()
+        cached = self._dim_cache.get(key)
+        if cached is not None and now < cached[0]:
+            return list(cached[1])
         tables: list[str] = []
         token: Optional[str] = None
         for _ in range(20):  # 500 metrics/page -> up to 10k tables; a hard cap
@@ -685,6 +734,8 @@ class MskConnectController:
             token = resp.get("NextToken")
             if not token:
                 break
+        # Cache only a fully-read result (the loop above completed without raising).
+        self._dim_cache[key] = (now + _METRIC_DIM_CACHE_TTL_SECONDS, list(tables))
         return tables
 
     # -- guarded mutation ---------------------------------------------------

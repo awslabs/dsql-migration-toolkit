@@ -420,11 +420,13 @@ class SchemaDriftKind(str, Enum):
 
     ADD_COLUMN = "add-column"      # 42703 undefined_column: source added a column the target lacks
     DROP_COLUMN = "drop-column"    # 23502 not_null_violation: source dropped a column the target requires
-    TYPE_CHANGE = "type-change"    # 42804 / 22xxx: source changed a column's type incompatibly
+    TYPE_CHANGE = "type-change"    # 42804 datatype_mismatch: source changed a column's type incompatibly
 
 
-# SQLSTATE -> drift kind. 22xxx (data exception) shares TYPE_CHANGE with 42804
-# (datatype_mismatch); it is matched by prefix below rather than enumerated.
+# SQLSTATE -> drift kind. Only STRUCTURAL rejections (tied to the row's column set
+# or a column's declared type) map to drift; a per-VALUE data exception does NOT (see
+# classify_schema_drift). 42804 (datatype_mismatch) is the type-change signal --
+# deliberately NOT class 22 (22001/22003/…), which ordinary bad data raises.
 _DRIFT_BY_SQLSTATE: dict[str, SchemaDriftKind] = {
     "42703": SchemaDriftKind.ADD_COLUMN,
     "23502": SchemaDriftKind.DROP_COLUMN,
@@ -435,20 +437,24 @@ _DRIFT_BY_SQLSTATE: dict[str, SchemaDriftKind] = {
 def classify_schema_drift(error_code: Optional[str]) -> Optional[SchemaDriftKind]:
     """Map a sink-quarantine SQLSTATE to a source-schema-drift kind, else ``None``.
 
-    Pure: the single source of truth for "which SQLSTATE means which drift". A
-    ``None``/unknown code (an ordinary poison row -- bad value, oversized LOB,
-    etc.) returns ``None`` so it is NOT surfaced as schema drift. Class ``22``
-    (data exception, e.g. ``22001`` string-too-long / ``22003`` numeric range /
-    ``22007`` bad datetime) is treated as a type change alongside ``42804``.
+    Pure: the single source of truth for "which SQLSTATE means which drift". Only the
+    three STRUCTURAL SQLSTATEs map -- rejections determined by the row's COLUMN SET or
+    a column's DECLARED TYPE, which a source DDL change produces:
+    ``42703`` (a column the target lacks -> ADD COLUMN), ``23502`` (a NOT NULL target
+    column got no value -> a dropped source column), ``42804`` (datatype_mismatch ->
+    TYPE CHANGE).
+
+    A class ``22`` data exception (``22001`` string-too-long / ``22003`` numeric range
+    / ``22007`` bad datetime / ``22P02`` bad text) is deliberately NOT drift: it is a
+    per-VALUE rejection that ordinary bad data raises with no DDL change at all, so
+    mapping it to TYPE_CHANGE fired a false "source changed a column's type" banner on
+    every oversized/out-of-range poison row. Such a code (and any other unknown /
+    ``None`` code) returns ``None`` so it stays an ordinary quarantine, not drift.
     """
     if not error_code:
         return None
     code = error_code.strip().upper()
-    if code in _DRIFT_BY_SQLSTATE:
-        return _DRIFT_BY_SQLSTATE[code]
-    if code.startswith("22"):
-        return SchemaDriftKind.TYPE_CHANGE
-    return None
+    return _DRIFT_BY_SQLSTATE.get(code)
 
 
 class CdcConnectorError(BaseModel):

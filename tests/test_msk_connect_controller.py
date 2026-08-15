@@ -16,6 +16,8 @@ from typing import Any
 
 from dsql_migrator.core.cdc import ConnectorState
 from dsql_migrator.core.msk_connect_controller import (
+    _DLQ_INITIAL_LOOKBACK_SECONDS,
+    _METRIC_DIM_CACHE_TTL_SECONDS,
     MskConnectController,
     target_lag_seconds,
 )
@@ -585,6 +587,34 @@ def test_replication_lag_series_batches_over_500_query_cap() -> None:
     assert all(len(c[1]["MetricDataQueries"]) <= 500 for c in gmd_calls)  # cap respected
 
 
+def test_metric_dimension_discovery_is_cached_within_ttl() -> None:
+    # Every CDC poll reads applied-ops (3 metrics) + per-table lag + the lag trend, each
+    # calling _list_metric_dimensions -> up to 5 ListMetrics-pagination passes per poll,
+    # repeated every ~5 s, for data that changes only when a NEW table starts emitting.
+    # Discovery is memoized per (stack, metric) for a short TTL: two reads of the SAME
+    # metric within the window share ONE ListMetrics pagination; past the TTL it re-reads.
+    clock = [1000.0]
+    client = _FakeClient({
+        "list_metrics": {"Metrics": [
+            {"Dimensions": [{"Name": "Stack", "Value": "stk"},
+                            {"Name": "Table", "Value": "ecommerce.orders"}]}]},
+        "get_metric_data": "echo",
+    })
+    ctrl = MskConnectController(
+        "us-east-1", session=_FakeSession(client), monotonic=lambda: clock[0]
+    )
+
+    # by_table + series both discover ReplicationLagMs -> ListMetrics ran ONCE (cached).
+    ctrl.replication_lag_by_table("stk", ["ecommerce.orders"])
+    ctrl.replication_lag_series("stk", ["ecommerce.orders"])
+    assert sum(1 for c in client.calls if c[0] == "list_metrics") == 1
+
+    # Past the TTL -> discovery is re-read exactly once more.
+    clock[0] += _METRIC_DIM_CACHE_TTL_SECONDS + 1
+    ctrl.replication_lag_by_table("stk", ["ecommerce.orders"])
+    assert sum(1 for c in client.calls if c[0] == "list_metrics") == 2
+
+
 def test_match_metric_tables_prefers_exact_then_unambiguous_bare() -> None:
     from dsql_migrator.core.msk_connect_controller import _match_metric_tables
 
@@ -742,3 +772,16 @@ def test_dlq_errors_parses_new_events_and_dedups() -> None:
 def test_dlq_errors_fail_closed_on_access_error() -> None:
     client = _FakeClient({}, raise_on="filter_log_events")
     assert _controller(client).dlq_errors("/msk-connect/x-cdc") == []
+
+
+def test_dlq_errors_first_read_uses_the_wide_initial_lookback() -> None:
+    # First poll (no cursor yet): the look-back must be wide enough to capture a
+    # headless / late-attach run's earlier quarantines, not just the trailing hour
+    # that silently dropped everything older (and could never pick it up once the
+    # cursor moved forward). Later polls read incrementally from the cursor.
+    client = _FakeClient({"filter_log_events": {"events": []}})
+    now = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
+    _controller(client).dlq_errors("/msk-connect/x-cdc", now=now)
+    call = next(c for c in client.calls if c[0] == "filter_log_events")
+    now_ms = int(now.timestamp() * 1000)
+    assert call[1]["startTime"] == now_ms - _DLQ_INITIAL_LOOKBACK_SECONDS * 1000

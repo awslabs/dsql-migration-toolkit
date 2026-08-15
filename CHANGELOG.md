@@ -5,6 +5,82 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.334
+
+_Batches several CDC-review fixes under one patch (the ECR Public image is republished
+once for the batch)._
+
+### Fixed
+
+- **Ordinary CDC poison rows falsely raised a "source schema change detected" banner.**
+  `classify_schema_drift` mapped any class-22 SQLSTATE (`22001` string-too-long, `22003` numeric
+  out-of-range, `22007` bad datetime, `22P02` bad text) to a `TYPE_CHANGE` drift — but those are
+  per-**value** rejections that ordinary bad data raises with no source DDL change at all, so a
+  single oversized/out-of-range quarantined row was reported as "the source changed a column's
+  type," steering the operator toward a schema reconciliation that was not the real problem. Drift
+  classification is now restricted to the three **structural** SQLSTATEs (determined by the row's
+  column set / a column's declared type, which a source DDL change produces): `42703` → ADD
+  COLUMN, `23502` → DROP COLUMN, `42804` (datatype_mismatch) → TYPE CHANGE. A class-22 value error
+  stays an ordinary quarantine (still counted in DLQ depth, not surfaced as drift).
+
+- **Every CDC status poll re-discovered the CloudWatch metric dimensions ~5× and re-paged
+  `ListMetrics` every ~5 s.** `applied_ops_by_table` (3 op metrics) plus `replication_lag_by_table`
+  and `replication_lag_series` (the same `ReplicationLagMs` metric, twice) each ran the bounded
+  `ListMetrics` pagination on every poll — 5 discovery passes per tick for data that changes only
+  when a new table starts emitting, inflating CloudWatch cost/latency with the poll rate and
+  risking throttling (which blanks the monitor). `_list_metric_dimensions` is now memoized per
+  `(stack, metric)` for a short TTL, collapsing the passes within a poll and the re-discovery
+  across polls to one pagination per metric per window; the live `GetMetricData` data reads stay
+  uncached so the numbers remain current.
+
+- **The DLQ view missed pre-existing quarantines on a late/headless attach.** The first CloudWatch
+  DLQ read looked back only the trailing hour, so a CDC run that had been dead-lettering for longer
+  than that before the operator opened the UI (e.g. a headless `run_e2e_migration.py` stream)
+  silently omitted the earlier quarantines — and once the read cursor advanced forward they could
+  never be picked up. The first-read look-back is now widened (`_DLQ_INITIAL_LOOKBACK_SECONDS`) to
+  capture a realistic late-attach backlog; subsequent polls still read incrementally from the
+  cursor (each read is `limit`-bounded, so history is not re-scanned every poll).
+
+- **Clicking "Start CDC" ran blocking AWS/file work on the UI event loop, freezing every
+  browser session on Fargate.** The Start-CDC confirm handler performed a deploy-role
+  `AssumeRole` (deployer build), an STS `GetCallerIdentity`, a ~50 KiB template read, and a config
+  load synchronously on the single asyncio loop that serves all sessions — so the click stalled
+  every session for the round-trip (longer under STS throttling). All of that setup now runs inside
+  the submitted background job body (worker thread), matching the sibling infra-deploy path; the
+  event loop only builds the pure params and submits the job.
+
+- **The CDC monitor re-scanned the entire (uncapped) DLQ error log 4–5× on every ~5 s poll.**
+  The depth badge, per-table chips, drift banner, and record list each called `cdc_dlq_records`,
+  which copied the whole append-only error log and re-ran the per-record CDC/Full-Load predicate —
+  O(records) work repeated 4–5× per tick and growing unbounded exactly during a drift storm when
+  the log is largest (the opposite of the project's bounded-work stance). `cdc_dlq_records` is now
+  memoized on the log's append-only record count (via a new O(1) `ErrorLogStore.count`), so the
+  copy + filter runs only when a new record actually arrives; an unchanged count hands back the
+  cached view, and a reset drops the count to 0 and invalidates it.
+
+- **A connector CREATE_FAILED rollback surfaced an opaque message instead of the diagnosed
+  cause.** On a connector failure the stack rolls back and the connectors-pass wait raises before
+  the per-connector RUNNING-waits (which diagnose on real names) are reached — so its own rollback
+  diagnosis is the only chance to surface the cause. But it was handed a synthetic
+  `"<src> + <sink>"` pseudo-name that matched no CloudWatch log stream (`connector_log_tail`
+  matches a stream by substring), so the worker-log diagnosis was always dead on this primary
+  failure path and the operator got the opaque "Stack operation ended in
+  'UPDATE_ROLLBACK_COMPLETE'". The wait now takes the list of REAL connector names and scans each
+  one's worker log, so a known failure (source unreachable, access denied, partition-quota
+  exhaustion, a plugin-packaging defect) surfaces as actionable guidance.
+
+- **CDC dropped the sub-second precision of a MySQL `TIME(1–6)` value (Full Load ↔ CDC
+  divergence).** The sink's `DebeziumTypeConverter.microsToTime` built the value with
+  `java.sql.Time.valueOf(LocalTime)`, and `java.sql.Time` holds only hour/minute/second — the
+  JDK contract discards the sub-second field — so a CDC-applied fractional `TIME` landed
+  truncated (`12:34:56` for a source `12:34:56.789012`), while the Full Load path (Python
+  `datetime.time(microsecond=…)`) kept the microseconds. The two write paths therefore disagreed
+  and Validation flagged a mismatch on every fractional-`TIME` row. The converter now returns a
+  `java.time.LocalTime`, which pgjdbc binds to a `time`/`time(n)` column with full microsecond
+  precision (and is timezone-independent). Rebuilds the DSQL sink jar; connector plugin
+  `PLUGIN_VERSION` → `v31` (a `PLUGIN_VERSION` bump requires Delete + Deploy of the CDC infra to
+  take effect).
+
 ## v0.1.333
 
 ### Fixed

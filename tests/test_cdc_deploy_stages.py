@@ -691,6 +691,27 @@ def test_start_connector_failed_raises() -> None:
         _run_start(handle, deployer)
     # The single connectors_running stage never completes; pipeline stays PENDING.
     assert _statuses(handle)["connectors_running"] != "DONE"
+
+
+def test_start_rollback_diagnoses_from_real_connector_logs() -> None:
+    # A connector CREATE_FAILED rolls the stack back, and the connectors-pass
+    # _wait_stack_settles raises BEFORE the per-connector RUNNING-waits run -- so its
+    # rollback diagnosis is the only chance to surface the cause. It must scan the REAL
+    # connector names' worker logs: a synthetic "src + sink" pseudo-name matched no log
+    # stream (connector_log_tail matches by substring), leaving the whole diagnosis dead
+    # on this -- the primary -- connector-failure path. A source-unreachable signature
+    # in the source connector's log must surface as actionable guidance, not the opaque
+    # "Stack operation ended in 'UPDATE_ROLLBACK_COMPLETE'".
+    handle = _FakeHandle()
+    deployer = _FakeDeployer(
+        stack_statuses=("UPDATE_ROLLBACK_COMPLETE",),
+        connector_logs={SRC: "com.mysql.cj... Communications link failure"},
+    )
+    with pytest.raises(CdcDeployError) as exc:
+        _run_start(handle, deployer)
+    msg = str(exc.value)
+    assert "could not reach the source MySQL" in msg  # the diagnosed real cause
+    assert "Stack operation ended in" not in msg  # NOT the opaque fallback
     assert _statuses(handle)["pipeline_running"] == "PENDING"
 
 

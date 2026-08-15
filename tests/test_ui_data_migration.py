@@ -2480,6 +2480,84 @@ def test_cdc_step_delete_and_stop_handlers_set_teardown_marker(monkeypatch) -> N
     assert state.cdc_teardown_ctx["region"] == "us-east-1"
     assert state.cdc_teardown_ctx["cleanup_secret"] is True  # no SM secret → tool cleans up
 
+
+def test_start_cdc_deploy_defers_blocking_setup_to_the_job_body(monkeypatch) -> None:
+    # The Start-CDC confirm handler runs on the NiceGUI event loop, and on Fargate ONE
+    # asyncio loop serves every browser session -- so any blocking call there freezes
+    # them all. All the blocking Start-CDC setup (the deploy-role AssumeRole in the
+    # deployer build, the STS account lookup, the ~50 KiB template read, the config
+    # load) must run INSIDE the submitted job body (worker thread), not on the loop.
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.cdc_deployer as _dep
+    import dsql_migrator.ui.data_migration._cdc_ui as _cdcui
+
+    calls = {"deployer": 0, "template": 0, "run": 0}
+
+    class _Deployer:
+        template_s3_bucket = ""
+
+        def _client(self, _svc):
+            return SimpleNamespace(
+                get_caller_identity=lambda: {"Account": "111122223333"}
+            )
+
+    def _build(*_a, **_k):
+        calls["deployer"] += 1
+        return _Deployer()
+
+    def _tmpl():
+        calls["template"] += 1
+        return "TEMPLATE-BODY"
+
+    def _run(*_a, **_k):
+        calls["run"] += 1
+
+    monkeypatch.setattr(_dep, "build_cdc_stack_deployer", _build)
+    monkeypatch.setattr(_dep, "run_cdc_start", _run)
+    monkeypatch.setattr(_cdcui, "_read_cdc_template_body", _tmpl)
+    monkeypatch.setattr(_cdcui, "_log_cdc_event", lambda *a, **k: None)
+
+    class _SubmitOnlyJM:
+        def __init__(self) -> None:
+            self.work = None
+
+        def submit(self, work):
+            self.work = work
+            return "job-1"
+
+    class _Ui:
+        def notify(self, *_a, **_k):
+            return None
+
+    session = SimpleNamespace(
+        target_config=SimpleNamespace(
+            region="us-east-1",
+            cluster_endpoint="ep.dsql.amazonaws.com",
+            database="postgres",
+            username="admin",
+        ),
+        aws_profile=None,
+        source_password=None,
+        source_config=None,
+        source_secret_id=None,
+    )
+    state = DataMigrationState()
+    state.set_selection(TableSelection(selected_tables=["orders"]))
+
+    jm = _SubmitOnlyJM()
+    _cdcui._start_cdc_deploy(
+        _Ui(), state, jm, lambda: None, inventory=_inventory(), session=session
+    )
+
+    # Submitted a job, but NOTHING blocking ran on the event loop.
+    assert jm.work is not None
+    assert calls == {"deployer": 0, "template": 0, "run": 0}
+
+    # Running the job body (worker thread) is where the blocking setup + deploy happen.
+    jm.work(SimpleNamespace())
+    assert calls == {"deployer": 1, "template": 1, "run": 1}
+
     state2 = DataMigrationState()
     _cdcui._start_cdc_stop(_Ui(), state2, _SubmitOnlyJM(), lambda: None, session=session)
     assert state2.cdc_teardown_job_id == "job-1"
@@ -3265,7 +3343,9 @@ def test_apply_cdc_status_surfaces_schema_drift_from_sqlstate() -> None:
     dlq_errors = [
         CdcConnectorError(table="orders", message="add col", error_code="42703"),
         CdcConnectorError(table="orders", message="add col", error_code="42703"),
-        CdcConnectorError(table="line_items", message="bad type", error_code="22001"),
+        # A class-22 value error (string too long) is an ordinary poison row, NOT a
+        # source type change -> counts toward DLQ depth but is not grouped as drift.
+        CdcConnectorError(table="line_items", message="bad value", error_code="22001"),
         # An ordinary poison row (oversized value): no SQLSTATE -> not drift.
         CdcConnectorError(table="media", message="too big", error_code=None),
     ]
@@ -3274,15 +3354,13 @@ def test_apply_cdc_status_surfaces_schema_drift_from_sqlstate() -> None:
 
     view = state.cdc_status_view
     assert view is not None
-    # All four count toward DLQ depth, but only the three drift rows are grouped.
+    # All four count toward DLQ depth, but only the two ADD COLUMN rows are drift; the
+    # 22001 value error and the no-SQLSTATE size rejection are ordinary poison rows.
     assert view.dlq_depth == 4
     groups = {(g.table, g.kind): g.count for g in view.schema_drift}
-    assert groups == {
-        ("orders", "add-column"): 2,
-        ("line_items", "type-change"): 1,
-    }
-    # The non-drift poison row is absent from the drift groups.
-    assert not any(g.table == "media" for g in view.schema_drift)
+    assert groups == {("orders", "add-column"): 2}
+    # The non-drift poison rows are absent from the drift groups.
+    assert not any(g.table in {"media", "line_items"} for g in view.schema_drift)
 
 
 def test_apply_cdc_status_no_drift_on_clean_stream() -> None:
@@ -14622,6 +14700,47 @@ def test_dlq_record_list_shows_only_cdc_rows() -> None:
 
     records = cdc_dlq_records(state, key)
     assert [r.table for r in records] == ["ecommerce.orders"]
+
+
+def test_cdc_dlq_records_memoizes_on_append_only_count() -> None:
+    """The CDC poll + re-render call this 4-5x per tick; the expensive copy+filter of
+    the whole (uncapped) error log must run only when a NEW record arrived, not on
+    every call with an unchanged append-only count."""
+    from dsql_migrator.core.models import DataErrorRecord
+    from dsql_migrator.ui.data_migration._status import cdc_dlq_records
+
+    state = DataMigrationState()
+    state.job_id = "job-fullload-1"
+    key = _mixed_error_log(state, full_load=2, cdc=2)
+
+    calls = {"records": 0}
+    real_records = state.error_log.records
+
+    def _counting(job_id):
+        calls["records"] += 1
+        return real_records(job_id)
+
+    state.error_log.records = _counting  # type: ignore[assignment]
+
+    first = cdc_dlq_records(state, key)
+    # Repeated calls with an unchanged count reuse the cached filtered view -- no
+    # re-copy, no re-filter, same object handed back.
+    for _ in range(4):
+        assert cdc_dlq_records(state, key) is first
+    assert calls["records"] == 1  # the expensive read ran exactly once
+
+    # A new record changes the append-only count -> recompute exactly once more.
+    state.error_log.record(
+        key,
+        DataErrorRecord(
+            table="ecommerce.orders",
+            message="x",
+            occurred_at=datetime(2026, 8, 4, 10, 15, 0, tzinfo=timezone.utc),
+        ),
+    )
+    updated = cdc_dlq_records(state, key)
+    assert calls["records"] == 2
+    assert len(updated) == len(first) + 1
 
 
 def test_cdc_error_download_label_and_payload_exclude_full_load_rows() -> None:

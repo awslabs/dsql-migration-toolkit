@@ -142,12 +142,35 @@ class DebeziumTypeConverterTest {
   }
 
   @Test
-  void microTimeToSqlTime() {
-    // 05:24:39 = 19479 s past midnight -> micros; converts to a java.sql.Time.
+  void microTimeToLocalTime() {
+    // 05:24:39 = 19479 s past midnight -> micros; converts to a java.time.LocalTime
+    // (NOT java.sql.Time, which would drop any sub-second component).
     long micros = 19_479L * 1_000_000L;
     Object r = DebeziumTypeConverter.convert(DebeziumTypeConverter.MICRO_TIME, micros);
-    assertInstanceOf(java.sql.Time.class, r);
-    assertEquals(java.sql.Time.valueOf("05:24:39"), r);
+    assertInstanceOf(java.time.LocalTime.class, r);
+    assertEquals(java.time.LocalTime.of(5, 24, 39), r);
+  }
+
+  @Test
+  void microTimeKeepsSubSecondMicroseconds() {
+    // A MySQL TIME(6) value 12:34:56.789012: the micros MUST survive. java.sql.Time
+    // .valueOf(LocalTime) would have truncated to 12:34:56, diverging from the Full
+    // Load path (Python datetime.time(microsecond=…)) which keeps them -> Validation
+    // mismatch. pgjdbc binds the LocalTime to time(n) with full micro precision.
+    long micros = ((12L * 3600 + 34 * 60 + 56) * 1_000_000L) + 789_012L;
+    Object r = DebeziumTypeConverter.convert(DebeziumTypeConverter.MICRO_TIME, micros);
+    assertInstanceOf(java.time.LocalTime.class, r);
+    assertEquals(java.time.LocalTime.of(12, 34, 56, 789_012_000), r); // 789012 micros
+  }
+
+  @Test
+  void timeMillisToLocalTimeKeepsMilliseconds() {
+    // io.debezium.time.Time (millis since midnight, MySQL TIME(1-3)) -> LocalTime with
+    // the millis preserved (01:02:03.456), same as the micro-precision path.
+    long millis = ((1L * 3600 + 2 * 60 + 3) * 1000L) + 456L;
+    Object r = DebeziumTypeConverter.convert(DebeziumTypeConverter.TIME_MS, millis);
+    assertInstanceOf(java.time.LocalTime.class, r);
+    assertEquals(java.time.LocalTime.of(1, 2, 3, 456_000_000), r);
   }
 
   @Test

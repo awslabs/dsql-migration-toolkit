@@ -68,6 +68,17 @@ class InMemoryErrorLogBackend:
         with self._lock:
             return list(self._by_job.get(job_id, []))
 
+    def count(self, job_id: str) -> int:
+        """Return the number of records for ``job_id`` WITHOUT copying them (O(1)).
+
+        Lets a hot caller (the CDC poll's DLQ surface) cheaply detect whether new
+        records arrived -- the log is append-only, so an unchanged count means an
+        unchanged view -- instead of copying + re-filtering the whole growing list
+        on every ~5 s poll. See :func:`dsql_migrator.ui.data_migration._status.cdc_dlq_records`.
+        """
+        with self._lock:
+            return len(self._by_job.get(job_id, ()))
+
 
 class ErrorLogStore:
     """Captures data errors per job and renders downloadable error logs."""
@@ -89,6 +100,17 @@ class ErrorLogStore:
         credential-free (no row values/secrets -- Property 7).
         """
         return self._backend.list(job_id)
+
+    def count(self, job_id: str) -> int:
+        """Return the number of records for ``job_id`` cheaply (no copy) when the
+        backend supports it, else fall back to the length of a listed copy.
+
+        The in-memory backend answers in O(1); an injected backend without a
+        ``count`` method still returns a correct value (just not copy-free)."""
+        backend_count = getattr(self._backend, "count", None)
+        if callable(backend_count):
+            return int(backend_count(job_id))
+        return len(self._backend.list(job_id))
 
     def summary(self, job_id: str) -> ErrorLogSummary:
         """Return total + per-table counts and whether a log artifact exists.

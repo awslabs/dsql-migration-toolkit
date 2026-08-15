@@ -1124,7 +1124,7 @@ def _wait_stack_settles(
     timeout: float,
     interval: float,
     vanish_ok: bool = False,
-    connector_for_log: Optional[str] = None,
+    connector_names_for_log: Optional[Sequence[str]] = None,
     watch_seeder_enis: bool = False,
 ) -> Optional[str]:
     """Stream stack events to the log and block until the stack settles.
@@ -1137,10 +1137,15 @@ def _wait_stack_settles(
 
     A connector's stack op (CREATE_FAILED) rolls back with only a generic
     CloudFormation event -- the real cause lives in the worker log. When
-    ``connector_for_log`` names the connector being created, a rollback triggers a
-    worker-log scan so a known failure (partition quota, source unreachable, a
+    ``connector_names_for_log`` lists the connectors being created, a rollback scans
+    EACH one's worker log so a known failure (partition quota, source unreachable, a
     plugin defect, …) becomes actionable guidance instead of an opaque
-    "Stack operation ended in 'UPDATE_ROLLBACK_COMPLETE'".
+    "Stack operation ended in 'UPDATE_ROLLBACK_COMPLETE'". Pass the REAL connector
+    names (``connector_log_tail`` matches a log stream by substring, so a synthetic
+    "src + sink" pseudo-name would match no stream and the diagnosis would be dead on
+    exactly this -- the primary -- connector-failure path); the stack rolls back and
+    re-raises here before the per-connector RUNNING-waits (which diagnose on real
+    names) are ever reached.
     """
     import time as _time
 
@@ -1249,9 +1254,12 @@ def _wait_stack_settles(
             if "ROLLBACK" in status or "FAILED" in status:
                 if saw_partition_quota:
                     raise CdcDeployError(_PARTITION_QUOTA_GUIDANCE.format(status=status))
-                if connector_for_log:
-                    tail = deployer.connector_log_tail(stack_name, connector_for_log)
-                    guidance = _diagnose_connector_log(connector_for_log, tail)
+                for name in connector_names_for_log or ():
+                    # Scan each REAL connector's worker log (a synthetic combined name
+                    # matched no log stream, so the diagnosis was always dead here) and
+                    # raise the first actionable cause found.
+                    tail = deployer.connector_log_tail(stack_name, name)
+                    guidance = _diagnose_connector_log(name, tail)
                     if guidance:
                         raise CdcDeployError(guidance)
                 raise CdcDeployError(f"Stack operation ended in '{status}'.")
@@ -1808,7 +1816,7 @@ def run_cdc_start(
                     _wait_stack_settles(
                         deployer, stack_name, driver=driver, since=since,
                         timeout=connector_timeout_seconds, interval=poll_interval_seconds,
-                        connector_for_log=f"{src_name} + {sink_name}",
+                        connector_names_for_log=[src_name, sink_name],
                     )
                 except CdcDeployError:
                     driver.stage("stack_connectors", "FAILED")

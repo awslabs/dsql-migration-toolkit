@@ -3056,34 +3056,35 @@ def _start_cdc_deploy(
         topic_prefix=CDC_DEFAULT_TOPIC_PREFIX,
         sink_mcu_count=_sink_mcu_count(),
     )
-    deployer = build_cdc_stack_deployer(
-        region,
-        aws_profile=getattr(session, "aws_profile", None),
-        assume_role_arn=getattr(migration_state, "cdc_deploy_role_arn", None),
-    )
-    # The cdc-stack template exceeds CFn's 51,200-byte inline limit, so the
-    # deployer stages it in S3 via TemplateURL. Derive the bucket name from the
-    # deterministic naming convention (same bucket the infra deploy created).
-    from dsql_migrator.core.s3_provision import plugin_bucket_name as _pbucket
-    try:
-        _sts = deployer._client("sts")
-        _acct = _sts.get_caller_identity()["Account"]  # type: ignore[attr-defined]
-        deployer.template_s3_bucket = _pbucket(_acct, region)
-    except Exception:  # noqa: BLE001 — best-effort; will fail later with a clear message
-        pass
     migration_state.clear_cdc_deploy_log()
     stack_name = migration_state.cdc_stack_name
-
-    template_body = _read_cdc_template_body()
-
-    # "Host is the mode": the in-VPC EC2 host sets DSQL_MIGRATOR_CDC_SEED_MODE=external
-    # so the app does the CDC Kafka prep in-process (Lambda-free); Fargate/local leave
-    # it unset -> "lambda" (the in-VPC seeder Lambda does the prep, unchanged).
-    from dsql_migrator.config import load_config as _load_config
-
-    seed_mode = _load_config().cdc_seed_mode
+    aws_profile = getattr(session, "aws_profile", None)
+    assume_role_arn = getattr(migration_state, "cdc_deploy_role_arn", None)
 
     def work(handle) -> None:
+        # Everything blocking (the deploy-role AssumeRole in the deployer build, the STS
+        # account lookup, the ~50 KiB template read, the config load) runs HERE on the
+        # job's worker thread -- NEVER on the NiceGUI event loop. On Fargate one asyncio
+        # loop serves every browser session, so a blocking call on it freezes them all;
+        # the sibling _start_cdc_infra_deploy offloads for exactly this reason.
+        deployer = build_cdc_stack_deployer(
+            region, aws_profile=aws_profile, assume_role_arn=assume_role_arn
+        )
+        # The cdc-stack template exceeds CFn's 51,200-byte inline limit, so the deployer
+        # stages it in S3 via TemplateURL. Derive the bucket name from the deterministic
+        # naming convention (same bucket the infra deploy created).
+        from dsql_migrator.core.s3_provision import plugin_bucket_name as _pbucket
+        try:
+            _acct = deployer._client("sts").get_caller_identity()["Account"]  # type: ignore[attr-defined]
+            deployer.template_s3_bucket = _pbucket(_acct, region)
+        except Exception:  # noqa: BLE001 — best-effort; a later step fails with a clear message
+            pass
+        template_body = _read_cdc_template_body()
+        # "Host is the mode": the in-VPC EC2 host sets DSQL_MIGRATOR_CDC_SEED_MODE=external
+        # so the app does the CDC Kafka prep in-process (Lambda-free); Fargate/local leave
+        # it unset -> "lambda" (the in-VPC seeder Lambda does the prep, unchanged).
+        from dsql_migrator.config import load_config as _load_config
+
         run_cdc_start(
             handle,
             stack_name=stack_name,
@@ -3095,7 +3096,7 @@ def _start_cdc_deploy(
             # deployed and the source connector starts from the current binlog.
             watermark=watermark,
             template_body=template_body,
-            seed_mode=seed_mode,
+            seed_mode=_load_config().cdc_seed_mode,
         )
 
     _action = "start CDC connectors"

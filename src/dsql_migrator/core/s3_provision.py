@@ -51,6 +51,15 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v31 rebuilds the DSQL sink jar so a MySQL TIME(1-6) value keeps its sub-second
+#    microseconds. DebeziumTypeConverter.microsToTime built the value with
+#    java.sql.Time.valueOf(LocalTime), and java.sql.Time holds only h/m/s -- the JDK
+#    contract DISCARDS the sub-second field -- so a CDC-applied fractional TIME landed
+#    truncated (12:34:56 for 12:34:56.789012) while the Full Load path kept the micros,
+#    diverging the two write paths and failing Validation. It now returns a
+#    java.time.LocalTime, which pgjdbc binds to a time/time(n) column with full
+#    microsecond precision (and is timezone-independent). Sink-jar change only; the
+#    debezium plugin and the seeder zip are unchanged.
 # v30 rebuilds the offset-seeder Lambda zip so the read-modify-write seed RESETS the
 #    position-relative row/event skip counters when it overrides file/pos to the
 #    watermark. A watermark position is always an event boundary (row=0/event=0), but
@@ -272,7 +281,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v30"
+PLUGIN_VERSION = "v31"
 
 
 class S3ProvisionError(RuntimeError):

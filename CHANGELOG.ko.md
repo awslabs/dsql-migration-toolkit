@@ -5,6 +5,67 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.334
+
+_여러 CDC 리뷰 수정을 한 패치로 묶습니다 (ECR Public 이미지는 이 배치에 대해 한 번 재게시)._
+
+### 수정 (Fixed)
+
+- **평범한 CDC poison 행이 거짓 "source schema change detected" 배너를 띄우던 문제.**
+  `classify_schema_drift`가 모든 class-22 SQLSTATE(`22001` 문자열 초과, `22003` 숫자 범위 초과, `22007` 잘못된
+  datetime, `22P02` 잘못된 텍스트)를 `TYPE_CHANGE` 드리프트로 매핑했지만, 이들은 소스 DDL 변경 없이 평범한 잘못된
+  데이터가 일으키는 값-단위(per-value) 거부입니다. 그래서 하나의 초과/범위-초과 격리 행이 "소스가 컬럼 타입을 변경함"으로
+  보고되어, 실제 문제가 아닌 스키마 조정으로 운영자를 오도했습니다. 이제 드리프트 분류는 세 개의 구조적(structural)
+  SQLSTATE(행의 컬럼 집합 / 컬럼의 선언 타입으로 결정 — 소스 DDL 변경이 유발)로 제한됩니다: `42703` → ADD COLUMN,
+  `23502` → DROP COLUMN, `42804`(datatype_mismatch) → TYPE CHANGE. class-22 값 오류는 평범한 격리로 남습니다
+  (DLQ 깊이에는 여전히 집계, 드리프트로는 표시 안 함).
+
+- **모든 CDC 상태 폴링이 CloudWatch 메트릭 차원을 ~5회 재탐색하고 ~5초마다 `ListMetrics`를 다시 페이징하던 문제.**
+  `applied_ops_by_table`(op 메트릭 3개)와 `replication_lag_by_table`/`replication_lag_series`(같은
+  `ReplicationLagMs` 메트릭을 두 번)가 폴링마다 각각 bounded `ListMetrics` 페이지네이션을 수행했습니다 — 새 테이블이
+  방출을 시작할 때만 바뀌는 데이터에 대해 tick당 5회 탐색으로, CloudWatch 비용/지연이 폴링 속도에 비례해 증가하고
+  스로틀링(모니터 공백) 위험이 있었습니다. 이제 `_list_metric_dimensions`가 `(stack, metric)`별로 짧은 TTL 동안
+  메모이즈되어, 폴링 내 패스와 폴링 간 재탐색을 창(window)당 메트릭당 1회 페이지네이션으로 축소합니다. 실시간
+  `GetMetricData` 데이터 읽기는 캐시하지 않아 수치는 최신으로 유지됩니다.
+
+- **늦은/헤드리스 attach 시 DLQ 뷰가 기존 격리 항목을 놓치던 문제.** 첫 CloudWatch DLQ 읽기가 최근 1시간만
+  되돌아봐서, 운영자가 UI를 열기 전에 그보다 오래 dead-letter해온 CDC 실행(예: 헤드리스 `run_e2e_migration.py`
+  스트림)은 이전 격리 항목을 조용히 누락했고 — 커서가 앞으로 이동하면 다시는 가져올 수 없었습니다. 이제 첫 읽기
+  되돌아보기 창을 넓혀(`_DLQ_INITIAL_LOOKBACK_SECONDS`) 현실적인 late-attach 백로그를 포착합니다. 이후 폴링은
+  여전히 커서에서 증분으로 읽습니다(각 읽기는 `limit`으로 제한되므로 매 폴링마다 이력을 다시 스캔하지 않음).
+
+- **"Start CDC" 클릭이 UI 이벤트 루프에서 블로킹 AWS/파일 작업을 실행해 Fargate의 모든 브라우저 세션을 얼리던 문제.**
+  Start-CDC 확인 핸들러가 배포-역할 `AssumeRole`(deployer 빌드), STS `GetCallerIdentity`, ~50 KiB 템플릿 읽기,
+  config 로드를 모든 세션을 담당하는 단일 asyncio 루프에서 동기적으로 수행해서 — 클릭이 라운드트립 동안 모든 세션을
+  멈추게 했습니다(STS 스로틀링 시 더 길게). 이제 그 모든 설정이 제출된 백그라운드 잡 본문(워커 스레드)에서 실행되며,
+  형제인 인프라 배포 경로와 동일합니다. 이벤트 루프는 순수 params 구성과 잡 제출만 합니다.
+
+- **CDC 모니터가 ~5초 폴링마다 전체(무제한) DLQ 에러 로그를 4–5회 재스캔하던 문제.**
+  깊이 배지, 테이블별 칩, 드리프트 배너, 레코드 목록이 각각 `cdc_dlq_records`를 호출했고, 이는 append-only 에러 로그
+  전체를 복사한 뒤 레코드별 CDC/Full-Load 판별을 다시 실행했습니다 — tick당 4–5회 반복되는 O(records) 작업이며,
+  로그가 가장 큰 드리프트 폭주 상황에서 무한정 증가했습니다(프로젝트의 bounded-work 원칙에 정반대). 이제
+  `cdc_dlq_records`가 로그의 append-only 레코드 개수(새 O(1) `ErrorLogStore.count`)로 메모이즈되어, 새 레코드가
+  실제로 도착했을 때만 복사+필터를 수행합니다. 개수가 그대로면 캐시된 뷰를 반환하고, 리셋은 개수를 0으로 떨어뜨려 캐시를
+  무효화합니다.
+
+- **커넥터 CREATE_FAILED 롤백이 진단된 원인 대신 불투명한 메시지를 표면화하던 문제.**
+  커넥터 실패 시 스택이 롤백되고, 커넥터-패스 대기가 (실제 이름으로 진단하는) 커넥터별 RUNNING 대기에 도달하기 전에
+  예외를 던집니다 — 따라서 그 대기 자체의 롤백 진단이 원인을 표면화할 유일한 기회입니다. 그런데 조작된
+  `"<src> + <sink>"` 유사 이름이 전달되어 어떤 CloudWatch 로그 스트림과도 매칭되지 않았고(`connector_log_tail`이
+  스트림을 부분 문자열로 매칭), worker-log 진단이 이 주요 실패 경로에서 항상 죽어 있어 운영자는 불투명한
+  "Stack operation ended in 'UPDATE_ROLLBACK_COMPLETE'"만 받았습니다. 이제 대기가 실제 커넥터 이름 목록을 받아
+  각각의 worker log를 스캔하므로, 알려진 실패(소스 도달 불가, 접근 거부, 파티션 쿼터 소진, 플러그인 패키징 결함)가
+  실행 가능한 안내로 표면화됩니다.
+
+- **CDC가 MySQL `TIME(1–6)` 값의 서브초 정밀도를 잃던 문제(Full Load ↔ CDC 불일치).**
+  sink의 `DebeziumTypeConverter.microsToTime`가 값을 `java.sql.Time.valueOf(LocalTime)`으로 만들었는데,
+  `java.sql.Time`은 시/분/초만 담습니다 — JDK 계약상 서브초 필드를 버립니다 — 그래서 CDC로 적용된 소수 `TIME`이
+  잘려서 저장됐고(소스 `12:34:56.789012` → `12:34:56`), Full Load 경로(Python `datetime.time(microsecond=…)`)는
+  마이크로초를 유지했습니다. 두 쓰기 경로가 어긋나 소수-`TIME` 행마다 Validation이 불일치를 표시했습니다. 이제 컨버터가
+  `java.time.LocalTime`을 반환하며, pgjdbc가 이를 `time`/`time(n)` 컬럼에 완전한 마이크로초 정밀도로 바인딩합니다
+  (타임존 독립적). DSQL sink jar을 재빌드하고 커넥터 플러그인 `PLUGIN_VERSION`을 `v31`로 올립니다(`PLUGIN_VERSION`
+  범프는 CDC 인프라의 Delete + Deploy가 있어야 반영됩니다).
+
 ## v0.1.333
 
 ### 수정 (Fixed)
