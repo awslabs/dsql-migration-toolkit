@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.328
+
+### Fixed
+
+- **A source-drop retry mid-Full-Load re-streamed and re-probed every already-loaded batch of
+  a huge table (batch-level resume was dormant).** `import_rows` can skip already-committed
+  keyset ranges via a resume job, but the workers never passed one — so an in-process retry
+  (e.g. an Aurora failover partway through a billion-row table) re-did the whole table. Each
+  worker now reuses a per-table (per-shard) resume job across its source-drop retries, so a
+  retry skips the batches the prior attempt already committed. Wired ONLY where it is safe:
+  the append/`SKIP_EXISTING` path and the sharded path, whose targets are NOT recreated on a
+  retry so committed rows persist; the single-table replace/`NONE` path still withholds it (a
+  retry recreates the empty target, so skipping would silently lose data). In-process only —
+  a full "Retry failed tables" still recreates and restarts the table. Also removes the
+  `SKIP_EXISTING` re-probe waste a resume otherwise pays on the overlapping prefix.
+
 ## v0.1.327
 
 ### Fixed

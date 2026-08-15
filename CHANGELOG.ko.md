@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.328
+
+### 수정 (Fixed)
+
+- **Full Load 중 소스 끊김 재시도가 대형 테이블의 이미 적재된 배치를 전부 재스트림·재프로브했습니다(배치 단위
+  재개가 휴면).** `import_rows`는 resume job으로 이미 커밋된 keyset 범위를 건너뛸 수 있는데, 워커가 이를 전달하지
+  않아 in-process 재시도(예: 10억 행 중간의 Aurora failover)가 테이블 전체를 다시 처리했습니다. 이제 각 워커가
+  소스-끊김 재시도 간 테이블별(샤드별) resume job을 재사용해, 재시도가 직전 시도에서 커밋한 배치를 건너뜁니다.
+  **안전한 곳에만** 배선: append/`SKIP_EXISTING` 경로와 샤드 경로(재시도 시 타깃을 재생성하지 않아 커밋 행 유지);
+  단일 테이블 replace/`NONE` 경로는 여전히 보류(재시도가 빈 타깃을 재생성하므로 스킵하면 데이터 손실). in-process
+  한정 — 전체 "Retry failed tables"는 여전히 재생성·재시작. 아울러 resume가 겹치는 프리픽스에서 물게 되는
+  `SKIP_EXISTING` 재-probe 낭비도 제거합니다.
+
 ## v0.1.327
 
 ### 수정 (Fixed)

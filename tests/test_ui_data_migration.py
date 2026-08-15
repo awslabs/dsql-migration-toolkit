@@ -467,6 +467,9 @@ class _FakeImporter:
         self.index_ddls_by_table: dict[str, object] = {}
         self.on_conflict_by_table: dict[str, object] = {}
         self.key_columns_by_table: dict[str, object] = {}
+        # The resume job each import_rows call received (None on the replace/NONE path,
+        # the shared job on the SKIP_EXISTING/append path) -- see batch-level resume.
+        self.job_by_table: dict[str, object] = {}
         # The column names of the TableDef each import_rows call received, so a test
         # can assert the LOB exclusion filtered the INSERT column list too.
         self.import_columns_by_table: dict[str, list[str]] = {}
@@ -475,7 +478,7 @@ class _FakeImporter:
         self._first_error = first_error
 
     def import_rows(
-        self, rows, table: TableDef, *, index_ddls=None, on_batch_loaded=None,
+        self, rows, table: TableDef, *, index_ddls=None, job=None, on_batch_loaded=None,
         should_cancel=None, on_conflict=None, shard_sources=None, key_columns=None,
     ) -> BatchedImportResult:
         # When sharded, the engine passes K row streams via shard_sources (and
@@ -487,6 +490,7 @@ class _FakeImporter:
         self.index_ddls_by_table[table.name] = index_ddls
         self.on_conflict_by_table[table.name] = on_conflict
         self.key_columns_by_table[table.name] = key_columns
+        self.job_by_table[table.name] = job
         self.import_columns_by_table[table.name] = [c.name for c in table.columns]
         self.received.append((table.name, materialized))
         loaded = self._rows if self._rows else len(materialized)
@@ -1832,6 +1836,45 @@ def test_batched_table_migrator_replace_passes_when_target_count_matches() -> No
     )
     result = migrator.migrate_table(_tables()[0])
     assert result.rows_loaded == 2
+
+
+def test_migrate_table_wires_resume_job_only_on_the_append_path() -> None:
+    # Batch-level resume (Property 4) is wired ONLY where it is safe: the SKIP_EXISTING
+    # (append/CDC-coexist) path, where the target is not recreated so a prior attempt's
+    # committed batches persist and can be skipped on a retry. On the replace/NONE path a
+    # retry recreates the empty target, so skipping "done" batches would silently lose data --
+    # the resume job must be withheld (None) there.
+    import dataclasses
+
+    resume = MigrationJob(job_id="r")
+
+    # APPEND path (orders not in replace_tables) -> SKIP_EXISTING, resume job passed through.
+    append_importer = _FakeImporter(rows=1)
+    append_migrator = BatchedTableMigrator(
+        _inputs(),
+        exporter=_FakeExporter(rows_by_table={"orders": [{"id": 1}]}),  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _i: append_importer,  # type: ignore[arg-type,return-value]
+    )
+    append_migrator.migrate_table(_tables()[0], resume_job=resume)
+    assert append_importer.on_conflict_by_table["orders"] == OnConflictMode.SKIP_EXISTING
+    assert append_importer.job_by_table["orders"] is resume
+
+    # REPLACE path -> NONE mode, resume job WITHHELD (None) so a recreate-on-retry cannot lose
+    # rows by skipping batches whose data was just dropped.
+    replace_importer = _FakeImporter(rows=1)
+    replace_inputs = dataclasses.replace(_inputs(), replace_tables=frozenset({"orders"}))
+    replace_migrator = BatchedTableMigrator(
+        replace_inputs,
+        exporter=_FakeExporter(rows_by_table={"orders": [{"id": 1}]}),  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _i: replace_importer,  # type: ignore[arg-type,return-value]
+        table_recreator=lambda _t: [],
+        target_counter=lambda _t: 1,
+    )
+    replace_migrator.migrate_table(_tables()[0], resume_job=resume)
+    assert replace_importer.on_conflict_by_table["orders"] == OnConflictMode.NONE
+    assert replace_importer.job_by_table["orders"] is None
 
 
 def test_views_referencing_selects_only_dependent_views() -> None:

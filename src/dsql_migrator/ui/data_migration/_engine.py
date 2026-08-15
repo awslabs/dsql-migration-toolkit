@@ -841,6 +841,12 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
         # Clearing the flag on a retry makes this worker recreate the table itself, so
         # the re-read again loads into an empty target and stays duplicate-free.
         _attempt_state = {"first": True}
+        # One resume job for this table, REUSED across the in-process source-drop retries so a
+        # retry skips the keyset ranges the prior attempt already committed -- only the
+        # SKIP_EXISTING/append path uses it (migrate_table guards the replace/NONE path, which
+        # recreates the target on retry). In-process only: this job lives in the worker, so a
+        # crash / "Retry failed tables" still restarts the table from the beginning.
+        _resume_job = MigrationJob(job_id=f"fullload-resume:{name}")
 
         def _load_table():
             pre = args.pre_recreated and _attempt_state["first"]
@@ -850,6 +856,7 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
                 on_rows=_on_rows,
                 should_cancel=_is_cancelled,
                 pre_recreated=pre,
+                resume_job=_resume_job,
             )
 
         outcome = _as_load_result(
@@ -947,6 +954,15 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
         # dead source connection) before waiting out the failover.
         _shard_conflict_mode = [conflict_mode]
         _live_rows: list = [None]
+        # One resume job for this shard, reused across the in-process source-drop retries so a
+        # retry skips the keyset ranges this shard already committed. A shard NEVER recreates
+        # its target (the parent pre-recreated it once, before submitting shards), so committed
+        # rows persist across a retry -- skipping them is safe on both the NONE (first attempt)
+        # and SKIP_EXISTING (retry) modes. In-process only: a full "Retry failed tables"
+        # recreates the target and restarts the shard from the beginning.
+        _resume_job = MigrationJob(
+            job_id=f"fullload-resume:{name}#shard{args.shard_index}"
+        )
 
         def _load_shard():
             # Stream + import together so a retry re-opens the SHARD's own snapshot
@@ -964,6 +980,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             return importer.import_rows(
                 rows,
                 table,
+                job=_resume_job,
                 on_batch_loaded=_on_rows,
                 should_cancel=_is_cancelled,
                 on_conflict=_shard_conflict_mode[0],
@@ -2741,6 +2758,7 @@ class BatchedTableMigrator:
         on_rows: Optional[Callable[[int, int], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
         pre_recreated: bool = False,
+        resume_job: Optional[MigrationJob] = None,
     ) -> TableLoadResult:
         """Stream ``table`` from the source and load it via batched INSERTs.
 
@@ -2989,12 +3007,23 @@ class BatchedTableMigrator:
                         f"changed by appending. {remedy}"
                     )
                 load_key_columns = actual
+        # Batch-level resume (Property 4): pass the resume job ONLY on the SKIP_EXISTING
+        # (append / CDC-coexist) path, where the target is NOT recreated -- so batches a prior
+        # attempt already committed are still present, and import_rows can SKIP those completed
+        # keyset ranges on a retry (a source-drop re-read of a 99%-loaded table no longer
+        # re-probes every already-loaded batch). NEVER on the replace/NONE path: that recreates
+        # the empty target on retry, so the prior batches' rows are gone -- skipping them would
+        # silently lose data.
+        load_job = (
+            resume_job if load_on_conflict is OnConflictMode.SKIP_EXISTING else None
+        )
         importer = self._importer_factory(self._inputs)
         try:
             result = importer.import_rows(
                 rows,
                 table,
                 index_ddls=index_ddls,
+                job=load_job,
                 on_batch_loaded=on_rows,
                 should_cancel=should_cancel,
                 on_conflict=load_on_conflict,
