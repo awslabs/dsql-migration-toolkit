@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.323
+
+### Fixed
+
+- **A misconfigured DSQL endpoint (a host that does not resolve) was retried the full OCC
+  budget before failing.** The Schema Applier classified every no-SQLSTATE connect error as
+  transient (a classifier shared with the batched loader), so a typo'd / deleted cluster
+  endpoint burned the whole retry budget per table before surfacing. The applier now fails
+  fast on the unambiguous permanent host-resolution signatures (getaddrinfo NXDOMAIN: "could
+  not translate host name", "name or service not known", etc.) while still retrying a
+  transient DNS blip ("temporary failure in name resolution") or a refused connect (a
+  rebooting cluster). Scoped to the applier -- the shared connection classifier is unchanged.
+
 ## v0.1.322
 
 ### Fixed

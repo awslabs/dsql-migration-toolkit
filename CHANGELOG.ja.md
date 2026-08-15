@@ -5,6 +5,18 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.323
+
+### 修正 (Fixed)
+
+- **設定ミスの DSQL エンドポイント(解決できないホスト)が失敗するまで OCC 予算全体を再試行していました。**
+  Schema Applier が SQLSTATE のない connect エラーをすべて transient として分類(バッチローダーと共有する
+  分類器)していたため、タイプミスや削除済みのクラスタエンドポイントがテーブルごとに再試行予算を使い切って
+  から表面化していました。明確な永続的ホスト解決失敗のシグネチャ(getaddrinfo NXDOMAIN: "could not
+  translate host name"、"name or service not known" など)では即座に失敗し、一時的な DNS blip("temporary
+  failure in name resolution")や refused connect(再起動中のクラスタ)は引き続き再試行します。applier に
+  限定 — 共有の接続分類器は変更していません。
+
 ## v0.1.322
 
 ### 修正 (Fixed)

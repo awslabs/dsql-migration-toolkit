@@ -977,3 +977,58 @@ def test_recreate_table_replays_the_unit_on_a_transient_execute_failure() -> Non
         'DROP TABLE IF EXISTS "t"',
         'CREATE TABLE "t" ("id" integer PRIMARY KEY)',
     ]
+
+
+# ---------------------------------------------------------------------------
+# A permanently-unresolvable host fails fast (not retried the full OCC budget)
+# ---------------------------------------------------------------------------
+
+
+class OperationalError(Exception):
+    """psycopg-like OperationalError (no SQLSTATE). The NAME makes
+    is_transient_connection_error classify it transient, so only the message
+    signature distinguishes a permanent host-resolution failure from a transient one."""
+
+    sqlstate = None
+
+
+def test_permanent_host_resolution_error_is_not_retryable() -> None:
+    from dsql_migrator.core.schema_applier import (
+        _is_permanent_connect_error,
+        _is_retryable_connect_error,
+    )
+
+    perm = OperationalError('could not translate host name "typo-endpoint" to address')
+    dns_blip = OperationalError("temporary failure in name resolution")
+    reset = OperationalError("connection reset by peer")
+
+    # Only the unambiguous NXDOMAIN-style failure is permanent...
+    assert _is_permanent_connect_error(perm) is True
+    assert _is_permanent_connect_error(dns_blip) is False  # EAI_AGAIN can recover
+    assert _is_permanent_connect_error(reset) is False  # a rebooting cluster can recover
+
+    # ...so it is excluded from the retryable set, while transient shapes stay retryable.
+    assert _is_retryable_connect_error(perm) is False
+    assert _is_retryable_connect_error(dns_blip) is True
+    assert _is_retryable_connect_error(reset) is True
+
+
+def test_recreate_table_fails_fast_on_a_permanently_unresolvable_host() -> None:
+    # A typo'd / deleted DSQL endpoint never resolves, so retrying the connect the full OCC
+    # budget only wastes time; it must fail after a single attempt.
+    attempts = {"n": 0}
+
+    def bad_host() -> _FakeConnection:
+        attempts["n"] += 1
+        raise OperationalError('could not translate host name "typo" to address')
+
+    with pytest.raises(OperationalError):
+        recreate_table(
+            [],
+            'CREATE TABLE "t" ("id" integer PRIMARY KEY)',
+            connection_factory=bad_host,
+            occ_max_attempts=5,
+            sleep=_no_sleep,
+            jitter=_zero_jitter,
+        )
+    assert attempts["n"] == 1  # permanent -> one attempt, not the budget of 5

@@ -67,13 +67,41 @@ from dsql_migrator.core.occ import (
 from dsql_migrator.core.target_connection import is_transient_connection_error
 
 
+# getaddrinfo failures for a host that does not exist (a typo'd or deleted DSQL endpoint).
+# These never recover on retry, unlike a transient DNS blip ("temporary failure in name
+# resolution", EAI_AGAIN) or a refused connect (a rebooting cluster) -- which stay retryable.
+_PERMANENT_CONNECT_SIGNATURES = (
+    "could not translate host name",
+    "nodename nor servname provided",
+    "name or service not known",
+    "no address associated with hostname",
+)
+
+
+def _is_permanent_connect_error(exc: BaseException) -> bool:
+    """True for a connect failure that will NEVER succeed on retry (host does not resolve).
+
+    :func:`is_transient_connection_error` treats every no-SQLSTATE psycopg error as transient,
+    so a typo'd / deleted DSQL endpoint (a getaddrinfo NXDOMAIN) would otherwise be retried
+    the full OCC budget before failing. Fail fast on the unambiguous permanent-resolution
+    signatures ONLY -- NOT ``temporary failure in name resolution`` (a DNS blip) or a refused
+    connect (a rebooting cluster), which stay retryable. Scoped to the applier; the shared
+    :func:`is_transient_connection_error` (used by the batched loader's pool) is unchanged.
+    """
+    message = str(exc).lower()
+    return any(sig in message for sig in _PERMANENT_CONNECT_SIGNATURES)
+
+
 def _is_retryable_connect_error(exc: BaseException) -> bool:
     """Retryable while OPENING a DSQL connection for DDL: an OCC ``40001`` or a
     transient connection failure (dropped socket / TLS teardown / connect timeout /
     the new-connection rate limit rejecting a connect under a burst). Lets a
     per-table DROP+recreate connect ride out a connection storm instead of failing
     the table -- the same resilience the batched loader's pool leases already have.
+    A permanently-unresolvable host is excluded so a misconfigured endpoint fails fast.
     """
+    if _is_permanent_connect_error(exc):
+        return False
     return is_occ_conflict(exc) or is_transient_connection_error(exc)
 
 
@@ -592,6 +620,7 @@ def _run_ddls_reconnecting(
         sleep=sleep,
         jitter=jitter,
         retryable=lambda exc: not isinstance(exc, SchemaApplyError)
+        and not _is_permanent_connect_error(exc)
         and is_transient_connection_error(exc),
     )(_unit)()
 

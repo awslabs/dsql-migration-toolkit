@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.323
+
+### 수정 (Fixed)
+
+- **잘못 설정된 DSQL 엔드포인트(해석되지 않는 호스트)가 실패 전까지 OCC 예산 전체를 재시도했습니다.**
+  Schema Applier가 SQLSTATE 없는 connect 오류를 모두 transient로 분류(배치 로더와 공유하는 분류기)해,
+  오타나 삭제된 클러스터 엔드포인트가 테이블마다 재시도 예산을 전부 소진한 뒤에야 표면화됐습니다. 이제
+  명확한 영구 호스트-해석 실패 시그니처(getaddrinfo NXDOMAIN: "could not translate host name", "name or
+  service not known" 등)에는 빠르게 실패하고, 일시적 DNS blip("temporary failure in name resolution")과
+  refused connect(재부팅 중 클러스터)는 계속 재시도합니다. applier로 한정 — 공유 연결 분류기는 변경하지
+  않았습니다.
+
 ## v0.1.322
 
 ### 수정 (Fixed)
