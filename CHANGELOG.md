@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.336
+
+### Fixed
+
+- **Validation no longer false-mismatches a MySQL `INT ZEROFILL` column.** The per-column
+  CHECKSUM rendered a ZEROFILL integer on the source with `CAST(col AS CHAR)`, which
+  applies the ZEROFILL display padding (e.g. `00042`), while the migrated target holds a
+  plain integer (`42`) — so a correctly-migrated ZEROFILL column was reported as a data
+  mismatch in Validation. The source side now renders the plain numeric value (`col + 0`,
+  which drops the display attribute), matching the target. Found by the tricky-schema
+  conversion E2E on a live Aurora DSQL cluster.
+
 ## v0.1.335
 
 _Schema-conversion fidelity fixes, found by applying the converter's own output to a

@@ -314,6 +314,13 @@ def _mysql_checksum_expr(column: "ColumnDef") -> Optional[str]:
         return f"CAST({ident} AS DECIMAL(65, {scale}))"
     if kind in ("float", "json"):
         return None
+    if "zerofill" in column.mysql_type.lower():
+        # A MySQL ZEROFILL integer is stored as a plain integer on the target (the
+        # converter strips the display attribute), rendering e.g. "42". But ZEROFILL is
+        # a DISPLAY attribute and CAST(col AS CHAR) applies it, emitting "00042" -- a
+        # false checksum mismatch against the target's "42". Arithmetic (col + 0)
+        # produces a plain numeric result that has no ZEROFILL padding, so it matches.
+        return f"CAST({ident} + 0 AS CHAR)"
     return f"CAST({ident} AS CHAR)"
 
 

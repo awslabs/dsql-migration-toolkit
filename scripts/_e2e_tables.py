@@ -118,6 +118,32 @@ _SETS: dict[str, tuple[list[str], list[tuple[str, str]]]] = {
             ("edge_empty", "id"),
         ],
     ),
+    # Tricky-SCHEMA conversion edge schema (scripts/seed_schema_edgecases.py): the
+    # FLOWABLE subset -- single integer PK, CDC-safe, that must convert (SC) then
+    # Full Load + CDC byte-identically. Only the clean-reconciling tables are here.
+    # EXCLUDED (validated at the Schema Conversion stage only, mirroring how
+    # edge_zerodate_loud / typetest_spatial are left out here): sc_defaults (VIRTUAL
+    # generated col not in the binlog), sc_spatial (bytea WKB / ST_AsBinary read),
+    # sc_wide250 (>100 columns exceeds the Validator's per-row checksum arg limit --
+    # a separate concern), the reserved/unicode/non-int/binary-PK tables, and every
+    # sc_only_* table.
+    "migration_schema": (
+        [
+            "sc_int_types", "sc_decimal_float", "sc_temporal", "sc_string_binary",
+            "sc_enum_set", "sc_indexes", "sc_collation", "sc_partition", "sc_comments",
+        ],
+        [
+            ("sc_int_types", "id"),
+            ("sc_decimal_float", "id"),
+            ("sc_temporal", "id"),
+            ("sc_string_binary", "id"),
+            ("sc_enum_set", "id"),
+            ("sc_indexes", "id"),
+            ("sc_collation", "id"),
+            ("sc_partition", "id"),
+            ("sc_comments", "id"),
+        ],
+    ),
     # us-east-1 large-scale Full Load THROUGHPUT test: 20 uniform tables (~52.7 GB
     # / ~43M rows each, ~1 TB total), each a single BIGINT UNSIGNED AUTO_INCREMENT
     # PK `id`, no secondary indexes. No FK chain (independent tables), so order is

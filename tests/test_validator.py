@@ -1041,6 +1041,20 @@ def test_checksum_boolean_column_renders_words() -> None:
     assert '"active"::text' in pg_sql
 
 
+def test_checksum_zerofill_int_renders_plain_numeric() -> None:
+    """A MySQL INT ZEROFILL migrates to a plain integer, so the checksum must render its
+    numeric value ('42'), not the zero-padded display form ('00042') that
+    CAST(col AS CHAR) emits -- otherwise the source ('00042') false-mismatches the
+    target integer ('42'). Arithmetic (col + 0) drops the display attribute.
+    """
+    from dsql_migrator.core.validator import _mysql_checksum_expr
+
+    zf = ColumnDef(name="n", mysql_type="int(5) unsigned zerofill")
+    assert _mysql_checksum_expr(zf) == "CAST(`n` + 0 AS CHAR)"
+    # A plain (non-zerofill) integer is unaffected.
+    assert _mysql_checksum_expr(ColumnDef(name="n", mysql_type="int")) == "CAST(`n` AS CHAR)"
+
+
 def test_checksum_temporal_columns_fixed_fraction_no_zone() -> None:
     mysql_sql, pg_sql, _mysql_tok, _pg_tok = _all_four_rendered(_typed_table())
     # MySQL: fixed 6-digit fraction, no zone.

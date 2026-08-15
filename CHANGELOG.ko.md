@@ -5,6 +5,17 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.336
+
+### Fixed
+
+- **검증(Validation)이 MySQL `INT ZEROFILL` 컬럼을 더 이상 오탐(false-mismatch)하지 않습니다.**
+  컬럼별 CHECKSUM이 소스의 ZEROFILL 정수를 `CAST(col AS CHAR)`로 렌더링해 ZEROFILL 표시
+  패딩(예: `00042`)이 붙었지만, 마이그레이션된 타깃은 일반 정수(`42`)를 담고 있어 정상
+  이관된 ZEROFILL 컬럼이 데이터 불일치로 보고됐습니다. 이제 소스 측은 일반 숫자값
+  (`col + 0` — 표시 속성 제거)으로 렌더링해 타깃과 일치합니다. 실제 Aurora DSQL 클러스터
+  대상 까다로운-스키마 변환 E2E에서 발견.
+
 ## v0.1.335
 
 _컨버터 자체 출력을 실제 Aurora DSQL 클러스터에 종합 "까다로운 스키마"(BINARY/VARBINARY/
