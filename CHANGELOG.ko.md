@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.337
+
+### Fixed
+
+- **`BIT(1)` 컬럼이 있는 테이블의 행이 CDC에서 더 이상 통째로 유실되지 않습니다** (라이브
+  클러스터 대상 까다로운-스키마 CDC E2E에서 발견). Debezium은 MySQL `BIT(1)`을 (논리 스키마
+  이름 없는) 순수 Kafka boolean으로 직렬화하지만, 스키마 컨버터는 `BIT(n)`을 DSQL 정수(smallint)로
+  매핑하므로, 싱크가 boolean을 smallint 컬럼에 바인딩하려다 해당 테이블의 **모든** 변경 이벤트를
+  DLQ로 격리했습니다 (`SQLSTATE 42804 column "b1" is of type smallint but expression is of
+  type boolean`) — 조용한 CDC 데이터 손실. 이제 `DsqlSinkTask`가 타깃 컬럼이 정수 타입일 때
+  (`ParameterMetaData`로 확인) boolean 바인드를 `0`/`1`로 강제 변환합니다 — 기존 `TINYINT(1)`→
+  boolean 변환의 대칭. Full Load와 CDC가 일치합니다. DSQL 싱크 플러그인 재빌드
+  (`PLUGIN_VERSION` v31→v32); 새 플러그인 반영에는 CDC 인프라 Delete+Deploy(또는 새 배포)가 필요.
+
 ## v0.1.336
 
 ### Fixed

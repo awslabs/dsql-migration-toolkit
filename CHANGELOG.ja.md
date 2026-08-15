@@ -5,6 +5,21 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.337
+
+### Fixed
+
+- **`BIT(1)` 列を持つテーブルの行が CDC で丸ごと失われなくなりました**(実クラスターに
+  対する厄介なスキーマ CDC E2E で発見)。Debezium は MySQL `BIT(1)` を(論理スキーマ名の
+  ない)素の Kafka boolean としてシリアライズしますが、スキーマコンバーターは `BIT(n)` を
+  DSQL 整数(smallint)にマップするため、シンクが boolean を smallint 列にバインドしようとして
+  当該テーブルの**すべて**の変更イベントを DLQ に隔離していました(`SQLSTATE 42804 column
+  "b1" is of type smallint but expression is of type boolean`)— 静かな CDC データ損失。
+  今後は `DsqlSinkTask` が、対象列が整数型のとき(`ParameterMetaData` で判定)boolean バインドを
+  `0`/`1` に強制変換します(既存の `TINYINT(1)`→boolean 変換の対称)。Full Load と CDC が
+  一致します。DSQL シンクプラグインを再ビルド(`PLUGIN_VERSION` v31→v32)。新プラグイン反映には
+  CDC インフラの Delete+Deploy(または新規デプロイ)が必要です。
+
 ## v0.1.336
 
 ### Fixed

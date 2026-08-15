@@ -51,6 +51,15 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v32 rebuilds the DSQL sink jar so a MySQL BIT(1) value binds to its integer target.
+#    Debezium serializes BIT(1) as a plain Kafka BOOLEAN (no logical schema name),
+#    but the schema converter maps BIT(n) to a DSQL integer (smallint), so the sink
+#    bound a Boolean into a smallint column and DLQ'd every row of a table with a
+#    BIT(1) column ("column b1 is of type smallint but expression is of type boolean").
+#    DsqlSinkTask.bind now coerces a Boolean to 0/1 when the target parameter is an
+#    integer type (via ParameterMetaData) -- the mirror of the existing INT16->boolean
+#    coercion for TINYINT(1). Sink-jar change only; the debezium plugin and seeder zip
+#    are unchanged.
 # v31 rebuilds the DSQL sink jar so a MySQL TIME(1-6) value keeps its sub-second
 #    microseconds. DebeziumTypeConverter.microsToTime built the value with
 #    java.sql.Time.valueOf(LocalTime), and java.sql.Time holds only h/m/s -- the JDK
@@ -281,7 +290,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v31"
+PLUGIN_VERSION = "v32"
 
 
 class S3ProvisionError(RuntimeError):

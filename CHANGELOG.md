@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.337
+
+### Fixed
+
+- **CDC no longer drops every row from a table with a `BIT(1)` column** (found by the
+  tricky-schema CDC E2E on a live cluster). Debezium serializes MySQL `BIT(1)` as a plain
+  Kafka boolean (no logical schema name), but the schema converter maps `BIT(n)` to a DSQL
+  integer (smallint), so the sink bound a boolean into a smallint column and quarantined
+  **every** change event for such a table to the DLQ (`SQLSTATE 42804 column "b1" is of
+  type smallint but expression is of type boolean`) — silent CDC data loss. `DsqlSinkTask`
+  now coerces a boolean bind to `0`/`1` when the target column is an integer type (read
+  from `ParameterMetaData`), the mirror of the existing `TINYINT(1)`→boolean coercion, so
+  Full Load and CDC agree. Rebuilds the DSQL sink plugin (`PLUGIN_VERSION` v31→v32); a CDC
+  infra Delete+Deploy (or a fresh deploy) is required to pick up the new plugin.
+
 ## v0.1.336
 
 ### Fixed

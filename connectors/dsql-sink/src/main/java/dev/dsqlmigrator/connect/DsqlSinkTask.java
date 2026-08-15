@@ -789,6 +789,17 @@ public class DsqlSinkTask extends SinkTask {
    * -&gt; true) when the target parameter is {@code BIT}/{@code BOOLEAN}. This mirrors
    * the Full Load value converter's TINYINT(1)-&gt;boolean handling so both data
    * paths agree.
+   *
+   * <p>The MIRROR case is MySQL {@code BIT(1)}: Debezium serializes it as a plain
+   * Kafka {@code BOOLEAN} (no logical schema name), but the schema converter maps
+   * {@code BIT(n)} to a DSQL INTEGER column (smallint/integer/bigint), so it arrives
+   * as a {@link Boolean} bound into an integer column and fails ("column is of type
+   * smallint but expression is of type boolean"), DLQing every row of a table with a
+   * {@code BIT(1)} column. We therefore convert a {@code Boolean} bind to {@code 0}/
+   * {@code 1} when the target parameter is an integer type — mirroring the Full Load
+   * BIT-&gt;int decode so both data paths agree. (Only BIT(1) reaches here as a
+   * Boolean: BIT(2..64) arrives as {@code io.debezium.data.Bits} bytes and TINYINT(1)
+   * as an INT16, so this never mis-coerces a genuine boolean-target column.)
    */
   private static void bind(
       PreparedStatement ps, ChangeEvent event, java.sql.ParameterMetaData meta)
@@ -798,6 +809,8 @@ public class DsqlSinkTask extends SinkTask {
       Object value = binds.get(i);
       if (value instanceof Number && meta != null && isBooleanParam(meta, i + 1)) {
         ps.setObject(i + 1, ((Number) value).longValue() != 0L);
+      } else if (value instanceof Boolean && meta != null && isIntegerParam(meta, i + 1)) {
+        ps.setObject(i + 1, ((Boolean) value) ? 1 : 0);
       } else {
         ps.setObject(i + 1, value);
       }
@@ -827,6 +840,23 @@ public class DsqlSinkTask extends SinkTask {
     try {
       int type = meta.getParameterType(idx);
       return type == java.sql.Types.BOOLEAN || type == java.sql.Types.BIT;
+    } catch (SQLException ignored) {
+      return false;
+    }
+  }
+
+  /**
+   * True when prepared-statement parameter {@code idx} (1-based) targets an integer
+   * type (the DSQL target for a MySQL {@code BIT(n)} column: smallint/integer/bigint).
+   * Used to coerce a {@code BIT(1)} Boolean into 0/1 — see {@link #bind}.
+   */
+  private static boolean isIntegerParam(java.sql.ParameterMetaData meta, int idx) {
+    try {
+      int type = meta.getParameterType(idx);
+      return type == java.sql.Types.SMALLINT
+          || type == java.sql.Types.INTEGER
+          || type == java.sql.Types.BIGINT
+          || type == java.sql.Types.TINYINT;
     } catch (SQLException ignored) {
       return false;
     }
