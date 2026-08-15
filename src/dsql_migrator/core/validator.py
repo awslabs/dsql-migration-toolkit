@@ -10,8 +10,11 @@ and produces a :class:`~dsql_migrator.core.models.ValidationReport`
 - Per-table row-count comparison (Requirement 6.1).
 - Sample/checksum-based data comparison (Requirement 6.2): in
   :attr:`~dsql_migrator.core.models.ValidationMode.CHECKSUM` mode an
-  order-independent per-table checksum is computed on both sides and compared,
-  so a reported match means the data itself is equal.
+  order-independent per-table checksum is computed on both sides and compared, so
+  a reported match means the data itself is equal FOR EVERY COMPARED COLUMN. Note
+  FLOAT/DOUBLE and JSON columns are NOT value-compared (no byte-identical
+  cross-engine form -- see the checksum note below); each table lists them in
+  ``checksum_excluded_columns`` so a match is not read as "every column verified".
 - Optional orphan-record check (Requirement 6.3): because DSQL has no foreign
   keys, referential integrity moves to the application; this checks each
   preserved foreign-key rule (:class:`~dsql_migrator.core.models.ForeignKeyDef`)
@@ -50,15 +53,20 @@ NORMALIZED so equal data hashes equally on both sides: the NULL sentinel, bytea 
 spatial WKB, BIT(n), boolean, and the temporal (timestamp / timestamptz / time)
 and DECIMAL type-classes each render to the SAME canonical text on MySQL and
 PostgreSQL (driven by the same converter classification the Full Load loader used
-to STORE the value). The single exception is FLOAT / DOUBLE: no byte-identical
-cross-engine shortest-round-trip text form exists and any fixed-precision rounding
-would degrade soundness for exact values, so float columns are intentionally
-EXCLUDED from the checksum concatenation entirely (:func:`_checksum_kind` returns
-``"float"`` and both renderers return ``None`` for them). Their equality is still
-covered by the row-count comparison and, for keys, by reconciliation. The checksum
-therefore stays SOUND (a reported match always means the two computed checksums
-were equal) and is now sensitive for the common real-schema types, not just a
-best-effort prototype.
+to STORE the value). The exceptions are FLOAT / DOUBLE and JSON: no byte-identical
+cross-engine text form exists (a float has no exact shortest-round-trip decimal and
+any fixed-precision rounding would degrade soundness for exact values; MySQL's
+canonical JSON differs from the CDC sink's compact serialization), so those columns
+are intentionally EXCLUDED from the checksum concatenation entirely
+(:func:`_checksum_kind` returns ``"float"``/``"json"`` and both renderers return
+``None`` for them). IMPORTANT: a difference confined to a NON-KEY float/double/json
+value is therefore NOT detected by any mode -- the row count is unchanged by an
+in-place value edit and reconciliation compares primary-key presence, not values. To
+keep that honest rather than a silent blind spot, each :class:`TableValidationResult`
+records the omitted columns in ``checksum_excluded_columns`` and the report/UI surface
+them, so a CHECKSUM match is read as "every column EXCEPT these was value-compared",
+not "every column verified". The checksum itself stays SOUND (a reported match always
+means the two computed checksums were equal over the compared columns).
 """
 
 from __future__ import annotations
@@ -1552,10 +1560,20 @@ class Validator:
         source_checksum: Optional[str] = None
         target_checksum: Optional[str] = None
         checksum_match: Optional[bool] = None
+        checksum_excluded_columns: list[str] = []
         if mode is ValidationMode.CHECKSUM and run_deep:
             source_checksum = _source_checksum(source_connection, table)
             target_checksum = _target_checksum(target_connection, table)
             checksum_match = source_checksum == target_checksum
+            # Columns the checksum could not value-compare (no byte-identical
+            # cross-engine text form): FLOAT/DOUBLE and JSON. Recorded so a MATCH is
+            # surfaced as "every column EXCEPT these was value-compared" -- a non-key
+            # value diff confined to such a column is invisible to every mode.
+            checksum_excluded_columns = [
+                column.name
+                for column in table.columns
+                if _checksum_kind(column) in ("float", "json")
+            ]
 
         # Full PK-set reconciliation (the "no mismatched records" check): stream
         # every PK from both sides and merge. Only for single-column integer PKs
@@ -1615,6 +1633,7 @@ class Validator:
             source_checksum=source_checksum,
             target_checksum=target_checksum,
             checksum_match=checksum_match,
+            checksum_excluded_columns=checksum_excluded_columns,
             matched=matched,
             row_diff_sample=row_diff_sample,
             reconcile=reconcile_result,
@@ -1952,6 +1971,23 @@ def render_text_report(report: ValidationReport) -> str:
         f"- Data identical: {'yes' if report.is_match else 'NO'} "
         f"({sum(1 for i in report.items if i.matched)}/{len(report.items)} tables matched)"
     )
+    # Honesty caveat (Property 9): FLOAT/DOUBLE and JSON columns have no byte-identical
+    # cross-engine form, so the CHECKSUM omits them -- a difference confined to such a
+    # NON-KEY column is invisible to every mode. Surface them so "Data identical: yes" is
+    # read as "every column EXCEPT these", not "every column verified".
+    excluded_by_table = {
+        item.table: item.checksum_excluded_columns
+        for item in report.items
+        if item.checksum_excluded_columns
+    }
+    if excluded_by_table:
+        detail = "; ".join(
+            f"{table} ({', '.join(cols)})" for table, cols in excluded_by_table.items()
+        )
+        lines.append(
+            "- Columns NOT value-compared (FLOAT/DOUBLE/JSON -- no cross-engine form, "
+            f"a non-key value diff there is undetected): {detail}"
+        )
     if reconciled:
         total_missing = sum(i.reconcile.missing_on_target for i in reconciled)  # type: ignore[union-attr]
         total_extra = sum(i.reconcile.extra_on_target for i in reconciled)  # type: ignore[union-attr]

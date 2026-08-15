@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.343
+
+### Fixed
+
+- **Validation now discloses the columns it did NOT value-compare, and its docstrings no
+  longer overclaim** (found by the Validation review). FLOAT/DOUBLE and JSON columns have
+  no byte-identical cross-engine text form, so the CHECKSUM omits them — a difference
+  confined to a NON-KEY float/double/json value is therefore undetected by any mode (an
+  in-place value edit leaves the row count unchanged and reconciliation compares
+  primary-key presence, not values). The module docstring previously claimed a CHECKSUM
+  match "means the data itself is equal" and that float equality was "covered by the
+  row-count comparison and reconciliation" — false for a non-key column — with no operator
+  disclosure. Now each table records the omitted columns
+  (`TableValidationResult.checksum_excluded_columns`) and both the text report and the
+  cut-over readiness panel surface them, so a "Data identical" result reads as "every
+  column EXCEPT these was value-compared." The exclusion itself is unchanged (there is no
+  sound byte-identical cross-engine float/JSON comparison).
+
 ## v0.1.342
 
 ### Fixed

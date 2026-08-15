@@ -497,6 +497,11 @@ class ValidationSummary:
     quarantine_explained_tables: tuple[str, ...] = ()
     # Rows dropped across those tables (the size of the explained shortfall).
     quarantine_explained_rows: int = 0
+    # Per-table columns the CHECKSUM could NOT value-compare (FLOAT/DOUBLE/JSON -- no
+    # byte-identical cross-engine form). Surfaced so a "Data identical" verdict is read
+    # as "every column EXCEPT these", not "every column verified" (a non-key value diff
+    # confined to such a column is undetected by any mode). Empty outside CHECKSUM mode.
+    checksum_excluded_columns: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     @property
     def unexplained_mismatched_tables(self) -> int:
@@ -596,6 +601,11 @@ def summarize_validation(report: ValidationReport) -> ValidationSummary:
         failed_tables=failed_table_names(report),
         quarantine_explained_tables=quarantine_explained,
         quarantine_explained_rows=quarantine_rows,
+        checksum_excluded_columns={
+            item.table: tuple(item.checksum_excluded_columns)
+            for item in report.items
+            if item.checksum_excluded_columns
+        },
     )
 
 
@@ -3984,6 +3994,27 @@ def _render_readiness_checks(
     ui.label(f"As-of (consistency point): {summary.as_of}").classes(  # type: ignore[attr-defined]
         "text-xs text-gray-500"
     )
+
+    # Honesty caveat: FLOAT/DOUBLE and JSON columns have no byte-identical cross-engine
+    # form, so the checksum omits them -- a "Data identical" pass means every OTHER
+    # column was value-compared. Surfaced so the pass is not read as "every column
+    # verified" (a non-key value diff confined to such a column is undetected).
+    if summary.checksum_excluded_columns:
+        detail = "; ".join(
+            f"{table} ({', '.join(cols)})"
+            for table, cols in summary.checksum_excluded_columns.items()
+        )
+        render_notice(
+            ui,
+            tone="info",
+            header="Some columns were not value-compared",
+            body=(
+                "FLOAT/DOUBLE and JSON columns have no byte-identical cross-engine text "
+                "form, so the checksum omits them — a 'Data identical' result means every "
+                "OTHER column was value-compared, and a non-key value difference confined "
+                f"to one of these columns would not be detected. Omitted: {detail}."
+            ),
+        )
 
 
 def _render_check_row(

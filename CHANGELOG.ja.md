@@ -5,6 +5,22 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.343
+
+### Fixed
+
+- **検証(Validation)が、値比較しなかった列を開示するようになり、docstring の過大主張を
+  修正しました**(Validation レビューで発見)。FLOAT/DOUBLE・JSON 列にはバイト同一のクロス
+  エンジンのテキスト形式がないため CHECKSUM はこれらを除外します。したがって**非キー**の
+  float/double/json 値だけに限定された差異は、どのモードでも検出されません(インプレースの値編集は
+  行数を変えず、reconcile は主キーの存在のみ比較)。従来の docstring は CHECKSUM 一致が
+  「データそのものが等しい」ことを意味し、float の等価性が「行数比較と reconciliation でカバー
+  される」(非キー列では誤り)と主張し、運用者への開示もありませんでした。今後はテーブルごとに
+  除外列を記録し(`TableValidationResult.checksum_excluded_columns`)、テキストレポートと
+  カットオーバー準備パネルに表示するので、「Data identical」の結果は「これらを除く全列を値比較
+  した」と読めます。除外自体は変更ありません(健全なバイト同一のクロスエンジン float/JSON 比較は
+  存在しません)。
+
 ## v0.1.342
 
 ### Fixed

@@ -1297,6 +1297,13 @@ class TableValidationResult(BaseModel):
     target_checksum: Optional[str] = None
     checksum_match: Optional[bool] = None
     matched: bool
+    # Columns OMITTED from the CHECKSUM because no byte-identical cross-engine text form
+    # exists (FLOAT/DOUBLE and JSON). A difference confined to such a NON-KEY column is
+    # NOT detected by any mode (row count is invariant under an in-place edit; reconcile
+    # compares PK presence, not values), so a CHECKSUM match means "every column EXCEPT
+    # these was value-compared". Surfaced in the report/UI so it is not read as "every
+    # column verified". Empty unless the CHECKSUM ran and a table has such a column.
+    checksum_excluded_columns: list[str] = Field(default_factory=list)
     # Dev-only diagnostic sample of diverging PKs, populated only when this table
     # did NOT match AND the row-diff sample size is configured > 0. None otherwise.
     row_diff_sample: Optional["RowDiffSample"] = None

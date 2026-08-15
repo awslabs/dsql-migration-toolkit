@@ -545,6 +545,34 @@ def test_checksum_match_reports_overall_match() -> None:
     assert item.matched is True
 
 
+def test_checksum_excluded_columns_are_recorded_and_surfaced() -> None:
+    """M2: FLOAT/DOUBLE and JSON columns are omitted from the checksum (no byte-identical
+    cross-engine form). The omission is recorded per table and surfaced in the report so a
+    MATCH is not misread as 'every column verified' -- a non-key value diff confined to
+    such a column is undetected by any mode."""
+    from dsql_migrator.core.validator import render_text_report
+
+    table = _table("metrics", columns=("id", "ratio", "meta"))
+    table.columns[1].mysql_type = "double"
+    table.columns[2].mysql_type = "json"
+    source = _FakeSourceConnection(counts={"metrics": 2}, checksums={"metrics": "42"})
+    target = _FakeTargetConnection(counts={"metrics": 2}, checksums={"metrics": "42"})
+
+    report = _validator(source, target).validate(
+        _SOURCE_CONFIG, _TARGET_CONFIG, [table], ValidationMode.CHECKSUM
+    )
+    item = report.items[0]
+    assert item.matched is True  # a false MATCH would be silent without the disclosure
+    assert item.checksum_excluded_columns == ["ratio", "meta"]
+    assert "not value-compared" in render_text_report(report).lower()
+
+    # ROW_COUNT mode runs no checksum, so it records no exclusions.
+    rc = _validator(source, target).validate(
+        _SOURCE_CONFIG, _TARGET_CONFIG, [table], ValidationMode.ROW_COUNT
+    )
+    assert rc.items[0].checksum_excluded_columns == []
+
+
 def test_deliberate_data_mismatch_with_equal_counts_is_not_a_match() -> None:
     """Property 9: equal row counts but different checksums must NOT report match."""
     source = _FakeSourceConnection(counts={"orders": 3}, checksums={"orders": "111"})

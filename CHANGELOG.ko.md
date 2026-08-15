@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.343
+
+### Fixed
+
+- **검증(Validation)이 이제 값 비교를 하지 않은 컬럼을 공개하고, docstring의 과대주장을
+  바로잡습니다** (Validation 리뷰에서 발견). FLOAT/DOUBLE·JSON 컬럼은 바이트 동일한 크로스-엔진
+  텍스트 형태가 없어 CHECKSUM이 이들을 제외하므로, **비-키** float/double/json 값에만 국한된
+  차이는 어떤 모드로도 감지되지 않습니다(제자리 값 수정은 행 수를 안 바꾸고, reconcile은 PK
+  존재만 비교). 기존 docstring은 CHECKSUM 일치가 "데이터 자체가 같음을 의미"하고 float 동등성이
+  "row-count와 reconciliation으로 커버된다"(비-키 컬럼엔 거짓)고 주장했고, 운영자에게 알림도
+  없었습니다. 이제 테이블별로 제외 컬럼을 기록(`TableValidationResult.checksum_excluded_columns`)
+  하고 텍스트 리포트와 cut-over 준비 패널에 표시해, "Data identical" 결과가 "이 컬럼들을 제외한
+  모든 컬럼이 값 비교됨"으로 읽히게 합니다. 제외 자체는 그대로입니다(건전한 바이트 동일 크로스-엔진
+  float/JSON 비교는 존재하지 않음).
+
 ## v0.1.342
 
 ### Fixed
