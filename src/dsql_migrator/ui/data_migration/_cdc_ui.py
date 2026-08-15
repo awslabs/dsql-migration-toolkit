@@ -4972,11 +4972,18 @@ def _render_cdc_dlq_panel(
         if _stalled and health.depth == 0:
             # "No records quarantined." is literally true but reads as reassurance, so
             # say why it proves nothing right now: a stalled sink never reaches a record
-            # to quarantine, so a zero depth is the EXPECTED reading during a stall.
-            ui.label(  # type: ignore[attr-defined]
-                "A zero count is expected while the sink is stalled — it never reaches "
-                "a record to quarantine, so this is not evidence that nothing was lost."
-            ).classes("text-xs font-semibold text-red-700")
+            # to quarantine, so a zero depth is the EXPECTED reading during a stall. A
+            # status caveat like this must carry its severity in a design-system notice
+            # box, not loose red text (the box + amber border + icon do the signalling).
+            render_notice(
+                ui,
+                tone="warning",
+                header="A zero count is expected while the sink is stalled",
+                body=(
+                    "A stalled sink never reaches a record to quarantine, so a zero "
+                    "dead-letter count here is not evidence that nothing was lost."
+                ),
+            )
         _render_cdc_schema_drift_banner(
             ui, status_view, session=session, on_refresh=on_refresh
         )

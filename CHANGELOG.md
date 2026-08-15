@@ -81,6 +81,18 @@ once for the batch)._
   `PLUGIN_VERSION` → `v31` (a `PLUGIN_VERSION` bump requires Delete + Deploy of the CDC infra to
   take effect).
 
+- **The CDC cost estimate understated MSK Connect ~3×.** `estimate_cdc_hourly_cost` assumed a flat
+  "two connectors at 1 MCU each" ($0.22/hr), but the defaults deploy 2 (source) + 4 (sink) = 6 MCU,
+  so it understated MSK Connect ~3× and the whole hourly figure ~30–40% — the opposite of the tool's
+  cost-awareness principle. The MSK Connect component now derives from the actual source + sink MCU
+  counts × the per-MCU rate, so the estimate tracks the real deploy (and a sink resize).
+
+- **A CDC dead-letter caveat rendered as loose red text instead of a design-system notice.** The "a
+  zero count is expected while the sink is stalled" caveat (a stalled sink never reaches a record to
+  quarantine, so a zero depth is not evidence nothing was lost) was a bare `text-red-700` label; it
+  now uses `render_notice(tone="warning", …)` so the box + amber border + leading icon carry the
+  severity, per the design system.
+
 ## v0.1.333
 
 ### Fixed

@@ -66,6 +66,16 @@ _여러 CDC 리뷰 수정을 한 패치로 묶습니다 (ECR Public 이미지는
   (타임존 독립적). DSQL sink jar을 재빌드하고 커넥터 플러그인 `PLUGIN_VERSION`을 `v31`로 올립니다(`PLUGIN_VERSION`
   범프는 CDC 인프라의 Delete + Deploy가 있어야 반영됩니다).
 
+- **CDC 비용 추정이 MSK Connect를 ~3배 과소평가하던 문제.** `estimate_cdc_hourly_cost`가 "커넥터 2개 ×
+  1 MCU"($0.22/hr) 고정으로 가정했지만, 기본 배포는 2(소스) + 4(싱크) = 6 MCU라서 MSK Connect를 ~3배,
+  전체 시간당 추정치를 ~30–40% 과소평가했습니다 — 툴의 비용-인식 원칙에 정반대. 이제 MSK Connect 구성요소가 실제
+  소스+싱크 MCU 수 × MCU당 요율에서 파생되어 실제 배포(및 싱크 리사이즈)를 반영합니다.
+
+- **CDC dead-letter 주의문이 디자인시스템 notice가 아닌 loose red text로 렌더링되던 문제.** "sink가 멈춘
+  동안에는 0 카운트가 정상"(멈춘 sink는 격리할 레코드에 도달조차 못하므로 0 depth가 무손실의 증거가 아님) 주의문이
+  맨 `text-red-700` 라벨이었는데, 이제 `render_notice(tone="warning", …)`를 사용해 박스 + 앰버 테두리 + 선행
+  아이콘이 심각도를 전달합니다(디자인시스템 준수).
+
 ## v0.1.333
 
 ### 수정 (Fixed)

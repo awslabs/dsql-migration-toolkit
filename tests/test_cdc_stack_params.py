@@ -561,6 +561,27 @@ def test_cost_estimate_range_is_ordered_and_positive() -> None:
     assert 0.5 < est.hourly_low_usd < 5
 
 
+def test_cost_estimate_tracks_deployed_mcu_count() -> None:
+    # MSK Connect bills per MCU-hour, and the defaults deploy source + sink = 2 + 4 = 6
+    # MCU -- so the estimate must reflect 6 MCU, not the old flat "two connectors at 1
+    # MCU each" ($0.22) that understated MSK Connect ~3x.
+    from dsql_migrator.core.cdc import (
+        CDC_DEFAULT_MCU_COUNT,
+        CDC_DEFAULT_SINK_MCU_COUNT,
+        _MSK_CONNECT_USD_PER_MCU_HOUR,
+    )
+
+    default = estimate_cdc_hourly_cost(includes_nat=False)  # 2 + 4 = 6 MCU
+    total_mcu = CDC_DEFAULT_MCU_COUNT + CDC_DEFAULT_SINK_MCU_COUNT
+    assert total_mcu == 6
+    assert default.hourly_low_usd == round(
+        0.75 + total_mcu * _MSK_CONNECT_USD_PER_MCU_HOUR, 2
+    )
+    # More MCUs cost strictly more, by the per-MCU rate (so a resize is reflected).
+    smaller = estimate_cdc_hourly_cost(includes_nat=False, source_mcu=1, sink_mcu=1)
+    assert default.hourly_low_usd > smaller.hourly_low_usd
+
+
 def test_cost_estimate_caveat_is_clear_about_nature_and_billing() -> None:
     est = estimate_cdc_hourly_cost()
     assert "estimate" in est.caveat.lower()

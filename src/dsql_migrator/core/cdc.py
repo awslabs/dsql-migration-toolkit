@@ -822,9 +822,14 @@ def build_cdc_stack_name(suffix: str) -> Optional[str]:
 # and the caveat travels with the number.
 _CDC_HOURLY_USD = {
     "msk_serverless": 0.75,
-    "msk_connect": 0.22,
     "nat_gateway": 0.045,
 }
+# MSK Connect bills per MCU-hour (~$0.11 in us-east-1). The estimate must track the
+# ACTUAL deployed compute -- the source connector's MCUs (CDC_DEFAULT_MCU_COUNT) PLUS
+# the sink's (CDC_DEFAULT_SINK_MCU_COUNT) -- not a flat "two connectors at 1 MCU each":
+# the defaults deploy 2 + 4 = 6 MCU, so a flat 0.22 understated MSK Connect ~3x and the
+# whole estimate ~30-40%, the opposite of the cost/footprint-awareness principle.
+_MSK_CONNECT_USD_PER_MCU_HOUR = 0.11
 
 
 @dataclass(frozen=True)
@@ -837,16 +842,25 @@ class CdcCostEstimate:
     caveat: str
 
 
-def estimate_cdc_hourly_cost(*, includes_nat: bool = True) -> CdcCostEstimate:
+def estimate_cdc_hourly_cost(
+    *,
+    includes_nat: bool = True,
+    source_mcu: int = CDC_DEFAULT_MCU_COUNT,
+    sink_mcu: int = CDC_DEFAULT_SINK_MCU_COUNT,
+) -> CdcCostEstimate:
     """Return a rough hourly USD range for a running CDC pipeline.
 
     ``includes_nat`` adds the NAT gateway base when the stack creates its own NAT
-    (it is omitted when existing NAT-egress subnets are reused). The range pads the
-    base figure by ~40% on the high side to acknowledge throughput-driven costs
-    (MSK Serverless partition-hours/storage, NAT data processing) that a flat base
-    cannot capture. Pure; the caveat string makes the estimate's nature clear.
+    (it is omitted when existing NAT-egress subnets are reused). ``source_mcu`` /
+    ``sink_mcu`` are the deployed MSK Connect MCUs (defaulting to the deploy defaults),
+    so the MSK Connect component tracks the real compute (2 + 4 = 6 MCU by default)
+    rather than a flat two. The range pads the base figure by ~40% on the high side to
+    acknowledge throughput-driven costs (MSK Serverless partition-hours/storage, NAT
+    data processing) that a flat base cannot capture. Pure; the caveat makes the
+    estimate's nature clear.
     """
-    hourly = _CDC_HOURLY_USD["msk_serverless"] + _CDC_HOURLY_USD["msk_connect"]
+    msk_connect = (int(source_mcu) + int(sink_mcu)) * _MSK_CONNECT_USD_PER_MCU_HOUR
+    hourly = _CDC_HOURLY_USD["msk_serverless"] + msk_connect
     if includes_nat:
         hourly += _CDC_HOURLY_USD["nat_gateway"]
     low = round(hourly, 2)
