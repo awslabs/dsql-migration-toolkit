@@ -5,6 +5,16 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.339
+
+### Changed
+
+- **앱 컨테이너 이미지를 `0.1.338`로 private ECR(us-east-1 및 ap-northeast-2)과 ECR Public에
+  재퍼블리시하고, CloudFormation `ContainerImageUri` 기본값을 `0.1.338`로 갱신했습니다**
+  (이전 `0.1.334`). 이제 fresh `git clone` 배포가 4 릴리스 뒤처진 기본값 대신 v0.1.335–338
+  수정(스키마 변환 경고 + bytea-in-key, ZEROFILL 체크섬, `BIT(1)`/`BIT(64)` CDC 싱크)이
+  반영된 이미지를 pull 합니다. 애플리케이션 코드 변경 없음.
+
 ## v0.1.338
 
 ### Fixed

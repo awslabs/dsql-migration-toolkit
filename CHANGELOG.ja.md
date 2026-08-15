@@ -5,6 +5,17 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.339
+
+### Changed
+
+- **アプリのコンテナイメージを `0.1.338` で private ECR(us-east-1 および ap-northeast-2)と
+  ECR Public に再パブリッシュし、CloudFormation `ContainerImageUri` のデフォルトを
+  `0.1.338` に更新しました**(以前は `0.1.334`)。これにより新規 `git clone` デプロイは、
+  4 リリース遅れのデフォルトではなく v0.1.335–338 の修正(スキーマ変換の警告 + bytea-in-key、
+  ZEROFILL チェックサム、`BIT(1)`/`BIT(64)` CDC シンク)を含むイメージを pull します。
+  アプリケーションのコード変更はありません。
+
 ## v0.1.338
 
 ### Fixed

@@ -5,6 +5,17 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.339
+
+### Changed
+
+- **Republished the app container image at `0.1.338` to the private ECR (us-east-1 and
+  ap-northeast-2) and ECR Public, and pointed the CloudFormation `ContainerImageUri`
+  default at `0.1.338`** (was `0.1.334`). A fresh `git clone` deploy now pulls an image
+  built with the v0.1.335–338 fixes (schema-conversion warnings + bytea-in-key, the
+  ZEROFILL checksum fix, and the `BIT(1)`/`BIT(64)` CDC sink fixes) instead of the
+  4-releases-old default. No application code change.
+
 ## v0.1.338
 
 ### Fixed
