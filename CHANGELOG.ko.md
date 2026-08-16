@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.350
+
+### Changed
+
+- **유지보수 리팩터(동작 변경 없음), 리팩터 기회 백로그 반영.** `ui/data_migration/__init__.py`
+  (5386 → 3384줄)에서 Full Load 렌더 클러스터를 새 형제 모듈 `ui/data_migration/_full_load_ui.py`로
+  분리 — watermark·load-status 렌더러, ~830줄 `_render_full_load_step`, 셀/툴팁 포매터, quarantine
+  헬퍼, progress/completeness/error-log 렌더러(및 작은 `format_selected_workloads` 헤드라인). 기존
+  `_cdc_ui.py` 분리 방식을 그대로 따르며 패키지 `__init__` 하단에서 re-export하므로 `dm.<name>`과
+  모든 소비자/테스트 import는 그대로 동작합니다. 단방향(새 모듈은 `_engine`/`_models`/`_status`/
+  `_cdc_ui` + 공유 `core`/`ui`만 import, `__init__` 역참조 없음). 이동한 probe가 새 네임스페이스에서
+  `DsqlConnector`/`tables_with_rows`/`target_primary_keys`를 조회하므로 테스트 1건의 monkeypatch
+  대상을 새 모듈로 변경했습니다. 동작 변경 없음.
+
 ## v0.1.349
 
 ### Changed

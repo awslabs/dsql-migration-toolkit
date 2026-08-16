@@ -1323,10 +1323,13 @@ def test_pre_dialog_probe_caches_each_targets_real_primary_key(monkeypatch) -> N
     Runs the real probe body with the connector and both introspector calls faked, and
     asserts the keys land on the migration state.
     """
-    from dsql_migrator.ui import data_migration as dm
+    # The probe body lives in _render_full_load_step, which now resides in the
+    # _full_load_ui module, so its DsqlConnector / tables_with_rows / target_primary_keys
+    # lookups resolve in that module's namespace -- patch it there.
+    from dsql_migrator.ui.data_migration import _full_load_ui as fl
 
-    monkeypatch.setattr(dm, "DsqlConnector", lambda *a, **k: _StubConnector())
-    monkeypatch.setattr(dm, "tables_with_rows", lambda names, **k: ["ecommerce.other"])
+    monkeypatch.setattr(fl, "DsqlConnector", lambda *a, **k: _StubConnector())
+    monkeypatch.setattr(fl, "tables_with_rows", lambda names, **k: ["ecommerce.other"])
     real_keys = {
         "ecommerce.orders": ["customer_id", "id"],
         "ecommerce.other": ["id"],
@@ -1334,7 +1337,7 @@ def test_pre_dialog_probe_caches_each_targets_real_primary_key(monkeypatch) -> N
     # The probe now reads every target's key in ONE bulk call (target_primary_keys),
     # not a per-table target_primary_key_columns loop.
     monkeypatch.setattr(
-        dm,
+        fl,
         "target_primary_keys",
         lambda names, **k: {name: real_keys.get(name) for name in names},
     )

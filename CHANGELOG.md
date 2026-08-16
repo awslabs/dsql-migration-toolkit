@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.350
+
+### Changed
+
+- **Maintainability refactor (no behavior change), from the refactor-opportunity backlog.**
+  Extracted the Full Load render cluster out of `ui/data_migration/__init__.py`
+  (5386 → 3384 lines) into a new sibling `ui/data_migration/_full_load_ui.py` — the watermark
+  and load-status renderers, the ~830-line `_render_full_load_step`, the per-cell/tooltip
+  formatters, the quarantine helpers, and the progress/completeness/error-log renderers (plus
+  the small `format_selected_workloads` headline). Mirrors the existing `_cdc_ui.py` split and
+  is re-exported at the bottom of the package `__init__`, so `dm.<name>` and every
+  consumer/test import resolve unchanged. One-directional (the new module imports from
+  `_engine`/`_models`/`_status`/`_cdc_ui` + shared `core`/`ui`, never back from `__init__`).
+  One test's monkeypatch was repointed to the new module (the moved probe resolves its
+  `DsqlConnector`/`tables_with_rows`/`target_primary_keys` deps in the new namespace). No
+  behavior change.
+
 ## v0.1.349
 
 ### Changed

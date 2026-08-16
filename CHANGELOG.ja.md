@@ -5,6 +5,21 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.350
+
+### Changed
+
+- **保守性リファクタリング(動作変更なし)、リファクタリング機会バックログの反映。**
+  `ui/data_migration/__init__.py`(5386 → 3384行)から、Full Load レンダークラスターを新しい兄弟
+  モジュール `ui/data_migration/_full_load_ui.py` へ分離 — watermark・load-status レンダラー、
+  約830行の `_render_full_load_step`、セル/ツールチップフォーマッター、quarantine ヘルパー、
+  progress/completeness/error-log レンダラー(および小さな `format_selected_workloads` 見出し)。
+  既存の `_cdc_ui.py` 分割方式に倣い、パッケージ `__init__` の末尾で re-export するため、`dm.<name>`
+  とすべての利用側/テストの import はそのまま解決します。単方向(新モジュールは `_engine`/`_models`/
+  `_status`/`_cdc_ui` + 共有 `core`/`ui` のみ import、`__init__` への逆参照なし)。移動した probe が
+  新しい名前空間で `DsqlConnector`/`tables_with_rows`/`target_primary_keys` を参照するため、テスト
+  1件の monkeypatch 対象を新モジュールへ変更しました。動作変更なし。
+
 ## v0.1.349
 
 ### Changed
