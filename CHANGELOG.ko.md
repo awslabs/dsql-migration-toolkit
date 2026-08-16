@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.348
+
+### Changed
+
+- **유지보수 리팩터(동작 변경 없음), 리팩터 기회 리뷰 결과 반영.** `core/cdc_deployer.py`
+  (2196 → 1450줄)에서 상태를 가진 AWS/CloudFormation 래퍼를 새 모듈
+  `core/cdc_stack_deployer.py`로 분리: `CdcStackDeployer` 클래스, `CdcStackDiscovery`/
+  `CdcDeployError` 데이터 타입, `build_cdc_stack_deployer` 팩토리, 그리고 이들이 쓰는
+  `_stack_absent_error`/`_parse_unsupported_azs`(+`_UNSUPPORTED_AZ_RE`) 헬퍼. `run_cdc_*` 배포
+  오케스트레이션(`_StageDriver`, 스테이지 시더, `_wait_stack_settles`, 커넥터 로그 진단)은
+  `cdc_deployer.py`에 남아 래퍼를 단방향으로 의존합니다(새 모듈은 오케스트레이션을 절대
+  import하지 않음). 이동한 모든 이름을 `cdc_deployer.py`가 re-export하므로, 모든 UI/테스트
+  import(`from dsql_migrator.core.cdc_deployer import CdcStackDeployer`,
+  `build_cdc_stack_deployer` 등)는 그대로 동작합니다. 동작 변경 없음.
+
 ## v0.1.347
 
 ### Changed

@@ -5,6 +5,22 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.348
+
+### Changed
+
+- **保守性リファクタリング(動作変更なし)、リファクタリング機会レビューの反映。**
+  `core/cdc_deployer.py`(2196 → 1450行)から、状態を持つ AWS/CloudFormation ラッパーを
+  新モジュール `core/cdc_stack_deployer.py` へ分離: `CdcStackDeployer` クラス、その
+  `CdcStackDiscovery`/`CdcDeployError` データ型、`build_cdc_stack_deployer` ファクトリ、および
+  それらが使う `_stack_absent_error`/`_parse_unsupported_azs`(+`_UNSUPPORTED_AZ_RE`)ヘルパー。
+  `run_cdc_*` デプロイのオーケストレーション(`_StageDriver`、ステージシーダー、
+  `_wait_stack_settles`、コネクタログ診断)は `cdc_deployer.py` に残り、ラッパーを単方向に
+  依存します(新モジュールはオーケストレーションを一切 import しません)。移動したすべての名前を
+  `cdc_deployer.py` が re-export するため、すべての UI/テストの import
+  (`from dsql_migrator.core.cdc_deployer import CdcStackDeployer`、`build_cdc_stack_deployer`
+  など)はそのまま解決します。動作変更なし。
+
 ## v0.1.347
 
 ### Changed

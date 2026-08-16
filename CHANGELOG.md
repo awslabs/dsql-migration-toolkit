@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.348
+
+### Changed
+
+- **Maintainability refactor (no behavior change), from the refactor-opportunity review.**
+  Split the stateful AWS/CloudFormation wrapper out of `core/cdc_deployer.py`
+  (2196 → 1450 lines) into a new `core/cdc_stack_deployer.py`: the `CdcStackDeployer` class,
+  its `CdcStackDiscovery`/`CdcDeployError` data types, the `build_cdc_stack_deployer` factory,
+  and the `_stack_absent_error` / `_parse_unsupported_azs` (+ `_UNSUPPORTED_AZ_RE`) helpers it
+  uses. The `run_cdc_*` deploy orchestration (`_StageDriver`, stage seeders,
+  `_wait_stack_settles`, the connector-log diagnostics) stays in `cdc_deployer.py` and depends
+  on the wrapper one-directionally (the new module never imports the orchestration). All moved
+  names are re-exported from `cdc_deployer.py`, so every UI/test import
+  (`from dsql_migrator.core.cdc_deployer import CdcStackDeployer`, `build_cdc_stack_deployer`,
+  …) resolves unchanged. No behavior change.
+
 ## v0.1.347
 
 ### Changed
