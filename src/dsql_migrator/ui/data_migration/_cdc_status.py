@@ -1,14 +1,26 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CDC status / controller / deploy-formatting logic (NiceGUI-free).
+"""CDC status / controller / deploy-formatting logic + shared job & error-log views (NiceGUI-free).
 
-Extracted from the Data Migration screen package ``__init__`` so the heavy
-status, network-probe, classification, and deploy-stage *formatting* logic lives
-apart from the NiceGUI render code. Everything here is pure or read-only network
-I/O; nothing builds NiceGUI widgets. The package ``__init__`` re-imports these
-names so the public import surface of ``dsql_migrator.ui.data_migration`` is
-unchanged and the remaining render code resolves them.
+The heavy CDC status, network-probe, classification, teardown-planning, and
+deploy-stage *formatting* logic lives here, apart from the NiceGUI render code.
+Everything here is pure or read-only network I/O; nothing builds NiceGUI widgets.
+
+Two things here are NOT CDC-specific but live here by COHESION, not by feature:
+
+- ``_current_job`` -- the shared :class:`~dsql_migrator.core.job_manager.JobManager`
+  snapshot accessor. Its primary user is this module (the teardown/status logic); the
+  rest of the package imports it from here.
+- The error-log *partitioning* views. Full Load and CDC share one error log, so
+  ``full_load_error_records`` (the Full Load's own records) and ``cdc_dlq_records``
+  (CDC's own) are two sides of the SAME split and both depend on
+  ``is_cdc_error_record``. Keeping them together is what makes the Full Load error
+  panel and the CDC DLQ panel add up to the whole log; splitting the FL readers into
+  the FL engine would fragment that and drag a CDC predicate into the FL module.
+
+The package ``__init__`` re-imports these names so the public import surface of
+``dsql_migrator.ui.data_migration`` is unchanged and the render code resolves them.
 """
 
 from __future__ import annotations

@@ -370,7 +370,7 @@ def build_page(
         infrastructure", the delete found nothing, and the operator kept paying for MSK /
         NAT behind a success toast. Every discovered stack is now returned and torn down.
         """
-        from dsql_migrator.ui.data_migration._status import cdc_teardown_stack_names
+        from dsql_migrator.ui.data_migration._cdc_status import cdc_teardown_stack_names
 
         migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
         return cdc_teardown_stack_names(
@@ -406,7 +406,7 @@ def build_page(
         the local lifecycle job + kind, and the freshly-probed raw stack status. The
         job/stack signals are refreshed by ``_cdc_probe`` just before the dialog opens.
         """
-        from dsql_migrator.ui.data_migration._status import cdc_teardown_in_flight
+        from dsql_migrator.ui.data_migration._cdc_status import cdc_teardown_in_flight
 
         migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
         return cdc_teardown_in_flight(
@@ -430,7 +430,7 @@ def build_page(
         it clears the marker and returns ``None`` so the banner disappears and the
         Start-over guard releases.
         """
-        from dsql_migrator.ui.data_migration._status import (
+        from dsql_migrator.ui.data_migration._cdc_status import (
             cdc_teardown_banner_state,
             stack_status_needs_cleanup as _stack_status_needs_cleanup,
         )
@@ -477,7 +477,7 @@ def build_page(
             }
             # With several stacks, say WHICH one of how many is being torn down -- the
             # banner names a single stack, so without this it looked like the only one.
-            from dsql_migrator.ui.data_migration._status import (
+            from dsql_migrator.ui.data_migration._cdc_status import (
                 teardown_queue_progress,
             )
 
@@ -493,7 +493,7 @@ def build_page(
         # which is what made the banner vanish while MSK / NAT kept billing.
         queue = list(getattr(migration_state, "cdc_teardown_queue", None) or [])
         if len(queue) > 1:
-            from dsql_migrator.ui.data_migration._status import (
+            from dsql_migrator.ui.data_migration._cdc_status import (
                 next_unfinished_teardown,
             )
 
@@ -529,7 +529,7 @@ def build_page(
         # the only completion signal was a toast that a refresh throws away -- so the
         # operator came back to an empty screen with no way to tell whether it finished or
         # never ran. Names every stack, since a multi-stack teardown showed only one.
-        from dsql_migrator.ui.data_migration._status import finished_teardown_stacks
+        from dsql_migrator.ui.data_migration._cdc_status import finished_teardown_stacks
 
         migration_state.set_cdc_teardown_done(
             kind=getattr(migration_state, "cdc_teardown_kind", None),
@@ -561,7 +561,7 @@ def build_page(
         hard-blocked by :func:`_cdc_teardown_in_flight`; a deploy/start is
         re-discoverable and must not trap a user trying to escape a stuck run.
         """
-        from dsql_migrator.ui.data_migration._status import _current_job
+        from dsql_migrator.ui.data_migration._cdc_status import _current_job
 
         migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
         job = _current_job(
@@ -584,7 +584,7 @@ def build_page(
         regardless of which step the user was on. ``_ensure_cdc_controller`` is
         throttled per session; clear the throttle timestamp first so this explicit
         user action always gets a fresh read. Best-effort and read-only."""
-        from dsql_migrator.ui.data_migration._status import _ensure_cdc_controller
+        from dsql_migrator.ui.data_migration._cdc_status import _ensure_cdc_controller
 
         migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
         session = SESSION_STORE.get_or_create(session_id)
@@ -616,7 +616,7 @@ def build_page(
             run_cdc_delete,
             run_cdc_stop,
         )
-        from dsql_migrator.ui.data_migration._status import (
+        from dsql_migrator.ui.data_migration._cdc_status import (
             should_replace_teardown_marker,
         )
 
@@ -709,7 +709,7 @@ def build_page(
         # ownership guard declines the others while it is still running); each still runs
         # to completion as its own background job. The per-stack plan (including where the
         # shared source-secret cleanup belongs) comes from the pure cdc_teardown_plan.
-        from dsql_migrator.ui.data_migration._status import cdc_teardown_plan
+        from dsql_migrator.ui.data_migration._cdc_status import cdc_teardown_plan
 
         job_id = None
         launched_queue: list[tuple[str, str]] = []
@@ -839,7 +839,7 @@ def build_page(
             return False
         try:
             from dsql_migrator.core.cdc_deployer import build_cdc_stack_deployer
-            from dsql_migrator.ui.data_migration._status import (
+            from dsql_migrator.ui.data_migration._cdc_status import (
                 teardown_stack_confirmed_gone,
             )
 

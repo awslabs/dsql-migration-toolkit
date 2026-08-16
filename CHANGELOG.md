@@ -5,6 +5,27 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.352
+
+### Changed
+
+- **Data-migration package layout made consistent + honest (no behavior change), from the
+  architecture review.** The package was a hybrid (per-feature `_cdc_*` slice for CDC, per-layer
+  for the rest) with two misleading names. Renamed for a consistent, honest convention:
+  `ui/data_migration/_engine.py` → **`_full_load_engine.py`** (it is the Full Load backend engine;
+  now symmetric with `_full_load_ui.py`) and `ui/data_migration/_status.py` → **`_cdc_status.py`**
+  (it is ~all CDC; the generic name hid that). All importers (src + tests) were updated; no
+  re-export shim, since these are private submodules. Documented the intentional layout in the
+  package `__init__` docstring — CDC is a larger subsystem so it legitimately spans more files
+  (`_cdc_ui`/`_cdc_monitoring`/`_cdc_state`/`_cdc_status` + `core/cdc*`), Full Load is a tight
+  pipeline (`_full_load_engine`/`_full_load_ui` + `core/exporter`/`batched_import`), and
+  `_models`/`_state` are the shared layer coupled by the Full Load → CDC watermark handoff — so
+  file count tracks intrinsic complexity, not forced symmetry. Deliberately did NOT relocate the
+  `full_load_error_*` readers or `_current_job` out of `_cdc_status`: the FL and CDC error-log
+  views share `is_cdc_error_record` (moving them would fragment that cohesion and pull a CDC
+  predicate into the FL module), and `_current_job`'s primary user is `_cdc_status` itself; the
+  module docstring now states this scope honestly instead.
+
 ## v0.1.351
 
 ### Changed

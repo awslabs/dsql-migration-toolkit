@@ -488,7 +488,7 @@ def test_dlq_zero_depth_is_not_painted_green_while_the_sink_is_stalled() -> None
 def test_sink_stall_and_recovery_each_log_once_on_transition() -> None:
     # The CDC poll runs every few seconds, so the event must fire on the STATE CHANGE
     # only -- otherwise the durable activity log fills with identical lines.
-    from dsql_migrator.ui.data_migration import _status as status_mod
+    from dsql_migrator.ui.data_migration import _cdc_status as status_mod
 
     logged: list[tuple] = []
 
@@ -532,7 +532,7 @@ def test_sink_stall_and_recovery_each_log_once_on_transition() -> None:
 def test_an_unconfirmed_divergence_writes_no_activity_log_event() -> None:
     # The regression: a post-burst one-poll divergence put a FAILURE line in the
     # durable log for a healthy pipeline. Only a confirmed stall may be recorded.
-    from dsql_migrator.ui.data_migration import _status as status_mod
+    from dsql_migrator.ui.data_migration import _cdc_status as status_mod
     import dsql_migrator.core.activity_log as real_log
 
     logged: list = []

@@ -1468,7 +1468,7 @@ def test_banner_advances_through_every_stack_in_a_multi_stack_teardown() -> None
     while the others were still deleting and still billing for MSK / NAT, with nothing on
     screen. The queue lets the banner move to the next unfinished stack.
     """
-    from dsql_migrator.ui.data_migration._status import next_unfinished_teardown
+    from dsql_migrator.ui.data_migration._cdc_status import next_unfinished_teardown
 
     queue = [("j1", "cdc-a"), ("j2", "cdc-b"), ("j3", "cdc-c")]
 
@@ -1599,7 +1599,7 @@ def test_teardown_queue_progress_and_finished_stacks() -> None:
     them -- so "queue never recorded", "banner goes silent", and "no durable completion"
     all survived mutation testing.
     """
-    from dsql_migrator.ui.data_migration._status import (
+    from dsql_migrator.ui.data_migration._cdc_status import (
         finished_teardown_stacks,
         teardown_queue_progress,
     )

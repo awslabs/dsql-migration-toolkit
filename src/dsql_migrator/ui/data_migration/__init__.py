@@ -38,6 +38,27 @@ As with the sibling step screens, the run orchestration, progress aggregation,
 and watermark formatting below are independent of NiceGUI so they can be unit
 tested directly; only :func:`build_data_migration_screen` and its render helpers
 touch NiceGUI.
+
+Package layout (the CDC-vs-Full-Load split is intentional, not an asymmetry to
+"fix"). This package is a HYBRID: a per-FEATURE vertical slice for CDC -- which is a
+genuinely larger subsystem (infra deploy, MSK, connectors, offset seeding, DLQ,
+schema drift) -- and a per-LAYER split for Full Load and the shared parts:
+
+- Full Load: ``_full_load_engine`` (backend run engine, NiceGUI-free) + ``_full_load_ui``
+  (render). Core: :mod:`~dsql_migrator.core.exporter` + :mod:`~dsql_migrator.core.batched_import`.
+- CDC: ``_cdc_ui`` (control render), ``_cdc_monitoring`` (post-start monitoring / DLQ
+  render), ``_cdc_state`` (pure phase predicates), ``_cdc_status`` (status / controller /
+  teardown + a couple of shared job/error-log helpers that co-locate by cohesion). Core:
+  :mod:`~dsql_migrator.core.cdc` and siblings + :mod:`~dsql_migrator.core.msk_connect_controller`.
+- Shared, used by BOTH data paths (the Full Load -> CDC watermark handoff, prerequisites,
+  and table selection couple them, so they are ONE layer, not split by feature):
+  ``_models`` (pure view-models / formatters / enums), ``_state`` (per-session
+  :class:`DataMigrationState`), and this ``__init__`` (the
+  :func:`build_data_migration_screen` orchestrator that wires both steps into one journey).
+
+File count tracks intrinsic complexity, not symmetry: CDC's ~11 core modules vs Full
+Load's 2 reflect that CDC is a distributed-systems subsystem while Full Load is a tight
+stream -> batch-insert -> verify pipeline. Do NOT split Full Load further just to "match" CDC.
 """
 
 from __future__ import annotations
@@ -103,7 +124,7 @@ from dsql_migrator.ui.workflow import WorkflowStep, get_status, with_status
 
 # Full Load backend run engine (NiceGUI-free); re-exported so the package's
 # public import surface is unchanged.
-from dsql_migrator.ui.data_migration._engine import (
+from dsql_migrator.ui.data_migration._full_load_engine import (
     MigratorFactory,
     DataMigrationInputs,
     TableLoadResult,
@@ -208,7 +229,7 @@ from dsql_migrator.ui.data_migration._models import (
 # CDC status / controller / deploy-formatting logic (NiceGUI-free); re-exported so
 # the package's public import surface is unchanged and the render code below
 # resolves the pure helpers/constants it consumes.
-from dsql_migrator.ui.data_migration._status import (
+from dsql_migrator.ui.data_migration._cdc_status import (
     _current_job,
     _read_cdc_template_body,
     _CDC_ACTION_NOUN,

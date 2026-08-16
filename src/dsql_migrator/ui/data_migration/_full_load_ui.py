@@ -26,7 +26,7 @@ from dsql_migrator.core.target_connection import DsqlConnector
 from dsql_migrator.core.target_introspector import target_primary_keys, tables_with_rows
 from dsql_migrator.ui.design import inline_hint, render_notice
 from dsql_migrator.ui.workflow import WorkflowStep, with_status
-from dsql_migrator.ui.data_migration._engine import (
+from dsql_migrator.ui.data_migration._full_load_engine import (
     full_load_progress_caption,
     job_status_to_step_status,
 )
@@ -43,7 +43,7 @@ from dsql_migrator.ui.data_migration._models import (
     summarize_table_states,
     unsettled_table_names,
 )
-from dsql_migrator.ui.data_migration._status import (
+from dsql_migrator.ui.data_migration._cdc_status import (
     _current_job,
     full_load_error_records,
     full_load_error_summary,

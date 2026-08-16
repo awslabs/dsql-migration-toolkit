@@ -157,7 +157,7 @@ class _FakeMigrator:
         quarantined = self._quarantine_by_table.get(table.name, 0)
         if quarantined:
             from dsql_migrator.core.batched_import import QuarantineRecord
-            from dsql_migrator.ui.data_migration._engine import TableLoadResult
+            from dsql_migrator.ui.data_migration._full_load_engine import TableLoadResult
 
             return TableLoadResult(
                 rows_loaded=rows,
@@ -521,7 +521,7 @@ def test_slim_worker_inputs_keeps_only_this_tables_conversion_and_empty_inventor
     import dataclasses
 
     from dsql_migrator.core.models import SourceInventory
-    from dsql_migrator.ui.data_migration._engine import _slim_worker_inputs
+    from dsql_migrator.ui.data_migration._full_load_engine import _slim_worker_inputs
 
     full = dataclasses.replace(
         _inputs(),  # inventory has multiple tables (orders + customers)
@@ -544,7 +544,7 @@ def test_start_chunk_if_pending_is_idempotent_for_worker_started_signals() -> No
     # sibling already started it -- the later signals must NOT re-stamp started_at or
     # re-count the attempt (which would reset the table's elapsed/ETA).
     from dsql_migrator.core.models import ChunkState
-    from dsql_migrator.ui.data_migration._engine import (
+    from dsql_migrator.ui.data_migration._full_load_engine import (
         _find_chunk,
         _start_chunk_if_pending,
     )
@@ -853,7 +853,7 @@ def test_migrate_shard_in_process_maps_rows_skipped_from_conflicts(monkeypatch) 
     # rows_skipped from conflicts.
     import dataclasses
 
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     table = _tables()[0]  # orders
     inputs = dataclasses.replace(_inputs(), replace_tables=frozenset({table.name}))
@@ -1386,7 +1386,7 @@ def test_shard_worker_keys_on_the_target_composite_pk(monkeypatch) -> None:
     """
     import dataclasses
 
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     table = _tables()[0]  # orders, source PK (id)
     inputs = dataclasses.replace(
@@ -1434,7 +1434,7 @@ def test_shard_worker_leaves_an_unchanged_pk_to_the_source_fallback(monkeypatch)
     import dataclasses
 
     from dsql_migrator.core.converter import TableConversion
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     table = _tables()[0]
     plain = TableConversion(
@@ -1881,7 +1881,7 @@ def test_migrate_table_wires_resume_job_only_on_the_append_path() -> None:
 
 
 def test_views_referencing_selects_only_dependent_views() -> None:
-    from dsql_migrator.ui.data_migration._engine import _views_referencing
+    from dsql_migrator.ui.data_migration._full_load_engine import _views_referencing
 
     view_ddls = {
         "shop.customer_order_summary": (
@@ -1911,7 +1911,7 @@ def _patch_view_ddl_calls(monkeypatch, migrator):
     Patches the REAL functions the migrator calls (not a fake applier), so this
     test exercises the actual construction path -- the gap that let a broken
     ``SchemaApplier(...)`` slip through before (it required ``introspector``)."""
-    import dsql_migrator.ui.data_migration._engine as engine
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     dropped: list[str] = []
     recreated: list[tuple] = []
@@ -2267,7 +2267,7 @@ def test_cdc_teardown_in_flight_true_via_durable_marker_closes_race() -> None:
     # Concern #2: right after Start over → delete, the local deploy pointer is wiped
     # and the stack has NOT yet flipped to DELETE_IN_PROGRESS -- yet the durable
     # teardown marker (RUNNING) must still block a second Start over (race closed).
-    from dsql_migrator.ui.data_migration._status import cdc_teardown_in_flight
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_teardown_in_flight
 
     jm = _MultiJobJM({"td-1": "RUNNING"})
     assert (
@@ -2283,7 +2283,7 @@ def test_cdc_teardown_in_flight_true_via_durable_marker_closes_race() -> None:
 
 
 def test_cdc_teardown_in_flight_true_via_local_job_or_stack_status() -> None:
-    from dsql_migrator.ui.data_migration._status import cdc_teardown_in_flight
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_teardown_in_flight
 
     # (a) local stop/delete job still running.
     jm = _MultiJobJM({"dep-1": "RUNNING"})
@@ -2311,7 +2311,7 @@ def test_cdc_teardown_in_flight_true_via_local_job_or_stack_status() -> None:
 
 
 def test_cdc_teardown_in_flight_false_for_deploy_start_and_settled_states() -> None:
-    from dsql_migrator.ui.data_migration._status import cdc_teardown_in_flight
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_teardown_in_flight
 
     # A running Deploy/Start (kind infra/start) is NOT a teardown → not blocked
     # (re-discoverable; must not trap a user escaping a stuck run).
@@ -2355,7 +2355,7 @@ def test_cdc_teardown_in_flight_ignores_deploy_start_stack_status() -> None:
     # (UPDATE_IN_PROGRESS) drives the SAME stack through a live status but is NOT a
     # teardown -- it must NOT hard-block Start over (it only warns via
     # cdc_op_in_flight). Only DELETE_IN_PROGRESS counts as a stack-level teardown.
-    from dsql_migrator.ui.data_migration._status import cdc_teardown_in_flight
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_teardown_in_flight
 
     for kind, status in (
         ("start", "UPDATE_IN_PROGRESS"),
@@ -2389,7 +2389,7 @@ def test_should_replace_teardown_marker_ownership() -> None:
     # Single-slot marker must not be clobbered by a DIFFERENT still-running teardown
     # (rare two-tab race): keep the first, longer-lived one so the banner/guard don't
     # switch to a shorter job and prematurely clear tracking of the still-running one.
-    from dsql_migrator.ui.data_migration._status import (
+    from dsql_migrator.ui.data_migration._cdc_status import (
         should_replace_teardown_marker,
     )
 
@@ -2404,7 +2404,7 @@ def test_should_replace_teardown_marker_ownership() -> None:
 def test_cdc_teardown_banner_state_tracks_job_status() -> None:
     # running while PENDING/RUNNING; failed on FAILED/CANCELLED (actionable banner);
     # None when settled-ok/unknown (caller clears the marker + hides the banner).
-    from dsql_migrator.ui.data_migration._status import cdc_teardown_banner_state
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_teardown_banner_state
 
     assert cdc_teardown_banner_state(_MultiJobJM({}), None) is None  # no marker
     assert cdc_teardown_banner_state(_MultiJobJM({"j": "PENDING"}), "j") == "running"
@@ -2420,7 +2420,7 @@ def test_teardown_stack_confirmed_gone_only_on_definitive_absence() -> None:
     # CloudFormation definitively reports the stack does-not-exist (describe returns
     # None). A present stack (any state, incl. DELETE_FAILED), a raising/errored read,
     # or a missing deployer/name must NOT clear it (never hide a still-billing failure).
-    from dsql_migrator.ui.data_migration._status import teardown_stack_confirmed_gone
+    from dsql_migrator.ui.data_migration._cdc_status import teardown_stack_confirmed_gone
 
     class _Gone:
         def describe_stack_or_none(self, name):
@@ -2846,7 +2846,7 @@ def test_ensure_cdc_controller_detects_deployed_connectors_for_start_over() -> N
     # (triggered on Start-over from any step, not only the CDC step) must flip the
     # cached state so cdc_deployed becomes True and the tiles appear.
     from dsql_migrator.core.cdc import cdc_expected_connector_names
-    from dsql_migrator.ui.data_migration._status import _ensure_cdc_controller
+    from dsql_migrator.ui.data_migration._cdc_status import _ensure_cdc_controller
 
     state = DataMigrationState()
     stack = state.cdc_stack_name  # default stack name
@@ -2901,7 +2901,7 @@ def test_probe_cdc_stack_phase_populates_other_stacks(monkeypatch) -> None:
     # The render-time probe surfaces OTHER mysql-dsql-cdc-* stacks (name != mine) so
     # the card can offer to adopt an existing pipeline instead of deploying a duplicate.
     import dsql_migrator.core.cdc_deployer as deployer_mod
-    from dsql_migrator.ui.data_migration._status import _probe_cdc_stack_phase
+    from dsql_migrator.ui.data_migration._cdc_status import _probe_cdc_stack_phase
 
     state = DataMigrationState()  # default stack name
     mine = state.cdc_stack_name
@@ -2962,7 +2962,7 @@ def test_probe_cdc_stack_phase_reconciles_table_include_list(monkeypatch) -> Non
     # The render-time probe reflects the live stack's TableIncludeList onto the state
     # so an adopted pipeline resolves its tables (each entry is a table's .name).
     import dsql_migrator.core.cdc_deployer as deployer_mod
-    from dsql_migrator.ui.data_migration._status import _probe_cdc_stack_phase
+    from dsql_migrator.ui.data_migration._cdc_status import _probe_cdc_stack_phase
 
     state = DataMigrationState()
 
@@ -3590,7 +3590,7 @@ def test_infra_deploy_does_not_promote_data_migration_to_done() -> None:
     is what keeps the step at NOT_STARTED.
     """
     from dsql_migrator.ui.data_migration import cdc_streaming_started
-    from dsql_migrator.ui.data_migration._engine import data_migration_step_after_cdc
+    from dsql_migrator.ui.data_migration._full_load_engine import data_migration_step_after_cdc
     from dsql_migrator.ui.workflow import StepStatus
 
     state = DataMigrationState()
@@ -4136,7 +4136,7 @@ def test_discovery_fingerprint_tracks_every_field_discovery_writes() -> None:
     A field left out would make a real change look like "nothing happened", and the
     refresh that reveals it (e.g. the duplicate-MSK adopt guard) would be skipped.
     """
-    from dsql_migrator.ui.data_migration._status import cdc_discovery_fingerprint
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_discovery_fingerprint
 
     class _S:
         pass
@@ -4160,7 +4160,7 @@ def test_discovery_fingerprint_tracks_every_field_discovery_writes() -> None:
 def test_discovery_fingerprint_is_stable_when_nothing_changed() -> None:
     # The whole point: a re-probe that finds the same stack/connectors must compare
     # equal, so no rebuild happens and an in-flight click survives.
-    from dsql_migrator.ui.data_migration._status import cdc_discovery_fingerprint
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_discovery_fingerprint
 
     class _S:
         cdc_connector_names = ["mysql-source", "mysql-sink"]
@@ -4175,7 +4175,7 @@ def test_discovery_fingerprint_is_stable_when_nothing_changed() -> None:
 def test_discovery_fingerprint_compares_a_rebuilt_controller_as_unchanged() -> None:
     # The controller object is rebuilt on every probe, so comparing identity would
     # always look changed and defeat the skip entirely. Presence is what matters.
-    from dsql_migrator.ui.data_migration._status import cdc_discovery_fingerprint
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_discovery_fingerprint
 
     class _S:
         pass
@@ -4369,7 +4369,7 @@ def test_infra_stage_eta_includes_bucket_and_plugin_upload() -> None:
     # under-reported the wait -- the user's only signal during a ~15-20 min deploy that
     # is now a foreground action.
     from dsql_migrator.core.cdc_deployer import CDC_INFRA_STAGES
-    from dsql_migrator.ui.data_migration._status import _CDC_STAGE_ETA_SECONDS
+    from dsql_migrator.ui.data_migration._cdc_status import _CDC_STAGE_ETA_SECONDS
 
     etas = _CDC_STAGE_ETA_SECONDS["infra"]
     assert etas.get("ensure_bucket", 0) > 0
@@ -7166,7 +7166,7 @@ def test_cdc_deploy_card_superseded_hides_stale_interrupted_stages() -> None:
 
 
 def test_running_mine_filters_to_running_connectors_only() -> None:
-    from dsql_migrator.ui.data_migration._status import _running_mine
+    from dsql_migrator.ui.data_migration._cdc_status import _running_mine
 
     raw = [
         {"connectorName": "mysql-dsql-cdc-stack-debezium-source", "connectorState": "RUNNING"},
@@ -9055,7 +9055,7 @@ def test_default_table_recreator_uses_applied_conversion(monkeypatch) -> None:
     import dataclasses
 
     from dsql_migrator.core.converter import TableConversion
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     captured: dict[str, object] = {}
 
@@ -9131,7 +9131,7 @@ def _record_failure(log: ErrorLogStore, job_id: str) -> None:
 
 
 def test_finalize_run_quarantine_only_accepted_completes() -> None:
-    from dsql_migrator.ui.data_migration._engine import _finalize_run, _RunCounts
+    from dsql_migrator.ui.data_migration._full_load_engine import _finalize_run, _RunCounts
 
     log = ErrorLogStore()
     _record_quarantine(log, "j1", 1)
@@ -9147,7 +9147,7 @@ def test_finalize_run_quarantine_only_accepted_completes() -> None:
 
 
 def test_finalize_run_quarantine_only_not_accepted_raises() -> None:
-    from dsql_migrator.ui.data_migration._engine import (
+    from dsql_migrator.ui.data_migration._full_load_engine import (
         FullLoadIncompleteError,
         _finalize_run,
         _RunCounts,
@@ -9167,7 +9167,7 @@ def test_finalize_run_quarantine_only_not_accepted_raises() -> None:
 
 
 def test_finalize_run_real_failure_still_raises_even_if_accepted() -> None:
-    from dsql_migrator.ui.data_migration._engine import (
+    from dsql_migrator.ui.data_migration._full_load_engine import (
         FullLoadIncompleteError,
         _finalize_run,
         _RunCounts,
@@ -9188,7 +9188,7 @@ def test_finalize_run_real_failure_still_raises_even_if_accepted() -> None:
 
 
 def test_finalize_run_mixed_failure_and_quarantine_still_raises_when_accepted() -> None:
-    from dsql_migrator.ui.data_migration._engine import (
+    from dsql_migrator.ui.data_migration._full_load_engine import (
         FullLoadIncompleteError,
         _finalize_run,
         _RunCounts,
@@ -9209,7 +9209,7 @@ def test_finalize_run_mixed_failure_and_quarantine_still_raises_when_accepted() 
 
 
 def test_finalize_run_clean_completes() -> None:
-    from dsql_migrator.ui.data_migration._engine import _finalize_run, _RunCounts
+    from dsql_migrator.ui.data_migration._full_load_engine import _finalize_run, _RunCounts
 
     # Nothing failed/quarantined => completes regardless of the flag.
     _finalize_run(
@@ -9251,7 +9251,7 @@ def test_finalize_run_accepted_quarantine_syncs_identity_sequence() -> None:
     # THE BUG: an accepted-quarantine run is a COMPLETED load, so its identity
     # sequence must be advanced past MAX(pk) -- previously this branch returned without
     # syncing, leaving the sequence at nextval=1 and colliding after cut-over.
-    from dsql_migrator.ui.data_migration._engine import _finalize_run, _RunCounts
+    from dsql_migrator.ui.data_migration._full_load_engine import _finalize_run, _RunCounts
 
     log = ErrorLogStore()
     _record_quarantine(log, "jq", 1)
@@ -9271,7 +9271,7 @@ def test_finalize_run_accepted_quarantine_syncs_identity_sequence() -> None:
 
 def test_finalize_run_clean_still_syncs_identity_sequence() -> None:
     # Regression guard: the clean path must keep syncing (no change).
-    from dsql_migrator.ui.data_migration._engine import _finalize_run, _RunCounts
+    from dsql_migrator.ui.data_migration._full_load_engine import _finalize_run, _RunCounts
 
     spy = _SyncSpy()
     _finalize_run(
@@ -9290,7 +9290,7 @@ def test_finalize_run_clean_still_syncs_identity_sequence() -> None:
 def test_finalize_run_real_failure_does_not_sync_identity_sequence() -> None:
     # A partial/failed load must NOT sync: a later retry can still add rows, so MAX(pk)
     # is not yet final and syncing off it could let the remaining rows collide.
-    from dsql_migrator.ui.data_migration._engine import (
+    from dsql_migrator.ui.data_migration._full_load_engine import (
         FullLoadIncompleteError,
         _finalize_run,
         _RunCounts,
@@ -9315,7 +9315,7 @@ def test_finalize_run_real_failure_does_not_sync_identity_sequence() -> None:
 
 def test_finalize_run_quarantine_not_accepted_does_not_sync() -> None:
     # Not accepted => the run RAISES (incomplete), so nothing is "completed" to sync.
-    from dsql_migrator.ui.data_migration._engine import (
+    from dsql_migrator.ui.data_migration._full_load_engine import (
         FullLoadIncompleteError,
         _finalize_run,
         _RunCounts,
@@ -9346,7 +9346,7 @@ def test_finalize_run_quarantine_not_accepted_does_not_sync() -> None:
 
 def test_sync_identity_sequences_for_tables_syncs_and_filters_non_identity() -> None:
     from dsql_migrator.core.models import TargetConnectionConfig
-    from dsql_migrator.ui.data_migration._engine import (
+    from dsql_migrator.ui.data_migration._full_load_engine import (
         sync_identity_sequences_for_tables,
     )
 
@@ -9365,7 +9365,7 @@ def test_sync_identity_sequences_for_tables_syncs_and_filters_non_identity() -> 
 
 def test_sync_identity_sequences_for_tables_never_raises_and_no_tables_is_noop() -> None:
     from dsql_migrator.core.models import TargetConnectionConfig
-    from dsql_migrator.ui.data_migration._engine import (
+    from dsql_migrator.ui.data_migration._full_load_engine import (
         sync_identity_sequences_for_tables,
     )
 
@@ -9529,14 +9529,14 @@ class _FlakySourceMigrator:
         self.pre_recreated_seen.append(pre_recreated)
         if self.attempts <= self._fail_times:
             raise self._error
-        from dsql_migrator.ui.data_migration._engine import TableLoadResult
+        from dsql_migrator.ui.data_migration._full_load_engine import TableLoadResult
 
         return TableLoadResult(rows_loaded=7)
 
 
 def _no_backoff(monkeypatch) -> None:
     """Make the retry backoff zero so the tests don't actually sleep."""
-    import dsql_migrator.ui.data_migration._engine as engine
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     monkeypatch.setattr(engine._time, "sleep", lambda _s: None)
 
@@ -9544,7 +9544,7 @@ def _no_backoff(monkeypatch) -> None:
 def test_source_drop_retries_the_table_and_succeeds(monkeypatch) -> None:
     # An Aurora failover mid-load must be recovered automatically: the table is
     # re-read from a fresh snapshot instead of failing and waiting for a human.
-    from dsql_migrator.ui.data_migration._engine import (
+    from dsql_migrator.ui.data_migration._full_load_engine import (
         _migrate_table_with_source_retry,
     )
 
@@ -9561,7 +9561,7 @@ def test_source_drop_retries_the_table_and_succeeds(monkeypatch) -> None:
 def test_source_drop_gives_up_after_the_configured_attempts(monkeypatch) -> None:
     # The budget is bounded: a source that never comes back surfaces the real error
     # (so the table is FAILED and retryable by hand) instead of looping forever.
-    from dsql_migrator.ui.data_migration._engine import (
+    from dsql_migrator.ui.data_migration._full_load_engine import (
         _migrate_table_with_source_retry,
     )
 
@@ -9579,7 +9579,7 @@ def test_source_drop_gives_up_after_the_configured_attempts(monkeypatch) -> None
 
 def test_data_error_is_not_retried(monkeypatch) -> None:
     # A schema/data error fails identically forever, so retrying only adds delay.
-    from dsql_migrator.ui.data_migration._engine import (
+    from dsql_migrator.ui.data_migration._full_load_engine import (
         _migrate_table_with_source_retry,
     )
 
@@ -9601,7 +9601,7 @@ def test_data_error_is_not_retried(monkeypatch) -> None:
 
 def test_user_stop_is_not_retried(monkeypatch) -> None:
     # A cooperative stop is not a failure: it must propagate immediately.
-    from dsql_migrator.ui.data_migration._engine import (
+    from dsql_migrator.ui.data_migration._full_load_engine import (
         _FullLoadStopped,
         _migrate_table_with_source_retry,
     )
@@ -9627,10 +9627,10 @@ def test_user_stop_is_not_retried(monkeypatch) -> None:
 
 def test_retry_aborts_promptly_when_the_user_stops_mid_backoff(monkeypatch) -> None:
     # A Stop during the failover wait must not be ignored for the whole backoff.
-    from dsql_migrator.ui.data_migration._engine import (
+    from dsql_migrator.ui.data_migration._full_load_engine import (
         _migrate_table_with_source_retry,
     )
-    import dsql_migrator.ui.data_migration._engine as engine
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     handle = _RetryHandle()
     # The user presses Stop while the retry is sleeping.
@@ -9648,7 +9648,7 @@ def test_retry_aborts_promptly_when_the_user_stops_mid_backoff(monkeypatch) -> N
 
 def test_retry_disabled_by_config_fails_immediately(monkeypatch) -> None:
     # attempts=1 means "no retry" -- the documented way to keep the old behavior.
-    from dsql_migrator.ui.data_migration._engine import (
+    from dsql_migrator.ui.data_migration._full_load_engine import (
         _migrate_table_with_source_retry,
     )
 
@@ -9668,7 +9668,7 @@ def test_in_process_retry_drops_pre_recreated_on_a_retry(monkeypatch) -> None:
     # licenses a plain INSERT. After a failed attempt has written rows, that is no
     # longer true -- so a retry must NOT keep the flag, or the re-read would collide
     # with its own rows. (Regression guard for the multiprocess load path.)
-    import dsql_migrator.ui.data_migration._engine as engine
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     _no_backoff(monkeypatch)
     migrator = _FlakySourceMigrator(fail_times=1)
@@ -9692,7 +9692,7 @@ def test_in_process_retry_classifies_like_the_single_process_path(monkeypatch) -
     # The multiprocess path is the default for a large migration, so it must recover
     # from the same failover the single-process path does -- and likewise refuse to
     # retry a data error (a run must not behave differently per worker mode).
-    import dsql_migrator.ui.data_migration._engine as engine
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     _no_backoff(monkeypatch)
     calls = {"n": 0}
@@ -9725,7 +9725,7 @@ def test_failed_table_error_message_explains_a_dropped_source(monkeypatch) -> No
     # Part A: once the retries are exhausted, the recorded per-table error carries the
     # operator explanation, not just the raw driver text.
     from dsql_migrator.core.error_log import ErrorLogStore
-    from dsql_migrator.ui.data_migration._engine import _migrate_one_table
+    from dsql_migrator.ui.data_migration._full_load_engine import _migrate_one_table
 
     _no_backoff(monkeypatch)
     monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_SOURCE_RETRY_ATTEMPTS", "1")
@@ -9784,7 +9784,7 @@ def test_retry_releases_the_dead_source_stream_before_waiting(monkeypatch) -> No
     # until closed/collected -- and the raising frame keeps it referenced. If the
     # retry waited with it still open, a 16x8 fan-out would DOUBLE the source
     # connection count exactly when a just-promoted Aurora writer is most fragile.
-    import dsql_migrator.ui.data_migration._engine as engine
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     closed: list[str] = []
     sleeps: list[float] = []
@@ -9826,7 +9826,7 @@ def test_retry_releases_the_dead_source_stream_before_waiting(monkeypatch) -> No
 def test_migrate_table_closes_row_streams_on_failure() -> None:
     # Every caller benefits: migrate_table closes the streams it created when the
     # load raises, so the source connection is released as the exception leaves.
-    import dsql_migrator.ui.data_migration._engine as engine
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     closed: list[str] = []
     rows = _TrackingStream(closed, "rows")
@@ -9997,7 +9997,7 @@ def test_index_failures_are_logged_as_info_not_a_table_failure() -> None:
     # A missing index must not read as data loss: the entry goes to the error log so
     # the operator knows WHICH index is absent, but the table stays loaded.
     from dsql_migrator.core.error_log import ErrorLogStore
-    from dsql_migrator.ui.data_migration._engine import _record_index_failures
+    from dsql_migrator.ui.data_migration._full_load_engine import _record_index_failures
 
     log = ErrorLogStore()
     _record_index_failures(
@@ -10017,7 +10017,7 @@ def test_index_failures_are_logged_as_info_not_a_table_failure() -> None:
 
 def test_no_index_failures_logs_nothing() -> None:
     from dsql_migrator.core.error_log import ErrorLogStore
-    from dsql_migrator.ui.data_migration._engine import _record_index_failures
+    from dsql_migrator.ui.data_migration._full_load_engine import _record_index_failures
 
     log = ErrorLogStore()
     _record_index_failures(log, "job-1", "orders", [])
@@ -10026,7 +10026,7 @@ def test_no_index_failures_logs_nothing() -> None:
 
 
 def test_table_load_result_carries_index_failures() -> None:
-    from dsql_migrator.ui.data_migration._engine import TableLoadResult
+    from dsql_migrator.ui.data_migration._full_load_engine import TableLoadResult
 
     r = TableLoadResult(rows_loaded=10, index_failures=("ix_a: boom",))
     assert r.index_failures == ("ix_a: boom",)
@@ -10037,7 +10037,7 @@ def test_table_load_result_carries_index_failures() -> None:
 def test_worker_result_carries_index_failures_for_the_parent() -> None:
     # The multiprocess path must report missing indexes too, or a run would behave
     # differently depending on the worker mode.
-    from dsql_migrator.ui.data_migration._engine import _TableWorkerResult
+    from dsql_migrator.ui.data_migration._full_load_engine import _TableWorkerResult
 
     r = _TableWorkerResult(
         table_name="orders", status="DONE", index_failures=("ix_a: boom",)
@@ -10096,7 +10096,7 @@ def test_stack_status_needs_cleanup_keeps_the_banner_alive() -> None:
     previously cleared the teardown marker, so the cross-view banner went silent while
     the leftover MSK / NAT kept billing with nothing in the UI saying so.
     """
-    from dsql_migrator.ui.data_migration._status import stack_status_needs_cleanup
+    from dsql_migrator.ui.data_migration._cdc_status import stack_status_needs_cleanup
 
     assert stack_status_needs_cleanup("DELETE_FAILED") is True
     assert stack_status_needs_cleanup("ROLLBACK_COMPLETE") is True
@@ -10318,7 +10318,7 @@ def test_report_progress_never_blocks_on_a_full_queue() -> None:
     telemetry (deltas re-accrued by the next flush; authoritative totals come from the
     worker's return value), so dropping a message is harmless. Blocking was not.
     """
-    from dsql_migrator.ui.data_migration._engine import _report_progress
+    from dsql_migrator.ui.data_migration._full_load_engine import _report_progress
 
     class _FullQueue:
         def __init__(self):
@@ -10352,7 +10352,7 @@ def test_worker_progress_paths_use_the_nonblocking_helper() -> None:
     # progress_queue.put() anywhere in a worker re-introduces the deadlock.
     import inspect
 
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     src = inspect.getsource(_engine)
     assert "progress_queue.put(" not in src, (
@@ -10373,7 +10373,7 @@ def test_parallel_load_bounds_the_cancel_wait() -> None:
     """
     import inspect
 
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     src = inspect.getsource(_engine._migrate_tables_in_parallel)
     # Scope to the PROCESS path (the one that hung). The thread fallback above it is
@@ -10396,7 +10396,7 @@ def test_cleanup_sentinel_is_also_nonblocking() -> None:
     # very cleanup that is supposed to unwind the job.
     import inspect
 
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     src = inspect.getsource(_engine._migrate_tables_in_parallel)
     assert "_report_progress(progress_queue, _PROGRESS_SENTINEL)" in src
@@ -10410,7 +10410,7 @@ def test_multiprocess_planner_shards_only_cdc_coexisting_and_honors_reader_shard
     # the pool budget (remaining_slots), which ignored the off-switch and the ceiling.
     import inspect
 
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     src = inspect.getsource(_engine._migrate_tables_in_parallel)
     process_path = src[src.index("# Unified process-parallel path"):]
@@ -11458,7 +11458,7 @@ def test_each_quarantined_row_is_recorded_on_the_activity_log(monkeypatch) -> No
     in-memory: after a restart nothing said WHICH rows were lost, just a count. A row the
     migration can never recover on its own is exactly what an audit trail is for.
     """
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     captured: list[dict] = []
     monkeypatch.setattr(
@@ -11487,7 +11487,7 @@ def test_every_load_path_logs_quarantined_rows(monkeypatch) -> None:
     # so a path that skipped the audit entry would hide the worst cases.
     import inspect
 
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     src = inspect.getsource(_engine)
     # One definition + one call per load path.
@@ -11506,7 +11506,7 @@ def test_run_incomplete_names_the_tables_and_reasons(monkeypatch) -> None:
 
     from dsql_migrator.core.error_log import ErrorLogStore
     from dsql_migrator.core.models import DataErrorRecord
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     captured: list[dict] = []
     monkeypatch.setattr(
@@ -11551,7 +11551,7 @@ def test_excluded_lob_columns_are_logged_one_event_per_column(monkeypatch) -> No
     """
     import dataclasses
 
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     captured: list[dict] = []
     monkeypatch.setattr(
@@ -11585,7 +11585,7 @@ def test_excluded_lob_columns_retry_logs_only_scoped_tables(monkeypatch) -> None
     # tables it actually re-ran -- not re-announce exclusions for untouched tables.
     import dataclasses
 
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     captured: list[dict] = []
     monkeypatch.setattr(
@@ -11605,7 +11605,7 @@ def test_excluded_lob_columns_retry_logs_only_scoped_tables(monkeypatch) -> None
 
 def test_log_excluded_lob_columns_noop_without_inputs_or_exclusions(monkeypatch) -> None:
     # Legacy callers pass no inputs; a run with no exclusions logs nothing.
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     captured: list[str] = []
     monkeypatch.setattr(
@@ -11622,7 +11622,7 @@ def test_lob_excluded_note_echoes_columns_on_the_table_line() -> None:
     """The per-table ``load table`` detail echoes which columns were excluded."""
     import dataclasses
 
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     class _M:
         _inputs = dataclasses.replace(_inputs(), excluded_lob_columns={
@@ -11649,7 +11649,7 @@ def test_captured_watermark_is_logged_prefers_gtid(monkeypatch) -> None:
     captured (the coordinate a later CDC catch-up resumes from). It is now logged at
     INFO right after capture, preferring the GTID as the resume coordinate.
     """
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     captured: list[dict] = []
     monkeypatch.setattr(
@@ -11670,7 +11670,7 @@ def test_captured_watermark_is_logged_prefers_gtid(monkeypatch) -> None:
 
 def test_captured_watermark_falls_back_to_binlog_and_flags_approx(monkeypatch) -> None:
     from dsql_migrator.core.models import Watermark
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     captured: list[dict] = []
     monkeypatch.setattr(
@@ -11693,7 +11693,7 @@ def test_captured_watermark_falls_back_to_binlog_and_flags_approx(monkeypatch) -
 
 
 def test_captured_watermark_none_is_noop(monkeypatch) -> None:
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     captured: list = []
     monkeypatch.setattr(
@@ -11706,7 +11706,7 @@ def test_captured_watermark_none_is_noop(monkeypatch) -> None:
 
 def test_run_full_load_logs_the_captured_watermark(monkeypatch) -> None:
     # End-to-end: a real run emits a "watermark captured" event after "run started".
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     captured: list[str] = []
     monkeypatch.setattr(
@@ -12768,7 +12768,7 @@ def test_start_over_teardown_acts_on_every_stack_it_offered() -> None:
     all CDC infrastructure", the delete found nothing, and the operator was left paying
     for MSK / NAT behind a success toast.
     """
-    from dsql_migrator.ui.data_migration._status import cdc_teardown_stack_names
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_teardown_stack_names
 
     # The regression case: two discovered stacks, none under this session's own name.
     two = cdc_teardown_stack_names(
@@ -12813,7 +12813,7 @@ def test_cdc_teardown_plan_covers_every_stack_and_cleans_the_secret_once() -> No
       so CloudFormation cannot own it, and re-scheduling an already-scheduled secret
       delete fails for every extra stack.
     """
-    from dsql_migrator.ui.data_migration._status import cdc_teardown_plan
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_teardown_plan
 
     plan = cdc_teardown_plan(["cdc-a", "cdc-b", "cdc-c"], cleanup_secret=True)
     # EVERY stack is torn down, in the offered order.
@@ -12898,7 +12898,7 @@ def test_attach_scope_mismatch_is_asymmetric() -> None:
     it may serve another table set in parallel and nothing this session owns is left
     uncovered.
     """
-    from dsql_migrator.ui.data_migration._status import cdc_attach_scope_mismatch
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_attach_scope_mismatch
 
     streamed = ["ecommerce_demo.orders", "ecommerce_demo.products"]
 
@@ -12918,7 +12918,7 @@ def test_attach_scope_mismatch_never_blocks_on_unknowns() -> None:
     # An un-probed candidate has no TableIncludeList, and a session with no confirmed
     # selection has nothing to compare -- neither may be reported as a mismatch, or a
     # readable-but-unprobed stack would become permanently unattachable.
-    from dsql_migrator.ui.data_migration._status import cdc_attach_scope_mismatch
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_attach_scope_mismatch
 
     assert cdc_attach_scope_mismatch([], ["ecommerce.orders"]) == []
     assert cdc_attach_scope_mismatch(["ecommerce.orders"], []) == []
@@ -13559,7 +13559,7 @@ def test_cdc_committed_offset_signal_distinguishes_stopped_from_fresh() -> None:
     which is pinned to a FIXED name and therefore survives a Stop -- so a restart needs no
     watermark at all.
     """
-    from dsql_migrator.ui.data_migration._status import cdc_has_committed_offset
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_has_committed_offset
 
     # Fresh infra: nothing has streamed, so a start point IS required.
     assert cdc_has_committed_offset(
@@ -13594,7 +13594,7 @@ def test_probe_records_the_committed_offset_signal_on_state() -> None:
     permanently on the first-start path -- Start CDC dead after a Stop -- with a fully
     green suite. Asserted through the real probe, from a fake describe.
     """
-    from dsql_migrator.ui.data_migration import _status
+    from dsql_migrator.ui.data_migration import _cdc_status as _status
 
     class _Discovery:
         def __init__(self, params):
@@ -13845,7 +13845,7 @@ def test_identity_sequence_sync_runs_only_after_a_complete_load() -> None:
     But syncing an INCOMPLETE load would set the sequence from a partial high-water mark,
     and the rows still to come could then collide -- so it is gated on completion.
     """
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     calls: list = []
 
@@ -13897,7 +13897,7 @@ def test_identity_sequence_sync_runs_only_after_a_complete_load() -> None:
 
 def test_identity_sequence_sync_never_fails_a_completed_load() -> None:
     """A load that finished correctly must not be reported FAILED over this follow-up."""
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     class _Inputs:
         target_config = object()
@@ -13929,7 +13929,7 @@ def test_identity_sequence_sync_is_wired_into_both_load_paths() -> None:
     import ast
     import inspect
 
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     tree = ast.parse(inspect.getsource(_engine))
     by_name = {
@@ -14502,7 +14502,7 @@ class _WorkflowSess:
 
 def _discover_with_connectors(names, *, cdc_status):
     """Run the pre-wired discovery branch with ``names`` present on AWS."""
-    from dsql_migrator.ui.data_migration._status import _ensure_cdc_controller
+    from dsql_migrator.ui.data_migration._cdc_status import _ensure_cdc_controller
 
     state = DataMigrationState()
 
@@ -14590,7 +14590,7 @@ def test_cdc_step_drops_back_on_a_freshly_built_controller_too() -> None:
     build-then-list branch -- exactly when a stale persisted "CDC: IN_PROGRESS" is on
     screen. Covering only the pre-wired branch left that case broken.
     """
-    from dsql_migrator.ui.data_migration import _status
+    from dsql_migrator.ui.data_migration import _cdc_status as _status
     from dsql_migrator.ui.workflow import WorkflowStep, get_status
 
     class _Ctl:
@@ -14625,7 +14625,7 @@ def _mixed_error_log(state, *, full_load: int = 3, cdc: int = 0):
     never sets it. Returns the shared log key both sources use.
     """
     from dsql_migrator.core.models import DataErrorRecord
-    from dsql_migrator.ui.data_migration._status import cdc_error_log_key
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_error_log_key
 
     key = cdc_error_log_key(state)
     for i in range(full_load):
@@ -14661,7 +14661,7 @@ def test_full_load_quarantines_are_not_counted_as_dead_letter_records() -> None:
     who had just excluded the oversized column read the non-zero count as "the exclusion
     failed" -- when a zero CDC count is the proof that it worked.
     """
-    from dsql_migrator.ui.data_migration._status import cdc_dlq_summary
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_dlq_summary
 
     state = DataMigrationState()
     state.job_id = "job-fullload-1"  # a Full Load ran this session
@@ -14678,7 +14678,7 @@ def test_full_load_quarantines_are_not_counted_as_dead_letter_records() -> None:
 def test_real_dead_letter_records_are_still_counted() -> None:
     # The control: filtering must not hide genuine CDC quarantines, which is the whole
     # purpose of the panel.
-    from dsql_migrator.ui.data_migration._status import cdc_dlq_summary
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_dlq_summary
 
     state = DataMigrationState()
     state.job_id = "job-fullload-1"
@@ -14695,7 +14695,7 @@ def test_dlq_record_list_shows_only_cdc_rows() -> None:
     A filtered count over an unfiltered list would be worse than the original bug: the
     badge would say 0 while three rows sat underneath it.
     """
-    from dsql_migrator.ui.data_migration._status import cdc_dlq_records
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_dlq_records
 
     state = DataMigrationState()
     state.job_id = "job-fullload-1"
@@ -14710,7 +14710,7 @@ def test_cdc_dlq_records_memoizes_on_append_only_count() -> None:
     the whole (uncapped) error log must run only when a NEW record arrived, not on
     every call with an unchanged append-only count."""
     from dsql_migrator.core.models import DataErrorRecord
-    from dsql_migrator.ui.data_migration._status import cdc_dlq_records
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_dlq_records
 
     state = DataMigrationState()
     state.job_id = "job-fullload-1"
@@ -14762,7 +14762,7 @@ def test_cdc_error_download_label_and_payload_exclude_full_load_rows() -> None:
         f"label must count CDC records only; got {joined!r}"
     )
     # And the bytes the button would produce carry no Full Load row.
-    from dsql_migrator.ui.data_migration._status import cdc_dlq_records
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_dlq_records
 
     payload = state.error_log.render_records(cdc_dlq_records(state, key)).decode()
     assert "product_media" not in payload
@@ -14901,7 +14901,7 @@ def test_full_load_pointer_is_rendered_by_the_dlq_panel() -> None:
         build_cdc_status_view,
     )
     from dsql_migrator.ui.data_migration import _cdc_ui
-    from dsql_migrator.ui.data_migration._status import cdc_dlq_summary
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_dlq_summary
 
     state = DataMigrationState()
     state.job_id = "job-fullload-1"
@@ -14930,7 +14930,7 @@ def test_full_load_error_log_excludes_dead_lettered_cdc_rows() -> None:
     made "Download Full Load error log (5 errors)" out of 3 Full Load quarantines and 2
     dead-lettered rows -- reading at cut-over as "the Full Load lost 5 rows".
     """
-    from dsql_migrator.ui.data_migration._status import full_load_error_summary
+    from dsql_migrator.ui.data_migration._cdc_status import full_load_error_summary
 
     state = DataMigrationState()
     state.job_id = "job-fullload-1"
@@ -14947,7 +14947,7 @@ def test_the_two_screens_partition_the_error_log_exactly() -> None:
     This is the property that makes filtering both directions correct rather than just
     moving the miscount around.
     """
-    from dsql_migrator.ui.data_migration._status import (
+    from dsql_migrator.ui.data_migration._cdc_status import (
         cdc_dlq_summary,
         full_load_error_summary,
     )
@@ -15004,7 +15004,7 @@ def test_full_load_latest_messages_ignores_cdc_records() -> None:
     CDC record become a Full Load table's displayed failure reason.
     """
     from dsql_migrator.core.models import DataErrorRecord
-    from dsql_migrator.ui.data_migration._status import full_load_latest_messages
+    from dsql_migrator.ui.data_migration._cdc_status import full_load_latest_messages
 
     state = DataMigrationState()
     state.job_id = "job-fullload-1"
@@ -15100,7 +15100,7 @@ def test_per_table_quarantined_column_still_counts_real_dlq_rows() -> None:
     _mixed_error_log(state, full_load=3, cdc=0)
     # Two dead-lettered rows for the table the table lists (no chunk_id -> CDC).
     from dsql_migrator.core.models import DataErrorRecord
-    from dsql_migrator.ui.data_migration._status import cdc_error_log_key
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_error_log_key
 
     for i in range(2):
         state.error_log.record(
@@ -15124,7 +15124,7 @@ def test_per_table_column_and_dlq_card_agree() -> None:
 
     They read the same key, so the invariant is that both go through the same filter.
     """
-    from dsql_migrator.ui.data_migration._status import (
+    from dsql_migrator.ui.data_migration._cdc_status import (
         cdc_dlq_summary,
         cdc_error_log_key,
     )
@@ -15616,7 +15616,7 @@ def _render_deploy_stages_for(kind, *, running_stage="stack_delete"):
     """Render the CDC stage-progress card for ``kind`` mid-run and return the double."""
     from dsql_migrator.core.models import ChunkState, MigrationJob
     from dsql_migrator.ui.data_migration import _cdc_ui
-    from dsql_migrator.ui.data_migration._status import _CDC_STAGE_LABELS
+    from dsql_migrator.ui.data_migration._cdc_status import _CDC_STAGE_LABELS
 
     stage_ids = list(_CDC_STAGE_LABELS[kind].keys())
     chunks = []
@@ -15981,12 +15981,12 @@ class _MemHandle:
 
 def test_memory_pressure_logger_noop_off_fargate(monkeypatch, caplog) -> None:
     # No cgroup memory file (macOS/dev) -> disabled, samples nothing, never logs.
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     monkeypatch.setattr(_engine, "_read_cgroup_memory", lambda: None)
     logger = _engine._MemoryPressureLogger(_MemHandle([]))
     assert logger._enabled is False
-    with caplog.at_level("INFO", logger="dsql_migrator.ui.data_migration._engine"):
+    with caplog.at_level("INFO", logger="dsql_migrator.ui.data_migration._full_load_engine"):
         logger.sample()
         logger.sample()
     assert not [r for r in caplog.records if "memory" in r.getMessage().lower()]
@@ -15995,7 +15995,7 @@ def test_memory_pressure_logger_noop_off_fargate(monkeypatch, caplog) -> None:
 def test_memory_pressure_logger_high_water_info_and_80pct_warning(monkeypatch, caplog) -> None:
     # A climbing usage logs a new high-water at INFO, then a single WARNING once it
     # crosses 80% of the limit, tagging the currently-loading table.
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     limit = 1024 * 1024 * 1024  # 1 GiB task limit
     readings = iter([
@@ -16017,7 +16017,7 @@ def test_memory_pressure_logger_high_water_info_and_80pct_warning(monkeypatch, c
     # so the probe above doesn't consume a tick).
     ticks = iter([0.0, 1000.0, 2000.0, 3000.0])
     monkeypatch.setattr(_engine._time, "monotonic", lambda: next(ticks))
-    with caplog.at_level("INFO", logger="dsql_migrator.ui.data_migration._engine"):
+    with caplog.at_level("INFO", logger="dsql_migrator.ui.data_migration._full_load_engine"):
         logger.sample()  # 270 -> INFO high-water
         logger.sample()  # 270 -> nothing
         logger.sample()  # 900 -> INFO high-water + WARNING
@@ -16042,7 +16042,7 @@ def test_memory_pressure_logger_high_water_info_and_80pct_warning(monkeypatch, c
 def test_memory_pressure_warning_rearms_only_after_receding(monkeypatch, caplog) -> None:
     # The WARNING fires once, does not repeat while still high, and re-arms after usage
     # drops below the re-arm threshold (so a run hovering near the limit doesn't flap).
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     limit = 1000 * 1024 * 1024
     readings = iter([
@@ -16057,7 +16057,7 @@ def test_memory_pressure_warning_rearms_only_after_receding(monkeypatch, caplog)
     # AFTER __init__ so the probe doesn't consume a tick.
     ticks = iter([0.0, 100.0, 200.0, 300.0, 400.0])
     monkeypatch.setattr(_engine._time, "monotonic", lambda: next(ticks))
-    with caplog.at_level("WARNING", logger="dsql_migrator.ui.data_migration._engine"):
+    with caplog.at_level("WARNING", logger="dsql_migrator.ui.data_migration._full_load_engine"):
         for _ in range(4):
             logger.sample()
 
@@ -16067,7 +16067,7 @@ def test_memory_pressure_warning_rearms_only_after_receding(monkeypatch, caplog)
 
 def test_read_cgroup_memory_prefers_v2_and_handles_max(monkeypatch, tmp_path) -> None:
     # v2 "max" (unlimited) -> limit None; a numeric max -> that limit.
-    from dsql_migrator.ui.data_migration import _engine
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     cur = tmp_path / "memory.current"
     mx = tmp_path / "memory.max"

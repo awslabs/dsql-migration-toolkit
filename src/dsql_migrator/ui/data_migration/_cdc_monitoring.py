@@ -41,7 +41,7 @@ from dsql_migrator.ui.data_migration._models import (
     lob_exclusion_candidates,
     per_table_counts_notice_body,
 )
-from dsql_migrator.ui.data_migration._status import (
+from dsql_migrator.ui.data_migration._cdc_status import (
     _CDC_TONE_STYLE,
     _apply_cdc_status,
     _cdc_status_view,

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from dsql_migrator.ui.data_migration._status import _current_job
+from dsql_migrator.ui.data_migration._cdc_status import _current_job
 
 # How often the CDC step polls MSK Connect + the DSQL target for live status.
 # Slower than the Full Load poll: these are network round-trips to AWS/DSQL, and

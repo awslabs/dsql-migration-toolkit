@@ -2165,7 +2165,7 @@ def _finalize_run(
     # an unfiltered read could attribute a dead-lettered row's reason to a table in a
     # FULL_LOAD activity-log line. The quarantine count above is already safe (it keys
     # on the "quarantined row pk[" prefix, which only the Full Load writers emit).
-    from dsql_migrator.ui.data_migration._status import full_load_error_records
+    from dsql_migrator.ui.data_migration._cdc_status import full_load_error_records
 
     for record in full_load_error_records(error_log, job_id):
         table = str(getattr(record, "table", "") or "?")

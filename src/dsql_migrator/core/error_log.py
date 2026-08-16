@@ -74,7 +74,7 @@ class InMemoryErrorLogBackend:
         Lets a hot caller (the CDC poll's DLQ surface) cheaply detect whether new
         records arrived -- the log is append-only, so an unchanged count means an
         unchanged view -- instead of copying + re-filtering the whole growing list
-        on every ~5 s poll. See :func:`dsql_migrator.ui.data_migration._status.cdc_dlq_records`.
+        on every ~5 s poll. See :func:`dsql_migrator.ui.data_migration._cdc_status.cdc_dlq_records`.
         """
         with self._lock:
             return len(self._by_job.get(job_id, ()))

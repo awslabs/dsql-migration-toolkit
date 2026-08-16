@@ -80,7 +80,7 @@ from dsql_migrator.ui.data_migration._models import (
     lob_exclusion_candidates,
     per_table_counts_notice_body,
 )
-from dsql_migrator.ui.data_migration._status import (
+from dsql_migrator.ui.data_migration._cdc_status import (
     _CDC_ACTION_NOUN,
     _CDC_ACTION_TERMINAL,
     _CDC_ACTION_TITLE,

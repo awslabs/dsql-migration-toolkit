@@ -36,7 +36,7 @@ from dsql_migrator.core.models import (
 )
 
 from dsql_migrator.ui.data_migration._models import MigrationType
-from dsql_migrator.ui.data_migration._status import CdcActivitySummary
+from dsql_migrator.ui.data_migration._cdc_status import CdcActivitySummary
 
 
 class DataMigrationState:

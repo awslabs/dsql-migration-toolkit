@@ -5,6 +5,27 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.352
+
+### Changed
+
+- **data_migration パッケージのレイアウトを一貫かつ正直に整理(動作変更なし)、アーキテクチャ
+  レビューの反映。** このパッケージはハイブリッド(CDC は `_cdc_*` のフィーチャスライス、残りは
+  レイヤ)で、2つの名前が誤解を招いていました。一貫した正直な規約へ改名:
+  `ui/data_migration/_engine.py` → **`_full_load_engine.py`**(Full Load バックエンドエンジン。
+  `_full_load_ui.py` と対称)、`ui/data_migration/_status.py` → **`_cdc_status.py`**(ほぼ全て
+  CDC なのに generic 名がそれを隠していた)。すべての importer(src+テスト)を更新;private
+  サブモジュールのため re-export シムなし。意図したレイアウトをパッケージ `__init__` docstring に
+  文書化 — CDC はより大きなサブシステムなので正当に多くのファイルにまたがり
+  (`_cdc_ui`/`_cdc_monitoring`/`_cdc_state`/`_cdc_status` + `core/cdc*`)、Full Load はタイトな
+  パイプライン(`_full_load_engine`/`_full_load_ui` + `core/exporter`/`batched_import`)、
+  `_models`/`_state` は Full Load → CDC の watermark ハンドオフで結合された共有レイヤ — つまり
+  ファイル数は強制的な対称性ではなく本質的な複雑さに従います。`full_load_error_*` リーダーと
+  `_current_job` は意図的に `_cdc_status` から移動しませんでした:FL/CDC のエラーログビューが
+  `is_cdc_error_record` を共有するため(移動すると凝集が壊れ、CDC 述語が FL モジュールへ引き込まれる)、
+  また `_current_job` の主な利用者は `_cdc_status` 自身だからです — 代わりにモジュール docstring が
+  この範囲を正直に明示します。
+
 ## v0.1.351
 
 ### Changed

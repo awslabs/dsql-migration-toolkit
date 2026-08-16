@@ -5,6 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.352
+
+### Changed
+
+- **data_migration 패키지 레이아웃을 일관되고 정직하게 정리(동작 변경 없음), 아키텍처 리뷰 반영.**
+  이 패키지는 하이브리드(CDC는 `_cdc_*` 피처 슬라이스, 나머지는 레이어)였고 이름 2개가 오해를
+  일으켰습니다. 일관·정직한 컨벤션으로 개명: `ui/data_migration/_engine.py` →
+  **`_full_load_engine.py`**(Full Load 백엔드 엔진 — 이제 `_full_load_ui.py`와 대칭),
+  `ui/data_migration/_status.py` → **`_cdc_status.py`**(사실상 전부 CDC인데 generic 이름이
+  이를 숨김). 모든 importer(src+테스트) 갱신; private 서브모듈이라 re-export shim 없음. 의도된
+  레이아웃을 패키지 `__init__` docstring에 문서화 — CDC는 더 큰 서브시스템이라 정당하게 더 많은
+  파일에 걸침(`_cdc_ui`/`_cdc_monitoring`/`_cdc_state`/`_cdc_status` + `core/cdc*`), Full Load는
+  타이트한 파이프라인(`_full_load_engine`/`_full_load_ui` + `core/exporter`/`batched_import`),
+  `_models`/`_state`는 Full Load → CDC watermark 핸드오프로 결합된 공용 레이어 — 즉 파일 수는
+  강제 대칭이 아니라 본질적 복잡도를 따릅니다. `full_load_error_*` 리더와 `_current_job`은 의도적으로
+  `_cdc_status`에서 옮기지 않음: FL/CDC 에러로그 뷰가 `is_cdc_error_record`를 공유하므로(옮기면
+  응집이 깨지고 CDC predicate가 FL 모듈로 끌려감), `_current_job`의 주 사용자는 `_cdc_status`
+  자신이기 때문 — 대신 모듈 docstring이 이 범위를 정직하게 명시합니다.
+
 ## v0.1.351
 
 ### Changed
