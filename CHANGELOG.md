@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.345
+
+### Changed
+
+- **The default `ContainerImageUri` now points at the freshly republished `0.1.344` ECR
+  Public image** (was `0.1.338`). The `0.1.344` image was republished to all three registries
+  (ECR Public `z0q0i9j0`, and the private us-east-1 / ap-northeast-2 repos), so a fresh
+  `git clone` deploy pulls a current build with the post-load index-creation fix and the
+  Validation review fixes (0.1.340–0.1.344) baked in, instead of the older `0.1.338` default.
+  A republish is not required for every patch (the drift guard tolerates being a few patches
+  behind); this refreshes it after a batch of behavior fixes.
+
 ## v0.1.344
 
 ### Fixed
