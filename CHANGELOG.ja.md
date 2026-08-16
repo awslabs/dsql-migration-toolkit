@@ -5,6 +5,21 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.349
+
+### Changed
+
+- **保守性リファクタリング(動作変更なし)、リファクタリング機会バックログの反映。**
+  `ui/schema_conversion.py`(5077 → 3977行)から、NiceGUI 非依存のスキーマ適用エンジンを新モジュール
+  `ui/schema_conversion_apply.py` へ分離: 適用コントラクト(`ApplyMode`/`ApplyObject`/`SchemaApplier`
+  プロトコル)、OCC リトライのオーケストレーション(`run_schema_apply` +
+  `build_apply_objects`/複合・恒等変換ファミリ)、AI 支援の変換ユニットビルダー、
+  `split_sql_statements`、および `DsqlSchemaApplier` アダプタ + `default_applier_factory`。これは
+  NiceGUI 依存のない純粋なドメイン/適用ロジック(ファイル中で最も単体テストされている部分)で、
+  画面ビルダーとレンダーヘルパーは残ります。単方向(新モジュールは stdlib + `core.*` +
+  `ui.ai_assist` のみ import、逆参照なし)。`schema_conversion.py` が移動したすべての名前を
+  re-export するため、すべての利用側/テストの import はそのまま解決します。動作変更なし。
+
 ## v0.1.348
 
 ### Changed

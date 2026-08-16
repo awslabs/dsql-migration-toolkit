@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.349
+
+### Changed
+
+- **유지보수 리팩터(동작 변경 없음), 리팩터 기회 백로그 반영.** `ui/schema_conversion.py`
+  (5077 → 3977줄)에서 NiceGUI-무관 스키마 적용 엔진을 새 모듈 `ui/schema_conversion_apply.py`로
+  분리: 적용 계약(`ApplyMode`/`ApplyObject`/`SchemaApplier` 프로토콜), OCC 재시도 오케스트레이션
+  (`run_schema_apply` + `build_apply_objects`/복합-·항등-변환 계열), AI 보조 변환 단위 빌더,
+  `split_sql_statements`, 그리고 `DsqlSchemaApplier` 어댑터 + `default_applier_factory`. 이는
+  NiceGUI 의존이 없는 순수 도메인/적용 로직(파일에서 가장 많이 단위 테스트되는 부분)이며, 화면
+  빌더와 렌더 헬퍼는 그대로 남습니다. 단방향(새 모듈은 stdlib + `core.*` + `ui.ai_assist`만 import,
+  역참조 없음). `schema_conversion.py`가 이동한 모든 이름을 re-export하므로 모든 소비자/테스트
+  import은 그대로 동작합니다. 동작 변경 없음.
+
 ## v0.1.348
 
 ### Changed

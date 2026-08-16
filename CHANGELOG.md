@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.349
+
+### Changed
+
+- **Maintainability refactor (no behavior change), from the refactor-opportunity backlog.**
+  Extracted the NiceGUI-agnostic schema-apply engine out of `ui/schema_conversion.py`
+  (5077 → 3977 lines) into a new `ui/schema_conversion_apply.py`: the apply contracts
+  (`ApplyMode`/`ApplyObject`/`SchemaApplier` protocols), the OCC-retrying orchestration
+  (`run_schema_apply` + the `build_apply_objects` / composite-/identity-conversion family),
+  the AI-assisted conversion-unit builders, `split_sql_statements`, and the `DsqlSchemaApplier`
+  adapter + `default_applier_factory`. This is pure domain/apply logic with no NiceGUI
+  dependency (the most heavily unit-tested part of the file); the screen builder and render
+  helpers stay. One-directional (the new module imports only stdlib + `core.*` + `ui.ai_assist`,
+  never back). `schema_conversion.py` re-exports every moved name, so all consumer/test imports
+  resolve unchanged. No behavior change.
+
 ## v0.1.348
 
 ### Changed
