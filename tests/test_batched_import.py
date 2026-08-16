@@ -93,6 +93,11 @@ class _FakeStore:
     insert_failures: list[str] = field(default_factory=list)
     # Index names whose CREATE INDEX must fail (simulates DSQL's 24-index limit).
     failing_index_names: set = field(default_factory=set)
+    # Number of NEWLY-created connections that should die on their first DDL
+    # execute (and stay dead for every later execute on that same instance),
+    # simulating DSQL force-closing a connection that crossed its ~60-min max
+    # connection duration. A fresh connection minted afterwards works normally.
+    ddl_kill_connections_remaining: int = 0
     poison_keys: set = field(default_factory=set)
     connections_created: int = 0
     select_calls: int = 0
@@ -134,6 +139,13 @@ class _FakeConnection:
         self._key_columns = key_columns
         self.autocommit = True
         self.closed = False
+        # Claim a "dies on first DDL" flag if any are still budgeted, so ONLY the
+        # first N connections created (not their fresh replacements) force-close.
+        with store.lock:
+            self._ddl_dies_on_first_use = store.ddl_kill_connections_remaining > 0
+            if self._ddl_dies_on_first_use:
+                store.ddl_kill_connections_remaining -= 1
+        self._dead = False
 
     def cursor(self) -> _FakeCursor:
         return _FakeCursor(self)
@@ -143,6 +155,15 @@ class _FakeConnection:
     ) -> None:
         text = query if isinstance(query, str) else query.as_string(None)
         if "CREATE" in text and "INDEX" in text:
+            # A connection DSQL force-closed stays dead: every execute on this same
+            # instance raises a no-SQLSTATE connection drop (a transient error), so
+            # a fix that reuses the dead connection keeps failing while one that
+            # re-leases a fresh connection recovers.
+            if self._dead or self._ddl_dies_on_first_use:
+                self._dead = True
+                raise Exception(
+                    "server closed the connection unexpectedly"
+                )  # no sqlstate -> transient connection drop
             if any(name in text for name in self._store.failing_index_names):
                 error = Exception(
                     "more than 24 indexes per table are not allowed"
@@ -1551,6 +1572,36 @@ def test_clean_load_reports_no_index_failures() -> None:
     result = importer.import_rows(_rows(3), _table(), index_ddls=_index_ddls())
     assert result.indexes_created == 2
     assert result.index_failures == []
+
+
+def test_index_creation_recovers_from_an_aged_out_connection_drop() -> None:
+    # Regression (found by the connection/UI-wiring review): a large-table load can
+    # run past DSQL's ~60-min max connection duration, after which DSQL force-closes
+    # a pooled connection with no SQLSTATE. The post-load index loop used to hold ONE
+    # lease for every DDL and retry only on OCC 40001, so a mid-loop drop propagated
+    # (not retried) and every REMAINING index was reused-on-the-dead-connection and
+    # reported failed -- even though the data was complete and a reconnect would have
+    # built them. The loop now leases a fresh connection per DDL and treats a
+    # connection drop as retryable, so it recovers on a new connection.
+    store = _FakeStore()
+    store.ddl_kill_connections_remaining = 1  # the first connection dies on its DDL
+    importer = _importer(
+        store,
+        ["id", "name"],
+        ["id"],
+        options=BatchedImportOptions(batch_size=10, parallelism=1),
+    )
+
+    result = importer.import_rows(_rows(3), _table(), index_ddls=_index_ddls())
+
+    # Data is complete, and BOTH indexes are built on a fresh connection -- no
+    # index is spuriously reported failed because of the aged-out connection.
+    assert result.rows_loaded == 3
+    assert result.indexes_created == 2
+    assert result.index_failures == []
+    assert store.executed_ddls == _index_ddls()
+    # A fresh connection was minted after the drop (the dead one was not reused).
+    assert store.connections_created >= 2
 
 
 def test_index_name_is_extracted_for_the_failure_message() -> None:

@@ -1442,28 +1442,47 @@ class BatchedImporter:
         independently (one bad index no longer stops the remaining ones) and the
         failures are returned for the caller to surface as a warning.
         """
+        # Lease a FRESH connection INSIDE each retried unit -- mirroring the data
+        # path (``_execute_insert``, which leases per attempt) -- and pass the wider
+        # ``retryable`` predicate so a transient/aged-out connection drop is retried
+        # against a NEW connection. Two things went wrong when this loop instead held
+        # ONE lease for every DDL and used the default (OCC-``40001``-only) retry
+        # predicate: (1) a connection-level drop carries no ``40001`` SQLSTATE, so it
+        # was never retried -- it propagated on the first attempt; and (2) the
+        # per-DDL ``except`` below swallowed it and the loop kept reusing the SAME
+        # (now dead) connection object, so once a pooled connection crossed DSQL's
+        # ~60-min max connection duration mid-load, EVERY remaining index for the
+        # table was reported failed even though the data was complete and a reconnect
+        # would have built them. Leasing per DDL (a drop closes the connection and
+        # refills the slot, so the next lease / retry mints a fresh one) plus
+        # ``retryable=_is_retryable_load_error`` fixes both: a transient drop is
+        # retried on a fresh connection, and no dead connection is reused across DDLs.
+        def _run_ddl(ddl: str) -> None:
+            with pool.lease() as connection:
+                _execute_ddl(connection, ddl)
+
         retried = with_occ_retry(
             max_attempts=self._occ_max_attempts,
             base_delay=self._occ_base_delay,
             sleep=self._sleep,
             jitter=self._jitter,
-        )(_execute_ddl)
+            retryable=_is_retryable_load_error,
+        )(_run_ddl)
         created = 0
         failures: list[str] = []
-        with pool.lease() as connection:
-            for ddl in index_ddls:
-                try:
-                    retried(connection, ddl)
-                except Exception as exc:  # noqa: BLE001 - isolate per-index failure
-                    # Log-safe: the DDL is tool-generated (no row values, no
-                    # credentials) and the driver message is a schema-level error.
-                    failures.append(f"{_index_name_of(ddl)}: {_safe_error(exc)}")
-                    _LOGGER.warning(
-                        "Post-load index creation failed (data is unaffected): %s",
-                        failures[-1],
-                    )
-                else:
-                    created += 1
+        for ddl in index_ddls:
+            try:
+                retried(ddl)
+            except Exception as exc:  # noqa: BLE001 - isolate per-index failure
+                # Log-safe: the DDL is tool-generated (no row values, no
+                # credentials) and the driver message is a schema-level error.
+                failures.append(f"{_index_name_of(ddl)}: {_safe_error(exc)}")
+                _LOGGER.warning(
+                    "Post-load index creation failed (data is unaffected): %s",
+                    failures[-1],
+                )
+            else:
+                created += 1
         return created, failures
 
 

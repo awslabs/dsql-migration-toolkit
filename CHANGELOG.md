@@ -5,6 +5,26 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.344
+
+### Fixed
+
+- **Post-load index creation now recovers from an aged-out / dropped DSQL connection instead
+  of spuriously failing every remaining index** (found by the connection / UI-wiring review).
+  A large-table Full Load can run past Aurora DSQL's ~60-minute maximum connection duration,
+  after which DSQL force-closes a pooled connection with no SQLSTATE. `_create_indexes` held a
+  SINGLE leased connection for the whole `CREATE INDEX ASYNC` loop and wrapped each DDL in OCC
+  retry with the default predicate (SQLSTATE 40001 only), so a mid-loop connection drop was
+  (1) not retried — it propagated on the first attempt — and (2) swallowed by the per-index
+  handler, which then kept reusing the SAME dead connection for every remaining DDL. The result
+  was that ALL of a table's secondary indexes were reported failed even though the data was
+  complete and a reconnect would have built them (non-data-loss, but the operator had to rebuild
+  indexes by hand). The loop now leases a FRESH connection inside each retried unit and treats a
+  transient connection drop as retryable (`retryable=_is_retryable_load_error`) — mirroring the
+  data path (`_execute_insert`) — so a dropped/aged connection is discarded and the index builds
+  on a new one. A genuinely bad index DDL (e.g. DSQL's 24-index limit) is still isolated and
+  surfaced as before.
+
 ## v0.1.343
 
 ### Fixed
