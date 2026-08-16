@@ -334,14 +334,14 @@ class S3SessionStateStore:
         """Return the boto3 S3 client, building it lazily (benign build race)."""
         client = self._client
         if client is None:
-            import boto3
+            # Build through the shared session factory so this S3 client shares the
+            # one credential context (profile-or-default chain) as every other AWS
+            # client in the tool, instead of re-implementing that selection here.
+            from dsql_migrator.core.aws_session import build_session
 
-            session = (
-                boto3.Session(profile_name=self._aws_profile)
-                if self._aws_profile
-                else boto3.Session()
+            client = build_session(self._aws_profile).client(
+                "s3", region_name=self._region
             )
-            client = session.client("s3", region_name=self._region)
             self._client = client
         return client
 

@@ -5,6 +5,24 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.346
+
+### Changed
+
+- **保守性リファクタリング(動作変更なし)、リファクタリング機会レビューの反映。** 安全で
+  動作を保存する構造変更2件:
+  - `core/validator.py`(2066 → 1528行)から純粋なクロスエンジン SQL ビルダーを新モジュール
+    `core/validation_sql.py` へ分離 — checksum/PK-token/keyset-page ビルダー、`_checksum_kind`・
+    quoting ヘルパー、`build_orphan_count_sql`、`integer_pk_column`/`single_pk_column`。これらは
+    接続/スレッド/実行状態に触れない純粋な `TableDef`/`ColumnDef` → SQL 関数で、最も独立して
+    テストされるロジックを見つけやすくします。`validator.py` がこれらを re-export するため、
+    `from dsql_migrator.core.validator import build_mysql_checksum_sql` などすべての利用側/テスト
+    の import はそのまま解決します。
+  - 2つの遅延 S3 クライアントビルダー(`JobStore._s3`、`SessionStateStore._s3`)が、
+    `boto3.Session(profile) or boto3.Session()` の選択を再実装する代わりに、共有の
+    `aws_session.build_session` ファクトリ経由で構築するようになりました。他のすべての AWS
+    クライアントと同じ単一の認証情報コンテキストを共有します。動作は同一です。
+
 ## v0.1.345
 
 ### Changed

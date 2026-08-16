@@ -5,6 +5,24 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.346
+
+### Changed
+
+- **유지보수 리팩터(동작 변경 없음), 리팩터 기회 리뷰 결과 반영.** 안전한 동작 보존
+  구조 변경 2건:
+  - `core/validator.py`(2066 → 1528줄)에서 순수 크로스엔진 SQL 빌더를 새 모듈
+    `core/validation_sql.py`로 분리 — checksum/PK-token/keyset-page 빌더, `_checksum_kind`·
+    quoting 헬퍼, `build_orphan_count_sql`, `integer_pk_column`/`single_pk_column`. 이들은
+    커넥션/스레드/실행 상태를 건드리지 않는 순수 `TableDef`/`ColumnDef` → SQL 함수라, 가장
+    독립적으로 테스트되는 로직을 찾기 쉬워집니다. `validator.py`가 이들을 re-export하므로
+    `from dsql_migrator.core.validator import build_mysql_checksum_sql` 등 모든 소비자/테스트
+    import는 그대로 동작합니다.
+  - 두 개의 지연 S3 클라이언트 빌더(`JobStore._s3`, `SessionStateStore._s3`)가
+    `boto3.Session(profile) or boto3.Session()` 선택을 재구현하는 대신 공유
+    `aws_session.build_session` 팩토리를 통해 빌드하도록 변경 — 다른 모든 AWS 클라이언트와
+    동일한 단일 크리덴셜 컨텍스트를 공유합니다. 동작은 동일합니다.
+
 ## v0.1.345
 
 ### Changed

@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.346
+
+### Changed
+
+- **Maintainability refactor (no behavior change), from the refactor-opportunity review.**
+  Two safe, behavior-preserving structural changes:
+  - Extracted the pure cross-engine SQL builders out of `core/validator.py` (2066 → 1528
+    lines) into a new `core/validation_sql.py` — the checksum/PK-token/keyset-page builders,
+    the `_checksum_kind`/quoting helpers, `build_orphan_count_sql`, and
+    `integer_pk_column`/`single_pk_column`. These are pure `TableDef`/`ColumnDef` → SQL
+    functions with no connection/thread/run state; isolating them makes the most
+    independently-tested logic easy to find. `validator.py` re-exports them, so
+    `from dsql_migrator.core.validator import build_mysql_checksum_sql` (and every other
+    consumer/test import) resolves unchanged.
+  - The two lazy S3-client builders (`JobStore._s3`, `SessionStateStore._s3`) now build
+    through the shared `aws_session.build_session` factory instead of re-implementing the
+    `boto3.Session(profile) or boto3.Session()` selection, so they share the one credential
+    context every other AWS client uses. Behavior is identical.
+
 ## v0.1.345
 
 ### Changed
