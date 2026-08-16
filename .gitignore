@@ -114,3 +114,6 @@ scripts/*
 # Local performance measurement outputs (not published)
 perf-runs/
 
+# Personal editor Task (grip -> Chrome Markdown preview); not shared. The
+# tracked .vscode/settings.json stays committed.
+.vscode/tasks.json

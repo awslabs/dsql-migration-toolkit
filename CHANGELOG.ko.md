@@ -5,7 +5,23 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
-## v0.1.352
+## v0.1.353
+
+### Fixed
+
+- **검증(Validation)이 이제 타깃 DSQL 커넥션이 수명을 다하면 재연결·재개하며, 테이블을 영구 error로
+  처리해 cut-over를 막지 않습니다** (성능/안정성 리뷰에서 발견). Aurora DSQL은 ~1시간 최대 커넥션
+  수명에서 커넥션을 강제 종료합니다. 검증은 비교 단위마다 타깃 커넥션을 하나 열어(병렬 경로는 테이블당
+  하나, 직렬 경로는 전체에 하나) count + checksum + keyset PK reconcile + orphan 읽기 전체에 재사용하고
+  재연결이 없었습니다 — 그래서 검증이 ~1h를 넘기면(수십억 행 테이블 하나의 keyset count/reconcile, 또는
+  직렬 모드의 다중 테이블 실행) 커넥션 드롭에 걸려 그 테이블이 error로 기록되고, reconcile은 재연결 없이
+  재시작하므로 그 테이블은 영영 통과 못 해 cut-over 게이트를 막았습니다. 이는 write 경로에서 이미
+  하드닝한 노후-커넥션 클래스(`schema_applier._run_ddls_reconnecting`, 배치 로더 풀, v0.1.344)와 동일한데
+  검증 read 경로엔 없던 것입니다. 이제 타깃 커넥션을 투명 재연결 프록시로 감쌉니다: 커넥션 레벨 일시
+  오류(SQLSTATE class 08 / no-SQLSTATE, `is_transient_connection_error`)에서 죽은 커넥션을 폐기하고
+  재연결(짧은 수명의 IAM 토큰 재발급, 제한된 재시도 + 짧은 백오프)한 뒤 진행 중이던 문장을 재실행합니다.
+  모든 타깃 읽기는 읽기전용·멱등이고 keyset 페이저는 자체 `WHERE pk > :last` 경계를 가지므로, 페이지
+  도중 드롭돼도 재스캔이 아니라 마지막 PK부터 재개합니다. 실제 쿼리/제약 오류는 그대로 전파됩니다.
 
 ### Changed
 

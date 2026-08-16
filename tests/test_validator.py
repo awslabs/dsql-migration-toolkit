@@ -449,6 +449,175 @@ def test_parallel_validation_matches_sequential_and_preserves_order() -> None:
     assert all(item.matched for item in report.items)
 
 
+# ---------------------------------------------------------------------------
+# Target-connection reconnect on an aged-out / dropped DSQL connection.
+#
+# DSQL force-closes a connection at its ~1h maximum connection duration. A >1h
+# validation of a billion-row table (keyset count + PK reconcile reuse ONE target
+# connection) would otherwise error the table on the drop and block cut-over. The
+# read path now transparently reconnects (new IAM token) and replays the in-flight
+# statement -- the same aged-connection hardening the write paths already have.
+# ---------------------------------------------------------------------------
+
+
+def _transient_drop() -> Exception:
+    """A no-SQLSTATE connection drop the way DSQL force-closes an aged connection."""
+    return Exception("server closed the connection unexpectedly")
+
+
+class _ScriptedTargetCursor:
+    def __init__(self, conn: "_ScriptedTargetConn") -> None:
+        self._conn = conn
+        self.closed = False
+
+    def execute(self, statement: Any, parameters: Any = None) -> None:
+        self._conn.executes.append((statement, parameters))
+        if self._conn.die:
+            raise _transient_drop()
+
+    def fetchone(self) -> Optional[tuple]:
+        return (self._conn.value,)
+
+    def fetchall(self) -> list[tuple]:
+        return [(self._conn.value,)]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _ScriptedTargetConn:
+    """A target connection that either dies transiently on every execute (``die``)
+    or serves a canned scalar; records executes/close for assertions."""
+
+    def __init__(self, *, die: bool, value: object = "ok") -> None:
+        self.die = die
+        self.value = value
+        self.executes: list = []
+        self.closed = False
+
+    def cursor(self) -> _ScriptedTargetCursor:
+        return _ScriptedTargetCursor(self)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_reconnecting_target_replays_statement_on_a_transient_drop() -> None:
+    from dsql_migrator.core.validator import _ReconnectingTargetConnection
+
+    dying = _ScriptedTargetConn(die=True)
+    healthy = _ScriptedTargetConn(die=False, value="ok")
+    made: list = []
+
+    def factory() -> _ScriptedTargetConn:
+        conn = dying if not made else healthy
+        made.append(conn)
+        return conn
+
+    proxy = _ReconnectingTargetConnection(factory, sleep=lambda _s: None)
+    cursor = proxy.cursor()
+    cursor.execute("SELECT 1", {"last": 42})
+
+    assert cursor.fetchone() == ("ok",)  # served by the fresh (reconnected) connection
+    assert dying.closed is True  # aged-out connection discarded
+    assert len(made) == 2  # eager connect + exactly one reconnect
+    # the SAME statement is replayed on the fresh connection (keyset resume-safe).
+    assert healthy.executes == [("SELECT 1", {"last": 42})]
+
+
+def test_reconnecting_target_propagates_a_non_transient_error() -> None:
+    from dsql_migrator.core.validator import _ReconnectingTargetConnection
+
+    class _PermCursor:
+        def __init__(self, conn: "_PermConn") -> None:
+            self._conn = conn
+
+        def execute(self, statement: Any, parameters: Any = None) -> None:
+            self._conn.executes += 1
+            err = Exception("relation does not exist")
+            err.sqlstate = "42P01"  # a real query error, NOT a connection drop
+            raise err
+
+        def close(self) -> None:
+            pass
+
+    class _PermConn:
+        def __init__(self) -> None:
+            self.executes = 0
+            self.closed = False
+
+        def cursor(self) -> "_PermCursor":
+            return _PermCursor(self)
+
+        def close(self) -> None:
+            self.closed = True
+
+    conns: list = []
+
+    def factory() -> _PermConn:
+        conn = _PermConn()
+        conns.append(conn)
+        return conn
+
+    proxy = _ReconnectingTargetConnection(factory, sleep=lambda _s: None)
+    with pytest.raises(Exception) as excinfo:
+        proxy.cursor().execute("SELECT 1")
+
+    assert getattr(excinfo.value, "sqlstate", None) == "42P01"
+    assert len(conns) == 1  # a real query error must NOT reconnect
+
+
+def test_reconnecting_target_gives_up_after_max_attempts() -> None:
+    from dsql_migrator.core.validator import _ReconnectingTargetConnection
+
+    made: list = []
+
+    def factory() -> _ScriptedTargetConn:
+        conn = _ScriptedTargetConn(die=True)
+        made.append(conn)
+        return conn
+
+    proxy = _ReconnectingTargetConnection(
+        factory, max_attempts=3, base_delay=0.0, sleep=lambda _s: None
+    )
+    with pytest.raises(Exception):
+        proxy.cursor().execute("SELECT 1")
+
+    # eager connect + 2 reconnects, then give up -> exactly max_attempts execute tries.
+    assert len(made) == 3
+
+
+def test_validation_recovers_when_the_target_connection_drops_mid_run(monkeypatch) -> None:
+    # The aged-connection fix end-to-end: the target connection is force-closed
+    # partway through validating a table; the read path reconnects and resumes, so
+    # the table MATCHES rather than erroring (which would block the cut-over gate).
+    import dsql_migrator.core.validator as validator_mod
+
+    monkeypatch.setattr(validator_mod.time, "sleep", lambda _s: None)
+
+    source = _FakeSourceConnection(counts={"orders": 5})
+    healthy = _FakeTargetConnection(counts={"orders": 5})
+    dying = _ScriptedTargetConn(die=True)
+    calls: list = []
+
+    def _tgt_factory(_cfg: Any):
+        calls.append(1)
+        return dying if len(calls) == 1 else healthy
+
+    validator = Validator(
+        source_engine_factory=lambda _conn: _FakeSourceEngine(source),
+        target_connection_factory=_tgt_factory,
+    )
+    report = validator.validate(_SOURCE_CONFIG, _TARGET_CONFIG, [_table("orders")])
+
+    assert report.is_match is True  # recovered -> matched, not errored
+    item = report.items[0]
+    assert item.matched is True
+    assert item.target_row_count == 5
+    assert dying.closed is True  # the dropped connection was discarded
+    assert len(calls) >= 2  # reconnected at least once
+
+
 def test_parallel_validation_reports_progress_monotonically() -> None:
     counts = {"orders": 1, "customers": 1, "items": 1}
     tables = [_table("orders"), _table("customers"), _table("items")]

@@ -5,7 +5,27 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
-## v0.1.352
+## v0.1.353
+
+### Fixed
+
+- **Validation now reconnects and resumes when its target DSQL connection ages out, instead of
+  permanently erroring the table and blocking cut-over** (found by the perf/stability review).
+  Aurora DSQL force-closes a connection at its ~1-hour maximum connection duration. Validation
+  opened ONE target connection per comparison unit (one per table in the parallel path, one for
+  all tables in the serial path) and reused it for that unit's entire count + checksum + keyset
+  PK reconcile + orphan reads, with no reconnect — so a validation that ran past ~1h (a single
+  billion-row table's keyset count/reconcile, or a multi-table run in the serial mode) hit the
+  connection drop, recorded the table as errored, and — because reconcile restarts with no
+  reconnect — that table could never pass, blocking the pre-cut-over gate. This is the same
+  aged-connection class already hardened on the WRITE paths (`schema_applier._run_ddls_reconnecting`
+  and the batched loader's pool, v0.1.344) but the validation READ path lacked it. The target
+  connection is now wrapped in a transparent reconnecting proxy: on a connection-level transient
+  error (SQLSTATE class 08 / no-SQLSTATE, via `is_transient_connection_error`) it discards the dead
+  connection, reconnects (re-minting a short-lived IAM token, bounded retries + short backoff), and
+  re-runs the in-flight statement. All target reads are read-only/idempotent and the keyset pagers
+  carry their own `WHERE pk > :last` bound, so a mid-page drop resumes from the last PK rather than
+  rescanning; a real query/constraint error still propagates unchanged.
 
 ### Changed
 

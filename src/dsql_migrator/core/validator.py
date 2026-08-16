@@ -72,6 +72,7 @@ means the two computed checksums were equal over the compared columns).
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any, Callable, Iterator, Mapping, Optional, Protocol
 
 from psycopg import sql
@@ -96,7 +97,10 @@ from dsql_migrator.core.models import (
     Watermark,
     TableValidationResult,
 )
-from dsql_migrator.core.target_connection import DsqlConnector
+from dsql_migrator.core.target_connection import (
+    DsqlConnector,
+    is_transient_connection_error,
+)
 from dsql_migrator.core.watermark import COMMIT, START_CONSISTENT_SNAPSHOT
 
 # The pure cross-engine SQL builders + PK-classification helpers were extracted to
@@ -241,6 +245,126 @@ def _source_binlog_position(
 # ---------------------------------------------------------------------------
 # Target reads (psycopg, read-only)
 # ---------------------------------------------------------------------------
+
+
+# Reconnect budget for the target read path. A DSQL connection is force-closed at
+# the ~1h maximum connection duration, and a fresh reconnect can transiently hit
+# DSQL's new-connection rate limit, so allow a few attempts with a short backoff.
+_TARGET_RECONNECT_MAX_ATTEMPTS = 4
+_TARGET_RECONNECT_BASE_DELAY_SECONDS = 0.5
+
+_EXECUTE_SENTINEL = object()
+
+
+class _ReconnectingTargetConnection:
+    """Target-connection proxy that transparently reconnects on a transient
+    (aged-out / dropped) DSQL connection and re-runs the in-flight statement.
+
+    Validation's target reads -- count, checksum, keyset PK pages, orphan count --
+    are read-only and idempotent, and the keyset pagers advance from the last PK, so
+    a connection force-closed at DSQL's ~1h maximum connection duration (or dropped by
+    a transient network / TLS event) partway through validating a large table is
+    replaced with a fresh connection (which re-mints a short-lived IAM token) and only
+    the failing statement is re-run -- the pager resumes from its last PK rather than
+    rescanning. Without this, a >1h validation of a billion-row table (its keyset
+    count + PK reconcile) permanently errors that table and blocks the cut-over gate;
+    this is the same aged-connection class already hardened on the WRITE paths
+    (``schema_applier._run_ddls_reconnecting`` and the batched loader's pool), which
+    the read path lacked.
+
+    Transparent: it quacks like a psycopg connection (``cursor()`` / ``close()``), so
+    every ``_target_*`` read helper is unchanged. Only a connection-level transient
+    error (SQLSTATE class ``08`` / no-SQLSTATE, via
+    :func:`is_transient_connection_error`) triggers a reconnect; any real query /
+    constraint error propagates unchanged. The underlying connection is opened EAGERLY
+    so the open cost / an immediate connect failure surfaces at the same point as
+    before this wrapper existed.
+    """
+
+    def __init__(
+        self,
+        factory: Callable[[], Any],
+        *,
+        max_attempts: int = _TARGET_RECONNECT_MAX_ATTEMPTS,
+        base_delay: float = _TARGET_RECONNECT_BASE_DELAY_SECONDS,
+        sleep: Optional[Callable[[float], None]] = None,
+    ) -> None:
+        self._factory = factory
+        self._max_attempts = max(1, int(max_attempts))
+        self._base_delay = max(0.0, float(base_delay))
+        # None -> time.sleep, looked up dynamically at call time so tests can patch it.
+        self._sleep = sleep
+        self._connection: Any = factory()  # eager: preserve the pre-wrapper connect timing
+
+    def _live(self) -> Any:
+        if self._connection is None:
+            self._connection = self._factory()
+        return self._connection
+
+    def _discard(self) -> None:
+        if self._connection is not None:
+            _safe_close(self._connection)
+            self._connection = None
+
+    def cursor(self) -> "_ReconnectingCursor":
+        return _ReconnectingCursor(self)
+
+    def close(self) -> None:
+        self._discard()
+
+
+class _ReconnectingCursor:
+    """Cursor proxy for :class:`_ReconnectingTargetConnection`.
+
+    ``execute`` runs on the owner's live connection; on a transient connection drop it
+    discards the dead connection, reconnects (short bounded backoff), and re-runs the
+    SAME statement on a fresh underlying cursor -- safe because every target read here
+    is idempotent and the keyset pages carry their own ``WHERE pk > :last`` bound.
+    ``fetchone`` / ``fetchall`` delegate to the live underlying cursor.
+    """
+
+    def __init__(self, owner: "_ReconnectingTargetConnection") -> None:
+        self._owner = owner
+        self._cursor: Any = None
+
+    def execute(self, statement: Any, parameters: Any = _EXECUTE_SENTINEL) -> Any:
+        attempt = 0
+        while True:
+            connection = self._owner._live()
+            cursor = connection.cursor()
+            try:
+                if parameters is _EXECUTE_SENTINEL:
+                    cursor.execute(statement)
+                else:
+                    cursor.execute(statement, parameters)
+                self._cursor = cursor
+                return cursor
+            except Exception as exc:  # noqa: BLE001 - reconnect on a transient drop
+                _safe_close(cursor)
+                attempt += 1
+                if (
+                    is_transient_connection_error(exc)
+                    and attempt < self._owner._max_attempts
+                ):
+                    # Discard the dead connection so the next _live() re-mints a fresh
+                    # one (new IAM token), then replay the SAME statement.
+                    self._owner._discard()
+                    delay = self._owner._base_delay * attempt
+                    if delay:
+                        (self._owner._sleep or time.sleep)(delay)
+                    continue
+                raise
+
+    def fetchone(self) -> Any:
+        return self._cursor.fetchone()
+
+    def fetchall(self) -> Any:
+        return self._cursor.fetchall()
+
+    def close(self) -> None:
+        if self._cursor is not None:
+            _safe_close(self._cursor)
+            self._cursor = None
 
 
 def _target_scalar(connection: Any, statement: Any) -> object:
@@ -733,7 +857,9 @@ class Validator:
                     current_binlog_file, current_binlog_position = (
                         _source_binlog_position(source_connection)
                     )
-                    target_connection = self._target_connection_factory(target)
+                    target_connection = _ReconnectingTargetConnection(
+                        lambda: self._target_connection_factory(target)
+                    )
                     try:
                         total = len(tables)
                         for index, table in enumerate(tables, start=1):
@@ -909,7 +1035,9 @@ class Validator:
                 )
                 source_connection.execute(text(START_CONSISTENT_SNAPSHOT))
                 try:
-                    target_connection = self._target_connection_factory(target)
+                    target_connection = _ReconnectingTargetConnection(
+                        lambda: self._target_connection_factory(target)
+                    )
                     try:
                         item = self._validate_table(
                             source_connection, target_connection, table,
