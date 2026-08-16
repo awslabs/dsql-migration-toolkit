@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.347
+
+### Changed
+
+- **Maintainability refactor (no behavior change), from the refactor-opportunity review.**
+  Extracted the Start-over confirmation dialog and the CDC-teardown/lifecycle banner UI out
+  of `ui/workflow.py` (2213 → 1703 lines) into a new `ui/start_over.py`:
+  `_start_over_cdc_warning`, `_open_start_over_dialog`, `_cdc_teardown_banner_copy`,
+  `_render_cdc_teardown_banner` (and the `_TEARDOWN_BANNER_POLL_SECONDS` constant they use).
+  These are a self-contained teardown-safety UI concern — each takes the NiceGUI `ui` module
+  and its callbacks as explicit parameters, so the new module has no back-dependency on
+  `workflow.py` (imported one-directionally by `build_workflow_sidebar`). `workflow.py`
+  re-exports them, so `from dsql_migrator.ui.workflow import _start_over_cdc_warning` (used by
+  tests) resolves unchanged. `_render_reconnect_banner` deliberately stayed (it depends on a
+  core notice helper). No behavior change.
+
 ## v0.1.346
 
 ### Changed

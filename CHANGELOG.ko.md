@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.347
+
+### Changed
+
+- **유지보수 리팩터(동작 변경 없음), 리팩터 기회 리뷰 결과 반영.** `ui/workflow.py`
+  (2213 → 1703줄)에서 Start-over 확인 다이얼로그와 CDC-teardown/lifecycle 배너 UI를 새 모듈
+  `ui/start_over.py`로 분리: `_start_over_cdc_warning`, `_open_start_over_dialog`,
+  `_cdc_teardown_banner_copy`, `_render_cdc_teardown_banner`(및 이들이 쓰는
+  `_TEARDOWN_BANNER_POLL_SECONDS` 상수). 이들은 자기완결적인 teardown-safety UI 관심사로,
+  각 함수가 NiceGUI `ui` 모듈과 콜백을 명시적 파라미터로 받으므로 새 모듈은 `workflow.py`에
+  역의존이 없습니다(단방향으로 `build_workflow_sidebar`가 import). `workflow.py`가 이들을
+  re-export하므로 `from dsql_migrator.ui.workflow import _start_over_cdc_warning`(테스트에서
+  사용)는 그대로 동작합니다. `_render_reconnect_banner`는 core notice 헬퍼에 의존하므로
+  의도적으로 남겨뒀습니다. 동작 변경 없음.
+
 ## v0.1.346
 
 ### Changed
