@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.351
+
+### Changed
+
+- **Maintainability refactor (no behavior change), from the refactor-opportunity backlog.**
+  Split `ui/data_migration/_cdc_ui.py` (5415 → 3695 lines) into three modules in two steps:
+  (1) the pure CDC state/phase predicates (`cdc_streaming_started`, `cdc_pipeline_live`,
+  `cdc_monitoring_visible`, `cdc_teardown_badge`, `cdc_infra_deploy_in_flight`,
+  `_cdc_is_streaming`, `_CDC_POLL_INTERVAL_SECONDS`) → new `_cdc_state.py`; then (2) the
+  ~1600-line post-start monitoring / DLQ / status render panels
+  (`_render_migration_table_status`, `_render_cdc_live_monitoring`, `_render_cdc_dlq_panel` +
+  sub-panels, the schema-drift banner, `lob_exclusion_lock`, the CDC-handling panel, …) →
+  new `_cdc_monitoring.py`, which imports the predicates from `_cdc_state` (not back from
+  `_cdc_ui`). The predicate split had to come first: it removes the back-edge that would
+  otherwise make `_cdc_ui` ↔ `_cdc_monitoring` a circular import. `_cdc_ui.py` re-exports all
+  moved names, so every consumer/test import resolves unchanged. One-directional throughout
+  (`_cdc_state` → `_status`; `_cdc_monitoring` → `_cdc_state`/`_models`/`_status`/`core`/`ui`).
+  No behavior change.
+
 ## v0.1.350
 
 ### Changed

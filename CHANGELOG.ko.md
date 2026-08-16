@@ -5,6 +5,23 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.351
+
+### Changed
+
+- **유지보수 리팩터(동작 변경 없음), 리팩터 기회 백로그 반영.** `ui/data_migration/_cdc_ui.py`
+  (5415 → 3695줄)를 2단계로 세 모듈로 분리: (1) 순수 CDC 상태/단계 predicate
+  (`cdc_streaming_started`, `cdc_pipeline_live`, `cdc_monitoring_visible`, `cdc_teardown_badge`,
+  `cdc_infra_deploy_in_flight`, `_cdc_is_streaming`, `_CDC_POLL_INTERVAL_SECONDS`) → 새
+  `_cdc_state.py`; 이어 (2) ~1600줄의 스트리밍 후 모니터링/DLQ/상태 렌더 패널
+  (`_render_migration_table_status`, `_render_cdc_live_monitoring`, `_render_cdc_dlq_panel` +
+  하위 패널, 스키마 드리프트 배너, `lob_exclusion_lock`, CDC 핸들링 패널 등) → 새
+  `_cdc_monitoring.py`(predicate를 `_cdc_ui`가 아니라 `_cdc_state`에서 import). predicate 분리를
+  먼저 해야 했습니다 — 그래야 `_cdc_ui` ↔ `_cdc_monitoring` 순환 import를 만드는 back-edge가
+  사라집니다. `_cdc_ui.py`가 이동한 모든 이름을 re-export하므로 모든 소비자/테스트 import는 그대로
+  동작합니다. 전 구간 단방향(`_cdc_state` → `_status`; `_cdc_monitoring` →
+  `_cdc_state`/`_models`/`_status`/`core`/`ui`). 동작 변경 없음.
+
 ## v0.1.350
 
 ### Changed

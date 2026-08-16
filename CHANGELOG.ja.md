@@ -5,6 +5,24 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.351
+
+### Changed
+
+- **保守性リファクタリング(動作変更なし)、リファクタリング機会バックログの反映。**
+  `ui/data_migration/_cdc_ui.py`(5415 → 3695行)を2ステップで3モジュールに分割: (1) 純粋な
+  CDC 状態/フェーズ述語(`cdc_streaming_started`、`cdc_pipeline_live`、`cdc_monitoring_visible`、
+  `cdc_teardown_badge`、`cdc_infra_deploy_in_flight`、`_cdc_is_streaming`、
+  `_CDC_POLL_INTERVAL_SECONDS`)→ 新 `_cdc_state.py`;続いて (2) 約1600行のストリーミング後の
+  モニタリング/DLQ/ステータスのレンダーパネル(`_render_migration_table_status`、
+  `_render_cdc_live_monitoring`、`_render_cdc_dlq_panel` + サブパネル、スキーマドリフトバナー、
+  `lob_exclusion_lock`、CDC ハンドリングパネル等)→ 新 `_cdc_monitoring.py`(述語は `_cdc_ui` では
+  なく `_cdc_state` から import)。述語の分割を先に行う必要がありました — そうすることで
+  `_cdc_ui` ↔ `_cdc_monitoring` の循環 import を生む back-edge が解消されます。`_cdc_ui.py` が
+  移動したすべての名前を re-export するため、すべての利用側/テストの import はそのまま解決します。
+  全体を通して単方向(`_cdc_state` → `_status`;`_cdc_monitoring` →
+  `_cdc_state`/`_models`/`_status`/`core`/`ui`)。動作変更なし。
+
 ## v0.1.350
 
 ### Changed
