@@ -649,6 +649,40 @@ def test_job_status_to_step_status(job_status: str, expected) -> None:
     assert job_status_to_step_status(job_status) is expected
 
 
+def test_reconcile_evaluation_step_recovers_an_interrupted_run() -> None:
+    from dsql_migrator.ui.evaluation import reconcile_evaluation_step
+
+    # IN_PROGRESS with no live job and no result = interrupted by a restart -> reset to
+    # NOT_STARTED so the spinner stops and Run returns.
+    assert (
+        reconcile_evaluation_step(
+            StepStatus.IN_PROGRESS, job_alive=False, has_result=False
+        )
+        is StepStatus.NOT_STARTED
+    )
+    # A genuinely running job (alive) is left IN_PROGRESS (keeps spinning).
+    assert (
+        reconcile_evaluation_step(
+            StepStatus.IN_PROGRESS, job_alive=True, has_result=False
+        )
+        is None
+    )
+    # A finished run (result present) is never reset, even if the job is gone.
+    assert (
+        reconcile_evaluation_step(
+            StepStatus.IN_PROGRESS, job_alive=False, has_result=True
+        )
+        is None
+    )
+    # Terminal steps are never reconciled.
+    assert (
+        reconcile_evaluation_step(
+            StepStatus.DONE, job_alive=False, has_result=True
+        )
+        is None
+    )
+
+
 # ---------------------------------------------------------------------------
 # Report export serialization (Requirement 8.4)
 # ---------------------------------------------------------------------------

@@ -742,6 +742,42 @@ def job_status_to_step_status(job_status: str) -> Optional[StepStatus]:
     return None
 
 
+def reconcile_evaluation_step(
+    status: StepStatus, *, job_alive: bool, has_result: bool
+) -> Optional[StepStatus]:
+    """Reconcile a possibly-interrupted Evaluation step against the live job.
+
+    An app restart restores the workflow status (so the step can read ``IN_PROGRESS``)
+    but the background job that was running it does NOT survive -- a fresh process has
+    no live job for it (``eval_state.job_id`` is not persisted). The poll timer bails
+    when there is no job, so the "Starting evaluation... 0%" panel would spin forever.
+
+    Returns ``NOT_STARTED`` when the step is ``IN_PROGRESS`` but there is neither a
+    live job nor a result (the interrupted case) so the spinner stops and the "Run
+    evaluation" affordance returns; otherwise ``None`` (leave the status unchanged --
+    a genuinely running job keeps spinning, a finished one keeps its DONE/FAILED).
+    Pure + deterministic so the reconciliation is unit-testable.
+    """
+    if status is StepStatus.IN_PROGRESS and not job_alive and not has_result:
+        return StepStatus.NOT_STARTED
+    return None
+
+
+def _eval_job_alive(job_manager: JobManager, job_id: Optional[str]) -> bool:
+    """True when the evaluation job still exists in this process (any state).
+
+    ``False`` when there is no job id (a fresh process after a restart never restores
+    it) or the job is unknown to the current :class:`JobManager` -- either way there is
+    nothing to poll, so the step was interrupted."""
+    if job_id is None:
+        return False
+    try:
+        job_manager.get_status(job_id)
+        return True
+    except JobNotFoundError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Report export serialization (NiceGUI-agnostic)
 # ---------------------------------------------------------------------------
@@ -1069,6 +1105,22 @@ def build_evaluation_screen(
 
     def content(refresh: Callable[[], None]) -> None:
         status = get_status(session.workflow, WorkflowStep.EVALUATION)
+        # Reconcile a stale IN_PROGRESS step whose job did not survive an app restart
+        # (the poll would otherwise spin at 0% with no terminal state). Flip it back to
+        # NOT_STARTED so the spinner stops and the "Run evaluation" button returns, and
+        # note the interruption so the reset is not confusing.
+        interrupted = False
+        reconciled = reconcile_evaluation_step(
+            status,
+            job_alive=_eval_job_alive(job_manager, eval_state.job_id),
+            has_result=eval_state.result is not None,
+        )
+        if reconciled is not None:
+            session.set_workflow(
+                with_status(session.workflow, WorkflowStep.EVALUATION, reconciled)
+            )
+            status = reconciled
+            interrupted = True
 
         def run_now() -> None:
             # In-screen Run so the action is discoverable on the empty screen
@@ -1085,6 +1137,18 @@ def build_evaluation_screen(
             with ui.row().classes("items-center gap-2"):
                 ui.label("Evaluation status:").classes("text-sm text-gray-500")
                 ui.badge(status_label(status)).props(f"color={_STATUS_COLORS[status]}")
+
+            if interrupted:
+                render_notice(
+                    ui,
+                    tone="info",
+                    header="Evaluation was interrupted by a restart",
+                    body=(
+                        "The app restarted while the evaluation was running, so it "
+                        "stopped — nothing was changed (this step only reads the "
+                        "databases). Run it again to continue."
+                    ),
+                )
 
             if not session.has_source() or not session.has_target():
                 render_notice(

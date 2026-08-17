@@ -5,6 +5,17 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.369
+
+### Fixed
+
+- **An Evaluation interrupted by an app restart no longer spins at "Starting
+  evaluation… 0%" forever.** The restart restored the step as ``IN_PROGRESS`` but the
+  background job did not survive, so the poll had nothing to advance. The screen now
+  reconciles a stale ``IN_PROGRESS`` step whose job is gone back to ``NOT_STARTED``
+  (with a calm "interrupted by a restart — run it again" note), so the spinner stops
+  and the Run button returns. Evaluation only reads, so nothing was lost.
+
 ## v0.1.368
 
 The AI assistant grew from a per-object Q&A box into an **agentic, migration-aware helper**.
