@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.367
+
+### Changed
+
+- **The AI panel's composer is now a roomy, multi-line chat box instead of a single-line field.**
+  A follow-up is often a pasted DDL/SQL snippet or a few sentences, so the input is now an
+  auto-growing textarea: it starts a few lines tall and grows with what you type, capped so a long
+  paste scrolls inside the box rather than pushing the send button off-screen. Enter sends the
+  message and **Shift+Enter** inserts a new line (the newline suppression is done client-side, so a
+  plain Enter never leaves a stray blank line).
+- **AI replies now use the panel's full width, and the repeated ✨ avatar icon beside each reply
+  is gone.** The per-reply avatar column only ate horizontal space and narrowed every answer; each
+  reply is now a full-width card, so long guidance (and code blocks) read with more room.
+
 ## v0.1.366
 
 ### Changed

@@ -36,6 +36,8 @@ class _El:
         self.enabled = True
         self.visible = True
         self.is_deleted = False
+        self.props_str = ""
+        self.events: list[str] = []
         if kind in ("markdown", "code"):
             ui.rendered.append((kind, text))
 
@@ -46,13 +48,17 @@ class _El:
     def style(self, *_a, **_k) -> "_El":
         return self
 
-    def props(self, *_a, **_k) -> "_El":
+    def props(self, *a, **_k) -> "_El":  # noqa: ANN002
+        if a and isinstance(a[0], str):
+            self.props_str = a[0]
         return self
 
     def tooltip(self, *_a, **_k) -> "_El":
         return self
 
-    def on(self, *_a, **_k) -> "_El":
+    def on(self, *a, **_k) -> "_El":  # noqa: ANN002
+        if a and isinstance(a[0], str):
+            self.events.append(a[0])
         return self
 
     def on_click(self, *_a, **_k) -> "_El":
@@ -111,6 +117,7 @@ class _Ui:
         self.timers: list[_Timer] = []
         self.drawer_visible: Optional[bool] = None
         self.buttons: list[_El] = []
+        self.textareas: list[_El] = []
 
     def add_css(self, *_a, **_k) -> None:
         pass
@@ -151,6 +158,11 @@ class _Ui:
 
     def input(self, *_a, **_k) -> _El:
         return self._el("input")
+
+    def textarea(self, *_a, **_k) -> _El:
+        el = self._el("textarea")
+        self.textareas.append(el)
+        return el
 
     def markdown(self, text: str = "", *_a, **_k) -> _El:
         return self._el("markdown", text)
@@ -381,6 +393,21 @@ def test_object_scope_takes_priority_over_general() -> None:
     _pump(ui)
     assert state.ai_conversation.active_scope.scope_id == "eval:orders"
     assert calls["n"] == 0
+
+
+def test_composer_is_a_roomy_multiline_autogrow_textarea() -> None:
+    # The composer must read like a chat window (multi-line, grows with content),
+    # not a single-line field: a follow-up is often a pasted snippet or a few lines.
+    state = _enabled_state()
+    ui = _Ui()
+    build_ai_panel(ui, state=state)
+    assert len(ui.textareas) == 1, "the composer must be a textarea, not ui.input"
+    props = ui.textareas[0].props_str
+    assert "autogrow" in props            # grows with what you type
+    assert "min-height" in props          # starts a few lines tall (autogrow forces rows=1)
+    assert "max-height" in props          # capped so a long paste scrolls, not overflows
+    # Enter-to-send is wired on the textarea (Shift+Enter falls through to a newline).
+    assert any(ev == "keydown.enter" for ev in ui.textareas[0].events)
 
 
 def test_general_chat_system_is_migration_scoped_and_declines_off_topic() -> None:
