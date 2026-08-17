@@ -110,6 +110,7 @@ class _Ui:
         self.rendered: list[tuple[str, str]] = []  # (markdown|code|set_content, body)
         self.timers: list[_Timer] = []
         self.drawer_visible: Optional[bool] = None
+        self.buttons: list[_El] = []
 
     def add_css(self, *_a, **_k) -> None:
         pass
@@ -142,8 +143,11 @@ class _Ui:
     def icon(self, *_a, **_k) -> _El:
         return self._el("icon")
 
-    def button(self, *_a, **_k) -> _El:
-        return self._el("button")
+    def button(self, *a, **_k) -> _El:  # noqa: ANN002
+        text = a[0] if a and isinstance(a[0], str) else ""
+        el = _El(self, "button", text)
+        self.buttons.append(el)
+        return el
 
     def input(self, *_a, **_k) -> _El:
         return self._el("input")
@@ -315,3 +319,28 @@ def test_disabled_panel_reports_not_enabled_and_stays_hidden() -> None:
     assert panel.is_enabled() is False
     assert state.ai_conversation.visible is False
     assert ui.drawer_visible is False
+
+
+def _reopen_tab(ui: _Ui) -> _El:
+    tabs = [b for b in ui.buttons if b.text == "AI"]
+    assert len(tabs) == 1, "expected exactly one right-edge 'AI' reopen tab"
+    return tabs[0]
+
+
+def test_reopen_tab_shows_when_collapsed_and_hides_when_open() -> None:
+    state = _enabled_state()  # AI on, panel closed by default
+    ui = _Ui()
+    panel = build_ai_panel(ui, state=state)
+    tab = _reopen_tab(ui)
+    assert tab.visible is True  # collapsed + enabled -> the expand tab is shown
+    panel.set_visible(True)
+    assert tab.visible is False  # open -> tab hidden (drawer covers the edge)
+    panel.set_visible(False)
+    assert tab.visible is True  # collapsed again -> tab back
+
+
+def test_reopen_tab_hidden_when_ai_disabled() -> None:
+    state = SessionConnectionState()  # AI off
+    ui = _Ui()
+    build_ai_panel(ui, state=state)
+    assert _reopen_tab(ui).visible is False  # no AI -> no floating reopen tab

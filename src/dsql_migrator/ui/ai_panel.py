@@ -146,9 +146,12 @@ def build_ai_panel(
                     subtitle_label = ui.label("").classes(  # type: ignore[attr-defined]
                         "text-xs text-gray-500 ellipsis"
                     )
-                ui.button(icon="close", on_click=lambda: _set_visible(False)).props(  # type: ignore[attr-defined]
-                    "flat dense round"
-                ).tooltip("Close")
+                # A right-collapsing chevron (not an X): the panel is only HIDDEN, not
+                # closed/discarded -- the conversation stays and the right-edge tab (and
+                # header button) bring it back. An X read as "end/discard this".
+                ui.button(
+                    icon="chevron_right", on_click=lambda: _set_visible(False)
+                ).props("flat dense round").tooltip("Hide the AI assistant")  # type: ignore[attr-defined]
             # Context chip: what the assistant is grounded on right now.
             chip_label = ui.label("").classes(  # type: ignore[attr-defined]
                 "text-xs text-indigo-700 bg-indigo-50 border-b border-indigo-100 "
@@ -178,6 +181,28 @@ def build_ai_panel(
                     "AI suggestions are advisory. Replies are grounded on the current "
                     "step's deterministic facts."
                 ).classes("text-xs text-gray-400")
+
+    # Collapsed-state affordance: a small tab pinned to the RIGHT EDGE so that, when
+    # the panel is closed, there is a VISIBLE way to reopen it (not only the header
+    # button). Shown only while the panel is closed AND AI is enabled; hidden when the
+    # panel is open (the drawer would cover it) or AI is off.
+    reopen_tab = (
+        ui.button("AI", icon="auto_awesome", on_click=lambda: _set_visible(True))  # type: ignore[attr-defined]
+        .props("dense color=indigo-6 no-caps")
+        .style(
+            "position: fixed; right: 0; top: 50%; transform: translateY(-50%); "
+            "z-index: 2000; border-top-right-radius: 0; border-bottom-right-radius: 0; "
+            "min-width: 0; padding: 12px 6px; box-shadow: -2px 0 8px rgba(0,0,0,0.15);"
+        )
+        .tooltip("Open the AI assistant")
+    )
+
+    def _sync_reopen_tab() -> None:
+        enabled = bool(getattr(state.ai_assist, "enabled", False))  # type: ignore[attr-defined]
+        try:
+            reopen_tab.set_visibility((not conversation.visible) and enabled)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
 
     # --- helpers ----------------------------------------------------------------
 
@@ -234,6 +259,7 @@ def build_ai_panel(
                 drawer.value = bool(visible)  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001
                 pass
+        _sync_reopen_tab()
 
     def _autoscroll(force: bool = False) -> None:
         if not force and not _scroll_state.get("at_bottom", True):
@@ -545,6 +571,7 @@ def build_ai_panel(
     except Exception:  # noqa: BLE001
         pass
     _apply_composer_state()
+    _sync_reopen_tab()
     _autoscroll(force=True)
 
     return AiPanelHandle(

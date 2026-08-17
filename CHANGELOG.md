@@ -5,6 +5,17 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.363
+
+### Changed
+
+- **The AI panel now has a visible right-edge "expand" tab when collapsed, and its header control
+  reads as "hide" rather than "close."** When the panel is closed (and AI is enabled), a small
+  pinned `AI` tab sits on the right edge so it is obvious how to reopen it (not only the header
+  button); it hides while the panel is open. The header dismiss control is now a right-collapsing
+  chevron (tooltip "Hide the AI assistant") instead of an X, since the panel is only hidden — the
+  conversation persists and either the tab or the header button brings it back.
+
 ## v0.1.362
 
 ### Changed
