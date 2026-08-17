@@ -942,6 +942,7 @@ def build_evaluation_screen(
     assessor: Optional[CompatibilityAssessor] = None,
     target_browser_factory: TargetBrowserFactory = _default_target_browser_factory,
     strategist_factory: StrategistFactory = _default_strategist_factory,
+    open_ai_scope: Optional[Callable[..., object]] = None,
 ) -> tuple[Callable[[Callable[[], None]], None], Callable[[], None]]:
     """Build the Evaluation screen, returning ``(content_builder, runner)``.
 
@@ -1149,6 +1150,7 @@ def build_evaluation_screen(
                     eval_state=eval_state,
                     refresh=refresh,
                     guidance_provider=guidance_provider,
+                    open_ai_scope=open_ai_scope,
                 )
 
     return content, runner
@@ -1229,6 +1231,7 @@ def _render_result(
             ObjectGuidanceOutcome,
         ]
     ] = None,
+    open_ai_scope: Optional[Callable[..., object]] = None,
 ) -> None:
     """Render the result as distinct, readable sections (one card per group).
 
@@ -1248,7 +1251,7 @@ def _render_result(
     # opens it for a given object. None when AI assist is disabled (the item
     # renderer then shows a disabled, clearly labeled affordance instead).
     on_ai = (
-        _build_guidance_drawer(ui, guidance_provider)
+        _build_guidance_drawer(ui, guidance_provider, open_ai_scope=open_ai_scope)
         if guidance_provider is not None
         else None
     )
@@ -1351,17 +1354,34 @@ def _build_guidance_drawer(
         ["AssessmentItem", "list[dict[str, str]]", Callable[[str], None]],
         ObjectGuidanceOutcome,
     ],
+    *,
+    open_ai_scope: Optional[Callable[..., object]] = None,
 ) -> Callable[["AssessmentItem"], object]:
-    """Build the shared AI chat drawer; return an opener for one object.
+    """Return an opener that shows one object's AI guidance.
 
-    The drawer itself (chat transcript, token streaming, follow-up composer, copy
-    action, and turn/length guardrails) is the shared
-    :func:`~dsql_migrator.ui.ai_chat_drawer.build_chat_drawer` component, so the
-    Evaluation and Schema Conversion AI assistants look and behave identically.
-    Here it is opened with the object's migration question and a streamer bound to
-    ``guidance_provider`` (the strategist's grounded streaming chat for the
-    object).
+    When ``open_ai_scope`` is wired (the real app), guidance deep-links into the
+    persistent app-wide AI panel (:mod:`dsql_migrator.ui.ai_panel`) so the
+    conversation lives alongside the whole journey. Without it (e.g. unit tests that
+    don't wire the shell), it falls back to the per-screen
+    :func:`~dsql_migrator.ui.ai_chat_drawer.build_chat_drawer` -- same transcript /
+    streaming / guardrails. Either way the streamer is bound to ``guidance_provider``
+    (the strategist's grounded streaming chat for the object).
     """
+    if open_ai_scope is not None:
+        def open_guidance_panel(item: "AssessmentItem") -> None:
+            open_ai_scope(
+                scope_id=f"evaluation:{item.object_name}",
+                title="AI migration guidance",
+                subtitle=f"{item.object_name} \u00b7 {item.kind}",
+                chip=f"Evaluation \u00b7 {item.object_name}",
+                seed_question=_guidance_question(item),
+                streamer=lambda messages, on_delta: guidance_provider(
+                    item, messages, on_delta
+                ),
+            )
+
+        return open_guidance_panel
+
     open_chat = build_chat_drawer(ui)
 
     def open_guidance(item: "AssessmentItem") -> None:

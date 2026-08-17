@@ -34,6 +34,7 @@ from dsql_migrator.config import (
     read_env_file,
 )
 from dsql_migrator.core.job_manager import JobManager
+from dsql_migrator.core.models import MigrationContext
 from dsql_migrator.ui.connect import build_connect_page
 from dsql_migrator.ui.data_migration import (
     DataMigrationStore,
@@ -117,6 +118,29 @@ def build_page(
     in the UI. ``connect_defaults`` optionally prefills the Connect form for
     local development; when ``None`` the form starts blank.
     """
+    # The persistent AI panel is built by the shell (build_workflow_sidebar) and its
+    # handle handed back here; screens deep-link into it via _open_ai_scope. The
+    # holder decouples build order: the screen builders below capture the holder now,
+    # and the shell populates it before the first render, so an AI button clicked at
+    # render time finds the live handle.
+    _ai_panel_holder: dict = {}
+
+    def _open_ai_scope(**kwargs: object) -> object:
+        handle = _ai_panel_holder.get("handle")
+        return handle.open_scope(**kwargs) if handle is not None else None
+
+    def _ai_context() -> MigrationContext:
+        # Credential-free "where you are" for the panel's baseline context chip.
+        st = SESSION_STORE.get_or_create(session_id)
+        view = st.active_view
+        step = "Connect"
+        if isinstance(view, str) and view and view.lower() != "connect":
+            step = view.replace("_", " ").title()
+        mtype = ""
+        if st.migration_type_chosen():
+            mtype = str(getattr(st.migration_type, "value", "")).replace("_", " ")
+        return MigrationContext(current_step=step, migration_type=mtype)
+
     # Build each step's (content_builder, runner). These only prepare closures;
     # nothing renders until the sidebar selects and invokes a screen.
     # Step 1 (Evaluation) is the first workflow step after Connect. The migration
@@ -127,6 +151,7 @@ def build_page(
         session_id,
         job_manager=JOB_MANAGER,
         eval_store=EVALUATION_STORE,
+        open_ai_scope=_open_ai_scope,
     )
     # Step 2 (Schema Conversion): object browsing, DDL preview, query conversion,
     # and target apply.
@@ -901,6 +926,8 @@ def build_page(
         cdc_teardown_done_dismiss=_cdc_teardown_done_dismiss,
         cdc_op_in_flight_getter=_cdc_op_in_flight,
         cdc_probe=_cdc_probe,
+        on_ai_panel_ready=lambda handle: _ai_panel_holder.__setitem__("handle", handle),
+        ai_context_getter=_ai_context,
         optional_tools={
             _QUERY_PLAYGROUND_VIEW: OptionalTool(
                 view_key=_QUERY_PLAYGROUND_VIEW,

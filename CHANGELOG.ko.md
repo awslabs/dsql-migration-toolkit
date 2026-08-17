@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.361
+
+### Added
+
+- **상시 AI 어시스턴트 패널이 앱 셸에 실제로 배선되었고, Evaluation 화면의 AI guidance가 이 패널로
+  열립니다.** AI 경험 개편의 두 번째 증분: `build_workflow_sidebar`가 패널을 1회 생성(콘텐츠 새로고침에도
+  살아남는 우측 드로어)하고, 언제든 열고/닫을 수 있는 상시 `auto_awesome` **헤더 토글**을 추가하며, 기준
+  컨텍스트 칩("지금 어디인지")을 표시합니다. 패널 핸들은 `app.py`로 반환되어 화면의 AI 버튼과 단계별
+  `MigrationContext`를 패널로 라우팅합니다. Evaluation의 객체별 "AI guidance"는 이제 패널로 딥링크
+  (`open_scope`)되어 대화가 여정 내내 유지되며, 패널이 배선되지 않은 경우(예: 테스트)에는 기존 화면별
+  드로어로 우아하게 폴백합니다 — 그래서 다른 화면들은 아직 동작/테스트 변경이 없습니다. Schema
+  Conversion, Query Converter, Validation, Full Load는 아직 화면별 드로어를 열며, 이들의 이관과 옛 드로어
+  은퇴는 다음 증분입니다.
+
 ## v0.1.360
 
 ### Added

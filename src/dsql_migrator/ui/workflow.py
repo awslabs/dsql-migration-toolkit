@@ -29,7 +29,8 @@ import os
 import re
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
-from dsql_migrator.core.models import StepStatus, WorkflowState
+from dsql_migrator.core.models import MigrationContext, StepStatus, WorkflowState
+from dsql_migrator.ui.ai_panel import AiPanelHandle, build_ai_panel
 from dsql_migrator.ui.design import (
     STATUS_DOT_TONES,
     inline_hint,
@@ -1115,6 +1116,8 @@ def build_workflow_sidebar(
     cdc_op_in_flight_getter: Optional[Callable[[], Optional[str]]] = None,
     cdc_probe: Optional[Callable[[], None]] = None,
     optional_tools: Optional[dict[str, "OptionalTool"]] = None,
+    on_ai_panel_ready: Optional[Callable[["AiPanelHandle"], None]] = None,
+    ai_context_getter: Optional[Callable[[], "MigrationContext"]] = None,
 ) -> None:
     """Render the app as a sidebar layout: header + left-drawer nav + content.
 
@@ -1258,6 +1261,26 @@ def build_workflow_sidebar(
 
         return _run
 
+    # --- Persistent AI assistant panel (right drawer) -------------------------
+    # Built once at the shell so it survives content refreshes (it is a sibling of
+    # the header/left-drawer, outside the refreshable main content). Renders from the
+    # session (transcript + open/closed state survive close/reopen, navigation, and a
+    # browser refresh). Screens deep-link into it via the handle's open_scope; the
+    # header toggle opens/closes it. Handed back via on_ai_panel_ready so app.py can
+    # route the screens' AI buttons + Connect's auto-open through the same handle.
+    ai_panel = build_ai_panel(ui, state=state, get_context=ai_context_getter)
+    if on_ai_panel_ready is not None:
+        on_ai_panel_ready(ai_panel)
+
+    def _toggle_ai_panel() -> None:
+        if ai_panel.is_enabled():
+            ai_panel.toggle()
+        else:
+            ui.notify(
+                "Enable AI Assist on the Connect screen to use the assistant.",
+                type="info",
+            )
+
     # --- Header ---------------------------------------------------------------
     with ui.header().classes("items-center justify-between"):
         with ui.row().classes("items-center gap-2"):
@@ -1266,6 +1289,11 @@ def build_workflow_sidebar(
             )
             ui.label(app_title).classes("text-lg font-bold")
         with ui.row().classes("items-center gap-3"):
+            # AI assistant toggle: always present so the panel can be opened/closed
+            # anytime; a no-op-with-hint until AI Assist is enabled on Connect.
+            ui.button(icon="auto_awesome", on_click=_toggle_ai_panel).props(
+                "flat round dense color=white"
+            ).tooltip("AI assistant")
             if on_reset is not None:
 
                 async def _open_start_over() -> None:

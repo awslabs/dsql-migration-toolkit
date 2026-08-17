@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.361
+
+### Added
+
+- **The persistent AI assistant panel is now live in the app shell, and the Evaluation screen's AI
+  guidance opens into it.** Second increment of the AI-experience overhaul: `build_workflow_sidebar`
+  builds the panel once (a right drawer that survives content refreshes), adds an always-present
+  `auto_awesome` **header toggle** to open/close it anytime, and shows a baseline context chip ("where
+  you are"). The panel is handed back to `app.py`, which routes screen AI buttons + a per-step
+  `MigrationContext` through it. Evaluation's per-object "AI guidance" now deep-links into the panel
+  (`open_scope`) so the conversation persists across the journey, with a graceful fallback to the
+  old per-screen drawer when the panel isn't wired (e.g. tests) — so no behavior/test churn for the
+  other screens yet. Schema Conversion, Query Converter, Validation, and Full Load still open the
+  per-screen drawer; migrating them and retiring the old drawer lands next.
+
 ## v0.1.360
 
 ### Added
