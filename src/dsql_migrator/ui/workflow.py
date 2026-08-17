@@ -1118,6 +1118,7 @@ def build_workflow_sidebar(
     optional_tools: Optional[dict[str, "OptionalTool"]] = None,
     on_ai_panel_ready: Optional[Callable[["AiPanelHandle"], None]] = None,
     ai_context_getter: Optional[Callable[[], "MigrationContext"]] = None,
+    ai_general_streamer_factory: Optional[Callable[[], object]] = None,
 ) -> None:
     """Render the app as a sidebar layout: header + left-drawer nav + content.
 
@@ -1268,7 +1269,12 @@ def build_workflow_sidebar(
     # browser refresh). Screens deep-link into it via the handle's open_scope; the
     # header toggle opens/closes it. Handed back via on_ai_panel_ready so app.py can
     # route the screens' AI buttons + Connect's auto-open through the same handle.
-    ai_panel = build_ai_panel(ui, state=state, get_context=ai_context_getter)
+    ai_panel = build_ai_panel(
+        ui,
+        state=state,
+        get_context=ai_context_getter,
+        general_streamer_factory=ai_general_streamer_factory,
+    )
     if on_ai_panel_ready is not None:
         on_ai_panel_ready(ai_panel)
 

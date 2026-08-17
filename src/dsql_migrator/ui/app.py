@@ -33,6 +33,10 @@ from dsql_migrator.config import (
     load_connect_defaults,
     read_env_file,
 )
+from dsql_migrator.core.assessment_strategist import (
+    AssessmentStrategist,
+    build_general_chat_system,
+)
 from dsql_migrator.core.job_manager import JobManager
 from dsql_migrator.core.models import MigrationContext
 from dsql_migrator.ui.connect import build_connect_page
@@ -140,6 +144,25 @@ def build_page(
         if st.migration_type_chosen():
             mtype = str(getattr(st.migration_type, "value", "")).replace("_", " ")
         return MigrationContext(current_step=step, migration_type=mtype)
+
+    def _general_ai_streamer() -> object:
+        # The panel's "ask anything about this migration" streamer, used when it is
+        # opened from the header with no specific object scope. Grounded on the
+        # current MigrationContext and carrying the same migration-only guardrail as
+        # the per-object chats. None when AI is off (the panel stays inert then).
+        st = SESSION_STORE.get_or_create(session_id)
+        if not st.ai_assist.enabled:
+            return None
+        strategist = AssessmentStrategist(st.ai_assist, aws_profile=st.aws_profile)
+        ctx = _ai_context()
+        system = build_general_chat_system(
+            current_step=ctx.current_step,
+            migration_type=ctx.migration_type,
+            summary=ctx.summary,
+        )
+        return lambda messages, on_delta: strategist.stream_chat(
+            system, messages, on_delta
+        )
 
     # Build each step's (content_builder, runner). These only prepare closures;
     # nothing renders until the sidebar selects and invokes a screen.
@@ -928,6 +951,7 @@ def build_page(
         cdc_probe=_cdc_probe,
         on_ai_panel_ready=lambda handle: _ai_panel_holder.__setitem__("handle", handle),
         ai_context_getter=_ai_context,
+        ai_general_streamer_factory=_general_ai_streamer,
         optional_tools={
             _QUERY_PLAYGROUND_VIEW: OptionalTool(
                 view_key=_QUERY_PLAYGROUND_VIEW,

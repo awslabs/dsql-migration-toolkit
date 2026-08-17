@@ -344,3 +344,52 @@ def test_reopen_tab_hidden_when_ai_disabled() -> None:
     ui = _Ui()
     build_ai_panel(ui, state=state)
     assert _reopen_tab(ui).visible is False  # no AI -> no floating reopen tab
+
+
+def test_general_scope_activates_on_open_from_header() -> None:
+    # Opened from the header with no object scope -> a general "ask anything about
+    # this migration" streamer is wired so the composer is usable immediately.
+    state = _enabled_state()
+    ui = _Ui()
+    calls = {"n": 0}
+
+    def factory():  # noqa: ANN202
+        calls["n"] += 1
+        return _make_streamer("general reply")
+
+    panel = build_ai_panel(ui, state=state, general_streamer_factory=factory)
+    panel.set_visible(True)
+    assert calls["n"] == 1
+    assert state.ai_conversation.active_scope.scope_id == "general"
+
+
+def test_object_scope_takes_priority_over_general() -> None:
+    # A screen deep-link sets a SPECIFIC scope; the general factory is not used.
+    state = _enabled_state()
+    ui = _Ui()
+    calls = {"n": 0}
+
+    def factory():  # noqa: ANN202
+        calls["n"] += 1
+        return _make_streamer("general")
+
+    panel = build_ai_panel(ui, state=state, general_streamer_factory=factory)
+    panel.open_scope(
+        scope_id="eval:orders", title="orders",
+        streamer=_make_streamer("A"), seed_question="Q",
+    )
+    _pump(ui)
+    assert state.ai_conversation.active_scope.scope_id == "eval:orders"
+    assert calls["n"] == 0
+
+
+def test_general_chat_system_is_migration_scoped_and_declines_off_topic() -> None:
+    from dsql_migrator.core.assessment_strategist import build_general_chat_system
+
+    sysp = build_general_chat_system(
+        current_step="Validation", migration_type="full load + cdc"
+    )
+    low = sysp.lower()
+    assert "aurora dsql" in low and "migrat" in low  # migration-domain scoped
+    assert "off-topic" in low and "decline" in low   # declines unrelated questions
+    assert "Validation" in sysp                       # grounded on the current step

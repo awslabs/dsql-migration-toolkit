@@ -285,6 +285,48 @@ def build_object_chat_system(item: AssessmentItem) -> str:
     )
 
 
+def build_general_chat_system(
+    *, current_step: str = "", migration_type: str = "", summary: str = ""
+) -> str:
+    """System grounding for the GENERAL (no specific object) assistant panel.
+
+    Opened from the header, the persistent panel lets the user ask about the
+    migration as a whole. This pins it to a MySQL -> Amazon Aurora DSQL migration
+    assistant: it answers questions about THIS migration (schema conversion, data
+    migration / CDC, validation, cut over, DSQL behavior and constraints) and the
+    current progress -- grounded on the credential-free
+    :class:`~dsql_migrator.core.models.MigrationContext` -- and DECLINES anything
+    off-topic, using the SAME guardrail wording as the per-object chats. No
+    credentials or row data ever enter the prompt (Property 7).
+    """
+    where = []
+    if current_step:
+        where.append(f"- Current step: {current_step}")
+    if migration_type:
+        where.append(f"- Migration type: {migration_type}")
+    if summary:
+        where.append(f"- Notes: {summary}")
+    context_block = "\n".join(where) or "- (no step context captured yet)"
+    return (
+        "You are a senior AWS database migration engineer chatting with a teammate "
+        "who is migrating a MySQL database to Amazon Aurora DSQL "
+        "(PostgreSQL-compatible) using this tool. Answer naturally and "
+        "conversationally; light GitHub-flavored Markdown is fine, but keep it "
+        "reading like a natural reply, not a form. Be specific and reasonably "
+        "concise.\n\n"
+        "Stay strictly on the topic of THIS MySQL -> Aurora DSQL migration: schema "
+        "conversion, data migration (Full Load / CDC), validation, cut over, and "
+        "Aurora DSQL behavior/constraints, plus the current progress. If the user "
+        "asks about anything off-topic — unrelated technologies, other systems, "
+        "general chit-chat, or non-migration questions — politely decline in one "
+        "sentence and steer back to the migration.\n\n"
+        "Where the user is in the tool (deterministic, authoritative — never "
+        "contradict it):\n"
+        f"{context_block}\n\n"
+        f"Aurora DSQL constraints:\n{DSQL_CONSTRAINTS}"
+    )
+
+
 def build_conversion_chat_system(
     object_name: str, source_ddl: str, deterministic_ddl: str
 ) -> str:
@@ -1154,6 +1196,7 @@ __all__ = [
     "build_assessment_prompt",
     "build_object_guidance_prompt",
     "build_object_chat_system",
+    "build_general_chat_system",
     "build_validation_chat_system",
     "build_conversion_chat_system",
     "build_query_chat_system",

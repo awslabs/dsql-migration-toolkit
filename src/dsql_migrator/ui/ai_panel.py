@@ -99,6 +99,7 @@ def build_ai_panel(
     *,
     state: object,
     get_context: Optional[Callable[[], MigrationContext]] = None,
+    general_streamer_factory: Optional[Callable[[], Optional[ChatStreamer]]] = None,
 ) -> AiPanelHandle:
     """Build the persistent AI panel once and return its :class:`AiPanelHandle`.
 
@@ -217,6 +218,40 @@ def build_ai_panel(
         bits = [b for b in (ctx.current_step, ctx.migration_type) if b]
         return "  ·  ".join(bits)
 
+    def _ensure_general_scope() -> None:
+        """Give the panel a GENERAL (whole-migration) streamer when it is opened with
+        no specific object scope, so the composer is usable straight from the header
+        toggle -- "ask anything about this migration".
+
+        The general streamer is grounded on the current MigrationContext and carries
+        the same domain guardrail as the per-object chats (migration-only, declines
+        off-topic). It is reconstructable, so this also restores a usable composer for
+        the general scope after a browser refresh (a screen-specific scope's live
+        streamer is not reconstructable and stays disabled until re-deep-linked).
+        """
+        if general_streamer_factory is None:
+            return
+        active = conversation.active_scope
+        if active is not None and active.scope_id != "general":
+            return  # a specific screen scope is active -- never override it
+        if active is not None and conv["streamer"] is not None:
+            return  # the general scope is already live
+        streamer = general_streamer_factory()
+        if streamer is None:
+            return
+        conv["streamer"] = streamer
+        if active is None:
+            conversation.active_scope = AiScope(
+                scope_id="general", title="AI assistant", chip=_baseline_chip()
+            )
+            conv["scope_start"] = len(conversation.messages)
+        try:
+            title_label.set_text("AI assistant")  # type: ignore[attr-defined]
+            subtitle_label.set_text("")  # type: ignore[attr-defined]
+            chip_label.set_text(_baseline_chip())  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+
     def _apply_composer_state() -> None:
         remaining = chat_turns_remaining(conversation.messages)
         at_limit = remaining <= 0
@@ -251,6 +286,10 @@ def build_ai_panel(
         _apply_composer_state()
 
     def _set_visible(visible: bool) -> None:
+        # Opening with no object scope -> activate the general "ask anything about
+        # this migration" streamer so the composer is immediately usable.
+        if visible:
+            _ensure_general_scope()
         conversation.visible = bool(visible)
         try:
             (drawer.show if visible else drawer.hide)()  # type: ignore[attr-defined]
@@ -260,6 +299,7 @@ def build_ai_panel(
             except Exception:  # noqa: BLE001
                 pass
         _sync_reopen_tab()
+        _apply_composer_state()
 
     def _autoscroll(force: bool = False) -> None:
         if not force and not _scroll_state.get("at_bottom", True):

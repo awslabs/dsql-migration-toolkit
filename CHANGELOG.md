@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.364
+
+### Added
+
+- **The AI panel can now be used from the header to "ask anything about this migration," not only
+  from a screen's object button — with a migration-only guardrail.** Opening the panel with no
+  object scope activates a GENERAL assistant grounded on the current step (`MigrationContext`), so
+  the composer is immediately usable. Its system prompt carries the SAME guardrail as the per-object
+  chats: it is pinned to this MySQL→Aurora DSQL migration (schema conversion, data migration/CDC,
+  validation, cut over, DSQL behavior) and politely declines + steers back on anything off-topic;
+  it is credential-free (Property 7) and bounded (turn/length caps). The general streamer is
+  reconstructable, so the composer stays usable for it after a browser refresh (a screen-specific
+  scope's live streamer is not, and stays disabled until re-opened from that screen). A screen
+  deep-link still takes priority over the general scope.
+
 ## v0.1.363
 
 ### Changed
