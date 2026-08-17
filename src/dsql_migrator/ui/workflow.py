@@ -1289,11 +1289,15 @@ def build_workflow_sidebar(
             )
             ui.label(app_title).classes("text-lg font-bold")
         with ui.row().classes("items-center gap-3"):
-            # AI assistant toggle: always present so the panel can be opened/closed
-            # anytime; a no-op-with-hint until AI Assist is enabled on Connect.
-            ui.button(icon="auto_awesome", on_click=_toggle_ai_panel).props(
-                "flat round dense color=white"
-            ).tooltip("AI assistant")
+            # AI assistant toggle: a LABELED button (not a bare icon) so it is
+            # obvious it opens/closes the side panel -- matches the "Start over"
+            # button's treatment. Always present so the panel is reachable anytime;
+            # a no-op-with-hint until AI Assist is enabled on Connect.
+            ui.button(
+                "AI assistant", icon="auto_awesome", on_click=_toggle_ai_panel
+            ).props("flat dense color=white").tooltip(
+                "Open or close the AI assistant panel"
+            )
             if on_reset is not None:
 
                 async def _open_start_over() -> None:

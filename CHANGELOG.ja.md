@@ -5,6 +5,15 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.362
+
+### Changed
+
+- **ヘッダーの AI パネルトグルが、単なるアイコンではなくラベル付きの「AI assistant」ボタンになりました。**
+  これによりサイドパネルを開閉するボタンであることが明確になります(`auto_awesome` アイコンだけでは何をする
+  ものか分かりませんでした)。「Start over」ボタンと同じ体裁で、ツールチップも「Open or close the AI
+  assistant panel」と明確になりました。
+
 ## v0.1.361
 
 ### Added

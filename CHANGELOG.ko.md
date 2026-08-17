@@ -5,6 +5,14 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.362
+
+### Changed
+
+- **헤더의 AI 패널 토글이 이제 아이콘 하나가 아니라 라벨이 있는 "AI assistant" 버튼입니다.** 그래서 사이드
+  패널을 여닫는 버튼임이 분명해집니다(`auto_awesome` 아이콘만으로는 무슨 동작인지 알 수 없었음).
+  "Start over" 버튼과 동일한 스타일이며, 툴팁도 "Open or close the AI assistant panel"로 명확해졌습니다.
+
 ## v0.1.361
 
 ### Added

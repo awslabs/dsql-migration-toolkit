@@ -5,6 +5,15 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.362
+
+### Changed
+
+- **The header AI-panel toggle is now a labeled "AI assistant" button, not a bare icon**, so it is
+  obvious it opens/closes the side panel (a lone `auto_awesome` glyph gave no hint of what it did).
+  It matches the "Start over" button's treatment and its tooltip now reads "Open or close the AI
+  assistant panel."
+
 ## v0.1.361
 
 ### Added
