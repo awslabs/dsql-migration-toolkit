@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.359
+
+### Changed
+
+- **fresh-clone 기본 이미지를 `0.1.344` → `0.1.358`로 올렸습니다.** `deploy/cloudformation.yaml`의
+  `ContainerImageUri` 기본값이 새로 재퍼블리시한 public 이미지
+  (`public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.358`)를 가리키도록 바꿔, `git clone` 후 배포하면
+  오래된 빌드가 아니라 현재 빌드를 받습니다. `0.1.358` 이미지는 3개 레지스트리(public `z0q0i9j0`,
+  private `us-east-1`, private `ap-northeast-2`) 모두에 퍼블리시했고, 배포된 Seoul 스택
+  (`mysql-dsql-migrator-seoul`)도 이 이미지로 업데이트했습니다. 드리프트 가드(app patch − default patch,
+  0–20 범위 유지)는 이제 1입니다.
+
 ## v0.1.358
 
 ### Changed

@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.359
+
+### Changed
+
+- **Fresh-clone default image bumped `0.1.344` → `0.1.358`.** The `ContainerImageUri` default in
+  `deploy/cloudformation.yaml` now points at the freshly republished public image
+  (`public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.358`), so a `git clone` + deploy pulls the
+  current build instead of a stale one. The `0.1.358` image was published to all three registries
+  (public `z0q0i9j0`, private `us-east-1`, private `ap-northeast-2`) and the deployed Seoul stack
+  (`mysql-dsql-migrator-seoul`) was updated to it. Drift guard (app patch − default patch, must stay
+  in 0–20) is now 1.
+
 ## v0.1.358
 
 ### Changed
