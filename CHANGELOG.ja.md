@@ -5,6 +5,28 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.358
+
+### Changed
+
+- **Full Load のソース負荷スロットル(v0.1.357)が、実行時に調整できる Settings ノブになり、一時停止状態が
+  進捗キャプションに表示されるようになりました。** オプトインの governor を Fargate で実際に使えるように
+  する追随対応です(Fargate はコンテナの環境変数がデプロイ時に固定され、アプリは Web UI からのみアクセス
+  可能):
+  - **Settings タブのノブ。** `full_load_max_source_threads_running` が実行時チューニングノブ(Settings →
+    Full Load)になり、オペレーターがブラウザから有効化/調整/無効化できます — Fargate で唯一の設定経路 —
+    そして他の Full Load ノブと同様に、次の Full Load 実行 /「Retry failed tables」から適用されます(再
+    デプロイ不要)。整数ノブの仕組みに合わせるため、フィールドを `Optional[int]`(未設定=off)から **0 = off**
+    の `int`(デフォルト 0)へ変更しました。env キーは変わらず、0/未設定はどちらも「スロットルなし」です。
+    範囲は 0–10000。
+  - **進捗キャプションのヒント。** governor があるテーブルの読み取りを一時停止している間、Full Load の進捗
+    キャプションに「— paused on source load (N table(s): source Threads_running over the configured
+    ceiling)」が付きます。これにより、意図的なスロットルがハングと誤認されることがありません。ワーカーが
+    pause/resume の遷移を進捗ドレインへ報告し(テーブル名のみ — Property 7)、ドレインがジョブにテーブル単位の
+    一時停止リーダー数(`MigrationJob.throttled_tables`、追加・デフォルト値付き)を保持します。この数は既存の
+    インメモリのジョブスナップショットに乗り、durable なジョブシグネチャを変えないため、スロットルの振動が
+    追加の S3 書き込みを引き起こしません。
+
 ## v0.1.357
 
 ### Added

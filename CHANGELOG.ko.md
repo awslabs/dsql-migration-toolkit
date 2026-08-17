@@ -5,6 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.358
+
+### Changed
+
+- **Full Load 소스 부하 스로틀(v0.1.357)이 이제 런타임에서 조정 가능한 Settings 노브가 되었고, 일시정지
+  상태가 진행 캡션에 표시됩니다.** 옵트인 governor를 Fargate에서 실제로 쓸 수 있게 하는 후속 작업입니다
+  (Fargate는 컨테이너 환경변수가 배포 시 고정되고, 앱은 웹 UI로만 접근 가능):
+  - **Settings 탭 노브.** `full_load_max_source_threads_running`이 런타임 튜닝 노브(Settings → Full
+    Load)가 되어, 운영자가 브라우저에서 켜기/조정/끄기를 할 수 있습니다 — Fargate의 유일한 설정 경로 —
+    그리고 다른 Full Load 노브들처럼 다음 Full Load 실행 / "Retry failed tables"부터 적용됩니다(재배포
+    불필요). 정수 노브 체계에 맞추기 위해 필드를 `Optional[int]`(미설정=off)에서 **0 = off**인 `int`(기본값
+    0)로 변경했습니다. env 키는 그대로이며 0/미설정 모두 "스로틀 없음"입니다. 범위 0–10000.
+  - **진행 캡션 힌트.** governor가 어떤 테이블의 읽기를 일시정지시키는 동안, Full Load 진행 캡션에
+    "— paused on source load (N table(s): source Threads_running over the configured ceiling)"가
+    덧붙습니다. 그래서 의도된 스로틀이 멈춤(hang)으로 오인되지 않습니다. 워커가 pause/resume 전이를 진행
+    드레인에 보고하고(테이블 이름만 — Property 7), 드레인이 잡에 테이블별 일시정지-리더 카운트
+    (`MigrationJob.throttled_tables`, additive/기본값)를 유지합니다. 이 카운트는 기존 인메모리 잡 스냅샷에
+    실려 있고 durable 잡 시그니처를 바꾸지 않으므로, 스로틀 진동이 추가 S3 쓰기를 유발하지 않습니다.
+
 ## v0.1.357
 
 ### Added

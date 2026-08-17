@@ -1002,11 +1002,11 @@ def _render_footer_tools(activity_log_path: str) -> None:
             # shrank and -- because a centred dialog is positioned from its middle -- the
             # tab strip itself moved under the pointer. Clicking through the tabs made the
             # whole panel jump. A single height keeps the strip anchored so only the
-            # content changes. Sized to the tallest panel (Full Load: notice + 3 fields)
+            # content changes. Sized to the tallest panel (Full Load: notice + 4 fields)
             # so nothing scrolls in the normal case; the vh cap keeps a small viewport
             # from pushing the dialog off-screen, and overflow-y auto means a panel that
             # does exceed it scrolls inside instead of resizing the card.
-            "height: 21rem; max-height: 68vh; overflow-y: auto"
+            "height: 26rem; max-height: 68vh; overflow-y: auto"
         ):
             for name, tab in zip(groups, group_tabs):
                 with ui.tab_panel(tab).classes("p-0 pt-3"):

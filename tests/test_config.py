@@ -101,8 +101,8 @@ def test_load_config_full_load_parallelism_defaults() -> None:
     # Reader sharding is OFF by default (one reader, previous behavior).
     assert config.full_load_reader_shards == 1
     assert config.full_load_shard_min_rows == 1_000_000
-    # The source-load governor is OFF by default (None -> no throttle, zero overhead).
-    assert config.full_load_max_source_threads_running is None
+    # The source-load governor is OFF by default (0 -> no throttle, zero overhead).
+    assert config.full_load_max_source_threads_running == 0
     # Per-batch retry budget: patient default (rides out a transient conn storm).
     assert config.full_load_occ_max_attempts == 20
 
@@ -136,12 +136,17 @@ def test_load_config_reads_source_load_governor_ceiling() -> None:
         env={f"{ENV_PREFIX}FULL_LOAD_MAX_SOURCE_THREADS_RUNNING": "40"}
     )
     assert config.full_load_max_source_threads_running == 40
+    # 0 is the OFF sentinel (not rejected): the throttle is disabled.
+    off = load_config(
+        env={f"{ENV_PREFIX}FULL_LOAD_MAX_SOURCE_THREADS_RUNNING": "0"}
+    )
+    assert off.full_load_max_source_threads_running == 0
 
 
-def test_load_config_source_load_governor_rejects_below_one() -> None:
-    # ge=1: a ceiling of 0 would pause forever; reject it rather than silently stall.
+def test_load_config_source_load_governor_rejects_negative() -> None:
+    # ge=0: 0 = off is valid, but a negative ceiling is nonsensical -> rejected.
     with pytest.raises(ValidationError):
-        load_config(env={f"{ENV_PREFIX}FULL_LOAD_MAX_SOURCE_THREADS_RUNNING": "0"})
+        load_config(env={f"{ENV_PREFIX}FULL_LOAD_MAX_SOURCE_THREADS_RUNNING": "-1"})
 
 
 def test_load_config_full_load_batch_rows_rejects_over_cap() -> None:
@@ -362,6 +367,7 @@ def test_tunable_knobs_bounds_match_appconfig_fields() -> None:
         "full_load_table_parallelism": (1, 16),
         "full_load_batch_parallelism": (1, 32),
         "full_load_batch_rows": (1, 3000),
+        "full_load_max_source_threads_running": (0, 10000),
         "validate_max_workers": (1, 32),
         "cdc_sink_mcu_count": (1, 8),
     }
@@ -497,6 +503,7 @@ def test_current_tuning_values_reflect_defaults(monkeypatch: pytest.MonkeyPatch)
         "full_load_table_parallelism": 4,
         "full_load_batch_parallelism": 8,
         "full_load_batch_rows": 2000,
+        "full_load_max_source_threads_running": 0,
         "validate_max_workers": 4,
         "cdc_sink_mcu_count": 4,
     }
@@ -535,3 +542,24 @@ def test_set_tuning_value_rejects_non_integer_and_unknown(
         set_tuning_value("full_load_batch_rows", "abc")  # type: ignore[arg-type]
     with pytest.raises(TuningValueError):
         set_tuning_value("no_such_knob", 5)
+
+
+def test_source_load_governor_is_tunable_from_the_settings_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The governor ceiling is a runtime knob, so it can be enabled/adjusted/turned
+    off from the Settings tab (the ONLY config path on Fargate, where the container's
+    env is fixed at deploy) -- applied by the next Full Load run, no redeploy."""
+    key = f"{ENV_PREFIX}FULL_LOAD_MAX_SOURCE_THREADS_RUNNING"
+    monkeypatch.delenv(key, raising=False)
+    # Turn it ON from the UI path -> the next load_config() sees it.
+    assert set_tuning_value("full_load_max_source_threads_running", 60) == 60
+    assert load_config().full_load_max_source_threads_running == 60
+    # Turn it back OFF with 0 (a valid value, not a rejected one).
+    assert set_tuning_value("full_load_max_source_threads_running", 0) == 0
+    assert load_config().full_load_max_source_threads_running == 0
+    # Its bounds are enforced on the way in (ge 0, le 10000).
+    with pytest.raises(TuningValueError):
+        set_tuning_value("full_load_max_source_threads_running", -1)
+    with pytest.raises(TuningValueError):
+        set_tuning_value("full_load_max_source_threads_running", 10001)

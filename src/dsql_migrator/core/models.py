@@ -751,6 +751,13 @@ class MigrationJob(BaseModel):
     # on the durable per-TABLE tracked job (which is what is persisted/displayed);
     # additive + defaulted so already-persisted job snapshots still deserialize.
     resume_batch_watermark: dict[str, int] = Field(default_factory=dict)
+    # Live UI state (not durable): table name -> number of its Full Load readers
+    # currently PAUSED by the source-load governor (a table has K shard readers, each
+    # of which may pause independently). The progress caption shows a "paused on source
+    # load" hint for tables with a count > 0. Maintained by the progress drain from the
+    # workers' throttle transitions; empty by default and additive so persisted
+    # snapshots still deserialize (a stale entry on a reloaded terminal job is unread).
+    throttled_tables: dict[str, int] = Field(default_factory=dict)
     watermark: Optional[Watermark] = Field(
         default=None,
         description=(

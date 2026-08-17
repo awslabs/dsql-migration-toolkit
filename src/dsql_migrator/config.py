@@ -395,23 +395,26 @@ class AppConfig(BaseModel):
             "DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS."
         ),
     )
-    full_load_max_source_threads_running: Optional[int] = Field(
-        default=None,
-        ge=1,
+    full_load_max_source_threads_running: int = Field(
+        default=0,
+        ge=0,
+        le=10000,
         description=(
-            "OPT-IN source-load throttle for Full Load (unset by default = OFF, no "
-            "throttle, zero overhead). When set, a reader PAUSES before fetching its "
+            "OPT-IN source-load throttle for Full Load (0 = OFF, the default: no "
+            "throttle, zero overhead). When > 0, a reader PAUSES before fetching its "
             "next page while the SOURCE's global Threads_running exceeds this value "
             "and resumes when it recedes -- so the migration caps the source's "
             "active-query concurrency at roughly this number, protecting a "
             "live-serving source (gh-ost --max-load style). It never fails the load "
             "(pause-only; a failed status read is ignored) and the paused state is "
-            "logged. IMPORTANT: the migration's OWN readers (up to "
-            "full_load_table_parallelism x full_load_reader_shards x "
-            "full_load_batch_parallelism) count toward Threads_running, so set this "
-            "ABOVE your application's steady-state Threads_running plus the headroom "
-            "you want the migration to use -- too low will stall the read. Config "
-            "key: DSQL_MIGRATOR_FULL_LOAD_MAX_SOURCE_THREADS_RUNNING."
+            "logged and shown in the Full Load progress caption. IMPORTANT: the "
+            "migration's OWN readers (up to full_load_table_parallelism x "
+            "full_load_reader_shards x full_load_batch_parallelism) count toward "
+            "Threads_running, so set this ABOVE your application's steady-state "
+            "Threads_running plus the headroom you want the migration to use -- too "
+            "low will stall the read. Runtime-tunable from the Settings tab (applies "
+            "at the next Full Load run/retry, no redeploy). Config key: "
+            "DSQL_MIGRATOR_FULL_LOAD_MAX_SOURCE_THREADS_RUNNING."
         ),
     )
     cdc_sink_mcu_count: int = Field(
@@ -626,6 +629,31 @@ TUNABLE_KNOBS: tuple[TunableKnob, ...] = (
         "Full Load",
         "Rows per batch",
         "Rows per INSERT batch (DSQL caps a transaction at 3000 rows).",
+    ),
+    TunableKnob(
+        "full_load_max_source_threads_running",
+        "FULL_LOAD_MAX_SOURCE_THREADS_RUNNING",
+        "Full Load",
+        "Source-load throttle (max Threads_running)",
+        "Pause reads while the source's Threads_running exceeds this; 0 = off.",
+        help_text=(
+            "A safety valve for running Full Load against a source that is still "
+            "serving production traffic. When the source's global Threads_running "
+            "exceeds this ceiling, every reader pauses between pages and resumes the "
+            "moment it recedes — capping the source's active-query concurrency at "
+            "roughly this number (gh-ost --max-load style). It only ever PAUSES: it "
+            "never fails the load, and if the status read itself fails it is ignored "
+            "(fail-open), so it cannot stall the migration on a hiccup.\n\n"
+            "0 disables it (no throttle, zero overhead) — the default.\n\n"
+            "How to size it: the migration's OWN readers (up to tables-in-parallel × "
+            "reader shards × batches-per-table) count toward Threads_running, so set "
+            "this ABOVE your application's steady-state Threads_running plus the "
+            "headroom you want the migration to use. Too low (below your app's own "
+            "load) will pause the read indefinitely — a Stop still works, and the "
+            "pause is logged and shown in the progress caption. Takes effect at the "
+            "next Full Load run or 'Retry failed tables' (re-read from config), so "
+            "you can turn it on/adjust it without a redeploy."
+        ),
     ),
     # CDC before Validation: this tuple's group order IS the Settings tab order, and it
     # should follow the migration journey the operator is working through (Full Load ->

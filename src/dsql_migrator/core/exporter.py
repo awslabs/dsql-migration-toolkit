@@ -622,14 +622,23 @@ class SourceLoadGovernor:
         connection: _Connection,
         max_threads_running: Optional[int],
         *,
-        sleep: Callable[[float], None] = _wall_sleep,
+        sleep: Optional[Callable[[float], None]] = None,
         monotonic: Callable[[], float] = _wall_monotonic,
         ttl_seconds: float = _GOVERNOR_STATUS_TTL_SECONDS,
         slice_seconds: float = _GOVERNOR_WAIT_SLICE_SECONDS,
         on_state_change: Optional[Callable[[bool, Optional[int]], None]] = None,
     ) -> None:
         self._connection = connection
-        self._ceiling = max_threads_running
+        # Normalize the ceiling: None / 0 / negative all mean OFF (0 is the config's
+        # "off" sentinel), so the rest of the class only checks ``is None``.
+        self._ceiling = (
+            max_threads_running
+            if max_threads_running and max_threads_running > 0
+            else None
+        )
+        # None -> _wall_sleep resolved at call time (so a test can monkeypatch it on
+        # the governor built internally by stream_converted_rows), like the validator's
+        # reconnect proxy.
         self._sleep = sleep
         self._monotonic = monotonic
         self._ttl = ttl_seconds
@@ -694,7 +703,7 @@ class SourceLoadGovernor:
             self._set_paused(True, running)
             if should_cancel is not None and should_cancel():
                 return  # caller re-polls should_cancel -> ExportCancelled
-            self._sleep(self._slice)
+            (self._sleep or _wall_sleep)(self._slice)
             fresh = True  # re-read the metric each slice while paused
 
 
@@ -983,6 +992,7 @@ class TableExporter:
         target_types: Optional[Mapping[str, str]] = None,
         pk_lower: Optional[int] = None,
         pk_upper: Optional[int] = None,
+        on_throttle: Optional[Callable[[bool, Optional[int]], None]] = None,
     ) -> "Iterator[Mapping[str, object]]":
         """Yield target-ready (converted) rows from a read-only consistent snapshot.
 
@@ -1014,8 +1024,12 @@ class TableExporter:
                 )
                 snapshot.execute(text(START_CONSISTENT_SNAPSHOT))
                 governor = (
-                    SourceLoadGovernor(snapshot, self._max_source_threads_running)
-                    if self._max_source_threads_running is not None
+                    SourceLoadGovernor(
+                        snapshot,
+                        self._max_source_threads_running,
+                        on_state_change=on_throttle,
+                    )
+                    if self._max_source_threads_running
                     else None
                 )
                 try:

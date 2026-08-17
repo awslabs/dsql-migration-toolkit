@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.358
+
+### Changed
+
+- **The Full Load source-load throttle (v0.1.357) is now a runtime-tunable Settings knob and its
+  paused state shows in the progress caption.** Two follow-ups that make the opt-in governor usable
+  on Fargate (where the container's environment is fixed at deploy and the app is reachable only
+  through the web UI):
+  - **Settings-tab knob.** `full_load_max_source_threads_running` is now a runtime tuning knob
+    (Settings → Full Load), so an operator can enable / adjust / turn it off from the browser — the
+    only config path on Fargate — with the change applied at the next Full Load run / "Retry failed
+    tables" (no redeploy), exactly like the other Full Load knobs. To fit the integer-knob machinery
+    the field changed from `Optional[int]` (unset = off) to `int` with **0 = off** (the default);
+    the env key is unchanged and 0/unset both mean "no throttle". Bounds 0–10000.
+  - **Progress-caption hint.** While a table's read is paused by the governor, the Full Load progress
+    caption appends "— paused on source load (N table(s): source Threads_running over the configured
+    ceiling)", so a deliberately throttled read is never mistaken for a hang. The workers report each
+    pause/resume transition to the progress drain (table name only — Property 7), which keeps a
+    per-table paused-reader count on the job (`MigrationJob.throttled_tables`, additive/defaulted);
+    the count rides the existing in-memory job snapshot and does not change the durable job
+    signature, so throttle oscillation triggers no extra S3 writes.
+
 ## v0.1.357
 
 ### Added

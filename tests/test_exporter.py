@@ -531,6 +531,42 @@ def test_table_exporter_no_governor_when_ceiling_unset() -> None:
     assert conn.status_reads == 0  # governor not built -> no status query at all
 
 
+def test_table_exporter_no_governor_when_ceiling_zero() -> None:
+    # 0 is the OFF sentinel -> no governor built, no status query (same as unset).
+    rows = [{"id": 1, "name": "n1"}]
+    conn = _FakeConnection(rows, threads_running=[5])
+    exporter = TableExporter(
+        engine_factory=lambda _cfg: _FakeEngine(conn),
+        max_source_threads_running=0,
+    )
+    out = list(exporter.stream_converted_rows(_source_config(), _simple_table()))
+    assert [r["id"] for r in out] == [1]
+    assert conn.status_reads == 0
+
+
+def test_stream_converted_rows_reports_throttle_transitions(monkeypatch) -> None:
+    # stream_converted_rows forwards the governor's pause/resume to on_throttle (the
+    # seam the Full Load engine wires to the progress caption). Patch the wall-clock
+    # sleep so the pause doesn't actually wait.
+    import dsql_migrator.core.exporter as exporter_mod
+
+    monkeypatch.setattr(exporter_mod, "_wall_sleep", lambda _s: None)
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 3)]
+    conn = _FakeConnection(rows, threads_running=[50, 1])  # over ceiling, then clear
+    transitions: list = []
+    exporter = TableExporter(
+        engine_factory=lambda _cfg: _FakeEngine(conn),
+        max_source_threads_running=10,
+    )
+    out = list(exporter.stream_converted_rows(
+        _source_config(), _simple_table(),
+        on_throttle=lambda paused, running: transitions.append((paused, running)),
+    ))
+    assert [r["id"] for r in out] == [1, 2]  # throttled, never dropped
+    assert (True, 50) in transitions          # paused when over the ceiling
+    assert any(not paused for paused, _ in transitions)  # and resumed when it cleared
+
+
 # ---------------------------------------------------------------------------
 # Reader range sharding
 # ---------------------------------------------------------------------------

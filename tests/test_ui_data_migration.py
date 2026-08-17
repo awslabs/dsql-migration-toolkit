@@ -429,6 +429,7 @@ class _FakeExporter:
         target_types=None,
         pk_lower=None,
         pk_upper=None,
+        on_throttle=None,
     ) -> list[dict]:
         self.streamed.append(table.name)
         self.target_types_by_table[table.name] = target_types
@@ -6055,6 +6056,46 @@ def test_full_load_progress_caption_reflects_phase_and_current_table() -> None:
     caption = full_load_progress_caption(running)
     assert "items" in caption
     assert "1/3" in caption
+
+
+def test_full_load_progress_caption_shows_source_load_throttle() -> None:
+    from dsql_migrator.ui.data_migration import full_load_progress_caption
+
+    running = _full_load_job(
+        [
+            {"chunk_id": "orders", "status": "IN_PROGRESS", "attempts": 1},
+            {"chunk_id": "items", "status": "PENDING"},
+        ],
+        counts={"orders": 5, "items": 9},
+    )
+    # No throttle -> no paused hint.
+    assert "paused on source load" not in full_load_progress_caption(running)
+    # A reader of the in-progress table paused -> the caption says so, so a deliberately
+    # throttled read is never mistaken for a hang.
+    running.throttled_tables = {"orders": 1}
+    caption = full_load_progress_caption(running)
+    assert "paused on source load" in caption
+    assert "1 table" in caption
+    # A stale count on a table that is NOT in progress is never shown.
+    running.throttled_tables = {"items": 1}  # items is PENDING
+    assert "paused on source load" not in full_load_progress_caption(running)
+
+
+def test_set_table_throttled_counts_paused_readers() -> None:
+    from dsql_migrator.ui.data_migration._full_load_engine import _set_table_throttled
+
+    job = MigrationJob(job_id="j")
+    # Two shard readers of one table pause, then resume one at a time.
+    _set_table_throttled(job, "orders", True)
+    _set_table_throttled(job, "orders", True)
+    assert job.throttled_tables == {"orders": 2}
+    _set_table_throttled(job, "orders", False)
+    assert job.throttled_tables == {"orders": 1}  # one reader still paused
+    _set_table_throttled(job, "orders", False)
+    assert job.throttled_tables == {}  # all resumed -> entry removed
+    # A spurious/duplicate resume never drives the count negative.
+    _set_table_throttled(job, "orders", False)
+    assert job.throttled_tables == {}
 
 
 def test_build_full_load_table_rows_pairs_loaded_with_source_count() -> None:

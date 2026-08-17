@@ -438,13 +438,52 @@ def full_load_progress_caption(job: Optional[MigrationJob]) -> str:
         return "Capturing export watermark (consistent snapshot)…"
     total = len(job.chunks)
     done = sum(1 for chunk in job.chunks if chunk.status in ("DONE", "FAILED"))
+    in_progress = {
+        chunk.chunk_id for chunk in job.chunks if chunk.status == "IN_PROGRESS"
+    }
     current = next(
         (chunk.chunk_id for chunk in job.chunks if chunk.status == "IN_PROGRESS"),
         None,
     )
     if current is not None:
-        return f"Exporting and loading {current} ({done}/{total} tables done)…"
-    return f"Exporting and loading tables ({done}/{total} done)…"
+        base = f"Exporting and loading {current} ({done}/{total} tables done)…"
+    else:
+        base = f"Exporting and loading tables ({done}/{total} done)…"
+    # Source-load governor: if any still-in-progress table has a reader paused (source
+    # Threads_running over the configured ceiling), say so -- so a deliberately throttled
+    # read is never mistaken for a hang. Intersect with IN_PROGRESS so a stale count on a
+    # settled table is never shown.
+    throttled = sorted(
+        name
+        for name, count in job.throttled_tables.items()
+        if count > 0 and name in in_progress
+    )
+    if throttled:
+        plural = "s" if len(throttled) != 1 else ""
+        base += (
+            f" — paused on source load ({len(throttled)} table{plural}: source "
+            "Threads_running over the configured ceiling)"
+        )
+    return base
+
+
+def _set_table_throttled(job: MigrationJob, table_name: str, paused: bool) -> None:
+    """Update the per-table paused-reader count from one throttle transition.
+
+    A table has K shard readers, each of which pauses/resumes independently, so this
+    keeps a count (not a flag): ``paused`` increments it, a resume decrements it, and it
+    is removed at zero. ``job.throttled_tables[name] > 0`` therefore means "at least one
+    reader of this table is currently paused by the source-load governor".
+    """
+    counts = job.throttled_tables
+    if paused:
+        counts[table_name] = counts.get(table_name, 0) + 1
+    else:
+        remaining = counts.get(table_name, 0) - 1
+        if remaining > 0:
+            counts[table_name] = remaining
+        else:
+            counts.pop(table_name, None)
 
 
 # Default number of tables migrated concurrently during Full Load. Operator-tunable
@@ -559,6 +598,12 @@ _PROGRESS_SENTINEL = None
 # worker BEGINS the table, not at submission time (when every table would otherwise show
 # in-progress at once with inflated per-table elapsed/ETA).
 _CHUNK_STARTED = "\x00chunk-started"
+# Marker for a worker's source-load-governor throttle transition, sent as
+# ``(_CHUNK_THROTTLED, table_name, paused: bool)``. The drain maintains a per-table
+# paused-reader count on the job so the progress caption can show a "paused on source
+# load" hint. Distinct 3-tuple sentinel so it is matched BEFORE the generic
+# ``(table, delta_loaded, delta_skipped)`` progress tuple.
+_CHUNK_THROTTLED = "\x00chunk-throttled"
 
 
 @dataclass(frozen=True)
@@ -848,6 +893,11 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
         # crash / "Retry failed tables" still restarts the table from the beginning.
         _resume_job = MigrationJob(job_id=f"fullload-resume:{name}")
 
+        # Source-load governor state -> the parent's progress drain, so the caption can
+        # show "paused on source load" (Property 7: table name only, never row data).
+        def _on_throttle(paused: bool, _running: Optional[int]) -> None:
+            _report_progress(progress_queue, (_CHUNK_THROTTLED, name, paused))
+
         def _load_table():
             pre = args.pre_recreated and _attempt_state["first"]
             _attempt_state["first"] = False
@@ -857,6 +907,7 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
                 should_cancel=_is_cancelled,
                 pre_recreated=pre,
                 resume_job=_resume_job,
+                on_throttle=_on_throttle,
             )
 
         outcome = _as_load_result(
@@ -964,6 +1015,12 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             job_id=f"fullload-resume:{name}#shard{args.shard_index}"
         )
 
+        # Source-load governor state -> the parent's progress drain (table name only,
+        # Property 7). Multiple shards of one table report independently; the drain
+        # keeps a per-table paused-reader count.
+        def _on_throttle(paused: bool, _running: Optional[int]) -> None:
+            _report_progress(progress_queue, (_CHUNK_THROTTLED, name, paused))
+
         def _load_shard():
             # Stream + import together so a retry re-opens the SHARD's own snapshot
             # from its pk_lower: the generator is single-use, and re-reading the
@@ -975,6 +1032,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
                 target_types=target_types,
                 pk_lower=args.pk_lower,
                 pk_upper=args.pk_upper,
+                on_throttle=_on_throttle,
             )
             _live_rows[0] = rows
             return importer.import_rows(
@@ -1221,6 +1279,12 @@ def _drain_progress_queue(
             # (== not is: the marker is pickled across the process boundary.)
             handle.update(lambda job, n=msg[1]: _start_chunk_if_pending(job, n))
             continue
+        if isinstance(msg, tuple) and len(msg) == 3 and msg[0] == _CHUNK_THROTTLED:
+            # Source-load governor paused/resumed a reader -> update the caption hint.
+            handle.update(
+                lambda job, n=msg[1], p=msg[2]: _set_table_throttled(job, n, p)
+            )
+            continue
         table_name, delta_loaded, delta_skipped = msg
         handle.update(
             lambda job, n=table_name, dl=delta_loaded, ds=delta_skipped: (
@@ -1237,6 +1301,11 @@ def _drain_progress_queue(
             break
         if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _CHUNK_STARTED:
             handle.update(lambda job, n=msg[1]: _start_chunk_if_pending(job, n))
+            continue
+        if isinstance(msg, tuple) and len(msg) == 3 and msg[0] == _CHUNK_THROTTLED:
+            handle.update(
+                lambda job, n=msg[1], p=msg[2]: _set_table_throttled(job, n, p)
+            )
             continue
         table_name, delta_loaded, delta_skipped = msg
         handle.update(
@@ -2765,6 +2834,7 @@ class BatchedTableMigrator:
         should_cancel: Optional[Callable[[], bool]] = None,
         pre_recreated: bool = False,
         resume_job: Optional[MigrationJob] = None,
+        on_throttle: Optional[Callable[[bool, Optional[int]], None]] = None,
     ) -> TableLoadResult:
         """Stream ``table`` from the source and load it via batched INSERTs.
 
@@ -2914,6 +2984,7 @@ class BatchedTableMigrator:
                 target_types=target_types,
                 pk_lower=lo,
                 pk_upper=hi,
+                on_throttle=on_throttle,
             )
 
         sharded = len(shard_ranges) > 1
