@@ -66,7 +66,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from dsql_migrator.core.activity_log import (
     ActivityCategory,
@@ -330,6 +330,8 @@ def build_data_migration_screen(
     validation_store: Optional[object] = None,
     open_ai_scope: Optional[Callable[..., object]] = None,
     ai_post_event: Optional[Callable[..., object]] = None,
+    ai_tools: "Optional[Sequence[Mapping[str, object]]]" = None,
+    ai_tool_execute: "Optional[Callable[[str, Mapping[str, object]], str]]" = None,
 ) -> tuple[Callable[[Callable[[], None]], None], Callable[[], None]]:
     """Build the Data Migration screen, returning ``(content_builder, runner)``.
 
@@ -1240,7 +1242,17 @@ def build_data_migration_screen(
             ai_error_opener = None
             if session.ai_assist.enabled and open_ai_scope is not None:
 
-                def ai_error_opener(table_name: str, error_message: str) -> None:
+                def ai_error_opener(
+                    table_name: str,
+                    error_message: str,
+                    *,
+                    topic: str = "failure",
+                    seed: "Optional[str]" = None,
+                ) -> None:
+                    # ``topic`` distinguishes a real FAILURE from a QUARANTINE (dropped
+                    # rows) so each gets its own panel scope + a fitting seed question;
+                    # both reuse the same Full Load error grounding (which explains
+                    # quarantine + the standing-gap trap).
                     from dsql_migrator.core.assessment_strategist import (
                         AssessmentStrategist,
                     )
@@ -1255,15 +1267,15 @@ def build_data_migration_screen(
                         table_name=table_name,
                         cdc_live=cdc_streaming_started(migration_state, job_manager),
                     )
-                    # Deep-link the per-failed-table diagnosis into the persistent
-                    # app-wide AI panel.
+                    # Deep-link the per-table diagnosis into the persistent AI panel.
                     open_ai_scope(
-                        scope_id=f"full_load:{table_name}",
-                        title="AI Assist — Full Load failure",
-                        subtitle=table_name,
+                        scope_id=f"full_load:{topic}:{table_name}",
+                        title="AI DBA",
+                        subtitle=f"Full Load · {table_name}",
                         chip=f"Full Load · {table_name}",
                         seed_question=(
-                            f"Why did loading {table_name} fail, and how do I fix it?"
+                            seed
+                            or f"Why did loading {table_name} fail, and how do I fix it?"
                         ),
                         streamer=lambda messages, on_delta: (
                             strategist.stream_full_load_error_chat(
@@ -1272,6 +1284,44 @@ def build_data_migration_screen(
                                 messages,
                                 on_delta,
                                 migration_context=migration_context,
+                                # Same read-only tools as the other chats, so it can
+                                # look up the converted DDL / target schema / source
+                                # structure to root-cause a schema/DDL failure by name.
+                                tools=ai_tools,
+                                execute=ai_tool_execute,
+                            )
+                        ),
+                    )
+
+            # Opener for the CDC DLQ / schema-drift diagnosis chat (revives the CDC
+            # assist path). None when AI is off -> the CDC panels show no AI affordance.
+            cdc_ai_opener = None
+            if session.ai_assist.enabled and open_ai_scope is not None:
+
+                def cdc_ai_opener(scope: str, facts: str, seed: str) -> None:
+                    from dsql_migrator.core.assessment_strategist import (
+                        AssessmentStrategist,
+                    )
+
+                    strategist = AssessmentStrategist(
+                        session.ai_assist, aws_profile=session.aws_profile
+                    )
+                    open_ai_scope(
+                        scope_id=f"cdc:{scope}",
+                        title="AI DBA",
+                        subtitle=(
+                            "CDC · dead-letter queue"
+                            if scope == "dlq"
+                            else "CDC · schema drift"
+                        ),
+                        chip="CDC · monitoring",
+                        seed_question=seed,
+                        streamer=lambda messages, on_delta: (
+                            strategist.stream_cdc_chat(
+                                facts, messages, on_delta, scope=scope,
+                                # Shared read-only tools: look up the affected table's
+                                # converted DDL / target schema to root-cause the drift.
+                                tools=ai_tools, execute=ai_tool_execute,
                             )
                         ),
                     )
@@ -1694,6 +1744,10 @@ def build_data_migration_screen(
                             migration_type=migration_type,
                             run_checks=run_checks,
                             session=session,
+                            # AI DBA opener for the DLQ / schema-drift diagnosis chat +
+                            # the activity-event seam for CDC transitions.
+                            cdc_ai_opener=cdc_ai_opener,
+                            ai_post_event=ai_post_event,
                             # So the CDC-step LOB card can lock once a Full Load has
                             # committed data under an exclusion set (survives a switch
                             # to cdc_only): FULL_LOAD stays DONE across the switch.

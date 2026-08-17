@@ -690,6 +690,21 @@ def _render_header_texts(step) -> list[str]:
     return ui.texts
 
 
+def test_header_has_a_what_next_readiness_briefing() -> None:
+    # The header carries a proactive "What's next?" briefing so the panel isn't only
+    # reactive: it opens a dedicated readiness scope on the general (tool-backed)
+    # streamer, seeded to read the real session state and name the blocking objects.
+    import inspect
+
+    from dsql_migrator.ui import workflow as wf
+
+    src = inspect.getsource(wf.build_workflow_sidebar)
+    assert '"What\'s next?"' in src
+    assert 'scope_id="readiness"' in src
+    assert "ai_general_streamer_factory()" in src  # same tool-backed streamer as chat
+    assert "top risks" in src
+
+
 def test_journey_header_shows_the_type_banner_only_on_data_migration() -> None:
     # The banner rides only on the Data Migration step (WorkflowStep.CDC), next to the
     # selector that owns the choice. It used to render on every step, but a single

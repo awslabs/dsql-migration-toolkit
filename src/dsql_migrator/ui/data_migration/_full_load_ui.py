@@ -1598,24 +1598,33 @@ def _render_full_load_progress(
     ]
     terminal = job.status in ("DONE", "FAILED", "CANCELLED")
 
-    def _ai_btn(table_name: str, error_message: str) -> None:
-        # Per-table AI Assist: opens the chat drawer to explain THIS failure's
-        # cause + fix. Shown enabled only when AI Assist is on (an opener was
-        # threaded in); otherwise a disabled, discoverable affordance points at
-        # the Connect screen -- mirroring Schema Conversion / Validation.
+    def _ai_btn(
+        table_name: str,
+        error_message: str,
+        *,
+        topic: str = "failure",
+        seed: "Optional[str]" = None,
+        tooltip: "Optional[str]" = None,
+    ) -> None:
+        # Per-table AI Assist: opens the chat drawer to explain THIS failure (or, for a
+        # QUARANTINE, why rows were dropped) + the options. Shown enabled only when AI
+        # Assist is on (an opener was threaded in); otherwise a disabled, discoverable
+        # affordance points at the Connect screen -- mirroring Schema Conversion.
         if ai_error_opener is not None:
             ui.button(
                 "AI Assist",
-                on_click=lambda n=table_name, e=error_message: ai_error_opener(n, e),
+                on_click=lambda n=table_name, e=error_message, t=topic, s=seed: (
+                    ai_error_opener(n, e, topic=t, seed=s)
+                ),
             ).props(
                 "flat dense no-caps size=sm color=indigo-6 icon=auto_awesome"
-            ).tooltip("Ask AI why this table failed and how to fix it.")
+            ).tooltip(tooltip or "Ask AI why this table failed and how to fix it.")
         else:
             ui.button("AI Assist").props(
                 "flat dense no-caps size=sm color=grey icon=auto_awesome"
             ).props("disable").tooltip(
                 "Enable AI Assist on the Connect screen to diagnose this "
-                "failure with AI."
+                "with AI."
             )
 
     def _failure_row(*, table_name, message, tone, action=None) -> None:
@@ -1662,6 +1671,28 @@ def _render_full_load_progress(
     # A quarantine table is DONE (not "unfinished"), so the retry checklist does
     # not cover it; a per-row Reload stays here for "I fixed the source value,
     # reload just this table".
+    def _quar_actions(table_name: str, reason_text: str):
+        # Quarantine rows get BOTH an AI Assist (why were they dropped + options) and
+        # the per-table Reload. The AI chat is scoped to the quarantine reason so it is
+        # not the generic "table failed" question -- these rows loaded, specific values
+        # were dropped, and the useful advice is json-vs-text / chunk / accept-the-gap.
+        def _render() -> None:
+            _ai_btn(
+                table_name,
+                reason_text,
+                topic="quarantine",
+                seed=(
+                    f"Rows in {table_name} were quarantined (permanently dropped) "
+                    f'during Full Load: "{reason_text}". Why did that happen, and what '
+                    "are my options — store the value differently (e.g. json vs text), "
+                    "chunk it, or accept the gap?"
+                ),
+                tooltip="Ask AI why these rows were dropped and what your options are.",
+            )
+            _quar_reload(table_name)()
+
+        return _render
+
     def _quar_reload(table_name: str):
         def _btn() -> None:
             if reload_confirm is not None and terminal:
@@ -1737,12 +1768,16 @@ def _render_full_load_progress(
             for table_name, pks, reasons in _group_quarantine_entries(
                 quarantine_entries
             ):
+                reason_text = (
+                    "; ".join(reasons) if reasons
+                    else "a value exceeded a DSQL per-value limit"
+                )
                 _quarantine_detail_row(
                     ui,
                     table=table_name,
                     primary_keys=pks,
                     reasons=reasons,
-                    action=_quar_reload(table_name),
+                    action=_quar_actions(table_name, reason_text),
                 )
 
 def _render_accept_quarantine_action(

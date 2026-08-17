@@ -1929,6 +1929,80 @@ def test_cdc_in_use_resolves_from_migration_type() -> None:
     assert _cdc_in_use(object()) is False
 
 
+def test_cutover_ai_facts_assembles_credential_free_grounding() -> None:
+    # The AI DBA cut-over chat is grounded on this facts block. It must carry the
+    # non-secret target coordinates, migration path, validation verdict, and identity-
+    # sync state, and NEVER a password / IAM token (Property 7).
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import (
+        TargetConnectionConfig, ValidationMode, ValidationReport,
+    )
+    from dsql_migrator.ui.validation import (
+        cutover_ai_facts,
+        summarize_validation,
+    )
+
+    session = SimpleNamespace(
+        target_config=TargetConnectionConfig(
+            cluster_endpoint="abc.dsql.us-east-1.on.aws",
+            region="us-east-1",
+            database="postgres",
+            username="admin",
+        ),
+    )
+    # A clean 1-of-1 report is enough grounding for the facts assertions below.
+    report = ValidationReport(
+        items=[
+            TableValidationResult(
+                table="orders", source_row_count=1, target_row_count=1,
+                row_count_match=True, matched=True,
+            )
+        ],
+        mode=ValidationMode.ROW_COUNT,
+    )
+    summary = summarize_validation(report)
+    facts = cutover_ai_facts(
+        session,
+        validation_summary=summary, release="clean", drift=None,
+        cdc_in_use=True,
+        identity_sync_result=None, identity_sync_failed=False,
+    )
+    # Non-secret target coords are named; the auth model is called out.
+    assert "abc.dsql.us-east-1.on.aws" in facts and "region=us-east-1" in facts
+    assert "role=admin" in facts and "short-lived IAM tokens" in facts
+    # NEVER a secret VALUE: no `password=` / `token=` assignment, even a placeholder.
+    # (The word "password" may appear as grounding — DSQL has NO password — which is
+    # exactly why we must not fake one.)
+    lowered = facts.lower()
+    assert "password=" not in lowered and "token=" not in lowered
+    assert "no password" in lowered  # positive: the auth model is grounded
+    # Verdict facts: the summary's verdict is woven in (whatever summarize_validation
+    # returned for this shape), plus the release/path.
+    assert "matched=1/1" in facts and "mode=ROW_COUNT" in facts
+    assert "Full Load + CDC" in facts and "CDC is live" in facts
+    assert "Release state: clean" in facts
+    # Identity-sync not run -> the STANDING risk is called out (23505 collision).
+    assert "NOT RUN" in facts and "23505" in facts
+
+
+def test_cutover_screen_offers_ai_dba_button_when_ai_is_on() -> None:
+    # The cut-over screen renders an "Ask AI DBA about cut over" button when AI is
+    # enabled + the opener is wired. Verify it appears via source inspection.
+    import inspect
+
+    from dsql_migrator.ui.validation import build_cutover_screen
+
+    src = inspect.getsource(build_cutover_screen)
+    assert "Ask AI DBA about cut over" in src
+    assert 'scope_id="cutover"' in src
+    assert "cutover_ai_facts" in src  # credential-free grounding
+    assert "stream_cutover_chat" in src  # via the strategist
+    # Gated on AI enabled + opener wired (never renders without either).
+    assert "session.ai_assist.enabled" in src
+    assert "open_ai_scope is not None" in src
+
+
 def test_cutover_runner_marks_step_done() -> None:
     # The Cut over step has no job: its runner records the user's acknowledgement
     # by marking WorkflowStep.CUT_OVER DONE on the session's workflow state.

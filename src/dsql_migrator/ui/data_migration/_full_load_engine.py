@@ -936,7 +936,11 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
         return _TableWorkerResult(
             table_name=name,
             status="FAILED",
-            error_message=f"{type(exc).__name__}: {exc}",
+            # safe_error_message, not f"{exc}": a psycopg error's str() keeps the
+            # server DETAIL/"Failing row contains (...)" line, i.e. the offending
+            # row's COLUMN VALUES. This message is surfaced to the AI DBA via
+            # list_failed_full_load_tables, so it must be value-free (Property 7).
+            error_message=safe_error_message(exc),
             error_code=_error_code(exc),
         )
 
@@ -1090,7 +1094,10 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
     except Exception as exc:  # noqa: BLE001
         return _TableWorkerResult(
             table_name=name, status="FAILED", shard_index=args.shard_index,
-            error_message=f"{type(exc).__name__}: {exc}",
+            # safe_error_message, not f"{exc}": drop the psycopg DETAIL/"Failing
+            # row contains (...)" row-value line before it reaches the durable
+            # result and, via list_failed_full_load_tables, the AI DBA (Property 7).
+            error_message=safe_error_message(exc),
             error_code=_error_code(exc),
         )
 

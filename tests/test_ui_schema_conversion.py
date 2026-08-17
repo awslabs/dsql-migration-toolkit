@@ -101,6 +101,76 @@ from dsql_migrator.ui.schema_conversion import (
 # ---------------------------------------------------------------------------
 
 
+def test_generate_ddl_event_data_and_summary() -> None:
+    from dsql_migrator.core.models import ObjectRef, ObjectType
+    from dsql_migrator.ui.schema_conversion import (
+        generate_ddl_event_data,
+        generate_ddl_summary,
+    )
+
+    inv = SourceInventory(
+        tables=[TableDef(name="orders"), TableDef(name="customers")],
+        views=[ViewDef(name="v_sales", definition="SELECT 1")],
+        triggers=[
+            ObjectRef(name="t1", object_type=ObjectType.TRIGGER),
+            ObjectRef(name="t2", object_type=ObjectType.TRIGGER),
+        ],
+        routines=[ObjectRef(name="r1", object_type=ObjectType.PROCEDURE)],
+        events=[ObjectRef(name="e1", object_type=ObjectType.EVENT)],
+    )
+    # A trigger tick is not counted as "converted" (only table/view leaves are).
+    node_ids = [
+        f"{TABLE_PREFIX}orders",
+        f"{VIEW_PREFIX}v_sales",
+        f"{TRIGGER_PREFIX}t1",
+    ]
+    data = generate_ddl_event_data(node_ids, inv)
+    assert data["converted"] == 2 and data["tables"] == 1 and data["views"] == 1
+    assert data["triggers"] == 2 and data["routines"] == 1 and data["events"] == 1
+    text = generate_ddl_summary(data)
+    assert "generated target DDL for 2 objects" in text
+    # It must be clear Generate is a preview, not an apply/migration to the target.
+    assert "NOT applied to Aurora DSQL" in text
+    assert "2 trigger(s)" in text and "1 stored routine(s)" in text
+    assert "Aurora DSQL doesn't support" in text
+
+    # No unsupported kinds -> no "Not converted" clause; singular grammar.
+    solo = generate_ddl_event_data([f"{TABLE_PREFIX}orders"], SourceInventory(
+        tables=[TableDef(name="orders")]
+    ))
+    solo_text = generate_ddl_summary(solo)
+    assert "generated target DDL for 1 object " in solo_text
+    assert "Not converted" not in solo_text
+
+
+def test_apply_event_data_and_summary() -> None:
+    from dsql_migrator.ui.schema_conversion import apply_event_data, apply_event_summary
+    from dsql_migrator.ui.schema_conversion_apply import (
+        ObjectApplyResult,
+        ObjectApplyStatus as S,
+    )
+
+    results = [
+        ObjectApplyResult("orders", S.CREATED),
+        ObjectApplyResult("customers", S.CREATED),
+        ObjectApplyResult("legacy", S.SKIPPED),
+        ObjectApplyResult("geo", S.FAILED, "spatial type unsupported"),
+    ]
+    data = apply_event_data(results)
+    assert data == {
+        "created": 2, "skipped": 1, "failed": 1, "total": 4, "failed_objects": ["geo"],
+    }
+    text = apply_event_summary(data)
+    assert "3 of 4 objects applied" in text  # created + skipped
+    assert "2 created, 1 skipped" in text
+    assert "1 FAILED" in text and "geo" in text  # names the failed object
+
+    # Clean run -> no FAILED clause, singular grammar.
+    clean = apply_event_data([ObjectApplyResult("t", S.CREATED)])
+    clean_text = apply_event_summary(clean)
+    assert "1 of 1 object applied" in clean_text and "FAILED" not in clean_text
+
+
 def _inventory() -> SourceInventory:
     return SourceInventory(
         tables=[
@@ -846,7 +916,6 @@ def test_reset_generation_clears_all_prior_analysis() -> None:
     # job linkage, and prior results/error so the screen is ready to run fresh.
     assert state.generated_node_ids is None
     assert state.edited_target_ddls == {}
-    assert state.all_suggestions() == []
     assert state.replace_confirmed is False
     assert state.job_id is None
     assert state.error is None
@@ -2218,6 +2287,8 @@ class _NotesUi:
         self.tooltips: list[str] = []
         self.classes: list[str] = []
         self.cards: list[dict] = []
+        self.button_icons: list[str] = []
+        self.handlers: list = []  # (event, callback) pairs registered via .on(...)
 
     class _El:
         def __init__(self, rec, badge=None):
@@ -2240,6 +2311,13 @@ class _NotesUi:
 
         def tooltip(self, text="", *_a, **_k):
             self._rec.tooltips.append(str(text))
+            return self
+
+        def disable(self, *_a, **_k):
+            return self
+
+        def on(self, event="", handler=None, *_a, **_k):
+            self._rec.handlers.append((str(event), handler))
             return self
 
         def __enter__(self):
@@ -2266,6 +2344,10 @@ class _NotesUi:
         return self._El(self)
 
     def column(self, *_a, **_k):
+        return self._El(self)
+
+    def button(self, *_a, **_k):
+        self.button_icons.append(str(_k.get("icon", "")))
         return self._El(self)
 
 
@@ -2315,6 +2397,64 @@ def test_conversion_notes_render_recommendations_in_their_own_section() -> None:
     # The advice gets the calm RECOMMENDED badge; the real gap keeps its severity.
     assert "RECOMMENDED" in ui.badges
     assert "MANUAL" in ui.badges
+
+
+def test_conversion_notes_carry_a_per_note_ai_icon_when_ai_is_on() -> None:
+    # Each conversion note gets a compact AI-guidance ICON (mirrors Evaluation) instead
+    # of a separate labeled "AI guidance" button, wired to open the object's chat.
+    from dsql_migrator.ui.schema_conversion import _render_conversion_warnings
+
+    opened: list = []
+    ui = _NotesUi()
+    _render_conversion_warnings(
+        ui,
+        [_loss_note(), _recommendation_note()],
+        on_ai_chat=lambda o, s, d: opened.append(o),
+        object_name="t",
+        source_ddl="CREATE TABLE t (...)",
+        deterministic_ddl="CREATE TABLE t (...)",
+    )
+    # One auto_awesome icon-button per note (2 notes), and no labeled "AI guidance".
+    assert ui.button_icons.count("auto_awesome") == 2
+    assert "AI guidance" not in ui.texts
+
+
+def test_per_note_ai_icon_seeds_the_specific_note_not_the_generic_object() -> None:
+    # Regression: clicking a warning's AI icon must ask about THAT warning, not the
+    # generic "How should I convert <table>? Walk me through the DDL changes." The icon
+    # now passes its note through to the opener, which builds a note-specific scope +
+    # seed question.
+    from dsql_migrator.ui.schema_conversion import (
+        _conversion_note_question,
+        _note_scope_key,
+        _render_conversion_warnings,
+    )
+
+    calls: list = []
+    ui = _NotesUi()
+    loss = _loss_note("Foreign key fk_customer was removed (DSQL has no FKs).")
+    rec = _recommendation_note("The integer key was kept; consider a UUID key.")
+    _render_conversion_warnings(
+        ui,
+        [loss, rec],
+        on_ai_chat=lambda o, s, d, n=None: calls.append((o, n)),
+        object_name="orders",
+        source_ddl="SRC",
+        deterministic_ddl="TGT",
+    )
+    # Invoke each captured click handler (one per note).
+    click_handlers = [h for (ev, h) in ui.handlers if ev == "click.stop" and h]
+    assert len(click_handlers) == 2
+    for h in click_handlers:
+        h()
+    # Each click carried its SPECIFIC note (never None -> never the generic question).
+    assert len(calls) == 2 and all(n is not None for (_o, n) in calls)
+    notes = [n for (_o, n) in calls]
+    # Distinct notes -> distinct scopes (so a second click re-seeds, not re-focuses).
+    assert _note_scope_key(notes[0]) != _note_scope_key(notes[1])
+    # The seed embeds the note's real message, grounded on the object.
+    q = _conversion_note_question("orders", loss)
+    assert "orders" in q and "Foreign key fk_customer was removed" in q
 
 
 def test_conversion_notes_omit_the_warnings_heading_when_only_advice() -> None:
@@ -2433,6 +2573,69 @@ def test_object_browser_takes_an_apply_in_progress_flag() -> None:
     params = inspect.signature(sc._render_browser_and_preview).parameters
     assert "apply_in_progress" in params
     assert params["apply_in_progress"].default is False  # opt-in, never locks by accident
+
+
+def test_conversion_chat_wires_use_as_target_ddl_footer() -> None:
+    # The per-object conversion chat now recloses the advisory loop: a reply with a
+    # single fenced ```sql block gets a "Use as target DDL" footer that (after a
+    # denylist check) adopts it as the object's edited target DDL -> Apply. This also
+    # makes validate_suggested_sql (previously imported-unused) actually used.
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+
+    src = inspect.getsource(sc.build_schema_conversion_screen)
+    assert 'footer_label="Use as target DDL"' in src
+    assert "extract_sql_from_reply" in src  # gate on a single runnable sql block
+    assert "validate_suggested_sql" in src  # untrusted model SQL is denylist-checked
+    assert "set_edited_target_ddl" in src   # adopts into the editor, not the target
+
+
+def test_object_browser_takes_a_reimplement_opener() -> None:
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+
+    params = inspect.signature(sc._render_browser_and_preview).parameters
+    assert "on_reimplement_chat" in params
+    assert params["on_reimplement_chat"].default is None  # AI-off -> no button
+
+
+def test_unconvertible_banner_offers_reimplementation_ai_action() -> None:
+    # The banner listing the triggers/routines/events DSQL can't convert carries an
+    # AI DBA action that deep-links the reimplementation chat -- turning bare counts
+    # into "name each object + how to reimplement it". Gated on the opener (AI on).
+    src = _browser_fn_source()
+    assert "Ask AI DBA how to reimplement these" in src
+    banner_at = src.index("Some source objects can't be converted")
+    button_at = src.index("Ask AI DBA how to reimplement these")
+    assert banner_at < button_at  # the action sits with the banner
+    guard_at = src.rindex("if on_reimplement_chat is not None:", 0, button_at)
+    assert guard_at < button_at  # no button unless the opener was wired
+
+
+def test_generate_does_not_auto_open_ai_reimplementation_chat() -> None:
+    # Reimplementation help is ON-DEMAND, matching every other step: Generate posts the
+    # conversion event (counts) but must NOT auto-fire an AI turn -- the user opens it
+    # via the banner's "Ask AI DBA how to reimplement these" button. (Auto-opening was
+    # the app's only auto-fired AI turn; it was removed for consistency + to not spend
+    # tokens without a click.)
+    src = _browser_fn_source()
+    gen_at = src.index("async def on_generate")
+    clear_at = src.index("def on_clear", gen_at)
+    on_generate_body = src[gen_at:clear_at]
+    assert "on_reimplement_chat()" not in on_generate_body  # no auto-fire on Generate
+
+    # The reimplementation chat still exists (on-demand) and is seeded to give each
+    # object's NAME + explanation + how-to.
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+
+    module_src = inspect.getsource(sc)
+    assert "give its " in module_src and "briefly explain what it does" in module_src
+    # ...and the banner button remains the on-demand entry point.
+    assert "Ask AI DBA how to reimplement these" in src
 
 
 def test_apply_in_progress_locks_every_selection_control() -> None:

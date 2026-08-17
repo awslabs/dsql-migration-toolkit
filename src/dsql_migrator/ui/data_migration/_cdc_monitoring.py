@@ -553,7 +553,66 @@ def _render_migration_table_status(
                     "not a proven exact match); Validation (step 4) is the exact check."
                 ).classes("text-xs text-gray-600")
 
-def _render_cdc_live_monitoring(ui, migration_state, job_manager, session=None) -> None:
+# CDC activity events already mirrored into the AI feed, keyed by the stable CDC log
+# key, so the ~5s monitor poll announces each transition ONCE (not every tick). Resets
+# on process restart (in-memory) -- a benign re-announce, never a data risk.
+_CDC_ANNOUNCED: "dict[str, set]" = {}
+
+
+def _announce_cdc_events(migration_state, status_view, ai_post_event) -> None:
+    """Edge-triggered CDC activity events into the AI feed (once per transition).
+
+    Announces: CDC streaming started, source schema drift (per table+kind), the DLQ
+    first growing past zero, and a confirmed sink stall -- the silent-data-loss signals
+    the assistant should be aware of. Deduped per stream via :data:`_CDC_ANNOUNCED`.
+    Credential/row-free text only (Property 7); never raises into the poller."""
+    if ai_post_event is None:
+        return
+    try:
+        seen = _CDC_ANNOUNCED.setdefault(cdc_error_log_key(migration_state), set())
+        if "started" not in seen:
+            seen.add("started")
+            ai_post_event(text="CDC streaming started", status="started")
+        for group in getattr(status_view, "schema_drift", None) or []:
+            marker = ("drift", group.table, group.kind)
+            if marker not in seen:
+                seen.add(marker)
+                label = _DRIFT_LABELS.get(group.kind, (group.kind, ""))[0]
+                ai_post_event(
+                    text=(
+                        f"CDC: source schema change on {group.table} ({label}) — "
+                        f"{group.count} record(s) dead-lettered"
+                    ),
+                    status="warning",
+                )
+        depth = int(getattr(status_view, "dlq_depth", 0) or 0)
+        if depth > 0 and "dlq" not in seen:
+            seen.add("dlq")
+            ai_post_event(
+                text=(
+                    f"CDC: dead-letter queue growing — {depth} poison record(s) "
+                    "quarantined"
+                ),
+                status="warning",
+            )
+        activity = getattr(migration_state, "cdc_activity", None)
+        if bool(getattr(activity, "sink_stall_confirmed", False)) and "stall" not in seen:
+            seen.add("stall")
+            ai_post_event(
+                text=(
+                    "CDC: sink stalled — the source is producing but the sink is not "
+                    "advancing"
+                ),
+                status="error",
+            )
+    except Exception:  # noqa: BLE001 - activity mirroring is best-effort
+        pass
+
+
+def _render_cdc_live_monitoring(
+    ui, migration_state, job_manager, session=None, cdc_ai_opener=None,
+    ai_post_event=None,
+) -> None:
     """Live connector health + DLQ, polled read-only from MSK Connect.
 
     Mirrors the Full Load poll chain: a refreshable region arms a one-shot timer
@@ -677,6 +736,9 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager, session=None) 
     def _cdc_live() -> None:  # type: ignore[misc]
         view = _cdc_status_view(migration_state, job_manager)
         if view is not None:
+            # Mirror CDC transitions (started / drift / DLQ growing / sink stalled) into
+            # the AI feed, once each, so the assistant is aware of silent-loss risks.
+            _announce_cdc_events(migration_state, view, ai_post_event)
             _render_cdc_pipeline_health(
                 ui, view, getattr(migration_state, "cdc_activity", None)
             )
@@ -687,6 +749,7 @@ def _render_cdc_live_monitoring(ui, migration_state, job_manager, session=None) 
                 view,
                 on_refresh=_poll_cdc,
                 session=session,
+                cdc_ai_opener=cdc_ai_opener,
             )
         else:
             controller = getattr(migration_state, "cdc_controller", None)
@@ -1115,8 +1178,78 @@ async def _open_add_column_dialog(ui, session, table: str, on_refresh=None) -> N
     dialog.open()  # type: ignore[attr-defined]
 
 
+_CDC_DLQ_SEED = (
+    "Triage these dead-lettered CDC records: what are the root causes (by SQLSTATE / "
+    "table), and exactly how do I fix them and backfill the affected tables before "
+    "cut over?"
+)
+_CDC_DRIFT_SEED = (
+    "The source schema changed and CDC dead-lettered the new rows. For each affected "
+    "table, tell me exactly what DDL to apply to the target and how to backfill the "
+    "set-aside rows — and whether I must stop CDC first."
+)
+
+
+def _cdc_dlq_facts(migration_state, log_key: str) -> str:
+    """Assemble a credential-free, row-free DLQ facts block for the AI DBA chat.
+
+    Reuses the CDC-assist error summarizer over the CDC-sourced dead-letter records
+    (depth + top tables + top SQLSTATEs + a capped sample), so the chat is grounded on
+    the real poison records without any row values leaving the tool (Property 7)."""
+    from collections import Counter
+
+    from dsql_migrator.core.cdc_assist import _summarize_errors
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_dlq_records
+
+    records = list(cdc_dlq_records(migration_state, log_key))
+    lines = [f"CDC dead-letter queue: {len(records)} poison record(s)."]
+    by_table = Counter(r.table for r in records)
+    if by_table:
+        lines.append(
+            "Top tables: "
+            + ", ".join(f"{t} ({n})" for t, n in by_table.most_common(8))
+        )
+    by_code = Counter(
+        str(getattr(r, "error_code", "") or "")
+        for r in records
+        if getattr(r, "error_code", None)
+    )
+    if by_code:
+        lines.append(
+            "Top SQLSTATEs: "
+            + ", ".join(f"{c} ({n})" for c, n in by_code.most_common(5))
+        )
+    activity = getattr(migration_state, "cdc_activity", None)
+    if bool(getattr(activity, "sink_stall_confirmed", False)):
+        lines.append(
+            "Sink stalled: yes (a zero DLQ depth would be EXPECTED during a stall)."
+        )
+    lines.append("Sample dead-lettered events:")
+    lines.append(_summarize_errors(records))
+    return "\n".join(lines)
+
+
+def _cdc_drift_facts(status_view: LoadStatusView) -> str:
+    """Assemble a credential-free schema-drift facts block for the AI DBA chat."""
+    drift = getattr(status_view, "schema_drift", None) or []
+    lines = ["Source schema drift detected (CDC does not replicate DDL):"]
+    for group in drift:
+        noun = "record" if group.count == 1 else "records"
+        lines.append(
+            f"- {group.table}: {group.kind} — {group.count} {noun} dead-lettered"
+        )
+    return "\n".join(lines)
+
+
+def _render_cdc_ai_button(ui, on_click, tooltip: str) -> None:
+    """The shared 'Ask AI DBA' affordance for the CDC DLQ / drift panels."""
+    ui.button("Ask AI DBA", on_click=on_click).props(  # type: ignore[attr-defined]
+        "flat dense no-caps size=sm color=indigo-6 icon=auto_awesome"
+    ).tooltip(tooltip)
+
+
 def _render_cdc_schema_drift_banner(
-    ui, status_view: LoadStatusView, session=None, on_refresh=None
+    ui, status_view: LoadStatusView, session=None, on_refresh=None, cdc_ai_opener=None
 ) -> None:
     """Flag source DDL the target has not caught up to (from the classified DLQ).
 
@@ -1140,6 +1273,15 @@ def _render_cdc_schema_drift_banner(
             ui.label("Source schema change detected").classes(  # type: ignore[attr-defined]
                 "text-sm font-semibold text-gray-900"
             )
+            if cdc_ai_opener is not None:
+                ui.space()  # type: ignore[attr-defined]
+                _render_cdc_ai_button(
+                    ui,
+                    lambda: cdc_ai_opener(
+                        "drift", _cdc_drift_facts(status_view), _CDC_DRIFT_SEED
+                    ),
+                    "Ask AI DBA what DDL to apply and how to backfill the drifted rows.",
+                )
         for group in drift:
             label, why = _DRIFT_LABELS.get(
                 group.kind, (group.kind, "the source schema changed")
@@ -1180,6 +1322,7 @@ def _render_cdc_dlq_panel(
     status_view: LoadStatusView,
     on_refresh=None,
     session=None,
+    cdc_ai_opener=None,
 ) -> None:
     """Render the dead-letter queue as one cohesive, AWS-console-style card.
 
@@ -1220,6 +1363,18 @@ def _render_cdc_dlq_panel(
                 f"{health.depth} quarantined"
             ).props(f"color={_badge_color}")
             ui.space()  # type: ignore[attr-defined]
+            # Ask AI DBA to triage the poison records (only when there is something to
+            # triage): reuses the CDC-assist DLQ-triage grounding in a conversational,
+            # tool-wired chat scoped to these dead-letter records.
+            if cdc_ai_opener is not None and health.depth > 0:
+                _dlq_key = cdc_error_log_key(migration_state)
+                _render_cdc_ai_button(
+                    ui,
+                    lambda k=_dlq_key: cdc_ai_opener(
+                        "dlq", _cdc_dlq_facts(migration_state, k), _CDC_DLQ_SEED
+                    ),
+                    "Ask AI DBA to triage these poison records and how to fix them.",
+                )
             if on_refresh is not None:
                 ui.button(on_click=on_refresh).props(  # type: ignore[attr-defined]
                     "flat dense round size=sm icon=refresh"
@@ -1241,7 +1396,8 @@ def _render_cdc_dlq_panel(
                 ),
             )
         _render_cdc_schema_drift_banner(
-            ui, status_view, session=session, on_refresh=on_refresh
+            ui, status_view, session=session, on_refresh=on_refresh,
+            cdc_ai_opener=cdc_ai_opener,
         )
         _render_cdc_dlq_breakdown(ui, status_view)
         # CDC commonly has no Full Load job_id this session, so key the record list /

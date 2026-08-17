@@ -44,7 +44,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Optional, Protocol, Sequence
+from typing import Callable, Mapping, Optional, Protocol, Sequence
 
 from dsql_migrator.config import SecretValue, load_config
 from dsql_migrator.core.activity_log import (
@@ -1040,6 +1040,76 @@ def _cdc_in_use(session: object) -> bool:
         return False
 
 
+def cutover_ai_facts(
+    session: object,
+    *,
+    validation_summary: "Optional[ValidationSummary]",
+    release: str,
+    drift: "Optional[DriftDisplay]",
+    cdc_in_use: bool,
+    identity_sync_result: "Optional[dict]",
+    identity_sync_failed: bool,
+) -> str:
+    """Assemble a credential-free CUT OVER facts block for the AI DBA chat.
+
+    Non-secret target coordinates (endpoint / region / database / role) + migration
+    path (Full Load only / with CDC) + the last validation verdict + drift summary +
+    identity-sync state. NEVER any password or IAM token (Property 7) -- DSQL has no
+    password anyway; the token is minted per connection by the driver. Pure and
+    deterministic so the chat's grounding is unit-testable."""
+    lines: list[str] = []
+    tc = getattr(session, "target_config", None)
+    if tc is not None:
+        lines.append(
+            f"Target coordinates (non-secret): endpoint={getattr(tc, 'cluster_endpoint', '')} "
+            f"region={getattr(tc, 'region', '')} database={getattr(tc, 'database', '')} "
+            f"role={getattr(tc, 'username', '')}. Auth = short-lived IAM tokens (no password)."
+        )
+    lines.append(
+        "Migration path: "
+        + ("Full Load + CDC" if cdc_in_use else "Full Load only")
+        + " (CDC is " + ("live" if cdc_in_use else "not in use") + " for this cut over)."
+    )
+    if validation_summary is not None:
+        lines.append(
+            f"Last validation: match={validation_summary.is_match}, "
+            f"matched={validation_summary.matched_tables}/"
+            f"{validation_summary.total_tables} tables, "
+            f"missing_on_target={validation_summary.missing_on_target}, "
+            f"extra_on_target={validation_summary.extra_on_target}, "
+            f"mode={validation_summary.mode}."
+        )
+    else:
+        lines.append("Last validation: not run yet.")
+    lines.append(f"Release state: {release}.")
+    if drift is not None and drift.available:
+        lines.append(
+            f"Source drift-since-snapshot: determinable={drift.determinable}, "
+            f"basis={drift.basis or 'n/a'}."
+        )
+    if identity_sync_failed:
+        lines.append(
+            "Identity-sync (AUTO_INCREMENT -> sequence): the LAST run FAILED; "
+            "sequences may not be advanced past MAX(pk) -- the first repointed insert "
+            "risks a 23505 duplicate-key collision."
+        )
+    elif identity_sync_result:
+        _synced = int(
+            (identity_sync_result or {}).get("synced_tables", 0) or 0
+        )
+        lines.append(
+            f"Identity-sync (AUTO_INCREMENT -> sequence): succeeded on {_synced} "
+            "table(s). Confirm this ran AFTER the final validation, or a late source "
+            "insert can leave the target sequence behind."
+        )
+    else:
+        lines.append(
+            "Identity-sync (AUTO_INCREMENT -> sequence): NOT RUN in this session. "
+            "Must be run before the app repoints or the first insert risks 23505."
+        )
+    return "\n".join(lines)
+
+
 @dataclass(frozen=True)
 class DriftDisplay:
     """The source-changes-since-snapshot report formatted for display (Req 6.5).
@@ -1581,6 +1651,8 @@ def build_validation_screen(
     conversion_store: "Optional[Any]" = None,
     open_ai_scope: "Optional[Callable[..., object]]" = None,
     ai_post_event: "Optional[Callable[..., object]]" = None,
+    ai_tools: "Optional[Sequence[Mapping[str, object]]]" = None,
+    ai_tool_execute: "Optional[Callable[[str, Mapping[str, object]], str]]" = None,
 ) -> tuple[Callable[[Callable[[], None]], None], Callable[[], None]]:
     """Build the Validation screen, returning ``(content_builder, runner)``.
 
@@ -2241,7 +2313,11 @@ def build_validation_screen(
                             seed_question=first_question,
                             streamer=lambda messages, on_delta: (
                                 strategist.stream_validation_chat(
-                                    facts, messages, on_delta, scope=scope
+                                    facts, messages, on_delta, scope=scope,
+                                    # The shared read-only tools let the chat root-cause
+                                    # a divergence against the real converted DDL / target
+                                    # schema / live counts, not just the frozen facts.
+                                    tools=ai_tools, execute=ai_tool_execute,
                                 )
                             ),
                         )
@@ -2435,6 +2511,9 @@ def build_cutover_screen(
     job_manager: Optional[JobManager] = None,
     sync_sequences: "Optional[Callable[..., dict]]" = None,
     ai_post_event: "Optional[Callable[..., object]]" = None,
+    open_ai_scope: "Optional[Callable[..., object]]" = None,
+    ai_tools: "Optional[Sequence[Mapping[str, object]]]" = None,
+    ai_tool_execute: "Optional[Callable[[str, Mapping[str, object]], str]]" = None,
 ) -> tuple[Callable[[Callable[[], None]], None], Callable[[], None]]:
     """Build the Cut over step (step 6), returning ``(content_builder, runner)``.
 
@@ -2521,6 +2600,65 @@ def build_cutover_screen(
         report = validation_state.result
         summary = summarize_validation(report) if report is not None else None
         drift = format_drift(report) if report is not None else None
+
+        # AI DBA cut-over chat: available on every render (a HOLD verdict is when it
+        # matters most). Grounded on credential-free facts assembled here so the reply
+        # produces a framework-tailored repoint recipe + a GO/HOLD verdict that maps
+        # to the real buttons in this tool.
+        if (
+            session.ai_assist.enabled  # type: ignore[attr-defined]
+            and open_ai_scope is not None
+            and ai_tools is not None
+            and ai_tool_execute is not None
+        ):
+            _release_for_ai = cutover_release_state(
+                summary, gap_accepted=validation_state.accept_explained_gap
+            )
+            _facts = cutover_ai_facts(
+                session,
+                validation_summary=summary,
+                release=_release_for_ai,
+                drift=drift,
+                cdc_in_use=_cdc_in_use(session),
+                identity_sync_result=validation_state.cutover_identity_sync,
+                identity_sync_failed=validation_state.cutover_identity_sync_failed,
+            )
+
+            def _open_cutover_ai() -> None:
+                strategist = AssessmentStrategist(
+                    session.ai_assist, aws_profile=session.aws_profile  # type: ignore[attr-defined]
+                )
+                open_ai_scope(
+                    scope_id="cutover",
+                    title="AI DBA",
+                    subtitle="Cut over · repoint recipe",
+                    chip="Cut over",
+                    seed_question=(
+                        "Given my real migration state, is it safe to cut over now, "
+                        "and give me a repoint recipe for my application (connection "
+                        "string, IAM-token generation/refresh, sslmode, OCC retries) "
+                        "with a clear GO/HOLD verdict and the rollback window."
+                    ),
+                    streamer=lambda messages, on_delta: (
+                        strategist.stream_cutover_chat(
+                            _facts, messages, on_delta,
+                            tools=ai_tools, execute=ai_tool_execute,
+                        )
+                    ),
+                )
+
+            with _section(ui, icon="auto_awesome", title="Ask AI DBA about cut over"):
+                ui.label(  # type: ignore[attr-defined]
+                    "Get a framework-tailored repoint recipe (JDBC / psycopg / "
+                    "SQLAlchemy / Django / Rails) and a GO/HOLD verdict grounded on "
+                    "your real validation, CDC and identity-sync state."
+                ).classes("text-sm text-gray-600")
+                with ui.row().classes("w-full justify-start"):  # type: ignore[attr-defined]
+                    ui.button(  # type: ignore[attr-defined]
+                        "Ask AI DBA about cut over",
+                        icon="auto_awesome",
+                        on_click=_open_cutover_ai,
+                    ).props("color=primary")
 
         # The runbook's "Sync identity sequences" button calls this: advance identity
         # keys past the current target MAX(pk), in the background, then refresh to show
@@ -3699,7 +3837,7 @@ def _render_recovery_section(
                     "Diagnose with AI",
                     icon="auto_awesome",
                     on_click=lambda: diagnose_provider(
-                        title="AI mismatch diagnosis",
+                        title="AI DBA",
                         subtitle="Whole validation run",
                         first_question=(
                             "Diagnose these mismatches — is this replication lag, a "
@@ -4201,7 +4339,7 @@ def _render_failing_table(
                         "Explain with AI",
                         icon="auto_awesome",
                         on_click=lambda _e=None, _it=item: diagnose_provider(
-                            title="AI mismatch diagnosis",
+                            title="AI DBA",
                             subtitle=f"{_it.table} · table",
                             first_question=(
                                 f"Why does `{_it.table}` not match, and exactly how "

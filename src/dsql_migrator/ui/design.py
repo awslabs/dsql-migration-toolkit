@@ -53,6 +53,16 @@ NOTICE_STYLE: dict[str, Tuple[str, str, str, str]] = {
     "error": ("bg-red-50", "border-red-200", "text-red-600", "error"),
 }
 
+# AI DBA brand accent -- the single source of truth for the assistant surface's
+# accent color (glyphs, buttons, chips, the user chat bubble). The panel is the app's
+# most-used AI surface; per the design-system rule its accent must live HERE, not be
+# re-typed inline in ~15 places where it could drift. Tailwind/Quasar "indigo".
+AI_ACCENT_COLOR = "indigo-6"  # Quasar `color=` prop for AI icons / buttons / spinners
+AI_ACCENT_TEXT = "text-indigo-700"  # accent text (chip label, model chip)
+AI_ACCENT_BG = "bg-indigo-50"  # subtle tinted accent surface (chip, model chip, code)
+AI_ACCENT_BORDER = "indigo-100"  # accent border COLOR (caller adds border / border-b)
+AI_ACCENT_BUBBLE_BG = "bg-indigo-600"  # user chat-bubble fill (white text on it)
+
 # Quasar color name per tone, for the animated spinner a ``busy`` notice shows in
 # place of its static glyph. ``ui.spinner`` takes a Quasar color, not the Tailwind
 # text class in NOTICE_STYLE, so the two cannot share one value.
@@ -199,8 +209,12 @@ def render_segmented_bar(ui, *, segments, show_legend: bool = True) -> None:
     allsegs = [(str(label), int(value), tone) for (label, value, tone) in segments]
     barsegs = [s for s in allsegs if s[1] > 0]
     total = sum(v for _, v, _ in barsegs) or 1
-    with ui.row().classes(
-        "w-full h-2 rounded-full overflow-hidden bg-gray-100 no-wrap"
+    # ``gap-0`` + inline ``gap: 0`` override NiceGUI's default row gap (~1rem) -- without
+    # it the segments are spaced apart and the gray track shows through as a gap.
+    with (
+        ui.row()
+        .classes("w-full h-2 rounded-full overflow-hidden bg-gray-100 no-wrap gap-0")
+        .style("gap: 0")
     ):
         for _label, value, tone in barsegs:
             fill = _DISTRIBUTION_TONES.get(tone, _DISTRIBUTION_TONES["neutral"])[0]

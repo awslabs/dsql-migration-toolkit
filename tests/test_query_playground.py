@@ -484,6 +484,33 @@ def test_extract_sql_isolates_select_from_accompanying_ddl() -> None:
     assert extract_sql_from_reply(md) == "SELECT a, b FROM t WHERE a >= 4"
 
 
+def test_retest_gate_rejects_data_modifying_ctes_but_allows_pure_reads() -> None:
+    # SAFETY: the re-test runs EXPLAIN ANALYZE, which EXECUTES the statement against
+    # the target. A data-modifying CTE (WITH x AS (DELETE/INSERT/UPDATE ...) SELECT ...)
+    # is valid SQL that starts with WITH -- it must NOT be handed to the re-test probe,
+    # or it would write to the (production) target. Only PURE reads are testable.
+    from dsql_migrator.ui.query_playground import _last_testable_statement
+
+    # Pure reads pass.
+    assert _last_testable_statement("SELECT id FROM orders WHERE id > 1") is not None
+    assert _last_testable_statement(
+        "WITH x AS (SELECT id FROM orders) SELECT * FROM x"
+    ) is not None
+    # Data-modifying CTEs are rejected (the safety hole).
+    assert _last_testable_statement(
+        "WITH d AS (DELETE FROM orders RETURNING id) SELECT * FROM d"
+    ) is None
+    assert _last_testable_statement(
+        "WITH i AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM i"
+    ) is None
+    # Top-level DML is rejected too.
+    assert _last_testable_statement("DELETE FROM orders WHERE id = 1") is None
+    # A tuning reply proposing a DELETE-CTE yields no runnable statement -> no re-test.
+    assert extract_sql_from_reply(
+        "```sql\nWITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d\n```"
+    ) is None
+
+
 def test_extract_sql_strips_comments_that_would_break_explain() -> None:
     # A leading -- line comment would otherwise comment out the EXPLAIN wrapper we
     # prepend, causing a syntax error; block comments must go too.
@@ -590,6 +617,63 @@ def test_retest_turn_without_baseline_or_dpu_is_honest() -> None:
         _probe(ProbeOutcome.PASSED, dpu_total=0.05, analyzed=True), baseline_dpu=None
     )
     assert "0.05000 DPU" in no_base and "baseline" in no_base.lower()
+
+
+def test_retest_turn_carries_trust_caveats() -> None:
+    # A successful re-test must caveat that it proves cost/runs-OK, NOT row-set
+    # equivalence -- and, when a suggested index was dropped, that the delta is
+    # measured against the CURRENT schema (so the AI isn't pushed to disown a
+    # correct index recommendation).
+    turn = _build_retest_turn(
+        _probe(ProbeOutcome.PASSED, dpu_total=0.03, plan="Index Only Scan", analyzed=True),
+        baseline_dpu=0.10,
+        index_dropped=True,
+    )
+    assert "same rows" in turn.lower() and "equivalence" in turn.lower()
+    assert "was NOT created" in turn or "not created" in turn.lower()
+
+    # No dropped index -> only the row-equivalence caveat, not the index note.
+    no_idx = _build_retest_turn(
+        _probe(ProbeOutcome.PASSED, dpu_total=0.03, plan="Index Only Scan", analyzed=True),
+        baseline_dpu=0.10,
+        index_dropped=False,
+    )
+    assert "equivalence" in no_idx.lower()
+    assert "was NOT created" not in no_idx
+
+    # A REJECTED re-test asks for a fix and carries NO cost caveat (nothing measured).
+    failed = _build_retest_turn(
+        _probe(ProbeOutcome.FAILED, detail="boom", code="42601"), baseline_dpu=0.10,
+    )
+    assert "equivalence" not in failed.lower()
+
+
+def test_query_ai_button_labels_are_unified_on_ai_dba() -> None:
+    # Both AI actions read as the SAME assistant: the verbs align on "… with AI DBA"
+    # (Fix / Review / Tune), not "Ask AI" here and "AI DBA" there.
+    import inspect
+
+    from dsql_migrator.ui import query_playground as qp
+
+    src = inspect.getsource(qp.build_query_playground_screen)
+    assert '"Fix with AI DBA"' in src and '"Review with AI DBA"' in src
+    assert '"Tune with AI DBA"' in src
+    # The old off-brand "Ask AI to ..." labels are gone.
+    assert "Ask AI to fix" not in src and "Ask AI to review" not in src
+
+
+def test_retest_reprobe_passes_source_search_path() -> None:
+    # The re-test probe must set the SAME search_path the initial Test used (the
+    # source database), so a rewrite with UNQUALIFIED table names is not falsely
+    # rejected against the default (public) search_path.
+    import inspect
+
+    from dsql_migrator.ui import query_playground as qp
+
+    src = inspect.getsource(qp.build_query_playground_screen)
+    # The re-probe reads source_config.database and passes it as search_path.
+    assert 'getattr(_src_cfg, "database", None)' in src
+    assert "search_path=_search_path" in src
 
 
 def test_state_probe_lifecycle() -> None:

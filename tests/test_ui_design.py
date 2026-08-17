@@ -12,6 +12,11 @@ keeping them correct keeps the whole app's visual language consistent.
 from __future__ import annotations
 
 from dsql_migrator.ui.design import (
+    AI_ACCENT_BG,
+    AI_ACCENT_BORDER,
+    AI_ACCENT_BUBBLE_BG,
+    AI_ACCENT_COLOR,
+    AI_ACCENT_TEXT,
     BADGE_TONES,
     CHIP_GROUP_PALETTE,
     INLINE_HINT_TEXT,
@@ -154,6 +159,36 @@ def test_notice_palette_uses_amber_not_orange_for_warning() -> None:
     bg, border, icon_color, _icon = NOTICE_STYLE["warning"]
     assert "amber" in bg and "amber" in border and "amber" in icon_color
     assert "orange" not in (bg + border + icon_color)
+
+
+def test_ai_accent_tokens_are_a_single_indigo_source_of_truth() -> None:
+    # The AI DBA brand accent must live in ONE place (design.py), not be re-typed
+    # inline in the panel. One indigo family across the token set; caller composes
+    # the border shorthand (border / border-b) with the border COLOR token.
+    assert AI_ACCENT_COLOR == "indigo-6"
+    assert AI_ACCENT_TEXT == "text-indigo-700"
+    assert AI_ACCENT_BG == "bg-indigo-50"
+    assert AI_ACCENT_BORDER == "indigo-100"  # color only (no "border-" prefix)
+    assert AI_ACCENT_BUBBLE_BG == "bg-indigo-600"
+    # All accent tokens are the same brand hue (indigo), so the surface reads coherent.
+    for token in (AI_ACCENT_COLOR, AI_ACCENT_TEXT, AI_ACCENT_BG,
+                  AI_ACCENT_BORDER, AI_ACCENT_BUBBLE_BG):
+        assert "indigo" in token
+
+
+def test_ai_panel_does_not_hardcode_indigo_inline() -> None:
+    # Regression: the panel must reference the design-system AI-accent tokens, not
+    # re-type "indigo-..." in class/props strings (the CLAUDE.md single-source rule).
+    import inspect
+
+    from dsql_migrator.ui import ai_panel
+
+    src = inspect.getsource(ai_panel)
+    for line in src.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue  # a descriptive comment may mention the color
+        assert "indigo-" not in line, f"hardcoded indigo in ai_panel: {line!r}"
 
 
 def test_badge_tones_present_and_fallback() -> None:

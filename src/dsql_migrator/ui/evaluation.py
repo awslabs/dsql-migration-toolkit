@@ -1501,7 +1501,7 @@ def _build_guidance_drawer(
             seed = _guidance_question(item)
         open_ai_scope(
             scope_id=scope_id,
-            title="AI migration guidance",
+            title="AI DBA",
             subtitle=subtitle,
             chip=f"Evaluation \u00b7 {item.object_name}",
             seed_question=seed,

@@ -399,6 +399,24 @@ def test_chat_system_prompt_scopes_to_this_object_topic() -> None:
     assert "Aurora DSQL constraints" in system
 
 
+def test_build_reimplementation_chat_system_names_tools_and_per_kind_paths() -> None:
+    from dsql_migrator.core.assessment_strategist import (
+        build_reimplementation_chat_system,
+    )
+
+    system = build_reimplementation_chat_system()
+    # It must drive the model to look up the REAL object names, not invent them.
+    assert "list_unsupported_objects" in system
+    assert "get_source_object_detail" in system
+    # A concrete path per unconvertible kind, incl. the external-scheduler answer.
+    assert "Trigger" in system and "procedure" in system.lower() and "EVENT" in system
+    assert "EventBridge Scheduler" in system
+    # CDC caveat (trigger/cascade side effects aren't replicated) is grounded.
+    assert "not replicated" in system.lower() or "NOT replicated" in system
+    assert "Aurora DSQL constraints" in system
+    assert "decline" in system.lower()  # scope guard retained
+
+
 def test_build_query_chat_system_grounds_on_query_and_error() -> None:
     from dsql_migrator.core.assessment_strategist import build_query_chat_system
 
@@ -421,6 +439,19 @@ def test_build_query_chat_system_grounds_on_query_and_error() -> None:
     )
     assert "json_unquote(json) does not exist" in system_err
     assert "fix the statement" in system_err.lower()
+
+    # Tool-aware + loosened (matches the object/conversion chats): it is told it HAS
+    # the read-only tools and should use them, not "stay strictly / decline off-topic".
+    assert "USE ANY TOOLS" in system
+    assert "get_target_schema" in system and "get_converted_ddl" in system
+
+    # The tool's own deterministic conversion warnings are woven in as authoritative.
+    system_warn = build_query_chat_system(
+        "SELECT ... FOR UPDATE", "SELECT ...",
+        warnings=["[MANUAL] SELECT ... FOR UPDATE lock semantics differ on DSQL"],
+    )
+    assert "FOR UPDATE lock semantics differ" in system_warn
+    assert "authoritative" in system_warn.lower()
 
 
 def test_build_query_optimize_system_grounds_on_dsql_efficiency_and_bans_pg_lore() -> None:
@@ -448,6 +479,9 @@ def test_build_query_optimize_system_grounds_on_dsql_efficiency_and_bans_pg_lore
     lowered = system.lower()
     assert "vacuum" in lowered and "reindex" in lowered  # named in the ban list
     assert "do not" in lowered or "not suggest" in lowered
+    # Tool-aware: before recommending an index/INCLUDE it should CHECK what exists.
+    assert "USE ANY TOOLS" in system and "get_target_schema" in system
+    assert "existing indexes" in system.lower() or "already exists" in system.lower()
 
     # Without a captured plan: it must NOT fabricate a plan/DPU; it should nudge to
     # run Test-on-target with ANALYZE first.
@@ -478,6 +512,48 @@ def test_build_validation_chat_system_grounds_on_facts_and_recovery() -> None:
     assert "validation run with mismatches" in build_validation_chat_system(
         facts, scope="run"
     )
+    # The loosened guard lets it help with the wider migration via tools.
+    assert "USE ANY TOOLS" in system
+
+
+def test_stream_validation_chat_routes_to_tool_chat_when_tools_given() -> None:
+    # With tools + execute, a mismatch chat runs the agentic tool loop so it can
+    # look up the real converted DDL / target schema / counts to root-cause the
+    # divergence -- not just reason over the frozen facts. Without them it stays a
+    # plain grounded stream (covered by the other tests).
+    class _ToolClient:
+        def __init__(self) -> None:
+            self._round = 0
+
+        def invoke_model(self, **kwargs: object) -> dict:
+            self._round += 1
+            if self._round == 1:
+                return {"body": json.dumps({
+                    "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "id": "t1",
+                                 "name": "get_validation_summary", "input": {}}],
+                })}
+            return {"body": json.dumps({
+                "stop_reason": "end_turn",
+                "content": [{"type": "text",
+                             "text": "orders is short 74 rows -- a standing gap."}],
+            })}
+
+    strategist = AssessmentStrategist(_config(), client=_ToolClient())
+    executed: list[str] = []
+
+    def execute(name: str, inp) -> str:  # noqa: ANN001
+        executed.append(name)
+        return json.dumps({"is_match": False, "missing_on_target": 74})
+
+    tools = [{"name": "get_validation_summary", "description": "x",
+              "input_schema": {"type": "object", "properties": {}}}]
+    outcome = strategist.stream_validation_chat(
+        "Table: orders", [{"role": "user", "text": "why is it short?"}],
+        lambda _t: None, scope="table", tools=tools, execute=execute,
+    )
+    assert outcome.available and "74" in outcome.markdown
+    assert executed == ["get_validation_summary"]  # the tool loop actually ran
 
 
 def test_build_full_load_error_chat_system_grounds_on_table_error_and_context() -> None:
@@ -510,12 +586,180 @@ def test_build_full_load_error_chat_system_grounds_on_table_error_and_context() 
     # The tool's Full Load recovery model + DSQL constraints are grounded.
     assert "Reload" in system  # per-table recovery action
     assert "idempotent" in system.lower()
+    # The standing-gap trap is grounded: CDC won't backfill a failed/quarantined table,
+    # so it must be resolved BEFORE starting CDC (else the target is silently short).
+    assert "standing gap" in system.lower() or "STANDING gap" in system
+    assert "backfill" in system.lower()
     assert "Aurora DSQL constraints" in system
-    assert "decline" in system.lower()  # scope guard
+    assert "decline" in system.lower()  # scope guard (kept, but loosened)
+    # The loosened guard tells the (tool-wired) chat it may look up wider migration data
+    # to root-cause the failure, instead of refusing -- so the wired tools get used.
+    assert "USE ANY TOOLS" in system
     # Context is optional -- omitting it still produces a valid grounding.
     minimal = build_full_load_error_chat_system("t1", "InternalError_: server unavailable")
     assert "InternalError_" in minimal
     assert "Current migration context" not in minimal
+
+
+def test_stream_full_load_error_chat_routes_to_tool_chat_when_tools_given() -> None:
+    # With tools + execute, the failed-table diagnosis runs the agentic loop so it can
+    # look up the real converted DDL / target schema to root-cause a schema/DDL failure.
+    class _ToolClient:
+        def __init__(self) -> None:
+            self._round = 0
+
+        def invoke_model(self, **kwargs: object) -> dict:
+            self._round += 1
+            if self._round == 1:
+                return {"body": json.dumps({
+                    "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "id": "t1",
+                                 "name": "get_converted_ddl",
+                                 "input": {"object_name": "orders"}}],
+                })}
+            return {"body": json.dumps({
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "The DDL dropped a NOT NULL."}],
+            })}
+
+    strategist = AssessmentStrategist(_config(), client=_ToolClient())
+    executed: list[str] = []
+
+    def execute(name: str, inp) -> str:  # noqa: ANN001
+        executed.append(name)
+        return json.dumps({"target_ddl": "CREATE TABLE orders (...)"})
+
+    tools = [{"name": "get_converted_ddl", "description": "x",
+              "input_schema": {"type": "object",
+                               "properties": {"object_name": {"type": "string"}},
+                               "required": ["object_name"]}}]
+    outcome = strategist.stream_full_load_error_chat(
+        "orders", "NotNullViolation", [{"role": "user", "text": "why?"}],
+        lambda _t: None, migration_context="Full Load + CDC",
+        tools=tools, execute=execute,
+    )
+    assert outcome.available and "NOT NULL" in outcome.markdown
+    assert executed == ["get_converted_ddl"]  # the tool loop actually ran
+
+
+def test_build_cutover_chat_system_grounds_on_facts_and_cutover_model() -> None:
+    from dsql_migrator.core.assessment_strategist import build_cutover_chat_system
+
+    facts = (
+        "Target coordinates (non-secret): endpoint=abc.dsql.us-east-1.on.aws "
+        "region=us-east-1 database=postgres role=admin.\n"
+        "Migration path: Full Load + CDC.\n"
+        "Last validation: match=True, matched=8/8 tables.\n"
+        "Identity-sync: NOT RUN in this session."
+    )
+    system = build_cutover_chat_system(facts)
+    # The facts are woven in verbatim and called authoritative.
+    assert "endpoint=abc.dsql.us-east-1.on.aws" in system
+    assert "Identity-sync: NOT RUN" in system
+    assert "authoritative" in system.lower()
+    # The cut-over model is grounded: IAM tokens + sslmode + OCC 40001 + rollback
+    # asymmetry + no-writes-from-chat rule + identity sequences.
+    assert "IAM" in system and "sslmode=require" in system
+    assert "40001" in system  # OCC retry framing
+    assert "ROLLBACK" in system or "Rollback" in system or "rollback" in system.lower()
+    assert "identity" in system.lower() and "23505" in system
+    # It must NEVER propose writes -- writes to DSQL go through the tool's approval.
+    assert "Do NOT propose changes to the target from a chat" in system
+    # Loosened guard for tool-wired chat.
+    assert "USE ANY TOOLS" in system
+    assert "decline" in system.lower()
+
+
+def test_stream_cutover_chat_routes_to_tool_chat_when_tools_given() -> None:
+    class _ToolClient:
+        def __init__(self) -> None:
+            self._round = 0
+
+        def invoke_model(self, **kwargs: object) -> dict:
+            self._round += 1
+            if self._round == 1:
+                return {"body": json.dumps({
+                    "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "id": "t1",
+                                 "name": "get_validation_summary", "input": {}}],
+                })}
+            return {"body": json.dumps({
+                "stop_reason": "end_turn",
+                "content": [{"type": "text",
+                             "text": "GO. Repoint with sslmode=require and mint a fresh IAM token per connection."}],
+            })}
+
+    strategist = AssessmentStrategist(_config(), client=_ToolClient())
+    executed: list[str] = []
+
+    def execute(name: str, inp) -> str:  # noqa: ANN001
+        executed.append(name)
+        return json.dumps({"is_match": True, "matched_tables": 8, "total_tables": 8})
+
+    tools = [{"name": "get_validation_summary", "description": "x",
+              "input_schema": {"type": "object", "properties": {}}}]
+    outcome = strategist.stream_cutover_chat(
+        "Cut over facts", [{"role": "user", "text": "safe to cut over?"}],
+        lambda _t: None, tools=tools, execute=execute,
+    )
+    assert outcome.available and "GO" in outcome.markdown
+    assert executed == ["get_validation_summary"]  # the tool loop actually ran
+
+
+def test_build_cdc_error_chat_system_grounds_on_facts_and_cdc_model() -> None:
+    from dsql_migrator.core.assessment_strategist import build_cdc_error_chat_system
+
+    facts = (
+        "CDC dead-letter queue: 12 poison record(s).\n"
+        "Top SQLSTATEs: 23502 (9), 22P02 (3)."
+    )
+    system = build_cdc_error_chat_system(facts, scope="dlq")
+    assert "12 poison record(s)" in system and "23502" in system  # facts woven in
+    assert "authoritative" in system.lower()
+    assert "dead-letter" in system.lower()  # DLQ framing
+    assert "does NOT propagate DDL" in system  # the CDC model is grounded
+    assert "standing" in system.lower() and "cut over" in system.lower()
+    assert "Aurora DSQL constraints" in system
+    assert "decline" in system.lower()  # scope guard (loosened)
+    assert "USE ANY TOOLS" in system  # tool-wired chat is told it may look things up
+    # The drift scope tunes the subject line.
+    assert "drift" in build_cdc_error_chat_system("x", scope="drift").lower()
+
+
+def test_stream_cdc_chat_routes_to_tool_chat_when_tools_given() -> None:
+    class _ToolClient:
+        def __init__(self) -> None:
+            self._round = 0
+
+        def invoke_model(self, **kwargs: object) -> dict:
+            self._round += 1
+            if self._round == 1:
+                return {"body": json.dumps({
+                    "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "id": "t1",
+                                 "name": "get_cdc_status", "input": {}}],
+                })}
+            return {"body": json.dumps({
+                "stop_reason": "end_turn",
+                "content": [{"type": "text",
+                             "text": "SQLSTATE 23502 means a dropped/added column."}],
+            })}
+
+    strategist = AssessmentStrategist(_config(), client=_ToolClient())
+    executed: list[str] = []
+
+    def execute(name: str, inp) -> str:  # noqa: ANN001
+        executed.append(name)
+        return json.dumps({"dlq_depth": 12, "schema_drift": []})
+
+    tools = [{"name": "get_cdc_status", "description": "x",
+              "input_schema": {"type": "object", "properties": {}}}]
+    outcome = strategist.stream_cdc_chat(
+        "CDC DLQ: 12 poison records", [{"role": "user", "text": "why?"}],
+        lambda _t: None, scope="dlq", tools=tools, execute=execute,
+    )
+    assert outcome.available and "dropped" in outcome.markdown.lower()
+    assert executed == ["get_cdc_status"]  # the tool loop actually ran
 
 
 def test_build_connection_error_chat_system_grounds_on_side_and_error() -> None:

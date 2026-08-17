@@ -338,33 +338,11 @@ def test_ai_candidate_object_names_empty_when_all_auto() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_state_suggestion_storage_set_get_all_clear() -> None:
-    state = SchemaConversionState()
-    assert state.all_suggestions() == []
-    assert state.get_suggestion("x") is None
-
-    state.set_suggestion(_suggestion("x"))
-    assert state.get_suggestion("x") is not None
-    assert [s.object_name for s in state.all_suggestions()] == ["x"]
-
-    # Re-storing the same object replaces, not duplicates.
-    state.set_suggestion(approve_suggestion(_suggestion("x")))
-    assert len(state.all_suggestions()) == 1
-    assert state.get_suggestion("x").status == AI_STATUS_APPROVED  # type: ignore[union-attr]
-
-    state.clear_suggestions()
-    assert state.all_suggestions() == []
-
-
-def test_store_suggestions_isolated_per_session() -> None:
-    store = SchemaConversionStore()
-    a = store.get_or_create("session-a")
-    b = store.get_or_create("session-b")
-
-    a.set_suggestion(_suggestion("only-a"))
-
-    assert [s.object_name for s in a.all_suggestions()] == ["only-a"]
-    assert b.all_suggestions() == []
+# NOTE: the per-object AI *suggestion* storage on SchemaConversionState (set/get/all/
+# clear_suggestion) was removed with the unreachable approve/reject-suggestion UI. The
+# AI-DDL loop is now the conversion chat's "Use as target DDL" footer, which adopts a
+# reply's SQL into edited_target_ddls -> Apply. The suggestion MODELS + helpers
+# (approve/reject/build_ai_apply_objects) remain (used + tested via core ai_routing).
 
 
 # ---------------------------------------------------------------------------

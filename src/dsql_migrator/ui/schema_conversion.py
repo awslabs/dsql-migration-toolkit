@@ -55,6 +55,7 @@ from dsql_migrator.core.ai_assistant import validate_suggested_sql
 from dsql_migrator.core.assessment_strategist import (
     AssessmentStrategist,
     build_conversion_chat_system,
+    build_reimplementation_chat_system,
 )
 from dsql_migrator.core.converter import (
     ConversionNoteKind,
@@ -70,8 +71,6 @@ from dsql_migrator.core.converter import (
 )
 from dsql_migrator.core.assessor import kind_label
 from dsql_migrator.core.models import (
-    AiAssistConfig,
-    AiConversionSuggestion,
     AssessmentReport,
     Classification,
     ColumnDef,
@@ -91,16 +90,6 @@ from dsql_migrator.core.occ import (
     with_occ_retry,
 )
 from dsql_migrator.core.job_manager import JobManager, JobNotFoundError
-from dsql_migrator.ui.ai_assist import (
-    AI_STATUS_APPROVED,
-    AI_STATUS_EDITED,
-    AI_STATUS_PENDING_REVIEW,
-    AI_STATUS_REJECTED,
-    AiConversionAssistant,
-    approve_suggestion,
-    approved_suggestions,
-    reject_suggestion,
-)
 from dsql_migrator.core.activity_log import (
     ActivityCategory,
     ActivityStatus,
@@ -833,10 +822,6 @@ class SchemaConversionState:
         # the edited script overrides the deterministic target DDL on apply, so
         # the user can apply the generated DDL as-is or after editing it.
         self.edited_target_ddls: dict[str, str] = {}
-        # Per-object AI suggestions keyed by object name, edited/approved on the
-        # UI thread. Only APPROVED suggestions are forwarded to apply (Property
-        # 13); see build_ai_apply_objects.
-        self.ai_suggestions: dict[str, AiConversionSuggestion] = {}
         self._apply_results: Optional[list[ObjectApplyResult]] = None
         self._error: Optional[str] = None
         # Live apply progress, written by the background apply worker and read by
@@ -846,10 +831,6 @@ class SchemaConversionState:
         self._apply_total: int = 0
         self._apply_done: int = 0
         self._apply_current: Optional[str] = None
-
-    def set_suggestion(self, suggestion: AiConversionSuggestion) -> None:
-        """Store/replace the AI suggestion for ``suggestion.object_name``."""
-        self.ai_suggestions[suggestion.object_name] = suggestion
 
     def set_edited_target_ddl(self, object_name: str, ddl: str) -> None:
         """Record the user-edited target DDL for ``object_name``.
@@ -869,18 +850,6 @@ class SchemaConversionState:
     def clear_edited_target_ddl(self, object_name: str) -> None:
         """Discard the edit for ``object_name`` (revert to generated DDL)."""
         self.edited_target_ddls.pop(object_name, None)
-
-    def get_suggestion(self, object_name: str) -> Optional[AiConversionSuggestion]:
-        """Return the stored AI suggestion for ``object_name``, if any."""
-        return self.ai_suggestions.get(object_name)
-
-    def all_suggestions(self) -> list[AiConversionSuggestion]:
-        """Return all stored AI suggestions for this session."""
-        return list(self.ai_suggestions.values())
-
-    def clear_suggestions(self) -> None:
-        """Discard all stored AI suggestions for this session."""
-        self.ai_suggestions.clear()
 
     def set_apply_results(self, results: list[ObjectApplyResult]) -> None:
         """Record a finished apply run's per-object results (clears any error)."""
@@ -1001,7 +970,6 @@ class SchemaConversionState:
         """
         self.generated_node_ids = None
         self.edited_target_ddls.clear()
-        self.ai_suggestions.clear()
         self.replace_confirmed = False
         self.job_id = None
         self.clear_outputs()
@@ -1071,35 +1039,6 @@ _APPLY_STATUS_COLORS: dict[ObjectApplyStatus, str] = {
 # How often the screen polls the background apply job (seconds).
 _POLL_INTERVAL_SECONDS = 0.5
 
-
-# Builds the AI conversion assistant for a config + optional global AWS profile.
-# Injectable so tests pass a fake and never reach AWS.
-AiAssistantFactory = Callable[
-    [AiAssistConfig, Optional[str]], AiConversionAssistant
-]
-
-
-def _default_ai_assistant_factory(
-    config: AiAssistConfig, aws_profile: Optional[str]
-) -> AiConversionAssistant:
-    """Build the real Bedrock-backed AI conversion assistant (Req 11.5/11.6).
-
-    Mirrors the Evaluation strategist and the Connect "Verify AI access"
-    factories: the optional global AWS profile is threaded into
-    :func:`~dsql_migrator.core.ai_assistant.build_bedrock_runtime_client` so the
-    assistant shares the single credential context used by every other AWS
-    client (Requirements 9.5, 9.7). ``boto3`` stays lazily imported inside that
-    builder and constructing the client performs no network call.
-    """
-    from dsql_migrator.core.ai_assistant import (
-        AiConversionAssistant as _BedrockAssistant,
-        build_bedrock_runtime_client,
-    )
-
-    client = build_bedrock_runtime_client(config, aws_profile=aws_profile)
-    return _BedrockAssistant(config, client=client)
-
-
 # When a live CDC pipeline is streaming into the target, applying schema
 # conversion is blocked (the sink is actively writing the target tables and
 # Debezium does not propagate DDL, so a REPLACE would drop/corrupt what CDC is
@@ -1142,12 +1081,12 @@ def build_schema_conversion_screen(
     converter: Optional[SchemaConverter] = None,
     applier_factory: Optional[ApplierFactory] = None,
     existence_checker: Optional[TargetExistenceChecker] = None,
-    assistant: Optional[AiConversionAssistant] = None,
-    assistant_factory: Optional[AiAssistantFactory] = None,
     on_continue_to_data_migration: Optional[Callable[[], None]] = None,
     cdc_active_check: Optional[Callable[[], bool]] = None,
     open_ai_scope: Optional[Callable[..., object]] = None,
     ai_post_event: Optional[Callable[..., object]] = None,
+    ai_tools: "Optional[Sequence[Mapping[str, object]]]" = None,
+    ai_tool_execute: "Optional[Callable[[str, Mapping[str, object]], str]]" = None,
 ) -> tuple[Callable[[Callable[[], None]], None], Callable[[], None]]:
     """Build the Schema Conversion screen, returning ``(content_builder, runner)``.
 
@@ -1159,12 +1098,12 @@ def build_schema_conversion_screen(
     The source inventory is taken from the Step 1 (Evaluation) result so the
     source is not re-introspected (Property 1). ``applier_factory`` builds the
     target :class:`SchemaApplier`; when it (or the target connection) is
-    unavailable the runner surfaces a clear status instead of breaking
-    (Task 15 not yet wired). AI suggestions use ``assistant`` when injected,
-    otherwise the assistant is built per session from ``assistant_factory``
-    (defaulting to the real Bedrock-backed one) using the session's AI-assist
-    config and global AWS profile, but only when AI assist is enabled. Both
-    returns plug into :func:`~dsql_migrator.ui.workflow.build_workflow_sidebar`.
+    unavailable the runner surfaces a clear status instead of breaking. AI help
+    is the per-object AI DBA chat (``open_ai_scope``): a per-warning icon and,
+    for a not-auto-converted object, a per-object icon open a conversion chat
+    whose "Use as target DDL" reply footer adopts a fix into the editable target
+    -> Apply (no separate approve/reject suggestion surface). Both returns plug
+    into :func:`~dsql_migrator.ui.workflow.build_workflow_sidebar`.
     """
     from nicegui import ui
 
@@ -1213,26 +1152,6 @@ def build_schema_conversion_screen(
                 inventory, SchemaConvertOptions()
             )
         return _conversion_cache["result"]  # type: ignore[return-value]
-
-    def _resolve_assistant() -> Optional[AiConversionAssistant]:
-        """Return the AI assistant to use, building it per session when enabled.
-
-        An explicitly injected ``assistant`` always wins (tests). Otherwise the
-        assistant is built from the session's AI-assist config and global AWS
-        profile via ``assistant_factory`` (defaulting to the real Bedrock-backed
-        one), but only when AI assist is enabled. Construction is guarded so a
-        misconfigured client degrades to "not wired" guidance instead of
-        breaking the screen (graceful degradation, Requirement 11.10).
-        """
-        if assistant is not None:
-            return assistant
-        if not session.ai_assist.enabled:
-            return None
-        factory = assistant_factory or _default_ai_assistant_factory
-        try:
-            return factory(session.ai_assist, session.aws_profile)
-        except Exception:  # noqa: BLE001 - degrade gracefully on client build failure
-            return None
 
     def _prepare_apply() -> Optional[tuple[SchemaApplier, ApplyMode, bool]]:
         """Validate apply preconditions and return (applier, mode, confirmed).
@@ -1365,9 +1284,15 @@ def build_schema_conversion_screen(
                 detail=summary_detail,
             )
             if ai_post_event is not None:
+                # A VISUAL apply summary (kind="apply" -> a Created/Skipped/Failed bar
+                # in the panel, mirroring the Generate conversion event); the text is
+                # the plain grounding fallback and names any failed objects.
+                _apply_data = apply_event_data(results)
                 ai_post_event(
-                    text=f"Schema applied to DSQL: {summary_detail}",
+                    text=apply_event_summary(_apply_data),
                     status="error" if any_failed else "success",
+                    kind="apply",
+                    data=_apply_data,
                 )
 
         conv_state.job_id = job_manager.submit(work)
@@ -1401,13 +1326,10 @@ def build_schema_conversion_screen(
         objects = override_apply_objects(
             build_apply_objects(_conversion(inventory)), conv_state.edited_target_ddls
         )
-        # Dedupe by object_name so an object with BOTH a deterministic unit (e.g. an
-        # UNSUPPORTED skip_reason placeholder) and an approved AI SCHEMA suggestion is applied
-        # once, not twice (the AI/edited unit wins).
-        merged = _dedupe_apply_objects(
-            objects, build_ai_apply_objects(conv_state.all_suggestions())
-        )
-        return [obj for obj in merged if obj.object_name in selected]
+        # One apply unit per object (the deterministic conversion, overlaid with any
+        # user edit from the "Use as target DDL" chat action) restricted to the current
+        # selection.
+        return [obj for obj in objects if obj.object_name in selected]
 
     def _refresh_view() -> None:
         """Re-render the screen via the refresh callback recorded by ``content``."""
@@ -2051,7 +1973,10 @@ def build_schema_conversion_screen(
             # AI panel. None when the panel is not wired (open_ai_scope is None) or AI
             # is off, in which case the object row shows the disabled affordance.
             def open_conversion_chat(
-                object_name: str, source_ddl: str, deterministic: str
+                object_name: str,
+                source_ddl: str,
+                deterministic: str,
+                note: "Optional[ConversionWarning]" = None,
             ) -> None:
                 if open_ai_scope is None or not session.ai_assist.enabled:
                     return
@@ -2061,18 +1986,109 @@ def build_schema_conversion_screen(
                 system = build_conversion_chat_system(
                     object_name, source_ddl, deterministic
                 )
-                open_ai_scope(
-                    scope_id=f"schema_conversion:{object_name}",
-                    title="AI conversion assistant",
-                    subtitle=f"{object_name}",
-                    chip=f"Schema conversion · {object_name}",
-                    seed_question=(
+
+                def _conversion_streamer(messages, on_delta):
+                    # With the shared read-only tools, the chat can look up the real
+                    # source structure / converted DDL / target schema and answer
+                    # wider-migration questions; without them it stays a plain chat.
+                    if ai_tools is not None and ai_tool_execute is not None:
+                        return strategist.tool_chat(
+                            system, messages, on_delta,
+                            tools=ai_tools, execute=ai_tool_execute,
+                        )
+                    return strategist.stream_chat(system, messages, on_delta)
+
+                # A per-NOTE icon passes its warning -> a distinct scope + a question
+                # about THAT specific issue (mirrors Evaluation's per-finding chat); the
+                # object-level fallback (note None) keeps the whole-object walkthrough.
+                if note is not None:
+                    scope_id = f"schema_conversion:{object_name}:{_note_scope_key(note)}"
+                    subtitle = _note_subtitle(object_name, note)
+                    seed = _conversion_note_question(object_name, note)
+                else:
+                    scope_id = f"schema_conversion:{object_name}"
+                    subtitle = f"{object_name}"
+                    seed = (
                         f"How should I convert {object_name} to Aurora DSQL? "
                         "Walk me through the DDL changes."
+                    )
+
+                # "Use as target DDL" footer: closes the advisory loop chat-natively.
+                # When a reply contains a single fenced ```sql block, one click adopts
+                # it as THIS object's edited target DDL (validated against the small
+                # denylist first), so an AI fix flows into the editor -> Apply instead
+                # of hand-copying. The footer button IS the explicit human approval
+                # (Property 13); nothing is written to the target here -- Apply still does.
+                def _footer_visible(md: str) -> bool:
+                    from dsql_migrator.ui.query_playground import extract_sql_from_reply
+
+                    return extract_sql_from_reply(md) is not None
+
+                def _use_as_target_ddl(md: str) -> None:
+                    from dsql_migrator.ui.query_playground import extract_sql_from_reply
+
+                    sql = extract_sql_from_reply(md)
+                    if not sql:
+                        return
+                    verdict = validate_suggested_sql(sql)
+                    if not verdict.is_safe:
+                        ui.notify(  # type: ignore[attr-defined]
+                            f"Can't adopt this SQL: {verdict.reason}", type="warning"
+                        )
+                        return
+                    conv_state.set_edited_target_ddl(object_name, sql)
+                    ui.notify(  # type: ignore[attr-defined]
+                        f"Set as {object_name}'s target DDL — review it and Apply.",
+                        type="positive",
+                    )
+                    refresh()
+
+                open_ai_scope(
+                    scope_id=scope_id,
+                    title="AI DBA",
+                    subtitle=subtitle,
+                    chip=f"Schema conversion · {object_name}",
+                    seed_question=seed,
+                    streamer=_conversion_streamer,
+                    footer_label="Use as target DDL",
+                    footer_visible=_footer_visible,
+                    footer_action=_use_as_target_ddl,
+                )
+
+            # Opener for the "reimplement the unconvertible objects" chat, shown on
+            # the banner listing the triggers/routines/events DSQL can't convert. It
+            # deep-links AI DBA seeded to NAME each object (via list_unsupported_objects)
+            # and give a per-kind reimplementation path -- turning the banner's bare
+            # counts into actionable guidance. Requires the shared tools; when AI is off
+            # (or the panel is not wired) no opener is passed and the banner has no button.
+            def open_reimplementation_chat() -> None:
+                if open_ai_scope is None or not session.ai_assist.enabled:
+                    return
+                strategist = AssessmentStrategist(
+                    session.ai_assist, aws_profile=session.aws_profile
+                )
+                system = build_reimplementation_chat_system()
+
+                def _reimpl_streamer(messages, on_delta):
+                    if ai_tools is not None and ai_tool_execute is not None:
+                        return strategist.tool_chat(
+                            system, messages, on_delta,
+                            tools=ai_tools, execute=ai_tool_execute,
+                        )
+                    return strategist.stream_chat(system, messages, on_delta)
+
+                open_ai_scope(
+                    scope_id="schema_conversion:reimplement",
+                    title="AI DBA",
+                    subtitle="Reimplement unconvertible objects",
+                    chip="Schema conversion · unconvertible objects",
+                    seed_question=(
+                        "List every trigger, stored routine, and scheduled event in my "
+                        "source that Aurora DSQL can't convert. For each one, give its "
+                        "name, briefly explain what it does, and how to reimplement it "
+                        "(application logic, or an external scheduler for events)."
                     ),
-                    streamer=lambda messages, on_delta: strategist.stream_chat(
-                        system, messages, on_delta
-                    ),
+                    streamer=_reimpl_streamer,
                 )
 
             with ui.card().classes("w-full"):
@@ -2085,9 +2101,6 @@ def build_schema_conversion_screen(
                     refresh,
                     target_inventory=target_inventory,
                     ai_candidates=ai_candidates,
-                    assistant=(
-                        _resolve_assistant() if session.ai_assist.enabled else None
-                    ),
                     on_apply_object=apply_object_confirmed,
                     on_refresh_source=refresh_source,
                     on_refresh_target=refresh_target,
@@ -2097,11 +2110,19 @@ def build_schema_conversion_screen(
                         if session.ai_assist.enabled
                         else None
                     ),
+                    on_reimplement_chat=(
+                        open_reimplementation_chat
+                        if session.ai_assist.enabled
+                        else None
+                    ),
                     # Freeze the source selection while an apply is in flight: the
                     # worker already holds a fixed object list, so re-ticking cannot
                     # change what it writes and would only desynchronize the screen
                     # from the target.
                     apply_in_progress=status is StepStatus.IN_PROGRESS,
+                    # Wire the AI activity feed so Generate posts its summary event
+                    # (on_generate lives in this helper, not the builder scope).
+                    ai_post_event=ai_post_event,
                 )
 
             def apply_all() -> None:
@@ -2222,6 +2243,95 @@ def _install_poll_timer(
     ui.timer(_POLL_INTERVAL_SECONDS, poll)  # type: ignore[attr-defined]
 
 
+def generate_ddl_event_data(
+    generated_node_ids: "Sequence[str]", inventory: SourceInventory
+) -> dict:
+    """Credential-free counts for the Generate-DDL AI activity event.
+
+    ``converted`` = the table/view objects that got converted DDL; the trigger /
+    stored-routine / scheduled-event counts are the source kinds Aurora DSQL cannot
+    convert (the same ones the on-screen banner warns about). Pure + deterministic so
+    the AI feed's Generate event (text AND its visual breakdown) is unit-testable.
+    """
+    tables = sum(1 for nid in generated_node_ids if nid.startswith(TABLE_PREFIX))
+    views = sum(1 for nid in generated_node_ids if nid.startswith(VIEW_PREFIX))
+    return {
+        "converted": tables + views,
+        "tables": tables,
+        "views": views,
+        "triggers": len(inventory.triggers),
+        "routines": len(inventory.routines),
+        "events": len(inventory.events),
+    }
+
+
+def generate_ddl_summary(data: dict) -> str:
+    """One-line text summary from :func:`generate_ddl_event_data` (the AI's grounding
+    fallback for the visual conversion event)."""
+    converted = int(data.get("converted", 0) or 0)
+    text = (
+        f"Schema conversion generated target DDL for {converted} object"
+        + ("" if converted == 1 else "s")
+        + " — a preview to review; NOT applied to Aurora DSQL yet (Apply creates them "
+        "on the target)"
+    )
+    unsupported = []
+    if data.get("triggers"):
+        unsupported.append(f"{data['triggers']} trigger(s)")
+    if data.get("routines"):
+        unsupported.append(f"{data['routines']} stored routine(s)")
+    if data.get("events"):
+        unsupported.append(f"{data['events']} event(s)")
+    if unsupported:
+        text += (
+            ". Not converted — Aurora DSQL doesn't support "
+            + ", ".join(unsupported)
+            + " (reimplement that logic in the application)"
+        )
+    return text
+
+
+def apply_event_data(results: "Sequence[ObjectApplyResult]") -> dict:
+    """Credential-free counts for the schema-apply AI activity event.
+
+    Mirrors :func:`generate_ddl_event_data`: created / skipped / failed / total, plus
+    the NAMES of the objects that failed (bounded; schema-only, never row data) so the
+    AI feed can say WHICH ones. Pure + deterministic so the visual apply event is
+    unit-testable.
+    """
+    created = sum(1 for r in results if r.status is ObjectApplyStatus.CREATED)
+    skipped = sum(1 for r in results if r.status is ObjectApplyStatus.SKIPPED)
+    failed = [r.object_name for r in results if r.status is ObjectApplyStatus.FAILED]
+    return {
+        "created": created,
+        "skipped": skipped,
+        "failed": len(failed),
+        "total": len(results),
+        "failed_objects": failed[:20],
+    }
+
+
+def apply_event_summary(data: dict) -> str:
+    """One-line text summary from :func:`apply_event_data` (the AI's grounding line)."""
+    created = int(data.get("created", 0) or 0)
+    skipped = int(data.get("skipped", 0) or 0)
+    failed = int(data.get("failed", 0) or 0)
+    total = int(data.get("total", 0) or 0)
+    text = (
+        f"Applied schema to Aurora DSQL: {created + skipped} of {total} object"
+        + ("" if total == 1 else "s")
+        + f" applied ({created} created, {skipped} skipped)"
+    )
+    if failed:
+        names = list(data.get("failed_objects") or [])
+        listed = ", ".join(names[:5])
+        more = f" and {len(names) - 5} more" if len(names) > 5 else ""
+        text += f", {failed} FAILED"
+        if listed:
+            text += f" ({listed}{more})"
+    return text
+
+
 async def generate_selected_ddl(
     conv_state: "SchemaConversionState",
     refresh: Callable[[], None],
@@ -2274,7 +2384,6 @@ def _render_browser_and_preview(
     *,
     target_inventory: Optional[TargetInventory] = None,
     ai_candidates: Optional[set[str]] = None,
-    assistant: Optional[AiConversionAssistant] = None,
     on_apply_object: Optional[Callable[[str], None]] = None,
     on_refresh_source: Optional[Callable[[], object]] = None,
     on_refresh_target: Optional[Callable[[], object]] = None,
@@ -2282,8 +2391,10 @@ def _render_browser_and_preview(
     # re-render) so each diff's "exists on target" verdict is current. Separate from
     # on_refresh_target, which is the user-facing button and announces itself.
     on_sync_target: Optional[Callable[[], object]] = None,
-    on_ai_chat: Optional[Callable[[str, str, str], None]] = None,
+    on_ai_chat: Optional[Callable[..., None]] = None,
+    on_reimplement_chat: Optional[Callable[[], None]] = None,
     apply_in_progress: bool = False,
+    ai_post_event: Optional[Callable[..., object]] = None,
 ) -> None:
     """Render side-by-side source/target browsers and the selected DDL diff.
 
@@ -2516,19 +2627,30 @@ def _render_browser_and_preview(
         await generate_selected_ddl(
             conv_state, refresh, sync_target=on_sync_target
         )
-        # Mirror the generate action into the AI activity feed with a brief summary,
-        # so the assistant reflects that DDL was generated (and can then be asked about
-        # it via its tools -- list_converted_tables / get_converted_ddl).
+        # Mirror the generate action into the AI activity feed with a real summary:
+        # how many objects got converted DDL AND which source-object kinds Aurora DSQL
+        # cannot convert (the same triggers/routines/events the on-screen banner warns
+        # about) -- so the assistant reflects the full outcome, not just a count. The
+        # assistant can then be asked about it via its tools (list_converted_tables /
+        # get_converted_ddl).
         if ai_post_event is not None and conv_state.generated_node_ids is not None:
-            _n = len(selected_object_names(conv_state.generated_node_ids))
-            ai_post_event(
-                text=(
-                    f"Generated Aurora DSQL DDL for {_n} object"
-                    + ("" if _n == 1 else "s")
-                    + " — ready to review and apply"
-                ),
-                status="success",
+            # ``inventory`` is this helper's own param (always present). Post a VISUAL
+            # conversion event (kind="conversion" -> a Converted/Not-supported bar in
+            # the panel); the text is the plain grounding fallback.
+            _data = generate_ddl_event_data(
+                conv_state.generated_node_ids, inventory
             )
+            ai_post_event(
+                text=generate_ddl_summary(_data),
+                status="success",
+                kind="conversion",
+                data=_data,
+            )
+            # The unconvertible triggers/routines/events are surfaced in the event (the
+            # "Not supported" bar segment + a note) and the on-screen banner. Explaining
+            # + reimplementing them is ON-DEMAND via the banner's "Ask AI DBA how to
+            # reimplement these" button -- matching every other step's on-demand AI
+            # pattern (no auto-fired turn on a deterministic action).
 
     def on_clear() -> None:
         # Full reset: discard the generated DDL, per-object edits, AI
@@ -2620,6 +2742,18 @@ def _render_browser_and_preview(
                 "(or an external scheduler) instead."
             ),
         )
+        # The detailed object list (names + what to do) is delivered in the AI window
+        # ON DEMAND -- the button below opens it (matching every step's on-demand AI
+        # pattern; there is no auto-fired turn on Generate) -- so it is intentionally
+        # NOT duplicated inline under the banner.
+        # AI DBA names each trigger/routine/event (via list_unsupported_objects) and
+        # gives a per-kind reimplementation path. Shown only when AI assist is on.
+        if on_reimplement_chat is not None:
+            ui.button(  # type: ignore[attr-defined]
+                "Ask AI DBA how to reimplement these",
+                icon="auto_awesome",
+                on_click=lambda: on_reimplement_chat(),
+            ).props("flat dense no-caps color=primary").classes("mt-1")
 
     def on_toggle_expand() -> None:
         conv_state.expand_all = not conv_state.expand_all
@@ -2683,7 +2817,6 @@ def _render_browser_and_preview(
                 is_ai_candidate=(
                     preview.object_name in candidates or not_auto_converted
                 ),
-                assistant=assistant,
                 on_apply_object=on_apply_object,
                 on_ai_chat=on_ai_chat,
             )
@@ -2967,9 +3100,8 @@ def _render_preview(
     refresh: Callable[[], None],
     *,
     is_ai_candidate: bool = False,
-    assistant: Optional[AiConversionAssistant] = None,
     on_apply_object: Optional[Callable[[str], None]] = None,
-    on_ai_chat: Optional[Callable[[str, str, str], None]] = None,
+    on_ai_chat: Optional[Callable[..., None]] = None,
 ) -> None:
     """Render one object's source-vs-target DDL diff (Req 10.2, 11.5).
 
@@ -2977,11 +3109,10 @@ def _render_preview(
     side-by-side, change-highlighted diff (via the editable target), so the user
     sees exactly what the conversion changed. The target is editable (the edit is
     remembered per object and used on apply, and the diff re-computes against the
-    edit). When an AI suggestion exists it is compared with the deterministic
-    conversion: if equivalent a single view is shown (with a note); if they
-    differ the target is split into "Converted" and "AI Suggested" tabs. Objects
-    that are not auto-converted (views, triggers, routines) show their source and
-    a read-only not-converted note instead.
+    edit). Objects that are not auto-converted (views, triggers, routines) show
+    their source + a read-only not-converted note, plus (for an AI candidate) the
+    per-object AI-chat icon so the user can convert it with AI DBA -- whose
+    "Use as target DDL" reply footer flows a fix into the editor -> Apply.
     """
     if preview.exists_on_target is True:
         render_notice(
@@ -2995,13 +3126,11 @@ def _render_preview(
         )
 
     editable = _is_applicable_target_ddl(preview.target_ddl)
-    suggestion = conv_state.get_suggestion(preview.object_name)
     with ui.column().classes("w-full gap-3"):  # type: ignore[attr-defined]
         if not editable:
-            # Not auto-converted (view/trigger/routine). Show the source, then
-            # either the AI suggestion (once generated, for review/approve) or
-            # the not-converted note plus the "Generate AI suggestion" button so
-            # the user can convert it with AI.
+            # Not auto-converted (view/trigger/routine): show the source + the
+            # read-only not-converted target, plus (for an AI candidate) the AI-chat
+            # icon to convert it with AI DBA.
             with ui.row().classes("items-center gap-1 w-full no-wrap"):  # type: ignore[attr-defined]
                 ui.label("Source DDL (MySQL)").classes(  # type: ignore[attr-defined]
                     "text-sm font-semibold text-blue-800"
@@ -3009,98 +3138,41 @@ def _render_preview(
                 ui.space()  # type: ignore[attr-defined]
                 _render_copy_ddl_button(ui, preview.source_ddl, label="Source DDL")
             ui.code(preview.source_ddl, language="sql").classes("w-full")  # type: ignore[attr-defined]
-            if suggestion is not None:
-                _render_suggestion_review(ui, suggestion, conv_state, refresh)
-            else:
-                with ui.row().classes("items-center gap-1 w-full no-wrap"):  # type: ignore[attr-defined]
-                    ui.label("Target DDL (Aurora DSQL)").classes(  # type: ignore[attr-defined]
-                        "text-sm font-semibold text-green-800"
-                    )
-                    ui.space()  # type: ignore[attr-defined]
-                    _render_copy_ddl_button(ui, preview.target_ddl, label="Target DDL")
-                ui.code(preview.target_ddl, language="sql").classes("w-full")  # type: ignore[attr-defined]
-                if is_ai_candidate:
-                    _render_generate_suggestion(
-                        ui,
-                        object_name=preview.object_name,
-                        source_ddl=preview.source_ddl,
-                        deterministic=preview.target_ddl,
-                        conv_state=conv_state,
-                        assistant=assistant,
-                        refresh=refresh,
-                        on_ai_chat=on_ai_chat,
-                    )
-        elif suggestion is not None and not ddl_equivalent(
-            preview.target_ddl, suggestion.suggested_sql_or_expr
-        ):
-            # Deterministic and AI conversions differ: separate them into tabs.
-            # The "Converted" tab shows the source/target diff (editable).
-            _render_target_tabs(
-                ui, preview, suggestion, conv_state, refresh, on_apply_object
-            )
-        else:
-            # Single view: the source/target diff over the deterministic
-            # (editable) conversion. The AI guidance button sits inline on the
-            # Edit/Apply toolbar (centered) via extra_actions for an AI candidate.
-            def _ai_extra() -> None:
+            with ui.row().classes("items-center gap-1 w-full no-wrap"):  # type: ignore[attr-defined]
+                ui.label("Target DDL (Aurora DSQL)").classes(  # type: ignore[attr-defined]
+                    "text-sm font-semibold text-green-800"
+                )
+                ui.space()  # type: ignore[attr-defined]
+                _render_copy_ddl_button(ui, preview.target_ddl, label="Target DDL")
+            ui.code(preview.target_ddl, language="sql").classes("w-full")  # type: ignore[attr-defined]
+            if is_ai_candidate:
                 _render_generate_suggestion(
                     ui,
                     object_name=preview.object_name,
                     source_ddl=preview.source_ddl,
                     deterministic=preview.target_ddl,
-                    conv_state=conv_state,
-                    assistant=assistant,
-                    refresh=refresh,
                     on_ai_chat=on_ai_chat,
                 )
-
+        else:
+            # Auto-converted: the source/target diff over the deterministic (editable)
+            # conversion. AI guidance is a compact icon next to each conversion warning
+            # below (mirrors Evaluation), not a separate toolbar button.
             _render_editable_target(
                 ui,
                 preview,
                 conv_state,
                 on_apply_object,
-                extra_actions=(_ai_extra if is_ai_candidate else None),
             )
-            if suggestion is not None:
-                ui.label(  # type: ignore[attr-defined]
-                    "AI suggestion matches the deterministic conversion."
-                ).classes("text-xs text-gray-500")
 
     if preview.warnings:
-        _render_conversion_warnings(ui, preview.warnings)
-
-
-def _render_target_tabs(
-    ui: object,
-    preview: DdlPreview,
-    suggestion: AiConversionSuggestion,
-    conv_state: SchemaConversionState,
-    refresh: Callable[[], None],
-    on_apply_object: Optional[Callable[[str], None]] = None,
-) -> None:
-    """Show the deterministic vs AI target DDL as 'Converted' / 'AI Suggested' tabs.
-
-    The "Converted" tab holds the editable deterministic DDL (applied as
-    written); the "AI Suggested" tab holds the AI suggestion with its review
-    controls. Only an explicitly approved suggestion is applied (Property 13);
-    editing/approving happens on the AI tab.
-    """
-    with ui.tabs().props("dense").classes("w-full") as tabs:  # type: ignore[attr-defined]
-        converted_tab = ui.tab("Converted")  # type: ignore[attr-defined]
-        ai_tab = ui.tab("AI Suggested")  # type: ignore[attr-defined]
-    with ui.tab_panels(tabs, value=converted_tab).classes("w-full"):  # type: ignore[attr-defined]
-        with ui.tab_panel(converted_tab):  # type: ignore[attr-defined]
-            _render_editable_target(
-                ui,
-                preview,
-                conv_state,
-                on_apply_object,
-                read_only_caption=(
-                    "Deterministic conversion — editable, applied as written"
-                ),
-            )
-        with ui.tab_panel(ai_tab):  # type: ignore[attr-defined]
-            _render_suggestion_review(ui, suggestion, conv_state, refresh)
+        _render_conversion_warnings(
+            ui,
+            preview.warnings,
+            on_ai_chat=on_ai_chat,
+            object_name=preview.object_name,
+            source_ddl=preview.source_ddl,
+            deterministic_ddl=preview.target_ddl,
+        )
 
 
 def ddl_equivalent(left: str, right: str) -> bool:
@@ -3125,8 +3197,90 @@ _WARNING_BADGE_COLOR: dict[str, str] = {
 }
 
 
+def _note_scope_key(note: ConversionWarning) -> str:
+    """A stable, short scope suffix identifying ONE conversion note on an object.
+
+    Uses the note kind + its column (like Evaluation keys a finding by rule), so a
+    per-note AI chat gets its own scope -- clicking a different warning re-seeds with
+    that warning instead of re-focusing the first one's conversation.
+    """
+    kind = getattr(getattr(note, "kind", None), "value", "") or "note"
+    column = (getattr(note, "column_name", "") or "").strip()
+    return f"{kind}:{column}" if column else kind
+
+
+def _note_subtitle(object_name: str, note: ConversionWarning) -> str:
+    """Panel subtitle for a per-note chat: object + the column (or note kind)."""
+    column = (getattr(note, "column_name", "") or "").strip()
+    if column:
+        return f"{object_name} · {column}"
+    kind = getattr(getattr(note, "kind", None), "value", "") or ""
+    return f"{object_name} · {kind}" if kind else object_name
+
+
+def _conversion_note_question(object_name: str, note: ConversionWarning) -> str:
+    """Phrase a guidance request about ONE specific conversion note on an object.
+
+    Embeds the note's actual message (and column) so the AI answers about THIS issue
+    -- not the generic "walk me through converting this table" question.
+    """
+    message = (getattr(note, "message", "") or "").strip()
+    column = (getattr(note, "column_name", "") or "").strip()
+    where = f" on column {column}" if column else ""
+    detail = f' The conversion flagged{where}: "{message}".' if message else where
+    return (
+        f"On {object_name}, migrating to Amazon Aurora DSQL,{detail} "
+        "What does this mean, and exactly what should I do about it?"
+    )
+
+
+def _render_conversion_note_ai_icon(
+    ui: object,
+    on_ai_chat: Optional[Callable[..., None]],
+    object_name: str,
+    source_ddl: str,
+    deterministic_ddl: str,
+    note: Optional[ConversionWarning] = None,
+) -> None:
+    """Compact AI-guidance ICON next to a conversion note (mirrors Evaluation).
+
+    Replaces the old labeled "AI guidance" toolbar button: one click opens the AI DBA
+    panel scoped to converting THIS object. ``click.stop`` keeps the click from toggling
+    an enclosing expansion. When AI is off (no ``on_ai_chat``) the icon is shown
+    disabled with a hint so the affordance stays discoverable.
+    """
+    if on_ai_chat is not None and object_name:
+        btn = ui.button(icon="auto_awesome")  # type: ignore[attr-defined]
+        btn.props("flat round dense size=sm color=indigo-6")
+        btn.on(  # type: ignore[attr-defined]
+            "click.stop",
+            # Pass THIS note so the chat is seeded with its specific issue, not the
+            # generic "walk me through converting the table" question.
+            lambda _e=None, _n=note: on_ai_chat(
+                object_name, source_ddl, deterministic_ddl, _n
+            ),
+        )
+        btn.tooltip(  # type: ignore[attr-defined]
+            "Ask AI DBA about this issue" if note is not None
+            else "Ask AI DBA about this conversion"
+        )
+    else:
+        disabled = ui.button(icon="auto_awesome")  # type: ignore[attr-defined]
+        disabled.props("flat round dense size=sm color=grey-5")
+        disabled.disable()  # type: ignore[attr-defined]
+        disabled.tooltip(  # type: ignore[attr-defined]
+            "Enable AI Assist on the Connect screen to get conversion guidance."
+        )
+
+
 def _render_conversion_warnings(
-    ui: object, warnings: Sequence[ConversionWarning]
+    ui: object,
+    warnings: Sequence[ConversionWarning],
+    *,
+    on_ai_chat: Optional[Callable[..., None]] = None,
+    object_name: str = "",
+    source_ddl: str = "",
+    deterministic_ddl: str = "",
 ) -> None:
     """Render conversion notes as wrapping lists, split by kind.
 
@@ -3177,6 +3331,12 @@ def _render_conversion_warnings(
                         )
                     ui.label(note.message).classes(  # type: ignore[attr-defined]
                         "text-sm flex-1 min-w-0 whitespace-normal break-words"
+                    )
+                    # Per-note AI-guidance icon on the right (mirrors Evaluation's
+                    # per-finding icon) -- one click asks AI DBA about THIS note's issue.
+                    _render_conversion_note_ai_icon(
+                        ui, on_ai_chat, object_name, source_ddl, deterministic_ddl,
+                        note=note,
                     )
 
     if losses:
@@ -3616,49 +3776,26 @@ def _render_editable_target(
     render(editing=False)
 
 
-# Quasar color names for each AI suggestion review status badge.
-_AI_STATUS_COLORS: dict[str, str] = {
-    AI_STATUS_PENDING_REVIEW: "primary",
-    AI_STATUS_EDITED: "warning",
-    AI_STATUS_APPROVED: "positive",
-    AI_STATUS_REJECTED: "negative",
-}
-
-# DSQL constraints used to ground the AI prompt (design.md "AI-assisted
-# Conversion Design"). Passed to the assistant seam so suggestions respect the
-# target's limits.
-_DSQL_CONSTRAINTS = (
-    "Aurora DSQL constraints: foreign keys are unsupported, a primary key is "
-    "required, secondary indexes are built asynchronously (CREATE INDEX ASYNC), "
-    "the 'C' collation is used, and there are transaction limits (single DDL per "
-    "transaction)."
-)
-
-
 def _render_generate_suggestion(
     ui: object,
     *,
     object_name: str,
     source_ddl: str,
     deterministic: str,
-    conv_state: SchemaConversionState,
-    assistant: Optional[AiConversionAssistant],
-    refresh: Callable[[], None],
-    on_ai_chat: Optional[Callable[[str, str, str], None]] = None,
+    on_ai_chat: Optional[Callable[..., None]] = None,
 ) -> None:
-    """Render the unified 'AI guidance' control that opens the chat drawer.
+    """Render the per-object AI-guidance icon for a not-auto-converted object.
 
     Matches the Evaluation screen's AI button (flat, indigo ``auto_awesome``) and
     opens the SAME right chat drawer, scoped to converting THIS object, so the
     AI-assistance experience is identical across the app. The chat is advisory;
     its in-drawer "Use as target DDL" action pulls the latest reply's SQL into
-    the editable target so it still flows into Apply. When AI is unavailable
-    (disabled, or no opener wired) the button is shown disabled with a hint, so
-    the affordance stays discoverable.
+    the editable target so it still flows into Apply. When AI is off (no opener
+    wired) the icon is shown disabled with a hint, so it stays discoverable.
     """
-    if assistant is None or on_ai_chat is None:
-        disabled = ui.button("AI guidance")  # type: ignore[attr-defined]
-        disabled.props("flat dense color=indigo-6 icon=auto_awesome")
+    if on_ai_chat is None:
+        disabled = ui.button(icon="auto_awesome")  # type: ignore[attr-defined]
+        disabled.props("flat round dense size=sm color=grey-5")
         disabled.disable()
         disabled.tooltip(  # type: ignore[attr-defined]
             "Enable AI-assisted conversion on the Connect screen (toggle it on, "
@@ -3668,92 +3805,11 @@ def _render_generate_suggestion(
         return
 
     ui.button(  # type: ignore[attr-defined]
-        "AI guidance",
+        icon="auto_awesome",
         on_click=lambda: on_ai_chat(object_name, source_ddl, deterministic),
-    ).props("flat dense color=indigo-6 icon=auto_awesome").tooltip(
-        "Open AI guidance for converting this object in the side panel."
+    ).props("flat round dense size=sm color=indigo-6").tooltip(
+        "Ask AI DBA about converting this object"
     )
-
-
-def _render_suggestion_review(
-    ui: object,
-    suggestion: AiConversionSuggestion,
-    conv_state: SchemaConversionState,
-    refresh: Callable[[], None],
-) -> None:
-    """Render a suggestion with its provenance and approve/reject controls.
-
-    Everything sits in one tinted panel: a header row (status badge + model
-    provenance), the rationale rendered as Markdown (so bullets, bold, and
-    inline code read cleanly instead of as one wall of text), the suggested SQL
-    shown read-only like normal output, and the approve/reject actions. Only an
-    explicitly approved suggestion is applied (Property 13).
-    """
-    with ui.column().classes(  # type: ignore[attr-defined]
-        "w-full gap-2 p-3 rounded-lg border border-indigo-200 bg-indigo-50"
-    ):
-        with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
-            ui.icon("auto_awesome", color="indigo-6").classes("text-lg")  # type: ignore[attr-defined]
-            ui.label("AI suggestion").classes("text-sm font-semibold")  # type: ignore[attr-defined]
-            ui.badge(suggestion.status).props(  # type: ignore[attr-defined]
-                f"color={_AI_STATUS_COLORS.get(suggestion.status, 'grey')}"
-            )
-            ui.space()  # type: ignore[attr-defined]
-            provenance = f"model: {suggestion.model_id}"
-            if suggestion.confidence is not None:
-                provenance += f"  \u00b7  confidence {suggestion.confidence:.2f}"
-            ui.label(provenance).classes("text-xs text-gray-400")  # type: ignore[attr-defined]
-
-        if suggestion.rationale:
-            with ui.card().classes(  # type: ignore[attr-defined]
-                "w-full bg-white !shadow-none border rounded"
-            ):
-                ui.label("Rationale & notes").classes(  # type: ignore[attr-defined]
-                    "text-xs font-semibold text-gray-500"
-                )
-                ui.markdown(suggestion.rationale).classes("text-sm")  # type: ignore[attr-defined]
-
-        ui.label("Suggested SQL / expression").classes(  # type: ignore[attr-defined]
-            "text-sm text-gray-500"
-        )
-        ui.code(  # type: ignore[attr-defined]
-            suggestion.suggested_sql_or_expr, language="sql"
-        ).classes("w-full")
-
-        if suggestion.approved_by_user:
-            render_notice(
-                ui,
-                tone="success",
-                header="Approved — will be applied on Run",
-                body="Approved. This suggestion will be applied to the target on Run.",
-            )
-        else:
-            render_notice(
-                ui,
-                tone="warning",
-                header="Not approved — will be skipped",
-                body=(
-                    "Not approved. This suggestion will NOT be applied until you "
-                    "approve it."
-                ),
-            )
-
-        def on_approve() -> None:
-            # Approve the suggestion as shown (read-only review; Property 13).
-            conv_state.set_suggestion(approve_suggestion(suggestion))
-            refresh()
-
-        def on_reject() -> None:
-            conv_state.set_suggestion(reject_suggestion(suggestion))
-            refresh()
-
-        with ui.row().classes("gap-2"):  # type: ignore[attr-defined]
-            ui.button("Approve", on_click=on_approve).props(  # type: ignore[attr-defined]
-                "color=positive"
-            )
-            ui.button("Reject", on_click=on_reject).props(  # type: ignore[attr-defined]
-                "color=negative flat"
-            )
 
 
 def _render_apply_controls(

@@ -220,6 +220,8 @@ def _render_cdc_step(
     run_checks=None,
     session: object = None,
     full_load_status: "Optional[StepStatus]" = None,
+    cdc_ai_opener=None,
+    ai_post_event=None,
 ) -> None:
     """Render the CDC step in user-journey order: decide -> prepare -> start ->
     monitor -> reference.
@@ -301,7 +303,10 @@ def _render_cdc_step(
     # 5. MONITOR: live connector health + DLQ, meaningful only once streaming.
     # session is threaded through so the drift banner can offer the opt-in
     # ADD COLUMN fix (it needs the source + target connections).
-    _render_cdc_live_monitoring(ui, migration_state, job_manager, session=session)
+    _render_cdc_live_monitoring(
+        ui, migration_state, job_manager, session=session,
+        cdc_ai_opener=cdc_ai_opener, ai_post_event=ai_post_event,
+    )
 
     # 5b. PER-TABLE: Full Load outcome + live source/target row counts per selected
     #     table, so the operator can see Full Load completion and CDC replication

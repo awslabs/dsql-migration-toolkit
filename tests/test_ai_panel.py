@@ -64,11 +64,16 @@ class _El:
     def on_click(self, *_a, **_k) -> "_El":
         return self
 
-    # context manager (with ui.row(): ...)
+    # context manager (with ui.row(): ...) -- tracks the slot stack so timers/
+    # elements record which container owns them (mirrors NiceGUI's slot_stack), so a
+    # test can model render_main.refresh() clearing a container + its timers.
     def __enter__(self) -> "_El":
+        self._ui.slot_stack.append(self)
         return self
 
     def __exit__(self, *_exc) -> bool:
+        if self._ui.slot_stack and self._ui.slot_stack[-1] is self:
+            self._ui.slot_stack.pop()
         return False
 
     # mutators the panel calls
@@ -107,6 +112,10 @@ class _Timer:
         self.interval = interval
         self.cb = cb
         self.active = True
+        # Which container slot owns this timer (set by _Ui.timer). render_main.refresh()
+        # deletes a container's descendants -- including timers created in its slot.
+        self.parent = None
+        self.is_deleted = False
 
 
 class _Ui:
@@ -120,6 +129,7 @@ class _Ui:
         self.textareas: list[_El] = []
         self.labels: list[_El] = []
         self.badges: list[_El] = []
+        self.slot_stack: list = []  # active container slots (for timer ownership)
 
     def add_css(self, *_a, **_k) -> None:
         pass
@@ -188,6 +198,7 @@ class _Ui:
 
     def timer(self, interval: float, cb) -> _Timer:  # noqa: ANN001
         t = _Timer(interval, cb)
+        t.parent = self.slot_stack[-1] if self.slot_stack else None
         self.timers.append(t)
         return t
 
@@ -344,8 +355,8 @@ def test_disabled_panel_reports_not_enabled_and_stays_hidden() -> None:
 
 
 def _reopen_tab(ui: _Ui) -> _El:
-    tabs = [b for b in ui.buttons if b.text == "AI"]
-    assert len(tabs) == 1, "expected exactly one right-edge 'AI' reopen tab"
+    tabs = [b for b in ui.buttons if b.text == "AI DBA"]
+    assert len(tabs) == 1, "expected exactly one right-edge 'AI DBA' reopen tab"
     return tabs[0]
 
 
@@ -405,6 +416,91 @@ def test_restored_open_panel_activates_general_streamer_so_composer_is_usable() 
     assert inputs and inputs[0].enabled is True
 
 
+def test_composer_reenables_after_nav_clears_a_screen_scope() -> None:
+    # Regression: a turn started from a step screen's "AI Assist" deep-link parents its
+    # streaming tick timer on the screen's slot. Navigating (render_main.refresh() ->
+    # container.clear()) used to delete + cancel that timer mid-turn, so tick() never
+    # ran _set_busy(False) and the shared composer stayed disabled forever. The fix
+    # anchors the tick timer on the persistent panel column so it survives navigation.
+    import threading
+
+    state = _enabled_state()
+    ui = _Ui()
+    release = threading.Event()
+
+    def blocking_streamer(messages, on_delta):  # noqa: ANN001
+        on_delta("partial ")
+        release.wait(timeout=5)  # keep the turn in-flight across "navigation"
+        return ObjectGuidanceOutcome(
+            available=True, reason="OK", detail="",
+            markdown="partial done", model_id="fake-model",
+        )
+
+    panel = build_ai_panel(ui, state=state)
+
+    # A turn fired from a control rendered INSIDE render_main's refreshable container:
+    # model that with a caller column entered as a context manager.
+    screen = ui.column()
+    with screen:
+        panel.open_scope(
+            scope_id="eval:orders", title="orders",
+            streamer=blocking_streamer,
+            seed_question="Explain the orders table.",
+        )
+
+    chat_input = ui.textareas[0]
+    assert chat_input.enabled is False  # in-flight -> composer disabled
+
+    # Navigation -> render_main.refresh(): clear the screen container, cancelling every
+    # timer parented under it (mirrors Element.clear() -> Timer._handle_delete()).
+    for t in ui.timers:
+        if getattr(t, "parent", None) is screen:
+            t.active = False
+            t.is_deleted = True
+    screen.is_deleted = True
+
+    release.set()  # the turn completes AFTER navigation
+    _pump(ui)
+
+    # Post-fix: the tick timer lives under the persistent panel column, survives the
+    # refresh, finalizes the turn -> composer usable again + assistant turn recorded.
+    assert chat_input.enabled is True
+    assert state.ai_conversation.messages[-1]["role"] == "assistant"
+
+
+def test_restored_open_panel_with_dead_screen_scope_falls_back_to_general() -> None:
+    # Regression: after a rebuild/restart the session restores an OPEN panel whose
+    # active scope is a SCREEN deep-link (e.g. an object chat) -- but that scope's
+    # streamer is a closure that can't be reconstructed, so conv["streamer"] is None.
+    # The composer must NOT be left dead (the bug the user hit: navigate to a step, the
+    # "Moved to ..." event shows, but the input is blocked). Build must re-home to the
+    # general scope so the composer is immediately usable.
+    from dsql_migrator.core.models import AiScope
+
+    state = _enabled_state()
+    state.ai_conversation.visible = True  # restored OPEN
+    state.ai_conversation.active_scope = AiScope(
+        scope_id="schema_conversion:orders", title="orders",
+        subtitle="orders", chip="Schema conversion · orders",
+    )
+    # A prior (screen-scoped) exchange restored from the session.
+    state.ai_conversation.messages.append(
+        {"role": "user", "text": "How do I convert orders?"}
+    )
+    state.ai_conversation.messages.append({"role": "assistant", "text": "Drop the FK."})
+    ui = _Ui()
+
+    def factory():  # noqa: ANN202
+        return _make_streamer("general reply")
+
+    build_ai_panel(ui, state=state, general_streamer_factory=factory)
+    # Stale screen scope re-homed to general (its streamer was unrecoverable)...
+    assert state.ai_conversation.active_scope.scope_id == "general"
+    # ...so the composer is enabled instead of dead.
+    inputs = [t for t in ui.textareas]
+    assert inputs and inputs[0].enabled is True
+
+
 def test_object_scope_takes_priority_over_general() -> None:
     # A screen deep-link sets a SPECIFIC scope; the general factory is not used.
     state = _enabled_state()
@@ -447,6 +543,116 @@ def _drain_events(ui: _Ui) -> None:
         ui.timers[0].cb()
 
 
+def _run_progress(ui: _Ui) -> None:
+    # Drive the panel's persistent progress poller (the 1.0s loop timer) once.
+    for t in ui.timers:
+        if abs(t.interval - 1.0) < 1e-6:
+            t.cb()
+            return
+
+
+def test_disabling_ai_midsession_inerts_panel_and_blocks_model_calls() -> None:
+    # COST SAFETY: turning AI Assist off on Connect mid-session must inert AI DBA -- the
+    # composer goes dead and NO further turn reaches the model, even though a streamer
+    # was set while it was on (the bug: the panel kept working -> unwanted AI charges).
+    state = _enabled_state()
+    ui = _Ui()
+    calls = {"n": 0}
+
+    def streamer(messages, on_delta):  # noqa: ANN001
+        calls["n"] += 1
+        on_delta("hi")
+        return ObjectGuidanceOutcome(
+            available=True, reason="OK", detail="", markdown="hi", model_id="m"
+        )
+
+    panel = build_ai_panel(ui, state=state)
+    send = panel.open_scope(
+        scope_id="eval:orders", title="orders",
+        streamer=streamer, seed_question="Q",
+    )
+    _pump(ui)
+    chat_input = ui.textareas[0]
+    assert chat_input.enabled is True and calls["n"] == 1  # worked while AI was on
+
+    state.ai_assist.enabled = False   # Connect toggles AI Assist OFF mid-session
+    _drain_events(ui)                 # the loop timer reactively inerts the panel
+    assert chat_input.enabled is False  # composer dead -> the user can't send
+    send("please answer again")       # even a programmatic send...
+    _pump(ui)
+    assert calls["n"] == 1            # ...never reaches the model (no Bedrock cost)
+
+
+def test_refresh_context_updates_step_chip_except_when_pinned_to_an_object() -> None:
+    # Side-menu navigation updates the panel's baseline STEP chip (via refresh_context)
+    # -- but a per-object scope keeps its own chip, so nav must not overwrite it.
+    from dsql_migrator.core.models import MigrationContext
+
+    step = {"name": "Evaluation"}
+
+    def get_context() -> MigrationContext:
+        return MigrationContext(
+            current_step=step["name"], migration_type="", summary=""
+        )
+
+    state = _enabled_state()
+    ui = _Ui()
+    panel = build_ai_panel(
+        ui, state=state, get_context=get_context,
+        general_streamer_factory=lambda: _make_streamer(),
+    )
+    panel.set_visible(True)  # general scope -> chip = baseline ("Evaluation")
+    assert any(el.text == "Evaluation" for el in ui.labels)
+
+    step["name"] = "Schema Conversion"   # navigate
+    panel.refresh_context()
+    assert any(el.text == "Schema Conversion" for el in ui.labels)
+
+    # Pinned to an object scope: refresh_context must NOT overwrite its chip.
+    panel.open_scope(
+        scope_id="eval:orders", title="orders",
+        chip="Evaluation · orders", streamer=_make_streamer(),
+    )
+    step["name"] = "Data Migration"
+    panel.refresh_context()
+    assert not any(el.text == "Data Migration" for el in ui.labels)
+
+
+def test_live_progress_card_monitors_and_finalizes_full_load() -> None:
+    # The AI panel is a live Full Load monitor: one card updated in place by the
+    # persistent poller (not one feed entry per table), finalizing to a summary.
+    state = _enabled_state()
+    state.ai_conversation.visible = True
+    ui = _Ui()
+    snap: dict = {"data": None}
+
+    panel = build_ai_panel(ui, state=state, get_progress=lambda: snap["data"])
+    # No Full Load job yet -> provider returns None -> no card.
+    _run_progress(ui)
+    assert not any("Full Load" in (el.text or "") for el in ui.labels)
+
+    # Running: 2/5 tables done, 1 failed, with a throughput + ETA line.
+    snap["data"] = {
+        "label": "Full Load", "running": True, "total": 5, "done": 2,
+        "failed": 1, "rows": 1000, "failed_objects": ["ecommerce.orders"],
+        "rows_per_sec": 250, "eta": "~2m 30s left",
+    }
+    _run_progress(ui)
+    texts = " ".join(el.text for el in ui.labels)
+    assert "Full Load — 2/5 tables · 1 failed · 1,000 rows" in texts
+    assert "Failed: ecommerce.orders" in texts
+    assert "250 rows/s" in texts and "~2m 30s left" in texts  # throughput/ETA line
+
+    # Terminal: the SAME card updates in place to the final summary ("complete").
+    snap["data"] = {
+        "label": "Full Load", "running": False, "total": 5, "done": 4,
+        "failed": 1, "rows": 5000, "failed_objects": ["ecommerce.orders"],
+    }
+    _run_progress(ui)
+    texts2 = " ".join(el.text for el in ui.labels)
+    assert "Full Load complete — 4/5 tables · 1 failed · 5,000 rows" in texts2
+
+
 def test_post_event_records_and_renders_when_enabled() -> None:
     # A major migration action is mirrored into the panel as a deterministic activity
     # event: recorded on the session (survives refresh) and shown in the feed.
@@ -463,6 +669,50 @@ def test_post_event_records_and_renders_when_enabled() -> None:
     # Rendered only once the loop timer drains the queue (safe UI-thread rendering).
     _drain_events(ui)
     assert any(el.text == "Started Full Load for orders" for el in ui.labels)
+
+
+def test_conversion_activity_event_reads_as_preview_not_applied() -> None:
+    # The Generate-DDL visual event must read as a PREVIEW (DDL generated to review),
+    # NOT an apply/migration ("N objects converted" overstated it), and name the
+    # DSQL-unconvertible kinds.
+    state = _enabled_state()
+    ui = _Ui()
+    panel = build_ai_panel(ui, state=state)
+    panel.post_event(
+        text="Schema conversion generated target DDL for 3 objects — a preview",
+        status="success",
+        kind="conversion",
+        data={
+            "converted": 3, "tables": 3, "views": 0,
+            "triggers": 2, "routines": 1, "events": 0,
+        },
+    )
+    _drain_events(ui)
+    texts = " ".join(el.text for el in ui.labels)
+    assert "DDL generated for 3 objects" in texts  # headline: generated, not "converted"
+    assert "nothing is applied to Aurora DSQL until you Apply" in texts  # preview note
+    assert "can't convert 2 trigger(s), 1 routine(s)" in texts  # unconvertible kinds
+
+
+def test_apply_activity_event_renders_created_skipped_failed_summary() -> None:
+    # When Apply finishes, the panel gets a VISUAL summary: a Created/Skipped/Failed
+    # bar + a headline, and (on failure) the names of the objects that failed.
+    state = _enabled_state()
+    ui = _Ui()
+    panel = build_ai_panel(ui, state=state)
+    panel.post_event(
+        text="Applied schema to Aurora DSQL: 3 of 4 objects applied",
+        status="error",
+        kind="apply",
+        data={
+            "created": 2, "skipped": 1, "failed": 1, "total": 4,
+            "failed_objects": ["geo"],
+        },
+    )
+    _drain_events(ui)
+    texts = " ".join(el.text for el in ui.labels)
+    assert "Schema apply — 3 of 4 applied, 1 failed" in texts
+    assert "Failed: geo" in texts  # names the failed object
 
 
 def test_post_event_is_noop_when_ai_disabled() -> None:

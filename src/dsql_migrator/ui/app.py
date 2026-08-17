@@ -165,6 +165,33 @@ _AI_TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        "name": "get_source_object_detail",
+        "description": (
+            "Get the real STRUCTURE of one SOURCE table (or view) by name: columns "
+            "(name/type/nullable/default/collation/generated), primary key, indexes "
+            "(incl. prefix lengths + type), foreign keys (incl. on_delete/on_update "
+            "cascade), CHECK constraints, and the partitioned flag. Schema only, "
+            "never any row data. Use it to name the EXACT offending column/key/FK "
+            "behind an assessment finding instead of guessing from DDL text."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"object_name": {"type": "string"}},
+            "required": ["object_name"],
+        },
+    },
+    {
+        "name": "list_unsupported_objects",
+        "description": (
+            "List the SOURCE objects Aurora DSQL cannot convert — triggers, stored "
+            "procedures/functions (routines), and scheduled events — BY NAME. Their "
+            "logic must be reimplemented in the application (or an external scheduler "
+            "like Amazon EventBridge Scheduler for events). Use this to name the "
+            "objects and advise how to reimplement each. No arguments."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "get_validation_summary",
         "description": (
             "Get the latest data-validation result: match verdict, matched/total "
@@ -173,10 +200,54 @@ _AI_TOOL_SCHEMAS: list[dict] = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
+        "name": "list_validation_mismatches",
+        "description": (
+            "List the tables that did NOT match in the last data validation — each "
+            "with source/target row counts, missing/extra counts, row-count & checksum "
+            "match flags, quarantined rows, and any error. Use it to NAME the specific "
+            "mismatched tables and reason lag-vs-standing-gap. Counts/verdicts only, "
+            "never row data. No arguments."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_schema_apply_result",
+        "description": (
+            "List the per-object results of the last Schema Conversion Apply: each "
+            "object's status (CREATED / SKIPPED / FAILED) and, for a failure, its error "
+            "detail. Use it to NAME the objects whose apply FAILED and why. Names / "
+            "statuses / messages only. No arguments."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "get_full_load_status",
         "description": (
             "Get Full Load progress (tables done/total/failed, rows loaded) and "
             "whether CDC is streaming. No arguments."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "list_failed_full_load_tables",
+        "description": (
+            "List the Full Load tables that FAILED (each with its latest error message) "
+            "and the tables that had rows QUARANTINED (permanently dropped, e.g. a value "
+            "over DSQL's ~1 MiB per-value limit). Use it to NAME the specific tables "
+            "blocking the migration and to reason about the standing-gap-before-CDC risk. "
+            "Names + messages only, never row data. No arguments."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_cdc_status",
+        "description": (
+            "Get live CDC (change-data-capture) health: whether the stream is running, "
+            "worst replication lag, dead-letter-queue (DLQ) depth with the top poison "
+            "tables and their SQLSTATEs, and any detected source SCHEMA DRIFT (kind + "
+            "tables). Use it to diagnose CDC silent-data-loss risk (rising DLQ, drift, "
+            "stalled sink) and what to fix before cut over. Counts / table names / "
+            "SQLSTATEs only, never row data. No arguments."
         ),
         "input_schema": {"type": "object", "properties": {}},
     },
@@ -261,6 +332,74 @@ def build_page(
         if handle is not None:
             handle.post_event(**kwargs)
 
+    def _full_load_rate_eta(job, prog, *, running):
+        # Run-level throughput (rows/sec) + ETA/elapsed for the monitor card, derived
+        # from the chunks' start/finish timestamps. Defensive: any missing/odd timing
+        # just yields (None, "") so the card simply omits the line. Never raises.
+        from datetime import datetime
+
+        from dsql_migrator.ui.data_migration._models import format_duration
+
+        try:
+            starts = [
+                c.started_at for c in job.chunks
+                if getattr(c, "started_at", None) is not None
+            ]
+            if not starts:
+                return None, ""
+            start = min(starts)
+            now = datetime.now(start.tzinfo) if start.tzinfo else datetime.now()
+            elapsed = (now - start).total_seconds()
+            rate = (
+                prog.rows_loaded / elapsed
+                if running and elapsed > 0 and prog.rows_loaded > 0
+                else None
+            )
+            pct = prog.progress_pct
+            if running and pct and pct > 0 and elapsed > 0:
+                remaining = max(0.0, elapsed / (pct / 100.0) - elapsed)
+                return rate, f"~{format_duration(remaining)} left"
+            if not running:
+                finishes = [
+                    c.finished_at for c in job.chunks
+                    if getattr(c, "finished_at", None) is not None
+                ]
+                if finishes:
+                    total = (max(finishes) - start).total_seconds()
+                    return None, f"{format_duration(total)} elapsed"
+            return rate, ""
+        except Exception:  # noqa: BLE001 - timing is best-effort, never break the card
+            return None, ""
+
+    def _full_load_progress_provider():
+        # Live Full Load snapshot for the AI panel's monitor card, polled by a
+        # persistent panel timer so it keeps updating across navigation. Credential- and
+        # row-free: table counts + failed table NAMES + rows loaded only (Property 7).
+        # Returns None when there is no Full Load job (nothing to monitor yet).
+        from dsql_migrator.ui.data_migration import _current_job, summarize_progress
+
+        _dm = DATA_MIGRATION_STORE.get_or_create(session_id)
+        _job = _current_job(JOB_MANAGER, _dm.job_id)
+        if _job is None or not hasattr(_job, "chunks"):
+            return None
+        _prog = summarize_progress(_job)
+        _failed = [
+            c.chunk_id for c in _job.chunks if getattr(c, "status", "") == "FAILED"
+        ]
+        _running = (_prog.in_progress_tables + _prog.pending_tables) > 0
+        _rate, _eta = _full_load_rate_eta(_job, _prog, running=_running)
+        return {
+            "label": "Full Load",
+            "running": _running,
+            "total": _prog.total_tables,
+            "done": _prog.done_tables,
+            "failed": _prog.failed_tables,
+            "rows": _prog.rows_loaded,
+            "failed_objects": _failed,
+            "rows_per_sec": _rate,
+            "eta": _eta,
+        }
+
     def _ai_context() -> MigrationContext:
         # Credential-free "where you are" for the panel's baseline chip AND the general
         # chat's grounding. We inject as much DETERMINISTIC, non-secret state as the tool
@@ -284,7 +423,7 @@ def build_page(
         # from context, not guessed). Model id + region are non-secret. ---
         _ai = getattr(st, "ai_assist", None)
         if _ai is not None and getattr(_ai, "model_id", ""):
-            _m = f"AI assistant: this chat runs on Amazon Bedrock model {_ai.model_id}"
+            _m = f"AI DBA: this chat runs on Amazon Bedrock model {_ai.model_id}"
             if getattr(_ai, "region", None):
                 _m += f" (region {_ai.region})"
             facts.append(_m)
@@ -474,6 +613,87 @@ def build_page(
                      "effort": _m.effort.value if _m.effort else None,
                      "risk": _m.risk, "recommendation": _m.recommendation}
                 )
+            if name == "get_source_object_detail":
+                # Real STRUCTURE of one source table/view (schema only, never rows):
+                # columns/types/nullability/defaults/collation, PK, indexes (incl.
+                # prefix lengths + type), FKs (incl. cascade actions), CHECKs. Lets a
+                # chat name the EXACT offending column/key instead of parsing DDL text.
+                _obj = str(args.get("object_name", "")).strip()
+                if not _obj:
+                    return _json.dumps({"status": "error", "message": "object_name required"})
+                _ev = EVALUATION_STORE.get(session_id)
+                _r = _ev.result if _ev else None
+                _inv = getattr(_r, "inventory", None) if _r is not None else None
+                if _inv is None:
+                    return _json.dumps(
+                        {"status": "not_run",
+                         "message": "Run Evaluation (Step 1) first to read the source schema."}
+                    )
+                _key = _obj.lower()
+                _tail = _key.rsplit(".", 1)[-1]
+
+                def _matches(_n: str) -> bool:
+                    _nl = _n.lower()
+                    return _nl == _key or _nl.rsplit(".", 1)[-1] == _tail
+
+                _t = next((t for t in _inv.tables if _matches(t.name)), None)
+                if _t is None:
+                    _v = next((v for v in _inv.views if _matches(v.name)), None)
+                    if _v is not None:
+                        return _json.dumps(
+                            {"status": "ok", "object_name": _v.name, "kind": "view",
+                             "definition": (_v.definition or "")[:4000]}
+                        )
+                    return _json.dumps({"status": "not_found", "object_name": _obj})
+                return _json.dumps(
+                    {"status": "ok", "object_name": _t.name, "kind": "table",
+                     "primary_key": list(_t.primary_key),
+                     "auto_increment_column": _t.auto_increment_column,
+                     "partitioned": _t.partitioned,
+                     "columns": [
+                         {"name": c.name, "type": c.mysql_type, "nullable": c.nullable,
+                          "default": c.default, "collation": c.collation,
+                          "generated": c.generated,
+                          "auto_update_timestamp": c.auto_update_timestamp}
+                         for c in _t.columns
+                     ],
+                     "indexes": [
+                         {"name": i.name, "columns": list(i.columns), "unique": i.unique,
+                          "index_type": i.index_type,
+                          "prefix_lengths": dict(i.prefix_lengths)}
+                         for i in _t.indexes
+                     ],
+                     "foreign_keys": [
+                         {"name": f.name, "columns": list(f.columns),
+                          "referenced_table": f.referenced_table,
+                          "referenced_columns": list(f.referenced_columns),
+                          "on_delete": f.on_delete, "on_update": f.on_update}
+                         for f in _t.foreign_keys
+                     ],
+                     "check_constraints": [
+                         {"name": ck.name, "expression": ck.expression}
+                         for ck in _t.check_constraints
+                     ],
+                     "expression_indexes": list(_t.expression_indexes)}
+                )
+            if name == "list_unsupported_objects":
+                _ev = EVALUATION_STORE.get(session_id)
+                _r = _ev.result if _ev else None
+                _inv = getattr(_r, "inventory", None) if _r is not None else None
+                if _inv is None:
+                    return _json.dumps(
+                        {"status": "not_run",
+                         "message": "Run Evaluation (Step 1) first to read the source."}
+                    )
+                return _json.dumps(
+                    {"status": "ok",
+                     "triggers": [t.name for t in _inv.triggers],
+                     "routines": [r.name for r in _inv.routines],
+                     "events": [e.name for e in _inv.events],
+                     "note": ("Aurora DSQL supports none of these; reimplement each "
+                              "one's logic in the application (an event can move to an "
+                              "external scheduler such as Amazon EventBridge Scheduler).")}
+                )
             if name == "get_validation_summary":
                 from dsql_migrator.ui.validation import summarize_validation
 
@@ -488,6 +708,48 @@ def build_page(
                      "missing_on_target": _s.missing_on_target,
                      "extra_on_target": _s.extra_on_target, "mode": _s.mode}
                 )
+            if name == "list_validation_mismatches":
+                _rep = VALIDATION_STORE.get_or_create(session_id).result
+                if _rep is None:
+                    return _json.dumps({"status": "not_run"})
+                _bad: list[dict] = []
+                for _it in _rep.items:
+                    if getattr(_it, "matched", True):
+                        continue
+                    _src = getattr(_it, "source_row_count", None)
+                    _tgt = getattr(_it, "target_row_count", None)
+                    _have = _src is not None and _tgt is not None
+                    _bad.append(
+                        {"table": _it.table,
+                         "source_row_count": _src, "target_row_count": _tgt,
+                         "missing_on_target": max(0, _src - _tgt) if _have else None,
+                         "extra_on_target": max(0, _tgt - _src) if _have else None,
+                         "row_count_match": getattr(_it, "row_count_match", None),
+                         "checksum_match": getattr(_it, "checksum_match", None),
+                         "rows_quarantined": getattr(_it, "rows_quarantined", None),
+                         "error": (str(getattr(_it, "error", "") or "")[:300]) or None}
+                    )
+                return _json.dumps(
+                    {"status": "ok", "mismatched_count": len(_bad),
+                     "mismatches": _bad[:50]}
+                )
+            if name == "get_schema_apply_result":
+                _res = SCHEMA_CONVERSION_STORE.get_or_create(session_id).apply_results
+                if not _res:
+                    return _json.dumps(
+                        {"status": "not_run", "message": "No schema apply has run yet."}
+                    )
+                return _json.dumps(
+                    {"status": "ok",
+                     "objects": [
+                         {"object_name": r.object_name, "status": r.status.value,
+                          "detail": (str(getattr(r, "detail", "") or "")[:300]) or None}
+                         for r in _res
+                     ],
+                     "failed": [
+                         r.object_name for r in _res if r.status.value == "FAILED"
+                     ]}
+                )
             if name == "get_full_load_status":
                 from dsql_migrator.ui.data_migration import (
                     _current_job,
@@ -497,15 +759,110 @@ def build_page(
                 _dm = DATA_MIGRATION_STORE.get_or_create(session_id)
                 _job = _current_job(JOB_MANAGER, _dm.job_id)
                 _out: dict = {"status": "ok", "full_load": None}
-                if _job is not None:
+                if _job is not None and hasattr(_job, "chunks"):
                     _fl = summarize_progress(_job)
+                    _fl_running = (_fl.in_progress_tables + _fl.pending_tables) > 0
+                    _fl_rate, _fl_eta = _full_load_rate_eta(
+                        _job, _fl, running=_fl_running
+                    )
                     _out["full_load"] = {
                         "total_tables": _fl.total_tables, "done_tables": _fl.done_tables,
-                        "failed_tables": _fl.failed_tables, "rows_loaded": _fl.rows_loaded,
+                        "failed_tables": _fl.failed_tables,
+                        "in_progress_tables": _fl.in_progress_tables,
+                        "pending_tables": _fl.pending_tables,
+                        "rows_loaded": _fl.rows_loaded,
                         "progress_pct": round(_fl.progress_pct, 1),
+                        "running": _fl_running,
+                        "rows_per_sec": round(_fl_rate) if _fl_rate else None,
+                        "eta": _fl_eta or None,
                     }
                 _out["cdc_streaming"] = bool(cdc_streaming_started(_dm, JOB_MANAGER))
                 return _json.dumps(_out)
+            if name == "list_failed_full_load_tables":
+                from dsql_migrator.ui.data_migration import _current_job
+                from dsql_migrator.ui.data_migration._cdc_status import (
+                    full_load_latest_messages,
+                )
+
+                _dm = DATA_MIGRATION_STORE.get_or_create(session_id)
+                _job = _current_job(JOB_MANAGER, _dm.job_id)
+                if _job is None or not hasattr(_job, "chunks"):
+                    return _json.dumps(
+                        {"status": "not_run", "message": "No Full Load has run yet."}
+                    )
+                try:
+                    _msgs = full_load_latest_messages(
+                        getattr(_dm, "error_log", None), _job.job_id
+                    )
+                except Exception:  # noqa: BLE001
+                    _msgs = {}
+                _quar_prefix = "quarantined row pk["
+                _failed = [
+                    {"table": c.chunk_id, "error": str(_msgs.get(c.chunk_id, ""))[:500]}
+                    for c in _job.chunks
+                    if getattr(c, "status", "") == "FAILED"
+                ]
+                _quarantined = sorted(
+                    {t for t, m in _msgs.items() if str(m).startswith(_quar_prefix)}
+                )
+                return _json.dumps(
+                    {"status": "ok", "failed": _failed, "failed_count": len(_failed),
+                     "quarantined_tables": _quarantined,
+                     "note": ("Failed and quarantined tables are STANDING gaps CDC will "
+                              "NOT backfill — resolve them (reload after fixing the "
+                              "cause, or accept the gap) before starting CDC.")}
+                )
+            if name == "get_cdc_status":
+                # All reads are LOCAL/cached (the DLQ error log + cached lag + streaming
+                # state) -- never a fresh AWS metric fetch per question.
+                from collections import Counter
+
+                from dsql_migrator.ui.data_migration._cdc_status import (
+                    cdc_dlq_records,
+                    cdc_dlq_summary,
+                    cdc_error_log_key,
+                    cdc_schema_drift_summary,
+                )
+
+                _dm = DATA_MIGRATION_STORE.get_or_create(session_id)
+                _streaming = bool(cdc_streaming_started(_dm, JOB_MANAGER))
+                _key = cdc_error_log_key(_dm)
+                try:
+                    _dlq = cdc_dlq_summary(_dm, _key)
+                    _records = list(cdc_dlq_records(_dm, _key))
+                    _drift = list(cdc_schema_drift_summary(_dm, _key))
+                except Exception:  # noqa: BLE001
+                    _dlq, _records, _drift = None, [], []
+                _by_table = dict(getattr(_dlq, "errors_by_table", {}) or {})
+                _poison = sorted(
+                    _by_table.items(), key=lambda kv: kv[1], reverse=True
+                )[:10]
+                _sqlstates = Counter(
+                    str(getattr(r, "error_code", "") or "")
+                    for r in _records
+                    if getattr(r, "error_code", None)
+                ).most_common(5)
+                _lag = getattr(_dm, "cdc_replication_lag_by_table", {}) or {}
+                _max_lag = max((int(v) for v in _lag.values()), default=None)
+                return _json.dumps(
+                    {"status": "ok", "streaming": _streaming,
+                     "dlq_depth": int(getattr(_dlq, "total_errors", 0) or 0),
+                     "poison_tables": [
+                         {"table": t, "count": c} for t, c in _poison
+                     ],
+                     "top_sqlstates": [
+                         {"sqlstate": s, "count": c} for s, c in _sqlstates
+                     ],
+                     "schema_drift": [
+                         {"table": d.table, "kind": d.kind, "count": d.count}
+                         for d in _drift
+                     ],
+                     "max_replication_lag_ms": _max_lag,
+                     "note": ("DLQ poison rows + detected schema drift are silent "
+                              "data-loss risks — resolve before cut over. Common "
+                              "SQLSTATEs: 22P02/22001 = data/format, 23505 = duplicate "
+                              "key, 23502 = NOT NULL / dropped column.")}
+                )
             # --- LIVE target Aurora DSQL reads (read-only; schema/counts only) ------
             if name in ("list_target_tables", "get_target_schema", "count_target_rows"):
                 _st = SESSION_STORE.get_or_create(session_id)
@@ -650,6 +1007,11 @@ def build_page(
         ),
         open_ai_scope=_open_ai_scope,
         ai_post_event=_ai_post_event,
+        # Give the per-object conversion chat the same read-only tools as Evaluation,
+        # so it can name the exact offending column/key and answer wider-migration
+        # questions (e.g. "which triggers can't be converted?") on demand.
+        ai_tool_execute=_ai_tool_execute,
+        ai_tools=_AI_TOOL_SCHEMAS,
     )
     # Data Migration is a single step with an inner migration-type selector
     # (Full load only / CDC only / Full load + CDC). One builder serves it; the
@@ -668,6 +1030,10 @@ def build_page(
         validation_store=VALIDATION_STORE,
         open_ai_scope=_open_ai_scope,
         ai_post_event=_ai_post_event,
+        # The per-failed-table diagnosis chat can look up the real converted DDL /
+        # target schema / source structure to root-cause a schema/DDL failure by name.
+        ai_tool_execute=_ai_tool_execute,
+        ai_tools=_AI_TOOL_SCHEMAS,
     )
     # Step 4 (Validation): compares the migrated target against the source as-of
     # the Step 3 watermark and reports consistency and drift.
@@ -682,6 +1048,10 @@ def build_page(
         conversion_store=SCHEMA_CONVERSION_STORE,
         open_ai_scope=_open_ai_scope,
         ai_post_event=_ai_post_event,
+        # The mismatch chat can root-cause a divergence against the real converted
+        # DDL / target schema / live row counts via the shared read-only tools.
+        ai_tool_execute=_ai_tool_execute,
+        ai_tools=_AI_TOOL_SCHEMAS,
     )
     # Step 6 (Cut over): guidance for switching the application from MySQL to
     # DSQL. The tool cannot perform/verify the cut-over, so this step has no job —
@@ -693,6 +1063,11 @@ def build_page(
         validation_store=VALIDATION_STORE,
         job_manager=JOB_MANAGER,
         ai_post_event=_ai_post_event,
+        # The repoint-recipe / "safe to cut over?" chat can consult the real validation,
+        # CDC and load state via the shared read-only tools -- never sees secrets.
+        open_ai_scope=_open_ai_scope,
+        ai_tool_execute=_ai_tool_execute,
+        ai_tools=_AI_TOOL_SCHEMAS,
     )
     # Optional tool (not a workflow step): the Query Playground — convert a MySQL
     # statement to DSQL and non-destructively test whether it runs on the target.
@@ -702,6 +1077,10 @@ def build_page(
         playground_store=PLAYGROUND_STORE,
         open_ai_scope=_open_ai_scope,
         ai_post_event=_ai_post_event,
+        # The query chat can check its statement against the real converted/target
+        # schema (does this table/column exist on the target yet?) via the tools.
+        ai_tool_execute=_ai_tool_execute,
+        ai_tools=_AI_TOOL_SCHEMAS,
     )
 
     def schema_run_guard() -> str | None:
@@ -1413,6 +1792,7 @@ def build_page(
         on_ai_panel_ready=lambda handle: _ai_panel_holder.__setitem__("handle", handle),
         ai_context_getter=_ai_context,
         ai_general_streamer_factory=_general_ai_streamer,
+        ai_progress_provider=_full_load_progress_provider,
         optional_tools={
             _QUERY_PLAYGROUND_VIEW: OptionalTool(
                 view_key=_QUERY_PLAYGROUND_VIEW,

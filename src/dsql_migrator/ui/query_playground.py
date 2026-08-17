@@ -37,7 +37,7 @@ from __future__ import annotations
 import re
 import threading
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional, Sequence
 
 from dsql_migrator.core.assessment_strategist import (
     build_query_chat_system,
@@ -141,15 +141,55 @@ def _strip_sql_comments(sql: str) -> str:
     return "\n".join(lines)
 
 
+def _is_pure_select(sql: str) -> bool:
+    """True only if ``sql`` is a read-only SELECT with NO data-modifying statement
+    anywhere -- including inside a CTE (``WITH x AS (DELETE ... RETURNING ...) SELECT
+    ...`` is valid PostgreSQL/DSQL and WOULD run under EXPLAIN ANALYZE).
+
+    This is the safety gate for the re-test probe, which runs ``EXPLAIN ANALYZE`` and
+    therefore EXECUTES the statement against the target. Conservative by design:
+    anything unparseable or containing an INSERT/UPDATE/DELETE/MERGE node returns
+    ``False`` so the playground never auto-executes a write it could not prove is a
+    pure read (the user can still copy such SQL and run it themselves). Pure/testable.
+    """
+    text = (sql or "").strip().rstrip(";")
+    if not text:
+        return False
+    try:
+        import sqlglot
+        from sqlglot import expressions as exp
+
+        parsed = sqlglot.parse_one(text, read="postgres")
+    except Exception:  # noqa: BLE001 - unparseable -> refuse (cannot prove read-only)
+        return False
+    if parsed is None:
+        return False
+    dml_types = tuple(
+        t
+        for t in (
+            getattr(exp, "Insert", None),
+            getattr(exp, "Update", None),
+            getattr(exp, "Delete", None),
+            getattr(exp, "Merge", None),
+        )
+        if t is not None
+    )
+    # A data-modifying node ANYWHERE (top-level or nested in a CTE/subquery) is unsafe.
+    if dml_types and next(parsed.find_all(*dml_types), None) is not None:
+        return False
+    return True
+
+
 def _last_testable_statement(sql: str) -> Optional[str]:
-    """Return the last EXPLAIN-testable statement (SELECT/WITH) from ``sql``.
+    """Return the last EXPLAIN-testable statement (a PURE SELECT/WITH) from ``sql``.
 
     An AI rewrite reply can contain MORE than the query — e.g. a suggested
     ``CREATE INDEX ASYNC ...;`` followed by the ``SELECT``. Passing the whole
     thing to ``EXPLAIN`` is a syntax error, and the playground can't run DDL here
     anyway. Split on statement boundaries (``;``) and return the LAST statement
-    that starts with SELECT or WITH (a CTE) — that's the query to plan. Returns
-    ``None`` when no such statement exists. Pure/testable.
+    that starts with SELECT or WITH AND is a PURE read (:func:`_is_pure_select` --
+    a data-modifying CTE would otherwise EXECUTE under the re-test's EXPLAIN ANALYZE).
+    Returns ``None`` when no such statement exists. Pure/testable.
     """
     # Split on semicolons (naive but sufficient: rewrites rarely embed ';' in a
     # string literal; if they do, the target simply rejects it and we surface it).
@@ -158,7 +198,10 @@ def _last_testable_statement(sql: str) -> Optional[str]:
         if not part:
             continue
         head = part.lstrip("(").lstrip().upper()
-        if head.startswith("SELECT") or head.startswith("WITH"):
+        if (
+            (head.startswith("SELECT") or head.startswith("WITH"))
+            and _is_pure_select(part)
+        ):
             return part
     return None
 
@@ -224,6 +267,8 @@ def _build_retest_turn(
     probe: ExecutionProbe,
     baseline_dpu: Optional[float],
     rewrite_sql: Optional[str] = None,
+    *,
+    index_dropped: bool = False,
 ) -> str:
     """Compose the follow-up chat turn that reports a rewrite's re-test result.
 
@@ -237,6 +282,22 @@ def _build_retest_turn(
     Pure/testable: builds only the text.
     """
     tested = f"\n\nThe query I actually ran:\n{_sql_block(rewrite_sql)}" if rewrite_sql else ""
+    # Trust caveats appended to any turn that reports a successful measurement: the
+    # re-test proves the rewrite RUNS + its cost, never that it returns the same rows;
+    # and a suggested index/DDL was NOT created (this measures the current schema).
+    caveat = (
+        "\n\n(Note: this re-test proves the rewrite RUNS on DSQL and its measured "
+        "cost — it does NOT verify it returns the SAME rows as the original, so "
+        "confirm result equivalence before adopting it."
+        + (
+            " Also, any index / DDL you suggested was NOT created; this measures the "
+            "rewrite against the CURRENT schema, so if your gain depends on that "
+            "index, say so."
+            if index_dropped
+            else ""
+        )
+        + ")"
+    )
     if probe.outcome is ProbeOutcome.FAILED:
         detail = probe.detail + (
             f" (SQLSTATE {probe.error_code})" if probe.error_code else ""
@@ -254,6 +315,7 @@ def _build_retest_turn(
             f"{tested}\n\nHere is its query plan:\n\n{_plan_block(probe.plan)}\n\n"
             "Briefly, does this plan confirm your rewrite is more efficient (scan "
             "type / filter layer), and is there anything more to improve?"
+            f"{caveat}"
         )
     if baseline_dpu is None:
         return (
@@ -261,7 +323,7 @@ def _build_retest_turn(
             f"Its measured cost is {new_dpu:.5f} DPU total. The original query was "
             "not measured with ANALYZE, so I don't have a baseline. Based on this "
             "plan and DPU, is the rewrite efficient, and what else could improve it?"
-            f"{tested}\n\nPlan:\n{_plan_block(probe.plan)}"
+            f"{tested}\n\nPlan:\n{_plan_block(probe.plan)}{caveat}"
         )
     delta = baseline_dpu - new_dpu
     pct = (delta / baseline_dpu * 100.0) if baseline_dpu else 0.0
@@ -276,7 +338,7 @@ def _build_retest_turn(
         "Explain to me what this means: did your rewrite actually improve things, "
         "by how much, and why (point to the change in scan type / filter layer / "
         f"bytes moved)? If it did NOT improve, say so honestly and suggest the next "
-        f"step. Rewrite's plan:\n{_plan_block(probe.plan)}"
+        f"step. Rewrite's plan:\n{_plan_block(probe.plan)}{caveat}"
     )
 
 
@@ -422,6 +484,8 @@ def build_query_playground_screen(
     ] = None,
     open_ai_scope: Optional[Callable[..., object]] = None,
     ai_post_event: Optional[Callable[..., object]] = None,
+    ai_tools: "Optional[Sequence[Mapping[str, object]]]" = None,
+    ai_tool_execute: "Optional[Callable[[str, Mapping[str, object]], str]]" = None,
 ) -> Callable[[Callable[[], None]], None]:
     """Build the Query Playground screen, returning its ``content_builder``.
 
@@ -661,6 +725,21 @@ def build_query_playground_screen(
                         ai_post_event(text="Target test skipped", status="info")
                 render_results.refresh()
 
+            def _query_streamer(strategist, system):
+                # One streamer for both query chats. With the shared read-only tools,
+                # the chat can check the statement against the real converted/target
+                # schema (does this table/column exist on the target yet?); without
+                # them it stays a plain grounded chat.
+                def _stream(messages, on_delta):
+                    if ai_tools is not None and ai_tool_execute is not None:
+                        return strategist.tool_chat(
+                            system, messages, on_delta,
+                            tools=ai_tools, execute=ai_tool_execute,
+                        )
+                    return strategist.stream_chat(system, messages, on_delta)
+
+                return _stream
+
             def on_ask_ai() -> None:
                 # Open the SAME shared right chat drawer the Evaluation / Schema
                 # Conversion screens use, grounded on this query's conversion and
@@ -684,6 +763,11 @@ def build_query_playground_screen(
                     result.original_sql,
                     result.converted_sql or "",
                     target_error=target_error,
+                    # Feed the tool's own deterministic conversion notes (lock semantics,
+                    # unconvertible idioms) so the AI builds on them, not around them.
+                    warnings=[
+                        f"[{w.classification}] {w.message}" for w in result.warnings
+                    ],
                 )
                 strategist = AssessmentStrategist(
                     session.ai_assist, aws_profile=getattr(session, "aws_profile", None)
@@ -697,13 +781,11 @@ def build_query_playground_screen(
                 )
                 open_ai_scope(
                     scope_id="query-converter:review",
-                    title="AI query assistant",
+                    title="AI DBA",
                     subtitle="Query Converter",
                     chip="Query Converter",
                     seed_question=first_question,
-                    streamer=lambda messages, on_delta: strategist.stream_chat(
-                        system, messages, on_delta
-                    ),
+                    streamer=_query_streamer(strategist, system),
                 )
 
             def on_optimize_ai() -> None:
@@ -769,16 +851,31 @@ def build_query_playground_screen(
                     factory = make_factory(
                         target_config, getattr(session, "aws_profile", None)
                     )
+                    # Set the SAME search_path the initial Test used (the source
+                    # database), so a rewrite that uses UNQUALIFIED table names is
+                    # resolved against the schema the original passed under -- otherwise
+                    # it is falsely REJECTED against the default (public) search_path.
+                    _src_cfg = getattr(session, "source_config", None)
+                    _search_path = getattr(_src_cfg, "database", None) or None
                     ui.notify("Re-testing the rewrite on the target…", type="info")
                     # EXPLAIN ANALYZE so DSQL emits the DPU estimate to compare. The
-                    # rewrite is treated as a SELECT probe (read-only / EXPLAIN).
+                    # rewrite is a PURE SELECT (extract_sql_from_reply refuses any DML,
+                    # incl. a data-modifying CTE), so ANALYZE never executes a write.
                     rprobe = await run.io_bound(
                         lambda: probe_statement(
-                            rewrite, StatementKind.SELECT, factory, analyze=True
+                            rewrite, StatementKind.SELECT, factory, analyze=True,
+                            search_path=_search_path,
                         )
                     )
+                    # If the reply suggested a CREATE INDEX, extract_sql_from_reply
+                    # dropped it (the read-only playground can't create it) -- tell the
+                    # AI so the measured delta isn't mistaken for the rewrite alone.
+                    _index_dropped = "create index" in (reply_markdown or "").lower()
                     send(  # type: ignore[operator]
-                        _build_retest_turn(rprobe, baseline_dpu, rewrite_sql=rewrite)
+                        _build_retest_turn(
+                            rprobe, baseline_dpu, rewrite_sql=rewrite,
+                            index_dropped=_index_dropped,
+                        )
                     )
 
                 tuning_seed = (
@@ -787,9 +884,7 @@ def build_query_playground_screen(
                     "is cheaper on DSQL (scan type / filter layer / fewer bytes "
                     "and DPU) — and keep the results identical."
                 )
-                tuning_streamer = lambda messages, on_delta: strategist.stream_chat(  # noqa: E731
-                    system, messages, on_delta
-                )
+                tuning_streamer = _query_streamer(strategist, system)
                 # Only offer the re-test when the reply actually contains a runnable
                 # rewritten query — a reply that just concludes "already efficient"
                 # (no ```sql SELECT) gets no button.
@@ -798,9 +893,9 @@ def build_query_playground_screen(
                 # follow-up turn drives.
                 sender["send"] = open_ai_scope(
                     scope_id="query-converter:tune",
-                    title="AI DBA — query tuning",
+                    title="AI DBA",
                     subtitle="Query Converter · Aurora DSQL efficiency",
-                    chip="AI DBA",
+                    chip="Query Converter",
                     seed_question=tuning_seed,
                     streamer=tuning_streamer,
                     footer_label="Test rewrite on target",
@@ -893,8 +988,9 @@ def build_query_playground_screen(
         Schema Conversion screens use -- advisory only, nothing auto-applied
         (Property 13).
 
-        Two actions: "Ask AI to review / fix" (correctness), and — for a converted
-        SELECT — "Tune with AI DBA", which opens the AI-DBA tuning chat grounded on
+        Two actions, both branded on the same assistant: "Review with AI DBA" /
+        "Fix with AI DBA" (correctness), and — for a converted SELECT —
+        "Tune with AI DBA", which opens the AI-DBA tuning chat grounded on
         the real EXPLAIN plan / DPU (when a Test has run) and offers an in-drawer
         "Test rewrite on target" action that re-probes the AI's SQL and asks the AI
         to report the before/after DPU improvement.
@@ -907,7 +1003,10 @@ def build_query_playground_screen(
         # A failed target test makes "fix" the headline; otherwise "review".
         probe = state.probe
         failed = probe is not None and probe.outcome is ProbeOutcome.FAILED
-        ask_label = "Ask AI to fix" if failed else "Ask AI to review / explain"
+        # Align the AI action verbs on the "… with AI DBA" noun (Fix / Review / Tune),
+        # so both buttons read as the SAME assistant used across the app -- not "some
+        # AI" here and "AI DBA" there.
+        ask_label = "Fix with AI DBA" if failed else "Review with AI DBA"
         is_select = result.statement_kind is StatementKind.SELECT
         # The AI DBA tunes for efficiency, so it only makes sense once the query has
         # actually run on the target (a PASSED probe): the AI reasons from the real

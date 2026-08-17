@@ -5,6 +5,69 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.370
+
+**AI DBA now spans the whole migration** — every step, not just Evaluation — as one
+consistent, on-demand, tool-grounded assistant.
+
+### Added
+
+- **AI wired across every step.** CDC gets dead-letter-queue and schema-drift diagnosis
+  chats, a `get_cdc_status` tool (streaming / lag / DLQ depth + poison tables + SQLSTATEs
+  / detected drift), and CDC activity events (streaming started, drift detected, DLQ
+  growing, sink stalled). Cut over gets a grounded repoint-recipe / "is it safe to cut
+  over?" GO-HOLD chat (connection-string translation, IAM-token generation/refresh,
+  sslmode, OCC retries, identity-sequence timing, rollback asymmetry). Full Load gets
+  per-failed-table AND per-quarantine AI help. Validation's mismatch chat and Schema
+  Conversion's per-warning chats are now tool-wired.
+- **Six new read-only tools** (15 total): `get_source_object_detail`,
+  `list_unsupported_objects`, `list_failed_full_load_tables`, `get_cdc_status`,
+  `list_validation_mismatches`, `get_schema_apply_result` — so the assistant NAMES the
+  specific blocking objects/tables instead of citing counts. Schema/counts/verdicts
+  only, never row values or credentials (Property 7).
+- **Reimplementation guidance** for the triggers / stored routines / scheduled events
+  DSQL cannot convert: an on-demand "Ask AI DBA how to reimplement these" action names
+  each object and gives a per-kind path (application logic, or an external scheduler).
+- **"Use as target DDL" footer** on the conversion chat: adopt an AI-proposed DDL block
+  (denylist-checked) straight into the editable target → Apply, closing the loop
+  chat-natively.
+- **Live Full Load monitor card** pinned in the AI panel (done/failed tables + failed
+  names + rows/sec + ETA), which keeps updating as you navigate to other steps; plus a
+  visual schema-apply summary event (Created/Skipped/Failed).
+- **"What's next?" briefing** in the header — a proactive, tool-grounded read of what to
+  do next and the top risks (including CDC DLQ/drift/stall and standing gaps CDC won't
+  backfill before cut over).
+
+### Changed
+
+- The assistant is branded **"AI DBA"** consistently everywhere (header, panel, every
+  chat scope), and its accent palette now lives in the design system as the single
+  source of truth.
+- **All AI is on-demand and consistent across steps** — removed the only auto-fired AI
+  turn (Generate no longer auto-opens a chat; its detail is one click away on the
+  banner), so no step spends a model call without an explicit click.
+- Removed the unreachable Step-2 approve/reject "AI suggestion" review UI (it was never
+  populated from the screen); the AI-DDL path is the chat's "Use as target DDL" loop.
+
+### Fixed
+
+- **Cost safety:** turning AI Assist off on the Connect screen mid-session now
+  immediately inerts the panel — the composer dies and no further model turn can fire.
+- **Property 7:** a failed Full Load table's error message is now sanitized
+  (`safe_error_message`, dropping the driver `DETAIL: Failing row contains (...)` line)
+  before the new `list_failed_full_load_tables` AI tool can relay it, so a table-level
+  failure can never carry a row's column values to the model.
+- **The composer no longer locks** after navigating during a streaming reply (the
+  streaming timer is anchored to the persistent panel), nor after a restart that
+  restored an object-scoped chat (it falls back to the general assistant).
+- **Query Converter "Test rewrite on target":** never executes a data-modifying CTE
+  (`WITH … (DELETE/INSERT/UPDATE) …` is refused — the re-test runs EXPLAIN ANALYZE, which
+  would otherwise write to the target), applies the source `search_path` so a rewrite
+  with unqualified names is not falsely rejected, and adds caveats (proves cost/runs-OK
+  not row-set equivalence; a suggested index was not created).
+- A Schema Conversion per-warning AI icon now seeds the chat with THAT specific warning
+  rather than a generic "walk me through converting this table".
+
 ## v0.1.369
 
 ### Fixed

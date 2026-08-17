@@ -462,7 +462,7 @@ def build_connect_page(
         )
         open_ai_scope(
             scope_id=f"connect:{side}",
-            title="AI connection help",
+            title="AI DBA",
             subtitle=f"Connect · {label}",
             chip=f"Connect · {label}",
             seed_question=(

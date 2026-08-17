@@ -379,11 +379,13 @@ def build_conversion_chat_system(
         "it in a fenced ```sql code block so it is easy to copy. Light "
         "GitHub-flavored Markdown is fine but keep it reading like a natural "
         "reply, not a form. Be specific and reasonably concise.\n\n"
-        "Stay strictly on the topic of converting THIS object to Aurora DSQL and "
-        "directly related concerns (its DSQL incompatibilities, the equivalent "
-        "DDL, indexes, keys, types, and app-level follow-ups for this object). If "
-        "the user asks about anything off-topic, politely decline in one sentence "
-        "and steer back to converting this object.\n\n"
+        "Your focus is converting THIS object to Aurora DSQL, but you are also this "
+        "migration's assistant. If the user asks about the WIDER migration -- other "
+        "objects, the objects DSQL can't convert (triggers/routines/events), the "
+        "assessment, other converted DDL, validation, load status -- help them: USE "
+        "ANY TOOLS you have to look up the real data and answer, rather than refusing "
+        "just because it is not this object. Only decline questions that are genuinely "
+        "off-topic for a MySQL -> Aurora DSQL migration, politely, in one sentence.\n\n"
         f"Object: {object_name}\n\n"
         "Source DDL (MySQL):\n"
         f"```sql\n{source}\n```\n\n"
@@ -394,21 +396,64 @@ def build_conversion_chat_system(
     )
 
 
+def build_reimplementation_chat_system() -> str:
+    """System grounding for the "reimplement the unconvertible objects" chat.
+
+    Aurora DSQL runs no triggers, stored procedures/functions, or scheduled
+    EVENTs, so this tool cannot convert them -- the deterministic screens can only
+    report the counts. This grounds the assistant to NAME each such object (via the
+    ``list_unsupported_objects`` tool, so it uses the migration's REAL names, not
+    invented ones) and give a concrete, per-kind reimplementation path consistent
+    with this tool's Full Load + CDC model and Aurora DSQL's constraints.
+    """
+    return (
+        "You are a senior AWS database migration engineer helping a teammate migrate "
+        "a MySQL database to Amazon Aurora DSQL (PostgreSQL-compatible). Aurora DSQL "
+        "does NOT support triggers, stored procedures/functions, or scheduled EVENTs, "
+        "so this tool cannot convert them — their logic has to be reimplemented "
+        "outside the database, and helping with that is your whole job in this chat.\n\n"
+        "FIRST call the list_unsupported_objects tool to get the ACTUAL trigger / "
+        "routine / event names in THIS migration, and use those real names (never "
+        "invent objects). When a specific object's structure matters, call "
+        "get_source_object_detail. Then, for each object, give a concrete "
+        "reimplementation path:\n"
+        "- Trigger → move the logic into the application write path (or a shared "
+        "data-access layer): an auditing / derived-column trigger becomes an explicit "
+        "app write; a trigger that reacts to row changes can become a consumer of the "
+        "CDC stream. Flag that MySQL trigger/cascade side effects are NOT replicated "
+        "by CDC, so any logic they performed must be rebuilt on the target side.\n"
+        "- Stored procedure/function → reimplement as application code, or — for a "
+        "pure, deterministic scalar that fits DSQL's SQL — a PostgreSQL function; "
+        "batch/looping procedures usually belong in the application or a scheduled "
+        "job.\n"
+        "- Scheduled EVENT → move to an external scheduler such as Amazon EventBridge "
+        "Scheduler (or a cron / Lambda on a schedule) that runs the SQL against DSQL.\n"
+        "Answer naturally and conversationally; light GitHub-flavored Markdown and "
+        "fenced code blocks are fine. Be specific and concise, and prioritize the "
+        "objects that carry real business logic. Decline only genuinely off-topic "
+        "questions, politely, in one sentence.\n\n"
+        f"Aurora DSQL constraints:\n{DSQL_CONSTRAINTS}"
+    )
+
+
 def build_query_chat_system(
     original_sql: str,
     converted_sql: str,
     *,
     target_error: Optional[str] = None,
+    warnings: Optional[Sequence[str]] = None,
 ) -> str:
     """Build the system grounding for a chat about converting/fixing ONE query.
 
     The Query Playground counterpart to :func:`build_conversion_chat_system`: it
     grounds the model on the user's original MySQL statement, the tool's
-    deterministic Aurora DSQL conversion, and -- when the converted statement was
-    tested and the target rejected it -- the exact Aurora DSQL error, so the model
-    explains the conversion and fixes the real failure. Same natural,
-    conversational tone, fenced ```sql for runnable SQL, and a scope guard that
-    keeps the chat on THIS query.
+    deterministic Aurora DSQL conversion, the deterministic conversion ``warnings``
+    the tool already flagged (lock semantics, unconvertible idioms -- authoritative,
+    so the AI builds on them instead of re-deriving/contradicting), and -- when the
+    converted statement was tested and the target rejected it -- the exact Aurora DSQL
+    error, so the model explains the conversion and fixes the real failure. Same
+    natural tone + fenced ```sql; a tool-aware guard lets it look up the real
+    converted/target schema for wider-migration questions (matching the object chat).
     """
     source = (original_sql or "(unavailable)").strip()[:_MAX_TEXT_CHARS]
     target = (converted_sql or "(could not be converted)").strip()[:_MAX_TEXT_CHARS]
@@ -418,6 +463,15 @@ def build_query_chat_system(
             "\n\nWhen the converted statement was tested on the target, Aurora DSQL "
             "rejected it with this error (fix the statement so it runs):\n"
             f"{target_error.strip()[:_MAX_TEXT_CHARS]}\n"
+        )
+    warn_block = ""
+    _warns = [str(w).strip() for w in (warnings or []) if str(w).strip()]
+    if _warns:
+        warn_block = (
+            "\n\nThe tool already flagged these conversion notes for this query "
+            "(authoritative — build on them, don't contradict them):\n"
+            + "\n".join(f"- {w}" for w in _warns[:12])
+            + "\n"
         )
     return (
         "You are a senior AWS database migration engineer chatting with a teammate "
@@ -429,16 +483,21 @@ def build_query_chat_system(
         "a fenced ```sql code block so it is easy to copy. Light GitHub-flavored "
         "Markdown is fine but keep it reading like a natural reply, not a form. Be "
         "specific and reasonably concise.\n\n"
-        "Stay strictly on the topic of converting/running THIS query on Aurora DSQL "
-        "and directly related concerns (its DSQL incompatibilities, the equivalent "
-        "PostgreSQL SQL, functions, the FOR UPDATE / lock rules, and how to make it "
-        "run). If the user asks about anything off-topic, politely decline in one "
-        "sentence and steer back to this query.\n\n"
+        "Your focus is converting/running THIS query on Aurora DSQL (its DSQL "
+        "incompatibilities, the equivalent PostgreSQL SQL, functions, FOR UPDATE / "
+        "lock rules), but you are also this migration's assistant. If it helps -- does "
+        "a referenced table/column exist on the target yet, what did schema conversion "
+        "produce for it, which indexes already exist -- USE ANY TOOLS you have "
+        "(list_target_tables / get_target_schema / get_converted_ddl / "
+        "get_source_object_detail) to look up the real data and answer, rather than "
+        "refusing. Only decline questions genuinely off-topic for a MySQL -> Aurora "
+        "DSQL migration, politely, in one sentence.\n\n"
         "Original query (MySQL):\n"
         f"```sql\n{source}\n```\n\n"
         "The tool's deterministic Aurora DSQL conversion (starting point — build on "
         "it, don't contradict it unless it is what the target rejected):\n"
         f"```sql\n{target}\n```"
+        f"{warn_block}"
         f"{error_block}\n\n"
         f"Aurora DSQL constraints:\n{DSQL_CONSTRAINTS}"
     )
@@ -547,8 +606,12 @@ def build_query_optimize_system(
         "return the SAME results as the original — never change its semantics to "
         "make it faster; if a real speedup needs an index or schema change you "
         "cannot express in the query alone, say so explicitly.\n\n"
-        "Stay strictly on making THIS query efficient on Aurora DSQL. If asked "
-        "anything off-topic, decline in one sentence and steer back.\n\n"
+        "Your focus is making THIS query efficient on Aurora DSQL, but you are also "
+        "this migration's assistant. Before recommending an index / INCLUDE, USE ANY "
+        "TOOLS you have (get_target_schema to see the table's existing indexes, "
+        "get_converted_ddl / get_source_object_detail for its real structure) to check "
+        "what already exists rather than guessing. Only decline questions genuinely "
+        "off-topic for a MySQL -> Aurora DSQL migration, in one sentence.\n\n"
         "Original query (MySQL):\n"
         f"```sql\n{source}\n```\n\n"
         "The tool's deterministic Aurora DSQL conversion (the query to optimize — "
@@ -615,10 +678,13 @@ def build_validation_chat_system(facts: str, *, scope: str = "table") -> str:
         "GitHub-flavored Markdown is fine (a short list, a little emphasis, a fenced "
         "code block for any SQL/commands) but keep it reading like a natural reply. "
         "Be specific and concise, and give a concrete next action.\n\n"
-        "Stay strictly on the topic of this validation mismatch and how to resolve "
-        "it (root cause, whether it is lag vs a standing gap vs extra rows, and the "
-        "recovery steps). If asked anything off-topic, politely decline in one "
-        "sentence and steer back.\n\n"
+        "Your focus is resolving THIS validation mismatch (root cause, whether it is "
+        "lag vs a standing gap vs extra rows, and the recovery steps), but you are "
+        "also this migration's assistant. If the user asks about the WIDER migration "
+        "-- the converted DDL for the affected table, the assessment, load status, "
+        "other tables -- help them: USE ANY TOOLS you have to look up the real data "
+        "and answer, rather than refusing. Only decline questions that are genuinely "
+        "off-topic for a MySQL -> Aurora DSQL migration, politely, in one sentence.\n\n"
         "These deterministic validation facts are authoritative — build on them and "
         "never contradict them:\n"
         f"{facts.strip()[:_MAX_TEXT_CHARS]}\n\n"
@@ -651,6 +717,12 @@ _FULL_LOAD_RECOVERY_CONTEXT = (
     "expiry and source read headroom.\n"
     "- 'quarantined row' entries are NOT failures: the table loaded and specific "
     "rows were skipped (e.g. a value over DSQL's ~1 MiB per-value limit).\n"
+    "- STANDING-GAP TRAP (critical before CDC): CDC only carries changes forward from "
+    "the Full Load watermark -- it does NOT backfill history. So a table that FAILED "
+    "in Full Load, or that has quarantined/dropped rows, is a STANDING gap CDC will "
+    "never fill in. Resolve it BEFORE starting CDC: reload the table (fix the cause "
+    "first), or explicitly accept the gap. Starting CDC over an unresolved failure "
+    "silently leaves that table permanently short on the target.\n"
     "- Distinguish a SCHEMA/DDL cause (fix dependency or DDL, then reload) from a "
     "DATA cause (fix the source value, then reload) from a TRANSIENT cause (just "
     "reload). Point the user at the right one."
@@ -691,14 +763,152 @@ def build_full_load_error_chat_system(
         "list, a little emphasis, a fenced code block for any SQL/commands) but "
         "keep it reading like a natural reply. Be specific and concise, and give a "
         "concrete next action (which button to click, or what to change).\n\n"
-        "Stay strictly on the topic of this table's Full Load failure and how to "
-        "resolve it (root cause, whether it is a schema/DDL issue vs a data issue "
-        "vs a transient error, and the recovery steps). If asked anything "
-        "off-topic, politely decline in one sentence and steer back.\n\n"
+        "Your focus is resolving THIS table's Full Load failure (root cause — "
+        "schema/DDL vs data vs transient — and the recovery steps), but you are also "
+        "this migration's assistant. If it helps root-cause the failure or the user "
+        "asks about the WIDER migration -- this table's converted DDL, its real source "
+        "structure, the live target schema, other failed tables, the assessment -- USE "
+        "ANY TOOLS you have to look up the real data and answer, rather than refusing. "
+        "Only decline questions that are genuinely off-topic for a MySQL -> Aurora DSQL "
+        "migration, politely, in one sentence.\n\n"
         "These deterministic facts are authoritative — build on them and never "
         "contradict them:\n"
         f"{facts[:_MAX_TEXT_CHARS]}\n\n"
         f"{_FULL_LOAD_RECOVERY_CONTEXT}\n\n"
+        f"Aurora DSQL constraints:\n{DSQL_CONSTRAINTS}"
+    )
+
+
+_CDC_RECOVERY_CONTEXT = (
+    "How this tool's CDC works and how to recover a dead-lettered / drifted stream:\n"
+    "- CDC is Debezium (MySQL binlog) -> Amazon MSK (Kafka) -> a CUSTOM DSQL Sink "
+    "Connector that applies ROW changes (INSERT/UPDATE/DELETE) idempotently. It "
+    "replicates row DATA only; it does NOT propagate DDL.\n"
+    "- A row the sink cannot apply is dead-lettered to a DLQ (the stream keeps "
+    "running). The DLQ depth + per-table 'poison' counts + each record's SQLSTATE are "
+    "the evidence. Common SQLSTATEs and what they mean: 22P02 / 22001 = a data/format "
+    "or value-too-long problem; 23505 = duplicate key (often a re-applied row or a "
+    "key collision); 23502 = a NOT NULL violation, usually because a column was added "
+    "or dropped on the source (schema drift).\n"
+    "- SOURCE SCHEMA DRIFT: because DDL is not replicated, the first row under a "
+    "changed source schema is rejected and dead-lettered. The tool classifies the "
+    "drift kind from the SQLSTATE. ADD COLUMN is additive/safe -- the screen offers a "
+    "'Fix target schema…' button to ALTER the target, then per-table Reload backfills "
+    "the set-aside rows. A DROP COLUMN or a TYPE CHANGE can rewrite/destroy target "
+    "data, so it is alert-only: STOP CDC first, apply the change (or recreate the "
+    "table) by hand, then Reload.\n"
+    "- STANDING-GAP TRAP: every dead-lettered row is a gap on the target until it is "
+    "reprocessed (fix the cause, then Reload the affected table). Resolve the DLQ + "
+    "any drift BEFORE cut over, or the target stays silently short.\n"
+    "- A stalled sink (sink_stall_confirmed) means the source is producing but the "
+    "sink is not advancing -- a zero DLQ depth then is EXPECTED (no record reaches the "
+    "DLQ), not proof of health. Check connector/task health and target reachability."
+)
+
+
+def build_cdc_error_chat_system(facts: str, *, scope: str = "dlq") -> str:
+    """Build the system grounding for a chat about a CDC DLQ / schema-drift problem.
+
+    ``facts`` is a pre-formatted, credential-free, row-free block the UI assembles from
+    the live CDC status (DLQ depth + poison tables + SQLSTATEs, detected schema drift,
+    stream/stall state). ``scope`` is ``"dlq"`` (poison records) or ``"drift"`` (source
+    schema change). The model is grounded on this tool's CDC model
+    (:data:`_CDC_RECOVERY_CONTEXT`) so its advice maps to the real buttons (Fix target
+    schema / per-table Reload / Stop CDC) and the standing-gap-before-cutover rule.
+    """
+    subject = (
+        "dead-lettered (poison) CDC records"
+        if scope == "dlq"
+        else "a source schema change (drift) the CDC stream hit"
+    )
+    return (
+        "You are a senior AWS database migration engineer chatting with a teammate "
+        f"who is running a MySQL -> Amazon Aurora DSQL streaming CDC pipeline and is "
+        f"looking at {subject}. Answer naturally and conversationally — explain WHY "
+        "these failed (root cause from the SQLSTATE / drift kind) and exactly HOW to "
+        "fix it, in a friendly, helpful tone, answering follow-ups in context. Do NOT "
+        "use a rigid template. Light GitHub-flavored Markdown is fine (a short list, a "
+        "little emphasis, a fenced code block for any SQL/commands) but keep it reading "
+        "like a natural reply. Be specific and concise, and give a concrete next action "
+        "(which button to click, what DDL to run).\n\n"
+        "Your focus is resolving THIS CDC problem, but you are also this migration's "
+        "assistant. If it helps root-cause the issue -- the affected table's converted "
+        "DDL, its real source structure, the live target schema, the load/validation "
+        "state -- USE ANY TOOLS you have to look up the real data and answer, rather "
+        "than refusing. Only decline questions that are genuinely off-topic for a "
+        "MySQL -> Aurora DSQL migration, politely, in one sentence.\n\n"
+        "These deterministic CDC facts are authoritative — build on them and never "
+        "contradict them:\n"
+        f"{facts.strip()[:_MAX_TEXT_CHARS]}\n\n"
+        f"{_CDC_RECOVERY_CONTEXT}\n\n"
+        f"Aurora DSQL constraints:\n{DSQL_CONSTRAINTS}"
+    )
+
+
+_CUTOVER_RECOVERY_CONTEXT = (
+    "How to cut a MySQL application over to Amazon Aurora DSQL safely:\n"
+    "- Aurora DSQL is PostgreSQL-wire; DSQL uses IAM-token auth (there is NO password) "
+    "and short-lived tokens generated per connection, so the driver must GENERATE and "
+    "REFRESH a fresh token whenever it opens a connection. TLS is required: use "
+    "sslmode=require (psycopg / libpq) or the equivalent for the driver.\n"
+    "- Rewire the connection string: JDBC "
+    "`jdbc:postgresql://<endpoint>:5432/postgres?sslmode=require&user=admin`, "
+    "psycopg `host=<endpoint> port=5432 dbname=postgres user=admin password=<TOKEN> "
+    "sslmode=require`, SQLAlchemy `postgresql+psycopg://admin:<TOKEN>@<endpoint>:5432/"
+    "postgres?sslmode=require`, Django/Rails: the postgresql/postgis adapter with the "
+    "same coords and a password callback that MINTS a fresh DSQL token each time. Use "
+    "a small connection pool with pre-ping; do NOT cache tokens across long-lived "
+    "processes (they expire).\n"
+    "- Application changes: expect OCC (SQLSTATE 40001) retries on write hot spots; "
+    "retry the whole transaction (up to a small budget) rather than the failing "
+    "statement. No foreign keys, no TRUNCATE. Batched writes must stay under DSQL's "
+    "per-transaction row limit (~3000). CREATE INDEX runs ASYNC.\n"
+    "- Identity keys: any AUTO_INCREMENT-derived key must have had its sequence "
+    "advanced past MAX(pk) on the target BEFORE the app repoints, or its first insert "
+    "collides (23505). This tool's cut-over runbook exposes 'Sync identity sequences'; "
+    "run it and confirm success before the repoint.\n"
+    "- Sequencing: 1) freeze source writes (or drain CDC to zero lag), 2) run a final "
+    "clean Validation, 3) sync identity sequences, 4) flip the app to DSQL, 5) smoke-"
+    "test reads and writes on DSQL, 6) keep the source READ-ONLY as a rollback anchor "
+    "for the agreed window.\n"
+    "- ROLLBACK ASYMMETRY: rolling BACK to MySQL after new writes have landed on DSQL "
+    "means those new writes are only on DSQL — the source is stale, and the tool does "
+    "NOT reverse-replicate DSQL -> MySQL. So the safe rollback window is 'no new "
+    "writes to DSQL yet'. After that, going back means data loss of the new writes. "
+    "Say so explicitly when discussing rollback.\n"
+    "- Do NOT propose changes to the target from a chat: writes to DSQL always go "
+    "through the operator's explicit approval on the tool's screens."
+)
+
+
+def build_cutover_chat_system(facts: str) -> str:
+    """Build the system grounding for a chat about CUTTING OVER to Aurora DSQL.
+
+    ``facts`` is a pre-formatted, credential-free block the UI assembles from the
+    session (migration_type, non-secret target coordinates -- endpoint/region/db/role,
+    NEVER a token, Property 7 -- the last validation verdict + drift summary, whether
+    CDC is in use, and the identity-sync state). Grounded on the recovery model
+    (:data:`_CUTOVER_RECOVERY_CONTEXT`) so the assistant produces a framework-tailored
+    repoint recipe and a "safe to cut over?" verdict that map to real buttons in the
+    tool -- not generic PostgreSQL advice."""
+    return (
+        "You are a senior AWS database migration engineer chatting with a teammate "
+        "who is about to CUT OVER their application from MySQL to Amazon Aurora DSQL "
+        "-- the single least-reversible step of the migration. Help them prepare a "
+        "safe repoint. Answer naturally and conversationally; light GitHub-flavored "
+        "Markdown is fine, and put runnable connection strings / DDL / commands in "
+        "fenced ```code blocks so they are easy to copy. Be specific and concrete; "
+        "state a clear GO / HOLD verdict when asked.\n\n"
+        "Your focus is CUT OVER for THIS migration (repoint recipe tailored to the "
+        "user's framework, is-it-safe verdict, rollback window). If it helps, USE ANY "
+        "TOOLS you have to check the real state (validation, CDC health, full-load "
+        "gaps, converted DDL) rather than guessing. Only decline questions that are "
+        "genuinely off-topic for a MySQL -> Aurora DSQL migration, politely, in one "
+        "sentence.\n\n"
+        "These deterministic cut-over facts are authoritative — build on them and "
+        "never contradict them:\n"
+        f"{facts.strip()[:_MAX_TEXT_CHARS]}\n\n"
+        f"{_CUTOVER_RECOVERY_CONTEXT}\n\n"
         f"Aurora DSQL constraints:\n{DSQL_CONSTRAINTS}"
     )
 
@@ -1168,6 +1378,8 @@ class AssessmentStrategist:
         on_delta: Callable[[str], None],
         *,
         scope: str = "table",
+        tools: Optional[Sequence[Mapping[str, Any]]] = None,
+        execute: Optional[Callable[[str, Mapping[str, Any]], str]] = None,
     ) -> "ObjectGuidanceOutcome":
         """Stream one assistant turn of a chat about a validation mismatch.
 
@@ -1176,10 +1388,17 @@ class AssessmentStrategist:
         drift), so replies explain WHY the table/run diverged and HOW to fix it
         (re-run to backfill a standing gap, or quiesce/stop CDC for a cut-over
         check) consistent with this tool's Full Load + CDC model. Never raises.
+
+        When ``tools`` + ``execute`` are supplied, the turn runs through
+        :meth:`tool_chat`, so the mismatch chat can also look up the real
+        converted DDL / target schema / row counts to root-cause the divergence.
         """
-        return self.stream_chat(
-            build_validation_chat_system(facts, scope=scope), messages, on_delta
-        )
+        system = build_validation_chat_system(facts, scope=scope)
+        if tools is not None and execute is not None:
+            return self.tool_chat(
+                system, messages, on_delta, tools=tools, execute=execute
+            )
+        return self.stream_chat(system, messages, on_delta)
 
     def stream_full_load_error_chat(
         self,
@@ -1189,6 +1408,8 @@ class AssessmentStrategist:
         on_delta: Callable[[str], None],
         *,
         migration_context: str = "",
+        tools: Optional[Sequence[Mapping[str, Any]]] = None,
+        execute: Optional[Callable[[str, Mapping[str, Any]], str]] = None,
     ) -> "ObjectGuidanceOutcome":
         """Stream one assistant turn of a chat about a FAILED Full Load table.
 
@@ -1198,14 +1419,72 @@ class AssessmentStrategist:
         selection), so replies explain WHY the table failed and HOW to fix it
         (schema/DDL vs data vs transient, then per-table Reload / Retry) specific to
         THIS migration and consistent with this tool's Full Load model. Never raises.
+
+        When ``tools`` + ``execute`` are supplied, the turn runs through
+        :meth:`tool_chat`, so the diagnosis can look up the real converted DDL / target
+        schema / source structure to root-cause a schema/DDL failure by name.
         """
-        return self.stream_chat(
-            build_full_load_error_chat_system(
-                table_name, error_message, migration_context=migration_context
-            ),
-            messages,
-            on_delta,
+        system = build_full_load_error_chat_system(
+            table_name, error_message, migration_context=migration_context
         )
+        if tools is not None and execute is not None:
+            return self.tool_chat(
+                system, messages, on_delta, tools=tools, execute=execute
+            )
+        return self.stream_chat(system, messages, on_delta)
+
+    def stream_cutover_chat(
+        self,
+        facts: str,
+        messages: Sequence[Mapping[str, str]],
+        on_delta: Callable[[str], None],
+        *,
+        tools: Optional[Sequence[Mapping[str, Any]]] = None,
+        execute: Optional[Callable[[str, Mapping[str, Any]], str]] = None,
+    ) -> "ObjectGuidanceOutcome":
+        """Stream one assistant turn of a chat about CUTTING OVER to Aurora DSQL.
+
+        Grounded by :func:`build_cutover_chat_system` on the credential-free cut-over
+        ``facts`` (migration type, non-secret target coordinates, last validation
+        verdict, CDC in use, identity-sync state), so replies produce a framework-
+        tailored repoint recipe and a GO/HOLD verdict that map to the real buttons in
+        this tool -- not generic advice. With ``tools`` + ``execute`` the turn runs
+        through :meth:`tool_chat` so it can consult live CDC/validation/load state.
+        Never raises.
+        """
+        system = build_cutover_chat_system(facts)
+        if tools is not None and execute is not None:
+            return self.tool_chat(
+                system, messages, on_delta, tools=tools, execute=execute
+            )
+        return self.stream_chat(system, messages, on_delta)
+
+    def stream_cdc_chat(
+        self,
+        facts: str,
+        messages: Sequence[Mapping[str, str]],
+        on_delta: Callable[[str], None],
+        *,
+        scope: str = "dlq",
+        tools: Optional[Sequence[Mapping[str, Any]]] = None,
+        execute: Optional[Callable[[str, Mapping[str, Any]], str]] = None,
+    ) -> "ObjectGuidanceOutcome":
+        """Stream one assistant turn of a chat about a CDC DLQ / schema-drift problem.
+
+        Grounded by :func:`build_cdc_error_chat_system` on the credential-free CDC
+        ``facts`` (DLQ depth + poison tables + SQLSTATEs, detected drift, stall state),
+        so replies explain WHY records dead-lettered / what drifted and HOW to fix it
+        (Fix target schema / per-table Reload / Stop CDC), consistent with this tool's
+        CDC model. When ``tools`` + ``execute`` are supplied the turn runs through
+        :meth:`tool_chat` so it can look up the affected table's real DDL / schema.
+        Never raises.
+        """
+        system = build_cdc_error_chat_system(facts, scope=scope)
+        if tools is not None and execute is not None:
+            return self.tool_chat(
+                system, messages, on_delta, tools=tools, execute=execute
+            )
+        return self.stream_chat(system, messages, on_delta)
 
     def stream_chat(
         self,

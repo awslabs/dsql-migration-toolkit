@@ -49,6 +49,11 @@ from dsql_migrator.ui.ai_chat_drawer import (
     split_markdown_segments,
 )
 from dsql_migrator.ui.design import (
+    AI_ACCENT_BG,
+    AI_ACCENT_BORDER,
+    AI_ACCENT_BUBBLE_BG,
+    AI_ACCENT_COLOR,
+    AI_ACCENT_TEXT,
     render_activity_event,
     render_notice,
     render_segmented_bar,
@@ -94,6 +99,7 @@ class AiPanelHandle:
         toggle: Callable[[], None],
         is_enabled: Callable[[], bool],
         is_visible: Callable[[], bool],
+        refresh_context: Callable[[], None],
     ) -> None:
         self.open_scope = open_scope
         self.post_event = post_event
@@ -101,6 +107,9 @@ class AiPanelHandle:
         self.toggle = toggle
         self.is_enabled = is_enabled
         self.is_visible = is_visible
+        # Re-read the "where you are" step context and update the baseline chip (used by
+        # the shell when the user navigates, so the step label follows the nav).
+        self.refresh_context = refresh_context
 
 
 def _panel_css(ui: object) -> None:
@@ -130,6 +139,7 @@ def build_ai_panel(
     get_context: Optional[Callable[[], MigrationContext]] = None,
     general_streamer_factory: Optional[Callable[[], Optional[ChatStreamer]]] = None,
     on_change: Optional[Callable[[], None]] = None,
+    get_progress: Optional[Callable[[], Optional[dict]]] = None,
 ) -> AiPanelHandle:
     """Build the persistent AI panel once and return its :class:`AiPanelHandle`.
 
@@ -170,6 +180,11 @@ def build_ai_panel(
         "pending": deque(),
     }
     _scroll_state: dict[str, bool] = {"at_bottom": True}
+    # Live progress card (e.g. Full Load) rendered ONCE and updated in place by the
+    # progress poller, so the panel is a live monitor without flooding the feed. Holds
+    # the element refs + a signature to skip no-op re-renders. Not persisted -- a live
+    # UI element; it is re-created from get_progress() after a rebuild if a job is live.
+    _live_progress: dict[str, object] = {}
 
     _panel_css(ui)
     drawer = ui.right_drawer(  # type: ignore[attr-defined]
@@ -182,9 +197,9 @@ def build_ai_panel(
                 "items-center gap-2 no-wrap w-full q-px-md q-py-sm bg-white "
                 "border-b border-gray-200"
             ):
-                ui.icon("auto_awesome", color="indigo-6").classes("text-2xl")  # type: ignore[attr-defined]
+                ui.icon("auto_awesome", color=AI_ACCENT_COLOR).classes("text-2xl")  # type: ignore[attr-defined]
                 with ui.column().classes("col gap-0 min-w-0"):  # type: ignore[attr-defined]
-                    title_label = ui.label("AI assistant").classes(  # type: ignore[attr-defined]
+                    title_label = ui.label("AI DBA").classes(  # type: ignore[attr-defined]
                         "text-base font-semibold leading-tight"
                     )
                     subtitle_label = ui.label("").classes(  # type: ignore[attr-defined]
@@ -195,12 +210,20 @@ def build_ai_panel(
                 # header button) bring it back. An X read as "end/discard this".
                 ui.button(
                     icon="chevron_right", on_click=lambda: _set_visible(False)
-                ).props("flat dense round").tooltip("Hide the AI assistant")  # type: ignore[attr-defined]
+                ).props("flat dense round").tooltip("Hide AI DBA")  # type: ignore[attr-defined]
             # Context chip: what the assistant is grounded on right now.
             chip_label = ui.label("").classes(  # type: ignore[attr-defined]
-                "text-xs text-indigo-700 bg-indigo-50 border-b border-indigo-100 "
+                f"text-xs {AI_ACCENT_TEXT} {AI_ACCENT_BG} border-b border-{AI_ACCENT_BORDER} "
                 "q-px-md q-py-xs w-full ellipsis"
             )
+            # PINNED live-monitor slot: a live progress card (e.g. Full Load) renders
+            # HERE, above the scroll, so chatting / new events never push it out of view
+            # -- it is a monitor, not part of the immutable transcript. Hidden until a
+            # job reports progress.
+            progress_slot = ui.column().classes(  # type: ignore[attr-defined]
+                "w-full q-px-md q-py-sm bg-white border-b border-gray-200 gap-0"
+            )
+            progress_slot.set_visibility(False)  # type: ignore[attr-defined]
             scroll = ui.scroll_area(  # type: ignore[attr-defined]
                 on_scroll=lambda e: _scroll_state.__setitem__(
                     "at_bottom", (e.vertical_percentage or 0) >= 0.95
@@ -231,7 +254,7 @@ def build_ai_panel(
                         .classes("col")
                     )
                     send_btn = ui.button(icon="send").props(  # type: ignore[attr-defined]
-                        "round dense color=indigo-6"
+                        f"round dense color={AI_ACCENT_COLOR}"
                     ).tooltip("Send  (Shift+Enter for a new line)")
                     # Shown only WHILE a reply is streaming (see _apply_composer_state):
                     # stops the turn, keeping whatever text arrived so far.
@@ -250,10 +273,6 @@ def build_ai_panel(
                         "text-xs text-gray-400 no-wrap"
                     )
                     char_counter.set_visibility(False)  # type: ignore[attr-defined]
-                ui.label(  # type: ignore[attr-defined]
-                    "AI suggestions are advisory. Replies are grounded on the current "
-                    "step's deterministic facts."
-                ).classes("text-xs text-gray-400")
                 # The Bedrock model currently answering, shown persistently under the
                 # composer as a labeled indigo CHIP (not faint gray text) so it is easy
                 # to spot. The per-reply "Generated by model X" is retrospective; this
@@ -261,15 +280,16 @@ def build_ai_panel(
                 # AI-assist config on build and on every open.
                 model_row = ui.row().classes(  # type: ignore[attr-defined]
                     "items-center gap-1.5 no-wrap self-start rounded "
-                    "bg-indigo-50 border border-indigo-100 q-px-sm q-py-xs max-w-full"
+                    f"{AI_ACCENT_BG} border border-{AI_ACCENT_BORDER} "
+                    "q-px-sm q-py-xs max-w-full"
                 )
                 with model_row:  # type: ignore[attr-defined]
-                    ui.icon("smart_toy", color="indigo-6").classes("text-sm")  # type: ignore[attr-defined]
+                    ui.icon("smart_toy", color=AI_ACCENT_COLOR).classes("text-sm")  # type: ignore[attr-defined]
                     ui.label("Model").classes(  # type: ignore[attr-defined]
-                        "text-xs font-semibold text-indigo-700 no-wrap"
+                        f"text-xs font-semibold {AI_ACCENT_TEXT} no-wrap"
                     )
                     model_value = ui.label("").classes(  # type: ignore[attr-defined]
-                        "text-xs text-indigo-700 ellipsis"
+                        f"text-xs {AI_ACCENT_TEXT} ellipsis"
                     )
 
     # Collapsed-state affordance: a small tab pinned to the RIGHT EDGE so that, when
@@ -277,14 +297,14 @@ def build_ai_panel(
     # button). Shown only while the panel is closed AND AI is enabled; hidden when the
     # panel is open (the drawer would cover it) or AI is off.
     reopen_tab = (
-        ui.button("AI", icon="auto_awesome", on_click=lambda: _set_visible(True))  # type: ignore[attr-defined]
-        .props("dense color=indigo-6 no-caps")
+        ui.button("AI DBA", icon="auto_awesome", on_click=lambda: _set_visible(True))  # type: ignore[attr-defined]
+        .props(f"dense color={AI_ACCENT_COLOR} no-caps")
         .style(
             "position: fixed; right: 0; top: 50%; transform: translateY(-50%); "
             "z-index: 2000; border-top-right-radius: 0; border-bottom-right-radius: 0; "
             "min-width: 0; padding: 12px 6px; box-shadow: -2px 0 8px rgba(0,0,0,0.15);"
         )
-        .tooltip("Open the AI assistant")
+        .tooltip("Open AI DBA")
     )
     # Unseen-activity badge on the reopen tab: when the panel is closed and a major
     # action posts an event, this shows the count so the action is noticed.
@@ -323,34 +343,41 @@ def build_ai_panel(
         return "  ·  ".join(bits)
 
     def _ensure_general_scope() -> None:
-        """Give the panel a GENERAL (whole-migration) streamer when it is opened with
-        no specific object scope, so the composer is usable straight from the header
-        toggle -- "ask anything about this migration".
+        """Guarantee the composer has a usable streamer, activating the GENERAL
+        (whole-migration) "ask anything" scope when nothing live is set.
 
         The general streamer is grounded on the current MigrationContext and carries
         the same domain guardrail as the per-object chats (migration-only, declines
-        off-topic). It is reconstructable, so this also restores a usable composer for
-        the general scope after a browser refresh (a screen-specific scope's live
-        streamer is not reconstructable and stays disabled until re-deep-linked).
+        off-topic).
+
+        A LIVE scope of any kind (general or a screen deep-link) is left untouched. But
+        when there is NO live streamer -- which is the state after a fresh build /
+        browser refresh / app restart, because ``conv`` is re-created with
+        ``streamer=None`` even though the session restored an active scope -- we
+        activate the general streamer so the panel is usable. A restored SCREEN scope's
+        streamer is a closure that cannot be reconstructed here, so rather than leave
+        the composer permanently dead (the panel would replay the transcript and render
+        new activity events, e.g. "Moved to the Data Migration step", but the input
+        would stay disabled), we re-home a stale screen scope to the general scope. The
+        user can re-deep-link the object from its screen to re-ground on it.
         """
         if general_streamer_factory is None:
             return
-        active = conversation.active_scope
-        if active is not None and active.scope_id != "general":
-            return  # a specific screen scope is active -- never override it
-        if active is not None and conv["streamer"] is not None:
-            return  # the general scope is already live
+        if conv["streamer"] is not None:
+            return  # a scope (general or a screen deep-link) is already live -- keep it
         streamer = general_streamer_factory()
         if streamer is None:
             return
         conv["streamer"] = streamer
-        if active is None:
+        active = conversation.active_scope
+        if active is None or active.scope_id != "general":
+            # No scope, or a stale (non-reconstructable) screen scope -> (re)home general.
             conversation.active_scope = AiScope(
-                scope_id="general", title="AI assistant", chip=_baseline_chip()
+                scope_id="general", title="AI DBA", chip=_baseline_chip()
             )
             conv["scope_start"] = len(conversation.messages)
         try:
-            title_label.set_text("AI assistant")  # type: ignore[attr-defined]
+            title_label.set_text("AI DBA")  # type: ignore[attr-defined]
             subtitle_label.set_text("")  # type: ignore[attr-defined]
             chip_label.set_text(_baseline_chip())  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001
@@ -363,7 +390,11 @@ def build_ai_panel(
         # cost stays bounded no matter how long the chat runs) -- not an arbitrary
         # "10 questions" wall. The composer is enabled whenever a streamer is active
         # and no turn is in flight.
-        enabled = (not conv["busy"]) and conv["streamer"] is not None
+        # AI Assist can be turned OFF on Connect mid-session; the composer must go dead
+        # immediately so no further Bedrock turn (and no cost) is possible, regardless
+        # of whether a streamer is still set from when it was on.
+        ai_on = is_enabled()
+        enabled = ai_on and (not conv["busy"]) and conv["streamer"] is not None
         for el in (chat_input, send_btn):
             try:
                 el.set_enabled(enabled)  # type: ignore[attr-defined]
@@ -376,7 +407,11 @@ def build_ai_panel(
         except Exception:  # noqa: BLE001
             pass
         try:
-            if conv["streamer"] is None:
+            if not ai_on:
+                composer_hint.set_text(  # type: ignore[attr-defined]
+                    "AI Assist is off — enable it on the Connect screen to use AI DBA."
+                )
+            elif conv["streamer"] is None:
                 composer_hint.set_text(  # type: ignore[attr-defined]
                     "Open AI from a step (e.g. an object's AI Assist) to start or "
                     "continue a conversation."
@@ -389,6 +424,16 @@ def build_ai_panel(
     def _set_busy(busy: bool) -> None:
         conv["busy"] = busy
         _apply_composer_state()
+
+    def _sync_ai_enabled() -> None:
+        # Reactive cost-safety: if AI Assist was turned OFF on Connect while the panel
+        # still holds a live streamer (from when it was on), drop the streamer so no
+        # further Bedrock turn can fire, and re-disable the composer. Cheap; called from
+        # the loop timer. Re-enabling AI + opening a scope restores a live streamer.
+        if not is_enabled() and conv["streamer"] is not None:
+            conv["streamer"] = None
+            conv["busy"] = False
+            _apply_composer_state()
 
     def _notify_change() -> None:
         # Persist the session (the callback is dirty-checked, so this is cheap) so the
@@ -484,7 +529,7 @@ def build_ai_panel(
                 "q-pa-sm gap-2"
             ):
                 with ui.row().classes("items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
-                    ui.icon("fact_check", color="indigo-6").classes("text-base")  # type: ignore[attr-defined]
+                    ui.icon("fact_check", color=AI_ACCENT_COLOR).classes("text-base")  # type: ignore[attr-defined]
                     ui.label(  # type: ignore[attr-defined]
                         f"Assessment complete — {total} object"
                         + ("" if total == 1 else "s")
@@ -503,14 +548,216 @@ def build_ai_panel(
                         + " already exist on the target"
                     ).classes("text-xs text-gray-500")
 
+    def _render_conversion_event(text: str, data: dict) -> None:
+        """A compact VISUAL for a completed Schema Conversion: a headline + a
+        Converted / Not-supported breakdown bar + a note naming the DSQL-unsupported
+        source kinds. ``text`` stays the plain grounding line the AI sees."""
+        converted = int(data.get("converted", 0) or 0)
+        triggers = int(data.get("triggers", 0) or 0)
+        routines = int(data.get("routines", 0) or 0)
+        events = int(data.get("events", 0) or 0)
+        unsupported = triggers + routines + events
+        with convo:  # type: ignore[attr-defined]
+            with ui.card().classes(  # type: ignore[attr-defined]
+                "w-full bg-white border border-gray-200 rounded-md !shadow-none "
+                "q-pa-sm gap-2"
+            ):
+                with ui.row().classes("items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
+                    ui.icon("transform", color=AI_ACCENT_COLOR).classes("text-base")  # type: ignore[attr-defined]
+                    ui.label(  # type: ignore[attr-defined]
+                        f"Schema conversion — DDL generated for {converted} object"
+                        + ("" if converted == 1 else "s")
+                    ).classes("text-xs font-semibold text-gray-800")
+                render_segmented_bar(
+                    ui,
+                    segments=[
+                        ("Converted", converted, "ok"),
+                        ("Not supported", unsupported, "bad"),
+                    ],
+                )
+                # "Generate" only produces the target DDL to review -- nothing is written
+                # to Aurora DSQL until Apply. Say so, so "generated" isn't read as "done".
+                ui.label(  # type: ignore[attr-defined]
+                    "Preview only — nothing is applied to Aurora DSQL until you Apply."
+                ).classes("text-xs text-gray-500")
+                if unsupported:
+                    _parts = []
+                    if triggers:
+                        _parts.append(f"{triggers} trigger(s)")
+                    if routines:
+                        _parts.append(f"{routines} routine(s)")
+                    if events:
+                        _parts.append(f"{events} event(s)")
+                    ui.label(  # type: ignore[attr-defined]
+                        "Aurora DSQL can't convert " + ", ".join(_parts)
+                        + " — reimplement that logic in the application."
+                    ).classes("text-xs text-gray-500")
+
+    def _render_apply_event(text: str, data: dict) -> None:
+        """A compact VISUAL for a completed schema APPLY: a headline + a
+        Created / Skipped / Failed breakdown bar, and (on failure) the names of the
+        objects that failed. ``text`` stays the plain grounding line the AI sees."""
+        created = int(data.get("created", 0) or 0)
+        skipped = int(data.get("skipped", 0) or 0)
+        failed = int(data.get("failed", 0) or 0)
+        total = int(data.get("total", 0) or 0)
+        with convo:  # type: ignore[attr-defined]
+            with ui.card().classes(  # type: ignore[attr-defined]
+                "w-full bg-white border border-gray-200 rounded-md !shadow-none "
+                "q-pa-sm gap-2"
+            ):
+                with ui.row().classes("items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
+                    ui.icon(  # type: ignore[attr-defined]
+                        "error" if failed else "check_circle",
+                        color="red-6" if failed else "green-6",
+                    ).classes("text-base")
+                    ui.label(  # type: ignore[attr-defined]
+                        f"Schema apply — {created + skipped} of {total} applied"
+                        + (f", {failed} failed" if failed else "")
+                    ).classes("text-xs font-semibold text-gray-800")
+                render_segmented_bar(
+                    ui,
+                    segments=[
+                        ("Created", created, "ok"),
+                        ("Skipped", skipped, "neutral"),
+                        ("Failed", failed, "bad"),
+                    ],
+                )
+                if failed:
+                    _names = list(data.get("failed_objects") or [])
+                    _listed = ", ".join(_names[:5])
+                    _more = f", +{len(_names) - 5} more" if len(_names) > 5 else ""
+                    ui.label(  # type: ignore[attr-defined]
+                        (f"Failed: {_listed}{_more}. " if _listed else "")
+                        + "Ask AI DBA about a failed object to fix it."
+                    ).classes("text-xs text-gray-500")
+
+    def _render_or_update_progress(data: dict) -> None:
+        """Create (once) or update-in-place a LIVE progress card, so the panel is a
+        real-time monitor (e.g. Full Load) without one feed entry per table.
+
+        ``data``: ``label`` (str), ``running`` (bool), ``total``/``done``/``failed``
+        (int), ``rows`` (int), ``failed_objects`` (list[str], bounded). Deduped by a
+        signature so an unchanged poll tick is a no-op (no flicker)."""
+        label = str(data.get("label", "Full Load") or "Full Load")
+        running = bool(data.get("running", False))
+        total = int(data.get("total", 0) or 0)
+        done = int(data.get("done", 0) or 0)
+        failed = int(data.get("failed", 0) or 0)
+        rows = int(data.get("rows", 0) or 0)
+        names = [str(n) for n in (data.get("failed_objects") or [])][:20]
+        pending = max(0, total - done - failed)
+        sig = (label, running, total, done, failed, rows, tuple(names))
+        if _live_progress.get("sig") == sig:
+            return  # nothing changed since the last poll tick
+
+        def _headline() -> str:
+            head = f"{label}{'' if running else ' complete'} — {done}/{total} tables"
+            if failed:
+                head += f" · {failed} failed"
+            if rows:
+                head += f" · {rows:,} rows"
+            return head
+
+        def _failed_text() -> str:
+            if not names:
+                return ""
+            shown = ", ".join(names[:5])
+            more = f", +{len(names) - 5} more" if len(names) > 5 else ""
+            return f"Failed: {shown}{more}. Ask AI DBA about a failed table to fix it."
+
+        if not _live_progress.get("card"):
+            # Render into the PINNED slot above the scroll (not convo), so chatting /
+            # new events never push the monitor out of view.
+            progress_slot.set_visibility(True)  # type: ignore[attr-defined]
+            with progress_slot:  # type: ignore[attr-defined]
+                card = ui.card().classes(  # type: ignore[attr-defined]
+                    "w-full bg-white border border-gray-200 rounded-md !shadow-none "
+                    "q-pa-sm gap-2"
+                )
+                with card:  # type: ignore[attr-defined]
+                    with ui.row().classes("items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
+                        spinner = ui.spinner(size="sm", color=AI_ACCENT_COLOR)  # type: ignore[attr-defined]
+                        ok_icon = ui.icon("check_circle", color="green-6").classes("text-base")  # type: ignore[attr-defined]
+                        err_icon = ui.icon("error", color="red-6").classes("text-base")  # type: ignore[attr-defined]
+                        head = ui.label("").classes(  # type: ignore[attr-defined]
+                            "text-xs font-semibold text-gray-800"
+                        )
+                    bar_box = ui.column().classes("w-full gap-0")  # type: ignore[attr-defined]
+                    # Throughput / ETA line (rows-per-second + time remaining) while a
+                    # load is in flight; hidden when there is nothing meaningful to show.
+                    meta_lbl = ui.label("").classes("text-xs text-gray-500")  # type: ignore[attr-defined]
+                    failed_lbl = ui.label("").classes("text-xs text-gray-500")  # type: ignore[attr-defined]
+            _live_progress.update(
+                card=card, spinner=spinner, ok_icon=ok_icon, err_icon=err_icon,
+                head=head, bar_box=bar_box, meta_lbl=meta_lbl, failed_lbl=failed_lbl,
+            )
+
+        head = _live_progress["head"]
+        head.set_text(_headline())  # type: ignore[union-attr]
+        _live_progress["spinner"].set_visibility(running)  # type: ignore[union-attr]
+        _live_progress["ok_icon"].set_visibility(not running and failed == 0)  # type: ignore[union-attr]
+        _live_progress["err_icon"].set_visibility(not running and failed > 0)  # type: ignore[union-attr]
+        bar_box = _live_progress["bar_box"]
+        try:
+            bar_box.clear()  # type: ignore[union-attr]
+            with bar_box:  # type: ignore[attr-defined]
+                render_segmented_bar(
+                    ui,
+                    segments=[
+                        ("Done", done, "ok"),
+                        ("Failed", failed, "bad"),
+                        ("Pending", pending, "neutral"),
+                    ],
+                )
+        except Exception:  # noqa: BLE001 - a bad bar must never break the panel
+            pass
+        # Throughput / ETA: rows-per-second + time remaining while loading; total
+        # elapsed once finished. Provider supplies pre-formatted, credential-free values.
+        _rate = data.get("rows_per_sec")
+        _eta = str(data.get("eta", "") or "")
+        _meta_bits: list[str] = []
+        if running and isinstance(_rate, (int, float)) and _rate > 0:
+            _meta_bits.append(f"{int(_rate):,} rows/s")
+        if _eta:
+            _meta_bits.append(_eta)
+        _meta = "  ·  ".join(_meta_bits)
+        _live_progress["meta_lbl"].set_text(_meta)  # type: ignore[union-attr]
+        _live_progress["meta_lbl"].set_visibility(bool(_meta))  # type: ignore[union-attr]
+        _fl = _failed_text()
+        _live_progress["failed_lbl"].set_text(_fl)  # type: ignore[union-attr]
+        _live_progress["failed_lbl"].set_visibility(bool(_fl))  # type: ignore[union-attr]
+        _live_progress["sig"] = sig
+
+    def _poll_progress() -> None:
+        """Loop timer: pull the current progress snapshot from ``get_progress`` and
+        drive the live card. No-op when no provider is wired or no job is active."""
+        if get_progress is None or not is_enabled():
+            return
+        try:
+            data = get_progress()
+        except Exception:  # noqa: BLE001 - a bad provider must never break the panel
+            return
+        if isinstance(data, dict):
+            try:
+                _render_or_update_progress(data)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _event_entry(
         text: str, status: str = "info", kind: str = "", data: object = None
     ) -> None:
         """Render one activity event. A known ``kind`` with structured ``data`` gets a
-        custom VISUAL (e.g. the assessment breakdown bar); everything else renders as
-        the design system's tinted timeline chip, visually distinct from the bubbles."""
+        custom VISUAL (e.g. the assessment / conversion breakdown bar); everything else
+        renders as the design system's tinted timeline chip, distinct from the bubbles."""
         if kind == "assessment" and isinstance(data, dict):
             _render_assessment_event(text, data)
+            return
+        if kind == "conversion" and isinstance(data, dict):
+            _render_conversion_event(text, data)
+            return
+        if kind == "apply" and isinstance(data, dict):
+            _render_apply_event(text, data)
             return
         with convo:  # type: ignore[attr-defined]
             render_activity_event(ui, text, tone=status)
@@ -521,14 +768,15 @@ def build_ai_panel(
                 has_code = "```" in text
                 if has_code:
                     classes = (
-                        "text-sm text-gray-800 bg-indigo-50 border border-indigo-100 "
+                        f"text-sm text-gray-800 {AI_ACCENT_BG} border "
+                        f"border-{AI_ACCENT_BORDER} "
                         "rounded-2xl rounded-tr-sm px-3 py-2 dsql-chat-md"
                     )
                     style = "max-width: 92%; overflow-wrap: anywhere"
                 else:
                     classes = (
-                        "text-sm text-white bg-indigo-600 rounded-2xl rounded-tr-sm "
-                        "px-3 py-2 dsql-chat-md dsql-chat-user"
+                        f"text-sm text-white {AI_ACCENT_BUBBLE_BG} rounded-2xl "
+                        "rounded-tr-sm px-3 py-2 dsql-chat-md dsql-chat-user"
                     )
                     style = "max-width: 85%; overflow-wrap: anywhere"
                 ui.markdown(text).classes(classes).style(style)  # type: ignore[attr-defined]
@@ -585,6 +833,9 @@ def build_ai_panel(
         """Render any events queued by ``post_event`` -- runs ON THE LOOP (a timer), so
         it is safe to build NiceGUI elements here even though post_event may have been
         called from a background job thread. Also bumps the unseen-badge when closed."""
+        # Cheap reactivity: notice an AI-Assist toggle-OFF and inert the composer so a
+        # disabled feature can never bill the user (runs every tick, before the queue).
+        _sync_ai_enabled()
         queue = conv.get("pending")
         if not queue:
             return
@@ -610,6 +861,13 @@ def build_ai_panel(
         text = (user_text or "").strip()
         streamer = conv["streamer"]
         if not text or conv["busy"] or streamer is None:
+            return
+        if not is_enabled():
+            # AI Assist was turned off (Connect) after this scope was opened. NEVER call
+            # the model -- that would bill the user for a disabled feature. Inert the
+            # composer instead of running the turn.
+            conv["streamer"] = None
+            _apply_composer_state()
             return
         conv["stop_requested"] = False  # clear any stale flag from a prior turn
         _set_busy(True)
@@ -684,7 +942,7 @@ def build_ai_panel(
                     )
                 typing = ui.row().classes("items-center gap-2 pl-1")  # type: ignore[attr-defined]
                 with typing:  # type: ignore[attr-defined]
-                    ui.spinner(type="dots", size="md", color="indigo-6")  # type: ignore[attr-defined]
+                    ui.spinner(type="dots", size="md", color=AI_ACCENT_COLOR)  # type: ignore[attr-defined]
                     ui.label("AI is writing…").classes("text-xs text-gray-500")  # type: ignore[attr-defined]
                 actions = ui.row().classes("items-center gap-1")  # type: ignore[attr-defined]
                 with actions:  # type: ignore[attr-defined]
@@ -799,12 +1057,24 @@ def build_ai_panel(
                     with actions:  # type: ignore[attr-defined]
                         ui.button(  # type: ignore[attr-defined]
                             str(footer_label), on_click=_do_footer
-                        ).props("flat dense no-caps color=indigo-6 icon=download_done")
+                        ).props(
+                            f"flat dense no-caps color={AI_ACCENT_COLOR} "
+                            "icon=download_done"
+                        )
             _set_busy(False)
             _autoscroll()
             _notify_change()  # persist the completed turn (crash-durable transcript)
 
-        timer_box["timer"] = ui.timer(0.12, tick)  # type: ignore[attr-defined]
+        # Anchor the streaming tick timer on the PERSISTENT panel column (`convo`, in
+        # the right drawer), NOT the ambient slot _run_turn was invoked from. A step
+        # screen's "AI Assist" deep-link runs inside render_main's @ui.refreshable
+        # container; a timer created in that slot is deleted + cancelled by
+        # render_main.refresh() on navigation, so tick() would never reach
+        # _set_busy(False) and the shared composer would stay disabled forever
+        # (stranded conv["busy"]=True). convo is never cleared, so the timer survives
+        # nav and still finalizes the (also convo-owned) reply bubble.
+        with convo:  # type: ignore[attr-defined]
+            timer_box["timer"] = ui.timer(0.12, tick)  # type: ignore[attr-defined]
 
     def _send() -> None:
         text = (getattr(chat_input, "value", "") or "").strip()  # type: ignore[attr-defined]
@@ -918,7 +1188,7 @@ def build_ai_panel(
             if conversation.messages:
                 _divider(f"Now: {title}" if title else "New topic")
         try:
-            title_label.set_text(title or "AI assistant")  # type: ignore[attr-defined]
+            title_label.set_text(title or "AI DBA")  # type: ignore[attr-defined]
             subtitle_label.set_text(subtitle)  # type: ignore[attr-defined]
             chip_label.set_text(chip or _baseline_chip())  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001
@@ -942,12 +1212,28 @@ def build_ai_panel(
     def is_visible() -> bool:
         return bool(conversation.visible)
 
+    def refresh_context() -> None:
+        # Update the baseline "where you are" step chip after navigation. Only when the
+        # panel is NOT pinned to a specific object scope -- a per-object chat keeps its
+        # own chip ("Schema conversion · orders"); the general/no scope tracks the step.
+        active = conversation.active_scope
+        if active is not None and active.scope_id != "general":
+            return
+        chip = _baseline_chip()
+        try:
+            chip_label.set_text(chip)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        # Persist it on the general scope so a later rebuild replays the current step.
+        if active is not None and active.scope_id == "general":
+            conversation.active_scope = active.model_copy(update={"chip": chip})
+
     # Restore the transcript + chip from the session (open/close, nav, refresh).
     _replay()
     try:
         active = conversation.active_scope
         if active is not None:
-            title_label.set_text(active.title or "AI assistant")  # type: ignore[attr-defined]
+            title_label.set_text(active.title or "AI DBA")  # type: ignore[attr-defined]
             subtitle_label.set_text(active.subtitle)  # type: ignore[attr-defined]
             chip_label.set_text(active.chip or _baseline_chip())  # type: ignore[attr-defined]
         else:
@@ -969,6 +1255,11 @@ def build_ai_panel(
     # Loop timer that renders events posted by post_event (possibly from a background
     # job thread). Low frequency -- it just checks a deque and renders any new events.
     ui.timer(0.25, _drain_events)  # type: ignore[attr-defined]
+    # Persistent progress poller: drives the live monitor card (e.g. Full Load) from
+    # get_progress(). Owned by the panel (not a screen), so it keeps updating even when
+    # the user navigates to another step -- "monitor Full Load from the AI panel".
+    if get_progress is not None:
+        ui.timer(1.0, _poll_progress)  # type: ignore[attr-defined]
 
     return AiPanelHandle(
         open_scope=open_scope,
@@ -977,6 +1268,7 @@ def build_ai_panel(
         toggle=toggle,
         is_enabled=is_enabled,
         is_visible=is_visible,
+        refresh_context=refresh_context,
     )
 
 

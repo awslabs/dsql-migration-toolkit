@@ -889,6 +889,58 @@ def test_migrate_shard_in_process_maps_rows_skipped_from_conflicts(monkeypatch) 
     assert result.rows_skipped == 3  # mapped from BatchedImportResult.conflicts
 
 
+def test_migrate_shard_in_process_sanitizes_row_values_from_failed_error(monkeypatch) -> None:
+    """Property 7: a FAILED table's error_message must carry no row COLUMN VALUES.
+
+    The worker's catch-all built the message with ``f"{type(exc).__name__}: {exc}"``,
+    which for a psycopg error keeps the server ``DETAIL: Failing row contains (...)``
+    line -- the offending row's values. That message is surfaced to the AI DBA via
+    ``list_failed_full_load_tables``, so it must be value-free: assert the DETAIL line
+    and its values are dropped and only the value-free primary line survives.
+    """
+    import dataclasses
+
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    table = _tables()[0]  # orders
+    inputs = dataclasses.replace(_inputs(), replace_tables=frozenset({table.name}))
+
+    leaky = (
+        'duplicate key value violates unique constraint "users_email_key"\n'
+        "DETAIL: Failing row contains (42, secret@example.com, hunter2)."
+    )
+
+    class _LeakyImporter:
+        def import_rows(self, rows, _table, *, on_batch_loaded=None,
+                        should_cancel=None, on_conflict=None, **_kw):
+            list(rows)  # drain the shard's row stream, then fail
+            raise RuntimeError(leaky)
+
+    def _fake_migrator(inp):
+        return BatchedTableMigrator(
+            inp,
+            exporter=_FakeExporter(),
+            watermark_capturer=_FakeWatermarkCapturer(_watermark()),
+            importer_factory=lambda _i: _LeakyImporter(),
+            target_counter=lambda _t: None,
+        )
+
+    monkeypatch.setattr(_engine, "BatchedTableMigrator", _fake_migrator)
+
+    args = _engine._ShardWorkerArgs(
+        job_id="j", table=table, inputs=inputs,
+        pk_lower=None, pk_upper=None, shard_index=0,
+    )
+    result = _engine._migrate_shard_in_process(args)
+
+    assert result.status == "FAILED"
+    msg = result.error_message or ""
+    assert "duplicate key value violates unique constraint" in msg  # actionable line kept
+    assert "secret@example.com" not in msg  # ... but the row-value DETAIL is dropped
+    assert "hunter2" not in msg
+    assert "Failing row contains" not in msg
+
+
 def _recreate_inventory():
     """orders (source PK id) + customers (source PK id), both migratable."""
     return _inventory()
@@ -1311,6 +1363,103 @@ def test_full_load_step_feeds_the_probed_target_keys_into_the_disclosure() -> No
         "schema_recreate_tables must be wrapped in a lambda so it is resolved after the "
         "dialog's target probe, not while the step renders"
     )
+
+
+def test_full_load_failure_chat_is_ai_dba_and_wired_to_tools() -> None:
+    # The per-failed-table diagnosis opens under the unified "AI DBA" name (not the old
+    # "AI Assist — Full Load failure") and is wired with the shared read-only tools, so
+    # it can look up the real converted DDL / target schema to root-cause a schema/DDL
+    # failure by name -- matching the other scoped chats.
+    import inspect
+
+    from dsql_migrator.ui import data_migration as dm
+
+    src = inspect.getsource(dm.build_data_migration_screen)
+    assert 'title="AI DBA"' in src
+    assert "AI Assist — Full Load failure" not in src  # old label removed
+    assert "stream_full_load_error_chat" in src
+    assert "tools=ai_tools" in src and "execute=ai_tool_execute" in src
+    # The opener supports a distinct topic + seed so quarantine gets its own scope.
+    assert 'topic: str = "failure"' in src
+    assert 'scope_id=f"full_load:{topic}:{table_name}"' in src
+
+
+def test_cdc_dlq_and_drift_panels_offer_ai_dba() -> None:
+    # The CDC DLQ panel and the schema-drift banner now offer an "Ask AI DBA" action
+    # (reviving the CDC assist path): scoped to the poison records / drift, grounded on
+    # credential-free facts. Verify the opener is threaded + both scopes are wired.
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    dlq = inspect.getsource(cm._render_cdc_dlq_panel)
+    assert "cdc_ai_opener" in dlq and '"dlq"' in dlq  # DLQ-scoped opener
+    assert "_cdc_dlq_facts" in dlq
+
+    drift = inspect.getsource(cm._render_cdc_schema_drift_banner)
+    assert "cdc_ai_opener" in drift and '"drift"' in drift  # drift-scoped opener
+    assert "_cdc_drift_facts" in drift
+
+    # The step + live-monitoring render thread the opener down to the panels.
+    assert "cdc_ai_opener" in inspect.getsource(_cdc_ui._render_cdc_step)
+    assert "cdc_ai_opener" in inspect.getsource(cm._render_cdc_live_monitoring)
+
+
+def test_cdc_activity_events_are_edge_triggered_once() -> None:
+    # CDC transitions (started / drift / DLQ growing / sink stalled) are mirrored into
+    # the AI feed ONCE each, not on every ~5s poll.
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    posted: list = []
+
+    def post(**kw) -> None:  # noqa: ANN003
+        posted.append(kw)
+
+    ms = SimpleNamespace(
+        job_id="cdc-events-test",
+        cdc_stack_name=None,
+        cdc_activity=SimpleNamespace(sink_stall_confirmed=False),
+    )
+    cm._CDC_ANNOUNCED.pop("cdc-events-test", None)  # isolate from other tests
+    view = SimpleNamespace(
+        dlq_depth=5,
+        schema_drift=[SimpleNamespace(table="orders", kind="add-column", count=3)],
+    )
+
+    cm._announce_cdc_events(ms, view, post)
+    texts = [p["text"] for p in posted]
+    assert any("streaming started" in t for t in texts)
+    assert any("orders" in t and "record(s) dead-lettered" in t for t in texts)
+    assert any("dead-letter queue growing" in t for t in texts)
+    assert not any("stalled" in t for t in texts)  # no stall yet
+
+    # A second poll with the SAME state re-announces nothing.
+    posted.clear()
+    cm._announce_cdc_events(ms, view, post)
+    assert posted == []
+
+    # The sink stalls -> exactly one new event.
+    ms.cdc_activity.sink_stall_confirmed = True
+    cm._announce_cdc_events(ms, view, post)
+    assert len(posted) == 1 and "stalled" in posted[0]["text"]
+
+
+def test_quarantine_rows_offer_ai_assist_scoped_to_the_reason() -> None:
+    # Quarantined-row groups now offer BOTH AI Assist and Reload (previously Reload
+    # only). The AI chat is scoped to the quarantine reason (topic + a dropped-rows
+    # seed), so 'why were these dropped / json-vs-text / chunk / accept the gap' is
+    # answerable -- not the generic 'table failed' question.
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _full_load_ui as flu
+
+    src = inspect.getsource(flu._render_full_load_progress)
+    assert "_quar_actions" in src  # quarantine action renders AI + Reload
+    assert 'topic="quarantine"' in src  # scoped as a quarantine, not a failure
+    assert "quarantined (permanently dropped)" in src  # the quarantine-specific seed
 
 
 def test_pre_dialog_probe_caches_each_targets_real_primary_key(monkeypatch) -> None:

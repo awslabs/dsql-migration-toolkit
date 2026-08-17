@@ -1119,6 +1119,7 @@ def build_workflow_sidebar(
     on_ai_panel_ready: Optional[Callable[["AiPanelHandle"], None]] = None,
     ai_context_getter: Optional[Callable[[], "MigrationContext"]] = None,
     ai_general_streamer_factory: Optional[Callable[[], object]] = None,
+    ai_progress_provider: Optional[Callable[[], Optional[dict]]] = None,
 ) -> None:
     """Render the app as a sidebar layout: header + left-drawer nav + content.
 
@@ -1195,6 +1196,9 @@ def build_workflow_sidebar(
             ai_panel.post_event(
                 text=f"Moved to the {step_title(view)} step", status="info"
             )
+            # Update the panel's baseline step chip so the "where you are" label follows
+            # the navigation (unless pinned to a specific object scope).
+            ai_panel.refresh_context()
         except Exception:  # noqa: BLE001 - the feed is best-effort, never break nav
             pass
 
@@ -1294,6 +1298,9 @@ def build_workflow_sidebar(
         # open-close, so the transcript survives an unexpected app restart even with
         # no intervening navigation. Only ever invoked from the UI event loop.
         on_change=on_state_change,
+        # Drives the live progress monitor card (e.g. Full Load) from a persistent
+        # panel-owned timer, so it keeps updating across navigation.
+        get_progress=ai_progress_provider,
     )
     if on_ai_panel_ready is not None:
         on_ai_panel_ready(ai_panel)
@@ -1303,9 +1310,46 @@ def build_workflow_sidebar(
             ai_panel.toggle()
         else:
             ui.notify(
-                "Enable AI Assist on the Connect screen to use the assistant.",
+                "Enable AI Assist on the Connect screen to use AI DBA.",
                 type="info",
             )
+
+    def _open_readiness_briefing() -> None:
+        # Proactive "what should I do next & what are my top risks" briefing. Uses the
+        # SAME general streamer as the header chat (tool_chat over this session's real
+        # state), seeded so AI DBA reads the actual assessment / conversion / load /
+        # validation state via tools and names the specific objects blocking progress
+        # -- turning the passive panel into a next-step guide. Re-opening the scope
+        # re-focuses without re-asking (open_scope dedupes by scope_id).
+        if not ai_panel.is_enabled():
+            ui.notify(
+                "Enable AI Assist on the Connect screen to use AI DBA.",
+                type="info",
+            )
+            return
+        streamer = (
+            ai_general_streamer_factory()
+            if ai_general_streamer_factory is not None
+            else None
+        )
+        if streamer is None:
+            ai_panel.toggle()  # AI enabled but no streamer available; just open blank
+            return
+        ai_panel.open_scope(
+            scope_id="readiness",
+            title="AI DBA",
+            subtitle="What's next & top risks",
+            chip="Migration readiness",
+            streamer=streamer,
+            seed_question=(
+                "Given where I am in this MySQL → Aurora DSQL migration, what should "
+                "I do next, and what are my top risks right now? Use your tools to "
+                "check my real assessment, schema conversion, data-load, CDC health "
+                "(DLQ poison records, schema drift, a stalled sink) and validation "
+                "state, and call out the specific objects/tables that are blocking "
+                "progress or are standing gaps CDC won't backfill before cut over."
+            ),
+        )
 
     # --- Header ---------------------------------------------------------------
     with ui.header().classes("items-center justify-between"):
@@ -1315,14 +1359,23 @@ def build_workflow_sidebar(
             )
             ui.label(app_title).classes("text-lg font-bold")
         with ui.row().classes("items-center gap-3"):
-            # AI assistant toggle: a LABELED button (not a bare icon) so it is
+            # Proactive briefing: asks AI DBA, grounded on the real session state,
+            # what to do next and the top risks -- so the panel isn't only reactive.
+            ui.button(
+                "What's next?",
+                icon="tips_and_updates",
+                on_click=_open_readiness_briefing,
+            ).props("flat dense color=white").tooltip(
+                "Ask AI DBA what to do next and your top risks, from your real state"
+            )
+            # AI DBA toggle: a LABELED button (not a bare icon) so it is
             # obvious it opens/closes the side panel -- matches the "Start over"
             # button's treatment. Always present so the panel is reachable anytime;
             # a no-op-with-hint until AI Assist is enabled on Connect.
             ui.button(
-                "AI assistant", icon="auto_awesome", on_click=_toggle_ai_panel
+                "AI DBA", icon="auto_awesome", on_click=_toggle_ai_panel
             ).props("flat dense color=white").tooltip(
-                "Open or close the AI assistant panel"
+                "Open or close the AI DBA panel"
             )
             if on_reset is not None:
 
