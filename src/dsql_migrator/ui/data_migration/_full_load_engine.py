@@ -1659,7 +1659,7 @@ def _migrate_tables_in_parallel(
     else:
         # Unified process-parallel path: small tables get 1 worker each, large
         # shardable tables get multiple shard workers. All submitted to ONE pool.
-        from dsql_migrator.core.exporter import shardable_int_pk
+        from dsql_migrator.core.exporter import shardable_leading_int_pk
 
         # Plan work units: for each table, decide if it should be sharded.
         # Small/non-shardable tables get 1 worker each; an eligible large table gets
@@ -1695,7 +1695,7 @@ def _migrate_tables_in_parallel(
             shardable = (
                 _shardable_ok
                 and not table_is_replace
-                and shardable_int_pk(table) is not None
+                and shardable_leading_int_pk(table) is not None
                 and effective_reader_shards > 1
             )
             if not shardable:

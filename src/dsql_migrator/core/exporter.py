@@ -11,9 +11,10 @@ keeps other formats orthogonal) while guaranteeing the source is only ever read.
 Pipeline for one table:
 
 1. PK keyset streaming (not OFFSET): rows are read in ascending primary-key
-   order with ``WHERE pk > :last ORDER BY pk LIMIT :batch_size`` (single key) or a
-   row-value tuple comparison ``(k1, ..., kn) > (:last_0, ..., :last_n)``
-   (composite key), carrying the last-seen primary key forward. This avoids large
+   order with ``WHERE pk > :last ORDER BY pk LIMIT :batch_size`` (single key) or an
+   explicit lexicographic disjunction ``(k0 > :last_0) OR (k0 = :last_0 AND k1 >
+   :last_1) OR ...`` (composite key, PK-index-friendly on MySQL 5.7+, unlike the
+   row-value tuple form), carrying the last-seen primary key forward. This avoids large
    ``OFFSET`` scans and yields a stable, resumable read order. Single- and
    composite-column primary keys are supported; only a missing primary key raises
    :class:`UnsupportedPrimaryKeyError` rather than being silently mishandled.
@@ -438,9 +439,10 @@ def _primary_key_columns(table: TableDef) -> list[str]:
     """Return the primary-key columns (one or more), or raise for a missing key.
 
     Keyset export streams in ascending primary-key order. A single-column key uses
-    ``pk > :last``; a composite key uses a row-value (tuple) comparison
-    ``(k1, ..., kn) > (:last_0, ..., :last_n)`` which is lexicographic and uses the
-    primary-key index, giving the same stable, resumable read order. Only a
+    ``pk > :last``; a composite key uses the explicit lexicographic disjunction
+    ``(k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR ...`` which uses the
+    primary-key index on MySQL 5.7+ (the row-value tuple form does not), giving the
+    same stable, resumable read order. Only a
     MISSING primary key is unsupported (no deterministic read order exists).
     """
     primary_key = list(table.primary_key)
@@ -463,40 +465,51 @@ class ExportCancelled(ExportError):
 
 
 # MySQL integer base types (lower-cased, display width / UNSIGNED / ZEROFILL
-# stripped before matching). Only a single integer PK can be range-sharded: its
-# values are orderable and evenly sliceable by MIN/MAX arithmetic. A composite,
-# string, or other non-integer PK is never sharded (it falls back to one reader).
+# stripped before matching). Range sharding bands the LEADING PK column: an integer
+# leading column is collation-free and evenly sliceable by MIN/MAX arithmetic, so
+# its interior boundaries are monotonic in MySQL's numeric order and the shards are
+# provably disjoint + covering. A non-integer leading column (string / UUID /
+# decimal / temporal / binary) has no such collation-free split, so it is never
+# sharded (the table falls back to a single reader -- always correct, just serial).
 _INTEGER_PK_TYPES = frozenset(
     {"tinyint", "smallint", "mediumint", "int", "integer", "bigint"}
 )
 
 
-def shardable_int_pk(table: TableDef) -> Optional[str]:
-    """Return the PK column name if ``table`` has a single integer PK, else None.
+def shardable_leading_int_pk(table: TableDef) -> Optional[str]:
+    """Return the LEADING PK column name if it is an integer type, else None.
 
-    Reader range sharding (splitting a big table into K disjoint PK ranges read
-    concurrently) only applies to a single integer primary key -- the one case
-    whose values can be evenly sliced by MIN/MAX arithmetic while still using the
-    PK index. Composite / non-integer PKs return None and use one reader.
+    Reader range sharding (splitting a big table into K disjoint ranges read
+    concurrently) bands the LEADING primary-key column. It is safe whenever that
+    leading column is an integer, for BOTH a single integer PK AND a COMPOSITE PK
+    whose first column is an integer (e.g. ``(tenant_id, id)``): integer columns are
+    collation-free, so MIN/MAX arithmetic yields interior boundaries strictly
+    increasing in MySQL's numeric comparison order -- the exact order the reader's
+    ``WHERE`` / ``ORDER BY`` use -- making the K ranges provably disjoint and
+    covering. The band is on the leading value only, so all rows sharing a leading
+    value co-locate in one shard (a composite key is never split across shards) and
+    the within-shard keyset walk still uses the full composite cursor. A non-integer
+    leading column returns None -> one reader (always correct, just not parallel).
     """
     pk = list(table.primary_key)
-    if len(pk) != 1:
+    if not pk:
         return None
-    pk_col = pk[0]
+    leading = pk[0]
     for column in table.columns:
-        if column.name == pk_col:
+        if column.name == leading:
             base = column.mysql_type.split("(")[0].strip().lower().split()[0]
-            return pk_col if base in _INTEGER_PK_TYPES else None
+            return leading if base in _INTEGER_PK_TYPES else None
     return None
 
 
 def compute_pk_shard_ranges(
     connection: _Connection, table: TableDef, shards: int
 ) -> list[tuple[Optional[int], Optional[int]]]:
-    """Return ``shards`` half-open ``[lo, hi)`` PK ranges covering the whole table.
+    """Return ``shards`` half-open ``[lo, hi)`` ranges over the LEADING PK column.
 
-    Reads ``MIN(pk)`` / ``MAX(pk)`` (index-only, read-only, Property 1) for the
-    single integer PK and splits ``[min, max]`` into ``shards`` contiguous slices.
+    Reads ``MIN`` / ``MAX`` (index-only, read-only, Property 1) of the LEADING PK
+    column -- when it is an integer (single or composite-leading) -- and splits
+    ``[min, max]`` into ``shards`` contiguous slices.
     The first range's ``lo`` is ``None`` (open start) and the last range's ``hi``
     is ``None`` (open end) so the union is guaranteed to cover every row -- even
     rows inserted outside the sampled [min,max] between this call and the read
@@ -510,7 +523,7 @@ def compute_pk_shard_ranges(
     (one hot shard, near-empty others) so the speedup is less than K -- it never
     hurts correctness (ranges stay disjoint + covering), only balance.
     """
-    pk_col = shardable_int_pk(table)
+    pk_col = shardable_leading_int_pk(table)
     if pk_col is None or shards <= 1:
         return [(None, None)]
     quoted_col = _quote_mysql_identifier(pk_col)
@@ -572,13 +585,16 @@ def keyset_stream(
     the next ``SELECT``, so a cooperative stop interrupts the read promptly rather
     than only between load batches.
 
-    ``pk_lower`` / ``pk_upper`` (optional, **single integer PK only**) bound the
-    read to the half-open PK range ``[pk_lower, pk_upper)`` — the mechanism behind
+    ``pk_lower`` / ``pk_upper`` (optional) bound the read to the half-open range
+    ``[pk_lower, pk_upper)`` on the **LEADING** PK column — the mechanism behind
     reader range sharding, where K readers each stream a disjoint slice of a large
-    table concurrently. The bound composes with the keyset cursor (``pk >= :lo AND
-    pk < :hi``), still uses the PK index, and preserves ascending-PK order within
-    the slice. ``pk_upper=None`` means "to the end" (the last shard); ``pk_lower=
-    None`` means "from the start" (the first shard). Ignored for composite keys.
+    table concurrently. It applies to a single OR composite key (sharding sets it
+    only for an INTEGER leading column): for a composite key the leading-column band
+    ANDs with the disjunction cursor below, so every row sharing a leading value
+    stays in one slice (a composite key is never split). The bound uses the PK index
+    (leading column is the index prefix) and preserves ascending-PK order within the
+    slice. ``pk_upper=None`` means "to the end" (the last shard); ``pk_lower=None``
+    means "from the start" (the first shard).
     """
     if batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
@@ -592,11 +608,15 @@ def keyset_stream(
     table_sql = _quote_mysql_table(table.name)
     order_by_sql = ", ".join(_quote_mysql_identifier(c) for c in pk_columns)
 
-    # Optional PK-range bound (reader sharding). Only meaningful for a single
-    # integer PK; a composite key ignores it (sharding never enables it there).
+    # Optional range bound on the LEADING PK column (reader sharding). Applies to a
+    # single OR composite key: for a composite key it bands the leading (index-prefix)
+    # column and ANDs with the disjunction cursor below, so every row sharing a leading
+    # value stays in ONE shard (a composite key is never split across shards). Sharding
+    # only sets these for an INTEGER leading column (shardable_leading_int_pk), whose
+    # numeric-order boundaries keep the K ranges disjoint + covering.
     range_params: dict[str, object] = {}
     range_clauses: list[str] = []
-    if len(pk_columns) == 1 and (pk_lower is not None or pk_upper is not None):
+    if pk_lower is not None or pk_upper is not None:
         pk_sql_bound = _quote_mysql_identifier(pk_columns[0])
         if pk_lower is not None:
             range_clauses.append(f"{pk_sql_bound} >= :pk_lower")
@@ -770,7 +790,7 @@ class TableExporter:
         tables don't justify the extra connections/snapshots). Called once per
         table before the shard readers open their own snapshots.
         """
-        if shards <= 1 or shardable_int_pk(table) is None:
+        if shards <= 1 or shardable_leading_int_pk(table) is None:
             return [(None, None)]
         engine = self._engine_factory(conn)
         try:

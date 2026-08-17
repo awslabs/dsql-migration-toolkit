@@ -42,7 +42,7 @@ from dsql_migrator.core.exporter import (
     compute_pk_shard_ranges,
     export_rows,
     keyset_stream,
-    shardable_int_pk,
+    shardable_leading_int_pk,
 )
 from dsql_migrator.core.introspector import is_write_or_ddl
 from dsql_migrator.core.models import ColumnDef, SourceConnectionConfig, TableDef
@@ -135,9 +135,10 @@ class _FakeConnection:
                     row
                     for row in self._rows
                     if tuple(row[c] for c in self._pk_cols) > last_key
+                    and _in_range(row)  # leading-column shard band (composite too)
                 ]
             else:
-                candidates = list(self._rows)
+                candidates = [row for row in self._rows if _in_range(row)]
         page = candidates[:limit] if limit is not None else candidates
         return _FakeResult(page)
 
@@ -344,7 +345,7 @@ def test_keyset_stream_rejects_missing_primary_key() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_shardable_int_pk_accepts_single_integer_pk() -> None:
+def test_shardable_leading_int_pk_accepts_single_and_composite_int_leading() -> None:
     # A single integer PK is shardable; the helper returns its column name.
     for mysql_type in ("INT", "BIGINT", "int(11)", "SMALLINT UNSIGNED", "MEDIUMINT"):
         table = TableDef(
@@ -352,25 +353,47 @@ def test_shardable_int_pk_accepts_single_integer_pk() -> None:
             columns=[ColumnDef(name="id", mysql_type=mysql_type)],
             primary_key=["id"],
         )
-        assert shardable_int_pk(table) == "id", mysql_type
-
-
-def test_shardable_int_pk_rejects_composite_and_non_integer() -> None:
+        assert shardable_leading_int_pk(table) == "id", mysql_type
+    # A COMPOSITE PK whose LEADING column is an integer shards on that leading column,
+    # regardless of the trailing columns' types (they never enter the boundary math).
     composite = TableDef(
         name="c",
         columns=[
-            ColumnDef(name="a", mysql_type="INT"),
-            ColumnDef(name="b", mysql_type="INT"),
+            ColumnDef(name="tenant_id", mysql_type="INT"),
+            ColumnDef(name="created", mysql_type="DATETIME(6)"),
+            ColumnDef(name="sku", mysql_type="VARCHAR(64)"),
         ],
-        primary_key=["a", "b"],
+        primary_key=["tenant_id", "created", "sku"],
+    )
+    assert shardable_leading_int_pk(composite) == "tenant_id"
+
+
+def test_shardable_leading_int_pk_rejects_non_integer_leading_and_no_pk() -> None:
+    # A composite PK whose LEADING column is NOT an integer -> single reader (the
+    # leading string/decimal has no collation-free arithmetic split).
+    non_int_leading = TableDef(
+        name="c",
+        columns=[
+            ColumnDef(name="uid", mysql_type="VARCHAR(36)"),
+            ColumnDef(name="seq", mysql_type="INT"),
+        ],
+        primary_key=["uid", "seq"],
     )
     string_pk = TableDef(
         name="s",
         columns=[ColumnDef(name="uid", mysql_type="VARCHAR(36)")],
         primary_key=["uid"],
     )
-    assert shardable_int_pk(composite) is None
-    assert shardable_int_pk(string_pk) is None
+    decimal_pk = TableDef(
+        name="d",
+        columns=[ColumnDef(name="amount", mysql_type="DECIMAL(10,2)")],
+        primary_key=["amount"],
+    )
+    no_pk = TableDef(name="n", columns=[ColumnDef(name="x", mysql_type="INT")])
+    assert shardable_leading_int_pk(non_int_leading) is None
+    assert shardable_leading_int_pk(string_pk) is None
+    assert shardable_leading_int_pk(decimal_pk) is None
+    assert shardable_leading_int_pk(no_pk) is None
 
 
 def test_compute_pk_shard_ranges_splits_min_max_into_half_open_ranges() -> None:
@@ -458,17 +481,42 @@ def test_shard_range_sql_keeps_a_hostile_identifier_inside_one_quoted_name() -> 
     assert "id` DROP" not in sql
 
 
-def test_compute_pk_shard_ranges_composite_pk_is_never_sharded() -> None:
-    composite = TableDef(
-        name="c",
+def _composite_table() -> TableDef:
+    return TableDef(
+        name="events",
         columns=[
-            ColumnDef(name="a", mysql_type="INT"),
-            ColumnDef(name="b", mysql_type="INT"),
+            ColumnDef(name="tenant_id", mysql_type="INT"),
+            ColumnDef(name="id", mysql_type="BIGINT"),
         ],
-        primary_key=["a", "b"],
+        primary_key=["tenant_id", "id"],
     )
-    # Even with shards>1, a composite PK returns the single whole-table range.
-    assert compute_pk_shard_ranges(_FakeConnection([]), composite, 4) == [(None, None)]
+
+
+def test_compute_pk_shard_ranges_shards_composite_when_leading_is_integer() -> None:
+    # Composite (tenant_id INT, id BIGINT): MIN/MAX are read from the LEADING integer
+    # column and split into K half-open ranges (first lo=None, last hi=None).
+    class _MinMaxConn:
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            s = str(statement)
+            assert "MIN(" in s and "`tenant_id`" in s  # LEADING column, not the trailing id
+            return _FakeResult([{"lo": 1, "hi": 1000}])
+
+    ranges = compute_pk_shard_ranges(_MinMaxConn(), _composite_table(), 4)
+    assert len(ranges) == 4
+    assert ranges[0][0] is None and ranges[-1][1] is None
+
+    # A composite whose LEADING column is NON-integer still falls back to one reader.
+    non_int_leading = TableDef(
+        name="s",
+        columns=[
+            ColumnDef(name="uid", mysql_type="VARCHAR(36)"),
+            ColumnDef(name="id", mysql_type="INT"),
+        ],
+        primary_key=["uid", "id"],
+    )
+    assert compute_pk_shard_ranges(_FakeConnection([]), non_int_leading, 4) == [
+        (None, None)
+    ]
 
 
 def test_keyset_stream_honors_pk_range_bounds() -> None:
@@ -517,6 +565,66 @@ def test_pk_range_shards_partition_all_rows_without_overlap() -> None:
         seen.extend(got)
     assert sorted(seen) == list(range(1, 21))   # full coverage
     assert len(seen) == len(set(seen))           # no overlap
+
+
+def test_keyset_stream_composite_key_honors_leading_pk_range_bound() -> None:
+    # Composite (tenant_id, id): a shard band on the LEADING column [2, 4) yields only
+    # tenant_id 2 and 3, correctly paginated across pages, while the 5.7-safe
+    # disjunction cursor still drives the within-shard ordering.
+    rows = [{"tenant_id": t, "id": i} for t in range(1, 6) for i in range(1, 4)]
+    connection = _FakeConnection(rows, pk=("tenant_id", "id"))
+    out = list(
+        keyset_stream(
+            connection, _composite_table(),
+            batch_size=2, pk_lower=2, pk_upper=4,  # tiny batch forces multi-page
+        )
+    )
+    assert [(r["tenant_id"], r["id"]) for r in out] == [
+        (2, 1), (2, 2), (2, 3), (3, 1), (3, 2), (3, 3),
+    ]
+    # SQL shape: the leading-column band AND the explicit disjunction cursor, and NOT a
+    # row-value tuple comparison (which would lose the 5.7 PK-index range scan).
+    next_page = next(
+        s for s, _p in connection.executed if "SELECT" in s and ":last_0" in s
+    )
+    assert "`tenant_id` >= :pk_lower" in next_page
+    assert "`tenant_id` < :pk_upper" in next_page
+    assert "`tenant_id` > :last_0" in next_page       # disjunction term ...
+    assert "(`tenant_id`, `id`)" not in next_page      # ... never the row-value form
+
+
+def test_pk_range_shards_partition_composite_leading_int_without_overlap() -> None:
+    # Composite (tenant_id, id): K shards banded on the LEADING column must union to the
+    # whole table with no overlap, and every row of one tenant co-locates in one shard.
+    rows = [{"tenant_id": t, "id": i} for t in range(1, 13) for i in range(1, 4)]
+
+    class _MinMaxConn(_FakeConnection):
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            if "MIN(" in str(statement):
+                return _FakeResult([{"lo": 1, "hi": 12}])
+            return super().execute(statement, parameters)
+
+    ranges = compute_pk_shard_ranges(
+        _MinMaxConn(rows, pk=("tenant_id", "id")), _composite_table(), 3
+    )
+    assert len(ranges) == 3
+    seen: list[tuple] = []
+    shard_of_tenant: dict[int, int] = {}
+    for shard_idx, (lo, hi) in enumerate(ranges):
+        got = [
+            (r["tenant_id"], r["id"])
+            for r in keyset_stream(
+                _FakeConnection(rows, pk=("tenant_id", "id")), _composite_table(),
+                batch_size=100, pk_lower=lo, pk_upper=hi,
+            )
+        ]
+        seen.extend(got)
+        for tenant, _id in got:
+            # every row of a given tenant lands in exactly one shard
+            assert shard_of_tenant.setdefault(tenant, shard_idx) == shard_idx
+    all_rows = [(r["tenant_id"], r["id"]) for r in rows]
+    assert sorted(seen) == sorted(all_rows)  # full coverage
+    assert len(seen) == len(set(seen))       # no overlap
 
 
 def test_keyset_stream_supports_composite_primary_key() -> None:

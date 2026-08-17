@@ -5,6 +5,29 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.354
+
+### Changed
+
+- **Full Load reader sharding now parallelizes tables with a COMPOSITE primary key whose leading
+  column is an integer, not just single-integer-PK tables** (from the migration-tool architecture
+  review; scope chosen after an adversarial design/verification pass). Previously only a single
+  integer PK could be range-sharded, so a large table with e.g. a `(tenant_id, id)` composite PK
+  loaded single-threaded — contradicting the tool's billion-row-scale stance. `shardable_int_pk`
+  is generalized to `shardable_leading_int_pk`: it shards on the LEADING PK column whenever that
+  column is an integer, for both single and composite PKs, and `keyset_stream` now applies the
+  leading-column range bound (`>= :lo AND < :hi`) for composite keys too (ANDed with the existing
+  5.7-safe lexicographic disjunction cursor, which is unchanged). Correctness is provable and was
+  adversarially verified: integer columns are collation-free, so MIN/MAX arithmetic yields interior
+  boundaries strictly increasing in MySQL's numeric order → the K shard ranges are disjoint and
+  covering, and because the band is on the leading value only, every row sharing a leading value
+  co-locates in one shard (a composite key is never split). Boundary derivation stays scan-free
+  (one `MIN`/`MAX` on the leading column). A NON-integer leading column (string / UUID / decimal /
+  temporal / binary) intentionally stays a single reader: those orderings are collation-dependent
+  (a case/accent-insensitive collation's order ≠ byte order, and design verification found real
+  overlap/gap/crash hazards in string/timestamp boundary schemes), and the single-reader fallback
+  is always correct — just not parallel. Single-integer-PK behavior is unchanged.
+
 ## v0.1.353
 
 ### Fixed
