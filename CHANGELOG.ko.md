@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.360
+
+### Added
+
+- **(내부용, 아직 사용자 비노출) 전여정 상시 AI 어시스턴트 패널의 기반.** AI 경험 개편의 첫 증분(화면마다
+  따로 뜨고 열 때마다 초기화되던 5개 채팅 → 여정 내내 상주하며 대화가 유지되는 패널 1개):
+  세션 기반 대화 모델(`SessionConnectionState.ai_conversation`의 `AiConversation`/`AiScope`/
+  `MigrationContext`) + `ui/ai_panel.py` 컴포넌트 — 세션에서 렌더하는 Cloudscape 스타일 우측 드로어(그래서
+  트랜스크립트·열림상태가 열고닫기·단계이동·브라우저 새로고침에도 유지), 답변 스트리밍, `open_scope`로
+  주제별 딥링크(scope 전환 시 구분선, 스트리머는 현재 scope 턴만으로 그라운딩하고 전체 트랜스크립트는
+  스크롤백으로 유지). 자격증명 무포함(Property 7), advisory·결정적 우선. 아직 셸/화면에 배선되지 않았고
+  (헤더 토글·우측 드로어·5개 화면 이관·옛 드로어 은퇴는 후속), 이번 릴리스에 사용자 동작 변화는 없음.
+
 ## v0.1.359
 
 ### Changed

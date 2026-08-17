@@ -1092,6 +1092,61 @@ class AiAssistConfig(BaseModel):
     )
 
 
+class AiScope(BaseModel):
+    """The current subject of the persistent AI assistant panel.
+
+    A "scope" is what the assistant is grounded on right now -- a specific object,
+    a validation result, a Full Load failure, etc. It carries only display metadata
+    (labels the panel shows) and a stable ``scope_id`` used to detect when the user
+    deep-links into a NEW subject (so the panel inserts a divider). It holds NO
+    credentials and NO row data (Property 7); the streamer that actually answers is
+    a live callable held by the panel, not persisted here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope_id: str = Field(min_length=1)
+    title: str = ""
+    subtitle: str = ""
+    chip: str = ""
+
+
+class AiConversation(BaseModel):
+    """The persistent AI assistant transcript for one UI session.
+
+    This is the SOURCE OF TRUTH the panel renders from, held on the session state
+    (server-side, keyed by the cookie-stable session id), so the conversation
+    survives closing/reopening the panel, navigating between steps, and a browser
+    refresh/reconnect. It is NOT durably persisted (in-memory only) and holds no
+    credentials or row data (Property 7). ``messages`` is the running transcript
+    (``{"role", "content"}`` turns); ``active_scope`` is the current subject;
+    ``visible`` is whether the panel is open. Cleared only by Start over
+    (``SessionConnectionState.clear``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    messages: list[dict] = Field(default_factory=list)
+    active_scope: Optional[AiScope] = None
+    visible: bool = False
+
+
+class MigrationContext(BaseModel):
+    """A credential-free snapshot of where the migration is, for the AI panel.
+
+    Phase 1 uses this only for the panel's baseline context chip ("what the
+    assistant can see right now") and as the foundation for later cross-step
+    grounding. It is assembled by the shell from deterministic session/workflow
+    state and carries NO credentials or row data (Property 7).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    current_step: str = ""
+    migration_type: str = ""
+    summary: str = ""
+
+
 class AiConversionSuggestion(BaseModel):
     """A reviewable AI conversion suggestion for one MANUAL/UNSUPPORTED object.
 

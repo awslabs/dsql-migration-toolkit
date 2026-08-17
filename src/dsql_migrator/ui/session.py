@@ -24,6 +24,7 @@ from typing import Optional
 from dsql_migrator.config import SecretValue
 from dsql_migrator.core.models import (
     AiAssistConfig,
+    AiConversation,
     SourceConnectionConfig,
     TargetConnectionConfig,
     WorkflowState,
@@ -55,6 +56,7 @@ class SessionConnectionState:
         "_workflow_unlocked",
         "workflow",
         "ai_assist",
+        "ai_conversation",
         "aws_profile",
         "active_view",
         "_migration_type",
@@ -105,6 +107,12 @@ class SessionConnectionState:
         # user enables it the workflow runs the deterministic-only path
         # (Requirements 11.1, 11.2).
         self.ai_assist: AiAssistConfig = AiAssistConfig()
+        # Persistent AI-assistant transcript + panel state for this session. The
+        # panel renders FROM this object, so the conversation survives closing/
+        # reopening the panel, navigating between steps, and a browser refresh (the
+        # session id is cookie-stable). In-memory only; credential-free (Property 7).
+        # Cleared by clear() (Start over) only.
+        self.ai_conversation: AiConversation = AiConversation()
         # Optional single global AWS named profile applied to ALL AWS clients
         # (DSQL token gen, Secrets Manager, Bedrock-runtime). Only the non-secret
         # profile NAME is held; None means the standard AWS credential chain is
@@ -352,6 +360,9 @@ class SessionConnectionState:
         self._workflow_unlocked = False
         self.workflow = WorkflowState()
         self.ai_assist = AiAssistConfig()
+        # Start over discards the AI transcript too: a fresh journey starts a fresh
+        # conversation (a stale prior chat would be confusing).
+        self.ai_conversation = AiConversation()
         self.aws_profile = None
         self.active_view = None
         self._migration_type = "full_load_only"

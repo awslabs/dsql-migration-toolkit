@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.360
+
+### Added
+
+- **(Internal, not yet user-visible) Foundation for a persistent, app-wide AI assistant panel.**
+  First increment of the AI-experience overhaul (moving from five per-screen chat dialogs that reset
+  on every open to one always-available panel whose conversation persists across the whole journey):
+  a session-backed conversation model (`AiConversation` / `AiScope` / `MigrationContext` on
+  `SessionConnectionState.ai_conversation`) and the `ui/ai_panel.py` component — a Cloudscape-styled
+  right drawer that renders FROM the session (so the transcript + open/closed state survive closing/
+  reopening the panel, navigating between steps, and a browser refresh), streams replies, and
+  deep-links per subject via `open_scope` (divider on scope change; the streamer is grounded on the
+  current scope's turns only, while the full transcript stays visible as scrollback). Credential-free
+  (Property 7); advisory/deterministic-first. NOT yet wired into the shell or the screens — that
+  cutover (header toggle, right drawer, migrating the five screens, retiring the old drawer) lands in
+  a follow-up. No user-facing behavior change in this release.
+
 ## v0.1.359
 
 ### Changed
