@@ -39,12 +39,25 @@ from dsql_migrator.core.models import (
     ValidationMode,
     Watermark,
 )
+from dsql_migrator.core.validation_sql import (
+    _mysql_row_token,
+    _pg_row_token,
+)
 from dsql_migrator.core.validator import (
     ValidationCancelled,
     Validator,
+    _source_checksum,
+    _source_checksum_keyset,
+    _target_checksum,
+    _target_checksum_keyset,
     build_mysql_checksum_sql,
+    build_mysql_page_checksum_first_sql,
+    build_mysql_page_checksum_next_sql,
+    build_mysql_pk_token_sql,
     build_orphan_count_sql,
     build_pg_checksum_sql,
+    build_pg_page_checksum_first_sql,
+    build_pg_page_checksum_next_sql,
 )
 
 FIXED_NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
@@ -122,6 +135,26 @@ class _FakeSourceConnection:
             if isinstance(self._gtid, Exception):
                 raise self._gtid
             return _FakeScalarResult(self._gtid)
+        # The paged checksum: "SELECT COALESCE(SUM(page_tok), 0), MAX(page_pk),
+        # COUNT(*) FROM (... LIMIT :page) ckpage" -- returns ONE (sub_sum, last_pk,
+        # count) row. Matched BEFORE every other branch: it contains MD5(/CONV(, AS
+        # PAGE_PK/AS PAGE_TOK, and COUNT(*), which would otherwise misroute it. The
+        # whole configured checksum lands on the first page (later pages contribute
+        # 0), so the validator's per-page accumulation reproduces the total exactly.
+        if "SUM(PAGE_TOK)" in upper:
+            table = _last_backtick_table(sql_text)
+            window = _keyset_page(
+                self._pk_sets.get(table, []),
+                last=params.get("last"),
+                page=int(params.get("page", 0)),
+            )
+            last_pk = window[-1][0] if window else None
+            sub_sum = (
+                int(self._checksums.get(table, 0))
+                if params.get("last") is None
+                else 0
+            )
+            return _FakeRowsResult([(sub_sum, last_pk, len(window))])
         # The pk-token query also contains MD5(/CONV(, so it MUST be matched BEFORE
         # the checksum branch (it returns (pk, token) ROWS, not a scalar).
         if "AS TOK" in upper and "AS PK" in upper:
@@ -187,6 +220,10 @@ class _FakeTargetCursor:
     def fetchone(self) -> Optional[tuple]:
         if self._result is None or isinstance(self._result, list):
             return None
+        # A multi-column aggregate (the paged checksum) is already a row tuple; a
+        # scalar result is wrapped so callers can read it as row[0].
+        if isinstance(self._result, tuple):
+            return self._result
         return (self._result,)
 
     def fetchall(self) -> list[tuple]:
@@ -244,6 +281,23 @@ class _FakeTargetConnection:
         if "NOT EXISTS" in text:
             child = _orphan_child_table(text)
             return self._orphans.get(child, 0)
+        # The paged checksum: returns ONE (sub_sum, last_pk, count) ROW (via
+        # fetchone). Matched FIRST because it also contains md5(/AS page_tok/COUNT(*),
+        # which would otherwise misroute it. Whole checksum on the first page (later
+        # pages 0) so the validator's per-page accumulation reproduces the total.
+        if "SUM(page_tok)" in text:
+            window = _keyset_page(
+                self._pk_sets.get(table, []),
+                last=params.get("last"),
+                page=_limit_in(text),
+            )
+            last_pk = window[-1][0] if window else None
+            sub_sum = (
+                int(self._checksums.get(table, 0))
+                if params.get("last") is None
+                else 0
+            )
+            return (sub_sum, last_pk, len(window))
         # The pk-token query also contains md5(, so match it BEFORE the checksum
         # branch; it returns a row LIST (consumed via fetchall), not a scalar.
         if "AS tok" in text and "AS pk" in text:
@@ -759,6 +813,151 @@ def test_deliberate_data_mismatch_with_equal_counts_is_not_a_match() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Bounded page-checksum (CHECKSUM avoids DSQL's 300s single-scan limit)
+# ---------------------------------------------------------------------------
+
+
+def test_page_checksum_shares_the_whole_table_row_token() -> None:
+    # The paged builder MUST sum the exact same per-row token as the whole-table
+    # checksum (and the row-diff sample) -- a drift would silently mismatch.
+    table = _typed_table("t")
+    mysql_token = _mysql_row_token(table)
+    assert f"COALESCE(SUM({mysql_token}), 0)" in build_mysql_checksum_sql(table)
+    assert f"{mysql_token} AS page_tok" in build_mysql_page_checksum_first_sql(table, "id")
+    assert f"{mysql_token} AS tok" in build_mysql_pk_token_sql(table, "id")
+
+    pg_token = _pg_row_token(table).as_string(None)
+    assert pg_token in build_pg_checksum_sql(table).as_string(None)
+    assert pg_token in build_pg_page_checksum_first_sql(table, "id", 5000).as_string(None)
+
+
+def test_pg_page_checksum_sql_is_keyset_bounded_and_qualified() -> None:
+    first = build_pg_page_checksum_first_sql(_table("orders"), "id", 500).as_string(None)
+    nxt = build_pg_page_checksum_next_sql(_table("orders"), "id", 500).as_string(None)
+    for part in ("SUM(page_tok)", "MAX(page_pk)", "COUNT(*)", "LIMIT 500"):
+        assert part in first and part in nxt
+    assert "WHERE" not in first  # the first page carries no keyset predicate
+    assert '"id" > %(last)s' in nxt  # subsequent pages are keyset+parameterized
+    # schema-qualified name splits to "schema"."table", never one quoted identifier
+    q = build_pg_page_checksum_first_sql(_table("app.orders"), "id", 10).as_string(None)
+    assert '"app"."orders"' in q
+
+
+def test_mysql_page_checksum_sql_is_keyset_bounded_and_qualified() -> None:
+    first = build_mysql_page_checksum_first_sql(_table("orders"), "id")
+    nxt = build_mysql_page_checksum_next_sql(_table("orders"), "id")
+    for part in ("SUM(page_tok)", "MAX(page_pk)", "COUNT(*)", "LIMIT :page"):
+        assert part in first and part in nxt
+    assert "WHERE" not in first
+    assert "WHERE `id` > :last" in nxt
+    assert "`app`.`orders`" in build_mysql_page_checksum_first_sql(_table("app.orders"), "id")
+
+
+class _PagedTargetCursor:
+    def __init__(self, owner: "_PagedTargetConn") -> None:
+        self._owner = owner
+        self._row: Optional[tuple] = None
+
+    def execute(self, statement: Any, parameters: Any = None) -> None:
+        text = statement if isinstance(statement, str) else statement.as_string(None)
+        self._owner.executed.append((text, parameters))
+        self._row = self._owner.pages.pop(0) if self._owner.pages else None
+
+    def fetchone(self) -> Optional[tuple]:
+        return self._row
+
+    def close(self) -> None:
+        pass
+
+
+class _PagedTargetConn:
+    """A target conn returning scripted ``(sub_sum, last_pk, count)`` rows per page."""
+
+    def __init__(self, pages: list[tuple]) -> None:
+        self.pages = list(pages)
+        self.executed: list[tuple] = []
+
+    def cursor(self) -> _PagedTargetCursor:
+        return _PagedTargetCursor(self)
+
+
+class _PagedSourceConn:
+    """A source conn returning one scripted ``(sub_sum, last_pk, count)`` row per page."""
+
+    def __init__(self, pages: list[tuple]) -> None:
+        self.pages = list(pages)
+        self.executed: list[tuple] = []
+
+    def execute(self, statement: object, parameters: object = None) -> _FakeRowsResult:
+        self.executed.append((str(statement), parameters or {}))
+        row = self.pages.pop(0) if self.pages else None
+        return _FakeRowsResult([row] if row is not None else [])
+
+
+def test_target_checksum_keyset_accumulates_subsums_and_advances_keyset() -> None:
+    # Three pages summing 100+200+50 = 350; the last page (count 2 < page 3) ends it.
+    conn = _PagedTargetConn([(100, 10, 3), (200, 20, 3), (50, 25, 2)])
+    total = _target_checksum_keyset(conn, _table("orders"), "id", 3)
+    assert total == "350"
+    # Genuinely paged: three statements, keyset-advanced by MAX(page_pk).
+    assert len(conn.executed) == 3
+    assert conn.executed[0][1] is None                 # first page: no keyset bound
+    assert conn.executed[1][1] == {"last": 10}         # advanced by page-1 last_pk
+    assert conn.executed[2][1] == {"last": 20}         # advanced by page-2 last_pk
+    assert "WHERE" not in conn.executed[0][0]
+    assert "WHERE" in conn.executed[1][0]
+
+
+def test_source_checksum_keyset_accumulates_subsums_and_advances_keyset() -> None:
+    conn = _PagedSourceConn([(100, 10, 3), (200, 20, 3), (50, 25, 2)])
+    total = _source_checksum_keyset(conn, _table("orders"), "id", 3)
+    assert total == "350"
+    assert len(conn.executed) == 3
+    assert conn.executed[0][1] == {"page": 3}
+    assert conn.executed[1][1] == {"last": 10, "page": 3}
+    assert conn.executed[2][1] == {"last": 20, "page": 3}
+
+
+def test_page_checksum_empty_table_is_zero() -> None:
+    # A COALESCE(SUM,0)=0 first page with count 0 terminates at "0" (matches the
+    # whole-table empty-table checksum), and a truly empty result set does too.
+    assert _target_checksum_keyset(_PagedTargetConn([(0, None, 0)]), _table("t"), "id", 3) == "0"
+    assert _target_checksum_keyset(_PagedTargetConn([]), _table("t"), "id", 3) == "0"
+    assert _source_checksum_keyset(_PagedSourceConn([(0, None, 0)]), _table("t"), "id", 3) == "0"
+
+
+def test_checksum_composite_pk_falls_back_to_single_scan() -> None:
+    # A composite/missing PK has no single keyset column, so both sides keep the
+    # whole-table single scan (never a paged SUM(page_tok) statement).
+    composite = _table("t", columns=("a", "b"), primary_key=("a", "b"))
+    target = _FakeTargetConnection(counts={"t": 1}, checksums={"t": "42"})
+    source = _FakeSourceConnection(counts={"t": 1}, checksums={"t": "42"})
+    assert _target_checksum(target, composite, 3) == "42"
+    assert _source_checksum(source, composite, 3) == "42"
+    assert not any("SUM(page_tok)" in s for s in target.executed)
+    assert not any("SUM(PAGE_TOK)" in s.upper() for s in source.executed)
+
+
+def test_checksum_is_paged_end_to_end_over_multiple_pages() -> None:
+    # A 5-row table with page size 2 pages the checksum (3 statements per side),
+    # NEVER a single unbounded scan, and still matches when the data is equal.
+    source = _FakeSourceConnection(counts={"orders": 5}, checksums={"orders": "777"})
+    target = _FakeTargetConnection(counts={"orders": 5}, checksums={"orders": "777"})
+    report = _reconciling_validator(source, target).validate(
+        _SOURCE_CONFIG, _TARGET_CONFIG, [_table("orders")], ValidationMode.CHECKSUM
+    )
+    item = report.items[0]
+    assert item.checksum_match is True
+    assert item.source_checksum == "777" and item.target_checksum == "777"
+    # Paged, not a single whole-table SELECT SUM(...) scan (would be 1 statement).
+    assert sum("SUM(page_tok)" in s for s in target.executed) == 3
+    assert sum("SUM(PAGE_TOK)" in s.upper() for s in source.executed) == 3
+    # The whole-table single-scan checksum SQL is NOT issued for a single-PK table.
+    assert not any(build_pg_checksum_sql(_table("orders")).as_string(None) == s
+                   for s in target.executed)
+
+
+# ---------------------------------------------------------------------------
 # Dev row-level diff sample (row_diff_sample_size > 0)
 # ---------------------------------------------------------------------------
 
@@ -817,8 +1016,8 @@ def test_row_diff_off_by_default_issues_no_pk_token_query() -> None:
 
 def test_row_diff_skipped_for_matched_table() -> None:
     # A matched table never triggers a diff query even when the sample size > 0.
-    source = _FakeSourceConnection(counts={"orders": 2}, checksums={"orders": "x"})
-    target = _FakeTargetConnection(counts={"orders": 2}, checksums={"orders": "x"})
+    source = _FakeSourceConnection(counts={"orders": 2}, checksums={"orders": "7"})
+    target = _FakeTargetConnection(counts={"orders": 2}, checksums={"orders": "7"})
     report = _validator_diff(source, target, 50).validate(
         _SOURCE_CONFIG, _TARGET_CONFIG, [_table("orders")], ValidationMode.CHECKSUM
     )
@@ -865,11 +1064,11 @@ def test_validation_soundness_invariant_over_mixed_tables() -> None:
     """When is_match is True, every table's counts AND checksums are truly equal."""
     source = _FakeSourceConnection(
         counts={"orders": 2, "items": 9},
-        checksums={"orders": "abc", "items": "def"},
+        checksums={"orders": "171", "items": "456"},
     )
     target = _FakeTargetConnection(
         counts={"orders": 2, "items": 9},
-        checksums={"orders": "abc", "items": "def"},
+        checksums={"orders": "171", "items": "456"},
     )
 
     report = _validator(source, target).validate(

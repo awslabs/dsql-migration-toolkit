@@ -5,6 +5,32 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.355
+
+### Changed
+
+- **Validation now computes the CHECKSUM over bounded keyset PK pages instead of one whole-table
+  `SELECT SUM(...)` scan, so a large table can actually produce a checksum on Aurora DSQL** (from
+  the perf/stability review). The per-table checksum was the last unbounded full scan on the
+  validation path (row counts and PK reconciliation are already keyset-paged): a single
+  `SELECT SUM(md5-prefix) FROM table` over a big table exceeds DSQL's hard ~300s per-transaction
+  limit, so the checksum could never complete and CHECKSUM-mode validation of a large table was
+  effectively impossible. The per-row checksum token is now factored out (`_mysql_row_token` /
+  `_pg_row_token`, shared by the whole-table checksum, the row-diff sample, and the new page
+  builders so they can never drift) and, for a single-column primary key, each engine sums the
+  token over one `WHERE pk > :last ORDER BY pk LIMIT N` page at a time and accumulates the per-page
+  sub-sums in Python. Because the token is per-row and `SUM` is order-independent, and a
+  single-column PK partitions the rows into disjoint covering pages, the accumulated total equals
+  the whole-table checksum exactly — while every statement stays well under the 300s limit and
+  memory stays at one page. The DSQL side composes with the v0.1.353 reconnecting proxy (a page
+  that hits the ~1h connection age limit replays from its last PK). The MySQL side is paged the
+  same way so both engines accumulate identically (each returns the integer total, so a paged side
+  is never compared against a whole-scanned side) and no single unbounded `SUM` statement runs; it
+  stays within validation's existing per-table `START TRANSACTION WITH CONSISTENT SNAPSHOT`, so
+  paging does not change what snapshot the source checksum sees. A composite/missing primary key
+  keeps the whole-table single-scan fallback (a documented residual, like the composite-PK
+  `COUNT(*)`); MySQL has no per-statement limit so its fallback is safe.
+
 ## v0.1.354
 
 ### Changed

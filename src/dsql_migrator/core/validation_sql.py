@@ -305,6 +305,49 @@ def _pg_checksum_expr(column: "ColumnDef") -> "Optional[sql.Composed]":
 # ---------------------------------------------------------------------------
 
 
+def _mysql_row_token(table: TableDef) -> str:
+    """MySQL per-row checksum token: the integer value of the first
+    ``_CHECKSUM_HEX_DIGITS`` MD5 hex digits over the row's rendered column values.
+
+    This is the SINGLE definition of the per-row token that both the whole-table
+    checksum (:func:`build_mysql_checksum_sql`), the row-diff sample
+    (:func:`build_mysql_pk_token_sql`), and the bounded page checksum
+    (:func:`build_mysql_page_checksum_first_sql`) reduce over -- factored out so a
+    paged sub-sum can never drift from the whole-table sum (a drift would silently
+    mismatch checksums). FLOAT/DOUBLE and JSON columns are omitted (no byte-identical
+    cross-engine text form); an all-omitted table falls back to a constant sentinel.
+    """
+    rendered = [_mysql_checksum_expr(column) for column in table.columns]
+    columns = ", ".join(
+        _mysql_concat_term(expr) for expr in rendered if expr is not None
+    )
+    if not columns:
+        columns = f"'{_NULL_SENTINEL}'"
+    return (
+        "CAST(CONV(SUBSTRING(MD5(CONCAT_WS('|', "
+        f"{columns})), 1, {_CHECKSUM_HEX_DIGITS}), 16, 10) AS DECIMAL(65, 0))"
+    )
+
+
+def _pg_row_token(table: TableDef) -> "sql.Composed":
+    """PostgreSQL per-row checksum token -- the byte-identical counterpart of
+    :func:`_mysql_row_token` (same MD5-prefix reduction as a positive ``bigint``).
+
+    The single definition shared by :func:`build_pg_checksum_sql`,
+    :func:`build_pg_pk_token_sql`, and the paged :func:`build_pg_page_checksum_first_sql`.
+    """
+    rendered_pg = [_pg_checksum_expr(column) for column in table.columns]
+    terms = [_pg_concat_term(expr) for expr in rendered_pg if expr is not None]
+    if not terms:
+        terms = [sql.Literal(_NULL_SENTINEL)]
+    column_terms = sql.SQL(", ").join(terms)
+    digits = sql.Literal(_CHECKSUM_HEX_DIGITS)
+    return sql.SQL(
+        "('x' || lpad(substr(md5(concat_ws('|', {terms})), 1, {digits}), 16, '0'))"
+        "::bit(64)::bigint"
+    ).format(terms=column_terms, digits=digits)
+
+
 def build_mysql_checksum_sql(table: TableDef) -> str:
     """Build an order-independent MySQL checksum query for ``table`` (read-only).
 
@@ -317,19 +360,9 @@ def build_mysql_checksum_sql(table: TableDef) -> str:
     FLOAT/DOUBLE and JSON columns are omitted (``_mysql_checksum_expr`` returns
     ``None`` -- neither has a byte-identical cross-engine text form).
     """
-    rendered = [_mysql_checksum_expr(column) for column in table.columns]
-    columns = ", ".join(
-        _mysql_concat_term(expr) for expr in rendered if expr is not None
-    )
-    # Edge case: an all-float (all-omitted) table -> one constant term so the
-    # SQL stays valid and identical on both engines (row count still catches drift).
-    if not columns:
-        columns = f"'{_NULL_SENTINEL}'"
     table_sql = _quote_mysql_table(table.name)
     return (
-        "SELECT COALESCE(SUM(CAST(CONV("
-        f"SUBSTRING(MD5(CONCAT_WS('|', {columns})), 1, {_CHECKSUM_HEX_DIGITS}), 16, 10"
-        f") AS DECIMAL(65, 0))), 0) FROM {table_sql}"
+        f"SELECT COALESCE(SUM({_mysql_row_token(table)}), 0) FROM {table_sql}"
     )
 
 
@@ -344,21 +377,9 @@ def build_pg_checksum_sql(table: TableDef) -> sql.Composed:
     never break out of the SQL (Requirement 9.4). All access is a single
     ``SELECT`` (read-only).
     """
-    rendered_pg = [_pg_checksum_expr(column) for column in table.columns]
-    terms = [
-        _pg_concat_term(expr) for expr in rendered_pg if expr is not None
-    ]
-    # Edge case: an all-float (all-omitted) table -> one constant sentinel term so
-    # the SQL stays valid and hashes identically to the MySQL side.
-    if not terms:
-        terms = [sql.Literal(_NULL_SENTINEL)]
-    column_terms = sql.SQL(", ").join(terms)
-    digits = sql.Literal(_CHECKSUM_HEX_DIGITS)
     return sql.SQL(
-        "SELECT COALESCE(SUM("
-        "('x' || lpad(substr(md5(concat_ws('|', {terms})), 1, {digits}), 16, '0'))"
-        "::bit(64)::bigint), 0) FROM {table}"
-    ).format(terms=column_terms, digits=digits, table=_pg_table_identifier(table.name))
+        "SELECT COALESCE(SUM({token}), 0) FROM {table}"
+    ).format(token=_pg_row_token(table), table=_pg_table_identifier(table.name))
 
 
 def build_mysql_pk_token_sql(table: TableDef, pk_column: str) -> str:
@@ -371,20 +392,10 @@ def build_mysql_pk_token_sql(table: TableDef, pk_column: str) -> str:
     no full materialization: the engine streams in PK order and stops at the LIMIT,
     reading only the first N rows via the primary-key index. Read-only.
     """
-    rendered = [_mysql_checksum_expr(column) for column in table.columns]
-    columns = ", ".join(
-        _mysql_concat_term(expr) for expr in rendered if expr is not None
-    )
-    # Edge case: an all-float (all-omitted) table -> one constant term (matches
-    # build_mysql_checksum_sql so the per-row token stays identical).
-    if not columns:
-        columns = f"'{_NULL_SENTINEL}'"
     pk_sql = _quote_mysql_identifier(pk_column)
     table_sql = _quote_mysql_table(table.name)
     return (
-        f"SELECT {pk_sql} AS pk, CAST(CONV("
-        f"SUBSTRING(MD5(CONCAT_WS('|', {columns})), 1, {_CHECKSUM_HEX_DIGITS}), 16, 10"
-        f") AS DECIMAL(65, 0)) AS tok FROM {table_sql} "
+        f"SELECT {pk_sql} AS pk, {_mysql_row_token(table)} AS tok FROM {table_sql} "
         f"ORDER BY {pk_sql} LIMIT :sample_size"
     )
 
@@ -398,22 +409,10 @@ def build_pg_pk_token_sql(table: TableDef, pk_column: str, sample_size: int) -> 
     so nothing can break out of the SQL (Requirement 9.4). A single read-only
     ``SELECT`` ordered by primary key and bounded by ``LIMIT`` -- no scan, no count.
     """
-    rendered_pg = [_pg_checksum_expr(column) for column in table.columns]
-    terms = [
-        _pg_concat_term(expr) for expr in rendered_pg if expr is not None
-    ]
-    # Edge case: an all-float (all-omitted) table -> one constant sentinel term
-    # (matches build_pg_checksum_sql so the per-row token stays identical).
-    if not terms:
-        terms = [sql.Literal(_NULL_SENTINEL)]
-    column_terms = sql.SQL(", ").join(terms)
-    digits = sql.Literal(_CHECKSUM_HEX_DIGITS)
     return sql.SQL(
-        "SELECT {pk} AS pk, "
-        "('x' || lpad(substr(md5(concat_ws('|', {terms})), 1, {digits}), 16, '0'))"
-        "::bit(64)::bigint AS tok FROM {table} ORDER BY {pk} LIMIT {limit}"
+        "SELECT {pk} AS pk, {token} AS tok FROM {table} ORDER BY {pk} LIMIT {limit}"
     ).format(
-        pk=sql.Identifier(pk_column), terms=column_terms, digits=digits,
+        pk=sql.Identifier(pk_column), token=_pg_row_token(table),
         table=_pg_table_identifier(table.name), limit=sql.Literal(sample_size),
     )
 
@@ -477,6 +476,87 @@ def build_pg_pk_next_page_sql(
         "ORDER BY {pk} LIMIT {limit}"
     ).format(
         pk=sql.Identifier(pk_column),
+        table=_pg_table_identifier(table.name),
+        last=sql.Placeholder("last"),
+        limit=sql.Literal(page_size),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bounded keyset page-checksum SQL builders (single-column PK, streaming)
+# ---------------------------------------------------------------------------
+#
+# The whole-table checksum is ONE ``SELECT SUM(md5-prefix) FROM table`` -- a single
+# unbounded scan that, on a large table, exceeds Aurora DSQL's hard 300s transaction
+# limit, so a big table could never produce a checksum. These builders sum the SAME
+# per-row token over one keyset page at a time (``WHERE pk > :last ORDER BY pk LIMIT
+# N`` -- the same keyset stream reconciliation uses); the caller accumulates the
+# per-page sub-sums in Python. Because the token is per-row and SUM is
+# order-independent, the accumulated total EQUALS the whole-table checksum exactly,
+# while every statement stays bounded (one page) and memory stays at one row. Each
+# page returns ``(sub_sum, last_pk, row_count)``: ``sub_sum`` folds into the running
+# total, ``MAX(page_pk)`` is the next keyset boundary, and ``COUNT(*) < N`` signals the
+# last page. Limited to a single-column PK (a self-consistent ascending order per
+# engine); a composite/missing PK keeps the whole-table single-scan fallback.
+
+
+def build_mysql_page_checksum_first_sql(table: TableDef, pk_column: str) -> str:
+    """First keyset page of the MySQL checksum: ``(sub_sum, last_pk, row_count)``."""
+    pk_sql = _quote_mysql_identifier(pk_column)
+    table_sql = _quote_mysql_table(table.name)
+    return (
+        "SELECT COALESCE(SUM(page_tok), 0), MAX(page_pk), COUNT(*) FROM ("
+        f"SELECT {pk_sql} AS page_pk, {_mysql_row_token(table)} AS page_tok "
+        f"FROM {table_sql} ORDER BY {pk_sql} LIMIT :page) ckpage"
+    )
+
+
+def build_mysql_page_checksum_next_sql(table: TableDef, pk_column: str) -> str:
+    """Subsequent keyset page of the MySQL checksum after ``:last`` (ascending)."""
+    pk_sql = _quote_mysql_identifier(pk_column)
+    table_sql = _quote_mysql_table(table.name)
+    return (
+        "SELECT COALESCE(SUM(page_tok), 0), MAX(page_pk), COUNT(*) FROM ("
+        f"SELECT {pk_sql} AS page_pk, {_mysql_row_token(table)} AS page_tok "
+        f"FROM {table_sql} WHERE {pk_sql} > :last ORDER BY {pk_sql} LIMIT :page) ckpage"
+    )
+
+
+def build_pg_page_checksum_first_sql(
+    table: TableDef, pk_column: str, page_size: int
+) -> sql.Composed:
+    """First keyset page of the PostgreSQL/DSQL checksum: ``(sub_sum, last_pk, count)``.
+
+    Identifiers compose with :class:`psycopg.sql.Identifier` and the bound is a
+    :class:`psycopg.sql.Literal` so nothing can break out of the SQL (Req 9.4).
+    """
+    return sql.SQL(
+        "SELECT COALESCE(SUM(page_tok), 0), MAX(page_pk), COUNT(*) FROM ("
+        "SELECT {pk} AS page_pk, {token} AS page_tok FROM {table} "
+        "ORDER BY {pk} LIMIT {limit}) ckpage"
+    ).format(
+        pk=sql.Identifier(pk_column),
+        token=_pg_row_token(table),
+        table=_pg_table_identifier(table.name),
+        limit=sql.Literal(page_size),
+    )
+
+
+def build_pg_page_checksum_next_sql(
+    table: TableDef, pk_column: str, page_size: int
+) -> sql.Composed:
+    """Subsequent keyset page of the PostgreSQL/DSQL checksum after the ``last`` param.
+
+    The keyset value is bound as ``%(last)s`` at execute time, so a billion-row table
+    reuses one prepared statement across all pages.
+    """
+    return sql.SQL(
+        "SELECT COALESCE(SUM(page_tok), 0), MAX(page_pk), COUNT(*) FROM ("
+        "SELECT {pk} AS page_pk, {token} AS page_tok FROM {table} WHERE {pk} > {last} "
+        "ORDER BY {pk} LIMIT {limit}) ckpage"
+    ).format(
+        pk=sql.Identifier(pk_column),
+        token=_pg_row_token(table),
         table=_pg_table_identifier(table.name),
         last=sql.Placeholder("last"),
         limit=sql.Literal(page_size),

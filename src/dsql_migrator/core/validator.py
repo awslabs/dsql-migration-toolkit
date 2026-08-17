@@ -122,11 +122,15 @@ from dsql_migrator.core.validation_sql import (  # noqa: F401
     _quote_mysql_identifier,
     _quote_mysql_table,
     build_mysql_checksum_sql,
+    build_mysql_page_checksum_first_sql,
+    build_mysql_page_checksum_next_sql,
     build_mysql_pk_first_page_sql,
     build_mysql_pk_next_page_sql,
     build_mysql_pk_token_sql,
     build_orphan_count_sql,
     build_pg_checksum_sql,
+    build_pg_page_checksum_first_sql,
+    build_pg_page_checksum_next_sql,
     build_pg_pk_first_page_sql,
     build_pg_pk_next_page_sql,
     build_pg_pk_token_sql,
@@ -178,10 +182,54 @@ def _source_count(connection: _SourceConnection, table_name: str) -> int:
     return int(value) if value is not None else 0
 
 
-def _source_checksum(connection: _SourceConnection, table: TableDef) -> str:
-    """Return the source checksum for ``table`` as a string (read-only)."""
+def _source_checksum(
+    connection: _SourceConnection, table: TableDef, page_size: int
+) -> str:
+    """Return the source checksum for ``table`` as a string (read-only).
+
+    For a single-column PK the checksum is accumulated over bounded keyset pages
+    (:func:`_source_checksum_keyset`) so a billion-row source is never summed in one
+    long-held read view; a composite/missing PK keeps the single whole-table scan
+    (MySQL has no per-statement transaction limit, so the fallback is safe).
+    """
+    pk_column = single_pk_column(table)
+    if pk_column is not None:
+        return _source_checksum_keyset(connection, table, pk_column, page_size)
     value = connection.execute(text(build_mysql_checksum_sql(table))).scalar()  # type: ignore[attr-defined]
     return "0" if value is None else str(value)
+
+
+def _source_checksum_keyset(
+    connection: _SourceConnection, table: TableDef, pk_column: str, page_size: int
+) -> str:
+    """Accumulate the source checksum over bounded keyset pages (single-column PK).
+
+    Each page sums the SAME per-row token as :func:`build_mysql_checksum_sql` over
+    only ``page_size`` rows (``WHERE pk > :last ORDER BY pk LIMIT N``); the per-page
+    sub-sums are folded into a Python integer. Because the token is per-row and SUM is
+    order-independent, the accumulated total equals the whole-table checksum exactly,
+    with every statement bounded and memory at one row. Reads only the PK + token.
+    """
+    first_sql = text(build_mysql_page_checksum_first_sql(table, pk_column))
+    next_sql = text(build_mysql_page_checksum_next_sql(table, pk_column))
+    total = 0
+    last: object = None
+    while True:
+        if last is None:
+            result = connection.execute(first_sql, {"page": page_size})  # type: ignore[attr-defined]
+        else:
+            result = connection.execute(next_sql, {"last": last, "page": page_size})  # type: ignore[attr-defined]
+        row = None
+        for candidate in result:  # single (sub_sum, last_pk, count) row
+            row = candidate
+            break
+        if row is None:
+            return str(total)
+        sub_sum, last_pk, count = row[0], row[1], row[2]
+        total += int(sub_sum) if sub_sum is not None else 0
+        if count is None or int(count) < page_size:
+            return str(total)
+        last = last_pk
 
 
 def _source_pk_tokens(
@@ -440,10 +488,57 @@ def _bounded_target_count(connection: Any, table: TableDef, page_size: int) -> i
     return _target_count(connection, table.name)
 
 
-def _target_checksum(connection: Any, table: TableDef) -> str:
-    """Return the target checksum for ``table`` as a string (read-only)."""
+def _target_checksum(connection: Any, table: TableDef, page_size: int) -> str:
+    """Return the target checksum for ``table`` as a string (read-only).
+
+    For a single-column PK the checksum is accumulated over BOUNDED keyset pages
+    (:func:`_target_checksum_keyset`) so a large DSQL table never sums in one
+    transaction -- a single ``SELECT SUM(...)`` scan would exceed DSQL's hard 300s
+    transaction limit and the table could never produce a checksum. A composite/missing
+    PK falls back to the single-scan ``build_pg_checksum_sql`` (a documented residual,
+    like :func:`_target_count`).
+    """
+    pk_column = single_pk_column(table)
+    if pk_column is not None:
+        return _target_checksum_keyset(connection, table, pk_column, page_size)
     value = _target_scalar(connection, build_pg_checksum_sql(table))
     return "0" if value is None else str(value)
+
+
+def _target_checksum_keyset(
+    connection: Any, table: TableDef, pk_column: str, page_size: int
+) -> str:
+    """Accumulate the target checksum over bounded keyset pages (single-column PK).
+
+    The DSQL counterpart of :func:`_source_checksum_keyset`: each ``page_size``-row
+    page sums the SAME per-row token as :func:`build_pg_checksum_sql` (so the
+    accumulated total equals the whole-table checksum), keyset-advanced by
+    ``MAX(page_pk)`` and terminated when a page returns fewer than ``page_size`` rows.
+    Every statement stays well under DSQL's 300s limit; memory stays at one row. A
+    connection force-closed at DSQL's ~1h limit is handled by the reconnecting proxy
+    that wraps ``connection`` -- the failing page replays from its ``WHERE pk > :last``.
+    """
+    first_sql = build_pg_page_checksum_first_sql(table, pk_column, page_size)
+    next_sql = build_pg_page_checksum_next_sql(table, pk_column, page_size)
+    total = 0
+    last: object = None
+    while True:
+        cursor = connection.cursor()
+        try:
+            if last is None:
+                cursor.execute(first_sql)
+            else:
+                cursor.execute(next_sql, {"last": last})
+            row = cursor.fetchone()
+        finally:
+            _safe_close(cursor)
+        if row is None:
+            return str(total)
+        sub_sum, last_pk, count = row[0], row[1], row[2]
+        total += int(sub_sum) if sub_sum is not None else 0
+        if count is None or int(count) < page_size:
+            return str(total)
+        last = last_pk
 
 
 def _target_pk_tokens(
@@ -1182,8 +1277,12 @@ class Validator:
         checksum_match: Optional[bool] = None
         checksum_excluded_columns: list[str] = []
         if mode is ValidationMode.CHECKSUM and run_deep:
-            source_checksum = _source_checksum(source_connection, table)
-            target_checksum = _target_checksum(target_connection, table)
+            source_checksum = _source_checksum(
+                source_connection, table, self._reconcile_page_size
+            )
+            target_checksum = _target_checksum(
+                target_connection, table, self._reconcile_page_size
+            )
             checksum_match = source_checksum == target_checksum
             # Columns the checksum could not value-compare (no byte-identical
             # cross-engine text form): FLOAT/DOUBLE and JSON. Recorded so a MATCH is
@@ -1678,6 +1777,10 @@ __all__ = [
     "build_mysql_pk_next_page_sql",
     "build_pg_pk_first_page_sql",
     "build_pg_pk_next_page_sql",
+    "build_mysql_page_checksum_first_sql",
+    "build_mysql_page_checksum_next_sql",
+    "build_pg_page_checksum_first_sql",
+    "build_pg_page_checksum_next_sql",
     "build_orphan_count_sql",
     "integer_pk_column",
     "reconcile_pk_streams",
