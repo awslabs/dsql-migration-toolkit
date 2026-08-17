@@ -1147,6 +1147,7 @@ def build_schema_conversion_screen(
     assistant_factory: Optional[AiAssistantFactory] = None,
     on_continue_to_data_migration: Optional[Callable[[], None]] = None,
     cdc_active_check: Optional[Callable[[], bool]] = None,
+    open_ai_scope: Optional[Callable[..., object]] = None,
 ) -> tuple[Callable[[Callable[[], None]], None], Callable[[], None]]:
     """Build the Schema Conversion screen, returning ``(content_builder, runner)``.
 
@@ -2036,12 +2037,19 @@ def build_schema_conversion_screen(
             # only: the user reads/copies SQL and pastes it into the object's
             # editor (no auto-adopt, since a reply can contain several illustrative
             # SQL blocks that must not all be applied).
-            open_chat = build_chat_drawer(ui) if session.ai_assist.enabled else None
+            # Deep-link into the persistent app-wide AI panel when it is wired
+            # (open_ai_scope); fall back to the per-screen drawer only when it is not
+            # (e.g. tests). The fallback drawer is built only in that case.
+            open_chat = (
+                build_chat_drawer(ui)
+                if session.ai_assist.enabled and open_ai_scope is None
+                else None
+            )
 
             def open_conversion_chat(
                 object_name: str, source_ddl: str, deterministic: str
             ) -> None:
-                if open_chat is None:
+                if open_chat is None and open_ai_scope is None:
                     return
                 strategist = AssessmentStrategist(
                     session.ai_assist, aws_profile=session.aws_profile
@@ -2049,16 +2057,28 @@ def build_schema_conversion_screen(
                 system = build_conversion_chat_system(
                     object_name, source_ddl, deterministic
                 )
+                first_question = (
+                    f"How should I convert {object_name} to Aurora DSQL? "
+                    "Walk me through the DDL changes."
+                )
+                streamer = lambda messages, on_delta: strategist.stream_chat(  # noqa: E731
+                    system, messages, on_delta
+                )
+                if open_ai_scope is not None:
+                    open_ai_scope(
+                        scope_id=f"schema_conversion:{object_name}",
+                        title="AI conversion assistant",
+                        subtitle=f"{object_name}",
+                        chip=f"Schema conversion · {object_name}",
+                        seed_question=first_question,
+                        streamer=streamer,
+                    )
+                    return
                 open_chat(
                     title="AI conversion assistant",
                     subtitle=f"{object_name}",
-                    first_question=(
-                        f"How should I convert {object_name} to Aurora DSQL? "
-                        "Walk me through the DDL changes."
-                    ),
-                    streamer=lambda messages, on_delta: strategist.stream_chat(
-                        system, messages, on_delta
-                    ),
+                    first_question=first_question,
+                    streamer=streamer,
                 )
 
             with ui.card().classes("w-full"):

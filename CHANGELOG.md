@@ -5,6 +5,27 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.365
+
+### Changed
+
+- **All four remaining AI chats (Schema Conversion, Query Converter, Validation, Full Load) now open
+  into the persistent AI panel, the Evaluation intro banner was removed, and the "10 questions per
+  conversation" cap is gone.** Each screen's per-object/-table/-topic AI button now deep-links into
+  the app-wide panel (`open_ai_scope`) so the conversation lives across the whole journey — with a
+  graceful fallback to the old per-screen drawer only when the panel isn't wired (e.g. tests), so no
+  behavior change to existing tests. The redundant Evaluation intro paragraph ("Analyze the source
+  against the target … The report can be downloaded.") was removed — the journey header, the "Ready
+  to evaluate" card, and the report itself already convey it.
+- **Guardrail rearchitecture: the arbitrary per-conversation turn cap (`MAX_CHAT_TURNS = 10`) is
+  removed.** The relevance guardrail is now purely the domain-scoped system prompt (every chat is
+  pinned to this MySQL→Aurora DSQL migration and politely declines/steers back on anything
+  off-topic), and cost is bounded by CONTEXT, not turns: the strategist trims each request's
+  transcript to a character budget, so an arbitrarily long conversation still costs a bounded amount
+  per turn. A per-message input length cap and the single-in-flight-turn lock remain; replies stay
+  advisory and credential-free (Property 7). (A hard denied-topics layer via Amazon Bedrock
+  Guardrails remains available as optional future hardening.)
+
 ## v0.1.364
 
 ### Added

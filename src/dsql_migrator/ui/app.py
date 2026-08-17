@@ -198,6 +198,7 @@ def build_page(
         cdc_active_check=lambda: cdc_streaming_started(
             DATA_MIGRATION_STORE.get_or_create(session_id), JOB_MANAGER
         ),
+        open_ai_scope=_open_ai_scope,
     )
     # Data Migration is a single step with an inner migration-type selector
     # (Full load only / CDC only / Full load + CDC). One builder serves it; the
@@ -214,6 +215,7 @@ def build_page(
         cdc_deploy_role_arn=config.cdc_deploy_role_arn,
         cdc_secret_kms_key_id=config.cdc_secret_kms_key_id,
         validation_store=VALIDATION_STORE,
+        open_ai_scope=_open_ai_scope,
     )
     # Step 4 (Validation): compares the migrated target against the source as-of
     # the Step 3 watermark and reports consistency and drift.
@@ -226,6 +228,7 @@ def build_page(
         validation_store=VALIDATION_STORE,
         # Lets a CHECKSUM run resolve the APPLIED target types (Schema-Conversion remaps).
         conversion_store=SCHEMA_CONVERSION_STORE,
+        open_ai_scope=_open_ai_scope,
     )
     # Step 6 (Cut over): guidance for switching the application from MySQL to
     # DSQL. The tool cannot perform/verify the cut-over, so this step has no job —
@@ -243,6 +246,7 @@ def build_page(
         SESSION_STORE,
         session_id,
         playground_store=PLAYGROUND_STORE,
+        open_ai_scope=_open_ai_scope,
     )
 
     def schema_run_guard() -> str | None:

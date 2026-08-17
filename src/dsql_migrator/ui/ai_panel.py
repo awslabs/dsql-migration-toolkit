@@ -35,9 +35,7 @@ from dsql_migrator.core.assessment_strategist import ObjectGuidanceOutcome
 from dsql_migrator.core.models import AiScope, MigrationContext
 from dsql_migrator.ui.ai_chat_drawer import (
     MAX_CHAT_INPUT_CHARS,
-    MAX_CHAT_TURNS,
     ChatStreamer,
-    chat_turns_remaining,
     markdown_has_code_block,
     split_markdown_segments,
 )
@@ -253,9 +251,13 @@ def build_ai_panel(
             pass
 
     def _apply_composer_state() -> None:
-        remaining = chat_turns_remaining(conversation.messages)
-        at_limit = remaining <= 0
-        enabled = (not conv["busy"]) and (not at_limit) and conv["streamer"] is not None
+        # No per-conversation turn CAP: the guardrail is domain-scoping (the system
+        # prompt keeps replies to this migration and declines off-topic) + a bounded
+        # CONTEXT (the strategist trims the transcript to a char budget per call, so
+        # cost stays bounded no matter how long the chat runs) -- not an arbitrary
+        # "10 questions" wall. The composer is enabled whenever a streamer is active
+        # and no turn is in flight.
+        enabled = (not conv["busy"]) and conv["streamer"] is not None
         for el in (chat_input, send_btn):
             try:
                 el.set_enabled(enabled)  # type: ignore[attr-defined]
@@ -267,17 +269,8 @@ def build_ai_panel(
                     "Open AI from a step (e.g. an object's AI Assist) to start or "
                     "continue a conversation."
                 )
-            elif at_limit:
-                composer_hint.set_text(  # type: ignore[attr-defined]
-                    "Conversation limit reached for this topic — open AI on another "
-                    "object to continue."
-                )
-            elif conv["busy"]:
-                composer_hint.set_text("")  # type: ignore[attr-defined]
             else:
-                composer_hint.set_text(  # type: ignore[attr-defined]
-                    f"{remaining} message(s) left on this topic."
-                )
+                composer_hint.set_text("")  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001
             pass
 
@@ -380,9 +373,6 @@ def build_ai_panel(
         text = (user_text or "").strip()
         streamer = conv["streamer"]
         if not text or conv["busy"] or streamer is None:
-            return
-        if chat_turns_remaining(conversation.messages) <= 0:
-            _apply_composer_state()
             return
         _set_busy(True)
         conversation.messages.append({"role": "user", "text": text})
@@ -526,7 +516,7 @@ def build_ai_panel(
 
     def _send() -> None:
         text = (getattr(chat_input, "value", "") or "").strip()  # type: ignore[attr-defined]
-        if not text or conv["busy"] or chat_turns_remaining(conversation.messages) <= 0:
+        if not text or conv["busy"]:
             return
         try:
             chat_input.set_value("")  # type: ignore[attr-defined]

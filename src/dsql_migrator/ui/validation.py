@@ -1580,6 +1580,7 @@ def build_validation_screen(
     strategist_factory: StrategistFactory = _default_strategist_factory,
     sync_sequences: "Optional[Callable[..., dict]]" = None,
     conversion_store: "Optional[Any]" = None,
+    open_ai_scope: "Optional[Callable[..., object]]" = None,
 ) -> tuple[Callable[[Callable[[], None]], None], Callable[[], None]]:
     """Build the Validation screen, returning ``(content_builder, runner)``.
 
@@ -2200,20 +2201,36 @@ def build_validation_screen(
                     strategist = strategist_factory(
                         session.ai_assist, session.aws_profile
                     )
-                    open_chat = build_chat_drawer(ui)
+                    # Deep-link into the persistent app-wide AI panel when wired;
+                    # fall back to the per-screen drawer only when it is not (tests).
+                    open_chat = (
+                        build_chat_drawer(ui) if open_ai_scope is None else None
+                    )
 
                     def diagnose_provider(  # noqa: E731 - small bound opener
-                        *, title, subtitle, first_question, facts, scope
+                        *, title, subtitle, first_question, facts, scope,
+                        scope_id, chip,
                     ):
+                        streamer = lambda messages, on_delta: (  # noqa: E731
+                            strategist.stream_validation_chat(
+                                facts, messages, on_delta, scope=scope
+                            )
+                        )
+                        if open_ai_scope is not None:
+                            open_ai_scope(
+                                scope_id=scope_id,
+                                title=title,
+                                subtitle=subtitle,
+                                chip=chip,
+                                seed_question=first_question,
+                                streamer=streamer,
+                            )
+                            return
                         open_chat(
                             title=title,
                             subtitle=subtitle,
                             first_question=first_question,
-                            streamer=lambda messages, on_delta: (
-                                strategist.stream_validation_chat(
-                                    facts, messages, on_delta, scope=scope
-                                )
-                            ),
+                            streamer=streamer,
                         )
 
                 # Per-table re-check: which tables are being re-compared right now
@@ -3662,6 +3679,8 @@ def _render_recovery_section(
                         ),
                         facts=_validation_run_facts(summary, drift),
                         scope="run",
+                        scope_id="validation:run",
+                        chip="Validation · run",
                     ),
                 ).props("color=primary outline no-caps")
 
@@ -4161,6 +4180,8 @@ def _render_failing_table(
                             ),
                             facts=_validation_table_facts(_it),
                             scope="table",
+                            scope_id=f"validation:{_it.table}",
+                            chip=f"Validation · {_it.table}",
                         ),
                     ).props("flat dense no-caps size=sm color=indigo-6")
             for line in _failure_reasons(item):

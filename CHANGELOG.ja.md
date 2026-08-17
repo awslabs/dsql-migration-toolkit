@@ -5,6 +5,25 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.365
+
+### Changed
+
+- **残り 4 つの AI チャット(Schema Conversion、Query Converter、Validation、Full Load)がすべて常駐 AI
+  パネルで開くようになり、Evaluation の冒頭バナーを削除し、「1 会話あたり 10 回まで」の上限をなくしました。**
+  各画面のオブジェクト/テーブル/トピック別の AI ボタンがアプリ全体のパネルへディープリンク(`open_ai_scope`)
+  し、会話が全行程で継続します — パネルが未配線の場合(例: テスト)のみ従来の画面別ドロワーへフォールバック
+  するため、既存テストの挙動は変わりません。冗長だった Evaluation の説明段落(「Analyze the source against
+  the target … The report can be downloaded.」)は削除しました — ジャーニーヘッダー、「Ready to evaluate」
+  カード、そしてレポート自体が既にその内容を伝えています。
+- **ガードレールの再設計: 恣意的な会話ターン上限(`MAX_CHAT_TURNS = 10`)を削除しました。** 関連性の
+  ガードレールはドメイン限定の system プロンプト(すべてのチャットがこの MySQL→Aurora DSQL マイグレーションに
+  固定され、無関係な話題は丁寧に断って本題へ戻す)のみとなり、コストはターン数ではなくコンテキストで
+  bound されます: strategist が各リクエストのトランスクリプトを文字数バジェットにトリムするため、会話が
+  どれだけ長くてもターンあたりのコストは bounded です。メッセージごとの入力長上限と単一実行中ターンの
+  ロックは維持され、返信は advisory・認証情報を含みません(Property 7)。(denied-topics のハードレイヤーで
+  ある Amazon Bedrock Guardrails は任意の将来強化策として残します。)
+
 ## v0.1.364
 
 ### Added

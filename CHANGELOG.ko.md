@@ -5,6 +5,24 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.365
+
+### Changed
+
+- **남은 4개 AI 채팅(Schema Conversion, Query Converter, Validation, Full Load)이 모두 상시 AI
+  패널로 열리고, Evaluation 상단 안내 배너를 제거했으며, "대화당 10회 질문" 제한을 없앴습니다.** 각 화면의
+  객체/테이블/주제별 AI 버튼이 이제 앱 전역 패널로 딥링크(`open_ai_scope`)되어 대화가 여정 내내 이어집니다 —
+  패널이 배선되지 않은 경우(예: 테스트)에만 기존 화면별 드로어로 폴백하므로 기존 테스트 동작 변화 없음.
+  중복이던 Evaluation 안내 문단("Analyze the source against the target … The report can be
+  downloaded.")은 제거했습니다 — 여정 헤더, "Ready to evaluate" 카드, 그리고 리포트 자체가 이미 그 내용을
+  전달합니다.
+- **가드레일 재설계: 임의의 대화 턴 상한(`MAX_CHAT_TURNS = 10`)을 제거했습니다.** 이제 관련성 가드레일은
+  도메인 한정 system 프롬프트(모든 채팅이 이 MySQL→Aurora DSQL 마이그레이션에 고정되고 off-topic은 정중히
+  거절·주제 복귀)이고, 비용은 턴 수가 아니라 컨텍스트로 bound됩니다: strategist가 매 요청의 트랜스크립트를
+  문자 예산으로 트림하므로, 대화가 아무리 길어도 턴당 비용은 bounded입니다. 메시지당 입력 길이 상한과
+  단일-진행-턴 락은 유지되고, 답변은 advisory·자격증명 무포함(Property 7)입니다. (denied-topics 하드
+  레이어인 Amazon Bedrock Guardrails는 선택적 향후 강화책으로 남겨둡니다.)
+
 ## v0.1.364
 
 ### Added

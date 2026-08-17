@@ -1039,19 +1039,10 @@ def build_evaluation_screen(
             refresh()
 
         with ui.column().classes("w-full gap-3"):
-            with ui.row().classes(
-                "w-full items-start gap-2 p-3 rounded-lg border "
-                "border-gray-200 bg-gray-50 no-wrap"
-            ):
-                ui.icon("insights", color="primary").classes("text-xl")
-                ui.label(
-                    "Analyze the source against the target Aurora DSQL and review "
-                    "the compatibility assessment report: every object is classified "
-                    "(Automatic / Review needed / Unsupported) with an estimated "
-                    "manual effort, and objects that already exist on the target are "
-                    "flagged. The report can be downloaded."
-                ).classes("text-sm text-gray-600")
-
+            # (No standalone intro banner here: the journey header names the step, the
+            # "Ready to evaluate" empty-state card below explains it before the first
+            # run, and after a run the assessment report itself is on screen -- a
+            # persistent paragraph restating all that was redundant.)
             with ui.row().classes("items-center gap-2"):
                 ui.label("Evaluation status:").classes("text-sm text-gray-500")
                 ui.badge(status_label(status)).props(f"color={_STATUS_COLORS[status]}")
