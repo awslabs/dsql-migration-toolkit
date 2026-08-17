@@ -1228,8 +1228,7 @@ def build_data_migration_screen(
             # re-render must not create a new drawer each time). ``None`` when AI is
             # off -> the renderer shows a disabled affordance instead.
             ai_error_opener = None
-            if session.ai_assist.enabled:
-                _ai_drawer = {"open_chat": None}
+            if session.ai_assist.enabled and open_ai_scope is not None:
 
                 def ai_error_opener(table_name: str, error_message: str) -> None:
                     from dsql_migrator.core.assessment_strategist import (
@@ -1246,39 +1245,25 @@ def build_data_migration_screen(
                         table_name=table_name,
                         cdc_live=cdc_streaming_started(migration_state, job_manager),
                     )
-                    first_question = (
-                        f"Why did loading {table_name} fail, and how do I fix it?"
-                    )
-                    streamer = lambda messages, on_delta: (  # noqa: E731
-                        strategist.stream_full_load_error_chat(
-                            table_name,
-                            error_message,
-                            messages,
-                            on_delta,
-                            migration_context=migration_context,
-                        )
-                    )
-                    # Deep-link into the persistent app-wide AI panel when wired; fall
-                    # back to the per-screen drawer only when it is not (tests).
-                    if open_ai_scope is not None:
-                        open_ai_scope(
-                            scope_id=f"full_load:{table_name}",
-                            title="AI Assist — Full Load failure",
-                            subtitle=table_name,
-                            chip=f"Full Load · {table_name}",
-                            seed_question=first_question,
-                            streamer=streamer,
-                        )
-                        return
-                    from dsql_migrator.ui.ai_chat_drawer import build_chat_drawer
-
-                    if _ai_drawer["open_chat"] is None:
-                        _ai_drawer["open_chat"] = build_chat_drawer(ui)
-                    _ai_drawer["open_chat"](
+                    # Deep-link the per-failed-table diagnosis into the persistent
+                    # app-wide AI panel.
+                    open_ai_scope(
+                        scope_id=f"full_load:{table_name}",
                         title="AI Assist — Full Load failure",
                         subtitle=table_name,
-                        first_question=first_question,
-                        streamer=streamer,
+                        chip=f"Full Load · {table_name}",
+                        seed_question=(
+                            f"Why did loading {table_name} fail, and how do I fix it?"
+                        ),
+                        streamer=lambda messages, on_delta: (
+                            strategist.stream_full_load_error_chat(
+                                table_name,
+                                error_message,
+                                messages,
+                                on_delta,
+                                migration_context=migration_context,
+                            )
+                        ),
                     )
 
             def accept_quarantine_and_continue() -> None:

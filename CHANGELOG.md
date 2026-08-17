@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.366
+
+### Changed
+
+- **Retired the old per-screen AI chat drawer — the persistent panel is now the sole AI chat
+  surface.** With every screen deep-linking into the app-wide panel (v0.1.361/365), the fallback to
+  `ai_chat_drawer.build_chat_drawer` was dead in production, so it was removed from all five screens
+  and the `build_chat_drawer` dialog builder was deleted (its module keeps only the pure,
+  screen-agnostic helpers the panel reuses — markdown segmentation, the `ChatStreamer` contract,
+  guardrail constants). Two screens whose openers were previously gated only by the drawer's
+  presence (Schema Conversion, Query Converter) now gate explicitly on AI-assist-enabled, so an
+  AI-off session never opens the panel through them. No user-facing behavior change (the app already
+  used the panel everywhere).
+
 ## v0.1.365
 
 ### Changed

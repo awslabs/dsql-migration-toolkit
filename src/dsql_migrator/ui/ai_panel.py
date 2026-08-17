@@ -3,9 +3,9 @@
 
 """The persistent, app-wide AI assistant panel (Cloudscape-styled right drawer).
 
-Unlike the per-screen :func:`~dsql_migrator.ui.ai_chat_drawer.build_chat_drawer`
-(a modal dialog that reset its transcript on every open), this is ONE panel wired
-at the app shell (:func:`~dsql_migrator.ui.workflow.build_workflow_sidebar`) that
+Unlike the per-screen chat drawer it replaced (a modal dialog that reset its
+transcript on every open), this is ONE panel wired at the app shell
+(:func:`~dsql_migrator.ui.workflow.build_workflow_sidebar`) that
 persists across the whole migration journey. It can be opened/closed at any time
 from the header toggle, and the conversation is preserved: the transcript, active
 scope, and open/closed state live on the session (``SessionConnectionState.

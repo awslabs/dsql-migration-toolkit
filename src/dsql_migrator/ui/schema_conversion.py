@@ -115,7 +115,6 @@ from dsql_migrator.ui.design import (
     radio_tiles,
     render_notice,
 )
-from dsql_migrator.ui.ai_chat_drawer import build_chat_drawer
 from dsql_migrator.ui.evaluation import EvaluationStore, classification_label
 from dsql_migrator.ui.session import SessionStore
 from dsql_migrator.ui.workflow import (
@@ -2037,19 +2036,13 @@ def build_schema_conversion_screen(
             # only: the user reads/copies SQL and pastes it into the object's
             # editor (no auto-adopt, since a reply can contain several illustrative
             # SQL blocks that must not all be applied).
-            # Deep-link into the persistent app-wide AI panel when it is wired
-            # (open_ai_scope); fall back to the per-screen drawer only when it is not
-            # (e.g. tests). The fallback drawer is built only in that case.
-            open_chat = (
-                build_chat_drawer(ui)
-                if session.ai_assist.enabled and open_ai_scope is None
-                else None
-            )
-
+            # Per-object AI conversion help deep-links into the persistent app-wide
+            # AI panel. None when the panel is not wired (open_ai_scope is None) or AI
+            # is off, in which case the object row shows the disabled affordance.
             def open_conversion_chat(
                 object_name: str, source_ddl: str, deterministic: str
             ) -> None:
-                if open_chat is None and open_ai_scope is None:
+                if open_ai_scope is None or not session.ai_assist.enabled:
                     return
                 strategist = AssessmentStrategist(
                     session.ai_assist, aws_profile=session.aws_profile
@@ -2057,28 +2050,18 @@ def build_schema_conversion_screen(
                 system = build_conversion_chat_system(
                     object_name, source_ddl, deterministic
                 )
-                first_question = (
-                    f"How should I convert {object_name} to Aurora DSQL? "
-                    "Walk me through the DDL changes."
-                )
-                streamer = lambda messages, on_delta: strategist.stream_chat(  # noqa: E731
-                    system, messages, on_delta
-                )
-                if open_ai_scope is not None:
-                    open_ai_scope(
-                        scope_id=f"schema_conversion:{object_name}",
-                        title="AI conversion assistant",
-                        subtitle=f"{object_name}",
-                        chip=f"Schema conversion · {object_name}",
-                        seed_question=first_question,
-                        streamer=streamer,
-                    )
-                    return
-                open_chat(
+                open_ai_scope(
+                    scope_id=f"schema_conversion:{object_name}",
                     title="AI conversion assistant",
                     subtitle=f"{object_name}",
-                    first_question=first_question,
-                    streamer=streamer,
+                    chip=f"Schema conversion · {object_name}",
+                    seed_question=(
+                        f"How should I convert {object_name} to Aurora DSQL? "
+                        "Walk me through the DDL changes."
+                    ),
+                    streamer=lambda messages, on_delta: strategist.stream_chat(
+                        system, messages, on_delta
+                    ),
                 )
 
             with ui.card().classes("w-full"):

@@ -65,7 +65,7 @@ from dsql_migrator.core.models import (
 )
 from dsql_migrator.core.target_introspector import TargetIntrospector
 from dsql_migrator.ui.connect import make_source_engine_factory
-from dsql_migrator.ui.ai_chat_drawer import build_chat_drawer, chat_turns_remaining
+from dsql_migrator.ui.ai_chat_drawer import chat_turns_remaining
 from dsql_migrator.ui.design import (
     filter_bar,
     filter_select,
@@ -1242,7 +1242,7 @@ def _render_result(
     # opens it for a given object. None when AI assist is disabled (the item
     # renderer then shows a disabled, clearly labeled affordance instead).
     on_ai = (
-        _build_guidance_drawer(ui, guidance_provider, open_ai_scope=open_ai_scope)
+        _build_guidance_drawer(guidance_provider, open_ai_scope=open_ai_scope)
         if guidance_provider is not None
         else None
     )
@@ -1340,46 +1340,32 @@ def _guidance_question(item: "AssessmentItem") -> str:
 
 
 def _build_guidance_drawer(
-    ui: object,
     guidance_provider: Callable[
         ["AssessmentItem", "list[dict[str, str]]", Callable[[str], None]],
         ObjectGuidanceOutcome,
     ],
     *,
     open_ai_scope: Optional[Callable[..., object]] = None,
-) -> Callable[["AssessmentItem"], object]:
-    """Return an opener that shows one object's AI guidance.
+) -> Optional[Callable[["AssessmentItem"], object]]:
+    """Return an opener that deep-links one object's AI guidance into the panel.
 
-    When ``open_ai_scope`` is wired (the real app), guidance deep-links into the
-    persistent app-wide AI panel (:mod:`dsql_migrator.ui.ai_panel`) so the
-    conversation lives alongside the whole journey. Without it (e.g. unit tests that
-    don't wire the shell), it falls back to the per-screen
-    :func:`~dsql_migrator.ui.ai_chat_drawer.build_chat_drawer` -- same transcript /
-    streaming / guardrails. Either way the streamer is bound to ``guidance_provider``
-    (the strategist's grounded streaming chat for the object).
+    Guidance opens in the persistent app-wide AI panel
+    (:mod:`dsql_migrator.ui.ai_panel`) so the conversation lives alongside the whole
+    journey; the streamer is bound to ``guidance_provider`` (the strategist's grounded
+    streaming chat for the object). Returns ``None`` when the panel is not wired
+    (``open_ai_scope is None`` -- e.g. a unit test that does not build the shell), so
+    the caller shows the disabled affordance.
     """
-    if open_ai_scope is not None:
-        def open_guidance_panel(item: "AssessmentItem") -> None:
-            open_ai_scope(
-                scope_id=f"evaluation:{item.object_name}",
-                title="AI migration guidance",
-                subtitle=f"{item.object_name} \u00b7 {item.kind}",
-                chip=f"Evaluation \u00b7 {item.object_name}",
-                seed_question=_guidance_question(item),
-                streamer=lambda messages, on_delta: guidance_provider(
-                    item, messages, on_delta
-                ),
-            )
-
-        return open_guidance_panel
-
-    open_chat = build_chat_drawer(ui)
+    if open_ai_scope is None:
+        return None
 
     def open_guidance(item: "AssessmentItem") -> None:
-        open_chat(
+        open_ai_scope(
+            scope_id=f"evaluation:{item.object_name}",
             title="AI migration guidance",
             subtitle=f"{item.object_name} \u00b7 {item.kind}",
-            first_question=_guidance_question(item),
+            chip=f"Evaluation \u00b7 {item.object_name}",
+            seed_question=_guidance_question(item),
             streamer=lambda messages, on_delta: guidance_provider(
                 item, messages, on_delta
             ),

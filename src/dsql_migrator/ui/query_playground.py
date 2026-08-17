@@ -56,7 +56,6 @@ from dsql_migrator.core.query_playground import (
     probe_statement,
 )
 from dsql_migrator.core.target_connection import DsqlConnector
-from dsql_migrator.ui.ai_chat_drawer import build_chat_drawer
 from dsql_migrator.ui.design import badge_classes, render_notice, section_header
 from dsql_migrator.ui.session import SessionStore
 
@@ -482,15 +481,9 @@ def build_query_playground_screen(
             # so the reassurance is the first thing seen (Usability / trust first).
             _render_safety_banner(ui)
 
-            # Deep-link into the persistent app-wide AI panel when wired
-            # (open_ai_scope); the per-screen fallback drawer is built only when it is
-            # not (e.g. tests). None when AI is off.
-            open_chat = (
-                build_chat_drawer(ui)
-                if session.ai_assist.enabled and open_ai_scope is None
-                else None
-            )
-
+            # Per-query AI help (review + DBA tuning) deep-links into the persistent
+            # app-wide AI panel; the openers below no-op when it is not wired or AI is
+            # off, and the buttons show a disabled/hint state.
             sql_input = ui.textarea(
                 label="MySQL SQL",
                 placeholder=_PLACEHOLDER_SQL,
@@ -628,7 +621,7 @@ def build_query_playground_screen(
                 # any target error captured by the probe (so the AI can fix the
                 # real failure). Advisory only -- nothing is auto-applied.
                 result = state.result
-                if result is None or (open_chat is None and open_ai_scope is None):
+                if result is None or open_ai_scope is None or not session.ai_assist.enabled:
                     return
                 from dsql_migrator.core.assessment_strategist import (
                     AssessmentStrategist,
@@ -656,24 +649,15 @@ def build_query_playground_screen(
                     else "Review this MySQL → Aurora DSQL conversion: is it correct, "
                     "will it run on DSQL, and how would you improve it?"
                 )
-                streamer = lambda messages, on_delta: strategist.stream_chat(  # noqa: E731
-                    system, messages, on_delta
-                )
-                if open_ai_scope is not None:
-                    open_ai_scope(
-                        scope_id="query-converter:review",
-                        title="AI query assistant",
-                        subtitle="Query Converter",
-                        chip="Query Converter",
-                        seed_question=first_question,
-                        streamer=streamer,
-                    )
-                    return
-                open_chat(
+                open_ai_scope(
+                    scope_id="query-converter:review",
                     title="AI query assistant",
                     subtitle="Query Converter",
-                    first_question=first_question,
-                    streamer=streamer,
+                    chip="Query Converter",
+                    seed_question=first_question,
+                    streamer=lambda messages, on_delta: strategist.stream_chat(
+                        system, messages, on_delta
+                    ),
                 )
 
             def on_optimize_ai() -> None:
@@ -686,7 +670,7 @@ def build_query_playground_screen(
                 # assistant reports how much it actually improved. Advisory only —
                 # nothing is auto-applied; the user copies SQL back to run for real.
                 result = state.result
-                if result is None or (open_chat is None and open_ai_scope is None):
+                if result is None or open_ai_scope is None or not session.ai_assist.enabled:
                     return
                 from dsql_migrator.core.assessment_strategist import (
                     AssessmentStrategist,
@@ -764,30 +748,19 @@ def build_query_playground_screen(
                 # rewritten query — a reply that just concludes "already efficient"
                 # (no ```sql SELECT) gets no button.
                 footer_visible = lambda md: extract_sql_from_reply(md) is not None  # noqa: E731
-                # open_scope (panel) returns the SAME send(text) callable open_chat
-                # does, so the "Test rewrite" follow-up turn still works either way.
-                if open_ai_scope is not None:
-                    sender["send"] = open_ai_scope(
-                        scope_id="query-converter:tune",
-                        title="AI DBA — query tuning",
-                        subtitle="Query Converter · Aurora DSQL efficiency",
-                        chip="AI DBA",
-                        seed_question=tuning_seed,
-                        streamer=tuning_streamer,
-                        footer_label="Test rewrite on target",
-                        footer_action=_retest_rewrite,
-                        footer_visible=footer_visible,
-                    )
-                else:
-                    sender["send"] = open_chat(
-                        title="AI DBA — query tuning",
-                        subtitle="Query Converter · Aurora DSQL efficiency",
-                        first_question=tuning_seed,
-                        streamer=tuning_streamer,
-                        footer_label="Test rewrite on target",
-                        footer_action=_retest_rewrite,
-                        footer_visible=footer_visible,
-                    )
+                # open_scope returns the send(text) callable the "Test rewrite"
+                # follow-up turn drives.
+                sender["send"] = open_ai_scope(
+                    scope_id="query-converter:tune",
+                    title="AI DBA — query tuning",
+                    subtitle="Query Converter · Aurora DSQL efficiency",
+                    chip="AI DBA",
+                    seed_question=tuning_seed,
+                    streamer=tuning_streamer,
+                    footer_label="Test rewrite on target",
+                    footer_action=_retest_rewrite,
+                    footer_visible=footer_visible,
+                )
 
             with ui.row().classes("items-center gap-2"):
                 ui.button("Convert", icon="sync_alt", on_click=on_convert).props(
