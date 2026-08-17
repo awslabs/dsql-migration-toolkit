@@ -22,6 +22,14 @@ window -- the streamer is only ever given the CURRENT scope's turns (so a reply 
 grounded on the object at hand), while the full transcript stays visible as
 scrollback. Deterministic-first: replies are advisory and grounded by the
 caller-supplied system prompt (the core strategist).
+
+Screens also mirror MAJOR migration actions into the panel via
+:meth:`AiPanelHandle.post_event` (Start Full Load, Apply schema, Run validation,
+Cut over, ...), so the AI window reflects what you do in the UI as a live activity
+feed. These events are deterministic (no model call), rendered as distinct timeline
+strips, and the most recent ones are folded into the next chat turn as grounding
+context -- so the assistant is aware of what the operator just did. Credential-free
+and row-data-free (Property 7).
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ from __future__ import annotations
 import inspect
 import logging
 import threading
+from collections import deque
 from typing import Callable, Optional
 
 from dsql_migrator.core.assessment_strategist import ObjectGuidanceOutcome
@@ -39,33 +48,55 @@ from dsql_migrator.ui.ai_chat_drawer import (
     markdown_has_code_block,
     split_markdown_segments,
 )
-from dsql_migrator.ui.design import render_notice
+from dsql_migrator.ui.design import (
+    render_activity_event,
+    render_notice,
+    render_segmented_bar,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-# Width of the persistent side panel. Narrower than the old 660px modal dialog
-# (a modal could be wide; a panel that sits beside the content should not eat the
-# whole page) while still leaving room for code blocks (which wrap internally).
-_PANEL_WIDTH_PX = 440
+# Width of the persistent side panel. Set wide (≈50% wider than the original 440px)
+# so an AI conversation -- prose, tables, and multi-line code blocks -- reads
+# comfortably without wrapping every few words; this is the width the old modal chat
+# used too. It does push the main content further left, but readability of the
+# assistant's answers won the trade-off (an explicit product choice).
+_PANEL_WIDTH_PX = 660
+
+# Activity-event styling lives in the design system (ACTIVITY_EVENT_STYLE /
+# render_activity_event) so the feed shares the app's one Cloudscape palette; the
+# ``status`` a caller passes to post_event IS the design-system tone key
+# (started / running / success / info / warning / error).
+
+# How many of the most RECENT activity events (session-wide) are folded into a chat
+# turn as grounding context, so the assistant is aware of what the operator just did
+# in the tool. Kept deliberately SMALL: only the last few actions are relevant to the
+# current question, and the point is to bound the text SENT to the model (only useful
+# info, nothing excessive). Events are short one-liners; the transcript is trimmed
+# separately in the strategist.
+_MAX_GROUNDED_EVENTS = 6
 
 
 class AiPanelHandle:
     """The shell's handle to the persistent AI panel.
 
-    Screens use :meth:`open_scope` to deep-link; the header toggle uses
-    :meth:`set_visible` / :meth:`toggle`; gating uses :meth:`is_enabled`.
+    Screens use :meth:`open_scope` to deep-link (a chat scope) and
+    :meth:`post_event` to mirror a major action into the activity feed; the header
+    toggle uses :meth:`set_visible` / :meth:`toggle`; gating uses :meth:`is_enabled`.
     """
 
     def __init__(
         self,
         *,
         open_scope: Callable[..., Callable[[str], None]],
+        post_event: Callable[..., None],
         set_visible: Callable[[bool], None],
         toggle: Callable[[], None],
         is_enabled: Callable[[], bool],
         is_visible: Callable[[], bool],
     ) -> None:
         self.open_scope = open_scope
+        self.post_event = post_event
         self.set_visible = set_visible
         self.toggle = toggle
         self.is_enabled = is_enabled
@@ -98,6 +129,7 @@ def build_ai_panel(
     state: object,
     get_context: Optional[Callable[[], MigrationContext]] = None,
     general_streamer_factory: Optional[Callable[[], Optional[ChatStreamer]]] = None,
+    on_change: Optional[Callable[[], None]] = None,
 ) -> AiPanelHandle:
     """Build the persistent AI panel once and return its :class:`AiPanelHandle`.
 
@@ -123,6 +155,19 @@ def build_ai_panel(
         "footer_action": None,
         "footer_visible": None,
         "scope_start": len(conversation.messages),
+        # Count of activity events posted while the panel was closed -- shown as a
+        # badge on the right-edge reopen tab so an action is noticed even with the
+        # panel hidden. Reset to 0 when the panel is opened.
+        "unseen": 0,
+        # Set by the Stop button to end the in-flight streaming turn early (the
+        # streaming tick reads it, keeps the partial reply, and re-enables the composer).
+        "stop_requested": False,
+        # Thread-safe queue of activity events awaiting render. post_event may be
+        # called from a BACKGROUND job thread (e.g. an assessment/schema/validation
+        # run finishing), and NiceGUI can only build elements safely on the event
+        # loop -- so post_event only appends here (+ to the session), and a loop timer
+        # (_drain_events) renders them. Mirrors how the streaming tick renders.
+        "pending": deque(),
     }
     _scroll_state: dict[str, bool] = {"at_bottom": True}
 
@@ -188,11 +233,44 @@ def build_ai_panel(
                     send_btn = ui.button(icon="send").props(  # type: ignore[attr-defined]
                         "round dense color=indigo-6"
                     ).tooltip("Send  (Shift+Enter for a new line)")
-                composer_hint = ui.label("").classes("text-xs text-gray-400")  # type: ignore[attr-defined]
+                    # Shown only WHILE a reply is streaming (see _apply_composer_state):
+                    # stops the turn, keeping whatever text arrived so far.
+                    stop_btn = ui.button(icon="stop").props(  # type: ignore[attr-defined]
+                        "round dense color=grey-7"
+                    ).tooltip("Stop generating")
+                    stop_btn.set_visibility(False)  # type: ignore[attr-defined]
+                with ui.row().classes(  # type: ignore[attr-defined]
+                    "items-center justify-between no-wrap w-full gap-2"
+                ):
+                    composer_hint = ui.label("").classes("text-xs text-gray-400 col")  # type: ignore[attr-defined]
+                    # A live character counter that appears only as you near the cap
+                    # (Cloudscape style), turning red at the limit. Hidden otherwise so
+                    # it does not clutter the composer.
+                    char_counter = ui.label("").classes(  # type: ignore[attr-defined]
+                        "text-xs text-gray-400 no-wrap"
+                    )
+                    char_counter.set_visibility(False)  # type: ignore[attr-defined]
                 ui.label(  # type: ignore[attr-defined]
                     "AI suggestions are advisory. Replies are grounded on the current "
                     "step's deterministic facts."
                 ).classes("text-xs text-gray-400")
+                # The Bedrock model currently answering, shown persistently under the
+                # composer as a labeled indigo CHIP (not faint gray text) so it is easy
+                # to spot. The per-reply "Generated by model X" is retrospective; this
+                # tells you up front which model you are talking to. Reads the live
+                # AI-assist config on build and on every open.
+                model_row = ui.row().classes(  # type: ignore[attr-defined]
+                    "items-center gap-1.5 no-wrap self-start rounded "
+                    "bg-indigo-50 border border-indigo-100 q-px-sm q-py-xs max-w-full"
+                )
+                with model_row:  # type: ignore[attr-defined]
+                    ui.icon("smart_toy", color="indigo-6").classes("text-sm")  # type: ignore[attr-defined]
+                    ui.label("Model").classes(  # type: ignore[attr-defined]
+                        "text-xs font-semibold text-indigo-700 no-wrap"
+                    )
+                    model_value = ui.label("").classes(  # type: ignore[attr-defined]
+                        "text-xs text-indigo-700 ellipsis"
+                    )
 
     # Collapsed-state affordance: a small tab pinned to the RIGHT EDGE so that, when
     # the panel is closed, there is a VISIBLE way to reopen it (not only the header
@@ -208,11 +286,26 @@ def build_ai_panel(
         )
         .tooltip("Open the AI assistant")
     )
+    # Unseen-activity badge on the reopen tab: when the panel is closed and a major
+    # action posts an event, this shows the count so the action is noticed.
+    with reopen_tab:  # type: ignore[attr-defined]
+        unseen_badge = ui.badge("").props("floating color=red rounded")  # type: ignore[attr-defined]
+    unseen_badge.set_visibility(False)  # type: ignore[attr-defined]
 
     def _sync_reopen_tab() -> None:
         enabled = bool(getattr(state.ai_assist, "enabled", False))  # type: ignore[attr-defined]
+        collapsed = (not conversation.visible) and enabled
         try:
-            reopen_tab.set_visibility((not conversation.visible) and enabled)  # type: ignore[attr-defined]
+            reopen_tab.set_visibility(collapsed)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        unseen = int(conv.get("unseen", 0) or 0)
+        try:
+            if collapsed and unseen > 0:
+                unseen_badge.set_text(str(unseen) if unseen < 100 else "99+")  # type: ignore[attr-defined]
+                unseen_badge.set_visibility(True)  # type: ignore[attr-defined]
+            else:
+                unseen_badge.set_visibility(False)  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001
             pass
 
@@ -276,6 +369,12 @@ def build_ai_panel(
                 el.set_enabled(enabled)  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001
                 pass
+        # The Stop button replaces Send while a reply is streaming.
+        try:
+            stop_btn.set_visibility(bool(conv["busy"]))  # type: ignore[attr-defined]
+            send_btn.set_visibility(not bool(conv["busy"]))  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
         try:
             if conv["streamer"] is None:
                 composer_hint.set_text(  # type: ignore[attr-defined]
@@ -291,11 +390,59 @@ def build_ai_panel(
         conv["busy"] = busy
         _apply_composer_state()
 
+    def _notify_change() -> None:
+        # Persist the session (the callback is dirty-checked, so this is cheap) so the
+        # transcript survives an unexpected app restart. ONLY call from the event loop
+        # (turn completion / drain timer / visibility toggle) -- never a job thread.
+        if on_change is None:
+            return
+        try:
+            on_change()
+        except Exception:  # noqa: BLE001 - persistence is best-effort, never break UI
+            pass
+
+    def _refresh_model_line() -> None:
+        """Update the connected-model chip under the composer (hidden when AI is off)."""
+        try:
+            cfg = state.ai_assist  # type: ignore[attr-defined]
+            model_id = str(getattr(cfg, "model_id", "") or "")
+            if not bool(getattr(cfg, "enabled", False)) or not model_id:
+                model_row.set_visibility(False)  # type: ignore[attr-defined]
+                return
+            region = str(getattr(cfg, "region", "") or "")
+            model_value.set_text(  # type: ignore[attr-defined]
+                f"{model_id}  ·  {region}" if region else model_id
+            )
+            model_row.set_visibility(True)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _update_counter() -> None:
+        """Show a character counter as the composer nears the per-message cap."""
+        try:
+            n = len(str(getattr(chat_input, "value", "") or ""))
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            if n >= int(MAX_CHAT_INPUT_CHARS * 0.8):
+                char_counter.set_text(f"{n}/{MAX_CHAT_INPUT_CHARS}")  # type: ignore[attr-defined]
+                char_counter.set_visibility(True)  # type: ignore[attr-defined]
+                if n >= MAX_CHAT_INPUT_CHARS:
+                    char_counter.classes(add="text-red-600", remove="text-gray-400")  # type: ignore[attr-defined]
+                else:
+                    char_counter.classes(add="text-gray-400", remove="text-red-600")  # type: ignore[attr-defined]
+            else:
+                char_counter.set_visibility(False)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+
     def _set_visible(visible: bool) -> None:
         # Opening with no object scope -> activate the general "ask anything about
         # this migration" streamer so the composer is immediately usable.
         if visible:
             _ensure_general_scope()
+            conv["unseen"] = 0  # opening the panel clears the unseen-activity badge
+            _refresh_model_line()  # the connected model may have changed since build
         conversation.visible = bool(visible)
         try:
             (drawer.show if visible else drawer.hide)()  # type: ignore[attr-defined]
@@ -306,6 +453,7 @@ def build_ai_panel(
                 pass
         _sync_reopen_tab()
         _apply_composer_state()
+        _notify_change()  # persist open/closed state (reopens where left after restart)
 
     def _autoscroll(force: bool = False) -> None:
         if not force and not _scroll_state.get("at_bottom", True):
@@ -323,6 +471,49 @@ def build_ai_panel(
                     "text-xs text-gray-400 no-wrap"
                 )
                 ui.element("div").classes("col border-t border-gray-200")  # type: ignore[attr-defined]
+
+    def _render_assessment_event(text: str, data: dict) -> None:
+        """A compact VISUAL for a completed assessment: a short headline + a
+        proportional Automatic/Review/Unsupported bar + a count legend (no wall of
+        text). ``text`` remains the plain grounding line the AI sees."""
+        total = int(data.get("total", 0) or 0)
+        conflicts = int(data.get("conflicts", 0) or 0)
+        with convo:  # type: ignore[attr-defined]
+            with ui.card().classes(  # type: ignore[attr-defined]
+                "w-full bg-white border border-gray-200 rounded-md !shadow-none "
+                "q-pa-sm gap-2"
+            ):
+                with ui.row().classes("items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
+                    ui.icon("fact_check", color="indigo-6").classes("text-base")  # type: ignore[attr-defined]
+                    ui.label(  # type: ignore[attr-defined]
+                        f"Assessment complete — {total} object"
+                        + ("" if total == 1 else "s")
+                    ).classes("text-xs font-semibold text-gray-800")
+                render_segmented_bar(
+                    ui,
+                    segments=[
+                        ("Automatic", int(data.get("auto", 0) or 0), "ok"),
+                        ("Review", int(data.get("manual", 0) or 0), "warning"),
+                        ("Unsupported", int(data.get("unsupported", 0) or 0), "bad"),
+                    ],
+                )
+                if conflicts:
+                    ui.label(  # type: ignore[attr-defined]
+                        f"{conflicts} object" + ("" if conflicts == 1 else "s")
+                        + " already exist on the target"
+                    ).classes("text-xs text-gray-500")
+
+    def _event_entry(
+        text: str, status: str = "info", kind: str = "", data: object = None
+    ) -> None:
+        """Render one activity event. A known ``kind`` with structured ``data`` gets a
+        custom VISUAL (e.g. the assessment breakdown bar); everything else renders as
+        the design system's tinted timeline chip, visually distinct from the bubbles."""
+        if kind == "assessment" and isinstance(data, dict):
+            _render_assessment_event(text, data)
+            return
+        with convo:  # type: ignore[attr-defined]
+            render_activity_event(ui, text, tone=status)
 
     def _user_bubble(text: str) -> None:
         with convo:  # type: ignore[attr-defined]
@@ -382,18 +573,74 @@ def build_ai_panel(
                 _user_bubble(text)
             elif role == "assistant":
                 _assistant_bubble_final(text)
+            elif role == "event":
+                _event_entry(
+                    text,
+                    str((entry or {}).get("status", "info")),
+                    kind=str((entry or {}).get("kind", "")),
+                    data=(entry or {}).get("data"),
+                )
+
+    def _drain_events() -> None:
+        """Render any events queued by ``post_event`` -- runs ON THE LOOP (a timer), so
+        it is safe to build NiceGUI elements here even though post_event may have been
+        called from a background job thread. Also bumps the unseen-badge when closed."""
+        queue = conv.get("pending")
+        if not queue:
+            return
+        rendered = False
+        while True:
+            try:
+                text, status, kind, data = queue.popleft()  # type: ignore[union-attr]
+            except IndexError:
+                break
+            try:
+                _event_entry(text, status, kind=kind, data=data)
+            except Exception:  # noqa: BLE001 - a bad event must not break the panel
+                pass
+            if not conversation.visible:
+                conv["unseen"] = int(conv.get("unseen", 0) or 0) + 1
+            rendered = True
+        if rendered:
+            _sync_reopen_tab()
+            _autoscroll()
+            _notify_change()  # persist the newly-recorded events (crash-durable)
 
     def _run_turn(user_text: str) -> None:
         text = (user_text or "").strip()
         streamer = conv["streamer"]
         if not text or conv["busy"] or streamer is None:
             return
+        conv["stop_requested"] = False  # clear any stale flag from a prior turn
         _set_busy(True)
         conversation.messages.append({"role": "user", "text": text})
         # Ground the streamer on the CURRENT scope only: send the turns since this
         # scope began, not the whole cross-scope scrollback.
         scope_start = int(conv["scope_start"])  # type: ignore[arg-type]
-        messages_snapshot = [dict(m) for m in conversation.messages[scope_start:]]
+        # The model only ever sees user/assistant TURNS within the current scope's
+        # window (the streamer maps any other role to "user", which would corrupt the
+        # alternation). Activity events are folded in SEPARATELY as grounding context,
+        # from the WHOLE session (not just the scope) so a reply is aware of what the
+        # operator just did anywhere in the tool.
+        messages_snapshot = [
+            dict(m)
+            for m in conversation.messages[scope_start:]
+            if (m or {}).get("role") in ("user", "assistant")
+        ]
+        recent_events = [
+            str((m or {}).get("text", ""))
+            for m in conversation.messages
+            if (m or {}).get("role") == "event"
+        ][-_MAX_GROUNDED_EVENTS:]
+        if recent_events and messages_snapshot:
+            ctx = (
+                "(Context — recent actions the operator performed in the migration "
+                "tool:\n" + "\n".join(f"- {e}" for e in recent_events) + "\n)"
+            )
+            messages_snapshot[-1] = {
+                **messages_snapshot[-1],
+                "text": f"{ctx}\n\n{messages_snapshot[-1].get('text', '')}",
+            }
         footer_label = conv["footer_label"]
         footer_action = conv["footer_action"]
         footer_visible = conv["footer_visible"]
@@ -463,6 +710,37 @@ def build_ai_panel(
                     _stop.active = False  # type: ignore[attr-defined]
                 return
             if not done:
+                if not bool(conv.get("stop_requested")):
+                    return
+                # Stop pressed mid-stream: end the turn now, keeping whatever text
+                # arrived. (The background Bedrock stream drains and is discarded --
+                # boto3 cannot be interrupted mid-iteration -- but the turn ends here.)
+                _t = timer_box.get("timer")
+                if _t is not None:
+                    _t.active = False  # type: ignore[attr-defined]
+                conv["stop_requested"] = False
+                try:
+                    typing.set_visibility(False)  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001
+                    pass
+                partial = text_now.strip()
+                if not partial:
+                    try:
+                        answer_md.set_content("_(stopped)_")  # type: ignore[attr-defined]
+                    except Exception:  # noqa: BLE001
+                        pass
+                # Persist the partial as the assistant turn so it survives refresh and
+                # keeps the user/assistant alternation valid for the next turn.
+                conversation.messages.append(
+                    {"role": "assistant", "text": partial or "_(stopped)_"}
+                )
+                try:
+                    meta.set_text("Stopped")  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001
+                    pass
+                _set_busy(False)
+                _autoscroll()
+                _notify_change()  # persist the stopped (partial) turn
                 return
             _t = timer_box.get("timer")
             if _t is not None:
@@ -524,6 +802,7 @@ def build_ai_panel(
                         ).props("flat dense no-caps color=indigo-6 icon=download_done")
             _set_busy(False)
             _autoscroll()
+            _notify_change()  # persist the completed turn (crash-durable transcript)
 
         timer_box["timer"] = ui.timer(0.12, tick)  # type: ignore[attr-defined]
 
@@ -537,7 +816,13 @@ def build_ai_panel(
             pass
         _run_turn(text)
 
+    def _stop_generation() -> None:
+        # End the in-flight streaming turn (the tick loop finalizes the partial reply).
+        if conv["busy"]:
+            conv["stop_requested"] = True
+
     send_btn.on("click", lambda _e=None: _send())  # type: ignore[attr-defined]
+    stop_btn.on("click", lambda _e=None: _stop_generation())  # type: ignore[attr-defined]
     # Enter sends; Shift+Enter inserts a newline (the multi-line textarea composer).
     # NiceGUI's modifier set has no `.exact`, so the plain-vs-shift distinction is made
     # client-side: this js_handler suppresses the browser's default newline and emits to
@@ -548,8 +833,55 @@ def build_ai_panel(
         lambda _e=None: _send(),
         js_handler="(e) => { if (!e.shiftKey) { e.preventDefault(); emit(); } }",
     )
+    # Keep the character counter in sync as the composer's value changes.
+    chat_input.on("update:model-value", lambda _e=None: _update_counter())  # type: ignore[attr-defined]
 
     # --- public API -------------------------------------------------------------
+
+    def post_event(
+        *,
+        text: str,
+        status: str = "info",
+        kind: str = "",
+        data: object = None,
+    ) -> None:
+        """Record a deterministic ACTIVITY event and mirror it into the panel feed.
+
+        Called by screens when a MAJOR migration action starts/finishes (Start Full
+        Load, Apply schema, Run validation, Cut over, ...). It appends an ``event``
+        entry to the transcript (the session source of truth, so it survives a
+        refresh), renders it in the feed, and -- when the panel is closed -- bumps the
+        reopen-tab unseen badge. It NEVER calls the model; the ``text`` is folded into a
+        later chat turn as grounding context instead (see ``_run_turn``). A no-op when
+        AI is disabled (the panel is inert then). The caller must pass credential-free,
+        row-data-free text (Property 7); ``status`` is one of the design tones
+        (started / success / info / warning / error).
+
+        ``kind`` + ``data`` opt into a richer VISUAL for the event (e.g.
+        ``kind="assessment"`` with a counts dict renders a breakdown bar instead of a
+        plain chip). ``data`` must be a credential-free, row-data-free dict of numbers/
+        statuses; ``text`` stays the plain fallback the AI is grounded on.
+        """
+        if not bool(getattr(state.ai_assist, "enabled", False)):  # type: ignore[attr-defined]
+            return
+        clean = str(text or "").strip()
+        if not clean:
+            return
+        st = str(status or "info")
+        entry: dict[str, object] = {"role": "event", "text": clean, "status": st}
+        if kind:
+            entry["kind"] = str(kind)
+        if isinstance(data, dict):
+            entry["data"] = dict(data)
+        # Record on the session (source of truth) and QUEUE for the loop timer to
+        # render. No UI is built here -- post_event is often called from a background
+        # job thread (assessment/schema/validation runs), and NiceGUI elements must be
+        # built on the event loop (see _drain_events). list.append + deque.append are
+        # both thread-safe.
+        conversation.messages.append(entry)
+        conv["pending"].append(  # type: ignore[union-attr]
+            (clean, st, str(kind), dict(data) if isinstance(data, dict) else None)
+        )
 
     def open_scope(
         *,
@@ -622,12 +954,25 @@ def build_ai_panel(
             chip_label.set_text(_baseline_chip())  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001
         pass
+    # If the panel is restored OPEN (e.g. after a browser refresh / app restart) with
+    # no live streamer, activate the general "ask anything" scope now so the composer
+    # is usable immediately -- otherwise the drawer shows (and replays the transcript +
+    # renders new activity events) but the input stays disabled with no way to start a
+    # chat. The general streamer is reconstructable; a specific screen scope's is not,
+    # so a restored object scope still waits for a re-open from its screen.
+    if bool(conversation.visible):
+        _ensure_general_scope()
     _apply_composer_state()
     _sync_reopen_tab()
+    _refresh_model_line()
     _autoscroll(force=True)
+    # Loop timer that renders events posted by post_event (possibly from a background
+    # job thread). Low frequency -- it just checks a deque and renders any new events.
+    ui.timer(0.25, _drain_events)  # type: ignore[attr-defined]
 
     return AiPanelHandle(
         open_scope=open_scope,
+        post_event=post_event,
         set_visible=set_visible,
         toggle=toggle,
         is_enabled=is_enabled,

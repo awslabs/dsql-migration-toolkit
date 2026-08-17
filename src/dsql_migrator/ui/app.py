@@ -107,6 +107,126 @@ _LAST_SESSION_SIGNATURE: dict[str, tuple] = {}
 _KEEP_DONE_JOBS = 100
 _KEEP_SESSIONS = 200
 
+# In-process tool-use (function calling) for the general AI chat: read-only,
+# credential-free tools the assistant can call to answer specific questions from the
+# migration's REAL, current data (converted DDL, assessment, validation, load status)
+# instead of guessing. Each name maps to a branch in build_page's `_ai_tool_execute`
+# over the UI stores. This is NOT an MCP server -- just local functions the model is
+# told about. Anthropic tool-schema shape.
+_AI_TOOL_SCHEMAS: list[dict] = [
+    {
+        "name": "list_converted_tables",
+        "description": (
+            "List the source object names whose schema has been converted to Aurora "
+            "DSQL DDL in this session (Schema Conversion). No arguments."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_converted_ddl",
+        "description": (
+            "Get the source MySQL DDL and the converted Aurora DSQL DDL for one table "
+            "or view, by name."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "object_name": {"type": "string", "description": "Table or view name."}
+            },
+            "required": ["object_name"],
+        },
+    },
+    {
+        "name": "list_objects_by_status",
+        "description": (
+            "List assessed source objects, optionally filtered by migration "
+            "classification (AUTO, MANUAL, or UNSUPPORTED)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "classification": {
+                    "type": "string",
+                    "enum": ["AUTO", "MANUAL", "UNSUPPORTED"],
+                }
+            },
+        },
+    },
+    {
+        "name": "get_assessment",
+        "description": (
+            "Get the compatibility assessment (classification, effort, risk, "
+            "recommendation) for one source object by name."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"object_name": {"type": "string"}},
+            "required": ["object_name"],
+        },
+    },
+    {
+        "name": "get_validation_summary",
+        "description": (
+            "Get the latest data-validation result: match verdict, matched/total "
+            "tables, and missing/extra row counts. No arguments."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_full_load_status",
+        "description": (
+            "Get Full Load progress (tables done/total/failed, rows loaded) and "
+            "whether CDC is streaming. No arguments."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "list_target_tables",
+        "description": (
+            "List the tables and views that currently EXIST on the target Aurora DSQL "
+            "cluster (a live, read-only catalog read). No arguments."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_target_schema",
+        "description": (
+            "Get the columns (name, type, nullable) and indexes of one table or view "
+            "AS IT EXISTS on the target Aurora DSQL cluster, by name (live catalog "
+            "read)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"object_name": {"type": "string"}},
+            "required": ["object_name"],
+        },
+    },
+    {
+        "name": "count_target_rows",
+        "description": (
+            "Count the rows currently in one table on the target Aurora DSQL cluster, "
+            "by name (a live SELECT COUNT(*); returns only the number, never row data)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"object_name": {"type": "string"}},
+            "required": ["object_name"],
+        },
+    },
+]
+
+# Appended to the general chat's system prompt so the model knows it HAS the tools
+# and should call them for specifics + present results visually (Markdown table / SQL).
+_AI_TOOLS_SYSTEM_HINT = (
+    "\n\nYou have read-only tools to look up this migration's REAL, current data "
+    "(converted DDL, the assessment, validation results, load status), plus a few that "
+    "read the LIVE target Aurora DSQL cluster (its existing tables, a table's schema, a "
+    "table's row count). When the user asks about specific objects or results, CALL the "
+    "tools and answer from the actual values -- never guess or answer generically. "
+    "Present the result visually: a Markdown table for a list/breakdown, a fenced "
+    "```sql block for DDL."
+)
+
 
 def build_page(
     config: AppConfig,
@@ -133,8 +253,24 @@ def build_page(
         handle = _ai_panel_holder.get("handle")
         return handle.open_scope(**kwargs) if handle is not None else None
 
+    def _ai_post_event(**kwargs: object) -> None:
+        # Mirror a MAJOR migration action into the AI panel's activity feed (a
+        # deterministic timeline entry the assistant is also made aware of). No-op
+        # until the panel is wired or when AI is off (post_event self-gates).
+        handle = _ai_panel_holder.get("handle")
+        if handle is not None:
+            handle.post_event(**kwargs)
+
     def _ai_context() -> MigrationContext:
-        # Credential-free "where you are" for the panel's baseline context chip.
+        # Credential-free "where you are" for the panel's baseline chip AND the general
+        # chat's grounding. We inject as much DETERMINISTIC, non-secret state as the tool
+        # has ACTUALLY produced as the operator worked through the steps -- connection
+        # coordinates, the assessment verdict, the schema-apply outcome, Full Load /CDC
+        # progress, the validation verdict -- so the assistant answers about THIS
+        # migration's real state, not generically. Every read is best-effort (a missing
+        # or empty store simply omits its line, never raises) and touches only counts /
+        # statuses / verdicts / non-secret coordinates -- no row values, PKs, checksums,
+        # credentials, or object names (Property 7).
         st = SESSION_STORE.get_or_create(session_id)
         view = st.active_view
         step = "Connect"
@@ -143,25 +279,334 @@ def build_page(
         mtype = ""
         if st.migration_type_chosen():
             mtype = str(getattr(st.migration_type, "value", "")).replace("_", " ")
-        return MigrationContext(current_step=step, migration_type=mtype)
+        facts: list[str] = []
+        # --- The assistant's own Bedrock model (so "which model are you?" is answerable
+        # from context, not guessed). Model id + region are non-secret. ---
+        _ai = getattr(st, "ai_assist", None)
+        if _ai is not None and getattr(_ai, "model_id", ""):
+            _m = f"AI assistant: this chat runs on Amazon Bedrock model {_ai.model_id}"
+            if getattr(_ai, "region", None):
+                _m += f" (region {_ai.region})"
+            facts.append(_m)
+        # --- Connect: source/target coordinates (session state) ---
+        sc = getattr(st, "source_config", None)
+        if sc is not None:
+            ver = getattr(st, "source_server_version", None)
+            src = f"Source: MySQL at {sc.host}"
+            if getattr(sc, "database", None):
+                src += f" (db {sc.database})"
+            if ver:
+                src += f", {ver}"
+            src += "; verified" if st.source_verified else "; not yet verified"
+            facts.append(src)
+        tc = getattr(st, "target_config", None)
+        if tc is not None:
+            tgt = (
+                f"Target: Aurora DSQL {tc.cluster_endpoint} in {tc.region} "
+                f"(db {tc.database}, role {tc.username})"
+            )
+            tgt += "; verified" if st.target_verified else "; not yet verified"
+            facts.append(tgt)
+        # --- Evaluation: assessment verdict (counts only) ---
+        try:
+            _ev = EVALUATION_STORE.get(session_id)
+            _res = _ev.result if _ev is not None else None
+            if _res is not None:
+                _c = {k.value: n for k, n in _res.assessment.summary.items()}
+                _total = sum(_c.values())
+                _line = (
+                    f"Assessment: {_total} objects — {_c.get('AUTO', 0)} auto, "
+                    f"{_c.get('MANUAL', 0)} review, {_c.get('UNSUPPORTED', 0)} unsupported"
+                )
+                _conf = len(_res.target_conflicts or [])
+                if _conf:
+                    _line += f", {_conf} target conflict(s)"
+                facts.append(_line)
+        except Exception:  # noqa: BLE001 - context is best-effort; never break the panel
+            pass
+        # --- Schema Conversion: bulk-apply outcome (counts only) ---
+        try:
+            from dsql_migrator.ui.schema_conversion import _summarize_apply
+            from dsql_migrator.ui.schema_conversion_apply import ObjectApplyStatus
+
+            _ar = SCHEMA_CONVERSION_STORE.get_or_create(session_id).apply_results
+            if _ar is not None:
+                _s = _summarize_apply(_ar)
+                facts.append(
+                    f"Schema apply: {_s[ObjectApplyStatus.CREATED]} created, "
+                    f"{_s[ObjectApplyStatus.SKIPPED]} skipped, "
+                    f"{_s[ObjectApplyStatus.FAILED]} failed"
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        # --- Data Migration: Full Load progress + CDC state (counts/booleans only) ---
+        try:
+            from dsql_migrator.ui.data_migration import (
+                _current_job,
+                summarize_progress,
+            )
+
+            _dm = DATA_MIGRATION_STORE.get_or_create(session_id)
+            _fl_job = _current_job(JOB_MANAGER, _dm.job_id)
+            if _fl_job is not None:
+                _fl = summarize_progress(_fl_job)
+                _line = f"Full Load: {_fl.done_tables}/{_fl.total_tables} tables done"
+                if _fl.failed_tables:
+                    _line += f", {_fl.failed_tables} failed"
+                _line += f", {_fl.rows_loaded:,} rows ({_fl.progress_pct:.0f}%)"
+                facts.append(_line)
+            if cdc_streaming_started(_dm, JOB_MANAGER):
+                _n = len(getattr(_dm, "cdc_connector_names", []) or [])
+                facts.append(
+                    f"CDC: streaming ({_n} connector{'' if _n == 1 else 's'})"
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        # --- Validation: latest verdict (counts only) ---
+        try:
+            from dsql_migrator.ui.validation import summarize_validation
+
+            _vr = VALIDATION_STORE.get_or_create(session_id).result
+            if _vr is not None:
+                _vs = summarize_validation(_vr)
+                _line = (
+                    f"Validation: {'MATCH' if _vs.is_match else 'MISMATCH'} "
+                    f"{_vs.matched_tables}/{_vs.total_tables} ({_vs.mode})"
+                )
+                if not _vs.is_match and (_vs.missing_on_target or _vs.extra_on_target):
+                    _line += (
+                        f" [missing {_vs.missing_on_target}, extra {_vs.extra_on_target}]"
+                    )
+                facts.append(_line)
+        except Exception:  # noqa: BLE001
+            pass
+        return MigrationContext(
+            current_step=step, migration_type=mtype, summary="\n".join(facts)
+        )
+
+    def _ai_tool_execute(name: str, args: dict) -> str:
+        # Run ONE read-only, credential-free AI tool over the UI stores and return a
+        # compact JSON string the model can read. Only schema (DDL) / names / counts /
+        # verdicts are ever returned -- NEVER row values or credentials (Property 7).
+        # A tool must never raise into the chat; any failure degrades to an error JSON.
+        import json as _json
+
+        args = args if isinstance(args, dict) else {}
+        try:
+            if name == "list_converted_tables":
+                from dsql_migrator.ui.schema_conversion import selected_object_names
+
+                _ids = SCHEMA_CONVERSION_STORE.get_or_create(
+                    session_id
+                ).generated_node_ids
+                _names = sorted(selected_object_names(_ids)) if _ids else []
+                return _json.dumps(
+                    {"status": "ok" if _names else "none",
+                     "converted": _names, "count": len(_names)}
+                )
+            if name == "get_converted_ddl":
+                from dsql_migrator.core.converter import (
+                    SchemaConverter,
+                    SchemaConvertOptions,
+                )
+                from dsql_migrator.ui.schema_conversion import (
+                    TABLE_PREFIX,
+                    VIEW_PREFIX,
+                    generate_previews,
+                )
+
+                _obj = str(args.get("object_name", "")).strip()
+                if not _obj:
+                    return _json.dumps({"status": "error", "message": "object_name required"})
+                _ev = EVALUATION_STORE.get_or_create(session_id).result
+                _inv = getattr(_ev, "inventory", None) if _ev is not None else None
+                if _inv is None:
+                    return _json.dumps(
+                        {"status": "not_run",
+                         "message": "Run Evaluation (Step 1) first to read the source schema."}
+                    )
+                _res = SchemaConverter().convert(_inv, SchemaConvertOptions())
+                _pv = generate_previews(
+                    [f"{TABLE_PREFIX}{_obj}", f"{VIEW_PREFIX}{_obj}"],
+                    _inv, _res, existence_checker=None,
+                )
+                _p = next((p for p in _pv if p.object_name == _obj), None)
+                if _p is None:
+                    return _json.dumps({"status": "not_found", "object_name": _obj})
+                return _json.dumps(
+                    {"status": "ok", "object_name": _p.object_name,
+                     "source_ddl": _p.source_ddl, "target_ddl": _p.target_ddl}
+                )
+            if name == "list_objects_by_status":
+                _ev = EVALUATION_STORE.get(session_id)
+                _r = _ev.result if _ev else None
+                if _r is None:
+                    return _json.dumps({"status": "not_run", "objects": []})
+                _items = _r.assessment.items
+                _want = str(args.get("classification", "")).strip().upper()
+                if _want:
+                    _items = [it for it in _items if it.classification.value == _want]
+                return _json.dumps(
+                    {"status": "ok", "count": len(_items),
+                     "objects": [
+                         {"object_name": it.object_name, "kind": it.kind,
+                          "classification": it.classification.value}
+                         for it in _items
+                     ]}
+                )
+            if name == "get_assessment":
+                _ev = EVALUATION_STORE.get(session_id)
+                _r = _ev.result if _ev else None
+                if _r is None:
+                    return _json.dumps({"status": "not_run"})
+                _obj = str(args.get("object_name", "")).strip().lower()
+                _m = next(
+                    (it for it in _r.assessment.items if it.object_name.lower() == _obj),
+                    None,
+                )
+                if _m is None:
+                    return _json.dumps(
+                        {"status": "not_found", "object_name": args.get("object_name")}
+                    )
+                return _json.dumps(
+                    {"status": "ok", "object_name": _m.object_name, "kind": _m.kind,
+                     "classification": _m.classification.value,
+                     "effort": _m.effort.value if _m.effort else None,
+                     "risk": _m.risk, "recommendation": _m.recommendation}
+                )
+            if name == "get_validation_summary":
+                from dsql_migrator.ui.validation import summarize_validation
+
+                _rep = VALIDATION_STORE.get_or_create(session_id).result
+                if _rep is None:
+                    return _json.dumps({"status": "not_run"})
+                _s = summarize_validation(_rep)
+                return _json.dumps(
+                    {"status": "ok", "is_match": _s.is_match,
+                     "matched_tables": _s.matched_tables, "total_tables": _s.total_tables,
+                     "mismatched_tables": _s.mismatched_tables,
+                     "missing_on_target": _s.missing_on_target,
+                     "extra_on_target": _s.extra_on_target, "mode": _s.mode}
+                )
+            if name == "get_full_load_status":
+                from dsql_migrator.ui.data_migration import (
+                    _current_job,
+                    summarize_progress,
+                )
+
+                _dm = DATA_MIGRATION_STORE.get_or_create(session_id)
+                _job = _current_job(JOB_MANAGER, _dm.job_id)
+                _out: dict = {"status": "ok", "full_load": None}
+                if _job is not None:
+                    _fl = summarize_progress(_job)
+                    _out["full_load"] = {
+                        "total_tables": _fl.total_tables, "done_tables": _fl.done_tables,
+                        "failed_tables": _fl.failed_tables, "rows_loaded": _fl.rows_loaded,
+                        "progress_pct": round(_fl.progress_pct, 1),
+                    }
+                _out["cdc_streaming"] = bool(cdc_streaming_started(_dm, JOB_MANAGER))
+                return _json.dumps(_out)
+            # --- LIVE target Aurora DSQL reads (read-only; schema/counts only) ------
+            if name in ("list_target_tables", "get_target_schema", "count_target_rows"):
+                _st = SESSION_STORE.get_or_create(session_id)
+                _tc = getattr(_st, "target_config", None)
+                if _tc is None or not getattr(_st, "target_verified", False):
+                    return _json.dumps(
+                        {"status": "not_connected",
+                         "message": "Connect and verify the target on Connect first."}
+                    )
+                from dsql_migrator.ui.evaluation import _default_target_browser_factory
+
+                _profile = getattr(_st, "aws_profile", None)
+                _inv = _default_target_browser_factory(_profile).browse(_tc)
+                _rels = [
+                    r
+                    for sch in _inv.schemas
+                    for r in (list(sch.tables) + list(sch.views))
+                ]
+                if name == "list_target_tables":
+                    return _json.dumps(
+                        {"status": "ok", "count": len(_rels),
+                         "objects": [
+                             {"name": r.qualified_name, "kind": r.kind.value}
+                             for r in _rels
+                         ]}
+                    )
+                _obj = str(args.get("object_name", "")).strip().lower()
+                _rel = next(
+                    (r for r in _rels
+                     if r.name.lower() == _obj or r.qualified_name.lower() == _obj),
+                    None,
+                )
+                if _rel is None:
+                    return _json.dumps(
+                        {"status": "not_found", "object_name": args.get("object_name"),
+                         "message": "No such table/view exists on the target yet."}
+                    )
+                if name == "get_target_schema":
+                    return _json.dumps(
+                        {"status": "ok", "name": _rel.qualified_name,
+                         "kind": _rel.kind.value,
+                         "columns": [
+                             {"name": c.name, "type": c.data_type, "nullable": c.nullable}
+                             for c in _rel.columns
+                         ],
+                         "indexes": [
+                             {"name": i.name, "unique": i.unique} for i in _rel.indexes
+                         ]}
+                    )
+                # count_target_rows: a live COUNT(*) with catalog-resolved, quoted
+                # identifiers (injection-safe) -- returns only the number, no row data.
+                from psycopg import sql as _sql
+
+                from dsql_migrator.core.target_connection import DsqlConnector
+
+                _conn = DsqlConnector(_tc, aws_profile=_profile).connect()
+                try:
+                    with _conn.cursor() as _cur:
+                        _cur.execute(
+                            _sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
+                                _sql.Identifier(_rel.schema_name),
+                                _sql.Identifier(_rel.name),
+                            )
+                        )
+                        _row = _cur.fetchone()
+                finally:
+                    try:
+                        _conn.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                return _json.dumps(
+                    {"status": "ok", "name": _rel.qualified_name,
+                     "row_count": int(_row[0]) if _row else 0}
+                )
+            return _json.dumps({"status": "error", "message": f"unknown tool {name}"})
+        except Exception:  # noqa: BLE001 - a tool must never break the chat
+            return _json.dumps({"status": "error", "message": "tool lookup failed"})
 
     def _general_ai_streamer() -> object:
         # The panel's "ask anything about this migration" streamer, used when it is
-        # opened from the header with no specific object scope. Grounded on the
-        # current MigrationContext and carrying the same migration-only guardrail as
-        # the per-object chats. None when AI is off (the panel stays inert then).
+        # opened from the header with no specific object scope. Grounded on the current
+        # MigrationContext + given READ-ONLY tools (function calling) so it can look up
+        # this migration's real data (converted DDL, assessment, validation, load
+        # status) on demand and answer with actual values, not generically. Carries the
+        # same migration-only guardrail. None when AI is off (the panel stays inert).
         st = SESSION_STORE.get_or_create(session_id)
         if not st.ai_assist.enabled:
             return None
         strategist = AssessmentStrategist(st.ai_assist, aws_profile=st.aws_profile)
         ctx = _ai_context()
-        system = build_general_chat_system(
-            current_step=ctx.current_step,
-            migration_type=ctx.migration_type,
-            summary=ctx.summary,
+        system = (
+            build_general_chat_system(
+                current_step=ctx.current_step,
+                migration_type=ctx.migration_type,
+                summary=ctx.summary,
+            )
+            + _AI_TOOLS_SYSTEM_HINT
         )
-        return lambda messages, on_delta: strategist.stream_chat(
-            system, messages, on_delta
+        return lambda messages, on_delta: strategist.tool_chat(
+            system, messages, on_delta,
+            tools=_AI_TOOL_SCHEMAS, execute=_ai_tool_execute,
         )
 
     # Build each step's (content_builder, runner). These only prepare closures;
@@ -175,6 +620,11 @@ def build_page(
         job_manager=JOB_MANAGER,
         eval_store=EVALUATION_STORE,
         open_ai_scope=_open_ai_scope,
+        ai_post_event=_ai_post_event,
+        # Give the per-object/finding guidance chat the same read-only tools the
+        # general chat has, so it can answer wider-migration questions too.
+        ai_tool_execute=_ai_tool_execute,
+        ai_tools=_AI_TOOL_SCHEMAS,
     )
     # Step 2 (Schema Conversion): object browsing, DDL preview, query conversion,
     # and target apply.
@@ -199,6 +649,7 @@ def build_page(
             DATA_MIGRATION_STORE.get_or_create(session_id), JOB_MANAGER
         ),
         open_ai_scope=_open_ai_scope,
+        ai_post_event=_ai_post_event,
     )
     # Data Migration is a single step with an inner migration-type selector
     # (Full load only / CDC only / Full load + CDC). One builder serves it; the
@@ -216,6 +667,7 @@ def build_page(
         cdc_secret_kms_key_id=config.cdc_secret_kms_key_id,
         validation_store=VALIDATION_STORE,
         open_ai_scope=_open_ai_scope,
+        ai_post_event=_ai_post_event,
     )
     # Step 4 (Validation): compares the migrated target against the source as-of
     # the Step 3 watermark and reports consistency and drift.
@@ -229,6 +681,7 @@ def build_page(
         # Lets a CHECKSUM run resolve the APPLIED target types (Schema-Conversion remaps).
         conversion_store=SCHEMA_CONVERSION_STORE,
         open_ai_scope=_open_ai_scope,
+        ai_post_event=_ai_post_event,
     )
     # Step 6 (Cut over): guidance for switching the application from MySQL to
     # DSQL. The tool cannot perform/verify the cut-over, so this step has no job —
@@ -239,6 +692,7 @@ def build_page(
         session_id,
         validation_store=VALIDATION_STORE,
         job_manager=JOB_MANAGER,
+        ai_post_event=_ai_post_event,
     )
     # Optional tool (not a workflow step): the Query Playground — convert a MySQL
     # statement to DSQL and non-destructively test whether it runs on the target.
@@ -247,6 +701,7 @@ def build_page(
         session_id,
         playground_store=PLAYGROUND_STORE,
         open_ai_scope=_open_ai_scope,
+        ai_post_event=_ai_post_event,
     )
 
     def schema_run_guard() -> str | None:
@@ -916,6 +1371,8 @@ def build_page(
                 on_next=go_to_first_step,
                 on_connection_change=on_connection_change,
                 defaults=connect_defaults,
+                open_ai_scope=_open_ai_scope,
+                ai_post_event=_ai_post_event,
             )
         ),
         step_content={

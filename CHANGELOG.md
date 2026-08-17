@@ -5,6 +5,50 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.368
+
+The AI assistant grew from a per-object Q&A box into an **agentic, migration-aware helper**.
+
+### Added
+
+- **Tool-using AI (in-process function calling, not an MCP server).** The general chat —
+  and each per-object/finding chat — can call read-only, credential-free tools to answer
+  specific questions from the migration's REAL data: list converted tables, show an
+  object's converted DSQL DDL, list/inspect assessed objects by classification, the
+  validation verdict, Full Load/CDC status, plus LIVE target-DSQL reads (existing tables,
+  a table's schema, a table's row count). Results render as Markdown tables/code. Tools
+  return only schema/counts/verdicts — never row values or credentials (Property 7).
+- **Activity feed.** Major actions are mirrored into the panel as deterministic timeline
+  events: Evaluation (with a visual Automatic/Review/Unsupported breakdown bar), Schema
+  Conversion generate + apply, Full Load start, Validation, Cut over, connection tests,
+  and step transitions. An unseen-count badge shows on the collapsed reopen tab.
+- **Connection-error AI help.** A failed connection test is auto-recorded and offers a
+  one-click "Ask AI to help fix this" that diagnoses from the exact entered values.
+- **Per-finding AI guidance** in Evaluation (a compact icon on each review finding),
+  a **Stop** button for a streaming reply, and a **connected-model chip** under the composer.
+
+### Changed
+
+- **A real chat surface:** roomy multi-line composer (Enter sends, Shift+Enter newline;
+  per-message cap raised 1000→4000 for pasted DDL), full-width replies, a wider panel,
+  a character counter, and design-system components for the activity chip + a segmented
+  distribution bar (single source of truth in `ui/design.py`).
+- **Context-grounded, never generic.** Every chat is grounded on injected deterministic
+  cross-step context (source/target coordinates + versions, migration type, assessment /
+  schema-apply / Full Load / CDC / validation state, and the connected model) and a shared
+  response-style directive: answer from the provided facts/tools with scannable Markdown,
+  not textbook advice. A per-object chat can now also answer wider-migration questions
+  via its tools instead of declining.
+- **Durable transcript.** The AI conversation now survives an unexpected app restart / crash
+  (persisted in the session snapshot, bounded to recent messages), not just a browser
+  refresh; "Start over" still clears it.
+
+### Fixed
+
+- Activity events posted from background job threads now render live (they were silently
+  dropped), via a UI-loop drain timer; a restored-open panel no longer leaves the composer
+  disabled with no way to start a chat.
+
 ## v0.1.367
 
 ### Changed

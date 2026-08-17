@@ -943,6 +943,9 @@ def build_evaluation_screen(
     target_browser_factory: TargetBrowserFactory = _default_target_browser_factory,
     strategist_factory: StrategistFactory = _default_strategist_factory,
     open_ai_scope: Optional[Callable[..., object]] = None,
+    ai_post_event: Optional[Callable[..., object]] = None,
+    ai_tool_execute: Optional[Callable[[str, dict], str]] = None,
+    ai_tools: Optional[list] = None,
 ) -> tuple[Callable[[Callable[[], None]], None], Callable[[], None]]:
     """Build the Evaluation screen, returning ``(content_builder, runner)``.
 
@@ -995,6 +998,11 @@ def build_evaluation_screen(
                 status=ActivityStatus.STARTED,
                 detail="assessing the source schema against Aurora DSQL",
             )
+            if ai_post_event is not None:
+                ai_post_event(
+                    text="Started compatibility assessment of the source against Aurora DSQL",
+                    status="started",
+                )
             try:
                 result = run_evaluation(
                     inputs,
@@ -1011,6 +1019,14 @@ def build_evaluation_screen(
                     detail=f"{type(exc).__name__}: {exc}",
                     exc=exc,
                 )
+                if ai_post_event is not None:
+                    # Keep the event lean: the type is the useful signal; the full
+                    # exception message can be long/verbose (and is already in the
+                    # activity log), so it is not sent into the AI feed/grounding.
+                    ai_post_event(
+                        text=f"Compatibility assessment failed ({type(exc).__name__})",
+                        status="error",
+                    )
                 raise
             eval_state.set_result(result)
             report = result.assessment
@@ -1025,6 +1041,29 @@ def build_evaluation_screen(
                     f"{conflicts} target conflict(s)"
                 ),
             )
+            if ai_post_event is not None:
+                # Friendly, short text (also the AI's grounding line) + structured data
+                # so the panel renders a VISUAL breakdown bar instead of a wall of text.
+                _sm = {k.value: v for k, v in report.summary.items()}
+                _auto = _sm.get("AUTO", 0)
+                _man = _sm.get("MANUAL", 0)
+                _uns = _sm.get("UNSUPPORTED", 0)
+                ai_post_event(
+                    text=(
+                        f"Assessment complete: {len(report.items)} objects — "
+                        f"{_auto} automatic, {_man} need review, {_uns} unsupported"
+                        + (f"; {conflicts} already on target" if conflicts else "")
+                    ),
+                    status="success",
+                    kind="assessment",
+                    data={
+                        "total": len(report.items),
+                        "auto": _auto,
+                        "manual": _man,
+                        "unsupported": _uns,
+                        "conflicts": conflicts,
+                    },
+                )
 
         eval_state.job_id = job_manager.submit(work)
 
@@ -1134,7 +1173,20 @@ def build_evaluation_screen(
                     strategist = strategist_factory(
                         session.ai_assist, session.aws_profile
                     )
-                    guidance_provider = strategist.stream_object_chat
+                    if ai_tool_execute is not None:
+                        # Give the per-object/finding chat the SAME read-only tools the
+                        # general chat has, so a chat started on ONE object can still
+                        # answer WIDER-migration questions (e.g. "list all unsupported
+                        # objects") by looking up the real data instead of refusing.
+                        def guidance_provider(  # noqa: ANN001
+                            item, messages, on_delta, _s=strategist
+                        ):
+                            return _s.stream_object_chat(
+                                item, messages, on_delta,
+                                tools=ai_tools or [], execute=ai_tool_execute,
+                            )
+                    else:
+                        guidance_provider = strategist.stream_object_chat
                 _render_result(
                     ui,
                     result,
@@ -1339,6 +1391,17 @@ def _guidance_question(item: "AssessmentItem") -> str:
     )
 
 
+def _concern_question(item: "AssessmentItem", concern: object) -> str:
+    """Phrase a guidance request about ONE specific finding on an object."""
+    rule = getattr(concern, "rule_id", "") or item.rule_id
+    risk = (getattr(concern, "risk", "") or "").strip()
+    detail = f' The concern: "{risk}".' if risk else ""
+    return (
+        f"On {item.object_name} ({item.kind}), migrating to Amazon Aurora DSQL, help "
+        f"me with the {rule} finding.{detail} What exactly should I do about it?"
+    )
+
+
 def _build_guidance_drawer(
     guidance_provider: Callable[
         ["AssessmentItem", "list[dict[str, str]]", Callable[[str], None]],
@@ -1346,7 +1409,7 @@ def _build_guidance_drawer(
     ],
     *,
     open_ai_scope: Optional[Callable[..., object]] = None,
-) -> Optional[Callable[["AssessmentItem"], object]]:
+) -> Optional[Callable[..., object]]:
     """Return an opener that deep-links one object's AI guidance into the panel.
 
     Guidance opens in the persistent app-wide AI panel
@@ -1359,13 +1422,25 @@ def _build_guidance_drawer(
     if open_ai_scope is None:
         return None
 
-    def open_guidance(item: "AssessmentItem") -> None:
+    def open_guidance(item: "AssessmentItem", concern: object = None) -> None:
+        # A per-FINDING icon passes its concern -> a distinct scope + a question about
+        # that specific finding; the object-level fallback (concern None) keeps the
+        # whole-object question. Either way the streamer grounds on the whole item.
+        rule = getattr(concern, "rule_id", None)
+        if concern is not None and rule:
+            scope_id = f"evaluation:{item.object_name}:{rule}"
+            subtitle = f"{item.object_name} \u00b7 {rule}"
+            seed = _concern_question(item, concern)
+        else:
+            scope_id = f"evaluation:{item.object_name}"
+            subtitle = f"{item.object_name} \u00b7 {item.kind}"
+            seed = _guidance_question(item)
         open_ai_scope(
-            scope_id=f"evaluation:{item.object_name}",
+            scope_id=scope_id,
             title="AI migration guidance",
-            subtitle=f"{item.object_name} \u00b7 {item.kind}",
+            subtitle=subtitle,
             chip=f"Evaluation \u00b7 {item.object_name}",
-            seed_question=_guidance_question(item),
+            seed_question=seed,
             streamer=lambda messages, on_delta: guidance_provider(
                 item, messages, on_delta
             ),
@@ -1649,12 +1724,11 @@ def _render_assessment_item(
 ) -> None:
     """Render one assessed object as an expandable row (header + detail body).
 
-    For an object that needs attention (not AUTO), the expanded body offers an
-    on-demand "AI guidance" affordance that opens the fixed right drawer
-    (``on_ai``). It sits in the body -- not the header -- so a click never
-    toggles the expansion. When AI assist is off (``ai_enabled`` False) the
-    button is shown disabled with a hint, so the affordance is discoverable
-    rather than silently missing.
+    For an object that needs attention (not AUTO), the header row carries a compact
+    on-demand AI-guidance ICON that opens the side panel for this object (``on_ai``),
+    so guidance is one click away without expanding the row; ``click.stop`` keeps that
+    click from toggling the expansion. When AI assist is off the icon is shown disabled
+    with a hint, so the affordance is discoverable rather than silently missing.
     """
     is_auto = item.classification.value == "AUTO"
     color = _CLASS_BADGE_COLOR.get(item.classification.value, "grey")
@@ -1755,8 +1829,10 @@ def _render_assessment_item(
                                 ui.label(concern.rule_id).classes(  # type: ignore[attr-defined]
                                     "text-xs text-gray-500 font-mono"
                                 )
+                                # Push the effort badge + per-finding AI icon to the
+                                # right of the concern's header line.
+                                ui.space()  # type: ignore[attr-defined]
                                 if concern.effort is not None:
-                                    ui.space()  # type: ignore[attr-defined]
                                     # "if you take it" makes clear the estimate is the
                                     # cost of OPTING IN, not required migration work --
                                     # it is excluded from the object's effort for exactly
@@ -1769,6 +1845,12 @@ def _render_assessment_item(
                                         if advisory
                                         else f"effort: {concern.effort.value}"
                                     ).props(f"color={_EFFORT_BADGE_COLOR} outline")
+                                # Per-FINDING AI guidance icon: ask AI about THIS
+                                # specific finding on this object (one click).
+                                _render_item_ai_action(
+                                    ui, item, on_ai=on_ai, ai_enabled=ai_enabled,
+                                    concern=concern,
+                                )
                             # Problem and fix are LABELED and visually separated. A bare
                             # sentence followed by a fainter arrowed sentence read as one
                             # wrapped paragraph -- the arrow was the only cue that the
@@ -1827,46 +1909,41 @@ def _render_assessment_item(
                         "text-sm font-semibold"
                     )
                     ui.label(item.recommendation).classes("text-sm")  # type: ignore[attr-defined]
-            # On-demand AI guidance for objects that need attention. AUTO objects
-            # convert automatically and have nothing to remediate, so the
-            # affordance is offered only on non-AUTO objects (matches the schema
-            # conversion screen, and avoids needless Bedrock calls).
-            if not is_auto:
-                _render_item_ai_action(
-                    ui, item, on_ai=on_ai, ai_enabled=ai_enabled
-                )
 
 
 def _render_item_ai_action(
     ui: object,
     item: "AssessmentItem",
     *,
-    on_ai: Optional[Callable[["AssessmentItem"], object]],
+    on_ai: Optional[Callable[..., object]],
     ai_enabled: bool,
+    concern: object = None,
 ) -> None:
-    """Render the per-object "AI guidance" button that opens the right drawer.
+    """Render an AI-guidance affordance as a compact ICON button next to a finding.
 
-    When AI assist is on, the button opens the fixed right drawer and triggers
-    on-demand generation for this object (``on_ai`` is the async opener). When AI
-    is off the button is shown disabled with a hint so the affordance stays
-    discoverable rather than silently missing.
+    Sits on the right of a concern's header line in the item body, so guidance for
+    THAT specific finding is one click away. When AI assist is on it opens the side
+    panel and asks about the finding (``on_ai(item, concern)``). When AI is off the
+    icon is shown disabled with a hint, so the affordance stays discoverable rather
+    than silently missing. ``concern`` is the finding this icon is attached to (its
+    text scopes the AI question); ``None`` falls back to object-level guidance.
     """
     if ai_enabled and on_ai is not None:
-        ui.button(  # type: ignore[attr-defined]
-            "AI guidance",
-            icon="auto_awesome",
-            on_click=lambda _e=None, it=item: on_ai(it),
-        ).props("flat dense color=indigo-6").classes("self-start").tooltip(
-            "Open AI guidance for this object in the side panel."
+        btn = ui.button(icon="auto_awesome")  # type: ignore[attr-defined]
+        btn.props("flat round dense size=sm color=indigo-6")
+        # `.stop` so the click never toggles an enclosing expansion.
+        btn.on(  # type: ignore[attr-defined]
+            "click.stop", lambda _e=None, it=item, cc=concern: on_ai(it, cc)
         )
+        btn.tooltip("Ask AI about this finding")  # type: ignore[attr-defined]
     else:
-        disabled = ui.button("AI guidance", icon="auto_awesome")  # type: ignore[attr-defined]
-        disabled.props("flat dense").classes("self-start")
+        disabled = ui.button(icon="auto_awesome")  # type: ignore[attr-defined]
+        disabled.props("flat round dense size=sm color=grey-5")
         disabled.disable()  # type: ignore[attr-defined]
         disabled.tooltip(  # type: ignore[attr-defined]
-            "Enable AI Assist on the Connect screen (toggle it on, "
-            "set the Bedrock model, and re-test the connection), then reopen this "
-            "step to get on-demand guidance for this object."
+            "Enable AI Assist on the Connect screen (toggle it on, set the Bedrock "
+            "model, and re-test the connection) to get on-demand guidance for this "
+            "finding."
         )
 
 

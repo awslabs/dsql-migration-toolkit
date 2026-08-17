@@ -220,6 +220,30 @@ def test_render_notice_unknown_tone_falls_back_to_info() -> None:
     assert NOTICE_STYLE["info"][3] in ui.icons
 
 
+def test_render_activity_event_is_a_cohesive_tinted_chip() -> None:
+    from dsql_migrator.ui.design import ACTIVITY_EVENT_STYLE, render_activity_event
+
+    ui = _RecordingUi()
+    render_activity_event(ui, "Source (MySQL) connection test failed", tone="error")
+    assert "Source (MySQL) connection test failed" in ui.texts
+    blob = " ".join(ui.classes)
+    bg, border, icon_color, icon = ACTIVITY_EVENT_STYLE["error"]
+    # Cohesive: tinted background + matching border + matching icon color (not a bare
+    # white box with a loud edge), and the tone's default glyph.
+    assert bg in blob and border in blob and icon_color in blob
+    assert icon in ui.icons
+    # Text stays dark and readable, not faint gray.
+    assert "text-gray-700" in blob
+
+
+def test_render_activity_event_unknown_tone_falls_back_to_info() -> None:
+    from dsql_migrator.ui.design import ACTIVITY_EVENT_STYLE, render_activity_event
+
+    ui = _RecordingUi()
+    render_activity_event(ui, "Something happened", tone="bogus")
+    assert ACTIVITY_EVENT_STYLE["info"][3] in ui.icons
+
+
 def test_render_notice_icon_override() -> None:
     ui = _RecordingUi()
     render_notice(ui, tone="info", header="Cost", body="x", icon="payments")

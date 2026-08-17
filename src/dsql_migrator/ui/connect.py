@@ -389,6 +389,8 @@ def build_connect_page(
     on_next: Optional[Callable[[], None]] = None,
     on_connection_change: Optional[Callable[[], None]] = None,
     defaults: Optional[ConnectDefaults] = None,
+    open_ai_scope: Optional[Callable[..., object]] = None,
+    ai_post_event: Optional[Callable[..., object]] = None,
 ) -> None:
     """Render the Connect screen for one session.
 
@@ -436,6 +438,70 @@ def build_connect_page(
     state = store.get_or_create(session_id)
     # Dev-only prefill values (blank/normal defaults when not provided).
     d = defaults or ConnectDefaults()
+
+    def _open_conn_error_ai(*, side: str, coordinates: str, detail: str) -> None:
+        # Deep-link the persistent AI panel to help diagnose a FAILED connection test.
+        # Gated on AI Assist being set up (the same gate the rest of the AI feature
+        # uses): when it is off, or the panel is not wired, this is a no-op and no
+        # "Ask AI" affordance is shown. Credential-free: only the non-secret
+        # coordinates + the tool's credential-free failure detail reach the model
+        # (Property 7).
+        if open_ai_scope is None or not state.ai_assist.enabled:
+            return
+        from dsql_migrator.core.assessment_strategist import (
+            AssessmentStrategist,
+            build_connection_error_chat_system,
+        )
+
+        label = "source (MySQL)" if side == "source" else "target (Aurora DSQL)"
+        system = build_connection_error_chat_system(
+            side=side, coordinates=coordinates, error_message=detail
+        )
+        strategist = AssessmentStrategist(
+            state.ai_assist, aws_profile=getattr(state, "aws_profile", None)
+        )
+        open_ai_scope(
+            scope_id=f"connect:{side}",
+            title="AI connection help",
+            subtitle=f"Connect · {label}",
+            chip=f"Connect · {label}",
+            seed_question=(
+                f"The {label} connection test failed with the error shown. Why did it "
+                "fail, and how do I fix it?"
+            ),
+            streamer=lambda messages, on_delta: strategist.stream_chat(
+                system, messages, on_delta
+            ),
+        )
+
+    def _reflect_conn_test(
+        container: object, *, side: str, success: bool, coordinates: str, detail: str
+    ) -> None:
+        # Hybrid AI reflection of a connection test (see the design note in the AI
+        # panel): AUTO-RECORD the outcome into the AI activity feed -- a deterministic
+        # event, NO model call, so the AI window always reflects what happened -- and,
+        # on a FAILURE with AI set up, offer a ONE-CLICK "Ask AI to help fix this"
+        # affordance that actually invokes the model (paid reasoning stays explicit).
+        label = "Source (MySQL)" if side == "source" else "Target (Aurora DSQL)"
+        if ai_post_event is not None:
+            # post_event self-gates on AI being enabled; no-op otherwise.
+            if success:
+                ai_post_event(text=f"{label} connection verified", status="success")
+            else:
+                ai_post_event(text=f"{label} connection test failed", status="error")
+        if getattr(container, "is_deleted", False):
+            return
+        container.clear()  # type: ignore[attr-defined]
+        if success or open_ai_scope is None or not state.ai_assist.enabled:
+            return
+        with container:  # type: ignore[attr-defined]
+            ui.button(
+                "Ask AI to help fix this",
+                icon="auto_awesome",
+                on_click=lambda: _open_conn_error_ai(
+                    side=side, coordinates=coordinates, detail=detail
+                ),
+            ).props("flat dense no-caps color=indigo-6")
 
     # The form is a view of the session's connection state: when a connection was
     # already entered this session, prefill the (non-secret) fields from it so
@@ -853,12 +919,25 @@ def build_connect_page(
                     result.detail,
                     type="positive" if result.success else "negative",
                 )
+                _reflect_conn_test(
+                    source_ai_help,
+                    side="source",
+                    success=result.success,
+                    coordinates=(
+                        f"MySQL host={config.host} port={config.port} "
+                        f"database={config.database or '(not set)'}"
+                    ),
+                    detail=result.detail,
+                )
                 update_next_state()
 
             source_test_button = ui.button("Test source connection")
             source_test_button.on_click(
                 lambda: run_busy(source_test_button, on_test_source)
             )
+            # Holder for the on-failure "Ask AI to help fix this" affordance (shown
+            # only when a test fails and AI Assist is set up); populated per test.
+            source_ai_help = ui.row().classes("w-full q-mt-xs")
 
         # The optional global AWS-profile selector sits here -- directly above the
         # Target, where the AWS identity is actually used (DSQL token, and below it
@@ -998,12 +1077,25 @@ def build_connect_page(
                     result.detail,
                     type="positive" if result.success else "negative",
                 )
+                _reflect_conn_test(
+                    target_ai_help,
+                    side="target",
+                    success=result.success,
+                    coordinates=(
+                        f"Aurora DSQL endpoint={config.cluster_endpoint} "
+                        f"region={config.region} database={config.database} "
+                        f"role={config.username}"
+                    ),
+                    detail=result.detail,
+                )
                 update_next_state()
 
             target_test_button = ui.button("Test target connection")
             target_test_button.on_click(
                 lambda: run_busy(target_test_button, on_test_target)
             )
+            # Holder for the on-failure "Ask AI to help fix this" affordance.
+            target_ai_help = ui.row().classes("w-full q-mt-xs")
 
         # --- AI-assisted conversion (optional, augmenting) -----------------
         with ui.card().classes("w-full"):

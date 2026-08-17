@@ -1184,7 +1184,22 @@ def build_workflow_sidebar(
         if on_state_change is not None:
             on_state_change()
 
+    def _announce_nav(view: object, previous: object) -> None:
+        # Mirror a genuine STEP transition into the AI panel's activity feed so the
+        # conversation follows along ("Moved to the Evaluation step"). Only for a real
+        # WorkflowStep that actually changed (not re-selecting the same step, not
+        # opening an optional tool); post_event self-gates when AI is off.
+        if view == previous or not isinstance(view, WorkflowStep):
+            return
+        try:
+            ai_panel.post_event(
+                text=f"Moved to the {step_title(view)} step", status="info"
+            )
+        except Exception:  # noqa: BLE001 - the feed is best-effort, never break nav
+            pass
+
     def select(view: object) -> None:
+        previous = selected.get("view")
         # An optional tool (string key, not a WorkflowStep) is reachable once the
         # connections are unlocked, in any order -- it has no workflow gating. The
         # dev escape hatch (DSQL_MIGRATOR_DEV_UNLOCK_STEPS) opens ANY step for local
@@ -1239,6 +1254,7 @@ def build_workflow_sidebar(
         state.set_active_view(
             view.value if isinstance(view, WorkflowStep) else _CONNECT_VIEW
         )
+        _announce_nav(view, previous)
         refresh_all()
 
     def go_to_first_step() -> None:
@@ -1274,6 +1290,10 @@ def build_workflow_sidebar(
         state=state,
         get_context=ai_context_getter,
         general_streamer_factory=ai_general_streamer_factory,
+        # Persist the session (dirty-checked) after a chat turn / activity event /
+        # open-close, so the transcript survives an unexpected app restart even with
+        # no intervening navigation. Only ever invoked from the UI event loop.
+        on_change=on_state_change,
     )
     if on_ai_panel_ready is not None:
         on_ai_panel_ready(ai_panel)

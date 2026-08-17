@@ -34,6 +34,7 @@ _LOGGER = logging.getLogger(__name__)
 from pydantic import BaseModel, ConfigDict, Field
 
 from dsql_migrator.core.models import (
+    AiConversation,
     AssessmentReport,
     SourceInventory,
     TableSelection,
@@ -139,6 +140,11 @@ class SessionSnapshot(BaseModel):
     ai_assist_enabled: bool = False
     ai_assist_model_id: Optional[str] = None
     ai_assist_region: Optional[str] = None
+    # The persistent AI-assistant transcript (messages + active scope + open/closed),
+    # so the conversation survives an app restart / crash -- not just a browser
+    # refresh. Credential-free and row-data-free (Property 7); "Start over" deletes the
+    # whole snapshot, so an intentional reset still clears it. None on older snapshots.
+    ai_conversation: Optional[AiConversation] = None
     workflow_unlocked: bool = False
     # The workflow view the user was last looking at ("connect" or a WorkflowStep
     # value) so a reconnect reopens the same step instead of resetting to Connect.

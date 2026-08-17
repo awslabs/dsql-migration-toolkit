@@ -329,6 +329,7 @@ def build_data_migration_screen(
     cdc_secret_kms_key_id: Optional[str] = None,
     validation_store: Optional[object] = None,
     open_ai_scope: Optional[Callable[..., object]] = None,
+    ai_post_event: Optional[Callable[..., object]] = None,
 ) -> tuple[Callable[[Callable[[], None]], None], Callable[[], None]]:
     """Build the Data Migration screen, returning ``(content_builder, runner)``.
 
@@ -497,6 +498,15 @@ def build_data_migration_screen(
             )
 
         migration_state.job_id = job_manager.submit(work)
+        # Mirror the Full Load start into the AI activity feed (deterministic; the
+        # completion event is posted from the live poll as the job reaches a terminal
+        # state). ``tables`` is the resolved selection, so the count is exact here.
+        if ai_post_event is not None:
+            _n = len(tables)
+            ai_post_event(
+                text=f"Started Full Load for {_n} table{'' if _n == 1 else 's'}",
+                status="started",
+            )
 
     def content(refresh: Callable[[], None]) -> None:
         migration_type = migration_state.migration_type

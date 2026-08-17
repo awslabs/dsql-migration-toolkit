@@ -370,6 +370,58 @@ def test_capture_then_apply_restores_full_session() -> None:
     assert m2.active_substep == "full_load"
 
 
+def test_ai_conversation_round_trips_through_a_snapshot() -> None:
+    # The AI transcript is durable: it survives an app restart (snapshot round-trip),
+    # not just a browser refresh. Credential-free content only.
+    from dsql_migrator.core.models import AiConversation, AiScope
+    from dsql_migrator.ui.session_persistence import session_signature
+
+    session = SessionConnectionState()
+    session.ai_conversation = AiConversation(
+        messages=[
+            {"role": "user", "text": "How do I convert orders?"},
+            {"role": "assistant", "text": "Use IDENTITY."},
+            {
+                "role": "event", "text": "Assessment complete", "status": "success",
+                "kind": "assessment",
+                "data": {"auto": 2, "manual": 38, "unsupported": 15},
+            },
+        ],
+        active_scope=AiScope(scope_id="general", title="AI assistant"),
+        visible=True,
+    )
+    eval_state = EvaluationState()
+    conv_state = SchemaConversionState()
+    migration_state = DataMigrationState()
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+
+    s2 = SessionConnectionState()
+    apply_session_snapshot(
+        snapshot, s2, EvaluationState(), SchemaConversionState(), DataMigrationState()
+    )
+    # Transcript, event data, active scope, and open state all survive.
+    assert [m["text"] for m in s2.ai_conversation.messages] == [
+        "How do I convert orders?", "Use IDENTITY.", "Assessment complete"
+    ]
+    assert s2.ai_conversation.messages[2]["data"] == {
+        "auto": 2, "manual": 38, "unsupported": 15
+    }
+    assert s2.ai_conversation.active_scope.scope_id == "general"
+    assert s2.ai_conversation.visible is True
+    # The restored transcript is an independent deep copy of the snapshot's.
+    s2.ai_conversation.messages.append({"role": "user", "text": "x"})
+    assert len(snapshot.ai_conversation.messages) == 3
+
+    # A new chat turn changes the signature, so the persistence hook saves it.
+    base = session_signature(session, eval_state, conv_state, migration_state)
+    session.ai_conversation.messages.append({"role": "user", "text": "another"})
+    assert (
+        session_signature(session, eval_state, conv_state, migration_state) != base
+    )
+
+
 def test_cdc_state_round_trips() -> None:
     session, eval_state, conv_state, migration_state = _populated_states()
     migration_state.set_cdc_start_mode("manual")

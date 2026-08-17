@@ -124,6 +124,102 @@ def render_notice(
 
 
 # ---------------------------------------------------------------------------
+# Activity event chip (AI panel timeline / "StatusIndicator" for an action)
+# ---------------------------------------------------------------------------
+
+# One migration ACTION mirrored into the AI panel's activity feed (Start Full Load,
+# Apply schema, Run validation, a connection test, ...). Lighter than a full
+# :func:`render_notice` Alert (it is a compact timeline line, not a call-to-action)
+# but still a COHESIVE tinted chip -- tinted background + matching border + matching
+# icon + dark, readable text -- so the feed reads as a calm, legible timeline rather
+# than a bare box with a loud edge. tone -> (background, border, icon-color, icon).
+# ``started`` reuses the info palette's blue family so an in-flight action reads as
+# neutral-active, distinct from success/warning/error.
+ACTIVITY_EVENT_STYLE: dict[str, Tuple[str, str, str, str]] = {
+    "started": ("bg-indigo-50", "border-indigo-200", "text-indigo-600", "play_circle"),
+    "running": ("bg-indigo-50", "border-indigo-200", "text-indigo-600", "play_circle"),
+    "success": ("bg-green-50", "border-green-200", "text-green-600", "check_circle"),
+    "info": ("bg-sky-50", "border-sky-200", "text-sky-600", "info"),
+    "warning": ("bg-amber-50", "border-amber-200", "text-amber-600", "warning"),
+    "error": ("bg-red-50", "border-red-200", "text-red-600", "error"),
+}
+
+
+def render_activity_event(ui, text: str, *, tone: str = "info", icon: str = ""):
+    """Render one activity-feed event as a compact, tinted Cloudscape-style chip.
+
+    A rounded, tone-tinted row with a leading status icon and readable text -- the
+    calm timeline treatment for a migration action mirrored into the AI panel. Lighter
+    than :func:`render_notice` (smaller, single purpose) but from the SAME palette, so
+    a success event is green, an error red, an in-flight action indigo, etc. ``tone``
+    selects from :data:`ACTIVITY_EVENT_STYLE` (unknown tones fall back to ``info``);
+    ``icon`` overrides the tone's default glyph. Returns the text label so a caller can
+    update it in place. Holds no credentials or row data (the caller passes safe text).
+    """
+    bg, border, icon_color, default_icon = ACTIVITY_EVENT_STYLE.get(
+        tone, ACTIVITY_EVENT_STYLE["info"]
+    )
+    with ui.row().classes(
+        f"items-start gap-2 no-wrap w-full rounded-md border {border} {bg} px-2.5 py-1.5"
+    ):
+        ui.icon(icon or default_icon).classes(f"{icon_color} text-base shrink-0 mt-0.5")
+        label = ui.label(text).classes(
+            "text-xs text-gray-700 leading-snug flex-1 min-w-0"
+        )
+    return label
+
+
+# ---------------------------------------------------------------------------
+# Segmented distribution bar (Cloudscape "pie/bar chart" — compact breakdown)
+# ---------------------------------------------------------------------------
+
+# tone -> (fill background, legend text color) for a proportional breakdown bar. Uses
+# the shared severity family (green/amber/red/sky/gray) so a distribution reads with
+# the same color meaning as the notices and status dots.
+_DISTRIBUTION_TONES: dict[str, Tuple[str, str]] = {
+    "ok": ("bg-green-500", "text-green-700"),
+    "warning": ("bg-amber-500", "text-amber-700"),
+    "bad": ("bg-red-500", "text-red-700"),
+    "info": ("bg-sky-500", "text-sky-700"),
+    "neutral": ("bg-gray-400", "text-gray-600"),
+}
+
+
+def render_segmented_bar(ui, *, segments, show_legend: bool = True) -> None:
+    """Render a proportional stacked "distribution" bar from ``segments``.
+
+    ``segments`` is a sequence of ``(label, value, tone)``. The result is a single
+    rounded horizontal bar whose colored segments are sized by each value's share of
+    the total, with an optional legend beneath it (a colored dot + the count + the
+    label) -- a small, text-light VISUAL for a categorical breakdown (e.g. an
+    assessment's Automatic / Review / Unsupported split), instead of a sentence of
+    numbers. Zero-value segments are dropped from the bar (no width) but KEPT in the
+    legend (so "0 unsupported" still reads). Tones map to :data:`_DISTRIBUTION_TONES`.
+    """
+    allsegs = [(str(label), int(value), tone) for (label, value, tone) in segments]
+    barsegs = [s for s in allsegs if s[1] > 0]
+    total = sum(v for _, v, _ in barsegs) or 1
+    with ui.row().classes(
+        "w-full h-2 rounded-full overflow-hidden bg-gray-100 no-wrap"
+    ):
+        for _label, value, tone in barsegs:
+            fill = _DISTRIBUTION_TONES.get(tone, _DISTRIBUTION_TONES["neutral"])[0]
+            ui.element("div").classes(f"{fill} h-full").style(
+                f"width: {value / total * 100:.1f}%"
+            )
+    if show_legend and allsegs:
+        with ui.row().classes("items-center gap-3 flex-wrap"):
+            for label, value, tone in allsegs:
+                fill, text_c = _DISTRIBUTION_TONES.get(
+                    tone, _DISTRIBUTION_TONES["neutral"]
+                )
+                with ui.row().classes("items-center gap-1 no-wrap"):
+                    ui.element("div").classes(f"h-2 w-2 rounded-full shrink-0 {fill}")
+                    ui.label(str(value)).classes(f"text-xs font-semibold {text_c}")
+                    ui.label(label).classes("text-xs text-gray-500")
+
+
+# ---------------------------------------------------------------------------
 # Inline hints (one-line status text, too light for a full notice box)
 # ---------------------------------------------------------------------------
 
@@ -597,6 +693,9 @@ def form_field(
 __all__ = [
     "NOTICE_STYLE",
     "render_notice",
+    "ACTIVITY_EVENT_STYLE",
+    "render_activity_event",
+    "render_segmented_bar",
     "INLINE_HINT_TEXT",
     "inline_hint",
     "BADGE_TONES",

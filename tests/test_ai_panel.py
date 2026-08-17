@@ -118,6 +118,8 @@ class _Ui:
         self.drawer_visible: Optional[bool] = None
         self.buttons: list[_El] = []
         self.textareas: list[_El] = []
+        self.labels: list[_El] = []
+        self.badges: list[_El] = []
 
     def add_css(self, *_a, **_k) -> None:
         pass
@@ -145,7 +147,9 @@ class _Ui:
         return self._el("scroll_area")
 
     def label(self, text: str = "", *_a, **_k) -> _El:
-        return self._el("label", text)
+        el = self._el("label", text)
+        self.labels.append(el)
+        return el
 
     def icon(self, *_a, **_k) -> _El:
         return self._el("icon")
@@ -153,6 +157,7 @@ class _Ui:
     def button(self, *a, **_k) -> _El:  # noqa: ANN002
         text = a[0] if a and isinstance(a[0], str) else ""
         el = _El(self, "button", text)
+        el.icon = _k.get("icon", "")  # type: ignore[attr-defined]
         self.buttons.append(el)
         return el
 
@@ -172,6 +177,11 @@ class _Ui:
 
     def spinner(self, *_a, **_k) -> _El:
         return self._el("spinner")
+
+    def badge(self, text: str = "", *_a, **_k) -> _El:
+        el = self._el("badge", text)
+        self.badges.append(el)
+        return el
 
     def element(self, *_a, **_k) -> _El:
         return self._el("element")
@@ -375,6 +385,26 @@ def test_general_scope_activates_on_open_from_header() -> None:
     assert state.ai_conversation.active_scope.scope_id == "general"
 
 
+def test_restored_open_panel_activates_general_streamer_so_composer_is_usable() -> None:
+    # After a refresh/restart the panel is rebuilt with visible=True restored from the
+    # session, but no live streamer -- the composer must not be left dead. Build should
+    # activate the general scope so it is immediately usable (the bug: events rendered
+    # but the chat input stayed disabled).
+    state = _enabled_state()
+    state.ai_conversation.visible = True  # restored open
+    ui = _Ui()
+
+    def factory():  # noqa: ANN202
+        return _make_streamer("hi")
+
+    build_ai_panel(ui, state=state, general_streamer_factory=factory)
+    assert state.ai_conversation.active_scope is not None
+    assert state.ai_conversation.active_scope.scope_id == "general"
+    # composer inputs are enabled (a streamer is active, not busy)
+    inputs = [t for t in ui.textareas]
+    assert inputs and inputs[0].enabled is True
+
+
 def test_object_scope_takes_priority_over_general() -> None:
     # A screen deep-link sets a SPECIFIC scope; the general factory is not used.
     state = _enabled_state()
@@ -408,6 +438,108 @@ def test_composer_is_a_roomy_multiline_autogrow_textarea() -> None:
     assert "max-height" in props          # capped so a long paste scrolls, not overflows
     # Enter-to-send is wired on the textarea (Shift+Enter falls through to a newline).
     assert any(ev == "keydown.enter" for ev in ui.textareas[0].events)
+
+
+def _drain_events(ui: _Ui) -> None:
+    # post_event only QUEUES (it may be called from a background job thread); a loop
+    # timer built at panel-build time renders queued events. Drive it here.
+    if ui.timers:
+        ui.timers[0].cb()
+
+
+def test_post_event_records_and_renders_when_enabled() -> None:
+    # A major migration action is mirrored into the panel as a deterministic activity
+    # event: recorded on the session (survives refresh) and shown in the feed.
+    state = _enabled_state()
+    ui = _Ui()
+    panel = build_ai_panel(ui, state=state)
+    panel.post_event(text="Started Full Load for orders", status="started")
+    msgs = state.ai_conversation.messages
+    # Recorded on the session (source of truth) immediately, from any thread.
+    assert msgs == [
+        {"role": "event", "text": "Started Full Load for orders", "status": "started"}
+    ]
+    assert not any(el.text == "Started Full Load for orders" for el in ui.labels)
+    # Rendered only once the loop timer drains the queue (safe UI-thread rendering).
+    _drain_events(ui)
+    assert any(el.text == "Started Full Load for orders" for el in ui.labels)
+
+
+def test_post_event_is_noop_when_ai_disabled() -> None:
+    state = SessionConnectionState()  # AI off
+    ui = _Ui()
+    panel = build_ai_panel(ui, state=state)
+    panel.post_event(text="Started Full Load for orders", status="started")
+    assert state.ai_conversation.messages == []  # nothing recorded on an inert panel
+
+
+def _reopen_badge(ui: _Ui) -> _El:
+    assert ui.badges, "expected the reopen-tab unseen badge to be built"
+    return ui.badges[0]
+
+
+def test_post_event_bumps_unseen_badge_when_closed_and_clears_on_open() -> None:
+    state = _enabled_state()  # AI on, panel closed by default
+    ui = _Ui()
+    panel = build_ai_panel(ui, state=state)
+    badge = _reopen_badge(ui)
+    assert badge.visible is False
+    panel.post_event(text="Full Load complete: 8 tables", status="success")
+    panel.post_event(text="Validation complete: 8/8 matched", status="success")
+    _drain_events(ui)  # the loop timer renders queued events + bumps the unseen count
+    assert badge.visible is True and badge.text == "2"  # unseen count while closed
+    panel.set_visible(True)
+    assert badge.visible is False  # opening the panel clears the badge
+
+
+def test_recent_events_are_folded_into_the_next_chat_turn_as_context() -> None:
+    # The assistant is made aware of what the operator did: recent activity events are
+    # folded into the CURRENT question's text, but never sent as their own turns
+    # (the streamer would mis-map a non-user/assistant role).
+    state = _enabled_state()
+    ui = _Ui()
+    panel = build_ai_panel(ui, state=state)
+    sent: list = []
+    send = panel.open_scope(
+        scope_id="general", title="AI assistant",
+        streamer=_make_streamer("ok", record=sent),
+    )
+    panel.post_event(text="Started Full Load for orders", status="started")
+    panel.post_event(text="Full Load complete: 1,240,000 rows", status="success")
+    send("What should I check next?")
+    _pump(ui)
+    turn = sent[-1]  # the messages the streamer saw for this turn
+    # Only user/assistant roles reach the model (events are not their own turns).
+    assert all(m["role"] in ("user", "assistant") for m in turn)
+    # The recent actions are folded into the last (current) user message as context.
+    last_user = turn[-1]
+    assert last_user["role"] == "user"
+    assert "Started Full Load for orders" in last_user["text"]
+    assert "Full Load complete: 1,240,000 rows" in last_user["text"]
+    assert "What should I check next?" in last_user["text"]
+
+
+def test_stop_button_is_built_and_hidden_until_streaming() -> None:
+    # A "stop generating" affordance exists; it is hidden until a reply is streaming
+    # (it replaces Send while busy — wired in _apply_composer_state / the tick loop).
+    state = _enabled_state()
+    ui = _Ui()
+    build_ai_panel(ui, state=state)
+    stop_btns = [b for b in ui.buttons if getattr(b, "icon", "") == "stop"]
+    assert len(stop_btns) == 1, "expected a single Stop-generating button"
+    assert stop_btns[0].visible is False  # hidden until a turn is in flight
+
+
+def test_model_line_shows_the_connected_model_when_enabled() -> None:
+    state = _enabled_state()
+    state.ai_assist.model_id = "global.anthropic.claude-sonnet-5"
+    ui = _Ui()
+    build_ai_panel(ui, state=state)
+    # A labeled chip: a "Model" caption + the model id as its value (easy to spot).
+    assert any(el.text == "Model" for el in ui.labels), "expected a 'Model' label chip"
+    assert any(
+        el.text == "global.anthropic.claude-sonnet-5" for el in ui.labels
+    ), "the connected Bedrock model id should be shown under the composer"
 
 
 def test_general_chat_system_is_migration_scoped_and_declines_off_topic() -> None:

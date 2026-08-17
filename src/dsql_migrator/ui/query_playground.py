@@ -421,6 +421,7 @@ def build_query_playground_screen(
         Callable[[TargetConnectionConfig, Optional[str]], TargetConnectionFactory]
     ] = None,
     open_ai_scope: Optional[Callable[..., object]] = None,
+    ai_post_event: Optional[Callable[..., object]] = None,
 ) -> Callable[[Callable[[], None]], None]:
     """Build the Query Playground screen, returning its ``content_builder``.
 
@@ -573,6 +574,33 @@ def build_query_playground_screen(
                 # Pretty-print the converted SQL (multi-line, indented) so a long
                 # statement is readable; formatting only, never semantics.
                 state.set_result(query_converter.convert(sql, pretty=True))
+                if ai_post_event is not None:
+                    converted = state.result
+                    if converted is not None:
+                        if converted.converted_sql is None:
+                            ai_post_event(
+                                text=(
+                                    "Query could not be converted to DSQL — "
+                                    "see conversion notes"
+                                ),
+                                status="info",
+                            )
+                        else:
+                            kind_label = kind_meta(converted.statement_kind)[1]
+                            class_label = classification_tone(
+                                converted.classification
+                            )[1]
+                            event_text = (
+                                f"Converted query to DSQL dialect "
+                                f"({kind_label}, {class_label.lower()})"
+                            )
+                            warn_n = len(converted.warnings)
+                            if warn_n > 0:
+                                event_text += (
+                                    f" — {warn_n} warning"
+                                    + ("s" if warn_n != 1 else "")
+                                )
+                            ai_post_event(text=event_text, status="success")
                 scroll_after_convert["pending"] = True
                 render_results.refresh()
 
@@ -613,6 +641,24 @@ def build_query_playground_screen(
                     )
                 )
                 state.set_probe(probe)
+                if ai_post_event is not None:
+                    if probe.outcome is ProbeOutcome.PASSED:
+                        event_text = "Query runs on Aurora DSQL"
+                        if probe.dpu is not None:
+                            event_text += f" (≈ {_fmt_dpu(probe.dpu.total)} DPU)"
+                        ai_post_event(text=event_text, status="success")
+                    elif probe.outcome is ProbeOutcome.FAILED:
+                        code = (
+                            f" (SQLSTATE {probe.error_code})"
+                            if probe.error_code
+                            else ""
+                        )
+                        ai_post_event(
+                            text=f"Aurora DSQL rejected the query{code}",
+                            status="error",
+                        )
+                    else:
+                        ai_post_event(text="Target test skipped", status="info")
                 render_results.refresh()
 
             def on_ask_ai() -> None:

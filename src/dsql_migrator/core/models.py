@@ -1117,11 +1117,13 @@ class AiConversation(BaseModel):
     This is the SOURCE OF TRUTH the panel renders from, held on the session state
     (server-side, keyed by the cookie-stable session id), so the conversation
     survives closing/reopening the panel, navigating between steps, and a browser
-    refresh/reconnect. It is NOT durably persisted (in-memory only) and holds no
-    credentials or row data (Property 7). ``messages`` is the running transcript
-    (``{"role", "content"}`` turns); ``active_scope`` is the current subject;
-    ``visible`` is whether the panel is open. Cleared only by Start over
-    (``SessionConnectionState.clear``).
+    refresh/reconnect. It is ALSO persisted in the durable session snapshot
+    (``SessionSnapshot.ai_conversation``, bounded to the most recent messages), so it
+    survives an app restart / crash too -- not just a refresh. It holds no credentials
+    or row data (Property 7), which is what makes persisting it safe. ``messages`` is
+    the running transcript (``{"role", "text", ...}`` turns + activity events);
+    ``active_scope`` is the current subject; ``visible`` is whether the panel is open.
+    Cleared only by Start over (``SessionConnectionState.clear`` + snapshot delete).
     """
 
     model_config = ConfigDict(extra="forbid")

@@ -26,6 +26,27 @@ from dsql_migrator.core.session_state_store import SessionSnapshot
 from dsql_migrator.ui.workflow import WorkflowStep, get_status, with_status
 
 
+# Upper bound on the AI transcript persisted in a snapshot. The conversation is
+# durable so it survives an app restart, but it must not grow the snapshot without
+# limit; keep the most recent messages (the tail is what the operator is reading).
+_MAX_PERSISTED_AI_MESSAGES = 500
+
+
+def _capture_ai_conversation(session: object) -> object:
+    """Return a bounded, deep copy of the session's AI transcript to persist (or None).
+
+    Deep-copied so a later in-memory mutation never rewrites an already-captured
+    snapshot; trimmed to the most recent ``_MAX_PERSISTED_AI_MESSAGES`` so the snapshot
+    stays bounded. Credential-free / row-data-free by construction (Property 7)."""
+    conv = getattr(session, "ai_conversation", None)
+    if conv is None:
+        return None
+    copy = conv.model_copy(deep=True)
+    if len(copy.messages) > _MAX_PERSISTED_AI_MESSAGES:
+        copy.messages = copy.messages[-_MAX_PERSISTED_AI_MESSAGES:]
+    return copy
+
+
 def _flatten_lob_exclusions(exclusions: dict) -> list[str]:
     """Flatten ``{table: {col, ...}}`` to sorted ``"table:column"`` strings."""
     flat = [
@@ -123,6 +144,7 @@ def capture_session_snapshot(
         ai_assist_enabled=bool(getattr(session.ai_assist, "enabled", False)),  # type: ignore[attr-defined]
         ai_assist_model_id=getattr(session.ai_assist, "model_id", None),  # type: ignore[attr-defined]
         ai_assist_region=getattr(session.ai_assist, "region", None),  # type: ignore[attr-defined]
+        ai_conversation=_capture_ai_conversation(session),
         workflow_unlocked=bool(session.workflow_unlocked()),  # type: ignore[attr-defined]
         active_view=getattr(session, "active_view", None),
     )
@@ -245,6 +267,14 @@ def apply_session_snapshot(
     # redirect for the retired standalone "cdc" view afterwards).
     if snapshot.active_view and hasattr(session, "set_active_view"):
         session.set_active_view(snapshot.active_view)  # type: ignore[attr-defined]
+
+    # Restore the AI transcript so it survives an app restart / crash (a browser
+    # refresh already kept it via the in-memory session). Deep-copied so the session
+    # owns its instance. Runs before the panel is built, so the panel replays it. A
+    # missing field (older snapshot) simply leaves the fresh empty conversation.
+    conv = getattr(snapshot, "ai_conversation", None)
+    if conv is not None and hasattr(session, "ai_conversation"):
+        session.ai_conversation = conv.model_copy(deep=True)  # type: ignore[attr-defined]
 
     if (
         snapshot.inventory is not None
@@ -416,6 +446,23 @@ def session_is_fresh(
     )
 
 
+def _ai_conversation_sig(conv: object) -> tuple:
+    """A cheap signature of the AI transcript (no text): message count + last-message
+    length + visibility + active scope id. Changes on a new turn / event / open-close
+    so the persistence dirty-check saves it, without hashing the whole transcript."""
+    if conv is None:
+        return (0,)
+    messages = getattr(conv, "messages", []) or []
+    last_len = len(str((messages[-1] or {}).get("text", ""))) if messages else 0
+    scope = getattr(conv, "active_scope", None)
+    return (
+        len(messages),
+        last_len,
+        bool(getattr(conv, "visible", False)),
+        getattr(scope, "scope_id", None),
+    )
+
+
 def session_signature(
     session: object,
     eval_state: object,
@@ -487,6 +534,11 @@ def session_signature(
         bool(getattr(getattr(session, "ai_assist", None), "enabled", False)),  # type: ignore[attr-defined]
         getattr(getattr(session, "ai_assist", None), "model_id", None),  # type: ignore[attr-defined]
         getattr(getattr(session, "ai_assist", None), "region", None),  # type: ignore[attr-defined]
+        # AI transcript state, so a new chat turn / activity event / open-close
+        # triggers a snapshot save (else the dirty-check would skip persisting it).
+        # Cheap: message count + last message length + visibility + active scope id --
+        # never the transcript text itself.
+        _ai_conversation_sig(getattr(session, "ai_conversation", None)),
         # Validation result presence + completion time, so a finished validation
         # triggers a snapshot save (and a re-run that replaces it does too). Cheap:
         # a bool + timestamp, never the report itself.

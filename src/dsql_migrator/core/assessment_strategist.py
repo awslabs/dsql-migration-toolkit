@@ -75,6 +75,11 @@ _OBJECT_GUIDANCE_MAX_TOKENS = 1536
 # chat stays responsive and affordable without ending the conversation.
 _MAX_CHAT_TRANSCRIPT_CHARS = 24000
 
+# Upper bound on the in-process tool-use agentic loop (model round-trips per user
+# turn). Each round may call one or more read-only tools; the cap stops a runaway
+# call-loop and bounds cost. A handful is plenty for "look up X, then answer".
+_MAX_TOOL_ROUNDS = 6
+
 # Defensive caps on untrusted output so a single response cannot flood the UI.
 _MAX_INSIGHTS = 200
 _MAX_FINDINGS = 100
@@ -83,6 +88,28 @@ _MAX_TEXT_CHARS = 4000
 # a verbose model reply cannot flood the page (best practice: accept prose, not
 # brittle JSON, and render it as Markdown).
 _MAX_NARRATIVE_CHARS = 12000
+
+# Shared response-style directive appended to EVERY chat system prompt in
+# :meth:`AssessmentStrategist.stream_chat`, so the assistant keeps replies lean and
+# scannable no matter which scope built the base prompt. It bounds the RECEIVED text
+# (concise, high-signal, no filler/recap) and pushes VISUAL structure (short bullets,
+# a small table for comparisons, bold for the verdict, fenced code for SQL) so an
+# answer reads at a glance in the narrow panel instead of as a wall of prose. The SENT
+# text is bounded separately (the transcript trim above + the caller's grounding).
+_RESPONSE_STYLE = (
+    "\n\nHow to answer (important):\n"
+    "- GROUND every answer in the specific facts, values, names, counts, and errors "
+    "given above — refer to the ACTUAL ones and tailor the advice to THIS situation. "
+    "Do NOT give generic, textbook advice that ignores the provided context; if a fact "
+    "you would need is missing, state the assumption you are making (or ask for it) "
+    "rather than answering generically.\n"
+    "- Be concise and high-signal: lead with the answer, include only what is useful "
+    "for THIS decision, and skip preamble, restating the question, and long recaps.\n"
+    "- Make it easy to scan: a few short bullets, a small Markdown table for a "
+    "comparison, **bold** for the key term or verdict, and a fenced ```sql block for "
+    "any SQL/DDL. Use only as much text as the question needs — a one- or two-line "
+    "answer is good when that is enough."
+)
 
 # Aurora DSQL constraints used to ground the assessment prompt. Mirrors the
 # constraints the deterministic assessor/converter apply so the AI analysis
@@ -265,12 +292,13 @@ def build_object_chat_system(item: AssessmentItem) -> str:
         "is fine (a little emphasis, an occasional short list or fenced code "
         "block) but keep it reading like a natural reply, not a form. Be specific "
         "and reasonably concise.\n\n"
-        "Stay strictly on the topic of migrating THIS object to Aurora DSQL and "
-        "directly related concerns (its DSQL incompatibilities, the equivalent "
-        "schema/DDL or data changes, and app-level follow-ups for this object). "
-        "If the user asks about anything off-topic — unrelated technologies, "
-        "other systems, general chit-chat, or non-migration questions — politely "
-        "decline in one sentence and steer back to this object's migration.\n\n"
+        "Your focus is migrating THIS object to Aurora DSQL, but you are also this "
+        "migration's assistant. If the user asks about the WIDER migration -- other "
+        "objects, the assessment as a whole, converted DDL, validation results, load "
+        "status -- help them: USE ANY TOOLS you have to look up the real data and "
+        "answer, rather than refusing just because it is not this object. Only decline "
+        "questions that are genuinely off-topic for a MySQL -> Aurora DSQL migration "
+        "(unrelated technologies, general chit-chat), politely, in one sentence.\n\n"
         "The conversation is about this single object, which a deterministic, "
         "rule-based assessment flagged. These facts are authoritative — build on "
         "them and never contradict them:\n"
@@ -675,6 +703,69 @@ def build_full_load_error_chat_system(
     )
 
 
+def build_connection_error_chat_system(
+    *, side: str, coordinates: str, error_message: str
+) -> str:
+    """System grounding for a chat about a FAILED connection test (Connect screen).
+
+    ``side`` is ``"source"`` (Amazon RDS/Aurora MySQL) or ``"target"`` (Amazon Aurora
+    DSQL, IAM-token auth). ``coordinates`` is a pre-formatted, credential-free line of
+    the NON-secret connection coordinates (host/port/db, or DSQL endpoint/region/db/
+    role -- never a password or IAM token, Property 7); ``error_message`` is the tool's
+    captured, credential-free failure detail. Steers the model to diagnose THIS SPECIFIC
+    attempt from the entered values first (so it catches a typo/non-default value like a
+    role ``admi`` -> ``admin``) and to answer briefly, rather than reciting a generic
+    connection-troubleshooting checklist.
+    """
+    is_source = side == "source"
+    engine = (
+        "the SOURCE database (Amazon RDS/Aurora MySQL, username/password or Secrets "
+        "Manager auth)"
+        if is_source
+        else "the TARGET database (Amazon Aurora DSQL, PostgreSQL-compatible, "
+        "short-lived IAM-token auth -- there is NO password)"
+    )
+    # Reference the model CHECKS the entered values against -- deliberately NOT phrased
+    # as a checklist of causes to recite (that produced generic, verbose answers).
+    reference = (
+        "Reference for spotting a bad value: a MySQL host is normally an RDS/Aurora "
+        "endpoint like <name>.<hash>.<region>.rds.amazonaws.com and the port is 3306."
+        if is_source
+        else "Reference for spotting a bad value: Aurora DSQL uses IAM-token auth (no "
+        "password); its default database is 'postgres' and its default role/username "
+        "is 'admin'; the endpoint looks like <id>.dsql.<region>.on.aws and the region "
+        "must match the cluster's; connecting requires dsql:DbConnect (or "
+        "dsql:DbConnectAdmin) on the cluster."
+    )
+    facts = (
+        f"Entered connection values:\n{coordinates}\n"
+        f"Error message:\n{error_message.strip()}"
+    )
+    return (
+        "You are a senior AWS database migration engineer helping a teammate whose "
+        f"connection test to {engine} just FAILED on the Connect screen of a MySQL -> "
+        "Amazon Aurora DSQL migration tool.\n\n"
+        "Diagnose THIS SPECIFIC attempt, not connections in general. FIRST inspect the "
+        "exact entered values and the error text below for a concrete mistake IN THEM "
+        "— a misspelled or non-default value (a role/username, database, region, or "
+        "endpoint that does not match the expected form), a wrong port, a region "
+        "mismatch. If a value looks off, say so directly: quote the suspect value and "
+        "the likely intended one (e.g. role 'admi' -> 'admin'). Only if nothing in the "
+        "values looks wrong should you consider environmental causes (network / "
+        "security-group reachability, IAM permissions, the cluster not existing).\n\n"
+        "Be brief and specific: lead with the single MOST LIKELY cause and its exact "
+        "fix (one short paragraph or a few bullets), then stop. Do NOT print a generic "
+        "connection-troubleshooting checklist. A fenced code block for a corrected "
+        "value/command is fine.\n\n"
+        "Stay strictly on resolving THIS connection failure; if asked anything "
+        "off-topic, decline in one sentence and steer back.\n\n"
+        f"{reference}\n\n"
+        "These deterministic facts are authoritative — build on them and never "
+        "contradict them:\n"
+        f"{facts[:_MAX_TEXT_CHARS]}"
+    )
+
+
 def _build_chat_body(
     system: str, messages: Sequence[Mapping[str, str]], max_tokens: int
 ) -> str:
@@ -1041,6 +1132,9 @@ class AssessmentStrategist:
         item: AssessmentItem,
         messages: Sequence[Mapping[str, str]],
         on_delta: Callable[[str], None],
+        *,
+        tools: Optional[Sequence[Mapping[str, Any]]] = None,
+        execute: Optional[Callable[[str, Mapping[str, Any]], str]] = None,
     ) -> "ObjectGuidanceOutcome":
         """Stream one assistant turn of a multi-turn chat about ONE object.
 
@@ -1052,7 +1146,17 @@ class AssessmentStrategist:
         assistant reply as :class:`ObjectGuidanceOutcome` -- available with the
         full Markdown, or a fixed, credential-free unavailable message on any
         Bedrock failure / empty stream (Requirements 11.8, 11.10). Never raises.
+
+        When ``tools`` + ``execute`` are supplied, the turn runs through
+        :meth:`tool_chat` instead, so a chat that started on ONE object can still
+        answer WIDER-migration questions (e.g. "list all unsupported objects") by
+        looking up the real data on demand -- matching the general chat's reach.
         """
+        if tools is not None and execute is not None:
+            return self.tool_chat(
+                build_object_chat_system(item), messages, on_delta,
+                tools=tools, execute=execute,
+            )
         return self.stream_chat(
             build_object_chat_system(item), messages, on_delta
         )
@@ -1121,7 +1225,10 @@ class AssessmentStrategist:
         stream (Requirements 11.8, 11.10). Never raises.
         """
         body = _build_chat_body(
-            system,
+            # Append the shared lean/scannable response-style directive to whatever
+            # grounding the caller built, so every scope's replies stay concise and
+            # visually structured (bounds the received text; see _RESPONSE_STYLE).
+            system + _RESPONSE_STYLE,
             _trim_chat_messages(messages, _MAX_CHAT_TRANSCRIPT_CHARS),
             _OBJECT_GUIDANCE_MAX_TOKENS,
         )
@@ -1167,6 +1274,127 @@ class AssessmentStrategist:
             model_id=self._config.model_id,
         )
 
+    def tool_chat(
+        self,
+        system: str,
+        messages: Sequence[Mapping[str, str]],
+        on_delta: Callable[[str], None],
+        *,
+        tools: Sequence[Mapping[str, Any]],
+        execute: Callable[[str, Mapping[str, Any]], str],
+        max_rounds: int = _MAX_TOOL_ROUNDS,
+    ) -> "ObjectGuidanceOutcome":
+        """Answer one chat turn that MAY call in-process tools (function calling).
+
+        Like :meth:`stream_chat`, but the model is given ``tools`` (Anthropic tool
+        schemas) it can call to fetch DETERMINISTIC migration facts on demand -- e.g.
+        the converted DDL of a table, the assessment of an object, the validation
+        verdict. Each requested tool is run via ``execute(name, input) -> str`` (a
+        read-only, credential-free callable the shell supplies over its own state) and
+        the result fed back, in a bounded agentic loop; the final assistant text is
+        delivered through ``on_delta`` and returned as :class:`ObjectGuidanceOutcome`.
+
+        Non-streaming per round (tool-use and token streaming do not compose cleanly),
+        so the final answer arrives at once; ``on_delta`` still receives it so the
+        panel renders it identically (Markdown tables / code included). Never raises:
+        any Bedrock failure or empty output maps to an unavailable outcome. Tool
+        results are length-capped and untrusted (Requirement 11.8).
+        """
+        convo: list[dict] = [
+            {
+                "role": "assistant" if str(m.get("role")) == "assistant" else "user",
+                "content": [{"type": "text", "text": str(m.get("text", ""))}],
+            }
+            for m in _trim_chat_messages(messages, _MAX_CHAT_TRANSCRIPT_CHARS)
+        ]
+        try:
+            for _ in range(max(1, max_rounds)):
+                body = json.dumps(
+                    {
+                        "anthropic_version": _ANTHROPIC_VERSION,
+                        "max_tokens": _OBJECT_GUIDANCE_MAX_TOKENS,
+                        "system": system + _RESPONSE_STYLE,
+                        "tools": list(tools),
+                        "messages": convo,
+                    }
+                )
+                response = self._get_client().invoke_model(
+                    modelId=self._config.model_id,
+                    body=body,
+                    contentType="application/json",
+                    accept="application/json",
+                )
+                raw = response.get("body") if isinstance(response, Mapping) else None
+                payload = raw.read() if hasattr(raw, "read") else raw
+                data = json.loads(payload) if payload else {}
+                content = data.get("content") if isinstance(data, Mapping) else None
+                content = content if isinstance(content, list) else []
+                stop = data.get("stop_reason") if isinstance(data, Mapping) else None
+                tool_uses = [
+                    b
+                    for b in content
+                    if isinstance(b, Mapping) and b.get("type") == "tool_use"
+                ]
+                if stop == "tool_use" and tool_uses:
+                    # Record the assistant's tool-call turn verbatim, then answer each.
+                    convo.append({"role": "assistant", "content": content})
+                    results: list[dict] = []
+                    for block in tool_uses:
+                        name = str(block.get("name", ""))
+                        inp = block.get("input")
+                        inp = dict(inp) if isinstance(inp, Mapping) else {}
+                        try:
+                            out = execute(name, inp)
+                        except Exception:  # noqa: BLE001 - a bad tool never breaks chat
+                            out = "{\"error\": \"tool failed\"}"
+                        results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": block.get("id"),
+                                "content": str(out)[:_MAX_TEXT_CHARS],
+                            }
+                        )
+                    convo.append({"role": "user", "content": results})
+                    continue
+                # Final answer (end_turn, or a turn with no tool call): join text blocks.
+                final = "".join(
+                    b.get("text", "")
+                    for b in content
+                    if isinstance(b, Mapping)
+                    and b.get("type") == "text"
+                    and isinstance(b.get("text"), str)
+                ).strip()
+                if not final:
+                    err = AiAssistUnavailableError("INVALID_OUTPUT")
+                    return ObjectGuidanceOutcome(
+                        available=False, reason=err.reason, detail=err.detail
+                    )
+                on_delta(final)
+                return ObjectGuidanceOutcome(
+                    available=True,
+                    reason="OK",
+                    detail="",
+                    markdown=final[:_MAX_NARRATIVE_CHARS],
+                    model_id=self._config.model_id,
+                )
+            return ObjectGuidanceOutcome(
+                available=False,
+                reason="UNAVAILABLE",
+                detail=(
+                    "The assistant kept looking things up without answering. "
+                    "Try rephrasing the question."
+                ),
+            )
+        except AiAssistUnavailableError as error:
+            return ObjectGuidanceOutcome(
+                available=False, reason=error.reason, detail=error.detail
+            )
+        except Exception as exc:  # noqa: BLE001 - mapped to a typed, safe signal
+            error = AiAssistUnavailableError(_classify_bedrock_error(exc))
+            return ObjectGuidanceOutcome(
+                available=False, reason=error.reason, detail=error.detail
+            )
+
 
 @dataclass(frozen=True)
 class ObjectGuidanceOutcome:
@@ -1201,5 +1429,7 @@ __all__ = [
     "build_conversion_chat_system",
     "build_query_chat_system",
     "build_query_optimize_system",
+    "build_full_load_error_chat_system",
+    "build_connection_error_chat_system",
     "parse_assessment_output",
 ]

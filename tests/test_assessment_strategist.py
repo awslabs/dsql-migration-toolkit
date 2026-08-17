@@ -389,9 +389,11 @@ def test_chat_system_prompt_scopes_to_this_object_topic() -> None:
     from dsql_migrator.core.assessment_strategist import build_object_chat_system
 
     system = build_object_chat_system(_guidance_item())
-    # The model is told to stay on-topic and decline off-topic questions.
-    assert "Stay strictly on the topic" in system
-    assert "politely" in system and "decline" in system
+    # Focused on THIS object, but allowed to help with the wider migration (via tools)
+    # rather than refusing; still declines genuinely off-topic questions.
+    assert "focus is migrating THIS object" in system
+    assert "WIDER migration" in system and "TOOLS" in system
+    assert "decline" in system
     # And it is grounded on the specific object + DSQL constraints.
     assert "orders" in system
     assert "Aurora DSQL constraints" in system
@@ -514,6 +516,118 @@ def test_build_full_load_error_chat_system_grounds_on_table_error_and_context() 
     minimal = build_full_load_error_chat_system("t1", "InternalError_: server unavailable")
     assert "InternalError_" in minimal
     assert "Current migration context" not in minimal
+
+
+def test_build_connection_error_chat_system_grounds_on_side_and_error() -> None:
+    from dsql_migrator.core.assessment_strategist import (
+        build_connection_error_chat_system,
+    )
+
+    # Source (MySQL) failure: the coordinates + error are woven in, scoped + on-topic.
+    src = build_connection_error_chat_system(
+        side="source",
+        coordinates="MySQL host=db.example.internal port=3306 database=shop",
+        error_message="OperationalError: (2003) Can't connect to MySQL server",
+    )
+    assert "db.example.internal" in src and "2003" in src
+    assert "MySQL" in src and "authoritative" in src.lower()
+    assert "decline" in src.lower()  # scope guard
+    # Target (DSQL) failure: names the IAM-token / dsql:DbConnect class of cause.
+    tgt = build_connection_error_chat_system(
+        side="target",
+        coordinates="Aurora DSQL endpoint=abc.dsql.us-east-1.on.aws region=us-east-1",
+        error_message="AccessDeniedException: not authorized to perform dsql:DbConnect",
+    )
+    assert "dsql:DbConnect" in tgt and "IAM" in tgt
+    assert "us-east-1" in tgt
+    # The target guidance states DSQL's no-password (IAM-token) auth model.
+    assert "no password" in tgt.lower()
+
+
+def test_tool_chat_runs_a_tool_then_answers() -> None:
+    # The agentic loop: round 1 the model asks to call a tool, we execute it and feed
+    # the result back, round 2 the model answers. Verify the tool ran with the model's
+    # input, the result was fed back as a tool_result user turn, and the final text is
+    # returned + streamed. Tools + the response-style directive ride in the request.
+    class _ToolClient:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+            self._round = 0
+
+        def invoke_model(self, **kwargs: object) -> dict:
+            self.calls.append(kwargs)
+            self._round += 1
+            if self._round == 1:
+                body = json.dumps(
+                    {
+                        "stop_reason": "tool_use",
+                        "content": [
+                            {"type": "text", "text": "Let me look that up."},
+                            {
+                                "type": "tool_use",
+                                "id": "t1",
+                                "name": "get_converted_ddl",
+                                "input": {"object_name": "orders"},
+                            },
+                        ],
+                    }
+                )
+            else:
+                body = json.dumps(
+                    {
+                        "stop_reason": "end_turn",
+                        "content": [
+                            {"type": "text", "text": "Here is the `orders` DDL."}
+                        ],
+                    }
+                )
+            return {"body": body}
+
+    client = _ToolClient()
+    strategist = AssessmentStrategist(_config(), client=client)
+    executed: list[tuple] = []
+
+    def execute(name: str, inp) -> str:  # noqa: ANN001
+        executed.append((name, dict(inp)))
+        return json.dumps({"target_ddl": "CREATE TABLE orders (...)"})
+
+    tools = [
+        {
+            "name": "get_converted_ddl",
+            "description": "Get converted DDL for one object.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"object_name": {"type": "string"}},
+                "required": ["object_name"],
+            },
+        }
+    ]
+    deltas: list[str] = []
+    outcome = strategist.tool_chat(
+        "SYSTEM", [{"role": "user", "text": "show orders ddl"}], deltas.append,
+        tools=tools, execute=execute,
+    )
+    assert outcome.available and "orders" in outcome.markdown
+    assert executed == [("get_converted_ddl", {"object_name": "orders"})]
+    assert len(client.calls) == 2  # tool_use round, then the answer round
+    assert deltas and "orders" in "".join(deltas)  # final answer streamed to the panel
+    # The tools + response-style directive were sent on the first request.
+    first = json.loads(client.calls[0]["body"])
+    assert first["tools"][0]["name"] == "get_converted_ddl"
+    assert "How to answer" in first["system"]  # _RESPONSE_STYLE appended
+    # Round 2 fed the tool result back as the trailing user (tool_result) turn.
+    second = json.loads(client.calls[1]["body"])
+    assert second["messages"][-1]["role"] == "user"
+    assert second["messages"][-1]["content"][0]["type"] == "tool_result"
+
+
+def test_tool_chat_maps_bedrock_failure_to_unavailable() -> None:
+    strategist = AssessmentStrategist(_config(), client=_BoomClient())
+    outcome = strategist.tool_chat(
+        "SYSTEM", [{"role": "user", "text": "hi"}], lambda _t: None,
+        tools=[], execute=lambda _n, _i: "{}",
+    )
+    assert not outcome.available  # never raises; degrades to an unavailable outcome
 
 
 def test_trim_chat_messages_keeps_recent_within_budget() -> None:

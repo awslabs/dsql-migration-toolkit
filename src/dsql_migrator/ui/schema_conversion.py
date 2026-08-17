@@ -1147,6 +1147,7 @@ def build_schema_conversion_screen(
     on_continue_to_data_migration: Optional[Callable[[], None]] = None,
     cdc_active_check: Optional[Callable[[], bool]] = None,
     open_ai_scope: Optional[Callable[..., object]] = None,
+    ai_post_event: Optional[Callable[..., object]] = None,
 ) -> tuple[Callable[[Callable[[], None]], None], Callable[[], None]]:
     """Build the Schema Conversion screen, returning ``(content_builder, runner)``.
 
@@ -1314,6 +1315,11 @@ def build_schema_conversion_screen(
                 status=ActivityStatus.STARTED,
                 detail=f"applying {len(objects)} object(s) to the target",
             )
+            if ai_post_event is not None:
+                ai_post_event(
+                    text=f"Started applying schema to DSQL: {len(objects)} objects",
+                    status="started",
+                )
 
             def _record_and_log(result: ObjectApplyResult) -> None:
                 # Record live progress, then log the per-object outcome to the
@@ -1358,6 +1364,11 @@ def build_schema_conversion_screen(
                 status=ActivityStatus.FAILURE if any_failed else ActivityStatus.SUCCESS,
                 detail=summary_detail,
             )
+            if ai_post_event is not None:
+                ai_post_event(
+                    text=f"Schema applied to DSQL: {summary_detail}",
+                    status="error" if any_failed else "success",
+                )
 
         conv_state.job_id = job_manager.submit(work)
 
@@ -2505,6 +2516,19 @@ def _render_browser_and_preview(
         await generate_selected_ddl(
             conv_state, refresh, sync_target=on_sync_target
         )
+        # Mirror the generate action into the AI activity feed with a brief summary,
+        # so the assistant reflects that DDL was generated (and can then be asked about
+        # it via its tools -- list_converted_tables / get_converted_ddl).
+        if ai_post_event is not None and conv_state.generated_node_ids is not None:
+            _n = len(selected_object_names(conv_state.generated_node_ids))
+            ai_post_event(
+                text=(
+                    f"Generated Aurora DSQL DDL for {_n} object"
+                    + ("" if _n == 1 else "s")
+                    + " — ready to review and apply"
+                ),
+                status="success",
+            )
 
     def on_clear() -> None:
         # Full reset: discard the generated DDL, per-object edits, AI

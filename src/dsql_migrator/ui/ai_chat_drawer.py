@@ -20,14 +20,17 @@ from typing import Callable
 
 from dsql_migrator.core.assessment_strategist import ObjectGuidanceOutcome
 
-# Guardrails for the per-object AI chat. The conversation is intentionally
-# bounded so it stays on-topic and cannot grow without limit: at most
-# ``_MAX_CHAT_TURNS`` user turns per conversation (the first auto-question counts
-# as one), each capped to ``_MAX_CHAT_INPUT_CHARS`` characters. (Topic scoping is
-# enforced model-side via the caller's system prompt; the transcript sent to the
-# model is separately length-capped in the core strategist.)
+# Guardrails for the AI chat. Topic scoping is enforced model-side via the
+# caller's system prompt, and the transcript sent to the model is separately
+# length-capped in the core strategist (so a long conversation stays bounded in
+# cost). ``MAX_CHAT_INPUT_CHARS`` caps a SINGLE message: generous enough to paste a
+# whole table DDL / SQL statement into the multi-line composer (that is a common
+# follow-up), while still bounding one turn -- the model context is trimmed
+# elsewhere, so this is a UX/abuse guard, not the cost lever. (``MAX_CHAT_TURNS`` is
+# retained for the pure ``chat_turns_remaining`` helper some callers still import; the
+# persistent panel no longer caps turns -- bounded context replaced the turn wall.)
 MAX_CHAT_TURNS = 10
-MAX_CHAT_INPUT_CHARS = 1000
+MAX_CHAT_INPUT_CHARS = 4000
 
 # A streaming chat turn: given the running transcript and a per-chunk callback,
 # stream the reply and return an outcome (available/markdown/model_id/detail).
