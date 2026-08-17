@@ -50,10 +50,13 @@ What it does, and the properties it satisfies:
 6. **Resumability (Property 4 / Requirement 5.3).** Because the exporter
    (task 8.2) streams rows in keyset (primary-key) order, batch ``i`` always maps
    to the same deterministic primary-key range. Each batch is therefore a stable
-   resumable unit keyed by :func:`batch_chunk_id`. When a
-   :class:`~dsql_migrator.core.models.MigrationJob` is supplied, batches whose
-   chunk id is already ``DONE`` are skipped, and the run converges to the same
-   target state as an uninterrupted run.
+   resumable unit. When a :class:`~dsql_migrator.core.models.MigrationJob` is
+   supplied, batches at or below the per-shard resume high-water
+   (:attr:`~dsql_migrator.core.models.MigrationJob.resume_batch_watermark`, the
+   highest contiguously-completed batch index) are skipped, and the run converges
+   to the same target state as an uninterrupted run. The high-water is a compact
+   O(shards) marker rather than a per-batch record, so resume state does not grow
+   with the row count (a billion-row table's memory stays bounded).
 
 7. **Post-load ``CREATE INDEX ASYNC`` (Property 2 -- DDL/DML separation).**
    Secondary indexes are built *after* all data batches succeed, as SEPARATE
@@ -91,7 +94,6 @@ from psycopg import sql
 from pydantic import BaseModel, ConfigDict, Field
 
 from dsql_migrator.core.models import (
-    ChunkState,
     MigrationJob,
     TableDef,
     TargetConnectionConfig,
@@ -255,7 +257,12 @@ class BatchedImportError(RuntimeError):
 
 @dataclass(frozen=True)
 class _BatchWork:
-    """One unit of work: the rows of a single batch plus how to load them."""
+    """One unit of work: the rows of a single batch plus how to load them.
+
+    ``shard_id`` / ``batch_index`` identify the batch's position for the compact
+    resume high-water (:class:`_BatchResumeTracker`): the draining thread advances
+    that shard's contiguous completed prefix by ``batch_index`` as the batch resolves.
+    """
 
     chunk_id: str
     table_name: str
@@ -263,6 +270,8 @@ class _BatchWork:
     key_columns: tuple[str, ...]
     on_conflict: OnConflictMode
     rows: tuple[Mapping[str, object], ...]
+    shard_id: Optional[int] = None
+    batch_index: int = 0
 
 
 @dataclass
@@ -300,6 +309,103 @@ class _RunAggregate:
             self.failures += 1
             if self.first_error is None and outcome.error:
                 self.first_error = outcome.error
+
+
+def _shard_key(shard_id: Optional[int]) -> str:
+    """String key for a shard reader (``""`` for the unsharded single reader).
+
+    JSON object keys are strings, and this key is persisted on
+    :attr:`MigrationJob.resume_batch_watermark`, so map ``shard_id`` to a stable
+    string once here rather than at every call site.
+    """
+    return "" if shard_id is None else str(shard_id)
+
+
+class _BatchResumeTracker:
+    """Compact, memory-bounded per-shard resume high-water for one ``import_rows`` run.
+
+    Replaces the O(rows / batch_size) per-batch ``ChunkState`` list a resumed
+    (SKIP_EXISTING) load used to accumulate on its ephemeral resume job -- a
+    billion-row table would otherwise retain hundreds of thousands of objects
+    (contributing to the Fargate OOM the memory-pressure logger warns about). Because
+    batches stream in keyset order per shard (``batch_chunk_id`` maps ``index`` to a
+    stable PK range), a completed CONTIGUOUS prefix means every range up to that index
+    is committed, so the resume point a same-process retry needs is just the highest
+    contiguously-completed index per shard -- one int per shard.
+
+    Batches complete concurrently (up to ``parallelism`` in flight), so completions
+    are not strictly in index order. Out-of-order completions are held in an ``ahead``
+    set that the frontier absorbs as it advances; its size is the completion-reorder
+    distance -- typically ~``parallelism`` (a stuck low-index batch could enlarge it,
+    but it holds small ints, not the per-batch model objects the old code retained, so
+    it is far smaller in every case). On a FAILED batch the shard is SEALED (its
+    frontier stops advancing and its ahead-set is dropped): a retry re-runs everything
+    past the frontier idempotently anyway, so there is no reason to keep accumulating
+    indices past a gap -- which HARD-bounds memory even when a batch fails midway
+    through a huge shard. The durable resume state carried across attempts is the
+    ``watermark`` dict: O(shards), independent of row count.
+
+    The tracker is written only from the single draining thread (``record_*``) and
+    read once at the end (:meth:`watermark`); it is NOT consulted for skipping (that
+    uses the immutable prior-run watermark), so it needs no lock.
+    """
+
+    def __init__(self, initial: Optional[Mapping[str, int]] = None) -> None:
+        # shard key -> highest contiguous completed batch index (seeded from the prior
+        # attempt so this run's completions extend, rather than restart, the prefix).
+        self._frontier: dict[str, int] = dict(initial or {})
+        self._ahead: dict[str, set[int]] = {}
+        self._sealed: set[str] = set()
+
+    def record_done(self, shard_id: Optional[int], index: int) -> None:
+        key = _shard_key(shard_id)
+        if key in self._sealed:
+            return
+        frontier = self._frontier.get(key, -1)
+        if index <= frontier:
+            return  # already covered (e.g. a re-run of a skipped range)
+        ahead = self._ahead.setdefault(key, set())
+        ahead.add(index)
+        while (frontier + 1) in ahead:
+            ahead.discard(frontier + 1)
+            frontier += 1
+        self._frontier[key] = frontier
+
+    def record_failed(self, shard_id: Optional[int]) -> None:
+        key = _shard_key(shard_id)
+        # A gap: freeze the frontier and drop the ahead-set so a shard that fails
+        # midway cannot accumulate O(rows) done-ahead indices behind the gap.
+        self._sealed.add(key)
+        self._ahead.pop(key, None)
+
+    def watermark(self) -> dict[str, int]:
+        """The per-shard contiguous completed prefix to carry into the next attempt."""
+        return dict(self._frontier)
+
+
+class _SkipCounter:
+    """Thread-safe count of batches skipped as already-committed on resume.
+
+    Only the COUNT is ever needed (``BatchedImportResult.batches_skipped``), so a
+    resume that skips most of a billion-row table keeps a single int rather than a
+    per-batch id list. K shard readers increment concurrently, so it locks; the
+    single-reader path passes no lock and never contends.
+    """
+
+    def __init__(self) -> None:
+        self._n = 0
+        self._lock = threading.Lock()
+
+    def add(self, *, locked: bool) -> None:
+        if locked:
+            with self._lock:
+                self._n += 1
+        else:
+            self._n += 1
+
+    @property
+    def value(self) -> int:
+        return self._n
 
 
 class BatchedImportOptions(BaseModel):
@@ -422,14 +528,15 @@ def batch_chunk_id(
     original single-reader id, so an unsharded table's resume state is byte-for-byte
     unchanged. A sharded run's ids look like ``table#s00-batch-000000``.
 
-    NOTE on resume with sharding: a sharded ``chunk_id`` is stably mapped to a PK
-    range only if the shard ranges are recomputed identically, i.e. the source
-    ``MIN(pk)``/``MAX(pk)`` are unchanged between runs (K is fixed by config, but the
-    range boundaries come from live MIN/MAX). The Full Load engine does NOT pass a
-    ``job`` into ``import_rows`` (whole-table re-load under idempotent SKIP_EXISTING
-    on resume), so batch-level ``done_ids`` skipping is not exercised for a sharded
-    table today; a future caller that wires ``job=`` with ``shards>1`` must pin the
-    ranges (persist first-run MIN/MAX) before relying on batch-level resume.
+    NOTE on resume with sharding: batch-level resume skips by the per-shard
+    high-water (:class:`_BatchResumeTracker`), keyed on ``batch index`` within a
+    shard. That is stably mapped to a PK range only if the shard ranges are recomputed
+    identically between attempts, i.e. the source ``MIN(pk)``/``MAX(pk)`` are unchanged
+    (K is fixed by config, but the range boundaries come from live MIN/MAX). This holds
+    for the loader's SAME-PROCESS source-drop retry -- the only place ``job=`` is wired
+    -- because the source is read-only for the duration and the ephemeral resume job is
+    never persisted (a cross-process "Retry failed tables" recreates the target and
+    restarts the table from index 0, so a shifted MIN/MAX cannot cause a stale skip).
     """
     if shard_id is None:
         return f"{table_name}#batch-{index:06d}"
@@ -718,27 +825,32 @@ class BatchedImporter:
                 "on_conflict=DO_UPDATE requires key_columns or a table primary key"
             )
 
-        done_ids = _done_chunk_ids(job)
-        skipped_ids: list[str] = []
+        # Resume high-water from any prior attempt on this (ephemeral) job: shard key
+        # -> highest contiguously-committed batch index. Immutable during the run --
+        # it drives batch skipping AND seeds this run's tracker so completions extend
+        # the prefix. Compact (one int per shard), unlike the old per-batch DONE set.
+        skip_watermark = dict(job.resume_batch_watermark) if job is not None else {}
+        skip_counter = _SkipCounter()
         # Reader range sharding: when ``shard_sources`` holds K disjoint-PK-range
         # row streams, build K work iterators (each ``chunk_id``-namespaced by shard
-        # and appending to ``skipped_ids`` under a lock). Otherwise the single
-        # ``rows`` stream builds one unsharded work iterator -- byte-for-byte the
-        # previous behavior (``shard_id=None`` keeps the original chunk ids).
+        # and counting skips under a lock). Otherwise the single ``rows`` stream builds
+        # one unsharded work iterator -- byte-for-byte the previous behavior
+        # (``shard_id=None`` keeps the original chunk ids).
         work_iters: list[Iterator[_BatchWork]]
         if shard_sources:
             skipped_lock = threading.Lock()
             work_iters = [
                 self._iter_work(
-                    shard_rows, table, columns, key_columns, done_ids, skipped_ids,
-                    effective_on_conflict, shard_id=i, skipped_lock=skipped_lock,
+                    shard_rows, table, columns, key_columns, skip_watermark,
+                    skip_counter, effective_on_conflict, shard_id=i,
+                    skipped_lock=skipped_lock,
                 )
                 for i, shard_rows in enumerate(shard_sources)
             ]
         else:
             work_iters = [
                 self._iter_work(
-                    rows, table, columns, key_columns, done_ids, skipped_ids,
+                    rows, table, columns, key_columns, skip_watermark, skip_counter,
                     effective_on_conflict,
                 )
             ]
@@ -748,12 +860,13 @@ class BatchedImporter:
             self._quarantine = []
             self._quarantine_total = 0
         try:
-            # Retain the per-batch outcome list ONLY when a job is present (batch-level resume
-            # / small tables) so _apply_outcomes_to_job can upsert chunk state; the common
-            # large-table path (job is None) folds into `agg` with no unbounded per-batch list.
-            agg, outcomes, stopped_early = self._run_data_batches(
+            # Outcomes are folded into `agg` as they resolve and the resume point is
+            # tracked as a compact per-shard high-water -- no per-batch list is ever
+            # retained, so a billion-row table's memory stays bounded whether or not a
+            # (resume) job is present. The tracker is seeded from the prior watermark.
+            agg, resume_tracker, stopped_early = self._run_data_batches(
                 work_iters, pool, on_batch_loaded, should_cancel,
-                retain_outcomes=job is not None,
+                resume_watermark=skip_watermark,
             )
             failures = agg.failures
             indexes_created = 0
@@ -767,11 +880,13 @@ class BatchedImporter:
         finally:
             pool.close_all()
 
+        # Persist the advanced resume high-water back onto the (ephemeral) job so a
+        # same-process source-drop retry skips the keyset ranges already committed.
         if job is not None:
-            _apply_outcomes_to_job(job, outcomes, skipped_ids)
+            job.resume_batch_watermark = resume_tracker.watermark()
 
         result = _aggregate_result(
-            agg, skipped_ids, indexes_created, cancelled=stopped_early
+            agg, skip_counter.value, indexes_created, cancelled=stopped_early
         )
         # Indexes that could not be created. Reported alongside a SUCCESSFUL data
         # load: the rows are all present, so this is a missing access path to fix
@@ -791,44 +906,43 @@ class BatchedImporter:
         table: TableDef,
         columns: list[str],
         key_columns: list[str],
-        done_ids: set[str],
-        skipped_ids: list[str],
+        skip_watermark: Mapping[str, int],
+        skip_counter: "_SkipCounter",
         on_conflict: OnConflictMode,
         shard_id: Optional[int] = None,
         skipped_lock: Optional[threading.Lock] = None,
     ) -> Iterator[_BatchWork]:
         """Yield a work item per non-skipped batch (consumes rows lazily).
 
-        Batches already ``DONE`` (per ``done_ids``) are recorded in ``skipped_ids``
-        and their rows are dropped without being loaded -- ``ON CONFLICT`` makes
-        re-loading safe, but skipping avoids needless work on resume (Property 4).
+        On resume, a batch at or below its shard's high-water in ``skip_watermark``
+        was already committed by a prior attempt; its rows are dropped (counted in
+        ``skip_counter``, not loaded). ``ON CONFLICT`` makes re-loading safe -- skipping
+        just avoids needless work on resume (Property 4). Batches stream in keyset
+        order, so ``index <= high-water`` is exactly "this PK range is already done".
 
-        ``shard_id`` namespaces the ``chunk_id`` for one reader shard (batch
-        ``index`` restarts at 0 per shard). ``skipped_lock`` guards ``skipped_ids``
-        when K shard producers append concurrently; ``None`` (single reader) needs
-        no lock.
+        ``shard_id`` namespaces the ``chunk_id`` for one reader shard (batch ``index``
+        restarts at 0 per shard). ``skipped_lock`` guards the shared skip counter when
+        K shard producers run concurrently; ``None`` (single reader) needs no lock.
         """
         columns_tuple = tuple(columns)
         key_tuple = tuple(key_columns)
+        high_water = skip_watermark.get(_shard_key(shard_id), -1)
         batch_size = _effective_batch_size(self._options.batch_size, len(columns_tuple))
         for index, batch in enumerate(
             _iter_batches(rows, batch_size, MAX_BATCH_BYTES)
         ):
-            chunk_id = batch_chunk_id(table.name, index, shard_id)
-            if chunk_id in done_ids:
-                if skipped_lock is not None:
-                    with skipped_lock:
-                        skipped_ids.append(chunk_id)
-                else:
-                    skipped_ids.append(chunk_id)
+            if index <= high_water:
+                skip_counter.add(locked=skipped_lock is not None)
                 continue
             yield _BatchWork(
-                chunk_id=chunk_id,
+                chunk_id=batch_chunk_id(table.name, index, shard_id),
                 table_name=table.name,
                 columns=columns_tuple,
                 key_columns=key_tuple,
                 on_conflict=on_conflict,
                 rows=tuple(batch),
+                shard_id=shard_id,
+                batch_index=index,
             )
 
     @staticmethod
@@ -985,8 +1099,8 @@ class BatchedImporter:
         on_batch_loaded: Optional[Callable[[int, int], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
         *,
-        retain_outcomes: bool = False,
-    ) -> "tuple[_RunAggregate, list[_BatchOutcome], bool]":
+        resume_watermark: Optional[Mapping[str, int]] = None,
+    ) -> "tuple[_RunAggregate, _BatchResumeTracker, bool]":
         """Execute batches concurrently with at most ``parallelism`` in flight.
 
         Submissions are throttled so no more than ``parallelism`` batches are
@@ -1003,24 +1117,29 @@ class BatchedImporter:
         table. Returns the batch outcomes and whether the load stopped early
         (left unsubmitted work).
         """
-        # Fold each outcome into a running aggregate as it resolves; a whole-table load can be
-        # millions of batches, so the memory-critical path (job is None) retains NO per-batch
-        # list. Only when `job` was passed (batch-level resume / small tables) is the list kept
-        # so _apply_outcomes_to_job can upsert per-batch chunk state exactly as before.
+        # Fold each outcome into a running aggregate as it resolves and advance a
+        # compact per-shard resume high-water -- NO per-batch list is ever retained, so
+        # a billion-row load stays bounded regardless of whether a (resume) job is
+        # present. The tracker is seeded from the prior attempt's watermark so this
+        # run's completions extend, not restart, the contiguous prefix.
         agg = _RunAggregate()
-        outcomes: list[_BatchOutcome] = []
+        resume_tracker = _BatchResumeTracker(resume_watermark)
         parallelism = self._options.parallelism
-        in_flight: dict[Future[tuple[int, int]], str] = {}
+        # future -> (chunk_id, shard_id, batch_index): the shard/index feed the resume
+        # high-water; only ~parallelism entries are ever live (bounded).
+        in_flight: dict[Future[tuple[int, int]], tuple[str, Optional[int], int]] = {}
         stopped_early = False
 
         def drain_one() -> None:
             done, _ = wait(set(in_flight), return_when=FIRST_COMPLETED)
             for future in done:
-                chunk_id = in_flight.pop(future)
+                chunk_id, shard_id, batch_index = in_flight.pop(future)
                 outcome = _resolve_outcome(future, chunk_id)
                 agg.fold(outcome)
-                if retain_outcomes:
-                    outcomes.append(outcome)
+                if outcome.status == "DONE":
+                    resume_tracker.record_done(shard_id, batch_index)
+                else:
+                    resume_tracker.record_failed(shard_id)
                 if (
                     on_batch_loaded is not None
                     and outcome.status == "DONE"
@@ -1063,7 +1182,7 @@ class BatchedImporter:
                         stopped_early = True
                         break
                     future = executor.submit(self._load_batch, work, pool)
-                    in_flight[future] = work.chunk_id
+                    in_flight[future] = (work.chunk_id, work.shard_id, work.batch_index)
                     if len(in_flight) >= parallelism:
                         drain_one()
             finally:
@@ -1072,7 +1191,7 @@ class BatchedImporter:
                 prefetched.close()
             while in_flight:
                 drain_one()
-        return agg, outcomes, stopped_early
+        return agg, resume_tracker, stopped_early
 
     def _load_batch(
         self, work: _BatchWork, pool: _ConnectionPool
@@ -1664,66 +1783,24 @@ def _resolve_outcome(
     )
 
 
-def _done_chunk_ids(job: Optional[MigrationJob]) -> set[str]:
-    """Return the set of chunk ids already ``DONE`` in ``job`` (for skipping)."""
-    if job is None:
-        return set()
-    return {chunk.chunk_id for chunk in job.chunks if chunk.status == "DONE"}
-
-
-def _apply_outcomes_to_job(
-    job: MigrationJob, outcomes: list[_BatchOutcome], skipped_ids: list[str]
-) -> None:
-    """Upsert this run's batch outcomes into ``job`` and recompute progress.
-
-    Skipped (already-``DONE``) batches are left untouched. Each executed batch's
-    chunk state is created or updated, ``attempts`` is incremented, and overall
-    ``progress_pct``/``error_count`` are recomputed from the chunk states.
-    """
-    by_id = {chunk.chunk_id: chunk for chunk in job.chunks}
-    for outcome in outcomes:
-        chunk = by_id.get(outcome.chunk_id)
-        if chunk is None:
-            chunk = ChunkState(chunk_id=outcome.chunk_id)
-            job.chunks.append(chunk)
-            by_id[outcome.chunk_id] = chunk
-        chunk.attempts += 1
-        chunk.status = "DONE" if outcome.status == "DONE" else "FAILED"
-        if outcome.status == "DONE":
-            chunk.rows_loaded = outcome.rows_loaded
-    _ = skipped_ids  # skipped chunks keep their existing DONE state untouched
-    _recompute_job_progress(job)
-
-
-def _recompute_job_progress(job: MigrationJob) -> None:
-    """Recompute ``progress_pct`` and ``error_count`` from chunk states."""
-    total = len(job.chunks)
-    if total == 0:
-        job.progress_pct = 0.0
-        job.error_count = 0
-        return
-    done = sum(1 for chunk in job.chunks if chunk.status == "DONE")
-    job.progress_pct = round(done / total * 100.0, 4)
-    job.error_count = sum(1 for chunk in job.chunks if chunk.status == "FAILED")
-
-
 def _aggregate_result(
     agg: "_RunAggregate",
-    skipped_ids: list[str],
+    batches_skipped: int,
     indexes_created: int,
     *,
     cancelled: bool = False,
 ) -> BatchedImportResult:
     """Build a :class:`BatchedImportResult` from the run's folded aggregate.
 
-    The per-batch outcomes were folded into ``agg`` as they resolved (see _RunAggregate), so
-    no per-batch list is retained -- the result reads the same totals off the running fold.
+    The per-batch outcomes were folded into ``agg`` as they resolved (see _RunAggregate)
+    and skipped batches counted in a single int -- no per-batch list is retained, so the
+    result reads the same totals off the running fold at O(1) memory.
     """
     return BatchedImportResult(
         rows_loaded=agg.rows_loaded,
         conflicts=agg.conflicts,
         batches_completed=agg.batches_completed,
-        batches_skipped=len(skipped_ids),
+        batches_skipped=batches_skipped,
         failures=agg.failures,
         first_error=agg.first_error,
         cancelled=cancelled,

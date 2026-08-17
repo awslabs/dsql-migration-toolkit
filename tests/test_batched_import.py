@@ -40,12 +40,12 @@ from dsql_migrator.core.batched_import import (
     BatchedImportOptions,
     BatchedImportResult,
     OnConflictMode,
+    _BatchResumeTracker,
     _prefetch_enabled,
     batch_chunk_id,
     build_insert_statement,
 )
 from dsql_migrator.core.models import (
-    ChunkState,
     ColumnDef,
     MigrationJob,
     TableDef,
@@ -887,18 +887,15 @@ def test_resume_skips_done_batches_and_converges_to_uninterrupted_state() -> Non
     _importer(uninterrupted_store, ["id", "name"], ["id"], options=options).import_rows(
         all_rows, table, job=uninterrupted_job
     )
+    # Its resume high-water advanced across every batch (single reader, indices 0..2).
+    assert uninterrupted_job.resume_batch_watermark == {"": 2}
 
-    # Resumed run: the first two batches were already DONE in a prior run, and
-    # the target already holds their rows. Only the third batch should load.
+    # Resumed run: the first two batches (indices 0, 1) were already committed by a
+    # prior attempt, recorded as the contiguous high-water 1; the target already holds
+    # their rows. Only the third batch (index 2) should load.
     resumed_store = _FakeStore()
     resumed_store.seed(all_rows[:4], ["id"])
-    resumed_job = MigrationJob(
-        job_id="job-resume",
-        chunks=[
-            ChunkState(chunk_id=batch_chunk_id(table.name, 0), status="DONE", rows_loaded=2),
-            ChunkState(chunk_id=batch_chunk_id(table.name, 1), status="DONE", rows_loaded=2),
-        ],
-    )
+    resumed_job = MigrationJob(job_id="job-resume", resume_batch_watermark={"": 1})
     result = _importer(
         resumed_store, ["id", "name"], ["id"], options=options
     ).import_rows(all_rows, table, job=resumed_job)
@@ -910,25 +907,123 @@ def test_resume_skips_done_batches_and_converges_to_uninterrupted_state() -> Non
     assert len(resumed_store.executed_inserts) == 1
     # Final target state equals the uninterrupted run (Property 4 equivalence).
     assert resumed_store.rows == uninterrupted_store.rows
-    # The job converges to all chunks DONE at 100%.
-    assert {chunk.status for chunk in resumed_job.chunks} == {"DONE"}
-    assert resumed_job.progress_pct == 100.0
+    # The high-water advanced to cover the whole table (indices 0..2 -> 2), and the
+    # durable per-table chunk list was never touched (that stays O(tables)).
+    assert resumed_job.resume_batch_watermark == {"": 2}
+    assert resumed_job.chunks == []
 
 
-def test_job_progress_and_chunk_state_updated() -> None:
+def test_import_with_job_records_compact_resume_high_water() -> None:
+    # A resume job accumulates only a per-shard high-water (one int), NOT a per-batch
+    # ChunkState list -- so a billion-row table's resume state does not grow with rows.
     store = _FakeStore()
     job = MigrationJob(job_id="job-1")
     importer = _importer(
         store, ["id", "name"], ["id"], options=BatchedImportOptions(batch_size=2)
     )
 
-    importer.import_rows(_rows(4), _table(), job=job)
+    result = importer.import_rows(_rows(4), _table(), job=job)
 
-    assert len(job.chunks) == 2
-    assert {chunk.status for chunk in job.chunks} == {"DONE"}
-    assert all(chunk.attempts == 1 for chunk in job.chunks)
-    assert job.progress_pct == 100.0
-    assert job.error_count == 0
+    assert result.batches_completed == 2
+    # Two batches (indices 0, 1) completed contiguously -> high-water 1 for the single
+    # (unsharded) reader, keyed "". No per-batch ChunkState objects are retained.
+    assert job.resume_batch_watermark == {"": 1}
+    assert job.chunks == []
+
+
+# ---------------------------------------------------------------------------
+# _BatchResumeTracker: compact, memory-bounded per-shard resume high-water
+# ---------------------------------------------------------------------------
+
+
+def test_resume_tracker_advances_over_out_of_order_completions() -> None:
+    # Batches complete concurrently, so out-of-order; the frontier is the highest
+    # CONTIGUOUS index, absorbing the ahead-set as the gap fills.
+    t = _BatchResumeTracker()
+    t.record_done(None, 0)
+    t.record_done(None, 2)  # ahead of the frontier -> held, frontier stays 0
+    assert t.watermark() == {"": 0}
+    t.record_done(None, 1)  # fills the gap -> frontier jumps to 2 (0,1,2 contiguous)
+    assert t.watermark() == {"": 2}
+
+
+def test_resume_tracker_seeds_from_prior_watermark() -> None:
+    # A resumed run skips 0..prior via the watermark, so its completions START at
+    # prior+1; seeding the frontier from the prior watermark lets them extend it.
+    t = _BatchResumeTracker({"": 4})
+    t.record_done(None, 5)
+    t.record_done(None, 6)
+    assert t.watermark() == {"": 6}
+    # A stale re-run of an already-covered index never regresses the frontier.
+    t.record_done(None, 3)
+    assert t.watermark() == {"": 6}
+
+
+def test_resume_tracker_seals_shard_on_failure_and_bounds_memory() -> None:
+    # A FAILED batch is a gap: the frontier freezes at the contiguous prefix and the
+    # ahead-set is dropped, so a shard that fails midway cannot accumulate O(rows)
+    # done-ahead indices (a retry re-runs everything past the frontier idempotently).
+    t = _BatchResumeTracker()
+    t.record_done(None, 0)
+    t.record_failed(None)          # gap at index 1 -> shard sealed at frontier 0
+    for i in range(2, 100_000):    # a huge run of later successes past the gap
+        t.record_done(None, i)
+    assert t.watermark() == {"": 0}          # frontier never advanced past the gap
+    assert t._ahead == {}                    # nothing accumulated (memory bounded)
+    assert "" in t._sealed
+
+
+def test_resume_tracker_tracks_shards_independently() -> None:
+    # Reader range sharding: each shard has its own high-water; a failure in one
+    # shard never freezes another's frontier.
+    t = _BatchResumeTracker()
+    t.record_done(0, 0)
+    t.record_done(0, 1)
+    t.record_done(1, 0)
+    t.record_failed(1)             # shard 1 sealed at 0
+    t.record_done(1, 1)            # ignored (sealed)
+    t.record_done(0, 2)            # shard 0 keeps advancing
+    assert t.watermark() == {"0": 2, "1": 0}
+
+
+def test_sharded_resume_skips_per_shard_by_high_water() -> None:
+    # Reader range sharding through import_rows: each shard's high-water is tracked
+    # and persisted independently, and a resume skips already-committed batches per
+    # shard (chunk ids are namespaced by shard, keys "0"/"1").
+    table = _table()
+    options = BatchedImportOptions(batch_size=1)  # one row per batch -> per-shard indices
+    columns = ["id", "name"]
+    shards = [
+        [{"id": 0, "name": "n0"}, {"id": 1, "name": "n1"}],
+        [{"id": 2, "name": "n2"}, {"id": 3, "name": "n3"}],
+    ]
+
+    # Fresh run: two shards of two rows each -> all four batches load.
+    fresh_store = _FakeStore()
+    fresh_job = MigrationJob(job_id="fresh")
+    _importer(fresh_store, columns, ["id"], options=options).import_rows(
+        iter(()), table, job=fresh_job,
+        shard_sources=[iter(s) for s in shards],
+        on_conflict=OnConflictMode.SKIP_EXISTING,
+    )
+    assert fresh_job.resume_batch_watermark == {"0": 1, "1": 1}
+
+    # Resume: shard 0 fully committed (hw 1), shard 1 committed through its first
+    # batch (hw 0); the target already holds those three rows.
+    resumed_store = _FakeStore()
+    resumed_store.seed(shards[0] + shards[1][:1], ["id"])
+    resumed_job = MigrationJob(job_id="resume", resume_batch_watermark={"0": 1, "1": 0})
+    result = _importer(resumed_store, columns, ["id"], options=options).import_rows(
+        iter(()), table, job=resumed_job,
+        shard_sources=[iter(s) for s in shards],
+        on_conflict=OnConflictMode.SKIP_EXISTING,
+    )
+    # Shard 0: both batches skipped; shard 1: first skipped, second loaded.
+    assert result.batches_skipped == 3
+    assert result.batches_completed == 1
+    assert resumed_job.resume_batch_watermark == {"0": 1, "1": 1}
+    # Every source row is now on the target (Property 4 convergence).
+    assert {key[0] for key in resumed_store.rows} == {0, 1, 2, 3}
 
 
 # ---------------------------------------------------------------------------

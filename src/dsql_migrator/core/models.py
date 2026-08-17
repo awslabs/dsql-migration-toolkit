@@ -739,6 +739,18 @@ class MigrationJob(BaseModel):
     chunks: list[ChunkState] = Field(default_factory=list)
     progress_pct: float = Field(default=0.0, ge=0.0, le=100.0)
     error_count: int = Field(default=0, ge=0)
+    # Ephemeral Full Load in-process resume marker: shard key -> highest CONTIGUOUSLY
+    # completed batch index for that shard reader. This is the compact, O(shards)
+    # replacement for a per-batch ``ChunkState`` list on the *ephemeral* per-table /
+    # per-shard resume job the batched loader uses to skip already-committed keyset
+    # ranges on a same-process source-drop retry. Because batches stream in keyset
+    # order (``batch_chunk_id`` maps index -> a stable PK range), a completed
+    # contiguous prefix means every range up to that index is committed, so one int
+    # per shard captures the resume point instead of one object per batch (a
+    # billion-row table would otherwise retain ~hundreds of thousands). It stays empty
+    # on the durable per-TABLE tracked job (which is what is persisted/displayed);
+    # additive + defaulted so already-persisted job snapshots still deserialize.
+    resume_batch_watermark: dict[str, int] = Field(default_factory=dict)
     watermark: Optional[Watermark] = Field(
         default=None,
         description=(

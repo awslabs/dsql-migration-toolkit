@@ -5,6 +5,32 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.356
+
+### Changed
+
+- **A resumed (append / CDC-coexisting / sharded) Full Load no longer retains per-batch resume
+  state that grew with the row count — it keeps a compact per-shard high-water instead** (from the
+  perf/stability review). The batched loader's in-process source-drop retry uses an *ephemeral*
+  resume job (created per table / per shard reader, never persisted) to skip keyset ranges already
+  committed on a retry. On the SKIP_EXISTING path that job was passed from row 1, and the loader
+  retained one `_BatchOutcome` per batch **and** appended one `ChunkState` per batch to it — so a
+  billion-row unsharded table accumulated hundreds of thousands of objects (× table parallelism),
+  contributing to the silent Fargate OOM the memory-pressure logger warns about. Because batches
+  stream in keyset order (batch `index` maps to a stable PK range), a completed *contiguous* prefix
+  means every range up to that index is committed, so the resume point a retry needs is just the
+  highest contiguously-completed batch index **per shard** — one int per shard, not one object per
+  batch. The loader now folds outcomes into its running aggregate (as the non-resume path already
+  did) and advances a compact `_BatchResumeTracker` (new `MigrationJob.resume_batch_watermark`);
+  the skipped-batch count is a single counter rather than an id list. Out-of-order completions are
+  absorbed by a small reorder buffer, and a FAILED batch *seals* its shard (freezing the frontier
+  and dropping the buffer) so a mid-shard failure cannot re-grow memory — a retry re-runs everything
+  past the frontier idempotently. Resume converges to the same target as before; the only behavior
+  change is that a batch completed *after* a gap is re-run on resume (idempotent under
+  `INSERT ... ON CONFLICT`) rather than individually skipped. The durable per-**table** job (what
+  the UI shows and what survives a restart) is unchanged; the new field is additive and defaulted
+  so already-persisted job snapshots still deserialize.
+
 ## v0.1.355
 
 ### Changed
