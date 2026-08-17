@@ -101,6 +101,8 @@ def test_load_config_full_load_parallelism_defaults() -> None:
     # Reader sharding is OFF by default (one reader, previous behavior).
     assert config.full_load_reader_shards == 1
     assert config.full_load_shard_min_rows == 1_000_000
+    # The source-load governor is OFF by default (None -> no throttle, zero overhead).
+    assert config.full_load_max_source_threads_running is None
     # Per-batch retry budget: patient default (rides out a transient conn storm).
     assert config.full_load_occ_max_attempts == 20
 
@@ -127,6 +129,19 @@ def test_load_config_reader_shards_rejects_over_cap() -> None:
     # Bounded at 8 to keep source read concurrency (table_parallelism x shards) sane.
     with pytest.raises(ValidationError):
         load_config(env={f"{ENV_PREFIX}FULL_LOAD_READER_SHARDS": "16"})
+
+
+def test_load_config_reads_source_load_governor_ceiling() -> None:
+    config = load_config(
+        env={f"{ENV_PREFIX}FULL_LOAD_MAX_SOURCE_THREADS_RUNNING": "40"}
+    )
+    assert config.full_load_max_source_threads_running == 40
+
+
+def test_load_config_source_load_governor_rejects_below_one() -> None:
+    # ge=1: a ceiling of 0 would pause forever; reject it rather than silently stall.
+    with pytest.raises(ValidationError):
+        load_config(env={f"{ENV_PREFIX}FULL_LOAD_MAX_SOURCE_THREADS_RUNNING": "0"})
 
 
 def test_load_config_full_load_batch_rows_rejects_over_cap() -> None:

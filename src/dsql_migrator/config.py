@@ -395,6 +395,25 @@ class AppConfig(BaseModel):
             "DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS."
         ),
     )
+    full_load_max_source_threads_running: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "OPT-IN source-load throttle for Full Load (unset by default = OFF, no "
+            "throttle, zero overhead). When set, a reader PAUSES before fetching its "
+            "next page while the SOURCE's global Threads_running exceeds this value "
+            "and resumes when it recedes -- so the migration caps the source's "
+            "active-query concurrency at roughly this number, protecting a "
+            "live-serving source (gh-ost --max-load style). It never fails the load "
+            "(pause-only; a failed status read is ignored) and the paused state is "
+            "logged. IMPORTANT: the migration's OWN readers (up to "
+            "full_load_table_parallelism x full_load_reader_shards x "
+            "full_load_batch_parallelism) count toward Threads_running, so set this "
+            "ABOVE your application's steady-state Threads_running plus the headroom "
+            "you want the migration to use -- too low will stall the read. Config "
+            "key: DSQL_MIGRATOR_FULL_LOAD_MAX_SOURCE_THREADS_RUNNING."
+        ),
+    )
     cdc_sink_mcu_count: int = Field(
         default=4,
         ge=1,
@@ -496,6 +515,10 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> AppConfig:
         values["full_load_reader_shards"] = int(fl_shards)
     if (fl_shard_min := _read(source, "FULL_LOAD_SHARD_MIN_ROWS")) is not None:
         values["full_load_shard_min_rows"] = int(fl_shard_min)
+    if (
+        fl_max_tr := _read(source, "FULL_LOAD_MAX_SOURCE_THREADS_RUNNING")
+    ) is not None:
+        values["full_load_max_source_threads_running"] = int(fl_max_tr)
     if (cdc_sink_mcu := _read(source, "CDC_SINK_MCU_COUNT")) is not None:
         values["cdc_sink_mcu_count"] = int(cdc_sink_mcu)
     if (to_stdout := _read(source, "ACTIVITY_LOG_STDOUT")) is not None:

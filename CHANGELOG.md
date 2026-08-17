@@ -5,6 +5,29 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.357
+
+### Added
+
+- **Opt-in Full Load source-load throttle (`full_load_max_source_threads_running`, unset = OFF)**
+  (from the perf/stability + migration-tool reviews; gh-ost `--max-load` style). Full Load could
+  previously only bound its source read pressure with the STATIC reader caps
+  (`full_load_table_parallelism` × `full_load_reader_shards` × `full_load_batch_parallelism`) — up to
+  ~128 concurrent readers — with no PROACTIVE back-off on a healthy-but-loaded production source.
+  When this ceiling is set, each reader now PAUSES before fetching its next page while the source's
+  global `Threads_running` exceeds it, and resumes when the metric recedes (a sliced, Stop-responsive
+  wait polled at the same between-pages point as the cooperative cancel — never mid-page). Because
+  the migration's own readers count toward `Threads_running`, this effectively caps the source's
+  active-query concurrency at roughly the ceiling, protecting a live-serving source. It is
+  **pause-only** (never fails the load), **fail-open** (a failed `SHOW GLOBAL STATUS` read is treated
+  as "don't throttle", so a broken status read can't stall the migration), and the metric is
+  TTL-cached (~2 s) so the extra status query is negligible even across many readers. Unset by
+  default → no throttle, zero overhead. IMPORTANT: set it ABOVE your application's steady-state
+  `Threads_running` plus the headroom you want the migration to use — too low will stall the read.
+  The paused/resumed state is logged (WARNING on pause, INFO on resume); surfacing it in the UI is a
+  future wire-up via the governor's `on_state_change` hook. Config key:
+  `DSQL_MIGRATOR_FULL_LOAD_MAX_SOURCE_THREADS_RUNNING`.
+
 ## v0.1.356
 
 ### Changed

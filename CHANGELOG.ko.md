@@ -5,6 +5,26 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.357
+
+### Added
+
+- **옵트인 Full Load 소스 부하 스로틀(`full_load_max_source_threads_running`, 미설정 = OFF)**
+  (성능/안정성 + 마이그레이션 도구 리뷰에서 도출, gh-ost `--max-load` 방식). 기존 Full Load은 정적 리더
+  상한(`full_load_table_parallelism` × `full_load_reader_shards` × `full_load_batch_parallelism`,
+  최대 ~128 동시 리더)으로만 소스 읽기 부하를 제한할 수 있었고, 건강하지만 부하가 있는 프로덕션 소스에 대한
+  선제적(proactive) 백오프는 없었습니다. 이 상한을 설정하면 각 리더가 다음 페이지를 가져오기 전에 소스의
+  전역 `Threads_running`이 상한을 초과하는 동안 일시정지(PAUSE)하고, 값이 내려가면 재개합니다(협조적 취소와
+  동일한 페이지 사이 지점에서 폴링하는, Stop에 즉시 반응하는 슬라이스 대기 — 페이지 도중에는 멈추지 않음).
+  마이그레이션 자신의 리더도 `Threads_running`에 포함되므로, 실질적으로 소스의 활성 쿼리 동시성을 상한 근처로
+  제한하여 라이브 서비스 중인 소스를 보호합니다. **일시정지 전용**(로드를 실패시키지 않음), **fail-open**
+  (`SHOW GLOBAL STATUS` 읽기 실패는 "스로틀 안 함"으로 처리 → 상태 읽기 실패가 마이그레이션을 멈추지 않음),
+  그리고 지표는 TTL 캐시(~2초)되어 많은 리더에서도 추가 상태 쿼리 부담이 미미합니다. 기본값 미설정 → 스로틀
+  없음, 오버헤드 0. 중요: 애플리케이션의 정상 상태 `Threads_running`에 마이그레이션이 쓸 여유를 더한 값보다
+  높게 설정하세요 — 너무 낮으면 읽기가 멈춥니다. 일시정지/재개 상태는 로그로 남깁니다(정지 시 WARNING, 재개
+  시 INFO). UI 표면화는 governor의 `on_state_change` 훅을 통한 향후 작업입니다. 설정 키:
+  `DSQL_MIGRATOR_FULL_LOAD_MAX_SOURCE_THREADS_RUNNING`.
+
 ## v0.1.356
 
 ### Changed

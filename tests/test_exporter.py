@@ -35,10 +35,12 @@ from dsql_migrator.core.exporter import (
     ExportCancelled,
     ExportError,
     RowWriter,
+    SourceLoadGovernor,
     TableExporter,
     UnsupportedPrimaryKeyError,
     ValueConversionError,
     ValueConverter,
+    _read_threads_running,
     compute_pk_shard_ranges,
     export_rows,
     keyset_stream,
@@ -76,6 +78,16 @@ class _FakeResult:
         return _FakeMappings(self._rows)
 
 
+class _StatusResult:
+    """Mirrors a SHOW GLOBAL STATUS result: ``.first()`` -> (Variable_name, Value)."""
+
+    def __init__(self, value: Optional[int]) -> None:
+        self._value = value
+
+    def first(self):  # noqa: ANN201 - mirrors SQLAlchemy Result.first()
+        return None if self._value is None else ("Threads_running", str(self._value))
+
+
 class _FakeConnection:
     """A fake connection that serves keyset pages from an in-memory dataset.
 
@@ -84,7 +96,7 @@ class _FakeConnection:
     SQL-shape assertions), and counts page queries (for laziness assertions).
     """
 
-    def __init__(self, rows: list[dict], pk="id") -> None:
+    def __init__(self, rows: list[dict], pk="id", threads_running=None) -> None:
         self._pk_cols = [pk] if isinstance(pk, str) else list(pk)
         self._rows = sorted(
             rows, key=lambda row: tuple(row[c] for c in self._pk_cols)
@@ -93,6 +105,15 @@ class _FakeConnection:
         self.executed: list[tuple[str, Optional[dict]]] = []
         self.page_queries = 0
         self.execution_options_seen: Optional[dict] = None
+        # Scripted Threads_running values the source-load governor's SHOW GLOBAL
+        # STATUS returns (consumed in order, last value repeats); None -> the metric
+        # is unconfigured, so SHOW returns 0 (never throttles). SHOW GLOBAL STATUS is
+        # NOT appended to ``executed`` so it doesn't shift the page-SQL-shape asserts.
+        self._threads_running = (
+            list(threads_running) if threads_running is not None else None
+        )
+        self._tr_index = 0
+        self.status_reads = 0
 
     def execution_options(self, **kwargs):  # noqa: ANN201 - mirrors SQLAlchemy
         self.execution_options_seen = kwargs
@@ -100,8 +121,17 @@ class _FakeConnection:
 
     def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
         sql = str(statement)
-        self.executed.append((sql, parameters))
         upper = sql.strip().upper()
+        if "THREADS_RUNNING" in upper:  # source-load governor's SHOW GLOBAL STATUS
+            self.status_reads += 1
+            if not self._threads_running:
+                return _StatusResult(0)  # unconfigured -> never throttles
+            value = self._threads_running[
+                min(self._tr_index, len(self._threads_running) - 1)
+            ]
+            self._tr_index += 1
+            return _StatusResult(value)
+        self.executed.append((sql, parameters))
         if upper.startswith("START TRANSACTION") or upper.startswith("COMMIT"):
             return _FakeResult([])
 
@@ -338,6 +368,167 @@ def test_keyset_stream_rejects_missing_primary_key() -> None:
     )
     with pytest.raises(UnsupportedPrimaryKeyError, match="no primary key"):
         list(keyset_stream(_FakeConnection([]), table))
+
+
+# ---------------------------------------------------------------------------
+# Source-load governor (opt-in proactive read throttle)
+# ---------------------------------------------------------------------------
+
+
+def test_read_threads_running_parses_and_fails_open() -> None:
+    assert _read_threads_running(_FakeConnection([], threads_running=[42])) == 42
+    # A NULL/absent status row -> None (fail-open), never raises.
+    assert _read_threads_running(_FakeConnection([], threads_running=[None])) is None
+
+    class _Boom:
+        def execute(self, *_a, **_k):  # noqa: ANN002, ANN003, ANN201
+            raise RuntimeError("status read failed")
+
+    assert _read_threads_running(_Boom()) is None  # exception -> None (never raises)
+
+
+def test_governor_disabled_is_a_noop() -> None:
+    conn = _FakeConnection([], threads_running=[999])
+    sleeps: list[float] = []
+    gov = SourceLoadGovernor(conn, None, sleep=sleeps.append)
+    assert gov.enabled is False
+    gov.throttle()
+    assert conn.status_reads == 0  # disabled -> never even reads the metric
+    assert sleeps == []
+
+
+def test_governor_under_ceiling_does_not_pause() -> None:
+    conn = _FakeConnection([], threads_running=[5])
+    sleeps: list[float] = []
+    changes: list = []
+    gov = SourceLoadGovernor(
+        conn, 10, sleep=sleeps.append,
+        on_state_change=lambda paused, running: changes.append((paused, running)),
+    )
+    gov.throttle()
+    assert sleeps == [] and changes == []
+    assert conn.status_reads == 1
+
+
+def test_governor_pauses_over_ceiling_then_resumes() -> None:
+    # Over the ceiling for two reads, then it recedes -> pause (sliced sleep) + resume.
+    conn = _FakeConnection([], threads_running=[20, 20, 5])
+    sleeps: list[float] = []
+    changes: list = []
+    gov = SourceLoadGovernor(
+        conn, 10, sleep=sleeps.append, monotonic=lambda: 0.0, slice_seconds=1.0,
+        on_state_change=lambda paused, running: changes.append((paused, running)),
+    )
+    gov.throttle()
+    assert sleeps == [1.0, 1.0]                    # two slices while over the ceiling
+    assert changes == [(True, 20), (False, 5)]     # one pause + one resume transition
+    assert conn.status_reads == 3                  # re-reads each slice while paused
+
+
+def test_governor_fail_open_never_pauses() -> None:
+    # A NULL/failed status read must not stall the load (fail-open).
+    conn = _FakeConnection([], threads_running=[None])
+    sleeps: list[float] = []
+    gov = SourceLoadGovernor(conn, 10, sleep=sleeps.append)
+    gov.throttle()
+    assert sleeps == []
+
+
+def test_governor_pause_honors_should_cancel() -> None:
+    # A Stop during a pause returns promptly so the caller can raise ExportCancelled.
+    conn = _FakeConnection([], threads_running=[99])  # always over the ceiling
+    sleeps: list[float] = []
+    calls = {"n": 0}
+
+    def should_cancel() -> bool:
+        calls["n"] += 1
+        return calls["n"] >= 2  # False on the first check, True on the second
+
+    gov = SourceLoadGovernor(conn, 10, sleep=sleeps.append, monotonic=lambda: 0.0)
+    gov.throttle(should_cancel)
+    assert len(sleeps) == 1  # one slice, then the cancel ended the wait (no hang)
+
+
+def test_governor_caches_reading_within_ttl() -> None:
+    # Two throttle() calls within the TTL read the metric ONCE (cached), so the extra
+    # SHOW GLOBAL STATUS is negligible across many pages.
+    conn = _FakeConnection([], threads_running=[5, 999])
+    gov = SourceLoadGovernor(conn, 10, monotonic=lambda: 100.0, ttl_seconds=2.0)
+    gov.throttle()
+    gov.throttle()
+    assert conn.status_reads == 1  # second call reused the cached value
+
+
+def test_keyset_stream_throttles_before_each_page() -> None:
+    # The governor is asked to throttle at the same between-pages point as the cancel
+    # poll: exactly once before each page fetch.
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 6)]
+    conn = _FakeConnection(rows)
+
+    class _SpyGovernor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def throttle(self, should_cancel=None) -> None:  # noqa: ANN001
+            self.calls += 1
+
+    spy = _SpyGovernor()
+    out = list(keyset_stream(conn, _simple_table(), batch_size=2, governor=spy))
+    assert [r["id"] for r in out] == [1, 2, 3, 4, 5]
+    assert spy.calls == conn.page_queries  # throttled once before every page
+
+
+def test_keyset_stream_cancel_after_throttle_raises() -> None:
+    # If a Stop lands DURING the governor's pause, keyset_stream re-polls the cancel
+    # after throttle returns and raises ExportCancelled (never fetches the page).
+    conn = _FakeConnection([{"id": 1, "name": "n1"}])
+    calls = {"n": 0}
+
+    def should_cancel() -> bool:
+        calls["n"] += 1
+        return calls["n"] >= 2  # False at the top poll, True right after throttle
+
+    class _NoopGovernor:
+        def throttle(self, should_cancel=None) -> None:  # noqa: ANN001
+            return
+
+    with pytest.raises(ExportCancelled):
+        list(keyset_stream(
+            conn, _simple_table(), batch_size=2,
+            should_cancel=should_cancel, governor=_NoopGovernor(),
+        ))
+    assert conn.page_queries == 0  # cancelled before the first page was fetched
+
+
+def test_show_global_status_passes_the_read_only_guard() -> None:
+    # The governor's query MUST NOT be blocked by the source read-only guard, else it
+    # would silently fail-open and never throttle.
+    assert is_write_or_ddl("SHOW GLOBAL STATUS LIKE 'Threads_running'") is False
+
+
+def test_table_exporter_wires_the_governor_when_ceiling_set() -> None:
+    # A configured ceiling makes stream_converted_rows consult the source's
+    # Threads_running between pages (governor wired end-to-end). Under the ceiling it
+    # never pauses, so every row still streams.
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 4)]
+    conn = _FakeConnection(rows, threads_running=[5])  # under ceiling 10 -> no pause
+    exporter = TableExporter(
+        engine_factory=lambda _cfg: _FakeEngine(conn),
+        max_source_threads_running=10,
+    )
+    out = list(exporter.stream_converted_rows(_source_config(), _simple_table()))
+    assert [r["id"] for r in out] == [1, 2, 3]
+    assert conn.status_reads >= 1  # the governor consulted the source
+
+
+def test_table_exporter_no_governor_when_ceiling_unset() -> None:
+    # Default (no ceiling) -> zero overhead: SHOW GLOBAL STATUS is never issued.
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 4)]
+    conn = _FakeConnection(rows, threads_running=[5])
+    exporter = TableExporter(engine_factory=lambda _cfg: _FakeEngine(conn))
+    out = list(exporter.stream_converted_rows(_source_config(), _simple_table()))
+    assert [r["id"] for r in out] == [1, 2, 3]
+    assert conn.status_reads == 0  # governor not built -> no status query at all
 
 
 # ---------------------------------------------------------------------------

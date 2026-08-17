@@ -2724,7 +2724,13 @@ class BatchedTableMigrator:
             engine_factory=make_source_engine_factory(
                 inputs.source_password,
                 read_timeout_seconds=FULL_LOAD_SOURCE_READ_TIMEOUT_SECONDS,
-            )
+            ),
+            # Opt-in source-load throttle: when the operator sets a ceiling, every
+            # reader (single + each shard, since both go through this exporter)
+            # pauses between pages while the source's Threads_running exceeds it.
+            # None (default) = no throttle. Read here so both the in-process and
+            # per-shard-process paths (which all use this migrator's exporter) honor it.
+            max_source_threads_running=load_config().full_load_max_source_threads_running,
         )
         self._watermark_capturer = watermark_capturer or WatermarkCapturer(
             engine_factory=make_source_engine_factory(inputs.source_password)

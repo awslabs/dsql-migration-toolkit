@@ -52,6 +52,7 @@ import csv
 import logging
 from abc import ABC, abstractmethod
 from datetime import datetime, time, timedelta, timezone
+from time import monotonic as _wall_monotonic, sleep as _wall_sleep
 from typing import Callable, Iterator, Mapping, Optional, Protocol, TextIO
 
 from sqlalchemy import text
@@ -562,6 +563,141 @@ def _select_column_sql(column: ColumnDef) -> str:
     return quoted
 
 
+# ---------------------------------------------------------------------------
+# Source-load governor (opt-in proactive read throttle)
+# ---------------------------------------------------------------------------
+
+# Cache the source Threads_running reading between page polls so the extra status
+# query is negligible even across many concurrent readers; while PAUSED, re-read
+# each wait slice so the pause ends as soon as the metric recedes.
+_GOVERNOR_STATUS_TTL_SECONDS = 2.0
+# Sliced wait so a Stop is honored within one slice, not after a long pause.
+_GOVERNOR_WAIT_SLICE_SECONDS = 1.0
+
+
+def _read_threads_running(connection: _Connection) -> Optional[int]:
+    """Read the source's global ``Threads_running``, or ``None`` on any failure.
+
+    ``SHOW GLOBAL STATUS`` reads live server state (not the snapshot), is read-only
+    (Property 1), and works inside the export's consistent-snapshot transaction. Any
+    failure or malformed value returns ``None`` so a broken status read can NEVER
+    stall the load (fail-open) -- the governor treats ``None`` as "don't throttle".
+    """
+    try:
+        row = connection.execute(
+            text("SHOW GLOBAL STATUS LIKE 'Threads_running'")
+        ).first()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - best-effort; never fail the load on a status read
+        return None
+    if row is None:
+        return None
+    try:
+        return int(row[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+class SourceLoadGovernor:
+    """Opt-in proactive throttle that pauses Full Load reads on a loaded source.
+
+    When ``max_threads_running`` is set, :func:`keyset_stream` calls
+    :meth:`throttle` before fetching each page: while the source's global
+    ``Threads_running`` exceeds the ceiling the read PAUSES (a sliced,
+    Stop-responsive wait) and resumes when the metric recedes. Because the
+    migration's own readers count toward ``Threads_running``, this effectively caps
+    the source's active-query concurrency at ~the ceiling -- protecting a
+    live-serving source (gh-ost ``--max-load`` style). It NEVER fails the load
+    (pause-only) and a failed status read is fail-open (treated as "don't
+    throttle"). With ``max_threads_running=None`` :meth:`throttle` is a no-op, so a
+    load that does not opt in pays ZERO overhead.
+
+    ``sleep`` / ``monotonic`` are injectable for tests; ``on_state_change`` (if
+    given) is called once on each pause<->resume transition with
+    ``(paused, threads_running)`` so a caller can surface the state (it is logged
+    regardless).
+    """
+
+    def __init__(
+        self,
+        connection: _Connection,
+        max_threads_running: Optional[int],
+        *,
+        sleep: Callable[[float], None] = _wall_sleep,
+        monotonic: Callable[[], float] = _wall_monotonic,
+        ttl_seconds: float = _GOVERNOR_STATUS_TTL_SECONDS,
+        slice_seconds: float = _GOVERNOR_WAIT_SLICE_SECONDS,
+        on_state_change: Optional[Callable[[bool, Optional[int]], None]] = None,
+    ) -> None:
+        self._connection = connection
+        self._ceiling = max_threads_running
+        self._sleep = sleep
+        self._monotonic = monotonic
+        self._ttl = ttl_seconds
+        self._slice = slice_seconds
+        self._on_state_change = on_state_change
+        self._cached_value: Optional[int] = None
+        self._cached_at: Optional[float] = None
+        self._paused = False
+
+    @property
+    def enabled(self) -> bool:
+        """True when a ceiling is set (otherwise :meth:`throttle` is a no-op)."""
+        return self._ceiling is not None
+
+    def _threads_running(self, *, fresh: bool) -> Optional[int]:
+        now = self._monotonic()
+        if (
+            not fresh
+            and self._cached_at is not None
+            and (now - self._cached_at) < self._ttl
+        ):
+            return self._cached_value
+        value = _read_threads_running(self._connection)
+        self._cached_value = value
+        self._cached_at = now
+        return value
+
+    def _set_paused(self, paused: bool, running: Optional[int]) -> None:
+        if paused == self._paused:
+            return
+        self._paused = paused
+        if paused:
+            _LOGGER.warning(
+                "Full Load paused: source Threads_running=%s exceeds the configured "
+                "ceiling %s -- waiting for source load to recede.",
+                running, self._ceiling,
+            )
+        else:
+            _LOGGER.info(
+                "Full Load resumed: source Threads_running=%s is at/below the "
+                "ceiling %s.", running, self._ceiling,
+            )
+        if self._on_state_change is not None:
+            self._on_state_change(paused, running)
+
+    def throttle(self, should_cancel: Optional[Callable[[], bool]] = None) -> None:
+        """Block (sliced) while the source is over the ceiling; no-op if disabled.
+
+        Returns promptly when the metric is at/below the ceiling, when the ceiling
+        is unset, on a status-read failure (fail-open), or when ``should_cancel``
+        fires (the caller re-polls it and raises :class:`ExportCancelled`). Never
+        raises -- throttling must never itself fail the load.
+        """
+        if self._ceiling is None:
+            return
+        fresh = False
+        while True:
+            running = self._threads_running(fresh=fresh)
+            if running is None or running <= self._ceiling:
+                self._set_paused(False, running)
+                return
+            self._set_paused(True, running)
+            if should_cancel is not None and should_cancel():
+                return  # caller re-polls should_cancel -> ExportCancelled
+            self._sleep(self._slice)
+            fresh = True  # re-read the metric each slice while paused
+
+
 def keyset_stream(
     connection: _Connection,
     table: TableDef,
@@ -570,6 +706,7 @@ def keyset_stream(
     should_cancel: Optional[Callable[[], bool]] = None,
     pk_lower: Optional[int] = None,
     pk_upper: Optional[int] = None,
+    governor: Optional["SourceLoadGovernor"] = None,
 ) -> Iterator[Mapping[str, object]]:
     """Yield ``table`` rows in ascending primary-key order via keyset pagination.
 
@@ -595,6 +732,11 @@ def keyset_stream(
     (leading column is the index prefix) and preserves ascending-PK order within the
     slice. ``pk_upper=None`` means "to the end" (the last shard); ``pk_lower=None``
     means "from the start" (the first shard).
+
+    ``governor`` (optional) is the opt-in :class:`SourceLoadGovernor`; when set it is
+    asked to :meth:`~SourceLoadGovernor.throttle` at the SAME pre-page poll point as
+    ``should_cancel``, so a loaded source pauses the read between pages (never
+    mid-page) and resumes when it recedes. ``None`` (the default) adds no overhead.
     """
     if batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
@@ -676,6 +818,13 @@ def keyset_stream(
         # is fine: the table is left incomplete and the idempotent re-load resumes.
         if should_cancel is not None and should_cancel():
             raise ExportCancelled(table.name)
+        # Opt-in source-load throttle at the SAME between-pages point: pause while the
+        # source is over its Threads_running ceiling (no-op when not configured). A
+        # pause honors Stop within a slice, so re-poll the cancel after it returns.
+        if governor is not None:
+            governor.throttle(should_cancel)
+            if should_cancel is not None and should_cancel():
+                raise ExportCancelled(table.name)
         if last_key is None:
             statement = text(first_page_sql)
             params: dict[str, object] = {"batch_size": batch_size, **range_params}
@@ -733,10 +882,18 @@ class TableExporter:
         engine_factory: Optional[Callable[[SourceConnectionConfig], Engine]] = None,
         *,
         batch_size: int = DEFAULT_BATCH_SIZE,
+        max_source_threads_running: Optional[int] = None,
     ) -> None:
-        """Create an exporter with an optional engine factory and page size."""
+        """Create an exporter with an optional engine factory and page size.
+
+        ``max_source_threads_running`` (optional) opts the streaming read into the
+        :class:`SourceLoadGovernor`: when set, :meth:`stream_converted_rows` pauses
+        between pages while the source's ``Threads_running`` exceeds it. ``None``
+        (the default) = no throttle, zero overhead.
+        """
         self._engine_factory = engine_factory or _default_engine_factory
         self._batch_size = batch_size
+        self._max_source_threads_running = max_source_threads_running
 
     def export_table(
         self,
@@ -856,6 +1013,11 @@ class TableExporter:
                     isolation_level="AUTOCOMMIT", stream_results=True
                 )
                 snapshot.execute(text(START_CONSISTENT_SNAPSHOT))
+                governor = (
+                    SourceLoadGovernor(snapshot, self._max_source_threads_running)
+                    if self._max_source_threads_running is not None
+                    else None
+                )
                 try:
                     for raw in keyset_stream(
                         snapshot,
@@ -864,6 +1026,7 @@ class TableExporter:
                         should_cancel=should_cancel,
                         pk_lower=pk_lower,
                         pk_upper=pk_upper,
+                        governor=governor,
                     ):
                         yield converter.convert_row(raw)
                 finally:
@@ -913,4 +1076,5 @@ __all__ = [
     "keyset_stream",
     "export_rows",
     "TableExporter",
+    "SourceLoadGovernor",
 ]
