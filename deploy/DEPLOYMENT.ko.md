@@ -45,7 +45,7 @@ NiceGUI ready to go on http://127.0.0.1:8080
 <summary><b>스크린샷</b> — 도구 UI(5단계 가이드 워크플로우)</summary>
 
 <div align="center">
-  <a href="../docs/demo-ui.png"><img src="../docs/demo-ui.png" alt="도구 UI — 5단계 가이드 마이그레이션 워크플로우" width="900"></a>
+  <a href="../docs/images/demo-ui.png"><img src="../docs/images/demo-ui.png" alt="도구 UI — 5단계 가이드 마이그레이션 워크플로우" width="900"></a>
 </div>
 
 </details>
@@ -101,7 +101,7 @@ Well-Architected SEC05-BP02. 외부에 공개하려면 [app-stack 배포](#2-app
 <summary><b>아키텍처 다이어그램</b> — 전체 토폴로지(app-stack + 선택적 CDC on MSK Connect)</summary>
 
 <div align="center">
-  <a href="architecture-aws.png"><img src="architecture-aws.png" alt="전체 AWS 아키텍처 — 운영자가 HTTPS ALB(선택적 Cognito)를 통해 ECS Fargate 컨트롤 플레인 앱에 접속하고, 앱이 Aurora DSQL로 Full Load를 수행하며, 선택적 CDC 파이프라인에서는 cdc-stack을 배포해 Debezium 소스 + 커스텀 DSQL 싱크 커넥터가 MSK Connect에서(S3의 플러그인 로드) 실행되어 Amazon MSK를 거쳐 Aurora DSQL로 스트리밍하고, gapless 핸드오프를 위한 VPC 내 offset-seeder Lambda가 있음" width="900"></a>
+  <a href="../docs/images/architecture-aws.png"><img src="../docs/images/architecture-aws.png" alt="전체 AWS 아키텍처 — 운영자가 HTTPS ALB(선택적 Cognito)를 통해 ECS Fargate 컨트롤 플레인 앱에 접속하고, 앱이 Aurora DSQL로 Full Load를 수행하며, 선택적 CDC 파이프라인에서는 cdc-stack을 배포해 Debezium 소스 + 커스텀 DSQL 싱크 커넥터가 MSK Connect에서(S3의 플러그인 로드) 실행되어 Amazon MSK를 거쳐 Aurora DSQL로 스트리밍하고, gapless 핸드오프를 위한 VPC 내 offset-seeder Lambda가 있음" width="900"></a>
 </div>
 
 </details>
@@ -167,7 +167,7 @@ Well-Architected SEC05-BP02. 외부에 공개하려면 [app-stack 배포](#2-app
 
 #### 권장 — AWS Console (안내형 폼)
 
-![CloudFormation — Create stack → Upload a template file](images/cfn-create-stack.png)
+![CloudFormation — Create stack → Upload a template file](../docs/images/cfn-create-stack.png)
 
 먼저 콘솔 우측 상단에서 **올바른 리전**(Aurora DSQL 클러스터와 같은 리전)인지 확인한 뒤:
 
@@ -728,7 +728,7 @@ ALB도 없습니다. UI에는 **SSM 포트포워드**로 접속합니다(호스�
 <summary><b>아키텍처 다이어그램</b> — 단일 EC2 호스트, 인프로세스 CDC 시드(SeedMode=External)</summary>
 
 <div align="center">
-  <a href="architecture-aws-ec2.png"><img src="architecture-aws-ec2.png" alt="단일 EC2 호스트 아키텍처 — 마이그레이션 도구가 VPC 내 EC2 호스트 1대에서 소스 그대로 실행되고 SSM 포트포워드로 접속(ALB 없음), Aurora DSQL로 Full Load를 수행하고 MSK로 CDC를 인프로세스 시드하며, Debezium 소스 + 커스텀 DSQL 싱크 커넥터가 MSK Connect에서 S3의 플러그인을 로드" width="820"></a>
+  <a href="../docs/images/architecture-aws-ec2.png"><img src="../docs/images/architecture-aws-ec2.png" alt="단일 EC2 호스트 아키텍처 — 마이그레이션 도구가 VPC 내 EC2 호스트 1대에서 소스 그대로 실행되고 SSM 포트포워드로 접속(ALB 없음), Aurora DSQL로 Full Load를 수행하고 MSK로 CDC를 인프로세스 시드하며, Debezium 소스 + 커스텀 DSQL 싱크 커넥터가 MSK Connect에서 S3의 플러그인을 로드" width="820"></a>
 </div>
 
 </details>

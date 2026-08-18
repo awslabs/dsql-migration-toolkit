@@ -17,7 +17,7 @@ cut-over where a short freeze is acceptable, Full Load alone is enough.
 ## 4.1 The pipeline
 
 <p align="center">
-  <img src="../../../deploy/architecture-cdc-pipeline.png" alt="CDC pipeline: source MySQL binlog → Debezium source connector → Amazon MSK (per-table topics keyed by PK + DLQ) → custom DSQL sink connector → Aurora DSQL" width="900">
+  <img src="../../images/architecture-cdc-pipeline.png" alt="CDC pipeline: source MySQL binlog → Debezium source connector → Amazon MSK (per-table topics keyed by PK + DLQ) → custom DSQL sink connector → Aurora DSQL" width="900">
 </p>
 
 - **Debezium MySQL source connector** reads the source's binary log (read-only)

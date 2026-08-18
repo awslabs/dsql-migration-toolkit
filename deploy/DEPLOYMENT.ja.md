@@ -46,7 +46,7 @@ NiceGUI ready to go on http://127.0.0.1:8080
 <summary><b>スクリーンショット</b> — ツールの UI（ガイド付き 5 ステップのワークフロー）</summary>
 
 <div align="center">
-  <a href="../docs/demo-ui.png"><img src="../docs/demo-ui.png" alt="ツールの UI — ガイド付き 5 ステップの移行ワークフロー" width="900"></a>
+  <a href="../docs/images/demo-ui.png"><img src="../docs/images/demo-ui.png" alt="ツールの UI — ガイド付き 5 ステップの移行ワークフロー" width="900"></a>
 </div>
 
 </details>
@@ -106,7 +106,7 @@ VPC 内から — VPN、Direct Connect、または SSM ポートフォワード�
 <summary><b>アーキテクチャ図</b> — 全体トポロジ（app-stack + オプションの CDC on MSK Connect）</summary>
 
 <div align="center">
-  <a href="architecture-aws.png"><img src="architecture-aws.png" alt="AWS アーキテクチャ全体 — オペレーターが HTTPS ALB（オプションで Cognito）経由で ECS Fargate コントロールプレーンアプリに接続し、アプリが Aurora DSQL への Full Load を行い、オプションの CDC パイプラインでは cdc-stack をデプロイして Debezium ソース + カスタム DSQL シンクコネクタが MSK Connect で（S3 からプラグインをロード）実行され、Amazon MSK を経由して Aurora DSQL へストリーミングし、gapless ハンドオフのための VPC 内 offset-seeder Lambda を備える" width="900"></a>
+  <a href="../docs/images/architecture-aws.png"><img src="../docs/images/architecture-aws.png" alt="AWS アーキテクチャ全体 — オペレーターが HTTPS ALB（オプションで Cognito）経由で ECS Fargate コントロールプレーンアプリに接続し、アプリが Aurora DSQL への Full Load を行い、オプションの CDC パイプラインでは cdc-stack をデプロイして Debezium ソース + カスタム DSQL シンクコネクタが MSK Connect で（S3 からプラグインをロード）実行され、Amazon MSK を経由して Aurora DSQL へストリーミングし、gapless ハンドオフのための VPC 内 offset-seeder Lambda を備える" width="900"></a>
 </div>
 
 </details>
@@ -175,7 +175,7 @@ VPC 内から — VPN、Direct Connect、または SSM ポートフォワード�
 
 #### 推奨 — AWS Console (ガイド付きフォーム)
 
-![CloudFormation — Create stack → Upload a template file](images/cfn-create-stack.png)
+![CloudFormation — Create stack → Upload a template file](../docs/images/cfn-create-stack.png)
 
 まず、**正しいリージョン**（コンソール右上 — Aurora DSQL クラスターと同一リージョン）
 にいることを確認し、次に:
@@ -791,7 +791,7 @@ ECR も ALB もありません。UI には **SSM ポートフォワード**で�
 <summary><b>アーキテクチャ図</b> — 単一 EC2 ホスト、インプロセス CDC シード（SeedMode=External）</summary>
 
 <div align="center">
-  <a href="architecture-aws-ec2.png"><img src="architecture-aws-ec2.png" alt="単一 EC2 ホストのアーキテクチャ — 移行ツールが VPC 内の EC2 ホスト 1 台でソースのまま動作し、SSM ポートフォワードで接続（ALB なし）、Aurora DSQL への Full Load とインプロセスの CDC シードを MSK に対して行い、Debezium ソース + カスタム DSQL シンクコネクタが MSK Connect で S3 からプラグインをロード" width="820"></a>
+  <a href="../docs/images/architecture-aws-ec2.png"><img src="../docs/images/architecture-aws-ec2.png" alt="単一 EC2 ホストのアーキテクチャ — 移行ツールが VPC 内の EC2 ホスト 1 台でソースのまま動作し、SSM ポートフォワードで接続（ALB なし）、Aurora DSQL への Full Load とインプロセスの CDC シードを MSK に対して行い、Debezium ソース + カスタム DSQL シンクコネクタが MSK Connect で S3 からプラグインをロード" width="820"></a>
 </div>
 
 </details>

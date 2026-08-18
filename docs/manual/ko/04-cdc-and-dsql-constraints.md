@@ -16,7 +16,7 @@ CDC가 필요한 경우는 **대규모 또는 지속적** 마이그레이션뿐�
 ## 4.1 파이프라인
 
 <p align="center">
-  <img src="../../../deploy/architecture-cdc-pipeline.png" alt="CDC 파이프라인: 소스 MySQL binlog → Debezium 소스 커넥터 → Amazon MSK(PK로 키잉한 테이블별 토픽 + DLQ) → 커스텀 DSQL 싱크 커넥터 → Aurora DSQL" width="900">
+  <img src="../../images/architecture-cdc-pipeline.png" alt="CDC 파이프라인: 소스 MySQL binlog → Debezium 소스 커넥터 → Amazon MSK(PK로 키잉한 테이블별 토픽 + DLQ) → 커스텀 DSQL 싱크 커넥터 → Aurora DSQL" width="900">
 </p>
 
 - **Debezium MySQL 소스 커넥터**가 소스 바이너리 로그를 읽기 전용으로 읽어 변경 이벤트를 냅니다.

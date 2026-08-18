@@ -13,7 +13,7 @@ CDC が必要になるのは、**大規模または継続的な** マイグレ�
 ## 4.1 パイプライン
 
 <p align="center">
-  <img src="../../../deploy/architecture-cdc-pipeline.png" alt="CDC パイプライン: ソース MySQL binlog → Debezium ソースコネクタ → Amazon MSK（PK でキー付けしたテーブルごとのトピック + DLQ）→ カスタム DSQL シンクコネクタ → Aurora DSQL" width="900">
+  <img src="../../images/architecture-cdc-pipeline.png" alt="CDC パイプライン: ソース MySQL binlog → Debezium ソースコネクタ → Amazon MSK（PK でキー付けしたテーブルごとのトピック + DLQ）→ カスタム DSQL シンクコネクタ → Aurora DSQL" width="900">
 </p>
 
 - **Debezium MySQL source connector** は、ソースのバイナリログを読み取り専用で読み込み、変更イベントを出力します。

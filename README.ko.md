@@ -29,7 +29,7 @@ Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 *분산* 데이터베이�
 
 <p align="center">
   <b>Simple architecture</b><br>
-  <img src="deploy/architecture-aws-simple.png" alt="아키텍처 다이어그램" width="720">
+  <img src="docs/images/architecture-aws-simple.png" alt="아키텍처 다이어그램" width="720">
 </p>
 
 ---
@@ -138,7 +138,7 @@ UI만 띄우므로, 대용량 마이그레이션과 프라이빗 소스에 적�
 
 <p align="center">
   <b>Console (UI)</b><br>
-  <img src="docs/demo-ui.png" alt="도구 UI — 5단계 가이드 마이그레이션 워크플로우" width="720">
+  <img src="docs/images/demo-ui.png" alt="도구 UI — 5단계 가이드 마이그레이션 워크플로우" width="720">
 </p>
 
 ### EC2 호스트 (소스에서 실행 — 컨테이너·Lambda 없음)
@@ -165,7 +165,7 @@ CDC는 Kafka를 **인프로세스로** 시드하므로 **오프셋 시더 Lambda
 EC2 호스트에서 소스로**(systemd + SSM 포트포워드, ALB/ECR 없음) 실행할 수 있습니다 —
 [빠른 시작](#빠른-시작) 참고.
 
-[![전체 AWS 아키텍처 토폴로지](deploy/architecture-aws.png)](deploy/architecture-aws.png)
+[![전체 AWS 아키텍처 토폴로지](docs/images/architecture-aws.png)](docs/images/architecture-aws.png)
 
 > 다이어그램을 클릭하면 원본 해상도로 열립니다.
 

@@ -48,7 +48,7 @@ before deciding on Fargate.
 <summary><b>Screenshot</b> — the tool's UI (the guided five-step workflow)</summary>
 
 <div align="center">
-  <a href="../docs/demo-ui.png"><img src="../docs/demo-ui.png" alt="The tool's UI — the guided five-step migration workflow" width="900"></a>
+  <a href="../docs/images/demo-ui.png"><img src="../docs/images/demo-ui.png" alt="The tool's UI — the guided five-step migration workflow" width="900"></a>
 </div>
 
 </details>
@@ -108,7 +108,7 @@ expose it publicly, see the override note under [Deploy the app-stack](#2-deploy
 <summary><b>Architecture diagram</b> — full topology (app-stack + optional CDC on MSK Connect)</summary>
 
 <div align="center">
-  <a href="architecture-aws.png"><img src="architecture-aws.png" alt="Full AWS architecture — the operator reaches the ECS Fargate control-plane app through an HTTPS ALB (optional Cognito); the app drives Full Load to Aurora DSQL and, for the optional CDC pipeline, deploys the cdc-stack whose Debezium source + custom DSQL sink connectors run on MSK Connect (plugins from S3), streaming through Amazon MSK to Aurora DSQL, with an in-VPC offset-seeder Lambda for a gapless handoff" width="900"></a>
+  <a href="../docs/images/architecture-aws.png"><img src="../docs/images/architecture-aws.png" alt="Full AWS architecture — the operator reaches the ECS Fargate control-plane app through an HTTPS ALB (optional Cognito); the app drives Full Load to Aurora DSQL and, for the optional CDC pipeline, deploys the cdc-stack whose Debezium source + custom DSQL sink connectors run on MSK Connect (plugins from S3), streaming through Amazon MSK to Aurora DSQL, with an in-VPC offset-seeder Lambda for a gapless handoff" width="900"></a>
 </div>
 
 </details>
@@ -177,7 +177,7 @@ stack; see **Parameter reference** below.
 
 #### Recommended — AWS Console (guided form)
 
-![CloudFormation — Create stack → Upload a template file](images/cfn-create-stack.png)
+![CloudFormation — Create stack → Upload a template file](../docs/images/cfn-create-stack.png)
 
 First confirm you're in the **right region** (top-right of the console — the same
 region as your Aurora DSQL cluster), then:
@@ -799,7 +799,7 @@ Template: **`deploy/cloudformation-ec2.yaml`**.
 <summary><b>Architecture diagram</b> — single EC2 host, in-process CDC seed (SeedMode=External)</summary>
 
 <div align="center">
-  <a href="architecture-aws-ec2.png"><img src="architecture-aws-ec2.png" alt="Single EC2 host architecture — the migration tool runs from source on one in-VPC EC2 host reached over an SSM port-forward (no ALB), drives Full Load to Aurora DSQL and seeds CDC in-process to MSK, with the Debezium source + custom DSQL sink connectors on MSK Connect loading plugins from S3" width="820"></a>
+  <a href="../docs/images/architecture-aws-ec2.png"><img src="../docs/images/architecture-aws-ec2.png" alt="Single EC2 host architecture — the migration tool runs from source on one in-VPC EC2 host reached over an SSM port-forward (no ALB), drives Full Load to Aurora DSQL and seeds CDC in-process to MSK, with the Debezium source + custom DSQL sink connectors on MSK Connect loading plugins from S3" width="820"></a>
 </div>
 
 </details>

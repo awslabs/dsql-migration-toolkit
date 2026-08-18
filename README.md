@@ -30,7 +30,7 @@ binlog/GTID watermark bridges the two for a gapless handoff.
 
 <p align="center">
   <b>Simple architecture</b><br>
-  <img src="deploy/architecture-aws-simple.png" alt="Architecture diagram" width="720">
+  <img src="docs/images/architecture-aws-simple.png" alt="Architecture diagram" width="720">
 </p>
 
 ---
@@ -149,7 +149,7 @@ parameters, custom domain & Cognito, teardown, troubleshooting).
 
 <p align="center">
   <b>Console (UI)</b><br>
-  <img src="docs/demo-ui.png" alt="The tool's UI — the guided five-step migration workflow" width="720">
+  <img src="docs/images/demo-ui.png" alt="The tool's UI — the guided five-step migration workflow" width="720">
 </p>
 
 ### EC2 host (from source — no container, no Lambda)
@@ -179,7 +179,7 @@ an **HTTPS ALB** (`internal` by default, optional Cognito), pulling the image fr
 **from source on a single EC2 host** (systemd + SSM port-forward, no ALB/ECR) — see
 [Quick start](#quick-start).
 
-[![Full AWS architecture topology](deploy/architecture-aws.png)](deploy/architecture-aws.png)
+[![Full AWS architecture topology](docs/images/architecture-aws.png)](docs/images/architecture-aws.png)
 
 > Click the diagram for the full-resolution image.
 

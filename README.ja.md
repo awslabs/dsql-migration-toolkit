@@ -32,7 +32,7 @@ Aurora DSQL へのデータ投入は 2 つの経路で行います。ツール�
 
 <p align="center">
   <b>Simple architecture</b><br>
-  <img src="deploy/architecture-aws-simple.png" alt="アーキテクチャ図" width="720">
+  <img src="docs/images/architecture-aws-simple.png" alt="アーキテクチャ図" width="720">
 </p>
 
 ---
@@ -149,7 +149,7 @@ CloudFormation で app-stack をデプロイすると（イメージのビルド
 
 <p align="center">
   <b>Console (UI)</b><br>
-  <img src="docs/demo-ui.png" alt="ツールの UI — ガイド付き 5 ステップの移行ワークフロー" width="720">
+  <img src="docs/images/demo-ui.png" alt="ツールの UI — ガイド付き 5 ステップの移行ワークフロー" width="720">
 </p>
 
 ### EC2 ホスト（ソースから — コンテナ・Lambda なし）
@@ -178,7 +178,7 @@ VPC 内のプライベートなデータ経路（ソース → EC2 → DSQL）�
 ホストでソースから**（systemd + SSM ポートフォワード、ALB/ECR なし）実行できます —
 [クイックスタート](#クイックスタート)を参照。
 
-[![完全な AWS アーキテクチャトポロジー](deploy/architecture-aws.png)](deploy/architecture-aws.png)
+[![完全な AWS アーキテクチャトポロジー](docs/images/architecture-aws.png)](docs/images/architecture-aws.png)
 
 > 図をクリックすると原寸で表示されます。
 
