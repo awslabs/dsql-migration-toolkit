@@ -1194,15 +1194,17 @@ def test_activity_log_tab_presents_its_action_at_full_size() -> None:
     )
 
 
-def test_settings_header_warns_that_values_do_not_persist() -> None:
-    """The non-persistence caveat must be a notice, not gray micro-text.
+def test_settings_footer_warns_that_values_do_not_persist() -> None:
+    """The non-persistence caveat must be a notice, and sit at the modal FOOTER.
 
     It prevents a real mistake: an operator who tunes here and walks away assumes the
     value sticks, but any restart -- including a Fargate task replacement they did not
     initiate -- silently reverts it to the deploy-time default, so a carefully tuned run
-    behaves differently next time with no sign why. As a caption under the title it read as
-    boilerplate. It also must NOT claim "changes apply to the next run", which is true only
-    of the Full Load / Validation groups (each panel states its own timing).
+    behaves differently next time with no sign why. It sits below the tabs as a closing
+    note on the whole panel (a caption under the title read as boilerplate; a banner above
+    the tabs competed with the title). It also must NOT claim "changes apply to the next
+    run", which is true only of the Full Load / Validation groups (each panel states its
+    own timing).
     """
     import inspect
 
@@ -1215,6 +1217,9 @@ def test_settings_header_warns_that_values_do_not_persist() -> None:
     # Leads with the consequence and names the durable alternative.
     assert "revert to the" in src and "restarts" in src
     assert "DSQL_MIGRATOR_*" in src
+    # A FOOTER below the tabs, not a header banner: the notice is rendered after the
+    # tab panels are built, so it reads as a closing note on the whole panel.
+    assert src.index("ui.tab_panels(") < src.index('"These settings are not permanent"')
     # The dialog-wide line must not assert a per-group timing. Check the STRING LITERALS
     # only -- the prose above explains why that wording was dropped, and matching the
     # whole source would flag the explanation as the thing it warns against.

@@ -1855,27 +1855,6 @@ def _render_footer_tools(activity_log_path: str) -> None:
             ui.button(icon="close", on_click=dialog.close).props(
                 "flat dense round size=sm color=grey-7"
             ).tooltip("Close")
-        # Worth keeping -- it prevents a real mistake: an operator who tunes here and
-        # walks away would otherwise assume the value persists, and on a Fargate task
-        # replacement (or any restart) it silently reverts to the deploy-time default,
-        # so a carefully-tuned run behaves differently the next time with no sign why.
-        # But as gray micro-text under the title it read as boilerplate and was skipped.
-        # Promoted to an info notice (the app's standard treatment for a fact the user
-        # must register) and reworded to lead with the consequence, "not permanent",
-        # rather than the abstract "app-wide and live".
-        #
-        # NOT "changes apply to the next run" -- that is only true of the Full Load /
-        # Validation groups; each panel states its own timing.
-        render_notice(
-            ui,
-            tone="info",
-            header="These settings are not permanent",
-            body=(
-                "They apply app-wide, take effect without a redeploy, and revert to the "
-                "deploy-time defaults whenever the app restarts. To make a value stick, "
-                "set its DSQL_MIGRATOR_* environment variable in the deployment."
-            ),
-        )
         # Tabs, not stacked sections: the categories are unrelated -- you come here to
         # change ONE of them -- so stacking made the reader scroll past the others, and
         # the modal grew with every added knob. Same ui.tabs/tab_panels shape the Schema
@@ -1907,6 +1886,24 @@ def _render_footer_tools(activity_log_path: str) -> None:
                 _render_diagnostics_controls()
             with ui.tab_panel(activity_tab).classes("p-0 pt-3"):
                 _render_activity_log_download(activity_log_path)
+
+        # Footer, BELOW the tabs: this persistence caveat reads as a closing note on the
+        # whole panel rather than a banner competing with the title. It prevents a real
+        # mistake -- an operator who tunes here and walks away would assume the value
+        # persists, but on a restart / Fargate task replacement it silently reverts to
+        # the deploy-time default. It's an info notice (the app's standard treatment for a
+        # fact the user must register). NOT "changes apply to the next run" -- that's only
+        # true of the Full Load / Validation groups; each panel states its own timing.
+        render_notice(
+            ui,
+            tone="info",
+            header="These settings are not permanent",
+            body=(
+                "They apply app-wide, take effect without a redeploy, and revert to the "
+                "deploy-time defaults whenever the app restarts. To make a value stick, "
+                "set its DSQL_MIGRATOR_* environment variable in the deployment."
+            ),
+        )
 
     with ui.item(on_click=dialog.open).props("clickable").classes("rounded-borders"):
         with ui.item_section().props("avatar"):

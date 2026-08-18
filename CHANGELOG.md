@@ -5,6 +5,17 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.372
+
+### Changed
+
+- **The "these settings are not permanent" notice moved to the bottom of the Settings
+  modal** (below the tuning tabs) instead of sitting between the title and the tabs. As a
+  banner above the tabs it competed with the header; as a closing footer note it still
+  registers the caveat — values apply app-wide, take effect without a redeploy, and
+  revert to the deploy-time defaults on restart (set the `DSQL_MIGRATOR_*` env var to make
+  one stick) — without pushing the tabs down.
+
 ## v0.1.371
 
 ### Changed
