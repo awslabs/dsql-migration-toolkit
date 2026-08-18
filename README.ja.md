@@ -37,32 +37,46 @@ Aurora DSQL へのデータ投入は 2 つの経路で行います。ツール�
 
 ---
 
+<br>
+
 ## できること / できないこと
 
 **✅ できること**
 
-- **評価** — MySQL スキーマを解析し、すべてのオブジェクトを分類
-  （`AUTO` / `MANUAL` / `UNSUPPORTED`）。工数見積もりと名前の競合チェックを含む。
-- **スキーマ変換** — MySQL → DSQL の DDL を変換・適用（型マッピング、FK 削除、非同期
-  インデックス、PK 戦略）。オブジェクトツリーでレビューしてから適用。
-- **Full Load** — 一貫性のあるスナップショットをストリーミングで一括ロード。再開可能、大規模対応。
-- **CDC** — ニアゼロダウンタイムのカットオーバーのための継続的変更レプリケーション。
-- **Validation** — 行数・チェックサム・PK 突き合わせでソース ↔ ターゲットの一致を検証し、ドリフトを報告。
-- **AI アシスト**（オプション、既定オフ）— 難しい項目に対する変換案の提示（レビュー後にのみ適用）。
+- **ガイド付き Web UI** — 移行全体をブラウザアプリ 1 つで進め、各ステップの状態を可視化。
+- **評価** — ソース MySQL スキーマを解析し、すべてのオブジェクトを分類
+  （`AUTO` / `MANUAL` / `UNSUPPORTED`）。工数見積もりと名前の競合検出を含む。
+- **スキーマ変換** — MySQL の DDL を DSQL に変換（型マッピング、外部キー削除、非同期
+  インデックス、PK 戦略）し、オブジェクトツリーでレビューしてから適用。
+- **Full Load** — 一貫性のあるスナップショットをバウンデッドメモリのバッチで DSQL へ
+  ストリーミング。再開可能で、大規模テーブルに対応。
+- **CDC（変更データキャプチャ）** — ニアゼロダウンタイムのカットオーバーに向けてターゲットを
+  最新に保つ、オプションの継続的レプリケーション。
+- **Validation** — 行数・チェックサム・主キー突き合わせでソースとターゲットの一致を検証し、
+  ドリフトを報告。
+- **AI アシスト** — オプションで既定はオフ。マッピングが難しいオブジェクトの変換を提案し、
+  レビュー後にのみ適用。
+- **お好みの形態でデプロイ** — 同じツールを 3 通りで:
+  **Local**  ·  **ECS Fargate**  ·  **単一 EC2 ホスト**。
 
 **❌ できないこと / 対象外**
 
-- **完全自動・ゼロダウンタイムではない** — 難しい変換と最終的な **Cut over** は利用者自身が判断・実行する。
-- **ソースには一切書き込まない** — 読み取り専用。ロールバック用のアンカーとして保持。
-- **CDC は DDL を複製しない** — スキーマ変更は Schema Conversion で対応。
-- **クロスリージョン非対応** — ソースとターゲットは同一リージョンに配置する必要がある。
-- **DSQL が非対応の機能はそのまま制約になる** — 外部キー・トリガー・ストアドプロシージャ非対応、
-  トランザクションあたりの行数制限、1 値あたり 1 MiB 制限など。
+- **完全自動・ゼロダウンタイムではない** — 難しい変換と最終的な **Cut over** は利用者自身が
+  判断・実行する。
+- **ソースには一切書き込まない** — ソースは全工程で読み取り専用とし、ロールバック用のアンカーとして
+  保持する。
+- **CDC で DDL を複製しない** — スキーマ変更はレプリケーションストリームではなく Schema Conversion
+  で対応する。
+- **単一リージョンのみ** — ソースとターゲットは同一の AWS リージョンに配置する必要がある。
+- **DSQL の制約をそのまま継承** — 外部キー・トリガー・ストアドプロシージャ非対応、
+  トランザクションあたりの行数制限、1 値あたり ~1 MiB 制限など。
 
 > 制限事項とその回避策の一覧は、ユーザーマニュアル
 > [第 6 章 — 制限事項](docs/manual/ja/06-limitations.md) を参照。
 
 ---
+
+<br>
 
 ## ワークフロー
 
@@ -73,35 +87,41 @@ Web UI は **Connect** を準備ステップとし、5 つのステップで移�
 | ステップ | 内容 |
 | --- | --- |
 | Connect | ソース（RDS/Aurora MySQL）とターゲット（Aurora DSQL）の接続情報を入力。認証情報はセッション中のみメモリに保持し、終了時に破棄。 |
-| 1. Evaluation | ソース**と**ターゲットのスキーマを解析し、互換性レポート（`AUTO`/`MANUAL`/`UNSUPPORTED`）を生成。工数見積もり・名前の競合検出・AI による戦略提案を含む。 |
+| 1. Evaluation | ソース**と**ターゲットのスキーマを解析し、互換性レポート（`AUTO`/`MANUAL`/`UNSUPPORTED`）を生成。工数見積もり・名前の競合検出・任意の AI 戦略提案を含む。 |
 | 2. Schema Conversion | オブジェクト一覧を表示し、ソースと変換後の DDL を並べて比較。ターゲットへの適用（SKIP / REPLACE）を選択。冪等なリトライに対応。 |
 | 3. Data Migration | 移行タイプ（**Full Load** のみ、または **CDC** 追加）を選択。前提条件チェックとテーブル選択の後にスナップショットを実行（ウォーターマーク → エクスポート → ロード、テーブルごとの進捗 + エラーログ）。CDC タイプではストリーミングインフラもここでデプロイされ、約 15〜20 分の作成が Full Load と**並行して**進む。 |
 | 4. Validation | ウォーターマーク時点でソースとターゲットを比較。行数/チェックサムの結果とドリフトを報告し、レポートをエクスポート。 |
 | 5. Cut over | Validation 通過後にアプリの接続先を MySQL → DSQL に切り替える運用ランブック。ツールが代行しない唯一のステップ。MySQL ソースはロールバック用に保持。 |
 
-各ステップは状態（未開始 / 進行中 / 完了 / 失敗）を表示し、個別に実行・再実行できます。
-機能の詳細は [ユーザーマニュアル](docs/manual/ja/README.md) を参照してください。
+各ステップは状態（未開始 / 進行中 / 完了 / 失敗）を表示し、あるステップを完了すると次が
+アンロックされ、完了済みのステップは再実行できます。オプションの AI アシスタントを全ステップで
+オンデマンドに利用できます。機能の詳細は [ユーザーマニュアル](docs/manual/ja/README.md) を
+参照してください。
 
 ---
 
+<br>
+
 ## クイックスタート
 
-同じツール・同じ UI で、変わるのは**実行場所**だけです。評価や小規模移行には
-**ローカル**、本番の移行には **ECS Fargate** を推奨します。
+同じツール・同じ UI で、変わるのは**実行場所**だけです。評価・小規模な移行には**ローカル**、
+本番の移行には **ECS Fargate**、コンテナ/ECR や AWS Lambda を使えないアカウントは**単一 EC2
+ホスト**（ソースから実行）を使います。
 
-| | **ローカル** | **ECS Fargate** |
-|---|---|---|
-| 適した用途 | 評価、小規模な移行 | 本番・大規模な移行 |
-| セットアップ | `uv sync` + 実行（数秒） | CloudFormation app-stack をデプロイ |
-| 移行エンジンの実行場所 | 自分のマシン | VPC 内の単一タスク Fargate サービス |
-| ソース・DSQL への到達 | マシンから（プライベートなソースは VPN / SSM） | AWS 内でプライベートに（ソース → Fargate → DSQL） |
-| データ経路 | マシン経由 | AWS 内で完結。ブラウザは UI 表示のみ |
-| プライベートなソース | トンネリングが必要 | ネイティブ対応（VPC 内） |
-| コンピュート・コスト | 自分の PC、無料 | Fargate タスク（ティアダウンまで課金） |
+| | **ローカル** | **ECS Fargate** | **EC2（ソースから）** |
+|---|---|---|---|
+| 適した用途 | 評価、小規模な移行 | 本番・大規模な移行 | コンテナ/ECR・Lambda 不可 |
+| セットアップ | `uv sync` + 実行（数秒） | CloudFormation app-stack をデプロイ | CloudFormation EC2 スタックをデプロイ（`git` + `uv`、イメージなし） |
+| 移行エンジンの実行場所 | ご自身のマシン | VPC 内の単一タスク Fargate サービス | VPC 内の単一 EC2 ホスト |
+| ソース・DSQL への到達 | ご自身のマシンから（プライベートなソースは VPN / SSM） | AWS 内でプライベートに（ソース → Fargate → DSQL） | AWS 内でプライベートに（ソース → EC2 → DSQL） |
+| UI への接続 | ブラウザ → `127.0.0.1:8080` | ALB URL（既定は `internal`） | SSM ポートフォワード（ALB・パブリック IP なし） |
+| データ経路 | ご自身のマシンを経由 | AWS 内にとどまる;ブラウザは UI を表示するだけ | AWS 内にとどまる;ブラウザは UI を表示するだけ |
+| プライベートなソース | トンネリングが必要 | ネイティブ対応（VPC 内） | ネイティブ対応（VPC 内） |
+| コンピュート・コスト | ご自身の PC、無料 | Fargate タスク（ティアダウンまで課金） | EC2 インスタンス + EBS（ティアダウンまで課金） |
 
 ### ローカル（最速）
 
-自分のマシンが移行エンジンになるため、ソース MySQL と DSQL の**両方**に到達できる
+ご自身のマシンが移行エンジンになるため、ソース MySQL と DSQL の**両方**に到達できる
 必要があります（プライベートなソースには VPN / SSM フォワード）。AWS 認証情報は
 シェルで利用可能であれば十分です（`aws sso login`、`AWS_PROFILE=…`）。
 
@@ -118,29 +138,45 @@ uv run mysql-dsql-migrator ui
 
 ### ECS Fargate（本番の移行）
 
-CloudFormation で app-stack をデプロイすると（イメージのビルド不要 — ECR Public
+CloudFormation で app-stack をデプロイすると（イメージのビルド不要 — 公開 ECR Public
 イメージを使用）、ツールが **VPC 内**の単一タスク Fargate サービスとして起動し、
-出力される ALB URL で UI にアクセスできます。**すべての移行トラフィックは AWS 内で
+出力される ALB URL で UI にアクセスできます。ここでは **移行トラフィックがすべて AWS 内で
 完結**し（ソース → Fargate → DSQL）、ブラウザは UI を表示するだけなので、
 大規模な移行やプライベートなソースに適しています。
 
-**詳細な手順: [`deploy/DEPLOYMENT.ja.md`](deploy/DEPLOYMENT.ja.md)**（クイックデプロイ、
-パラメータ、Dev/Test vs Prod、DNS と Cognito、ティアダウン、トラブルシューティング）。
+**詳細な手順: [`deploy/DEPLOYMENT.ja.md`](deploy/DEPLOYMENT.ja.md)**（AWS Console・CLI、
+パラメータ、カスタムドメイン・Cognito、ティアダウン、トラブルシューティング）。
 
 <p align="center">
   <b>Console (UI)</b><br>
   <img src="docs/demo-ui.png" alt="ツールの UI — ガイド付き 5 ステップの移行ワークフロー" width="720">
 </p>
 
+### EC2 ホスト（ソースから — コンテナ・Lambda なし）
+
+**コンテナ/ECR や AWS Lambda を使えないアカウント**向けです。同じエンジンが VPC 内の**単一 EC2
+ホストでソースのまま**（`git clone` + `uv sync` + **systemd** サービス）動作します。**Fargate の
+フロントドアサービスを一切立ち上げません — ECS、ALB、ACM 証明書、Cognito なし**（イメージビルドも
+なし）: UI には **SSM ポートフォワード**で接続し、状態は**保持型 EBS ボリューム**にあります（S3
+不要）。CDC は Kafka を**インプロセスで**シードするため、**オフセットシーダー Lambda も不要**です。
+VPC 内のプライベートなデータ経路（ソース → EC2 → DSQL）は Fargate と同じで、構成要素はずっと
+少なくなります。
+
+**詳細な手順: [`deploy/DEPLOYMENT.ja.md` → 単一 EC2 ホストで実行](deploy/DEPLOYMENT.ja.md#単一-ec2-ホストで実行-ソースからlambda-free)。**
+
 ---
 
-## アーキテクチャ
+<br>
+
+## 全体アーキテクチャ
 
 本ツールは、顧客環境内で実行する **Python アプリ**（NiceGUI UI + インポート可能な
 エンジン）です。評価 → 変換 → 一貫性スナップショットの一括ロード → 検証を行います。
 デプロイ時は **HTTPS ALB**（既定は `internal`、オプションで Cognito 認証）の背後にある
 **単一タスクの Amazon ECS Fargate サービス**として動作し、**Amazon ECR** から
-イメージを取得します。
+イメージを取得します。コンテナや Lambda を使えないアカウントでは、代わりに**単一 EC2
+ホストでソースから**（systemd + SSM ポートフォワード、ALB/ECR なし）実行できます —
+[クイックスタート](#クイックスタート)を参照。
 
 [![完全な AWS アーキテクチャトポロジー](deploy/architecture-aws.png)](deploy/architecture-aws.png)
 
@@ -150,9 +186,9 @@ CloudFormation で app-stack をデプロイすると（イメージのビルド
   提示・CDC 準備状況の評価・DLQ トリアージを行いますが、Full Load / CDC の行データには
   一切アクセスしません。スキーマ/DDL/プランのメタデータのみを使用します。既定はオフ、
   サードパーティ API キー不要（スコープ限定の `bedrock:InvokeModel`）。
-- **CDC は別経路**（`cdc-stack`）— Amazon MSK + Debezium → マネージド
+- **CDC は別スタック**（`cdc-stack`）— Amazon MSK + Debezium → マネージド
   MSK Connect 上の**カスタム Aurora DSQL シンクコネクタ**
-  （[`connectors/dsql-sink/`](connectors/dsql-sink)）。既製の JDBC シンクでは DSQL の
+  ([`connectors/dsql-sink/`](connectors/dsql-sink))。既製の JDBC シンクでは DSQL の
   短命な IAM トークン、ステートメントレベルの OCC リトライ、≤3,000 行バッチに対応
   できないため独自に構築しました。ツールはコントロールプレーンに留まり、シンクの
   コンピューティングは持ちません。
@@ -173,8 +209,7 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 | Amazon ECS (Fargate) | 単一タスクのコントロールプレーンアプリ（NiceGUI + エンジン）を実行。 |
 | Amazon ECR | アプリのコンテナイメージを保管（既定では ECR Public イメージ）。 |
 | Elastic Load Balancing (ALB) | アプリへ転送する HTTPS のエントリポイント（既定は `internal`）。 |
-| Amazon Route 53 | アプリドメインの DNS（パブリックドメイン使用時のみ。オペレーター提供）。 |
-| AWS WAF | ALB 前段の Web 保護（パブリック公開時に推奨）。 |
+| Amazon Route 53 | カスタムドメイン時のみ — ALB への alias レコードを自分で作成（スタックは作成しない）。 |
 | Amazon Cognito | ALB での OIDC 認証ゲート（パブリックインターネット公開時に必須）。 |
 | AWS Certificate Manager | ALB HTTPS リスナー用の TLS 証明書。 |
 | Amazon VPC | プライベートサブネット、セキュリティグループ、NAT / VPC エンドポイント。 |
@@ -186,10 +221,17 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 | Amazon Bedrock | 任意の AI アシスト（コントロールプレーンのみ）。 |
 | AWS CloudFormation | 両スタックの Infrastructure-as-Code。 |
 
-通常のデプロイは ECR Public イメージをそのまま使うため、ビルドは不要です。**AWS CodeBuild**
-はランタイムコンポーネントではなく、ローカルに Docker がない制限されたネットワークで
-自前イメージをビルドする場合にのみ使用するオプションのビルドツール
-（`deploy/codebuild.yaml`）です。
+> [!NOTE]
+> 通常のデプロイは ECR Public イメージをそのまま使うため、ビルドは不要です。**AWS CodeBuild**
+> はランタイムコンポーネントではなく、ローカルに Docker がない制限されたネットワークで自前
+> イメージをビルドする場合にのみ一度だけ使うオプションのビルドツール（`deploy/codebuild.yaml`）です。
+
+> [!IMPORTANT]
+> **EC2（ソースから）デプロイ**は ECS / ECR / ALB / Cognito の代わりに **Amazon EC2 + 保持型 EBS
+> ボリューム + AWS Systems Manager**（Session Manager）を使い、**アプリの状態を S3 ではなくその EBS
+> ボリュームに**保持します。このモードでは CDC が Kafka をインプロセスでシードするため、下記の
+> **AWS Lambda** オフセットシーダーは作成されません。（CDC はコネクタアーティファクトのために上記の
+> S3 プラグインバケットを引き続き自動プロビジョニングします。）[クイックスタート](#クイックスタート)を参照。
 
 **任意の CDC データプレーン（cdc-stack）**
 
@@ -198,24 +240,29 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 | Amazon MSK (Serverless) | Kafka のバックボーン。PK でパーティション分割されたテーブルごとのトピックと、DLQ トピック。 |
 | Amazon MSK Connect | Debezium ソースとカスタム DSQL シンクコネクタをホストするマネージド Kafka Connect（JSON コンバータ、`schemas.enable=true` — スキーマレジストリ不要）。 |
 | AWS Lambda | VPC 内のオフセットシーダー（CFN カスタムリソース）— ギャップのない引き継ぎのため Debezium の GTID ウォーターマークを自動投入。 |
-| Amazon VPC (専用) | CDC は独自の VPC で動作し、ソース MySQL にプライベートに到達。 |
+| Amazon VPC | CDC は指定した VPC（通常はソースの VPC）で動作し、MySQL にプライベートに到達 — 必要に応じてスタックがその中に専用サブネット + NAT を作成。 |
 
 </details>
 
 ---
 
+<br>
+
 ## 前提条件
 
 - スキーマとデータの読み取り権限を持つユーザーが設定されたソース **RDS / Aurora MySQL**。
 - ソースと**同一リージョン**のターゲット **Aurora DSQL** クラスター（IAM トークン認証、パスワードなし）。
-- 標準チェーン（環境変数 / `~/.aws` / プロファイル）で利用可能な、`dsql:DbConnect` 権限を持つ
-  **AWS 認証情報**。オプションで `secretsmanager:GetSecretValue`、`bedrock:InvokeModel`。
-- **ローカル実行時のみ:** Python 3.10 以降（3.12 推奨）、[`uv`](https://docs.astral.sh/uv/)。
+- 標準チェーン（環境変数 / `~/.aws` / プロファイル）で利用可能な、`dsql:DbConnect`（`admin`
+  ユーザーは `dsql:DbConnectAdmin`）権限を持つ **AWS 認証情報**。オプションで
+  `secretsmanager:GetSecretValue`、`bedrock:InvokeModel`。
+- **ローカル実行時のみ:** Python 3.10 以降（3.12 固定）、[`uv`](https://docs.astral.sh/uv/)。
 
 > ソース DB・CDC のセットアップ（binlog など）を含む完全なチェックリストは
 > [ユーザーマニュアル §1.1](docs/manual/ja/01-setup.md) を参照。
 
 ---
+
+<br>
 
 ## プロジェクト構成
 
@@ -230,13 +277,15 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 
 ---
 
+<br>
+
 ## ドキュメント
 
 | ドキュメント | 内容 |
 |---|---|
-| [**デプロイガイド**](deploy/DEPLOYMENT.ja.md) | ローカルはコマンド 1 つ、ECS Fargate はコンソールまたは CLI でデプロイ — 前提条件、パラメータ、カスタムドメイン / Cognito / AI アシスト、ティアダウン、トラブルシューティング。 |
+| [**デプロイガイド**](deploy/DEPLOYMENT.ja.md) | ローカルはコマンド 1 つ、ECS Fargate へデプロイ（AWS コンソールまたは CLI）、または単一 EC2 ホストでソースから実行（コンテナ/Lambda なし）— 前提条件、パラメータ、カスタムドメイン / Cognito / AI アシスト、ティアダウン、トラブルシューティング。 |
 | [**ユーザーマニュアル**](docs/manual/) | 5 ステップの移行手順を詳細に解説。**性能チューニングと実測結果**、テスト/検証、**お客様向け FAQ** を含む。 |
-| [**アーキテクチャ**](#アーキテクチャ) | 構成要素と動作 + AWS・CDC パイプライン図（`deploy/architecture-*.png`）。 |
+| [**全体アーキテクチャ**](#全体アーキテクチャ) | 構成要素と動作 + AWS・CDC パイプライン図（`deploy/architecture-*.png`）。 |
 | [**変更履歴**](CHANGELOG.ja.md) | リリースごとの変更点（セマンティックバージョニング）。 |
 
 多言語: [English README](README.md) · [한국어 README](README.ko.md) — デプロイガイド・
@@ -244,12 +293,16 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 
 ---
 
+<br>
+
 ## デプロイ
 
 本ツールは顧客の IAM コンテキストで顧客のプライベートな RDS/Aurora と DSQL に接続するため、
 **顧客環境内（シングルテナント）** で動作します。本番では `deploy/cloudformation.yaml` から
 デプロイする単一タスクの **ECS Fargate** サービス（イメージのビルド不要）として稼働します。
-オプションのストリーミング CDC は別途 **cdc-stack** としてデプロイします。
+コンテナ/ECR や AWS Lambda を使えないアカウントでは、代わりに**単一 EC2 ホストでソースから**
+（`deploy/cloudformation-ec2.yaml`）実行できます。オプションのストリーミング CDC は別途
+**cdc-stack** としてデプロイします。
 
 **▶ 詳細な手順: [`deploy/DEPLOYMENT.ja.md`](deploy/DEPLOYMENT.ja.md)**
 
@@ -262,6 +315,8 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 
 ---
 
+<br>
+
 ## 設定（上級者向け — 通常は変更不要）
 
 すべての操作は UI で行え、妥当な既定値が設定済みです — **ほとんどの利用者は変更不要です。**
@@ -272,8 +327,8 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 
 環境変数で設定します（config ファイルなし、認証情報は永続化されない）。Fargate では ECS
 タスク定義で指定します。Full Load / Validation の並列度パラメータ 4 つは、サイドバーの
-**Performance tuning** から**実行時に**調整することも可能です（再デプロイ不要、再起動で
-リセット）。
+**Settings**（Full Load・Validation タブ）から**実行時に**調整することも可能です（再デプロイ
+不要、再起動でリセット）。
 
 | 変数 | 既定値 | 説明 |
 | --- | --- | --- |
@@ -295,7 +350,7 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4`（≤32） | Validation で並行して比較するテーブル数。`1` = 逐次。 |
 | `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | 起動時のログレベル。`DEBUG` は失敗イベントに stacktrace（コールスタックのみ）を追加。実行時に **Diagnostics** からも変更可。 |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | アクティビティログイベントを標準出力にもミラーリング（ECS では → CloudWatch）。実行時に **Diagnostics** から切り替え可。 |
-| `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | AI アシスト用の Bedrock モデル / 推論プロファイル ID。`global.*` プロファイルは全ての商用リージョンから呼び出せます（`us.*` は米国専用）。 |
+| `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-5` | AI アシスト用の Bedrock モデル / 推論プロファイル ID。常に `global.*` プロファイル — 全ての商用リージョンから呼び出せます（`us.*` は us-east-1/us-east-2/us-west-2 でのみ解決）。 |
 | `BEDROCK_REGION` | _(未設定)_ | Amazon Bedrock 呼び出し用のリージョン。 |
 
 AI アシストは既定でオフです。UI からオンにできます。UI には Bedrock への到達性を確認し、
@@ -313,12 +368,16 @@ AI アシストは既定でオフです。UI からオンにできます。UI �
 
 ---
 
+<br>
+
 ## バージョン / 変更履歴
 
 現在のバージョン: [`pyproject.toml`](pyproject.toml)。リリースごとの変更点:
 [**CHANGELOG.ja.md**](CHANGELOG.ja.md)。
 
 ---
+
+<br>
 
 ## ライセンス
 

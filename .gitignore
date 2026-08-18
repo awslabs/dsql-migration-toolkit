@@ -90,6 +90,10 @@ deploy/cdc-stack/*params*.json
 # Internal design/spec artifacts (Kiro) — not published
 .kiro/
 
+# Developer-only runbooks (hands-on QA procedures the author runs, not customer
+# deployment docs) — kept locally, not published.
+docs/dev/
+
 # Agent guidance for Claude Code (local dev aid, not a published doc)
 CLAUDE.md
 

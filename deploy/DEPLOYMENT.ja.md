@@ -26,6 +26,8 @@ _言語: [English](DEPLOYMENT.md) | [한국어](DEPLOYMENT.ko.md) | **日本語*
 
 ---
 
+<br>
+
 ## ローカルで実行
 
 **ECS Fargate のデプロイを決める前に、まずローカルで試してください** — **コマンド 1 つで
@@ -40,9 +42,14 @@ NiceGUI ready to go on http://127.0.0.1:8080
 ありません。** 最初の確認・評価・小規模な移行に最適で、Fargate に進むか決める前に試すのに
 向いています。
 
+<details>
+<summary><b>スクリーンショット</b> — ツールの UI（ガイド付き 5 ステップのワークフロー）</summary>
+
 <div align="center">
-  <img src="../docs/demo-ui.png" alt="ツールの UI — ガイド付き 5 ステップの移行ワークフロー" width="560">
+  <a href="../docs/demo-ui.png"><img src="../docs/demo-ui.png" alt="ツールの UI — ガイド付き 5 ステップの移行ワークフロー" width="900"></a>
 </div>
+
+</details>
 
 UI はご自身のマシンで動作し（ブラウザ → `127.0.0.1:8080`）、**移行そのものもそこで実行
 されます**。ご自身のワークステーションがソースを読み取り DSQL に書き込むエンジンとなるため、
@@ -73,6 +80,8 @@ DSQL リージョンへのアウトバウンド HTTPS + AWS 認証情報が必�
 
 ---
 
+<br>
+
 ## ECS Fargate にデプロイ
 
 > [!TIP]
@@ -92,6 +101,15 @@ CloudFormation が取得します。同じ `deploy/cloudformation.yaml` を次�
 VPC 内から — VPN、Direct Connect、または SSM ポートフォワードで — アクセスします。設計上、
 公開エンドポイントはありません — Well-Architected SEC05-BP02。公開するには、
 [app-stack のデプロイ](#2-app-stack-のデプロイ) のオーバーライドの注記を参照してください。
+
+<details>
+<summary><b>アーキテクチャ図</b> — 全体トポロジ（app-stack + オプションの CDC on MSK Connect）</summary>
+
+<div align="center">
+  <a href="architecture-aws.png"><img src="architecture-aws.png" alt="AWS アーキテクチャ全体 — オペレーターが HTTPS ALB（オプションで Cognito）経由で ECS Fargate コントロールプレーンアプリに接続し、アプリが Aurora DSQL への Full Load を行い、オプションの CDC パイプラインでは cdc-stack をデプロイして Debezium ソース + カスタム DSQL シンクコネクタが MSK Connect で（S3 からプラグインをロード）実行され、Amazon MSK を経由して Aurora DSQL へストリーミングし、gapless ハンドオフのための VPC 内 offset-seeder Lambda を備える" width="900"></a>
+</div>
+
+</details>
 
 <hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
@@ -756,22 +774,29 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 
 ---
 
+<br>
+
 ## 単一 EC2 ホストで実行 (ソースから、Lambda-free)
 
 **コンテナ/ECR や AWS Lambda を使えないアカウント**向けです。同じコントロールプレーンアプリが、
-VPC 内の **EC2 ホスト 1 台でソースのまま**動作します — ホストが `git` +
-[`uv`](https://docs.astral.sh/uv/) をインストールし、このリポジトリを取得して仮想環境
-（CPython 3.12）を `uv sync` し、UI を **systemd サービス**（`dsql-migrator.service`）として
-実行します。**イメージビルドも ECR も ALB もなし**で、UI には **SSM ポートフォワード**で接続します
-（ホストにはインバウンドルールもパブリック IP もありません）。状態（Full Load ジョブ / セッションの
-SQLite + アクティビティログ）は**保持型 EBS ボリューム**にあるため、**S3 バケットは不要です。**
-CDC では Kafka を**インプロセスで**シードするため、Fargate と異なり**オフセットシーダー Lambda を
-作成しません**（`SeedMode=External`）。
+VPC 内の **EC2 ホスト 1 台でソースのまま**、**systemd サービス**として動作します — イメージビルドも
+ECR も ALB もありません。UI には **SSM ポートフォワード**で接続します（ホストにはパブリック IP も
+インバウンドルールもありません）。状態（Full Load ジョブ / セッション）は**保持型 EBS ボリューム**
+にあり、再起動後も保持され、**S3 バケットは不要です。** CDC では Kafka を**インプロセスで**シード
+するため、Fargate と異なり**オフセットシーダー Lambda を作成しません**（`SeedMode=External`）。
 
-テンプレート: **`deploy/cloudformation-ec2.yaml`**。本セクションはクイックパスです。完全なハンズオン
-手順（デフォルト経路が変わらないことを証明する change-set ドライラン、異常系 / 復元力チェック、
-一時的な「ローカルコピーを実行」する S3 フロー）は
-**[`deploy/TEST_EC2_MSK_ONLY.md`](TEST_EC2_MSK_ONLY.md)** にあります。
+テンプレート: **`deploy/cloudformation-ec2.yaml`**。
+
+<details>
+<summary><b>アーキテクチャ図</b> — 単一 EC2 ホスト、インプロセス CDC シード（SeedMode=External）</summary>
+
+<div align="center">
+  <a href="architecture-aws-ec2.png"><img src="architecture-aws-ec2.png" alt="単一 EC2 ホストのアーキテクチャ — 移行ツールが VPC 内の EC2 ホスト 1 台でソースのまま動作し、SSM ポートフォワードで接続（ALB なし）、Aurora DSQL への Full Load とインプロセスの CDC シードを MSK に対して行い、Debezium ソース + カスタム DSQL シンクコネクタが MSK Connect で S3 からプラグインをロード" width="820"></a>
+</div>
+
+</details>
+
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
 ### いつ使うか
 
@@ -787,19 +812,30 @@ CDC では Kafka を**インプロセスで**シードするため、Fargate と
 > インスタンスの再起動 / 置き換え後も保持型 EBS ボリュームで残りますが、コントロールプレーン自体は
 > 1 台です — 能動的に進める移行には適していますが、長期常設の HA サービス用ではありません。
 
-### 前提条件
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
-- **ソース MySQL および（CDC の場合）MSK と同じ場所にある、VPC 内の NAT-egress プライベート
-  サブネット。** ホストにはパブリック IP がなく、その egress 経由で AWS API / ソース / MSK に到達します。
-- UI をポートフォワードするための AWS CLI **Session Manager プラグイン** —
+### 1. 前提条件
+
+- **インターネット egress ができるプライベートサブネット（NAT ゲートウェイ）。** ホストには
+  **パブリック IP がなく**、**初回起動時に `uv`・CPython・Python ホイールの取得とリポジトリの
+  クローンをすべて公開インターネット**（astral.sh · PyPI · GitHub）から行い、その後もソース
+  DB・DSQL・AWS API へは同じ egress で到達します。VPC エンドポイントだけでは不十分です
+  （これらの公開ソースは PrivateLink では取得できません）。**ソース MySQL と同じ VPC**
+  （CDC を使う場合は MSK とも同じ VPC）に配置してください。
+- **AWS CLI と Session Manager プラグイン**（ご自身のマシンに）— UI を開く手段です（ALB や
+  公開エンドポイントはなく、SSM でポートフォワードします）。
   [インストール手順](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)。
-- インプロセス CDC シードのためにホストを MSK 9098 に入れるのに必要な**ホストサブネットの CIDR**
-  （下記「ホストを MSK 9098 に許可」を参照）。
-- ホストが取得するアプリソース: **デフォルトの `SourceMode=git`** は公開リポジトリを HTTPS で
-  クローンします（認証不要）。リポジトリが公開される前は、チェックアウトの tarball で
-  **`SourceMode=s3`** を使用してください（[`TEST_EC2_MSK_ONLY.md`](TEST_EC2_MSK_ONLY.md) §2 参照）。
+- **CDC を使う場合のみ — ホストサブネットの CIDR。** これを cdc-stack に渡すと、MSK が
+  インプロセスシードのためにホストをポート 9098 で許可します（下記
+  [ホストを MSK 9098 に許可](#5-ホストを-msk-9098-に許可-cdc-のみ) を参照）。
+- **ホストがアプリソースを取得する方法。** デフォルト（`SourceMode=git`）は公開リポジトリを
+  HTTPS でクローンします — 認証情報は不要。ホストのネットワークがリポジトリに到達できない
+  場合は、チェックアウトの tarball を S3 にアップロードして `SourceMode=s3`（`SourceS3Uri`）を
+  使用してください。
 
-### 必須 / 主要パラメータ
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 2. 必須 / 主要パラメータ
 
 | パラメータ | 必須 | デフォルト | 内容 |
 | --- | --- | --- | --- |
@@ -820,17 +856,33 @@ CDC では Kafka を**インプロセスで**シードするため、Fargate と
 > スタック名は **`mysql-dsql-cdc-` で始めてはいけません**（その接頭辞は CDC デプロイロールのスコープに
 > 入ります）。`mysql-dsql-migrator-ec2` が適切です。
 
-### デプロイ
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 3. デプロイ
+
+これは CloudFormation スタック（`deploy/cloudformation-ec2.yaml`）で、Fargate と同様に 2 通りで
+デプロイできます:
+
+- **AWS Console — 推奨。** テンプレートをアップロードしてガイド付きフォームを入力します
+  （`VpcId` / `HostSubnetId` はネイティブピッカー。Console がテンプレートをステージングするため、
+  S3 バケットは不要）。手順は [Fargate の Console ウォークスルー](#推奨--aws-console-ガイド付きフォーム)
+  と同じです — このテンプレートを選び、上記の EC2 パラメータを入力し、スタック名を
+  `mysql-dsql-migrator-ec2` にするだけです。
+- **AWS CLI** — `aws cloudformation deploy` 1 回:
 
 ```bash
+# --- ご自身の環境 (ここを編集) -----------------------------------------------
 export AWS_REGION=us-east-1
 export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export VPC_ID=vpc-xxxxxxxx
-export HOST_SUBNET_ID=subnet-xxxxxxxx        # NAT-egress プライベートサブネット、MSK と同じ場所
-export DSQL_CLUSTER_ARN=arn:aws:dsql:$AWS_REGION:$ACCOUNT:cluster/xxxx
-export SOURCE_DB_SG=sg-source
+export VPC_ID=vpc-0a1b2c3d4e5f6a7b8
+# HostSubnetId: VPC_ID 内の NAT-egress プライベートサブネット、MSK と同じ場所
+export HOST_SUBNET_ID=subnet-0123456789abcdef0
+export DSQL_CLUSTER_ARN=arn:aws:dsql:us-east-1:123456789012:cluster/f0a1b2c3d4e5f6a7b8c9d0e1f2
+export SOURCE_DB_SG=sg-0a1b2c3d4e5f6a7b8
+# -----------------------------------------------------------------------------
 
-# ホストサブネットの CIDR — ホストを MSK 9098 に許可する際に使用（下記 CDC ステップ）:
+# ホストサブネットの CIDR — ホストの MSK への egress 範囲（下記 MskEgressCidr）と、
+# CDC の場合はホストを 9098 で許可するのに使用（「ホストを MSK 9098 に許可」を参照）:
 export HOST_SUBNET_CIDR=$(aws ec2 describe-subnets --subnet-ids "$HOST_SUBNET_ID" \
   --region "$AWS_REGION" --query 'Subnets[0].CidrBlock' --output text)
 
@@ -852,15 +904,17 @@ aws cloudformation deploy \
     DsqlClusterArn="$DSQL_CLUSTER_ARN" \
     SourceDbSecurityGroupId="$SOURCE_DB_SG" \
     MskEgressCidr="$HOST_SUBNET_CIDR"
-    # デフォルトの SourceMode=git は公開リポジトリをクローンします。公開前は次を追加:
-    #   SourceMode=s3 SourceS3Uri=s3://.../dsql-src.tar.gz   (TEST_EC2_MSK_ONLY.md §2 参照)
+    # デフォルトの SourceMode=git は公開リポジトリをクローンします（認証情報不要）。ホストが
+    # リポジトリに到達できない場合は追加:  SourceMode=s3 SourceS3Uri=s3://$TEMPLATE_BUCKET/dsql-src.tar.gz
 ```
 
 初回起動は約 3〜4 分: ホストが 443 経由で Python 3.12 + wheel をインストールし、
 `uv sync --extra cdc-external`（インプロセスシードに必要な `kafka-python` + MSK IAM 署名機を含む）
 を実行してからサービスを開始します。進捗はホストの `/var/log/dsql-migrator-userdata.log` にあります。
 
-### UI に接続する (SSM ポートフォワード)
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 4. UI に接続する (SSM ポートフォワード)
 
 スタックは `HostInstanceId` とすぐ実行できる `SsmPortForwardCommand` を出力します:
 
@@ -878,16 +932,26 @@ aws ssm start-session --target "$INSTANCE_ID" \
 Command で `systemctl is-active dsql-migrator.service` と `journalctl -u dsql-migrator` を使って
 サービスの状態を確認してください。
 
-### ホストを MSK 9098 に許可 (CDC のみ)
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
-CDC ではホストが Kafka をインプロセスでシードするため、MSK Serverless 9098 に到達する必要があります。
-**ホストサブネットの CIDR** を **cdc-stack `HostSubnetCidr` パラメータ**に渡します（コネクタ SG の
-イングレスが作成されます）— ツールが CDC インフラのデプロイ時に渡すことも、cdc-stack を自分で
-デプロイする際に設定することもできます。詳細な手順: [`TEST_EC2_MSK_ONLY.md`](TEST_EC2_MSK_ONLY.md)
-§4。ホストが MSK に到達できない場合、**Start CDC はコネクタを作成する前に明確に失敗**します
-（`CdcDeployError`）— 静かなギャップは発生しません。
+### 5. ホストを MSK 9098 に許可 (CDC のみ)
 
-### Teardown
+CDC ではホストが Kafka をインプロセスでシードするため、MSK Serverless 9098 に到達する必要があります
+— cdc-stack の `HostSubnetCidr` パラメータがホストを許可します（コネクタ SG のイングレスを追加）。
+**この EC2 ホストでは自動です:** ホストが起動時に自分のサブネット CIDR を導出し、UI で **CDC
+インフラをデプロイ**するとツールがその値を渡します — 設定するものはありません。（cdc-stack をツール
+外で自分でデプロイする場合のみ `HostSubnetCidr` を手動で渡します。）いずれの場合も、ホストが MSK に
+到達できないと **Start CDC はコネクタを作成する前に明確に失敗**します（`CdcDeployError`）— 静かな
+ギャップは発生しません。
+
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 6. Teardown
+
+CDC をデプロイした場合は、**ホストが稼働しているうちに先に**削除してください — **Data Migration**
+ステップで **Delete all CDC infrastructure** を使います。この削除はホスト上のアプリから実行される
+ため、先にホストを削除すると cdc-stack を手動（`aws cloudformation delete-stack`）で削除することに
+なります。その後、EC2 ホストを解体します:
 
 ```bash
 aws cloudformation delete-stack --stack-name mysql-dsql-migrator-ec2 --region "$AWS_REGION"
@@ -896,16 +960,19 @@ aws cloudformation wait stack-delete-complete --stack-name mysql-dsql-migrator-e
 
 > [!WARNING]
 > 状態 EBS ボリュームは設計上 **`DeletionPolicy: Retain`** のため、**スタック削除後も残ります** —
-> 保持したくない場合は手動で削除してください（`aws:cloudformation:stack-name` タグで検索）。CDC を
-> デプロイした場合は、先に cdc-stack を削除してください（UI の **Start over → Delete all CDC
-> infrastructure**、または `aws cloudformation delete-stack`）。
+> 保持したくない場合は手動で削除してください（`aws:cloudformation:stack-name` タグで検索）。
 
 ---
 
-## 付録 — 自前のイメージをビルドする (制限されたネットワークのみ)
+<br>
+
+## 付録 — 自前のイメージをビルドする (ECS Fargate 専用; 制限されたネットワークのみ)
 
 > [!NOTE]
-> **ほとんどのデプロイはこのセクションをスキップします。** イメージは ECR Public に
+> **これは ECS Fargate デプロイにのみ該当します** — 単一 EC2 ホストモードはソースから実行され、
+> コンテナイメージを使用しないため、このセクションは一切不要です。
+>
+> **さらに Fargate デプロイでもほとんどはスキップします。** イメージは ECR Public に
 > 公開されており、CloudFormation がデフォルトでそれを取得するため、何もビルドしません。
 > ネットワークが ECR Public に到達できない場合にのみ、自前のイメージをビルドしてください
 > （その結果を `ContainerImageUri` として渡します）。以下の Option A または B を選んで

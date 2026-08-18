@@ -28,6 +28,8 @@ Pick one — each mode has its own section below.
 
 ---
 
+<br>
+
 ## Run locally
 
 **Before you commit to an ECS Fargate deployment, try it locally first** — **one
@@ -42,9 +44,14 @@ Open that URL in your browser and you're in — **no infrastructure, no build, n
 resources to create.** Great for a first look, evaluation, and smaller migrations
 before deciding on Fargate.
 
+<details>
+<summary><b>Screenshot</b> — the tool's UI (the guided five-step workflow)</summary>
+
 <div align="center">
-  <img src="../docs/demo-ui.png" alt="The tool's UI — the guided five-step migration workflow" width="560">
+  <a href="../docs/demo-ui.png"><img src="../docs/demo-ui.png" alt="The tool's UI — the guided five-step migration workflow" width="900"></a>
 </div>
+
+</details>
 
 The UI runs on your own machine (browser → `127.0.0.1:8080`), and **the migration
 itself runs there too**: your workstation is the engine that reads the source and
@@ -75,6 +82,8 @@ for a real migration use **[ECS Fargate](#deploy-on-ecs-fargate)**.
 
 ---
 
+<br>
+
 ## Deploy on ECS Fargate
 
 > [!TIP]
@@ -94,6 +103,15 @@ first in [Prerequisites](#1-prerequisites).
 `https://<LoadBalancerDns>/` from inside the VPC — over VPN, Direct Connect, or an SSM
 port-forward. There is no public endpoint by design — Well-Architected SEC05-BP02. To
 expose it publicly, see the override note under [Deploy the app-stack](#2-deploy-the-app-stack).
+
+<details>
+<summary><b>Architecture diagram</b> — full topology (app-stack + optional CDC on MSK Connect)</summary>
+
+<div align="center">
+  <a href="architecture-aws.png"><img src="architecture-aws.png" alt="Full AWS architecture — the operator reaches the ECS Fargate control-plane app through an HTTPS ALB (optional Cognito); the app drives Full Load to Aurora DSQL and, for the optional CDC pipeline, deploys the cdc-stack whose Debezium source + custom DSQL sink connectors run on MSK Connect (plugins from S3), streaming through Amazon MSK to Aurora DSQL, with an in-VPC offset-seeder Lambda for a gapless handoff" width="900"></a>
+</div>
+
+</details>
 
 <hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
@@ -763,22 +781,30 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 
 ---
 
+<br>
+
 ## Run on a single EC2 host (from source, Lambda-free)
 
 For accounts that **cannot use containers/ECR or AWS Lambda**. The same control-plane
-app runs on **one in-VPC EC2 host straight from source** — the host installs `git` +
-[`uv`](https://docs.astral.sh/uv/), fetches this repo, `uv sync`s a virtualenv
-(CPython 3.12), and runs the UI as a **systemd service** (`dsql-migrator.service`).
-**No image build, no ECR, no ALB** — you reach the UI over an **SSM port-forward** (the
-host has no inbound rule and no public IP). State (the Full Load job / session SQLite +
-activity log) lives on a **retained EBS volume**, so **no S3 bucket is required**. For
-CDC it seeds Kafka **in-process**, so — unlike Fargate — it creates **no offset-seeder
-Lambda** (`SeedMode=External`).
+app runs on **one in-VPC EC2 host, from source**, as a **`systemd` service** — no image
+build, no ECR, no ALB. You reach the UI over an **SSM port-forward** (the host has no
+public IP and no inbound rule). State (the Full Load job / session) lives on a
+**retained EBS volume** — it survives a reboot and needs **no S3 bucket**. For CDC it
+seeds Kafka **in-process**, so — unlike Fargate — it creates **no offset-seeder Lambda**
+(`SeedMode=External`).
 
-Template: **`deploy/cloudformation-ec2.yaml`**. This section is the quick path; the full
-hands-on walkthrough (change-set dry-run proving the default path is untouched,
-negative / resilience checks, and the temporary "run my local copy" S3 flow) is
-**[`deploy/TEST_EC2_MSK_ONLY.md`](TEST_EC2_MSK_ONLY.md)**.
+Template: **`deploy/cloudformation-ec2.yaml`**.
+
+<details>
+<summary><b>Architecture diagram</b> — single EC2 host, in-process CDC seed (SeedMode=External)</summary>
+
+<div align="center">
+  <a href="architecture-aws-ec2.png"><img src="architecture-aws-ec2.png" alt="Single EC2 host architecture — the migration tool runs from source on one in-VPC EC2 host reached over an SSM port-forward (no ALB), drives Full Load to Aurora DSQL and seeds CDC in-process to MSK, with the Debezium source + custom DSQL sink connectors on MSK Connect loading plugins from S3" width="820"></a>
+</div>
+
+</details>
+
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
 ### When to use it
 
@@ -795,20 +821,29 @@ negative / resilience checks, and the temporary "run my local copy" S3 flow) is
 > volume, but the control plane itself is one box — fine for a migration you actively
 > run, not a long-lived HA service.
 
-### Prerequisites
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
-- A **NAT-egress private subnet of your VPC, co-located with the source MySQL and (for
-  CDC) the MSK**. The host has no public IP and reaches AWS APIs / the source / MSK over
-  that egress.
-- The **Session Manager plugin** for the AWS CLI (to port-forward the UI) —
-  [install guide](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html).
-- The **host subnet's CIDR**, to admit the host to MSK on 9098 for the in-process CDC
-  seed (see "Admit the host to MSK" below).
-- The app source reachable by the host: the **default `SourceMode=git`** clones the
-  public repo over HTTPS (no auth); before the repo is public, use **`SourceMode=s3`**
-  with a tarball of your checkout (see [`TEST_EC2_MSK_ONLY.md`](TEST_EC2_MSK_ONLY.md) §2).
+### 1. Prerequisites
 
-### Required / key parameters
+- **A private subnet with internet egress (a NAT gateway).** The host has **no public
+  IP**, and at **first boot it pulls `uv` / CPython / Python wheels and clones the repo
+  from the public internet** (astral.sh · PyPI · GitHub) — then reaches the source DB,
+  DSQL, and AWS APIs over the same egress. VPC endpoints alone won't work: those public
+  sources aren't reachable over PrivateLink. Put it in **the same VPC as your source
+  MySQL** (and, if you'll run CDC, the same VPC as the MSK).
+- **The AWS CLI with the Session Manager plugin** on your machine — this is how you open
+  the UI (there's no ALB or public endpoint; you port-forward over SSM).
+  [Install guide](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html).
+- **For CDC only — your host subnet's CIDR.** You pass it to the cdc-stack so MSK admits
+  the host on port 9098 for the in-process seed (see
+  [Admit the host to MSK](#5-admit-the-host-to-msk-on-9098-cdc-only) below).
+- **A way for the host to fetch the app source.** By default (`SourceMode=git`) it clones
+  the public repo over HTTPS — no credentials. If the host's network can't reach the
+  repo, upload a tarball of your checkout to S3 and use `SourceMode=s3` (`SourceS3Uri`).
+
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 2. Required / key parameters
 
 | Parameter | Required | Default | What it is |
 | --- | --- | --- | --- |
@@ -829,23 +864,38 @@ negative / resilience checks, and the temporary "run my local copy" S3 flow) is
 > The stack name **must not start with `mysql-dsql-cdc-`** (that prefix falls inside
 > the CDC deploy role's scope). `mysql-dsql-migrator-ec2` is a good choice.
 
-### Deploy
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 3. Deploy
+
+This is a CloudFormation stack (`deploy/cloudformation-ec2.yaml`), deployable two ways —
+the same as Fargate:
+
+- **AWS Console — recommended.** Upload the template and fill the guided form (native
+  pickers for `VpcId` / `HostSubnetId`; the Console stages the template for you, so no
+  S3 bucket is needed). The steps match the
+  [Fargate Console walkthrough](#recommended--aws-console-guided-form) — just pick this
+  template, enter the EC2 parameters above, and name the stack `mysql-dsql-migrator-ec2`.
+- **AWS CLI** — one `aws cloudformation deploy`:
 
 ```bash
+# --- Your environment (edit these) -------------------------------------------
 export AWS_REGION=us-east-1
 export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export VPC_ID=vpc-xxxxxxxx
-export HOST_SUBNET_ID=subnet-xxxxxxxx        # NAT-egress private subnet, co-located with MSK
-export DSQL_CLUSTER_ARN=arn:aws:dsql:$AWS_REGION:$ACCOUNT:cluster/xxxx
-export SOURCE_DB_SG=sg-source
+export VPC_ID=vpc-0a1b2c3d4e5f6a7b8
+# HostSubnetId: a NAT-egress private subnet in VPC_ID, co-located with the MSK
+export HOST_SUBNET_ID=subnet-0123456789abcdef0
+export DSQL_CLUSTER_ARN=arn:aws:dsql:us-east-1:123456789012:cluster/f0a1b2c3d4e5f6a7b8c9d0e1f2
+export SOURCE_DB_SG=sg-0a1b2c3d4e5f6a7b8
+# -----------------------------------------------------------------------------
 
-# The host subnet's CIDR — used to admit the host to MSK 9098 (CDC step below):
+# The host subnet's CIDR — scopes the host's egress to MSK (MskEgressCidr below) and,
+# for CDC, admits the host on 9098 (see "Admit the host to MSK"):
 export HOST_SUBNET_CIDR=$(aws ec2 describe-subnets --subnet-ids "$HOST_SUBNET_ID" \
   --region "$AWS_REGION" --query 'Subnets[0].CidrBlock' --output text)
 
-# This template exceeds CloudFormation's 51,200-byte inline-upload limit, so the
-# CLI needs an S3 bucket to stage it. Create one once, or reuse a bucket you
-# already have in this account/region:
+# This template exceeds CloudFormation's 51,200-byte inline-upload limit, so the CLI
+# needs an S3 bucket to stage it. Create one once, or reuse a bucket you already have:
 export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$AWS_REGION
 aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
 
@@ -861,8 +911,8 @@ aws cloudformation deploy \
     DsqlClusterArn="$DSQL_CLUSTER_ARN" \
     SourceDbSecurityGroupId="$SOURCE_DB_SG" \
     MskEgressCidr="$HOST_SUBNET_CIDR"
-    # Default SourceMode=git clones the public repo. Before it is public, add:
-    #   SourceMode=s3 SourceS3Uri=s3://.../dsql-src.tar.gz   (see TEST_EC2_MSK_ONLY.md §2)
+    # Default SourceMode=git clones the public repo (no credentials). If the host
+    # can't reach it, add:  SourceMode=s3 SourceS3Uri=s3://$TEMPLATE_BUCKET/dsql-src.tar.gz
 ```
 
 First boot takes ~3–4 min: the host installs Python 3.12 + wheels over 443, runs
@@ -870,7 +920,9 @@ First boot takes ~3–4 min: the host installs Python 3.12 + wheels over 443, ru
 the in-process seed), then starts the service. Progress is in
 `/var/log/dsql-migrator-userdata.log` on the host.
 
-### Reach the UI (SSM port-forward)
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 4. Reach the UI (SSM port-forward)
 
 The stack outputs `HostInstanceId` and a ready-to-run `SsmPortForwardCommand`:
 
@@ -888,16 +940,26 @@ Open `http://localhost:8080` → the tool UI loads (the same guided workflow). C
 service health over SSM Run Command with `systemctl is-active dsql-migrator.service` and
 `journalctl -u dsql-migrator`.
 
-### Admit the host to MSK on 9098 (CDC only)
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
-For CDC the host seeds Kafka in-process, so it must reach MSK Serverless on 9098. Pass
-the **host subnet's CIDR** to the **cdc-stack `HostSubnetCidr` parameter** (this creates
-the connector-SG ingress) — the tool can supply it at CDC-infra deploy time, or set it
-when you deploy the cdc-stack yourself. Full steps: [`TEST_EC2_MSK_ONLY.md`](TEST_EC2_MSK_ONLY.md)
-§4. If the host cannot reach MSK, **Start CDC fails loudly before creating any
-connector** (`CdcDeployError`) — never a silent gap.
+### 5. Admit the host to MSK on 9098 (CDC only)
 
-### Teardown
+For CDC the host seeds Kafka in-process, so it must reach MSK Serverless on 9098 — the
+cdc-stack admits it via its `HostSubnetCidr` parameter (which adds the connector-SG
+ingress). **On this EC2 host that's automatic:** the host derives its own subnet CIDR at
+boot and the tool passes it when you **Deploy CDC infrastructure** from the UI — you set
+nothing. (You'd only pass `HostSubnetCidr` by hand if you deploy the cdc-stack yourself,
+outside the tool.) Either way, if the host can't reach MSK, **Start CDC fails loudly
+before creating any connector** (`CdcDeployError`) — never a silent gap.
+
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 6. Teardown
+
+If you deployed CDC, remove it **first, while the host is still running** — on the
+**Data Migration** step, use **Delete all CDC infrastructure**. That teardown runs from
+the app on the host, so deleting the host first leaves you to remove the cdc-stack by
+hand (`aws cloudformation delete-stack`). Then tear down the EC2 host:
 
 ```bash
 aws cloudformation delete-stack --stack-name mysql-dsql-migrator-ec2 --region "$AWS_REGION"
@@ -907,16 +969,19 @@ aws cloudformation wait stack-delete-complete --stack-name mysql-dsql-migrator-e
 > [!WARNING]
 > The state EBS volume has **`DeletionPolicy: Retain`** by design, so it **survives
 > stack deletion** — delete it manually if you don't want to keep it (find it by the
-> `aws:cloudformation:stack-name` tag). If you deployed CDC, remove the cdc-stack first
-> (from the UI's **Start over → Delete all CDC infrastructure**, or
-> `aws cloudformation delete-stack`).
+> `aws:cloudformation:stack-name` tag).
 
 ---
 
-## Appendix — Build your own image (restricted network only)
+<br>
+
+## Appendix — Build your own image (ECS Fargate; restricted network only)
 
 > [!NOTE]
-> **Most deployments skip this section.** The image is published to ECR Public and
+> **This applies to the ECS Fargate deployment only** — the single-EC2-host mode runs
+> from source and uses no container image, so it never needs this.
+>
+> **And most Fargate deployments skip it too.** The image is published to ECR Public and
 > CloudFormation pulls it by default — you build nothing. Build your own image only
 > if your network can't reach ECR Public (then pass the result as
 > `ContainerImageUri`). Pick Option A or B below; both create the ECR repository,

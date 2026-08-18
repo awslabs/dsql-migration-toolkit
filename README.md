@@ -35,35 +35,48 @@ binlog/GTID watermark bridges the two for a gapless handoff.
 
 ---
 
+<br>
+
 ## What it does / doesn't do
 
 **✅ Does**
 
-- **Assessment** — introspects your MySQL schema and classifies every object
-  (`AUTO` / `MANUAL` / `UNSUPPORTED`) with effort estimates and name-conflict checks.
-- **Schema conversion** — converts and applies DDL MySQL → DSQL (type mapping, FK
-  removal, async indexes, PK strategies), review-and-apply from an object tree.
-- **Full Load** — bulk-loads a consistent snapshot by streaming; resumable, large-scale.
-- **CDC** — continuous replication for near-zero-downtime cut-over.
-- **Validation** — proves source ↔ target match by row count, checksum, and PK
-  reconciliation, and reports drift.
-- **AI assist** (optional, off by default) — conversion suggestions for hard items,
-  applied only after your review.
+- **Guided web UI** — drives the whole migration from one browser app, with visible
+  per-step status.
+- **Assessment** — introspects the source MySQL schema and classifies every object
+  (`AUTO` / `MANUAL` / `UNSUPPORTED`), with effort estimates and name-conflict detection.
+- **Schema conversion** — converts MySQL DDL to DSQL (type mapping, foreign-key removal,
+  asynchronous indexes, primary-key strategies) and applies it after your review from an
+  object tree.
+- **Full Load** — streams a consistent snapshot into DSQL in bounded-memory batches;
+  resumable and built for large tables.
+- **Change data capture (CDC)** — optional continuous replication that keeps the target
+  current for a near-zero-downtime cut-over.
+- **Validation** — confirms source and target agree by row count, checksum, and
+  primary-key reconciliation, and reports any drift.
+- **AI assist** — optional and off by default; suggests conversions for hard-to-map
+  objects, applied only after you review them.
+- **Deploy in your preferred form** — the same tool, three ways:
+  **Local**  ·  **ECS Fargate**  ·  **single EC2 host**.
 
 **❌ Doesn't / out of scope**
 
-- **Not fully automated / zero-downtime** — hard conversions and the final **Cut
-  over** are yours to decide and perform.
-- **Never writes to the source** — read-only, kept as a rollback anchor.
-- **CDC doesn't replicate DDL** — schema changes go through Schema Conversion.
-- **No cross-region** — source and target must be in the same region.
-- **DSQL's omitted features stay constraints** — no FK / triggers / stored
-  procedures, per-transaction row limit, 1 MiB per-value limit, etc.
+- **Not fully automated or zero-downtime** — the hard conversions and the final **Cut
+  over** remain your decision and action.
+- **Never writes to the source** — the source stays read-only throughout, preserved as a
+  rollback anchor.
+- **Doesn't replicate DDL over CDC** — schema changes go through Schema Conversion, not
+  the replication stream.
+- **Single region only** — the source and target must be in the same AWS region.
+- **Inherits DSQL's constraints** — no foreign keys, triggers, or stored procedures; a
+  per-transaction row limit; a ~1 MiB per-value limit; and more.
 
 > Full enforced-limit list and workarounds: User Manual
 > [Chapter 6 — Limitations](docs/manual/en/06-limitations.md).
 
 ---
+
+<br>
 
 ## Workflow
 
@@ -80,11 +93,14 @@ The web UI guides you through five steps, with **Connect** as the preliminary st
 | 4. Validation | Compare target against source as of the watermark; report row-count/checksum results and drift; export the report. |
 | 5. Cut over | Runbook for switching your app MySQL → DSQL once validation passes — the one step the tool doesn't execute. MySQL source kept as rollback anchor. |
 
-Each step shows its status (not started / in progress / done / failed) and can be
-run or re-run independently. Feature-level detail lives in the
+Each step shows its status (not started / in progress / done / failed); completing a
+step unlocks the next, and any completed step can be re-run. An optional AI assistant
+is available on demand throughout. Feature-level detail lives in the
 [User Manual](docs/manual/README.md).
 
 ---
+
+<br>
 
 ## Quick start
 
@@ -128,8 +144,8 @@ VPC**, reachable at the ALB URL it outputs. Here **all migration traffic stays i
 AWS** (source → Fargate → DSQL); your browser only opens the UI — suited to
 large-scale migrations and private sources.
 
-**Full procedure: [`deploy/DEPLOYMENT.md`](deploy/DEPLOYMENT.md)** (quick deploy,
-parameters, Dev/Test vs Prod, DNS & Cognito, teardown, troubleshooting).
+**Full procedure: [`deploy/DEPLOYMENT.md`](deploy/DEPLOYMENT.md)** (AWS Console & CLI,
+parameters, custom domain & Cognito, teardown, troubleshooting).
 
 <p align="center">
   <b>Console (UI)</b><br>
@@ -140,16 +156,20 @@ parameters, Dev/Test vs Prod, DNS & Cognito, teardown, troubleshooting).
 
 For accounts that **can't use containers/ECR or AWS Lambda.** The same engine runs on a
 **single in-VPC EC2 host straight from source** (`git clone` + `uv sync` + a **systemd**
-service) — no image build, no ALB; you reach the UI over an **SSM port-forward** and
-state lives on a **retained EBS volume** (no S3 needed). For CDC it seeds Kafka
-**in-process**, so it needs **no offset-seeder Lambda**. The private in-VPC data path
-(source → EC2 → DSQL) is the same one Fargate gives.
+service). It stands up **none of Fargate's front-door services — no ECS, ALB, ACM
+certificate, or Cognito** (and no image build): you reach the UI over an **SSM
+port-forward**, and state lives on a **retained EBS volume** (no S3 needed). For CDC it
+seeds Kafka **in-process**, so there's **no offset-seeder Lambda** either. The private
+in-VPC data path (source → EC2 → DSQL) is the same one Fargate gives — with far fewer
+moving parts.
 
 **Full procedure: [`deploy/DEPLOYMENT.md` → Run on a single EC2 host](deploy/DEPLOYMENT.md#run-on-a-single-ec2-host-from-source-lambda-free).**
 
 ---
 
-## Architecture
+<br>
+
+## Full architecture
 
 The tool is a **Python app** (NiceGUI UI + an importable engine) the operator runs
 inside the customer environment: assess → convert → bulk-load a consistent snapshot
@@ -167,7 +187,7 @@ an **HTTPS ALB** (`internal` by default, optional Cognito), pulling the image fr
   suggestions, CDC-readiness assessment, and DLQ triage. It never sees Full Load /
   CDC row data — only schema/DDL/plan metadata. Off by default; no third-party API
   keys (scoped `bedrock:InvokeModel`).
-- **CDC is a separate path** (`cdc-stack`) — Amazon MSK + Debezium → a
+- **CDC is a separate stack** (`cdc-stack`) — Amazon MSK + Debezium → a
   **custom Aurora DSQL sink connector**
   ([`connectors/dsql-sink/`](connectors/dsql-sink)) on managed MSK Connect. A stock
   JDBC sink can't handle DSQL's short-lived IAM tokens, statement-level OCC retry,
@@ -190,8 +210,7 @@ both stacks. Debezium is open-source software running *on* MSK Connect.
 | Amazon ECS (Fargate) | Runs the single-task control-plane app (NiceGUI + engine). |
 | Amazon ECR | Stores the app container image (published ECR Public image by default). |
 | Elastic Load Balancing (ALB) | HTTPS entry point forwarding to the app (`internal` by default). |
-| Amazon Route 53 | DNS for the app domain (only with a public domain; operator-provided). |
-| AWS WAF | Web protection in front of the ALB (recommended when publicly exposed). |
+| Amazon Route 53 | Custom domain only — you create an alias record to the ALB (not provisioned by the stack). |
 | Amazon Cognito | OIDC auth gate at the ALB (required when exposed to the public internet). |
 | AWS Certificate Manager | TLS certificate for the ALB HTTPS listener. |
 | Amazon VPC | Private subnets, security groups, NAT / VPC endpoints. |
@@ -203,13 +222,15 @@ both stacks. Debezium is open-source software running *on* MSK Connect.
 | Amazon Bedrock | Optional AI assist (control plane only). |
 | AWS CloudFormation | Infrastructure-as-code for both stacks. |
 
-A normal deploy uses the ECR Public image as-is (no build). **AWS CodeBuild** is
-not a runtime component — an optional build tool (`deploy/codebuild.yaml`) used
-once only when you must build your own image on a restricted network.
+> [!NOTE]
+> A normal deploy uses the ECR Public image as-is (no build). **AWS CodeBuild** is not a
+> runtime component — it's an optional build tool (`deploy/codebuild.yaml`) used once
+> only when you must build your own image on a restricted network.
 
+> [!IMPORTANT]
 > **EC2 (from-source) deploy** uses **Amazon EC2 + a retained EBS volume + AWS Systems
 > Manager** (Session Manager) in place of ECS / ECR / ALB / Cognito, and keeps **app
-> state on that EBS volume instead of S3**; in that mode CDC seeds Kafka in-process, so
+> state on that EBS volume instead of S3**. In that mode CDC seeds Kafka in-process, so
 > the **AWS Lambda** offset-seeder below is **not** created. (CDC still auto-provisions
 > the S3 plugin bucket above for the connector artifacts.) See [Quick start](#quick-start).
 
@@ -220,24 +241,29 @@ once only when you must build your own image on a restricted network.
 | Amazon MSK (Serverless) | Kafka backbone: per-table topics partitioned by PK, plus a DLQ topic. |
 | Amazon MSK Connect | Managed Kafka Connect hosting the Debezium source and our custom DSQL sink connector (JSON converter, `schemas.enable=true` — no schema registry). |
 | AWS Lambda | In-VPC offset seeder (CFN custom resource) auto-seeding the Debezium GTID watermark for a gapless handoff. |
-| Amazon VPC (dedicated) | CDC runs in its own VPC to reach the source MySQL privately. |
+| Amazon VPC | CDC runs in the VPC you provide (typically the source's) to reach MySQL privately — optionally in its own subnets + NAT that the stack creates there. |
 
 </details>
 
 ---
+
+<br>
 
 ## Prerequisites
 
 - A source **RDS / Aurora MySQL** with a read-only schema/data user.
 - A target **Aurora DSQL** cluster in the **same region** (IAM-token auth, no password).
 - **AWS credentials** via the standard chain (env / `~/.aws` / profile) with
-  `dsql:DbConnect`. Optionally `secretsmanager:GetSecretValue` and `bedrock:InvokeModel`.
+  `dsql:DbConnect` (or `dsql:DbConnectAdmin` for the `admin` user). Optionally
+  `secretsmanager:GetSecretValue` and `bedrock:InvokeModel`.
 - **Local run only:** Python 3.10+ (pinned 3.12) and [`uv`](https://docs.astral.sh/uv/).
 
 > Full checklist incl. source-DB / CDC setup (binlog, etc.):
 > [User Manual §1.1](docs/manual/en/01-setup.md).
 
 ---
+
+<br>
 
 ## Project layout
 
@@ -252,19 +278,23 @@ once only when you must build your own image on a restricted network.
 
 ---
 
+<br>
+
 ## Documentation
 
 | Doc | What's inside |
 |---|---|
 | [**Deployment guide**](deploy/DEPLOYMENT.md) | Run locally in one command, deploy on ECS Fargate (AWS Console or CLI), or run from source on a single EC2 host (no container/Lambda) — prerequisites, parameters, custom domain / Cognito / AI assist, teardown, troubleshooting. |
-| [**User manual**](docs/manual/) | Step-by-step walkthrough of the six migration steps — plus **performance tuning & measured test results**, testing / verification, and a **customer FAQ**. |
-| [**Architecture**](#architecture) | How the pieces fit, plus the AWS and CDC-pipeline diagrams (`deploy/architecture-*.png`). |
+| [**User manual**](docs/manual/) | Step-by-step walkthrough of the five migration steps — plus **performance tuning & measured test results**, testing / verification, and a **customer FAQ**. |
+| [**Full architecture**](#full-architecture) | How the pieces fit, plus the AWS and CDC-pipeline diagrams (`deploy/architecture-*.png`). |
 | [**Changelog**](CHANGELOG.md) | Per-release changes (semantic-versioned). |
 
 Localized: [한국어 README](README.ko.md) · [日本語 README](README.ja.md) — the deployment
 guide, changelog, and user manual are translated too.
 
 ---
+
+<br>
 
 ## Deployment
 
@@ -286,6 +316,8 @@ Optional streaming CDC is a separate **cdc-stack**.
 
 ---
 
+<br>
+
 ## Configuration (advanced — usually no need to touch)
 
 Everything is done in the UI with sensible defaults — **most operators never touch
@@ -297,7 +329,7 @@ this.** The full environment-variable reference (for automation / tuning) is bel
 Read from environment variables (no config file, no persisted credentials). On
 Fargate, set these in the ECS task definition. The four Full Load / Validation
 parallelism knobs can also be retuned **at runtime** from the sidebar's
-**Settings → Performance** tab (no redeploy; resets on restart).
+**Settings** (the Full Load and Validation tabs) — no redeploy; resets on restart.
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -337,12 +369,16 @@ Full background on the tuning knobs: manual
 
 ---
 
+<br>
+
 ## Version / changelog
 
 Current version: [`pyproject.toml`](pyproject.toml); changes per version:
 [**CHANGELOG.md**](CHANGELOG.md).
 
 ---
+
+<br>
 
 ## License
 

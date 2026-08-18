@@ -5,7 +5,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 
 # NOTE: the top-level Description below is capped by CloudFormation at 1024 bytes,
 # so it is kept short. The full rationale + placement prerequisites live in
-# deploy/TEST_EC2_MSK_ONLY.md and deploy/DEPLOYMENT.md. In brief:
+# deploy/DEPLOYMENT.md (the single-EC2-host section). In brief:
 #   * Run this host in the SAME VPC as the CDC MSK (cdc-stack); CDC is seeded
 #     IN PROCESS here (DSQL_MIGRATOR_CDC_SEED_MODE=external, no seeder Lambda), so
 #     the host must reach MSK Serverless on 9098 -- deploy into a NAT-egress subnet
@@ -21,7 +21,7 @@ Description: >
   an SSM port-forward (no inbound rule, no public IP). State lives on a retained
   EBS volume. Must run in the same VPC as the CDC MSK and be admitted on 9098 (pass
   this host's subnet CIDR to the cdc-stack HostSubnetCidr param). Stack name must
-  NOT start with "mysql-dsql-cdc-". See deploy/TEST_EC2_MSK_ONLY.md for details.
+  NOT start with "mysql-dsql-cdc-". See deploy/DEPLOYMENT.md for details.
 
 # Console UX: group + label the parameters so uploading this template in the AWS
 # CloudFormation console renders an ordered, sectioned "Specify stack details"

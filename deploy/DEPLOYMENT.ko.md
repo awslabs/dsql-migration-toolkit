@@ -26,6 +26,8 @@ UI이며 **어디서 실행하느냐**만 다릅니다. 선택적 스트리밍 *
 
 ---
 
+<br>
+
 ## 로컬에서 실행
 
 **ECS Fargate 배포를 결정하기 전에, 먼저 로컬에서 시도해보세요** — **명령어 한 줄이면 UI가 뜹니다.
@@ -39,9 +41,14 @@ NiceGUI ready to go on http://127.0.0.1:8080
 이 URL을 브라우저에서 열면 바로 사용 — **인프라도, 빌드도, 만들 AWS 리소스도 없습니다.** 첫 확인·
 평가·소규모 마이그레이션에 좋고, Fargate로 갈지 결정하기 전에 써보기 좋습니다.
 
+<details>
+<summary><b>스크린샷</b> — 도구 UI(5단계 가이드 워크플로우)</summary>
+
 <div align="center">
-  <img src="../docs/demo-ui.png" alt="도구 UI — 5단계 가이드 마이그레이션 워크플로우" width="560">
+  <a href="../docs/demo-ui.png"><img src="../docs/demo-ui.png" alt="도구 UI — 5단계 가이드 마이그레이션 워크플로우" width="900"></a>
 </div>
+
+</details>
 
 UI가 내 머신에서 돌고(브라우저 → `127.0.0.1:8080`), **마이그레이션 자체도 거기서 실행**됩니다 — 내
 워크스테이션이 소스를 읽고 DSQL에 쓰는 엔진이라, 모든 데이터가 내 머신과 네트워크를 통과합니다.
@@ -68,6 +75,8 @@ AWS 자격증명이 있어야 합니다. 인프라 없음 — 평가 / 소규모
 
 ---
 
+<br>
+
 ## ECS Fargate에 배포
 
 > [!TIP]
@@ -87,6 +96,15 @@ AWS 자격증명이 있어야 합니다. 인프라 없음 — 평가 / 소규모
 Direct Connect, 또는 SSM 포트 포워딩으로 — 열어야 합니다. 설계상 공용 엔드포인트가 없습니다 —
 Well-Architected SEC05-BP02. 외부에 공개하려면 [app-stack 배포](#2-app-stack-배포)의 오버라이드
 노트를 참고하세요.
+
+<details>
+<summary><b>아키텍처 다이어그램</b> — 전체 토폴로지(app-stack + 선택적 CDC on MSK Connect)</summary>
+
+<div align="center">
+  <a href="architecture-aws.png"><img src="architecture-aws.png" alt="전체 AWS 아키텍처 — 운영자가 HTTPS ALB(선택적 Cognito)를 통해 ECS Fargate 컨트롤 플레인 앱에 접속하고, 앱이 Aurora DSQL로 Full Load를 수행하며, 선택적 CDC 파이프라인에서는 cdc-stack을 배포해 Debezium 소스 + 커스텀 DSQL 싱크 커넥터가 MSK Connect에서(S3의 플러그인 로드) 실행되어 Amazon MSK를 거쳐 Aurora DSQL로 스트리밍하고, gapless 핸드오프를 위한 VPC 내 offset-seeder Lambda가 있음" width="900"></a>
+</div>
+
+</details>
 
 <hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
@@ -693,20 +711,29 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 
 ---
 
+<br>
+
 ## 단일 EC2 호스트에서 실행 (소스에서, Lambda-free)
 
 **컨테이너/ECR나 AWS Lambda를 쓸 수 없는 계정**을 위한 방식입니다. 같은 컨트롤 플레인 앱이 VPC
-안의 **EC2 호스트 하나에서 소스 그대로** 실행됩니다 — 호스트가 `git` +
-[`uv`](https://docs.astral.sh/uv/)를 설치하고, 이 저장소를 가져와 가상환경(CPython 3.12)을
-`uv sync`한 뒤, UI를 **systemd 서비스**(`dsql-migrator.service`)로 실행합니다. **이미지 빌드도
-ECR도 ALB도 없이** UI에는 **SSM 포트포워드**로 접속합니다(호스트에 인바운드 규칙도 공인 IP도
-없음). 상태(Full Load 작업 / 세션 SQLite + 활동 로그)는 **보존형 EBS 볼륨**에 있으므로 **S3 버킷이
-필요 없습니다.** CDC는 Kafka를 **인프로세스로** 시드하므로, Fargate와 달리 **오프셋 시더 Lambda를
+안의 **EC2 호스트 하나에서 소스 그대로**, **systemd 서비스**로 실행됩니다 — 이미지 빌드도 ECR도
+ALB도 없습니다. UI에는 **SSM 포트포워드**로 접속합니다(호스트에 공인 IP도 인바운드 규칙도 없음).
+상태(Full Load 작업 / 세션)는 **보존형 EBS 볼륨**에 있어 재부팅 후에도 유지되며 **S3 버킷이 필요
+없습니다.** CDC는 Kafka를 **인프로세스로** 시드하므로, Fargate와 달리 **오프셋 시더 Lambda를
 만들지 않습니다**(`SeedMode=External`).
 
-템플릿: **`deploy/cloudformation-ec2.yaml`**. 이 절은 빠른 경로이며, 전체 실습 절차(기본 경로가
-바뀌지 않음을 증명하는 change-set 드라이런, 부정/복원력 점검, 그리고 임시 "내 로컬 복사본 실행"
-S3 흐름)는 **[`deploy/TEST_EC2_MSK_ONLY.md`](TEST_EC2_MSK_ONLY.md)**에 있습니다.
+템플릿: **`deploy/cloudformation-ec2.yaml`**.
+
+<details>
+<summary><b>아키텍처 다이어그램</b> — 단일 EC2 호스트, 인프로세스 CDC 시드(SeedMode=External)</summary>
+
+<div align="center">
+  <a href="architecture-aws-ec2.png"><img src="architecture-aws-ec2.png" alt="단일 EC2 호스트 아키텍처 — 마이그레이션 도구가 VPC 내 EC2 호스트 1대에서 소스 그대로 실행되고 SSM 포트포워드로 접속(ALB 없음), Aurora DSQL로 Full Load를 수행하고 MSK로 CDC를 인프로세스 시드하며, Debezium 소스 + 커스텀 DSQL 싱크 커넥터가 MSK Connect에서 S3의 플러그인을 로드" width="820"></a>
+</div>
+
+</details>
+
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
 ### 언제 쓰나
 
@@ -721,19 +748,28 @@ S3 흐름)는 **[`deploy/TEST_EC2_MSK_ONLY.md`](TEST_EC2_MSK_ONLY.md)**에 있�
 > 인스턴스 재부팅/교체에도 보존형 EBS 볼륨에서 살아남지만, 컨트롤 플레인 자체는 한 대입니다 —
 > 직접 진행하는 마이그레이션에는 적합하지만, 장기 상시 HA 서비스용은 아닙니다.
 
-### 사전 요구사항
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
-- **소스 MySQL 및 (CDC의 경우) MSK와 같은 위치의, VPC 내 NAT-egress 프라이빗 서브넷.** 호스트는
-  공인 IP가 없고, 그 egress로 AWS API / 소스 / MSK에 도달합니다.
-- UI 포트포워드를 위한 AWS CLI **Session Manager 플러그인** —
+### 1. 사전 요구사항
+
+- **인터넷 egress가 되는 프라이빗 서브넷(NAT 게이트웨이).** 호스트는 **공인 IP가 없고**,
+  **첫 부팅 때 `uv`·CPython·Python 휠을 받고 저장소를 클론하는 것을 모두 공개 인터넷**
+  (astral.sh · PyPI · GitHub)에서 하며 — 이후 소스 DB·DSQL·AWS API 접근도 같은 egress로
+  처리합니다. VPC 엔드포인트만으로는 안 됩니다(이 공개 소스들은 PrivateLink로 받을 수 없음).
+  **소스 MySQL과 같은 VPC**에 두세요(CDC를 쓸 거면 MSK와도 같은 VPC).
+- **AWS CLI + Session Manager 플러그인**(내 컴퓨터에) — UI를 여는 방법입니다(ALB나 공용
+  엔드포인트가 없어 SSM으로 포트포워드).
   [설치 안내](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html).
-- 인프로세스 CDC 시드를 위해 호스트를 MSK 9098로 들여보내는 데 필요한 **호스트 서브넷 CIDR**
-  (아래 "호스트를 MSK 9098에 허용" 참고).
-- 호스트가 접근할 앱 소스: **기본 `SourceMode=git`**은 공개 저장소를 HTTPS로 클론(인증 불필요)합니다.
-  저장소가 공개되기 전에는 체크아웃 tarball로 **`SourceMode=s3`**를 사용하세요
-  ([`TEST_EC2_MSK_ONLY.md`](TEST_EC2_MSK_ONLY.md) §2 참고).
+- **CDC를 쓸 때만 — 호스트 서브넷의 CIDR.** 이 값을 cdc-stack에 넘기면 MSK가 인프로세스
+  시드를 위해 호스트를 9098 포트로 허용합니다(아래
+  [호스트를 MSK 9098에 허용](#5-호스트를-msk-9098에-허용-cdc만) 참고).
+- **호스트가 앱 소스를 가져오는 방법.** 기본값(`SourceMode=git`)은 공개 저장소를 HTTPS로
+  클론합니다 — 자격증명 불필요. 호스트 네트워크가 저장소에 닿지 못하면, 체크아웃 tarball을
+  S3에 올려 `SourceMode=s3`(`SourceS3Uri`)를 사용하세요.
 
-### 필수 / 핵심 파라미터
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 2. 필수 / 핵심 파라미터
 
 | 파라미터 | 필수 | 기본값 | 무엇인가 |
 | --- | --- | --- | --- |
@@ -754,17 +790,32 @@ S3 흐름)는 **[`deploy/TEST_EC2_MSK_ONLY.md`](TEST_EC2_MSK_ONLY.md)**에 있�
 > 스택 이름은 **`mysql-dsql-cdc-`로 시작하면 안 됩니다**(그 접두사는 CDC 배포 역할 범위에 들어감).
 > `mysql-dsql-migrator-ec2`가 적절합니다.
 
-### 배포
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 3. 배포
+
+이것은 CloudFormation 스택(`deploy/cloudformation-ec2.yaml`)이며, Fargate와 마찬가지로 두 방법으로
+배포합니다:
+
+- **AWS Console — 권장.** 템플릿을 업로드하고 안내형 폼을 채웁니다(`VpcId` / `HostSubnetId`는
+  네이티브 선택기; Console이 템플릿을 대신 스테이징하므로 S3 버킷 불필요). 절차는
+  [Fargate Console 안내](#권장--aws-console-안내형-폼)와 동일합니다 — 이 템플릿을 고르고, 위의 EC2
+  파라미터를 입력하고, 스택 이름을 `mysql-dsql-migrator-ec2`로 지정하면 됩니다.
+- **AWS CLI** — `aws cloudformation deploy` 한 번:
 
 ```bash
+# --- 내 환경 (여기를 수정) ---------------------------------------------------
 export AWS_REGION=us-east-1
 export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export VPC_ID=vpc-xxxxxxxx
-export HOST_SUBNET_ID=subnet-xxxxxxxx        # NAT-egress 프라이빗 서브넷, MSK와 같은 위치
-export DSQL_CLUSTER_ARN=arn:aws:dsql:$AWS_REGION:$ACCOUNT:cluster/xxxx
-export SOURCE_DB_SG=sg-source
+export VPC_ID=vpc-0a1b2c3d4e5f6a7b8
+# HostSubnetId: VPC_ID 안의 NAT-egress 프라이빗 서브넷, MSK와 같은 위치
+export HOST_SUBNET_ID=subnet-0123456789abcdef0
+export DSQL_CLUSTER_ARN=arn:aws:dsql:us-east-1:123456789012:cluster/f0a1b2c3d4e5f6a7b8c9d0e1f2
+export SOURCE_DB_SG=sg-0a1b2c3d4e5f6a7b8
+# -----------------------------------------------------------------------------
 
-# 호스트 서브넷 CIDR — 호스트를 MSK 9098에 허용할 때 사용(아래 CDC 단계):
+# 호스트 서브넷 CIDR — 호스트의 MSK egress 범위 지정(아래 MskEgressCidr)과,
+# CDC의 경우 호스트를 9098로 허용하는 데 사용("호스트를 MSK 9098에 허용" 참고):
 export HOST_SUBNET_CIDR=$(aws ec2 describe-subnets --subnet-ids "$HOST_SUBNET_ID" \
   --region "$AWS_REGION" --query 'Subnets[0].CidrBlock' --output text)
 
@@ -785,15 +836,17 @@ aws cloudformation deploy \
     DsqlClusterArn="$DSQL_CLUSTER_ARN" \
     SourceDbSecurityGroupId="$SOURCE_DB_SG" \
     MskEgressCidr="$HOST_SUBNET_CIDR"
-    # 기본 SourceMode=git은 공개 저장소를 클론합니다. 공개 전에는 다음을 추가:
-    #   SourceMode=s3 SourceS3Uri=s3://.../dsql-src.tar.gz   (TEST_EC2_MSK_ONLY.md §2 참고)
+    # 기본 SourceMode=git은 공개 저장소를 클론합니다(자격증명 불필요). 호스트가 저장소에
+    # 닿지 못하면 추가:  SourceMode=s3 SourceS3Uri=s3://$TEMPLATE_BUCKET/dsql-src.tar.gz
 ```
 
 첫 부팅은 약 3~4분: 호스트가 443으로 Python 3.12 + wheel을 설치하고,
 `uv sync --extra cdc-external`(인프로세스 시드에 필요한 `kafka-python` + MSK IAM 서명기 포함)을
 실행한 뒤 서비스를 시작합니다. 진행 상황은 호스트의 `/var/log/dsql-migrator-userdata.log`에 있습니다.
 
-### UI 접속 (SSM 포트포워드)
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 4. UI 접속 (SSM 포트포워드)
 
 스택은 `HostInstanceId`와 바로 실행 가능한 `SsmPortForwardCommand`를 출력합니다:
 
@@ -811,16 +864,25 @@ aws ssm start-session --target "$INSTANCE_ID" \
 `systemctl is-active dsql-migrator.service`와 `journalctl -u dsql-migrator`로 서비스 상태를
 확인하세요.
 
-### 호스트를 MSK 9098에 허용 (CDC만)
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
-CDC에서는 호스트가 Kafka를 인프로세스로 시드하므로 MSK Serverless 9098에 도달해야 합니다. **호스트
-서브넷 CIDR**을 **cdc-stack `HostSubnetCidr` 파라미터**로 전달하면(커넥터 SG 인그레스가 생성됨)
-됩니다 — 도구가 CDC 인프라 배포 시점에 넣어줄 수도 있고, cdc-stack을 직접 배포할 때 설정할 수도
-있습니다. 전체 절차: [`TEST_EC2_MSK_ONLY.md`](TEST_EC2_MSK_ONLY.md) §4. 호스트가 MSK에 도달할 수
-없으면 **Start CDC가 커넥터를 만들기 전에 명확히 실패**(`CdcDeployError`)합니다 — 조용한 갭은
-없습니다.
+### 5. 호스트를 MSK 9098에 허용 (CDC만)
 
-### Teardown
+CDC에서는 호스트가 Kafka를 인프로세스로 시드하므로 MSK Serverless 9098에 도달해야 합니다 —
+cdc-stack의 `HostSubnetCidr` 파라미터가 호스트를 허용합니다(커넥터 SG 인그레스 추가). **이 EC2
+호스트에선 자동입니다:** 호스트가 부팅 때 자기 서브넷 CIDR을 도출하고, UI에서 **CDC 인프라 배포**를
+누르면 도구가 그 값을 넣어줍니다 — 따로 설정할 게 없습니다. (cdc-stack을 도구 밖에서 직접 배포할
+때만 `HostSubnetCidr`을 수동으로 넘깁니다.) 어느 경우든 호스트가 MSK에 도달할 수 없으면 **Start
+CDC가 커넥터를 만들기 전에 명확히 실패**(`CdcDeployError`)합니다 — 조용한 갭은 없습니다.
+
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 6. Teardown
+
+CDC를 배포했다면 **호스트가 살아 있는 동안 먼저** 제거하세요 — **Data Migration** 단계에서
+**Delete all CDC infrastructure**를 사용합니다. 이 삭제는 호스트의 앱에서 실행되므로, 호스트를 먼저
+지우면 cdc-stack을 손으로(`aws cloudformation delete-stack`) 지워야 합니다. 그다음 EC2 호스트를
+정리하세요:
 
 ```bash
 aws cloudformation delete-stack --stack-name mysql-dsql-migrator-ec2 --region "$AWS_REGION"
@@ -829,18 +891,21 @@ aws cloudformation wait stack-delete-complete --stack-name mysql-dsql-migrator-e
 
 > [!WARNING]
 > 상태 EBS 볼륨은 설계상 **`DeletionPolicy: Retain`**이라 **스택 삭제 후에도 남습니다** — 보관을
-> 원치 않으면 수동으로 삭제하세요(`aws:cloudformation:stack-name` 태그로 찾음). CDC를 배포했다면
-> cdc-stack을 먼저 제거하세요(UI의 **Start over → Delete all CDC infrastructure** 또는
-> `aws cloudformation delete-stack`).
+> 원치 않으면 수동으로 삭제하세요(`aws:cloudformation:stack-name` 태그로 찾음).
 
 ---
 
-## 부록 — 자체 이미지 빌드 (제한된 네트워크 전용)
+<br>
+
+## 부록 — 자체 이미지 빌드 (ECS Fargate 전용; 제한된 네트워크만)
 
 > [!NOTE]
-> **대부분의 배포는 이 절을 건너뜁니다.** 이미지는 ECR Public에 게시돼 있고 CloudFormation이 기본으로
-> 가져오므로 빌드할 게 없습니다. 네트워크가 ECR Public에 도달할 수 없을 때만 자체 이미지를 빌드해
-> (`ContainerImageUri`로 전달) 사용하세요. 아래 Option A/B 중 하나 — 둘 다 ECR 저장소를 만들고
+> **이 절은 ECS Fargate 배포에만 해당합니다** — 단일 EC2 호스트 모드는 소스에서 실행되어 컨테이너
+> 이미지를 쓰지 않으므로 이 절이 전혀 필요 없습니다.
+>
+> **그리고 Fargate 배포도 대부분 이 절을 건너뜁니다.** 이미지는 ECR Public에 게시돼 있고
+> CloudFormation이 기본으로 가져오므로 빌드할 게 없습니다. 네트워크가 ECR Public에 도달할 수 없을
+> 때만 자체 이미지를 빌드해(`ContainerImageUri`로 전달) 사용하세요. 아래 Option A/B 중 하나 — 둘 다 ECR 저장소를 만들고
 > `deploy/Dockerfile`을 `linux/amd64`로 빌드해 ECR에 푸시하고 이미지 URI를 출력합니다.
 
 ### Option A — 로컬 빌드 (Docker 호환 런타임 필요)
