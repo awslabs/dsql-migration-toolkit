@@ -79,28 +79,41 @@ DSQL リージョンへのアウトバウンド HTTPS + AWS 認証情報が必�
 > **実運用・大規模な移行に推奨。** データ経路全体がノート PC ではなく AWS 内にとどまります
 > （ソース → Fargate → DSQL）。
 
-イメージのビルドは不要です — イメージは **ECR Public** にあり、CloudFormation が
-取得します。同じ `deploy/cloudformation.yaml` をデプロイする 2 つの方法があります。
+イメージのビルド不要で 2 つの方法でデプロイできます — イメージは **ECR Public** にあり、
+CloudFormation が取得します。同じ `deploy/cloudformation.yaml` を次のいずれかで:
 
-- **AWS Console — 推奨。** テンプレートをアップロードすると、ガイド付きフォームが
-  値を受け取ってくれます。[app-stack のデプロイ](#app-stack-のデプロイ) を参照。
-- **AWS CLI。** パラメータのオーバーライドを伴う `aws cloudformation deploy` コマンド
-  1 つで実行します。こちらも [app-stack のデプロイ](#app-stack-のデプロイ) にあります。
+- **AWS Console — 推奨。** テンプレートをアップロードすると、ガイド付きフォームが値を集めます。
+- **AWS CLI。** `aws cloudformation deploy` 1 回でパラメータを渡します。
 
-まず、両方の経路で必要になる値を集めます（詳細は
-[前提条件](#前提条件) にあります）。**VPC から始めてください**（推奨: ソース DB が
-存在する VPC）。次に、その VPC から ALB 用とタスク用の**サブネット**を選びます
-（Console では VpcId を選ぶと、その VPC のサブネットがドロップダウンに表示されます）。
-加えて **ACM 証明書**、**DSQL クラスター ARN**、ソース DB 用の
-**Secrets Manager シークレット ARN** が必要です。残りはデフォルトで処理されます
-（公開イメージ、`internal` ALB、Cognito オフ）。
+いずれも [app-stack のデプロイ](#2-app-stack-のデプロイ) に詳細があります — 必要な値はまず
+[前提条件](#1-前提条件) で集めてください。
 
-**UI への到達 (internal ALB)。** ALB はデフォルトで internal なので、`https://<LoadBalancerDns>/`
-には **VPC 内から**アクセスします — VPN / Direct Connect / SSM ポートフォワード。
-設計上、公開エンドポイントはありません（Well-Architected SEC05-BP02）。公開する
-には、**app-stack のデプロイ** セクションのオーバーライドの注記を参照してください。
+**UI への到達。** ALB はデフォルトで internal なので、`https://<LoadBalancerDns>/` には
+VPC 内から — VPN、Direct Connect、または SSM ポートフォワードで — アクセスします。設計上、
+公開エンドポイントはありません — Well-Architected SEC05-BP02。公開するには、
+[app-stack のデプロイ](#2-app-stack-のデプロイ) のオーバーライドの注記を参照してください。
 
-### 前提条件
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 1. 前提条件
+
+何を集めるか。その後すぐ [app-stack のデプロイ](#2-app-stack-のデプロイ) へ進んでください。
+詳細な説明は下記の折りたたみと [パラメータリファレンス](#パラメータリファレンス) にあります。
+
+| 何 | パラメータ | 補足 |
+| --- | --- | --- |
+| アクセス | — | AWS Console（推奨）または AWS CLI v2 — IAM ロール、ECS、ALB、セキュリティグループ、CloudWatch Logs を作成できること。イメージのビルドは不要 — ECR Public から取得します。 |
+| VPC | `VpcId` | ソース MySQL の VPC が理想的、**DSQL と同一リージョン**。以下のサブネットはここから選びます。 |
+| ALB サブネット 2 つ + タスクサブネット 2 つ | `AlbSubnetIds` / `ServiceSubnetIds` | 異なる AZ。タスクサブネットは**443 の egress**が必要。 |
+| ACM 証明書 | `CertificateArn` | 同一リージョン。ドメインがない場合は `AWS_REGION=<region> deploy/create_test_cert.sh` で自己署名のテスト証明書を作成してください。 |
+| DSQL クラスター ARN | `DsqlClusterArn` | 移行のターゲット。 |
+| ソース DB への到達性 | `SourceDbSecurityGroupId`（推奨）または `SourceDbCidr` | いずれか一方。 |
+
+ソース DB の認証情報はデプロイ**後**に UI で入力します（再利用する場合を除き AWS シークレットは
+不要）。それ以外のパラメータはすべて妥当なデフォルトのままです。
+
+<details>
+<summary><b>パラメータの詳細</b> — VPC / サブネット / 証明書のガイダンスと、すべてのオプション値</summary>
 
 #### アクセス
 
@@ -111,35 +124,15 @@ DSQL リージョンへのアウトバウンド HTTPS + AWS 認証情報が必�
 - イメージのビルドは不要です — イメージは ECR Public から取得されます。（自前ビルドは
   制限されたネットワーク向けのみ。付録を参照。）
 
-#### 必須の値
+#### フォームを入力する前に知っておくこと
 
-> 🔑 **VPC から始めてください — 残りはすべてそこから決まります。** **ソースの
-> RDS/Aurora MySQL がすでに存在する VPC** を使用してください。同一 VPC が最も単純で
-> 推奨される選択肢です（ツールはソースにプライベートに到達でき、ソースのセキュリティ
-> グループをタスクに対してのみ開放すれば済みます）。DSQL ターゲットと**同一リージョン
-> でなければなりません**。**以下の 2 つのサブネットフィールドは _この VPC の中から_
-> 選びます** — AWS Console では VpcId を選ぶとその VPC のサブネットがドロップダウンで
-> 表示されるので、入力するのではなく選択します。（ピアリングされた VPC / Transit
-> Gateway / Direct Connect / VPN も、ルーティングと SG がタスクからソースに到達できる
-> ようにすれば動作します。）
-
-| 必須 | パラメータ | 内容 |
-| --- | --- | --- |
-| **VPC** | `VpcId` | 上記の VPC — 推奨: ソース DB の VPC、DSQL と同一リージョン。 |
-| **ALB サブネット** | `AlbSubnetIds` | **その VPC の**サブネット 2 つ、異なる AZ — `internal` ALB（推奨）にはプライベート、internet-facing にはパブリック。 |
-| **タスクサブネット** | `ServiceSubnetIds` | **その VPC の**プライベートサブネット 2 つ、異なる AZ、**443 の egress**（NAT ゲートウェイまたは VPC エンドポイント）を備え、DSQL / Secrets Manager / ECR / CloudWatch に到達できるもの。 |
-| **ACM 証明書** | `CertificateArn` | HTTPS リスナー用の**同一リージョン**の ACM 証明書の **ARN**（`arn:aws:acm:<region>:<account>:certificate/<id>`）。**本番:** 保有するドメイン用に ACM パブリック証明書を発行してください。**手早いテスト（ドメインなし）:** `AWS_REGION=<region> deploy/create_test_cert.sh` を実行し、出力される `CertificateArn` を貼り付けます（自己署名。ブラウザは警告します）。既存の ARN は ACM コンソールからコピーします。 |
-| **DSQL クラスター ARN** | `DsqlClusterArn` | ターゲットの Aurora DSQL クラスター。 |
-
-> **ソースの認証情報**は、デプロイ**後**に UI（Connect ステップ）で入力します —
-> 通常は**ユーザー名/パスワード**（RDS/Aurora MySQL の一般的なケース）で、メモリ上に
-> 保持され、AWS シークレットは不要です。したがって `SourceSecretArn` は**オプション**です
-> （次の表）: 既存の Secrets Manager シークレットを再利用する場合にのみ設定してください。
-
-> **なぜ VPC 以外にこれらだけが必須なのか。** サブネットと証明書は AWS 自体が要求します —
-> ALB と Fargate タスクは必ずサブネットに配置する必要があり、HTTPS リスナーには証明書が
-> 必要で、CloudFormation は VPC だけからそれらを自動で選ぶことができません。DSQL
-> クラスター ARN は移行の**ターゲット**です。残りはデフォルトがあります（次の表）。
+> [!IMPORTANT]
+> **VPC から始めてください。** ソースの RDS/Aurora MySQL がすでに存在する VPC を使用してください
+> — DSQL と同一リージョン — ここで選ぶサブネット/証明書は AWS 自体が要求するものです（ALB と
+> Fargate タスクは必ずサブネットに配置する必要があり、HTTPS リスナーには証明書が必要です）。
+> **この VPC はこのアカウントが所有している必要があります** — RAM 共有（クロスアカウント）の
+> VPC はサポートされません。CDC デプロイロールの EC2 権限はデプロイ先アカウントにスコープ
+> 限定されているため、コネクタの ENI 作成が `AccessDenied` で失敗します。
 
 #### オプションの値 (それ以外の場合は妥当なデフォルト)
 
@@ -152,7 +145,11 @@ DSQL リージョンへのアウトバウンド HTTPS + AWS 認証情報が必�
 | **AI アシスト** | `EnableAiAssist`, `BedrockModelId`, `BedrockRegion` | Amazon Bedrock 支援の変換を有効化する場合のみ（モデルを選択。IAM スコープは自動的に導出）。 |
 | **カスタムイメージ / サイジング** | `ContainerImageUri`, `ContainerCpu`, `ContainerMemory` | プライベート ECR イメージ、またはデフォルト以外のタスクサイズの場合のみ。 |
 
-### app-stack のデプロイ
+</details>
+
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 2. app-stack のデプロイ
 
 `deploy/cloudformation.yaml` をデプロイする 2 つの方法があります — いずれか 1 つを
 選んでください。どちらも同じスタックを作成します。パラメータのリファレンスは
@@ -160,46 +157,10 @@ DSQL リージョンへのアウトバウンド HTTPS + AWS 認証情報が必�
 
 #### 推奨 — AWS Console (ガイド付きフォーム)
 
-**概要** — テンプレートをアップロード、5 つのフィールドを入力、作成、URL を開く
-（クリック約 5 分 + スタック起動 約 3〜5 分）:
-
-1. **CloudFormation → Create stack → With new resources (standard).** 右上のリージョンが
-   Aurora DSQL クラスターと同じか確認。
-2. **Upload a template file** → `deploy/cloudformation.yaml` を選択 → **Next**。
-3. **Stack name** に `mysql-dsql-migrator` を入力し、**既定値のない 5 フィールド**を埋めます —
-   `VpcId`、`AlbSubnetIds`（サブネット 2 個、2 AZ）、`ServiceSubnetIds`（プライベート
-   サブネット 2 個、2 AZ）、`CertificateArn`、`DsqlClusterArn` — **さらに
-   `SourceDbSecurityGroupId`（推奨）か `SourceDbCidr` のどちらか一方**。後者はテンプレートが
-   すべてのデプロイで強制します: 両方空だとタスクからソース MySQL への経路がなく、接続が
-   タイムアウトします。他はすべて既定値のまま → **Next**。
-4. **Next**（スタックオプション）→ **IAM 権限の承認にチェック** → **Create stack**。
-5. **CREATE_COMPLETE** を待つ → **Outputs** タブ → **`AppUrl`** をコピー → VPC 内部から
-   アクセス。完了。
-
-<!-- スクリーンショット枠: CloudFormation "Create stack → Upload a template file" 画面を
-     キャプチャして deploy/images/cfn-create-stack.png に保存し、コメントを解除:
 ![CloudFormation — Create stack → Upload a template file](images/cfn-create-stack.png)
--->
-> 📸 *「Create stack → Upload a template file」画面のスクリーンショットがここに入ります（ソースのプレースホルダー参照）。*
-
-フィールドごとの詳細、サブネット選択のヒント、ドメインなしの証明書コマンド、公開アクセスの
-オプションは以下に続きます。
 
 まず、**正しいリージョン**（コンソール右上 — Aurora DSQL クラスターと同一リージョン）
 にいることを確認し、次に:
-
-> **開始前に — `CertificateArn` を用意しておく。** コンソールは HTTPS 証明書を
-> 代わりに生成できません。保有ドメイン用の ACM 証明書がまだない場合は、先に
-> ターミナルで `AWS_REGION=<region> deploy/create_test_cert.sh` を実行し、出力される
-> `arn:aws:acm:…` を保管して step 3 で貼り付けられるようにしてください（自己署名の
-> テスト証明書 — ブラウザは警告します。本番では、ご自身のドメイン用の実際の ACM
-> 証明書を使用してください）。
->
-> **デスクトップから到達しますか。パブリック IP も取得しておく。** `AlbScheme=internet-facing`
-> を設定する場合は、今すぐ `curl https://checkip.amazonaws.com` で IP を取得し、
-> step 3 で `AllowedIngressCidr=<その IP>/32` を入力して、あなただけが ALB に
-> 到達できるようにしてください。デフォルトの `10.0.0.0/8` は internal ALB 用
-> （VPC/VPN 内部から到達）であり、公開ブラウザをブロックします。
 
 **1. Create stack ウィザードを開く。** CloudFormation コンソールへ移動:
 <https://console.aws.amazon.com/cloudformation/home> → **Create stack** →
@@ -211,10 +172,8 @@ DSQL リージョンへのアウトバウンド HTTPS + AWS 認証情報が必�
 このリポジトリの `deploy/cloudformation.yaml` を選択 → **Next**。
 
 **3. Specify stack details。** **Stack name** を `mysql-dsql-migrator` に設定し、
-続いてパラメータを入力します。フォームはグループ化されており（Network /
-Migration endpoints / TLS & access / Authentication / Container image & sizing / AI）、
-ネイティブのピッカーを備えているため、id を入力する代わりに**ご自身のアカウントから
-選択**します。
+続いてパラメータを入力します。フォームはネイティブのピッカーを備えているため、
+id を入力する代わりに**ご自身のアカウントから選択**します。
 
 **以下の必須フィールドを入力します**（それ以外はすべて動作するデフォルトがあります）:
 
@@ -225,18 +184,20 @@ Migration endpoints / TLS & access / Authentication / Container image & sizing /
 | `ServiceSubnetIds` | サブネットのマルチセレクト — **異なる AZ の 2 つのプライベートサブネット**（プライベート/NAT サブネットがない場合は ALB サブネットを流用し `AssignPublicIp=ENABLED` を設定）。 |
 | `CertificateArn` | HTTPS 用の ACM 証明書 ARN — **ドメインがない場合は、すぐ下のコマンドを参照。** |
 | `DsqlClusterArn` | ターゲットの Aurora DSQL クラスター ARN。 |
+| `SourceDbSecurityGroupId`（または `SourceDbCidr`） | いずれか一方 — タスクのソース MySQL への egress の範囲を指定します。セキュリティグループ id を優先し、ない場合のみ CIDR を使用してください。 |
 
-> ⚠️ サブネットのドロップダウンは、ご自身の VpcId のものだけでなく、**リージョン内の
+> [!WARNING]
+> サブネットのドロップダウンは、ご自身の VpcId のものだけでなく、**リージョン内の
 > すべてのサブネット**を一覧表示します。別の VPC のものを選ぶとデプロイが失敗します —
 > 下の **「どのサブネットを選ぶか」** の注記を使って正しいものを選んでください。
 
-**推奨:** `SourceDbSecurityGroupId`（または `SourceDbCidr`）を設定して、タスクが
-ソースに到達できるようにします。既存のソースシークレットを再利用する場合を除き
-`SourceSecretArn` は空のままにします — デプロイ後に UI でソースのホスト/ユーザー名/
-パスワードを入力します。
+**オプション:** 既存のソースシークレットを再利用する場合を除き `SourceSecretArn` は空のまま
+にします — デプロイ後に UI でソースのホスト/ユーザー名/パスワードを入力します。
 
-**ACM 証明書がまだありませんか。** 自己署名の**テスト**証明書を 1 行で生成し、
-出力される ARN を `CertificateArn` に貼り付けます（ブラウザは警告します。テスト専用）:
+> [!TIP]
+> **ACM 証明書がまだありませんか。** 自己署名の**テスト**証明書を 1 行で生成し、
+> 出力される ARN を `CertificateArn` に貼り付けます（ブラウザは警告します。テスト専用 —
+> 本番では、ご自身のドメイン用の実際の ACM 証明書を取得してください）:
 
 ```bash
 AWS_REGION=<region> deploy/create_test_cert.sh
@@ -244,8 +205,19 @@ AWS_REGION=<region> deploy/create_test_cert.sh
 ```
 
 **デスクトップのブラウザから UI に到達しますか。** デフォルトは `internal` ALB
-（VPC/VPN 内部からのみ到達可能）です。ご自身のマシンから開くには、以下の 3 つを
-まとめて設定します:
+（VPC/VPN 内部からのみ到達可能）です。ご自身のマシンから開く方法は 2 つ —
+A か B のいずれかを選んでください:
+
+**A. 推奨 — Cognito でサインインする**（どこからでも、複数人でアクセス可能）:
+
+| フィールド | 入力する値 |
+| --- | --- |
+| `AlbScheme` | `internet-facing` |
+| `AlbSubnetIds` | **パブリック**サブネット（プライベートではない） |
+| `EnableCognitoAuth` | `true` — さらに `CognitoDomainPrefix` と `CognitoAdminEmail`（下の注記を参照） |
+| `AllowedIngressCidr` | `0.0.0.0/0` で問題ありません — Cognito のログインがアクセスゲートになります。ユーザーのネットワーク CIDR が分かる場合はさらに絞り込んでも構いません |
+
+**B. 代替 — ご自身のマシンのみ、ログインなし:**
 
 | フィールド | 入力する値 |
 | --- | --- |
@@ -253,34 +225,35 @@ AWS_REGION=<region> deploy/create_test_cert.sh
 | `AlbSubnetIds` | **パブリック**サブネット（プライベートではない） |
 | `AllowedIngressCidr` | デスクトップのパブリック IP を `/32` で — `curl https://checkip.amazonaws.com` で取得（例: `203.0.113.5/32`） |
 
-internet-facing ALB で `AllowedIngressCidr` をデフォルトの `10.0.0.0/8` のままにすると
-ブラウザがブロックされます。`0.0.0.0/0`（インターネット全体）は追加で
-`EnableCognitoAuth=true` が必要です。
-
-それ以外はすべてデフォルトのままにします（公開イメージ、`internal` ALB、Cognito
-オフ）。特に **`HttpsEgressCidr` は `0.0.0.0/0` のままにしてください** — これは
+残りのパラメータはデフォルトのままにします（例: コンテナイメージ）。特に
+**`HttpsEgressCidr` は `0.0.0.0/0` のままにしてください** — これは
 タスクが NAT/IGW 経由で AWS API（DSQL、Secrets Manager、ECR、CloudWatch）に到達する
 ためのアウトバウンド CIDR です。これらすべてを VPC エンドポイント（PrivateLink）で
 フロントする場合にのみ絞り込んでください。そうでないのに絞り込むと、タスクは
 イメージを取得できず DSQL に到達できず、起動に失敗します。→ **Next**。
 
+> [!TIP]
 > **どのサブネットを選ぶか。** ドロップダウンは（すべての VPC にわたる）**リージョン内の
-> すべてのサブネット**を `subnet-id | CIDR | アベイラビリティーゾーン | Name タグ` として
-> 一覧表示します。**まず CIDR 範囲でご自身の VpcId のサブネットに絞り込んでください**
-> （例: `172.31.0.0/16` の VPC → `172.31.x` のサブネットを選び、他の VPC に属する別の
-> CIDR は無視）。次に **AZ 列**を使って「異なる AZ」を満たし、**Name タグ**でパブリックと
-> プライベートを見分けます。次の表に従って選んでください（スタックは事前にフラグを
-> 付けられません — ドロップダウンは AWS がご自身のアカウントから埋めます）:
->
-> | フィールド | 推奨サブネット |
-> | --- | --- |
-> | `AlbSubnetIds` | **2 つの異なる AZ にある 2 つのサブネット。** デフォルトの `internal` ALB には**プライベート**サブネット、`internet-facing` には**パブリック**を使用。 |
-> | `ServiceSubnetIds` | **2 つの異なる AZ にある 2 つのプライベートサブネット**。それぞれアウトバウンド 443（NAT ゲートウェイのルート、または VPC エンドポイント）を備え、タスクが DSQL / Secrets Manager / ECR に到達できるもの。 |
->
-> どれがどれか分からない場合は、**VPC コンソール → Subnets** を開き、ご自身の VPC で
-> フィルターして、各サブネットの AZ とルートテーブルを確認します（`0.0.0.0/0 → nat-…`
-> のルート = egress を持つプライベート。`→ igw-…` = パブリック）。明確な Name タグの
-> 規約（例: `…-private-a` / `…-public-a`）があれば、ドロップダウンが一目で分かります。
+> すべてのサブネット**を一覧表示します。**まず CIDR 範囲でご自身の VpcId のサブネットに
+> 絞り込んでください**（例: `172.31.0.0/16` の VPC → `172.31.x` のサブネットを選び、他の
+> VPC に属する別の CIDR は無視）。次に **AZ 列**を使って「異なる AZ」を満たし、**Name
+> タグ**でパブリックとプライベートを見分けます。どれがどれか分からない場合は、**VPC
+> コンソール → Subnets** を開き、ご自身の VPC でフィルターして、各サブネットのルート
+> テーブルを確認します（`0.0.0.0/0 → nat-…` のルート = egress を持つプライベート。
+> `→ igw-…` = パブリック）— 明確な Name タグの規約（`…-private-a` / `…-public-a`）が
+> あれば、以降はドロップダウンが一目で分かります。
+
+> [!IMPORTANT]
+> 上記で **A**（Cognito）を選んだ場合は、step 3 で `EnableCognitoAuth=true`、
+> `CognitoDomainPrefix`、**および `CognitoAdminEmail`** を併せて設定してください（その後
+> step 4〜5 はそのまま進めます）。続いて
+> [DNS を ALB に向ける](#dns-を-alb-に向ける--オプション-カスタムドメインのみ)
+> （カスタムドメインの場合のみ）と
+> [運用者ユーザーの作成](#運用者ユーザーの作成-cognito--cognito-を有効にした場合のみ)
+> （サインインと追加ユーザーの作成）を参照してください。`CognitoAdminEmail` は任意では
+> ありません — ユーザープールにセルフサインアップがないため、これなしで Cognito を有効に
+> するとログイン手段のないアプリになり、テンプレートが拒否します。`AppDomainName` は
+> 任意で、空のままにすると ALB 自身の DNS 名を使用します。
 
 **4. Configure stack options。** デフォルトで問題ありません。必要ならタグを追加します。→ **Next**。
 
@@ -299,16 +272,14 @@ internet-facing ALB で `AllowedIngressCidr` をデフォルトの `10.0.0.0/8` 
    Conversion → Data Migration → Validation → Cut over）です。読み込まれれば
    デプロイは完了です。**Connect** でソース DB の認証情報を入力して開始します。
 
+> [!NOTE]
 > **▶ 次: 最初の移行を実行する。** デプロイはここで終わりです — UI が起動しています。
 > 各ステップが何をするか、実際の移行をどう進めるかは、
 > [**ユーザーマニュアル**](../docs/manual/ja/README.md) に従ってください（[セットアップ](../docs/manual/ja/01-setup.md)
 > → Connect から開始）。
 
-**Prod プロファイル**の場合は、step 3 で追加で `EnableCognitoAuth=true`、
-`CognitoDomainPrefix`、**および `CognitoAdminEmail`** を設定してください（その後 **DNS を ALB に向ける** ・ **Cognito** セクションを実施）。
-`CognitoAdminEmail` は任意ではありません — ユーザープールにセルフサインアップがないため、これなしで
-Cognito を有効にするとログイン手段のないアプリになり、テンプレートが拒否します。`AppDomainName` は
-任意で、空のままにすると ALB 自身の DNS 名を使用します。
+<details>
+<summary><b>代替 — AWS CLI でデプロイ</b></summary>
 
 #### AWS CLI
 
@@ -318,17 +289,22 @@ Cognito を有効にするとログイン手段のないアプリになり、テ
 ```bash
 # --- あなたの環境 (ここを編集) -----------------------------------------------
 export AWS_REGION=us-east-1
-export VPC_ID=vpc-xxxxxxxx                               # 推奨: ソース DB の VPC
-export ALB_SUBNET_IDS=subnet-aaaaaaa,subnet-bbbbbbb      # サブネット 2 つ、異なる AZ
-export SERVICE_SUBNET_IDS=subnet-ccccccc,subnet-ddddddd  # プライベートサブネット 2 つ
+# VpcId: 推奨 -- ソース DB の VPC
+export VPC_ID=vpc-0a1b2c3d4e5f6a7b8
+# AlbSubnetIds: サブネット 2 つ、異なる AZ
+export ALB_SUBNET_IDS=subnet-0f1e2d3c4b5a69788,subnet-0a9b8c7d6e5f43210
+# ServiceSubnetIds: プライベートサブネット 2 つ
+export SERVICE_SUBNET_IDS=subnet-0123456789abcdef0,subnet-0fedcba987654321f
 # CertificateArn: 下に実際の ACM 証明書 ARN を貼り付けるか、自己署名テスト証明書
 # (ドメイン不要) をスクリプト出力の 1 行キャプチャで自動入力する:
 #   export CERTIFICATE_ARN=$(deploy/create_test_cert.sh | sed -n 's/^CertificateArn=//p')
-export CERTIFICATE_ARN=arn:aws:acm:us-east-1:<account>:certificate/xxxx
-export DSQL_CLUSTER_ARN=arn:aws:dsql:us-east-1:<account>:cluster/xxxx
-export SOURCE_DB_SG=sg-source
+export CERTIFICATE_ARN=arn:aws:acm:us-east-1:123456789012:certificate/a1b2c3d4-e5f6-47a8-9b0c-1d2e3f4a5b6c
+export DSQL_CLUSTER_ARN=arn:aws:dsql:us-east-1:123456789012:cluster/f0a1b2c3d4e5f6a7b8c9d0e1f2
+export SOURCE_DB_SG=sg-0a1b2c3d4e5f6a7b8
 # -----------------------------------------------------------------------------
+```
 
+> [!WARNING]
 > **スタック名は小文字で、28 文字以内にしてください。** スタックは ALB を
 > `<スタック名>-alb` として作成し、ALB サービスはこの名前を 32 文字に制限します。
 > これを超えると約 2 分のロールバックの後、`The load balancer name '<スタック名>-alb'
@@ -337,10 +313,24 @@ export SOURCE_DB_SG=sg-source
 > この DNS 名が小文字のときのみ動作します。ALB が OAuth `redirect_uri` のホストを
 > 小文字に変換して送信する一方、Cognito は 2 つの文字列を厳密に比較するためです。
 
+このテンプレートは CloudFormation のインライン アップロード上限(51,200 バイト)を超えて
+いるため、CLI がステージング用の S3 バケットを必要とします(Console はこれを裏側で
+自動的に処理するため、推奨パスになっています)。一度だけ作成するか、この
+アカウント/リージョンに既存のバケットがあれば再利用してください:
+
+```bash
+export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$AWS_REGION
+aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
+```
+
+```bash
 aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator \
   --region "$AWS_REGION" \
+  --s3-bucket "$TEMPLATE_BUCKET" \
+  --s3-prefix cfn-templates \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
   --parameter-overrides \
     VpcId="$VPC_ID" \
@@ -356,6 +346,7 @@ aws cloudformation deploy \
     # SourceSecretArn=...   # オプション — 既存のソースシークレットを再利用する場合のみ
 ```
 
+> [!TIP]
 > **AI アシスト（推奨）。** `EnableAiAssist=true` + `BedrockRegion` で Schema
 > Conversion と Query Converter の AI DBA を有効にします — オプトインかつ助言専用の
 > 機能で、選択したモデルに対する `bedrock:InvokeModel` のみにスコープされます。
@@ -364,31 +355,38 @@ aws cloudformation deploy \
 > Bedrock エンドポイントへ egress できる必要があります。両方省略すれば AI なしで
 > デプロイされます（決定論的パスは変わりません）。詳細とモデル選択は §8 を参照。
 
-**Prod プロファイル**の場合は次を追加します: `EnableCognitoAuth=true`、
-`CognitoDomainPrefix=...`、`CognitoAdminEmail=...`（この 3 つは常にセットで必要 —
-テンプレートが強制します）。任意で、カスタムドメインなら `AppDomainName=...`、自前イメージなら
-`ContainerImageUri=...`。
+外部アクセス + Cognito ログインを使う場合は、`--parameter-overrides` に
+次を追加してください:
 
-> **テストのショートカット / オーバーライド**
+```bash
+    AlbScheme=internet-facing \
+    AllowedIngressCidr=0.0.0.0/0 \
+    EnableCognitoAuth=true \
+    CognitoDomainPrefix=<一意なprefix> \
+    CognitoAdminEmail=<あなたのメール>
+```
+
+Cognito の 3 つのフィールドは常にセットで必要です — テンプレートが強制します。
+
+> [!TIP]
+> **`--parameter-overrides` に追加できるその他のオーバーライド**
 >
-> - **ACM 証明書 / ドメインなし:** `AWS_REGION=us-east-1 deploy/create_test_cert.sh`
->   が自己署名証明書をインポートします。その `CertificateArn` を使用します（ブラウザは警告します。テスト専用）。
-> - **NAT ゲートウェイなし:** `AssignPublicIp=ENABLED` を設定し、`ServiceSubnetIds` を
->   パブリックサブネットに配置します（タスクは依然として ALB SG 経由でのみ到達可能）。
 > - **公開 UI（デスクトップから）:** `AlbScheme=internet-facing` **かつ**
 >   `AllowedIngressCidr=<あなたのパブリック IP>/32`（取得方法: `curl https://checkip.amazonaws.com`）。
 >   デフォルトの `10.0.0.0/8` は内部専用で公開ブラウザをブロックします。`0.0.0.0/0` は
 >   決して使用しないでください（完全開放は追加で `EnableCognitoAuth=true` を必要とします）。
-> - **制限されたネットワーク（ECR Public 不可）:** `ContainerImageUri` をご自身の
->   プライベート ECR コピーでオーバーライドします（[pull-through キャッシュ](https://docs.aws.amazon.com/AmazonECR/latest/userguide/pull-through-cache.html)
->   または `deploy/Dockerfile` からビルド。付録を参照）。
-
-よろしければ、まずテンプレートを検証します:
-
-```bash
-aws cloudformation validate-template \
-  --template-body file://deploy/cloudformation.yaml --region "$AWS_REGION"
-```
+> - **カスタムドメイン:** `AppDomainName=<あなたのドメイン>` を追加 —
+>   [DNS を ALB に向ける](#dns-を-alb-に向ける--オプション-カスタムドメインのみ) を参照。
+> - **カスタムイメージ:** `ContainerImageUri` をオーバーライド — 制限されたネットワークなら
+>   ご自身のプライベート ECR コピー（[pull-through キャッシュ](https://docs.aws.amazon.com/AmazonECR/latest/userguide/pull-through-cache.html)
+>   または `deploy/Dockerfile` からビルド。付録を参照）で、それ以外なら管理している
+>   任意のイメージで。
+> - **適用前に変更内容を確認する（本番）:** 上のコマンドに `--no-execute-changeset` を
+>   追加すると、デプロイの代わりに change-set の ARN が出力されます。`aws cloudformation
+>   describe-change-set --change-set-name <その ARN> --region "$AWS_REGION" --query
+>   'Changes[].ResourceChange.[Action,LogicalResourceId,ResourceType,Replacement]'
+>   --output table` で確認し、問題なければ `aws cloudformation execute-change-set
+>   --change-set-name <その ARN> --region "$AWS_REGION"` で適用してください。
 
 完了後、出力を読み取ります:
 
@@ -405,6 +403,17 @@ Migration Tool** の UI が読み込まれます — **Connect** から始まる
 ワークフロー（Connect → Evaluation → Schema Conversion →
 Data Migration → Validation → Cut over）です。UI が表示されればデプロイは
 成功です。**Connect** でソース DB の認証情報を入力して開始します。
+
+</details>
+
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 参考資料と運用
+
+任意の詳細情報 — 必要なものだけ展開してください。初回デプロイに必須ではありません。
+
+<details>
+<summary><b>パラメータリファレンスとタスクのサイジング</b> — すべてのパラメータ、CPU/メモリのサイジング方法</summary>
 
 ### パラメータリファレンス
 
@@ -460,11 +469,17 @@ Fargate では CPU とメモリを**独立に選べません**: CPU 値ごとに
 - **大きな `TEXT`/`BLOB` テーブル、または並列度を上げる場合:** **`4096` CPU / `8192`+ MiB** — 広い行が
   バッチを大きくします。（メモリ 4 GB 超は CPU も上げる必要: 4 GB は CPU ≥ `1024`、8 GB は CPU ≥ `2048`。）
 
+> [!TIP]
 > メモリの引き上げは**再デプロイ**（スタックがタスクをインプレース更新）です — Fargate はタスクの
 > メモリを自動スケールせず、単一タスクのコントロールプレーンなので水平スケールもしません。迷ったら
 > 大きめに: 過剰プロビジョニングはコストがわずかに増えるだけですが、不足すると移行の途中で OOM-kill
 > されます。アプリはメモリの high-water と約 80% の圧迫警告をログ（+アクティビティログ）に残すので、
 > 根拠を見て適切なサイズを決められます。
+
+</details>
+
+<details>
+<summary><b>カスタムドメインと Cognito ログイン</b> — オプション。デフォルトの internal ALB ならスキップ</summary>
 
 ### DNS を ALB に向ける — オプション (カスタムドメインのみ)
 
@@ -514,6 +529,11 @@ aws cognito-idp admin-create-user \
 各ユーザーは一時パスワードを受け取り、（ALB がトリガーする）Cognito hosted UI 経由の
 初回サインイン時に新しいパスワードを設定するよう求められます。ユーザープールは**セルフ
 サインアップが無効**なため、すべてのユーザーをこの方法で作成する必要があります。
+
+</details>
+
+<details>
+<summary><b>検証、更新、AI アシスト</b> — デプロイ後の確認、新イメージのロールアウト、Bedrock の有効化</summary>
 
 ### 検証
 
@@ -569,11 +589,15 @@ docker push "$IMAGE_URI"
 aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator --region "$AWS_REGION" \
+  --s3-bucket "$TEMPLATE_BUCKET" \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides ContainerImageUri=$IMAGE_URI
   # (他のパラメータを再度指定するか、以前の値に依存する)
+  # $TEMPLATE_BUCKET: 上の AWS CLI デプロイのセクションで作成したステージング用バケット
+  # (このテンプレートは CloudFormation のインラインアップロード上限 51,200 バイトを超えています)
 ```
 
+> [!WARNING]
 > コントロールプレーンは**単一タスク**として実行されるため、置き換え中は短い中断が
 > 予想されます。移行済みのデータ、DSQL クラスター、デプロイ済みの cdc-stack は影響を
 > 受けず、再接続時に復旧します。進行中のセッション状態（ワークフローの進捗、進行中の
@@ -608,8 +632,9 @@ aws cloudformation deploy ... \
 | Claude Opus 4.8 | `global.anthropic.claude-opus-4-8` | 高品質。Opus 5 より一段下。 |
 | Claude Sonnet 4.6 | `global.anthropic.claude-sonnet-4-6` | 前世代の Sonnet。 |
 
-`BedrockModelId` はこれらの `us.` クロスリージョン推論プロファイルの**ドロップダウン**
-であり、タスクロールの `bedrock:InvokeModel` スコープはそこから**自動的に導出**されます
+`BedrockModelId` はこれらの `global.` クロスリージョン推論プロファイルの**ドロップダウン**
+であり（すべての商用リージョンから解決できるため、1 つのリストでどのデプロイにも対応します）、
+タスクロールの `bedrock:InvokeModel` スコープはそこから**自動的に導出**されます
 — したがって `BedrockModelArns` は**設定する必要はありません**（別のモデル/ARN で
 オーバーライドする場合にのみ使用）。ただし、選択したモデルについて `BedrockRegion` の
 Bedrock コンソールで**モデルアクセスを有効化する必要は依然としてあります**。
@@ -618,8 +643,14 @@ Bedrock コンソールで**モデルアクセスを有効化する必要は依�
 （NAT または Bedrock VPC エンドポイント）。UI で AI を有効化し、**Verify AI access** の
 事前チェックで到達性を確認してください。
 
+</details>
+
+<details>
+<summary><b>Teardown、トラブルシューティング、セキュリティ</b> — すべて削除、よくある問題、セキュリティに関する注記</summary>
+
 ### Teardown
 
+> [!WARNING]
 > **完全な teardown の順序 (すべてのリソースを削除 / すべてのコストを停止)。** 移行は
 > 最大 3 つのスタックを使用します。何も — そしてコストも — 残らないよう、この順序で
 > 削除してください:
@@ -721,6 +752,7 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 - このスタックはこのリポジトリからデプロイされたことが**ありません** — 本番利用の前に
   対象アカウントで検証してください。
 
+</details>
 
 ---
 
@@ -750,6 +782,7 @@ CDC では Kafka を**インプロセスで**シードするため、Fargate と
 - ❌ それ以外は **[ECS Fargate](#ecs-fargate-にデプロイ)** が適しています — マネージド・ロード
   バランス経路で、パッチすべきホストがありません。
 
+> [!WARNING]
 > **単一ホスト = 単一障害点（SPOF）。** ALB も Auto Scaling も 2 つ目のタスクもありません。状態は
 > インスタンスの再起動 / 置き換え後も保持型 EBS ボリュームで残りますが、コントロールプレーン自体は
 > 1 台です — 能動的に進める移行には適していますが、長期常設の HA サービス用ではありません。
@@ -783,6 +816,7 @@ CDC では Kafka を**インプロセスで**シードするため、Fargate と
 | `EnableAiAssist` / `BedrockModelId` / `BedrockRegion` | いいえ | off / `global.anthropic.claude-sonnet-5` | Fargate と同じ opt-in の Bedrock AI アシスト（IAM スコープはモデルから自動導出）。 |
 | `KeyName` | いいえ | `""` | オプションの SSH キー。SSM が主要なアクセス経路なので通常は空（ホストにはインバウンドルールが一切なし）。 |
 
+> [!WARNING]
 > スタック名は **`mysql-dsql-cdc-` で始めてはいけません**（その接頭辞は CDC デプロイロールのスコープに
 > 入ります）。`mysql-dsql-migrator-ec2` が適切です。
 
@@ -800,10 +834,17 @@ export SOURCE_DB_SG=sg-source
 export HOST_SUBNET_CIDR=$(aws ec2 describe-subnets --subnet-ids "$HOST_SUBNET_ID" \
   --region "$AWS_REGION" --query 'Subnets[0].CidrBlock' --output text)
 
+# このテンプレートは CloudFormation のインラインアップロード上限(51,200 バイト)を超えて
+# いるため、CLI がステージング用の S3 バケットを必要とします。一度だけ作成するか、既存の
+# バケットがあれば再利用してください:
+export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$AWS_REGION
+aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
+
 aws cloudformation deploy \
   --template-file deploy/cloudformation-ec2.yaml \
   --stack-name mysql-dsql-migrator-ec2 \
   --region "$AWS_REGION" \
+  --s3-bucket "$TEMPLATE_BUCKET" \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
   --parameter-overrides \
     VpcId="$VPC_ID" \
@@ -853,7 +894,8 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-ec2 --region "$
 aws cloudformation wait stack-delete-complete --stack-name mysql-dsql-migrator-ec2 --region "$AWS_REGION"
 ```
 
-> ⚠️ 状態 EBS ボリュームは設計上 **`DeletionPolicy: Retain`** のため、**スタック削除後も残ります** —
+> [!WARNING]
+> 状態 EBS ボリュームは設計上 **`DeletionPolicy: Retain`** のため、**スタック削除後も残ります** —
 > 保持したくない場合は手動で削除してください（`aws:cloudformation:stack-name` タグで検索）。CDC を
 > デプロイした場合は、先に cdc-stack を削除してください（UI の **Start over → Delete all CDC
 > infrastructure**、または `aws cloudformation delete-stack`）。
@@ -862,6 +904,7 @@ aws cloudformation wait stack-delete-complete --stack-name mysql-dsql-migrator-e
 
 ## 付録 — 自前のイメージをビルドする (制限されたネットワークのみ)
 
+> [!NOTE]
 > **ほとんどのデプロイはこのセクションをスキップします。** イメージは ECR Public に
 > 公開されており、CloudFormation がデフォルトでそれを取得するため、何もビルドしません。
 > ネットワークが ECR Public に到達できない場合にのみ、自前のイメージをビルドしてください
@@ -907,5 +950,6 @@ CodeBuild はマネージドな（特権付きの）環境で Docker を実行�
 AWS CLI だけがあれば済みます。イメージは `linux/amd64` 向けにビルドされ、同じ ECR
 リポジトリにプッシュされます。
 
+> [!TIP]
 > デプロイの再現性のため、リリースごとにイミュータブルなタグ（またはイメージダイジェスト）
 > を使用してください。

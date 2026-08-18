@@ -81,27 +81,41 @@ for a real migration use **[ECS Fargate](#deploy-on-ecs-fargate)**.
 > **Recommended for production — real, large-scale migrations.** The whole data path
 > stays inside AWS (source → Fargate → DSQL), not your laptop.
 
-No image build needed — the image is on **ECR Public** and CloudFormation pulls
-it. Two ways to deploy the same `deploy/cloudformation.yaml`:
+Two ways to deploy, no image build needed — the image is on **ECR Public** and
+CloudFormation pulls it. Deploy the same `deploy/cloudformation.yaml` via:
 
-- **AWS Console — RECOMMENDED.** Upload the template; a guided form collects the
-  values for you. See [Deploy the app-stack](#deploy-the-app-stack).
-- **AWS CLI.** One `aws cloudformation deploy` command with parameter overrides.
-  Also in [Deploy the app-stack](#deploy-the-app-stack).
+- **AWS Console — recommended.** Upload the template; a guided form collects the values.
+- **AWS CLI.** One `aws cloudformation deploy` with parameter overrides.
 
-First gather the values both paths need ([Prerequisites](#prerequisites) has the
-details). **Start with the VPC** (recommended: the one your source DB lives in) —
-then pick its ALB + task **subnets from that VPC** (in the Console they appear in a
-dropdown once you choose the VpcId). Plus an **ACM certificate**, the **DSQL cluster
-ARN**, and a **Secrets Manager secret ARN** for the source DB. Defaults handle the
-rest (published image, `internal` ALB, Cognito off).
+Both are detailed in [Deploy the app-stack](#2-deploy-the-app-stack) — gather the values
+first in [Prerequisites](#1-prerequisites).
 
-**Reaching the UI (internal ALB).** The ALB is internal by default, so browse
-`https://<LoadBalancerDns>/` from **inside the VPC** — VPN / Direct Connect / SSM
-port-forward. No public endpoint by design (Well-Architected SEC05-BP02). To
-expose it publicly, see the override note under **Deploy the app-stack**.
+**Reaching the UI.** The ALB is `internal` by default, so browse
+`https://<LoadBalancerDns>/` from inside the VPC — over VPN, Direct Connect, or an SSM
+port-forward. There is no public endpoint by design — Well-Architected SEC05-BP02. To
+expose it publicly, see the override note under [Deploy the app-stack](#2-deploy-the-app-stack).
 
-### Prerequisites
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 1. Prerequisites
+
+What to gather, then go straight to [Deploy the app-stack](#2-deploy-the-app-stack).
+Full descriptions are in the collapsible below and in [Parameter reference](#parameter-reference).
+
+| What | Parameter | Notes |
+| --- | --- | --- |
+| Access | — | AWS Console (recommended) or AWS CLI v2, able to create IAM roles, ECS, an ALB, security groups, and CloudWatch Logs. No image build — it's pulled from ECR Public. |
+| A VPC | `VpcId` | Ideally your source MySQL's VPC, **same region as DSQL**. The subnets below are picked from it. |
+| Two ALB + two task subnets | `AlbSubnetIds` / `ServiceSubnetIds` | Distinct AZs; task subnets need **egress on 443**. |
+| An ACM certificate | `CertificateArn` | Same region. No domain? Run `AWS_REGION=<region> deploy/create_test_cert.sh` for a self-signed test cert. |
+| The DSQL cluster ARN | `DsqlClusterArn` | The migration target. |
+| Source-DB reachability | `SourceDbSecurityGroupId` (preferred) or `SourceDbCidr` | One of the two. |
+
+Source-DB credentials go in the UI **after** deploy (no AWS secret unless you reuse one);
+every other parameter keeps a sensible default.
+
+<details>
+<summary><b>Full parameter details</b> — VPC / subnet / certificate guidance, plus every optional value</summary>
 
 #### Access
 
@@ -112,35 +126,16 @@ expose it publicly, see the override note under **Deploy the app-stack**.
 - No image build needed — the image is pulled from ECR Public. (Building your own
   is only for a restricted network; see the Appendix.)
 
-#### Required values
+#### Good to know before you fill the form
 
-> 🔑 **Start with the VPC — everything else follows from it.** Use the **VPC your
-> source RDS/Aurora MySQL already lives in**: same-VPC is the simplest and
-> recommended choice (the tool reaches the source privately and you only open the
-> source security group to the task). It **must be in the same region** as the DSQL
-> target. **The two subnet fields below are picked _from this VPC_** — in the AWS
-> Console they appear as a dropdown of that VPC's subnets once you choose the
-> VpcId, so you select rather than type them. (A peered VPC / Transit Gateway /
-> Direct Connect / VPN also works if routing + SGs let the task reach the source.)
-
-| Required | Parameter | What it is |
-| --- | --- | --- |
-| **VPC** | `VpcId` | The VPC above — recommended: the source DB's VPC, same region as DSQL. **Must be owned by this account:** RAM-shared (cross-account) VPCs/subnets are not supported, because the CDC deploy role's EC2 permissions are scoped to resources in the deploying account, so the connector's ENI create would fail with `AccessDenied`. |
-| **ALB subnets** | `AlbSubnetIds` | 2 subnets **of that VPC**, distinct AZs — private for an `internal` ALB (recommended), public for internet-facing. |
-| **Task subnets** | `ServiceSubnetIds` | 2 private subnets **of that VPC**, distinct AZs, with **egress on 443** (NAT gateway or VPC endpoints) to reach DSQL / Secrets Manager / ECR / CloudWatch. |
-| **ACM certificate** | `CertificateArn` | The **ARN** of an ACM certificate in the **same region** (`arn:aws:acm:<region>:<account>:certificate/<id>`) for the HTTPS listener. **Prod:** request a public ACM cert for a domain you own. **Quick test (no domain):** run `AWS_REGION=<region> deploy/create_test_cert.sh` and paste the `CertificateArn` it prints (self-signed; browsers warn). Copy an existing ARN from the ACM console. |
-| **DSQL cluster ARN** | `DsqlClusterArn` | The target Aurora DSQL cluster. |
-
-> **Source credentials** are entered in the UI **after** deploy (Connect step) —
-> typically a **username/password** (the common case for RDS/Aurora MySQL), held in
-> memory, no AWS secret needed. So `SourceSecretArn` is **optional** (next table):
-> set it only to reuse an existing Secrets Manager secret.
-
-> **Why these few are required (not just the VPC).** The subnets and certificate
-> are required by AWS itself — an ALB and a Fargate task must be placed in subnets,
-> and an HTTPS listener must have a certificate; CloudFormation can't auto-pick
-> them from the VPC alone. The DSQL cluster ARN is the migration's **target**. The
-> rest have defaults (next table).
+> [!IMPORTANT]
+> **Start with the VPC.** Use the one your source RDS/Aurora MySQL already lives
+> in — same region as DSQL — and the subnets/certificate you pick from it are
+> required by AWS itself (an ALB and a Fargate task must sit in subnets; an HTTPS
+> listener must have a certificate). **The VPC must be owned by this account** —
+> a RAM-shared (cross-account) VPC is not supported, because the CDC deploy role's
+> EC2 permissions are scoped to the deploying account, so the connector's ENI
+> create would fail with `AccessDenied`.
 
 #### Optional values (sensible defaults otherwise)
 
@@ -153,55 +148,21 @@ expose it publicly, see the override note under **Deploy the app-stack**.
 | **AI assist** | `EnableAiAssist`, `BedrockModelId`, `BedrockRegion` | Only to enable Amazon Bedrock-assisted conversion (pick a model; IAM scope auto-derived). |
 | **Custom image / sizing** | `ContainerImageUri`, `ContainerCpu`, `ContainerMemory` | Only for a private-ECR image or non-default task size. |
 
-### Deploy the app-stack
+</details>
+
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 2. Deploy the app-stack
 
 Two ways to deploy `deploy/cloudformation.yaml` — pick one. Both produce the same
 stack; see **Parameter reference** below.
 
 #### Recommended — AWS Console (guided form)
 
-**At a glance** — upload the template, fill 5 fields, create, open the URL
-(~5 min of clicks + ~3–5 min for the stack to come up):
-
-1. **CloudFormation → Create stack → With new resources (standard).** Check the
-   Region (top-right) matches your Aurora DSQL cluster.
-2. **Upload a template file** → pick `deploy/cloudformation.yaml` → **Next**.
-3. **Stack name** `mysql-dsql-migrator`, then fill the **5 fields that have no
-   default** — `VpcId`, `AlbSubnetIds` (2 subnets, 2 AZs), `ServiceSubnetIds`
-   (2 private subnets, 2 AZs), `CertificateArn`, `DsqlClusterArn` — **plus one of
-   `SourceDbSecurityGroupId` (preferred) or `SourceDbCidr`**, which the template
-   enforces on every deploy: with both empty the task has no route to the source
-   MySQL and the connection times out. Leave everything else at its default →
-   **Next**.
-4. **Next** (stack options) → tick the **IAM-capabilities acknowledgement** →
-   **Create stack**.
-5. Wait for **CREATE_COMPLETE** → open the **Outputs** tab → copy **`AppUrl`** →
-   browse it from inside the VPC. Done.
-
-<!-- Screenshot slot: capture the CloudFormation "Create stack → Upload a template
-     file" screen, save it as deploy/images/cfn-create-stack.png, then uncomment:
 ![CloudFormation — Create stack → Upload a template file](images/cfn-create-stack.png)
--->
-> 📸 *A screenshot of the "Create stack → Upload a template file" screen belongs
-> here (see the placeholder in the source).*
-
-The field-by-field details, subnet-picking tips, the no-domain cert command, and
-public-access options follow below.
 
 First confirm you're in the **right region** (top-right of the console — the same
 region as your Aurora DSQL cluster), then:
-
-> **Before you start — have a `CertificateArn` ready.** The console can't generate
-> the HTTPS cert for you. If you don't already have an ACM cert for a domain you
-> own, run `AWS_REGION=<region> deploy/create_test_cert.sh` in a terminal first and
-> keep the `arn:aws:acm:…` it prints to paste at step 3 (self-signed TEST cert —
-> browsers warn; for prod, use a real ACM cert for your domain).
->
-> **Reaching it from your desktop? Get your public IP too.** If you'll set
-> `AlbScheme=internet-facing`, grab your IP now with
-> `curl https://checkip.amazonaws.com` and enter `AllowedIngressCidr=<that-ip>/32`
-> at step 3 so only you can reach the ALB. The default `10.0.0.0/8` is for an
-> internal ALB (reached from inside the VPC/VPN) and will block a public browser.
 
 **1. Open the Create stack wizard.** Go to the CloudFormation console:
 <https://console.aws.amazon.com/cloudformation/home> → **Create stack** →
@@ -213,9 +174,8 @@ region as your Aurora DSQL cluster), then:
 select `deploy/cloudformation.yaml` from this repo → **Next**.
 
 **3. Specify stack details.** Set the **Stack name** to `mysql-dsql-migrator`,
-then fill the parameters. The form is grouped (Network / Migration endpoints /
-TLS & access / Authentication / Container image & sizing / AI) with native
-pickers, so you **select from your account** instead of typing ids.
+then fill the parameters. The form uses native pickers, so you **select from
+your account** instead of typing ids.
 
 **Fill these required fields** (everything else has a working default):
 
@@ -226,17 +186,20 @@ pickers, so you **select from your account** instead of typing ids.
 | `ServiceSubnetIds` | Subnet multi-select — **2 private subnets in distinct AZs** (or reuse the ALB subnets + set `AssignPublicIp=ENABLED` if you have no private/NAT subnets). |
 | `CertificateArn` | ACM cert ARN for HTTPS — **no domain? see the command just below.** |
 | `DsqlClusterArn` | The target Aurora DSQL cluster ARN. |
+| `SourceDbSecurityGroupId` (or `SourceDbCidr`) | One of the two — scopes the task's egress to the source MySQL. Prefer the security-group id; use the CIDR only if you have none. |
 
-> ⚠️ The subnet dropdowns list **every subnet in the region**, not just your
+> [!WARNING]
+> The subnet dropdowns list **every subnet in the region**, not just your
 > VpcId's. Picking one from another VPC fails the deploy — choose the right ones
 > using the **"Which subnets to pick"** callout below.
 
-**Recommended:** set `SourceDbSecurityGroupId` (or `SourceDbCidr`) so the task can
-reach the source. Leave `SourceSecretArn` empty unless reusing an existing source
+**Optional:** leave `SourceSecretArn` empty unless reusing an existing source
 secret — you'll enter the source host/username/password in the UI after deploy.
 
-**No ACM certificate yet?** Generate a self-signed **test** cert in one line, then
-paste the ARN it prints into `CertificateArn` (browsers warn; test only):
+> [!TIP]
+> **No ACM certificate yet?** Generate a self-signed **test** cert in one line, then
+> paste the ARN it prints into `CertificateArn` (browsers warn; test only — for prod,
+> request a real ACM cert for a domain you own instead):
 
 ```bash
 AWS_REGION=<region> deploy/create_test_cert.sh
@@ -244,8 +207,19 @@ AWS_REGION=<region> deploy/create_test_cert.sh
 ```
 
 **Reaching the UI from your desktop browser?** The default is an `internal` ALB
-(reachable only from inside the VPC/VPN). To open it from your own machine, set
-these three together:
+(reachable only from inside the VPC/VPN). Two ways to open it from your own
+machine — pick A or B:
+
+**A. Recommended — sign in via Cognito** (works from anywhere, any number of users):
+
+| Field | What to enter |
+| --- | --- |
+| `AlbScheme` | `internet-facing` |
+| `AlbSubnetIds` | **public** subnets (not private) |
+| `EnableCognitoAuth` | `true` — plus `CognitoDomainPrefix` and `CognitoAdminEmail` (see the note below) |
+| `AllowedIngressCidr` | `0.0.0.0/0` is fine — the Cognito login is the access gate; narrow it further only if you also know your users' network CIDR |
+
+**B. Alternative — just your machine, no login:**
 
 | Field | What to enter |
 | --- | --- |
@@ -253,33 +227,34 @@ these three together:
 | `AlbSubnetIds` | **public** subnets (not private) |
 | `AllowedIngressCidr` | your desktop public IP as `/32` — get it with `curl https://checkip.amazonaws.com` (e.g. `203.0.113.5/32`) |
 
-Leaving `AllowedIngressCidr` at its `10.0.0.0/8` default with an internet-facing
-ALB blocks your browser; `0.0.0.0/0` (whole internet) additionally requires
-`EnableCognitoAuth=true`.
-
-Leave everything else at its default (published image, `internal` ALB, Cognito
-off). In particular **keep `HttpsEgressCidr` at `0.0.0.0/0`** — it's the task's
+Leave the remaining parameters at their defaults (e.g. the container image).
+In particular **keep `HttpsEgressCidr` at `0.0.0.0/0`** — it's the task's
 outbound CIDR for reaching AWS APIs (DSQL, Secrets Manager, ECR, CloudWatch) via
 NAT/IGW; only tighten it if you front all of those with VPC endpoints (PrivateLink),
 otherwise the task can't pull its image or reach DSQL and fails to start. → **Next**.
 
+> [!TIP]
 > **Which subnets to pick.** The dropdown lists **every subnet in the region**
-> (across all your VPCs), shown as `subnet-id | CIDR | Availability Zone | Name
-> tag`. **First narrow to your VpcId's subnets by their CIDR range** (e.g. a VPC
-> on `172.31.0.0/16` → pick the `172.31.x` subnets; ignore other CIDRs which belong
-> to other VPCs). Then use the **AZ column** to satisfy "distinct AZs" and the
-> **Name tag** to tell public from private. Pick by this table (the stack can't
-> pre-flag them — AWS fills the dropdown from your account):
->
-> | Field | Recommended subnets |
-> | --- | --- |
-> | `AlbSubnetIds` | **2 subnets in 2 different AZs.** For the default `internal` ALB use **private** subnets; for `internet-facing` use **public** ones. |
-> | `ServiceSubnetIds` | **2 private subnets in 2 different AZs**, each with outbound 443 (a NAT gateway route, or VPC endpoints) so the task can reach DSQL / Secrets Manager / ECR. |
->
-> Not sure which is which? Open the **VPC console → Subnets**, filter by your VPC,
-> and check each subnet's AZ and route table (a `0.0.0.0/0 → nat-…` route = private
-> with egress; `→ igw-…` = public). A clear Name-tag convention
-> (e.g. `…-private-a` / `…-public-a`) makes the dropdown self-explanatory.
+> (across all your VPCs). **First narrow to your VpcId's subnets by their CIDR
+> range** (e.g. a VPC on `172.31.0.0/16` → pick the `172.31.x` subnets; ignore
+> other CIDRs, which belong to other VPCs), then use the **AZ column** for
+> "distinct AZs" and the **Name tag** for public vs. private. Not sure which is
+> which? Open the **VPC console → Subnets**, filter by your VPC, and check each
+> subnet's route table (`0.0.0.0/0 → nat-…` = private with egress; `→ igw-…` =
+> public) — a clear Name-tag convention (`…-private-a` / `…-public-a`) makes the
+> dropdown self-explanatory going forward.
+
+> [!IMPORTANT]
+> If you picked **Option A** (Cognito) above, set `EnableCognitoAuth=true`,
+> `CognitoDomainPrefix`, **and `CognitoAdminEmail`** together in step 3 (then
+> continue through steps 4–5 as usual). Afterward, see
+> [Point DNS at the ALB](#point-dns-at-the-alb--optional-custom-domain-only)
+> (custom domain only) and
+> [Create operator users](#create-operator-users-cognito--only-with-cognito) (sign
+> in and add more Cognito users). `CognitoAdminEmail` is not optional here — the
+> template rejects Cognito without it, because the user pool has no self sign-up
+> and you would get an app with no way in. `AppDomainName` stays optional: leave
+> it empty to use the ALB's own DNS name.
 
 **4. Configure stack options.** Defaults are fine. Optionally add tags. → **Next**.
 
@@ -298,16 +273,14 @@ otherwise the task can't pull its image or reach DSQL and fails to start. → **
    Conversion → Data Migration → Validation → Cut over). If it loads, the
    deployment is done; enter your source DB credentials at **Connect** to begin.
 
+> [!NOTE]
 > **▶ Next: run your first migration.** Deployment ends here — the UI is up. For
 > what each step does and how to drive an actual migration, follow the
 > [**User Manual**](../docs/manual/en/README.md) (start at
 > [Set up](../docs/manual/en/01-setup.md) → Connect).
 
-For a **Prod profile**, additionally set `EnableCognitoAuth=true`,
-`CognitoDomainPrefix`, **and `CognitoAdminEmail`** in step 3 (then do sections 4–5).
-`CognitoAdminEmail` is not optional here — the template rejects Cognito without it,
-because the user pool has no self sign-up and you would get an app with no way in.
-`AppDomainName` stays optional: leave it empty to use the ALB's own DNS name.
+<details>
+<summary><b>Alternative — deploy with the AWS CLI</b></summary>
 
 #### AWS CLI
 
@@ -317,17 +290,22 @@ every customer. The minimal (Dev/Test) deploy:
 ```bash
 # --- Your environment (edit these) -------------------------------------------
 export AWS_REGION=us-east-1
-export VPC_ID=vpc-xxxxxxxx                               # recommended: the source DB's VPC
-export ALB_SUBNET_IDS=subnet-aaaaaaa,subnet-bbbbbbb      # 2 subnets, distinct AZs
-export SERVICE_SUBNET_IDS=subnet-ccccccc,subnet-ddddddd  # 2 private subnets
+# VpcId: recommended -- the source DB's VPC
+export VPC_ID=vpc-0a1b2c3d4e5f6a7b8
+# AlbSubnetIds: 2 subnets, distinct AZs
+export ALB_SUBNET_IDS=subnet-0f1e2d3c4b5a69788,subnet-0a9b8c7d6e5f43210
+# ServiceSubnetIds: 2 private subnets
+export SERVICE_SUBNET_IDS=subnet-0123456789abcdef0,subnet-0fedcba987654321f
 # CertificateArn: paste a real ACM cert ARN below, OR auto-fill a self-signed TEST
 # cert (no domain needed) by capturing the script's output in one line instead:
 #   export CERTIFICATE_ARN=$(deploy/create_test_cert.sh | sed -n 's/^CertificateArn=//p')
-export CERTIFICATE_ARN=arn:aws:acm:us-east-1:<account>:certificate/xxxx
-export DSQL_CLUSTER_ARN=arn:aws:dsql:us-east-1:<account>:cluster/xxxx
-export SOURCE_DB_SG=sg-source
+export CERTIFICATE_ARN=arn:aws:acm:us-east-1:123456789012:certificate/a1b2c3d4-e5f6-47a8-9b0c-1d2e3f4a5b6c
+export DSQL_CLUSTER_ARN=arn:aws:dsql:us-east-1:123456789012:cluster/f0a1b2c3d4e5f6a7b8c9d0e1f2
+export SOURCE_DB_SG=sg-0a1b2c3d4e5f6a7b8
 # -----------------------------------------------------------------------------
+```
 
+> [!WARNING]
 > **Stack name: use lower case, 28 characters or fewer.** The stack provisions its
 > ALB as `<stack-name>-alb`, which the ALB service caps at 32 characters — a longer
 > stack name fails the deploy, after a ~2 minute rollback, with
@@ -337,10 +315,24 @@ export SOURCE_DB_SG=sg-source
 > it) only works when that DNS name is lower case, because the ALB sends the OAuth
 > `redirect_uri` with the host lower-cased and Cognito compares the two exactly.
 
+This template exceeds CloudFormation's 51,200-byte inline-upload limit, so the CLI
+needs an S3 bucket to stage it (the Console handles this invisibly — one reason
+it's the recommended path). Create one once, or reuse a bucket you already have
+in this account/region:
+
+```bash
+export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$AWS_REGION
+aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
+```
+
+```bash
 aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator \
   --region "$AWS_REGION" \
+  --s3-bucket "$TEMPLATE_BUCKET" \
+  --s3-prefix cfn-templates \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
   --parameter-overrides \
     VpcId="$VPC_ID" \
@@ -356,6 +348,7 @@ aws cloudformation deploy \
     # SourceSecretArn=...   # optional — only to reuse an existing source secret
 ```
 
+> [!TIP]
 > **AI assist (recommended).** `EnableAiAssist=true` + `BedrockRegion` turns on the
 > AI DBA for Schema Conversion and the Query Converter — an opt-in, advisory-only
 > feature scoped to `bedrock:InvokeModel` for the selected model. You **must still
@@ -364,31 +357,38 @@ aws cloudformation deploy \
 > task needs egress to the Bedrock endpoint. Omit both to deploy without AI (the
 > deterministic path is unchanged). Full details + model choices in §8.
 
-For a **Prod profile**, add: `EnableCognitoAuth=true`, `CognitoDomainPrefix=...`,
-`CognitoAdminEmail=...` (all three are required together — the template enforces it),
-plus optionally `AppDomainName=...` for a custom domain and `ContainerImageUri=...`
-for your own image.
+For external access with Cognito sign-in, add these to
+`--parameter-overrides`:
 
-> **Test shortcuts / overrides**
+```bash
+    AlbScheme=internet-facing \
+    AllowedIngressCidr=0.0.0.0/0 \
+    EnableCognitoAuth=true \
+    CognitoDomainPrefix=<your-unique-prefix> \
+    CognitoAdminEmail=<your-email>
+```
+
+All three Cognito fields are required together — the template enforces it.
+
+> [!TIP]
+> **Other overrides for `--parameter-overrides`**
 >
-> - **No ACM cert / domain:** `AWS_REGION=us-east-1 deploy/create_test_cert.sh`
->   imports a self-signed cert; use its `CertificateArn` (browsers warn; test only).
-> - **No NAT gateway:** set `AssignPublicIp=ENABLED` and put `ServiceSubnetIds` in
->   public subnets (the task is still only reachable via the ALB SG).
 > - **Public UI (from your desktop):** `AlbScheme=internet-facing` **and**
 >   `AllowedIngressCidr=<your-public-ip>/32` (get it: `curl https://checkip.amazonaws.com`).
 >   The default `10.0.0.0/8` is internal-only and blocks public browsers; never use
 >   `0.0.0.0/0` (fully-open additionally requires `EnableCognitoAuth=true`).
-> - **Restricted network (no ECR Public):** override `ContainerImageUri` with your
->   own private ECR copy ([pull-through cache](https://docs.aws.amazon.com/AmazonECR/latest/userguide/pull-through-cache.html)
->   or build from `deploy/Dockerfile`, see the Appendix).
-
-Validate the template first if you like:
-
-```bash
-aws cloudformation validate-template \
-  --template-body file://deploy/cloudformation.yaml --region "$AWS_REGION"
-```
+> - **Custom domain:** add `AppDomainName=<your-domain>` — see
+>   [Point DNS at the ALB](#point-dns-at-the-alb--optional-custom-domain-only).
+> - **Custom image:** override `ContainerImageUri` — your own private ECR copy
+>   ([pull-through cache](https://docs.aws.amazon.com/AmazonECR/latest/userguide/pull-through-cache.html)
+>   or build from `deploy/Dockerfile`, see the Appendix) for a restricted network, or
+>   any other image you maintain.
+> - **Review changes before applying (production):** add `--no-execute-changeset`
+>   to the command above; it prints a change-set ARN instead of deploying. Inspect
+>   it with `aws cloudformation describe-change-set --change-set-name <the ARN>
+>   --region "$AWS_REGION" --query 'Changes[].ResourceChange.[Action,LogicalResourceId,ResourceType,Replacement]' --output table`,
+>   then apply it with `aws cloudformation execute-change-set --change-set-name
+>   <the ARN> --region "$AWS_REGION"` once it looks right.
 
 Read the outputs after it completes:
 
@@ -405,6 +405,17 @@ Migration Tool** UI loads — the guided workflow starting at **Connect** (Conne
 → Evaluation → Schema Conversion → Data Migration → Validation → Cut
 over). Seeing the UI means the deployment succeeded; enter your source DB
 credentials at **Connect** to begin.
+
+</details>
+
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### Reference and operations
+
+Optional deep-dives — expand what you need; none of this is required for a first deploy.
+
+<details>
+<summary><b>Parameter reference and task sizing</b> — every parameter, plus how to size CPU / memory</summary>
 
 ### Parameter reference
 
@@ -463,11 +474,17 @@ shutdown). Pick a valid pair:
   `8192`+ MiB** — wide rows enlarge each buffered batch. (To go above 4 GB memory you
   must also raise CPU: 4 GB needs CPU ≥ `1024`, 8 GB needs CPU ≥ `2048`.)
 
+> [!TIP]
 > Memory to raise it is a **redeploy** (the stack updates the task in place) — Fargate
 > does not auto-scale a task's memory, and this single-task control plane does not scale
 > horizontally. If unsure, size up: an over-provisioned task only costs a little more,
 > an under-provisioned one OOM-kills mid-migration. The app logs a memory high-water and
 > an ~80% pressure warning (also on the activity log) so you can right-size from evidence.
+
+</details>
+
+<details>
+<summary><b>Custom domain and Cognito login</b> — optional; skip with the default internal ALB</summary>
 
 ### Point DNS at the ALB — optional (custom domain only)
 
@@ -516,6 +533,11 @@ aws cognito-idp admin-create-user \
 Each user receives a temporary password and is prompted to set a new one on first
 sign-in via the Cognito hosted UI (triggered by the ALB). The pool has **self sign-up
 disabled**, so every user must be created this way.
+
+</details>
+
+<details>
+<summary><b>Verify, update, and AI assist</b> — post-deploy checks, new-image rollout, enabling Bedrock</summary>
 
 ### Verify
 
@@ -571,11 +593,15 @@ docker push "$IMAGE_URI"
 aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator --region "$AWS_REGION" \
+  --s3-bucket "$TEMPLATE_BUCKET" \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides ContainerImageUri=$IMAGE_URI
   # (re-supply the other parameters, or rely on previous values)
+  # $TEMPLATE_BUCKET: the staging bucket from the AWS CLI deploy section above
+  # (the template exceeds CloudFormation's 51,200-byte inline-upload limit)
 ```
 
+> [!WARNING]
 > The control plane runs as a **single task**, so expect a brief interruption
 > during replacement. Your migrated data, the DSQL cluster, and a deployed
 > cdc-stack are unaffected and recovered on reconnect. In-flight session state
@@ -621,8 +647,14 @@ Ensure task egress can reach the Bedrock runtime endpoint (NAT or a Bedrock VPC
 endpoint). Enable AI in the UI; use the **Verify AI access** preflight to
 confirm reachability.
 
+</details>
+
+<details>
+<summary><b>Teardown, troubleshooting, and security</b> — remove everything, common issues, security notes</summary>
+
 ### Teardown
 
+> [!WARNING]
 > **Complete teardown order (remove ALL resources / stop ALL cost).** The
 > migration uses up to three stacks; remove them in this order so nothing — and no
 > cost — is left behind:
@@ -727,6 +759,7 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 - This stack has **not** been deployed from this repository — validate it in
   your target account before production use.
 
+</details>
 
 ---
 
@@ -756,6 +789,7 @@ negative / resilience checks, and the temporary "run my local copy" S3 flow) is
 - ❌ Otherwise prefer **[ECS Fargate](#deploy-on-ecs-fargate)**: it's the managed,
   load-balanced path with no host to patch.
 
+> [!WARNING]
 > **Single host = single point of failure.** There is no ALB, no Auto Scaling, no
 > second task. State survives an instance reboot / replacement on the retained EBS
 > volume, but the control plane itself is one box — fine for a migration you actively
@@ -791,6 +825,7 @@ negative / resilience checks, and the temporary "run my local copy" S3 flow) is
 | `EnableAiAssist` / `BedrockModelId` / `BedrockRegion` | no | off / `global.anthropic.claude-sonnet-5` | Same opt-in Bedrock AI assist as Fargate (IAM scope auto-derived from the model). |
 | `KeyName` | no | `""` | Optional SSH key; SSM is the primary access path, so usually left empty (the host has no inbound rule at all). |
 
+> [!WARNING]
 > The stack name **must not start with `mysql-dsql-cdc-`** (that prefix falls inside
 > the CDC deploy role's scope). `mysql-dsql-migrator-ec2` is a good choice.
 
@@ -808,10 +843,17 @@ export SOURCE_DB_SG=sg-source
 export HOST_SUBNET_CIDR=$(aws ec2 describe-subnets --subnet-ids "$HOST_SUBNET_ID" \
   --region "$AWS_REGION" --query 'Subnets[0].CidrBlock' --output text)
 
+# This template exceeds CloudFormation's 51,200-byte inline-upload limit, so the
+# CLI needs an S3 bucket to stage it. Create one once, or reuse a bucket you
+# already have in this account/region:
+export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$AWS_REGION
+aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
+
 aws cloudformation deploy \
   --template-file deploy/cloudformation-ec2.yaml \
   --stack-name mysql-dsql-migrator-ec2 \
   --region "$AWS_REGION" \
+  --s3-bucket "$TEMPLATE_BUCKET" \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
   --parameter-overrides \
     VpcId="$VPC_ID" \
@@ -862,7 +904,8 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-ec2 --region "$
 aws cloudformation wait stack-delete-complete --stack-name mysql-dsql-migrator-ec2 --region "$AWS_REGION"
 ```
 
-> ⚠️ The state EBS volume has **`DeletionPolicy: Retain`** by design, so it **survives
+> [!WARNING]
+> The state EBS volume has **`DeletionPolicy: Retain`** by design, so it **survives
 > stack deletion** — delete it manually if you don't want to keep it (find it by the
 > `aws:cloudformation:stack-name` tag). If you deployed CDC, remove the cdc-stack first
 > (from the UI's **Start over → Delete all CDC infrastructure**, or
@@ -872,6 +915,7 @@ aws cloudformation wait stack-delete-complete --stack-name mysql-dsql-migrator-e
 
 ## Appendix — Build your own image (restricted network only)
 
+> [!NOTE]
 > **Most deployments skip this section.** The image is published to ECR Public and
 > CloudFormation pulls it by default — you build nothing. Build your own image only
 > if your network can't reach ECR Public (then pass the result as
@@ -916,5 +960,6 @@ CodeBuild runs Docker in its managed (privileged) environment, so your machine
 only needs the AWS CLI. The image is built for `linux/amd64` and pushed to the
 same ECR repository.
 
+> [!TIP]
 > Use an immutable tag (or an image digest) per release so deployments are
 > reproducible.

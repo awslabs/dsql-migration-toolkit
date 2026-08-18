@@ -74,27 +74,41 @@ AWS 자격증명이 있어야 합니다. 인프라 없음 — 평가 / 소규모
 > **프로덕션 — 실제·대규모 마이그레이션에 권장.** 데이터 경로 전체가 내 노트북이 아니라 AWS
 > 안에 머뭅니다(소스 → Fargate → DSQL).
 
-이미지는 따로 빌드하지 않아도 됩니다 — **ECR Public**에 올라가 있어 CloudFormation이 알아서
-가져옵니다. 같은 `deploy/cloudformation.yaml`을 배포하는 방법은 두 가지입니다:
+이미지 빌드 없이 두 가지 방법으로 배포합니다 — 이미지는 **ECR Public**에 있고 CloudFormation이
+가져옵니다. 같은 `deploy/cloudformation.yaml`을 이렇게 배포하세요:
 
-- **AWS Console — 권장.** 템플릿을 업로드하면 안내형 폼이 필요한 값을 하나씩 물어봅니다.
-  [app-stack 배포](#app-stack-배포)를 참고하세요.
-- **AWS CLI.** `aws cloudformation deploy` 명령 하나로 파라미터를 넘깁니다. 이 방법도
-  [app-stack 배포](#app-stack-배포)에 있습니다.
+- **AWS Console — 권장.** 템플릿을 업로드하면 안내형 폼이 값을 모아줍니다.
+- **AWS CLI.** `aws cloudformation deploy` 한 번으로 파라미터를 넘깁니다.
 
-어느 쪽이든 먼저 필요한 값을 준비하세요(자세한 내용은 [사전 요구사항](#사전-요구사항)).
-**VPC부터 정하는 게 좋습니다**(권장: 소스 DB가 있는 VPC). VPC를 정하면 ALB·태스크
-**서브넷은 그 안에서 고르면 됩니다**(콘솔에서는 VpcId를 선택하면 해당 VPC의 서브넷이 드롭다운으로
-나옵니다). 그 밖에 필요한 것은 **ACM 인증서**와 **DSQL 클러스터 ARN**입니다. 소스 DB 자격증명은
-배포 후 UI(Connect 단계)에서 입력하므로(보통 id/password) 별도의 시크릿은 필요 없습니다. 나머지는
-기본값이 알아서 처리합니다(게시된 이미지, `internal` ALB, Cognito 비활성화).
+둘 다 [app-stack 배포](#2-app-stack-배포)에 자세히 있고 — 필요한 값은 먼저
+[사전 요구사항](#1-사전-요구사항)에서 모으세요.
 
-**UI 접근 (internal ALB).** 기본이 `internal`이라 공용 엔드포인트가 없습니다(SEC05-BP02).
-그래서 `https://<LoadBalancerDns>/`는 **VPC 안에서** 열어야 합니다 — VPN / Direct Connect /
-SSM 포트 포워딩을 이용하세요. 외부에 공개하려면 **app-stack 배포** 섹션의 오버라이드 노트를
-참고하세요.
+**UI 접근.** 기본이 `internal` ALB라 `https://<LoadBalancerDns>/`는 VPC 안에서 — VPN,
+Direct Connect, 또는 SSM 포트 포워딩으로 — 열어야 합니다. 설계상 공용 엔드포인트가 없습니다 —
+Well-Architected SEC05-BP02. 외부에 공개하려면 [app-stack 배포](#2-app-stack-배포)의 오버라이드
+노트를 참고하세요.
 
-### 사전 요구사항
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 1. 사전 요구사항
+
+무엇을 모을지, 그다음 곧바로 [app-stack 배포](#2-app-stack-배포)로 가세요. 자세한 설명은 아래
+접이식과 [파라미터 레퍼런스](#파라미터-레퍼런스)에 있습니다.
+
+| 무엇 | 파라미터 | 설명 |
+| --- | --- | --- |
+| 접근 | — | AWS Console(권장) 또는 AWS CLI v2 — IAM 역할, ECS, ALB, 보안 그룹, CloudWatch Logs를 생성할 수 있어야 함. 이미지 빌드 불필요 — ECR Public에서 가져옵니다. |
+| VPC | `VpcId` | 소스 MySQL의 VPC가 이상적, **DSQL과 같은 리전**. 아래 서브넷은 여기서 고릅니다. |
+| ALB 서브넷 2개 + 태스크 서브넷 2개 | `AlbSubnetIds` / `ServiceSubnetIds` | 서로 다른 AZ; 태스크 서브넷은 **443 egress** 필요. |
+| ACM 인증서 | `CertificateArn` | 같은 리전. 도메인이 없나요? `AWS_REGION=<region> deploy/create_test_cert.sh`로 self-signed 테스트 인증서를 만드세요. |
+| DSQL 클러스터 ARN | `DsqlClusterArn` | 마이그레이션 타깃. |
+| 소스 DB 도달성 | `SourceDbSecurityGroupId`(권장) 또는 `SourceDbCidr` | 둘 중 하나. |
+
+소스 DB 자격증명은 배포 **후** UI에서 입력합니다(재사용할 게 아니면 AWS 시크릿 불필요); 그 외
+파라미터는 모두 합리적 기본값을 유지합니다.
+
+<details>
+<summary><b>전체 파라미터 상세</b> — VPC / 서브넷 / 인증서 안내, 그리고 모든 옵션 값</summary>
 
 #### 접근
 
@@ -104,30 +118,14 @@ SSM 포트 포워딩을 이용하세요. 외부에 공개하려면 **app-stack �
   Cognito(옵션 — 공개 ALB일 때만).
 - 이미지 빌드 불필요 — 이미지는 ECR Public에서 가져온다. (자체 빌드는 제한된 네트워크 전용; 부록 참고.)
 
-#### 필수 값
+#### 폼을 채우기 전에 알아둘 것
 
-> 🔑 **VPC부터 정하세요 — 나머지는 거기서 따라옵니다.** **소스 RDS/Aurora MySQL이 이미 있는 VPC**를
-> 쓰는 게 가장 단순하고 권장됩니다(도구가 소스에 프라이빗하게 도달하고, 소스 보안 그룹을 태스크에만
-> 열면 됨). DSQL 타깃과 **같은 리전**이어야 합니다. **아래 두 서브넷 필드는 _이 VPC 안에서_ 고릅니다**
-> — 콘솔에서는 VpcId를 고르면 해당 VPC의 서브넷이 드롭다운으로 나와 타이핑 없이 선택합니다. (피어링된
-> VPC / Transit Gateway / Direct Connect / VPN도, 라우팅·SG가 태스크를 소스에 닿게 하면 동작.)
-
-| 필수 | 파라미터 | 설명 |
-| --- | --- | --- |
-| **VPC** | `VpcId` | 위 VPC — 권장: 소스 DB의 VPC, DSQL과 같은 리전. |
-| **ALB 서브넷** | `AlbSubnetIds` | **그 VPC의** 서브넷 2개, 다른 AZ — `internal` ALB(권장)면 프라이빗, internet-facing이면 퍼블릭. |
-| **태스크 서브넷** | `ServiceSubnetIds` | **그 VPC의** 프라이빗 서브넷 2개, 다른 AZ, **443 egress**(NAT 게이트웨이 또는 VPC 엔드포인트)로 DSQL / Secrets Manager / ECR / CloudWatch 도달. |
-| **ACM 인증서** | `CertificateArn` | HTTPS 리스너용 **같은 리전** ACM 인증서의 **ARN**(`arn:aws:acm:<region>:<account>:certificate/<id>`). **운영:** 보유한 도메인으로 ACM 퍼블릭 인증서를 발급해 그 ARN 사용. **빠른 테스트(도메인 없음):** `AWS_REGION=<region> deploy/create_test_cert.sh` 실행 후 출력된 `CertificateArn`을 붙여넣기(self-signed; 브라우저 경고). 기존 인증서는 ACM 콘솔에서 ARN 복사. |
-| **DSQL 클러스터 ARN** | `DsqlClusterArn` | 타깃 Aurora DSQL 클러스터. |
-
-> **소스 자격증명**은 배포 **후** UI(Connect 단계)에서 입력합니다 — RDS/Aurora MySQL은 보통
-> **id/password** 방식이며, 메모리에만 보관하고 AWS 시크릿이 필요 없습니다. 그래서
-> `SourceSecretArn`은 **옵션**입니다(아래 표): 기존 Secrets Manager 시크릿을 **재사용**할 때만 설정하세요.
-
-> **왜 VPC 외에 이것들이 필수인가.** 서브넷과 인증서는 **AWS 자체 요구사항**입니다 — ALB와 Fargate
-> 태스크는 반드시 서브넷에 배치돼야 하고 HTTPS 리스너는 인증서가 있어야 하며, CloudFormation이 VPC만
-> 보고 자동 선택하지 못합니다. DSQL 클러스터 ARN은 마이그레이션의 **타깃**입니다. 그 외는 모두
-> 기본값이 있습니다(아래 표).
+> [!IMPORTANT]
+> **VPC부터 정하세요.** 소스 RDS/Aurora MySQL이 이미 있는 VPC를 사용하세요 — DSQL과 같은 리전 —
+> 그리고 여기서 고르는 서브넷/인증서는 AWS 자체 요구사항입니다(ALB와 Fargate 태스크는 서브넷에
+> 배치돼야 하고, HTTPS 리스너는 인증서가 있어야 함). **이 VPC는 이 계정 소유여야 합니다** —
+> RAM 공유(계정 간) VPC는 지원되지 않습니다. CDC 배포 역할의 EC2 권한이 배포하는 계정으로
+> 범위 제한돼 있어, 커넥터의 ENI 생성이 `AccessDenied`로 실패하기 때문입니다.
 
 #### 옵션 값 (없으면 합리적 기본값 사용)
 
@@ -140,45 +138,20 @@ SSM 포트 포워딩을 이용하세요. 외부에 공개하려면 **app-stack �
 | **AI 보조** | `EnableAiAssist`, `BedrockModelId`, `BedrockRegion` | Amazon Bedrock 보조 변환을 켤 때만(모델 선택; IAM 스코프 자동 도출). |
 | **커스텀 이미지 / 사이징** | `ContainerImageUri`, `ContainerCpu`, `ContainerMemory` | 프라이빗 ECR 이미지나 기본 외 태스크 크기일 때만. |
 
-### app-stack 배포
+</details>
+
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 2. app-stack 배포
 
 `deploy/cloudformation.yaml`을 배포하는 두 방법 — 하나를 고른다. 둘 다 같은 스택을 만든다.
 파라미터 설명은 **파라미터 레퍼런스** 참고.
 
 #### 권장 — AWS Console (안내형 폼)
 
-**한눈에** — 템플릿 업로드, 5개 필드 입력, 생성, URL 열기 (클릭 ~5분 + 스택 기동 ~3–5분):
-
-1. **CloudFormation → Create stack → With new resources (standard).** 우측 상단 리전이
-   Aurora DSQL 클러스터와 같은지 확인.
-2. **Upload a template file** → `deploy/cloudformation.yaml` 선택 → **Next**.
-3. **Stack name** `mysql-dsql-migrator` 입력 후 **기본값이 없는 5개 필드**를 채웁니다 —
-   `VpcId`, `AlbSubnetIds`(서브넷 2개, AZ 2개), `ServiceSubnetIds`(프라이빗 서브넷 2개, AZ 2개),
-   `CertificateArn`, `DsqlClusterArn` — **그리고 `SourceDbSecurityGroupId`(권장) 또는
-   `SourceDbCidr` 중 하나**. 후자는 템플릿이 모든 배포에서 강제합니다: 둘 다 비면 태스크가
-   소스 MySQL로 나갈 경로가 없어 연결이 타임아웃됩니다. 나머지는 기본값 그대로 → **Next**.
-4. **Next**(스택 옵션) → **IAM 권한 확인 체크** → **Create stack**.
-5. **CREATE_COMPLETE** 대기 → **Outputs** 탭 → **`AppUrl`** 복사 → VPC 내부에서 접속. 끝.
-
-<!-- 스크린샷 자리: CloudFormation "Create stack → Upload a template file" 화면을 캡처해
-     deploy/images/cfn-create-stack.png 로 저장한 뒤 주석 해제:
 ![CloudFormation — Create stack → Upload a template file](images/cfn-create-stack.png)
--->
-> 📸 *"Create stack → Upload a template file" 화면 스크린샷이 여기 들어갑니다(소스의 자리 표시 참고).*
-
-필드별 상세, 서브넷 고르는 팁, 도메인 없을 때의 인증서 명령, 퍼블릭 접근 옵션은 아래에 이어집니다.
 
 먼저 콘솔 우측 상단에서 **올바른 리전**(Aurora DSQL 클러스터와 같은 리전)인지 확인한 뒤:
-
-> **시작 전 준비 — `CertificateArn`을 미리 마련.** 콘솔은 HTTPS 인증서를 대신 만들어 주지 못합니다.
-> 보유 도메인의 ACM 인증서가 없다면, 터미널에서 `AWS_REGION=<region> deploy/create_test_cert.sh`를
-> 먼저 실행하고 출력된 `arn:aws:acm:…`을 step 3에서 붙여넣을 수 있게 보관하세요(self-signed 테스트
-> 인증서 — 브라우저 경고; 운영은 보유 도메인의 실제 ACM 인증서 사용).
->
-> **내 데스크톱에서 접속하나요? 공인 IP도 미리 준비.** `AlbScheme=internet-facing`으로 열 거라면,
-> 지금 `curl https://checkip.amazonaws.com`로 공인 IP를 확인해 step 3에서
-> `AllowedIngressCidr=<그 IP>/32`로 입력하세요(나만 ALB에 접근 가능). 기본값 `10.0.0.0/8`은 내부
-> ALB용(VPC/VPN 내부에서 접근)이라 외부 브라우저는 차단됩니다.
 
 **1. Create stack 마법사 열기.** CloudFormation 콘솔로 이동:
 <https://console.aws.amazon.com/cloudformation/home> → **Create stack** →
@@ -190,9 +163,8 @@ template**에서 **Upload a template file** → **Choose file** → 이 저장�
 `deploy/cloudformation.yaml` 선택 → **Next**.
 
 **3. Specify stack details.** **Stack name**을 `mysql-dsql-migrator`로 지정한 뒤
-파라미터를 채웁니다. 폼은 구획별로 묶여 있고(Network / Migration endpoints / TLS & access /
-Authentication / Container image & sizing / AI), 네이티브 선택기라 ID를 타이핑하지 않고
-**계정에서 골라** 입력합니다.
+파라미터를 채웁니다. 폼은 네이티브 선택기라 ID를 타이핑하지 않고 **계정에서 골라**
+입력합니다.
 
 **아래 필수 필드를 채웁니다**(나머지는 기본값으로 동작):
 
@@ -203,16 +175,19 @@ Authentication / Container image & sizing / AI), 네이티브 선택기라 ID를
 | `ServiceSubnetIds` | 서브넷 멀티선택 — **서로 다른 AZ의 프라이빗 2개**(프라이빗/NAT 서브넷이 없으면 ALB 서브넷을 그대로 쓰고 `AssignPublicIp=ENABLED` 설정). |
 | `CertificateArn` | HTTPS용 ACM 인증서 ARN — **도메인이 없으면 바로 아래 명령 참고.** |
 | `DsqlClusterArn` | 타깃 Aurora DSQL 클러스터 ARN. |
+| `SourceDbSecurityGroupId`(또는 `SourceDbCidr`) | 둘 중 하나 — 태스크의 소스 MySQL egress 범위를 지정. 보안 그룹 id를 우선하고, 없을 때만 CIDR 사용. |
 
-> ⚠️ 서브넷 드롭다운은 내 VpcId 것만이 아니라 **리전의 모든 서브넷**을 보여줍니다. 다른 VPC의 서브넷을
+> [!WARNING]
+> 서브넷 드롭다운은 내 VpcId 것만이 아니라 **리전의 모든 서브넷**을 보여줍니다. 다른 VPC의 서브넷을
 > 고르면 배포가 실패하니, 아래 **"어떤 서브넷을 고를까"** 박스를 보고 올바른 것을 선택하세요.
 
-**권장:** `SourceDbSecurityGroupId`(또는 `SourceDbCidr`)를 설정해 태스크가 소스에 도달하게 합니다.
-`SourceSecretArn`은 기존 소스 시크릿을 재사용할 때만 입력 — 보통은 비워두고 배포 후 UI에서 소스
-host/id/password를 입력합니다.
+**선택:** `SourceSecretArn`은 기존 소스 시크릿을 재사용할 때만 입력 — 보통은 비워두고 배포 후
+UI에서 소스 host/id/password를 입력합니다.
 
-**ACM 인증서가 아직 없나요?** 한 줄로 self-signed **테스트** 인증서를 만들고, 출력된 ARN을
-`CertificateArn`에 붙여넣으면 됩니다(브라우저 경고; 테스트 전용):
+> [!TIP]
+> **ACM 인증서가 아직 없나요?** 한 줄로 self-signed **테스트** 인증서를 만들고, 출력된 ARN을
+> `CertificateArn`에 붙여넣으면 됩니다(브라우저 경고; 테스트 전용 — 운영에서는 보유 도메인의
+> 실제 ACM 인증서를 발급받아 쓰세요):
 
 ```bash
 AWS_REGION=<region> deploy/create_test_cert.sh
@@ -220,7 +195,18 @@ AWS_REGION=<region> deploy/create_test_cert.sh
 ```
 
 **내 데스크톱 브라우저에서 UI에 접속하나요?** 기본값은 `internal` ALB(VPC/VPN 내부에서만 접근)입니다.
-내 PC에서 열려면 아래 세 가지를 함께 설정하세요:
+내 PC에서 열려면 아래 A 또는 B 중 하나를 선택하세요:
+
+**A. 권장 — Cognito 로그인으로 접속**(어디서든, 여러 명이 접속 가능):
+
+| 필드 | 입력값 |
+| --- | --- |
+| `AlbScheme` | `internet-facing` |
+| `AlbSubnetIds` | **퍼블릭** 서브넷(프라이빗 아님) |
+| `EnableCognitoAuth` | `true` — 그리고 `CognitoDomainPrefix`, `CognitoAdminEmail`(아래 노트 참고) |
+| `AllowedIngressCidr` | `0.0.0.0/0`이면 충분합니다 — Cognito 로그인이 접근 게이트 역할을 합니다. 사용자들의 네트워크 CIDR을 안다면 그걸로 더 좁혀도 됩니다 |
+
+**B. 대안 — 내 기기 하나만, 로그인 없이:**
 
 | 필드 | 입력값 |
 | --- | --- |
@@ -228,29 +214,28 @@ AWS_REGION=<region> deploy/create_test_cert.sh
 | `AlbSubnetIds` | **퍼블릭** 서브넷(프라이빗 아님) |
 | `AllowedIngressCidr` | 내 데스크톱 공인 IP를 `/32`로 — `curl https://checkip.amazonaws.com`로 확인(예: `203.0.113.5/32`) |
 
-internet-facing ALB인데 `AllowedIngressCidr`를 기본값 `10.0.0.0/8`로 두면 브라우저가 차단됩니다.
-`0.0.0.0/0`(전체 인터넷)은 추가로 `EnableCognitoAuth=true`가 필요합니다.
-
-나머지는 기본값 유지(게시 이미지, `internal` ALB, Cognito off). 특히 **`HttpsEgressCidr`는
+나머지 파라미터는 기본값 유지(예: 컨테이너 이미지). 특히 **`HttpsEgressCidr`는
 `0.0.0.0/0` 그대로 두세요** — 태스크가 NAT/IGW로 AWS API(DSQL·Secrets Manager·ECR·CloudWatch)에
 나가는 아웃바운드 CIDR입니다. 이 서비스들을 전부 VPC 엔드포인트(PrivateLink)로 둘 때만 좁히고,
 그렇지 않은데 좁히면 이미지 pull/DSQL이 막혀 태스크가 기동 실패합니다. → **Next**.
 
+> [!TIP]
 > **어떤 서브넷을 고를까.** 드롭다운은 (내 VpcId 것만이 아니라) **리전의 모든 서브넷**을
-> `subnet-id | CIDR | 가용영역(AZ) | Name 태그`로 보여줍니다. **먼저 CIDR 대역으로 내 VpcId의
-> 서브넷으로 좁히세요**(예: VPC가 `172.31.0.0/16`이면 → `172.31.x` 서브넷만 고르고, 다른 CIDR은 다른
-> VPC 것이니 무시). 그다음 **AZ 컬럼**으로 "다른 AZ 2개"를 맞추고, **Name 태그**로 public/private을
-> 구분하세요. 아래 표 기준으로 고릅니다(스택이 미리 flag해 줄 수는 없습니다 — 드롭다운은 AWS가 계정에서
-> 채움):
->
-> | 필드 | 추천 서브넷 |
-> | --- | --- |
-> | `AlbSubnetIds` | **서로 다른 2개 AZ의 서브넷 2개.** 기본 `internal` ALB면 **프라이빗**, `internet-facing`이면 **퍼블릭**. |
-> | `ServiceSubnetIds` | **서로 다른 2개 AZ의 프라이빗 서브넷 2개**, 각각 아웃바운드 443(NAT 게이트웨이 라우트 또는 VPC 엔드포인트)이 있어 태스크가 DSQL / Secrets Manager / ECR에 도달. |
->
-> 어느 게 어느 건지 모르겠다면 **VPC 콘솔 → Subnets**에서 내 VPC로 필터하고 각 서브넷의 AZ와 라우트
-> 테이블을 확인하세요(`0.0.0.0/0 → nat-…` 라우트 = egress 있는 프라이빗; `→ igw-…` = 퍼블릭). Name
-> 태그 규칙(예: `…-private-a` / `…-public-a`)을 두면 드롭다운이 한눈에 구분됩니다.
+> 보여줍니다. **먼저 CIDR 대역으로 내 VpcId의 서브넷으로 좁히세요**(예: VPC가 `172.31.0.0/16`이면
+> → `172.31.x` 서브넷만 고르고, 다른 CIDR은 다른 VPC 것이니 무시), 그다음 **AZ 컬럼**으로 "다른 AZ
+> 2개"를 맞추고 **Name 태그**로 public/private을 구분하세요. 어느 게 어느 건지 모르겠다면 **VPC
+> 콘솔 → Subnets**에서 내 VPC로 필터하고 각 서브넷의 라우트 테이블을 확인하세요(`0.0.0.0/0 →
+> nat-…` = egress 있는 프라이빗; `→ igw-…` = 퍼블릭) — Name 태그 규칙(예: `…-private-a` /
+> `…-public-a`)을 두면 이후로는 드롭다운이 한눈에 구분됩니다.
+
+> [!IMPORTANT]
+> 위에서 **A**(Cognito)를 선택했다면 3단계 폼에서 `EnableCognitoAuth=true`, `CognitoDomainPrefix`,
+> **그리고 `CognitoAdminEmail`**을 함께 설정하세요(이후 4~5단계는 그대로 진행). 그다음
+> [DNS를 ALB로 지정](#dns를-alb로-지정--optional-커스텀-도메인만)(커스텀 도메인일 때만)과
+> [운영자 사용자 만들기](#운영자-사용자-만들기-cognito--cognito를-켰을-때만)(로그인 및
+> 추가 사용자 생성)을 참고하세요. `CognitoAdminEmail`은 선택이 아닙니다 — 유저풀에 self
+> sign-up이 없어 이 값 없이 Cognito를 켜면 로그인할 방법이 없는 앱이 되므로 템플릿이
+> 거부합니다. `AppDomainName`은 선택이며, 비워 두면 ALB 자체 DNS 이름을 씁니다.
 
 **4. Configure stack options.** 기본값으로 충분. 필요하면 태그 추가. → **Next**.
 
@@ -267,15 +252,13 @@ internet-facing ALB인데 `AllowedIngressCidr`를 기본값 `10.0.0.0/8`로 두�
    Validation → Cut over). UI가 보이면 배포 완료이며, **Connect**에서 소스 DB 자격증명을
    입력해 시작합니다.
 
+> [!NOTE]
 > **▶ 다음: 첫 마이그레이션.** 배포는 여기서 끝 — UI가 떴습니다. 각 단계가 무엇을 하고
 > 실제 마이그레이션을 어떻게 진행하는지는 [**사용자 매뉴얼**](../docs/manual/ko/README.md)을
 > 따라가세요([설정](../docs/manual/ko/01-setup.md) → Connect에서 시작).
 
-**Prod 프로파일**은 3단계 폼에서 `EnableCognitoAuth=true`, `CognitoDomainPrefix`,
-**그리고 `CognitoAdminEmail`**을 추가 설정(이후 **DNS 지정** · **Cognito 사용자** 섹션 진행).
-`CognitoAdminEmail`은 선택이 아닙니다 — 유저풀에 self sign-up이 없어 이 값 없이 Cognito를 켜면
-로그인할 방법이 없는 앱이 되므로 템플릿이 거부합니다. `AppDomainName`은 선택이며, 비워 두면
-ALB 자체 DNS 이름을 씁니다.
+<details>
+<summary><b>대안 — AWS CLI로 배포</b></summary>
 
 #### AWS CLI
 
@@ -284,17 +267,22 @@ ALB 자체 DNS 이름을 씁니다.
 ```bash
 # --- 내 환경 (여기만 수정) ----------------------------------------------------
 export AWS_REGION=us-east-1
-export VPC_ID=vpc-xxxxxxxx                               # 권장: 소스 DB의 VPC
-export ALB_SUBNET_IDS=subnet-aaaaaaa,subnet-bbbbbbb      # 서브넷 2개, 다른 AZ
-export SERVICE_SUBNET_IDS=subnet-ccccccc,subnet-ddddddd  # 프라이빗 서브넷 2개
+# VpcId: 권장 -- 소스 DB의 VPC
+export VPC_ID=vpc-0a1b2c3d4e5f6a7b8
+# AlbSubnetIds: 서브넷 2개, 다른 AZ
+export ALB_SUBNET_IDS=subnet-0f1e2d3c4b5a69788,subnet-0a9b8c7d6e5f43210
+# ServiceSubnetIds: 프라이빗 서브넷 2개
+export SERVICE_SUBNET_IDS=subnet-0123456789abcdef0,subnet-0fedcba987654321f
 # CertificateArn: 아래에 실제 ACM 인증서 ARN을 붙여넣거나, 도메인 없이 self-signed 테스트
 # 인증서로 자동 채우려면 스크립트 출력을 한 줄로 캡처:
 #   export CERTIFICATE_ARN=$(deploy/create_test_cert.sh | sed -n 's/^CertificateArn=//p')
-export CERTIFICATE_ARN=arn:aws:acm:us-east-1:<account>:certificate/xxxx
-export DSQL_CLUSTER_ARN=arn:aws:dsql:us-east-1:<account>:cluster/xxxx
-export SOURCE_DB_SG=sg-source
+export CERTIFICATE_ARN=arn:aws:acm:us-east-1:123456789012:certificate/a1b2c3d4-e5f6-47a8-9b0c-1d2e3f4a5b6c
+export DSQL_CLUSTER_ARN=arn:aws:dsql:us-east-1:123456789012:cluster/f0a1b2c3d4e5f6a7b8c9d0e1f2
+export SOURCE_DB_SG=sg-0a1b2c3d4e5f6a7b8
 # -----------------------------------------------------------------------------
+```
 
+> [!WARNING]
 > **스택 이름은 소문자로, 28자 이내로 지정하십시오.** 스택은 ALB를 `<스택이름>-alb`로
 > 만들고 ALB 서비스는 이 이름을 32자로 제한합니다. 더 길면 약 2분간 롤백한 뒤
 > `The load balancer name '<스택이름>-alb' cannot be longer than '32' characters`로
@@ -303,10 +291,23 @@ export SOURCE_DB_SG=sg-source
 > `redirect_uri`의 호스트를 소문자로 변환해 보내는데 Cognito는 두 문자열을 정확히
 > 비교하기 때문입니다.
 
+이 템플릿은 CloudFormation의 인라인 업로드 한도(51,200바이트)를 초과해서, CLI가 이를 스테이징할
+S3 버킷이 필요합니다(콘솔은 이 문제를 자동으로 처리하므로 권장 경로인 이유이기도 합니다). 한 번만
+만들거나, 이 계정/리전에 이미 있는 버킷을 재사용하세요:
+
+```bash
+export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$AWS_REGION
+aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
+```
+
+```bash
 aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator \
   --region "$AWS_REGION" \
+  --s3-bucket "$TEMPLATE_BUCKET" \
+  --s3-prefix cfn-templates \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
   --parameter-overrides \
     VpcId="$VPC_ID" \
@@ -322,6 +323,7 @@ aws cloudformation deploy \
     # SourceSecretArn=...   # 옵션 — 기존 소스 시크릿을 재사용할 때만
 ```
 
+> [!TIP]
 > **AI 어시스트(권장).** `EnableAiAssist=true` + `BedrockRegion`으로 Schema
 > Conversion과 Query Converter의 AI DBA를 켭니다 — 옵트인·자문 전용 기능이며,
 > 선택한 모델에 대한 `bedrock:InvokeModel`로만 범위가 제한됩니다. `BedrockModelId`
@@ -330,29 +332,34 @@ aws cloudformation deploy \
 > 둘 다 생략하면 AI 없이 배포됩니다(결정론적 경로는 그대로). 자세한 내용·모델 선택은
 > §8을 보세요.
 
-**Prod 프로파일**은 추가: `EnableCognitoAuth=true`, `CognitoDomainPrefix=...`,
-`CognitoAdminEmail=...` (셋은 항상 함께 필요 — 템플릿이 강제합니다). 선택적으로 커스텀
-도메인이면 `AppDomainName=...`, 자체 이미지면 `ContainerImageUri=...`.
+외부 접속 + Cognito 로그인을 쓰려면 `--parameter-overrides`에 다음을 추가하세요:
 
-> **테스트 지름길 / 오버라이드**
+```bash
+    AlbScheme=internet-facing \
+    AllowedIngressCidr=0.0.0.0/0 \
+    EnableCognitoAuth=true \
+    CognitoDomainPrefix=<고유-prefix> \
+    CognitoAdminEmail=<이메일>
+```
+
+Cognito 필드 3개는 항상 함께 필요합니다 — 템플릿이 강제합니다.
+
+> [!TIP]
+> **`--parameter-overrides`에 추가할 수 있는 다른 오버라이드**
 >
-> - **ACM 인증서/도메인 없음:** `AWS_REGION=us-east-1 deploy/create_test_cert.sh`가 자체 서명
->   인증서를 import; 그 `CertificateArn` 사용(브라우저 경고; 테스트 전용).
-> - **NAT 없음:** `AssignPublicIp=ENABLED` + `ServiceSubnetIds`를 퍼블릭 서브넷에(태스크는 여전히 ALB SG로만 접근).
 > - **공개 UI(내 데스크톱에서 접속):** `AlbScheme=internet-facing` **및**
 >   `AllowedIngressCidr=<내 공인 IP>/32`(확인: `curl https://checkip.amazonaws.com`). 기본값
 >   `10.0.0.0/8`은 내부 전용이라 외부 브라우저를 차단; `0.0.0.0/0`(완전 개방)은 금물(추가로
 >   `EnableCognitoAuth=true` 필요).
-> - **제한된 네트워크(ECR Public 불가):** `ContainerImageUri`를 자체 프라이빗 ECR 사본으로 오버라이드
+> - **커스텀 도메인:** `AppDomainName=<내 도메인>`을 추가 — [DNS를 ALB로 지정](#dns를-alb로-지정--optional-커스텀-도메인만) 참고.
+> - **커스텀 이미지:** `ContainerImageUri`를 오버라이드 — 제한된 네트워크라면 자체 프라이빗 ECR 사본
 >   ([pull-through 캐시](https://docs.aws.amazon.com/AmazonECR/latest/userguide/pull-through-cache.html)
->   또는 `deploy/Dockerfile`에서 빌드, 부록 참고).
-
-원하면 먼저 템플릿을 검증:
-
-```bash
-aws cloudformation validate-template \
-  --template-body file://deploy/cloudformation.yaml --region "$AWS_REGION"
-```
+>   또는 `deploy/Dockerfile`에서 빌드, 부록 참고)으로, 그 외에는 직접 관리하는 다른 이미지로.
+> - **적용 전 변경사항 검토(운영):** 위 명령에 `--no-execute-changeset`을 추가하면 배포 대신
+>   change-set ARN을 출력합니다. `aws cloudformation describe-change-set --change-set-name <그 ARN>
+>   --region "$AWS_REGION" --query 'Changes[].ResourceChange.[Action,LogicalResourceId,ResourceType,Replacement]' --output table`로
+>   검토한 뒤, 문제없으면 `aws cloudformation execute-change-set --change-set-name <그 ARN>
+>   --region "$AWS_REGION"`으로 적용하세요.
 
 완료 후 출력 읽기:
 
@@ -368,6 +375,17 @@ aws cloudformation describe-stacks --stack-name mysql-dsql-migrator \
 UI가 뜹니다 — **Connect**로 시작하는 안내형 워크플로(Connect → Evaluation →
 Schema Conversion → Data Migration → Validation → Cut over). UI가 보이면 배포 성공이며,
 **Connect**에서 소스 DB 자격증명을 입력해 시작합니다.
+
+</details>
+
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
+### 참고 및 운영
+
+선택적 심화 자료 — 필요한 것만 펼쳐보세요; 첫 배포엔 필수가 아닙니다.
+
+<details>
+<summary><b>파라미터 레퍼런스와 태스크 사이징</b> — 모든 파라미터, CPU/메모리 사이징 방법</summary>
 
 ### 파라미터 레퍼런스
 
@@ -423,10 +441,16 @@ Fargate는 CPU와 메모리를 **독립적으로 못 고릅니다**: CPU 값마�
 - **큰 `TEXT`/`BLOB` 테이블이나 병렬도 상향 시:** **`4096` CPU / `8192`+ MiB** — 넓은 행이 배치를
   키움. (메모리 4 GB 초과는 CPU도 올려야: 4 GB는 CPU ≥ `1024`, 8 GB는 CPU ≥ `2048`.)
 
+> [!TIP]
 > 메모리 상향은 **재배포**(스택이 태스크를 in-place 업데이트) — Fargate는 태스크 메모리를 자동
 > 스케일하지 않고, 단일 태스크 컨트롤 플레인이라 수평 스케일도 안 됨. 확신이 없으면 넉넉히: 과다
 > 프로비저닝은 비용이 조금 더 들 뿐이지만, 부족하면 마이그레이션 도중 OOM-kill됩니다. 앱이 메모리
 > high-water와 ~80% 압박 경고를 로그(+활동 로그)에 남기므로 근거를 보고 적정 크기를 잡을 수 있음.
+
+</details>
+
+<details>
+<summary><b>커스텀 도메인과 Cognito 로그인</b> — 선택 사항; 기본 internal ALB면 건너뛰기</summary>
 
 ### DNS를 ALB로 지정 — Optional (커스텀 도메인만)
 
@@ -472,6 +496,11 @@ aws cognito-idp admin-create-user \
 각 사용자는 임시 비밀번호를 받고, ALB가 트리거하는 Cognito hosted UI를 통해 첫 로그인 시 새 비밀번호를
 설정하라는 안내를 받습니다. 유저풀은 **self sign-up이 비활성**이므로 모든 사용자를 이 방식으로 만들어야
 합니다.
+
+</details>
+
+<details>
+<summary><b>검증, 업데이트, AI 보조</b> — 배포 후 점검, 새 이미지 롤아웃, Bedrock 활성화</summary>
 
 ### 검증
 
@@ -520,11 +549,15 @@ docker push "$IMAGE_URI"
 aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator --region "$AWS_REGION" \
+  --s3-bucket "$TEMPLATE_BUCKET" \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides ContainerImageUri=$IMAGE_URI
   # (나머지 파라미터를 다시 제공하거나 이전 값에 의존)
+  # $TEMPLATE_BUCKET: 위 AWS CLI 배포 섹션에서 만든 스테이징 버킷
+  # (이 템플릿은 CloudFormation 인라인 업로드 한도 51,200바이트를 초과합니다)
 ```
 
+> [!WARNING]
 > 컨트롤 플레인은 **단일 태스크**로 실행되므로 교체 중 짧은 중단이 있습니다. 마이그레이션된 데이터,
 > DSQL 클러스터, 배포된 cdc-stack은 영향받지 않고 재연결 시 자동 복구됩니다. 진행 중 세션 상태
 > (워크플로 진행, 진행 중인 Full Load)는 태스크 임시 디스크에 있어 **살아남지 않습니다** —
@@ -557,16 +590,23 @@ aws cloudformation deploy ... \
 | Claude Opus 4.8 | `global.anthropic.claude-opus-4-8` | 고품질; Opus 5보다 한 단계 아래. |
 | Claude Sonnet 4.6 | `global.anthropic.claude-sonnet-4-6` | 이전 세대 Sonnet. |
 
-`BedrockModelId`는 위 `us.` cross-region inference profile들의 **드롭다운**이고, 태스크
-역할의 `bedrock:InvokeModel` 스코프는 여기서 **자동 도출**됩니다 — 따라서 `BedrockModelArns`는
+`BedrockModelId`는 위 `global.` cross-region inference profile들의 **드롭다운**이고(모든
+상용 리전에서 해석되므로 하나의 목록으로 어떤 배포든 커버), 태스크 역할의 `bedrock:InvokeModel`
+스코프는 여기서 **자동 도출**됩니다 — 따라서 `BedrockModelArns`는
 **설정할 필요가 없습니다**(다른 모델/ARN으로 바꿀 때만 override로 사용). 단, 선택한 모델의
 **모델 액세스는 `BedrockRegion`의 Bedrock 콘솔에서 직접 활성화**해야 합니다.
 
 태스크 egress가 Bedrock runtime 엔드포인트에 도달할 수 있는지 확인(NAT 또는 Bedrock VPC 엔드포인트).
 UI에서 AI를 켜고, **Verify AI access** 사전 점검으로 도달성을 확인하세요.
 
+</details>
+
+<details>
+<summary><b>Teardown, 문제 해결, 보안</b> — 전부 제거, 흔한 문제, 보안 노트</summary>
+
 ### Teardown
 
+> [!WARNING]
 > **완전 teardown 순서 (모든 리소스/비용 제거).** 마이그레이션은 최대 3개의 스택을 씁니다. 아무것도 —
 > 비용도 — 남지 않도록 다음 순서로 제거하세요:
 >
@@ -649,6 +689,7 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   이미지)로 재빌드하세요 — 단, 이는 별도 검증이 필요한 더 큰 변경입니다.
 - 이 스택은 이 저장소에서 배포된 적 **없음** — 프로덕션 사용 전 대상 계정에서 검증하세요.
 
+</details>
 
 ---
 
@@ -675,6 +716,7 @@ S3 흐름)는 **[`deploy/TEST_EC2_MSK_ONLY.md`](TEST_EC2_MSK_ONLY.md)**에 있�
 - ❌ 그 외에는 **[ECS Fargate](#ecs-fargate에-배포)**가 낫습니다 — 관리형·로드밸런싱 경로이며
   패치할 호스트가 없습니다.
 
+> [!WARNING]
 > **단일 호스트 = 단일 장애점(SPOF).** ALB도, Auto Scaling도, 두 번째 태스크도 없습니다. 상태는
 > 인스턴스 재부팅/교체에도 보존형 EBS 볼륨에서 살아남지만, 컨트롤 플레인 자체는 한 대입니다 —
 > 직접 진행하는 마이그레이션에는 적합하지만, 장기 상시 HA 서비스용은 아닙니다.
@@ -708,6 +750,7 @@ S3 흐름)는 **[`deploy/TEST_EC2_MSK_ONLY.md`](TEST_EC2_MSK_ONLY.md)**에 있�
 | `EnableAiAssist` / `BedrockModelId` / `BedrockRegion` | 아니오 | off / `global.anthropic.claude-sonnet-5` | Fargate와 동일한 opt-in Bedrock AI 보조(IAM 범위는 모델에서 자동 도출). |
 | `KeyName` | 아니오 | `""` | 선택적 SSH 키; SSM이 기본 접속 경로라 보통 비워둠(호스트에 인바운드 규칙 자체가 없음). |
 
+> [!WARNING]
 > 스택 이름은 **`mysql-dsql-cdc-`로 시작하면 안 됩니다**(그 접두사는 CDC 배포 역할 범위에 들어감).
 > `mysql-dsql-migrator-ec2`가 적절합니다.
 
@@ -725,10 +768,16 @@ export SOURCE_DB_SG=sg-source
 export HOST_SUBNET_CIDR=$(aws ec2 describe-subnets --subnet-ids "$HOST_SUBNET_ID" \
   --region "$AWS_REGION" --query 'Subnets[0].CidrBlock' --output text)
 
+# 이 템플릿은 CloudFormation 인라인 업로드 한도(51,200바이트)를 초과해서, CLI가
+# 스테이징할 S3 버킷이 필요합니다. 한 번만 만들거나, 이미 있는 버킷을 재사용하세요:
+export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$AWS_REGION
+aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
+
 aws cloudformation deploy \
   --template-file deploy/cloudformation-ec2.yaml \
   --stack-name mysql-dsql-migrator-ec2 \
   --region "$AWS_REGION" \
+  --s3-bucket "$TEMPLATE_BUCKET" \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
   --parameter-overrides \
     VpcId="$VPC_ID" \
@@ -778,7 +827,8 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-ec2 --region "$
 aws cloudformation wait stack-delete-complete --stack-name mysql-dsql-migrator-ec2 --region "$AWS_REGION"
 ```
 
-> ⚠️ 상태 EBS 볼륨은 설계상 **`DeletionPolicy: Retain`**이라 **스택 삭제 후에도 남습니다** — 보관을
+> [!WARNING]
+> 상태 EBS 볼륨은 설계상 **`DeletionPolicy: Retain`**이라 **스택 삭제 후에도 남습니다** — 보관을
 > 원치 않으면 수동으로 삭제하세요(`aws:cloudformation:stack-name` 태그로 찾음). CDC를 배포했다면
 > cdc-stack을 먼저 제거하세요(UI의 **Start over → Delete all CDC infrastructure** 또는
 > `aws cloudformation delete-stack`).
@@ -787,6 +837,7 @@ aws cloudformation wait stack-delete-complete --stack-name mysql-dsql-migrator-e
 
 ## 부록 — 자체 이미지 빌드 (제한된 네트워크 전용)
 
+> [!NOTE]
 > **대부분의 배포는 이 절을 건너뜁니다.** 이미지는 ECR Public에 게시돼 있고 CloudFormation이 기본으로
 > 가져오므로 빌드할 게 없습니다. 네트워크가 ECR Public에 도달할 수 없을 때만 자체 이미지를 빌드해
 > (`ContainerImageUri`로 전달) 사용하세요. 아래 Option A/B 중 하나 — 둘 다 ECR 저장소를 만들고
@@ -828,4 +879,5 @@ deploy/build_in_codebuild.sh 0.1.0
 CodeBuild는 관리형(권한 있는) 환경에서 Docker를 실행하므로 사용자 머신엔 AWS CLI만 있으면 됩니다.
 이미지는 `linux/amd64`로 빌드되어 같은 ECR 저장소에 푸시됩니다.
 
+> [!TIP]
 > 배포 재현성을 위해 릴리스마다 immutable 태그(또는 이미지 digest)를 사용하세요.
