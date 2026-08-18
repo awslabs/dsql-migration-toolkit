@@ -1368,81 +1368,14 @@ def build_workflow_sidebar(
             ).props("flat dense color=white").tooltip(
                 "Ask AI DBA what to do next and your top risks, from your real state"
             )
-            # AI DBA toggle: a LABELED button (not a bare icon) so it is
-            # obvious it opens/closes the side panel -- matches the "Start over"
-            # button's treatment. Always present so the panel is reachable anytime;
-            # a no-op-with-hint until AI Assist is enabled on Connect.
+            # AI DBA toggle: a LABELED button (not a bare icon) so it is obvious it
+            # opens/closes the side panel. Always present so the panel is reachable
+            # anytime; a no-op-with-hint until AI Assist is enabled on Connect.
             ui.button(
                 "AI DBA", icon="auto_awesome", on_click=_toggle_ai_panel
             ).props("flat dense color=white").tooltip(
                 "Open or close the AI DBA panel"
             )
-            if on_reset is not None:
-
-                async def _open_start_over() -> None:
-                    # Confirm the LIVE CDC deployment state before deciding whether to
-                    # show the stop/delete tiles. cdc_deployed_getter only reads cached
-                    # discovery, which is populated when the CDC step renders -- so from
-                    # any OTHER step (or a session that never opened it) a genuinely
-                    # deployed CDC would otherwise fall back to the passive warning with
-                    # no teardown action. Run the read-only AWS probe off the event loop
-                    # first (it is blocking network I/O), then open the dialog with the
-                    # freshly-refreshed cached state. Best-effort: if the probe fails we
-                    # still open with whatever was cached.
-                    #
-                    # The probe is ~1-2s of network I/O, so show a busy cue on the
-                    # button while it runs: disable it (prevents a double-open) and
-                    # swap its label to "Checking…" + a sync/hourglass icon, restoring
-                    # both when the dialog opens. We swap the LABEL/ICON rather than use
-                    # Quasar's `loading` prop, matching the app-wide busy idiom in
-                    # connect.py (the loading prop spins the border on flat buttons and
-                    # reads as an artifact); the label swap makes the short wait legible.
-                    if cdc_probe is not None:
-                        from nicegui import run as _sd_run
-
-                        start_over_btn.disable()
-                        start_over_btn.set_text("Checking…")
-                        start_over_btn.props("icon=hourglass_top")
-                        try:
-                            await _sd_run.io_bound(cdc_probe)
-                        except Exception:  # noqa: BLE001 - open with cached state
-                            pass
-                        finally:
-                            if not getattr(start_over_btn, "is_deleted", False):
-                                start_over_btn.set_text("Start over")
-                                start_over_btn.props("icon=restart_alt")
-                                start_over_btn.enable()
-                    _open_start_over_dialog(
-                        ui, state, on_reset, select, refresh_all, _CONNECT_VIEW,
-                        cdc_deployed=(
-                            bool(cdc_deployed_getter()) if cdc_deployed_getter else False
-                        ),
-                        on_reset_cdc=on_reset_cdc,
-                        cdc_stack_name=(
-                            cdc_stack_name_getter() if cdc_stack_name_getter else None
-                        ),
-                        cdc_stack_names=(
-                            cdc_stack_names_getter() if cdc_stack_names_getter else None
-                        ),
-                        cdc_teardown_in_flight=(
-                            bool(cdc_teardown_in_flight_getter())
-                            if cdc_teardown_in_flight_getter
-                            else False
-                        ),
-                        cdc_op_in_flight=(
-                            cdc_op_in_flight_getter()
-                            if cdc_op_in_flight_getter
-                            else None
-                        ),
-                    )
-
-                start_over_btn = ui.button(
-                    "Start over",
-                    icon="restart_alt",
-                    on_click=_open_start_over,
-                ).props("flat dense color=white")
-                start_over_btn.tooltip("Clear this session and start a new migration")
-            ui.label(f"v{version}").classes("text-sm opacity-80")
 
     # --- Left drawer (navigation) --------------------------------------------
     drawer = ui.left_drawer(value=True, bordered=True).classes("bg-grey-1")
@@ -1626,6 +1559,82 @@ def build_workflow_sidebar(
         ui.separator()
         if footer_extra is not None:
             footer_extra()
+        # Session-level controls live at the drawer FOOT, deliberately away from the
+        # header's AI controls: "Start over" is destructive (it can also tear down CDC
+        # infra), so it must not sit one click from "AI DBA". Its confirm dialog still
+        # spells out the full impact before anything is wiped. Rendered as a ui.item
+        # (avatar icon + label + caption) so it lines up exactly with the "Settings"
+        # row above it, instead of a button whose icon/label sat at a different indent.
+        if on_reset is not None:
+            _start_over_probing = {"busy": False}
+
+            async def _open_start_over() -> None:
+                if _start_over_probing["busy"]:
+                    return  # a probe is already running -- ignore the re-click
+                # Confirm the LIVE CDC deployment state before deciding whether to show
+                # the stop/delete tiles. cdc_deployed_getter only reads cached discovery,
+                # populated when the CDC step renders -- so from any OTHER step (or a
+                # session that never opened it) a genuinely deployed CDC would otherwise
+                # fall back to the passive warning with no teardown action. Run the
+                # read-only AWS probe off the event loop first (blocking network I/O),
+                # then open the dialog with the freshly-refreshed cached state.
+                # Best-effort: if the probe fails we still open with whatever was cached.
+                #
+                # The probe is ~1-2s, so show a busy cue: swap the label to "Checking…"
+                # and dim the row while it runs (a ui.item has no button `loading` prop),
+                # restoring both when the dialog opens. The guard flag prevents a
+                # double-open during the wait.
+                if cdc_probe is not None:
+                    from nicegui import run as _sd_run
+
+                    _start_over_probing["busy"] = True
+                    start_over_label.set_text("Checking…")
+                    start_over_item.classes(add="opacity-60")
+                    try:
+                        await _sd_run.io_bound(cdc_probe)
+                    except Exception:  # noqa: BLE001 - open with cached state
+                        pass
+                    finally:
+                        _start_over_probing["busy"] = False
+                        if not getattr(start_over_item, "is_deleted", False):
+                            start_over_label.set_text("Start over")
+                            start_over_item.classes(remove="opacity-60")
+                _open_start_over_dialog(
+                    ui, state, on_reset, select, refresh_all, _CONNECT_VIEW,
+                    cdc_deployed=(
+                        bool(cdc_deployed_getter()) if cdc_deployed_getter else False
+                    ),
+                    on_reset_cdc=on_reset_cdc,
+                    cdc_stack_name=(
+                        cdc_stack_name_getter() if cdc_stack_name_getter else None
+                    ),
+                    cdc_stack_names=(
+                        cdc_stack_names_getter() if cdc_stack_names_getter else None
+                    ),
+                    cdc_teardown_in_flight=(
+                        bool(cdc_teardown_in_flight_getter())
+                        if cdc_teardown_in_flight_getter
+                        else False
+                    ),
+                    cdc_op_in_flight=(
+                        cdc_op_in_flight_getter()
+                        if cdc_op_in_flight_getter
+                        else None
+                    ),
+                )
+
+            with ui.item(on_click=_open_start_over).props("clickable").classes(
+                "rounded-borders"
+            ) as start_over_item:
+                with ui.item_section().props("avatar"):
+                    # A solid/filled glyph so it reads as bold as the "Settings" gear
+                    # above it -- the thin restart_alt looked lightweight next to it.
+                    ui.icon("replay_circle_filled", color="grey-7")
+                with ui.item_section():
+                    start_over_label = ui.item_label("Start over").classes("text-sm")
+                    ui.item_label("Reset this session").props("caption")
+        # App version: small and dim at the very bottom of the drawer.
+        ui.label(f"version {version}").classes("text-xs text-grey-6 px-4 pt-1 pb-2")
 
     # --- Main content area ----------------------------------------------------
     with ui.column().classes("w-full max-w-6xl gap-4 p-4"):

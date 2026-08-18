@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.371
+
+### Changed
+
+- **"Start over" and the version label moved from the header to the left-drawer footer**
+  (below Settings). "Start over" is destructive — it can also tear down the CDC
+  infrastructure — so it no longer sits one click from the "AI DBA" button where it
+  invited mis-clicks. It now renders as a list row matching the "Settings" row (icon +
+  "Start over" + "Reset this session" caption); the confirm dialog still spells out the
+  full impact. The header keeps only the AI controls ("What's next?" / "AI DBA").
+- **The AI DBA side panel width is now responsive** — clamped to roughly 40% of the
+  browser width (min 360 px, max 660 px) and recomputed on resize, instead of a fixed
+  660 px that crushed the tool UI on a narrow browser. Wide screens keep the comfortable
+  660 px; a narrow window gives the panel proportionally less so the migration UI stays
+  usable.
+
 ## v0.1.370
 
 **AI DBA now spans the whole migration** — every step, not just Evaluation — as one

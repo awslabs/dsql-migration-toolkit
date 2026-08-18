@@ -134,6 +134,12 @@ class _Ui:
     def add_css(self, *_a, **_k) -> None:
         pass
 
+    def add_body_html(self, *_a, **_k) -> None:
+        pass
+
+    def on(self, *_a, **_k) -> None:  # responsive-drawer-width resize handler
+        pass
+
     def notify(self, *_a, **_k) -> None:
         pass
 

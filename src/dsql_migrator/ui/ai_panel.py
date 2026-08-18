@@ -191,6 +191,29 @@ def build_ai_panel(
         value=bool(conversation.visible), bordered=True, elevated=False
     ).classes("bg-gray-50 q-pa-none").props(f"width={_PANEL_WIDTH_PX} :breakpoint=0")
 
+    # Responsive width. Quasar's `width` prop is px-only AND it also drives the content
+    # push, so a CSS-only vw override would desync the drawer width from the push. Instead
+    # keep the prop but recompute it (clamped) from the viewport on load + resize -- a
+    # fixed 660 crushes the Tool UI on a narrow browser. The client emits its innerWidth;
+    # the server updates the prop so Quasar re-sizes the drawer AND the push together.
+    def _resize_drawer(event: object) -> None:
+        try:
+            inner = float(getattr(event, "args", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if inner > 0:
+            drawer.props(  # type: ignore[attr-defined]
+                f"width={max(360, min(_PANEL_WIDTH_PX, round(inner * 0.4)))}"
+            )
+
+    ui.on("ai_dba_drawer_width", _resize_drawer, throttle=0.2)  # type: ignore[attr-defined]
+    ui.add_body_html(  # type: ignore[attr-defined]
+        "<script>(function(){var f=function(){"
+        "if(window.emitEvent){emitEvent('ai_dba_drawer_width', window.innerWidth);}};"
+        "window.addEventListener('resize', f);"
+        "window.addEventListener('load', f);setTimeout(f, 300);})();</script>"
+    )
+
     with drawer:  # type: ignore[attr-defined]
         with ui.column().classes("full-height column no-wrap w-full"):  # type: ignore[attr-defined]
             with ui.row().classes(  # type: ignore[attr-defined]

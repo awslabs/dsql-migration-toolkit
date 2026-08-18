@@ -705,6 +705,35 @@ def test_header_has_a_what_next_readiness_briefing() -> None:
     assert "top risks" in src
 
 
+def test_start_over_and_version_live_in_the_drawer_footer_not_the_header() -> None:
+    # "Start over" is destructive (it can also tear down CDC infra), so it must not sit
+    # one click from "AI DBA" in the header where it invited mis-clicks. It — and the
+    # version label — moved to the FOOT of the left drawer (below Settings). Guard the
+    # placement so a refactor doesn't drift it back next to the AI controls.
+    import inspect
+
+    from dsql_migrator.ui import workflow as wf
+
+    src = inspect.getsource(wf.build_workflow_sidebar)
+    header_block = src[src.index("with ui.header()") : src.index("# --- Left drawer")]
+    drawer_block = src[src.index("# --- Left drawer") :]
+
+    # The header keeps only the AI controls; the Start over row (identified by its
+    # unique "Reset this session" caption) and the version label are gone from it.
+    caption = '"Reset this session"'
+    assert '"AI DBA"' in header_block
+    assert "Start over" not in header_block
+    assert caption not in header_block
+    assert 'f"version {version}"' not in header_block
+
+    # Both now render in the drawer, and the Start over row comes AFTER the Settings
+    # footer_extra() slot (so it reads as the last, least-prominent control).
+    assert "Start over" in drawer_block
+    assert caption in drawer_block
+    assert 'f"version {version}"' in drawer_block
+    assert drawer_block.index("footer_extra()") < drawer_block.index(caption)
+
+
 def test_journey_header_shows_the_type_banner_only_on_data_migration() -> None:
     # The banner rides only on the Data Migration step (WorkflowStep.CDC), next to the
     # selector that owns the choice. It used to render on every step, but a single
