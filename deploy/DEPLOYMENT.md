@@ -2,50 +2,33 @@
 
 _Language: **English** | [한국어](DEPLOYMENT.ko.md) | [日本語](DEPLOYMENT.ja.md)_
 
-The tool runs in one of two ways: **locally** (`uv run …`, no infrastructure —
-best for evaluation and small migrations) or on **ECS Fargate** (a hosted service
-in your own AWS account — best for real, large-scale migrations). **This guide
-covers the Fargate deployment (the app-stack);** for running locally, see
-[Step 1](#step-1--choose-where-to-run) below and the root README.
-
-On Fargate, the **control-plane app** runs as a single-task **Amazon ECS Fargate**
-service behind an **Application Load Balancer (HTTPS)**, inside the customer's own
-AWS account and VPC (single-tenant), with the image pulled from **Amazon ECR**. By
-default the ALB is **`internal`** (no login needed — the network is the access
-gate); **Amazon Cognito (OIDC)** login is an opt-in add-on, needed only if you
-expose the UI publicly. The optional streaming **CDC pipeline** (MSK + Debezium +
-sink) is a separate `cdc-stack`, not covered here.
+Deploy the migration tool **inside your own AWS account** (single-tenant) — it's the
+same tool and UI everywhere, only **where it runs** differs. The optional streaming
+**CDC pipeline** (MSK + Debezium + sink) is a separate `cdc-stack`, not covered here.
 
 ---
 
-## Quick deployment (TL;DR)
+## Choose where to run
 
-In a hurry? The happy path, in order — each step is detailed in the sections below.
+Pick one — each mode has its own section below.
 
-1. Choose where to run (testing — Local; real migration — Fargate recommended).
-2. Gather the required values.
-3. Prepare an ACM certificate.
-4. Upload the CloudFormation template.
-5. Fill in the parameters.
-6. Create the stack.
-7. Open the tool URL (`AppUrl`).
-8. (Optional) Enable public access, Cognito login, or AI assist.
-
----
-
-## Step 1 — Choose where to run
-
-- **Local** (testing / evaluation / development) — **one command, no
-  infrastructure. 👉 Try this first, before you deploy to ECS Fargate.** See
-  **[Step 2a](#step-2a--run-locally-try-this-first)**.
-- **ECS Fargate — RECOMMENDED for production workloads** — the same engine runs as a single-task Fargate
-  service + HTTPS ALB **inside your VPC**, so the data path stays in AWS (not your
-  laptop). The real deployment. See
-  **[Step 2b](#step-2b--deploy-on-ecs-fargate-recommended-for-production-workloads)**.
+- **[Run locally](#run-locally)** — `uv run …`, **no infrastructure.** Your machine is
+  the engine, so it must reach **both** the source MySQL and DSQL. Best for evaluation
+  and small migrations. **👉 Try this first.**
+- **[Deploy on ECS Fargate](#deploy-on-ecs-fargate)** — **recommended for real,
+  large-scale migrations.** A single-task **ECS Fargate** service behind an **HTTPS ALB**
+  in your VPC, image pulled from **ECR**, so the data path stays in AWS (not your laptop).
+  The ALB is **`internal`** by default; **Cognito** (OIDC) login is an opt-in add-on for
+  public exposure.
+- **[Run on a single EC2 host](#run-on-a-single-ec2-host-from-source-lambda-free)** —
+  runs the app **from source** (`git` + `uv` + a **systemd** service), reached over an
+  **SSM port-forward** (no ALB, no public IP); state on a retained EBS volume, CDC seeded
+  **in-process** (no offset-seeder Lambda). For accounts that can't use
+  **containers/ECR** or **AWS Lambda**.
 
 ---
 
-## Step 2a — Run locally (try this first)
+## Run locally
 
 **Before you commit to an ECS Fargate deployment, try it locally first** — **one
 command and the UI is up. That's it.**
@@ -70,21 +53,33 @@ your **desktop must be able to reach _both_** the source MySQL **and** the targe
 Aurora DSQL — a private source needs an SSM port-forward / VPN, and your machine
 needs outbound HTTPS + AWS credentials to the DSQL region. Zero infra — best for
 evaluation / smaller migrations / development. It is *not* the hosted architecture;
-for a real migration use ECS Fargate (**[Step 2b](#step-2b--deploy-on-ecs-fargate-recommended-for-production-workloads)**).
+for a real migration use **[ECS Fargate](#deploy-on-ecs-fargate)**.
 
-> **Tip — keep your session (and edits) across restarts.** Set
-> `DSQL_MIGRATOR_STORAGE_SECRET` to a fixed random string before launching, e.g.
-> `DSQL_MIGRATOR_STORAGE_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(32))") uv run mysql-dsql-migrator ui`.
-> Without it, each restart gets a new browser-session id, so workflow progress
-> **and your Schema Conversion edits (a customized target DDL — e.g. a
-> `TINYINT(1)`→`smallint` remap)** are not restored, and a Full Load re-run would
-> recreate the table from the default conversion. With it set, the session
-> resumes where you left off and the re-run reuses your applied schema. (Treat
-> the value as a secret; see [`.env.example`](../.env.example).)
+> [!TIP]
+> **Keep your session (and edits) across restarts.** Launch with a fixed
+> `DSQL_MIGRATOR_STORAGE_SECRET` so the browser-session id — the key your saved
+> workbench is stored under — stays stable:
+>
+> ```bash
+> DSQL_MIGRATOR_STORAGE_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(32))") \
+>   uv run mysql-dsql-migrator ui
+> ```
+>
+> - **Without it** — each restart gets a new session id, so workflow progress **and your
+>   Schema Conversion edits** (a customized target DDL, e.g. `TINYINT(1)`→`smallint`) are
+>   not restored, and a Full Load re-run recreates the table from the default conversion.
+> - **With it** — the session resumes where you left off and the re-run reuses your
+>   applied schema.
+>
+> Treat the value as a secret (see [`.env.example`](../.env.example)).
 
 ---
 
-## Step 2b — Deploy on ECS Fargate (recommended for production workloads)
+## Deploy on ECS Fargate
+
+> [!TIP]
+> **Recommended for production — real, large-scale migrations.** The whole data path
+> stays inside AWS (source → Fargate → DSQL), not your laptop.
 
 No image build needed — the image is on **ECR Public** and CloudFormation pulls
 it. Two ways to deploy the same `deploy/cloudformation.yaml`:
@@ -732,6 +727,146 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 - This stack has **not** been deployed from this repository — validate it in
   your target account before production use.
 
+
+---
+
+## Run on a single EC2 host (from source, Lambda-free)
+
+For accounts that **cannot use containers/ECR or AWS Lambda**. The same control-plane
+app runs on **one in-VPC EC2 host straight from source** — the host installs `git` +
+[`uv`](https://docs.astral.sh/uv/), fetches this repo, `uv sync`s a virtualenv
+(CPython 3.12), and runs the UI as a **systemd service** (`dsql-migrator.service`).
+**No image build, no ECR, no ALB** — you reach the UI over an **SSM port-forward** (the
+host has no inbound rule and no public IP). State (the Full Load job / session SQLite +
+activity log) lives on a **retained EBS volume**, so **no S3 bucket is required**. For
+CDC it seeds Kafka **in-process**, so — unlike Fargate — it creates **no offset-seeder
+Lambda** (`SeedMode=External`).
+
+Template: **`deploy/cloudformation-ec2.yaml`**. This section is the quick path; the full
+hands-on walkthrough (change-set dry-run proving the default path is untouched,
+negative / resilience checks, and the temporary "run my local copy" S3 flow) is
+**[`deploy/TEST_EC2_MSK_ONLY.md`](TEST_EC2_MSK_ONLY.md)**.
+
+### When to use it
+
+- ✅ Your account/policy **forbids running containers or pulling from ECR**, or
+  **forbids AWS Lambda**.
+- ✅ You still want the **private in-VPC data path** (source → host → DSQL) that
+  Fargate gives — not routing data through a laptop.
+- ❌ Otherwise prefer **[ECS Fargate](#deploy-on-ecs-fargate)**: it's the managed,
+  load-balanced path with no host to patch.
+
+> **Single host = single point of failure.** There is no ALB, no Auto Scaling, no
+> second task. State survives an instance reboot / replacement on the retained EBS
+> volume, but the control plane itself is one box — fine for a migration you actively
+> run, not a long-lived HA service.
+
+### Prerequisites
+
+- A **NAT-egress private subnet of your VPC, co-located with the source MySQL and (for
+  CDC) the MSK**. The host has no public IP and reaches AWS APIs / the source / MSK over
+  that egress.
+- The **Session Manager plugin** for the AWS CLI (to port-forward the UI) —
+  [install guide](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html).
+- The **host subnet's CIDR**, to admit the host to MSK on 9098 for the in-process CDC
+  seed (see "Admit the host to MSK" below).
+- The app source reachable by the host: the **default `SourceMode=git`** clones the
+  public repo over HTTPS (no auth); before the repo is public, use **`SourceMode=s3`**
+  with a tarball of your checkout (see [`TEST_EC2_MSK_ONLY.md`](TEST_EC2_MSK_ONLY.md) §2).
+
+### Required / key parameters
+
+| Parameter | Required | Default | What it is |
+| --- | --- | --- | --- |
+| `VpcId` | yes | — | VPC of the source DB / MSK (same region as DSQL). |
+| `HostSubnetId` | yes | — | A **NAT-egress private subnet** of `VpcId`, co-located with the MSK. |
+| `DsqlClusterArn` | yes | — | Target DSQL cluster (scopes `dsql:DbConnect`). |
+| `SourceDbSecurityGroupId` / `SourceDbCidr` | one required | `""` | Opens host egress to the source MySQL (SG preferred over a raw CIDR). |
+| `SourceMode` | no | `git` | `git` (clone `SourceRepoUrl@SourceRepoRef` over public HTTPS) or `s3` (tarball from `SourceS3Uri`). |
+| `SourceS3Uri` | if `s3` | `""` | `s3://…/source.tar.gz` of the repo root — the temporary "run my local copy" path. |
+| `MskEgressCidr` | no | `0.0.0.0/0` | CIDR the host may reach MSK on 9098 for the in-process seed; narrow to the connector subnet CIDR for least privilege. |
+| `InstanceType` | no | `t3.large` | Control-plane host size. |
+| `StateVolumeSizeGiB` | no | `20` | Retained EBS state volume; size up for a large-table Full Load's local CSV spillover. |
+| `SourceSecretArn` | no | `""` | Only to reuse an existing source-creds secret (else enter username/password in the UI). |
+| `EnableAiAssist` / `BedrockModelId` / `BedrockRegion` | no | off / `global.anthropic.claude-sonnet-5` | Same opt-in Bedrock AI assist as Fargate (IAM scope auto-derived from the model). |
+| `KeyName` | no | `""` | Optional SSH key; SSM is the primary access path, so usually left empty (the host has no inbound rule at all). |
+
+> The stack name **must not start with `mysql-dsql-cdc-`** (that prefix falls inside
+> the CDC deploy role's scope). `mysql-dsql-migrator-ec2` is a good choice.
+
+### Deploy
+
+```bash
+export AWS_REGION=us-east-1
+export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+export VPC_ID=vpc-xxxxxxxx
+export HOST_SUBNET_ID=subnet-xxxxxxxx        # NAT-egress private subnet, co-located with MSK
+export DSQL_CLUSTER_ARN=arn:aws:dsql:$AWS_REGION:$ACCOUNT:cluster/xxxx
+export SOURCE_DB_SG=sg-source
+
+# The host subnet's CIDR — used to admit the host to MSK 9098 (CDC step below):
+export HOST_SUBNET_CIDR=$(aws ec2 describe-subnets --subnet-ids "$HOST_SUBNET_ID" \
+  --region "$AWS_REGION" --query 'Subnets[0].CidrBlock' --output text)
+
+aws cloudformation deploy \
+  --template-file deploy/cloudformation-ec2.yaml \
+  --stack-name mysql-dsql-migrator-ec2 \
+  --region "$AWS_REGION" \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    VpcId="$VPC_ID" \
+    HostSubnetId="$HOST_SUBNET_ID" \
+    DsqlClusterArn="$DSQL_CLUSTER_ARN" \
+    SourceDbSecurityGroupId="$SOURCE_DB_SG" \
+    MskEgressCidr="$HOST_SUBNET_CIDR"
+    # Default SourceMode=git clones the public repo. Before it is public, add:
+    #   SourceMode=s3 SourceS3Uri=s3://.../dsql-src.tar.gz   (see TEST_EC2_MSK_ONLY.md §2)
+```
+
+First boot takes ~3–4 min: the host installs Python 3.12 + wheels over 443, runs
+`uv sync --extra cdc-external` (which brings in `kafka-python` + the MSK IAM signer for
+the in-process seed), then starts the service. Progress is in
+`/var/log/dsql-migrator-userdata.log` on the host.
+
+### Reach the UI (SSM port-forward)
+
+The stack outputs `HostInstanceId` and a ready-to-run `SsmPortForwardCommand`:
+
+```bash
+INSTANCE_ID=$(aws cloudformation describe-stacks --stack-name mysql-dsql-migrator-ec2 \
+  --region "$AWS_REGION" --query "Stacks[0].Outputs[?OutputKey=='HostInstanceId'].OutputValue" --output text)
+
+aws ssm start-session --target "$INSTANCE_ID" \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["8080"],"localPortNumber":["8080"]}' \
+  --region "$AWS_REGION"
+```
+
+Open `http://localhost:8080` → the tool UI loads (the same guided workflow). Check the
+service health over SSM Run Command with `systemctl is-active dsql-migrator.service` and
+`journalctl -u dsql-migrator`.
+
+### Admit the host to MSK on 9098 (CDC only)
+
+For CDC the host seeds Kafka in-process, so it must reach MSK Serverless on 9098. Pass
+the **host subnet's CIDR** to the **cdc-stack `HostSubnetCidr` parameter** (this creates
+the connector-SG ingress) — the tool can supply it at CDC-infra deploy time, or set it
+when you deploy the cdc-stack yourself. Full steps: [`TEST_EC2_MSK_ONLY.md`](TEST_EC2_MSK_ONLY.md)
+§4. If the host cannot reach MSK, **Start CDC fails loudly before creating any
+connector** (`CdcDeployError`) — never a silent gap.
+
+### Teardown
+
+```bash
+aws cloudformation delete-stack --stack-name mysql-dsql-migrator-ec2 --region "$AWS_REGION"
+aws cloudformation wait stack-delete-complete --stack-name mysql-dsql-migrator-ec2 --region "$AWS_REGION"
+```
+
+> ⚠️ The state EBS volume has **`DeletionPolicy: Retain`** by design, so it **survives
+> stack deletion** — delete it manually if you don't want to keep it (find it by the
+> `aws:cloudformation:stack-name` tag). If you deployed CDC, remove the cdc-stack first
+> (from the UI's **Start over → Delete all CDC infrastructure**, or
+> `aws cloudformation delete-stack`).
 
 ---
 

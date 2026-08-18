@@ -89,17 +89,19 @@ run or re-run independently. Feature-level detail lives in the
 ## Quick start
 
 Same tool, same UI — only **where it runs** changes. Run **locally** for
-evaluation / small migrations, on **ECS Fargate** for real ones.
+evaluation / small migrations, on **ECS Fargate** for real ones, or on a **single
+EC2 host** (from source) when your account can't use containers/ECR or AWS Lambda.
 
-| | **Local** | **ECS Fargate** |
-|---|---|---|
-| Best for | Evaluation, small migrations | Real / large-scale migrations |
-| Setup | `uv sync` + run (seconds) | Deploy CloudFormation app-stack |
-| Migration engine runs on | Your machine | A single-task Fargate service in your VPC |
-| Reaches source & DSQL | From your machine (VPN / SSM for a private source) | Privately inside AWS (source → Fargate → DSQL) |
-| Data path | Through your machine | Stays in AWS; your browser only loads the UI |
-| Private source | Needs tunneling | Native (in-VPC) |
-| Compute / cost | Your laptop, free | Fargate task (bill until teardown) |
+| | **Local** | **ECS Fargate** | **EC2 (from source)** |
+|---|---|---|---|
+| Best for | Evaluation, small migrations | Real / large-scale migrations | No containers/ECR or Lambda allowed |
+| Setup | `uv sync` + run (seconds) | Deploy CloudFormation app-stack | Deploy CloudFormation EC2 stack (`git` + `uv`, no image) |
+| Migration engine runs on | Your machine | A single-task Fargate service in your VPC | A single EC2 host in your VPC |
+| Reaches source & DSQL | From your machine (VPN / SSM for a private source) | Privately inside AWS (source → Fargate → DSQL) | Privately inside AWS (source → EC2 → DSQL) |
+| Reach the UI | Browser → `127.0.0.1:8080` | ALB URL (`internal` by default) | SSM port-forward (no ALB / public IP) |
+| Data path | Through your machine | Stays in AWS; your browser only loads the UI | Stays in AWS; your browser only loads the UI |
+| Private source | Needs tunneling | Native (in-VPC) | Native (in-VPC) |
+| Compute / cost | Your laptop, free | Fargate task (bill until teardown) | One EC2 instance + EBS (bill until teardown) |
 
 ### Local (fastest)
 
@@ -134,6 +136,17 @@ parameters, Dev/Test vs Prod, DNS & Cognito, teardown, troubleshooting).
   <img src="docs/demo-ui.png" alt="The tool's UI — the guided five-step migration workflow" width="720">
 </p>
 
+### EC2 host (from source — no container, no Lambda)
+
+For accounts that **can't use containers/ECR or AWS Lambda.** The same engine runs on a
+**single in-VPC EC2 host straight from source** (`git clone` + `uv sync` + a **systemd**
+service) — no image build, no ALB; you reach the UI over an **SSM port-forward** and
+state lives on a **retained EBS volume** (no S3 needed). For CDC it seeds Kafka
+**in-process**, so it needs **no offset-seeder Lambda**. The private in-VPC data path
+(source → EC2 → DSQL) is the same one Fargate gives.
+
+**Full procedure: [`deploy/DEPLOYMENT.md` → Run on a single EC2 host](deploy/DEPLOYMENT.md#run-on-a-single-ec2-host-from-source-lambda-free).**
+
 ---
 
 ## Architecture
@@ -142,7 +155,9 @@ The tool is a **Python app** (NiceGUI UI + an importable engine) the operator ru
 inside the customer environment: assess → convert → bulk-load a consistent snapshot
 → validate. Deployed, it runs as a **single-task Amazon ECS Fargate service** behind
 an **HTTPS ALB** (`internal` by default, optional Cognito), pulling the image from
-**Amazon ECR**.
+**Amazon ECR**. For accounts that can't use containers or Lambda, it can instead run
+**from source on a single EC2 host** (systemd + SSM port-forward, no ALB/ECR) — see
+[Quick start](#quick-start).
 
 [![Full AWS architecture topology](deploy/architecture-aws.png)](deploy/architecture-aws.png)
 
@@ -192,6 +207,12 @@ A normal deploy uses the ECR Public image as-is (no build). **AWS CodeBuild** is
 not a runtime component — an optional build tool (`deploy/codebuild.yaml`) used
 once only when you must build your own image on a restricted network.
 
+> **EC2 (from-source) deploy** uses **Amazon EC2 + a retained EBS volume + AWS Systems
+> Manager** (Session Manager) in place of ECS / ECR / ALB / Cognito, and keeps **app
+> state on that EBS volume instead of S3**; in that mode CDC seeds Kafka in-process, so
+> the **AWS Lambda** offset-seeder below is **not** created. (CDC still auto-provisions
+> the S3 plugin bucket above for the connector artifacts.) See [Quick start](#quick-start).
+
 **Optional CDC data plane (cdc-stack)**
 
 | Service | Role |
@@ -235,7 +256,7 @@ once only when you must build your own image on a restricted network.
 
 | Doc | What's inside |
 |---|---|
-| [**Deployment guide**](deploy/DEPLOYMENT.md) | Run locally in one command, or deploy on ECS Fargate (AWS Console or CLI) — prerequisites, parameters, custom domain / Cognito / AI assist, teardown, troubleshooting. |
+| [**Deployment guide**](deploy/DEPLOYMENT.md) | Run locally in one command, deploy on ECS Fargate (AWS Console or CLI), or run from source on a single EC2 host (no container/Lambda) — prerequisites, parameters, custom domain / Cognito / AI assist, teardown, troubleshooting. |
 | [**User manual**](docs/manual/) | Step-by-step walkthrough of the six migration steps — plus **performance tuning & measured test results**, testing / verification, and a **customer FAQ**. |
 | [**Architecture**](#architecture) | How the pieces fit, plus the AWS and CDC-pipeline diagrams (`deploy/architecture-*.png`). |
 | [**Changelog**](CHANGELOG.md) | Per-release changes (semantic-versioned). |
@@ -250,7 +271,9 @@ guide, changelog, and user manual are translated too.
 The tool connects to a customer's private RDS/Aurora and DSQL in the customer's IAM
 context, so it runs **inside the customer environment (single-tenant)** — in
 production as a single-task **ECS Fargate** service from `deploy/cloudformation.yaml`
-(no image build). Optional streaming CDC is a separate **cdc-stack**.
+(no image build). For accounts that can't use containers/ECR or AWS Lambda, it can
+instead run **from source on a single EC2 host** (`deploy/cloudformation-ec2.yaml`).
+Optional streaming CDC is a separate **cdc-stack**.
 
 **▶ Full step-by-step: [`deploy/DEPLOYMENT.md`](deploy/DEPLOYMENT.md).**
 

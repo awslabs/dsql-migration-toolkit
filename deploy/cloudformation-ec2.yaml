@@ -16,8 +16,8 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Lambda-free "EC2 + MSK only" deployment of the MySQL -> Aurora DSQL migration
   tool (Option 3), for customers who cannot use AWS Lambda. Runs the same
-  control-plane app (UI + Full Load + in-process CDC offset seed) as one Docker
-  container on a single in-VPC EC2 host -- no ALB/ACM/Cognito/ECS -- reached over
+  control-plane app (UI + Full Load + in-process CDC offset seed) from source as a
+  systemd service on a single in-VPC EC2 host -- no ALB/ACM/Cognito/ECS -- reached over
   an SSM port-forward (no inbound rule, no public IP). State lives on a retained
   EBS volume. Must run in the same VPC as the CDC MSK and be admitted on 9098 (pass
   this host's subnet CIDR to the cdc-stack HostSubnetCidr param). Stack name must
@@ -224,7 +224,7 @@ Parameters:
     Default: 8080
     MinValue: 1
     MaxValue: 65535
-    Description: Port the NiceGUI app listens on inside the container.
+    Description: Port the NiceGUI app (systemd service) listens on.
 
   EnableActivityLogCloudWatch:
     Type: String
@@ -232,8 +232,8 @@ Parameters:
     AllowedValues: ["true", "false"]
     Description: >
       When true, the app mirrors each activity-log event to stdout as a JSON line.
-      On this EC2 host stdout is captured by Docker's json-file log driver (view
-      with `docker logs dsql-migrator`), giving a queryable audit trail alongside
+      On this EC2 host the systemd service's stdout is captured by journald (view
+      with `journalctl -u dsql-migrator`), giving a queryable audit trail alongside
       the rotating file on the EBS state volume. Off by default; the local rotating
       file (on the durable state volume) remains regardless.
 
@@ -409,12 +409,12 @@ Conditions:
 Resources:
   # Stable secret used to sign the UI's browser-session cookie
   # (DSQL_MIGRATOR_STORAGE_SECRET). Auto-generated once and held in Secrets
-  # Manager so the browser session id stays stable across container restarts
+  # Manager so the browser session id stays stable across service restarts
   # -- this lets a reconnecting browser resume its persisted workbench state
   # (workflow progress, Evaluation result, Full Load linkage) instead of
   # re-running Step 1. It only signs the session cookie; no DB/user credentials
   # are stored here. (On this host the per-session SQLite ALSO lives on the
-  # retained EBS volume, so restoration survives even a container recreate.)
+  # retained EBS volume, so restoration survives even an instance replacement.)
   # No KmsKeyId, deliberately (CKV_AWS_149 / SECRETSMANAGER_USING_CMK) -- the same
   # decision, for the same reasons, as the StorageSecret in cloudformation.yaml: a
   # customer-managed key would cost ~$1/month, force a kms:Decrypt grant on the reader
@@ -699,8 +699,8 @@ Resources:
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/mysql-dsql-cdc-*-msk/*/*
         # NEW for the EC2 mode: user-data reads the auto-generated cookie-signing
-        # secret at boot to inject it into the container as
-        # DSQL_MIGRATOR_STORAGE_SECRET. On Fargate this was the EXECUTION role's job
+        # secret at boot to inject it into the app's runtime env (read by the systemd
+        # unit) as DSQL_MIGRATOR_STORAGE_SECRET. On Fargate this was the EXECUTION role's job
         # (Secrets injection into the task); with no ECS execution role here, the host
         # role reads it directly. Scoped to this stack's StorageSecret only.
         - PolicyName: read-storage-secret

@@ -84,17 +84,19 @@ Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 *분산* 데이터베이�
 ## 빠른 시작
 
 같은 도구·같은 UI이며 **어디서 실행하느냐**만 다릅니다. 평가·소규모는 **로컬**, 실제
-마이그레이션은 **ECS Fargate**를 권장합니다.
+마이그레이션은 **ECS Fargate**, 컨테이너/ECR나 AWS Lambda를 쓸 수 없는 계정은 **단일 EC2
+호스트**(소스에서 실행)를 사용합니다.
 
-| | **로컬** | **ECS Fargate** |
-|---|---|---|
-| 적합한 용도 | 평가, 소규모 마이그레이션 | 실제·대규모 마이그레이션 |
-| 셋업 | `uv sync` + 실행 (수 초) | CloudFormation app-stack 배포 |
-| 마이그레이션 엔진 실행 위치 | 내 머신 | 내 VPC 안의 단일 태스크 Fargate 서비스 |
-| 소스·DSQL 도달 | 내 머신에서 (프라이빗 소스는 VPN/SSM) | AWS 내부에서 프라이빗하게 (소스 → Fargate → DSQL) |
-| 데이터 경로 | 내 머신을 경유 | AWS 내부에 머무름; 브라우저는 UI만 로드 |
-| 프라이빗 소스 | 터널링 필요 | 네이티브 지원 (in-VPC) |
-| 컴퓨트·비용 | 내 노트북, 무료 | Fargate 태스크 (teardown까지 과금) |
+| | **로컬** | **ECS Fargate** | **EC2 (소스 실행)** |
+|---|---|---|---|
+| 적합한 용도 | 평가, 소규모 마이그레이션 | 실제·대규모 마이그레이션 | 컨테이너/ECR·Lambda 사용 불가 |
+| 셋업 | `uv sync` + 실행 (수 초) | CloudFormation app-stack 배포 | CloudFormation EC2 스택 배포 (`git` + `uv`, 이미지 없음) |
+| 마이그레이션 엔진 실행 위치 | 내 머신 | 내 VPC 안의 단일 태스크 Fargate 서비스 | 내 VPC 안의 단일 EC2 호스트 |
+| 소스·DSQL 도달 | 내 머신에서 (프라이빗 소스는 VPN/SSM) | AWS 내부에서 프라이빗하게 (소스 → Fargate → DSQL) | AWS 내부에서 프라이빗하게 (소스 → EC2 → DSQL) |
+| UI 접속 | 브라우저 → `127.0.0.1:8080` | ALB URL (기본 `internal`) | SSM 포트포워드 (ALB·공인 IP 없음) |
+| 데이터 경로 | 내 머신을 경유 | AWS 내부에 머무름; 브라우저는 UI만 로드 | AWS 내부에 머무름; 브라우저는 UI만 로드 |
+| 프라이빗 소스 | 터널링 필요 | 네이티브 지원 (in-VPC) | 네이티브 지원 (in-VPC) |
+| 컴퓨트·비용 | 내 노트북, 무료 | Fargate 태스크 (teardown까지 과금) | EC2 인스턴스 + EBS (teardown까지 과금) |
 
 ### 로컬 (가장 빠름)
 
@@ -128,6 +130,16 @@ Dev/Test vs Prod, DNS·Cognito, teardown, 문제 해결).
   <img src="docs/demo-ui.png" alt="도구 UI — 5단계 가이드 마이그레이션 워크플로우" width="720">
 </p>
 
+### EC2 호스트 (소스에서 실행 — 컨테이너·Lambda 없음)
+
+**컨테이너/ECR나 AWS Lambda를 쓸 수 없는 계정**용입니다. 같은 엔진이 VPC 안의 **단일 EC2
+호스트에서 소스 그대로**(`git clone` + `uv sync` + **systemd** 서비스) 실행됩니다 — 이미지 빌드도
+ALB도 없이 UI에는 **SSM 포트포워드**로 접속하고, 상태는 **보존형 EBS 볼륨**에 있습니다(S3 불필요).
+CDC는 Kafka를 **인프로세스로** 시드하므로 **오프셋 시더 Lambda가 필요 없습니다.** VPC 내 프라이빗
+데이터 경로(소스 → EC2 → DSQL)는 Fargate와 동일합니다.
+
+**전체 절차: [`deploy/DEPLOYMENT.ko.md` → 단일 EC2 호스트에서 실행](deploy/DEPLOYMENT.ko.md#단일-ec2-호스트에서-실행-소스에서-lambda-free).**
+
 ---
 
 ## 아키텍처
@@ -135,7 +147,9 @@ Dev/Test vs Prod, DNS·Cognito, teardown, 문제 해결).
 이 도구는 운영자가 고객 환경 안에서 실행하는 **Python 앱**(NiceGUI UI + import 가능한 엔진)으로,
 평가 → 변환 → 일관성 스냅샷 벌크 로드 → 검증을 수행합니다. 배포 시 단일 태스크
 **Amazon ECS Fargate** 서비스로 **HTTPS ALB**(기본 `internal`, 선택적 Cognito) 뒤에서 돌고,
-이미지는 **Amazon ECR**에서 가져옵니다.
+이미지는 **Amazon ECR**에서 가져옵니다. 컨테이너나 Lambda를 쓸 수 없는 계정에서는 대신 **단일
+EC2 호스트에서 소스로**(systemd + SSM 포트포워드, ALB/ECR 없음) 실행할 수 있습니다 —
+[빠른 시작](#빠른-시작) 참고.
 
 [![전체 AWS 아키텍처 토폴로지](deploy/architecture-aws.png)](deploy/architecture-aws.png)
 
@@ -182,6 +196,12 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 구성요소가 아니라, 로컬 Docker가 없는 제한된 네트워크에서 자체 이미지를 빌드해야 할 때만 한 번
 쓰는 선택적 빌드 도구(`deploy/codebuild.yaml`)입니다.
 
+> **EC2(소스 실행) 배포**는 ECS / ECR / ALB / Cognito 대신 **Amazon EC2 + 보존형 EBS 볼륨 +
+> AWS Systems Manager**(Session Manager)를 쓰고, **앱 상태를 S3 대신 그 EBS 볼륨에 둡니다.** 이
+> 모드에서 CDC는 Kafka를 인프로세스로 시드하므로 아래의 **AWS Lambda** 오프셋 시더를 만들지
+> 않습니다. (CDC는 커넥터 아티팩트를 위해 위의 S3 플러그인 버킷을 여전히 자동 프로비저닝합니다.)
+> [빠른 시작](#빠른-시작) 참고.
+
 **선택적 CDC 데이터 플레인 (cdc-stack)**
 
 | 서비스 | 역할 |
@@ -225,7 +245,7 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 
 | 문서 | 내용 |
 |---|---|
-| [**배포 가이드**](deploy/DEPLOYMENT.ko.md) | 로컬은 명령어 한 줄, 또는 ECS Fargate 배포(AWS Console 또는 CLI) — 사전 요구사항, 파라미터, 커스텀 도메인 / Cognito / AI 어시스트, teardown, 트러블슈팅. |
+| [**배포 가이드**](deploy/DEPLOYMENT.ko.md) | 로컬은 명령어 한 줄, ECS Fargate 배포(AWS Console 또는 CLI), 또는 단일 EC2 호스트에서 소스 실행(컨테이너/Lambda 없음) — 사전 요구사항, 파라미터, 커스텀 도메인 / Cognito / AI 어시스트, teardown, 트러블슈팅. |
 | [**사용자 매뉴얼**](docs/manual/) | 5단계 마이그레이션 단계별 안내 — **성능 튜닝 & 측정 테스트 결과**, 테스트 / 검증, **고객 FAQ** 포함. |
 | [**아키텍처**](#아키텍처) | 구성 요소와 동작 + AWS·CDC 파이프라인 다이어그램(`deploy/architecture-*.png`). |
 | [**변경 이력**](CHANGELOG.ko.md) | 릴리스별 변경(유의적 버전). |
@@ -239,7 +259,9 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 
 이 도구는 고객의 프라이빗 RDS/Aurora와 DSQL에 고객의 IAM 컨텍스트로 연결하므로 **고객 환경
 안에서(단일 테넌트)** 실행됩니다 — 프로덕션에서는 `deploy/cloudformation.yaml`로 배포하는 단일
-태스크 **ECS Fargate** 서비스(이미지 빌드 없음). 선택적 스트리밍 CDC는 별도 **cdc-stack**입니다.
+태스크 **ECS Fargate** 서비스(이미지 빌드 없음). 컨테이너/ECR나 AWS Lambda를 쓸 수 없는 계정은
+대신 **단일 EC2 호스트에서 소스로**(`deploy/cloudformation-ec2.yaml`) 실행할 수 있습니다. 선택적
+스트리밍 CDC는 별도 **cdc-stack**입니다.
 
 **▶ 전체 단계별 절차: [`deploy/DEPLOYMENT.ko.md`](deploy/DEPLOYMENT.ko.md).**
 
