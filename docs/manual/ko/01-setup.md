@@ -8,7 +8,7 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
 타깃 모두에 연결됐다"까지를 안내합니다.
 
 > **이미 AWS에 배포했다면?** [`deploy/DEPLOYMENT.ko.md`](../../../deploy/DEPLOYMENT.ko.md)를
-> 따라 UI가 이미 `AppUrl`에서 열려 있다면, [§1.4 연결](#14-소스와-타깃-연결)로 바로 넘어가세요.
+> 따라 UI가 이미 `AppUrl`에서 열려 있다면, [§1.5 연결](#15-소스와-타깃-연결)로 바로 넘어가세요.
 > 이 장은 배포 가이드가 다루지 않는 로컬 실행도 함께 설명합니다.
 
 도구를 실행하는 방법은 두 가지입니다:
@@ -171,7 +171,29 @@ CloudFormation 파라미터에 대응합니다:
 
 ---
 
-## 1.4 소스와 타깃 연결
+## 1.4 단일 EC2 호스트에서 실행 (소스에서)
+
+**컨테이너/ECR나 AWS Lambda를 쓸 수 없는 계정**에서는 같은 도구를 **VPC 안의 단일 EC2 호스트에서
+소스 그대로** 실행합니다 — 빌드하거나 가져올 이미지가 없습니다. 파라미터화된 전체 CloudFormation
+절차(`deploy/cloudformation-ec2.yaml`)는
+[`deploy/DEPLOYMENT.ko.md`](../../../deploy/DEPLOYMENT.ko.md#단일-ec2-호스트에서-실행-소스에서-lambda-free)에
+있으며, 요지는:
+
+- 호스트가 소스에서 부트스트랩합니다(`git clone` + `uv sync` + **systemd** 서비스) — **Docker·ECR
+  없음**.
+- UI에는 **SSM 포트포워드**(Session Manager)로 접속하므로 **ALB·공인 IP·인바운드 규칙이 필요 없고**,
+  ACM 인증서나 Cognito도 없습니다.
+- 앱 상태는 **보존형 EBS 볼륨**(S3 아님)에 있어 인스턴스 교체를 넘어 유지됩니다.
+- CDC는 Kafka를 **인프로세스로** 시드하므로 **오프셋 시더 Lambda가 생성되지 않습니다**(CDC는 커넥터
+  아티팩트를 위해 S3 플러그인 버킷은 여전히 자동 프로비저닝).
+
+VPC 내 프라이빗 데이터 경로(소스 → EC2 → DSQL)는 Fargate와 동일하며 구성 요소는 훨씬 적습니다.
+파라미터와 SSM 포트포워드 명령은
+[배포 가이드](../../../deploy/DEPLOYMENT.ko.md#단일-ec2-호스트에서-실행-소스에서-lambda-free)를 참고하세요.
+
+---
+
+## 1.5 소스와 타깃 연결
 
 도구를 열고 **Connect** 단계에서 시작합니다. 입력 항목:
 

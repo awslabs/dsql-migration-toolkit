@@ -20,7 +20,7 @@ one-line "must know" plus a pointer to the chapter that covers it in depth.
       region where Aurora DSQL is available, but **source and target must be in
       the same region** — **cross-region migration is not supported**, and the
       optional CDC pipeline runs in a single region/VPC. Run the tool in that
-      region too. → [§1.4](01-setup.md#14-connect-to-your-source-and-target),
+      region too. → [§1.5](01-setup.md#15-connect-to-your-source-and-target),
       [§6.2](06-limitations.md#62-migration-process-limits)
 
 - [ ] **Your source is only ever read.** The tool never writes to your RDS /
@@ -31,7 +31,7 @@ one-line "must know" plus a pointer to the chapter that covers it in depth.
       password to manage), and uses **optimistic concurrency** (no locks). You
       give the tool the DSQL **cluster endpoint** and an AWS identity allowed to
       connect to it. → [§1.1](01-setup.md#11-prerequisites),
-      [§1.4](01-setup.md#14-connect-to-your-source-and-target)
+      [§1.5](01-setup.md#15-connect-to-your-source-and-target)
 
 - [ ] **Every table you migrate to DSQL must have a primary key.** DSQL
       distributes and stores data **by primary key**, so a PK is required, and the
@@ -72,7 +72,7 @@ one-line "must know" plus a pointer to the chapter that covers it in depth.
 
 - [ ] **Credentials live in session memory only.** They're never written to disk,
       logs, or reports, and are discarded when the session ends — so after a
-      restart you re-enter your connection details. → [§1.4](01-setup.md#14-connect-to-your-source-and-target)
+      restart you re-enter your connection details. → [§1.5](01-setup.md#15-connect-to-your-source-and-target)
 
 - [ ] **AI assist is optional and Amazon Bedrock-only.** AI is **off by default**;
       when enabled it works **exclusively through Amazon Bedrock** using your AWS

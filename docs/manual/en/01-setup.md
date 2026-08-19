@@ -8,7 +8,7 @@ This chapter gets you from "I have an Aurora MySQL database" to "the tool is
 open in my browser and connected to both my source and my Aurora DSQL target."
 
 > **Already deployed on AWS?** If you followed [`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.md)
-> and the UI is already open at your `AppUrl`, skip ahead to [§1.4 Connect](#14-connect-to-your-source-and-target).
+> and the UI is already open at your `AppUrl`, skip ahead to [§1.5 Connect](#15-connect-to-your-source-and-target).
 > This chapter also covers running locally, which the deployment guide does not.
 
 There are two ways to run the tool:
@@ -193,7 +193,31 @@ CloudFormation parameter in [`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.
 
 ---
 
-## 1.4 Connect to your source and target
+## 1.4 Run on a single EC2 host (from source)
+
+For accounts that **can't use containers/ECR or AWS Lambda**, the same tool runs on
+a **single in-VPC EC2 host straight from source** — no image to build or pull. The
+full, parameterized CloudFormation flow (`deploy/cloudformation-ec2.yaml`) is in
+[`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.md#run-on-a-single-ec2-host-from-source-lambda-free);
+the essence:
+
+- The host bootstraps from source (`git clone` + `uv sync` + a **systemd** service)
+  — **no Docker, no ECR**.
+- You reach the UI over an **SSM port-forward** (Session Manager), so it needs **no
+  ALB, no public IP, and no inbound rule**; there is no ACM certificate or Cognito.
+- App state lives on a **retained EBS volume** (not S3), so it survives an instance
+  replacement.
+- For CDC it seeds Kafka **in-process**, so **no offset-seeder Lambda** is created
+  (CDC still auto-provisions the S3 plugin bucket for the connector artifacts).
+
+The private in-VPC data path (source → EC2 → DSQL) is the same one Fargate gives, with
+far fewer moving parts. See the
+[Deployment guide](../../../deploy/DEPLOYMENT.md#run-on-a-single-ec2-host-from-source-lambda-free)
+for the parameters and the SSM port-forward command.
+
+---
+
+## 1.5 Connect to your source and target
 
 Open the tool and start at the **Connect** step. You provide:
 
