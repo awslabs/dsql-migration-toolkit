@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.375
+
+### Fixed
+
+- **Stripped the maintainer's local build path (`/Users/<user>/...`) from the committed
+  `offset-seeder-lambda.zip`.** The vendored packages' `.dist-info/RECORD` manifests
+  carried absolute `.pyc` cache paths from the machine the zip was built on, embedding a
+  personal handle in a shipped artifact. Removed those manifest lines only (457 across 10
+  RECORD files); every package file and the Lambda sources (`seeder.py`, `cfnresponse.py`)
+  are byte-identical, so the Lambda's behavior is unchanged. No `PLUGIN_VERSION` bump (the
+  immutable MSK Connect plugins are untouched).
+
 ## v0.1.374
 
 ### Changed

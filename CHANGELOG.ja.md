@@ -5,6 +5,17 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.375
+
+### Fixed
+
+- **コミットされた `offset-seeder-lambda.zip` からメンテナのローカルビルドパス（`/Users/<user>/...`）を除去。**
+  vendoring されたパッケージの `.dist-info/RECORD` マニフェストがビルドマシンの絶対 `.pyc`
+  キャッシュパスを含み、個人ハンドルが配布アーティファクトに埋め込まれていました。該当する
+  マニフェスト行のみを削除（10 個の RECORD、457 行）— すべてのパッケージファイルと Lambda
+  ソース（`seeder.py`, `cfnresponse.py`）は byte-identical なので、Lambda の動作は変わりません。
+  `PLUGIN_VERSION` の更新なし（immutable な MSK Connect プラグインは未変更）。
+
 ## v0.1.374
 
 ### Changed

@@ -5,6 +5,16 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.375
+
+### Fixed
+
+- **커밋된 `offset-seeder-lambda.zip`에서 유지보수자 로컬 빌드 경로(`/Users/<user>/...`) 제거.**
+  vendoring된 패키지들의 `.dist-info/RECORD` 매니페스트가 빌드 머신의 절대 `.pyc` 캐시 경로를
+  담아 개인 핸들이 배포 아티팩트에 박혀 있었음. 해당 매니페스트 줄만 제거(10개 RECORD, 457줄) —
+  모든 패키지 파일과 Lambda 소스(`seeder.py`, `cfnresponse.py`)는 byte-identical이라 Lambda
+  동작은 변하지 않음. `PLUGIN_VERSION` 범프 없음(immutable MSK Connect 플러그인은 그대로).
+
 ## v0.1.374
 
 ### Changed
