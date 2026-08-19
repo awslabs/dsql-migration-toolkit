@@ -33,9 +33,9 @@ per-value limit**, and more. Your schema and, in places, your application must
 adapt. Evaluation (step 1) tells you exactly where.
 
 
-**Q3. Should I run the tool locally or deploy it on AWS (ECS Fargate)?**
+**Q3. Should I run the tool locally, deploy it on ECS Fargate, or run it on a single EC2 host?**
 
-It's the same web UI either way — pick based on your use case.
+It's the same web UI in all three — pick based on your use case.
 
 - **Run locally** — launch it on your laptop/workstation (defaults to
   `http://127.0.0.1:8080`). **Fastest to start**, and a good fit for the
@@ -43,10 +43,16 @@ It's the same web UI either way — pick based on your use case.
 - **Deploy on AWS (ECS Fargate)** — the form most teams use for a real migration.
   It runs as a single task behind an Application Load Balancer (optionally gated by
   Amazon Cognito), so a team can share access and run a long migration reliably.
+- **Run on a single EC2 host (from source)** — for accounts that **can't use
+  containers/ECR or AWS Lambda**. The same engine runs in-VPC straight from source
+  (`git clone` + `uv` + a systemd service), reached over an SSM port-forward, with
+  state on a retained EBS volume — none of Fargate's ALB / ECR / Cognito front door.
 
 In short: **local for a quick evaluation or a small job, Fargate for a real
-production migration.** Either way the source is accessed read-only; see how to run
-each in [Chapter 1 §1.2–§1.3](01-setup.md).
+production migration, and the single EC2 host when your account rules out
+containers/ECR or Lambda.** Either way the source is accessed read-only. See how to
+run local and Fargate in [Chapter 1 §1.2–§1.3](01-setup.md), and the EC2-host path in
+the [Deployment guide](../../../deploy/DEPLOYMENT.md#run-on-a-single-ec2-host-from-source-lambda-free).
 
 
 **Q4. Do source and target have to be in the same AWS region?**
