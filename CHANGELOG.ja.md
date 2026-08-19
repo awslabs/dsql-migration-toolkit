@@ -5,6 +5,15 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.374
+
+### Changed
+
+- **Fargate `ContainerImageUri` の既定値を新しく公開した `:0.1.373` ECR Public イメージに変更**
+  （従来は `:0.1.358`）— 既定デプロイが現在のビルドを pull します。イメージはまだ個人アカウントの
+  ECR Public（alias `z0q0i9j0`）に暫定的にホストされています（`cloudformation.yaml` のコメントに
+  明記）— AWS Labs / チーム所有のアカウントへ移行予定。
+
 ## v0.1.373
 
 AWS Labs（`github.com/awslabs/dsql-migration-toolkit`）でのオープンソース公開に向けた

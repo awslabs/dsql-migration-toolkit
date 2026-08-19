@@ -163,9 +163,14 @@ Parameters:
     Description: ACM certificate ARN for the ALB HTTPS (443) listener.
     AllowedPattern: ^arn:aws[a-zA-Z-]*:acm:[a-z0-9-]+:[0-9]{12}:certificate/.+$
 
+  # NOTE (maintainers): the default image is currently hosted in an individual AWS
+  # account's ECR Public registry (alias z0q0i9j0) as an INTERIM measure. Migrate it
+  # to an AWS Labs / team-owned account before/soon after publication so the default
+  # survives personnel changes and reads as an official source; then repoint this
+  # default and refresh the tag to the released version.
   ContainerImageUri:
     Type: String
-    Default: public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.358
+    Default: public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.373
     Description: >
       App container image URI. Defaults to the published ECR Public image, so a
       normal deploy needs NO image build -- Fargate pulls it directly (works from

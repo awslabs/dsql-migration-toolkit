@@ -5,6 +5,15 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.374
+
+### Changed
+
+- **Fargate `ContainerImageUri` 기본값을 새로 게시한 `:0.1.373` ECR Public 이미지로 변경**
+  (기존 `:0.1.358`) — 기본 배포가 현재 빌드를 pull. 이미지는 아직 개인 계정 ECR Public(alias
+  `z0q0i9j0`)에 임시로 호스팅됨(`cloudformation.yaml` 주석 명시) — AWS Labs/팀 소유 계정으로
+  이전 예정.
+
 ## v0.1.373
 
 AWS Labs(`github.com/awslabs/dsql-migration-toolkit`) 오픈소스 공개를 앞둔 공개 준비 정리.

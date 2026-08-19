@@ -5,6 +5,16 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.374
+
+### Changed
+
+- **The Fargate `ContainerImageUri` default now points at the freshly published
+  `:0.1.373` ECR Public image** (was `:0.1.358`), so a default deploy pulls the current
+  build. The image is still hosted in an individual account's ECR Public registry
+  (alias `z0q0i9j0`) as an INTERIM measure — noted in `cloudformation.yaml`, to be
+  migrated to an AWS Labs / team-owned account.
+
 ## v0.1.373
 
 Public-release readiness pass ahead of open-sourcing under AWS Labs
