@@ -39,12 +39,15 @@ migration_activity.log
 #  - the dsql-sink-plugin/ staging dir (the build script `rm -rf`s and recreates
 #    it from the sink jar + converter; pure staging, not a source input).
 #  - the Maven build output for the sink.
+#  - dependency-reduced-pom.xml: the maven-shade-plugin writes this "effective pom"
+#    to the module root (NOT target/) on every `mvn package`; nothing reads it.
 # The committed inputs that DO stay: the three deploy zips above, the
 # connectors/plugins/debezium-connector-mysql/ input folder (the real Debezium
 # jars the build script does NOT fetch), and connectors/dsql-sink/src/.
 schema-registry-kafkaconnect-converter-*.jar
 connectors/plugins/dsql-sink-plugin/
 connectors/dsql-sink/target/
+connectors/dsql-sink/dependency-reduced-pom.xml
 
 # --- E2E orchestrator runtime artifacts -------------------------------------
 # Regenerated on every run of scripts/run_e2e_migration.py (binlog watermark,
