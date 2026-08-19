@@ -21,7 +21,7 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 | **네이티브 파티셔닝 없음** | DSQL이 직접 자동 분산. | 파티션 테이블 **MANUAL**(파티셔닝 제거). |
 | **값당 1 MiB 한도** | ~1 MiB를 초과하는 단일 `TEXT`/`BLOB` 값은 저장 불가. | 1–8 MiB 값은 에러 로그/DLQ로 **격리(quarantine)**; > 8 MiB 컬럼은 **캡처 단계에서 제외**해야 함. 대형 LOB 컬럼은 `OVERSIZED_LOB`(MANUAL). |
 | **`DECIMAL` 정밀도 > 38** | 더 높은 정밀도 미지원. | **UNSUPPORTED**(`NUMERIC_PRECISION`). |
-| **공간/geometry 타입** | 미지원. | **UNSUPPORTED**. |
+| **공간/geometry 타입** | `bytea`로 대체(원본 WKB가 Full Load·CDC 전 구간에서 그대로 보존됨). | 변환기가 각 컬럼을 `bytea`로 자동 대체하고, 평가기가 해당 테이블을 검토 대상 **MANUAL**로 표시. |
 | **FULLTEXT / SPATIAL 인덱스** | 미지원. | **UNSUPPORTED**. |
 | **테이블당 ≤ 255 컬럼, DB당 ≤ 1000 테이블** | 초과 시 미지원. | **UNSUPPORTED**(`TOO_MANY_COLUMNS` / `TABLE_COUNT_LIMIT`). |
 | **테이블당 ≤ 24 인덱스** (PK가 포함되므로 보조 인덱스는 ≤ 23; MySQL은 64) | 초과분 `CREATE INDEX ASYNC`가 Full Load로 모든 행을 쓴 **뒤에** 실패. | 계획 단계에서 **MANUAL**(`TOO_MANY_INDEXES`)로 표시하고 Schema Conversion에도 동일 노트. |
@@ -66,8 +66,9 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 - **단일 태스크 컨트롤 플레인.** 도구는 **하나의** ECS Fargate 태스크로 배포됩니다. 작업/세션 상태는
   태스크의 **임시 스토리지**에 로컬 SQLite로 저장되므로, 태스크가 교체되면(배포, 크래시) 진행 중이던
   작업 상태를 잃습니다. 이때는 다시 연결해 읽기 전용 단계를 재실행하면 됩니다. 이 상태를 공유 저장소로
-  옮기지 않은 채 태스크를 두 개 이상으로 확장하지 마세요. 무손실 재개가 필요하면 작업/세션 상태 경로를
-  공유 EFS 마운트로 지정할 수 있습니다([`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.md) 참조).
+  옮기지 않은 채 태스크를 두 개 이상으로 확장하지 마세요. 코드가 노출하는 `SessionStateStore`/`JobStore`
+  프로토콜은 DynamoDB로 뒷받침하도록 설계되어 있습니다. 세션의 지속적 재개는 이미 S3(`sessions/` 프리픽스)
+  스냅샷을 통해 태스크 교체를 견디고 살아남습니다.
 - **앱 자체 인증 없음.** 앱은 ALB의 **선택적 Cognito** 게이트에 의존합니다. 인터넷에 노출되는 배포라면
   Cognito를 켜세요. 배포 템플릿은 Cognito 없이 인터넷에 노출하는 안전하지 않은 조합을 막습니다.
 - **자격증명은 세션별로만, 메모리에만 존재.** 절대 디스크에 남지 않으며, 재시작하면 소스/타깃 연결 정보를

@@ -180,14 +180,16 @@ CDC는 병목 지점이 Full Load와 다른 파이프라인입니다. Full Load�
 |---|---|---|
 | `topic.creation.default.partitions` | cdc-stack (추론) | 싱크의 병렬 단위 — 싱크 태스크 1개가 파티션 1개를 소비. **비가역적**(늘리기만 가능). |
 | `SinkTasksMax` | cdc-stack (추론) | 싱크 커넥터 쓰기 병렬수; 실효값은 파티션 수로 상한. |
-| `ConnectorMcuCount` | cdc-stack (추론) | 워커당 MSK Connect 컴퓨트 단위(1/2/4/8). |
+| `ConnectorMcuCount` | cdc-stack (기본값 2, 환경변수 override 가능) | 워커당 MSK Connect 컴퓨트 단위(1/2/4/8). |
 | `SinkBatchMaxRows` | cdc-stack (3000, 고정) | DSQL 쓰기 트랜잭션당 행 수(DSQL 하드 한도). |
 | `consumer.max.poll.records` | 싱크 워커 설정 | 한 `put()`에 넘기는 레코드 수 — 싱크가 하나의 JDBC `executeBatch`로 묶을 수 있는 상한. |
 | `max.batch.size` / `max.queue.size` | 소스 커넥터 | 스트리밍 반복당 배출 binlog 이벤트 수 / reader→producer 큐 깊이. |
 | `producer.batch.size` / `linger.ms` / `compression.type` | 소스 워커 설정 | Kafka produce 배치의 크기·채움 지연·압축. |
 
-커넥터 스케일링 노브(파티션 / `SinkTasksMax` / `ConnectorMcuCount`)는 **캡처 테이블 수로부터
-추론**되며 UI에 노출되지 않습니다 — [§7.2 → CDC](07-performance-and-tuning.md#72-병렬수-튜닝) 참고.
+커넥터 스케일링 노브(파티션 / `SinkTasksMax`)는 **캡처 테이블 수로부터 추론**되며 UI에
+노출되지 않습니다. `ConnectorMcuCount`는 테이블 수에서 도출되지 않는 고정 기본값
+(`CDC_DEFAULT_MCU_COUNT` = 2, 환경변수 override 가능)입니다 —
+[§7.2 → CDC](07-performance-and-tuning.md#72-병렬수-튜닝) 참고.
 
 ### 테스트 환경 (CDC)
 
@@ -302,6 +304,8 @@ gap 없이 따라잡음을 실증으로 확인.)
 
 ```bash
 AWS_REGION=us-east-1 \
+DB_HOST=<rds-host> DB_PORT=3306 DB_USER=admin DB_PASSWORD=<pw> \
+TARGET_ENDPOINT=<dsql-cluster-endpoint> \
 MEASURE_SCHEMA=customers_sample \
 MEASURE_TABLES="order_items orders payments customers" \
 TABLE_PARALLELISM=8 \

@@ -40,8 +40,10 @@ count-matched tables are reported as "not deeply checked" (not as a false match)
 A real source keeps changing while you migrate, so "do the counts match?" needs a
 reference point. Validation uses the **watermark**:
 
-- It compares the **current** source GTID to the watermark's GTID. If the source
-  has advanced, the report marks **`drifted = true`** with the watermark's
+- It compares the **current** source position against the watermark's: by **GTID**
+  when both the watermark and the live source expose one, otherwise by the binlog
+  **file:position** (the normal path on RDS MySQL 8.0, which can't enable GTID). If
+  the source has advanced, the report marks **`drifted = true`** with the watermark's
   snapshot timestamp as the "as of" point — so a count difference is correctly
   attributed to *new source activity since the snapshot*, not to a migration bug.
 - During CDC, you typically watch the target **converge** toward the source

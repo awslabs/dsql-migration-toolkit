@@ -43,7 +43,7 @@ Source MySQL                         Aurora DSQL
 SELECT <cols> FROM <table>
 WHERE pk > :last           -- (composite PKs use a row-value tuple comparison)
 ORDER BY pk
-LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 1000
+LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 5000
 ```
 
 各ページの最後の行まで `:last` を進めていき、短いページが終端を知らせるまで繰り返します。このクエリは
@@ -91,7 +91,7 @@ Schema Conversion ステップにあります。
 | トランザクションあたり ≤ 3000 行 | バッチの行数を制限 | `DEFAULT_BATCH_ROWS = 2000`、ハード上限 `3000` |
 | バインドパラメータの上限 | 収まるようにバッチを制限 | `MAX_STATEMENT_PARAMETERS = 65535`(`65535 // columns`) |
 | 書き込みトランザクションあたりのサイズ | 幅の広い行を分割 | `MAX_BATCH_BYTES = 8 MiB` |
-| 楽観的並行性制御(`40001`) | バックオフ + ジッターでバッチをリトライ | 最大 10 回 |
+| 楽観的並行性制御(`40001`) | バックオフ + ジッターでバッチをリトライ — 一時的な接続断でも適用 | 最大 20 回 |
 | リソース使用量の制限 | 同時実行バッチ数を制限 | テーブルあたり `DEFAULT_PARALLELISM = 8`、同時に `4` テーブル |
 
 **設計上、冪等です。** ロードは `INSERT ... ON CONFLICT` を使うため、バッチを再実行しても重複が生じる
@@ -191,8 +191,12 @@ v0.1.68 から、ローダーは **`ProcessPoolExecutor`** を使用します �
 ### 動作方式
 
 - **小規模テーブル**（シャード不可または行数閾値未満）：テーブルごとに 1 ワーカー。
-- **大規模テーブル**（単一整数 PK）：自動的に K 個の PK レンジシャードに分割され、
-  それぞれ別のワーカープロセスでロード。
+- **大規模テーブル**（先頭の PK 列が整数の場合 — 単一整数 PK、または `(tenant_id, id)` の
+  ように先頭列が整数の複合 PK）：K 個の PK レンジシャードに分割され、それぞれ別のワーカー
+  プロセスがソースの重ならない区間をロード。このリーダーレンジシャーディングは**デフォルトで
+  無効**（`full_load_reader_shards=1`）で、`FULL_LOAD_READER_SHARDS` > 1 で有効化します。また
+  **CDC 併行実行**でのみ動作します — 単独の Full Load / REPLACE は常にテーブルあたり 1 つの
+  リーダーを使用します。
 - **すべてのワークユニットが 1 つの bounded pool を共有** —
   `table_parallelism` が同時ワーカー数を制御。
 
@@ -210,7 +214,7 @@ ProcessPoolExecutor(max_workers=table_parallelism)
 
 大規模な移行では worker 数をタスクの vCPU 数に合わせてください — pool slot を
 whole-table worker と shard worker に配分するのはローダーが自動で行います。関連する設定
-(`TABLE_PARALLELISM`、`BATCH_PARALLELISM`、`SHARD_MIN_ROWS`)とその上限、そしてソース負荷との
+(`TABLE_PARALLELISM`、`BATCH_PARALLELISM`、`SHARD_MIN_ROWS`、`FULL_LOAD_READER_SHARDS`)とその上限、そしてソース負荷との
 関係は [第 7 章 §7.2 — 並列度のチューニング](07-performance-and-tuning.md#72-並列度のチューニング)
 にまとまっています。この設計が実際に達成したスループット(および置き換えられた ThreadPool の
 ベースライン)は [付録: パフォーマンステスト結果](12-performance-test-results.md) にあります。

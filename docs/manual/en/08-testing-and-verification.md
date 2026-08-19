@@ -11,7 +11,7 @@ different engine (PostgreSQL-wire, distributed, serverless, IAM-auth, optimistic
 concurrency). For each DSQL trait below, we list the scenario it forces and how
 the tool exercises it.
 
-> Two test layers back every scenario: an **offline suite** (~1,700 Python + 42
+> Two test layers back every scenario: an **offline suite** (~3,100 Python + 72
 > Java tests; no AWS — seams injected) that proves the behavior deterministically,
 > and a **live end-to-end run** (real RDS MySQL + Aurora DSQL + MSK) that proves it
 > on real infrastructure with deliberately failing rows (summarized in §8.2).
@@ -70,8 +70,8 @@ primary key.
 | DSQL characteristic | Scenario tested | How it's exercised |
 |---|---|---|
 | No foreign keys | An FK-laden source | FK removed from DDL, preserved as a `MANUAL` note; Validation's **orphan check** confirms app-side integrity held (`test_orphan_records_are_detected_and_fail_the_match`) |
-| Primary key required | A table with **no** PK; a **composite** PK | No-PK is blocked up front (`UNSUPPORTED`) and keyset export refuses it; composite PK loads via row-value tuple comparison (`test_exporter.py`, scenario doc) |
-| Unsupported types/objects | Spatial types, `DECIMAL` precision > 38, > 255 columns, triggers/routines | Flagged `UNSUPPORTED` in Evaluation with a reason (`test_converter.py`, assessor tests) |
+| Primary key required | A table with **no** PK; a **composite** PK | No-PK is blocked up front (`UNSUPPORTED`) and keyset export refuses it; composite PK loads via an explicit lexicographic-disjunction keyset predicate (`(k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR …`) — deliberately **not** the row-value tuple form, which isn't PK-index-friendly on MySQL 5.7+ (`test_exporter.py`, scenario doc) |
+| Unsupported types/objects | `DECIMAL` precision > 38, > 255 columns, triggers/routines | Flagged `UNSUPPORTED` in Evaluation with a reason (`test_converter.py`, assessor tests) |
 | TINYINT(1) → boolean, out of range | A `TINYINT(1)` holding `2` | A **loud, table-fatal** error — refuses to flatten `2` to `true` (no silent corruption) |
 | Type heterogeneity (MySQL → PG dialect) | Max type-diversity schema | Full Load (Python) and CDC sink (Java) must encode each type to the **identical** stored form — enforced by a shared **write-contract** parity test (`test_dsql_write_contract.py`) |
 

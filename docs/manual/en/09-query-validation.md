@@ -23,11 +23,10 @@ classifies it:
 
 - **AUTO** — converted deterministically; ready to test.
 - **MANUAL** — converted, but review it (an idiom that has a caveat on DSQL).
-- **UNSUPPORTED** — no faithful DSQL equivalent (explained inline).
 
 It also flags **anti-patterns** that matter on DSQL — for example
-`SELECT ... FOR UPDATE` and other lock idioms that behave differently under DSQL's
-optimistic concurrency control.
+`SELECT ... FOR UPDATE`, which behaves differently under DSQL's optimistic
+concurrency control.
 
 The original and the converted SQL are shown side by side so you can see exactly
 what changed.
@@ -64,8 +63,9 @@ so testing first is required. Run the test with **EXPLAIN ANALYZE** on so a **DP
 baseline** is captured; the button then shows the current cost (e.g. *now ≈ 0.03
 DPU*) and the AI can later prove how much a rewrite saves.
 
-Clicking it opens the shared right-hand AI chat drawer, grounded on **this query's
-real EXPLAIN plan and DPU** plus Aurora DSQL's execution model. The AI:
+Clicking it opens the persistent app-wide AI panel and sets its scope to this query,
+grounded on **this query's real EXPLAIN plan and DPU** plus Aurora DSQL's execution
+model. The AI:
 
 - proposes a rewritten query in a code block,
 - explains **what it changed and why it is cheaper on DSQL** (which scan type or

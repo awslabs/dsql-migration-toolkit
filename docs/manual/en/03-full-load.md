@@ -44,7 +44,7 @@ The loader reads with **keyset pagination on the primary key**, not `OFFSET`:
 SELECT <cols> FROM <table>
 WHERE pk > :last           -- (composite PKs use a row-value tuple comparison)
 ORDER BY pk
-LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 1000
+LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 5000
 ```
 
 It advances `:last` to the last row of each page until a short page signals the
@@ -95,7 +95,7 @@ is a real DSQL constraint, handled for you:
 | ≤ 3000 rows per transaction | Caps batch row count | `DEFAULT_BATCH_ROWS = 2000`, hard cap `3000` |
 | Bind-parameter limit | Clamps batch to fit | `MAX_STATEMENT_PARAMETERS = 65535` (`65535 // columns`) |
 | Per-write-txn size | Splits wide rows | `MAX_BATCH_BYTES = 8 MiB` |
-| Optimistic concurrency (`40001`) | Retries the batch with backoff + jitter | up to 10 attempts |
+| Optimistic concurrency (`40001`) | Retries the batch with backoff + jitter — also on a transient connection drop | up to 20 attempts |
 | Bounded resource use | Limited concurrent batches | `DEFAULT_PARALLELISM = 8` per table, `4` tables at once |
 
 **Idempotent by construction.** Loads use `INSERT ... ON CONFLICT`, so re-running
@@ -206,9 +206,13 @@ table shard) loads in its own OS process with its own GIL and its own CPU core.
 
 - **Small tables** (non-shardable or below the row threshold): 1 worker process
   each — same as before, just in a separate process instead of a thread.
-- **Large tables** with a single integer primary key: automatically split into K
+- **Large tables** whose leading PK column is an integer (a single integer PK, or a
+  composite PK with an integer leading column such as `(tenant_id, id)`): split into K
   PK-range shards, each loaded by its own worker process from a disjoint slice of
-  the source.
+  the source. This reader-range sharding is **off by default** (`full_load_reader_shards=1`);
+  enable it with `FULL_LOAD_READER_SHARDS` > 1, and it only engages on a
+  **CDC-coexisting run** — a standalone Full Load / REPLACE always uses one reader per
+  table.
 - **All work units share one bounded pool** — `table_parallelism` controls the
   total number of concurrent worker processes.
 
@@ -226,7 +230,7 @@ ProcessPoolExecutor(max_workers=table_parallelism)
 
 For a large migration, set the worker count to the task's vCPU count — the loader
 distributes the pool slots between whole-table workers and shard workers itself. The
-knobs (`TABLE_PARALLELISM`, `BATCH_PARALLELISM`, `SHARD_MIN_ROWS`), their limits, and how
+knobs (`TABLE_PARALLELISM`, `BATCH_PARALLELISM`, `SHARD_MIN_ROWS`, `FULL_LOAD_READER_SHARDS`), their limits, and how
 they interact with source load live together in
 [Chapter 7 §7.2 — Tuning parallelism](07-performance-and-tuning.md#72-tuning-parallelism);
 the measured throughput this design achieves (and the ThreadPool baseline it replaced) is

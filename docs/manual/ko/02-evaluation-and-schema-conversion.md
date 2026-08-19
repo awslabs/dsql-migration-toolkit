@@ -31,8 +31,8 @@ Aurora MySQL 사용자에게 **이 단계는 DSQL이 받아들이지 않을 것�
 | 분류 | 의미 | 예시 |
 |---|---|---|
 | **AUTO** | 자동 변환, 사람 개입 없음. | 매핑 가능한 타입과 PK를 가진 일반 테이블/컬럼. |
-| **MANUAL** | 변환되지만 결정이나 앱 측 변경 필요. | 외래 키, 대소문자 무시 collation, 파티션 테이블, 초대형 LOB 컬럼, `ENUM`/`SET`, 생성 컬럼, `ON UPDATE` 타임스탬프, 다중 데이터베이스 소스. |
-| **UNSUPPORTED** | 자동 변환 불가 — 재설계 필요. | 트리거, 저장 프로시저/함수, 스케줄 이벤트, PK 없는 테이블, 공간/geometry 타입, `DECIMAL` 정밀도 > 38, 테이블당 컬럼 > 255, DB당 테이블 > 1000, FULLTEXT/SPATIAL 인덱스. |
+| **MANUAL** | 변환되지만 결정이나 앱 측 변경 필요. | 외래 키, 대소문자 무시 collation, 파티션 테이블, 초대형 LOB 컬럼, `ENUM`/`SET`, 생성 컬럼, `ON UPDATE` 타임스탬프, 공간/geometry 타입, 다중 데이터베이스 소스. |
+| **UNSUPPORTED** | 자동 변환 불가 — 재설계 필요. | 트리거, 저장 프로시저/함수, 스케줄 이벤트, PK 없는 테이블, `DECIMAL` 정밀도 > 38, 테이블당 컬럼 > 255, DB당 테이블 > 1000, FULLTEXT/SPATIAL 인덱스. |
 
 분류되지 않는 객체는 없습니다 — 어떤 규칙에도 걸리지 않으면 기본 **AUTO**. 한 객체에 여러 규칙이
 걸리면 **가장 엄격한** 분류가 우선합니다(`UNSUPPORTED` > `MANUAL` > `AUTO`). 걸린 모든 규칙의
@@ -260,7 +260,7 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 | `DATETIME` | `timestamp`(시간대 없음) | `timestamp` (UTC wall-clock) | AUTO | **UTC**로 취급/정규화. |
 | `DATETIME(6)` | `timestamp` | `timestamp` (UTC, microsecond precision) | AUTO | 소수 초를 마이크로초까지 보존. |
 | `TIMESTAMP` | `timestamptz` | `timestamptz` (UTC instant) | AUTO | 절대 UTC 시각으로 저장. |
-| `TIME` | `time`(시간대 없음) | `time` | AUTO | 범위 내 `00:00:00..23:59:59`. **범위 밖** MySQL `TIME`(음수 또는 `> 24h`, MySQL 범위 `-838:59:59..838:59:59`)은 `time` 표현이 없어 **시끄럽게 실패**(대신 `interval` 컬럼 필요). |
+| `TIME` | `time`(시간대 없음) | `time` | MANUAL | 범위 내 `00:00:00..23:59:59`. **범위 밖** MySQL `TIME`(음수 또는 `> 24h`, MySQL 범위 `-838:59:59..838:59:59`)은 `time` 표현이 없어 **시끄럽게 실패**(대신 `interval` 컬럼 필요). |
 | `YEAR` | `smallint` | `smallint` (integer year) | MANUAL | DSQL에 `YEAR` 타입 없음; `1901–2155`가 `smallint`에 들어가며 정수 연도로 저장(`YEAR` 표시 의미는 보존 안 됨). |
 
 #### 문자열, 바이너리, 구조화
@@ -276,7 +276,7 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 | `ENUM('a','b',…)` | `text` + `CHECK (col IN ('a','b',…))` | `text` | MANUAL | DSQL에 `ENUM` 없음; 순서 의미 보존 안 됨. |
 | `SET('x','y',…)` | `text` | `text` (comma-joined) | MANUAL | 무손실 매핑 없음; 다중 값 set 의미는 앱에서 처리. |
 | `JSON` | `json` | `json` | AUTO | (CDC는 JSON 텍스트를 `PGobject(type=json)`로 감싸 `json` 컬럼을 타겟팅.) |
-| 공간(`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL에 공간 타입 없음; 데이터는 원시 WKB 바이트로 **보존**(Full Load는 `ST_AsBinary(col)`, CDC는 Debezium geometry의 `.wkb` 추출; **SRID는 드롭**). `geometry` *컬럼 타입* 자체는 UNSUPPORTED로 플래그되지만 값은 손실되지 않음. |
+| 공간(`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL에 공간 타입 없음; 데이터는 원시 WKB 바이트로 **보존**(Full Load는 `ST_AsBinary(col)`, CDC는 Debezium geometry의 `.wkb` 추출; **SRID는 드롭**). `geometry` *컬럼 타입* 자체는 MANUAL로 플래그되며(자동으로 `bytea`로 대체, WKB 보존) 값은 손실되지 않음. |
 
 ### 구조적 제약
 

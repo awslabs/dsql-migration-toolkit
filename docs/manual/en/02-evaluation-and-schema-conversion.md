@@ -33,8 +33,8 @@ types, primary keys, indexes, foreign keys, views, triggers, routines,
 | Class | Meaning | Examples |
 |---|---|---|
 | **AUTO** | Converts automatically, no human action. | Ordinary tables/columns with mappable types and a PK. |
-| **MANUAL** | Converts, but needs a decision or an app-side change. | Foreign keys, case-insensitive collation, partitioned tables, oversized LOB columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, multi-database sources. |
-| **UNSUPPORTED** | No automatic conversion — redesign needed. | Triggers, stored procedures/functions, scheduled events, tables with no PK, spatial/geometry types, `DECIMAL` precision > 38, > 255 columns/table, > 1000 tables/database, FULLTEXT/SPATIAL indexes. |
+| **MANUAL** | Converts, but needs a decision or an app-side change. | Foreign keys, case-insensitive collation, partitioned tables, oversized LOB columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, multi-database sources. |
+| **UNSUPPORTED** | No automatic conversion — redesign needed. | Triggers, stored procedures/functions, scheduled events, tables with no PK, `DECIMAL` precision > 38, > 255 columns/table, > 1000 tables/database, FULLTEXT/SPATIAL indexes. |
 
 Nothing is left unclassified — an object matched by no rule defaults to **AUTO**.
 When several rules match one object, the **most demanding** classification wins
@@ -310,7 +310,7 @@ conversion (redesign).
 | `DATETIME` | `timestamp` (without time zone) | `timestamp` (UTC wall-clock) | AUTO | Treated/normalized as **UTC**. |
 | `DATETIME(6)` | `timestamp` | `timestamp` (UTC, microsecond precision) | AUTO | Fractional seconds preserved to microseconds. |
 | `TIMESTAMP` | `timestamptz` | `timestamptz` (UTC instant) | AUTO | Stored as an absolute UTC instant. |
-| `TIME` | `time` (without time zone) | `time` | AUTO | In-range `00:00:00..23:59:59`. An **out-of-range** MySQL `TIME` (negative or `> 24h`, MySQL range `-838:59:59..838:59:59`) has no `time` representation → **fails loudly** (needs an `interval` column instead). |
+| `TIME` | `time` (without time zone) | `time` | MANUAL | In-range `00:00:00..23:59:59`. An **out-of-range** MySQL `TIME` (negative or `> 24h`, MySQL range `-838:59:59..838:59:59`) has no `time` representation → **fails loudly** (needs an `interval` column instead). |
 | `YEAR` | `smallint` | `smallint` (integer year) | MANUAL | DSQL has no `YEAR` type; `1901–2155` fits `smallint`, stored as the integer year (`YEAR` display semantics not preserved). |
 
 #### Strings, binary, and structured
@@ -326,7 +326,7 @@ conversion (redesign).
 | `ENUM('a','b',…)` | `text` + `CHECK (col IN ('a','b',…))` | `text` | MANUAL | DSQL has no `ENUM`; ordering semantics not preserved. |
 | `SET('x','y',…)` | `text` | `text` (comma-joined) | MANUAL | No lossless mapping; multi-value set semantics handled in the app. |
 | `JSON` | `json` | `json` | AUTO | (CDC wraps the JSON text in a `PGobject(type=json)` so it targets the `json` column.) |
-| spatial (`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL has no spatial type; the data is **preserved** as raw WKB bytes (Full Load reads `ST_AsBinary(col)`, CDC extracts Debezium geometry's `.wkb`; **SRID is dropped**). The `geometry` *column type* itself is flagged UNSUPPORTED, but the values are not lost. |
+| spatial (`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL has no spatial type; the data is **preserved** as raw WKB bytes (Full Load reads `ST_AsBinary(col)`, CDC extracts Debezium geometry's `.wkb`; **SRID is dropped**). The `geometry` *column type* itself is flagged MANUAL (auto-substituted to `bytea`, WKB preserved), so the values are not lost. |
 
 ### Structural constraints
 

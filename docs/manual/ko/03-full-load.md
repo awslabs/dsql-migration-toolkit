@@ -42,7 +42,7 @@ Source MySQL                         Aurora DSQL
 SELECT <cols> FROM <table>
 WHERE pk > :last           -- (복합 PK는 행-값 튜플 비교 사용)
 ORDER BY pk
-LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 1000
+LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 5000
 ```
 
 각 페이지의 마지막 행 PK로 `:last`를 전진시키며, 짧은 페이지가 끝을 알릴 때까지 반복합니다. 쿼리는
@@ -87,7 +87,7 @@ LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 1000
 | 트랜잭션당 ≤ 3000행 | 배치 행 수 제한 | `DEFAULT_BATCH_ROWS = 2000`, 하드 상한 `3000` |
 | 바인드 파라미터 한도 | 한도에 맞게 배치 크기 제한 | `MAX_STATEMENT_PARAMETERS = 65535` (`65535 // 컬럼수`) |
 | write-txn 크기 | 넓은 행 분할 | `MAX_BATCH_BYTES = 8 MiB` |
-| 낙관적 동시성(`40001`) | 백오프+지터로 배치 재시도 | 최대 10회 |
+| 낙관적 동시성(`40001`) | 백오프+지터로 배치 재시도 — 일시적 연결 끊김에도 적용 | 최대 20회 |
 | 한정된 자원 사용 | 동시 배치 제한 | 테이블당 `DEFAULT_PARALLELISM = 8`, 동시 `4`개 테이블 |
 
 **다시 돌려도 안전합니다(idempotent).** 적재는 `INSERT ... ON CONFLICT`를 쓰므로 같은 배치를 다시
@@ -182,8 +182,12 @@ v0.1.68부터 로더는 **`ProcessPoolExecutor`**를 사용합니다 — 각 테
 ### 동작 방식
 
 - **소형 테이블** (shard 불가 또는 행 수 미달): 테이블당 1 worker 프로세스.
-- **대형 테이블** (단일 정수 PK): 자동으로 K개 PK range shard로 분할, 각각 별도
-  worker 프로세스에서 로드.
+- **대형 테이블** (선행 PK 컬럼이 정수인 경우 — 단일 정수 PK, 또는 `(tenant_id, id)`처럼
+  선행 컬럼이 정수인 복합 PK): K개 PK range shard로 분할해 각각 별도 worker 프로세스에서
+  소스의 겹치지 않는 구간을 로드. 이 reader-range 샤딩은 **기본적으로 꺼져 있으며**
+  (`full_load_reader_shards=1`), `FULL_LOAD_READER_SHARDS` > 1로 켭니다. 또한
+  **CDC 병행 실행**에서만 동작합니다 — 단독 Full Load / REPLACE는 항상 테이블당 리더 하나를
+  사용합니다.
 - **모든 work unit이 하나의 bounded pool 공유** — `table_parallelism`이 동시 worker 수를 제어.
 
 ```
@@ -200,7 +204,7 @@ ProcessPoolExecutor(max_workers=table_parallelism)
 
 대규모 마이그레이션에서는 worker 수를 태스크의 vCPU 수에 맞추세요 — pool slot을
 whole-table worker와 shard worker에 배분하는 일은 로더가 알아서 합니다. 관련 설정
-(`TABLE_PARALLELISM`, `BATCH_PARALLELISM`, `SHARD_MIN_ROWS`)과 각각의 한도, 그리고 소스
+(`TABLE_PARALLELISM`, `BATCH_PARALLELISM`, `SHARD_MIN_ROWS`, `FULL_LOAD_READER_SHARDS`)과 각각의 한도, 그리고 소스
 부하와의 관계는 [7장 §7.2 — 병렬도 튜닝](07-performance-and-tuning.md#72-병렬수-튜닝)에
 모여 있습니다. 이 설계가 실제로 낸 처리량(그리고 이것이 대체한 ThreadPool 기준선)은
 [Appendix: 성능 테스트 결과](12-performance-test-results.md)에 있습니다.

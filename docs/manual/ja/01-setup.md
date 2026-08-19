@@ -158,10 +158,10 @@ AWS_REGION=us-east-1 deploy/build_in_codebuild.sh      # イメージ URI を出
 > インターフェイスを作成しようとすると `AccessDenied` で失敗します。
 
 > **セキュリティ上の注意:** デプロイされたアプリは **自身では一切認証を行わず**、ALB の任意の
-> Cognito ゲートに依存します。Cognito **なし** のインターネット向け ALB はマイグレーションツール
-> 全体を露出させてしまいますが、デプロイテンプレートの `Rules` セクションがその組み合わせを
-> ブロックします。インターネット向けのデプロイでは必ず Cognito(`EnableCognitoAuth=true`)を
-> 有効にしてください。
+> Cognito ゲートに依存します。`0.0.0.0/0` に全開放したインターネット向け ALB を Cognito **なし**
+> のままにすると、デプロイテンプレートの `Rules`(`CognitoRequiredWhenIngressOpen`)がこれを
+> ブロックします。Cognito(`EnableCognitoAuth=true`)を有効にするか、`AllowedIngressCidr` を
+> 自分のネットワークに限定してください。
 
 ### 顧客向けデプロイの推奨設定
 
@@ -171,14 +171,14 @@ AWS_REGION=us-east-1 deploy/build_in_codebuild.sh      # イメージ URI を出
 
 | 設定 | 推奨値 | 理由 |
 |---|---|---|
-| `AlbScheme` | **`internal`**(推奨) | ツールをパブリックインターネットから切り離す — VPN / Direct Connect / VPC ピアリング経由でアクセスします。`internet-facing` は Cognito を有効にした場合のみ使用してください。 |
-| `EnableCognitoAuth` | **`true`**(推奨。インターネット向けの場合は **必須**) | アプリは自身の認証を持たないため、Cognito が唯一のゲートです。`CognitoDomainPrefix` と **`CognitoAdminEmail`** を併せて設定してください — テンプレートは 3 つをセットで要求します。ユーザープールにセルフサインアップがなく、最初のユーザーがいないと誰もログインできないアプリになるためです。 |
+| `AlbScheme` | **`internal`**(推奨) | ツールをパブリックインターネットから切り離す — VPN / Direct Connect / VPC ピアリング経由でアクセスします。`internet-facing` は `AllowedIngressCidr` を自分のネットワークに限定した場合のみ使用してください(`0.0.0.0/0` に開放した ALB は Cognito なしではブロックされます)。 |
+| `EnableCognitoAuth` | **`true`**(推奨。`AllowedIngressCidr=0.0.0.0/0` の場合のみ **必須**) | アプリは自身の認証を持たないため、Cognito が唯一のゲートです。`CognitoDomainPrefix` と **`CognitoAdminEmail`** を併せて設定してください — テンプレートは 3 つをセットで要求します。ユーザープールにセルフサインアップがなく、最初のユーザーがいないと誰もログインできないアプリになるためです。 |
 | `AllowedIngressCidr` | **自分のネットワークに限定**(推奨) | ALB に到達できる範囲を制限します。`0.0.0.0/0` のように全開放しないでください。 |
 | `AssignPublicIp` | **`DISABLED` + NAT ゲートウェイまたは VPC エンドポイント**(本番環境で推奨) | パブリックサブネットでの `ENABLED` は NAT を省くための **テスト専用** の近道です。 |
 | タスクの egress | **VPC エンドポイント**(現実的な場合は推奨) | DSQL / Secrets Manager / ECR / Logs (/ Bedrock) にパブリック経路なしでプライベートに到達します。そうでなければ NAT ゲートウェイを使用します。 |
 | イメージ参照 | **イミュータブルなタグまたは digest**(推奨) | 再現可能なデプロイ — 動く `:latest` は避けてください。 |
 | アクティビティログの CloudWatch ミラー | **オン**(推奨) | 永続的な監査証跡になります — タスク上の `/tmp` のコピーはタスク置き換え時に失われます。 |
-| ジョブ/セッションの状態 | **EFS バックエンド**(無損失の再開が必要なら推奨) | タスク置き換え後も残るため、進行中の Full Load が再開できます。既定の `/tmp` はタスクごとで揮発性です。 |
+| ジョブ/セッションの状態 | **S3 バックエンド** — 管理対象バケット(無損失の再開に推奨) | タスク置き換え後も残るため、進行中の Full Load が再開できます。既定の `/tmp` はタスクごとで揮発性です。 |
 
 > *動作を最も速く確認する* 近道は **Dev/Test プロファイル**(`internal` ALB、
 > `EnableCognitoAuth=false`、自己署名証明書)です — これでも本物の Fargate であり、構成要素が
@@ -194,7 +194,7 @@ AWS_REGION=us-east-1 deploy/build_in_codebuild.sh      # イメージ URI を出
 | 項目 | 入力内容 |
 |---|---|
 | **Source** | RDS/Aurora MySQL の host、port(3306)、user、password — **または** それらを保持する Secrets Manager シークレットの ARN/名前。 |
-| **Target** | Aurora DSQL の **クラスターエンドポイント**、リージョン、データベース(既定は `postgres`)、ユーザー名(既定は `admin`)。**パスワードなし** — ツールが IAM トークンを生成します。 |
+| **Target** | Aurora DSQL の **クラスターエンドポイント**、リージョン、データベース(`postgres` に固定、読み取り専用で表示)、ユーザー名(既定は `admin`)。**パスワードなし** — ツールが IAM トークンを生成します。 |
 
 次に、各接続を **テスト** するためにクリックします。ツールは:
 

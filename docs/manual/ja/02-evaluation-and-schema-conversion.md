@@ -31,8 +31,8 @@ Aurora MySQL ユーザーにとって、**この段階は DSQL が受け入れ�
 | 分類 | 意味 | 例 |
 |---|---|---|
 | **AUTO** | 自動変換され、人手の作業は不要。 | マッピング可能な型と PK を持つ通常のテーブル/カラム。 |
-| **MANUAL** | 変換はされるが、判断またはアプリ側の変更が必要。 | 外部キー、大文字小文字を区別しない collation、パーティションテーブル、過大な LOB カラム、`ENUM`/`SET`、生成カラム、`ON UPDATE` タイムスタンプ、複数データベースのソース。 |
-| **UNSUPPORTED** | 自動変換不可 — 再設計が必要。 | トリガー、ストアドプロシージャ/関数、スケジュールイベント、PK のないテーブル、空間/geometry 型、`DECIMAL` 精度 > 38、テーブルあたりカラム > 255、データベースあたりテーブル > 1000、FULLTEXT/SPATIAL インデックス。 |
+| **MANUAL** | 変換はされるが、判断またはアプリ側の変更が必要。 | 外部キー、大文字小文字を区別しない collation、パーティションテーブル、過大な LOB カラム、`ENUM`/`SET`、生成カラム、`ON UPDATE` タイムスタンプ、空間/geometry 型、複数データベースのソース。 |
+| **UNSUPPORTED** | 自動変換不可 — 再設計が必要。 | トリガー、ストアドプロシージャ/関数、スケジュールイベント、PK のないテーブル、`DECIMAL` 精度 > 38、テーブルあたりカラム > 255、データベースあたりテーブル > 1000、FULLTEXT/SPATIAL インデックス。 |
 
 分類されないオブジェクトはありません — どのルールにも一致しないオブジェクトはデフォルトで **AUTO** に
 なります。1 つのオブジェクトに複数のルールが一致した場合は、**最も厳しい** 分類が優先され
@@ -269,7 +269,7 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 | `DATETIME` | `timestamp` (タイムゾーンなし) | `timestamp` (UTC wall-clock) | AUTO | **UTC** として扱われ/正規化されます。 |
 | `DATETIME(6)` | `timestamp` | `timestamp` (UTC, microsecond precision) | AUTO | 小数秒はマイクロ秒まで保持されます。 |
 | `TIMESTAMP` | `timestamptz` | `timestamptz` (UTC instant) | AUTO | 絶対的な UTC 時点として格納されます。 |
-| `TIME` | `time` (タイムゾーンなし) | `time` | AUTO | 範囲内は `00:00:00..23:59:59`。**範囲外** の MySQL `TIME` (負の値または `> 24h`、MySQL の範囲は `-838:59:59..838:59:59`) は `time` として表現できないため **明示的に失敗** します (代わりに `interval` 列が必要です)。 |
+| `TIME` | `time` (タイムゾーンなし) | `time` | MANUAL | 範囲内は `00:00:00..23:59:59`。**範囲外** の MySQL `TIME` (負の値または `> 24h`、MySQL の範囲は `-838:59:59..838:59:59`) は `time` として表現できないため **明示的に失敗** します (代わりに `interval` 列が必要です)。 |
 | `YEAR` | `smallint` | `smallint` (integer year) | MANUAL | DSQL には `YEAR` 型がありません。`1901–2155` は `smallint` に収まり、整数の年として格納されます (`YEAR` の表示セマンティクスは保持されません)。 |
 
 #### 文字列、バイナリ、構造化
@@ -285,7 +285,7 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 | `ENUM('a','b',…)` | `text` + `CHECK (col IN ('a','b',…))` | `text` | MANUAL | DSQL には `ENUM` がありません。順序のセマンティクスは保持されません。 |
 | `SET('x','y',…)` | `text` | `text` (comma-joined) | MANUAL | ロスレスなマッピングはありません。複数値の set セマンティクスはアプリケーションで処理します。 |
 | `JSON` | `json` | `json` | AUTO | (CDC は JSON テキストを `PGobject(type=json)` でラップし、`json` 列をターゲットにします。) |
-| 空間型 (`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL には空間型がありません。データは生の WKB バイトとして **保持** されます (Full Load は `ST_AsBinary(col)` を読み取り、CDC は Debezium の geometry の `.wkb` を抽出します。**SRID はドロップ** されます)。`geometry` の *列型* 自体は UNSUPPORTED としてフラグ付けされますが、値は失われません。 |
+| 空間型 (`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL には空間型がありません。データは生の WKB バイトとして **保持** されます (Full Load は `ST_AsBinary(col)` を読み取り、CDC は Debezium の geometry の `.wkb` を抽出します。**SRID はドロップ** されます)。`geometry` の *列型* 自体は MANUAL としてフラグ付けされ(自動的に `bytea` へ置換され、WKB は保持)、値は失われません。 |
 
 ### 構造上の制約
 

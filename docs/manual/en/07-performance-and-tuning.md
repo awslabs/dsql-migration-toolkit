@@ -168,7 +168,7 @@ refresh margin), so hours-long CDC never stalls on auth.
 
 ## 7.2 Tuning parallelism
 
-All four migration phases run with sensible bounded defaults; you can raise them
+All three migration phases run with sensible bounded defaults; you can raise them
 for throughput on big hardware or lower them to protect a busy source. **Each
 phase is tuned differently** — Full Load and Validation via the app's environment
 variables, CDC via CloudFormation parameters.
@@ -331,7 +331,7 @@ single-task source has spare CPU — so raise the **sink's** MCUs, not the sourc
 if the sink can't keep up. See the appendix (§12) for the measured curve.
 
 Unlike everything else in this section, this one is in the UI:
-**Settings → Performance → CDC → "Sink compute (MCU)"** (or
+**Settings → CDC → "Sink compute (MCU)"** (or
 `DSQL_MIGRATOR_CDC_SINK_MCU_COUNT`). Only 1 / 2 / 4 / 8 are offered — those are the
 MSK Connect API's valid values (`mcuCount`), so 8 MCUs per worker is the ceiling.
 1 MCU = 1 vCPU + 4 GiB.
@@ -369,7 +369,7 @@ parameters, passed when the tool deploys the cdc-stack.
 
 > **Retune between runs without redeploying.** For iterating on these Full Load /
 > Validation values, open **Settings** in the sidebar footer and go to the
-> **Performance** tab: the loader and validator re-read the config on every run,
+> **Full Load / Validation** tab: the loader and validator re-read the config on every run,
 > so a value you set there applies to the **next** Full Load / Validation
 > immediately — no task-definition edit or redeploy. It is app-wide (single-task
 > app) and resets to the deploy/startup values on restart, so set the
@@ -410,7 +410,7 @@ for the full CPU↔memory pairing table.
 
 Full Load reads your production source, so the natural worry is: **"loading many
 tables at once means a heavy read — will it hurt the source?"** The design already
-keeps that read light (keyset streaming, no `OFFSET` re-scans, one ~1000-row page
+keeps that read light (keyset streaming, no `OFFSET` re-scans, one ~5000-row page
 in flight per table, no global lock, scan-free `information_schema` counts instead
 of `COUNT(*)`, and implicit back-pressure — the next page is only read after the
 current one is loaded). What's left to manage is **concurrent read pressure**, and
@@ -422,10 +422,10 @@ it scales almost entirely with **one lever**.
 tables are read from the source at once* — one streaming source connection per
 concurrent table. It is the dial on concurrent source read pressure. `BATCH_PARALLELISM`
 and `BATCH_ROWS` raise **DSQL write** pressure, not source read load; leave them
-unless DSQL is the bottleneck. (The source read **page size is fixed at 1000 rows**
+unless DSQL is the bottleneck. (The source read **page size is fixed at 5000 rows**
 and is not tunable — table parallelism is your only source-read throttle.)
 
-> Set it under **Settings → Performance** to experiment between runs, or as the env
+> Set it under **Settings → Full Load** to experiment between runs, or as the env
 > var to persist it (see §7.2).
 
 ### Start conservative, then tune under observation

@@ -187,15 +187,16 @@ defaults in [§7.2](07-performance-and-tuning.md#72-tuning-parallelism).
 |---|---|---|
 | `topic.creation.default.partitions` | cdc-stack (inferred) | Sink's unit of parallelism — one sink task consumes one partition. **Irreversible** (raise-only). |
 | `SinkTasksMax` | cdc-stack (inferred) | Sink connector write parallelism; effective value capped by the partition count. |
-| `ConnectorMcuCount` | cdc-stack (inferred) | MSK Connect compute units per worker (1/2/4/8). |
+| `ConnectorMcuCount` | cdc-stack (default 2, env-overridable) | MSK Connect compute units per worker (1/2/4/8). |
 | `SinkBatchMaxRows` | cdc-stack (3000, fixed) | Rows per DSQL write transaction (DSQL's hard limit). |
 | `consumer.max.poll.records` | sink worker config | Records handed to one `put()` — bounds how many the sink can coalesce into one JDBC `executeBatch`. |
 | `max.batch.size` / `max.queue.size` | source connector | Binlog events drained per streaming iteration / reader→producer queue depth. |
 | `producer.batch.size` / `linger.ms` / `compression.type` | source worker config | Size, fill-delay, and compression of the Kafka produce batch. |
 
-The connector-scaling knobs (partitions / `SinkTasksMax` / `ConnectorMcuCount`) are
-**inferred from the captured-table count** and not exposed in the UI — see
-[§7.2 → CDC](07-performance-and-tuning.md#72-tuning-parallelism).
+The connector-scaling knobs (partitions / `SinkTasksMax`) are **inferred from the
+captured-table count** and not exposed in the UI; `ConnectorMcuCount` is a fixed
+default (`CDC_DEFAULT_MCU_COUNT` = 2, env-overridable), not derived from the table
+count — see [§7.2 → CDC](07-performance-and-tuning.md#72-tuning-parallelism).
 
 ### Test environment (CDC)
 
@@ -335,6 +336,8 @@ catch up with no gap.)
 
 ```bash
 AWS_REGION=us-east-1 \
+DB_HOST=<rds-host> DB_PORT=3306 DB_USER=admin DB_PASSWORD=<pw> \
+TARGET_ENDPOINT=<dsql-cluster-endpoint> \
 MEASURE_SCHEMA=customers_sample \
 MEASURE_TABLES="order_items orders payments customers" \
 TABLE_PARALLELISM=8 \

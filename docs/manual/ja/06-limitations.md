@@ -22,7 +22,7 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
 | **ネイティブパーティショニングなし** | DSQL がデータを自動的に分散します。 | パーティション化されたテーブルは **MANUAL** としてフラグ付け(パーティショニングを削除)。 |
 | **値ごとに 1 MiB の上限** | 約 1 MiB を超える単一の `TEXT`/`BLOB` 値は保存できません。 | 1〜8 MiB の値はエラーログ / DLQ に**隔離**(quarantine)されます。> 8 MiB の列は**キャプチャ時に除外**する必要があります。大きな LOB 列は `OVERSIZED_LOB`(MANUAL)としてフラグ付け。 |
 | **`DECIMAL` の精度 > 38** | これより高い精度は未対応です。 | **UNSUPPORTED**(`NUMERIC_PRECISION`)としてフラグ付け。 |
-| **空間 / geometry 型** | 未対応です。 | **UNSUPPORTED** としてフラグ付け。 |
+| **空間 / geometry 型** | `bytea` に置換されます(元の WKB が Full Load・CDC の全区間でそのまま保存されます)。 | コンバーターが各列を `bytea` に自動置換し、アセッサーがそのテーブルを要レビューの **MANUAL** としてフラグ付け。 |
 | **FULLTEXT / SPATIAL インデックス** | 未対応です。 | **UNSUPPORTED** としてフラグ付け。 |
 | **テーブルあたり ≤ 255 列、データベースあたり ≤ 1000 テーブル** | これらを超えると未対応です。 | **UNSUPPORTED**(`TOO_MANY_COLUMNS` / `TABLE_COUNT_LIMIT`)としてフラグ付け。 |
 | **テーブルあたり ≤ 24 インデックス**(PK も数に含まれるため、セカンダリは ≤ 23。MySQL は 64) | 超過分の `CREATE INDEX ASYNC` は、Full Load が全行を書き込んだ**後に**失敗します。 | 計画段階で **MANUAL**(`TOO_MANY_INDEXES`)としてフラグ付けし、Schema Conversion にも同じ注記を表示。 |
@@ -78,8 +78,9 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
   ローカルの SQLite として保存されるため、タスクが置き換わると(デプロイ、クラッシュ)、
   進行中のジョブ状態が失われます — 再接続して読み取り専用のステップを再実行して
   ください。この状態を共有ストアに移さずにタスクを 2 つ以上にスケールしないでください。
-  無損失の再開が必要な場合は、ジョブ / セッションの状態パスを共有 EFS マウントに
-  向けることができます([`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.ja.md) を参照)。
+  コードが公開する `SessionStateStore`/`JobStore` プロトコルは DynamoDB で裏付ける
+  ように設計されています。セッションの永続的な再開は、すでに S3(`sessions/` プレフィックス)
+  スナップショットによってタスクの置き換えを乗り越えて維持されます。
 - **組み込みのアプリ認証はありません。** アプリは ALB の**オプションの Cognito**
   ゲートに依存します。インターネットに公開するデプロイでは Cognito を有効にして
   ください — デプロイテンプレートは、Cognito なしでインターネットに公開する

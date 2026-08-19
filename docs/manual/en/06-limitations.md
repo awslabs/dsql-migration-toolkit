@@ -22,7 +22,7 @@ fails **loudly** where it can't.
 | **No native partitioning** | DSQL auto-distributes data itself. | Partitioned tables flagged **MANUAL** (drop the partitioning). |
 | **1 MiB per-value limit** | A single `TEXT`/`BLOB` value over ~1 MiB can't be stored. | 1–8 MiB values **quarantined** to the error log / DLQ; > 8 MiB columns must be **excluded at capture**. Large LOB columns flagged `OVERSIZED_LOB` (MANUAL). |
 | **`DECIMAL` precision > 38** | Higher precision unsupported. | Flagged **UNSUPPORTED** (`NUMERIC_PRECISION`). |
-| **Spatial / geometry types** | Not supported. | Flagged **UNSUPPORTED**. |
+| **Spatial / geometry types** | Substituted to `bytea` (raw WKB preserved end-to-end through Full Load and CDC). | The converter auto-substitutes each column to `bytea`; the assessor flags the table **MANUAL** for review. |
 | **FULLTEXT / SPATIAL indexes** | Not supported. | Flagged **UNSUPPORTED**. |
 | **≤ 255 columns per table, ≤ 1000 tables per database** | Beyond these, unsupported. | Flagged **UNSUPPORTED** (`TOO_MANY_COLUMNS` / `TABLE_COUNT_LIMIT`). |
 | **≤ 24 indexes per table** (the PK counts, so ≤ 23 secondary; MySQL allows 64) | The excess `CREATE INDEX ASYNC` fails **after** Full Load has written every row. | Flagged **MANUAL** (`TOO_MANY_INDEXES`) at planning time, with a matching Schema Conversion note. |
@@ -72,8 +72,9 @@ fails **loudly** where it can't.
   job/session state is local SQLite on the task's **ephemeral storage**, so a task
   replacement (deploy, crash) loses in-flight job state — you reconnect and re-run
   the read-only steps. Don't scale to more than one task without moving that state
-  to a shared store; for zero-loss resume you can point the job/session state
-  paths at a shared EFS mount (see [`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.md)).
+  to a shared store — the `SessionStateStore`/`JobStore` protocols the code exposes
+  are designed to be backed by DynamoDB. Durable session resume already survives a
+  task replacement via an S3 (`sessions/` prefix) snapshot.
 - **No built-in app authentication.** The app relies on the ALB's **optional
   Cognito** gate. Enable Cognito for any internet-facing deployment — the deploy
   template blocks the unsafe internet-facing-without-Cognito combination.

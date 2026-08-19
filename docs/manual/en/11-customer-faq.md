@@ -181,9 +181,12 @@ target's shape goes to the **DLQ** (dead-letter), not lost. See
 
 **Q15. Why a custom DSQL sink connector instead of a stock JDBC sink?**
 
-Three DSQL-specific reasons a stock sink can't handle: (1) it retries write
-conflicts at the **statement level** (only the conflicting row re-runs) instead of
-re-submitting the whole batch, which avoids livelock on hot keys; (2) it mints and
+Three DSQL-specific reasons a stock sink can't handle: (1) on a write conflict
+(`SQLSTATE 40001`) it re-runs the **whole batch transaction** — an idempotent,
+PK-keyed upsert/delete — with **exponential backoff + full jitter**, which bounds
+livelock on hot keys (a per-row, record-by-record replay happens only on a
+*permanent, non-OCC* error, to isolate the bad row to the DLQ while healthy rows
+commit); (2) it mints and
 **refreshes short-lived IAM tokens** so an hours-long stream never stalls on auth;
 (3) it enforces DSQL's 3000-row / 1 MiB envelopes and routes poison rows to a DLQ.
 See [Chapter 4 §4.1](04-cdc-and-dsql-constraints.md#41-the-pipeline).
@@ -193,8 +196,8 @@ See [Chapter 4 §4.1](04-cdc-and-dsql-constraints.md#41-the-pipeline).
 
 The streaming pipeline (MSK Serverless + MSK Connect, plus a NAT gateway if the tool
 created one) **costs money for as long as it runs** — there is no free "pause". Tear
-the cdc-stack down after cut-over (the **Cut over** step's *Delete all CDC
-infrastructure* does this). Full Load alone provisions **no** streaming
+the cdc-stack down after cut-over (via **Start over (top right)** → *Delete all CDC
+infrastructure*; the Cut over runbook points you there). Full Load alone provisions **no** streaming
 infrastructure. See [Chapter 6 §6.2](06-limitations.md#62-migration-process-limits).
 
 
@@ -444,7 +447,7 @@ identity must hold them**):
 The AWS-hosted form is a **single ECS Fargate task** whose job/session state is local
 SQLite on ephemeral storage — a task replacement loses in-flight job state (you
 reconnect and re-run the read-only steps). Don't run more than one task without
-moving that state to a shared store (e.g. an EFS mount for zero-loss resume). See
+moving that state to a shared store (e.g. the managed S3 bucket for zero-loss resume). See
 [Chapter 6 §6.3](06-limitations.md#63-deployment-limits-the-aws-hosted-form).
 
 

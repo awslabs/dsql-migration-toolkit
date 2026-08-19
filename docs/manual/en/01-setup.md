@@ -164,10 +164,10 @@ can't be inferred, such as the VpcId).
 > shared subnet fails with `AccessDenied`.
 
 > **Security note:** the deployed app enforces **no authentication of its own** —
-> it relies on the ALB's optional Cognito gate. An internet-facing ALB **without**
-> Cognito would expose the full migration tool; the deploy template's `Rules`
-> section blocks that combination. Enable Cognito (`EnableCognitoAuth=true`) for
-> any internet-facing deployment.
+> it relies on the ALB's optional Cognito gate. An internet-facing ALB left open to
+> `0.0.0.0/0` **without** Cognito is blocked by the template's `Rules`
+> (`CognitoRequiredWhenIngressOpen`); either enable Cognito (`EnableCognitoAuth=true`)
+> or scope `AllowedIngressCidr` to your network.
 
 ### Recommended settings for a customer deployment
 
@@ -177,14 +177,14 @@ CloudFormation parameter in [`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.
 
 | Setting | Recommended | Why |
 |---|---|---|
-| `AlbScheme` | **`internal`** (Recommended) | Keeps the tool off the public internet — reach it over VPN / Direct Connect / VPC peering. Use `internet-facing` only with Cognito on. |
-| `EnableCognitoAuth` | **`true`** (Recommended; **required** if internet-facing) | The app has no authentication of its own; Cognito is the gate. Set `CognitoDomainPrefix` **and `CognitoAdminEmail`** with it — the template requires all three together, because the user pool has no self sign-up and without a first user the deploy would hand you an app nobody can log in to. |
+| `AlbScheme` | **`internal`** (Recommended) | Keeps the tool off the public internet — reach it over VPN / Direct Connect / VPC peering. Use `internet-facing` only when `AllowedIngressCidr` is scoped to your network (an ALB open to `0.0.0.0/0` without Cognito is blocked). |
+| `EnableCognitoAuth` | **`true`** (Recommended; **required** only if `AllowedIngressCidr=0.0.0.0/0`) | The app has no authentication of its own; Cognito is the gate. Set `CognitoDomainPrefix` **and `CognitoAdminEmail`** with it — the template requires all three together, because the user pool has no self sign-up and without a first user the deploy would hand you an app nobody can log in to. |
 | `AllowedIngressCidr` | **scoped to your network** (Recommended) | Restrict who can reach the ALB; don't leave it wide open (`0.0.0.0/0`). |
 | `AssignPublicIp` | **`DISABLED` + NAT gateway or VPC endpoints** (Recommended for production) | `ENABLED` in public subnets is a **test-only** shortcut to skip a NAT. |
 | Task egress | **VPC endpoints** (Recommended where practical) | Reach DSQL / Secrets Manager / ECR / Logs (/ Bedrock) privately, with no public path; otherwise a NAT gateway. |
 | Image reference | **immutable tag or digest** (Recommended) | Reproducible deploys; avoid a moving `:latest`. |
 | Activity-log CloudWatch mirror | **on** (Recommended) | A durable audit trail — the on-task `/tmp` copy is lost on task replacement. |
-| Job/session state | **EFS-backed** (Recommended if you need zero-loss resume) | Survives a task replacement so an in-flight Full Load resumes; the default `/tmp` is per-task and ephemeral. |
+| Job/session state | **S3-backed** — the managed bucket (Recommended for zero-loss resume) | Survives a task replacement so an in-flight Full Load resumes; the default `/tmp` is per-task and ephemeral. |
 
 > The fastest path to *see it run* is the **Dev/Test profile** (`internal` ALB,
 > `EnableCognitoAuth=false`, self-signed cert) — still real Fargate, just fewer
@@ -200,7 +200,7 @@ Open the tool and start at the **Connect** step. You provide:
 | Field | What to enter |
 |---|---|
 | **Source** | Your RDS/Aurora MySQL host, port (3306), user, and password — **or** a Secrets Manager secret ARN/name holding them. |
-| **Target** | Your Aurora DSQL **cluster endpoint**, region, database (`postgres` by default), and username (`admin` by default). **No password** — the tool generates an IAM token. |
+| **Target** | Your Aurora DSQL **cluster endpoint**, region, database (fixed to `postgres`, shown read-only), and username (`admin` by default). **No password** — the tool generates an IAM token. |
 
 Then click to **test** each connection. The tool:
 

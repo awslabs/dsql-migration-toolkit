@@ -85,7 +85,7 @@ DSQL은 분산형이면서 PostgreSQL 호환이라, 싱크는 기존 MySQL/JDBC 
 |---|---|
 | **IAM 토큰 인증(비밀번호 없음)** | 단기 IAM 토큰(admin 또는 standard)을 생성해 TLS 위 JDBC 비밀번호로 사용하고, 만료 전 **갱신**(15분 토큰, 2분 갱신 여유)해 장기 CDC가 만료 토큰에 멈추지 않게 함. |
 | **낙관적 동시성(락 없음)** | `SQLSTATE 40001`에 대해 배치 전체가 아닌 **문장 단위**로 지수 백오프+지터로 재시도(최대 10회). 경합 시 처리량 차이의 핵심. |
-| **트랜잭션당 ≤ 3000행** | ≤ 3000행 청크로 적용(기본 배치 1000), 청크당 한 번 `commit()`. |
+| **트랜잭션당 ≤ 3000행** | ≤ 3000행 청크로 적용(기본 배치 3000), 청크당 한 번 `commit()`. |
 | **문장 단위 UPDATE/재생 없음** | 모든 변경을 **PK 기준 upsert/delete**로 적용: insert/update는 `INSERT ... ON CONFLICT (pk) DO UPDATE`, delete는 `DELETE ... WHERE pk = ?`(Kafka tombstone 포함). 같은 이벤트를 다시 적용해도 안전(중복 없음). |
 | **커넥션 끊김(idle close / 토큰 만료 / 워커 교체)** | 죽은 커넥션이나 half-open(끊겼지만 살아있는 듯 보이는) 커넥션을 감지해 새 토큰으로 재연결하고 **같은 오프셋부터 다시 적용**합니다. 같은 변경을 다시 적용해도 중복이 안 생기므로 안전하며, 레코드를 버리지 않습니다. 연결 오류는 일시적(transient) 오류로 보고 재시도하며, 손상된 행(poison row)으로 오인하지 않습니다. |
 
@@ -150,7 +150,9 @@ CDC 실행 중에는 Data Migration 화면이 테이블별 실시간 모니터�
 | 컬럼 | 의미 |
 |---|---|
 | **Full Load rows** | 원샷 스냅샷이 테이블에 적재한 행 수. |
-| **Net rows since Full Load** | Full Load 이후 CDC가 적용한 **순증감(net)** 행 수 — CDC 이벤트 수가 *아님*: insert는 더하고, delete는 빼며, update는 바꾸지 않습니다. 싱크가 실시간 보고(스캔 없음). 스트림이 순삭제(insert보다 delete가 많음)했으면 **음수**가 되며, 이는 오류가 아니라 정상입니다. |
+| **Inserts** | Full Load 이후 이 테이블에 적용된 CDC insert 누적 수 — 싱크가 실시간 보고하는 테이블별 **음수가 되지 않는** 누적 카운트(스캔 없음). |
+| **Updates** | Full Load 이후 이 테이블에 적용된 CDC update 누적 수 — 싱크가 실시간 보고하는 테이블별 **음수가 되지 않는** 누적 카운트(스캔 없음). |
+| **Deletes** | Full Load 이후 이 테이블에 적용된 CDC delete 누적 수 — 싱크가 실시간 보고하는 테이블별 **음수가 되지 않는** 누적 카운트(스캔 없음). |
 | **Source rows** | 스캔 없는 `information_schema` **추정치**. **Target rows** — DSQL 정확 카운트. |
 | **Stream lag** | 타깃이 소스보다 **시간상** 얼마나 뒤처졌는지(아래 참고). |
 | **Consistency** | 색상 배지: 초록 *consistent* = 카운트 일치 · *replicating…* = 따라잡는 중 · 빨강 *rows missing* = 최신 변경은 도착했으나 중간에 행 유실 · 빨강 *data quarantined* = DLQ에 미적용 이벤트 존재. |

@@ -102,7 +102,7 @@ classic MySQL/JDBC writer. Here is what it does for each constraint:
 |---|---|
 | **IAM-token auth (no password)** | Generates a short-lived IAM token (admin or standard) and uses it as the JDBC password over TLS; **refreshes before expiry** (15-min token, 2-min refresh margin) so long-running CDC never stalls on an expired token. |
 | **Optimistic concurrency (no locks)** | On `SQLSTATE 40001` it retries at the **statement level** with exponential backoff + jitter (up to 10 attempts), not per whole batch. This is the key throughput difference under contention. |
-| **≤ 3000 rows per transaction** | Applies in chunks of ≤ 3000 rows (default batch 1000), one `commit()` per chunk. |
+| **≤ 3000 rows per transaction** | Applies in chunks of ≤ 3000 rows (default batch 3000), one `commit()` per chunk. |
 | **No UPDATE-by-statement / replays** | Every change is an **idempotent upsert or delete keyed by PK**: `INSERT ... ON CONFLICT (pk) DO UPDATE` for inserts/updates, `DELETE ... WHERE pk = ?` for deletes (and Kafka tombstones). Re-applying the same event is safe. |
 | **Connections drop (idle close / token expiry / worker recycle)** | Detects a dead/half-open connection, reconnects with a fresh token, and **replays the same offsets** (safe because applies are idempotent) rather than dropping records. Connectivity errors are treated as transient and retried, not mistaken for poison rows. |
 
@@ -176,7 +176,9 @@ never runs a `COUNT(*)` against your production database. The columns:
 | Column | What it means |
 |---|---|
 | **Full Load rows** | Rows the one-shot snapshot loaded into the table. |
-| **Net rows since Full Load** | The **net** rows CDC has applied since Full Load — *not* a count of CDC events: inserts add, deletes subtract, updates don't change it. Reported live by the sink (scan-free). It is **negative** when the stream net-deleted rows (more deletes than inserts) — expected, not an error. |
+| **Inserts** | Cumulative CDC inserts applied to this table since Full Load — a **non-negative** per-table running count reported live by the sink (scan-free). |
+| **Updates** | Cumulative CDC updates applied to this table since Full Load — a **non-negative** per-table running count reported live by the sink (scan-free). |
+| **Deletes** | Cumulative CDC deletes applied to this table since Full Load — a **non-negative** per-table running count reported live by the sink (scan-free). |
 | **Source rows** | Scan-free `information_schema` **estimate**. **Target rows** — exact DSQL count. |
 | **Stream lag** | How far the target is behind the source **in time** (see below). |
 | **Consistency** | A colored badge: green *consistent* = counts match · *replicating…* = catching up · red *rows missing* = the newest change landed but rows went missing mid-stream · red *data quarantined* = the DLQ has un-applied events. |

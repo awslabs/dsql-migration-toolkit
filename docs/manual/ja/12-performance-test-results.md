@@ -183,14 +183,15 @@ CDC はボトルネックが異なるパイプラインです。Full Load は **
 |---|---|---|
 | `topic.creation.default.partitions` | cdc-stack（推論） | シンクの並列単位 — シンクタスク 1 つがパーティション 1 つを消費。**不可逆**（増やすのみ）。 |
 | `SinkTasksMax` | cdc-stack（推論） | シンクコネクタの書き込み並列度；実効値はパーティション数で上限。 |
-| `ConnectorMcuCount` | cdc-stack（推論） | ワーカーあたりの MSK Connect コンピュートユニット（1/2/4/8）。 |
+| `ConnectorMcuCount` | cdc-stack（既定 2、環境変数で上書き可） | ワーカーあたりの MSK Connect コンピュートユニット（1/2/4/8）。 |
 | `SinkBatchMaxRows` | cdc-stack（3000、固定） | DSQL 書き込みトランザクションあたりの行数（DSQL のハード上限）。 |
 | `consumer.max.poll.records` | シンクワーカー設定 | 1 回の `put()` に渡すレコード数 — シンクが 1 つの JDBC `executeBatch` にまとめられる上限。 |
 | `max.batch.size` / `max.queue.size` | ソースコネクタ | ストリーミング反復あたりに排出する binlog イベント数 / reader→producer キュー深さ。 |
 | `producer.batch.size` / `linger.ms` / `compression.type` | ソースワーカー設定 | Kafka produce バッチのサイズ・充填遅延・圧縮。 |
 
-コネクタのスケーリングノブ（パーティション / `SinkTasksMax` / `ConnectorMcuCount`）は
-**キャプチャテーブル数から推論**され、UI には公開されません —
+コネクタのスケーリングノブ（パーティション / `SinkTasksMax`）は**キャプチャテーブル数から
+推論**され、UI には公開されません。`ConnectorMcuCount` はテーブル数から導出されない固定の
+既定値（`CDC_DEFAULT_MCU_COUNT` = 2、環境変数で上書き可）です —
 [§7.2 → CDC](07-performance-and-tuning.md#72-並列度のチューニング) を参照。
 
 ### テスト環境（CDC）
@@ -303,6 +304,8 @@ CDC のボトルネックになり得ます（2 vCPU ソースが CPU 93% でパ
 
 ```bash
 AWS_REGION=us-east-1 \
+DB_HOST=<rds-host> DB_PORT=3306 DB_USER=admin DB_PASSWORD=<pw> \
+TARGET_ENDPOINT=<dsql-cluster-endpoint> \
 MEASURE_SCHEMA=customers_sample \
 MEASURE_TABLES="order_items orders payments customers" \
 TABLE_PARALLELISM=8 \

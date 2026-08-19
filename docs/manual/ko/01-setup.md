@@ -143,9 +143,9 @@ AWS_REGION=us-east-1 deploy/build_in_codebuild.sh      # 이미지 URI 출력
 > 공유 서브넷에 커넥터의 네트워크 인터페이스를 만들 때 `AccessDenied`로 실패합니다.
 
 > **보안 참고:** 배포된 앱은 **자체 인증을 하지 않으며** ALB의 선택적 Cognito 게이트에 의존합니다.
-> Cognito **없이** 인터넷 노출 ALB를 쓰면 마이그레이션 도구 전체가 노출되며, 배포 템플릿의 `Rules`
-> 섹션이 그 조합을 막습니다. 인터넷 노출 배포에서는 반드시 Cognito(`EnableCognitoAuth=true`)를
-> 켜세요.
+> `0.0.0.0/0`으로 전체 개방된 인터넷 노출 ALB를 Cognito **없이** 두면 배포 템플릿의 `Rules`
+> (`CognitoRequiredWhenIngressOpen`)가 이를 막습니다. Cognito(`EnableCognitoAuth=true`)를 켜거나
+> `AllowedIngressCidr`를 내 네트워크로 한정하세요.
 
 ### 고객 배포 권장 설정
 
@@ -155,14 +155,14 @@ CloudFormation 파라미터에 대응합니다:
 
 | 설정 | 권장값 | 이유 |
 |---|---|---|
-| `AlbScheme` | **`internal`** (권장) | 도구를 공용 인터넷에서 떼어 놓음 — VPN / Direct Connect / VPC 피어링으로 접속. `internet-facing`은 Cognito를 켰을 때만. |
-| `EnableCognitoAuth` | **`true`** (권장; 인터넷 노출 시 **필수**) | 앱 자체 인증이 없으므로 Cognito가 유일한 게이트. `CognitoDomainPrefix`와 **`CognitoAdminEmail`**을 함께 설정하세요 — 템플릿이 셋을 함께 요구합니다. 유저풀에 self sign-up이 없어 첫 사용자가 없으면 아무도 로그인할 수 없는 앱이 되기 때문입니다. |
+| `AlbScheme` | **`internal`** (권장) | 도구를 공용 인터넷에서 떼어 놓음 — VPN / Direct Connect / VPC 피어링으로 접속. `internet-facing`은 `AllowedIngressCidr`를 내 네트워크로 한정했을 때만 사용(`0.0.0.0/0`으로 열린 ALB는 Cognito 없이는 차단됨). |
+| `EnableCognitoAuth` | **`true`** (권장; `AllowedIngressCidr=0.0.0.0/0`일 때만 **필수**) | 앱 자체 인증이 없으므로 Cognito가 유일한 게이트. `CognitoDomainPrefix`와 **`CognitoAdminEmail`**을 함께 설정하세요 — 템플릿이 셋을 함께 요구합니다. 유저풀에 self sign-up이 없어 첫 사용자가 없으면 아무도 로그인할 수 없는 앱이 되기 때문입니다. |
 | `AllowedIngressCidr` | **내 네트워크로 한정** (권장) | ALB 접근 범위를 제한. `0.0.0.0/0`로 열어 두지 말 것. |
 | `AssignPublicIp` | **`DISABLED` + NAT 게이트웨이 또는 VPC 엔드포인트** (운영 권장) | 퍼블릭 서브넷의 `ENABLED`는 NAT를 생략하는 **테스트 전용** 지름길. |
 | 태스크 egress | **VPC 엔드포인트** (가능하면 권장) | DSQL / Secrets Manager / ECR / Logs (/ Bedrock)에 공용 경로 없이 프라이빗으로 도달. 아니면 NAT 게이트웨이. |
 | 이미지 참조 | **immutable 태그 또는 digest** (권장) | 재현 가능한 배포 — 움직이는 `:latest` 피하기. |
 | 활동 로그 CloudWatch 미러 | **켜기** (권장) | 영속 감사 추적 — 태스크의 `/tmp` 사본은 태스크 교체 시 사라짐. |
-| 작업/세션 상태 | **EFS 백업** (무손실 재개가 필요하면 권장) | 태스크 교체 후에도 살아남아 진행 중 Full Load가 재개됨. 기본 `/tmp`는 태스크별·휘발성. |
+| 작업/세션 상태 | **S3 백업** — 관리형 버킷 (무손실 재개 권장) | 태스크 교체 후에도 살아남아 진행 중 Full Load가 재개됨. 기본 `/tmp`는 태스크별·휘발성. |
 
 > *동작을 가장 빨리 보는* 길은 **Dev/Test 프로파일**(`internal` ALB,
 > `EnableCognitoAuth=false`, 자체 서명 인증서) — 여전히 실제 Fargate이며 구성 요소만 더 적습니다.
@@ -178,7 +178,7 @@ CloudFormation 파라미터에 대응합니다:
 | 항목 | 입력 내용 |
 |---|---|
 | **Source** | RDS/Aurora MySQL host, port(3306), user, password — **또는** 이를 담은 Secrets Manager 시크릿 ARN/이름. |
-| **Target** | Aurora DSQL **클러스터 엔드포인트**, 리전, 데이터베이스(기본 `postgres`), 사용자명(기본 `admin`). **비밀번호 없음** — 도구가 IAM 토큰 생성. |
+| **Target** | Aurora DSQL **클러스터 엔드포인트**, 리전, 데이터베이스(`postgres`로 고정, 읽기 전용 표시), 사용자명(기본 `admin`). **비밀번호 없음** — 도구가 IAM 토큰 생성. |
 
 각 연결을 **테스트**합니다. 도구는:
 
