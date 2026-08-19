@@ -5,6 +5,17 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.376
+
+### Security
+
+- **Dependabot 경보 해소를 위해 전이 웹 스택 의존성 2개 상향**(둘 다 NiceGUI / FastAPI가
+  끌어오는 것으로 first-party 아님): **aiohttp 3.14.1 → 3.14.3**(HTTP 응답 파서 OOB read
+  CVE-2026-69244 + WebSocket 관련 medium 2건 해소), **starlette 1.3.0 → 1.6.0**
+  (`request.form()` DoS CVE-2026-54283 해소). 둘 다 NiceGUI/FastAPI 허용 범위 내이며 테스트는
+  그린 유지. 커넥터의 pgjdbc SCRAM-DoS 경보는 sink jar 재빌드가 필요하고 악의적 PostgreSQL
+  서버가 있어야 성립(신뢰된 Aurora DSQL 타깃에선 배제) — 별도 처리.
+
 ## v0.1.375
 
 ### Fixed

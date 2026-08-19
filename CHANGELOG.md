@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.376
+
+### Security
+
+- **Bumped two transitive web-stack dependencies to clear Dependabot alerts** (both
+  pulled by NiceGUI / FastAPI, not first-party code): **aiohttp 3.14.1 → 3.14.3**
+  (fixes the HTTP-response-parser out-of-bounds read CVE-2026-69244 plus two moderate
+  WebSocket issues) and **starlette 1.3.0 → 1.6.0** (fixes the `request.form()` DoS
+  CVE-2026-54283). Both are within NiceGUI/FastAPI's allowed ranges and the suite stays
+  green. The remaining pgjdbc SCRAM-DoS alert on the connector is tracked separately —
+  it needs a sink-jar rebuild and requires a malicious PostgreSQL server, which our
+  trusted Aurora DSQL target rules out.
+
 ## v0.1.375
 
 ### Fixed

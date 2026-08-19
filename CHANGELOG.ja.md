@@ -5,6 +5,18 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.376
+
+### Security
+
+- **Dependabot アラート解消のため、推移的な Web スタック依存関係 2 つを引き上げ**（どちらも
+  NiceGUI / FastAPI が取り込むもので first-party ではない）: **aiohttp 3.14.1 → 3.14.3**
+  （HTTP 応答パーサの OOB read CVE-2026-69244 と WebSocket 関連の medium 2 件を修正）、
+  **starlette 1.3.0 → 1.6.0**（`request.form()` の DoS CVE-2026-54283 を修正）。どちらも
+  NiceGUI/FastAPI の許容範囲内で、テストはグリーンを維持。コネクタの pgjdbc SCRAM-DoS アラートは
+  sink jar の再ビルドが必要で、悪意ある PostgreSQL サーバーを要する（信頼された Aurora DSQL
+  ターゲットでは該当しない）ため別途対応。
+
 ## v0.1.375
 
 ### Fixed
