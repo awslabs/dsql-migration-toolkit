@@ -516,8 +516,7 @@ CDC_SINK_SUFFIX = "-dsql-sink"
 # set an env var. This mirrors the product principle "infer anything that can be
 # inferred instead of asking".
 #
-# The model is grounded in the 2026-07-08 throughput test (see the Obsidian note
-# "CDC Performance Test Results"):
+# The model is grounded in a throughput test (2026-07-08):
 #   * Debezium (source) is single-task per MySQL server (one binlog stream); with
 #     the v14 producer tuning it sustains ~30k rec/s and is NOT the bottleneck.
 #   * The sink is DSQL-write-latency-bound. Throughput scales with the number of

@@ -4,8 +4,7 @@
 # source RDS / target DSQL -- so the numbers reflect the real in-VPC network path
 # (sub-ms RTT) rather than a laptop over VPN. This is the environment the prefetch
 # queue was designed for: a LOCAL (long-RTT) A/B showed ~0% because reads and writes
-# share the fixed VPN pipe, so the honest verdict was "re-measure in-VPC" (see the
-# Obsidian note "Full Load 처리량 병목 분석과 개선 방향 — 2026-07-04" §7).
+# share the fixed VPN pipe, so the honest verdict was "re-measure in-VPC".
 #
 # By default it runs BOTH variants back-to-back on the SAME deployed image:
 #   - prefetch=off  (DSQL_MIGRATOR_FULL_LOAD_PREFETCH=0)  -> the pre-improvement path
@@ -279,5 +278,5 @@ echo ""
 echo "==> Done. Recovered reports in ${OUT_DIR}/:"
 ls -1 "${OUT_DIR}"/*-in-vpc.json 2>/dev/null || echo "   (none recovered)"
 echo ""
-echo "Compare with (first = baseline):"
-echo "  python scripts/perf_compare.py compare ${OUT_DIR}/*-in-vpc.json --per-table"
+echo "Reports are plain JSON in ${OUT_DIR}/ (first = baseline); compare them with your"
+echo "own tooling (the maintainers use a local perf_compare.py that is not shipped here)."
