@@ -207,13 +207,11 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 | Amazon Bedrock | 선택적 AI 보조(컨트롤 플레인만). |
 | AWS CloudFormation | 두 스택의 IaC. |
 
-> [!NOTE]
-> 일반 배포는 ECR Public 이미지를 그대로 사용하므로 빌드가 없습니다. **AWS CodeBuild**는 런타임
+> **참고** — 일반 배포는 ECR Public 이미지를 그대로 사용하므로 빌드가 없습니다. **AWS CodeBuild**는 런타임
 > 구성요소가 아니라, 로컬 Docker가 없는 제한된 네트워크에서 자체 이미지를 빌드해야 할 때만 한 번
 > 쓰는 선택적 빌드 도구(`deploy/codebuild.yaml`)입니다.
 
-> [!IMPORTANT]
-> **EC2(소스 실행) 배포**는 ECS / ECR / ALB / Cognito 대신 **Amazon EC2 + 보존형 EBS 볼륨 +
+> **중요** — **EC2(소스 실행) 배포**는 ECS / ECR / ALB / Cognito 대신 **Amazon EC2 + 보존형 EBS 볼륨 +
 > AWS Systems Manager**(Session Manager)를 쓰고, **앱 상태를 S3 대신 그 EBS 볼륨에 둡니다.** 이
 > 모드에서 CDC는 Kafka를 인프로세스로 시드하므로 아래의 **AWS Lambda** 오프셋 시더를 만들지
 > 않습니다. (CDC는 커넥터 아티팩트를 위해 위의 S3 플러그인 버킷을 여전히 자동 프로비저닝합니다.)
@@ -340,7 +338,7 @@ AI 보조는 기본 off이며 UI에서 켭니다. UI는 Bedrock 도달 가능 �
 이유를 보고하는 **Verify AI access** 사전 점검도 제공합니다. 튜닝 노브의 배경은 매뉴얼
 [성능과 튜닝](docs/manual/ko/07-performance-and-tuning.md).
 
-> **CDC 스케일링은 여기서 설정하지 않고 추론됩니다.** 커넥터 노브(테이블별 토픽 파티션 수, 싱크
+> **참고** — CDC 스케일링은 여기서 설정하지 않고 추론됩니다. 커넥터 노브(테이블별 토픽 파티션 수, 싱크
 > `tasks.max`, MSK Connect MCU)는 cdc-stack 배포 시점에 캡처 대상 테이블 수로부터 결정됩니다. 고급
 > 환경 변수 재정의(`DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` / `_SINK_TASKS_MAX` / `_MCU_COUNT`)는 매뉴얼
 > [§7.2 — CDC](docs/manual/ko/07-performance-and-tuning.md)에 문서화돼 있습니다.

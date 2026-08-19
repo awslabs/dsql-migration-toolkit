@@ -224,13 +224,11 @@ both stacks. Debezium is open-source software running *on* MSK Connect.
 | Amazon Bedrock | Optional AI assist (control plane only). |
 | AWS CloudFormation | Infrastructure-as-code for both stacks. |
 
-> [!NOTE]
-> A normal deploy uses the ECR Public image as-is (no build). **AWS CodeBuild** is not a
+> **Note** — A normal deploy uses the ECR Public image as-is (no build). **AWS CodeBuild** is not a
 > runtime component — it's an optional build tool (`deploy/codebuild.yaml`) used once
 > only when you must build your own image on a restricted network.
 
-> [!IMPORTANT]
-> **EC2 (from-source) deploy** uses **Amazon EC2 + a retained EBS volume + AWS Systems
+> **Important** — **EC2 (from-source) deploy** uses **Amazon EC2 + a retained EBS volume + AWS Systems
 > Manager** (Session Manager) in place of ECS / ECR / ALB / Cognito, and keeps **app
 > state on that EBS volume instead of S3**. In that mode CDC seeds Kafka in-process, so
 > the **AWS Lambda** offset-seeder below is **not** created. (CDC still auto-provisions
@@ -361,7 +359,7 @@ access** preflight (checks Bedrock reachability, reports actionable failures).
 Full background on the tuning knobs: manual
 [Performance and tuning](docs/manual/en/07-performance-and-tuning.md).
 
-> **CDC scaling is inferred, not set here.** The connector knobs (per-table topic
+> **Note** — CDC scaling is inferred, not set here. The connector knobs (per-table topic
 > partitions, sink `tasks.max`, MSK Connect MCUs) are derived from the captured-table
 > count at cdc-stack deploy time; advanced env overrides
 > (`DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` / `_SINK_TASKS_MAX` / `_MCU_COUNT`) are

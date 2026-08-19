@@ -223,13 +223,11 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 | Amazon Bedrock | 任意の AI アシスト（コントロールプレーンのみ）。 |
 | AWS CloudFormation | 両スタックの Infrastructure-as-Code。 |
 
-> [!NOTE]
-> 通常のデプロイは ECR Public イメージをそのまま使うため、ビルドは不要です。**AWS CodeBuild**
+> **注記** — 通常のデプロイは ECR Public イメージをそのまま使うため、ビルドは不要です。**AWS CodeBuild**
 > はランタイムコンポーネントではなく、ローカルに Docker がない制限されたネットワークで自前
 > イメージをビルドする場合にのみ一度だけ使うオプションのビルドツール（`deploy/codebuild.yaml`）です。
 
-> [!IMPORTANT]
-> **EC2（ソースから）デプロイ**は ECS / ECR / ALB / Cognito の代わりに **Amazon EC2 + 保持型 EBS
+> **重要** — **EC2（ソースから）デプロイ**は ECS / ECR / ALB / Cognito の代わりに **Amazon EC2 + 保持型 EBS
 > ボリューム + AWS Systems Manager**（Session Manager）を使い、**アプリの状態を S3 ではなくその EBS
 > ボリュームに**保持します。このモードでは CDC が Kafka をインプロセスでシードするため、下記の
 > **AWS Lambda** オフセットシーダーは作成されません。（CDC はコネクタアーティファクトのために上記の
@@ -360,7 +358,7 @@ AI アシストは既定でオフです。UI からオンにできます。UI �
 チューニングの詳細はマニュアル
 [パフォーマンスとチューニング](docs/manual/ja/07-performance-and-tuning.md) を参照。
 
-> **CDC のスケーリングはここでは設定しません。自動で決定されます。** コネクタの各種パラメータ
+> **注記** — CDC のスケーリングはここでは設定しません（自動で決定されます）。コネクタの各種パラメータ
 > （テーブルごとのトピックパーティション数、シンクの `tasks.max`、MSK Connect の MCU）は
 > cdc-stack デプロイ時にキャプチャ対象テーブル数から自動導出されます。高度な上書き
 > （`DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS` / `_SINK_TASKS_MAX` / `_MCU_COUNT`）については
