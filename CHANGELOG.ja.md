@@ -5,6 +5,18 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.377
+
+### Security
+
+- **DSQL シンクコネクタプラグインを PostgreSQL JDBC（pgjdbc）42.7.3 → 42.7.11 で再ビルド**し、
+  最後の Dependabot アラート（pgjdbc SCRAM 認証の CPU 枯渇 DoS、CVE-2026-42198）を解消。シンク
+  jar のみ変更（`PLUGIN_VERSION` v33 → v34）で、Debezium プラグインとオフセットシーダー zip は
+  変更なし。実際のリスクは低い（DoS には悪意ある PostgreSQL サーバーが必要で、シンクは信頼された
+  Aurora DSQL にのみ接続）が、アラート面をクリーンにするため引き上げ。新しいプラグインの反映には
+  cdc-stack の再デプロイ（Delete + Deploy インフラ）が必要 — 実行中のスタックはそれまで現在の
+  プラグインを維持。
+
 ## v0.1.376
 
 ### Security

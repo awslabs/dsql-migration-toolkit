@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.377
+
+### Security
+
+- **Rebuilt the DSQL sink connector plugin with PostgreSQL JDBC (pgjdbc) 42.7.3 → 42.7.11**
+  to clear the last Dependabot alert — the pgjdbc SCRAM-auth CPU-exhaustion DoS
+  (CVE-2026-42198). Sink jar only (`PLUGIN_VERSION` v33 → v34); the Debezium plugin and
+  offset-seeder zip are unchanged. Low real risk here (the DoS needs a malicious
+  PostgreSQL server; the sink connects only to the trusted Aurora DSQL target), but
+  bumped for a clean advisory surface. Picking up the new plugin needs a cdc-stack
+  redeploy (Delete + Deploy infra) — a running stack keeps its current plugin until then.
+
 ## v0.1.376
 
 ### Security

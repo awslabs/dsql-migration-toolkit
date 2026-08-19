@@ -5,6 +5,17 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.377
+
+### Security
+
+- **DSQL 싱크 커넥터 플러그인을 PostgreSQL JDBC(pgjdbc) 42.7.3 → 42.7.11로 재빌드**하여 마지막
+  Dependabot 경보(pgjdbc SCRAM 인증 CPU 소진 DoS, CVE-2026-42198)를 해소. 싱크 jar만 변경
+  (`PLUGIN_VERSION` v33 → v34); Debezium 플러그인과 오프셋 시더 zip은 그대로. 실제 위험은 낮음
+  (DoS는 악의적 PostgreSQL 서버가 있어야 성립하며 싱크는 신뢰된 Aurora DSQL에만 연결)이나 경보
+  정리를 위해 상향. 새 플러그인 반영은 cdc-stack 재배포(Delete + Deploy 인프라)가 필요 — 실행 중인
+  스택은 그때까지 기존 플러그인 유지.
+
 ## v0.1.376
 
 ### Security
