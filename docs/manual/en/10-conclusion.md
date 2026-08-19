@@ -17,6 +17,7 @@ cut-over runbook, and where to go next.
 |---|---|
 | One-shot migration; a short maintenance freeze is acceptable | **Full Load only** (no streaming infrastructure, no ongoing cost). |
 | Large-scale / continuous; need **near-zero-downtime** cut-over | **Full Load + CDC** (gapless handoff keeps DSQL live until you switch over). |
+| Target already loaded; you only need to attach or resume streaming | **CDC only** (stream into an already-loaded target — e.g. resume CDC from a prior watermark, or feed a target loaded out of band — with no fresh Full Load). |
 
 CDC adds real moving parts (MSK, MSK Connect, the sink connector) and **ongoing
 cost while deployed**. Reach for it only when you genuinely need continuous
@@ -35,8 +36,8 @@ replication; otherwise Full Load alone is simpler and cheaper.
    at all: cascading foreign keys never reach the binary log, so CDC cannot
    replicate them.
 3. **Schema Conversion** — review the source-vs-converted DDL and apply it to DSQL.
-4. **Data Migration** — choose the migration type (**Full Load** only, or add
-   **CDC**) now that the report tells you what you are dealing with. Run the
+4. **Data Migration** — choose the migration type (**Full Load only**, **CDC only**, or
+   **Full Load + CDC**) now that the report tells you what you are dealing with. Run the
    prerequisite checks, then **Full Load** bulk-copies the rows and captures the
    watermark (check the error log: quarantined rows are expected, e.g. oversized
    values, or actionable). For a CDC type, deploy the streaming infrastructure from

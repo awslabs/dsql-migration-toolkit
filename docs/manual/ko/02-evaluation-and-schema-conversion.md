@@ -126,10 +126,12 @@ AI 어시스트는 **옵트인·기본 꺼짐** 보강 기능으로, **Amazon Be
 - **로컬 실행:** 자격증명 체인이 선택 모델에 대해 `bedrock:InvokeModel`을 허용해야 하고, 해당 리전
   Bedrock 콘솔에서 그 **모델을 활성화**해 두어야 합니다.
 - **Fargate 배포:** AI 어시스트는 **`EnableAiAssist=true`로 배포하지 않으면 꺼져 있습니다.** 이 값을
-  켜면 태스크 역할에 `BedrockModelArns`에 나열한 모델 ARN으로 **범위가 제한된** `bedrock:InvokeModel`
-  이 부여됩니다(최소 권한 — 그 모델만 호출 가능). `BedrockRegion`도 설정해야 하고, 태스크의 아웃바운드
+  켜면 태스크 역할에 **범위가 제한된** `bedrock:InvokeModel`이 부여됩니다(최소 권한 — 범위에 든 모델만
+  호출 가능). 기본적으로 `BedrockModelArns`는 비어 있고 그 범위는 **`BedrockModelId`에서 자동으로
+  도출**되므로 아무것도 나열할 필요가 없습니다 — `BedrockModelArns`는 **선택 사항**이며 자동 도출된
+  범위를 재정의할 때만 사용합니다. `BedrockRegion`도 설정해야 하고, 태스크의 아웃바운드
   트래픽(egress)이 Bedrock 런타임 엔드포인트에 도달할 수 있어야 합니다(NAT 또는 Bedrock VPC 엔드포인트).
-  [`deploy/DEPLOYMENT.md` §9](../../../deploy/DEPLOYMENT.md) 참조.
+  [`deploy/DEPLOYMENT.md`: "Enable AI-assisted conversion (optional)"](../../../deploy/DEPLOYMENT.md) 참조.
 - **모델:** 기본은 `global.anthropic.claude-sonnet-5`(범용·비용 효율 선택). `BedrockModelId`(배포) 또는
   Connect 화면의 Bedrock 설정에서 변경.
 

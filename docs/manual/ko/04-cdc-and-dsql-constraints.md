@@ -153,7 +153,8 @@ CDC 실행 중에는 Data Migration 화면이 테이블별 실시간 모니터�
 | **Inserts** | Full Load 이후 이 테이블에 적용된 CDC insert 누적 수 — 싱크가 실시간 보고하는 테이블별 **음수가 되지 않는** 누적 카운트(스캔 없음). |
 | **Updates** | Full Load 이후 이 테이블에 적용된 CDC update 누적 수 — 싱크가 실시간 보고하는 테이블별 **음수가 되지 않는** 누적 카운트(스캔 없음). |
 | **Deletes** | Full Load 이후 이 테이블에 적용된 CDC delete 누적 수 — 싱크가 실시간 보고하는 테이블별 **음수가 되지 않는** 누적 카운트(스캔 없음). |
-| **Source rows** | 스캔 없는 `information_schema` **추정치**. **Target rows** — DSQL 정확 카운트. |
+| **Quarantined** | **DLQ**로 격리된 변경 이벤트의 테이블별 수 — 영구 거부된 행(타입 불일치, 1 MiB 초과 초대형 값, 제약/스키마 드리프트), 싱크가 실시간 보고. |
+| **Source rows (est.)** | 스캔 없는 `information_schema` **추정치**. **Target rows** — DSQL 정확 카운트. |
 | **Stream lag** | 타깃이 소스보다 **시간상** 얼마나 뒤처졌는지(아래 참고). |
 | **Consistency** | 색상 배지: 초록 *consistent* = 카운트 일치 · *replicating…* = 따라잡는 중 · 빨강 *rows missing* = 최신 변경은 도착했으나 중간에 행 유실 · 빨강 *data quarantined* = DLQ에 미적용 이벤트 존재. |
 

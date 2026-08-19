@@ -16,6 +16,6 @@ DSQL**. It covers set up, Evaluation, Schema Conversion, Full Load, streaming CD
 (and how DSQL constraints are handled), Validation, the cut-over to DSQL, and
 limitations.
 
-> **English is the source of truth.** The Korean translation follows it and may
-> occasionally lag behind; if the two differ, the English version is
+> **English is the source of truth.** The Korean and Japanese translations follow
+> it and may lag behind; if they differ, the English version is
 > authoritative.

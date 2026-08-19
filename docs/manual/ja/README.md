@@ -56,6 +56,7 @@ Data Migration は **Full Load**（ツール独自のバルクローダー）と
 | 9 | [Query Converter と AI DBA](09-query-validation.md) | 任意の Query Converter: 単一の MySQL クエリを Aurora DSQL へ変換し、ターゲット上で読み取り専用でテストし（`EXPLAIN` / `EXPLAIN ANALYZE` + DPU コスト）、**AI DBA** に DSQL の効率に合わせて書き直させ、再テストによって改善を証明します。 |
 | 10 | [Conclusion](10-conclusion.md) | どの経路をいつ使うか、推奨されるエンドツーエンドのフロー、次に進む先。 |
 | 11 | [Customer FAQ](11-customer-faq.md) | 顧客が最もよく尋ねる質問 — Full Load、CDC、制限、型マッピング、検証、カットオーバー／ロールバック、運用 — を、ツールの実際の動作に基づいて回答し、詳細へのリンクを添えています。 |
+| 12 | [付録: 性能テスト結果](12-performance-test-results.md) | チューニングの根拠を裏付ける、実測の Full Load / Validation / CDC スループットの例と方法論。 |
 
 ## MySQL ユーザーへの Aurora DSQL についての注意
 

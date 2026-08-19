@@ -145,10 +145,12 @@ never touches.
   for your region.
 - **Deployed on Fargate:** AI assist is **off unless you deploy with
   `EnableAiAssist=true`**, which grants the task role a **scoped**
-  `bedrock:InvokeModel` limited to the model ARN(s) you list in `BedrockModelArns`
-  (least privilege — it can invoke only those models). You also set `BedrockRegion`
+  `bedrock:InvokeModel` (least privilege — it can invoke only the model(s) in scope).
+  By default `BedrockModelArns` is empty and that scope is **auto-derived from
+  `BedrockModelId`**, so you don't have to list anything; `BedrockModelArns` is
+  **optional** and only overrides the auto-derived scope. You also set `BedrockRegion`
   and the task's egress must be able to reach the Bedrock runtime endpoint (NAT or
-  a Bedrock VPC endpoint). See [`deploy/DEPLOYMENT.md` §9](../../../deploy/DEPLOYMENT.md).
+  a Bedrock VPC endpoint). See [`deploy/DEPLOYMENT.md`: "Enable AI-assisted conversion (optional)"](../../../deploy/DEPLOYMENT.md).
 - **Model:** the default is `global.anthropic.claude-sonnet-5` (a general,
   cost-effective choice); override it with `BedrockModelId` (deploy) or in the
   Connect screen's Bedrock settings.

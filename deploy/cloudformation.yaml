@@ -1682,18 +1682,21 @@ Resources:
       Cluster:
         Ref: Cluster
       LaunchType: FARGATE
-      # Single-tenant control plane: exactly one task. DO NOT raise DesiredCount
-      # above 1 without first moving session/job SQLite state off the task's
-      # ephemeral /tmp to a shared store (DynamoDB behind the SessionStateStore/
-      # JobStore protocols) -- otherwise a browser hitting the other task loses its
-      # session and resume breaks.
+      # Single-tenant control plane: exactly one task by design -- the app is not
+      # built for concurrent writers (CDC-deploy coordination and the in-memory
+      # orchestration assume a single instance), so DO NOT raise DesiredCount above 1.
+      # State is NOT the reason for the cap: the JobStore/SessionStateStore point at
+      # the durable S3 stores above (jobs/ + sessions/ prefixes), not the task's
+      # ephemeral /tmp, so job/session snapshots already survive a task swap.
       DesiredCount: 1
       DeploymentConfiguration:
         # MinimumHealthyPercent: 0 lets the single task be replaced on deploy
         # (brief downtime). The cdc-stack (MSK/connectors) and the migrated DSQL
-        # data are independent of this task, so a replacement never touches them;
-        # an in-flight Full Load job and the in-memory session do not survive the
-        # swap (the user reconnects and re-runs Evaluation -- read-only, minutes).
+        # data are independent of this task, so a replacement never touches them; and
+        # because the job/session snapshots persist in the durable S3 stores above, the
+        # replacement RESUMES -- the Full Load continues from its last checkpoint
+        # (unfinished PK ranges re-run, idempotent) and a reconnecting browser restores
+        # its workbench rather than re-running Evaluation.
         MinimumHealthyPercent: 0
         MaximumPercent: 100
       TaskDefinition:

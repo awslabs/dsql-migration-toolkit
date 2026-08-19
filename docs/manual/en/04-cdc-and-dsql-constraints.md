@@ -179,7 +179,8 @@ never runs a `COUNT(*)` against your production database. The columns:
 | **Inserts** | Cumulative CDC inserts applied to this table since Full Load — a **non-negative** per-table running count reported live by the sink (scan-free). |
 | **Updates** | Cumulative CDC updates applied to this table since Full Load — a **non-negative** per-table running count reported live by the sink (scan-free). |
 | **Deletes** | Cumulative CDC deletes applied to this table since Full Load — a **non-negative** per-table running count reported live by the sink (scan-free). |
-| **Source rows** | Scan-free `information_schema` **estimate**. **Target rows** — exact DSQL count. |
+| **Quarantined** | Per-table count of change events set aside to the **DLQ** — permanently-rejected rows (bad type, oversized > 1 MiB value, constraint / schema-drift), reported live by the sink. |
+| **Source rows (est.)** | Scan-free `information_schema` **estimate**. **Target rows** — exact DSQL count. |
 | **Stream lag** | How far the target is behind the source **in time** (see below). |
 | **Consistency** | A colored badge: green *consistent* = counts match · *replicating…* = catching up · red *rows missing* = the newest change landed but rows went missing mid-stream · red *data quarantined* = the DLQ has un-applied events. |
 

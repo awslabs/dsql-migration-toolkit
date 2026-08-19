@@ -116,7 +116,8 @@ CDC 実行中、Data Migration 画面はテーブルごとのライブモニタ�
 | **Inserts** | Full Load 以降にこのテーブルへ適用された CDC insert の累計数 — シンクがライブ報告する、テーブルごとの**負にならない**累計カウント(スキャン不要)。 |
 | **Updates** | Full Load 以降にこのテーブルへ適用された CDC update の累計数 — シンクがライブ報告する、テーブルごとの**負にならない**累計カウント(スキャン不要)。 |
 | **Deletes** | Full Load 以降にこのテーブルへ適用された CDC delete の累計数 — シンクがライブ報告する、テーブルごとの**負にならない**累計カウント(スキャン不要)。 |
-| **Source rows** | スキャン不要の `information_schema` **見積り**。**Target rows** — DSQL の正確なカウント。 |
+| **Quarantined** | **DLQ** に隔離された変更イベントの、テーブルごとの件数 — 恒久的に拒否された行(型の不一致、1 MiB を超える特大サイズの値、制約 / スキーマドリフト)。シンクがライブ報告。 |
+| **Source rows (est.)** | スキャン不要の `information_schema` **見積り**。**Target rows** — DSQL の正確なカウント。 |
 | **Stream lag** | ターゲットがソースより**時間的に**どれだけ遅れているか(下記参照)。 |
 | **Consistency** | 色付きバッジ: 緑 *consistent* = カウント一致 · *replicating…* = 追いつき中 · 赤 *rows missing* = 最新の変更は届いたが途中で行が消失 · 赤 *data quarantined* = DLQ に未適用イベントあり。 |
 

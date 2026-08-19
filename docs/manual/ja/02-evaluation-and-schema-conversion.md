@@ -133,11 +133,13 @@ AI アシストは **オプトイン・デフォルト無効** の補強機能�
 - **ローカルで実行する場合:** 認証情報チェーンが選択したモデルに対して `bedrock:InvokeModel` を許可して
   いる必要があり、対象リージョンの Bedrock コンソールでその **モデルを有効化** しておく必要があります。
 - **Fargate にデプロイする場合:** AI アシストは **`EnableAiAssist=true` でデプロイしない限り無効です。**
-  この値を有効にすると、タスクロールに `BedrockModelArns` で列挙したモデル ARN に **スコープを限定した**
-  `bedrock:InvokeModel` が付与されます(最小権限 — それらのモデルのみ呼び出し可能)。あわせて
+  この値を有効にすると、タスクロールに **スコープを限定した** `bedrock:InvokeModel` が付与されます
+  (最小権限 — スコープ内のモデルのみ呼び出し可能)。デフォルトでは `BedrockModelArns` は空で、その
+  スコープは **`BedrockModelId` から自動的に導出** されるため、何も列挙する必要はありません。
+  `BedrockModelArns` は **任意** で、自動導出されたスコープを上書きする場合にのみ使用します。あわせて
   `BedrockRegion` も設定し、タスクの送信(egress)トラフィックが Bedrock ランタイムエンドポイントに
   到達できる必要があります(NAT または Bedrock VPC エンドポイント)。
-  [`deploy/DEPLOYMENT.md` §9](../../../deploy/DEPLOYMENT.ja.md) を参照してください。
+  [`deploy/DEPLOYMENT.md`: 「AI 支援変換の有効化 (オプション)」](../../../deploy/DEPLOYMENT.ja.md) を参照してください。
 - **モデル:** デフォルトは `global.anthropic.claude-sonnet-5`(汎用的でコスト効率の良い選択)です。
   `BedrockModelId`(デプロイ時)または Connect 画面の Bedrock 設定で変更します。
 
