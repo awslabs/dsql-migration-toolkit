@@ -1,4 +1,4 @@
-# mysql-dsql-migration-tool-with-AI
+# DSQL Migration Toolkit
 
 _언어: [English](README.md) | **한국어** | [日本語](README.ja.md)_
 
@@ -116,8 +116,8 @@ Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 *분산* 데이터베이�
 (`aws sso login`, `AWS_PROFILE=…`).
 
 ```bash
-git clone <repo-url> mysql-dsql-migrator
-cd mysql-dsql-migrator
+git clone https://github.com/awslabs/dsql-migration-toolkit.git
+cd dsql-migration-toolkit
 uv sync                       # .venv 가상환경 생성·채움 (uv 필요)
 cp .env.example .env          # 선택: 연결 정보 미리 채우기 (git-ignore 됨)
 uv run mysql-dsql-migrator ui

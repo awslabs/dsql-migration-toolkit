@@ -8,12 +8,13 @@ Description: >
   customer account/VPC (app-stack). Runs the control-plane app as a single-task
   Amazon ECS Fargate service in private subnets, fronted by an Application Load
   Balancer (HTTPS) with optional Amazon Cognito (OIDC) auth. The container image
-  is pulled from Amazon ECR. IAM is least privilege (scoped task + execution
-  roles); job/session state is on ephemeral storage; no credentials are stored
-  in this template. Prerequisite: build and push the image to ECR and pass its
-  URI as ContainerImageUri (see deploy/Dockerfile + README). The optional
-  streaming CDC pipeline (MSK + Debezium + Fargate sink) is a separate cdc-stack,
-  not provisioned here.
+  is pulled from Amazon ECR -- the ContainerImageUri default is the published ECR
+  Public image, so a normal deploy needs NO build (build your own only on a
+  restricted network; see deploy/Dockerfile + README). IAM is least privilege
+  (scoped task + execution roles); job/session state is kept in the tool's managed
+  S3 bucket so it survives a task replacement; no credentials are stored in this
+  template. The optional streaming CDC pipeline (MSK + Debezium + Fargate sink) is
+  a separate cdc-stack, not provisioned here.
 
 # Console UX: group + label the parameters so uploading this template in the AWS
 # CloudFormation console renders an ordered, sectioned "Specify stack details"

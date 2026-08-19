@@ -1,4 +1,4 @@
-# mysql-dsql-migration-tool-with-AI
+# DSQL Migration Toolkit
 
 _言語: [English](README.md) | [한국어](README.ko.md) | **日本語**_
 
@@ -126,8 +126,8 @@ Web UI は **Connect** を準備ステップとし、5 つのステップで移�
 シェルで利用可能であれば十分です（`aws sso login`、`AWS_PROFILE=…`）。
 
 ```bash
-git clone <repo-url> mysql-dsql-migrator
-cd mysql-dsql-migrator
+git clone https://github.com/awslabs/dsql-migration-toolkit.git
+cd dsql-migration-toolkit
 uv sync                       # .venv 仮想環境を作成（uv が必要）
 cp .env.example .env          # 任意: 接続情報を事前入力（git-ignore される）
 uv run mysql-dsql-migrator ui

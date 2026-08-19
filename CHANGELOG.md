@@ -5,6 +5,46 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.373
+
+Public-release readiness pass ahead of open-sourcing under AWS Labs
+(`github.com/awslabs/dsql-migration-toolkit`).
+
+### Removed
+
+- **The internal-only "temporary GitLab SSH" clone path is gone from the EC2 from-source
+  template** (`cloudformation-ec2.yaml`): the `DeployKeySsmParam` parameter, the
+  `HasDeployKey` condition, the read-deploy-key IAM policy, the port-22 `GitSshEgress`
+  rule, and the user-data SSH-deploy-key branch. It was pre-publication scaffolding for
+  cloning from an internal Git host and is dead for public users. Source acquisition is
+  now public-HTTPS `git clone` (default) or an S3 source tarball (restricted network /
+  your own local copy) only — no deploy key, no port-22 egress.
+
+### Changed
+
+- **The EC2 template's `SourceRepoUrl` default now points at the public repo**
+  (`https://github.com/awslabs/dsql-migration-toolkit.git`) instead of a personal fork.
+- **`cloudformation.yaml` top-level description corrected** — it no longer calls building
+  and pushing an image a prerequisite (the `ContainerImageUri` default is the published
+  ECR Public image, no build), and it now states job/session state is kept in the managed
+  S3 bucket (durable across a task replacement), not on ephemeral storage.
+- **READMEs** retitled to "DSQL Migration Toolkit" (the repo is source-agnostic ahead of
+  future non-MySQL sources; the tool today migrates MySQL → DSQL), and the Quick Start
+  `git clone` now uses the real public URL. The pip package and CLI stay
+  `mysql-dsql-migrator`.
+- **`THIRD-PARTY-NOTICES.md` now enumerates all three bundled plugin artifacts** — it had
+  covered only the Debezium jars. Added the shaded dependencies of the custom DSQL sink
+  plugin (PostgreSQL JDBC / pgjdbc 42.7.3 BSD-2-Clause; AWS SDK for Java 2.x 2.31.0
+  Apache-2.0; transitive Netty / Reactive Streams) and the vendored Python packages in
+  the offset-seeder Lambda (boto3, botocore, s3transfer, jmespath, python-dateutil, six,
+  urllib3, click, kafka-python, aws-msk-iam-sasl-signer-python).
+- **`pyproject.toml`** gained `[project.urls]` (Homepage / Repository / Issues → the
+  awslabs repo) and an `authors` entry.
+- Minor: completed the `.gitignore` "committed on purpose" note (it omitted
+  `offset-seeder-lambda.zip`) and fixed a stale PNG path in it; genericized a personal
+  handle used as test-fixture data; and dropped an internal "Property 7" spec reference
+  from the customer setup manual (EN/KO/JA).
+
 ## v0.1.372
 
 ### Changed
@@ -1381,7 +1421,7 @@ once for the batch)._
   `systemd` service (`dsql-migrator.service`) — reached the same way (SSM
   port-forward), with the same retained-EBS state and `SeedMode=External`. Source
   acquisition is a new `SourceMode` parameter: `git` (default — `git clone` the
-  public repo over HTTPS, or the AWS GitLab SSH URL with a read-only deploy key from
+  public repo over HTTPS, or an internal Git host over SSH with a read-only deploy key from
   SSM via the new `DeployKeySsmParam`, which auto-drops its IAM grant + port-22 egress
   once the repo is public) or `s3` (download + extract a source tarball from
   `SourceS3Uri` — the simple way to run a local working copy before the repo is

@@ -209,7 +209,7 @@ Then click to **test** each connection. The tool:
 
 **Credentials live in per-session process memory only.** They are never written
 to disk, logs, reports, or job state, and they are discarded when the session
-ends (this is a hard project rule — "Property 7"). After a restart you re-enter
+ends — a strict, non-negotiable rule of the tool. After a restart you re-enter
 them.
 
 > **Single region.** This tool works in any region where Aurora DSQL is

@@ -59,7 +59,6 @@ Metadata:
           - SourceS3Uri
           - SourceRepoUrl
           - SourceRepoRef
-          - DeployKeySsmParam
           - AppPort
           - EnableActivityLogCloudWatch
       - Label:
@@ -101,11 +100,9 @@ Metadata:
       SourceS3Uri:
         default: "Source S3 URI  [Required if Source mode = s3] — s3:// tarball of the repo root"
       SourceRepoUrl:
-        default: "Source repo URL  [Optional] — default = public GitHub HTTPS; use the GitLab SSH URL + a deploy key temporarily"
+        default: "Source repo URL  [Optional] — default = the public GitHub HTTPS clone URL"
       SourceRepoRef:
         default: "Source ref  [Optional, default main] — branch or tag"
-      DeployKeySsmParam:
-        default: "Deploy-key SSM param  [Optional] — SecureString name for the temporary GitLab SSH clone; empty for public GitHub"
       AppPort:
         default: "App listen port  [Optional, default 8080] — bound on host loopback, reached via SSM port-forward"
       EnableActivityLogCloudWatch:
@@ -175,11 +172,10 @@ Parameters:
     AllowedValues: ["git", "s3"]
     Description: >
       How the host obtains the app source (NO Docker/ECR -- it runs from source).
-      "git" (default): git clone SourceRepoUrl@SourceRepoRef -- public HTTPS needs
-      no auth; the temporary AWS GitLab SSH path uses a deploy key (see
-      DeployKeySsmParam). "s3": download+extract a source tarball from SourceS3Uri --
-      the simplest TEMPORARY path to run YOUR LOCAL working copy before the repo is
-      public on GitHub (tar your checkout, upload it to S3, point SourceS3Uri at it).
+      "git" (default): git clone SourceRepoUrl@SourceRepoRef over public HTTPS (no
+      auth). "s3": download+extract a source tarball from SourceS3Uri -- for a
+      restricted network with no public GitHub egress, or to run your own local /
+      modified copy (tar your checkout, upload it to S3, point SourceS3Uri at it).
 
   SourceS3Uri:
     Type: String
@@ -191,25 +187,15 @@ Parameters:
 
   SourceRepoUrl:
     Type: String
-    Default: https://github.com/dalyoung/mysql-dsql-migration-tool.git
+    Default: https://github.com/awslabs/dsql-migration-toolkit.git
     Description: >
-      Git repo to clone when SourceMode=git. Default is the (future) public GitHub
-      URL -- a no-auth HTTPS clone. For the temporary AWS GitLab path set this to the
-      SSH URL (git@ssh.gitlab.aws.dev:...) AND set DeployKeySsmParam.
+      Git repo to clone when SourceMode=git -- the public GitHub HTTPS URL, a
+      no-auth clone. Override only to clone a fork or a different HTTPS URL.
 
   SourceRepoRef:
     Type: String
     Default: main
     Description: Branch or tag to clone (shallow --branch; not a bare commit SHA).
-
-  DeployKeySsmParam:
-    Type: String
-    Default: ""
-    Description: >
-      Name of an SSM Parameter Store SecureString holding a READ-ONLY SSH deploy key
-      (name WITHOUT a leading slash, e.g. mysql-dsql-migrator/deploy-key). Set ONLY
-      for the temporary AWS GitLab SSH clone; empty (the public-GitHub end state) =
-      no key, no IAM grant, no port-22 egress. Ignored when SourceMode=s3.
 
   HttpsEgressCidr:
     Type: String
@@ -399,13 +385,6 @@ Conditions:
     Fn::Not:
       - Fn::Equals: [Ref: KeyName, ""]
 
-  # A deploy-key SSM param was supplied -> the TEMPORARY GitLab SSH clone path.
-  # Gates the read-deploy-key IAM grant + the port-22 egress so BOTH exist only on
-  # that path; the public-GitHub end state (empty) auto-drops them.
-  HasDeployKey:
-    Fn::Not:
-      - Fn::Equals: [Ref: DeployKeySsmParam, ""]
-
 Resources:
   # Stable secret used to sign the UI's browser-session cookie
   # (DSQL_MIGRATOR_STORAGE_SECRET). Auto-generated once and held in Secrets
@@ -493,26 +472,6 @@ Resources:
                     Action: secretsmanager:GetSecretValue
                     Resource:
                       Ref: SourceSecretArn
-            - Ref: AWS::NoValue
-        # Read the SSH deploy key from SSM ONLY on the temporary GitLab clone path
-        # (DeployKeySsmParam set). Auto-drops to AWS::NoValue once the repo is public
-        # on GitHub (DeployKeySsmParam empty -> HasDeployKey false). KMS nuance: a
-        # SecureString on the default aws/ssm key needs no extra grant; a customer CMK
-        # additionally needs kms:Decrypt on that key (unknown at deploy time -> not
-        # added here, documented in the runbook).
-        - Fn::If:
-            - HasDeployKey
-            - PolicyName: read-deploy-key
-              PolicyDocument:
-                Version: "2012-10-17"
-                Statement:
-                  - Sid: GetDeployKey
-                    Effect: Allow
-                    Action:
-                      - ssm:GetParameter
-                      - ssm:GetParameters
-                    Resource:
-                      Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DeployKeySsmParam}
             - Ref: AWS::NoValue
         - PolicyName: provision-cdc-source-secret
           PolicyDocument:
@@ -1248,23 +1207,6 @@ Resources:
         Ref: SourceDbCidr
       Description: Egress to source RDS/Aurora MySQL CIDR.
 
-  # TCP 22 egress for the TEMPORARY GitLab SSH clone (git@ssh.gitlab.aws.dev). Only
-  # created when a deploy key is supplied; the public-GitHub end state clones over
-  # HTTPS (443, already allowed) so this rule is absent then. Open to the internet on
-  # 22 because the GitLab host is a public endpoint reached via NAT; the SG still has
-  # NO inbound, so this is outbound-only.
-  GitSshEgress:
-    Type: AWS::EC2::SecurityGroupEgress
-    Condition: HasDeployKey
-    Properties:
-      GroupId:
-        Fn::GetAtt: [HostSecurityGroup, GroupId]
-      IpProtocol: tcp
-      FromPort: 22
-      ToPort: 22
-      CidrIp: 0.0.0.0/0
-      Description: Egress for the temporary GitLab SSH source clone (git over SSH).
-
   # The single control-plane host. Runs the app FROM SOURCE (no Docker/ECR) as a
   # systemd service; reached only via SSM port-forward. Bootstrap in UserData:
   # install git+uv, mount the retained state volume, obtain the source (S3 tarball
@@ -1350,10 +1292,9 @@ Resources:
 
             # --- Obtain the app source (NO Docker/ECR) --------------------------
             # SourceMode selects how the source lands at /opt/dsql-migrator:
-            #   s3   -> download+extract a source tarball from S3 (TEMPORARY: use your
-            #           LOCAL working copy now, before the repo is public on GitHub).
-            #   git  -> git clone (public HTTPS by default; SSH + a deploy key from SSM
-            #           when DeployKeySsmParam is set -- the temporary AWS GitLab path).
+            #   s3   -> download+extract a source tarball from S3 (restricted network
+            #           with no public GitHub egress, or your own local/modified copy).
+            #   git  -> git clone over public HTTPS (the default).
             install -d -o dsqlapp -g dsqlapp -m 0755 /opt/dsql-migrator
             SOURCE_MODE="${SourceMode}"
             if [ "${!SOURCE_MODE}" = "s3" ]; then
@@ -1361,22 +1302,7 @@ Resources:
               tar -xzf /tmp/dsql-src.tar.gz -C /opt/dsql-migrator --strip-components=1
               chown -R dsqlapp:dsqlapp /opt/dsql-migrator
             else
-              DEPLOY_KEY_PARAM="${DeployKeySsmParam}"
-              GIT_SSH_COMMAND=""
-              if [ -n "${!DEPLOY_KEY_PARAM}" ]; then
-                # TEMPORARY GitLab SSH path: fetch a read-only deploy key from SSM.
-                install -d -o dsqlapp -g dsqlapp -m 0700 /opt/dsql-migrator/.ssh
-                aws ssm get-parameter --with-decryption --name "${!DEPLOY_KEY_PARAM}" \
-                  --query Parameter.Value --output text --region ${AWS::Region} \
-                  > /opt/dsql-migrator/.ssh/id_deploy
-                chmod 600 /opt/dsql-migrator/.ssh/id_deploy
-                GIT_HOST=$(echo "${SourceRepoUrl}" | sed -E 's/^[^@]+@([^:]+):.*/\1/')
-                ssh-keyscan -H "${!GIT_HOST}" > /opt/dsql-migrator/.ssh/known_hosts 2>/dev/null
-                chmod 600 /opt/dsql-migrator/.ssh/known_hosts
-                chown -R dsqlapp:dsqlapp /opt/dsql-migrator/.ssh
-                GIT_SSH_COMMAND="ssh -i /opt/dsql-migrator/.ssh/id_deploy -o UserKnownHostsFile=/opt/dsql-migrator/.ssh/known_hosts -o IdentitiesOnly=yes"
-              fi
-              sudo -u dsqlapp -H env GIT_SSH_COMMAND="${!GIT_SSH_COMMAND}" \
+              sudo -u dsqlapp -H \
                 git clone --depth 1 --branch ${SourceRepoRef} ${SourceRepoUrl} /opt/dsql-migrator
             fi
 

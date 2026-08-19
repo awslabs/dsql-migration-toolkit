@@ -2684,7 +2684,7 @@ def test_apply_in_progress_is_wired_from_the_step_status() -> None:
 
 
 _RAW_VIEW = (
-    "CREATE ALGORITHM=UNDEFINED DEFINER=`dalyoung`@`%` SQL SECURITY DEFINER VIEW "
+    "CREATE ALGORITHM=UNDEFINED DEFINER=`appuser`@`%` SQL SECURITY DEFINER VIEW "
     "`ecommerce_demo`.`customer_order_summary` AS select `c`.`customer_id` AS "
     "`customer_id`,`co`.`country_name` AS `country_name`,count(distinct "
     "`o`.`order_id`) AS `order_count` from ((`ecommerce_demo`.`customers` `c` join "
@@ -2722,7 +2722,7 @@ def test_view_source_ddl_drops_server_metadata() -> None:
     assert "DEFINER" not in out
     assert "ALGORITHM" not in out
     assert "SQL SECURITY" not in out
-    assert '"dalyoung"' not in out  # the mangled form must never appear
+    assert '"appuser"' not in out  # the mangled form must never appear
 
 
 def test_view_source_ddl_keeps_unparseable_definitions_verbatim() -> None:

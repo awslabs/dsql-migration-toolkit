@@ -1,4 +1,4 @@
-# mysql-dsql-migration-tool-with-AI
+# DSQL Migration Toolkit
 
 _Language: **English** | [한국어](README.ko.md) | [日本語](README.ja.md)_
 
@@ -126,8 +126,8 @@ and DSQL (a private source needs VPN / SSM forward). AWS credentials just need t
 be usable in your shell (`aws sso login`, `AWS_PROFILE=…`).
 
 ```bash
-git clone <repo-url> mysql-dsql-migrator
-cd mysql-dsql-migrator
+git clone https://github.com/awslabs/dsql-migration-toolkit.git
+cd dsql-migration-toolkit
 uv sync                       # create + fill a .venv (needs uv)
 cp .env.example .env          # optional: pre-fill connection details (git-ignored)
 uv run mysql-dsql-migrator ui

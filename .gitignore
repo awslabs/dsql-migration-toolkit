@@ -28,6 +28,7 @@ migration_activity.log
 # NOTE: the deploy-critical plugin ZIPs are COMMITTED on purpose, not ignored:
 #   connectors/plugins/debezium-mysql-plugin.zip
 #   connectors/plugins/dsql-sink-plugin.zip
+#   connectors/plugins/offset-seeder-lambda.zip
 # s3_provision.py uploads these exact files to S3 for the CDC stack, so a fresh
 # clone can deploy without a Java/Maven toolchain (deployment-convenience first).
 #
@@ -38,7 +39,7 @@ migration_activity.log
 #  - the dsql-sink-plugin/ staging dir (the build script `rm -rf`s and recreates
 #    it from the sink jar + converter; pure staging, not a source input).
 #  - the Maven build output for the sink.
-# The committed inputs that DO stay: the two deploy zips above, the
+# The committed inputs that DO stay: the three deploy zips above, the
 # connectors/plugins/debezium-connector-mysql/ input folder (the real Debezium
 # jars the build script does NOT fetch), and connectors/dsql-sink/src/.
 schema-registry-kafkaconnect-converter-*.jar
@@ -71,7 +72,7 @@ RESUME_CONTEXT.md
 # public repo; ignored so a blanket `git add -A` can never capture it.
 docs/public-release-readiness-review-*.md
 # Editable draw.io architecture sources are NOT shared publicly -- only the
-# rendered PNGs (deploy/architecture-aws*.png) are committed for readers.
+# rendered PNGs (docs/images/architecture-aws*.png) are committed for readers.
 *.drawio
 # Per-environment CDC deploy parameter files (account id, real ARNs, VPC/subnet
 # ids, MSK bootstrap). Regenerated per environment; not source — never commit.

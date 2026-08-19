@@ -5,6 +5,41 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.373
+
+AWS Labs(`github.com/awslabs/dsql-migration-toolkit`) 오픈소스 공개를 앞둔 공개 준비 정리.
+
+### Removed
+
+- **EC2 소스 실행 템플릿(`cloudformation-ec2.yaml`)에서 내부 전용 "임시 GitLab SSH" clone
+  경로 제거**: `DeployKeySsmParam` 파라미터, `HasDeployKey` 조건, read-deploy-key IAM 정책,
+  22번 포트 `GitSshEgress` 규칙, user-data의 SSH 배포키 분기. 내부 Git 호스트에서 clone하기
+  위한 공개 전 스캐폴딩으로 공개 사용자에게는 무의미했습니다. 소스 취득은 이제 공개 HTTPS
+  `git clone`(기본) 또는 S3 소스 tarball(제한망 / 로컬 작업본)만 남고 — 배포키도, 22번 포트
+  egress도 없습니다.
+
+### Changed
+
+- **EC2 템플릿의 `SourceRepoUrl` 기본값이 공개 repo를 가리킵니다**
+  (`https://github.com/awslabs/dsql-migration-toolkit.git`) — 개인 fork 대신.
+- **`cloudformation.yaml` 최상단 설명 정정** — 이미지 빌드·푸시를 전제조건이라 하지 않으며
+  (`ContainerImageUri` 기본값이 게시된 ECR Public 이미지라 빌드 불필요), job/세션 상태가
+  ephemeral이 아니라 관리형 S3 버킷에 보관되어 task 교체를 넘어 durable함을 명시합니다.
+- **README** 제목을 "DSQL Migration Toolkit"으로 변경(향후 비-MySQL 소스를 대비해 repo가 소스
+  중립적; 현재 도구는 MySQL → DSQL 마이그레이션)하고, Quick Start `git clone`이 실제 공개 URL을
+  사용합니다. pip 패키지와 CLI는 `mysql-dsql-migrator`로 유지됩니다.
+- **`THIRD-PARTY-NOTICES.md`가 번들된 3개 플러그인 아티팩트를 모두 열거**합니다 — 기존에는
+  Debezium jar만 다뤘습니다. 커스텀 DSQL 싱크 플러그인의 shaded 의존성(PostgreSQL JDBC / pgjdbc
+  42.7.3 BSD-2-Clause; AWS SDK for Java 2.x 2.31.0 Apache-2.0; 전이적 Netty / Reactive
+  Streams)과 오프셋 시더 Lambda에 vendoring된 Python 패키지(boto3, botocore, s3transfer,
+  jmespath, python-dateutil, six, urllib3, click, kafka-python,
+  aws-msk-iam-sasl-signer-python)를 추가했습니다.
+- **`pyproject.toml`**에 `[project.urls]`(Homepage / Repository / Issues → awslabs repo)와
+  `authors` 항목을 추가했습니다.
+- 부수: `.gitignore`의 "일부러 커밋" 주석 보완(`offset-seeder-lambda.zip` 누락)과 stale PNG
+  경로 정정; 테스트 픽스처 데이터로 쓰인 개인 핸들 일반화; 고객 설정 매뉴얼(EN/KO/JA)에서
+  내부 "Property 7" 스펙 참조 제거.
+
 ## v0.1.372
 
 ### Changed
@@ -1200,7 +1235,7 @@ _여러 CDC 리뷰 수정을 한 패치로 묶습니다 (ECR Public 이미지는
   `uv sync --extra cdc-external`을 실행한 뒤 `systemd` 서비스(`dsql-migrator.service`)로
   앱을 띄웁니다 — 접속 방식(SSM 포트포워드), 보존형 EBS 상태, `SeedMode=External`은 동일합니다.
   소스 취득은 새 `SourceMode` 파라미터로 선택합니다: `git`(기본 — 공개 repo를 HTTPS로
-  `git clone`, 또는 SSM의 읽기전용 배포키(`DeployKeySsmParam`)로 AWS GitLab SSH URL clone;
+  `git clone`, 또는 SSM의 읽기전용 배포키(`DeployKeySsmParam`)로 내부 Git 호스트를 SSH로 clone;
   이 키 관련 IAM 권한·22번 포트 egress는 repo가 공개되면 자동으로 사라짐) 또는 `s3`(소스
   tarball을 `SourceS3Uri`에서 받아 전개 — repo 공개 전 로컬 작업본을 실행하는 간단한 방법).
   `ContainerImageUri` 파라미터와 모든 Docker 단계는 제거됐습니다. Fargate 앱 스택

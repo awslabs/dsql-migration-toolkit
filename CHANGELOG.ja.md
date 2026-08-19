@@ -5,6 +5,43 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.373
+
+AWS Labs（`github.com/awslabs/dsql-migration-toolkit`）でのオープンソース公開に向けた
+公開準備の整理。
+
+### Removed
+
+- **EC2 ソース実行テンプレート（`cloudformation-ec2.yaml`）から内部専用の「一時的な GitLab SSH」
+  clone 経路を削除**: `DeployKeySsmParam` パラメータ、`HasDeployKey` 条件、read-deploy-key IAM
+  ポリシー、ポート 22 の `GitSshEgress` ルール、user-data の SSH デプロイキー分岐。内部 Git
+  ホストから clone するための公開前スキャフォールディングで、公開ユーザーには無意味でした。
+  ソース取得は公開 HTTPS `git clone`（既定）または S3 ソース tarball（制限ネットワーク / 自分の
+  ローカルコピー）のみとなり — デプロイキーもポート 22 の egress もありません。
+
+### Changed
+
+- **EC2 テンプレートの `SourceRepoUrl` 既定値が公開リポジトリを指すようになりました**
+  （`https://github.com/awslabs/dsql-migration-toolkit.git`）— 個人 fork の代わりに。
+- **`cloudformation.yaml` の最上位 description を訂正** — イメージのビルド・プッシュを前提条件と
+  呼ばなくなり（`ContainerImageUri` の既定値が公開 ECR Public イメージのためビルド不要）、
+  job/セッション状態が ephemeral ではなくマネージド S3 バケットに保持され、タスク置換を越えて
+  durable であることを明記しました。
+- **README** のタイトルを "DSQL Migration Toolkit" に変更（将来の非 MySQL ソースに備えてリポジトリ
+  はソース中立;現在のツールは MySQL → DSQL の移行）し、Quick Start の `git clone` が実際の公開
+  URL を使うようにしました。pip パッケージと CLI は `mysql-dsql-migrator` のまま維持します。
+- **`THIRD-PARTY-NOTICES.md` がバンドルされた 3 つのプラグインアーティファクトをすべて列挙**する
+  ようになりました — 従来は Debezium の jar のみでした。カスタム DSQL シンクプラグインの shaded
+  依存関係（PostgreSQL JDBC / pgjdbc 42.7.3 BSD-2-Clause;AWS SDK for Java 2.x 2.31.0
+  Apache-2.0;推移的な Netty / Reactive Streams）と、オフセットシーダー Lambda に vendoring された
+  Python パッケージ（boto3, botocore, s3transfer, jmespath, python-dateutil, six, urllib3,
+  click, kafka-python, aws-msk-iam-sasl-signer-python）を追加しました。
+- **`pyproject.toml`** に `[project.urls]`（Homepage / Repository / Issues → awslabs リポジトリ）と
+  `authors` 項目を追加しました。
+- 付随: `.gitignore` の「意図的にコミット」注記の補完（`offset-seeder-lambda.zip` の欠落）と
+  stale な PNG パスの訂正;テストフィクスチャのデータに使われていた個人ハンドルの一般化;
+  顧客向けセットアップマニュアル（EN/KO/JA）から内部の「Property 7」スペック参照を削除。
+
 ## v0.1.372
 
 ### Changed
@@ -1272,7 +1309,7 @@ _複数の CDC レビュー修正を 1 つのパッチにまとめています�
   (`dsql-migrator.service`)としてアプリを起動します — 接続方法(SSM ポートフォワード)、
   保持される EBS の状態、`SeedMode=External` は同じです。ソースの取得は新しい `SourceMode`
   パラメータで選択します: `git`(既定 — 公開リポジトリを HTTPS で `git clone`、または SSM の
-  読み取り専用デプロイキー(`DeployKeySsmParam`)で AWS GitLab の SSH URL を clone。この
+  読み取り専用デプロイキー(`DeployKeySsmParam`)で内部 Git ホストへ SSH で clone。この
   キー関連の IAM 権限・ポート 22 の egress はリポジトリが公開されると自動的に消えます)または
   `s3`(ソース tarball を `SourceS3Uri` から取得して展開 — リポジトリ公開前にローカルの作業
   コピーを実行する簡単な方法)。`ContainerImageUri` パラメータとすべての Docker 手順は削除

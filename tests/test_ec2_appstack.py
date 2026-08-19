@@ -153,28 +153,34 @@ def test_user_data_runs_from_source_not_docker() -> None:
 
 
 def test_user_data_source_mode_branches() -> None:
-    # SourceMode selects S3-tarball (run the local copy now) vs git clone.
+    # SourceMode selects S3-tarball (restricted network / local copy) vs git clone.
     ud = str(_load()["Resources"]["AppHost"]["Properties"]["UserData"])
     assert 'if [ "${!SOURCE_MODE}" = "s3" ]' in ud  # S3 tarball branch
     assert "aws s3 cp" in ud
-    # Temporary GitLab SSH deploy-key path is present but conditional (DeployKeySsmParam).
-    assert "get-parameter --with-decryption" in ud
+    assert "git clone" in ud  # public-HTTPS git branch
 
 
-def test_deploy_key_grant_and_egress_are_conditional() -> None:
+def test_no_internal_gitlab_deploy_key_path() -> None:
+    # The pre-publication internal-GitLab SSH clone path was removed for the public
+    # release; guard against a silent reintroduction. Source acquisition is public
+    # HTTPS git clone or an S3 tarball only -- no deploy key, no port-22 egress.
     doc = _load()
-    assert "HasDeployKey" in doc["Conditions"]
-    # Port-22 egress exists only on the temporary GitLab SSH path.
-    git_egress = doc["Resources"]["GitSshEgress"]
-    assert git_egress["Condition"] == "HasDeployKey"
-    assert git_egress["Properties"]["FromPort"] == 22
+    assert "HasDeployKey" not in doc.get("Conditions", {})
+    assert "GitSshEgress" not in doc["Resources"]
+    assert "DeployKeySsmParam" not in doc["Parameters"]
+    sg = doc["Resources"]["HostSecurityGroup"]["Properties"]
+    egress_ports = {e.get("FromPort") for e in sg.get("SecurityGroupEgress", [])}
+    assert 22 not in egress_ports, "port-22 SSH egress must not be reintroduced"
+    ud = str(doc["Resources"]["AppHost"]["Properties"]["UserData"])
+    assert "gitlab" not in ud.lower()
+    assert "get-parameter --with-decryption" not in ud
 
 
 def test_params_source_model_dropped_and_added() -> None:
     params = _load()["Parameters"]
     # New source-acquisition params.
     for added in ("SourceMode", "SourceS3Uri", "SourceRepoUrl", "SourceRepoRef",
-                  "DeployKeySsmParam", "InstanceType", "HostSubnetId",
+                  "InstanceType", "HostSubnetId",
                   "StateVolumeSizeGiB", "MskEgressCidr", "LatestAl2023Ami"):
         assert added in params, added
     # Docker/ECR + ALB/Cognito/Fargate params gone.

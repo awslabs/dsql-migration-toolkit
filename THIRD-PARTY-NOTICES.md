@@ -9,9 +9,11 @@ local Java/Maven toolchain. Each component is the property of its respective
 authors and is provided under its own license, listed below. This file is
 informational; it does not modify any component's license.
 
-## Runtime Python dependencies
+## Runtime Python dependencies (application)
 
-Declared in `pyproject.toml` and installed from PyPI (not vendored):
+Declared in `pyproject.toml` and installed from PyPI for the application itself
+(not vendored in this repo). The offset-seeder Lambda ships its own vendored
+copies of some of these — see "Offset-seeder Lambda" under bundled artifacts below.
 
 | Package | License |
 |---|---|
@@ -23,7 +25,13 @@ Declared in `pyproject.toml` and installed from PyPI (not vendored):
 | sqlalchemy | MIT |
 | sqlglot | MIT |
 
-## Bundled Java / connector artifacts (`connectors/plugins/`)
+## Bundled connector artifacts (`connectors/plugins/`)
+
+Three deploy-critical artifacts are committed so the optional CDC pipeline can be
+deployed without a Java/Maven/Python build toolchain. Each bundled component
+retains its own license inside the artifact; the primary components are below.
+
+### Debezium MySQL source plugin (`debezium-mysql-plugin.zip` + `debezium-connector-mysql/`)
 
 | Component | Version | License | Upstream |
 |---|---|---|---|
@@ -61,6 +69,37 @@ Declared in `pyproject.toml` and installed from PyPI (not vendored):
 
 The Debezium distribution retains its upstream `LICENSE.txt` (Apache-2.0) inside
 `connectors/plugins/debezium-connector-mysql/`.
+
+### Custom Aurora DSQL sink plugin (`dsql-sink-plugin.zip`)
+
+A single shaded jar — this project's first-party `dsql-sink-connector`
+(Apache-2.0) — that bundles the following (each retains its own license inside
+the jar):
+
+| Component | Version | License | Upstream |
+|---|---|---|---|
+| PostgreSQL JDBC Driver (pgjdbc) | 42.7.3 | BSD-2-Clause | https://github.com/pgjdbc/pgjdbc |
+| com.ongres SCRAM / stringprep (pgjdbc SCRAM auth) | via pgjdbc | BSD-2-Clause | https://github.com/ongres/scram |
+| AWS SDK for Java 2.x (`dsql`, `cloudwatch` + transitive) | 2.31.0 | Apache-2.0 | https://github.com/aws/aws-sdk-java-v2 |
+| Netty (transitive via AWS SDK v2) | via AWS SDK | Apache-2.0 | https://github.com/netty/netty |
+| Reactive Streams (transitive via AWS SDK v2) | via AWS SDK | MIT-0 | https://github.com/reactive-streams/reactive-streams |
+
+### Offset-seeder Lambda (`offset-seeder-lambda.zip`)
+
+Vendored Python packages for the in-VPC CDC offset-seeder Lambda:
+
+| Package | Version | License |
+|---|---|---|
+| boto3 | 1.42.97 | Apache-2.0 |
+| botocore | 1.42.97 | Apache-2.0 |
+| s3transfer | 0.16.1 | Apache-2.0 |
+| jmespath | 1.1.0 | MIT |
+| python-dateutil | 2.9.0.post0 | Apache-2.0 / BSD-3-Clause |
+| six | 1.17.0 | MIT |
+| urllib3 | 1.26.20 | MIT |
+| click | 8.1.8 | BSD-3-Clause |
+| kafka-python | 3.0.10 | Apache-2.0 |
+| aws-msk-iam-sasl-signer-python | 1.0.2 | Apache-2.0 |
 
 ## AWS sample code
 
