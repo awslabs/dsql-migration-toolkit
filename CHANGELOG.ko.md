@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.378
+
+### Security
+
+- **DSQL 싱크 커넥터 플러그인을 PostgreSQL JDBC(pgjdbc) 42.7.11 → 42.7.12로 재빌드**하여 새로 게시된
+  Dependabot 경보(pgjdbc silent channel-binding 인증 다운그레이드, CVE-2026-54291, 42.7.4–42.7.11
+  영향 — 직전 42.7.11도 범위 내였음)를 해소. 싱크 jar만 변경(`PLUGIN_VERSION` v34 → v35); Debezium
+  플러그인과 오프셋 시더 zip은 그대로. 실제 위험은 낮음(다운그레이드는 MITM + `channelBinding` 의존이
+  있어야 성립하며 싱크는 신뢰된 Aurora DSQL에 TLS로 연결). 정식 재빌드 플로우로 처리 — Dependabot의
+  매니페스트-only PR은 커밋된 shaded jar를 42.7.11로 남겨둠. 새 플러그인 반영은 cdc-stack 재배포
+  (Delete + Deploy 인프라) 필요.
+
 ## v0.1.377
 
 ### Security

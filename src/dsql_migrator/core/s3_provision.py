@@ -51,6 +51,11 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v35 rebuilds the DSQL sink jar with PostgreSQL JDBC (pgjdbc) 42.7.11 -> 42.7.12 to
+#    clear a newly-published Dependabot advisory: the pgjdbc silent channel-binding
+#    auth-downgrade (CVE-2026-54291, affecting 42.7.4-42.7.11). Sink jar only; the
+#    Debezium plugin and seeder zip are unchanged. Low real risk (needs a MITM position +
+#    channelBinding reliance; the sink uses TLS to the trusted Aurora DSQL target).
 # v34 rebuilds the DSQL sink jar with PostgreSQL JDBC (pgjdbc) 42.7.3 -> 42.7.11 to
 #    clear the Dependabot SCRAM-auth CPU-exhaustion DoS advisory (CVE-2026-42198). Sink
 #    jar only; the Debezium plugin and the seeder zip are unchanged. Low real risk here --
@@ -303,7 +308,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
-PLUGIN_VERSION = "v34"
+PLUGIN_VERSION = "v35"
 
 
 class S3ProvisionError(RuntimeError):

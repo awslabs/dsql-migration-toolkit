@@ -5,6 +5,19 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.378
+
+### Security
+
+- **DSQL シンクコネクタプラグインを PostgreSQL JDBC（pgjdbc）42.7.11 → 42.7.12 で再ビルド**し、
+  新たに公開された Dependabot アラート（pgjdbc の silent channel-binding 認証ダウングレード、
+  CVE-2026-54291、42.7.4–42.7.11 に影響 — 直前の 42.7.11 も範囲内だった）を解消。シンク jar のみ変更
+  （`PLUGIN_VERSION` v34 → v35）で、Debezium プラグインとオフセットシーダー zip は変更なし。実際の
+  リスクは低い（ダウングレードには MITM と `channelBinding` への依存が必要で、シンクは信頼された
+  Aurora DSQL に TLS で接続）。正式な再ビルドフローで対応 — Dependabot のマニフェストのみの PR は
+  コミット済みの shaded jar を 42.7.11 のままにしてしまう。新しいプラグインの反映には cdc-stack の
+  再デプロイ（Delete + Deploy インフラ）が必要。
+
 ## v0.1.377
 
 ### Security

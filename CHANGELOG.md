@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.378
+
+### Security
+
+- **Rebuilt the DSQL sink connector plugin with PostgreSQL JDBC (pgjdbc) 42.7.11 → 42.7.12**
+  to clear a newly-published Dependabot advisory — the pgjdbc silent channel-binding
+  authentication downgrade (CVE-2026-54291, affecting 42.7.4–42.7.11, so the prior 42.7.11
+  bump was itself in range). Sink jar only (`PLUGIN_VERSION` v34 → v35); the Debezium
+  plugin and offset-seeder zip are unchanged. Low real risk (the downgrade needs a MITM
+  position and reliance on `channelBinding`; the sink uses TLS to the trusted Aurora DSQL
+  target). Done via the full rebuild flow — a Dependabot manifest-only PR would have left
+  the committed shaded jar at 42.7.11. Picking up the new plugin needs a cdc-stack
+  redeploy (Delete + Deploy infra).
+
 ## v0.1.377
 
 ### Security

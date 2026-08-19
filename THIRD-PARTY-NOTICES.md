@@ -78,7 +78,7 @@ the jar):
 
 | Component | Version | License | Upstream |
 |---|---|---|---|
-| PostgreSQL JDBC Driver (pgjdbc) | 42.7.11 | BSD-2-Clause | https://github.com/pgjdbc/pgjdbc |
+| PostgreSQL JDBC Driver (pgjdbc) | 42.7.12 | BSD-2-Clause | https://github.com/pgjdbc/pgjdbc |
 | com.ongres SCRAM / stringprep (pgjdbc SCRAM auth) | via pgjdbc | BSD-2-Clause | https://github.com/ongres/scram |
 | AWS SDK for Java 2.x (`dsql`, `cloudwatch` + transitive) | 2.31.0 | Apache-2.0 | https://github.com/aws/aws-sdk-java-v2 |
 | Netty (transitive via AWS SDK v2) | via AWS SDK | Apache-2.0 | https://github.com/netty/netty |
