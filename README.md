@@ -98,6 +98,13 @@ step unlocks the next, and any completed step can be re-run. An optional AI assi
 is available on demand throughout. Feature-level detail lives in the
 [User Manual](docs/manual/README.md).
 
+<details>
+<summary><b>Console (UI)</b> — click to expand</summary>
+
+<img src="docs/images/demo-ui.png" alt="The tool's UI — the guided five-step migration workflow" width="720">
+
+</details>
+
 ---
 
 <br>
@@ -146,11 +153,6 @@ large-scale migrations and private sources.
 
 **Full procedure: [`deploy/DEPLOYMENT.md`](deploy/DEPLOYMENT.md)** (AWS Console & CLI,
 parameters, custom domain & Cognito, teardown, troubleshooting).
-
-<p align="center">
-  <b>Console (UI)</b><br>
-  <img src="docs/images/demo-ui.png" alt="The tool's UI — the guided five-step migration workflow" width="720">
-</p>
 
 ### EC2 host (from source — no container, no Lambda)
 

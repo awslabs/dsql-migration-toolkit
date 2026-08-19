@@ -88,6 +88,13 @@ Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 *분산* 데이터베이�
 열리고 완료된 단계는 다시 실행할 수 있습니다. 선택적 AI 어시스턴트를 모든 단계에서 온디맨드로 쓸 수
 있습니다. 기능 단위 상세는 [사용자 매뉴얼](docs/manual/ko/README.md)에 있습니다.
 
+<details>
+<summary><b>Console (UI)</b> — 펼치기</summary>
+
+<img src="docs/images/demo-ui.png" alt="도구 UI — 5단계 가이드 마이그레이션 워크플로우" width="720">
+
+</details>
+
 ---
 
 <br>
@@ -135,11 +142,6 @@ UI만 띄우므로, 대용량 마이그레이션과 프라이빗 소스에 적�
 
 **전체 절차: [`deploy/DEPLOYMENT.ko.md`](deploy/DEPLOYMENT.ko.md)**(AWS Console·CLI,
 파라미터, 커스텀 도메인·Cognito, teardown, 문제 해결).
-
-<p align="center">
-  <b>Console (UI)</b><br>
-  <img src="docs/images/demo-ui.png" alt="도구 UI — 5단계 가이드 마이그레이션 워크플로우" width="720">
-</p>
 
 ### EC2 호스트 (소스에서 실행 — 컨테이너·Lambda 없음)
 

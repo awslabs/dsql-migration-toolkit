@@ -98,6 +98,13 @@ Web UI は **Connect** を準備ステップとし、5 つのステップで移�
 オンデマンドに利用できます。機能の詳細は [ユーザーマニュアル](docs/manual/ja/README.md) を
 参照してください。
 
+<details>
+<summary><b>Console (UI)</b> — クリックで展開</summary>
+
+<img src="docs/images/demo-ui.png" alt="ツールの UI — ガイド付き 5 ステップの移行ワークフロー" width="720">
+
+</details>
+
 ---
 
 <br>
@@ -146,11 +153,6 @@ CloudFormation で app-stack をデプロイすると（イメージのビルド
 
 **詳細な手順: [`deploy/DEPLOYMENT.ja.md`](deploy/DEPLOYMENT.ja.md)**（AWS Console・CLI、
 パラメータ、カスタムドメイン・Cognito、ティアダウン、トラブルシューティング）。
-
-<p align="center">
-  <b>Console (UI)</b><br>
-  <img src="docs/images/demo-ui.png" alt="ツールの UI — ガイド付き 5 ステップの移行ワークフロー" width="720">
-</p>
 
 ### EC2 ホスト（ソースから — コンテナ・Lambda なし）
 
