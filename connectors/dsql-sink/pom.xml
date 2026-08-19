@@ -20,7 +20,7 @@
     <maven.compiler.release>17</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <kafka.version>3.7.0</kafka.version>
-    <postgresql.version>42.7.11</postgresql.version>
+    <postgresql.version>42.7.12</postgresql.version>
     <aws.sdk.version>2.31.0</aws.sdk.version>
     <junit.version>5.10.2</junit.version>
   </properties>
