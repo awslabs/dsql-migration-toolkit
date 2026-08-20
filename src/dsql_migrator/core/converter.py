@@ -2911,6 +2911,30 @@ class SchemaConverter:
                 )
             )
 
+        # PostgreSQL source: warn on columns whose PG type Aurora DSQL does not support
+        # as a column type (arrays, and geometric/network/xml/money/bit/enum/composite/
+        # range/pgvector -- anything outside DSQL's documented supported set). PG->DSQL is
+        # otherwise near-identity, but these cannot be safely auto-substituted in v1 (that
+        # needs the Full Load value path), so the DDL keeps the faithful source type and
+        # the user is told to remodel before applying. Property 6 (no silent loss).
+        if is_postgres:
+            from dsql_migrator.core.converter_postgres import unsupported_dsql_reason
+
+            for column in table.columns:
+                reason = unsupported_dsql_reason(column.mysql_type)
+                if reason is None:
+                    continue
+                warnings.append(
+                    ConversionWarning(
+                        object_name=table.name,
+                        column_name=column.name,
+                        source_type=column.mysql_type,
+                        target_type=column.mysql_type,
+                        classification=Classification.UNSUPPORTED,
+                        message=reason,
+                    )
+                )
+
         # Apply DSQL structural constraints (Requirements 3.3, 3.5). Foreign keys
         # are never emitted by _build_source_ddl, so removal only requires
         # preserving them as metadata plus a warning.
