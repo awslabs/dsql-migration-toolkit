@@ -711,7 +711,12 @@ def run_evaluation(
     inventory = introspector.introspect(inputs.source_config)
 
     report(35, "Assessing source/target compatibility...")
-    assessment = (assessor or CompatibilityAssessor()).assess(inventory)
+    # The default rule set is source-engine-specific (MySQL vs PostgreSQL); pass the
+    # source type so a PostgreSQL source is assessed with its own rules.
+    assessment = (
+        assessor
+        or CompatibilityAssessor(source_type=inputs.source_config.source_type)
+    ).assess(inventory)
 
     report(60, "Introspecting target Aurora DSQL catalog...")
     browser = target_browser_factory(inputs.aws_profile)

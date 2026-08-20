@@ -483,17 +483,18 @@ def test_assessor_accepts_custom_extensible_rules() -> None:
 
 
 def test_default_rules_source_type_seam() -> None:
-    import pytest
-
     from dsql_migrator.core.models import SourceType
 
     # MySQL is byte-identical to the no-arg default (rule order preserved for ties).
     assert [type(r).__name__ for r in default_rules(SourceType.MYSQL)] == [
         type(r).__name__ for r in default_rules()
     ]
-    # PostgreSQL rules are not defined yet -> fail loudly, not silently apply MySQL.
-    with pytest.raises(NotImplementedError):
-        default_rules(SourceType.POSTGRES)
+    # PostgreSQL returns its own (source-neutral structural) rule set: a proper subset
+    # of the MySQL rule ids -- it drops the MySQL type/feature rules (detailed
+    # assertions live in tests/test_assessor_postgres.py).
+    pg_ids = {r.rule_id for r in default_rules(SourceType.POSTGRES)}
+    mysql_ids = {r.rule_id for r in default_rules(SourceType.MYSQL)}
+    assert pg_ids and pg_ids < mysql_ids
 
 
 def test_default_rules_contains_all_documented_rule_ids() -> None:
