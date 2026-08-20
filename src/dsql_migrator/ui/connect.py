@@ -35,8 +35,8 @@ from dsql_migrator.config import ConnectDefaults, SecretValue
 from dsql_migrator.core.introspector import (
     SourceIntrospector,
     install_read_only_guard,
-    source_engine_kwargs,
 )
+from dsql_migrator.core.source_dialect import dialect_for
 from dsql_migrator.core.activity_log import (
     ActivityCategory,
     ActivityStatus,
@@ -68,8 +68,6 @@ from dsql_migrator.ui.ai_assist import (
     run_verify_ai_access,
 )
 from dsql_migrator.ui.session import SessionStore
-
-MYSQL_DRIVER = "mysql+pymysql"
 
 # An AWS region token, e.g. "us-east-1", "ap-southeast-2", "eu-central-1".
 _AWS_REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
@@ -309,8 +307,11 @@ def make_source_engine_factory(
     """
 
     def factory(conn: SourceConnectionConfig) -> Engine:
+        # Driver scheme + engine kwargs come from the source dialect selected by
+        # conn.source_type (default MySQL, so the MySQL path is unchanged).
+        dialect = dialect_for(conn.source_type)
         url = URL.create(
-            MYSQL_DRIVER,
+            dialect.driver_scheme,
             username=conn.username,
             password=password.reveal() if password is not None else None,
             host=conn.host,
@@ -324,7 +325,7 @@ def make_source_engine_factory(
         # read/write timeout so a mid-stream stall fails the table (retryable)
         # rather than hanging the job in RUNNING forever.
         engine = create_engine(
-            url, **source_engine_kwargs(read_timeout_seconds=read_timeout_seconds)
+            url, **dialect.engine_kwargs(read_timeout_seconds=read_timeout_seconds)
         )
         install_read_only_guard(engine)
         return engine

@@ -350,19 +350,27 @@ def install_read_only_guard(engine: Engine) -> None:
 
 
 def _default_engine_factory(conn: SourceConnectionConfig) -> Engine:
-    """Build a read-only-guarded MySQL engine from a connection config."""
+    """Build a read-only-guarded source engine from a connection config.
+
+    The driver scheme and engine kwargs come from the source dialect selected by
+    ``conn.source_type`` (default MySQL). ``dialect_for`` is imported lazily to avoid
+    an import cycle (``source_dialect`` imports this module's MySQL helpers).
+    """
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    dialect = dialect_for(conn.source_type)
     password: Optional[str] = None
     if conn.secret is not None:
         password = resolve_secret(conn.secret).reveal()
     url = URL.create(
-        MYSQL_DRIVER,
+        dialect.driver_scheme,
         username=conn.username,
         password=password,
         host=conn.host,
         port=conn.port,
         database=conn.database,
     )
-    engine = create_engine(url, **source_engine_kwargs())
+    engine = create_engine(url, **dialect.engine_kwargs())
     install_read_only_guard(engine)
     return engine
 
