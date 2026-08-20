@@ -28,6 +28,14 @@ from dsql_migrator.core.introspector import (
 )
 from dsql_migrator.core.models import SourceType
 
+# MySQL integer base types (lower-cased, display width / UNSIGNED / ZEROFILL stripped
+# before matching). Reader range sharding bands the LEADING PK column, which is only
+# safe for a collation-free integer column; a non-integer leading column falls back to
+# a single reader. Owned here so the exporter's sharding is source-dialect-driven.
+_MYSQL_INTEGER_PK_TYPES = frozenset(
+    {"tinyint", "smallint", "mediumint", "int", "integer", "bigint"}
+)
+
 
 class SourceDialect(ABC):
     """Source-engine-specific behavior for reading a migration source (read-only)."""
@@ -68,6 +76,24 @@ class SourceDialect(ABC):
         engine-specific enrichment returns three empty lists. Structural reflection
         (tables/columns/views) is dialect-agnostic and done by the caller.
         """
+
+    @abstractmethod
+    def quote_identifier(self, name: str) -> str:
+        """Quote a bare identifier for this engine (e.g. MySQL backticks)."""
+
+    @abstractmethod
+    def quote_table(self, name: str) -> str:
+        """Quote a possibly ``schema.table`` name, quoting each part separately.
+
+        Cluster-wide introspection qualifies names as ``schema.table``; each part
+        must be quoted independently so the engine reads it as schema + table, not
+        one identifier containing a dot.
+        """
+
+    @property
+    @abstractmethod
+    def integer_pk_types(self) -> frozenset[str]:
+        """Base type names whose LEADING PK column is range-shardable (integers)."""
 
 
 class MySQLSourceDialect(SourceDialect):
@@ -123,6 +149,24 @@ class MySQLSourceDialect(SourceDialect):
             collect_routines(connection, enrich_db),
             collect_events(connection, enrich_db),
         )
+
+    def quote_identifier(self, name: str) -> str:
+        # MySQL: backticks, embedded backticks doubled.
+        escaped = name.replace("`", "``")
+        return f"`{escaped}`"
+
+    def quote_table(self, name: str) -> str:
+        # Split on the first dot so ``schema.table`` becomes `schema`.`table` rather
+        # than one `schema.table` identifier (which MySQL reads as one table in the
+        # unset current database -> "1046, No database selected").
+        schema, separator, obj = name.partition(".")
+        if separator and schema and obj:
+            return f"{self.quote_identifier(schema)}.{self.quote_identifier(obj)}"
+        return self.quote_identifier(name)
+
+    @property
+    def integer_pk_types(self) -> frozenset[str]:
+        return _MYSQL_INTEGER_PK_TYPES
 
 
 # Singleton dialect per source type. PostgreSQL is registered in a later phase; until

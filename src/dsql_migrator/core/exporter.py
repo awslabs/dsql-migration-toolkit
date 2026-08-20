@@ -61,6 +61,7 @@ from sqlalchemy.engine import Engine
 from dsql_migrator.core.converter import is_spatial_mysql_type, map_mysql_type
 from dsql_migrator.core.introspector import _default_engine_factory
 from dsql_migrator.core.models import ColumnDef, SourceConnectionConfig, TableDef
+from dsql_migrator.core.source_dialect import MySQLSourceDialect, SourceDialect
 from dsql_migrator.core.watermark import (
     COMMIT,
     START_CONSISTENT_SNAPSHOT,
@@ -416,24 +417,21 @@ class CsvRowWriter(RowWriter):
 # ---------------------------------------------------------------------------
 
 
+# The MySQL source dialect: the default for the source-reading helpers below
+# (identifier quoting, integer-PK types). Threading a dialect through them keeps one
+# source of truth for the source-engine SQL and lets a non-MySQL source supply its
+# own quoting/types later without touching these call sites.
+_MYSQL_DIALECT = MySQLSourceDialect()
+
+
 def _quote_mysql_identifier(name: str) -> str:
-    """Quote a MySQL identifier with backticks, escaping embedded backticks."""
-    escaped = name.replace("`", "``")
-    return f"`{escaped}`"
+    """Quote a MySQL identifier with backticks (delegates to the MySQL dialect)."""
+    return _MYSQL_DIALECT.quote_identifier(name)
 
 
 def _quote_mysql_table(name: str) -> str:
-    """Quote a possibly schema-qualified table name as ``\\`schema\\`.\\`table\\```.
-
-    Cluster-wide introspection qualifies names as ``database.table``; quoting the
-    whole string as one identifier yields ``\\`database.table\\``` which MySQL
-    reads as one table in the (unset) current database ("1046, No database
-    selected"). Split on the first dot so each part is quoted independently.
-    """
-    schema, separator, obj = name.partition(".")
-    if separator and schema and obj:
-        return f"{_quote_mysql_identifier(schema)}.{_quote_mysql_identifier(obj)}"
-    return _quote_mysql_identifier(name)
+    """Quote a possibly schema-qualified MySQL table name (delegates to the dialect)."""
+    return _MYSQL_DIALECT.quote_table(name)
 
 
 def _primary_key_columns(table: TableDef) -> list[str]:
@@ -465,19 +463,9 @@ class ExportCancelled(ExportError):
     """
 
 
-# MySQL integer base types (lower-cased, display width / UNSIGNED / ZEROFILL
-# stripped before matching). Range sharding bands the LEADING PK column: an integer
-# leading column is collation-free and evenly sliceable by MIN/MAX arithmetic, so
-# its interior boundaries are monotonic in MySQL's numeric order and the shards are
-# provably disjoint + covering. A non-integer leading column (string / UUID /
-# decimal / temporal / binary) has no such collation-free split, so it is never
-# sharded (the table falls back to a single reader -- always correct, just serial).
-_INTEGER_PK_TYPES = frozenset(
-    {"tinyint", "smallint", "mediumint", "int", "integer", "bigint"}
-)
-
-
-def shardable_leading_int_pk(table: TableDef) -> Optional[str]:
+def shardable_leading_int_pk(
+    table: TableDef, dialect: "SourceDialect" = _MYSQL_DIALECT
+) -> Optional[str]:
     """Return the LEADING PK column name if it is an integer type, else None.
 
     Reader range sharding (splitting a big table into K disjoint ranges read
@@ -499,12 +487,15 @@ def shardable_leading_int_pk(table: TableDef) -> Optional[str]:
     for column in table.columns:
         if column.name == leading:
             base = column.mysql_type.split("(")[0].strip().lower().split()[0]
-            return leading if base in _INTEGER_PK_TYPES else None
+            return leading if base in dialect.integer_pk_types else None
     return None
 
 
 def compute_pk_shard_ranges(
-    connection: _Connection, table: TableDef, shards: int
+    connection: _Connection,
+    table: TableDef,
+    shards: int,
+    dialect: "SourceDialect" = _MYSQL_DIALECT,
 ) -> list[tuple[Optional[int], Optional[int]]]:
     """Return ``shards`` half-open ``[lo, hi)`` ranges over the LEADING PK column.
 
@@ -524,11 +515,11 @@ def compute_pk_shard_ranges(
     (one hot shard, near-empty others) so the speedup is less than K -- it never
     hurts correctness (ranges stay disjoint + covering), only balance.
     """
-    pk_col = shardable_leading_int_pk(table)
+    pk_col = shardable_leading_int_pk(table, dialect)
     if pk_col is None or shards <= 1:
         return [(None, None)]
-    quoted_col = _quote_mysql_identifier(pk_col)
-    quoted_table = _quote_mysql_table(table.name)
+    quoted_col = dialect.quote_identifier(pk_col)
+    quoted_table = dialect.quote_table(table.name)
     row = connection.execute(
         text(f"SELECT MIN({quoted_col}) AS lo, MAX({quoted_col}) AS hi "
              f"FROM {quoted_table}")
