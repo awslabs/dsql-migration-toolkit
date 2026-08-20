@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.382
+
+### Fixed
+
+- **AI DBA replies no longer fail with "AI reply unavailable / could not be parsed"
+  on reasoning-heavy turns (e.g. Query Converter's "Tune with AI DBA").** The current
+  models (Claude 5 family) use extended thinking, and thinking tokens count against
+  `max_tokens`; the chat/guidance cap was 1536, small enough that a single turn could
+  spend the whole budget on thinking and stop (`stop_reason=max_tokens`) with no answer
+  text — which surfaced as an unparseable reply. The generation budgets are now
+  generous (8192) so thinking plus a full answer fit; the concise `_RESPONSE_STYLE`
+  still keeps visible answers short, so normal replies don't get longer.
+
+### Changed
+
+- **Token budgets are keyed by call shape, not per screen/feature.** Now that the AI
+  DBA is one persistent app-wide panel, every interactive turn (object guidance,
+  grounded chat, tool-calling chat, CDC error chat) shares a single `_CHAT_MAX_TOKENS`
+  — one place to tune the chat budget, nothing per-screen to keep in sync. The only
+  other budgets are the genuinely different shapes: the one-shot assessment report and
+  the bare permission probe (`max_tokens=1`, output ignored). Internal only.
+
 ## v0.1.381
 
 ### Changed

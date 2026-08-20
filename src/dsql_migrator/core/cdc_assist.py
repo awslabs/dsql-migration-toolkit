@@ -55,7 +55,11 @@ from dsql_migrator.core.models import AiAssessmentReport, AiAssistConfig
 
 # CDC readiness / triage return a structured report (summary + prioritized
 # findings), so they use a larger budget than the per-object suggestion path.
-_CDC_MAX_TOKENS = 2048
+# Output-token cap for CDC DLQ triage. Generous because the current models
+# (Claude 5 family) use EXTENDED THINKING, whose tokens count against max_tokens:
+# too small a cap and a reasoning-heavy turn spends it all on thinking and emits no
+# answer (see the note on the token budgets in assessment_strategist).
+_CDC_MAX_TOKENS = 8192
 
 # Cap how many dead-lettered errors are summarized into a triage prompt so an
 # unbounded DLQ cannot flood the request; triage clusters them anyway.

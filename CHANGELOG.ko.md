@@ -5,6 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.382
+
+### 수정 (Fixed)
+
+- **추론이 많은 턴(예: Query Converter의 "Tune with AI DBA")에서 AI DBA 응답이 "AI reply
+  unavailable / 파싱 불가"로 실패하던 문제를 고쳤습니다.** 현재 모델(Claude 5 계열)은 extended
+  thinking을 쓰고 thinking 토큰이 `max_tokens`에 포함되는데, 채팅/가이던스 한도가 1536이라
+  한 턴이 예산을 전부 thinking에 써버리고 답변 텍스트 없이 멈춰(`stop_reason=max_tokens`) 파싱
+  불가로 표시됐습니다. 이제 생성 예산을 넉넉히(8192) 둬 thinking + 전체 답변이 모두 들어갑니다.
+  답변 간결함은 여전히 `_RESPONSE_STYLE`이 통제하므로 일반 답변이 길어지지 않습니다.
+
+### 변경 (Changed)
+
+- **토큰 예산을 화면/기능별이 아니라 호출 형태(call shape)별로 둡니다.** AI DBA가 하나의 상시
+  패널이 된 만큼, 모든 대화 턴(object guidance, 그라운디드 챗, 툴 호출 챗, CDC 에러 챗)이 단일
+  `_CHAT_MAX_TOKENS`를 공유합니다 — 채팅 예산을 한 곳에서 조정하고, 화면마다 동기화할 한도가
+  없습니다. 나머지 예산은 형태가 실제로 다른 것뿐입니다: 일회성 assessment 리포트와 권한 프로브
+  (`max_tokens=1`, 출력 무시). 내부 변경입니다.
+
 ## v0.1.381
 
 ### 변경 (Changed)

@@ -5,6 +5,26 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.382
+
+### 修正 (Fixed)
+
+- **推論の多いターン（例: Query Converter の「Tune with AI DBA」）で AI DBA の応答が「AI reply
+  unavailable / 解析不可」で失敗する問題を修正しました。** 現在のモデル（Claude 5 系）は
+  extended thinking を使い、thinking トークンが `max_tokens` に計上されます。チャット/ガイダンスの
+  上限が 1536 と小さく、1 ターンで予算を thinking に使い切って回答テキストなしで停止し
+  （`stop_reason=max_tokens`）、解析不可として表示されていました。生成予算を十分（8192）に
+  引き上げ、thinking と完全な回答の両方が収まるようにしました。回答の簡潔さは引き続き
+  `_RESPONSE_STYLE` が制御するため、通常の回答が長くなることはありません。
+
+### 変更 (Changed)
+
+- **トークン予算を画面/機能ごとではなく、呼び出しの形（call shape）ごとに設定します。** AI DBA が
+  1 つの常設パネルになったため、すべての対話ターン（object guidance、グラウンデッドチャット、
+  ツール呼び出しチャット、CDC エラーチャット）が単一の `_CHAT_MAX_TOKENS` を共有します — チャット
+  予算を 1 か所で調整でき、画面ごとに同期する上限はありません。残る予算は形が実際に異なるものだけ
+  です: 一回限りの assessment レポートと、権限プローブ（`max_tokens=1`、出力は無視）。内部変更です。
+
 ## v0.1.381
 
 ### 変更 (Changed)
