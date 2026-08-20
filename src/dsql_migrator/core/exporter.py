@@ -61,10 +61,13 @@ from sqlalchemy.engine import Engine
 from dsql_migrator.core.converter import map_mysql_type
 from dsql_migrator.core.introspector import _default_engine_factory
 from dsql_migrator.core.models import SourceConnectionConfig, TableDef
-from dsql_migrator.core.source_dialect import MySQLSourceDialect, SourceDialect
+from dsql_migrator.core.source_dialect import (
+    MySQLSourceDialect,
+    SourceDialect,
+    dialect_for,
+)
 from dsql_migrator.core.watermark import (
     COMMIT,
-    START_CONSISTENT_SNAPSHOT,
     estimate_source_rows,
 )
 
@@ -900,6 +903,7 @@ class TableExporter:
         (Requirement 5.1 / Property 1). The caller owns ``writer`` and is
         responsible for closing it. Returns the number of rows exported.
         """
+        dialect = dialect_for(conn.source_type)
         engine = self._engine_factory(conn)
         try:
             with engine.connect() as connection:
@@ -912,6 +916,7 @@ class TableExporter:
                     writer,
                     batch_size=self._batch_size,
                     target_types=target_types,
+                    dialect=dialect,
                 )
         finally:
             engine.dispose()
@@ -935,7 +940,8 @@ class TableExporter:
         tables don't justify the extra connections/snapshots). Called once per
         table before the shard readers open their own snapshots.
         """
-        if shards <= 1 or shardable_leading_int_pk(table) is None:
+        dialect = dialect_for(conn.source_type)
+        if shards <= 1 or shardable_leading_int_pk(table, dialect) is None:
             return [(None, None)]
         engine = self._engine_factory(conn)
         try:
@@ -945,7 +951,7 @@ class TableExporter:
                     est = estimate_source_rows(ro, [table.name]).get(table.name)
                     if est is not None and est < min_rows:
                         return [(None, None)]
-                return compute_pk_shard_ranges(ro, table, shards)
+                return compute_pk_shard_ranges(ro, table, shards, dialect)
         finally:
             engine.dispose()
 
@@ -994,14 +1000,15 @@ class TableExporter:
         shards are disjoint, so their independently-timed snapshots never overlap a
         row); see :func:`compute_pk_shard_ranges`.
         """
-        converter = ValueConverter(table, target_types=target_types)
+        dialect = dialect_for(conn.source_type)
+        converter = dialect.value_converter(table, target_types=target_types)
         engine = self._engine_factory(conn)
         try:
             with engine.connect() as connection:
                 snapshot = connection.execution_options(
                     isolation_level="AUTOCOMMIT", stream_results=True
                 )
-                snapshot.execute(text(START_CONSISTENT_SNAPSHOT))
+                snapshot.execute(text(dialect.snapshot_start_sql))
                 governor = (
                     SourceLoadGovernor(
                         snapshot,
@@ -1020,6 +1027,7 @@ class TableExporter:
                         pk_lower=pk_lower,
                         pk_upper=pk_upper,
                         governor=governor,
+                        dialect=dialect,
                     ):
                         yield converter.convert_row(raw)
                 finally:
@@ -1035,22 +1043,26 @@ def export_rows(
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
     target_types: Optional[Mapping[str, str]] = None,
+    dialect: "SourceDialect" = _MYSQL_DIALECT,
 ) -> int:
     """Stream-convert-write ``table`` rows on an open connection (read-only).
 
     Wraps the keyset stream in a consistent-snapshot transaction, writes the
     header, then converts and writes each row as it arrives. Returns the row
     count. The transaction is committed even if writing fails; the caller owns
-    the ``writer`` lifecycle.
+    the ``writer`` lifecycle. ``dialect`` (default MySQL) supplies the snapshot SQL,
+    the per-row value converter, and the keyset quoting.
     """
-    value_converter = ValueConverter(table, target_types=target_types)
+    value_converter = dialect.value_converter(table, target_types=target_types)
     column_names = [column.name for column in table.columns]
 
-    connection.execute(text(START_CONSISTENT_SNAPSHOT))
+    connection.execute(text(dialect.snapshot_start_sql))
     rows_exported = 0
     try:
         writer.write_header(column_names)
-        for row in keyset_stream(connection, table, batch_size=batch_size):
+        for row in keyset_stream(
+            connection, table, batch_size=batch_size, dialect=dialect
+        ):
             writer.write_row(value_converter.convert_row(row))
             rows_exported += 1
     finally:

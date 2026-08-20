@@ -104,6 +104,21 @@ class SourceDialect(ABC):
         column is just the quoted name.
         """
 
+    @property
+    @abstractmethod
+    def snapshot_start_sql(self) -> str:
+        """SQL that opens the read-only consistent-snapshot transaction for a stream."""
+
+    @abstractmethod
+    def value_converter(self, table: object, *, target_types: object = None) -> object:
+        """Per-row value converter for reading ``table`` from this source.
+
+        Turns a raw driver row into target-ready values (engine/driver-specific quirks
+        -> canonical types); ``target_types`` optionally overrides the target type per
+        column. MySQL returns the PyMySQL-aware :class:`~dsql_migrator.core.exporter.
+        ValueConverter`.
+        """
+
 
 class MySQLSourceDialect(SourceDialect):
     """RDS/Aurora MySQL source dialect -- the original, default engine.
@@ -186,6 +201,18 @@ class MySQLSourceDialect(SourceDialect):
         if is_spatial_mysql_type(column.mysql_type):  # type: ignore[attr-defined]
             return f"ST_AsBinary({quoted}) AS {quoted}"
         return quoted
+
+    @property
+    def snapshot_start_sql(self) -> str:
+        # MySQL: InnoDB REPEATABLE READ consistent snapshot (same as watermark capture).
+        from dsql_migrator.core.watermark import START_CONSISTENT_SNAPSHOT
+
+        return START_CONSISTENT_SNAPSHOT
+
+    def value_converter(self, table: object, *, target_types: object = None) -> object:
+        from dsql_migrator.core.exporter import ValueConverter
+
+        return ValueConverter(table, target_types=target_types)
 
 
 # Singleton dialect per source type. PostgreSQL is registered in a later phase; until

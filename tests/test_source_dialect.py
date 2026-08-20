@@ -80,3 +80,20 @@ def test_exporter_quote_helpers_delegate_to_the_mysql_dialect() -> None:
     d = dialect_for(SourceType.MYSQL)
     assert _quote_mysql_identifier("a`b") == d.quote_identifier("a`b")
     assert _quote_mysql_table("db.t") == d.quote_table("db.t")
+
+
+def test_mysql_dialect_snapshot_sql_matches_watermark_constant() -> None:
+    from dsql_migrator.core.watermark import START_CONSISTENT_SNAPSHOT
+
+    assert dialect_for(SourceType.MYSQL).snapshot_start_sql == START_CONSISTENT_SNAPSHOT
+
+
+def test_mysql_dialect_value_converter_returns_mysql_value_converter() -> None:
+    from dsql_migrator.core.exporter import ValueConverter
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    table = TableDef(
+        name="t", columns=[ColumnDef(name="id", mysql_type="int")], primary_key=["id"]
+    )
+    vc = dialect_for(SourceType.MYSQL).value_converter(table)
+    assert isinstance(vc, ValueConverter)
