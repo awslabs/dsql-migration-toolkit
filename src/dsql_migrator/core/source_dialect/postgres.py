@@ -15,9 +15,14 @@ from __future__ import annotations
 
 from typing import Optional
 
+from sqlalchemy import text
+
 from dsql_migrator.core.introspector import SOURCE_CONNECT_TIMEOUT_SECONDS
 from dsql_migrator.core.models import SourceType
 from dsql_migrator.core.source_dialect.base import SourceDialect
+
+# System schemas excluded when resolving a bare (unqualified) table name to its columns.
+_PG_SYSTEM_SCHEMAS_SQL = "('pg_catalog', 'information_schema', 'pg_toast')"
 
 # PostgreSQL integer base types (lower-cased, precision stripped). Same sharding
 # rationale as MySQL: only a collation-free integer leading PK column is range-shardable.
@@ -77,10 +82,43 @@ class PostgresSourceDialect(SourceDialect):
     def enrich(
         self, connection: object, enrich_db: str, tables: list
     ) -> tuple[list, list, list]:
-        # v1: no PostgreSQL-catalog enrichment. Structural reflection (columns/types/PK/
-        # indexes/FK) is dialect-agnostic and already done by the caller via SQLAlchemy;
-        # PG-specific enrichment (identity/generated columns, index method) and stored
-        # trigger/function/event collection from pg_catalog are a later refinement.
+        # Capture EXACT PostgreSQL type strings via format_type(atttypid, atttypmod):
+        # generic SQLAlchemy reflection loses array element types (text[] -> "ARRAY"),
+        # timestamptz -> "TIMESTAMP", precision, etc. This overwrites each column's
+        # reflected type string in place so the converter/assessor see the true PG type.
+        # A non-PostgreSQL connection (e.g. the SQLite test double) no-ops (mirrors the
+        # MySQL dialect's runtime guard). Stored trigger/function/event collection from
+        # pg_catalog is a later refinement, so triggers/routines/events stay empty.
+        dialect_name = getattr(getattr(connection, "dialect", None), "name", None)
+        if dialect_name != "postgresql":
+            return ([], [], [])
+
+        for table in tables:
+            schema, _, bare = table.name.rpartition(".")
+            params: dict[str, object] = {"rel": bare}
+            if schema:
+                schema_filter = "AND n.nspname = :nsp"
+                params["nsp"] = schema
+            else:
+                # Bare name (single-schema reflection): restrict to a user schema.
+                schema_filter = f"AND n.nspname NOT IN {_PG_SYSTEM_SCHEMAS_SQL}"
+            rows = connection.execute(  # type: ignore[attr-defined]
+                text(
+                    "SELECT a.attname AS col, "
+                    "format_type(a.atttypid, a.atttypmod) AS typ "
+                    "FROM pg_attribute a "
+                    "JOIN pg_class c ON c.oid = a.attrelid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE c.relname = :rel AND a.attnum > 0 "
+                    f"AND NOT a.attisdropped {schema_filter}"
+                ),
+                params,
+            ).mappings()
+            exact = {row["col"]: row["typ"] for row in rows}
+            for column in table.columns:
+                resolved = exact.get(column.name)
+                if resolved:
+                    column.mysql_type = resolved
         return ([], [], [])
 
     def quote_identifier(self, name: str) -> str:

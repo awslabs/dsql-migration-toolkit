@@ -94,9 +94,58 @@ def test_postgres_dialect_engine_kwargs_pin_utc_and_optional_statement_timeout()
     assert "statement_timeout=30000" in timed["connect_args"]["options"]
 
 
-def test_postgres_dialect_enrich_is_v1_noop() -> None:
-    # v1: structure comes from SQLAlchemy reflection; no pg_catalog enrichment yet.
+def test_postgres_dialect_enrich_noops_on_non_pg_connection() -> None:
+    # A non-PostgreSQL connection (no .dialect / not "postgresql") must skip the
+    # pg_catalog query entirely -- e.g. the SQLite test double or a bare object.
     assert dialect_for(SourceType.POSTGRES).enrich(object(), "app", []) == ([], [], [])
+
+
+class _FakePgMappings:
+    def __init__(self, rows: list[dict]) -> None:
+        self._rows = rows
+
+    def mappings(self) -> list[dict]:
+        return self._rows
+
+
+class _FakePgConnection:
+    """A connection whose dialect is PostgreSQL, returning canned format_type rows."""
+
+    class _Dialect:
+        name = "postgresql"
+
+    dialect = _Dialect()
+
+    def __init__(self, rows: list[dict]) -> None:
+        self._rows = rows
+
+    def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        return _FakePgMappings(self._rows)
+
+
+def test_postgres_dialect_enrich_captures_exact_pg_types() -> None:
+    # enrich overwrites each reflected column type with format_type's exact string, so a
+    # text[] shows as "text[]" (not the lossy "ARRAY") and numeric keeps its precision;
+    # a column absent from the catalog result is left unchanged.
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    conn = _FakePgConnection(
+        [{"col": "tags", "typ": "text[]"}, {"col": "total", "typ": "numeric(12,2)"}]
+    )
+    table = TableDef(
+        name="orders",
+        columns=[
+            ColumnDef(name="tags", mysql_type="ARRAY"),
+            ColumnDef(name="total", mysql_type="NUMERIC"),
+            ColumnDef(name="note", mysql_type="TEXT"),
+        ],
+        primary_key=[],
+    )
+    result = dialect_for(SourceType.POSTGRES).enrich(conn, "shop", [table])
+    assert result == ([], [], [])
+    assert table.columns[0].mysql_type == "text[]"
+    assert table.columns[1].mysql_type == "numeric(12,2)"
+    assert table.columns[2].mysql_type == "TEXT"  # not in catalog rows -> unchanged
 
 
 def test_postgres_dialect_value_converter_is_a_phase2_stub() -> None:
