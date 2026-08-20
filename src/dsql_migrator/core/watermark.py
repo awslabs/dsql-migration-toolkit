@@ -60,6 +60,7 @@ from dsql_migrator.core.introspector import (
     _default_engine_factory,
 )
 from dsql_migrator.core.models import SourceConnectionConfig, Watermark
+from dsql_migrator.core.source_dialect import MySQLSourceDialect, SourceDialect
 
 # Transaction-control and read statements issued during capture. None of these
 # are writes or DDL, so they pass the read-only guard (Property 1).
@@ -85,24 +86,11 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _quote_mysql_identifier(name: str) -> str:
-    """Quote a MySQL identifier with backticks, escaping embedded backticks."""
-    escaped = name.replace("`", "``")
-    return f"`{escaped}`"
-
-
-def _quote_mysql_table(name: str) -> str:
-    """Quote a possibly schema-qualified table name as ``\\`schema\\`.\\`table\\```.
-
-    Cluster-wide introspection qualifies names as ``database.table``; quoting the
-    whole string as one identifier yields ``\\`database.table\\``` which MySQL
-    reads as one table in the (unset) current database ("1046, No database
-    selected"). Split on the first dot so each part is quoted independently.
-    """
-    schema, separator, obj = name.partition(".")
-    if separator and schema and obj:
-        return f"{_quote_mysql_identifier(schema)}.{_quote_mysql_identifier(obj)}"
-    return _quote_mysql_identifier(name)
+# The MySQL source dialect: default for the exact-count / max-PK helpers below, whose
+# identifier quoting now comes from the dialect (single source of truth) so a non-MySQL
+# source quotes its own way. (The information_schema row-estimate query stays
+# MySQL-specific for now; its PostgreSQL pg_class form is a later phase.)
+_MYSQL_DIALECT = MySQLSourceDialect()
 
 
 def _read_master_status(
@@ -272,17 +260,21 @@ def estimate_source_rows(
     return out
 
 
-def _count_table_rows(connection: _Connection, table: str) -> int:
+def _count_table_rows(
+    connection: _Connection, table: str, dialect: "SourceDialect" = _MYSQL_DIALECT
+) -> int:
     """Return exact ``COUNT(*)`` for ``table`` (full scan; used only when an
     exact count is explicitly required, not during watermark capture)."""
-    statement = text(f"SELECT COUNT(*) FROM {_quote_mysql_table(table)}")
+    statement = text(f"SELECT COUNT(*) FROM {dialect.quote_table(table)}")
     result = connection.execute(statement)
     value = result.scalar()
     return int(value) if value is not None else 0
 
 
 def count_source_rows(
-    connection: _Connection, tables: list[str]
+    connection: _Connection,
+    tables: list[str],
+    dialect: "SourceDialect" = _MYSQL_DIALECT,
 ) -> dict[str, Optional[int]]:
     """Return an exact ``COUNT(*)`` per source table over one connection (read-only).
 
@@ -295,7 +287,7 @@ def count_source_rows(
     counts: dict[str, Optional[int]] = {}
     for table in tables:
         try:
-            counts[table] = _count_table_rows(connection, table)
+            counts[table] = _count_table_rows(connection, table, dialect)
         except ReadOnlySourceError:
             raise
         except Exception:  # noqa: BLE001 - missing table/error -> unknown
@@ -304,7 +296,9 @@ def count_source_rows(
 
 
 def max_pk_source(
-    connection: _Connection, pk_by_table: dict[str, str]
+    connection: _Connection,
+    pk_by_table: dict[str, str],
+    dialect: "SourceDialect" = _MYSQL_DIALECT,
 ) -> dict[str, Optional[int]]:
     """Return ``MAX(pk)`` per source table for a single integer PK (read-only).
 
@@ -320,8 +314,8 @@ def max_pk_source(
             out[table] = None
             continue
         try:
-            quoted = _quote_mysql_table(table)
-            col = "`" + pk.replace("`", "``") + "`"
+            quoted = dialect.quote_table(table)
+            col = dialect.quote_identifier(pk)
             result = connection.execute(text(f"SELECT MAX({col}) FROM {quoted}"))
             val = result.scalar()
             out[table] = int(val) if isinstance(val, int) else None
