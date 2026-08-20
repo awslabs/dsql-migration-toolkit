@@ -13,6 +13,7 @@ import pytest
 from dsql_migrator.core.models import SourceType
 from dsql_migrator.core.source_dialect import (
     MySQLSourceDialect,
+    PostgresSourceDialect,
     dialect_for,
 )
 
@@ -47,11 +48,62 @@ def test_mysql_dialect_engine_kwargs_match_source_engine_kwargs() -> None:
     )
 
 
-def test_dialect_for_postgres_not_yet_registered() -> None:
-    # PostgreSQL gets its dialect in a later phase; until then it fails loudly rather
-    # than silently reading as MySQL.
+def test_dialect_for_postgres_returns_postgres_dialect() -> None:
+    d = dialect_for(SourceType.POSTGRES)
+    assert isinstance(d, PostgresSourceDialect)
+    assert d.source_type is SourceType.POSTGRES
+    assert dialect_for(SourceType.POSTGRES) is d  # singleton
+
+
+def test_postgres_dialect_connection_constants() -> None:
+    d = dialect_for(SourceType.POSTGRES)
+    assert d.driver_scheme == "postgresql+psycopg"
+    assert d.default_port == 5432
+    assert d.system_schemas == frozenset(
+        {"pg_catalog", "information_schema", "pg_toast"}
+    )
+    assert {"integer", "bigint", "smallint"} <= d.integer_pk_types
+    assert "varchar" not in d.integer_pk_types
+
+
+def test_postgres_dialect_quoting_is_double_quote() -> None:
+    d = dialect_for(SourceType.POSTGRES)
+    assert d.quote_identifier("id") == '"id"'
+    assert d.quote_identifier('we"ird') == '"we""ird"'  # embedded double-quote doubled
+    assert d.quote_table("app.orders") == '"app"."orders"'
+    assert d.quote_table("orders") == '"orders"'
+    assert d.quote_table("app.a.b") == '"app"."a.b"'  # split on first dot only
+
+
+def test_postgres_dialect_snapshot_and_select_column() -> None:
+    from dsql_migrator.core.models import ColumnDef
+
+    d = dialect_for(SourceType.POSTGRES)
+    assert d.snapshot_start_sql == "START TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+    # v1: plain quoted column (no spatial ST_AsBinary special-case).
+    assert d.select_column_sql(ColumnDef(name="geom", mysql_type="geometry")) == '"geom"'
+
+
+def test_postgres_dialect_engine_kwargs_pin_utc_and_optional_statement_timeout() -> None:
+    d = dialect_for(SourceType.POSTGRES)
+    base = d.engine_kwargs()
+    assert base["pool_pre_ping"] is True
+    assert base["connect_args"]["options"] == "-c timezone=UTC"
+    assert "connect_timeout" in base["connect_args"]
+    timed = d.engine_kwargs(read_timeout_seconds=30)
+    assert "statement_timeout=30000" in timed["connect_args"]["options"]
+
+
+def test_postgres_dialect_enrich_is_v1_noop() -> None:
+    # v1: structure comes from SQLAlchemy reflection; no pg_catalog enrichment yet.
+    assert dialect_for(SourceType.POSTGRES).enrich(object(), "app", []) == ([], [], [])
+
+
+def test_postgres_dialect_value_converter_is_a_phase2_stub() -> None:
+    # Full Load value conversion for PG is Phase 2; it must fail loudly (never silently
+    # mis-convert), so it raises rather than returning a half-baked converter.
     with pytest.raises(NotImplementedError):
-        dialect_for(SourceType.POSTGRES)
+        dialect_for(SourceType.POSTGRES).value_converter(object())
 
 
 def test_mysql_dialect_quoting() -> None:
