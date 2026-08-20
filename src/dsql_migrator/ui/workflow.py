@@ -399,30 +399,32 @@ _SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+")
 
 def format_source_engine(
     version: Optional[str],
-    mysql_version: Optional[str] = None,
+    engine_version: Optional[str] = None,
     aurora_version: Optional[str] = None,
 ) -> Optional[str]:
     """Format the source engine label from the captured version strings.
 
+    ``engine_version`` is the clean base-engine patch (MySQL ``@@innodb_version``).
     Prefers the explicit Aurora engine version (``@@aurora_version``, e.g.
     ``3.07.1``) when present -- newer Aurora MySQL reports only the
     MySQL-compatible patch in ``VERSION()`` so the Aurora tag may be absent
     there. Otherwise falls back to the Aurora tag embedded in ``VERSION()``
     (``8.0.mysql_aurora.3.10.4``). Plain MySQL is shown as ``MySQL 8.0.35``.
-    Returns ``None`` when no version was captured.
+    Returns ``None`` when no version was captured. (MySQL-labeled today; PostgreSQL
+    labeling arrives with the Phase-3 engine selector.)
     """
     if aurora_version:
         base = version.split(_AURORA_VERSION_MARKER)[0] if version else None
-        mysql = mysql_version or base
+        mysql = engine_version or base
         suffix = f" (MySQL {mysql})" if mysql else ""
         return f"Aurora MySQL {aurora_version}{suffix}"
     if not version:
-        return f"MySQL {mysql_version}" if mysql_version else None
+        return f"MySQL {engine_version}" if engine_version else None
     if _AURORA_VERSION_MARKER in version:
         base, _, aurora = version.partition(_AURORA_VERSION_MARKER)
         mysql = (
-            mysql_version
-            if mysql_version and _SEMVER_RE.match(mysql_version)
+            engine_version
+            if engine_version and _SEMVER_RE.match(engine_version)
             else base
         )
         return f"Aurora MySQL {aurora} (MySQL {mysql})"
@@ -634,7 +636,7 @@ def build_migration_diagram(
         source_region = _aws_region_from_host(host)
         engine = format_source_engine(
             server_version,
-            getattr(state, "source_mysql_version", None),
+            getattr(state, "source_engine_version", None),
             aurora_version,
         )
         # (icon, labeled text) pairs; each on its own line so nothing is cut off.

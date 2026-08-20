@@ -48,7 +48,7 @@ class SessionConnectionState:
         "source_verified",
         "target_verified",
         "source_server_version",
-        "source_mysql_version",
+        "source_engine_version",
         "source_aurora_version",
         "source_instance_class",
         "target_cluster_name",
@@ -79,10 +79,11 @@ class SessionConnectionState:
         # Source server version (e.g. Aurora MySQL version) captured read-only on
         # a successful source test; shown on the overview diagram. Non-secret.
         self.source_server_version: Optional[str] = None
-        # Community MySQL engine version (e.g. 8.0.42) behind an Aurora build.
-        self.source_mysql_version: Optional[str] = None
-        # Aurora MySQL engine version (e.g. 3.07.1) from @@aurora_version;
-        # present only for Aurora MySQL sources. Non-secret.
+        # Clean base-engine version (MySQL 8.0.42 behind an Aurora build, or
+        # PostgreSQL 16.4). Non-secret.
+        self.source_engine_version: Optional[str] = None
+        # Aurora-managed engine version (Aurora MySQL 3.07.1 from @@aurora_version,
+        # or Aurora PostgreSQL from aurora_version()); None for RDS/community. Non-secret.
         self.source_aurora_version: Optional[str] = None
         # Source RDS/Aurora instance class (e.g. db.r6g.large) looked up via the
         # RDS API on a successful source test; best effort, shown on the diagram.
@@ -174,7 +175,7 @@ class SessionConnectionState:
             # A failed test or an edited connection invalidates the captured
             # version so the diagram never shows stale source metadata.
             self.source_server_version = None
-            self.source_mysql_version = None
+            self.source_engine_version = None
             self.source_aurora_version = None
             self.source_instance_class = None
         self._refresh_workflow_unlock()
@@ -199,12 +200,12 @@ class SessionConnectionState:
     def set_source_version(
         self,
         version: Optional[str],
-        mysql_version: Optional[str] = None,
+        engine_version: Optional[str] = None,
         aurora_version: Optional[str] = None,
     ) -> None:
-        """Record the source server, community MySQL, and Aurora versions."""
+        """Record the source raw server, clean base-engine, and Aurora versions."""
         self.source_server_version = version
-        self.source_mysql_version = mysql_version
+        self.source_engine_version = engine_version
         self.source_aurora_version = aurora_version
 
     def set_source_instance_class(self, instance_class: Optional[str]) -> None:
@@ -352,7 +353,7 @@ class SessionConnectionState:
         self.source_verified = False
         self.target_verified = False
         self.source_server_version = None
-        self.source_mysql_version = None
+        self.source_engine_version = None
         self.source_aurora_version = None
         self.source_instance_class = None
         self.target_cluster_name = None

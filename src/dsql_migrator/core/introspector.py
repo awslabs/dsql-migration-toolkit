@@ -857,54 +857,25 @@ class SourceIntrospector:
         Implements Requirement 1.1. On failure the reason is returned with any
         plaintext credential redacted (Requirement 1.4 / 9.2).
         """
+        from dsql_migrator.core.source_dialect import dialect_for
+
+        dialect = dialect_for(conn.source_type)
         engine: Optional[Engine] = None
         try:
             engine = self._engine_factory(conn)
             with engine.connect() as connection:
                 connection.execute(text("SELECT 1"))
-                # Read the server version read-only so the UI can show the source
-                # engine (e.g. Aurora MySQL version) on the overview diagram. A
-                # failure here must not fail the connection test, so it is best
-                # effort.
-                version: Optional[str] = None
-                try:
-                    row = connection.execute(text("SELECT VERSION()")).first()
-                    version = str(row[0]) if row and row[0] is not None else None
-                except Exception:  # noqa: BLE001 - version is optional metadata
-                    version = None
-                # The community MySQL engine version behind an Aurora build is not
-                # in VERSION() (which carries only major.minor before the Aurora
-                # tag); @@innodb_version usually exposes the full patch (e.g.
-                # 8.0.42). Best effort, optional.
-                mysql_version: Optional[str] = None
-                try:
-                    row = connection.execute(
-                        text("SELECT @@innodb_version")
-                    ).first()
-                    mysql_version = (
-                        str(row[0]) if row and row[0] is not None else None
-                    )
-                except Exception:  # noqa: BLE001 - optional metadata
-                    mysql_version = None
-                # Aurora MySQL exposes its engine version (e.g. 3.07.1) via
-                # @@aurora_version even when VERSION() reports only the
-                # MySQL-compatible patch. Present only on Aurora; best effort.
-                aurora_version: Optional[str] = None
-                try:
-                    row = connection.execute(
-                        text("SELECT @@aurora_version")
-                    ).first()
-                    aurora_version = (
-                        str(row[0]) if row and row[0] is not None else None
-                    )
-                except Exception:  # noqa: BLE001 - non-Aurora has no such var
-                    aurora_version = None
+                # Read source version metadata read-only so the UI can show the
+                # source engine (e.g. Aurora MySQL / PostgreSQL version) on the
+                # overview diagram. The dialect probes each version best-effort, so
+                # a failure here never fails the connection test.
+                versions = dialect.probe_versions(connection)
             return ConnectionResult(
                 success=True,
                 detail="Connection successful.",
-                server_version=version,
-                mysql_version=mysql_version,
-                aurora_version=aurora_version,
+                server_version=versions.server_version,
+                engine_version=versions.engine_version,
+                aurora_version=versions.aurora_version,
             )
         except Exception as exc:  # noqa: BLE001 - surfaced as a failure reason
             message = _sanitize_message(str(exc), _revealed_secret(conn))

@@ -19,7 +19,11 @@ from sqlalchemy import text
 
 from dsql_migrator.core.introspector import SOURCE_CONNECT_TIMEOUT_SECONDS
 from dsql_migrator.core.models import SourceType
-from dsql_migrator.core.source_dialect.base import SourceDialect
+from dsql_migrator.core.source_dialect.base import (
+    SourceDialect,
+    SourceVersions,
+    probe_scalar,
+)
 
 # System schemas excluded when resolving a bare (unqualified) table name to its columns.
 _PG_SYSTEM_SCHEMAS_SQL = "('pg_catalog', 'information_schema', 'pg_toast')"
@@ -156,6 +160,20 @@ class PostgresSourceDialect(SourceDialect):
             "PostgreSQL-source Full Load value conversion is not implemented yet "
             "(Phase 2); PostgreSQL support currently covers Evaluation + Schema "
             "Conversion."
+        )
+
+    def probe_versions(self, connection: object) -> SourceVersions:
+        # version() is the verbose banner ("PostgreSQL 16.4 ... on <arch>").
+        # SHOW server_version is "<numeric>[ (<packaging>)]" -- "16.10 (Homebrew)",
+        # "16.4 (Debian ...)", or a clean "16.4" on RDS/Aurora -- so keep only the
+        # leading numeric token for a clean engine_version. aurora_version() gives the
+        # Aurora PostgreSQL engine version (Aurora only; community/RDS lacks the
+        # function, so it best-efforts to None).
+        server_version = probe_scalar(connection, "SHOW server_version")
+        return SourceVersions(
+            server_version=probe_scalar(connection, "SELECT version()"),
+            engine_version=server_version.split()[0] if server_version else None,
+            aurora_version=probe_scalar(connection, "SELECT aurora_version()"),
         )
 
 

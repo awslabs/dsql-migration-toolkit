@@ -18,7 +18,11 @@ from dsql_migrator.core.introspector import (
     source_engine_kwargs,
 )
 from dsql_migrator.core.models import SourceType
-from dsql_migrator.core.source_dialect.base import SourceDialect
+from dsql_migrator.core.source_dialect.base import (
+    SourceDialect,
+    SourceVersions,
+    probe_scalar,
+)
 
 # MySQL integer base types (lower-cased, display width / UNSIGNED / ZEROFILL stripped
 # before matching). Reader range sharding bands the LEADING PK column, which is only
@@ -118,6 +122,17 @@ class MySQLSourceDialect(SourceDialect):
         from dsql_migrator.core.exporter import ValueConverter
 
         return ValueConverter(table, target_types=target_types)
+
+    def probe_versions(self, connection: object) -> SourceVersions:
+        # VERSION() carries the raw wire version (with the Aurora tag before newer
+        # builds dropped it); @@innodb_version exposes the full community patch (e.g.
+        # 8.0.42); @@aurora_version gives the Aurora MySQL engine version (Aurora only).
+        # Each is best effort -- a non-Aurora/RDS source simply has no @@aurora_version.
+        return SourceVersions(
+            server_version=probe_scalar(connection, "SELECT VERSION()"),
+            engine_version=probe_scalar(connection, "SELECT @@innodb_version"),
+            aurora_version=probe_scalar(connection, "SELECT @@aurora_version"),
+        )
 
 
 __all__ = ["MySQLSourceDialect"]

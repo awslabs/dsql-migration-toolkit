@@ -16,6 +16,7 @@ from dsql_migrator.core.source_dialect import (
     PostgresSourceDialect,
     dialect_for,
 )
+from dsql_migrator.core.source_dialect.base import SourceVersions
 
 
 def test_dialect_for_mysql_returns_mysql_dialect() -> None:
@@ -153,6 +154,97 @@ def test_postgres_dialect_value_converter_is_a_phase2_stub() -> None:
     # mis-convert), so it raises rather than returning a half-baked converter.
     with pytest.raises(NotImplementedError):
         dialect_for(SourceType.POSTGRES).value_converter(object())
+
+
+# ---------------------------------------------------------------------------
+# probe_versions -- best-effort source version metadata for the overview diagram
+# ---------------------------------------------------------------------------
+
+
+class _ScalarResult:
+    def __init__(self, value: object) -> None:
+        self._value = value
+
+    def first(self):  # noqa: ANN201
+        return (self._value,) if self._value is not None else None
+
+
+class _FakeVersionConnection:
+    """Dispatches a version probe to the first matching canned scalar.
+
+    ``responses`` is a list of (uppercased-substring, value): the first token found
+    in the (upper-cased) SQL wins. The plain-version probe is keyed on ``" VERSION()"``
+    (leading space) so it does NOT spuriously match ``AURORA_VERSION()``. A probe with
+    no canned match raises -- proving each probe is isolated (a failing one must not
+    sink the others).
+    """
+
+    def __init__(self, responses: list[tuple[str, object]]) -> None:
+        self._responses = responses
+
+    def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        sql = str(statement).strip().upper()
+        for token, value in self._responses:
+            if token in sql:
+                return _ScalarResult(value)
+        raise RuntimeError(f"no canned response for {sql!r}")
+
+
+def test_mysql_dialect_probe_versions() -> None:
+    # MySQL reads VERSION() / @@innodb_version / @@aurora_version, each mapped to the
+    # matching SourceVersions field.
+    conn = _FakeVersionConnection(
+        [
+            ("INNODB_VERSION", "8.0.42"),
+            ("AURORA_VERSION", "3.07.1"),
+            (" VERSION()", "8.0.mysql_aurora.3.07.1"),
+        ]
+    )
+    versions = dialect_for(SourceType.MYSQL).probe_versions(conn)
+    assert versions == SourceVersions(
+        server_version="8.0.mysql_aurora.3.07.1",
+        engine_version="8.0.42",
+        aurora_version="3.07.1",
+    )
+
+
+def test_postgres_dialect_probe_versions() -> None:
+    # PostgreSQL reads version() (verbose) / SHOW server_version / aurora_version()
+    # (Aurora only). The SHOW server_version packaging suffix ("16.10 (Homebrew)") is
+    # stripped to a clean "16.10". AURORA_VERSION is matched before VERSION() so
+    # aurora_version() is not mis-read as the verbose banner.
+    conn = _FakeVersionConnection(
+        [
+            ("AURORA_VERSION", "16.4"),
+            ("SERVER_VERSION", "16.10 (Homebrew)"),
+            (" VERSION()", "PostgreSQL 16.10 on aarch64-apple-darwin"),
+        ]
+    )
+    versions = dialect_for(SourceType.POSTGRES).probe_versions(conn)
+    assert versions == SourceVersions(
+        server_version="PostgreSQL 16.10 on aarch64-apple-darwin",
+        engine_version="16.10",  # packaging suffix "(Homebrew)" stripped
+        aurora_version="16.4",
+    )
+
+
+def test_probe_versions_are_best_effort_and_isolated() -> None:
+    # A community/RDS PostgreSQL source has no aurora_version() function (that probe
+    # raises); it must best-effort to None WITHOUT losing the versions that succeeded.
+    conn = _FakeVersionConnection(
+        [("SERVER_VERSION", "16.4"), (" VERSION()", "PostgreSQL 16.4")]
+    )
+    versions = dialect_for(SourceType.POSTGRES).probe_versions(conn)
+    assert versions.engine_version == "16.4"
+    assert versions.server_version == "PostgreSQL 16.4"
+    assert versions.aurora_version is None  # aurora_version() probe raised -> None
+
+
+def test_probe_versions_all_none_when_every_probe_fails() -> None:
+    # An engine/connection that answers nothing (every probe raises) yields all-None
+    # -- the connection test itself must still succeed (metadata is optional).
+    conn = _FakeVersionConnection([])
+    assert dialect_for(SourceType.MYSQL).probe_versions(conn) == SourceVersions()
 
 
 def test_mysql_dialect_quoting() -> None:

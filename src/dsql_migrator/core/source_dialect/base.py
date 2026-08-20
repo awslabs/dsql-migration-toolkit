@@ -10,9 +10,49 @@ engine's specifics stay in one place; this base carries only the shared interfac
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Optional
 
 from dsql_migrator.core.models import SourceType
+
+
+@dataclass(frozen=True)
+class SourceVersions:
+    """Best-effort version metadata probed read-only from a source connection.
+
+    Every field is optional: each version is probed independently and any failure
+    (a missing variable/function, an engine that has no Aurora version) leaves it
+    ``None`` without failing the connection test. Rendered on the overview diagram.
+
+    - ``server_version``: raw server version string in the engine's own format
+      (MySQL ``VERSION()`` e.g. ``8.0.mysql_aurora.3.04.0``; PostgreSQL ``version()``).
+    - ``engine_version``: the clean base-engine version (MySQL community patch from
+      ``@@innodb_version`` e.g. ``8.0.42``; PostgreSQL ``server_version`` e.g. ``16.4``).
+    - ``aurora_version``: the Aurora-managed engine version (Aurora MySQL from
+      ``@@aurora_version`` e.g. ``3.07.1``; Aurora PostgreSQL from ``aurora_version()``).
+      ``None`` for RDS/community/self-managed sources.
+    """
+
+    server_version: Optional[str] = None
+    engine_version: Optional[str] = None
+    aurora_version: Optional[str] = None
+
+
+def probe_scalar(connection: object, sql: str) -> Optional[str]:
+    """Run a scalar query read-only, returning its first column as ``str`` or ``None``.
+
+    Best effort: any failure (a variable/function the engine lacks, a driver error)
+    returns ``None`` so an optional version probe never fails the connection test.
+    Shared by every dialect's :meth:`SourceDialect.probe_versions` -- engine-neutral,
+    so it lives on the base rather than in a per-engine module.
+    """
+    from sqlalchemy import text
+
+    try:
+        row = connection.execute(text(sql)).first()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - optional metadata; never fail the caller
+        return None
+    return str(row[0]) if row and row[0] is not None else None
 
 
 class SourceDialect(ABC):
@@ -97,5 +137,15 @@ class SourceDialect(ABC):
         ValueConverter`.
         """
 
+    @abstractmethod
+    def probe_versions(self, connection: object) -> SourceVersions:
+        """Read source version metadata read-only for the overview diagram.
 
-__all__ = ["SourceDialect"]
+        Best effort: each version is probed independently (via :func:`probe_scalar`)
+        and any failure yields ``None`` -- it must never fail the connection test.
+        MySQL reads ``VERSION()`` / ``@@innodb_version`` / ``@@aurora_version``;
+        PostgreSQL reads ``version()`` / ``server_version`` / ``aurora_version()``.
+        """
+
+
+__all__ = ["SourceDialect", "SourceVersions", "probe_scalar"]

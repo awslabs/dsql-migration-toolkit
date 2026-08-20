@@ -899,7 +899,7 @@ def build_connect_page(
                 # for the overview diagram; None on failure.
                 state.set_source_version(
                     result.server_version,
-                    result.mysql_version,
+                    result.engine_version,
                     result.aurora_version,
                 )
                 # Best-effort RDS instance class (e.g. db.r6g.large) for the

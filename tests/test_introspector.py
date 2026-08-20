@@ -669,7 +669,7 @@ def test_test_connection_captures_server_version() -> None:
     result = introspector.test_connection(_source_config())
     assert result.success is True
     assert result.server_version == "8.0.mysql_aurora.3.04.0"
-    assert result.mysql_version == "8.0.42"  # community engine version
+    assert result.engine_version == "8.0.42"  # community engine version
     assert result.aurora_version == "3.04.0"  # from @@aurora_version
 
 
@@ -680,7 +680,7 @@ def test_test_connection_version_is_optional_when_unavailable() -> None:
     result = introspector.test_connection(_source_config())
     assert result.success is True
     assert result.server_version is None
-    assert result.mysql_version is None
+    assert result.engine_version is None
 
 
 # ---------------------------------------------------------------------------

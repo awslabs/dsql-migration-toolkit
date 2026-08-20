@@ -89,24 +89,26 @@ class ConnectionResult(BaseModel):
     server_version: Optional[str] = Field(
         default=None,
         description=(
-            "Source server version string read on a successful source test "
-            "(e.g. '8.0.mysql_aurora.3.04.0'); None for the target or on failure."
+            "Raw source server version string read on a successful source test, in "
+            "the engine's own format (MySQL VERSION(), e.g. '8.0.mysql_aurora.3.04.0'; "
+            "PostgreSQL version()). None for the target or on failure."
         ),
     )
-    mysql_version: Optional[str] = Field(
+    engine_version: Optional[str] = Field(
         default=None,
         description=(
-            "Community MySQL engine version (e.g. '8.0.42') read from "
-            "@@innodb_version; used to show the MySQL patch behind an Aurora "
-            "version. None when unavailable."
+            "Clean base-engine version read on a successful source test (MySQL "
+            "community patch from @@innodb_version, e.g. '8.0.42'; PostgreSQL "
+            "server_version, e.g. '16.4'). None when unavailable."
         ),
     )
     aurora_version: Optional[str] = Field(
         default=None,
         description=(
-            "Aurora MySQL engine version (e.g. '3.07.1') read from "
-            "@@aurora_version; present only for Aurora MySQL sources. None for "
-            "community/RDS MySQL, the target, or on failure."
+            "Aurora-managed engine version read on a successful source test (Aurora "
+            "MySQL from @@aurora_version, e.g. '3.07.1'; Aurora PostgreSQL from "
+            "aurora_version()). None for RDS/community sources, the target, or on "
+            "failure."
         ),
     )
 
