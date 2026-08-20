@@ -75,6 +75,7 @@ from dsql_migrator.core.models import (
     ConversionNoteKind,
     ForeignKeyDef,
     SourceInventory,
+    SourceType,
     TableDef,
     ViewDef,
 )
@@ -2756,7 +2757,15 @@ class SchemaConverter:
     foundation. Each table is parsed with ``sqlglot`` (mysql), its column types
     are rewritten per the DSQL type-mapping table, and the result is rendered as
     ``postgres`` DDL with double-quoted identifiers.
+
+    ``source_type`` selects the source engine. For MySQL (default) the flow above
+    applies. For PostgreSQL -- where both source and target are PostgreSQL, so it is
+    near-identity -- the table is rebuilt from its reflected PG types and parsed as
+    ``postgres`` (no MySQL->DSQL type remap), then the same DSQL-constraint phase runs.
     """
+
+    def __init__(self, *, source_type: SourceType = SourceType.MYSQL) -> None:
+        self._source_type = source_type
 
     def convert_table(
         self, table: TableDef, options: SchemaConvertOptions | None = None
@@ -2770,28 +2779,38 @@ class SchemaConverter:
         warnings are applied (Requirement 3.5).
         """
         options = options or SchemaConvertOptions()
-        # DSQL-unsupported source types (e.g. MySQL spatial) are substituted with
-        # bytea so the table still converts and the data is PRESERVED as raw bytes
-        # (never silently dropped/NULLed); a MANUAL warning is added per column.
-        table_for_ddl, bytea_fallback_columns = _substitute_unsupported_types(table)
-        source_ddl = _build_source_ddl(table_for_ddl)
-        # A single table whose reconstructed DDL cannot be parsed (e.g. a MySQL
-        # spatial type that sqlglot's MySQL dialect does not recognize and Aurora
-        # DSQL has no equivalent for) must NOT abort the whole Schema Conversion
-        # step. Isolate the failure: surface this one table as UNSUPPORTED with a
-        # clear reason and let the caller keep converting the rest.
-        try:
-            create = sqlglot.parse_one(source_ddl, read=_MYSQL)
-        except sqlglot.errors.SqlglotError as exc:
-            # SqlglotError covers BOTH ParseError and TokenError. Catching only
-            # ParseError meant a tokenizer failure -- e.g. an unbalanced quote in a
-            # reflected column default, or a MySQL charset introducer like
-            # ``_utf8mb4'x'`` -- escaped this guard and aborted the ENTIRE Schema
-            # Conversion step instead of isolating the one table.
-            return _unparsable_table_conversion(table, exc)
-
+        is_postgres = self._source_type is SourceType.POSTGRES
         source_types = {column.name: column.mysql_type for column in table.columns}
         warnings: list[ConversionWarning] = []
+        # Columns retyped to bytea for a DSQL-unsupported source type (MySQL spatial).
+        # Empty for a PostgreSQL source (no such substitution in v1).
+        bytea_fallback_columns: list[str] = []
+
+        # A single table whose reconstructed DDL cannot be parsed must NOT abort the
+        # whole Schema Conversion step. Isolate the failure: surface this one table as
+        # UNSUPPORTED with a clear reason and let the caller keep converting the rest.
+        # (SqlglotError covers BOTH ParseError and TokenError.)
+        if is_postgres:
+            # PostgreSQL source -> Aurora DSQL (both PostgreSQL): near-identity. Rebuild
+            # the CREATE from the reflected PG types and parse it as postgres -- there is
+            # no MySQL->DSQL type remap, no MySQL COLLATE to strip, and no spatial->bytea
+            # fallback (PG-unsupported-type substitution is a later refinement).
+            from dsql_migrator.core.converter_postgres import build_pg_source_ddl
+
+            try:
+                create = sqlglot.parse_one(build_pg_source_ddl(table), read=_POSTGRES)
+            except sqlglot.errors.SqlglotError as exc:
+                return _unparsable_table_conversion(table, exc)
+        else:
+            # DSQL-unsupported source types (e.g. MySQL spatial) are substituted with
+            # bytea so the table still converts and the data is PRESERVED as raw bytes
+            # (never silently dropped/NULLed); a MANUAL warning is added per column.
+            table_for_ddl, bytea_fallback_columns = _substitute_unsupported_types(table)
+            source_ddl = _build_source_ddl(table_for_ddl)
+            try:
+                create = sqlglot.parse_one(source_ddl, read=_MYSQL)
+            except sqlglot.errors.SqlglotError as exc:
+                return _unparsable_table_conversion(table, exc)
 
         # A source DEFAULT that could NOT be carried across must be reported. Aurora DSQL
         # supports column defaults, so most are preserved (see _column_default_sql) -- but
@@ -2800,7 +2819,7 @@ class SchemaConverter:
         # a NOT NULL column losing its default is a functional break (an application
         # INSERT that omits the column succeeds on MySQL and is REJECTED on the target),
         # whereas a nullable column merely starts defaulting to NULL.
-        for column in table.columns:
+        for column in (() if is_postgres else table.columns):
             if not column.default or column.generated:
                 continue
             if column.name == table.auto_increment_column:
@@ -2825,7 +2844,7 @@ class SchemaConverter:
                 )
             )
 
-        for column_def in create.find_all(exp.ColumnDef):
+        for column_def in (() if is_postgres else create.find_all(exp.ColumnDef)):
             # Drop any MySQL column COLLATE clause: DSQL/PostgreSQL does not have
             # MySQL collation names (e.g. utf8mb4_general_ci), and the reconstructed
             # type carries it as ``COLLATE '<name>'`` which is invalid PostgreSQL DDL
@@ -2923,15 +2942,17 @@ class SchemaConverter:
         warnings.extend(pk_strategy_warnings)
         for optional_warning in (
             _no_primary_key_warning(table),
-            _bytea_key_warning(table),
+            # MySQL-specific (read mysql_type / MySQL feature flags): skipped for a
+            # PostgreSQL source, whose type/feature warnings are a later refinement.
+            (_bytea_key_warning(table) if not is_postgres else None),
             _foreign_key_warning(table),
             _check_constraint_warning(table),
             _identifier_length_warning(table),
             _expression_index_warning(table),
             _comment_warning(table),
             _partitioned_table_warning(table),
-            _unsupported_index_type_warning(table),
-            _prefix_index_warning(table),
+            (_unsupported_index_type_warning(table) if not is_postgres else None),
+            (_prefix_index_warning(table) if not is_postgres else None),
             _too_many_columns_warning(table),
             _too_many_indexes_warning(table, len(extra_index_ddls)),
             _too_many_key_columns_warning(table),
@@ -2939,10 +2960,10 @@ class SchemaConverter:
             # PK strategy has rewritten the key (a UUID/identity conversion changes
             # the key's byte estimate, and COMPOSITE_KEY changes its columns).
             _key_size_warning(table, create),
-            _oversized_lob_warning(table),
-            _generated_column_warning(table),
-            _collation_warning(table),
-            _on_update_timestamp_warning(table),
+            (_oversized_lob_warning(table) if not is_postgres else None),
+            (_generated_column_warning(table) if not is_postgres else None),
+            (_collation_warning(table) if not is_postgres else None),
+            (_on_update_timestamp_warning(table) if not is_postgres else None),
         ):
             if optional_warning is not None:
                 warnings.append(optional_warning)
