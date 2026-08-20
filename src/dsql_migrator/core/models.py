@@ -29,16 +29,34 @@ from dsql_migrator.config import SecretRef
 # ---------------------------------------------------------------------------
 
 
+class SourceType(str, Enum):
+    """Which source database engine a migration reads from (always read-only).
+
+    ``MYSQL`` (RDS/Aurora MySQL) is the original and default engine; ``POSTGRES``
+    (RDS/Aurora PostgreSQL) is the second source type. The value selects the
+    source-reading dialect -- driver, identifier quoting, system schemas, snapshot
+    SQL, type handling -- via ``core.source_dialect.dialect_for``.
+    """
+
+    MYSQL = "mysql"
+    POSTGRES = "postgres"
+
+
 class SourceConnectionConfig(BaseModel):
-    """Connection settings for the source MySQL (RDS/Aurora) database.
+    """Connection settings for the source database (RDS/Aurora MySQL or PostgreSQL).
 
     Credentials are not stored here: ``secret`` references where to resolve them
     (e.g., a Secrets Manager ARN), and ``username`` is non-secret. This keeps the
-    model safe to serialize and log.
+    model safe to serialize and log. ``source_type`` selects the source engine
+    (default MySQL) and drives the source-reading dialect.
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    source_type: SourceType = Field(
+        default=SourceType.MYSQL,
+        description="Source database engine; selects the source-reading dialect.",
+    )
     host: str = Field(min_length=1, description="Source database host.")
     port: int = Field(default=3306, ge=1, le=65535, description="Source port.")
     database: Optional[str] = Field(
