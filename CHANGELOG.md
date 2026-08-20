@@ -5,6 +5,33 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.380
+
+### Changed
+
+- **The AI DBA panel is now drag-resizable, and its default width is narrower.** You can
+  drag the panel's left edge to set any width; a persistent grip on that edge (which
+  highlights on hover) marks it as draggable, with an `ew-resize` cursor. The width you
+  choose is remembered and a later browser resize no longer overrides it. The auto
+  (default) width dropped from 40% to 30% of the viewport so it pushes the Tool UI less on
+  first open, still clamped to a 360–660 px readable range; a dragged width is clamped only
+  to the window (keeping at least 200 px for the Tool UI). UI-only.
+
+- **Redesigned the migration overview diagram as three independent, explicitly-labeled
+  cards** (Source → Migration Tool → Target) with neutral-grey borders and header bands,
+  joined by grey dashed connectors, replacing the single unified panel. The source/target
+  cards show the engine identity, the endpoint as a copy-to-clipboard "code label", and
+  inline detail rows ordered Endpoint → Instance type → Region; the blue-accented Migration
+  Tool card has a cog tile, a "Convert · Load · Validate" header tagline, and the current
+  stage. The journey stepper below the diagram is slimmed. Adds a reusable
+  `render_status_pill` (Cloudscape StatusIndicator) to the design system as the single
+  source of truth for the tinted status badge. UI-only — the diagram's data derivation
+  (`build_migration_diagram`) is unchanged.
+
+- **Removed the duplicate per-step status badge** on the Evaluation and Schema Conversion
+  screens (the shared step header already shows it); the Data Migration status stays, since
+  it is phase-aware (Full Load / CDC). Minor Data Migration option-card copy clarification.
+
 ## v0.1.378
 
 ### Security

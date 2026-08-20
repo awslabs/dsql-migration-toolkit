@@ -73,7 +73,7 @@ from dsql_migrator.ui.design import (
     section_header,
 )
 from dsql_migrator.ui.session import SessionStore
-from dsql_migrator.ui.workflow import WorkflowStep, get_status, status_label, with_status
+from dsql_migrator.ui.workflow import WorkflowStep, get_status, with_status
 
 
 # ---------------------------------------------------------------------------
@@ -956,14 +956,6 @@ class EvaluationStore:
 # NiceGUI screen
 # ---------------------------------------------------------------------------
 
-# Quasar color names reused for the inline status badge.
-_STATUS_COLORS: dict[StepStatus, str] = {
-    StepStatus.NOT_STARTED: "grey",
-    StepStatus.IN_PROGRESS: "primary",
-    StepStatus.DONE: "positive",
-    StepStatus.FAILED: "negative",
-}
-
 # How often the screen polls the background job (seconds).
 _POLL_INTERVAL_SECONDS = 0.5
 
@@ -1134,10 +1126,6 @@ def build_evaluation_screen(
             # "Ready to evaluate" empty-state card below explains it before the first
             # run, and after a run the assessment report itself is on screen -- a
             # persistent paragraph restating all that was redundant.)
-            with ui.row().classes("items-center gap-2"):
-                ui.label("Evaluation status:").classes("text-sm text-gray-500")
-                ui.badge(status_label(status)).props(f"color={_STATUS_COLORS[status]}")
-
             if interrupted:
                 render_notice(
                     ui,

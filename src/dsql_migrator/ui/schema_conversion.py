@@ -109,7 +109,6 @@ from dsql_migrator.ui.session import SessionStore
 from dsql_migrator.ui.workflow import (
     WorkflowStep,
     get_status,
-    status_label,
     with_status,
 )
 
@@ -1021,14 +1020,6 @@ class SchemaConversionStore:
 # NiceGUI screen
 # ---------------------------------------------------------------------------
 
-# Quasar color names reused for the inline status badge.
-_STATUS_COLORS: dict[StepStatus, str] = {
-    StepStatus.NOT_STARTED: "grey",
-    StepStatus.IN_PROGRESS: "primary",
-    StepStatus.DONE: "positive",
-    StepStatus.FAILED: "negative",
-}
-
 # Quasar color names for each per-object apply status badge.
 _APPLY_STATUS_COLORS: dict[ObjectApplyStatus, str] = {
     ObjectApplyStatus.CREATED: "positive",
@@ -1745,10 +1736,6 @@ def build_schema_conversion_screen(
                 "the converted target DDL, choose how to handle existing target "
                 "objects, then apply the conversion."
             ).classes("text-sm text-gray-500")
-
-            with ui.row().classes("items-center gap-2"):
-                ui.label("Schema Conversion status:").classes("text-sm text-gray-500")
-                ui.badge(status_label(status)).props(f"color={_STATUS_COLORS[status]}")
 
             if inventory is None:
                 render_notice(

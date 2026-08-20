@@ -130,6 +130,8 @@ class _Ui:
         self.labels: list[_El] = []
         self.badges: list[_El] = []
         self.slot_stack: list = []  # active container slots (for timer ownership)
+        self.event_handlers: dict = {}  # ui.on(name, cb) -> {name: cb}
+        self.drawer_el: Optional[_El] = None  # the right_drawer element
 
     def add_css(self, *_a, **_k) -> None:
         pass
@@ -137,8 +139,11 @@ class _Ui:
     def add_body_html(self, *_a, **_k) -> None:
         pass
 
-    def on(self, *_a, **_k) -> None:  # responsive-drawer-width resize handler
-        pass
+    def on(self, name=None, handler=None, *_a, **_k) -> None:  # noqa: ANN001
+        # ui.on(event_name, handler, *, throttle=...) -- record so tests can invoke
+        # the drawer-width / drag-resize handlers directly.
+        if name is not None:
+            self.event_handlers[name] = handler
 
     def notify(self, *_a, **_k) -> None:
         pass
@@ -148,7 +153,9 @@ class _Ui:
 
     def right_drawer(self, *_a, value: bool = False, **_k) -> _El:  # noqa: ANN001
         self.drawer_visible = bool(value)
-        return self._el("right_drawer")
+        el = self._el("right_drawer")
+        self.drawer_el = el
+        return el
 
     def column(self, *_a, **_k) -> _El:
         return self._el("column")
@@ -265,6 +272,69 @@ def test_visibility_persists_to_session() -> None:
     assert state.ai_conversation.visible is True and ui.drawer_visible is True
     panel.toggle()
     assert state.ai_conversation.visible is False and ui.drawer_visible is False
+
+
+class _Evt:
+    """A minimal event double: the drawer-width handlers read ``event.args``."""
+
+    def __init__(self, args: object) -> None:
+        self.args = args
+
+
+def _drawer_width(ui: _Ui) -> int:
+    """Parse the ``width=<px>`` currently on the drawer element's props."""
+    props = ui.drawer_el.props_str  # type: ignore[union-attr]
+    for tok in props.split():
+        if tok.startswith("width="):
+            return int(tok.split("=", 1)[1])
+    raise AssertionError(f"no width in drawer props: {props!r}")
+
+
+def test_auto_width_is_30pct_of_viewport_clamped() -> None:
+    state = _enabled_state()
+    ui = _Ui()
+    build_ai_panel(ui, state=state)
+    fn = ui.event_handlers["ai_dba_drawer_width"]
+    # Mid-size window: 30% of 1500 = 450, inside [360, 660].
+    fn(_Evt(1500))
+    assert _drawer_width(ui) == 450
+    # Huge window: capped at the readable max (660), not 30% (=900).
+    fn(_Evt(3000))
+    assert _drawer_width(ui) == 660
+    # Narrow window: floored at the readability minimum (360), not 30% (=240).
+    fn(_Evt(800))
+    assert _drawer_width(ui) == 360
+
+
+def test_drag_resize_sets_and_remembers_manual_width() -> None:
+    state = _enabled_state()
+    ui = _Ui()
+    build_ai_panel(ui, state=state)
+    viewport = ui.event_handlers["ai_dba_drawer_width"]
+    drag = ui.event_handlers["ai_dba_drawer_resize"]
+    viewport(_Evt(1600))  # AUTO -> 480
+    assert _drawer_width(ui) == 480
+    # User drags the edge to 700 px (wider than the AUTO cap of 660 -- allowed).
+    drag(_Evt(700))
+    assert _drawer_width(ui) == 700
+    # A later window resize must NOT clobber the width the user chose.
+    viewport(_Evt(1400))
+    assert _drawer_width(ui) == 700
+
+
+def test_drag_resize_clamps_to_window_and_floor() -> None:
+    state = _enabled_state()
+    ui = _Ui()
+    build_ai_panel(ui, state=state)
+    viewport = ui.event_handlers["ai_dba_drawer_width"]
+    drag = ui.event_handlers["ai_dba_drawer_resize"]
+    viewport(_Evt(1000))
+    # Dragged too wide: clamped so the Tool UI keeps its 200 px gap (1000 - 200).
+    drag(_Evt(5000))
+    assert _drawer_width(ui) == 800
+    # Dragged too narrow: floored at the 360 px readability minimum.
+    drag(_Evt(50))
+    assert _drawer_width(ui) == 360
 
 
 def test_open_scope_seeds_and_persists_the_conversation() -> None:

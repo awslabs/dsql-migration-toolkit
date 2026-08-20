@@ -231,6 +231,36 @@ def test_render_status_dot_unknown_tone_falls_back() -> None:
     assert dot_bg in blob
 
 
+def test_status_pill_tones_cover_badge_tones() -> None:
+    from dsql_migrator.ui.design import STATUS_PILL_TONES
+
+    assert set(STATUS_PILL_TONES) >= {"ok", "bad", "active", "neutral", "reconnect"}
+
+
+def test_render_status_pill_emits_dot_text_and_tinted_container() -> None:
+    from dsql_migrator.ui.design import STATUS_PILL_TONES, render_status_pill
+
+    ui = _RecordingUi()
+    render_status_pill(ui, "Connected", tone="ok")
+    assert "Connected" in ui.texts
+    blob = " ".join(ui.classes)
+    dot_bg, text_color, pill_bg = STATUS_PILL_TONES["ok"]
+    assert dot_bg in blob  # the leading status dot
+    assert text_color in blob  # the label color
+    assert pill_bg in blob  # the tinted pill container
+    assert "rounded-full" in blob  # rendered as a pill, not loose text
+
+
+def test_render_status_pill_unknown_tone_falls_back() -> None:
+    from dsql_migrator.ui.design import STATUS_PILL_TONES, render_status_pill
+
+    ui = _RecordingUi()
+    render_status_pill(ui, "Unknown", tone="does-not-exist")
+    blob = " ".join(ui.classes)
+    _dot_bg, _text_color, pill_bg = STATUS_PILL_TONES["neutral"]
+    assert pill_bg in blob
+
+
 # ---------------------------------------------------------------------------
 # render_notice
 # ---------------------------------------------------------------------------

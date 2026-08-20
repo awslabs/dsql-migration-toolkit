@@ -61,12 +61,19 @@ from dsql_migrator.ui.design import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Width of the persistent side panel. Set wide (≈50% wider than the original 440px)
-# so an AI conversation -- prose, tables, and multi-line code blocks -- reads
-# comfortably without wrapping every few words; this is the width the old modal chat
-# used too. It does push the main content further left, but readability of the
-# assistant's answers won the trade-off (an explicit product choice).
-_PANEL_WIDTH_PX = 660
+# Width of the persistent side panel.
+#   * AUTO width = viewport × _PANEL_DEFAULT_FRAC, clamped to [_PANEL_MIN_PX,
+#     _PANEL_MAX_PX]. Wide enough that an AI conversation -- prose, tables, and
+#     multi-line code blocks -- reads comfortably without wrapping every few words,
+#     but it does push the main content left, so it's a fraction of the viewport.
+#   * The user can override AUTO by DRAGGING the drawer's left edge (see the
+#     ``.ai-dba-resizer`` handle). A dragged width is remembered and only re-clamped
+#     to the window (leaving at least _PANEL_EDGE_GAP_PX for the Tool UI), so a later
+#     window resize never clobbers the width they chose.
+_PANEL_MIN_PX = 360  # never crush below this (readability floor)
+_PANEL_MAX_PX = 660  # AUTO cap: don't get absurdly wide on a big monitor
+_PANEL_DEFAULT_FRAC = 0.3  # AUTO width as a fraction of the viewport
+_PANEL_EDGE_GAP_PX = 200  # min space kept for the Tool UI when dragged wide
 
 # Activity-event styling lives in the design system (ACTIVITY_EVENT_STYLE /
 # render_activity_event) so the feed shares the app's one Cloudscape palette; the
@@ -129,6 +136,18 @@ def _panel_css(ui: object) -> None:
         "color: #1e293b; border-radius: 6px; padding: 1px 4px; }"
         ".dsql-chat-md pre { background: #f8fafc; border: 1px solid #e2e8f0; "
         "color: #1e293b; border-radius: 8px; padding: 8px 10px; margin: 4px 0; }"
+        # Drag-to-resize handle on the drawer's left edge. A persistent centered grip
+        # bar makes the edge discoverable as draggable even before hover; on hover the
+        # handle tints and the grip grows + turns the AI accent color (indigo), with an
+        # ew-resize cursor throughout.
+        ".ai-dba-resizer { position: absolute; left: 0; top: 0; height: 100%; "
+        "width: 8px; cursor: ew-resize; z-index: 10; background: transparent; "
+        "display: flex; align-items: center; justify-content: center; }"
+        ".ai-dba-resizer::before { content: ''; width: 3px; height: 34px; "
+        "border-radius: 9999px; background: #cbd5e1; "
+        "transition: background 0.15s ease, height 0.15s ease; }"
+        ".ai-dba-resizer:hover { background: rgba(99,102,241,0.08); }"
+        ".ai-dba-resizer:hover::before { background: #6366f1; height: 48px; }"
     )
 
 
@@ -189,32 +208,84 @@ def build_ai_panel(
     _panel_css(ui)
     drawer = ui.right_drawer(  # type: ignore[attr-defined]
         value=bool(conversation.visible), bordered=True, elevated=False
-    ).classes("bg-gray-50 q-pa-none").props(f"width={_PANEL_WIDTH_PX} :breakpoint=0")
+    ).classes("bg-gray-50 q-pa-none").props(f"width={_PANEL_MAX_PX} :breakpoint=0")
 
-    # Responsive width. Quasar's `width` prop is px-only AND it also drives the content
-    # push, so a CSS-only vw override would desync the drawer width from the push. Instead
-    # keep the prop but recompute it (clamped) from the viewport on load + resize -- a
-    # fixed 660 crushes the Tool UI on a narrow browser. The client emits its innerWidth;
-    # the server updates the prop so Quasar re-sizes the drawer AND the push together.
-    def _resize_drawer(event: object) -> None:
+    # Drawer width is driven by Quasar's `width` prop (px-only), which ALSO drives the
+    # content push -- so a CSS-only override would desync the drawer from the push.
+    # Both the responsive AUTO width and the user's drag therefore go through the prop:
+    # the client emits a number, the server clamps it and updates the prop, and Quasar
+    # re-sizes the drawer AND the push together.
+    #   * ``viewport`` -- last innerWidth the client reported (drives AUTO width).
+    #   * ``manual``   -- a width the user dragged to (0 = still AUTO). Once set, it
+    #                     wins over AUTO so a window resize won't clobber their choice.
+    _width_state: dict[str, float] = {"viewport": 0.0, "manual": 0.0}
+
+    def _apply_width() -> None:
+        vp = _width_state["viewport"]
+        manual = _width_state["manual"]
+        if manual > 0:
+            # Honor the dragged width, clamped only to the window so it can't cover the
+            # whole app (keep at least _PANEL_EDGE_GAP_PX for the Tool UI).
+            hi = (vp - _PANEL_EDGE_GAP_PX) if vp > 0 else manual
+            target = manual
+        else:
+            # AUTO: a fraction of the viewport, capped at the readable default max.
+            hi = _PANEL_MAX_PX
+            target = (vp * _PANEL_DEFAULT_FRAC) if vp > 0 else _PANEL_MAX_PX
+        hi = max(hi, _PANEL_MIN_PX)
+        width = int(max(_PANEL_MIN_PX, min(hi, round(target))))
+        drawer.props(f"width={width}")  # type: ignore[attr-defined]
+
+    def _on_viewport(event: object) -> None:
         try:
             inner = float(getattr(event, "args", 0) or 0)
         except (TypeError, ValueError):
             return
         if inner > 0:
-            drawer.props(  # type: ignore[attr-defined]
-                f"width={max(360, min(_PANEL_WIDTH_PX, round(inner * 0.4)))}"
-            )
+            _width_state["viewport"] = inner
+            _apply_width()
 
-    ui.on("ai_dba_drawer_width", _resize_drawer, throttle=0.2)  # type: ignore[attr-defined]
+    def _on_drag_resize(event: object) -> None:
+        try:
+            px = float(getattr(event, "args", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if px > 0:
+            _width_state["manual"] = px
+            _apply_width()
+
+    ui.on("ai_dba_drawer_width", _on_viewport, throttle=0.2)  # type: ignore[attr-defined]
+    ui.on("ai_dba_drawer_resize", _on_drag_resize, throttle=0.05)  # type: ignore[attr-defined]
     ui.add_body_html(  # type: ignore[attr-defined]
-        "<script>(function(){var f=function(){"
-        "if(window.emitEvent){emitEvent('ai_dba_drawer_width', window.innerWidth);}};"
-        "window.addEventListener('resize', f);"
-        "window.addEventListener('load', f);setTimeout(f, 300);})();</script>"
+        "<script>(function(){"
+        # Report the viewport width (drives the AUTO drawer width) on load + resize.
+        "var vp=function(){if(window.emitEvent){"
+        "emitEvent('ai_dba_drawer_width', window.innerWidth);}};"
+        "window.addEventListener('resize', vp);"
+        "window.addEventListener('load', vp);setTimeout(vp, 300);"
+        # Drag the drawer's left edge (.ai-dba-resizer) to resize it. Track the drag on
+        # `document` (not the 6px strip) so a fast pointer that leaves the strip keeps
+        # dragging; throttle emits to ~25fps client-side (+ a final emit on release).
+        "var dragging=false,last=0;"
+        "var send=function(x){if(window.emitEvent){"
+        "emitEvent('ai_dba_drawer_resize', x);}};"
+        "document.addEventListener('mousedown', function(e){"
+        "if(!(e.target.closest&&e.target.closest('.ai-dba-resizer')))return;"
+        "dragging=true;document.body.style.userSelect='none';"
+        "document.body.style.cursor='ew-resize';e.preventDefault();});"
+        "document.addEventListener('mousemove', function(e){"
+        "if(!dragging)return;var now=Date.now();"
+        "if(now-last>=40){last=now;send(window.innerWidth-e.clientX);}});"
+        "document.addEventListener('mouseup', function(e){"
+        "if(!dragging)return;dragging=false;send(window.innerWidth-e.clientX);"
+        "document.body.style.userSelect='';document.body.style.cursor='';});"
+        "})();</script>"
     )
 
     with drawer:  # type: ignore[attr-defined]
+        # Drag handle pinned to the drawer's left edge (styled in _panel_css). Absolute
+        # inside the fixed .q-drawer, so it hugs the left border full-height.
+        ui.element("div").classes("ai-dba-resizer")  # type: ignore[attr-defined]
         with ui.column().classes("full-height column no-wrap w-full"):  # type: ignore[attr-defined]
             with ui.row().classes(  # type: ignore[attr-defined]
                 "items-center gap-2 no-wrap w-full q-px-md q-py-sm bg-white "

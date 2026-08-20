@@ -319,6 +319,39 @@ def render_status_dot(ui, text: str, *, tone: str = "neutral") -> None:
         ui.label(text).classes(f"text-[11px] leading-tight {text_color}")
 
 
+# tone -> (dot bg, text color, pill bg). Same tone family as STATUS_DOT_TONES but
+# with a subtle tinted CONTAINER, so the dot+text reads as a self-contained status
+# pill (the "• Connected" chip AWS pins to a Container header) rather than loose
+# colored text. ``neutral`` uses a slightly stronger gray fill so an inactive pill
+# still reads as a chip on a white card.
+STATUS_PILL_TONES: dict[str, Tuple[str, str, str]] = {
+    "ok": ("bg-green-500", "text-green-700", "bg-green-50"),
+    "bad": ("bg-red-500", "text-red-600", "bg-red-50"),
+    "active": ("bg-blue-500", "text-blue-700", "bg-blue-50"),
+    "neutral": ("bg-gray-400", "text-gray-500", "bg-gray-100"),
+    "reconnect": ("bg-amber-500", "text-amber-700", "bg-amber-50"),
+}
+
+
+def render_status_pill(ui, text: str, *, tone: str = "neutral") -> None:
+    """Render a Cloudscape "StatusIndicator" as a self-contained tinted pill.
+
+    A rounded, tone-tinted chip with a leading colored dot and matching text -- the
+    "• Connected" / "• Provisioned" badge AWS pins to the right of a Container header.
+    Heavier than :func:`render_status_dot` (which is bare dot + text for tight inline
+    use), lighter than a full :func:`render_notice`. ``tone`` selects from
+    :data:`STATUS_PILL_TONES`; unknown tones fall back to ``neutral``.
+    """
+    dot_bg, text_color, pill_bg = STATUS_PILL_TONES.get(
+        tone, STATUS_PILL_TONES["neutral"]
+    )
+    with ui.row().classes(
+        f"items-center gap-1.5 no-wrap rounded-full px-2 py-0.5 {pill_bg}"
+    ):
+        ui.element("div").classes(f"h-2 w-2 rounded-full shrink-0 {dot_bg}")
+        ui.label(text).classes(f"text-xs font-medium {text_color}")
+
+
 # ---------------------------------------------------------------------------
 # Selectable object chips, colored by group (e.g. schema)
 # ---------------------------------------------------------------------------
@@ -716,6 +749,8 @@ __all__ = [
     "badge_classes",
     "STATUS_DOT_TONES",
     "render_status_dot",
+    "STATUS_PILL_TONES",
+    "render_status_pill",
     "CHIP_GROUP_PALETTE",
     "CHIP_GROUP_QUASAR_COLOR",
     "chip_group_index",

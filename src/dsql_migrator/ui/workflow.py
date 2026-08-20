@@ -32,10 +32,10 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 from dsql_migrator.core.models import MigrationContext, StepStatus, WorkflowState
 from dsql_migrator.ui.ai_panel import AiPanelHandle, build_ai_panel
 from dsql_migrator.ui.design import (
-    STATUS_DOT_TONES,
+    CODE_TEXT_CLASSES,
     inline_hint,
     render_notice,
-    render_status_dot,
+    render_status_pill,
 )
 
 # The Start-over confirmation dialog + CDC-teardown banner UI were extracted to
@@ -736,121 +736,302 @@ def build_migration_diagram(
     return source, tool, target
 
 
-def _render_diagram_segment(
-    ui: object,
-    node: DiagramNode,
-    *,
-    role_pill: "Optional[tuple[str, str]]" = None,
-) -> None:
-    """Render one segment of the unified migration overview panel.
+# The engine version detail is authored by build_migration_diagram as a single
+# label-less entry (its icon marks it), unlike the "Label: value" detail lines.
+_ENGINE_DETAIL_ICON = "developer_board"
+# Detail labels whose value is a copy-worthy connection identifier -- rendered as a
+# monospace "code label" with a copy button rather than a plain text row.
+_COPYABLE_DETAIL_LABELS = frozenset({"Endpoint"})
+# Detail labels suppressed from the diagram: the DSQL cluster id is just the endpoint's
+# leading label, so surfacing both is redundant -- the endpoint alone carries it.
+_HIDDEN_DETAIL_LABELS = frozenset({"Cluster id"})
+# Fixed display order for the endpoint-card detail rows, independent of the order
+# build_migration_diagram happens to emit them in: the copy-worthy endpoint first, then
+# the instance type, then the (optional) scoping database, then the region last. Labels
+# not listed here sort to the end (stable, keeping their emitted order).
+_DETAIL_ORDER = ("Endpoint", "Instance type", "Database", "Region")
 
-    ``role_pill`` is an optional ``(label, tailwind_classes)`` tuple that renders
-    a small pill badge at the top of the segment — used only on the tool node to
-    convey its "CONVERT · LOAD" function. Source/target are self-explanatory from
-    their titles and need no role pill.
+
+def _render_copyable_value(ui: object, *, label: str, value: str) -> None:
+    """Render an endpoint/identifier as an AWS-console "code label" with a copy button.
+
+    A small uppercase caption over a bordered, single-line monospace box holding the
+    ``value`` and a trailing copy button (``ui.clipboard.write`` + a positive toast,
+    with a graceful fallback when the browser clipboard is unavailable, e.g. non-HTTPS
+    or a denied permission). The value truncates on one line -- its full string is a
+    click away via Copy and repeated in the hover tooltip -- so a long endpoint stays
+    clean instead of wrapping. Mirrors the copy pattern used for DDL blocks.
     """
-    segment_bg = " bg-amber-50/60" if node.reconnect else ""
-    with ui.column().classes(  # type: ignore[attr-defined]
-        "items-center gap-1 py-5 px-5 min-w-0 flex-1" + segment_bg
+
+    def _copy() -> None:
+        try:
+            ui.clipboard.write(value)  # type: ignore[attr-defined]
+            ui.notify(  # type: ignore[attr-defined]
+                f"{label} copied.", type="positive", position="top"
+            )
+        except Exception:  # noqa: BLE001 - clipboard may be unavailable (non-HTTPS/denied)
+            ui.notify(  # type: ignore[attr-defined]
+                f"Select and copy the {label.lower()} from the field.",
+                type="info",
+                position="top",
+            )
+
+    with ui.column().classes("gap-1 w-full min-w-0"):  # type: ignore[attr-defined]
+        ui.label(label).classes(  # type: ignore[attr-defined]
+            "text-[9px] text-gray-400 uppercase tracking-wide"
+        )
+        with ui.row().classes(  # type: ignore[attr-defined]
+            "items-center gap-1 no-wrap w-full rounded-md border border-slate-200 "
+            "bg-slate-50 pl-2 pr-0.5 py-0.5 min-w-0"
+        ):
+            # Smaller than the shared code-surface size (text-xs -> 10px) so a long
+            # endpoint reads compactly in the chip; the shared token is untouched.
+            ui.label(value).classes(  # type: ignore[attr-defined]
+                f"{CODE_TEXT_CLASSES.replace('text-xs', 'text-[10px]')} "
+                "truncate flex-1 min-w-0"
+            ).tooltip(value)  # type: ignore[attr-defined]
+            ui.button(on_click=_copy).props(  # type: ignore[attr-defined]
+                "flat dense round size=sm icon=content_copy color=grey-6"
+            ).tooltip(f"Copy {label.lower()}")  # type: ignore[attr-defined]
+
+
+def _render_card_header(
+    ui: object,
+    *,
+    role: str,
+    header_icon: str,
+    subtitle: str = "",
+    badge: "Optional[tuple[str, str]]" = None,
+    accent: bool = False,
+) -> None:
+    """Render a diagram card's header band: a small glyph + the box's ROLE + a badge.
+
+    ``role`` is the box's function ("Source" / "Migration Tool" / "Target"), shown bold
+    -- the explicit labeling the overview calls for. An optional ``subtitle`` renders as
+    a small caption beneath the role (the tool uses it for its "Convert · Load ·
+    Validate" tagline). ``accent`` tints the band blue for the active Migration Tool
+    card; the source/target bands stay neutral grey (any reconnect / not-connected state
+    is carried by the status pill). ``badge`` is an optional ``(text, tone)`` pill pushed
+    to the right.
+    """
+    band, icon_color = (
+        ("bg-blue-50 border-blue-200", "primary")
+        if accent
+        else ("bg-gray-100 border-gray-200", "grey-7")
+    )
+    with ui.row().classes(  # type: ignore[attr-defined]
+        f"items-center gap-2 no-wrap w-full px-4 py-2 border-b {band}"
     ):
-        # Role pill — only on the tool node.
-        if role_pill is not None:
-            pill_text, pill_classes = role_pill
-            ui.label(pill_text).classes(  # type: ignore[attr-defined]
-                "text-[9px] font-bold tracking-widest uppercase "
-                f"px-2 py-0.5 rounded-full border {pill_classes} mb-1"
-            )
-        # Service glyph (SVG) or Material icon — scaled up for visual weight.
-        if node.svg:
-            svg_opacity = (
-                "" if node.connected else (" opacity-60" if node.reconnect else " opacity-25")
-            )
-            ui.html(node.svg).classes("h-10 w-10" + svg_opacity)  # type: ignore[attr-defined]
-        else:
-            color = "primary" if node.connected else ("amber-7" if node.reconnect else "grey-5")
-            ui.icon(node.icon, color=color).classes("text-3xl")  # type: ignore[attr-defined]
-        # Title — text-sm for clear hierarchy.
-        ui.label(node.title).classes(  # type: ignore[attr-defined]
-            "text-sm font-semibold text-gray-900 text-center mt-2"
+        ui.icon(header_icon, color=icon_color).classes("text-lg shrink-0")  # type: ignore[attr-defined]
+        ui.label(role).classes(  # type: ignore[attr-defined]
+            "text-sm font-bold text-gray-800 shrink-0"
         )
-        # Subtitle.
-        ui.label(node.subtitle).classes(  # type: ignore[attr-defined]
-            "text-xs text-gray-400 text-center break-all leading-tight"
+        if subtitle:
+            # Beside the role, not beneath it -- a quiet caption on the same header line.
+            ui.label(subtitle).classes(  # type: ignore[attr-defined]
+                "text-[11px] text-gray-500 truncate min-w-0"
+            ).tooltip(subtitle)  # type: ignore[attr-defined]
+        ui.space()  # type: ignore[attr-defined]
+        if badge is not None:
+            text, tone = badge
+            render_status_pill(ui, text, tone=tone)
+
+
+def _engine_version_subline(node: DiagramNode) -> str:
+    """The small line under the engine name: its version, else a placeholder, else "".
+
+    Prefers the engine-version detail (authored label-less, marked by
+    ``_ENGINE_DETAIL_ICON``) so a Source reads "Aurora MySQL" over "Version 3.04.1
+    (MySQL 8.0)"; the redundant engine-name prefix is stripped (the title already
+    carries it). With no version captured, shows the pre-connection descriptor
+    (``subtitle``, e.g. "RDS / Aurora MySQL" / "PostgreSQL-compatible") ONLY while
+    there are no real details yet -- once connected, ``subtitle`` is the
+    cluster/instance NAME, which is redundant with the endpoint / cluster-id fields
+    below, so the subline is dropped (returns "").
+    """
+    for icon_name, line in node.details:
+        if icon_name == _ENGINE_DETAIL_ICON and ": " not in line:
+            rest = line[len(node.title):].strip() if line.startswith(node.title) else line
+            return f"Version {rest}" if rest and rest != line else line
+    return node.subtitle if not node.details else ""
+
+
+def _render_endpoint_card(
+    ui: object, node: DiagramNode, *, role: str, header_icon: str
+) -> None:
+    """Render a Source/Target box: header band (role + status pill) over the engine
+    identity and its copy-worthy endpoint/cluster fields.
+
+    The engine name (``node.title``) and its version/name line headline the body; the
+    endpoint and cluster-id details render as monospace "code label" fields
+    (:func:`_render_copyable_value`), other details as plain label/value rows. A
+    restored-but-unverified endpoint is cued by its amber header band + "Reconnect to
+    resume" pill (the card border itself stays neutral gray); a not-yet-connected glyph
+    is dimmed.
+    """
+    with ui.card().classes(  # type: ignore[attr-defined]
+        "flex-1 min-w-0 self-stretch !shadow-none rounded-xl overflow-hidden p-0 "
+        "border border-gray-200"
+    ):
+        _render_card_header(
+            ui,
+            role=role,
+            header_icon=header_icon,
+            badge=node.badges[0] if node.badges else None,
         )
-        # Region.
-        if node.region:
-            with ui.row().classes("items-center gap-1 no-wrap mt-0.5"):  # type: ignore[attr-defined]
-                ui.icon("public", color="grey-4").classes("text-[10px]")  # type: ignore[attr-defined]
-                ui.label(node.region).classes(  # type: ignore[attr-defined]
-                    "text-[10px] text-gray-400"
-                )
-        # Status indicators — larger dot and heavier text for legibility.
-        if node.badges:
-            with ui.column().classes("items-center gap-1 mt-2"):  # type: ignore[attr-defined]
-                for text, tone in node.badges:
-                    dot_bg, text_color = STATUS_DOT_TONES.get(
-                        tone, STATUS_DOT_TONES["neutral"]
-                    )
-                    with ui.row().classes("items-center gap-1.5 no-wrap"):  # type: ignore[attr-defined]
-                        ui.element("div").classes(  # type: ignore[attr-defined]
-                            f"h-2.5 w-2.5 rounded-full shrink-0 {dot_bg}"
-                        )
-                        ui.label(text).classes(  # type: ignore[attr-defined]
-                            f"text-xs font-medium {text_color}"
-                        )
-        # Detail key-value pairs.
-        if node.details:
-            with ui.column().classes(  # type: ignore[attr-defined]
-                "gap-1 mt-3 w-full pt-2 border-t border-gray-100"
+        with ui.column().classes("gap-2 px-4 py-3 w-full min-w-0"):  # type: ignore[attr-defined]
+            # Engine identity: service glyph + name + version/name subline.
+            with ui.row().classes(  # type: ignore[attr-defined]
+                "items-center gap-3 no-wrap w-full min-w-0"
             ):
-                for _icon_name, line in node.details:
-                    if ": " in line:
-                        label, _, value = line.partition(": ")
-                        with ui.column().classes("gap-0 w-full"):  # type: ignore[attr-defined]
-                            ui.label(label).classes(  # type: ignore[attr-defined]
-                                "text-[9px] text-gray-400 uppercase tracking-wide"
-                            )
-                            ui.label(value).classes(  # type: ignore[attr-defined]
-                                "text-[11px] text-gray-700 break-all leading-snug"
-                            )
-                    else:
-                        ui.label(line).classes(  # type: ignore[attr-defined]
-                            "text-[11px] text-gray-700 break-all leading-snug"
+                if node.svg:
+                    svg_opacity = (
+                        ""
+                        if node.connected
+                        else (" opacity-60" if node.reconnect else " opacity-30")
+                    )
+                    ui.html(node.svg).classes("h-8 w-8 shrink-0" + svg_opacity)  # type: ignore[attr-defined]
+                else:
+                    color = (
+                        "primary"
+                        if node.connected
+                        else ("amber-7" if node.reconnect else "grey-5")
+                    )
+                    ui.icon(node.icon, color=color).classes("text-2xl shrink-0")  # type: ignore[attr-defined]
+                with ui.column().classes("gap-0 min-w-0"):  # type: ignore[attr-defined]
+                    ui.label(node.title).classes(  # type: ignore[attr-defined]
+                        "text-base font-semibold text-gray-900 leading-tight"
+                    )
+                    subline = _engine_version_subline(node)
+                    if subline:
+                        ui.label(subline).classes(  # type: ignore[attr-defined]
+                            "text-xs text-gray-500 break-all leading-tight"
                         )
+            # Detail fields (endpoint/cluster-id as code labels, rest as inline rows).
+            # Only rendered once there is something to show (a verified connection).
+            detail_rows = [
+                (line.partition(": ")[0], line.partition(": ")[2])
+                for icon_name, line in node.details
+                if icon_name != _ENGINE_DETAIL_ICON
+                and ": " in line
+                and line.partition(": ")[0] not in _HIDDEN_DETAIL_LABELS
+            ]
+            if node.region:
+                detail_rows.append(("Region", node.region))
+            detail_rows.sort(
+                key=lambda lv: (
+                    _DETAIL_ORDER.index(lv[0])
+                    if lv[0] in _DETAIL_ORDER
+                    else len(_DETAIL_ORDER)
+                )
+            )
+            if detail_rows:
+                with ui.column().classes(  # type: ignore[attr-defined]
+                    "gap-1.5 w-full min-w-0 pt-2 border-t border-gray-100"
+                ):
+                    for label, value in detail_rows:
+                        if label in _COPYABLE_DETAIL_LABELS:
+                            _render_copyable_value(ui, label=label, value=value)
+                        else:
+                            # Label and value on one line, the value directly beside its
+                            # property label (not pushed to the right edge).
+                            with ui.row().classes(  # type: ignore[attr-defined]
+                                "items-baseline gap-2 no-wrap w-full min-w-0"
+                            ):
+                                ui.label(label).classes(  # type: ignore[attr-defined]
+                                    "text-[11px] text-gray-500 shrink-0"
+                                )
+                                ui.label(value).classes(  # type: ignore[attr-defined]
+                                    "text-[11px] font-medium text-gray-800 truncate min-w-0"
+                                ).tooltip(value)  # type: ignore[attr-defined]
+
+
+def _render_tool_card(ui: object, node: DiagramNode) -> None:
+    """Render the center Migration Tool box: a blue-accented card with a cog tile,
+    the current stage, and the AI-assist status pill.
+
+    The tool's badges carry the state: the ``active`` one is "Current stage: <stage>"
+    (shown as the prominent stage line), the other is the AI-assist on/off pill. The
+    card border stays neutral gray like the others; its blue-tinted header band + cog
+    tile mark it as the active center of the flow.
+    """
+    stage: Optional[str] = None
+    ai_badge: "Optional[tuple[str, str]]" = None
+    for text, tone in node.badges:
+        if tone == "active" and text.startswith("Current stage:"):
+            stage = text.split(":", 1)[1].strip()
+        else:
+            ai_badge = (text, tone)
+    with ui.card().classes(  # type: ignore[attr-defined]
+        "flex-1 min-w-0 self-stretch !shadow-none rounded-xl overflow-hidden p-0 "
+        "border border-gray-200"
+    ):
+        # "Convert · Load · Validate" rides in the header as a tagline under the title;
+        # the body stays focused on the cog tile + the live stage + AI status.
+        _render_card_header(
+            ui,
+            role="Migration Tool",
+            header_icon="sync_alt",
+            subtitle=node.subtitle,
+            accent=True,
+        )
+        with ui.column().classes(  # type: ignore[attr-defined]
+            "items-center gap-2 px-4 py-3 w-full"
+        ):
+            # Cog tile — the tool's identity glyph, centered in a rounded blue square.
+            with ui.element("div").classes(  # type: ignore[attr-defined]
+                "flex items-center justify-center h-11 w-11 rounded-lg "
+                "bg-blue-50 border border-blue-200"
+            ):
+                ui.icon("settings", color="primary").classes("text-2xl")  # type: ignore[attr-defined]
+            if stage:
+                with ui.column().classes("items-center gap-0"):  # type: ignore[attr-defined]
+                    ui.label("Current stage").classes(  # type: ignore[attr-defined]
+                        "text-[10px] text-gray-400 uppercase tracking-wide"
+                    )
+                    ui.label(stage).classes(  # type: ignore[attr-defined]
+                        "text-base font-semibold text-blue-700 text-center leading-tight"
+                    )
+            if ai_badge is not None:
+                with ui.element("div").classes("mt-0.5"):  # type: ignore[attr-defined]
+                    render_status_pill(ui, ai_badge[0], tone=ai_badge[1])
+
+
+def _render_flow_connector(ui: object) -> None:
+    """Render the dashed flow connector between two diagram cards.
+
+    A short horizontal dashed rule, vertically centered between the cards, replacing
+    the old solid arrow — the "data flows left to right" cue without a heavy glyph.
+    Neutral grey so it stays quiet against the cards.
+    """
+    with ui.column().classes(  # type: ignore[attr-defined]
+        "items-center justify-center w-8 shrink-0 self-center"
+    ):
+        ui.element("div").classes(  # type: ignore[attr-defined]
+            "w-full border-t-2 border-dashed border-gray-300"
+        )
 
 
 def _render_migration_diagram(
     ui: object, state: "object", current_step: "Optional[WorkflowStep]" = None
 ) -> None:
-    """Render the source -> tool -> target overview as a single unified panel.
+    """Render the source -> tool -> target overview as three independent cards.
 
-    Three segments share one surface. Flow direction is communicated by bold
-    ``arrow_forward`` icons between segments — no faint divider lines, no
-    redundant role labels. The tool segment gets a single "CONVERT · LOAD" pill
-    badge; source/target are self-explanatory from their titles.
+    Each of Source / Migration Tool / Target is its own bordered card with a labeled
+    header band and status badge, joined by dashed flow connectors -- so the three
+    roles read as distinct, explicitly-labeled stages of one pipeline. The middle
+    Migration Tool card is blue-accented and shows the active stage; the source/target
+    cards surface the engine identity and copy-worthy endpoint/cluster fields.
     """
     source, tool, target = build_migration_diagram(state, current_step)
-    with ui.card().classes(  # type: ignore[attr-defined]
-        "w-full !shadow-none border border-gray-200 rounded-xl p-0 overflow-hidden"
+    with ui.row().classes(  # type: ignore[attr-defined]
+        "items-stretch w-full no-wrap gap-0"
     ):
-        with ui.row().classes(  # type: ignore[attr-defined]
-            "items-stretch w-full no-wrap gap-0"
-        ):
-            _render_diagram_segment(ui, source)
-            # Flow arrow — bold, unmistakable direction.
-            with ui.column().classes(  # type: ignore[attr-defined]
-                "items-center justify-center w-8 shrink-0 self-center"
-            ):
-                ui.icon("arrow_forward", color="grey-6").classes("text-xl")  # type: ignore[attr-defined]
-            _render_diagram_segment(
-                ui, tool, role_pill=("CONVERT · LOAD", "bg-blue-50 border-blue-200 text-blue-600")
-            )
-            # Flow arrow.
-            with ui.column().classes(  # type: ignore[attr-defined]
-                "items-center justify-center w-8 shrink-0 self-center"
-            ):
-                ui.icon("arrow_forward", color="grey-6").classes("text-xl")  # type: ignore[attr-defined]
-            _render_diagram_segment(ui, target)
+        _render_endpoint_card(ui, source, role="Source", header_icon="storage")
+        _render_flow_connector(ui)
+        _render_tool_card(ui, tool)
+        _render_flow_connector(ui)
+        _render_endpoint_card(ui, target, role="Target", header_icon="dns")
 
 
 def _migration_type_chosen(state: "object") -> bool:
@@ -921,9 +1102,10 @@ def _render_journey_header(
        cross-step continuity on every step.
     """
     steps = ordered_steps()
-    # Band 1: the journey stepper.
+    # Band 1: the journey stepper (kept slim -- it is a secondary progress cue next to
+    # the sidebar, so its vertical footprint stays minimal).
     with ui.row().classes(  # type: ignore[attr-defined]
-        "items-center gap-1 w-full no-wrap overflow-x-auto py-1"
+        "items-center gap-1 w-full no-wrap overflow-x-auto py-0.5"
     ):
         for index, st in enumerate(steps):
             st_status = get_status(state.workflow, st)
@@ -936,13 +1118,13 @@ def _render_journey_header(
                 icon_name = status_icon(st_status)
                 icon_color = status_color(st_status)
             chip = (
-                "items-center gap-1 no-wrap rounded-full px-2 py-1 cursor-pointer "
+                "items-center gap-1 no-wrap rounded-full px-2 py-0.5 cursor-pointer "
                 + ("bg-blue-50 border border-blue-300" if is_current else "hover:bg-gray-100")
             )
             with ui.row().classes(chip).on(  # type: ignore[attr-defined]
                 "click", lambda _e=None, s=st: select(s)
             ):
-                ui.icon(icon_name, color=icon_color).classes("text-base")  # type: ignore[attr-defined]
+                ui.icon(icon_name, color=icon_color).classes("text-sm")  # type: ignore[attr-defined]
                 ui.label(f"{index + 1}. {step_title(st)}").classes(  # type: ignore[attr-defined]
                     "text-xs whitespace-nowrap "
                     + (
@@ -952,7 +1134,7 @@ def _render_journey_header(
                     )
                 )
             if index < len(steps) - 1:
-                ui.icon("chevron_right", color="grey-5").classes("text-sm")  # type: ignore[attr-defined]
+                ui.icon("chevron_right", color="grey-5").classes("text-xs")  # type: ignore[attr-defined]
 
     # Band 2: the migration-type banner. Two gates:
     #  - Only on the Data Migration step (WorkflowStep.CDC), where the selector lives

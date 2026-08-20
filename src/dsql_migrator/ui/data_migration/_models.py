@@ -1810,9 +1810,8 @@ _MIGRATION_TYPE_META: dict[MigrationType, _MigrationTypeMeta] = {
         label="Full load only",
         icon="bolt",
         blurb=(
-            "One-shot Full Load: pick tables, check Prerequisites, then run the "
-            "snapshot. Progress, the export watermark, and any data errors update "
-            "automatically while the job runs."
+            "One-shot Full Load: pick tables, check Prerequisites, then run it. "
+            "Progress and any data errors update automatically while the job runs."
         ),
         when="Choose for a one-time copy or a maintenance-window cutover.",
         requirements="No extra infrastructure.",
@@ -1835,7 +1834,7 @@ _MIGRATION_TYPE_META: dict[MigrationType, _MigrationTypeMeta] = {
         label="Full load + CDC",
         icon="merge",
         blurb=(
-            "Full Load then CDC, end to end: run the snapshot, and when it finishes "
+            "Full Load then CDC, end to end: run the Full Load, and when it finishes "
             "the CDC step opens automatically -- seeded from the Full Load "
             "watermark for a gapless hand-off (no manual seed point)."
         ),
