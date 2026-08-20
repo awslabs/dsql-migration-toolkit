@@ -84,6 +84,23 @@ def test_build_source_config_valid() -> None:
     assert config.secret is None
 
 
+def test_build_source_config_defaults_to_mysql_source_type() -> None:
+    from dsql_migrator.core.models import SourceType
+
+    config = build_source_config(host="db.example.com", port=3306)
+    assert config.source_type is SourceType.MYSQL
+
+
+def test_build_source_config_passes_through_postgres_source_type() -> None:
+    from dsql_migrator.core.models import SourceType
+
+    config = build_source_config(
+        host="pg.example.com", port=5432, source_type=SourceType.POSTGRES
+    )
+    assert config.source_type is SourceType.POSTGRES
+    assert config.port == 5432
+
+
 def test_build_source_config_blank_username_becomes_none() -> None:
     config = build_source_config(host="h", port=3306, database="app", username="")
     assert config.username is None

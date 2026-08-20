@@ -47,6 +47,7 @@ from dsql_migrator.core.models import (
     AiAssistConfig,
     ConnectionResult,
     SourceConnectionConfig,
+    SourceType,
     TargetConnectionConfig,
 )
 from dsql_migrator.core.secrets import (
@@ -156,6 +157,7 @@ def build_source_config(
     port: int,
     database: Optional[str] = None,
     username: Optional[str] = None,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> SourceConnectionConfig:
     """Build and validate a :class:`SourceConnectionConfig` from form input.
 
@@ -164,12 +166,15 @@ def build_source_config(
     database is optional: a connection test only needs to reach the server, so a
     blank database is normalized to ``None`` (a specific schema is selected later
     before introspection). The password is intentionally not part of this model.
+    ``source_type`` (default MySQL) records the source engine and drives the
+    source-reading dialect; the engine-type selector supplies it.
     """
     return SourceConnectionConfig(
         host=host,
         port=port,
         database=(database or "").strip() or None,
         username=username or None,
+        source_type=source_type,
     )
 
 
