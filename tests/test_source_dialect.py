@@ -97,3 +97,72 @@ def test_mysql_dialect_value_converter_returns_mysql_value_converter() -> None:
     )
     vc = dialect_for(SourceType.MYSQL).value_converter(table)
     assert isinstance(vc, ValueConverter)
+
+
+class _FakeDialectName:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeEnrichConnection:
+    """Minimal connection whose ``dialect.name`` decides the enrich branch."""
+
+    def __init__(self, dialect_name: str) -> None:
+        self.dialect = _FakeDialectName(dialect_name)
+
+
+def test_mysql_dialect_enrich_orchestration_calls_and_order(monkeypatch) -> None:
+    # Guards MySQLSourceDialect.enrich's ACTIVE branch: it must run all three in-place
+    # enrichers and return (triggers, routines, events) IN THAT ORDER. A reorder, a
+    # dropped call, or a missing collect_* would otherwise pass silently (the enrich_* /
+    # collect_* helpers are tested directly elsewhere, but this orchestration was not).
+    import dsql_migrator.core.introspector as intro
+    from dsql_migrator.core.source_dialect import MySQLSourceDialect
+
+    calls: list[tuple[str, object]] = []
+
+    def _spy(name):
+        def fn(connection, enrich_db, tables):
+            calls.append((name, enrich_db))
+        return fn
+
+    monkeypatch.setattr(intro, "enrich_columns", _spy("columns"))
+    monkeypatch.setattr(intro, "enrich_index_types", _spy("indexes"))
+    monkeypatch.setattr(intro, "enrich_partitions", _spy("partitions"))
+    monkeypatch.setattr(intro, "collect_triggers", lambda c, db: ["TRG"])
+    monkeypatch.setattr(intro, "collect_routines", lambda c, db: ["ROUT"])
+    monkeypatch.setattr(intro, "collect_events", lambda c, db: ["EVT"])
+
+    triggers, routines, events = MySQLSourceDialect().enrich(
+        _FakeEnrichConnection("mysql"), "app", []
+    )
+    # Return-tuple order (a swap would mis-file routines as triggers, etc.).
+    assert triggers == ["TRG"]
+    assert routines == ["ROUT"]
+    assert events == ["EVT"]
+    # All three in-place enrichers ran, against the right schema (a dropped call fails).
+    assert [name for name, _ in calls] == ["columns", "indexes", "partitions"]
+    assert all(db == "app" for _, db in calls)
+
+
+def test_mysql_dialect_enrich_no_ops_on_non_mysql_connection(monkeypatch) -> None:
+    # A non-MySQL connection (e.g. the SQLite test double) must skip enrichment entirely.
+    import dsql_migrator.core.introspector as intro
+    from dsql_migrator.core.source_dialect import MySQLSourceDialect
+
+    def _boom(*_a, **_k):
+        raise AssertionError("enrich ran information_schema queries on a non-MySQL conn")
+
+    for fn in (
+        "enrich_columns",
+        "enrich_index_types",
+        "enrich_partitions",
+        "collect_triggers",
+        "collect_routines",
+        "collect_events",
+    ):
+        monkeypatch.setattr(intro, fn, _boom)
+
+    assert MySQLSourceDialect().enrich(
+        _FakeEnrichConnection("sqlite"), "app", []
+    ) == ([], [], [])
