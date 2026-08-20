@@ -56,6 +56,19 @@ class SourceDialect(ABC):
     ) -> dict[str, object]:
         """``create_engine`` kwargs shared by every engine for this source."""
 
+    @abstractmethod
+    def enrich(
+        self, connection: object, enrich_db: str, tables: list
+    ) -> tuple[list, list, list]:
+        """Enrich reflected ``tables`` and collect (triggers, routines, events).
+
+        Engine-specific catalog reads for one schema (column defaults, index method,
+        partitioning) applied to ``tables`` in place, plus the schema's stored
+        triggers/routines/events returned as three lists. A dialect with no
+        engine-specific enrichment returns three empty lists. Structural reflection
+        (tables/columns/views) is dialect-agnostic and done by the caller.
+        """
+
 
 class MySQLSourceDialect(SourceDialect):
     """RDS/Aurora MySQL source dialect -- the original, default engine.
@@ -82,6 +95,34 @@ class MySQLSourceDialect(SourceDialect):
         self, *, read_timeout_seconds: Optional[int] = None
     ) -> dict[str, object]:
         return source_engine_kwargs(read_timeout_seconds=read_timeout_seconds)
+
+    def enrich(
+        self, connection: object, enrich_db: str, tables: list
+    ) -> tuple[list, list, list]:
+        # MySQL enrichment reads information_schema; run it only against a genuine
+        # MySQL connection. A non-MySQL engine (e.g. the SQLite double used in tests)
+        # safely no-ops, preserving the prior runtime gate
+        # (``connection.dialect.name == "mysql"``).
+        dialect_name = getattr(getattr(connection, "dialect", None), "name", None)
+        if dialect_name != "mysql":
+            return ([], [], [])
+        from dsql_migrator.core.introspector import (
+            collect_events,
+            collect_routines,
+            collect_triggers,
+            enrich_columns,
+            enrich_index_types,
+            enrich_partitions,
+        )
+
+        enrich_columns(connection, enrich_db, tables)
+        enrich_index_types(connection, enrich_db, tables)
+        enrich_partitions(connection, enrich_db, tables)
+        return (
+            collect_triggers(connection, enrich_db),
+            collect_routines(connection, enrich_db),
+            collect_events(connection, enrich_db),
+        )
 
 
 # Singleton dialect per source type. PostgreSQL is registered in a later phase; until

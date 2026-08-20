@@ -38,8 +38,10 @@ from dsql_migrator.core.models import (
     IndexDef,
     ObjectType,
     SourceConnectionConfig,
+    SourceType,
     TableDef,
 )
+from dsql_migrator.core.source_dialect import dialect_for
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +503,7 @@ def test_cluster_wide_introspection_qualifies_names_across_schemas() -> None:
         "billing": {"tables": {"invoices": {}}},
     }
     inventory = _assemble_inventory(
-        _FakeInspector(catalog), _NonMysqlConnection(), None, is_mysql=False
+        _FakeInspector(catalog), _NonMysqlConnection(), None, dialect=dialect_for(SourceType.MYSQL)
     )
 
     table_names = {table.name for table in inventory.tables}
@@ -533,7 +535,7 @@ def test_cluster_wide_introspection_qualifies_cross_schema_fk_target() -> None:
         "billing": {"tables": {"customers": {}}},
     }
     inventory = _assemble_inventory(
-        _FakeInspector(catalog), _NonMysqlConnection(), None, is_mysql=False
+        _FakeInspector(catalog), _NonMysqlConnection(), None, dialect=dialect_for(SourceType.MYSQL)
     )
     orders = next(t for t in inventory.tables if t.name == "shop.orders")
     # Cross-schema FK target is qualified with the FK's referred_schema, matching
@@ -563,7 +565,7 @@ def test_cluster_wide_same_schema_fk_qualified_with_reflected_schema() -> None:
         },
     }
     inventory = _assemble_inventory(
-        _FakeInspector(catalog), _NonMysqlConnection(), None, is_mysql=False
+        _FakeInspector(catalog), _NonMysqlConnection(), None, dialect=dialect_for(SourceType.MYSQL)
     )
     orders = next(t for t in inventory.tables if t.name == "shop.orders")
     assert orders.foreign_keys[0].referenced_table == "shop.orders"
@@ -576,7 +578,7 @@ def test_single_database_introspection_keeps_unqualified_names() -> None:
     # (schema=None) and names stay unqualified.
     catalog = {None: {"tables": {"orders": {}, "customers": {}}, "views": {}}}
     inventory = _assemble_inventory(
-        _FakeInspector(catalog), _NonMysqlConnection(), "shop", is_mysql=False
+        _FakeInspector(catalog), _NonMysqlConnection(), "shop", dialect=dialect_for(SourceType.MYSQL)
     )
 
     assert {table.name for table in inventory.tables} == {"orders", "customers"}

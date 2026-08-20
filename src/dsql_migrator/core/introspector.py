@@ -23,7 +23,7 @@ reflection.
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Protocol
+from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Engine
@@ -43,6 +43,9 @@ from dsql_migrator.core.models import (
     TableDef,
     ViewDef,
 )
+
+if TYPE_CHECKING:
+    from dsql_migrator.core.source_dialect import SourceDialect
 
 MYSQL_DRIVER = "mysql+pymysql"
 
@@ -759,10 +762,13 @@ def enrich_partitions(
             table.partitioned = True
 
 
-def _user_schemas(inspector: object) -> list[str]:
-    """Return non-system schema names on the cluster, in catalog order."""
+def _user_schemas(inspector: object, system_schemas: frozenset[str]) -> list[str]:
+    """Return non-system schema names on the cluster, in catalog order.
+
+    ``system_schemas`` (the source dialect's engine-internal schemas) are excluded.
+    """
     names = inspector.get_schema_names()  # type: ignore[attr-defined]
-    return [name for name in names if name not in MYSQL_SYSTEM_SCHEMAS]
+    return [name for name in names if name not in system_schemas]
 
 
 def _qualify(schema: str, *object_lists: list) -> None:
@@ -777,14 +783,16 @@ def _assemble_inventory(
     connection: _Connection,
     database: Optional[str],
     *,
-    is_mysql: bool,
+    dialect: "SourceDialect",
 ) -> SourceInventory:
     """Assemble a :class:`SourceInventory` from one or all schemas.
 
     When ``database`` is set, a single schema is reflected with unqualified
     names (single-database mode). When it is empty/``None``, every non-system
     schema is reflected and names are qualified ``schema.object`` (cluster-wide
-    mode). On MySQL, each reflected schema is enriched via ``information_schema``.
+    mode). Structural reflection is dialect-agnostic; the ``dialect`` supplies the
+    system schemas to exclude and the engine-specific enrichment (which no-ops for a
+    dialect/connection without it).
     """
     if database:
         # Single-database mode: reflect the connection's default schema and keep
@@ -792,7 +800,10 @@ def _assemble_inventory(
         plans: list[tuple[Optional[str], str, bool]] = [(None, database, False)]
     else:
         # Cluster-wide mode: reflect every user schema and qualify names.
-        plans = [(schema, schema, True) for schema in _user_schemas(inspector)]
+        plans = [
+            (schema, schema, True)
+            for schema in _user_schemas(inspector, dialect.system_schemas)
+        ]
 
     all_tables: list[TableDef] = []
     all_views: list[ViewDef] = []
@@ -803,17 +814,9 @@ def _assemble_inventory(
     for reflect_schema, enrich_db, qualify in plans:
         tables = _reflect_tables(inspector, schema=reflect_schema)
         views = _reflect_views(inspector, schema=reflect_schema)
-        triggers: list[ObjectRef] = []
-        routines: list[ObjectRef] = []
-        events: list[ObjectRef] = []
-
-        if is_mysql:
-            enrich_columns(connection, enrich_db, tables)
-            enrich_index_types(connection, enrich_db, tables)
-            enrich_partitions(connection, enrich_db, tables)
-            triggers = collect_triggers(connection, enrich_db)
-            routines = collect_routines(connection, enrich_db)
-            events = collect_events(connection, enrich_db)
+        # Engine-specific enrichment (columns/indexes/partitions in place + stored
+        # triggers/routines/events). No-ops for a dialect/connection without it.
+        triggers, routines, events = dialect.enrich(connection, enrich_db, tables)
 
         if qualify:
             _qualify(enrich_db, tables, views, triggers, routines, events)
@@ -926,13 +929,15 @@ class SourceIntrospector:
         enrich triggers, routines, AUTO_INCREMENT, and collation. All access is
         read-only (Property 1).
         """
+        from dsql_migrator.core.source_dialect import dialect_for
+
+        dialect = dialect_for(conn.source_type)
         engine = self._engine_factory(conn)
         try:
             with engine.connect() as connection:
                 inspector = inspect(connection)
-                is_mysql = connection.dialect.name == "mysql"
                 return _assemble_inventory(
-                    inspector, connection, conn.database, is_mysql=is_mysql
+                    inspector, connection, conn.database, dialect=dialect
                 )
         finally:
             engine.dispose()
