@@ -101,7 +101,8 @@ from dsql_migrator.core.target_connection import (
     DsqlConnector,
     is_transient_connection_error,
 )
-from dsql_migrator.core.watermark import COMMIT, START_CONSISTENT_SNAPSHOT
+from dsql_migrator.core.source_dialect import dialect_for
+from dsql_migrator.core.watermark import COMMIT
 
 # The pure cross-engine SQL builders + PK-classification helpers were extracted to
 # validation_sql.py for maintainability. Re-exported here so existing imports
@@ -935,6 +936,7 @@ class Validator:
             except Exception:  # noqa: BLE001 - progress is advisory; never break a run
                 pass
 
+        source_dialect = dialect_for(source.source_type)
         source_engine = self._source_engine_factory(source)
         items: list[TableValidationResult] = []
         orphan_findings: list[OrphanFinding] = []
@@ -944,7 +946,7 @@ class Validator:
                 source_connection = raw_connection.execution_options(
                     isolation_level="AUTOCOMMIT"
                 )
-                source_connection.execute(text(START_CONSISTENT_SNAPSHOT))
+                source_connection.execute(text(source_dialect.snapshot_start_sql))
                 try:
                     current_gtid = _source_gtid(source_connection)
                     # Also capture file:pos -- the drift fallback when the source has
@@ -1121,6 +1123,7 @@ class Validator:
         orphans, then close everything cleanly via ``finally``. A per-table failure
         is already isolated inside :meth:`_validate_table`.
         """
+        source_dialect = dialect_for(source.source_type)
         source_engine = self._source_engine_factory(source)
         orphans: list[OrphanFinding] = []
         try:
@@ -1128,7 +1131,7 @@ class Validator:
                 source_connection = raw_connection.execution_options(
                     isolation_level="AUTOCOMMIT"
                 )
-                source_connection.execute(text(START_CONSISTENT_SNAPSHOT))
+                source_connection.execute(text(source_dialect.snapshot_start_sql))
                 try:
                     target_connection = _ReconnectingTargetConnection(
                         lambda: self._target_connection_factory(target)
