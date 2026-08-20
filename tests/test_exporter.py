@@ -1196,13 +1196,15 @@ def test_table_exporter_rejects_table_without_columns() -> None:
 def test_select_column_sql_wraps_spatial_in_st_asbinary() -> None:
     # Spatial columns are read as WKB bytes (-> bytea), aliased back to the name;
     # other columns are read as-is. This keeps Full Load bytes identical to the
-    # WKB Debezium delivers for CDC.
-    from dsql_migrator.core.exporter import _select_column_sql
+    # WKB Debezium delivers for CDC. The logic now lives on the MySQL dialect.
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.core.source_dialect import dialect_for
 
-    geom = _select_column_sql(ColumnDef(name="geom", mysql_type="point"))
+    d = dialect_for(SourceType.MYSQL)
+    geom = d.select_column_sql(ColumnDef(name="geom", mysql_type="point"))
     assert "ST_AsBinary" in geom
     assert geom.endswith("AS `geom`")
 
-    plain = _select_column_sql(ColumnDef(name="name", mysql_type="VARCHAR(100)"))
+    plain = d.select_column_sql(ColumnDef(name="name", mysql_type="VARCHAR(100)"))
     assert "ST_AsBinary" not in plain
     assert plain == "`name`"

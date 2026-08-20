@@ -58,9 +58,9 @@ from typing import Callable, Iterator, Mapping, Optional, Protocol, TextIO
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from dsql_migrator.core.converter import is_spatial_mysql_type, map_mysql_type
+from dsql_migrator.core.converter import map_mysql_type
 from dsql_migrator.core.introspector import _default_engine_factory
-from dsql_migrator.core.models import ColumnDef, SourceConnectionConfig, TableDef
+from dsql_migrator.core.models import SourceConnectionConfig, TableDef
 from dsql_migrator.core.source_dialect import MySQLSourceDialect, SourceDialect
 from dsql_migrator.core.watermark import (
     COMMIT,
@@ -539,21 +539,6 @@ def compute_pk_shard_ranges(
     return ranges
 
 
-def _select_column_sql(column: ColumnDef) -> str:
-    """Return the SELECT-list expression for one source column.
-
-    Spatial columns (geometry/point/...) have no DSQL type and are migrated to
-    ``bytea``; read them as ``ST_AsBinary(col)`` so the value is the geometry's
-    WKB bytes -- identical to what Debezium delivers for CDC -- and aliased back
-    to the column name so the streamed row keeps its key. Other columns are read
-    as-is.
-    """
-    quoted = _quote_mysql_identifier(column.name)
-    if is_spatial_mysql_type(column.mysql_type):
-        return f"ST_AsBinary({quoted}) AS {quoted}"
-    return quoted
-
-
 # ---------------------------------------------------------------------------
 # Source-load governor (opt-in proactive read throttle)
 # ---------------------------------------------------------------------------
@@ -707,6 +692,7 @@ def keyset_stream(
     pk_lower: Optional[int] = None,
     pk_upper: Optional[int] = None,
     governor: Optional["SourceLoadGovernor"] = None,
+    dialect: "SourceDialect" = _MYSQL_DIALECT,
 ) -> Iterator[Mapping[str, object]]:
     """Yield ``table`` rows in ascending primary-key order via keyset pagination.
 
@@ -746,9 +732,11 @@ def keyset_stream(
     if not column_names:
         raise ExportError(f"table '{table.name}' has no columns to export")
 
-    columns_sql = ", ".join(_select_column_sql(column) for column in table.columns)
-    table_sql = _quote_mysql_table(table.name)
-    order_by_sql = ", ".join(_quote_mysql_identifier(c) for c in pk_columns)
+    columns_sql = ", ".join(
+        dialect.select_column_sql(column) for column in table.columns
+    )
+    table_sql = dialect.quote_table(table.name)
+    order_by_sql = ", ".join(dialect.quote_identifier(c) for c in pk_columns)
 
     # Optional range bound on the LEADING PK column (reader sharding). Applies to a
     # single OR composite key: for a composite key it bands the leading (index-prefix)
@@ -759,7 +747,7 @@ def keyset_stream(
     range_params: dict[str, object] = {}
     range_clauses: list[str] = []
     if pk_lower is not None or pk_upper is not None:
-        pk_sql_bound = _quote_mysql_identifier(pk_columns[0])
+        pk_sql_bound = dialect.quote_identifier(pk_columns[0])
         if pk_lower is not None:
             range_clauses.append(f"{pk_sql_bound} >= :pk_lower")
             range_params["pk_lower"] = pk_lower
@@ -769,7 +757,7 @@ def keyset_stream(
 
     if len(pk_columns) == 1:
         # Single-column key: scalar ``pk > :last`` (one bind param ``last``).
-        pk_sql = _quote_mysql_identifier(pk_columns[0])
+        pk_sql = dialect.quote_identifier(pk_columns[0])
         where_sql = f"{pk_sql} > :last"
         last_param_names = ["last"]
     else:
@@ -782,7 +770,7 @@ def keyset_stream(
         # whole keyset export O(n^2). The disjunction uses the PK index on every version. The
         # named params (:last_i) are REUSED across terms, so the bind set is unchanged (one
         # value per key column) and the param binding below is untouched.
-        key_sql_cols = [_quote_mysql_identifier(c) for c in pk_columns]
+        key_sql_cols = [dialect.quote_identifier(c) for c in pk_columns]
         last_param_names = [f"last_{i}" for i in range(len(pk_columns))]
         terms: list[str] = []
         for i in range(len(pk_columns)):

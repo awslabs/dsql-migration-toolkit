@@ -95,6 +95,15 @@ class SourceDialect(ABC):
     def integer_pk_types(self) -> frozenset[str]:
         """Base type names whose LEADING PK column is range-shardable (integers)."""
 
+    @abstractmethod
+    def select_column_sql(self, column: object) -> str:
+        """SELECT-list expression to read one source column (quoted, engine-specific).
+
+        MySQL wraps a spatial column as ``ST_AsBinary(col) AS col`` (WKB bytes,
+        matching what Debezium delivers) so it can migrate to ``bytea``; an ordinary
+        column is just the quoted name.
+        """
+
 
 class MySQLSourceDialect(SourceDialect):
     """RDS/Aurora MySQL source dialect -- the original, default engine.
@@ -167,6 +176,16 @@ class MySQLSourceDialect(SourceDialect):
     @property
     def integer_pk_types(self) -> frozenset[str]:
         return _MYSQL_INTEGER_PK_TYPES
+
+    def select_column_sql(self, column: object) -> str:
+        # Spatial columns have no DSQL type -> read as ST_AsBinary (WKB bytes, matching
+        # what Debezium delivers for CDC) aliased back to the name; others read as-is.
+        from dsql_migrator.core.converter import is_spatial_mysql_type
+
+        quoted = self.quote_identifier(column.name)  # type: ignore[attr-defined]
+        if is_spatial_mysql_type(column.mysql_type):  # type: ignore[attr-defined]
+            return f"ST_AsBinary({quoted}) AS {quoted}"
+        return quoted
 
 
 # Singleton dialect per source type. PostgreSQL is registered in a later phase; until
