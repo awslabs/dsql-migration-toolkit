@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.381
+
+### Changed
+
+- **Query Converter's "Test on target" now resolves unqualified tables against the
+  right schema, and lets you pick it.** A converted query like `SELECT ... FROM
+  "orders"` was being tested under the default `public` search_path, so a table
+  migrated into a `<database>`-named schema failed with `relation "orders" does not
+  exist (SQLSTATE 42P01)`. The test now resolves the schema robustly — the connected
+  source database (a MySQL DB maps to a same-named PG schema) when the target has it,
+  else the target's sole user schema — and adds an optional **"Test against schema"**
+  picker (populated in the background from the target's user schemas, defaulted to the
+  inferred one) so you can retarget when a table was migrated under a different schema.
+  On a `42P01` rejection the raw error is now followed by an actionable hint (which
+  schema it tested against and how to fix it). Rather than force a schema up front
+  (Convert needs none), the schema is inferred and only surfaced as an override.
+
 ## v0.1.380
 
 ### Changed
