@@ -482,6 +482,20 @@ def test_assessor_accepts_custom_extensible_rules() -> None:
     assert item.classification is Classification.MANUAL
 
 
+def test_default_rules_source_type_seam() -> None:
+    import pytest
+
+    from dsql_migrator.core.models import SourceType
+
+    # MySQL is byte-identical to the no-arg default (rule order preserved for ties).
+    assert [type(r).__name__ for r in default_rules(SourceType.MYSQL)] == [
+        type(r).__name__ for r in default_rules()
+    ]
+    # PostgreSQL rules are not defined yet -> fail loudly, not silently apply MySQL.
+    with pytest.raises(NotImplementedError):
+        default_rules(SourceType.POSTGRES)
+
+
 def test_default_rules_contains_all_documented_rule_ids() -> None:
     rule_ids = {rule.rule_id for rule in default_rules()}
     assert rule_ids == {

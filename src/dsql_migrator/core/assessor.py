@@ -46,6 +46,7 @@ from dsql_migrator.core.models import (
     EffortLevel,
     ObjectType,
     SourceInventory,
+    SourceType,
     TargetInventory,
 )
 
@@ -1334,12 +1335,20 @@ def default_inventory_rules() -> list[InventoryRule]:
     return [check_multiple_source_databases, check_table_count]
 
 
-def default_rules() -> list[Rule]:
-    """Return the default, ordered list of compatibility rules.
+def default_rules(source_type: SourceType = SourceType.MYSQL) -> list[Rule]:
+    """Return the default, ordered list of compatibility rules for ``source_type``.
 
     The order is significant: it breaks ties when several rules of equal
-    severity match the same object.
+    severity match the same object. Many rules inspect source-engine column types
+    (ENUM/SET, TINYINT(1), BIT, YEAR, ...) or MySQL-specific features, so the list
+    is source-engine-specific. Only MySQL is defined so far; PostgreSQL rules arrive
+    with PostgreSQL-source support, so an unsupported source type raises rather than
+    silently applying MySQL rules to it.
     """
+    if source_type is not SourceType.MYSQL:
+        raise NotImplementedError(
+            f"No default assessment rules for source type {source_type!r} yet."
+        )
     return [
         ForeignKeyRule(),
         CheckConstraintRule(),
