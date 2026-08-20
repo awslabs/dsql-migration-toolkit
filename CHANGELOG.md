@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.385
+
+### Changed
+
+- **Republished the app image at `0.1.384` and repointed the default to it.** The
+  `0.1.384` image (AI DBA diagnostics tools + token-budget fix + Query Converter schema
+  picker) was pushed to ECR Public (`z0q0i9j0`) and both private ECRs (us-east-1,
+  ap-northeast-2), and `cloudformation.yaml`'s `ContainerImageUri` default was bumped
+  `0.1.382 → 0.1.384`, so a fresh git-clone deploy pulls the fixed image instead of the
+  stale one. (Updating an already-deployed stack to the new image is a separate,
+  explicitly-confirmed step.)
+
 ## v0.1.384
 
 ### Added
