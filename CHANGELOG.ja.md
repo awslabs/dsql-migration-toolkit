@@ -5,6 +5,18 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.383
+
+### 変更 (Changed)
+
+- **AI DBA の読み取り専用ツールを `ui/app.py` から専用モジュール `ui/ai_tools.py` に切り出し
+  ました。** ツールスキーマ、システムプロンプトのヒント、約400行の `_ai_tool_execute` 本体が
+  1つのモジュールにまとまり、`build_ai_tool_executor(...)` ファクトリがページのストア + Full
+  Load レート/ETA ヘルパーを受け取って executor を返します（ファクトリなので app のグローバルを
+  import する必要がなく、循環 import を回避）。挙動を保つ移動（ツールロジックは不変）で、
+  `build_page` は配線のみ。クロージャでは不可能だった executor の単体テストが可能になりました
+  （新規 `tests/test_ai_tools.py`）。Full Load / CDC の失敗診断ツールを綺麗に追加する土台です。
+
 ## v0.1.382
 
 ### 修正 (Fixed)

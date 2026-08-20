@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.383
+
+### 변경 (Changed)
+
+- **AI DBA의 read-only 툴들을 `ui/app.py`에서 별도 모듈 `ui/ai_tools.py`로 분리했습니다.**
+  툴 스키마, 시스템 프롬프트 힌트, ~400줄짜리 `_ai_tool_execute` 본문이 한 모듈에 모였고,
+  `build_ai_tool_executor(...)` 팩토리가 페이지의 스토어 + Full Load 속도/ETA 헬퍼를 받아
+  executor를 반환합니다(팩토리라 app 전역을 import할 필요가 없어 순환 import 회피). 동작 보존
+  이동(툴 로직 불변)이며 `build_page`는 배선만 합니다. 클로저였을 땐 불가능했던 executor 단위
+  테스트가 이제 가능합니다(신규 `tests/test_ai_tools.py`). Full Load/CDC 실패 진단 툴을 깔끔히
+  추가할 토대입니다.
+
 ## v0.1.382
 
 ### 수정 (Fixed)

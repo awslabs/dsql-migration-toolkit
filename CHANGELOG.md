@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.383
+
+### Changed
+
+- **Extracted the AI DBA's read-only tools out of `ui/app.py` into their own
+  `ui/ai_tools.py`.** The tool schemas, the system-prompt hint, and the ~400-line
+  `_ai_tool_execute` body now live in one cohesive module; `build_ai_tool_executor(...)`
+  is a factory that takes the page's stores + Full Load rate/ETA helper and returns the
+  executor (a factory, so the module needn't import app's globals — no circular import).
+  Behavior-preserving move (the tool logic is unchanged); `build_page` just wires it. The
+  executor is now unit-testable on its own (new `tests/test_ai_tools.py`), which it wasn't
+  as a closure. Sets up adding more tools (Full Load / CDC failure diagnostics) cleanly.
+
 ## v0.1.382
 
 ### Fixed
