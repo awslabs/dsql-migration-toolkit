@@ -170,6 +170,57 @@ AI_TOOL_SCHEMAS: list[dict] = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
+        "name": "get_cdc_pipeline_diagnostics",
+        "description": (
+            "Diagnose WHY CDC is not streaming (or failed to start): the CDC "
+            "CloudFormation stack phase + raw status, per-connector state "
+            "(RUNNING/FAILED), a confirmed sink stall (connector RUNNING but applying "
+            "nothing), the last CDC deploy action + any FAILED deploy stage, the tail "
+            "of the deploy log (already-diagnosed, human-actionable failure text — e.g. "
+            "partition-quota exhaustion, missing IAM JAAS, bad source creds), and the "
+            "Full Load -> CDC watermark handoff (binlog file:pos / GTID presence, "
+            "snapshot time, resume mode). Use it when CDC shows not-streaming or a "
+            "deploy failed. All CACHED/local state — states/phases/log text only, never "
+            "row data or credentials. No arguments."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_prerequisite_verdicts",
+        "description": (
+            "Get the latest prerequisite-check verdicts for Full Load and/or CDC — each "
+            "check's status (PASS/FAIL/WARN/INFO/SKIP), whether it is required, and its "
+            "detail + remediation (e.g. binlog row format, GTID, MSK / MSK Connect "
+            "availability, target IAM auth, source reachability, replication grants, "
+            "primary keys). Plus can_proceed (blocked only by a required FAIL). Use it "
+            "to explain WHY a mode cannot start and exactly how to fix it. Cached from "
+            "the last checks the operator ran (empty if none run yet). Verdicts + "
+            "English remediation only, never credentials."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["FULL_LOAD", "CDC"],
+                    "description": "Limit to one mode; omit for both.",
+                }
+            },
+        },
+    },
+    {
+        "name": "list_cdc_dlq_samples",
+        "description": (
+            "List a small SAMPLE of the actual CDC dead-letter-queue (DLQ) error "
+            "messages — one per distinct (table, SQLSTATE) — with the error code, the "
+            "English error text, and when it occurred. Turns 'SQLSTATE 23505 x5' from "
+            "get_cdc_status into the concrete reason + how to fix it. The failing row's "
+            "primary-key VALUE is deliberately EXCLUDED (Property 7). Names / SQLSTATEs "
+            "/ error text only, never row data. No arguments."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "list_target_tables",
         "description": (
             "List the tables and views that currently EXIST on the target Aurora DSQL "
@@ -208,7 +259,9 @@ AI_TOOL_SCHEMAS: list[dict] = [
 # and should call them for specifics + present results visually (Markdown table / SQL).
 AI_TOOLS_SYSTEM_HINT = (
     "\n\nYou have read-only tools to look up this migration's REAL, current data "
-    "(converted DDL, the assessment, validation results, load status), plus a few that "
+    "(converted DDL, the assessment, validation results, load status), to DIAGNOSE "
+    "failures (why CDC is not streaming / a deploy failed, prerequisite verdicts, Full "
+    "Load failed/quarantined tables, actual DLQ error messages), plus a few that "
     "read the LIVE target Aurora DSQL cluster (its existing tables, a table's schema, a "
     "table's row count). When the user asks about specific objects or results, CALL the "
     "tools and answer from the actual values -- never guess or answer generically. "
@@ -487,12 +540,24 @@ def build_ai_tool_executor(
                     _fl_rate, _fl_eta = _full_load_rate_eta(
                         _job, _fl, running=_fl_running
                     )
+                    _chunks = list(getattr(_job, "chunks", []) or [])
                     _out["full_load"] = {
                         "total_tables": _fl.total_tables, "done_tables": _fl.done_tables,
                         "failed_tables": _fl.failed_tables,
                         "in_progress_tables": _fl.in_progress_tables,
                         "pending_tables": _fl.pending_tables,
                         "rows_loaded": _fl.rows_loaded,
+                        # Skipped = already-present (ON CONFLICT DO NOTHING); quarantined
+                        # = permanently DROPPED (a real data gap CDC won't backfill).
+                        "rows_skipped": sum(
+                            int(getattr(c, "rows_skipped", 0) or 0) for c in _chunks
+                        ),
+                        "rows_quarantined": sum(
+                            int(getattr(c, "rows_quarantined", 0) or 0) for c in _chunks
+                        ),
+                        "throttled_tables": len(
+                            getattr(_job, "throttled_tables", []) or []
+                        ),
                         "progress_pct": round(_fl.progress_pct, 1),
                         "running": _fl_running,
                         "rows_per_sec": round(_fl_rate) if _fl_rate else None,
@@ -519,14 +584,36 @@ def build_ai_tool_executor(
                 except Exception:  # noqa: BLE001
                     _msgs = {}
                 _quar_prefix = "quarantined row pk["
+                _chunks = list(getattr(_job, "chunks", []) or [])
+                # Per-table failure detail: attempts (retries) + what got loaded /
+                # skipped / permanently dropped, so the chat can reason lag vs gap.
                 _failed = [
-                    {"table": c.chunk_id, "error": str(_msgs.get(c.chunk_id, ""))[:500]}
-                    for c in _job.chunks
+                    {"table": c.chunk_id,
+                     "error": str(_msgs.get(c.chunk_id, ""))[:500],
+                     "attempts": int(getattr(c, "attempts", 0) or 0),
+                     "rows_loaded": int(getattr(c, "rows_loaded", 0) or 0),
+                     "rows_skipped": int(getattr(c, "rows_skipped", 0) or 0),
+                     "rows_quarantined": int(getattr(c, "rows_quarantined", 0) or 0)}
+                    for c in _chunks
                     if getattr(c, "status", "") == "FAILED"
                 ]
-                _quarantined = sorted(
-                    {t for t, m in _msgs.items() if str(m).startswith(_quar_prefix)}
-                )
+                # Quarantined tables: union of the per-chunk counter (authoritative) and
+                # the legacy message-prefix detection, with the dropped-row count.
+                _by_id = {c.chunk_id: c for c in _chunks}
+                _quar_names = {
+                    t for t, m in _msgs.items() if str(m).startswith(_quar_prefix)
+                }
+                _quar_names |= {
+                    c.chunk_id for c in _chunks
+                    if int(getattr(c, "rows_quarantined", 0) or 0) > 0
+                }
+                _quarantined = [
+                    {"table": t,
+                     "rows_quarantined": int(
+                         getattr(_by_id.get(t), "rows_quarantined", 0) or 0
+                     )}
+                    for t in sorted(_quar_names)
+                ]
                 return _json.dumps(
                     {"status": "ok", "failed": _failed, "failed_count": len(_failed),
                      "quarantined_tables": _quarantined,
@@ -584,6 +671,143 @@ def build_ai_tool_executor(
                               "data-loss risks — resolve before cut over. Common "
                               "SQLSTATEs: 22P02/22001 = data/format, 23505 = duplicate "
                               "key, 23502 = NOT NULL / dropped column.")}
+                )
+            if name == "get_cdc_pipeline_diagnostics":
+                # Why CDC is not streaming / a deploy failed. All CACHED/local state:
+                # connector states, sink-stall flag, CFN stack phase, the failed deploy
+                # stage + deploy-log tail, and the Full Load -> CDC watermark handoff.
+                from dsql_migrator.ui.data_migration import _current_job
+
+                _dm = DATA_MIGRATION_STORE.get_or_create(session_id)
+                _streaming = bool(cdc_streaming_started(_dm, JOB_MANAGER))
+                _view = getattr(_dm, "cdc_status_view", None)
+                _conn_states = dict(getattr(_view, "connector_states", {}) or {})
+                _act = getattr(_dm, "cdc_activity", None)
+                _deploy_job = _current_job(
+                    JOB_MANAGER, getattr(_dm, "cdc_deploy_job_id", None)
+                )
+                _failed_stage = None
+                if _deploy_job is not None and hasattr(_deploy_job, "chunks"):
+                    _failed_stage = next(
+                        (c.chunk_id for c in _deploy_job.chunks
+                         if getattr(c, "status", "") == "FAILED"),
+                        None,
+                    )
+                try:
+                    _log = _dm.get_cdc_deploy_log()
+                except Exception:  # noqa: BLE001
+                    _log = []
+                _log_lines = [str(m) for _ts, m in _log]
+                _err_lines = [ln for ln in _log_lines if "ERROR" in ln.upper()]
+                _log_tail = (_err_lines or _log_lines)[-8:]
+                _fl_job = _current_job(JOB_MANAGER, getattr(_dm, "job_id", None))
+                _wm = getattr(_fl_job, "watermark", None) if _fl_job is not None else None
+                _handoff = None
+                if _wm is not None:
+                    _snap = getattr(_wm, "snapshot_timestamp", None)
+                    _handoff = {
+                        "binlog_file": getattr(_wm, "binlog_file", None),
+                        "binlog_position": getattr(_wm, "binlog_position", None),
+                        "has_gtid": bool(getattr(_wm, "gtid_executed", None)),
+                        "snapshot_timestamp": _snap.isoformat() if _snap else None,
+                    }
+                try:
+                    _resume_mode = _dm.cdc_start_mode
+                except Exception:  # noqa: BLE001
+                    _resume_mode = None
+                return _json.dumps(
+                    {"status": "ok", "streaming": _streaming,
+                     "stack_phase": getattr(_dm, "cdc_stack_phase", None),
+                     "stack_status": getattr(_dm, "cdc_stack_phase_status", None),
+                     "connector_states": _conn_states,
+                     "sink_stall_confirmed": bool(
+                         getattr(_act, "sink_stall_confirmed", False)
+                     ),
+                     "deploy_action": getattr(_dm, "cdc_action_kind", None),
+                     "failed_deploy_stage": _failed_stage,
+                     "deploy_log_tail": _log_tail,
+                     "watermark_handoff": _handoff,
+                     "resume_mode": _resume_mode,
+                     "note": ("If streaming is false: check stack_phase (deployed?), "
+                              "connector_states (any FAILED?), failed_deploy_stage + "
+                              "deploy_log_tail (why the deploy stopped). "
+                              "sink_stall_confirmed = connector RUNNING but nothing "
+                              "applied (silent data loss). watermark_handoff is where "
+                              "CDC resumes from after Full Load.")}
+                )
+            if name == "get_prerequisite_verdicts":
+                from dsql_migrator.core.models import MigrationMode
+
+                _dm = DATA_MIGRATION_STORE.get_or_create(session_id)
+                _want = str(args.get("mode", "") or "").upper()
+                _modes = (
+                    [MigrationMode(_want)]
+                    if _want in ("FULL_LOAD", "CDC")
+                    else [MigrationMode.FULL_LOAD, MigrationMode.CDC]
+                )
+                _reports: dict = {}
+                for _m in _modes:
+                    _rep = _dm.get_prereq_report(_m)
+                    if _rep is None:
+                        _reports[_m.value] = {"status": "not_run"}
+                        continue
+                    _reports[_m.value] = {
+                        "status": "ok",
+                        "can_proceed": bool(_rep.can_proceed),
+                        "checks": [
+                            {"check_id": str(getattr(r.check_id, "value", r.check_id)),
+                             "title": r.title,
+                             "status": str(getattr(r.status, "value", r.status)),
+                             "required": bool(r.required),
+                             "target": r.target,
+                             "detail": str(r.detail or "")[:400],
+                             "remediation": str(r.remediation or "")[:400]}
+                            for r in _rep.results
+                        ],
+                    }
+                return _json.dumps(
+                    {"status": "ok", "reports": _reports,
+                     "note": ("can_proceed is false only when a REQUIRED check FAILED. "
+                              "INFO = expected/no-action (e.g. GTID off, MSK created at "
+                              "deploy time). Use remediation for the fix. 'not_run' "
+                              "means the operator hasn't run checks for that mode yet.")}
+                )
+            if name == "list_cdc_dlq_samples":
+                from dsql_migrator.ui.data_migration._cdc_status import (
+                    cdc_dlq_records,
+                    cdc_error_log_key,
+                )
+
+                _dm = DATA_MIGRATION_STORE.get_or_create(session_id)
+                _key = cdc_error_log_key(_dm)
+                try:
+                    _records = list(cdc_dlq_records(_dm, _key))
+                except Exception:  # noqa: BLE001
+                    _records = []
+                _seen: set = set()
+                _samples: list[dict] = []
+                for r in _records:
+                    _code = str(getattr(r, "error_code", "") or "")
+                    _tbl = str(getattr(r, "table", "") or "")
+                    if (_tbl, _code) in _seen:
+                        continue
+                    _seen.add((_tbl, _code))
+                    _occ = getattr(r, "occurred_at", None)
+                    # NB: the failing row's primary-key VALUE (r.pk) is intentionally
+                    # NOT included -- error text + code only (Property 7).
+                    _samples.append(
+                        {"table": _tbl, "sqlstate": _code,
+                         "message": str(getattr(r, "message", "") or "")[:400],
+                         "occurred_at": _occ.isoformat() if _occ else None}
+                    )
+                    if len(_samples) >= 20:
+                        break
+                return _json.dumps(
+                    {"status": "ok" if _samples else "none",
+                     "sample_count": len(_samples), "samples": _samples,
+                     "note": ("One sample per (table, SQLSTATE). Dead-lettered rows are "
+                              "NOT applied to the target; fix the cause (source data / "
+                              "schema drift), then re-load the affected rows if needed.")}
                 )
             # --- LIVE target Aurora DSQL reads (read-only; schema/counts only) ------
             if name in ("list_target_tables", "get_target_schema", "count_target_rows"):

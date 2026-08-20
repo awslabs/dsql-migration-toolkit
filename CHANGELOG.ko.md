@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.384
+
+### 추가 (Added)
+
+- **AI DBA가 이제 Full Load / CDC 실패를 진단합니다(상태 보고를 넘어서).** read-only 툴 3개 추가
+  (`ui/ai_tools.py`): `get_cdc_pipeline_diagnostics`는 "CDC가 왜 안 흐르나 / 배포가 왜 실패했나"를
+  캐시된 상태로 답합니다(CFN 스택 phase, 커넥터별 RUNNING/FAILED, 확정된 sink stall, 실패한 배포
+  스테이지 + 배포 로그의 이미 진단된 에러 tail, Full Load→CDC 워터마크 핸드오프).
+  `get_prerequisite_verdicts`는 Full Load/CDC 전제조건(binlog·GTID·MSK·IAM·PK 등)을 PASS/FAIL/WARN +
+  remediation + `can_proceed`로 반환합니다. `list_cdc_dlq_samples`는 (테이블, SQLSTATE)별 실제 DLQ
+  에러 메시지 샘플을 반환합니다. `get_full_load_status`/`list_failed_full_load_tables`에도 테이블별
+  `rows_skipped`/`rows_quarantined`/`attempts` 상세가 추가됐습니다. 모두 캐시/로컬(질문마다 추가
+  AWS 호출 없음)이고 자격증명·행 데이터 없음 — 실패 행의 PK 값은 의도적으로 제외(Property 7).
+
 ## v0.1.383
 
 ### 변경 (Changed)

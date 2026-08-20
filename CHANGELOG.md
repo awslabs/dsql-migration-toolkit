@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.384
+
+### Added
+
+- **AI DBA can now diagnose Full Load / CDC failures, not just report status.** Three new
+  read-only tools (in `ui/ai_tools.py`): `get_cdc_pipeline_diagnostics` answers "why is CDC
+  not streaming / why did the deploy fail" from cached state (CFN stack phase, per-connector
+  RUNNING/FAILED, confirmed sink stall, the failed deploy stage + the deploy log's
+  already-diagnosed error tail, and the Full Load→CDC watermark handoff);
+  `get_prerequisite_verdicts` returns the Full Load/CDC prerequisite checks (binlog, GTID,
+  MSK, IAM, PKs…) with PASS/FAIL/WARN + remediation and `can_proceed`; `list_cdc_dlq_samples`
+  returns a sample of the actual DLQ error messages per (table, SQLSTATE). `get_full_load_status`
+  and `list_failed_full_load_tables` also gained per-table `rows_skipped` / `rows_quarantined` /
+  `attempts` detail. All cached/local (no extra AWS calls per question) and credential- +
+  row-data-free — the failing row's PK value is deliberately excluded (Property 7).
+
 ## v0.1.383
 
 ### Changed

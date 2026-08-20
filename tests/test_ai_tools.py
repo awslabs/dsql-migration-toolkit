@@ -51,7 +51,9 @@ def _executor():
             _Obj(generated_node_ids=[], apply_results=[])
         ),
         validation_store=_Store(_Obj(result=None)),
-        data_migration_store=_Store(_Obj(job_id=None)),
+        data_migration_store=_Store(
+            _Obj(job_id=None, get_prereq_report=lambda _m: None)
+        ),
         job_manager=_Obj(),
         full_load_rate_eta=lambda *_a, **_k: (None, None),
     )
@@ -111,3 +113,23 @@ def test_not_run_and_none_branches() -> None:
     assert json.loads(ex("get_validation_summary", {}))["status"] == "not_run"
     # A target read with no verified target degrades to not_connected (no AWS call).
     assert json.loads(ex("list_target_tables", {}))["status"] == "not_connected"
+
+
+def test_prerequisite_verdicts_reports_not_run_per_mode() -> None:
+    # No checks run yet (get_prereq_report -> None) => both modes report not_run.
+    out = json.loads(_executor()("get_prerequisite_verdicts", {}))
+    assert out["status"] == "ok"
+    assert out["reports"]["FULL_LOAD"]["status"] == "not_run"
+    assert out["reports"]["CDC"]["status"] == "not_run"
+    # A mode filter limits the report to that one mode.
+    one = json.loads(_executor()("get_prerequisite_verdicts", {"mode": "CDC"}))
+    assert set(one["reports"]) == {"CDC"}
+
+
+def test_new_diagnostic_tools_are_registered() -> None:
+    names = {t["name"] for t in AI_TOOL_SCHEMAS}
+    assert {
+        "get_cdc_pipeline_diagnostics",
+        "get_prerequisite_verdicts",
+        "list_cdc_dlq_samples",
+    } <= names
