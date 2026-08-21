@@ -548,11 +548,19 @@ def build_pg_page_checksum_first_sql(
 ) -> sql.Composed:
     """First keyset page of the PostgreSQL/DSQL checksum: ``(sub_sum, last_pk, count)``.
 
+    The last (max) PK of the ascending page is taken as
+    ``(array_agg(page_pk ORDER BY page_pk))[COUNT(*)]`` rather than ``MAX(page_pk)``:
+    a ``uuid`` PK is orderable but has NO ``max()`` aggregate in PostgreSQL/DSQL
+    (``function max(uuid) does not exist``), which would abort the keyset checksum for
+    a uuid single-PK. array_agg + ORDER BY works for any orderable PK type (int / uuid /
+    text / timestamp) and equals ``MAX`` for the common integer case.
+
     Identifiers compose with :class:`psycopg.sql.Identifier` and the bound is a
     :class:`psycopg.sql.Literal` so nothing can break out of the SQL (Req 9.4).
     """
     return sql.SQL(
-        "SELECT COALESCE(SUM(page_tok), 0), MAX(page_pk), COUNT(*) FROM ("
+        "SELECT COALESCE(SUM(page_tok), 0), "
+        "(array_agg(page_pk ORDER BY page_pk))[COUNT(*)], COUNT(*) FROM ("
         "SELECT {pk} AS page_pk, {token} AS page_tok FROM {table} "
         "ORDER BY {pk} LIMIT {limit}) ckpage"
     ).format(
@@ -572,7 +580,8 @@ def build_pg_page_checksum_next_sql(
     reuses one prepared statement across all pages.
     """
     return sql.SQL(
-        "SELECT COALESCE(SUM(page_tok), 0), MAX(page_pk), COUNT(*) FROM ("
+        "SELECT COALESCE(SUM(page_tok), 0), "
+        "(array_agg(page_pk ORDER BY page_pk))[COUNT(*)], COUNT(*) FROM ("
         "SELECT {pk} AS page_pk, {token} AS page_tok FROM {table} WHERE {pk} > {last} "
         "ORDER BY {pk} LIMIT {limit}) ckpage"
     ).format(

@@ -834,7 +834,14 @@ def test_page_checksum_shares_the_whole_table_row_token() -> None:
 def test_pg_page_checksum_sql_is_keyset_bounded_and_qualified() -> None:
     first = build_pg_page_checksum_first_sql(_table("orders"), "id", 500).as_string(None)
     nxt = build_pg_page_checksum_next_sql(_table("orders"), "id", 500).as_string(None)
-    for part in ("SUM(page_tok)", "MAX(page_pk)", "COUNT(*)", "LIMIT 500"):
+    # The last-PK uses array_agg (not MAX) so a uuid PK -- which has no max() aggregate
+    # in PostgreSQL/DSQL -- still keyset-advances (see build_pg_page_checksum_first_sql).
+    for part in (
+        "SUM(page_tok)",
+        "(array_agg(page_pk ORDER BY page_pk))[COUNT(*)]",
+        "COUNT(*)",
+        "LIMIT 500",
+    ):
         assert part in first and part in nxt
     assert "WHERE" not in first  # the first page carries no keyset predicate
     assert '"id" > %(last)s' in nxt  # subsequent pages are keyset+parameterized

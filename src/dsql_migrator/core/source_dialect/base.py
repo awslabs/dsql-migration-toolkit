@@ -137,6 +137,15 @@ class SourceDialect(ABC):
     #: The ``SourceType`` this dialect serves.
     source_type: SourceType
 
+    #: Whether the ``database`` connection field names a single SCHEMA to reflect
+    #: (MySQL: a database IS a schema) or the connection database whose non-system
+    #: schemas should ALL be reflected (PostgreSQL: schemas live inside the database).
+    #: Drives ``_assemble_inventory``: True -> a set database reflects that one schema
+    #: (unqualified); False -> every non-system schema of the connected database is
+    #: reflected, ``schema.table``-qualified (so a PG source never silently drops a
+    #: non-``public`` schema).
+    database_is_schema: bool = True
+
     @property
     @abstractmethod
     def driver_scheme(self) -> str:

@@ -513,6 +513,30 @@ def test_cluster_wide_introspection_qualifies_names_across_schemas() -> None:
     assert "mysql.user" not in table_names
 
 
+def test_postgres_reflects_all_schemas_even_with_database_set() -> None:
+    # A PostgreSQL source's `database` is the connection, not a schema (database_is_schema
+    # is False), so _assemble_inventory must reflect ALL non-system schemas, qualified --
+    # never just `public`. Regression: a set database used to reflect only the default
+    # schema, silently dropping a non-public schema (e.g. `app`).
+    from dsql_migrator.core.introspector import _assemble_inventory
+
+    catalog = {
+        "pg_catalog": {"tables": {"pg_class": {}}},  # system -> skipped
+        "information_schema": {"tables": {"tables": {}}},  # system -> skipped
+        "public": {"tables": {"docs": {}}},
+        "app": {"tables": {"orders": {}, "items": {}}},
+    }
+    inventory = _assemble_inventory(
+        _FakeInspector(catalog),
+        _NonMysqlConnection(),
+        "mydb",  # database SET -- for PG this is the connection, not a single schema
+        dialect=dialect_for(SourceType.POSTGRES),
+    )
+    table_names = {table.name for table in inventory.tables}
+    # Every non-system schema reflected AND schema-qualified (app not dropped).
+    assert table_names == {"public.docs", "app.orders", "app.items"}
+
+
 def test_cluster_wide_introspection_qualifies_cross_schema_fk_target() -> None:
     from dsql_migrator.core.introspector import _assemble_inventory
 

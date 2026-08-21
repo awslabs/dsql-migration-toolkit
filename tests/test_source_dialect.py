@@ -354,6 +354,14 @@ def test_probe_versions_all_none_when_every_probe_fails() -> None:
     assert dialect_for(SourceType.MYSQL).probe_versions(conn) == SourceVersions()
 
 
+def test_database_is_schema_flag_per_engine() -> None:
+    # MySQL: a database IS a schema, so a set `database` reflects that one schema. A
+    # PostgreSQL "database" is the connection whose schemas (public, app, ...) must ALL be
+    # reflected -- so its flag is False (else a non-public schema is silently dropped).
+    assert dialect_for(SourceType.MYSQL).database_is_schema is True
+    assert dialect_for(SourceType.POSTGRES).database_is_schema is False
+
+
 def test_mysql_dialect_quoting() -> None:
     d = dialect_for(SourceType.MYSQL)
     assert d.quote_identifier("id") == "`id`"

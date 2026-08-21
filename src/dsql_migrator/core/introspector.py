@@ -787,19 +787,23 @@ def _assemble_inventory(
 ) -> SourceInventory:
     """Assemble a :class:`SourceInventory` from one or all schemas.
 
-    When ``database`` is set, a single schema is reflected with unqualified
-    names (single-database mode). When it is empty/``None``, every non-system
-    schema is reflected and names are qualified ``schema.object`` (cluster-wide
-    mode). Structural reflection is dialect-agnostic; the ``dialect`` supplies the
-    system schemas to exclude and the engine-specific enrichment (which no-ops for a
-    dialect/connection without it).
+    For an engine whose ``database`` IS a schema (MySQL, ``dialect.database_is_schema``):
+    when ``database`` is set, that single schema is reflected with unqualified names
+    (single-database mode); when empty/``None``, every non-system schema is reflected,
+    ``schema.object``-qualified (cluster-wide mode). For an engine whose schemas live
+    INSIDE the connection database (PostgreSQL, ``database_is_schema`` False), every
+    non-system schema of the connected database is reflected + qualified regardless (so a
+    non-``public`` schema is never silently dropped). Structural reflection is
+    dialect-agnostic; the ``dialect`` supplies the system schemas + engine enrichment.
     """
-    if database:
-        # Single-database mode: reflect the connection's default schema and keep
+    if database and dialect.database_is_schema:
+        # Single-database mode (MySQL): reflect the connection's default schema and keep
         # names unqualified. ``enrich_db`` is the selected database.
         plans: list[tuple[Optional[str], str, bool]] = [(None, database, False)]
     else:
-        # Cluster-wide mode: reflect every user schema and qualify names.
+        # Reflect every non-system schema and qualify names. This is MySQL's cluster-wide
+        # mode (blank database) AND the only mode for PostgreSQL (whose one connected
+        # database holds many schemas -- public, app, ... -- all of which must migrate).
         plans = [
             (schema, schema, True)
             for schema in _user_schemas(inspector, dialect.system_schemas)

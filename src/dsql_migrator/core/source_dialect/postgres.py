@@ -72,6 +72,11 @@ class PostgresSourceDialect(SourceDialect):
     """RDS/Aurora PostgreSQL source dialect (read-only)."""
 
     source_type = SourceType.POSTGRES
+    # A PostgreSQL "database" is the connection target; its user data lives in SCHEMAS
+    # inside it. So a set ``database`` must reflect ALL non-system schemas (public, app,
+    # ...), schema-qualified -- not just the default ``public`` (which would silently
+    # drop every other schema). Contrast MySQL, where a database IS a schema.
+    database_is_schema = False
 
     @property
     def driver_scheme(self) -> str:
