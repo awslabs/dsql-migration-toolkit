@@ -28,6 +28,25 @@ from dsql_migrator.core.source_dialect.base import (
 # System schemas excluded when resolving a bare (unqualified) table name to its columns.
 _PG_SYSTEM_SCHEMAS_SQL = "('pg_catalog', 'information_schema', 'pg_toast')"
 
+
+def _reads_as_text(type_string: str) -> bool:
+    """True for PG types Full Load must read via a text cast rather than natively.
+
+    psycopg's native round trip is lossy or parse-heavy for these:
+    - ``json`` / ``jsonb``: the default loader ``json.loads`` -> a Python dict/list, which
+      the target dumper would ``json.dumps`` back (a ~10x round trip) and which collapses a
+      JSON literal ``null`` to Python ``None`` (-> SQL NULL);
+    - ``interval`` (incl. fields-qualified ``interval day to second``): psycopg loads it as
+      a ``datetime.timedelta``, which CANNOT hold months/years -- it silently collapses
+      ``1 mon`` -> 30 days / ``1 year`` -> 365 days, and raises under a non-default
+      ``IntervalStyle``.
+    Reading these as their exact source text (``CAST(col AS text)``) and binding that text
+    to the identical target column as an unknown-typed literal (oid 0, which the server
+    re-parses) is faithful for all of them -- the same path MySQL's JSON text uses.
+    """
+    base = type_string.split("(", 1)[0].strip().lower()
+    return base in ("json", "jsonb") or base.startswith("interval")
+
 # PostgreSQL integer base types (lower-cased, precision stripped). Same sharding
 # rationale as MySQL: only a collation-free integer leading PK column is range-shardable.
 # Includes the internal aliases (int2/int4/int8) and the serial pseudo-types, which
@@ -143,9 +162,17 @@ class PostgresSourceDialect(SourceDialect):
         return _PG_INTEGER_PK_TYPES
 
     def select_column_sql(self, column: object) -> str:
-        # v1: read every column as-is (quoted). PostGIS geometry is out of scope for a
-        # first PostgreSQL-source release, so there is no ST_AsBinary-style special case.
-        return self.quote_identifier(column.name)  # type: ignore[attr-defined]
+        # Most columns read as-is (quoted). json/jsonb/interval are read via a text cast so
+        # Full Load streams their EXACT text and binds it back to the identical target
+        # column as an unknown-typed literal (oid 0), which the server re-parses --
+        # faithful AND fast (see _reads_as_text for why the native psycopg round trip is
+        # lossy/parse-heavy for these). json/jsonb can't be a PK and an interval PK still
+        # paginates correctly (the text boundary is cast back to interval for `> :last`).
+        # PostGIS geometry is out of scope (no ST_AsBinary-style case) for a first release.
+        quoted = self.quote_identifier(column.name)  # type: ignore[attr-defined]
+        if _reads_as_text(column.mysql_type):  # type: ignore[attr-defined]
+            return f"CAST({quoted} AS text) AS {quoted}"
+        return quoted
 
     @property
     def snapshot_start_sql(self) -> str:
@@ -153,14 +180,13 @@ class PostgresSourceDialect(SourceDialect):
         return "START TRANSACTION ISOLATION LEVEL REPEATABLE READ"
 
     def value_converter(self, table: object, *, target_types: object = None) -> object:
-        # Full Load value conversion for a PostgreSQL source is Phase 2 (psycopg returns
-        # near-native types, but bit/bytea/json/array handling must be verified against a
-        # live source before shipping). Fail loudly rather than risk silent corruption.
-        raise NotImplementedError(
-            "PostgreSQL-source Full Load value conversion is not implemented yet "
-            "(Phase 2); PostgreSQL support currently covers Evaluation + Schema "
-            "Conversion."
-        )
+        # PG->DSQL is psycopg-native on both ends, so Full Load value conversion is pure
+        # pass-through (json/jsonb/interval fidelity is handled by select_column_sql's text
+        # cast on read, not per value). Kept in its own module (exporter_postgres) per the
+        # per-engine separation rule.
+        from dsql_migrator.core.exporter_postgres import PostgresValueConverter
+
+        return PostgresValueConverter(table, target_types=target_types)
 
     def probe_versions(self, connection: object) -> SourceVersions:
         # version() is the verbose banner ("PostgreSQL 16.4 ... on <arch>").

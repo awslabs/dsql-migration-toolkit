@@ -149,11 +149,47 @@ def test_postgres_dialect_enrich_captures_exact_pg_types() -> None:
     assert table.columns[2].mysql_type == "TEXT"  # not in catalog rows -> unchanged
 
 
-def test_postgres_dialect_value_converter_is_a_phase2_stub() -> None:
-    # Full Load value conversion for PG is Phase 2; it must fail loudly (never silently
-    # mis-convert), so it raises rather than returning a half-baked converter.
-    with pytest.raises(NotImplementedError):
-        dialect_for(SourceType.POSTGRES).value_converter(object())
+def test_postgres_dialect_value_converter_returns_pg_converter() -> None:
+    # Phase 2: PG Full Load value conversion is implemented -- the dialect returns a
+    # PostgresValueConverter (own module) exposing the convert_row/convert_value contract.
+    from dsql_migrator.core.exporter_postgres import PostgresValueConverter
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    table = TableDef(
+        name="t",
+        columns=[ColumnDef(name="id", mysql_type="integer")],
+        primary_key=["id"],
+    )
+    vc = dialect_for(SourceType.POSTGRES).value_converter(table)
+    assert isinstance(vc, PostgresValueConverter)
+    assert vc.convert_row({"id": 1}) == {"id": 1}
+
+
+@pytest.mark.parametrize(
+    "pg_type",
+    ["json", "jsonb", "interval", "interval day to second", "interval second(3)"],
+)
+def test_postgres_select_column_casts_json_and_interval_to_text(pg_type: str) -> None:
+    # json/jsonb/interval read via CAST(col AS text) so Full Load streams their exact
+    # text (faithful + fast), aliased back to the column name so the row key is unchanged.
+    from dsql_migrator.core.models import ColumnDef
+
+    d = dialect_for(SourceType.POSTGRES)
+    sql = d.select_column_sql(ColumnDef(name="c", mysql_type=pg_type))
+    assert sql == 'CAST("c" AS text) AS "c"'
+
+
+@pytest.mark.parametrize(
+    "pg_type",
+    ["integer", "bigint", "text", "numeric(12,2)", "uuid", "timestamp with time zone",
+     "bytea", "boolean"],
+)
+def test_postgres_select_column_reads_scalars_as_is(pg_type: str) -> None:
+    # Everything that binds natively is read as-is (just quoted) -- no needless cast.
+    from dsql_migrator.core.models import ColumnDef
+
+    d = dialect_for(SourceType.POSTGRES)
+    assert d.select_column_sql(ColumnDef(name="c", mysql_type=pg_type)) == '"c"'
 
 
 # ---------------------------------------------------------------------------
