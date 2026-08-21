@@ -86,6 +86,15 @@ _LOGGER = logging.getLogger(__name__)
 # bounded (one page in flight per reader shard).
 DEFAULT_BATCH_SIZE = 5000
 
+# The streaming read sets ``stream_results=True`` on the connection (a server-side
+# cursor, so a page holds only ``batch_size`` rows). But the snapshot's transaction-
+# control statements (``START TRANSACTION`` / ``COMMIT``) must NOT run through a
+# server-side cursor: psycopg would emit ``DECLARE ... CURSOR FOR START TRANSACTION``,
+# a syntax error (a server-side cursor is valid only for a ``SELECT``). Overriding
+# ``stream_results=False`` per-statement runs them as plain statements. Harmless for
+# MySQL (pymysql's SSCursor tolerates non-SELECTs); required for the psycopg source.
+_TXN_CONTROL_EXEC_OPTS = {"stream_results": False}
+
 
 class ExportError(RuntimeError):
     """Base error for failures while exporting a source table."""
@@ -1008,7 +1017,10 @@ class TableExporter:
                 snapshot = connection.execution_options(
                     isolation_level="AUTOCOMMIT", stream_results=True
                 )
-                snapshot.execute(text(dialect.snapshot_start_sql))
+                snapshot.execute(
+                    text(dialect.snapshot_start_sql),
+                    execution_options=_TXN_CONTROL_EXEC_OPTS,
+                )
                 governor = (
                     SourceLoadGovernor(
                         snapshot,
@@ -1031,7 +1043,9 @@ class TableExporter:
                     ):
                         yield converter.convert_row(raw)
                 finally:
-                    snapshot.execute(text(COMMIT))
+                    snapshot.execute(
+                        text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
+                    )
         finally:
             engine.dispose()
 
@@ -1056,7 +1070,9 @@ def export_rows(
     value_converter = dialect.value_converter(table, target_types=target_types)
     column_names = [column.name for column in table.columns]
 
-    connection.execute(text(dialect.snapshot_start_sql))
+    connection.execute(
+        text(dialect.snapshot_start_sql), execution_options=_TXN_CONTROL_EXEC_OPTS
+    )
     rows_exported = 0
     try:
         writer.write_header(column_names)
@@ -1066,7 +1082,9 @@ def export_rows(
             writer.write_row(value_converter.convert_row(row))
             rows_exported += 1
     finally:
-        connection.execute(text(COMMIT))
+        connection.execute(
+            text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
+        )
     return rows_exported
 
 

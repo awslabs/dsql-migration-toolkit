@@ -119,7 +119,7 @@ class _FakeConnection:
         self.execution_options_seen = kwargs
         return self
 
-    def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+    def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
         sql = str(statement)
         upper = sql.strip().upper()
         if "THREADS_RUNNING" in upper:  # source-load governor's SHOW GLOBAL STATUS
@@ -627,7 +627,7 @@ def test_compute_pk_shard_ranges_splits_min_max_into_half_open_ranges() -> None:
     # MIN=1, MAX=1000, shards=4 -> 4 contiguous ranges; first lo=None, last hi=None
     # (open ends guarantee full coverage), interior boundaries evenly spaced.
     class _MinMaxConn:
-        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
             assert "MIN(" in str(statement) and "MAX(" in str(statement)
             return _FakeResult([{"lo": 1, "hi": 1000}])
 
@@ -647,11 +647,11 @@ def test_compute_pk_shard_ranges_splits_min_max_into_half_open_ranges() -> None:
 
 def test_compute_pk_shard_ranges_falls_back_for_small_or_empty_table() -> None:
     class _EmptyConn:
-        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
             return _FakeResult([{"lo": None, "hi": None}])
 
     class _TinyConn:
-        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
             return _FakeResult([{"lo": 1, "hi": 3}])  # span 3 <= shards 4
 
     assert compute_pk_shard_ranges(_EmptyConn(), _simple_table(), 4) == [(None, None)]
@@ -693,7 +693,7 @@ def test_shard_range_sql_keeps_a_hostile_identifier_inside_one_quoted_name() -> 
     seen: list[str] = []
 
     class _CapturingConn:
-        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
             seen.append(str(statement))
             return _FakeResult([{"lo": 1, "hi": 1000}])
 
@@ -723,7 +723,7 @@ def test_compute_pk_shard_ranges_shards_composite_when_leading_is_integer() -> N
     # Composite (tenant_id INT, id BIGINT): MIN/MAX are read from the LEADING integer
     # column and split into K half-open ranges (first lo=None, last hi=None).
     class _MinMaxConn:
-        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
             s = str(statement)
             assert "MIN(" in s and "`tenant_id`" in s  # LEADING column, not the trailing id
             return _FakeResult([{"lo": 1, "hi": 1000}])
@@ -774,7 +774,7 @@ def test_pk_range_shards_partition_all_rows_without_overlap() -> None:
     rows = [{"id": i, "name": f"n{i}"} for i in range(1, 21)]
 
     class _MinMaxConn(_FakeConnection):
-        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
             if "MIN(" in str(statement):
                 return _FakeResult([{"lo": 1, "hi": 20}])
             return super().execute(statement, parameters)
@@ -826,7 +826,7 @@ def test_pk_range_shards_partition_composite_leading_int_without_overlap() -> No
     rows = [{"tenant_id": t, "id": i} for t in range(1, 13) for i in range(1, 4)]
 
     class _MinMaxConn(_FakeConnection):
-        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
             if "MIN(" in str(statement):
                 return _FakeResult([{"lo": 1, "hi": 12}])
             return super().execute(statement, parameters)
