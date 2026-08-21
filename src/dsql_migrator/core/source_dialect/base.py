@@ -293,6 +293,20 @@ class SourceDialect(ABC):
         """
 
     @abstractmethod
+    def capture_resume_lsn(self, connection: object) -> Optional[str]:
+        """Read the engine's CDC resume coordinate at the Full Load consistency point.
+
+        The gapless Full Load -> CDC handoff point (CDC resumes streaming from here).
+        PostgreSQL returns the current WAL LSN (``pg_current_wal_lsn`` on a primary /
+        ``pg_last_wal_replay_lsn`` on a standby); it is captured BEFORE the per-table
+        reader snapshots open (which are at or after it), so replaying from it is a
+        superset and the idempotent load converges with no gap -- the PG analog of
+        capturing MySQL's binlog:pos. MySQL returns ``None`` here: its binlog/GTID
+        coordinate is captured by the dedicated ``WatermarkCapturer``, not this seam.
+        Best effort: any failure (insufficient privilege, unreadable) returns ``None``.
+        """
+
+    @abstractmethod
     def read_active_query_count(self, connection: object) -> Optional[int]:
         """Read the source's live active-query concurrency, or ``None`` on any failure.
 

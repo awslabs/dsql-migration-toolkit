@@ -731,6 +731,15 @@ class Watermark(BaseModel):
     server_uuid: Optional[str] = Field(
         default=None, description="The source server's '@@GLOBAL.server_uuid'."
     )
+    wal_lsn: Optional[str] = Field(
+        default=None,
+        description=(
+            "PostgreSQL WAL LSN (e.g. '3/AF012B8') captured at the snapshot point -- the "
+            "PG analog of MySQL's binlog:pos and the coordinate a PostgreSQL CDC catch-up "
+            "resumes streaming from for a gapless Full Load -> CDC handoff. None for a "
+            "MySQL source, or when it cannot be read (e.g. insufficient privilege)."
+        ),
+    )
     snapshot_timestamp: datetime = Field(
         description="UTC timestamp captured at the consistent-snapshot point."
     )

@@ -585,12 +585,17 @@ def test_batched_table_migrator_captures_watermark_for_selected_tables() -> None
 def test_capture_watermark_skips_binlog_for_postgres_source(monkeypatch) -> None:
     # A PostgreSQL source has no binlog/GTID, and the MySQL WatermarkCapturer's SQL
     # (START TRANSACTION WITH CONSISTENT SNAPSHOT / SHOW MASTER STATUS) is fatal on PG.
-    # capture_watermark must SKIP the capturer and return a binlog-less watermark carrying
-    # only the scan-free row-count baseline (dialect-dispatched, None -> 0).
+    # capture_watermark must SKIP the capturer and return a watermark carrying the PG
+    # resume coordinate (WAL LSN, dialect-captured) + the scan-free row-count baseline
+    # (dialect-dispatched, None -> 0).
     import dataclasses
 
     import dsql_migrator.ui.data_migration._full_load_engine as eng
     from dsql_migrator.core.models import SourceType
+
+    class _LsnResult:
+        def first(self):  # noqa: ANN201
+            return ("3/AF012B8",)  # what pg_current_wal_lsn()::text yields
 
     class _NoConn:
         def __enter__(self):  # noqa: ANN204
@@ -598,6 +603,11 @@ def test_capture_watermark_skips_binlog_for_postgres_source(monkeypatch) -> None
 
         def __exit__(self, *_a):  # noqa: ANN204
             return False
+
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            # capture_resume_lsn's WAL LSN probe (estimate_source_rows is monkeypatched).
+            assert "pg_current_wal_lsn" in str(statement)
+            return _LsnResult()
 
     class _NoEngine:
         def connect(self):  # noqa: ANN201
@@ -632,6 +642,8 @@ def test_capture_watermark_skips_binlog_for_postgres_source(monkeypatch) -> None
     watermark = migrator.capture_watermark(list(_inventory().tables))
     assert capturer.calls == []  # MySQL binlog capturer skipped for a PG source
     assert watermark.binlog_file is None and watermark.gtid_executed is None
+    # The PG resume coordinate (WAL LSN) IS captured -- the gapless CDC handoff point.
+    assert watermark.wal_lsn == "3/AF012B8"
     assert watermark.row_counts_approximate is True
     assert watermark.table_row_counts == {"orders": 5, "customers": 0}  # None -> 0
     assert fake_engine.disposed is True  # source engine disposed (no leak)
@@ -11950,21 +11962,35 @@ def test_captured_watermark_postgres_wording_is_not_mysql_binlog(monkeypatch) ->
         lambda category, action, **kw: captured.append({"action": action, **kw}),
     )
 
-    wm = Watermark(  # binlog-less: exactly what _capture_rowcount_only_watermark returns
+    # With the PG resume coordinate captured, the log shows the WAL LSN (the gapless
+    # handoff point) -- never MySQL binlog wording.
+    wm = Watermark(
+        wal_lsn="3/AF012B8",
         snapshot_timestamp=datetime(2026, 3, 4, 5, 6, 7, tzinfo=timezone.utc),
         table_row_counts={"orders": 7, "customers": 3},
         row_counts_approximate=True,
     )
     _engine._log_captured_watermark(wm, SourceType.POSTGRES)
-
     (entry,) = captured
-    detail = entry["detail"]
-    assert "binary logging" not in detail  # MySQL-flavored wording must not appear
+    assert "WAL LSN 3/AF012B8" in entry["detail"]
+    assert "binary logging" not in entry["detail"]
+
+    # If the LSN could not be read (None), the wording is engine-specific (PostgreSQL),
+    # not the MySQL "binary logging off" phrasing.
+    captured.clear()
+    wm_no_lsn = Watermark(
+        snapshot_timestamp=datetime(2026, 3, 4, 5, 6, 7, tzinfo=timezone.utc),
+        table_row_counts={"orders": 7},
+        row_counts_approximate=True,
+    )
+    _engine._log_captured_watermark(wm_no_lsn, SourceType.POSTGRES)
+    detail = captured[0]["detail"]
+    assert "binary logging" not in detail
     assert "PostgreSQL" in detail
     assert "row-count baseline only" in detail
     # MySQL default keeps its original wording (regression guard).
     captured.clear()
-    _engine._log_captured_watermark(wm, SourceType.MYSQL)
+    _engine._log_captured_watermark(wm_no_lsn, SourceType.MYSQL)
     assert "binary logging off or restricted" in captured[0]["detail"]
 
 

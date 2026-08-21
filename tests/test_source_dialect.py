@@ -590,6 +590,40 @@ def test_postgres_read_active_query_count_reads_pg_stat_activity() -> None:
     assert d.read_active_query_count(_PgActivityConn(1, raise_error=True)) is None
 
 
+class _LsnResult:
+    def __init__(self, value) -> None:
+        self._value = value
+
+    def first(self):  # noqa: ANN201
+        return (self._value,) if self._value is not None else None
+
+
+class _LsnConn:
+    def __init__(self, value, *, raise_error: bool = False) -> None:
+        self._value = value
+        self._raise = raise_error
+
+    def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        if self._raise:
+            raise RuntimeError("insufficient privilege")
+        # Recovery-aware: primary -> pg_current_wal_lsn, standby -> pg_last_wal_replay_lsn.
+        assert "pg_current_wal_lsn" in str(statement)
+        assert "pg_is_in_recovery" in str(statement)
+        return _LsnResult(self._value)
+
+
+def test_mysql_capture_resume_lsn_is_none() -> None:
+    # MySQL's resume coordinate is the binlog (WatermarkCapturer), not this seam.
+    assert dialect_for(SourceType.MYSQL).capture_resume_lsn(object()) is None
+
+
+def test_postgres_capture_resume_lsn_reads_wal_lsn() -> None:
+    d = dialect_for(SourceType.POSTGRES)
+    assert d.capture_resume_lsn(_LsnConn("3/AF012B8")) == "3/AF012B8"
+    # Best effort: an error (e.g. insufficient privilege) -> None (still a valid watermark).
+    assert d.capture_resume_lsn(_LsnConn(None, raise_error=True)) is None
+
+
 def test_database_is_schema_flag_per_engine() -> None:
     # MySQL: a database IS a schema, so a set `database` reflects that one schema. A
     # PostgreSQL "database" is the connection whose schemas (public, app, ...) must ALL be

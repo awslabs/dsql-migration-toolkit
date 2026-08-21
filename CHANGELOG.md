@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.390
+
+### Added
+
+- **PostgreSQL source: the Full Load watermark now captures the WAL LSN** — the
+  PostgreSQL resume coordinate (the analog of MySQL's binlog position), recorded at the
+  Full Load consistency point. This is the gapless Full Load → change-data-capture (CDC)
+  handoff point a PostgreSQL CDC catch-up resumes streaming from: because the Full Load
+  reads a snapshot at or after this LSN, replaying from it is a superset and the
+  idempotent load converges with no gap. A read-replica source uses the standby replay
+  LSN; if the LSN cannot be read (e.g. insufficient privilege) the watermark is still
+  valid (the LSN is best-effort). The watermark entry in the activity log shows it. No
+  change for MySQL sources (which continue to record binlog/GTID). Note: CDC from a
+  PostgreSQL source is still to come — this makes the Full Load side of the handoff ready;
+  the streaming side (a replication slot to retain WAL, and the CDC connector) arrives
+  with PostgreSQL CDC.
+
 ## v0.1.389
 
 ### Fixed

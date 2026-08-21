@@ -370,6 +370,18 @@ class PostgresSourceDialect(SourceDialect):
             or "remaining connection slots" in low
         )
 
+    def capture_resume_lsn(self, connection: object) -> Optional[str]:
+        # The WAL LSN a PostgreSQL CDC catch-up resumes from (the gapless handoff point,
+        # PG's analog of MySQL binlog:pos). pg_current_wal_lsn() is the primary's current
+        # insert position; on a standby/read-replica it errors, so branch on
+        # pg_is_in_recovery() to pg_last_wal_replay_lsn(). Cast to text ('3/AF012B8').
+        # Best effort via probe_scalar: any failure (insufficient privilege) -> None.
+        return probe_scalar(
+            connection,
+            "SELECT (CASE WHEN pg_is_in_recovery() "
+            "THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_lsn() END)::text",
+        )
+
     def read_active_query_count(self, connection: object) -> Optional[int]:
         # PostgreSQL live active-query concurrency = backends currently executing a query
         # in pg_stat_activity (state='active'). This is a plain SELECT that SUCCEEDS

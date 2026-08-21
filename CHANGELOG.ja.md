@@ -5,6 +5,21 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.390
+
+### 追加 (Added)
+
+- **PostgreSQL ソース: Full Load ウォーターマークが WAL LSN を記録するようになりました** —
+  PostgreSQL の再開座標(MySQL の binlog 位置に相当)を Full Load の一貫性ポイントで記録します。
+  これは PostgreSQL の CDC キャッチアップがストリーミングを再開する **gapless な Full Load →
+  CDC 引き継ぎポイント**です。Full Load はこの LSN 以降のスナップショットを読むため、この地点
+  から再生すると上位集合になり、冪等ロードがギャップなく収束します。リードレプリカのソースでは
+  スタンバイの replay LSN を使い、LSN を読めない場合(権限不足など)でもウォーターマークは有効
+  です(LSN はベストエフォート)。アクティビティログのウォーターマーク項目に LSN が表示されます。
+  MySQL ソースは変更なし(引き続き binlog/GTID を記録)。備考: PostgreSQL ソースの CDC 自体は
+  今後の予定で、本変更は引き継ぎの **Full Load 側を準備**するものです。ストリーミング側(WAL
+  保持用のレプリケーションスロット、CDC コネクタ)は PostgreSQL CDC と共に導入されます。
+
 ## v0.1.389
 
 ### 修正 (Fixed)

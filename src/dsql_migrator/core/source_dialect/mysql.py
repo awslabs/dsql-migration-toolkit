@@ -179,6 +179,11 @@ class MySQLSourceDialect(SourceDialect):
         # MySQL "too many connections" (ER_CON_COUNT_ERROR 1040 / 1203).
         return _mysql_too_many_connections(exc)
 
+    def capture_resume_lsn(self, connection: object) -> Optional[str]:
+        # MySQL's CDC resume coordinate is the binlog file:pos / GTID captured by the
+        # dedicated WatermarkCapturer (watermark.py), not this seam -> None here.
+        return None
+
     def read_active_query_count(self, connection: object) -> Optional[int]:
         # MySQL live active-query concurrency = global Threads_running (SHOW GLOBAL
         # STATUS). Lazy import to avoid an import cycle (exporter imports the dialect

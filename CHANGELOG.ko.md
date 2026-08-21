@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.390
+
+### 추가 (Added)
+
+- **PostgreSQL 소스: Full Load 워터마크가 이제 WAL LSN을 캡처합니다** — PostgreSQL의 재개
+  좌표(MySQL binlog 위치의 대응물)를 Full Load 일관성 지점에서 기록합니다. 이는 PostgreSQL
+  CDC 캐치업이 스트리밍을 재개하는 **gapless Full Load → CDC 인계 지점**입니다. Full Load가
+  이 LSN 이후 시점의 스냅샷을 읽으므로 이 지점부터 재생하면 상위집합이 되어 멱등 적재가
+  누락 없이 수렴합니다. 리드 레플리카 소스에서는 스탠바이 replay LSN을 사용하고, LSN을 읽을
+  수 없으면(예: 권한 부족) 워터마크는 여전히 유효합니다(LSN은 best-effort). 활동 로그의
+  워터마크 항목에 LSN이 표시됩니다. MySQL 소스는 변화 없음(계속 binlog/GTID 기록). 참고:
+  PostgreSQL 소스의 CDC 자체는 아직 예정 항목이며, 이번 변경은 인계의 **Full Load 쪽을
+  준비**한 것입니다. 스트리밍 쪽(WAL 보존용 replication slot, CDC 커넥터)은 PostgreSQL CDC와
+  함께 들어옵니다.
+
 ## v0.1.389
 
 ### 수정 (Fixed)

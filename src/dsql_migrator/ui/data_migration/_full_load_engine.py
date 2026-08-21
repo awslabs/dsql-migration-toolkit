@@ -2399,20 +2399,22 @@ def _log_captured_watermark(
     """
     if watermark is None:
         return
-    # Prefer the GTID (the portable resume coordinate); fall back to binlog file:pos;
-    # else word the absence for the source engine: for a non-MySQL source the watermark
-    # is binlog-less BY DESIGN (CDC deferred), so don't imply a MySQL misconfiguration.
+    # Prefer the GTID (MySQL's portable resume coordinate); then binlog file:pos; then
+    # the PostgreSQL WAL LSN (its resume coordinate); else word the absence for the source
+    # engine (e.g. binary logging off on MySQL, or the LSN unreadable on PostgreSQL).
     if watermark.gtid_executed:
         coord = f"GTID {watermark.gtid_executed}"
     elif watermark.binlog_file:
         coord = f"binlog {watermark.binlog_file}:{watermark.binlog_position}"
+    elif watermark.wal_lsn:
+        coord = f"WAL LSN {watermark.wal_lsn}"
     elif source_type is SourceType.MYSQL:
         coord = "no binlog/GTID coordinate available (binary logging off or restricted)"
     else:
         engine = dialect_for(source_type).engine_display_name
         coord = (
             f"row-count baseline only (Full Load; the WAL/LSN handoff coordinate for a "
-            f"gapless CDC catch-up is not captured yet for a {engine} source)"
+            f"gapless CDC catch-up could not be read for this {engine} source)"
         )
     ts = watermark.snapshot_timestamp.isoformat().replace("+00:00", "Z")
     approx = " (row counts are approximate estimates)" if watermark.row_counts_approximate else ""
@@ -2886,30 +2888,35 @@ class BatchedTableMigrator:
         if source.source_type is not SourceType.MYSQL:
             # A binlog/GTID watermark is a MySQL CDC concept, and the MySQL WatermarkCapturer
             # runs MySQL-only SQL (START TRANSACTION WITH CONSISTENT SNAPSHOT / SHOW MASTER
-            # STATUS) that FAILS on PostgreSQL. PG CDC is deferred, so Full Load proceeds
-            # WITHOUT a binlog watermark -- but still records the scan-free row-count
-            # baseline (dialect-dispatched: pg_class.reltuples for PG).
-            return self._capture_rowcount_only_watermark(source, table_names)
+            # STATUS) that FAILS on PostgreSQL. A non-MySQL source records its OWN resume
+            # coordinate (PostgreSQL: the WAL LSN, via the dialect) plus the scan-free
+            # row-count baseline (dialect-dispatched: pg_class.reltuples for PG).
+            return self._capture_postgres_watermark(source, table_names)
         return self._watermark_capturer.capture(source, table_names)
 
-    def _capture_rowcount_only_watermark(
+    def _capture_postgres_watermark(
         self, source: SourceConnectionConfig, table_names: Sequence[str]
     ) -> Watermark:
-        """A binlog-less watermark carrying only the scan-free row-count baseline.
+        """Watermark for a non-MySQL (PostgreSQL) source: WAL LSN + row-count baseline.
 
-        For a non-MySQL source (PostgreSQL) with CDC deferred: no binlog/GTID
-        coordinate, just the approximate per-table estimate (never a COUNT(*) scan)
-        via the source dialect, so the progress baseline is preserved.
+        Records the dialect's CDC resume coordinate -- for PostgreSQL the WAL ``wal_lsn``
+        (the gapless Full Load -> CDC handoff point, PG's analog of MySQL binlog:pos),
+        captured BEFORE the per-table reader snapshots open so replaying from it is a
+        superset -- plus the approximate per-table estimate (never a COUNT(*) scan) via
+        the source dialect, so the progress baseline is preserved. The LSN is best-effort:
+        None (e.g. insufficient privilege) still yields a valid, loadable watermark.
         """
         dialect = dialect_for(source.source_type)
         engine = make_source_engine_factory(self._inputs.source_password)(source)
         try:
             with engine.connect() as connection:
+                wal_lsn = dialect.capture_resume_lsn(connection)
                 estimates = estimate_source_rows(connection, list(table_names), dialect)
         finally:
             engine.dispose()
         return Watermark(
             snapshot_timestamp=datetime.now(timezone.utc),
+            wal_lsn=wal_lsn,
             # None estimate (never-analyzed / missing) -> 0, matching the MySQL baseline.
             table_row_counts={n: (c or 0) for n, c in estimates.items()},
             row_counts_approximate=True,
