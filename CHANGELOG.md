@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.389
+
+### Fixed
+
+- **PostgreSQL source: Full Load parity polish** (no change for MySQL sources).
+  - **Stalled/failed-over source connections are now detected promptly** without
+    capping a healthy read. MySQL uses a per-socket idle read timeout; the PostgreSQL
+    source now sets TCP keepalives + `tcp_user_timeout` so a dead/stalled/failed-over
+    connection surfaces (and auto-retries) within the read-timeout budget, while a
+    legitimately slow-but-still-streaming page is no longer at risk of being cut by the
+    `statement_timeout` total cap (which remains only as the hung-query backstop).
+  - The **watermark** entry in the activity log no longer says "binary logging off" for
+    a PostgreSQL source (which has no binary logging); it now states the row-count-only
+    baseline is by design for the source engine.
+  - The multiprocess Full Load **shard planner** now evaluates PK-shardability with the
+    source engine's dialect instead of defaulting to MySQL's integer-type set (internal
+    consistency with the authoritative shard-range planner; no user-visible change).
+
 ## v0.1.388
 
 ### Fixed

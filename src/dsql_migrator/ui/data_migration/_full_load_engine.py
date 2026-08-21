@@ -1773,6 +1773,10 @@ def _migrate_tables_in_parallel(
         # plain-INSERT, no CDC) or a non-CDC append has nothing to reconcile it, so such
         # a table must be read by a SINGLE reader (one snapshot = one point-in-time cut).
         _shardable_ok = bool(migrator._inputs.cdc_coexisting)
+        # Resolve the SOURCE dialect so the shardability pre-gate uses the right
+        # integer-PK set (the authoritative plan_pk_shard_ranges below already does);
+        # without it this pre-gate ran under the module-default MySQL dialect.
+        _shard_dialect = dialect_for(migrator._inputs.source_config.source_type)
 
         # Shard count is capped exactly like single-process: cfg.full_load_reader_shards
         # clamped so table_parallelism x shards stays under the source max_connections
@@ -1792,7 +1796,7 @@ def _migrate_tables_in_parallel(
             shardable = (
                 _shardable_ok
                 and not table_is_replace
-                and shardable_leading_int_pk(table) is not None
+                and shardable_leading_int_pk(table, _shard_dialect) is not None
                 and effective_reader_shards > 1
             )
             if not shardable:
@@ -2377,7 +2381,10 @@ def _log_excluded_lob_columns(
             )
 
 
-def _log_captured_watermark(watermark: "Optional[Watermark]") -> None:
+def _log_captured_watermark(
+    watermark: "Optional[Watermark]",
+    source_type: SourceType = SourceType.MYSQL,
+) -> None:
     """Record the Full Load consistency point (watermark) in the activity log.
 
     The watermark pins the exact source position the snapshot reflects and is where a
@@ -2393,13 +2400,20 @@ def _log_captured_watermark(watermark: "Optional[Watermark]") -> None:
     if watermark is None:
         return
     # Prefer the GTID (the portable resume coordinate); fall back to binlog file:pos;
-    # else say it plainly (binary logging may be disabled / SHOW MASTER STATUS blocked).
+    # else word the absence for the source engine: for a non-MySQL source the watermark
+    # is binlog-less BY DESIGN (CDC deferred), so don't imply a MySQL misconfiguration.
     if watermark.gtid_executed:
         coord = f"GTID {watermark.gtid_executed}"
     elif watermark.binlog_file:
         coord = f"binlog {watermark.binlog_file}:{watermark.binlog_position}"
-    else:
+    elif source_type is SourceType.MYSQL:
         coord = "no binlog/GTID coordinate available (binary logging off or restricted)"
+    else:
+        engine = dialect_for(source_type).engine_display_name
+        coord = (
+            f"row-count baseline only (Full Load; the WAL/LSN handoff coordinate for a "
+            f"gapless CDC catch-up is not captured yet for a {engine} source)"
+        )
     ts = watermark.snapshot_timestamp.isoformat().replace("+00:00", "Z")
     approx = " (row counts are approximate estimates)" if watermark.row_counts_approximate else ""
     log_activity(
@@ -2478,7 +2492,11 @@ def run_full_load(
 
     watermark = migrator.capture_watermark(tables)
     handle.update(lambda job: setattr(job, "watermark", watermark))
-    _log_captured_watermark(watermark)
+    # inputs is Optional here; fall back to MySQL when absent (matches the default).
+    _log_captured_watermark(
+        watermark,
+        getattr(getattr(inputs, "source_config", None), "source_type", SourceType.MYSQL),
+    )
 
     # On a "drop & reload" run, drop views that depend on the replaced tables
     # BEFORE the per-table DROP+recreate (a view can span several tables loaded in
@@ -2559,7 +2577,12 @@ def run_full_load_retry(
         handle.update(lambda job: setattr(job, "watermark", watermark))
         # A retry reuses the ORIGINAL watermark (no new snapshot); record which
         # consistency point it resumed against so the audit trail is complete.
-        _log_captured_watermark(watermark)
+        _log_captured_watermark(
+            watermark,
+            getattr(
+                getattr(inputs, "source_config", None), "source_type", SourceType.MYSQL
+            ),
+        )
 
     # Same run-level view pre-drop / recreate as run_full_load, so a retry that
     # DROP+recreates a table whose view dependency blocked the first attempt now

@@ -11937,6 +11937,37 @@ def test_captured_watermark_falls_back_to_binlog_and_flags_approx(monkeypatch) -
     assert "approximate estimates" in entry["detail"]
 
 
+def test_captured_watermark_postgres_wording_is_not_mysql_binlog(monkeypatch) -> None:
+    # A PostgreSQL source captures a binlog-less (row-count-only) watermark BY DESIGN
+    # (CDC deferred); the activity-log wording must NOT imply a MySQL misconfiguration
+    # ("binary logging off"). It states the row-count baseline is expected for the engine.
+    from dsql_migrator.core.models import SourceType, Watermark
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        _engine, "log_activity",
+        lambda category, action, **kw: captured.append({"action": action, **kw}),
+    )
+
+    wm = Watermark(  # binlog-less: exactly what _capture_rowcount_only_watermark returns
+        snapshot_timestamp=datetime(2026, 3, 4, 5, 6, 7, tzinfo=timezone.utc),
+        table_row_counts={"orders": 7, "customers": 3},
+        row_counts_approximate=True,
+    )
+    _engine._log_captured_watermark(wm, SourceType.POSTGRES)
+
+    (entry,) = captured
+    detail = entry["detail"]
+    assert "binary logging" not in detail  # MySQL-flavored wording must not appear
+    assert "PostgreSQL" in detail
+    assert "row-count baseline only" in detail
+    # MySQL default keeps its original wording (regression guard).
+    captured.clear()
+    _engine._log_captured_watermark(wm, SourceType.MYSQL)
+    assert "binary logging off or restricted" in captured[0]["detail"]
+
+
 def test_captured_watermark_none_is_noop(monkeypatch) -> None:
     from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 

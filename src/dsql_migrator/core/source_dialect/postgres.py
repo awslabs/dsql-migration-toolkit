@@ -135,12 +135,34 @@ class PostgresSourceDialect(SourceDialect):
         options = (
             "-c timezone=UTC -c datestyle=ISO -c intervalstyle=postgres -c lc_numeric=C"
         )
-        if read_timeout_seconds is not None:
-            options += f" -c statement_timeout={int(read_timeout_seconds) * 1000}"
         connect_args: dict[str, object] = {
             "connect_timeout": SOURCE_CONNECT_TIMEOUT_SECONDS,
             "options": options,
         }
+        if read_timeout_seconds is not None:
+            timeout = int(read_timeout_seconds)
+            # MySQL's read timeout is a per-socket IDLE timeout: it fails a STALLED read
+            # (a page that stops delivering rows / a dropped or failed-over connection)
+            # WITHOUT capping a healthy page that keeps streaming. PostgreSQL has no
+            # per-statement idle timeout, so match the intent with two libpq mechanisms:
+            #   - TCP keepalives + tcp_user_timeout detect a dead/stalled/failed-over
+            #     connection (unACKed data) within ~the budget -> a class-08 connection
+            #     error the dialect classifies transient -> the table auto-retries. These
+            #     do NOT fire while a page is actively streaming (data keeps getting
+            #     ACKed), so a legitimately slow-but-progressing page is never killed --
+            #     unlike a bare statement_timeout, which is a TOTAL per-statement cap.
+            #   - statement_timeout stays as the backstop for a hung-but-alive query
+            #     (server executing, delivering nothing): it fires SQLSTATE 57014, also
+            #     classified transient (see _PG_TRANSIENT_SQLSTATES) so the table retries.
+            options += f" -c statement_timeout={timeout * 1000}"
+            connect_args["options"] = options
+            connect_args["keepalives"] = 1
+            connect_args["keepalives_idle"] = max(1, timeout // 3)
+            connect_args["keepalives_interval"] = max(1, timeout // 6)
+            connect_args["keepalives_count"] = 3
+            # tcp_user_timeout is milliseconds; no-op on platforms without TCP_USER_TIMEOUT
+            # (e.g. macOS) and on Unix-domain sockets, effective on the Linux deploy target.
+            connect_args["tcp_user_timeout"] = timeout * 1000
         return {"pool_pre_ping": True, "connect_args": connect_args}
 
     def enrich(

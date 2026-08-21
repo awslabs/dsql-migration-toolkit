@@ -98,8 +98,21 @@ def test_postgres_dialect_engine_kwargs_pin_utc_and_optional_statement_timeout()
     assert "-c intervalstyle=postgres" in opts
     assert "-c lc_numeric=C" in opts
     assert "connect_timeout" in base["connect_args"]
+    # No read timeout -> no per-statement cap and no keepalive tuning (zero overhead).
+    assert "statement_timeout" not in base["connect_args"]["options"]
+    assert "keepalives" not in base["connect_args"]
+    assert "tcp_user_timeout" not in base["connect_args"]
     timed = d.engine_kwargs(read_timeout_seconds=30)
-    assert "statement_timeout=30000" in timed["connect_args"]["options"]
+    ca = timed["connect_args"]
+    # statement_timeout is the hung-but-alive-query backstop (-> 57014, transient) ...
+    assert "statement_timeout=30000" in ca["options"]
+    # ... and TCP keepalives + tcp_user_timeout detect a dead/stalled/failed-over
+    # connection (-> class 08, transient) WITHOUT capping a healthy streaming page --
+    # the idle-timeout semantics MySQL's socket read_timeout has (tcp_user_timeout in ms).
+    assert ca["keepalives"] == 1
+    assert ca["keepalives_idle"] == 10 and ca["keepalives_interval"] == 5
+    assert ca["keepalives_count"] == 3
+    assert ca["tcp_user_timeout"] == 30000
 
 
 def test_postgres_dialect_enrich_noops_on_non_pg_connection() -> None:
