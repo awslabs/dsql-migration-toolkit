@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.391
+
+### Changed
+
+- **PostgreSQL source: the "unsupported type" Schema Conversion warning now names the
+  faithful remodel target for each type** instead of a generic "remodel to a supported
+  type". For a DSQL-unsupported PostgreSQL column type it tells you what to store it as:
+  an array → **jsonb** (or a child table); inet/cidr/macaddr/xml/tsvector/bit → **text**;
+  money → **numeric**; a range → **text** (or lower/upper-bound columns); pgvector →
+  jsonb/text; a user-defined enum → text; a composite → separate columns or jsonb. The
+  type is still not auto-converted (the application must adapt to the new type), so the
+  column is surfaced for you to remodel deliberately — no silent substitution, and
+  deliberately not a blanket `bytea` (which only fits a genuinely binary type).
+
 ## v0.1.390
 
 ### Added

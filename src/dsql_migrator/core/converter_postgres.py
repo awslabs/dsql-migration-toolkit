@@ -95,23 +95,67 @@ def normalize_pg_base_type(pg_type: str) -> str:
     return " ".join(_TYPE_MODIFIER_RE.sub("", pg_type).lower().split())
 
 
+# The FAITHFUL DSQL remodel target per unsupported PostgreSQL type family, appended to
+# the warning so the operator knows WHAT to use instead -- not just "unsupported".
+# Chosen for round-trip fidelity, NOT a blanket bytea: a type with a canonical text form
+# -> text; a currency -> numeric; an array -> jsonb (queryable) or a child table. bytea
+# is only natural for a genuinely binary type (e.g. spatial WKB), so it is not used as a
+# general fallback here. The column type still changes, so the application must adapt --
+# hence a warning to remodel deliberately rather than a silent auto-substitution.
+_PG_UNSUPPORTED_REMODEL = {
+    "inet": "text (its canonical address string round-trips losslessly)",
+    "cidr": "text (its canonical address string round-trips losslessly)",
+    "macaddr": "text",
+    "macaddr8": "text",
+    "xml": "text",
+    "money": "numeric (preserves the exact amount; avoid locale-formatted text)",
+    "bit": "text (the bit string, e.g. '10101010') or bytea",
+    "bit varying": "text (the bit string) or bytea",
+    "varbit": "text (the bit string) or bytea",
+    "tsvector": "text",
+    "tsquery": "text",
+    "point": "text, or separate numeric columns for the coordinates",
+    "line": "text",
+    "lseg": "text",
+    "box": "text",
+    "path": "text",
+    "polygon": "text",
+    "circle": "text",
+    "vector": "jsonb or text (pgvector is an extension Aurora DSQL does not provide)",
+}
+
+# Range / multirange types (int4range, tsrange, ... and the PG14+ multirange variants):
+# their canonical text form round-trips, or split into lower/upper bound columns.
+_PG_RANGE_TYPES = frozenset(
+    {
+        "int4range", "int8range", "numrange", "tsrange", "tstzrange", "daterange",
+        "int4multirange", "int8multirange", "nummultirange", "tsmultirange",
+        "tstzmultirange", "datemultirange",
+    }
+)
+
+
 def unsupported_dsql_reason(pg_type: Optional[str]) -> Optional[str]:
     """Return why a PostgreSQL column type is unsupported on Aurora DSQL, else ``None``.
 
     Arrays (any ``...[]``) are unsupported as column types; otherwise a base type outside
     DSQL's documented supported set (geometric, network, xml, money, bit, enum/composite/
-    range, pgvector, ...) is unsupported. Returns a human-readable reason for a warning,
-    or ``None`` when the type is DSQL-supported (int/bigint/numeric/text/varchar/uuid/
-    json[b]/bytea/boolean/date-time/interval). PG->DSQL is otherwise near-identity, so
-    supported types pass through verbatim.
+    range, pgvector, ...) is unsupported. Returns a human-readable reason that names the
+    FAITHFUL remodel target for the type (e.g. array -> jsonb, inet -> text, money ->
+    numeric) so the operator knows what to change it to -- or ``None`` when the type is
+    DSQL-supported (int/bigint/numeric/text/varchar/uuid/json[b]/bytea/boolean/date-time/
+    interval). PG->DSQL is otherwise near-identity, so supported types pass through
+    verbatim. The column is NOT auto-substituted (the app must adapt to the new type);
+    the user remodels deliberately -- Property 6 (no silent loss / no silent degradation).
     """
     if not pg_type:
         return None
     if "[]" in pg_type:
         return (
             f"Aurora DSQL does not support array column types ('{pg_type}'). Store the "
-            "data relationally in a child table keyed by this row's primary key, or as "
-            "json/jsonb/text, and adapt the application before migrating this column."
+            "array as jsonb (queryable with the JSON operators) or in a child table keyed "
+            "by this row's primary key, and adapt the application before migrating this "
+            "column."
         )
     base = normalize_pg_base_type(pg_type)
     # interval[fields][(p)] is supported (dsql_lint: 0 errors). format_type spells the
@@ -119,13 +163,29 @@ def unsupported_dsql_reason(pg_type: Optional[str]) -> Optional[str]:
     # allowlist can't capture them -- match on the leading token instead.
     if base == "interval" or base.startswith("interval "):
         return None
-    if base not in _DSQL_SUPPORTED_PG_BASE_TYPES:
+    if base in _DSQL_SUPPORTED_PG_BASE_TYPES:
+        return None
+    if base in _PG_RANGE_TYPES:
+        target = (
+            "text (its canonical form, e.g. '[1,5)'), or two columns for the lower and "
+            "upper bounds"
+        )
+    else:
+        target = _PG_UNSUPPORTED_REMODEL.get(base)
+    if target is not None:
         return (
             f"Aurora DSQL does not support the PostgreSQL type '{pg_type}' as a column "
-            "type. Remodel the column to a DSQL-supported type (see the Aurora DSQL "
-            "supported data types) before migrating."
+            f"type. Store it as {target}, and adapt the application before migrating this "
+            "column."
         )
-    return None
+    # Fallback for user-defined types (enum / composite / domain) whose NAME format_type
+    # returns verbatim, and any type not individually mapped.
+    return (
+        f"Aurora DSQL does not support the PostgreSQL type '{pg_type}' as a column type. "
+        "Remodel the column to a DSQL-supported type (a PostgreSQL enum -> text; a "
+        "composite type -> separate columns or jsonb; see the Aurora DSQL supported data "
+        "types) before migrating."
+    )
 
 
 def build_pg_source_ddl(table: TableDef) -> str:

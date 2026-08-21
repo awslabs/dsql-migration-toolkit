@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.391
+
+### 변경 (Changed)
+
+- **PostgreSQL 소스: "미지원 타입" 스키마 변환 경고가 이제 타입별로 무엇으로 리모델할지
+  구체적으로 알려줍니다** (기존의 일반적인 "지원 타입으로 리모델하라" 대신). DSQL가 지원하지
+  않는 PostgreSQL 컬럼 타입에 대해 무엇으로 저장할지 안내합니다: 배열 → **jsonb**(또는 자식
+  테이블); inet/cidr/macaddr/xml/tsvector/bit → **text**; money → **numeric**; range →
+  **text**(또는 하한/상한 컬럼); pgvector → jsonb/text; 사용자 정의 enum → text; composite →
+  개별 컬럼 또는 jsonb. 타입은 여전히 **자동 변환하지 않으며**(앱이 새 타입에 맞춰 바뀌어야
+  하므로) 사용자가 의도적으로 리모델하도록 표면화합니다 — 조용한 치환 없음, 그리고 (진짜
+  바이너리 타입에만 맞는) 무분별한 `bytea` 폴백도 의도적으로 쓰지 않습니다.
+
 ## v0.1.390
 
 ### 추가 (Added)

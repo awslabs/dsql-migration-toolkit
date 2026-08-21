@@ -138,6 +138,30 @@ def test_unsupported_dsql_reason_handles_empty() -> None:
     assert unsupported_dsql_reason("") is None
 
 
+def test_unsupported_reason_names_the_faithful_remodel_target() -> None:
+    # Option (a): the warning names WHAT to remodel each unsupported type to (the faithful
+    # DSQL target), not a blanket "unsupported" -- and NOT a blanket bytea. No auto-substitution.
+    assert "jsonb" in unsupported_dsql_reason("text[]").lower()  # array -> jsonb/child table
+    assert "text" in unsupported_dsql_reason("inet").lower()
+    assert "text" in unsupported_dsql_reason("cidr").lower()
+    assert "text" in unsupported_dsql_reason("xml").lower()
+    assert "numeric" in unsupported_dsql_reason("money").lower()  # currency -> numeric
+    assert "text" in unsupported_dsql_reason("bit(8)").lower()
+    assert "text" in unsupported_dsql_reason("tsvector").lower()
+    assert "text" in unsupported_dsql_reason("point").lower()  # geometric -> text/numeric cols
+    r_range = unsupported_dsql_reason("int4range").lower()
+    assert "text" in r_range and ("bound" in r_range or "[1,5)" in r_range)
+    r_vec = unsupported_dsql_reason("vector(3)").lower()
+    assert "jsonb" in r_vec or "text" in r_vec
+    # A user-defined enum/composite NAME (format_type returns it verbatim) -> generic
+    # remodel guidance that still names concrete targets (enum -> text, composite -> cols).
+    enum_reason = unsupported_dsql_reason("mood").lower()
+    assert "mood" in enum_reason and ("enum" in enum_reason or "remodel" in enum_reason)
+    # bytea is NOT used as a general fallback (only mentioned as a secondary option for bit).
+    assert "bytea" not in unsupported_dsql_reason("inet").lower()
+    assert "bytea" not in unsupported_dsql_reason("money").lower()
+
+
 def test_convert_table_warns_on_array_column_for_pg_source() -> None:
     # A PostgreSQL-source table with a text[] column must convert (DDL faithful to the
     # source, since v1 does not auto-substitute) AND carry an UNSUPPORTED warning naming
