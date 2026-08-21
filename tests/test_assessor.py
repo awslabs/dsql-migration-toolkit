@@ -489,12 +489,14 @@ def test_default_rules_source_type_seam() -> None:
     assert [type(r).__name__ for r in default_rules(SourceType.MYSQL)] == [
         type(r).__name__ for r in default_rules()
     ]
-    # PostgreSQL returns its own (source-neutral structural) rule set: a proper subset
-    # of the MySQL rule ids -- it drops the MySQL type/feature rules (detailed
-    # assertions live in tests/test_assessor_postgres.py).
+    # PostgreSQL has ONE PG-specific rule (DSQL-unsupported column types); the REST are the
+    # shared source-neutral structural rules -- a proper subset of the MySQL ids (PG drops
+    # the MySQL type/feature rules). Detailed assertions in tests/test_assessor_postgres.py.
     pg_ids = {r.rule_id for r in default_rules(SourceType.POSTGRES)}
     mysql_ids = {r.rule_id for r in default_rules(SourceType.MYSQL)}
-    assert pg_ids and pg_ids < mysql_ids
+    assert "PG_UNSUPPORTED_TYPE" in pg_ids
+    assert (pg_ids - {"PG_UNSUPPORTED_TYPE"}) < mysql_ids  # rest are shared structural
+    assert "ENUM_SET_TYPE" not in pg_ids  # MySQL type rules never run for PG
 
 
 def test_default_rules_contains_all_documented_rule_ids() -> None:

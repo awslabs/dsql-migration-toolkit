@@ -18,17 +18,70 @@ index types, DECIMAL-precision parsed from a MySQL type), the MySQL-binlog CDC c
 rule (its guidance is entirely MySQL/Debezium-framed; PostgreSQL CDC is deferred), and
 the view rule (its linter targets MySQL application-query anti-patterns).
 
-PostgreSQL-specific TYPE / view / index rules (DSQL-unsupported PG types, identity/serial
-notes, GIN/GiST/BRIN index methods) are a later refinement, and stored
-trigger/function/event flagging depends on PostgreSQL-catalog enrichment (also later).
+The DSQL-unsupported PostgreSQL TYPE rule IS included (``UnsupportedPostgresTypeRule``,
+below) so Evaluation flags an unsupported column type the same as Schema Conversion does.
+The remaining PG-specific refinements -- identity/serial notes and GIN/GiST/BRIN index
+methods -- and stored trigger/function/event flagging (which depends on PostgreSQL-catalog
+enrichment) are still later refinements.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from dsql_migrator.core.assessor import KIND_TABLE, Finding, ObjectKey, Rule
+from dsql_migrator.core.models import Classification, EffortLevel
+
 if TYPE_CHECKING:
-    from dsql_migrator.core.assessor import Rule
+    from dsql_migrator.core.models import SourceInventory
+
+
+class UnsupportedPostgresTypeRule(Rule):
+    """Flag columns whose PostgreSQL type Aurora DSQL does not support as a column type.
+
+    Surfaces at Evaluation (Step 1) the SAME DSQL-unsupported PG column types the Schema
+    Conversion step warns about via ``unsupported_dsql_reason`` (arrays, geometric,
+    network, xml, money, bit, range, tsvector, enum/composite, pgvector). Without it a
+    table using such a type reads AUTO at Evaluation and the problem only appears at
+    Schema Conversion. Reuses that single source of truth so the two steps never drift.
+    PostgreSQL-source only.
+    """
+
+    rule_id = "PG_UNSUPPORTED_TYPE"
+
+    def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
+        from dsql_migrator.core.converter_postgres import unsupported_dsql_reason
+
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            bad = [
+                (col.name, col.mysql_type)
+                for col in table.columns
+                if unsupported_dsql_reason(col.mysql_type) is not None
+            ]
+            if not bad:
+                continue
+            cols = ", ".join(f"{name} ({typ})" for name, typ in bad)
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, table.name),
+                    rule_id=self.rule_id,
+                    classification=Classification.UNSUPPORTED,
+                    risk=(
+                        f"Column(s) {cols} use PostgreSQL types Aurora DSQL does not "
+                        "support as column types, so this table's CREATE would be "
+                        "rejected as-is."
+                    ),
+                    recommendation=(
+                        "Remodel each to a DSQL-supported type before migrating; Schema "
+                        "Conversion names the target per type (array -> jsonb or a child "
+                        "table; inet/cidr/xml/tsvector/bit -> text; money -> numeric; "
+                        "range -> text; enum -> text; composite -> columns or jsonb)."
+                    ),
+                    effort=EffortLevel.MEDIUM,
+                )
+            )
+        return findings
 
 
 def default_rules() -> "list[Rule]":
@@ -53,6 +106,9 @@ def default_rules() -> "list[Rule]":
     )
 
     return [
+        # PG-specific: DSQL-unsupported column types (the only UNSUPPORTED-level rule here;
+        # first so it is prominent, though severity ordering already makes it win ties).
+        UnsupportedPostgresTypeRule(),
         ForeignKeyRule(),
         CheckConstraintRule(),
         TriggerRule(),

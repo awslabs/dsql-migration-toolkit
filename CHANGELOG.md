@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.392
+
+### Changed
+
+- **PostgreSQL source: Evaluation now flags DSQL-unsupported column types too** (not just
+  Schema Conversion). A PostgreSQL column whose type Aurora DSQL does not support as a
+  column type — array, geometric, network (inet/cidr/macaddr), xml, money, bit, range,
+  tsvector, enum/composite, pgvector — is now surfaced as **Unsupported** in the
+  Evaluation report, with the same faithful remodel target the Schema Conversion warning
+  names (array → jsonb, inet/xml → text, money → numeric, …). Previously such a table read
+  as "Automatic" at Evaluation and the problem only appeared at Schema Conversion. Both
+  steps share one source of truth so they never disagree. No change for MySQL sources.
+
 ## v0.1.391
 
 ### Changed

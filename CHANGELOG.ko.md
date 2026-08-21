@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.392
+
+### 변경 (Changed)
+
+- **PostgreSQL 소스: 이제 Evaluation에서도 DSQL 미지원 컬럼 타입을 flag합니다**(Schema
+  Conversion뿐 아니라). Aurora DSQL이 컬럼 타입으로 지원하지 않는 PostgreSQL 타입 — 배열,
+  geometric, network(inet/cidr/macaddr), xml, money, bit, range, tsvector, enum/composite,
+  pgvector — 이 있는 컬럼은 이제 Evaluation 리포트에서 **Unsupported**로 표면화되며, Schema
+  Conversion 경고와 동일한 권장 리모델 대상(배열 → jsonb, inet/xml → text, money → numeric …)을
+  안내합니다. 이전에는 그런 테이블이 Evaluation에서 "Automatic"으로 보이고 문제는 Schema
+  Conversion에서야 나타났습니다. 두 단계가 하나의 소스(`unsupported_dsql_reason`)를 공유해 서로
+  어긋나지 않습니다. MySQL 소스는 동작 변화 없음.
+
 ## v0.1.391
 
 ### 변경 (Changed)

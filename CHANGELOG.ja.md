@@ -5,6 +5,19 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.392
+
+### 変更 (Changed)
+
+- **PostgreSQL ソース: Evaluation でも DSQL 未サポートの列型を検出するようになりました**
+  (Schema Conversion だけでなく)。Aurora DSQL が列型としてサポートしない PostgreSQL 型 —
+  配列、geometric、network(inet/cidr/macaddr)、xml、money、bit、range、tsvector、
+  enum/composite、pgvector — を持つ列は、Evaluation レポートで **Unsupported** として顕在化し、
+  Schema Conversion の警告と同じ推奨リモデル先(配列 → jsonb、inet/xml → text、money → numeric
+  …)を示します。従来はそのようなテーブルが Evaluation では「Automatic」と表示され、問題は
+  Schema Conversion で初めて現れていました。両ステップは単一の情報源(`unsupported_dsql_reason`)
+  を共有するため食い違いません。MySQL ソースの挙動は変わりません。
+
 ## v0.1.391
 
 ### 変更 (Changed)
