@@ -38,7 +38,7 @@ from dsql_migrator.core.assessment_strategist import (
     build_general_chat_system,
 )
 from dsql_migrator.core.job_manager import JobManager
-from dsql_migrator.core.models import MigrationContext
+from dsql_migrator.core.models import MigrationContext, SourceType
 from dsql_migrator.ui.connect import build_connect_page
 from dsql_migrator.ui.data_migration import (
     DataMigrationStore,
@@ -431,7 +431,12 @@ def build_page(
         sc = getattr(st, "source_config", None)
         if sc is not None:
             ver = getattr(st, "source_server_version", None)
-            src = f"Source: MySQL at {sc.host}"
+            _eng = (
+                "PostgreSQL"
+                if getattr(sc, "source_type", None) is SourceType.POSTGRES
+                else "MySQL"
+            )
+            src = f"Source: {_eng} at {sc.host}"
             if getattr(sc, "database", None):
                 src += f" (db {sc.database})"
             if ver:
@@ -564,7 +569,11 @@ def build_page(
                         {"status": "not_run",
                          "message": "Run Evaluation (Step 1) first to read the source schema."}
                     )
-                _res = SchemaConverter().convert(_inv, SchemaConvertOptions())
+                _sc = getattr(SESSION_STORE.get_or_create(session_id), "source_config", None)
+                _stype = _sc.source_type if _sc is not None else SourceType.MYSQL
+                _res = SchemaConverter(source_type=_stype).convert(
+                    _inv, SchemaConvertOptions()
+                )
                 _pv = generate_previews(
                     [f"{TABLE_PREFIX}{_obj}", f"{VIEW_PREFIX}{_obj}"],
                     _inv, _res, existence_checker=None,

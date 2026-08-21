@@ -102,6 +102,7 @@ from dsql_migrator.core.models import (
     PrerequisiteResult,
     PrerequisiteStatus,
     SourceInventory,
+    SourceType,
     StepStatus,
     TableSelection,
     TargetInventory,
@@ -408,7 +409,9 @@ def build_data_migration_screen(
         target_config = session.target_config
         assert source_config is not None  # guaranteed by has_source()
         assert target_config is not None  # guaranteed by has_target()
-        _conversion = SchemaConverter().convert(inventory)
+        _conversion = SchemaConverter(
+            source_type=source_config.source_type
+        ).convert(inventory)
         inputs = DataMigrationInputs(
             source_config=source_config,
             source_password=session.source_password,
@@ -567,8 +570,14 @@ def build_data_migration_screen(
         # match the target -- no sink change. Recompute from the applied conversion
         # each render and store it on the state for the CDC start path to read.
         if inventory is not None and inventory.tables:
+            _stype = (
+                session.source_config.source_type
+                if session.source_config is not None
+                else SourceType.MYSQL
+            )
             _applied = applied_table_conversions(
-                SchemaConverter().convert(inventory), conv_state.edited_target_ddls
+                SchemaConverter(source_type=_stype).convert(inventory),
+                conv_state.edited_target_ddls,
             )
             migration_state.set_cdc_message_key_columns(
                 composite_key_columns_for_cdc(inventory.tables, _applied)
@@ -1151,7 +1160,9 @@ def build_data_migration_screen(
                     if retry_cdc_coexisting
                     else frozenset(migration_state.replace_targets) & set(names)
                 )
-                _retry_conversion = SchemaConverter().convert(inventory)
+                _retry_conversion = SchemaConverter(
+                    source_type=source_config.source_type
+                ).convert(inventory)
                 retry_inputs = DataMigrationInputs(
                     source_config=source_config,
                     source_password=session.source_password,
@@ -1626,7 +1637,13 @@ def build_data_migration_screen(
                                 selected_names,
                                 table_conversions=(
                                     applied_table_conversions(
-                                        SchemaConverter().convert(inventory),
+                                        SchemaConverter(
+                                            source_type=(
+                                                session.source_config.source_type
+                                                if session.source_config is not None
+                                                else SourceType.MYSQL
+                                            )
+                                        ).convert(inventory),
                                         conv_state.edited_target_ddls,
                                     )
                                     if inventory is not None

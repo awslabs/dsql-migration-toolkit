@@ -5,6 +5,19 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.386
+
+### 追加 (Added)
+
+- **MySQL だけでなく PostgreSQL からも移行できるようになりました。** 接続(Connect)画面の先頭に
+  **ソースエンジン**の選択が追加され、**MySQL** または **PostgreSQL** を選べます。これにより RDS /
+  Aurora **PostgreSQL** データベースも(従来の RDS / Aurora MySQL に加えて)Aurora DSQL へ移行でき
+  ます。ソースが Aurora か RDS かは引き続きエンドポイントから自動判定され、ポートの既定値もエンジンに
+  合わせて切り替わります(MySQL は 3306、PostgreSQL は 5432)。概要ダイアグラムのソース表記もそれに
+  従います(例: 「Aurora PostgreSQL」)。PostgreSQL のサポート範囲は**評価・スキーマ変換・フルロード・
+  検証**で、PostgreSQL ソースの**変更データキャプチャ(CDC)はまだ利用できません**(現時点では CDC は
+  MySQL 専用)。
+
 ## v0.1.380
 
 ### 変更 (Changed)

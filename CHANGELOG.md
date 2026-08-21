@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.386
+
+### Added
+
+- **Migrate from PostgreSQL, not just MySQL.** The Connect screen now opens with a
+  **Source engine** picker — choose **MySQL** or **PostgreSQL** — so you can migrate an
+  RDS / Aurora **PostgreSQL** database to Aurora DSQL, in addition to RDS / Aurora MySQL.
+  Whether the source is Aurora or RDS is still auto-detected from the endpoint, and the
+  port default follows the engine (3306 for MySQL, 5432 for PostgreSQL). The overview
+  diagram labels the source accordingly (e.g. "Aurora PostgreSQL"). PostgreSQL support
+  covers **Evaluation, Schema Conversion, Full Load, and Validation**; change-data-capture
+  (CDC) from a PostgreSQL source is not yet available (it remains MySQL-only for now).
+
 ## v0.1.380
 
 ### Changed

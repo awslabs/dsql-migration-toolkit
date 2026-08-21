@@ -29,7 +29,12 @@ import os
 import re
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
-from dsql_migrator.core.models import MigrationContext, StepStatus, WorkflowState
+from dsql_migrator.core.models import (
+    MigrationContext,
+    SourceType,
+    StepStatus,
+    WorkflowState,
+)
 from dsql_migrator.ui.ai_panel import AiPanelHandle, build_ai_panel
 from dsql_migrator.ui.design import (
     CODE_TEXT_CLASSES,
@@ -395,24 +400,39 @@ class DiagramNode:
 _AURORA_VERSION_MARKER = ".mysql_aurora."
 # A clean community version like ``8.0.42`` (used to prefer the full MySQL patch).
 _SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+")
+# The engine word shown across the source node (label/title/placeholder), defined once
+# so every surface stays in sync when a second source engine is added.
+_SOURCE_ENGINE_WORD = {SourceType.MYSQL: "MySQL", SourceType.POSTGRES: "PostgreSQL"}
 
 
 def format_source_engine(
     version: Optional[str],
     engine_version: Optional[str] = None,
     aurora_version: Optional[str] = None,
+    *,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> Optional[str]:
     """Format the source engine label from the captured version strings.
 
-    ``engine_version`` is the clean base-engine patch (MySQL ``@@innodb_version``).
-    Prefers the explicit Aurora engine version (``@@aurora_version``, e.g.
-    ``3.07.1``) when present -- newer Aurora MySQL reports only the
-    MySQL-compatible patch in ``VERSION()`` so the Aurora tag may be absent
-    there. Otherwise falls back to the Aurora tag embedded in ``VERSION()``
-    (``8.0.mysql_aurora.3.10.4``). Plain MySQL is shown as ``MySQL 8.0.35``.
-    Returns ``None`` when no version was captured. (MySQL-labeled today; PostgreSQL
-    labeling arrives with the Phase-3 engine selector.)
+    ``engine_version`` is the clean base-engine patch (MySQL ``@@innodb_version`` /
+    PostgreSQL ``server_version``). For MySQL: prefers the explicit Aurora engine
+    version (``@@aurora_version``, e.g. ``3.07.1``) when present -- newer Aurora MySQL
+    reports only the MySQL-compatible patch in ``VERSION()`` so the Aurora tag may be
+    absent there -- otherwise the Aurora tag embedded in ``VERSION()``
+    (``8.0.mysql_aurora.3.10.4``); plain MySQL is ``MySQL 8.0.35``. For PostgreSQL the
+    version shapes differ (``server_version`` is a clean ``16.4``, ``version()`` a verbose
+    banner, ``aurora_version()`` the Aurora-PG version), so it renders from those. Returns
+    ``None`` when no version was captured.
     """
+    if source_type is SourceType.POSTGRES:
+        # PG: prefer the Aurora-PG version, else the clean server_version (engine_version),
+        # else the verbose version() banner as-is. No ``.mysql_aurora.`` marker exists.
+        if aurora_version:
+            suffix = f" (PostgreSQL {engine_version})" if engine_version else ""
+            return f"Aurora PostgreSQL {aurora_version}{suffix}"
+        if engine_version:
+            return f"PostgreSQL {engine_version}"
+        return f"PostgreSQL {version}" if version else None
     if aurora_version:
         base = version.split(_AURORA_VERSION_MARKER)[0] if version else None
         mysql = engine_version or base
@@ -436,25 +456,29 @@ def _source_engine_title(
     version: Optional[str],
     host: Optional[str],
     aurora_version: Optional[str] = None,
+    *,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> str:
     """Classify the source engine for the diagram title.
 
-    Aurora MySQL is detected by ``@@aurora_version``, the ``.mysql_aurora.``
-    version marker, or a ``.cluster-`` Aurora cluster endpoint host. A non-Aurora
-    ``.rds.amazonaws.com`` host is RDS MySQL; a plain community version is native
-    ``MySQL``. Falls back to the generic ``Source MySQL`` when undetermined.
+    Aurora is detected by ``@@aurora_version``/``aurora_version()``, the (MySQL-only)
+    ``.mysql_aurora.`` version marker, or a ``.cluster-`` Aurora cluster endpoint host. A
+    non-Aurora ``.rds.amazonaws.com`` host is RDS; a plain community version is native;
+    the fallback is the generic ``Source <engine>``. The engine WORD (MySQL/PostgreSQL)
+    comes from ``source_type``.
     """
+    word = _SOURCE_ENGINE_WORD[source_type]
     if (
         aurora_version
         or (version and _AURORA_VERSION_MARKER in version)
         or (host and ".cluster-" in host)
     ):
-        return "Aurora MySQL"
+        return f"Aurora {word}"
     if host and host.endswith(".rds.amazonaws.com"):
-        return "RDS MySQL"
+        return f"RDS {word}"
     if version:
-        return "MySQL"
-    return "Source MySQL"
+        return word
+    return f"Source {word}"
 
 
 def _aws_region_from_host(host: Optional[str]) -> Optional[str]:
@@ -611,6 +635,11 @@ def build_migration_diagram(
     unit-testable.
     """
     source_config = getattr(state, "source_config", None)
+    # Source engine word for the node label/title/placeholder (MySQL/PostgreSQL);
+    # unknown (no source_config, e.g. a fresh/resumed session) defaults to MySQL so
+    # existing MySQL flows render byte-identically.
+    source_type = getattr(source_config, "source_type", SourceType.MYSQL)
+    source_word = _SOURCE_ENGINE_WORD.get(source_type, "MySQL")
     target_config = getattr(state, "target_config", None)
     source_verified = bool(getattr(state, "source_verified", False))
     target_verified = bool(getattr(state, "target_verified", False))
@@ -629,7 +658,7 @@ def build_migration_diagram(
         database = getattr(source_config, "database", None)
         # Mirror the target: the cluster/instance name is the primary line and
         # the full endpoint (host) is shown small as a labeled detail.
-        source_subtitle = (host.split(".", 1)[0] if host else "") or "Source MySQL"
+        source_subtitle = (host.split(".", 1)[0] if host else "") or f"Source {source_word}"
         server_version = getattr(state, "source_server_version", None)
         aurora_version = getattr(state, "source_aurora_version", None)
         instance_class = getattr(state, "source_instance_class", None)
@@ -638,6 +667,7 @@ def build_migration_diagram(
             server_version,
             getattr(state, "source_engine_version", None),
             aurora_version,
+            source_type=source_type,
         )
         # (icon, labeled text) pairs; each on its own line so nothing is cut off.
         source_details = tuple(
@@ -652,11 +682,13 @@ def build_migration_diagram(
             )
             if pair is not None
         )
-        source_title = _source_engine_title(server_version, host, aurora_version)
+        source_title = _source_engine_title(
+            server_version, host, aurora_version, source_type=source_type
+        )
     else:
-        source_subtitle = "RDS / Aurora MySQL"
+        source_subtitle = f"RDS / Aurora {source_word}"
         source_details = ()
-        source_title = "Source MySQL"
+        source_title = f"Source {source_word}"
         source_region = None
     # Source credentials/config are never persisted (Property 7), so on a resume
     # the source node has no remembered details -- only the "Reconnect to resume"

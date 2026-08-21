@@ -59,6 +59,7 @@ from dsql_migrator.core.target_connection import DsqlConnector
 from dsql_migrator.ui.design import (
     INLINE_HINT_TEXT,
     inline_hint,
+    radio_tiles,
     render_notice,
     section_header,
 )
@@ -714,28 +715,86 @@ def build_connect_page(
                         on_change=on_profile_change,
                     ).classes("w-full")
 
-        # --- Source: RDS / Aurora MySQL -----------------------------------
+        # --- Source engine: which database engine to migrate FROM ----------
+        # Chosen ABOVE the source card because it drives the port default, the
+        # Database-field guidance, and the source dialect (MySQL vs PostgreSQL).
+        # Aurora-vs-RDS is NOT a choice here -- it is auto-detected from the
+        # endpoint/version (infer, don't ask).
+        _engine = {
+            "type": getattr(state.source_config, "source_type", SourceType.MYSQL)
+        }
+
+        def _db_field_hint(source_type: SourceType) -> str:
+            if source_type is SourceType.POSTGRES:
+                return (
+                    'hint="PostgreSQL connects to ONE database -- enter its name '
+                    "(blank uses the role's default database).\""
+                )
+            return (
+                'hint="Empty assesses the whole cluster; set it to scope to a '
+                'single database."'
+            )
+
+        def on_engine_change(value: str) -> None:
+            new_type = SourceType(value)
+            if new_type is _engine["type"]:
+                return  # radio_tiles fires on re-select too; ignore a no-op
+            old_default = dialect_for(_engine["type"]).default_port
+            _engine["type"] = new_type
+            # Move the port to the new engine's default UNLESS the user typed a custom
+            # one (mirror on_endpoint_change's don't-clobber guard).
+            if int(source_port.value or 0) == old_default:
+                source_port.set_value(dialect_for(new_type).default_port)
+            # Remove-then-add so the new hint REPLACES the old one (a bare
+            # ``.props('hint=...')`` can leave the previous hint alongside the new).
+            source_database.props(remove="hint")
+            source_database.props(_db_field_hint(new_type))
+            invalidate_source()  # a different source engine invalidates any prior test
+            # radio_tiles renders the selected styling from its `selected` arg, so
+            # re-render the tiles to reflect the new choice (the Connect form has no
+            # refreshable of its own; this local one keeps the selection in sync).
+            _engine_tiles.refresh()
+
+        with ui.card().classes("w-full"):
+            _section_header("dns", "Source engine", None)
+
+            @ui.refreshable
+            def _engine_tiles() -> None:
+                radio_tiles(
+                    ui,
+                    [
+                        ("mysql", "storage", "MySQL",
+                         "Migrate from RDS / Aurora MySQL."),
+                        ("postgres", "storage", "PostgreSQL",
+                         "Migrate from RDS / Aurora PostgreSQL."),
+                    ],
+                    selected=_engine["type"].value,
+                    on_select=on_engine_change,
+                )
+
+            _engine_tiles()
+
+        # --- Source: RDS / Aurora connection ------------------------------
         with ui.card().classes("w-full"):
             source_badge = _section_header(
                 "storage",
-                "Source (RDS / Aurora MySQL)",
+                "Source (RDS / Aurora)",
                 connection_status_badge(state.source_verified),
             )
             source_host = ui.input("Host", value=src_host or "").classes(
                 "w-full"
             )
             source_port = ui.number(
-                "Port", value=src_port or 3306, format="%d"
+                "Port",
+                value=src_port or dialect_for(_engine["type"]).default_port,
+                format="%d",
             ).classes("w-full")
             # The "optional / scope" guidance lives on the field itself (Quasar
             # ``hint``) so it reads as part of the Database input, not as a separate
-            # gray line below it.
+            # gray line below it. The hint is engine-aware (see _db_field_hint).
             source_database = ui.input(
-                "Database (optional)", value=src_database or ""
-            ).classes("w-full").props(
-                'hint="Empty assesses the whole cluster; set it to scope to a '
-                'single database."'
-            )
+                "Database", value=src_database or ""
+            ).classes("w-full").props(_db_field_hint(_engine["type"]))
 
             # Authentication method: type a username/password, or resolve both
             # from an AWS Secrets Manager secret (e.g. an RDS/Aurora managed
@@ -865,6 +924,7 @@ def build_connect_page(
                         port=int(source_port.value or 0),
                         database=(source_database.value or "").strip(),
                         username=username_value,
+                        source_type=_engine["type"],
                     )
                 except (ValueError, TypeError):
                     fail_source("Please check the source connection fields.")

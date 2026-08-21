@@ -65,13 +65,15 @@ from dsql_migrator.core.models import (
     MigrationJob,
     SourceConnectionConfig,
     SourceInventory,
+    SourceType,
     StepStatus,
     TableDef,
     TargetConnectionConfig,
     Watermark,
     apply_lob_exclusions,
 )
-from dsql_migrator.core.watermark import WatermarkCapturer
+from dsql_migrator.core.source_dialect import dialect_for
+from dsql_migrator.core.watermark import WatermarkCapturer, estimate_source_rows
 from dsql_migrator.ui.connect import make_source_engine_factory
 
 _LOGGER = logging.getLogger(__name__)
@@ -2747,8 +2749,11 @@ def _default_table_recreator(inputs: "DataMigrationInputs") -> TableRecreator:
         conversion = inputs.table_conversions.get(table.name)
         if conversion is None:
             # No applied conversion carried in (e.g. a table generated outside this
-            # session): re-derive deterministically.
-            conversion = SchemaConverter().convert_table(table, SchemaConvertOptions())
+            # session): re-derive deterministically with the SOURCE engine's dialect
+            # (else a PostgreSQL-source table would be re-derived as MySQL DDL).
+            conversion = SchemaConverter(
+                source_type=inputs.source_config.source_type
+            ).convert_table(table, SchemaConvertOptions())
         connector = DsqlConnector(
             inputs.target_config, aws_profile=inputs.aws_profile
         )
@@ -2829,8 +2834,37 @@ class BatchedTableMigrator:
         source tables (read-only).
         """
         table_names = [table.name for table in tables]
-        return self._watermark_capturer.capture(
-            self._inputs.source_config, table_names
+        source = self._inputs.source_config
+        if source.source_type is not SourceType.MYSQL:
+            # A binlog/GTID watermark is a MySQL CDC concept, and the MySQL WatermarkCapturer
+            # runs MySQL-only SQL (START TRANSACTION WITH CONSISTENT SNAPSHOT / SHOW MASTER
+            # STATUS) that FAILS on PostgreSQL. PG CDC is deferred, so Full Load proceeds
+            # WITHOUT a binlog watermark -- but still records the scan-free row-count
+            # baseline (dialect-dispatched: pg_class.reltuples for PG).
+            return self._capture_rowcount_only_watermark(source, table_names)
+        return self._watermark_capturer.capture(source, table_names)
+
+    def _capture_rowcount_only_watermark(
+        self, source: SourceConnectionConfig, table_names: Sequence[str]
+    ) -> Watermark:
+        """A binlog-less watermark carrying only the scan-free row-count baseline.
+
+        For a non-MySQL source (PostgreSQL) with CDC deferred: no binlog/GTID
+        coordinate, just the approximate per-table estimate (never a COUNT(*) scan)
+        via the source dialect, so the progress baseline is preserved.
+        """
+        dialect = dialect_for(source.source_type)
+        engine = make_source_engine_factory(self._inputs.source_password)(source)
+        try:
+            with engine.connect() as connection:
+                estimates = estimate_source_rows(connection, list(table_names), dialect)
+        finally:
+            engine.dispose()
+        return Watermark(
+            snapshot_timestamp=datetime.now(timezone.utc),
+            # None estimate (never-analyzed / missing) -> 0, matching the MySQL baseline.
+            table_row_counts={n: (c or 0) for n, c in estimates.items()},
+            row_counts_approximate=True,
         )
 
     def migrate_table(

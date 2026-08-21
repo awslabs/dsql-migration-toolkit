@@ -60,6 +60,7 @@ from dsql_migrator.core.models import (
     OrphanFinding,
     SourceConnectionConfig,
     SourceInventory,
+    SourceType,
     StepStatus,
     TableDef,
     TableSelection,
@@ -1724,8 +1725,14 @@ def build_validation_screen(
             )
             from dsql_migrator.ui.schema_conversion import applied_table_conversions
 
+            _stype = (
+                session.source_config.source_type
+                if session.source_config is not None
+                else SourceType.MYSQL
+            )
             applied = applied_table_conversions(
-                SchemaConverter().convert(inv), conv_state.edited_target_ddls
+                SchemaConverter(source_type=_stype).convert(inv),
+                conv_state.edited_target_ddls,
             )
             out: dict[str, dict[str, str]] = {}
             for name, conversion in applied.items():

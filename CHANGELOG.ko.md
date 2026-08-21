@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.386
+
+### 추가 (Added)
+
+- **이제 MySQL뿐 아니라 PostgreSQL에서도 마이그레이션할 수 있습니다.** 연결(Connect) 화면 맨 위에
+  **소스 엔진** 선택이 추가되어 — **MySQL** 또는 **PostgreSQL** 중 선택 — RDS / Aurora
+  **PostgreSQL** 데이터베이스도 (기존 RDS / Aurora MySQL에 더해) Aurora DSQL로 마이그레이션할 수
+  있습니다. 소스가 Aurora인지 RDS인지는 여전히 엔드포인트에서 자동 감지되며, 포트 기본값도 엔진에
+  맞춰집니다(MySQL 3306, PostgreSQL 5432). 오버뷰 다이어그램도 소스를 그에 맞게 표시합니다(예:
+  "Aurora PostgreSQL"). PostgreSQL 지원 범위는 **평가·스키마 변환·풀 로드·검증**이며, PostgreSQL
+  소스의 **변경 데이터 캡처(CDC)는 아직 제공되지 않습니다**(현재 CDC는 MySQL 전용).
+
 ## v0.1.380
 
 ### 변경 (Changed)
