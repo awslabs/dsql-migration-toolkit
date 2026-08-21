@@ -582,6 +582,61 @@ def test_batched_table_migrator_captures_watermark_for_selected_tables() -> None
     assert capturer.calls == [["orders"]]
 
 
+def test_capture_watermark_skips_binlog_for_postgres_source(monkeypatch) -> None:
+    # A PostgreSQL source has no binlog/GTID, and the MySQL WatermarkCapturer's SQL
+    # (START TRANSACTION WITH CONSISTENT SNAPSHOT / SHOW MASTER STATUS) is fatal on PG.
+    # capture_watermark must SKIP the capturer and return a binlog-less watermark carrying
+    # only the scan-free row-count baseline (dialect-dispatched, None -> 0).
+    import dataclasses
+
+    import dsql_migrator.ui.data_migration._full_load_engine as eng
+    from dsql_migrator.core.models import SourceType
+
+    class _NoConn:
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, *_a):  # noqa: ANN204
+            return False
+
+    class _NoEngine:
+        def connect(self):  # noqa: ANN201
+            return _NoConn()
+
+        def dispose(self) -> None:
+            self.disposed = True
+
+    fake_engine = _NoEngine()
+    monkeypatch.setattr(
+        eng, "make_source_engine_factory", lambda pw, **k: (lambda src: fake_engine)
+    )
+    monkeypatch.setattr(
+        eng,
+        "estimate_source_rows",
+        lambda conn, tables, dialect: {"orders": 5, "customers": None},
+    )
+
+    capturer = _FakeWatermarkCapturer(_watermark())  # must NOT be called for PG
+    pg_inputs = dataclasses.replace(
+        _inputs(),
+        source_config=SourceConnectionConfig(
+            host="db", database="app", source_type=SourceType.POSTGRES
+        ),
+    )
+    migrator = BatchedTableMigrator(
+        pg_inputs,
+        exporter=_FakeExporter(),  # type: ignore[arg-type]
+        watermark_capturer=capturer,  # type: ignore[arg-type]
+        importer_factory=lambda _i: _FakeImporter(),  # type: ignore[arg-type,return-value]
+    )
+    watermark = migrator.capture_watermark(list(_inventory().tables))
+    assert capturer.calls == []  # MySQL binlog capturer skipped for a PG source
+    assert watermark.binlog_file is None and watermark.gtid_executed is None
+    assert watermark.row_counts_approximate is True
+    assert watermark.table_row_counts == {"orders": 5, "customers": 0}  # None -> 0
+    assert fake_engine.disposed is True  # source engine disposed (no leak)
+
+
 def test_batched_table_migrator_streams_then_loads() -> None:
     exporter = _FakeExporter(rows_by_table={"orders": [{"id": 1}, {"id": 2}]})
     importer = _FakeImporter()

@@ -489,7 +489,15 @@ def build_connect_page(
         # event, NO model call, so the AI window always reflects what happened -- and,
         # on a FAILURE with AI set up, offer a ONE-CLICK "Ask AI to help fix this"
         # affordance that actually invokes the model (paid reasoning stays explicit).
-        label = "Source (MySQL)" if side == "source" else "Target (Aurora DSQL)"
+        if side == "source":
+            _word = (
+                "PostgreSQL"
+                if _engine["type"] is SourceType.POSTGRES
+                else "MySQL"
+            )
+            label = f"Source ({_word})"
+        else:
+            label = "Target (Aurora DSQL)"
         if ai_post_event is not None:
             # post_event self-gates on AI being enabled; no-op otherwise.
             if success:
@@ -637,7 +645,7 @@ def build_connect_page(
             "text-blue-800 font-medium"
         ).props("header-class=text-blue-800"):
             ui.label(
-                "This tool migrates a MySQL database (RDS / Aurora MySQL) to "
+                "This tool migrates a MySQL or PostgreSQL database (RDS / Aurora) to "
                 "Amazon Aurora DSQL. You connect both ends here, then move through "
                 "five steps:"
             ).classes("text-sm text-gray-600")
@@ -990,7 +998,8 @@ def build_connect_page(
                     side="source",
                     success=result.success,
                     coordinates=(
-                        f"MySQL host={config.host} port={config.port} "
+                        f"{'PostgreSQL' if config.source_type is SourceType.POSTGRES else 'MySQL'} "
+                        f"host={config.host} port={config.port} "
                         f"database={config.database or '(not set)'}"
                     ),
                     detail=result.detail,
