@@ -90,6 +90,7 @@ from dsql_migrator.core.models import (
     RowDiffKind,
     RowDiffSample,
     SourceConnectionConfig,
+    SourceType,
     TableDef,
     TargetConnectionConfig,
     ValidationMode,
@@ -101,7 +102,8 @@ from dsql_migrator.core.target_connection import (
     DsqlConnector,
     is_transient_connection_error,
 )
-from dsql_migrator.core.source_dialect import dialect_for
+from dsql_migrator.core.source_dialect import SourceDialect, dialect_for
+from dsql_migrator.core.validator_postgres import PgSourceConnection
 from dsql_migrator.core.watermark import COMMIT
 
 # The pure cross-engine SQL builders + PK-classification helpers were extracted to
@@ -564,6 +566,7 @@ def _diff_pks(
     target_connection: Any,
     table: TableDef,
     sample_size: int,
+    source_dialect: SourceDialect,
 ) -> Optional[RowDiffSample]:
     """Sample which primary keys diverge between source and target for ``table``.
 
@@ -580,7 +583,9 @@ def _diff_pks(
         return None  # composite/missing PK: skip rather than fall back to a scan
     pk_column = table.primary_key[0]
 
-    source_tokens = _source_pk_tokens(source_connection, table, pk_column, sample_size)
+    source_tokens = _source_pk_tokens_for(
+        source_dialect, source_connection, table, pk_column, sample_size
+    )
     target_tokens = _target_pk_tokens(target_connection, table, pk_column, sample_size)
 
     findings: list[RowDiffFinding] = []
@@ -685,6 +690,73 @@ def _iter_target_pks(
             yield int(row[0])
         if len(rows) < page_size:
             return
+
+
+# ---------------------------------------------------------------------------
+# Source-read dispatch (by source engine)
+# ---------------------------------------------------------------------------
+#
+# MySQL source reads use build_mysql_* over the SQLAlchemy text() path. A PostgreSQL
+# source reuses the SAME PG-16 readers as the DSQL target (build_pg_* + _target_* /
+# _bounded_target_count) -- both ends are PostgreSQL, so one renderer serves both sides --
+# via a PgSourceConnection shim that runs them through the guarded SQLAlchemy connection
+# (read-only guard + snapshot preserved). The target read path is unchanged.
+
+
+def _source_is_postgres(dialect: SourceDialect) -> bool:
+    return dialect.source_type is SourceType.POSTGRES
+
+
+def _source_row_count_live(
+    dialect: SourceDialect,
+    connection: _SourceConnection,
+    table: TableDef,
+    page_size: int,
+) -> int:
+    """Exact live source count: PG keyset-bounds it (single PK) like the target; MySQL
+    (no per-txn limit) uses a plain ``COUNT(*)`` as before."""
+    if _source_is_postgres(dialect):
+        return _bounded_target_count(PgSourceConnection(connection), table, page_size)
+    return _source_count(connection, table.name)
+
+
+def _source_checksum_for(
+    dialect: SourceDialect,
+    connection: _SourceConnection,
+    table: TableDef,
+    page_size: int,
+) -> str:
+    if _source_is_postgres(dialect):
+        return _target_checksum(PgSourceConnection(connection), table, page_size)
+    return _source_checksum(connection, table, page_size)
+
+
+def _iter_source_pks_for(
+    dialect: SourceDialect,
+    connection: _SourceConnection,
+    table: TableDef,
+    pk_column: str,
+    page_size: int,
+) -> "Iterator[int]":
+    if _source_is_postgres(dialect):
+        return _iter_target_pks(
+            PgSourceConnection(connection), table, pk_column, page_size
+        )
+    return _iter_source_pks(connection, table, pk_column, page_size)
+
+
+def _source_pk_tokens_for(
+    dialect: SourceDialect,
+    connection: _SourceConnection,
+    table: TableDef,
+    pk_column: str,
+    sample_size: int,
+) -> dict[str, str]:
+    if _source_is_postgres(dialect):
+        return _target_pk_tokens(
+            PgSourceConnection(connection), table, pk_column, sample_size
+        )
+    return _source_pk_tokens(connection, table, pk_column, sample_size)
 
 
 # Poll the cancel check every this-many merge steps during reconciliation. Small
@@ -948,12 +1020,22 @@ class Validator:
                 )
                 source_connection.execute(text(source_dialect.snapshot_start_sql))
                 try:
-                    current_gtid = _source_gtid(source_connection)
-                    # Also capture file:pos -- the drift fallback when the source has
-                    # no GTID (the normal case on RDS MySQL 8.0).
-                    current_binlog_file, current_binlog_position = (
-                        _source_binlog_position(source_connection)
-                    )
+                    # Drift coordinates are MySQL binlog/GTID concepts. On a PostgreSQL
+                    # source these probes are SQL syntax errors that would ABORT the
+                    # shared snapshot transaction (PostgreSQL fails the whole txn on any
+                    # statement error), poisoning every subsequent table read -- so skip
+                    # them for PG (drift stays "undeterminable", which is correct while PG
+                    # CDC is deferred). MySQL runs them as before on the same snapshot.
+                    current_gtid: Optional[str] = None
+                    current_binlog_file: Optional[str] = None
+                    current_binlog_position: Optional[int] = None
+                    if not _source_is_postgres(source_dialect):
+                        current_gtid = _source_gtid(source_connection)
+                        # Also capture file:pos -- the drift fallback when the source has
+                        # no GTID (the normal case on RDS MySQL 8.0).
+                        current_binlog_file, current_binlog_position = (
+                            _source_binlog_position(source_connection)
+                        )
                     target_connection = _ReconnectingTargetConnection(
                         lambda: self._target_connection_factory(target)
                     )
@@ -978,6 +1060,7 @@ class Validator:
                                     watermark,
                                     reconcile,
                                     cancel,
+                                    source_dialect,
                                     deep_only_on_count_mismatch=(
                                         deep_only_on_count_mismatch
                                     ),
@@ -1139,7 +1222,7 @@ class Validator:
                     try:
                         item = self._validate_table(
                             source_connection, target_connection, table,
-                            mode, watermark, reconcile, cancel,
+                            mode, watermark, reconcile, cancel, source_dialect,
                             deep_only_on_count_mismatch=deep_only_on_count_mismatch,
                         )
                         if check_orphans:
@@ -1166,6 +1249,13 @@ class Validator:
         determine drift at all. Best-effort and read-only: any failure degrades to
         ``None`` values (drift becomes "undeterminable"), never aborting the run.
         """
+        # Drift coordinates are MySQL binlog/GTID; a PostgreSQL source has neither, and
+        # the probes are MySQL-only SQL, so skip them entirely (drift "undeterminable",
+        # correct while PG CDC is deferred). (Unlike the serial path this uses a throwaway
+        # connection, so it wouldn't poison table reads -- but skipping avoids two doomed
+        # queries.)
+        if source.source_type is SourceType.POSTGRES:
+            return None, None, None
         engine = self._source_engine_factory(source)
         try:
             with engine.connect() as raw_connection:
@@ -1189,6 +1279,7 @@ class Validator:
         watermark: Optional[Watermark],
         reconcile: bool,
         should_cancel: CancelCheck,
+        source_dialect: SourceDialect,
         deep_only_on_count_mismatch: bool = False,
     ) -> TableValidationResult:
         """Compare one table, isolating any failure to this table's result.
@@ -1210,6 +1301,7 @@ class Validator:
                 watermark,
                 reconcile,
                 should_cancel,
+                source_dialect,
                 deep_only_on_count_mismatch=deep_only_on_count_mismatch,
             )
         except ValidationCancelled:
@@ -1233,6 +1325,7 @@ class Validator:
         watermark: Optional[Watermark],
         reconcile: bool,
         should_cancel: CancelCheck,
+        source_dialect: SourceDialect,
         deep_only_on_count_mismatch: bool = False,
     ) -> TableValidationResult:
         """Compare one table's row count (and, in CHECKSUM mode, its checksum).
@@ -1251,7 +1344,8 @@ class Validator:
         only credits checks that actually ran.
         """
         source_row_count = self._source_row_count(
-            source_connection, table, watermark
+            source_connection, table, watermark, source_dialect,
+            self._reconcile_page_size,
         )
         # The TARGET count must be BOUNDED on Aurora DSQL: a single COUNT(*) scans the
         # whole table in one transaction and, at scale, exceeds DSQL's hard 300s limit,
@@ -1280,8 +1374,8 @@ class Validator:
         checksum_match: Optional[bool] = None
         checksum_excluded_columns: list[str] = []
         if mode is ValidationMode.CHECKSUM and run_deep:
-            source_checksum = _source_checksum(
-                source_connection, table, self._reconcile_page_size
+            source_checksum = _source_checksum_for(
+                source_dialect, source_connection, table, self._reconcile_page_size
             )
             target_checksum = _target_checksum(
                 target_connection, table, self._reconcile_page_size
@@ -1308,8 +1402,9 @@ class Validator:
             if pk_column is not None:
                 reconcile_result = reconcile_pk_streams(
                     pk_column,
-                    _iter_source_pks(
-                        source_connection, table, pk_column, self._reconcile_page_size
+                    _iter_source_pks_for(
+                        source_dialect, source_connection, table, pk_column,
+                        self._reconcile_page_size,
                     ),
                     _iter_target_pks(
                         target_connection, table, pk_column, self._reconcile_page_size
@@ -1344,7 +1439,7 @@ class Validator:
         if not matched and self._row_diff_sample_size > 0:
             row_diff_sample = _diff_pks(
                 source_connection, target_connection, table,
-                self._row_diff_sample_size,
+                self._row_diff_sample_size, source_dialect,
             )
 
         return TableValidationResult(
@@ -1367,14 +1462,17 @@ class Validator:
         source_connection: _SourceConnection,
         table: TableDef,
         watermark: Optional[Watermark],
+        source_dialect: SourceDialect,
+        page_size: int,
     ) -> int:
         """Return the as-of source row count for ``table``.
 
         Uses the watermark's recorded snapshot count only when it is exact; the
         Full Load watermark stores approximate (scan-free) estimates to spare the
         source, so validation re-counts the source live (exact) for a correct
-        row-count comparison. The exact ``COUNT(*)`` therefore runs only at
-        validation time, never during the migration itself.
+        row-count comparison. The exact count therefore runs only at validation
+        time, never during the migration itself, and is dispatched per source engine
+        (MySQL ``COUNT(*)``; PostgreSQL keyset-bounded like the target).
         """
         if (
             watermark is not None
@@ -1382,7 +1480,9 @@ class Validator:
             and table.name in watermark.table_row_counts
         ):
             return watermark.table_row_counts[table.name]
-        return _source_count(source_connection, table.name)
+        return _source_row_count_live(
+            source_dialect, source_connection, table, page_size
+        )
 
     @staticmethod
     def _check_orphans(

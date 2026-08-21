@@ -2220,3 +2220,76 @@ def test_build_drift_is_none_without_a_watermark() -> None:
     from dsql_migrator.core.validator import _build_drift
 
     assert _build_drift(None, "uuid:1-5", "mysql-bin.000004", 1120) is None
+
+
+# ---------------------------------------------------------------------------
+# Source-read dispatch by engine (MySQL text() builders vs PG readers via the shim)
+# ---------------------------------------------------------------------------
+
+
+class _FakeDialect:
+    def __init__(self, source_type: Any) -> None:
+        self.source_type = source_type
+
+
+def test_source_read_dispatch_routes_by_engine(monkeypatch) -> None:
+    # A MySQL source uses the build_mysql_* helpers; a PostgreSQL source reuses the PG
+    # readers (the same ones the DSQL target uses) wrapped in a PgSourceConnection shim.
+    import dsql_migrator.core.validator as v
+    from dsql_migrator.core.models import SourceType, TableDef, ColumnDef
+
+    calls: list[tuple] = []
+    # PgSourceConnection -> a marker so we can assert the PG path wraps the connection.
+    monkeypatch.setattr(v, "PgSourceConnection", lambda c: ("shim", c))
+    monkeypatch.setattr(v, "_source_checksum", lambda c, t, ps: calls.append(("my_ck", c)) or "my")
+    monkeypatch.setattr(v, "_target_checksum", lambda c, t, ps: calls.append(("pg_ck", c)) or "pg")
+    monkeypatch.setattr(v, "_source_count", lambda c, name: calls.append(("my_ct", c)) or 1)
+    monkeypatch.setattr(v, "_bounded_target_count", lambda c, t, ps: calls.append(("pg_ct", c)) or 2)
+    monkeypatch.setattr(v, "_source_pk_tokens", lambda c, t, pk, n: calls.append(("my_pk", c)) or {})
+    monkeypatch.setattr(v, "_target_pk_tokens", lambda c, t, pk, n: calls.append(("pg_pk", c)) or {})
+
+    tbl = TableDef(name="t", columns=[ColumnDef(name="id", mysql_type="integer")], primary_key=["id"])
+    pg = _FakeDialect(SourceType.POSTGRES)
+    my = _FakeDialect(SourceType.MYSQL)
+
+    # checksum
+    assert v._source_checksum_for(pg, "C", tbl, 100) == "pg"
+    assert calls[-1] == ("pg_ck", ("shim", "C"))  # PG path wraps in the shim
+    assert v._source_checksum_for(my, "C", tbl, 100) == "my"
+    assert calls[-1] == ("my_ck", "C")  # MySQL path uses the raw connection
+
+    # live count
+    assert v._source_row_count_live(pg, "C", tbl, 100) == 2
+    assert calls[-1] == ("pg_ct", ("shim", "C"))
+    assert v._source_row_count_live(my, "C", tbl, 100) == 1
+    assert calls[-1] == ("my_ct", "C")
+
+    # pk tokens (used by _diff_pks)
+    v._source_pk_tokens_for(pg, "C", tbl, "id", 50)
+    assert calls[-1] == ("pg_pk", ("shim", "C"))
+    v._source_pk_tokens_for(my, "C", tbl, "id", 50)
+    assert calls[-1] == ("my_pk", "C")
+
+
+def test_pg_checksum_unconstrained_numeric_rounds_to_dsql_default_scale() -> None:
+    # An unconstrained PG `numeric` (no declared scale) is stored by DSQL at its default
+    # numeric(18,6), so the checksum rounds BOTH sides to scale 6 -- not scale 0 (the old
+    # bug: dropped the whole fraction -> false MATCH) and not raw ::text (0.5 source vs
+    # 0.500000 target -> false MISMATCH). A scale-bearing numeric(p,s) keeps its scale.
+    # A PostgreSQL source sets column.target_type = the PG type, so _checksum_kind takes
+    # the "numeric" branch (without target_type it would fall to the plain fallback).
+    from dsql_migrator.core.validator import build_pg_checksum_sql
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    table = TableDef(
+        name="t",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", target_type="bigint"),
+            ColumnDef(name="unconstrained", mysql_type="numeric", target_type="numeric"),
+            ColumnDef(name="scaled", mysql_type="numeric(12,2)", target_type="numeric(12,2)"),
+        ],
+        primary_key=["id"],
+    )
+    rendered = build_pg_checksum_sql(table).as_string(None)
+    assert 'round("unconstrained", 6)' in rendered          # DSQL default scale, not 0
+    assert 'round("scaled", 2)' in rendered                 # declared scale kept

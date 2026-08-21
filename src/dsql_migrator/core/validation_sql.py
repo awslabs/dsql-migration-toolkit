@@ -102,6 +102,13 @@ def _pg_concat_term(expr: "sql.Composed") -> "sql.Composed":
     ).format(e=expr, s=sql.Literal(_NULL_SENTINEL))
 
 
+# Aurora DSQL stores an UNCONSTRAINED ``numeric`` (no declared precision/scale) at its
+# documented default of ``numeric(18,6)`` -- so a PostgreSQL-source unconstrained numeric
+# lands with 6 fractional digits on the target. The checksum rounds such a column to this
+# scale on both sides so equal values match (see ``_pg_checksum_expr``).
+_DSQL_DEFAULT_NUMERIC_SCALE = 6
+
+
 def _decimal_scale(mysql_type: str) -> int:
     """Return the declared scale of a MySQL DECIMAL(p,s) (default 0).
 
@@ -287,9 +294,23 @@ def _pg_checksum_expr(column: "ColumnDef") -> "Optional[sql.Composed]":
     if kind == "time":
         return sql.SQL("to_char({col}, 'HH24:MI:SS.US')").format(col=ident)
     if kind == "numeric":
-        # round() to the declared scale, then a fixed-scale to_char mask matching
-        # MySQL CAST(col AS DECIMAL(65, s)) so equal decimals print identically.
-        scale = _decimal_scale(column.mysql_type)
+        # An UNCONSTRAINED numeric (bare ``numeric``/``decimal``, no parens -> arbitrary
+        # precision AND scale, a PostgreSQL-source case) has no declared scale. Aurora
+        # DSQL stores such a column at its DEFAULT scale numeric(18,6), so a source value
+        # is rounded to 6 fractional digits on the target (0.5 -> 0.500000). Compare at
+        # that scale -- round BOTH sides to 6 -- so an equal value matches despite the
+        # source's arbitrary scale, AND a difference WITHIN what DSQL can store is still
+        # caught (rounding to scale 0, the old bug, hid the whole fraction -> false MATCH;
+        # comparing raw ::text false-MISMATCHED 0.5 vs 0.500000). Source precision beyond
+        # 6 digits that DSQL cannot hold is a SCHEMA concern (surfaced in Schema
+        # Conversion), not a Validation mismatch. A DECLARED scale (numeric(p,s), incl.
+        # numeric(p) == scale 0, and every MySQL DECIMAL(p,s)) keeps that exact scale, so
+        # a trailing-zero / stored-scale diff never false-mismatches cross-engine.
+        scale = (
+            _DSQL_DEFAULT_NUMERIC_SCALE
+            if "(" not in column.mysql_type
+            else _decimal_scale(column.mysql_type)
+        )
         return sql.SQL("to_char(round({col}, {scale}), {mask})").format(
             col=ident,
             scale=sql.Literal(scale),

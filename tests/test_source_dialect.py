@@ -89,7 +89,14 @@ def test_postgres_dialect_engine_kwargs_pin_utc_and_optional_statement_timeout()
     d = dialect_for(SourceType.POSTGRES)
     base = d.engine_kwargs()
     assert base["pool_pre_ping"] is True
-    assert base["connect_args"]["options"] == "-c timezone=UTC"
+    opts = base["connect_args"]["options"]
+    # Pin the locale/format GUCs so the source renders checksum text identically to the
+    # DSQL target (whose defaults are exactly these); a non-default source locale would
+    # otherwise cause a false checksum MISMATCH on byte-identical data.
+    assert "-c timezone=UTC" in opts
+    assert "-c datestyle=ISO" in opts
+    assert "-c intervalstyle=postgres" in opts
+    assert "-c lc_numeric=C" in opts
     assert "connect_timeout" in base["connect_args"]
     timed = d.engine_kwargs(read_timeout_seconds=30)
     assert "statement_timeout=30000" in timed["connect_args"]["options"]

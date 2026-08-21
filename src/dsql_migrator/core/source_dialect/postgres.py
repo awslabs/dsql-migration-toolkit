@@ -90,11 +90,19 @@ class PostgresSourceDialect(SourceDialect):
     def engine_kwargs(
         self, *, read_timeout_seconds: Optional[int] = None
     ) -> dict[str, object]:
-        # Pin the session to UTC (mirrors MySQL's ``SET time_zone='+00:00'``) so
-        # timestamp/timestamptz render deterministically vs the UTC target; psycopg
-        # passes server settings via the libpq ``options`` connect arg. A read timeout
-        # bounds a stalled stream via ``statement_timeout`` (milliseconds).
-        options = "-c timezone=UTC"
+        # Pin locale/format GUCs so the source renders text IDENTICALLY to the Aurora
+        # DSQL target (whose defaults are exactly these: timezone/DateStyle=ISO,
+        # IntervalStyle=postgres, lc_numeric=C). Validation reuses the target's PG
+        # checksum renderer, whose numeric to_char 'D' mask honors lc_numeric and whose
+        # date/interval ::text honor DateStyle/IntervalStyle -- so a source DB with a
+        # non-default locale (e.g. lc_numeric=de_DE -> '3,14') would otherwise produce a
+        # FALSE checksum MISMATCH on byte-identical data. Pinning also makes the Full Load
+        # interval text cast (see select_column_sql) style-consistent. UTC also keeps
+        # timestamp/timestamptz deterministic. psycopg passes these via libpq ``options``;
+        # a read timeout bounds a stalled stream via ``statement_timeout`` (milliseconds).
+        options = (
+            "-c timezone=UTC -c datestyle=ISO -c intervalstyle=postgres -c lc_numeric=C"
+        )
         if read_timeout_seconds is not None:
             options += f" -c statement_timeout={int(read_timeout_seconds) * 1000}"
         connect_args: dict[str, object] = {
