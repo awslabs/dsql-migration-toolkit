@@ -22,6 +22,7 @@ from dsql_migrator.core.models import SourceType
 from dsql_migrator.core.source_dialect.base import (
     SourceDialect,
     SourceVersions,
+    estimate_row_counts_query,
     probe_scalar,
 )
 
@@ -187,6 +188,28 @@ class PostgresSourceDialect(SourceDialect):
         from dsql_migrator.core.exporter_postgres import PostgresValueConverter
 
         return PostgresValueConverter(table, target_types=target_types)
+
+    def estimate_row_counts(
+        self, connection: object, tables: list[str]
+    ) -> "dict[str, Optional[int]]":
+        # PostgreSQL: pg_class.reltuples is the planner's row estimate (maintained by
+        # ANALYZE/autovacuum); join pg_namespace for the schema, and the default schema is
+        # current_schema() (NOT current_database()). relkind IN ('r','p') covers ordinary
+        # + partitioned tables. reltuples is -1 for a never-analyzed table in PG14+ (and
+        # can be a stale float); map negative/NULL to None ("unknown", not a real 0).
+        return estimate_row_counts_query(
+            connection,
+            tables,
+            current_schema_sql="SELECT current_schema()",
+            select_from="FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace",
+            schema_column="n.nspname",
+            table_column="c.relname",
+            estimate_column="c.reltuples::bigint",
+            extra_filter="c.relkind IN ('r', 'p')",
+            parse_estimate=lambda value: (
+                None if value is None or int(value) < 0 else int(value)
+            ),
+        )
 
     def probe_versions(self, connection: object) -> SourceVersions:
         # version() is the verbose banner ("PostgreSQL 16.4 ... on <arch>").

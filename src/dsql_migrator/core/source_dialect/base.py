@@ -55,6 +55,82 @@ def probe_scalar(connection: object, sql: str) -> Optional[str]:
     return str(row[0]) if row and row[0] is not None else None
 
 
+def estimate_row_counts_query(
+    connection: object,
+    tables: list[str],
+    *,
+    current_schema_sql: str,
+    select_from: str,
+    schema_column: str,
+    table_column: str,
+    estimate_column: str,
+    extra_filter: str = "",
+    parse_estimate=lambda value: int(value) if value is not None else None,
+) -> "dict[str, Optional[int]]":
+    """Scan-free per-table row ESTIMATE, keyed exactly as ``tables`` was passed.
+
+    The engine-neutral skeleton behind each dialect's :meth:`SourceDialect.
+    estimate_row_counts`: resolve the default schema (``current_schema_sql``), split each
+    requested name into ``(schema, table)`` (an unqualified name uses the default
+    schema), and read the metadata row estimate in ONE query -- never a ``COUNT(*)``
+    scan. A name missing from the estimate maps to ``None`` (unknown, distinct from a
+    genuine 0). The engine supplies its own catalog source: ``select_from`` (FROM/JOINs),
+    the ``schema_column``/``table_column``/``estimate_column`` projections, an optional
+    ``extra_filter`` (e.g. PostgreSQL ``c.relkind IN ('r','p')``), and ``parse_estimate``
+    (e.g. map PostgreSQL's never-analyzed ``-1`` to ``None``). Column names come from the
+    dialect (never user input), so the interpolation is injection-safe; values bind.
+    """
+    from sqlalchemy import text
+
+    from dsql_migrator.core.introspector import ReadOnlySourceError
+
+    if not tables:
+        return {}
+    current_schema: Optional[str] = None
+    try:
+        current_schema = connection.execute(  # type: ignore[attr-defined]
+            text(current_schema_sql)
+        ).scalar()
+    except ReadOnlySourceError:
+        raise
+    except Exception:  # noqa: BLE001 - degrade gracefully
+        current_schema = None
+
+    wanted: dict[tuple[str, str], str] = {}
+    params: dict[str, str] = {}
+    clauses: list[str] = []
+    for index, name in enumerate(tables):
+        schema, separator, obj = name.partition(".")
+        if not (separator and schema and obj):
+            schema, obj = (current_schema or ""), name
+        wanted[(schema, obj)] = name
+        params[f"s{index}"] = schema
+        params[f"t{index}"] = obj
+        clauses.append(f"({schema_column} = :s{index} AND {table_column} = :t{index})")
+
+    out: dict[str, Optional[int]] = {name: None for name in tables}
+    if not clauses:
+        return out
+    where = " OR ".join(clauses)
+    if extra_filter:
+        where = f"{extra_filter} AND ({where})"
+    query = text(
+        f"SELECT {schema_column}, {table_column}, {estimate_column} "
+        f"{select_from} WHERE {where}"
+    )
+    try:
+        result = connection.execute(query, params)  # type: ignore[attr-defined]
+    except ReadOnlySourceError:
+        raise
+    except Exception:  # noqa: BLE001 - estimates are non-critical; leave None
+        return out
+    for row in result:
+        original = wanted.get((str(row[0]), str(row[1])))
+        if original is not None:
+            out[original] = parse_estimate(row[2])
+    return out
+
+
 class SourceDialect(ABC):
     """Source-engine-specific behavior for reading a migration source (read-only)."""
 
@@ -138,6 +214,19 @@ class SourceDialect(ABC):
         """
 
     @abstractmethod
+    def estimate_row_counts(
+        self, connection: object, tables: list[str]
+    ) -> "dict[str, Optional[int]]":
+        """Scan-free per-table row ESTIMATE (``None`` = unknown/missing), keyed as passed.
+
+        Reads the engine's metadata row estimate in ONE query -- never a ``COUNT(*)``
+        scan -- so a watermark/consistency baseline adds negligible load even for a
+        very large source. MySQL reads ``information_schema.tables.table_rows``;
+        PostgreSQL reads ``pg_class.reltuples``. Typically implemented via
+        :func:`estimate_row_counts_query`.
+        """
+
+    @abstractmethod
     def probe_versions(self, connection: object) -> SourceVersions:
         """Read source version metadata read-only for the overview diagram.
 
@@ -148,4 +237,9 @@ class SourceDialect(ABC):
         """
 
 
-__all__ = ["SourceDialect", "SourceVersions", "probe_scalar"]
+__all__ = [
+    "SourceDialect",
+    "SourceVersions",
+    "probe_scalar",
+    "estimate_row_counts_query",
+]

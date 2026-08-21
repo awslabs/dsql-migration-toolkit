@@ -165,6 +165,70 @@ def test_postgres_dialect_value_converter_returns_pg_converter() -> None:
     assert vc.convert_row({"id": 1}) == {"id": 1}
 
 
+# ---------------------------------------------------------------------------
+# estimate_row_counts -- scan-free per-table row estimate (engine-specific catalog)
+# ---------------------------------------------------------------------------
+
+
+class _EstScalar:
+    def __init__(self, value: object) -> None:
+        self._value = value
+
+    def scalar(self) -> object:
+        return self._value
+
+
+class _FakeEstimateConnection:
+    """Answers the default-schema scalar and returns canned estimate rows.
+
+    Records the estimate SQL so tests can assert the engine-specific catalog query.
+    Rows are (schema, table, estimate) tuples as the real catalog would return.
+    """
+
+    def __init__(self, current_schema: object, rows: list) -> None:
+        self._current_schema = current_schema
+        self._rows = rows
+        self.estimate_sql: str = ""
+
+    def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        sql = str(statement)
+        low = sql.lower()
+        if "database()" in low or "current_schema()" in low:
+            return _EstScalar(self._current_schema)
+        self.estimate_sql = sql
+        return list(self._rows)
+
+
+def test_mysql_estimate_row_counts_uses_information_schema() -> None:
+    conn = _FakeEstimateConnection("shop", [("shop", "orders", 100), ("shop", "items", 5)])
+    out = dialect_for(SourceType.MYSQL).estimate_row_counts(conn, ["orders", "items"])
+    assert out == {"orders": 100, "items": 5}
+    assert "information_schema.tables" in conn.estimate_sql
+    assert "table_rows" in conn.estimate_sql
+
+
+def test_postgres_estimate_row_counts_uses_pg_class_reltuples() -> None:
+    # reltuples estimates: positive -> int, -1 (never analyzed, PG14+) -> None,
+    # NULL -> None, and a table missing from the result -> None.
+    conn = _FakeEstimateConnection(
+        "public",
+        [("public", "orders", 100), ("public", "fresh", -1), ("public", "nully", None)],
+    )
+    out = dialect_for(SourceType.POSTGRES).estimate_row_counts(
+        conn, ["orders", "fresh", "nully", "absent"]
+    )
+    assert out == {"orders": 100, "fresh": None, "nully": None, "absent": None}
+    assert "pg_class" in conn.estimate_sql and "reltuples" in conn.estimate_sql
+    assert "pg_namespace" in conn.estimate_sql
+    assert "relkind" in conn.estimate_sql
+
+
+def test_estimate_row_counts_empty_tables_short_circuits() -> None:
+    conn = _FakeEstimateConnection("public", [])
+    assert dialect_for(SourceType.POSTGRES).estimate_row_counts(conn, []) == {}
+    assert conn.estimate_sql == ""  # no query issued
+
+
 @pytest.mark.parametrize(
     "pg_type",
     ["json", "jsonb", "interval", "interval day to second", "interval second(3)"],

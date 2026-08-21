@@ -948,7 +948,7 @@ class TableExporter:
             with engine.connect() as connection:
                 ro = connection.execution_options(isolation_level="AUTOCOMMIT")
                 if min_rows > 0:
-                    est = estimate_source_rows(ro, [table.name]).get(table.name)
+                    est = estimate_source_rows(ro, [table.name], dialect).get(table.name)
                     if est is not None and est < min_rows:
                         return [(None, None)]
                 return compute_pk_shard_ranges(ro, table, shards, dialect)

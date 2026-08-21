@@ -21,6 +21,7 @@ from dsql_migrator.core.models import SourceType
 from dsql_migrator.core.source_dialect.base import (
     SourceDialect,
     SourceVersions,
+    estimate_row_counts_query,
     probe_scalar,
 )
 
@@ -122,6 +123,22 @@ class MySQLSourceDialect(SourceDialect):
         from dsql_migrator.core.exporter import ValueConverter
 
         return ValueConverter(table, target_types=target_types)
+
+    def estimate_row_counts(
+        self, connection: object, tables: list[str]
+    ) -> "dict[str, Optional[int]]":
+        # MySQL: information_schema.tables.table_rows is the storage-engine row estimate;
+        # the default schema is the current DATABASE(). (Byte-identical to the query the
+        # watermark module issued inline before the dialect seam.)
+        return estimate_row_counts_query(
+            connection,
+            tables,
+            current_schema_sql="SELECT DATABASE()",
+            select_from="FROM information_schema.tables",
+            schema_column="table_schema",
+            table_column="table_name",
+            estimate_column="table_rows",
+        )
 
     def probe_versions(self, connection: object) -> SourceVersions:
         # VERSION() carries the raw wire version (with the Aurora tag before newer

@@ -143,121 +143,41 @@ def _read_global_variable(connection: _Connection, name: str) -> Optional[str]:
 
 
 def _approximate_row_counts(
-    connection: _Connection, tables: list[str]
+    connection: _Connection,
+    tables: list[str],
+    dialect: "SourceDialect" = _MYSQL_DIALECT,
 ) -> dict[str, int]:
-    """Return approximate per-table row counts from ``information_schema``.
+    """Return approximate per-table row counts (0 for missing) from the source.
 
-    Reads the storage-engine row estimate (``information_schema.tables.
-    table_rows``) in a single metadata query -- never a ``COUNT(*)`` table/index
-    scan -- so capturing the watermark adds negligible load to the source even
-    for very large tables (the scalable default; the estimate is good enough for
-    a progress baseline). Tables absent from the estimate (or with a NULL
-    estimate) default to 0. Names may be schema-qualified (``db.table``) or
-    unqualified (resolved against the connection's current database).
+    Thin wrapper over :meth:`SourceDialect.estimate_row_counts` (a single scan-free
+    metadata query -- never a ``COUNT(*)`` scan -- so capturing the watermark adds
+    negligible load even for very large tables) that maps its ``None`` "unknown"
+    sentinel to ``0`` for the progress-baseline callers that want a numeric default.
     """
-    if not tables:
-        return {}
-    current_db: Optional[str] = None
-    try:
-        current_db = connection.execute(text("SELECT DATABASE()")).scalar()
-    except ReadOnlySourceError:
-        raise
-    except Exception:  # noqa: BLE001 - degrade gracefully
-        current_db = None
-
-    # Map each requested name to its (schema, table) lookup key and remember the
-    # original name so the result is keyed exactly as the caller passed it.
-    wanted: dict[tuple[str, str], str] = {}
-    params: dict[str, str] = {}
-    clauses: list[str] = []
-    for index, name in enumerate(tables):
-        schema, separator, obj = name.partition(".")
-        if not (separator and schema and obj):
-            schema, obj = (current_db or ""), name
-        wanted[(schema, obj)] = name
-        params[f"s{index}"] = schema
-        params[f"t{index}"] = obj
-        clauses.append(f"(table_schema = :s{index} AND table_name = :t{index})")
-
-    counts: dict[str, int] = {name: 0 for name in tables}
-    if not clauses:
-        return counts
-    query = text(
-        "SELECT table_schema, table_name, table_rows "
-        "FROM information_schema.tables "
-        f"WHERE {' OR '.join(clauses)}"
-    )
-    try:
-        result = connection.execute(query, params)
-    except ReadOnlySourceError:
-        raise
-    except Exception:  # noqa: BLE001 - estimates are non-critical; degrade to 0
-        return counts
-    for row in result:
-        key = (str(row[0]), str(row[1]))
-        original = wanted.get(key)
-        if original is not None and row[2] is not None:
-            counts[original] = int(row[2])
-    return counts
+    return {
+        name: (0 if estimate is None else estimate)
+        for name, estimate in dialect.estimate_row_counts(connection, tables).items()
+    }
 
 
 def estimate_source_rows(
-    connection: _Connection, tables: list[str]
+    connection: _Connection,
+    tables: list[str],
+    dialect: "SourceDialect" = _MYSQL_DIALECT,
 ) -> dict[str, Optional[int]]:
     """Return APPROXIMATE per-table source row counts (no table scan, read-only).
 
-    Reads the storage-engine row estimate from ``information_schema.tables.
-    table_rows`` in a single metadata query -- never a ``COUNT(*)`` scan -- so it
-    adds negligible load to the source even for large-scale tables. This is the
-    scalable default for the per-table consistency view: source-side scans on a
-    live production source must be avoided. A table missing from the estimate maps
-    to ``None`` (unknown), distinct from a genuine 0. The estimate can drift from
-    the exact count by a meaningful margin under heavy write churn -- it is a
-    baseline, not an authoritative reconciliation (Validation, Step 4, does the
-    exact comparison when one is explicitly needed).
+    Delegates to :meth:`SourceDialect.estimate_row_counts`: one scan-free metadata
+    query (MySQL ``information_schema.tables.table_rows``; PostgreSQL
+    ``pg_class.reltuples``) -- never a ``COUNT(*)`` scan -- so it adds negligible load
+    even for large-scale tables. This is the scalable default for the per-table
+    consistency view: source-side scans on a live production source must be avoided. A
+    table missing from the estimate maps to ``None`` (unknown), distinct from a genuine
+    0. The estimate can drift from the exact count under heavy write churn -- it is a
+    baseline, not an authoritative reconciliation (Validation, Step 4, does the exact
+    comparison when one is explicitly needed).
     """
-    if not tables:
-        return {}
-    current_db: Optional[str] = None
-    try:
-        current_db = connection.execute(text("SELECT DATABASE()")).scalar()
-    except ReadOnlySourceError:
-        raise
-    except Exception:  # noqa: BLE001 - degrade gracefully
-        current_db = None
-
-    wanted: dict[tuple[str, str], str] = {}
-    params: dict[str, str] = {}
-    clauses: list[str] = []
-    for index, name in enumerate(tables):
-        schema, separator, obj = name.partition(".")
-        if not (separator and schema and obj):
-            schema, obj = (current_db or ""), name
-        wanted[(schema, obj)] = name
-        params[f"s{index}"] = schema
-        params[f"t{index}"] = obj
-        clauses.append(f"(table_schema = :s{index} AND table_name = :t{index})")
-
-    out: dict[str, Optional[int]] = {name: None for name in tables}
-    if not clauses:
-        return out
-    query = text(
-        "SELECT table_schema, table_name, table_rows "
-        "FROM information_schema.tables "
-        f"WHERE {' OR '.join(clauses)}"
-    )
-    try:
-        result = connection.execute(query, params)
-    except ReadOnlySourceError:
-        raise
-    except Exception:  # noqa: BLE001 - estimates are non-critical; leave None
-        return out
-    for row in result:
-        key = (str(row[0]), str(row[1]))
-        original = wanted.get(key)
-        if original is not None and row[2] is not None:
-            out[original] = int(row[2])
-    return out
+    return dialect.estimate_row_counts(connection, tables)
 
 
 def _count_table_rows(
