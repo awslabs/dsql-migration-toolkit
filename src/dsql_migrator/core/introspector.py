@@ -40,6 +40,7 @@ from dsql_migrator.core.models import (
     ObjectType,
     SourceConnectionConfig,
     SourceInventory,
+    SourceType,
     TableDef,
     ViewDef,
 )
@@ -111,8 +112,11 @@ MYSQL_TRANSIENT_SIGNATURES = (
 )
 
 
-def is_source_transient_error(exc: BaseException) -> bool:
+def _mysql_source_transient(exc: BaseException) -> bool:
     """True for a source-MySQL failure that a fresh connection can recover from.
+
+    MySQL-specific classifier behind ``MySQLSourceDialect.is_transient_error``; the
+    engine-dispatching public entry point is :func:`is_source_transient_error` below.
 
     The Full Load's source read is the one place this matters: an Aurora failover
     (or any connection drop / stall) kills the in-flight read of a large table.
@@ -155,33 +159,42 @@ def is_source_transient_error(exc: BaseException) -> bool:
 # raw driver text ("OperationalError: (2013, 'Lost connection to MySQL server
 # during query')") tells the user nothing about what to do, and this case is
 # EXPECTED on Aurora (failover during a multi-hour load), so it gets a concrete
-# next step and an explicit safety reassurance instead.
-SOURCE_CONNECTION_LOST_HINT = (
-    "The source MySQL connection dropped mid-read. On Aurora this is usually a "
+# next step and an explicit safety reassurance instead. ``{engine}`` is filled with
+# the source dialect's display name so a PostgreSQL migration never reads "MySQL".
+SOURCE_CONNECTION_LOST_HINT_TEMPLATE = (
+    "The source {engine} connection dropped mid-read. On Aurora this is usually a "
     "failover (writer promotion during patching, an instance replacement, or an AZ "
     "event) — the database itself is fine. Nothing on the source was changed (the "
     "load only reads it), and re-running is safe: the load is idempotent and "
     "resumes by primary key, so it fills only what is missing and never duplicates "
     "rows."
 )
+# MySQL-rendered constant kept for backward compatibility (and existing callers/tests).
+SOURCE_CONNECTION_LOST_HINT = SOURCE_CONNECTION_LOST_HINT_TEMPLATE.format(engine="MySQL")
 
 
 # Codes that specifically mean the SOURCE ran out of connection slots, which needs
 # different advice from a failover: fewer concurrent readers, not "wait and re-run".
 _MYSQL_TOO_MANY_CONNECTIONS_CODES = frozenset({1040, 1203})
 
-SOURCE_TOO_MANY_CONNECTIONS_HINT = (
-    "The source MySQL refused a new connection because it is at its connection "
+SOURCE_TOO_MANY_CONNECTIONS_HINT_TEMPLATE = (
+    "The source {engine} refused a new connection because it is at its connection "
     "limit. Full Load opens one source reader per table (times the reader shards "
     "per table), so a high parallelism can exhaust a small instance's "
     "max_connections. Lower DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM (and/or "
     "FULL_LOAD_READER_SHARDS), or raise the source's max_connections, then re-run — "
     "the load is idempotent and fills only what is missing."
 )
+SOURCE_TOO_MANY_CONNECTIONS_HINT = SOURCE_TOO_MANY_CONNECTIONS_HINT_TEMPLATE.format(
+    engine="MySQL"
+)
 
 
-def _is_too_many_connections(exc: BaseException) -> bool:
-    """True when ``exc`` is the source refusing a connection for lack of slots."""
+def _mysql_too_many_connections(exc: BaseException) -> bool:
+    """True when ``exc`` is the source MySQL refusing a connection for lack of slots.
+
+    MySQL-specific predicate behind ``MySQLSourceDialect.is_too_many_connections``.
+    """
     candidates = [exc]
     for attr in ("orig", "__cause__"):
         nested = getattr(exc, attr, None)
@@ -198,19 +211,46 @@ def _is_too_many_connections(exc: BaseException) -> bool:
     return "too many connections" in str(exc).lower()
 
 
-def source_error_hint(exc: BaseException) -> Optional[str]:
+# Backward-compatible alias (the historical private name).
+_is_too_many_connections = _mysql_too_many_connections
+
+
+def is_source_transient_error(
+    exc: BaseException, source_type: SourceType = SourceType.MYSQL
+) -> bool:
+    """True for a source failure a fresh connection can recover from, per engine.
+
+    Dispatches to the source dialect's classifier so the recoverable shapes are the
+    right ones for the engine: MySQL numeric driver codes, PostgreSQL SQLSTATE classes
+    (on ``.sqlstate``). A MySQL-only classifier silently never fires for psycopg, so a
+    PostgreSQL failover would go un-retried without this dispatch. Defaults to MySQL so
+    existing callers are unchanged. Anything unrecognized is NON-transient.
+    """
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    return dialect_for(source_type).is_transient_error(exc)
+
+
+def source_error_hint(
+    exc: BaseException, source_type: SourceType = SourceType.MYSQL
+) -> Optional[str]:
     """Return an actionable operator hint for ``exc``, or ``None`` if there is none.
 
     Keeps the "what happened / what to do next" phrasing next to the classifier that
     recognizes the condition, so every surface (per-table error log, activity log,
-    the UI notice) explains a source failure the same way. Connection EXHAUSTION gets
-    its own hint: it is also transient, but waiting is not the fix -- the operator
-    needs to reduce reader concurrency or raise the source's limit.
+    the UI notice) explains a source failure the same way, worded for the SOURCE engine
+    (the dialect's display name fills the template — a PostgreSQL migration never reads
+    "MySQL"). Connection EXHAUSTION gets its own hint: it is also transient, but waiting
+    is not the fix -- the operator needs to reduce reader concurrency or raise the limit.
     """
-    if _is_too_many_connections(exc):
-        return SOURCE_TOO_MANY_CONNECTIONS_HINT
-    if is_source_transient_error(exc):
-        return SOURCE_CONNECTION_LOST_HINT
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    dialect = dialect_for(source_type)
+    engine = dialect.engine_display_name
+    if dialect.is_too_many_connections(exc):
+        return SOURCE_TOO_MANY_CONNECTIONS_HINT_TEMPLATE.format(engine=engine)
+    if dialect.is_transient_error(exc):
+        return SOURCE_CONNECTION_LOST_HINT_TEMPLATE.format(engine=engine)
     return None
 
 

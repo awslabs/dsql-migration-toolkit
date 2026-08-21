@@ -435,6 +435,148 @@ def test_postgres_probe_grants_empty_when_no_grants_and_not_super() -> None:
     assert dialect_for(SourceType.POSTGRES).probe_grants(conn) == []
 
 
+# ---------------------------------------------------------------------------
+# Engine-specific source-error classification + hint wording + load-governor metric.
+# A PostgreSQL source carries a STRING SQLSTATE (never MySQL int codes), so each
+# dialect must classify its own transient/too-many/active-query surfaces -- a
+# MySQL-only classifier silently never fires for psycopg.
+# ---------------------------------------------------------------------------
+
+
+class _PgErr(Exception):
+    """A psycopg-shaped error: carries a string ``.sqlstate``."""
+
+    def __init__(self, sqlstate=None, message: str = "") -> None:
+        super().__init__(message or (sqlstate or ""))
+        self.sqlstate = sqlstate
+
+
+class _Wrapped(Exception):
+    """A SQLAlchemy-shaped wrapper keeping the driver error on ``.orig``."""
+
+    def __init__(self, orig: BaseException) -> None:
+        super().__init__(str(orig))
+        self.orig = orig
+        self.sqlstate = None  # the wrapper itself has none; the orig carries it
+
+
+def test_engine_display_names() -> None:
+    assert dialect_for(SourceType.MYSQL).engine_display_name == "MySQL"
+    assert dialect_for(SourceType.POSTGRES).engine_display_name == "PostgreSQL"
+
+
+def test_mysql_is_transient_error_uses_mysql_codes() -> None:
+    d = dialect_for(SourceType.MYSQL)
+    assert d.is_transient_error(Exception(2013, "Lost connection during query"))
+    assert d.is_transient_error(Exception(1040, "Too many connections"))
+    assert not d.is_transient_error(Exception(1064, "You have an error in your SQL"))
+    # A PG-style string SQLSTATE means NOTHING to the MySQL classifier (proves why the
+    # per-engine dispatch is needed): a PG failover would go un-retried under MySQL rules.
+    assert not d.is_transient_error(_PgErr("57P03", "the database system is starting up"))
+
+
+def test_mysql_is_too_many_connections() -> None:
+    d = dialect_for(SourceType.MYSQL)
+    assert d.is_too_many_connections(Exception(1040, "Too many connections"))
+    assert d.is_too_many_connections(Exception(0, "ERROR: too many connections"))
+    assert not d.is_too_many_connections(Exception(2013, "Lost connection"))
+
+
+def test_postgres_is_transient_error_by_sqlstate() -> None:
+    import socket
+
+    d = dialect_for(SourceType.POSTGRES)
+    # Connection class 08 and the operator-intervention / insufficient-resource states.
+    assert d.is_transient_error(_PgErr("08006", "connection failure"))
+    assert d.is_transient_error(_PgErr("57P01", "admin shutdown"))
+    assert d.is_transient_error(_PgErr("57P03", "cannot connect now (failover)"))
+    assert d.is_transient_error(_PgErr("53300", "too many clients already"))
+    # query_canceled (57014): the Full Load per-page read timeout (statement_timeout)
+    # firing on a stalled/over-long page -- the analog of MySQL's socket read_timeout, so
+    # it must auto-retry (parity fix; without it a timed-out PG page would fail unretried).
+    assert d.is_transient_error(
+        _PgErr("57014", "canceling statement due to statement timeout")
+    )
+    # Wrapped by SQLAlchemy: the real sqlstate is on .orig.
+    assert d.is_transient_error(_Wrapped(_PgErr("08006")))
+    # A socket timeout (stalled read) is transient.
+    assert d.is_transient_error(socket.timeout())
+    # A genuine data/constraint error carries a decisive non-transient SQLSTATE.
+    assert not d.is_transient_error(_PgErr("23505", "duplicate key value"))
+    assert not d.is_transient_error(_PgErr("42601", "syntax error at or near"))
+
+
+def test_postgres_is_transient_error_no_sqlstate_paths() -> None:
+    d = dialect_for(SourceType.POSTGRES)
+    # A psycopg connection-level error type with NO sqlstate (server never answered).
+    op = type("OperationalError", (Exception,), {})
+    op.__module__ = "psycopg"
+    assert d.is_transient_error(op("server closed the connection unexpectedly"))
+    # Wrapped/re-raised losing the type+code: fall back to a known drop signature.
+    assert d.is_transient_error(Exception("connection reset by peer"))
+    # No sqlstate, no matching signature, not a psycopg type -> NOT transient.
+    assert not d.is_transient_error(ValueError("some unrelated structural error"))
+
+
+def test_postgres_is_too_many_connections() -> None:
+    d = dialect_for(SourceType.POSTGRES)
+    assert d.is_too_many_connections(_PgErr("53300", "sorry, too many clients already"))
+    assert d.is_too_many_connections(_Wrapped(_PgErr("53300")))
+    assert d.is_too_many_connections(Exception("remaining connection slots are reserved"))
+    assert not d.is_too_many_connections(_PgErr("08006", "connection failure"))
+
+
+class _MyStatusResult:
+    def __init__(self, value) -> None:
+        self._value = value
+
+    def first(self):  # noqa: ANN201
+        return ("Threads_running", str(self._value)) if self._value is not None else None
+
+
+class _MyStatusConn:
+    def __init__(self, value) -> None:
+        self._value = value
+
+    def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        assert "GLOBAL STATUS" in str(statement)  # MySQL metric, never on PG
+        return _MyStatusResult(self._value)
+
+
+class _PgScalar:
+    def __init__(self, value) -> None:
+        self._value = value
+
+    def scalar(self):  # noqa: ANN201
+        return self._value
+
+
+class _PgActivityConn:
+    def __init__(self, value, *, raise_error: bool = False) -> None:
+        self._value = value
+        self._raise = raise_error
+
+    def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        if self._raise:
+            raise RuntimeError("probe failed")
+        assert "pg_stat_activity" in str(statement)  # PG metric, never a MySQL SHOW
+        return _PgScalar(self._value)
+
+
+def test_mysql_read_active_query_count_reads_threads_running() -> None:
+    d = dialect_for(SourceType.MYSQL)
+    assert d.read_active_query_count(_MyStatusConn(7)) == 7
+    assert d.read_active_query_count(_MyStatusConn(None)) is None
+
+
+def test_postgres_read_active_query_count_reads_pg_stat_activity() -> None:
+    d = dialect_for(SourceType.POSTGRES)
+    assert d.read_active_query_count(_PgActivityConn(3)) == 3
+    assert d.read_active_query_count(_PgActivityConn(None)) is None
+    # Fail-open: any error -> None so the governor never stalls the load.
+    assert d.read_active_query_count(_PgActivityConn(1, raise_error=True)) is None
+
+
 def test_database_is_schema_flag_per_engine() -> None:
     # MySQL: a database IS a schema, so a set `database` reflects that one schema. A
     # PostgreSQL "database" is the connection whose schemas (public, app, ...) must ALL be

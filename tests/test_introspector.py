@@ -810,3 +810,51 @@ def test_source_error_hint_explains_failover_and_reassures() -> None:
     # No hint invented for an unrelated error (it would be misleading).
     assert source_error_hint(_pymysql_operational(1054, "Unknown column")) is None
     assert is_source_transient_error(_pymysql_operational(1054, "Unknown column")) is False
+
+
+class _PgErr(Exception):
+    """A psycopg-shaped error carrying a string ``.sqlstate``."""
+
+    def __init__(self, sqlstate: str, message: str = "") -> None:
+        super().__init__(message or sqlstate)
+        self.sqlstate = sqlstate
+
+
+def test_is_source_transient_error_dispatches_by_source_type() -> None:
+    from dsql_migrator.core.introspector import is_source_transient_error
+    from dsql_migrator.core.models import SourceType
+
+    failover = _PgErr("57P03", "cannot connect now, the DB is starting up")
+    # Under PostgreSQL dispatch a PG failover SQLSTATE is transient (auto-retried)...
+    assert is_source_transient_error(failover, SourceType.POSTGRES) is True
+    # ...but the default (MySQL) classifier never fires for a string SQLSTATE -- which is
+    # exactly the bug this dispatch fixes (a PG failover would otherwise not auto-retry).
+    assert is_source_transient_error(failover) is False
+    assert is_source_transient_error(failover, SourceType.MYSQL) is False
+    # A PG data error is NOT transient under PG dispatch.
+    assert is_source_transient_error(_PgErr("23505", "dup key"), SourceType.POSTGRES) is False
+
+
+def test_source_error_hint_is_worded_for_the_source_engine() -> None:
+    from dsql_migrator.core.introspector import (
+        SOURCE_CONNECTION_LOST_HINT,
+        source_error_hint,
+    )
+    from dsql_migrator.core.models import SourceType
+
+    # PostgreSQL: the dropped-connection hint names PostgreSQL, not MySQL.
+    pg_hint = source_error_hint(_PgErr("08006", "connection failure"), SourceType.POSTGRES)
+    assert pg_hint is not None
+    assert "PostgreSQL" in pg_hint and "MySQL" not in pg_hint
+    assert "idempotent" in pg_hint.lower()
+    # PostgreSQL too-many-connections (53300) gets the connection-limit hint, PG-worded.
+    pg_toomany = source_error_hint(
+        _PgErr("53300", "too many clients already"), SourceType.POSTGRES
+    )
+    assert pg_toomany is not None
+    assert "PostgreSQL" in pg_toomany and "connection" in pg_toomany.lower()
+    # Back-compat: the MySQL-rendered constant is unchanged and the default dispatch
+    # still words the hint for MySQL.
+    assert SOURCE_CONNECTION_LOST_HINT.startswith("The source MySQL connection dropped")
+    mysql_hint = source_error_hint(_pymysql_operational(2013, "Lost connection"))
+    assert mysql_hint is not None and "MySQL" in mysql_hint and "PostgreSQL" not in mysql_hint

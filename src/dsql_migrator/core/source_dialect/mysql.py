@@ -15,6 +15,8 @@ from typing import Optional
 from dsql_migrator.core.introspector import (
     MYSQL_DRIVER,
     MYSQL_SYSTEM_SCHEMAS,
+    _mysql_source_transient,
+    _mysql_too_many_connections,
     source_engine_kwargs,
 )
 from dsql_migrator.core.models import SourceType
@@ -164,6 +166,26 @@ class MySQLSourceDialect(SourceDialect):
         except Exception:  # noqa: BLE001 - treated as "no grants visible"
             return []
         return [str(row[0]) for row in rows if row]
+
+    @property
+    def engine_display_name(self) -> str:
+        return "MySQL"
+
+    def is_transient_error(self, exc: BaseException) -> bool:
+        # MySQL driver codes / socket timeout / message signatures (see the classifier).
+        return _mysql_source_transient(exc)
+
+    def is_too_many_connections(self, exc: BaseException) -> bool:
+        # MySQL "too many connections" (ER_CON_COUNT_ERROR 1040 / 1203).
+        return _mysql_too_many_connections(exc)
+
+    def read_active_query_count(self, connection: object) -> Optional[int]:
+        # MySQL live active-query concurrency = global Threads_running (SHOW GLOBAL
+        # STATUS). Lazy import to avoid an import cycle (exporter imports the dialect
+        # registry). Fail-open (None) is handled inside _read_threads_running.
+        from dsql_migrator.core.exporter import _read_threads_running
+
+        return _read_threads_running(connection)
 
 
 __all__ = ["MySQLSourceDialect"]

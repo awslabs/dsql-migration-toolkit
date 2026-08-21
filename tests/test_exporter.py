@@ -459,6 +459,30 @@ def test_governor_caches_reading_within_ttl() -> None:
     assert conn.status_reads == 1  # second call reused the cached value
 
 
+def test_governor_uses_injected_metric_reader_not_a_hardcoded_query() -> None:
+    # The governor reads its metric through the injected ``metric_reader`` (a PostgreSQL
+    # source passes the dialect's pg_stat_activity reader), so it NEVER runs a hardcoded
+    # MySQL ``SHOW GLOBAL STATUS`` on the connection. A connection whose execute() raises
+    # proves the governor touches ONLY the reader -- the fix for a PG snapshot connection,
+    # where a MySQL SHOW would be a syntax error that aborts the snapshot transaction.
+    class _NoSqlConn:
+        def execute(self, *_a, **_k):  # noqa: ANN002, ANN003, ANN202
+            raise AssertionError("governor must not run SQL on the connection directly")
+
+    seen = []
+
+    def _reader(conn):  # noqa: ANN001, ANN202
+        seen.append(conn)
+        return 0  # at/below the ceiling -> no pause
+
+    gov = SourceLoadGovernor(
+        _NoSqlConn(), 5, sleep=lambda _s: None, metric_reader=_reader
+    )
+    gov.throttle()
+    assert seen, "the injected metric_reader must be used"
+    # Reaching here (no AssertionError) proves the governor never queried the connection.
+
+
 def test_keyset_stream_throttles_before_each_page() -> None:
     # The governor is asked to throttle at the same between-pages point as the cancel
     # poll: exactly once before each page fetch.

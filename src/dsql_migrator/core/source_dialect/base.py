@@ -259,6 +259,54 @@ class SourceDialect(ABC):
         gathered per dialect, not with one MySQL statement run against every engine.
         """
 
+    @property
+    @abstractmethod
+    def engine_display_name(self) -> str:
+        """Human-facing engine name for operator messages (``MySQL`` / ``PostgreSQL``).
+
+        Used to word the source-failure hints for the right engine so a PostgreSQL
+        migration never shows "the source MySQL connection dropped".
+        """
+
+    @abstractmethod
+    def is_transient_error(self, exc: BaseException) -> bool:
+        """True for a SOURCE failure a fresh connection can recover from (retry it).
+
+        The Full Load's source read is where this matters: an Aurora failover / any
+        connection drop / stall kills the in-flight read of a large table, but the table
+        is NOT broken -- re-reading from a new connection succeeds -- so it is worth an
+        automatic retry, whereas a genuine data/schema error would fail identically
+        forever and must surface at once. The recoverable shapes are engine-specific
+        (MySQL numeric driver codes; PostgreSQL SQLSTATE classes on ``.sqlstate``), so
+        each dialect classifies its own -- a MySQL-only classifier silently never fires
+        for psycopg (which carries a string SQLSTATE, not an int code), leaving a PG
+        failover un-retried. Anything unrecognized is NON-transient (never retried).
+        """
+
+    @abstractmethod
+    def is_too_many_connections(self, exc: BaseException) -> bool:
+        """True when the SOURCE refused a connection for lack of free slots.
+
+        A subset of the transient errors that needs different advice (reduce reader
+        concurrency / raise the source limit, not just "wait and re-run"). MySQL uses
+        error codes 1040/1203; PostgreSQL uses SQLSTATE ``53300``.
+        """
+
+    @abstractmethod
+    def read_active_query_count(self, connection: object) -> Optional[int]:
+        """Read the source's live active-query concurrency, or ``None`` on any failure.
+
+        Feeds the opt-in :class:`~dsql_migrator.core.exporter.SourceLoadGovernor`, which
+        pauses Full Load reads while this exceeds a ceiling (protecting a live-serving
+        source). The metric is engine-specific: MySQL reads global ``Threads_running``
+        (``SHOW GLOBAL STATUS``), PostgreSQL counts ``active`` backends in
+        ``pg_stat_activity``. It MUST be a valid statement for the engine AND succeed
+        inside the export's open snapshot transaction -- a MySQL ``SHOW`` run on a
+        PostgreSQL source is a syntax error that would ABORT that transaction and fail
+        every subsequent page read. Best effort: any failure returns ``None`` so the
+        governor fails open (treats it as "don't throttle") and never stalls the load.
+        """
+
 
 __all__ = [
     "SourceDialect",

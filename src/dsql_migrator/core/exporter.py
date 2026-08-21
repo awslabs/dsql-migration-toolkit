@@ -615,8 +615,15 @@ class SourceLoadGovernor:
         ttl_seconds: float = _GOVERNOR_STATUS_TTL_SECONDS,
         slice_seconds: float = _GOVERNOR_WAIT_SLICE_SECONDS,
         on_state_change: Optional[Callable[[bool, Optional[int]], None]] = None,
+        metric_reader: Callable[[_Connection], Optional[int]] = _read_threads_running,
     ) -> None:
         self._connection = connection
+        # How to read the source's live active-query concurrency. Defaults to MySQL's
+        # global Threads_running; a PostgreSQL source passes the dialect's
+        # pg_stat_activity reader so the governor NEVER runs MySQL-only SQL on the
+        # snapshot connection (which on PG would be a syntax error that aborts the
+        # snapshot transaction and fails every subsequent page read).
+        self._metric_reader = metric_reader
         # Normalize the ceiling: None / 0 / negative all mean OFF (0 is the config's
         # "off" sentinel), so the rest of the class only checks ``is None``.
         self._ceiling = (
@@ -649,7 +656,7 @@ class SourceLoadGovernor:
             and (now - self._cached_at) < self._ttl
         ):
             return self._cached_value
-        value = _read_threads_running(self._connection)
+        value = self._metric_reader(self._connection)
         self._cached_value = value
         self._cached_at = now
         return value
@@ -660,13 +667,13 @@ class SourceLoadGovernor:
         self._paused = paused
         if paused:
             _LOGGER.warning(
-                "Full Load paused: source Threads_running=%s exceeds the configured "
+                "Full Load paused: source active-query count=%s exceeds the configured "
                 "ceiling %s -- waiting for source load to recede.",
                 running, self._ceiling,
             )
         else:
             _LOGGER.info(
-                "Full Load resumed: source Threads_running=%s is at/below the "
+                "Full Load resumed: source active-query count=%s is at/below the "
                 "ceiling %s.", running, self._ceiling,
             )
         if self._on_state_change is not None:
@@ -1026,6 +1033,9 @@ class TableExporter:
                         snapshot,
                         self._max_source_threads_running,
                         on_state_change=on_throttle,
+                        # Engine-correct metric: MySQL Threads_running vs PostgreSQL
+                        # pg_stat_activity. Never runs MySQL SQL on a PG snapshot conn.
+                        metric_reader=dialect.read_active_query_count,
                     )
                     if self._max_source_threads_running
                     else None

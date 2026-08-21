@@ -5,6 +5,29 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.388
+
+### Fixed
+
+- **PostgreSQL source: three source-read behaviors no longer assume MySQL** (no change
+  for MySQL sources).
+  - The optional Full Load **read throttle** (max source active queries) polled a
+    MySQL-only `SHOW GLOBAL STATUS` on the source's snapshot connection. On a PostgreSQL
+    source that is invalid SQL that would abort the snapshot transaction and then fail
+    every table read once the throttle was enabled. It now reads the engine's real
+    metric — MySQL `Threads_running`, PostgreSQL active backends from `pg_stat_activity`
+    — so the throttle works on PostgreSQL and never runs the wrong statement on the
+    snapshot.
+  - The **auto-retry** that recovers a source connection dropped mid-load (e.g. an
+    Aurora failover) recognized only MySQL error codes/messages, so a PostgreSQL drop
+    was not retried and the table was left for a manual re-run. It now also recognizes
+    PostgreSQL connection SQLSTATEs (class `08`, failover/shutdown `57P0x`,
+    too-many-connections `53300`, and a timed-out page `57014` — the read-timeout
+    analog of MySQL's socket timeout), so a PostgreSQL source auto-recovers like MySQL.
+  - The operator **hint** shown when a source connection drops said "the source MySQL
+    connection dropped" even for a PostgreSQL source; it is now worded for the actual
+    source engine.
+
 ## v0.1.387
 
 ### Fixed

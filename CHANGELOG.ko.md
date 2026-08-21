@@ -5,6 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.388
+
+### 수정 (Fixed)
+
+- **PostgreSQL 소스: 소스 읽기 관련 동작 3가지가 더 이상 MySQL을 가정하지 않습니다**(MySQL
+  소스는 동작 변화 없음).
+  - Full Load의 선택적 **읽기 스로틀**(소스 동시 쿼리 상한)이 소스 스냅샷 커넥션에서 MySQL
+    전용 `SHOW GLOBAL STATUS`를 조회했습니다. PostgreSQL 소스에서는 잘못된 구문이라 스냅샷
+    트랜잭션을 abort시키고, 스로틀을 켠 순간 모든 테이블 읽기가 실패했습니다. 이제 엔진별
+    실제 지표 — MySQL `Threads_running`, PostgreSQL은 `pg_stat_activity`의 active 백엔드 수
+    — 를 읽으므로 PostgreSQL에서도 스로틀이 동작하고 스냅샷에 엉뚱한 구문을 실행하지 않습니다.
+  - 로드 중 끊어진 소스 커넥션(예: Aurora 페일오버)을 복구하는 **자동 재시도**가 MySQL 에러
+    코드/메시지만 인식해서, PostgreSQL 연결 끊김은 재시도되지 않고 수동 재실행 대상으로
+    남았습니다. 이제 PostgreSQL 연결 SQLSTATE(class `08`, 페일오버/셧다운 `57P0x`, 연결 초과
+    `53300`, 그리고 페이지 읽기 타임아웃 `57014` — MySQL 소켓 타임아웃에 해당)도 인식하여
+    MySQL처럼 자동 복구합니다.
+  - 소스 커넥션이 끊겼을 때 표시되는 운영자 **힌트**가 PostgreSQL 소스에서도 "the source
+    MySQL connection dropped"라고 표시되던 것을, 실제 소스 엔진에 맞게 표기하도록 고쳤습니다.
+
 ## v0.1.387
 
 ### 수정 (Fixed)

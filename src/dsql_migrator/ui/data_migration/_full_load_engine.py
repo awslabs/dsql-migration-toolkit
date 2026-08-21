@@ -722,7 +722,14 @@ def _report_progress(
         pass
 
 
-def _retry_source_drops_in_process(work, *, cancelled, table_name: str, release=None):
+def _retry_source_drops_in_process(
+    work,
+    *,
+    cancelled,
+    table_name: str,
+    release=None,
+    source_type: SourceType = SourceType.MYSQL,
+):
     """Run ``work()`` in a child process, retrying a dropped SOURCE connection.
 
     The in-process twin of :func:`_migrate_table_with_source_retry` (see it for why a
@@ -753,7 +760,7 @@ def _retry_source_drops_in_process(work, *, cancelled, table_name: str, release=
         except ExportCancelled:
             raise
         except Exception as exc:  # noqa: BLE001 - classify transient vs permanent
-            if attempt >= attempts or not is_source_transient_error(exc):
+            if attempt >= attempts or not is_source_transient_error(exc, source_type):
                 raise
             if cancelled():
                 raise
@@ -914,7 +921,10 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
 
         outcome = _as_load_result(
             _retry_source_drops_in_process(
-                _load_table, cancelled=_is_cancelled, table_name=name
+                _load_table,
+                cancelled=_is_cancelled,
+                table_name=name,
+                source_type=args.inputs.source_config.source_type,
             )
         )
         # Flush remaining progress.
@@ -1066,6 +1076,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
         result = _retry_source_drops_in_process(
             _attempt, cancelled=_is_cancelled, table_name=name,
             release=_release_rows,
+            source_type=args.inputs.source_config.source_type,
         )
         if (pending_loaded or pending_skipped) and progress_queue is not None:
             _report_progress(progress_queue, (name, pending_loaded, pending_skipped))
@@ -1435,7 +1446,10 @@ def _migrate_table_with_source_retry(
         except _FullLoadStopped:
             raise  # a user stop is not a failure to retry
         except Exception as exc:  # noqa: BLE001 - classify transient vs permanent
-            if attempt >= attempts or not is_source_transient_error(exc):
+            # A fake migrator (tests) may not expose source_type; default to MySQL,
+            # matching the doubles' simulated source.
+            source_type = getattr(migrator, "source_type", SourceType.MYSQL)
+            if attempt >= attempts or not is_source_transient_error(exc, source_type):
                 raise
             if handle.cancelled:
                 raise
@@ -1564,7 +1578,12 @@ def _migrate_one_table(
         # back to the DSQL target-side hint (OCC exhaustion, per-table limit, constraint
         # / data rejection) so a target failure also explains what to do next, not just
         # the bare driver text.
-        hint = source_error_hint(exc) or target_error_hint(exc)
+        hint = (
+            source_error_hint(
+                exc, getattr(migrator, "source_type", SourceType.MYSQL)
+            )
+            or target_error_hint(exc)
+        )
         if hint:
             message = f"{message} — {hint}"
         _LOGGER.warning("Full Load failed for table %s: %s", name, message)
@@ -2825,6 +2844,12 @@ class BatchedTableMigrator:
         # the append path when the applied conversion asks for a different key than
         # the source, to decide against the live target instead of assuming.
         self._target_pk_reader = target_pk_reader or self._default_target_pk
+
+    @property
+    def source_type(self) -> SourceType:
+        """The source engine this migrator reads (drives engine-specific source-error
+        classification / hints on the retry path)."""
+        return self._inputs.source_config.source_type
 
     def capture_watermark(self, tables: Sequence[TableDef]) -> Watermark:
         """Capture the export consistency point for the selected ``tables``.

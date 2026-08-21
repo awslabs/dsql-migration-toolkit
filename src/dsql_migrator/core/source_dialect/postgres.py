@@ -29,6 +29,33 @@ from dsql_migrator.core.source_dialect.base import (
 # System schemas excluded when resolving a bare (unqualified) table name to its columns.
 _PG_SYSTEM_SCHEMAS_SQL = "('pg_catalog', 'information_schema', 'pg_toast')"
 
+# PostgreSQL SQLSTATEs (beyond connection class ``08``) that a fresh connection +
+# idempotent re-read recovers from during Full Load: operator_intervention (57P0x --
+# admin/crash shutdown and cannot_connect_now during a failover), insufficient_resources
+# (53300 too_many_connections / 53400 configuration_limit), which drain as other readers
+# finish, and query_canceled (57014). 57014 is how the Full Load per-page read timeout
+# surfaces on PostgreSQL: ``read_timeout_seconds`` is applied as libpq ``statement_timeout``
+# (see engine_kwargs), so a stalled or over-long page is canceled with 57014 -- the exact
+# analog of MySQL's socket ``read_timeout`` (a stall -> socket.timeout, classified transient)
+# -- and must likewise auto-retry the table from a fresh snapshot (the read path's only
+# source of 57014; a cooperative Stop raises ExportCancelled, not a driver cancel). A
+# genuine data/schema error carries a 22/23/42 SQLSTATE and is therefore NOT matched
+# (never retried into a delay loop); bounded retry attempts stop a page that never completes.
+_PG_TRANSIENT_SQLSTATES = frozenset(
+    {"57P01", "57P02", "57P03", "53300", "53400", "57014"}
+)
+
+
+def _pg_error_candidates(exc: BaseException) -> list[BaseException]:
+    """The exception plus its wrapped ``.orig`` / ``.__cause__`` (psycopg under
+    SQLAlchemy keeps the real ``.sqlstate`` on ``.orig``)."""
+    candidates: list[BaseException] = [exc]
+    for attr in ("orig", "__cause__"):
+        nested = getattr(exc, attr, None)
+        if nested is not None and nested is not exc:
+            candidates.append(nested)
+    return candidates
+
 
 def _reads_as_text(type_string: str) -> bool:
     """True for PG types Full Load must read via a text cast rather than natively.
@@ -266,6 +293,79 @@ class PostgresSourceDialect(SourceDialect):
         except Exception:  # noqa: BLE001 - treated as "no grants visible"
             return []
         return [str(row[0]) for row in rows if row]
+
+    @property
+    def engine_display_name(self) -> str:
+        return "PostgreSQL"
+
+    def is_transient_error(self, exc: BaseException) -> bool:
+        # psycopg carries a STRING SQLSTATE on .sqlstate (never an int code like MySQL),
+        # so the MySQL classifier would never fire for a PG source. Classify by SQLSTATE:
+        # connection class 08 or the operator-intervention/insufficient-resource states a
+        # fresh connection recovers from. A decisive non-transient SQLSTATE (22/23/42 data
+        # or schema error) means NOT transient -- never fall through to signatures. Only
+        # when NO SQLSTATE is present anywhere (server never answered: a dropped socket /
+        # TLS teardown / connect timeout the wrapper may have flattened) do we treat a
+        # psycopg connection-level error type, or a known drop signature, as transient.
+        import socket
+
+        candidates = _pg_error_candidates(exc)
+        saw_sqlstate = False
+        for candidate in candidates:
+            if isinstance(candidate, (socket.timeout, TimeoutError)):
+                return True
+            state = getattr(candidate, "sqlstate", None)
+            if isinstance(state, str):
+                saw_sqlstate = True
+                if state.startswith("08") or state in _PG_TRANSIENT_SQLSTATES:
+                    return True
+        if saw_sqlstate:
+            return False  # a real, non-transient SQLSTATE is authoritative
+        for candidate in candidates:
+            module = type(candidate).__module__ or ""
+            name = type(candidate).__name__
+            if module.startswith("psycopg") and name in (
+                "OperationalError",
+                "InterfaceError",
+            ):
+                return True
+        from dsql_migrator.core.target_connection import TRANSIENT_CONN_SIGNATURES
+
+        message = str(exc).lower()
+        return any(sig in message for sig in TRANSIENT_CONN_SIGNATURES)
+
+    def is_too_many_connections(self, exc: BaseException) -> bool:
+        # PostgreSQL too_many_connections is SQLSTATE 53300 (its message is
+        # "sorry, too many clients already" / "remaining connection slots are reserved").
+        for candidate in _pg_error_candidates(exc):
+            state = getattr(candidate, "sqlstate", None)
+            if isinstance(state, str) and state == "53300":
+                return True
+        low = str(exc).lower()
+        return (
+            "too many clients" in low
+            or "too many connections" in low
+            or "remaining connection slots" in low
+        )
+
+    def read_active_query_count(self, connection: object) -> Optional[int]:
+        # PostgreSQL live active-query concurrency = backends currently executing a query
+        # in pg_stat_activity (state='active'). This is a plain SELECT that SUCCEEDS
+        # inside the export's REPEATABLE READ snapshot (so it never aborts the txn the way
+        # a MySQL SHOW would) and reads live shared-memory state (not the MVCC snapshot),
+        # so the governor sees current load. pg_stat_activity.state exists on every
+        # supported PostgreSQL (9.2+). Fail-open: None on any error -> governor won't
+        # throttle (and never stalls the load).
+        try:
+            value = connection.execute(  # type: ignore[attr-defined]
+                text("SELECT count(*) FROM pg_stat_activity WHERE state = 'active'")
+            ).scalar()
+        except Exception:  # noqa: BLE001 - best-effort; never fail the load on a probe
+            return None
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
 
 
 __all__ = ["PostgresSourceDialect"]
