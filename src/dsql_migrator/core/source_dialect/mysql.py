@@ -151,5 +151,19 @@ class MySQLSourceDialect(SourceDialect):
             aurora_version=probe_scalar(connection, "SELECT @@aurora_version"),
         )
 
+    def probe_grants(self, connection: object) -> list[str]:
+        # MySQL exposes the current user's privileges as raw ACL lines via SHOW GRANTS.
+        # Best effort: any error is treated as "no grants visible" (empty), so the
+        # privilege check reports a FAIL with remediation rather than crashing the run.
+        from sqlalchemy import text
+
+        try:
+            rows = connection.execute(  # type: ignore[attr-defined]
+                text("SHOW GRANTS")
+            ).fetchall()
+        except Exception:  # noqa: BLE001 - treated as "no grants visible"
+            return []
+        return [str(row[0]) for row in rows if row]
+
 
 __all__ = ["MySQLSourceDialect"]

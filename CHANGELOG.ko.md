@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.387
+
+### 수정 (Fixed)
+
+- **PostgreSQL 소스: Full Load "필수 권한" 점검이 더 이상 잘못 실패하지 않습니다.** 소스
+  사용자가 데이터를 읽을 수 있는지 확인하는 사전 점검이 MySQL의 `SHOW GRANTS`로 권한을
+  조회했는데, 이 구문은 PostgreSQL에 존재하지 않습니다. 그래서 PostgreSQL 소스에서는 권한이
+  하나도 보이지 않아 "SELECT 권한 없음"이라는 잘못된 실패를 보고했고, 권한이 충분한
+  사용자에게도 **Full Load가 차단**되었습니다. 이제 권한 조회를 엔진별로 분리했습니다.
+  MySQL은 그대로 `SHOW GRANTS`를 사용하고, PostgreSQL은 슈퍼유저면 전체 권한으로, 그렇지
+  않으면 현재 롤의 테이블 권한을 읽어 판단합니다. MySQL 소스는 동작이 바뀌지 않습니다.
+
 ## v0.1.386
 
 ### 추가 (Added)

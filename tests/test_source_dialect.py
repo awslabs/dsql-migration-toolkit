@@ -354,6 +354,87 @@ def test_probe_versions_all_none_when_every_probe_fails() -> None:
     assert dialect_for(SourceType.MYSQL).probe_versions(conn) == SourceVersions()
 
 
+# ---------------------------------------------------------------------------
+# probe_grants -- engine-specific source privilege probe (feeds the "required
+# privileges" Full Load prerequisite). PostgreSQL has no SHOW GRANTS, so running
+# MySQL's statement against it would empty-out to a FALSE "SELECT missing" FAIL.
+# ---------------------------------------------------------------------------
+
+
+class _GrantsResult:
+    def __init__(self, scalar_value=None, rows=None) -> None:
+        self._scalar = scalar_value
+        self._rows = rows or []
+
+    def scalar(self):  # noqa: ANN201
+        return self._scalar
+
+    def fetchall(self):  # noqa: ANN201
+        return self._rows
+
+
+class _FakeGrantsConnection:
+    """Dispatches a grant probe by SQL substring; an unmatched query raises.
+
+    ``super`` answers ``current_setting('is_superuser')``; ``pg_rows`` answers the
+    ``role_table_grants`` query; ``mysql_rows`` answers ``SHOW GRANTS``. A query with
+    no configured answer raises, proving nothing else is issued.
+    """
+
+    def __init__(self, *, super=None, pg_rows=None, mysql_rows=None) -> None:
+        self._super = super
+        self._pg_rows = pg_rows
+        self._mysql_rows = mysql_rows
+
+    def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        sql = str(statement).upper()
+        if "IS_SUPERUSER" in sql:
+            return _GrantsResult(scalar_value=self._super)
+        if "ROLE_TABLE_GRANTS" in sql:
+            return _GrantsResult(rows=self._pg_rows or [])
+        if "SHOW GRANTS" in sql:
+            return _GrantsResult(rows=self._mysql_rows or [])
+        raise RuntimeError(f"unexpected grant probe SQL: {sql!r}")
+
+
+def test_mysql_probe_grants_reads_show_grants() -> None:
+    conn = _FakeGrantsConnection(
+        mysql_rows=[("GRANT SELECT, INSERT ON `shop`.* TO `migrator`@`%`",)]
+    )
+    grants = dialect_for(SourceType.MYSQL).probe_grants(conn)
+    assert grants == ["GRANT SELECT, INSERT ON `shop`.* TO `migrator`@`%`"]
+
+
+def test_mysql_probe_grants_empty_on_error() -> None:
+    class _Boom:
+        def execute(self, *_a, **_k):  # noqa: ANN002, ANN003, ANN201
+            raise RuntimeError("SHOW GRANTS failed")
+
+    assert dialect_for(SourceType.MYSQL).probe_grants(_Boom()) == []
+
+
+def test_postgres_probe_grants_superuser_reports_all_privileges() -> None:
+    # A PG superuser bypasses every privilege check -> ALL PRIVILEGES (which satisfies
+    # any requirement), WITHOUT ever querying role_table_grants (pg_rows unset -> would
+    # raise if reached).
+    conn = _FakeGrantsConnection(super="on")
+    assert dialect_for(SourceType.POSTGRES).probe_grants(conn) == ["ALL PRIVILEGES"]
+
+
+def test_postgres_probe_grants_non_superuser_lists_table_privileges() -> None:
+    # A non-superuser's grants come from role_table_grants; SELECT being present makes
+    # the Full Load privilege check pass.
+    conn = _FakeGrantsConnection(super="off", pg_rows=[("SELECT",), ("INSERT",)])
+    grants = dialect_for(SourceType.POSTGRES).probe_grants(conn)
+    assert grants == ["SELECT", "INSERT"]
+    assert " ".join(grants).upper().find("SELECT") != -1
+
+
+def test_postgres_probe_grants_empty_when_no_grants_and_not_super() -> None:
+    conn = _FakeGrantsConnection(super="off", pg_rows=[])
+    assert dialect_for(SourceType.POSTGRES).probe_grants(conn) == []
+
+
 def test_database_is_schema_flag_per_engine() -> None:
     # MySQL: a database IS a schema, so a set `database` reflects that one schema. A
     # PostgreSQL "database" is the connection whose schemas (public, app, ...) must ALL be

@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.387
+
+### Fixed
+
+- **PostgreSQL source: the Full Load "required privileges" check no longer fails by
+  mistake.** The prerequisite that confirms the source user can read the data was
+  probing privileges with MySQL's `SHOW GRANTS`, which does not exist on PostgreSQL — so
+  on a PostgreSQL source it saw no grants and reported a false "SELECT missing" failure
+  that **blocked the Full Load**, even for a fully-privileged user. The grant probe is
+  now engine-specific: MySQL still uses `SHOW GRANTS`; PostgreSQL reports full access for
+  a superuser and otherwise reads the current role's table privileges. No change for
+  MySQL sources.
+
 ## v0.1.386
 
 ### Added

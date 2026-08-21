@@ -10,8 +10,9 @@ connections into the read-only :class:`SourceProbe` / :class:`TargetProbe` /
 :class:`MskProbe` surfaces the :class:`PrerequisiteChecker` consumes.
 
 Every probe is **read-only** (Property 1): the source adapter runs only
-``SELECT 1`` / ``SHOW GLOBAL VARIABLES`` / ``SHOW GRANTS``, and the target
-adapter only validates connectivity and reads the catalog. Probe methods are
+``SELECT 1`` / ``SHOW GLOBAL VARIABLES`` and the dialect's engine-specific grant
+probe, and the target adapter only validates connectivity and reads the catalog.
+Probe methods are
 defensive: any access error is turned into a "not satisfied" result (a failing
 :class:`ConnectionResult`, empty grants/variables, or ``False`` existence) so the
 corresponding check reports a ``FAIL`` with actionable remediation rather than
@@ -57,7 +58,7 @@ _CDC_VARIABLES = ("log_bin", "binlog_format", "binlog_row_image", "gtid_mode")
 
 
 class SessionSourceProbe:
-    """Read-only :class:`SourceProbe` over a session's source MySQL connection."""
+    """Read-only :class:`SourceProbe` over a session's source connection (any engine)."""
 
     def __init__(
         self,
@@ -81,12 +82,21 @@ class SessionSourceProbe:
             )
 
     def grants(self) -> list[str]:
-        """Return ``SHOW GRANTS`` lines for the source user (empty on error)."""
+        """Return the source user's privilege grant lines (empty on error).
+
+        Delegates to the source dialect so the grant surface is engine-correct: MySQL
+        reads ``SHOW GRANTS``; PostgreSQL (no ``SHOW GRANTS``) derives it from superuser
+        status / ``role_table_grants``. A single MySQL statement run against PostgreSQL
+        would error to empty and falsely FAIL the privilege prerequisite, blocking the
+        Full Load on a perfectly-privileged PG source.
+        """
+        from dsql_migrator.core.source_dialect import dialect_for
+
+        dialect = dialect_for(self._config.source_type)
         try:
             engine = self._engine_factory(self._config)
             with engine.connect() as connection:
-                rows = connection.execute(text("SHOW GRANTS")).fetchall()
-            return [str(row[0]) for row in rows if row]
+                return dialect.probe_grants(connection)
         except Exception:  # noqa: BLE001 - treated as "no grants visible"
             return []
 

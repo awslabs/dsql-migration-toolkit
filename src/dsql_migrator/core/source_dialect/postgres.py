@@ -238,5 +238,34 @@ class PostgresSourceDialect(SourceDialect):
             aurora_version=probe_scalar(connection, "SELECT aurora_version()"),
         )
 
+    def probe_grants(self, connection: object) -> list[str]:
+        # PostgreSQL has NO ``SHOW GRANTS`` (running MySQL's statement here errors ->
+        # empty -> a FALSE "SELECT missing" FAIL that blocks the Full Load). Instead:
+        # a superuser bypasses every privilege check, so report ALL PRIVILEGES; a
+        # non-superuser's table privileges come from information_schema.role_table_grants
+        # (privileges granted to the current role or PUBLIC). If SELECT is among them the
+        # Full Load privilege check passes. Coarse by design -- grant presence, not
+        # per-migrated-table -- which matches MySQL's SHOW GRANTS. Best effort: any error
+        # yields [] (the check FAILs with remediation).
+        try:
+            is_super = connection.execute(  # type: ignore[attr-defined]
+                text("SELECT current_setting('is_superuser')")
+            ).scalar()
+        except Exception:  # noqa: BLE001 - unknown -> fall through to the grants query
+            is_super = None
+        if str(is_super).lower() == "on":
+            return ["ALL PRIVILEGES"]
+        try:
+            rows = connection.execute(  # type: ignore[attr-defined]
+                text(
+                    "SELECT DISTINCT privilege_type "
+                    "FROM information_schema.role_table_grants "
+                    "WHERE grantee IN (current_user, 'PUBLIC')"
+                )
+            ).fetchall()
+        except Exception:  # noqa: BLE001 - treated as "no grants visible"
+            return []
+        return [str(row[0]) for row in rows if row]
+
 
 __all__ = ["PostgresSourceDialect"]

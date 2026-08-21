@@ -245,6 +245,20 @@ class SourceDialect(ABC):
         PostgreSQL reads ``version()`` / ``server_version`` / ``aurora_version()``.
         """
 
+    @abstractmethod
+    def probe_grants(self, connection: object) -> list[str]:
+        """Read the source user's privilege grants read-only, as raw text lines.
+
+        Feeds the "Source user has the required privileges" prerequisite, which joins +
+        upper-cases the returned blob and looks for the tokens a mode needs (Full Load:
+        ``SELECT``; ``ALL PRIVILEGES`` satisfies any). Best effort: any error yields
+        ``[]`` (the check then reports a FAIL with remediation rather than crashing).
+        The grant surface is engine-specific -- MySQL reads ``SHOW GRANTS``; PostgreSQL
+        (which has no ``SHOW GRANTS``) reports ``ALL PRIVILEGES`` for a superuser, else
+        the distinct table-privilege types granted to the current role -- so it MUST be
+        gathered per dialect, not with one MySQL statement run against every engine.
+        """
+
 
 __all__ = [
     "SourceDialect",
