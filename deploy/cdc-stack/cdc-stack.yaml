@@ -69,7 +69,11 @@ Parameters:
 
   DebeziumPluginS3Key:
     Type: String
-    Description: S3 object key of the Debezium MySQL source connector plugin zip.
+    Default: ""
+    Description: >
+      S3 object key of the Debezium MySQL source connector plugin zip. Empty for a
+      PostgreSQL source (EngineType=postgres), where the MySQL source plugin is not
+      created.
 
   DebeziumPostgresPluginS3Key:
     Type: String
@@ -1408,6 +1412,9 @@ Resources:
   # --- Custom plugins ---------------------------------------------------------
   DebeziumSourcePlugin:
     Type: AWS::KafkaConnect::CustomPlugin
+    # Created only for a MySQL source; a PostgreSQL stack creates PostgresSourcePlugin
+    # instead (and passes an empty DebeziumPluginS3Key).
+    Condition: IsMySqlSource
     Properties:
       # Name carries PluginVersion so a new artifact (key change + version bump)
       # creates a uniquely-named plugin instead of colliding on a fixed name.

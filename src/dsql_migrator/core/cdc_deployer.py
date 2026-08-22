@@ -536,13 +536,26 @@ def _patch_plugin_params(params: CdcInfraParams, upload) -> CdcInfraParams:
     """
     updates = {
         "PluginBucketArn": upload.bucket_arn,
-        "DebeziumPluginS3Key": upload.debezium_key,
         "DsqlSinkPluginS3Key": upload.dsql_sink_key,
         "LambdaSeederS3Key": upload.lambda_seeder_key,
         "PluginVersion": upload.plugin_version,
     }
-    new_filled = [(k, updates.get(k, v)) for k, v in params.filled]
+    # The source plugin key is engine-specific: a MySQL param set carries
+    # DebeziumPluginS3Key, a PostgreSQL one carries DebeziumPostgresPluginS3Key.
+    # Fill whichever the set already carries; never cross-add the other engine's key
+    # (a MySQL stack must not gain a PG plugin param and vice versa). getattr keeps
+    # this tolerant of an older PluginUploadResult without the PG field.
+    engine_keys = {
+        "DebeziumPluginS3Key": upload.debezium_key,
+        "DebeziumPostgresPluginS3Key": getattr(upload, "debezium_pg_key", ""),
+    }
+    new_filled = [
+        (k, engine_keys[k] if k in engine_keys else updates.get(k, v))
+        for k, v in params.filled
+    ]
     present = {k for k, _ in new_filled}
+    # Append only the always-present neutral plugin params, not the engine-specific
+    # source key (that must match the param set's engine).
     for k, v in updates.items():
         if k not in present:
             new_filled.append((k, v))
