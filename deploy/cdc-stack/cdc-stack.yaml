@@ -71,6 +71,13 @@ Parameters:
     Type: String
     Description: S3 object key of the Debezium MySQL source connector plugin zip.
 
+  DebeziumPostgresPluginS3Key:
+    Type: String
+    Default: ""
+    Description: >
+      S3 object key of the Debezium PostgreSQL source connector plugin zip
+      (pgoutput). Used only when EngineType=postgres; empty for a MySQL source.
+
   DsqlSinkPluginS3Key:
     Type: String
     Description: >
@@ -100,17 +107,31 @@ Parameters:
       the CustomPlugin name charset.
     AllowedPattern: "^[A-Za-z0-9._-]{1,32}$"
 
+  # --- Source engine selector -------------------------------------------------
+  # Selects which source connector the stack instantiates. Default 'mysql' keeps
+  # every existing deploy byte-identical (the PostgreSQL resources are gated off).
+  # The tool sets 'postgres' for a PostgreSQL source; exactly one source connector
+  # is created either way (they are mutually exclusive by condition and share the
+  # same ConnectorName, so all monitoring/alarms stay engine-agnostic).
+  EngineType:
+    Type: String
+    Default: mysql
+    AllowedValues: [mysql, postgres]
+    Description: Source database engine (mysql | postgres).
+
   # --- Source (MySQL) ---------------------------------------------------------
   SourceDbHostname:
     Type: String
-    Description: Source MySQL hostname (Debezium database.hostname).
+    Description: Source database hostname (Debezium database.hostname).
 
   SourceDbPort:
     Type: Number
     Default: 3306
     MinValue: 1
     MaxValue: 65535
-    Description: Source MySQL port (Debezium database.port; also connector egress).
+    Description: >
+      Source database port (Debezium database.port; also connector egress). The
+      tool supplies 3306 for MySQL and 5432 for PostgreSQL.
 
   SourceDbSecurityGroupId:
     Type: String
@@ -153,6 +174,59 @@ Parameters:
       The Kafka Connect ${provider:path:key} syntax splits on ':', so the full
       ARN cannot be used here -- supply the name only (e.g. prod/mysql/cdc-user).
       SourceSecretArn is kept separately for the IAM GetSecretValue resource scope.
+
+  # --- Source (PostgreSQL) ----------------------------------------------------
+  # Used only when EngineType=postgres. PostgreSQL logical replication has no
+  # server.id/GTID/schema-history; instead a publication + a logical replication
+  # slot (pgoutput) identify the capture. The publication and slot are pre-created
+  # out of band (publication.autocreate.mode=disabled) -- created by the tool at the
+  # Full Load consistency point for a gapless handoff (that wiring lands in a later
+  # Phase). All default to empty/inert so a MySQL deploy is unaffected.
+  PgDatabaseName:
+    Type: String
+    Default: ""
+    Description: >
+      Source PostgreSQL database to capture (Debezium database.dbname). PostgreSQL
+      captures a single database (unlike MySQL's server-wide capture).
+  PgSlotName:
+    Type: String
+    Default: ""
+    Description: >
+      Name of the pre-created logical replication slot (Debezium slot.name). The
+      slot pins the source WAL from the Full Load LSN until CDC consumes it.
+  PgPublicationName:
+    Type: String
+    Default: ""
+    Description: >
+      Name of the pre-created publication scoped to the migrated tables
+      (Debezium publication.name). Never FOR ALL TABLES (that would break
+      UPDATE/DELETE on the source's no-PK tables).
+  PgPublicationAutocreateMode:
+    Type: String
+    Default: disabled
+    AllowedValues: [disabled, filtered, all_tables]
+    Description: >
+      Debezium publication.autocreate.mode. 'disabled' (default) means the tool/DBA
+      pre-creates the publication -- the safe choice; 'all_tables' is rejected by
+      design elsewhere in the tool.
+  PgSnapshotMode:
+    Type: String
+    Default: never
+    AllowedValues: [never, initial, no_data]
+    Description: >
+      Debezium PostgreSQL snapshot.mode. 'never' for the gapless Full-Load->CDC
+      handoff (the slot already holds the start LSN, so no snapshot is taken);
+      'initial' for a stand-alone CDC that should snapshot first.
+  PgHeartbeatQuery:
+    Type: String
+    Default: ""
+    Description: >
+      Optional Debezium heartbeat.action.query. On a low-traffic source a
+      PostgreSQL logical slot's confirmed_flush_lsn only advances when the captured
+      tables change, so an idle-captured window can pin WAL. A heartbeat query
+      (a write to a dedicated heartbeat table) advances it -- but it WRITES to the
+      source, so it is empty by default (the source is read-only unless the operator
+      opts in with a heartbeat table). Emitted only when non-empty.
 
   # --- Target (Aurora DSQL) ---------------------------------------------------
   DsqlClusterArn:
@@ -619,6 +693,27 @@ Conditions:
     Fn::Not:
       - Fn::Equals: [Ref: MskBootstrapServers, ""]
 
+  # Source engine gates. Exactly one source connector is created per stack. Default
+  # EngineType=mysql -> IsMySqlSource true on every existing stack, so DeployMysqlSource
+  # collapses to HasBootstrapServers (the source connector's original gate) and the
+  # PostgreSQL resources are absent -- the MySQL path is byte-identical.
+  IsMySqlSource:
+    Fn::Equals: [Ref: EngineType, "mysql"]
+  IsPostgresSource:
+    Fn::Equals: [Ref: EngineType, "postgres"]
+  DeployMysqlSource:
+    Fn::And:
+      - Condition: HasBootstrapServers
+      - Condition: IsMySqlSource
+  DeployPostgresSource:
+    Fn::And:
+      - Condition: HasBootstrapServers
+      - Condition: IsPostgresSource
+  # Optional PostgreSQL heartbeat.action.query (writes to the source; off by default).
+  HasPgHeartbeatQuery:
+    Fn::Not:
+      - Fn::Equals: [Ref: PgHeartbeatQuery, ""]
+
   # SeedMode selects who does the CDC Kafka prep. Default "Lambda" -> SeedByLambda
   # true on every existing stack, so all the seeder gates below (which AND with
   # SeedByLambda) collapse to their current value and the default path is unchanged.
@@ -691,12 +786,17 @@ Conditions:
   # implies this condition, so CdcStartPrepResource (gated on HasBootstrapServers)
   # can always reference the function's Arn / role. In practice the deployer always
   # supplies LambdaSeederS3Key, so this is effectively always true.
+  # AND IsMySqlSource: the offset seeder seeds a MySQL binlog connect-offset, so a
+  # PostgreSQL stack (which resumes from a replication slot, not a seeded offset)
+  # must never create it. No-op for MySQL (IsMySqlSource is true by default).
   DeploySeederFunction:
-    Fn::Or:
-      - Fn::Not:
-          - Fn::Equals: [Ref: MskBootstrapServers, ""]
-      - Fn::Not:
-          - Fn::Equals: [Ref: LambdaSeederS3Key, ""]
+    Fn::And:
+      - Condition: IsMySqlSource
+      - Fn::Or:
+          - Fn::Not:
+              - Fn::Equals: [Ref: MskBootstrapServers, ""]
+          - Fn::Not:
+              - Fn::Equals: [Ref: LambdaSeederS3Key, ""]
 
   # The in-VPC seeder Lambda (+ its role) and the CdcStartPrepResource that invokes
   # it are created ONLY in SeedMode=Lambda. AND-ing SeedByLambda onto the existing
@@ -1321,6 +1421,23 @@ Resources:
           FileKey:
             Ref: DebeziumPluginS3Key
 
+  # Debezium PostgreSQL source plugin (pgoutput). Created only for a PostgreSQL
+  # source; a distinct resource name from the MySQL plugin (both carry PluginVersion
+  # for immutable-name safety). Only one source plugin exists per stack.
+  PostgresSourcePlugin:
+    Type: AWS::KafkaConnect::CustomPlugin
+    Condition: IsPostgresSource
+    Properties:
+      Name:
+        Fn::Sub: ${AWS::StackName}-debezium-postgres-${PluginVersion}
+      ContentType: ZIP
+      Location:
+        S3Location:
+          BucketArn:
+            Ref: PluginBucketArn
+          FileKey:
+            Ref: DebeziumPostgresPluginS3Key
+
   DsqlSinkPlugin:
     Type: AWS::KafkaConnect::CustomPlugin
     Properties:
@@ -1552,7 +1669,7 @@ Resources:
   # is documented here rather than set inline.
   DebeziumSourceConnector:
     Type: AWS::KafkaConnect::Connector
-    Condition: HasBootstrapServers
+    Condition: DeployMysqlSource
     DependsOn:
       - MskCluster
       - ConnectorSelfIngress
@@ -1821,6 +1938,179 @@ Resources:
         # key.converter/value.converter are declared in WorkerConfiguration. They
         # are intentionally absent here to avoid split authority -- the worker
         # config is the single canonical source (connector config would shadow it).
+
+  # --- Debezium PostgreSQL source connector (pgoutput) ------------------------
+  # Created only for a PostgreSQL source (EngineType=postgres). Mirrors the MySQL
+  # source connector's shell (capacity/auth/worker/log/plugin) and shares the same
+  # ConnectorName so all monitoring/alarms stay engine-agnostic, but its config uses
+  # PostgreSQL logical replication: pgoutput + a pre-created publication + a logical
+  # replication slot (no server.id/GTID/schema-history). The tool deploys with
+  # SeedMode=External (PostgreSQL resumes from the slot's LSN, not a Kafka
+  # connect-offset seed), so there is no CdcStartPrepResource ordering edge.
+  PostgresSourceConnector:
+    Type: AWS::KafkaConnect::Connector
+    Condition: DeployPostgresSource
+    DependsOn:
+      - MskCluster
+      - ConnectorSelfIngress
+    Properties:
+      ConnectorName:
+        Fn::Sub: ${AWS::StackName}-debezium-source
+      KafkaConnectVersion:
+        Ref: KafkaConnectVersion
+      ServiceExecutionRoleArn:
+        Fn::GetAtt: [ConnectorExecutionRole, Arn]
+      Capacity:
+        ProvisionedCapacity:
+          McuCount:
+            Ref: ConnectorMcuCount
+          WorkerCount:
+            Ref: ConnectorWorkerCount
+      KafkaCluster:
+        ApacheKafkaCluster:
+          BootstrapServers:
+            Ref: MskBootstrapServers
+          Vpc:
+            SecurityGroups:
+              - Fn::GetAtt: [ConnectorSecurityGroup, GroupId]
+            Subnets:
+              Fn::If:
+                - CreateOwnedNetwork
+                - - Ref: ConnectorSubnetA
+                  - Ref: ConnectorSubnetB
+                - Ref: ConnectorSubnetIds
+      KafkaClusterClientAuthentication:
+        AuthenticationType: IAM
+      KafkaClusterEncryptionInTransit:
+        EncryptionType: TLS
+      WorkerConfiguration:
+        Revision:
+          Fn::GetAtt: [WorkerConfiguration, Revision]
+        WorkerConfigurationArn:
+          Fn::GetAtt: [WorkerConfiguration, WorkerConfigurationArn]
+      Plugins:
+        - CustomPlugin:
+            CustomPluginArn:
+              Fn::GetAtt: [PostgresSourcePlugin, CustomPluginArn]
+            Revision:
+              Fn::GetAtt: [PostgresSourcePlugin, Revision]
+      LogDelivery:
+        WorkerLogDelivery:
+          CloudWatchLogs:
+            Enabled: true
+            LogGroup:
+              Ref: ConnectorLogGroup
+      ConnectorConfiguration:
+        connector.class: io.debezium.connector.postgresql.PostgresConnector
+        tasks.max:
+          Fn::Sub: "${SourceTasksMax}"
+        database.hostname:
+          Ref: SourceDbHostname
+        database.port:
+          Fn::Sub: "${SourceDbPort}"
+        # Same Secrets Manager config-provider wiring as the MySQL source (the
+        # provider class is bundled in the PostgreSQL plugin zip too).
+        database.user:
+          Fn::Join: ["", ["${secretsManager:", Ref: SourceSecretName, ":username}"]]
+        database.password:
+          Fn::Join: ["", ["${secretsManager:", Ref: SourceSecretName, ":password}"]]
+        # PostgreSQL captures a single database (unlike MySQL's server-wide capture).
+        database.dbname:
+          Ref: PgDatabaseName
+        # pgoutput is built into RDS/Aurora PostgreSQL -- no server-side output
+        # plugin to install; only a publication + a replication slot are needed.
+        plugin.name: pgoutput
+        slot.name:
+          Ref: PgSlotName
+        publication.name:
+          Ref: PgPublicationName
+        # The tool/DBA pre-creates the publication (scoped to the migrated tables);
+        # Debezium must not auto-create it (never FOR ALL TABLES).
+        publication.autocreate.mode:
+          Ref: PgPublicationAutocreateMode
+        # Keep the slot on stop so a Stop/Start resumes gaplessly from its LSN.
+        slot.drop.on.stop: "false"
+        topic.prefix:
+          Ref: TopicPrefix
+        table.include.list:
+          Fn::Join: [",", Ref: TableIncludeList]
+        column.exclude.list:
+          Ref: ColumnExcludeList
+        message.key.columns:
+          Fn::If:
+            - HasMessageKeyColumns
+            - Ref: MessageKeyColumns
+            - Ref: AWS::NoValue
+        # Topic creation (engine-neutral -- identical to the MySQL source): MSK
+        # Serverless does not auto-create topics, so Debezium must, sized to accept
+        # up to MaxMessageBytes.
+        topic.creation.enable: "true"
+        topic.creation.default.replication.factor: "-1"
+        topic.creation.default.partitions:
+          Fn::Sub: "${TopicDefaultPartitions}"
+        topic.creation.default.max.message.bytes:
+          Fn::Sub: "${MaxMessageBytes}"
+        topic.creation.groups:
+          Fn::If:
+            - HasTopicCreationGroups
+            - Ref: TopicCreationGroups
+            - Ref: AWS::NoValue
+        topic.creation.p2.include:
+          Fn::If: [HasTopicGroup2, Ref: TopicGroupInclude2, Ref: AWS::NoValue]
+        topic.creation.p2.partitions:
+          Fn::If: [HasTopicGroup2, "2", Ref: AWS::NoValue]
+        topic.creation.p2.replication.factor:
+          Fn::If: [HasTopicGroup2, "-1", Ref: AWS::NoValue]
+        topic.creation.p2.max.message.bytes:
+          Fn::If:
+            - HasTopicGroup2
+            - Fn::Sub: "${MaxMessageBytes}"
+            - Ref: AWS::NoValue
+        topic.creation.p4.include:
+          Fn::If: [HasTopicGroup4, Ref: TopicGroupInclude4, Ref: AWS::NoValue]
+        topic.creation.p4.partitions:
+          Fn::If: [HasTopicGroup4, "4", Ref: AWS::NoValue]
+        topic.creation.p4.replication.factor:
+          Fn::If: [HasTopicGroup4, "-1", Ref: AWS::NoValue]
+        topic.creation.p4.max.message.bytes:
+          Fn::If:
+            - HasTopicGroup4
+            - Fn::Sub: "${MaxMessageBytes}"
+            - Ref: AWS::NoValue
+        # snapshot.mode=never for the gapless handoff (the slot holds the start LSN,
+        # so no snapshot is taken); 'initial' for a stand-alone CDC.
+        snapshot.mode:
+          Ref: PgSnapshotMode
+        # Deterministic encodings the custom DSQL sink relies on (match the Full Load
+        # write contract): unconstrained numeric -> BigDecimal, interval -> ISO-8601
+        # string, bytea -> raw bytes, time/timestamp -> microseconds.
+        decimal.handling.mode: precise
+        interval.handling.mode: string
+        binary.handling.mode: bytes
+        time.precision.mode: adaptive_time_microseconds
+        # Same source-reboot resilience as the MySQL source (RETRIABLE errors retried
+        # for up to 10 min so a failover/patch reboot resumes without a manual Start).
+        errors.retry.timeout: "600000"
+        errors.retry.delay.max.ms: "60000"
+        errors.log.enable: "true"
+        # Offset-staleness guard. A PostgreSQL logical slot's confirmed_flush_lsn only
+        # advances when the captured tables change, so on an idle-captured source the
+        # slot can pin WAL. heartbeat.interval.ms emits a periodic heartbeat; a real
+        # slot-advance on a low-traffic source additionally needs heartbeat.action.query
+        # (a WRITE), which is opt-in via PgHeartbeatQuery because the source is
+        # otherwise read-only. (Slot lifecycle/monitoring is finalized in a later Phase.)
+        heartbeat.interval.ms: "300000"
+        heartbeat.action.query:
+          Fn::If:
+            - HasPgHeartbeatQuery
+            - Ref: PgHeartbeatQuery
+            - Ref: AWS::NoValue
+        max.batch.size:
+          Fn::Sub: "${SourceMaxBatchSize}"
+        max.queue.size:
+          Fn::Sub: "${SourceMaxQueueSize}"
+        # key.converter/value.converter come from WorkerConfiguration (single
+        # canonical source), exactly as the MySQL source connector.
 
   # --- Custom DSQL sink connector ---------------------------------------------
   # Configuration mirrors CdcPipelineOrchestrator.build_sink_config: one topic
