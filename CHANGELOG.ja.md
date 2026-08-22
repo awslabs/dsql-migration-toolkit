@@ -5,6 +5,23 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.393
+
+### 追加 (Added)
+
+- **PostgreSQL ソース: CDC を「coming soon」としてゲートします(Full Load + Validation は完全サポート)。**
+  現在の CDC は Debezium **MySQL** → MSK → DSQL シンク経路のみで、PostgreSQL の論理レプリケーション
+  経路は計画中で未実装です。Data Migration の**タイプ選択**で、PostgreSQL ソースの場合は CDC タイル
+  2 つ(「CDC only」/「Full load + CDC」)を無効化し、「Coming soon for PostgreSQL — use Full load
+  only」の注記を表示します。これにより、動作しない CDC 選択(= PostgreSQL ソースに MySQL Debezium
+  コネクタをデプロイする状態)になるのを防ぎます。PostgreSQL CDC の提供時に単一の有効化ポイント
+  (`source_supports_cdc`)で有効化します。
+- **前提チェック(prerequisite)ゲートがソースエンジンを認識します。** CDC 専用の前提チェックは MySQL
+  の binlog/GTID ですが、PostgreSQL ソースではそれらの代わりにブロックしない正直な **INFO**(「CDC is
+  not yet available for PostgreSQL sources」)を報告し(該当チェックは N/A)、誤って FAIL になる原因の
+  MySQL 専用の変数読み取りを実行せず、MySQL のレプリケーション権限も要求しません。MySQL ソースは
+  変更なし。
+
 ## v0.1.392
 
 ### 変更 (Changed)

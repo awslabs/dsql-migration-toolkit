@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.393
+
+### Added
+
+- **PostgreSQL source: CDC is gated as "coming soon" (Full Load + Validation stay fully
+  supported).** CDC today is Debezium **MySQL** → MSK → DSQL sink; the PostgreSQL logical
+  replication path is planned but not yet implemented. The Data Migration **type selector**
+  now disables the two CDC tiles ("CDC only" / "Full load + CDC") for a PostgreSQL source,
+  with a "Coming soon for PostgreSQL — use Full load only" note, so the tiles cannot become
+  a non-functional CDC selection (which would deploy a MySQL Debezium connector against a
+  PostgreSQL source). A single enablement point (`source_supports_cdc`) flips these on when
+  PostgreSQL CDC ships.
+- **Prerequisite gate is source-engine-aware.** The CDC-only prerequisite checks are MySQL
+  binlog/GTID; a PostgreSQL source now reports an honest, non-blocking **INFO** ("CDC is not
+  yet available for PostgreSQL sources") in place of those checks (reported as N/A) instead
+  of running MySQL-only variable reads that would falsely FAIL, and it is never asked for
+  MySQL's replication privileges. No change for MySQL sources.
+
 ## v0.1.392
 
 ### Changed

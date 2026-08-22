@@ -19,6 +19,7 @@ from dsql_migrator.core.models import (
     PrerequisiteCheckId,
     PrerequisiteCheckRequest,
     PrerequisiteStatus,
+    SourceType,
     TableDef,
 )
 from dsql_migrator.core.models import ColumnDef
@@ -26,6 +27,7 @@ from dsql_migrator.core.prerequisites import (
     PrerequisiteChecker,
     check_binlog_row_format,
     check_gtid_mode,
+    check_postgres_cdc_unsupported,
     check_replication_grants,
     check_table_primary_key,
     check_target_columns_loadable,
@@ -324,6 +326,93 @@ def test_cdc_gtid_off_is_info_but_does_not_block() -> None:
     assert gtid.required is False
     # Everything else healthy -> the INFO recommendation does not block.
     assert report.can_proceed is True
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL source: CDC is not yet implemented, so the CDC-only checks must be
+# engine-aware -- a PostgreSQL source must NOT run the MySQL binlog/GTID/grant
+# checks (which would falsely FAIL) and must report an honest, non-blocking INFO.
+# ---------------------------------------------------------------------------
+
+
+def test_prereq_request_defaults_to_mysql_source() -> None:
+    # Existing callers build the request without source_type; the default keeps
+    # them on the MySQL checks.
+    request = PrerequisiteCheckRequest(mode=MigrationMode.CDC)
+    assert request.source_type is SourceType.MYSQL
+
+
+def test_postgres_cdc_request_reports_unsupported_and_skips_mysql_checks() -> None:
+    """A PostgreSQL source asked for CDC must not run MySQL binlog/GTID checks.
+
+    CDC is Debezium-MySQL-only today, so the checker branches on the engine: it
+    emits a non-blocking POSTGRES_CDC_UNSUPPORTED INFO in place of the MySQL
+    binlog/GTID/MSK checks (reported SKIP), and -- crucially -- never calls the
+    MySQL `variables()` probe whose `SHOW GLOBAL VARIABLES` SQL would error on a
+    PostgreSQL connection. can_proceed stays True (Full Load + Validation work).
+    """
+
+    class _NoVariablesSource(_FakeSource):
+        def variables(self) -> dict[str, str]:  # pragma: no cover - must not run
+            raise AssertionError(
+                "variables() (MySQL SHOW GLOBAL VARIABLES) must not run for a "
+                "PostgreSQL source"
+            )
+
+    checker = PrerequisiteChecker(
+        source_probe=_NoVariablesSource(grants=["GRANT ALL PRIVILEGES ON db.* TO u"]),
+        target_probe=_FakeTarget(existing={"app.orders"}),
+        msk_probe=_FakeMsk(),
+    )
+    request = PrerequisiteCheckRequest(
+        mode=MigrationMode.CDC,
+        tables=["app.orders"],
+        source_type=SourceType.POSTGRES,
+    )
+    report = checker.check(request, tables=[_table("app.orders")])
+
+    unsupported = _result(report, PrerequisiteCheckId.POSTGRES_CDC_UNSUPPORTED)
+    assert unsupported.status is PrerequisiteStatus.INFO
+    assert unsupported.required is False
+    # The MySQL-only checks are not applicable for this engine.
+    assert _result(report, PrerequisiteCheckId.BINLOG_ROW_FORMAT).status is (
+        PrerequisiteStatus.SKIP
+    )
+    assert _result(report, PrerequisiteCheckId.GTID_MODE).status is (
+        PrerequisiteStatus.SKIP
+    )
+    # Non-blocking: PostgreSQL Full Load + Validation are fully supported.
+    assert report.can_proceed is True
+
+
+def test_postgres_source_never_demands_mysql_replication_grants() -> None:
+    # Even in CDC mode, a PostgreSQL source is only asked for SELECT (its CDC
+    # replication readiness is checked differently when PG CDC ships) -- never
+    # MySQL's REPLICATION CLIENT/SLAVE, which a PG grant list would never contain.
+    pg_select_only = check_replication_grants(
+        ["GRANT SELECT ON db.* TO u"],
+        MigrationMode.CDC,
+        source_type=SourceType.POSTGRES,
+    )
+    assert pg_select_only.status is PrerequisiteStatus.PASS
+
+    # A MySQL source in CDC mode still requires the replication privileges.
+    mysql_missing = check_replication_grants(
+        ["GRANT SELECT ON db.* TO u"],
+        MigrationMode.CDC,
+        source_type=SourceType.MYSQL,
+    )
+    assert mysql_missing.status is PrerequisiteStatus.FAIL
+    assert "REPLICATION" in mysql_missing.detail.upper()
+
+
+def test_check_postgres_cdc_unsupported_is_credential_free_info() -> None:
+    result = check_postgres_cdc_unsupported()
+    assert result.status is PrerequisiteStatus.INFO
+    assert result.required is False
+    assert "PostgreSQL" in result.title
+    # Points the user at the supported path.
+    assert "Full Load" in result.detail
 
 
 def test_required_failure_blocks_progression() -> None:

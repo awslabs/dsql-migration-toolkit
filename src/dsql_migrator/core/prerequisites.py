@@ -41,6 +41,7 @@ from dsql_migrator.core.models import (
     PrerequisiteReport,
     PrerequisiteResult,
     PrerequisiteStatus,
+    SourceType,
     TableDef,
     apply_lob_exclusions,
 )
@@ -124,15 +125,25 @@ def check_source_reachable(result: ConnectionResult) -> PrerequisiteResult:
 
 
 def check_replication_grants(
-    grants: list[str], mode: MigrationMode
+    grants: list[str],
+    mode: MigrationMode,
+    *,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> PrerequisiteResult:
     """PASS when the source user holds the privileges required for ``mode``.
 
     Full Load requires ``SELECT``; CDC additionally requires ``REPLICATION
     CLIENT`` and ``REPLICATION SLAVE``. ``ALL PRIVILEGES`` satisfies any
     requirement. Matching is case-insensitive over the raw ``SHOW GRANTS`` text.
+
+    The CDC replication privileges are MySQL-specific tokens. PostgreSQL CDC is
+    not yet implemented (its replication readiness is the ``REPLICATION`` role
+    attribute / ``rds_replication`` membership, checked separately when PG CDC
+    ships), so a PostgreSQL source is only asked for the ``SELECT`` Full Load
+    grant here regardless of ``mode`` -- never MySQL's replication privileges.
     """
-    required = _CDC_GRANTS if mode == MigrationMode.CDC else _FULL_LOAD_GRANTS
+    cdc_mysql = mode == MigrationMode.CDC and source_type is SourceType.MYSQL
+    required = _CDC_GRANTS if cdc_mysql else _FULL_LOAD_GRANTS
     blob = " ".join(grants).upper()
     has_all = "ALL PRIVILEGES" in blob
     missing = [
@@ -153,7 +164,7 @@ def check_replication_grants(
             "Use a dedicated least-privilege CDC user granted SELECT, REPLICATION "
             "CLIENT, REPLICATION SLAVE (and RELOAD + LOCK TABLES for the initial "
             "snapshot) rather than an admin account."
-            if mode == MigrationMode.CDC
+            if cdc_mysql
             else "Grant SELECT to a dedicated migration user (avoid an admin account)."
         ),
     )
@@ -413,6 +424,33 @@ def check_msk_connect_available(available: bool) -> PrerequisiteResult:
     )
 
 
+def check_postgres_cdc_unsupported() -> PrerequisiteResult:
+    """Report (non-blocking ``INFO``) that CDC is not yet available for PostgreSQL.
+
+    CDC today is Debezium MySQL -> MSK -> DSQL sink; the PostgreSQL logical-replication
+    path (pgoutput publication + replication slot) is planned but not yet implemented,
+    so the UI gates the CDC migration types for a PostgreSQL source. This result stands
+    in for the MySQL binlog/GTID checks so the report is honest for a PostgreSQL source
+    instead of running MySQL-only variable checks that would falsely FAIL. It is
+    ``required=False`` (an ``INFO``), so it never blocks -- Full Load + Validation are
+    fully supported for PostgreSQL.
+    """
+    return PrerequisiteResult(
+        check_id=PrerequisiteCheckId.POSTGRES_CDC_UNSUPPORTED,
+        title="CDC is not yet available for PostgreSQL sources",
+        status=PrerequisiteStatus.INFO,
+        required=False,
+        detail=(
+            "This tool's CDC (change data capture) currently supports MySQL sources "
+            "only. Full Load and Validation are fully supported for PostgreSQL."
+        ),
+        remediation=(
+            "Use Full load only for a PostgreSQL source. PostgreSQL CDC (logical "
+            "replication) is planned; no action is needed here."
+        ),
+    )
+
+
 def _skipped(check_id: PrerequisiteCheckId, title: str) -> PrerequisiteResult:
     """Build a non-applicable (SKIP) result for a check not run in this mode."""
     return PrerequisiteResult(
@@ -478,7 +516,13 @@ class PrerequisiteChecker:
 
         # Source-side checks
         results.append(check_source_reachable(self._source.reachable()))
-        results.append(check_replication_grants(self._source.grants(), request.mode))
+        results.append(
+            check_replication_grants(
+                self._source.grants(),
+                request.mode,
+                source_type=request.source_type,
+            )
+        )
 
         # Per-table checks. Filter each table through the migration-wide LOB
         # exclusion so the pre-load gate sees the columns the load will actually
@@ -510,7 +554,32 @@ class PrerequisiteChecker:
             )
 
         # CDC-only checks (SKIP in Full Load).
-        if request.mode == MigrationMode.CDC:
+        if request.mode == MigrationMode.CDC and request.source_type is SourceType.POSTGRES:
+            # PostgreSQL CDC is not yet implemented (the UI gates the CDC migration
+            # types for a PostgreSQL source). Report an honest, non-blocking INFO in
+            # place of the MySQL binlog/GTID checks -- running MySQL-only variable
+            # reads against a PostgreSQL source would error and falsely FAIL. The
+            # MySQL/MSK checks below are marked SKIP (not applicable to this engine).
+            results.append(check_postgres_cdc_unsupported())
+            results.append(
+                _skipped(
+                    PrerequisiteCheckId.BINLOG_ROW_FORMAT,
+                    "Binary log uses ROW format with full row image",
+                )
+            )
+            results.append(
+                _skipped(PrerequisiteCheckId.GTID_MODE, "GTID mode is enabled")
+            )
+            results.append(
+                _skipped(PrerequisiteCheckId.MSK_AVAILABLE, "MSK cluster is available")
+            )
+            results.append(
+                _skipped(
+                    PrerequisiteCheckId.MSK_CONNECT_AVAILABLE,
+                    "MSK Connect is available",
+                )
+            )
+        elif request.mode == MigrationMode.CDC:
             variables = self._source.variables()
             results.append(check_binlog_row_format(variables))
             results.append(check_gtid_mode(variables))
@@ -562,4 +631,5 @@ __all__ = [
     "check_gtid_mode",
     "check_msk_available",
     "check_msk_connect_available",
+    "check_postgres_cdc_unsupported",
 ]

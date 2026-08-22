@@ -5740,6 +5740,104 @@ def test_type_selector_records_a_choice_even_for_the_current_value() -> None:
     assert state.active_substep == "full_load"  # not reset (no real change)
 
 
+def test_source_supports_cdc_allowlists_mysql_only() -> None:
+    # Single enablement point for CDC-by-engine: MySQL yes, PostgreSQL not yet.
+    # An allowlist means any future engine defaults to "no CDC" until enabled.
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import source_supports_cdc
+
+    assert source_supports_cdc(SourceType.MYSQL) is True
+    assert source_supports_cdc(SourceType.POSTGRES) is False
+
+
+def _selector_click_handlers(state, *, source_type):
+    """Render the type selector and return (ui, per-tile click handlers).
+
+    Handlers are captured in tile render order: Full load only, CDC only,
+    Full load + CDC (MigrationType definition order).
+    """
+    from dsql_migrator.ui.data_migration import _render_migration_type_selector
+
+    ui = _RecordingUi()
+    clicks: list = []
+    orig_card = ui.card
+
+    def _card(*a, **k):
+        el = orig_card(*a, **k)
+        el.on = lambda _evt, handler, *_a, **_k: (clicks.append(handler), el)[1]
+        return el
+
+    ui.card = _card
+    _render_migration_type_selector(
+        ui,
+        state,
+        status=StepStatus.NOT_STARTED,
+        refresh=lambda: None,
+        locked=False,
+        source_type=source_type,
+    )
+    return ui, clicks
+
+
+def test_migration_type_selector_gates_cdc_tiles_for_postgres_source() -> None:
+    """A PostgreSQL source cannot select a CDC migration type (CDC not yet built).
+
+    The two CDC tiles render disabled with a "coming soon" note, and clicking them
+    does NOT change the type -- preventing a MySQL Debezium connector from being
+    deployed against a PostgreSQL source. Full load only stays selectable.
+    """
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import (
+        DataMigrationState,
+        MigrationType,
+    )
+    from dsql_migrator.ui.session import SessionConnectionState
+
+    session = SessionConnectionState()
+    state = DataMigrationState()
+    state.bind_session(session)
+    assert state.migration_type is MigrationType.FULL_LOAD_ONLY  # the default
+
+    ui, clicks = _selector_click_handlers(state, source_type=SourceType.POSTGRES)
+
+    # The gated CDC tiles say so where the user clicks (a dead tile reads as a bug).
+    assert any(
+        "Coming soon" in t and "PostgreSQL" in t for t in ui.texts
+    ), ui.texts
+    # Three tiles rendered (Full load only, CDC only, Full load + CDC).
+    assert len(clicks) == 3
+
+    # Clicking either CDC tile must NOT change the selection (gated).
+    clicks[1]()  # CDC only
+    assert state.migration_type is MigrationType.FULL_LOAD_ONLY
+    clicks[2]()  # Full load + CDC
+    assert state.migration_type is MigrationType.FULL_LOAD_ONLY
+
+    # Full load only remains selectable.
+    clicks[0]()
+    assert state.migration_type is MigrationType.FULL_LOAD_ONLY
+    assert session.migration_type_chosen() is True
+
+
+def test_migration_type_selector_offers_all_tiles_for_mysql_source() -> None:
+    # A MySQL source keeps all three tiles selectable and shows no CDC "coming
+    # soon" gate.
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import DataMigrationState, MigrationType
+    from dsql_migrator.ui.session import SessionConnectionState
+
+    session = SessionConnectionState()
+    state = DataMigrationState()
+    state.bind_session(session)
+
+    ui, clicks = _selector_click_handlers(state, source_type=SourceType.MYSQL)
+
+    assert not any("Coming soon" in t for t in ui.texts)
+    assert len(clicks) == 3
+    clicks[1]()  # CDC only -> selectable for MySQL
+    assert state.migration_type is MigrationType.CDC_ONLY
+
+
 def test_migration_type_unlocked_before_any_migration_starts() -> None:
     from dsql_migrator.ui.data_migration import DataMigrationState, migration_type_locked
 

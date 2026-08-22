@@ -33,6 +33,7 @@ from dsql_migrator.core.models import (
     PrerequisiteResult,
     PrerequisiteStatus,
     SourceInventory,
+    SourceType,
     TableStatusRow,
     Watermark,
 )
@@ -1553,6 +1554,27 @@ class MigrationType(str, Enum):
     FULL_LOAD_ONLY = "full_load_only"
     CDC_ONLY = "cdc_only"
     FULL_LOAD_AND_CDC = "full_load_and_cdc"
+
+
+# The migration types that include a CDC phase (as opposed to Full Load only).
+_CDC_MIGRATION_TYPES: frozenset[MigrationType] = frozenset(
+    {MigrationType.CDC_ONLY, MigrationType.FULL_LOAD_AND_CDC}
+)
+
+
+def source_supports_cdc(source_type: SourceType) -> bool:
+    """Return whether CDC is available for a source of ``source_type`` today.
+
+    This is the SINGLE enablement point for CDC-by-engine. CDC is currently
+    Debezium **MySQL** -> MSK -> DSQL sink only; the PostgreSQL logical-replication
+    path (pgoutput publication + replication slot) is planned but not yet
+    implemented, so the Data Migration type selector gates the CDC tiles for a
+    PostgreSQL source (Full Load + Validation stay fully supported). Deliberately
+    an **allowlist** -- only MySQL is CDC-capable -- so any future source engine
+    defaults to "no CDC" until it is explicitly enabled here, rather than silently
+    offering a non-functional CDC deploy. When PostgreSQL CDC ships, add it here.
+    """
+    return source_type is SourceType.MYSQL
 
 
 # Ordered sub-steps of the Data Migration flow (Prerequisites -> Full Load -> CDC).

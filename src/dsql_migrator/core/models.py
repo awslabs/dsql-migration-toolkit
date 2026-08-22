@@ -864,6 +864,11 @@ class PrerequisiteCheckId(str, Enum):
     GTID_MODE = "GTID_MODE"
     MSK_AVAILABLE = "MSK_AVAILABLE"
     MSK_CONNECT_AVAILABLE = "MSK_CONNECT_AVAILABLE"
+    # CDC-only, PostgreSQL source: CDC is not yet implemented for PostgreSQL, so
+    # the MySQL binlog/GTID checks above do not apply. Emitted (non-blocking INFO)
+    # in place of them for a PostgreSQL source so the report is honest rather than
+    # running MySQL-only checks that would falsely FAIL. See prerequisites.py.
+    POSTGRES_CDC_UNSUPPORTED = "POSTGRES_CDC_UNSUPPORTED"
 
 
 class PrerequisiteResult(BaseModel):
@@ -894,12 +899,18 @@ class PrerequisiteCheckRequest(BaseModel):
     selection (from :class:`~dsql_migrator.core.table_selection.TableSelector`).
     Source/target connection access is supplied to the checker separately as
     read-only probes, never stored here as secrets (Property 7).
+
+    ``source_type`` selects the engine-specific checks: the CDC-only checks are
+    MySQL binlog/GTID today, so a PostgreSQL source reports them as not-applicable
+    and gets an honest "CDC not yet supported" INFO instead of MySQL checks that
+    would falsely FAIL. Defaults to MySQL so existing callers are unchanged.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     mode: MigrationMode
     tables: list[str] = Field(default_factory=list)
+    source_type: SourceType = SourceType.MYSQL
 
 
 class PrerequisiteReport(BaseModel):

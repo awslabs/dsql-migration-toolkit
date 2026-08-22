@@ -5,6 +5,23 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.393
+
+### 추가 (Added)
+
+- **PostgreSQL 소스: CDC를 "coming soon"으로 게이트합니다(Full Load + Validation은 완전 지원).**
+  현재 CDC는 Debezium **MySQL** → MSK → DSQL 싱크 경로만 지원하며, PostgreSQL 논리 복제 경로는
+  계획되어 있으나 아직 구현되지 않았습니다. 이제 Data Migration **유형 선택기**에서 PostgreSQL
+  소스일 때 CDC 타일 2개("CDC only" / "Full load + CDC")를 비활성화하고 "Coming soon for
+  PostgreSQL — use Full load only" 안내를 표시하여, 동작하지 않는 CDC 선택(= PostgreSQL 소스에
+  MySQL Debezium 커넥터를 배포하는 상황)이 되지 않도록 막습니다. PostgreSQL CDC가 출시되면 단일
+  활성화 지점(`source_supports_cdc`)에서 켜집니다.
+- **사전 점검(prerequisite) 게이트가 소스 엔진을 인식합니다.** CDC 전용 사전 점검은 MySQL
+  binlog/GTID 기반인데, 이제 PostgreSQL 소스는 그 점검들 대신 차단하지 않는 정직한 **INFO**("CDC is
+  not yet available for PostgreSQL sources")를 보고하며(해당 점검들은 N/A로 표시), 실패로 오판되게
+  만들던 MySQL 전용 변수 읽기를 실행하지 않고 MySQL 복제 권한도 요구하지 않습니다. MySQL 소스는
+  변화 없음.
+
 ## v0.1.392
 
 ### 변경 (Changed)
