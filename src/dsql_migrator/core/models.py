@@ -737,7 +737,27 @@ class Watermark(BaseModel):
             "PostgreSQL WAL LSN (e.g. '3/AF012B8') captured at the snapshot point -- the "
             "PG analog of MySQL's binlog:pos and the coordinate a PostgreSQL CDC catch-up "
             "resumes streaming from for a gapless Full Load -> CDC handoff. None for a "
-            "MySQL source, or when it cannot be read (e.g. insufficient privilege)."
+            "MySQL source, or when it cannot be read (e.g. insufficient privilege). On a "
+            "PostgreSQL Full Load + CDC run this is the consistent-point of the logical "
+            "replication slot created at capture time (below); otherwise a plain "
+            "pg_current_wal_lsn() read."
+        ),
+    )
+    slot_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Name of the PostgreSQL logical replication slot created on the source at "
+            "this consistency point (Full Load + CDC only). The slot pins the source WAL "
+            "from wal_lsn until CDC consumes it; the CDC connector resumes from it "
+            "(snapshot.mode=never) and teardown drops it. None otherwise."
+        ),
+    )
+    publication_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Name of the PostgreSQL publication created on the source for the migrated "
+            "tables (Full Load + CDC only); the CDC connector captures through it. None "
+            "otherwise."
         ),
     )
     snapshot_timestamp: datetime = Field(

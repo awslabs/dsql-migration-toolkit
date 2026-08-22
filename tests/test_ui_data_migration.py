@@ -647,6 +647,113 @@ def test_capture_watermark_skips_binlog_for_postgres_source(monkeypatch) -> None
     assert watermark.row_counts_approximate is True
     assert watermark.table_row_counts == {"orders": 5, "customers": 0}  # None -> 0
     assert fake_engine.disposed is True  # source engine disposed (no leak)
+    assert watermark.slot_name is None  # Full-Load-only: no slot (would pin WAL)
+    assert watermark.publication_name is None
+
+
+def test_capture_watermark_creates_slot_for_postgres_cdc_handoff(monkeypatch) -> None:
+    # Full Load + CDC on a PostgreSQL source (inputs.cdc_stack_name set): capture must
+    # create a logical replication slot + publication ON THE SOURCE at the consistency
+    # point (before any reader) and record the slot's consistent-point LSN + the
+    # slot/publication names on the watermark -- so CDC resumes gaplessly and teardown
+    # can drop them. The slot goes through the dedicated audited write engine, NOT the
+    # read-only-guarded one.
+    import dataclasses
+
+    import dsql_migrator.ui.data_migration._full_load_engine as eng
+    from dsql_migrator.core import cdc_pg_slot
+    from dsql_migrator.core.models import SourceType
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = list(rows)
+
+        def first(self):  # noqa: ANN201
+            return self._rows[0] if self._rows else None
+
+    class _WriteConn:
+        """Records slot/publication writes; returns a canned consistent-point LSN."""
+
+        def __init__(self):
+            self.statements = []
+
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, *_a):  # noqa: ANN204
+            return False
+
+        def execute(self, statement, params=None):  # noqa: ANN001, ANN201
+            sql = str(statement)
+            self.statements.append(sql)
+            up = " ".join(sql.upper().split())
+            if "FROM PG_PUBLICATION" in up or "FROM PG_REPLICATION_SLOTS" in up:
+                return _Result([])  # neither exists yet
+            if "PG_CREATE_LOGICAL_REPLICATION_SLOT" in up:
+                return _Result([("7/DEADBEEF",)])
+            return _Result([])
+
+    write_conn = _WriteConn()
+
+    class _WriteEngine:
+        def connect(self):  # noqa: ANN201
+            return write_conn
+
+        def dispose(self) -> None:
+            self.disposed = True
+
+    write_engine = _WriteEngine()
+
+    # Read-only engine (row estimates only on this path; capture_resume_lsn is NOT called).
+    class _RoConn:
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, *_a):  # noqa: ANN204
+            return False
+
+    class _RoEngine:
+        def connect(self):  # noqa: ANN201
+            return _RoConn()
+
+        def dispose(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        eng, "make_source_engine_factory", lambda pw, **k: (lambda src: _RoEngine())
+    )
+    monkeypatch.setattr(
+        eng, "estimate_source_rows", lambda conn, tables, dialect: {"orders": 5}
+    )
+    # The audited PG source-WRITE engine is the dedicated cdc_pg_slot one.
+    monkeypatch.setattr(
+        cdc_pg_slot, "build_pg_source_write_engine", lambda src, pw: write_engine
+    )
+
+    pg_inputs = dataclasses.replace(
+        _inputs(),
+        source_config=SourceConnectionConfig(
+            host="db", database="app", source_type=SourceType.POSTGRES
+        ),
+        cdc_stack_name="mysql-dsql-cdc-stack",
+    )
+    migrator = BatchedTableMigrator(
+        pg_inputs,
+        exporter=_FakeExporter(),  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _i: _FakeImporter(),  # type: ignore[arg-type,return-value]
+    )
+    watermark = migrator.capture_watermark([TableDef(name="orders", primary_key=["id"])])
+
+    # The slot's consistent-point LSN is the gapless resume coordinate.
+    assert watermark.wal_lsn == "7/DEADBEEF"
+    assert watermark.slot_name == "dsqlmig_mysql_dsql_cdc_stack"
+    assert watermark.publication_name == "dsqlmig_pub_mysql_dsql_cdc_stack"
+    # Publication FOR TABLE the migrated table, then the slot -- both on the write engine.
+    writes = " ".join(write_conn.statements).upper()
+    assert "CREATE PUBLICATION" in writes and "FOR ALL TABLES" not in writes
+    assert "PG_CREATE_LOGICAL_REPLICATION_SLOT" in writes
+    assert write_engine.disposed is True  # write engine disposed (no leak)
 
 
 def test_batched_table_migrator_streams_then_loads() -> None:

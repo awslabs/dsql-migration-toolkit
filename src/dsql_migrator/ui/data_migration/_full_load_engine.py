@@ -119,6 +119,16 @@ class DataMigrationInputs:
     # all DROP/replace. Set for the Full load + CDC flow where connectors start
     # before the Full Load (gapless, no offset seeding needed).
     cdc_coexisting: bool = False
+    # The CDC stack this Full Load will hand off to, for a PostgreSQL Full Load + CDC
+    # run. When set (PostgreSQL source only), the watermark capture creates a logical
+    # replication slot + publication ON THE SOURCE at the consistency point (named
+    # deterministically from this stack name) so CDC resumes from the slot's LSN with no
+    # gap; the slot pins WAL until CDC consumes it. Left None for a Full-Load-only run
+    # (a slot with no consumer would pin WAL and fill the source disk) and always for a
+    # MySQL source (which bridges via the binlog offset-seeder, not a slot). This is the
+    # PostgreSQL gapless-handoff signal -- distinct from cdc_coexisting, which is MySQL's
+    # CDC-live-during-load (SKIP_EXISTING) model that PostgreSQL deliberately does not use.
+    cdc_stack_name: Optional[str] = None
     # Per-table APPLIED target conversion (schema/create/index DDL), keyed by
     # qualified table name, honoring the user's Schema Conversion edits. Single
     # source of truth for the target schema, used to (a) recreate a table on a
@@ -2903,24 +2913,97 @@ class BatchedTableMigrator:
         (the gapless Full Load -> CDC handoff point, PG's analog of MySQL binlog:pos),
         captured BEFORE the per-table reader snapshots open so replaying from it is a
         superset -- plus the approximate per-table estimate (never a COUNT(*) scan) via
-        the source dialect, so the progress baseline is preserved. The LSN is best-effort:
-        None (e.g. insufficient privilege) still yields a valid, loadable watermark.
+        the source dialect, so the progress baseline is preserved.
+
+        Two paths by whether CDC will follow (``inputs.cdc_stack_name``):
+
+        * **Full Load + CDC** (stack name set): create a logical replication slot +
+          publication ON THE SOURCE at this consistency point (via the audited source-write
+          path). The slot's returned consistent-point becomes ``wal_lsn`` and pins the
+          source WAL until CDC consumes it; the slot/publication names are recorded so the
+          connector resumes from them and teardown drops them. Slot creation is FATAL here
+          -- a missing slot would silently lose every change made during the load.
+        * **Full Load only** (no stack name): a best-effort ``pg_current_wal_lsn()`` READ
+          (no slot -- a slot with no consumer would pin WAL and fill the source disk).
+          None (e.g. insufficient privilege) still yields a valid, loadable watermark.
         """
         dialect = dialect_for(source.source_type)
+        stack_name = self._inputs.cdc_stack_name
+        wal_lsn: Optional[str] = None
+        slot_name: Optional[str] = None
+        publication_name: Optional[str] = None
+        # Row estimates (and, Full-Load-only, the plain LSN read) go through the shared
+        # read-only-guarded engine.
         engine = make_source_engine_factory(self._inputs.source_password)(source)
         try:
             with engine.connect() as connection:
-                wal_lsn = dialect.capture_resume_lsn(connection)
+                if stack_name is None:
+                    wal_lsn = dialect.capture_resume_lsn(connection)
                 estimates = estimate_source_rows(connection, list(table_names), dialect)
         finally:
             engine.dispose()
+        # Full Load + CDC: create the slot+publication at this consistency point (before
+        # any per-table reader snapshot opens -- capture_watermark runs strictly before
+        # _migrate_tables_in_parallel), through the dedicated audited source-WRITE path
+        # (NOT the read-only-guarded engine above).
+        if stack_name is not None:
+            handles = self._provision_pg_replication(source, stack_name, table_names)
+            wal_lsn = handles.consistent_lsn
+            slot_name = handles.slot_name
+            publication_name = handles.publication_name
         return Watermark(
             snapshot_timestamp=datetime.now(timezone.utc),
             wal_lsn=wal_lsn,
+            slot_name=slot_name,
+            publication_name=publication_name,
             # None estimate (never-analyzed / missing) -> 0, matching the MySQL baseline.
             table_row_counts={n: (c or 0) for n, c in estimates.items()},
             row_counts_approximate=True,
         )
+
+    def _provision_pg_replication(
+        self,
+        source: SourceConnectionConfig,
+        stack_name: str,
+        table_names: Sequence[str],
+    ) -> "PgReplicationHandles":
+        """Create the PostgreSQL CDC slot + publication on the source, audited.
+
+        The ONLY source-write in the Full Load path. Uses the dedicated, non-read-only-
+        guarded, AUTOCOMMIT PostgreSQL write engine (:mod:`dsql_migrator.core.cdc_pg_slot`);
+        names the objects deterministically from ``stack_name`` so the connector param and
+        teardown reference the same slot/publication. Each write is recorded in the audit
+        trail (``log_activity``). Raises on failure -- the gapless handoff is impossible
+        without the slot, so the Full Load must fail loudly rather than produce a
+        decorative LSN.
+        """
+        from dsql_migrator.core import cdc_pg_slot
+
+        slot = cdc_pg_slot.pg_slot_name(stack_name)
+        publication = cdc_pg_slot.pg_publication_name(stack_name)
+
+        def _audit(message: str) -> None:
+            log_activity(
+                ActivityCategory.FULL_LOAD,
+                "CDC replication slot",
+                status=ActivityStatus.INFO,
+                detail=f"source ({stack_name}): {message}",
+            )
+
+        engine = cdc_pg_slot.build_pg_source_write_engine(
+            source, self._inputs.source_password
+        )
+        try:
+            with engine.connect() as connection:
+                return cdc_pg_slot.provision_pg_replication(
+                    connection,
+                    slot_name=slot,
+                    publication_name=publication,
+                    tables=list(table_names),
+                    on_log=_audit,
+                )
+        finally:
+            engine.dispose()
 
     def migrate_table(
         self,
