@@ -138,6 +138,45 @@ def test_both_source_connectors_share_one_connector_name() -> None:
     assert mysql_name == pg_name
 
 
+def test_seed_conditions_are_engine_aware() -> None:
+    # SeedByLambda/SeedByExternal are the single source of truth for the seed path and
+    # MUST be engine-aware: a PostgreSQL stack resumes from a replication slot (not a
+    # Kafka connect-offset), so it is ALWAYS the external (no-Lambda) path regardless
+    # of SeedMode. Otherwise a PG stack in SeedMode=Lambda would create the Lambda
+    # seeder / CdcStartPrepResource / Lambda sink variant, all referencing the
+    # IsMySqlSource-gated seeder -> a CloudFormation rollback.
+    conds = _load_template()["Conditions"]
+    lam = json.dumps(conds["SeedByLambda"])
+    ext = json.dumps(conds["SeedByExternal"])
+    assert "IsMySqlSource" in lam, lam  # Lambda path only for MySQL
+    assert "IsPostgresSource" in ext, ext  # PG is always external-seeded
+    # Every SeedMode-gated resource ANDs one of these, so this makes CdcStartPrepResource
+    # and the Lambda sink variant off for PostgreSQL in one place.
+
+
+def test_start_prep_resource_is_gated_off_for_postgres() -> None:
+    # Belt-and-braces: DeployStartPrepResource still names IsMySqlSource directly so
+    # CdcStartPrepResource is obviously MySQL-only at its own definition.
+    conds = _load_template()["Conditions"]
+    gate = json.dumps(conds["DeployStartPrepResource"])
+    assert "IsMySqlSource" in gate, gate
+    assert "SeedByLambda" in gate
+    assert "HasBootstrapServers" in gate
+
+
+def test_source_connector_arn_output_refs_the_active_engine() -> None:
+    # The single source-connector ARN output is gated on HasBootstrapServers but must
+    # Ref whichever engine's connector exists (both are conditional). Without the
+    # Fn::If it would Ref the IsMySqlSource-gated DebeziumSourceConnector on a
+    # PostgreSQL stack -> a CloudFormation reference-to-absent-resource error.
+    out = _load_template()["Outputs"]["DebeziumSourceConnectorArn"]
+    value = json.dumps(out["Value"])
+    assert "Fn::If" in value
+    assert "IsMySqlSource" in value
+    assert "DebeziumSourceConnector" in value
+    assert "PostgresSourceConnector" in value
+
+
 def test_postgres_connector_reuses_the_neutral_sink_untouched() -> None:
     # The DSQL sink is engine-neutral: it must be unchanged (still the custom
     # connector), so a PostgreSQL pipeline reuses it verbatim.

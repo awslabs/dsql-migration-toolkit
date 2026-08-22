@@ -146,6 +146,15 @@ def test_pg_infra_params_are_postgres_shaped() -> None:
     assert "DebeziumPostgresPluginS3Key" in d
 
 
+def test_pg_infra_params_force_seed_mode_external() -> None:
+    # PostgreSQL resumes from a logical replication slot, not the Lambda binlog
+    # offset seeder. The PG builder MUST force SeedMode=External so the template does
+    # not create CdcStartPrepResource (which GetAtt/DependsOn the IsMySqlSource-gated
+    # OffsetSeederFunction/Role -> a CloudFormation rollback on a PG stack).
+    d = dict(_pg_infra().filled)
+    assert d["SeedMode"] == "External", d.get("SeedMode")
+
+
 def test_pg_infra_params_drop_mysql_only_source_params() -> None:
     d = dict(_pg_infra().filled)
     for bad in ("DebeziumPluginS3Key", "SourceDbServerId", "SnapshotMode"):

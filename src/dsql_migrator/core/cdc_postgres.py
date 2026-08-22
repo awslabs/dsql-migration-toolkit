@@ -208,10 +208,20 @@ def build_pg_cdc_infra_params(
     scaling inputs, ``seed_mode``, ...). ``source_db_port`` defaults to 5432.
 
     ``debezium_plugin_s3_key`` (the MySQL plugin key) is forced empty and dropped:
-    the MySQL source plugin resource is gated off for a PostgreSQL stack. Pure.
+    the MySQL source plugin resource is gated off for a PostgreSQL stack.
+
+    ``seed_mode`` is forced to ``"external"``: PostgreSQL resumes streaming from a
+    pre-created logical replication slot (not a seeded Kafka connect-offset), so the
+    in-VPC binlog offset-seeder Lambda + its CdcStartPrepResource must NOT be created
+    (they are ``IsMySqlSource``-gated in the template). Leaving the MySQL default
+    ``"lambda"`` would emit ``SeedMode=Lambda`` and, at Start, create
+    ``CdcStartPrepResource`` referencing the excluded seeder -> a CloudFormation
+    rollback. (The PostgreSQL in-process topic pre-creation that External implies is
+    wired in a later phase.) Pure.
     """
     infra_kwargs.pop("debezium_plugin_s3_key", None)  # MySQL plugin key: dropped
     infra_kwargs.pop("source_db_server_id", None)  # MySQL binlog server id: dropped
+    infra_kwargs["seed_mode"] = "external"  # PG uses a slot, not the Lambda seeder
     base = build_cdc_infra_params(
         source_config.as_neutral_source(),
         sink_config,

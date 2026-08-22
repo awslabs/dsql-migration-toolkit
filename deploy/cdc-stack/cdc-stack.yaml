@@ -718,15 +718,25 @@ Conditions:
     Fn::Not:
       - Fn::Equals: [Ref: PgHeartbeatQuery, ""]
 
-  # SeedMode selects who does the CDC Kafka prep. Default "Lambda" -> SeedByLambda
-  # true on every existing stack, so all the seeder gates below (which AND with
-  # SeedByLambda) collapse to their current value and the default path is unchanged.
-  # "External" -> the app did the prep in-process, so the in-VPC seeder resources are
-  # omitted and the sink uses its no-CdcStartPrepResource variant.
+  # SeedMode selects who does the CDC Kafka prep, and these two conditions are the
+  # SINGLE source of truth for it -- every seeder / start-prep / sink-variant gate
+  # ANDs one of them. They are engine-aware: the in-VPC offset-seeder Lambda seeds a
+  # MySQL binlog connect-offset, which a PostgreSQL source (resuming from a logical
+  # replication slot) never uses. So a PostgreSQL stack is ALWAYS the "external"
+  # (no-Lambda) path regardless of the SeedMode value -- otherwise a PG stack in
+  # SeedMode=Lambda would create CdcStartPrepResource + the Lambda sink variant, both
+  # of which reference the IsMySqlSource-gated seeder resources -> a CloudFormation
+  # rollback. MySQL is byte-identical: IsMySqlSource is true by default so SeedByLambda
+  # collapses to Equals(SeedMode,Lambda) and IsPostgresSource is false so SeedByExternal
+  # collapses to Equals(SeedMode,External).
   SeedByLambda:
-    Fn::Equals: [Ref: SeedMode, "Lambda"]
+    Fn::And:
+      - Fn::Equals: [Ref: SeedMode, "Lambda"]
+      - Condition: IsMySqlSource
   SeedByExternal:
-    Fn::Equals: [Ref: SeedMode, "External"]
+    Fn::Or:
+      - Fn::Equals: [Ref: SeedMode, "External"]
+      - Condition: IsPostgresSource
 
   # A Lambda-free EC2 host subnet CIDR was supplied -> add the 9098 ingress that lets
   # that host reach MSK for in-process seeding. Empty default -> no rule (unchanged).
@@ -810,10 +820,15 @@ Conditions:
     Fn::And:
       - Condition: DeploySeederFunction
       - Condition: SeedByLambda
+  # CdcStartPrepResource GetAtt/DependsOn the OffsetSeeder Function+Role. Now that
+  # SeedByLambda is engine-aware (false for a PostgreSQL stack), the SeedByLambda term
+  # alone keeps this off for PostgreSQL; the explicit IsMySqlSource is belt-and-braces
+  # so the intent is local and obvious. No-op for MySQL.
   DeployStartPrepResource:
     Fn::And:
       - Condition: HasBootstrapServers
       - Condition: SeedByLambda
+      - Condition: IsMySqlSource
 
   # When no ConnectorSubnetIds are supplied, the stack creates its OWN private
   # subnets + NAT gateway + route table inside the VPC (the customer's existing
@@ -2495,9 +2510,21 @@ Outputs:
 
   DebeziumSourceConnectorArn:
     Condition: HasBootstrapServers
-    Description: ARN of the Debezium MySQL source connector (only present once the bootstrap string is supplied).
+    Description: >
+      ARN of the Debezium source connector (only present once the bootstrap string
+      is supplied). Refs whichever engine's source connector exists -- both share
+      the same ConnectorName, so this is the single source-connector ARN.
+    # Ref the source connector for the active engine. The MySQL connector
+    # (DebeziumSourceConnector) is created only when IsMySqlSource; the PostgreSQL
+    # one (PostgresSourceConnector) only when IsPostgresSource. Without this Fn::If
+    # the output (gated on HasBootstrapServers) would Ref DebeziumSourceConnector on
+    # a PostgreSQL stack, where that resource is condition-excluded -> a hard CFN
+    # error. Same pattern as DsqlSinkConnectorArn's SeedMode Fn::If below.
     Value:
-      Ref: DebeziumSourceConnector
+      Fn::If:
+        - IsMySqlSource
+        - Ref: DebeziumSourceConnector
+        - Ref: PostgresSourceConnector
 
   DsqlSinkConnectorArn:
     Condition: DeploySinkConnector
