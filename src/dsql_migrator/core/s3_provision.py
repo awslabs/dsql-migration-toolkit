@@ -33,6 +33,13 @@ from dsql_migrator.core.aws_session import BotoSessionLike, build_session
 # names carry a version suffix (cdc-stack PluginVersion) for immutability; the S3
 # keys themselves are stable so re-uploads overwrite in place.
 DEBEZIUM_PLUGIN_KEY = "cdc-plugins/debezium-mysql-plugin.zip"
+# The Debezium PostgreSQL source-connector plugin (pgoutput). Same packaging as the
+# MySQL one: the stock Debezium 2.7.4.Final PostgreSQL plugin with the
+# msk-config-providers jar injected (the Secrets Manager config provider used for
+# database.user/password is not on the MSK Connect runtime classpath). Uploaded for
+# every deploy (harmless when the source is MySQL); only a PostgreSQL cdc-stack
+# instantiates the CustomPlugin that references this key.
+DEBEZIUM_PG_PLUGIN_KEY = "cdc-plugins/debezium-postgres-plugin.zip"
 # The sink plugin is a ZIP bundle (sink jar + Glue Schema Registry Avro converter
 # jar) -- not a bare jar -- because both connectors' worker configs declare the
 # AWSKafkaAvroConverter, which must be on each plugin's classpath.
@@ -45,6 +52,7 @@ LAMBDA_SEEDER_KEY = "cdc-plugins/offset-seeder-lambda.zip"
 # Local artifact paths relative to the repo root (this file is at
 # src/dsql_migrator/core/s3_provision.py, so parents[3] is the repo root).
 _DEBEZIUM_PLUGIN_RELPATH = "connectors/plugins/debezium-mysql-plugin.zip"
+_DEBEZIUM_PG_PLUGIN_RELPATH = "connectors/plugins/debezium-postgres-plugin.zip"
 _DSQL_SINK_PLUGIN_RELPATH = "connectors/plugins/dsql-sink-plugin.zip"
 _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 
@@ -308,6 +316,14 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # v3 (defunct) bundled aws-msk-iam-auth -> SDK conflict, never reached RUNNING.
 # v2 bundled the Glue Avro converter into both plugins.
 # v1 was the DebeziumTypeConverter-fix generation.
+#
+# NOTE (PostgreSQL source, no bump): the Debezium PostgreSQL plugin
+# (debezium-postgres-plugin.zip) is a NEW artifact under a NEW CustomPlugin
+# resource name (${AWS::StackName}-debezium-postgres-${PluginVersion}), instantiated
+# only on a PostgreSQL cdc-stack. The MySQL/sink/seeder ZIPs are unchanged, so no
+# existing plugin resource collides -- adding it needs no version bump and does NOT
+# force a Delete+Deploy on a live MySQL stack. Bump only when a plugin's CONTENT
+# changes.
 PLUGIN_VERSION = "v35"
 
 
@@ -322,6 +338,7 @@ class PluginUploadResult:
     bucket_name: str
     bucket_arn: str
     debezium_key: str
+    debezium_pg_key: str
     dsql_sink_key: str
     lambda_seeder_key: str
     plugin_version: str
@@ -360,11 +377,12 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def _artifact_paths() -> tuple[Path, Path, Path]:
-    """Return (debezium_zip, dsql_sink_zip, lambda_seeder_zip) under the repo root.
+def _artifact_paths() -> tuple[Path, Path, Path, Path]:
+    """Return (debezium_zip, debezium_pg_zip, dsql_sink_zip, lambda_seeder_zip).
 
-    Overridable via env vars (so a container image can point elsewhere):
-    ``DSQL_MIGRATOR_DEBEZIUM_PLUGIN_PATH`` / ``DSQL_MIGRATOR_SINK_PLUGIN_PATH`` /
+    Paths are under the repo root, overridable via env vars (so a container image
+    can point elsewhere): ``DSQL_MIGRATOR_DEBEZIUM_PLUGIN_PATH`` /
+    ``DSQL_MIGRATOR_DEBEZIUM_PG_PLUGIN_PATH`` / ``DSQL_MIGRATOR_SINK_PLUGIN_PATH`` /
     ``DSQL_MIGRATOR_LAMBDA_SEEDER_PATH``.
     """
     import os
@@ -373,13 +391,16 @@ def _artifact_paths() -> tuple[Path, Path, Path]:
     deb = os.environ.get("DSQL_MIGRATOR_DEBEZIUM_PLUGIN_PATH") or str(
         root / _DEBEZIUM_PLUGIN_RELPATH
     )
+    deb_pg = os.environ.get("DSQL_MIGRATOR_DEBEZIUM_PG_PLUGIN_PATH") or str(
+        root / _DEBEZIUM_PG_PLUGIN_RELPATH
+    )
     sink = os.environ.get("DSQL_MIGRATOR_SINK_PLUGIN_PATH") or str(
         root / _DSQL_SINK_PLUGIN_RELPATH
     )
     seeder = os.environ.get("DSQL_MIGRATOR_LAMBDA_SEEDER_PATH") or str(
         root / _LAMBDA_SEEDER_RELPATH
     )
-    return Path(deb), Path(sink), Path(seeder)
+    return Path(deb), Path(deb_pg), Path(sink), Path(seeder)
 
 
 def ensure_plugin_bucket(
@@ -499,14 +520,20 @@ def ensure_and_upload_plugins(
     """
     account_id = get_account_id(sts_client)
     bucket = ensure_plugin_bucket(s3_client, account_id, region)
-    deb_path, sink_path, seeder_path = _artifact_paths()
+    deb_path, deb_pg_path, sink_path, seeder_path = _artifact_paths()
     upload_plugin(s3_client, bucket, DEBEZIUM_PLUGIN_KEY, deb_path, on_progress=on_progress)
+    # The PostgreSQL source plugin is uploaded for every deploy (both engines share
+    # the managed bucket). It is inert unless a PostgreSQL cdc-stack references it.
+    upload_plugin(
+        s3_client, bucket, DEBEZIUM_PG_PLUGIN_KEY, deb_pg_path, on_progress=on_progress
+    )
     upload_plugin(s3_client, bucket, DSQL_SINK_PLUGIN_KEY, sink_path, on_progress=on_progress)
     upload_plugin(s3_client, bucket, LAMBDA_SEEDER_KEY, seeder_path, on_progress=on_progress)
     return PluginUploadResult(
         bucket_name=bucket,
         bucket_arn=f"arn:aws:s3:::{bucket}",
         debezium_key=DEBEZIUM_PLUGIN_KEY,
+        debezium_pg_key=DEBEZIUM_PG_PLUGIN_KEY,
         dsql_sink_key=DSQL_SINK_PLUGIN_KEY,
         lambda_seeder_key=LAMBDA_SEEDER_KEY,
         plugin_version=PLUGIN_VERSION,
@@ -540,6 +567,7 @@ __all__ = [
     "S3ProvisionError",
     "PluginUploadResult",
     "DEBEZIUM_PLUGIN_KEY",
+    "DEBEZIUM_PG_PLUGIN_KEY",
     "DSQL_SINK_PLUGIN_KEY",
     "LAMBDA_SEEDER_KEY",
     "PLUGIN_VERSION",

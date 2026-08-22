@@ -168,26 +168,31 @@ def test_upload_missing_local_file_raises(tmp_path: Path) -> None:
 def test_ensure_and_upload_returns_result(tmp_path: Path, monkeypatch) -> None:
     deb = _write(tmp_path, b"debezium-zip")
     deb = deb.rename(tmp_path / "deb.zip")
+    deb_pg = tmp_path / "deb-pg.zip"
+    deb_pg.write_bytes(b"debezium-pg-zip")
     sink = tmp_path / "sink.jar"
     sink.write_bytes(b"sink-jar")
     seeder = tmp_path / "seeder.zip"
     seeder.write_bytes(b"seeder-zip")
     monkeypatch.setattr(
-        "dsql_migrator.core.s3_provision._artifact_paths", lambda: (deb, sink, seeder)
+        "dsql_migrator.core.s3_provision._artifact_paths",
+        lambda: (deb, deb_pg, sink, seeder),
     )
     s3 = _FakeS3(head_object=None)  # always upload
     result = ensure_and_upload_plugins(s3, _FakeSts(), "us-east-1")
     assert result.bucket_name == "mysql-dsql-migrator-plugins-123456789012-us-east-1"
     assert result.bucket_arn.endswith(result.bucket_name)
     assert result.debezium_key.endswith("debezium-mysql-plugin.zip")
+    # The PostgreSQL source plugin is uploaded alongside the MySQL one.
+    assert result.debezium_pg_key.endswith("debezium-postgres-plugin.zip")
     # Sink ships as a ZIP bundle holding the single sink jar (the JSON converter is
     # provided by the MSK Connect runtime -- no Glue converter jar bundled).
     assert result.dsql_sink_key.endswith("dsql-sink-connector.zip")
     # The offset-seeder Lambda zip is uploaded under the same managed bucket.
     assert result.lambda_seeder_key.endswith("offset-seeder-lambda.zip")
     assert result.plugin_version
-    # All three artifacts uploaded.
-    assert sum(1 for c in s3.calls if c[0] == "put_object") == 3
+    # All four artifacts uploaded (MySQL + PostgreSQL source plugins, sink, seeder).
+    assert sum(1 for c in s3.calls if c[0] == "put_object") == 4
 
 
 def test_plugin_artifacts_are_zip_bundles_and_version_is_current() -> None:
@@ -198,15 +203,46 @@ def test_plugin_artifacts_are_zip_bundles_and_version_is_current() -> None:
     # defunct aws-msk-iam-auth generation that hit the AUTH_SCHEME_PROVIDER conflict).
     from dsql_migrator.core.s3_provision import (
         DEBEZIUM_PLUGIN_KEY,
+        DEBEZIUM_PG_PLUGIN_KEY,
         DSQL_SINK_PLUGIN_KEY,
         PLUGIN_VERSION,
+        _DEBEZIUM_PG_PLUGIN_RELPATH,
         _DSQL_SINK_PLUGIN_RELPATH,
     )
 
     assert DEBEZIUM_PLUGIN_KEY.endswith(".zip")
+    assert DEBEZIUM_PG_PLUGIN_KEY.endswith("debezium-postgres-plugin.zip")
+    assert _DEBEZIUM_PG_PLUGIN_RELPATH.endswith("debezium-postgres-plugin.zip")
     assert DSQL_SINK_PLUGIN_KEY.endswith(".zip")  # was a bare .jar before the fix
     assert _DSQL_SINK_PLUGIN_RELPATH.endswith("dsql-sink-plugin.zip")
     assert PLUGIN_VERSION not in ("v1", "v2", "v3")
+
+
+def test_debezium_postgres_plugin_zip_is_committed_with_expected_layout() -> None:
+    """The prebuilt Debezium PostgreSQL source plugin ships in the repo (deploy
+    convenience: no Maven needed) with the connector jar + the msk-config-providers
+    jar (Secrets Manager config provider) under a single top-level dir, mirroring the
+    MySQL plugin's packaging.
+    """
+    import zipfile
+    from dsql_migrator.core.s3_provision import _DEBEZIUM_PG_PLUGIN_RELPATH, _repo_root
+
+    zip_path = _repo_root() / _DEBEZIUM_PG_PLUGIN_RELPATH
+    assert zip_path.is_file(), f"missing committed PG plugin artifact: {zip_path}"
+    with zipfile.ZipFile(zip_path) as zf:
+        names = zf.namelist()
+    # Single top-level dir, matching the MySQL plugin's shape.
+    assert any(n.startswith("debezium-connector-postgres/") for n in names)
+    # The Debezium PostgreSQL connector jar (pgoutput) is present at 2.7.4.Final.
+    assert any(
+        "debezium-connector-postgres-2.7.4.Final.jar" in n for n in names
+    ), names
+    # The Secrets Manager config-provider jar is injected (not on the MSK runtime
+    # classpath) -- same reason it is bundled in the MySQL plugin.
+    assert any("msk-config-providers" in n for n in names), names
+    # MySQL-only jars must NOT be present.
+    assert not any("mysql-connector-j" in n for n in names)
+    assert not any("debezium-connector-binlog" in n for n in names)
 
 
 # ---------------------------------------------------------------------------

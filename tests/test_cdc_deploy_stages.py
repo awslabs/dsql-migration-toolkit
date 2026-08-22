@@ -281,12 +281,14 @@ def _run_infra(handle, deployer, on_log, **kw):
     orig = s3p._artifact_paths
     with tempfile.TemporaryDirectory() as d:
         deb = Path(d) / "debezium-mysql-plugin.zip"
+        deb_pg = Path(d) / "debezium-postgres-plugin.zip"
         sink = Path(d) / "dsql-sink-connector.zip"
         seeder = Path(d) / "offset-seeder-lambda.zip"
         deb.write_bytes(b"")  # size 0 → matches the fake head_object skip
+        deb_pg.write_bytes(b"")
         sink.write_bytes(b"")
         seeder.write_bytes(b"")
-        s3p._artifact_paths = lambda: (deb, sink, seeder)
+        s3p._artifact_paths = lambda: (deb, deb_pg, sink, seeder)
         try:
             run_cdc_infra_deploy(
                 handle, deployer=deployer, on_log=on_log,
