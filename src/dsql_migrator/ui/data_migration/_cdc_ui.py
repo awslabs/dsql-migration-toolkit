@@ -38,9 +38,7 @@ from dsql_migrator.core.cdc import (
     CDC_STACK_NAME_PREFIX,
     CdcPipelineOrchestrator,
     CdcResumePoint,
-    build_cdc_infra_params,
     build_cdc_stack_name,
-    build_cdc_stack_params,
     cdc_expected_connector_names,
     composite_cdc_excluded_key_columns,
     cdc_stack_name_suffix,
@@ -54,10 +52,16 @@ from dsql_migrator.core.job_manager import (
     JobNotFoundError,
     is_interrupted_by_restart,
 )
+from dsql_migrator.core.cdc_postgres import (
+    dispatch_cdc_infra_params,
+    dispatch_cdc_stack_params,
+    dispatch_source_config,
+)
 from dsql_migrator.core.models import (
     LoadStatusView,
     MigrationMode,
     SourceInventory,
+    SourceType,
     StepStatus,
     Watermark,
 )
@@ -144,6 +148,18 @@ from dsql_migrator.ui.data_migration._cdc_state import (  # noqa: E402,F401
     cdc_streaming_started,
     cdc_teardown_badge,
 )
+
+
+def _cdc_source_type(session) -> SourceType:
+    """The session's source engine (default MySQL), for CDC config dispatch."""
+    return getattr(
+        getattr(session, "source_config", None), "source_type", SourceType.MYSQL
+    )
+
+
+def _cdc_source_database(session) -> str:
+    """The session's source database name (PostgreSQL captures a single database)."""
+    return getattr(getattr(session, "source_config", None), "database", "") or ""
 
 
 def _logged_cdc_lifecycle(action: str, *, detail: str, work):
@@ -442,16 +458,19 @@ def _render_cdc_source_config_card(
         )
         return
 
-    config = CdcPipelineOrchestrator().build_source_config(
-        "mysql-source",
+    config = dispatch_source_config(
+        _cdc_source_type(session),
         tables_for_config,
         watermark if watermark is not None else _sentinel_watermark(),
+        database=_cdc_source_database(session),
+        stack_name=getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME),
         column_exclude_list=exclude_list,
         resume_override=override if (mode == "manual" and override is not None and override.has_coordinates()) else None,
     )
 
     # The sink config (topics, keying, DLQ). DLQ name is the cdc-stack default --
-    # NOT derived from a connector that may not exist yet (pre-deploy).
+    # NOT derived from a connector that may not exist yet (pre-deploy). Engine-neutral
+    # (the DSQL sink is the same for both source engines).
     sink = CdcPipelineOrchestrator().build_sink_config(
         "mysql-sink", tables_for_config, CDC_DEFAULT_DLQ_TOPIC
     )
@@ -459,7 +478,7 @@ def _render_cdc_source_config_card(
     # Build the deployable cdc-stack parameter set: tool-known values filled,
     # customer-environment values as <FILL_ME> placeholders.
     target = getattr(session, "target_config", None)
-    params = build_cdc_stack_params(
+    params = dispatch_cdc_stack_params(
         config,
         sink,
         target_endpoint=getattr(target, "cluster_endpoint", "") if target else "",
@@ -2897,10 +2916,12 @@ def _start_cdc_deploy(
             ),
         )
         return
-    source_config = CdcPipelineOrchestrator().build_source_config(
-        "mysql-source",
+    source_config = dispatch_source_config(
+        _cdc_source_type(session),
         tables_for_config,
         watermark if watermark is not None else _sentinel_watermark(),
+        database=_cdc_source_database(session),
+        stack_name=migration_state.cdc_stack_name,
         column_exclude_list=exclude_list,
         resume_override=override if (mode == "manual" and override is not None and override.has_coordinates()) else None,
         message_key_columns=message_key_columns,
@@ -2911,7 +2932,7 @@ def _start_cdc_deploy(
     target, region = _cdc_target_region(ui, session)
     if region is None:
         return
-    params = build_cdc_stack_params(
+    params = dispatch_cdc_stack_params(
         source_config, sink_config,
         target_endpoint=getattr(target, "cluster_endpoint", "") if target else "",
         target_database=getattr(target, "database", "postgres") if target else "postgres",
@@ -3215,10 +3236,12 @@ async def _start_cdc_infra_deploy(
     exclude_list = exclude_value.split(",") if exclude_value else None
     tables_for_config = _cdc_tables_for_config(migration_state, inventory, watermark)
     mode = migration_state.cdc_start_mode()
-    source_config = CdcPipelineOrchestrator().build_source_config(
-        "mysql-source",
+    source_config = dispatch_source_config(
+        _cdc_source_type(session),
         tables_for_config,
         watermark if watermark is not None else _sentinel_watermark(),
+        database=_cdc_source_database(session),
+        stack_name=migration_state.cdc_stack_name,
         column_exclude_list=exclude_list,
         resume_override=override if (mode == "manual" and override is not None and override.has_coordinates()) else None,
     )
@@ -3280,7 +3303,7 @@ async def _start_cdc_infra_deploy(
     from dsql_migrator.config import load_config as _load_config
 
     _cfg = _load_config()
-    params = build_cdc_infra_params(
+    params = dispatch_cdc_infra_params(
         source_config, sink_config,
         vpc_id=fields["vpc_id"],
         connector_subnet_ids=connector_subnet_ids,

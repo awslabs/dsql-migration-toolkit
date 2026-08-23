@@ -13798,7 +13798,9 @@ def test_every_cdc_param_build_passes_the_configured_sink_mcu() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id in ("build_cdc_stack_params", "build_cdc_infra_params")
+        # The param builds now go through the source-engine dispatch (MySQL vs
+        # PostgreSQL); the sink_mcu_count wiring must survive that indirection.
+        and node.func.id in ("dispatch_cdc_stack_params", "dispatch_cdc_infra_params")
     ]
     # Two Start-CDC-path builds (preview + deploy) and one infra create.
     assert len(calls) == 3, f"expected 3 param builds, found {len(calls)}"

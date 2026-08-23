@@ -35,8 +35,11 @@ from dsql_migrator.core.cdc_postgres import (
     build_pg_cdc_infra_params,
     build_pg_cdc_stack_params,
     build_pg_source_config,
+    dispatch_cdc_infra_params,
+    dispatch_cdc_stack_params,
+    dispatch_source_config,
 )
-from dsql_migrator.core.models import TableDef, Watermark
+from dsql_migrator.core.models import SourceType, TableDef, Watermark
 
 
 def _tables() -> list[TableDef]:
@@ -272,6 +275,58 @@ def test_patch_plugin_params_fills_pg_key_only_for_a_pg_set() -> None:
     assert "DebeziumPluginS3Key" not in patched
     assert patched["DsqlSinkPluginS3Key"].endswith("dsql-sink-connector.zip")
     assert patched["PluginBucketArn"].endswith("us-east-1")
+
+
+def test_dispatch_source_config_branches_by_engine() -> None:
+    tables = _tables()
+    # MySQL -> the orchestrator's DebeziumSourceConfig (name unchanged).
+    mysql_cfg = dispatch_source_config(SourceType.MYSQL, tables, _wm())
+    assert isinstance(mysql_cfg, DebeziumSourceConfig)
+    assert mysql_cfg.name == "mysql-source"
+    # PostgreSQL -> a PostgresSourceConfig with the database + deterministic slot/pub
+    # names from the stack, snapshot.mode=never (a WAL LSN is present).
+    pg_cfg = dispatch_source_config(
+        SourceType.POSTGRES, tables, _wm(wal_lsn="3/AF012B8"),
+        database="app", stack_name="mysql-dsql-cdc-stack",
+    )
+    assert isinstance(pg_cfg, PostgresSourceConfig)
+    assert pg_cfg.database_name == "app"
+    assert pg_cfg.slot_name == "dsqlmig_mysql_dsql_cdc_stack"
+    assert pg_cfg.publication_name == "dsqlmig_pub_mysql_dsql_cdc_stack"
+    assert pg_cfg.snapshot_mode == "never"
+    assert pg_cfg.table_include_list == ["app.orders", "app.customers"]
+
+
+def test_dispatch_params_route_to_the_matching_engine_builder() -> None:
+    tables = _tables()
+    sink = _sink()
+    mysql_cfg = dispatch_source_config(SourceType.MYSQL, tables, _wm())
+    pg_cfg = dispatch_source_config(
+        SourceType.POSTGRES, tables, _wm(wal_lsn="3/AF012B8"),
+        database="app", stack_name="mysql-dsql-cdc-stack",
+    )
+    # Stack params: PG carries EngineType=postgres; MySQL does not.
+    assert dict(dispatch_cdc_stack_params(mysql_cfg, sink, target_endpoint="ep").filled).get(
+        "EngineType"
+    ) is None
+    assert dict(
+        dispatch_cdc_stack_params(pg_cfg, sink, target_endpoint="ep").filled
+    )["EngineType"] == "postgres"
+    # Infra params: same routing, and PG drops the MySQL-only source params. The MySQL
+    # builder requires debezium_plugin_s3_key; the PG builder pops it (harmless to pass).
+    deb = "cdc-plugins/debezium-mysql-plugin.zip"
+    mysql_infra = dict(
+        dispatch_cdc_infra_params(
+            mysql_cfg, sink, debezium_plugin_s3_key=deb, **_neutral_infra_kwargs()
+        ).filled
+    )
+    pg_infra = dict(
+        dispatch_cdc_infra_params(
+            pg_cfg, sink, debezium_plugin_s3_key=deb, **_neutral_infra_kwargs()
+        ).filled
+    )
+    assert "SourceDbServerId" in mysql_infra and "EngineType" not in mysql_infra
+    assert pg_infra["EngineType"] == "postgres" and "SourceDbServerId" not in pg_infra
 
 
 def test_patch_plugin_params_fills_mysql_key_only_for_a_mysql_set() -> None:

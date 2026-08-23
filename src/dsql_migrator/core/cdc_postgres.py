@@ -49,7 +49,7 @@ from dsql_migrator.core.cdc import (
     build_cdc_infra_params,
     build_cdc_stack_params,
 )
-from dsql_migrator.core.models import TableDef, Watermark
+from dsql_migrator.core.models import SourceType, TableDef, Watermark
 
 # The MySQL-only source parameters emitted by the shared MySQL builders that do NOT
 # apply to a PostgreSQL source connector; dropped from the reused neutral base.
@@ -275,10 +275,86 @@ def build_pg_cdc_stack_params(
     )
 
 
+# ---------------------------------------------------------------------------
+# Source-engine dispatch -- one branch point the UI uses so the CDC config/param
+# builders pick the MySQL or PostgreSQL implementation by source_type. The MySQL
+# branch is byte-identical to the prior direct calls; the PostgreSQL branch feeds the
+# PG builders the database name + the deterministic slot/publication names (from the
+# stack name -- the SAME names created at Full Load and dropped at teardown). Gated
+# behind the still-closed CDC tile for PostgreSQL, so this is reached only when PG CDC
+# is enabled (Phase F).
+# ---------------------------------------------------------------------------
+
+
+def dispatch_source_config(
+    source_type: SourceType,
+    tables: Sequence[TableDef],
+    watermark: Watermark,
+    *,
+    database: str = "",
+    stack_name: str = "",
+    column_exclude_list: Optional[Sequence[str]] = None,
+    resume_override: Optional[CdcResumePoint] = None,
+    message_key_columns: Optional[Mapping[str, Sequence[str]]] = None,
+):
+    """Build the source connector config for ``source_type`` (MySQL or PostgreSQL).
+
+    PostgreSQL -> :func:`build_pg_source_config` with the database name and the
+    deterministic slot/publication names derived from ``stack_name`` (so the connector
+    resumes from the SAME slot the Full Load created and teardown drops). MySQL ->
+    the orchestrator's ``build_source_config`` exactly as before (byte-identical).
+    """
+    if source_type is SourceType.POSTGRES:
+        from dsql_migrator.core import cdc_pg_slot
+
+        return build_pg_source_config(
+            "postgres-source",
+            tables,
+            watermark,
+            database_name=database,
+            slot_name=cdc_pg_slot.pg_slot_name(stack_name),
+            publication_name=cdc_pg_slot.pg_publication_name(stack_name),
+            column_exclude_list=column_exclude_list,
+            message_key_columns=message_key_columns,
+            resume_override=resume_override,
+        )
+    from dsql_migrator.core.cdc import CdcPipelineOrchestrator
+
+    return CdcPipelineOrchestrator().build_source_config(
+        "mysql-source",
+        tables,
+        watermark,
+        column_exclude_list=column_exclude_list,
+        resume_override=resume_override,
+        message_key_columns=message_key_columns,
+    )
+
+
+def dispatch_cdc_stack_params(source_config, sink_config, **kwargs) -> CdcStackParams:
+    """Build the Start-CDC params for whichever engine ``source_config`` is."""
+    if isinstance(source_config, PostgresSourceConfig):
+        return build_pg_cdc_stack_params(source_config, sink_config, **kwargs)
+    from dsql_migrator.core.cdc import build_cdc_stack_params
+
+    return build_cdc_stack_params(source_config, sink_config, **kwargs)
+
+
+def dispatch_cdc_infra_params(source_config, sink_config, **kwargs) -> CdcInfraParams:
+    """Build the infra-create params for whichever engine ``source_config`` is."""
+    if isinstance(source_config, PostgresSourceConfig):
+        return build_pg_cdc_infra_params(source_config, sink_config, **kwargs)
+    from dsql_migrator.core.cdc import build_cdc_infra_params
+
+    return build_cdc_infra_params(source_config, sink_config, **kwargs)
+
+
 __all__ = [
     "PG_DEFAULT_SOURCE_PORT",
     "PostgresSourceConfig",
     "build_pg_source_config",
     "build_pg_cdc_infra_params",
     "build_pg_cdc_stack_params",
+    "dispatch_source_config",
+    "dispatch_cdc_stack_params",
+    "dispatch_cdc_infra_params",
 ]
