@@ -29,6 +29,7 @@ from dsql_migrator.ui.data_migration import (
     connector_health_rows,
     format_column_exclude_list,
     lob_exclusion_candidates,
+    scope_lob_candidates,
 )
 from dsql_migrator.core.msk_connect_controller import ConnectorHealth
 
@@ -96,6 +97,80 @@ def test_lob_exclusion_candidates_empty_for_none_or_no_lobs() -> None:
         ]
     )
     assert lob_exclusion_candidates(inventory) == []
+
+
+def test_scope_lob_candidates_filters_to_effective_selection() -> None:
+    # Two schemas each with an oversized-LOB table; the user selected only ecommerce.
+    candidates = lob_exclusion_candidates(
+        SourceInventory(
+            tables=[
+                TableDef(
+                    name="ecommerce.orders",
+                    columns=[ColumnDef(name="notes", mysql_type="LONGTEXT")],
+                    primary_key=["id"],
+                ),
+                TableDef(
+                    name="analytics.events",
+                    columns=[ColumnDef(name="payload", mysql_type="LONGBLOB")],
+                    primary_key=["id"],
+                ),
+            ]
+        )
+    )
+    assert {c.table for c in candidates} == {"ecommerce.orders", "analytics.events"}
+    # Effective selection = only the ecommerce table -> analytics is filtered out,
+    # even though the raw stored selection is still the empty "= all" default.
+    scoped = scope_lob_candidates(
+        candidates, selected_tables=["ecommerce.orders"], stored_selection=[]
+    )
+    assert [c.table for c in scoped] == ["ecommerce.orders"]
+
+
+def test_scope_lob_candidates_none_falls_back_to_stored_or_all() -> None:
+    candidates = lob_exclusion_candidates(
+        SourceInventory(
+            tables=[
+                TableDef(
+                    name="ecommerce.orders",
+                    columns=[ColumnDef(name="notes", mysql_type="LONGTEXT")],
+                    primary_key=["id"],
+                ),
+                TableDef(
+                    name="analytics.events",
+                    columns=[ColumnDef(name="payload", mysql_type="LONGBLOB")],
+                    primary_key=["id"],
+                ),
+            ]
+        )
+    )
+    # No effective selection supplied + empty stored selection => all (legacy).
+    assert len(scope_lob_candidates(
+        candidates, selected_tables=None, stored_selection=[]
+    )) == 2
+    # No effective selection but a non-empty stored selection => filter to it.
+    scoped = scope_lob_candidates(
+        candidates, selected_tables=None, stored_selection=["analytics.events"]
+    )
+    assert [c.table for c in scoped] == ["analytics.events"]
+
+
+def test_scope_lob_candidates_empty_effective_selection_shows_none() -> None:
+    # An explicit empty EFFECTIVE selection means nothing is being migrated -> no
+    # candidates (not "all"), distinct from the None fallback above.
+    candidates = lob_exclusion_candidates(
+        SourceInventory(
+            tables=[
+                TableDef(
+                    name="ecommerce.orders",
+                    columns=[ColumnDef(name="notes", mysql_type="LONGTEXT")],
+                    primary_key=["id"],
+                )
+            ]
+        )
+    )
+    assert scope_lob_candidates(
+        candidates, selected_tables=[], stored_selection=[]
+    ) == []
 
 
 def test_lob_exclusion_candidates_sorted_by_table() -> None:

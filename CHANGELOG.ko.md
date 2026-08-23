@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.387
+
+### 수정 (Fixed)
+
+- **"Oversized LOB columns" 패널이 이제 선택한 스키마/테이블의 컬럼만 나열합니다(모든 스키마 아님).**
+  Schema Conversion에서 스키마를 하나 고르면 Data Migration 피커가 pre-tick만 될 뿐,
+  `migration_state.selection`은 피커를 직접 건드리기 전까지 빈 "= 전체" 기본값이라, 그 원시 선택으로
+  필터링하던 패널이 모든 스키마의 LOB 컬럼을 나열했습니다. 이제 패널은 (로드가 쓰는 것과 동일한)
+  **실효 선택**으로 필터링합니다 — 신규 순수 헬퍼 `scope_lob_candidates`. 실효 선택이 주어지면 엄격히
+  필터(비어 있으면 마이그레이션 대상 없음 = 후보 없음)하고, 이를 해석할 수 없는 호출부(CDC 전용
+  패널)를 위해 레거시 원시-선택 폴백을 유지합니다.
+
 ## v0.1.386
 
 ### 추가 (Added)

@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.387
+
+### Fixed
+
+- **The "Oversized LOB columns" panel now lists only the SELECTED schema's/tables'
+  columns, not every schema's.** Picking one schema in Schema Conversion only
+  pre-ticks the Data Migration picker; `migration_state.selection` stays the empty
+  "= all" default until the picker is touched, so the panel — which filtered on that
+  raw selection — fell through to listing LOB columns from all schemas. The panel now
+  filters on the resolved **effective selection** (the same set the load uses), via a
+  new pure `scope_lob_candidates` helper. When an effective selection is supplied it
+  filters strictly (empty = nothing to migrate = no candidates); the legacy raw-
+  selection fallback is kept for callers that can't resolve it (CDC-only panel).
+
 ## v0.1.386
 
 ### Added
