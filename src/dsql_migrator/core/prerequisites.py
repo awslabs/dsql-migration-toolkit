@@ -578,9 +578,13 @@ class PrerequisiteChecker:
 
             facts = self._source.cdc_prerequisites([table.name for table in tables])
             if facts is None:
-                # The probe could not run (no dialect facts) -- fall back to the honest
-                # non-blocking INFO rather than inventing failures.
-                results.append(check_postgres_cdc_unsupported())
+                # For a PostgreSQL source the probe returns facts unless it FAILED
+                # (unreachable / insufficient privilege). CDC must not start against a
+                # source whose logical-replication readiness is unverified, so this is a
+                # blocking FAIL -- not the advisory not-supported INFO.
+                results.append(
+                    prerequisites_postgres.check_postgres_cdc_facts_unavailable()
+                )
             else:
                 results.extend(
                     prerequisites_postgres.check_postgres_cdc_prerequisites(

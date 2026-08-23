@@ -219,6 +219,30 @@ def check_replica_identity(
     )
 
 
+def check_postgres_cdc_facts_unavailable() -> PrerequisiteResult:
+    """A blocking FAIL when the source CDC readiness could not be probed at all.
+
+    For a PostgreSQL source in CDC mode, ``None`` facts mean the read-only probe failed
+    (unreachable source, insufficient privilege) -- NOT that CDC is unsupported. CDC must
+    not proceed against a source whose logical-replication readiness (wal_level, slot
+    role, REPLICA IDENTITY) is unverified: starting it could create a publication that
+    breaks source UPDATE/DELETE, or resume from a slot that cannot be created. So this is a
+    required FAIL, not an advisory INFO.
+    """
+    return PrerequisiteResult(
+        check_id=PrerequisiteCheckId.WAL_LEVEL_LOGICAL,
+        title="PostgreSQL CDC readiness could not be verified",
+        status=PrerequisiteStatus.FAIL,
+        required=True,
+        detail="Could not read the source's logical-replication settings.",
+        remediation=(
+            "Verify the source is reachable and the migration user can read the "
+            "server settings, then re-run the checks. CDC will not start until the "
+            "PostgreSQL logical-replication prerequisites can be confirmed."
+        ),
+    )
+
+
 def check_postgres_cdc_prerequisites(
     facts: PostgresCdcFacts, tables: Sequence[TableDef]
 ) -> list[PrerequisiteResult]:
@@ -235,6 +259,7 @@ def check_postgres_cdc_prerequisites(
 
 __all__ = [
     "PostgresCdcFacts",
+    "check_postgres_cdc_facts_unavailable",
     "check_wal_level_logical",
     "check_replication_role",
     "check_replication_slot_headroom",

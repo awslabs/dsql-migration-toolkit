@@ -37,26 +37,48 @@ class _Result:
     def first(self):
         return self._rows[0] if self._rows else None
 
+    def fetchall(self):
+        return list(self._rows)
+
 
 class _FakeConn:
-    """Records executed statements; answers existence checks + the slot LSN from state."""
+    """Records executed statements; answers existence/reconcile reads + the slot LSN.
 
-    def __init__(self, *, pubs=(), slots=(), lsn="3/AF012B8"):
+    ``pubs`` maps an existing publication name -> its member tables (for the reconcile
+    read); ``replident`` maps a qualified table -> its pg_class.relreplident code (default
+    'd', usable). ``slots`` are pre-existing slot names.
+    """
+
+    def __init__(
+        self, *, pubs=None, slots=(), lsn="3/AF012B8", replident=None,
+        fail_slot_create=False,
+    ):
         self.statements: list[tuple[str, dict]] = []
-        self._pubs = set(pubs)
+        self._pubs = dict(pubs or {})
         self._slots = set(slots)
         self._lsn = lsn
+        self._replident = dict(replident or {})
+        self._fail_slot_create = fail_slot_create
 
     def execute(self, statement, params=None):
         sql = str(statement)
         params = params or {}
         self.statements.append((sql, params))
         up = " ".join(sql.upper().split())
+        # PG_PUBLICATION_TABLES must be checked before PG_PUBLICATION (substring).
+        if "FROM PG_PUBLICATION_TABLES" in up:
+            tables = self._pubs.get(params.get("name"), [])
+            return _Result([(t,) for t in tables])
         if "FROM PG_PUBLICATION" in up:
             return _Result([(1,)] if params.get("name") in self._pubs else [])
+        if "FROM PG_CLASS" in up:  # _verify_tables_replicable relreplident read
+            names = params.get("names") or []
+            return _Result([(n, self._replident.get(n, "d")) for n in names])
         if "FROM PG_REPLICATION_SLOTS" in up:
             return _Result([(1,)] if params.get("name") in self._slots else [])
         if "PG_CREATE_LOGICAL_REPLICATION_SLOT" in up:
+            if self._fail_slot_create:
+                raise RuntimeError("all replication slots are in use")
             self._slots.add(params.get("name"))
             return _Result([(self._lsn,)])
         if up.startswith("SELECT PG_DROP_REPLICATION_SLOT"):
@@ -83,18 +105,27 @@ class _FakeConn:
 # ---------------------------------------------------------------------------
 
 
-def test_slot_and_publication_names_are_deterministic_and_sanitized() -> None:
+def test_slot_and_publication_names_are_deterministic_sanitized_and_collision_resistant() -> None:
+    import re
+
     stack = "mysql-dsql-cdc-Prod.1"
     slot = pg_slot_name(stack)
     pub = pg_publication_name(stack)
-    # Hyphens/dots/uppercase are reduced to the PostgreSQL slot charset [a-z0-9_].
-    assert slot == "dsqlmig_mysql_dsql_cdc_prod_1"
-    assert pub == "dsqlmig_pub_mysql_dsql_cdc_prod_1"
-    import re
-
+    # Slot charset [a-z0-9_]; sanitized base + prefix + a hash discriminator.
     assert re.fullmatch(r"[a-z0-9_]+", slot)
-    # 63-char slot-name limit is respected.
+    assert slot.startswith("dsqlmig_mysql_dsql_cdc_prod_1_")
+    assert pub.startswith("dsqlmig_pub_mysql_dsql_cdc_prod_1_")
+    # Deterministic.
+    assert pg_slot_name(stack) == slot
+    # 63-char slot-name limit is respected even for a very long stack name.
     assert len(pg_slot_name("x" * 200)) <= 63
+    # Collision resistance: case-only differences and long suffixes that would sanitize/
+    # truncate to the same base still yield DISTINCT slot names (the hash of the original
+    # name differs), so two migrations of one source never fight over one slot.
+    assert pg_slot_name("mysql-dsql-cdc-Orders") != pg_slot_name("mysql-dsql-cdc-orders")
+    long_a = "mysql-dsql-cdc-" + "a" * 60 + "-one"
+    long_b = "mysql-dsql-cdc-" + "a" * 60 + "-two"
+    assert pg_slot_name(long_a) != pg_slot_name(long_b)
 
 
 # ---------------------------------------------------------------------------
@@ -135,12 +166,24 @@ def test_create_publication_is_for_exact_tables_not_all_tables() -> None:
     assert any("creating publication" in m for m in logs)
 
 
-def test_create_publication_skips_when_it_already_exists() -> None:
-    conn = _FakeConn(pubs={"dsqlmig_pub_s"})
+def test_create_publication_reuses_when_it_exists_with_the_same_tables() -> None:
+    conn = _FakeConn(pubs={"dsqlmig_pub_s": ["app.orders"]})
     logs: list[str] = []
-    create_publication(conn, name="dsqlmig_pub_s", tables=["app.orders"], on_log=logs.append)
+    created = create_publication(
+        conn, name="dsqlmig_pub_s", tables=["app.orders"], on_log=logs.append
+    )
+    assert created is False  # reused, not created
     assert conn.writes() == []  # no CREATE issued
-    assert any("already exists" in m for m in logs)
+    assert any("reusing" in m for m in logs)
+
+
+def test_create_publication_refuses_reuse_when_the_table_set_differs() -> None:
+    # A re-run that added a table must NOT silently reuse the stale, narrower publication
+    # (pgoutput only streams a publication's members -> the new table would be unreplicated).
+    conn = _FakeConn(pubs={"dsqlmig_pub_s": ["app.orders"]})
+    with pytest.raises(PgReplicationError) as ei:
+        create_publication(conn, name="dsqlmig_pub_s", tables=["app.orders", "app.customers"])
+    assert "app.customers" in str(ei.value) or "covers" in str(ei.value)
 
 
 def test_create_publication_rejects_zero_tables() -> None:
@@ -220,6 +263,35 @@ def test_provision_drops_a_stale_slot_before_creating_a_fresh_one() -> None:
     create_idx = next(i for i, s in enumerate(ops) if "PG_CREATE_LOGICAL_REPLICATION_SLOT" in s)
     assert drop_idx < create_idx  # stale slot dropped before the fresh create
     assert any("stale" in m for m in logs)
+
+
+def test_provision_refuses_a_table_with_no_replica_identity() -> None:
+    # Source-safety guard: publishing a REPLICA IDENTITY NOTHING table would break its
+    # UPDATE/DELETE on the source, so provision must refuse before creating anything.
+    conn = _FakeConn(replident={"app.orders": "n"})
+    with pytest.raises(PgReplicationError) as ei:
+        provision_pg_replication(
+            conn, slot_name="dsqlmig_s", publication_name="dsqlmig_pub_s",
+            tables=["app.orders"],
+        )
+    assert "REPLICA IDENTITY" in str(ei.value)
+    assert conn.writes() == []  # nothing created
+
+
+def test_provision_drops_the_publication_it_created_if_slot_creation_fails() -> None:
+    # AUTOCOMMIT commits CREATE PUBLICATION immediately; if slot creation then fails,
+    # provision must drop the publication it just created (no orphan arming a source
+    # write outage).
+    conn = _FakeConn(fail_slot_create=True)
+    with pytest.raises(RuntimeError):
+        provision_pg_replication(
+            conn, slot_name="dsqlmig_s", publication_name="dsqlmig_pub_s",
+            tables=["app.orders"],
+        )
+    ops = [s.upper() for s in conn.writes()]
+    assert any(s.startswith("CREATE PUBLICATION") for s in ops)
+    # ...and it was compensated with a DROP PUBLICATION.
+    assert any(s.startswith("DROP PUBLICATION") for s in ops)
 
 
 def test_deprovision_drops_slot_then_publication() -> None:

@@ -300,21 +300,31 @@ def dispatch_source_config(
 ):
     """Build the source connector config for ``source_type`` (MySQL or PostgreSQL).
 
-    PostgreSQL -> :func:`build_pg_source_config` with the database name and the
-    deterministic slot/publication names derived from ``stack_name`` (so the connector
-    resumes from the SAME slot the Full Load created and teardown drops). MySQL ->
-    the orchestrator's ``build_source_config`` exactly as before (byte-identical).
+    PostgreSQL -> :func:`build_pg_source_config`. The connector must resume from the EXACT
+    slot/publication the Full Load created, so it uses the names RECORDED on the watermark
+    (``watermark.slot_name`` / ``watermark.publication_name``) when present -- not a name
+    re-derived from the (mutable) live ``stack_name``, which could drift after Full Load
+    and point the connector at a slot that does not exist. Falls back to the deterministic
+    names from ``stack_name`` only when the watermark carries none (e.g. a stand-alone CDC
+    with no Full Load in this session). MySQL -> the orchestrator's ``build_source_config``
+    exactly as before (byte-identical).
     """
     if source_type is SourceType.POSTGRES:
         from dsql_migrator.core import cdc_pg_slot
 
+        slot_name = getattr(watermark, "slot_name", None) or cdc_pg_slot.pg_slot_name(
+            stack_name
+        )
+        publication_name = getattr(
+            watermark, "publication_name", None
+        ) or cdc_pg_slot.pg_publication_name(stack_name)
         return build_pg_source_config(
             "postgres-source",
             tables,
             watermark,
             database_name=database,
-            slot_name=cdc_pg_slot.pg_slot_name(stack_name),
-            publication_name=cdc_pg_slot.pg_publication_name(stack_name),
+            slot_name=slot_name,
+            publication_name=publication_name,
             column_exclude_list=column_exclude_list,
             message_key_columns=message_key_columns,
             resume_override=resume_override,

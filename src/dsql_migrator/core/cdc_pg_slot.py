@@ -90,19 +90,47 @@ def _sanitize(stack_name: str) -> str:
     return re.sub(r"[^a-z0-9_]", "_", (stack_name or "").lower())
 
 
-def pg_slot_name(stack_name: str) -> str:
-    """Return the deterministic logical replication slot name for ``stack_name``.
+# Length of the case-preserving hash discriminator appended to slot/publication names.
+_STACK_HASH_LEN = 8
 
-    ``dsqlmig_<sanitized-stack>`` truncated to PostgreSQL's 63-char slot-name limit, so
-    the connector param (``PgSlotName``), the creation, and teardown all name the SAME
-    slot from the stack name alone.
+
+def _stack_hash(stack_name: str) -> str:
+    """Return a short deterministic hash of the ORIGINAL stack name (case-preserving)."""
+    import hashlib
+
+    return hashlib.sha1((stack_name or "").encode("utf-8")).hexdigest()[:_STACK_HASH_LEN]
+
+
+def _derive_name(prefix: str, stack_name: str) -> str:
+    """``<prefix><sanitized>_<hash8>`` within the 63-char limit; collision-resistant.
+
+    The lowercasing + 63-char truncation of the raw sanitized name could map two DISTINCT
+    stack names (case-only differences, or suffixes differing only past the truncation
+    boundary) to one slot/publication -- so two migrations of the same source would fight
+    over one slot. Appending a hash of the ORIGINAL (case-preserving) full stack name makes
+    the name stack-unique, which also makes ``provision``'s drop-of-a-stale-slot safe (a
+    pre-existing slot with our name is genuinely OUR stack's prior slot, not another's).
+    The sanitized base is truncated (never the hash) to fit 63 chars.
     """
-    return (_SLOT_PREFIX + _sanitize(stack_name))[:_MAX_SLOT_NAME]
+    suffix = "_" + _stack_hash(stack_name)
+    keep = _MAX_SLOT_NAME - len(prefix) - len(suffix)
+    return f"{prefix}{_sanitize(stack_name)[:keep]}{suffix}"
+
+
+def pg_slot_name(stack_name: str) -> str:
+    """Return the deterministic, collision-resistant logical-replication slot name.
+
+    ``dsqlmig_<sanitized-stack>_<hash8>`` within PostgreSQL's 63-char slot-name limit, so
+    the connector param (``PgSlotName``), the creation, and teardown all name the SAME slot
+    from the stack name alone -- and two distinct stacks never collide (see
+    :func:`_derive_name`).
+    """
+    return _derive_name(_SLOT_PREFIX, stack_name)
 
 
 def pg_publication_name(stack_name: str) -> str:
-    """Return the deterministic publication name for ``stack_name`` (same charset/limit)."""
-    return (_PUBLICATION_PREFIX + _sanitize(stack_name))[:_MAX_SLOT_NAME]
+    """Return the deterministic, collision-resistant publication name for ``stack_name``."""
+    return _derive_name(_PUBLICATION_PREFIX, stack_name)
 
 
 def build_pg_source_write_engine(
@@ -182,27 +210,84 @@ def slot_exists(connection: object, name: str) -> bool:
     return row is not None
 
 
+def _publication_tables(connection: object, name: str) -> set:
+    """Return the set of qualified ``schema.table`` names a publication covers."""
+    rows = connection.execute(  # type: ignore[attr-defined]
+        text(
+            "SELECT schemaname || '.' || tablename FROM pg_publication_tables "
+            "WHERE pubname = :name"
+        ),
+        {"name": name},
+    ).fetchall()
+    return {str(r[0]) for r in rows}
+
+
+def _verify_tables_replicable(connection: object, tables: Sequence[str]) -> None:
+    """Raise if any table lacks a REPLICA IDENTITY usable for UPDATE/DELETE replication.
+
+    A last-line source-safety guard at the write layer (independent of the advisory
+    prerequisite check, which can be bypassed): adding a REPLICA IDENTITY NOTHING table to
+    a publication ARMS a source-write outage -- every UPDATE/DELETE on it then ERRORs on
+    the publisher. relreplident 'n' (nothing) is refused; 'd'/'f'/'i' are usable ('d'
+    relies on the primary key, which the prerequisite gate separately requires). Best-effort
+    read: if relreplident is unreadable the table is not blocked here (the prereq owns that).
+    """
+    names = list(tables)
+    if not names:
+        return
+    try:
+        rows = connection.execute(  # type: ignore[attr-defined]
+            text(
+                "SELECT n.nspname || '.' || c.relname, c.relreplident FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname || '.' || c.relname = ANY(:names)"
+            ),
+            {"names": names},
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - if unreadable, let the prereq gate own it
+        return
+    nothing = sorted(str(r[0]) for r in rows if str(r[1]) == "n")
+    if nothing:
+        raise PgReplicationError(
+            "cannot publish tables with REPLICA IDENTITY NOTHING (UPDATE/DELETE would "
+            f"fail on the source): {', '.join(nothing)}. Set a primary key or "
+            "ALTER TABLE ... REPLICA IDENTITY FULL before starting CDC."
+        )
+
+
 def create_publication(
     connection: object,
     *,
     name: str,
     tables: Sequence[str],
     on_log: Optional[Callable[[str], None]] = None,
-) -> None:
-    """Create a publication for exactly ``tables`` (idempotent; skips if it exists).
+) -> bool:
+    """Create a publication for exactly ``tables``; return whether it was CREATED (vs reused).
 
     ``FOR TABLE <exact migrated tables>`` -- NEVER ``FOR ALL TABLES`` (that would make an
     UPDATE/DELETE on any of the source's no-PK tables ERROR on the publisher, a customer
     write outage). ``tables`` are qualified ``schema.table`` names, quoted via the PG
-    dialect. PostgreSQL has no ``CREATE PUBLICATION IF NOT EXISTS``, so existence is
-    checked first (idempotent re-run).
+    dialect. PostgreSQL has no ``CREATE PUBLICATION IF NOT EXISTS``, so existence is checked
+    first. On reuse the existing publication's table set is RECONCILED against ``tables``:
+    a mismatch (e.g. a table added on a re-run) is refused loudly rather than silently
+    leaving the new table unreplicated -- pgoutput only streams a publication's members.
     """
     if not tables:
         raise PgReplicationError("cannot create a publication for zero tables")
     if publication_exists(connection, name):
+        existing = _publication_tables(connection, name)
+        requested = {str(t) for t in tables}
+        if existing != requested:
+            raise PgReplicationError(
+                f"publication {name} already exists but covers {sorted(existing)}, not "
+                f"the requested {sorted(requested)}. pgoutput only streams a publication's "
+                "member tables, so reusing it would silently skip the difference. Drop it "
+                f'(DROP PUBLICATION IF EXISTS "{_sanitize(name)}") and re-run, or align the '
+                "table selection."
+            )
         if on_log is not None:
-            on_log(f"publication {name} already exists; reusing")
-        return
+            on_log(f"publication {name} already exists with the same tables; reusing")
+        return False
     dialect = dialect_for(SourceType.POSTGRES)
     quoted = ", ".join(dialect.quote_table(t) for t in tables)
     ident = _sanitize(name)  # allowlisted charset; also the literal in the DDL
@@ -212,6 +297,7 @@ def create_publication(
         action=f"creating publication {ident}",
         on_log=on_log,
     )
+    return True
 
 
 def create_replication_slot(
@@ -301,15 +387,34 @@ def provision_pg_replication(
     creation runs at Full Load time, before any CDC connector exists to hold it active.
     Returns the handles (incl. the resume LSN) to record on the watermark. Callers pass a
     connection from :func:`build_pg_source_write_engine` (the un-guarded AUTOCOMMIT path).
+
+    Refuses upfront if any table lacks a usable REPLICA IDENTITY (a source-write outage
+    guard). On AUTOCOMMIT the publication commits immediately, so if slot creation then
+    fails, a publication CREATED by this call is dropped (compensating) rather than left
+    orphaned on the source.
     """
-    create_publication(
+    # Source-safety guard (independent of the advisory prereq): never publish a table
+    # whose UPDATE/DELETE would then ERROR on the source publisher.
+    _verify_tables_replicable(connection, tables)
+    created_publication = create_publication(
         connection, name=publication_name, tables=tables, on_log=on_log
     )
-    if slot_exists(connection, slot_name):
-        if on_log is not None:
-            on_log(f"dropping stale replication slot {slot_name} from a prior run")
-        drop_replication_slot(connection, name=slot_name, on_log=on_log)
-    lsn = create_replication_slot(connection, name=slot_name, on_log=on_log)
+    try:
+        if slot_exists(connection, slot_name):
+            if on_log is not None:
+                on_log(f"dropping stale replication slot {slot_name} from a prior run")
+            drop_replication_slot(connection, name=slot_name, on_log=on_log)
+        lsn = create_replication_slot(connection, name=slot_name, on_log=on_log)
+    except Exception:
+        # AUTOCOMMIT already committed the CREATE PUBLICATION; if we created it this call,
+        # drop it so a failed provision does not leave an orphaned publication arming a
+        # source-write outage. A reused (pre-existing) publication is left as-is.
+        if created_publication:
+            try:
+                drop_publication(connection, name=publication_name, on_log=on_log)
+            except Exception:  # noqa: BLE001 - best-effort compensation
+                pass
+        raise
     return PgReplicationHandles(
         slot_name=slot_name, publication_name=publication_name, consistent_lsn=lsn
     )

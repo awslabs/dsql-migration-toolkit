@@ -704,6 +704,8 @@ def test_refresh_pg_slot_health_reads_for_pg_and_noops_for_mysql() -> None:
         SourceConnectionConfig(source_type=SourceType.POSTGRES, host="pg", database="app"),
         _Conn((True, "reserved", 999, "0/16B3748", "0/16B3800")),
     )
+    from dsql_migrator.core.cdc_pg_slot import pg_slot_name
+
     assert pg_state.cdc_slot_health is not None
-    assert pg_state.cdc_slot_health.slot_name == "dsqlmig_mysql_dsql_cdc_stack"
+    assert pg_state.cdc_slot_health.slot_name == pg_slot_name("mysql-dsql-cdc-stack")
     assert pg_state.cdc_slot_health.wal_status == "reserved"

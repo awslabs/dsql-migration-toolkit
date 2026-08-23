@@ -291,10 +291,31 @@ def test_dispatch_source_config_branches_by_engine() -> None:
     )
     assert isinstance(pg_cfg, PostgresSourceConfig)
     assert pg_cfg.database_name == "app"
-    assert pg_cfg.slot_name == "dsqlmig_mysql_dsql_cdc_stack"
-    assert pg_cfg.publication_name == "dsqlmig_pub_mysql_dsql_cdc_stack"
+    # No recorded names on this watermark -> derived from the stack (hash-suffixed).
+    from dsql_migrator.core.cdc_pg_slot import pg_publication_name, pg_slot_name
+
+    assert pg_cfg.slot_name == pg_slot_name("mysql-dsql-cdc-stack")
+    assert pg_cfg.publication_name == pg_publication_name("mysql-dsql-cdc-stack")
     assert pg_cfg.snapshot_mode == "never"
     assert pg_cfg.table_include_list == ["app.orders", "app.customers"]
+
+
+def test_dispatch_source_config_uses_recorded_watermark_names() -> None:
+    # The connector must resume from the EXACT slot the Full Load created, so when the
+    # watermark carries recorded slot/publication names, dispatch uses THOSE -- not a name
+    # re-derived from the (mutable) live stack name (which could point at a missing slot).
+    wm = Watermark(
+        snapshot_timestamp=datetime.now(timezone.utc),
+        wal_lsn="3/AF012B8",
+        slot_name="dsqlmig_recorded_slot",
+        publication_name="dsqlmig_pub_recorded",
+    )
+    cfg = dispatch_source_config(
+        SourceType.POSTGRES, _tables(), wm,
+        database="app", stack_name="a-totally-different-stack-name",
+    )
+    assert cfg.slot_name == "dsqlmig_recorded_slot"
+    assert cfg.publication_name == "dsqlmig_pub_recorded"
 
 
 def test_dispatch_params_route_to_the_matching_engine_builder() -> None:

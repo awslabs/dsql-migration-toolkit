@@ -865,6 +865,7 @@ class _SlotConn:
 
     def __init__(self):
         self.sql: list[str] = []
+        self.params: list[dict] = []
 
     def __enter__(self):  # noqa: ANN204
         return self
@@ -875,6 +876,7 @@ class _SlotConn:
     def execute(self, statement, params=None):  # noqa: ANN001, ANN201
         s = str(statement)
         self.sql.append(s)
+        self.params.append(params or {})
         up = " ".join(s.upper().split())
         if "FROM PG_REPLICATION_SLOTS" in up or "FROM PG_PUBLICATION" in up:
             return _SlotRes([(1,)])  # both exist -> drops are issued
@@ -938,6 +940,72 @@ def test_delete_drops_pg_replication_slot_before_secret_cleanup(monkeypatch) -> 
     assert "PG_DROP_REPLICATION_SLOT" in writes
     assert "DROP PUBLICATION IF EXISTS" in writes
     assert engine.disposed is True  # source write engine disposed (no leak)
+
+
+def test_delete_uses_deployed_slot_name_and_secret_fallback(monkeypatch) -> None:
+    # Teardown must drop the DEPLOYED slot name (PgSlotName from the stack params, which
+    # is the exact name the connector used even if the session's stack name drifted), and
+    # -- for a Secrets-Manager-auth source with no tool-managed secret -- fall back to the
+    # stack's own SourceSecretArn.
+    from dsql_migrator.config import SecretValue
+    from dsql_migrator.core import cdc_pg_slot
+    import dsql_migrator.core.secrets as secrets
+    from dsql_migrator.core.secrets import SecretResolutionError
+
+    conn = _SlotConn()
+
+    class _Eng:
+        def connect(self):  # noqa: ANN201
+            return conn
+
+        def dispose(self) -> None:
+            self.disposed = True
+
+    engine = _Eng()
+    monkeypatch.setattr(cdc_pg_slot, "build_pg_source_write_engine", lambda src, pw: engine)
+    monkeypatch.setattr(secrets, "delete_source_secret", lambda **k: "absent")
+    resolved = []
+
+    def _resolve(secret_id, prof, region=None):
+        resolved.append(secret_id)
+        if secret_id.startswith("mysql-dsql-migrator/cdc/"):
+            raise SecretResolutionError("no tool secret")  # SM-auth source: none created
+        return ("cdc_user", SecretValue("pw"))
+
+    monkeypatch.setattr(secrets, "resolve_source_secret", _resolve)
+
+    handle = _FakeHandle()
+    _, on_log = _logs()
+    params = dict(_PG_DELETE_PARAMS)
+    params["PgSlotName"] = "dsqlmig_deployed_slot"
+    params["PgPublicationName"] = "dsqlmig_pub_deployed"
+    params["SourceSecretArn"] = "arn:aws:secretsmanager:us-east-1:1:secret:customer-abc"
+    existing = CdcStackDiscovery("CREATE_COMPLETE", params, True)
+    deployer = _FakeDeployer(existing=existing, stack_statuses=("DELETE_IN_PROGRESS", None))
+    run_cdc_delete(
+        handle, stack_name=STACK, deployer=deployer, on_log=on_log,
+        region="us-east-1", sleep=lambda _s: None,
+        delete_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    # Dropped the DEPLOYED slot name (a bind param) and publication (inlined), not
+    # re-derived ones.
+    slot_params = [p.get("name") for p in conn.params if p.get("name")]
+    assert "dsqlmig_deployed_slot" in slot_params
+    assert "dsqlmig_pub_deployed" in " ".join(conn.sql)
+    # Fell back to the stack's customer secret after the tool secret was absent.
+    assert any(s.startswith("arn:aws:secretsmanager") for s in resolved), resolved
+
+
+def test_delete_absent_stack_warns_about_a_possible_orphan_slot() -> None:
+    # When the stack is gone (deleted out-of-band), the drop can't run; a loud reminder
+    # must name the slot that may still pin WAL on the source.
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    deployer = _FakeDeployer(existing="absent")
+    run_cdc_delete(
+        handle, stack_name=STACK, deployer=deployer, on_log=on_log, sleep=lambda _s: None,
+    )
+    assert any("pg_drop_replication_slot" in m for m in logs), logs
 
 
 def test_delete_mysql_stack_never_touches_the_source(monkeypatch) -> None:

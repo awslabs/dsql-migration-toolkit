@@ -1203,15 +1203,23 @@ def _drop_pg_source_replication(
 
     Reconstructs the source connection from the (captured) stack parameters
     (``SourceDbHostname`` / ``SourceDbPort`` / ``PgDatabaseName``) plus the source
-    credentials still in the tool-managed secret, then drops the slot + publication via
-    the audited, non-read-only-guarded PostgreSQL write path
-    (:mod:`dsql_migrator.core.cdc_pg_slot`). The slot/publication names are the same
-    deterministic ones created at Full Load time. Best-effort but LOUD: any failure logs
-    a prominent manual-drop reminder (a surviving slot pins the source WAL) and returns
-    without failing the already-complete infra teardown.
+    credentials, then drops the slot + publication via the audited, non-read-only-guarded
+    PostgreSQL write path (:mod:`dsql_migrator.core.cdc_pg_slot`). The slot/publication
+    names are the DEPLOYED ones the connector used (``PgSlotName`` / ``PgPublicationName``
+    from the captured params), so a teardown drops exactly what the connector held even if
+    the session's stack name drifted; it falls back to the deterministic name. Credentials
+    come from the tool-managed secret, or -- for a Secrets-Manager-auth source where the
+    tool never created one -- from the stack's own ``SourceSecretArn`` / ``SourceSecretName``.
+    Best-effort but LOUD: any failure logs a prominent manual-drop reminder (a surviving
+    slot pins the source WAL) and returns without failing the already-complete teardown.
     """
-    slot = cdc_pg_slot.pg_slot_name(stack_name)
-    publication = cdc_pg_slot.pg_publication_name(stack_name)
+    # Prefer the DEPLOYED names the connector actually used; fall back to the derived name.
+    slot = (stack_params.get("PgSlotName") or "").strip() or cdc_pg_slot.pg_slot_name(
+        stack_name
+    )
+    publication = (
+        stack_params.get("PgPublicationName") or ""
+    ).strip() or cdc_pg_slot.pg_publication_name(stack_name)
     host = (stack_params.get("SourceDbHostname") or "").strip()
     database = (stack_params.get("PgDatabaseName") or "").strip()
     try:
@@ -1232,13 +1240,33 @@ def _drop_pg_source_replication(
     try:
         from dsql_migrator.core.models import SourceConnectionConfig, SourceType
         from dsql_migrator.core.secrets import (
+            SecretResolutionError,
             cdc_source_secret_name,
             resolve_source_secret,
         )
 
-        username, password = resolve_source_secret(
-            cdc_source_secret_name(stack_name), aws_profile, region=region
-        )
+        # The tool-managed secret is only created for a username/password source. For a
+        # Secrets-Manager-auth source it was never created, so fall back to the stack's
+        # own source secret (SourceSecretArn/Name) -- the exact creds the connector used.
+        try:
+            username, password = resolve_source_secret(
+                cdc_source_secret_name(stack_name), aws_profile, region=region
+            )
+        except SecretResolutionError:
+            fallback = (
+                stack_params.get("SourceSecretArn")
+                or stack_params.get("SourceSecretName")
+                or ""
+            ).strip()
+            if not fallback:
+                raise
+            driver.log(
+                "Tool-managed source secret absent; using the stack's source secret "
+                "to drop the replication slot."
+            )
+            username, password = resolve_source_secret(
+                fallback, aws_profile, region=region
+            )
         source_config = SourceConnectionConfig(
             source_type=SourceType.POSTGRES,
             host=host,
@@ -1308,6 +1336,18 @@ def run_cdc_delete(
         existing = deployer.describe_stack_or_none(stack_name)
         if existing is None:
             driver.log("Stack does not exist — nothing to delete.")
+            # The stack is gone, so its parameters (engine, source host, secret) can no
+            # longer be read to drop a PostgreSQL replication slot. If it was deleted
+            # out-of-band (e.g. from the CloudFormation console after a DELETE_FAILED), a
+            # logical replication slot may survive on the source and pin WAL. Warn so the
+            # operator can drop it manually -- the tool cannot reach it from here. (No-op
+            # concern for a MySQL source, which has no slot.)
+            driver.log(
+                "NOTE: if this was a PostgreSQL CDC stack deleted outside the tool, a "
+                f"replication slot named '{cdc_pg_slot.pg_slot_name(stack_name)}' may "
+                "remain on the source. Drop it there if present so it does not pin WAL: "
+                f"SELECT pg_drop_replication_slot('{cdc_pg_slot.pg_slot_name(stack_name)}');"
+            )
             driver.all_done()
             return
         # Capture the stack's parameters NOW (while it still exists) so a PostgreSQL

@@ -349,14 +349,14 @@ def test_prereq_request_defaults_to_mysql_source() -> None:
     assert request.source_type is SourceType.MYSQL
 
 
-def test_postgres_cdc_request_reports_unsupported_and_skips_mysql_checks() -> None:
-    """A PostgreSQL source asked for CDC must not run MySQL binlog/GTID checks.
+def test_postgres_cdc_request_never_runs_mysql_variable_checks() -> None:
+    """A PostgreSQL source asked for CDC must never call the MySQL `variables()` probe.
 
-    CDC is Debezium-MySQL-only today, so the checker branches on the engine: it
-    emits a non-blocking POSTGRES_CDC_UNSUPPORTED INFO in place of the MySQL
-    binlog/GTID/MSK checks (reported SKIP), and -- crucially -- never calls the
-    MySQL `variables()` probe whose `SHOW GLOBAL VARIABLES` SQL would error on a
-    PostgreSQL connection. can_proceed stays True (Full Load + Validation work).
+    The checker branches on the engine to the PostgreSQL readiness checks (fed by the
+    dialect probe), and the MySQL binlog/GTID checks are SKIP. Crucially it never calls
+    `variables()`, whose `SHOW GLOBAL VARIABLES` SQL would error on a PostgreSQL
+    connection. (With healthy facts here, the PG checks pass; the facts-None blocking
+    behavior is covered separately.)
     """
 
     class _NoVariablesSource(_FakeSource):
@@ -367,7 +367,9 @@ def test_postgres_cdc_request_reports_unsupported_and_skips_mysql_checks() -> No
             )
 
     checker = PrerequisiteChecker(
-        source_probe=_NoVariablesSource(grants=["GRANT ALL PRIVILEGES ON db.* TO u"]),
+        source_probe=_NoVariablesSource(
+            grants=["GRANT ALL PRIVILEGES ON db.* TO u"], cdc_facts=_pg_facts_ok()
+        ),
         target_probe=_FakeTarget(existing={"app.orders"}),
         msk_probe=_FakeMsk(),
     )
@@ -378,9 +380,6 @@ def test_postgres_cdc_request_reports_unsupported_and_skips_mysql_checks() -> No
     )
     report = checker.check(request, tables=[_table("app.orders")])
 
-    unsupported = _result(report, PrerequisiteCheckId.POSTGRES_CDC_UNSUPPORTED)
-    assert unsupported.status is PrerequisiteStatus.INFO
-    assert unsupported.required is False
     # The MySQL-only checks are not applicable for this engine.
     assert _result(report, PrerequisiteCheckId.BINLOG_ROW_FORMAT).status is (
         PrerequisiteStatus.SKIP
@@ -388,7 +387,7 @@ def test_postgres_cdc_request_reports_unsupported_and_skips_mysql_checks() -> No
     assert _result(report, PrerequisiteCheckId.GTID_MODE).status is (
         PrerequisiteStatus.SKIP
     )
-    # Non-blocking: PostgreSQL Full Load + Validation are fully supported.
+    # Healthy PG facts -> the real checks ran and pass.
     assert report.can_proceed is True
 
 
@@ -492,9 +491,11 @@ def test_postgres_cdc_unready_source_blocks() -> None:
     assert report.can_proceed is False
 
 
-def test_postgres_cdc_facts_none_falls_back_to_unsupported_info() -> None:
-    # If the probe cannot gather facts (None), the checker reports the honest
-    # not-yet-supported INFO rather than inventing failures.
+def test_postgres_cdc_facts_none_blocks_the_run() -> None:
+    # For a PostgreSQL source, None facts mean the readiness probe FAILED (unreachable /
+    # insufficient privilege). CDC must NOT proceed against an unverified source -- a
+    # required FAIL blocks it (not a benign INFO), so a slot/publication is never created
+    # against a source whose logical-replication readiness is unknown.
     from dsql_migrator.core.models import PrerequisiteCheckId as Id
 
     checker = PrerequisiteChecker(
@@ -509,8 +510,10 @@ def test_postgres_cdc_facts_none_falls_back_to_unsupported_info() -> None:
         ),
         tables=[_table("app.orders")],
     )
-    assert _result(report, Id.POSTGRES_CDC_UNSUPPORTED).status is PrerequisiteStatus.INFO
-    assert report.can_proceed is True  # INFO never blocks
+    blocker = _result(report, Id.WAL_LEVEL_LOGICAL)
+    assert blocker.status is PrerequisiteStatus.FAIL
+    assert blocker.required is True
+    assert report.can_proceed is False  # unverified -> blocked
 
 
 def test_pg_pure_checks_wal_level_role_writer_replica_identity() -> None:

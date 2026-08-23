@@ -671,6 +671,9 @@ def test_capture_watermark_creates_slot_for_postgres_cdc_handoff(monkeypatch) ->
         def first(self):  # noqa: ANN201
             return self._rows[0] if self._rows else None
 
+        def fetchall(self):  # noqa: ANN201
+            return list(self._rows)
+
     class _WriteConn:
         """Records slot/publication writes; returns a canned consistent-point LSN."""
 
@@ -687,6 +690,8 @@ def test_capture_watermark_creates_slot_for_postgres_cdc_handoff(monkeypatch) ->
             sql = str(statement)
             self.statements.append(sql)
             up = " ".join(sql.upper().split())
+            if "FROM PG_CLASS" in up:  # replica-identity guard: usable ('d')
+                return _Result([(n, "d") for n in (params or {}).get("names", [])])
             if "FROM PG_PUBLICATION" in up or "FROM PG_REPLICATION_SLOTS" in up:
                 return _Result([])  # neither exists yet
             if "PG_CREATE_LOGICAL_REPLICATION_SLOT" in up:
@@ -747,8 +752,10 @@ def test_capture_watermark_creates_slot_for_postgres_cdc_handoff(monkeypatch) ->
 
     # The slot's consistent-point LSN is the gapless resume coordinate.
     assert watermark.wal_lsn == "7/DEADBEEF"
-    assert watermark.slot_name == "dsqlmig_mysql_dsql_cdc_stack"
-    assert watermark.publication_name == "dsqlmig_pub_mysql_dsql_cdc_stack"
+    assert watermark.slot_name == cdc_pg_slot.pg_slot_name("mysql-dsql-cdc-stack")
+    assert watermark.publication_name == cdc_pg_slot.pg_publication_name(
+        "mysql-dsql-cdc-stack"
+    )
     # Publication FOR TABLE the migrated table, then the slot -- both on the write engine.
     writes = " ".join(write_conn.statements).upper()
     assert "CREATE PUBLICATION" in writes and "FOR ALL TABLES" not in writes
