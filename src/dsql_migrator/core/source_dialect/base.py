@@ -11,9 +11,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 from dsql_migrator.core.models import SourceType
+
+if TYPE_CHECKING:
+    from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
 
 
 @dataclass(frozen=True)
@@ -319,6 +322,22 @@ class SourceDialect(ABC):
         PostgreSQL source is a syntax error that would ABORT that transaction and fail
         every subsequent page read. Best effort: any failure returns ``None`` so the
         governor fails open (treats it as "don't throttle") and never stalls the load.
+        """
+
+    @abstractmethod
+    def probe_cdc_prerequisites(
+        self, connection: object, table_names: Sequence[str]
+    ) -> "Optional[PostgresCdcFacts]":
+        """Read the CDC logical-replication readiness facts (PostgreSQL only).
+
+        Gathers -- read-only, best-effort -- the facts the PostgreSQL CDC prerequisite
+        checks need (``wal_level``, whether the user can create a slot, slot/wal-sender
+        headroom, whether the source is a writer, and each captured table's REPLICA
+        IDENTITY) into a :class:`~dsql_migrator.core.prerequisites_postgres.PostgresCdcFacts`.
+        MySQL returns ``None``: its CDC readiness is the binlog/GTID checks, not this
+        seam. Every field is best-effort so an under-privileged source degrades to
+        "unknown" (a non-blocking INFO) rather than erroring the gate. Read-only, so it
+        passes the source read-only guard (only ``SHOW`` / ``SELECT`` on system views).
         """
 
 

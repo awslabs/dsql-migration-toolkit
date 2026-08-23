@@ -401,5 +401,72 @@ class PostgresSourceDialect(SourceDialect):
         except (TypeError, ValueError):
             return None
 
+    def probe_cdc_prerequisites(self, connection: object, table_names):
+        # Gather the PostgreSQL CDC logical-replication readiness facts read-only and
+        # best-effort (each field None/False on any failure, so an under-privileged
+        # source degrades to "unknown" rather than erroring the gate). All plain SHOW /
+        # SELECT on system catalogs, so it passes the read-only guard.
+        from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
+
+        def _scalar(sql: str, params=None):
+            try:
+                return connection.execute(  # type: ignore[attr-defined]
+                    text(sql), params or {}
+                ).scalar()
+            except Exception:  # noqa: BLE001 - best-effort probe
+                return None
+
+        def _int(value):
+            try:
+                return int(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        wal_level = _scalar("SHOW wal_level")
+        is_super = str(
+            _scalar("SELECT current_setting('is_superuser')") or ""
+        ).lower() == "on"
+        # REPLICATION role attribute (self-managed) OR rds_replication membership
+        # (RDS/Aurora, where the attribute cannot be granted). The CASE guards
+        # pg_has_role against a non-existent rds_replication role (self-managed).
+        repl_attr = bool(
+            _scalar("SELECT rolreplication FROM pg_roles WHERE rolname = current_user")
+        )
+        rds_member = bool(
+            _scalar(
+                "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE "
+                "rolname = 'rds_replication') THEN pg_has_role(current_user, "
+                "'rds_replication', 'MEMBER') ELSE false END"
+            )
+        )
+        identity: dict[str, str] = {}
+        names = list(table_names)
+        if names:
+            try:
+                rows = connection.execute(  # type: ignore[attr-defined]
+                    text(
+                        "SELECT n.nspname || '.' || c.relname AS qname, "
+                        "c.relreplident FROM pg_class c "
+                        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                        "WHERE n.nspname || '.' || c.relname = ANY(:names)"
+                    ),
+                    {"names": names},
+                ).fetchall()
+                identity = {str(r[0]): str(r[1]) for r in rows}
+            except Exception:  # noqa: BLE001 - best-effort probe
+                identity = {}
+        return PostgresCdcFacts(
+            wal_level=str(wal_level) if wal_level is not None else None,
+            is_superuser=is_super,
+            has_replication_role=repl_attr or rds_member,
+            max_replication_slots=_int(_scalar("SHOW max_replication_slots")),
+            used_replication_slots=_int(
+                _scalar("SELECT count(*) FROM pg_replication_slots")
+            ),
+            max_wal_senders=_int(_scalar("SHOW max_wal_senders")),
+            is_in_recovery=bool(_scalar("SELECT pg_is_in_recovery()")),
+            replica_identity=identity,
+        )
+
 
 __all__ = ["PostgresSourceDialect"]

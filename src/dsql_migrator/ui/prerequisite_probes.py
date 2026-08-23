@@ -123,6 +123,24 @@ class SessionSourceProbe:
         except Exception:  # noqa: BLE001 - treated as "variables unknown"
             return {}
 
+    def cdc_prerequisites(self, table_names):
+        """Return the PostgreSQL CDC readiness facts, or None for a MySQL source.
+
+        Delegates to the source dialect (read-only), mirroring :meth:`grants`: only
+        ``PostgresSourceDialect`` gathers the logical-replication facts; MySQL returns
+        None (it uses the binlog/GTID variable checks). Any connection failure degrades
+        to None so the checks report "unknown" rather than crashing the gate.
+        """
+        from dsql_migrator.core.source_dialect import dialect_for
+
+        dialect = dialect_for(self._config.source_type)
+        try:
+            engine = self._engine_factory(self._config)
+            with engine.connect() as connection:
+                return dialect.probe_cdc_prerequisites(connection, list(table_names))
+        except Exception:  # noqa: BLE001 - treated as "facts unknown"
+            return None
+
 
 class SessionTargetProbe:
     """Read-only :class:`TargetProbe` over a session's Aurora DSQL target."""

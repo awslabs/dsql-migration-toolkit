@@ -46,6 +46,7 @@ class _FakeSource:
         reachable: bool = True,
         grants: list[str] | None = None,
         variables: dict[str, str] | None = None,
+        cdc_facts=None,
     ) -> None:
         self._reachable = reachable
         self._grants = grants if grants is not None else ["GRANT ALL PRIVILEGES ON *.*"]
@@ -55,6 +56,7 @@ class _FakeSource:
             "binlog_row_image": "FULL",
             "gtid_mode": "ON",
         }
+        self._cdc_facts = cdc_facts
 
     def reachable(self) -> ConnectionResult:
         return ConnectionResult(success=self._reachable)
@@ -64,6 +66,11 @@ class _FakeSource:
 
     def variables(self) -> dict[str, str]:
         return dict(self._variables)
+
+    def cdc_prerequisites(self, table_names):
+        # None (default) -> the checker's PostgreSQL branch falls back to the
+        # not-yet-supported INFO; a PostgresCdcFacts -> the real PG checks run.
+        return self._cdc_facts
 
 
 class _FakeTarget:
@@ -413,6 +420,139 @@ def test_check_postgres_cdc_unsupported_is_credential_free_info() -> None:
     assert "PostgreSQL" in result.title
     # Points the user at the supported path.
     assert "Full Load" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL CDC readiness: the real logical-replication checks (Phase C5),
+# fed by PostgresCdcFacts from the dialect probe.
+# ---------------------------------------------------------------------------
+
+
+def _pg_facts_ok(**over):
+    from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
+
+    base = dict(
+        wal_level="logical", is_superuser=False, has_replication_role=True,
+        max_replication_slots=10, used_replication_slots=1, max_wal_senders=10,
+        is_in_recovery=False, replica_identity={"app.orders": "d"},
+    )
+    base.update(over)
+    return PostgresCdcFacts(**base)
+
+
+def test_postgres_cdc_facts_run_the_real_readiness_checks() -> None:
+    from dsql_migrator.core.models import PrerequisiteCheckId as Id
+
+    checker = PrerequisiteChecker(
+        source_probe=_FakeSource(cdc_facts=_pg_facts_ok()),
+        target_probe=_FakeTarget(existing={"app.orders"}),
+        msk_probe=_FakeMsk(),
+    )
+    report = checker.check(
+        PrerequisiteCheckRequest(
+            mode=MigrationMode.CDC, tables=["app.orders"],
+            source_type=SourceType.POSTGRES,
+        ),
+        tables=[_table("app.orders")],
+    )
+    ids = {r.check_id for r in report.results}
+    # The real PG checks ran (not the not-supported INFO fallback).
+    assert Id.WAL_LEVEL_LOGICAL in ids
+    assert Id.REPLICATION_ROLE in ids
+    assert Id.SOURCE_IS_WRITER in ids
+    assert Id.REPLICA_IDENTITY in ids
+    assert Id.POSTGRES_CDC_UNSUPPORTED not in ids
+    # MSK is engine-neutral -> still runs for PostgreSQL CDC.
+    assert Id.MSK_AVAILABLE in ids
+    # MySQL binlog/GTID are not applicable -> SKIP.
+    assert _result(report, Id.BINLOG_ROW_FORMAT).status is PrerequisiteStatus.SKIP
+    assert report.can_proceed is True
+
+
+def test_postgres_cdc_unready_source_blocks() -> None:
+    # wal_level!=logical, no replication role, a standby, REPLICA IDENTITY nothing:
+    # every required PG check FAILs, so can_proceed is False.
+    checker = PrerequisiteChecker(
+        source_probe=_FakeSource(
+            cdc_facts=_pg_facts_ok(
+                wal_level="replica", has_replication_role=False,
+                is_in_recovery=True, replica_identity={"app.orders": "n"},
+            )
+        ),
+        target_probe=_FakeTarget(existing={"app.orders"}),
+        msk_probe=_FakeMsk(),
+    )
+    report = checker.check(
+        PrerequisiteCheckRequest(
+            mode=MigrationMode.CDC, tables=["app.orders"],
+            source_type=SourceType.POSTGRES,
+        ),
+        tables=[_table("app.orders")],
+    )
+    assert report.can_proceed is False
+
+
+def test_postgres_cdc_facts_none_falls_back_to_unsupported_info() -> None:
+    # If the probe cannot gather facts (None), the checker reports the honest
+    # not-yet-supported INFO rather than inventing failures.
+    from dsql_migrator.core.models import PrerequisiteCheckId as Id
+
+    checker = PrerequisiteChecker(
+        source_probe=_FakeSource(cdc_facts=None),
+        target_probe=_FakeTarget(existing={"app.orders"}),
+        msk_probe=_FakeMsk(),
+    )
+    report = checker.check(
+        PrerequisiteCheckRequest(
+            mode=MigrationMode.CDC, tables=["app.orders"],
+            source_type=SourceType.POSTGRES,
+        ),
+        tables=[_table("app.orders")],
+    )
+    assert _result(report, Id.POSTGRES_CDC_UNSUPPORTED).status is PrerequisiteStatus.INFO
+    assert report.can_proceed is True  # INFO never blocks
+
+
+def test_pg_pure_checks_wal_level_role_writer_replica_identity() -> None:
+    from dsql_migrator.core.prerequisites_postgres import (
+        check_replica_identity,
+        check_replication_role,
+        check_source_is_writer,
+        check_wal_level_logical,
+    )
+
+    # wal_level
+    assert check_wal_level_logical(_pg_facts_ok()).status is PrerequisiteStatus.PASS
+    assert check_wal_level_logical(
+        _pg_facts_ok(wal_level="replica")
+    ).status is PrerequisiteStatus.FAIL
+    # unknown wal_level -> non-blocking INFO
+    assert check_wal_level_logical(
+        _pg_facts_ok(wal_level=None)
+    ).status is PrerequisiteStatus.INFO
+    # replication role: superuser OR membership; else FAIL
+    assert check_replication_role(
+        _pg_facts_ok(is_superuser=True, has_replication_role=False)
+    ).status is PrerequisiteStatus.PASS
+    assert check_replication_role(
+        _pg_facts_ok(has_replication_role=False)
+    ).status is PrerequisiteStatus.FAIL
+    # writer vs standby
+    assert check_source_is_writer(_pg_facts_ok()).status is PrerequisiteStatus.PASS
+    assert check_source_is_writer(
+        _pg_facts_ok(is_in_recovery=True)
+    ).status is PrerequisiteStatus.FAIL
+    # replica identity: 'd'/'f'/'i' usable, 'n' fails, unknown -> INFO
+    t = _table("app.orders")
+    assert check_replica_identity(
+        t, _pg_facts_ok(replica_identity={"app.orders": "f"})
+    ).status is PrerequisiteStatus.PASS
+    assert check_replica_identity(
+        t, _pg_facts_ok(replica_identity={"app.orders": "n"})
+    ).status is PrerequisiteStatus.FAIL
+    assert check_replica_identity(
+        t, _pg_facts_ok(replica_identity={})
+    ).status is PrerequisiteStatus.INFO
 
 
 def test_required_failure_blocks_progression() -> None:

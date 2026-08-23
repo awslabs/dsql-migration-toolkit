@@ -889,6 +889,12 @@ class PrerequisiteCheckId(str, Enum):
     # in place of them for a PostgreSQL source so the report is honest rather than
     # running MySQL-only checks that would falsely FAIL. See prerequisites.py.
     POSTGRES_CDC_UNSUPPORTED = "POSTGRES_CDC_UNSUPPORTED"
+    # CDC-only, PostgreSQL source: logical-replication readiness (pgoutput + a slot).
+    WAL_LEVEL_LOGICAL = "WAL_LEVEL_LOGICAL"
+    REPLICATION_ROLE = "REPLICATION_ROLE"
+    REPLICATION_SLOTS = "REPLICATION_SLOTS"
+    SOURCE_IS_WRITER = "SOURCE_IS_WRITER"
+    REPLICA_IDENTITY = "REPLICA_IDENTITY"
 
 
 class PrerequisiteResult(BaseModel):

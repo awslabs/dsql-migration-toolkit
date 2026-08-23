@@ -39,6 +39,11 @@ _GTID_SET_RE = re.compile(rf"^{_GTID_COMPONENT}(?:,{_GTID_COMPONENT})*$")
 # (e.g. "mysql-bin.000123", "binlog.000001"). No whitespace.
 _BINLOG_FILE_RE = re.compile(r"^\S+\.\d+$")
 
+# A PostgreSQL WAL LSN: two hex halves joined by '/', e.g. "3/AF012B8". This is the
+# PG analog of MySQL's binlog file:position -- the coordinate a PostgreSQL CDC
+# catch-up resumes from.
+_WAL_LSN_RE = re.compile(r"^[0-9A-Fa-f]+/[0-9A-Fa-f]+$")
+
 
 def _strip_noise(value: str) -> str:
     """Collapse whitespace and drop ``/* ... */`` comments from a coordinate.
@@ -107,4 +112,25 @@ def parse_binlog_coordinate(value: str) -> Optional[Tuple[str, int]]:
     return file_part, int(pos_part)
 
 
-__all__ = ["validate_gtid", "validate_binlog_file", "parse_binlog_coordinate"]
+def validate_wal_lsn(value: str) -> Optional[str]:
+    """Return an advisory message if ``value`` is not a PostgreSQL WAL LSN.
+
+    Returns ``None`` for a well-formed LSN like ``3/AF012B8`` (two hex halves joined
+    by ``/``). Advisory, not blocking (matching :func:`validate_gtid`): a liberal
+    shape check for the manual PostgreSQL CDC start position -- the connector remains
+    the final authority. An empty string returns a message.
+    """
+    cleaned = value.strip()
+    if not cleaned:
+        return "Enter a WAL LSN, e.g. 3/AF012B8."
+    if not _WAL_LSN_RE.match(cleaned):
+        return "This does not look like a PostgreSQL WAL LSN (expected e.g. 3/AF012B8)."
+    return None
+
+
+__all__ = [
+    "validate_gtid",
+    "validate_binlog_file",
+    "parse_binlog_coordinate",
+    "validate_wal_lsn",
+]

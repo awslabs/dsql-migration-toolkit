@@ -31,7 +31,10 @@ never include credential or token values.
 
 from __future__ import annotations
 
-from typing import Iterable, Mapping, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Protocol, Sequence
+
+if TYPE_CHECKING:
+    from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
 
 from dsql_migrator.core.models import (
     ConnectionResult,
@@ -67,6 +70,15 @@ class SourceProbe(Protocol):
         Keys should be the MySQL variable names (e.g. ``log_bin``,
         ``binlog_format``, ``binlog_row_image``, ``gtid_mode``); values are their
         string values (e.g. ``ON`` / ``ROW`` / ``FULL``).
+        """
+
+    def cdc_prerequisites(
+        self, table_names: Sequence[str]
+    ) -> "Optional[PostgresCdcFacts]":
+        """Return the PostgreSQL CDC readiness facts, or ``None`` for a MySQL source.
+
+        Read-only; delegates to the source dialect. Only consulted for a PostgreSQL
+        source in CDC mode (MySQL uses the binlog/GTID variable checks instead).
         """
 
 
@@ -555,12 +567,26 @@ class PrerequisiteChecker:
 
         # CDC-only checks (SKIP in Full Load).
         if request.mode == MigrationMode.CDC and request.source_type is SourceType.POSTGRES:
-            # PostgreSQL CDC is not yet implemented (the UI gates the CDC migration
-            # types for a PostgreSQL source). Report an honest, non-blocking INFO in
-            # place of the MySQL binlog/GTID checks -- running MySQL-only variable
-            # reads against a PostgreSQL source would error and falsely FAIL. The
-            # MySQL/MSK checks below are marked SKIP (not applicable to this engine).
-            results.append(check_postgres_cdc_unsupported())
+            # PostgreSQL CDC readiness: logical replication (pgoutput) needs
+            # wal_level=logical, a slot-creating role, slot/wal-sender headroom, a writer
+            # source, and a usable REPLICA IDENTITY per captured table. The facts are
+            # read once (read-only) by the dialect probe; the pure checks live in the
+            # engine-separated prerequisites_postgres module. MSK is engine-neutral (PG
+            # CDC uses the same MSK pipeline) so it still runs; the MySQL binlog/GTID
+            # checks do not apply and are SKIP.
+            from dsql_migrator.core import prerequisites_postgres
+
+            facts = self._source.cdc_prerequisites([table.name for table in tables])
+            if facts is None:
+                # The probe could not run (no dialect facts) -- fall back to the honest
+                # non-blocking INFO rather than inventing failures.
+                results.append(check_postgres_cdc_unsupported())
+            else:
+                results.extend(
+                    prerequisites_postgres.check_postgres_cdc_prerequisites(
+                        facts, [effective[table.name] for table in tables]
+                    )
+                )
             results.append(
                 _skipped(
                     PrerequisiteCheckId.BINLOG_ROW_FORMAT,
@@ -571,12 +597,13 @@ class PrerequisiteChecker:
                 _skipped(PrerequisiteCheckId.GTID_MODE, "GTID mode is enabled")
             )
             results.append(
-                _skipped(PrerequisiteCheckId.MSK_AVAILABLE, "MSK cluster is available")
+                check_msk_available(
+                    self._msk.cluster_available() if self._msk else False
+                )
             )
             results.append(
-                _skipped(
-                    PrerequisiteCheckId.MSK_CONNECT_AVAILABLE,
-                    "MSK Connect is available",
+                check_msk_connect_available(
+                    self._msk.connect_available() if self._msk else False
                 )
             )
         elif request.mode == MigrationMode.CDC:
