@@ -113,6 +113,40 @@ def test_pg_source_config_standalone_uses_snapshot_initial() -> None:
     assert src.snapshot_mode == "initial"
 
 
+def test_pg_source_config_force_initial_snapshot_overrides_gapless() -> None:
+    # The PostgreSQL Manual start choice = re-snapshot: force_initial_snapshot forces
+    # snapshot.mode=initial even though the watermark carries a gapless WAL LSN (which
+    # would otherwise select `never`). Debezium PG resumes only from the slot, so Manual
+    # cannot supply a start LSN -- it re-snapshots instead.
+    forced = build_pg_source_config(
+        "pg-source", _tables(), _wm(wal_lsn="3/AF012B8"),
+        database_name="app", slot_name="s1", publication_name="p1",
+        force_initial_snapshot=True,
+    )
+    assert forced.snapshot_mode == "initial"
+    # Without the flag the same gapless watermark -> never (Automatic).
+    auto = build_pg_source_config(
+        "pg-source", _tables(), _wm(wal_lsn="3/AF012B8"),
+        database_name="app", slot_name="s1", publication_name="p1",
+    )
+    assert auto.snapshot_mode == "never"
+
+
+def test_dispatch_force_initial_snapshot_is_postgres_only() -> None:
+    tables = _tables()
+    # PG: the flag flows to build_pg_source_config -> initial even with a gapless LSN.
+    pg = dispatch_source_config(
+        SourceType.POSTGRES, tables, _wm(wal_lsn="3/AF012B8"),
+        database="app", stack_name="mysql-dsql-cdc-stack", force_initial_snapshot=True,
+    )
+    assert isinstance(pg, PostgresSourceConfig)
+    assert pg.snapshot_mode == "initial"
+    # MySQL accepts the kwarg for a uniform call site but IGNORES it (no such concept);
+    # byte-identical to the flag-less MySQL build.
+    mysql = dispatch_source_config(SourceType.MYSQL, tables, _wm(), force_initial_snapshot=True)
+    assert isinstance(mysql, DebeziumSourceConfig)
+
+
 def test_pg_source_config_manual_override_snapshots_initial() -> None:
     # A manual resume override (no watermark LSN path) also snapshots first.
     override = CdcResumePoint(wal_lsn="3/AF012B8")

@@ -125,6 +125,7 @@ def build_pg_source_config(
     column_exclude_list: Optional[Sequence[str]] = None,
     message_key_columns: Optional[Mapping[str, Sequence[str]]] = None,
     resume_override: Optional[CdcResumePoint] = None,
+    force_initial_snapshot: bool = False,
 ) -> PostgresSourceConfig:
     """Build the Debezium PostgreSQL source config for the selected tables.
 
@@ -137,6 +138,14 @@ def build_pg_source_config(
     - **Stand-alone / no-LSN path:** ``initial`` -- no slot LSN to resume from, so
       Debezium snapshots the tables first, then streams.
 
+    ``force_initial_snapshot`` forces ``initial`` even when a gapless slot LSN is
+    present -- the PostgreSQL analog of the operator's **Manual** start choice. Unlike
+    MySQL (whose manual GTID/binlog offset is seeded into ``connect-offsets``), Debezium
+    PostgreSQL resumes only from the replication slot's position and cannot be told to
+    start from an arbitrary WAL LSN, so the honest manual option is to re-snapshot all
+    tables from scratch (``initial``) instead of using the gapless slot. There is no
+    manual WAL-LSN value to carry, so this is a plain flag, not a ``resume_override``.
+
     ``slot_name`` / ``publication_name`` name the pre-created objects (the tool/DBA
     creates them out of band; the live creation wiring is a later phase, which is why
     they are passed in here rather than derived). ``column_exclude_list`` and
@@ -148,7 +157,8 @@ def build_pg_source_config(
         else (CdcResumePoint.from_watermark(watermark) if watermark is not None else None)
     )
     has_lsn = (
-        resume_override is None
+        not force_initial_snapshot
+        and resume_override is None
         and resume is not None
         and resume.can_resume_from_lsn()
     )
@@ -296,6 +306,7 @@ def dispatch_source_config(
     stack_name: str = "",
     column_exclude_list: Optional[Sequence[str]] = None,
     resume_override: Optional[CdcResumePoint] = None,
+    force_initial_snapshot: bool = False,
     message_key_columns: Optional[Mapping[str, Sequence[str]]] = None,
 ):
     """Build the source connector config for ``source_type`` (MySQL or PostgreSQL).
@@ -306,8 +317,10 @@ def dispatch_source_config(
     re-derived from the (mutable) live ``stack_name``, which could drift after Full Load
     and point the connector at a slot that does not exist. Falls back to the deterministic
     names from ``stack_name`` only when the watermark carries none (e.g. a stand-alone CDC
-    with no Full Load in this session). MySQL -> the orchestrator's ``build_source_config``
-    exactly as before (byte-identical).
+    with no Full Load in this session). ``force_initial_snapshot`` (the PostgreSQL Manual
+    start choice = re-snapshot) is honored only on the PG path. MySQL -> the orchestrator's
+    ``build_source_config`` exactly as before (byte-identical; the flag does not apply --
+    MySQL's manual start is a seeded ``resume_override``).
     """
     if source_type is SourceType.POSTGRES:
         from dsql_migrator.core import cdc_pg_slot
@@ -328,6 +341,7 @@ def dispatch_source_config(
             column_exclude_list=column_exclude_list,
             message_key_columns=message_key_columns,
             resume_override=resume_override,
+            force_initial_snapshot=force_initial_snapshot,
         )
     from dsql_migrator.core.cdc import CdcPipelineOrchestrator
 

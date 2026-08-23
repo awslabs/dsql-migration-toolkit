@@ -709,3 +709,157 @@ def test_refresh_pg_slot_health_reads_for_pg_and_noops_for_mysql() -> None:
     assert pg_state.cdc_slot_health is not None
     assert pg_state.cdc_slot_health.slot_name == pg_slot_name("mysql-dsql-cdc-stack")
     assert pg_state.cdc_slot_health.wal_status == "reserved"
+
+
+def test_cdc_resume_signal_is_engine_aware() -> None:
+    # The shared CDC start signal differs by engine: MySQL Manual seeds a GTID/binlog
+    # resume_override; PostgreSQL Manual has no coordinate and instead re-snapshots
+    # (force_initial_snapshot), because Debezium PG resumes only from the slot.
+    from types import SimpleNamespace
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+    from dsql_migrator.ui.data_migration._cdc_ui import _cdc_resume_signal
+
+    def _session(source_type):
+        return SimpleNamespace(
+            source_config=SourceConnectionConfig(
+                source_type=source_type, host="h", database="app"
+            )
+        )
+
+    # PostgreSQL: no override value; Manual -> force initial (re-snapshot), Auto -> gapless.
+    pg = _session(SourceType.POSTGRES)
+    state = DataMigrationState()
+    state.set_cdc_start_mode("manual")
+    assert _cdc_resume_signal(state, pg) == (None, True)
+    state.set_cdc_start_mode("auto")
+    assert _cdc_resume_signal(state, pg) == (None, False)
+
+    # MySQL: force_initial_snapshot is never set. A Manual GTID becomes the resume_override.
+    my = _session(SourceType.MYSQL)
+    state.set_cdc_start_mode("manual")
+    state.set_cdc_start_position(gtid="3E11FA47-71CA-11E1-9E33-C80AA9429562:1-100")
+    override, force = _cdc_resume_signal(state, my)
+    assert force is False
+    assert override is not None and override.gtid_executed
+    # MySQL Manual with nothing entered -> no override (nothing to seed).
+    state.set_cdc_start_position(gtid=None, binlog_file=None, binlog_pos=None)
+    assert _cdc_resume_signal(state, my) == (None, False)
+    # MySQL Automatic -> no override.
+    state.set_cdc_start_mode("auto")
+    assert _cdc_resume_signal(state, my) == (None, False)
+
+
+class _FakeEl:
+    def __init__(self, sink):
+        self._sink = sink
+
+    def classes(self, *_a, **_k):
+        return self
+
+    def props(self, *_a, **_k):
+        return self
+
+    def tooltip(self, text="", *_a, **_k):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+class _FakeUi:
+    """Minimal NiceGUI double for rendering the CDC start-point card (collects text)."""
+
+    def __init__(self):
+        self.texts: list[str] = []
+        self.radios: list[dict] = []
+
+    def _el(self):
+        return _FakeEl(self)
+
+    def card(self, *_a, **_k):
+        return self._el()
+
+    def row(self, *_a, **_k):
+        return self._el()
+
+    def column(self, *_a, **_k):
+        return self._el()
+
+    def icon(self, *_a, **_k):
+        return self._el()
+
+    def space(self, *_a, **_k):
+        return self._el()
+
+    def spinner(self, *_a, **_k):
+        return self._el()
+
+    def label(self, text="", *_a, **_k):
+        self.texts.append(str(text))
+        return self._el()
+
+    def badge(self, text="", *_a, **_k):
+        self.texts.append(str(text))
+        return self._el()
+
+    def radio(self, options=None, *_a, **_k):
+        if isinstance(options, dict):
+            self.radios.append(options)
+        return self._el()
+
+    def input(self, label="", *_a, **_k):
+        self.texts.append(str(label))
+        return self._el()
+
+    def button(self, text="", *_a, **_k):
+        self.texts.append(str(text))
+        return self._el()
+
+    def notify(self, *_a, **_k):
+        return None
+
+
+def test_cdc_start_card_postgres_manual_is_resnapshot_without_coordinate_inputs() -> None:
+    # PostgreSQL Manual renders a re-snapshot explanation (snapshot.mode=initial) with the
+    # PG-worded radio labels -- NO GTID/binlog inputs, which Debezium PG cannot use.
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._cdc_ui import _render_cdc_start_point_card
+
+    state = DataMigrationState()
+    state.set_cdc_start_mode("manual")
+    fake = _FakeUi()
+    _render_cdc_start_point_card(
+        fake, state, lambda: None,
+        wm_resume=None, wm_usable=False, effective_resume=None,
+        mode="manual", locked=False, session=None, source_type=SourceType.POSTGRES,
+    )
+    radio_values = [v for r in fake.radios for v in r.values()]
+    assert "Manual — re-snapshot from scratch (initial)" in radio_values
+    # No MySQL coordinate wording anywhere in the PG card.
+    assert all("GTID" not in v and "binlog" not in v for v in radio_values)
+    assert "GTID set" not in fake.texts  # the MySQL manual input field label
+    joined = " ".join(fake.texts)
+    assert "snapshot.mode=initial" in joined  # the re-snapshot confirmation/explanation
+
+
+def test_cdc_start_card_postgres_auto_shows_slot_resume_and_wal_lsn() -> None:
+    # PostgreSQL Automatic renders the gapless-slot label + the resolved WAL LSN.
+    from dsql_migrator.core.cdc import CdcResumePoint
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._cdc_ui import _render_cdc_start_point_card
+
+    wm = CdcResumePoint(wal_lsn="3/AF012B8")
+    state = DataMigrationState()
+    state.set_cdc_start_mode("auto")
+    fake = _FakeUi()
+    _render_cdc_start_point_card(
+        fake, state, lambda: None,
+        wm_resume=wm, wm_usable=True, effective_resume=wm,
+        mode="auto", locked=False, session=None, source_type=SourceType.POSTGRES,
+    )
+    radio_values = [v for r in fake.radios for v in r.values()]
+    assert any("gapless from the replication slot" in v for v in radio_values)
+    assert "3/AF012B8" in " ".join(fake.texts)  # WAL LSN summary + confirmation
