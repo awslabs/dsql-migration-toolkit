@@ -264,7 +264,19 @@ def build_pg_cdc_stack_params(
         source_config.as_neutral_source(), sink_config, **stack_kwargs  # type: ignore[arg-type]
     )
     filled = [(k, v) for (k, v) in base.filled if k not in _MYSQL_ONLY_STACK_KEYS]
-    filled.extend(_pg_source_param_tuples(source_config))
+    # DebeziumPostgresPluginS3Key is a plugin Location param and is left to the deploy's
+    # plugin-upload step / carried forward as UsePreviousValue on the Start update -- it must
+    # NOT be a filled-empty here. Emitting it "" (as _pg_source_param_tuples does for the
+    # INFRA create, where _patch_plugin_params fills it) would, on the Start update_stack,
+    # blank the CustomPlugin's FileKey and force CloudFormation to REPLACE the custom-named
+    # AWS::KafkaConnect::CustomPlugin -- which it refuses ("custom-named resource requires
+    # replacing"), rolling the Start back. So drop it from filled; it stays a placeholder
+    # below (the manual CLI-deploy path), exactly as the MySQL DebeziumPluginS3Key does.
+    filled.extend(
+        (k, v)
+        for (k, v) in _pg_source_param_tuples(source_config)
+        if k != "DebeziumPostgresPluginS3Key"
+    )
     # Placeholder set: swap the MySQL plugin-key placeholder for the PostgreSQL one
     # (the customer-environment values -- VPC, secrets, bucket -- are engine-neutral).
     placeholders: list[tuple[str, str]] = []

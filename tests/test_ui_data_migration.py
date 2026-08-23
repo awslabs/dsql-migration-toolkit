@@ -5854,14 +5854,15 @@ def test_type_selector_records_a_choice_even_for_the_current_value() -> None:
     assert state.active_substep == "full_load"  # not reset (no real change)
 
 
-def test_source_supports_cdc_allowlists_mysql_only() -> None:
-    # Single enablement point for CDC-by-engine: MySQL yes, PostgreSQL not yet.
-    # An allowlist means any future engine defaults to "no CDC" until enabled.
+def test_source_supports_cdc_allowlists_mysql_and_postgres() -> None:
+    # Single enablement point for CDC-by-engine. MySQL (Debezium binlog) and PostgreSQL
+    # (pgoutput publication + replication slot, Phases A-D, live-validated in Phase F) are
+    # CDC-capable. An allowlist means any FUTURE engine still defaults to "no CDC".
     from dsql_migrator.core.models import SourceType
     from dsql_migrator.ui.data_migration import source_supports_cdc
 
     assert source_supports_cdc(SourceType.MYSQL) is True
-    assert source_supports_cdc(SourceType.POSTGRES) is False
+    assert source_supports_cdc(SourceType.POSTGRES) is True
 
 
 def _selector_click_handlers(state, *, source_type):
@@ -5893,12 +5894,13 @@ def _selector_click_handlers(state, *, source_type):
     return ui, clicks
 
 
-def test_migration_type_selector_gates_cdc_tiles_for_postgres_source() -> None:
-    """A PostgreSQL source cannot select a CDC migration type (CDC not yet built).
+def test_migration_type_selector_offers_cdc_tiles_for_postgres_source() -> None:
+    """A PostgreSQL source can now select a CDC migration type (Phases A-D, Phase F).
 
-    The two CDC tiles render disabled with a "coming soon" note, and clicking them
-    does NOT change the type -- preventing a MySQL Debezium connector from being
-    deployed against a PostgreSQL source. Full load only stays selectable.
+    The two CDC tiles render selectable with no "coming soon" gate, and clicking them
+    changes the type -- identical to a MySQL source. (Before PG CDC shipped these tiles
+    were gated; that gate is lifted now that the pgoutput slot -> MSK -> DSQL sink path
+    is live-validated.)
     """
     from dsql_migrator.core.models import SourceType
     from dsql_migrator.ui.data_migration import (
@@ -5914,21 +5916,17 @@ def test_migration_type_selector_gates_cdc_tiles_for_postgres_source() -> None:
 
     ui, clicks = _selector_click_handlers(state, source_type=SourceType.POSTGRES)
 
-    # The gated CDC tiles say so where the user clicks (a dead tile reads as a bug).
-    assert any(
-        "Coming soon" in t and "PostgreSQL" in t for t in ui.texts
-    ), ui.texts
+    # No CDC gate for PostgreSQL anymore.
+    assert not any("Coming soon" in t for t in ui.texts), ui.texts
     # Three tiles rendered (Full load only, CDC only, Full load + CDC).
     assert len(clicks) == 3
 
-    # Clicking either CDC tile must NOT change the selection (gated).
+    # Clicking a CDC tile now selects it (as for MySQL).
     clicks[1]()  # CDC only
-    assert state.migration_type is MigrationType.FULL_LOAD_ONLY
+    assert state.migration_type is MigrationType.CDC_ONLY
     clicks[2]()  # Full load + CDC
-    assert state.migration_type is MigrationType.FULL_LOAD_ONLY
-
-    # Full load only remains selectable.
-    clicks[0]()
+    assert state.migration_type is MigrationType.FULL_LOAD_AND_CDC
+    clicks[0]()  # Full load only
     assert state.migration_type is MigrationType.FULL_LOAD_ONLY
     assert session.migration_type_chosen() is True
 

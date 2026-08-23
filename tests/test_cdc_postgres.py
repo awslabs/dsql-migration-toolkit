@@ -263,6 +263,14 @@ def test_pg_stack_params_swap_snapshot_for_engine_and_pg_snapshot() -> None:
     placeholder_keys = {k for k, _ in params.placeholders}
     assert "DebeziumPostgresPluginS3Key" in placeholder_keys
     assert "DebeziumPluginS3Key" not in placeholder_keys
+    # The plugin key is a PLACEHOLDER ONLY -- it must NOT appear in .filled (as an empty
+    # value). On the Start update_stack a filled-empty plugin key blanks the CustomPlugin's
+    # FileKey and forces CloudFormation to REPLACE the custom-named AWS::KafkaConnect::
+    # CustomPlugin, which it refuses ("custom-named resource requires replacing"). It must
+    # be UsePreviousValue on Start, exactly like the MySQL DebeziumPluginS3Key.
+    assert "DebeziumPostgresPluginS3Key" not in d
+    # ...but the INFRA create set DOES carry it (empty, for _patch_plugin_params to fill).
+    assert "DebeziumPostgresPluginS3Key" in dict(_pg_infra().filled)
 
 
 # ---------------------------------------------------------------------------

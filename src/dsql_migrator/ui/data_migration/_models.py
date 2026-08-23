@@ -1570,11 +1570,14 @@ def source_supports_cdc(source_type: SourceType) -> bool:
     path (pgoutput publication + replication slot) is planned but not yet
     implemented, so the Data Migration type selector gates the CDC tiles for a
     PostgreSQL source (Full Load + Validation stay fully supported). Deliberately
-    an **allowlist** -- only MySQL is CDC-capable -- so any future source engine
-    defaults to "no CDC" until it is explicitly enabled here, rather than silently
-    offering a non-functional CDC deploy. When PostgreSQL CDC ships, add it here.
+    an **allowlist** -- only CDC-capable engines are listed -- so any future source
+    engine defaults to "no CDC" until it is explicitly enabled here, rather than
+    silently offering a non-functional CDC deploy.
+
+    PostgreSQL CDC (pgoutput publication + replication slot -> MSK -> DSQL sink) is
+    implemented (Phases A-D) and enabled here after live E2E validation (Phase F).
     """
-    return source_type is SourceType.MYSQL
+    return source_type in (SourceType.MYSQL, SourceType.POSTGRES)
 
 
 # Ordered sub-steps of the Data Migration flow (Prerequisites -> Full Load -> CDC).
