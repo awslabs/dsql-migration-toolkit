@@ -5945,6 +5945,52 @@ def test_migration_type_selector_offers_all_tiles_for_mysql_source() -> None:
     assert state.migration_type is MigrationType.CDC_ONLY
 
 
+def test_pg_cdc_handoff_stack_gates_slot_creation(monkeypatch) -> None:
+    """The Full Load sets cdc_stack_name (-> slot creation) only for a PG combined flow.
+
+    This is the C4b wiring: for a PostgreSQL Full Load + CDC run (CDC not yet streaming)
+    the watermark capture must create the replication slot, so the launch names the stack.
+    A MySQL source, a Full-Load-only run, or an already-streaming CDC leaves it None (no
+    slot -- MySQL uses the binlog seeder, and a slot with no consumer pins WAL).
+    """
+    import dsql_migrator.ui.data_migration as dm
+    from dsql_migrator.ui.data_migration import (
+        DataMigrationState,
+        MigrationType,
+        _pg_cdc_handoff_stack,
+    )
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+
+    monkeypatch.setattr(dm, "cdc_streaming_started", lambda *a, **k: False)
+    pg = SourceConnectionConfig(source_type=SourceType.POSTGRES, host="pg", database="app")
+    mysql = SourceConnectionConfig(source_type=SourceType.MYSQL, host="db", database="app")
+
+    def _state(mt):
+        s = DataMigrationState()
+        s.bind_session(SessionConnectionState())
+        s.set_migration_type(mt)
+        s.cdc_stack_name = "mysql-dsql-cdc-stack"
+        return s
+
+    # PostgreSQL + combined + not streaming -> the stack name (slot handoff armed).
+    assert (
+        _pg_cdc_handoff_stack(_state(MigrationType.FULL_LOAD_AND_CDC), pg, None)
+        == "mysql-dsql-cdc-stack"
+    )
+    # PostgreSQL Full-Load-only -> None (no CDC to hand off to).
+    assert _pg_cdc_handoff_stack(_state(MigrationType.FULL_LOAD_ONLY), pg, None) is None
+    # MySQL combined -> None (binlog offset-seeder handoff, not a slot).
+    assert (
+        _pg_cdc_handoff_stack(_state(MigrationType.FULL_LOAD_AND_CDC), mysql, None) is None
+    )
+    # CDC already streaming -> None (no fresh slot; the running slot stands).
+    monkeypatch.setattr(dm, "cdc_streaming_started", lambda *a, **k: True)
+    assert (
+        _pg_cdc_handoff_stack(_state(MigrationType.FULL_LOAD_AND_CDC), pg, None) is None
+    )
+
+
 def test_migration_type_unlocked_before_any_migration_starts() -> None:
     from dsql_migrator.ui.data_migration import DataMigrationState, migration_type_locked
 

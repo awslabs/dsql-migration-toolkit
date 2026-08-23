@@ -428,6 +428,12 @@ def build_data_migration_screen(
             # confirmed tables for a clean reload (no leftover rows). Once CDC is
             # live the load falls back to idempotent SKIP_EXISTING (no DROP).
             cdc_coexisting=cdc_streaming_started(migration_state, job_manager),
+            # PostgreSQL Full Load + CDC: name the CDC stack so the watermark capture
+            # creates the logical replication slot + publication on the source at the
+            # consistency point (gapless handoff; see _capture_postgres_watermark).
+            cdc_stack_name=_pg_cdc_handoff_stack(
+                migration_state, source_config, job_manager
+            ),
             table_conversions=applied_table_conversions(
                 _conversion, conv_state.edited_target_ddls
             ),
@@ -2377,6 +2383,28 @@ def _render_cdc_existing_infra_banner(ui, migration_state, refresh) -> None:
                 ui.button(  # type: ignore[attr-defined]
                     f"Attach to {name}", on_click=_adopt, icon="link"
                 ).props("color=primary")
+
+
+def _pg_cdc_handoff_stack(migration_state, source_config, job_manager):
+    """Return the CDC stack name for a PostgreSQL Full-Load->CDC gapless handoff, else None.
+
+    When set on :class:`DataMigrationInputs`, the Full Load watermark capture creates a
+    logical replication slot + publication on the source at the consistency point (named
+    for this stack), so CDC resumes with no gap (see ``_capture_postgres_watermark``).
+
+    Returns the stack name ONLY for a PostgreSQL source on the combined ``Full load + CDC``
+    type while CDC is not yet streaming (PostgreSQL is Full-Load-first: the slot bridges to
+    a CDC that starts afterward). Returns None for MySQL (which hands off via the binlog
+    offset-seeder, not a slot), a Full-Load-only run, or once CDC is already streaming --
+    a slot with no consumer would pin the source WAL. Pure.
+    """
+    if getattr(source_config, "source_type", None) is not SourceType.POSTGRES:
+        return None
+    if migration_state.migration_type is not MigrationType.FULL_LOAD_AND_CDC:
+        return None
+    if cdc_streaming_started(migration_state, job_manager):
+        return None
+    return getattr(migration_state, "cdc_stack_name", None) or None
 
 
 def _render_migration_type_selector(
