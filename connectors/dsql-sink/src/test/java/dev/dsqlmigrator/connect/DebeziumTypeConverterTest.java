@@ -112,6 +112,106 @@ class DebeziumTypeConverterTest {
     assertArrayEquals(wkb, (byte[]) r);
   }
 
+  // --- PostgreSQL-source logical types (Phase D) ------------------------------
+
+  @Test
+  void pgUuidStringToJavaUuid() {
+    // PostgreSQL uuid -> Debezium io.debezium.data.Uuid (a dashed string). The sink binds
+    // a java.util.UUID so pgjdbc targets the uuid column (a plain String would be varchar).
+    // Mirrors the Full Load path (psycopg uuid.UUID).
+    String text = "0b6be8e2-2a11-4c3e-9d2e-1a2b3c4d5e6f";
+    Object r = DebeziumTypeConverter.convert(DebeziumTypeConverter.UUID_TYPE, text);
+    assertInstanceOf(java.util.UUID.class, r);
+    assertEquals(java.util.UUID.fromString(text), r);
+  }
+
+  @Test
+  void pgUuidMalformedPassesThroughToFailLoudly() {
+    // A value that is not a UUID is left as the raw string so it DLQs, rather than crashing
+    // the whole batch with an IllegalArgumentException.
+    Object r = DebeziumTypeConverter.convert(DebeziumTypeConverter.UUID_TYPE, "not-a-uuid");
+    assertEquals("not-a-uuid", r);
+  }
+
+  @Test
+  void pgZonedTimeStringToOffsetTime() {
+    // PostgreSQL timetz -> Debezium io.debezium.time.ZonedTime, an ISO-8601 offset time
+    // that Debezium ALWAYS normalizes to UTC (a source 07:15:00-05:00 streams as
+    // 12:15:00Z). The sink binds a java.time.OffsetTime, preserving the sub-second micros a
+    // java.sql.Time would drop. (The UTC-vs-source-offset divergence from the Full Load
+    // write is reconciled offset-insensitively in Validation -- see test_validation_sql.)
+    Object r =
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.ZONED_TIME, "12:15:00.123456Z");
+    assertInstanceOf(java.time.OffsetTime.class, r);
+    assertEquals(java.time.OffsetTime.parse("12:15:00.123456Z"), r);
+    // The converter binds whatever offset it is handed (it does not itself re-normalize);
+    // a defensive non-UTC input still parses to the matching OffsetTime.
+    Object r2 =
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.ZONED_TIME, "07:15:00-05:00");
+    assertEquals(java.time.OffsetTime.parse("07:15:00-05:00"), r2);
+  }
+
+  @Test
+  void pgZonedTimeUnparseablePassesThroughToFailLoudly() {
+    Object r = DebeziumTypeConverter.convert(DebeziumTypeConverter.ZONED_TIME, "nonsense");
+    assertEquals("nonsense", r);
+  }
+
+  @Test
+  void pgIntervalIsoStringWrappedInPgInterval() throws Exception {
+    // PostgreSQL interval (interval.handling.mode=string) -> an ISO-8601 duration string.
+    // Wrapped in a PGobject(type=interval) so pgjdbc binds it to the interval column;
+    // PostgreSQL's interval input parses ISO-8601. Same stored value as the Full Load path.
+    Object r =
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.INTERVAL_TYPE, "P1Y2M3DT4H5M6S");
+    assertInstanceOf(PGobject.class, r);
+    PGobject pg = (PGobject) r;
+    assertEquals("interval", pg.getType());
+    assertEquals("P1Y2M3DT4H5M6S", pg.getValue());
+  }
+
+  @Test
+  void pgVariableScaleDecimalStructToBigDecimal() {
+    // Unconstrained PostgreSQL numeric under decimal.handling.mode=precise -> a Struct
+    // {scale INT32, value BYTES}. `value` is the two's-complement big-endian unscaled
+    // integer; decode to a BigDecimal (mirrors the Full Load Decimal). 1234.5678 = unscaled
+    // 12345678 with scale 4.
+    java.math.BigInteger unscaled = new java.math.BigInteger("12345678");
+    Schema vsd =
+        SchemaBuilder.struct()
+            .name(DebeziumTypeConverter.VARIABLE_SCALE_DECIMAL)
+            .field("scale", Schema.INT32_SCHEMA)
+            .field("value", Schema.BYTES_SCHEMA)
+            .build();
+    Struct value = new Struct(vsd).put("scale", 4).put("value", unscaled.toByteArray());
+
+    Object r = DebeziumTypeConverter.convert(DebeziumTypeConverter.VARIABLE_SCALE_DECIMAL, value);
+
+    assertInstanceOf(BigDecimal.class, r);
+    assertEquals(new BigDecimal("1234.5678"), r);
+  }
+
+  @Test
+  void pgVariableScaleDecimalNegativeAndZeroScale() {
+    // A negative value (two's-complement bytes) and a scale-0 integer both decode exactly.
+    Schema vsd =
+        SchemaBuilder.struct()
+            .name(DebeziumTypeConverter.VARIABLE_SCALE_DECIMAL)
+            .field("scale", Schema.INT32_SCHEMA)
+            .field("value", Schema.BYTES_SCHEMA)
+            .build();
+    Struct neg =
+        new Struct(vsd).put("scale", 2).put("value", new java.math.BigInteger("-9999").toByteArray());
+    assertEquals(
+        new BigDecimal("-99.99"),
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.VARIABLE_SCALE_DECIMAL, neg));
+    Struct whole =
+        new Struct(vsd).put("scale", 0).put("value", new java.math.BigInteger("42").toByteArray());
+    assertEquals(
+        new BigDecimal("42"),
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.VARIABLE_SCALE_DECIMAL, whole));
+  }
+
   @Test
   void nullPassesThrough() {
     assertNull(DebeziumTypeConverter.convert(DebeziumTypeConverter.MICRO_TIMESTAMP, null));

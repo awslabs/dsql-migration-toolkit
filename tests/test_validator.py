@@ -2278,6 +2278,41 @@ def test_source_read_dispatch_routes_by_engine(monkeypatch) -> None:
     assert calls[-1] == ("my_pk", "C")
 
 
+def test_pg_checksum_timetz_is_offset_insensitive() -> None:
+    # A PostgreSQL `timetz` stores its offset. The CDC sink writes it UTC-normalized
+    # (Debezium's ZonedTime is always GMT) while Full Load preserves the source offset --
+    # the same instant, different stored offset -- so an offset-sensitive ::text would
+    # false-mismatch a CDC-written value. The checksum classifies timetz distinctly and
+    # renders it shifted to UTC on BOTH engines so an equal instant matches regardless of
+    # which write path produced it.
+    from dsql_migrator.core.validator import _checksum_kind, build_pg_checksum_sql
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    # All four format_type spellings classify as "timetz" -- including the precision-
+    # qualified "time(6) with time zone", which a naive "(" split would collapse to "time".
+    for spelling in ("time with time zone", "time(6) with time zone", "timetz", "timetz(3)"):
+        assert (
+            _checksum_kind(ColumnDef(name="tz", mysql_type=spelling, target_type=spelling))
+            == "timetz"
+        ), spelling
+    # A plain `time` (no zone) is NOT timetz -- it keeps the offset-free render.
+    assert _checksum_kind(ColumnDef(name="t", mysql_type="time", target_type="time")) == "time"
+
+    table = TableDef(
+        name="app.events",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", target_type="bigint"),
+            ColumnDef(name="tz", mysql_type="time with time zone", target_type="time with time zone"),
+            ColumnDef(name="t", mysql_type="time", target_type="time"),
+        ],
+        primary_key=["id"],
+    )
+    pg_sql = build_pg_checksum_sql(table).as_string(None)
+    assert '("tz" AT TIME ZONE \'UTC\')::text' in pg_sql  # timetz: normalized to UTC
+    assert "to_char(\"t\", 'HH24:MI:SS.US')" in pg_sql     # plain time unchanged
+    assert '"t" AT TIME ZONE' not in pg_sql                # ...and not shifted
+
+
 def test_pg_checksum_unconstrained_numeric_rounds_to_dsql_default_scale() -> None:
     # An unconstrained PG `numeric` (no declared scale) is stored by DSQL at its default
     # numeric(18,6), so the checksum rounds BOTH sides to scale 6 -- not scale 0 (the old

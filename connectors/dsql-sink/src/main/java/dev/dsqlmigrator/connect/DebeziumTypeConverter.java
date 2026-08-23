@@ -70,6 +70,36 @@ final class DebeziumTypeConverter {
   static final String GEOGRAPHY_TYPE = "io.debezium.data.geometry.Geography";
   static final String POINT_TYPE = "io.debezium.data.geometry.Point";
 
+  // --- PostgreSQL-source logical types --------------------------------------
+  // The DSQL sink is engine-neutral: it dispatches on the Debezium logical-type NAME,
+  // and these names are emitted ONLY by the PostgreSQL source connector (never by the
+  // MySQL one), so adding them is inert for a MySQL migration. Each conversion mirrors
+  // the Full Load PostgreSQL value path (exporter_postgres.PostgresValueConverter) so a
+  // row lands identically in DSQL whether migrated by Full Load or CDC. The source
+  // connector is configured (deploy/cdc-stack.yaml PostgresSourceConnector) to emit the
+  // exact encodings decoded here: decimal.handling.mode=precise, interval.handling.mode=
+  // string, time.precision.mode=adaptive_time_microseconds.
+
+  // PostgreSQL uuid -> Debezium sends the canonical dashed string; bind a java.util.UUID
+  // (the DSQL column is uuid). A plain String would bind as varchar and be rejected.
+  static final String UUID_TYPE = "io.debezium.data.Uuid";
+  // PostgreSQL time with time zone (timetz) -> an ISO-8601 offset-time string that Debezium
+  // ALWAYS normalizes to UTC (e.g. "12:15:00.123456Z"); bind a java.time.OffsetTime to keep
+  // the sub-seconds. Because the source offset is discarded here (not by us -- by Debezium),
+  // a CDC-written timetz stores the UTC offset while Full Load stores the source offset (the
+  // same instant, different stored offset); Validation compares timetz offset-insensitively
+  // (validation_sql._pg_checksum_expr shifts both to UTC) so the two write paths agree.
+  static final String ZONED_TIME = "io.debezium.time.ZonedTime";
+  // PostgreSQL interval (with interval.handling.mode=string) -> an ISO-8601 duration
+  // string (e.g. "P1Y2M3DT4H5M6S"); wrap in a PGobject(type=interval) so it binds to the
+  // interval column (PostgreSQL's interval input accepts ISO-8601).
+  static final String INTERVAL_TYPE = "io.debezium.time.Interval";
+  // PostgreSQL numeric WITHOUT a declared scale, under decimal.handling.mode=precise ->
+  // a Struct {scale INT32, value BYTES}; decode to a BigDecimal. (A numeric WITH a fixed
+  // scale arrives as org.apache.kafka.connect.data.Decimal -> a BigDecimal that passes
+  // through the default case unchanged.)
+  static final String VARIABLE_SCALE_DECIMAL = "io.debezium.data.VariableScaleDecimal";
+
   private static final long MICROS_PER_MILLI = 1_000L;
   private static final int NANOS_PER_MICRO = 1_000;
   private static final long MICROS_PER_SECOND = 1_000_000L;
@@ -111,6 +141,14 @@ final class DebeziumTypeConverter {
       case GEOGRAPHY_TYPE:
       case POINT_TYPE:
         return geometryWkb(value);
+      case UUID_TYPE:
+        return uuidObject(value.toString());
+      case ZONED_TIME:
+        return offsetTime(value.toString());
+      case INTERVAL_TYPE:
+        return pgObject("interval", value.toString());
+      case VARIABLE_SCALE_DECIMAL:
+        return variableScaleDecimal(value);
       // DECIMAL_TYPE: Debezium precise mode already delivers a BigDecimal, which
       // setObject binds correctly to numeric — pass through.
       default:
@@ -205,13 +243,78 @@ final class DebeziumTypeConverter {
 
   /** Wrap a JSON string in a {@code PGobject(type=json)} so it binds to a json column. */
   private static PGobject jsonObject(String json) {
+    return pgObject("json", json);
+  }
+
+  /**
+   * Wrap a value string in a {@code PGobject} of the given PostgreSQL type name so pgjdbc
+   * binds it to that column type (rather than as {@code varchar}). Used for {@code json}
+   * and {@code interval}, whose canonical text forms the server re-parses.
+   */
+  private static PGobject pgObject(String type, String value) {
     PGobject pg = new PGobject();
     try {
-      pg.setType("json");
-      pg.setValue(json);
+      pg.setType(type);
+      pg.setValue(value);
     } catch (java.sql.SQLException e) {
-      throw new DataException("Failed to wrap JSON value for DSQL", e);
+      throw new DataException("Failed to wrap " + type + " value for DSQL", e);
     }
     return pg;
+  }
+
+  /**
+   * Bind a PostgreSQL {@code uuid} value: Debezium sends the canonical dashed string, so
+   * parse it to a {@link java.util.UUID} (pgjdbc targets the {@code uuid} column). Mirrors
+   * the Full Load path (psycopg {@code uuid.UUID}). A malformed value is left as the raw
+   * string so it fails loudly to the DLQ rather than crashing the batch (matching
+   * {@link #microsToTime}'s fail-loud stance).
+   */
+  private static Object uuidObject(String text) {
+    try {
+      return java.util.UUID.fromString(text);
+    } catch (IllegalArgumentException e) {
+      return text;
+    }
+  }
+
+  /**
+   * Bind a PostgreSQL {@code time with time zone} (timetz) value: Debezium
+   * {@code ZonedTime} is an ISO-8601 offset-time string ALWAYS normalized to UTC (e.g.
+   * {@code 12:15:00.123456Z}). Parse to a {@link java.time.OffsetTime} so pgjdbc targets the
+   * {@code timetz} column with full microsecond precision -- {@code java.sql.Time} would drop
+   * the sub-seconds and the offset. Debezium already discarded the source offset (sent UTC),
+   * so a CDC-written timetz differs from the offset-preserving Full Load write in stored
+   * offset only (same instant); Validation reconciles them offset-insensitively. An
+   * unparseable value is left as the raw string to fail loudly to the DLQ.
+   */
+  private static Object offsetTime(String text) {
+    try {
+      return java.time.OffsetTime.parse(text);
+    } catch (java.time.format.DateTimeParseException e) {
+      return text;
+    }
+  }
+
+  /**
+   * Decode a Debezium {@code io.debezium.data.VariableScaleDecimal} (a {@link Struct}
+   * {@code {scale INT32, value BYTES}}) to a {@link BigDecimal}. This is how an
+   * UNCONSTRAINED PostgreSQL {@code numeric} is encoded under
+   * {@code decimal.handling.mode=precise}. The {@code value} bytes are the
+   * two's-complement big-endian unscaled integer, so {@code new BigInteger(bytes)} with
+   * the scale reconstructs it exactly (mirrors the Full Load {@code Decimal}). An
+   * unexpected shape is bound as-is so it fails loudly to the DLQ rather than writing a
+   * wrong value.
+   */
+  private static Object variableScaleDecimal(Object value) {
+    if (value instanceof Struct) {
+      Struct struct = (Struct) value;
+      Object scale = struct.get("scale");
+      Object unscaled = struct.get("value");
+      if (scale instanceof Number && unscaled instanceof byte[]) {
+        return new BigDecimal(
+            new java.math.BigInteger((byte[]) unscaled), ((Number) scale).intValue());
+      }
+    }
+    return value;
   }
 }

@@ -17,12 +17,18 @@ module docstring for the cross-engine checksum-normalization rationale.
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from psycopg import sql
 
 from dsql_migrator.core.converter import is_spatial_mysql_type, map_mysql_type
 from dsql_migrator.core.models import ColumnDef, ForeignKeyDef, TableDef
+
+# A length/precision/scale modifier "(N)" / "(p,s)" anywhere in a type string, used to
+# reduce a format_type spelling to its base for a timetz classification (e.g.
+# "time(6) with time zone" -> "time with time zone"). Mirrors converter_postgres.
+_TYPE_MODIFIER_RE = re.compile(r"\(\s*\d+\s*(?:,\s*\d+\s*)?\)")
 
 # Number of leading MD5 hex digits used to build a per-row checksum token. 15
 # hex digits = 60 bits, which stays positive in both MySQL's unsigned CONV and
@@ -181,6 +187,16 @@ def _checksum_kind(column: "ColumnDef") -> str:
     # back to the source-derived default mapping when no applied type is known.
     applied = column.target_type
     if applied:
+        # PostgreSQL timetz must be detected on the FULL type string BEFORE the "(" split
+        # below: format_type spells a precision inline as "time(6) with time zone", which
+        # the split collapses to bare "time" (losing the zone). A timetz is rendered
+        # offset-insensitively (see _pg_checksum_expr) because the CDC sink stores it
+        # UTC-normalized (Debezium's ZonedTime is always GMT) while Full Load keeps the
+        # source offset -- the same instant, so an offset-sensitive ::text would false-
+        # mismatch. Only a PostgreSQL source produces timetz (MySQL has no such type).
+        normalized = " ".join(_TYPE_MODIFIER_RE.sub("", applied).lower().split())
+        if normalized in ("time with time zone", "timetz"):
+            return "timetz"
         kind = applied.split("(", 1)[0].strip().lower()
     else:
         try:
@@ -293,6 +309,14 @@ def _pg_checksum_expr(column: "ColumnDef") -> "Optional[sql.Composed]":
         ).format(col=ident)
     if kind == "time":
         return sql.SQL("to_char({col}, 'HH24:MI:SS.US')").format(col=ident)
+    if kind == "timetz":
+        # timetz stores its offset. The CDC sink writes it UTC-normalized (Debezium's
+        # ZonedTime is always GMT) while Full Load preserves the SOURCE offset -- the same
+        # instant-of-day but a different stored offset, so an offset-sensitive ::text would
+        # false-mismatch a CDC-written value against the source. Shift BOTH sides to the UTC
+        # offset first (timetz AT TIME ZONE 'UTC' stays a timetz, re-expressed at +00), so an
+        # equal instant renders identically regardless of which write path produced it.
+        return sql.SQL("({col} AT TIME ZONE 'UTC')::text").format(col=ident)
     if kind == "numeric":
         # An UNCONSTRAINED numeric (bare ``numeric``/``decimal``, no parens -> arbitrary
         # precision AND scale, a PostgreSQL-source case) has no declared scale. Aurora

@@ -9,7 +9,9 @@
  */
 package dev.dsqlmigrator.connect;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Struct;
@@ -27,6 +29,24 @@ import org.apache.kafka.connect.sink.SinkRecord;
  * (falling back to the before-image when the message has no key).
  */
 final class DebeziumEvents {
+
+  /**
+   * Debezium's default sentinel for an UNCHANGED, out-of-line (TOASTed) column value on a
+   * PostgreSQL UPDATE. Under {@code REPLICA IDENTITY DEFAULT} the WAL omits a TOASTed
+   * column that the UPDATE did not change, so Debezium substitutes this placeholder in the
+   * after-image ({@code unavailable.value.placeholder}, which the source connector leaves
+   * at its default). Binding it would OVERWRITE the real value with the sentinel, so such a
+   * column is dropped from the upsert (see {@link #extractAfterImage}) -> {@code ON CONFLICT
+   * DO UPDATE} leaves the existing DSQL value intact. This is a PostgreSQL-only concern
+   * (MySQL has no TOAST), so {@link #parse} gates the drop on a PostgreSQL source and the
+   * guard is never even evaluated for a MySQL source.
+   */
+  static final String TOAST_UNAVAILABLE_PLACEHOLDER = "__debezium_unavailable_value";
+
+  // The bytea form of the placeholder (a bytea column carries the sentinel as the UTF-8
+  // bytes of the string, since the source connector uses the default string placeholder).
+  private static final byte[] TOAST_UNAVAILABLE_PLACEHOLDER_BYTES =
+      TOAST_UNAVAILABLE_PLACEHOLDER.getBytes(StandardCharsets.UTF_8);
 
   private DebeziumEvents() {}
 
@@ -46,10 +66,17 @@ final class DebeziumEvents {
     }
 
     String op = optString(envelope, "op");
+    Struct source = optStruct(envelope, "source");
     String table = resolveTable(envelope, record.topic());
     // Source commit time for the end-to-end replication-lag metric (now - ts at
     // apply). 0 when the source block omits ts_ms -> lag simply not recorded.
-    long sourceTsMs = optLong(optStruct(envelope, "source"), "ts_ms");
+    long sourceTsMs = optLong(source, "ts_ms");
+    // The TOAST unavailable-value omission (see extractAfterImage) is a PostgreSQL-only
+    // concern, so gate it on the origin engine (Debezium's source.connector). A MySQL --
+    // or unknown -- source keeps byte-identical pre-Phase-D behavior: every after-image
+    // column is bound verbatim, even one whose value happens to equal the sentinel string
+    // (MySQL has no TOAST, so the sentinel is only ever real user data there).
+    boolean pgSource = "postgresql".equals(optString(source, "connector"));
     Struct after = optStruct(envelope, "after");
 
     if ("d".equals(op) || after == null) {
@@ -65,7 +92,7 @@ final class DebeziumEvents {
 
     List<String> columns = new ArrayList<>();
     List<Object> values = new ArrayList<>();
-    extractStruct(after, columns, values);
+    extractAfterImage(after, columns, values, pgSource);
     if (pkColumns.isEmpty()) {
       throw new DataException(
           "Cannot build upsert for table " + table + ": record has no key (pk) fields");
@@ -100,6 +127,72 @@ final class DebeziumEvents {
       // carries the Debezium logical type that drives the conversion.
       values.add(DebeziumTypeConverter.convert(field.schema().name(), struct.get(field)));
     }
+  }
+
+  /**
+   * Extract an UPSERT after-image, dropping any column whose value is the PostgreSQL TOAST
+   * unavailable-value placeholder (see {@link #TOAST_UNAVAILABLE_PLACEHOLDER}) when
+   * {@code dropToastPlaceholder} is set (i.e. a PostgreSQL source -- see {@link #parse}).
+   * For a MySQL source {@code dropToastPlaceholder} is false and every column is bound
+   * verbatim, byte-identical to the pre-Phase-D path (MySQL has no TOAST, so the sentinel
+   * there would only ever be genuine user data that must NOT be dropped).
+   *
+   * <p>An omitted column is simply absent from the rendered {@code INSERT ... ON CONFLICT
+   * DO UPDATE SET ...}, so its existing DSQL value is preserved (a partial upsert) instead
+   * of being overwritten with the sentinel. The primary key is never TOASTed, so it is
+   * never dropped -- and the {@code ON CONFLICT} target comes from the record key, not this
+   * after-image, so dropping a non-key column cannot affect conflict resolution.
+   *
+   * <p><b>Tradeoff:</b> if a placeholder-bearing UPDATE ever targets a PK that does not yet
+   * exist in DSQL, the {@code ON CONFLICT} inserts a row with that column left at its
+   * default (NULL) rather than the true value. Under the gapless handoff the row always
+   * exists (the slot resumes after the Full Load consistency point), and Validation would
+   * surface any residual gap -- a bounded, detectable gap is strictly better than silently
+   * writing the sentinel string into the column.
+   *
+   * <p><b>Known v1 limitation (unchanged TOASTed {@code numeric}):</b> Debezium substitutes
+   * a DETECTABLE placeholder only for string- and bytes-schema'd columns (text/varchar/
+   * char/json/jsonb and bytea) -- the realistic large-value types. For an unchanged TOASTed
+   * {@code numeric} its value converter yields a plain {@code NULL} (not the sentinel), which
+   * this method cannot distinguish from a genuine {@code NULL} update, so such a column is
+   * NOT omitted and the upsert would overwrite the real value with NULL. This requires a
+   * {@code numeric} large enough to be stored out-of-line (thousands of digits, &gt;~2 KiB) --
+   * effectively unreachable for real data (business numbers never reach that size; "very
+   * large values" are text/blob, which ARE handled). The robust fix is Debezium's
+   * {@code ReselectColumnsPostProcessor} (re-query the unavailable column from the source by
+   * PK), to be enabled on the source connector and validated live in Phase F.
+   */
+  private static void extractAfterImage(
+      Object after, List<String> names, List<Object> values, boolean dropToastPlaceholder) {
+    if (!(after instanceof Struct struct)) {
+      return;
+    }
+    for (Field field : struct.schema().fields()) {
+      Object raw = struct.get(field);
+      if (dropToastPlaceholder && isToastPlaceholder(raw)) {
+        continue; // unchanged TOAST value: omit so the existing target value is kept
+      }
+      names.add(field.name());
+      values.add(DebeziumTypeConverter.convert(field.schema().name(), raw));
+    }
+  }
+
+  /**
+   * True when a raw after-image value is Debezium's TOAST unavailable-value placeholder --
+   * as the sentinel string (text/varchar/char/json/jsonb columns) or its UTF-8 bytes (a
+   * bytea column). Checked on the RAW value BEFORE type conversion so a {@code json}
+   * sentinel is caught before it would be wrapped in a {@code PGobject}. Only consulted for
+   * a PostgreSQL source (see {@link #extractAfterImage}), so a MySQL row that happens to
+   * carry this exact string is never affected.
+   */
+  private static boolean isToastPlaceholder(Object raw) {
+    if (raw instanceof String s) {
+      return TOAST_UNAVAILABLE_PLACEHOLDER.equals(s);
+    }
+    if (raw instanceof byte[] b) {
+      return Arrays.equals(b, TOAST_UNAVAILABLE_PLACEHOLDER_BYTES);
+    }
+    return false;
   }
 
   /**

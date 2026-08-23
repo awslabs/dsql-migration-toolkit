@@ -59,6 +59,17 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v36 rebuilds the DSQL sink jar with PostgreSQL-source typed binds + TOAST handling
+#    (PG CDC Phase D). DebeziumTypeConverter now decodes the four PostgreSQL logical types
+#    the source connector emits (io.debezium.data.Uuid -> java.util.UUID; ZonedTime ->
+#    java.time.OffsetTime for timetz; Interval ISO-8601 -> PGobject(interval);
+#    VariableScaleDecimal Struct -> BigDecimal), each mirroring the Full Load PG value path
+#    so a row lands identically whether migrated by Full Load or CDC. DebeziumEvents now
+#    OMITS an unchanged TOASTed column (Debezium's __debezium_unavailable_value sentinel)
+#    from the upsert -> ON CONFLICT DO UPDATE keeps the existing DSQL value instead of
+#    overwriting it with the sentinel. Sink-jar change only; MySQL behavior is byte-identical
+#    (the new logical-type names and the sentinel are emitted ONLY by a PostgreSQL source).
+#    A running cdc-stack keeps its current plugin until a Delete + Deploy infra redeploy.
 # v35 rebuilds the DSQL sink jar with PostgreSQL JDBC (pgjdbc) 42.7.11 -> 42.7.12 to
 #    clear a newly-published Dependabot advisory: the pgjdbc silent channel-binding
 #    auth-downgrade (CVE-2026-54291, affecting 42.7.4-42.7.11). Sink jar only; the
@@ -324,7 +335,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # existing plugin resource collides -- adding it needs no version bump and does NOT
 # force a Delete+Deploy on a live MySQL stack. Bump only when a plugin's CONTENT
 # changes.
-PLUGIN_VERSION = "v35"
+PLUGIN_VERSION = "v36"
 
 
 class S3ProvisionError(RuntimeError):
