@@ -21,7 +21,7 @@ functions (``check_*``) that take already-gathered facts and return a
 Mode coverage:
 
 - ``FULL_LOAD`` runs the common checks; the CDC-only checks
-  (``BINLOG_ROW_FORMAT`` / ``GTID_MODE`` / ``MSK_AVAILABLE`` /
+  (``BINLOG_ROW_FORMAT`` / ``BINLOG_RETENTION`` / ``GTID_MODE`` / ``MSK_AVAILABLE`` /
   ``MSK_CONNECT_AVAILABLE``) are reported as ``SKIP``.
 - ``CDC`` runs the common checks plus the CDC-only checks.
 
@@ -303,6 +303,24 @@ def _on(value: Optional[str]) -> bool:
     return (value or "").strip().upper() in {"ON", "1"}
 
 
+def _as_int(value: Optional[str]) -> Optional[int]:
+    """Parse a MySQL variable value to int, or None when absent/non-numeric."""
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+# The binlog must be retained at least this long for the Full Load -> CDC handoff:
+# CDC resumes from the binlog file:position (or GTID) watermark captured at snapshot
+# start, so the source must still hold that binlog when CDC begins consuming. 24h is
+# the widely-recommended floor (matches AWS DMS guidance) with margin for the load +
+# CDC-stack deploy; 168h (7d) is the recommended set-value.
+_MIN_BINLOG_RETENTION_HOURS = 24
+
+
 def check_binlog_row_format(variables: dict[str, str]) -> PrerequisiteResult:
     """PASS when binary logging is on with ROW format and a FULL row image."""
     log_bin = _on(variables.get("log_bin"))
@@ -354,6 +372,92 @@ def check_gtid_mode(variables: dict[str, str]) -> PrerequisiteResult:
             "Optional: enable GTID mode for more robust CDC resume across source "
             "failover/replica promotion. Not required -- CDC otherwise resumes "
             "from the binlog file:position watermark."
+        ),
+    )
+
+
+def check_binlog_retention(variables: dict[str, str]) -> PrerequisiteResult:
+    """WARN when the source's binlog retention is too short for the FL -> CDC handoff.
+
+    CDC resumes from the binlog file:position (or GTID) watermark captured at the
+    Full Load snapshot point, so the source must still hold that binlog when CDC
+    begins. If retention is too short (the classic RDS gotcha: ``binlog retention
+    hours`` unset -> RDS purges aggressively), the binlog is gone before CDC starts
+    -> a SILENT data gap. This never hard-blocks (WARN / ``required=False``, per
+    Property 14) -- a fast load + prompt CDC start may still fit inside a short
+    window -- but it is a real, non-obvious risk worth surfacing.
+
+    Retention (hours) is read from, in order: the RDS ``binlog retention hours``
+    config (folded into ``variables`` as ``rds_binlog_retention_hours`` by the probe;
+    ``"0"`` means the RDS row exists but is unset -> aggressive purge -> risk), else
+    the self-managed ``binlog_expire_logs_seconds`` (``0`` = purge DISABLED = binlogs
+    kept = safe) or ``expire_logs_days``. Unknown -> non-blocking ``INFO``.
+    """
+    hours: Optional[float] = None
+    unbounded = False  # self-managed automatic purge disabled -> binlogs retained
+    rds = variables.get("rds_binlog_retention_hours")
+    if rds is not None:
+        try:
+            hours = float(str(rds).strip())
+        except (TypeError, ValueError):
+            hours = 0.0  # unparseable RDS value -> treat as risk
+    else:
+        secs = _as_int(variables.get("binlog_expire_logs_seconds"))
+        days = _as_int(variables.get("expire_logs_days"))
+        if secs is not None and secs > 0:
+            hours = secs / 3600.0
+        elif secs == 0:
+            unbounded = True
+        elif days is not None and days > 0:
+            hours = days * 24.0
+        elif days == 0:
+            unbounded = True
+
+    if unbounded:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.BINLOG_RETENTION,
+            title="Binary log retention covers the CDC handoff",
+            status=PrerequisiteStatus.PASS,
+            required=False,
+            detail="Automatic binlog purging is disabled; binlogs are retained.",
+        )
+    if hours is None:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.BINLOG_RETENTION,
+            title="Binary log retention covers the CDC handoff",
+            status=PrerequisiteStatus.INFO,
+            required=False,
+            detail=(
+                "Could not read the source's binlog retention. Ensure it exceeds the "
+                "Full Load duration plus the time to start CDC, or the binlog may be "
+                "purged before CDC resumes from the watermark."
+            ),
+            remediation=(
+                f"Confirm retention >= {_MIN_BINLOG_RETENTION_HOURS}h. On RDS: "
+                "CALL mysql.rds_set_configuration('binlog retention hours', 168);"
+            ),
+        )
+    ok = hours >= _MIN_BINLOG_RETENTION_HOURS
+    return PrerequisiteResult(
+        check_id=PrerequisiteCheckId.BINLOG_RETENTION,
+        title="Binary log retention covers the CDC handoff",
+        status=PrerequisiteStatus.PASS if ok else PrerequisiteStatus.WARN,
+        required=False,
+        detail=(
+            f"Binlog retention is ~{hours:.0f}h."
+            if ok
+            else (
+                f"Binlog retention is only ~{hours:.0f}h — the binlog may be purged "
+                "before CDC resumes from the Full Load watermark (silent data gap)."
+            )
+        ),
+        remediation=""
+        if ok
+        else (
+            f"Raise retention to >= {_MIN_BINLOG_RETENTION_HOURS}h (168h/7d "
+            "recommended). On RDS: "
+            "CALL mysql.rds_set_configuration('binlog retention hours', 168); "
+            "self-managed: set binlog_expire_logs_seconds accordingly."
         ),
     )
 
@@ -513,6 +617,7 @@ class PrerequisiteChecker:
         if request.mode == MigrationMode.CDC:
             variables = self._source.variables()
             results.append(check_binlog_row_format(variables))
+            results.append(check_binlog_retention(variables))
             results.append(check_gtid_mode(variables))
             results.append(
                 check_msk_available(
@@ -529,6 +634,12 @@ class PrerequisiteChecker:
                 _skipped(
                     PrerequisiteCheckId.BINLOG_ROW_FORMAT,
                     "Binary log uses ROW format with full row image",
+                )
+            )
+            results.append(
+                _skipped(
+                    PrerequisiteCheckId.BINLOG_RETENTION,
+                    "Binary log retention covers the CDC handoff",
                 )
             )
             results.append(
@@ -559,6 +670,7 @@ __all__ = [
     "check_target_iam_auth",
     "check_target_schema_ready",
     "check_binlog_row_format",
+    "check_binlog_retention",
     "check_gtid_mode",
     "check_msk_available",
     "check_msk_connect_available",

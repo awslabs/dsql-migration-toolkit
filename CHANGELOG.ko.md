@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.386
+
+### 추가 (Added)
+
+- **CDC 전제조건에 소스 binlog 보존기간 체크 추가** — 신규 `BINLOG_RETENTION` 체크(CDC 모드 전용,
+  Full Load에선 SKIP). CDC는 Full Load 스냅샷 시점에 잡은 binlog file:position / GTID 워터마크에서
+  재개하므로, CDC 시작 전에 소스 binlog가 파기되면 핸드오프에 조용한 데이터 갭이 생깁니다. 이 체크는
+  RDS `binlog retention hours`(`mysql.rds_configuration`에서 읽음; 미설정 = 공격적 파기)를 읽고,
+  self-managed 폴백(`binlog_expire_logs_seconds` / `expire_logs_days`, `0` = 자동 파기 비활성 = 안전)도
+  지원합니다. 24h 미만이면 **WARN**(비차단, Property 14) + 조치(`CALL mysql.rds_set_configuration('binlog
+  retention hours', 168)`), 판별 불가면 INFO. RDS CDC의 전형적 함정을 메웁니다. Full Load의 소스
+  체크(연결 + SELECT 권한 + 테이블별 PK)는 변경 없음 — 보충 불필요.
+
 ## v0.1.385
 
 ### 변경 (Changed)

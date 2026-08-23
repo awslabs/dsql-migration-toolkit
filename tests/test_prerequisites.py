@@ -24,6 +24,7 @@ from dsql_migrator.core.models import (
 from dsql_migrator.core.models import ColumnDef
 from dsql_migrator.core.prerequisites import (
     PrerequisiteChecker,
+    check_binlog_retention,
     check_binlog_row_format,
     check_gtid_mode,
     check_replication_grants,
@@ -52,6 +53,9 @@ class _FakeSource:
             "binlog_format": "ROW",
             "binlog_row_image": "FULL",
             "gtid_mode": "ON",
+            # ~30d self-managed retention so the default healthy source PASSes the
+            # binlog-retention check too.
+            "binlog_expire_logs_seconds": "2592000",
         }
 
     def reachable(self) -> ConnectionResult:
@@ -252,6 +256,53 @@ def test_binlog_and_gtid_checks() -> None:
     gtid_off = check_gtid_mode({"gtid_mode": "OFF"})
     assert gtid_off.status == PrerequisiteStatus.INFO
     assert gtid_off.required is False
+
+
+def test_binlog_retention_rds_value() -> None:
+    # RDS retention hours: >= 24h passes, a short/unset ("0") value WARNs.
+    ok = check_binlog_retention({"rds_binlog_retention_hours": "168"})
+    assert ok.status == PrerequisiteStatus.PASS
+    short = check_binlog_retention({"rds_binlog_retention_hours": "0"})
+    assert short.status == PrerequisiteStatus.WARN
+    assert short.required is False  # never a gating FAIL
+    assert "168" in short.remediation  # points at the RDS fix
+
+
+def test_binlog_retention_self_managed() -> None:
+    # binlog_expire_logs_seconds: 30d passes; a short value WARNs; 0 = purge DISABLED
+    # (binlogs kept) = PASS. expire_logs_days is the older fallback.
+    assert (
+        check_binlog_retention({"binlog_expire_logs_seconds": "2592000"}).status
+        == PrerequisiteStatus.PASS
+    )
+    assert (
+        check_binlog_retention({"binlog_expire_logs_seconds": "3600"}).status
+        == PrerequisiteStatus.WARN
+    )
+    assert (
+        check_binlog_retention({"binlog_expire_logs_seconds": "0"}).status
+        == PrerequisiteStatus.PASS
+    )
+    assert (
+        check_binlog_retention({"expire_logs_days": "7"}).status
+        == PrerequisiteStatus.PASS
+    )
+
+
+def test_binlog_retention_unknown_is_non_blocking_info() -> None:
+    # No retention signal at all -> advisory INFO, never a WARN/FAIL.
+    res = check_binlog_retention({})
+    assert res.status == PrerequisiteStatus.INFO
+    assert res.required is False
+
+
+def test_binlog_retention_rds_takes_precedence_over_variables() -> None:
+    # An RDS source with retention unset ("0") is a risk even if the server variable
+    # still reports a long value -- RDS governs retention, so RDS wins.
+    res = check_binlog_retention(
+        {"rds_binlog_retention_hours": "0", "binlog_expire_logs_seconds": "2592000"}
+    )
+    assert res.status == PrerequisiteStatus.WARN
 
 
 # ---------------------------------------------------------------------------

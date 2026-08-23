@@ -2944,6 +2944,7 @@ def _connector_failure_detail(migration_state, view, name: str) -> str:
 _CDC_ONLY_CHECK_IDS = frozenset(
     {
         PrerequisiteCheckId.BINLOG_ROW_FORMAT,
+        PrerequisiteCheckId.BINLOG_RETENTION,
         PrerequisiteCheckId.GTID_MODE,
         PrerequisiteCheckId.MSK_AVAILABLE,
         PrerequisiteCheckId.MSK_CONNECT_AVAILABLE,

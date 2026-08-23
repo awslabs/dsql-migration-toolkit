@@ -163,7 +163,9 @@ privileges**. You must also **raise binlog retention** so the log at the Full Lo
 watermark survives until CDC starts (Aurora MySQL keeps binlogs only ~24 h by
 default). On RDS/Aurora these are set via **parameter groups** and
 `mysql.rds_set_configuration`, not `my.cnf`. The prerequisite gate **blocks CDC**
-until these are met. See [§1.1](01-setup.md#11-prerequisites) and
+until the binlog format and replication privileges are met, and **warns**
+(non-blocking) if binlog retention looks too short. See
+[§1.1](01-setup.md#11-prerequisites) and
 [Chapter 6 §6.2](06-limitations.md#62-migration-process-limits).
 
 

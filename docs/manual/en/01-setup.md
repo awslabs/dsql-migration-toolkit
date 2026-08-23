@@ -98,7 +98,10 @@ what's missing, but setting them up is a source-side task you do once.
 
   Choose a window that comfortably covers the gap between Full Load and CDC start
   plus your expected catch-up time (7 days is a safe default). The Aurora MySQL
-  maximum is **2160 (90 days)**; you can lower it again after cut-over.
+  maximum is **2160 (90 days)**; you can lower it again after cut-over. The gate
+  now **warns** (non-blocking) if retention looks too short (under 24h) or is unset,
+  so you catch it before the binlog is purged — but it never blocks, since only you
+  know how long your Full Load will run.
 - **GTID is recommended, but not required.** With `gtid_mode=ON`, CDC resume
   survives a source failover or replica promotion; without it, the tool falls back
   to the binlog `file:position` watermark — which works, but is less robust across

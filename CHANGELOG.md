@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.386
+
+### Added
+
+- **CDC prerequisites now check the source's binary-log retention** — a new
+  `BINLOG_RETENTION` check (CDC mode only; SKIP for Full Load). CDC resumes from the
+  binlog file:position / GTID watermark captured at the Full Load snapshot, so if the
+  source's binlog is purged before CDC starts the handoff has a silent data gap. The
+  check reads the RDS `binlog retention hours` (from `mysql.rds_configuration`; an unset
+  value = aggressive purge) with a self-managed fallback (`binlog_expire_logs_seconds` /
+  `expire_logs_days`, where `0` = purging disabled = safe), and WARNs (non-blocking, per
+  Property 14) with remediation (`CALL mysql.rds_set_configuration('binlog retention
+  hours', 168)`) when retention is under 24h; unknown → advisory INFO. This closes the
+  classic RDS CDC gotcha the gate previously missed. Full Load's source checks are
+  unchanged (reachability + SELECT grant + per-table PK) — nothing to add there.
+
 ## v0.1.385
 
 ### Changed
