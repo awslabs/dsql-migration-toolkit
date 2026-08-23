@@ -464,3 +464,19 @@ def test_patch_plugin_params_fills_mysql_key_only_for_a_mysql_set() -> None:
     assert patched["DebeziumPluginS3Key"].endswith("debezium-mysql-plugin.zip")
     # The PostgreSQL plugin key must NOT be cross-added to a MySQL set.
     assert "DebeziumPostgresPluginS3Key" not in patched
+
+
+def test_pg_stack_params_filled_carries_no_plugin_location_or_immutable_param() -> None:
+    # Tier-3 #23: NO plugin-Location / immutable param may appear in the Start (stack) params'
+    # .filled -- sending one on the Start update_stack blanks/changes an immutable CustomPlugin
+    # property and forces CloudFormation to REPLACE the custom-named plugin (the rollback that
+    # bit at Phase F). They must be placeholder-only (UsePreviousValue). Guards ALL siblings.
+    src = build_pg_source_config(
+        "pg-source", _tables(), _wm(wal_lsn="3/AF012B8"),
+        database_name="app", slot_name="s1", publication_name="p1",
+    )
+    filled_keys = {k for k, _ in build_pg_cdc_stack_params(src, _sink(), target_endpoint="ep").filled}
+    assert filled_keys.isdisjoint({
+        "DebeziumPostgresPluginS3Key", "DebeziumPluginS3Key", "PluginBucketArn",
+        "DsqlSinkPluginS3Key", "LambdaSeederS3Key", "PluginVersion",
+    }), filled_keys

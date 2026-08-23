@@ -2396,3 +2396,61 @@ def test_pg_source_connection_shim_renders_composed_and_binds_params() -> None:
     sqla.calls.clear()
     cur.execute(build_pg_pk_next_page_sql(table, "id", 5), {})
     assert sqla.calls[-1][1] is None
+
+
+def test_checksum_kind_jsonb_included_json_excluded() -> None:
+    # Tier-3 #14: jsonb has a canonical text form -> classified "plain" (col::text,
+    # INCLUDED in the checksum); json has no byte-identical cross-engine text form ->
+    # "json" (EXCLUDED). Guards a "fix" that broadens kind=="json" to startswith("json")
+    # and would silently drop jsonb from the checksum.
+    from dsql_migrator.core.validator import (
+        _checksum_kind, _mysql_checksum_expr, _pg_checksum_expr,
+    )
+
+    jb = ColumnDef(name="d", mysql_type="jsonb", target_type="jsonb")
+    js = ColumnDef(name="d", mysql_type="json", target_type="json")
+    assert _checksum_kind(jb) == "plain" and _checksum_kind(js) == "json"
+    assert _pg_checksum_expr(jb) is not None and _pg_checksum_expr(js) is None
+    assert _mysql_checksum_expr(jb) is not None and _mysql_checksum_expr(js) is None
+
+
+def test_pg_source_keyset_count_through_shim_non_integer_and_composite() -> None:
+    # Tier-3 #16: the PG-source live count keyset-pages a single (uuid/varchar) PK through
+    # the shim (no COUNT(*)) and falls back to COUNT(*) for a composite PK.
+    from types import SimpleNamespace
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.core.validator import _source_row_count_live
+
+    class _Res:
+        def __init__(self, rows):
+            self._rows = list(rows)
+
+        def fetchone(self):
+            return self._rows[0] if self._rows else None
+
+        def fetchall(self):
+            return list(self._rows)
+
+    class _PagedSqla:
+        def __init__(self, batches):
+            self._b = list(batches)
+            self.sqls: list = []
+            self.connection = SimpleNamespace(driver_connection=None)
+
+        def exec_driver_sql(self, sql, params=None):
+            self.sqls.append(sql)
+            return _Res(self._b.pop(0) if self._b else [])
+
+    # uuid single PK, page 2 over 3 rows -> genuinely paged, no COUNT(*).
+    ut = _table("t", columns=("id",), primary_key=("id",))
+    ut.columns[0].mysql_type = "uuid"
+    sqla = _PagedSqla([[("u1",), ("u2",)], [("u3",)]])
+    assert _source_row_count_live(_FakeDialect(SourceType.POSTGRES), sqla, ut, 2) == 3
+    assert len(sqla.sqls) == 2
+    assert not any("COUNT(*)" in s for s in sqla.sqls)
+    assert '"id" > %(last)s' in sqla.sqls[1]
+    # composite PK -> COUNT(*) fallback through the shim.
+    ct = _table("t", columns=("a", "b"), primary_key=("a", "b"))
+    sqla2 = _PagedSqla([[(2,)]])
+    assert _source_row_count_live(_FakeDialect(SourceType.POSTGRES), sqla2, ct, 2) == 2
+    assert "COUNT(*)" in sqla2.sqls[0]

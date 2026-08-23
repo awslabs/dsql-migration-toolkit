@@ -1665,6 +1665,11 @@ _KEY_TYPE_BYTES: dict = {
     _T.TIMESTAMP: 8,
     _T.TIMESTAMPTZ: 8,
     _T.UUID: 16,
+    # PostgreSQL-source fixed-width key types. Without these a timetz / interval PRIMARY
+    # KEY hits the unbounded-varlen fallback (1025 bytes) and falsely trips the ">1024-byte
+    # key" warning, even though both are small fixed-width DSQL-supported key types.
+    _T.TIMETZ: 12,  # time (8) + zone offset (4)
+    _T.INTERVAL: 16,  # months (4) + days (4) + micros (8)
 }
 # Assumed bytes for a variable-length key column with NO declared length (``text``,
 # or a type we cannot size). Not a DSQL cap: the docs list no per-column key cap --

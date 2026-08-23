@@ -270,3 +270,73 @@ def test_convert_table_no_type_warnings_for_all_supported_pg_columns() -> None:
     assert not any(
         w.classification is Classification.UNSUPPORTED for w in conv.warnings
     )
+
+
+def test_timetz_and_interval_pk_do_not_trigger_key_size_warning() -> None:
+    # Tier-3 #12 (real bug fixed): a timetz / interval PRIMARY KEY is a small fixed-width
+    # DSQL-supported key, but it used to hit the unbounded-varlen fallback (1025 bytes) and
+    # falsely trip the ">1024-byte key" warning. Adding TIMETZ/INTERVAL to _KEY_TYPE_BYTES
+    # sizes them correctly, so no false alarm -- while a genuinely oversized key still warns.
+    conv = SchemaConverter(source_type=SourceType.POSTGRES)
+    for typ in ("time with time zone", "timetz", "interval"):
+        table = TableDef(name="public.t", columns=[_col("k", typ, nullable=False)], primary_key=["k"])
+        assert not any("bytes combined" in w.message for w in conv.convert_table(table).warnings), typ
+    big = TableDef(
+        name="public.big",
+        columns=[_col("k", "character varying(2000)", nullable=False)],
+        primary_key=["k"],
+    )
+    assert any("bytes combined" in w.message for w in conv.convert_table(big).warnings)
+
+
+def test_pg_source_pk_strategy_is_inert_without_auto_increment() -> None:
+    # Tier-3 #9 (documented deferral tripwire): PG enrich never sets auto_increment_column,
+    # so IDENTITY_WITH_CACHE / CONVERT_TO_UUID PK strategies are no-ops for a PG serial/
+    # identity PK (and the monotonic hot-partition RECOMMENDATION never fires). This pins
+    # that inert behavior so it fails loudly when the deferred serial/identity refinement
+    # lands (introspector setting auto_increment_column for PG).
+    from dsql_migrator.core.converter import PrimaryKeyStrategy, SchemaConvertOptions
+    from dsql_migrator.core.models import ConversionNoteKind
+
+    table = TableDef(name="public.users", columns=[_col("id", "integer", nullable=False)], primary_key=["id"])
+    for strat in (PrimaryKeyStrategy.IDENTITY_WITH_CACHE, PrimaryKeyStrategy.CONVERT_TO_UUID):
+        r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(
+            table, SchemaConvertOptions(primary_key_strategy=strat)
+        )
+        upper = r.target_ddl.upper()
+        assert "GENERATED" not in upper and "UUID" not in upper  # strategy inert -> INT PK
+        assert not any(w.kind is ConversionNoteKind.RECOMMENDATION for w in r.warnings)
+
+
+def test_pg_source_emits_index_ddls_and_preserves_fk() -> None:
+    # Tier-3 #10: secondary indexes + foreign keys are handled for a PG source (NOT dropped
+    # by an is_postgres gate). CREATE [UNIQUE] INDEX ASYNC on the schema-qualified table,
+    # FK preserved as metadata, and a FK-removal warning.
+    from dsql_migrator.core.models import ForeignKeyDef, IndexDef
+
+    table = TableDef(
+        name="public.orders",
+        columns=[_col("id", "bigint", False), _col("email", "text", False), _col("cust", "bigint", False)],
+        primary_key=["id"],
+        indexes=[IndexDef(name="ix_email", columns=["email"], unique=True)],
+        foreign_keys=[ForeignKeyDef(name="fk_cust", columns=["cust"],
+                                    referenced_table="cust", referenced_columns=["id"])],
+    )
+    r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert any(
+        "CREATE UNIQUE INDEX ASYNC" in d and "ix_email" in d and '"public"."orders"' in d
+        for d in r.index_ddls
+    )
+    assert [f.name for f in r.preserved_foreign_keys] == ["fk_cust"]
+    assert any("foreign key" in w.message.lower() and "fk_cust" in w.message for w in r.warnings)
+
+
+def test_pg_source_multi_schema_emits_create_schema() -> None:
+    # Tier-3 #11: a schema-qualified PG table emits CREATE SCHEMA IF NOT EXISTS + a
+    # schema-qualified CREATE TABLE; an unqualified name emits no schema DDL.
+    conv = SchemaConverter(source_type=SourceType.POSTGRES)
+    q = conv.convert_table(TableDef(name="sales.orders", columns=[_col("id", "bigint", False)], primary_key=["id"]))
+    assert any('CREATE SCHEMA IF NOT EXISTS "sales"' in d for d in q.schema_ddls)
+    assert '"sales"."orders"' in q.target_ddl
+    u = conv.convert_table(TableDef(name="orders", columns=[_col("id", "bigint", False)], primary_key=["id"]))
+    assert not u.schema_ddls

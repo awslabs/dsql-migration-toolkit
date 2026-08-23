@@ -326,4 +326,56 @@ class DebeziumEventsTest {
     ChangeEvent event = DebeziumEvents.parse(record(key(1L), env, "users"));
     assertEquals("users", event.table());
   }
+
+  // --- Tier-3 TOAST regression guards -----------------------------------------
+
+  @Test
+  void multiToastBothStringAndByteaColumnsDropped() {
+    // A single UPDATE can leave MULTIPLE TOASTed columns unchanged: a text sentinel AND a
+    // bytea sentinel in one row -> BOTH omitted, the genuinely-changed column retained.
+    byte[] sentinelBytes =
+        DebeziumEvents.TOAST_UNAVAILABLE_PLACEHOLDER.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    Struct after = new Struct(TOAST_ROW).put("id", 1L)
+        .put("name", DebeziumEvents.TOAST_UNAVAILABLE_PLACEHOLDER)  // text sentinel
+        .put("body", "real")
+        .put("blob", sentinelBytes);                                // bytea sentinel
+    Struct env = new Struct(TOAST_ENVELOPE)
+        .put("op", "u").put("after", after).put("source", engineSource("postgresql", "docs"));
+    ChangeEvent event = DebeziumEvents.parse(record(key(1L), env, "dsqlcdc.app.docs"));
+    assertEquals(List.of("id", "body"), event.columns());  // both sentinels dropped
+  }
+
+  @Test
+  void allNonPkToastSentinelsYieldDoNothingUpsert() {
+    // When EVERY non-PK column is an unchanged TOAST value, only the PK survives -> the
+    // upsert must render DO NOTHING (idempotent no-op), never an empty/invalid SET.
+    byte[] sentinelBytes =
+        DebeziumEvents.TOAST_UNAVAILABLE_PLACEHOLDER.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    Struct after = new Struct(TOAST_ROW).put("id", 2L)
+        .put("name", DebeziumEvents.TOAST_UNAVAILABLE_PLACEHOLDER)
+        .put("body", DebeziumEvents.TOAST_UNAVAILABLE_PLACEHOLDER)
+        .put("blob", sentinelBytes);
+    Struct env = new Struct(TOAST_ENVELOPE)
+        .put("op", "u").put("after", after).put("source", engineSource("postgresql", "docs"));
+    ChangeEvent event = DebeziumEvents.parse(record(key(2L), env, "dsqlcdc.app.docs"));
+    assertEquals(event.pkColumns(), event.columns());  // only the PK remains
+    String sql = DsqlDialect.upsertSql(event.table(), event.columns(), event.pkColumns());
+    assertTrue(sql.trim().endsWith("DO NOTHING"), sql);
+  }
+
+  @Test
+  void absentConnectorRetainsSentinelColumn() {
+    // No source.connector -> not a known-PostgreSQL source -> the TOAST omit is NOT applied
+    // (safe default). A value equal to the sentinel is genuine data and MUST be retained.
+    Schema envNoConn = SchemaBuilder.struct().name("Envelope")
+        .field("op", Schema.STRING_SCHEMA).field("after", TOAST_ROW).field("source", SOURCE).build();
+    Struct after = new Struct(TOAST_ROW).put("id", 3L)
+        .put("name", DebeziumEvents.TOAST_UNAVAILABLE_PLACEHOLDER).put("body", "x").put("blob", null);
+    Struct env = new Struct(envNoConn).put("op", "u").put("after", after).put("source", source("docs"));
+    ChangeEvent event = DebeziumEvents.parse(record(key(3L), env, "dsqlcdc.app.docs"));
+    assertTrue(event.columns().contains("name"));  // NOT dropped for a non-PG source
+    assertEquals(
+        DebeziumEvents.TOAST_UNAVAILABLE_PLACEHOLDER,
+        event.values().get(event.columns().indexOf("name")));
+  }
 }

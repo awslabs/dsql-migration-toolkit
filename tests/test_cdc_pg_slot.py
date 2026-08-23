@@ -329,3 +329,18 @@ def test_write_engine_for_postgres_is_autocommit_and_unguarded() -> None:
         assert engine.get_execution_options().get("isolation_level") == "AUTOCOMMIT"
     finally:
         engine.dispose()
+
+
+def test_provision_does_not_drop_a_reused_publication_when_slot_creation_fails() -> None:
+    # Tier-3 #24: when provision REUSES an existing publication (created=False) and the slot
+    # create then fails, the compensating cleanup must NOT drop that publication -- we did not
+    # create it, and dropping an operator's/other pipeline's publication is a destructive,
+    # unaudited source write. Assert: no CREATE PUBLICATION and no DROP PUBLICATION issued.
+    conn = _FakeConn(pubs={"dsqlmig_pub_s": ["app.orders"]}, fail_slot_create=True)
+    with pytest.raises(RuntimeError):
+        provision_pg_replication(
+            conn, slot_name="dsqlmig_s", publication_name="dsqlmig_pub_s", tables=["app.orders"]
+        )
+    ops = [s.upper() for s in conn.writes()]
+    assert not any(s.startswith("CREATE PUBLICATION") for s in ops)  # reused, not created
+    assert not any(s.startswith("DROP PUBLICATION") for s in ops)   # so never compensated-dropped

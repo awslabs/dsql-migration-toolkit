@@ -1264,3 +1264,24 @@ def test_keyset_stream_postgres_dialect_emits_pg_sql_not_mysql() -> None:
     assert any('cast("doc" as text)' in s.lower() for s in selects)
     # Keyset predicate uses the PG-quoted PK.
     assert any('"id" > :last' in s for s in selects[1:])
+
+
+def test_shardable_leading_int_pk_postgres_membership() -> None:
+    # Tier-3 #13: PG reader sharding gates on shardable_leading_int_pk; a wrong
+    # membership/parse would drop rows or fail range reads. Lock it for the PG dialect.
+    from dsql_migrator.core.exporter import shardable_leading_int_pk
+    from dsql_migrator.core.source_dialect import PostgresSourceDialect
+
+    pg = PostgresSourceDialect()
+    for t in ("integer", "bigint", "smallint", "bigserial"):
+        table = TableDef(name="t", columns=[ColumnDef(name="id", mysql_type=t)], primary_key=["id"])
+        assert shardable_leading_int_pk(table, pg) == "id", t
+    comp = TableDef(
+        name="t",
+        columns=[ColumnDef(name="tenant_id", mysql_type="bigint"), ColumnDef(name="uid", mysql_type="uuid")],
+        primary_key=["tenant_id", "uid"],
+    )
+    assert shardable_leading_int_pk(comp, pg) == "tenant_id"  # composite-leading int
+    for t in ("uuid", "text", "numeric(10,0)", "timestamp with time zone"):
+        table = TableDef(name="t", columns=[ColumnDef(name="id", mysql_type=t)], primary_key=["id"])
+        assert shardable_leading_int_pk(table, pg) is None, t

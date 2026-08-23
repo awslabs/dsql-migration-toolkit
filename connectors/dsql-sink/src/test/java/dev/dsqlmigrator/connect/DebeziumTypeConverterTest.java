@@ -343,4 +343,45 @@ class DebeziumTypeConverterTest {
     assertInstanceOf(Timestamp.class, stored);
     assertEquals(Instant.ofEpochMilli(EPOCH_MS), ((Timestamp) stored).toInstant());
   }
+
+  // --- Tier-3 regression guards ------------------------------------------------
+
+  @Test
+  void dateEpochDayToSqlDateIsTimezoneIndependent() {
+    // io.debezium.time.Date is days-since-epoch. Converting via LocalDate.ofEpochDay is
+    // calendar-based (TZ-independent); a `new java.sql.Date(epochDay*86400000L)` would shift
+    // the day under a non-UTC JVM zone. Compare the LocalDate, not millis.
+    Object r0 = DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, 0L);
+    assertInstanceOf(java.sql.Date.class, r0);
+    assertEquals(java.time.LocalDate.of(1970, 1, 1), ((java.sql.Date) r0).toLocalDate());
+    long ed2024 = java.time.LocalDate.of(2024, 1, 1).toEpochDay();
+    assertEquals(
+        java.time.LocalDate.of(2024, 1, 1),
+        ((java.sql.Date) DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, ed2024)).toLocalDate());
+    long ed1900 = java.time.LocalDate.of(1900, 1, 1).toEpochDay(); // pre-epoch (negative)
+    assertEquals(
+        java.time.LocalDate.of(1900, 1, 1),
+        ((java.sql.Date) DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, ed1900)).toLocalDate());
+  }
+
+  @Test
+  void zonedTimestampKeepsMicroseconds() {
+    // io.debezium.time.ZonedTimestamp with sub-millisecond micros must not truncate to millis.
+    Timestamp ts = (Timestamp) DebeziumTypeConverter.convert(
+        DebeziumTypeConverter.ZONED_TIMESTAMP, "2024-01-01T00:00:00.123456Z");
+    assertEquals(123_456_000, ts.getNanos());
+    // A non-UTC offset resolves to the same instant AND keeps the micros.
+    Timestamp ts2 = (Timestamp) DebeziumTypeConverter.convert(
+        DebeziumTypeConverter.ZONED_TIMESTAMP, "2024-01-01T05:00:00.123456+05:00");
+    assertEquals(Instant.parse("2024-01-01T00:00:00.123456Z"), ts2.toInstant());
+  }
+
+  @Test
+  void arrayListPassesThroughUnchangedKnownGap() {
+    // Documented gap: a PG array (a List, no logical schema name) hits the default branch and
+    // is bound as-is. Arrays are unsupported DSQL COLUMN types (flagged at Schema Conversion),
+    // so one never reaches here as a real target column; this pins the pass-through contract.
+    java.util.List<Integer> arr = java.util.List.of(1, 2, 3);
+    assertTrue(DebeziumTypeConverter.convert(null, arr) == arr, "List passes through unchanged");
+  }
 }
