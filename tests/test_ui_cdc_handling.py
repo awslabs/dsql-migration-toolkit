@@ -822,6 +822,60 @@ class _FakeUi:
         return None
 
 
+def test_estimate_cdc_table_rows_threads_source_dialect(monkeypatch) -> None:
+    # Regression: the CDC topic-sizing estimate must run with the SOURCE-engine dialect, so
+    # a PostgreSQL source uses pg_class.reltuples -- not the MySQL information_schema default,
+    # which raises on PG and (under the broad except) silently returns None -> uniform
+    # partitions. Assert the dialect actually threaded through matches the source engine.
+    from types import SimpleNamespace
+    import dsql_migrator.core.watermark as wm
+    import dsql_migrator.ui.connect as connect
+    from dsql_migrator.config import SecretValue
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+    from dsql_migrator.core.source_dialect import MySQLSourceDialect, PostgresSourceDialect
+    from dsql_migrator.ui.data_migration._cdc_ui import _estimate_cdc_table_rows
+
+    class _RoConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    class _RoEngine:
+        def connect(self):
+            return _RoConn()
+
+        def dispose(self):
+            pass
+
+    seen = {}
+
+    def _fake_estimate(conn, tables, dialect):
+        seen["dialect"] = dialect
+        return {t: 42 for t in tables}
+
+    monkeypatch.setattr(connect, "make_source_engine_factory", lambda pw, **k: (lambda src: _RoEngine()))
+    monkeypatch.setattr(wm, "estimate_source_rows", _fake_estimate)
+
+    def _session(source_type):
+        return SimpleNamespace(
+            source_config=SourceConnectionConfig(
+                source_type=source_type, host="h", database="app", username="u"
+            ),
+            source_password=SecretValue("pw"),
+            has_source=lambda: True,
+        )
+
+    pg = _estimate_cdc_table_rows(_session(SourceType.POSTGRES), ["public.orders"])
+    assert pg == {"public.orders": 42}
+    assert isinstance(seen["dialect"], PostgresSourceDialect)  # NOT the MySQL default
+
+    my = _estimate_cdc_table_rows(_session(SourceType.MYSQL), ["orders"])
+    assert my == {"orders": 42}
+    assert isinstance(seen["dialect"], MySQLSourceDialect)
+
+
 def test_cdc_start_card_postgres_manual_is_resnapshot_without_coordinate_inputs() -> None:
     # PostgreSQL Manual renders a re-snapshot explanation (snapshot.mode=initial) with the
     # PG-worded radio labels -- NO GTID/binlog inputs, which Debezium PG cannot use.

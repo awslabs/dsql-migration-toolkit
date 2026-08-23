@@ -2918,22 +2918,41 @@ class SchemaConverter:
         # needs the Full Load value path), so the DDL keeps the faithful source type and
         # the user is told to remodel before applying. Property 6 (no silent loss).
         if is_postgres:
-            from dsql_migrator.core.converter_postgres import unsupported_dsql_reason
+            from dsql_migrator.core.converter_postgres import (
+                clamp_pg_numeric,
+                unsupported_dsql_reason,
+            )
 
             for column in table.columns:
                 reason = unsupported_dsql_reason(column.mysql_type)
-                if reason is None:
-                    continue
-                warnings.append(
-                    ConversionWarning(
-                        object_name=table.name,
-                        column_name=column.name,
-                        source_type=column.mysql_type,
-                        target_type=column.mysql_type,
-                        classification=Classification.UNSUPPORTED,
-                        message=reason,
+                if reason is not None:
+                    warnings.append(
+                        ConversionWarning(
+                            object_name=table.name,
+                            column_name=column.name,
+                            source_type=column.mysql_type,
+                            target_type=column.mysql_type,
+                            classification=Classification.UNSUPPORTED,
+                            message=reason,
+                        )
                     )
-                )
+                    continue
+                # A supported numeric whose precision/scale exceeds DSQL's 38/37 is clamped
+                # in the emitted DDL (converter_postgres._ddl_column_type); surface the
+                # lossy reduction here so it is not a silent range/scale change. Mirrors the
+                # MySQL DECIMAL clamp warning.
+                clamped, clamp_note = clamp_pg_numeric(column.mysql_type)
+                if clamp_note is not None:
+                    warnings.append(
+                        ConversionWarning(
+                            object_name=table.name,
+                            column_name=column.name,
+                            source_type=column.mysql_type,
+                            target_type=clamped,
+                            classification=Classification.MANUAL,
+                            message=clamp_note,
+                        )
+                    )
 
         # Apply DSQL structural constraints (Requirements 3.3, 3.5). Foreign keys
         # are never emitted by _build_source_ddl, so removal only requires

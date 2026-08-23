@@ -9,6 +9,7 @@ import sqlglot
 from dsql_migrator.core.converter import SchemaConverter
 from dsql_migrator.core.converter_postgres import (
     build_pg_source_ddl,
+    clamp_pg_numeric,
     normalize_pg_base_type,
     unsupported_dsql_reason,
 )
@@ -182,6 +183,49 @@ def test_convert_table_warns_on_array_column_for_pg_source() -> None:
     assert len(array_warnings) == 1
     # The supported uuid PK column is not flagged.
     assert not any(w.column_name == "id" for w in conv.warnings)
+
+
+def test_clamp_pg_numeric_reduces_over_precision_and_scale() -> None:
+    # Aurora DSQL caps numeric at precision 38 / scale 37. A PG numeric beyond that must be
+    # clamped (with a warning) -- otherwise the verbatim numeric(40,10) is REJECTED by DSQL
+    # at CREATE TABLE with no prior signal. Mirrors the MySQL DECIMAL clamp.
+    clamped, note = clamp_pg_numeric("numeric(40,10)")
+    assert clamped == "numeric(38,10)" and note and "precision 40" in note
+    clamped, note = clamp_pg_numeric("numeric(1000,500)")
+    assert clamped == "numeric(38,37)" and note and "precision 1000" in note and "scale 500" in note
+    # decimal/dec aliases + precision-only.
+    assert clamp_pg_numeric("decimal(50)")[0] == "decimal(38)"
+    # In-range, bare, and non-numeric types pass through untouched (no warning).
+    for ok in ("numeric(12,2)", "numeric(38,37)", "numeric", "uuid", "text"):
+        assert clamp_pg_numeric(ok) == (ok, None)
+
+
+def test_convert_table_clamps_over_precision_pg_numeric_with_warning() -> None:
+    # End-to-end: an over-precision PG numeric converts to a VALID DSQL DDL (clamped to
+    # <=38/37) AND carries a MANUAL warning naming the column, so the fidelity loss is
+    # surfaced instead of a silent apply-time CREATE TABLE failure.
+    table = TableDef(
+        name="prices",
+        columns=[
+            _col("id", "bigint", nullable=False),
+            _col("huge", "numeric(40,10)"),
+            _col("wild", "numeric(1000,500)"),
+            _col("ok", "numeric(12,2)"),
+        ],
+        primary_key=["id"],
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    ddl = conv.target_ddl.lower()  # sqlglot renders numeric as its `decimal` alias
+    assert "decimal(38, 10)" in ddl and "decimal(38, 37)" in ddl  # clamped to DSQL limits
+    assert "(40" not in ddl and "1000" not in ddl                 # originals gone
+    assert "decimal(12, 2)" in ddl                                # in-range unchanged
+    clamp_warns = {
+        w.column_name
+        for w in conv.warnings
+        if w.classification is Classification.MANUAL and "aurora dsql" in w.message.lower()
+    }
+    assert {"huge", "wild"} <= clamp_warns
+    assert "ok" not in clamp_warns  # the in-range column is not warned
 
 
 @pytest.mark.parametrize(

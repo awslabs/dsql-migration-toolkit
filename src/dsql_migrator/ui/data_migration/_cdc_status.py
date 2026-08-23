@@ -371,11 +371,19 @@ def _fetch_migration_row_counts(migration_state, session, table_names, inventory
         source_config = getattr(session, "source_config", None)
         has_password = getattr(session, "source_password", None) is not None
         if source_config is not None and session.has_source() and has_password:
+            # Thread the SOURCE-engine dialect so the scan-free estimate + max-PK reads use
+            # PostgreSQL SQL (pg_class.reltuples, double-quoted idents) for a PG source, not
+            # the MySQL default (information_schema.table_rows, backticks). Without it these
+            # reads raise on PG and the broad `except` below silently returns None -- the
+            # CDC-convergence monitor goes blind and could green-light a premature cutover.
+            from dsql_migrator.core.source_dialect import dialect_for
+
+            dialect = dialect_for(source_config.source_type)
             engine_factory = make_source_engine_factory(session.source_password)
             engine = engine_factory(source_config)
             with engine.connect() as connection:
-                source_counts = estimate_source_rows(connection, list(table_names))
-                source_max_pk = max_pk_source(connection, pk_by_table)
+                source_counts = estimate_source_rows(connection, list(table_names), dialect)
+                source_max_pk = max_pk_source(connection, pk_by_table, dialect)
                 # PostgreSQL CDC only: piggyback the source read-only connection to read
                 # the replication slot's WAL-retention health (a cheap pg_replication_slots
                 # SELECT), so the monitor can warn about WAL pressure before the source

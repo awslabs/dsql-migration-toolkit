@@ -694,13 +694,19 @@ def _estimate_cdc_table_rows(session, table_names):
         from dsql_migrator.core.watermark import estimate_source_rows
         from dsql_migrator.ui.connect import make_source_engine_factory
 
+        from dsql_migrator.core.source_dialect import dialect_for
+
         source_config = getattr(session, "source_config", None)
         has_password = getattr(session, "source_password", None) is not None
         if source_config is None or not session.has_source() or not has_password:
             return None
+        # Source-engine dialect (PG uses pg_class.reltuples, not MySQL information_schema)
+        # so a PostgreSQL source's per-table sizing estimate does not raise + fall back to
+        # the uniform partition default. Mirrors _full_load_engine's capture path.
+        dialect = dialect_for(source_config.source_type)
         engine = make_source_engine_factory(session.source_password)(source_config)
         with engine.connect() as connection:
-            estimates = estimate_source_rows(connection, list(table_names))
+            estimates = estimate_source_rows(connection, list(table_names), dialect)
         scoped = {n: int(c) for n, c in estimates.items() if c}
         return scoped or None
     except Exception:  # noqa: BLE001 - optional sizing signal; uniform fallback

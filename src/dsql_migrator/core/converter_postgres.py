@@ -66,6 +66,59 @@ _DSQL_SUPPORTED_PG_BASE_TYPES = frozenset(
 # timestamp(6) with time zone.
 _TYPE_MODIFIER_RE = re.compile(r"\(\s*\d+\s*(?:,\s*\d+\s*)?\)")
 
+# Aurora DSQL numeric limits (same as converter._DSQL_NUMERIC_*): precision 1-38, scale
+# 0-37. A PostgreSQL numeric(p,s) with a larger precision/scale is REJECTED by DSQL at
+# CREATE TABLE, so it must be clamped (with a warning) rather than emitted verbatim.
+_DSQL_NUMERIC_MAX_PRECISION = 38
+_DSQL_NUMERIC_MAX_SCALE = 37
+_NUMERIC_SPEC_RE = re.compile(
+    r"^\s*(numeric|decimal|dec)\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)\s*$", re.IGNORECASE
+)
+
+
+def clamp_pg_numeric(pg_type: str) -> "tuple[str, Optional[str]]":
+    """Clamp a PostgreSQL ``numeric(p[,s])`` to what Aurora DSQL accepts.
+
+    Returns ``(type_string, warning)``. When the declared precision (>38) or scale (>37)
+    exceeds DSQL's limits the spec is reduced and a warning describes the lost range/
+    places; otherwise the type is returned verbatim with ``None``. The MySQL path clamps
+    the same way (:func:`~dsql_migrator.core.converter._clamp_numeric_spec`); without this
+    a PostgreSQL ``numeric(40,10)`` would be emitted verbatim and DSQL would reject the
+    whole ``CREATE TABLE`` at apply time with no prior signal. A bare ``numeric`` (no
+    precision) is left untouched -- DSQL stores it at its default ``numeric(18,6)`` and the
+    value/validation layer already accounts for that. Non-numeric types pass through.
+    """
+    match = _NUMERIC_SPEC_RE.match(pg_type or "")
+    if match is None:
+        return pg_type, None
+    base = match.group(1)
+    precision = int(match.group(2))
+    scale = int(match.group(3)) if match.group(3) is not None else None
+    notes: list[str] = []
+    if precision > _DSQL_NUMERIC_MAX_PRECISION:
+        notes.append(
+            f"precision {precision} exceeds the Aurora DSQL maximum of "
+            f"{_DSQL_NUMERIC_MAX_PRECISION}"
+        )
+        precision = _DSQL_NUMERIC_MAX_PRECISION
+    if scale is not None and scale > _DSQL_NUMERIC_MAX_SCALE:
+        notes.append(
+            f"scale {scale} exceeds the Aurora DSQL maximum of {_DSQL_NUMERIC_MAX_SCALE}"
+        )
+        scale = _DSQL_NUMERIC_MAX_SCALE
+    if scale is not None and scale > precision:
+        notes.append(f"scale was further reduced to {precision} to fit the precision")
+        scale = precision
+    if not notes:
+        return pg_type, None
+    spec = f"{precision}" if scale is None else f"{precision},{scale}"
+    clamped = f"{base}({spec})"
+    return clamped, (
+        f"{pg_type} was reduced to {clamped} for Aurora DSQL ("
+        + "; ".join(notes)
+        + "); values beyond the reduced precision/scale will be rounded or rejected."
+    )
+
 
 def _ddl_column_type(pg_type: str) -> str:
     """The type string to emit in the rebuilt ``CREATE TABLE`` (usually verbatim).
@@ -82,7 +135,9 @@ def _ddl_column_type(pg_type: str) -> str:
     lowered = pg_type.lower()
     if lowered.startswith("interval") and " " in lowered:
         return _TYPE_MODIFIER_RE.sub("", pg_type).rstrip()
-    return pg_type
+    # Clamp an over-precision numeric(p,s) so the emitted DDL is valid for DSQL (the
+    # warning is surfaced separately by the converter -- see convert_table's PG branch).
+    return clamp_pg_numeric(pg_type)[0]
 
 
 def normalize_pg_base_type(pg_type: str) -> str:
@@ -222,6 +277,7 @@ def build_pg_source_ddl(table: TableDef) -> str:
 
 __all__ = [
     "build_pg_source_ddl",
+    "clamp_pg_numeric",
     "normalize_pg_base_type",
     "unsupported_dsql_reason",
 ]
