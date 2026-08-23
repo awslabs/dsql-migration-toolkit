@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Optional, Sequence
 from dsql_migrator.core.models import SourceType
 
 if TYPE_CHECKING:
+    from dsql_migrator.core.cdc_postgres import SlotHealth
     from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
 
 
@@ -338,6 +339,21 @@ class SourceDialect(ABC):
         seam. Every field is best-effort so an under-privileged source degrades to
         "unknown" (a non-blocking INFO) rather than erroring the gate. Read-only, so it
         passes the source read-only guard (only ``SHOW`` / ``SELECT`` on system views).
+        """
+
+    @abstractmethod
+    def read_replication_slot_health(
+        self, connection: object, slot_name: str
+    ) -> "Optional[SlotHealth]":
+        """Read a logical replication slot's WAL-retention health (PostgreSQL only).
+
+        Returns a :class:`~dsql_migrator.core.cdc_postgres.SlotHealth` from
+        ``pg_replication_slots`` (active / wal_status / safe_wal_size / restart_lsn /
+        confirmed_flush_lsn) so the CDC monitor can warn about WAL pressure before the
+        source disk fills. MySQL returns ``None`` (its binlog auto-expires -- no slot to
+        watch). Read-only (a plain ``SELECT`` on ``pg_replication_slots``) and best-effort
+        (any failure returns ``None``), so it never disturbs the read-only source or the
+        poll.
         """
 
 

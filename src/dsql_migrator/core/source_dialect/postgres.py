@@ -468,5 +468,42 @@ class PostgresSourceDialect(SourceDialect):
             replica_identity=identity,
         )
 
+    def read_replication_slot_health(self, connection: object, slot_name: str):
+        # Read the slot's WAL-retention health from pg_replication_slots (a plain
+        # SELECT -> passes the read-only guard). wal_status/safe_wal_size are PG13+; the
+        # tool targets PG13-16, and this is best-effort (any failure -> None) so it never
+        # disturbs the poll. 0 rows -> the slot does not exist (exists=False).
+        from dsql_migrator.core.cdc_postgres import SlotHealth
+
+        try:
+            row = connection.execute(  # type: ignore[attr-defined]
+                text(
+                    "SELECT active, wal_status, safe_wal_size, "
+                    "restart_lsn::text, confirmed_flush_lsn::text "
+                    "FROM pg_replication_slots WHERE slot_name = :name"
+                ),
+                {"name": slot_name},
+            ).first()
+        except Exception:  # noqa: BLE001 - best-effort; never fail the poll
+            return None
+        if row is None:
+            return SlotHealth(slot_name=slot_name, exists=False)
+
+        def _int(value):
+            try:
+                return int(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        return SlotHealth(
+            slot_name=slot_name,
+            exists=True,
+            active=bool(row[0]),
+            wal_status=str(row[1]) if row[1] is not None else None,
+            safe_wal_size=_int(row[2]),
+            restart_lsn=str(row[3]) if row[3] is not None else None,
+            confirmed_flush_lsn=str(row[4]) if row[4] is not None else None,
+        )
+
 
 __all__ = ["PostgresSourceDialect"]

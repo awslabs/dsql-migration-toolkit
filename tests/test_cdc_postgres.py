@@ -329,6 +329,67 @@ def test_dispatch_params_route_to_the_matching_engine_builder() -> None:
     assert pg_infra["EngineType"] == "postgres" and "SourceDbServerId" not in pg_infra
 
 
+def test_classify_slot_health_tones() -> None:
+    from dsql_migrator.core.cdc_postgres import SlotHealth, classify_slot_health
+
+    # Unknown / missing -> info (never a false all-clear).
+    assert classify_slot_health(None)[0] == "info"
+    assert classify_slot_health(SlotHealth("s", exists=False))[0] == "info"
+    # Invalidated slot -> error (gapless resume broken).
+    assert classify_slot_health(
+        SlotHealth("s", exists=True, active=True, wal_status="lost")
+    )[0] == "error"
+    # WAL pressure -> warning (unreserved / extended / no headroom).
+    for h in (
+        SlotHealth("s", exists=True, active=True, wal_status="unreserved"),
+        SlotHealth("s", exists=True, active=True, wal_status="extended"),
+        SlotHealth("s", exists=True, active=True, wal_status="reserved", safe_wal_size=-1),
+    ):
+        assert classify_slot_health(h)[0] == "warning"
+    # Inactive slot (no consumer) -> warning (WAL accumulating).
+    assert classify_slot_health(
+        SlotHealth("s", exists=True, active=False, wal_status="reserved")
+    )[0] == "warning"
+    # Active + reserved + headroom -> success.
+    assert classify_slot_health(
+        SlotHealth("s", exists=True, active=True, wal_status="reserved", safe_wal_size=1000)
+    )[0] == "success"
+
+
+def test_read_replication_slot_health_is_postgres_only() -> None:
+    from sqlalchemy import text  # noqa: F401 - documents the SELECT the fake matches
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    # MySQL: no slot to watch.
+    assert (
+        dialect_for(SourceType.MYSQL).read_replication_slot_health(object(), "s") is None
+    )
+
+    class _R:
+        def __init__(self, row):
+            self._row = row
+
+        def first(self):
+            return self._row
+
+    class _Conn:
+        def __init__(self, row):
+            self._row = row
+
+        def execute(self, statement, params=None):
+            assert "pg_replication_slots" in str(statement)
+            return _R(self._row)
+
+    pg = dialect_for(SourceType.POSTGRES)
+    health = pg.read_replication_slot_health(
+        _Conn((True, "reserved", 12345, "0/16B3748", "0/16B3800")), "dsqlmig_s"
+    )
+    assert health.exists and health.active and health.wal_status == "reserved"
+    assert health.safe_wal_size == 12345 and health.restart_lsn == "0/16B3748"
+    # 0 rows -> the slot does not exist.
+    assert pg.read_replication_slot_health(_Conn(None), "dsqlmig_s").exists is False
+
+
 def test_patch_plugin_params_fills_mysql_key_only_for_a_mysql_set() -> None:
     msrc = DebeziumSourceConfig(name="mysql-source", table_include_list=["app.orders"])
     mi = build_cdc_infra_params(

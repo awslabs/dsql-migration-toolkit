@@ -197,5 +197,10 @@ class MySQLSourceDialect(SourceDialect):
         # so there are no PostgreSQL-style facts to gather here.
         return None
 
+    def read_replication_slot_health(self, connection: object, slot_name: str):
+        # MySQL has no logical replication slot (its binlog auto-expires), so there is
+        # no WAL-retention health to report.
+        return None
+
 
 __all__ = ["MySQLSourceDialect"]

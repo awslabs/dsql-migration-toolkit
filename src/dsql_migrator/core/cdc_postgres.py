@@ -34,6 +34,7 @@ slot creation / offset handoff wiring is a subsequent phase.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal, Mapping, Optional, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -348,9 +349,92 @@ def dispatch_cdc_infra_params(source_config, sink_config, **kwargs) -> CdcInfraP
     return build_cdc_infra_params(source_config, sink_config, **kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Replication-slot health monitoring (WAL-pressure warning). A PostgreSQL logical
+# slot pins the source WAL until CDC consumes it; if CDC stalls or is stopped the
+# WAL accumulates and can fill the source disk. This surfaces that BEFORE it does.
+# MySQL has no analog (binlog auto-expires), so this is PostgreSQL-only.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SlotHealth:
+    """Read-only health of a PostgreSQL logical replication slot (pg_replication_slots).
+
+    ``active`` is whether a consumer (the CDC connector) is attached -- an inactive slot
+    still pins WAL. ``wal_status`` (PG13+) is 'reserved' (safe) / 'extended' (kept beyond
+    the safe limit) / 'unreserved' (WAL about to be removed) / 'lost' (WAL already gone --
+    the slot is invalidated and gapless resume is broken). ``safe_wal_size`` (PG13+) is
+    the bytes of WAL that can still be written before this slot risks losing required WAL
+    (a negative value means it is already past that). All optional/best-effort.
+    """
+
+    slot_name: str
+    exists: bool = False
+    active: bool = False
+    wal_status: Optional[str] = None
+    safe_wal_size: Optional[int] = None
+    restart_lsn: Optional[str] = None
+    confirmed_flush_lsn: Optional[str] = None
+
+
+def classify_slot_health(health: Optional[SlotHealth]) -> tuple[str, str, str]:
+    """Classify slot health into ``(tone, headline, detail)`` for a WAL-pressure notice.
+
+    Tones are the design-system notice tones (info / success / warning / error):
+
+    * ``error``   -- ``wal_status='lost'``: the slot is invalidated, required WAL was
+      removed, so CDC cannot resume gaplessly (a Full Load re-run is needed).
+    * ``warning`` -- WAL pressure: ``unreserved``/``extended``, a non-positive
+      ``safe_wal_size``, or an inactive slot (no consumer, so WAL is accumulating).
+    * ``success`` -- ``reserved`` and active (a healthy, consumed slot).
+    * ``info``    -- unknown (slot missing / status unreadable).
+
+    Pure (mirrors :func:`~dsql_migrator.core.cdc.classify_schema_drift`).
+    """
+    if health is None or not health.exists:
+        return (
+            "info",
+            "Replication slot status unavailable",
+            "Could not read the source replication slot's WAL retention.",
+        )
+    status = (health.wal_status or "").strip().lower()
+    if status == "lost":
+        return (
+            "error",
+            "Replication slot invalidated",
+            "The source removed WAL this slot needed, so CDC cannot resume gaplessly. "
+            "Re-run Full Load to re-establish a consistency point.",
+        )
+    low_headroom = health.safe_wal_size is not None and health.safe_wal_size <= 0
+    if status in ("unreserved", "extended") or low_headroom:
+        return (
+            "warning",
+            "Replication slot is pinning WAL",
+            "The source is retaining WAL for this slot beyond the safe limit. If CDC "
+            "does not catch up, the source disk can fill -- speed up or resume CDC, or "
+            "raise max_slot_wal_keep_size on the source.",
+        )
+    if not health.active:
+        return (
+            "warning",
+            "Replication slot has no consumer",
+            "CDC is not attached to the slot, so the source keeps accumulating WAL for "
+            "it. Resume CDC, or delete the CDC infrastructure to drop the slot.",
+        )
+    return (
+        "success",
+        "Replication slot healthy",
+        "The source replication slot is active and its WAL retention is within safe "
+        "limits.",
+    )
+
+
 __all__ = [
     "PG_DEFAULT_SOURCE_PORT",
     "PostgresSourceConfig",
+    "SlotHealth",
+    "classify_slot_health",
     "build_pg_source_config",
     "build_pg_cdc_infra_params",
     "build_pg_cdc_stack_params",
