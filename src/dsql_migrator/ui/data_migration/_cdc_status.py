@@ -303,6 +303,35 @@ def _single_int_pk_by_table(inventory, table_names) -> dict[str, str]:
     return out
 
 
+def _refresh_pg_slot_health(migration_state, source_config, connection) -> None:
+    """Read the PostgreSQL replication slot's WAL health onto ``migration_state``.
+
+    PostgreSQL-only and best-effort: reuses the already-open read-only source
+    ``connection`` to read ``pg_replication_slots`` for the deterministic slot name of
+    this session's CDC stack, and stores the :class:`SlotHealth` (or None) via
+    :meth:`set_cdc_slot_health`. A MySQL source (dialect returns None) or any failure
+    leaves it None. Never raises -- it must not disturb the row-count read.
+    """
+    try:
+        from dsql_migrator.core.models import SourceType
+
+        if getattr(source_config, "source_type", None) is not SourceType.POSTGRES:
+            migration_state.set_cdc_slot_health(None)
+            return
+        from dsql_migrator.core.cdc import CDC_DEFAULT_STACK_NAME
+        from dsql_migrator.core.cdc_pg_slot import pg_slot_name
+        from dsql_migrator.core.source_dialect import dialect_for
+
+        stack_name = getattr(migration_state, "cdc_stack_name", None) or CDC_DEFAULT_STACK_NAME
+        dialect = dialect_for(SourceType.POSTGRES)
+        health = dialect.read_replication_slot_health(
+            connection, pg_slot_name(stack_name)
+        )
+        migration_state.set_cdc_slot_health(health)
+    except Exception:  # noqa: BLE001 - best-effort; never disturb the counts read
+        pass
+
+
 def _fetch_migration_row_counts(migration_state, session, table_names, inventory=None):
     """Read source/target ``COUNT(*)`` and ``MAX(pk)`` per table (BLOCKING, read-only).
 
@@ -347,6 +376,11 @@ def _fetch_migration_row_counts(migration_state, session, table_names, inventory
             with engine.connect() as connection:
                 source_counts = estimate_source_rows(connection, list(table_names))
                 source_max_pk = max_pk_source(connection, pk_by_table)
+                # PostgreSQL CDC only: piggyback the source read-only connection to read
+                # the replication slot's WAL-retention health (a cheap pg_replication_slots
+                # SELECT), so the monitor can warn about WAL pressure before the source
+                # disk fills. Best-effort; MySQL's dialect returns None (no slot).
+                _refresh_pg_slot_health(migration_state, source_config, connection)
             source_available = True
     except Exception:  # noqa: BLE001 - read-only best effort; keep None on failure
         pass

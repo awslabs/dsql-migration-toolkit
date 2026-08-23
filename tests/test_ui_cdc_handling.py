@@ -614,3 +614,96 @@ def test_change_flow_shows_idle_for_a_drained_pipeline() -> None:
     text = " ".join(ui.texts)
     assert "pipeline idle" in text
     assert "Sink stalled" not in text
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL CDC replication-slot WAL-health monitor (Phase C6)
+# ---------------------------------------------------------------------------
+
+
+class _StubSlotState:
+    """Minimal migration-state stub for the slot-health fetch/render."""
+
+    def __init__(self, stack_name="mysql-dsql-cdc-stack"):
+        self.cdc_stack_name = stack_name
+        self.cdc_slot_health = "unset"
+
+    def set_cdc_slot_health(self, health):
+        self.cdc_slot_health = health
+
+
+def test_render_cdc_slot_health_panel() -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.cdc_postgres import SlotHealth
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _render_cdc_slot_health
+    from tests.test_ui_data_migration import _RecordingUi
+
+    # None / no slot -> nothing rendered (inherently MySQL-safe: MySQL never populates it).
+    ui = _RecordingUi()
+    _render_cdc_slot_health(ui, SimpleNamespace(cdc_slot_health=None))
+    assert ui.texts == []
+    ui2 = _RecordingUi()
+    _render_cdc_slot_health(ui2, SimpleNamespace(cdc_slot_health=SlotHealth("s", exists=False)))
+    assert ui2.texts == []
+
+    # Invalidated slot -> an error notice naming the problem.
+    ui3 = _RecordingUi()
+    _render_cdc_slot_health(
+        ui3,
+        SimpleNamespace(
+            cdc_slot_health=SlotHealth("s", exists=True, active=True, wal_status="lost")
+        ),
+    )
+    assert any("invalidated" in t.lower() for t in ui3.texts), ui3.texts
+
+    # Healthy slot -> a success notice.
+    ui4 = _RecordingUi()
+    _render_cdc_slot_health(
+        ui4,
+        SimpleNamespace(
+            cdc_slot_health=SlotHealth(
+                "s", exists=True, active=True, wal_status="reserved", safe_wal_size=1000
+            )
+        ),
+    )
+    assert any("healthy" in t.lower() for t in ui4.texts), ui4.texts
+
+
+def test_refresh_pg_slot_health_reads_for_pg_and_noops_for_mysql() -> None:
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+    from dsql_migrator.ui.data_migration._cdc_status import _refresh_pg_slot_health
+
+    class _R:
+        def __init__(self, row):
+            self._row = row
+
+        def first(self):
+            return self._row
+
+    class _Conn:
+        def __init__(self, row):
+            self._row = row
+
+        def execute(self, statement, params=None):
+            return _R(self._row)
+
+    # MySQL source -> the dialect has no slot, so health is set to None (never crashes).
+    mysql_state = _StubSlotState()
+    _refresh_pg_slot_health(
+        mysql_state,
+        SourceConnectionConfig(source_type=SourceType.MYSQL, host="db", database="app"),
+        _Conn(None),
+    )
+    assert mysql_state.cdc_slot_health is None
+
+    # PostgreSQL source -> reads pg_replication_slots for the stack's deterministic slot.
+    pg_state = _StubSlotState(stack_name="mysql-dsql-cdc-stack")
+    _refresh_pg_slot_health(
+        pg_state,
+        SourceConnectionConfig(source_type=SourceType.POSTGRES, host="pg", database="app"),
+        _Conn((True, "reserved", 999, "0/16B3748", "0/16B3800")),
+    )
+    assert pg_state.cdc_slot_health is not None
+    assert pg_state.cdc_slot_health.slot_name == "dsqlmig_mysql_dsql_cdc_stack"
+    assert pg_state.cdc_slot_health.wal_status == "reserved"
