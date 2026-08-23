@@ -51,6 +51,7 @@ class PostgresCdcFacts:
     max_replication_slots: Optional[int] = None
     used_replication_slots: Optional[int] = None
     max_wal_senders: Optional[int] = None
+    used_wal_senders: Optional[int] = None
     is_in_recovery: bool = False
     replica_identity: Mapping[str, str] = field(default_factory=dict)
 
@@ -122,20 +123,35 @@ def check_replication_role(facts: PostgresCdcFacts) -> PrerequisiteResult:
 def check_replication_slot_headroom(facts: PostgresCdcFacts) -> PrerequisiteResult:
     """WARN (non-blocking) when there is no room for another logical slot / WAL sender.
 
-    A new slot needs a free ``max_replication_slots`` entry and a free
-    ``max_wal_senders``. Unknown counts (unreadable) are a non-blocking INFO.
+    A new slot needs a free ``max_replication_slots`` entry AND a free ``max_wal_senders``
+    (the connector's walsender). A source whose OTHER replication (read replicas, other
+    CDC) has consumed the wal_sender pool has slot room but no sender room, so the connector
+    would fail to attach at Start with a confusing "all replication slots are in use"-style
+    error -- catch it here (WARN) instead. Unknown counts (unreadable) are a non-blocking
+    INFO.
     """
+    walsenders_full = (
+        facts.used_wal_senders is not None
+        and facts.max_wal_senders is not None
+        and facts.used_wal_senders >= facts.max_wal_senders
+    )
     if facts.max_replication_slots is None or facts.used_replication_slots is None:
         status = PrerequisiteStatus.INFO
         detail = "Could not read replication-slot capacity on the source."
-    elif facts.used_replication_slots >= facts.max_replication_slots or (
-        facts.max_wal_senders is not None and facts.max_wal_senders < 1
+    elif (
+        facts.used_replication_slots >= facts.max_replication_slots
+        or (facts.max_wal_senders is not None and facts.max_wal_senders < 1)
+        or walsenders_full
     ):
         status = PrerequisiteStatus.WARN
+        senders = (
+            f"{facts.used_wal_senders}/{facts.max_wal_senders}"
+            if facts.used_wal_senders is not None
+            else str(facts.max_wal_senders)
+        )
         detail = (
             f"{facts.used_replication_slots}/{facts.max_replication_slots} replication "
-            f"slots in use (max_wal_senders={facts.max_wal_senders}); no headroom for a "
-            "new CDC slot."
+            f"slots in use (wal_senders={senders}); no headroom for a new CDC slot/sender."
         )
     else:
         status = PrerequisiteStatus.PASS

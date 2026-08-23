@@ -1232,3 +1232,35 @@ def test_select_column_sql_wraps_spatial_in_st_asbinary() -> None:
     plain = d.select_column_sql(ColumnDef(name="name", mysql_type="VARCHAR(100)"))
     assert "ST_AsBinary" not in plain
     assert plain == "`name`"
+
+
+def test_keyset_stream_postgres_dialect_emits_pg_sql_not_mysql() -> None:
+    # Regression (#5): the PG-source read composition (dialect quoting + select_column_sql)
+    # inside keyset_stream is only unit-tested in isolation. A wiring regression that emits
+    # MySQL backticks or drops the jsonb text-cast passes every isolated test but breaks
+    # 100% of PostgreSQL Full Loads. Assert the composed SELECTs are PG-shaped.
+    from dsql_migrator.core.source_dialect import PostgresSourceDialect
+
+    rows = [{"id": i, "doc": "{}"} for i in range(1, 4)]
+    connection = _FakeConnection(rows)
+    table = TableDef(
+        name="public.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="doc", mysql_type="jsonb"),
+        ],
+        primary_key=["id"],
+    )
+    out = list(
+        keyset_stream(connection, table, batch_size=2, dialect=PostgresSourceDialect())
+    )
+    assert [r["id"] for r in out] == [1, 2, 3]
+    selects = [s for s, _ in connection.executed if s.strip().upper().startswith("SELECT")]
+    assert selects, "no SELECT emitted"
+    # PostgreSQL double-quoted identifiers, NEVER MySQL backticks.
+    assert all("`" not in s for s in selects)
+    assert any('"id"' in s for s in selects)
+    # jsonb is read via CAST(... AS text) so a JSON `null` is preserved as text, not parsed.
+    assert any('cast("doc" as text)' in s.lower() for s in selects)
+    # Keyset predicate uses the PG-quoted PK.
+    assert any('"id" > :last' in s for s in selects[1:])

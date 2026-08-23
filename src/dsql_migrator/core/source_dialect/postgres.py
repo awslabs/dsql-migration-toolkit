@@ -464,6 +464,13 @@ class PostgresSourceDialect(SourceDialect):
                 _scalar("SELECT count(*) FROM pg_replication_slots")
             ),
             max_wal_senders=_int(_scalar("SHOW max_wal_senders")),
+            # Active walsender backends (read replicas / other CDC + our own). A full pool
+            # means no sender for a new CDC slot even when slot entries are free.
+            used_wal_senders=_int(
+                _scalar(
+                    "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'walsender'"
+                )
+            ),
             is_in_recovery=bool(_scalar("SELECT pg_is_in_recovery()")),
             replica_identity=identity,
         )

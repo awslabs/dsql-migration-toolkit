@@ -2335,3 +2335,64 @@ def test_pg_checksum_unconstrained_numeric_rounds_to_dsql_default_scale() -> Non
     rendered = build_pg_checksum_sql(table).as_string(None)
     assert 'round("unconstrained", 6)' in rendered          # DSQL default scale, not 0
     assert 'round("scaled", 2)' in rendered                 # declared scale kept
+
+
+def test_pg_source_connection_shim_renders_composed_and_binds_params() -> None:
+    # Regression (#3): the PG-source validation adapter is on the critical path of EVERY PG
+    # validation read but was only ever monkeypatched away. It must render a psycopg
+    # Composed to text and thread params through exec_driver_sql -- and treat empty params
+    # as no-params (the `if params:` guard).
+    from types import SimpleNamespace
+    from dsql_migrator.core.models import ColumnDef, TableDef
+    from dsql_migrator.core.validation_sql import (
+        build_pg_checksum_sql,
+        build_pg_pk_next_page_sql,
+    )
+    from dsql_migrator.core.validator_postgres import PgSourceConnection
+
+    class _Res:
+        def __init__(self, rows):
+            self._rows = list(rows)
+
+        def fetchone(self):
+            return self._rows[0] if self._rows else None
+
+        def fetchall(self):
+            return list(self._rows)
+
+    class _SqlaConn:
+        def __init__(self, rows):
+            self.rows = rows
+            self.calls: list = []
+            # driver_connection=None so Composed.as_string(None) renders offline.
+            self.connection = SimpleNamespace(driver_connection=None)
+
+        def exec_driver_sql(self, sql, params=None):
+            self.calls.append((sql, params))
+            return _Res(self.rows)
+
+    table = TableDef(
+        name="app.orders",
+        columns=[ColumnDef(name="id", mysql_type="bigint", target_type="bigint")],
+        primary_key=["id"],
+    )
+    sqla = _SqlaConn([(10,), (11,)])
+    cur = PgSourceConnection(sqla).cursor()
+
+    # (1) Parameterized keyset page -> rendered %(last)s + params threaded through.
+    cur.execute(build_pg_pk_next_page_sql(table, "id", 500), {"last": 10})
+    text, params = sqla.calls[-1]
+    assert '"id" > %(last)s' in text and "LIMIT 500" in text
+    assert params == {"last": 10}
+    assert cur.fetchall() == [(10,), (11,)]
+
+    # (2) A no-param Composed (checksum) takes the no-params exec branch.
+    sqla.calls.clear()
+    cur.execute(build_pg_checksum_sql(table))
+    assert sqla.calls[-1][1] is None
+    assert cur.fetchone() == (10,)
+
+    # (3) The `if params:` guard treats an empty dict as no-params too.
+    sqla.calls.clear()
+    cur.execute(build_pg_pk_next_page_sql(table, "id", 5), {})
+    assert sqla.calls[-1][1] is None

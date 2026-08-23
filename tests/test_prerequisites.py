@@ -721,3 +721,39 @@ def test_exclusion_never_drops_a_pk_from_the_primary_key_check() -> None:
         _result(report, PrerequisiteCheckId.TABLE_PRIMARY_KEY, "app.docs").status
         is PrerequisiteStatus.PASS
     )
+
+
+def test_check_replication_slot_headroom_states() -> None:
+    # Regression + enhancement (#8): the headroom prereq WARNs when there is no room for a
+    # new CDC slot OR walsender, INFOs on unknown counts (never a false FAIL), PASSes when
+    # healthy. Non-blocking (required=False) either way.
+    from dsql_migrator.core.prerequisites_postgres import (
+        PostgresCdcFacts,
+        check_replication_slot_headroom,
+    )
+
+    S = PrerequisiteStatus
+    healthy = check_replication_slot_headroom(
+        PostgresCdcFacts(max_replication_slots=10, used_replication_slots=2,
+                         max_wal_senders=10, used_wal_senders=2)
+    )
+    assert healthy.status is S.PASS and healthy.required is False
+    # Slots exhausted -> WARN.
+    assert check_replication_slot_headroom(
+        PostgresCdcFacts(max_replication_slots=5, used_replication_slots=5,
+                         max_wal_senders=10, used_wal_senders=1)
+    ).status is S.WARN
+    # Degenerate max_wal_senders=0 -> WARN.
+    assert check_replication_slot_headroom(
+        PostgresCdcFacts(max_replication_slots=10, used_replication_slots=0,
+                         max_wal_senders=0)
+    ).status is S.WARN
+    # NEW: walsender pool exhausted even with FREE slots -> WARN (was PASS before #8).
+    walsender_full = check_replication_slot_headroom(
+        PostgresCdcFacts(max_replication_slots=10, used_replication_slots=1,
+                         max_wal_senders=5, used_wal_senders=5)
+    )
+    assert walsender_full.status is S.WARN and "5/5" in walsender_full.detail
+    # Unknown counts -> INFO, never a blocking failure.
+    info = check_replication_slot_headroom(PostgresCdcFacts(max_replication_slots=None))
+    assert info.status is S.INFO and info.required is False
