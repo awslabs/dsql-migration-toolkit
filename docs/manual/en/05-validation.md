@@ -41,7 +41,9 @@ count-matched tables are reported as "not deeply checked" (not as a false match)
 > checksum and listed in the report as **"not value-compared."** A value difference
 > confined to such a **non-key** column is therefore not caught by any mode (row count
 > is unchanged by an in-place edit, and reconcile compares PK *presence*, not values).
-> Key columns and every other type are still fully compared.
+> Key columns and every other type are still fully compared. Column count is **not**
+> a checksum limit — a very wide table's columns are hashed in groups (nested MD5) so
+> the checksum stays within DSQL's 100-argument function cap.
 
 ---
 
