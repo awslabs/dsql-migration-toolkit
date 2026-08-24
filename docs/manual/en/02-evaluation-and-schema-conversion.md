@@ -212,7 +212,9 @@ handles the dialect and constraint bridging automatically:
   `BIT(n)` → integer, `ENUM` → `text` + `CHECK`, `BLOB`/`BINARY` → `bytea`, etc.;
   see [§2.3](#23-mysql--dsql-type-and-constraint-handling-reference) below).
 - **Column defaults** — a source `DEFAULT` is carried across (Aurora DSQL supports
-  them), including `DEFAULT CURRENT_TIMESTAMP`. Two translations happen for you:
+  them), including `CURRENT_TIMESTAMP` **and its fractional `CURRENT_TIMESTAMP(n)`**,
+  `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, and `LOCALTIME`/`LOCALTIMESTAMP`. Two
+  translations happen for you:
   a `TINYINT(1)` default becomes `TRUE`/`FALSE` for the `boolean` target, and a
   `DATETIME` default is pinned to UTC so it matches the naive-UTC values the loader
   writes. This matters most for a **`NOT NULL` column with a default**: MySQL accepts
@@ -298,7 +300,7 @@ conversion (redesign).
 
 | MySQL type | Aurora DSQL type | Stored value form | Class | Note |
 |---|---|---|---|---|
-| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | Precision/scale preserved. **Precision > 38 is UNSUPPORTED** (DSQL caps NUMERIC at 38). |
+| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | Precision/scale preserved. **Precision > 38** → Evaluation flags it **UNSUPPORTED** (DSQL caps NUMERIC at 38); Schema Conversion still emits DDL by **clamping to `numeric(38,37)`** with a data-loss warning (scale is also capped at 37). |
 | `DECIMAL(p,s) UNSIGNED` | `numeric(p,s)` | `numeric(p,s)` | AUTO | Unsigned-ness is not representable and carries no storage meaning. |
 | `FLOAT` | `real` | `real` | AUTO | Single-precision float. |
 | `FLOAT(M,D)` | `real` | `real` | AUTO | The `(M,D)` display spec is dropped (PostgreSQL `float` takes one precision, not a scale). |
@@ -330,6 +332,12 @@ conversion (redesign).
 | `JSON` | `json` | `json` | AUTO | (CDC wraps the JSON text in a `PGobject(type=json)` so it targets the `json` column.) |
 | spatial (`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL has no spatial type; the data is **preserved** as raw WKB bytes (Full Load reads `ST_AsBinary(col)`, CDC extracts Debezium geometry's `.wkb`; **SRID is dropped**). The `geometry` *column type* itself is flagged MANUAL (auto-substituted to `bytea`, WKB preserved), so the values are not lost. |
 
+> **A `bytea` column cannot be a key on DSQL.** Any column that maps to `bytea`
+> (`BINARY`/`VARBINARY`, `*BLOB`, or spatial) **cannot** be part of a primary key or
+> index: a PK over such a column makes the table **UNSUPPORTED**, and a secondary
+> index on it is **dropped (MANUAL)**. Re-key as `text`/`uuid` or a hash column. See
+> the Structural constraints below.
+
 ### Structural constraints
 
 | DSQL rule | What the tool does |
@@ -340,11 +348,17 @@ conversion (redesign).
 | **One DDL per transaction** | Schema conversion emits exactly one DDL statement per execution unit. |
 | **`CREATE INDEX ASYNC`** | Secondary indexes are created asynchronously, after data. |
 | **Optimistic concurrency** | Every batch and DDL is wrapped in `40001` retry. |
-| **Column defaults ARE supported** | A source `DEFAULT` is carried across, including `DEFAULT CURRENT_TIMESTAMP`. `TINYINT(1)` defaults become `TRUE`/`FALSE` (a `boolean` column rejects `DEFAULT 1`), a `DATETIME` default is pinned to UTC to match the loader's naive-UTC values, and `UUID()` becomes `gen_random_uuid()`. A default with no DSQL equivalent is dropped and **reported**, never silently lost. Keeping the default matters most on a `NOT NULL` column: MySQL accepts an `INSERT` that omits it, the target would not. |
+| **Column defaults ARE supported** | A source `DEFAULT` is carried across, including `CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, and `LOCALTIME`/`LOCALTIMESTAMP`. `TINYINT(1)` defaults become `TRUE`/`FALSE` (a `boolean` column rejects `DEFAULT 1`), a `DATETIME` default is pinned to UTC to match the loader's naive-UTC values, and function defaults are translated (`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`CURRENT_TIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC expressions). A default with no DSQL equivalent (e.g. one referencing another column) is dropped and **reported**, never silently lost. Keeping the default matters most on a `NOT NULL` column: MySQL accepts an `INSERT` that omits it, the target would not. |
 | **No `ON UPDATE CURRENT_TIMESTAMP`** | Unreproducible: DSQL has neither an `ON UPDATE` clause nor triggers (the usual PostgreSQL workaround). The column keeps its insert-time default and is flagged **MANUAL** — set the timestamp explicitly on update in your application. |
 | **No triggers / stored procedures / events** | Flagged **UNSUPPORTED** — reimplement in the application (or EventBridge/Lambda for scheduled events). |
 | **No native partitioning** | DSQL auto-distributes; partitioned tables are flagged MANUAL. |
 | **One database per cluster** | A multi-database source is flagged MANUAL (consolidate into schemas or split clusters). |
+| **Source `CHECK` constraints are dropped** | A MySQL `CHECK` (8.0.16+) is **not** carried to the target (its functions/operators may differ on PostgreSQL) and is flagged **MANUAL** — re-add a DSQL-compatible `CHECK` by hand or enforce it in the app. (The `CHECK … IN (...)` the tool *generates* for an `ENUM` is unaffected.) |
+| **`bytea` cannot be a key** | A `bytea` column (from `BINARY`/`VARBINARY`, `*BLOB`, or spatial) cannot be a **primary-key** column (table → **UNSUPPORTED**) or an **index** column (index dropped → **MANUAL**). Re-key as `text`/`uuid`/hash. |
+| **≤ 8 columns per key** | A primary key or index over more than 8 columns exceeds DSQL's limit: the PK case is **UNSUPPORTED**, an over-wide secondary index is **dropped (MANUAL)**. |
+| **≤ 24 indexes per table** | DSQL allows at most 24 indexes per table (the PK counts, so ≤ 23 secondary). Excess indexes are flagged and not all emitted. |
+| **≤ 1 KiB key value** | The combined key value must stay under ~1 KiB; a wide key is flagged as a **recommendation** (it can fail at insert time on real data). |
+| **63-byte identifiers** | DSQL/PostgreSQL truncate identifiers to 63 bytes; where truncation would collide two names, the object is flagged **UNSUPPORTED** (rename to keep the first 63 bytes unique). |
 
 The **Class** column above uses the same AUTO / MANUAL / UNSUPPORTED scale Evaluation
 applies to every object — see [§2.1](#every-object-gets-one-classification) for what each
