@@ -27,6 +27,10 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
 
 - 네트워크로 접근 가능한 소스 **Amazon RDS 또는 Aurora MySQL**. 스키마와 데이터를 읽을 수 있는
   사용자면 됩니다(읽기 전용으로 충분합니다 — 도구는 소스에 절대 쓰지 않습니다).
+  - **지원 소스 엔진 및 버전**(Full Load + CDC + 체크섬 검증까지 end-to-end 검증됨):
+    **RDS for MySQL** 5.7 / 8.0 / 8.4, **Aurora MySQL** 5.7(v2) / 8.0(v3) / 8.4.
+    MySQL 5.7은 표준 지원이 종료됐지만(RDS/Aurora Extended Support 적용될 수 있음), 도구는
+    마이그레이션 소스로 5.7을 완전히 지원합니다.
 - 도구를 실행할 리전과 **동일한 리전**의 타깃 **Amazon Aurora DSQL** 클러스터. (DSQL은 IAM 토큰
   인증을 쓰므로 관리할 비밀번호가 없습니다.)
 

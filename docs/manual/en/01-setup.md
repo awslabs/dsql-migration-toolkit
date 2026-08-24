@@ -30,6 +30,11 @@ You connect to the **same** source and target either way; only where the tool
 - A source **Amazon RDS or Aurora MySQL** database you can reach over the
   network, with a user that can read the schema and data (read-only is enough —
   the tool never writes to the source).
+  - **Supported source engines & versions** (validated end-to-end — Full Load +
+    CDC + checksum validation): **RDS for MySQL** 5.7 / 8.0 / 8.4, and **Aurora
+    MySQL** 5.7 (v2) / 8.0 (v3) / 8.4. MySQL 5.7 is past end of standard support
+    (RDS/Aurora Extended Support may apply), but the tool fully supports it as a
+    migration source.
 - A target **Amazon Aurora DSQL** cluster in the **same AWS region** as you'll
   run the tool. (DSQL uses IAM-token auth — there is no password to manage.)
 
