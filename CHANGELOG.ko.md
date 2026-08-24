@@ -5,6 +5,16 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.394
+
+### 변경 (Changed)
+
+- **앱 이미지를 `0.1.393`으로 재게시하고 기본값을 그것으로 repoint했습니다.** `0.1.393`
+  이미지(MySQL 8.4 + 5.7 소스 호환성 수정)를 ECR Public(`z0q0i9j0`)과 두 프라이빗
+  ECR(us-east-1, ap-northeast-2)에 푸시하고, `cloudformation.yaml`의 `ContainerImageUri`
+  기본값을 `0.1.390 → 0.1.393`으로 repoint해 fresh `git clone` 배포가 8.4/5.7 대응 빌드를
+  받도록 했습니다.
+
 ## v0.1.393
 
 ### 수정 (Fixed)
