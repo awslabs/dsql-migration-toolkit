@@ -5,6 +5,16 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.391
+
+### 変更 (Changed)
+
+- **`0.1.390` アプリイメージを再公開し、デフォルトをそれに向け直しました。** `0.1.390` イメージ(CDC
+  applied-ops のウィンドウ修正 + `0.1.388/389` の AI 信頼性修正)を ECR Public(`z0q0i9j0`)と
+  private ECR 2つ(us-east-1、ap-northeast-2)へプッシュし、`cloudformation.yaml` の
+  `ContainerImageUri` デフォルトを `0.1.387 → 0.1.390` に更新して、新規の git-clone デプロイが
+  これを取得するようにしました。
+
 ## v0.1.390
 
 ### 修正 (Fixed)

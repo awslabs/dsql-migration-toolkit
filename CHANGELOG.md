@@ -5,6 +5,16 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.391
+
+### Changed
+
+- **Republished the `0.1.390` app image and repointed the default to it.** The `0.1.390`
+  image (CDC applied-ops windowing fix + the `0.1.388/389` AI-reliability fixes) was
+  pushed to ECR Public (`z0q0i9j0`) and both private ECRs (us-east-1, ap-northeast-2),
+  and `cloudformation.yaml`'s `ContainerImageUri` default was bumped `0.1.387 → 0.1.390`
+  so a fresh git-clone deploy pulls it.
+
 ## v0.1.390
 
 ### Fixed
