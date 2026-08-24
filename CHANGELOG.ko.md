@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.389
+
+### 수정 (Fixed)
+
+- **추론이 많은 턴(헤더 "What's next?" 브리핑, Query Converter "Tune" 등)에서 AI DBA가 "AI reply
+  unavailable / 파싱 불가"로 실패하던 문제를 고쳤습니다.** Claude 5 모델은 기본으로 extended
+  thinking을 하고 thinking 토큰이 `max_tokens`에 포함되므로, 다중 툴/무거운 턴에서 예산을 전부
+  thinking에 써버려 답변 텍스트가 안 나올 수 있었습니다. 예산 상향(v0.1.382)만으론 빈도만 줄었습니다.
+  이 답변들은 그라운디드(툴 결과+시스템 컨텍스트가 사실을 제공)하고 간결하게 유지되므로, 모든
+  AI-DBA 생성에서 extended thinking을 **비활성화**(chat/tool-chat/guidance 바디에 `thinking:
+  {type: disabled}`)했습니다. 전체 예산이 답변에 쓰여 빈-thinking 실패가 발생할 수 없습니다.
+
 ## v0.1.388
 
 ### 변경 (Changed)

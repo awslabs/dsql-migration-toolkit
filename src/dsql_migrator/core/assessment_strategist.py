@@ -86,10 +86,22 @@ _ASSESSMENT_MAX_TOKENS = 8192
 # EVERY interactive AI DBA turn -- object guidance, plain grounded chat
 # (stream_chat), and tool-calling chat (tool_chat), incl. Query Converter tuning
 # and the CDC error chat that delegates here. Single source of truth for the
-# persistent panel: one place to tune the chat budget. Must fit the model's
-# thinking budget PLUS a full answer, so it is generous even though _RESPONSE_STYLE
-# keeps the visible answer short.
+# persistent panel: one place to tune the chat budget. With extended thinking
+# DISABLED (see _THINKING_OFF) the whole budget is available for the answer.
 _CHAT_MAX_TOKENS = 8192
+
+# The current models (Claude 5 family) do EXTENDED THINKING by default, and thinking
+# tokens count against max_tokens. On a reasoning-heavy / multi-tool turn the model
+# could spend the ENTIRE budget on thinking and stop (stop_reason="max_tokens") with
+# only a thinking block -- no answer text -- which surfaced to the user as "AI reply
+# unavailable / could not be parsed" (seen on Query Converter "Tune" and the header
+# "What's next?" briefing). Raising the cap only reduced the frequency; it never
+# eliminated the tail. Since these replies are GROUNDED (tool results + the system
+# context carry the facts, not deep model reasoning) and _RESPONSE_STYLE keeps them
+# concise, we turn thinking OFF for every AI-DBA generation: the full budget goes to
+# the answer, so the empty-thinking failure cannot occur. (sonnet-5 rejects
+# thinking.type.enabled/budget -- "disabled" is the supported off switch here.)
+_THINKING_OFF = {"type": "disabled"}
 
 # Upper bound on the running multi-turn chat transcript (characters) sent to the
 # model per turn. Bounds token cost / context growth on a long conversation: the
@@ -1011,6 +1023,7 @@ def _build_chat_body(
         {
             "anthropic_version": _ANTHROPIC_VERSION,
             "max_tokens": max_tokens,
+            "thinking": _THINKING_OFF,
             "system": system,
             "messages": [
                 {
@@ -1614,6 +1627,7 @@ class AssessmentStrategist:
                     {
                         "anthropic_version": _ANTHROPIC_VERSION,
                         "max_tokens": _CHAT_MAX_TOKENS,
+                        "thinking": _THINKING_OFF,
                         "system": system + _RESPONSE_STYLE,
                         "tools": list(tools),
                         "messages": convo,

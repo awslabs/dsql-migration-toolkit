@@ -688,6 +688,12 @@ def _build_invoke_body(prompt: str, max_tokens: int = _MAX_TOKENS) -> str:
     body = {
         "anthropic_version": _ANTHROPIC_VERSION,
         "max_tokens": max_tokens,
+        # Turn OFF extended thinking (Claude 5 does it by default): thinking tokens
+        # count against max_tokens, so a reasoning-heavy turn could spend the whole
+        # budget on thinking and emit no answer text -- surfacing as "AI reply
+        # unavailable / could not be parsed". These replies are grounded (context +
+        # deterministic facts carry the load), so the full budget goes to the answer.
+        "thinking": {"type": "disabled"},
         "messages": [
             {"role": "user", "content": [{"type": "text", "text": prompt}]}
         ],

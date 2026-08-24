@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.389
+
+### Fixed
+
+- **AI DBA no longer fails with "AI reply unavailable / could not be parsed" on
+  reasoning-heavy turns (e.g. the header "What's next?" briefing, Query Converter
+  "Tune").** The Claude 5 models do extended thinking by default and thinking tokens
+  count against `max_tokens`, so a multi-tool / heavy turn could spend the whole budget
+  on thinking and stop with no answer text. Raising the cap (v0.1.382) only reduced the
+  frequency. Since these replies are grounded (tool results + system context carry the
+  facts) and kept concise, extended thinking is now **disabled** for every AI-DBA
+  generation (`thinking: {type: disabled}` on the chat, tool-chat, and guidance bodies),
+  so the full budget goes to the answer and the empty-thinking failure can't occur.
+
 ## v0.1.388
 
 ### Changed

@@ -5,6 +5,19 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.389
+
+### 修正 (Fixed)
+
+- **推論の多いターン(ヘッダーの「What's next?」ブリーフィング、Query Converter の「Tune」など)で
+  AI DBA が「AI reply unavailable / 解析不可」で失敗する問題を修正しました。** Claude 5 モデルは
+  既定で extended thinking を行い、thinking トークンが `max_tokens` に計上されるため、マルチツール/
+  重いターンで予算を thinking に使い切って回答テキストが出ないことがありました。上限引き上げ
+  (v0.1.382)では頻度が下がるだけでした。これらの回答はグラウンデッド(ツール結果+システム
+  コンテキストが事実を担う)で簡潔なため、すべての AI-DBA 生成で extended thinking を**無効化**
+  (chat/tool-chat/guidance ボディに `thinking: {type: disabled}`)しました。予算全体が回答に使われ、
+  空 thinking の失敗が起こり得なくなります。
+
 ## v0.1.388
 
 ### 変更 (Changed)
