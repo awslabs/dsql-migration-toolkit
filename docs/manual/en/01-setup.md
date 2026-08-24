@@ -11,14 +11,18 @@ open in my browser and connected to both my source and my Aurora DSQL target."
 > and the UI is already open at your `AppUrl`, skip ahead to [§1.5 Connect](#15-connect-to-your-source-and-target).
 > This chapter also covers running locally, which the deployment guide does not.
 
-There are two ways to run the tool:
+There are three ways to run the tool:
 
 - **Local** — run it on your laptop/workstation for evaluation and smaller
   migrations. Fastest to start.
 - **On AWS (ECS Fargate)** — the deployed form most teams use for real
   migrations, reached through a web endpoint behind an Application Load Balancer.
+- **On AWS (single EC2 host, from source)** — for accounts that can't use
+  containers/ECR or AWS Lambda: the tool runs straight from source (`git clone` +
+  `uv sync` + a **systemd** service) on one in-VPC EC2 host, reached over an SSM
+  port-forward (no ECS/ALB/image). → [§1.4](#14-run-on-a-single-ec2-host-from-source).
 
-You connect to the **same** source and target either way; only where the tool
+You connect to the **same** source and target in every case; only where the tool
 *process* runs differs.
 
 ---
