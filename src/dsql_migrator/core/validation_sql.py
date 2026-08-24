@@ -29,6 +29,20 @@ from dsql_migrator.core.models import ColumnDef, ForeignKeyDef, TableDef
 # PostgreSQL's signed bigint, so equal data yields equal checksums on both.
 _CHECKSUM_HEX_DIGITS = 15
 
+# PostgreSQL / Aurora DSQL cap a function call at FUNC_MAX_ARGS = 100 arguments, so
+# ``concat_ws('|', v1, ..., vN)`` (N+1 args) fails at N >= 100 with "cannot pass more
+# than 100 arguments to a function". A table can legitimately have up to 255 columns
+# (see the assessor's column limit), so a wide table's per-row checksum would error on
+# the target. When the term count would exceed the limit, the per-row token NESTS MD5s:
+# hash each group of <= _CONCAT_MAX_TERMS rendered columns, then MD5 the group hashes.
+# The nesting is applied IDENTICALLY on both engines so equal data still hashes equally
+# (MySQL's own argument limit is higher, but the nested shape MUST match to compare).
+# Group MD5s are 32 lowercase hex chars on both engines (no '|'/'~'), so the outer
+# concat needs no re-escaping and stays injective; group order is fixed, so the nested
+# form is exactly as deterministic as the flat one. A count <= _CONCAT_MAX_TERMS emits
+# the ORIGINAL flat SQL unchanged, so narrow tables (and their golden tests) don't move.
+_CONCAT_MAX_TERMS = 96
+
 
 def _quote_mysql_identifier(name: str) -> str:
     """Quote a MySQL identifier with backticks, escaping embedded backticks."""
@@ -305,6 +319,33 @@ def _pg_checksum_expr(column: "ColumnDef") -> "Optional[sql.Composed]":
 # ---------------------------------------------------------------------------
 
 
+def _chunk_terms(terms: list, size: int = _CONCAT_MAX_TERMS) -> list:
+    """Split ``terms`` into ordered groups of at most ``size`` (order preserved)."""
+    return [terms[i : i + size] for i in range(0, len(terms), size)]
+
+
+def _mysql_md5_concat(terms: list[str]) -> str:
+    """``MD5(CONCAT_WS('|', ...))`` over ``terms``, nesting per group of
+    ``_CONCAT_MAX_TERMS`` when the term count would exceed the PG/DSQL 100-argument
+    limit. A count within the limit returns the ORIGINAL flat expression unchanged.
+    """
+    if len(terms) <= _CONCAT_MAX_TERMS:
+        return f"MD5(CONCAT_WS('|', {', '.join(terms)}))"
+    groups = [f"MD5(CONCAT_WS('|', {', '.join(g)}))" for g in _chunk_terms(terms)]
+    return f"MD5(CONCAT_WS('|', {', '.join(groups)}))"
+
+
+def _pg_md5_concat(terms: list) -> "sql.Composed":
+    """PostgreSQL counterpart of :func:`_mysql_md5_concat` (byte-identical nesting:
+    same group size, same order, lowercase hex group hashes)."""
+    def _one(group: list) -> "sql.Composed":
+        return sql.SQL("md5(concat_ws('|', {t}))").format(t=sql.SQL(", ").join(group))
+
+    if len(terms) <= _CONCAT_MAX_TERMS:
+        return _one(terms)
+    return _one([_one(g) for g in _chunk_terms(terms)])
+
+
 def _mysql_row_token(table: TableDef) -> str:
     """MySQL per-row checksum token: the integer value of the first
     ``_CHECKSUM_HEX_DIGITS`` MD5 hex digits over the row's rendered column values.
@@ -316,16 +357,16 @@ def _mysql_row_token(table: TableDef) -> str:
     paged sub-sum can never drift from the whole-table sum (a drift would silently
     mismatch checksums). FLOAT/DOUBLE and JSON columns are omitted (no byte-identical
     cross-engine text form); an all-omitted table falls back to a constant sentinel.
+    Wide tables (>= _CONCAT_MAX_TERMS rendered columns) nest MD5s per group so the
+    per-row hash stays under the PG/DSQL 100-argument limit (see :func:`_mysql_md5_concat`).
     """
     rendered = [_mysql_checksum_expr(column) for column in table.columns]
-    columns = ", ".join(
-        _mysql_concat_term(expr) for expr in rendered if expr is not None
-    )
-    if not columns:
-        columns = f"'{_NULL_SENTINEL}'"
+    terms = [_mysql_concat_term(expr) for expr in rendered if expr is not None]
+    if not terms:
+        terms = [f"'{_NULL_SENTINEL}'"]
     return (
-        "CAST(CONV(SUBSTRING(MD5(CONCAT_WS('|', "
-        f"{columns})), 1, {_CHECKSUM_HEX_DIGITS}), 16, 10) AS DECIMAL(65, 0))"
+        f"CAST(CONV(SUBSTRING({_mysql_md5_concat(terms)}, 1, "
+        f"{_CHECKSUM_HEX_DIGITS}), 16, 10) AS DECIMAL(65, 0))"
     )
 
 
@@ -335,17 +376,17 @@ def _pg_row_token(table: TableDef) -> "sql.Composed":
 
     The single definition shared by :func:`build_pg_checksum_sql`,
     :func:`build_pg_pk_token_sql`, and the paged :func:`build_pg_page_checksum_first_sql`.
+    Wide tables nest MD5s per group (see :func:`_pg_md5_concat`) to stay under the
+    100-argument function limit, identically to the MySQL side.
     """
     rendered_pg = [_pg_checksum_expr(column) for column in table.columns]
     terms = [_pg_concat_term(expr) for expr in rendered_pg if expr is not None]
     if not terms:
         terms = [sql.Literal(_NULL_SENTINEL)]
-    column_terms = sql.SQL(", ").join(terms)
     digits = sql.Literal(_CHECKSUM_HEX_DIGITS)
     return sql.SQL(
-        "('x' || lpad(substr(md5(concat_ws('|', {terms})), 1, {digits}), 16, '0'))"
-        "::bit(64)::bigint"
-    ).format(terms=column_terms, digits=digits)
+        "('x' || lpad(substr({md5}, 1, {digits}), 16, '0'))::bit(64)::bigint"
+    ).format(md5=_pg_md5_concat(terms), digits=digits)
 
 
 def build_mysql_checksum_sql(table: TableDef) -> str:

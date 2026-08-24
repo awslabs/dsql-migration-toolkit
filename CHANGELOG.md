@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.395
+
+### Fixed
+
+- **Checksum validation now supports wide tables (> ~100 columns).** The per-row
+  checksum token was `MD5(CONCAT_WS('|', <every rendered column>))`; on Aurora DSQL /
+  PostgreSQL a function call is capped at **100 arguments** (`FUNC_MAX_ARGS`), so a
+  table with ≥ 100 checksummed columns failed CHECKSUM validation on the **target**
+  with *"cannot pass more than 100 arguments to a function"* — even though tables up
+  to 255 columns are otherwise supported. The token now **nests MD5s**: it hashes
+  each group of ≤ 96 rendered columns, then hashes the group hashes, applied
+  **identically on both engines** so equal data still hashes equally. Tables within
+  the limit emit the original flat SQL unchanged (no re-checksum of narrow tables).
+  Verified against a live **Aurora DSQL** cluster: a flat 200-argument `concat_ws`
+  errors, while the nested form succeeds.
+
 ## v0.1.394
 
 ### Changed
