@@ -24,6 +24,7 @@ from dsql_migrator.core.introspector import is_write_or_ddl
 from dsql_migrator.core.models import MigrationJob, Watermark
 from dsql_migrator.core.watermark import (
     COMMIT,
+    SHOW_BINARY_LOG_STATUS,
     SHOW_MASTER_STATUS,
     START_CONSISTENT_SNAPSHOT,
     WatermarkCapturer,
@@ -101,7 +102,7 @@ class _FakeConnection:
         self.executed.append(sql)
         upper = sql.upper()
 
-        if "SHOW MASTER STATUS" in upper:
+        if "SHOW BINARY LOG STATUS" in upper or "SHOW MASTER STATUS" in upper:
             if isinstance(self._master_status, Exception):
                 raise self._master_status
             return _FakeResult(mapping=self._master_status)
@@ -369,7 +370,60 @@ def test_capturer_uses_injected_engine_and_clock() -> None:
     assert engine.disposed is True
     # The snapshot transaction is controlled explicitly via AUTOCOMMIT.
     assert {"isolation_level": "AUTOCOMMIT"} in connection.execution_options_calls
-    assert SHOW_MASTER_STATUS in connection.executed
+    # 8.4-safe: the capture issues SHOW BINARY LOG STATUS (falls back to
+    # SHOW MASTER STATUS only on servers that reject the newer form).
+    assert SHOW_BINARY_LOG_STATUS in connection.executed
+
+
+class _StmtConn:
+    """Connection dispatching per statement to a row / None / raised Exception."""
+
+    def __init__(self, responses: dict) -> None:
+        self._responses = responses
+        self.executed: list[str] = []
+
+    def execute(self, statement, _parameters=None):  # noqa: ANN001, ANN201
+        sql = str(statement)
+        self.executed.append(sql)
+        upper = sql.upper()
+        for key, val in self._responses.items():
+            if key in upper:
+                if isinstance(val, Exception):
+                    raise val
+                return _FakeResult(mapping=val)
+        raise AssertionError(f"unexpected statement {sql!r}")
+
+
+def test_read_binlog_status_row_prefers_new_statement_then_falls_back() -> None:
+    """8.4-safe: SHOW BINARY LOG STATUS first; SHOW MASTER STATUS only as fallback."""
+    from dsql_migrator.core.watermark import read_binlog_status_row
+
+    row = {"File": "mysql-bin.000007", "Position": 42, "Executed_Gtid_Set": ""}
+
+    # 8.2+/8.4: the new statement answers -> used; the removed legacy form is never run.
+    c_new = _StmtConn({
+        "SHOW BINARY LOG STATUS": row,
+        "SHOW MASTER STATUS": AssertionError("legacy must not run when the new form works"),
+    })
+    assert read_binlog_status_row(c_new) == row
+    assert not any("SHOW MASTER STATUS" in s for s in c_new.executed)
+
+    # 8.0.x (< 8.2): the new statement is a syntax error -> fall back to the legacy form.
+    c_old = _StmtConn({
+        "SHOW BINARY LOG STATUS": RuntimeError("1064 syntax error"),
+        "SHOW MASTER STATUS": row,
+    })
+    assert read_binlog_status_row(c_old) == row
+    assert any("SHOW MASTER STATUS" in s for s in c_old.executed)
+
+    # Binary logging disabled on 8.4: the new statement returns no row -> None, and the
+    # removed legacy form is NOT tried (a supported-but-empty answer is authoritative).
+    c_off = _StmtConn({
+        "SHOW BINARY LOG STATUS": None,
+        "SHOW MASTER STATUS": AssertionError("legacy must not run after an empty new-form answer"),
+    })
+    assert read_binlog_status_row(c_off) is None
+    assert not any("SHOW MASTER STATUS" in s for s in c_off.executed)
 
 
 # ---------------------------------------------------------------------------

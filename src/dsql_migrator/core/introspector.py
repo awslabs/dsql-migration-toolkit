@@ -698,6 +698,27 @@ def enrich_columns(
             # CURRENT_TIMESTAMP on a datetime/timestamp column also carries this flag.
             if "default_generated" in extra_text:
                 column.default_is_expression = True
+            elif column.default and (column.mysql_type or "").strip().lower().startswith(
+                ("timestamp", "datetime")
+            ):
+                # MySQL < 8.0.13 (e.g. 5.7) has NO DEFAULT_GENERATED flag in EXTRA, so a
+                # temporal FUNCTION default arrives in COLUMN_DEFAULT looking like a bare
+                # token (e.g. "CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP(6)"). On a
+                # datetime/timestamp column such a value can ONLY be the function -- MySQL
+                # rejects a same-text string literal there -- so classify it as an
+                # expression default (else the converter quotes it and the target CREATE
+                # fails with "invalid input syntax for type timestamp"). Scoped to temporal
+                # columns so a genuine VARCHAR literal is never misclassified; 8.0+ keeps
+                # using the authoritative DEFAULT_GENERATED flag above.
+                _canon = column.default.strip().upper().replace(" ", "")
+                if _canon in (
+                    "CURRENT_TIMESTAMP", "NOW()", "LOCALTIME", "LOCALTIMESTAMP",
+                    "UTC_TIMESTAMP", "UTC_TIMESTAMP()",
+                ) or _canon.startswith((
+                    "CURRENT_TIMESTAMP(", "NOW(", "LOCALTIME(", "LOCALTIMESTAMP(",
+                    "UTC_TIMESTAMP(",
+                )):
+                    column.default_is_expression = True
         if table.name in auto_increment_by_table:
             table.auto_increment_column = auto_increment_by_table[table.name]
 

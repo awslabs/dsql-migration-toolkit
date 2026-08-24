@@ -5,6 +5,40 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.393
+
+### Fixed
+
+- **MySQL 5.7 source: temporal function defaults were mis-rendered as string literals.**
+  The converter tells an *expression* default from a *literal* using MySQL's
+  `DEFAULT_GENERATED` `EXTRA` flag — which only exists on **MySQL 8.0.13+**. On a **5.7**
+  source the flag is absent, so a temporal function default like `CURRENT_TIMESTAMP` /
+  `CURRENT_TIMESTAMP(6)` was treated as a literal and quoted (`DEFAULT
+  'CURRENT_TIMESTAMP(6)'`), making the target `CREATE` fail with *"invalid input syntax
+  for type timestamp"*. Introspection now also recognizes temporal function defaults
+  (`CURRENT_TIMESTAMP[(n)]`, `NOW()`, `LOCALTIME[STAMP]`, `UTC_TIMESTAMP`) on
+  `datetime`/`timestamp` columns as expression defaults when the flag is absent —
+  **scoped to temporal columns** so a genuine string literal is never misclassified, and
+  8.0+ keeps using the authoritative flag. Verified end-to-end against a live **MySQL
+  5.7.44** source (Full Load of `DATETIME(6)`/`TIMESTAMP` columns now creates + loads
+  correctly; the binlog watermark is captured via the `SHOW MASTER STATUS` fallback added
+  in `0.1.392`).
+
+## v0.1.392
+
+### Fixed
+
+- **MySQL 8.4 source: binlog watermark capture (gapless Full Load → CDC handoff).**
+  `SHOW MASTER STATUS` was **removed in MySQL 8.4**, so on an Aurora/MySQL 8.4 source the
+  watermark captured an empty binlog `file:position` — silently degrading the gapless
+  Full Load → CDC handoff (CDC could not resume from the watermark and fell back toward a
+  from-now start, risking a data gap). The watermark capture, the CDC **"Fetch current
+  position"** action, and the validator's binlog-drift read now issue **`SHOW BINARY LOG
+  STATUS`** (MySQL 8.2+, including 8.4) and **fall back to `SHOW MASTER STATUS`** on
+  ≤ 8.0.x servers that don't recognize the newer form — one code path covering 8.0.x
+  through 8.4+ with no version probe. Verified end-to-end against a live **Aurora MySQL
+  8.4.7** cluster (Full Load + watermark now returns real coordinates).
+
 ## v0.1.391
 
 ### Changed

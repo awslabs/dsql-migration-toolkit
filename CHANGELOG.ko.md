@@ -5,6 +5,35 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.393
+
+### 수정 (Fixed)
+
+- **MySQL 5.7 소스: 시간 함수 기본값이 문자열 리터럴로 잘못 렌더링되던 문제.**
+  converter는 *표현식* 기본값과 *리터럴* 기본값을 MySQL의 `DEFAULT_GENERATED` `EXTRA`
+  플래그로 구분하는데, 이 플래그는 **MySQL 8.0.13+에만** 존재합니다. **5.7** 소스에는 플래그가
+  없어 `CURRENT_TIMESTAMP` / `CURRENT_TIMESTAMP(6)` 같은 시간 함수 기본값이 리터럴로 처리돼
+  따옴표가 붙었고(`DEFAULT 'CURRENT_TIMESTAMP(6)'`), 타깃 `CREATE`가 *"invalid input syntax
+  for type timestamp"* 로 실패했습니다. 이제 introspection이 플래그가 없을 때도
+  `datetime`/`timestamp` 컬럼의 시간 함수 기본값(`CURRENT_TIMESTAMP[(n)]`, `NOW()`,
+  `LOCALTIME[STAMP]`, `UTC_TIMESTAMP`)을 표현식 기본값으로 인식합니다 — **시간 타입 컬럼에
+  한정**해 실제 문자열 리터럴은 절대 오분류되지 않으며, 8.0+는 기존 플래그를 그대로 사용합니다.
+  실제 **MySQL 5.7.44** 소스에서 E2E 검증(`DATETIME(6)`/`TIMESTAMP` 컬럼의 Full Load가 정상
+  생성·적재; 워터마크는 `0.1.392`에서 추가한 `SHOW MASTER STATUS` 폴백으로 캡처).
+
+## v0.1.392
+
+### 수정 (Fixed)
+
+- **MySQL 8.4 소스: binlog 워터마크 캡처(gapless Full Load → CDC 핸드오프).**
+  `SHOW MASTER STATUS`가 **MySQL 8.4에서 제거**되어, Aurora/MySQL 8.4 소스에서는 워터마크가
+  binlog `file:position`을 빈 값으로 캡처했습니다 — gapless Full Load → CDC 핸드오프가 조용히
+  깨져(CDC가 워터마크에서 재개하지 못하고 현재 시점부터 시작해 데이터 갭 위험) 있었습니다. 이제
+  워터마크 캡처, CDC **"Fetch current position"** 동작, 검증기의 binlog drift 읽기가 모두
+  **`SHOW BINARY LOG STATUS`**(MySQL 8.2+, 8.4 포함)를 사용하고, 신형 구문을 모르는 ≤ 8.0.x
+  서버에서는 **`SHOW MASTER STATUS`로 폴백**합니다 — 버전 탐지 없이 8.0.x~8.4+를 한 경로로
+  처리. 실제 **Aurora MySQL 8.4.7** 클러스터에서 E2E 검증(Full Load + 워터마크가 실제 좌표 반환).
+
 ## v0.1.391
 
 ### 변경 (Changed)

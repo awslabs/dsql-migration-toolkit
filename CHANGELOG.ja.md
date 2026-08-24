@@ -5,6 +5,37 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.393
+
+### 修正 (Fixed)
+
+- **MySQL 5.7 ソース: 時刻関数のデフォルトが文字列リテラルとして誤って出力されていた問題。**
+  コンバーターは *式* デフォルトと *リテラル* デフォルトを MySQL の `DEFAULT_GENERATED`
+  `EXTRA` フラグで判別しますが、このフラグは **MySQL 8.0.13+ にのみ**存在します。**5.7**
+  ソースではフラグが無いため、`CURRENT_TIMESTAMP` / `CURRENT_TIMESTAMP(6)` のような時刻関数
+  デフォルトがリテラル扱いで引用符付き(`DEFAULT 'CURRENT_TIMESTAMP(6)'`)になり、ターゲットの
+  `CREATE` が *"invalid input syntax for type timestamp"* で失敗していました。イントロスペクション
+  がフラグ非在時でも `datetime`/`timestamp` 列の時刻関数デフォルト(`CURRENT_TIMESTAMP[(n)]`、
+  `NOW()`、`LOCALTIME[STAMP]`、`UTC_TIMESTAMP`)を式デフォルトとして認識するようになりました
+  — **時刻型の列に限定**するため実際の文字列リテラルが誤分類されることはなく、8.0+ は従来の
+  フラグを引き続き使用します。実際の **MySQL 5.7.44** ソースで E2E 検証済み(`DATETIME(6)` /
+  `TIMESTAMP` 列の Full Load が正しく作成・ロードされ、ウォーターマークは `0.1.392` で追加した
+  `SHOW MASTER STATUS` フォールバックで取得)。
+
+## v0.1.392
+
+### 修正 (Fixed)
+
+- **MySQL 8.4 ソース: binlog ウォーターマーク取得(ギャップレスな Full Load → CDC ハンドオフ)。**
+  `SHOW MASTER STATUS` は **MySQL 8.4 で削除**されたため、Aurora/MySQL 8.4 ソースでは
+  ウォーターマークが binlog `file:position` を空で取得し、ギャップレスな Full Load → CDC
+  ハンドオフが暗黙に壊れていました(CDC がウォーターマークから再開できず、現在時点から開始して
+  データギャップの恐れ)。ウォーターマーク取得、CDC の **「Fetch current position」** 操作、
+  バリデーターの binlog ドリフト読み取りが、いずれも **`SHOW BINARY LOG STATUS`**(MySQL
+  8.2+、8.4 を含む)を発行し、新形式を認識しない ≤ 8.0.x サーバーでは **`SHOW MASTER STATUS`
+  にフォールバック**するようになりました — バージョン判定なしで 8.0.x〜8.4+ を単一経路で処理。
+  実際の **Aurora MySQL 8.4.7** クラスターで E2E 検証済み(Full Load + ウォーターマークが実座標を返す)。
+
 ## v0.1.391
 
 ### 変更 (Changed)

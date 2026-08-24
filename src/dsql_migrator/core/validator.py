@@ -101,7 +101,11 @@ from dsql_migrator.core.target_connection import (
     DsqlConnector,
     is_transient_connection_error,
 )
-from dsql_migrator.core.watermark import COMMIT, START_CONSISTENT_SNAPSHOT
+from dsql_migrator.core.watermark import (
+    COMMIT,
+    START_CONSISTENT_SNAPSHOT,
+    read_binlog_status_row,
+)
 
 # The pure cross-engine SQL builders + PK-classification helpers were extracted to
 # validation_sql.py for maintainability. Re-exported here so existing imports
@@ -270,16 +274,12 @@ def _source_binlog_position(
     """Read the source's current binlog ``(file, position)``, or ``(None, None)``.
 
     The drift fallback for a source without GTID -- which is the normal case on RDS
-    MySQL 8.0, where GTID cannot be enabled. Read-only (``SHOW MASTER STATUS``) and
-    best-effort: any failure degrades to ``(None, None)`` so validation still
-    produces a report, exactly like :func:`_source_gtid`.
+    MySQL 8.0, where GTID cannot be enabled. Read-only (``SHOW BINARY LOG STATUS``
+    on 8.2+/8.4, else ``SHOW MASTER STATUS``) and best-effort: any failure degrades
+    to ``(None, None)`` so validation still produces a report, exactly like
+    :func:`_source_gtid`.
     """
-    try:
-        row = connection.execute(
-            text("SHOW MASTER STATUS")
-        ).mappings().first()  # type: ignore[attr-defined]
-    except Exception:  # noqa: BLE001 - drift info is optional; degrade gracefully
-        return None, None
+    row = read_binlog_status_row(connection)
     if not row:
         return None, None
     file_name = row.get("File") or None
