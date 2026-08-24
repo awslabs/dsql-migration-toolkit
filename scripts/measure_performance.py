@@ -109,11 +109,24 @@ def region() -> str:
 def _configs(schema: str):
     from dsql_migrator.config import SecretValue
     from dsql_migrator.core.models import (
-        SourceConnectionConfig, TargetConnectionConfig,
+        SourceConnectionConfig, SourceType, TargetConnectionConfig,
     )
+    # PERF_SOURCE_ENGINE selects the source dialect (default MySQL -- byte-identical to the
+    # original perf harness). For a PostgreSQL source set it to "postgres": the Full Load path
+    # routes through the injected engine factory / dialect_for(source_type), so this source_type
+    # is the only wiring the full-load subcommand needs (the pymysql helper below is cdc-lag
+    # only, unused by full-load).
+    engine = cfg("PERF_SOURCE_ENGINE", "mysql").strip().lower()
+    is_pg = engine in ("postgres", "postgresql", "pg")
     source = SourceConnectionConfig(
-        host=cfg("DB_HOST"), port=int(cfg("DB_PORT", "3306")),
-        database=schema, username=cfg("DB_USER", "admin"),
+        source_type=SourceType.POSTGRES if is_pg else SourceType.MYSQL,
+        host=cfg("DB_HOST"), port=int(cfg("DB_PORT", "5432" if is_pg else "3306")),
+        # MySQL: a database IS the schema, so connect to `schema`. PostgreSQL: a database
+        # CONTAINS schemas, so connect to the fixed DB (DB_NAME, default perfdb) and let
+        # `schema` (the --schema arg) qualify the tables as `schema.table` (matching PG
+        # introspection's schema-qualified names -- see the `f"{schema}.{t}"` below).
+        database=(cfg("DB_NAME", "perfdb") if is_pg else schema),
+        username=cfg("DB_USER", "admin"),
     )
     target = TargetConnectionConfig(
         cluster_endpoint=cfg("TARGET_ENDPOINT"), region=region(),
@@ -421,7 +434,10 @@ def cmd_full_load(args) -> int:
     from dsql_migrator.core.error_log import ErrorLogStore
     from dsql_migrator.core.job_manager import JobManager
     from dsql_migrator.core.table_selection import TableSelection, TableSelector
-    from dsql_migrator.ui.data_migration._engine import (
+    # These moved out of the (now-removed) _engine module into _full_load_engine and are
+    # re-exported from the data_migration package -- import from the package so this keeps
+    # working across the refactor.
+    from dsql_migrator.ui.data_migration import (
         DataMigrationInputs, default_migrator_factory, run_full_load,
     )
     from dsql_migrator.ui.evaluation import _default_introspector_factory
@@ -481,7 +497,9 @@ def cmd_full_load(args) -> int:
     leading = getattr(args, "composite_leading", "") or ""
     table_conversions: dict = {}
     if leading:
-        converter = SchemaConverter()
+        # Use the SOURCE dialect's converter (PostgreSQL vs MySQL); a MySQL converter would
+        # mis-handle PG source types in the composite-key DDL.
+        converter = SchemaConverter(source_type=source.source_type)
         for tdef in tables:
             conv = converter.convert_table(
                 tdef,
