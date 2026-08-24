@@ -469,6 +469,28 @@ def test_cdc_deploy_job_id_round_trips_for_reconnect() -> None:
     assert m2.cdc_action_kind == "start"
 
 
+def test_cdc_ops_window_start_round_trips_for_reconnect() -> None:
+    # The Full Load watermark that scopes per-table CDC applied-ops (I/U/D) must
+    # survive a reconnect, so the counts keep measuring only post-Full-Load events
+    # instead of falling back to the metric's fixed trailing window (which would sum
+    # prior CDC runs on the same stack).
+    from datetime import datetime, timezone
+
+    session, eval_state, conv_state, migration_state = _populated_states()
+    ts = datetime(2026, 8, 24, 3, 4, 5, tzinfo=timezone.utc)
+    migration_state.set_cdc_ops_window_start(ts)
+
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+    assert snapshot.cdc_ops_window_start == ts
+
+    m2 = DataMigrationState()
+    apply_session_snapshot(snapshot, SessionConnectionState(), EvaluationState(),
+                           SchemaConversionState(), m2)
+    assert m2.cdc_ops_window_start == ts
+
+
 def test_teardown_reconnect_drops_stale_connectors_and_job_link() -> None:
     # Regression: after a completed Stop/Delete, a RECONNECT must NOT restore the
     # finished lifecycle-job link or the (now-gone) connector names -- otherwise the

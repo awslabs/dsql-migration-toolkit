@@ -3248,6 +3248,57 @@ def test_fetch_cdc_status_reads_applied_ops_when_controller_exposes_reader() -> 
     }
 
 
+def test_cdc_ops_window_start_stores_ts_and_none_falls_back_to_now() -> None:
+    from datetime import datetime, timezone
+
+    s = DataMigrationState()
+    assert s.cdc_ops_window_start is None
+    ts = datetime(2026, 8, 24, 1, 2, 3, tzinfo=timezone.utc)
+    s.set_cdc_ops_window_start(ts)
+    assert s.cdc_ops_window_start == ts
+    # None (CDC-only / no watermark) -> now, timezone-aware.
+    s.set_cdc_ops_window_start(None)
+    assert s.cdc_ops_window_start is not None
+    assert s.cdc_ops_window_start.tzinfo is not None
+
+
+def test_fetch_cdc_status_windows_applied_ops_from_full_load_watermark() -> None:
+    # Per-table applied-ops (I/U/D) must count only events applied AFTER the Full Load
+    # watermark, so prior CDC runs still inside the sink metric's trailing window are
+    # excluded. _fetch passes window_seconds = now - cdc_ops_window_start (bounded).
+    from datetime import datetime, timedelta, timezone
+
+    from dsql_migrator.core.cdc import ConnectorState, ConnectorStatus
+    from dsql_migrator.core.msk_connect_controller import ConnectorHealth
+    from dsql_migrator.ui.data_migration import _fetch_cdc_status
+
+    seen: dict = {}
+
+    class _Ctrl(_FakeCdcController):
+        def applied_ops_by_table(self, stack, tables, **kw):
+            seen["kw"] = dict(kw)
+            return {}
+
+    state = DataMigrationState()
+    state.set_cdc_stack_name("s")
+    state.set_cdc_controller(
+        _Ctrl(
+            statuses=[ConnectorStatus(name="sink", state=ConnectorState.RUNNING)],
+            health={"sink": ConnectorHealth(running_tasks=1, errored_tasks=0)},
+        )
+    )
+    state.set_cdc_connector_names(["sink"])
+
+    # No watermark yet -> the reader's default window (no window_seconds forced).
+    _fetch_cdc_status(state, ["orders"])
+    assert "window_seconds" not in seen["kw"]
+
+    # CDC started from a Full Load watermark ~2h ago -> the window is ~2h.
+    state.set_cdc_ops_window_start(datetime.now(timezone.utc) - timedelta(hours=2))
+    _fetch_cdc_status(state, ["orders"])
+    assert 7000 <= seen["kw"]["window_seconds"] <= 7400  # ~7200s, bounded [60, 14d]
+
+
 def test_fetch_cdc_status_reads_replication_lag_when_controller_exposes_reader() -> None:
     # _fetch scopes the ReplicationLagMs read to the migrated table set and _apply
     # stores it on state (drives the time-based "Stream lag" column).

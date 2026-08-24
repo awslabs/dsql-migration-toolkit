@@ -2969,6 +2969,13 @@ def _start_cdc_deploy(
         _logged_cdc_lifecycle(_action, detail=_detail, work=work)
     )
     migration_state.set_cdc_deploy_job_id(job_id, kind="start")
+    # Count per-table applied-ops (I/U/D) only from THIS migration's Full Load
+    # watermark onward, so the monitor shows post-Full-Load CDC events -- not stale
+    # ops from prior CDC runs still inside the metric's trailing window. No watermark
+    # (CDC-only / manual) -> now (count from this CDC start).
+    migration_state.set_cdc_ops_window_start(
+        watermark.snapshot_timestamp if watermark is not None else None
+    )
     _log_cdc_event(_action, detail=_detail)
     ui.notify("Start CDC submitted — watch the progress below.", type="positive", position="top")  # type: ignore[attr-defined]
     refresh()

@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.390
+
+### Fixed
+
+- **CDC per-table Inserts/Updates/Deletes now count only events applied AFTER the Full
+  Load watermark, not prior CDC runs.** The "Changes since Full Load" column summed the
+  sink's `InsertsApplied`/`UpdatesApplied`/`DeletesApplied` CloudWatch metrics over a
+  fixed 14-day trailing window, so a clean Full-Load→CDC run with no post-watermark
+  writes still showed non-zero counts — those were leftover ops from earlier demo/test
+  CDC runs on the same stack still inside the window. CDC start now pins the applied-ops
+  window to the Full Load watermark (`cdc_ops_window_start`, persisted across reconnect;
+  falls back to CDC-start time for CDC-only/manual), and the poll windows the metric read
+  from it — so a fresh gapless run correctly reads 0 until real change traffic flows.
+
 ## v0.1.389
 
 ### Fixed

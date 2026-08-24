@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.390
+
+### 수정 (Fixed)
+
+- **CDC per-table Inserts/Updates/Deletes가 이제 Full Load 워터마크 이후 적용된 이벤트만 셉니다(이전
+  CDC run 제외).** "Changes since Full Load" 컬럼이 싱크의 `InsertsApplied`/`UpdatesApplied`/
+  `DeletesApplied` CloudWatch 메트릭을 **고정 14일 트레일링 창**으로 합산해서, 워크로드 없이 Full
+  Load 직후 CDC를 해도 non-zero가 떴습니다 — 같은 스택에서 돌린 **이전 데모/테스트 CDC run**이 창
+  안에 남아 있었기 때문입니다. 이제 CDC 시작 시 applied-ops 창을 **Full Load 워터마크**에 고정
+  (`cdc_ops_window_start`, 재접속에도 유지; CDC-only/수동은 CDC 시작 시각으로 폴백)하고 폴이 그
+  시점부터 메트릭을 읽어, 깨끗한 gapless run은 실제 변경 트래픽이 흐르기 전까지 0으로 정확히 표시됩니다.
+
 ## v0.1.389
 
 ### 수정 (Fixed)

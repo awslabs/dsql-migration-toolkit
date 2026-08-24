@@ -139,6 +139,7 @@ def capture_session_snapshot(
         ),
         cdc_deploy_job_id=getattr(migration_state, "cdc_deploy_job_id", None),
         cdc_action_kind=getattr(migration_state, "cdc_action_kind", None),
+        cdc_ops_window_start=getattr(migration_state, "cdc_ops_window_start", None),
         cdc_stack_name=getattr(migration_state, "cdc_stack_name", None),
         cdc_infra_inputs=dict(migration_state.cdc_infra_inputs()),  # type: ignore[attr-defined]
         ai_assist_enabled=bool(getattr(session.ai_assist, "enabled", False)),  # type: ignore[attr-defined]
@@ -370,6 +371,16 @@ def apply_session_snapshot(
     ):
         migration_state.set_cdc_deploy_job_id(  # type: ignore[attr-defined]
             snapshot.cdc_deploy_job_id, kind=snapshot.cdc_action_kind
+        )
+
+    # Restore the CDC applied-ops window start (Full Load watermark) so per-table
+    # I/U/D counts keep measuring post-Full-Load events after a reconnect, not a fixed
+    # trailing window. Only when present (the setter would otherwise reset it to now).
+    if snapshot.cdc_ops_window_start is not None and hasattr(
+        migration_state, "set_cdc_ops_window_start"
+    ):
+        migration_state.set_cdc_ops_window_start(  # type: ignore[attr-defined]
+            snapshot.cdc_ops_window_start
         )
 
     # Restore the CDC infrastructure identity + inputs so the lifecycle card knows

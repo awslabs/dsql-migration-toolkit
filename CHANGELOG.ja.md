@@ -5,6 +5,20 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.390
+
+### 修正 (Fixed)
+
+- **CDC のテーブル別 Inserts/Updates/Deletes が、Full Load ウォーターマーク以降に適用された
+  イベントのみをカウントするようになりました(以前の CDC 実行を除外)。** 「Changes since Full
+  Load」列はシンクの `InsertsApplied`/`UpdatesApplied`/`DeletesApplied` CloudWatch メトリクスを
+  **固定14日のトレーリングウィンドウ**で合算していたため、ワークロードなしで Full Load 直後に CDC
+  を開始しても非ゼロが表示されていました — 同じスタックで実行した**以前のデモ/テスト CDC 実行**が
+  ウィンドウ内に残っていたためです。CDC 開始時に applied-ops ウィンドウを **Full Load ウォーター
+  マーク**に固定し(`cdc_ops_window_start`、再接続後も保持。CDC-only/手動は CDC 開始時刻に
+  フォールバック)、ポールがその時点からメトリクスを読むようにしたので、クリーンな gapless 実行は
+  実際の変更トラフィックが流れるまで正しく 0 と表示されます。
+
 ## v0.1.389
 
 ### 修正 (Fixed)
