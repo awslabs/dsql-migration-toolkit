@@ -21,8 +21,11 @@ DSQL(PostgreSQL)로 변환하고 분류합니다:
 - **AUTO** — 규칙 기반으로 변환 완료; 바로 테스트 가능.
 - **MANUAL** — 변환은 됐으나 검토 필요(DSQL에서 주의점이 있는 관용구).
 
-또한 DSQL에서 문제가 되는 **안티패턴**을 표시합니다 — 예를 들어 `SELECT ... FOR UPDATE`는
-DSQL의 낙관적 동시성 제어(OCC)에서 다르게 동작합니다.
+또한 MySQL 관용구를 **재작성**하고 DSQL에서 문제가 되는 것을 **표시**합니다 — 예: `ON DUPLICATE KEY UPDATE`
+→ `INSERT ... ON CONFLICT DO UPDATE`(MANUAL — 충돌 타깃을 직접 확인), `JSON_UNQUOTE(JSON_EXTRACT(...))`
+→ `JSON_EXTRACT_PATH_TEXT`, MySQL `HAVING`-별칭 참조 인라인화, 그리고 `SELECT ... FOR UPDATE`(DSQL의
+낙관적 동시성 제어에서 다르게 동작). 이런 발견은 모두 **MANUAL**로 분류됩니다. 애플리케이션 코드 전반의
+안티패턴 스캔(외래 키/`AUTO_INCREMENT`/트리거 의존, 미지원 함수)은 [2장](02-evaluation-and-schema-conversion.md) 참조.
 
 원본과 변환된 SQL을 나란히 보여줘 무엇이 바뀌었는지 정확히 확인할 수 있습니다.
 
@@ -42,6 +45,11 @@ DSQL의 낙관적 동시성 제어(OCC)에서 다르게 동작합니다.
 
 판정에는 DSQL이 문을 받아들였는지, 아니라면 정확한 에러(SQLSTATE 포함), 캡처된 쿼리 플랜, 그리고
 ANALYZE일 때 DPU 비용이 표시됩니다.
+
+**어느 스키마로 테스트되는가.** 스키마 없이 쓴 테이블명(`FROM orders`)은 세션 `search_path`로 스키마에
+해석됩니다; 도구는 연결된 소스 DB의 동일 이름 스키마를 기본값으로 쓰고, **Test against schema** 피커로
+바꿀 수 있습니다. `relation "…" does not exist`(SQLSTATE **42P01**)는 그 테이블이 테스트 대상 스키마에
+없다는 뜻일 뿐 — 올바른 스키마를 골라 다시 테스트하세요.
 
 > **DSQL 플랜 읽기:** Aurora DSQL은 *분산* PostgreSQL 호환 엔진이라 플랜이 조금 다르게 읽힙니다 —
 > §9.4 참조.

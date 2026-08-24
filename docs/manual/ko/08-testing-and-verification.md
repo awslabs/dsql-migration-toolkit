@@ -15,7 +15,9 @@ _언어: [English](../en/08-testing-and-verification.md) | **한국어** | [日�
 
 > 여기 적힌 동작들은 짐작이 아닙니다. 각 상황을 AWS 없이도 결정론적으로 재현하는 자동 검증과,
 > 실제 RDS MySQL + Aurora DSQL + MSK에 *일부러 실패하도록 심은 데이터*까지 넣어 돌린 라이브
-> 실행으로 확인돼 있습니다(§8.2 요약).
+> 실행으로 확인돼 있습니다(§8.2 요약). 소규모 `integration` 마커 티어(`tests/test_integration_e2e.py`)는
+> 로컬 MySQL + PostgreSQL-16 컨테이너도 돌리지만 `RUN_INTEGRATION_TESTS=1`일 때만 실행되고, 아니면
+> 스스로 스킵돼 기본 `pytest` 실행은 완전 오프라인으로 유지됩니다.
 
 한 가지 원칙만 기억하면 됩니다: **조용한 손상보다 시끄러운 실패가 낫습니다.** 이 도구는 데이터를
 몰래 왜곡하거나 버리느니, 눈에 보이고 고칠 수 있는 오류로 멈춥니다. 불완전한 로드를 성공으로
@@ -109,6 +111,10 @@ _언어: [English](../en/08-testing-and-verification.md) | **한국어** | [日�
 잃지 않고 포착·보고됐습니다. 그리고 마이그레이션 끝에서 **Validation을 당신이 직접 실행**하므로,
 전환 전 *당신의* 데이터로 동일한 증거 — 정확한 행 수, 체크섬, PK 단위 대조 — 를 얻습니다. 결과를
 믿어 달라는 게 아니라, 직접 재현하는 것입니다.
+
+> 동일한 PK 단위 대조는 셸에서도 가능합니다: `scripts/cdc_consistency_check.py`(타깃에 **누락**/**초과**된
+> 정확한 PK를 나열)와 `scripts/compare_rows.py -t <schema.table> --watch N`(행 수/라이브 수렴 확인) —
+> [`scripts/README.md`](../../../scripts/README.md) 참고. 권위 있는 go/no-go는 내장 **Validation** 단계입니다.
 
 ---
 

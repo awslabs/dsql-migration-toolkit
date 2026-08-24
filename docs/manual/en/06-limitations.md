@@ -17,11 +17,12 @@ fails **loudly** where it can't.
 | Limit | Consequence | Tool behavior |
 |---|---|---|
 | **No foreign keys** | Referential integrity is your application's job on DSQL. | FK definitions removed from DDL but preserved in the report; flagged **MANUAL**. |
+| **Source `CHECK` constraints** | A MySQL `CHECK` (8.0.16+) is not translated to the target. | Dropped from the DDL and flagged **MANUAL** — re-add a DSQL-compatible `CHECK` by hand or enforce it in the app. (The `CHECK … IN (...)` the tool *generates* for an `ENUM` is unaffected.) |
 | **Primary key required** | A PK-less table can't be migrated. | Flagged **UNSUPPORTED**; also blocks Full Load (keyset export needs a PK). |
 | **No triggers / stored procedures / functions / scheduled events** | Server-side logic doesn't move. | Flagged **UNSUPPORTED** — reimplement in the application (events → EventBridge/Lambda). |
 | **No native partitioning** | DSQL auto-distributes data itself. | Partitioned tables flagged **MANUAL** (drop the partitioning). |
 | **1 MiB per-value limit** | A single `TEXT`/`BLOB` value over ~1 MiB can't be stored. | 1–8 MiB values **quarantined** to the error log / DLQ; > 8 MiB columns must be **excluded at capture**. Large LOB columns flagged `OVERSIZED_LOB` (MANUAL). |
-| **`DECIMAL` precision > 38** | Higher precision unsupported. | Flagged **UNSUPPORTED** (`NUMERIC_PRECISION`). |
+| **`DECIMAL` precision > 38** | Higher precision unsupported. | Evaluation flags it **UNSUPPORTED** (`NUMERIC_PRECISION`); if the converted DDL is applied anyway, Schema Conversion **clamps to `numeric(38,37)`** (lossy) with a warning — scale is also capped at 37. |
 | **Spatial / geometry types** | Substituted to `bytea` (raw WKB preserved end-to-end through Full Load and CDC). | The converter auto-substitutes each column to `bytea`; the assessor flags the table **MANUAL** for review. |
 | **FULLTEXT / SPATIAL indexes** | Not supported. | Flagged **UNSUPPORTED**. |
 | **≤ 255 columns per table, ≤ 1000 tables per database** | Beyond these, unsupported. | Flagged **UNSUPPORTED** (`TOO_MANY_COLUMNS` / `TABLE_COUNT_LIMIT`). |
@@ -56,6 +57,11 @@ fails **loudly** where it can't.
 - **CDC replicates data, not DDL.** Schema changes on the source during CDC are
   **not** propagated to DSQL — you must apply equivalent DDL to DSQL yourself
   (see [Chapter 4 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)).
+- **Cascading FK actions don't replicate over CDC.** InnoDB `ON DELETE/UPDATE
+  CASCADE` (and `SET NULL`/`SET DEFAULT`) fire *inside* MySQL and never reach the
+  binlog, so CDC can't apply them — child rows the source cascaded may be left
+  orphaned on the target. Evaluation flags such tables **MANUAL**; enforce the
+  cascade in the application.
 - **CDC is billable while deployed.** The streaming pipeline (MSK Serverless +
   MSK Connect, plus a NAT gateway if created) costs money for as long as it runs.
   Tear down the cdc-stack after cut-over. Full Load alone provisions no streaming
@@ -68,13 +74,14 @@ fails **loudly** where it can't.
 
 ## 6.3 Deployment limits (the AWS-hosted form)
 
-- **Single-task control plane.** The tool deploys as **one** ECS Fargate task. Its
-  job/session state is local SQLite on the task's **ephemeral storage**, so a task
-  replacement (deploy, crash) loses in-flight job state — you reconnect and re-run
-  the read-only steps. Don't scale to more than one task without moving that state
-  to a shared store — the `SessionStateStore`/`JobStore` protocols the code exposes
-  are designed to be backed by DynamoDB. Durable session resume already survives a
-  task replacement via an S3 (`sessions/` prefix) snapshot.
+- **Single-task control plane.** The tool deploys as **one** ECS Fargate task, and
+  you should not raise it above one. On the AWS-hosted deploy both **job and session
+  state are kept durable in a managed S3 bucket** (`jobs/` + `sessions/` prefixes),
+  so a task replacement (deploy, crash) **resumes** rather than losing progress — a
+  resume lands on the last recorded status transition, not the exact in-flight
+  batch. The single-task cap is about **single-writer orchestration** (coordinating
+  CDC deploys and in-memory session state), **not** state durability; local SQLite
+  on ephemeral storage is only the local-dev fallback.
 - **No built-in app authentication.** The app relies on the ALB's **optional
   Cognito** gate. Enable Cognito for any internet-facing deployment — the deploy
   template blocks the unsafe internet-facing-without-Cognito combination.

@@ -16,11 +16,12 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 | 한계 | 결과 | 도구 동작 |
 |---|---|---|
 | **외래 키 없음** | DSQL에서 참조 무결성은 애플리케이션 책임. | FK 정의는 DDL에서 제거하되 리포트에 보존; **MANUAL** 플래그. |
+| **소스 `CHECK` 제약** | MySQL `CHECK`(8.0.16+)는 타깃으로 변환되지 않음. | DDL에서 드롭되고 **MANUAL** 플래그 — DSQL 호환 `CHECK`를 직접 다시 추가하거나 앱에서 강제. (도구가 `ENUM`용으로 *생성*하는 `CHECK … IN (...)`은 영향 없음.) |
 | **기본 키 필수** | PK 없는 테이블은 마이그레이션 불가. | **UNSUPPORTED** 플래그; Full Load도 차단(keyset export에 PK 필요). |
 | **트리거/저장 프로시저/함수/스케줄 이벤트 없음** | 서버 측 로직은 옮겨지지 않음. | **UNSUPPORTED** — 애플리케이션으로 재구현(이벤트 → EventBridge/Lambda). |
 | **네이티브 파티셔닝 없음** | DSQL이 직접 자동 분산. | 파티션 테이블 **MANUAL**(파티셔닝 제거). |
 | **값당 1 MiB 한도** | ~1 MiB를 초과하는 단일 `TEXT`/`BLOB` 값은 저장 불가. | 1–8 MiB 값은 에러 로그/DLQ로 **격리(quarantine)**; > 8 MiB 컬럼은 **캡처 단계에서 제외**해야 함. 대형 LOB 컬럼은 `OVERSIZED_LOB`(MANUAL). |
-| **`DECIMAL` 정밀도 > 38** | 더 높은 정밀도 미지원. | **UNSUPPORTED**(`NUMERIC_PRECISION`). |
+| **`DECIMAL` 정밀도 > 38** | 더 높은 정밀도 미지원. | Evaluation은 **UNSUPPORTED**(`NUMERIC_PRECISION`)로 표시하지만, 변환된 DDL을 적용하면 Schema Conversion이 **`numeric(38,37)`로 clamp**(손실)하며 경고 — 스케일도 37로 제한. |
 | **공간/geometry 타입** | `bytea`로 대체(원본 WKB가 Full Load·CDC 전 구간에서 그대로 보존됨). | 변환기가 각 컬럼을 `bytea`로 자동 대체하고, 평가기가 해당 테이블을 검토 대상 **MANUAL**로 표시. |
 | **FULLTEXT / SPATIAL 인덱스** | 미지원. | **UNSUPPORTED**. |
 | **테이블당 ≤ 255 컬럼, DB당 ≤ 1000 테이블** | 초과 시 미지원. | **UNSUPPORTED**(`TOO_MANY_COLUMNS` / `TABLE_COUNT_LIMIT`). |
@@ -52,6 +53,10 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 - **CDC는 데이터를 복제할 뿐 DDL은 복제하지 않음.** CDC 도중 소스에서 발생한 스키마 변경은 DSQL로
   **전파되지 않으므로** 동일한 DDL을 DSQL에 직접 적용해야 합니다
   ([4장 §4.2](04-cdc-and-dsql-constraints.md#42-cdc는-스키마가-아니라-데이터를-복제--중요) 참조).
+- **캐스케이드 FK 동작은 CDC로 복제되지 않음.** InnoDB의 `ON DELETE/UPDATE CASCADE`(및 `SET NULL`/
+  `SET DEFAULT`)는 MySQL *내부*에서 발생해 binlog에 남지 않으므로 CDC가 적용할 수 없습니다 — 소스가
+  캐스케이드한 자식 행이 타깃에 orphan으로 남을 수 있습니다. Evaluation이 해당 테이블을 **MANUAL**로
+  표시하며, 캐스케이드는 애플리케이션에서 강제하세요.
 - **CDC는 배포되어 있는 동안 과금됨.** 스트리밍 파이프라인(MSK Serverless + MSK Connect, NAT 게이트웨이를
   만들었다면 그것까지)은 실행되는 내내 비용이 발생합니다. Cut over 후에는 cdc-stack을 내리세요. Full Load만
   수행하면 스트리밍 인프라가 프로비저닝되지 않습니다.
@@ -63,12 +68,12 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 
 ## 6.3 배포 한계 (AWS 호스팅 형태)
 
-- **단일 태스크 컨트롤 플레인.** 도구는 **하나의** ECS Fargate 태스크로 배포됩니다. 작업/세션 상태는
-  태스크의 **임시 스토리지**에 로컬 SQLite로 저장되므로, 태스크가 교체되면(배포, 크래시) 진행 중이던
-  작업 상태를 잃습니다. 이때는 다시 연결해 읽기 전용 단계를 재실행하면 됩니다. 이 상태를 공유 저장소로
-  옮기지 않은 채 태스크를 두 개 이상으로 확장하지 마세요. 코드가 노출하는 `SessionStateStore`/`JobStore`
-  프로토콜은 DynamoDB로 뒷받침하도록 설계되어 있습니다. 세션의 지속적 재개는 이미 S3(`sessions/` 프리픽스)
-  스냅샷을 통해 태스크 교체를 견디고 살아남습니다.
+- **단일 태스크 컨트롤 플레인.** 도구는 **하나의** ECS Fargate 태스크로 배포되며, 하나를 초과해 올리면
+  안 됩니다. AWS 호스팅 배포에서는 **작업/세션 상태가 모두 관리형 S3 버킷**(`jobs/` + `sessions/` 프리픽스)에
+  durable하게 보관되므로, 태스크가 교체돼도(배포, 크래시) 진행 상태를 잃지 않고 **재개**합니다 — 재개는
+  마지막으로 기록된 상태 전이 지점으로 복귀하며, 진행 중이던 정확한 배치는 아닙니다. 단일 태스크 제한은
+  상태 durability가 아니라 **단일 writer 오케스트레이션**(CDC 배포 조율 + 인메모리 세션 상태) 때문입니다;
+  임시 스토리지의 로컬 SQLite는 로컬 개발 폴백일 뿐입니다.
 - **앱 자체 인증 없음.** 앱은 ALB의 **선택적 Cognito** 게이트에 의존합니다. 인터넷에 노출되는 배포라면
   Cognito를 켜세요. 배포 템플릿은 Cognito 없이 인터넷에 노출하는 안전하지 않은 조합을 막습니다.
 - **자격증명은 세션별로만, 메모리에만 존재.** 절대 디스크에 남지 않으며, 재시작하면 소스/타깃 연결 정보를

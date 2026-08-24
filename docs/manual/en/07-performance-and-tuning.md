@@ -423,7 +423,8 @@ tables are read from the source at once* — one streaming source connection per
 concurrent table. It is the dial on concurrent source read pressure. `BATCH_PARALLELISM`
 and `BATCH_ROWS` raise **DSQL write** pressure, not source read load; leave them
 unless DSQL is the bottleneck. (The source read **page size is fixed at 5000 rows**
-and is not tunable — table parallelism is your only source-read throttle.)
+and is not tunable; table parallelism is your **primary** source-read lever, with an
+optional `Threads_running` cap as a second, opt-in safety valve — see the note below.)
 
 > Set it under **Settings → Full Load** to experiment between runs, or as the env
 > var to persist it (see §7.2).
@@ -451,11 +452,14 @@ headroom, not the number of tables:
   pages); and above all, **your application's own query latency rising** — the ultimate
   back-off trigger regardless of instance metrics.
 
-> [!note] No built-in rate limiter
-> The tool has **no throughput/QPS rate limiting** — source read pressure scales
-> linearly with table parallelism. Lowering the knob is your control. Schedule the
-> bulk load **off-peak** and avoid overlapping the instance's backup/maintenance
-> window (a snapshot plus full scans is the worst case for gp2 `BurstBalance`).
+> [!note] Source-load safety valve
+> There is **no QPS rate limiter**, but there **is** an opt-in concurrency throttle:
+> `DSQL_MIGRATOR_FULL_LOAD_MAX_SOURCE_THREADS_RUNNING` (default `0` = off, also
+> settable in **Settings → Full Load**) pauses new source reads while the source's
+> global `Threads_running` exceeds the ceiling — a gh-ost-style `--max-load` guard.
+> Otherwise, lowering table parallelism is your control. Schedule the bulk load
+> **off-peak** and avoid overlapping the instance's backup/maintenance window (a
+> snapshot plus full scans is the worst case for gp2 `BurstBalance`).
 
 ### Pre-flight headroom checklist
 

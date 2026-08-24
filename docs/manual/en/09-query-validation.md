@@ -24,9 +24,14 @@ classifies it:
 - **AUTO** — converted deterministically; ready to test.
 - **MANUAL** — converted, but review it (an idiom that has a caveat on DSQL).
 
-It also flags **anti-patterns** that matter on DSQL — for example
-`SELECT ... FOR UPDATE`, which behaves differently under DSQL's optimistic
-concurrency control.
+It also **rewrites** MySQL idioms and **flags** ones that matter on DSQL — e.g.
+`ON DUPLICATE KEY UPDATE` → `INSERT ... ON CONFLICT DO UPDATE` (MANUAL — you confirm
+the conflict target), `JSON_UNQUOTE(JSON_EXTRACT(...))` → `JSON_EXTRACT_PATH_TEXT`,
+MySQL `HAVING`-alias references inlined, and `SELECT ... FOR UPDATE` (which behaves
+differently under DSQL's optimistic concurrency). Every such finding is classified
+**MANUAL**. For the broader application-code anti-pattern scan (foreign-key /
+`AUTO_INCREMENT` / trigger reliance, unsupported functions) see
+[Chapter 2](02-evaluation-and-schema-conversion.md).
 
 The original and the converted SQL are shown side by side so you can see exactly
 what changed.
@@ -48,6 +53,12 @@ What can and can't be tested:
 
 The verdict shows whether DSQL accepted the statement, the exact error (with
 SQLSTATE) if it didn't, the captured query plan, and — with ANALYZE — the DPU cost.
+
+**Which schema is tested.** An unqualified table name (`FROM orders`) resolves
+against a schema via the session `search_path`; the tool defaults to the connected
+source database's same-named schema, and a **Test against schema** picker lets you
+retarget. A `relation "…" does not exist` (SQLSTATE **42P01**) simply means the
+table isn't in the tested schema — pick the right one and re-test.
 
 > **Reading a DSQL plan:** Aurora DSQL is a *distributed* PostgreSQL-compatible
 > engine, so its plans read a little differently — see §9.4.

@@ -23,8 +23,12 @@ MySQL 文を貼り付けると、スキーマ変換と同じ決定論優先（de
 - **AUTO** — 決定論的に変換完了。すぐにテストできます。
 - **MANUAL** — 変換はされましたが、確認が必要です（DSQL で注意点のあるイディオム）。
 
-また、DSQL で問題となる**アンチパターン**も表示します。たとえば
-`SELECT ... FOR UPDATE` は、DSQL の楽観的並行性制御（OCC）のもとで異なる動作をします。
+また、MySQL のイディオムを**書き換え**、DSQL で問題となるものを**フラグ**します。例:
+`ON DUPLICATE KEY UPDATE` → `INSERT ... ON CONFLICT DO UPDATE`(MANUAL — 競合ターゲットは自分で確認)、
+`JSON_UNQUOTE(JSON_EXTRACT(...))` → `JSON_EXTRACT_PATH_TEXT`、MySQL の `HAVING` エイリアス参照のインライン化、
+そして `SELECT ... FOR UPDATE`（DSQL の楽観的並行性制御のもとで異なる動作）。これらの指摘はすべて **MANUAL**
+に分類されます。アプリケーションコード全体のアンチパターンスキャン（外部キー/`AUTO_INCREMENT`/トリガー依存、
+未対応関数）は [第 2 章](02-evaluation-and-schema-conversion.md) を参照してください。
 
 元の SQL と変換後の SQL を並べて表示するため、何が変わったのかを正確に確認できます。
 
@@ -46,6 +50,11 @@ MySQL 文を貼り付けると、スキーマ変換と同じ決定論優先（de
 
 判定には、DSQL が文を受け入れたかどうか、受け入れなかった場合は正確なエラー（SQLSTATE
 付き）、取得したクエリプラン、そして ANALYZE の場合は DPU コストが表示されます。
+
+**どのスキーマでテストされるか。** スキーマ修飾のないテーブル名（`FROM orders`）はセッションの
+`search_path` でスキーマに解決されます。ツールは接続元ソース DB と同名のスキーマを既定にし、
+**Test against schema** ピッカーで切り替えられます。`relation "…" does not exist`（SQLSTATE **42P01**）は、
+そのテーブルがテスト対象スキーマに無いことを意味するだけです — 正しいスキーマを選んで再テストしてください。
 
 > **DSQL プランの読み方:** Aurora DSQL は*分散型*の PostgreSQL 互換エンジンであるため、
 > プランの読み方が少し異なります — §9.4 を参照してください。
