@@ -364,6 +364,38 @@ class DebeziumEventsTest {
   }
 
   @Test
+  void pgSourceBitColumnRendersBitStringWhileMysqlKeepsInteger() {
+    // Live DLQ-test finding: a PG bit/varbit column must land as the bit-string (matching
+    // Full Load's psycopg write), not the MySQL-BIT integer -- gated on source.connector so
+    // MySQL stays byte-identical (BIT -> integer). B'11011011' = little-endian {0xDB}.
+    Schema bits =
+        SchemaBuilder.bytes().name(DebeziumTypeConverter.BITS_TYPE)
+            .parameter("length", "8").optional().build();
+    Schema row =
+        SchemaBuilder.struct().name("Row")
+            .field("id", Schema.INT64_SCHEMA).field("flags", bits).optional().build();
+    Schema env =
+        SchemaBuilder.struct().name("Envelope")
+            .field("op", Schema.STRING_SCHEMA).field("after", row).field("source", ENGINE_SOURCE)
+            .build();
+    byte[] db = new byte[] {(byte) 0xDB};
+
+    Struct pgEnv =
+        new Struct(env).put("op", "c")
+            .put("after", new Struct(row).put("id", 1L).put("flags", db))
+            .put("source", engineSource("postgresql", "t"));
+    ChangeEvent pg = DebeziumEvents.parse(record(key(1L), pgEnv, "dsqlcdc.app.t"));
+    assertEquals("11011011", pg.values().get(pg.columns().indexOf("flags")));
+
+    Struct myEnv =
+        new Struct(env).put("op", "c")
+            .put("after", new Struct(row).put("id", 1L).put("flags", db))
+            .put("source", engineSource("mysql", "t"));
+    ChangeEvent my = DebeziumEvents.parse(record(key(1L), myEnv, "dsqlcdc.app.t"));
+    assertEquals(219L, my.values().get(my.columns().indexOf("flags")));
+  }
+
+  @Test
   void absentConnectorRetainsSentinelColumn() {
     // No source.connector -> not a known-PostgreSQL source -> the TOAST omit is NOT applied
     // (safe default). A value equal to the sentinel is genuine data and MUST be retained.

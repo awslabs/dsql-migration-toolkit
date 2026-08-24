@@ -376,6 +376,53 @@ class DebeziumTypeConverterTest {
     assertEquals(Instant.parse("2024-01-01T00:00:00.123456Z"), ts2.toInstant());
   }
 
+  // --- PostgreSQL bit/varbit -> bit-string (live-test finding: CDC must match Full Load) ---
+
+  private static Schema bitsSchema(int length) {
+    return SchemaBuilder.bytes()
+        .name(DebeziumTypeConverter.BITS_TYPE)
+        .parameter("length", String.valueOf(length))
+        .optional()
+        .build();
+  }
+
+  @Test
+  void pgBitFixedLengthRendersBitString() {
+    // PG bit(8) B'11011011' -> Debezium little-endian bytes {0xDB} -> the bit-string
+    // "11011011" (matches psycopg / the Full Load write), NOT the MySQL integer 219. The
+    // live DLQ test proved the old integer path diverged the CDC write from Full Load.
+    assertEquals("11011011", DebeziumTypeConverter.pgBitString(new byte[] {(byte) 0xDB}, bitsSchema(8)));
+  }
+
+  @Test
+  void pgBitLeadingZerosPaddedToDeclaredLength() {
+    // bit(8) value 15 = {0x0F} -> "00001111" (left-padded to the declared length 8) exactly
+    // as psycopg returns; a bare binary of 15 would drop the leading zeros. All-zero -> all 0s.
+    assertEquals("00001111", DebeziumTypeConverter.pgBitString(new byte[] {0x0F}, bitsSchema(8)));
+    assertEquals("00000000", DebeziumTypeConverter.pgBitString(new byte[] {0x00}, bitsSchema(8)));
+  }
+
+  @Test
+  void pgVarbitRendersBitStringAtDeclaredLength() {
+    // varbit '1010101010' (10 bits) = 682, little-endian {0xAA,0x02}; with the declared
+    // length 10 it reconstructs exactly. (An unbounded bit varying whose per-value length is
+    // shorter than the declared max may carry extra leading zeros -- a documented best-effort
+    // residual: Debezium's byte encoding does not preserve the per-value bit length.)
+    assertEquals(
+        "1010101010",
+        DebeziumTypeConverter.pgBitString(new byte[] {(byte) 0xAA, 0x02}, bitsSchema(10)));
+  }
+
+  @Test
+  void pgBitStringHandlesWideValuesAndNonBytes() {
+    // > 64 bits must not overflow (BigInteger, not long): 9 bytes of 0xFF at length 72.
+    byte[] wide = new byte[9];
+    java.util.Arrays.fill(wide, (byte) 0xFF);
+    assertEquals("1".repeat(72), DebeziumTypeConverter.pgBitString(wide, bitsSchema(72)));
+    // a non-bytes value passes through unchanged (binds as-is; fails loudly if truly wrong).
+    assertEquals("x", DebeziumTypeConverter.pgBitString("x", bitsSchema(8)));
+  }
+
   @Test
   void arrayListPassesThroughUnchangedKnownGap() {
     // Documented gap: a PG array (a List, no logical schema name) hits the default branch and

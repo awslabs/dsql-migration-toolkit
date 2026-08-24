@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.sink.SinkRecord;
@@ -51,32 +52,35 @@ final class DebeziumEvents {
   private DebeziumEvents() {}
 
   static ChangeEvent parse(SinkRecord record) {
+    Object value = record.value();
+    Struct envelope = (value instanceof Struct) ? (Struct) value : null;
+    Struct source = envelope != null ? optStruct(envelope, "source") : null;
+    // Determine the origin engine (Debezium's source.connector) EARLY so PostgreSQL-specific
+    // value handling applies to the key/before PK extraction too, not just the after-image:
+    //   - the TOAST unavailable-value omission (see extractAfterImage), and
+    //   - PG bit/varbit rendered as the bit-string text (see convertField / pgBitString).
+    // A MySQL -- or unknown/tombstone -- source keeps byte-identical prior behavior (MySQL
+    // BIT stays an integer; the sentinel string is only ever real user data there).
+    boolean pgSource = source != null && "postgresql".equals(optString(source, "connector"));
+
     List<String> pkColumns = new ArrayList<>();
     List<Object> pkValues = new ArrayList<>();
-    extractStruct(record.key(), pkColumns, pkValues);
+    extractStruct(record.key(), pkColumns, pkValues, pgSource);
 
-    Object value = record.value();
     if (value == null) {
       // Tombstone -> delete by key. No envelope, so no source.ts_ms (lag unknown).
       return buildDelete(tableFromTopic(record.topic()), pkColumns, pkValues, 0L);
     }
-    if (!(value instanceof Struct envelope)) {
+    if (envelope == null) {
       throw new DataException(
           "Unsupported record value type; expected a Debezium Struct envelope");
     }
 
     String op = optString(envelope, "op");
-    Struct source = optStruct(envelope, "source");
     String table = resolveTable(envelope, record.topic());
     // Source commit time for the end-to-end replication-lag metric (now - ts at
     // apply). 0 when the source block omits ts_ms -> lag simply not recorded.
     long sourceTsMs = optLong(source, "ts_ms");
-    // The TOAST unavailable-value omission (see extractAfterImage) is a PostgreSQL-only
-    // concern, so gate it on the origin engine (Debezium's source.connector). A MySQL --
-    // or unknown -- source keeps byte-identical pre-Phase-D behavior: every after-image
-    // column is bound verbatim, even one whose value happens to equal the sentinel string
-    // (MySQL has no TOAST, so the sentinel is only ever real user data there).
-    boolean pgSource = "postgresql".equals(optString(source, "connector"));
     Struct after = optStruct(envelope, "after");
 
     if ("d".equals(op) || after == null) {
@@ -84,7 +88,7 @@ final class DebeziumEvents {
         // No message key: fall back to the before-image for the PK.
         Struct before = optStruct(envelope, "before");
         if (before != null) {
-          extractStruct(before, pkColumns, pkValues);
+          extractStruct(before, pkColumns, pkValues, pgSource);
         }
       }
       return buildDelete(table, pkColumns, pkValues, sourceTsMs);
@@ -115,7 +119,8 @@ final class DebeziumEvents {
     return ChangeEvent.delete(table, pkColumns, pkValues, sourceTsMs);
   }
 
-  private static void extractStruct(Object maybeStruct, List<String> names, List<Object> values) {
+  private static void extractStruct(
+      Object maybeStruct, List<String> names, List<Object> values, boolean pgSource) {
     if (!(maybeStruct instanceof Struct struct)) {
       return;
     }
@@ -123,10 +128,25 @@ final class DebeziumEvents {
       names.add(field.name());
       // Convert the Debezium-encoded value to its canonical DSQL-target form
       // (e.g. MicroTimestamp Long -> java.sql.Timestamp) so it matches the Full
-      // Load bulk loader's encoding before it is bound. The field's schema name
-      // carries the Debezium logical type that drives the conversion.
-      values.add(DebeziumTypeConverter.convert(field.schema().name(), struct.get(field)));
+      // Load bulk loader's encoding before it is bound.
+      values.add(convertField(field, struct.get(field), pgSource));
     }
+  }
+
+  /**
+   * Convert one field value to its DSQL-target form. Delegates to
+   * {@link DebeziumTypeConverter#convert(String, Object)} except for a PostgreSQL source's
+   * {@code io.debezium.data.Bits} (bit/varbit), which PostgreSQL treats as a bit STRING and
+   * the Full Load path writes as such -- so it is rendered via
+   * {@link DebeziumTypeConverter#pgBitString} (using the field schema's declared length)
+   * rather than the MySQL-BIT integer mapping. MySQL Bits keeps the integer mapping.
+   */
+  private static Object convertField(Field field, Object raw, boolean pgSource) {
+    Schema fieldSchema = field.schema();
+    if (pgSource && DebeziumTypeConverter.BITS_TYPE.equals(fieldSchema.name())) {
+      return DebeziumTypeConverter.pgBitString(raw, fieldSchema);
+    }
+    return DebeziumTypeConverter.convert(fieldSchema.name(), raw);
   }
 
   /**
@@ -173,7 +193,7 @@ final class DebeziumEvents {
         continue; // unchanged TOAST value: omit so the existing target value is kept
       }
       names.add(field.name());
-      values.add(DebeziumTypeConverter.convert(field.schema().name(), raw));
+      values.add(convertField(field, raw, dropToastPlaceholder));
     }
   }
 

@@ -14,6 +14,7 @@ import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.DataException;
 import org.postgresql.util.PGobject;
@@ -207,6 +208,56 @@ final class DebeziumTypeConverter {
       return result.longValue();
     }
     return new java.math.BigDecimal(result);
+  }
+
+  /**
+   * Render a Debezium {@code io.debezium.data.Bits} value as its PostgreSQL bit-string
+   * text ("11011011"), for a PostgreSQL SOURCE only. PostgreSQL {@code bit(n)} /
+   * {@code bit varying} are bit STRINGS, not integers: the Full Load path (psycopg) writes
+   * the exact bit-string to the remodeled text column, so the CDC path must match it --
+   * binding the MySQL-BIT integer instead ({@link #bitsToLong}) silently DIVERGED the two
+   * writes (Full Load "11011011" vs CDC "219"). Gated on the PG source in
+   * {@link DebeziumEvents}; a MySQL BIT keeps the integer mapping unchanged (byte-identical).
+   *
+   * <p>The bytes are little-endian; they are read into a positive {@link java.math.BigInteger}
+   * and formatted MSB-first, left-padded with leading zeros to the Debezium schema's declared
+   * bit {@code length} (so {@code bit(8)} value 15 -&gt; "00001111", matching psycopg). A fixed
+   * {@code bit(n)} reconstructs exactly; an unbounded {@code bit varying} value whose actual
+   * bit-length is shorter than the declared length may carry extra leading zeros (Debezium's
+   * byte encoding does not preserve the per-value length) -- a documented best-effort residual.
+   */
+  static Object pgBitString(Object value, Schema schema) {
+    if (!(value instanceof byte[])) {
+      return value; // not the expected bytes form -> bind as-is (fails loudly if wrong)
+    }
+    byte[] le = (byte[]) value;
+    byte[] be = new byte[le.length];
+    for (int i = 0; i < le.length; i++) {
+      be[i] = le[le.length - 1 - i]; // little-endian -> big-endian for a positive BigInteger
+    }
+    String bits = new java.math.BigInteger(1, be).toString(2);
+    int length = bitLengthParam(schema, bits.length());
+    if (bits.length() < length) {
+      bits = "0".repeat(length - bits.length()) + bits;
+    } else if (bits.length() > length) {
+      bits = bits.substring(bits.length() - length); // keep the low `length` bits
+    }
+    return bits;
+  }
+
+  /** The declared bit {@code length} parameter of a Debezium Bits schema, or {@code fallback}. */
+  private static int bitLengthParam(Schema schema, int fallback) {
+    if (schema != null && schema.parameters() != null) {
+      String len = schema.parameters().get("length");
+      if (len != null) {
+        try {
+          return Integer.parseInt(len.trim());
+        } catch (NumberFormatException ignored) {
+          // malformed parameter -> fall through to the fallback
+        }
+      }
+    }
+    return fallback;
   }
 
   /**

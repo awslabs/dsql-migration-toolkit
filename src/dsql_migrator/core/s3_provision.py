@@ -59,6 +59,16 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # The PluginVersion token stamped on the cdc-stack plugin resource names. Bumped
 # only when the on-disk artifacts change in an incompatible way (MSK Connect
 # CustomPlugins are immutable, so a new token forces fresh plugin resources).
+# v37 rebuilds the DSQL sink jar so a PostgreSQL-source bit/varbit column lands as its
+#    bit-STRING text ("11011011"), matching the Full Load path (psycopg returns the bit
+#    string). Before, the sink applied the MySQL-BIT rule (io.debezium.data.Bits
+#    little-endian bytes -> integer) to PG bit/varbit too, so CDC wrote "219" while Full
+#    Load wrote "11011011" -- a silent Full-Load-vs-CDC divergence (found by the live DLQ
+#    test). DebeziumEvents now renders PG Bits via DebeziumTypeConverter.pgBitString (padded
+#    to the Debezium schema's declared length), gated on source.connector==postgresql so a
+#    MySQL BIT stays an integer (byte-identical). A fixed bit(n) reconstructs exactly; an
+#    unbounded bit varying may carry extra leading zeros (documented best-effort residual).
+#    Sink-jar change only. A running cdc-stack keeps its current plugin until a redeploy.
 # v36 rebuilds the DSQL sink jar with PostgreSQL-source typed binds + TOAST handling
 #    (PG CDC Phase D). DebeziumTypeConverter now decodes the four PostgreSQL logical types
 #    the source connector emits (io.debezium.data.Uuid -> java.util.UUID; ZonedTime ->
@@ -335,7 +345,7 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 # existing plugin resource collides -- adding it needs no version bump and does NOT
 # force a Delete+Deploy on a live MySQL stack. Bump only when a plugin's CONTENT
 # changes.
-PLUGIN_VERSION = "v36"
+PLUGIN_VERSION = "v37"
 
 
 class S3ProvisionError(RuntimeError):
