@@ -15,8 +15,9 @@ _언어: [English](../en/11-customer-faq.md) | **한국어** | [日本語](../ja
 
 **Q1. 이 도구는 무엇을 어느 방향으로 마이그레이션하나요?**
 
-Amazon **RDS / Aurora MySQL → Amazon Aurora DSQL**, 단방향입니다. 버전 업그레이드가 아니라
-**이기종(heterogeneous)** 마이그레이션(MySQL → PostgreSQL 방언 → DSQL 제약)입니다 — DSQL은
+Amazon **RDS / Aurora MySQL → Amazon Aurora DSQL**, 단방향입니다. 지원 소스는 **RDS for MySQL**과
+**Aurora MySQL**의 **5.7 / 8.0 / 8.4** 버전입니다(모두 end-to-end 검증 — Full Load + CDC + 체크섬).
+버전 업그레이드가 아니라 **이기종(heterogeneous)** 마이그레이션(MySQL → PostgreSQL 방언 → DSQL 제약)입니다 — DSQL은
 PostgreSQL 와이어 호환, 분산, 서버리스, IAM 인증 방식입니다. **소스는 전 과정 내내 읽기 전용**이며,
 도구는 MySQL에 절대 쓰지 않습니다.
 
@@ -345,9 +346,9 @@ Validation(4단계)이 소스와 타깃을 **점점 더 엄격한 3단계**로 �
 
 **Q23. 마이그레이션 중 소스가 계속 바뀌면 검증이 틀리지 않나요?**
 
-아니요, 그 차이를 **원인별로 구분해** 알려 주므로 괜찮습니다. Validation은 현재 소스의 GTID를 Full
-Load 시점에 기록해 둔 워터마크와 대조해, 마이그레이션 중 소스가 얼마나 더 진행됐는지(**변경 누적,
-drift**)를 함께 보고합니다. 그래서 행 수 차이가 **마이그레이션 이후 새로 생긴 소스 변경 때문인지**,
+아니요, 그 차이를 **원인별로 구분해** 알려 주므로 괜찮습니다. Validation은 현재 소스 위치를(**GTID**로,
+GTID를 못 켠 경우 binlog **file:position**으로) Full Load 시점에 기록해 둔 워터마크와 대조해,
+마이그레이션 중 소스가 얼마나 더 진행됐는지(**변경 누적, drift**)를 함께 보고합니다. 그래서 행 수 차이가 **마이그레이션 이후 새로 생긴 소스 변경 때문인지**,
 아니면 **실제 문제 때문인지**를 구분할 수 있습니다. 컷오버 직전 최종 확인을 깨끗하게 하려면, 소스 쓰기를
 멈추고 CDC가 남은 변경을 모두 반영할 때까지 기다린 뒤 검증하세요(Q27).
 

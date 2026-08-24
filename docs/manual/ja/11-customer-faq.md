@@ -15,8 +15,9 @@ _言語: [English](../en/11-customer-faq.md) | [한국어](../ko/11-customer-faq
 
 **Q1. このツールは何を、どの方向に移行しますか？**
 
-Amazon **RDS / Aurora MySQL → Amazon Aurora DSQL**、単方向のみです。これはバージョンアップグレードではなく、
-**異機種（heterogeneous）** 移行（MySQL → PostgreSQL 方言 → DSQL 制約）です。DSQL は
+Amazon **RDS / Aurora MySQL → Amazon Aurora DSQL**、単方向のみです。サポートするソースは **RDS for MySQL**
+と **Aurora MySQL** の **5.7 / 8.0 / 8.4** バージョンです（すべてエンドツーエンドで検証済み — Full Load + CDC +
+チェックサム）。これはバージョンアップグレードではなく、**異機種（heterogeneous）** 移行（MySQL → PostgreSQL 方言 → DSQL 制約）です。DSQL は
 PostgreSQL ワイヤ互換で、分散型、サーバーレス、IAM 認証方式です。**ソースは全工程を通じて読み取り専用**であり、
 本ツールがお客様の MySQL に書き込むことは一切ありません。
 
@@ -318,8 +319,8 @@ Validation（ステップ4）は **証拠** を提供し、ソースとターゲ
 
 **Q23. 移行中もソースが変わり続けます。検証が誤らないのですか？**
 
-いいえ — 正しく帰属されます。Validation はソースの GTID を Full Load ウォーターマークと照合して読み取り、
-**ドリフト** を報告します。したがって、**新たなソース活動** による件数の差分はバグと区別されます。
+いいえ — 正しく帰属されます。Validation はソースの現在位置を（**GTID** で、GTID を有効化できない場合は
+binlog の **file:position** で）Full Load ウォーターマークと照合し、**ドリフト** を報告します。したがって、**新たなソース活動** による件数の差分はバグと区別されます。
 クリーンな最終的な go/no-go のためには、ソースへの書き込みを凍結し、先に CDC をドレインさせてください（Q27）。
 
 
