@@ -135,6 +135,15 @@ def _ddl_column_type(pg_type: str) -> str:
     lowered = pg_type.lower()
     if lowered.startswith("interval") and " " in lowered:
         return _TYPE_MODIFIER_RE.sub("", pg_type).rstrip()
+    if lowered.startswith("bit varying"):
+        # sqlglot's postgres reader cannot parse the two-word "bit varying"[(n)]
+        # (ParseError at "varying") -- and format_type ALWAYS spells varbit that way, so
+        # a real varbit column would abort the whole table via the unparsable fallback and
+        # collateral-damage its sibling columns. Emit the equivalent one-word alias
+        # "varbit"[(n)], which sqlglot parses. The column is still flagged UNSUPPORTED
+        # (bit strings are not a DSQL column type): unsupported_dsql_reason reads the
+        # ORIGINAL column.mysql_type, so the surfaced warning still names "bit varying".
+        return "varbit" + pg_type[len("bit varying"):]
     # Clamp an over-precision numeric(p,s) so the emitted DDL is valid for DSQL (the
     # warning is surfaced separately by the converter -- see convert_table's PG branch).
     return clamp_pg_numeric(pg_type)[0]

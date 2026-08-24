@@ -191,7 +191,11 @@ class PostgresSourceDialect(SourceDialect):
             rows = connection.execute(  # type: ignore[attr-defined]
                 text(
                     "SELECT a.attname AS col, "
-                    "format_type(a.atttypid, a.atttypmod) AS typ "
+                    "format_type(a.atttypid, a.atttypmod) AS typ, "
+                    # attgenerated: 's' = STORED generated column, '' = ordinary (PG12+,
+                    # the supported floor). DSQL has no generated columns, so the converter
+                    # warns and creates it as ordinary -- see _pg_generated_column_warning.
+                    "a.attgenerated AS gen "
                     "FROM pg_attribute a "
                     "JOIN pg_class c ON c.oid = a.attrelid "
                     "JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -200,11 +204,13 @@ class PostgresSourceDialect(SourceDialect):
                 ),
                 params,
             ).mappings()
-            exact = {row["col"]: row["typ"] for row in rows}
+            exact = {row["col"]: (row["typ"], row.get("gen")) for row in rows}
             for column in table.columns:
                 resolved = exact.get(column.name)
                 if resolved:
-                    column.mysql_type = resolved
+                    column.mysql_type = resolved[0]
+                    if resolved[1] == "s":  # STORED generated column
+                        column.generated = True
         return ([], [], [])
 
     def quote_identifier(self, name: str) -> str:

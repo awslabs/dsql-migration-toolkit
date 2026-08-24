@@ -558,6 +558,23 @@ def test_pg_pure_checks_wal_level_role_writer_replica_identity() -> None:
     ).status is PrerequisiteStatus.INFO
 
 
+def test_pg_replica_identity_index_and_default_pass() -> None:
+    # Regression: all three usable REPLICA IDENTITY codes must PASS -- 'd'
+    # (default/PK), 'f' (full) and 'i' (index) -- while 'n' (nothing) FAILs. Existing
+    # tests only pinned 'f', so 'd'/'i' could regress out of _USABLE_REPLICA_IDENTITY
+    # unnoticed.
+    from dsql_migrator.core.prerequisites_postgres import check_replica_identity
+
+    t = _table("app.orders")
+    for code in ("d", "f", "i"):
+        assert check_replica_identity(
+            t, _pg_facts_ok(replica_identity={"app.orders": code})
+        ).status is PrerequisiteStatus.PASS, code
+    assert check_replica_identity(
+        t, _pg_facts_ok(replica_identity={"app.orders": "n"})
+    ).status is PrerequisiteStatus.FAIL
+
+
 def test_required_failure_blocks_progression() -> None:
     # Target schema not applied for the selected table -> required FAIL.
     checker = PrerequisiteChecker(

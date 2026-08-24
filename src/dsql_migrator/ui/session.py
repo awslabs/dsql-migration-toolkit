@@ -26,6 +26,7 @@ from dsql_migrator.core.models import (
     AiAssistConfig,
     AiConversation,
     SourceConnectionConfig,
+    SourceType,
     TargetConnectionConfig,
     WorkflowState,
 )
@@ -63,6 +64,7 @@ class SessionConnectionState:
         "_migration_type_chosen",
         "_cdc_infra_inputs",
         "source_secret_id",
+        "restored_source_type",
     )
 
     def __init__(self) -> None:
@@ -145,6 +147,12 @@ class SessionConnectionState:
         # Connect screen -- the CDC deploy reads it to auto-fill SourceSecretArn/Name
         # (Property 7: only the non-secret reference is stored, never the credential).
         self.source_secret_id: Optional[str] = None
+        # The source ENGINE kind recovered from a snapshot restore (never the source
+        # connection/secret, which is not persisted). A hint only: it pre-selects the
+        # engine on the Connect screen so a PostgreSQL operator resuming a restored
+        # workbench does not land on the MySQL default. Cleared once a live source is
+        # reconnected (set_source) or on Start over.
+        self.restored_source_type: Optional[SourceType] = None
 
     def set_source(
         self,
@@ -158,6 +166,13 @@ class SessionConnectionState:
         """
         self.source_config = config
         self._source_password = password
+        # A live source supersedes any restored-engine hint (the picker now reads the
+        # real config's source_type).
+        self.restored_source_type = None
+
+    def set_restored_source_type(self, source_type: Optional[SourceType]) -> None:
+        """Record the source engine kind recovered from a snapshot restore (hint only)."""
+        self.restored_source_type = source_type
 
     @property
     def source_password(self) -> Optional[SecretValue]:
@@ -370,6 +385,7 @@ class SessionConnectionState:
         self._migration_type_chosen = False
         self._cdc_infra_inputs = {}
         self.source_secret_id = None
+        self.restored_source_type = None
 
     def __repr__(self) -> str:
         return (

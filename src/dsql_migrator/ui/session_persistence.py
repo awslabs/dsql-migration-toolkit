@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from dsql_migrator.core.models import StepStatus
+from dsql_migrator.core.models import SourceType, StepStatus
 from dsql_migrator.core.session_state_store import SessionSnapshot
 from dsql_migrator.ui.workflow import WorkflowStep, get_status, with_status
 
@@ -155,6 +155,12 @@ def capture_session_snapshot(
         snapshot.target_region = getattr(target, "region", None)
         snapshot.target_database = getattr(target, "database", None)
         snapshot.target_username = getattr(target, "username", None)
+    # The source ENGINE kind only (never the source connection/secret) so a restore can
+    # pre-select the right engine on Connect. Store its plain string value.
+    source = getattr(session, "source_config", None)
+    source_type = getattr(source, "source_type", None)
+    if source_type is not None:
+        snapshot.source_type = getattr(source_type, "value", source_type)
     result = eval_state.result  # type: ignore[attr-defined]
     if result is not None:
         snapshot.inventory = result.inventory
@@ -201,6 +207,15 @@ def apply_session_snapshot(
     from dsql_migrator.ui.evaluation import EvaluationResult
 
     session.set_workflow(snapshot.workflow.model_copy(deep=True))  # type: ignore[attr-defined]
+    # Pre-select the source engine on Connect from the persisted (non-secret) hint. The
+    # source connection itself is not restored -- the user re-enters credentials -- but
+    # a PG operator should not have to re-pick the engine. Unknown/older values fall back
+    # to the MySQL default at the picker (getattr on the enum).
+    if snapshot.source_type and hasattr(session, "set_restored_source_type"):
+        try:
+            session.set_restored_source_type(SourceType(snapshot.source_type))  # type: ignore[attr-defined]
+        except ValueError:
+            pass  # unknown engine string -> leave the hint unset (MySQL default)
     # Step 4 (Validation): re-hydrate the last report so a reconnect reopens the
     # result page instead of resetting to "Re-run". Marked restored so the UI can
     # note it is as-of the saved time (re-validate if the source has since changed).

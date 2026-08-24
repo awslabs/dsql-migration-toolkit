@@ -728,8 +728,13 @@ def build_connect_page(
         # Database-field guidance, and the source dialect (MySQL vs PostgreSQL).
         # Aurora-vs-RDS is NOT a choice here -- it is auto-detected from the
         # endpoint/version (infer, don't ask).
+        # Seed from the live source config if present, else the non-secret engine hint
+        # recovered from a snapshot restore (so a PG operator resuming a restored
+        # workbench is not reset to the MySQL default), else MySQL.
         _engine = {
-            "type": getattr(state.source_config, "source_type", SourceType.MYSQL)
+            "type": getattr(state.source_config, "source_type", None)
+            or getattr(state, "restored_source_type", None)
+            or SourceType.MYSQL
         }
 
         def _db_field_hint(source_type: SourceType) -> str:

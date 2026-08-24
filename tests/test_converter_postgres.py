@@ -340,3 +340,208 @@ def test_pg_source_multi_schema_emits_create_schema() -> None:
     assert '"sales"."orders"' in q.target_ddl
     u = conv.convert_table(TableDef(name="orders", columns=[_col("id", "bigint", False)], primary_key=["id"]))
     assert not u.schema_ddls
+
+
+# --- Tier-4 PG converter fixes -----------------------------------------------
+
+
+def test_pg_source_bytea_index_is_skipped_and_warned() -> None:
+    # T4-7: DSQL cannot build a key/index on a bytea column ("datatype bytea is not
+    # supported in a key"). On a PG source ColumnDef.mysql_type holds the exact PG type, so
+    # a bytea column reads as "bytea"; _maps_to_bytea now recognizes it, so a secondary index
+    # over it is SKIPPED (not emitted as a doomed CREATE INDEX ASYNC) and surfaced as a
+    # MANUAL/LOSS warning. A sibling non-bytea index is still emitted.
+    from dsql_migrator.core.models import ConversionNoteKind, IndexDef
+
+    table = TableDef(
+        name="public.docs",
+        columns=[_col("id", "bigint", False), _col("payload", "bytea"), _col("name", "text")],
+        primary_key=["id"],
+        indexes=[
+            IndexDef(name="ix_payload", columns=["payload"], unique=False),
+            IndexDef(name="ix_name", columns=["name"], unique=False),
+        ],
+    )
+    r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert not any("ix_payload" in d for d in r.index_ddls)  # doomed bytea index dropped
+    assert any("CREATE INDEX ASYNC" in d and "ix_name" in d for d in r.index_ddls)  # sibling kept
+    warn = [w for w in r.warnings if "bytea" in w.message.lower() and "ix_payload" in w.message]
+    assert warn, r.warnings
+    assert warn[0].classification is Classification.MANUAL
+    assert warn[0].kind is ConversionNoteKind.LOSS
+
+
+def test_pg_source_bytea_primary_key_is_flagged_unsupported() -> None:
+    # T4-7: a bytea PRIMARY KEY makes the generated CREATE TABLE REJECTED by DSQL. It was
+    # SILENT for a PG source (the warning was is_postgres-gated off); now it is surfaced as
+    # UNSUPPORTED rather than emitting a DDL that only fails at apply time.
+    table = TableDef(
+        name="public.blobs",
+        columns=[_col("k", "bytea", nullable=False), _col("v", "text")],
+        primary_key=["k"],
+    )
+    r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert any(
+        "bytea" in w.message.lower()
+        and "primary key" in w.message.lower()
+        and w.classification is Classification.UNSUPPORTED
+        for w in r.warnings
+    ), r.warnings
+
+
+@pytest.mark.parametrize("bit_type", ["bit varying", "bit varying(10)"])
+def test_pg_bit_varying_column_converts_without_aborting_table(bit_type: str) -> None:
+    # T4-6: format_type spells varbit as the two-word "bit varying"[(n)], which sqlglot's
+    # postgres reader CANNOT parse -> the whole table used to fall back to the generic
+    # "could not auto-convert" and every sibling column lost its conversion. The emitted DDL
+    # now uses the parseable one-word "varbit" alias, so the table converts, the bit column
+    # is still flagged UNSUPPORTED (named by its original "bit varying" type), and the
+    # sibling columns are preserved.
+    table = TableDef(
+        name="public.flags",
+        columns=[_col("id", "bigint", False), _col("mask", bit_type), _col("label", "text")],
+        primary_key=["id"],
+    )
+    r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert "could not auto-convert" not in r.target_ddl.lower()  # not the whole-table fallback
+    assert '"public"."flags"' in r.target_ddl
+    assert any(
+        w.column_name == "mask"
+        and w.classification is Classification.UNSUPPORTED
+        and "bit varying" in w.message
+        for w in r.warnings
+    ), r.warnings
+
+
+def test_bit_varying_ddl_is_emitted_as_parseable_varbit() -> None:
+    # T4-6 (unit): the two-word "bit varying"[(n)] is rewritten to the parseable "varbit"
+    # alias; a fixed-width bit(n) already parses and is left untouched.
+    from dsql_migrator.core.converter_postgres import _ddl_column_type
+
+    assert _ddl_column_type("bit varying") == "varbit"
+    assert _ddl_column_type("bit varying(10)") == "varbit(10)"
+    assert _ddl_column_type("bit(8)") == "bit(8)"
+    table = TableDef(
+        name="t",
+        columns=[_col("id", "bigint", False), _col("m", "bit varying(8)")],
+        primary_key=["id"],
+    )
+    sqlglot.parse_one(build_pg_source_ddl(table), read="postgres")  # must not raise
+
+
+@pytest.mark.parametrize(
+    "bare",
+    ["numeric", "varchar", "character varying", "char", "character",
+     "timestamp", "time", "text", "bytea", "uuid", "boolean"],
+)
+def test_bare_parameterless_pg_types_emit_verbatim_and_parse(bare: str) -> None:
+    # T4-5 regression guard: a parameterless PG type passes through _ddl_column_type
+    # unchanged (no spurious numeric clamp) and the emitted CREATE TABLE still parses as
+    # postgres (no parse abort).
+    from dsql_migrator.core.converter_postgres import _ddl_column_type
+
+    assert _ddl_column_type(bare) == bare
+    table = TableDef(
+        name="t", columns=[_col("id", "bigint", False), _col("c", bare)], primary_key=["id"]
+    )
+    sqlglot.parse_one(build_pg_source_ddl(table), read="postgres")  # must not raise
+
+
+def test_pg_stored_generated_column_warns_manual_with_pg_wording() -> None:
+    # T4-4: a PostgreSQL STORED generated column has no Aurora DSQL equivalent -> created as
+    # an ordinary column; Full Load copies the computed value (target starts correct) but
+    # nothing maintains it afterward. Surfaced as a MANUAL/LOSS warning with PG-specific
+    # wording (not the MySQL "SHOW CREATE TABLE" variant).
+    from dsql_migrator.core.models import ConversionNoteKind
+
+    gen = ColumnDef(name="full_name", mysql_type="text", nullable=True, generated=True)
+    table = TableDef(
+        name="public.people",
+        columns=[_col("id", "bigint", False), _col("first", "text"), gen],
+        primary_key=["id"],
+    )
+    r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    warn = [w for w in r.warnings if "generated" in w.message.lower() and "full_name" in w.message]
+    assert warn, r.warnings
+    assert warn[0].classification is Classification.MANUAL
+    assert warn[0].kind is ConversionNoteKind.LOSS
+    assert "PostgreSQL STORED" in warn[0].message  # PG-worded
+    assert "SHOW CREATE TABLE" not in warn[0].message  # not the MySQL variant
+
+
+def test_pg_source_without_generated_columns_emits_no_generated_warning() -> None:
+    # T4-4: no false positive -- an ordinary PG table emits no generated-column warning.
+    table = TableDef(
+        name="public.people",
+        columns=[_col("id", "bigint", False), _col("first", "text")],
+        primary_key=["id"],
+    )
+    r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert not any("generated" in w.message.lower() for w in r.warnings)
+
+
+# --- Tier-4 adversarial-verify follow-ups (unsupported PG column in a key/index) ----
+
+
+def test_pg_unsupported_type_pk_has_no_contradictory_key_size_note() -> None:
+    # A varbit/bit-varying PRIMARY KEY converts (T4-6) and is flagged UNSUPPORTED as a column
+    # type -- so the key-size estimator must NOT also fire a contradictory ">1 KiB / the DDL
+    # itself applies fine" note (which used to be a false ~1025-byte alarm from the
+    # unbounded-varlen fallback for a type the estimator does not recognize).
+    table = TableDef(
+        name="public.t3",
+        columns=[_col("flags", "bit varying(64)", nullable=False), _col("note", "text")],
+        primary_key=["flags"],
+    )
+    r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert any(
+        w.column_name == "flags" and w.classification is Classification.UNSUPPORTED
+        for w in r.warnings
+    )
+    assert not any(
+        "bytes combined" in w.message or "applies fine" in w.message for w in r.warnings
+    ), r.warnings
+
+
+@pytest.mark.parametrize("typ", ["bit varying(64)", "bytea[]", "int4range", "inet"])
+def test_pg_index_over_unsupported_column_is_not_emitted(typ: str) -> None:
+    # An index over a DSQL-unsupported PG column type (varbit, array, range, network, ...) is
+    # SKIPPED, not emitted as a doomed post-load CREATE INDEX ASYNC, and does not trigger a
+    # key-size note. The column itself is flagged UNSUPPORTED (must be remodelled).
+    from dsql_migrator.core.models import IndexDef
+
+    table = TableDef(
+        name="public.t",
+        columns=[_col("id", "bigint", False), _col("c", typ)],
+        primary_key=["id"],
+        indexes=[IndexDef(name="ix_c", columns=["c"], unique=False)],
+    )
+    r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert not any("ix_c" in d for d in r.index_ddls)  # doomed index skipped
+    assert not any("bytes combined" in w.message for w in r.warnings)
+    assert any(
+        w.column_name == "c" and w.classification is Classification.UNSUPPORTED
+        for w in r.warnings
+    )
+
+
+def test_pg_geometric_key_column_is_not_mislabeled_as_bytea() -> None:
+    # PG reuses the names point/polygon (which appear in the MySQL _SPATIAL_TYPES set), but a
+    # PG source does NOT substitute them to bytea -- so a point key/index must NOT get the
+    # MySQL "convert to bytea" wording. It is surfaced as an UNSUPPORTED column type (store as
+    # text) and its index is skipped.
+    from dsql_migrator.core.models import IndexDef
+
+    table = TableDef(
+        name="public.places",
+        columns=[_col("id", "integer", False), _col("loc", "point")],
+        primary_key=["id"],
+        indexes=[IndexDef(name="ix_loc", columns=["loc"], unique=False)],
+    )
+    r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert not any("ix_loc" in d for d in r.index_ddls)  # geometric index skipped
+    assert not any("bytea" in w.message.lower() for w in r.warnings)  # not mislabeled bytea
+    assert any(
+        w.column_name == "loc" and w.classification is Classification.UNSUPPORTED
+        for w in r.warnings
+    )

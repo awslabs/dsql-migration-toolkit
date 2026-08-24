@@ -145,7 +145,10 @@ class ColumnDef(BaseModel):
     collation: Optional[str] = None
     generated: bool = Field(
         default=False,
-        description="True for a MySQL generated/computed column (VIRTUAL/STORED).",
+        description=(
+            "True for a generated/computed column: MySQL VIRTUAL/STORED, or a "
+            "PostgreSQL GENERATED ALWAYS AS (...) STORED column."
+        ),
     )
     auto_update_timestamp: bool = Field(
         default=False,

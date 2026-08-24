@@ -133,6 +133,13 @@ class SessionSnapshot(BaseModel):
     target_region: Optional[str] = None
     target_database: Optional[str] = None
     target_username: Optional[str] = None
+    # The source ENGINE kind ("mysql" / "postgres") -- NOT the source connection (that
+    # carries a secret and stays unpersisted, above). Kept so a snapshot restore can
+    # pre-select the right engine on the Connect screen instead of always defaulting to
+    # MySQL; a PostgreSQL operator resuming a restored workbench would otherwise land on
+    # MySQL + port 3306 and have to re-pick. Optional/None on older snapshots -> the
+    # picker falls back to the MySQL default (unchanged for every MySQL session).
+    source_type: Optional[str] = None
     # AI Assist preference (non-secret: a toggle + Bedrock model id/region, never a
     # credential). Persisted so a reconnecting session keeps the user's choice
     # instead of resetting the toggle to off on every restart. Optional/defaulted

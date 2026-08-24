@@ -169,6 +169,32 @@ def test_postgres_dialect_enrich_captures_exact_pg_types() -> None:
     assert table.columns[2].mysql_type == "TEXT"  # not in catalog rows -> unchanged
 
 
+def test_postgres_dialect_enrich_flags_stored_generated_columns() -> None:
+    # T4-4: enrich reads pg_attribute.attgenerated -> a STORED generated column ('s') sets
+    # ColumnDef.generated so the converter can warn (DSQL has no generated columns). An
+    # ordinary column (attgenerated '') stays generated=False.
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    conn = _FakePgConnection(
+        [
+            {"col": "id", "typ": "bigint", "gen": ""},
+            {"col": "full_name", "typ": "text", "gen": "s"},
+        ]
+    )
+    table = TableDef(
+        name="people",
+        columns=[
+            ColumnDef(name="id", mysql_type="BIGINT"),
+            ColumnDef(name="full_name", mysql_type="TEXT"),
+        ],
+        primary_key=["id"],
+    )
+    dialect_for(SourceType.POSTGRES).enrich(conn, "shop", [table])
+    assert table.columns[0].generated is False  # ordinary column
+    assert table.columns[1].generated is True  # STORED generated column
+    assert table.columns[1].mysql_type == "text"
+
+
 def test_postgres_dialect_value_converter_returns_pg_converter() -> None:
     # Phase 2: PG Full Load value conversion is implemented -- the dialect returns a
     # PostgresValueConverter (own module) exposing the convert_row/convert_value contract.

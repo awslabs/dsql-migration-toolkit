@@ -1063,6 +1063,74 @@ def test_delete_pg_slot_drop_failure_is_loud_but_not_fatal(monkeypatch) -> None:
     ), logs
 
 
+def test_delete_pg_missing_host_skips_drop_gracefully(monkeypatch) -> None:
+    # A PostgreSQL teardown whose captured stack params carry no source host cannot
+    # reconstruct the source connection, so the slot drop is skipped BEFORE any engine
+    # is built -- but it must log a loud manual-drop reminder (a surviving slot pins
+    # WAL) and let the (already-complete) teardown finish.
+    from dsql_migrator.core import cdc_pg_slot
+
+    built: list = []
+    monkeypatch.setattr(
+        cdc_pg_slot, "build_pg_source_write_engine",
+        lambda src, pw: built.append((src, pw)),
+    )
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    params = dict(_PG_DELETE_PARAMS)
+    params["SourceDbHostname"] = ""
+    existing = CdcStackDiscovery("CREATE_COMPLETE", params, True)
+    deployer = _FakeDeployer(existing=existing, stack_statuses=("DELETE_IN_PROGRESS", None))
+    run_cdc_delete(
+        handle, stack_name=STACK, deployer=deployer, on_log=on_log,
+        sleep=lambda _s: None, delete_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    assert all(s == "DONE" for s in _statuses(handle).values())
+    assert built == []  # no source engine built when the host is unknown
+    assert any(
+        "WARNING" in m and "source host" in m and "pg_drop_replication_slot" in m
+        for m in logs
+    ), logs
+
+
+def test_delete_pg_no_credentials_skips_drop_gracefully(monkeypatch) -> None:
+    # A PostgreSQL teardown where the source credentials can't be resolved (no
+    # tool-managed secret and no stack SourceSecretArn/Name fallback) must catch the
+    # SecretResolutionError, never build a source engine, log a loud manual-drop
+    # reminder, and let the (already-complete) teardown finish.
+    from dsql_migrator.core import cdc_pg_slot
+    import dsql_migrator.core.secrets as secrets
+    from dsql_migrator.core.secrets import SecretResolutionError
+
+    built: list = []
+    monkeypatch.setattr(
+        cdc_pg_slot, "build_pg_source_write_engine",
+        lambda src, pw: built.append((src, pw)),
+    )
+    monkeypatch.setattr(
+        secrets, "resolve_source_secret",
+        lambda secret_id, prof, region=None: (_ for _ in ()).throw(
+            SecretResolutionError("none")
+        ),
+    )
+    monkeypatch.setattr(secrets, "delete_source_secret", lambda **k: "absent")
+
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    params = dict(_PG_DELETE_PARAMS)  # no SourceSecretArn/Name -> no fallback
+    existing = CdcStackDiscovery("CREATE_COMPLETE", params, True)
+    deployer = _FakeDeployer(existing=existing, stack_statuses=("DELETE_IN_PROGRESS", None))
+    run_cdc_delete(
+        handle, stack_name=STACK, deployer=deployer, on_log=on_log, region="us-east-1",
+        sleep=lambda _s: None, delete_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    assert all(s == "DONE" for s in _statuses(handle).values())
+    assert built == []  # creds unresolved -> engine never built
+    assert any(
+        "WARNING" in m and "pg_drop_replication_slot" in m for m in logs
+    ), logs
+
+
 def test_delete_absent_stack_is_noop_success() -> None:
     handle = _FakeHandle()
     logs, on_log = _logs()
