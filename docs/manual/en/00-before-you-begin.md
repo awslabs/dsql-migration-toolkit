@@ -83,7 +83,10 @@ one-line "must know" plus a pointer to the chapter that covers it in depth.
       credentials (the `bedrock:InvokeModel` permission). There is **no direct
       API-key entry** (no Anthropic/OpenAI key field) — the only way to use AI is
       Bedrock. Every suggestion is **review-only** and AI is never in the data
-      path. → [Chapter 2](02-evaluation-and-schema-conversion.md)
+      path. The same assistant is available on **every step** as the **AI DBA**
+      panel — a read-only helper that can diagnose Full Load / CDC failures, triage
+      the DLQ, and check prerequisites. → [Chapter 2](02-evaluation-and-schema-conversion.md),
+      [Chapter 9](09-query-validation.md)
 
 - [ ] **(If deploying on AWS) it's a single-task control plane with optional auth.**
       The usual form is one **ECS Fargate** task behind an ALB with the ALB's

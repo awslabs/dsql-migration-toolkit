@@ -48,6 +48,15 @@ DSQL 타깃 스키마는 **Schema Conversion** 단계에서 고정됩니다. **C
 동일 DDL을 DSQL에 직접(Schema Conversion으로) **먼저** 적용하세요. 그 전까지, 타깃 형태에 맞지 않는
 행(예: 새 컬럼 참조)은 손실되지 않고 **DLQ**로 격리됩니다 — 조용히 사라지지 않습니다.
 
+### CDC 중 소스 스키마 드리프트 감지·처리
+
+소스 `ALTER`를 직접 눈치챌 필요가 없습니다. 데드레터 레코드가 소스 형태 변경을 시사하면, 도구가
+SQLSTATE로 드리프트를 **분류**(컬럼 추가/삭제/타입 변경)하고 CDC 단계에 **"소스 스키마 변경 감지"** 배너를
+표시합니다. 흔한 경우인 소스 **`ADD COLUMN`**에 대해서는 정확한 `ALTER TABLE … ADD COLUMN` 문을 보여주고
+원클릭 적용(트랜잭션당 1 DDL)하는 **"Fix target schema…"** 액션을 제공합니다; 이후 CDC가 재개되고, 컬럼이
+없던 동안 밀쳐뒀던 행은 테이블별 **Reload**로 백필합니다. 컬럼 삭제/타입 변경 드리프트는 직접 해결하도록
+표시만 합니다(도구는 타깃 데이터를 자동 삭제하지 않습니다).
+
 ---
 
 ## 4.3 무손실 Full Load → CDC 핸드오프
@@ -177,6 +186,20 @@ CDC 실행 중에는 Data Migration 화면이 테이블별 실시간 모니터�
 
 지연 측정은 철저히 **best-effort**이며 복제에 영향을 주지 않습니다. "Stream lag → caught up"을
 [cut over](10-conclusion.md)로 넘어가도 안전하다는 신호로 사용하세요.
+
+### 파이프라인 헬스와 change flow
+
+per-table 표 위에 **파이프라인 헬스 카드**가 각 커넥터 상태와 **"change flow"** 상태 줄을 보여줍니다 —
+*Streaming*, *No changes flowing — idle*, 또는 **"Sink stalled — changes are NOT reaching DSQL"** — 소스 poll과
+싱크 send의 rec/s 게이지 두 개와 함께라 유휴 스트림과 멈춘 스트림을 한눈에 구분합니다. **라이브 stream-lag
+차트**는 최악의 종단 지연을 시간축으로 그려 "caught up"과 확정된 싱크 stall을 구분합니다.
+
+### DLQ 들여다보기
+
+인터랙티브 **DLQ 인스펙터**가 데드레터 레코드를 **Time / Table / SQLSTATE / Reason**으로 나열합니다 —
+페이지·필터 지원, 테이블별 분해와 depth 배지 포함 — UI를 벗어나지 않고 poison 행을 트리아지할 수
+있습니다. **"Download CDC error log"**로 NDJSON 내보내기. (Reason에는 SQL 템플릿이 담기고 행 값은 없습니다
+— §4.5 참고.)
 
 ---
 

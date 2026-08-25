@@ -57,6 +57,18 @@ yourself (via Schema Conversion) **first**. Until you do, rows that no longer
 match the target shape (e.g. referencing a new column) are isolated to the **DLQ**
 rather than lost — visible, not silent.
 
+### Detecting and handling source schema drift
+
+You don't have to notice a source `ALTER` yourself. When dead-lettered records
+indicate the source shape changed, the tool **classifies the drift** by SQLSTATE
+(added column / dropped column / type change) and shows a **"Source schema change
+detected"** banner on the CDC step. For the common case — a source **`ADD COLUMN`** —
+it offers a **"Fix target schema…"** action that shows the exact `ALTER TABLE … ADD
+COLUMN` statements and applies them (one DDL per transaction); CDC then resumes and
+you use the per-table **Reload** to backfill the rows that were set aside while the
+column was missing. Drop-column / type-change drifts are surfaced for you to resolve
+by hand (the tool never drops target data automatically).
+
 ---
 
 ## 4.3 The gapless Full Load → CDC handoff
@@ -208,6 +220,23 @@ value.
 Lag is emitted strictly **best-effort** and never affects replication. Use "Stream
 lag → caught up" as the signal that it's safe to proceed to
 [cut-over](10-conclusion.md).
+
+### Pipeline health and change flow
+
+Above the per-table table, a **pipeline-health card** shows each connector's state
+and a **"change flow"** status line — *Streaming*, *No changes flowing — idle*, or
+**"Sink stalled — changes are NOT reaching DSQL"** — with two rec/s gauges (source
+poll vs sink send), so you can tell an idle stream from a stuck one at a glance. A
+**live stream-lag chart** plots the worst end-to-end lag over time, distinguishing
+"caught up" from a confirmed sink stall.
+
+### Inspecting the DLQ
+
+An interactive **DLQ inspector** lists dead-lettered records — **Time / Table /
+SQLSTATE / Reason** — paged and filterable, with a per-table breakdown and a depth
+badge, so you can triage poison rows without leaving the UI. **"Download CDC error
+log"** exports them as NDJSON. (The reason carries the SQL template, never row
+values — see §4.5.)
 
 ---
 

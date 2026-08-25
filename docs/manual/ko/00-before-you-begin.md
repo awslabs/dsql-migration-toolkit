@@ -66,8 +66,10 @@ _언어: [English](../en/00-before-you-begin.md) | **한국어** | [日本語](.
 - [ ] **AI 어시스트는 선택이며 Amazon Bedrock으로만 가능합니다.** AI는 **기본 꺼짐**이고, 켜면 AWS
       자격증명(`bedrock:InvokeModel` 권한)으로 **오직 Amazon Bedrock을 통해서만** 동작합니다.
       **직접 API 키 입력은 지원하지 않습니다**(Anthropic/OpenAI 키 입력란 없음) — AI를 쓰는 유일한
-      경로는 Bedrock입니다. 모든 제안은 **검토 전용**이며 AI는 데이터 경로에 절대 없습니다.
-      → [2장](02-evaluation-and-schema-conversion.md)
+      경로는 Bedrock입니다. 모든 제안은 **검토 전용**이며 AI는 데이터 경로에 절대 없습니다. 같은
+      어시스턴트가 **모든 단계**에서 **AI DBA** 패널로 제공됩니다 — Full Load / CDC 실패 진단, DLQ
+      트리아지, 사전점검 확인을 하는 read-only 도우미입니다.
+      → [2장](02-evaluation-and-schema-conversion.md), [9장](09-query-validation.md)
 
 - [ ] **(AWS 배포 시) 단일 태스크 컨트롤 플레인이며 인증은 선택입니다.** 일반적인 형태는 ALB 뒤의
       **ECS Fargate** 태스크 하나이며 ALB의 **선택적 Cognito** 게이트를 씁니다(인터넷에 노출되는 배포에선

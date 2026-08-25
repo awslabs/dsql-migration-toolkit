@@ -565,4 +565,23 @@ a high change rate. Scale it with the §7.2 CDC parameters when you need through
 
 ---
 
+## 7.6 The Settings dialog (tuning, diagnostics, activity log)
+
+The knobs above are also editable **in the UI** without a restart: the **Settings**
+entry (sidebar footer) opens a tabbed dialog with —
+
+- **Full Load / CDC / Validation** tabs — the tunable knobs from §7.2 (table & batch
+  parallelism, batch rows, the source-load throttle, CDC sink MCU, validation
+  workers), each applied to the **next** run of that step.
+- a **Diagnostics** tab — set the app **log level** (DEBUG / INFO / WARNING / ERROR)
+  and toggle **"mirror to stdout"** so logs also reach the container's CloudWatch log
+  group for a debugging window.
+- an **Activity log** tab — download the session's activity log (the same feed the AI
+  DBA reads).
+
+Changes made in the dialog **revert on restart**; to persist one, set its
+`DSQL_MIGRATOR_*` environment variable (listed in §7.2) instead.
+
+---
+
 **Next:** [8. Testing and verification →](08-testing-and-verification.md)

@@ -440,4 +440,20 @@ PK의 같은 키 구간으로 쓰기가 몰리기 때문으로, §7.1의 핫 파
 
 ---
 
+## 7.6 Settings 다이얼로그 (튜닝·진단·활동 로그)
+
+위 knob들은 재시작 없이 **UI에서도** 편집할 수 있습니다: **Settings**(사이드바 하단)가 탭 다이얼로그를
+엽니다 —
+
+- **Full Load / CDC / Validation** 탭 — §7.2의 튜닝 knob(테이블·배치 병렬수, 배치 행수, 소스 부하 스로틀,
+  CDC 싱크 MCU, 검증 워커)을 각각 해당 단계의 **다음** 실행에 적용.
+- **Diagnostics** 탭 — 앱 **로그 레벨**(DEBUG / INFO / WARNING / ERROR) 설정 + **"mirror to stdout"** 토글로
+  로그를 컨테이너의 CloudWatch 로그 그룹에도 보내 디버깅 창을 확보.
+- **Activity log** 탭 — 세션 활동 로그 다운로드(AI DBA가 읽는 그 피드).
+
+다이얼로그 변경은 **재시작 시 되돌아갑니다**; 유지하려면 해당 `DSQL_MIGRATOR_*` 환경변수(§7.2 목록)를
+설정하세요.
+
+---
+
 **다음:** [8. 테스트 및 검증 →](08-testing-and-verification.md)
