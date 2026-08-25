@@ -216,6 +216,29 @@ class SourceDialect(ABC):
     def snapshot_start_sql(self) -> str:
         """SQL that opens the read-only consistent-snapshot transaction for a stream."""
 
+    @property
+    def supports_shared_snapshot(self) -> bool:
+        """Whether multiple shard readers can share ONE point-in-time snapshot.
+
+        When True, range-sharding a table's read is consistent even on a live source and
+        WITHOUT a CDC stream to reconcile it: every shard imports the same exported snapshot
+        (one point-in-time cut), so no cross-shard torn read is possible. PostgreSQL supports
+        this (``pg_export_snapshot`` / ``SET TRANSACTION SNAPSHOT`` -- the mechanism
+        ``pg_dump -j`` uses); MySQL/InnoDB has no equivalent, so it stays False (each shard
+        opens its own independently-timed snapshot, safe only under a CDC handoff).
+        """
+        return False
+
+    def export_snapshot_sql(self) -> str:
+        """SQL returning a snapshot id to share across shard readers (only on a dialect
+        whose :pyattr:`supports_shared_snapshot` is True)."""
+        raise NotImplementedError("this source dialect cannot export a shared snapshot")
+
+    def set_transaction_snapshot_sql(self, snapshot_id: str) -> str:
+        """SQL that makes the CURRENT transaction read the exported ``snapshot_id``. Must run
+        as the FIRST statement after :pyattr:`snapshot_start_sql`, before any query."""
+        raise NotImplementedError("this source dialect cannot import a shared snapshot")
+
     @abstractmethod
     def value_converter(self, table: object, *, target_types: object = None) -> object:
         """Per-row value converter for reading ``table`` from this source.

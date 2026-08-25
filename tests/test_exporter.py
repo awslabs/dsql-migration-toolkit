@@ -47,7 +47,12 @@ from dsql_migrator.core.exporter import (
     shardable_leading_int_pk,
 )
 from dsql_migrator.core.introspector import is_write_or_ddl
-from dsql_migrator.core.models import ColumnDef, SourceConnectionConfig, TableDef
+from dsql_migrator.core.models import (
+    ColumnDef,
+    SourceConnectionConfig,
+    SourceType,
+    TableDef,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +137,11 @@ class _FakeConnection:
             self._tr_index += 1
             return _StatusResult(value)
         self.executed.append((sql, parameters))
-        if upper.startswith("START TRANSACTION") or upper.startswith("COMMIT"):
+        if (
+            upper.startswith("START TRANSACTION")
+            or upper.startswith("COMMIT")
+            or upper.startswith("SET TRANSACTION")  # incl. SET TRANSACTION SNAPSHOT
+        ):
             return _FakeResult([])
 
         self.page_queries += 1
@@ -566,6 +575,43 @@ def test_table_exporter_no_governor_when_ceiling_zero() -> None:
     out = list(exporter.stream_converted_rows(_source_config(), _simple_table()))
     assert [r["id"] for r in out] == [1]
     assert conn.status_reads == 0
+
+
+def _pg_source_config() -> SourceConnectionConfig:
+    return SourceConnectionConfig(
+        source_type=SourceType.POSTGRES, host="pg.example.com", port=5432, database="app"
+    )
+
+
+def test_stream_converted_rows_adopts_the_shared_snapshot() -> None:
+    # A PG shard given shared_snapshot_id runs SET TRANSACTION SNAPSHOT as the FIRST statement
+    # after the snapshot start (before any page read), so every shard reads one point-in-time
+    # cut -- a consistent range-sharded read even for a REPLACE (no-CDC) load.
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 4)]
+    conn = _FakeConnection(rows)
+    exporter = TableExporter(engine_factory=lambda _cfg: _FakeEngine(conn))
+    out = list(exporter.stream_converted_rows(
+        _pg_source_config(), _simple_table(), shared_snapshot_id="00000003-0000001B-1"
+    ))
+    assert [r["id"] for r in out] == [1, 2, 3]
+    stmts = [s.strip().upper() for s, _ in conn.executed]
+    assert any(
+        "SET TRANSACTION SNAPSHOT '00000003-0000001B-1'" in s for s, _ in conn.executed
+    )
+    i_start = next(i for i, s in enumerate(stmts) if s.startswith("START TRANSACTION"))
+    i_set = next(i for i, s in enumerate(stmts) if s.startswith("SET TRANSACTION SNAPSHOT"))
+    i_read = next(i for i, s in enumerate(stmts) if s.startswith("SELECT"))
+    assert i_start < i_set < i_read  # snapshot start -> adopt shared snapshot -> read
+
+
+def test_stream_converted_rows_no_shared_snapshot_by_default() -> None:
+    # Without shared_snapshot_id (default), NO SET TRANSACTION SNAPSHOT is emitted -- the
+    # stream keeps its own snapshot (unchanged single-reader / MySQL behavior).
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 4)]
+    conn = _FakeConnection(rows)
+    exporter = TableExporter(engine_factory=lambda _cfg: _FakeEngine(conn))
+    list(exporter.stream_converted_rows(_pg_source_config(), _simple_table()))
+    assert not any("SNAPSHOT" in s.upper() for s, _ in conn.executed)
 
 
 def test_stream_converted_rows_reports_throttle_transitions(monkeypatch) -> None:

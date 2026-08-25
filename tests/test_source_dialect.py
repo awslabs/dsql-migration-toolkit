@@ -195,6 +195,33 @@ def test_postgres_dialect_enrich_flags_stored_generated_columns() -> None:
     assert table.columns[1].mysql_type == "text"
 
 
+def test_postgres_dialect_supports_shared_snapshot_and_renders_export_import_sql() -> None:
+    # PG shards can share ONE exported snapshot (pg_export_snapshot / SET TRANSACTION
+    # SNAPSHOT, like pg_dump -j) -> a consistent range-sharded read even for a REPLACE
+    # (no-CDC) load. The snapshot id can't be a bind param, so it is validated strictly.
+    pg = dialect_for(SourceType.POSTGRES)
+    assert pg.supports_shared_snapshot is True
+    assert pg.export_snapshot_sql() == "SELECT pg_export_snapshot()"
+    assert pg.set_transaction_snapshot_sql("00000003-0000001B-1") == (
+        "SET TRANSACTION SNAPSHOT '00000003-0000001B-1'"
+    )
+    # an id with quotes/whitespace/; is rejected (injection guard), since it is interpolated
+    for bad in ("x'; DROP TABLE t --", "a b", "a;b", "", "a'b"):
+        with pytest.raises(ValueError):
+            pg.set_transaction_snapshot_sql(bad)
+
+
+def test_mysql_dialect_has_no_shared_snapshot() -> None:
+    # InnoDB has no exported-snapshot equivalent -> shards fall back to their own snapshots
+    # (safe only under a CDC handoff). The base defaults must raise, not silently no-op.
+    my = dialect_for(SourceType.MYSQL)
+    assert my.supports_shared_snapshot is False
+    with pytest.raises(NotImplementedError):
+        my.export_snapshot_sql()
+    with pytest.raises(NotImplementedError):
+        my.set_transaction_snapshot_sql("whatever")
+
+
 def test_postgres_dialect_value_converter_returns_pg_converter() -> None:
     # Phase 2: PG Full Load value conversion is implemented -- the dialect returns a
     # PostgresValueConverter (own module) exposing the convert_row/convert_value contract.

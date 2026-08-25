@@ -13,6 +13,7 @@ Phase-2 item that fails loudly rather than risk a silent mis-conversion.
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from sqlalchemy import text
@@ -247,6 +248,25 @@ class PostgresSourceDialect(SourceDialect):
     def snapshot_start_sql(self) -> str:
         # PostgreSQL consistent read snapshot for the streaming read.
         return "START TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+
+    @property
+    def supports_shared_snapshot(self) -> bool:
+        # PostgreSQL exports a snapshot so all shard readers observe one point-in-time cut,
+        # making a range-sharded read consistent even on a live source with no CDC handoff.
+        return True
+
+    def export_snapshot_sql(self) -> str:
+        # Run inside the anchor's REPEATABLE READ transaction (held open for the load); the
+        # returned id is imported by each shard via set_transaction_snapshot_sql.
+        return "SELECT pg_export_snapshot()"
+
+    def set_transaction_snapshot_sql(self, snapshot_id: str) -> str:
+        # The snapshot id cannot be a bind parameter (SET TRANSACTION SNAPSHOT takes a
+        # literal), so validate it strictly before interpolating. pg_export_snapshot ids are
+        # short tokens like "00000003-0000001B-1"; reject anything with quotes/whitespace/;.
+        if not re.fullmatch(r"[0-9A-Za-z._-]+", snapshot_id or ""):
+            raise ValueError(f"unexpected PostgreSQL exported-snapshot id: {snapshot_id!r}")
+        return f"SET TRANSACTION SNAPSHOT '{snapshot_id}'"
 
     def value_converter(self, table: object, *, target_types: object = None) -> object:
         # PG->DSQL is psycopg-native on both ends, so Full Load value conversion is pure

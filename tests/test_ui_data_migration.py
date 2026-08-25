@@ -430,7 +430,10 @@ class _FakeExporter:
         pk_lower=None,
         pk_upper=None,
         on_throttle=None,
+        shared_snapshot_id=None,
     ) -> list[dict]:
+        self.shared_snapshot_ids = getattr(self, "shared_snapshot_ids", [])
+        self.shared_snapshot_ids.append(shared_snapshot_id)
         self.streamed.append(table.name)
         self.target_types_by_table[table.name] = target_types
         self.stream_columns_by_table[table.name] = [c.name for c in table.columns]
@@ -1757,6 +1760,111 @@ def test_shard_worker_keys_on_the_target_composite_pk(monkeypatch) -> None:
     assert result.status == "DONE"
     assert seen["on_conflict"] is OnConflictMode.SKIP_EXISTING
     assert seen["key_columns"] == ["customer_id", "id"]
+
+
+def test_shard_worker_forwards_shared_snapshot_id_to_the_exporter(monkeypatch) -> None:
+    # A sharded read forwards its shared_snapshot_id to stream_converted_rows so every shard
+    # adopts the SAME exported point-in-time snapshot -> a consistent range-sharded read even
+    # for a REPLACE (no-CDC) load (PostgreSQL). The parent exports the id once; each shard
+    # imports it here.
+    import dataclasses
+
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    table = _tables()[0]
+    inputs = dataclasses.replace(
+        _inputs(), replace_tables=frozenset(), table_conversions={"orders": _composite_applied()}
+    )
+    fake_exporter = _FakeExporter()
+
+    class _NoopImporter:
+        def import_rows(self, rows, _table, **_kw):
+            list(rows)
+            return BatchedImportResult(rows_loaded=1, failures=0)
+
+    monkeypatch.setattr(
+        _engine, "BatchedTableMigrator",
+        lambda inp: BatchedTableMigrator(
+            inp, exporter=fake_exporter,
+            watermark_capturer=_FakeWatermarkCapturer(_watermark()),
+            importer_factory=lambda _i: _NoopImporter(),
+            target_counter=lambda _t: None,
+        ),
+    )
+
+    result = _engine._migrate_shard_in_process(
+        _engine._ShardWorkerArgs(
+            job_id="j", table=table, inputs=inputs,
+            pk_lower=0, pk_upper=1000, shard_index=0,
+            shared_snapshot_id="00000003-0000001B-1",
+        )
+    )
+    assert result.status == "DONE"
+    assert "00000003-0000001B-1" in getattr(fake_exporter, "shared_snapshot_ids", [])
+
+
+def test_open_shared_snapshot_closes_connection_on_failure() -> None:
+    # On a build failure (empty exported id -> RuntimeError, or any SQL error) the anchor's
+    # checked-out connection must be closed BEFORE the engine is disposed -- engine.dispose()
+    # does not close a leased connection, so its open REPEATABLE READ txn would linger.
+    import pytest
+
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.core.source_dialect import dialect_for
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    calls: list[str] = []
+
+    class _Res:
+        def scalar(self):
+            return None  # empty exported-snapshot id -> RuntimeError
+
+    class _Conn:
+        def execution_options(self, **_k):
+            return self
+
+        def execute(self, *_a, **_k):
+            return _Res()
+
+        def close(self):
+            calls.append("conn.close")
+
+    class _Eng:
+        def connect(self):
+            calls.append("connect")
+            return _Conn()
+
+        def dispose(self):
+            calls.append("engine.dispose")
+
+    class _Mig:
+        class _exporter:
+            _engine_factory = staticmethod(lambda _cfg: _Eng())
+
+        class _inputs:
+            source_config = None
+
+    with pytest.raises(RuntimeError):
+        _engine._open_shared_snapshot(_Mig(), dialect_for(SourceType.POSTGRES))
+    assert calls == ["connect", "conn.close", "engine.dispose"]  # conn closed before dispose
+
+
+def test_shared_snapshot_anchor_opened_inside_the_pool_try() -> None:
+    # The anchor open must sit INSIDE the try whose finally tears down the progress-drain
+    # thread/queue and closes the anchor. Opening it before that try would leak the drain
+    # thread on a build failure (source unreachable / export error).
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    src = inspect.getsource(_engine._migrate_tables_in_parallel)
+    i_open = src.index("_open_shared_snapshot(")
+    i_pool = src.index("with ProcessPoolExecutor(")
+    try_before_pool = src.rindex("try:", 0, i_pool)
+    assert try_before_pool < i_open < i_pool, (
+        "the shared-snapshot anchor must be opened inside the pool try so its finally "
+        "always runs (drain-thread teardown + _close_shared_snapshot) on a build failure"
+    )
 
 
 def test_shard_worker_leaves_an_unchanged_pk_to_the_source_fallback(monkeypatch) -> None:

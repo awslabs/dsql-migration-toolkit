@@ -646,6 +646,10 @@ class _ShardWorkerArgs:
     pk_lower: Optional[int]
     pk_upper: Optional[int]
     shard_index: int
+    # A dialect-exported snapshot id all shards import so they share ONE point-in-time cut
+    # (consistent sharded read of a REPLACE load without CDC). None => each shard uses its
+    # own snapshot (MySQL, or the CDC-handoff path).
+    shared_snapshot_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1059,6 +1063,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
                 pk_lower=args.pk_lower,
                 pk_upper=args.pk_upper,
                 on_throttle=_on_throttle,
+                shared_snapshot_id=args.shared_snapshot_id,
             )
             _live_rows[0] = rows
             return importer.import_rows(
@@ -1701,6 +1706,65 @@ def _migrate_one_table(
         )
 
 
+def _open_shared_snapshot(migrator, dialect):
+    """Open an anchor REPEATABLE READ transaction on the source and export its snapshot id.
+
+    Returns ``(engine, connection, snapshot_id)``. The transaction is held OPEN (via the
+    returned engine+connection) for the whole sharded load so every shard worker can import
+    the same point-in-time cut (``dialect.set_transaction_snapshot_sql``) -- a consistent
+    range-sharded read even for a REPLACE (no-CDC) load. Caller MUST call
+    :func:`_close_shared_snapshot` when the load finishes. PostgreSQL only.
+    """
+    from sqlalchemy import text
+
+    from dsql_migrator.core.exporter import _TXN_CONTROL_EXEC_OPTS
+
+    engine = migrator._exporter._engine_factory(migrator._inputs.source_config)
+    conn = None
+    try:
+        conn = engine.connect()
+        anchor = conn.execution_options(isolation_level="AUTOCOMMIT")
+        anchor.execute(
+            text(dialect.snapshot_start_sql), execution_options=_TXN_CONTROL_EXEC_OPTS
+        )
+        snapshot_id = anchor.execute(text(dialect.export_snapshot_sql())).scalar()
+        if not snapshot_id:
+            raise RuntimeError("source returned an empty exported-snapshot id")
+        return engine, conn, snapshot_id
+    except Exception:
+        # Close the checked-out connection (else its open REPEATABLE READ txn lingers until
+        # GC) BEFORE disposing the engine -- engine.dispose() does not close a leased conn.
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - best-effort on the failure path
+                pass
+        engine.dispose()
+        raise
+
+
+def _close_shared_snapshot(engine, conn) -> None:
+    """COMMIT + close the anchor snapshot transaction opened by :func:`_open_shared_snapshot`."""
+    if conn is None:
+        return
+    from sqlalchemy import text
+
+    from dsql_migrator.core.exporter import _TXN_CONTROL_EXEC_OPTS, COMMIT
+
+    try:
+        conn.execution_options(isolation_level="AUTOCOMMIT").execute(
+            text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
+        )
+    except Exception:  # noqa: BLE001 - best-effort teardown of a read-only anchor txn
+        pass
+    finally:
+        try:
+            conn.close()
+        finally:
+            if engine is not None:
+                engine.dispose()
+
+
 def _migrate_tables_in_parallel(
     handle: JobHandle,
     job_id: str,
@@ -1782,11 +1846,17 @@ def _migrate_tables_in_parallel(
         # will reconcile post-snapshot writes -- i.e. cdc_coexisting. A REPLACE (clean
         # plain-INSERT, no CDC) or a non-CDC append has nothing to reconcile it, so such
         # a table must be read by a SINGLE reader (one snapshot = one point-in-time cut).
-        _shardable_ok = bool(migrator._inputs.cdc_coexisting)
         # Resolve the SOURCE dialect so the shardability pre-gate uses the right
         # integer-PK set (the authoritative plan_pk_shard_ranges below already does);
         # without it this pre-gate ran under the module-default MySQL dialect.
         _shard_dialect = dialect_for(migrator._inputs.source_config.source_type)
+        # Sharding a table's read is consistent when EITHER a CDC stream will reconcile the
+        # shards' independently-timed snapshots (cdc_coexisting) OR the source dialect can
+        # give every shard ONE shared point-in-time snapshot (supports_shared_snapshot --
+        # PostgreSQL exported snapshots). The latter makes even a REPLACE (no-CDC) load shard
+        # SAFELY on a live source, so it lifts the "single-reader for REPLACE" restriction.
+        _shared_snapshot = _shard_dialect.supports_shared_snapshot
+        _shardable_ok = bool(migrator._inputs.cdc_coexisting) or _shared_snapshot
 
         # Shard count is capped exactly like single-process: cfg.full_load_reader_shards
         # clamped so table_parallelism x shards stays under the source max_connections
@@ -1805,7 +1875,7 @@ def _migrate_tables_in_parallel(
             )
             shardable = (
                 _shardable_ok
-                and not table_is_replace
+                and (not table_is_replace or _shared_snapshot)
                 and shardable_leading_int_pk(table, _shard_dialect) is not None
                 and effective_reader_shards > 1
             )
@@ -1865,7 +1935,19 @@ def _migrate_tables_in_parallel(
         # Track shard results per table for aggregation.
         shard_results: dict[str, list[_TableWorkerResult]] = {}
 
+        # For a shared-snapshot dialect (PostgreSQL) with sharded work, open ONE anchor
+        # snapshot in the parent and export its id; every shard imports it so the whole
+        # sharded read is a single consistent point-in-time cut. None for MySQL / no shards
+        # -> shards use own snapshots. Opened INSIDE the try so a build failure still runs the
+        # finally (drain-thread + queue teardown, _close_shared_snapshot).
+        _anchor_engine = _anchor_conn = None
+        shared_snapshot_id: Optional[str] = None
+
         try:
+            if _shared_snapshot and any(wu[0] == "shard" for wu in work_units):
+                _anchor_engine, _anchor_conn, shared_snapshot_id = _open_shared_snapshot(
+                    migrator, _shard_dialect
+                )
             with ProcessPoolExecutor(
                 max_workers=total_workers,
                 mp_context=ctx,
@@ -1905,6 +1987,7 @@ def _migrate_tables_in_parallel(
                             job_id=job_id, table=table,
                             inputs=_slim_worker_inputs(migrator._inputs, table.name),
                             pk_lower=lo, pk_upper=hi, shard_index=shard_idx,
+                            shared_snapshot_id=shared_snapshot_id,
                         )
                         f = pool.submit(_migrate_shard_in_process, shard_args)
                         futures[f] = ("shard", table.name, shard_idx)
@@ -2070,6 +2153,8 @@ def _migrate_tables_in_parallel(
                             handle.update(lambda job, n=name: _fail_chunk(job, n))
                             _tally(_TableLoadOutcome.FAILED)
         finally:
+            # Close the shared-snapshot anchor (if any) once all shard readers are done.
+            _close_shared_snapshot(_anchor_engine, _anchor_conn)
             stop_drain.set()
             # Non-blocking: this runs on the CLEANUP path, so a full queue must not
             # be able to wedge it. ``stop_drain`` already tells the drain to exit, so

@@ -994,6 +994,7 @@ class TableExporter:
         pk_lower: Optional[int] = None,
         pk_upper: Optional[int] = None,
         on_throttle: Optional[Callable[[bool, Optional[int]], None]] = None,
+        shared_snapshot_id: Optional[str] = None,
     ) -> "Iterator[Mapping[str, object]]":
         """Yield target-ready (converted) rows from a read-only consistent snapshot.
 
@@ -1012,9 +1013,13 @@ class TableExporter:
 
         ``pk_lower`` / ``pk_upper`` (optional, single integer PK only) bound this
         stream to a half-open PK slice ``[pk_lower, pk_upper)`` -- one shard of a
-        range-sharded read. Each shard opens its OWN snapshot connection here (the
-        shards are disjoint, so their independently-timed snapshots never overlap a
-        row); see :func:`compute_pk_shard_ranges`.
+        range-sharded read; see :func:`compute_pk_shard_ranges`.
+
+        ``shared_snapshot_id`` (optional) makes this shard read the exported snapshot
+        another connection published (``SET TRANSACTION SNAPSHOT`` right after the snapshot
+        start), so every shard observes ONE point-in-time cut -- a consistent range-sharded
+        read even on a live source with no CDC handoff. ``None`` (the default) keeps the
+        shard's own independently-timed snapshot.
         """
         dialect = dialect_for(conn.source_type)
         converter = dialect.value_converter(table, target_types=target_types)
@@ -1028,6 +1033,13 @@ class TableExporter:
                     text(dialect.snapshot_start_sql),
                     execution_options=_TXN_CONTROL_EXEC_OPTS,
                 )
+                if shared_snapshot_id is not None:
+                    # First statement in the just-opened transaction: adopt the shared
+                    # point-in-time snapshot so this shard sees exactly what the others do.
+                    snapshot.execute(
+                        text(dialect.set_transaction_snapshot_sql(shared_snapshot_id)),
+                        execution_options=_TXN_CONTROL_EXEC_OPTS,
+                    )
                 governor = (
                     SourceLoadGovernor(
                         snapshot,
