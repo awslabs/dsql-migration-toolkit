@@ -5,6 +5,14 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.399
+
+### 변경 (Changed)
+
+- **ECR Public 이미지를 `0.1.398`로 재게시하고 `ContainerImageUri` 기본값을 거기로 repoint**
+  했습니다. 이제 fresh-clone 기본 배포가 엔진 중립 UI(`0.1.398` 헤더 변경 + PostgreSQL 소스 인지
+  문구)를 사용합니다. 서울 demo 스택도 `0.1.398`로 업데이트했습니다.
+
 ## v0.1.398
 
 ### 변경 (Changed)

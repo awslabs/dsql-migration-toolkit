@@ -5,6 +5,14 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.399
+
+### 変更 (Changed)
+
+- **ECR Public イメージを `0.1.398` で再公開し、`ContainerImageUri` の既定値をそこへ repoint**
+  しました。これにより fresh-clone の既定デプロイがエンジン中立 UI(`0.1.398` のヘッダー変更 +
+  PostgreSQL ソース対応の文言)を使用します。Seoul デモスタックも `0.1.398` に更新しました。
+
 ## v0.1.398
 
 ### 変更 (Changed)

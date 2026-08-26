@@ -5,6 +5,15 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.399
+
+### Changed
+
+- **Republished the ECR Public image at `0.1.398` and repointed the `ContainerImageUri`
+  default to it**, so a fresh-clone default deploy runs the engine-neutral UI (the
+  `0.1.398` header rename + source-aware PostgreSQL wording). The Seoul demo stack was
+  updated to `0.1.398` as well.
+
 ## v0.1.398
 
 ### Changed
