@@ -227,6 +227,8 @@ deploy/DEPLOYMENT.md("Deploy on ECS Fargate")를 따라 이 저장소의 ECS Far
 > 파라미터를 해석하고 배포를 대신 실행할 뿐입니다. 직접 손으로 하고 싶다면(또는 에이전트에 AWS
 > 접근이 없다면) Console 또는 CLI 경로를 사용하세요.
 
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
 #### 옵션 B — 권장: AWS Console (안내형 폼)
 
 ![CloudFormation — Create stack → Upload a template file](../docs/images/cfn-create-stack.png)
@@ -337,10 +339,12 @@ AWS_REGION=<region> deploy/create_test_cert.sh
 > 실제 마이그레이션을 어떻게 진행하는지는 [**사용자 매뉴얼**](../docs/manual/ko/README.md)을
 > 따라가세요([설정](../docs/manual/ko/01-setup.md) → Connect에서 시작).
 
-<details>
-<summary><b>대안 — AWS CLI로 배포</b></summary>
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
 #### 옵션 C — AWS CLI
+
+<details>
+<summary><b>AWS CLI 명령 보기</b></summary>
 
 환경을 셸 변수로 한 번 설정; 명령 자체는 모든 고객에게 동일. 최소(Dev/Test) 배포:
 
@@ -906,12 +910,16 @@ deploy/DEPLOYMENT.md("Run on a single EC2 host")를 따라 이 저장소의 단�
 책임은 나에게 있습니다. 나중에 정리하려면 에이전트에게 *"`mysql-dsql-migrator-ec2` 스택을
 삭제해줘"* 라고 말하면 [Teardown](#6-teardown) 절차를 따릅니다.
 
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
 #### 옵션 B — 권장: AWS Console (안내형 폼)
 
 템플릿을 업로드하고 안내형 폼을 채웁니다(`VpcId` / `HostSubnetId`는 네이티브 선택기; Console이
 템플릿을 대신 스테이징하므로 S3 버킷 불필요). 절차는 [옵션 B — AWS Console](#2-app-stack-배포)와
 동일합니다 — 이 템플릿을 고르고, 위의 EC2 파라미터를 입력하고, 스택 이름을
 `mysql-dsql-migrator-ec2`로 지정하면 됩니다.
+
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
 #### 옵션 C — AWS CLI
 

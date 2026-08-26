@@ -239,6 +239,8 @@ stack"* and it follows [Teardown](#teardown).
 > agent only resolves the parameters and runs the deploy for you. If you'd rather do it
 > by hand (or your agent lacks AWS access), use the Console or CLI path instead.
 
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
 #### Option B — Recommended: AWS Console (guided form)
 
 ![CloudFormation — Create stack → Upload a template file](../docs/images/cfn-create-stack.png)
@@ -361,10 +363,12 @@ otherwise the task can't pull its image or reach DSQL and fails to start. → **
 > [**User Manual**](../docs/manual/en/README.md) (start at
 > [Set up](../docs/manual/en/01-setup.md) → Connect).
 
-<details>
-<summary><b>Alternative — deploy with the AWS CLI</b></summary>
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
 #### Option C — AWS CLI
+
+<details>
+<summary><b>Show the AWS CLI commands</b></summary>
 
 Set your environment as shell variables once; the command itself is identical for
 every customer. The minimal (Dev/Test) deploy:
@@ -985,12 +989,16 @@ if anything is ambiguous or a step fails.
 on your credentials. To tear it down later, tell the agent *"delete the
 `mysql-dsql-migrator-ec2` stack"* and it follows [Teardown](#6-teardown).
 
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
 #### Option B — Recommended: AWS Console (guided form)
 
 Upload the template and fill the guided form (native pickers for `VpcId` /
 `HostSubnetId`; the Console stages the template for you, so no S3 bucket is needed). The
 steps match [Option B — AWS Console](#2-deploy-the-app-stack) above — just pick this
 template, enter the EC2 parameters above, and name the stack `mysql-dsql-migrator-ec2`.
+
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
 #### Option C — AWS CLI
 

@@ -239,6 +239,8 @@ app-stack（deploy/cloudformation.yaml）を私の AWS アカウントにデプ�
 > パラメータを解決してデプロイを実行するだけです。手作業で行いたい場合（またはエージェントに
 > AWS アクセスがない場合）は、代わりに Console または CLI 経路を使ってください。
 
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
 #### オプション B — 推奨: AWS Console (ガイド付きフォーム)
 
 ![CloudFormation — Create stack → Upload a template file](../docs/images/cfn-create-stack.png)
@@ -362,10 +364,12 @@ A か B のいずれかを選んでください:
 > [**ユーザーマニュアル**](../docs/manual/ja/README.md) に従ってください（[セットアップ](../docs/manual/ja/01-setup.md)
 > → Connect から開始）。
 
-<details>
-<summary><b>代替 — AWS CLI でデプロイ</b></summary>
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
 #### オプション C — AWS CLI
+
+<details>
+<summary><b>AWS CLI コマンドを表示</b></summary>
 
 環境をシェル変数として一度設定します。コマンド自体はどのお客様でも同一です。
 最小構成（Dev/Test）のデプロイ:
@@ -977,12 +981,16 @@ app-stack（deploy/cloudformation-ec2.yaml）を私の AWS アカウントにデ
 する AWS の操作は、あなたの責任です。後で解体するには、エージェントに *「`mysql-dsql-migrator-ec2`
 スタックを削除して」* と伝えれば、[Teardown](#6-teardown) に従います。
 
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
+
 #### オプション B — 推奨: AWS Console (ガイド付きフォーム)
 
 テンプレートをアップロードしてガイド付きフォームを入力します（`VpcId` / `HostSubnetId` は
 ネイティブピッカー。Console がテンプレートをステージングするため、S3 バケットは不要）。手順は
 [オプション B — AWS Console](#2-app-stack-のデプロイ) と同じです — このテンプレートを選び、上記の
 EC2 パラメータを入力し、スタック名を `mysql-dsql-migrator-ec2` にするだけです。
+
+<hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
 #### オプション C — AWS CLI
 
