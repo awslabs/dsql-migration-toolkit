@@ -2249,11 +2249,19 @@ def test_source_read_dispatch_routes_by_engine(monkeypatch) -> None:
     # PgSourceConnection -> a marker so we can assert the PG path wraps the connection.
     monkeypatch.setattr(v, "PgSourceConnection", lambda c: ("shim", c))
     monkeypatch.setattr(v, "_source_checksum", lambda c, t, ps: calls.append(("my_ck", c)) or "my")
-    monkeypatch.setattr(v, "_target_checksum", lambda c, t, ps: calls.append(("pg_ck", c)) or "pg")
+    # _target_checksum / _target_pk_tokens now take source_is_postgres -- the PG-source path
+    # must pass True (so the DSQL renderer uses the PG numeric-scale rule on both ends).
+    monkeypatch.setattr(
+        v, "_target_checksum",
+        lambda c, t, ps, source_is_postgres=False: calls.append(("pg_ck", c, source_is_postgres)) or "pg",
+    )
     monkeypatch.setattr(v, "_source_count", lambda c, name: calls.append(("my_ct", c)) or 1)
     monkeypatch.setattr(v, "_bounded_target_count", lambda c, t, ps: calls.append(("pg_ct", c)) or 2)
     monkeypatch.setattr(v, "_source_pk_tokens", lambda c, t, pk, n: calls.append(("my_pk", c)) or {})
-    monkeypatch.setattr(v, "_target_pk_tokens", lambda c, t, pk, n: calls.append(("pg_pk", c)) or {})
+    monkeypatch.setattr(
+        v, "_target_pk_tokens",
+        lambda c, t, pk, n, source_is_postgres=False: calls.append(("pg_pk", c, source_is_postgres)) or {},
+    )
 
     tbl = TableDef(name="t", columns=[ColumnDef(name="id", mysql_type="integer")], primary_key=["id"])
     pg = _FakeDialect(SourceType.POSTGRES)
@@ -2261,7 +2269,7 @@ def test_source_read_dispatch_routes_by_engine(monkeypatch) -> None:
 
     # checksum
     assert v._source_checksum_for(pg, "C", tbl, 100) == "pg"
-    assert calls[-1] == ("pg_ck", ("shim", "C"))  # PG path wraps in the shim
+    assert calls[-1] == ("pg_ck", ("shim", "C"), True)  # PG path wraps in the shim + flags PG
     assert v._source_checksum_for(my, "C", tbl, 100) == "my"
     assert calls[-1] == ("my_ck", "C")  # MySQL path uses the raw connection
 
@@ -2273,7 +2281,7 @@ def test_source_read_dispatch_routes_by_engine(monkeypatch) -> None:
 
     # pk tokens (used by _diff_pks)
     v._source_pk_tokens_for(pg, "C", tbl, "id", 50)
-    assert calls[-1] == ("pg_pk", ("shim", "C"))
+    assert calls[-1] == ("pg_pk", ("shim", "C"), True)
     v._source_pk_tokens_for(my, "C", tbl, "id", 50)
     assert calls[-1] == ("my_pk", "C")
 
@@ -2332,9 +2340,39 @@ def test_pg_checksum_unconstrained_numeric_rounds_to_dsql_default_scale() -> Non
         ],
         primary_key=["id"],
     )
-    rendered = build_pg_checksum_sql(table).as_string(None)
+    # A PostgreSQL source passes source_is_postgres=True (both the DSQL target and the PG
+    # source render with it), so a bare numeric compares at DSQL's default scale 6.
+    rendered = build_pg_checksum_sql(table, source_is_postgres=True).as_string(None)
     assert 'round("unconstrained", 6)' in rendered          # DSQL default scale, not 0
     assert 'round("scaled", 2)' in rendered                 # declared scale kept
+    # Without the PG-source flag (the DEFAULT -- e.g. the DSQL target of a MySQL-source
+    # migration) the scale-6 rule must NOT fire: a bare numeric renders at its declared
+    # scale 0, matching the MySQL source side. This is the B1 regression guard.
+    rendered_mysql = build_pg_checksum_sql(table).as_string(None)
+    assert 'round("unconstrained", 0)' in rendered_mysql
+    assert 'round("unconstrained", 6)' not in rendered_mysql
+
+
+def test_pg_checksum_bigint_unsigned_scale_matches_mysql_source() -> None:
+    # B1 regression: for a MySQL source the DSQL TARGET side is rendered by
+    # _pg_checksum_expr with source_is_postgres=False. A MySQL `bigint unsigned` -- the
+    # paren-less COLUMN_TYPE on MySQL 8.0.19+ / 8.4 / Aurora MySQL 3 -- maps to
+    # numeric(20,0), an INTEGER. Both sides must render at scale 0. The old code applied
+    # the PostgreSQL unconstrained-numeric scale-6 default to ANY paren-less type, so the
+    # target gained ".000000" while the MySQL source side stayed scale 0 -> every BIGINT
+    # UNSIGNED row false-mismatched in CHECKSUM validation. (MySQL 5.7 spells it
+    # "bigint(20) unsigned" -- parens -> already scale 0 -- which is why 5.7 never broke.)
+    from dsql_migrator.core.validator import _mysql_checksum_expr, _pg_checksum_expr
+
+    for spelling in ("bigint unsigned", "bigint(20) unsigned"):
+        col = ColumnDef(name="amount", mysql_type=spelling)
+        mysql_expr = _mysql_checksum_expr(col)
+        pg_expr = _pg_checksum_expr(col, source_is_postgres=False).as_string(None)
+        assert mysql_expr == "CAST(`amount` AS DECIMAL(65, 0))", spelling
+        assert 'round("amount", 0)' in pg_expr, spelling
+        # The target must NOT gain fractional digits (that was the false-mismatch).
+        assert 'round("amount", 6)' not in pg_expr, spelling
+        assert "D000000" not in pg_expr, spelling
 
 
 def test_pg_source_connection_shim_renders_composed_and_binds_params() -> None:

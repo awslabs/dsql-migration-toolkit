@@ -74,6 +74,40 @@ _DSQL_NUMERIC_MAX_SCALE = 37
 _NUMERIC_SPEC_RE = re.compile(
     r"^\s*(numeric|decimal|dec)\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)\s*$", re.IGNORECASE
 )
+# A bare numeric with NO precision/scale at all: "numeric", "decimal", "dec".
+_BARE_NUMERIC_RE = re.compile(r"^\s*(numeric|decimal|dec)\s*$", re.IGNORECASE)
+
+# Aurora DSQL's default storage for an unconstrained numeric (documented). 18 total
+# digits, 6 fractional -> 12 integer digits.
+_DSQL_DEFAULT_NUMERIC = "numeric(18,6)"
+_DSQL_DEFAULT_NUMERIC_SCALE = 6
+_DSQL_DEFAULT_NUMERIC_INT_DIGITS = 12
+
+
+def unconstrained_numeric_note(pg_type: str) -> "Optional[str]":
+    """Warn that a bare PostgreSQL ``numeric``/``decimal`` (no declared precision/scale)
+    is stored by Aurora DSQL at its default ``numeric(18,6)``.
+
+    Returns the warning message, or ``None`` when ``pg_type`` is not a bare numeric. A
+    bare ``numeric`` is arbitrary-precision on PostgreSQL but the target caps it at 6
+    fractional digits (and 12 integer digits), so a value beyond that is rounded (or, for
+    the integer part, rejected) on load. :func:`clamp_pg_numeric` covers only a DECLARED
+    precision/scale that exceeds DSQL's 38/37 limits; this covers the common no-parens
+    form, which would otherwise migrate with NO signal that its precision is capped
+    (Property 6: no silent precision loss). Values within 12 integer / 6 fractional digits
+    are unaffected.
+    """
+    if _BARE_NUMERIC_RE.match(pg_type or "") is None:
+        return None
+    return (
+        f"PostgreSQL '{pg_type.strip()}' declares no precision/scale, so Aurora DSQL stores "
+        f"it at its default {_DSQL_DEFAULT_NUMERIC}: values with more than "
+        f"{_DSQL_DEFAULT_NUMERIC_SCALE} fractional digits are rounded, and values needing "
+        f"more than {_DSQL_DEFAULT_NUMERIC_INT_DIGITS} integer digits will not fit (rounded "
+        "or rejected on load). If this column needs a different precision/scale, set an "
+        "explicit numeric(p,s) (p<=38, s<=37) target in Schema Conversion; otherwise "
+        f"{_DSQL_DEFAULT_NUMERIC} is used and Validation compares at that scale."
+    )
 
 
 def clamp_pg_numeric(pg_type: str) -> "tuple[str, Optional[str]]":
@@ -85,8 +119,9 @@ def clamp_pg_numeric(pg_type: str) -> "tuple[str, Optional[str]]":
     the same way (:func:`~dsql_migrator.core.converter._clamp_numeric_spec`); without this
     a PostgreSQL ``numeric(40,10)`` would be emitted verbatim and DSQL would reject the
     whole ``CREATE TABLE`` at apply time with no prior signal. A bare ``numeric`` (no
-    precision) is left untouched -- DSQL stores it at its default ``numeric(18,6)`` and the
-    value/validation layer already accounts for that. Non-numeric types pass through.
+    precision) is left untouched here -- DSQL stores it at its default ``numeric(18,6)``;
+    that precision cap is surfaced separately by :func:`unconstrained_numeric_note`.
+    Non-numeric types pass through.
     """
     match = _NUMERIC_SPEC_RE.match(pg_type or "")
     if match is None:

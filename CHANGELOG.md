@@ -5,6 +5,26 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.394
+
+### Fixed
+
+- **CHECKSUM validation no longer false-mismatches `BIGINT UNSIGNED` on modern MySQL
+  sources.** The DSQL-target checksum render applied PostgreSQL's unconstrained-`numeric`
+  scale-6 rule to any parenthesis-less type, but MySQL 8.0.19+ / 8.4 / Aurora MySQL 3
+  report `BIGINT UNSIGNED` as the paren-less `bigint unsigned` (stored as `numeric(20,0)`,
+  an integer). The target side gained `.000000` while the unchanged MySQL source side
+  rendered scale 0, so every `BIGINT UNSIGNED` row diverged and the table was reported
+  mismatched despite byte-identical data. The scale-6 rule is now gated to a genuine
+  PostgreSQL source, so a MySQL source renders both sides at the declared scale. (MySQL
+  5.7's `bigint(20) unsigned` spelling carried parens and was unaffected.)
+- **A bare PostgreSQL `numeric`/`decimal` (no declared precision) now raises a Schema
+  Conversion warning.** Aurora DSQL stores such a column at its default `numeric(18,6)`,
+  rounding values beyond 6 fractional digits — previously silent (only a *declared*
+  precision above DSQL's 38/37 was flagged), and Validation compares the column at scale
+  6, so the loss could pass unnoticed. Conversion now emits a MANUAL warning naming the
+  column and the `numeric(18,6)` cap so the precision decision is visible before load.
+
 ## v0.1.393
 
 ### Added

@@ -5,6 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.394
+
+### 수정 (Fixed)
+
+- **최신 MySQL 소스에서 `BIGINT UNSIGNED`가 더 이상 CHECKSUM 검증에서 거짓 불일치를 내지
+  않습니다.** DSQL 대상 체크섬 렌더가 PostgreSQL의 무제약 `numeric` scale-6 규칙을 괄호 없는
+  모든 타입에 적용했는데, MySQL 8.0.19+ / 8.4 / Aurora MySQL 3은 `BIGINT UNSIGNED`를 괄호 없는
+  `bigint unsigned`로 보고합니다(`numeric(20,0)`, 즉 정수로 저장). 대상 측은 `.000000`을 얻는
+  반면 변경되지 않은 MySQL 소스 측은 scale 0으로 렌더되어, 데이터가 바이트 단위로 동일한데도
+  모든 `BIGINT UNSIGNED` 행이 어긋나 테이블이 불일치로 보고됐습니다. 이제 scale-6 규칙은 진짜
+  PostgreSQL 소스에만 적용되며, MySQL 소스는 양쪽 모두 선언된 스케일로 렌더됩니다. (MySQL
+  5.7의 `bigint(20) unsigned` 표기는 괄호가 있어 영향을 받지 않았습니다.)
+- **선언된 정밀도가 없는 PostgreSQL `numeric`/`decimal`(bare)에 대해 Schema Conversion 경고가
+  표시됩니다.** Aurora DSQL은 이런 컬럼을 기본값 `numeric(18,6)`으로 저장해 소수 6자리를 초과하는
+  값을 반올림하는데, 기존에는 무음이었고(선언된 정밀도가 DSQL의 38/37을 초과하는 경우만 플래그),
+  Validation이 해당 컬럼을 scale 6으로 비교하므로 손실이 드러나지 않을 수 있었습니다. 이제 변환은
+  컬럼명과 `numeric(18,6)` 상한을 명시한 MANUAL 경고를 발생시켜, 적재 전에 정밀도 결정을
+  볼 수 있게 합니다.
+
 ## v0.1.393
 
 ### 추가 (Added)

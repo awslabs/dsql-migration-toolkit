@@ -3050,6 +3050,7 @@ class SchemaConverter:
         if is_postgres:
             from dsql_migrator.core.converter_postgres import (
                 clamp_pg_numeric,
+                unconstrained_numeric_note,
                 unsupported_dsql_reason,
             )
 
@@ -3081,6 +3082,25 @@ class SchemaConverter:
                             target_type=clamped,
                             classification=Classification.MANUAL,
                             message=clamp_note,
+                        )
+                    )
+                    continue
+                # A bare `numeric`/`decimal` (no declared precision) is stored by DSQL at
+                # its default numeric(18,6): a value beyond 6 fractional digits is rounded
+                # on load. Surface it so this is not a SILENT precision loss (Property 6) --
+                # Validation compares such a column at scale 6 (validation_sql), a schema
+                # decision that must be visible here, not hidden. Mutually exclusive with the
+                # clamp warning above (a bare numeric has no declared precision to clamp).
+                bare_note = unconstrained_numeric_note(column.mysql_type)
+                if bare_note is not None:
+                    warnings.append(
+                        ConversionWarning(
+                            object_name=table.name,
+                            column_name=column.name,
+                            source_type=column.mysql_type,
+                            target_type="numeric(18,6)",
+                            classification=Classification.MANUAL,
+                            message=bare_note,
                         )
                     )
 

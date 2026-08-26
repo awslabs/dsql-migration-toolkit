@@ -11,6 +11,7 @@ from dsql_migrator.core.converter_postgres import (
     build_pg_source_ddl,
     clamp_pg_numeric,
     normalize_pg_base_type,
+    unconstrained_numeric_note,
     unsupported_dsql_reason,
 )
 from dsql_migrator.core.models import (
@@ -226,6 +227,55 @@ def test_convert_table_clamps_over_precision_pg_numeric_with_warning() -> None:
     }
     assert {"huge", "wild"} <= clamp_warns
     assert "ok" not in clamp_warns  # the in-range column is not warned
+
+
+def test_unconstrained_numeric_note_flags_only_bare_numeric() -> None:
+    # B2: a bare `numeric`/`decimal`/`dec` (no declared precision) is stored by DSQL at its
+    # default numeric(18,6) -- a >6-fractional-digit value is rounded on load. This must be
+    # WARNED (not silent). A declared precision/scale, and non-numeric types, return None.
+    for bare in ("numeric", "decimal", "dec", "  NUMERIC  "):
+        note = unconstrained_numeric_note(bare)
+        assert note is not None and "numeric(18,6)" in note and "6 fractional digits" in note
+    for not_bare in ("numeric(12,2)", "numeric(38)", "decimal(10,4)", "uuid", "text", ""):
+        assert unconstrained_numeric_note(not_bare) is None
+
+
+def test_convert_table_warns_on_bare_numeric_for_pg_source() -> None:
+    # End-to-end B2 regression: a PostgreSQL bare `numeric` converts (near-identity) but
+    # MUST carry a MANUAL warning that DSQL caps it at numeric(18,6) -- otherwise the >6dp
+    # rounding is silent (Property 6) and Validation, which compares such a column at scale
+    # 6, would report a green MATCH over data DSQL truncated. Declared-scale numerics are
+    # NOT warned; a bare numeric and an over-precision numeric are mutually exclusive
+    # (the clamp path `continue`s), so a bare column never also gets a clamp warning.
+    table = TableDef(
+        name="ledger",
+        columns=[
+            _col("id", "bigint", nullable=False),
+            _col("amount", "numeric"),        # bare -> warned
+            _col("price", "decimal"),         # bare alias -> warned
+            _col("rate", "numeric(12,4)"),    # declared -> not warned
+        ],
+        primary_key=["id"],
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    bare_warns = {
+        w.column_name
+        for w in conv.warnings
+        if w.classification is Classification.MANUAL
+        and "declares no precision/scale" in (w.message or "")
+    }
+    assert bare_warns == {"amount", "price"}
+    # The warning must name the DSQL default and be actionable (mention Schema Conversion).
+    amount_msg = next(
+        w.message for w in conv.warnings
+        if w.column_name == "amount" and "declares no precision/scale" in (w.message or "")
+    )
+    assert "numeric(18,6)" in amount_msg and "Schema Conversion" in amount_msg
+    # Each bare column gets exactly ONE such warning (not also a clamp warning).
+    assert sum(
+        1 for w in conv.warnings
+        if w.column_name == "amount" and "declares no precision/scale" in (w.message or "")
+    ) == 1
 
 
 @pytest.mark.parametrize(

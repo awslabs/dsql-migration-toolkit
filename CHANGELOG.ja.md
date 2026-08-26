@@ -5,6 +5,26 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.394
+
+### 修正 (Fixed)
+
+- **新しい MySQL ソースで `BIGINT UNSIGNED` が CHECKSUM 検証で誤った不一致を出さなくなりました。**
+  DSQL ターゲットのチェックサム描画が PostgreSQL の無制約 `numeric` scale-6 ルールを括弧なしの
+  すべての型に適用していましたが、MySQL 8.0.19+ / 8.4 / Aurora MySQL 3 は `BIGINT UNSIGNED` を
+  括弧なしの `bigint unsigned`(`numeric(20,0)`、すなわち整数として格納)で報告します。ターゲット
+  側は `.000000` を得る一方、変更されていない MySQL ソース側は scale 0 で描画されるため、データが
+  バイト単位で同一でもすべての `BIGINT UNSIGNED` 行が食い違い、テーブルが不一致として報告されて
+  いました。scale-6 ルールは本物の PostgreSQL ソースにのみ適用されるようになり、MySQL ソースは
+  両側とも宣言されたスケールで描画されます(MySQL 5.7 の `bigint(20) unsigned` 表記は括弧付きで
+  影響を受けませんでした)。
+- **宣言された精度のない PostgreSQL `numeric`/`decimal`(bare)に対して Schema Conversion 警告が
+  表示されます。** Aurora DSQL はそのような列を既定の `numeric(18,6)` で格納し、小数 6 桁を超える
+  値を丸めますが、これは従来サイレントで(DSQL の 38/37 を超える*宣言済み*精度のみをフラグ)、
+  Validation は当該列を scale 6 で比較するため損失が見逃される可能性がありました。変換は列名と
+  `numeric(18,6)` の上限を明示した MANUAL 警告を出すようになり、ロード前に精度の決定が見えるように
+  なりました。
+
 ## v0.1.393
 
 ### 追加 (Added)

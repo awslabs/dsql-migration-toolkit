@@ -491,7 +491,9 @@ def _bounded_target_count(connection: Any, table: TableDef, page_size: int) -> i
     return _target_count(connection, table.name)
 
 
-def _target_checksum(connection: Any, table: TableDef, page_size: int) -> str:
+def _target_checksum(
+    connection: Any, table: TableDef, page_size: int, source_is_postgres: bool = False
+) -> str:
     """Return the target checksum for ``table`` as a string (read-only).
 
     For a single-column PK the checksum is accumulated over BOUNDED keyset pages
@@ -500,16 +502,29 @@ def _target_checksum(connection: Any, table: TableDef, page_size: int) -> str:
     transaction limit and the table could never produce a checksum. A composite/missing
     PK falls back to the single-scan ``build_pg_checksum_sql`` (a documented residual,
     like :func:`_target_count`).
+
+    ``source_is_postgres`` is forwarded to the PG checksum builders for the numeric-scale
+    rule; it is ``True`` both when rendering the DSQL target of a PostgreSQL-source
+    migration AND when this same function renders a PostgreSQL SOURCE (via
+    :func:`_source_checksum_for`), so both ends of a PG migration agree.
     """
     pk_column = single_pk_column(table)
     if pk_column is not None:
-        return _target_checksum_keyset(connection, table, pk_column, page_size)
-    value = _target_scalar(connection, build_pg_checksum_sql(table))
+        return _target_checksum_keyset(
+            connection, table, pk_column, page_size, source_is_postgres
+        )
+    value = _target_scalar(
+        connection, build_pg_checksum_sql(table, source_is_postgres)
+    )
     return "0" if value is None else str(value)
 
 
 def _target_checksum_keyset(
-    connection: Any, table: TableDef, pk_column: str, page_size: int
+    connection: Any,
+    table: TableDef,
+    pk_column: str,
+    page_size: int,
+    source_is_postgres: bool = False,
 ) -> str:
     """Accumulate the target checksum over bounded keyset pages (single-column PK).
 
@@ -521,8 +536,12 @@ def _target_checksum_keyset(
     connection force-closed at DSQL's ~1h limit is handled by the reconnecting proxy
     that wraps ``connection`` -- the failing page replays from its ``WHERE pk > :last``.
     """
-    first_sql = build_pg_page_checksum_first_sql(table, pk_column, page_size)
-    next_sql = build_pg_page_checksum_next_sql(table, pk_column, page_size)
+    first_sql = build_pg_page_checksum_first_sql(
+        table, pk_column, page_size, source_is_postgres
+    )
+    next_sql = build_pg_page_checksum_next_sql(
+        table, pk_column, page_size, source_is_postgres
+    )
     total = 0
     last: object = None
     while True:
@@ -545,16 +564,23 @@ def _target_checksum_keyset(
 
 
 def _target_pk_tokens(
-    connection: Any, table: TableDef, pk_column: str, sample_size: int
+    connection: Any,
+    table: TableDef,
+    pk_column: str,
+    sample_size: int,
+    source_is_postgres: bool = False,
 ) -> dict[str, str]:
     """Return up to ``sample_size`` ``{pk: token}`` entries for the target (read-only).
 
     Bounded by ``LIMIT`` -- at most ``sample_size`` rows are read, in PK order, via
     the primary-key index. PK and token stringified for cross-engine comparison.
+    ``source_is_postgres`` is forwarded to the PG token builder for the numeric-scale rule.
     """
     cursor = connection.cursor()
     try:
-        cursor.execute(build_pg_pk_token_sql(table, pk_column, sample_size))
+        cursor.execute(
+            build_pg_pk_token_sql(table, pk_column, sample_size, source_is_postgres)
+        )
         rows = cursor.fetchall()
     finally:
         _safe_close(cursor)
@@ -586,7 +612,10 @@ def _diff_pks(
     source_tokens = _source_pk_tokens_for(
         source_dialect, source_connection, table, pk_column, sample_size
     )
-    target_tokens = _target_pk_tokens(target_connection, table, pk_column, sample_size)
+    target_tokens = _target_pk_tokens(
+        target_connection, table, pk_column, sample_size,
+        source_is_postgres=_source_is_postgres(source_dialect),
+    )
 
     findings: list[RowDiffFinding] = []
     for pk in sorted(set(source_tokens) | set(target_tokens)):
@@ -727,7 +756,9 @@ def _source_checksum_for(
     page_size: int,
 ) -> str:
     if _source_is_postgres(dialect):
-        return _target_checksum(PgSourceConnection(connection), table, page_size)
+        return _target_checksum(
+            PgSourceConnection(connection), table, page_size, source_is_postgres=True
+        )
     return _source_checksum(connection, table, page_size)
 
 
@@ -754,7 +785,8 @@ def _source_pk_tokens_for(
 ) -> dict[str, str]:
     if _source_is_postgres(dialect):
         return _target_pk_tokens(
-            PgSourceConnection(connection), table, pk_column, sample_size
+            PgSourceConnection(connection), table, pk_column, sample_size,
+            source_is_postgres=True,
         )
     return _source_pk_tokens(connection, table, pk_column, sample_size)
 
@@ -1378,7 +1410,8 @@ class Validator:
                 source_dialect, source_connection, table, self._reconcile_page_size
             )
             target_checksum = _target_checksum(
-                target_connection, table, self._reconcile_page_size
+                target_connection, table, self._reconcile_page_size,
+                source_is_postgres=_source_is_postgres(source_dialect),
             )
             checksum_match = source_checksum == target_checksum
             # Columns the checksum could not value-compare (no byte-identical
