@@ -1213,8 +1213,23 @@ def _fetch_cdc_status(migration_state, tables=None):
     stack = getattr(migration_state, "cdc_stack_name", None)
     ops_reader = getattr(controller, "applied_ops_by_table", None)
     if callable(ops_reader) and stack and tables:
+        # Scope the applied-ops window to events applied SINCE the Full Load watermark
+        # (this migration's gapless resume point), so ops from PRIOR CDC runs still
+        # inside the sink metric's long trailing window are excluded -- a clean
+        # Full-Load->CDC run with no post-watermark writes then reads 0. Falls back to
+        # the reader's default window when the start is unknown.
+        _ops_kwargs: dict = {}
+        _since = getattr(migration_state, "cdc_ops_window_start", None)
+        if _since is not None:
+            try:
+                _elapsed = (datetime.now(timezone.utc) - _since).total_seconds()
+                _ops_kwargs["window_seconds"] = int(
+                    max(60, min(_elapsed, 14 * 24 * 3600))
+                )
+            except Exception:  # noqa: BLE001 - fall back to the default window
+                _ops_kwargs = {}
         try:
-            applied_ops = dict(ops_reader(stack, list(tables)) or {})
+            applied_ops = dict(ops_reader(stack, list(tables), **_ops_kwargs) or {})
         except Exception:  # noqa: BLE001 - advisory, keep status even if it fails
             applied_ops = {}
     # Best-effort: read per-table end-to-end replication lag (ms) from the sink's

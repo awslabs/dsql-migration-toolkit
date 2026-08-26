@@ -53,6 +53,7 @@ from dsql_migrator.core.query_playground import (
     ExecutionProbe,
     ProbeOutcome,
     TargetConnectionFactory,
+    list_target_schemas,
     probe_statement,
 )
 from dsql_migrator.core.target_connection import DsqlConnector
@@ -117,6 +118,31 @@ def is_testable(result: QueryConversionResult) -> bool:
     if result.converted_sql is None:
         return False
     return result.statement_kind in (StatementKind.SELECT, StatementKind.DDL)
+
+
+def resolve_test_schema(
+    override: Optional[str],
+    inferred: Optional[str],
+    target_schemas: Optional[list[str]],
+) -> Optional[str]:
+    """Pick the schema a target Test resolves UNQUALIFIED names in (search_path).
+
+    ``override`` (the user's "Test against schema" pick) always wins. Otherwise the
+    ``inferred`` schema (the connected source DB, which maps to a same-named PG
+    schema) is used when the target actually HAS it; failing that, the sole user
+    schema on the target; failing that, the inferred name as a best guess (which may
+    be ``None``). ``target_schemas`` is the target's user schemas (``None`` = not yet
+    fetched, ``[]`` = fetched, none found). Pure, so the resolution is unit-tested
+    without a live session/target.
+    """
+    if override:
+        return override
+    if target_schemas:
+        if inferred and inferred in target_schemas:
+            return inferred
+        if len(target_schemas) == 1:
+            return target_schemas[0]
+    return inferred
 
 
 _SQL_FENCE_RE = re.compile(r"```(?:sql)?\s*\n?(.*?)```", re.IGNORECASE | re.DOTALL)
@@ -378,6 +404,16 @@ class PlaygroundState:
         # query for real timings/row counts) instead of plan-only EXPLAIN. Off by
         # default because ANALYZE executes the query; read/written on the UI thread.
         self.analyze: bool = False
+        # "Test against schema": the schema a target test resolves UNQUALIFIED table
+        # names in (search_path). ``test_schema`` is the user's explicit override
+        # (None = use the inferred default: the connected source DB, or the sole
+        # target schema). ``target_schemas`` caches the target's user schemas for the
+        # picker (None = not fetched yet, [] = fetched, none found). All read/written
+        # on the UI thread (the fetch result is applied after its await), so plain
+        # attributes -- no lock needed, unlike the probe fields above.
+        self.test_schema: Optional[str] = None
+        self.target_schemas: Optional[list[str]] = None
+        self.schemas_loading: bool = False
 
     def set_result(self, result: QueryConversionResult) -> None:
         """Record the latest conversion and clear any stale probe verdict."""
@@ -507,6 +543,19 @@ def build_query_playground_screen(
     query_converter = converter or QueryConverter()
     make_factory = target_connection_factory or _default_target_connection_factory
 
+    def _inferred_source_schema() -> Optional[str]:
+        """The schema inferred from the connection: a MySQL DB maps to a same-named
+        PG schema, so the connected source database is the natural default."""
+        src = getattr(session, "source_config", None)
+        return getattr(src, "database", None) or None
+
+    def _effective_test_schema() -> Optional[str]:
+        """The schema a Test actually resolves unqualified names in: the user's
+        override, else the inferred default (see :func:`resolve_test_schema`)."""
+        return resolve_test_schema(
+            state.test_schema, _inferred_source_schema(), state.target_schemas
+        )
+
     def content(refresh: Callable[[], None]) -> None:
         # ``ui.code`` renders SQL inside a <pre> whose default ``white-space: pre``
         # (no wrap) lives on the inner element, so Tailwind classes on the wrapper
@@ -603,6 +652,17 @@ def build_query_playground_screen(
                 result = state.result
                 if result is None:
                     return
+                # Populate the "Test against schema" picker once, in the background,
+                # as soon as there is a testable result and a verified target -- so the
+                # picker is ready (defaulted) before the first Test, without blocking
+                # this render on a round-trip.
+                if (
+                    is_testable(result)
+                    and session.has_target()
+                    and state.target_schemas is None
+                    and not state.schemas_loading
+                ):
+                    ui.timer(0.01, _load_test_schemas, once=True)
                 with ui.column().classes("w-full gap-3") as results_box:
                     _render_conversion(ui, result)
                     _render_test_panel(result, on_test, render_results.refresh)
@@ -668,6 +728,31 @@ def build_query_playground_screen(
                 scroll_after_convert["pending"] = True
                 render_results.refresh()
 
+            async def _load_test_schemas() -> None:
+                """Fetch the target's user schemas ONCE for the "Test against schema"
+                picker (background). Best-effort: on any failure the picker just falls
+                back to the inferred default. Guarded so it runs at most once."""
+                if state.target_schemas is not None or state.schemas_loading:
+                    return
+                if not session.has_target():
+                    return
+                target_config = session.target_config
+                if target_config is None:
+                    return
+                state.schemas_loading = True
+                factory = make_factory(
+                    target_config, getattr(session, "aws_profile", None)
+                )
+                try:
+                    schemas = await run.io_bound(
+                        lambda: list_target_schemas(factory)
+                    )
+                except Exception:  # noqa: BLE001 - never break the screen on a read
+                    schemas = []
+                state.target_schemas = list(schemas or [])
+                state.schemas_loading = False
+                render_results.refresh()
+
             async def on_test() -> None:
                 result = state.result
                 if result is None or not is_testable(result):
@@ -687,14 +772,13 @@ def build_query_playground_screen(
                 converted = result.converted_sql
                 kind = result.statement_kind
                 analyze = state.analyze
-                # Point the probe's search_path at the migrated schema (a MySQL DB
-                # maps to a PG schema), so an UNQUALIFIED table reference in the
-                # user's query (SELECT ... FROM orders) resolves to the migrated
-                # table instead of failing with relation-does-not-exist under the
-                # default public search_path -- mirroring how the query ran against
-                # that MySQL database.
-                source_config = getattr(session, "source_config", None)
-                search_path = getattr(source_config, "database", None) or None
+                # Point the probe's search_path at the schema the converted query
+                # should resolve UNQUALIFIED table names in (SELECT ... FROM orders),
+                # so it hits the migrated table instead of failing with
+                # relation-does-not-exist under the default public search_path. This
+                # is the user's "Test against schema" pick when set, otherwise the
+                # inferred default (a MySQL DB maps to a same-named PG schema).
+                search_path = _effective_test_schema()
                 state.begin_probe()
                 render_results.refresh()
                 # The probe is a network round-trip; run it off the event loop.
@@ -851,12 +935,12 @@ def build_query_playground_screen(
                     factory = make_factory(
                         target_config, getattr(session, "aws_profile", None)
                     )
-                    # Set the SAME search_path the initial Test used (the source
-                    # database), so a rewrite that uses UNQUALIFIED table names is
-                    # resolved against the schema the original passed under -- otherwise
-                    # it is falsely REJECTED against the default (public) search_path.
-                    _src_cfg = getattr(session, "source_config", None)
-                    _search_path = getattr(_src_cfg, "database", None) or None
+                    # Set the SAME search_path the initial Test used (the user's
+                    # "Test against schema" pick or the inferred default), so a rewrite
+                    # that uses UNQUALIFIED table names is resolved against the schema
+                    # the original passed under -- otherwise it is falsely REJECTED
+                    # against the default (public) search_path.
+                    _search_path = _effective_test_schema()
                     ui.notify("Re-testing the rewrite on the target…", type="info")
                     # EXPLAIN ANALYZE so DSQL emits the DPU estimate to compare. The
                     # rewrite is a PURE SELECT (extract_sql_from_reply refuses any DML,
@@ -947,6 +1031,35 @@ def build_query_playground_screen(
                     "DSQL's per-statement DPU cost estimate. Off = plan-only EXPLAIN "
                     "(the query is not executed, no cost estimate)."
                 )
+            # "Test against schema": which schema the probe resolves UNQUALIFIED table
+            # names in (search_path). Populated from the target's user schemas in the
+            # background and defaulted to the inferred schema, so it needs no attention
+            # on the happy path but lets the user retarget when a table was migrated
+            # under a different schema. Shown once the list has loaded and is non-empty
+            # (while it loads, Test still works against the inferred default).
+            schemas = state.target_schemas
+            if has_target and testable and schemas:
+                effective = _effective_test_schema()
+                options = list(schemas)
+                # Keep an inferred default selectable even if it holds no tables yet
+                # (so it wouldn't appear in the object-derived list).
+                if effective and effective not in options:
+                    options = [effective] + options
+                ui.select(
+                    options,
+                    value=effective,
+                    label="Test against schema",
+                    on_change=lambda e: setattr(
+                        state, "test_schema", e.value or None
+                    ),
+                ).props("dense outlined options-dense").style(
+                    "min-width: 200px"
+                ).tooltip(
+                    "The converted query's unqualified table names (FROM orders) are "
+                    "resolved in this schema (search_path). A MySQL database maps to a "
+                    "same-named schema on the target — switch this if your table was "
+                    "migrated under a different schema."
+                )
 
         if state.probing:
             with ui.row().classes("items-center gap-2"):
@@ -974,6 +1087,36 @@ def build_query_playground_screen(
         probe = state.probe
         if probe is not None:
             _render_probe(ui, probe)
+            # A missing-relation rejection (42P01) is almost always a search_path
+            # mismatch -- the query resolved unqualified names in the wrong schema.
+            # Turn the raw error into an actionable next step rather than a dead end.
+            if probe.outcome is ProbeOutcome.FAILED and probe.error_code == "42P01":
+                effective = _effective_test_schema()
+                have_picker = bool(state.target_schemas) and has_target and testable
+                where = (
+                    f'schema "{effective}"'
+                    if effective
+                    else "the default (public) search_path"
+                )
+                if have_picker:
+                    body = (
+                        f"The query was tested against {where}. If this table was "
+                        "migrated under a different schema, pick it in \"Test against "
+                        "schema\" above and run Test again."
+                    )
+                else:
+                    body = (
+                        f"The query was tested against {where}, and no matching table "
+                        "was found. Apply the schema conversion / Full Load so the "
+                        "table exists on the target, or connect the source with the "
+                        "database that contains it, then test again."
+                    )
+                render_notice(
+                    ui,
+                    tone="info",
+                    header="Table not found in the tested schema",
+                    body=body,
+                )
 
     def _render_ai_panel(
         result: QueryConversionResult,

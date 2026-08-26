@@ -31,7 +31,19 @@ count-matched tables are reported as "not deeply checked" (not as a false match)
 
 > **Reconcile applies to single-column integer PKs.** Those have a well-defined
 > ordering across both engines. Composite or non-integer PKs are skipped for the
-> reconcile pass (count/checksum still apply).
+> reconcile pass (count/checksum still apply). On a **very large** table with a
+> composite or missing PK, the exact `COUNT(*)`/checksum fall back to a single
+> unbounded query that can hit DSQL's ~300 s per-transaction limit (surfaced as a
+> per-table error); single-column-PK tables are keyset-paged and unaffected.
+
+> **Checksum excludes `FLOAT`/`DOUBLE` and `JSON` columns.** These have no
+> byte-identical text form across MySQL and PostgreSQL, so they are left out of the
+> checksum and listed in the report as **"not value-compared."** A value difference
+> confined to such a **non-key** column is therefore not caught by any mode (row count
+> is unchanged by an in-place edit, and reconcile compares PK *presence*, not values).
+> Key columns and every other type are still fully compared. Column count is **not**
+> a checksum limit — a very wide table's columns are hashed in groups (nested MD5) so
+> the checksum stays within DSQL's 100-argument function cap.
 
 ---
 
@@ -42,7 +54,9 @@ reference point. Validation uses the **watermark**:
 
 - It compares the **current** source position against the watermark's: by **GTID**
   when both the watermark and the live source expose one, otherwise by the binlog
-  **file:position** (the normal path on RDS MySQL 8.0, which can't enable GTID). If
+  **file:position** (the path whenever GTID can't be enabled, e.g. RDS MySQL 8.0; the
+  coordinate is read via `SHOW BINARY LOG STATUS` on MySQL 8.2+/8.4, else
+  `SHOW MASTER STATUS`). If
   the source has advanced, the report marks **`drifted = true`** with the watermark's
   snapshot timestamp as the "as of" point — so a count difference is correctly
   attributed to *new source activity since the snapshot*, not to a migration bug.

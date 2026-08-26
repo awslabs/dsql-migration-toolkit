@@ -251,7 +251,9 @@ both stacks. Debezium is open-source software running *on* MSK Connect.
 
 ## Prerequisites
 
-- A source **RDS / Aurora MySQL** with a read-only schema/data user.
+- A source **RDS / Aurora MySQL** with a read-only schema/data user. **Supported
+  engines/versions** (validated end-to-end): **RDS for MySQL** 5.7 / 8.0 / 8.4 and
+  **Aurora MySQL** 5.7 / 8.0 / 8.4 (5.7 is on Extended Support but fully supported as a source).
 - A target **Aurora DSQL** cluster in the **same region** (IAM-token auth, no password).
 - **AWS credentials** via the standard chain (env / `~/.aws` / profile) with
   `dsql:DbConnect` (or `dsql:DbConnectAdmin` for the `admin` user). Optionally

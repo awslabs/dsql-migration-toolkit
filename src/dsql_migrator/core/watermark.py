@@ -11,7 +11,8 @@ as-of this point (Requirements 5.7, 5.8 / Property 11).
 What is captured (within a single consistent-snapshot transaction so every
 value is as-of one point):
 
-- MySQL binlog coordinates (file + position) via ``SHOW MASTER STATUS``,
+- MySQL binlog coordinates (file + position) via ``SHOW BINARY LOG STATUS``
+  (MySQL 8.2+/8.4), falling back to ``SHOW MASTER STATUS`` (<= 8.0.x),
 - the GTID set (``@@GLOBAL.gtid_executed``),
 - the source ``@@GLOBAL.server_uuid``,
 - a UTC snapshot timestamp, and
@@ -66,6 +67,13 @@ from dsql_migrator.core.source_dialect import MySQLSourceDialect, SourceDialect
 # are writes or DDL, so they pass the read-only guard (Property 1).
 START_CONSISTENT_SNAPSHOT = "START TRANSACTION WITH CONSISTENT SNAPSHOT"
 SHOW_MASTER_STATUS = "SHOW MASTER STATUS"
+# MySQL 8.4 REMOVED `SHOW MASTER STATUS`; `SHOW BINARY LOG STATUS` (added in 8.2.0)
+# is its replacement and returns the same File / Position / Executed_Gtid_Set
+# columns. Aurora MySQL 3.x (8.0.x) predates the new form, so we try the new
+# statement first and fall back to the legacy one -- covering 8.0.x through 8.4+
+# without a version probe.
+SHOW_BINARY_LOG_STATUS = "SHOW BINARY LOG STATUS"
+_BINLOG_STATUS_STATEMENTS = (SHOW_BINARY_LOG_STATUS, SHOW_MASTER_STATUS)
 SHOW_BINARY_LOGS = "SHOW BINARY LOGS"
 COMMIT = "COMMIT"
 
@@ -93,23 +101,37 @@ def _utc_now() -> datetime:
 _MYSQL_DIALECT = MySQLSourceDialect()
 
 
+def read_binlog_status_row(connection: _Connection):
+    """Return the binlog-status row (``File`` / ``Position`` / ``Executed_Gtid_Set``) or ``None``.
+
+    Tries ``SHOW BINARY LOG STATUS`` (MySQL 8.2+, including 8.4 where
+    ``SHOW MASTER STATUS`` was removed) and falls back to ``SHOW MASTER STATUS``
+    (MySQL <= 8.0.x). Returns ``None`` when the supported statement yields no row
+    (binary logging disabled). A :class:`ReadOnlySourceError` is never suppressed.
+
+    Shared by the watermark capture, the CDC "Fetch from source" action, and the
+    validator's drift read so all three stay version-agnostic across 8.0.x/8.4+.
+    """
+    for statement in _BINLOG_STATUS_STATEMENTS:
+        try:
+            return connection.execute(text(statement)).mappings().first()
+        except ReadOnlySourceError:
+            raise
+        except Exception:  # noqa: BLE001 - statement unsupported on this version; try the next form
+            continue
+    return None
+
+
 def _read_master_status(
     connection: _Connection,
 ) -> tuple[Optional[str], Optional[int], Optional[str]]:
-    """Read binlog file/position/GTID via ``SHOW MASTER STATUS`` (read-only).
+    """Read binlog file/position/GTID via ``SHOW BINARY LOG STATUS`` / ``SHOW MASTER STATUS``.
 
     Returns ``(None, None, None)`` when the command is unavailable or returns no
     row (e.g. binary logging disabled or restricted privileges). A
     :class:`ReadOnlySourceError` is never suppressed.
     """
-    try:
-        result = connection.execute(text(SHOW_MASTER_STATUS))
-        row = result.mappings().first()
-    except ReadOnlySourceError:
-        raise
-    except Exception:  # noqa: BLE001 - binlog info is optional; degrade gracefully
-        return None, None, None
-
+    row = read_binlog_status_row(connection)
     if not row:
         return None, None, None
 

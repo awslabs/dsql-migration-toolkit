@@ -190,7 +190,8 @@ AI アシストは **オプトイン・デフォルト無効** の補強機能�
   `ENUM` → `text` + `CHECK`、`BLOB`/`BINARY` → `bytea` など。
   下記 [§2.3](#23-mysql--dsql-の型と制約の処理-リファレンス) を参照)。
 - **列のデフォルト値** — ソースの `DEFAULT` を引き継ぎます(Aurora DSQL がサポートしており、
-  `DEFAULT CURRENT_TIMESTAMP` も含みます)。2 つは自動的に変換されます: `TINYINT(1)` のデフォルトは
+  `CURRENT_TIMESTAMP` **および小数秒付きの `CURRENT_TIMESTAMP(n)`**、`NOW()`、`CURRENT_DATE`/`CURRENT_TIME`、
+  `LOCALTIME`/`LOCALTIMESTAMP` を含みます)。2 つは自動的に変換されます: `TINYINT(1)` のデフォルトは
   `boolean` ターゲット向けに `TRUE`/`FALSE` へ、`DATETIME` のデフォルトはローダーが書き込む naive
   UTC の値と一致するよう UTC に固定されます。これが最も重要なのは **デフォルト値を持つ `NOT NULL`
   列** です: MySQL はその列を省略した `INSERT` を受け付けますが、デフォルトがなければターゲットは
@@ -257,7 +258,7 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 
 | MySQL 型 | Aurora DSQL 型 | 格納される値の形式 | 分類 | 備考 |
 |---|---|---|---|---|
-| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 精度/スケールを保持。**精度 > 38 は UNSUPPORTED** です (DSQL は NUMERIC を 38 に制限)。 |
+| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 精度/スケールを保持。**精度 > 38** は Evaluation で **UNSUPPORTED** と表示されます (DSQL は NUMERIC を 38 に制限) が、Schema Conversion は **`numeric(38,37)` にクランプ**し、データ損失の警告とともに DDL を出力します (スケールも 37 に制限)。 |
 | `DECIMAL(p,s) UNSIGNED` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 符号なしは表現できず、格納上の意味を持ちません。 |
 | `FLOAT` | `real` | `real` | AUTO | 単精度 float。 |
 | `FLOAT(M,D)` | `real` | `real` | AUTO | `(M,D)` 表示仕様はドロップされます (PostgreSQL の `float` はスケールではなく 1 つの精度を取ります)。 |
@@ -289,6 +290,11 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 | `JSON` | `json` | `json` | AUTO | (CDC は JSON テキストを `PGobject(type=json)` でラップし、`json` 列をターゲットにします。) |
 | 空間型 (`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL には空間型がありません。データは生の WKB バイトとして **保持** されます (Full Load は `ST_AsBinary(col)` を読み取り、CDC は Debezium の geometry の `.wkb` を抽出します。**SRID はドロップ** されます)。`geometry` の *列型* 自体は MANUAL としてフラグ付けされ(自動的に `bytea` へ置換され、WKB は保持)、値は失われません。 |
 
+> **DSQL では `bytea` 列はキーになれません。** `bytea` にマッピングされる列
+> (`BINARY`/`VARBINARY`、`*BLOB`、空間型)は主キーやインデックスの一部に **できません**:
+> そうした列を PK にするとテーブルは **UNSUPPORTED**、セカンダリインデックスならインデックスは
+> **破棄 (MANUAL)** されます。`text`/`uuid` やハッシュ列に re-key してください。下の構造上の制約を参照。
+
 ### 構造上の制約
 
 | DSQL のルール | ツールの動作 |
@@ -299,11 +305,17 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 | **トランザクションあたり 1 つの DDL** | Schema Conversion は実行単位ごとに正確に 1 つの DDL 文を出力します。 |
 | **`CREATE INDEX ASYNC`** | セカンダリインデックスはデータの後に非同期で作成されます。 |
 | **楽観的並行性制御** | すべてのバッチと DDL は `40001` リトライでラップされます。 |
-| **列のデフォルト値はサポートされます** | ソースの `DEFAULT` を引き継ぎます(`DEFAULT CURRENT_TIMESTAMP` を含む)。`TINYINT(1)` のデフォルトは `TRUE`/`FALSE` に変換され(`boolean` 列は `DEFAULT 1` を拒否します)、`DATETIME` のデフォルトはローダーが書き込む naive UTC の値と一致するよう UTC に固定され、`UUID()` は `gen_random_uuid()` になります。DSQL に対応がないデフォルトは黙って失われるのではなく、破棄して **報告** します。デフォルトの保持が最も重要なのは `NOT NULL` 列です: MySQL はその列を省略した `INSERT` を受け付けますが、ターゲットは拒否します。 |
+| **列のデフォルト値はサポートされます** | ソースの `DEFAULT` を引き継ぎます(`CURRENT_TIMESTAMP[(n)]`、`NOW()`、`CURRENT_DATE`/`CURRENT_TIME`、`LOCALTIME`/`LOCALTIMESTAMP` を含む)。`TINYINT(1)` のデフォルトは `TRUE`/`FALSE` に変換され(`boolean` 列は `DEFAULT 1` を拒否します)、`DATETIME` のデフォルトはローダーが書き込む naive UTC の値と一致するよう UTC に固定され、関数デフォルトは変換されます(`UUID()`→`gen_random_uuid()`、`CURDATE()`→`CURRENT_DATE`、`CURTIME()`→`CURRENT_TIME`、`UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 式)。DSQL に対応がないデフォルト(例: 他の列を参照する式)は黙って失われるのではなく、破棄して **報告** します。デフォルトの保持が最も重要なのは `NOT NULL` 列です: MySQL はその列を省略した `INSERT` を受け付けますが、ターゲットは拒否します。 |
 | **`ON UPDATE CURRENT_TIMESTAMP` なし** | 再現不可: DSQL には `ON UPDATE` 句も、(PostgreSQL で通常用いる回避策の)トリガーもありません。列は挿入時のデフォルトを保持し **MANUAL** としてフラグ付けされます — 更新時のタイムスタンプはアプリケーションで明示的に設定してください。 |
 | **トリガー / ストアドプロシージャ / イベントなし** | **UNSUPPORTED** としてフラグ付け — アプリケーションで再実装します (スケジュールイベントは EventBridge/Lambda で)。 |
 | **ネイティブパーティショニングなし** | DSQL が自動分散します。パーティション化されたテーブルは MANUAL としてフラグ付けされます。 |
 | **クラスターあたり 1 つのデータベース** | 複数データベースのソースは MANUAL としてフラグ付けされます (スキーマに統合するか、クラスターを分割します)。 |
+| **ソースの `CHECK` 制約は破棄** | MySQL の `CHECK`(8.0.16+)はターゲットに引き継がれず(関数/演算子が PostgreSQL と異なる場合がある)、**MANUAL** としてフラグ付けされます — DSQL 互換の `CHECK` を手動で再追加するか、アプリで強制してください。(ツールが `ENUM` 用に *生成* する `CHECK … IN (...)` は影響を受けません。) |
+| **`bytea` はキーになれない** | `bytea` 列(`BINARY`/`VARBINARY`、`*BLOB`、空間型由来)は **主キー** 列(テーブル → **UNSUPPORTED**)や **インデックス** 列(インデックス破棄 → **MANUAL**)にできません。`text`/`uuid`/ハッシュに re-key してください。 |
+| **キー列は 8 個以下** | 主キーまたはインデックスが 8 列を超えると DSQL の上限超過: PK は **UNSUPPORTED**、過剰なセカンダリインデックスは **破棄 (MANUAL)**。 |
+| **テーブルあたりインデックス 24 個以下** | DSQL はテーブルあたり最大 24 個のインデックスを許可(PK を含む → セカンダリは 23 個以下)。超過分は表示され、一部は生成されません。 |
+| **キー値は 1 KiB 以下** | 結合キー値は ~1 KiB 未満である必要があります。大きいキーは **推奨(recommendation)** として表示されます(実データで挿入時に失敗する可能性)。 |
+| **識別子 63 バイト** | DSQL/PostgreSQL は識別子を 63 バイトに切り詰めます。切り詰めで 2 つの名前が衝突する場合、そのオブジェクトは **UNSUPPORTED** としてフラグ付けされます(先頭 63 バイトが一意になるよう改名)。 |
 
 上の表の **クラス** 列は、Evaluation がすべてのオブジェクトに適用するのと同じ
 AUTO / MANUAL / UNSUPPORTED の尺度です — 各クラスの意味と、複数のルールが一致した場合に

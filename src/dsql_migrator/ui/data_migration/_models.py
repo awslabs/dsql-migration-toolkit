@@ -1004,6 +1004,7 @@ _PREREQ_CATEGORY_BY_CHECK: dict[PrerequisiteCheckId, PrereqCategory] = {
     PrerequisiteCheckId.TARGET_IAM_AUTH: PrereqCategory.CONNECTIVITY,
     PrerequisiteCheckId.REPLICATION_GRANTS: PrereqCategory.SOURCE_CONFIG,
     PrerequisiteCheckId.BINLOG_ROW_FORMAT: PrereqCategory.SOURCE_CONFIG,
+    PrerequisiteCheckId.BINLOG_RETENTION: PrereqCategory.SOURCE_CONFIG,
     PrerequisiteCheckId.GTID_MODE: PrereqCategory.SOURCE_CONFIG,
     PrerequisiteCheckId.TABLE_PRIMARY_KEY: PrereqCategory.SCHEMA_TABLES,
     PrerequisiteCheckId.TARGET_SCHEMA_READY: PrereqCategory.SCHEMA_TABLES,
@@ -1260,6 +1261,33 @@ def lob_exclusion_candidates(
             )
     candidates.sort(key=lambda c: c.table)
     return candidates
+
+
+def scope_lob_candidates(
+    candidates: Sequence[LobExclusionCandidate],
+    *,
+    selected_tables: Optional[Sequence[str]],
+    stored_selection: Sequence[str],
+) -> list[LobExclusionCandidate]:
+    """Scope oversized-LOB candidates to the tables that will actually be migrated.
+
+    ``selected_tables`` is the caller's RESOLVED effective selection (e.g. the Full
+    Load screen's ``effective_migration_selection``): when provided, filter strictly
+    to it -- so selecting a single schema lists only that schema's LOB columns even
+    though ``stored_selection`` (``migration_state.selection.selected_tables``) is
+    still the empty "= all" default until the picker is touched (the Schema-Conversion
+    pick only pre-ticks the picker). When ``None``, fall back to ``stored_selection``
+    (empty => all), the legacy behavior for callers that can't resolve the effective
+    set. Pure, so the scoping is unit-testable without a live screen. Both name forms
+    are qualified ``db.table`` (matches ``TableDef.name`` / ``TableSelection``).
+    """
+    if selected_tables is not None:
+        scoped = set(selected_tables)
+        return [c for c in candidates if c.table in scoped]
+    stored = set(stored_selection)
+    if not stored:
+        return list(candidates)
+    return [c for c in candidates if c.table in stored]
 
 
 def format_column_exclude_list(

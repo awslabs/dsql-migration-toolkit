@@ -24,7 +24,9 @@ one-line "must know" plus a pointer to the chapter that covers it in depth.
       [§6.2](06-limitations.md#62-migration-process-limits)
 
 - [ ] **Your source is only ever read.** The tool never writes to your RDS /
-      Aurora MySQL source — a read-capable user is enough. → [§1.1](01-setup.md#11-prerequisites)
+      Aurora MySQL source — a read-capable user is enough. Supported sources:
+      **RDS for MySQL** and **Aurora MySQL**, versions **5.7 / 8.0 / 8.4**.
+      → [§1.1](01-setup.md#11-prerequisites)
 
 - [ ] **DSQL is PostgreSQL-compatible, IAM-authenticated, and distributed.** It
       speaks the PostgreSQL wire protocol, uses **short-lived IAM tokens** (no
@@ -59,12 +61,14 @@ one-line "must know" plus a pointer to the chapter that covers it in depth.
 
 - [ ] **CDC requires source binlog set up first (managed-MySQL way).** If you'll
       use CDC, the source must have **binary logging on in ROW format with a full
-      row image** (`binlog_format=ROW`, `binlog_row_image=FULL`), a user with
-      **replication privileges**, and **binlog retention raised** so the logs
-      survive until CDC catches up. On RDS/Aurora this is done via **parameter
-      groups** and the `mysql.rds_set_configuration` **stored procedure** — not
-      `my.cnf`/`SET GLOBAL` as on community MySQL. Full Load alone needs none of
-      this. → [§1.1](01-setup.md#11-prerequisites)
+      row image** (`binlog_format=ROW`, `binlog_row_image=FULL`) and a user with
+      **replication privileges** — the prerequisite gate **blocks** CDC until both
+      are met. Also **raise binlog retention** so the binlog at the Full Load
+      watermark still exists when CDC starts; the gate only **warns** here, but
+      too-short retention is a real silent-gap risk. On RDS/Aurora this is done via
+      **parameter groups** and the `mysql.rds_set_configuration` **stored
+      procedure** — not `my.cnf`/`SET GLOBAL` as on community MySQL. Full Load alone
+      needs none of this. → [§1.1](01-setup.md#11-prerequisites)
 
 - [ ] **CDC replicates data, not schema.** During CDC, source **DDL** changes are
       **not** propagated to DSQL — you re-apply them yourself via Schema
@@ -79,12 +83,19 @@ one-line "must know" plus a pointer to the chapter that covers it in depth.
       credentials (the `bedrock:InvokeModel` permission). There is **no direct
       API-key entry** (no Anthropic/OpenAI key field) — the only way to use AI is
       Bedrock. Every suggestion is **review-only** and AI is never in the data
-      path. → [Chapter 2](02-evaluation-and-schema-conversion.md)
+      path. The same assistant is available on **every step** as the **AI DBA**
+      panel — a read-only helper that can diagnose Full Load / CDC failures, triage
+      the DLQ, and check prerequisites. → [Chapter 2](02-evaluation-and-schema-conversion.md),
+      [Chapter 9](09-query-validation.md)
 
 - [ ] **(If deploying on AWS) it's a single-task control plane with optional auth.**
-      One ECS Fargate task; in-flight job state lives on ephemeral storage; the
-      app relies on the ALB's **optional Cognito** gate (enable it for any
-      internet-facing deployment). → [§6.3](06-limitations.md#63-deployment-limits-the-aws-hosted-form)
+      The usual form is one **ECS Fargate** task behind an ALB with the ALB's
+      **optional Cognito** gate (enable it for any internet-facing deployment); on
+      the AWS-hosted deploy, job/session state is kept durable in a managed S3
+      bucket so a task swap resumes. A **single-EC2-host-from-source** mode also
+      exists — state on a retained EBS volume, reached over an SSM port-forward, no
+      ALB/Cognito. → [§1.4](01-setup.md#14-run-on-a-single-ec2-host-from-source),
+      [§6.3](06-limitations.md#63-deployment-limits-the-aws-hosted-form)
 
 ---
 

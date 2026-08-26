@@ -402,6 +402,41 @@ def test_enrich_columns_marks_generated_and_on_update_columns() -> None:
     assert "ON UPDATE" not in (by_name["updated_at"].default or "")
 
 
+def test_enrich_columns_classifies_temporal_function_default_on_mysql_57() -> None:
+    """MySQL < 8.0.13 (e.g. 5.7) has no ``DEFAULT_GENERATED`` flag in EXTRA.
+
+    A temporal FUNCTION default must still be classified as an expression -- otherwise
+    the converter quotes it and the target CREATE fails ("invalid input syntax for type
+    timestamp: 'CURRENT_TIMESTAMP(6)'"). The classification is scoped to temporal columns
+    so a genuine VARCHAR literal that merely reads like a function is NOT misclassified.
+    """
+    tables = [
+        TableDef(
+            name="t",
+            columns=[
+                ColumnDef(name="created", mysql_type="datetime(6)"),
+                ColumnDef(name="ts", mysql_type="timestamp"),
+                ColumnDef(name="label", mysql_type="varchar(50)"),
+            ],
+        )
+    ]
+    rows = [
+        # (TABLE_NAME, COLUMN_NAME, COLLATION_NAME, EXTRA, COLUMN_TYPE, COLUMN_DEFAULT)
+        # 5.7: EXTRA is empty (the 8.0.13+ DEFAULT_GENERATED flag does not exist).
+        ("t", "created", None, "", "datetime(6)", "CURRENT_TIMESTAMP(6)"),
+        ("t", "ts", None, "", "timestamp", "CURRENT_TIMESTAMP"),
+        # A VARCHAR literal that happens to read like a function must stay a literal.
+        ("t", "label", "utf8mb4_general_ci", "", "varchar(50)", "NOW()"),
+    ]
+    enrich_columns(_FakeConnection(rows), "app", tables)
+
+    by = {c.name: c for c in tables[0].columns}
+    assert by["created"].default_is_expression is True
+    assert by["created"].default == "CURRENT_TIMESTAMP(6)"
+    assert by["ts"].default_is_expression is True
+    assert by["label"].default_is_expression is False  # temporal-scoped: literal untouched
+
+
 def test_enrich_index_types_records_index_type() -> None:
     tables = [
         TableDef(

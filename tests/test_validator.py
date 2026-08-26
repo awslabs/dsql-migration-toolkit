@@ -831,6 +831,53 @@ def test_page_checksum_shares_the_whole_table_row_token() -> None:
     assert pg_token in build_pg_page_checksum_first_sql(table, "id", 5000).as_string(None)
 
 
+def _int_cols_table(n: int, name: str = "w") -> TableDef:
+    return TableDef(
+        name=name,
+        columns=[ColumnDef(name=f"c{i}", mysql_type="int") for i in range(n)],
+        primary_key=["c0"],
+        foreign_keys=[],
+    )
+
+
+def test_row_token_stays_flat_within_the_arg_limit() -> None:
+    # At exactly _CONCAT_MAX_TERMS columns the token is the ORIGINAL single flat
+    # CONCAT_WS on BOTH engines -- no nesting, so narrow tables are byte-unchanged.
+    from dsql_migrator.core.validation_sql import _CONCAT_MAX_TERMS
+
+    table = _int_cols_table(_CONCAT_MAX_TERMS)
+    assert _mysql_row_token(table).count("CONCAT_WS(") == 1
+    assert _pg_row_token(table).as_string(None).count("concat_ws(") == 1
+
+
+def test_row_token_nests_md5_for_wide_tables_over_the_pg_arg_limit() -> None:
+    # A table wider than the PG/DSQL 100-argument limit must NEST MD5s per group so
+    # no single concat_ws exceeds the limit -- identically on both engines, so equal
+    # data still hashes equally. (255-column tables are supported by the assessor.)
+    from dsql_migrator.core.validation_sql import _CONCAT_MAX_TERMS
+
+    assert _CONCAT_MAX_TERMS < 100  # leaves room for the separator argument
+
+    # One column past the limit already triggers nesting (2 groups -> 3 concat_ws).
+    just_over = _int_cols_table(_CONCAT_MAX_TERMS + 1)
+    assert _mysql_row_token(just_over).count("CONCAT_WS(") == 3
+    assert _pg_row_token(just_over).as_string(None).count("concat_ws(") == 3
+
+    # A realistic wide table (200 int columns -> 3 groups of <=96) + drift guard.
+    n = 200
+    wide = _int_cols_table(n)
+    groups = (n + _CONCAT_MAX_TERMS - 1) // _CONCAT_MAX_TERMS
+    my = _mysql_row_token(wide)
+    pg = _pg_row_token(wide).as_string(None)
+    assert my.count("CONCAT_WS(") == groups + 1  # `groups` inner + 1 outer
+    assert pg.count("concat_ws(") == groups + 1  # PG nests identically
+    assert groups <= _CONCAT_MAX_TERMS  # outer concat also stays under the limit
+    # Every checksum builder still reduces over this exact wide token (no drift).
+    assert f"COALESCE(SUM({my}), 0)" in build_mysql_checksum_sql(wide)
+    assert f"{my} AS page_tok" in build_mysql_page_checksum_first_sql(wide, "c0")
+    assert pg in build_pg_checksum_sql(wide).as_string(None)
+
+
 def test_pg_page_checksum_sql_is_keyset_bounded_and_qualified() -> None:
     first = build_pg_page_checksum_first_sql(_table("orders"), "id", 500).as_string(None)
     nxt = build_pg_page_checksum_next_sql(_table("orders"), "id", 500).as_string(None)

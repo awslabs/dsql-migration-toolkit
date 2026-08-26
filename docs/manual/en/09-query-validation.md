@@ -24,9 +24,14 @@ classifies it:
 - **AUTO** — converted deterministically; ready to test.
 - **MANUAL** — converted, but review it (an idiom that has a caveat on DSQL).
 
-It also flags **anti-patterns** that matter on DSQL — for example
-`SELECT ... FOR UPDATE`, which behaves differently under DSQL's optimistic
-concurrency control.
+It also **rewrites** MySQL idioms and **flags** ones that matter on DSQL — e.g.
+`ON DUPLICATE KEY UPDATE` → `INSERT ... ON CONFLICT DO UPDATE` (MANUAL — you confirm
+the conflict target), `JSON_UNQUOTE(JSON_EXTRACT(...))` → `JSON_EXTRACT_PATH_TEXT`,
+MySQL `HAVING`-alias references inlined, and `SELECT ... FOR UPDATE` (which behaves
+differently under DSQL's optimistic concurrency). Every such finding is classified
+**MANUAL**. For the broader application-code anti-pattern scan (foreign-key /
+`AUTO_INCREMENT` / trigger reliance, unsupported functions) see
+[Chapter 2](02-evaluation-and-schema-conversion.md).
 
 The original and the converted SQL are shown side by side so you can see exactly
 what changed.
@@ -48,6 +53,12 @@ What can and can't be tested:
 
 The verdict shows whether DSQL accepted the statement, the exact error (with
 SQLSTATE) if it didn't, the captured query plan, and — with ANALYZE — the DPU cost.
+
+**Which schema is tested.** An unqualified table name (`FROM orders`) resolves
+against a schema via the session `search_path`; the tool defaults to the connected
+source database's same-named schema, and a **Test against schema** picker lets you
+retarget. A `relation "…" does not exist` (SQLSTATE **42P01**) simply means the
+table isn't in the tested schema — pick the right one and re-test.
 
 > **Reading a DSQL plan:** Aurora DSQL is a *distributed* PostgreSQL-compatible
 > engine, so its plans read a little differently — see §9.4.
@@ -89,6 +100,15 @@ rewrite didn't help). The measured DPU, not the model's prose, is the proof.
 > editor and re-run Convert / Test yourself — the human-review gate. AI assist stays
 > opt-in, on the control plane, and never touches the data path.
 
+### Review or fix a query with the AI DBA
+
+Separately from **Tune** (which is about *cost*), a **Review with AI DBA** button —
+relabelled **Fix with AI DBA** when the target *rejected* the converted statement —
+is a *correctness* action: it asks the AI whether the conversion is right and, on a
+rejection, why DSQL refused it (grounded on the exact error + SQLSTATE) and how to
+rewrite it. Unlike Tune, it needs **no passed test** — reach for it the moment a
+conversion looks wrong or a Test on target fails. It is advisory only, same as Tune.
+
 ---
 
 ## 9.4 Why DSQL query tuning is different from PostgreSQL
@@ -124,7 +144,45 @@ monotonic ones (`AUTO_INCREMENT`, timestamps) that create hot partitions.
 
 ---
 
-## 9.5 Where to go next
+## 9.5 The AI DBA — your app-wide assistant
+
+The **Tune** / **Review** actions above open the same assistant that lives on
+**every** step: the **AI DBA** panel (header **AI DBA** button). It's the same
+Bedrock-only AI assist you enable on Connect (**off by default**), surfaced as a
+persistent, session-backed right-side panel — its conversation and scope survive
+moving between steps, a browser refresh, and even an app restart.
+
+What makes it more than a chatbot:
+
+- **Ask anything about *this* migration.** A general chat mode answers grounded on
+  your actual run, not generic docs.
+- **Read-only diagnostic tools.** To answer, the model calls tools that pull the
+  migration's real state — never row values, never credentials. It can diagnose a
+  **Full Load** failure (which tables failed and why), explain **why CDC isn't
+  streaming** or **why a CDC deploy failed** and triage the **DLQ** (sample
+  dead-lettered records by table + SQLSTATE), report **prerequisite verdicts** (what's
+  blocking CDC and how to fix it), explain a **Validation** mismatch, and read the
+  **target DSQL** catalog (tables, schema, row counts).
+- **Cross-step context.** Major actions mirror into the panel as an activity feed, a
+  **live Full Load progress card stays pinned and keeps updating** while you work
+  elsewhere, and recent actions ground each answer.
+- **"What's next?" briefing.** A header action gives a tool-grounded read of what to
+  do next and the top risks right now.
+- **Scoped deep-links.** Each step offers a one-click "ask about this" into the panel
+  — per-failed-table / per-quarantine help on Full Load, drift + DLQ triage on CDC,
+  "Explain this mismatch" on Validation, and a **GO / HOLD "is it safe to cut over?"**
+  read on Cut over.
+
+**Safety — the same model as all AI assist:** off by default; Bedrock-only (no API-key
+entry); the tools are strictly read-only and see **schema / status / DDL / plan
+metadata — never Full Load or CDC row data, never credentials**; nothing it suggests is
+applied without your explicit action. See
+[§2.1](02-evaluation-and-schema-conversion.md) for the permission model and how to
+enable it.
+
+---
+
+## 9.6 Where to go next
 
 - **Tuning the data path (parallelism):** [Chapter 7 — Performance and tuning](07-performance-and-tuning.md).
 - **Conclusion and cut-over:** [Chapter 10 — Conclusion](10-conclusion.md).

@@ -26,6 +26,7 @@ from dsql_migrator.core.query_playground import (
     ExecutionProbe,
     ProbeMode,
     ProbeOutcome,
+    list_target_schemas,
     parse_dpu_estimate,
     probe_statement,
 )
@@ -38,6 +39,7 @@ from dsql_migrator.ui.query_playground import (
     is_testable,
     kind_meta,
     probe_outcome_tone,
+    resolve_test_schema,
 )
 
 
@@ -184,6 +186,90 @@ def test_no_search_path_leaves_explain_first() -> None:
     probe_statement("SELECT * FROM t", StatementKind.SELECT, _factory(conn))
     assert not any(s.upper().startswith("SET SEARCH_PATH") for s in conn.executed)
     assert conn.executed[0].upper().startswith("EXPLAIN ")
+
+
+# ---------------------------------------------------------------------------
+# "Test against schema": listing target schemas + resolving the effective one
+# ---------------------------------------------------------------------------
+
+
+class _SchemaListCursor:
+    """A cursor that records the schema-list query + its bound params."""
+
+    def __init__(self, rows: list[tuple]) -> None:
+        self.rows = rows
+        self.sql: Optional[str] = None
+        self.params: Any = None
+        self.closed = False
+
+    def execute(self, sql: Any, params: Any = None) -> None:
+        self.sql = str(sql)
+        self.params = params
+
+    def fetchall(self) -> list[tuple]:
+        return list(self.rows)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _SchemaListConnection:
+    def __init__(self, rows: list[tuple]) -> None:
+        self.cur = _SchemaListCursor(rows)
+        self.closed = False
+
+    def cursor(self) -> _SchemaListCursor:
+        return self.cur
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_list_target_schemas_returns_user_schema_names() -> None:
+    conn = _SchemaListConnection([("ecommerce_demo",), ("analytics",)])
+    schemas = list_target_schemas(lambda: conn)
+    assert schemas == ["ecommerce_demo", "analytics"]
+    # Reads from information_schema and excludes system schemas via a BOUND parameter
+    # (never inlined), then closes both the cursor and the connection.
+    assert "information_schema.tables" in (conn.cur.sql or "")
+    assert "pg_catalog" in conn.cur.params["excluded"]
+    assert conn.cur.closed is True and conn.closed is True
+
+
+def test_list_target_schemas_swallows_read_errors() -> None:
+    def factory():  # noqa: ANN202
+        raise RuntimeError("connection refused")
+
+    # Best-effort: a failure yields [] (the picker falls back to the default), never
+    # raising and breaking the screen.
+    assert list_target_schemas(factory) == []
+
+
+def test_resolve_test_schema_prefers_user_override() -> None:
+    # An explicit "Test against schema" pick always wins, even over the inferred DB.
+    assert resolve_test_schema("chosen", "inferred_db", ["a", "b"]) == "chosen"
+
+
+def test_resolve_test_schema_uses_inferred_when_present_on_target() -> None:
+    # No override: the connected source DB is used when the target actually has it.
+    assert (
+        resolve_test_schema(None, "ecommerce_demo", ["ecommerce_demo", "analytics"])
+        == "ecommerce_demo"
+    )
+
+
+def test_resolve_test_schema_falls_back_to_sole_target_schema() -> None:
+    # No override and the inferred DB isn't on the target, but there is exactly one
+    # user schema -> use it (the only place a converted query could resolve to).
+    assert resolve_test_schema(None, "missing_db", ["only_schema"]) == "only_schema"
+
+
+def test_resolve_test_schema_best_guess_when_ambiguous() -> None:
+    # Inferred DB absent from several target schemas -> fall back to the inferred
+    # name as a best guess (the user can still override via the picker).
+    assert resolve_test_schema(None, "guess_db", ["a", "b", "c"]) == "guess_db"
+    # Nothing to go on (no override, no inferred, none fetched) -> None (no SET).
+    assert resolve_test_schema(None, None, None) is None
 
 
 def test_select_explain_captures_query_plan() -> None:
@@ -662,18 +748,32 @@ def test_query_ai_button_labels_are_unified_on_ai_dba() -> None:
     assert "Ask AI to fix" not in src and "Ask AI to review" not in src
 
 
-def test_retest_reprobe_passes_source_search_path() -> None:
+def test_retest_reprobe_passes_effective_search_path() -> None:
     # The re-test probe must set the SAME search_path the initial Test used (the
-    # source database), so a rewrite with UNQUALIFIED table names is not falsely
-    # rejected against the default (public) search_path.
+    # user's "Test against schema" pick, else the inferred source database), so a
+    # rewrite with UNQUALIFIED table names is not falsely rejected against the
+    # default (public) search_path.
     import inspect
 
     from dsql_migrator.ui import query_playground as qp
 
     src = inspect.getsource(qp.build_query_playground_screen)
-    # The re-probe reads source_config.database and passes it as search_path.
-    assert 'getattr(_src_cfg, "database", None)' in src
+    # Both the initial Test and the re-probe resolve the schema the same way.
+    assert "_search_path = _effective_test_schema()" in src
     assert "search_path=_search_path" in src
+    # The effective schema delegates to the pure resolver, seeded from the override,
+    # the inferred source database, and the fetched target schemas.
+    assert "resolve_test_schema(" in src
+    assert 'getattr(src, "database", None)' in src
+
+
+def test_state_defaults_for_test_schema_picker() -> None:
+    state = PlaygroundState()
+    # No override, no fetched schema list, not loading -- so a Test uses the inferred
+    # default until the user (or the background fetch) changes these.
+    assert state.test_schema is None
+    assert state.target_schemas is None
+    assert state.schemas_loading is False
 
 
 def test_state_probe_lifecycle() -> None:

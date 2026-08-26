@@ -14,7 +14,10 @@ the tool exercises it.
 > Two test layers back every scenario: an **offline suite** (~3,100 Python + 72
 > Java tests; no AWS — seams injected) that proves the behavior deterministically,
 > and a **live end-to-end run** (real RDS MySQL + Aurora DSQL + MSK) that proves it
-> on real infrastructure with deliberately failing rows (summarized in §8.2).
+> on real infrastructure with deliberately failing rows (summarized in §8.2). A
+> small `integration`-marked tier (`tests/test_integration_e2e.py`) also exercises a
+> local MySQL + a PostgreSQL-16 container, but only under `RUN_INTEGRATION_TESTS=1`;
+> it self-skips otherwise, so the default `pytest` run stays fully offline.
 
 ---
 
@@ -188,6 +191,12 @@ that *should* fail were caught and reported rather than lost. And because you ru
 **Validation** yourself at the end of your own migration, you get this same
 evidence — exact counts, checksums, and per-PK reconciliation — for *your* data
 before you cut over. You don't have to take the result on trust; you reproduce it.
+
+> The same per-PK reconciliation is also available from a shell:
+> `scripts/cdc_consistency_check.py` (names the exact PKs **missing** / **extra** on
+> the target) and `scripts/compare_rows.py -t <schema.table> --watch N` (row-count /
+> live-convergence check) — see [`scripts/README.md`](../../../scripts/README.md).
+> The built-in **Validation** step remains the authoritative go/no-go.
 
 ---
 

@@ -213,6 +213,7 @@ from dsql_migrator.ui.data_migration._models import (
     format_watermark,
     LobExclusionCandidate,
     lob_exclusion_candidates,
+    scope_lob_candidates,
     format_column_exclude_list,
     _DSQL_VALUE_LIMIT_MIB,
     _BROKER_MESSAGE_LIMIT_MIB,
@@ -1005,19 +1006,13 @@ def build_data_migration_screen(
             # ``full_load_run_guard_reason``), so a stale PASS never starts a load
             # against an unchecked column set. The lock is silent: the greyed picker
             # beside it already explains why inputs are frozen.
-            if migration_type is not MigrationType.CDC_ONLY:
-                _render_cdc_lob_exclusion_panel(
-                    ui,
-                    migration_state,
-                    inventory,
-                    refresh,
-                    locked=selection_locked,
-                    lock_reason=None,
-                    migration_wide=True,
-                )
-
-            # The tables a Full Load will migrate (same logic the run uses), so
-            # the Full Load step can re-surface them for an explicit confirmation.
+            # The tables a Full Load will migrate (same logic the run uses) -- used
+            # both to re-surface the selection for confirmation below AND to scope the
+            # oversized-LOB panel to the SELECTED tables. Computed BEFORE the panel so
+            # the panel filters to the effective selection: picking one schema in
+            # Schema Conversion only pre-ticks the picker (``migration_state.selection``
+            # stays the empty "= all" default until touched), so passing the raw
+            # selection used to list LOB columns from every schema.
             migratable = migratable_table_names(
                 inventory, conv_state.generated_node_ids, _target_inventory()
             )
@@ -1032,6 +1027,17 @@ def build_data_migration_screen(
                     conv_state.ticked_node_ids,
                 ),
             )
+            if migration_type is not MigrationType.CDC_ONLY:
+                _render_cdc_lob_exclusion_panel(
+                    ui,
+                    migration_state,
+                    inventory,
+                    refresh,
+                    locked=selection_locked,
+                    lock_reason=None,
+                    migration_wide=True,
+                    selected_tables=selected_names,
+                )
             # A Full Load that already ran (live job, or the step reached DONE --
             # both survive a session restore) is proof its prerequisites passed at
             # start time, so a missing in-memory report (not persisted across a
@@ -3039,6 +3045,7 @@ def _connector_failure_detail(migration_state, view, name: str) -> str:
 _CDC_ONLY_CHECK_IDS = frozenset(
     {
         PrerequisiteCheckId.BINLOG_ROW_FORMAT,
+        PrerequisiteCheckId.BINLOG_RETENTION,
         PrerequisiteCheckId.GTID_MODE,
         PrerequisiteCheckId.MSK_AVAILABLE,
         PrerequisiteCheckId.MSK_CONNECT_AVAILABLE,
@@ -3432,6 +3439,7 @@ __all__ = [
     "format_watermark",
     "LobExclusionCandidate",
     "lob_exclusion_candidates",
+    "scope_lob_candidates",
     "format_column_exclude_list",
     "DlqHealth",
     "assess_dlq_health",

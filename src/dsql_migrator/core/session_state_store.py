@@ -115,6 +115,11 @@ class SessionSnapshot(BaseModel):
     # restore cleanly.
     cdc_deploy_job_id: Optional[str] = None
     cdc_action_kind: Optional[str] = None
+    # Start of the per-table CDC applied-ops (I/U/D) window -- the Full Load watermark
+    # -- so a reconnecting session keeps counting only post-Full-Load events instead of
+    # falling back to the metric's fixed trailing window (which includes prior CDC runs
+    # on the same stack). Optional/defaulted so older snapshots restore cleanly.
+    cdc_ops_window_start: Optional[datetime] = None
     # CDC infrastructure identity + inputs so a reconnecting session knows which
     # cdc-stack it owns and the VpcId/subnet inputs it deployed with. With these
     # restored, re-probing AWS (describe_stacks) recovers the live phase (Infra

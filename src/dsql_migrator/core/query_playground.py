@@ -422,6 +422,40 @@ def probe_statement(
             _safe_close(connection)
 
 
+def list_target_schemas(connection_factory: TargetConnectionFactory) -> list[str]:
+    """List the target's USER schemas that actually contain tables/views.
+
+    Powers the Query Converter's "Test against schema" picker: a migration maps each
+    MySQL database to a same-named PostgreSQL schema, so the schemas that HOLD objects
+    are exactly the candidates a converted (unqualified) query can be tested against.
+    System schemas are excluded (reusing the introspector's ``SYSTEM_SCHEMAS`` so the
+    exclusion lives in one place). Returns a sorted, de-duplicated list of names; a
+    read failure yields ``[]`` (best-effort -- the picker just falls back to the
+    inferred default) rather than raising. The connection is always closed.
+    """
+    from dsql_migrator.core.target_introspector import SYSTEM_SCHEMAS
+
+    connection: Optional[Any] = None
+    try:
+        connection = connection_factory()
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                "SELECT DISTINCT table_schema FROM information_schema.tables "
+                "WHERE table_schema <> ALL(%(excluded)s) ORDER BY table_schema",
+                {"excluded": list(SYSTEM_SCHEMAS)},
+            )
+            rows = cursor.fetchall()
+        finally:
+            _safe_close(cursor)
+        return [str(row[0]) for row in rows if row and row[0]]
+    except Exception:  # noqa: BLE001 - a schema-list read must never break the screen
+        return []
+    finally:
+        if connection is not None:
+            _safe_close(connection)
+
+
 __all__ = [
     "TargetConnectionFactory",
     "ProbeOutcome",
@@ -430,5 +464,6 @@ __all__ = [
     "ExecutionProbe",
     "parse_dpu_estimate",
     "probe_statement",
+    "list_target_schemas",
     "DEFAULT_USD_PER_DPU",
 ]

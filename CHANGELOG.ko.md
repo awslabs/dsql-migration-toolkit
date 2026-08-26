@@ -5,143 +5,230 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
-## v0.1.394
+## v0.1.396
+
+### 추가 (Added)
+
+- **PostgreSQL이 이제 마이그레이션 소스로 지원됩니다(RDS / Aurora PostgreSQL → Aurora
+  DSQL).** Connect 화면에 소스 엔진 선택기(MySQL / PostgreSQL)가 추가되었고, PostgreSQL
+  소스는 소스 다이얼렉트 어댑터(`core/source_dialect`)를 통해 전체 여정(Evaluation, Schema
+  Conversion, Full Load, Validation, CDC)을 실행합니다. PostgreSQL → DSQL은 near-identity
+  이므로(양쪽 모두 PostgreSQL-16 와이어) Schema Conversion은 타입을 그대로 전달하고 DSQL
+  미지원 타입(배열, geometric / network / xml / money / bit / range / tsvector / enum /
+  composite / domain)은 충실한 리모델 대상과 함께 플래그합니다. Full Load는 keyset로
+  스트리밍하며(샤딩 REPLACE 읽기는 공유 exported 스냅샷 사용), Validation은 PostgreSQL-16
+  체크섬 렌더러 하나를 양단에서 재사용합니다. 실제 Aurora PostgreSQL에서 end-to-end 검증
+  완료(Full Load + Validation, CHECKSUM 바이트 동일).
+- **PostgreSQL CDC(Debezium `pgoutput` → MSK → DSQL sink).** 논리 복제 슬롯 + publication
+  수명주기, WAL 보존 상태 표시, gapless Full-Load → CDC 핸드오프, 타입 바인드(uuid /
+  timetz-UTC / interval / timestamptz / jsonb / bytea / numeric) 및 TOAST partial-upsert.
+  전용 Debezium-PostgreSQL 커넥터 플러그인이 MySQL용과 함께 제공됩니다.
 
 ### 수정 (Fixed)
 
 - **최신 MySQL 소스에서 `BIGINT UNSIGNED`가 더 이상 CHECKSUM 검증에서 거짓 불일치를 내지
-  않습니다.** DSQL 대상 체크섬 렌더가 PostgreSQL의 무제약 `numeric` scale-6 규칙을 괄호 없는
-  모든 타입에 적용했는데, MySQL 8.0.19+ / 8.4 / Aurora MySQL 3은 `BIGINT UNSIGNED`를 괄호 없는
-  `bigint unsigned`로 보고합니다(`numeric(20,0)`, 즉 정수로 저장). 대상 측은 `.000000`을 얻는
-  반면 변경되지 않은 MySQL 소스 측은 scale 0으로 렌더되어, 데이터가 바이트 단위로 동일한데도
-  모든 `BIGINT UNSIGNED` 행이 어긋나 테이블이 불일치로 보고됐습니다. 이제 scale-6 규칙은 진짜
-  PostgreSQL 소스에만 적용되며, MySQL 소스는 양쪽 모두 선언된 스케일로 렌더됩니다. (MySQL
-  5.7의 `bigint(20) unsigned` 표기는 괄호가 있어 영향을 받지 않았습니다.)
-- **선언된 정밀도가 없는 PostgreSQL `numeric`/`decimal`(bare)에 대해 Schema Conversion 경고가
-  표시됩니다.** Aurora DSQL은 이런 컬럼을 기본값 `numeric(18,6)`으로 저장해 소수 6자리를 초과하는
-  값을 반올림하는데, 기존에는 무음이었고(선언된 정밀도가 DSQL의 38/37을 초과하는 경우만 플래그),
-  Validation이 해당 컬럼을 scale 6으로 비교하므로 손실이 드러나지 않을 수 있었습니다. 이제 변환은
-  컬럼명과 `numeric(18,6)` 상한을 명시한 MANUAL 경고를 발생시켜, 적재 전에 정밀도 결정을
-  볼 수 있게 합니다.
+  않습니다.** DSQL 대상 체크섬이 PostgreSQL의 무제약 `numeric` scale-6 규칙을 괄호 없는 모든
+  타입에 적용했는데, MySQL 8.0.19+ / 8.4 / Aurora MySQL 3은 `BIGINT UNSIGNED`를 괄호 없는
+  `bigint unsigned`(`numeric(20,0)`, 정수)로 보고합니다. 대상 측은 `.000000`을 얻는 반면
+  변경되지 않은 MySQL 소스 측은 scale 0으로 렌더되어, 데이터가 바이트 단위로 동일한데도 모든
+  해당 행이 어긋났습니다. 이제 scale-6 규칙은 진짜 PostgreSQL 소스에만 적용됩니다(MySQL 5.7의
+  `bigint(20) unsigned`는 영향 없음).
+- **선언된 정밀도가 없는 PostgreSQL `numeric`/`decimal`(bare)에 Schema Conversion 경고가
+  표시됩니다.** Aurora DSQL은 이런 컬럼을 기본값 `numeric(18,6)`으로 저장해 소수 6자리 초과
+  값을 반올림하는데, 기존에는 무음이었고(선언된 정밀도가 38/37을 초과하는 경우만 플래그)
+  Validation이 scale 6으로 비교하므로 손실이 드러나지 않을 수 있었습니다. 이제 변환이 컬럼명과
+  `numeric(18,6)` 상한을 명시합니다.
 
-## v0.1.393
+## v0.1.395
 
-### 추가 (Added)
+### 수정 (Fixed)
 
-- **PostgreSQL 소스: CDC를 "coming soon"으로 게이트합니다(Full Load + Validation은 완전 지원).**
-  현재 CDC는 Debezium **MySQL** → MSK → DSQL 싱크 경로만 지원하며, PostgreSQL 논리 복제 경로는
-  계획되어 있으나 아직 구현되지 않았습니다. 이제 Data Migration **유형 선택기**에서 PostgreSQL
-  소스일 때 CDC 타일 2개("CDC only" / "Full load + CDC")를 비활성화하고 "Coming soon for
-  PostgreSQL — use Full load only" 안내를 표시하여, 동작하지 않는 CDC 선택(= PostgreSQL 소스에
-  MySQL Debezium 커넥터를 배포하는 상황)이 되지 않도록 막습니다. PostgreSQL CDC가 출시되면 단일
-  활성화 지점(`source_supports_cdc`)에서 켜집니다.
-- **사전 점검(prerequisite) 게이트가 소스 엔진을 인식합니다.** CDC 전용 사전 점검은 MySQL
-  binlog/GTID 기반인데, 이제 PostgreSQL 소스는 그 점검들 대신 차단하지 않는 정직한 **INFO**("CDC is
-  not yet available for PostgreSQL sources")를 보고하며(해당 점검들은 N/A로 표시), 실패로 오판되게
-  만들던 MySQL 전용 변수 읽기를 실행하지 않고 MySQL 복제 권한도 요구하지 않습니다. MySQL 소스는
-  변화 없음.
+- **넓은 테이블(>~100 컬럼) 체크섬 검증 지원.** per-row 체크섬 토큰이
+  `MD5(CONCAT_WS('|', <모든 렌더 컬럼>))`이었는데, Aurora DSQL / PostgreSQL은 함수 호출 인자를
+  **100개**로 제한(`FUNC_MAX_ARGS`)하므로 체크섬 대상 컬럼이 100개 이상인 테이블은 **타깃**에서
+  *"cannot pass more than 100 arguments to a function"* 로 CHECKSUM 검증이 실패했습니다(테이블은
+  최대 255컬럼까지 지원되는데도). 이제 토큰이 **MD5를 중첩**합니다: ≤ 96개 컬럼 그룹을 각각 해시한 뒤
+  그 그룹 해시들을 다시 해시하며, **양쪽 엔진에 동일하게** 적용돼 같은 데이터는 여전히 같게 해시됩니다.
+  한도 이내 테이블은 기존 플랫 SQL을 그대로 내보냅니다(좁은 테이블 재-체크섬 없음). 실제 **Aurora DSQL**
+  클러스터에서 검증: 플랫 200-인자 `concat_ws`는 에러, 중첩 형태는 성공.
 
-## v0.1.392
+## v0.1.394
 
 ### 변경 (Changed)
 
-- **PostgreSQL 소스: 이제 Evaluation에서도 DSQL 미지원 컬럼 타입을 flag합니다**(Schema
-  Conversion뿐 아니라). Aurora DSQL이 컬럼 타입으로 지원하지 않는 PostgreSQL 타입 — 배열,
-  geometric, network(inet/cidr/macaddr), xml, money, bit, range, tsvector, enum/composite,
-  pgvector — 이 있는 컬럼은 이제 Evaluation 리포트에서 **Unsupported**로 표면화되며, Schema
-  Conversion 경고와 동일한 권장 리모델 대상(배열 → jsonb, inet/xml → text, money → numeric …)을
-  안내합니다. 이전에는 그런 테이블이 Evaluation에서 "Automatic"으로 보이고 문제는 Schema
-  Conversion에서야 나타났습니다. 두 단계가 하나의 소스(`unsupported_dsql_reason`)를 공유해 서로
-  어긋나지 않습니다. MySQL 소스는 동작 변화 없음.
+- **앱 이미지를 `0.1.393`으로 재게시하고 기본값을 그것으로 repoint했습니다.** `0.1.393`
+  이미지(MySQL 8.4 + 5.7 소스 호환성 수정)를 ECR Public(`z0q0i9j0`)과 두 프라이빗
+  ECR(us-east-1, ap-northeast-2)에 푸시하고, `cloudformation.yaml`의 `ContainerImageUri`
+  기본값을 `0.1.390 → 0.1.393`으로 repoint해 fresh `git clone` 배포가 8.4/5.7 대응 빌드를
+  받도록 했습니다.
+
+## v0.1.393
+
+### 수정 (Fixed)
+
+- **MySQL 5.7 소스: 시간 함수 기본값이 문자열 리터럴로 잘못 렌더링되던 문제.**
+  converter는 *표현식* 기본값과 *리터럴* 기본값을 MySQL의 `DEFAULT_GENERATED` `EXTRA`
+  플래그로 구분하는데, 이 플래그는 **MySQL 8.0.13+에만** 존재합니다. **5.7** 소스에는 플래그가
+  없어 `CURRENT_TIMESTAMP` / `CURRENT_TIMESTAMP(6)` 같은 시간 함수 기본값이 리터럴로 처리돼
+  따옴표가 붙었고(`DEFAULT 'CURRENT_TIMESTAMP(6)'`), 타깃 `CREATE`가 *"invalid input syntax
+  for type timestamp"* 로 실패했습니다. 이제 introspection이 플래그가 없을 때도
+  `datetime`/`timestamp` 컬럼의 시간 함수 기본값(`CURRENT_TIMESTAMP[(n)]`, `NOW()`,
+  `LOCALTIME[STAMP]`, `UTC_TIMESTAMP`)을 표현식 기본값으로 인식합니다 — **시간 타입 컬럼에
+  한정**해 실제 문자열 리터럴은 절대 오분류되지 않으며, 8.0+는 기존 플래그를 그대로 사용합니다.
+  실제 **MySQL 5.7.44** 소스에서 E2E 검증(`DATETIME(6)`/`TIMESTAMP` 컬럼의 Full Load가 정상
+  생성·적재; 워터마크는 `0.1.392`에서 추가한 `SHOW MASTER STATUS` 폴백으로 캡처).
+
+## v0.1.392
+
+### 수정 (Fixed)
+
+- **MySQL 8.4 소스: binlog 워터마크 캡처(gapless Full Load → CDC 핸드오프).**
+  `SHOW MASTER STATUS`가 **MySQL 8.4에서 제거**되어, Aurora/MySQL 8.4 소스에서는 워터마크가
+  binlog `file:position`을 빈 값으로 캡처했습니다 — gapless Full Load → CDC 핸드오프가 조용히
+  깨져(CDC가 워터마크에서 재개하지 못하고 현재 시점부터 시작해 데이터 갭 위험) 있었습니다. 이제
+  워터마크 캡처, CDC **"Fetch current position"** 동작, 검증기의 binlog drift 읽기가 모두
+  **`SHOW BINARY LOG STATUS`**(MySQL 8.2+, 8.4 포함)를 사용하고, 신형 구문을 모르는 ≤ 8.0.x
+  서버에서는 **`SHOW MASTER STATUS`로 폴백**합니다 — 버전 탐지 없이 8.0.x~8.4+를 한 경로로
+  처리. 실제 **Aurora MySQL 8.4.7** 클러스터에서 E2E 검증(Full Load + 워터마크가 실제 좌표 반환).
 
 ## v0.1.391
 
 ### 변경 (Changed)
 
-- **PostgreSQL 소스: "미지원 타입" 스키마 변환 경고가 이제 타입별로 무엇으로 리모델할지
-  구체적으로 알려줍니다** (기존의 일반적인 "지원 타입으로 리모델하라" 대신). DSQL가 지원하지
-  않는 PostgreSQL 컬럼 타입에 대해 무엇으로 저장할지 안내합니다: 배열 → **jsonb**(또는 자식
-  테이블); inet/cidr/macaddr/xml/tsvector/bit → **text**; money → **numeric**; range →
-  **text**(또는 하한/상한 컬럼); pgvector → jsonb/text; 사용자 정의 enum → text; composite →
-  개별 컬럼 또는 jsonb. 타입은 여전히 **자동 변환하지 않으며**(앱이 새 타입에 맞춰 바뀌어야
-  하므로) 사용자가 의도적으로 리모델하도록 표면화합니다 — 조용한 치환 없음, 그리고 (진짜
-  바이너리 타입에만 맞는) 무분별한 `bytea` 폴백도 의도적으로 쓰지 않습니다.
+- **`0.1.390` 앱 이미지를 재게시하고 기본값을 그것으로 repoint했습니다.** `0.1.390` 이미지(CDC
+  applied-ops 윈도잉 수정 + `0.1.388/389` AI 신뢰성 수정)를 ECR Public(`z0q0i9j0`)과 private ECR
+  2곳(us-east-1, ap-northeast-2)에 푸시하고, `cloudformation.yaml`의 `ContainerImageUri` 기본값을
+  `0.1.387 → 0.1.390`으로 올려 fresh git-clone 배포가 이를 pull하도록 했습니다.
 
 ## v0.1.390
 
-### 추가 (Added)
+### 수정 (Fixed)
 
-- **PostgreSQL 소스: Full Load 워터마크가 이제 WAL LSN을 캡처합니다** — PostgreSQL의 재개
-  좌표(MySQL binlog 위치의 대응물)를 Full Load 일관성 지점에서 기록합니다. 이는 PostgreSQL
-  CDC 캐치업이 스트리밍을 재개하는 **gapless Full Load → CDC 인계 지점**입니다. Full Load가
-  이 LSN 이후 시점의 스냅샷을 읽으므로 이 지점부터 재생하면 상위집합이 되어 멱등 적재가
-  누락 없이 수렴합니다. 리드 레플리카 소스에서는 스탠바이 replay LSN을 사용하고, LSN을 읽을
-  수 없으면(예: 권한 부족) 워터마크는 여전히 유효합니다(LSN은 best-effort). 활동 로그의
-  워터마크 항목에 LSN이 표시됩니다. MySQL 소스는 변화 없음(계속 binlog/GTID 기록). 참고:
-  PostgreSQL 소스의 CDC 자체는 아직 예정 항목이며, 이번 변경은 인계의 **Full Load 쪽을
-  준비**한 것입니다. 스트리밍 쪽(WAL 보존용 replication slot, CDC 커넥터)은 PostgreSQL CDC와
-  함께 들어옵니다.
+- **CDC per-table Inserts/Updates/Deletes가 이제 Full Load 워터마크 이후 적용된 이벤트만 셉니다(이전
+  CDC run 제외).** "Changes since Full Load" 컬럼이 싱크의 `InsertsApplied`/`UpdatesApplied`/
+  `DeletesApplied` CloudWatch 메트릭을 **고정 14일 트레일링 창**으로 합산해서, 워크로드 없이 Full
+  Load 직후 CDC를 해도 non-zero가 떴습니다 — 같은 스택에서 돌린 **이전 데모/테스트 CDC run**이 창
+  안에 남아 있었기 때문입니다. 이제 CDC 시작 시 applied-ops 창을 **Full Load 워터마크**에 고정
+  (`cdc_ops_window_start`, 재접속에도 유지; CDC-only/수동은 CDC 시작 시각으로 폴백)하고 폴이 그
+  시점부터 메트릭을 읽어, 깨끗한 gapless run은 실제 변경 트래픽이 흐르기 전까지 0으로 정확히 표시됩니다.
 
 ## v0.1.389
 
 ### 수정 (Fixed)
 
-- **PostgreSQL 소스: Full Load 동작 다듬기**(MySQL 소스는 동작 변화 없음).
-  - **끊기거나 페일오버된 소스 연결을 건강한 읽기를 방해하지 않으면서 신속히 감지**합니다.
-    MySQL은 소켓별 idle 읽기 타임아웃을 쓰는데, PostgreSQL 소스는 이제 TCP keepalive +
-    `tcp_user_timeout`을 설정해 죽은/멈춘/페일오버된 연결이 읽기 타임아웃 예산 내에
-    드러나(자동 재시도) 반면, 정상적으로 느리지만 계속 스트리밍 중인 페이지가
-    `statement_timeout` 총량 캡에 잘릴 위험을 없앴습니다(statement_timeout은 멈춘 쿼리용
-    백스톱으로만 유지).
-  - 활동 로그의 **워터마크** 항목이 PostgreSQL 소스(바이너리 로깅 없음)에 대해 "binary
-    logging off"라고 표시하던 것을, 소스 엔진 특성상 행수 기준 baseline만 있는 것이
-    설계된 동작임을 표기하도록 고쳤습니다.
-  - 멀티프로세스 Full Load **샤드 플래너**가 PK 샤딩 가능성을 MySQL 정수타입 집합 기본값이
-    아니라 소스 엔진 다이얼렉트로 판정합니다(권위 있는 샤드 범위 플래너와의 내부 일관성;
-    사용자 눈에 보이는 변화 없음).
+- **추론이 많은 턴(헤더 "What's next?" 브리핑, Query Converter "Tune" 등)에서 AI DBA가 "AI reply
+  unavailable / 파싱 불가"로 실패하던 문제를 고쳤습니다.** Claude 5 모델은 기본으로 extended
+  thinking을 하고 thinking 토큰이 `max_tokens`에 포함되므로, 다중 툴/무거운 턴에서 예산을 전부
+  thinking에 써버려 답변 텍스트가 안 나올 수 있었습니다. 예산 상향(v0.1.382)만으론 빈도만 줄었습니다.
+  이 답변들은 그라운디드(툴 결과+시스템 컨텍스트가 사실을 제공)하고 간결하게 유지되므로, 모든
+  AI-DBA 생성에서 extended thinking을 **비활성화**(chat/tool-chat/guidance 바디에 `thinking:
+  {type: disabled}`)했습니다. 전체 예산이 답변에 쓰여 빈-thinking 실패가 발생할 수 없습니다.
 
 ## v0.1.388
 
-### 수정 (Fixed)
+### 변경 (Changed)
 
-- **PostgreSQL 소스: 소스 읽기 관련 동작 3가지가 더 이상 MySQL을 가정하지 않습니다**(MySQL
-  소스는 동작 변화 없음).
-  - Full Load의 선택적 **읽기 스로틀**(소스 동시 쿼리 상한)이 소스 스냅샷 커넥션에서 MySQL
-    전용 `SHOW GLOBAL STATUS`를 조회했습니다. PostgreSQL 소스에서는 잘못된 구문이라 스냅샷
-    트랜잭션을 abort시키고, 스로틀을 켠 순간 모든 테이블 읽기가 실패했습니다. 이제 엔진별
-    실제 지표 — MySQL `Threads_running`, PostgreSQL은 `pg_stat_activity`의 active 백엔드 수
-    — 를 읽으므로 PostgreSQL에서도 스로틀이 동작하고 스냅샷에 엉뚱한 구문을 실행하지 않습니다.
-  - 로드 중 끊어진 소스 커넥션(예: Aurora 페일오버)을 복구하는 **자동 재시도**가 MySQL 에러
-    코드/메시지만 인식해서, PostgreSQL 연결 끊김은 재시도되지 않고 수동 재실행 대상으로
-    남았습니다. 이제 PostgreSQL 연결 SQLSTATE(class `08`, 페일오버/셧다운 `57P0x`, 연결 초과
-    `53300`, 그리고 페이지 읽기 타임아웃 `57014` — MySQL 소켓 타임아웃에 해당)도 인식하여
-    MySQL처럼 자동 복구합니다.
-  - 소스 커넥션이 끊겼을 때 표시되는 운영자 **힌트**가 PostgreSQL 소스에서도 "the source
-    MySQL connection dropped"라고 표시되던 것을, 실제 소스 엔진에 맞게 표기하도록 고쳤습니다.
+- **`0.1.387` 앱 이미지를 재게시하고 기본값을 그것으로 repoint했습니다.** `0.1.387` 이미지(LOB 패널
+  스코핑 수정 + `0.1.385/386` prereq 작업)를 ECR Public(`z0q0i9j0`)과 private ECR 2곳(us-east-1,
+  ap-northeast-2)에 푸시하고, `cloudformation.yaml`의 `ContainerImageUri` 기본값을 `0.1.384 → 0.1.387`로
+  올려 fresh git-clone 배포가 이를 pull하도록 했습니다. (이미 배포된 스택을 새 이미지로 갱신하는 것은
+  별도의 명시 승인 단계입니다.)
 
 ## v0.1.387
 
 ### 수정 (Fixed)
 
-- **PostgreSQL 소스: Full Load "필수 권한" 점검이 더 이상 잘못 실패하지 않습니다.** 소스
-  사용자가 데이터를 읽을 수 있는지 확인하는 사전 점검이 MySQL의 `SHOW GRANTS`로 권한을
-  조회했는데, 이 구문은 PostgreSQL에 존재하지 않습니다. 그래서 PostgreSQL 소스에서는 권한이
-  하나도 보이지 않아 "SELECT 권한 없음"이라는 잘못된 실패를 보고했고, 권한이 충분한
-  사용자에게도 **Full Load가 차단**되었습니다. 이제 권한 조회를 엔진별로 분리했습니다.
-  MySQL은 그대로 `SHOW GRANTS`를 사용하고, PostgreSQL은 슈퍼유저면 전체 권한으로, 그렇지
-  않으면 현재 롤의 테이블 권한을 읽어 판단합니다. MySQL 소스는 동작이 바뀌지 않습니다.
+- **"Oversized LOB columns" 패널이 이제 선택한 스키마/테이블의 컬럼만 나열합니다(모든 스키마 아님).**
+  Schema Conversion에서 스키마를 하나 고르면 Data Migration 피커가 pre-tick만 될 뿐,
+  `migration_state.selection`은 피커를 직접 건드리기 전까지 빈 "= 전체" 기본값이라, 그 원시 선택으로
+  필터링하던 패널이 모든 스키마의 LOB 컬럼을 나열했습니다. 이제 패널은 (로드가 쓰는 것과 동일한)
+  **실효 선택**으로 필터링합니다 — 신규 순수 헬퍼 `scope_lob_candidates`. 실효 선택이 주어지면 엄격히
+  필터(비어 있으면 마이그레이션 대상 없음 = 후보 없음)하고, 이를 해석할 수 없는 호출부(CDC 전용
+  패널)를 위해 레거시 원시-선택 폴백을 유지합니다.
 
 ## v0.1.386
 
 ### 추가 (Added)
 
-- **이제 MySQL뿐 아니라 PostgreSQL에서도 마이그레이션할 수 있습니다.** 연결(Connect) 화면 맨 위에
-  **소스 엔진** 선택이 추가되어 — **MySQL** 또는 **PostgreSQL** 중 선택 — RDS / Aurora
-  **PostgreSQL** 데이터베이스도 (기존 RDS / Aurora MySQL에 더해) Aurora DSQL로 마이그레이션할 수
-  있습니다. 소스가 Aurora인지 RDS인지는 여전히 엔드포인트에서 자동 감지되며, 포트 기본값도 엔진에
-  맞춰집니다(MySQL 3306, PostgreSQL 5432). 오버뷰 다이어그램도 소스를 그에 맞게 표시합니다(예:
-  "Aurora PostgreSQL"). PostgreSQL 지원 범위는 **평가·스키마 변환·풀 로드·검증**이며, PostgreSQL
-  소스의 **변경 데이터 캡처(CDC)는 아직 제공되지 않습니다**(현재 CDC는 MySQL 전용).
+- **CDC 전제조건에 소스 binlog 보존기간 체크 추가** — 신규 `BINLOG_RETENTION` 체크(CDC 모드 전용,
+  Full Load에선 SKIP). CDC는 Full Load 스냅샷 시점에 잡은 binlog file:position / GTID 워터마크에서
+  재개하므로, CDC 시작 전에 소스 binlog가 파기되면 핸드오프에 조용한 데이터 갭이 생깁니다. 이 체크는
+  RDS `binlog retention hours`(`mysql.rds_configuration`에서 읽음; 미설정 = 공격적 파기)를 읽고,
+  self-managed 폴백(`binlog_expire_logs_seconds` / `expire_logs_days`, `0` = 자동 파기 비활성 = 안전)도
+  지원합니다. 24h 미만이면 **WARN**(비차단, Property 14) + 조치(`CALL mysql.rds_set_configuration('binlog
+  retention hours', 168)`), 판별 불가면 INFO. RDS CDC의 전형적 함정을 메웁니다. Full Load의 소스
+  체크(연결 + SELECT 권한 + 테이블별 PK)는 변경 없음 — 보충 불필요.
+
+## v0.1.385
+
+### 변경 (Changed)
+
+- **앱 이미지를 `0.1.384`로 재게시하고 기본값을 그것으로 repoint했습니다.** `0.1.384` 이미지(AI DBA
+  진단 툴 + 토큰 예산 수정 + Query Converter 스키마 셀렉터)를 ECR Public(`z0q0i9j0`)과 private ECR
+  2곳(us-east-1, ap-northeast-2)에 푸시하고, `cloudformation.yaml`의 `ContainerImageUri` 기본값을
+  `0.1.382 → 0.1.384`로 올렸습니다. 그래서 fresh git-clone 배포도 낡은 이미지 대신 수정본을
+  pull합니다. (이미 배포된 스택을 새 이미지로 갱신하는 것은 별도의 명시 승인 단계입니다.)
+
+## v0.1.384
+
+### 추가 (Added)
+
+- **AI DBA가 이제 Full Load / CDC 실패를 진단합니다(상태 보고를 넘어서).** read-only 툴 3개 추가
+  (`ui/ai_tools.py`): `get_cdc_pipeline_diagnostics`는 "CDC가 왜 안 흐르나 / 배포가 왜 실패했나"를
+  캐시된 상태로 답합니다(CFN 스택 phase, 커넥터별 RUNNING/FAILED, 확정된 sink stall, 실패한 배포
+  스테이지 + 배포 로그의 이미 진단된 에러 tail, Full Load→CDC 워터마크 핸드오프).
+  `get_prerequisite_verdicts`는 Full Load/CDC 전제조건(binlog·GTID·MSK·IAM·PK 등)을 PASS/FAIL/WARN +
+  remediation + `can_proceed`로 반환합니다. `list_cdc_dlq_samples`는 (테이블, SQLSTATE)별 실제 DLQ
+  에러 메시지 샘플을 반환합니다. `get_full_load_status`/`list_failed_full_load_tables`에도 테이블별
+  `rows_skipped`/`rows_quarantined`/`attempts` 상세가 추가됐습니다. 모두 캐시/로컬(질문마다 추가
+  AWS 호출 없음)이고 자격증명·행 데이터 없음 — 실패 행의 PK 값은 의도적으로 제외(Property 7).
+
+## v0.1.383
+
+### 변경 (Changed)
+
+- **AI DBA의 read-only 툴들을 `ui/app.py`에서 별도 모듈 `ui/ai_tools.py`로 분리했습니다.**
+  툴 스키마, 시스템 프롬프트 힌트, ~400줄짜리 `_ai_tool_execute` 본문이 한 모듈에 모였고,
+  `build_ai_tool_executor(...)` 팩토리가 페이지의 스토어 + Full Load 속도/ETA 헬퍼를 받아
+  executor를 반환합니다(팩토리라 app 전역을 import할 필요가 없어 순환 import 회피). 동작 보존
+  이동(툴 로직 불변)이며 `build_page`는 배선만 합니다. 클로저였을 땐 불가능했던 executor 단위
+  테스트가 이제 가능합니다(신규 `tests/test_ai_tools.py`). Full Load/CDC 실패 진단 툴을 깔끔히
+  추가할 토대입니다.
+
+## v0.1.382
+
+### 수정 (Fixed)
+
+- **추론이 많은 턴(예: Query Converter의 "Tune with AI DBA")에서 AI DBA 응답이 "AI reply
+  unavailable / 파싱 불가"로 실패하던 문제를 고쳤습니다.** 현재 모델(Claude 5 계열)은 extended
+  thinking을 쓰고 thinking 토큰이 `max_tokens`에 포함되는데, 채팅/가이던스 한도가 1536이라
+  한 턴이 예산을 전부 thinking에 써버리고 답변 텍스트 없이 멈춰(`stop_reason=max_tokens`) 파싱
+  불가로 표시됐습니다. 이제 생성 예산을 넉넉히(8192) 둬 thinking + 전체 답변이 모두 들어갑니다.
+  답변 간결함은 여전히 `_RESPONSE_STYLE`이 통제하므로 일반 답변이 길어지지 않습니다.
+
+### 변경 (Changed)
+
+- **토큰 예산을 화면/기능별이 아니라 호출 형태(call shape)별로 둡니다.** AI DBA가 하나의 상시
+  패널이 된 만큼, 모든 대화 턴(object guidance, 그라운디드 챗, 툴 호출 챗, CDC 에러 챗)이 단일
+  `_CHAT_MAX_TOKENS`를 공유합니다 — 채팅 예산을 한 곳에서 조정하고, 화면마다 동기화할 한도가
+  없습니다. 나머지 예산은 형태가 실제로 다른 것뿐입니다: 일회성 assessment 리포트와 권한 프로브
+  (`max_tokens=1`, 출력 무시). 내부 변경입니다.
+
+## v0.1.381
+
+### 변경 (Changed)
+
+- **Query Converter의 "Test on target"이 정규화되지 않은 테이블을 올바른 스키마에서 해석하고,
+  스키마를 직접 고를 수 있게 되었습니다.** `SELECT ... FROM "orders"`처럼 변환된 쿼리가 기본
+  `public` search_path에서 테스트돼, `<database>` 이름의 스키마로 마이그레이션된 테이블이
+  `relation "orders" does not exist (SQLSTATE 42P01)`로 실패했습니다. 이제 테스트가 스키마를
+  견고하게 해석합니다 — 연결된 소스 데이터베이스(MySQL DB는 같은 이름의 PG 스키마로 매핑)가
+  타깃에 있으면 그것을, 없고 타깃 유저 스키마가 하나뿐이면 그것을 사용합니다. 그리고 선택적
+  **"Test against schema"** 셀렉터(타깃 유저 스키마 목록을 백그라운드로 채우고, 추론된 스키마를
+  기본값으로)를 추가해, 테이블이 다른 스키마로 마이그레이션된 경우 대상을 바꿀 수 있습니다.
+  `42P01` 거부 시에는 raw 에러 뒤에 어떤 스키마에서 테스트했는지와 해결 방법을 담은 실행 가능한
+  힌트를 함께 보여줍니다. 스키마를 처음부터 강제하지 않고(Convert에는 필요 없음) 추론하되
+  override로만 노출합니다.
 
 ## v0.1.380
 

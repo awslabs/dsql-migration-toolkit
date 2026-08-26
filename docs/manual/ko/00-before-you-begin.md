@@ -20,7 +20,8 @@ _언어: [English](../en/00-before-you-begin.md) | **한국어** | [日本語](.
       [§6.2](06-limitations.md#62-마이그레이션-프로세스-한계)
 
 - [ ] **소스는 항상 읽기만 합니다.** 도구는 RDS / Aurora MySQL 소스에 절대 쓰지 않습니다 — 읽기 가능한
-      사용자면 충분합니다. → [§1.1](01-setup.md#11-사전-요구사항)
+      사용자면 충분합니다. 지원 소스: **RDS for MySQL**과 **Aurora MySQL**의 **5.7 / 8.0 / 8.4** 버전.
+      → [§1.1](01-setup.md#11-사전-요구사항)
 
 - [ ] **DSQL은 PostgreSQL 호환·IAM 인증·분산형입니다.** PostgreSQL 와이어 프로토콜을 쓰고, **단기 IAM
       토큰**(관리할 비밀번호 없음)을 사용하며, **낙관적 동시성**(락 없음)을 씁니다. 도구에 DSQL
@@ -48,11 +49,12 @@ _언어: [English](../en/00-before-you-begin.md) | **한국어** | [日本語](.
 
 - [ ] **CDC는 소스 binlog를 먼저 설정해야 합니다(관리형 MySQL 방식).** CDC를 쓴다면 소스에
       **바이너리 로깅이 ROW 포맷·full row image로 켜져 있어야** 하고(`binlog_format=ROW`,
-      `binlog_row_image=FULL`), **복제 권한**을 가진 사용자가 있어야 하며, CDC가 따라잡을 때까지 로그가
-      남도록 **binlog 보존을 늘려야** 합니다. RDS/Aurora에서는 **파라미터 그룹**과
-      `mysql.rds_set_configuration` **저장 프로시저**로 설정합니다 — community MySQL처럼
-      `my.cnf`/`SET GLOBAL`이 아닙니다. Full Load만 한다면 이 중 아무것도 필요 없습니다.
-      → [§1.1](01-setup.md#11-사전-요구사항)
+      `binlog_row_image=FULL`)와 **복제 권한**을 가진 사용자가 있어야 합니다 — 사전점검 게이트는 이
+      둘이 충족될 때까지 CDC를 **차단**합니다. 또한 Full Load 워터마크 시점의 binlog이 CDC 시작 시까지
+      남아 있도록 **binlog 보존을 늘리세요**; 이 항목은 게이트가 **경고만** 하지만, 너무 짧은 보존은 실제
+      silent-gap 위험입니다. RDS/Aurora에서는 **파라미터 그룹**과 `mysql.rds_set_configuration`
+      **저장 프로시저**로 설정합니다 — community MySQL처럼 `my.cnf`/`SET GLOBAL`이 아닙니다. Full Load만
+      한다면 이 중 아무것도 필요 없습니다. → [§1.1](01-setup.md#11-사전-요구사항)
 
 - [ ] **CDC는 스키마가 아니라 데이터를 복제합니다.** CDC 중 소스 **DDL** 변경은 DSQL로 **전파되지
       않습니다** — Schema Conversion으로 직접 다시 적용합니다.
@@ -64,12 +66,17 @@ _언어: [English](../en/00-before-you-begin.md) | **한국어** | [日本語](.
 - [ ] **AI 어시스트는 선택이며 Amazon Bedrock으로만 가능합니다.** AI는 **기본 꺼짐**이고, 켜면 AWS
       자격증명(`bedrock:InvokeModel` 권한)으로 **오직 Amazon Bedrock을 통해서만** 동작합니다.
       **직접 API 키 입력은 지원하지 않습니다**(Anthropic/OpenAI 키 입력란 없음) — AI를 쓰는 유일한
-      경로는 Bedrock입니다. 모든 제안은 **검토 전용**이며 AI는 데이터 경로에 절대 없습니다.
-      → [2장](02-evaluation-and-schema-conversion.md)
+      경로는 Bedrock입니다. 모든 제안은 **검토 전용**이며 AI는 데이터 경로에 절대 없습니다. 같은
+      어시스턴트가 **모든 단계**에서 **AI DBA** 패널로 제공됩니다 — Full Load / CDC 실패 진단, DLQ
+      트리아지, 사전점검 확인을 하는 read-only 도우미입니다.
+      → [2장](02-evaluation-and-schema-conversion.md), [9장](09-query-validation.md)
 
-- [ ] **(AWS 배포 시) 단일 태스크 컨트롤 플레인이며 인증은 선택입니다.** ECS Fargate 태스크가 하나 뜨고,
-      진행 중인 작업 상태는 임시 스토리지에 저장되며, 앱은 ALB의 **선택적 Cognito** 게이트에 의존합니다
-      (인터넷에 노출되는 배포에서는 반드시 켜세요). → [§6.3](06-limitations.md#63-배포-한계-aws-호스팅-형태)
+- [ ] **(AWS 배포 시) 단일 태스크 컨트롤 플레인이며 인증은 선택입니다.** 일반적인 형태는 ALB 뒤의
+      **ECS Fargate** 태스크 하나이며 ALB의 **선택적 Cognito** 게이트를 씁니다(인터넷에 노출되는 배포에선
+      반드시 켜세요); AWS 호스팅 배포에서는 작업/세션 상태가 관리형 S3 버킷에 durable하게 보관돼 태스크
+      교체 후 재개됩니다. **단일 EC2 호스트(소스에서)** 모드도 있습니다 — 상태는 보존 EBS 볼륨, 접속은
+      SSM 포트포워딩, ALB/Cognito 없음. → [§1.4](01-setup.md#14-단일-ec2-호스트에서-실행-소스에서),
+      [§6.3](06-limitations.md#63-배포-한계-aws-호스팅-형태)
 
 ---
 

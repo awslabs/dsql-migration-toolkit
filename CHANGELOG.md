@@ -5,154 +5,259 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
-## v0.1.394
+## v0.1.396
+
+### Added
+
+- **PostgreSQL is now a supported migration source (RDS / Aurora PostgreSQL → Aurora
+  DSQL).** The Connect screen has a source-engine selector (MySQL / PostgreSQL), and a
+  PostgreSQL source runs the full journey — Evaluation, Schema Conversion, Full Load,
+  Validation, and CDC — through a source-dialect adapter (`core/source_dialect`).
+  PostgreSQL → DSQL is near-identity (both PostgreSQL-16 wire): Schema Conversion passes
+  types through and flags the DSQL-unsupported ones (arrays, geometric / network / xml /
+  money / bit / range / tsvector / enum / composite / domains) with a faithful remodel
+  target; Full Load streams by keyset (sharded REPLACE reads use a shared exported
+  snapshot); Validation reuses one PostgreSQL-16 checksum renderer on both ends. Verified
+  live end-to-end on real Aurora PostgreSQL (Full Load + Validation, CHECKSUM byte-identical).
+- **PostgreSQL CDC (Debezium `pgoutput` → MSK → DSQL sink).** Logical-replication slot +
+  publication lifecycle, WAL-retention health surfacing, gapless Full-Load → CDC handoff,
+  and typed sink binds (uuid / timetz-UTC / interval / timestamptz / jsonb / bytea /
+  numeric) with TOAST partial-upsert. A dedicated Debezium-PostgreSQL connector plugin
+  ships alongside the MySQL one.
 
 ### Fixed
 
 - **CHECKSUM validation no longer false-mismatches `BIGINT UNSIGNED` on modern MySQL
-  sources.** The DSQL-target checksum render applied PostgreSQL's unconstrained-`numeric`
-  scale-6 rule to any parenthesis-less type, but MySQL 8.0.19+ / 8.4 / Aurora MySQL 3
-  report `BIGINT UNSIGNED` as the paren-less `bigint unsigned` (stored as `numeric(20,0)`,
-  an integer). The target side gained `.000000` while the unchanged MySQL source side
-  rendered scale 0, so every `BIGINT UNSIGNED` row diverged and the table was reported
-  mismatched despite byte-identical data. The scale-6 rule is now gated to a genuine
-  PostgreSQL source, so a MySQL source renders both sides at the declared scale. (MySQL
-  5.7's `bigint(20) unsigned` spelling carried parens and was unaffected.)
+  sources.** The DSQL-target checksum applied PostgreSQL's unconstrained-`numeric` scale-6
+  rule to any parenthesis-less type, but MySQL 8.0.19+ / 8.4 / Aurora MySQL 3 report
+  `BIGINT UNSIGNED` as the paren-less `bigint unsigned` (stored as `numeric(20,0)`, an
+  integer). The target side gained `.000000` while the unchanged MySQL source side rendered
+  scale 0, so every such row diverged despite byte-identical data. The scale-6 rule is now
+  gated to a genuine PostgreSQL source. (MySQL 5.7's `bigint(20) unsigned` was unaffected.)
 - **A bare PostgreSQL `numeric`/`decimal` (no declared precision) now raises a Schema
-  Conversion warning.** Aurora DSQL stores such a column at its default `numeric(18,6)`,
-  rounding values beyond 6 fractional digits — previously silent (only a *declared*
-  precision above DSQL's 38/37 was flagged), and Validation compares the column at scale
-  6, so the loss could pass unnoticed. Conversion now emits a MANUAL warning naming the
-  column and the `numeric(18,6)` cap so the precision decision is visible before load.
+  Conversion warning.** Aurora DSQL stores such a column at its default `numeric(18,6)` and
+  rounds values beyond 6 fractional digits; this was previously silent (only a *declared*
+  precision above 38/37 was flagged) and Validation compares at scale 6, so the loss could
+  pass unnoticed. Conversion now names the column and the `numeric(18,6)` cap.
 
-## v0.1.393
+## v0.1.395
 
-### Added
+### Fixed
 
-- **PostgreSQL source: CDC is gated as "coming soon" (Full Load + Validation stay fully
-  supported).** CDC today is Debezium **MySQL** → MSK → DSQL sink; the PostgreSQL logical
-  replication path is planned but not yet implemented. The Data Migration **type selector**
-  now disables the two CDC tiles ("CDC only" / "Full load + CDC") for a PostgreSQL source,
-  with a "Coming soon for PostgreSQL — use Full load only" note, so the tiles cannot become
-  a non-functional CDC selection (which would deploy a MySQL Debezium connector against a
-  PostgreSQL source). A single enablement point (`source_supports_cdc`) flips these on when
-  PostgreSQL CDC ships.
-- **Prerequisite gate is source-engine-aware.** The CDC-only prerequisite checks are MySQL
-  binlog/GTID; a PostgreSQL source now reports an honest, non-blocking **INFO** ("CDC is not
-  yet available for PostgreSQL sources") in place of those checks (reported as N/A) instead
-  of running MySQL-only variable reads that would falsely FAIL, and it is never asked for
-  MySQL's replication privileges. No change for MySQL sources.
+- **Checksum validation now supports wide tables (> ~100 columns).** The per-row
+  checksum token was `MD5(CONCAT_WS('|', <every rendered column>))`; on Aurora DSQL /
+  PostgreSQL a function call is capped at **100 arguments** (`FUNC_MAX_ARGS`), so a
+  table with ≥ 100 checksummed columns failed CHECKSUM validation on the **target**
+  with *"cannot pass more than 100 arguments to a function"* — even though tables up
+  to 255 columns are otherwise supported. The token now **nests MD5s**: it hashes
+  each group of ≤ 96 rendered columns, then hashes the group hashes, applied
+  **identically on both engines** so equal data still hashes equally. Tables within
+  the limit emit the original flat SQL unchanged (no re-checksum of narrow tables).
+  Verified against a live **Aurora DSQL** cluster: a flat 200-argument `concat_ws`
+  errors, while the nested form succeeds.
 
-## v0.1.392
+## v0.1.394
 
 ### Changed
 
-- **PostgreSQL source: Evaluation now flags DSQL-unsupported column types too** (not just
-  Schema Conversion). A PostgreSQL column whose type Aurora DSQL does not support as a
-  column type — array, geometric, network (inet/cidr/macaddr), xml, money, bit, range,
-  tsvector, enum/composite, pgvector — is now surfaced as **Unsupported** in the
-  Evaluation report, with the same faithful remodel target the Schema Conversion warning
-  names (array → jsonb, inet/xml → text, money → numeric, …). Previously such a table read
-  as "Automatic" at Evaluation and the problem only appeared at Schema Conversion. Both
-  steps share one source of truth so they never disagree. No change for MySQL sources.
+- **Republished the app image as `0.1.393` and repointed the default to it.** The
+  `0.1.393` image (MySQL 8.4 + 5.7 source-compatibility fixes) was pushed to ECR Public
+  (`z0q0i9j0`) and both private ECRs (us-east-1, ap-northeast-2), and
+  `cloudformation.yaml`'s `ContainerImageUri` default was repointed `0.1.390 → 0.1.393` so
+  a fresh `git clone` deploy pulls the 8.4/5.7-ready build.
+
+## v0.1.393
+
+### Fixed
+
+- **MySQL 5.7 source: temporal function defaults were mis-rendered as string literals.**
+  The converter tells an *expression* default from a *literal* using MySQL's
+  `DEFAULT_GENERATED` `EXTRA` flag — which only exists on **MySQL 8.0.13+**. On a **5.7**
+  source the flag is absent, so a temporal function default like `CURRENT_TIMESTAMP` /
+  `CURRENT_TIMESTAMP(6)` was treated as a literal and quoted (`DEFAULT
+  'CURRENT_TIMESTAMP(6)'`), making the target `CREATE` fail with *"invalid input syntax
+  for type timestamp"*. Introspection now also recognizes temporal function defaults
+  (`CURRENT_TIMESTAMP[(n)]`, `NOW()`, `LOCALTIME[STAMP]`, `UTC_TIMESTAMP`) on
+  `datetime`/`timestamp` columns as expression defaults when the flag is absent —
+  **scoped to temporal columns** so a genuine string literal is never misclassified, and
+  8.0+ keeps using the authoritative flag. Verified end-to-end against a live **MySQL
+  5.7.44** source (Full Load of `DATETIME(6)`/`TIMESTAMP` columns now creates + loads
+  correctly; the binlog watermark is captured via the `SHOW MASTER STATUS` fallback added
+  in `0.1.392`).
+
+## v0.1.392
+
+### Fixed
+
+- **MySQL 8.4 source: binlog watermark capture (gapless Full Load → CDC handoff).**
+  `SHOW MASTER STATUS` was **removed in MySQL 8.4**, so on an Aurora/MySQL 8.4 source the
+  watermark captured an empty binlog `file:position` — silently degrading the gapless
+  Full Load → CDC handoff (CDC could not resume from the watermark and fell back toward a
+  from-now start, risking a data gap). The watermark capture, the CDC **"Fetch current
+  position"** action, and the validator's binlog-drift read now issue **`SHOW BINARY LOG
+  STATUS`** (MySQL 8.2+, including 8.4) and **fall back to `SHOW MASTER STATUS`** on
+  ≤ 8.0.x servers that don't recognize the newer form — one code path covering 8.0.x
+  through 8.4+ with no version probe. Verified end-to-end against a live **Aurora MySQL
+  8.4.7** cluster (Full Load + watermark now returns real coordinates).
 
 ## v0.1.391
 
 ### Changed
 
-- **PostgreSQL source: the "unsupported type" Schema Conversion warning now names the
-  faithful remodel target for each type** instead of a generic "remodel to a supported
-  type". For a DSQL-unsupported PostgreSQL column type it tells you what to store it as:
-  an array → **jsonb** (or a child table); inet/cidr/macaddr/xml/tsvector/bit → **text**;
-  money → **numeric**; a range → **text** (or lower/upper-bound columns); pgvector →
-  jsonb/text; a user-defined enum → text; a composite → separate columns or jsonb. The
-  type is still not auto-converted (the application must adapt to the new type), so the
-  column is surfaced for you to remodel deliberately — no silent substitution, and
-  deliberately not a blanket `bytea` (which only fits a genuinely binary type).
+- **Republished the `0.1.390` app image and repointed the default to it.** The `0.1.390`
+  image (CDC applied-ops windowing fix + the `0.1.388/389` AI-reliability fixes) was
+  pushed to ECR Public (`z0q0i9j0`) and both private ECRs (us-east-1, ap-northeast-2),
+  and `cloudformation.yaml`'s `ContainerImageUri` default was bumped `0.1.387 → 0.1.390`
+  so a fresh git-clone deploy pulls it.
 
 ## v0.1.390
 
-### Added
+### Fixed
 
-- **PostgreSQL source: the Full Load watermark now captures the WAL LSN** — the
-  PostgreSQL resume coordinate (the analog of MySQL's binlog position), recorded at the
-  Full Load consistency point. This is the gapless Full Load → change-data-capture (CDC)
-  handoff point a PostgreSQL CDC catch-up resumes streaming from: because the Full Load
-  reads a snapshot at or after this LSN, replaying from it is a superset and the
-  idempotent load converges with no gap. A read-replica source uses the standby replay
-  LSN; if the LSN cannot be read (e.g. insufficient privilege) the watermark is still
-  valid (the LSN is best-effort). The watermark entry in the activity log shows it. No
-  change for MySQL sources (which continue to record binlog/GTID). Note: CDC from a
-  PostgreSQL source is still to come — this makes the Full Load side of the handoff ready;
-  the streaming side (a replication slot to retain WAL, and the CDC connector) arrives
-  with PostgreSQL CDC.
+- **CDC per-table Inserts/Updates/Deletes now count only events applied AFTER the Full
+  Load watermark, not prior CDC runs.** The "Changes since Full Load" column summed the
+  sink's `InsertsApplied`/`UpdatesApplied`/`DeletesApplied` CloudWatch metrics over a
+  fixed 14-day trailing window, so a clean Full-Load→CDC run with no post-watermark
+  writes still showed non-zero counts — those were leftover ops from earlier demo/test
+  CDC runs on the same stack still inside the window. CDC start now pins the applied-ops
+  window to the Full Load watermark (`cdc_ops_window_start`, persisted across reconnect;
+  falls back to CDC-start time for CDC-only/manual), and the poll windows the metric read
+  from it — so a fresh gapless run correctly reads 0 until real change traffic flows.
 
 ## v0.1.389
 
 ### Fixed
 
-- **PostgreSQL source: Full Load parity polish** (no change for MySQL sources).
-  - **Stalled/failed-over source connections are now detected promptly** without
-    capping a healthy read. MySQL uses a per-socket idle read timeout; the PostgreSQL
-    source now sets TCP keepalives + `tcp_user_timeout` so a dead/stalled/failed-over
-    connection surfaces (and auto-retries) within the read-timeout budget, while a
-    legitimately slow-but-still-streaming page is no longer at risk of being cut by the
-    `statement_timeout` total cap (which remains only as the hung-query backstop).
-  - The **watermark** entry in the activity log no longer says "binary logging off" for
-    a PostgreSQL source (which has no binary logging); it now states the row-count-only
-    baseline is by design for the source engine.
-  - The multiprocess Full Load **shard planner** now evaluates PK-shardability with the
-    source engine's dialect instead of defaulting to MySQL's integer-type set (internal
-    consistency with the authoritative shard-range planner; no user-visible change).
+- **AI DBA no longer fails with "AI reply unavailable / could not be parsed" on
+  reasoning-heavy turns (e.g. the header "What's next?" briefing, Query Converter
+  "Tune").** The Claude 5 models do extended thinking by default and thinking tokens
+  count against `max_tokens`, so a multi-tool / heavy turn could spend the whole budget
+  on thinking and stop with no answer text. Raising the cap (v0.1.382) only reduced the
+  frequency. Since these replies are grounded (tool results + system context carry the
+  facts) and kept concise, extended thinking is now **disabled** for every AI-DBA
+  generation (`thinking: {type: disabled}` on the chat, tool-chat, and guidance bodies),
+  so the full budget goes to the answer and the empty-thinking failure can't occur.
 
 ## v0.1.388
 
-### Fixed
+### Changed
 
-- **PostgreSQL source: three source-read behaviors no longer assume MySQL** (no change
-  for MySQL sources).
-  - The optional Full Load **read throttle** (max source active queries) polled a
-    MySQL-only `SHOW GLOBAL STATUS` on the source's snapshot connection. On a PostgreSQL
-    source that is invalid SQL that would abort the snapshot transaction and then fail
-    every table read once the throttle was enabled. It now reads the engine's real
-    metric — MySQL `Threads_running`, PostgreSQL active backends from `pg_stat_activity`
-    — so the throttle works on PostgreSQL and never runs the wrong statement on the
-    snapshot.
-  - The **auto-retry** that recovers a source connection dropped mid-load (e.g. an
-    Aurora failover) recognized only MySQL error codes/messages, so a PostgreSQL drop
-    was not retried and the table was left for a manual re-run. It now also recognizes
-    PostgreSQL connection SQLSTATEs (class `08`, failover/shutdown `57P0x`,
-    too-many-connections `53300`, and a timed-out page `57014` — the read-timeout
-    analog of MySQL's socket timeout), so a PostgreSQL source auto-recovers like MySQL.
-  - The operator **hint** shown when a source connection drops said "the source MySQL
-    connection dropped" even for a PostgreSQL source; it is now worded for the actual
-    source engine.
+- **Republished the `0.1.387` app image and repointed the default to it.** The
+  `0.1.387` image (LOB-panel scoping fix + the `0.1.385/386` prereq work) was pushed
+  to ECR Public (`z0q0i9j0`) and both private ECRs (us-east-1, ap-northeast-2), and
+  `cloudformation.yaml`'s `ContainerImageUri` default was bumped `0.1.384 → 0.1.387`
+  so a fresh git-clone deploy pulls it. (Updating an already-deployed stack to the
+  new image is a separate, explicitly-confirmed step.)
 
 ## v0.1.387
 
 ### Fixed
 
-- **PostgreSQL source: the Full Load "required privileges" check no longer fails by
-  mistake.** The prerequisite that confirms the source user can read the data was
-  probing privileges with MySQL's `SHOW GRANTS`, which does not exist on PostgreSQL — so
-  on a PostgreSQL source it saw no grants and reported a false "SELECT missing" failure
-  that **blocked the Full Load**, even for a fully-privileged user. The grant probe is
-  now engine-specific: MySQL still uses `SHOW GRANTS`; PostgreSQL reports full access for
-  a superuser and otherwise reads the current role's table privileges. No change for
-  MySQL sources.
+- **The "Oversized LOB columns" panel now lists only the SELECTED schema's/tables'
+  columns, not every schema's.** Picking one schema in Schema Conversion only
+  pre-ticks the Data Migration picker; `migration_state.selection` stays the empty
+  "= all" default until the picker is touched, so the panel — which filtered on that
+  raw selection — fell through to listing LOB columns from all schemas. The panel now
+  filters on the resolved **effective selection** (the same set the load uses), via a
+  new pure `scope_lob_candidates` helper. When an effective selection is supplied it
+  filters strictly (empty = nothing to migrate = no candidates); the legacy raw-
+  selection fallback is kept for callers that can't resolve it (CDC-only panel).
 
 ## v0.1.386
 
 ### Added
 
-- **Migrate from PostgreSQL, not just MySQL.** The Connect screen now opens with a
-  **Source engine** picker — choose **MySQL** or **PostgreSQL** — so you can migrate an
-  RDS / Aurora **PostgreSQL** database to Aurora DSQL, in addition to RDS / Aurora MySQL.
-  Whether the source is Aurora or RDS is still auto-detected from the endpoint, and the
-  port default follows the engine (3306 for MySQL, 5432 for PostgreSQL). The overview
-  diagram labels the source accordingly (e.g. "Aurora PostgreSQL"). PostgreSQL support
-  covers **Evaluation, Schema Conversion, Full Load, and Validation**; change-data-capture
-  (CDC) from a PostgreSQL source is not yet available (it remains MySQL-only for now).
+- **CDC prerequisites now check the source's binary-log retention** — a new
+  `BINLOG_RETENTION` check (CDC mode only; SKIP for Full Load). CDC resumes from the
+  binlog file:position / GTID watermark captured at the Full Load snapshot, so if the
+  source's binlog is purged before CDC starts the handoff has a silent data gap. The
+  check reads the RDS `binlog retention hours` (from `mysql.rds_configuration`; an unset
+  value = aggressive purge) with a self-managed fallback (`binlog_expire_logs_seconds` /
+  `expire_logs_days`, where `0` = purging disabled = safe), and WARNs (non-blocking, per
+  Property 14) with remediation (`CALL mysql.rds_set_configuration('binlog retention
+  hours', 168)`) when retention is under 24h; unknown → advisory INFO. This closes the
+  classic RDS CDC gotcha the gate previously missed. Full Load's source checks are
+  unchanged (reachability + SELECT grant + per-table PK) — nothing to add there.
+
+## v0.1.385
+
+### Changed
+
+- **Republished the app image at `0.1.384` and repointed the default to it.** The
+  `0.1.384` image (AI DBA diagnostics tools + token-budget fix + Query Converter schema
+  picker) was pushed to ECR Public (`z0q0i9j0`) and both private ECRs (us-east-1,
+  ap-northeast-2), and `cloudformation.yaml`'s `ContainerImageUri` default was bumped
+  `0.1.382 → 0.1.384`, so a fresh git-clone deploy pulls the fixed image instead of the
+  stale one. (Updating an already-deployed stack to the new image is a separate,
+  explicitly-confirmed step.)
+
+## v0.1.384
+
+### Added
+
+- **AI DBA can now diagnose Full Load / CDC failures, not just report status.** Three new
+  read-only tools (in `ui/ai_tools.py`): `get_cdc_pipeline_diagnostics` answers "why is CDC
+  not streaming / why did the deploy fail" from cached state (CFN stack phase, per-connector
+  RUNNING/FAILED, confirmed sink stall, the failed deploy stage + the deploy log's
+  already-diagnosed error tail, and the Full Load→CDC watermark handoff);
+  `get_prerequisite_verdicts` returns the Full Load/CDC prerequisite checks (binlog, GTID,
+  MSK, IAM, PKs…) with PASS/FAIL/WARN + remediation and `can_proceed`; `list_cdc_dlq_samples`
+  returns a sample of the actual DLQ error messages per (table, SQLSTATE). `get_full_load_status`
+  and `list_failed_full_load_tables` also gained per-table `rows_skipped` / `rows_quarantined` /
+  `attempts` detail. All cached/local (no extra AWS calls per question) and credential- +
+  row-data-free — the failing row's PK value is deliberately excluded (Property 7).
+
+## v0.1.383
+
+### Changed
+
+- **Extracted the AI DBA's read-only tools out of `ui/app.py` into their own
+  `ui/ai_tools.py`.** The tool schemas, the system-prompt hint, and the ~400-line
+  `_ai_tool_execute` body now live in one cohesive module; `build_ai_tool_executor(...)`
+  is a factory that takes the page's stores + Full Load rate/ETA helper and returns the
+  executor (a factory, so the module needn't import app's globals — no circular import).
+  Behavior-preserving move (the tool logic is unchanged); `build_page` just wires it. The
+  executor is now unit-testable on its own (new `tests/test_ai_tools.py`), which it wasn't
+  as a closure. Sets up adding more tools (Full Load / CDC failure diagnostics) cleanly.
+
+## v0.1.382
+
+### Fixed
+
+- **AI DBA replies no longer fail with "AI reply unavailable / could not be parsed"
+  on reasoning-heavy turns (e.g. Query Converter's "Tune with AI DBA").** The current
+  models (Claude 5 family) use extended thinking, and thinking tokens count against
+  `max_tokens`; the chat/guidance cap was 1536, small enough that a single turn could
+  spend the whole budget on thinking and stop (`stop_reason=max_tokens`) with no answer
+  text — which surfaced as an unparseable reply. The generation budgets are now
+  generous (8192) so thinking plus a full answer fit; the concise `_RESPONSE_STYLE`
+  still keeps visible answers short, so normal replies don't get longer.
+
+### Changed
+
+- **Token budgets are keyed by call shape, not per screen/feature.** Now that the AI
+  DBA is one persistent app-wide panel, every interactive turn (object guidance,
+  grounded chat, tool-calling chat, CDC error chat) shares a single `_CHAT_MAX_TOKENS`
+  — one place to tune the chat budget, nothing per-screen to keep in sync. The only
+  other budgets are the genuinely different shapes: the one-shot assessment report and
+  the bare permission probe (`max_tokens=1`, output ignored). Internal only.
+
+## v0.1.381
+
+### Changed
+
+- **Query Converter's "Test on target" now resolves unqualified tables against the
+  right schema, and lets you pick it.** A converted query like `SELECT ... FROM
+  "orders"` was being tested under the default `public` search_path, so a table
+  migrated into a `<database>`-named schema failed with `relation "orders" does not
+  exist (SQLSTATE 42P01)`. The test now resolves the schema robustly — the connected
+  source database (a MySQL DB maps to a same-named PG schema) when the target has it,
+  else the target's sole user schema — and adds an optional **"Test against schema"**
+  picker (populated in the background from the target's user schemas, defaulted to the
+  inferred one) so you can retarget when a table was migrated under a different schema.
+  On a `42P01` rejection the raw error is now followed by an actionable hint (which
+  schema it tested against and how to fix it). Rather than force a schema up front
+  (Convert needs none), the schema is inferred and only surfaced as an override.
 
 ## v0.1.380
 

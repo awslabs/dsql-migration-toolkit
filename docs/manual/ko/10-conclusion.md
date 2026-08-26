@@ -74,9 +74,11 @@ CDC는 실제로 움직이는 구성 요소(MSK, MSK Connect, 싱크 커넥터)�
 2. **소스 쓰기 동결**(잠시 읽기 전용 / 점검 모드).
 3. **마지막 소진(drain) 대기** — CDC가 아직 처리 중인(in-flight) 마지막 변경까지 적용해 지연이 다시
    0이 되도록 합니다. 이제 MySQL과 DSQL이 같은 행을 가집니다.
-4. **Validation 재실행**으로 최종 go/no-go 판단을 하고, 깨끗한 MATCH일 때만 전환합니다.
+4. **Validation 재실행**으로 최종 go/no-go 판단을 하고, 깨끗한 MATCH일 때만 전환합니다. 최종 검증은
+   CDC가 전달한 행들 이후로 **identity / `AUTO_INCREMENT` 시퀀스를 전진**시키기도 하므로(*Sync identity
+   sequences* 동작), 전환 후 앱의 첫 insert가 마이그레이션된 id와 충돌(`23505`)하지 않습니다.
 5. **애플리케이션을 DSQL 엔드포인트로 전환** + 스모크 테스트.
-6. **CDC 파이프라인은 맨 마지막에 제거** — **Cut over** 단계에서 *Start over* → *Delete all CDC
+6. **CDC 파이프라인은 맨 마지막에 제거** — **Start over(우상단)** → *Delete all CDC
    infrastructure* 를 클릭합니다. 복제를 끝내고 MSK / MSK Connect / NAT 비용을 중단하며, 기존 스택을
    정리합니다(나중에 새 Full Load나 CDC를 배포하려면 먼저 제거되어 있어야 하기 때문입니다).
 

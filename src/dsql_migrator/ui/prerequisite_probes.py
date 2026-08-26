@@ -53,8 +53,18 @@ from dsql_migrator.ui.connect import make_source_engine_factory
 # MSK Serverless/provisioned cluster states that mean the broker is usable.
 _MSK_CLUSTER_READY_STATES = frozenset({"ACTIVE"})
 
-# MySQL global variables relevant to the CDC binlog/GTID prerequisite checks.
-_CDC_VARIABLES = ("log_bin", "binlog_format", "binlog_row_image", "gtid_mode")
+# MySQL global variables relevant to the CDC binlog/GTID/retention prerequisite
+# checks. ``binlog_expire_logs_seconds`` / ``expire_logs_days`` are the self-managed
+# binlog-retention signals (RDS retention is read separately from
+# ``mysql.rds_configuration`` -- see ``variables``).
+_CDC_VARIABLES = (
+    "log_bin",
+    "binlog_format",
+    "binlog_row_image",
+    "gtid_mode",
+    "binlog_expire_logs_seconds",
+    "expire_logs_days",
+)
 
 
 class SessionSourceProbe:
@@ -101,27 +111,55 @@ class SessionSourceProbe:
             return []
 
     def variables(self) -> dict[str, str]:
-        """Return the CDC-relevant ``SHOW GLOBAL VARIABLES`` (empty on error)."""
-        # The names are BOUND, not formatted into the statement. Nothing external can
-        # reach this list either way (it is a module constant), but these are VALUES --
-        # unlike a schema/table name, which cannot be a bind parameter at all -- so
-        # binding is possible here, and doing it keeps the statement text a plain
-        # literal. tests/test_prerequisite_probes.py pins the placeholder count to
-        # _CDC_VARIABLES, so adding a variable cannot silently drop it from the query.
+        """Return the CDC-relevant source variables (empty on error).
+
+        The ``SHOW GLOBAL VARIABLES`` names are BOUND, not formatted into the
+        statement. Nothing external can reach this list either way (it is a module
+        constant), but these are VALUES -- unlike a schema/table name, which cannot be
+        a bind parameter at all -- so binding is possible here, and doing it keeps the
+        statement text a plain literal. tests/test_prerequisite_probes.py pins the
+        placeholder count to _CDC_VARIABLES, so adding a variable cannot silently drop
+        it from the query. The RDS-only ``binlog retention hours`` is read separately
+        from ``mysql.rds_configuration`` and folded into the SAME map under the
+        synthetic key ``rds_binlog_retention_hours`` (``"0"`` = the RDS row exists but
+        is unset -> RDS purges aggressively), so the pure check reads one dict.
+        """
         params = {f"v{index}": name for index, name in enumerate(_CDC_VARIABLES)}
+        placeholders = ", ".join(f":v{index}" for index in range(len(_CDC_VARIABLES)))
+        result: dict[str, str] = {}
         try:
             engine = self._engine_factory(self._config)
             with engine.connect() as connection:
                 rows = connection.execute(
                     text(
                         "SHOW GLOBAL VARIABLES WHERE Variable_name "
-                        "IN (:v0, :v1, :v2, :v3)"
+                        f"IN ({placeholders})"
                     ),
                     params,
                 ).fetchall()
-            return {str(row[0]): str(row[1]) for row in rows if len(row) >= 2}
+            result = {str(row[0]): str(row[1]) for row in rows if len(row) >= 2}
         except Exception:  # noqa: BLE001 - treated as "variables unknown"
-            return {}
+            result = {}
+        # RDS-specific binlog retention (best-effort, SEPARATE try so a non-RDS source
+        # -- where mysql.rds_configuration does not exist -- never wipes the vars above).
+        try:
+            engine = self._engine_factory(self._config)
+            with engine.connect() as connection:
+                rrows = connection.execute(
+                    text(
+                        "SELECT value FROM mysql.rds_configuration "
+                        "WHERE name = 'binlog retention hours'"
+                    )
+                ).fetchall()
+            if rrows:  # the row exists => this IS an RDS source
+                raw = rrows[0][0]
+                # NULL/empty => retention unset => RDS purges aggressively => risk ("0").
+                result["rds_binlog_retention_hours"] = (
+                    str(raw).strip() if raw is not None and str(raw).strip() else "0"
+                )
+        except Exception:  # noqa: BLE001 - not RDS / no access -> key absent
+            pass
+        return result
 
     def cdc_prerequisites(self, table_names):
         """Return the PostgreSQL CDC readiness facts, or None for a MySQL source.

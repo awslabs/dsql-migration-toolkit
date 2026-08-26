@@ -1040,10 +1040,10 @@ def _render_cdc_manual_inputs(
         refresh()
 
     async def _fetch_from_source() -> None:
-        """Query SHOW MASTER STATUS on the source and fill the input fields."""
+        """Query the source binlog status and fill the input fields."""
         from nicegui import run
         from dsql_migrator.ui.connect import make_source_engine_factory
-        from sqlalchemy import text
+        from dsql_migrator.core.watermark import read_binlog_status_row
 
         source_config = getattr(session, "source_config", None)
         source_password = getattr(session, "source_password", None)
@@ -1061,7 +1061,7 @@ def _render_cdc_manual_inputs(
             engine_factory = make_source_engine_factory(source_password)
             engine = engine_factory(source_config)
             with engine.connect() as conn:
-                row = conn.execute(text("SHOW MASTER STATUS")).mappings().first()
+                row = read_binlog_status_row(conn)
             engine.dispose()
             return row
 
@@ -1081,7 +1081,7 @@ def _render_cdc_manual_inputs(
 
         if not row:
             ui.notify(  # type: ignore[attr-defined]
-                "SHOW MASTER STATUS returned no data — binary logging may be "
+                "No binary log position returned — binary logging may be "
                 "disabled.",
                 type="warning", position="top",
             )
@@ -3129,6 +3129,13 @@ def _start_cdc_deploy(
         _logged_cdc_lifecycle(_action, detail=_detail, work=work)
     )
     migration_state.set_cdc_deploy_job_id(job_id, kind="start")
+    # Count per-table applied-ops (I/U/D) only from THIS migration's Full Load
+    # watermark onward, so the monitor shows post-Full-Load CDC events -- not stale
+    # ops from prior CDC runs still inside the metric's trailing window. No watermark
+    # (CDC-only / manual) -> now (count from this CDC start).
+    migration_state.set_cdc_ops_window_start(
+        watermark.snapshot_timestamp if watermark is not None else None
+    )
     _log_cdc_event(_action, detail=_detail)
     ui.notify("Start CDC submitted — watch the progress below.", type="positive", position="top")  # type: ignore[attr-defined]
     refresh()

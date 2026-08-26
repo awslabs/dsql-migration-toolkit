@@ -60,14 +60,48 @@ from dsql_migrator.core.models import (
     TargetInventory,
 )
 
-# A larger output budget than the per-object suggestion path: the strategist
-# returns a whole structured report (strategy + insights + findings).
-_ASSESSMENT_MAX_TOKENS = 4096
+# Output-token budgets. These are the `max_tokens` CAP per model turn, not a
+# target -- the _RESPONSE_STYLE directive keeps answers concise, so a bigger cap
+# only adds headroom, it does not bloat normal replies.
+#
+# Keyed by CALL SHAPE, not by screen/feature. The AI DBA is now ONE persistent
+# app-wide panel, so every interactive turn shares a SINGLE chat budget
+# (_CHAT_MAX_TOKENS) -- there is no per-screen limit to keep in sync. The only
+# reason two other budgets exist is that they are genuinely different SHAPES of
+# call: a whole one-shot structured report, and a bare permission probe.
+#
+# IMPORTANT: the current models (Claude 5 family, e.g. global.anthropic.
+# claude-sonnet-5) use EXTENDED THINKING, and thinking tokens count against
+# `max_tokens`. A single reasoning-heavy turn can spend a few thousand tokens on
+# thinking BEFORE emitting any answer/tool call; if the cap is too small the turn
+# stops (stop_reason="max_tokens") with only a thinking block -- no text and no
+# completable tool_use -- which the chat then had to treat as an empty/unparseable
+# reply. So the generation caps must comfortably fit THINKING + the answer.
+# (Verified: a tuning turn burned an entire 1536-token cap on thinking alone and
+# produced no text.) Keep them generous.
+#
+# One-shot structured report (strategy + insights + findings) -- the largest output.
+_ASSESSMENT_MAX_TOKENS = 8192
 
-# Output budget for the on-demand, single-object guidance shown in the
-# Evaluation drawer: one focused remediation write-up (why it matters + how to
-# fix it for DSQL + example), so a tighter cap than the whole-report path.
-_OBJECT_GUIDANCE_MAX_TOKENS = 1536
+# EVERY interactive AI DBA turn -- object guidance, plain grounded chat
+# (stream_chat), and tool-calling chat (tool_chat), incl. Query Converter tuning
+# and the CDC error chat that delegates here. Single source of truth for the
+# persistent panel: one place to tune the chat budget. With extended thinking
+# DISABLED (see _THINKING_OFF) the whole budget is available for the answer.
+_CHAT_MAX_TOKENS = 8192
+
+# The current models (Claude 5 family) do EXTENDED THINKING by default, and thinking
+# tokens count against max_tokens. On a reasoning-heavy / multi-tool turn the model
+# could spend the ENTIRE budget on thinking and stop (stop_reason="max_tokens") with
+# only a thinking block -- no answer text -- which surfaced to the user as "AI reply
+# unavailable / could not be parsed" (seen on Query Converter "Tune" and the header
+# "What's next?" briefing). Raising the cap only reduced the frequency; it never
+# eliminated the tail. Since these replies are GROUNDED (tool results + the system
+# context carry the facts, not deep model reasoning) and _RESPONSE_STYLE keeps them
+# concise, we turn thinking OFF for every AI-DBA generation: the full budget goes to
+# the answer, so the empty-thinking failure cannot occur. (sonnet-5 rejects
+# thinking.type.enabled/budget -- "disabled" is the supported off switch here.)
+_THINKING_OFF = {"type": "disabled"}
 
 # Upper bound on the running multi-turn chat transcript (characters) sent to the
 # model per turn. Bounds token cost / context growth on a long conversation: the
@@ -989,6 +1023,7 @@ def _build_chat_body(
         {
             "anthropic_version": _ANTHROPIC_VERSION,
             "max_tokens": max_tokens,
+            "thinking": _THINKING_OFF,
             "system": system,
             "messages": [
                 {
@@ -1238,7 +1273,7 @@ class AssessmentStrategist:
             response = self._get_client().invoke_model(
                 modelId=self._config.model_id,
                 body=_build_invoke_body(
-                    prompt, max_tokens=_OBJECT_GUIDANCE_MAX_TOKENS
+                    prompt, max_tokens=_CHAT_MAX_TOKENS
                 ),
                 contentType="application/json",
                 accept="application/json",
@@ -1297,7 +1332,7 @@ class AssessmentStrategist:
             response = self._get_client().invoke_model_with_response_stream(
                 modelId=self._config.model_id,
                 body=_build_invoke_body(
-                    prompt, max_tokens=_OBJECT_GUIDANCE_MAX_TOKENS
+                    prompt, max_tokens=_CHAT_MAX_TOKENS
                 ),
                 contentType="application/json",
                 accept="application/json",
@@ -1509,7 +1544,7 @@ class AssessmentStrategist:
             # visually structured (bounds the received text; see _RESPONSE_STYLE).
             system + _RESPONSE_STYLE,
             _trim_chat_messages(messages, _MAX_CHAT_TRANSCRIPT_CHARS),
-            _OBJECT_GUIDANCE_MAX_TOKENS,
+            _CHAT_MAX_TOKENS,
         )
         try:
             response = self._get_client().invoke_model_with_response_stream(
@@ -1591,7 +1626,8 @@ class AssessmentStrategist:
                 body = json.dumps(
                     {
                         "anthropic_version": _ANTHROPIC_VERSION,
-                        "max_tokens": _OBJECT_GUIDANCE_MAX_TOKENS,
+                        "max_tokens": _CHAT_MAX_TOKENS,
+                        "thinking": _THINKING_OFF,
                         "system": system + _RESPONSE_STYLE,
                         "tools": list(tools),
                         "messages": convo,

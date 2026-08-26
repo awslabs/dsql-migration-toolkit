@@ -181,7 +181,8 @@ SCT 같은 단계입니다:
   `text` + `CHECK`, `BLOB`/`BINARY` → `bytea` 등.
   아래 [§2.3](#23-mysql--dsql-타입과-제약-처리-참조) 참조).
 - **컬럼 기본값** — 소스 `DEFAULT`를 그대로 가져옵니다(Aurora DSQL이 지원하며,
-  `DEFAULT CURRENT_TIMESTAMP`도 포함). 두 가지는 자동 변환됩니다: `TINYINT(1)` 기본값은 `boolean`
+  `CURRENT_TIMESTAMP` **및 소수초 `CURRENT_TIMESTAMP(n)`**, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`,
+  `LOCALTIME`/`LOCALTIMESTAMP` 포함). 두 가지는 자동 변환됩니다: `TINYINT(1)` 기본값은 `boolean`
   타깃에 맞게 `TRUE`/`FALSE`로, `DATETIME` 기본값은 로더가 쓰는 naive UTC 값과 일치하도록 UTC로
   고정됩니다. 이것이 가장 중요한 경우는 **기본값이 있는 `NOT NULL` 컬럼**입니다: MySQL은 그 컬럼을
   생략한 `INSERT`를 받아주지만, 기본값이 없으면 타깃은 같은 문장을 거부합니다 — 컷오버 후에야
@@ -248,7 +249,7 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 
 | MySQL 타입 | Aurora DSQL 타입 | 저장 값 형태 | 분류 | 비고 |
 |---|---|---|---|---|
-| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 정밀도/스케일 보존. **정밀도 > 38은 UNSUPPORTED**(DSQL은 NUMERIC을 38로 제한). |
+| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 정밀도/스케일 보존. **정밀도 > 38**은 Evaluation에서 **UNSUPPORTED**로 표시(DSQL은 NUMERIC을 38로 제한)되지만, Schema Conversion은 **`numeric(38,37)`으로 clamp**하며 데이터 손실 경고와 함께 DDL을 냅니다(스케일도 37로 제한). |
 | `DECIMAL(p,s) UNSIGNED` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 부호 없음은 표현 불가하며 저장상 의미 없음. |
 | `FLOAT` | `real` | `real` | AUTO | 단정밀도 float. |
 | `FLOAT(M,D)` | `real` | `real` | AUTO | `(M,D)` 표시 스펙 드롭(PostgreSQL `float`은 스케일이 아닌 정밀도 하나만 받음). |
@@ -280,6 +281,11 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 | `JSON` | `json` | `json` | AUTO | (CDC는 JSON 텍스트를 `PGobject(type=json)`로 감싸 `json` 컬럼을 타겟팅.) |
 | 공간(`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL에 공간 타입 없음; 데이터는 원시 WKB 바이트로 **보존**(Full Load는 `ST_AsBinary(col)`, CDC는 Debezium geometry의 `.wkb` 추출; **SRID는 드롭**). `geometry` *컬럼 타입* 자체는 MANUAL로 플래그되며(자동으로 `bytea`로 대체, WKB 보존) 값은 손실되지 않음. |
 
+> **DSQL에서 `bytea` 컬럼은 키가 될 수 없습니다.** `bytea`로 매핑되는 컬럼
+> (`BINARY`/`VARBINARY`, `*BLOB`, spatial)은 기본 키나 인덱스의 일부가 **될 수 없습니다**:
+> 그런 컬럼을 PK로 두면 테이블이 **UNSUPPORTED**, 세컨더리 인덱스면 인덱스가 **드롭(MANUAL)**
+> 됩니다. `text`/`uuid`나 해시 컬럼으로 re-key하세요. 아래 구조적 제약 참고.
+
 ### 구조적 제약
 
 | DSQL 규칙 | 도구 동작 |
@@ -290,11 +296,17 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 | **트랜잭션당 한 개 DDL** | 스키마 변환은 실행 단위당 정확히 한 개 DDL 문을 내보냄. |
 | **`CREATE INDEX ASYNC`** | 보조 인덱스를 데이터 적재 후 비동기로 생성. |
 | **낙관적 동시성** | 모든 배치·DDL을 `40001` 재시도로 감쌈. |
-| **컬럼 기본값은 지원됨** | 소스 `DEFAULT`를 그대로 가져옵니다(`DEFAULT CURRENT_TIMESTAMP` 포함). `TINYINT(1)` 기본값은 `TRUE`/`FALSE`로 변환하고(`boolean` 컬럼은 `DEFAULT 1`을 거부), `DATETIME` 기본값은 로더가 쓰는 naive UTC 값과 맞도록 UTC로 고정하며, `UUID()`는 `gen_random_uuid()`가 됩니다. DSQL에 대응이 없는 기본값은 조용히 사라지지 않고 드롭 + **보고**됩니다. 기본값 보존이 가장 중요한 경우는 `NOT NULL` 컬럼입니다: MySQL은 해당 컬럼을 생략한 `INSERT`를 받아주지만 타깃은 거부합니다. |
+| **컬럼 기본값은 지원됨** | 소스 `DEFAULT`를 그대로 가져옵니다(`CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, `LOCALTIME`/`LOCALTIMESTAMP` 포함). `TINYINT(1)` 기본값은 `TRUE`/`FALSE`로 변환하고(`boolean` 컬럼은 `DEFAULT 1`을 거부), `DATETIME` 기본값은 로더가 쓰는 naive UTC 값과 맞도록 UTC로 고정하며, 함수형 기본값은 변환됩니다(`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`CURRENT_TIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 식). DSQL에 대응이 없는 기본값(예: 다른 컬럼을 참조하는 식)은 조용히 사라지지 않고 드롭 + **보고**됩니다. 기본값 보존이 가장 중요한 경우는 `NOT NULL` 컬럼입니다: MySQL은 해당 컬럼을 생략한 `INSERT`를 받아주지만 타깃은 거부합니다. |
 | **`ON UPDATE CURRENT_TIMESTAMP` 없음** | 재현 불가: DSQL에는 `ON UPDATE` 절도, (PostgreSQL의 통상적 우회책인) 트리거도 없습니다. 컬럼은 삽입 시점 기본값을 유지하고 **MANUAL**로 표시됩니다 — 갱신 시 타임스탬프를 애플리케이션에서 명시적으로 설정하세요. |
 | **트리거/저장 프로시저/이벤트 없음** | **UNSUPPORTED** — 애플리케이션으로 재구현(스케줄 이벤트는 EventBridge/Lambda). |
 | **네이티브 파티셔닝 없음** | DSQL이 자동 분산; 파티션 테이블은 MANUAL. |
 | **클러스터당 하나의 DB** | 다중 DB 소스는 MANUAL(스키마로 통합하거나 클러스터 분리). |
+| **소스 `CHECK` 제약은 드롭됨** | MySQL `CHECK`(8.0.16+)는 타깃으로 넘어가지 않고(함수/연산자가 PostgreSQL과 다를 수 있음) **MANUAL**로 표시됩니다 — DSQL 호환 `CHECK`를 직접 다시 추가하거나 앱에서 강제하세요. (도구가 `ENUM`용으로 *생성*하는 `CHECK … IN (...)`은 영향 없음.) |
+| **`bytea`는 키가 될 수 없음** | `bytea` 컬럼(`BINARY`/`VARBINARY`, `*BLOB`, spatial 유래)은 **기본 키** 컬럼(테이블 → **UNSUPPORTED**)이나 **인덱스** 컬럼(인덱스 드롭 → **MANUAL**)이 될 수 없습니다. `text`/`uuid`/해시로 re-key하세요. |
+| **키 컬럼 ≤ 8개** | PK 또는 인덱스가 8개 컬럼을 넘으면 DSQL 한도 초과: PK는 **UNSUPPORTED**, 과도한 세컨더리 인덱스는 **드롭(MANUAL)**. |
+| **테이블당 인덱스 ≤ 24개** | DSQL은 테이블당 최대 24개 인덱스 허용(PK 포함 → 세컨더리 ≤ 23). 초과 인덱스는 표시되고 일부는 생성되지 않습니다. |
+| **키 값 ≤ 1 KiB** | 결합된 키 값은 ~1 KiB 미만이어야 합니다; 큰 키는 **권장(recommendation)** 으로 표시(실데이터에서 삽입 시 실패 가능). |
+| **식별자 63바이트** | DSQL/PostgreSQL은 식별자를 63바이트로 자릅니다; 잘림으로 두 이름이 충돌하면 객체가 **UNSUPPORTED**로 표시됩니다(앞 63바이트가 유일하도록 개명). |
 
 위 표의 **분류** 열은 Evaluation이 모든 객체에 적용하는 것과 같은 AUTO / MANUAL / UNSUPPORTED
 척도입니다 — 각 분류의 의미와, 여러 규칙이 겹칠 때 가장 엄격한 분류가 이기는 방식은

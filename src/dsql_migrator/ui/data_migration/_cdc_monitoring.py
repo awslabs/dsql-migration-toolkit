@@ -17,6 +17,7 @@ unchanged.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from collections.abc import Sequence
 from typing import Optional
 
 from dsql_migrator.core.activity_log import ActivityStatus
@@ -40,6 +41,7 @@ from dsql_migrator.ui.data_migration._models import (
     format_column_exclude_list,
     lob_exclusion_candidates,
     per_table_counts_notice_body,
+    scope_lob_candidates,
 )
 from dsql_migrator.ui.data_migration._cdc_status import (
     _CDC_TONE_STYLE,
@@ -1692,6 +1694,7 @@ def _render_cdc_lob_exclusion_panel(
     locked: bool,
     lock_reason: Optional[str] = None,
     migration_wide: bool = False,
+    selected_tables: Optional[Sequence[str]] = None,
 ) -> None:
     """Render the explicit, opt-in oversized-LOB column exclusion (H13).
 
@@ -1716,12 +1719,14 @@ def _render_cdc_lob_exclusion_panel(
     weight of a settings card. The full opt-in card is shown only when there are
     actual candidates to exclude.
     """
-    all_candidates = lob_exclusion_candidates(inventory)
-    selected_tables = set(migration_state.selection.selected_tables)
-    candidates = (
-        [c for c in all_candidates if c.table in selected_tables]
-        if selected_tables
-        else all_candidates
+    # Scope the candidates to the tables that will ACTUALLY be migrated. The caller
+    # passes the resolved EFFECTIVE selection so picking one schema lists only that
+    # schema's LOB columns, even though ``migration_state.selection`` is still the
+    # empty "= all" default until the picker is touched (see scope_lob_candidates).
+    candidates = scope_lob_candidates(
+        lob_exclusion_candidates(inventory),
+        selected_tables=selected_tables,
+        stored_selection=migration_state.selection.selected_tables,
     )
     selection = migration_state.lob_exclusions()
     if not candidates:

@@ -21,7 +21,9 @@ CDC가 필요한 경우는 **대규모 또는 지속적** 마이그레이션뿐�
 
 - **Debezium MySQL 소스 커넥터**가 소스 바이너리 로그를 읽기 전용으로 읽어 변경 이벤트를 냅니다.
 - **Amazon MSK**(Kafka)가 내구성 있는 백본 역할을 합니다. **테이블당 토픽 1개**, 기본 키로 키잉(한
-  행의 모든 변경이 한 파티션에 순서대로 유지), 그리고 DLQ 토픽으로 구성됩니다.
+  행의 모든 변경이 한 파티션에 순서대로 유지), 그리고 DLQ 토픽, Debezium **스키마 히스토리** 토픽
+  (`recovery`가 재구성하는 대상), 그리고 유휴 구간에도 커밋된 binlog offset을 전진시켜 재시작 시 무손실
+  재개를 가능케 하는 **하트비트** 토픽으로 구성됩니다.
 - **커스텀 DSQL 싱크 커넥터**(이 프로젝트가 소유한 Java Kafka Connect 플러그인)가 변경을 DSQL에
   적용합니다. 두 커넥터 모두 **관리형 MSK Connect**에서 실행되며, 도구는 **자체 싱크 컴퓨트를 돌리지
   않고** 컨트롤 플레인 역할만 합니다(구성 작성, 시작 오프셋 시드, 모니터링).
@@ -45,6 +47,15 @@ CDC는 **행 수준 데이터 변경**(insert/update/delete)을 복제합니다.
 DSQL 타깃 스키마는 **Schema Conversion** 단계에서 고정됩니다. **CDC 중 소스 스키마를 바꾸면**,
 동일 DDL을 DSQL에 직접(Schema Conversion으로) **먼저** 적용하세요. 그 전까지, 타깃 형태에 맞지 않는
 행(예: 새 컬럼 참조)은 손실되지 않고 **DLQ**로 격리됩니다 — 조용히 사라지지 않습니다.
+
+### CDC 중 소스 스키마 드리프트 감지·처리
+
+소스 `ALTER`를 직접 눈치챌 필요가 없습니다. 데드레터 레코드가 소스 형태 변경을 시사하면, 도구가
+SQLSTATE로 드리프트를 **분류**(컬럼 추가/삭제/타입 변경)하고 CDC 단계에 **"소스 스키마 변경 감지"** 배너를
+표시합니다. 흔한 경우인 소스 **`ADD COLUMN`**에 대해서는 정확한 `ALTER TABLE … ADD COLUMN` 문을 보여주고
+원클릭 적용(트랜잭션당 1 DDL)하는 **"Fix target schema…"** 액션을 제공합니다; 이후 CDC가 재개되고, 컬럼이
+없던 동안 밀쳐뒀던 행은 테이블별 **Reload**로 백필합니다. 컬럼 삭제/타입 변경 드리프트는 직접 해결하도록
+표시만 합니다(도구는 타깃 데이터를 자동 삭제하지 않습니다).
 
 ---
 
@@ -161,8 +172,8 @@ CDC 실행 중에는 Data Migration 화면이 테이블별 실시간 모니터�
 ### Stream lag — 행 수가 아니라 실제 시간 척도
 
 **Stream lag**은 종단 간 복제 지연입니다: 각 변경에 대해 싱크가 **적용 시각 − 소스 커밋 시각**(Debezium
-`source.ts_ms`)을 기록해 테이블별 `ReplicationLagMs` CloudWatch 메트릭으로 내보내며, 모니터는 가장 최근
-값을 표시합니다.
+`source.ts_ms`)을 기록해 테이블별 `ReplicationLagMs` CloudWatch 메트릭으로 내보내며, 모니터는 최근 창에서
+관찰된 **최악(최대) 지연**을 표시합니다(마지막 단일 값이 아님).
 
 - **시간(duration)** 으로 표시됩니다: `caught up`(1초 미만 / 스트림 소진), `8.5s behind`,
   `2m 10s behind`, `1h 4m behind`.
@@ -175,6 +186,20 @@ CDC 실행 중에는 Data Migration 화면이 테이블별 실시간 모니터�
 
 지연 측정은 철저히 **best-effort**이며 복제에 영향을 주지 않습니다. "Stream lag → caught up"을
 [cut over](10-conclusion.md)로 넘어가도 안전하다는 신호로 사용하세요.
+
+### 파이프라인 헬스와 change flow
+
+per-table 표 위에 **파이프라인 헬스 카드**가 각 커넥터 상태와 **"change flow"** 상태 줄을 보여줍니다 —
+*Streaming*, *No changes flowing — idle*, 또는 **"Sink stalled — changes are NOT reaching DSQL"** — 소스 poll과
+싱크 send의 rec/s 게이지 두 개와 함께라 유휴 스트림과 멈춘 스트림을 한눈에 구분합니다. **라이브 stream-lag
+차트**는 최악의 종단 지연을 시간축으로 그려 "caught up"과 확정된 싱크 stall을 구분합니다.
+
+### DLQ 들여다보기
+
+인터랙티브 **DLQ 인스펙터**가 데드레터 레코드를 **Time / Table / SQLSTATE / Reason**으로 나열합니다 —
+페이지·필터 지원, 테이블별 분해와 depth 배지 포함 — UI를 벗어나지 않고 poison 행을 트리아지할 수
+있습니다. **"Download CDC error log"**로 NDJSON 내보내기. (Reason에는 SQL 템플릿이 담기고 행 값은 없습니다
+— §4.5 참고.)
 
 ---
 

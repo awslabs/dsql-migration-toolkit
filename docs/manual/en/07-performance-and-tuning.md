@@ -423,7 +423,8 @@ tables are read from the source at once* — one streaming source connection per
 concurrent table. It is the dial on concurrent source read pressure. `BATCH_PARALLELISM`
 and `BATCH_ROWS` raise **DSQL write** pressure, not source read load; leave them
 unless DSQL is the bottleneck. (The source read **page size is fixed at 5000 rows**
-and is not tunable — table parallelism is your only source-read throttle.)
+and is not tunable; table parallelism is your **primary** source-read lever, with an
+optional `Threads_running` cap as a second, opt-in safety valve — see the note below.)
 
 > Set it under **Settings → Full Load** to experiment between runs, or as the env
 > var to persist it (see §7.2).
@@ -451,11 +452,14 @@ headroom, not the number of tables:
   pages); and above all, **your application's own query latency rising** — the ultimate
   back-off trigger regardless of instance metrics.
 
-> [!note] No built-in rate limiter
-> The tool has **no throughput/QPS rate limiting** — source read pressure scales
-> linearly with table parallelism. Lowering the knob is your control. Schedule the
-> bulk load **off-peak** and avoid overlapping the instance's backup/maintenance
-> window (a snapshot plus full scans is the worst case for gp2 `BurstBalance`).
+> [!note] Source-load safety valve
+> There is **no QPS rate limiter**, but there **is** an opt-in concurrency throttle:
+> `DSQL_MIGRATOR_FULL_LOAD_MAX_SOURCE_THREADS_RUNNING` (default `0` = off, also
+> settable in **Settings → Full Load**) pauses new source reads while the source's
+> global `Threads_running` exceeds the ceiling — a gh-ost-style `--max-load` guard.
+> Otherwise, lowering table parallelism is your control. Schedule the bulk load
+> **off-peak** and avoid overlapping the instance's backup/maintenance window (a
+> snapshot plus full scans is the worst case for gp2 `BurstBalance`).
 
 ### Pre-flight headroom checklist
 
@@ -558,6 +562,25 @@ a high change rate. Scale it with the §7.2 CDC parameters when you need through
 > the same metrics against your own source/target. Note that `full-load` **drops and
 > recreates** the target tables (needs `--yes`) so use it **only on a non-production
 > target**, and `cdc-lag` needs an active CDC pipeline.
+
+---
+
+## 7.6 The Settings dialog (tuning, diagnostics, activity log)
+
+The knobs above are also editable **in the UI** without a restart: the **Settings**
+entry (sidebar footer) opens a tabbed dialog with —
+
+- **Full Load / CDC / Validation** tabs — the tunable knobs from §7.2 (table & batch
+  parallelism, batch rows, the source-load throttle, CDC sink MCU, validation
+  workers), each applied to the **next** run of that step.
+- a **Diagnostics** tab — set the app **log level** (DEBUG / INFO / WARNING / ERROR)
+  and toggle **"mirror to stdout"** so logs also reach the container's CloudWatch log
+  group for a debugging window.
+- an **Activity log** tab — download the session's activity log (the same feed the AI
+  DBA reads).
+
+Changes made in the dialog **revert on restart**; to persist one, set its
+`DSQL_MIGRATOR_*` environment variable (listed in §7.2) instead.
 
 ---
 

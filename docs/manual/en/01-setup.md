@@ -11,14 +11,18 @@ open in my browser and connected to both my source and my Aurora DSQL target."
 > and the UI is already open at your `AppUrl`, skip ahead to [§1.5 Connect](#15-connect-to-your-source-and-target).
 > This chapter also covers running locally, which the deployment guide does not.
 
-There are two ways to run the tool:
+There are three ways to run the tool:
 
 - **Local** — run it on your laptop/workstation for evaluation and smaller
   migrations. Fastest to start.
 - **On AWS (ECS Fargate)** — the deployed form most teams use for real
   migrations, reached through a web endpoint behind an Application Load Balancer.
+- **On AWS (single EC2 host, from source)** — for accounts that can't use
+  containers/ECR or AWS Lambda: the tool runs straight from source (`git clone` +
+  `uv sync` + a **systemd** service) on one in-VPC EC2 host, reached over an SSM
+  port-forward (no ECS/ALB/image). → [§1.4](#14-run-on-a-single-ec2-host-from-source).
 
-You connect to the **same** source and target either way; only where the tool
+You connect to the **same** source and target in every case; only where the tool
 *process* runs differs.
 
 ---
@@ -30,6 +34,11 @@ You connect to the **same** source and target either way; only where the tool
 - A source **Amazon RDS or Aurora MySQL** database you can reach over the
   network, with a user that can read the schema and data (read-only is enough —
   the tool never writes to the source).
+  - **Supported source engines & versions** (validated end-to-end — Full Load +
+    CDC + checksum validation): **RDS for MySQL** 5.7 / 8.0 / 8.4, and **Aurora
+    MySQL** 5.7 (v2) / 8.0 (v3) / 8.4. MySQL 5.7 is past end of standard support
+    (RDS/Aurora Extended Support may apply), but the tool fully supports it as a
+    migration source.
 - A target **Amazon Aurora DSQL** cluster in the **same AWS region** as you'll
   run the tool. (DSQL uses IAM-token auth — there is no password to manage.)
 
@@ -98,7 +107,10 @@ what's missing, but setting them up is a source-side task you do once.
 
   Choose a window that comfortably covers the gap between Full Load and CDC start
   plus your expected catch-up time (7 days is a safe default). The Aurora MySQL
-  maximum is **2160 (90 days)**; you can lower it again after cut-over.
+  maximum is **2160 (90 days)**; you can lower it again after cut-over. The gate
+  now **warns** (non-blocking) if retention looks too short (under 24h) or is unset,
+  so you catch it before the binlog is purged — but it never blocks, since only you
+  know how long your Full Load will run.
 - **GTID is recommended, but not required.** With `gtid_mode=ON`, CDC resume
   survives a source failover or replica promotion; without it, the tool falls back
   to the binlog `file:position` watermark — which works, but is less robust across

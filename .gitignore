@@ -125,3 +125,6 @@ perf-runs/
 # Personal editor Task (grip -> Chrome Markdown preview); not shared. The
 # tracked .vscode/settings.json stays committed.
 .vscode/tasks.json
+
+# Playwright MCP browser scratch artifacts (console/page dumps)
+.playwright-mcp/

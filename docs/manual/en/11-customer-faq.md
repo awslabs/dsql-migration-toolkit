@@ -16,11 +16,12 @@ to the chapter with the full detail. If you read only one thing first, read
 
 **Q1. What does this tool migrate, and in which direction?**
 
-Amazon **RDS / Aurora MySQL → Amazon Aurora DSQL**, one direction only. This is a
-**heterogeneous** migration (MySQL → PostgreSQL dialect → DSQL constraints), not a
-version upgrade — DSQL is PostgreSQL-wire-compatible, distributed, serverless, and
-IAM-authenticated. The **source is read-only the entire time**; the tool never
-writes to your MySQL.
+Amazon **RDS / Aurora MySQL → Amazon Aurora DSQL**, one direction only. Supported
+sources are **RDS for MySQL** and **Aurora MySQL**, versions **5.7 / 8.0 / 8.4**
+(all validated end-to-end — Full Load + CDC + checksum). This is a **heterogeneous**
+migration (MySQL → PostgreSQL dialect → DSQL constraints), not a version upgrade —
+DSQL is PostgreSQL-wire-compatible, distributed, serverless, and IAM-authenticated.
+The **source is read-only the entire time**; the tool never writes to your MySQL.
 
 
 **Q2. Is Aurora DSQL a drop-in replacement for Aurora MySQL?**
@@ -163,7 +164,9 @@ privileges**. You must also **raise binlog retention** so the log at the Full Lo
 watermark survives until CDC starts (Aurora MySQL keeps binlogs only ~24 h by
 default). On RDS/Aurora these are set via **parameter groups** and
 `mysql.rds_set_configuration`, not `my.cnf`. The prerequisite gate **blocks CDC**
-until these are met. See [§1.1](01-setup.md#11-prerequisites) and
+until the binlog format and replication privileges are met, and **warns**
+(non-blocking) if binlog retention looks too short. See
+[§1.1](01-setup.md#11-prerequisites) and
 [Chapter 6 §6.2](06-limitations.md#62-migration-process-limits).
 
 
@@ -346,9 +349,10 @@ source and target actually match**, not on hope. See
 
 **Q23. The source keeps changing during migration — won't validation be wrong?**
 
-No — it's attributed correctly. Validation reads the source GTID against the Full
-Load watermark and reports **drift**, so a count delta from **new source activity**
-is distinguished from a bug. For a clean final go/no-go, freeze source writes and
+No — it's attributed correctly. Validation compares the source's current position
+(by **GTID**, or the binlog **file:position** when GTID isn't enabled) against the
+Full Load watermark and reports **drift**, so a count delta from **new source
+activity** is distinguished from a bug. For a clean final go/no-go, freeze source writes and
 let CDC drain first (Q27).
 
 

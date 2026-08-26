@@ -87,9 +87,13 @@ freeze shrinks to just the final drain + smoke test.
 3. **Wait for the final drain** — let CDC apply the last in-flight changes until
    lag is zero again. MySQL and DSQL now hold the same rows.
 4. **Re-run Validation** for the final go/no-go; cut over only on a clean MATCH.
+   The final validation also **advances any identity / `AUTO_INCREMENT` sequence**
+   past the rows CDC delivered (a *Sync identity sequences* action), so the
+   application's first insert after cut-over can't collide with a migrated id
+   (`23505`).
 5. **Repoint the application** to the DSQL endpoint and smoke-test.
-6. **Tear the CDC pipeline down LAST** — on the **Cut over** step, click *Start
-   over* → *Delete all CDC infrastructure*. It ends replication, stops MSK / MSK
+6. **Tear the CDC pipeline down LAST** — click **Start over (top right)** →
+   *Delete all CDC infrastructure*. It ends replication, stops MSK / MSK
    Connect / NAT cost, and clears the old stack (a future fresh Full Load or CDC
    needs it removed before it can deploy).
 

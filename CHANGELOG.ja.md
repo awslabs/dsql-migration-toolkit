@@ -5,148 +5,242 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
-## v0.1.394
-
-### 修正 (Fixed)
-
-- **新しい MySQL ソースで `BIGINT UNSIGNED` が CHECKSUM 検証で誤った不一致を出さなくなりました。**
-  DSQL ターゲットのチェックサム描画が PostgreSQL の無制約 `numeric` scale-6 ルールを括弧なしの
-  すべての型に適用していましたが、MySQL 8.0.19+ / 8.4 / Aurora MySQL 3 は `BIGINT UNSIGNED` を
-  括弧なしの `bigint unsigned`(`numeric(20,0)`、すなわち整数として格納)で報告します。ターゲット
-  側は `.000000` を得る一方、変更されていない MySQL ソース側は scale 0 で描画されるため、データが
-  バイト単位で同一でもすべての `BIGINT UNSIGNED` 行が食い違い、テーブルが不一致として報告されて
-  いました。scale-6 ルールは本物の PostgreSQL ソースにのみ適用されるようになり、MySQL ソースは
-  両側とも宣言されたスケールで描画されます(MySQL 5.7 の `bigint(20) unsigned` 表記は括弧付きで
-  影響を受けませんでした)。
-- **宣言された精度のない PostgreSQL `numeric`/`decimal`(bare)に対して Schema Conversion 警告が
-  表示されます。** Aurora DSQL はそのような列を既定の `numeric(18,6)` で格納し、小数 6 桁を超える
-  値を丸めますが、これは従来サイレントで(DSQL の 38/37 を超える*宣言済み*精度のみをフラグ)、
-  Validation は当該列を scale 6 で比較するため損失が見逃される可能性がありました。変換は列名と
-  `numeric(18,6)` の上限を明示した MANUAL 警告を出すようになり、ロード前に精度の決定が見えるように
-  なりました。
-
-## v0.1.393
+## v0.1.396
 
 ### 追加 (Added)
 
-- **PostgreSQL ソース: CDC を「coming soon」としてゲートします(Full Load + Validation は完全サポート)。**
-  現在の CDC は Debezium **MySQL** → MSK → DSQL シンク経路のみで、PostgreSQL の論理レプリケーション
-  経路は計画中で未実装です。Data Migration の**タイプ選択**で、PostgreSQL ソースの場合は CDC タイル
-  2 つ(「CDC only」/「Full load + CDC」)を無効化し、「Coming soon for PostgreSQL — use Full load
-  only」の注記を表示します。これにより、動作しない CDC 選択(= PostgreSQL ソースに MySQL Debezium
-  コネクタをデプロイする状態)になるのを防ぎます。PostgreSQL CDC の提供時に単一の有効化ポイント
-  (`source_supports_cdc`)で有効化します。
-- **前提チェック(prerequisite)ゲートがソースエンジンを認識します。** CDC 専用の前提チェックは MySQL
-  の binlog/GTID ですが、PostgreSQL ソースではそれらの代わりにブロックしない正直な **INFO**(「CDC is
-  not yet available for PostgreSQL sources」)を報告し(該当チェックは N/A)、誤って FAIL になる原因の
-  MySQL 専用の変数読み取りを実行せず、MySQL のレプリケーション権限も要求しません。MySQL ソースは
-  変更なし。
+- **PostgreSQL がマイグレーションのソースとしてサポートされました(RDS / Aurora PostgreSQL →
+  Aurora DSQL)。** Connect 画面にソースエンジン選択(MySQL / PostgreSQL)が追加され、PostgreSQL
+  ソースはソース方言アダプタ(`core/source_dialect`)を通じて全工程(Evaluation、Schema
+  Conversion、Full Load、Validation、CDC)を実行します。PostgreSQL → DSQL はほぼ同一
+  (どちらも PostgreSQL-16 ワイヤ)であり、Schema Conversion は型をそのまま渡し、DSQL 非対応の
+  型(配列、geometric / network / xml / money / bit / range / tsvector / enum / composite /
+  domain)を忠実なリモデル先とともにフラグします。Full Load は keyset でストリーミングし
+  (シャーディング REPLACE 読み取りは共有 exported スナップショットを使用)、Validation は
+  PostgreSQL-16 のチェックサムレンダラを両端で再利用します。実際の Aurora PostgreSQL で
+  end-to-end 検証済み(Full Load + Validation、CHECKSUM バイト単位で同一)。
+- **PostgreSQL CDC(Debezium `pgoutput` → MSK → DSQL sink)。** 論理レプリケーションスロット +
+  publication のライフサイクル、WAL 保持ヘルスの表示、gapless な Full-Load → CDC ハンドオフ、
+  型付きバインド(uuid / timetz-UTC / interval / timestamptz / jsonb / bytea / numeric)および
+  TOAST partial-upsert。専用の Debezium-PostgreSQL コネクタプラグインが MySQL 用と併せて提供
+  されます。
 
-## v0.1.392
+### 修正 (Fixed)
+
+- **最新の MySQL ソースで `BIGINT UNSIGNED` が CHECKSUM 検証で誤った不一致を出さなくなりました。**
+  DSQL ターゲットのチェックサムが PostgreSQL の無制約 `numeric` scale-6 ルールを括弧なしのすべての
+  型に適用していましたが、MySQL 8.0.19+ / 8.4 / Aurora MySQL 3 は `BIGINT UNSIGNED` を括弧なしの
+  `bigint unsigned`(`numeric(20,0)`、整数)で報告します。ターゲット側は `.000000` を得る一方、
+  変更されていない MySQL ソース側は scale 0 で描画されるため、データがバイト単位で同一でも該当行が
+  すべて食い違っていました。scale-6 ルールは本物の PostgreSQL ソースにのみ適用されるようになりました
+  (MySQL 5.7 の `bigint(20) unsigned` は影響を受けません)。
+- **宣言された精度のない PostgreSQL `numeric`/`decimal`(bare)に Schema Conversion 警告が表示され
+  ます。** Aurora DSQL はそのような列を既定の `numeric(18,6)` で格納し、小数 6 桁を超える値を丸め
+  ますが、これは従来サイレントで(38/37 を超える*宣言済み*精度のみをフラグ)、Validation は scale 6
+  で比較するため損失が見逃される可能性がありました。変換は列名と `numeric(18,6)` の上限を明示します。
+
+## v0.1.395
+
+### 修正 (Fixed)
+
+- **幅の広いテーブル(> 約 100 列)のチェックサム検証をサポート。** 行ごとのチェックサムトークンは
+  `MD5(CONCAT_WS('|', <レンダリングした全列>))` でしたが、Aurora DSQL / PostgreSQL は関数呼び出しの
+  引数を **100 個**に制限する(`FUNC_MAX_ARGS`)ため、チェックサム対象列が 100 以上のテーブルは
+  **ターゲット**側で *"cannot pass more than 100 arguments to a function"* となり CHECKSUM 検証が
+  失敗していました(テーブルは最大 255 列までサポートされるにもかかわらず)。トークンは **MD5 を入れ子**に
+  するようになりました: ≤ 96 列のグループごとにハッシュし、そのグループハッシュをさらにハッシュします。
+  **両エンジンで同一に**適用されるため、同じデータは引き続き同じ値にハッシュされます。上限内のテーブルは
+  従来のフラットな SQL をそのまま出力します(狭いテーブルの再チェックサムなし)。実際の **Aurora DSQL**
+  クラスターで検証済み: フラットな 200 引数の `concat_ws` はエラー、入れ子形式は成功します。
+
+## v0.1.394
 
 ### 変更 (Changed)
 
-- **PostgreSQL ソース: Evaluation でも DSQL 未サポートの列型を検出するようになりました**
-  (Schema Conversion だけでなく)。Aurora DSQL が列型としてサポートしない PostgreSQL 型 —
-  配列、geometric、network(inet/cidr/macaddr)、xml、money、bit、range、tsvector、
-  enum/composite、pgvector — を持つ列は、Evaluation レポートで **Unsupported** として顕在化し、
-  Schema Conversion の警告と同じ推奨リモデル先(配列 → jsonb、inet/xml → text、money → numeric
-  …)を示します。従来はそのようなテーブルが Evaluation では「Automatic」と表示され、問題は
-  Schema Conversion で初めて現れていました。両ステップは単一の情報源(`unsupported_dsql_reason`)
-  を共有するため食い違いません。MySQL ソースの挙動は変わりません。
+- **アプリイメージを `0.1.393` として再公開し、デフォルトをそれに向け直しました。** `0.1.393`
+  イメージ(MySQL 8.4 + 5.7 ソース互換性の修正)を ECR Public(`z0q0i9j0`)と両プライベート
+  ECR(us-east-1、ap-northeast-2)へプッシュし、`cloudformation.yaml` の `ContainerImageUri`
+  デフォルトを `0.1.390 → 0.1.393` に向け直して、新規 `git clone` デプロイが 8.4/5.7 対応
+  ビルドを取得するようにしました。
+
+## v0.1.393
+
+### 修正 (Fixed)
+
+- **MySQL 5.7 ソース: 時刻関数のデフォルトが文字列リテラルとして誤って出力されていた問題。**
+  コンバーターは *式* デフォルトと *リテラル* デフォルトを MySQL の `DEFAULT_GENERATED`
+  `EXTRA` フラグで判別しますが、このフラグは **MySQL 8.0.13+ にのみ**存在します。**5.7**
+  ソースではフラグが無いため、`CURRENT_TIMESTAMP` / `CURRENT_TIMESTAMP(6)` のような時刻関数
+  デフォルトがリテラル扱いで引用符付き(`DEFAULT 'CURRENT_TIMESTAMP(6)'`)になり、ターゲットの
+  `CREATE` が *"invalid input syntax for type timestamp"* で失敗していました。イントロスペクション
+  がフラグ非在時でも `datetime`/`timestamp` 列の時刻関数デフォルト(`CURRENT_TIMESTAMP[(n)]`、
+  `NOW()`、`LOCALTIME[STAMP]`、`UTC_TIMESTAMP`)を式デフォルトとして認識するようになりました
+  — **時刻型の列に限定**するため実際の文字列リテラルが誤分類されることはなく、8.0+ は従来の
+  フラグを引き続き使用します。実際の **MySQL 5.7.44** ソースで E2E 検証済み(`DATETIME(6)` /
+  `TIMESTAMP` 列の Full Load が正しく作成・ロードされ、ウォーターマークは `0.1.392` で追加した
+  `SHOW MASTER STATUS` フォールバックで取得)。
+
+## v0.1.392
+
+### 修正 (Fixed)
+
+- **MySQL 8.4 ソース: binlog ウォーターマーク取得(ギャップレスな Full Load → CDC ハンドオフ)。**
+  `SHOW MASTER STATUS` は **MySQL 8.4 で削除**されたため、Aurora/MySQL 8.4 ソースでは
+  ウォーターマークが binlog `file:position` を空で取得し、ギャップレスな Full Load → CDC
+  ハンドオフが暗黙に壊れていました(CDC がウォーターマークから再開できず、現在時点から開始して
+  データギャップの恐れ)。ウォーターマーク取得、CDC の **「Fetch current position」** 操作、
+  バリデーターの binlog ドリフト読み取りが、いずれも **`SHOW BINARY LOG STATUS`**(MySQL
+  8.2+、8.4 を含む)を発行し、新形式を認識しない ≤ 8.0.x サーバーでは **`SHOW MASTER STATUS`
+  にフォールバック**するようになりました — バージョン判定なしで 8.0.x〜8.4+ を単一経路で処理。
+  実際の **Aurora MySQL 8.4.7** クラスターで E2E 検証済み(Full Load + ウォーターマークが実座標を返す)。
 
 ## v0.1.391
 
 ### 変更 (Changed)
 
-- **PostgreSQL ソース: 「未サポート型」のスキーマ変換警告が、型ごとに何へリモデルすべきかを
-  具体的に示すようになりました**(従来の一般的な「サポート型へリモデル」の代わりに)。DSQL が
-  サポートしない PostgreSQL の列型について、何として保存するかを案内します: 配列 →
-  **jsonb**(または子テーブル); inet/cidr/macaddr/xml/tsvector/bit → **text**; money →
-  **numeric**; range → **text**(または下限/上限カラム); pgvector → jsonb/text; ユーザー定義
-  enum → text; コンポジット → 個別カラムまたは jsonb。型は依然として**自動変換しません**
-  (アプリが新しい型に合わせる必要があるため)。ユーザーが意図的にリモデルできるよう表面化し、
-  サイレントな置換は行わず、(本当にバイナリな型にのみ適する)無差別な `bytea` フォールバックも
-  意図的に使いません。
+- **`0.1.390` アプリイメージを再公開し、デフォルトをそれに向け直しました。** `0.1.390` イメージ(CDC
+  applied-ops のウィンドウ修正 + `0.1.388/389` の AI 信頼性修正)を ECR Public(`z0q0i9j0`)と
+  private ECR 2つ(us-east-1、ap-northeast-2)へプッシュし、`cloudformation.yaml` の
+  `ContainerImageUri` デフォルトを `0.1.387 → 0.1.390` に更新して、新規の git-clone デプロイが
+  これを取得するようにしました。
 
 ## v0.1.390
 
-### 追加 (Added)
+### 修正 (Fixed)
 
-- **PostgreSQL ソース: Full Load ウォーターマークが WAL LSN を記録するようになりました** —
-  PostgreSQL の再開座標(MySQL の binlog 位置に相当)を Full Load の一貫性ポイントで記録します。
-  これは PostgreSQL の CDC キャッチアップがストリーミングを再開する **gapless な Full Load →
-  CDC 引き継ぎポイント**です。Full Load はこの LSN 以降のスナップショットを読むため、この地点
-  から再生すると上位集合になり、冪等ロードがギャップなく収束します。リードレプリカのソースでは
-  スタンバイの replay LSN を使い、LSN を読めない場合(権限不足など)でもウォーターマークは有効
-  です(LSN はベストエフォート)。アクティビティログのウォーターマーク項目に LSN が表示されます。
-  MySQL ソースは変更なし(引き続き binlog/GTID を記録)。備考: PostgreSQL ソースの CDC 自体は
-  今後の予定で、本変更は引き継ぎの **Full Load 側を準備**するものです。ストリーミング側(WAL
-  保持用のレプリケーションスロット、CDC コネクタ)は PostgreSQL CDC と共に導入されます。
+- **CDC のテーブル別 Inserts/Updates/Deletes が、Full Load ウォーターマーク以降に適用された
+  イベントのみをカウントするようになりました(以前の CDC 実行を除外)。** 「Changes since Full
+  Load」列はシンクの `InsertsApplied`/`UpdatesApplied`/`DeletesApplied` CloudWatch メトリクスを
+  **固定14日のトレーリングウィンドウ**で合算していたため、ワークロードなしで Full Load 直後に CDC
+  を開始しても非ゼロが表示されていました — 同じスタックで実行した**以前のデモ/テスト CDC 実行**が
+  ウィンドウ内に残っていたためです。CDC 開始時に applied-ops ウィンドウを **Full Load ウォーター
+  マーク**に固定し(`cdc_ops_window_start`、再接続後も保持。CDC-only/手動は CDC 開始時刻に
+  フォールバック)、ポールがその時点からメトリクスを読むようにしたので、クリーンな gapless 実行は
+  実際の変更トラフィックが流れるまで正しく 0 と表示されます。
 
 ## v0.1.389
 
 ### 修正 (Fixed)
 
-- **PostgreSQL ソース: Full Load の細かな挙動調整**(MySQL ソースの挙動は変わりません)。
-  - **切断・フェイルオーバーしたソース接続を、正常な読み取りを妨げずに速やかに検出**します。
-    MySQL はソケットごとのアイドル読み取りタイムアウトを使いますが、PostgreSQL ソースは
-    TCP キープアライブ + `tcp_user_timeout` を設定し、切断/停止/フェイルオーバーした接続が
-    読み取りタイムアウトの予算内で顕在化(自動リトライ)する一方、正常に低速でもストリーミング
-    継続中のページが `statement_timeout` の総量キャップで切られる恐れをなくしました
-    (statement_timeout はハングしたクエリ用のバックストップとしてのみ残します)。
-  - アクティビティログの**ウォーターマーク**項目が、PostgreSQL ソース(バイナリログなし)に
-    対して「binary logging off」と表示していたのを、ソースエンジンの仕様として行数ベースの
-    baseline のみであることを示すように修正しました。
-  - マルチプロセス Full Load の**シャードプランナー**が、PK シャーディング可否を MySQL の
-    整数型セットの既定ではなくソースエンジンのダイアレクトで判定します(権威あるシャード範囲
-    プランナーとの内部整合。ユーザーに見える変化なし)。
+- **推論の多いターン(ヘッダーの「What's next?」ブリーフィング、Query Converter の「Tune」など)で
+  AI DBA が「AI reply unavailable / 解析不可」で失敗する問題を修正しました。** Claude 5 モデルは
+  既定で extended thinking を行い、thinking トークンが `max_tokens` に計上されるため、マルチツール/
+  重いターンで予算を thinking に使い切って回答テキストが出ないことがありました。上限引き上げ
+  (v0.1.382)では頻度が下がるだけでした。これらの回答はグラウンデッド(ツール結果+システム
+  コンテキストが事実を担う)で簡潔なため、すべての AI-DBA 生成で extended thinking を**無効化**
+  (chat/tool-chat/guidance ボディに `thinking: {type: disabled}`)しました。予算全体が回答に使われ、
+  空 thinking の失敗が起こり得なくなります。
 
 ## v0.1.388
 
-### 修正 (Fixed)
+### 変更 (Changed)
 
-- **PostgreSQL ソース: ソース読み取りに関する 3 つの挙動が MySQL 前提でなくなりました**(MySQL
-  ソースの挙動は変わりません)。
-  - Full Load の任意の**読み取りスロットル**(ソースの同時クエリ上限)が、ソースのスナップ
-    ショット接続で MySQL 専用の `SHOW GLOBAL STATUS` を実行していました。PostgreSQL ソースでは
-    これは無効な構文でスナップショットトランザクションを中断させ、スロットルを有効にした
-    途端すべてのテーブル読み取りが失敗していました。今はエンジンごとの実指標 — MySQL は
-    `Threads_running`、PostgreSQL は `pg_stat_activity` のアクティブなバックエンド数 — を読む
-    ため、PostgreSQL でもスロットルが機能し、スナップショットに誤った文を実行しません。
-  - ロード中に切断されたソース接続(例: Aurora のフェイルオーバー)を回復する**自動リトライ**が
-    MySQL のエラーコード/メッセージしか認識せず、PostgreSQL の切断はリトライされずテーブルは
-    手動再実行待ちになっていました。今は PostgreSQL の接続 SQLSTATE(クラス `08`、
-    フェイルオーバー/シャットダウン `57P0x`、接続過多 `53300`、およびページ読み取りタイムアウト
-    `57014` — MySQL のソケットタイムアウトに相当)も認識し、MySQL 同様に自動回復します。
-  - ソース接続が切れたときに表示される運用者向け**ヒント**が、PostgreSQL ソースでも「the
-    source MySQL connection dropped」と表示されていたのを、実際のソースエンジンに合わせた
-    文言に修正しました。
+- **`0.1.387` アプリイメージを再公開し、デフォルトをそれに向け直しました。** `0.1.387` イメージ(LOB
+  パネルのスコープ修正 + `0.1.385/386` の前提条件対応)を ECR Public(`z0q0i9j0`)と private ECR 2つ
+  (us-east-1、ap-northeast-2)へプッシュし、`cloudformation.yaml` の `ContainerImageUri` デフォルトを
+  `0.1.384 → 0.1.387` に更新して、新規の git-clone デプロイがこれを取得するようにしました。(既に
+  デプロイ済みのスタックを新イメージへ更新するのは、別途明示的に確認する手順です。)
 
 ## v0.1.387
 
 ### 修正 (Fixed)
 
-- **PostgreSQL ソース: Full Load の「必要な権限」チェックが誤って失敗しなくなりました。**
-  ソースユーザーがデータを読めるかを確認する事前チェックが、MySQL の `SHOW GRANTS` で権限を
-  取得していましたが、この構文は PostgreSQL には存在しません。そのため PostgreSQL ソースでは
-  権限が何も見えず、「SELECT 権限がない」という誤った失敗を報告し、十分な権限を持つ
-  ユーザーでも **Full Load がブロック**されていました。権限の取得をエンジンごとに分離し、
-  MySQL は引き続き `SHOW GRANTS` を使い、PostgreSQL はスーパーユーザーなら全権限、そうで
-  なければ現在のロールのテーブル権限を読み取って判定します。MySQL ソースの動作は変わりません。
+- **「Oversized LOB columns」パネルが、選択したスキーマ/テーブルの列だけを表示するようになりました
+  (全スキーマではなく)。** Schema Conversion でスキーマを 1 つ選んでも Data Migration のピッカーが
+  事前チェックされるだけで、`migration_state.selection` はピッカーを操作するまで空の「= 全て」既定値
+  のままです。その生の選択でフィルタしていたパネルは全スキーマの LOB 列を列挙していました。パネルは
+  (ロードが使うのと同じ)**実効選択**でフィルタするようになりました — 新しい純粋ヘルパー
+  `scope_lob_candidates`。実効選択が渡された場合は厳密にフィルタし(空 = 移行対象なし = 候補なし)、
+  それを解決できない呼び出し元(CDC 専用パネル)向けにレガシーの生選択フォールバックを維持します。
 
 ## v0.1.386
 
 ### 追加 (Added)
 
-- **MySQL だけでなく PostgreSQL からも移行できるようになりました。** 接続(Connect)画面の先頭に
-  **ソースエンジン**の選択が追加され、**MySQL** または **PostgreSQL** を選べます。これにより RDS /
-  Aurora **PostgreSQL** データベースも(従来の RDS / Aurora MySQL に加えて)Aurora DSQL へ移行でき
-  ます。ソースが Aurora か RDS かは引き続きエンドポイントから自動判定され、ポートの既定値もエンジンに
-  合わせて切り替わります(MySQL は 3306、PostgreSQL は 5432)。概要ダイアグラムのソース表記もそれに
-  従います(例: 「Aurora PostgreSQL」)。PostgreSQL のサポート範囲は**評価・スキーマ変換・フルロード・
-  検証**で、PostgreSQL ソースの**変更データキャプチャ(CDC)はまだ利用できません**(現時点では CDC は
-  MySQL 専用)。
+- **CDC 前提条件にソースの binlog 保持期間チェックを追加** — 新しい `BINLOG_RETENTION` チェック
+  （CDC モードのみ、Full Load では SKIP）。CDC は Full Load スナップショット時点で取得した binlog
+  file:position / GTID ウォーターマークから再開するため、CDC 開始前にソースの binlog が削除されると
+  引き継ぎに静かなデータギャップが生じます。本チェックは RDS の `binlog retention hours`
+  （`mysql.rds_configuration` から読み取り。未設定 = 積極的な削除）を読み、self-managed のフォール
+  バック（`binlog_expire_logs_seconds` / `expire_logs_days`、`0` = 自動削除無効 = 安全）にも対応します。
+  24h 未満なら **WARN**（非ブロッキング、Property 14）+ 対処（`CALL mysql.rds_set_configuration('binlog
+  retention hours', 168)`）、判定不能なら INFO。RDS CDC の典型的な落とし穴を塞ぎます。Full Load の
+  ソースチェック（到達性 + SELECT 権限 + テーブルごとの PK）は変更なし — 追加不要です。
+
+## v0.1.385
+
+### 変更 (Changed)
+
+- **アプリイメージを `0.1.384` で再公開し、デフォルトをそれに向け直しました。** `0.1.384` イメージ
+  （AI DBA 診断ツール + トークン予算の修正 + Query Converter スキーマセレクター）を ECR Public
+  （`z0q0i9j0`）と private ECR 2つ（us-east-1、ap-northeast-2）へプッシュし、`cloudformation.yaml`
+  の `ContainerImageUri` デフォルトを `0.1.382 → 0.1.384` に更新しました。これにより新規の
+  git-clone デプロイも古いイメージではなく修正済みイメージを取得します。（既にデプロイ済みの
+  スタックを新イメージへ更新するのは、別途明示的に確認する手順です。）
+
+## v0.1.384
+
+### 追加 (Added)
+
+- **AI DBA が Full Load / CDC の失敗を診断できるようになりました（ステータス報告にとどまらず）。**
+  読み取り専用ツールを3つ追加（`ui/ai_tools.py`）: `get_cdc_pipeline_diagnostics` は「なぜ CDC が
+  ストリーミングしていないか / なぜデプロイが失敗したか」をキャッシュ状態から回答します（CFN
+  スタックのフェーズ、コネクタ別 RUNNING/FAILED、確定した sink stall、失敗したデプロイステージ +
+  デプロイログの診断済みエラー末尾、Full Load→CDC ウォーターマーク引き継ぎ）。
+  `get_prerequisite_verdicts` は Full Load/CDC の前提条件（binlog・GTID・MSK・IAM・PK など）を
+  PASS/FAIL/WARN + remediation + `can_proceed` で返します。`list_cdc_dlq_samples` は (テーブル,
+  SQLSTATE) ごとの実際の DLQ エラーメッセージのサンプルを返します。`get_full_load_status` /
+  `list_failed_full_load_tables` にもテーブル別の `rows_skipped` / `rows_quarantined` / `attempts`
+  詳細が加わりました。すべてキャッシュ/ローカル（質問ごとの追加 AWS 呼び出しなし）で、認証情報・
+  行データなし — 失敗行の PK 値は意図的に除外（Property 7）。
+
+## v0.1.383
+
+### 変更 (Changed)
+
+- **AI DBA の読み取り専用ツールを `ui/app.py` から専用モジュール `ui/ai_tools.py` に切り出し
+  ました。** ツールスキーマ、システムプロンプトのヒント、約400行の `_ai_tool_execute` 本体が
+  1つのモジュールにまとまり、`build_ai_tool_executor(...)` ファクトリがページのストア + Full
+  Load レート/ETA ヘルパーを受け取って executor を返します（ファクトリなので app のグローバルを
+  import する必要がなく、循環 import を回避）。挙動を保つ移動（ツールロジックは不変）で、
+  `build_page` は配線のみ。クロージャでは不可能だった executor の単体テストが可能になりました
+  （新規 `tests/test_ai_tools.py`）。Full Load / CDC の失敗診断ツールを綺麗に追加する土台です。
+
+## v0.1.382
+
+### 修正 (Fixed)
+
+- **推論の多いターン（例: Query Converter の「Tune with AI DBA」）で AI DBA の応答が「AI reply
+  unavailable / 解析不可」で失敗する問題を修正しました。** 現在のモデル（Claude 5 系）は
+  extended thinking を使い、thinking トークンが `max_tokens` に計上されます。チャット/ガイダンスの
+  上限が 1536 と小さく、1 ターンで予算を thinking に使い切って回答テキストなしで停止し
+  （`stop_reason=max_tokens`）、解析不可として表示されていました。生成予算を十分（8192）に
+  引き上げ、thinking と完全な回答の両方が収まるようにしました。回答の簡潔さは引き続き
+  `_RESPONSE_STYLE` が制御するため、通常の回答が長くなることはありません。
+
+### 変更 (Changed)
+
+- **トークン予算を画面/機能ごとではなく、呼び出しの形（call shape）ごとに設定します。** AI DBA が
+  1 つの常設パネルになったため、すべての対話ターン（object guidance、グラウンデッドチャット、
+  ツール呼び出しチャット、CDC エラーチャット）が単一の `_CHAT_MAX_TOKENS` を共有します — チャット
+  予算を 1 か所で調整でき、画面ごとに同期する上限はありません。残る予算は形が実際に異なるものだけ
+  です: 一回限りの assessment レポートと、権限プローブ（`max_tokens=1`、出力は無視）。内部変更です。
+
+## v0.1.381
+
+### 変更 (Changed)
+
+- **Query Converter の「Test on target」が、スキーマ修飾のないテーブルを正しいスキーマで解決し、
+  スキーマを選べるようになりました。** `SELECT ... FROM "orders"` のような変換済みクエリが
+  デフォルトの `public` search_path でテストされ、`<database>` 名のスキーマに移行されたテーブルが
+  `relation "orders" does not exist (SQLSTATE 42P01)` で失敗していました。今回テストはスキーマを
+  堅牢に解決します — 接続中のソースデータベース（MySQL DB は同名の PG スキーマにマップ）が
+  ターゲットに存在すればそれを、なくてターゲットのユーザースキーマが 1 つだけならそれを使います。
+  さらに任意の **「Test against schema」** セレクター（ターゲットのユーザースキーマ一覧を
+  バックグラウンドで取得し、推論したスキーマを既定値に）を追加し、テーブルが別のスキーマに移行
+  された場合に対象を切り替えられます。`42P01` の拒否時には、生のエラーの後に、どのスキーマで
+  テストしたかと解決方法を示す実行可能なヒントを表示します。スキーマを最初から必須にはせず
+  （Convert には不要）、推論しつつオーバーライドとしてのみ提示します。
 
 ## v0.1.380
 

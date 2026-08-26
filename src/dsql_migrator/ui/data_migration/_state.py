@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Mapping, Optional, Sequence
 
 from dsql_migrator.core.cdc import (
@@ -200,6 +200,14 @@ class DataMigrationState:
         # {"inserts","updates","deletes"}; empty when the metrics are unavailable
         # (older plugin / sink not emitting).
         self.cdc_applied_ops_by_table: dict[str, dict[str, int]] = {}
+        # Start of the window the applied-ops above are summed over: the Full Load
+        # watermark (this migration's gapless resume point), set when CDC starts. The
+        # sink's *Applied CloudWatch metrics have a long retention, so a fixed trailing
+        # window would sum ops from PRIOR CDC runs still inside it (e.g. earlier demo
+        # workloads on the same stack) -- making a clean Full-Load->CDC run wrongly show
+        # non-zero I/U/D. Windowing from here counts only post-Full-Load events. ``None``
+        # -> the reader's default window (no watermark known yet).
+        self.cdc_ops_window_start: Optional[datetime] = None
         # Per-table end-to-end replication lag (milliseconds) from the sink's
         # ``ReplicationLagMs`` CloudWatch metric (apply time minus source commit time).
         # Refreshed every CDC poll; drives the time-based "Stream lag" column (a far
@@ -634,6 +642,7 @@ class DataMigrationState:
             # Applied-ops + replication-lag metrics are per-stack too; drop them so the
             # adopted stack's poll repopulates rather than showing the prior stack's.
             self.cdc_applied_ops_by_table = {}
+            self.cdc_ops_window_start = None
             self.cdc_replication_lag_by_table = {}
             self.cdc_replication_lag_series = []
             # Slot health belongs to the previously-targeted stack's slot.
@@ -705,6 +714,22 @@ class DataMigrationState:
         """
         with self._lock:
             self.cdc_slot_health = health
+
+    def set_cdc_ops_window_start(self, ts: "Optional[datetime]") -> None:
+        """Pin the start of the window the per-table applied-ops (I/U/D) are summed over.
+
+        The CDC counts must reflect only events applied AFTER the Full Load watermark
+        (this migration's gapless resume point) -- otherwise the sink's long-retention
+        ``*Applied`` metrics let a fixed trailing window sum ops from PRIOR CDC runs
+        still inside it (e.g. earlier demo workloads on the same stack), so a clean
+        Full-Load->CDC run wrongly shows non-zero counts. ``ts`` is the watermark's
+        snapshot timestamp; ``None`` (CDC-only / no watermark) falls back to now, so
+        counting starts at this CDC start.
+        """
+        with self._lock:
+            self.cdc_ops_window_start = (
+                ts if ts is not None else datetime.now(timezone.utc)
+            )
 
     def set_cdc_replication_lag_by_table(self, lag_ms: "dict[str, int]") -> None:
         """Record per-table replication lag in ms (from ``ReplicationLagMs``).

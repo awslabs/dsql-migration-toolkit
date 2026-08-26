@@ -188,10 +188,20 @@ class _FakeRows:
 
 
 class _RecordingConnection:
-    """Records (statement, parameters) and returns canned variable rows."""
+    """Records (statement, parameters) and returns canned variable rows.
 
-    def __init__(self, rows: list[tuple[str, str]]):
+    ``variables()`` issues TWO queries: ``SHOW GLOBAL VARIABLES`` (returns ``rows``)
+    and the RDS-only ``mysql.rds_configuration`` read (returns ``rds_rows`` -- empty
+    by default so a non-RDS source adds no retention key).
+    """
+
+    def __init__(
+        self,
+        rows: list[tuple[str, str]],
+        rds_rows: list[tuple[Any]] | None = None,
+    ):
         self._rows = rows
+        self._rds_rows = rds_rows or []
         self.calls: list[tuple[str, Any]] = []
 
     def __enter__(self) -> "_RecordingConnection":
@@ -202,6 +212,8 @@ class _RecordingConnection:
 
     def execute(self, statement: Any, parameters: Any = None) -> _FakeRows:
         self.calls.append((str(statement), parameters))
+        if "rds_configuration" in str(statement):
+            return _FakeRows(self._rds_rows)
         return _FakeRows(self._rows)
 
 
@@ -309,3 +321,22 @@ def test_grants_delegates_to_postgres_dialect_not_show_grants() -> None:
     grants = _typed_source_probe(connection, SourceType.POSTGRES).grants()
     assert grants == ["ALL PRIVILEGES"]
     assert not any("SHOW GRANTS" in call for call in connection.calls)
+
+
+def test_variables_folds_in_rds_binlog_retention_when_set() -> None:
+    conn = _RecordingConnection([("log_bin", "ON")], rds_rows=[("168",)])
+    result = _source_probe(conn).variables()
+    assert result["log_bin"] == "ON"
+    assert result["rds_binlog_retention_hours"] == "168"
+
+
+def test_variables_marks_rds_retention_unset_as_zero() -> None:
+    # The RDS row exists but its value is NULL -> retention unset -> "0" (risk).
+    conn = _RecordingConnection([("log_bin", "ON")], rds_rows=[(None,)])
+    assert _source_probe(conn).variables()["rds_binlog_retention_hours"] == "0"
+
+
+def test_variables_omits_rds_key_on_self_managed() -> None:
+    # No mysql.rds_configuration rows (non-RDS / no access) -> no synthetic key.
+    result = _source_probe(_RecordingConnection([("log_bin", "ON")])).variables()
+    assert "rds_binlog_retention_hours" not in result
