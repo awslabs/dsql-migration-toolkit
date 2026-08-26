@@ -2,14 +2,15 @@
 
 _언어: [English](README.md) | **한국어** | [日本語](README.ja.md)_
 
-Amazon RDS MySQL / Aurora MySQL을 **Amazon Aurora DSQL**로 마이그레이션하는 웹 기반
-All-In-One 도구이며, 판단이 필요한 부분을 위한 **선택적 AI 보조**(Amazon Bedrock)를
-내장했습니다.
+Amazon RDS / Aurora **MySQL** *또는* **PostgreSQL**을 **Amazon Aurora DSQL**로
+마이그레이션하는 웹 기반 All-In-One 도구이며, 판단이 필요한 부분을 위한 **선택적 AI
+보조**(Amazon Bedrock)를 내장했습니다.
 
-Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 *분산* 데이터베이스이므로, 이것은
-두 개의 변환이 겹치는 **이종(heterogeneous) 마이그레이션**입니다: MySQL → PostgreSQL
-방언, 이어서 PostgreSQL → DSQL 제약(외래 키 없음, 낙관적 동시성, 트랜잭션당 행/시간
-한도, 비동기 인덱스, `C` collation 등).
+Aurora DSQL은 PostgreSQL 16 호환 *분산* 데이터베이스입니다. **MySQL** 소스는 두 개의
+변환이 겹치는 **이종(heterogeneous) 마이그레이션**입니다: MySQL → PostgreSQL 방언,
+이어서 PostgreSQL → DSQL 제약(외래 키 없음, 낙관적 동시성, 트랜잭션당 행/시간 한도,
+비동기 인덱스, `C` collation 등). **PostgreSQL** 소스는 방언 변환 단계를 건너뛰고(양쪽
+모두 PostgreSQL) DSQL 제약만 적용합니다.
 
 목표는 완전 자동화된 무중단 마이그레이션이 아닙니다. **마이그레이션 가능성을 평가하고,
 결정론적으로 변환 가능한 것(`sqlglot`)은 자동화하며, 사람의 작업이 필요한 지점을 명확히
@@ -24,8 +25,8 @@ Aurora DSQL은 MySQL이 아니라 PostgreSQL 16 호환 *분산* 데이터베이�
 ## 한눈에 보기
 
 두 개의 데이터 경로가 Aurora DSQL로 수렴합니다: 도구가 주도하는 일회성 **Full Load**와,
-관리형 MSK Connect에서 돌아가는 선택적 연속 **CDC** 스트림. binlog/GTID 워터마크가 둘을
-무손실로 이어 줍니다.
+관리형 MSK Connect에서 돌아가는 선택적 연속 **CDC** 스트림. 워터마크(MySQL은 binlog/GTID,
+PostgreSQL은 LSN)가 둘을 무손실로 이어 줍니다.
 
 <p align="center">
   <b>Simple architecture</b><br>

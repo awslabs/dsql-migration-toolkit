@@ -1052,8 +1052,9 @@ class Validator:
                     # source these probes are SQL syntax errors that would ABORT the
                     # shared snapshot transaction (PostgreSQL fails the whole txn on any
                     # statement error), poisoning every subsequent table read -- so skip
-                    # them for PG (drift stays "undeterminable", which is correct while PG
-                    # CDC is deferred). MySQL runs them as before on the same snapshot.
+                    # them for PG (these MySQL binlog/GTID drift coordinates do not exist
+                    # for a PostgreSQL source, which uses LSN watermarks, so drift stays
+                    # "undeterminable"). MySQL runs them as before on the same snapshot.
                     current_gtid: Optional[str] = None
                     current_binlog_file: Optional[str] = None
                     current_binlog_position: Optional[int] = None
@@ -1277,9 +1278,9 @@ class Validator:
         determine drift at all. Best-effort and read-only: any failure degrades to
         ``None`` values (drift becomes "undeterminable"), never aborting the run.
         """
-        # Drift coordinates are MySQL binlog/GTID; a PostgreSQL source has neither, and
-        # the probes are MySQL-only SQL, so skip them entirely (drift "undeterminable",
-        # correct while PG CDC is deferred). (Unlike the serial path this uses a throwaway
+        # Drift coordinates are MySQL binlog/GTID; a PostgreSQL source has neither (it
+        # uses LSN watermarks), and the probes are MySQL-only SQL, so skip them entirely
+        # (drift "undeterminable"). (Unlike the serial path this uses a throwaway
         # connection, so it wouldn't poison table reads -- but skipping avoids two doomed
         # queries.)
         if source.source_type is SourceType.POSTGRES:

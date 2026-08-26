@@ -2,15 +2,16 @@
 
 _言語: [English](README.md) | [한국어](README.ko.md) | **日本語**_
 
-Amazon RDS MySQL / Aurora MySQL から **Amazon Aurora DSQL** への移行を支援する
-Web ベースのオールインワンツールです。人手による判断が必要な箇所には、オプションで
-**AI 支援（Amazon Bedrock）** を利用できます。
+Amazon RDS / Aurora の **MySQL** *または* **PostgreSQL** から **Amazon Aurora DSQL**
+への移行を支援する Web ベースのオールインワンツールです。人手による判断が必要な箇所
+には、オプションで **AI 支援（Amazon Bedrock）** を利用できます。
 
-Aurora DSQL は MySQL ではなく PostgreSQL 16 互換の*分散*データベースであるため、
-本移行は 2 段階の変換を伴う**異種間移行（heterogeneous migration）** です。
-まず MySQL → PostgreSQL 方言への変換、次に PostgreSQL → DSQL 固有の制約
-（外部キー非対応、楽観的同時実行制御、トランザクションあたりの行数/時間制限、
-非同期インデックス、`C` コレーションなど）への適合が必要です。
+Aurora DSQL は PostgreSQL 16 互換の*分散*データベースです。**MySQL** ソースは 2 段階の
+変換を伴う**異種間移行（heterogeneous migration）** です。まず MySQL → PostgreSQL 方言
+への変換、次に PostgreSQL → DSQL 固有の制約（外部キー非対応、楽観的同時実行制御、
+トランザクションあたりの行数/時間制限、非同期インデックス、`C` コレーションなど）への
+適合が必要です。**PostgreSQL** ソースは方言変換の段階を省略し（両端とも PostgreSQL）、
+DSQL 固有の制約のみを適用します。
 
 本ツールは完全自動のゼロダウンタイム移行を目指すものではありません。目標は、
 **移行可能性の評価、機械的に変換できる部分（`sqlglot`）の自動化、そして人手が
@@ -27,8 +28,8 @@ Aurora DSQL は MySQL ではなく PostgreSQL 16 互換の*分散*データベ�
 
 Aurora DSQL へのデータ投入は 2 つの経路で行います。ツールが実行する 1 回限りの
 **Full Load** と、マネージド MSK Connect 上で動作するオプションの **CDC**（継続的
-変更レプリケーション）ストリームです。binlog/GTID ウォーターマークにより、
-両者はギャップなく接続されます。
+変更レプリケーション）ストリームです。ウォーターマーク（MySQL は binlog/GTID、
+PostgreSQL は LSN）により、両者はギャップなく接続されます。
 
 <p align="center">
   <b>Simple architecture</b><br>

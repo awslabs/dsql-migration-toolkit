@@ -29,8 +29,8 @@ from dsql_migrator.core.source_dialect.base import SourceDialect
 from dsql_migrator.core.source_dialect.mysql import MySQLSourceDialect
 from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
 
-# Singleton dialect per source type. PostgreSQL Full Load value conversion is still a
-# Phase-2 stub, but the dialect is registered so Evaluation / Schema Conversion resolve.
+# Singleton dialect per source type. Both MySQL and PostgreSQL are fully implemented
+# (Evaluation, Schema Conversion, Full Load, Validation, and CDC).
 _DIALECTS: dict[SourceType, SourceDialect] = {
     SourceType.MYSQL: MySQLSourceDialect(),
     SourceType.POSTGRES: PostgresSourceDialect(),

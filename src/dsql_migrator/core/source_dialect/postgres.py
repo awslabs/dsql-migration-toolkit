@@ -5,10 +5,10 @@
 
 The migration TARGET is Aurora DSQL (PostgreSQL-16 wire), so a PostgreSQL source is
 near-identity: psycopg driver, double-quote identifiers, a REPEATABLE READ snapshot,
-psycopg-native values. Scope is Full Load + Validation; CDC is deferred. Some methods
-are staged: ``enrich`` is a v1 no-op (SQLAlchemy reflection already yields the
-structure; PG-catalog enrichment is a later refinement) and ``value_converter`` is a
-Phase-2 item that fails loudly rather than risk a silent mis-conversion.
+psycopg-native values. It backs the full journey (Evaluation, Schema Conversion, Full
+Load, Validation, and CDC): ``enrich`` reads the PG catalog for exact column types
+(``format_type``) and the STORED-generated flag, and ``value_converter`` returns the
+pass-through :class:`PostgresValueConverter`.
 """
 
 from __future__ import annotations

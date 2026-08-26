@@ -888,11 +888,6 @@ class PrerequisiteCheckId(str, Enum):
     GTID_MODE = "GTID_MODE"
     MSK_AVAILABLE = "MSK_AVAILABLE"
     MSK_CONNECT_AVAILABLE = "MSK_CONNECT_AVAILABLE"
-    # CDC-only, PostgreSQL source: CDC is not yet implemented for PostgreSQL, so
-    # the MySQL binlog/GTID checks above do not apply. Emitted (non-blocking INFO)
-    # in place of them for a PostgreSQL source so the report is honest rather than
-    # running MySQL-only checks that would falsely FAIL. See prerequisites.py.
-    POSTGRES_CDC_UNSUPPORTED = "POSTGRES_CDC_UNSUPPORTED"
     # CDC-only, PostgreSQL source: logical-replication readiness (pgoutput + a slot).
     WAL_LEVEL_LOGICAL = "WAL_LEVEL_LOGICAL"
     REPLICATION_ROLE = "REPLICATION_ROLE"

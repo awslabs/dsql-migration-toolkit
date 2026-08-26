@@ -28,7 +28,6 @@ from dsql_migrator.core.prerequisites import (
     check_binlog_retention,
     check_binlog_row_format,
     check_gtid_mode,
-    check_postgres_cdc_unsupported,
     check_replication_grants,
     check_table_primary_key,
     check_target_columns_loadable,
@@ -463,15 +462,6 @@ def test_postgres_source_never_demands_mysql_replication_grants() -> None:
     assert "REPLICATION" in mysql_missing.detail.upper()
 
 
-def test_check_postgres_cdc_unsupported_is_credential_free_info() -> None:
-    result = check_postgres_cdc_unsupported()
-    assert result.status is PrerequisiteStatus.INFO
-    assert result.required is False
-    assert "PostgreSQL" in result.title
-    # Points the user at the supported path.
-    assert "Full Load" in result.detail
-
-
 # ---------------------------------------------------------------------------
 # PostgreSQL CDC readiness: the real logical-replication checks (Phase C5),
 # fed by PostgresCdcFacts from the dialect probe.
@@ -511,7 +501,6 @@ def test_postgres_cdc_facts_run_the_real_readiness_checks() -> None:
     assert Id.REPLICATION_ROLE in ids
     assert Id.SOURCE_IS_WRITER in ids
     assert Id.REPLICA_IDENTITY in ids
-    assert Id.POSTGRES_CDC_UNSUPPORTED not in ids
     # MSK is engine-neutral -> still runs for PostgreSQL CDC.
     assert Id.MSK_AVAILABLE in ids
     # MySQL binlog/GTID are not applicable -> SKIP.

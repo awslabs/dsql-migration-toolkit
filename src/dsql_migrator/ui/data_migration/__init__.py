@@ -2433,10 +2433,11 @@ def _render_migration_type_selector(
     cannot change once a migration has started; when ``None`` it falls back to
     locking only while this step is ``IN_PROGRESS``.
 
-    ``source_type`` gates the CDC tiles: CDC is not yet available for a PostgreSQL
-    source (:func:`source_supports_cdc`), so those tiles render disabled with a
-    "coming soon" note and cannot be selected -- this prevents deploying the MySQL
-    Debezium connector against a PostgreSQL source. Full load only is always
+    ``source_type`` gates the CDC tiles by :func:`source_supports_cdc` (the single
+    CDC-by-engine allowlist). MySQL and PostgreSQL both support CDC today, so all
+    three tiles are enabled for them; the gate remains as a defensive default so any
+    future source engine without CDC renders its CDC tiles disabled (with a note)
+    rather than offering a non-functional deploy. Full load only is always
     available. Defaults to MySQL so existing callers keep all three tiles.
     """
     running = locked if locked is not None else (status is StepStatus.IN_PROGRESS)
@@ -2542,17 +2543,18 @@ def _render_migration_type_selector(
                         "text-xs text-gray-700 font-medium mt-1"
                     )
                 if gated:
-                    # This CDC tile is disabled because CDC is not yet available for
-                    # the selected source engine. Say so where the user clicks (a
-                    # silently dead tile reads as a bug), and steer them to Full load
-                    # only. The MySQL binlog/MSK requirements note would be misleading
-                    # here, so it is replaced by this one.
+                    # This CDC tile is disabled because CDC is not available for the
+                    # selected source engine. Say so where the user clicks (a silently
+                    # dead tile reads as a bug), and steer them to Full load only. The
+                    # MySQL binlog/MSK requirements note would be misleading here, so it
+                    # is replaced by this one. (MySQL and PostgreSQL both support CDC, so
+                    # this only shows for a future engine that does not.)
                     with ui.row().classes("items-start gap-1 no-wrap mt-1"):  # type: ignore[attr-defined]
                         ui.icon("schedule").classes(  # type: ignore[attr-defined]
                             "text-amber-600 text-xs mt-0.5"
                         )
                         ui.label(  # type: ignore[attr-defined]
-                            "Coming soon for PostgreSQL — use Full load only."
+                            "CDC is not available for this source engine — use Full load only."
                         ).classes("text-xs text-amber-700")
                 elif meta.requirements:
                     # Purely informational: what the mode needs (verified later by

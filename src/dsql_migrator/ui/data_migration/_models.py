@@ -1593,17 +1593,12 @@ _CDC_MIGRATION_TYPES: frozenset[MigrationType] = frozenset(
 def source_supports_cdc(source_type: SourceType) -> bool:
     """Return whether CDC is available for a source of ``source_type`` today.
 
-    This is the SINGLE enablement point for CDC-by-engine. CDC is currently
-    Debezium **MySQL** -> MSK -> DSQL sink only; the PostgreSQL logical-replication
-    path (pgoutput publication + replication slot) is planned but not yet
-    implemented, so the Data Migration type selector gates the CDC tiles for a
-    PostgreSQL source (Full Load + Validation stay fully supported). Deliberately
-    an **allowlist** -- only CDC-capable engines are listed -- so any future source
+    This is the SINGLE enablement point for CDC-by-engine. Both MySQL (Debezium
+    MySQL -> MSK -> DSQL sink) and PostgreSQL (pgoutput publication + replication
+    slot -> MSK -> DSQL sink) CDC are implemented and enabled. Deliberately an
+    **allowlist** -- only CDC-capable engines are listed -- so any future source
     engine defaults to "no CDC" until it is explicitly enabled here, rather than
     silently offering a non-functional CDC deploy.
-
-    PostgreSQL CDC (pgoutput publication + replication slot -> MSK -> DSQL sink) is
-    implemented (Phases A-D) and enabled here after live E2E validation (Phase F).
     """
     return source_type in (SourceType.MYSQL, SourceType.POSTGRES)
 

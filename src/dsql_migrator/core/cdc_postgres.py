@@ -26,10 +26,10 @@ source-config adapter, then swap the three MySQL-only source parameters
 PostgreSQL ones (``EngineType`` / ``DebeziumPostgresPluginS3Key`` / the ``Pg*``
 params). MySQL output is untouched (byte-identical). Pure: no AWS, no I/O.
 
-CDC is deferred for a PostgreSQL source in the UI (the migration-type CDC tiles are
-gated -- see :func:`dsql_migrator.ui.data_migration.source_supports_cdc`); this
-module is the deploy-side foundation those tiles enable in a later phase. The live
-slot creation / offset handoff wiring is a subsequent phase.
+PostgreSQL CDC is enabled (see
+:func:`dsql_migrator.ui.data_migration.source_supports_cdc`); this module is the
+deploy-side foundation for it, alongside the live slot / publication lifecycle in
+:mod:`dsql_migrator.core.cdc_pg_slot` and the gapless offset handoff.
 """
 
 from __future__ import annotations

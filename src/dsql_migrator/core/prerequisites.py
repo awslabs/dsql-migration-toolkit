@@ -148,11 +148,11 @@ def check_replication_grants(
     CLIENT`` and ``REPLICATION SLAVE``. ``ALL PRIVILEGES`` satisfies any
     requirement. Matching is case-insensitive over the raw ``SHOW GRANTS`` text.
 
-    The CDC replication privileges are MySQL-specific tokens. PostgreSQL CDC is
-    not yet implemented (its replication readiness is the ``REPLICATION`` role
-    attribute / ``rds_replication`` membership, checked separately when PG CDC
-    ships), so a PostgreSQL source is only asked for the ``SELECT`` Full Load
-    grant here regardless of ``mode`` -- never MySQL's replication privileges.
+    The CDC replication privileges are MySQL-specific tokens. PostgreSQL CDC uses
+    PostgreSQL's own replication readiness instead (the ``REPLICATION`` role
+    attribute / ``rds_replication`` membership), checked separately, so a
+    PostgreSQL source is only asked for the ``SELECT`` Full Load grant here
+    regardless of ``mode`` -- never MySQL's replication privileges.
     """
     cdc_mysql = mode == MigrationMode.CDC and source_type is SourceType.MYSQL
     required = _CDC_GRANTS if cdc_mysql else _FULL_LOAD_GRANTS
@@ -540,33 +540,6 @@ def check_msk_connect_available(available: bool) -> PrerequisiteResult:
     )
 
 
-def check_postgres_cdc_unsupported() -> PrerequisiteResult:
-    """Report (non-blocking ``INFO``) that CDC is not yet available for PostgreSQL.
-
-    CDC today is Debezium MySQL -> MSK -> DSQL sink; the PostgreSQL logical-replication
-    path (pgoutput publication + replication slot) is planned but not yet implemented,
-    so the UI gates the CDC migration types for a PostgreSQL source. This result stands
-    in for the MySQL binlog/GTID checks so the report is honest for a PostgreSQL source
-    instead of running MySQL-only variable checks that would falsely FAIL. It is
-    ``required=False`` (an ``INFO``), so it never blocks -- Full Load + Validation are
-    fully supported for PostgreSQL.
-    """
-    return PrerequisiteResult(
-        check_id=PrerequisiteCheckId.POSTGRES_CDC_UNSUPPORTED,
-        title="CDC is not yet available for PostgreSQL sources",
-        status=PrerequisiteStatus.INFO,
-        required=False,
-        detail=(
-            "This tool's CDC (change data capture) currently supports MySQL sources "
-            "only. Full Load and Validation are fully supported for PostgreSQL."
-        ),
-        remediation=(
-            "Use Full load only for a PostgreSQL source. PostgreSQL CDC (logical "
-            "replication) is planned; no action is needed here."
-        ),
-    )
-
-
 def _skipped(check_id: PrerequisiteCheckId, title: str) -> PrerequisiteResult:
     """Build a non-applicable (SKIP) result for a check not run in this mode."""
     return PrerequisiteResult(
@@ -774,5 +747,4 @@ __all__ = [
     "check_gtid_mode",
     "check_msk_available",
     "check_msk_connect_available",
-    "check_postgres_cdc_unsupported",
 ]

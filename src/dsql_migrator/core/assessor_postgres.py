@@ -15,8 +15,9 @@ Excluded from v1 (all inspect MySQL specifics, so they would misfire or mislead 
 PostgreSQL source): the MySQL type/feature rules (ENUM/SET, TINYINT(1), BIT, YEAR,
 AUTO_INCREMENT, MySQL collation, MySQL spatial + LOB, ON UPDATE CURRENT_TIMESTAMP, MySQL
 index types, DECIMAL-precision parsed from a MySQL type), the MySQL-binlog CDC cascade
-rule (its guidance is entirely MySQL/Debezium-framed; PostgreSQL CDC is deferred), and
-the view rule (its linter targets MySQL application-query anti-patterns).
+rule (its guidance is entirely MySQL/Debezium-framed; PostgreSQL CDC uses its own
+logical-replication readiness checks instead), and the view rule (its linter targets
+MySQL application-query anti-patterns).
 
 The DSQL-unsupported PostgreSQL TYPE rule IS included (``UnsupportedPostgresTypeRule``,
 below) so Evaluation flags an unsupported column type the same as Schema Conversion does.
