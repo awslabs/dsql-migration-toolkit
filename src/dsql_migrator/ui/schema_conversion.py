@@ -2439,9 +2439,9 @@ def _render_browser_and_preview(
                 tree.untick()
 
             with ui.row().classes("items-center justify-between w-full no-wrap"):  # type: ignore[attr-defined]
-                ui.label("Source (MySQL)").classes(  # type: ignore[attr-defined]
-                    "text-sm font-semibold text-blue-800"
-                )
+                ui.label(  # type: ignore[attr-defined]
+                    f"Source ({'PostgreSQL' if source_type is SourceType.POSTGRES else 'MySQL'})"
+                ).classes("text-sm font-semibold text-blue-800")
                 with ui.row().classes("items-center gap-1 no-wrap"):  # type: ignore[attr-defined]
                     # Bulk selection: tick/untick every selectable object leaf at once
                     # (the per-object ticks still work for fine-grained picks).
@@ -2819,6 +2819,7 @@ def _render_browser_and_preview(
                 ),
                 on_apply_object=on_apply_object,
                 on_ai_chat=on_ai_chat,
+                source_type=source_type,
             )
 
     # Group the generated objects by kind (Tables, then Views) with a small
@@ -3104,6 +3105,7 @@ def _render_preview(
     is_ai_candidate: bool = False,
     on_apply_object: Optional[Callable[[str], None]] = None,
     on_ai_chat: Optional[Callable[..., None]] = None,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> None:
     """Render one object's source-vs-target DDL diff (Req 10.2, 11.5).
 
@@ -3134,9 +3136,9 @@ def _render_preview(
             # read-only not-converted target, plus (for an AI candidate) the AI-chat
             # icon to convert it with AI DBA.
             with ui.row().classes("items-center gap-1 w-full no-wrap"):  # type: ignore[attr-defined]
-                ui.label("Source DDL (MySQL)").classes(  # type: ignore[attr-defined]
-                    "text-sm font-semibold text-blue-800"
-                )
+                ui.label(  # type: ignore[attr-defined]
+                    f"Source DDL ({'PostgreSQL' if source_type is SourceType.POSTGRES else 'MySQL'})"
+                ).classes("text-sm font-semibold text-blue-800")
                 ui.space()  # type: ignore[attr-defined]
                 _render_copy_ddl_button(ui, preview.source_ddl, label="Source DDL")
             ui.code(preview.source_ddl, language="sql").classes("w-full")  # type: ignore[attr-defined]
@@ -3164,6 +3166,7 @@ def _render_preview(
                 preview,
                 conv_state,
                 on_apply_object,
+                source_type=source_type,
             )
 
     if preview.warnings:
@@ -3549,7 +3552,13 @@ def _render_ddl_header(
             trailing()
 
 
-def _render_ddl_diff(ui: object, source_ddl: str, target_ddl: str) -> None:
+def _render_ddl_diff(
+    ui: object,
+    source_ddl: str,
+    target_ddl: str,
+    *,
+    source_type: SourceType = SourceType.MYSQL,
+) -> None:
     """Render the Source vs Target DDL side by side, each in a code editor.
 
     Uses NiceGUI's bundled CodeMirror rather than a hand-built diff table. That table
@@ -3568,6 +3577,11 @@ def _render_ddl_diff(ui: object, source_ddl: str, target_ddl: str) -> None:
     rather than inferred from row positions.
     """
     ui.add_css(_DDL_PANE_CSS)  # type: ignore[attr-defined]
+    # The source pane is highlighted in ITS OWN dialect: "PostgreSQL"/"MySQL" is both the
+    # visible engine label and the CodeMirror language id (the target/DSQL pane below uses
+    # the "PostgreSQL" id the same way), so a PostgreSQL source reads as PostgreSQL rather
+    # than being mislabeled and mis-highlighted as MySQL.
+    source_engine = "PostgreSQL" if source_type is SourceType.POSTGRES else "MySQL"
     # An AWS-Console code surface: a white, bordered panel with a quiet header bar naming
     # each side, then the two editors.
     with ui.column().classes(f"w-full gap-0 {CODE_SURFACE_CLASSES}"):  # type: ignore[attr-defined]
@@ -3577,11 +3591,11 @@ def _render_ddl_diff(ui: object, source_ddl: str, target_ddl: str) -> None:
             _render_ddl_header(
                 ui,
                 icon="storage",
-                title="Source — MySQL",
+                title=f"Source — {source_engine}",
                 copy_ddl=source_ddl,
                 copy_label="Source DDL",
                 divider=True,
-                expand_language="MySQL",
+                expand_language=source_engine,
             )
             _render_ddl_header(
                 ui,
@@ -3592,7 +3606,7 @@ def _render_ddl_diff(ui: object, source_ddl: str, target_ddl: str) -> None:
                 expand_language="PostgreSQL",
             )
         with ui.row().classes("w-full gap-0 no-wrap items-stretch"):  # type: ignore[attr-defined]
-            _render_ddl_pane(ui, source_ddl, language="MySQL", divider=True)
+            _render_ddl_pane(ui, source_ddl, language=source_engine, divider=True)
             _render_ddl_pane(ui, target_ddl, language="PostgreSQL", divider=False)
 
 
@@ -3603,6 +3617,7 @@ def _render_editable_target(
     on_apply_object: Optional[Callable[[str], object]] = None,
     extra_actions: Optional[Callable[[], None]] = None,
     read_only_caption: Optional[str] = None,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> None:
     """Render the source/target DDL diff with an inline Edit toggle.
 
@@ -3665,7 +3680,9 @@ def _render_editable_target(
                     ui.label(read_only_caption).classes(  # type: ignore[attr-defined]
                         "text-xs text-gray-500"
                     )
-                _render_ddl_diff(ui, preview.source_ddl, current)
+                _render_ddl_diff(
+                    ui, preview.source_ddl, current, source_type=source_type
+                )
                 ui.separator().classes("mt-1")  # type: ignore[attr-defined]
                 with ui.row().classes("items-center gap-2 w-full no-wrap"):  # type: ignore[attr-defined]
                     ui.button(  # type: ignore[attr-defined]

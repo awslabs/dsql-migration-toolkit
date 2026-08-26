@@ -460,7 +460,11 @@ def build_connect_page(
             build_connection_error_chat_system,
         )
 
-        label = "source (MySQL)" if side == "source" else "target (Aurora DSQL)"
+        if side == "source":
+            _word = "PostgreSQL" if _engine["type"] is SourceType.POSTGRES else "MySQL"
+            label = f"source ({_word})"
+        else:
+            label = "target (Aurora DSQL)"
         system = build_connection_error_chat_system(
             side=side, coordinates=coordinates, error_message=detail
         )

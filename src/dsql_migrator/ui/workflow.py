@@ -1551,6 +1551,11 @@ def build_workflow_sidebar(
         if streamer is None:
             ai_panel.toggle()  # AI enabled but no streamer available; just open blank
             return
+        # Source-aware engine word (MySQL/PostgreSQL), derived like build_migration_diagram.
+        source_type = getattr(
+            getattr(state, "source_config", None), "source_type", SourceType.MYSQL
+        )
+        engine_word = _SOURCE_ENGINE_WORD.get(source_type, "MySQL")
         ai_panel.open_scope(
             scope_id="readiness",
             title="AI DBA",
@@ -1558,8 +1563,8 @@ def build_workflow_sidebar(
             chip="Migration readiness",
             streamer=streamer,
             seed_question=(
-                "Given where I am in this MySQL → Aurora DSQL migration, what should "
-                "I do next, and what are my top risks right now? Use your tools to "
+                f"Given where I am in this {engine_word} → Aurora DSQL migration, what "
+                "should I do next, and what are my top risks right now? Use your tools to "
                 "check my real assessment, schema conversion, data-load, CDC health "
                 "(DLQ poison records, schema drift, a stalled sink) and validation "
                 "state, and call out the specific objects/tables that are blocking "

@@ -34,6 +34,7 @@ from dsql_migrator.core.models import (
     ForeignKeyDef,
     IndexDef,
     SourceInventory,
+    SourceType,
     StepStatus,
     TableDef,
     TargetConnectionConfig,
@@ -2535,14 +2536,14 @@ def _browser_fn_source() -> str:
 
 
 def test_bulk_select_buttons_live_in_the_source_header() -> None:
-    """Select all / Unselect all belong on the "Source (MySQL)" header row.
+    """Select all / Unselect all belong on the source ("Source (MySQL/PostgreSQL)") header row.
 
     On their own row below the header they pushed the source filter box down, so the
     source and target panels started at different y-positions and the side-by-side
     comparison read as misaligned.
     """
     src = _browser_fn_source()
-    header_at = src.index('"Source (MySQL)"')
+    header_at = src.index("Source (")
     select_all_at = src.index('"Select all"')
     filter_at = src.index('placeholder="Filter objects by name"')
     # The bulk buttons come AFTER the header label and BEFORE the filter input...
@@ -2868,6 +2869,32 @@ def test_ddl_comparison_renders_each_side_in_its_own_dialect() -> None:
     assert "Target — Aurora DSQL" in ui.labels
 
 
+def test_ddl_comparison_labels_and_highlights_a_postgres_source_as_postgres() -> None:
+    """A PostgreSQL source pane must read as PostgreSQL, not be mislabeled as MySQL.
+
+    The left "source" pane holds the session source's DDL; for a PostgreSQL source it
+    must be titled "Source — PostgreSQL" and syntax-highlighted with the PostgreSQL
+    CodeMirror language (the same id the DSQL/target pane uses), not "MySQL".
+    """
+    from dsql_migrator.ui.schema_conversion import _render_ddl_diff
+
+    ui = _DdlPaneUi()
+    _render_ddl_diff(
+        ui,
+        'CREATE TABLE "t" ("id" integer)',
+        'CREATE TABLE "t" ("id" INT)',
+        source_type=SourceType.POSTGRES,
+    )
+
+    assert len(ui.editors) == 2, ui.editors
+    source, target = ui.editors
+    assert source["language"] == "PostgreSQL", source
+    assert target["language"] == "PostgreSQL", target
+    assert "Source — PostgreSQL" in ui.labels
+    assert "Source — MySQL" not in ui.labels
+    assert "Target — Aurora DSQL" in ui.labels
+
+
 def test_ddl_panes_do_not_wrap_lines() -> None:
     # One logical line stays one line and the editor scrolls horizontally, as a Markdown
     # fence and every editor do. Wrapping is what split ``'cancelled')`` mid-token before.
@@ -3061,8 +3088,9 @@ def test_each_ddl_pane_offers_an_expand_to_a_content_sized_dialog() -> None:
 
     src = inspect.getsource(schema_conversion._render_ddl_diff)
     # Both panes opt in, each with its own dialect so the expanded view highlights the same
-    # way the pane did.
-    assert 'expand_language="MySQL"' in src, src
+    # way the pane did. The source pane's dialect follows the session's source engine
+    # (MySQL or PostgreSQL) via ``source_engine``; the target is always DSQL (PostgreSQL).
+    assert "expand_language=source_engine" in src, src
     assert 'expand_language="PostgreSQL"' in src, src
 
     expand = inspect.getsource(schema_conversion._render_expand_ddl_button)

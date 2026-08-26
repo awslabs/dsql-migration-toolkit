@@ -2299,44 +2299,71 @@ def _render_cdc_infra_deploy_action(
     _sync_gate()
 
 def _render_cdc_least_privilege_note(ui, *, session=None) -> None:
-    """Recommend a dedicated least-privilege CDC MySQL user before deploy.
+    """Recommend a dedicated least-privilege CDC source user before deploy.
 
     When the source was connected with a username/password, those exact
     credentials are stored in Secrets Manager and injected into the live Debezium
     connector. If the operator connected as root/admin, that over-privileged
     credential becomes long-lived. This collapsible note recommends a dedicated
-    CDC user with only the grants Debezium needs and shows a copyable snippet.
+    CDC user with only the grants Debezium needs and shows a copyable snippet
+    (engine-appropriate: a MySQL user or a PostgreSQL role).
     Shown only for password auth (an SM-auth source already chose its own secret).
     """
     if getattr(session, "source_secret_id", None):
         return  # SM auth -- the customer manages their own credential.
+    is_pg = _cdc_source_type(session) is SourceType.POSTGRES
     with ui.expansion(  # type: ignore[attr-defined]
         "Recommended: use a dedicated least-privilege CDC user",
         icon="security",
         value=False,
     ).classes(f"w-full {EXPANSION_PANEL_CLASSES}").props("expand-separator"):
-        ui.label(  # type: ignore[attr-defined]
-            "The username/password you connected with will be stored in AWS "
-            "Secrets Manager and used by the CDC connector. Avoid using an "
-            "admin/root account: create a dedicated MySQL user granted only what "
-            "Debezium needs, reconnect on the Connect step as that user, then "
-            "deploy. This limits blast radius if the secret is ever exposed."
-        ).classes("text-xs text-gray-600")
-        ui.code(  # type: ignore[attr-defined]
-            "CREATE USER 'dsql_cdc'@'%' IDENTIFIED BY '<strong-password>';\n"
-            "GRANT SELECT, RELOAD, SHOW DATABASES,\n"
-            "      REPLICATION SLAVE, REPLICATION CLIENT,\n"
-            "      LOCK TABLES\n"
-            "  ON *.* TO 'dsql_cdc'@'%';\n"
-            "FLUSH PRIVILEGES;",
-            language="sql",
-        ).classes("w-full text-xs")
-        ui.label(  # type: ignore[attr-defined]
-            "RELOAD + LOCK TABLES are used only for the consistent initial "
-            "snapshot; SELECT reads table data; REPLICATION SLAVE/CLIENT read the "
-            "binlog. Scope the grant to specific schemas instead of *.* if your "
-            "policy requires it."
-        ).classes("text-xs text-gray-500")
+        if is_pg:
+            ui.label(  # type: ignore[attr-defined]
+                "The username/password you connected with will be stored in AWS "
+                "Secrets Manager and used by the CDC connector. Avoid using a "
+                "superuser account: create a dedicated PostgreSQL role granted "
+                "only what Debezium needs, reconnect on the Connect step as that "
+                "role, then deploy. This limits blast radius if the secret is "
+                "ever exposed."
+            ).classes("text-xs text-gray-600")
+            ui.code(  # type: ignore[attr-defined]
+                "CREATE ROLE debezium WITH LOGIN REPLICATION PASSWORD '<strong-password>';\n"
+                "GRANT USAGE ON SCHEMA public TO debezium;\n"
+                "GRANT SELECT ON ALL TABLES IN SCHEMA public TO debezium;\n"
+                "CREATE PUBLICATION dbz_publication FOR TABLE <schema>.<table>;",
+                language="sql",
+            ).classes("w-full text-xs")
+            ui.label(  # type: ignore[attr-defined]
+                "REPLICATION lets Debezium read the WAL; SELECT reads table data "
+                "for the initial snapshot. Debezium also needs the publication "
+                "above (CREATE PUBLICATION FOR TABLE) and logical decoding enabled "
+                "on the server: set wal_level=logical (on RDS/Aurora, set the "
+                "rds.logical_replication=1 parameter and reboot). Scope the grant "
+                "to specific schemas if your policy requires it."
+            ).classes("text-xs text-gray-500")
+        else:
+            ui.label(  # type: ignore[attr-defined]
+                "The username/password you connected with will be stored in AWS "
+                "Secrets Manager and used by the CDC connector. Avoid using an "
+                "admin/root account: create a dedicated MySQL user granted only what "
+                "Debezium needs, reconnect on the Connect step as that user, then "
+                "deploy. This limits blast radius if the secret is ever exposed."
+            ).classes("text-xs text-gray-600")
+            ui.code(  # type: ignore[attr-defined]
+                "CREATE USER 'dsql_cdc'@'%' IDENTIFIED BY '<strong-password>';\n"
+                "GRANT SELECT, RELOAD, SHOW DATABASES,\n"
+                "      REPLICATION SLAVE, REPLICATION CLIENT,\n"
+                "      LOCK TABLES\n"
+                "  ON *.* TO 'dsql_cdc'@'%';\n"
+                "FLUSH PRIVILEGES;",
+                language="sql",
+            ).classes("w-full text-xs")
+            ui.label(  # type: ignore[attr-defined]
+                "RELOAD + LOCK TABLES are used only for the consistent initial "
+                "snapshot; SELECT reads table data; REPLICATION SLAVE/CLIENT read the "
+                "binlog. Scope the grant to specific schemas instead of *.* if your "
+                "policy requires it."
+            ).classes("text-xs text-gray-500")
 
 def _render_cdc_delete_action(
     ui, migration_state, job_manager, refresh, *, session=None
@@ -2458,11 +2485,12 @@ def _render_cdc_infra_form(
                 placeholder=placeholder,
             ).classes("w-full text-sm")
 
-            # The connector must reach the source MySQL privately, so the source's
-            # own VPC (or one with private connectivity to it) is the safe default.
+            # The connector must reach the source database privately, so the
+            # source's own VPC (or one with private connectivity to it) is the
+            # safe default.
             if key == "vpc_id":
                 ui.label(  # type: ignore[attr-defined]
-                    "Recommended: the same VPC as your source MySQL (or one with "
+                    "Recommended: the same VPC as your source database (or one with "
                     "private connectivity to it) — the connector must reach the "
                     "source privately."
                 ).classes("w-full text-xs text-gray-500")
@@ -2571,7 +2599,7 @@ def cdc_deploy_connection_blocker(session) -> Optional[str]:
         return None
     if not getattr(session, "has_source", lambda: False)():
         return (
-            "The source (MySQL) connection is not active. Open the Connect step "
+            "The source connection is not active. Open the Connect step "
             "and test the source connection, then return here to deploy."
         )
     if getattr(session, "source_password", None) is None:

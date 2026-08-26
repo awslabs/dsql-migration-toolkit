@@ -1155,7 +1155,7 @@ def build_page(
     build_workflow_sidebar(
         SESSION_STORE,
         session_id,
-        app_title="MySQL to Aurora DSQL Migration Tool",
+        app_title="Aurora DSQL Migration Tool",
         version=__version__,
         connect_builder=lambda go_to_first_step, on_connection_change: (
             build_connect_page(

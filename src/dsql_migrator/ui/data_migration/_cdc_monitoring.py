@@ -1737,7 +1737,7 @@ def _render_cdc_lob_exclusion_panel(
             icon="data_object",
             header="No oversized LOB columns",
             body=(
-                "No MySQL LOB/TEXT columns in the selected tables can exceed the "
+                "No LOB/TEXT columns in the selected tables can exceed the "
                 f"Aurora DSQL {_DSQL_VALUE_LIMIT_MIB} MiB value limit — nothing "
                 "needs excluding from "
                 + ("this migration." if migration_wide else "CDC capture.")

@@ -5944,6 +5944,31 @@ def test_migration_type_tiles_surface_cdc_requirements_upfront() -> None:
     ].when
 
 
+def test_migration_type_requirements_are_source_aware() -> None:
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import (
+        MigrationType,
+        migration_type_requirements,
+    )
+
+    # The CDC requirement names the source's change stream, which differs by engine.
+    for mt in (MigrationType.CDC_ONLY, MigrationType.FULL_LOAD_AND_CDC):
+        mysql = migration_type_requirements(mt, SourceType.MYSQL)
+        assert "MSK" in mysql and "binlog" in mysql.lower() and "ROW" in mysql
+        # PostgreSQL: logical replication / pgoutput publication -- never MySQL binlog.
+        pg = migration_type_requirements(mt, SourceType.POSTGRES)
+        assert "MSK" in pg
+        assert "logical replication" in pg.lower() and "pgoutput" in pg
+        assert "binlog" not in pg.lower()
+        # Unknown/default engine falls back to the MySQL wording (the static baseline).
+        assert migration_type_requirements(mt) == mysql
+
+    # Non-CDC types have no change-stream requirement for either engine.
+    for st in (SourceType.MYSQL, SourceType.POSTGRES):
+        note = migration_type_requirements(MigrationType.FULL_LOAD_ONLY, st)
+        assert "MSK" not in note and "binlog" not in note.lower()
+
+
 # ---------------------------------------------------------------------------
 # migration_type_locked -- the type is frozen once a migration has started
 # ---------------------------------------------------------------------------
@@ -8736,6 +8761,32 @@ def test_least_privilege_note_hidden_for_sm_auth() -> None:
     _render_cdc_least_privilege_note(ui, session=sess)
     # SM-auth source manages its own credential -> no nudge, nothing rendered.
     assert ui.texts == []
+
+
+def test_least_privilege_note_postgres_shows_role_and_publication() -> None:
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+    from dsql_migrator.ui.data_migration import _render_cdc_least_privilege_note
+
+    ui = _RecordingUi()
+    sess = type(
+        "S",
+        (),
+        {
+            "source_secret_id": None,
+            "source_config": SourceConnectionConfig(
+                host="pg", database="app", source_type=SourceType.POSTGRES
+            ),
+        },
+    )()
+    _render_cdc_least_privilege_note(ui, session=sess)
+    blob = "\n".join(ui.texts)
+    # PostgreSQL guidance: a role + WAL/publication + logical decoding -- NOT MySQL grants.
+    assert "least-privilege" in blob.lower() or "dedicated" in blob.lower()
+    assert "CREATE ROLE debezium" in blob
+    assert "CREATE PUBLICATION" in blob
+    assert "wal_level=logical" in blob
+    assert "REPLICATION SLAVE" not in blob
+    assert "CREATE USER" not in blob
 
 
 # --- DataMigrationState.set_cdc_stack_name: validated, multi-DB names --------

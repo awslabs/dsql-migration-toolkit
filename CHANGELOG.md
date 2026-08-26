@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.398
+
+### Changed
+
+- **Engine-neutral UI for a PostgreSQL source.** The in-app header is now **Aurora DSQL
+  Migration Tool** (was "MySQL to Aurora DSQL Migration Tool"), and the remaining
+  MySQL-only UI copy is now source-aware so a PostgreSQL source no longer sees MySQL
+  wording: the CDC migration-type requirements and least-privilege setup (PostgreSQL
+  logical replication — `CREATE ROLE … REPLICATION` + a `pgoutput` publication — vs
+  MySQL binlog ROW mode + `REPLICATION` grants), the CDC connector / "types converted"
+  labels, the **Cut over** runbook, and the **Schema Conversion** source pane (its label
+  and syntax highlighting follow the source engine). The source **Port** field already
+  defaulted per engine (3306 / 5432). (The Query Converter stays MySQL-only for now — its
+  conversion engine is MySQL-specific.)
+
 ## v0.1.397
 
 ### Changed

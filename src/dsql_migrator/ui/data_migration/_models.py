@@ -1382,7 +1382,7 @@ class ConnectorHealthRow:
     state: str
     tone: str
     detail: str
-    # User-friendly role label (e.g. "Source (MySQL -> Kafka)") derived from the
+    # User-friendly role label (e.g. "Source (-> Kafka)") derived from the
     # connector name; ``name`` keeps the raw connector id for reference/debug.
     label: str = ""
 
@@ -1395,17 +1395,19 @@ _BAD_CONNECTOR_STATES = frozenset({"FAILED"})
 def connector_role_label(name: str) -> str:
     """Map a raw MSK Connect connector name to a user-friendly role label.
 
-    The pipeline is MySQL -> Debezium source -> Kafka/MSK -> custom DSQL sink, so
-    a name containing "source"/"debezium" is the source and one containing
+    The pipeline is source DB -> Debezium source -> Kafka/MSK -> custom DSQL sink,
+    so a name containing "source"/"debezium" is the source and one containing
     "sink" is the sink. The explicit "source"/"sink" tokens are checked first
     because the source connector name also contains "dsql" (e.g.
     ``mysql-dsql-cdc-spike-debezium-source``), which would otherwise misclassify it.
-    Falls back to the raw name when the role can't be inferred, so an unexpected
-    connector is never hidden.
+    The label stays engine-neutral (the connector name follows the tool's
+    ``mysql-dsql-*`` convention regardless of the actual source engine, so it can't
+    be used to name MySQL vs. PostgreSQL). Falls back to the raw name when the role
+    can't be inferred, so an unexpected connector is never hidden.
     """
     lowered = name.lower()
     if "source" in lowered or "debezium" in lowered:
-        return "Source (MySQL → Kafka)"
+        return "Source (→ Kafka)"
     if "sink" in lowered or "dsql" in lowered:
         return "Sink (Kafka → Aurora DSQL)"
     return name
@@ -1427,7 +1429,7 @@ def connector_health_rows(
     and rows are ordered Source-then-Sink (data-flow order), not by raw name.
     Returns ``[]`` when no connector states are reported.
     """
-    # Order by data flow: Source (MySQL->Kafka) before Sink (Kafka->DSQL), then
+    # Order by data flow: Source (-> Kafka) before Sink (Kafka -> DSQL), then
     # by name for any extra/unknown connectors.
     def _flow_key(connector_name: str) -> tuple:
         label = connector_role_label(connector_name)
@@ -1508,9 +1510,9 @@ def cdc_handling_facts() -> list[CdcHandlingFact]:
         ),
         CdcHandlingFact(
             handled=True,
-            title="MySQL types are converted for DSQL",
+            title="Source types are converted for DSQL",
             detail=(
-                "Column types (e.g. ENUM, JSON, DATETIME, generated columns) are "
+                "Column types (e.g. ENUM, JSON, date/time, generated columns) are "
                 "mapped to their DSQL-compatible target types automatically."
             ),
             evidence="H8",
@@ -1893,6 +1895,28 @@ _MIGRATION_TYPE_META: dict[MigrationType, _MigrationTypeMeta] = {
         ),
     ),
 }
+
+
+def migration_type_requirements(
+    mt: MigrationType, source_type: SourceType = SourceType.MYSQL
+) -> str:
+    """Source-aware upfront requirements note for a migration-type tile.
+
+    CDC needs the source's change stream enabled, and how that is enabled differs
+    by engine: MySQL's binlog in ROW mode vs. PostgreSQL logical replication
+    (``wal_level=logical`` + a ``pgoutput`` publication). Non-CDC types keep their
+    static note (no such requirement). Defaults to the MySQL wording baked into
+    ``_MIGRATION_TYPE_META`` when the engine is unknown, so existing MySQL callers
+    are unchanged and only a PostgreSQL source gets the re-worded requirement --
+    the same source-aware pattern used elsewhere in the CDC flow.
+    """
+    meta = _MIGRATION_TYPE_META[mt]
+    if mt not in _CDC_MIGRATION_TYPES or source_type is not SourceType.POSTGRES:
+        return meta.requirements
+    return (
+        "Needs a managed MSK pipeline and the source's change stream enabled — "
+        "PostgreSQL logical replication (wal_level=logical + a pgoutput publication)."
+    )
 
 
 # The Evaluation rule whose finding only matters once CDC is in scope: foreign keys

@@ -986,7 +986,9 @@ def build_validation_scope(
         source_label = f"Source · {database}"
         source_detail = source_config.host
     else:
-        source_label = "Source MySQL"
+        # Engine-neutral: with no source connected we can't know MySQL vs PostgreSQL,
+        # so mirror the sibling "Target Aurora DSQL" fallback and just say "Source".
+        source_label = "Source"
         source_detail = "not connected"
 
     if target_config is not None:
@@ -1039,6 +1041,24 @@ def _cdc_in_use(session: object) -> bool:
         )
     except Exception:  # noqa: BLE001 - decorative; never break the page
         return False
+
+
+def _source_engine_word(session: object) -> str:
+    """Return the source engine's display word ("PostgreSQL" / "MySQL").
+
+    The cut-over runbook names the source engine ("your app stops writing to
+    MySQL", "keep the MySQL source frozen") — copy that is wrong for a PostgreSQL
+    source. Derive the word from the session's source config; default to "MySQL"
+    (the original/most common source, matching :class:`SourceType`'s own default)
+    if the source type cannot be resolved, so the runbook is never left blank.
+    """
+    try:
+        source_config = getattr(session, "source_config", None)
+        if source_config is not None and source_config.source_type is SourceType.POSTGRES:
+            return "PostgreSQL"
+    except Exception:  # noqa: BLE001 - decorative; never break the page
+        pass
+    return "MySQL"
 
 
 def cutover_ai_facts(
@@ -2589,13 +2609,14 @@ def build_cutover_screen(
             )
 
     def content(refresh: Callable[[], None]) -> None:
+        engine = _source_engine_word(session)
         with _section(ui, icon="rocket_launch", title="Cut over to Aurora DSQL"):
             render_notice(
                 ui,
                 tone="info",
                 header="The final step is yours to perform",
                 body=(
-                    "Cut-over is the moment your application stops writing to MySQL "
+                    f"Cut-over is the moment your application stops writing to {engine} "
                     "and starts using Aurora DSQL. The tool has done its job — read "
                     "the source, converted the schema, loaded the data, and proven "
                     "consistency — but repointing your application is an operational "
@@ -2692,7 +2713,8 @@ def build_cutover_screen(
             )
             summary = summary or _cutover_summary_for_preview()
             _render_cutover_section(
-                ui, summary, drift, cdc_in_use=_cdc_in_use(session)
+                ui, summary, drift,
+                cdc_in_use=_cdc_in_use(session), source_engine=engine,
             )
             return
 
@@ -2786,6 +2808,7 @@ def build_cutover_screen(
         _render_cutover_section(
             ui, summary, drift,
             cdc_in_use=_cdc_in_use(session),
+            source_engine=engine,
             identity_sync_provider=_identity_sync_provider,
             identity_sync_result=validation_state.cutover_identity_sync,
             identity_sync_failed=validation_state.cutover_identity_sync_failed,
@@ -3862,6 +3885,7 @@ def _render_recovery_section(
 def _render_cutover_section(
     ui: object, summary: ValidationSummary, drift: DriftDisplay, *,
     cdc_in_use: bool = False,
+    source_engine: str = "MySQL",
     identity_sync_provider: "Optional[Callable[[], None]]" = None,
     identity_sync_result: "Optional[dict[str, int]]" = None,
     identity_sync_failed: "Optional[dict[str, str]]" = None,
@@ -3891,8 +3915,8 @@ def _render_cutover_section(
             tone="success",
             header="Validation passed — you're ready to switch your app to DSQL",
             body=(
-                "Cut-over is the moment your application stops writing to MySQL and "
-                "starts using Aurora DSQL. The tool has proven the target is "
+                f"Cut-over is the moment your application stops writing to {source_engine} "
+                "and starts using Aurora DSQL. The tool has proven the target is "
                 "consistent; repointing the application is the final operational "
                 "step, and only you can do it. Follow the runbook below for a safe "
                 "switch with a rollback path."
@@ -3904,15 +3928,17 @@ def _render_cutover_section(
                  "status until replication lag is at (or near) zero — DSQL is "
                  "tracking the source's live writes."),
                 ("2", "Freeze writes on the source: briefly put your application in "
-                 "read-only / maintenance mode so MySQL stops taking new writes."),
+                 f"read-only / maintenance mode so {source_engine} stops taking new "
+                 "writes."),
                 ("3", "Wait for the final drain: let CDC apply the last in-flight "
-                 "change events until lag is zero again. MySQL and DSQL now hold "
-                 "the same rows."),
+                 f"change events until lag is zero again. {source_engine} and DSQL now "
+                 "hold the same rows."),
                 ("4", "Re-run validation here for the final go/no-go — do this AFTER "
                  "the drain (step 3). Cut over only on a clean MATCH (or differences "
-                 "you can fully explain). This final run also advances any identity "
-                 "(AUTO_INCREMENT) sequence past the rows CDC delivered, so the app's "
-                 "first insert after cut-over cannot collide with a migrated id."),
+                 "you can fully explain). This final run also advances any "
+                 "auto-generated / identity key sequence past the rows CDC delivered, "
+                 "so the app's first insert after cut-over cannot collide with a "
+                 "migrated id."),
                 ("5", "Repoint your application to the Aurora DSQL endpoint "
                  "(PostgreSQL wire, IAM-token auth — no password) and smoke-test "
                  "the critical read/write paths."),
@@ -3928,7 +3954,7 @@ def _render_cutover_section(
             steps = (
                 ("1", "Freeze writes on the source: put your application in "
                  "read-only / maintenance mode so no new rows are written to "
-                 "MySQL while you switch."),
+                 f"{source_engine} while you switch."),
                 ("2", "If the source took writes since the snapshot, re-run Full "
                  "Load once more (it's idempotent — only fills the unfinished "
                  "work, never duplicates), then re-run validation here."),
@@ -4035,12 +4061,12 @@ def _render_cutover_section(
             tone="info",
             header="Keep the source as your rollback anchor",
             body=(
-                "Until you've signed off on DSQL, keep the MySQL source frozen "
-                "(read-only) rather than dropping it. Before you repoint, rollback "
-                "is trivial — the source is untouched and still authoritative. "
+                f"Until you've signed off on DSQL, keep the {source_engine} source "
+                "frozen (read-only) rather than dropping it. Before you repoint, "
+                "rollback is trivial — the source is untouched and still authoritative. "
                 "After the application writes to DSQL, those new rows live only on "
-                "DSQL (this tool replicates MySQL -> DSQL, not the reverse), so "
-                "rolling back then means reconciling them yourself first."
+                f"DSQL (this tool replicates {source_engine} -> DSQL, not the reverse), "
+                "so rolling back then means reconciling them yourself first."
             ),
         )
 

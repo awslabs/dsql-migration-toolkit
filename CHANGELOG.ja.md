@@ -5,6 +5,19 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.398
+
+### 変更 (Changed)
+
+- **PostgreSQL ソース向けのエンジン中立 UI。** アプリのヘッダーが **Aurora DSQL Migration Tool**
+  になり(旧 "MySQL to Aurora DSQL Migration Tool")、残っていた MySQL 専用の UI 文言をソース対応に
+  し、PostgreSQL ソースで MySQL 文言が表示されないようにしました: CDC の移行タイプ要件と最小権限
+  セットアップ(PostgreSQL 論理レプリケーション — `CREATE ROLE … REPLICATION` + `pgoutput`
+  publication — と、MySQL binlog ROW モード + `REPLICATION` 権限)、CDC コネクタ /「型変換」ラベル、
+  **Cut over** ランブック、**Schema Conversion** のソースペイン(ラベルと構文ハイライトがソース
+  エンジンに追従)。ソースの **Port** フィールドは既にエンジン別の既定値(3306 / 5432)でした。
+  (Query Converter は変換エンジンが MySQL 専用のため当面据え置き。)
+
 ## v0.1.397
 
 ### 変更 (Changed)

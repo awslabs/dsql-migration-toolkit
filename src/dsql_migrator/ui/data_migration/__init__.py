@@ -180,6 +180,7 @@ from dsql_migrator.ui.data_migration._models import (
     should_pin_cdc_substep,
     _MigrationTypeMeta,
     _MIGRATION_TYPE_META,
+    migration_type_requirements,
     MigrationProgress,
     summarize_progress,
     build_full_load_status_view,
@@ -744,9 +745,11 @@ def build_data_migration_screen(
                 # so a lock can never appear without its reason.
                 locked=_type_lock_reason is not None,
                 lock_reason=_type_lock_reason,
-                # Gate the CDC tiles by source engine: PostgreSQL CDC is not yet
-                # available, so its CDC tiles render disabled (Full load only stays
-                # selectable) rather than deploying a MySQL connector against PG.
+                # Gate the CDC tiles by source engine. MySQL and PostgreSQL both
+                # support CDC now (PG via pgoutput logical replication -> MSK -> DSQL
+                # sink), so all three tiles are enabled for them; the gate stays as a
+                # defensive default that would disable the CDC tiles for any future
+                # engine whose CDC path is not shipped.
                 source_type=(
                     session.source_config.source_type
                     if session.source_config is not None
@@ -2562,13 +2565,16 @@ def _render_migration_type_selector(
                     # warning/error color -- so it reads as a heads-up at decision
                     # time, not an alarm before anything has run. The icon still
                     # distinguishes "needs infra" (info) from "no extra infra"
-                    # (check_circle), but both use the same quiet tone.
-                    needs_infra = "MSK" in meta.requirements
+                    # (check_circle), but both use the same quiet tone. The CDC
+                    # requirement is source-aware (MySQL binlog vs. PostgreSQL logical
+                    # replication), so a PG source never sees MySQL-only wording.
+                    requirements = migration_type_requirements(mt, source_type)
+                    needs_infra = "MSK" in requirements
                     with ui.row().classes("items-start gap-1 no-wrap mt-1"):  # type: ignore[attr-defined]
                         ui.icon(  # type: ignore[attr-defined]
                             "info" if needs_infra else "check_circle",
                         ).classes("text-gray-500 text-xs mt-0.5")
-                        ui.label(meta.requirements).classes("text-xs text-gray-500")
+                        ui.label(requirements).classes("text-xs text-gray-500")
     if running:
         ui.label(  # type: ignore[attr-defined]
             "Migration type is locked once the migration has started."
@@ -3426,6 +3432,7 @@ __all__ = [
     "MigrationType",
     "source_supports_cdc",
     "prereq_mode_for_type",
+    "migration_type_requirements",
     "substeps_for_type",
     "resolve_active_substep_for_type",
     "prerequisites_section_expanded",

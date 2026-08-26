@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.398
+
+### 변경 (Changed)
+
+- **PostgreSQL 소스에 맞춘 엔진 중립 UI.** 앱 헤더가 **Aurora DSQL Migration Tool**로 바뀌었고
+  (기존 "MySQL to Aurora DSQL Migration Tool"), 남아 있던 MySQL 전용 UI 문구를 소스 인지형으로
+  바꿔 PostgreSQL 소스에서 더 이상 MySQL 문구가 보이지 않습니다: CDC 마이그레이션 타입 요구사항과
+  최소권한 설정(PostgreSQL 논리 복제 — `CREATE ROLE … REPLICATION` + `pgoutput` publication — vs
+  MySQL binlog ROW 모드 + `REPLICATION` 권한), CDC 커넥터 / "타입 변환" 라벨, **Cut over** 런북,
+  **Schema Conversion** 소스 패널(라벨·구문 강조가 소스 엔진을 따름). 소스 **Port** 필드는 이미
+  엔진별 기본값(3306 / 5432)이었습니다. (Query Converter는 변환 엔진이 MySQL 전용이라 당분간 유지.)
+
 ## v0.1.397
 
 ### 변경 (Changed)

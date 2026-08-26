@@ -1914,6 +1914,59 @@ def test_cutover_section_cdc_includes_drain_and_teardown() -> None:
     assert "rollback" in blob.lower()
 
 
+def test_source_engine_word_maps_source_type() -> None:
+    # The cut-over runbook names the source engine ("stops writing to MySQL");
+    # a PostgreSQL source must get "PostgreSQL", and an unresolvable source falls
+    # back to "MySQL" (SourceType's own default) so the copy is never blank.
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+    from dsql_migrator.ui.validation import _source_engine_word
+
+    def _session(stype):
+        return SimpleNamespace(
+            source_config=SourceConnectionConfig(
+                host="h", database="d", source_type=stype,
+            )
+        )
+
+    assert _source_engine_word(_session(SourceType.POSTGRES)) == "PostgreSQL"
+    assert _source_engine_word(_session(SourceType.MYSQL)) == "MySQL"
+    # No source config / unresolvable session -> default "MySQL", never blank.
+    assert _source_engine_word(SimpleNamespace(source_config=None)) == "MySQL"
+    assert _source_engine_word(object()) == "MySQL"
+
+
+def test_cutover_section_names_source_engine_for_postgres() -> None:
+    # Engine-aware runbook: with a PostgreSQL source the freeze/rollback copy must
+    # say "PostgreSQL", not the hardcoded "MySQL".
+    from dsql_migrator.ui.validation import _render_cutover_section
+
+    ui = _CutoverUi()
+    _render_cutover_section(
+        ui, _cutover_summary(), _no_drift(),
+        cdc_in_use=False, source_engine="PostgreSQL",
+    )
+    blob = " ".join(ui.texts)
+    assert "PostgreSQL" in blob
+    assert "MySQL" not in blob  # no hardcoded MySQL leaks through
+
+    # CDC path: the drain/freeze steps also carry the engine word.
+    ui_cdc = _CutoverUi()
+    _render_cutover_section(
+        ui_cdc, _cutover_summary(), _no_drift(),
+        cdc_in_use=True, source_engine="PostgreSQL",
+    )
+    cdc_blob = " ".join(ui_cdc.texts)
+    assert "PostgreSQL and DSQL now" in cdc_blob
+    assert "MySQL" not in cdc_blob
+
+    # Default (MySQL) still reads "MySQL".
+    ui_my = _CutoverUi()
+    _render_cutover_section(ui_my, _cutover_summary(), _no_drift(), cdc_in_use=False)
+    assert "MySQL" in " ".join(ui_my.texts)
+
+
 def test_cdc_in_use_resolves_from_migration_type() -> None:
     from dsql_migrator.ui.data_migration import MigrationType
     from dsql_migrator.ui.validation import _cdc_in_use
