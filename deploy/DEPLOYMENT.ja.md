@@ -169,9 +169,68 @@ VPC 内から — VPN、Direct Connect、または SSM ポートフォワード�
 
 ### 2. app-stack のデプロイ
 
-`deploy/cloudformation.yaml` をデプロイする 2 つの方法があります — いずれか 1 つを
+`deploy/cloudformation.yaml` をデプロイする 3 つの方法があります — いずれか 1 つを
 選んでください。どちらも同じスタックを作成します。パラメータのリファレンスは
 **パラメータリファレンス** セクションにあります。
+
+#### 最も簡単 — AI コーディングエージェントにデプロイさせる
+
+シェルアクセスを持つ AI コーディングエージェント — **Claude Code、Kiro、Cursor、
+あるいは AWS CLI を実行できる任意のエージェント** — を使っている場合は、このデプロイ
+全体をエージェントに任せられます。エージェントはこのガイドを読み、**ほとんどの
+パラメータをご自身の AWS アカウントから発見し**（リージョン、VPC、サブネット、DSQL
+クラスター ARN、ソース DB のセキュリティグループとポート）、本当に判断が必要な数点
+だけをあなたに尋ね、その後 CloudFormation デプロイを実行して URL を出力します。これは
+最もミスの少ない経路です: 手動デプロイで最もつまずきやすいサブネット/AZ の選択、
+`--s3-bucket` によるテンプレートのステージング、スタック名の制限、`CAPABILITY_NAMED_IAM`
+フラグを、エージェントが処理します — **MySQL でも PostgreSQL** でもソースを問わず同様に。
+
+**必要なもの:** エージェントを向けたクローン済みのリポジトリと、ターゲットの Aurora
+DSQL クラスターのアカウント・リージョンに対して**エージェントのシェルで使える AWS
+認証情報**（`aws sts get-caller-identity` が成功すること）。
+
+**このプロンプトをエージェントに貼り付けてください**（2 つの空欄を埋める）:
+
+```text
+deploy/DEPLOYMENT.md（「Deploy on ECS Fargate」）に従って、このリポジトリの ECS Fargate
+app-stack（deploy/cloudformation.yaml）を私の AWS アカウントにデプロイしてください。
+
+ターゲットの Aurora DSQL クラスター: <DSQL cluster ARN or endpoint>
+ソースデータベース: <RDS/Aurora identifier — or "I'll enter it in the UI later">
+
+手順:
+1. deploy/DEPLOYMENT.md と deploy/cloudformation.yaml のパラメータを読む。
+2. 可能な限り、尋ねずに（読み取り専用で）発見する: DSQL の ARN/エンドポイントから
+   リージョンを導出する; ソース DB の VpcId を見つける; その VPC 内の異なる AZ にある
+   2 つのサブネットを AlbSubnetIds と ServiceSubnetIds として選ぶ（ルートテーブルで
+   パブリックかプライベートかを分類する）; ソース DB のセキュリティグループ id
+   （SourceDbSecurityGroupId）とポート（SourceDbPort: MySQL は 3306、PostgreSQL は 5432）を
+   見つける; DsqlClusterArn を確認する。
+3. ACM 証明書がない場合は deploy/create_test_cert.sh を実行し、出力される ARN を使う
+   （自己署名のテスト証明書; ブラウザは警告する — プライベート/internal ALB なら問題ない）。
+4. 解決した全パラメータセットと、正確な `aws cloudformation deploy` コマンドを私に見せ、
+   何かを作成する前に私の承認を待つ。本当に推測できないことだけを尋ねる — 主に: internal ALB
+   （VPN/ピアリングで到達）か internet-facing + Cognito ログインか、そして AI assist
+   （Amazon Bedrock）を有効にするかどうか。
+5. 私の OK が出たらデプロイする — スタック名は小文字で 28 文字以内; テンプレートは
+   --s3-bucket でステージングする（CloudFormation の 51,200 バイトのインライン上限を超えるため）;
+   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM を使う。CREATE_COMPLETE を待ってから、
+   AppUrl 出力とその到達方法を表示する（ALB はデフォルトで internal）。
+
+ガードレール: リージョンは 1 つだけ（DSQL クラスターのもの）; 作成する前に read/describe する;
+既存のリソースを変更・削除しない; すべてを本番として扱う; 曖昧な点があるか、ステップが
+失敗したら、止まって尋ねる。
+```
+
+エージェントは数点の本当の判断（internal か 公開/Cognito か、AI assist を有効にするか、
+コストの承認）を提示し、それ以外はすべて埋めます。**承認する前に、エージェントが解決した
+パラメータセットを確認してください** — エージェントがあなたの認証情報で実行する AWS の
+操作は、あなたの責任です。後で解体するには、エージェントに *「`mysql-dsql-migrator`
+スタックを削除して」* と伝えれば、[Teardown](#teardown) に従います。
+
+> これは下の 2 つの手動経路と同じ `deploy/cloudformation.yaml` を使います — エージェントは
+> パラメータを解決してデプロイを実行するだけです。手作業で行いたい場合（またはエージェントに
+> AWS アクセスがない場合）は、代わりに Console または CLI 経路を使ってください。
 
 #### 推奨 — AWS Console (ガイド付きフォーム)
 

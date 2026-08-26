@@ -172,8 +172,65 @@ every other parameter keeps a sensible default.
 
 ### 2. Deploy the app-stack
 
-Two ways to deploy `deploy/cloudformation.yaml` — pick one. Both produce the same
+Three ways to deploy `deploy/cloudformation.yaml` — pick one. All produce the same
 stack; see **Parameter reference** below.
+
+#### Easiest — let an AI coding agent deploy it
+
+If you use an AI coding agent with shell access — **Claude Code, Kiro, Cursor, or any
+agent that can run the AWS CLI** — it can drive this whole deploy for you. It reads this
+guide, **discovers most parameters from your AWS account** (region, VPC, subnets, DSQL
+cluster ARN, the source-DB security group and port), asks you only for the few real
+decisions, then runs the CloudFormation deploy and prints the URL. This is the
+least error-prone path: the agent handles the subnet/AZ picking, the `--s3-bucket`
+template staging, the stack-name limits, and the `CAPABILITY_NAMED_IAM` flag that most
+often trip up a manual deploy — for a **MySQL or PostgreSQL** source alike.
+
+**You need:** the cloned repo with the agent pointed at it, and **AWS credentials usable
+in the agent's shell** (`aws sts get-caller-identity` should succeed) for the account and
+region of your target Aurora DSQL cluster.
+
+**Paste this prompt into the agent** (fill the two blanks):
+
+```text
+Deploy this repo's ECS Fargate app-stack (deploy/cloudformation.yaml) to my AWS
+account by following deploy/DEPLOYMENT.md ("Deploy on ECS Fargate").
+
+Target Aurora DSQL cluster: <DSQL cluster ARN or endpoint>
+Source database: <RDS/Aurora identifier — or "I'll enter it in the UI later">
+
+Steps:
+1. Read deploy/DEPLOYMENT.md and the parameters in deploy/cloudformation.yaml.
+2. DISCOVER (read-only), don't ask, wherever you can: derive the region from the DSQL
+   ARN/endpoint; find the source DB's VpcId; choose AlbSubnetIds and ServiceSubnetIds
+   as 2 subnets in DISTINCT AZs within that VPC (classify public vs private by route
+   table); find the source DB's security-group id (SourceDbSecurityGroupId) and port
+   (SourceDbPort: 3306 for MySQL, 5432 for PostgreSQL); confirm the DsqlClusterArn.
+3. If I have no ACM certificate, run deploy/create_test_cert.sh and use the ARN it
+   prints (self-signed TEST cert; browsers warn — fine for a private/internal ALB).
+4. Show me the full resolved parameter set and the exact `aws cloudformation deploy`
+   command, and WAIT for my approval before creating anything. Ask me ONLY what you
+   truly can't infer — chiefly: internal ALB (reach via VPN/peering) vs internet-facing
+   + Cognito login, and whether to enable AI assist (Amazon Bedrock).
+5. On my OK, deploy — stack name lowercase and <=28 chars; stage the template with
+   --s3-bucket (it exceeds CloudFormation's 51,200-byte inline limit); use
+   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM. Wait for CREATE_COMPLETE, then
+   print the AppUrl output and how to reach it (the ALB is internal by default).
+
+Guardrails: single region only (the DSQL cluster's); read/describe before you create;
+never modify or delete existing resources; treat everything as production; stop and ask
+if anything is ambiguous or a step fails.
+```
+
+The agent surfaces the handful of real decisions (internal vs public/Cognito, whether
+to enable AI assist, cost acknowledgement) and fills in everything else. **Review the
+parameter set it resolves before you approve** — you own the AWS actions it runs on your
+credentials. To tear it down later, tell the agent *"delete the `mysql-dsql-migrator`
+stack"* and it follows [Teardown](#teardown).
+
+> This uses the same `deploy/cloudformation.yaml` as the two manual paths below — the
+> agent only resolves the parameters and runs the deploy for you. If you'd rather do it
+> by hand (or your agent lacks AWS access), use the Console or CLI path instead.
 
 #### Recommended — AWS Console (guided form)
 

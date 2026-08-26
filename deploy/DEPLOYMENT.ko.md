@@ -162,8 +162,63 @@ Well-Architected SEC05-BP02. 외부에 공개하려면 [app-stack 배포](#2-app
 
 ### 2. app-stack 배포
 
-`deploy/cloudformation.yaml`을 배포하는 두 방법 — 하나를 고른다. 둘 다 같은 스택을 만든다.
-파라미터 설명은 **파라미터 레퍼런스** 참고.
+`deploy/cloudformation.yaml`을 배포하는 세 가지 방법 — 하나를 선택한다. 셋 다 같은 스택을
+만든다. 파라미터 설명은 **파라미터 레퍼런스** 참고.
+
+#### 가장 쉬움 — AI 코딩 에이전트로 배포
+
+셸 접근이 가능한 AI 코딩 에이전트를 쓴다면 — **Claude Code, Kiro, Cursor, 또는 AWS CLI를
+실행할 수 있는 모든 에이전트** — 이 배포 전체를 대신 진행해줄 수 있습니다. 에이전트가 이
+가이드를 읽고 **대부분의 파라미터를 내 AWS 계정에서 찾아내고**(리전, VPC, 서브넷, DSQL 클러스터
+ARN, 소스 DB 보안 그룹과 포트), 진짜 결정이 필요한 몇 가지만 물은 뒤, CloudFormation 배포를
+실행하고 URL을 출력합니다. 이것이 오류가 가장 적은 경로입니다: 수동 배포에서 가장 자주 발목을
+잡는 서브넷/AZ 선택, `--s3-bucket` 템플릿 스테이징, 스택 이름 제한, `CAPABILITY_NAMED_IAM`
+플래그를 에이전트가 알아서 처리합니다 — **MySQL이든 PostgreSQL이든** 소스에 상관없이.
+
+**준비물:** 에이전트가 가리키도록 클론한 저장소, 그리고 타깃 Aurora DSQL 클러스터가 있는
+계정·리전에 대해 **에이전트 셸에서 사용 가능한 AWS 자격증명**(`aws sts get-caller-identity`가
+성공해야 함).
+
+**이 프롬프트를 에이전트에 붙여넣으세요**(빈칸 두 개를 채우세요):
+
+```text
+deploy/DEPLOYMENT.md("Deploy on ECS Fargate")를 따라 이 저장소의 ECS Fargate app-stack
+(deploy/cloudformation.yaml)을 내 AWS 계정에 배포해줘.
+
+타깃 Aurora DSQL 클러스터: <DSQL cluster ARN or endpoint>
+소스 데이터베이스: <RDS/Aurora identifier — or "I'll enter it in the UI later">
+
+단계:
+1. deploy/DEPLOYMENT.md와 deploy/cloudformation.yaml의 파라미터를 읽어.
+2. 가능한 곳은 묻지 말고 DISCOVER(읽기 전용)해: DSQL ARN/엔드포인트에서 리전을 도출하고;
+   소스 DB의 VpcId를 찾고; 그 VPC 안에서 서로 다른(DISTINCT) AZ의 서브넷 2개를 AlbSubnetIds와
+   ServiceSubnetIds로 선택하고(라우트 테이블로 public/private 분류); 소스 DB의 보안 그룹 id
+   (SourceDbSecurityGroupId)와 포트(SourceDbPort: MySQL은 3306, PostgreSQL은 5432)를 찾고;
+   DsqlClusterArn을 확인해.
+3. ACM 인증서가 없으면 deploy/create_test_cert.sh를 실행하고 출력된 ARN을 사용해(self-signed
+   테스트 인증서; 브라우저가 경고하지만 private/internal ALB에는 괜찮음).
+4. 해석된 전체 파라미터 세트와 정확한 `aws cloudformation deploy` 명령을 나에게 보여주고,
+   무엇이든 만들기 전에 내 승인을 WAIT(대기)해. 정말 추론할 수 없는 것만 물어봐 — 주로:
+   internal ALB(VPN/peering으로 접근) vs internet-facing + Cognito 로그인, 그리고 AI 보조
+   (Amazon Bedrock) 활성화 여부.
+5. 내가 OK하면 배포해 — 스택 이름은 소문자로 28자 이하; --s3-bucket으로 템플릿을 스테이징하고
+   (CloudFormation의 51,200바이트 인라인 한도를 초과함); --capabilities CAPABILITY_IAM
+   CAPABILITY_NAMED_IAM를 사용해. CREATE_COMPLETE를 기다린 뒤, AppUrl 출력값과 접속 방법을
+   출력해(ALB는 기본적으로 internal).
+
+가드레일: 오직 단일 리전(DSQL 클러스터의 리전); 만들기 전에 read/describe; 기존 리소스를 절대
+수정하거나 삭제하지 마; 모든 것을 프로덕션으로 취급; 모호하거나 단계가 실패하면 멈추고 물어봐.
+```
+
+에이전트가 진짜 결정 몇 가지(internal vs 공개/Cognito, AI 보조 활성화 여부, 비용 승인)를
+제시하고 나머지는 모두 채웁니다. **승인하기 전에 에이전트가 해석한 파라미터 세트를 검토하세요** —
+에이전트가 내 자격증명으로 실행하는 AWS 작업의 책임은 나에게 있습니다. 나중에 정리하려면
+에이전트에게 *"`mysql-dsql-migrator` 스택을 삭제해줘"* 라고 말하면 [Teardown](#teardown) 절차를
+따릅니다.
+
+> 이것은 아래 두 수동 경로와 같은 `deploy/cloudformation.yaml`을 사용합니다 — 에이전트는
+> 파라미터를 해석하고 배포를 대신 실행할 뿐입니다. 직접 손으로 하고 싶다면(또는 에이전트에 AWS
+> 접근이 없다면) Console 또는 CLI 경로를 사용하세요.
 
 #### 권장 — AWS Console (안내형 폼)
 
