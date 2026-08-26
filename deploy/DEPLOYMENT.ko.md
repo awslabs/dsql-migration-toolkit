@@ -165,7 +165,13 @@ Well-Architected SEC05-BP02. 외부에 공개하려면 [app-stack 배포](#2-app
 `deploy/cloudformation.yaml`을 배포하는 세 가지 방법 중 하나를 선택하세요. 셋 다 같은 스택을
 만듭니다. 파라미터 설명은 **파라미터 레퍼런스** 참고.
 
-#### 가장 쉬움 — AI 코딩 에이전트로 배포
+| | 옵션 | 적합 |
+| --- | --- | --- |
+| **A** | **AI 코딩 에이전트** | 가장 쉬움·오류 적음 — Claude Code / Kiro / Cursor 사용 시. |
+| **B** | **AWS Console** | 네이티브 피커가 있는 안내형 폼 (권장). |
+| **C** | **AWS CLI** | 스크립트/반복 배포. |
+
+#### 옵션 A — 가장 쉬움: AI 코딩 에이전트로 배포
 
 셸 접근이 가능한 AI 코딩 에이전트를 쓴다면 — **Claude Code, Kiro, Cursor, 또는 AWS CLI를
 실행할 수 있는 모든 에이전트** — 이 배포 전체를 대신 진행해줄 수 있습니다. 에이전트가 이
@@ -220,7 +226,7 @@ deploy/DEPLOYMENT.md("Deploy on ECS Fargate")를 따라 이 저장소의 ECS Far
 > 파라미터를 해석하고 배포를 대신 실행할 뿐입니다. 직접 손으로 하고 싶다면(또는 에이전트에 AWS
 > 접근이 없다면) Console 또는 CLI 경로를 사용하세요.
 
-#### 권장 — AWS Console (안내형 폼)
+#### 옵션 B — 권장: AWS Console (안내형 폼)
 
 ![CloudFormation — Create stack → Upload a template file](../docs/images/cfn-create-stack.png)
 
@@ -333,7 +339,7 @@ AWS_REGION=<region> deploy/create_test_cert.sh
 <details>
 <summary><b>대안 — AWS CLI로 배포</b></summary>
 
-#### AWS CLI
+#### 옵션 C — AWS CLI
 
 환경을 셸 변수로 한 번 설정; 명령 자체는 모든 고객에게 동일. 최소(Dev/Test) 배포:
 
@@ -854,7 +860,7 @@ ALB도 없습니다. UI에는 **SSM 포트포워드**로 접속합니다(호스�
 
 - **AWS Console — 권장.** 템플릿을 업로드하고 안내형 폼을 채웁니다(`VpcId` / `HostSubnetId`는
   네이티브 선택기; Console이 템플릿을 대신 스테이징하므로 S3 버킷 불필요). 절차는
-  [Fargate Console 안내](#권장--aws-console-안내형-폼)와 동일합니다 — 이 템플릿을 고르고, 위의 EC2
+  [옵션 B — AWS Console](#2-app-stack-배포)와 동일합니다 — 이 템플릿을 고르고, 위의 EC2
   파라미터를 입력하고, 스택 이름을 `mysql-dsql-migrator-ec2`로 지정하면 됩니다.
 - **AWS CLI** — `aws cloudformation deploy` 한 번:
 

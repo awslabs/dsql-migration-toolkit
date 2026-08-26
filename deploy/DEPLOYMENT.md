@@ -172,10 +172,16 @@ every other parameter keeps a sensible default.
 
 ### 2. Deploy the app-stack
 
-Three ways to deploy `deploy/cloudformation.yaml` — pick one. All produce the same
-stack; see **Parameter reference** below.
+Three ways to deploy `deploy/cloudformation.yaml` — **pick one** (all produce the same
+stack; see **Parameter reference** below):
 
-#### Easiest — let an AI coding agent deploy it
+| | Option | Best for |
+| --- | --- | --- |
+| **A** | **AI coding agent** | Easiest, least error-prone — you use Claude Code / Kiro / Cursor. |
+| **B** | **AWS Console** | Guided form with native pickers (recommended). |
+| **C** | **AWS CLI** | Scriptable / repeatable deploys. |
+
+#### Option A — Easiest: let an AI coding agent deploy it
 
 If you use an AI coding agent with shell access — **Claude Code, Kiro, Cursor, or any
 agent that can run the AWS CLI** — it can drive this whole deploy for you. It reads this
@@ -232,7 +238,7 @@ stack"* and it follows [Teardown](#teardown).
 > agent only resolves the parameters and runs the deploy for you. If you'd rather do it
 > by hand (or your agent lacks AWS access), use the Console or CLI path instead.
 
-#### Recommended — AWS Console (guided form)
+#### Option B — Recommended: AWS Console (guided form)
 
 ![CloudFormation — Create stack → Upload a template file](../docs/images/cfn-create-stack.png)
 
@@ -357,7 +363,7 @@ otherwise the task can't pull its image or reach DSQL and fails to start. → **
 <details>
 <summary><b>Alternative — deploy with the AWS CLI</b></summary>
 
-#### AWS CLI
+#### Option C — AWS CLI
 
 Set your environment as shell variables once; the command itself is identical for
 every customer. The minimal (Dev/Test) deploy:
@@ -930,8 +936,8 @@ the same as Fargate:
 
 - **AWS Console — recommended.** Upload the template and fill the guided form (native
   pickers for `VpcId` / `HostSubnetId`; the Console stages the template for you, so no
-  S3 bucket is needed). The steps match the
-  [Fargate Console walkthrough](#recommended--aws-console-guided-form) — just pick this
+  S3 bucket is needed). The steps match
+  [Option B — AWS Console](#2-deploy-the-app-stack) above — just pick this
   template, enter the EC2 parameters above, and name the stack `mysql-dsql-migrator-ec2`.
 - **AWS CLI** — one `aws cloudformation deploy`:
 

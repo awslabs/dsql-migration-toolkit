@@ -173,7 +173,13 @@ VPC 内から — VPN、Direct Connect、または SSM ポートフォワード�
 選んでください。いずれも同じスタックを作成します。パラメータのリファレンスは
 **パラメータリファレンス** セクションにあります。
 
-#### 最も簡単 — AI コーディングエージェントにデプロイさせる
+| | オプション | 適したケース |
+| --- | --- | --- |
+| **A** | **AI コーディングエージェント** | 最も簡単・ミスが少ない — Claude Code / Kiro / Cursor を使う場合。 |
+| **B** | **AWS Console** | ネイティブピッカー付きのガイド付きフォーム（推奨）。 |
+| **C** | **AWS CLI** | スクリプト化/反復デプロイ。 |
+
+#### オプション A — 最も簡単: AI コーディングエージェントにデプロイさせる
 
 シェルアクセスを持つ AI コーディングエージェント — **Claude Code、Kiro、Cursor、
 あるいは AWS CLI を実行できる任意のエージェント** — を使っている場合は、このデプロイ
@@ -232,7 +238,7 @@ app-stack（deploy/cloudformation.yaml）を私の AWS アカウントにデプ�
 > パラメータを解決してデプロイを実行するだけです。手作業で行いたい場合（またはエージェントに
 > AWS アクセスがない場合）は、代わりに Console または CLI 経路を使ってください。
 
-#### 推奨 — AWS Console (ガイド付きフォーム)
+#### オプション B — 推奨: AWS Console (ガイド付きフォーム)
 
 ![CloudFormation — Create stack → Upload a template file](../docs/images/cfn-create-stack.png)
 
@@ -358,7 +364,7 @@ A か B のいずれかを選んでください:
 <details>
 <summary><b>代替 — AWS CLI でデプロイ</b></summary>
 
-#### AWS CLI
+#### オプション C — AWS CLI
 
 環境をシェル変数として一度設定します。コマンド自体はどのお客様でも同一です。
 最小構成（Dev/Test）のデプロイ:
@@ -924,7 +930,7 @@ ECR も ALB もありません。UI には **SSM ポートフォワード**で�
 
 - **AWS Console — 推奨。** テンプレートをアップロードしてガイド付きフォームを入力します
   （`VpcId` / `HostSubnetId` はネイティブピッカー。Console がテンプレートをステージングするため、
-  S3 バケットは不要）。手順は [Fargate の Console ウォークスルー](#推奨--aws-console-ガイド付きフォーム)
+  S3 バケットは不要）。手順は [オプション B — AWS Console](#2-app-stack-のデプロイ)
   と同じです — このテンプレートを選び、上記の EC2 パラメータを入力し、スタック名を
   `mysql-dsql-migrator-ec2` にするだけです。
 - **AWS CLI** — `aws cloudformation deploy` 1 回:
