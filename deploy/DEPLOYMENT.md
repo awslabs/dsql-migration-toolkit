@@ -90,9 +90,10 @@ for a real migration use **[ECS Fargate](#deploy-on-ecs-fargate)**.
 > **Recommended for production — real, large-scale migrations.** The whole data path
 > stays inside AWS (source → Fargate → DSQL), not your laptop.
 
-Two ways to deploy, no image build needed — the image is on **ECR Public** and
+Three ways to deploy, no image build needed — the image is on **ECR Public** and
 CloudFormation pulls it. Deploy the same `deploy/cloudformation.yaml` via:
 
+- **AI coding agent (easiest).** An agent — Claude Code / Kiro / Cursor — discovers the parameters and runs the deploy for you.
 - **AWS Console — recommended.** Upload the template; a guided form collects the values.
 - **AWS CLI.** One `aws cloudformation deploy` with parameter overrides.
 
@@ -931,15 +932,69 @@ Template: **`deploy/cloudformation-ec2.yaml`**.
 
 ### 3. Deploy
 
-This is a CloudFormation stack (`deploy/cloudformation-ec2.yaml`), deployable two ways —
-the same as Fargate:
+Three ways to deploy this stack (`deploy/cloudformation-ec2.yaml`) — **pick one** (all
+produce the same host; parameters are in the table above):
 
-- **AWS Console — recommended.** Upload the template and fill the guided form (native
-  pickers for `VpcId` / `HostSubnetId`; the Console stages the template for you, so no
-  S3 bucket is needed). The steps match
-  [Option B — AWS Console](#2-deploy-the-app-stack) above — just pick this
-  template, enter the EC2 parameters above, and name the stack `mysql-dsql-migrator-ec2`.
-- **AWS CLI** — one `aws cloudformation deploy`:
+| | Option | Best for |
+| --- | --- | --- |
+| **A** | **AI coding agent** | Easiest, least error-prone — you use Claude Code / Kiro / Cursor. |
+| **B** | **AWS Console** | Guided form with native pickers (recommended). |
+| **C** | **AWS CLI** | Scriptable / repeatable deploys. |
+
+#### Option A — Easiest: let an AI coding agent deploy it
+
+An agent with shell access (**Claude Code, Kiro, Cursor, or any agent that can run the
+AWS CLI**) can discover the parameters from your account and run this deploy for you —
+the same idea as [Option A for Fargate](#2-deploy-the-app-stack), but targeting the
+EC2-from-source stack (reach the UI over an SSM port-forward; no ALB/Cognito). You need
+the cloned repo and **AWS credentials usable in the agent's shell**
+(`aws sts get-caller-identity` should succeed). Paste this prompt (fill the two blanks):
+
+```text
+Deploy this repo's single-EC2-host app-stack (deploy/cloudformation-ec2.yaml) to my
+AWS account by following deploy/DEPLOYMENT.md ("Run on a single EC2 host").
+
+Target Aurora DSQL cluster: <DSQL cluster ARN or endpoint>
+Source database: <RDS/Aurora identifier — or "I'll enter it in the UI later">
+
+Steps:
+1. Read deploy/DEPLOYMENT.md ("Run on a single EC2 host") and the parameters in
+   deploy/cloudformation-ec2.yaml.
+2. DISCOVER (read-only), don't ask, wherever you can: derive the region from the DSQL
+   ARN/endpoint; find the source DB's VpcId; pick HostSubnetId = a NAT-egress PRIVATE
+   subnet of that VPC (its route table has 0.0.0.0/0 -> a NAT gateway), co-located with
+   the MSK if I'll run CDC; read that subnet's CIDR for MskEgressCidr; find the source
+   DB's SourceDbSecurityGroupId and its port (SourceDbPort: 3306 for MySQL, 5432 for
+   PostgreSQL); confirm the DsqlClusterArn.
+3. Show me the full resolved parameter set and the exact `aws cloudformation deploy`
+   command, and WAIT for my approval before creating anything. Ask me ONLY what you
+   truly can't infer — chiefly: whether I'll run CDC (affects the subnet choice and
+   MskEgressCidr), SourceMode git (default; clones the public repo) vs s3, and whether
+   to enable AI assist (Amazon Bedrock).
+4. On my OK, deploy — stage the template with --s3-bucket (it exceeds CloudFormation's
+   51,200-byte inline limit); use --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM;
+   name the stack mysql-dsql-migrator-ec2 (it must NOT start with mysql-dsql-cdc-). Wait
+   for CREATE_COMPLETE, then tell me how to reach the UI over an SSM port-forward.
+
+Guardrails: single region only (the DSQL cluster's); read/describe before you create;
+never modify or delete existing resources; treat everything as production; stop and ask
+if anything is ambiguous or a step fails.
+```
+
+**Review the resolved parameters before you approve** — you own the AWS actions it runs
+on your credentials. To tear it down later, tell the agent *"delete the
+`mysql-dsql-migrator-ec2` stack"* and it follows [Teardown](#6-teardown).
+
+#### Option B — Recommended: AWS Console (guided form)
+
+Upload the template and fill the guided form (native pickers for `VpcId` /
+`HostSubnetId`; the Console stages the template for you, so no S3 bucket is needed). The
+steps match [Option B — AWS Console](#2-deploy-the-app-stack) above — just pick this
+template, enter the EC2 parameters above, and name the stack `mysql-dsql-migrator-ec2`.
+
+#### Option C — AWS CLI
+
+One `aws cloudformation deploy`:
 
 ```bash
 # --- Your environment (edit these) -------------------------------------------

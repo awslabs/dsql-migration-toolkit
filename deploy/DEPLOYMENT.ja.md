@@ -88,9 +88,10 @@ DSQL リージョンへのアウトバウンド HTTPS + AWS 認証情報が必�
 > **実運用・大規模な移行に推奨。** データ経路全体がノート PC ではなく AWS 内にとどまります
 > （ソース → Fargate → DSQL）。
 
-イメージのビルド不要で 2 つの方法でデプロイできます — イメージは **ECR Public** にあり、
+イメージのビルド不要で 3 つの方法でデプロイできます — イメージは **ECR Public** にあり、
 CloudFormation が取得します。同じ `deploy/cloudformation.yaml` を次のいずれかで:
 
+- **AI コーディングエージェント（最も簡単）。** エージェント（Claude Code / Kiro / Cursor）がパラメータを発見し、代わりにデプロイします。
 - **AWS Console — 推奨。** テンプレートをアップロードすると、ガイド付きフォームが値を集めます。
 - **AWS CLI。** `aws cloudformation deploy` 1 回でパラメータを渡します。
 
@@ -925,15 +926,67 @@ ECR も ALB もありません。UI には **SSM ポートフォワード**で�
 
 ### 3. デプロイ
 
-これは CloudFormation スタック（`deploy/cloudformation-ec2.yaml`）で、Fargate と同様に 2 通りで
-デプロイできます:
+このスタック（`deploy/cloudformation-ec2.yaml`）をデプロイする 3 つの方法 — **いずれか 1 つを選択**（いずれも同じホストを作成。パラメータは上の表を参照）:
 
-- **AWS Console — 推奨。** テンプレートをアップロードしてガイド付きフォームを入力します
-  （`VpcId` / `HostSubnetId` はネイティブピッカー。Console がテンプレートをステージングするため、
-  S3 バケットは不要）。手順は [オプション B — AWS Console](#2-app-stack-のデプロイ)
-  と同じです — このテンプレートを選び、上記の EC2 パラメータを入力し、スタック名を
-  `mysql-dsql-migrator-ec2` にするだけです。
-- **AWS CLI** — `aws cloudformation deploy` 1 回:
+| | オプション | 適したケース |
+| --- | --- | --- |
+| **A** | **AI コーディングエージェント** | 最も簡単・ミスが少ない — Claude Code / Kiro / Cursor。 |
+| **B** | **AWS Console** | ネイティブピッカー付きガイド付きフォーム（推奨）。 |
+| **C** | **AWS CLI** | スクリプト化/反復。 |
+
+#### オプション A — 最も簡単: AI コーディングエージェントにデプロイさせる
+
+シェルアクセスを持つエージェント（**Claude Code、Kiro、Cursor、あるいは AWS CLI を実行できる
+任意のエージェント**）は、パラメータをご自身のアカウントから発見し、このデプロイを実行できます —
+[Fargate のオプション A](#2-app-stack-のデプロイ) と同じ考え方ですが、ソースから実行する EC2
+スタックを対象とします（UI には SSM ポートフォワードで到達; ALB/Cognito なし）。クローン済みの
+リポジトリと、**エージェントのシェルで使える AWS 認証情報**（`aws sts get-caller-identity` が
+成功すること）が必要です。このプロンプトを貼り付けてください（2 つの空欄を埋める）:
+
+```text
+deploy/DEPLOYMENT.md（「Run on a single EC2 host」）に従って、このリポジトリの単一 EC2 ホストの
+app-stack（deploy/cloudformation-ec2.yaml）を私の AWS アカウントにデプロイしてください。
+
+ターゲットの Aurora DSQL クラスター: <DSQL cluster ARN or endpoint>
+ソースデータベース: <RDS/Aurora identifier — or "I'll enter it in the UI later">
+
+手順:
+1. deploy/DEPLOYMENT.md（「Run on a single EC2 host」）と deploy/cloudformation-ec2.yaml の
+   パラメータを読む。
+2. 可能な限り、尋ねずに（読み取り専用で）発見する: DSQL の ARN/エンドポイントからリージョンを
+   導出する; ソース DB の VpcId を見つける; HostSubnetId = その VPC の NAT-egress プライベート
+   サブネット（ルートテーブルに 0.0.0.0/0 -> NAT ゲートウェイがある）を、CDC を実行するなら MSK と
+   同じ場所で選ぶ; そのサブネットの CIDR を MskEgressCidr 用に読む; ソース DB の
+   SourceDbSecurityGroupId とそのポート（SourceDbPort: MySQL は 3306、PostgreSQL は 5432）を
+   見つける; DsqlClusterArn を確認する。
+3. 解決した全パラメータセットと、正確な `aws cloudformation deploy` コマンドを私に見せ、何かを
+   作成する前に私の承認を待つ。本当に推測できないことだけを尋ねる — 主に: CDC を実行するかどうか
+   （サブネットの選択と MskEgressCidr に影響する）、SourceMode git（デフォルト; 公開リポジトリを
+   クローンする）か s3 か、そして AI assist（Amazon Bedrock）を有効にするかどうか。
+4. 私の OK が出たらデプロイする — テンプレートは --s3-bucket でステージングする（CloudFormation の
+   51,200 バイトのインライン上限を超えるため）; --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM を
+   使う; スタック名は mysql-dsql-migrator-ec2 にする（mysql-dsql-cdc- で始めてはいけない）。
+   CREATE_COMPLETE を待ってから、SSM ポートフォワードで UI に到達する方法を私に伝える。
+
+ガードレール: リージョンは 1 つだけ（DSQL クラスターのもの）; 作成する前に read/describe する;
+既存のリソースを変更・削除しない; すべてを本番として扱う; 曖昧な点があるか、ステップが失敗したら、
+止まって尋ねる。
+```
+
+**承認する前に、解決されたパラメータを確認してください** — エージェントがあなたの認証情報で実行
+する AWS の操作は、あなたの責任です。後で解体するには、エージェントに *「`mysql-dsql-migrator-ec2`
+スタックを削除して」* と伝えれば、[Teardown](#6-teardown) に従います。
+
+#### オプション B — 推奨: AWS Console (ガイド付きフォーム)
+
+テンプレートをアップロードしてガイド付きフォームを入力します（`VpcId` / `HostSubnetId` は
+ネイティブピッカー。Console がテンプレートをステージングするため、S3 バケットは不要）。手順は
+[オプション B — AWS Console](#2-app-stack-のデプロイ) と同じです — このテンプレートを選び、上記の
+EC2 パラメータを入力し、スタック名を `mysql-dsql-migrator-ec2` にするだけです。
+
+#### オプション C — AWS CLI
+
+`aws cloudformation deploy` 1 回:
 
 ```bash
 # --- ご自身の環境 (ここを編集) -----------------------------------------------

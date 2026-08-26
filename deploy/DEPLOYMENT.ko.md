@@ -83,9 +83,10 @@ AWS 자격증명이 있어야 합니다. 인프라 없음 — 평가 / 소규모
 > **프로덕션 — 실제·대규모 마이그레이션에 권장.** 데이터 경로 전체가 내 노트북이 아니라 AWS
 > 안에 머뭅니다(소스 → Fargate → DSQL).
 
-이미지 빌드 없이 두 가지 방법으로 배포합니다 — 이미지는 **ECR Public**에 있고 CloudFormation이
+이미지 빌드 없이 세 가지 방법으로 배포합니다 — 이미지는 **ECR Public**에 있고 CloudFormation이
 가져옵니다. 같은 `deploy/cloudformation.yaml`을 이렇게 배포하세요:
 
+- **AI 코딩 에이전트(가장 쉬움).** 에이전트(Claude Code / Kiro / Cursor)가 파라미터를 찾아 대신 배포합니다.
 - **AWS Console — 권장.** 템플릿을 업로드하면 안내형 폼이 값을 모아줍니다.
 - **AWS CLI.** `aws cloudformation deploy` 한 번으로 파라미터를 넘깁니다.
 
@@ -855,14 +856,66 @@ ALB도 없습니다. UI에는 **SSM 포트포워드**로 접속합니다(호스�
 
 ### 3. 배포
 
-이것은 CloudFormation 스택(`deploy/cloudformation-ec2.yaml`)이며, Fargate와 마찬가지로 두 방법으로
-배포합니다:
+이 스택(`deploy/cloudformation-ec2.yaml`)을 배포하는 세 가지 방법 — **하나를 선택**(셋 다 같은
+호스트를 만들며, 파라미터는 위 표 참조):
 
-- **AWS Console — 권장.** 템플릿을 업로드하고 안내형 폼을 채웁니다(`VpcId` / `HostSubnetId`는
-  네이티브 선택기; Console이 템플릿을 대신 스테이징하므로 S3 버킷 불필요). 절차는
-  [옵션 B — AWS Console](#2-app-stack-배포)와 동일합니다 — 이 템플릿을 고르고, 위의 EC2
-  파라미터를 입력하고, 스택 이름을 `mysql-dsql-migrator-ec2`로 지정하면 됩니다.
-- **AWS CLI** — `aws cloudformation deploy` 한 번:
+| | 옵션 | 적합 |
+| --- | --- | --- |
+| **A** | **AI 코딩 에이전트** | 가장 쉬움·오류 적음 — Claude Code / Kiro / Cursor 사용 시. |
+| **B** | **AWS Console** | 네이티브 피커가 있는 안내형 폼 (권장). |
+| **C** | **AWS CLI** | 스크립트/반복 배포. |
+
+#### 옵션 A — 가장 쉬움: AI 코딩 에이전트로 배포
+
+셸 접근이 가능한 에이전트(**Claude Code, Kiro, Cursor, 또는 AWS CLI를 실행할 수 있는 모든
+에이전트**)가 내 계정에서 파라미터를 찾아내고 이 배포를 대신 실행해줄 수 있습니다 —
+[Fargate의 옵션 A](#2-app-stack-배포)와 같은 개념이되, EC2-소스 스택을 대상으로 합니다(UI는 SSM
+포트포워드로 접속; ALB/Cognito 없음). 클론한 저장소와 **에이전트 셸에서 사용 가능한 AWS 자격증명**
+(`aws sts get-caller-identity`가 성공해야 함)이 필요합니다. 이 프롬프트를 붙여넣으세요(빈칸 두 개를
+채우세요):
+
+```text
+deploy/DEPLOYMENT.md("Run on a single EC2 host")를 따라 이 저장소의 단일 EC2 호스트 app-stack
+(deploy/cloudformation-ec2.yaml)을 내 AWS 계정에 배포해줘.
+
+타깃 Aurora DSQL 클러스터: <DSQL cluster ARN or endpoint>
+소스 데이터베이스: <RDS/Aurora identifier — or "I'll enter it in the UI later">
+
+단계:
+1. deploy/DEPLOYMENT.md("Run on a single EC2 host")와 deploy/cloudformation-ec2.yaml의
+   파라미터를 읽어.
+2. 가능한 곳은 묻지 말고 DISCOVER(읽기 전용)해: DSQL ARN/엔드포인트에서 리전을 도출하고;
+   소스 DB의 VpcId를 찾고; HostSubnetId = 그 VPC의 NAT-egress PRIVATE 서브넷(라우트 테이블에
+   0.0.0.0/0 -> NAT 게이트웨이가 있음)을 고르되, CDC를 쓸 거면 MSK와 같은 위치로; 그 서브넷의
+   CIDR을 MskEgressCidr로 읽고; 소스 DB의 SourceDbSecurityGroupId와 포트(SourceDbPort: MySQL은
+   3306, PostgreSQL은 5432)를 찾고; DsqlClusterArn을 확인해.
+3. 해석된 전체 파라미터 세트와 정확한 `aws cloudformation deploy` 명령을 나에게 보여주고,
+   무엇이든 만들기 전에 내 승인을 WAIT(대기)해. 정말 추론할 수 없는 것만 물어봐 — 주로: CDC를
+   쓸지 여부(서브넷 선택과 MskEgressCidr에 영향), SourceMode git(기본; 공개 저장소를 클론) vs
+   s3, 그리고 AI 보조(Amazon Bedrock) 활성화 여부.
+4. 내가 OK하면 배포해 — --s3-bucket으로 템플릿을 스테이징하고(CloudFormation의 51,200바이트
+   인라인 한도를 초과함); --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM를 사용해; 스택
+   이름은 mysql-dsql-migrator-ec2로(mysql-dsql-cdc-로 시작하면 안 됨). CREATE_COMPLETE를 기다린
+   뒤, UI에 SSM 포트포워드로 접속하는 방법을 알려줘.
+
+가드레일: 오직 단일 리전(DSQL 클러스터의 리전); 만들기 전에 read/describe; 기존 리소스를 절대
+수정하거나 삭제하지 마; 모든 것을 프로덕션으로 취급; 모호하거나 단계가 실패하면 멈추고 물어봐.
+```
+
+**승인하기 전에 해석된 파라미터를 검토하세요** — 에이전트가 내 자격증명으로 실행하는 AWS 작업의
+책임은 나에게 있습니다. 나중에 정리하려면 에이전트에게 *"`mysql-dsql-migrator-ec2` 스택을
+삭제해줘"* 라고 말하면 [Teardown](#6-teardown) 절차를 따릅니다.
+
+#### 옵션 B — 권장: AWS Console (안내형 폼)
+
+템플릿을 업로드하고 안내형 폼을 채웁니다(`VpcId` / `HostSubnetId`는 네이티브 선택기; Console이
+템플릿을 대신 스테이징하므로 S3 버킷 불필요). 절차는 [옵션 B — AWS Console](#2-app-stack-배포)와
+동일합니다 — 이 템플릿을 고르고, 위의 EC2 파라미터를 입력하고, 스택 이름을
+`mysql-dsql-migrator-ec2`로 지정하면 됩니다.
+
+#### 옵션 C — AWS CLI
+
+`aws cloudformation deploy` 한 번:
 
 ```bash
 # --- 내 환경 (여기를 수정) ---------------------------------------------------
