@@ -76,6 +76,7 @@ from dsql_migrator.core.models import (
     ColumnDef,
     ObjectType,
     SourceInventory,
+    SourceType,
     StepStatus,
     TableDef,
     TargetConnectionConfig,
@@ -1101,7 +1102,15 @@ def build_schema_conversion_screen(
     session = store.get_or_create(session_id)
     conv_state = conv_store.get_or_create(session_id)
     eval_state = eval_store.get_or_create(session_id)
-    schema_converter = converter or SchemaConverter()
+    # Convert with the source engine's dialect (PostgreSQL vs the MySQL default);
+    # source_config is None before Connect / on a resume, so fall back to MySQL. This one
+    # construction feeds the whole memoized preview/apply/result path.
+    _src_type = (
+        session.source_config.source_type
+        if session.source_config is not None
+        else SourceType.MYSQL
+    )
+    schema_converter = converter or SchemaConverter(source_type=_src_type)
 
     # An INJECTED existence checker (tests) always wins and is never rebuilt. A DERIVED one
     # (built from the browsed target inventory) must be rebuilt when that snapshot changes --
@@ -2110,6 +2119,7 @@ def build_schema_conversion_screen(
                     # Wire the AI activity feed so Generate posts its summary event
                     # (on_generate lives in this helper, not the builder scope).
                     ai_post_event=ai_post_event,
+                    source_type=_src_type,
                 )
 
             def apply_all() -> None:
@@ -2382,6 +2392,7 @@ def _render_browser_and_preview(
     on_reimplement_chat: Optional[Callable[[], None]] = None,
     apply_in_progress: bool = False,
     ai_post_event: Optional[Callable[..., object]] = None,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> None:
     """Render side-by-side source/target browsers and the selected DDL diff.
 
@@ -2795,7 +2806,9 @@ def _render_browser_and_preview(
             # Full Load pick it up.
             source_table = _find_table(inventory, preview.object_name)
             if source_table is not None and not not_auto_converted:
-                _render_pk_strategy_picker(ui, source_table, conv_state, refresh)
+                _render_pk_strategy_picker(
+                    ui, source_table, conv_state, refresh, source_type=source_type
+                )
             _render_preview(
                 ui,
                 preview,
@@ -2893,6 +2906,8 @@ def _render_pk_strategy_picker(
     table: TableDef,
     conv_state: SchemaConversionState,
     refresh: Callable[[], None],
+    *,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> None:
     """Per-table primary-key strategy picker (Keep / Server-generated / Composite).
 
@@ -2938,7 +2953,7 @@ def _render_pk_strategy_picker(
         and stored is not None
         and identity_from_ddl(table, stored)
     )
-    converter = SchemaConverter()
+    converter = SchemaConverter(source_type=source_type)
 
     def _select_strategy(choice: str) -> None:
         """Apply a primary-key strategy choice (called with the tile's value)."""

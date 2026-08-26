@@ -1721,16 +1721,19 @@ def test_cdc_stack_seeder_function_persists_across_stop(
     assert resources["CdcStartPrepResource"].get("Condition") == "DeployStartPrepResource"
 
     conds = cdc_template["Conditions"]
-    # DeploySeederFunctionLambda ANDs the (unchanged) DeploySeederFunction with
-    # SeedByLambda. The underlying DeploySeederFunction is still the Fn::Or.
+    # DeploySeederFunctionLambda ANDs the DeploySeederFunction with SeedByLambda.
     lambda_gate = json.dumps(conds["DeploySeederFunctionLambda"])
     assert "DeploySeederFunction" in lambda_gate
     assert "SeedByLambda" in lambda_gate
     deploy = conds["DeploySeederFunction"]
-    assert "Fn::Or" in deploy  # bootstrap present OR key present
     deploy_text = json.dumps(deploy)
-    # Key-present alone keeps the Function deployed across a Stop (persist), and the
-    # OR includes bootstrap so HasBootstrapServers implies this condition.
+    # The MySQL binlog offset seeder is gated on IsMySqlSource (a PostgreSQL stack
+    # resumes from a replication slot, not a Kafka connect-offset, so it must never
+    # create this Lambda). No-op for MySQL (IsMySqlSource is true by default).
+    assert "IsMySqlSource" in deploy_text
+    # Nested under that AND, the original Fn::Or (bootstrap present OR key present)
+    # still keeps the Function deployed across a Stop (which blanks MskBootstrapServers).
+    assert "Fn::Or" in deploy_text
     assert "LambdaSeederS3Key" in deploy_text
     assert "MskBootstrapServers" in deploy_text
 

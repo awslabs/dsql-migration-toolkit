@@ -38,9 +38,7 @@ from dsql_migrator.core.cdc import (
     CDC_STACK_NAME_PREFIX,
     CdcPipelineOrchestrator,
     CdcResumePoint,
-    build_cdc_infra_params,
     build_cdc_stack_name,
-    build_cdc_stack_params,
     cdc_expected_connector_names,
     composite_cdc_excluded_key_columns,
     cdc_stack_name_suffix,
@@ -54,10 +52,16 @@ from dsql_migrator.core.job_manager import (
     JobNotFoundError,
     is_interrupted_by_restart,
 )
+from dsql_migrator.core.cdc_postgres import (
+    dispatch_cdc_infra_params,
+    dispatch_cdc_stack_params,
+    dispatch_source_config,
+)
 from dsql_migrator.core.models import (
     LoadStatusView,
     MigrationMode,
     SourceInventory,
+    SourceType,
     StepStatus,
     Watermark,
 )
@@ -144,6 +148,40 @@ from dsql_migrator.ui.data_migration._cdc_state import (  # noqa: E402,F401
     cdc_streaming_started,
     cdc_teardown_badge,
 )
+
+
+def _cdc_source_type(session) -> SourceType:
+    """The session's source engine (default MySQL), for CDC config dispatch."""
+    return getattr(
+        getattr(session, "source_config", None), "source_type", SourceType.MYSQL
+    )
+
+
+def _cdc_source_database(session) -> str:
+    """The session's source database name (PostgreSQL captures a single database)."""
+    return getattr(getattr(session, "source_config", None), "database", "") or ""
+
+
+def _cdc_resume_signal(migration_state, session):
+    """Resolve the engine-appropriate CDC start signal for the config builders.
+
+    Returns ``(resume_override, force_initial_snapshot)`` so every ``dispatch_source_config``
+    call site stays consistent:
+
+    - **MySQL** -- a Manual choice supplies a GTID / binlog ``file:position`` that is seeded
+      into ``connect-offsets``; pass it as ``resume_override`` (only when it has usable
+      coordinates). ``force_initial_snapshot`` is always ``False`` (not a MySQL concept).
+    - **PostgreSQL** -- Debezium resumes only from the replication slot and cannot start
+      from an arbitrary WAL LSN, so Manual means "re-snapshot from scratch" (``initial``):
+      there is no override value, just ``force_initial_snapshot = (mode == "manual")``.
+      Automatic uses the gapless slot (``never``).
+    """
+    mode = migration_state.cdc_start_mode()
+    if _cdc_source_type(session) is SourceType.POSTGRES:
+        return None, mode == "manual"
+    override = migration_state.cdc_start_override()
+    usable = mode == "manual" and override is not None and override.has_coordinates()
+    return (override if usable else None), False
 
 
 def _logged_cdc_lifecycle(action: str, *, detail: str, work):
@@ -346,39 +384,54 @@ def _render_cdc_source_config_card(
     """
     job = _current_job(job_manager, migration_state.job_id)
     watermark = getattr(job, "watermark", None) if job is not None else None
+    source_type = _cdc_source_type(session)
+    is_pg = source_type is SourceType.POSTGRES
     override = migration_state.cdc_start_override()
     mode = migration_state.cdc_start_mode()
     # The watermark resume (gapless) is the Automatic option's source.
     wm_resume = (
         CdcResumePoint.from_watermark(watermark) if watermark is not None else None
     )
-    # Gate on what the SEEDER actually needs (binlog file:pos), not on the broad
-    # "has any coordinate" test. A GTID-only watermark passed has_coordinates(), so the
-    # card claimed "Automatic -- gapless from Full Load (recommended)" and showed Ready --
-    # while build_watermark_params returned all-empty values, the template skipped the
-    # seeder, and the connector started from the CURRENT binlog, losing every change made
-    # during the load. The failure was silent until Validation, or after cut over.
-    #
-    # Reachable, not theoretical: the coordinates come from SEPARATE queries that degrade
-    # independently -- SHOW MASTER STATUS needs REPLICATION CLIENT (commonly restricted on
-    # RDS/Aurora) while @@GLOBAL.gtid_executed is a plain global read.
-    wm_usable = wm_resume is not None and wm_resume.can_seed_offset()
-    # A GTID set with NO file:pos: there IS a watermark and it looks usable, but it cannot
-    # seed the offset. Called out separately so the reason is explicit instead of the
-    # generic "no watermark" wording, which would be wrong here.
-    wm_gtid_only = (
-        wm_resume is not None
-        and not wm_resume.can_seed_offset()
-        and bool(wm_resume.gtid_executed)
-    )
-    # Effective start position: in manual mode an entered override wins; in auto
-    # mode the watermark is used.
-    if mode == "manual" and override is not None and override.has_coordinates():
-        effective_resume: Optional[CdcResumePoint] = override
-    elif mode == "auto" and wm_usable:
-        effective_resume = wm_resume
+    if is_pg:
+        # PostgreSQL Automatic = gapless resume from the logical replication slot created
+        # at the Full Load consistency point (the watermark carries the WAL LSN + slot
+        # name). Manual = re-snapshot from scratch (snapshot.mode=initial), which needs no
+        # coordinate and is ALWAYS a resolvable start point -- Debezium PG resumes only from
+        # the slot and cannot start from an arbitrary WAL LSN, so there is no binlog offset
+        # to seed and the MySQL can_seed_offset()/gtid-only tests do not apply.
+        wm_usable = wm_resume is not None and wm_resume.can_resume_from_lsn()
+        wm_gtid_only = False
+        effective_resume: Optional[CdcResumePoint] = (
+            wm_resume if (mode == "auto" and wm_usable) else None
+        )
     else:
-        effective_resume = None
+        # Gate on what the SEEDER actually needs (binlog file:pos), not on the broad
+        # "has any coordinate" test. A GTID-only watermark passed has_coordinates(), so the
+        # card claimed "Automatic -- gapless from Full Load (recommended)" and showed Ready --
+        # while build_watermark_params returned all-empty values, the template skipped the
+        # seeder, and the connector started from the CURRENT binlog, losing every change made
+        # during the load. The failure was silent until Validation, or after cut over.
+        #
+        # Reachable, not theoretical: the coordinates come from SEPARATE queries that degrade
+        # independently -- SHOW MASTER STATUS needs REPLICATION CLIENT (commonly restricted on
+        # RDS/Aurora) while @@GLOBAL.gtid_executed is a plain global read.
+        wm_usable = wm_resume is not None and wm_resume.can_seed_offset()
+        # A GTID set with NO file:pos: there IS a watermark and it looks usable, but it cannot
+        # seed the offset. Called out separately so the reason is explicit instead of the
+        # generic "no watermark" wording, which would be wrong here.
+        wm_gtid_only = (
+            wm_resume is not None
+            and not wm_resume.can_seed_offset()
+            and bool(wm_resume.gtid_executed)
+        )
+        # Effective start position: in manual mode an entered override wins; in auto
+        # mode the watermark is used.
+        if mode == "manual" and override is not None and override.has_coordinates():
+            effective_resume = override
+        elif mode == "auto" and wm_usable:
+            effective_resume = wm_resume
+        else:
+            effective_resume = None
 
     # PRIMARY card: the CDC start point. This is the central decision of the CDC
     # step, so it is a top-level card with an explicit Automatic/Manual choice --
@@ -405,14 +458,21 @@ def _render_cdc_source_config_card(
         mode=mode,
         locked=started,
         session=session,
+        source_type=source_type,
         wm_gtid_only=wm_gtid_only,
         resumes_from_offset=resumes_from_offset,
     )
 
     # On a restart the connector config below is not what decides the start position (the
     # committed offset is), so an absent effective_resume must not hide the rest of the
-    # card -- it is exactly the state a resume renders in.
-    if effective_resume is None and not resumes_from_offset:
+    # card -- it is exactly the state a resume renders in. A PostgreSQL Manual choice
+    # (re-snapshot, snapshot.mode=initial) is likewise a resolvable start with no coordinate,
+    # so it must not early-return either.
+    if (
+        effective_resume is None
+        and not resumes_from_offset
+        and not (is_pg and mode == "manual")
+    ):
         return
 
     # Build the connector config (pure -- no AWS calls). Restrict the table list
@@ -424,6 +484,7 @@ def _render_cdc_source_config_card(
     )
     exclude_list = exclude_value.split(",") if exclude_value else None
     tables_for_config = _cdc_tables_for_config(migration_state, inventory, watermark)
+    _resume_override, _force_initial_snapshot = _cdc_resume_signal(migration_state, session)
 
     # A CDC sink needs at least one table: with none selected the sink topic list
     # would be empty and the deploy would later fail at connector create (opaque
@@ -442,16 +503,20 @@ def _render_cdc_source_config_card(
         )
         return
 
-    config = CdcPipelineOrchestrator().build_source_config(
-        "mysql-source",
+    config = dispatch_source_config(
+        _cdc_source_type(session),
         tables_for_config,
         watermark if watermark is not None else _sentinel_watermark(),
+        database=_cdc_source_database(session),
+        stack_name=getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME),
         column_exclude_list=exclude_list,
-        resume_override=override if (mode == "manual" and override is not None and override.has_coordinates()) else None,
+        resume_override=_resume_override,
+        force_initial_snapshot=_force_initial_snapshot,
     )
 
     # The sink config (topics, keying, DLQ). DLQ name is the cdc-stack default --
-    # NOT derived from a connector that may not exist yet (pre-deploy).
+    # NOT derived from a connector that may not exist yet (pre-deploy). Engine-neutral
+    # (the DSQL sink is the same for both source engines).
     sink = CdcPipelineOrchestrator().build_sink_config(
         "mysql-sink", tables_for_config, CDC_DEFAULT_DLQ_TOPIC
     )
@@ -459,7 +524,7 @@ def _render_cdc_source_config_card(
     # Build the deployable cdc-stack parameter set: tool-known values filled,
     # customer-environment values as <FILL_ME> placeholders.
     target = getattr(session, "target_config", None)
-    params = build_cdc_stack_params(
+    params = dispatch_cdc_stack_params(
         config,
         sink,
         target_endpoint=getattr(target, "cluster_endpoint", "") if target else "",
@@ -629,13 +694,19 @@ def _estimate_cdc_table_rows(session, table_names):
         from dsql_migrator.core.watermark import estimate_source_rows
         from dsql_migrator.ui.connect import make_source_engine_factory
 
+        from dsql_migrator.core.source_dialect import dialect_for
+
         source_config = getattr(session, "source_config", None)
         has_password = getattr(session, "source_password", None) is not None
         if source_config is None or not session.has_source() or not has_password:
             return None
+        # Source-engine dialect (PG uses pg_class.reltuples, not MySQL information_schema)
+        # so a PostgreSQL source's per-table sizing estimate does not raise + fall back to
+        # the uniform partition default. Mirrors _full_load_engine's capture path.
+        dialect = dialect_for(source_config.source_type)
         engine = make_source_engine_factory(session.source_password)(source_config)
         with engine.connect() as connection:
-            estimates = estimate_source_rows(connection, list(table_names))
+            estimates = estimate_source_rows(connection, list(table_names), dialect)
         scoped = {n: int(c) for n, c in estimates.items() if c}
         return scoped or None
     except Exception:  # noqa: BLE001 - optional sizing signal; uniform fallback
@@ -653,6 +724,7 @@ def _render_cdc_start_point_card(
     mode: str,
     locked: bool = False,
     session: object = None,
+    source_type: SourceType = SourceType.MYSQL,
     # A watermark that HAS a GTID set but no binlog file:position -- present, yet unable
     # to seed the CDC start offset. Distinguished from "no watermark" so the card can name
     # the actual cause and its fix (the REPLICATION CLIENT grant) instead of implying the
@@ -676,12 +748,22 @@ def _render_cdc_start_point_card(
     ``locked`` (CDC already started) makes the radio + manual inputs read-only:
     the start position is already committed to connect-offsets, so changing it
     here cannot affect the live pipeline.
+
+    For a **PostgreSQL** source the choice is Automatic (gapless from the replication
+    slot created at Full Load) vs Manual (re-snapshot from scratch, ``snapshot.mode=
+    initial``). Debezium PG resumes only from the slot and cannot be given an arbitrary
+    WAL LSN, so Manual is a re-snapshot -- there is no coordinate to enter and no
+    GTID/binlog inputs are shown.
     """
+    is_pg = source_type is SourceType.POSTGRES
+    # A PostgreSQL Manual choice (re-snapshot) is a resolved start with no coordinate, so
+    # it is "ready" even though effective_resume is None.
+    ready = resumes_from_offset or effective_resume is not None or (is_pg and mode == "manual")
     with ui.card().classes("w-full"):  # type: ignore[attr-defined]
         with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
             ui.icon(  # type: ignore[attr-defined]
                 "play_circle",
-                color="primary" if effective_resume is not None else "grey",
+                color="primary" if ready else "grey",
             ).classes("text-xl")
             ui.label("CDC start point").classes("text-sm font-semibold")  # type: ignore[attr-defined]
             # "What is this?" moved to a hover ⓘ instead of a standing paragraph.
@@ -699,7 +781,7 @@ def _render_cdc_start_point_card(
                     "CDC has started — the start point is locked. To change it, "
                     "stop CDC first."
                 )
-            elif resumes_from_offset or effective_resume is not None:
+            elif ready:
                 ui.badge("Ready", color="positive").props("outline")  # type: ignore[attr-defined]
             else:
                 ui.badge("Action needed", color="warning").props("outline")  # type: ignore[attr-defined]
@@ -724,18 +806,28 @@ def _render_cdc_start_point_card(
             )
             return
 
-        if wm_usable:
-            auto_label = "Automatic — gapless from Full Load (recommended)"
-        elif wm_gtid_only:
-            # Do NOT say "needs a Full Load watermark": there IS one. It simply lacks the
-            # binlog file:position the offset seed is keyed on, so the honest label names
-            # what is missing rather than implying the load never ran.
+        if is_pg:
+            # PostgreSQL: Automatic = gapless from the slot; Manual = re-snapshot (initial).
             auto_label = (
-                "Automatic — unavailable (the Full Load watermark has no binlog "
-                "position)"
+                "Automatic — gapless from the replication slot (recommended)"
+                if wm_usable
+                else "Automatic — needs a Full Load slot (unavailable)"
             )
+            manual_label = "Manual — re-snapshot from scratch (initial)"
         else:
-            auto_label = "Automatic — needs a Full Load watermark (unavailable)"
+            if wm_usable:
+                auto_label = "Automatic — gapless from Full Load (recommended)"
+            elif wm_gtid_only:
+                # Do NOT say "needs a Full Load watermark": there IS one. It simply lacks the
+                # binlog file:position the offset seed is keyed on, so the honest label names
+                # what is missing rather than implying the load never ran.
+                auto_label = (
+                    "Automatic — unavailable (the Full Load watermark has no binlog "
+                    "position)"
+                )
+            else:
+                auto_label = "Automatic — needs a Full Load watermark (unavailable)"
+            manual_label = "Manual — enter a GTID or binlog position"
 
         def _on_mode(value: str) -> None:
             migration_state.set_cdc_start_mode(value)
@@ -745,7 +837,7 @@ def _render_cdc_start_point_card(
         # watermark exists so the user is steered to Manual rather than a dead end.
         # When CDC has started the whole choice is disabled (read-only).
         radio = ui.radio(  # type: ignore[attr-defined]
-            {"auto": auto_label, "manual": "Manual — enter a GTID or binlog position"},
+            {"auto": auto_label, "manual": manual_label},
             value=mode,
             on_change=lambda e: _on_mode(e.value),
         ).props("inline=false")
@@ -757,7 +849,22 @@ def _render_cdc_start_point_card(
                 "opacity-50 pointer-events-none cursor-not-allowed"
             )
         if not wm_usable and mode == "auto" and not locked:
-            if wm_gtid_only:
+            if is_pg:
+                # PG has no offset seeder: Automatic needs the replication slot the tool
+                # creates at the Full Load consistency point. Absent one, steer to Manual
+                # (re-snapshot) rather than a dead end.
+                render_notice(
+                    ui,
+                    tone="warning",
+                    header="No replication slot from a Full Load in this session",
+                    body=(
+                        "Automatic resumes from the logical replication slot the tool "
+                        "creates at the Full Load consistency point, and none is recorded "
+                        "here. Run a Full Load with CDC enabled for a gapless handoff, or "
+                        "choose Manual to re-snapshot every table from scratch."
+                    ),
+                )
+            elif wm_gtid_only:
                 # Name the cause AND the fix. This is the one case where the operator can
                 # get a real gapless handoff by changing something on the source, so a
                 # generic "no watermark" message would send them to Manual with a GTID
@@ -788,17 +895,35 @@ def _render_cdc_start_point_card(
                 )
 
         if mode == "manual":
-            _render_cdc_manual_inputs(
-                ui, migration_state, refresh, locked=locked, session=session,
-            )
+            if is_pg:
+                _render_cdc_pg_manual_explanation(ui)
+            else:
+                _render_cdc_manual_inputs(
+                    ui, migration_state, refresh, locked=locked, session=session,
+                )
         elif wm_usable and wm_resume is not None:
-            _render_cdc_start_summary(
-                ui, wm_resume.gtid_executed, wm_resume.binlog_file,
-                wm_resume.binlog_position,
-            )
+            if is_pg:
+                _render_cdc_pg_start_summary(ui, wm_resume.wal_lsn)
+            else:
+                _render_cdc_start_summary(
+                    ui, wm_resume.gtid_executed, wm_resume.binlog_file,
+                    wm_resume.binlog_position,
+                )
 
         # Resolved start-point confirmation (the single source of truth).
-        if effective_resume is not None:
+        if is_pg:
+            # PG has no MySQL-style coordinate: confirm the resolved mode instead.
+            pg_confirm = None
+            if mode == "manual":
+                pg_confirm = "Start point set — re-snapshot every table (snapshot.mode=initial)"
+            elif effective_resume is not None:
+                lsn = effective_resume.wal_lsn or "(recorded)"
+                pg_confirm = f"Start point set — gapless from the replication slot (WAL LSN {lsn})"
+            if pg_confirm is not None:
+                with ui.row().classes("items-center gap-2 no-wrap mt-1"):  # type: ignore[attr-defined]
+                    ui.icon("check_circle", color="positive").classes("text-base")  # type: ignore[attr-defined]
+                    ui.label(pg_confirm).classes("text-xs text-gray-700 font-mono")  # type: ignore[attr-defined]
+        elif effective_resume is not None:
             with ui.row().classes("items-center gap-2 no-wrap mt-1"):  # type: ignore[attr-defined]
                 ui.icon("check_circle", color="positive").classes("text-base")  # type: ignore[attr-defined]
                 coord = (
@@ -810,6 +935,37 @@ def _render_cdc_start_point_card(
                 ui.label(f"Start point set — {coord}").classes(  # type: ignore[attr-defined]
                     "text-xs text-gray-700 font-mono"
                 )
+
+def _render_cdc_pg_manual_explanation(ui) -> None:
+    """Explain the PostgreSQL Manual start choice (re-snapshot), shown instead of the
+    MySQL GTID/binlog inputs.
+
+    Debezium PostgreSQL resumes CDC only from the replication slot's committed position
+    and cannot be told to start from an arbitrary WAL LSN, so there is no coordinate to
+    enter. Manual means: skip the gapless slot and re-snapshot every selected table from
+    scratch (``snapshot.mode=initial``) before streaming.
+    """
+    render_notice(
+        ui,
+        tone="info",
+        icon="restart_alt",
+        header="Manual re-snapshots every table (snapshot.mode=initial)",
+        body=(
+            "PostgreSQL resumes CDC from the replication slot created at Full Load — there "
+            "is no way to start streaming from a specific WAL LSN, so there is nothing to "
+            "enter here. Manual takes a fresh initial snapshot of every selected table, "
+            "then streams. Use it when no Full Load slot is available, or when you want a "
+            "clean re-copy instead of the gapless handoff."
+        ),
+    )
+
+
+def _render_cdc_pg_start_summary(ui, wal_lsn) -> None:
+    """Show the resolved WAL LSN for the PostgreSQL Automatic (gapless slot) choice."""
+    with ui.row().classes("items-center gap-1 no-wrap mt-1"):  # type: ignore[attr-defined]
+        ui.label("WAL LSN:").classes("text-xs text-gray-500")  # type: ignore[attr-defined]
+        ui.label(str(wal_lsn or "(none)")).classes("text-xs font-mono")  # type: ignore[attr-defined]
+
 
 def _render_cdc_start_summary(ui, gtid, binlog_file, binlog_pos) -> None:
     """Show the resolved coordinates for the Automatic (watermark) choice."""
@@ -2856,6 +3012,7 @@ def _start_cdc_deploy(
     )
     exclude_list = exclude_value.split(",") if exclude_value else None
     tables_for_config = _cdc_tables_for_config(migration_state, inventory, watermark)
+    _resume_override, _force_initial_snapshot = _cdc_resume_signal(migration_state, session)
     mode = migration_state.cdc_start_mode()
     # Guard: a CDC sink requires at least one table (empty -> SinkTopics="" ->
     # connector create fails later with an opaque HTTP 400, ~minutes into a
@@ -2897,12 +3054,15 @@ def _start_cdc_deploy(
             ),
         )
         return
-    source_config = CdcPipelineOrchestrator().build_source_config(
-        "mysql-source",
+    source_config = dispatch_source_config(
+        _cdc_source_type(session),
         tables_for_config,
         watermark if watermark is not None else _sentinel_watermark(),
+        database=_cdc_source_database(session),
+        stack_name=migration_state.cdc_stack_name,
         column_exclude_list=exclude_list,
-        resume_override=override if (mode == "manual" and override is not None and override.has_coordinates()) else None,
+        resume_override=_resume_override,
+        force_initial_snapshot=_force_initial_snapshot,
         message_key_columns=message_key_columns,
     )
     sink_config = CdcPipelineOrchestrator().build_sink_config(
@@ -2911,7 +3071,7 @@ def _start_cdc_deploy(
     target, region = _cdc_target_region(ui, session)
     if region is None:
         return
-    params = build_cdc_stack_params(
+    params = dispatch_cdc_stack_params(
         source_config, sink_config,
         target_endpoint=getattr(target, "cluster_endpoint", "") if target else "",
         target_database=getattr(target, "database", "postgres") if target else "postgres",
@@ -3221,13 +3381,17 @@ async def _start_cdc_infra_deploy(
     )
     exclude_list = exclude_value.split(",") if exclude_value else None
     tables_for_config = _cdc_tables_for_config(migration_state, inventory, watermark)
+    _resume_override, _force_initial_snapshot = _cdc_resume_signal(migration_state, session)
     mode = migration_state.cdc_start_mode()
-    source_config = CdcPipelineOrchestrator().build_source_config(
-        "mysql-source",
+    source_config = dispatch_source_config(
+        _cdc_source_type(session),
         tables_for_config,
         watermark if watermark is not None else _sentinel_watermark(),
+        database=_cdc_source_database(session),
+        stack_name=migration_state.cdc_stack_name,
         column_exclude_list=exclude_list,
-        resume_override=override if (mode == "manual" and override is not None and override.has_coordinates()) else None,
+        resume_override=_resume_override,
+        force_initial_snapshot=_force_initial_snapshot,
     )
     # Infra-only deploy (DeploySink=false, no connector yet): an empty table
     # selection is allowed here -- SinkTopics is populated later at Start CDC.
@@ -3287,7 +3451,7 @@ async def _start_cdc_infra_deploy(
     from dsql_migrator.config import load_config as _load_config
 
     _cfg = _load_config()
-    params = build_cdc_infra_params(
+    params = dispatch_cdc_infra_params(
         source_config, sink_config,
         vpc_id=fields["vpc_id"],
         connector_subnet_ids=connector_subnet_ids,

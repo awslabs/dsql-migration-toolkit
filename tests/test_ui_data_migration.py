@@ -430,7 +430,10 @@ class _FakeExporter:
         pk_lower=None,
         pk_upper=None,
         on_throttle=None,
+        shared_snapshot_id=None,
     ) -> list[dict]:
+        self.shared_snapshot_ids = getattr(self, "shared_snapshot_ids", [])
+        self.shared_snapshot_ids.append(shared_snapshot_id)
         self.streamed.append(table.name)
         self.target_types_by_table[table.name] = target_types
         self.stream_columns_by_table[table.name] = [c.name for c in table.columns]
@@ -580,6 +583,187 @@ def test_batched_table_migrator_captures_watermark_for_selected_tables() -> None
     watermark = migrator.capture_watermark(selected)
     assert watermark.binlog_file == "mysql-bin.000123"
     assert capturer.calls == [["orders"]]
+
+
+def test_capture_watermark_skips_binlog_for_postgres_source(monkeypatch) -> None:
+    # A PostgreSQL source has no binlog/GTID, and the MySQL WatermarkCapturer's SQL
+    # (START TRANSACTION WITH CONSISTENT SNAPSHOT / SHOW MASTER STATUS) is fatal on PG.
+    # capture_watermark must SKIP the capturer and return a watermark carrying the PG
+    # resume coordinate (WAL LSN, dialect-captured) + the scan-free row-count baseline
+    # (dialect-dispatched, None -> 0).
+    import dataclasses
+
+    import dsql_migrator.ui.data_migration._full_load_engine as eng
+    from dsql_migrator.core.models import SourceType
+
+    class _LsnResult:
+        def first(self):  # noqa: ANN201
+            return ("3/AF012B8",)  # what pg_current_wal_lsn()::text yields
+
+    class _NoConn:
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, *_a):  # noqa: ANN204
+            return False
+
+        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+            # capture_resume_lsn's WAL LSN probe (estimate_source_rows is monkeypatched).
+            assert "pg_current_wal_lsn" in str(statement)
+            return _LsnResult()
+
+    class _NoEngine:
+        def connect(self):  # noqa: ANN201
+            return _NoConn()
+
+        def dispose(self) -> None:
+            self.disposed = True
+
+    fake_engine = _NoEngine()
+    monkeypatch.setattr(
+        eng, "make_source_engine_factory", lambda pw, **k: (lambda src: fake_engine)
+    )
+    monkeypatch.setattr(
+        eng,
+        "estimate_source_rows",
+        lambda conn, tables, dialect: {"orders": 5, "customers": None},
+    )
+
+    capturer = _FakeWatermarkCapturer(_watermark())  # must NOT be called for PG
+    pg_inputs = dataclasses.replace(
+        _inputs(),
+        source_config=SourceConnectionConfig(
+            host="db", database="app", source_type=SourceType.POSTGRES
+        ),
+    )
+    migrator = BatchedTableMigrator(
+        pg_inputs,
+        exporter=_FakeExporter(),  # type: ignore[arg-type]
+        watermark_capturer=capturer,  # type: ignore[arg-type]
+        importer_factory=lambda _i: _FakeImporter(),  # type: ignore[arg-type,return-value]
+    )
+    watermark = migrator.capture_watermark(list(_inventory().tables))
+    assert capturer.calls == []  # MySQL binlog capturer skipped for a PG source
+    assert watermark.binlog_file is None and watermark.gtid_executed is None
+    # The PG resume coordinate (WAL LSN) IS captured -- the gapless CDC handoff point.
+    assert watermark.wal_lsn == "3/AF012B8"
+    assert watermark.row_counts_approximate is True
+    assert watermark.table_row_counts == {"orders": 5, "customers": 0}  # None -> 0
+    assert fake_engine.disposed is True  # source engine disposed (no leak)
+    assert watermark.slot_name is None  # Full-Load-only: no slot (would pin WAL)
+    assert watermark.publication_name is None
+
+
+def test_capture_watermark_creates_slot_for_postgres_cdc_handoff(monkeypatch) -> None:
+    # Full Load + CDC on a PostgreSQL source (inputs.cdc_stack_name set): capture must
+    # create a logical replication slot + publication ON THE SOURCE at the consistency
+    # point (before any reader) and record the slot's consistent-point LSN + the
+    # slot/publication names on the watermark -- so CDC resumes gaplessly and teardown
+    # can drop them. The slot goes through the dedicated audited write engine, NOT the
+    # read-only-guarded one.
+    import dataclasses
+
+    import dsql_migrator.ui.data_migration._full_load_engine as eng
+    from dsql_migrator.core import cdc_pg_slot
+    from dsql_migrator.core.models import SourceType
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = list(rows)
+
+        def first(self):  # noqa: ANN201
+            return self._rows[0] if self._rows else None
+
+        def fetchall(self):  # noqa: ANN201
+            return list(self._rows)
+
+    class _WriteConn:
+        """Records slot/publication writes; returns a canned consistent-point LSN."""
+
+        def __init__(self):
+            self.statements = []
+
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, *_a):  # noqa: ANN204
+            return False
+
+        def execute(self, statement, params=None):  # noqa: ANN001, ANN201
+            sql = str(statement)
+            self.statements.append(sql)
+            up = " ".join(sql.upper().split())
+            if "FROM PG_CLASS" in up:  # replica-identity guard: usable ('d')
+                return _Result([(n, "d") for n in (params or {}).get("names", [])])
+            if "FROM PG_PUBLICATION" in up or "FROM PG_REPLICATION_SLOTS" in up:
+                return _Result([])  # neither exists yet
+            if "PG_CREATE_LOGICAL_REPLICATION_SLOT" in up:
+                return _Result([("7/DEADBEEF",)])
+            return _Result([])
+
+    write_conn = _WriteConn()
+
+    class _WriteEngine:
+        def connect(self):  # noqa: ANN201
+            return write_conn
+
+        def dispose(self) -> None:
+            self.disposed = True
+
+    write_engine = _WriteEngine()
+
+    # Read-only engine (row estimates only on this path; capture_resume_lsn is NOT called).
+    class _RoConn:
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, *_a):  # noqa: ANN204
+            return False
+
+    class _RoEngine:
+        def connect(self):  # noqa: ANN201
+            return _RoConn()
+
+        def dispose(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        eng, "make_source_engine_factory", lambda pw, **k: (lambda src: _RoEngine())
+    )
+    monkeypatch.setattr(
+        eng, "estimate_source_rows", lambda conn, tables, dialect: {"orders": 5}
+    )
+    # The audited PG source-WRITE engine is the dedicated cdc_pg_slot one.
+    monkeypatch.setattr(
+        cdc_pg_slot, "build_pg_source_write_engine", lambda src, pw: write_engine
+    )
+
+    pg_inputs = dataclasses.replace(
+        _inputs(),
+        source_config=SourceConnectionConfig(
+            host="db", database="app", source_type=SourceType.POSTGRES
+        ),
+        cdc_stack_name="mysql-dsql-cdc-stack",
+    )
+    migrator = BatchedTableMigrator(
+        pg_inputs,
+        exporter=_FakeExporter(),  # type: ignore[arg-type]
+        watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
+        importer_factory=lambda _i: _FakeImporter(),  # type: ignore[arg-type,return-value]
+    )
+    watermark = migrator.capture_watermark([TableDef(name="orders", primary_key=["id"])])
+
+    # The slot's consistent-point LSN is the gapless resume coordinate.
+    assert watermark.wal_lsn == "7/DEADBEEF"
+    assert watermark.slot_name == cdc_pg_slot.pg_slot_name("mysql-dsql-cdc-stack")
+    assert watermark.publication_name == cdc_pg_slot.pg_publication_name(
+        "mysql-dsql-cdc-stack"
+    )
+    # Publication FOR TABLE the migrated table, then the slot -- both on the write engine.
+    writes = " ".join(write_conn.statements).upper()
+    assert "CREATE PUBLICATION" in writes and "FOR ALL TABLES" not in writes
+    assert "PG_CREATE_LOGICAL_REPLICATION_SLOT" in writes
+    assert write_engine.disposed is True  # write engine disposed (no leak)
 
 
 def test_batched_table_migrator_streams_then_loads() -> None:
@@ -1576,6 +1760,111 @@ def test_shard_worker_keys_on_the_target_composite_pk(monkeypatch) -> None:
     assert result.status == "DONE"
     assert seen["on_conflict"] is OnConflictMode.SKIP_EXISTING
     assert seen["key_columns"] == ["customer_id", "id"]
+
+
+def test_shard_worker_forwards_shared_snapshot_id_to_the_exporter(monkeypatch) -> None:
+    # A sharded read forwards its shared_snapshot_id to stream_converted_rows so every shard
+    # adopts the SAME exported point-in-time snapshot -> a consistent range-sharded read even
+    # for a REPLACE (no-CDC) load (PostgreSQL). The parent exports the id once; each shard
+    # imports it here.
+    import dataclasses
+
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    table = _tables()[0]
+    inputs = dataclasses.replace(
+        _inputs(), replace_tables=frozenset(), table_conversions={"orders": _composite_applied()}
+    )
+    fake_exporter = _FakeExporter()
+
+    class _NoopImporter:
+        def import_rows(self, rows, _table, **_kw):
+            list(rows)
+            return BatchedImportResult(rows_loaded=1, failures=0)
+
+    monkeypatch.setattr(
+        _engine, "BatchedTableMigrator",
+        lambda inp: BatchedTableMigrator(
+            inp, exporter=fake_exporter,
+            watermark_capturer=_FakeWatermarkCapturer(_watermark()),
+            importer_factory=lambda _i: _NoopImporter(),
+            target_counter=lambda _t: None,
+        ),
+    )
+
+    result = _engine._migrate_shard_in_process(
+        _engine._ShardWorkerArgs(
+            job_id="j", table=table, inputs=inputs,
+            pk_lower=0, pk_upper=1000, shard_index=0,
+            shared_snapshot_id="00000003-0000001B-1",
+        )
+    )
+    assert result.status == "DONE"
+    assert "00000003-0000001B-1" in getattr(fake_exporter, "shared_snapshot_ids", [])
+
+
+def test_open_shared_snapshot_closes_connection_on_failure() -> None:
+    # On a build failure (empty exported id -> RuntimeError, or any SQL error) the anchor's
+    # checked-out connection must be closed BEFORE the engine is disposed -- engine.dispose()
+    # does not close a leased connection, so its open REPEATABLE READ txn would linger.
+    import pytest
+
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.core.source_dialect import dialect_for
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    calls: list[str] = []
+
+    class _Res:
+        def scalar(self):
+            return None  # empty exported-snapshot id -> RuntimeError
+
+    class _Conn:
+        def execution_options(self, **_k):
+            return self
+
+        def execute(self, *_a, **_k):
+            return _Res()
+
+        def close(self):
+            calls.append("conn.close")
+
+    class _Eng:
+        def connect(self):
+            calls.append("connect")
+            return _Conn()
+
+        def dispose(self):
+            calls.append("engine.dispose")
+
+    class _Mig:
+        class _exporter:
+            _engine_factory = staticmethod(lambda _cfg: _Eng())
+
+        class _inputs:
+            source_config = None
+
+    with pytest.raises(RuntimeError):
+        _engine._open_shared_snapshot(_Mig(), dialect_for(SourceType.POSTGRES))
+    assert calls == ["connect", "conn.close", "engine.dispose"]  # conn closed before dispose
+
+
+def test_shared_snapshot_anchor_opened_inside_the_pool_try() -> None:
+    # The anchor open must sit INSIDE the try whose finally tears down the progress-drain
+    # thread/queue and closes the anchor. Opening it before that try would leak the drain
+    # thread on a build failure (source unreachable / export error).
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    src = inspect.getsource(_engine._migrate_tables_in_parallel)
+    i_open = src.index("_open_shared_snapshot(")
+    i_pool = src.index("with ProcessPoolExecutor(")
+    try_before_pool = src.rindex("try:", 0, i_pool)
+    assert try_before_pool < i_open < i_pool, (
+        "the shared-snapshot anchor must be opened inside the pool try so its finally "
+        "always runs (drain-thread teardown + _close_shared_snapshot) on a build failure"
+    )
 
 
 def test_shard_worker_leaves_an_unchanged_pk_to_the_source_fallback(monkeypatch) -> None:
@@ -5722,6 +6011,148 @@ def test_type_selector_records_a_choice_even_for_the_current_value() -> None:
     assert session.migration_type_chosen() is True   # the choice IS recorded
     assert state.migration_type is MigrationType.FULL_LOAD_ONLY  # value unchanged
     assert state.active_substep == "full_load"  # not reset (no real change)
+
+
+def test_source_supports_cdc_allowlists_mysql_and_postgres() -> None:
+    # Single enablement point for CDC-by-engine. MySQL (Debezium binlog) and PostgreSQL
+    # (pgoutput publication + replication slot, Phases A-D, live-validated in Phase F) are
+    # CDC-capable. An allowlist means any FUTURE engine still defaults to "no CDC".
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import source_supports_cdc
+
+    assert source_supports_cdc(SourceType.MYSQL) is True
+    assert source_supports_cdc(SourceType.POSTGRES) is True
+
+
+def _selector_click_handlers(state, *, source_type):
+    """Render the type selector and return (ui, per-tile click handlers).
+
+    Handlers are captured in tile render order: Full load only, CDC only,
+    Full load + CDC (MigrationType definition order).
+    """
+    from dsql_migrator.ui.data_migration import _render_migration_type_selector
+
+    ui = _RecordingUi()
+    clicks: list = []
+    orig_card = ui.card
+
+    def _card(*a, **k):
+        el = orig_card(*a, **k)
+        el.on = lambda _evt, handler, *_a, **_k: (clicks.append(handler), el)[1]
+        return el
+
+    ui.card = _card
+    _render_migration_type_selector(
+        ui,
+        state,
+        status=StepStatus.NOT_STARTED,
+        refresh=lambda: None,
+        locked=False,
+        source_type=source_type,
+    )
+    return ui, clicks
+
+
+def test_migration_type_selector_offers_cdc_tiles_for_postgres_source() -> None:
+    """A PostgreSQL source can now select a CDC migration type (Phases A-D, Phase F).
+
+    The two CDC tiles render selectable with no "coming soon" gate, and clicking them
+    changes the type -- identical to a MySQL source. (Before PG CDC shipped these tiles
+    were gated; that gate is lifted now that the pgoutput slot -> MSK -> DSQL sink path
+    is live-validated.)
+    """
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import (
+        DataMigrationState,
+        MigrationType,
+    )
+    from dsql_migrator.ui.session import SessionConnectionState
+
+    session = SessionConnectionState()
+    state = DataMigrationState()
+    state.bind_session(session)
+    assert state.migration_type is MigrationType.FULL_LOAD_ONLY  # the default
+
+    ui, clicks = _selector_click_handlers(state, source_type=SourceType.POSTGRES)
+
+    # No CDC gate for PostgreSQL anymore.
+    assert not any("Coming soon" in t for t in ui.texts), ui.texts
+    # Three tiles rendered (Full load only, CDC only, Full load + CDC).
+    assert len(clicks) == 3
+
+    # Clicking a CDC tile now selects it (as for MySQL).
+    clicks[1]()  # CDC only
+    assert state.migration_type is MigrationType.CDC_ONLY
+    clicks[2]()  # Full load + CDC
+    assert state.migration_type is MigrationType.FULL_LOAD_AND_CDC
+    clicks[0]()  # Full load only
+    assert state.migration_type is MigrationType.FULL_LOAD_ONLY
+    assert session.migration_type_chosen() is True
+
+
+def test_migration_type_selector_offers_all_tiles_for_mysql_source() -> None:
+    # A MySQL source keeps all three tiles selectable and shows no CDC "coming
+    # soon" gate.
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration import DataMigrationState, MigrationType
+    from dsql_migrator.ui.session import SessionConnectionState
+
+    session = SessionConnectionState()
+    state = DataMigrationState()
+    state.bind_session(session)
+
+    ui, clicks = _selector_click_handlers(state, source_type=SourceType.MYSQL)
+
+    assert not any("Coming soon" in t for t in ui.texts)
+    assert len(clicks) == 3
+    clicks[1]()  # CDC only -> selectable for MySQL
+    assert state.migration_type is MigrationType.CDC_ONLY
+
+
+def test_pg_cdc_handoff_stack_gates_slot_creation(monkeypatch) -> None:
+    """The Full Load sets cdc_stack_name (-> slot creation) only for a PG combined flow.
+
+    This is the C4b wiring: for a PostgreSQL Full Load + CDC run (CDC not yet streaming)
+    the watermark capture must create the replication slot, so the launch names the stack.
+    A MySQL source, a Full-Load-only run, or an already-streaming CDC leaves it None (no
+    slot -- MySQL uses the binlog seeder, and a slot with no consumer pins WAL).
+    """
+    import dsql_migrator.ui.data_migration as dm
+    from dsql_migrator.ui.data_migration import (
+        DataMigrationState,
+        MigrationType,
+        _pg_cdc_handoff_stack,
+    )
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+
+    monkeypatch.setattr(dm, "cdc_streaming_started", lambda *a, **k: False)
+    pg = SourceConnectionConfig(source_type=SourceType.POSTGRES, host="pg", database="app")
+    mysql = SourceConnectionConfig(source_type=SourceType.MYSQL, host="db", database="app")
+
+    def _state(mt):
+        s = DataMigrationState()
+        s.bind_session(SessionConnectionState())
+        s.set_migration_type(mt)
+        s.cdc_stack_name = "mysql-dsql-cdc-stack"
+        return s
+
+    # PostgreSQL + combined + not streaming -> the stack name (slot handoff armed).
+    assert (
+        _pg_cdc_handoff_stack(_state(MigrationType.FULL_LOAD_AND_CDC), pg, None)
+        == "mysql-dsql-cdc-stack"
+    )
+    # PostgreSQL Full-Load-only -> None (no CDC to hand off to).
+    assert _pg_cdc_handoff_stack(_state(MigrationType.FULL_LOAD_ONLY), pg, None) is None
+    # MySQL combined -> None (binlog offset-seeder handoff, not a slot).
+    assert (
+        _pg_cdc_handoff_stack(_state(MigrationType.FULL_LOAD_AND_CDC), mysql, None) is None
+    )
+    # CDC already streaming -> None (no fresh slot; the running slot stands).
+    monkeypatch.setattr(dm, "cdc_streaming_started", lambda *a, **k: True)
+    assert (
+        _pg_cdc_handoff_stack(_state(MigrationType.FULL_LOAD_AND_CDC), pg, None) is None
+    )
 
 
 def test_migration_type_unlocked_before_any_migration_starts() -> None:
@@ -11933,6 +12364,51 @@ def test_captured_watermark_falls_back_to_binlog_and_flags_approx(monkeypatch) -
     assert "approximate estimates" in entry["detail"]
 
 
+def test_captured_watermark_postgres_wording_is_not_mysql_binlog(monkeypatch) -> None:
+    # A PostgreSQL source captures a binlog-less (row-count-only) watermark BY DESIGN
+    # (CDC deferred); the activity-log wording must NOT imply a MySQL misconfiguration
+    # ("binary logging off"). It states the row-count baseline is expected for the engine.
+    from dsql_migrator.core.models import SourceType, Watermark
+    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        _engine, "log_activity",
+        lambda category, action, **kw: captured.append({"action": action, **kw}),
+    )
+
+    # With the PG resume coordinate captured, the log shows the WAL LSN (the gapless
+    # handoff point) -- never MySQL binlog wording.
+    wm = Watermark(
+        wal_lsn="3/AF012B8",
+        snapshot_timestamp=datetime(2026, 3, 4, 5, 6, 7, tzinfo=timezone.utc),
+        table_row_counts={"orders": 7, "customers": 3},
+        row_counts_approximate=True,
+    )
+    _engine._log_captured_watermark(wm, SourceType.POSTGRES)
+    (entry,) = captured
+    assert "WAL LSN 3/AF012B8" in entry["detail"]
+    assert "binary logging" not in entry["detail"]
+
+    # If the LSN could not be read (None), the wording is engine-specific (PostgreSQL),
+    # not the MySQL "binary logging off" phrasing.
+    captured.clear()
+    wm_no_lsn = Watermark(
+        snapshot_timestamp=datetime(2026, 3, 4, 5, 6, 7, tzinfo=timezone.utc),
+        table_row_counts={"orders": 7},
+        row_counts_approximate=True,
+    )
+    _engine._log_captured_watermark(wm_no_lsn, SourceType.POSTGRES)
+    detail = captured[0]["detail"]
+    assert "binary logging" not in detail
+    assert "PostgreSQL" in detail
+    assert "row-count baseline only" in detail
+    # MySQL default keeps its original wording (regression guard).
+    captured.clear()
+    _engine._log_captured_watermark(wm_no_lsn, SourceType.MYSQL)
+    assert "binary logging off or restricted" in captured[0]["detail"]
+
+
 def test_captured_watermark_none_is_noop(monkeypatch) -> None:
     from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
@@ -13532,7 +14008,9 @@ def test_every_cdc_param_build_passes_the_configured_sink_mcu() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id in ("build_cdc_stack_params", "build_cdc_infra_params")
+        # The param builds now go through the source-engine dispatch (MySQL vs
+        # PostgreSQL); the sink_mcu_count wiring must survive that indirection.
+        and node.func.id in ("dispatch_cdc_stack_params", "dispatch_cdc_infra_params")
     ]
     # Two Start-CDC-path builds (preview + deploy) and one infra create.
     assert len(calls) == 3, f"expected 3 param builds, found {len(calls)}"

@@ -129,3 +129,25 @@ def test_parse_coordinate_negative_position_is_none() -> None:
 
 def test_parse_coordinate_bad_file_is_none() -> None:
     assert parse_binlog_coordinate("not a file:100") is None
+
+
+# ---------------------------------------------------------------------------
+# validate_wal_lsn (PostgreSQL CDC start position)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_wal_lsn_accepts_a_well_formed_lsn() -> None:
+    from dsql_migrator.core.cdc_coords import validate_wal_lsn
+
+    assert validate_wal_lsn("3/AF012B8") is None
+    assert validate_wal_lsn("0/16B3748") is None
+    assert validate_wal_lsn("  9/AABBCC  ") is None  # surrounding whitespace tolerated
+
+
+def test_validate_wal_lsn_rejects_malformed_and_blank() -> None:
+    from dsql_migrator.core.cdc_coords import validate_wal_lsn
+
+    assert validate_wal_lsn("") is not None
+    assert validate_wal_lsn("not-an-lsn") is not None
+    assert validate_wal_lsn("3AF012B8") is not None  # missing the '/'
+    assert validate_wal_lsn("mysql-bin.000123:100") is not None  # a binlog coord

@@ -75,6 +75,7 @@ from dsql_migrator.core.models import (
     ConversionNoteKind,
     ForeignKeyDef,
     SourceInventory,
+    SourceType,
     TableDef,
     ViewDef,
 )
@@ -1403,14 +1404,16 @@ _BINARY_BASE_TYPES = frozenset(
 def _maps_to_bytea(column: ColumnDef) -> bool:
     """Return True when ``column`` converts to DSQL ``bytea``.
 
-    That is the BINARY/VARBINARY/BLOB family and every MySQL spatial type. DSQL
-    rejects a ``bytea`` column used in a primary key or index, so a key/index over
-    such a column must be surfaced (PK -> the CREATE TABLE is rejected; index -> it
-    is not emitted).
+    That is the BINARY/VARBINARY/BLOB family and every MySQL spatial type, plus the
+    PostgreSQL ``bytea`` type itself (on a PG source, ``mysql_type`` holds the exact PG
+    type string). DSQL rejects a ``bytea`` column used in a primary key or index, so a
+    key/index over such a column must be surfaced (PK -> the CREATE TABLE is rejected;
+    index -> it is not emitted). ``bytea`` never appears as a MySQL column type, so this
+    leaves the MySQL classification unchanged.
     """
     tokens = column.mysql_type.strip().lower().replace("(", " ").split()
     base = tokens[0] if tokens else ""
-    return base in _BINARY_BASE_TYPES or base in _SPATIAL_TYPES
+    return base in _BINARY_BASE_TYPES or base in _SPATIAL_TYPES or base == "bytea"
 
 
 def _substitute_unsupported_types(table: TableDef) -> tuple[TableDef, list[str]]:
@@ -1590,7 +1593,30 @@ def _wide_indexes(table: TableDef) -> list[tuple[str, int]]:
     ]
 
 
-def _build_index_ddls(table: TableDef) -> list[str]:
+def _pg_unsupported_key_columns(table: TableDef) -> set[str]:
+    """Names of PG-source columns whose type is not a valid DSQL COLUMN type at all.
+
+    On a PostgreSQL source a column typed ``varbit``/``bit varying``, an array, or a
+    geometric/network/xml/... type is not a DSQL column (surfaced per-column, as
+    UNSUPPORTED, by the ``is_postgres`` type-check loop in :meth:`convert_table`). It
+    therefore cannot participate in a key/index
+    either, so an index over it must be skipped (not emitted as a doomed ``CREATE INDEX
+    ASYNC``) and it must be excluded from the key-size estimate (whose "the DDL applies
+    fine" note would otherwise contradict the unsupported-type warning). ``bytea`` is NOT
+    included here -- it IS a valid column, just not a valid key, handled by
+    :func:`_maps_to_bytea`. PG-only: :func:`unsupported_dsql_reason` expects a PG type and
+    must never be applied to a MySQL type string.
+    """
+    from dsql_migrator.core.converter_postgres import unsupported_dsql_reason
+
+    return {
+        column.name
+        for column in table.columns
+        if unsupported_dsql_reason(column.mysql_type) is not None
+    }
+
+
+def _build_index_ddls(table: TableDef, *, is_postgres: bool = False) -> list[str]:
     """Render the table's secondary indexes as ``CREATE INDEX ASYNC`` statements.
 
     DSQL builds secondary indexes asynchronously, so each index is emitted as a
@@ -1611,12 +1637,16 @@ def _build_index_ddls(table: TableDef) -> list[str]:
     # so an index over a BINARY/VARBINARY/BLOB/spatial column is SKIPPED rather than
     # emitted as a doomed post-load CREATE INDEX ASYNC. Reported by
     # _bytea_key_warning (plain index) / _unsupported_index_type_warning (spatial).
-    bytea_columns = {column.name for column in table.columns if _maps_to_bytea(column)}
+    skip_columns = {column.name for column in table.columns if _maps_to_bytea(column)}
+    # A PG source also has DSQL-unsupported COLUMN types (varbit, arrays, geometric, ...)
+    # that cannot be a valid column, let alone indexed -- skip an index over them too.
+    if is_postgres:
+        skip_columns |= _pg_unsupported_key_columns(table)
     statements: list[str] = []
     for index in table.indexes:
         if len(index.columns) > _DSQL_MAX_PK_COLUMNS:
             continue
-        if any(column in bytea_columns for column in index.columns):
+        if any(column in skip_columns for column in index.columns):
             continue
         unique = "UNIQUE " if index.unique else ""
         columns = ", ".join(_quote_pg_identifier(column) for column in index.columns)
@@ -1664,6 +1694,11 @@ _KEY_TYPE_BYTES: dict = {
     _T.TIMESTAMP: 8,
     _T.TIMESTAMPTZ: 8,
     _T.UUID: 16,
+    # PostgreSQL-source fixed-width key types. Without these a timetz / interval PRIMARY
+    # KEY hits the unbounded-varlen fallback (1025 bytes) and falsely trips the ">1024-byte
+    # key" warning, even though both are small fixed-width DSQL-supported key types.
+    _T.TIMETZ: 12,  # time (8) + zone offset (4)
+    _T.INTERVAL: 16,  # months (4) + days (4) + micros (8)
 }
 # Assumed bytes for a variable-length key column with NO declared length (``text``,
 # or a type we cannot size). Not a DSQL cap: the docs list no per-column key cap --
@@ -2075,6 +2110,37 @@ def _generated_column_warning(table: TableDef) -> Optional[ConversionWarning]:
     )
 
 
+def _pg_generated_column_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """PostgreSQL-source variant of :func:`_generated_column_warning`.
+
+    A PostgreSQL ``GENERATED ALWAYS AS (...) STORED`` column has no Aurora DSQL
+    equivalent, so it is created as an ORDINARY column (``build_pg_source_ddl`` emits
+    no ``GENERATED`` clause). Full Load copies the values the source already computed --
+    the target starts CORRECT -- but nothing maintains them, so any insert/update that
+    does not supply the value drifts. The wording is PG-specific (the MySQL variant names
+    ``SHOW CREATE TABLE``); kept as a separate helper so the MySQL message stays
+    byte-identical.
+    """
+    columns = [column.name for column in table.columns if column.generated]
+    if not columns:
+        return None
+    names = ", ".join(columns)
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            f"Columns ({names}) are PostgreSQL STORED generated columns; Aurora DSQL has "
+            "no equivalent, so they are created as ORDINARY columns. Full Load copies the "
+            "values the source already computed, so the target starts correct — but "
+            "nothing maintains them afterwards, so any insert/update that does not supply "
+            "the value will drift. Compute it in the application (or in the query) before "
+            "cut over. The generating expression is not captured here; read it from the "
+            "source (e.g. \\d+ on the table, or pg_get_expr on pg_attrdef)."
+        ),
+    )
+
+
 def _collation_warning(table: TableDef) -> Optional[ConversionWarning]:
     """Warn about case-INSENSITIVE collations, which change query results on the target.
 
@@ -2261,7 +2327,7 @@ def _too_many_key_columns_warning(table: TableDef) -> Optional[ConversionWarning
 
 
 def _key_size_warning(
-    table: TableDef, create: exp.Expression
+    table: TableDef, create: exp.Expression, *, is_postgres: bool = False
 ) -> Optional[ConversionWarning]:
     """Warn when a key's declared column widths can exceed DSQL's 1 KiB key budget.
 
@@ -2293,13 +2359,19 @@ def _key_size_warning(
     # ("datatype bytea is not supported in a key"), reported by _bytea_key_warning.
     # Skip those keys/indexes here so this note does not contradict it by claiming
     # "the DDL itself applies fine" for a key DSQL refuses (and an index we do not emit).
-    bytea_columns = {column.name for column in table.columns if _maps_to_bytea(column)}
+    skip_columns = {column.name for column in table.columns if _maps_to_bytea(column)}
+    # Likewise for a PG source's DSQL-unsupported column types (varbit, arrays, geometric):
+    # the CREATE TABLE is already UNSUPPORTED for that column, so a key-size "applies fine"
+    # note would contradict it -- and the width estimate would be a false >1 KiB alarm from
+    # the unbounded-varlen fallback (an unrecognized type is assumed max-width).
+    if is_postgres:
+        skip_columns |= _pg_unsupported_key_columns(table)
 
     def estimate(columns: list[str]) -> int:
         return sum(_estimate_key_column_bytes(create, c) for c in columns)
 
     target_pk = _target_key_columns(create) or table.primary_key
-    if target_pk and not any(c in bytea_columns for c in target_pk):
+    if target_pk and not any(c in skip_columns for c in target_pk):
         pk_bytes = estimate(target_pk)
         if pk_bytes > _DSQL_MAX_KEY_BYTES:
             at_risk.append(
@@ -2310,7 +2382,7 @@ def _key_size_warning(
         # on a bytea column).
         if len(index.columns) > _DSQL_MAX_PK_COLUMNS:
             continue
-        if any(column in bytea_columns for column in index.columns):
+        if any(column in skip_columns for column in index.columns):
             continue
         index_bytes = estimate(index.columns)
         if index_bytes > _DSQL_MAX_KEY_BYTES:
@@ -2512,6 +2584,65 @@ def _bytea_key_warning(table: TableDef) -> Optional[ConversionWarning]:
         parts.append(
             f"the primary key includes {', '.join(pk_bytea)} "
             "(BINARY/VARBINARY/BLOB or spatial, which convert to bytea), so the generated "
+            "CREATE TABLE will be REJECTED as-is and neither the table nor its data "
+            "migrates — change the key column to a keyable type (store it as text, a uuid, "
+            "or a hash) before applying"
+        )
+    if index_bytea:
+        parts.append(
+            f"secondary index(es) {', '.join(index_bytea)} are on bytea column(s) and were "
+            "therefore NOT emitted (queries relying on them will fall back to a scan)"
+        )
+    return ConversionWarning(
+        object_name=table.name,
+        classification=(
+            Classification.UNSUPPORTED if pk_bytea else Classification.MANUAL
+        ),
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            "Aurora DSQL cannot use a bytea column in a key (\"datatype bytea is not "
+            f"supported in a key\"): {'; also, '.join(parts)}."
+        ),
+    )
+
+
+def _is_pg_bytea(column: ColumnDef) -> bool:
+    """True when a PostgreSQL-source column's exact type is ``bytea`` (not a MySQL family).
+
+    On a PG source ``mysql_type`` holds the exact PG type string, so this is a plain
+    ``bytea`` check -- deliberately NARROWER than :func:`_maps_to_bytea` (which also matches
+    the MySQL binary/blob families and the spatial names ``point``/``polygon`` that PG reuses
+    for its geometric types). Those PG geometric types are not bytea and are surfaced
+    per-column by the unsupported-type warning, so they must not be described as bytea here.
+    """
+    tokens = column.mysql_type.strip().lower().replace("(", " ").split()
+    return (tokens[0] if tokens else "") == "bytea"
+
+
+def _pg_bytea_key_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """PostgreSQL-source variant of :func:`_bytea_key_warning`.
+
+    Aurora DSQL rejects a ``bytea`` column in any key ("datatype bytea is not supported in
+    a key"). A bytea PRIMARY KEY -> the generated CREATE TABLE is REJECTED (UNSUPPORTED); a
+    bytea SECONDARY index -> it cannot be built and is NOT emitted (MANUAL/LOSS). Worded for
+    a PG source (no MySQL binary/blob/spatial families) and scoped to genuine bytea columns.
+    """
+    bytea_columns = {column.name for column in table.columns if _is_pg_bytea(column)}
+    if not bytea_columns:
+        return None
+    pk_bytea = [c for c in table.primary_key if c in bytea_columns]
+    index_bytea = [
+        index.name
+        for index in table.indexes
+        if any(c in bytea_columns for c in index.columns)
+        and (index.index_type or "").strip().lower() not in _UNSUPPORTED_INDEX_TYPES
+    ]
+    if not pk_bytea and not index_bytea:
+        return None
+    parts: list[str] = []
+    if pk_bytea:
+        parts.append(
+            f"the primary key includes {', '.join(pk_bytea)} (bytea), so the generated "
             "CREATE TABLE will be REJECTED as-is and neither the table nor its data "
             "migrates — change the key column to a keyable type (store it as text, a uuid, "
             "or a hash) before applying"
@@ -2756,7 +2887,15 @@ class SchemaConverter:
     foundation. Each table is parsed with ``sqlglot`` (mysql), its column types
     are rewritten per the DSQL type-mapping table, and the result is rendered as
     ``postgres`` DDL with double-quoted identifiers.
+
+    ``source_type`` selects the source engine. For MySQL (default) the flow above
+    applies. For PostgreSQL -- where both source and target are PostgreSQL, so it is
+    near-identity -- the table is rebuilt from its reflected PG types and parsed as
+    ``postgres`` (no MySQL->DSQL type remap), then the same DSQL-constraint phase runs.
     """
+
+    def __init__(self, *, source_type: SourceType = SourceType.MYSQL) -> None:
+        self._source_type = source_type
 
     def convert_table(
         self, table: TableDef, options: SchemaConvertOptions | None = None
@@ -2770,28 +2909,38 @@ class SchemaConverter:
         warnings are applied (Requirement 3.5).
         """
         options = options or SchemaConvertOptions()
-        # DSQL-unsupported source types (e.g. MySQL spatial) are substituted with
-        # bytea so the table still converts and the data is PRESERVED as raw bytes
-        # (never silently dropped/NULLed); a MANUAL warning is added per column.
-        table_for_ddl, bytea_fallback_columns = _substitute_unsupported_types(table)
-        source_ddl = _build_source_ddl(table_for_ddl)
-        # A single table whose reconstructed DDL cannot be parsed (e.g. a MySQL
-        # spatial type that sqlglot's MySQL dialect does not recognize and Aurora
-        # DSQL has no equivalent for) must NOT abort the whole Schema Conversion
-        # step. Isolate the failure: surface this one table as UNSUPPORTED with a
-        # clear reason and let the caller keep converting the rest.
-        try:
-            create = sqlglot.parse_one(source_ddl, read=_MYSQL)
-        except sqlglot.errors.SqlglotError as exc:
-            # SqlglotError covers BOTH ParseError and TokenError. Catching only
-            # ParseError meant a tokenizer failure -- e.g. an unbalanced quote in a
-            # reflected column default, or a MySQL charset introducer like
-            # ``_utf8mb4'x'`` -- escaped this guard and aborted the ENTIRE Schema
-            # Conversion step instead of isolating the one table.
-            return _unparsable_table_conversion(table, exc)
-
+        is_postgres = self._source_type is SourceType.POSTGRES
         source_types = {column.name: column.mysql_type for column in table.columns}
         warnings: list[ConversionWarning] = []
+        # Columns retyped to bytea for a DSQL-unsupported source type (MySQL spatial).
+        # Empty for a PostgreSQL source (no such substitution in v1).
+        bytea_fallback_columns: list[str] = []
+
+        # A single table whose reconstructed DDL cannot be parsed must NOT abort the
+        # whole Schema Conversion step. Isolate the failure: surface this one table as
+        # UNSUPPORTED with a clear reason and let the caller keep converting the rest.
+        # (SqlglotError covers BOTH ParseError and TokenError.)
+        if is_postgres:
+            # PostgreSQL source -> Aurora DSQL (both PostgreSQL): near-identity. Rebuild
+            # the CREATE from the reflected PG types and parse it as postgres -- there is
+            # no MySQL->DSQL type remap, no MySQL COLLATE to strip, and no spatial->bytea
+            # fallback (PG-unsupported-type substitution is a later refinement).
+            from dsql_migrator.core.converter_postgres import build_pg_source_ddl
+
+            try:
+                create = sqlglot.parse_one(build_pg_source_ddl(table), read=_POSTGRES)
+            except sqlglot.errors.SqlglotError as exc:
+                return _unparsable_table_conversion(table, exc)
+        else:
+            # DSQL-unsupported source types (e.g. MySQL spatial) are substituted with
+            # bytea so the table still converts and the data is PRESERVED as raw bytes
+            # (never silently dropped/NULLed); a MANUAL warning is added per column.
+            table_for_ddl, bytea_fallback_columns = _substitute_unsupported_types(table)
+            source_ddl = _build_source_ddl(table_for_ddl)
+            try:
+                create = sqlglot.parse_one(source_ddl, read=_MYSQL)
+            except sqlglot.errors.SqlglotError as exc:
+                return _unparsable_table_conversion(table, exc)
 
         # A source DEFAULT that could NOT be carried across must be reported. Aurora DSQL
         # supports column defaults, so most are preserved (see _column_default_sql) -- but
@@ -2800,7 +2949,7 @@ class SchemaConverter:
         # a NOT NULL column losing its default is a functional break (an application
         # INSERT that omits the column succeeds on MySQL and is REJECTED on the target),
         # whereas a nullable column merely starts defaulting to NULL.
-        for column in table.columns:
+        for column in (() if is_postgres else table.columns):
             if not column.default or column.generated:
                 continue
             if column.name == table.auto_increment_column:
@@ -2825,7 +2974,7 @@ class SchemaConverter:
                 )
             )
 
-        for column_def in create.find_all(exp.ColumnDef):
+        for column_def in (() if is_postgres else create.find_all(exp.ColumnDef)):
             # Drop any MySQL column COLLATE clause: DSQL/PostgreSQL does not have
             # MySQL collation names (e.g. utf8mb4_general_ci), and the reconstructed
             # type carries it as ``COLLATE '<name>'`` which is invalid PostgreSQL DDL
@@ -2892,6 +3041,69 @@ class SchemaConverter:
                 )
             )
 
+        # PostgreSQL source: warn on columns whose PG type Aurora DSQL does not support
+        # as a column type (arrays, and geometric/network/xml/money/bit/enum/composite/
+        # range/pgvector -- anything outside DSQL's documented supported set). PG->DSQL is
+        # otherwise near-identity, but these cannot be safely auto-substituted in v1 (that
+        # needs the Full Load value path), so the DDL keeps the faithful source type and
+        # the user is told to remodel before applying. Property 6 (no silent loss).
+        if is_postgres:
+            from dsql_migrator.core.converter_postgres import (
+                clamp_pg_numeric,
+                unconstrained_numeric_note,
+                unsupported_dsql_reason,
+            )
+
+            for column in table.columns:
+                reason = unsupported_dsql_reason(column.mysql_type)
+                if reason is not None:
+                    warnings.append(
+                        ConversionWarning(
+                            object_name=table.name,
+                            column_name=column.name,
+                            source_type=column.mysql_type,
+                            target_type=column.mysql_type,
+                            classification=Classification.UNSUPPORTED,
+                            message=reason,
+                        )
+                    )
+                    continue
+                # A supported numeric whose precision/scale exceeds DSQL's 38/37 is clamped
+                # in the emitted DDL (converter_postgres._ddl_column_type); surface the
+                # lossy reduction here so it is not a silent range/scale change. Mirrors the
+                # MySQL DECIMAL clamp warning.
+                clamped, clamp_note = clamp_pg_numeric(column.mysql_type)
+                if clamp_note is not None:
+                    warnings.append(
+                        ConversionWarning(
+                            object_name=table.name,
+                            column_name=column.name,
+                            source_type=column.mysql_type,
+                            target_type=clamped,
+                            classification=Classification.MANUAL,
+                            message=clamp_note,
+                        )
+                    )
+                    continue
+                # A bare `numeric`/`decimal` (no declared precision) is stored by DSQL at
+                # its default numeric(18,6): a value beyond 6 fractional digits is rounded
+                # on load. Surface it so this is not a SILENT precision loss (Property 6) --
+                # Validation compares such a column at scale 6 (validation_sql), a schema
+                # decision that must be visible here, not hidden. Mutually exclusive with the
+                # clamp warning above (a bare numeric has no declared precision to clamp).
+                bare_note = unconstrained_numeric_note(column.mysql_type)
+                if bare_note is not None:
+                    warnings.append(
+                        ConversionWarning(
+                            object_name=table.name,
+                            column_name=column.name,
+                            source_type=column.mysql_type,
+                            target_type="numeric(18,6)",
+                            classification=Classification.MANUAL,
+                            message=bare_note,
+                        )
+                    )
+
         # Apply DSQL structural constraints (Requirements 3.3, 3.5). Foreign keys
         # are never emitted by _build_source_ddl, so removal only requires
         # preserving them as metadata plus a warning.
@@ -2923,26 +3135,32 @@ class SchemaConverter:
         warnings.extend(pk_strategy_warnings)
         for optional_warning in (
             _no_primary_key_warning(table),
-            _bytea_key_warning(table),
+            # MySQL vs PostgreSQL bytea-in-key warnings are worded per engine: the MySQL one
+            # names the BINARY/VARBINARY/BLOB/spatial families it substitutes to bytea; the
+            # PG one names only the genuine bytea columns (PG's other DSQL-unsupported types
+            # are surfaced per-column, as UNSUPPORTED, by the is_postgres type-check loop).
+            (_bytea_key_warning(table) if not is_postgres else None),
+            (_pg_bytea_key_warning(table) if is_postgres else None),
             _foreign_key_warning(table),
             _check_constraint_warning(table),
             _identifier_length_warning(table),
             _expression_index_warning(table),
             _comment_warning(table),
             _partitioned_table_warning(table),
-            _unsupported_index_type_warning(table),
-            _prefix_index_warning(table),
+            (_unsupported_index_type_warning(table) if not is_postgres else None),
+            (_prefix_index_warning(table) if not is_postgres else None),
             _too_many_columns_warning(table),
             _too_many_indexes_warning(table, len(extra_index_ddls)),
             _too_many_key_columns_warning(table),
             # Reads the post-conversion types off `create`, so it must run AFTER the
             # PK strategy has rewritten the key (a UUID/identity conversion changes
             # the key's byte estimate, and COMPOSITE_KEY changes its columns).
-            _key_size_warning(table, create),
-            _oversized_lob_warning(table),
-            _generated_column_warning(table),
-            _collation_warning(table),
-            _on_update_timestamp_warning(table),
+            _key_size_warning(table, create, is_postgres=is_postgres),
+            (_oversized_lob_warning(table) if not is_postgres else None),
+            (_generated_column_warning(table) if not is_postgres else None),
+            (_pg_generated_column_warning(table) if is_postgres else None),
+            (_collation_warning(table) if not is_postgres else None),
+            (_on_update_timestamp_warning(table) if not is_postgres else None),
         ):
             if optional_warning is not None:
                 warnings.append(optional_warning)
@@ -2958,7 +3176,7 @@ class SchemaConverter:
             table=table.name,
             target_ddl=target_ddl,
             schema_ddls=schema_ddls,
-            index_ddls=_build_index_ddls(table) + extra_index_ddls,
+            index_ddls=_build_index_ddls(table, is_postgres=is_postgres) + extra_index_ddls,
             preserved_foreign_keys=list(table.foreign_keys),
             warnings=warnings,
         )

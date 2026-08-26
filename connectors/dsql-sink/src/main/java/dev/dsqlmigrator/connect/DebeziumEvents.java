@@ -9,9 +9,12 @@
  */
 package dev.dsqlmigrator.connect;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.sink.SinkRecord;
@@ -28,19 +31,47 @@ import org.apache.kafka.connect.sink.SinkRecord;
  */
 final class DebeziumEvents {
 
+  /**
+   * Debezium's default sentinel for an UNCHANGED, out-of-line (TOASTed) column value on a
+   * PostgreSQL UPDATE. Under {@code REPLICA IDENTITY DEFAULT} the WAL omits a TOASTed
+   * column that the UPDATE did not change, so Debezium substitutes this placeholder in the
+   * after-image ({@code unavailable.value.placeholder}, which the source connector leaves
+   * at its default). Binding it would OVERWRITE the real value with the sentinel, so such a
+   * column is dropped from the upsert (see {@link #extractAfterImage}) -> {@code ON CONFLICT
+   * DO UPDATE} leaves the existing DSQL value intact. This is a PostgreSQL-only concern
+   * (MySQL has no TOAST), so {@link #parse} gates the drop on a PostgreSQL source and the
+   * guard is never even evaluated for a MySQL source.
+   */
+  static final String TOAST_UNAVAILABLE_PLACEHOLDER = "__debezium_unavailable_value";
+
+  // The bytea form of the placeholder (a bytea column carries the sentinel as the UTF-8
+  // bytes of the string, since the source connector uses the default string placeholder).
+  private static final byte[] TOAST_UNAVAILABLE_PLACEHOLDER_BYTES =
+      TOAST_UNAVAILABLE_PLACEHOLDER.getBytes(StandardCharsets.UTF_8);
+
   private DebeziumEvents() {}
 
   static ChangeEvent parse(SinkRecord record) {
+    Object value = record.value();
+    Struct envelope = (value instanceof Struct) ? (Struct) value : null;
+    Struct source = envelope != null ? optStruct(envelope, "source") : null;
+    // Determine the origin engine (Debezium's source.connector) EARLY so PostgreSQL-specific
+    // value handling applies to the key/before PK extraction too, not just the after-image:
+    //   - the TOAST unavailable-value omission (see extractAfterImage), and
+    //   - PG bit/varbit rendered as the bit-string text (see convertField / pgBitString).
+    // A MySQL -- or unknown/tombstone -- source keeps byte-identical prior behavior (MySQL
+    // BIT stays an integer; the sentinel string is only ever real user data there).
+    boolean pgSource = source != null && "postgresql".equals(optString(source, "connector"));
+
     List<String> pkColumns = new ArrayList<>();
     List<Object> pkValues = new ArrayList<>();
-    extractStruct(record.key(), pkColumns, pkValues);
+    extractStruct(record.key(), pkColumns, pkValues, pgSource);
 
-    Object value = record.value();
     if (value == null) {
       // Tombstone -> delete by key. No envelope, so no source.ts_ms (lag unknown).
       return buildDelete(tableFromTopic(record.topic()), pkColumns, pkValues, 0L);
     }
-    if (!(value instanceof Struct envelope)) {
+    if (envelope == null) {
       throw new DataException(
           "Unsupported record value type; expected a Debezium Struct envelope");
     }
@@ -49,7 +80,7 @@ final class DebeziumEvents {
     String table = resolveTable(envelope, record.topic());
     // Source commit time for the end-to-end replication-lag metric (now - ts at
     // apply). 0 when the source block omits ts_ms -> lag simply not recorded.
-    long sourceTsMs = optLong(optStruct(envelope, "source"), "ts_ms");
+    long sourceTsMs = optLong(source, "ts_ms");
     Struct after = optStruct(envelope, "after");
 
     if ("d".equals(op) || after == null) {
@@ -57,7 +88,7 @@ final class DebeziumEvents {
         // No message key: fall back to the before-image for the PK.
         Struct before = optStruct(envelope, "before");
         if (before != null) {
-          extractStruct(before, pkColumns, pkValues);
+          extractStruct(before, pkColumns, pkValues, pgSource);
         }
       }
       return buildDelete(table, pkColumns, pkValues, sourceTsMs);
@@ -65,7 +96,7 @@ final class DebeziumEvents {
 
     List<String> columns = new ArrayList<>();
     List<Object> values = new ArrayList<>();
-    extractStruct(after, columns, values);
+    extractAfterImage(after, columns, values, pgSource);
     if (pkColumns.isEmpty()) {
       throw new DataException(
           "Cannot build upsert for table " + table + ": record has no key (pk) fields");
@@ -88,7 +119,8 @@ final class DebeziumEvents {
     return ChangeEvent.delete(table, pkColumns, pkValues, sourceTsMs);
   }
 
-  private static void extractStruct(Object maybeStruct, List<String> names, List<Object> values) {
+  private static void extractStruct(
+      Object maybeStruct, List<String> names, List<Object> values, boolean pgSource) {
     if (!(maybeStruct instanceof Struct struct)) {
       return;
     }
@@ -96,10 +128,91 @@ final class DebeziumEvents {
       names.add(field.name());
       // Convert the Debezium-encoded value to its canonical DSQL-target form
       // (e.g. MicroTimestamp Long -> java.sql.Timestamp) so it matches the Full
-      // Load bulk loader's encoding before it is bound. The field's schema name
-      // carries the Debezium logical type that drives the conversion.
-      values.add(DebeziumTypeConverter.convert(field.schema().name(), struct.get(field)));
+      // Load bulk loader's encoding before it is bound.
+      values.add(convertField(field, struct.get(field), pgSource));
     }
+  }
+
+  /**
+   * Convert one field value to its DSQL-target form. Delegates to
+   * {@link DebeziumTypeConverter#convert(String, Object)} except for a PostgreSQL source's
+   * {@code io.debezium.data.Bits} (bit/varbit), which PostgreSQL treats as a bit STRING and
+   * the Full Load path writes as such -- so it is rendered via
+   * {@link DebeziumTypeConverter#pgBitString} (using the field schema's declared length)
+   * rather than the MySQL-BIT integer mapping. MySQL Bits keeps the integer mapping.
+   */
+  private static Object convertField(Field field, Object raw, boolean pgSource) {
+    Schema fieldSchema = field.schema();
+    if (pgSource && DebeziumTypeConverter.BITS_TYPE.equals(fieldSchema.name())) {
+      return DebeziumTypeConverter.pgBitString(raw, fieldSchema);
+    }
+    return DebeziumTypeConverter.convert(fieldSchema.name(), raw);
+  }
+
+  /**
+   * Extract an UPSERT after-image, dropping any column whose value is the PostgreSQL TOAST
+   * unavailable-value placeholder (see {@link #TOAST_UNAVAILABLE_PLACEHOLDER}) when
+   * {@code dropToastPlaceholder} is set (i.e. a PostgreSQL source -- see {@link #parse}).
+   * For a MySQL source {@code dropToastPlaceholder} is false and every column is bound
+   * verbatim, byte-identical to the pre-Phase-D path (MySQL has no TOAST, so the sentinel
+   * there would only ever be genuine user data that must NOT be dropped).
+   *
+   * <p>An omitted column is simply absent from the rendered {@code INSERT ... ON CONFLICT
+   * DO UPDATE SET ...}, so its existing DSQL value is preserved (a partial upsert) instead
+   * of being overwritten with the sentinel. The primary key is never TOASTed, so it is
+   * never dropped -- and the {@code ON CONFLICT} target comes from the record key, not this
+   * after-image, so dropping a non-key column cannot affect conflict resolution.
+   *
+   * <p><b>Tradeoff:</b> if a placeholder-bearing UPDATE ever targets a PK that does not yet
+   * exist in DSQL, the {@code ON CONFLICT} inserts a row with that column left at its
+   * default (NULL) rather than the true value. Under the gapless handoff the row always
+   * exists (the slot resumes after the Full Load consistency point), and Validation would
+   * surface any residual gap -- a bounded, detectable gap is strictly better than silently
+   * writing the sentinel string into the column.
+   *
+   * <p><b>Known v1 limitation (unchanged TOASTed {@code numeric}):</b> Debezium substitutes
+   * a DETECTABLE placeholder only for string- and bytes-schema'd columns (text/varchar/
+   * char/json/jsonb and bytea) -- the realistic large-value types. For an unchanged TOASTed
+   * {@code numeric} its value converter yields a plain {@code NULL} (not the sentinel), which
+   * this method cannot distinguish from a genuine {@code NULL} update, so such a column is
+   * NOT omitted and the upsert would overwrite the real value with NULL. This requires a
+   * {@code numeric} large enough to be stored out-of-line (thousands of digits, &gt;~2 KiB) --
+   * effectively unreachable for real data (business numbers never reach that size; "very
+   * large values" are text/blob, which ARE handled). The robust fix is Debezium's
+   * {@code ReselectColumnsPostProcessor} (re-query the unavailable column from the source by
+   * PK), to be enabled on the source connector and validated live in Phase F.
+   */
+  private static void extractAfterImage(
+      Object after, List<String> names, List<Object> values, boolean dropToastPlaceholder) {
+    if (!(after instanceof Struct struct)) {
+      return;
+    }
+    for (Field field : struct.schema().fields()) {
+      Object raw = struct.get(field);
+      if (dropToastPlaceholder && isToastPlaceholder(raw)) {
+        continue; // unchanged TOAST value: omit so the existing target value is kept
+      }
+      names.add(field.name());
+      values.add(convertField(field, raw, dropToastPlaceholder));
+    }
+  }
+
+  /**
+   * True when a raw after-image value is Debezium's TOAST unavailable-value placeholder --
+   * as the sentinel string (text/varchar/char/json/jsonb columns) or its UTF-8 bytes (a
+   * bytea column). Checked on the RAW value BEFORE type conversion so a {@code json}
+   * sentinel is caught before it would be wrapped in a {@code PGobject}. Only consulted for
+   * a PostgreSQL source (see {@link #extractAfterImage}), so a MySQL row that happens to
+   * carry this exact string is never affected.
+   */
+  private static boolean isToastPlaceholder(Object raw) {
+    if (raw instanceof String s) {
+      return TOAST_UNAVAILABLE_PLACEHOLDER.equals(s);
+    }
+    if (raw instanceof byte[] b) {
+      return Arrays.equals(b, TOAST_UNAVAILABLE_PLACEHOLDER_BYTES);
+    }
+    return false;
   }
 
   /**

@@ -26,6 +26,7 @@ from dsql_migrator.core.models import (
     AiAssistConfig,
     AiConversation,
     SourceConnectionConfig,
+    SourceType,
     TargetConnectionConfig,
     WorkflowState,
 )
@@ -48,7 +49,7 @@ class SessionConnectionState:
         "source_verified",
         "target_verified",
         "source_server_version",
-        "source_mysql_version",
+        "source_engine_version",
         "source_aurora_version",
         "source_instance_class",
         "target_cluster_name",
@@ -63,6 +64,7 @@ class SessionConnectionState:
         "_migration_type_chosen",
         "_cdc_infra_inputs",
         "source_secret_id",
+        "restored_source_type",
     )
 
     def __init__(self) -> None:
@@ -79,10 +81,11 @@ class SessionConnectionState:
         # Source server version (e.g. Aurora MySQL version) captured read-only on
         # a successful source test; shown on the overview diagram. Non-secret.
         self.source_server_version: Optional[str] = None
-        # Community MySQL engine version (e.g. 8.0.42) behind an Aurora build.
-        self.source_mysql_version: Optional[str] = None
-        # Aurora MySQL engine version (e.g. 3.07.1) from @@aurora_version;
-        # present only for Aurora MySQL sources. Non-secret.
+        # Clean base-engine version (MySQL 8.0.42 behind an Aurora build, or
+        # PostgreSQL 16.4). Non-secret.
+        self.source_engine_version: Optional[str] = None
+        # Aurora-managed engine version (Aurora MySQL 3.07.1 from @@aurora_version,
+        # or Aurora PostgreSQL from aurora_version()); None for RDS/community. Non-secret.
         self.source_aurora_version: Optional[str] = None
         # Source RDS/Aurora instance class (e.g. db.r6g.large) looked up via the
         # RDS API on a successful source test; best effort, shown on the diagram.
@@ -144,6 +147,12 @@ class SessionConnectionState:
         # Connect screen -- the CDC deploy reads it to auto-fill SourceSecretArn/Name
         # (Property 7: only the non-secret reference is stored, never the credential).
         self.source_secret_id: Optional[str] = None
+        # The source ENGINE kind recovered from a snapshot restore (never the source
+        # connection/secret, which is not persisted). A hint only: it pre-selects the
+        # engine on the Connect screen so a PostgreSQL operator resuming a restored
+        # workbench does not land on the MySQL default. Cleared once a live source is
+        # reconnected (set_source) or on Start over.
+        self.restored_source_type: Optional[SourceType] = None
 
     def set_source(
         self,
@@ -157,6 +166,13 @@ class SessionConnectionState:
         """
         self.source_config = config
         self._source_password = password
+        # A live source supersedes any restored-engine hint (the picker now reads the
+        # real config's source_type).
+        self.restored_source_type = None
+
+    def set_restored_source_type(self, source_type: Optional[SourceType]) -> None:
+        """Record the source engine kind recovered from a snapshot restore (hint only)."""
+        self.restored_source_type = source_type
 
     @property
     def source_password(self) -> Optional[SecretValue]:
@@ -174,7 +190,7 @@ class SessionConnectionState:
             # A failed test or an edited connection invalidates the captured
             # version so the diagram never shows stale source metadata.
             self.source_server_version = None
-            self.source_mysql_version = None
+            self.source_engine_version = None
             self.source_aurora_version = None
             self.source_instance_class = None
         self._refresh_workflow_unlock()
@@ -199,12 +215,12 @@ class SessionConnectionState:
     def set_source_version(
         self,
         version: Optional[str],
-        mysql_version: Optional[str] = None,
+        engine_version: Optional[str] = None,
         aurora_version: Optional[str] = None,
     ) -> None:
-        """Record the source server, community MySQL, and Aurora versions."""
+        """Record the source raw server, clean base-engine, and Aurora versions."""
         self.source_server_version = version
-        self.source_mysql_version = mysql_version
+        self.source_engine_version = engine_version
         self.source_aurora_version = aurora_version
 
     def set_source_instance_class(self, instance_class: Optional[str]) -> None:
@@ -352,7 +368,7 @@ class SessionConnectionState:
         self.source_verified = False
         self.target_verified = False
         self.source_server_version = None
-        self.source_mysql_version = None
+        self.source_engine_version = None
         self.source_aurora_version = None
         self.source_instance_class = None
         self.target_cluster_name = None
@@ -369,6 +385,7 @@ class SessionConnectionState:
         self._migration_type_chosen = False
         self._cdc_infra_inputs = {}
         self.source_secret_id = None
+        self.restored_source_type = None
 
     def __repr__(self) -> str:
         return (

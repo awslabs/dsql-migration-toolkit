@@ -611,6 +611,25 @@ def _announce_cdc_events(migration_state, status_view, ai_post_event) -> None:
         pass
 
 
+def _render_cdc_slot_health(ui, migration_state) -> None:
+    """Render the PostgreSQL replication-slot WAL-pressure notice (PostgreSQL CDC only).
+
+    Reads ``migration_state.cdc_slot_health`` (a :class:`SlotHealth`, populated by the
+    read-only source read on the consistency-view refresh) and renders the classified
+    notice: an invalidated slot -> error, WAL pressure / an inactive slot -> warning, a
+    healthy slot -> success. Only a real slot renders a panel; ``None`` / no-slot (a
+    MySQL source, or before the slot exists) shows nothing, so the panel is inherently
+    PostgreSQL-only. Pure render (no I/O).
+    """
+    health = getattr(migration_state, "cdc_slot_health", None)
+    if health is None or not getattr(health, "exists", False):
+        return
+    from dsql_migrator.core.cdc_postgres import classify_slot_health
+
+    tone, headline, detail = classify_slot_health(health)
+    render_notice(ui, tone=tone, header=headline, body=detail)
+
+
 def _render_cdc_live_monitoring(
     ui, migration_state, job_manager, session=None, cdc_ai_opener=None,
     ai_post_event=None,
@@ -744,6 +763,9 @@ def _render_cdc_live_monitoring(
             _render_cdc_pipeline_health(
                 ui, view, getattr(migration_state, "cdc_activity", None)
             )
+            # PostgreSQL CDC: warn about source WAL pressure (the logical slot pinning
+            # WAL) before the source disk fills. No-op for a MySQL source (no slot).
+            _render_cdc_slot_health(ui, migration_state)
             _render_cdc_dlq_panel(
                 ui,
                 migration_state,

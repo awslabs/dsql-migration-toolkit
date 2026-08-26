@@ -215,6 +215,12 @@ class DataMigrationState:
         # empty/absent when the metric is unavailable (older plugin) or the table is
         # idle/caught up.
         self.cdc_replication_lag_by_table: dict[str, int] = {}
+        # PostgreSQL CDC only: the source logical replication slot's WAL-retention health
+        # (a cdc_postgres.SlotHealth), refreshed when the source is read for the
+        # consistency view. Drives the WAL-pressure warning panel; None when unknown or
+        # for a MySQL source (which has no slot). Stored untyped to avoid importing the
+        # PG-only model here.
+        self.cdc_slot_health = None
         # Rolling replication-lag series backing the live "Stream lag" chart:
         # [(epoch_seconds, max_lag_ms), ...], bounded to ~15 min. Hybrid — seeded once
         # from CloudWatch's 1-minute history (survives a reload) then extended by each
@@ -639,6 +645,8 @@ class DataMigrationState:
             self.cdc_ops_window_start = None
             self.cdc_replication_lag_by_table = {}
             self.cdc_replication_lag_series = []
+            # Slot health belongs to the previously-targeted stack's slot.
+            self.cdc_slot_health = None
         return True
 
     def append_cdc_deploy_log(self, when: datetime, message: str) -> None:
@@ -696,6 +704,16 @@ class DataMigrationState:
                     "deletes": int(ops.get("deletes", 0) or 0),
                 }
             self.cdc_applied_ops_by_table = normalized
+
+    def set_cdc_slot_health(self, health) -> None:
+        """Record the PostgreSQL source replication slot's WAL-retention health.
+
+        ``health`` is a :class:`~dsql_migrator.core.cdc_postgres.SlotHealth` (or ``None``
+        when unknown / not a PostgreSQL source). Thread-safe: written from the read-only
+        source-read worker, read by the render on the loop.
+        """
+        with self._lock:
+            self.cdc_slot_health = health
 
     def set_cdc_ops_window_start(self, ts: "Optional[datetime]") -> None:
         """Pin the start of the window the per-table applied-ops (I/U/D) are summed over.

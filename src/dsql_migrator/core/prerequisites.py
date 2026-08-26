@@ -31,7 +31,10 @@ never include credential or token values.
 
 from __future__ import annotations
 
-from typing import Iterable, Mapping, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Protocol, Sequence
+
+if TYPE_CHECKING:
+    from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
 
 from dsql_migrator.core.models import (
     ConnectionResult,
@@ -41,6 +44,7 @@ from dsql_migrator.core.models import (
     PrerequisiteReport,
     PrerequisiteResult,
     PrerequisiteStatus,
+    SourceType,
     TableDef,
     apply_lob_exclusions,
 )
@@ -66,6 +70,15 @@ class SourceProbe(Protocol):
         Keys should be the MySQL variable names (e.g. ``log_bin``,
         ``binlog_format``, ``binlog_row_image``, ``gtid_mode``); values are their
         string values (e.g. ``ON`` / ``ROW`` / ``FULL``).
+        """
+
+    def cdc_prerequisites(
+        self, table_names: Sequence[str]
+    ) -> "Optional[PostgresCdcFacts]":
+        """Return the PostgreSQL CDC readiness facts, or ``None`` for a MySQL source.
+
+        Read-only; delegates to the source dialect. Only consulted for a PostgreSQL
+        source in CDC mode (MySQL uses the binlog/GTID variable checks instead).
         """
 
 
@@ -124,15 +137,25 @@ def check_source_reachable(result: ConnectionResult) -> PrerequisiteResult:
 
 
 def check_replication_grants(
-    grants: list[str], mode: MigrationMode
+    grants: list[str],
+    mode: MigrationMode,
+    *,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> PrerequisiteResult:
     """PASS when the source user holds the privileges required for ``mode``.
 
     Full Load requires ``SELECT``; CDC additionally requires ``REPLICATION
     CLIENT`` and ``REPLICATION SLAVE``. ``ALL PRIVILEGES`` satisfies any
     requirement. Matching is case-insensitive over the raw ``SHOW GRANTS`` text.
+
+    The CDC replication privileges are MySQL-specific tokens. PostgreSQL CDC uses
+    PostgreSQL's own replication readiness instead (the ``REPLICATION`` role
+    attribute / ``rds_replication`` membership), checked separately, so a
+    PostgreSQL source is only asked for the ``SELECT`` Full Load grant here
+    regardless of ``mode`` -- never MySQL's replication privileges.
     """
-    required = _CDC_GRANTS if mode == MigrationMode.CDC else _FULL_LOAD_GRANTS
+    cdc_mysql = mode == MigrationMode.CDC and source_type is SourceType.MYSQL
+    required = _CDC_GRANTS if cdc_mysql else _FULL_LOAD_GRANTS
     blob = " ".join(grants).upper()
     has_all = "ALL PRIVILEGES" in blob
     missing = [
@@ -153,7 +176,7 @@ def check_replication_grants(
             "Use a dedicated least-privilege CDC user granted SELECT, REPLICATION "
             "CLIENT, REPLICATION SLAVE (and RELOAD + LOCK TABLES for the initial "
             "snapshot) rather than an admin account."
-            if mode == MigrationMode.CDC
+            if cdc_mysql
             else "Grant SELECT to a dedicated migration user (avoid an admin account)."
         ),
     )
@@ -582,7 +605,13 @@ class PrerequisiteChecker:
 
         # Source-side checks
         results.append(check_source_reachable(self._source.reachable()))
-        results.append(check_replication_grants(self._source.grants(), request.mode))
+        results.append(
+            check_replication_grants(
+                self._source.grants(),
+                request.mode,
+                source_type=request.source_type,
+            )
+        )
 
         # Per-table checks. Filter each table through the migration-wide LOB
         # exclusion so the pre-load gate sees the columns the load will actually
@@ -614,7 +643,51 @@ class PrerequisiteChecker:
             )
 
         # CDC-only checks (SKIP in Full Load).
-        if request.mode == MigrationMode.CDC:
+        if request.mode == MigrationMode.CDC and request.source_type is SourceType.POSTGRES:
+            # PostgreSQL CDC readiness: logical replication (pgoutput) needs
+            # wal_level=logical, a slot-creating role, slot/wal-sender headroom, a writer
+            # source, and a usable REPLICA IDENTITY per captured table. The facts are
+            # read once (read-only) by the dialect probe; the pure checks live in the
+            # engine-separated prerequisites_postgres module. MSK is engine-neutral (PG
+            # CDC uses the same MSK pipeline) so it still runs; the MySQL binlog/GTID
+            # checks do not apply and are SKIP.
+            from dsql_migrator.core import prerequisites_postgres
+
+            facts = self._source.cdc_prerequisites([table.name for table in tables])
+            if facts is None:
+                # For a PostgreSQL source the probe returns facts unless it FAILED
+                # (unreachable / insufficient privilege). CDC must not start against a
+                # source whose logical-replication readiness is unverified, so this is a
+                # blocking FAIL -- not the advisory not-supported INFO.
+                results.append(
+                    prerequisites_postgres.check_postgres_cdc_facts_unavailable()
+                )
+            else:
+                results.extend(
+                    prerequisites_postgres.check_postgres_cdc_prerequisites(
+                        facts, [effective[table.name] for table in tables]
+                    )
+                )
+            results.append(
+                _skipped(
+                    PrerequisiteCheckId.BINLOG_ROW_FORMAT,
+                    "Binary log uses ROW format with full row image",
+                )
+            )
+            results.append(
+                _skipped(PrerequisiteCheckId.GTID_MODE, "GTID mode is enabled")
+            )
+            results.append(
+                check_msk_available(
+                    self._msk.cluster_available() if self._msk else False
+                )
+            )
+            results.append(
+                check_msk_connect_available(
+                    self._msk.connect_available() if self._msk else False
+                )
+            )
+        elif request.mode == MigrationMode.CDC:
             variables = self._source.variables()
             results.append(check_binlog_row_format(variables))
             results.append(check_binlog_retention(variables))

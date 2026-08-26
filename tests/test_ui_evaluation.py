@@ -30,6 +30,7 @@ from dsql_migrator.core.models import (
     ForeignKeyDef,
     SourceConnectionConfig,
     SourceInventory,
+    SourceType,
     StepStatus,
     TableDef,
     TargetConnectionConfig,
@@ -1673,3 +1674,37 @@ def test_ui_chart_axis_uses_friendly_kind_labels() -> None:
 
     _render_assessment_chart(_ChartUi(), report)
     assert captured["option"]["yAxis"]["data"] == ["Stored procedures"], captured
+
+
+def test_run_evaluation_threads_postgres_source_type_to_assessor() -> None:
+    # Tier-3 #25: a PostgreSQL array column is UNSUPPORTED under PG assessor rules but would
+    # be assessed differently under MySQL rules, so this proves run_evaluation built the
+    # assessor with the SESSION's source_type (POSTGRES), not the MySQL default.
+    inv = SourceInventory(tables=[TableDef(
+        name="t",
+        columns=[
+            ColumnDef(name="id", mysql_type="integer", nullable=False),
+            ColumnDef(name="tags", mysql_type="integer[]", nullable=True),
+        ],
+        primary_key=["id"],
+    )])
+    src_factory, _ = _source_factory(inv)
+    tgt_factory, _ = _target_factory(_empty_target())
+    pg_inputs = EvaluationInputs(
+        source_config=SourceConnectionConfig(
+            host="h", port=5432, database="app", username="u",
+            source_type=SourceType.POSTGRES,
+        ),
+        source_password=SecretValue("pw"),
+        target_config=_target_config(),
+        aws_profile=None,
+    )
+    result = run_evaluation(
+        pg_inputs, introspector_factory=src_factory, target_browser_factory=tgt_factory
+    )
+    rule_ids = {it.rule_id for it in result.assessment.items} | {
+        c.rule_id for it in result.assessment.items for c in (it.concerns or [])
+    }
+    assert "PG_UNSUPPORTED_TYPE" in rule_ids  # PG rules ran (not MySQL)
+    item = next(it for it in result.assessment.items if it.object_name == "t")
+    assert item.classification is Classification.UNSUPPORTED

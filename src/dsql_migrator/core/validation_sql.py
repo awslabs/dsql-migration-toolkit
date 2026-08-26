@@ -17,12 +17,18 @@ module docstring for the cross-engine checksum-normalization rationale.
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from psycopg import sql
 
 from dsql_migrator.core.converter import is_spatial_mysql_type, map_mysql_type
 from dsql_migrator.core.models import ColumnDef, ForeignKeyDef, TableDef
+
+# A length/precision/scale modifier "(N)" / "(p,s)" anywhere in a type string, used to
+# reduce a format_type spelling to its base for a timetz classification (e.g.
+# "time(6) with time zone" -> "time with time zone"). Mirrors converter_postgres.
+_TYPE_MODIFIER_RE = re.compile(r"\(\s*\d+\s*(?:,\s*\d+\s*)?\)")
 
 # Number of leading MD5 hex digits used to build a per-row checksum token. 15
 # hex digits = 60 bits, which stays positive in both MySQL's unsigned CONV and
@@ -116,6 +122,13 @@ def _pg_concat_term(expr: "sql.Composed") -> "sql.Composed":
     ).format(e=expr, s=sql.Literal(_NULL_SENTINEL))
 
 
+# Aurora DSQL stores an UNCONSTRAINED ``numeric`` (no declared precision/scale) at its
+# documented default of ``numeric(18,6)`` -- so a PostgreSQL-source unconstrained numeric
+# lands with 6 fractional digits on the target. The checksum rounds such a column to this
+# scale on both sides so equal values match (see ``_pg_checksum_expr``).
+_DSQL_DEFAULT_NUMERIC_SCALE = 6
+
+
 def _decimal_scale(mysql_type: str) -> int:
     """Return the declared scale of a MySQL DECIMAL(p,s) (default 0).
 
@@ -131,6 +144,36 @@ def _decimal_scale(mysql_type: str) -> int:
         except ValueError:
             return 0
     return 0
+
+
+def _numeric_render_scale(column: "ColumnDef", source_is_postgres: bool) -> int:
+    """Fixed scale to render a ``numeric`` column at, on BOTH engines, for the checksum.
+
+    A DECLARED scale -- ``numeric(p,s)`` / ``numeric(p)`` (== scale 0) / any MySQL
+    ``DECIMAL(p[,s])`` -- is rendered at that exact scale so a stored-scale / trailing-zero
+    difference can never false-mismatch cross-engine.
+
+    An UNCONSTRAINED ``numeric`` (bare, no parens -> arbitrary precision AND scale) exists
+    ONLY for a PostgreSQL source. Aurora DSQL stores such a column at its DEFAULT
+    ``numeric(18,6)``, so a source value is rounded to 6 fractional digits on the target
+    (0.5 -> 0.500000). Rounding BOTH sides to 6 lets an equal value match despite the
+    source's arbitrary scale, while a difference WITHIN what DSQL can store is still caught
+    (scale 0 -- the old bug -- hid the whole fraction -> false MATCH; raw ``::text``
+    false-MISMATCHED 0.5 vs 0.500000). That >6-digit rounding is a SCHEMA decision surfaced
+    at Schema Conversion (the bare-``numeric`` warning; see
+    ``converter_postgres.unconstrained_numeric_note``), not a hidden Validation mask.
+
+    ``source_is_postgres`` gates the scale-6 default so it NEVER applies to a MySQL source:
+    MySQL's paren-less spellings include ``bigint unsigned`` (MySQL 8.0.19+ / 8.4 / Aurora
+    MySQL 3 report ``COLUMN_TYPE`` with no display width), which maps to ``numeric(20,0)``
+    -- an integer. The unchanged MySQL source side (:func:`_mysql_checksum_expr`) renders it
+    at scale 0, so the target side must too, or every ``BIGINT UNSIGNED`` row would
+    false-mismatch. (MySQL 5.7 spells it ``bigint(20) unsigned`` -- parens -> scale 0
+    already -- which is why that path was never observed to break.)
+    """
+    if source_is_postgres and "(" not in column.mysql_type:
+        return _DSQL_DEFAULT_NUMERIC_SCALE
+    return _decimal_scale(column.mysql_type)
 
 
 def _pg_numeric_mask(scale: int) -> str:
@@ -188,6 +231,16 @@ def _checksum_kind(column: "ColumnDef") -> str:
     # back to the source-derived default mapping when no applied type is known.
     applied = column.target_type
     if applied:
+        # PostgreSQL timetz must be detected on the FULL type string BEFORE the "(" split
+        # below: format_type spells a precision inline as "time(6) with time zone", which
+        # the split collapses to bare "time" (losing the zone). A timetz is rendered
+        # offset-insensitively (see _pg_checksum_expr) because the CDC sink stores it
+        # UTC-normalized (Debezium's ZonedTime is always GMT) while Full Load keeps the
+        # source offset -- the same instant, so an offset-sensitive ::text would false-
+        # mismatch. Only a PostgreSQL source produces timetz (MySQL has no such type).
+        normalized = " ".join(_TYPE_MODIFIER_RE.sub("", applied).lower().split())
+        if normalized in ("time with time zone", "timetz"):
+            return "timetz"
         kind = applied.split("(", 1)[0].strip().lower()
     else:
         try:
@@ -270,10 +323,17 @@ def _mysql_checksum_expr(column: "ColumnDef") -> Optional[str]:
     return f"CAST({ident} AS CHAR)"
 
 
-def _pg_checksum_expr(column: "ColumnDef") -> "Optional[sql.Composed]":
+def _pg_checksum_expr(
+    column: "ColumnDef", source_is_postgres: bool = False
+) -> "Optional[sql.Composed]":
     """Inner PG render expression for one column (``None`` = omit from checksum).
 
-    The byte-identical counterpart of :func:`_mysql_checksum_expr`.
+    The byte-identical counterpart of :func:`_mysql_checksum_expr`. This renders the DSQL
+    TARGET side for every migration, and ALSO the source side when the source is itself
+    PostgreSQL (one PG-16 renderer serves both ends). ``source_is_postgres`` is threaded in
+    only so the unconstrained-``numeric`` scale-6 rule fires for a genuine PostgreSQL-source
+    bare numeric and NOT for a MySQL paren-less type such as ``bigint unsigned`` (see
+    :func:`_numeric_render_scale`).
     """
     ident = sql.Identifier(column.name)
     kind = _checksum_kind(column)
@@ -300,10 +360,23 @@ def _pg_checksum_expr(column: "ColumnDef") -> "Optional[sql.Composed]":
         ).format(col=ident)
     if kind == "time":
         return sql.SQL("to_char({col}, 'HH24:MI:SS.US')").format(col=ident)
+    if kind == "timetz":
+        # timetz stores its offset. The CDC sink writes it UTC-normalized (Debezium's
+        # ZonedTime is always GMT) while Full Load preserves the SOURCE offset -- the same
+        # instant-of-day but a different stored offset, so an offset-sensitive ::text would
+        # false-mismatch a CDC-written value against the source. Shift BOTH sides to the UTC
+        # offset first (timetz AT TIME ZONE 'UTC' stays a timetz, re-expressed at +00), so an
+        # equal instant renders identically regardless of which write path produced it.
+        return sql.SQL("({col} AT TIME ZONE 'UTC')::text").format(col=ident)
     if kind == "numeric":
-        # round() to the declared scale, then a fixed-scale to_char mask matching
-        # MySQL CAST(col AS DECIMAL(65, s)) so equal decimals print identically.
-        scale = _decimal_scale(column.mysql_type)
+        # Pin the render scale on both engines. A DECLARED scale (numeric(p,s), incl.
+        # numeric(p) == scale 0, and every MySQL DECIMAL(p,s)) keeps that exact scale; a
+        # PostgreSQL-source UNCONSTRAINED numeric compares at DSQL's default numeric(18,6)
+        # scale of 6 (that >6-digit rounding is surfaced at Schema Conversion). The
+        # source-engine gate is REQUIRED so a MySQL paren-less ``bigint unsigned`` (->
+        # numeric(20,0), an integer) does not wrongly gain 6 fractional digits on the
+        # target while the MySQL source side stays at scale 0. See _numeric_render_scale.
+        scale = _numeric_render_scale(column, source_is_postgres)
         return sql.SQL("to_char(round({col}, {scale}), {mask})").format(
             col=ident,
             scale=sql.Literal(scale),
@@ -370,16 +443,20 @@ def _mysql_row_token(table: TableDef) -> str:
     )
 
 
-def _pg_row_token(table: TableDef) -> "sql.Composed":
+def _pg_row_token(table: TableDef, source_is_postgres: bool = False) -> "sql.Composed":
     """PostgreSQL per-row checksum token -- the byte-identical counterpart of
     :func:`_mysql_row_token` (same MD5-prefix reduction as a positive ``bigint``).
 
     The single definition shared by :func:`build_pg_checksum_sql`,
     :func:`build_pg_pk_token_sql`, and the paged :func:`build_pg_page_checksum_first_sql`.
-    Wide tables nest MD5s per group (see :func:`_pg_md5_concat`) to stay under the
-    100-argument function limit, identically to the MySQL side.
+    ``source_is_postgres`` is forwarded to :func:`_pg_checksum_expr` for the numeric-scale
+    rule (default ``False`` = the DSQL target of a MySQL-source migration). Wide tables
+    nest MD5s per group (see :func:`_pg_md5_concat`) to stay under the 100-argument
+    function limit, identically to the MySQL side.
     """
-    rendered_pg = [_pg_checksum_expr(column) for column in table.columns]
+    rendered_pg = [
+        _pg_checksum_expr(column, source_is_postgres) for column in table.columns
+    ]
     terms = [_pg_concat_term(expr) for expr in rendered_pg if expr is not None]
     if not terms:
         terms = [sql.Literal(_NULL_SENTINEL)]
@@ -407,7 +484,9 @@ def build_mysql_checksum_sql(table: TableDef) -> str:
     )
 
 
-def build_pg_checksum_sql(table: TableDef) -> sql.Composed:
+def build_pg_checksum_sql(
+    table: TableDef, source_is_postgres: bool = False
+) -> sql.Composed:
     """Build an order-independent PostgreSQL checksum query for ``table``.
 
     Mirrors :func:`build_mysql_checksum_sql`: the first ``_CHECKSUM_HEX_DIGITS``
@@ -416,11 +495,15 @@ def build_pg_checksum_sql(table: TableDef) -> sql.Composed:
     ``COALESCE(..., <sentinel>)`` (FLOAT/DOUBLE and JSON columns are omitted). Identifiers
     are composed with :class:`psycopg.sql.Identifier` so a column/table name can
     never break out of the SQL (Requirement 9.4). All access is a single
-    ``SELECT`` (read-only).
+    ``SELECT`` (read-only). ``source_is_postgres`` selects the numeric-scale rule (see
+    :func:`_numeric_render_scale`); the caller passes ``True`` only for a PostgreSQL source.
     """
     return sql.SQL(
         "SELECT COALESCE(SUM({token}), 0) FROM {table}"
-    ).format(token=_pg_row_token(table), table=_pg_table_identifier(table.name))
+    ).format(
+        token=_pg_row_token(table, source_is_postgres),
+        table=_pg_table_identifier(table.name),
+    )
 
 
 def build_mysql_pk_token_sql(table: TableDef, pk_column: str) -> str:
@@ -441,7 +524,9 @@ def build_mysql_pk_token_sql(table: TableDef, pk_column: str) -> str:
     )
 
 
-def build_pg_pk_token_sql(table: TableDef, pk_column: str, sample_size: int) -> sql.Composed:
+def build_pg_pk_token_sql(
+    table: TableDef, pk_column: str, sample_size: int, source_is_postgres: bool = False
+) -> sql.Composed:
     """Build the bounded ``(pk, per-row token)`` PostgreSQL counterpart.
 
     Mirrors :func:`build_mysql_pk_token_sql` using the same per-row token as
@@ -449,11 +534,12 @@ def build_pg_pk_token_sql(table: TableDef, pk_column: str, sample_size: int) -> 
     :class:`psycopg.sql.Identifier` and the bound is a :class:`psycopg.sql.Literal`
     so nothing can break out of the SQL (Requirement 9.4). A single read-only
     ``SELECT`` ordered by primary key and bounded by ``LIMIT`` -- no scan, no count.
+    ``source_is_postgres`` selects the numeric-scale rule (see :func:`_numeric_render_scale`).
     """
     return sql.SQL(
         "SELECT {pk} AS pk, {token} AS tok FROM {table} ORDER BY {pk} LIMIT {limit}"
     ).format(
-        pk=sql.Identifier(pk_column), token=_pg_row_token(table),
+        pk=sql.Identifier(pk_column), token=_pg_row_token(table, source_is_postgres),
         table=_pg_table_identifier(table.name), limit=sql.Literal(sample_size),
     )
 
@@ -564,27 +650,35 @@ def build_mysql_page_checksum_next_sql(table: TableDef, pk_column: str) -> str:
 
 
 def build_pg_page_checksum_first_sql(
-    table: TableDef, pk_column: str, page_size: int
+    table: TableDef, pk_column: str, page_size: int, source_is_postgres: bool = False
 ) -> sql.Composed:
     """First keyset page of the PostgreSQL/DSQL checksum: ``(sub_sum, last_pk, count)``.
+
+    The last (max) PK of the ascending page is taken as
+    ``(array_agg(page_pk ORDER BY page_pk))[COUNT(*)]`` rather than ``MAX(page_pk)``:
+    a ``uuid`` PK is orderable but has NO ``max()`` aggregate in PostgreSQL/DSQL
+    (``function max(uuid) does not exist``), which would abort the keyset checksum for
+    a uuid single-PK. array_agg + ORDER BY works for any orderable PK type (int / uuid /
+    text / timestamp) and equals ``MAX`` for the common integer case.
 
     Identifiers compose with :class:`psycopg.sql.Identifier` and the bound is a
     :class:`psycopg.sql.Literal` so nothing can break out of the SQL (Req 9.4).
     """
     return sql.SQL(
-        "SELECT COALESCE(SUM(page_tok), 0), MAX(page_pk), COUNT(*) FROM ("
+        "SELECT COALESCE(SUM(page_tok), 0), "
+        "(array_agg(page_pk ORDER BY page_pk))[COUNT(*)], COUNT(*) FROM ("
         "SELECT {pk} AS page_pk, {token} AS page_tok FROM {table} "
         "ORDER BY {pk} LIMIT {limit}) ckpage"
     ).format(
         pk=sql.Identifier(pk_column),
-        token=_pg_row_token(table),
+        token=_pg_row_token(table, source_is_postgres),
         table=_pg_table_identifier(table.name),
         limit=sql.Literal(page_size),
     )
 
 
 def build_pg_page_checksum_next_sql(
-    table: TableDef, pk_column: str, page_size: int
+    table: TableDef, pk_column: str, page_size: int, source_is_postgres: bool = False
 ) -> sql.Composed:
     """Subsequent keyset page of the PostgreSQL/DSQL checksum after the ``last`` param.
 
@@ -592,12 +686,13 @@ def build_pg_page_checksum_next_sql(
     reuses one prepared statement across all pages.
     """
     return sql.SQL(
-        "SELECT COALESCE(SUM(page_tok), 0), MAX(page_pk), COUNT(*) FROM ("
+        "SELECT COALESCE(SUM(page_tok), 0), "
+        "(array_agg(page_pk ORDER BY page_pk))[COUNT(*)], COUNT(*) FROM ("
         "SELECT {pk} AS page_pk, {token} AS page_tok FROM {table} WHERE {pk} > {last} "
         "ORDER BY {pk} LIMIT {limit}) ckpage"
     ).format(
         pk=sql.Identifier(pk_column),
-        token=_pg_row_token(table),
+        token=_pg_row_token(table, source_is_postgres),
         table=_pg_table_identifier(table.name),
         last=sql.Placeholder("last"),
         limit=sql.Literal(page_size),

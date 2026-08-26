@@ -38,7 +38,7 @@ from dsql_migrator.core.assessment_strategist import (
     build_general_chat_system,
 )
 from dsql_migrator.core.job_manager import JobManager
-from dsql_migrator.core.models import MigrationContext
+from dsql_migrator.core.models import MigrationContext, SourceType
 from dsql_migrator.ui.connect import build_connect_page
 from dsql_migrator.ui.ai_tools import (
     AI_TOOL_SCHEMAS as _AI_TOOL_SCHEMAS,
@@ -245,7 +245,12 @@ def build_page(
         sc = getattr(st, "source_config", None)
         if sc is not None:
             ver = getattr(st, "source_server_version", None)
-            src = f"Source: MySQL at {sc.host}"
+            _eng = (
+                "PostgreSQL"
+                if getattr(sc, "source_type", None) is SourceType.POSTGRES
+                else "MySQL"
+            )
+            src = f"Source: {_eng} at {sc.host}"
             if getattr(sc, "database", None):
                 src += f" (db {sc.database})"
             if ver:

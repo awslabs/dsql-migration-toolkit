@@ -58,12 +58,16 @@ from typing import Callable, Iterator, Mapping, Optional, Protocol, TextIO
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from dsql_migrator.core.converter import is_spatial_mysql_type, map_mysql_type
+from dsql_migrator.core.converter import map_mysql_type
 from dsql_migrator.core.introspector import _default_engine_factory
-from dsql_migrator.core.models import ColumnDef, SourceConnectionConfig, TableDef
+from dsql_migrator.core.models import SourceConnectionConfig, TableDef
+from dsql_migrator.core.source_dialect import (
+    MySQLSourceDialect,
+    SourceDialect,
+    dialect_for,
+)
 from dsql_migrator.core.watermark import (
     COMMIT,
-    START_CONSISTENT_SNAPSHOT,
     estimate_source_rows,
 )
 
@@ -81,6 +85,15 @@ _LOGGER = logging.getLogger(__name__)
 # network I/O), so larger pages amortize that cost across more rows. Memory stays
 # bounded (one page in flight per reader shard).
 DEFAULT_BATCH_SIZE = 5000
+
+# The streaming read sets ``stream_results=True`` on the connection (a server-side
+# cursor, so a page holds only ``batch_size`` rows). But the snapshot's transaction-
+# control statements (``START TRANSACTION`` / ``COMMIT``) must NOT run through a
+# server-side cursor: psycopg would emit ``DECLARE ... CURSOR FOR START TRANSACTION``,
+# a syntax error (a server-side cursor is valid only for a ``SELECT``). Overriding
+# ``stream_results=False`` per-statement runs them as plain statements. Harmless for
+# MySQL (pymysql's SSCursor tolerates non-SELECTs); required for the psycopg source.
+_TXN_CONTROL_EXEC_OPTS = {"stream_results": False}
 
 
 class ExportError(RuntimeError):
@@ -416,24 +429,21 @@ class CsvRowWriter(RowWriter):
 # ---------------------------------------------------------------------------
 
 
+# The MySQL source dialect: the default for the source-reading helpers below
+# (identifier quoting, integer-PK types). Threading a dialect through them keeps one
+# source of truth for the source-engine SQL and lets a non-MySQL source supply its
+# own quoting/types later without touching these call sites.
+_MYSQL_DIALECT = MySQLSourceDialect()
+
+
 def _quote_mysql_identifier(name: str) -> str:
-    """Quote a MySQL identifier with backticks, escaping embedded backticks."""
-    escaped = name.replace("`", "``")
-    return f"`{escaped}`"
+    """Quote a MySQL identifier with backticks (delegates to the MySQL dialect)."""
+    return _MYSQL_DIALECT.quote_identifier(name)
 
 
 def _quote_mysql_table(name: str) -> str:
-    """Quote a possibly schema-qualified table name as ``\\`schema\\`.\\`table\\```.
-
-    Cluster-wide introspection qualifies names as ``database.table``; quoting the
-    whole string as one identifier yields ``\\`database.table\\``` which MySQL
-    reads as one table in the (unset) current database ("1046, No database
-    selected"). Split on the first dot so each part is quoted independently.
-    """
-    schema, separator, obj = name.partition(".")
-    if separator and schema and obj:
-        return f"{_quote_mysql_identifier(schema)}.{_quote_mysql_identifier(obj)}"
-    return _quote_mysql_identifier(name)
+    """Quote a possibly schema-qualified MySQL table name (delegates to the dialect)."""
+    return _MYSQL_DIALECT.quote_table(name)
 
 
 def _primary_key_columns(table: TableDef) -> list[str]:
@@ -465,19 +475,9 @@ class ExportCancelled(ExportError):
     """
 
 
-# MySQL integer base types (lower-cased, display width / UNSIGNED / ZEROFILL
-# stripped before matching). Range sharding bands the LEADING PK column: an integer
-# leading column is collation-free and evenly sliceable by MIN/MAX arithmetic, so
-# its interior boundaries are monotonic in MySQL's numeric order and the shards are
-# provably disjoint + covering. A non-integer leading column (string / UUID /
-# decimal / temporal / binary) has no such collation-free split, so it is never
-# sharded (the table falls back to a single reader -- always correct, just serial).
-_INTEGER_PK_TYPES = frozenset(
-    {"tinyint", "smallint", "mediumint", "int", "integer", "bigint"}
-)
-
-
-def shardable_leading_int_pk(table: TableDef) -> Optional[str]:
+def shardable_leading_int_pk(
+    table: TableDef, dialect: "SourceDialect" = _MYSQL_DIALECT
+) -> Optional[str]:
     """Return the LEADING PK column name if it is an integer type, else None.
 
     Reader range sharding (splitting a big table into K disjoint ranges read
@@ -499,12 +499,15 @@ def shardable_leading_int_pk(table: TableDef) -> Optional[str]:
     for column in table.columns:
         if column.name == leading:
             base = column.mysql_type.split("(")[0].strip().lower().split()[0]
-            return leading if base in _INTEGER_PK_TYPES else None
+            return leading if base in dialect.integer_pk_types else None
     return None
 
 
 def compute_pk_shard_ranges(
-    connection: _Connection, table: TableDef, shards: int
+    connection: _Connection,
+    table: TableDef,
+    shards: int,
+    dialect: "SourceDialect" = _MYSQL_DIALECT,
 ) -> list[tuple[Optional[int], Optional[int]]]:
     """Return ``shards`` half-open ``[lo, hi)`` ranges over the LEADING PK column.
 
@@ -524,11 +527,11 @@ def compute_pk_shard_ranges(
     (one hot shard, near-empty others) so the speedup is less than K -- it never
     hurts correctness (ranges stay disjoint + covering), only balance.
     """
-    pk_col = shardable_leading_int_pk(table)
+    pk_col = shardable_leading_int_pk(table, dialect)
     if pk_col is None or shards <= 1:
         return [(None, None)]
-    quoted_col = _quote_mysql_identifier(pk_col)
-    quoted_table = _quote_mysql_table(table.name)
+    quoted_col = dialect.quote_identifier(pk_col)
+    quoted_table = dialect.quote_table(table.name)
     row = connection.execute(
         text(f"SELECT MIN({quoted_col}) AS lo, MAX({quoted_col}) AS hi "
              f"FROM {quoted_table}")
@@ -546,21 +549,6 @@ def compute_pk_shard_ranges(
         r_hi: Optional[int] = None if i == shards - 1 else lo + (i + 1) * step
         ranges.append((r_lo, r_hi))
     return ranges
-
-
-def _select_column_sql(column: ColumnDef) -> str:
-    """Return the SELECT-list expression for one source column.
-
-    Spatial columns (geometry/point/...) have no DSQL type and are migrated to
-    ``bytea``; read them as ``ST_AsBinary(col)`` so the value is the geometry's
-    WKB bytes -- identical to what Debezium delivers for CDC -- and aliased back
-    to the column name so the streamed row keeps its key. Other columns are read
-    as-is.
-    """
-    quoted = _quote_mysql_identifier(column.name)
-    if is_spatial_mysql_type(column.mysql_type):
-        return f"ST_AsBinary({quoted}) AS {quoted}"
-    return quoted
 
 
 # ---------------------------------------------------------------------------
@@ -627,8 +615,15 @@ class SourceLoadGovernor:
         ttl_seconds: float = _GOVERNOR_STATUS_TTL_SECONDS,
         slice_seconds: float = _GOVERNOR_WAIT_SLICE_SECONDS,
         on_state_change: Optional[Callable[[bool, Optional[int]], None]] = None,
+        metric_reader: Callable[[_Connection], Optional[int]] = _read_threads_running,
     ) -> None:
         self._connection = connection
+        # How to read the source's live active-query concurrency. Defaults to MySQL's
+        # global Threads_running; a PostgreSQL source passes the dialect's
+        # pg_stat_activity reader so the governor NEVER runs MySQL-only SQL on the
+        # snapshot connection (which on PG would be a syntax error that aborts the
+        # snapshot transaction and fails every subsequent page read).
+        self._metric_reader = metric_reader
         # Normalize the ceiling: None / 0 / negative all mean OFF (0 is the config's
         # "off" sentinel), so the rest of the class only checks ``is None``.
         self._ceiling = (
@@ -661,7 +656,7 @@ class SourceLoadGovernor:
             and (now - self._cached_at) < self._ttl
         ):
             return self._cached_value
-        value = _read_threads_running(self._connection)
+        value = self._metric_reader(self._connection)
         self._cached_value = value
         self._cached_at = now
         return value
@@ -672,13 +667,13 @@ class SourceLoadGovernor:
         self._paused = paused
         if paused:
             _LOGGER.warning(
-                "Full Load paused: source Threads_running=%s exceeds the configured "
+                "Full Load paused: source active-query count=%s exceeds the configured "
                 "ceiling %s -- waiting for source load to recede.",
                 running, self._ceiling,
             )
         else:
             _LOGGER.info(
-                "Full Load resumed: source Threads_running=%s is at/below the "
+                "Full Load resumed: source active-query count=%s is at/below the "
                 "ceiling %s.", running, self._ceiling,
             )
         if self._on_state_change is not None:
@@ -716,6 +711,7 @@ def keyset_stream(
     pk_lower: Optional[int] = None,
     pk_upper: Optional[int] = None,
     governor: Optional["SourceLoadGovernor"] = None,
+    dialect: "SourceDialect" = _MYSQL_DIALECT,
 ) -> Iterator[Mapping[str, object]]:
     """Yield ``table`` rows in ascending primary-key order via keyset pagination.
 
@@ -755,9 +751,11 @@ def keyset_stream(
     if not column_names:
         raise ExportError(f"table '{table.name}' has no columns to export")
 
-    columns_sql = ", ".join(_select_column_sql(column) for column in table.columns)
-    table_sql = _quote_mysql_table(table.name)
-    order_by_sql = ", ".join(_quote_mysql_identifier(c) for c in pk_columns)
+    columns_sql = ", ".join(
+        dialect.select_column_sql(column) for column in table.columns
+    )
+    table_sql = dialect.quote_table(table.name)
+    order_by_sql = ", ".join(dialect.quote_identifier(c) for c in pk_columns)
 
     # Optional range bound on the LEADING PK column (reader sharding). Applies to a
     # single OR composite key: for a composite key it bands the leading (index-prefix)
@@ -768,7 +766,7 @@ def keyset_stream(
     range_params: dict[str, object] = {}
     range_clauses: list[str] = []
     if pk_lower is not None or pk_upper is not None:
-        pk_sql_bound = _quote_mysql_identifier(pk_columns[0])
+        pk_sql_bound = dialect.quote_identifier(pk_columns[0])
         if pk_lower is not None:
             range_clauses.append(f"{pk_sql_bound} >= :pk_lower")
             range_params["pk_lower"] = pk_lower
@@ -778,7 +776,7 @@ def keyset_stream(
 
     if len(pk_columns) == 1:
         # Single-column key: scalar ``pk > :last`` (one bind param ``last``).
-        pk_sql = _quote_mysql_identifier(pk_columns[0])
+        pk_sql = dialect.quote_identifier(pk_columns[0])
         where_sql = f"{pk_sql} > :last"
         last_param_names = ["last"]
     else:
@@ -791,7 +789,7 @@ def keyset_stream(
         # whole keyset export O(n^2). The disjunction uses the PK index on every version. The
         # named params (:last_i) are REUSED across terms, so the bind set is unchanged (one
         # value per key column) and the param binding below is untouched.
-        key_sql_cols = [_quote_mysql_identifier(c) for c in pk_columns]
+        key_sql_cols = [dialect.quote_identifier(c) for c in pk_columns]
         last_param_names = [f"last_{i}" for i in range(len(pk_columns))]
         terms: list[str] = []
         for i in range(len(pk_columns)):
@@ -921,6 +919,7 @@ class TableExporter:
         (Requirement 5.1 / Property 1). The caller owns ``writer`` and is
         responsible for closing it. Returns the number of rows exported.
         """
+        dialect = dialect_for(conn.source_type)
         engine = self._engine_factory(conn)
         try:
             with engine.connect() as connection:
@@ -933,6 +932,7 @@ class TableExporter:
                     writer,
                     batch_size=self._batch_size,
                     target_types=target_types,
+                    dialect=dialect,
                 )
         finally:
             engine.dispose()
@@ -956,17 +956,18 @@ class TableExporter:
         tables don't justify the extra connections/snapshots). Called once per
         table before the shard readers open their own snapshots.
         """
-        if shards <= 1 or shardable_leading_int_pk(table) is None:
+        dialect = dialect_for(conn.source_type)
+        if shards <= 1 or shardable_leading_int_pk(table, dialect) is None:
             return [(None, None)]
         engine = self._engine_factory(conn)
         try:
             with engine.connect() as connection:
                 ro = connection.execution_options(isolation_level="AUTOCOMMIT")
                 if min_rows > 0:
-                    est = estimate_source_rows(ro, [table.name]).get(table.name)
+                    est = estimate_source_rows(ro, [table.name], dialect).get(table.name)
                     if est is not None and est < min_rows:
                         return [(None, None)]
-                return compute_pk_shard_ranges(ro, table, shards)
+                return compute_pk_shard_ranges(ro, table, shards, dialect)
         finally:
             engine.dispose()
 
@@ -993,6 +994,7 @@ class TableExporter:
         pk_lower: Optional[int] = None,
         pk_upper: Optional[int] = None,
         on_throttle: Optional[Callable[[bool, Optional[int]], None]] = None,
+        shared_snapshot_id: Optional[str] = None,
     ) -> "Iterator[Mapping[str, object]]":
         """Yield target-ready (converted) rows from a read-only consistent snapshot.
 
@@ -1011,23 +1013,41 @@ class TableExporter:
 
         ``pk_lower`` / ``pk_upper`` (optional, single integer PK only) bound this
         stream to a half-open PK slice ``[pk_lower, pk_upper)`` -- one shard of a
-        range-sharded read. Each shard opens its OWN snapshot connection here (the
-        shards are disjoint, so their independently-timed snapshots never overlap a
-        row); see :func:`compute_pk_shard_ranges`.
+        range-sharded read; see :func:`compute_pk_shard_ranges`.
+
+        ``shared_snapshot_id`` (optional) makes this shard read the exported snapshot
+        another connection published (``SET TRANSACTION SNAPSHOT`` right after the snapshot
+        start), so every shard observes ONE point-in-time cut -- a consistent range-sharded
+        read even on a live source with no CDC handoff. ``None`` (the default) keeps the
+        shard's own independently-timed snapshot.
         """
-        converter = ValueConverter(table, target_types=target_types)
+        dialect = dialect_for(conn.source_type)
+        converter = dialect.value_converter(table, target_types=target_types)
         engine = self._engine_factory(conn)
         try:
             with engine.connect() as connection:
                 snapshot = connection.execution_options(
                     isolation_level="AUTOCOMMIT", stream_results=True
                 )
-                snapshot.execute(text(START_CONSISTENT_SNAPSHOT))
+                snapshot.execute(
+                    text(dialect.snapshot_start_sql),
+                    execution_options=_TXN_CONTROL_EXEC_OPTS,
+                )
+                if shared_snapshot_id is not None:
+                    # First statement in the just-opened transaction: adopt the shared
+                    # point-in-time snapshot so this shard sees exactly what the others do.
+                    snapshot.execute(
+                        text(dialect.set_transaction_snapshot_sql(shared_snapshot_id)),
+                        execution_options=_TXN_CONTROL_EXEC_OPTS,
+                    )
                 governor = (
                     SourceLoadGovernor(
                         snapshot,
                         self._max_source_threads_running,
                         on_state_change=on_throttle,
+                        # Engine-correct metric: MySQL Threads_running vs PostgreSQL
+                        # pg_stat_activity. Never runs MySQL SQL on a PG snapshot conn.
+                        metric_reader=dialect.read_active_query_count,
                     )
                     if self._max_source_threads_running
                     else None
@@ -1041,10 +1061,13 @@ class TableExporter:
                         pk_lower=pk_lower,
                         pk_upper=pk_upper,
                         governor=governor,
+                        dialect=dialect,
                     ):
                         yield converter.convert_row(raw)
                 finally:
-                    snapshot.execute(text(COMMIT))
+                    snapshot.execute(
+                        text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
+                    )
         finally:
             engine.dispose()
 
@@ -1056,26 +1079,34 @@ def export_rows(
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
     target_types: Optional[Mapping[str, str]] = None,
+    dialect: "SourceDialect" = _MYSQL_DIALECT,
 ) -> int:
     """Stream-convert-write ``table`` rows on an open connection (read-only).
 
     Wraps the keyset stream in a consistent-snapshot transaction, writes the
     header, then converts and writes each row as it arrives. Returns the row
     count. The transaction is committed even if writing fails; the caller owns
-    the ``writer`` lifecycle.
+    the ``writer`` lifecycle. ``dialect`` (default MySQL) supplies the snapshot SQL,
+    the per-row value converter, and the keyset quoting.
     """
-    value_converter = ValueConverter(table, target_types=target_types)
+    value_converter = dialect.value_converter(table, target_types=target_types)
     column_names = [column.name for column in table.columns]
 
-    connection.execute(text(START_CONSISTENT_SNAPSHOT))
+    connection.execute(
+        text(dialect.snapshot_start_sql), execution_options=_TXN_CONTROL_EXEC_OPTS
+    )
     rows_exported = 0
     try:
         writer.write_header(column_names)
-        for row in keyset_stream(connection, table, batch_size=batch_size):
+        for row in keyset_stream(
+            connection, table, batch_size=batch_size, dialect=dialect
+        ):
             writer.write_row(value_converter.convert_row(row))
             rows_exported += 1
     finally:
-        connection.execute(text(COMMIT))
+        connection.execute(
+            text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
+        )
     return rows_exported
 
 

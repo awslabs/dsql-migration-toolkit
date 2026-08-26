@@ -5,6 +5,40 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.396
+
+### 추가 (Added)
+
+- **PostgreSQL이 이제 마이그레이션 소스로 지원됩니다(RDS / Aurora PostgreSQL → Aurora
+  DSQL).** Connect 화면에 소스 엔진 선택기(MySQL / PostgreSQL)가 추가되었고, PostgreSQL
+  소스는 소스 다이얼렉트 어댑터(`core/source_dialect`)를 통해 전체 여정(Evaluation, Schema
+  Conversion, Full Load, Validation, CDC)을 실행합니다. PostgreSQL → DSQL은 near-identity
+  이므로(양쪽 모두 PostgreSQL-16 와이어) Schema Conversion은 타입을 그대로 전달하고 DSQL
+  미지원 타입(배열, geometric / network / xml / money / bit / range / tsvector / enum /
+  composite / domain)은 충실한 리모델 대상과 함께 플래그합니다. Full Load는 keyset로
+  스트리밍하며(샤딩 REPLACE 읽기는 공유 exported 스냅샷 사용), Validation은 PostgreSQL-16
+  체크섬 렌더러 하나를 양단에서 재사용합니다. 실제 Aurora PostgreSQL에서 end-to-end 검증
+  완료(Full Load + Validation, CHECKSUM 바이트 동일).
+- **PostgreSQL CDC(Debezium `pgoutput` → MSK → DSQL sink).** 논리 복제 슬롯 + publication
+  수명주기, WAL 보존 상태 표시, gapless Full-Load → CDC 핸드오프, 타입 바인드(uuid /
+  timetz-UTC / interval / timestamptz / jsonb / bytea / numeric) 및 TOAST partial-upsert.
+  전용 Debezium-PostgreSQL 커넥터 플러그인이 MySQL용과 함께 제공됩니다.
+
+### 수정 (Fixed)
+
+- **최신 MySQL 소스에서 `BIGINT UNSIGNED`가 더 이상 CHECKSUM 검증에서 거짓 불일치를 내지
+  않습니다.** DSQL 대상 체크섬이 PostgreSQL의 무제약 `numeric` scale-6 규칙을 괄호 없는 모든
+  타입에 적용했는데, MySQL 8.0.19+ / 8.4 / Aurora MySQL 3은 `BIGINT UNSIGNED`를 괄호 없는
+  `bigint unsigned`(`numeric(20,0)`, 정수)로 보고합니다. 대상 측은 `.000000`을 얻는 반면
+  변경되지 않은 MySQL 소스 측은 scale 0으로 렌더되어, 데이터가 바이트 단위로 동일한데도 모든
+  해당 행이 어긋났습니다. 이제 scale-6 규칙은 진짜 PostgreSQL 소스에만 적용됩니다(MySQL 5.7의
+  `bigint(20) unsigned`는 영향 없음).
+- **선언된 정밀도가 없는 PostgreSQL `numeric`/`decimal`(bare)에 Schema Conversion 경고가
+  표시됩니다.** Aurora DSQL은 이런 컬럼을 기본값 `numeric(18,6)`으로 저장해 소수 6자리 초과
+  값을 반올림하는데, 기존에는 무음이었고(선언된 정밀도가 38/37을 초과하는 경우만 플래그)
+  Validation이 scale 6으로 비교하므로 손실이 드러나지 않을 수 있었습니다. 이제 변환이 컬럼명과
+  `numeric(18,6)` 상한을 명시합니다.
+
 ## v0.1.395
 
 ### 수정 (Fixed)

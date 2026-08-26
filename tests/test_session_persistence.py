@@ -16,7 +16,9 @@ from datetime import datetime, timezone
 from dsql_migrator.core.models import (
     AssessmentReport,
     ColumnDef,
+    SourceConnectionConfig,
     SourceInventory,
+    SourceType,
     StepStatus,
     TableDef,
     TableSelection,
@@ -783,6 +785,74 @@ def test_target_connection_and_unlock_round_trip_for_reconnect() -> None:
     assert s2.source_config is None
     # target_verified is not blindly restored -- the user re-tests on Connect.
     assert s2.target_verified is False
+
+
+def test_source_type_hint_round_trips_for_postgres_reconnect() -> None:
+    # The source ENGINE kind (non-secret) is persisted so a reconnect pre-selects
+    # Postgres on Connect -- but the source connection itself (which carries a secret)
+    # is NOT restored. The user re-enters credentials; the engine picker just no longer
+    # snaps back to the MySQL default for a PostgreSQL migration.
+    session, eval_state, conv_state, migration_state = _populated_states()
+    session.set_source(
+        SourceConnectionConfig(
+            source_type=SourceType.POSTGRES,
+            host="pg.example",
+            port=5432,
+            database="app",
+            username="u",
+        ),
+        None,
+    )
+    snap = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+    assert snap.source_type == "postgres"
+
+    s2 = SessionConnectionState()
+    m2 = DataMigrationState()
+    m2.bind_session(s2)
+    apply_session_snapshot(snap, s2, EvaluationState(), SchemaConversionState(), m2)
+    # The source secret / connection is NOT restored ...
+    assert s2.source_config is None
+    # ... but the engine hint is, so Connect pre-selects Postgres (not MySQL).
+    assert s2.restored_source_type is SourceType.POSTGRES
+
+
+def test_source_type_hint_absent_on_old_snapshot_defaults_mysql() -> None:
+    # Byte-identity for MySQL: a session with NO source set (an older snapshot predates
+    # the field, or the source was never reconnected) captures source_type=None and
+    # restores with NO engine hint, so Connect keeps its MySQL default. A MySQL source
+    # round-trips as "mysql" and restores as the MySQL hint -- neither disturbs the
+    # historical default path.
+    session, eval_state, conv_state, migration_state = _populated_states()
+    # No source set -> nothing to persist.
+    snap = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+    assert snap.source_type is None
+
+    s2 = SessionConnectionState()
+    m2 = DataMigrationState()
+    m2.bind_session(s2)
+    apply_session_snapshot(snap, s2, EvaluationState(), SchemaConversionState(), m2)
+    assert s2.restored_source_type is None  # MySQL default path unchanged
+
+    # A MySQL source persists its kind as "mysql" and restores as the MySQL hint.
+    session.set_source(
+        SourceConnectionConfig(source_type=SourceType.MYSQL, host="my.example"), None
+    )
+    mysql_snap = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+    assert mysql_snap.source_type == "mysql"
+
+    s3 = SessionConnectionState()
+    m3 = DataMigrationState()
+    m3.bind_session(s3)
+    apply_session_snapshot(
+        mysql_snap, s3, EvaluationState(), SchemaConversionState(), m3
+    )
+    assert s3.restored_source_type is SourceType.MYSQL
 
 
 def test_active_view_round_trips_for_reconnect() -> None:

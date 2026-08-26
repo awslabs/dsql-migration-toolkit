@@ -38,8 +38,10 @@ from dsql_migrator.core.models import (
     IndexDef,
     ObjectType,
     SourceConnectionConfig,
+    SourceType,
     TableDef,
 )
+from dsql_migrator.core.source_dialect import dialect_for
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +538,7 @@ def test_cluster_wide_introspection_qualifies_names_across_schemas() -> None:
         "billing": {"tables": {"invoices": {}}},
     }
     inventory = _assemble_inventory(
-        _FakeInspector(catalog), _NonMysqlConnection(), None, is_mysql=False
+        _FakeInspector(catalog), _NonMysqlConnection(), None, dialect=dialect_for(SourceType.MYSQL)
     )
 
     table_names = {table.name for table in inventory.tables}
@@ -544,6 +546,30 @@ def test_cluster_wide_introspection_qualifies_names_across_schemas() -> None:
     assert table_names == {"shop.orders", "shop.customers", "billing.invoices"}
     assert {view.name for view in inventory.views} == {"shop.active"}
     assert "mysql.user" not in table_names
+
+
+def test_postgres_reflects_all_schemas_even_with_database_set() -> None:
+    # A PostgreSQL source's `database` is the connection, not a schema (database_is_schema
+    # is False), so _assemble_inventory must reflect ALL non-system schemas, qualified --
+    # never just `public`. Regression: a set database used to reflect only the default
+    # schema, silently dropping a non-public schema (e.g. `app`).
+    from dsql_migrator.core.introspector import _assemble_inventory
+
+    catalog = {
+        "pg_catalog": {"tables": {"pg_class": {}}},  # system -> skipped
+        "information_schema": {"tables": {"tables": {}}},  # system -> skipped
+        "public": {"tables": {"docs": {}}},
+        "app": {"tables": {"orders": {}, "items": {}}},
+    }
+    inventory = _assemble_inventory(
+        _FakeInspector(catalog),
+        _NonMysqlConnection(),
+        "mydb",  # database SET -- for PG this is the connection, not a single schema
+        dialect=dialect_for(SourceType.POSTGRES),
+    )
+    table_names = {table.name for table in inventory.tables}
+    # Every non-system schema reflected AND schema-qualified (app not dropped).
+    assert table_names == {"public.docs", "app.orders", "app.items"}
 
 
 def test_cluster_wide_introspection_qualifies_cross_schema_fk_target() -> None:
@@ -568,7 +594,7 @@ def test_cluster_wide_introspection_qualifies_cross_schema_fk_target() -> None:
         "billing": {"tables": {"customers": {}}},
     }
     inventory = _assemble_inventory(
-        _FakeInspector(catalog), _NonMysqlConnection(), None, is_mysql=False
+        _FakeInspector(catalog), _NonMysqlConnection(), None, dialect=dialect_for(SourceType.MYSQL)
     )
     orders = next(t for t in inventory.tables if t.name == "shop.orders")
     # Cross-schema FK target is qualified with the FK's referred_schema, matching
@@ -598,7 +624,7 @@ def test_cluster_wide_same_schema_fk_qualified_with_reflected_schema() -> None:
         },
     }
     inventory = _assemble_inventory(
-        _FakeInspector(catalog), _NonMysqlConnection(), None, is_mysql=False
+        _FakeInspector(catalog), _NonMysqlConnection(), None, dialect=dialect_for(SourceType.MYSQL)
     )
     orders = next(t for t in inventory.tables if t.name == "shop.orders")
     assert orders.foreign_keys[0].referenced_table == "shop.orders"
@@ -611,7 +637,7 @@ def test_single_database_introspection_keeps_unqualified_names() -> None:
     # (schema=None) and names stay unqualified.
     catalog = {None: {"tables": {"orders": {}, "customers": {}}, "views": {}}}
     inventory = _assemble_inventory(
-        _FakeInspector(catalog), _NonMysqlConnection(), "shop", is_mysql=False
+        _FakeInspector(catalog), _NonMysqlConnection(), "shop", dialect=dialect_for(SourceType.MYSQL)
     )
 
     assert {table.name for table in inventory.tables} == {"orders", "customers"}
@@ -702,7 +728,7 @@ def test_test_connection_captures_server_version() -> None:
     result = introspector.test_connection(_source_config())
     assert result.success is True
     assert result.server_version == "8.0.mysql_aurora.3.04.0"
-    assert result.mysql_version == "8.0.42"  # community engine version
+    assert result.engine_version == "8.0.42"  # community engine version
     assert result.aurora_version == "3.04.0"  # from @@aurora_version
 
 
@@ -713,7 +739,7 @@ def test_test_connection_version_is_optional_when_unavailable() -> None:
     result = introspector.test_connection(_source_config())
     assert result.success is True
     assert result.server_version is None
-    assert result.mysql_version is None
+    assert result.engine_version is None
 
 
 # ---------------------------------------------------------------------------
@@ -819,3 +845,51 @@ def test_source_error_hint_explains_failover_and_reassures() -> None:
     # No hint invented for an unrelated error (it would be misleading).
     assert source_error_hint(_pymysql_operational(1054, "Unknown column")) is None
     assert is_source_transient_error(_pymysql_operational(1054, "Unknown column")) is False
+
+
+class _PgErr(Exception):
+    """A psycopg-shaped error carrying a string ``.sqlstate``."""
+
+    def __init__(self, sqlstate: str, message: str = "") -> None:
+        super().__init__(message or sqlstate)
+        self.sqlstate = sqlstate
+
+
+def test_is_source_transient_error_dispatches_by_source_type() -> None:
+    from dsql_migrator.core.introspector import is_source_transient_error
+    from dsql_migrator.core.models import SourceType
+
+    failover = _PgErr("57P03", "cannot connect now, the DB is starting up")
+    # Under PostgreSQL dispatch a PG failover SQLSTATE is transient (auto-retried)...
+    assert is_source_transient_error(failover, SourceType.POSTGRES) is True
+    # ...but the default (MySQL) classifier never fires for a string SQLSTATE -- which is
+    # exactly the bug this dispatch fixes (a PG failover would otherwise not auto-retry).
+    assert is_source_transient_error(failover) is False
+    assert is_source_transient_error(failover, SourceType.MYSQL) is False
+    # A PG data error is NOT transient under PG dispatch.
+    assert is_source_transient_error(_PgErr("23505", "dup key"), SourceType.POSTGRES) is False
+
+
+def test_source_error_hint_is_worded_for_the_source_engine() -> None:
+    from dsql_migrator.core.introspector import (
+        SOURCE_CONNECTION_LOST_HINT,
+        source_error_hint,
+    )
+    from dsql_migrator.core.models import SourceType
+
+    # PostgreSQL: the dropped-connection hint names PostgreSQL, not MySQL.
+    pg_hint = source_error_hint(_PgErr("08006", "connection failure"), SourceType.POSTGRES)
+    assert pg_hint is not None
+    assert "PostgreSQL" in pg_hint and "MySQL" not in pg_hint
+    assert "idempotent" in pg_hint.lower()
+    # PostgreSQL too-many-connections (53300) gets the connection-limit hint, PG-worded.
+    pg_toomany = source_error_hint(
+        _PgErr("53300", "too many clients already"), SourceType.POSTGRES
+    )
+    assert pg_toomany is not None
+    assert "PostgreSQL" in pg_toomany and "connection" in pg_toomany.lower()
+    # Back-compat: the MySQL-rendered constant is unchanged and the default dispatch
+    # still words the hint for MySQL.
+    assert SOURCE_CONNECTION_LOST_HINT.startswith("The source MySQL connection dropped")
+    mysql_hint = source_error_hint(_pymysql_operational(2013, "Lost connection"))
+    assert mysql_hint is not None and "MySQL" in mysql_hint and "PostgreSQL" not in mysql_hint

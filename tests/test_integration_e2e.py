@@ -118,7 +118,7 @@ class _FakeExportConnection:
     def execution_options(self, **_kwargs):  # noqa: ANN201 - mirrors SQLAlchemy
         return self
 
-    def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+    def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
         sql = str(statement)
         self.executed.append(sql)
         upper = sql.strip().upper()
@@ -229,7 +229,7 @@ class _FakeValidationSource:
     def execution_options(self, **_kwargs):  # noqa: ANN201
         return self
 
-    def execute(self, statement, _parameters=None):  # noqa: ANN001, ANN201
+    def execute(self, statement, _parameters=None, execution_options=None):  # noqa: ANN001, ANN201
         sql = str(statement)
         self.executed.append(sql)
         upper = sql.upper()

@@ -47,7 +47,12 @@ from dsql_migrator.core.exporter import (
     shardable_leading_int_pk,
 )
 from dsql_migrator.core.introspector import is_write_or_ddl
-from dsql_migrator.core.models import ColumnDef, SourceConnectionConfig, TableDef
+from dsql_migrator.core.models import (
+    ColumnDef,
+    SourceConnectionConfig,
+    SourceType,
+    TableDef,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +124,7 @@ class _FakeConnection:
         self.execution_options_seen = kwargs
         return self
 
-    def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+    def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
         sql = str(statement)
         upper = sql.strip().upper()
         if "THREADS_RUNNING" in upper:  # source-load governor's SHOW GLOBAL STATUS
@@ -132,7 +137,11 @@ class _FakeConnection:
             self._tr_index += 1
             return _StatusResult(value)
         self.executed.append((sql, parameters))
-        if upper.startswith("START TRANSACTION") or upper.startswith("COMMIT"):
+        if (
+            upper.startswith("START TRANSACTION")
+            or upper.startswith("COMMIT")
+            or upper.startswith("SET TRANSACTION")  # incl. SET TRANSACTION SNAPSHOT
+        ):
             return _FakeResult([])
 
         self.page_queries += 1
@@ -459,6 +468,30 @@ def test_governor_caches_reading_within_ttl() -> None:
     assert conn.status_reads == 1  # second call reused the cached value
 
 
+def test_governor_uses_injected_metric_reader_not_a_hardcoded_query() -> None:
+    # The governor reads its metric through the injected ``metric_reader`` (a PostgreSQL
+    # source passes the dialect's pg_stat_activity reader), so it NEVER runs a hardcoded
+    # MySQL ``SHOW GLOBAL STATUS`` on the connection. A connection whose execute() raises
+    # proves the governor touches ONLY the reader -- the fix for a PG snapshot connection,
+    # where a MySQL SHOW would be a syntax error that aborts the snapshot transaction.
+    class _NoSqlConn:
+        def execute(self, *_a, **_k):  # noqa: ANN002, ANN003, ANN202
+            raise AssertionError("governor must not run SQL on the connection directly")
+
+    seen = []
+
+    def _reader(conn):  # noqa: ANN001, ANN202
+        seen.append(conn)
+        return 0  # at/below the ceiling -> no pause
+
+    gov = SourceLoadGovernor(
+        _NoSqlConn(), 5, sleep=lambda _s: None, metric_reader=_reader
+    )
+    gov.throttle()
+    assert seen, "the injected metric_reader must be used"
+    # Reaching here (no AssertionError) proves the governor never queried the connection.
+
+
 def test_keyset_stream_throttles_before_each_page() -> None:
     # The governor is asked to throttle at the same between-pages point as the cancel
     # poll: exactly once before each page fetch.
@@ -544,6 +577,43 @@ def test_table_exporter_no_governor_when_ceiling_zero() -> None:
     assert conn.status_reads == 0
 
 
+def _pg_source_config() -> SourceConnectionConfig:
+    return SourceConnectionConfig(
+        source_type=SourceType.POSTGRES, host="pg.example.com", port=5432, database="app"
+    )
+
+
+def test_stream_converted_rows_adopts_the_shared_snapshot() -> None:
+    # A PG shard given shared_snapshot_id runs SET TRANSACTION SNAPSHOT as the FIRST statement
+    # after the snapshot start (before any page read), so every shard reads one point-in-time
+    # cut -- a consistent range-sharded read even for a REPLACE (no-CDC) load.
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 4)]
+    conn = _FakeConnection(rows)
+    exporter = TableExporter(engine_factory=lambda _cfg: _FakeEngine(conn))
+    out = list(exporter.stream_converted_rows(
+        _pg_source_config(), _simple_table(), shared_snapshot_id="00000003-0000001B-1"
+    ))
+    assert [r["id"] for r in out] == [1, 2, 3]
+    stmts = [s.strip().upper() for s, _ in conn.executed]
+    assert any(
+        "SET TRANSACTION SNAPSHOT '00000003-0000001B-1'" in s for s, _ in conn.executed
+    )
+    i_start = next(i for i, s in enumerate(stmts) if s.startswith("START TRANSACTION"))
+    i_set = next(i for i, s in enumerate(stmts) if s.startswith("SET TRANSACTION SNAPSHOT"))
+    i_read = next(i for i, s in enumerate(stmts) if s.startswith("SELECT"))
+    assert i_start < i_set < i_read  # snapshot start -> adopt shared snapshot -> read
+
+
+def test_stream_converted_rows_no_shared_snapshot_by_default() -> None:
+    # Without shared_snapshot_id (default), NO SET TRANSACTION SNAPSHOT is emitted -- the
+    # stream keeps its own snapshot (unchanged single-reader / MySQL behavior).
+    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 4)]
+    conn = _FakeConnection(rows)
+    exporter = TableExporter(engine_factory=lambda _cfg: _FakeEngine(conn))
+    list(exporter.stream_converted_rows(_pg_source_config(), _simple_table()))
+    assert not any("SNAPSHOT" in s.upper() for s, _ in conn.executed)
+
+
 def test_stream_converted_rows_reports_throttle_transitions(monkeypatch) -> None:
     # stream_converted_rows forwards the governor's pause/resume to on_throttle (the
     # seam the Full Load engine wires to the progress caption). Patch the wall-clock
@@ -627,7 +697,7 @@ def test_compute_pk_shard_ranges_splits_min_max_into_half_open_ranges() -> None:
     # MIN=1, MAX=1000, shards=4 -> 4 contiguous ranges; first lo=None, last hi=None
     # (open ends guarantee full coverage), interior boundaries evenly spaced.
     class _MinMaxConn:
-        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
             assert "MIN(" in str(statement) and "MAX(" in str(statement)
             return _FakeResult([{"lo": 1, "hi": 1000}])
 
@@ -647,11 +717,11 @@ def test_compute_pk_shard_ranges_splits_min_max_into_half_open_ranges() -> None:
 
 def test_compute_pk_shard_ranges_falls_back_for_small_or_empty_table() -> None:
     class _EmptyConn:
-        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
             return _FakeResult([{"lo": None, "hi": None}])
 
     class _TinyConn:
-        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
             return _FakeResult([{"lo": 1, "hi": 3}])  # span 3 <= shards 4
 
     assert compute_pk_shard_ranges(_EmptyConn(), _simple_table(), 4) == [(None, None)]
@@ -693,7 +763,7 @@ def test_shard_range_sql_keeps_a_hostile_identifier_inside_one_quoted_name() -> 
     seen: list[str] = []
 
     class _CapturingConn:
-        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
             seen.append(str(statement))
             return _FakeResult([{"lo": 1, "hi": 1000}])
 
@@ -723,7 +793,7 @@ def test_compute_pk_shard_ranges_shards_composite_when_leading_is_integer() -> N
     # Composite (tenant_id INT, id BIGINT): MIN/MAX are read from the LEADING integer
     # column and split into K half-open ranges (first lo=None, last hi=None).
     class _MinMaxConn:
-        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
             s = str(statement)
             assert "MIN(" in s and "`tenant_id`" in s  # LEADING column, not the trailing id
             return _FakeResult([{"lo": 1, "hi": 1000}])
@@ -774,7 +844,7 @@ def test_pk_range_shards_partition_all_rows_without_overlap() -> None:
     rows = [{"id": i, "name": f"n{i}"} for i in range(1, 21)]
 
     class _MinMaxConn(_FakeConnection):
-        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
             if "MIN(" in str(statement):
                 return _FakeResult([{"lo": 1, "hi": 20}])
             return super().execute(statement, parameters)
@@ -826,7 +896,7 @@ def test_pk_range_shards_partition_composite_leading_int_without_overlap() -> No
     rows = [{"tenant_id": t, "id": i} for t in range(1, 13) for i in range(1, 4)]
 
     class _MinMaxConn(_FakeConnection):
-        def execute(self, statement, parameters=None):  # noqa: ANN001, ANN201
+        def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
             if "MIN(" in str(statement):
                 return _FakeResult([{"lo": 1, "hi": 12}])
             return super().execute(statement, parameters)
@@ -1196,13 +1266,68 @@ def test_table_exporter_rejects_table_without_columns() -> None:
 def test_select_column_sql_wraps_spatial_in_st_asbinary() -> None:
     # Spatial columns are read as WKB bytes (-> bytea), aliased back to the name;
     # other columns are read as-is. This keeps Full Load bytes identical to the
-    # WKB Debezium delivers for CDC.
-    from dsql_migrator.core.exporter import _select_column_sql
+    # WKB Debezium delivers for CDC. The logic now lives on the MySQL dialect.
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.core.source_dialect import dialect_for
 
-    geom = _select_column_sql(ColumnDef(name="geom", mysql_type="point"))
+    d = dialect_for(SourceType.MYSQL)
+    geom = d.select_column_sql(ColumnDef(name="geom", mysql_type="point"))
     assert "ST_AsBinary" in geom
     assert geom.endswith("AS `geom`")
 
-    plain = _select_column_sql(ColumnDef(name="name", mysql_type="VARCHAR(100)"))
+    plain = d.select_column_sql(ColumnDef(name="name", mysql_type="VARCHAR(100)"))
     assert "ST_AsBinary" not in plain
     assert plain == "`name`"
+
+
+def test_keyset_stream_postgres_dialect_emits_pg_sql_not_mysql() -> None:
+    # Regression (#5): the PG-source read composition (dialect quoting + select_column_sql)
+    # inside keyset_stream is only unit-tested in isolation. A wiring regression that emits
+    # MySQL backticks or drops the jsonb text-cast passes every isolated test but breaks
+    # 100% of PostgreSQL Full Loads. Assert the composed SELECTs are PG-shaped.
+    from dsql_migrator.core.source_dialect import PostgresSourceDialect
+
+    rows = [{"id": i, "doc": "{}"} for i in range(1, 4)]
+    connection = _FakeConnection(rows)
+    table = TableDef(
+        name="public.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint"),
+            ColumnDef(name="doc", mysql_type="jsonb"),
+        ],
+        primary_key=["id"],
+    )
+    out = list(
+        keyset_stream(connection, table, batch_size=2, dialect=PostgresSourceDialect())
+    )
+    assert [r["id"] for r in out] == [1, 2, 3]
+    selects = [s for s, _ in connection.executed if s.strip().upper().startswith("SELECT")]
+    assert selects, "no SELECT emitted"
+    # PostgreSQL double-quoted identifiers, NEVER MySQL backticks.
+    assert all("`" not in s for s in selects)
+    assert any('"id"' in s for s in selects)
+    # jsonb is read via CAST(... AS text) so a JSON `null` is preserved as text, not parsed.
+    assert any('cast("doc" as text)' in s.lower() for s in selects)
+    # Keyset predicate uses the PG-quoted PK.
+    assert any('"id" > :last' in s for s in selects[1:])
+
+
+def test_shardable_leading_int_pk_postgres_membership() -> None:
+    # Tier-3 #13: PG reader sharding gates on shardable_leading_int_pk; a wrong
+    # membership/parse would drop rows or fail range reads. Lock it for the PG dialect.
+    from dsql_migrator.core.exporter import shardable_leading_int_pk
+    from dsql_migrator.core.source_dialect import PostgresSourceDialect
+
+    pg = PostgresSourceDialect()
+    for t in ("integer", "bigint", "smallint", "bigserial"):
+        table = TableDef(name="t", columns=[ColumnDef(name="id", mysql_type=t)], primary_key=["id"])
+        assert shardable_leading_int_pk(table, pg) == "id", t
+    comp = TableDef(
+        name="t",
+        columns=[ColumnDef(name="tenant_id", mysql_type="bigint"), ColumnDef(name="uid", mysql_type="uuid")],
+        primary_key=["tenant_id", "uid"],
+    )
+    assert shardable_leading_int_pk(comp, pg) == "tenant_id"  # composite-leading int
+    for t in ("uuid", "text", "numeric(10,0)", "timestamp with time zone"):
+        table = TableDef(name="t", columns=[ColumnDef(name="id", mysql_type=t)], primary_key=["id"])
+        assert shardable_leading_int_pk(table, pg) is None, t

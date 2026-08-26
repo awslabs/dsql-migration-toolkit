@@ -112,6 +112,106 @@ class DebeziumTypeConverterTest {
     assertArrayEquals(wkb, (byte[]) r);
   }
 
+  // --- PostgreSQL-source logical types (Phase D) ------------------------------
+
+  @Test
+  void pgUuidStringToJavaUuid() {
+    // PostgreSQL uuid -> Debezium io.debezium.data.Uuid (a dashed string). The sink binds
+    // a java.util.UUID so pgjdbc targets the uuid column (a plain String would be varchar).
+    // Mirrors the Full Load path (psycopg uuid.UUID).
+    String text = "0b6be8e2-2a11-4c3e-9d2e-1a2b3c4d5e6f";
+    Object r = DebeziumTypeConverter.convert(DebeziumTypeConverter.UUID_TYPE, text);
+    assertInstanceOf(java.util.UUID.class, r);
+    assertEquals(java.util.UUID.fromString(text), r);
+  }
+
+  @Test
+  void pgUuidMalformedPassesThroughToFailLoudly() {
+    // A value that is not a UUID is left as the raw string so it DLQs, rather than crashing
+    // the whole batch with an IllegalArgumentException.
+    Object r = DebeziumTypeConverter.convert(DebeziumTypeConverter.UUID_TYPE, "not-a-uuid");
+    assertEquals("not-a-uuid", r);
+  }
+
+  @Test
+  void pgZonedTimeStringToOffsetTime() {
+    // PostgreSQL timetz -> Debezium io.debezium.time.ZonedTime, an ISO-8601 offset time
+    // that Debezium ALWAYS normalizes to UTC (a source 07:15:00-05:00 streams as
+    // 12:15:00Z). The sink binds a java.time.OffsetTime, preserving the sub-second micros a
+    // java.sql.Time would drop. (The UTC-vs-source-offset divergence from the Full Load
+    // write is reconciled offset-insensitively in Validation -- see test_validation_sql.)
+    Object r =
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.ZONED_TIME, "12:15:00.123456Z");
+    assertInstanceOf(java.time.OffsetTime.class, r);
+    assertEquals(java.time.OffsetTime.parse("12:15:00.123456Z"), r);
+    // The converter binds whatever offset it is handed (it does not itself re-normalize);
+    // a defensive non-UTC input still parses to the matching OffsetTime.
+    Object r2 =
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.ZONED_TIME, "07:15:00-05:00");
+    assertEquals(java.time.OffsetTime.parse("07:15:00-05:00"), r2);
+  }
+
+  @Test
+  void pgZonedTimeUnparseablePassesThroughToFailLoudly() {
+    Object r = DebeziumTypeConverter.convert(DebeziumTypeConverter.ZONED_TIME, "nonsense");
+    assertEquals("nonsense", r);
+  }
+
+  @Test
+  void pgIntervalIsoStringWrappedInPgInterval() throws Exception {
+    // PostgreSQL interval (interval.handling.mode=string) -> an ISO-8601 duration string.
+    // Wrapped in a PGobject(type=interval) so pgjdbc binds it to the interval column;
+    // PostgreSQL's interval input parses ISO-8601. Same stored value as the Full Load path.
+    Object r =
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.INTERVAL_TYPE, "P1Y2M3DT4H5M6S");
+    assertInstanceOf(PGobject.class, r);
+    PGobject pg = (PGobject) r;
+    assertEquals("interval", pg.getType());
+    assertEquals("P1Y2M3DT4H5M6S", pg.getValue());
+  }
+
+  @Test
+  void pgVariableScaleDecimalStructToBigDecimal() {
+    // Unconstrained PostgreSQL numeric under decimal.handling.mode=precise -> a Struct
+    // {scale INT32, value BYTES}. `value` is the two's-complement big-endian unscaled
+    // integer; decode to a BigDecimal (mirrors the Full Load Decimal). 1234.5678 = unscaled
+    // 12345678 with scale 4.
+    java.math.BigInteger unscaled = new java.math.BigInteger("12345678");
+    Schema vsd =
+        SchemaBuilder.struct()
+            .name(DebeziumTypeConverter.VARIABLE_SCALE_DECIMAL)
+            .field("scale", Schema.INT32_SCHEMA)
+            .field("value", Schema.BYTES_SCHEMA)
+            .build();
+    Struct value = new Struct(vsd).put("scale", 4).put("value", unscaled.toByteArray());
+
+    Object r = DebeziumTypeConverter.convert(DebeziumTypeConverter.VARIABLE_SCALE_DECIMAL, value);
+
+    assertInstanceOf(BigDecimal.class, r);
+    assertEquals(new BigDecimal("1234.5678"), r);
+  }
+
+  @Test
+  void pgVariableScaleDecimalNegativeAndZeroScale() {
+    // A negative value (two's-complement bytes) and a scale-0 integer both decode exactly.
+    Schema vsd =
+        SchemaBuilder.struct()
+            .name(DebeziumTypeConverter.VARIABLE_SCALE_DECIMAL)
+            .field("scale", Schema.INT32_SCHEMA)
+            .field("value", Schema.BYTES_SCHEMA)
+            .build();
+    Struct neg =
+        new Struct(vsd).put("scale", 2).put("value", new java.math.BigInteger("-9999").toByteArray());
+    assertEquals(
+        new BigDecimal("-99.99"),
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.VARIABLE_SCALE_DECIMAL, neg));
+    Struct whole =
+        new Struct(vsd).put("scale", 0).put("value", new java.math.BigInteger("42").toByteArray());
+    assertEquals(
+        new BigDecimal("42"),
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.VARIABLE_SCALE_DECIMAL, whole));
+  }
+
   @Test
   void nullPassesThrough() {
     assertNull(DebeziumTypeConverter.convert(DebeziumTypeConverter.MICRO_TIMESTAMP, null));
@@ -242,5 +342,93 @@ class DebeziumTypeConverterTest {
     Object stored = event.values().get(idx);
     assertInstanceOf(Timestamp.class, stored);
     assertEquals(Instant.ofEpochMilli(EPOCH_MS), ((Timestamp) stored).toInstant());
+  }
+
+  // --- Tier-3 regression guards ------------------------------------------------
+
+  @Test
+  void dateEpochDayToSqlDateIsTimezoneIndependent() {
+    // io.debezium.time.Date is days-since-epoch. Converting via LocalDate.ofEpochDay is
+    // calendar-based (TZ-independent); a `new java.sql.Date(epochDay*86400000L)` would shift
+    // the day under a non-UTC JVM zone. Compare the LocalDate, not millis.
+    Object r0 = DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, 0L);
+    assertInstanceOf(java.sql.Date.class, r0);
+    assertEquals(java.time.LocalDate.of(1970, 1, 1), ((java.sql.Date) r0).toLocalDate());
+    long ed2024 = java.time.LocalDate.of(2024, 1, 1).toEpochDay();
+    assertEquals(
+        java.time.LocalDate.of(2024, 1, 1),
+        ((java.sql.Date) DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, ed2024)).toLocalDate());
+    long ed1900 = java.time.LocalDate.of(1900, 1, 1).toEpochDay(); // pre-epoch (negative)
+    assertEquals(
+        java.time.LocalDate.of(1900, 1, 1),
+        ((java.sql.Date) DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, ed1900)).toLocalDate());
+  }
+
+  @Test
+  void zonedTimestampKeepsMicroseconds() {
+    // io.debezium.time.ZonedTimestamp with sub-millisecond micros must not truncate to millis.
+    Timestamp ts = (Timestamp) DebeziumTypeConverter.convert(
+        DebeziumTypeConverter.ZONED_TIMESTAMP, "2024-01-01T00:00:00.123456Z");
+    assertEquals(123_456_000, ts.getNanos());
+    // A non-UTC offset resolves to the same instant AND keeps the micros.
+    Timestamp ts2 = (Timestamp) DebeziumTypeConverter.convert(
+        DebeziumTypeConverter.ZONED_TIMESTAMP, "2024-01-01T05:00:00.123456+05:00");
+    assertEquals(Instant.parse("2024-01-01T00:00:00.123456Z"), ts2.toInstant());
+  }
+
+  // --- PostgreSQL bit/varbit -> bit-string (live-test finding: CDC must match Full Load) ---
+
+  private static Schema bitsSchema(int length) {
+    return SchemaBuilder.bytes()
+        .name(DebeziumTypeConverter.BITS_TYPE)
+        .parameter("length", String.valueOf(length))
+        .optional()
+        .build();
+  }
+
+  @Test
+  void pgBitFixedLengthRendersBitString() {
+    // PG bit(8) B'11011011' -> Debezium little-endian bytes {0xDB} -> the bit-string
+    // "11011011" (matches psycopg / the Full Load write), NOT the MySQL integer 219. The
+    // live DLQ test proved the old integer path diverged the CDC write from Full Load.
+    assertEquals("11011011", DebeziumTypeConverter.pgBitString(new byte[] {(byte) 0xDB}, bitsSchema(8)));
+  }
+
+  @Test
+  void pgBitLeadingZerosPaddedToDeclaredLength() {
+    // bit(8) value 15 = {0x0F} -> "00001111" (left-padded to the declared length 8) exactly
+    // as psycopg returns; a bare binary of 15 would drop the leading zeros. All-zero -> all 0s.
+    assertEquals("00001111", DebeziumTypeConverter.pgBitString(new byte[] {0x0F}, bitsSchema(8)));
+    assertEquals("00000000", DebeziumTypeConverter.pgBitString(new byte[] {0x00}, bitsSchema(8)));
+  }
+
+  @Test
+  void pgVarbitRendersBitStringAtDeclaredLength() {
+    // varbit '1010101010' (10 bits) = 682, little-endian {0xAA,0x02}; with the declared
+    // length 10 it reconstructs exactly. (An unbounded bit varying whose per-value length is
+    // shorter than the declared max may carry extra leading zeros -- a documented best-effort
+    // residual: Debezium's byte encoding does not preserve the per-value bit length.)
+    assertEquals(
+        "1010101010",
+        DebeziumTypeConverter.pgBitString(new byte[] {(byte) 0xAA, 0x02}, bitsSchema(10)));
+  }
+
+  @Test
+  void pgBitStringHandlesWideValuesAndNonBytes() {
+    // > 64 bits must not overflow (BigInteger, not long): 9 bytes of 0xFF at length 72.
+    byte[] wide = new byte[9];
+    java.util.Arrays.fill(wide, (byte) 0xFF);
+    assertEquals("1".repeat(72), DebeziumTypeConverter.pgBitString(wide, bitsSchema(72)));
+    // a non-bytes value passes through unchanged (binds as-is; fails loudly if truly wrong).
+    assertEquals("x", DebeziumTypeConverter.pgBitString("x", bitsSchema(8)));
+  }
+
+  @Test
+  void arrayListPassesThroughUnchangedKnownGap() {
+    // Documented gap: a PG array (a List, no logical schema name) hits the default branch and
+    // is bound as-is. Arrays are unsupported DSQL COLUMN types (flagged at Schema Conversion),
+    // so one never reaches here as a real target column; this pins the pass-through contract.
+    java.util.List<Integer> arr = java.util.List.of(1, 2, 3);
+    assertTrue(DebeziumTypeConverter.convert(null, arr) == arr, "List passes through unchanged");
   }
 }

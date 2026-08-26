@@ -281,12 +281,14 @@ def _run_infra(handle, deployer, on_log, **kw):
     orig = s3p._artifact_paths
     with tempfile.TemporaryDirectory() as d:
         deb = Path(d) / "debezium-mysql-plugin.zip"
+        deb_pg = Path(d) / "debezium-postgres-plugin.zip"
         sink = Path(d) / "dsql-sink-connector.zip"
         seeder = Path(d) / "offset-seeder-lambda.zip"
         deb.write_bytes(b"")  # size 0 → matches the fake head_object skip
+        deb_pg.write_bytes(b"")
         sink.write_bytes(b"")
         seeder.write_bytes(b"")
-        s3p._artifact_paths = lambda: (deb, sink, seeder)
+        s3p._artifact_paths = lambda: (deb, deb_pg, sink, seeder)
         try:
             run_cdc_infra_deploy(
                 handle, deployer=deployer, on_log=on_log,
@@ -848,6 +850,285 @@ def test_delete_happy_path() -> None:
     )
     assert all(s == "DONE" for s in _statuses(handle).values())
     assert "delete_stack" in deployer.calls
+
+
+class _SlotRes:
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def first(self):  # noqa: ANN201
+        return self._rows[0] if self._rows else None
+
+
+class _SlotConn:
+    """Fake source connection: slot+publication exist, records the drop statements."""
+
+    def __init__(self):
+        self.sql: list[str] = []
+        self.params: list[dict] = []
+
+    def __enter__(self):  # noqa: ANN204
+        return self
+
+    def __exit__(self, *_a):  # noqa: ANN204
+        return False
+
+    def execute(self, statement, params=None):  # noqa: ANN001, ANN201
+        s = str(statement)
+        self.sql.append(s)
+        self.params.append(params or {})
+        up = " ".join(s.upper().split())
+        if "FROM PG_REPLICATION_SLOTS" in up or "FROM PG_PUBLICATION" in up:
+            return _SlotRes([(1,)])  # both exist -> drops are issued
+        return _SlotRes([])
+
+
+def _patch_pg_teardown(monkeypatch, *, engine):
+    """Patch the PG source-write engine + secret resolution/deletion for a delete test."""
+    from dsql_migrator.config import SecretValue
+    from dsql_migrator.core import cdc_pg_slot
+    import dsql_migrator.core.secrets as secrets
+
+    monkeypatch.setattr(
+        cdc_pg_slot, "build_pg_source_write_engine", lambda src, pw: engine
+    )
+    monkeypatch.setattr(
+        secrets, "resolve_source_secret",
+        lambda sid, prof, region=None: ("cdc_user", SecretValue("pw")),
+    )
+    monkeypatch.setattr(
+        secrets, "delete_source_secret",
+        lambda **k: "scheduled",  # avoid a real Secrets Manager call in cleanup_secret
+    )
+
+
+_PG_DELETE_PARAMS = {
+    "EngineType": "postgres",
+    "SourceDbHostname": "pg.example.com",
+    "SourceDbPort": "5432",
+    "PgDatabaseName": "app",
+}
+
+
+def test_delete_drops_pg_replication_slot_before_secret_cleanup(monkeypatch) -> None:
+    # A PostgreSQL cdc-stack teardown must drop the logical replication slot +
+    # publication on the source (after the stack/connectors are gone, before the
+    # secret is deleted). A slot left behind pins source WAL.
+    conn = _SlotConn()
+
+    class _Eng:
+        def connect(self):  # noqa: ANN201
+            return conn
+
+        def dispose(self) -> None:
+            self.disposed = True
+
+    engine = _Eng()
+    _patch_pg_teardown(monkeypatch, engine=engine)
+
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    existing = CdcStackDiscovery("CREATE_COMPLETE", dict(_PG_DELETE_PARAMS), True)
+    deployer = _FakeDeployer(existing=existing, stack_statuses=("DELETE_IN_PROGRESS", None))
+    run_cdc_delete(
+        handle, stack_name=STACK, deployer=deployer, on_log=on_log,
+        region="us-east-1", sleep=lambda _s: None,
+        delete_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    assert all(s == "DONE" for s in _statuses(handle).values())
+    writes = " ".join(conn.sql).upper()
+    assert "PG_DROP_REPLICATION_SLOT" in writes
+    assert "DROP PUBLICATION IF EXISTS" in writes
+    assert engine.disposed is True  # source write engine disposed (no leak)
+
+
+def test_delete_uses_deployed_slot_name_and_secret_fallback(monkeypatch) -> None:
+    # Teardown must drop the DEPLOYED slot name (PgSlotName from the stack params, which
+    # is the exact name the connector used even if the session's stack name drifted), and
+    # -- for a Secrets-Manager-auth source with no tool-managed secret -- fall back to the
+    # stack's own SourceSecretArn.
+    from dsql_migrator.config import SecretValue
+    from dsql_migrator.core import cdc_pg_slot
+    import dsql_migrator.core.secrets as secrets
+    from dsql_migrator.core.secrets import SecretResolutionError
+
+    conn = _SlotConn()
+
+    class _Eng:
+        def connect(self):  # noqa: ANN201
+            return conn
+
+        def dispose(self) -> None:
+            self.disposed = True
+
+    engine = _Eng()
+    monkeypatch.setattr(cdc_pg_slot, "build_pg_source_write_engine", lambda src, pw: engine)
+    monkeypatch.setattr(secrets, "delete_source_secret", lambda **k: "absent")
+    resolved = []
+
+    def _resolve(secret_id, prof, region=None):
+        resolved.append(secret_id)
+        if secret_id.startswith("mysql-dsql-migrator/cdc/"):
+            raise SecretResolutionError("no tool secret")  # SM-auth source: none created
+        return ("cdc_user", SecretValue("pw"))
+
+    monkeypatch.setattr(secrets, "resolve_source_secret", _resolve)
+
+    handle = _FakeHandle()
+    _, on_log = _logs()
+    params = dict(_PG_DELETE_PARAMS)
+    params["PgSlotName"] = "dsqlmig_deployed_slot"
+    params["PgPublicationName"] = "dsqlmig_pub_deployed"
+    params["SourceSecretArn"] = "arn:aws:secretsmanager:us-east-1:1:secret:customer-abc"
+    existing = CdcStackDiscovery("CREATE_COMPLETE", params, True)
+    deployer = _FakeDeployer(existing=existing, stack_statuses=("DELETE_IN_PROGRESS", None))
+    run_cdc_delete(
+        handle, stack_name=STACK, deployer=deployer, on_log=on_log,
+        region="us-east-1", sleep=lambda _s: None,
+        delete_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    # Dropped the DEPLOYED slot name (a bind param) and publication (inlined), not
+    # re-derived ones.
+    slot_params = [p.get("name") for p in conn.params if p.get("name")]
+    assert "dsqlmig_deployed_slot" in slot_params
+    assert "dsqlmig_pub_deployed" in " ".join(conn.sql)
+    # Fell back to the stack's customer secret after the tool secret was absent.
+    assert any(s.startswith("arn:aws:secretsmanager") for s in resolved), resolved
+
+
+def test_delete_absent_stack_warns_about_a_possible_orphan_slot() -> None:
+    # When the stack is gone (deleted out-of-band), the drop can't run; a loud reminder
+    # must name the slot that may still pin WAL on the source.
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    deployer = _FakeDeployer(existing="absent")
+    run_cdc_delete(
+        handle, stack_name=STACK, deployer=deployer, on_log=on_log, sleep=lambda _s: None,
+    )
+    assert any("pg_drop_replication_slot" in m for m in logs), logs
+
+
+def test_delete_mysql_stack_never_touches_the_source(monkeypatch) -> None:
+    # A MySQL teardown must be byte-identical: no source-write engine is ever built.
+    from dsql_migrator.core import cdc_pg_slot
+
+    built: list = []
+    monkeypatch.setattr(
+        cdc_pg_slot, "build_pg_source_write_engine",
+        lambda src, pw: built.append((src, pw)),
+    )
+    handle = _FakeHandle()
+    _, on_log = _logs()
+    # No EngineType (or "mysql") -> the PG slot-drop branch never runs.
+    existing = CdcStackDiscovery("CREATE_COMPLETE", {}, True)
+    deployer = _FakeDeployer(existing=existing, stack_statuses=("DELETE_IN_PROGRESS", None))
+    run_cdc_delete(
+        handle, stack_name=STACK, deployer=deployer, on_log=on_log,
+        sleep=lambda _s: None, delete_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    assert all(s == "DONE" for s in _statuses(handle).values())
+    assert built == []  # source never contacted for a MySQL teardown
+
+
+def test_delete_pg_slot_drop_failure_is_loud_but_not_fatal(monkeypatch) -> None:
+    # A surviving slot is a production-disk hazard, so a drop failure logs a prominent
+    # manual-drop reminder -- but never fails the (already-complete) infra teardown.
+    from dsql_migrator.core import cdc_pg_slot
+    import dsql_migrator.core.secrets as secrets
+
+    def _boom(src, pw):
+        raise RuntimeError("cannot reach source")
+
+    monkeypatch.setattr(cdc_pg_slot, "build_pg_source_write_engine", _boom)
+    monkeypatch.setattr(
+        secrets, "resolve_source_secret",
+        lambda sid, prof, region=None: ("cdc_user", None),
+    )
+    monkeypatch.setattr(secrets, "delete_source_secret", lambda **k: "scheduled")
+
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    existing = CdcStackDiscovery("CREATE_COMPLETE", dict(_PG_DELETE_PARAMS), True)
+    deployer = _FakeDeployer(existing=existing, stack_statuses=("DELETE_IN_PROGRESS", None))
+    run_cdc_delete(
+        handle, stack_name=STACK, deployer=deployer, on_log=on_log,
+        region="us-east-1", sleep=lambda _s: None,
+        delete_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    # Teardown still completes...
+    assert all(s == "DONE" for s in _statuses(handle).values())
+    # ...with a loud manual-drop reminder naming pg_drop_replication_slot.
+    assert any(
+        "WARNING" in m and "pg_drop_replication_slot" in m for m in logs
+    ), logs
+
+
+def test_delete_pg_missing_host_skips_drop_gracefully(monkeypatch) -> None:
+    # A PostgreSQL teardown whose captured stack params carry no source host cannot
+    # reconstruct the source connection, so the slot drop is skipped BEFORE any engine
+    # is built -- but it must log a loud manual-drop reminder (a surviving slot pins
+    # WAL) and let the (already-complete) teardown finish.
+    from dsql_migrator.core import cdc_pg_slot
+
+    built: list = []
+    monkeypatch.setattr(
+        cdc_pg_slot, "build_pg_source_write_engine",
+        lambda src, pw: built.append((src, pw)),
+    )
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    params = dict(_PG_DELETE_PARAMS)
+    params["SourceDbHostname"] = ""
+    existing = CdcStackDiscovery("CREATE_COMPLETE", params, True)
+    deployer = _FakeDeployer(existing=existing, stack_statuses=("DELETE_IN_PROGRESS", None))
+    run_cdc_delete(
+        handle, stack_name=STACK, deployer=deployer, on_log=on_log,
+        sleep=lambda _s: None, delete_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    assert all(s == "DONE" for s in _statuses(handle).values())
+    assert built == []  # no source engine built when the host is unknown
+    assert any(
+        "WARNING" in m and "source host" in m and "pg_drop_replication_slot" in m
+        for m in logs
+    ), logs
+
+
+def test_delete_pg_no_credentials_skips_drop_gracefully(monkeypatch) -> None:
+    # A PostgreSQL teardown where the source credentials can't be resolved (no
+    # tool-managed secret and no stack SourceSecretArn/Name fallback) must catch the
+    # SecretResolutionError, never build a source engine, log a loud manual-drop
+    # reminder, and let the (already-complete) teardown finish.
+    from dsql_migrator.core import cdc_pg_slot
+    import dsql_migrator.core.secrets as secrets
+    from dsql_migrator.core.secrets import SecretResolutionError
+
+    built: list = []
+    monkeypatch.setattr(
+        cdc_pg_slot, "build_pg_source_write_engine",
+        lambda src, pw: built.append((src, pw)),
+    )
+    monkeypatch.setattr(
+        secrets, "resolve_source_secret",
+        lambda secret_id, prof, region=None: (_ for _ in ()).throw(
+            SecretResolutionError("none")
+        ),
+    )
+    monkeypatch.setattr(secrets, "delete_source_secret", lambda **k: "absent")
+
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    params = dict(_PG_DELETE_PARAMS)  # no SourceSecretArn/Name -> no fallback
+    existing = CdcStackDiscovery("CREATE_COMPLETE", params, True)
+    deployer = _FakeDeployer(existing=existing, stack_statuses=("DELETE_IN_PROGRESS", None))
+    run_cdc_delete(
+        handle, stack_name=STACK, deployer=deployer, on_log=on_log, region="us-east-1",
+        sleep=lambda _s: None, delete_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    assert all(s == "DONE" for s in _statuses(handle).values())
+    assert built == []  # creds unresolved -> engine never built
+    assert any(
+        "WARNING" in m and "pg_drop_replication_slot" in m for m in logs
+    ), logs
 
 
 def test_delete_absent_stack_is_noop_success() -> None:

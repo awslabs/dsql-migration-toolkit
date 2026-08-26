@@ -5,6 +5,40 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.396
+
+### 追加 (Added)
+
+- **PostgreSQL がマイグレーションのソースとしてサポートされました(RDS / Aurora PostgreSQL →
+  Aurora DSQL)。** Connect 画面にソースエンジン選択(MySQL / PostgreSQL)が追加され、PostgreSQL
+  ソースはソース方言アダプタ(`core/source_dialect`)を通じて全工程(Evaluation、Schema
+  Conversion、Full Load、Validation、CDC)を実行します。PostgreSQL → DSQL はほぼ同一
+  (どちらも PostgreSQL-16 ワイヤ)であり、Schema Conversion は型をそのまま渡し、DSQL 非対応の
+  型(配列、geometric / network / xml / money / bit / range / tsvector / enum / composite /
+  domain)を忠実なリモデル先とともにフラグします。Full Load は keyset でストリーミングし
+  (シャーディング REPLACE 読み取りは共有 exported スナップショットを使用)、Validation は
+  PostgreSQL-16 のチェックサムレンダラを両端で再利用します。実際の Aurora PostgreSQL で
+  end-to-end 検証済み(Full Load + Validation、CHECKSUM バイト単位で同一)。
+- **PostgreSQL CDC(Debezium `pgoutput` → MSK → DSQL sink)。** 論理レプリケーションスロット +
+  publication のライフサイクル、WAL 保持ヘルスの表示、gapless な Full-Load → CDC ハンドオフ、
+  型付きバインド(uuid / timetz-UTC / interval / timestamptz / jsonb / bytea / numeric)および
+  TOAST partial-upsert。専用の Debezium-PostgreSQL コネクタプラグインが MySQL 用と併せて提供
+  されます。
+
+### 修正 (Fixed)
+
+- **最新の MySQL ソースで `BIGINT UNSIGNED` が CHECKSUM 検証で誤った不一致を出さなくなりました。**
+  DSQL ターゲットのチェックサムが PostgreSQL の無制約 `numeric` scale-6 ルールを括弧なしのすべての
+  型に適用していましたが、MySQL 8.0.19+ / 8.4 / Aurora MySQL 3 は `BIGINT UNSIGNED` を括弧なしの
+  `bigint unsigned`(`numeric(20,0)`、整数)で報告します。ターゲット側は `.000000` を得る一方、
+  変更されていない MySQL ソース側は scale 0 で描画されるため、データがバイト単位で同一でも該当行が
+  すべて食い違っていました。scale-6 ルールは本物の PostgreSQL ソースにのみ適用されるようになりました
+  (MySQL 5.7 の `bigint(20) unsigned` は影響を受けません)。
+- **宣言された精度のない PostgreSQL `numeric`/`decimal`(bare)に Schema Conversion 警告が表示され
+  ます。** Aurora DSQL はそのような列を既定の `numeric(18,6)` で格納し、小数 6 桁を超える値を丸め
+  ますが、これは従来サイレントで(38/37 を超える*宣言済み*精度のみをフラグ)、Validation は scale 6
+  で比較するため損失が見逃される可能性がありました。変換は列名と `numeric(18,6)` の上限を明示します。
+
 ## v0.1.395
 
 ### 修正 (Fixed)

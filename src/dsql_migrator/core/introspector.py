@@ -23,7 +23,7 @@ reflection.
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Protocol
+from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Engine
@@ -40,9 +40,13 @@ from dsql_migrator.core.models import (
     ObjectType,
     SourceConnectionConfig,
     SourceInventory,
+    SourceType,
     TableDef,
     ViewDef,
 )
+
+if TYPE_CHECKING:
+    from dsql_migrator.core.source_dialect import SourceDialect
 
 MYSQL_DRIVER = "mysql+pymysql"
 
@@ -108,8 +112,11 @@ MYSQL_TRANSIENT_SIGNATURES = (
 )
 
 
-def is_source_transient_error(exc: BaseException) -> bool:
+def _mysql_source_transient(exc: BaseException) -> bool:
     """True for a source-MySQL failure that a fresh connection can recover from.
+
+    MySQL-specific classifier behind ``MySQLSourceDialect.is_transient_error``; the
+    engine-dispatching public entry point is :func:`is_source_transient_error` below.
 
     The Full Load's source read is the one place this matters: an Aurora failover
     (or any connection drop / stall) kills the in-flight read of a large table.
@@ -152,33 +159,42 @@ def is_source_transient_error(exc: BaseException) -> bool:
 # raw driver text ("OperationalError: (2013, 'Lost connection to MySQL server
 # during query')") tells the user nothing about what to do, and this case is
 # EXPECTED on Aurora (failover during a multi-hour load), so it gets a concrete
-# next step and an explicit safety reassurance instead.
-SOURCE_CONNECTION_LOST_HINT = (
-    "The source MySQL connection dropped mid-read. On Aurora this is usually a "
+# next step and an explicit safety reassurance instead. ``{engine}`` is filled with
+# the source dialect's display name so a PostgreSQL migration never reads "MySQL".
+SOURCE_CONNECTION_LOST_HINT_TEMPLATE = (
+    "The source {engine} connection dropped mid-read. On Aurora this is usually a "
     "failover (writer promotion during patching, an instance replacement, or an AZ "
     "event) — the database itself is fine. Nothing on the source was changed (the "
     "load only reads it), and re-running is safe: the load is idempotent and "
     "resumes by primary key, so it fills only what is missing and never duplicates "
     "rows."
 )
+# MySQL-rendered constant kept for backward compatibility (and existing callers/tests).
+SOURCE_CONNECTION_LOST_HINT = SOURCE_CONNECTION_LOST_HINT_TEMPLATE.format(engine="MySQL")
 
 
 # Codes that specifically mean the SOURCE ran out of connection slots, which needs
 # different advice from a failover: fewer concurrent readers, not "wait and re-run".
 _MYSQL_TOO_MANY_CONNECTIONS_CODES = frozenset({1040, 1203})
 
-SOURCE_TOO_MANY_CONNECTIONS_HINT = (
-    "The source MySQL refused a new connection because it is at its connection "
+SOURCE_TOO_MANY_CONNECTIONS_HINT_TEMPLATE = (
+    "The source {engine} refused a new connection because it is at its connection "
     "limit. Full Load opens one source reader per table (times the reader shards "
     "per table), so a high parallelism can exhaust a small instance's "
     "max_connections. Lower DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM (and/or "
     "FULL_LOAD_READER_SHARDS), or raise the source's max_connections, then re-run — "
     "the load is idempotent and fills only what is missing."
 )
+SOURCE_TOO_MANY_CONNECTIONS_HINT = SOURCE_TOO_MANY_CONNECTIONS_HINT_TEMPLATE.format(
+    engine="MySQL"
+)
 
 
-def _is_too_many_connections(exc: BaseException) -> bool:
-    """True when ``exc`` is the source refusing a connection for lack of slots."""
+def _mysql_too_many_connections(exc: BaseException) -> bool:
+    """True when ``exc`` is the source MySQL refusing a connection for lack of slots.
+
+    MySQL-specific predicate behind ``MySQLSourceDialect.is_too_many_connections``.
+    """
     candidates = [exc]
     for attr in ("orig", "__cause__"):
         nested = getattr(exc, attr, None)
@@ -195,19 +211,46 @@ def _is_too_many_connections(exc: BaseException) -> bool:
     return "too many connections" in str(exc).lower()
 
 
-def source_error_hint(exc: BaseException) -> Optional[str]:
+# Backward-compatible alias (the historical private name).
+_is_too_many_connections = _mysql_too_many_connections
+
+
+def is_source_transient_error(
+    exc: BaseException, source_type: SourceType = SourceType.MYSQL
+) -> bool:
+    """True for a source failure a fresh connection can recover from, per engine.
+
+    Dispatches to the source dialect's classifier so the recoverable shapes are the
+    right ones for the engine: MySQL numeric driver codes, PostgreSQL SQLSTATE classes
+    (on ``.sqlstate``). A MySQL-only classifier silently never fires for psycopg, so a
+    PostgreSQL failover would go un-retried without this dispatch. Defaults to MySQL so
+    existing callers are unchanged. Anything unrecognized is NON-transient.
+    """
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    return dialect_for(source_type).is_transient_error(exc)
+
+
+def source_error_hint(
+    exc: BaseException, source_type: SourceType = SourceType.MYSQL
+) -> Optional[str]:
     """Return an actionable operator hint for ``exc``, or ``None`` if there is none.
 
     Keeps the "what happened / what to do next" phrasing next to the classifier that
     recognizes the condition, so every surface (per-table error log, activity log,
-    the UI notice) explains a source failure the same way. Connection EXHAUSTION gets
-    its own hint: it is also transient, but waiting is not the fix -- the operator
-    needs to reduce reader concurrency or raise the source's limit.
+    the UI notice) explains a source failure the same way, worded for the SOURCE engine
+    (the dialect's display name fills the template — a PostgreSQL migration never reads
+    "MySQL"). Connection EXHAUSTION gets its own hint: it is also transient, but waiting
+    is not the fix -- the operator needs to reduce reader concurrency or raise the limit.
     """
-    if _is_too_many_connections(exc):
-        return SOURCE_TOO_MANY_CONNECTIONS_HINT
-    if is_source_transient_error(exc):
-        return SOURCE_CONNECTION_LOST_HINT
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    dialect = dialect_for(source_type)
+    engine = dialect.engine_display_name
+    if dialect.is_too_many_connections(exc):
+        return SOURCE_TOO_MANY_CONNECTIONS_HINT_TEMPLATE.format(engine=engine)
+    if dialect.is_transient_error(exc):
+        return SOURCE_CONNECTION_LOST_HINT_TEMPLATE.format(engine=engine)
     return None
 
 
@@ -350,19 +393,27 @@ def install_read_only_guard(engine: Engine) -> None:
 
 
 def _default_engine_factory(conn: SourceConnectionConfig) -> Engine:
-    """Build a read-only-guarded MySQL engine from a connection config."""
+    """Build a read-only-guarded source engine from a connection config.
+
+    The driver scheme and engine kwargs come from the source dialect selected by
+    ``conn.source_type`` (default MySQL). ``dialect_for`` is imported lazily to avoid
+    an import cycle (``source_dialect`` imports this module's MySQL helpers).
+    """
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    dialect = dialect_for(conn.source_type)
     password: Optional[str] = None
     if conn.secret is not None:
         password = resolve_secret(conn.secret).reveal()
     url = URL.create(
-        MYSQL_DRIVER,
+        dialect.driver_scheme,
         username=conn.username,
         password=password,
         host=conn.host,
         port=conn.port,
         database=conn.database,
     )
-    engine = create_engine(url, **source_engine_kwargs())
+    engine = create_engine(url, **dialect.engine_kwargs())
     install_read_only_guard(engine)
     return engine
 
@@ -772,10 +823,13 @@ def enrich_partitions(
             table.partitioned = True
 
 
-def _user_schemas(inspector: object) -> list[str]:
-    """Return non-system schema names on the cluster, in catalog order."""
+def _user_schemas(inspector: object, system_schemas: frozenset[str]) -> list[str]:
+    """Return non-system schema names on the cluster, in catalog order.
+
+    ``system_schemas`` (the source dialect's engine-internal schemas) are excluded.
+    """
     names = inspector.get_schema_names()  # type: ignore[attr-defined]
-    return [name for name in names if name not in MYSQL_SYSTEM_SCHEMAS]
+    return [name for name in names if name not in system_schemas]
 
 
 def _qualify(schema: str, *object_lists: list) -> None:
@@ -790,22 +844,31 @@ def _assemble_inventory(
     connection: _Connection,
     database: Optional[str],
     *,
-    is_mysql: bool,
+    dialect: "SourceDialect",
 ) -> SourceInventory:
     """Assemble a :class:`SourceInventory` from one or all schemas.
 
-    When ``database`` is set, a single schema is reflected with unqualified
-    names (single-database mode). When it is empty/``None``, every non-system
-    schema is reflected and names are qualified ``schema.object`` (cluster-wide
-    mode). On MySQL, each reflected schema is enriched via ``information_schema``.
+    For an engine whose ``database`` IS a schema (MySQL, ``dialect.database_is_schema``):
+    when ``database`` is set, that single schema is reflected with unqualified names
+    (single-database mode); when empty/``None``, every non-system schema is reflected,
+    ``schema.object``-qualified (cluster-wide mode). For an engine whose schemas live
+    INSIDE the connection database (PostgreSQL, ``database_is_schema`` False), every
+    non-system schema of the connected database is reflected + qualified regardless (so a
+    non-``public`` schema is never silently dropped). Structural reflection is
+    dialect-agnostic; the ``dialect`` supplies the system schemas + engine enrichment.
     """
-    if database:
-        # Single-database mode: reflect the connection's default schema and keep
+    if database and dialect.database_is_schema:
+        # Single-database mode (MySQL): reflect the connection's default schema and keep
         # names unqualified. ``enrich_db`` is the selected database.
         plans: list[tuple[Optional[str], str, bool]] = [(None, database, False)]
     else:
-        # Cluster-wide mode: reflect every user schema and qualify names.
-        plans = [(schema, schema, True) for schema in _user_schemas(inspector)]
+        # Reflect every non-system schema and qualify names. This is MySQL's cluster-wide
+        # mode (blank database) AND the only mode for PostgreSQL (whose one connected
+        # database holds many schemas -- public, app, ... -- all of which must migrate).
+        plans = [
+            (schema, schema, True)
+            for schema in _user_schemas(inspector, dialect.system_schemas)
+        ]
 
     all_tables: list[TableDef] = []
     all_views: list[ViewDef] = []
@@ -816,17 +879,9 @@ def _assemble_inventory(
     for reflect_schema, enrich_db, qualify in plans:
         tables = _reflect_tables(inspector, schema=reflect_schema)
         views = _reflect_views(inspector, schema=reflect_schema)
-        triggers: list[ObjectRef] = []
-        routines: list[ObjectRef] = []
-        events: list[ObjectRef] = []
-
-        if is_mysql:
-            enrich_columns(connection, enrich_db, tables)
-            enrich_index_types(connection, enrich_db, tables)
-            enrich_partitions(connection, enrich_db, tables)
-            triggers = collect_triggers(connection, enrich_db)
-            routines = collect_routines(connection, enrich_db)
-            events = collect_events(connection, enrich_db)
+        # Engine-specific enrichment (columns/indexes/partitions in place + stored
+        # triggers/routines/events). No-ops for a dialect/connection without it.
+        triggers, routines, events = dialect.enrich(connection, enrich_db, tables)
 
         if qualify:
             _qualify(enrich_db, tables, views, triggers, routines, events)
@@ -867,54 +922,25 @@ class SourceIntrospector:
         Implements Requirement 1.1. On failure the reason is returned with any
         plaintext credential redacted (Requirement 1.4 / 9.2).
         """
+        from dsql_migrator.core.source_dialect import dialect_for
+
+        dialect = dialect_for(conn.source_type)
         engine: Optional[Engine] = None
         try:
             engine = self._engine_factory(conn)
             with engine.connect() as connection:
                 connection.execute(text("SELECT 1"))
-                # Read the server version read-only so the UI can show the source
-                # engine (e.g. Aurora MySQL version) on the overview diagram. A
-                # failure here must not fail the connection test, so it is best
-                # effort.
-                version: Optional[str] = None
-                try:
-                    row = connection.execute(text("SELECT VERSION()")).first()
-                    version = str(row[0]) if row and row[0] is not None else None
-                except Exception:  # noqa: BLE001 - version is optional metadata
-                    version = None
-                # The community MySQL engine version behind an Aurora build is not
-                # in VERSION() (which carries only major.minor before the Aurora
-                # tag); @@innodb_version usually exposes the full patch (e.g.
-                # 8.0.42). Best effort, optional.
-                mysql_version: Optional[str] = None
-                try:
-                    row = connection.execute(
-                        text("SELECT @@innodb_version")
-                    ).first()
-                    mysql_version = (
-                        str(row[0]) if row and row[0] is not None else None
-                    )
-                except Exception:  # noqa: BLE001 - optional metadata
-                    mysql_version = None
-                # Aurora MySQL exposes its engine version (e.g. 3.07.1) via
-                # @@aurora_version even when VERSION() reports only the
-                # MySQL-compatible patch. Present only on Aurora; best effort.
-                aurora_version: Optional[str] = None
-                try:
-                    row = connection.execute(
-                        text("SELECT @@aurora_version")
-                    ).first()
-                    aurora_version = (
-                        str(row[0]) if row and row[0] is not None else None
-                    )
-                except Exception:  # noqa: BLE001 - non-Aurora has no such var
-                    aurora_version = None
+                # Read source version metadata read-only so the UI can show the
+                # source engine (e.g. Aurora MySQL / PostgreSQL version) on the
+                # overview diagram. The dialect probes each version best-effort, so
+                # a failure here never fails the connection test.
+                versions = dialect.probe_versions(connection)
             return ConnectionResult(
                 success=True,
                 detail="Connection successful.",
-                server_version=version,
-                mysql_version=mysql_version,
-                aurora_version=aurora_version,
+                server_version=versions.server_version,
+                engine_version=versions.engine_version,
+                aurora_version=versions.aurora_version,
             )
         except Exception as exc:  # noqa: BLE001 - surfaced as a failure reason
             message = _sanitize_message(str(exc), _revealed_secret(conn))
@@ -939,13 +965,15 @@ class SourceIntrospector:
         enrich triggers, routines, AUTO_INCREMENT, and collation. All access is
         read-only (Property 1).
         """
+        from dsql_migrator.core.source_dialect import dialect_for
+
+        dialect = dialect_for(conn.source_type)
         engine = self._engine_factory(conn)
         try:
             with engine.connect() as connection:
                 inspector = inspect(connection)
-                is_mysql = connection.dialect.name == "mysql"
                 return _assemble_inventory(
-                    inspector, connection, conn.database, is_mysql=is_mysql
+                    inspector, connection, conn.database, dialect=dialect
                 )
         finally:
             engine.dispose()

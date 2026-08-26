@@ -2,14 +2,16 @@
 
 _Language: **English** | [한국어](README.ko.md) | [日本語](README.ja.md)_
 
-A web-based all-in-one tool for migrating Amazon RDS MySQL / Aurora MySQL to
-**Amazon Aurora DSQL**, with **optional AI assistance (Amazon Bedrock)** for the
-parts that genuinely need judgment.
+A web-based all-in-one tool for migrating Amazon RDS / Aurora **MySQL** *or*
+**PostgreSQL** to **Amazon Aurora DSQL**, with **optional AI assistance (Amazon
+Bedrock)** for the parts that genuinely need judgment.
 
-Aurora DSQL is a PostgreSQL 16–compatible *distributed* database, not a MySQL one,
-so this is a **heterogeneous migration** with two overlapping conversions: MySQL →
-PostgreSQL dialect, then PostgreSQL → DSQL constraints (no foreign keys, optimistic
-concurrency, per-transaction row/time limits, async indexes, `C` collation, …).
+Aurora DSQL is a PostgreSQL 16–compatible *distributed* database. A **MySQL** source
+is a **heterogeneous migration** with two overlapping conversions: MySQL → PostgreSQL
+dialect, then PostgreSQL → DSQL constraints (no foreign keys, optimistic concurrency,
+per-transaction row/time limits, async indexes, `C` collation, …). A **PostgreSQL**
+source skips the dialect step (both ends are PostgreSQL) and applies only the DSQL
+constraints.
 
 The goal is not fully automated zero-downtime migration. It is to **assess
 migratability, automate what converts deterministically (`sqlglot`), and clearly
@@ -25,8 +27,8 @@ surface what needs human work.** The source database is always accessed read-onl
 ## At a glance
 
 Two data paths converge on Aurora DSQL: a one-shot **Full Load** driven by the
-tool, and an optional continuous **CDC** stream on managed MSK Connect. A
-binlog/GTID watermark bridges the two for a gapless handoff.
+tool, and an optional continuous **CDC** stream on managed MSK Connect. A watermark
+(MySQL binlog/GTID, or PostgreSQL LSN) bridges the two for a gapless handoff.
 
 <p align="center">
   <b>Simple architecture</b><br>

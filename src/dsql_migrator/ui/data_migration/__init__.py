@@ -102,6 +102,7 @@ from dsql_migrator.core.models import (
     PrerequisiteResult,
     PrerequisiteStatus,
     SourceInventory,
+    SourceType,
     StepStatus,
     TableSelection,
     TargetInventory,
@@ -166,7 +167,9 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
 # package's public import surface is unchanged.
 from dsql_migrator.ui.data_migration._models import (
     MigrationType,
+    _CDC_MIGRATION_TYPES,
     _SUBSTEPS,
+    source_supports_cdc,
     prereq_mode_for_type,
     migration_status_label,
     migration_status_badge,
@@ -409,7 +412,9 @@ def build_data_migration_screen(
         target_config = session.target_config
         assert source_config is not None  # guaranteed by has_source()
         assert target_config is not None  # guaranteed by has_target()
-        _conversion = SchemaConverter().convert(inventory)
+        _conversion = SchemaConverter(
+            source_type=source_config.source_type
+        ).convert(inventory)
         inputs = DataMigrationInputs(
             source_config=source_config,
             source_password=session.source_password,
@@ -424,6 +429,12 @@ def build_data_migration_screen(
             # confirmed tables for a clean reload (no leftover rows). Once CDC is
             # live the load falls back to idempotent SKIP_EXISTING (no DROP).
             cdc_coexisting=cdc_streaming_started(migration_state, job_manager),
+            # PostgreSQL Full Load + CDC: name the CDC stack so the watermark capture
+            # creates the logical replication slot + publication on the source at the
+            # consistency point (gapless handoff; see _capture_postgres_watermark).
+            cdc_stack_name=_pg_cdc_handoff_stack(
+                migration_state, source_config, job_manager
+            ),
             table_conversions=applied_table_conversions(
                 _conversion, conv_state.edited_target_ddls
             ),
@@ -568,8 +579,14 @@ def build_data_migration_screen(
         # match the target -- no sink change. Recompute from the applied conversion
         # each render and store it on the state for the CDC start path to read.
         if inventory is not None and inventory.tables:
+            _stype = (
+                session.source_config.source_type
+                if session.source_config is not None
+                else SourceType.MYSQL
+            )
             _applied = applied_table_conversions(
-                SchemaConverter().convert(inventory), conv_state.edited_target_ddls
+                SchemaConverter(source_type=_stype).convert(inventory),
+                conv_state.edited_target_ddls,
             )
             migration_state.set_cdc_message_key_columns(
                 composite_key_columns_for_cdc(inventory.tables, _applied)
@@ -628,7 +645,12 @@ def build_data_migration_screen(
                 aws_profile=session.aws_profile,
             )
             request = PrerequisiteCheckRequest(
-                mode=mode, tables=[table.name for table in tables]
+                mode=mode,
+                tables=[table.name for table in tables],
+                # Engine selects the CDC-only checks: a PostgreSQL source reports
+                # CDC as not-yet-supported (INFO) instead of running MySQL binlog
+                # checks that would falsely FAIL.
+                source_type=source_config.source_type,
             )
             from nicegui import run
 
@@ -722,6 +744,14 @@ def build_data_migration_screen(
                 # so a lock can never appear without its reason.
                 locked=_type_lock_reason is not None,
                 lock_reason=_type_lock_reason,
+                # Gate the CDC tiles by source engine: PostgreSQL CDC is not yet
+                # available, so its CDC tiles render disabled (Full load only stays
+                # selectable) rather than deploying a MySQL connector against PG.
+                source_type=(
+                    session.source_config.source_type
+                    if session.source_config is not None
+                    else SourceType.MYSQL
+                ),
             )
             # Plan-level CDC discovery surfacing: the moment the plan includes CDC,
             # the discovery (armed below on has_cdc) populates cdc_other_stacks. Show
@@ -1157,7 +1187,9 @@ def build_data_migration_screen(
                     if retry_cdc_coexisting
                     else frozenset(migration_state.replace_targets) & set(names)
                 )
-                _retry_conversion = SchemaConverter().convert(inventory)
+                _retry_conversion = SchemaConverter(
+                    source_type=source_config.source_type
+                ).convert(inventory)
                 retry_inputs = DataMigrationInputs(
                     source_config=source_config,
                     source_password=session.source_password,
@@ -1632,7 +1664,13 @@ def build_data_migration_screen(
                                 selected_names,
                                 table_conversions=(
                                     applied_table_conversions(
-                                        SchemaConverter().convert(inventory),
+                                        SchemaConverter(
+                                            source_type=(
+                                                session.source_config.source_type
+                                                if session.source_config is not None
+                                                else SourceType.MYSQL
+                                            )
+                                        ).convert(inventory),
                                         conv_state.edited_target_ddls,
                                     )
                                     if inventory is not None
@@ -2353,6 +2391,28 @@ def _render_cdc_existing_infra_banner(ui, migration_state, refresh) -> None:
                 ).props("color=primary")
 
 
+def _pg_cdc_handoff_stack(migration_state, source_config, job_manager):
+    """Return the CDC stack name for a PostgreSQL Full-Load->CDC gapless handoff, else None.
+
+    When set on :class:`DataMigrationInputs`, the Full Load watermark capture creates a
+    logical replication slot + publication on the source at the consistency point (named
+    for this stack), so CDC resumes with no gap (see ``_capture_postgres_watermark``).
+
+    Returns the stack name ONLY for a PostgreSQL source on the combined ``Full load + CDC``
+    type while CDC is not yet streaming (PostgreSQL is Full-Load-first: the slot bridges to
+    a CDC that starts afterward). Returns None for MySQL (which hands off via the binlog
+    offset-seeder, not a slot), a Full-Load-only run, or once CDC is already streaming --
+    a slot with no consumer would pin the source WAL. Pure.
+    """
+    if getattr(source_config, "source_type", None) is not SourceType.POSTGRES:
+        return None
+    if migration_state.migration_type is not MigrationType.FULL_LOAD_AND_CDC:
+        return None
+    if cdc_streaming_started(migration_state, job_manager):
+        return None
+    return getattr(migration_state, "cdc_stack_name", None) or None
+
+
 def _render_migration_type_selector(
     ui,
     migration_state,
@@ -2361,6 +2421,7 @@ def _render_migration_type_selector(
     refresh,
     locked: Optional[bool] = None,
     lock_reason: Optional[str] = None,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> None:
     """Render the migration type as AWS-console-style radio tiles.
 
@@ -2371,12 +2432,28 @@ def _render_migration_type_selector(
     via :func:`migration_type_locked`) disables the whole group so the type
     cannot change once a migration has started; when ``None`` it falls back to
     locking only while this step is ``IN_PROGRESS``.
+
+    ``source_type`` gates the CDC tiles by :func:`source_supports_cdc` (the single
+    CDC-by-engine allowlist). MySQL and PostgreSQL both support CDC today, so all
+    three tiles are enabled for them; the gate remains as a defensive default so any
+    future source engine without CDC renders its CDC tiles disabled (with a note)
+    rather than offering a non-functional deploy. Full load only is always
+    available. Defaults to MySQL so existing callers keep all three tiles.
     """
     running = locked if locked is not None else (status is StepStatus.IN_PROGRESS)
     selected = migration_state.migration_type
+    cdc_available = source_supports_cdc(source_type)
+
+    def _gated(mt: MigrationType) -> bool:
+        # A CDC-bearing type on a source whose CDC is not yet supported: disabled.
+        return not cdc_available and mt in _CDC_MIGRATION_TYPES
 
     def _select(new_type: MigrationType) -> None:
         if running:
+            return
+        if _gated(new_type):
+            # CDC is not available for this source engine yet; ignore the click so
+            # the type cannot become a non-functional CDC selection.
             return
         # Re-selecting the SAME tile still has to record the choice: the type has a
         # default (Full load only), so clicking that tile is how a user confirms it --
@@ -2423,19 +2500,25 @@ def _render_migration_type_selector(
         for mt in MigrationType:
             meta = _MIGRATION_TYPE_META[mt]
             is_selected = mt is selected
+            gated = _gated(mt)
+            # Non-interactive while a job runs (whole group locked) OR when this is a
+            # CDC tile the source engine cannot yet use (PostgreSQL CDC not shipped).
+            disabled = running or gated
             # Cloudscape-tile look: bordered card, primary border + tint when
             # selected, muted + non-interactive while a job runs.
             border = "border-blue-500" if is_selected else "border-gray-300"
             bg = "bg-blue-50" if is_selected else "bg-white"
             interactivity = (
                 "opacity-60 cursor-not-allowed"
-                if running
+                if disabled
                 else "cursor-pointer hover:border-blue-400"
             )
             tile = ui.card().classes(  # type: ignore[attr-defined]
                 f"flex-1 p-3 rounded-lg border {border} {bg} {interactivity} "
                 "transition-colors gap-1"
             )
+            # _select refuses gated/running clicks, so attaching it unconditionally is
+            # safe and keeps the disabled tile inert rather than silently missing.
             tile.on("click", lambda _e=None, _mt=mt: _select(_mt))
             with tile:
                 with ui.row().classes("items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
@@ -2459,7 +2542,21 @@ def _render_migration_type_selector(
                     ui.label(meta.when).classes(  # type: ignore[attr-defined]
                         "text-xs text-gray-700 font-medium mt-1"
                     )
-                if meta.requirements:
+                if gated:
+                    # This CDC tile is disabled because CDC is not available for the
+                    # selected source engine. Say so where the user clicks (a silently
+                    # dead tile reads as a bug), and steer them to Full load only. The
+                    # MySQL binlog/MSK requirements note would be misleading here, so it
+                    # is replaced by this one. (MySQL and PostgreSQL both support CDC, so
+                    # this only shows for a future engine that does not.)
+                    with ui.row().classes("items-start gap-1 no-wrap mt-1"):  # type: ignore[attr-defined]
+                        ui.icon("schedule").classes(  # type: ignore[attr-defined]
+                            "text-amber-600 text-xs mt-0.5"
+                        )
+                        ui.label(  # type: ignore[attr-defined]
+                            "CDC is not available for this source engine — use Full load only."
+                        ).classes("text-xs text-amber-700")
+                elif meta.requirements:
                     # Purely informational: what the mode needs (verified later by
                     # the Prerequisites step). Kept a calm neutral gray -- NOT a
                     # warning/error color -- so it reads as a heads-up at decision
@@ -3327,6 +3424,7 @@ __all__ = [
     "migratable_table_names",
     "resolve_active_substep",
     "MigrationType",
+    "source_supports_cdc",
     "prereq_mode_for_type",
     "substeps_for_type",
     "resolve_active_substep_for_type",

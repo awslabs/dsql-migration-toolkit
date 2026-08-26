@@ -323,6 +323,7 @@ def build_ai_tool_executor(
                     SchemaConverter,
                     SchemaConvertOptions,
                 )
+                from dsql_migrator.core.models import SourceType
                 from dsql_migrator.ui.schema_conversion import (
                     TABLE_PREFIX,
                     VIEW_PREFIX,
@@ -339,7 +340,11 @@ def build_ai_tool_executor(
                         {"status": "not_run",
                          "message": "Run Evaluation (Step 1) first to read the source schema."}
                     )
-                _res = SchemaConverter().convert(_inv, SchemaConvertOptions())
+                # Convert with the migration's SOURCE engine so a PostgreSQL source
+                # previews with PG (not MySQL) semantics.
+                _sc = getattr(SESSION_STORE.get_or_create(session_id), "source_config", None)
+                _stype = _sc.source_type if _sc is not None else SourceType.MYSQL
+                _res = SchemaConverter(source_type=_stype).convert(_inv, SchemaConvertOptions())
                 _pv = generate_previews(
                     [f"{TABLE_PREFIX}{_obj}", f"{VIEW_PREFIX}{_obj}"],
                     _inv, _res, existence_checker=None,

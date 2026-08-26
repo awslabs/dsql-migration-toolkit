@@ -29,16 +29,34 @@ from dsql_migrator.config import SecretRef
 # ---------------------------------------------------------------------------
 
 
+class SourceType(str, Enum):
+    """Which source database engine a migration reads from (always read-only).
+
+    ``MYSQL`` (RDS/Aurora MySQL) is the original and default engine; ``POSTGRES``
+    (RDS/Aurora PostgreSQL) is the second source type. The value selects the
+    source-reading dialect -- driver, identifier quoting, system schemas, snapshot
+    SQL, type handling -- via ``core.source_dialect.dialect_for``.
+    """
+
+    MYSQL = "mysql"
+    POSTGRES = "postgres"
+
+
 class SourceConnectionConfig(BaseModel):
-    """Connection settings for the source MySQL (RDS/Aurora) database.
+    """Connection settings for the source database (RDS/Aurora MySQL or PostgreSQL).
 
     Credentials are not stored here: ``secret`` references where to resolve them
     (e.g., a Secrets Manager ARN), and ``username`` is non-secret. This keeps the
-    model safe to serialize and log.
+    model safe to serialize and log. ``source_type`` selects the source engine
+    (default MySQL) and drives the source-reading dialect.
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    source_type: SourceType = Field(
+        default=SourceType.MYSQL,
+        description="Source database engine; selects the source-reading dialect.",
+    )
     host: str = Field(min_length=1, description="Source database host.")
     port: int = Field(default=3306, ge=1, le=65535, description="Source port.")
     database: Optional[str] = Field(
@@ -71,24 +89,26 @@ class ConnectionResult(BaseModel):
     server_version: Optional[str] = Field(
         default=None,
         description=(
-            "Source server version string read on a successful source test "
-            "(e.g. '8.0.mysql_aurora.3.04.0'); None for the target or on failure."
+            "Raw source server version string read on a successful source test, in "
+            "the engine's own format (MySQL VERSION(), e.g. '8.0.mysql_aurora.3.04.0'; "
+            "PostgreSQL version()). None for the target or on failure."
         ),
     )
-    mysql_version: Optional[str] = Field(
+    engine_version: Optional[str] = Field(
         default=None,
         description=(
-            "Community MySQL engine version (e.g. '8.0.42') read from "
-            "@@innodb_version; used to show the MySQL patch behind an Aurora "
-            "version. None when unavailable."
+            "Clean base-engine version read on a successful source test (MySQL "
+            "community patch from @@innodb_version, e.g. '8.0.42'; PostgreSQL "
+            "server_version, e.g. '16.4'). None when unavailable."
         ),
     )
     aurora_version: Optional[str] = Field(
         default=None,
         description=(
-            "Aurora MySQL engine version (e.g. '3.07.1') read from "
-            "@@aurora_version; present only for Aurora MySQL sources. None for "
-            "community/RDS MySQL, the target, or on failure."
+            "Aurora-managed engine version read on a successful source test (Aurora "
+            "MySQL from @@aurora_version, e.g. '3.07.1'; Aurora PostgreSQL from "
+            "aurora_version()). None for RDS/community sources, the target, or on "
+            "failure."
         ),
     )
 
@@ -125,7 +145,10 @@ class ColumnDef(BaseModel):
     collation: Optional[str] = None
     generated: bool = Field(
         default=False,
-        description="True for a MySQL generated/computed column (VIRTUAL/STORED).",
+        description=(
+            "True for a generated/computed column: MySQL VIRTUAL/STORED, or a "
+            "PostgreSQL GENERATED ALWAYS AS (...) STORED column."
+        ),
     )
     auto_update_timestamp: bool = Field(
         default=False,
@@ -711,6 +734,35 @@ class Watermark(BaseModel):
     server_uuid: Optional[str] = Field(
         default=None, description="The source server's '@@GLOBAL.server_uuid'."
     )
+    wal_lsn: Optional[str] = Field(
+        default=None,
+        description=(
+            "PostgreSQL WAL LSN (e.g. '3/AF012B8') captured at the snapshot point -- the "
+            "PG analog of MySQL's binlog:pos and the coordinate a PostgreSQL CDC catch-up "
+            "resumes streaming from for a gapless Full Load -> CDC handoff. None for a "
+            "MySQL source, or when it cannot be read (e.g. insufficient privilege). On a "
+            "PostgreSQL Full Load + CDC run this is the consistent-point of the logical "
+            "replication slot created at capture time (below); otherwise a plain "
+            "pg_current_wal_lsn() read."
+        ),
+    )
+    slot_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Name of the PostgreSQL logical replication slot created on the source at "
+            "this consistency point (Full Load + CDC only). The slot pins the source WAL "
+            "from wal_lsn until CDC consumes it; the CDC connector resumes from it "
+            "(snapshot.mode=never) and teardown drops it. None otherwise."
+        ),
+    )
+    publication_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Name of the PostgreSQL publication created on the source for the migrated "
+            "tables (Full Load + CDC only); the CDC connector captures through it. None "
+            "otherwise."
+        ),
+    )
     snapshot_timestamp: datetime = Field(
         description="UTC timestamp captured at the consistent-snapshot point."
     )
@@ -836,6 +888,12 @@ class PrerequisiteCheckId(str, Enum):
     GTID_MODE = "GTID_MODE"
     MSK_AVAILABLE = "MSK_AVAILABLE"
     MSK_CONNECT_AVAILABLE = "MSK_CONNECT_AVAILABLE"
+    # CDC-only, PostgreSQL source: logical-replication readiness (pgoutput + a slot).
+    WAL_LEVEL_LOGICAL = "WAL_LEVEL_LOGICAL"
+    REPLICATION_ROLE = "REPLICATION_ROLE"
+    REPLICATION_SLOTS = "REPLICATION_SLOTS"
+    SOURCE_IS_WRITER = "SOURCE_IS_WRITER"
+    REPLICA_IDENTITY = "REPLICA_IDENTITY"
 
 
 class PrerequisiteResult(BaseModel):
@@ -866,12 +924,18 @@ class PrerequisiteCheckRequest(BaseModel):
     selection (from :class:`~dsql_migrator.core.table_selection.TableSelector`).
     Source/target connection access is supplied to the checker separately as
     read-only probes, never stored here as secrets (Property 7).
+
+    ``source_type`` selects the engine-specific checks: the CDC-only checks are
+    MySQL binlog/GTID today, so a PostgreSQL source reports them as not-applicable
+    and gets an honest "CDC not yet supported" INFO instead of MySQL checks that
+    would falsely FAIL. Defaults to MySQL so existing callers are unchanged.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     mode: MigrationMode
     tables: list[str] = Field(default_factory=list)
+    source_type: SourceType = SourceType.MYSQL
 
 
 class PrerequisiteReport(BaseModel):

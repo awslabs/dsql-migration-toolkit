@@ -881,7 +881,14 @@ def test_row_token_nests_md5_for_wide_tables_over_the_pg_arg_limit() -> None:
 def test_pg_page_checksum_sql_is_keyset_bounded_and_qualified() -> None:
     first = build_pg_page_checksum_first_sql(_table("orders"), "id", 500).as_string(None)
     nxt = build_pg_page_checksum_next_sql(_table("orders"), "id", 500).as_string(None)
-    for part in ("SUM(page_tok)", "MAX(page_pk)", "COUNT(*)", "LIMIT 500"):
+    # The last-PK uses array_agg (not MAX) so a uuid PK -- which has no max() aggregate
+    # in PostgreSQL/DSQL -- still keyset-advances (see build_pg_page_checksum_first_sql).
+    for part in (
+        "SUM(page_tok)",
+        "(array_agg(page_pk ORDER BY page_pk))[COUNT(*)]",
+        "COUNT(*)",
+        "LIMIT 500",
+    ):
         assert part in first and part in nxt
     assert "WHERE" not in first  # the first page carries no keyset predicate
     assert '"id" > %(last)s' in nxt  # subsequent pages are keyset+parameterized
@@ -2267,3 +2274,268 @@ def test_build_drift_is_none_without_a_watermark() -> None:
     from dsql_migrator.core.validator import _build_drift
 
     assert _build_drift(None, "uuid:1-5", "mysql-bin.000004", 1120) is None
+
+
+# ---------------------------------------------------------------------------
+# Source-read dispatch by engine (MySQL text() builders vs PG readers via the shim)
+# ---------------------------------------------------------------------------
+
+
+class _FakeDialect:
+    def __init__(self, source_type: Any) -> None:
+        self.source_type = source_type
+
+
+def test_source_read_dispatch_routes_by_engine(monkeypatch) -> None:
+    # A MySQL source uses the build_mysql_* helpers; a PostgreSQL source reuses the PG
+    # readers (the same ones the DSQL target uses) wrapped in a PgSourceConnection shim.
+    import dsql_migrator.core.validator as v
+    from dsql_migrator.core.models import SourceType, TableDef, ColumnDef
+
+    calls: list[tuple] = []
+    # PgSourceConnection -> a marker so we can assert the PG path wraps the connection.
+    monkeypatch.setattr(v, "PgSourceConnection", lambda c: ("shim", c))
+    monkeypatch.setattr(v, "_source_checksum", lambda c, t, ps: calls.append(("my_ck", c)) or "my")
+    # _target_checksum / _target_pk_tokens now take source_is_postgres -- the PG-source path
+    # must pass True (so the DSQL renderer uses the PG numeric-scale rule on both ends).
+    monkeypatch.setattr(
+        v, "_target_checksum",
+        lambda c, t, ps, source_is_postgres=False: calls.append(("pg_ck", c, source_is_postgres)) or "pg",
+    )
+    monkeypatch.setattr(v, "_source_count", lambda c, name: calls.append(("my_ct", c)) or 1)
+    monkeypatch.setattr(v, "_bounded_target_count", lambda c, t, ps: calls.append(("pg_ct", c)) or 2)
+    monkeypatch.setattr(v, "_source_pk_tokens", lambda c, t, pk, n: calls.append(("my_pk", c)) or {})
+    monkeypatch.setattr(
+        v, "_target_pk_tokens",
+        lambda c, t, pk, n, source_is_postgres=False: calls.append(("pg_pk", c, source_is_postgres)) or {},
+    )
+
+    tbl = TableDef(name="t", columns=[ColumnDef(name="id", mysql_type="integer")], primary_key=["id"])
+    pg = _FakeDialect(SourceType.POSTGRES)
+    my = _FakeDialect(SourceType.MYSQL)
+
+    # checksum
+    assert v._source_checksum_for(pg, "C", tbl, 100) == "pg"
+    assert calls[-1] == ("pg_ck", ("shim", "C"), True)  # PG path wraps in the shim + flags PG
+    assert v._source_checksum_for(my, "C", tbl, 100) == "my"
+    assert calls[-1] == ("my_ck", "C")  # MySQL path uses the raw connection
+
+    # live count
+    assert v._source_row_count_live(pg, "C", tbl, 100) == 2
+    assert calls[-1] == ("pg_ct", ("shim", "C"))
+    assert v._source_row_count_live(my, "C", tbl, 100) == 1
+    assert calls[-1] == ("my_ct", "C")
+
+    # pk tokens (used by _diff_pks)
+    v._source_pk_tokens_for(pg, "C", tbl, "id", 50)
+    assert calls[-1] == ("pg_pk", ("shim", "C"), True)
+    v._source_pk_tokens_for(my, "C", tbl, "id", 50)
+    assert calls[-1] == ("my_pk", "C")
+
+
+def test_pg_checksum_timetz_is_offset_insensitive() -> None:
+    # A PostgreSQL `timetz` stores its offset. The CDC sink writes it UTC-normalized
+    # (Debezium's ZonedTime is always GMT) while Full Load preserves the source offset --
+    # the same instant, different stored offset -- so an offset-sensitive ::text would
+    # false-mismatch a CDC-written value. The checksum classifies timetz distinctly and
+    # renders it shifted to UTC on BOTH engines so an equal instant matches regardless of
+    # which write path produced it.
+    from dsql_migrator.core.validator import _checksum_kind, build_pg_checksum_sql
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    # All four format_type spellings classify as "timetz" -- including the precision-
+    # qualified "time(6) with time zone", which a naive "(" split would collapse to "time".
+    for spelling in ("time with time zone", "time(6) with time zone", "timetz", "timetz(3)"):
+        assert (
+            _checksum_kind(ColumnDef(name="tz", mysql_type=spelling, target_type=spelling))
+            == "timetz"
+        ), spelling
+    # A plain `time` (no zone) is NOT timetz -- it keeps the offset-free render.
+    assert _checksum_kind(ColumnDef(name="t", mysql_type="time", target_type="time")) == "time"
+
+    table = TableDef(
+        name="app.events",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", target_type="bigint"),
+            ColumnDef(name="tz", mysql_type="time with time zone", target_type="time with time zone"),
+            ColumnDef(name="t", mysql_type="time", target_type="time"),
+        ],
+        primary_key=["id"],
+    )
+    pg_sql = build_pg_checksum_sql(table).as_string(None)
+    assert '("tz" AT TIME ZONE \'UTC\')::text' in pg_sql  # timetz: normalized to UTC
+    assert "to_char(\"t\", 'HH24:MI:SS.US')" in pg_sql     # plain time unchanged
+    assert '"t" AT TIME ZONE' not in pg_sql                # ...and not shifted
+
+
+def test_pg_checksum_unconstrained_numeric_rounds_to_dsql_default_scale() -> None:
+    # An unconstrained PG `numeric` (no declared scale) is stored by DSQL at its default
+    # numeric(18,6), so the checksum rounds BOTH sides to scale 6 -- not scale 0 (the old
+    # bug: dropped the whole fraction -> false MATCH) and not raw ::text (0.5 source vs
+    # 0.500000 target -> false MISMATCH). A scale-bearing numeric(p,s) keeps its scale.
+    # A PostgreSQL source sets column.target_type = the PG type, so _checksum_kind takes
+    # the "numeric" branch (without target_type it would fall to the plain fallback).
+    from dsql_migrator.core.validator import build_pg_checksum_sql
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    table = TableDef(
+        name="t",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", target_type="bigint"),
+            ColumnDef(name="unconstrained", mysql_type="numeric", target_type="numeric"),
+            ColumnDef(name="scaled", mysql_type="numeric(12,2)", target_type="numeric(12,2)"),
+        ],
+        primary_key=["id"],
+    )
+    # A PostgreSQL source passes source_is_postgres=True (both the DSQL target and the PG
+    # source render with it), so a bare numeric compares at DSQL's default scale 6.
+    rendered = build_pg_checksum_sql(table, source_is_postgres=True).as_string(None)
+    assert 'round("unconstrained", 6)' in rendered          # DSQL default scale, not 0
+    assert 'round("scaled", 2)' in rendered                 # declared scale kept
+    # Without the PG-source flag (the DEFAULT -- e.g. the DSQL target of a MySQL-source
+    # migration) the scale-6 rule must NOT fire: a bare numeric renders at its declared
+    # scale 0, matching the MySQL source side. This is the B1 regression guard.
+    rendered_mysql = build_pg_checksum_sql(table).as_string(None)
+    assert 'round("unconstrained", 0)' in rendered_mysql
+    assert 'round("unconstrained", 6)' not in rendered_mysql
+
+
+def test_pg_checksum_bigint_unsigned_scale_matches_mysql_source() -> None:
+    # B1 regression: for a MySQL source the DSQL TARGET side is rendered by
+    # _pg_checksum_expr with source_is_postgres=False. A MySQL `bigint unsigned` -- the
+    # paren-less COLUMN_TYPE on MySQL 8.0.19+ / 8.4 / Aurora MySQL 3 -- maps to
+    # numeric(20,0), an INTEGER. Both sides must render at scale 0. The old code applied
+    # the PostgreSQL unconstrained-numeric scale-6 default to ANY paren-less type, so the
+    # target gained ".000000" while the MySQL source side stayed scale 0 -> every BIGINT
+    # UNSIGNED row false-mismatched in CHECKSUM validation. (MySQL 5.7 spells it
+    # "bigint(20) unsigned" -- parens -> already scale 0 -- which is why 5.7 never broke.)
+    from dsql_migrator.core.validator import _mysql_checksum_expr, _pg_checksum_expr
+
+    for spelling in ("bigint unsigned", "bigint(20) unsigned"):
+        col = ColumnDef(name="amount", mysql_type=spelling)
+        mysql_expr = _mysql_checksum_expr(col)
+        pg_expr = _pg_checksum_expr(col, source_is_postgres=False).as_string(None)
+        assert mysql_expr == "CAST(`amount` AS DECIMAL(65, 0))", spelling
+        assert 'round("amount", 0)' in pg_expr, spelling
+        # The target must NOT gain fractional digits (that was the false-mismatch).
+        assert 'round("amount", 6)' not in pg_expr, spelling
+        assert "D000000" not in pg_expr, spelling
+
+
+def test_pg_source_connection_shim_renders_composed_and_binds_params() -> None:
+    # Regression (#3): the PG-source validation adapter is on the critical path of EVERY PG
+    # validation read but was only ever monkeypatched away. It must render a psycopg
+    # Composed to text and thread params through exec_driver_sql -- and treat empty params
+    # as no-params (the `if params:` guard).
+    from types import SimpleNamespace
+    from dsql_migrator.core.models import ColumnDef, TableDef
+    from dsql_migrator.core.validation_sql import (
+        build_pg_checksum_sql,
+        build_pg_pk_next_page_sql,
+    )
+    from dsql_migrator.core.validator_postgres import PgSourceConnection
+
+    class _Res:
+        def __init__(self, rows):
+            self._rows = list(rows)
+
+        def fetchone(self):
+            return self._rows[0] if self._rows else None
+
+        def fetchall(self):
+            return list(self._rows)
+
+    class _SqlaConn:
+        def __init__(self, rows):
+            self.rows = rows
+            self.calls: list = []
+            # driver_connection=None so Composed.as_string(None) renders offline.
+            self.connection = SimpleNamespace(driver_connection=None)
+
+        def exec_driver_sql(self, sql, params=None):
+            self.calls.append((sql, params))
+            return _Res(self.rows)
+
+    table = TableDef(
+        name="app.orders",
+        columns=[ColumnDef(name="id", mysql_type="bigint", target_type="bigint")],
+        primary_key=["id"],
+    )
+    sqla = _SqlaConn([(10,), (11,)])
+    cur = PgSourceConnection(sqla).cursor()
+
+    # (1) Parameterized keyset page -> rendered %(last)s + params threaded through.
+    cur.execute(build_pg_pk_next_page_sql(table, "id", 500), {"last": 10})
+    text, params = sqla.calls[-1]
+    assert '"id" > %(last)s' in text and "LIMIT 500" in text
+    assert params == {"last": 10}
+    assert cur.fetchall() == [(10,), (11,)]
+
+    # (2) A no-param Composed (checksum) takes the no-params exec branch.
+    sqla.calls.clear()
+    cur.execute(build_pg_checksum_sql(table))
+    assert sqla.calls[-1][1] is None
+    assert cur.fetchone() == (10,)
+
+    # (3) The `if params:` guard treats an empty dict as no-params too.
+    sqla.calls.clear()
+    cur.execute(build_pg_pk_next_page_sql(table, "id", 5), {})
+    assert sqla.calls[-1][1] is None
+
+
+def test_checksum_kind_jsonb_included_json_excluded() -> None:
+    # Tier-3 #14: jsonb has a canonical text form -> classified "plain" (col::text,
+    # INCLUDED in the checksum); json has no byte-identical cross-engine text form ->
+    # "json" (EXCLUDED). Guards a "fix" that broadens kind=="json" to startswith("json")
+    # and would silently drop jsonb from the checksum.
+    from dsql_migrator.core.validator import (
+        _checksum_kind, _mysql_checksum_expr, _pg_checksum_expr,
+    )
+
+    jb = ColumnDef(name="d", mysql_type="jsonb", target_type="jsonb")
+    js = ColumnDef(name="d", mysql_type="json", target_type="json")
+    assert _checksum_kind(jb) == "plain" and _checksum_kind(js) == "json"
+    assert _pg_checksum_expr(jb) is not None and _pg_checksum_expr(js) is None
+    assert _mysql_checksum_expr(jb) is not None and _mysql_checksum_expr(js) is None
+
+
+def test_pg_source_keyset_count_through_shim_non_integer_and_composite() -> None:
+    # Tier-3 #16: the PG-source live count keyset-pages a single (uuid/varchar) PK through
+    # the shim (no COUNT(*)) and falls back to COUNT(*) for a composite PK.
+    from types import SimpleNamespace
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.core.validator import _source_row_count_live
+
+    class _Res:
+        def __init__(self, rows):
+            self._rows = list(rows)
+
+        def fetchone(self):
+            return self._rows[0] if self._rows else None
+
+        def fetchall(self):
+            return list(self._rows)
+
+    class _PagedSqla:
+        def __init__(self, batches):
+            self._b = list(batches)
+            self.sqls: list = []
+            self.connection = SimpleNamespace(driver_connection=None)
+
+        def exec_driver_sql(self, sql, params=None):
+            self.sqls.append(sql)
+            return _Res(self._b.pop(0) if self._b else [])
+
+    # uuid single PK, page 2 over 3 rows -> genuinely paged, no COUNT(*).
+    ut = _table("t", columns=("id",), primary_key=("id",))
+    ut.columns[0].mysql_type = "uuid"
+    sqla = _PagedSqla([[("u1",), ("u2",)], [("u3",)]])
+    assert _source_row_count_live(_FakeDialect(SourceType.POSTGRES), sqla, ut, 2) == 3
+    assert len(sqla.sqls) == 2
+    assert not any("COUNT(*)" in s for s in sqla.sqls)
+    assert '"id" > %(last)s' in sqla.sqls[1]
+    # composite PK -> COUNT(*) fallback through the shim.
+    ct = _table("t", columns=("a", "b"), primary_key=("a", "b"))
+    sqla2 = _PagedSqla([[(2,)]])
+    assert _source_row_count_live(_FakeDialect(SourceType.POSTGRES), sqla2, ct, 2) == 2
+    assert "COUNT(*)" in sqla2.sqls[0]

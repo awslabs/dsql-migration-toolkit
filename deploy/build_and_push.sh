@@ -67,13 +67,14 @@ aws ecr get-login-password --region "${REGION}" \
 # so the set MUST match the Dockerfile's COPY list. Fail early with an actionable
 # message rather than a cryptic Docker COPY error.
 DEBEZIUM_ZIP="${REPO_ROOT}/connectors/plugins/debezium-mysql-plugin.zip"
+DEBEZIUM_PG_ZIP="${REPO_ROOT}/connectors/plugins/debezium-postgres-plugin.zip"
 SINK_ZIP="${REPO_ROOT}/connectors/plugins/dsql-sink-plugin.zip"
 SEEDER_ZIP="${REPO_ROOT}/connectors/plugins/offset-seeder-lambda.zip"
-for artifact in "${DEBEZIUM_ZIP}" "${SINK_ZIP}" "${SEEDER_ZIP}"; do
+for artifact in "${DEBEZIUM_ZIP}" "${DEBEZIUM_PG_ZIP}" "${SINK_ZIP}" "${SEEDER_ZIP}"; do
   if [ ! -f "${artifact}" ]; then
     echo "error: missing committed CDC deploy artifact:" >&2
     echo "  ${artifact}" >&2
-    echo "All three connectors/plugins/*.zip are committed pre-built; restore from" >&2
+    echo "All connectors/plugins/*.zip are committed pre-built; restore from" >&2
     echo "version control. Rebuild the sink only if you changed the Java source:" >&2
     echo "  (cd connectors/dsql-sink && mvn -q package) then repackage the plugin zip." >&2
     exit 1

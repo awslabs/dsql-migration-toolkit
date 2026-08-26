@@ -1641,18 +1641,23 @@ def test_enrichment_is_unconditional_for_a_mysql_source() -> None:
 
     If a code path reflected without enriching, defaults would arrive quoted and
     expression flags unset -- exactly the shape the converter no longer accepts.
+    Enrichment now lives on the source dialect: ``_assemble_inventory`` calls
+    ``dialect.enrich`` right after reflection in the loop, and the MySQL dialect runs
+    ``enrich_columns`` for a MySQL connection (no source-type opt-out).
     """
     import inspect as _inspect
 
-    from dsql_migrator.core import introspector
+    from dsql_migrator.core import introspector, source_dialect
 
-    source = _inspect.getsource(introspector)
-    reflect_index = source.index("tables = _reflect_tables(inspector")
-    enrich_index = source.index("enrich_columns(connection", reflect_index)
-    between = source[reflect_index:enrich_index]
-    # Enrichment follows reflection in the same loop iteration, gated only on the source
-    # being MySQL (the sole dialect this tool migrates from).
-    assert "if is_mysql:" in between
+    # Reflection is immediately followed by dialect-driven enrichment in the loop.
+    intro_src = _inspect.getsource(introspector)
+    reflect_index = intro_src.index("tables = _reflect_tables(inspector")
+    enrich_index = intro_src.index("dialect.enrich(connection", reflect_index)
+    assert enrich_index > reflect_index
+
+    # The MySQL dialect's enrichment runs enrich_columns for a MySQL connection.
+    mysql_enrich = _inspect.getsource(source_dialect.MySQLSourceDialect.enrich)
+    assert "enrich_columns(connection" in mysql_enrich
 
 
 def test_on_update_is_never_emitted_into_the_target_ddl() -> None:

@@ -32,12 +32,15 @@ RUN uv sync --frozen --no-dev --extra cdc-external
 # Bundle the three CDC deploy artifacts so the tool can upload them to the
 # customer's S3 bucket at deploy time (s3_provision._artifact_paths resolves these
 # relative to the repo root = /app). These exact filenames are what _artifact_paths
-# reads (debezium-mysql-plugin.zip / dsql-sink-plugin.zip / offset-seeder-lambda.zip);
-# they MUST stay in sync with s3_provision._*_RELPATH or CDC deploy fails at the
-# upload-plugins stage on a clean image. Only the three needed files are copied to
-# keep the image lean; the rest of connectors/ (build scratch, extracted dirs) is not.
+# reads (debezium-mysql-plugin.zip / debezium-postgres-plugin.zip /
+# dsql-sink-plugin.zip / offset-seeder-lambda.zip); they MUST stay in sync with
+# s3_provision._*_RELPATH or CDC deploy fails at the upload-plugins stage on a clean
+# image. Only the needed files are copied to keep the image lean; the rest of
+# connectors/ (build scratch, extracted dirs) is not.
 COPY connectors/plugins/debezium-mysql-plugin.zip \
      ./connectors/plugins/debezium-mysql-plugin.zip
+COPY connectors/plugins/debezium-postgres-plugin.zip \
+     ./connectors/plugins/debezium-postgres-plugin.zip
 COPY connectors/plugins/dsql-sink-plugin.zip \
      ./connectors/plugins/dsql-sink-plugin.zip
 COPY connectors/plugins/offset-seeder-lambda.zip \

@@ -46,6 +46,7 @@ from dsql_migrator.core.models import (
     EffortLevel,
     ObjectType,
     SourceInventory,
+    SourceType,
     TargetInventory,
 )
 
@@ -1334,12 +1335,26 @@ def default_inventory_rules() -> list[InventoryRule]:
     return [check_multiple_source_databases, check_table_count]
 
 
-def default_rules() -> list[Rule]:
-    """Return the default, ordered list of compatibility rules.
+def default_rules(source_type: SourceType = SourceType.MYSQL) -> list[Rule]:
+    """Return the default, ordered list of compatibility rules for ``source_type``.
 
     The order is significant: it breaks ties when several rules of equal
-    severity match the same object.
+    severity match the same object. Many rules inspect source-engine column types
+    (ENUM/SET, TINYINT(1), BIT, YEAR, ...) or MySQL-specific features, so the list
+    is source-engine-specific. Only MySQL is defined so far; PostgreSQL rules arrive
+    with PostgreSQL-source support, so an unsupported source type raises rather than
+    silently applying MySQL rules to it.
     """
+    if source_type is SourceType.POSTGRES:
+        # PostgreSQL rules live in their own module (see assessor_postgres); imported
+        # lazily so that module can import the shared rule classes from here.
+        from dsql_migrator.core.assessor_postgres import default_rules as _pg_rules
+
+        return _pg_rules()
+    if source_type is not SourceType.MYSQL:
+        raise NotImplementedError(
+            f"No default assessment rules for source type {source_type!r} yet."
+        )
     return [
         ForeignKeyRule(),
         CheckConstraintRule(),
@@ -1484,6 +1499,7 @@ class CompatibilityAssessor:
         rules: list[Rule] | None = None,
         *,
         inventory_rules: list[InventoryRule] | None = None,
+        source_type: SourceType = SourceType.MYSQL,
     ) -> None:
         """Create an assessor.
 
@@ -1491,9 +1507,12 @@ class CompatibilityAssessor:
         customization. The order of the rules breaks classification ties.
         ``inventory_rules`` overrides the cluster/database-wide checks (e.g.
         multiple source databases, table-count limit) that produce findings not
-        tied to a single object.
+        tied to a single object. ``source_type`` selects the default rule set for the
+        source engine (MySQL vs PostgreSQL) when ``rules`` is not given.
         """
-        self._rules: list[Rule] = list(rules) if rules is not None else default_rules()
+        self._rules: list[Rule] = (
+            list(rules) if rules is not None else default_rules(source_type)
+        )
         self._inventory_rules: list[InventoryRule] = (
             list(inventory_rules)
             if inventory_rules is not None

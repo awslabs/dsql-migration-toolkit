@@ -482,6 +482,23 @@ def test_assessor_accepts_custom_extensible_rules() -> None:
     assert item.classification is Classification.MANUAL
 
 
+def test_default_rules_source_type_seam() -> None:
+    from dsql_migrator.core.models import SourceType
+
+    # MySQL is byte-identical to the no-arg default (rule order preserved for ties).
+    assert [type(r).__name__ for r in default_rules(SourceType.MYSQL)] == [
+        type(r).__name__ for r in default_rules()
+    ]
+    # PostgreSQL has ONE PG-specific rule (DSQL-unsupported column types); the REST are the
+    # shared source-neutral structural rules -- a proper subset of the MySQL ids (PG drops
+    # the MySQL type/feature rules). Detailed assertions in tests/test_assessor_postgres.py.
+    pg_ids = {r.rule_id for r in default_rules(SourceType.POSTGRES)}
+    mysql_ids = {r.rule_id for r in default_rules(SourceType.MYSQL)}
+    assert "PG_UNSUPPORTED_TYPE" in pg_ids
+    assert (pg_ids - {"PG_UNSUPPORTED_TYPE"}) < mysql_ids  # rest are shared structural
+    assert "ENUM_SET_TYPE" not in pg_ids  # MySQL type rules never run for PG
+
+
 def test_default_rules_contains_all_documented_rule_ids() -> None:
     rule_ids = {rule.rule_id for rule in default_rules()}
     assert rule_ids == {

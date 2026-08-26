@@ -35,8 +35,8 @@ from dsql_migrator.config import ConnectDefaults, SecretValue
 from dsql_migrator.core.introspector import (
     SourceIntrospector,
     install_read_only_guard,
-    source_engine_kwargs,
 )
+from dsql_migrator.core.source_dialect import dialect_for
 from dsql_migrator.core.activity_log import (
     ActivityCategory,
     ActivityStatus,
@@ -47,6 +47,7 @@ from dsql_migrator.core.models import (
     AiAssistConfig,
     ConnectionResult,
     SourceConnectionConfig,
+    SourceType,
     TargetConnectionConfig,
 )
 from dsql_migrator.core.secrets import (
@@ -58,6 +59,7 @@ from dsql_migrator.core.target_connection import DsqlConnector
 from dsql_migrator.ui.design import (
     INLINE_HINT_TEXT,
     inline_hint,
+    radio_tiles,
     render_notice,
     section_header,
 )
@@ -68,8 +70,6 @@ from dsql_migrator.ui.ai_assist import (
     run_verify_ai_access,
 )
 from dsql_migrator.ui.session import SessionStore
-
-MYSQL_DRIVER = "mysql+pymysql"
 
 # An AWS region token, e.g. "us-east-1", "ap-southeast-2", "eu-central-1".
 _AWS_REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
@@ -158,6 +158,7 @@ def build_source_config(
     port: int,
     database: Optional[str] = None,
     username: Optional[str] = None,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> SourceConnectionConfig:
     """Build and validate a :class:`SourceConnectionConfig` from form input.
 
@@ -166,12 +167,15 @@ def build_source_config(
     database is optional: a connection test only needs to reach the server, so a
     blank database is normalized to ``None`` (a specific schema is selected later
     before introspection). The password is intentionally not part of this model.
+    ``source_type`` (default MySQL) records the source engine and drives the
+    source-reading dialect; the engine-type selector supplies it.
     """
     return SourceConnectionConfig(
         host=host,
         port=port,
         database=(database or "").strip() or None,
         username=username or None,
+        source_type=source_type,
     )
 
 
@@ -309,8 +313,11 @@ def make_source_engine_factory(
     """
 
     def factory(conn: SourceConnectionConfig) -> Engine:
+        # Driver scheme + engine kwargs come from the source dialect selected by
+        # conn.source_type (default MySQL, so the MySQL path is unchanged).
+        dialect = dialect_for(conn.source_type)
         url = URL.create(
-            MYSQL_DRIVER,
+            dialect.driver_scheme,
             username=conn.username,
             password=password.reveal() if password is not None else None,
             host=conn.host,
@@ -324,7 +331,7 @@ def make_source_engine_factory(
         # read/write timeout so a mid-stream stall fails the table (retryable)
         # rather than hanging the job in RUNNING forever.
         engine = create_engine(
-            url, **source_engine_kwargs(read_timeout_seconds=read_timeout_seconds)
+            url, **dialect.engine_kwargs(read_timeout_seconds=read_timeout_seconds)
         )
         install_read_only_guard(engine)
         return engine
@@ -482,7 +489,15 @@ def build_connect_page(
         # event, NO model call, so the AI window always reflects what happened -- and,
         # on a FAILURE with AI set up, offer a ONE-CLICK "Ask AI to help fix this"
         # affordance that actually invokes the model (paid reasoning stays explicit).
-        label = "Source (MySQL)" if side == "source" else "Target (Aurora DSQL)"
+        if side == "source":
+            _word = (
+                "PostgreSQL"
+                if _engine["type"] is SourceType.POSTGRES
+                else "MySQL"
+            )
+            label = f"Source ({_word})"
+        else:
+            label = "Target (Aurora DSQL)"
         if ai_post_event is not None:
             # post_event self-gates on AI being enabled; no-op otherwise.
             if success:
@@ -630,7 +645,7 @@ def build_connect_page(
             "text-blue-800 font-medium"
         ).props("header-class=text-blue-800"):
             ui.label(
-                "This tool migrates a MySQL database (RDS / Aurora MySQL) to "
+                "This tool migrates a MySQL or PostgreSQL database (RDS / Aurora) to "
                 "Amazon Aurora DSQL. You connect both ends here, then move through "
                 "five steps:"
             ).classes("text-sm text-gray-600")
@@ -708,28 +723,91 @@ def build_connect_page(
                         on_change=on_profile_change,
                     ).classes("w-full")
 
-        # --- Source: RDS / Aurora MySQL -----------------------------------
+        # --- Source engine: which database engine to migrate FROM ----------
+        # Chosen ABOVE the source card because it drives the port default, the
+        # Database-field guidance, and the source dialect (MySQL vs PostgreSQL).
+        # Aurora-vs-RDS is NOT a choice here -- it is auto-detected from the
+        # endpoint/version (infer, don't ask).
+        # Seed from the live source config if present, else the non-secret engine hint
+        # recovered from a snapshot restore (so a PG operator resuming a restored
+        # workbench is not reset to the MySQL default), else MySQL.
+        _engine = {
+            "type": getattr(state.source_config, "source_type", None)
+            or getattr(state, "restored_source_type", None)
+            or SourceType.MYSQL
+        }
+
+        def _db_field_hint(source_type: SourceType) -> str:
+            if source_type is SourceType.POSTGRES:
+                return (
+                    'hint="PostgreSQL connects to ONE database -- enter its name '
+                    "(blank uses the role's default database).\""
+                )
+            return (
+                'hint="Empty assesses the whole cluster; set it to scope to a '
+                'single database."'
+            )
+
+        def on_engine_change(value: str) -> None:
+            new_type = SourceType(value)
+            if new_type is _engine["type"]:
+                return  # radio_tiles fires on re-select too; ignore a no-op
+            old_default = dialect_for(_engine["type"]).default_port
+            _engine["type"] = new_type
+            # Move the port to the new engine's default UNLESS the user typed a custom
+            # one (mirror on_endpoint_change's don't-clobber guard).
+            if int(source_port.value or 0) == old_default:
+                source_port.set_value(dialect_for(new_type).default_port)
+            # Remove-then-add so the new hint REPLACES the old one (a bare
+            # ``.props('hint=...')`` can leave the previous hint alongside the new).
+            source_database.props(remove="hint")
+            source_database.props(_db_field_hint(new_type))
+            invalidate_source()  # a different source engine invalidates any prior test
+            # radio_tiles renders the selected styling from its `selected` arg, so
+            # re-render the tiles to reflect the new choice (the Connect form has no
+            # refreshable of its own; this local one keeps the selection in sync).
+            _engine_tiles.refresh()
+
+        with ui.card().classes("w-full"):
+            _section_header("dns", "Source engine", None)
+
+            @ui.refreshable
+            def _engine_tiles() -> None:
+                radio_tiles(
+                    ui,
+                    [
+                        ("mysql", "storage", "MySQL",
+                         "Migrate from RDS / Aurora MySQL."),
+                        ("postgres", "storage", "PostgreSQL",
+                         "Migrate from RDS / Aurora PostgreSQL."),
+                    ],
+                    selected=_engine["type"].value,
+                    on_select=on_engine_change,
+                )
+
+            _engine_tiles()
+
+        # --- Source: RDS / Aurora connection ------------------------------
         with ui.card().classes("w-full"):
             source_badge = _section_header(
                 "storage",
-                "Source (RDS / Aurora MySQL)",
+                "Source (RDS / Aurora)",
                 connection_status_badge(state.source_verified),
             )
             source_host = ui.input("Host", value=src_host or "").classes(
                 "w-full"
             )
             source_port = ui.number(
-                "Port", value=src_port or 3306, format="%d"
+                "Port",
+                value=src_port or dialect_for(_engine["type"]).default_port,
+                format="%d",
             ).classes("w-full")
             # The "optional / scope" guidance lives on the field itself (Quasar
             # ``hint``) so it reads as part of the Database input, not as a separate
-            # gray line below it.
+            # gray line below it. The hint is engine-aware (see _db_field_hint).
             source_database = ui.input(
-                "Database (optional)", value=src_database or ""
-            ).classes("w-full").props(
-                'hint="Empty assesses the whole cluster; set it to scope to a '
-                'single database."'
-            )
+                "Database", value=src_database or ""
+            ).classes("w-full").props(_db_field_hint(_engine["type"]))
 
             # Authentication method: type a username/password, or resolve both
             # from an AWS Secrets Manager secret (e.g. an RDS/Aurora managed
@@ -859,6 +937,7 @@ def build_connect_page(
                         port=int(source_port.value or 0),
                         database=(source_database.value or "").strip(),
                         username=username_value,
+                        source_type=_engine["type"],
                     )
                 except (ValueError, TypeError):
                     fail_source("Please check the source connection fields.")
@@ -893,7 +972,7 @@ def build_connect_page(
                 # for the overview diagram; None on failure.
                 state.set_source_version(
                     result.server_version,
-                    result.mysql_version,
+                    result.engine_version,
                     result.aurora_version,
                 )
                 # Best-effort RDS instance class (e.g. db.r6g.large) for the
@@ -924,7 +1003,8 @@ def build_connect_page(
                     side="source",
                     success=result.success,
                     coordinates=(
-                        f"MySQL host={config.host} port={config.port} "
+                        f"{'PostgreSQL' if config.source_type is SourceType.POSTGRES else 'MySQL'} "
+                        f"host={config.host} port={config.port} "
                         f"database={config.database or '(not set)'}"
                     ),
                     detail=result.detail,

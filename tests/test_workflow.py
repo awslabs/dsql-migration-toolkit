@@ -1721,3 +1721,62 @@ def test_banner_getter_wires_the_queue_advance_and_completion() -> None:
     assert "dismiss_cdc_teardown_done" in ast.unparse(
         by_name["_cdc_teardown_done_dismiss"]
     )
+
+
+def test_build_migration_diagram_labels_postgres_source() -> None:
+    # A PostgreSQL source renders "Aurora PostgreSQL" / "PostgreSQL" wording (not MySQL),
+    # driven by source_config.source_type.
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.workflow import build_migration_diagram
+
+    state = SessionConnectionState()
+    state.source_config = SourceConnectionConfig(
+        host="mydb.cluster-abc123.ap-northeast-2.rds.amazonaws.com",
+        database="app", source_type=SourceType.POSTGRES,
+    )
+    state.source_verified = True
+    # PG version shapes: verbose banner + clean server_version + aurora_version()
+    state.set_source_version("PostgreSQL 16.4 on aarch64", "16.4", "16.4")
+    source, _tool, _target = build_migration_diagram(state)
+    assert source.title == "Aurora PostgreSQL"  # .cluster- host + aurora_version
+    texts = [text for _icon, text in source.details]
+    assert "Aurora PostgreSQL 16.4 (PostgreSQL 16.4)" in texts
+
+
+def test_build_migration_diagram_postgres_placeholder_before_verify() -> None:
+    # Unverified PG source -> the placeholder wording is PostgreSQL, not MySQL.
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.workflow import build_migration_diagram
+
+    state = SessionConnectionState()
+    state.source_config = SourceConnectionConfig(
+        host="h", database="app", source_type=SourceType.POSTGRES
+    )
+    state.source_verified = False
+    source, _tool, _target = build_migration_diagram(state)
+    assert source.title == "Source PostgreSQL"
+    assert source.subtitle == "RDS / Aurora PostgreSQL"
+
+
+def test_format_source_engine_postgres_variants() -> None:
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.workflow import format_source_engine
+
+    pg = SourceType.POSTGRES
+    # Aurora PostgreSQL with the clean server_version alongside.
+    assert (
+        format_source_engine("PostgreSQL 16.4 on x", "16.4", "16.4", source_type=pg)
+        == "Aurora PostgreSQL 16.4 (PostgreSQL 16.4)"
+    )
+    # Plain PostgreSQL from the clean server_version.
+    assert format_source_engine(None, "16.4", None, source_type=pg) == "PostgreSQL 16.4"
+    # Only the verbose banner captured -> shown as-is.
+    assert (
+        format_source_engine("PostgreSQL 16.4 on x", None, None, source_type=pg)
+        == "PostgreSQL PostgreSQL 16.4 on x"
+    )
+    assert format_source_engine(None, None, None, source_type=pg) is None
+    # MySQL default path is unchanged.
+    assert format_source_engine("8.0.35", None) == "MySQL 8.0.35"

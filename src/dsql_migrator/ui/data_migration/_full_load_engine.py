@@ -65,13 +65,15 @@ from dsql_migrator.core.models import (
     MigrationJob,
     SourceConnectionConfig,
     SourceInventory,
+    SourceType,
     StepStatus,
     TableDef,
     TargetConnectionConfig,
     Watermark,
     apply_lob_exclusions,
 )
-from dsql_migrator.core.watermark import WatermarkCapturer
+from dsql_migrator.core.source_dialect import dialect_for
+from dsql_migrator.core.watermark import WatermarkCapturer, estimate_source_rows
 from dsql_migrator.ui.connect import make_source_engine_factory
 
 _LOGGER = logging.getLogger(__name__)
@@ -117,6 +119,16 @@ class DataMigrationInputs:
     # all DROP/replace. Set for the Full load + CDC flow where connectors start
     # before the Full Load (gapless, no offset seeding needed).
     cdc_coexisting: bool = False
+    # The CDC stack this Full Load will hand off to, for a PostgreSQL Full Load + CDC
+    # run. When set (PostgreSQL source only), the watermark capture creates a logical
+    # replication slot + publication ON THE SOURCE at the consistency point (named
+    # deterministically from this stack name) so CDC resumes from the slot's LSN with no
+    # gap; the slot pins WAL until CDC consumes it. Left None for a Full-Load-only run
+    # (a slot with no consumer would pin WAL and fill the source disk) and always for a
+    # MySQL source (which bridges via the binlog offset-seeder, not a slot). This is the
+    # PostgreSQL gapless-handoff signal -- distinct from cdc_coexisting, which is MySQL's
+    # CDC-live-during-load (SKIP_EXISTING) model that PostgreSQL deliberately does not use.
+    cdc_stack_name: Optional[str] = None
     # Per-table APPLIED target conversion (schema/create/index DDL), keyed by
     # qualified table name, honoring the user's Schema Conversion edits. Single
     # source of truth for the target schema, used to (a) recreate a table on a
@@ -634,6 +646,10 @@ class _ShardWorkerArgs:
     pk_lower: Optional[int]
     pk_upper: Optional[int]
     shard_index: int
+    # A dialect-exported snapshot id all shards import so they share ONE point-in-time cut
+    # (consistent sharded read of a REPLACE load without CDC). None => each shard uses its
+    # own snapshot (MySQL, or the CDC-handoff path).
+    shared_snapshot_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -720,7 +736,14 @@ def _report_progress(
         pass
 
 
-def _retry_source_drops_in_process(work, *, cancelled, table_name: str, release=None):
+def _retry_source_drops_in_process(
+    work,
+    *,
+    cancelled,
+    table_name: str,
+    release=None,
+    source_type: SourceType = SourceType.MYSQL,
+):
     """Run ``work()`` in a child process, retrying a dropped SOURCE connection.
 
     The in-process twin of :func:`_migrate_table_with_source_retry` (see it for why a
@@ -751,7 +774,7 @@ def _retry_source_drops_in_process(work, *, cancelled, table_name: str, release=
         except ExportCancelled:
             raise
         except Exception as exc:  # noqa: BLE001 - classify transient vs permanent
-            if attempt >= attempts or not is_source_transient_error(exc):
+            if attempt >= attempts or not is_source_transient_error(exc, source_type):
                 raise
             if cancelled():
                 raise
@@ -912,7 +935,10 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
 
         outcome = _as_load_result(
             _retry_source_drops_in_process(
-                _load_table, cancelled=_is_cancelled, table_name=name
+                _load_table,
+                cancelled=_is_cancelled,
+                table_name=name,
+                source_type=args.inputs.source_config.source_type,
             )
         )
         # Flush remaining progress.
@@ -1037,6 +1063,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
                 pk_lower=args.pk_lower,
                 pk_upper=args.pk_upper,
                 on_throttle=_on_throttle,
+                shared_snapshot_id=args.shared_snapshot_id,
             )
             _live_rows[0] = rows
             return importer.import_rows(
@@ -1064,6 +1091,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
         result = _retry_source_drops_in_process(
             _attempt, cancelled=_is_cancelled, table_name=name,
             release=_release_rows,
+            source_type=args.inputs.source_config.source_type,
         )
         if (pending_loaded or pending_skipped) and progress_queue is not None:
             _report_progress(progress_queue, (name, pending_loaded, pending_skipped))
@@ -1433,7 +1461,10 @@ def _migrate_table_with_source_retry(
         except _FullLoadStopped:
             raise  # a user stop is not a failure to retry
         except Exception as exc:  # noqa: BLE001 - classify transient vs permanent
-            if attempt >= attempts or not is_source_transient_error(exc):
+            # A fake migrator (tests) may not expose source_type; default to MySQL,
+            # matching the doubles' simulated source.
+            source_type = getattr(migrator, "source_type", SourceType.MYSQL)
+            if attempt >= attempts or not is_source_transient_error(exc, source_type):
                 raise
             if handle.cancelled:
                 raise
@@ -1562,7 +1593,12 @@ def _migrate_one_table(
         # back to the DSQL target-side hint (OCC exhaustion, per-table limit, constraint
         # / data rejection) so a target failure also explains what to do next, not just
         # the bare driver text.
-        hint = source_error_hint(exc) or target_error_hint(exc)
+        hint = (
+            source_error_hint(
+                exc, getattr(migrator, "source_type", SourceType.MYSQL)
+            )
+            or target_error_hint(exc)
+        )
         if hint:
             message = f"{message} — {hint}"
         _LOGGER.warning("Full Load failed for table %s: %s", name, message)
@@ -1670,6 +1706,65 @@ def _migrate_one_table(
         )
 
 
+def _open_shared_snapshot(migrator, dialect):
+    """Open an anchor REPEATABLE READ transaction on the source and export its snapshot id.
+
+    Returns ``(engine, connection, snapshot_id)``. The transaction is held OPEN (via the
+    returned engine+connection) for the whole sharded load so every shard worker can import
+    the same point-in-time cut (``dialect.set_transaction_snapshot_sql``) -- a consistent
+    range-sharded read even for a REPLACE (no-CDC) load. Caller MUST call
+    :func:`_close_shared_snapshot` when the load finishes. PostgreSQL only.
+    """
+    from sqlalchemy import text
+
+    from dsql_migrator.core.exporter import _TXN_CONTROL_EXEC_OPTS
+
+    engine = migrator._exporter._engine_factory(migrator._inputs.source_config)
+    conn = None
+    try:
+        conn = engine.connect()
+        anchor = conn.execution_options(isolation_level="AUTOCOMMIT")
+        anchor.execute(
+            text(dialect.snapshot_start_sql), execution_options=_TXN_CONTROL_EXEC_OPTS
+        )
+        snapshot_id = anchor.execute(text(dialect.export_snapshot_sql())).scalar()
+        if not snapshot_id:
+            raise RuntimeError("source returned an empty exported-snapshot id")
+        return engine, conn, snapshot_id
+    except Exception:
+        # Close the checked-out connection (else its open REPEATABLE READ txn lingers until
+        # GC) BEFORE disposing the engine -- engine.dispose() does not close a leased conn.
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - best-effort on the failure path
+                pass
+        engine.dispose()
+        raise
+
+
+def _close_shared_snapshot(engine, conn) -> None:
+    """COMMIT + close the anchor snapshot transaction opened by :func:`_open_shared_snapshot`."""
+    if conn is None:
+        return
+    from sqlalchemy import text
+
+    from dsql_migrator.core.exporter import _TXN_CONTROL_EXEC_OPTS, COMMIT
+
+    try:
+        conn.execution_options(isolation_level="AUTOCOMMIT").execute(
+            text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
+        )
+    except Exception:  # noqa: BLE001 - best-effort teardown of a read-only anchor txn
+        pass
+    finally:
+        try:
+            conn.close()
+        finally:
+            if engine is not None:
+                engine.dispose()
+
+
 def _migrate_tables_in_parallel(
     handle: JobHandle,
     job_id: str,
@@ -1751,7 +1846,17 @@ def _migrate_tables_in_parallel(
         # will reconcile post-snapshot writes -- i.e. cdc_coexisting. A REPLACE (clean
         # plain-INSERT, no CDC) or a non-CDC append has nothing to reconcile it, so such
         # a table must be read by a SINGLE reader (one snapshot = one point-in-time cut).
-        _shardable_ok = bool(migrator._inputs.cdc_coexisting)
+        # Resolve the SOURCE dialect so the shardability pre-gate uses the right
+        # integer-PK set (the authoritative plan_pk_shard_ranges below already does);
+        # without it this pre-gate ran under the module-default MySQL dialect.
+        _shard_dialect = dialect_for(migrator._inputs.source_config.source_type)
+        # Sharding a table's read is consistent when EITHER a CDC stream will reconcile the
+        # shards' independently-timed snapshots (cdc_coexisting) OR the source dialect can
+        # give every shard ONE shared point-in-time snapshot (supports_shared_snapshot --
+        # PostgreSQL exported snapshots). The latter makes even a REPLACE (no-CDC) load shard
+        # SAFELY on a live source, so it lifts the "single-reader for REPLACE" restriction.
+        _shared_snapshot = _shard_dialect.supports_shared_snapshot
+        _shardable_ok = bool(migrator._inputs.cdc_coexisting) or _shared_snapshot
 
         # Shard count is capped exactly like single-process: cfg.full_load_reader_shards
         # clamped so table_parallelism x shards stays under the source max_connections
@@ -1770,8 +1875,8 @@ def _migrate_tables_in_parallel(
             )
             shardable = (
                 _shardable_ok
-                and not table_is_replace
-                and shardable_leading_int_pk(table) is not None
+                and (not table_is_replace or _shared_snapshot)
+                and shardable_leading_int_pk(table, _shard_dialect) is not None
                 and effective_reader_shards > 1
             )
             if not shardable:
@@ -1830,7 +1935,19 @@ def _migrate_tables_in_parallel(
         # Track shard results per table for aggregation.
         shard_results: dict[str, list[_TableWorkerResult]] = {}
 
+        # For a shared-snapshot dialect (PostgreSQL) with sharded work, open ONE anchor
+        # snapshot in the parent and export its id; every shard imports it so the whole
+        # sharded read is a single consistent point-in-time cut. None for MySQL / no shards
+        # -> shards use own snapshots. Opened INSIDE the try so a build failure still runs the
+        # finally (drain-thread + queue teardown, _close_shared_snapshot).
+        _anchor_engine = _anchor_conn = None
+        shared_snapshot_id: Optional[str] = None
+
         try:
+            if _shared_snapshot and any(wu[0] == "shard" for wu in work_units):
+                _anchor_engine, _anchor_conn, shared_snapshot_id = _open_shared_snapshot(
+                    migrator, _shard_dialect
+                )
             with ProcessPoolExecutor(
                 max_workers=total_workers,
                 mp_context=ctx,
@@ -1870,6 +1987,7 @@ def _migrate_tables_in_parallel(
                             job_id=job_id, table=table,
                             inputs=_slim_worker_inputs(migrator._inputs, table.name),
                             pk_lower=lo, pk_upper=hi, shard_index=shard_idx,
+                            shared_snapshot_id=shared_snapshot_id,
                         )
                         f = pool.submit(_migrate_shard_in_process, shard_args)
                         futures[f] = ("shard", table.name, shard_idx)
@@ -2035,6 +2153,8 @@ def _migrate_tables_in_parallel(
                             handle.update(lambda job, n=name: _fail_chunk(job, n))
                             _tally(_TableLoadOutcome.FAILED)
         finally:
+            # Close the shared-snapshot anchor (if any) once all shard readers are done.
+            _close_shared_snapshot(_anchor_engine, _anchor_conn)
             stop_drain.set()
             # Non-blocking: this runs on the CLEANUP path, so a full queue must not
             # be able to wedge it. ``stop_drain`` already tells the drain to exit, so
@@ -2356,7 +2476,10 @@ def _log_excluded_lob_columns(
             )
 
 
-def _log_captured_watermark(watermark: "Optional[Watermark]") -> None:
+def _log_captured_watermark(
+    watermark: "Optional[Watermark]",
+    source_type: SourceType = SourceType.MYSQL,
+) -> None:
     """Record the Full Load consistency point (watermark) in the activity log.
 
     The watermark pins the exact source position the snapshot reflects and is where a
@@ -2371,14 +2494,23 @@ def _log_captured_watermark(watermark: "Optional[Watermark]") -> None:
     """
     if watermark is None:
         return
-    # Prefer the GTID (the portable resume coordinate); fall back to binlog file:pos;
-    # else say it plainly (binary logging may be disabled / SHOW MASTER STATUS blocked).
+    # Prefer the GTID (MySQL's portable resume coordinate); then binlog file:pos; then
+    # the PostgreSQL WAL LSN (its resume coordinate); else word the absence for the source
+    # engine (e.g. binary logging off on MySQL, or the LSN unreadable on PostgreSQL).
     if watermark.gtid_executed:
         coord = f"GTID {watermark.gtid_executed}"
     elif watermark.binlog_file:
         coord = f"binlog {watermark.binlog_file}:{watermark.binlog_position}"
-    else:
+    elif watermark.wal_lsn:
+        coord = f"WAL LSN {watermark.wal_lsn}"
+    elif source_type is SourceType.MYSQL:
         coord = "no binlog/GTID coordinate available (binary logging off or restricted)"
+    else:
+        engine = dialect_for(source_type).engine_display_name
+        coord = (
+            f"row-count baseline only (Full Load; the WAL/LSN handoff coordinate for a "
+            f"gapless CDC catch-up could not be read for this {engine} source)"
+        )
     ts = watermark.snapshot_timestamp.isoformat().replace("+00:00", "Z")
     approx = " (row counts are approximate estimates)" if watermark.row_counts_approximate else ""
     log_activity(
@@ -2457,7 +2589,11 @@ def run_full_load(
 
     watermark = migrator.capture_watermark(tables)
     handle.update(lambda job: setattr(job, "watermark", watermark))
-    _log_captured_watermark(watermark)
+    # inputs is Optional here; fall back to MySQL when absent (matches the default).
+    _log_captured_watermark(
+        watermark,
+        getattr(getattr(inputs, "source_config", None), "source_type", SourceType.MYSQL),
+    )
 
     # On a "drop & reload" run, drop views that depend on the replaced tables
     # BEFORE the per-table DROP+recreate (a view can span several tables loaded in
@@ -2538,7 +2674,12 @@ def run_full_load_retry(
         handle.update(lambda job: setattr(job, "watermark", watermark))
         # A retry reuses the ORIGINAL watermark (no new snapshot); record which
         # consistency point it resumed against so the audit trail is complete.
-        _log_captured_watermark(watermark)
+        _log_captured_watermark(
+            watermark,
+            getattr(
+                getattr(inputs, "source_config", None), "source_type", SourceType.MYSQL
+            ),
+        )
 
     # Same run-level view pre-drop / recreate as run_full_load, so a retry that
     # DROP+recreates a table whose view dependency blocked the first attempt now
@@ -2747,8 +2888,11 @@ def _default_table_recreator(inputs: "DataMigrationInputs") -> TableRecreator:
         conversion = inputs.table_conversions.get(table.name)
         if conversion is None:
             # No applied conversion carried in (e.g. a table generated outside this
-            # session): re-derive deterministically.
-            conversion = SchemaConverter().convert_table(table, SchemaConvertOptions())
+            # session): re-derive deterministically with the SOURCE engine's dialect
+            # (else a PostgreSQL-source table would be re-derived as MySQL DDL).
+            conversion = SchemaConverter(
+                source_type=inputs.source_config.source_type
+            ).convert_table(table, SchemaConvertOptions())
         connector = DsqlConnector(
             inputs.target_config, aws_profile=inputs.aws_profile
         )
@@ -2821,6 +2965,12 @@ class BatchedTableMigrator:
         # the source, to decide against the live target instead of assuming.
         self._target_pk_reader = target_pk_reader or self._default_target_pk
 
+    @property
+    def source_type(self) -> SourceType:
+        """The source engine this migrator reads (drives engine-specific source-error
+        classification / hints on the retry path)."""
+        return self._inputs.source_config.source_type
+
     def capture_watermark(self, tables: Sequence[TableDef]) -> Watermark:
         """Capture the export consistency point for the selected ``tables``.
 
@@ -2829,9 +2979,116 @@ class BatchedTableMigrator:
         source tables (read-only).
         """
         table_names = [table.name for table in tables]
-        return self._watermark_capturer.capture(
-            self._inputs.source_config, table_names
+        source = self._inputs.source_config
+        if source.source_type is not SourceType.MYSQL:
+            # A binlog/GTID watermark is a MySQL CDC concept, and the MySQL WatermarkCapturer
+            # runs MySQL-only SQL (START TRANSACTION WITH CONSISTENT SNAPSHOT / SHOW MASTER
+            # STATUS) that FAILS on PostgreSQL. A non-MySQL source records its OWN resume
+            # coordinate (PostgreSQL: the WAL LSN, via the dialect) plus the scan-free
+            # row-count baseline (dialect-dispatched: pg_class.reltuples for PG).
+            return self._capture_postgres_watermark(source, table_names)
+        return self._watermark_capturer.capture(source, table_names)
+
+    def _capture_postgres_watermark(
+        self, source: SourceConnectionConfig, table_names: Sequence[str]
+    ) -> Watermark:
+        """Watermark for a non-MySQL (PostgreSQL) source: WAL LSN + row-count baseline.
+
+        Records the dialect's CDC resume coordinate -- for PostgreSQL the WAL ``wal_lsn``
+        (the gapless Full Load -> CDC handoff point, PG's analog of MySQL binlog:pos),
+        captured BEFORE the per-table reader snapshots open so replaying from it is a
+        superset -- plus the approximate per-table estimate (never a COUNT(*) scan) via
+        the source dialect, so the progress baseline is preserved.
+
+        Two paths by whether CDC will follow (``inputs.cdc_stack_name``):
+
+        * **Full Load + CDC** (stack name set): create a logical replication slot +
+          publication ON THE SOURCE at this consistency point (via the audited source-write
+          path). The slot's returned consistent-point becomes ``wal_lsn`` and pins the
+          source WAL until CDC consumes it; the slot/publication names are recorded so the
+          connector resumes from them and teardown drops them. Slot creation is FATAL here
+          -- a missing slot would silently lose every change made during the load.
+        * **Full Load only** (no stack name): a best-effort ``pg_current_wal_lsn()`` READ
+          (no slot -- a slot with no consumer would pin WAL and fill the source disk).
+          None (e.g. insufficient privilege) still yields a valid, loadable watermark.
+        """
+        dialect = dialect_for(source.source_type)
+        stack_name = self._inputs.cdc_stack_name
+        wal_lsn: Optional[str] = None
+        slot_name: Optional[str] = None
+        publication_name: Optional[str] = None
+        # Row estimates (and, Full-Load-only, the plain LSN read) go through the shared
+        # read-only-guarded engine.
+        engine = make_source_engine_factory(self._inputs.source_password)(source)
+        try:
+            with engine.connect() as connection:
+                if stack_name is None:
+                    wal_lsn = dialect.capture_resume_lsn(connection)
+                estimates = estimate_source_rows(connection, list(table_names), dialect)
+        finally:
+            engine.dispose()
+        # Full Load + CDC: create the slot+publication at this consistency point (before
+        # any per-table reader snapshot opens -- capture_watermark runs strictly before
+        # _migrate_tables_in_parallel), through the dedicated audited source-WRITE path
+        # (NOT the read-only-guarded engine above).
+        if stack_name is not None:
+            handles = self._provision_pg_replication(source, stack_name, table_names)
+            wal_lsn = handles.consistent_lsn
+            slot_name = handles.slot_name
+            publication_name = handles.publication_name
+        return Watermark(
+            snapshot_timestamp=datetime.now(timezone.utc),
+            wal_lsn=wal_lsn,
+            slot_name=slot_name,
+            publication_name=publication_name,
+            # None estimate (never-analyzed / missing) -> 0, matching the MySQL baseline.
+            table_row_counts={n: (c or 0) for n, c in estimates.items()},
+            row_counts_approximate=True,
         )
+
+    def _provision_pg_replication(
+        self,
+        source: SourceConnectionConfig,
+        stack_name: str,
+        table_names: Sequence[str],
+    ) -> "PgReplicationHandles":
+        """Create the PostgreSQL CDC slot + publication on the source, audited.
+
+        The ONLY source-write in the Full Load path. Uses the dedicated, non-read-only-
+        guarded, AUTOCOMMIT PostgreSQL write engine (:mod:`dsql_migrator.core.cdc_pg_slot`);
+        names the objects deterministically from ``stack_name`` so the connector param and
+        teardown reference the same slot/publication. Each write is recorded in the audit
+        trail (``log_activity``). Raises on failure -- the gapless handoff is impossible
+        without the slot, so the Full Load must fail loudly rather than produce a
+        decorative LSN.
+        """
+        from dsql_migrator.core import cdc_pg_slot
+
+        slot = cdc_pg_slot.pg_slot_name(stack_name)
+        publication = cdc_pg_slot.pg_publication_name(stack_name)
+
+        def _audit(message: str) -> None:
+            log_activity(
+                ActivityCategory.FULL_LOAD,
+                "CDC replication slot",
+                status=ActivityStatus.INFO,
+                detail=f"source ({stack_name}): {message}",
+            )
+
+        engine = cdc_pg_slot.build_pg_source_write_engine(
+            source, self._inputs.source_password
+        )
+        try:
+            with engine.connect() as connection:
+                return cdc_pg_slot.provision_pg_replication(
+                    connection,
+                    slot_name=slot,
+                    publication_name=publication,
+                    tables=list(table_names),
+                    on_log=_audit,
+                )
+        finally:
+            engine.dispose()
 
     def migrate_table(
         self,

@@ -256,6 +256,73 @@ def test_variables_binds_the_names_instead_of_formatting_them() -> None:
     assert len(parameters) == len(_CDC_VARIABLES)
 
 
+# ---------------------------------------------------------------------------
+# SessionSourceProbe.grants: delegates to the source dialect (engine-correct).
+# The pre-fix probe hard-coded SHOW GRANTS, which errors -> empty on a PostgreSQL
+# source and falsely FAILs the "required privileges" prerequisite, blocking the
+# Full Load. The probe must instead ask the dialect for the grant surface.
+# ---------------------------------------------------------------------------
+
+
+class _GrantsDispatchConnection:
+    """Records SQL and answers is_superuser / role_table_grants / SHOW GRANTS."""
+
+    def __init__(self, *, super=None, pg_rows=None, mysql_rows=None):
+        self._super = super
+        self._pg_rows = pg_rows or []
+        self._mysql_rows = mysql_rows or []
+        self.calls: list[str] = []
+
+    def __enter__(self) -> "_GrantsDispatchConnection":
+        return self
+
+    def __exit__(self, *_exc: Any) -> bool:
+        return False
+
+    def execute(self, statement: Any, parameters: Any = None) -> Any:
+        sql = str(statement)
+        self.calls.append(sql)
+        upper = sql.upper()
+        rows = self._mysql_rows if "SHOW GRANTS" in upper else self._pg_rows
+        scalar = self._super
+        return type(
+            "_R", (), {"fetchall": lambda _self: rows, "scalar": lambda _self: scalar}
+        )()
+
+
+def _typed_source_probe(connection: Any, source_type: Any) -> Any:
+    from dsql_migrator.core.models import SourceConnectionConfig
+    from dsql_migrator.ui.prerequisite_probes import SessionSourceProbe
+
+    probe = SessionSourceProbe(
+        SourceConnectionConfig(host="db.example.com", source_type=source_type), None
+    )
+    probe._engine_factory = lambda _config: type(  # noqa: SLF001
+        "_Engine", (), {"connect": lambda _self: connection}
+    )()
+    return probe
+
+
+def test_grants_delegates_to_mysql_dialect_show_grants() -> None:
+    from dsql_migrator.core.models import SourceType
+
+    connection = _GrantsDispatchConnection(mysql_rows=[("GRANT SELECT ON db.* TO u",)])
+    grants = _typed_source_probe(connection, SourceType.MYSQL).grants()
+    assert grants == ["GRANT SELECT ON db.* TO u"]
+    assert any("SHOW GRANTS" in call for call in connection.calls)
+
+
+def test_grants_delegates_to_postgres_dialect_not_show_grants() -> None:
+    # For a PostgreSQL source the probe must NOT issue SHOW GRANTS; a superuser yields
+    # ALL PRIVILEGES via the PG-specific probe.
+    from dsql_migrator.core.models import SourceType
+
+    connection = _GrantsDispatchConnection(super="on")
+    grants = _typed_source_probe(connection, SourceType.POSTGRES).grants()
+    assert grants == ["ALL PRIVILEGES"]
+    assert not any("SHOW GRANTS" in call for call in connection.calls)
+
+
 def test_variables_folds_in_rds_binlog_retention_when_set() -> None:
     conn = _RecordingConnection([("log_bin", "ON")], rds_rows=[("168",)])
     result = _source_probe(conn).variables()

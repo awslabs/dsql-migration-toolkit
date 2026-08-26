@@ -19,6 +19,7 @@ from dsql_migrator.core.models import (
     PrerequisiteCheckId,
     PrerequisiteCheckRequest,
     PrerequisiteStatus,
+    SourceType,
     TableDef,
 )
 from dsql_migrator.core.models import ColumnDef
@@ -45,6 +46,7 @@ class _FakeSource:
         reachable: bool = True,
         grants: list[str] | None = None,
         variables: dict[str, str] | None = None,
+        cdc_facts=None,
     ) -> None:
         self._reachable = reachable
         self._grants = grants if grants is not None else ["GRANT ALL PRIVILEGES ON *.*"]
@@ -57,6 +59,7 @@ class _FakeSource:
             # binlog-retention check too.
             "binlog_expire_logs_seconds": "2592000",
         }
+        self._cdc_facts = cdc_facts
 
     def reachable(self) -> ConnectionResult:
         return ConnectionResult(success=self._reachable)
@@ -66,6 +69,11 @@ class _FakeSource:
 
     def variables(self) -> dict[str, str]:
         return dict(self._variables)
+
+    def cdc_prerequisites(self, table_names):
+        # None (default) -> the checker's PostgreSQL branch falls back to the
+        # not-yet-supported INFO; a PostgresCdcFacts -> the real PG checks run.
+        return self._cdc_facts
 
 
 class _FakeTarget:
@@ -377,6 +385,236 @@ def test_cdc_gtid_off_is_info_but_does_not_block() -> None:
     assert report.can_proceed is True
 
 
+# ---------------------------------------------------------------------------
+# PostgreSQL source: CDC is not yet implemented, so the CDC-only checks must be
+# engine-aware -- a PostgreSQL source must NOT run the MySQL binlog/GTID/grant
+# checks (which would falsely FAIL) and must report an honest, non-blocking INFO.
+# ---------------------------------------------------------------------------
+
+
+def test_prereq_request_defaults_to_mysql_source() -> None:
+    # Existing callers build the request without source_type; the default keeps
+    # them on the MySQL checks.
+    request = PrerequisiteCheckRequest(mode=MigrationMode.CDC)
+    assert request.source_type is SourceType.MYSQL
+
+
+def test_postgres_cdc_request_never_runs_mysql_variable_checks() -> None:
+    """A PostgreSQL source asked for CDC must never call the MySQL `variables()` probe.
+
+    The checker branches on the engine to the PostgreSQL readiness checks (fed by the
+    dialect probe), and the MySQL binlog/GTID checks are SKIP. Crucially it never calls
+    `variables()`, whose `SHOW GLOBAL VARIABLES` SQL would error on a PostgreSQL
+    connection. (With healthy facts here, the PG checks pass; the facts-None blocking
+    behavior is covered separately.)
+    """
+
+    class _NoVariablesSource(_FakeSource):
+        def variables(self) -> dict[str, str]:  # pragma: no cover - must not run
+            raise AssertionError(
+                "variables() (MySQL SHOW GLOBAL VARIABLES) must not run for a "
+                "PostgreSQL source"
+            )
+
+    checker = PrerequisiteChecker(
+        source_probe=_NoVariablesSource(
+            grants=["GRANT ALL PRIVILEGES ON db.* TO u"], cdc_facts=_pg_facts_ok()
+        ),
+        target_probe=_FakeTarget(existing={"app.orders"}),
+        msk_probe=_FakeMsk(),
+    )
+    request = PrerequisiteCheckRequest(
+        mode=MigrationMode.CDC,
+        tables=["app.orders"],
+        source_type=SourceType.POSTGRES,
+    )
+    report = checker.check(request, tables=[_table("app.orders")])
+
+    # The MySQL-only checks are not applicable for this engine.
+    assert _result(report, PrerequisiteCheckId.BINLOG_ROW_FORMAT).status is (
+        PrerequisiteStatus.SKIP
+    )
+    assert _result(report, PrerequisiteCheckId.GTID_MODE).status is (
+        PrerequisiteStatus.SKIP
+    )
+    # Healthy PG facts -> the real checks ran and pass.
+    assert report.can_proceed is True
+
+
+def test_postgres_source_never_demands_mysql_replication_grants() -> None:
+    # Even in CDC mode, a PostgreSQL source is only asked for SELECT (its CDC
+    # replication readiness is checked differently when PG CDC ships) -- never
+    # MySQL's REPLICATION CLIENT/SLAVE, which a PG grant list would never contain.
+    pg_select_only = check_replication_grants(
+        ["GRANT SELECT ON db.* TO u"],
+        MigrationMode.CDC,
+        source_type=SourceType.POSTGRES,
+    )
+    assert pg_select_only.status is PrerequisiteStatus.PASS
+
+    # A MySQL source in CDC mode still requires the replication privileges.
+    mysql_missing = check_replication_grants(
+        ["GRANT SELECT ON db.* TO u"],
+        MigrationMode.CDC,
+        source_type=SourceType.MYSQL,
+    )
+    assert mysql_missing.status is PrerequisiteStatus.FAIL
+    assert "REPLICATION" in mysql_missing.detail.upper()
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL CDC readiness: the real logical-replication checks (Phase C5),
+# fed by PostgresCdcFacts from the dialect probe.
+# ---------------------------------------------------------------------------
+
+
+def _pg_facts_ok(**over):
+    from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
+
+    base = dict(
+        wal_level="logical", is_superuser=False, has_replication_role=True,
+        max_replication_slots=10, used_replication_slots=1, max_wal_senders=10,
+        is_in_recovery=False, replica_identity={"app.orders": "d"},
+    )
+    base.update(over)
+    return PostgresCdcFacts(**base)
+
+
+def test_postgres_cdc_facts_run_the_real_readiness_checks() -> None:
+    from dsql_migrator.core.models import PrerequisiteCheckId as Id
+
+    checker = PrerequisiteChecker(
+        source_probe=_FakeSource(cdc_facts=_pg_facts_ok()),
+        target_probe=_FakeTarget(existing={"app.orders"}),
+        msk_probe=_FakeMsk(),
+    )
+    report = checker.check(
+        PrerequisiteCheckRequest(
+            mode=MigrationMode.CDC, tables=["app.orders"],
+            source_type=SourceType.POSTGRES,
+        ),
+        tables=[_table("app.orders")],
+    )
+    ids = {r.check_id for r in report.results}
+    # The real PG checks ran (not the not-supported INFO fallback).
+    assert Id.WAL_LEVEL_LOGICAL in ids
+    assert Id.REPLICATION_ROLE in ids
+    assert Id.SOURCE_IS_WRITER in ids
+    assert Id.REPLICA_IDENTITY in ids
+    # MSK is engine-neutral -> still runs for PostgreSQL CDC.
+    assert Id.MSK_AVAILABLE in ids
+    # MySQL binlog/GTID are not applicable -> SKIP.
+    assert _result(report, Id.BINLOG_ROW_FORMAT).status is PrerequisiteStatus.SKIP
+    assert report.can_proceed is True
+
+
+def test_postgres_cdc_unready_source_blocks() -> None:
+    # wal_level!=logical, no replication role, a standby, REPLICA IDENTITY nothing:
+    # every required PG check FAILs, so can_proceed is False.
+    checker = PrerequisiteChecker(
+        source_probe=_FakeSource(
+            cdc_facts=_pg_facts_ok(
+                wal_level="replica", has_replication_role=False,
+                is_in_recovery=True, replica_identity={"app.orders": "n"},
+            )
+        ),
+        target_probe=_FakeTarget(existing={"app.orders"}),
+        msk_probe=_FakeMsk(),
+    )
+    report = checker.check(
+        PrerequisiteCheckRequest(
+            mode=MigrationMode.CDC, tables=["app.orders"],
+            source_type=SourceType.POSTGRES,
+        ),
+        tables=[_table("app.orders")],
+    )
+    assert report.can_proceed is False
+
+
+def test_postgres_cdc_facts_none_blocks_the_run() -> None:
+    # For a PostgreSQL source, None facts mean the readiness probe FAILED (unreachable /
+    # insufficient privilege). CDC must NOT proceed against an unverified source -- a
+    # required FAIL blocks it (not a benign INFO), so a slot/publication is never created
+    # against a source whose logical-replication readiness is unknown.
+    from dsql_migrator.core.models import PrerequisiteCheckId as Id
+
+    checker = PrerequisiteChecker(
+        source_probe=_FakeSource(cdc_facts=None),
+        target_probe=_FakeTarget(existing={"app.orders"}),
+        msk_probe=_FakeMsk(),
+    )
+    report = checker.check(
+        PrerequisiteCheckRequest(
+            mode=MigrationMode.CDC, tables=["app.orders"],
+            source_type=SourceType.POSTGRES,
+        ),
+        tables=[_table("app.orders")],
+    )
+    blocker = _result(report, Id.WAL_LEVEL_LOGICAL)
+    assert blocker.status is PrerequisiteStatus.FAIL
+    assert blocker.required is True
+    assert report.can_proceed is False  # unverified -> blocked
+
+
+def test_pg_pure_checks_wal_level_role_writer_replica_identity() -> None:
+    from dsql_migrator.core.prerequisites_postgres import (
+        check_replica_identity,
+        check_replication_role,
+        check_source_is_writer,
+        check_wal_level_logical,
+    )
+
+    # wal_level
+    assert check_wal_level_logical(_pg_facts_ok()).status is PrerequisiteStatus.PASS
+    assert check_wal_level_logical(
+        _pg_facts_ok(wal_level="replica")
+    ).status is PrerequisiteStatus.FAIL
+    # unknown wal_level -> non-blocking INFO
+    assert check_wal_level_logical(
+        _pg_facts_ok(wal_level=None)
+    ).status is PrerequisiteStatus.INFO
+    # replication role: superuser OR membership; else FAIL
+    assert check_replication_role(
+        _pg_facts_ok(is_superuser=True, has_replication_role=False)
+    ).status is PrerequisiteStatus.PASS
+    assert check_replication_role(
+        _pg_facts_ok(has_replication_role=False)
+    ).status is PrerequisiteStatus.FAIL
+    # writer vs standby
+    assert check_source_is_writer(_pg_facts_ok()).status is PrerequisiteStatus.PASS
+    assert check_source_is_writer(
+        _pg_facts_ok(is_in_recovery=True)
+    ).status is PrerequisiteStatus.FAIL
+    # replica identity: 'd'/'f'/'i' usable, 'n' fails, unknown -> INFO
+    t = _table("app.orders")
+    assert check_replica_identity(
+        t, _pg_facts_ok(replica_identity={"app.orders": "f"})
+    ).status is PrerequisiteStatus.PASS
+    assert check_replica_identity(
+        t, _pg_facts_ok(replica_identity={"app.orders": "n"})
+    ).status is PrerequisiteStatus.FAIL
+    assert check_replica_identity(
+        t, _pg_facts_ok(replica_identity={})
+    ).status is PrerequisiteStatus.INFO
+
+
+def test_pg_replica_identity_index_and_default_pass() -> None:
+    # Regression: all three usable REPLICA IDENTITY codes must PASS -- 'd'
+    # (default/PK), 'f' (full) and 'i' (index) -- while 'n' (nothing) FAILs. Existing
+    # tests only pinned 'f', so 'd'/'i' could regress out of _USABLE_REPLICA_IDENTITY
+    # unnoticed.
+    from dsql_migrator.core.prerequisites_postgres import check_replica_identity
+
+    t = _table("app.orders")
+    for code in ("d", "f", "i"):
+        assert check_replica_identity(
+            t, _pg_facts_ok(replica_identity={"app.orders": code})
+        ).status is PrerequisiteStatus.PASS, code
+    assert check_replica_identity(
+        t, _pg_facts_ok(replica_identity={"app.orders": "n"})
+    ).status is PrerequisiteStatus.FAIL
+
+
 def test_required_failure_blocks_progression() -> None:
     # Target schema not applied for the selected table -> required FAIL.
     checker = PrerequisiteChecker(
@@ -540,3 +778,39 @@ def test_exclusion_never_drops_a_pk_from_the_primary_key_check() -> None:
         _result(report, PrerequisiteCheckId.TABLE_PRIMARY_KEY, "app.docs").status
         is PrerequisiteStatus.PASS
     )
+
+
+def test_check_replication_slot_headroom_states() -> None:
+    # Regression + enhancement (#8): the headroom prereq WARNs when there is no room for a
+    # new CDC slot OR walsender, INFOs on unknown counts (never a false FAIL), PASSes when
+    # healthy. Non-blocking (required=False) either way.
+    from dsql_migrator.core.prerequisites_postgres import (
+        PostgresCdcFacts,
+        check_replication_slot_headroom,
+    )
+
+    S = PrerequisiteStatus
+    healthy = check_replication_slot_headroom(
+        PostgresCdcFacts(max_replication_slots=10, used_replication_slots=2,
+                         max_wal_senders=10, used_wal_senders=2)
+    )
+    assert healthy.status is S.PASS and healthy.required is False
+    # Slots exhausted -> WARN.
+    assert check_replication_slot_headroom(
+        PostgresCdcFacts(max_replication_slots=5, used_replication_slots=5,
+                         max_wal_senders=10, used_wal_senders=1)
+    ).status is S.WARN
+    # Degenerate max_wal_senders=0 -> WARN.
+    assert check_replication_slot_headroom(
+        PostgresCdcFacts(max_replication_slots=10, used_replication_slots=0,
+                         max_wal_senders=0)
+    ).status is S.WARN
+    # NEW: walsender pool exhausted even with FREE slots -> WARN (was PASS before #8).
+    walsender_full = check_replication_slot_headroom(
+        PostgresCdcFacts(max_replication_slots=10, used_replication_slots=1,
+                         max_wal_senders=5, used_wal_senders=5)
+    )
+    assert walsender_full.status is S.WARN and "5/5" in walsender_full.detail
+    # Unknown counts -> INFO, never a blocking failure.
+    info = check_replication_slot_headroom(PostgresCdcFacts(max_replication_slots=None))
+    assert info.status is S.INFO and info.required is False

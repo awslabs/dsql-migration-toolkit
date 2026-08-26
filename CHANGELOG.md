@@ -5,6 +5,41 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.396
+
+### Added
+
+- **PostgreSQL is now a supported migration source (RDS / Aurora PostgreSQL → Aurora
+  DSQL).** The Connect screen has a source-engine selector (MySQL / PostgreSQL), and a
+  PostgreSQL source runs the full journey — Evaluation, Schema Conversion, Full Load,
+  Validation, and CDC — through a source-dialect adapter (`core/source_dialect`).
+  PostgreSQL → DSQL is near-identity (both PostgreSQL-16 wire): Schema Conversion passes
+  types through and flags the DSQL-unsupported ones (arrays, geometric / network / xml /
+  money / bit / range / tsvector / enum / composite / domains) with a faithful remodel
+  target; Full Load streams by keyset (sharded REPLACE reads use a shared exported
+  snapshot); Validation reuses one PostgreSQL-16 checksum renderer on both ends. Verified
+  live end-to-end on real Aurora PostgreSQL (Full Load + Validation, CHECKSUM byte-identical).
+- **PostgreSQL CDC (Debezium `pgoutput` → MSK → DSQL sink).** Logical-replication slot +
+  publication lifecycle, WAL-retention health surfacing, gapless Full-Load → CDC handoff,
+  and typed sink binds (uuid / timetz-UTC / interval / timestamptz / jsonb / bytea /
+  numeric) with TOAST partial-upsert. A dedicated Debezium-PostgreSQL connector plugin
+  ships alongside the MySQL one.
+
+### Fixed
+
+- **CHECKSUM validation no longer false-mismatches `BIGINT UNSIGNED` on modern MySQL
+  sources.** The DSQL-target checksum applied PostgreSQL's unconstrained-`numeric` scale-6
+  rule to any parenthesis-less type, but MySQL 8.0.19+ / 8.4 / Aurora MySQL 3 report
+  `BIGINT UNSIGNED` as the paren-less `bigint unsigned` (stored as `numeric(20,0)`, an
+  integer). The target side gained `.000000` while the unchanged MySQL source side rendered
+  scale 0, so every such row diverged despite byte-identical data. The scale-6 rule is now
+  gated to a genuine PostgreSQL source. (MySQL 5.7's `bigint(20) unsigned` was unaffected.)
+- **A bare PostgreSQL `numeric`/`decimal` (no declared precision) now raises a Schema
+  Conversion warning.** Aurora DSQL stores such a column at its default `numeric(18,6)` and
+  rounds values beyond 6 fractional digits; this was previously silent (only a *declared*
+  precision above 38/37 was flagged) and Validation compares at scale 6, so the loss could
+  pass unnoticed. Conversion now names the column and the `numeric(18,6)` cap.
+
 ## v0.1.395
 
 ### Fixed

@@ -106,21 +106,43 @@ class CdcResumePoint(BaseModel):
         default=None,
         description="Source server UUID the coordinates belong to, if available.",
     )
+    wal_lsn: Optional[str] = Field(
+        default=None,
+        description=(
+            "PostgreSQL WAL LSN to resume from (the PG analog of MySQL's "
+            "binlog:pos). Captured at the Full Load consistency point; consumed by "
+            "the PostgreSQL CDC path (a logical replication slot pins the WAL from "
+            "this LSN). None for a MySQL source."
+        ),
+    )
 
     @classmethod
     def from_watermark(cls, watermark: Watermark) -> "CdcResumePoint":
         """Derive the resume coordinates from an export-start watermark.
 
-        Copies the binlog coordinates, GTID set, and ``server_uuid`` recorded on
-        the watermark so a CDC run can resume from the same consistency point
-        (Property 11). Coordinates absent from the watermark stay ``None``.
+        Copies the binlog coordinates, GTID set, ``server_uuid``, and the PG WAL
+        LSN recorded on the watermark so a CDC run can resume from the same
+        consistency point (Property 11). Coordinates absent from the watermark stay
+        ``None`` (a MySQL watermark has no ``wal_lsn``; a PG one has no binlog/GTID).
         """
         return cls(
             binlog_file=watermark.binlog_file,
             binlog_position=watermark.binlog_position,
             gtid_executed=watermark.gtid_executed,
             server_uuid=watermark.server_uuid,
+            wal_lsn=watermark.wal_lsn,
         )
+
+    def can_resume_from_lsn(self) -> bool:
+        """True when a PostgreSQL WAL LSN is present to resume streaming from.
+
+        The PG analog of :meth:`can_seed_offset`: the PostgreSQL CDC path resumes
+        from a pre-created logical replication slot positioned at this LSN, so a
+        present ``wal_lsn`` means the gapless Full-Load -> CDC handoff is possible
+        (``snapshot.mode=never``). Absent -> a stand-alone CDC that must snapshot
+        first (``snapshot.mode=initial``).
+        """
+        return bool(self.wal_lsn)
 
     def has_coordinates(self) -> bool:
         """Return True when at least one usable resume coordinate is present.
