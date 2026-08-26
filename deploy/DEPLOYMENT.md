@@ -1,4 +1,4 @@
-# Deployment Guide — MySQL → Aurora DSQL Migration Tool (app-stack)
+# Deployment Guide — MySQL / PostgreSQL → Aurora DSQL Migration Tool (app-stack)
 
 _Language: **English** | [한국어](DEPLOYMENT.ko.md) | [日本語](DEPLOYMENT.ja.md)_
 
@@ -13,7 +13,7 @@ same tool and UI everywhere, only **where it runs** differs. The optional stream
 Pick one — each mode has its own section below.
 
 - **[Run locally](#run-locally)** — `uv run …`, **no infrastructure.** Your machine is
-  the engine, so it must reach **both** the source MySQL and DSQL. Best for evaluation
+  the engine, so it must reach **both** the source (MySQL or PostgreSQL) and DSQL. Best for evaluation
   and small migrations. **👉 Try this first.**
 - **[Deploy on ECS Fargate](#deploy-on-ecs-fargate)** — **recommended for real,
   large-scale migrations.** A single-task **ECS Fargate** service behind an **HTTPS ALB**
@@ -56,7 +56,7 @@ before deciding on Fargate.
 The UI runs on your own machine (browser → `127.0.0.1:8080`), and **the migration
 itself runs there too**: your workstation is the engine that reads the source and
 writes to DSQL, so all data flows through your machine and its network. This means
-your **desktop must be able to reach _both_** the source MySQL **and** the target
+your **desktop must be able to reach _both_** the source (MySQL or PostgreSQL) **and** the target
 Aurora DSQL — a private source needs an SSM port-forward / VPN, and your machine
 needs outbound HTTPS + AWS credentials to the DSQL region. Zero infra — best for
 evaluation / smaller migrations / development. It is *not* the hosted architecture;
@@ -123,7 +123,7 @@ Full descriptions are in the collapsible below and in [Parameter reference](#par
 | What | Parameter | Notes |
 | --- | --- | --- |
 | Access | — | AWS Console (recommended) or AWS CLI v2, able to create IAM roles, ECS, an ALB, security groups, and CloudWatch Logs. No image build — it's pulled from ECR Public. |
-| A VPC | `VpcId` | Ideally your source MySQL's VPC, **same region as DSQL**. The subnets below are picked from it. |
+| A VPC | `VpcId` | Ideally your source DB's VPC, **same region as DSQL**. The subnets below are picked from it. |
 | Two ALB + two task subnets | `AlbSubnetIds` / `ServiceSubnetIds` | Distinct AZs; task subnets need **egress on 443**. |
 | An ACM certificate | `CertificateArn` | Same region. No domain? Run `AWS_REGION=<region> deploy/create_test_cert.sh` for a self-signed test cert. |
 | The DSQL cluster ARN | `DsqlClusterArn` | The migration target. |
@@ -147,7 +147,7 @@ every other parameter keeps a sensible default.
 #### Good to know before you fill the form
 
 > [!IMPORTANT]
-> **Start with the VPC.** Use the one your source RDS/Aurora MySQL already lives
+> **Start with the VPC.** Use the one your source RDS/Aurora (MySQL or PostgreSQL) already lives
 > in — same region as DSQL — and the subnets/certificate you pick from it are
 > required by AWS itself (an ALB and a Fargate task must sit in subnets; an HTTPS
 > listener must have a certificate). **The VPC must be owned by this account** —
@@ -160,7 +160,7 @@ every other parameter keeps a sensible default.
 | Optional | Parameter | When you need it |
 | --- | --- | --- |
 | **Source secret ARN** | `SourceSecretArn` | Only to **reuse an existing** Secrets Manager secret for the source creds. Leave empty to use username/password in the UI (the common case). |
-| **Source DB reachability** | `SourceDbSecurityGroupId` (preferred) / `SourceDbCidr` | **Provide at least one** so the task gets egress to the source MySQL on `SourceDbPort`. `SourceDbSecurityGroupId` scopes egress to the source DB's SG; use `SourceDbCidr` if you have no SG id. With both empty the deploy is rejected (the task would have no route to the source). |
+| **Source DB reachability** | `SourceDbSecurityGroupId` (preferred) / `SourceDbCidr` | **Provide at least one** so the task gets egress to the source DB on `SourceDbPort`. `SourceDbSecurityGroupId` scopes egress to the source DB's SG; use `SourceDbCidr` if you have no SG id. With both empty the deploy is rejected (the task would have no route to the source). |
 | **Custom domain** | `AppDomainName` | Only if you front the ALB with your own Route 53 domain. |
 | **Public access / Cognito** | `AlbScheme`, `AllowedIngressCidr`, `EnableCognitoAuth`, `CognitoDomainPrefix` | Only to expose the UI publicly; defaults keep it `internal` (no login). |
 | **AI assist** | `EnableAiAssist`, `BedrockModelId`, `BedrockRegion` | Only to enable Amazon Bedrock-assisted conversion (pick a model; IAM scope auto-derived). |
@@ -256,12 +256,12 @@ your account** instead of typing ids.
 
 | Field | What to enter |
 | --- | --- |
-| `VpcId` | Dropdown — the VPC your source MySQL lives in. |
+| `VpcId` | Dropdown — the VPC your source DB lives in. |
 | `AlbSubnetIds` | Subnet multi-select — **2 subnets in distinct AZs** (see the subnet callout below). |
 | `ServiceSubnetIds` | Subnet multi-select — **2 private subnets in distinct AZs** (or reuse the ALB subnets + set `AssignPublicIp=ENABLED` if you have no private/NAT subnets). |
 | `CertificateArn` | ACM cert ARN for HTTPS — **no domain? see the command just below.** |
 | `DsqlClusterArn` | The target Aurora DSQL cluster ARN. |
-| `SourceDbSecurityGroupId` (or `SourceDbCidr`) | One of the two — scopes the task's egress to the source MySQL. Prefer the security-group id; use the CIDR only if you have none. |
+| `SourceDbSecurityGroupId` (or `SourceDbCidr`) | One of the two — scopes the task's egress to the source DB. Prefer the security-group id; use the CIDR only if you have none. |
 
 > [!WARNING]
 > The subnet dropdowns list **every subnet in the region**, not just your
@@ -343,7 +343,7 @@ otherwise the task can't pull its image or reach DSQL and fails to start. → **
    inside the VPC; see "Reaching the UI" above).
 
 **7. Open it — you should see the tool.** Browse `AppUrl` in a browser (from
-   inside the VPC). The **MySQL → Aurora DSQL Migration Tool** UI loads — the
+   inside the VPC). The **Aurora DSQL Migration Tool** UI loads — the
    guided workflow starting at **Connect** (Connect → Evaluation → Schema
    Conversion → Data Migration → Validation → Cut over). If it loads, the
    deployment is done; enter your source DB credentials at **Connect** to begin.
@@ -475,7 +475,7 @@ aws cloudformation describe-stacks --stack-name mysql-dsql-migrator \
 Key outputs: `LoadBalancerDns`, `AppUrl`, `ClusterName`, `ServiceName`,
 `TaskRoleArn`, `CognitoHostedUiDomain`.
 
-Open **`AppUrl`** in a browser (from inside the VPC). The **MySQL → Aurora DSQL
+Open **`AppUrl`** in a browser (from inside the VPC). The **Aurora DSQL
 Migration Tool** UI loads — the guided workflow starting at **Connect** (Connect
 → Evaluation → Schema Conversion → Data Migration → Validation → Cut
 over). Seeing the UI means the deployment succeeded; enter your source DB
@@ -511,7 +511,7 @@ Optional deep-dives — expand what you need; none of this is required for a fir
 | `SourceSecretArn` | no | `""` | **Optional.** Set only to **reuse an existing** Secrets Manager secret for the source creds (scopes `GetSecretValue`). Leave empty to enter username/password in the UI (the common case). |
 | `SourceDbSecurityGroupId` | no* | `""` | Source DB SG; **preferred (recommended) egress target** over a raw CIDR. *One of this / `SourceDbCidr` is required. |
 | `SourceDbCidr` | no* | `""` | Source DB CIDR (use if no SG id). *One of this / `SourceDbSecurityGroupId` is required. |
-| `SourceDbPort` | no | `3306` | Source MySQL port. |
+| `SourceDbPort` | no | `3306` | Source DB port — **`3306` for MySQL, `5432` for PostgreSQL** (override the default for a PostgreSQL source). |
 | `HttpsEgressCidr` | no | `0.0.0.0/0` | Destination CIDR for the task's outbound 443 (AWS APIs: DSQL token, Secrets Manager, ECR, CloudWatch, Bedrock) and 5432 (DSQL). **Recommended: leave the `0.0.0.0/0` default** — the task reaches public AWS endpoints via NAT/IGW. Only tighten (e.g. to your VPC CIDR) when you front *all* those services with interface VPC endpoints (PrivateLink); tightening without them blocks image pull / DSQL and the task fails to start. |
 | `EnableCognitoAuth` | no | `false` | ALB authenticates via Cognito (OIDC). Defaults to `false`: an internal ALB (or one scoped to your CIDR) is the access gate and the operator already holds the IAM/DB permissions, so no login is needed. **Required (enforced) only when `AllowedIngressCidr=0.0.0.0/0`.** Needs **both** `CognitoDomainPrefix` and `CognitoAdminEmail` when `true`. |
 | `AppDomainName` | no | `""` | DNS name fronting the ALB (must match the cert). Leave **empty** to use the ALB's own DNS name as the Cognito callback host — then no custom domain or Route 53 record is needed. |
@@ -887,7 +887,7 @@ Template: **`deploy/cloudformation-ec2.yaml`**.
   from the public internet** (astral.sh · PyPI · GitHub) — then reaches the source DB,
   DSQL, and AWS APIs over the same egress. VPC endpoints alone won't work: those public
   sources aren't reachable over PrivateLink. Put it in **the same VPC as your source
-  MySQL** (and, if you'll run CDC, the same VPC as the MSK).
+  DB (MySQL or PostgreSQL)** (and, if you'll run CDC, the same VPC as the MSK).
 - **The AWS CLI with the Session Manager plugin** on your machine — this is how you open
   the UI (there's no ALB or public endpoint; you port-forward over SSM).
   [Install guide](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html).
@@ -907,7 +907,7 @@ Template: **`deploy/cloudformation-ec2.yaml`**.
 | `VpcId` | yes | — | VPC of the source DB / MSK (same region as DSQL). |
 | `HostSubnetId` | yes | — | A **NAT-egress private subnet** of `VpcId`, co-located with the MSK. |
 | `DsqlClusterArn` | yes | — | Target DSQL cluster (scopes `dsql:DbConnect`). |
-| `SourceDbSecurityGroupId` / `SourceDbCidr` | one required | `""` | Opens host egress to the source MySQL (SG preferred over a raw CIDR). |
+| `SourceDbSecurityGroupId` / `SourceDbCidr` | one required | `""` | Opens host egress to the source DB (SG preferred over a raw CIDR). |
 | `SourceMode` | no | `git` | `git` (clone `SourceRepoUrl@SourceRepoRef` over public HTTPS) or `s3` (tarball from `SourceS3Uri`). |
 | `SourceS3Uri` | if `s3` | `""` | `s3://…/source.tar.gz` of the repo root — the temporary "run my local copy" path. |
 | `MskEgressCidr` | no | `0.0.0.0/0` | CIDR the host may reach MSK on 9098 for the in-process seed; narrow to the connector subnet CIDR for least privilege. |

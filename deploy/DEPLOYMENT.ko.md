@@ -1,4 +1,4 @@
-# 배포 가이드 — MySQL → Aurora DSQL 마이그레이션 도구 (app-stack)
+# 배포 가이드 — MySQL / PostgreSQL → Aurora DSQL 마이그레이션 도구 (app-stack)
 
 _언어: [English](DEPLOYMENT.md) | **한국어** | [日本語](DEPLOYMENT.ja.md)_
 
@@ -12,8 +12,8 @@ UI이며 **어디서 실행하느냐**만 다릅니다. 선택적 스트리밍 *
 
 하나를 고르세요 — 각 모드는 아래에 자체 섹션이 있습니다.
 
-- **[로컬에서 실행](#로컬에서-실행)** — `uv run …`, **인프라 없음.** 내 머신이 엔진이므로 소스
-  MySQL과 DSQL **양쪽**에 도달할 수 있어야 합니다. 평가·소규모 마이그레이션에 적합. **👉 먼저 이걸
+- **[로컬에서 실행](#로컬에서-실행)** — `uv run …`, **인프라 없음.** 내 머신이 엔진이므로 소스(MySQL 또는
+  PostgreSQL)와 DSQL **양쪽**에 도달할 수 있어야 합니다. 평가·소규모 마이그레이션에 적합. **👉 먼저 이걸
   시도하세요.**
 - **[ECS Fargate에 배포](#ecs-fargate에-배포)** — **실제·대규모 마이그레이션에 권장.** 내 VPC 안의
   단일 태스크 **ECS Fargate** 서비스가 **HTTPS ALB** 뒤에서 돌고 이미지는 **ECR**에서 가져오므로,
@@ -52,7 +52,7 @@ NiceGUI ready to go on http://127.0.0.1:8080
 
 UI가 내 머신에서 돌고(브라우저 → `127.0.0.1:8080`), **마이그레이션 자체도 거기서 실행**됩니다 — 내
 워크스테이션이 소스를 읽고 DSQL에 쓰는 엔진이라, 모든 데이터가 내 머신과 네트워크를 통과합니다.
-따라서 **내 데스크톱이 소스 MySQL과 타깃 Aurora DSQL _양쪽_ 모두에 도달**할 수 있어야 합니다 —
+따라서 **내 데스크톱이 소스(MySQL 또는 PostgreSQL)와 타깃 Aurora DSQL _양쪽_ 모두에 도달**할 수 있어야 합니다 —
 프라이빗 소스는 SSM 포트 포워딩 / VPN이 필요하고, 내 머신은 DSQL 리전으로의 아웃바운드 HTTPS +
 AWS 자격증명이 있어야 합니다. 인프라 없음 — 평가 / 소규모 마이그레이션 / 개발에 적합. 호스팅
 아키텍처는 아니며, 실제 마이그레이션은 **[ECS Fargate](#ecs-fargate에-배포)**를 쓰세요.
@@ -116,7 +116,7 @@ Well-Architected SEC05-BP02. 외부에 공개하려면 [app-stack 배포](#2-app
 | 무엇 | 파라미터 | 설명 |
 | --- | --- | --- |
 | 접근 | — | AWS Console(권장) 또는 AWS CLI v2 — IAM 역할, ECS, ALB, 보안 그룹, CloudWatch Logs를 생성할 수 있어야 함. 이미지 빌드 불필요 — ECR Public에서 가져옵니다. |
-| VPC | `VpcId` | 소스 MySQL의 VPC가 이상적, **DSQL과 같은 리전**. 아래 서브넷은 여기서 고릅니다. |
+| VPC | `VpcId` | 소스 DB의 VPC가 이상적, **DSQL과 같은 리전**. 아래 서브넷은 여기서 고릅니다. |
 | ALB 서브넷 2개 + 태스크 서브넷 2개 | `AlbSubnetIds` / `ServiceSubnetIds` | 서로 다른 AZ; 태스크 서브넷은 **443 egress** 필요. |
 | ACM 인증서 | `CertificateArn` | 같은 리전. 도메인이 없나요? `AWS_REGION=<region> deploy/create_test_cert.sh`로 self-signed 테스트 인증서를 만드세요. |
 | DSQL 클러스터 ARN | `DsqlClusterArn` | 마이그레이션 타깃. |
@@ -139,7 +139,7 @@ Well-Architected SEC05-BP02. 외부에 공개하려면 [app-stack 배포](#2-app
 #### 폼을 채우기 전에 알아둘 것
 
 > [!IMPORTANT]
-> **VPC부터 정하세요.** 소스 RDS/Aurora MySQL이 이미 있는 VPC를 사용하세요 — DSQL과 같은 리전 —
+> **VPC부터 정하세요.** 소스 RDS/Aurora(MySQL 또는 PostgreSQL)가 이미 있는 VPC를 사용하세요 — DSQL과 같은 리전 —
 > 그리고 여기서 고르는 서브넷/인증서는 AWS 자체 요구사항입니다(ALB와 Fargate 태스크는 서브넷에
 > 배치돼야 하고, HTTPS 리스너는 인증서가 있어야 함). **이 VPC는 이 계정 소유여야 합니다** —
 > RAM 공유(계정 간) VPC는 지원되지 않습니다. CDC 배포 역할의 EC2 권한이 배포하는 계정으로
@@ -150,7 +150,7 @@ Well-Architected SEC05-BP02. 외부에 공개하려면 [app-stack 배포](#2-app
 | 옵션 | 파라미터 | 필요한 경우 |
 | --- | --- | --- |
 | **소스 시크릿 ARN** | `SourceSecretArn` | 기존 Secrets Manager 시크릿을 **재사용**할 때만. 비워두면 UI에서 id/password 입력(일반적인 경우). |
-| **소스 DB 도달 경로** | `SourceDbSecurityGroupId`(권장) / `SourceDbCidr` | **둘 중 최소 하나 필수** — 태스크가 소스 MySQL(`SourceDbPort`)로 egress하도록. `SourceDbSecurityGroupId`는 소스 DB SG로 egress를 범위 제한, SG id가 없으면 `SourceDbCidr` 사용. 둘 다 비우면 배포가 거부됩니다(소스로 가는 경로 없음). |
+| **소스 DB 도달 경로** | `SourceDbSecurityGroupId`(권장) / `SourceDbCidr` | **둘 중 최소 하나 필수** — 태스크가 소스 DB(`SourceDbPort`)로 egress하도록. `SourceDbSecurityGroupId`는 소스 DB SG로 egress를 범위 제한, SG id가 없으면 `SourceDbCidr` 사용. 둘 다 비우면 배포가 거부됩니다(소스로 가는 경로 없음). |
 | **커스텀 도메인** | `AppDomainName` | 자체 Route 53 도메인으로 ALB를 front할 때만. |
 | **공개 접근 / Cognito** | `AlbScheme`, `AllowedIngressCidr`, `EnableCognitoAuth`, `CognitoDomainPrefix` | UI를 공개할 때만; 기본은 `internal`(로그인 없음). |
 | **AI 보조** | `EnableAiAssist`, `BedrockModelId`, `BedrockRegion` | Amazon Bedrock 보조 변환을 켤 때만(모델 선택; IAM 스코프 자동 도출). |
@@ -162,8 +162,8 @@ Well-Architected SEC05-BP02. 외부에 공개하려면 [app-stack 배포](#2-app
 
 ### 2. app-stack 배포
 
-`deploy/cloudformation.yaml`을 배포하는 세 가지 방법 — 하나를 선택한다. 셋 다 같은 스택을
-만든다. 파라미터 설명은 **파라미터 레퍼런스** 참고.
+`deploy/cloudformation.yaml`을 배포하는 세 가지 방법 중 하나를 선택하세요. 셋 다 같은 스택을
+만듭니다. 파라미터 설명은 **파라미터 레퍼런스** 참고.
 
 #### 가장 쉬움 — AI 코딩 에이전트로 배포
 
@@ -243,12 +243,12 @@ template**에서 **Upload a template file** → **Choose file** → 이 저장�
 
 | 필드 | 입력값 |
 | --- | --- |
-| `VpcId` | 드롭다운 — 소스 MySQL이 있는 VPC. |
+| `VpcId` | 드롭다운 — 소스 DB가 있는 VPC. |
 | `AlbSubnetIds` | 서브넷 멀티선택 — **서로 다른 AZ 2개**(아래 서브넷 박스 참고). |
 | `ServiceSubnetIds` | 서브넷 멀티선택 — **서로 다른 AZ의 프라이빗 2개**(프라이빗/NAT 서브넷이 없으면 ALB 서브넷을 그대로 쓰고 `AssignPublicIp=ENABLED` 설정). |
 | `CertificateArn` | HTTPS용 ACM 인증서 ARN — **도메인이 없으면 바로 아래 명령 참고.** |
 | `DsqlClusterArn` | 타깃 Aurora DSQL 클러스터 ARN. |
-| `SourceDbSecurityGroupId`(또는 `SourceDbCidr`) | 둘 중 하나 — 태스크의 소스 MySQL egress 범위를 지정. 보안 그룹 id를 우선하고, 없을 때만 CIDR 사용. |
+| `SourceDbSecurityGroupId`(또는 `SourceDbCidr`) | 둘 중 하나 — 태스크의 소스 DB egress 범위를 지정. 보안 그룹 id를 우선하고, 없을 때만 CIDR 사용. |
 
 > [!WARNING]
 > 서브넷 드롭다운은 내 VpcId 것만이 아니라 **리전의 모든 서브넷**을 보여줍니다. 다른 VPC의 서브넷을
@@ -320,7 +320,7 @@ AWS_REGION=<region> deploy/create_test_cert.sh
    (VPC 안에서 접속; 위 "UI 접근" 참고).
 
 **7. 열기 — 도구가 보여야 함.** 브라우저에서 `AppUrl`로 접속(VPC 내부에서)하면
-   **MySQL → Aurora DSQL Migration Tool** UI가 뜹니다 — **Connect**로 시작하는 안내형
+   **Aurora DSQL Migration Tool** UI가 뜹니다 — **Connect**로 시작하는 안내형
    워크플로(Connect → Evaluation → Schema Conversion → Data Migration →
    Validation → Cut over). UI가 보이면 배포 완료이며, **Connect**에서 소스 DB 자격증명을
    입력해 시작합니다.
@@ -444,7 +444,7 @@ aws cloudformation describe-stacks --stack-name mysql-dsql-migrator \
 주요 출력: `LoadBalancerDns`, `AppUrl`, `ClusterName`, `ServiceName`,
 `TaskRoleArn`, `CognitoHostedUiDomain`.
 
-브라우저에서 **`AppUrl`**로 접속(VPC 내부에서)하면 **MySQL → Aurora DSQL Migration Tool**
+브라우저에서 **`AppUrl`**로 접속(VPC 내부에서)하면 **Aurora DSQL Migration Tool**
 UI가 뜹니다 — **Connect**로 시작하는 안내형 워크플로(Connect → Evaluation →
 Schema Conversion → Data Migration → Validation → Cut over). UI가 보이면 배포 성공이며,
 **Connect**에서 소스 DB 자격증명을 입력해 시작합니다.
@@ -479,7 +479,7 @@ Schema Conversion → Data Migration → Validation → Cut over). UI가 보이�
 | `SourceSecretArn` | no | `""` | **옵션.** 기존 Secrets Manager 시크릿을 **재사용**할 때만 설정(`GetSecretValue` 범위 지정). 비워두면 UI에서 id/password 입력(일반적인 경우). |
 | `SourceDbSecurityGroupId` | no* | `""` | 소스 DB SG; raw CIDR보다 **선호(권장) egress 타깃**. *이것/`SourceDbCidr` 중 하나 필수. |
 | `SourceDbCidr` | no* | `""` | 소스 DB CIDR(SG id 없을 때 사용). *이것/`SourceDbSecurityGroupId` 중 하나 필수. |
-| `SourceDbPort` | no | `3306` | 소스 MySQL 포트. |
+| `SourceDbPort` | no | `3306` | 소스 DB 포트 — **`3306`은 MySQL, `5432`는 PostgreSQL** (PostgreSQL 소스는 기본값을 재정의). |
 | `HttpsEgressCidr` | no | `0.0.0.0/0` | 태스크 아웃바운드 443(AWS API: DSQL 토큰·Secrets Manager·ECR·CloudWatch·Bedrock) + 5432(DSQL)의 **대상** CIDR. **권장: 기본값 `0.0.0.0/0` 그대로** — 태스크가 NAT/IGW로 퍼블릭 AWS 엔드포인트에 도달. 좁히기(예: 내 VPC CIDR)는 위 서비스들을 *전부* 인터페이스 VPC 엔드포인트(PrivateLink)로 둘 때만; 엔드포인트 없이 좁히면 이미지 pull/DSQL이 막혀 태스크가 기동 실패합니다. |
 | `EnableCognitoAuth` | no | `false` | ALB가 Cognito(OIDC)로 인증. 기본 `false`: internal ALB(또는 내 CIDR로 범위 제한한 ALB)가 접근 게이트이고 운영자가 이미 IAM/DB 권한을 보유하므로 로그인 불필요. **`AllowedIngressCidr=0.0.0.0/0`일 때만 필수(강제됨).** `true`면 `CognitoDomainPrefix`와 `CognitoAdminEmail` **둘 다** 필요. |
 | `AppDomainName` | no | `""` | ALB 앞단 DNS 이름(인증서와 일치해야 함). **비워 두면** ALB 자체 DNS 이름을 Cognito 콜백 호스트로 사용 — 커스텀 도메인이나 Route 53 레코드가 필요 없습니다. |
@@ -811,7 +811,7 @@ ALB도 없습니다. UI에는 **SSM 포트포워드**로 접속합니다(호스�
   **첫 부팅 때 `uv`·CPython·Python 휠을 받고 저장소를 클론하는 것을 모두 공개 인터넷**
   (astral.sh · PyPI · GitHub)에서 하며 — 이후 소스 DB·DSQL·AWS API 접근도 같은 egress로
   처리합니다. VPC 엔드포인트만으로는 안 됩니다(이 공개 소스들은 PrivateLink로 받을 수 없음).
-  **소스 MySQL과 같은 VPC**에 두세요(CDC를 쓸 거면 MSK와도 같은 VPC).
+  **소스 DB(MySQL 또는 PostgreSQL)와 같은 VPC**에 두세요(CDC를 쓸 거면 MSK와도 같은 VPC).
 - **AWS CLI + Session Manager 플러그인**(내 컴퓨터에) — UI를 여는 방법입니다(ALB나 공용
   엔드포인트가 없어 SSM으로 포트포워드).
   [설치 안내](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html).
@@ -831,7 +831,7 @@ ALB도 없습니다. UI에는 **SSM 포트포워드**로 접속합니다(호스�
 | `VpcId` | 예 | — | 소스 DB / MSK의 VPC(DSQL과 동일 리전). |
 | `HostSubnetId` | 예 | — | `VpcId`의 **NAT-egress 프라이빗 서브넷**, MSK와 같은 위치. |
 | `DsqlClusterArn` | 예 | — | 타깃 DSQL 클러스터(`dsql:DbConnect` 범위). |
-| `SourceDbSecurityGroupId` / `SourceDbCidr` | 하나 필수 | `""` | 소스 MySQL로의 호스트 egress를 개방(원시 CIDR보다 SG 선호). |
+| `SourceDbSecurityGroupId` / `SourceDbCidr` | 하나 필수 | `""` | 소스 DB로의 호스트 egress를 개방(원시 CIDR보다 SG 선호). |
 | `SourceMode` | 아니오 | `git` | `git`(공개 HTTPS로 `SourceRepoUrl@SourceRepoRef` 클론) 또는 `s3`(`SourceS3Uri` tarball). |
 | `SourceS3Uri` | `s3`면 필수 | `""` | 저장소 루트의 `s3://…/source.tar.gz` — 임시 "내 로컬 복사본 실행" 경로. |
 | `MskEgressCidr` | 아니오 | `0.0.0.0/0` | 인프로세스 시드를 위해 호스트가 MSK 9098에 도달할 CIDR; 최소 권한을 위해 커넥터 서브넷 CIDR로 좁히기. |

@@ -1,4 +1,4 @@
-# デプロイガイド — MySQL → Aurora DSQL 移行ツール (app-stack)
+# デプロイガイド — MySQL / PostgreSQL → Aurora DSQL 移行ツール (app-stack)
 
 _言語: [English](DEPLOYMENT.md) | [한국어](DEPLOYMENT.ko.md) | **日本語**_
 
@@ -13,7 +13,7 @@ _言語: [English](DEPLOYMENT.md) | [한국어](DEPLOYMENT.ko.md) | **日本語*
 1 つを選んでください — 各モードには以下に専用セクションがあります。
 
 - **[ローカルで実行](#ローカルで実行)** — `uv run …`、**インフラ不要。** ご自身のマシンがエンジンに
-  なるため、ソース MySQL と DSQL の**両方**に到達できる必要があります。評価・小規模な移行に最適。
+  なるため、ソース（MySQL または PostgreSQL）と DSQL の**両方**に到達できる必要があります。評価・小規模な移行に最適。
   **👉 まずこちらを試してください。**
 - **[ECS Fargate にデプロイ](#ecs-fargate-にデプロイ)** — **実運用・大規模な移行に推奨。** ご自身の
   VPC 内の単一タスク **ECS Fargate** サービスが **HTTPS ALB** の背後で動作し、イメージは **ECR**
@@ -54,7 +54,7 @@ NiceGUI ready to go on http://127.0.0.1:8080
 UI はご自身のマシンで動作し（ブラウザ → `127.0.0.1:8080`）、**移行そのものもそこで実行
 されます**。ご自身のワークステーションがソースを読み取り DSQL に書き込むエンジンとなるため、
 すべてのデータがご自身のマシンとそのネットワークを通過します。つまり、**ご自身のデスクトップが
-ソース MySQL _と_ ターゲット Aurora DSQL の _両方_ に到達できる必要があります** —
+ソース（MySQL または PostgreSQL）_と_ ターゲット Aurora DSQL の _両方_ に到達できる必要があります** —
 プライベートなソースには SSM ポートフォワード / VPN が必要で、ご自身のマシンには
 DSQL リージョンへのアウトバウンド HTTPS + AWS 認証情報が必要です。インフラ不要 —
 評価 / 小規模な移行 / 開発に最適です。これはホスティングされたアーキテクチャ
@@ -121,7 +121,7 @@ VPC 内から — VPN、Direct Connect、または SSM ポートフォワード�
 | 何 | パラメータ | 補足 |
 | --- | --- | --- |
 | アクセス | — | AWS Console（推奨）または AWS CLI v2 — IAM ロール、ECS、ALB、セキュリティグループ、CloudWatch Logs を作成できること。イメージのビルドは不要 — ECR Public から取得します。 |
-| VPC | `VpcId` | ソース MySQL の VPC が理想的、**DSQL と同一リージョン**。以下のサブネットはここから選びます。 |
+| VPC | `VpcId` | ソース DB の VPC が理想的、**DSQL と同一リージョン**。以下のサブネットはここから選びます。 |
 | ALB サブネット 2 つ + タスクサブネット 2 つ | `AlbSubnetIds` / `ServiceSubnetIds` | 異なる AZ。タスクサブネットは**443 の egress**が必要。 |
 | ACM 証明書 | `CertificateArn` | 同一リージョン。ドメインがない場合は `AWS_REGION=<region> deploy/create_test_cert.sh` で自己署名のテスト証明書を作成してください。 |
 | DSQL クラスター ARN | `DsqlClusterArn` | 移行のターゲット。 |
@@ -145,7 +145,7 @@ VPC 内から — VPN、Direct Connect、または SSM ポートフォワード�
 #### フォームを入力する前に知っておくこと
 
 > [!IMPORTANT]
-> **VPC から始めてください。** ソースの RDS/Aurora MySQL がすでに存在する VPC を使用してください
+> **VPC から始めてください。** ソースの RDS/Aurora（MySQL または PostgreSQL）がすでに存在する VPC を使用してください
 > — DSQL と同一リージョン — ここで選ぶサブネット/証明書は AWS 自体が要求するものです（ALB と
 > Fargate タスクは必ずサブネットに配置する必要があり、HTTPS リスナーには証明書が必要です）。
 > **この VPC はこのアカウントが所有している必要があります** — RAM 共有（クロスアカウント）の
@@ -157,7 +157,7 @@ VPC 内から — VPN、Direct Connect、または SSM ポートフォワード�
 | オプション | パラメータ | 必要になる場合 |
 | --- | --- | --- |
 | **ソースシークレット ARN** | `SourceSecretArn` | 既存の Secrets Manager シークレットをソース認証情報として**再利用する場合のみ**。空のままにすると UI でユーザー名/パスワードを使用します（一般的なケース）。 |
-| **ソース DB への到達性** | `SourceDbSecurityGroupId`（推奨） / `SourceDbCidr` | タスクが `SourceDbPort` でソース MySQL への egress を得られるよう、**少なくとも一方を指定**してください。`SourceDbSecurityGroupId` は egress をソース DB の SG に絞り込みます。SG id がない場合は `SourceDbCidr` を使用します。両方とも空だとデプロイは拒否されます（タスクにソースへの経路がなくなるため）。 |
+| **ソース DB への到達性** | `SourceDbSecurityGroupId`（推奨） / `SourceDbCidr` | タスクが `SourceDbPort` でソース DB への egress を得られるよう、**少なくとも一方を指定**してください。`SourceDbSecurityGroupId` は egress をソース DB の SG に絞り込みます。SG id がない場合は `SourceDbCidr` を使用します。両方とも空だとデプロイは拒否されます（タスクにソースへの経路がなくなるため）。 |
 | **カスタムドメイン** | `AppDomainName` | ご自身の Route 53 ドメインで ALB をフロントする場合のみ。 |
 | **公開アクセス / Cognito** | `AlbScheme`, `AllowedIngressCidr`, `EnableCognitoAuth`, `CognitoDomainPrefix` | UI を公開する場合のみ。デフォルトは `internal`（ログインなし）のままです。 |
 | **AI アシスト** | `EnableAiAssist`, `BedrockModelId`, `BedrockRegion` | Amazon Bedrock 支援の変換を有効化する場合のみ（モデルを選択。IAM スコープは自動的に導出）。 |
@@ -170,7 +170,7 @@ VPC 内から — VPN、Direct Connect、または SSM ポートフォワード�
 ### 2. app-stack のデプロイ
 
 `deploy/cloudformation.yaml` をデプロイする 3 つの方法があります — いずれか 1 つを
-選んでください。どちらも同じスタックを作成します。パラメータのリファレンスは
+選んでください。いずれも同じスタックを作成します。パラメータのリファレンスは
 **パラメータリファレンス** セクションにあります。
 
 #### 最も簡単 — AI コーディングエージェントにデプロイさせる
@@ -256,12 +256,12 @@ id を入力する代わりに**ご自身のアカウントから選択**しま�
 
 | フィールド | 入力する値 |
 | --- | --- |
-| `VpcId` | ドロップダウン — ソース MySQL が存在する VPC。 |
+| `VpcId` | ドロップダウン — ソース DB が存在する VPC。 |
 | `AlbSubnetIds` | サブネットのマルチセレクト — **異なる AZ の 2 つのサブネット**（下のサブネットの注記を参照）。 |
 | `ServiceSubnetIds` | サブネットのマルチセレクト — **異なる AZ の 2 つのプライベートサブネット**（プライベート/NAT サブネットがない場合は ALB サブネットを流用し `AssignPublicIp=ENABLED` を設定）。 |
 | `CertificateArn` | HTTPS 用の ACM 証明書 ARN — **ドメインがない場合は、すぐ下のコマンドを参照。** |
 | `DsqlClusterArn` | ターゲットの Aurora DSQL クラスター ARN。 |
-| `SourceDbSecurityGroupId`（または `SourceDbCidr`） | いずれか一方 — タスクのソース MySQL への egress の範囲を指定します。セキュリティグループ id を優先し、ない場合のみ CIDR を使用してください。 |
+| `SourceDbSecurityGroupId`（または `SourceDbCidr`） | いずれか一方 — タスクのソース DB への egress の範囲を指定します。セキュリティグループ id を優先し、ない場合のみ CIDR を使用してください。 |
 
 > [!WARNING]
 > サブネットのドロップダウンは、ご自身の VpcId のものだけでなく、**リージョン内の
@@ -344,7 +344,7 @@ A か B のいずれかを選んでください:
    （VPC 内から到達してください。上記の「UI への到達」を参照）。
 
 **7. 開く — ツールが表示されるはずです。** ブラウザで `AppUrl` にアクセスします
-   （VPC 内から）。**MySQL → Aurora DSQL Migration Tool** の UI が読み込まれます —
+   （VPC 内から）。**Aurora DSQL Migration Tool** の UI が読み込まれます —
    **Connect** から始まるガイド付きワークフロー（Connect → Evaluation → Schema
    Conversion → Data Migration → Validation → Cut over）です。読み込まれれば
    デプロイは完了です。**Connect** でソース DB の認証情報を入力して開始します。
@@ -475,7 +475,7 @@ aws cloudformation describe-stacks --stack-name mysql-dsql-migrator \
 主な出力: `LoadBalancerDns`、`AppUrl`、`ClusterName`、`ServiceName`、
 `TaskRoleArn`、`CognitoHostedUiDomain`。
 
-ブラウザで **`AppUrl`** を開きます（VPC 内から）。**MySQL → Aurora DSQL
+ブラウザで **`AppUrl`** を開きます（VPC 内から）。**Aurora DSQL
 Migration Tool** の UI が読み込まれます — **Connect** から始まるガイド付き
 ワークフロー（Connect → Evaluation → Schema Conversion →
 Data Migration → Validation → Cut over）です。UI が表示されればデプロイは
@@ -511,7 +511,7 @@ Data Migration → Validation → Cut over）です。UI が表示されれば�
 | `SourceSecretArn` | no | `""` | **オプション。** 既存の Secrets Manager シークレットをソース認証情報として**再利用する**場合のみ設定します（`GetSecretValue` のスコープを指定）。空のままにすると UI でユーザー名/パスワードを入力します（一般的なケース）。 |
 | `SourceDbSecurityGroupId` | no* | `""` | ソース DB の SG。生の CIDR よりも**推奨される（望ましい）egress ターゲット**。*これ / `SourceDbCidr` のいずれか一方が必須。 |
 | `SourceDbCidr` | no* | `""` | ソース DB の CIDR（SG id がない場合に使用）。*これ / `SourceDbSecurityGroupId` のいずれか一方が必須。 |
-| `SourceDbPort` | no | `3306` | ソース MySQL のポート。 |
+| `SourceDbPort` | no | `3306` | ソース DB ポート — **`3306` は MySQL、`5432` は PostgreSQL**（PostgreSQL ソースは既定値を上書き）。 |
 | `HttpsEgressCidr` | no | `0.0.0.0/0` | タスクのアウトバウンド 443（AWS API: DSQL トークン、Secrets Manager、ECR、CloudWatch、Bedrock）および 5432（DSQL）の宛先 CIDR。**推奨: デフォルトの `0.0.0.0/0` のまま**にする — タスクは NAT/IGW 経由でパブリックな AWS エンドポイントに到達します。絞り込み（例: ご自身の VPC CIDR へ）は、それらのサービス*すべて*をインターフェース VPC エンドポイント（PrivateLink）でフロントする場合にのみ行ってください。エンドポイントなしで絞り込むとイメージの取得 / DSQL がブロックされ、タスクは起動に失敗します。 |
 | `EnableCognitoAuth` | no | `false` | ALB が Cognito (OIDC) で認証します。デフォルトは `false`: internal ALB（またはご自身の CIDR に絞り込んだ ALB）がアクセスゲートであり、運用者はすでに IAM/DB の権限を保持しているため、ログインは不要です。**`AllowedIngressCidr=0.0.0.0/0` の場合にのみ必須（強制されます）。** `true` の場合は `CognitoDomainPrefix` と `CognitoAdminEmail` の **両方**が必要です。 |
 | `AppDomainName` | no | `""` | ALB をフロントする DNS 名（証明書と一致する必要があります）。**空のままにすると** ALB 自身の DNS 名を Cognito のコールバックホストとして使用します — カスタムドメインや Route 53 レコードは不要です。 |
@@ -879,7 +879,7 @@ ECR も ALB もありません。UI には **SSM ポートフォワード**で�
   **パブリック IP がなく**、**初回起動時に `uv`・CPython・Python ホイールの取得とリポジトリの
   クローンをすべて公開インターネット**（astral.sh · PyPI · GitHub）から行い、その後もソース
   DB・DSQL・AWS API へは同じ egress で到達します。VPC エンドポイントだけでは不十分です
-  （これらの公開ソースは PrivateLink では取得できません）。**ソース MySQL と同じ VPC**
+  （これらの公開ソースは PrivateLink では取得できません）。**ソース DB（MySQL または PostgreSQL）と同じ VPC**
   （CDC を使う場合は MSK とも同じ VPC）に配置してください。
 - **AWS CLI と Session Manager プラグイン**（ご自身のマシンに）— UI を開く手段です（ALB や
   公開エンドポイントはなく、SSM でポートフォワードします）。
@@ -901,7 +901,7 @@ ECR も ALB もありません。UI には **SSM ポートフォワード**で�
 | `VpcId` | はい | — | ソース DB / MSK の VPC（DSQL と同一リージョン）。 |
 | `HostSubnetId` | はい | — | `VpcId` の **NAT-egress プライベートサブネット**、MSK と同じ場所。 |
 | `DsqlClusterArn` | はい | — | ターゲット DSQL クラスター（`dsql:DbConnect` のスコープ）。 |
-| `SourceDbSecurityGroupId` / `SourceDbCidr` | いずれか必須 | `""` | ソース MySQL へのホスト egress を開放（生の CIDR より SG を推奨）。 |
+| `SourceDbSecurityGroupId` / `SourceDbCidr` | いずれか必須 | `""` | ソース DB へのホスト egress を開放（生の CIDR より SG を推奨）。 |
 | `SourceMode` | いいえ | `git` | `git`（公開 HTTPS で `SourceRepoUrl@SourceRepoRef` をクローン）または `s3`（`SourceS3Uri` の tarball）。 |
 | `SourceS3Uri` | `s3` の場合必須 | `""` | リポジトリルートの `s3://…/source.tar.gz` — 一時的な「ローカルコピーを実行」パス。 |
 | `MskEgressCidr` | いいえ | `0.0.0.0/0` | インプロセスシードのためにホストが MSK 9098 に到達する CIDR。最小権限のためコネクタサブネット CIDR に絞る。 |
