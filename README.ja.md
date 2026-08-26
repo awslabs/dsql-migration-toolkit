@@ -45,9 +45,9 @@ PostgreSQL は LSN）により、両者はギャップなく接続されます�
 **✅ できること**
 
 - **ガイド付き Web UI** — 移行全体をブラウザアプリ 1 つで進め、各ステップの状態を可視化。
-- **評価** — ソース MySQL スキーマを解析し、すべてのオブジェクトを分類
+- **評価** — ソーススキーマ（MySQL または PostgreSQL）を解析し、すべてのオブジェクトを分類
   （`AUTO` / `MANUAL` / `UNSUPPORTED`）。工数見積もりと名前の競合検出を含む。
-- **スキーマ変換** — MySQL の DDL を DSQL に変換（型マッピング、外部キー削除、非同期
+- **スキーマ変換** — ソーススキーマを DSQL DDL に変換（型マッピング、外部キー削除、非同期
   インデックス、PK 戦略）し、オブジェクトツリーでレビューしてから適用。
 - **Full Load** — 一貫性のあるスナップショットをバウンデッドメモリのバッチで DSQL へ
   ストリーミング。再開可能で、大規模テーブルに対応。
@@ -87,12 +87,12 @@ Web UI は **Connect** を準備ステップとし、5 つのステップで移�
 
 | ステップ | 内容 |
 | --- | --- |
-| Connect | ソース（RDS/Aurora MySQL）とターゲット（Aurora DSQL）の接続情報を入力。認証情報はセッション中のみメモリに保持し、終了時に破棄。 |
+| Connect | ソース（RDS/Aurora MySQL または PostgreSQL）とターゲット（Aurora DSQL）の接続情報を入力。認証情報はセッション中のみメモリに保持し、終了時に破棄。 |
 | 1. Evaluation | ソース**と**ターゲットのスキーマを解析し、互換性レポート（`AUTO`/`MANUAL`/`UNSUPPORTED`）を生成。工数見積もり・名前の競合検出・任意の AI 戦略提案を含む。 |
 | 2. Schema Conversion | オブジェクト一覧を表示し、ソースと変換後の DDL を並べて比較。ターゲットへの適用（SKIP / REPLACE）を選択。冪等なリトライに対応。 |
 | 3. Data Migration | 移行タイプ（**Full Load** のみ、または **CDC** 追加）を選択。前提条件チェックとテーブル選択の後にスナップショットを実行（ウォーターマーク → エクスポート → ロード、テーブルごとの進捗 + エラーログ）。CDC タイプではストリーミングインフラもここでデプロイされ、約 15〜20 分の作成が Full Load と**並行して**進む。 |
 | 4. Validation | ウォーターマーク時点でソースとターゲットを比較。行数/チェックサムの結果とドリフトを報告し、レポートをエクスポート。 |
-| 5. Cut over | Validation 通過後にアプリの接続先を MySQL → DSQL に切り替える運用ランブック。ツールが代行しない唯一のステップ。MySQL ソースはロールバック用に保持。 |
+| 5. Cut over | Validation 通過後にアプリの接続先を DSQL に切り替える運用ランブック。ツールが代行しない唯一のステップ。ソース（MySQL または PostgreSQL）はロールバック用に保持。 |
 
 各ステップは状態（未開始 / 進行中 / 完了 / 失敗）を表示し、あるステップを完了すると次が
 アンロックされ、完了済みのステップは再実行できます。オプションの AI アシスタントを全ステップで
@@ -129,7 +129,7 @@ Web UI は **Connect** を準備ステップとし、5 つのステップで移�
 
 ### ローカル（最速）
 
-ご自身のマシンが移行エンジンになるため、ソース MySQL と DSQL の**両方**に到達できる
+ご自身のマシンが移行エンジンになるため、ソース（MySQL または PostgreSQL）と DSQL の**両方**に到達できる
 必要があります（プライベートなソースには VPN / SSM フォワード）。AWS 認証情報は
 シェルで利用可能であれば十分です（`aws sso login`、`AWS_PROFILE=…`）。
 
@@ -202,7 +202,7 @@ VPC 内のプライベートなデータ経路（ソース → EC2 → DSQL）�
 <details>
 <summary><b>使用する AWS サービス</b>（app-stack は常時、cdc-stack は任意）</summary>
 
-移行の**ソース**（RDS / Aurora MySQL）は顧客所有であり、両スタックの外部です。Debezium は
+移行の**ソース**（RDS / Aurora MySQL または PostgreSQL）は顧客所有であり、両スタックの外部です。Debezium は
 MSK Connect *上で*動作するオープンソースソフトウェアです。
 
 **コントロールプレーンと共有（app-stack）**
@@ -240,8 +240,8 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 | --- | --- |
 | Amazon MSK (Serverless) | Kafka のバックボーン。PK でパーティション分割されたテーブルごとのトピックと、DLQ トピック。 |
 | Amazon MSK Connect | Debezium ソースとカスタム DSQL シンクコネクタをホストするマネージド Kafka Connect（JSON コンバータ、`schemas.enable=true` — スキーマレジストリ不要）。 |
-| AWS Lambda | VPC 内のオフセットシーダー（CFN カスタムリソース）— ギャップのない引き継ぎのため Debezium の GTID ウォーターマークを自動投入。 |
-| Amazon VPC | CDC は指定した VPC（通常はソースの VPC）で動作し、MySQL にプライベートに到達 — 必要に応じてスタックがその中に専用サブネット + NAT を作成。 |
+| AWS Lambda | VPC 内のオフセットシーダー（CFN カスタムリソース）— ギャップのない引き継ぎのため Debezium ウォーターマーク（MySQL GTID / PostgreSQL LSN）を自動投入。 |
+| Amazon VPC | CDC は指定した VPC（通常はソースの VPC）で動作し、ソースにプライベートに到達 — 必要に応じてスタックがその中に専用サブネット + NAT を作成。 |
 
 </details>
 
@@ -251,14 +251,17 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 
 ## 前提条件
 
-- スキーマとデータの読み取り権限を持つユーザーが設定されたソース **RDS / Aurora MySQL**。
+- スキーマとデータの読み取り権限を持つユーザーが設定されたソース **RDS / Aurora MySQL** *または* **PostgreSQL**。
+  **対応エンジン/バージョン**（エンドツーエンドで検証済み）: **RDS for MySQL** / **Aurora MySQL**
+  5.7 / 8.0 / 8.4（5.7 は Extended Support 対象だがソースとして完全サポート）、および **RDS for
+  PostgreSQL** / **Aurora PostgreSQL** 13–16（CDC は `pgoutput` による論理レプリケーションが必要）。
 - ソースと**同一リージョン**のターゲット **Aurora DSQL** クラスター（IAM トークン認証、パスワードなし）。
 - 標準チェーン（環境変数 / `~/.aws` / プロファイル）で利用可能な、`dsql:DbConnect`（`admin`
   ユーザーは `dsql:DbConnectAdmin`）権限を持つ **AWS 認証情報**。オプションで
   `secretsmanager:GetSecretValue`、`bedrock:InvokeModel`。
 - **ローカル実行時のみ:** Python 3.10 以降（3.12 固定）、[`uv`](https://docs.astral.sh/uv/)。
 
-> ソース DB・CDC のセットアップ（binlog など）を含む完全なチェックリストは
+> ソース DB・CDC のセットアップ（binlog / 論理レプリケーション など）を含む完全なチェックリストは
 > [ユーザーマニュアル §1.1](docs/manual/ja/01-setup.md) を参照。
 
 ---
@@ -309,7 +312,7 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 
 > [!IMPORTANT]
 > **単一リージョンのみサポート。** 本ツールは Aurora DSQL が利用可能な任意のリージョンで
-> 動作しますが、ソース（RDS / Aurora MySQL）とターゲット（Aurora DSQL）は**同一リージョン**
+> 動作しますが、ソース（RDS / Aurora MySQL または PostgreSQL）とターゲット（Aurora DSQL）は**同一リージョン**
 > に配置する必要があります（リージョンは DSQL エンドポイントから導出）。プロビジョニングされる
 > すべてのインフラ — 特にソースへプライベートに到達する CDC VPC — もそのリージョンに
 > デプロイされます。クロスリージョン構成はサポートされません。

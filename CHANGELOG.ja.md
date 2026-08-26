@@ -5,6 +5,18 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.397
+
+### 変更 (Changed)
+
+- **ECR Public イメージを `0.1.396` で再公開し、`ContainerImageUri` の既定値をそこへ
+  repoint** しました。これにより fresh-clone の既定デプロイが PostgreSQL 対応イメージを使用
+  します(既定値は以前、PostgreSQL ソース対応より前の `0.1.393` のままでした)。
+- **README(en/ko/ja)が PostgreSQL をサポート対象ソースとして全体的に記載**します — はじめに、
+  ワークフロー、前提条件(RDS/Aurora PostgreSQL 13–16)、クイックスタート、AWS サービス / CDC の
+  注記 — さらに「simple architecture」図が MySQL / PostgreSQL ソースと `binlog / WAL (CDC)` の
+  経路を示します。
+
 ## v0.1.396
 
 ### 追加 (Added)

@@ -42,9 +42,9 @@ PostgreSQL은 LSN)가 둘을 무손실로 이어 줍니다.
 **✅ 할 수 있는 것**
 
 - **가이드형 웹 UI** — 전체 마이그레이션을 브라우저 앱 하나에서 진행하며 단계별 상태를 표시.
-- **평가** — 소스 MySQL 스키마를 introspect해 모든 객체를 분류(`AUTO`/`MANUAL`/`UNSUPPORTED`)하고,
+- **평가** — 소스 스키마(MySQL 또는 PostgreSQL)를 introspect해 모든 객체를 분류(`AUTO`/`MANUAL`/`UNSUPPORTED`)하고,
   작업량 추정과 이름 충돌 감지를 함께 제공.
-- **스키마 변환** — MySQL DDL을 DSQL로 변환(타입 매핑, 외래 키 제거, 비동기 인덱스, PK 전략)하고,
+- **스키마 변환** — 소스 스키마를 DSQL DDL로 변환(타입 매핑, 외래 키 제거, 비동기 인덱스, PK 전략)하고,
   객체 트리에서 검토한 뒤 적용.
 - **Full Load** — 일관성 스냅샷을 바운디드 메모리 배치로 스트리밍 적재. 재개 가능하며 대용량 테이블
   대응.
@@ -78,12 +78,12 @@ PostgreSQL은 LSN)가 둘을 무손실로 이어 줍니다.
 
 | 단계 | 하는 일 |
 | --- | --- |
-| Connect | 소스(RDS/Aurora MySQL)와 타깃(Aurora DSQL) 연결 정보 입력. 자격증명은 세션별 메모리에만 있다가 세션 종료 시 폐기. |
+| Connect | 소스(RDS/Aurora MySQL 또는 PostgreSQL)와 타깃(Aurora DSQL) 연결 정보 입력. 자격증명은 세션별 메모리에만 있다가 세션 종료 시 폐기. |
 | 1. Evaluation | 소스 **와** 타깃을 introspect해 호환성 리포트(`AUTO`/`MANUAL`/`UNSUPPORTED`) 생성. 작업량 추정·이름 충돌 감지·선택적 AI 전략 포함. |
 | 2. Schema Conversion | 객체를 탐색하고 소스 vs 변환 DDL을 나란히 비교, 타깃에 적용(SKIP / REPLACE), 안전 재시도 포함. |
 | 3. Data Migration | 마이그레이션 타입(**Full Load**만, 또는 **CDC** 추가)을 선택하고, 사전 점검·테이블 선택 후 스냅샷 실행(워터마크 → export → 로드, 테이블별 진행률 + 에러 로그). CDC 타입이면 스트리밍 인프라도 여기서 배포되므로 약 15~20분의 생성이 Full Load와 **동시에** 진행됩니다. |
 | 4. Validation | 워터마크 시점 기준으로 타깃을 소스와 비교 — 행 수/체크섬 결과와 드리프트를 보고, 리포트 export. |
-| 5. Cut over | Validation 통과 후 앱을 MySQL → DSQL로 전환하는 운영 런북 — 도구가 대신 실행하지 않는 유일한 단계. MySQL 소스는 롤백 앵커로 유지. |
+| 5. Cut over | Validation 통과 후 앱을 DSQL로 전환하는 운영 런북 — 도구가 대신 실행하지 않는 유일한 단계. 소스(MySQL 또는 PostgreSQL)는 롤백 앵커로 유지. |
 
 각 단계는 상태(시작 안 함 / 진행 중 / 완료 / 실패)를 표시하며, 한 단계를 완료하면 다음 단계가
 열리고 완료된 단계는 다시 실행할 수 있습니다. 선택적 AI 어시스턴트를 모든 단계에서 온디맨드로 쓸 수
@@ -119,7 +119,7 @@ PostgreSQL은 LSN)가 둘을 무손실로 이어 줍니다.
 
 ### 로컬 (가장 빠름)
 
-내 머신이 마이그레이션 엔진이므로, 소스 MySQL과 DSQL **양쪽**에 도달할 수 있어야 합니다
+내 머신이 마이그레이션 엔진이므로, 소스(MySQL 또는 PostgreSQL)와 DSQL **양쪽**에 도달할 수 있어야 합니다
 (프라이빗 소스는 VPN/SSM 포워딩). AWS 자격증명은 실행하는 셸에서 사용 가능하면 됩니다
 (`aws sso login`, `AWS_PROFILE=…`).
 
@@ -186,7 +186,7 @@ EC2 호스트에서 소스로**(systemd + SSM 포트포워드, ALB/ECR 없음) �
 <details>
 <summary><b>사용되는 AWS 서비스</b> (app-stack은 항상, cdc-stack은 선택)</summary>
 
-마이그레이션 **소스**(RDS / Aurora MySQL)는 고객 소유이며 두 스택 모두와 무관합니다.
+마이그레이션 **소스**(RDS / Aurora MySQL 또는 PostgreSQL)는 고객 소유이며 두 스택 모두와 무관합니다.
 Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입니다.
 
 **컨트롤 플레인 & 공유 (app-stack)**
@@ -224,8 +224,8 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 | --- | --- |
 | Amazon MSK (Serverless) | Kafka 백본: PK로 파티셔닝된 테이블당 토픽 + DLQ 토픽. |
 | Amazon MSK Connect | Debezium 소스와 커스텀 DSQL 싱크 커넥터를 호스팅하는 관리형 Kafka Connect(JSON 컨버터, `schemas.enable=true` — 스키마 레지스트리 불필요). |
-| AWS Lambda | in-VPC 오프셋 시더(CFN 커스텀 리소스) — 무손실 핸드오프를 위해 Debezium GTID 워터마크를 자동 시드. |
-| Amazon VPC | CDC는 제공한 VPC(보통 소스의 VPC)에서 실행되어 MySQL에 프라이빗하게 도달 — 필요 시 스택이 그 안에 전용 서브넷 + NAT를 생성. |
+| AWS Lambda | in-VPC 오프셋 시더(CFN 커스텀 리소스) — 무손실 핸드오프를 위해 Debezium 워터마크(MySQL GTID / PostgreSQL LSN)를 자동 시드. |
+| Amazon VPC | CDC는 제공한 VPC(보통 소스의 VPC)에서 실행되어 소스에 프라이빗하게 도달 — 필요 시 스택이 그 안에 전용 서브넷 + NAT를 생성. |
 
 </details>
 
@@ -235,14 +235,17 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 
 ## 사전 요구사항
 
-- 스키마·데이터를 읽을 수 있는 사용자를 가진 소스 **RDS / Aurora MySQL**.
+- 스키마·데이터를 읽을 수 있는 사용자를 가진 소스 **RDS / Aurora MySQL** 또는 **PostgreSQL**.
+  **지원 엔진/버전**(end-to-end 검증됨): **RDS for MySQL** / **Aurora MySQL** 5.7 / 8.0 / 8.4
+  (5.7은 Extended Support이지만 소스로 완전 지원), 그리고 **RDS for PostgreSQL** / **Aurora
+  PostgreSQL** 13–16 (CDC는 `pgoutput` 논리 복제 필요).
 - 소스와 **동일 리전**의 타깃 **Aurora DSQL** 클러스터(IAM 토큰 인증, 비밀번호 없음).
 - 표준 체인(환경 변수 / `~/.aws` / 프로필)으로 도달 가능하고 `dsql:DbConnect`(admin 사용자는
   `dsql:DbConnectAdmin`) 권한이 있는 **AWS 자격증명**. 선택적으로 `secretsmanager:GetSecretValue`,
   `bedrock:InvokeModel`.
 - **로컬 실행 시에만:** Python 3.10+(3.12 고정), [`uv`](https://docs.astral.sh/uv/).
 
-> 소스 DB·CDC 설정(binlog 등)을 포함한 전체 체크리스트:
+> 소스 DB·CDC 설정(binlog / 논리 복제 등)을 포함한 전체 체크리스트:
 > [사용자 매뉴얼 §1.1](docs/manual/ko/01-setup.md).
 
 ---
@@ -292,7 +295,7 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 
 > [!IMPORTANT]
 > **단일 리전만 지원.** 이 도구는 Aurora DSQL을 제공하는 모든 리전에서 동작하지만, 소스(RDS /
-> Aurora MySQL)와 타깃(Aurora DSQL)은 **동일 리전에 있어야 하며**(리전은 DSQL 엔드포인트에서
+> Aurora MySQL 또는 PostgreSQL)와 타깃(Aurora DSQL)은 **동일 리전에 있어야 하며**(리전은 DSQL 엔드포인트에서
 > 도출), 프로비저닝되는 모든 인프라 — 특히 소스에 프라이빗하게 도달해야 하는 CDC VPC — 가 그
 > 리전에 배포됩니다. 크로스 리전 소스/타깃은 지원되지 않습니다.
 

@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.397
+
+### Changed
+
+- **Republished the ECR Public image at `0.1.396` and repointed the
+  `ContainerImageUri` default to it**, so a fresh-clone default deploy runs a
+  PostgreSQL-capable image (the default previously lagged at `0.1.393`, before PostgreSQL
+  source support).
+- **README (en/ko/ja) now documents PostgreSQL as a supported source throughout** —
+  intro, workflow, prerequisites (RDS/Aurora PostgreSQL 13–16), quick start, and the
+  AWS-services / CDC notes — and the "simple architecture" diagram shows a MySQL /
+  PostgreSQL source with a `binlog / WAL (CDC)` path.
+
 ## v0.1.396
 
 ### Added

@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.397
+
+### 변경 (Changed)
+
+- **ECR Public 이미지를 `0.1.396`으로 재게시하고 `ContainerImageUri` 기본값을 거기로
+  repoint**했습니다. 이제 fresh-clone 기본 배포가 PostgreSQL 지원 이미지를 사용합니다
+  (기본값이 이전엔 PostgreSQL 소스 지원 이전 버전인 `0.1.393`에 머물러 있었습니다).
+- **README(en/ko/ja)가 PostgreSQL을 지원 소스로 전반에 걸쳐 문서화**합니다 — 소개, 워크플로우,
+  사전 요구사항(RDS/Aurora PostgreSQL 13–16), 빠른 시작, AWS 서비스 / CDC 노트 — 그리고
+  "simple architecture" 다이어그램이 MySQL / PostgreSQL 소스와 `binlog / WAL (CDC)` 경로를
+  보여줍니다.
+
 ## v0.1.396
 
 ### 추가 (Added)

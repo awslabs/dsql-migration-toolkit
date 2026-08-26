@@ -45,11 +45,11 @@ tool, and an optional continuous **CDC** stream on managed MSK Connect. A waterm
 
 - **Guided web UI** — drives the whole migration from one browser app, with visible
   per-step status.
-- **Assessment** — introspects the source MySQL schema and classifies every object
-  (`AUTO` / `MANUAL` / `UNSUPPORTED`), with effort estimates and name-conflict detection.
-- **Schema conversion** — converts MySQL DDL to DSQL (type mapping, foreign-key removal,
-  asynchronous indexes, primary-key strategies) and applies it after your review from an
-  object tree.
+- **Assessment** — introspects the source schema (MySQL or PostgreSQL) and classifies every
+  object (`AUTO` / `MANUAL` / `UNSUPPORTED`), with effort estimates and name-conflict detection.
+- **Schema conversion** — converts the source schema to DSQL DDL (type mapping, foreign-key
+  removal, asynchronous indexes, primary-key strategies) and applies it after your review from
+  an object tree.
 - **Full Load** — streams a consistent snapshot into DSQL in bounded-memory batches;
   resumable and built for large tables.
 - **Change data capture (CDC)** — optional continuous replication that keeps the target
@@ -88,12 +88,12 @@ The web UI guides you through five steps, with **Connect** as the preliminary st
 
 | Step | What it does |
 | --- | --- |
-| Connect | Enter source (RDS/Aurora MySQL) and target (Aurora DSQL) connection details. Credentials stay in per-session memory and are discarded on session end. |
+| Connect | Enter source (RDS/Aurora MySQL or PostgreSQL) and target (Aurora DSQL) connection details. Credentials stay in per-session memory and are discarded on session end. |
 | 1. Evaluation | Introspect source **and** target, produce a compatibility report (`AUTO`/`MANUAL`/`UNSUPPORTED`) with effort estimates and name-conflict detection, plus optional AI strategy. |
 | 2. Schema Conversion | Browse objects, view source-vs-converted DDL side by side, apply to target (SKIP / REPLACE) with idempotent retry. |
 | 3. Data Migration | Choose the migration type (**Full Load** only, or add **CDC**), run prerequisite checks and pick tables, then run the snapshot (watermark → export → load, per-table progress + error log). For a CDC type the streaming infrastructure is deployed here too, so its ~15–20 min create runs **while** the Full Load does. |
 | 4. Validation | Compare target against source as of the watermark; report row-count/checksum results and drift; export the report. |
-| 5. Cut over | Runbook for switching your app MySQL → DSQL once validation passes — the one step the tool doesn't execute. MySQL source kept as rollback anchor. |
+| 5. Cut over | Runbook for switching your app to DSQL once validation passes — the one step the tool doesn't execute. The source (MySQL or PostgreSQL) is kept as rollback anchor. |
 
 Each step shows its status (not started / in progress / done / failed); completing a
 step unlocks the next, and any completed step can be re-run. An optional AI assistant
@@ -130,9 +130,9 @@ EC2 host** (from source) when your account can't use containers/ECR or AWS Lambd
 
 ### Local (fastest)
 
-Your machine is the migration engine, so it must reach **both** the source MySQL
-and DSQL (a private source needs VPN / SSM forward). AWS credentials just need to
-be usable in your shell (`aws sso login`, `AWS_PROFILE=…`).
+Your machine is the migration engine, so it must reach **both** the source (MySQL or
+PostgreSQL) and DSQL (a private source needs VPN / SSM forward). AWS credentials just
+need to be usable in your shell (`aws sso login`, `AWS_PROFILE=…`).
 
 ```bash
 git clone https://github.com/awslabs/dsql-migration-toolkit.git
@@ -204,8 +204,8 @@ an **HTTPS ALB** (`internal` by default, optional Cognito), pulling the image fr
 <details>
 <summary><b>AWS services used</b> (app-stack always; cdc-stack optional)</summary>
 
-The migration **source** (RDS / Aurora MySQL) is customer-owned and external to
-both stacks. Debezium is open-source software running *on* MSK Connect.
+The migration **source** (RDS / Aurora MySQL or PostgreSQL) is customer-owned and external
+to both stacks. Debezium is open-source software running *on* MSK Connect.
 
 **Control plane & shared (app-stack)**
 
@@ -242,8 +242,8 @@ both stacks. Debezium is open-source software running *on* MSK Connect.
 | --- | --- |
 | Amazon MSK (Serverless) | Kafka backbone: per-table topics partitioned by PK, plus a DLQ topic. |
 | Amazon MSK Connect | Managed Kafka Connect hosting the Debezium source and our custom DSQL sink connector (JSON converter, `schemas.enable=true` — no schema registry). |
-| AWS Lambda | In-VPC offset seeder (CFN custom resource) auto-seeding the Debezium GTID watermark for a gapless handoff. |
-| Amazon VPC | CDC runs in the VPC you provide (typically the source's) to reach MySQL privately — optionally in its own subnets + NAT that the stack creates there. |
+| AWS Lambda | In-VPC offset seeder (CFN custom resource) auto-seeding the Debezium watermark (MySQL GTID / PostgreSQL LSN) for a gapless handoff. |
+| Amazon VPC | CDC runs in the VPC you provide (typically the source's) to reach the source privately — optionally in its own subnets + NAT that the stack creates there. |
 
 </details>
 
@@ -253,16 +253,17 @@ both stacks. Debezium is open-source software running *on* MSK Connect.
 
 ## Prerequisites
 
-- A source **RDS / Aurora MySQL** with a read-only schema/data user. **Supported
-  engines/versions** (validated end-to-end): **RDS for MySQL** 5.7 / 8.0 / 8.4 and
-  **Aurora MySQL** 5.7 / 8.0 / 8.4 (5.7 is on Extended Support but fully supported as a source).
+- A source **RDS / Aurora MySQL** *or* **PostgreSQL** with a read-only schema/data user.
+  **Supported engines/versions** (validated end-to-end): **RDS for MySQL** / **Aurora MySQL**
+  5.7 / 8.0 / 8.4 (5.7 is on Extended Support but fully supported as a source), and **RDS for
+  PostgreSQL** / **Aurora PostgreSQL** 13–16 (CDC requires logical replication via `pgoutput`).
 - A target **Aurora DSQL** cluster in the **same region** (IAM-token auth, no password).
 - **AWS credentials** via the standard chain (env / `~/.aws` / profile) with
   `dsql:DbConnect` (or `dsql:DbConnectAdmin` for the `admin` user). Optionally
   `secretsmanager:GetSecretValue` and `bedrock:InvokeModel`.
 - **Local run only:** Python 3.10+ (pinned 3.12) and [`uv`](https://docs.astral.sh/uv/).
 
-> Full checklist incl. source-DB / CDC setup (binlog, etc.):
+> Full checklist incl. source-DB / CDC setup (binlog / logical replication, etc.):
 > [User Manual §1.1](docs/manual/en/01-setup.md).
 
 ---
@@ -313,8 +314,8 @@ Optional streaming CDC is a separate **cdc-stack**.
 
 > [!IMPORTANT]
 > **Single-region only.** The tool works in any region offering Aurora DSQL, but
-> the source (RDS / Aurora MySQL) and target (Aurora DSQL) **must be in the same
-> region** (derived from the DSQL endpoint), and all provisioned infrastructure —
+> the source (RDS / Aurora MySQL or PostgreSQL) and target (Aurora DSQL) **must be in
+> the same region** (derived from the DSQL endpoint), and all provisioned infrastructure —
 > especially the CDC VPC, which must reach the source privately — deploys there.
 > Cross-region source/target is not supported.
 
