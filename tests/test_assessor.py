@@ -3,7 +3,7 @@
 
 """Unit tests for the compatibility assessment rule engine.
 
-Covers each rule (FK_UNSUPPORTED, TRIGGER_UNSUPPORTED, PROC_PLPGSQL,
+Covers each rule (FK_PRESERVED, TRIGGER_UNSUPPORTED, PROC_PLPGSQL,
 AUTO_INCREMENT, NO_PRIMARY_KEY, CI_COLLATION, PARTITIONED_TABLE, SPATIAL_TYPE,
 TINYINT_BOOLEAN, BIT_TYPE, YEAR_TYPE), the most-severe aggregation strategy,
 report export, and Property 8 (assessment completeness: every object is
@@ -72,7 +72,10 @@ _CONCERN_SEVERITY = {
 # ---------------------------------------------------------------------------
 
 
-def test_fk_unsupported_rule_classifies_table_manual() -> None:
+def test_fk_rule_flags_foreign_keys_as_advisory() -> None:
+    # Aurora DSQL enforces foreign keys (2026-08): the converter preserves + re-creates
+    # them after load, so an FK is ADVICE (RECOMMENDATION), not a required manual gap --
+    # it carries no effort and reads RECOMMENDED, like the AUTO_INCREMENT note.
     inventory = SourceInventory(
         tables=[
             _table_with_pk(
@@ -89,10 +92,11 @@ def test_fk_unsupported_rule_classifies_table_manual() -> None:
         ]
     )
     item = _item_for(_assess(inventory), "orders")
-    assert item.rule_id == "FK_UNSUPPORTED"
-    assert item.classification is Classification.MANUAL
+    assert item.rule_id == "FK_PRESERVED"
     assert "foreign key" in item.risk.lower()
-    assert item.effort is EffortLevel.SIMPLE
+    concern = next(c for c in item.concerns if c.rule_id == "FK_PRESERVED")
+    assert concern.is_advisory
+    assert item.effort is None
 
 
 def test_trigger_unsupported_rule_classifies_trigger_unsupported() -> None:
@@ -344,14 +348,13 @@ def test_most_severe_classification_wins_when_multiple_rules_match() -> None:
         ]
     )
     item = _item_for(_assess(inventory), "line_items")
-    # UNSUPPORTED outranks MANUAL.
+    # UNSUPPORTED outranks the advisory FK finding.
     assert item.classification is Classification.UNSUPPORTED
     assert item.rule_id == "NO_PRIMARY_KEY"
     # Findings from both rules are preserved in the combined recommendation.
-    assert "application layer" in item.recommendation.lower()
+    assert "foreign key" in item.recommendation.lower()
     assert "primary key" in item.recommendation.lower()
-    # The most demanding effort across matched rules wins: FK is SIMPLE, no-PK
-    # is MEDIUM, so the item is MEDIUM.
+    # The FK finding is advisory (no effort); the no-PK gap is MEDIUM and governs.
     assert item.effort is EffortLevel.MEDIUM
 
 
@@ -502,7 +505,7 @@ def test_default_rules_source_type_seam() -> None:
 def test_default_rules_contains_all_documented_rule_ids() -> None:
     rule_ids = {rule.rule_id for rule in default_rules()}
     assert rule_ids == {
-        "FK_UNSUPPORTED",
+        "FK_PRESERVED",
         "CHECK_CONSTRAINT_DROPPED",
         "FK_CASCADE_CDC_GAP",
         "TRIGGER_UNSUPPORTED",
@@ -909,7 +912,7 @@ def test_cascade_fk_rule_flags_the_cdc_gap_with_the_action_named() -> None:
     # The risk must name the concrete action, why CDC misses it, and that it is silent.
     assert "ON DELETE CASCADE" in finding.risk
     assert "binary log" in finding.risk
-    assert "no error" in finding.risk.lower()
+    assert "orphan" in finding.risk.lower()
     assert "#32506" in finding.risk
     # The recommendation must give the fix AND the interim safety net.
     assert "EXPLICIT" in finding.recommendation
@@ -939,7 +942,7 @@ def test_cascade_fk_rule_is_separate_from_the_plain_fk_finding() -> None:
     from dsql_migrator.core.assessor import CascadeForeignKeyRule, ForeignKeyRule
 
     inventory = SourceInventory(tables=[_child_table(_fk(on_delete="CASCADE"))])
-    assert [f.rule_id for f in ForeignKeyRule().evaluate(inventory)] == ["FK_UNSUPPORTED"]
+    assert [f.rule_id for f in ForeignKeyRule().evaluate(inventory)] == ["FK_PRESERVED"]
     assert [f.rule_id for f in CascadeForeignKeyRule().evaluate(inventory)] == [
         "FK_CASCADE_CDC_GAP"
     ]
@@ -1202,7 +1205,7 @@ def test_each_matched_rule_becomes_its_own_concern() -> None:
     rule_ids = [c.rule_id for c in item.concerns]
     assert len(item.concerns) >= 5, rule_ids
     for expected in (
-        "FK_UNSUPPORTED",
+        "FK_PRESERVED",
         "AUTO_INCREMENT",
         "CI_COLLATION",
         "ENUM_SET_TYPE",
@@ -1278,9 +1281,11 @@ def test_text_report_numbers_each_concern_with_its_fix() -> None:
         SourceInventory(tables=[_multi_rule_table()])
     )
     text = render_text_report(report)
-    assert "    1. [MANUAL] FK_UNSUPPORTED" in text
-    assert "       Risk: Foreign key constraints" in text
-    assert "       Fix:  Remove the foreign key" in text
+    # Each concern is numbered with its own Risk/Fix (real gaps) or Note (advice).
+    assert "    1. [" in text
+    # The preserved-FK finding is advisory: labeled RECOMMENDED and captioned Note.
+    assert "[RECOMMENDED] FK_PRESERVED" in text
+    assert "Note: Foreign key constraints" in text
     # The old single run-on Risk line is gone for a multi-rule object.
     assert "Aurora DSQL.; AUTO_INCREMENT column" not in text
 
@@ -1435,11 +1440,10 @@ def test_html_chart_lists_kinds_largest_first() -> None:
 def test_advisory_finding_does_not_inflate_the_effort_estimate() -> None:
     """Effort answers "how much work must I do", so optional advice must not raise it.
 
-    A table needing only a foreign-key workaround (SIMPLE, under two hours) was reported
-    as MEDIUM (two to six) purely because it ALSO carried the AUTO_INCREMENT throughput
-    recommendation -- and since MySQL tables overwhelmingly have an AUTO_INCREMENT key,
-    that inflated the estimate for the most common table shape there is. Measured on a
-    real 7-table schema, this moved two tables from MEDIUM back to SIMPLE.
+    A table needing only a SIMPLE workaround (here ON UPDATE CURRENT_TIMESTAMP, under two
+    hours) was reported as MEDIUM (two to six) purely because it ALSO carried the
+    AUTO_INCREMENT throughput recommendation -- and since MySQL tables overwhelmingly have
+    an AUTO_INCREMENT key, that inflated the estimate for the most common table shape.
     """
     from dsql_migrator.core.models import ConversionNoteKind
 
@@ -1449,18 +1453,14 @@ def test_advisory_finding_does_not_inflate_the_effort_estimate() -> None:
                 name="orders",
                 columns=[
                     ColumnDef(name="id", mysql_type="int", nullable=False),
-                    ColumnDef(name="customer_id", mysql_type="int"),
+                    ColumnDef(
+                        name="updated_at",
+                        mysql_type="datetime",
+                        auto_update_timestamp=True,
+                    ),
                 ],
                 primary_key=["id"],
                 auto_increment_column="id",
-                foreign_keys=[
-                    ForeignKeyDef(
-                        name="fk_customer",
-                        columns=["customer_id"],
-                        referenced_table="customers",
-                        referenced_columns=["id"],
-                    )
-                ],
             )
         ]
     )
@@ -1473,8 +1473,8 @@ def test_advisory_finding_does_not_inflate_the_effort_estimate() -> None:
     assert advisory.is_advisory
     assert advisory.effort is EffortLevel.MEDIUM
     # The real gap is SIMPLE, and that -- not the advice's MEDIUM -- governs the object.
-    assert by_rule["FK_UNSUPPORTED"].note_kind is ConversionNoteKind.LOSS
-    assert not by_rule["FK_UNSUPPORTED"].is_advisory
+    assert by_rule["ON_UPDATE_TIMESTAMP"].note_kind is ConversionNoteKind.LOSS
+    assert not by_rule["ON_UPDATE_TIMESTAMP"].is_advisory
     assert item.effort is EffortLevel.SIMPLE
 
 
@@ -1493,12 +1493,14 @@ def test_an_object_whose_only_finding_is_advice_carries_no_effort() -> None:
 
 
 def test_findings_default_to_loss_so_every_other_rule_is_unchanged() -> None:
-    # LOSS is what every rule historically meant; only AUTO_INCREMENT opts out. A rule
-    # that silently became advisory would quietly drop out of the effort estimate.
+    # LOSS is what every rule historically meant; only the two "converts cleanly, here's
+    # advice" rules opt out -- AUTO_INCREMENT (throughput) and FK_PRESERVED (Aurora DSQL
+    # enforces FKs now). A rule that silently became advisory would quietly drop out of
+    # the effort estimate.
     inventory = SourceInventory(tables=[_multi_rule_table()])
     item = _item_for(_assess(inventory), "orders")
     advisory = {c.rule_id for c in item.concerns if c.is_advisory}
-    assert advisory == {"AUTO_INCREMENT"}, advisory
+    assert advisory == {"AUTO_INCREMENT", "FK_PRESERVED"}, advisory
 
 
 def test_text_export_labels_an_advisory_finding_as_recommended() -> None:
@@ -1508,9 +1510,11 @@ def test_text_export_labels_an_advisory_finding_as_recommended() -> None:
     text = render_text_report(_assess(inventory))
     assert "[RECOMMENDED] AUTO_INCREMENT" in text
     assert "effort if you take it: MEDIUM" in text
-    # It is captioned Note, not Risk, and the gaps keep their Risk caption.
+    # It is captioned Note, not Risk; the preserved-FK finding is likewise advisory.
     assert "Note: The integer key" in text
-    assert "Risk: Foreign key" in text
+    assert "Note: Foreign key" in text
+    # A genuine gap keeps its Risk caption.
+    assert "Risk: Columns" in text
 
 
 def test_html_export_marks_an_advisory_finding_outside_the_severity_ramp() -> None:

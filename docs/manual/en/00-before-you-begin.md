@@ -42,11 +42,13 @@ one-line "must know" plus a pointer to the chapter that covers it in depth.
       PK to such tables before loading. (Both single-column and composite PKs are
       supported.) → [§6.1](06-limitations.md#61-aurora-dsql-feature-limits-your-schema-must-fit-these)
 
-- [ ] **DSQL intentionally omits features MySQL has.** No **foreign keys**, no
+- [ ] **DSQL intentionally omits some features MySQL has.** No
       **triggers / stored procedures / events**, a **per-transaction row limit
       (≤ 3000)**, a **1 MiB per-value limit**, `DECIMAL` **precision ≤ 38**, and
-      **no spatial types**. You don't have to find these yourself — the
-      **Evaluation** step inspects your schema and flags every one as
+      **no spatial types**. (**Foreign keys are supported** — Aurora DSQL enforces
+      them — so the tool preserves them and re-creates them after the data load;
+      they are *not* an omitted feature.) You don't have to find these yourself —
+      the **Evaluation** step inspects your schema and flags every one as
       `AUTO` / `MANUAL` / `UNSUPPORTED` with a recommended action. Plan to resolve
       the `UNSUPPORTED` items and decide the `MANUAL` ones before loading data.
       → [Chapter 2](02-evaluation-and-schema-conversion.md),

@@ -71,7 +71,7 @@ LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 5000
 - `DATETIME` → UTC로 정규화된 `timestamp`; `TIMESTAMP` → `timestamptz`.
 - `BLOB`/`BINARY`/`VARBINARY` 계열 → `bytea`.
 
-전체 매핑(및 "외래 키 없음" 같은 DSQL 제약 처리)은
+전체 매핑(및 "값당 1 MiB 한도" 같은 DSQL 제약 처리)은
 [2장 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-타입과-제약-처리-참조)과 Schema Conversion
 단계에 있습니다.
 

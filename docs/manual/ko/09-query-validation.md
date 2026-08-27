@@ -25,7 +25,7 @@ DSQL(PostgreSQL)로 변환하고 분류합니다:
 → `INSERT ... ON CONFLICT DO UPDATE`(MANUAL — 충돌 타깃을 직접 확인), `JSON_UNQUOTE(JSON_EXTRACT(...))`
 → `JSON_EXTRACT_PATH_TEXT`, MySQL `HAVING`-별칭 참조 인라인화, 그리고 `SELECT ... FOR UPDATE`(DSQL의
 낙관적 동시성 제어에서 다르게 동작). 이런 발견은 모두 **MANUAL**로 분류됩니다. 애플리케이션 코드 전반의
-안티패턴 스캔(외래 키/`AUTO_INCREMENT`/트리거 의존, 미지원 함수)은 [2장](02-evaluation-and-schema-conversion.md) 참조.
+안티패턴 스캔(`AUTO_INCREMENT`/트리거 의존, 미지원 함수)은 [2장](02-evaluation-and-schema-conversion.md) 참조.
 
 원본과 변환된 SQL을 나란히 보여줘 무엇이 바뀌었는지 정확히 확인할 수 있습니다.
 

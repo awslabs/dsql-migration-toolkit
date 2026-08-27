@@ -361,7 +361,8 @@ def test_pg_source_pk_strategy_is_inert_without_auto_increment() -> None:
 def test_pg_source_emits_index_ddls_and_preserves_fk() -> None:
     # Tier-3 #10: secondary indexes + foreign keys are handled for a PG source (NOT dropped
     # by an is_postgres gate). CREATE [UNIQUE] INDEX ASYNC on the schema-qualified table,
-    # FK preserved as metadata, and a FK-removal warning.
+    # FK preserved as metadata AND re-created as a post-load ADD CONSTRAINT, with an
+    # advisory FK note.
     from dsql_migrator.core.models import ForeignKeyDef, IndexDef
 
     table = TableDef(
@@ -378,6 +379,10 @@ def test_pg_source_emits_index_ddls_and_preserves_fk() -> None:
         for d in r.index_ddls
     )
     assert [f.name for f in r.preserved_foreign_keys] == ["fk_cust"]
+    assert r.foreign_key_ddls == [
+        'ALTER TABLE "public"."orders" ADD CONSTRAINT "fk_cust" '
+        'FOREIGN KEY ("cust") REFERENCES "cust" ("id") NOT VALID'
+    ]
     assert any("foreign key" in w.message.lower() and "fk_cust" in w.message for w in r.warnings)
 
 

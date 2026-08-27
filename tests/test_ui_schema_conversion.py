@@ -468,12 +468,14 @@ def test_render_source_table_ddl_includes_pk_index_and_fk() -> None:
     assert "FOREIGN KEY (`customer_id`)" in ddl
 
 
-def test_render_target_ddl_emits_async_index_and_no_foreign_key() -> None:
+def test_render_target_ddl_emits_async_index_and_post_load_foreign_key() -> None:
     conversion = _converted().tables[0]
     target = render_target_ddl(conversion)
     assert "CREATE INDEX ASYNC" in target
-    # DSQL removes foreign keys, so the converted target DDL must not declare one.
-    assert "FOREIGN KEY" not in target
+    # Aurora DSQL enforces FKs now: the preview shows the FK as a post-load
+    # ALTER TABLE ... ADD CONSTRAINT (not inlined in CREATE TABLE).
+    assert "CREATE TABLE" in target and "FOREIGN KEY" not in target.split("ALTER TABLE")[0]
+    assert 'ALTER TABLE "orders" ADD CONSTRAINT "fk_customer" FOREIGN KEY' in target
 
 
 def test_build_table_preview_pairs_source_and_target() -> None:
@@ -1459,7 +1461,7 @@ def test_build_target_object_tree_empty_when_no_inventory() -> None:
 
 
 def test_object_header_summary_combines_all_status_parts() -> None:
-    table = _inventory().tables[0]  # orders: has a removed-FK conversion warning
+    table = _inventory().tables[0]  # orders: has an advisory (preserved-FK) conversion note
     conversion = _converted().tables[0]
     preview = build_table_preview(table, conversion, exists_on_target=True)
 
@@ -1472,7 +1474,7 @@ def test_object_header_summary_combines_all_status_parts() -> None:
     )
 
     assert "exists on target" in summary
-    assert "warning" in summary  # at least one conversion warning surfaced
+    assert "recommendation" in summary  # the preserved-FK advisory note surfaced
     assert "edited" in summary
     assert "applied: CREATED" in summary
     assert " · " in summary  # parts are joined with a separator
@@ -1631,6 +1633,39 @@ def test_applied_table_conversions_overlays_edits_and_falls_back() -> None:
 
     deterministic_customers = next(t for t in result.tables if t.table == "customers")
     assert applied["customers"] is deterministic_customers
+
+
+def test_applied_table_conversions_strips_fk_when_preservation_off() -> None:
+    # The Schema Conversion "Preserve foreign keys" toggle (preserve_foreign_keys=False)
+    # is the single choke point: Full Load never re-creates the FKs, but the
+    # relationship stays as metadata (for the Validation orphan check).
+    result = _converted()  # orders has FK fk_customer
+
+    kept = applied_table_conversions(result, {}, preserve_foreign_keys=True)
+    assert kept["orders"].foreign_key_ddls  # preserved by default
+
+    stripped = applied_table_conversions(result, {}, preserve_foreign_keys=False)
+    assert stripped["orders"].foreign_key_ddls == []
+    assert [fk.name for fk in stripped["orders"].preserved_foreign_keys] == [
+        "fk_customer"
+    ]
+
+
+def test_applied_table_conversions_strips_fk_from_an_edited_script() -> None:
+    # Even when the FK DDL comes from a user-edited / baked script, the choke drops it
+    # when preservation is off (it runs after the edited script is parsed).
+    result = _converted()
+    edited = {
+        "orders": (
+            'CREATE TABLE "orders" ("id" integer PRIMARY KEY, "customer_id" integer);\n'
+            'ALTER TABLE "orders" ADD CONSTRAINT "fk_customer" '
+            'FOREIGN KEY ("customer_id") REFERENCES "customers" ("id");'
+        )
+    }
+    kept = applied_table_conversions(result, edited, preserve_foreign_keys=True)
+    assert kept["orders"].foreign_key_ddls  # the edited ADD CONSTRAINT is honored
+    stripped = applied_table_conversions(result, edited, preserve_foreign_keys=False)
+    assert stripped["orders"].foreign_key_ddls == []
 
 
 def test_apply_should_replace_routes_edits_to_replace() -> None:

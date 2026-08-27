@@ -29,8 +29,8 @@ It also **rewrites** MySQL idioms and **flags** ones that matter on DSQL — e.g
 the conflict target), `JSON_UNQUOTE(JSON_EXTRACT(...))` → `JSON_EXTRACT_PATH_TEXT`,
 MySQL `HAVING`-alias references inlined, and `SELECT ... FOR UPDATE` (which behaves
 differently under DSQL's optimistic concurrency). Every such finding is classified
-**MANUAL**. For the broader application-code anti-pattern scan (foreign-key /
-`AUTO_INCREMENT` / trigger reliance, unsupported functions) see
+**MANUAL**. For the broader application-code anti-pattern scan (`AUTO_INCREMENT` /
+trigger reliance, unsupported functions) see
 [Chapter 2](02-evaluation-and-schema-conversion.md).
 
 The original and the converted SQL are shown side by side so you can see exactly

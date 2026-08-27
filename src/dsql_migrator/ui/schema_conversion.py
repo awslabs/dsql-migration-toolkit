@@ -197,8 +197,8 @@ def split_conversion_notes(
     ``Classification`` says how much WORK a note implies (MANUAL vs UNSUPPORTED) but
     not whether anything is actually wrong, so the two were conflated: a kept
     AUTO_INCREMENT key converts perfectly and works, yet it was listed under
-    "Conversion warnings" with the same amber MANUAL badge as a removed foreign key.
-    That presented throughput advice as a defect.
+    "Conversion warnings" with the same amber MANUAL badge as a genuine loss (e.g. a
+    dropped CHECK constraint). That presented throughput advice as a defect.
 
     Notes default to ``LOSS`` (what every note historically meant), so anything that
     does not explicitly opt into ``RECOMMENDATION`` -- including a payload
@@ -507,7 +507,7 @@ def render_source_table_ddl(table: TableDef) -> str:
 
     This mirrors a ``SHOW CREATE TABLE`` view (columns, primary key, secondary
     indexes, and foreign keys) so the source side of the diff shows exactly what
-    DSQL conversion changes (e.g. removed foreign keys, async indexes). It is
+    DSQL conversion changes (e.g. async indexes, foreign keys applied after load). It is
     rendered text only and is never executed.
 
     ``AUTO_INCREMENT`` and ``ON UPDATE CURRENT_TIMESTAMP`` are included because both are
@@ -597,13 +597,16 @@ def render_target_ddl(conversion: TableConversion) -> str:
     """Join a table conversion's statements into one displayable target script.
 
     Any ``CREATE SCHEMA IF NOT EXISTS`` is shown first, then the ``CREATE
-    TABLE``, then each ``CREATE INDEX ASYNC``, each terminated with ``;`` and
-    separated by a blank line so the single-DDL units are visually distinct.
+    TABLE``, then each ``CREATE INDEX ASYNC``, then each foreign-key
+    ``ALTER TABLE ... ADD CONSTRAINT`` (applied after the data load / at cut over,
+    not inside CREATE TABLE), each terminated with ``;`` and separated by a blank
+    line so the single-DDL units are visually distinct.
     """
     statements = [
         *conversion.schema_ddls,
         conversion.target_ddl,
         *conversion.index_ddls,
+        *conversion.foreign_key_ddls,
     ]
     return "\n\n".join(f"{statement.rstrip().rstrip(';')};" for statement in statements)
 
@@ -797,6 +800,11 @@ class SchemaConversionState:
         # Same, for the TARGET browser pane: it is what the operator compares against
         # while working, so a Generate/apply must not discard where they navigated to.
         self.target_expanded_node_ids: list[str] = []
+        # Whether to PRESERVE source foreign keys (Aurora DSQL enforces them, so the
+        # default is to re-create them after the data load / at cut over). Turning this
+        # off strips FKs from the conversion and Full Load, leaving referential
+        # integrity to the application. UI-only per-session choice.
+        self.preserve_foreign_keys: bool = True
         # Whether the generated-object expansions render expanded (Expand all /
         # Collapse all toggle). UI-only; defaults to collapsed so a long list is
         # scannable via each header's status summary before opening one.
@@ -1146,10 +1154,16 @@ def build_schema_conversion_screen(
         Evaluation yields a new inventory -> ``is not`` miss -> recompute, and only the current
         inventory is ever held (one entry).
         """
-        if _conversion_cache.get("inventory") is not inventory:
+        preserve_fk = conv_state.preserve_foreign_keys
+        if (
+            _conversion_cache.get("inventory") is not inventory
+            or _conversion_cache.get("preserve_fk") != preserve_fk
+        ):
             _conversion_cache["inventory"] = inventory
+            _conversion_cache["preserve_fk"] = preserve_fk
             _conversion_cache["result"] = schema_converter.convert(
-                inventory, SchemaConvertOptions()
+                inventory,
+                SchemaConvertOptions(preserve_foreign_keys=preserve_fk),
             )
         return _conversion_cache["result"]  # type: ignore[return-value]
 
@@ -2657,10 +2671,34 @@ def _render_browser_and_preview(
         conv_state.reset_generation()
         refresh()
 
+    def on_toggle_preserve_fk(value: object) -> None:
+        # Aurora DSQL enforces FKs; toggling this changes whether the conversion
+        # (and Full Load) re-creates them. The base conversion is memoized on the
+        # flag, so a refresh recomputes the preview with/without the FK DDL.
+        conv_state.preserve_foreign_keys = bool(value)
+        refresh()
+
     with ui.row().classes("gap-2 items-center"):  # type: ignore[attr-defined]
         gen_btn = ui.button(  # type: ignore[attr-defined]
             "Generate DDL for selected", on_click=on_generate
         ).props("color=primary")
+        fk_checkbox = ui.checkbox(  # type: ignore[attr-defined]
+            "Preserve foreign keys",
+            value=conv_state.preserve_foreign_keys,
+            on_change=lambda e: on_toggle_preserve_fk(getattr(e, "value", e)),
+        )
+        fk_checkbox.props("dense").classes("text-sm")  # type: ignore[attr-defined]
+        fk_checkbox.tooltip(  # type: ignore[attr-defined]
+            "Aurora DSQL enforces foreign keys. On (default): the tool preserves them "
+            "and re-creates them after the data load (at cut over for a CDC migration), "
+            "with extra-read and 3000-row-cascade caveats. Off: strip them and enforce "
+            "referential integrity in your application."
+        )
+        if apply_in_progress:
+            fk_checkbox.disable()  # type: ignore[attr-defined]
+            fk_checkbox.tooltip(  # type: ignore[attr-defined]
+                "Wait for the apply to finish before changing foreign-key preservation."
+            )
         if apply_in_progress:
             # Regenerating mid-apply would swap the DDL under the in-flight worker,
             # so the target could end up with statements the screen no longer shows.
@@ -3292,7 +3330,7 @@ def _render_conversion_warnings(
     Two separate sections, because they are different claims:
 
     * **Conversion warnings** -- something could not be carried over or changed
-      meaning (a removed foreign key, a dropped collation, an unmapped type). Keeps
+      meaning (a dropped CHECK constraint, a dropped collation, an unmapped type). Keeps
       the severity badge (MANUAL amber / UNSUPPORTED red): the operator has to decide
       what to do.
     * **Recommendations** -- the conversion is complete and correct; this is advice
@@ -3572,7 +3610,7 @@ def _render_ddl_diff(
 
     What is given up is the line-for-line alignment: each pane starts at line 1, so a
     changed line is no longer physically beside its counterpart. The panes are short DDL for
-    ONE object, and the conversion notes below already name what changed (removed foreign
+    ONE object, and the conversion notes below already name what changed (post-load foreign
     keys, async indexes, remapped types), so the pairing that mattered is stated in words
     rather than inferred from row positions.
     """

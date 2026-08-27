@@ -28,10 +28,11 @@ The **source is read-only the entire time**; the tool never writes to your MySQL
 
 No. DSQL speaks the **PostgreSQL** wire protocol, authenticates with short-lived
 **IAM tokens** (no password), uses **optimistic concurrency** instead of locks,
-and intentionally omits features that don't scale horizontally — **no foreign
-keys, no triggers/stored procedures, a per-transaction row limit, a 1 MiB
-per-value limit**, and more. Your schema and, in places, your application must
-adapt. Evaluation (step 1) tells you exactly where.
+and intentionally omits features that don't scale horizontally — **no
+triggers/stored procedures, a per-transaction row limit, a 1 MiB per-value
+limit**, and more (foreign keys, by contrast, **are supported and enforced**).
+Your schema and, in places, your application must adapt. Evaluation (step 1) tells
+you exactly where.
 
 
 **Q3. Should I run the tool locally, deploy it on ECS Fargate, or run it on a single EC2 host?**
@@ -292,11 +293,18 @@ write-contract test enforces it), so a row lands the same whichever path migrate
 
 **Q20. What happens to foreign keys, triggers, and stored procedures?**
 
-DSQL has none of these. **Foreign keys** are removed from the DDL but **preserved in
-the report** (enforce referential integrity in your application) — flagged MANUAL.
-**Triggers, stored procedures/functions, and scheduled events** are flagged
-UNSUPPORTED — reimplement them in your application (scheduled events → EventBridge /
-Lambda). See [Chapter 6 §6.1](06-limitations.md#61-aurora-dsql-feature-limits-your-schema-must-fit-these).
+**Foreign keys are supported** — Aurora DSQL enforces them. The tool **preserves**
+each source FK and re-creates it on DSQL as a post-load `ALTER TABLE … ADD
+CONSTRAINT … FOREIGN KEY` (Full Load applies it after the data lands; for a **CDC**
+migration it is deferred to **cut over**, since the constraints must not exist while
+the sink streams rows out of order). You can instead **opt to strip** them and
+enforce referential integrity in the application layer. Runtime caveats to weigh:
+DML on related tables incurs **extra reads**, a concurrent conflict is a retryable
+`40001`, and a `CASCADE`/`SET NULL`/`SET DEFAULT` action counts toward DSQL's
+3000-row/txn limit. **Triggers, stored procedures/functions, and scheduled events**
+*are* omitted — flagged UNSUPPORTED — so reimplement them in your application
+(scheduled events → EventBridge / Lambda). See
+[Chapter 6 §6.1](06-limitations.md#61-aurora-dsql-feature-limits-your-schema-must-fit-these).
 
 
 **Q21. My table has no primary key. Can I migrate it?**

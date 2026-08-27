@@ -16,7 +16,7 @@ fails **loudly** where it can't.
 
 | Limit | Consequence | Tool behavior |
 |---|---|---|
-| **No foreign keys** | Referential integrity is your application's job on DSQL. | FK definitions removed from DDL but preserved in the report; flagged **MANUAL**. |
+| **Foreign keys (enforced, with runtime caveats)** | DSQL supports **enforced** foreign keys, but DML on referenced/referencing tables incurs **extra reads**, a concurrent conflict is a retryable `40001`, and a `CASCADE`/`SET NULL`/`SET DEFAULT` action counts toward the **3000-row/txn** limit (a cascade touching > 3000 rows fails). | Preserved and re-created as a post-load `ALTER TABLE … ADD CONSTRAINT` (Full Load applies it after the data lands; a CDC migration defers it to cut over). Prefer `NO ACTION`/`RESTRICT` for unbounded child cardinality, or strip them (`preserve_foreign_keys=False`) and enforce integrity in the app. |
 | **Source `CHECK` constraints** | A MySQL `CHECK` (8.0.16+) is not translated to the target. | Dropped from the DDL and flagged **MANUAL** — re-add a DSQL-compatible `CHECK` by hand or enforce it in the app. (The `CHECK … IN (...)` the tool *generates* for an `ENUM` is unaffected.) |
 | **Primary key required** | A PK-less table can't be migrated. | Flagged **UNSUPPORTED**; also blocks Full Load (keyset export needs a PK). |
 | **No triggers / stored procedures / functions / scheduled events** | Server-side logic doesn't move. | Flagged **UNSUPPORTED** — reimplement in the application (events → EventBridge/Lambda). |
@@ -33,10 +33,10 @@ fails **loudly** where it can't.
 | **No `TRUNCATE`; one DDL per transaction; optimistic concurrency** | Different write/DDL semantics than MySQL. | Handled transparently: DROP+recreate instead of TRUNCATE, single-DDL units, `40001` retry everywhere. |
 | **IAM-token auth (no password); short-lived tokens** | No static DB password. | The tool (and the CDC sink) mint and refresh IAM tokens automatically. |
 
-> **Bottom line for schema design:** push relational integrity, large blobs,
-> server-side logic, and very-high-precision numerics out of the database and into
-> the application *before* you rely on DSQL for them. Evaluation tells you exactly
-> which objects need this.
+> **Bottom line for schema design:** push large blobs, server-side logic, and
+> very-high-precision numerics out of the database and into the application *before*
+> you rely on DSQL for them, and keep any cascade fan-out within DSQL's
+> per-transaction limit. Evaluation tells you exactly which objects need this.
 
 ---
 
@@ -59,9 +59,14 @@ fails **loudly** where it can't.
   (see [Chapter 4 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)).
 - **Cascading FK actions don't replicate over CDC.** InnoDB `ON DELETE/UPDATE
   CASCADE` (and `SET NULL`/`SET DEFAULT`) fire *inside* MySQL and never reach the
-  binlog, so CDC can't apply them — child rows the source cascaded may be left
-  orphaned on the target. Evaluation flags such tables **MANUAL**; enforce the
-  cascade in the application.
+  binlog, so CDC can't apply them — the child rows the source cascaded are left
+  behind on the target. Because the tool re-creates the foreign key on DSQL **at
+  cut over** (never during replication), those orphaned rows then **block the
+  `ADD CONSTRAINT`** and are reported by the **Validation orphan check**, rather
+  than silently diverging. Evaluation flags such tables **MANUAL**; replace the
+  automatic action with explicit child-row statements in the application, and
+  **quiesce source writes before the final cut-over comparison** so the divergence
+  is caught.
 - **CDC is billable while deployed.** The streaming pipeline (MSK Serverless +
   MSK Connect, plus a NAT gateway if created) costs money for as long as it runs.
   Tear down the cdc-stack after cut-over. Full Load alone provisions no streaming

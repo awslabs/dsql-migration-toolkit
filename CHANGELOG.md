@@ -5,6 +5,59 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.400
+
+### Added
+
+- **Aurora DSQL now supports enforced foreign keys** (announced 2026-08-27), so the tool
+  **preserves foreign keys** instead of stripping them. Schema Conversion renders each
+  source FK as a post-load `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` statement
+  (`TableConversion.foreign_key_ddls`) — kept OUT of `CREATE TABLE` so the concurrent,
+  cross-table bulk load stays order-independent — with a strip option
+  (`SchemaConvertOptions.preserve_foreign_keys=False`) for the app-enforced-integrity case.
+- **Full Load applies preserved foreign keys as a run-level post-pass** after the data
+  load, each `ADD CONSTRAINT … NOT VALID` as its own single-DDL autocommit transaction
+  with OCC (40001) retry and reconnect (new `schema_applier.apply_foreign_key`,
+  duplicate-tolerant). DSQL only accepts an `ADD CONSTRAINT` that is `NOT VALID` (it
+  enforces every new write immediately without scanning existing rows); the loaded rows
+  are then confirmed via the async `ALTER TABLE ASYNC … VALIDATE CONSTRAINT`
+  (`schema_applier.validate_foreign_key`).
+  An **orphan pre-gate** (reusing Validation's orphan query) skips — with an actionable
+  per-FK activity-log entry — any foreign key whose child rows reference a missing parent,
+  instead of letting the `ALTER` fail opaquely; the pre-gate count is itself OCC-retry-safe,
+  so a transient serialization failure (OC001/40001) from a live CDC sink at cut over is
+  not mistaken for a failed pre-check, and the shared pre-gate probe reconnects on a
+  mid-pass connection drop rather than failing every remaining foreign key. Each rendered
+  FK DDL is paired to its metadata **by constraint name**, so editing the Schema-Conversion
+  target script to drop or reorder a foreign-key line keeps the pre-gate and the
+  `VALIDATE` targeting the constraint actually being added. For a **CDC migration** the apply is
+  **deferred to cut over** (foreign keys must not exist while the sink streams
+  out-of-order rows — it dead-letters an FK violation, SQLSTATE 23503).
+- **Schema Conversion has a "Preserve foreign keys" toggle** (on by default) that strips
+  the foreign keys from the conversion and Full Load when turned off; the **target preview
+  now shows the foreign-key DDL**, and the edited-target-script re-parser preserves an
+  edited `ADD CONSTRAINT … FOREIGN KEY`.
+- **The Cut over runbook adds an "Apply foreign keys" action** for a CDC migration: after
+  the final drain (and before repointing) it re-creates the deferred foreign keys on
+  Aurora DSQL, orphan-gated and idempotent, and reports how many were applied / skipped
+  (orphan rows) / failed.
+
+### Changed
+
+- The Evaluation **foreign-key finding is now advisory** (RECOMMENDED, no required effort)
+  rather than a MANUAL "not supported — remove it" gap; it carries the runtime caveats
+  (extra reads on referenced/referencing DML, retryable 40001 conflicts, and `CASCADE` /
+  `SET NULL` / `SET DEFAULT` counting toward the 3000-row transaction limit). Rule id
+  `FK_UNSUPPORTED` → `FK_PRESERVED`.
+- The cascade-over-CDC finding + banner keeps its (still-real) warning but is reworded: an
+  un-replicated source cascade now surfaces as a **blocking orphan at the cut-over FK
+  apply** (caught by the Validation orphan check), not silent divergence.
+- Corrected the now-false "Aurora DSQL has no foreign keys / enforce in the application
+  layer" guidance across the converter, assessor, validator, and the AI grounding
+  constants; the query linter no longer flags `FOREIGN KEY` as an anti-pattern
+  (`FOREIGN_KEY_DEPENDENCY` is retained for back-compat but no longer emitted); and
+  `CLAUDE.md`'s Aurora DSQL domain-constraints section was updated.
+
 ## v0.1.399
 
 ### Changed

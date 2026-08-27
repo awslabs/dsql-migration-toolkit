@@ -5,6 +5,56 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.400
+
+### 추가 (Added)
+
+- **Aurora DSQL이 이제 강제(enforced) 외래 키를 지원**(2026-08-27 발표)하므로, 이 도구가 외래
+  키를 제거하는 대신 **보존**합니다. Schema Conversion은 각 소스 FK를 로드 후 실행하는
+  `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` 문(`TableConversion.foreign_key_ddls`)으로
+  렌더링하며 — 동시·교차 테이블 벌크 로드가 순서에 무관하게 유지되도록 `CREATE TABLE`에서는
+  제외합니다 — 애플리케이션 계층에서 무결성을 강제하는 경우를 위한 제거 옵션
+  (`SchemaConvertOptions.preserve_foreign_keys=False`)도 제공합니다.
+- **Full Load는 보존된 외래 키를 데이터 로드 이후 실행 단위(run-level) 사후 패스로 적용**합니다.
+  각 `ADD CONSTRAINT … NOT VALID`는 OCC(40001) 재시도 및 재연결을 갖춘 단일 DDL autocommit
+  트랜잭션으로 실행됩니다(신규 `schema_applier.apply_foreign_key`, 중복 허용). DSQL은 `NOT VALID`인
+  `ADD CONSTRAINT`만 허용하며(기존 행을 스캔하지 않고 모든 새 쓰기를 즉시 강제), 로드된 행은
+  이후 비동기 `ALTER TABLE ASYNC … VALIDATE CONSTRAINT`(`schema_applier.validate_foreign_key`)로
+  확인됩니다. **orphan 사전 게이트**
+  (Validation의 orphan 쿼리 재사용)가 자식 행이 존재하지 않는 부모를 참조하는 외래 키를 —
+  실행 가능한 FK별 activity-log 항목과 함께 — 건너뛰어 `ALTER`가 불투명하게 실패하지 않도록
+  합니다. 사전 게이트 카운트 자체가 OCC 재시도 안전(OCC-retry-safe)하므로, cut over 시점의
+  라이브 CDC sink로 인한 일시적 직렬화 실패(OC001/40001)를 사전 확인 실패로 오인하지 않으며,
+  공유 사전 게이트 프로브는 패스 도중 연결이 끊겨도 나머지 외래 키를 모두 실패시키는 대신 재연결합니다.
+  렌더링된 각 FK DDL은 **제약 이름(constraint name)으로** 메타데이터와 매칭되므로, Schema Conversion
+  타깃 스크립트에서 외래 키 줄을 삭제하거나 순서를 바꿔도 사전 게이트와 `VALIDATE`가 실제로 추가되는
+  제약을 정확히 대상으로 삼습니다.
+  **CDC 마이그레이션**에서는 적용이 **cut over로 지연(deferred)**됩니다(sink가 순서가
+  뒤섞인 행을 스트리밍하는 동안 외래 키가 존재해서는 안 됩니다 — FK 위반을 dead-letter 처리,
+  SQLSTATE 23503).
+- **Schema Conversion에 "Preserve foreign keys" 토글**(기본값 켜짐)이 추가되어, 끄면 변환과
+  Full Load에서 외래 키를 제거합니다. 이제 **타깃 미리보기에 외래 키 DDL이 표시**되며, 편집된
+  타깃 스크립트 재파서가 편집된 `ADD CONSTRAINT … FOREIGN KEY`를 보존합니다.
+- **Cut over 런북에 "Apply foreign keys" 작업이 추가**되었습니다(CDC 마이그레이션용). 최종
+  드레인 이후(그리고 repoint 이전)에 Aurora DSQL에서 지연된 외래 키를 orphan 게이트 및
+  멱등(idempotent) 방식으로 재생성하고, 적용/건너뜀(orphan 행)/실패 개수를 보고합니다.
+
+### 변경 (Changed)
+
+- **Evaluation의 외래 키 발견 항목이 이제 권고(advisory)**(RECOMMENDED, 필요 작업량 없음)로
+  바뀌었습니다. 기존의 MANUAL "지원되지 않음 — 제거하세요" 갭이 아니며, 런타임 유의사항
+  (참조되는/참조하는 테이블의 DML에서 발생하는 추가 읽기, 재시도 가능한 40001 충돌, 그리고
+  3000행 트랜잭션 한도에 포함되는 `CASCADE` / `SET NULL` / `SET DEFAULT`)을 함께 담습니다.
+  규칙 id `FK_UNSUPPORTED` → `FK_PRESERVED`.
+- **CDC 중 cascade 발견 항목 + 배너**는 (여전히 유효한) 경고를 유지하되 문구를 다시
+  다듬었습니다: 복제되지 않은 소스 cascade는 이제 조용한 divergence가 아니라 **cut over FK 적용
+  시점의 차단(blocking) orphan**으로 드러납니다(Validation orphan 검사가 포착).
+- 이제 거짓이 된 "Aurora DSQL은 외래 키가 없음 / 애플리케이션 계층에서 강제" 안내를 converter,
+  assessor, validator 및 AI grounding 상수 전반에서 바로잡았습니다. 쿼리 린터는 더 이상
+  `FOREIGN KEY`를 안티패턴으로 표시하지 않습니다(`FOREIGN_KEY_DEPENDENCY`는 하위 호환을 위해
+  유지되지만 더 이상 emit되지 않음). 그리고 `CLAUDE.md`의 Aurora DSQL 도메인 제약 섹션도
+  업데이트했습니다.
+
 ## v0.1.399
 
 ### 변경 (Changed)

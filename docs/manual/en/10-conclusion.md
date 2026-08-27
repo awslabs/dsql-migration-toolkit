@@ -30,11 +30,13 @@ replication; otherwise Full Load alone is simpler and cheaper.
 1. **Connect** to source (read-only) and target (DSQL, IAM-token).
 2. **Evaluation** — read the compatibility report. Resolve every **UNSUPPORTED**
    item (PK, triggers, routines, spatial types, precision > 38, oversized LOBs)
-   and decide each **MANUAL** item (FK → app-side integrity, partitioning, etc.).
+   and decide each **MANUAL** item (cascade FKs that CDC can't replicate,
+   partitioning, `ENUM`/`SET`, etc.).
    *Don't skip this* — it's what turns "the load failed mysteriously" into "I knew
    that object needed changing." It is also where you learn whether CDC is viable
-   at all: cascading foreign keys never reach the binary log, so CDC cannot
-   replicate them.
+   at all: a source cascade (`ON DELETE/UPDATE CASCADE`) never reaches the binary
+   log, so CDC can't replicate it — the orphaned child rows it leaves then block
+   the cut-over foreign-key apply (caught by the Validation orphan check).
 3. **Schema Conversion** — review the source-vs-converted DDL and apply it to DSQL.
 4. **Data Migration** — choose the migration type (**Full Load only**, **CDC only**, or
    **Full Load + CDC**) now that the report tells you what you are dealing with. Run the

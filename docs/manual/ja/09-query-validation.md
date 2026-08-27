@@ -27,7 +27,7 @@ MySQL 文を貼り付けると、スキーマ変換と同じ決定論優先（de
 `ON DUPLICATE KEY UPDATE` → `INSERT ... ON CONFLICT DO UPDATE`(MANUAL — 競合ターゲットは自分で確認)、
 `JSON_UNQUOTE(JSON_EXTRACT(...))` → `JSON_EXTRACT_PATH_TEXT`、MySQL の `HAVING` エイリアス参照のインライン化、
 そして `SELECT ... FOR UPDATE`（DSQL の楽観的並行性制御のもとで異なる動作）。これらの指摘はすべて **MANUAL**
-に分類されます。アプリケーションコード全体のアンチパターンスキャン（外部キー/`AUTO_INCREMENT`/トリガー依存、
+に分類されます。アプリケーションコード全体のアンチパターンスキャン（`AUTO_INCREMENT`/トリガー依存、
 未対応関数）は [第 2 章](02-evaluation-and-schema-conversion.md) を参照してください。
 
 元の SQL と変換後の SQL を並べて表示するため、何が変わったのかを正確に確認できます。

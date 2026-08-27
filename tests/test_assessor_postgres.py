@@ -19,7 +19,7 @@ from dsql_migrator.core.models import (
 
 _EXPECTED_PG_RULE_IDS = {
     "PG_UNSUPPORTED_TYPE",  # PG-specific: DSQL-unsupported column types
-    "FK_UNSUPPORTED",
+    "FK_PRESERVED",
     "CHECK_CONSTRAINT_DROPPED",
     "TRIGGER_UNSUPPORTED",
     "PROC_PLPGSQL",

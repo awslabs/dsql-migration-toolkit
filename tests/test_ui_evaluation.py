@@ -222,12 +222,12 @@ def test_run_evaluation_assessment_includes_effort_estimate() -> None:
         target_browser_factory=tgt_factory,
     )
 
-    # The FK table is SIMPLE; the no-PK table is MEDIUM. Both are counted in the
-    # effort summary, and every non-AUTO item carries an effort.
+    # The FK table is advisory now (Aurora DSQL enforces FKs), so it carries NO required
+    # effort; the no-PK table is a real MEDIUM gap. Only the latter counts in the summary.
     efforts = {item.object_name: item.effort for item in result.assessment.items}
-    assert efforts["orders"] is EffortLevel.SIMPLE
+    assert efforts["orders"] is None
     assert efforts["audit_log"] is EffortLevel.MEDIUM
-    assert result.assessment.effort_summary[EffortLevel.SIMPLE] == 1
+    assert result.assessment.effort_summary[EffortLevel.SIMPLE] == 0
     assert result.assessment.effort_summary[EffortLevel.MEDIUM] == 1
     assert result.assessment.effort_summary[EffortLevel.SIGNIFICANT] == 0
 
@@ -352,7 +352,7 @@ def test_build_assessment_chart_data_groups_by_kind_and_classification() -> None
             ),
             AssessmentItem(
                 object_name="t2",
-                rule_id="FK_UNSUPPORTED",
+                rule_id="FK_PRESERVED",
                 classification=Classification.MANUAL,
                 effort=EffortLevel.SIMPLE,
                 kind="TABLE",
@@ -398,7 +398,7 @@ def test_sort_assessment_items_orders_by_importance() -> None:
         ),
         AssessmentItem(
             object_name="fk_table",
-            rule_id="FK_UNSUPPORTED",
+            rule_id="FK_PRESERVED",
             classification=Classification.MANUAL,
             effort=EffortLevel.SIMPLE,
             kind="TABLE",
@@ -436,7 +436,7 @@ def _filter_items() -> list:
         ),
         AssessmentItem(
             object_name="fk_table",
-            rule_id="FK_UNSUPPORTED",
+            rule_id="FK_PRESERVED",
             classification=Classification.MANUAL,
             effort=EffortLevel.SIMPLE,
             kind="TABLE",
@@ -1049,7 +1049,7 @@ def test_assessment_row_renders_one_block_per_concern() -> None:
 
     body = "\n".join(ui.texts)
     # Every rule id is shown, so the reader can see WHICH rules fired.
-    for rule_id in ("FK_UNSUPPORTED", "AUTO_INCREMENT", "CI_COLLATION",
+    for rule_id in ("FK_PRESERVED", "AUTO_INCREMENT", "CI_COLLATION",
                     "ENUM_SET_TYPE", "ON_UPDATE_TIMESTAMP"):
         assert rule_id in body, rule_id
     # Each concern is its own bordered card, indented behind one vertical spine, so the
@@ -1111,7 +1111,7 @@ def test_row_falls_back_to_joined_text_for_a_pre_concerns_report() -> None:
 
     legacy = AssessmentItem(
         object_name="orders",
-        rule_id="FK_UNSUPPORTED",
+        rule_id="FK_PRESERVED",
         classification=Classification.MANUAL,
         risk="a; b",
         recommendation="fix a; fix b",

@@ -15,10 +15,14 @@ and produces a :class:`~dsql_migrator.core.models.ValidationReport`
   FLOAT/DOUBLE and JSON columns are NOT value-compared (no byte-identical
   cross-engine form -- see the checksum note below); each table lists them in
   ``checksum_excluded_columns`` so a match is not read as "every column verified".
-- Optional orphan-record check (Requirement 6.3): because DSQL has no foreign
-  keys, referential integrity moves to the application; this checks each
-  preserved foreign-key rule (:class:`~dsql_migrator.core.models.ForeignKeyDef`)
-  for child rows on the target whose key has no matching parent row.
+- Optional orphan-record check (Requirement 6.3): Aurora DSQL now enforces foreign
+  keys, and the tool re-creates them after the load (at cut over for a CDC
+  migration). This check is the PRE-APPLY GATE for that step -- an enforced
+  ``ADD CONSTRAINT`` fails if any child row has no matching parent -- and the
+  integrity safety net when the user chose to strip foreign keys instead. It counts,
+  for each preserved foreign-key rule
+  (:class:`~dsql_migrator.core.models.ForeignKeyDef`), the child rows on the target
+  whose (non-null) key has no matching parent row.
 - Validation report including mismatches (Requirement 6.4).
 - As-of-watermark validation with drift reporting (Requirement 6.5): when a
   :class:`~dsql_migrator.core.models.Watermark` is supplied, per-table source row

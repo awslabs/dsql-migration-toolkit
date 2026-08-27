@@ -65,14 +65,14 @@ transaction must **re-run**, and under contention this happens often.
 |---|---|---|
 | Indexes built async, after load | A table with secondary indexes; a load where a data batch fails | Indexes are created only after **all** data lands; if any data batch fails, indexes are **not** created (`test_indexes_created_after_all_data…`, `test_indexes_are_skipped_when_a_data_batch_fails`) |
 
-### Schema differences — no FK, PK required, unsupported types/objects
+### Schema differences — FK enforced, PK required, unsupported types/objects
 
-DSQL omits foreign keys, triggers, stored procedures, several types, and requires a
-primary key.
+Aurora DSQL enforces foreign keys, requires a primary key, and omits triggers,
+stored procedures, and several types.
 
 | DSQL characteristic | Scenario tested | How it's exercised |
 |---|---|---|
-| No foreign keys | An FK-laden source | FK removed from DDL, preserved as a `MANUAL` note; Validation's **orphan check** confirms app-side integrity held (`test_orphan_records_are_detected_and_fail_the_match`) |
+| Foreign keys enforced | An FK-laden source | Each source FK is preserved and re-created as a post-load `ALTER TABLE … ADD CONSTRAINT` (deferred to cut over for a CDC migration), gated by an orphan pre-check; Validation's **orphan check** is that pre-apply gate (and the safety net when FKs are stripped) (`test_orphan_records_are_detected_and_fail_the_match`) |
 | Primary key required | A table with **no** PK; a **composite** PK | No-PK is blocked up front (`UNSUPPORTED`) and keyset export refuses it; composite PK loads via an explicit lexicographic-disjunction keyset predicate (`(k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR …`) — deliberately **not** the row-value tuple form, which isn't PK-index-friendly on MySQL 5.7+ (`test_exporter.py`, scenario doc) |
 | Unsupported types/objects | `DECIMAL` precision > 38, > 255 columns, triggers/routines | Flagged `UNSUPPORTED` in Evaluation with a reason (`test_converter.py`, assessor tests) |
 | TINYINT(1) → boolean, out of range | A `TINYINT(1)` holding `2` | A **loud, table-fatal** error — refuses to flatten `2` to `true` (no silent corruption) |
@@ -137,7 +137,7 @@ The scenarios above were also exercised **together, on real AWS** (RDS MySQL +
 Aurora DSQL + MSK), using a purpose-built schema designed to hit as many DSQL
 characteristics as possible in one run:
 
-- A parent → child / lob foreign-key chain (forces the **no-FK** + **PK** +
+- A parent → child / lob foreign-key chain (forces the **FK-preservation** + **PK** +
   **orphan-check** scenarios).
 - Maximum type diversity — every integer/unsigned variant, `DECIMAL` incl.
   precision > 38, `FLOAT`/`DOUBLE`, `BIT`, collation, the full DATE/TIME family,

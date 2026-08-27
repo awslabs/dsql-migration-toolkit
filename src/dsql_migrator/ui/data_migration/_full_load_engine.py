@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import multiprocessing.queues
+import re
 import threading
 import time as _time
 from concurrent.futures import (
@@ -28,7 +29,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import (
-    Callable, Iterator, Mapping, NamedTuple, Optional, Protocol, Sequence, Union,
+    Any, Callable, Iterator, Mapping, NamedTuple, Optional, Protocol, Sequence, Union,
 )
 
 from dsql_migrator.config import SecretValue, load_config
@@ -50,7 +51,11 @@ from dsql_migrator.core.batched_import import (
     OnConflictMode,
     safe_error_message,
 )
-from dsql_migrator.core.target_connection import DsqlConnector, target_error_hint
+from dsql_migrator.core.target_connection import (
+    DsqlConnector,
+    is_transient_connection_error,
+    target_error_hint,
+)
 from dsql_migrator.core.converter import (
     SchemaConverter,
     SchemaConvertOptions,
@@ -58,10 +63,14 @@ from dsql_migrator.core.converter import (
     parse_target_column_types,
     parse_target_primary_key,
 )
-from dsql_migrator.core.schema_applier import recreate_table
+from dsql_migrator.core.schema_applier import (
+    apply_foreign_key, recreate_table, validate_foreign_key,
+)
+from dsql_migrator.core.validation_sql import build_orphan_count_sql
 from dsql_migrator.core.models import (
     ChunkState,
     DataErrorRecord,
+    ForeignKeyDef,
     MigrationJob,
     SourceConnectionConfig,
     SourceInventory,
@@ -2444,6 +2453,25 @@ def _recreate_dependent_views(migrator: DataMigrator) -> None:
             _LOGGER.warning("Dependent-view recreate pass failed", exc_info=True)
 
 
+def _apply_foreign_keys(migrator: DataMigrator) -> None:
+    """Call the migrator's post-load foreign-key apply, if it supports one (else no-op).
+
+    Best-effort run-level post-pass, mirroring :func:`_recreate_dependent_views`:
+    Aurora DSQL enforces foreign keys, but they must be added AFTER the concurrent
+    bulk load (which has no parent-before-child ordering). The data is already
+    loaded, so a failure here is logged and swallowed rather than failing an
+    otherwise-successful run; a foreign key that cannot be created (an orphan
+    pre-gate hit, or an ALTER failure) is reported in the activity log for manual
+    application, not treated as data loss.
+    """
+    hook = getattr(migrator, "apply_foreign_keys", None)
+    if callable(hook):
+        try:
+            hook()
+        except Exception:  # noqa: BLE001 - optional post-pass; never fail the run
+            _LOGGER.warning("Foreign-key apply pass failed", exc_info=True)
+
+
 def _log_excluded_lob_columns(
     inputs: "Optional[DataMigrationInputs]",
     scope: Optional[set[str]] = None,
@@ -2601,6 +2629,7 @@ def run_full_load(
     _predrop_dependent_views(migrator)
     counts = _migrate_tables_in_parallel(handle, job_id, tables, migrator, error_log)
     _recreate_dependent_views(migrator)
+    _apply_foreign_keys(migrator)
     _finalize_run(
         handle,
         job_id,
@@ -2689,6 +2718,7 @@ def run_full_load_retry(
         handle, job_id, tables_to_retry, migrator, error_log
     )
     _recreate_dependent_views(migrator)
+    _apply_foreign_keys(migrator)
     _finalize_run(
         handle,
         job_id,
@@ -3519,12 +3549,255 @@ class BatchedTableMigrator:
             except Exception:  # noqa: BLE001 - best-effort; the tables/data are already loaded
                 _LOGGER.warning("Could not recreate dependent view", exc_info=True)
 
+    def apply_foreign_keys(self) -> None:
+        """Run-level POST-PASS: re-create preserved foreign keys after the data load.
+
+        Aurora DSQL enforces foreign keys, but they must NOT exist during the load
+        (the concurrent, sharded, multi-table bulk load has no parent-before-child
+        ordering, so a child row can commit before its parent), so each preserved FK
+        is applied HERE as its own single-DDL ``ADD CONSTRAINT`` (OC001 retry +
+        reconnect, idempotent). Before adding a constraint an ORPHAN PRE-GATE counts
+        child rows with no matching parent: an enforced ``ADD CONSTRAINT`` would fail
+        on any orphan, so the FK is skipped with an actionable activity-log entry
+        (table / FK / count) instead of an opaque ALTER error. A per-FK apply failure
+        is logged and skipped, never failing the completed load.
+
+        No-op for a CDC-coexisting run (foreign keys are applied at cut over, after
+        the stream drains, never while the sink streams out-of-order rows) and when
+        the user disabled foreign-key preservation (``foreign_key_ddls`` empty).
+        """
+        if self._inputs.cdc_coexisting:
+            return
+        apply_preserved_foreign_keys(
+            self._inputs.table_conversions, self._view_connection_factory()
+        )
+
     def _view_connection_factory(self):
         """A fresh-DSQL-connection factory for the view pre-drop / recreate DDL."""
         connector = DsqlConnector(
             self._inputs.target_config, aws_profile=self._inputs.aws_profile
         )
         return connector.connect
+
+
+def apply_preserved_foreign_keys(
+    table_conversions: Mapping[str, TableConversion],
+    connection_factory: Callable[[], Any],
+) -> tuple[int, int, int]:
+    """Re-create preserved foreign keys as post-load ``ADD CONSTRAINT``, orphan-gated.
+
+    Shared by the Full Load run-level post-pass
+    (:meth:`BatchedTableMigrator.apply_foreign_keys`) and the CDC **cut-over** action
+    (which runs it once the stream has drained). Each preserved FK is applied as its
+    own single-DDL ``ALTER TABLE ... ADD CONSTRAINT`` (OCC 40001 retry + reconnect,
+    idempotent). An ORPHAN PRE-GATE counts child rows with no matching parent first:
+    an enforced ``ADD CONSTRAINT`` would fail on any orphan, so that FK is skipped with
+    an actionable activity-log entry (table / FK / count) instead of an opaque ALTER
+    failure. Best-effort per FK: a failure is logged and skipped, never raised.
+
+    Returns ``(applied, skipped, failed)`` counts.
+    """
+    # Pair each rendered ADD-CONSTRAINT DDL with its FK metadata by CONSTRAINT NAME,
+    # not by list position. The deterministic conversion builds both lists in
+    # table.foreign_keys order (aligned), but an edited Schema-Conversion script
+    # re-parses foreign_key_ddls from only the FK lines the user kept -- in their
+    # edited order -- while preserved_foreign_keys stays the full deterministic list.
+    # A positional zip would then pair a DDL with the WRONG FK's metadata, so the
+    # orphan pre-gate would check the wrong columns and VALIDATE the wrong constraint.
+    # Matching on the constraint name (the DDL's own key) keeps the pre-gate and the
+    # VALIDATE target aligned to the constraint actually being added.
+    pending: list[tuple[str, Optional[str], Optional[ForeignKeyDef], str]] = []
+    for table_name, conv in table_conversions.items():
+        by_name = {fk.name: fk for fk in conv.preserved_foreign_keys}
+        for add_ddl in conv.foreign_key_ddls:
+            constraint_name = _constraint_name_from_ddl(add_ddl)
+            fk = by_name.get(constraint_name) if constraint_name is not None else None
+            pending.append((table_name, constraint_name, fk, add_ddl))
+    if not pending:
+        return (0, 0, 0)
+
+    probe = connection_factory()  # one read-only connection for the orphan pre-gate
+    applied = skipped = failed = 0
+    try:
+        for table_name, constraint_name, fk, add_ddl in pending:
+            target = f"{table_name}.{constraint_name or '?'}"
+            try:
+                if fk is None:
+                    # No metadata to key the orphan query on (an edited/renamed FK the
+                    # re-parser could not match). Skip the pre-gate and let the ADD run:
+                    # a NOT VALID add succeeds without scanning, and the best-effort
+                    # VALIDATE below surfaces any pre-existing violation.
+                    orphans = 0
+                    _LOGGER.debug("No FK metadata for %s; skipping orphan pre-gate", target)
+                else:
+                    orphans = _count_orphans(probe, table_name, fk)
+            except Exception as exc:  # noqa: BLE001 - cannot verify -> do not risk a bad ADD
+                if is_transient_connection_error(exc):
+                    # The shared probe died mid-pass (class 08 / expired IAM token /
+                    # DSQL session-max-duration). Reopen it once so a single drop does
+                    # not cascade into a wall of false "apply manually" entries for the
+                    # remaining FKs, then retry this FK's pre-check.
+                    try:
+                        probe.close()
+                    except Exception:  # noqa: BLE001 - best-effort close of the dead probe
+                        pass
+                    try:
+                        probe = connection_factory()
+                        orphans = _count_orphans(probe, table_name, fk)
+                    except Exception:  # noqa: BLE001 - reconnect/re-check still failing
+                        failed += 1
+                        _LOGGER.warning(
+                            "Orphan pre-check failed for FK %s (after reconnect)",
+                            target, exc_info=True,
+                        )
+                        log_activity(
+                            ActivityCategory.FULL_LOAD,
+                            "foreign key not applied",
+                            status=ActivityStatus.FAILURE,
+                            target=target,
+                            detail=(
+                                "orphan pre-check failed; verify referential integrity "
+                                "and apply this foreign key manually"
+                            ),
+                        )
+                        continue
+                else:
+                    failed += 1
+                    _LOGGER.warning("Orphan pre-check failed for FK %s", target, exc_info=True)
+                    log_activity(
+                        ActivityCategory.FULL_LOAD,
+                        "foreign key not applied",
+                        status=ActivityStatus.FAILURE,
+                        target=target,
+                        detail=(
+                            "orphan pre-check failed; verify referential integrity and "
+                            "apply this foreign key manually"
+                        ),
+                    )
+                    continue
+            if orphans:
+                skipped += 1
+                log_activity(
+                    ActivityCategory.FULL_LOAD,
+                    "foreign key not applied",
+                    status=ActivityStatus.FAILURE,
+                    target=target,
+                    detail=(
+                        f"{orphans} child row(s) reference a missing parent, so Aurora "
+                        "DSQL cannot enforce this foreign key. Resolve the orphan rows "
+                        "(often an un-replicated source cascade) and re-apply."
+                    ),
+                )
+                continue
+            try:
+                # DSQL only accepts ADD CONSTRAINT ... NOT VALID (renders that way);
+                # it enforces every NEW write immediately.
+                apply_foreign_key(add_ddl, connection_factory=connection_factory)
+                # Existing rows are consistent (the orphan pre-gate above was clean), so
+                # mark the constraint validated via the async VALIDATE job. Uses the
+                # DDL's own constraint name (not the metadata's) so it targets exactly
+                # the constraint just added. Best-effort: if it fails the FK still
+                # enforces all new writes.
+                if constraint_name is not None:
+                    try:
+                        validate_foreign_key(
+                            table_name, constraint_name,
+                            connection_factory=connection_factory,
+                        )
+                    except Exception:  # noqa: BLE001 - async VALIDATE is best-effort
+                        _LOGGER.warning(
+                            "VALIDATE CONSTRAINT deferred for %s (FK still enforces new writes)",
+                            target, exc_info=True,
+                        )
+                applied += 1
+            except Exception:  # noqa: BLE001 - non-blocking: the data is already loaded
+                failed += 1
+                _LOGGER.warning("Could not apply FK %s", target, exc_info=True)
+                log_activity(
+                    ActivityCategory.FULL_LOAD,
+                    "foreign key not applied",
+                    status=ActivityStatus.FAILURE,
+                    target=target,
+                    detail="could not be created automatically; apply it manually",
+                )
+    finally:
+        try:
+            probe.close()
+        except Exception:  # noqa: BLE001 - best-effort close
+            pass
+    log_activity(
+        ActivityCategory.FULL_LOAD,
+        "foreign keys applied",
+        status=ActivityStatus.INFO,
+        detail=(
+            f"post-load foreign keys: {applied} applied, {skipped} skipped "
+            f"(orphan rows), {failed} failed"
+        ),
+    )
+    return (applied, skipped, failed)
+
+
+# Matches ``ADD CONSTRAINT <name> FOREIGN KEY`` and captures <name>, either a
+# double-quoted identifier (as rendered) or a bare word (if a user typed it unquoted).
+_FK_CONSTRAINT_NAME_RE = re.compile(
+    r'ADD\s+CONSTRAINT\s+("(?:[^"]|"")+"|[^\s("]+)\s+FOREIGN\s+KEY',
+    re.IGNORECASE,
+)
+
+
+def _constraint_name_from_ddl(add_ddl: object) -> Optional[str]:
+    """Return the (unquoted) constraint name from an ``ADD CONSTRAINT ... FOREIGN KEY`` DDL.
+
+    The constraint name is the reliable key that pairs a rendered FK DDL with its
+    metadata (for the orphan pre-gate) and with the ``VALIDATE CONSTRAINT`` target --
+    more robust than positional pairing, which breaks when a user deletes/reorders FK
+    lines in the edited Schema-Conversion script. Returns ``None`` if the statement is
+    not a recognizable ADD-CONSTRAINT-FOREIGN-KEY (the caller then applies it without a
+    pre-gate rather than mis-keying another FK's metadata).
+    """
+    match = _FK_CONSTRAINT_NAME_RE.search(str(add_ddl))
+    if not match:
+        return None
+    token = match.group(1)
+    if len(token) >= 2 and token.startswith('"') and token.endswith('"'):
+        return token[1:-1].replace('""', '"')
+    return token
+
+
+def _count_orphans(connection: Any, child_table: str, fk: ForeignKeyDef) -> int:
+    """Count child rows whose foreign key points to a missing parent (target).
+
+    Read-only pre-gate for the post-load ``ADD CONSTRAINT``: an enforced foreign key
+    cannot be created while orphan rows exist, so this turns an opaque ALTER failure
+    into an actionable per-FK count. Reuses the Validation orphan query
+    (:func:`~dsql_migrator.core.validation_sql.build_orphan_count_sql`).
+
+    The count is wrapped in OCC retry: on Aurora DSQL even a read can raise a
+    serialization failure (OC001/40001) when the target is being written concurrently
+    (e.g. a live CDC sink at cut over), and a transient conflict must not be mistaken
+    for "orphan pre-check failed" and skip an otherwise-applicable foreign key.
+    """
+    from dsql_migrator.core.occ import with_occ_retry
+
+    def _run() -> int:
+        # A prior OC001 leaves the connection's transaction aborted; clear it before the
+        # retry so the re-run starts clean (a no-op / harmless on an autocommit conn).
+        try:
+            connection.rollback()
+        except Exception:  # noqa: BLE001 - best-effort
+            pass
+        cursor = connection.cursor()
+        try:
+            cursor.execute(build_orphan_count_sql(child_table, fk))
+            row = cursor.fetchone()
+        finally:
+            try:
+                cursor.close()
+            except Exception:  # noqa: BLE001 - best-effort close
+                pass
+        return int(row[0]) if row and row[0] is not None else 0
+
+    return with_occ_retry()(_run)()
 
 
 def default_migrator_factory(inputs: DataMigrationInputs) -> DataMigrator:

@@ -1032,3 +1032,84 @@ def test_recreate_table_fails_fast_on_a_permanently_unresolvable_host() -> None:
             jitter=_zero_jitter,
         )
     assert attempts["n"] == 1  # permanent -> one attempt, not the budget of 5
+
+
+# ---------------------------------------------------------------------------
+# apply_foreign_key: post-load ADD CONSTRAINT (Aurora DSQL enforces FKs)
+# ---------------------------------------------------------------------------
+
+_FK_ADD = (
+    'ALTER TABLE "orders" ADD CONSTRAINT "fk_user" '
+    'FOREIGN KEY ("user_id") REFERENCES "users" ("id")'
+)
+
+
+def test_apply_foreign_key_runs_the_add_constraint() -> None:
+    from dsql_migrator.core.schema_applier import apply_foreign_key
+
+    connection = _FakeConnection()
+    apply_foreign_key(
+        _FK_ADD,
+        connection_factory=lambda: connection,
+        sleep=_no_sleep,
+        jitter=_zero_jitter,
+    )
+    assert connection.executed == [_FK_ADD]
+
+
+def test_apply_foreign_key_retries_on_occ_conflict() -> None:
+    from dsql_migrator.core.schema_applier import apply_foreign_key
+
+    # First execute raises OC001 (40001); the per-statement OCC retry re-runs it.
+    connection = _FakeConnection(failures=[OCC_SQLSTATE])
+    apply_foreign_key(
+        _FK_ADD,
+        connection_factory=lambda: connection,
+        sleep=_no_sleep,
+        jitter=_zero_jitter,
+    )
+    assert connection.executed == [_FK_ADD]
+
+
+def test_apply_foreign_key_tolerates_duplicate_constraint() -> None:
+    # A reconnect can replay an ADD that already committed; the duplicate_object
+    # error (SQLSTATE 42710) must be treated as success, not re-raised.
+    from dsql_migrator.core.schema_applier import apply_foreign_key
+
+    connection = _FakeConnection(failures=["42710"])
+    apply_foreign_key(  # must NOT raise
+        _FK_ADD,
+        connection_factory=lambda: connection,
+        sleep=_no_sleep,
+        jitter=_zero_jitter,
+    )
+
+
+def test_apply_foreign_key_reraises_a_genuine_failure() -> None:
+    # A real, non-transient, non-duplicate error (e.g. 23503 FK violation) propagates,
+    # so the caller's post-pass can report the foreign key as not applied.
+    from dsql_migrator.core.schema_applier import apply_foreign_key
+
+    connection = _FakeConnection(failures=["23503"])
+    with pytest.raises(Exception):
+        apply_foreign_key(
+            _FK_ADD,
+            connection_factory=lambda: connection,
+            sleep=_no_sleep,
+            jitter=_zero_jitter,
+        )
+
+
+def test_validate_foreign_key_runs_async_validate() -> None:
+    # The NOT VALID FK's second step: ALTER TABLE ASYNC ... VALIDATE CONSTRAINT.
+    from dsql_migrator.core.schema_applier import validate_foreign_key
+
+    connection = _FakeConnection()
+    validate_foreign_key(
+        "orders", "fk_user",
+        connection_factory=lambda: connection, sleep=_no_sleep, jitter=_zero_jitter,
+    )
+    assert len(connection.executed) == 1
+    sqltext = connection.executed[0]
+    assert "ALTER TABLE ASYNC" in sqltext
+    assert "VALIDATE CONSTRAINT" in sqltext and '"fk_user"' in sqltext

@@ -497,7 +497,7 @@ def _auto_increment_table(name: str = "t") -> TableDef:
     )
 
 
-def test_foreign_keys_removed_and_preserved_as_metadata() -> None:
+def test_foreign_keys_preserved_as_post_load_add_constraint() -> None:
     table = TableDef(
         name="orders",
         columns=[
@@ -515,14 +515,106 @@ def test_foreign_keys_removed_and_preserved_as_metadata() -> None:
         ],
     )
     result = SchemaConverter().convert_table(table)
-    # DSQL does not support foreign keys: none are emitted in the DDL.
+    # FKs are NOT inlined in CREATE TABLE (the concurrent bulk load has no
+    # parent-before-child ordering); they are emitted as a post-load ADD CONSTRAINT.
     assert "FOREIGN KEY" not in result.target_ddl.upper()
     assert "REFERENCES" not in result.target_ddl.upper()
-    # The relationship is preserved as metadata for application-layer checks.
+    assert result.foreign_key_ddls == [
+        'ALTER TABLE "orders" ADD CONSTRAINT "fk_user" '
+        'FOREIGN KEY ("user_id") REFERENCES "users" ("id") NOT VALID'
+    ]
+    # The relationship is also kept as structured metadata.
     assert [fk.name for fk in result.preserved_foreign_keys] == ["fk_user"]
-    fk_warnings = [w for w in result.warnings if "foreign key" in w.message.lower()]
-    assert len(fk_warnings) == 1
-    assert fk_warnings[0].classification is Classification.MANUAL
+    # Aurora DSQL enforces FKs now, so the conversion note is advice, not a loss.
+    fk_notes = [w for w in result.warnings if "foreign key" in w.message.lower()]
+    assert len(fk_notes) == 1
+    assert fk_notes[0].kind is ConversionNoteKind.RECOMMENDATION
+
+
+def test_foreign_keys_stripped_when_preservation_disabled() -> None:
+    table = TableDef(
+        name="orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="INT"),
+            ColumnDef(name="user_id", mysql_type="INT"),
+        ],
+        primary_key=["id"],
+        foreign_keys=[
+            ForeignKeyDef(
+                name="fk_user",
+                columns=["user_id"],
+                referenced_table="users",
+                referenced_columns=["id"],
+            )
+        ],
+    )
+    result = SchemaConverter().convert_table(
+        table, SchemaConvertOptions(preserve_foreign_keys=False)
+    )
+    # Opting out strips the FK DDL entirely; the relationship is still recorded.
+    assert result.foreign_key_ddls == []
+    assert [fk.name for fk in result.preserved_foreign_keys] == ["fk_user"]
+    # The note flips to a LOSS: referential integrity moved to the application layer.
+    fk_notes = [w for w in result.warnings if "foreign key" in w.message.lower()]
+    assert len(fk_notes) == 1
+    assert fk_notes[0].kind is ConversionNoteKind.LOSS
+
+
+def test_foreign_key_ddl_renders_actions_composite_and_self_reference() -> None:
+    table = TableDef(
+        name="shipments",
+        columns=[
+            ColumnDef(name="id", mysql_type="INT"),
+            ColumnDef(name="warehouse_id", mysql_type="INT"),
+            ColumnDef(name="product_no", mysql_type="INT"),
+            ColumnDef(name="parent_id", mysql_type="INT"),
+        ],
+        primary_key=["id"],
+        foreign_keys=[
+            ForeignKeyDef(
+                name="fk_inv",
+                columns=["warehouse_id", "product_no"],
+                referenced_table="inventory",
+                referenced_columns=["warehouse_id", "product_no"],
+                on_delete="CASCADE",
+                on_update="RESTRICT",
+            ),
+            ForeignKeyDef(
+                name="fk_parent",
+                columns=["parent_id"],
+                referenced_table="shipments",  # self-referential
+                referenced_columns=["id"],
+                on_delete="SET_NULL",  # underscored spelling normalises to SET NULL
+            ),
+            ForeignKeyDef(
+                name="fk_default",
+                columns=["id"],
+                referenced_table="other",
+                referenced_columns=["id"],
+                on_delete="NO ACTION",  # the default -- clause omitted
+            ),
+            ForeignKeyDef(
+                name="fk_setdefault",
+                columns=["warehouse_id"],
+                referenced_table="other",
+                referenced_columns=["id"],
+                on_delete="SET DEFAULT",  # distinct DSQL action (counts toward the 3000-row cap)
+                on_update="SET DEFAULT",
+            ),
+        ],
+    )
+    assert SchemaConverter().convert_table(table).foreign_key_ddls == [
+        'ALTER TABLE "shipments" ADD CONSTRAINT "fk_inv" FOREIGN KEY '
+        '("warehouse_id", "product_no") REFERENCES "inventory" '
+        '("warehouse_id", "product_no") ON DELETE CASCADE ON UPDATE RESTRICT NOT VALID',
+        'ALTER TABLE "shipments" ADD CONSTRAINT "fk_parent" FOREIGN KEY '
+        '("parent_id") REFERENCES "shipments" ("id") ON DELETE SET NULL NOT VALID',
+        'ALTER TABLE "shipments" ADD CONSTRAINT "fk_default" FOREIGN KEY '
+        '("id") REFERENCES "other" ("id") NOT VALID',
+        'ALTER TABLE "shipments" ADD CONSTRAINT "fk_setdefault" FOREIGN KEY '
+        '("warehouse_id") REFERENCES "other" ("id") '
+        'ON DELETE SET DEFAULT ON UPDATE SET DEFAULT NOT VALID',
+    ]
 
 
 def test_secondary_unique_index_emitted_as_create_index_async() -> None:

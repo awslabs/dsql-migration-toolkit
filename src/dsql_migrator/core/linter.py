@@ -15,8 +15,6 @@ Detected patterns (Requirement 7.2):
   MODE``): DSQL uses optimistic concurrency control (OCC) and does not support
   pessimistic locks. The recommendation for these findings includes applying the
   ``40001`` (OC000/OC001) retry middleware when moving to OCC (Requirement 7.3).
-- **Foreign-key dependency** (``FOREIGN KEY``): DSQL has no foreign keys;
-  referential integrity must move to the application.
 - **AUTO_INCREMENT dependency** (``AUTO_INCREMENT``, ``LAST_INSERT_ID``): DSQL
   does not provide MySQL auto-increment semantics.
 - **Trigger / stored-routine usage** (``CREATE TRIGGER``, ``CREATE
@@ -78,6 +76,8 @@ class AntiPatternType(str, Enum):
     """The kinds of application anti-patterns this linter detects (Req 7.2)."""
 
     PESSIMISTIC_LOCK = "PESSIMISTIC_LOCK"
+    # Retained for back-compat with persisted reports; no longer emitted (Aurora DSQL
+    # supports enforced foreign keys as of 2026-08), so its summary count is always 0.
     FOREIGN_KEY_DEPENDENCY = "FOREIGN_KEY_DEPENDENCY"
     AUTO_INCREMENT_DEPENDENCY = "AUTO_INCREMENT_DEPENDENCY"
     TRIGGER_OR_ROUTINE_USAGE = "TRIGGER_OR_ROUTINE_USAGE"
@@ -243,16 +243,11 @@ def _default_patterns() -> list[_PatternDef]:
                 + _OCC_RETRY_NOTE
             ),
         ),
-        _PatternDef(
-            pattern=AntiPatternType.FOREIGN_KEY_DEPENDENCY,
-            regex=re.compile(r"\bFOREIGN\s+KEY\b", re.IGNORECASE),
-            matched_text=lambda m: m.group(0),
-            recommendation=lambda m: (
-                "Aurora DSQL does not support foreign key constraints. Remove the "
-                "foreign key and enforce referential integrity in the application "
-                "layer."
-            ),
-        ),
+        # NOTE: no FOREIGN_KEY_DEPENDENCY pattern. Aurora DSQL now supports enforced
+        # foreign keys (2026-08), so ``FOREIGN KEY`` in application SQL is no longer an
+        # anti-pattern. The enum member is retained for back-compat with persisted
+        # reports (its summary count is always 0). The runtime caveats (extra reads,
+        # OCC 40001 retry, 3000-row cascade limit) are surfaced by Schema Conversion.
         _PatternDef(
             pattern=AntiPatternType.AUTO_INCREMENT_DEPENDENCY,
             regex=re.compile(r"\b(AUTO_INCREMENT|LAST_INSERT_ID)\b", re.IGNORECASE),

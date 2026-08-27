@@ -437,7 +437,9 @@ def build_data_migration_screen(
                 migration_state, source_config, job_manager
             ),
             table_conversions=applied_table_conversions(
-                _conversion, conv_state.edited_target_ddls
+                _conversion,
+                conv_state.edited_target_ddls,
+                preserve_foreign_keys=conv_state.preserve_foreign_keys,
             ),
             # Converted view DDLs so a "drop & reload" run can pre-drop / recreate
             # views that depend on a replaced table (else the DROP is blocked).
@@ -588,6 +590,7 @@ def build_data_migration_screen(
             _applied = applied_table_conversions(
                 SchemaConverter(source_type=_stype).convert(inventory),
                 conv_state.edited_target_ddls,
+                preserve_foreign_keys=conv_state.preserve_foreign_keys,
             )
             migration_state.set_cdc_message_key_columns(
                 composite_key_columns_for_cdc(inventory.tables, _applied)
@@ -787,13 +790,16 @@ def build_data_migration_screen(
                             f"{len(_cascade_tables)} {_noun} use foreign keys with "
                             f"automatic ON DELETE/UPDATE actions ({_listed}). MySQL "
                             "applies those to child rows inside InnoDB, so they never "
-                            "reach the binary log — CDC cannot see them, and DSQL has "
-                            "no foreign keys to re-perform them. The child rows are "
-                            "left behind on the target with no error. Replace the "
-                            "automatic actions with explicit child-row statements in "
-                            "your application before starting CDC (you need that on "
-                            "DSQL anyway), and enable the orphan-record check in "
-                            "Validation. See Evaluation for the full list."
+                            "reach the binary log — CDC replicates the parent change "
+                            "but not the cascaded child change, leaving orphaned rows "
+                            "on the target during replication. The tool re-creates "
+                            "these foreign keys on Aurora DSQL only at cut over (never "
+                            "during replication), so any such orphan will then BLOCK "
+                            "the ADD CONSTRAINT and be reported by the Validation "
+                            "orphan-record check. Replace the automatic actions with "
+                            "explicit child-row statements in your application before "
+                            "starting CDC, and quiesce source writes before the final "
+                            "cut-over comparison. See Evaluation for the full list."
                         ),
                     )
 
@@ -1205,6 +1211,7 @@ def build_data_migration_screen(
                     table_conversions=applied_table_conversions(
                         _retry_conversion,
                         conv_state.edited_target_ddls,
+                        preserve_foreign_keys=conv_state.preserve_foreign_keys,
                     ),
                     dependent_view_ddls=applied_view_ddls(
                         _retry_conversion,
@@ -1675,6 +1682,9 @@ def build_data_migration_screen(
                                             )
                                         ).convert(inventory),
                                         conv_state.edited_target_ddls,
+                                        preserve_foreign_keys=(
+                                            conv_state.preserve_foreign_keys
+                                        ),
                                     )
                                     if inventory is not None
                                     else {}

@@ -297,7 +297,7 @@ def test_suggest_schema_conversion_grounds_prompt_and_returns_suggestion() -> No
         object_name="orders",
         source_ddl="CREATE TABLE `orders` (`id` INT AUTO_INCREMENT PRIMARY KEY)",
         deterministic_result="MANUAL: monotonic AUTO_INCREMENT key risks hot partition",
-        dsql_constraints="Foreign keys unsupported; primary key required; indexes async",
+        dsql_constraints="Foreign keys enforced; primary key required; indexes async",
     )
 
     # InvokeModel was called once with the configured model id (provenance).
@@ -307,7 +307,7 @@ def test_suggest_schema_conversion_grounds_prompt_and_returns_suggestion() -> No
     # The prompt is grounded with source DDL, DSQL constraints, deterministic result.
     prompt = _decode_prompt(client.calls[0])
     assert "CREATE TABLE `orders`" in prompt
-    assert "Foreign keys unsupported; primary key required; indexes async" in prompt
+    assert "Foreign keys enforced; primary key required; indexes async" in prompt
     assert "monotonic AUTO_INCREMENT key risks hot partition" in prompt
 
     # The returned suggestion is reviewable and carries provenance.

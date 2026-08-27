@@ -679,14 +679,17 @@ def _classify_edited_table_conversion(
     """Build a TableConversion from a user-edited target-DDL script.
 
     Splits the edited script and buckets statements by leading keyword
-    (CREATE SCHEMA / CREATE TABLE / CREATE INDEX) so the structured conversion
-    mirrors what Schema Apply applied. Anything missing falls back to the
-    deterministic conversion (e.g. an edit that only changed the CREATE TABLE
-    keeps the deterministic schema/index DDLs).
+    (CREATE SCHEMA / CREATE TABLE / CREATE INDEX / ALTER TABLE ... ADD CONSTRAINT
+    ... FOREIGN KEY) so the structured conversion mirrors what Schema Apply and the
+    post-load foreign-key pass will apply. Anything missing falls back to the
+    deterministic conversion (e.g. an edit that only changed the CREATE TABLE keeps
+    the deterministic schema DDLs); indexes and foreign keys honor the edit exactly
+    (removing one from the script drops it).
     """
     schema_ddls: list[str] = []
     create_ddl: Optional[str] = None
     index_ddls: list[str] = []
+    foreign_key_ddls: list[str] = []
     for statement in split_sql_statements(edited_script):
         stmt = statement.strip()
         if not stmt:
@@ -698,11 +701,15 @@ def _classify_edited_table_conversion(
             create_ddl = stmt
         elif head.startswith("CREATE") and "INDEX" in head:
             index_ddls.append(stmt)
+        elif head.startswith("ALTER TABLE") and "FOREIGN KEY" in head:
+            # A preserved foreign key, applied as a post-load ADD CONSTRAINT.
+            foreign_key_ddls.append(stmt)
     return TableConversion(
         table=deterministic.table,
         target_ddl=create_ddl or deterministic.target_ddl,
         schema_ddls=schema_ddls or list(deterministic.schema_ddls),
         index_ddls=index_ddls,
+        foreign_key_ddls=foreign_key_ddls,
         preserved_foreign_keys=list(deterministic.preserved_foreign_keys),
         warnings=list(deterministic.warnings),
     )
@@ -711,6 +718,8 @@ def _classify_edited_table_conversion(
 def applied_table_conversions(
     result: SchemaConversionResult,
     edited_target_ddls: Mapping[str, str],
+    *,
+    preserve_foreign_keys: bool = True,
 ) -> dict[str, TableConversion]:
     """Per-table APPLIED conversion (honoring user edits), keyed by table name.
 
@@ -720,15 +729,25 @@ def applied_table_conversions(
     target schema the Schema Apply step applied -- driving value conversion off
     the applied column types and recreating a fresh-load target from the applied
     (not re-derived) DDL.
+
+    ``preserve_foreign_keys`` is the single choke point for the Schema Conversion
+    foreign-key toggle: when ``False`` the rendered FK DDL is dropped from EVERY
+    conversion (whether it came from the deterministic result, a user edit, or a
+    baked primary-key-strategy script), so Full Load never re-creates the foreign
+    keys and referential integrity is left to the application. The FKs remain in
+    ``preserved_foreign_keys`` as metadata (e.g. for the Validation orphan check).
     """
     conversions: dict[str, TableConversion] = {}
     for table in result.tables:
         edited = edited_target_ddls.get(table.table)
-        conversions[table.table] = (
+        conv = (
             _classify_edited_table_conversion(table, edited)
             if edited is not None
             else table
         )
+        if not preserve_foreign_keys and conv.foreign_key_ddls:
+            conv = conv.model_copy(update={"foreign_key_ddls": []})
+        conversions[table.table] = conv
     return conversions
 
 

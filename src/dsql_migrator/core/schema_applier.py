@@ -146,6 +146,7 @@ _SCHEMA = "SCHEMA"
 # this code too. Used to make a SKIP_IF_EXISTS apply idempotently self-heal when
 # the pre-apply introspection snapshot was stale (Property 5 spirit).
 _DUPLICATE_OBJECT_SQLSTATE = "42P07"
+_DUPLICATE_CONSTRAINT_SQLSTATE = "42710"
 
 # PostgreSQL ``program_limit_exceeded``. Aurora DSQL raises this on ``CREATE SCHEMA``
 # when the cluster is already at its hard cap of 10 schemas ("more than 10 schemas
@@ -716,6 +717,88 @@ def _is_duplicate_object(exc: BaseException) -> bool:
     return getattr(exc, "sqlstate", None) == _DUPLICATE_OBJECT_SQLSTATE
 
 
+def _is_duplicate_constraint(exc: BaseException) -> bool:
+    """Return ``True`` if ``exc`` means the constraint already exists.
+
+    PostgreSQL/DSQL raise ``duplicate_object`` (``SQLSTATE 42710``) when
+    ``ALTER TABLE ... ADD CONSTRAINT`` names a constraint that is already present.
+    Treated as success by :func:`apply_foreign_key` so a reconnect that replays an
+    already-committed ADD is idempotent.
+    """
+    return getattr(exc, "sqlstate", None) == _DUPLICATE_CONSTRAINT_SQLSTATE
+
+
+def apply_foreign_key(
+    add_ddl: object,
+    *,
+    connection_factory: ConnectionFactory,
+    occ_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    occ_base_delay: float = DEFAULT_BASE_DELAY_SECONDS,
+    sleep: SleepFunc = time.sleep,
+    jitter: JitterFunc = random.random,
+) -> None:
+    """Apply one preserved foreign key as a post-load ``ALTER TABLE ADD CONSTRAINT``.
+
+    Aurora DSQL enforces foreign keys, but they must NOT exist during the
+    concurrent, cross-table bulk load (a child row can commit before its parent),
+    so each FK is added AFTER the load, as its own single autocommit DDL (DSQL
+    allows one DDL per transaction) with OC001 (40001) retry and a connection-level
+    transient reconnect. ``ADD CONSTRAINT`` is not natively idempotent, so a
+    reconnect that replays an already-committed ADD raises ``duplicate_object``
+    (SQLSTATE 42710); that is treated as success, because the constraint being
+    present is the goal.
+    """
+    try:
+        _run_ddls_reconnecting(
+            connection_factory,
+            [add_ddl],
+            occ_max_attempts=occ_max_attempts,
+            occ_base_delay=occ_base_delay,
+            sleep=sleep,
+            jitter=jitter,
+        )
+    except Exception as exc:  # noqa: BLE001 - duplicate == already applied (idempotent)
+        if _is_duplicate_constraint(exc):
+            return
+        raise
+
+
+def validate_foreign_key(
+    table_name: str,
+    constraint_name: str,
+    *,
+    connection_factory: ConnectionFactory,
+    occ_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    occ_base_delay: float = DEFAULT_BASE_DELAY_SECONDS,
+    sleep: SleepFunc = time.sleep,
+    jitter: JitterFunc = random.random,
+) -> None:
+    """Validate a ``NOT VALID`` foreign key against existing rows (async DDL).
+
+    The counterpart to :func:`apply_foreign_key`: on Aurora DSQL an ``ADD CONSTRAINT``
+    must be ``NOT VALID`` (enforces new writes without scanning existing data), so
+    ``ALTER TABLE ASYNC <t> VALIDATE CONSTRAINT <name>`` then marks the constraint
+    validated for the already-loaded rows. It runs as an async DDL job (returns
+    immediately). Callers run it best-effort after their orphan pre-gate is clean, so
+    it is expected to succeed; if it does not, the constraint still enforces every new
+    write. Identifiers are composed injection-safely.
+    """
+    from dsql_migrator.core.validation_sql import _pg_table_identifier
+
+    ddl = sql.SQL("ALTER TABLE ASYNC {tbl} VALIDATE CONSTRAINT {name}").format(
+        tbl=_pg_table_identifier(table_name),
+        name=sql.Identifier(constraint_name),
+    )
+    _run_ddls_reconnecting(
+        connection_factory,
+        [ddl],
+        occ_max_attempts=occ_max_attempts,
+        occ_base_delay=occ_base_delay,
+        sleep=sleep,
+        jitter=jitter,
+    )
+
+
 def _is_dependent_objects_error(exc: BaseException) -> bool:
     """Return ``True`` if a DROP failed because another object depends on the target.
 
@@ -820,4 +903,6 @@ __all__ = [
     "ConnectionFactory",
     "parse_create_object",
     "recreate_table",
+    "apply_foreign_key",
+    "validate_foreign_key",
 ]

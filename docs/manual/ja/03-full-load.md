@@ -74,7 +74,7 @@ PK を要求するため、Evaluation でも `UNSUPPORTED` としてフラグ付
 - `DATETIME` → UTC に正規化された `timestamp`、`TIMESTAMP` → `timestamptz`。
 - `BLOB`/`BINARY`/`VARBINARY` 系 → `bytea`。
 
-マッピングの全体(および「外部キーなし」のような DSQL 制約の扱い方)は
+マッピングの全体(および値あたり 1 MiB 制限のような DSQL 制約の扱い方)は
 [第 2 章 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-の型と制約の処理-リファレンス)と
 Schema Conversion ステップにあります。
 

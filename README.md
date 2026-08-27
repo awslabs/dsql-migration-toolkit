@@ -8,7 +8,7 @@ Bedrock)** for the parts that genuinely need judgment.
 
 Aurora DSQL is a PostgreSQL 16–compatible *distributed* database. A **MySQL** source
 is a **heterogeneous migration** with two overlapping conversions: MySQL → PostgreSQL
-dialect, then PostgreSQL → DSQL constraints (no foreign keys, optimistic concurrency,
+dialect, then PostgreSQL → DSQL constraints (optimistic concurrency,
 per-transaction row/time limits, async indexes, `C` collation, …). A **PostgreSQL**
 source skips the dialect step (both ends are PostgreSQL) and applies only the DSQL
 constraints.
@@ -48,8 +48,8 @@ tool, and an optional continuous **CDC** stream on managed MSK Connect. A waterm
 - **Assessment** — introspects the source schema (MySQL or PostgreSQL) and classifies every
   object (`AUTO` / `MANUAL` / `UNSUPPORTED`), with effort estimates and name-conflict detection.
 - **Schema conversion** — converts the source schema to DSQL DDL (type mapping, foreign-key
-  removal, asynchronous indexes, primary-key strategies) and applies it after your review from
-  an object tree.
+  preservation (re-created after load), asynchronous indexes, primary-key strategies) and applies
+  it after your review from an object tree.
 - **Full Load** — streams a consistent snapshot into DSQL in bounded-memory batches;
   resumable and built for large tables.
 - **Change data capture (CDC)** — optional continuous replication that keeps the target
@@ -70,7 +70,7 @@ tool, and an optional continuous **CDC** stream on managed MSK Connect. A waterm
 - **Doesn't replicate DDL over CDC** — schema changes go through Schema Conversion, not
   the replication stream.
 - **Single region only** — the source and target must be in the same AWS region.
-- **Inherits DSQL's constraints** — no foreign keys, triggers, or stored procedures; a
+- **Inherits DSQL's constraints** — no triggers or stored procedures; a
   per-transaction row limit; a ~1 MiB per-value limit; and more.
 
 > Full enforced-limit list and workarounds: User Manual

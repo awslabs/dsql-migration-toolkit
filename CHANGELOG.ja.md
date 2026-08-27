@@ -5,6 +5,57 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.400
+
+### 追加 (Added)
+
+- **Aurora DSQL が enforced な外部キーをサポート**(2026-08-27 発表)したため、本ツールは外部
+  キーを削除する代わりに**保持**します。Schema Conversion は各ソース FK をロード後に実行する
+  `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` 文(`TableConversion.foreign_key_ddls`)として
+  レンダリングし — 並行・テーブル横断のバルクロードが順序に依存しないよう `CREATE TABLE` からは
+  除外します — アプリケーション層で整合性を強制する場合向けの削除オプション
+  (`SchemaConvertOptions.preserve_foreign_keys=False`)も用意します。
+- **Full Load は保持した外部キーをデータロード後の実行単位(run-level)の後処理パスとして適用**
+  します。各 `ADD CONSTRAINT … NOT VALID` は OCC(40001)リトライと再接続を備えた単一 DDL の
+  autocommit トランザクションとして実行されます(新規 `schema_applier.apply_foreign_key`、重複
+  許容)。DSQL は `NOT VALID` の `ADD CONSTRAINT` のみを受け付け(既存行をスキャンせずにすべての
+  新規書き込みを即座に強制)、ロード済みの行はその後、非同期の
+  `ALTER TABLE ASYNC … VALIDATE CONSTRAINT`(`schema_applier.validate_foreign_key`)で確認され
+  ます。**orphan 事前ゲート**(Validation の orphan クエリを再利用)が、子行が存在しない親を参照する
+  外部キーを — 実行可能な FK ごとの activity-log エントリとともに — スキップし、`ALTER` が不透明
+  に失敗しないようにします。事前ゲートのカウント自体が OCC リトライ安全(OCC-retry-safe)であり、
+  cut over 時のライブ CDC sink による一時的なシリアライゼーション失敗(OC001/40001)を事前チェック
+  の失敗と誤認しません。また共有の事前ゲートプローブはパス途中の接続断でも残りの外部キーをすべて
+  失敗させる代わりに再接続します。レンダリングされた各 FK DDL は**制約名(constraint name)で**
+  メタデータと対応付けられるため、Schema Conversion のターゲットスクリプトで外部キー行を削除・並べ替え
+  ても、事前ゲートと `VALIDATE` が実際に追加される制約を正しく対象にします。
+  **CDC マイグレーション**では適用が**cut over へ延期(deferred)**され
+  ます(sink が順不同の行をストリーミングしている間は外部キーが存在してはなりません — FK 違反を
+  dead-letter 処理、SQLSTATE 23503)。
+- **Schema Conversion に「Preserve foreign keys」トグル**(既定でオン)が追加され、オフにすると
+  変換と Full Load から外部キーを削除します。**ターゲットプレビューに外部キー DDL が表示**される
+  ようになり、編集後のターゲットスクリプト再パーサが編集済みの `ADD CONSTRAINT … FOREIGN KEY`
+  を保持します。
+- **Cut over ランブックに「Apply foreign keys」アクションが追加**されました(CDC マイグレーション
+  向け)。最終ドレイン後(かつ repoint 前)に Aurora DSQL 上で延期された外部キーを orphan ゲート
+  かつ冪等(idempotent)に再作成し、適用/スキップ(orphan 行)/失敗の件数を報告します。
+
+### 変更 (Changed)
+
+- **Evaluation の外部キー所見が advisory(推奨、必要な作業量なし)に**なりました。従来の MANUAL
+  「サポートされていません — 削除してください」ギャップではなく、ランタイム上の注意事項(参照
+  される/参照する側テーブルの DML での追加読み取り、リトライ可能な 40001 の競合、そして 3000 行
+  トランザクション上限に算入される `CASCADE` / `SET NULL` / `SET DEFAULT`)を併せて示します。
+  ルール id `FK_UNSUPPORTED` → `FK_PRESERVED`。
+- **CDC 中の cascade 所見 + バナー**は(依然として実在する)警告を維持しつつ文言を見直しました:
+  複製されないソース cascade は、サイレントな divergence ではなく、**cut over の FK 適用時点での
+  ブロッキング orphan** として表面化します(Validation の orphan チェックが捕捉)。
+- いまや誤りとなった「Aurora DSQL には外部キーがない / アプリケーション層で強制する」という
+  ガイダンスを converter、assessor、validator および AI grounding 定数の全体で修正しました。
+  クエリリンタは `FOREIGN KEY` をアンチパターンとしてフラグしなくなりました
+  (`FOREIGN_KEY_DEPENDENCY` は後方互換のため保持しますが、もはや emit されません)。また
+  `CLAUDE.md` の Aurora DSQL ドメイン制約セクションも更新しました。
+
 ## v0.1.399
 
 ### 変更 (Changed)

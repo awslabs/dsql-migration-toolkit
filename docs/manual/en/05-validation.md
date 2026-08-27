@@ -78,9 +78,13 @@ evidence supports it:
 - A failure comparing one table is **isolated** to that table's error entry — it
   never aborts the run or silently passes the rest.
 
-Because DSQL has no foreign keys, an optional **orphan check** can count target
-child rows whose preserved (app-enforced) foreign key has no matching parent —
-useful for confirming referential integrity held up after FK removal.
+Aurora DSQL **enforces** foreign keys, and the tool re-creates them after the load
+(at cut over for a CDC migration). An optional **orphan check** counts target child
+rows whose (non-null) foreign key has no matching parent: it is the **pre-apply
+gate** for that step — an enforced `ADD CONSTRAINT` fails if any child row is
+orphaned, so the tool skips that constraint with an actionable message rather than
+failing the run — and it is the referential-integrity safety net when you chose to
+**strip** the foreign keys instead.
 
 For a table that mismatches, an optional bounded **row-diff sample** lists a few
 differing PKs (and checksum tokens) — **never the row values** — so you can

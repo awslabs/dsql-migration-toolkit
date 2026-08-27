@@ -78,7 +78,7 @@ examples MySQL users should know:
 - `DATETIME` → `timestamp` normalized to UTC; `TIMESTAMP` → `timestamptz`.
 - `BLOB`/`BINARY`/`VARBINARY` family → `bytea`.
 
-The full mapping (and how DSQL constraints like "no foreign keys" are handled)
+The full mapping (and how DSQL constraints like the 1 MiB per-value limit are handled)
 lives in [Chapter 2 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-type-and-constraint-handling-reference)
 and the Schema Conversion step.
 

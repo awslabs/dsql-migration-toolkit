@@ -15,7 +15,7 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 
 | 한계 | 결과 | 도구 동작 |
 |---|---|---|
-| **외래 키 없음** | DSQL에서 참조 무결성은 애플리케이션 책임. | FK 정의는 DDL에서 제거하되 리포트에 보존; **MANUAL** 플래그. |
+| **외래 키(지원·강제됨)** | DSQL은 강제되는 외래 키를 지원합니다. 다만 참조/피참조 테이블에 대한 DML에는 추가 읽기 비용이 있고, `CASCADE`/`SET NULL`/`SET DEFAULT` 동작은 트랜잭션당 3,000행 한도에 포함됩니다. | FK를 제거하지 않고 **보존** — 적재 후 실행할 `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY`로 렌더링(`CREATE TABLE` 밖)해 데이터 적재 뒤 다시 생성하며, CDC 마이그레이션은 cut over 시점에 적용. Evaluation은 이를 **권고(RECOMMENDED, 필수 작업 아님)**로 분류하고, 원하면 떼어 낼 수도 있음(`preserve_foreign_keys=False`). |
 | **소스 `CHECK` 제약** | MySQL `CHECK`(8.0.16+)는 타깃으로 변환되지 않음. | DDL에서 드롭되고 **MANUAL** 플래그 — DSQL 호환 `CHECK`를 직접 다시 추가하거나 앱에서 강제. (도구가 `ENUM`용으로 *생성*하는 `CHECK … IN (...)`은 영향 없음.) |
 | **기본 키 필수** | PK 없는 테이블은 마이그레이션 불가. | **UNSUPPORTED** 플래그; Full Load도 차단(keyset export에 PK 필요). |
 | **트리거/저장 프로시저/함수/스케줄 이벤트 없음** | 서버 측 로직은 옮겨지지 않음. | **UNSUPPORTED** — 애플리케이션으로 재구현(이벤트 → EventBridge/Lambda). |
@@ -32,7 +32,7 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 | **`TRUNCATE` 없음; 트랜잭션당 DDL 한 개; 낙관적 동시성** | MySQL과 다른 쓰기/DDL 의미. | 투명하게 처리: TRUNCATE 대신 DROP+재생성, 단일 DDL 단위, 필요한 곳마다 `40001` 재시도. |
 | **IAM 토큰 인증(비밀번호 없음); 단기 토큰** | 정적 DB 비밀번호 없음. | 도구(와 CDC 싱크)가 IAM 토큰을 자동 발급·갱신. |
 
-> **스키마 설계의 결론:** 관계 무결성, 대형 blob, 서버 측 로직, 매우 높은 정밀도의 숫자는 DSQL에
+> **스키마 설계의 결론:** 대형 blob, 서버 측 로직, 매우 높은 정밀도의 숫자는 DSQL에
 > 맡기기 *전에* 데이터베이스 밖의 애플리케이션으로 옮기세요. 어떤 객체에 이 작업이 필요한지는
 > Evaluation이 정확히 알려 줍니다.
 
@@ -55,8 +55,9 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   ([4장 §4.2](04-cdc-and-dsql-constraints.md#42-cdc는-스키마가-아니라-데이터를-복제--중요) 참조).
 - **캐스케이드 FK 동작은 CDC로 복제되지 않음.** InnoDB의 `ON DELETE/UPDATE CASCADE`(및 `SET NULL`/
   `SET DEFAULT`)는 MySQL *내부*에서 발생해 binlog에 남지 않으므로 CDC가 적용할 수 없습니다 — 소스가
-  캐스케이드한 자식 행이 타깃에 orphan으로 남을 수 있습니다. Evaluation이 해당 테이블을 **MANUAL**로
-  표시하며, 캐스케이드는 애플리케이션에서 강제하세요.
+  캐스케이드한 자식 행이 타깃에 orphan으로 남습니다. 이 orphan은 조용히 어긋나 버리는 대신 **cut over
+  시점의 외래 키 적용(`ADD CONSTRAINT`)을 차단**하며(Validation의 **고아 검사**가 먼저 잡아냄), 그래서
+  cut over 전에 정리하게 됩니다. Evaluation이 해당 테이블을 표시합니다.
 - **CDC는 배포되어 있는 동안 과금됨.** 스트리밍 파이프라인(MSK Serverless + MSK Connect, NAT 게이트웨이를
   만들었다면 그것까지)은 실행되는 내내 비용이 발생합니다. Cut over 후에는 cdc-stack을 내리세요. Full Load만
   수행하면 스트리밍 인프라가 프로비저닝되지 않습니다.

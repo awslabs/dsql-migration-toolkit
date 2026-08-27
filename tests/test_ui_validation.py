@@ -2310,6 +2310,169 @@ def test_cutover_section_shows_sync_outcome_when_present() -> None:
     assert "no server-generated key needed advancing" in " ".join(ui2.texts)
 
 
+# ---------------------------------------------------------------------------
+# Cut-over foreign-key apply (CDC migrations: FKs are applied at cut over)
+# ---------------------------------------------------------------------------
+
+
+def _fk_inventory():
+    from dsql_migrator.core.models import (
+        ColumnDef, ForeignKeyDef, SourceInventory, TableDef,
+    )
+
+    return SourceInventory(
+        tables=[
+            TableDef(
+                name="orders",
+                columns=[
+                    ColumnDef(name="id", mysql_type="int"),
+                    ColumnDef(name="uid", mysql_type="int"),
+                ],
+                primary_key=["id"],
+                foreign_keys=[
+                    ForeignKeyDef(
+                        name="fk_u",
+                        columns=["uid"],
+                        referenced_table="users",
+                        referenced_columns=["id"],
+                    )
+                ],
+            )
+        ]
+    )
+
+
+def test_cutover_section_apply_foreign_keys_button_defers_to_click() -> None:
+    # For a CDC migration with pending FKs, the runbook renders an "Apply foreign keys"
+    # button whose handler is the provider; rendering must not run it (no target write).
+    from dsql_migrator.ui.validation import _render_cutover_section
+
+    provider_calls: list = []
+    ui = _RecheckUi()
+    _render_cutover_section(
+        ui, _cutover_summary(), _no_drift(), cdc_in_use=True,
+        fk_apply_provider=lambda: provider_calls.append(True),
+        fk_apply_result=None,
+        fk_pending_count=2,
+    )
+    fk_buttons = [(t, cb) for t, cb in ui.buttons if "Apply foreign keys" in t]
+    assert len(fk_buttons) == 1
+    _text, on_click = fk_buttons[0]
+    assert provider_calls == []  # rendering does not apply
+    on_click()
+    assert provider_calls == [True]
+
+
+def test_cutover_section_fk_block_hidden_for_full_load_only() -> None:
+    # Full Load applies FKs automatically, so the cut-over runbook shows no FK action.
+    from dsql_migrator.ui.validation import _render_cutover_section
+
+    ui = _CutoverUi()
+    _render_cutover_section(
+        ui, _cutover_summary(), _no_drift(), cdc_in_use=False,
+        fk_apply_provider=lambda: None,
+        fk_pending_count=2,
+    )
+    assert "apply foreign keys" not in " ".join(ui.texts).lower()
+
+
+def test_cutover_section_fk_block_warns_on_orphans() -> None:
+    from dsql_migrator.ui.validation import _render_cutover_section
+
+    ui = _CutoverUi()
+    _render_cutover_section(
+        ui, _cutover_summary(), _no_drift(), cdc_in_use=True,
+        fk_apply_provider=lambda: None,
+        fk_apply_result=(1, 2, 0),  # 2 skipped for orphan rows
+        fk_pending_count=3,
+    )
+    blob = " ".join(ui.texts)
+    assert "Some foreign keys were not applied" in blob
+
+
+def test_run_cutover_foreign_keys_applies_and_records(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+    from dsql_migrator.core.models import (
+        SourceConnectionConfig, SourceType, TargetConnectionConfig,
+    )
+    from dsql_migrator.ui.validation import ValidationState, _run_cutover_foreign_keys
+
+    inv = _fk_inventory()
+    eval_store = SimpleNamespace(
+        get_or_create=lambda sid: SimpleNamespace(
+            result=SimpleNamespace(inventory=inv)
+        )
+    )
+    conv_store = SimpleNamespace(
+        get=lambda sid: SimpleNamespace(
+            edited_target_ddls={}, preserve_foreign_keys=True
+        )
+    )
+    session = SimpleNamespace(
+        target_config=TargetConnectionConfig(
+            cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"
+        ),
+        aws_profile=None,
+        source_config=SourceConnectionConfig(
+            host="h", database="d", source_type=SourceType.MYSQL
+        ),
+    )
+    state = ValidationState()
+
+    captured: dict = {}
+
+    def _fake_apply(conversions, connection_factory):
+        captured["tables"] = sorted(conversions)
+        return (1, 0, 0)
+
+    monkeypatch.setattr(engine, "apply_preserved_foreign_keys", _fake_apply)
+    monkeypatch.setattr(
+        "dsql_migrator.core.target_connection.DsqlConnector",
+        lambda *a, **k: SimpleNamespace(connect=lambda: object()),
+    )
+
+    _run_cutover_foreign_keys(
+        session, state, eval_store=eval_store, conversion_store=conv_store,
+        session_id="s", job_manager=None, refresh=lambda: None,
+    )
+    assert state.cutover_fk_apply == (1, 0, 0)
+    assert captured["tables"] == ["orders"]
+
+
+def test_run_cutover_foreign_keys_noops_without_state() -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.validation import ValidationState, _run_cutover_foreign_keys
+
+    state = ValidationState()
+    _run_cutover_foreign_keys(
+        SimpleNamespace(target_config=None, aws_profile=None, source_config=None),
+        state, eval_store=None, conversion_store=None, session_id="s",
+        job_manager=None, refresh=lambda: None,
+    )
+    assert state.cutover_fk_apply == (0, 0, 0)
+
+
+def test_cutover_pending_foreign_keys_counts_and_respects_toggle() -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.validation import _cutover_pending_foreign_keys
+
+    eval_store = SimpleNamespace(
+        get_or_create=lambda sid: SimpleNamespace(
+            result=SimpleNamespace(inventory=_fk_inventory())
+        )
+    )
+    on = SimpleNamespace(get=lambda sid: SimpleNamespace(preserve_foreign_keys=True))
+    off = SimpleNamespace(get=lambda sid: SimpleNamespace(preserve_foreign_keys=False))
+
+    assert _cutover_pending_foreign_keys(eval_store, on, "s") == 1
+    assert _cutover_pending_foreign_keys(eval_store, off, "s") == 0  # toggle off
+    assert _cutover_pending_foreign_keys(None, on, "s") == 0  # no eval store
+
+
 def test_cutover_screen_has_no_render_time_sync_entrypoint() -> None:
     # The old render-time entrypoint is gone; the screen wires an explicit button
     # provider instead. Source-level backstop for the executable tests above.

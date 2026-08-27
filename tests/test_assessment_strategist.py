@@ -69,7 +69,7 @@ def _assessment() -> AssessmentReport:
         [
             AssessmentItem(
                 object_name="orders",
-                rule_id="FK_UNSUPPORTED",
+                rule_id="FK_PRESERVED",
                 classification=Classification.MANUAL,
                 risk="FK not supported",
                 recommendation="drop FK",
@@ -98,8 +98,8 @@ def _well_formed_text() -> str:
             "insights": [
                 {
                     "object_name": "orders",
-                    "recommendation": "Enforce FK in the application layer.",
-                    "rationale": "DSQL has no foreign keys.",
+                    "recommendation": "Preserve the foreign key; DSQL enforces it after load.",
+                    "rationale": "Aurora DSQL enforces foreign keys.",
                     "effort": "SIMPLE",
                 },
                 {
@@ -268,7 +268,7 @@ class _BoomStreamClient:
 def _guidance_item() -> AssessmentItem:
     return AssessmentItem(
         object_name="orders",
-        rule_id="FK_UNSUPPORTED",
+        rule_id="FK_PRESERVED",
         classification=Classification.MANUAL,
         effort=EffortLevel.SIMPLE,
         kind="TABLE",
@@ -276,17 +276,17 @@ def _guidance_item() -> AssessmentItem:
 
 
 def test_stream_object_guidance_emits_chunks_and_returns_markdown() -> None:
-    client = _FakeStreamClient(["## Why\n", "Foreign keys ", "are unsupported."])
+    client = _FakeStreamClient(["## Why\n", "Foreign keys ", "are enforced."])
     strategist = AssessmentStrategist(_config(), client=client)
     seen: list[str] = []
 
     outcome = strategist.stream_object_guidance(_guidance_item(), seen.append)
 
     # Every delta was emitted in order, and the final markdown is their join.
-    assert seen == ["## Why\n", "Foreign keys ", "are unsupported."]
+    assert seen == ["## Why\n", "Foreign keys ", "are enforced."]
     assert outcome.available is True
     assert outcome.reason == "OK"
-    assert outcome.markdown == "## Why\nForeign keys are unsupported."
+    assert outcome.markdown == "## Why\nForeign keys are enforced."
     assert outcome.model_id == "test-model"
     assert client.calls and client.calls[0]["modelId"] == "test-model"
 

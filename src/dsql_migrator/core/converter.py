@@ -39,9 +39,13 @@ alongside the converted DDL.
 DSQL constraints (Requirements 3.3, 3.4, 3.5, 3.7) are applied on top of the
 type-mapping foundation:
 
-- Foreign keys are removed from the target DDL and preserved as referential
-  metadata (``TableConversion.preserved_foreign_keys``) so that referential
-  integrity can be enforced in the application layer (Requirement 3.3).
+- Foreign keys are preserved and rendered as separate post-load
+  ``ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY`` statements
+  (``TableConversion.foreign_key_ddls``). Aurora DSQL enforces foreign keys (as
+  of 2026-08); they are kept out of ``CREATE TABLE`` and applied *after* the data
+  load so the concurrent, cross-table bulk load stays order-independent. The user
+  can opt to strip them instead (``SchemaConvertOptions.preserve_foreign_keys``)
+  and enforce referential integrity in the application layer (Requirement 3.3).
 - Secondary indexes are emitted as separate ``CREATE INDEX ASYNC`` statements
   (``TableConversion.index_ddls``), matching DSQL asynchronous index creation
   (Requirement 3.4).
@@ -220,10 +224,11 @@ class TableConversion(BaseModel):
     """The converted target DDL for a single source table plus its warnings.
 
     ``index_ddls`` holds the table's secondary indexes rendered as separate
-    ``CREATE INDEX ASYNC`` statements (Requirement 3.4). ``preserved_foreign_keys``
-    keeps the source foreign keys that were removed from ``target_ddl`` so that
-    referential integrity can be re-established in the application layer
-    (Requirement 3.3).
+    ``CREATE INDEX ASYNC`` statements (Requirement 3.4). ``foreign_key_ddls`` holds
+    the source foreign keys rendered as separate post-load
+    ``ALTER TABLE ... ADD CONSTRAINT`` statements, applied after the data load (empty
+    when the user chose to strip them); ``preserved_foreign_keys`` keeps the same
+    foreign keys as structured metadata (Requirement 3.3).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -242,9 +247,21 @@ class TableConversion(BaseModel):
         default_factory=list,
         description="CREATE INDEX ASYNC statements for the table's indexes.",
     )
+    foreign_key_ddls: list[str] = Field(
+        default_factory=list,
+        description=(
+            "ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY statements for the "
+            "table's foreign keys, applied as a run-level post-load pass (at cut "
+            "over for a CDC migration). Empty when the user chose to strip foreign "
+            "keys."
+        ),
+    )
     preserved_foreign_keys: list[ForeignKeyDef] = Field(
         default_factory=list,
-        description="Foreign keys removed from the DDL, kept as referential metadata.",
+        description=(
+            "Source foreign keys kept as structured metadata; rendered as DDL in "
+            "foreign_key_ddls."
+        ),
     )
     warnings: list[ConversionWarning] = Field(default_factory=list)
 
@@ -337,6 +354,15 @@ class SchemaConvertOptions(BaseModel):
             "required for and only valid with that strategy."
         ),
     )
+    preserve_foreign_keys: bool = Field(
+        default=True,
+        description=(
+            "Preserve source foreign keys and re-create them on Aurora DSQL "
+            "(applied after the data load / at cut over). Aurora DSQL enforces "
+            "foreign keys; set False to strip them and enforce referential "
+            "integrity in the application layer instead."
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_composite_pairing(self) -> "SchemaConvertOptions":
@@ -414,9 +440,11 @@ class SchemaConversionResult(BaseModel):
         order), then all ``CREATE INDEX ASYNC`` units (in inventory order, then
         each table's index order). A schema is created before its tables and an
         index references its table, so every table is created before any index;
-        DSQL removes foreign keys, so there is no cross-table ``CREATE TABLE``
-        ordering constraint and inventory order is a stable, deterministic global
-        order. No DML is interleaved, preserving the DDL/DML separation rule
+        foreign keys are applied as a separate post-load ``ADD CONSTRAINT`` pass
+        (``TableConversion.foreign_key_ddls``, not emitted here), so there is no
+        cross-table ``CREATE TABLE`` ordering constraint and inventory order is a
+        stable, deterministic global order. No DML is interleaved, preserving the
+        DDL/DML separation rule
         (Property 2).
         """
         table_units: list[ExecutionUnit] = []
@@ -1304,9 +1332,10 @@ def _build_source_ddl(table: TableDef) -> str:
     A schema-qualified ``database.table`` name is rendered as a qualified
     identifier so it transpiles to a PostgreSQL ``"schema"."table"`` rather than
     a single flat identifier. Foreign keys and secondary indexes are
-    intentionally not emitted here: foreign keys are removed for DSQL (preserved
-    as metadata by the caller) and indexes are rendered separately as
-    ``CREATE INDEX ASYNC``. Raises ``ValueError`` if the table has no columns.
+    intentionally not emitted here: foreign keys are rendered separately as
+    post-load ``ALTER TABLE ... ADD CONSTRAINT`` statements and indexes as
+    ``CREATE INDEX ASYNC`` (by the caller). Raises ``ValueError`` if the table has
+    no columns.
     """
     if not table.columns:
         raise ValueError(f"table {table.name!r} has no columns to convert")
@@ -1654,6 +1683,73 @@ def _build_index_ddls(table: TableDef, *, is_postgres: bool = False) -> list[str
             f"CREATE {unique}INDEX ASYNC {_quote_pg_identifier(index.name)} "
             f"ON {table_identifier} ({columns})"
         )
+    return statements
+
+
+# The referential actions Aurora DSQL accepts on a FOREIGN KEY (matches PostgreSQL).
+_FK_ACTIONS = frozenset({"NO ACTION", "RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT"})
+
+
+def _normalize_fk_action(action: Optional[str]) -> Optional[str]:
+    """Normalise a reflected ``ON DELETE``/``ON UPDATE`` action to DSQL SQL.
+
+    Reflected actions are upper-cased MySQL keywords, occasionally underscored
+    (``SET_NULL``). Returns the canonical spelling only when it is one DSQL accepts
+    (so an unexpected value is dropped, not emitted verbatim); ``None`` for a
+    missing action (the DDL then omits the clause, defaulting to ``NO ACTION``).
+    """
+    if not action:
+        return None
+    normalized = " ".join(action.upper().replace("_", " ").split())
+    return normalized if normalized in _FK_ACTIONS else None
+
+
+def _build_foreign_key_ddls(table: TableDef, *, preserve: bool = True) -> list[str]:
+    """Render the table's foreign keys as post-load ``ALTER TABLE ADD CONSTRAINT``.
+
+    Aurora DSQL enforces foreign keys (as of 2026-08), but they must NOT exist
+    during the bulk load: the loader writes parent and child tables concurrently in
+    per-table keyset-PK order with no cross-table ordering, so a child row can
+    commit before its parent. Each FK is therefore emitted as a standalone
+    ``ALTER TABLE <t> ADD CONSTRAINT <name> FOREIGN KEY (...) REFERENCES <ref> (...)``
+    statement applied as a run-level POST-PASS after the data load (and, for a CDC
+    migration, at cut over once the stream drains). Identifiers are quoted via
+    ``sqlglot`` to avoid injection (Requirement 9.4); the referential actions are
+    preserved verbatim (``NO ACTION`` is the default, so it is omitted).
+
+    Each statement ends with ``NOT VALID`` because that is the ONLY ``ALTER TABLE
+    ADD CONSTRAINT`` form Aurora DSQL supports (a plain ADD is rejected as an
+    unsupported statement): DSQL adds the constraint without scanning existing data,
+    and it **enforces all new inserts/updates immediately**. Existing (just-loaded)
+    rows are validated separately by ``ALTER TABLE ASYNC ... VALIDATE CONSTRAINT``
+    (fired by the Full Load / cut-over apply pass once the orphan pre-gate is clean).
+
+    Returns an empty list when ``preserve`` is False (the user chose to strip FKs
+    and enforce referential integrity in the application layer).
+    """
+    if not preserve:
+        return []
+    table_identifier = _quote_pg_qualified(table.name)
+    statements: list[str] = []
+    for fk in table.foreign_keys:
+        columns = ", ".join(_quote_pg_identifier(column) for column in fk.columns)
+        ref_columns = ", ".join(
+            _quote_pg_identifier(column) for column in fk.referenced_columns
+        )
+        clause = (
+            f"ALTER TABLE {table_identifier} ADD CONSTRAINT "
+            f"{_quote_pg_identifier(fk.name)} FOREIGN KEY ({columns}) "
+            f"REFERENCES {_quote_pg_qualified(fk.referenced_table)} ({ref_columns})"
+        )
+        on_delete = _normalize_fk_action(fk.on_delete)
+        if on_delete is not None and on_delete != "NO ACTION":
+            clause += f" ON DELETE {on_delete}"
+        on_update = _normalize_fk_action(fk.on_update)
+        if on_update is not None and on_update != "NO ACTION":
+            clause += f" ON UPDATE {on_update}"
+        # NOT VALID: the only ADD-CONSTRAINT form DSQL accepts; enforces new writes at once.
+        clause += " NOT VALID"
+        statements.append(clause)
     return statements
 
 
@@ -2043,23 +2139,43 @@ def _apply_pk_strategy(
     return warnings
 
 
-def _foreign_key_warning(table: TableDef) -> Optional[ConversionWarning]:
-    """Return a warning that the table's foreign keys were removed, if any.
+def _foreign_key_warning(
+    table: TableDef, *, preserve: bool = True
+) -> Optional[ConversionWarning]:
+    """Return an advisory note about the table's foreign keys, if any.
 
-    DSQL does not support foreign keys, so they are removed from the target DDL
-    and preserved as metadata; referential integrity must move to the
-    application layer (Requirement 3.3).
+    Aurora DSQL enforces foreign keys (as of 2026-08). When they are preserved this
+    is a RECOMMENDATION (not a LOSS): the conversion is complete, but the operator
+    should know the runtime caveats. When the user chose to strip them it is a LOSS
+    note that referential integrity moved to the application layer (Requirement 3.3).
     """
     if not table.foreign_keys:
         return None
     names = ", ".join(fk.name for fk in table.foreign_keys)
+    if not preserve:
+        return ConversionWarning(
+            object_name=table.name,
+            classification=Classification.MANUAL,
+            kind=ConversionNoteKind.LOSS,
+            message=(
+                f"Foreign key constraints ({names}) were removed at your request. "
+                "Aurora DSQL supports foreign keys; enforce referential integrity in "
+                "the application layer instead, or re-enable preservation to "
+                "re-create them on the target."
+            ),
+        )
     return ConversionWarning(
         object_name=table.name,
         classification=Classification.MANUAL,
+        kind=ConversionNoteKind.RECOMMENDATION,
         message=(
-            f"Foreign key constraints ({names}) are not supported by Aurora DSQL "
-            "and were removed from the DDL. They are preserved as referential "
-            "metadata; enforce referential integrity in the application layer."
+            f"Foreign key constraints ({names}) are preserved and re-created on "
+            "Aurora DSQL after the data load (at cut over for a CDC migration). "
+            "Note: DML on referenced/referencing tables incurs extra reads "
+            "(benchmark write-heavy tables); a concurrent conflict raises a "
+            "retryable serialization error (SQLSTATE 40001); and CASCADE / SET NULL "
+            "/ SET DEFAULT actions count toward DSQL's 3000-row transaction limit "
+            "(a cascade touching more than 3000 rows fails)."
         ),
     )
 
@@ -2903,10 +3019,10 @@ class SchemaConverter:
         """Convert a single table definition to DSQL-compatible DDL.
 
         Applies the type mapping (Property 6) plus DSQL structural constraints:
-        foreign keys are removed and preserved as metadata (Requirement 3.3),
-        secondary indexes are emitted as ``CREATE INDEX ASYNC`` (Requirement 3.4),
-        and the primary-key strategy plus hot-partition / primary-key-required
-        warnings are applied (Requirement 3.5).
+        foreign keys are preserved and rendered as post-load ADD CONSTRAINT DDL
+        (Requirement 3.3), secondary indexes are emitted as ``CREATE INDEX ASYNC``
+        (Requirement 3.4), and the primary-key strategy plus hot-partition /
+        primary-key-required warnings are applied (Requirement 3.5).
         """
         options = options or SchemaConvertOptions()
         is_postgres = self._source_type is SourceType.POSTGRES
@@ -3141,7 +3257,7 @@ class SchemaConverter:
             # are surfaced per-column, as UNSUPPORTED, by the is_postgres type-check loop).
             (_bytea_key_warning(table) if not is_postgres else None),
             (_pg_bytea_key_warning(table) if is_postgres else None),
-            _foreign_key_warning(table),
+            _foreign_key_warning(table, preserve=options.preserve_foreign_keys),
             _check_constraint_warning(table),
             _identifier_length_warning(table),
             _expression_index_warning(table),
@@ -3177,6 +3293,9 @@ class SchemaConverter:
             target_ddl=target_ddl,
             schema_ddls=schema_ddls,
             index_ddls=_build_index_ddls(table, is_postgres=is_postgres) + extra_index_ddls,
+            foreign_key_ddls=_build_foreign_key_ddls(
+                table, preserve=options.preserve_foreign_keys
+            ),
             preserved_foreign_keys=list(table.foreign_keys),
             warnings=warnings,
         )

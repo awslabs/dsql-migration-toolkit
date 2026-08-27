@@ -2426,6 +2426,383 @@ def test_migrator_skips_view_pass_on_append_or_cdc(monkeypatch) -> None:
     assert dropped2 == [] and recreated2 == []
 
 
+# ---------------------------------------------------------------------------
+# Post-load foreign-key apply pass (Aurora DSQL enforces FKs, applied after load)
+# ---------------------------------------------------------------------------
+
+_FK_DDL = (
+    'ALTER TABLE "orders" ADD CONSTRAINT "fk_user" '
+    'FOREIGN KEY ("user_id") REFERENCES "users" ("id")'
+)
+
+
+def _fk_conv(*, foreign_key_ddls: list[str]):
+    from dsql_migrator.core.converter import TableConversion
+    from dsql_migrator.core.models import ForeignKeyDef
+
+    return TableConversion(
+        table="orders",
+        target_ddl='CREATE TABLE "orders" ("id" integer PRIMARY KEY, "user_id" integer)',
+        foreign_key_ddls=foreign_key_ddls,
+        preserved_foreign_keys=[
+            ForeignKeyDef(
+                name="fk_user",
+                columns=["user_id"],
+                referenced_table="users",
+                referenced_columns=["id"],
+            )
+        ],
+    )
+
+
+class _FkProbeCursor:
+    def __init__(self, orphans: int) -> None:
+        self.orphans = orphans
+
+    def execute(self, statement) -> None:  # noqa: ANN001 - fake
+        self._statement = statement
+
+    def fetchone(self):
+        return (self.orphans,)
+
+    def close(self) -> None:
+        pass
+
+
+class _FkProbeConnection:
+    """A fake target connection: its cursor returns a canned orphan COUNT."""
+
+    def __init__(self, orphans: int) -> None:
+        self.orphans = orphans
+
+    def cursor(self):
+        return _FkProbeCursor(self.orphans)
+
+    def close(self) -> None:
+        pass
+
+
+def _patch_fk_apply(monkeypatch, *, orphans: int = 0):
+    """Stub the FK connection factory and record apply_foreign_key calls (no real DSQL)."""
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    applied: list[str] = []
+    monkeypatch.setattr(
+        engine.BatchedTableMigrator,
+        "_view_connection_factory",
+        lambda self: (lambda: _FkProbeConnection(orphans)),
+    )
+    # The engine imported apply_foreign_key by name, so patch the engine binding.
+    monkeypatch.setattr(
+        engine,
+        "apply_foreign_key",
+        lambda add_ddl, *, connection_factory: applied.append(add_ddl),
+    )
+    return applied
+
+
+def test_apply_foreign_keys_adds_constraint_after_load(monkeypatch) -> None:
+    migrator = _view_migrator(table_conversions={"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])})
+    applied = _patch_fk_apply(monkeypatch, orphans=0)
+    migrator.apply_foreign_keys()
+    # With no orphans, the preserved FK is re-created as a post-load ADD CONSTRAINT.
+    assert applied == [_FK_DDL]
+
+
+def test_apply_foreign_keys_skips_when_orphans_exist(monkeypatch) -> None:
+    migrator = _view_migrator(table_conversions={"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])})
+    applied = _patch_fk_apply(monkeypatch, orphans=3)
+    migrator.apply_foreign_keys()
+    # An enforced ADD CONSTRAINT would fail on orphan rows, so the FK is NOT applied.
+    assert applied == []
+
+
+def test_apply_foreign_keys_deferred_for_cdc_coexisting(monkeypatch) -> None:
+    migrator = _view_migrator(
+        cdc_coexisting=True,
+        table_conversions={"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])},
+    )
+    applied = _patch_fk_apply(monkeypatch, orphans=0)
+    migrator.apply_foreign_keys()
+    # For a CDC migration, FKs are applied at cut over (after the stream drains), not here.
+    assert applied == []
+
+
+def test_apply_foreign_keys_noop_when_preservation_disabled(monkeypatch) -> None:
+    # foreign_key_ddls is empty when the user chose to strip FKs in Schema Conversion.
+    migrator = _view_migrator(table_conversions={"orders": _fk_conv(foreign_key_ddls=[])})
+    applied = _patch_fk_apply(monkeypatch, orphans=0)
+    migrator.apply_foreign_keys()
+    assert applied == []
+
+
+def test_apply_foreign_keys_engine_helper_is_best_effort() -> None:
+    # The run-level post-pass must never fail an otherwise-complete load.
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    class _Boom:
+        def apply_foreign_keys(self) -> None:
+            raise RuntimeError("boom")
+
+    engine._apply_foreign_keys(_Boom())  # must not raise
+
+
+def test_count_orphans_retries_on_occ_conflict() -> None:
+    # On Aurora DSQL a read can raise OC001/40001 when the target is written
+    # concurrently (a live CDC sink at cut over); the orphan pre-gate must retry it,
+    # not treat the transient conflict as "orphan pre-check failed" and skip the FK.
+    from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration._full_load_engine import _count_orphans
+
+    class _Oc(Exception):
+        sqlstate = "40001"
+
+    class _Cur:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, *_a):
+            self._conn.attempts += 1
+            if self._conn.attempts == 1:
+                raise _Oc()  # first attempt: transient serialization failure
+
+        def fetchone(self):
+            return (0,)
+
+        def close(self):
+            pass
+
+    class _Conn:
+        def __init__(self):
+            self.attempts = 0
+            self.rollbacks = 0
+
+        def cursor(self):
+            return _Cur(self)
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    conn = _Conn()
+    fk = ForeignKeyDef(name="fk", columns=["a"], referenced_table="p", referenced_columns=["id"])
+    assert _count_orphans(conn, "child", fk) == 0
+    assert conn.attempts == 2  # first raised OC001, retried, then succeeded
+    assert conn.rollbacks >= 1  # cleared the aborted transaction before the retry
+
+
+def test_constraint_name_from_ddl_parses_quoted_and_bare() -> None:
+    from dsql_migrator.ui.data_migration._full_load_engine import _constraint_name_from_ddl
+
+    assert _constraint_name_from_ddl(_FK_DDL) == "fk_user"
+    # A user may type the name unquoted in the edited script.
+    assert _constraint_name_from_ddl(
+        'ALTER TABLE "t" ADD CONSTRAINT my_fk FOREIGN KEY ("a") REFERENCES "p" ("id")'
+    ) == "my_fk"
+    # Embedded double-quotes are un-escaped.
+    assert _constraint_name_from_ddl(
+        'ALTER TABLE "t" ADD CONSTRAINT "weird""name" FOREIGN KEY ("a") REFERENCES "p" ("id")'
+    ) == 'weird"name'
+    # Not an ADD-CONSTRAINT-FOREIGN-KEY statement -> None (caller skips the pre-gate).
+    assert _constraint_name_from_ddl('CREATE INDEX ASYNC "i" ON "t" ("a")') is None
+
+
+class _CapturingCursor:
+    def __init__(self, sink: list, orphans: int) -> None:
+        self._sink = sink
+        self._orphans = orphans
+
+    def execute(self, statement) -> None:  # noqa: ANN001 - fake
+        self._sink.append(str(statement))
+
+    def fetchone(self):
+        return (self._orphans,)
+
+    def close(self) -> None:
+        pass
+
+
+class _CapturingConn:
+    """Fake probe connection that records the orphan-count SQL it was asked to run."""
+
+    def __init__(self, sink: list, orphans: int = 0) -> None:
+        self._sink = sink
+        self._orphans = orphans
+
+    def cursor(self):
+        return _CapturingCursor(self._sink, self._orphans)
+
+    def rollback(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _multi_fk_conv(*, foreign_key_ddls: list[str]):
+    """A conversion whose preserved_foreign_keys is the FULL [fk_a, fk_b] list.
+
+    Models an EDITED Schema-Conversion script: foreign_key_ddls carries only the FK
+    line(s) the user kept, while preserved_foreign_keys stays the deterministic full
+    list -- the exact shape that a positional zip would misalign.
+    """
+    from dsql_migrator.core.converter import TableConversion
+    from dsql_migrator.core.models import ForeignKeyDef
+
+    return TableConversion(
+        table="child",
+        target_ddl='CREATE TABLE "child" ("id" integer PRIMARY KEY, "a_id" integer, "b_id" integer)',
+        foreign_key_ddls=foreign_key_ddls,
+        preserved_foreign_keys=[
+            ForeignKeyDef(name="fk_a", columns=["a_id"], referenced_table="pa", referenced_columns=["id"]),
+            ForeignKeyDef(name="fk_b", columns=["b_id"], referenced_table="pb", referenced_columns=["id"]),
+        ],
+    )
+
+
+def test_apply_preserved_fk_matches_ddl_to_metadata_by_name(monkeypatch) -> None:
+    # Regression: an edited script that dropped fk_a leaves foreign_key_ddls=[fk_b] but
+    # preserved_foreign_keys=[fk_a, fk_b]. A positional zip would key the orphan pre-gate
+    # and VALIDATE off fk_a (WRONG); name-matching keys them off fk_b (the DDL applied).
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    ddl_b = (
+        'ALTER TABLE "child" ADD CONSTRAINT "fk_b" FOREIGN KEY ("b_id") '
+        'REFERENCES "pb" ("id") NOT VALID'
+    )
+    conv = _multi_fk_conv(foreign_key_ddls=[ddl_b])
+    executed: list[str] = []
+    applied: list[str] = []
+    validated: list[tuple] = []
+    monkeypatch.setattr(
+        engine, "apply_foreign_key",
+        lambda add_ddl, *, connection_factory: applied.append(add_ddl),
+    )
+    monkeypatch.setattr(
+        engine, "validate_foreign_key",
+        lambda tbl, name, *, connection_factory: validated.append((tbl, name)),
+    )
+    result = engine.apply_preserved_foreign_keys(
+        {"child": conv}, lambda: _CapturingConn(executed)
+    )
+    assert result == (1, 0, 0)
+    assert applied == [ddl_b]                      # the surviving fk_b DDL was applied
+    assert validated == [("child", "fk_b")]        # VALIDATE targets fk_b, not fk_a
+    # The orphan pre-gate keyed on fk_b's column ("b_id"), NOT fk_a's ("a_id").
+    assert any("b_id" in stmt for stmt in executed)
+    assert not any("a_id" in stmt for stmt in executed)
+
+
+def test_apply_preserved_fk_counts_orphan_skip(monkeypatch) -> None:
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    applied: list[str] = []
+    monkeypatch.setattr(
+        engine, "apply_foreign_key",
+        lambda add_ddl, *, connection_factory: applied.append(add_ddl),
+    )
+    result = engine.apply_preserved_foreign_keys(
+        {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _FkProbeConnection(3)
+    )
+    assert result == (0, 1, 0)   # orphan rows -> skipped, not applied
+    assert applied == []
+
+
+def test_apply_preserved_fk_counts_precheck_failure(monkeypatch) -> None:
+    # A PERMANENT (non-OCC, non-connection) pre-check error must count `failed` and
+    # NOT risk a bad ADD -- the data-safety-critical branch that had no coverage.
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    class _BoomCursor:
+        def execute(self, *_a):
+            raise RuntimeError("permanent boom")  # no 08 sqlstate -> not transient/OCC
+
+        def close(self):
+            pass
+
+    class _BoomConn:
+        def cursor(self):
+            return _BoomCursor()
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    applied: list[str] = []
+    monkeypatch.setattr(
+        engine, "apply_foreign_key",
+        lambda add_ddl, *, connection_factory: applied.append(add_ddl),
+    )
+    result = engine.apply_preserved_foreign_keys(
+        {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _BoomConn()
+    )
+    assert result == (0, 0, 1)
+    assert applied == []   # never applied a FK we could not pre-verify
+
+
+def test_apply_preserved_fk_reconnects_probe_on_transient_drop(monkeypatch) -> None:
+    # The shared probe dying mid-pass (class 08) must not cascade into false failures:
+    # the pre-gate reopens the probe once and the FK still applies.
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    class _Class08(Exception):
+        sqlstate = "08006"
+
+    class _DeadCursor:
+        def execute(self, *_a):
+            raise _Class08()
+
+        def close(self):
+            pass
+
+    class _DeadConn:
+        def cursor(self):
+            return _DeadCursor()
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    conns: list = [_DeadConn(), _FkProbeConnection(0)]  # first dies, reconnect is healthy
+    applied: list[str] = []
+    monkeypatch.setattr(
+        engine, "apply_foreign_key",
+        lambda add_ddl, *, connection_factory: applied.append(add_ddl),
+    )
+    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    result = engine.apply_preserved_foreign_keys(
+        {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: conns.pop(0)
+    )
+    assert result == (1, 0, 0)   # reconnected and applied, not a false "apply manually"
+    assert applied == [_FK_DDL]
+    assert conns == []           # both the dead probe and its replacement were taken
+
+
+def test_apply_preserved_fk_validate_failure_still_counts_applied(monkeypatch) -> None:
+    # A NOT VALID FK enforces every new write even if the async VALIDATE never lands,
+    # so a VALIDATE failure is swallowed and the FK still counts as applied (1,0,0).
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    applied: list[str] = []
+    monkeypatch.setattr(
+        engine, "apply_foreign_key",
+        lambda add_ddl, *, connection_factory: applied.append(add_ddl),
+    )
+
+    def _boom_validate(*_a, **_k):
+        raise RuntimeError("VALIDATE not ready")
+
+    monkeypatch.setattr(engine, "validate_foreign_key", _boom_validate)
+    result = engine.apply_preserved_foreign_keys(
+        {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _FkProbeConnection(0)
+    )
+    assert result == (1, 0, 0)   # applied despite the swallowed VALIDATE failure
+    assert applied == [_FK_DDL]
+
+
 def test_reload_mode_drives_derived_replace_targets() -> None:
     state = DataMigrationState()
     state.set_tables_with_data(frozenset({"shop.orders", "shop.customers"}))

@@ -210,7 +210,7 @@ class IndexDef(BaseModel):
 
 
 class ForeignKeyDef(BaseModel):
-    """A foreign key constraint (removed during DSQL conversion)."""
+    """A foreign key constraint (preserved and re-created on DSQL after load)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -225,8 +225,12 @@ class ForeignKeyDef(BaseModel):
     # changes are never written to the binary log (MySQL bug #32506, closed as
     # documented behavior -- the same reason "cascaded foreign key actions do not
     # activate triggers"). Debezium reads the binary log, so a CDC stream CANNOT
-    # replicate them, and DSQL has no foreign keys to re-perform the cascade. The
-    # assessor uses these to flag the affected tables up front.
+    # replicate them; and the tool applies foreign keys only at cut over (never while
+    # the sink streams), so there is no target-side FK to re-perform the cascade in
+    # flight. The child rows the source cascade removed/nulled are therefore left as
+    # orphans on the target, which then BLOCK the post-load / cut-over ADD CONSTRAINT
+    # (the orphan pre-gate) -- an actionable error, not silent divergence. The assessor
+    # uses these to flag the affected tables up front.
     on_delete: Optional[str] = None
     on_update: Optional[str] = None
 
@@ -1495,9 +1499,12 @@ class TableValidationResult(BaseModel):
 class OrphanFinding(BaseModel):
     """An orphan-record finding on the target for a preserved referential rule.
 
-    Because DSQL has no foreign keys, referential integrity moves to the
-    application; this records child rows whose foreign-key value has no matching
-    parent row on the target (Requirement 6.3). Only actual orphans (count > 0)
+    Records child rows whose foreign-key value has no matching parent row on the
+    target (Requirement 6.3). Aurora DSQL enforces foreign keys, but the tool applies
+    them only after the load / at cut over, so this doubles as the PRE-APPLY GATE: an
+    enforced ``ADD CONSTRAINT`` cannot be created while orphans exist, so a count > 0
+    blocks that FK with an actionable message (and is also the safety net when the user
+    strips FKs to enforce integrity in the application). Only actual orphans (count > 0)
     are reported.
     """
 

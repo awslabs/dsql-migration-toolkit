@@ -113,10 +113,10 @@ def test_source_inventory_round_trip() -> None:
 
 def test_assessment_report_from_items_computes_complete_summary() -> None:
     items = [
-        AssessmentItem(object_name="t1", rule_id="FK_UNSUPPORTED", classification=Classification.MANUAL),
+        AssessmentItem(object_name="t1", rule_id="FK_PRESERVED", classification=Classification.MANUAL),
         AssessmentItem(object_name="t2", rule_id="NO_PRIMARY_KEY", classification=Classification.UNSUPPORTED),
         AssessmentItem(object_name="t3", rule_id="OK", classification=Classification.AUTO),
-        AssessmentItem(object_name="t4", rule_id="FK_UNSUPPORTED", classification=Classification.MANUAL),
+        AssessmentItem(object_name="t4", rule_id="FK_PRESERVED", classification=Classification.MANUAL),
     ]
     report = AssessmentReport.from_items(items)
     assert report.summary == {

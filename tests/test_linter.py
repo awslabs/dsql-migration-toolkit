@@ -61,15 +61,13 @@ def test_detects_for_share_as_pessimistic_lock() -> None:
     assert AntiPatternType.PESSIMISTIC_LOCK in _patterns(findings)
 
 
-def test_detects_foreign_key_dependency() -> None:
+def test_foreign_key_is_no_longer_flagged() -> None:
+    # Aurora DSQL now supports enforced foreign keys (2026-08), so a FOREIGN KEY in
+    # application SQL is no longer an anti-pattern and must NOT be flagged.
     findings = _scan_sql(
         "ALTER TABLE orders ADD FOREIGN KEY (customer_id) REFERENCES customers(id)"
     )
-    assert AntiPatternType.FOREIGN_KEY_DEPENDENCY in _patterns(findings)
-    finding = next(
-        f for f in findings if f.pattern is AntiPatternType.FOREIGN_KEY_DEPENDENCY
-    )
-    assert "application layer" in finding.recommendation.lower()
+    assert AntiPatternType.FOREIGN_KEY_DEPENDENCY not in _patterns(findings)
 
 
 def test_detects_auto_increment_dependency() -> None:
@@ -157,14 +155,13 @@ def test_case_insensitive_detection() -> None:
 def test_multiple_patterns_in_one_source() -> None:
     sql = (
         "CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY);\n"
-        "ALTER TABLE t ADD FOREIGN KEY (p) REFERENCES p(id);\n"
+        "ALTER TABLE t ADD FOREIGN KEY (p) REFERENCES p(id);\n"  # supported now, not flagged
         "SELECT GROUP_CONCAT(x) FROM t WHERE id = 1 FOR UPDATE;\n"
         "CALL do_work();"
     )
     patterns = _patterns(AppLinter().scan(AppSource.from_sql(sql)))
     assert patterns == {
         AntiPatternType.AUTO_INCREMENT_DEPENDENCY,
-        AntiPatternType.FOREIGN_KEY_DEPENDENCY,
         AntiPatternType.UNSUPPORTED_FUNCTION,
         AntiPatternType.PESSIMISTIC_LOCK,
         AntiPatternType.TRIGGER_OR_ROUTINE_USAGE,

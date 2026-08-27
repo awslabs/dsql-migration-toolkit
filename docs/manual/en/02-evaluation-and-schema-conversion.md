@@ -32,8 +32,8 @@ types, primary keys, indexes, foreign keys, views, triggers, routines,
 
 | Class | Meaning | Examples |
 |---|---|---|
-| **AUTO** | Converts automatically, no human action. | Ordinary tables/columns with mappable types and a PK. |
-| **MANUAL** | Converts, but needs a decision or an app-side change. | Foreign keys, case-insensitive collation, partitioned tables, oversized LOB columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, multi-database sources. |
+| **AUTO** | Converts automatically, no human action. | Ordinary tables/columns with mappable types and a PK; **foreign keys** (converted automatically, flagged `RECOMMENDED` — see below). |
+| **MANUAL** | Converts, but needs a decision or an app-side change. | Case-insensitive collation, partitioned tables, oversized LOB columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, multi-database sources, foreign keys with `CASCADE`/`SET NULL` actions (which CDC can't replicate). |
 | **UNSUPPORTED** | No automatic conversion — redesign needed. | Triggers, stored procedures/functions, scheduled events, tables with no PK, `DECIMAL` precision > 38, > 255 columns/table, > 1000 tables/database, FULLTEXT/SPATIAL indexes. |
 
 Nothing is left unclassified — an object matched by no rule defaults to **AUTO**.
@@ -46,8 +46,9 @@ rules are combined, so no finding is hidden.
 Not every finding is a problem. A finding is one of two things, and the report marks
 which:
 
-- a **gap** — something could not be carried over or changed meaning (a removed
-  foreign key, a dropped collation). You have to decide what to do about it.
+- a **gap** — something could not be carried over or changed meaning (a dropped
+  collation, an unreproducible `ON UPDATE` timestamp). You have to decide what to do
+  about it.
 - a **recommendation** (`RECOMMENDED`, info-blue) — the conversion is complete and
   correct; this is advice about *running well* on DSQL. Ignoring it costs performance,
   not correctness.
@@ -56,6 +57,17 @@ which:
 moving to a UUID/random or cached-identity key buys **insert throughput**, because DSQL
 stores rows in primary-key order so a monotonic key concentrates writes on one partition
 (see [Chapter 7 §7.1](07-performance-and-tuning.md#primary-key-strategy--avoid-hot-partitions)).
+
+**Foreign keys** are the other advisory finding. Aurora DSQL **enforces** foreign keys,
+so each one converts cleanly and is preserved — flagged `RECOMMENDED` with **no required
+effort**, not a gap. The note carries the runtime caveats worth weighing: DML on a
+referenced/referencing table incurs **extra reads** (AWS suggests benchmarking before you
+add them), a concurrent conflict is a retryable serialization error (`SQLSTATE 40001`),
+and a `CASCADE`/`SET NULL`/`SET DEFAULT` action counts toward DSQL's
+3000-row-per-transaction limit (a cascade touching > 3000 rows fails) — so prefer
+`NO ACTION`/`RESTRICT` where child cardinality is unbounded. A cascade action also can't
+survive CDC (see [Chapter 6 §6.2](06-limitations.md#62-migration-process-limits)), which
+is the one case Evaluation still flags **MANUAL**.
 
 Because a recommendation is optional, **it does not count toward an object's estimated
 effort** — otherwise nearly every MySQL table would be inflated to `MEDIUM` by its
@@ -84,10 +96,10 @@ effort** — otherwise nearly every MySQL table would be inflated to `MEDIUM` by
 For every assessed object you get:
 
 - its **classification** (AUTO / MANUAL / UNSUPPORTED),
-- a **risk description** — *why* it's flagged (e.g. "Aurora DSQL does not support
-  foreign keys"),
-- a **recommended action** — *what to do* (e.g. "enforce this relationship in the
-  application layer"), and
+- a **risk description** — *why* it's flagged (e.g. "Aurora DSQL has no
+  `ON UPDATE CURRENT_TIMESTAMP` clause"),
+- a **recommended action** — *what to do* (e.g. "set the timestamp explicitly on
+  update in your application"), and
 - for non-automatic items, an **effort estimate** (SCT-style buckets, e.g.
   simple / medium / significant) so you can size the work.
 
@@ -175,14 +187,15 @@ Work the list top-down by severity:
    where missing; move triggers/routines/events into the application (or
    EventBridge/Lambda); replace spatial types; reduce `DECIMAL` precision to ≤ 38;
    exclude or split oversized LOB columns.
-2. **Decide every MANUAL item.** Choose how to enforce removed foreign keys in the
-   app, drop partitioning, accept the default collation, handle `ENUM`/`SET`, etc.
+2. **Decide every MANUAL item.** Drop partitioning, accept the default collation,
+   handle `ENUM`/`SET`, decide `ON UPDATE` timestamps, replace a cascade action CDC
+   can't replicate, etc.
 3. **AUTO items** need nothing from you.
 
-> **Why this matters for DSQL specifically:** DSQL deliberately omits foreign
-> keys, triggers, stored procedures, and several types. Evaluation is the moment
-> you find that out — cheaply, read-only, before any data moves — instead of
-> discovering it as a failed load later.
+> **Why this matters for DSQL specifically:** DSQL deliberately omits triggers,
+> stored procedures, and several types, and enforces foreign keys with runtime
+> caveats. Evaluation is the moment you find that out — cheaply, read-only, before
+> any data moves — instead of discovering it as a failed load later.
 
 ---
 
@@ -225,8 +238,16 @@ handles the dialect and constraint bridging automatically:
   than silently lost. `ON UPDATE CURRENT_TIMESTAMP` cannot be reproduced at all — DSQL
   has no `ON UPDATE` clause and no triggers — so it is flagged **MANUAL** for the
   application to handle.
-- **Foreign-key removal** — FKs are stripped from the DDL but **preserved in the
-  report**, with a note to enforce referential integrity in the application.
+- **Foreign-key preservation** — Aurora DSQL **enforces** foreign keys, so each
+  source FK is kept **out of the `CREATE TABLE`** and rendered as a separate
+  post-load `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` statement. Full Load
+  re-creates them as a run-level pass **after** the data has loaded; for a **CDC**
+  migration the apply is **deferred to cut over** (the constraints must not exist
+  while the sink streams rows out of parent-before-child order — an FK violation
+  would be dead-lettered, `SQLSTATE 23503`), and the rendered DDL is shown here so
+  you can apply it at cut over. You can instead **opt to strip** the foreign keys
+  (`SchemaConvertOptions.preserve_foreign_keys=False`) and enforce referential
+  integrity in the application layer.
 - **Primary-key strategies** — keep the integer PK, convert to UUID, or use an
   identity column with caching (to avoid hot-partition contention on a
   monotonic key). Each table's card also has a **primary-key picker** to switch it
@@ -249,10 +270,9 @@ handles the dialect and constraint bridging automatically:
 
 Beyond schema, the tool can convert queries and **lint your application's SQL** for
 patterns DSQL won't accept or that won't scale — e.g. `SELECT ... FOR UPDATE`
-(pessimistic locking against DSQL's optimistic concurrency), dependence on foreign
-keys, `AUTO_INCREMENT` assumptions, trigger/stored-procedure calls, and
-unsupported functions. Use this to find code that needs changing **before**
-cut-over.
+(pessimistic locking against DSQL's optimistic concurrency), `AUTO_INCREMENT`
+assumptions, trigger/stored-procedure calls, and unsupported functions. Use this to
+find code that needs changing **before** cut-over.
 
 ### The end state
 
@@ -342,7 +362,7 @@ conversion (redesign).
 
 | DSQL rule | What the tool does |
 |---|---|
-| **No foreign keys** | FK definitions are removed from the DDL but **preserved in the report**, with a MANUAL note to enforce referential integrity in your application. |
+| **Foreign keys are enforced** | Aurora DSQL supports **enforced** foreign keys. Each source FK is kept out of the `CREATE TABLE` and re-created as a post-load `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` (Full Load applies it after the data lands; a CDC migration defers it to cut over). Runtime caveats: DML on referenced/referencing tables incurs **extra reads**, a concurrent conflict is a retryable `40001`, and `CASCADE`/`SET NULL`/`SET DEFAULT` actions count toward the 3000-row-per-transaction limit — prefer `NO ACTION`/`RESTRICT` for unbounded child cardinality. You may instead strip them (`preserve_foreign_keys=False`) and enforce integrity in the app. |
 | **Primary key required** | A table with no PK is flagged **UNSUPPORTED** (and can't be loaded). |
 | **No `TRUNCATE`** | "Replace" loads use **DROP + recreate**, never `TRUNCATE`. |
 | **One DDL per transaction** | Schema conversion emits exactly one DDL statement per execution unit. |

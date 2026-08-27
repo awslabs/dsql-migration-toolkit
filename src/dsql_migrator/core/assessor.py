@@ -264,9 +264,18 @@ class Rule(ABC):
 
 
 class ForeignKeyRule(Rule):
-    """Flag tables that declare foreign keys (DSQL does not support them)."""
+    """Note tables that declare foreign keys (Aurora DSQL enforces them, as of 2026-08).
 
-    rule_id = "FK_UNSUPPORTED"
+    Foreign keys convert cleanly: the converter preserves them and re-creates them on
+    DSQL as a post-load ``ADD CONSTRAINT`` pass (at cut over for a CDC migration), so
+    this is ADVICE, not a compatibility gap -- filed as a ``RECOMMENDATION`` (like
+    ``AutoIncrementRule``) so it reads "RECOMMENDED", never inflates the effort
+    estimate, and stays consistent with the Schema Conversion note for the same key.
+    The wording leads with what is true ("converts cleanly") and carries the runtime
+    caveats DSQL documents so the operator sees them at planning time.
+    """
+
+    rule_id = "FK_PRESERVED"
 
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
         findings: list[Finding] = []
@@ -279,14 +288,20 @@ class ForeignKeyRule(Rule):
                         rule_id=self.rule_id,
                         classification=Classification.MANUAL,
                         risk=(
-                            f"Foreign key constraints ({names}) are not "
-                            "supported by Aurora DSQL."
+                            f"Foreign key constraints ({names}) convert cleanly and "
+                            "are re-created on Aurora DSQL after the data load. DSQL "
+                            "enforces them with commit-time optimistic concurrency, so "
+                            "DML on referenced/referencing tables incurs extra reads."
                         ),
                         recommendation=(
-                            "Remove the foreign key and enforce referential "
-                            "integrity in the application layer."
+                            "No action needed -- foreign keys are preserved "
+                            "automatically. Benchmark write-heavy child/parent tables "
+                            "(the extra reads add cost), and note that CASCADE / SET "
+                            "NULL / SET DEFAULT actions count toward DSQL's 3000-row "
+                            "transaction limit. To skip re-creating them, disable "
+                            "foreign-key preservation in Schema Conversion."
                         ),
-                        effort=EffortLevel.SIMPLE,
+                        note_kind=ConversionNoteKind.RECOMMENDATION,
                     )
                 )
         return findings
@@ -340,14 +355,16 @@ class CascadeForeignKeyRule(Rule):
     -- so the resulting child-row writes never reach the binary log (MySQL bug
     #32506, closed as documented behavior; the same reason cascaded actions do not
     fire triggers). Debezium reads the binary log, so a CDC stream simply never sees
-    them, and DSQL has no foreign keys to re-perform the cascade on its own. The
-    child rows are therefore left behind on the target with **no error and no
-    warning** -- silently diverging while everything reports healthy.
+    them; and the tool applies foreign keys only at cut over (never while the sink
+    streams), so no target-side FK re-performs the cascade in flight. The child rows
+    the source cascade removed/nulled are therefore left as ORPHANS on the target,
+    which then **block the cut-over ADD CONSTRAINT** (the orphan pre-gate) -- an
+    actionable per-FK error, not silent divergence.
 
     This is a limitation of every binlog-based CDC tool (Debezium, DMS, Maxwell),
     not of this migrator, but it is invisible unless it is called out BEFORE the
     stream starts -- hence flagging it here, at planning time, rather than leaving
-    the operator to discover orphaned rows after cut-over.
+    the operator to discover the blocked constraint at cut-over.
     """
 
     rule_id = "FK_CASCADE_CDC_GAP"
@@ -380,20 +397,22 @@ class CascadeForeignKeyRule(Rule):
                         f"Foreign keys with automatic referential actions "
                         f"({detail}) change CHILD rows inside the InnoDB engine, so "
                         "those changes are NOT written to the binary log. CDC reads "
-                        "the binary log, so it cannot replicate them and Aurora DSQL "
-                        "(no foreign keys) cannot re-perform them -- the child rows "
-                        "are left behind on the target with no error or warning. "
-                        "This affects every binlog-based CDC tool (MySQL bug #32506)."
+                        "the binary log, so it cannot replicate them: the parent "
+                        "change arrives on the target but the cascaded child change "
+                        "does not, leaving orphaned rows during replication. This "
+                        "affects every binlog-based CDC tool (MySQL bug #32506)."
                     ),
                     recommendation=(
                         "Before starting CDC, replace the automatic action with "
                         "EXPLICIT child-row statements in the application (e.g. "
                         "delete the children, then the parent) so the changes are "
-                        "logged and replicated. You need this application logic on "
-                        "DSQL anyway, since DSQL has no foreign keys to cascade for "
-                        "you. Until then, enable the orphan-record check in "
-                        "Validation and quiesce source writes before the final "
-                        "cut-over comparison, so any divergence is caught."
+                        "logged and replicated. The tool re-creates the foreign key "
+                        "on Aurora DSQL only at cut over -- never during replication, "
+                        "so the sink is not tripped by out-of-order rows -- and any "
+                        "orphaned child rows left by an un-replicated cascade will "
+                        "then BLOCK the ADD CONSTRAINT and be reported by the "
+                        "Validation orphan check. Quiesce source writes before the "
+                        "final cut-over comparison so the divergence is caught."
                     ),
                     effort=EffortLevel.MEDIUM,
                 )

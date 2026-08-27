@@ -1352,6 +1352,22 @@ class ValidationState:
         # instead of being painted as "nothing to advance" (audit finding D2). None
         # until the button runs; then a dict (empty == every table advanced/no-op'd).
         self._cutover_identity_sync_failed: Optional[dict[str, str]] = None
+        # Cut-over foreign-key apply outcome (applied, skipped, failed) counts, or None
+        # until the operator clicks "Apply foreign keys". For a CDC migration the FK
+        # ADD CONSTRAINTs are deferred to cut over (they must not exist while the sink
+        # streams out-of-order rows); this records the button's result. Lock-guarded.
+        self._cutover_fk_apply: Optional[tuple[int, int, int]] = None
+
+    def set_cutover_fk_apply(self, result: "Optional[tuple[int, int, int]]") -> None:
+        """Record the cut-over foreign-key apply outcome (applied, skipped, failed)."""
+        with self._lock:
+            self._cutover_fk_apply = result
+
+    @property
+    def cutover_fk_apply(self) -> "Optional[tuple[int, int, int]]":
+        """The cut-over FK-apply button's last (applied, skipped, failed), or None."""
+        with self._lock:
+            return self._cutover_fk_apply
 
     def set_cutover_identity_sync(
         self,
@@ -2530,6 +2546,96 @@ def _run_cutover_identity_sync(
         _work()
 
 
+def _cutover_pending_foreign_keys(
+    eval_store: "Optional[EvaluationStore]",
+    conversion_store: "Optional[Any]",
+    session_id: str,
+) -> int:
+    """Count foreign keys still to apply at cut over (cheap; reads FK metadata only).
+
+    Zero when FK preservation is off, no schema-conversion / evaluation state exists,
+    or the source has no foreign keys. Used to decide whether the cut-over runbook
+    shows the "Apply foreign keys" action, without a schema re-conversion.
+    """
+    if conversion_store is None or eval_store is None:
+        return 0
+    conv_state = conversion_store.get(session_id)
+    if conv_state is None or not conv_state.preserve_foreign_keys:
+        return 0
+    result = eval_store.get_or_create(session_id).result
+    inventory = result.inventory if result is not None else None
+    if inventory is None:
+        return 0
+    return sum(len(table.foreign_keys) for table in inventory.tables)
+
+
+def _run_cutover_foreign_keys(
+    session: object,
+    validation_state: "ValidationState",
+    *,
+    eval_store: "Optional[EvaluationStore]" = None,
+    conversion_store: "Optional[Any]" = None,
+    session_id: str = "",
+    job_manager: "Optional[JobManager]" = None,
+    refresh: "Optional[Callable[[], None]]" = None,
+) -> None:
+    """Apply preserved foreign keys on Aurora DSQL at cut over (operator action).
+
+    For a CDC migration the FK ``ADD CONSTRAINT``s are deferred (they must not exist
+    while the sink streams out-of-order rows -- it dead-letters an FK violation). This
+    runs them once, AFTER the final drain and BEFORE repointing: it rebuilds the applied
+    conversions from the source inventory + Schema-Conversion edits/toggle, then applies
+    each FK with the orphan pre-gate (via ``apply_preserved_foreign_keys``). Runs in the
+    background so the click never blocks the UI; the ``(applied, skipped, failed)``
+    result is stored on ``validation_state`` and the screen refreshes. Best-effort.
+    """
+    target_config = getattr(session, "target_config", None)
+    conv_state = (
+        conversion_store.get(session_id) if conversion_store is not None else None
+    )
+    eval_result = (
+        eval_store.get_or_create(session_id).result if eval_store is not None else None
+    )
+    inventory = eval_result.inventory if eval_result is not None else None
+    if target_config is None or conv_state is None or inventory is None:
+        # Nothing to apply (missing state): record an empty result so the button reads
+        # "ran, nothing to do" rather than staying un-run.
+        validation_state.set_cutover_fk_apply((0, 0, 0))
+        if refresh is not None:
+            refresh()
+        return
+    aws_profile = getattr(session, "aws_profile", None)
+
+    def _work(_handle: object = None) -> None:
+        from dsql_migrator.core.converter import SchemaConverter
+        from dsql_migrator.core.target_connection import DsqlConnector
+        from dsql_migrator.ui.data_migration._full_load_engine import (
+            apply_preserved_foreign_keys,
+        )
+        from dsql_migrator.ui.schema_conversion import applied_table_conversions
+
+        _stype = (
+            session.source_config.source_type  # type: ignore[attr-defined]
+            if getattr(session, "source_config", None) is not None
+            else SourceType.MYSQL
+        )
+        applied = applied_table_conversions(
+            SchemaConverter(source_type=_stype).convert(inventory),
+            conv_state.edited_target_ddls,
+            preserve_foreign_keys=conv_state.preserve_foreign_keys,
+        )
+        connect = DsqlConnector(target_config, aws_profile=aws_profile).connect
+        result = apply_preserved_foreign_keys(applied, connect)
+        validation_state.set_cutover_fk_apply(result)
+        if refresh is not None:
+            refresh()
+
+    if job_manager is not None:
+        job_manager.submit(_work)
+    else:
+        _work()
+
+
 def build_cutover_screen(
     store: SessionStore,
     session_id: str,
@@ -2537,6 +2643,8 @@ def build_cutover_screen(
     validation_store: ValidationStore,
     job_manager: Optional[JobManager] = None,
     sync_sequences: "Optional[Callable[..., dict]]" = None,
+    eval_store: "Optional[EvaluationStore]" = None,
+    conversion_store: "Optional[Any]" = None,
     ai_post_event: "Optional[Callable[..., object]]" = None,
     open_ai_scope: "Optional[Callable[..., object]]" = None,
     ai_tools: "Optional[Sequence[Mapping[str, object]]]" = None,
@@ -2697,6 +2805,19 @@ def build_cutover_screen(
                 job_manager=job_manager, sync=sync_sequences, refresh=refresh,
             )
 
+        # For a CDC migration, foreign keys were deferred during the stream; the runbook's
+        # "Apply foreign keys" button runs them at cut over (after the final drain).
+        def _fk_apply_provider() -> None:
+            _run_cutover_foreign_keys(
+                session, validation_state,
+                eval_store=eval_store, conversion_store=conversion_store,
+                session_id=session_id, job_manager=job_manager, refresh=refresh,
+            )
+
+        _fk_pending = _cutover_pending_foreign_keys(
+            eval_store, conversion_store, session_id
+        )
+
         # Dev-only UI review: with no clean verdict, synthesize a ready summary so
         # the runbook itself can be reviewed without running the whole workflow.
         # Gated on the same dev flag as the nav unlock; never reached in real use.
@@ -2812,6 +2933,9 @@ def build_cutover_screen(
             identity_sync_provider=_identity_sync_provider,
             identity_sync_result=validation_state.cutover_identity_sync,
             identity_sync_failed=validation_state.cutover_identity_sync_failed,
+            fk_apply_provider=_fk_apply_provider,
+            fk_apply_result=validation_state.cutover_fk_apply,
+            fk_pending_count=_fk_pending,
         )
 
         done = get_status(session.workflow, WorkflowStep.CUT_OVER) is StepStatus.DONE
@@ -3889,6 +4013,9 @@ def _render_cutover_section(
     identity_sync_provider: "Optional[Callable[[], None]]" = None,
     identity_sync_result: "Optional[dict[str, int]]" = None,
     identity_sync_failed: "Optional[dict[str, str]]" = None,
+    fk_apply_provider: "Optional[Callable[[], None]]" = None,
+    fk_apply_result: "Optional[tuple[int, int, int]]" = None,
+    fk_pending_count: int = 0,
 ) -> None:
     """Render the go-path cut-over runbook as its OWN titled section card.
 
@@ -3981,6 +4108,70 @@ def _render_cutover_section(
                         "text-xs font-semibold flex items-center justify-center"
                     )
                     ui.label(text).classes("text-sm text-gray-700 leading-snug")  # type: ignore[attr-defined]
+
+        # Explicit foreign-key apply: for a CDC migration the FK ADD CONSTRAINTs were
+        # DEFERRED during the stream (they must not exist while the sink applies rows out
+        # of parent-before-child order — an FK violation would be dead-lettered). Apply
+        # them here, AFTER the final drain and BEFORE repointing. Orphan-gated + best
+        # effort, idempotent (safe to re-click). Only shown for a CDC migration that has
+        # foreign keys to create (Full Load already applied them automatically).
+        if cdc_in_use and fk_apply_provider is not None and fk_pending_count > 0:
+            with ui.column().classes(  # type: ignore[attr-defined]
+                "w-full gap-1 mt-1 pt-2 border-t border-gray-100"
+            ):
+                ui.label(  # type: ignore[attr-defined]
+                    "Before you repoint: apply foreign keys"
+                ).classes("text-sm font-semibold text-gray-900")
+                _fk_noun = "foreign key" if fk_pending_count == 1 else "foreign keys"
+                ui.label(  # type: ignore[attr-defined]
+                    f"Aurora DSQL enforces foreign keys, but this schema's "
+                    f"{fk_pending_count} {_fk_noun} were not created during CDC (they "
+                    "must not exist while the stream applies rows out of "
+                    "parent-before-child order). Apply them now — after the final drain "
+                    "and before repointing. Each is checked for orphan rows first and "
+                    "skipped with a note if any exist. Safe to run more than once."
+                ).classes("text-xs text-gray-600 leading-snug")
+                with ui.row().classes("items-center gap-3 mt-1"):  # type: ignore[attr-defined]
+                    ui.button(  # type: ignore[attr-defined]
+                        "Apply foreign keys",
+                        icon="link",
+                        on_click=lambda: fk_apply_provider(),
+                    ).props("color=primary outline no-caps")
+                    if fk_apply_result is not None:
+                        _applied, _skipped, _failed = fk_apply_result
+                        if _failed == 0 and _skipped == 0:
+                            inline_hint(
+                                ui,
+                                f"Applied {_applied} foreign key(s).",
+                                tone="success",
+                            )
+                        else:
+                            inline_hint(
+                                ui,
+                                f"Applied {_applied}, skipped {_skipped} (orphan rows), "
+                                f"failed {_failed}.",
+                                tone="warning",
+                            )
+                # Skipped (orphans) / failed FKs must not read as done: surface a warning
+                # so the operator resolves them before repointing onto a schema whose
+                # referential integrity is not fully enforced.
+                if fk_apply_result is not None and (
+                    fk_apply_result[1] or fk_apply_result[2]
+                ):
+                    _a, _s, _f = fk_apply_result
+                    render_notice(
+                        ui,
+                        tone="warning",
+                        header="Some foreign keys were not applied",
+                        body=(
+                            f"{_s} skipped (orphan child rows reference a missing parent) "
+                            f"and {_f} failed. The activity log names each table / foreign "
+                            "key. Resolve the orphan rows (often an un-replicated source "
+                            "cascade), then click Apply foreign keys again — it is "
+                            "idempotent. Referential integrity is not fully enforced on "
+                            "the target until every foreign key is applied."
+                        ),
+                    )
 
         # Explicit identity-sequence sync: an OPERATOR ACTION, not a render side-effect.
         # Identity (AUTO_INCREMENT) keys are loaded/replicated with explicit ids, which do

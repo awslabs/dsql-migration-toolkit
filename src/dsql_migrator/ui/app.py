@@ -476,6 +476,11 @@ def build_page(
         session_id,
         validation_store=VALIDATION_STORE,
         job_manager=JOB_MANAGER,
+        # For a CDC migration, foreign keys are applied at cut over (deferred during the
+        # stream). The runbook's "Apply foreign keys" action rebuilds the applied
+        # conversions from the source inventory + schema-conversion edits/toggle.
+        eval_store=EVALUATION_STORE,
+        conversion_store=SCHEMA_CONVERSION_STORE,
         ai_post_event=_ai_post_event,
         # The repoint-recipe / "safe to cut over?" chat can consult the real validation,
         # CDC and load state via the shared read-only tools -- never sees secrets.

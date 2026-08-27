@@ -149,7 +149,9 @@ _RESPONSE_STYLE = (
 # constraints the deterministic assessor/converter apply so the AI analysis
 # stays consistent with the factual backbone.
 DSQL_CONSTRAINTS = (
-    "Aurora DSQL constraints: foreign keys are unsupported; every table requires "
+    "Aurora DSQL constraints: foreign keys ARE supported and enforced (preserved "
+    "and re-created after the data load, with extra-read cost and a 3000-row limit "
+    "on CASCADE actions); every table requires "
     "a primary key; secondary indexes are created asynchronously "
     "(CREATE INDEX ASYNC); the 'C' collation is used; triggers and stored "
     "procedures are unsupported; AUTO_INCREMENT/monotonic keys cause hot "
@@ -895,8 +897,9 @@ _CUTOVER_RECOVERY_CONTEXT = (
     "processes (they expire).\n"
     "- Application changes: expect OCC (SQLSTATE 40001) retries on write hot spots; "
     "retry the whole transaction (up to a small budget) rather than the failing "
-    "statement. No foreign keys, no TRUNCATE. Batched writes must stay under DSQL's "
-    "per-transaction row limit (~3000). CREATE INDEX runs ASYNC.\n"
+    "statement. Foreign keys are supported and enforced (they add read cost and "
+    "their CASCADE actions count toward the row limit); no TRUNCATE. Batched writes "
+    "must stay under DSQL's per-transaction row limit (~3000). CREATE INDEX runs ASYNC.\n"
     "- Identity keys: any AUTO_INCREMENT-derived key must have had its sequence "
     "advanced past MAX(pk) on the target BEFORE the app repoints, or its first insert "
     "collides (23505). This tool's cut-over runbook exposes 'Sync identity sequences'; "

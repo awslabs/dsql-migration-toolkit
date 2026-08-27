@@ -64,10 +64,12 @@ _AI_TRIGGER = frozenset({Classification.MANUAL, Classification.UNSUPPORTED})
 # "AI-assisted Conversion Design"). Kept here so the core routing layer does not
 # depend on the UI; mirrors the constraints the Schema Converter applies.
 SCHEMA_DSQL_CONSTRAINTS = (
-    "Aurora DSQL constraints: foreign keys are unsupported, every table requires "
-    "a primary key, secondary indexes are built asynchronously "
-    "(CREATE INDEX ASYNC), the 'C' collation is used, and there are transaction "
-    "limits (a single DDL statement per transaction)."
+    "Aurora DSQL constraints: foreign keys ARE supported and enforced (added after "
+    "the data load, not inside CREATE TABLE; DML on referenced/referencing tables "
+    "incurs extra reads and CASCADE/SET NULL/SET DEFAULT actions count toward the "
+    "3000-row transaction limit), every table requires a primary key, secondary "
+    "indexes are built asynchronously (CREATE INDEX ASYNC), the 'C' collation is "
+    "used, and there are transaction limits (a single DDL statement per transaction)."
 )
 
 # DSQL constraints used to ground a query (DML) rewrite suggestion prompt.
