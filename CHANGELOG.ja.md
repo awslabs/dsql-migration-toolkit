@@ -5,6 +5,19 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.402
+
+### 修正 (Fixed)
+
+- **PostgreSQL の Full Load + CDC マイグレーションで UI から CDC インフラをデプロイできるように
+  なりました。**「Deploy CDC infrastructure」/ Start CDC のゲートが MySQL の `BINLOG_ROW_FORMAT`
+  事前チェック(ソースの変更ストリームチェック)の合格を要求していましたが、PostgreSQL の事前チェック
+  レポートには binlog チェックが存在しません(対応するのは `WAL_LEVEL_LOGICAL`、すなわち
+  `wal_level=logical`)。そのためゲートが常に発火し、すべての PostgreSQL ソースで **Deploy CDC
+  infrastructure** ボタンが無効化されていました。ゲートはレポートが持つエンジン固有の変更ストリーム
+  チェック(MySQL は `BINLOG_ROW_FORMAT`、PostgreSQL は `WAL_LEVEL_LOGICAL`)で判定するようになり、
+  メッセージもエンジン中立になりました。MySQL の挙動は変わりません。
+
 ## v0.1.401
 
 ### 修正 (Fixed)

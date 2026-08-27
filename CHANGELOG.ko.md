@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.402
+
+### 수정 (Fixed)
+
+- **PostgreSQL Full Load + CDC 마이그레이션에서 UI로 CDC 인프라를 배포할 수 있게 되었습니다.**
+  "Deploy CDC infrastructure" / Start CDC 게이트가 MySQL의 `BINLOG_ROW_FORMAT` 사전 점검(소스
+  변경 스트림 점검) 통과를 요구했는데, PostgreSQL 사전 점검 리포트에는 binlog 점검이 없습니다(대응
+  점검은 `WAL_LEVEL_LOGICAL`, 즉 `wal_level=logical`). 그래서 게이트가 항상 작동해 모든 PostgreSQL
+  소스에서 **Deploy CDC infrastructure** 버튼이 비활성화되어 있었습니다. 이제 게이트는 리포트가 담고
+  있는 엔진별 변경 스트림 점검(MySQL은 `BINLOG_ROW_FORMAT`, PostgreSQL은 `WAL_LEVEL_LOGICAL`)을
+  기준으로 판정하며 메시지도 엔진 중립적으로 바뀌었습니다. MySQL 동작은 변함이 없습니다.
+
 ## v0.1.401
 
 ### 수정 (Fixed)

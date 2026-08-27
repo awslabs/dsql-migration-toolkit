@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.402
+
+### Fixed
+
+- **A PostgreSQL Full Load + CDC migration can now deploy the CDC infrastructure from
+  the UI.** The "Deploy CDC infrastructure" / Start CDC gate required the MySQL
+  `BINLOG_ROW_FORMAT` prerequisite to have passed — the source change-stream check — but
+  a PostgreSQL prerequisite report carries no binlog check (its equivalent is
+  `WAL_LEVEL_LOGICAL`, i.e. `wal_level=logical`), so the gate always fired and left the
+  **Deploy CDC infrastructure** button disabled for every PostgreSQL source. The gate now
+  keys on whichever engine's change-stream check the report carries (`BINLOG_ROW_FORMAT`
+  for MySQL, `WAL_LEVEL_LOGICAL` for PostgreSQL), with an engine-neutral message. MySQL
+  behavior is unchanged.
+
 ## v0.1.401
 
 ### Fixed

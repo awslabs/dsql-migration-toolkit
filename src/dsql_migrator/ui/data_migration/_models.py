@@ -1969,8 +1969,11 @@ def cdc_prerequisite_block_reason(
     checked only in ``MigrationMode.CDC``:
 
     * the report exists (the CDC-mode checks have actually run), and
-    * ``BINLOG_ROW_FORMAT`` passed -- Debezium cannot read a ``STATEMENT``/``MIXED``
-      binlog, nor reconstruct rows without ``binlog_row_image=FULL``.
+    * the engine's change-stream check passed -- ``BINLOG_ROW_FORMAT`` for MySQL
+      (Debezium cannot read a ``STATEMENT``/``MIXED`` binlog, nor reconstruct rows
+      without ``binlog_row_image=FULL``), or ``WAL_LEVEL_LOGICAL`` for PostgreSQL
+      (pgoutput needs ``wal_level=logical``). A report carries only its own engine's
+      check, so gating on the MySQL one alone blocked every PostgreSQL CDC deploy.
 
     Without this, a source on the wrong binlog format surfaced only as an
     undiagnosed connector ``CREATE_FAILED`` ~26 min into a billable create; and
@@ -2000,20 +2003,31 @@ def cdc_prerequisite_block_reason(
             "verify the source binary log is usable for streaming before any "
             "billable infrastructure is created."
         )
-    binlog = next(
+    # The "CDC possible at all" source check differs by engine: MySQL needs the binary
+    # log in ROW format with a FULL row image (BINLOG_ROW_FORMAT); PostgreSQL needs
+    # wal_level=logical (WAL_LEVEL_LOGICAL). A report carries only its own engine's
+    # check, so gate on whichever is present -- keying on BINLOG_ROW_FORMAT alone left
+    # every PostgreSQL Full Load + CDC unable to deploy (its report has no binlog check,
+    # so the gate always fired).
+    stream = next(
         (
             r
             for r in report.results
-            if r.check_id is PrerequisiteCheckId.BINLOG_ROW_FORMAT
+            if r.check_id
+            in (
+                PrerequisiteCheckId.BINLOG_ROW_FORMAT,
+                PrerequisiteCheckId.WAL_LEVEL_LOGICAL,
+            )
         ),
         None,
     )
-    if binlog is None or binlog.status is not PrerequisiteStatus.PASS:
-        detail = (binlog.detail or "").strip() if binlog is not None else ""
+    if stream is None or stream.status is not PrerequisiteStatus.PASS:
+        detail = (stream.detail or "").strip() if stream is not None else ""
         suffix = f" {detail}" if detail else ""
         return (
-            "CDC needs the source binary log in ROW format with a FULL row image "
-            f"— that check has not passed.{suffix} Fix it on the source (an RDS "
-            "parameter-group change needs a reboot), then re-run the checks."
+            "CDC needs the source change stream enabled (MySQL: binary log in ROW "
+            "format with a FULL row image; PostgreSQL: wal_level=logical) — that check "
+            f"has not passed.{suffix} Fix it on the source (an RDS parameter-group "
+            "change needs a reboot), then re-run the checks."
         )
     return None

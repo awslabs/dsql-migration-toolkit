@@ -4719,6 +4719,26 @@ def test_cdc_prerequisite_gate_blocks_on_failed_binlog_format() -> None:
     assert cdc_prerequisite_block_reason(passing) is None
 
 
+def test_cdc_prerequisite_gate_postgres_uses_wal_level_check() -> None:
+    # PostgreSQL's "CDC possible at all" check is WAL_LEVEL_LOGICAL, not the MySQL
+    # BINLOG_ROW_FORMAT. A PG report (which carries no binlog check) must CLEAR the gate
+    # when wal_level=logical passed -- gating on BINLOG_ROW_FORMAT alone left every
+    # PostgreSQL Full Load + CDC unable to deploy the CDC infrastructure.
+    from dsql_migrator.ui.data_migration import cdc_prerequisite_block_reason
+
+    passing = PrerequisiteReport.build(
+        MigrationMode.CDC,
+        [_result(PrerequisiteCheckId.WAL_LEVEL_LOGICAL, PrerequisiteStatus.PASS)],
+    )
+    assert cdc_prerequisite_block_reason(passing) is None
+
+    failing = PrerequisiteReport.build(
+        MigrationMode.CDC,
+        [_result(PrerequisiteCheckId.WAL_LEVEL_LOGICAL, PrerequisiteStatus.FAIL)],
+    )
+    assert cdc_prerequisite_block_reason(failing) is not None
+
+
 def test_cdc_prerequisite_gate_ignores_unrelated_required_failures() -> None:
     # Deliberately NOT gated on report.can_proceed: a per-table TARGET_SCHEMA_READY
     # failure is the Full Load guard's business and does not make streaming
