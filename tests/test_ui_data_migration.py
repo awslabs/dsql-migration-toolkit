@@ -14475,6 +14475,35 @@ def test_cdc_source_card_reads_mysql_only_fields_defensively_for_postgres() -> N
     )
 
 
+def test_cdc_start_button_ready_accepts_postgres_lsn_resume() -> None:
+    """Start CDC must enable for a PostgreSQL WAL-LSN watermark, not only MySQL coords.
+
+    ``_render_cdc_start_button`` computed ``ready`` from ``wm_resume.has_coordinates()``
+    (GTID/binlog only). A PostgreSQL Full Load watermark carries a WAL LSN and NO
+    binlog/GTID, so ``has_coordinates()`` is False and Start CDC stayed disabled with
+    "Set the CDC start point above first" -- even though the start-point card showed the
+    LSN as set (it keys on ``can_resume_from_lsn()``). The readiness gate must accept the
+    PostgreSQL LSN resume too.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    tree = ast.parse(inspect.getsource(_cdc_ui._render_cdc_start_button))
+    ready_assigns = [
+        ast.unparse(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "ready" for t in node.targets)
+    ]
+    joined = " ".join(ready_assigns)
+    assert "can_resume_from_lsn" in joined, (
+        "Start CDC readiness must accept a PostgreSQL WAL-LSN resume "
+        "(can_resume_from_lsn), not only MySQL has_coordinates()"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Sink MCU knob: config -> CFN parameter wiring
 # ---------------------------------------------------------------------------

@@ -5,6 +5,18 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.404
+
+### 修正 (Fixed)
+
+- **PostgreSQL の Full Load ウォーターマークでも Start CDC が有効になります。** Start CDC の準備判定が
+  `CdcResumePoint.has_coordinates()`(MySQL の GTID / binlog `file:position`)のみに依存していました。
+  PostgreSQL の Full Load は **WAL LSN** を記録し binlog/GTID を持たないため、判定が false のままとなり、
+  開始点カードには LSN が設定済みと表示される(カードは PostgreSQL の `can_resume_from_lsn()` を使用)
+  にもかかわらず **Start CDC** ボタンが「Set the CDC start point above first」で無効化されていました。
+  判定は両方の座標タイプを受け入れるようになり、ギャップレスな PostgreSQL Full Load → CDC ハンドオフを
+  開始できます。MySQL は変わりません。
+
 ## v0.1.403
 
 ### 修正 (Fixed)

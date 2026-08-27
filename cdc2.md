@@ -1,0 +1,172 @@
+- generic [ref=f6e3]:
+  - banner [ref=f6e4]:
+    - generic [ref=f6e5]:
+      - button [ref=f6e6] [cursor=pointer]:
+        - img [ref=f6e8]: menu
+      - generic [ref=f6e9]: Aurora DSQL Migration Tool
+    - generic [ref=f6e10]:
+      - button "What's next?" [ref=f6e11] [cursor=pointer]:
+        - generic [ref=f6e12]:
+          - img [ref=f6e13]: tips_and_updates
+          - generic [ref=f6e14]: What's next?
+      - button "AI DBA" [ref=f6e15] [cursor=pointer]:
+        - generic [ref=f6e16]:
+          - img [ref=f6e17]: auto_awesome
+          - generic [ref=f6e18]: AI DBA
+  - complementary [ref=f6e19]:
+    - generic [ref=f6e20]:
+      - list [ref=f6e1020]:
+        - generic [ref=f6e1021]: Setup
+        - listitem [ref=f6e1022] [cursor=pointer]:
+          - generic [ref=f6e1023]: link
+          - generic [ref=f6e1025]:
+            - generic [ref=f6e1026]: Connect
+            - generic [ref=f6e1027]: Connected
+        - separator [ref=f6e1028]
+        - generic [ref=f6e1029]: Migration workflow
+        - listitem [ref=f6e1030] [cursor=pointer]:
+          - generic [ref=f6e1031]: check_circle
+          - generic [ref=f6e1033]:
+            - generic [ref=f6e1034]: 1. Evaluation
+            - generic [ref=f6e1035]: Success
+        - listitem [ref=f6e1036] [cursor=pointer]:
+          - generic [ref=f6e1037]: check_circle
+          - generic [ref=f6e1039]:
+            - generic [ref=f6e1040]: 2. Schema Conversion
+            - generic [ref=f6e1041]: Success
+        - listitem [ref=f6e1042] [cursor=pointer]:
+          - generic [ref=f6e1043]: check_circle
+          - generic [ref=f6e1045]:
+            - generic [ref=f6e1046]: 3. Data Migration
+            - generic [ref=f6e1047]: Success
+        - listitem [ref=f6e1048] [cursor=pointer]:
+          - generic [ref=f6e1049]: radio_button_unchecked
+          - generic [ref=f6e1051]:
+            - generic [ref=f6e1052]: 4. Validation
+            - generic [ref=f6e1053]: Not started
+        - listitem [ref=f6e1054] [cursor=pointer]:
+          - generic [ref=f6e1055]: radio_button_unchecked
+          - generic [ref=f6e1057]:
+            - generic [ref=f6e1058]: 5. Cut over
+            - generic [ref=f6e1059]: Not started
+        - separator [ref=f6e1060]
+        - generic [ref=f6e1061]: Optional tools
+        - listitem [ref=f6e1062] [cursor=pointer]:
+          - generic [ref=f6e1063]: science
+          - generic [ref=f6e1065]:
+            - generic [ref=f6e1066]: Query Converter
+            - generic [ref=f6e1067]: Optional · Convert & test app queries
+      - separator [ref=f6e69]
+      - listitem [ref=f6e70] [cursor=pointer]:
+        - generic [ref=f6e71]: settings
+        - generic [ref=f6e73]:
+          - generic [ref=f6e74]: Settings
+          - generic [ref=f6e75]: Tuning · logging
+      - listitem [ref=f6e76] [cursor=pointer]:
+        - generic [ref=f6e77]: replay_circle_filled
+        - generic [ref=f6e79]:
+          - generic [ref=f6e80]: Start over
+          - generic [ref=f6e81]: Reset this session
+      - generic [ref=f6e82]: version 0.1.403
+  - main [ref=f6e84]:
+    - generic [ref=f6e86]:
+      - generic [ref=f6e1068]:
+        - generic [ref=f6e1069]:
+          - generic [ref=f6e1070]:
+            - generic [ref=f6e1071]: storage
+            - generic [ref=f6e1072]: Source
+            - generic [ref=f6e1073]: Connected
+          - generic [ref=f6e1076]:
+            - generic [ref=f6e1077]
+            - generic [ref=f6e1085]
+        - generic [ref=f6e1101]:
+          - generic [ref=f6e1102]:
+            - generic [ref=f6e1103]: sync_alt
+            - generic [ref=f6e1104]: Migration Tool
+            - generic [ref=f6e1105]: Convert · Load · Validate
+          - generic [ref=f6e1106]:
+            - generic [ref=f6e1107]: settings
+            - generic [ref=f6e1109]
+            - generic [ref=f6e1112]: "AI assist: Off"
+        - generic [ref=f6e1118]:
+          - generic [ref=f6e1119]:
+            - generic [ref=f6e1120]: dns
+            - generic [ref=f6e1121]: Target
+            - generic [ref=f6e1122]: Connected
+          - generic [ref=f6e1125]:
+            - generic [ref=f6e1126]
+            - generic [ref=f6e1133]
+      - generic [ref=f6e1144]:
+        - generic [ref=f6e1145] [cursor=pointer]:
+          - generic [ref=f6e1146]: check_circle
+          - generic [ref=f6e1147]: 1. Evaluation
+        - generic [ref=f6e1148]: chevron_right
+        - generic [ref=f6e1149] [cursor=pointer]:
+          - generic [ref=f6e1150]: check_circle
+          - generic [ref=f6e1151]: 2. Schema Conversion
+        - generic [ref=f6e1152]: chevron_right
+        - generic [ref=f6e1153] [cursor=pointer]:
+          - generic [ref=f6e1154]: adjust
+          - generic [ref=f6e1155]: 3. Data Migration
+        - generic [ref=f6e1156]: chevron_right
+        - generic [ref=f6e1157] [cursor=pointer]:
+          - generic [ref=f6e1158]: radio_button_unchecked
+          - generic [ref=f6e1159]: 4. Validation
+        - generic [ref=f6e1160]: chevron_right
+        - generic [ref=f6e1161] [cursor=pointer]:
+          - generic [ref=f6e1162]: radio_button_unchecked
+          - generic [ref=f6e1163]: 5. Cut over
+      - generic [ref=f6e1164]:
+        - generic [ref=f6e1165]:
+          - generic [ref=f6e1166]: Data Migration
+          - status [ref=f6e1168]: Success
+        - button "Re-run migration" [disabled] [ref=f6e1170]
+      - generic [ref=f6e1173]:
+        - generic [ref=f6e1174]: Migration type
+        - generic [ref=f6e1175]:
+          - generic [ref=f6e1176] [cursor=pointer]:
+            - generic [ref=f6e1177]
+            - generic [ref=f6e1181]: "One-shot Full Load: pick tables, check Prerequisites, then run it. Progress and any data errors update automatically while the job runs."
+            - generic [ref=f6e1182]: Choose for a one-time copy or a maintenance-window cutover.
+            - generic [ref=f6e1183]
+          - generic [ref=f6e1186] [cursor=pointer]:
+            - generic [ref=f6e1187]
+            - generic [ref=f6e1191]: "Continuous CDC via the optional managed pipeline: check Prerequisites, then review the CDC setup. Stand-alone (no Full Load in this session) -- start from a prior watermark or an external GTID."
+            - generic [ref=f6e1192]: Choose to resume/attach streaming to an already-loaded target.
+            - generic [ref=f6e1193]
+          - generic [ref=f6e1196] [cursor=pointer]:
+            - generic [ref=f6e1197]
+            - generic [ref=f6e1201]: "Full Load then CDC, end to end: run the Full Load, and when it finishes the CDC step opens automatically -- seeded from the Full Load watermark for a gapless hand-off (no manual seed point)."
+            - generic [ref=f6e1202]: Choose for near-zero-downtime cutover (snapshot, then stay in sync).
+            - generic [ref=f6e1203]
+        - generic [ref=f6e1206]:
+          - generic [ref=f6e1207]: "Data Migration status:"
+          - status [ref=f6e1208]: "Full Load: DONE"
+        - generic [ref=f6e1209]:
+          - generic [ref=f6e1210]:
+            - generic [ref=f6e1211]: Tables to migrate
+            - generic [ref=f6e1212]: info
+            - generic [ref=f6e1213]: lock
+          - generic [ref=f6e1214]: "Pre-selected: 5 of 5 table(s) already on the target — tick or untick to change."
+          - generic [ref=f6e1215]:
+            - generic [ref=f6e1216]
+            - generic [ref=f6e1219]
+          - generic [ref=f6e1224]:
+            - tree
+        - generic [ref=f6e1225]:
+          - generic [ref=f6e1226]: data_object
+          - generic [ref=f6e1227]:
+            - generic [ref=f6e1228]: No oversized LOB columns
+            - generic [ref=f6e1229]: No LOB/TEXT columns in the selected tables can exceed the Aurora DSQL 1 MiB value limit — nothing needs excluding from this migration.
+        - generic [ref=f6e1230]:
+          - button "Expand" [ref=f6e1233] [cursor=pointer]:
+            - generic [ref=f6e1234]
+            - generic [ref=f6e1237]: keyboard_arrow_down
+          - button "Expand" [ref=f6e1243] [cursor=pointer]:
+            - generic [ref=f6e1244]
+            - generic [ref=f6e1247]: keyboard_arrow_down
+          - generic [ref=f6e1252]:
+            - button "Collapse" [expanded] [ref=f6e1253] [cursor=pointer]
+            - generic [ref=f6e1261]
+      - separator [ref=f6e1370]
+      - 'button "Next: Validation" [ref=f6e1372] [cursor=pointer]'

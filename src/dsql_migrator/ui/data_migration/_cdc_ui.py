@@ -1776,7 +1776,16 @@ def _render_cdc_start_button(
     ready = (
         resumes_from_offset
         or (override is not None and override.has_coordinates())
-        or (wm_resume is not None and wm_resume.has_coordinates())
+        # MySQL resumes from a binlog/GTID coordinate (has_coordinates); PostgreSQL
+        # resumes from the logical-replication slot's WAL LSN (can_resume_from_lsn).
+        # Accept EITHER so a PostgreSQL Full Load watermark (a WAL LSN, no binlog/GTID)
+        # enables Start CDC -- keying on has_coordinates() alone left it disabled for PG
+        # with "Set the CDC start point above first" while the start-point card showed
+        # the LSN as set.
+        or (
+            wm_resume is not None
+            and (wm_resume.has_coordinates() or wm_resume.can_resume_from_lsn())
+        )
     )
     # A restart is a materially different operation from a first start -- it resumes an
     # existing position rather than establishing one -- so it must not be described with

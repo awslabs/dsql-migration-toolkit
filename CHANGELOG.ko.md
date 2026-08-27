@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.404
+
+### 수정 (Fixed)
+
+- **PostgreSQL Full Load 워터마크로도 Start CDC가 활성화됩니다.** Start CDC 준비 판정이
+  `CdcResumePoint.has_coordinates()`(MySQL의 GTID / binlog `file:position`)에만 의존했습니다.
+  PostgreSQL Full Load는 **WAL LSN**을 기록하며 binlog/GTID가 없으므로 판정이 false로 남아
+  시작점 카드에는 LSN이 설정됨으로 표시되는데도(카드는 PostgreSQL의 `can_resume_from_lsn()` 사용)
+  **Start CDC** 버튼이 "Set the CDC start point above first"로 비활성화되어 있었습니다. 이제 판정이
+  두 좌표 유형을 모두 수용하여 gapless PostgreSQL Full Load → CDC 핸드오프를 시작할 수 있습니다.
+  MySQL은 변함이 없습니다.
+
 ## v0.1.403
 
 ### 수정 (Fixed)

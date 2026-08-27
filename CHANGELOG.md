@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.404
+
+### Fixed
+
+- **Start CDC now enables for a PostgreSQL Full Load watermark.** The Start CDC readiness
+  gate keyed only on `CdcResumePoint.has_coordinates()` (a MySQL GTID / binlog
+  `file:position`). A PostgreSQL Full Load records a **WAL LSN** (and no binlog/GTID), so
+  the gate stayed false and the **Start CDC** button was disabled with "Set the CDC start
+  point above first" — even though the start-point card showed the LSN as set (it keys on
+  the PostgreSQL `can_resume_from_lsn()`). The gate now accepts either coordinate type, so
+  a gapless PostgreSQL Full Load → CDC handoff can start. MySQL is unchanged.
+
 ## v0.1.403
 
 ### Fixed
