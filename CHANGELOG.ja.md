@@ -5,6 +5,18 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.403
+
+### 修正 (Fixed)
+
+- **Data Migration → CDC ステップが PostgreSQL ソースでクラッシュしなくなりました。** PostgreSQL の
+  Full Load 後、CDC ソース設定カードのレンダリングで `config.start_gtid`(および
+  `start_binlog_file`/`start_binlog_pos`)にアクセスしていましたが、これらは `PostgresSourceConfig`
+  に存在しない MySQL の GTID/binlog フィールドのため `AttributeError` が発生し、ステップがエラーカード
+  (「An unexpected error occurred while rendering this step」)に置き換わっていました。これらの
+  MySQL 専用フィールドは防御的に(`getattr` で)読み取るようになり、代わりに PostgreSQL の開始点(論理
+  レプリケーションの `slot.name` / `publication.name`)を表示します。MySQL は変わりません。
+
 ## v0.1.402
 
 ### 修正 (Fixed)

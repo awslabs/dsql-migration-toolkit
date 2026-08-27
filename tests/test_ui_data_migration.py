@@ -14444,6 +14444,37 @@ def test_cdc_step_gates_automatic_on_can_seed_offset_not_has_coordinates() -> No
     assert "gtid_executed" in joined
 
 
+def test_cdc_source_card_reads_mysql_only_fields_defensively_for_postgres() -> None:
+    """The CDC source-config card must not access MySQL-only attributes directly.
+
+    ``_render_cdc_source_config_card`` builds a source config that is a
+    ``PostgresSourceConfig`` for a PostgreSQL source, which has NO ``start_gtid`` /
+    ``start_binlog_file`` / ``start_binlog_pos`` (those are MySQL GTID/binlog concepts).
+    A bare ``config.start_gtid`` therefore raised ``AttributeError`` and crashed the CDC
+    step render for every PostgreSQL source. They must be read via ``getattr(...)`` so a
+    PG config renders (its start point is the slot/publication instead).
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    tree = ast.parse(inspect.getsource(_cdc_ui._render_cdc_source_config_card))
+    mysql_only = {"start_gtid", "start_binlog_file", "start_binlog_pos"}
+    bare = [
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "config"
+        and node.attr in mysql_only
+    ]
+    assert not bare, (
+        f"MySQL-only source fields accessed directly on config (crashes a PostgreSQL "
+        f"source config): {bare} — read them via getattr() instead"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Sink MCU knob: config -> CFN parameter wiring
 # ---------------------------------------------------------------------------

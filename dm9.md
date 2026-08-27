@@ -1,0 +1,177 @@
+- generic [ref=f4e3]:
+  - banner [ref=f4e4]:
+    - generic [ref=f4e5]:
+      - button [ref=f4e6] [cursor=pointer]:
+        - img [ref=f4e8]: menu
+      - generic [ref=f4e9]: Aurora DSQL Migration Tool
+    - generic [ref=f4e10]:
+      - button "What's next?" [ref=f4e11] [cursor=pointer]:
+        - generic [ref=f4e12]:
+          - img [ref=f4e13]: tips_and_updates
+          - generic [ref=f4e14]: What's next?
+      - button "AI DBA" [ref=f4e15] [cursor=pointer]:
+        - generic [ref=f4e16]:
+          - img [ref=f4e17]: auto_awesome
+          - generic [ref=f4e18]: AI DBA
+  - complementary [ref=f4e19]:
+    - generic [ref=f4e20]:
+      - list [ref=f4e4054]:
+        - generic [ref=f4e4055]: Setup
+        - listitem [ref=f4e4056] [cursor=pointer]:
+          - generic [ref=f4e4057]: link
+          - generic [ref=f4e4059]:
+            - generic [ref=f4e4060]: Connect
+            - generic [ref=f4e4061]: Connected
+        - separator [ref=f4e4062]
+        - generic [ref=f4e4063]: Migration workflow
+        - listitem [ref=f4e4064] [cursor=pointer]:
+          - generic [ref=f4e4065]: check_circle
+          - generic [ref=f4e4067]:
+            - generic [ref=f4e4068]: 1. Evaluation
+            - generic [ref=f4e4069]: Success
+        - listitem [ref=f4e4070] [cursor=pointer]:
+          - generic [ref=f4e4071]: check_circle
+          - generic [ref=f4e4073]:
+            - generic [ref=f4e4074]: 2. Schema Conversion
+            - generic [ref=f4e4075]: Success
+        - listitem [ref=f4e4076] [cursor=pointer]:
+          - generic [ref=f4e4077]: check_circle
+          - generic [ref=f4e4079]:
+            - generic [ref=f4e4080]: 3. Data Migration
+            - generic [ref=f4e4081]: Success
+        - listitem [ref=f4e4082] [cursor=pointer]:
+          - generic [ref=f4e4083]: radio_button_unchecked
+          - generic [ref=f4e4085]:
+            - generic [ref=f4e4086]: 4. Validation
+            - generic [ref=f4e4087]: Not started
+        - listitem [ref=f4e4088] [cursor=pointer]:
+          - generic [ref=f4e4089]: radio_button_unchecked
+          - generic [ref=f4e4091]:
+            - generic [ref=f4e4092]: 5. Cut over
+            - generic [ref=f4e4093]: Not started
+        - separator [ref=f4e4094]
+        - generic [ref=f4e4095]: Optional tools
+        - listitem [ref=f4e4096] [cursor=pointer]:
+          - generic [ref=f4e4097]: science
+          - generic [ref=f4e4099]:
+            - generic [ref=f4e4100]: Query Converter
+            - generic [ref=f4e4101]: Optional · Convert & test app queries
+      - separator [ref=f4e69]
+      - listitem [ref=f4e70] [cursor=pointer]:
+        - generic [ref=f4e71]: settings
+        - generic [ref=f4e73]:
+          - generic [ref=f4e74]: Settings
+          - generic [ref=f4e75]: Tuning · logging
+      - listitem [ref=f4e76] [cursor=pointer]:
+        - generic [ref=f4e77]: replay_circle_filled
+        - generic [ref=f4e79]:
+          - generic [ref=f4e80]: Start over
+          - generic [ref=f4e81]: Reset this session
+      - generic [ref=f4e82]: version 0.1.402
+  - main [ref=f4e84]:
+    - generic [ref=f4e86]:
+      - generic [ref=f4e4102]:
+        - generic [ref=f4e4103]:
+          - generic [ref=f4e4104]:
+            - generic [ref=f4e4105]: storage
+            - generic [ref=f4e4106]: Source
+            - generic [ref=f4e4107]: Connected
+          - generic [ref=f4e4110]:
+            - generic [ref=f4e4111]
+            - generic [ref=f4e4119]
+        - generic [ref=f4e4135]:
+          - generic [ref=f4e4136]:
+            - generic [ref=f4e4137]: sync_alt
+            - generic [ref=f4e4138]: Migration Tool
+            - generic [ref=f4e4139]: Convert · Load · Validate
+          - generic [ref=f4e4140]:
+            - generic [ref=f4e4141]: settings
+            - generic [ref=f4e4143]
+            - generic [ref=f4e4146]: "AI assist: Off"
+        - generic [ref=f4e4152]:
+          - generic [ref=f4e4153]:
+            - generic [ref=f4e4154]: dns
+            - generic [ref=f4e4155]: Target
+            - generic [ref=f4e4156]: Connected
+          - generic [ref=f4e4159]:
+            - generic [ref=f4e4160]
+            - generic [ref=f4e4167]
+      - generic [ref=f4e4178]:
+        - generic [ref=f4e4179] [cursor=pointer]:
+          - generic [ref=f4e4180]: check_circle
+          - generic [ref=f4e4181]: 1. Evaluation
+        - generic [ref=f4e4182]: chevron_right
+        - generic [ref=f4e4183] [cursor=pointer]:
+          - generic [ref=f4e4184]: check_circle
+          - generic [ref=f4e4185]: 2. Schema Conversion
+        - generic [ref=f4e4186]: chevron_right
+        - generic [ref=f4e4187] [cursor=pointer]:
+          - generic [ref=f4e4188]: adjust
+          - generic [ref=f4e4189]: 3. Data Migration
+        - generic [ref=f4e4190]: chevron_right
+        - generic [ref=f4e4191] [cursor=pointer]:
+          - generic [ref=f4e4192]: radio_button_unchecked
+          - generic [ref=f4e4193]: 4. Validation
+        - generic [ref=f4e4194]: chevron_right
+        - generic [ref=f4e4195] [cursor=pointer]:
+          - generic [ref=f4e4196]: radio_button_unchecked
+          - generic [ref=f4e4197]: 5. Cut over
+      - generic [ref=f4e4198]:
+        - generic [ref=f4e4199]:
+          - generic [ref=f4e4200]: Data Migration
+          - status [ref=f4e4202]: Success
+        - button "Re-run migration" [ref=f4e4204] [cursor=pointer]
+      - generic [ref=f4e4207]:
+        - generic [ref=f4e4208]: Migration type
+        - generic [ref=f4e4209]:
+          - generic [ref=f4e4210] [cursor=pointer]:
+            - generic [ref=f4e4211]
+            - generic [ref=f4e4215]: "One-shot Full Load: pick tables, check Prerequisites, then run it. Progress and any data errors update automatically while the job runs."
+            - generic [ref=f4e4216]: Choose for a one-time copy or a maintenance-window cutover.
+            - generic [ref=f4e4217]
+          - generic [ref=f4e4220] [cursor=pointer]:
+            - generic [ref=f4e4221]
+            - generic [ref=f4e4225]: "Continuous CDC via the optional managed pipeline: check Prerequisites, then review the CDC setup. Stand-alone (no Full Load in this session) -- start from a prior watermark or an external GTID."
+            - generic [ref=f4e4226]: Choose to resume/attach streaming to an already-loaded target.
+            - generic [ref=f4e4227]
+          - generic [ref=f4e4230] [cursor=pointer]:
+            - generic [ref=f4e4231]
+            - generic [ref=f4e4235]: "Full Load then CDC, end to end: run the Full Load, and when it finishes the CDC step opens automatically -- seeded from the Full Load watermark for a gapless hand-off (no manual seed point)."
+            - generic [ref=f4e4236]: Choose for near-zero-downtime cutover (snapshot, then stay in sync).
+            - generic [ref=f4e4237]
+        - generic [ref=f4e4240]:
+          - generic [ref=f4e4241]: "Data Migration status:"
+          - status [ref=f4e4242]: "Full Load: DONE"
+        - generic [ref=f4e4243]:
+          - generic [ref=f4e4244]:
+            - generic [ref=f4e4245]: Tables to migrate
+            - generic [ref=f4e4246]: info
+            - generic [ref=f4e4247]: lock
+          - generic [ref=f4e4248]: "Pre-selected: 5 of 5 table(s) already on the target — tick or untick to change."
+          - generic [ref=f4e4249]:
+            - generic [ref=f4e4250]
+            - generic [ref=f4e4253]
+          - generic [ref=f4e4258]:
+            - tree
+        - generic [ref=f4e4259]:
+          - generic [ref=f4e4260]: data_object
+          - generic [ref=f4e4261]:
+            - generic [ref=f4e4262]: No oversized LOB columns
+            - generic [ref=f4e4263]: No LOB/TEXT columns in the selected tables can exceed the Aurora DSQL 1 MiB value limit — nothing needs excluding from this migration.
+        - generic [ref=f4e4264]:
+          - button "Expand" [ref=f4e4267] [cursor=pointer]:
+            - generic [ref=f4e4268]
+            - generic [ref=f4e4271]: keyboard_arrow_down
+          - button "Expand" [ref=f4e4277] [cursor=pointer]:
+            - generic [ref=f4e4278]
+            - generic [ref=f4e4281]: keyboard_arrow_down
+          - generic [ref=f4e4286]:
+            - button "Collapse" [expanded] [ref=f4e4287] [cursor=pointer]
+            - generic [ref=f4e4296]
+      - generic [ref=f4e4322]:
+        - generic [ref=f4e4323]: error
+        - generic [ref=f4e4324]:
+          - generic [ref=f4e4325]: Data Migration could not be displayed
+          - generic [ref=f4e4326]: An unexpected error occurred while rendering this step (AttributeError). Your connections and migrated data are unaffected — use the sidebar to navigate to another step or refresh the page. If it persists, check the activity log.
+      - separator [ref=f4e4327]
+      - 'button "Next: Validation" [ref=f4e4329] [cursor=pointer]'

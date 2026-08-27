@@ -1,0 +1,360 @@
+- generic [ref=f4e3]:
+  - banner [ref=f4e4]:
+    - generic [ref=f4e5]:
+      - button [ref=f4e6] [cursor=pointer]:
+        - img [ref=f4e8]: menu
+      - generic [ref=f4e9]: Aurora DSQL Migration Tool
+    - generic [ref=f4e10]:
+      - button "What's next?" [ref=f4e11] [cursor=pointer]:
+        - generic [ref=f4e12]:
+          - img [ref=f4e13]: tips_and_updates
+          - generic [ref=f4e14]: What's next?
+      - button "AI DBA" [ref=f4e15] [cursor=pointer]:
+        - generic [ref=f4e16]:
+          - img [ref=f4e17]: auto_awesome
+          - generic [ref=f4e18]: AI DBA
+  - complementary [ref=f4e19]:
+    - generic [ref=f4e20]:
+      - list [ref=f4e2837]:
+        - generic [ref=f4e2838]: Setup
+        - listitem [ref=f4e2839] [cursor=pointer]:
+          - generic [ref=f4e2840]: link
+          - generic [ref=f4e2842]:
+            - generic [ref=f4e2843]: Connect
+            - generic [ref=f4e2844]: Connected
+        - separator [ref=f4e2845]
+        - generic [ref=f4e2846]: Migration workflow
+        - listitem [ref=f4e2847] [cursor=pointer]:
+          - generic [ref=f4e2848]: check_circle
+          - generic [ref=f4e2850]:
+            - generic [ref=f4e2851]: 1. Evaluation
+            - generic [ref=f4e2852]: Success
+        - listitem [ref=f4e2853] [cursor=pointer]:
+          - generic [ref=f4e2854]: check_circle
+          - generic [ref=f4e2856]:
+            - generic [ref=f4e2857]: 2. Schema Conversion
+            - generic [ref=f4e2858]: Success
+        - listitem [ref=f4e2859] [cursor=pointer]:
+          - generic [ref=f4e2860]: radio_button_unchecked
+          - generic [ref=f4e2862]:
+            - generic [ref=f4e2863]: 3. Data Migration
+            - generic [ref=f4e2864]: Not started
+        - listitem [ref=f4e2865] [cursor=pointer]:
+          - generic [ref=f4e2866]: radio_button_unchecked
+          - generic [ref=f4e2868]:
+            - generic [ref=f4e2869]: 4. Validation
+            - generic [ref=f4e2870]: Not started
+        - listitem [ref=f4e2871] [cursor=pointer]:
+          - generic [ref=f4e2872]: radio_button_unchecked
+          - generic [ref=f4e2874]:
+            - generic [ref=f4e2875]: 5. Cut over
+            - generic [ref=f4e2876]: Not started
+        - separator [ref=f4e2877]
+        - generic [ref=f4e2878]: Optional tools
+        - listitem [ref=f4e2879] [cursor=pointer]:
+          - generic [ref=f4e2880]: science
+          - generic [ref=f4e2882]:
+            - generic [ref=f4e2883]: Query Converter
+            - generic [ref=f4e2884]: Optional · Convert & test app queries
+      - separator [ref=f4e69]
+      - listitem [ref=f4e70] [cursor=pointer]:
+        - generic [ref=f4e71]: settings
+        - generic [ref=f4e73]:
+          - generic [ref=f4e74]: Settings
+          - generic [ref=f4e75]: Tuning · logging
+      - listitem [ref=f4e76] [cursor=pointer]:
+        - generic [ref=f4e77]: replay_circle_filled
+        - generic [ref=f4e79]:
+          - generic [ref=f4e80]: Start over
+          - generic [ref=f4e81]: Reset this session
+      - generic [ref=f4e82]: version 0.1.402
+  - main [ref=f4e84]:
+    - generic [ref=f4e86]:
+      - generic [ref=f4e2885]:
+        - generic [ref=f4e2886]:
+          - generic [ref=f4e2887]:
+            - generic [ref=f4e2888]: storage
+            - generic [ref=f4e2889]: Source
+            - generic [ref=f4e2890]: Connected
+          - generic [ref=f4e2893]:
+            - generic [ref=f4e2894]:
+              - img "Amazon RDS source database" [ref=f4e2896]
+              - generic [ref=f4e2899]:
+                - generic [ref=f4e2900]: Aurora PostgreSQL
+                - generic [ref=f4e2901]: Version 16.9.6 (PostgreSQL 16.9)
+            - generic [ref=f4e2902]:
+              - generic [ref=f4e2903]:
+                - generic [ref=f4e2904]: Endpoint
+                - generic [ref=f4e2905]:
+                  - generic [ref=f4e2906]: fk-pg-cdc2.cluster-ctelzzqt4cxq.ap-northeast-2.rds.amazonaws.com
+                  - button [ref=f4e2907] [cursor=pointer]:
+                    - img [ref=f4e2909]: content_copy
+              - generic [ref=f4e2910]:
+                - generic [ref=f4e2911]: Database
+                - generic [ref=f4e2912]: ecommerce_demo
+              - generic [ref=f4e2913]:
+                - generic [ref=f4e2914]: Region
+                - generic [ref=f4e2915]: ap-northeast-2
+        - generic [ref=f4e2918]:
+          - generic [ref=f4e2919]:
+            - generic [ref=f4e2920]: sync_alt
+            - generic [ref=f4e2921]: Migration Tool
+            - generic [ref=f4e2922]: Convert · Load · Validate
+          - generic [ref=f4e2923]:
+            - generic [ref=f4e2924]: settings
+            - generic [ref=f4e2926]:
+              - generic [ref=f4e2927]: Current stage
+              - generic [ref=f4e2928]: Data Migration
+            - generic [ref=f4e2929]: "AI assist: Off"
+        - generic [ref=f4e2935]:
+          - generic [ref=f4e2936]:
+            - generic [ref=f4e2937]: dns
+            - generic [ref=f4e2938]: Target
+            - generic [ref=f4e2939]: Connected
+          - generic [ref=f4e2942]:
+            - generic [ref=f4e2943]:
+              - img "Amazon Aurora DSQL" [ref=f4e2945]
+              - generic [ref=f4e2948]: Aurora DSQL
+            - generic [ref=f4e2950]:
+              - generic [ref=f4e2951]:
+                - generic [ref=f4e2952]: Endpoint
+                - generic [ref=f4e2953]:
+                  - generic [ref=f4e2954]: njuamqafkgxcop4mj6rmzhswae.dsql.ap-northeast-2.on.aws
+                  - button [ref=f4e2955] [cursor=pointer]:
+                    - img [ref=f4e2957]: content_copy
+              - generic [ref=f4e2958]:
+                - generic [ref=f4e2959]: Region
+                - generic [ref=f4e2960]: ap-northeast-2
+      - generic [ref=f4e2961]:
+        - generic [ref=f4e2962] [cursor=pointer]:
+          - generic [ref=f4e2963]: check_circle
+          - generic [ref=f4e2964]: 1. Evaluation
+        - generic [ref=f4e2965]: chevron_right
+        - generic [ref=f4e2966] [cursor=pointer]:
+          - generic [ref=f4e2967]: check_circle
+          - generic [ref=f4e2968]: 2. Schema Conversion
+        - generic [ref=f4e2969]: chevron_right
+        - generic [ref=f4e2970] [cursor=pointer]:
+          - generic [ref=f4e2971]: adjust
+          - generic [ref=f4e2972]: 3. Data Migration
+        - generic [ref=f4e2973]: chevron_right
+        - generic [ref=f4e2974] [cursor=pointer]:
+          - generic [ref=f4e2975]: radio_button_unchecked
+          - generic [ref=f4e2976]: 4. Validation
+        - generic [ref=f4e2977]: chevron_right
+        - generic [ref=f4e2978] [cursor=pointer]:
+          - generic [ref=f4e2979]: radio_button_unchecked
+          - generic [ref=f4e2980]: 5. Cut over
+      - generic [ref=f4e2981]:
+        - generic [ref=f4e2982]:
+          - generic [ref=f4e2983]: Data Migration
+          - status [ref=f4e2985]: Not started
+        - button "Start migration" [ref=f4e2987] [cursor=pointer]
+      - generic [ref=f4e2990]:
+        - generic [ref=f4e2991]: Migration type
+        - generic [ref=f4e2992]:
+          - generic [ref=f4e2993] [cursor=pointer]:
+            - generic [ref=f4e2994]:
+              - generic [ref=f4e2995]: radio_button_unchecked
+              - generic [ref=f4e2996]: bolt
+              - generic [ref=f4e2997]: Full load only
+            - generic [ref=f4e2998]: "One-shot Full Load: pick tables, check Prerequisites, then run it. Progress and any data errors update automatically while the job runs."
+            - generic [ref=f4e2999]: Choose for a one-time copy or a maintenance-window cutover.
+            - generic [ref=f4e3000]:
+              - generic [ref=f4e3001]: check_circle
+              - generic [ref=f4e3002]: No extra infrastructure.
+          - generic [ref=f4e3003] [cursor=pointer]:
+            - generic [ref=f4e3004]:
+              - generic [ref=f4e3005]: radio_button_unchecked
+              - generic [ref=f4e3006]: sync
+              - generic [ref=f4e3007]: CDC only
+            - generic [ref=f4e3008]: "Continuous CDC via the optional managed pipeline: check Prerequisites, then review the CDC setup. Stand-alone (no Full Load in this session) -- start from a prior watermark or an external GTID."
+            - generic [ref=f4e3009]: Choose to resume/attach streaming to an already-loaded target.
+            - generic [ref=f4e3010]:
+              - generic [ref=f4e3011]: info
+              - generic [ref=f4e3012]: Needs a managed MSK pipeline and the source's change stream enabled — PostgreSQL logical replication (wal_level=logical + a pgoutput publication).
+          - generic [ref=f4e3013] [cursor=pointer]:
+            - generic [ref=f4e3014]:
+              - generic [ref=f4e3015]: radio_button_checked
+              - generic [ref=f4e3016]: merge
+              - generic [ref=f4e3017]: Full load + CDC
+            - generic [ref=f4e3018]: "Full Load then CDC, end to end: run the Full Load, and when it finishes the CDC step opens automatically -- seeded from the Full Load watermark for a gapless hand-off (no manual seed point)."
+            - generic [ref=f4e3019]: Choose for near-zero-downtime cutover (snapshot, then stay in sync).
+            - generic [ref=f4e3020]:
+              - generic [ref=f4e3021]: info
+              - generic [ref=f4e3022]: Needs a managed MSK pipeline and the source's change stream enabled — PostgreSQL logical replication (wal_level=logical + a pgoutput publication).
+        - generic [ref=f4e3023]:
+          - generic [ref=f4e3024]: "Data Migration status:"
+          - status [ref=f4e3025]: "Full Load: NOT_STARTED"
+        - generic [ref=f4e3026]:
+          - generic [ref=f4e3027]:
+            - generic [ref=f4e3028]: Tables to migrate
+            - generic [ref=f4e3029]: info
+            - button [ref=f4e3030] [cursor=pointer]:
+              - img [ref=f4e3032]: refresh
+          - generic [ref=f4e3033]: "Pre-selected: 5 of 5 table(s) already on the target — tick or untick to change."
+          - generic [ref=f4e3034]:
+            - textbox [ref=f4e3039]:
+              - /placeholder: Filter tables by name
+            - button "Select all" [ref=f4e3040] [cursor=pointer]:
+              - generic [ref=f4e3041]:
+                - img [ref=f4e3042]: done_all
+                - generic [ref=f4e3043]: Select all
+            - button "Unselect all" [ref=f4e3044] [cursor=pointer]:
+              - generic [ref=f4e3045]:
+                - img [ref=f4e3046]: remove_done
+                - generic [ref=f4e3047]: Unselect all
+            - generic [ref=f4e3048]: 5 of 5 selected
+          - generic [ref=f4e3049]:
+            - generic [ref=f4e3050]:
+              - generic [ref=f4e3051]: check_circle
+              - generic [ref=f4e3052]: Has a primary key
+            - generic [ref=f4e3053]:
+              - generic [ref=f4e3054]: warning
+              - generic [ref=f4e3055]: No primary key (required to migrate to Aurora DSQL)
+          - tree [ref=f4e3059]:
+            - generic [ref=f4e3060]:
+              - 'treeitem "Schema: public" [expanded] [ref=f4e3061] [cursor=pointer]':
+                - generic [ref=f4e3062]: play_arrow
+                - checkbox [checked] [ref=f4e3063]
+              - group [ref=f4e3071]:
+                - generic [ref=f4e3072]:
+                  - treeitem "Tables (5)" [expanded] [ref=f4e3073] [cursor=pointer]:
+                    - generic [ref=f4e3074]: play_arrow
+                    - checkbox [checked] [ref=f4e3075]
+                  - group [ref=f4e3083]:
+                    - treeitem "suppliers" [ref=f4e3085]:
+                      - checkbox [checked] [ref=f4e3086] [cursor=pointer]
+                      - generic [ref=f4e3092]
+                    - treeitem "products" [ref=f4e3096]:
+                      - checkbox [checked] [ref=f4e3097] [cursor=pointer]
+                      - generic [ref=f4e3103]
+                    - treeitem "customers" [ref=f4e3107]:
+                      - checkbox [checked] [ref=f4e3108] [cursor=pointer]
+                      - generic [ref=f4e3114]
+                    - treeitem "orders" [ref=f4e3118]:
+                      - checkbox [checked] [ref=f4e3119] [cursor=pointer]
+                      - generic [ref=f4e3125]
+                    - treeitem "order_items" [ref=f4e3129]:
+                      - checkbox [checked] [ref=f4e3130] [cursor=pointer]
+                      - generic [ref=f4e3136]
+        - generic [ref=f4e3139]:
+          - generic [ref=f4e3140]: data_object
+          - generic [ref=f4e3141]:
+            - generic [ref=f4e3142]: No oversized LOB columns
+            - generic [ref=f4e3143]: No LOB/TEXT columns in the selected tables can exceed the Aurora DSQL 1 MiB value limit — nothing needs excluding from this migration.
+        - generic [ref=f4e3144]:
+          - generic [ref=f4e3146]:
+            - button "Collapse" [expanded] [ref=f4e3147] [cursor=pointer]:
+              - generic [ref=f4e3148]:
+                - generic [ref=f4e3149]: check_circle
+                - generic [ref=f4e3150]: Prerequisites
+              - generic [ref=f4e3151]: keyboard_arrow_down
+            - generic [ref=f4e3155]:
+              - generic [ref=f4e3156]: Run read-only checks before migrating. These cover both phases -- the Full Load and the CDC stream; a failed required check blocks the migration.
+              - button "Check Full load + CDC prerequisites" [ref=f4e3158] [cursor=pointer]
+              - generic [ref=f4e3161]:
+                - generic [ref=f4e3162]: Full load + CDC prerequisites
+                - status [ref=f4e3163]: Can proceed
+              - generic [ref=f4e3164]:
+                - status [ref=f4e3165]: "Full Load: Can proceed"
+                - status [ref=f4e3166]: "CDC: Can proceed"
+              - generic [ref=f4e3167]:
+                - generic [ref=f4e3169]:
+                  - button "Expand" [ref=f4e3170] [cursor=pointer]:
+                    - generic [ref=f4e3171]:
+                      - generic [ref=f4e3172]: check_circle
+                      - generic [ref=f4e3173]: Connectivity & Access
+                      - status [ref=f4e3174]: 3 passed
+                    - generic [ref=f4e3175]: keyboard_arrow_down
+                  - separator [ref=f4e3177]
+                  - separator [ref=f4e3178]
+                - generic [ref=f4e3180]:
+                  - button "Expand" [ref=f4e3181] [cursor=pointer]:
+                    - generic [ref=f4e3182]:
+                      - generic [ref=f4e3183]: check_circle
+                      - generic [ref=f4e3184]: Source Configuration
+                      - status [ref=f4e3185]: 1 passed · 2 skipped
+                    - generic [ref=f4e3186]: keyboard_arrow_down
+                  - separator [ref=f4e3188]
+                  - separator [ref=f4e3189]
+                - generic [ref=f4e3191]:
+                  - button "Expand" [ref=f4e3192] [cursor=pointer]:
+                    - generic [ref=f4e3193]:
+                      - generic [ref=f4e3194]: check_circle
+                      - generic [ref=f4e3195]: Schema & Tables
+                      - status [ref=f4e3196]: 24 passed
+                    - generic [ref=f4e3197]: keyboard_arrow_down
+                  - separator [ref=f4e3199]
+                  - separator [ref=f4e3200]
+                - generic [ref=f4e3202]:
+                  - button "Expand" [ref=f4e3203] [cursor=pointer]:
+                    - generic [ref=f4e3204]:
+                      - generic [ref=f4e3205]: info
+                      - generic [ref=f4e3206]: Streaming Pipeline (CDC)
+                      - status [ref=f4e3207]: 2 recommendations
+                    - generic [ref=f4e3208]: keyboard_arrow_down
+                  - separator [ref=f4e3210]
+                  - separator [ref=f4e3211]
+              - button "Continue to Full Load (then CDC)" [ref=f4e3213] [cursor=pointer]:
+                - generic [ref=f4e3214]:
+                  - img [ref=f4e3215]: arrow_forward
+                  - generic [ref=f4e3216]: Continue to Full Load (then CDC)
+              - separator [ref=f4e3217]
+              - generic [ref=f4e3218]:
+                - generic [ref=f4e3219]: cloud_upload
+                - generic [ref=f4e3220]: CDC streaming infrastructure
+                - status [ref=f4e3221]: Not deployed
+              - generic [ref=f4e3222]:
+                - generic [ref=f4e3223]: schedule
+                - generic [ref=f4e3224]:
+                  - generic [ref=f4e3225]: Deploy now so it is ready when the Full Load finishes
+                  - generic [ref=f4e3226]: CDC needs Amazon MSK, which takes ~10-15 minutes to provision and bills while it exists. Deploying it here lets it run WHILE your Full Load does, instead of waiting afterwards — the snapshot is unaffected, and no data streams until you explicitly start CDC. You can also skip this and deploy later from the CDC step.
+              - generic [ref=f4e3227]: No cdc-stack is deployed yet. Provide your VPC and the plugin/source details below, then deploy the infrastructure (MSK Serverless, the connector networking, plugins and IAM role). This takes ~10-15 minutes and creates billable AWS resources; connectors are created later by Start CDC.
+              - generic [ref=f4e3229]:
+                - 'button "Expand \"Recommended: use a dedicated least-privilege CDC user\"" [ref=f4e3230] [cursor=pointer]':
+                  - generic [ref=f4e3231]: security
+                  - generic [ref=f4e3233]: "Recommended: use a dedicated least-privilege CDC user"
+                  - generic [ref=f4e3235]: keyboard_arrow_down
+                - separator [ref=f4e3237]
+                - separator [ref=f4e3238]
+              - generic [ref=f4e3240]:
+                - button "Collapse \"Infrastructure inputs\"" [expanded] [ref=f4e3241] [cursor=pointer]:
+                  - generic [ref=f4e3242]: lan
+                  - generic [ref=f4e3244]: Infrastructure inputs
+                  - generic [ref=f4e3246]: keyboard_arrow_down
+                - generic [ref=f4e3249]:
+                  - generic [ref=f4e3250]: Enter your VPC ID. Subnets, the plugin S3 bucket, the DSQL cluster ARN, the source host, and the source-credentials secret are all configured automatically.
+                  - generic [ref=f4e3254]:
+                    - generic: VPC ID *
+                    - textbox "VPC ID *" [ref=f4e3255]:
+                      - /placeholder: vpc-0123456789abcdef0
+                      - text: vpc-bd48a5d4
+                  - generic [ref=f4e3256]: "Recommended: the same VPC as your source database (or one with private connectivity to it) — the connector must reach the source privately."
+                  - generic [ref=f4e3260]:
+                    - generic: Advanced — connector subnet IDs (leave blank to auto-configure)
+                    - textbox "Advanced — connector subnet IDs (leave blank to auto-configure)" [ref=f4e3261]:
+                      - /placeholder: subnet-aaa,subnet-bbb
+                  - generic [ref=f4e3265]:
+                    - generic: mysql-dsql-cdc-
+                    - generic: Advanced — CDC stack name (one per source DB)
+                    - textbox "Advanced — CDC stack name (one per source DB)" [ref=f4e3266]:
+                      - /placeholder: stack
+                      - text: stack
+                  - generic [ref=f4e3267]: Full stack name = the fixed prefix + your suffix (e.g. mysql-dsql-cdc-orders). One stack per source DB.
+              - button "Deploy CDC infrastructure" [ref=f4e3268] [cursor=pointer]:
+                - generic [ref=f4e3269]:
+                  - img [ref=f4e3270]: cloud_upload
+                  - generic [ref=f4e3271]: Deploy CDC infrastructure
+          - button "Expand" [ref=f4e3276] [cursor=pointer]:
+            - generic [ref=f4e3277]:
+              - generic [ref=f4e3278]: radio_button_unchecked
+              - generic [ref=f4e3279]: Full Load
+            - generic [ref=f4e3280]: keyboard_arrow_down
+          - button "Expand" [ref=f4e3286] [cursor=pointer]:
+            - generic [ref=f4e3287]:
+              - generic [ref=f4e3288]: radio_button_unchecked
+              - generic [ref=f4e3289]: CDC
+            - generic [ref=f4e3290]: keyboard_arrow_down
+      - separator [ref=f4e3292]
+      - 'button "Next: Validation" [disabled] [ref=f4e3294]'

@@ -544,12 +544,25 @@ def _render_cdc_source_config_card(
         f"snapshot.mode = {config.snapshot_mode}",
         f"table.include.list = {', '.join(config.table_include_list) or '(all selected)'}",
     ]
-    if config.start_gtid:
-        source_lines.append(f"gtid (start) = {config.start_gtid}")
-    if config.start_binlog_file:
+    # MySQL start point (GTID / binlog file+pos) -- a PostgreSQL source config has
+    # neither attribute, so read them defensively (accessing config.start_gtid on a
+    # PostgresSourceConfig raised AttributeError and crashed the CDC step render).
+    start_gtid = getattr(config, "start_gtid", None)
+    if start_gtid:
+        source_lines.append(f"gtid (start) = {start_gtid}")
+    start_binlog_file = getattr(config, "start_binlog_file", None)
+    if start_binlog_file:
         source_lines.append(
-            f"binlog (start) = {config.start_binlog_file}:{config.start_binlog_pos}"
+            f"binlog (start) = {start_binlog_file}:{getattr(config, 'start_binlog_pos', '')}"
         )
+    # PostgreSQL start point: the logical-replication slot + publication (Debezium
+    # pgoutput resumes from the slot's LSN); shown only when present (PG source).
+    slot_name = getattr(config, "slot_name", None)
+    if slot_name:
+        source_lines.append(f"slot.name = {slot_name}")
+    publication_name = getattr(config, "publication_name", None)
+    if publication_name:
+        source_lines.append(f"publication.name = {publication_name}")
     if config.column_exclude_list:
         source_lines.append(
             f"column.exclude.list = {', '.join(config.column_exclude_list)}"

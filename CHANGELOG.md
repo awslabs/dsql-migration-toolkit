@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.403
+
+### Fixed
+
+- **The Data Migration → CDC step no longer crashes for a PostgreSQL source.** After a
+  PostgreSQL Full Load, rendering the CDC source-config card accessed `config.start_gtid`
+  (and `start_binlog_file`/`start_binlog_pos`) — MySQL GTID/binlog fields that a
+  `PostgresSourceConfig` does not have — raising `AttributeError` and replacing the step
+  with an error card ("An unexpected error occurred while rendering this step"). Those
+  MySQL-only fields are now read defensively (via `getattr`), and the PostgreSQL start
+  point (logical-replication `slot.name` / `publication.name`) is shown instead. MySQL is
+  unchanged.
+
 ## v0.1.402
 
 ### Fixed

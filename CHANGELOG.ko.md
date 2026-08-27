@@ -5,6 +5,18 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.403
+
+### 수정 (Fixed)
+
+- **Data Migration → CDC 단계가 PostgreSQL 소스에서 더 이상 크래시하지 않습니다.** PostgreSQL
+  Full Load 이후 CDC 소스 설정 카드를 렌더링할 때 `config.start_gtid`(및
+  `start_binlog_file`/`start_binlog_pos`)에 접근했는데, 이는 `PostgresSourceConfig`에 없는 MySQL
+  GTID/binlog 필드라 `AttributeError`가 발생해 단계가 오류 카드("An unexpected error occurred while
+  rendering this step")로 대체되었습니다. 이제 이 MySQL 전용 필드는 방어적으로(`getattr`) 읽고,
+  PostgreSQL 시작 지점(논리 복제 `slot.name` / `publication.name`)을 대신 표시합니다. MySQL은 변함이
+  없습니다.
+
 ## v0.1.402
 
 ### 수정 (Fixed)
