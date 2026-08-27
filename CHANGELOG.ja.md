@@ -5,6 +5,21 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.401
+
+### 修正 (Fixed)
+
+- **PostgreSQL Full Load + CDC で初期 Full Load の終了時に外部キーを適用していた問題を修正**
+  (この場合、後続の CDC ストリームが FK 違反を dead-letter 処理 — SQLSTATE 23503)。ロード後の
+  FK 適用は**すべての** CDC マイグレーションで cut over へ延期されるべきですが、延期の判定が
+  `cdc_coexisting`(ロード中に CDC が live である MySQL のシグナルで、ロード中は `True`)だけに
+  依存していました。PostgreSQL は **Full-Load 優先**の gapless ハンドオフ(CDC はロードの*後*に開始)
+  を使うため、初期 PG ロード中は `cdc_coexisting` が `False` となり、外部キーが早すぎるタイミングで
+  適用されていました。延期判定が `cdc_stack_name`(PostgreSQL の Full Load + CDC 実行でのみ設定)
+  でもトリガーされるようになり、PG CDC の外部キーも MySQL と同様に cut-over 適用を待ちます。MySQL の
+  挙動は変わらず、PostgreSQL の **Full-Load のみ**のマイグレーションは引き続きロード終了時に外部キーを
+  適用します。
+
 ## v0.1.400
 
 ### 追加 (Added)

@@ -2528,6 +2528,21 @@ def test_apply_foreign_keys_deferred_for_cdc_coexisting(monkeypatch) -> None:
     assert applied == []
 
 
+def test_apply_foreign_keys_deferred_for_pg_cdc_handoff(monkeypatch) -> None:
+    # PostgreSQL Full Load + CDC is Full-Load-FIRST: cdc_coexisting is False during the
+    # initial load (CDC starts AFTER), but cdc_stack_name marks the CDC handoff. FKs must
+    # still be deferred to cut over -- applying them here would make the later PG CDC
+    # stream dead-letter FK violations (23503). Regression for the PG-specific gap.
+    migrator = _view_migrator(
+        cdc_coexisting=False,
+        cdc_stack_name="mysql-dsql-cdc-stack",
+        table_conversions={"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])},
+    )
+    applied = _patch_fk_apply(monkeypatch, orphans=0)
+    migrator.apply_foreign_keys()
+    assert applied == []
+
+
 def test_apply_foreign_keys_noop_when_preservation_disabled(monkeypatch) -> None:
     # foreign_key_ddls is empty when the user chose to strip FKs in Schema Conversion.
     migrator = _view_migrator(table_conversions={"orders": _fk_conv(foreign_key_ddls=[])})

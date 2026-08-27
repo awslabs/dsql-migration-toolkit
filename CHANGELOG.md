@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.401
+
+### Fixed
+
+- **PostgreSQL Full Load + CDC no longer applies foreign keys at the end of the initial
+  Full Load** (which would make the subsequent CDC stream dead-letter FK violations,
+  SQLSTATE 23503). The post-load FK apply is deferred to cut over for **every** CDC
+  migration, but the deferral was gated only on `cdc_coexisting` — MySQL's
+  CDC-live-during-load signal, which is `True` mid-load. PostgreSQL uses a **Full-Load-first**
+  gapless handoff (CDC starts *after* the load), so `cdc_coexisting` is `False` during the
+  initial PG load and the foreign keys were applied too early. The deferral now also
+  triggers on `cdc_stack_name` (set only for a PostgreSQL Full Load + CDC run), so PG CDC
+  foreign keys wait for the cut-over apply like MySQL's. MySQL behavior is unchanged, and a
+  PostgreSQL **Full-Load-only** migration still applies foreign keys at end of load.
+
 ## v0.1.400
 
 ### Added

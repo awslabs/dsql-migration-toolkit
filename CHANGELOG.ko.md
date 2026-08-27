@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.401
+
+### 수정 (Fixed)
+
+- **PostgreSQL Full Load + CDC에서 초기 Full Load 종료 시점에 외래 키를 적용하던 문제 수정**
+  (이렇게 되면 이후 CDC 스트림이 FK 위반을 dead-letter 처리 — SQLSTATE 23503). 적재 후 FK 적용은
+  모든 CDC 마이그레이션에서 cut over로 지연되어야 하지만, 지연 판정이 `cdc_coexisting`(적재 중 CDC가
+  live인 MySQL 신호로, 적재 도중 `True`)에만 걸려 있었습니다. PostgreSQL은 **Full-Load-우선**
+  gapless 핸드오프(CDC가 적재 *이후* 시작)를 사용하므로 초기 PG 적재 중에는 `cdc_coexisting`이
+  `False`여서 외래 키가 너무 일찍 적용되었습니다. 이제 지연 판정이 `cdc_stack_name`(PostgreSQL
+  Full Load + CDC 실행에만 설정됨)에도 걸리므로, PG CDC 외래 키도 MySQL처럼 cut-over 적용을
+  기다립니다. MySQL 동작은 변함이 없고, PostgreSQL **Full-Load 전용** 마이그레이션은 여전히 적재
+  종료 시 외래 키를 적용합니다.
+
 ## v0.1.400
 
 ### 추가 (Added)

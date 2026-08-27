@@ -3562,11 +3562,23 @@ class BatchedTableMigrator:
         (table / FK / count) instead of an opaque ALTER error. A per-FK apply failure
         is logged and skipped, never failing the completed load.
 
-        No-op for a CDC-coexisting run (foreign keys are applied at cut over, after
-        the stream drains, never while the sink streams out-of-order rows) and when
-        the user disabled foreign-key preservation (``foreign_key_ddls`` empty).
+        No-op for ANY CDC migration -- foreign keys are applied at cut over, after the
+        stream drains, never while the sink streams out-of-order rows (it would
+        dead-letter an FK violation, SQLSTATE 23503). Two distinct CDC signals both
+        force deferral, one per engine's handoff model:
+          * ``cdc_coexisting`` -- MySQL's model, where connectors stream DURING the
+            load (SKIP_EXISTING). CDC is already live, so this is True mid-load.
+          * ``cdc_stack_name`` -- PostgreSQL's Full-Load-FIRST gapless handoff, where
+            CDC starts AFTER this load. Here ``cdc_coexisting`` is False during the
+            initial load, so gating on it alone would wrongly apply FKs at end of the
+            PG load and the later stream would dead-letter (23503). ``cdc_stack_name``
+            is set only for a PostgreSQL Full Load + CDC run (None for a load-only run
+            and always for MySQL), so it is the reliable "this load hands off to CDC"
+            marker.
+        Also a no-op when the user disabled foreign-key preservation
+        (``foreign_key_ddls`` empty).
         """
-        if self._inputs.cdc_coexisting:
+        if self._inputs.cdc_coexisting or self._inputs.cdc_stack_name:
             return
         apply_preserved_foreign_keys(
             self._inputs.table_conversions, self._view_connection_factory()
