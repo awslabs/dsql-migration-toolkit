@@ -468,6 +468,25 @@ def build_apply_objects(result: SchemaConversionResult) -> list[ApplyObject]:
     return objects
 
 
+def _is_foreign_key_ddl(statement: str) -> bool:
+    """Return True when ``statement`` is a preserved-foreign-key ALTER.
+
+    A preserved foreign key is rendered as a post-load ``ALTER TABLE ... ADD
+    CONSTRAINT ... FOREIGN KEY ... NOT VALID`` (NOT inlined in ``CREATE TABLE``),
+    because the concurrent, cross-table bulk load has no parent-before-child
+    ordering. Such a statement is applied by the post-load foreign-key pass, not
+    at Schema Apply, so both apply paths -- the deterministic
+    :func:`build_apply_objects` (which omits ``foreign_key_ddls``) and the edited
+    :func:`override_apply_objects` -- exclude it; it is also the one non-``CREATE``
+    statement the Schema Applier's CREATE-only parser would otherwise reject. The
+    ``(`` split isolates the leading clause before the referencing column list,
+    where both ``ALTER TABLE`` and ``FOREIGN KEY`` always appear (this is the
+    single source of truth reused by :func:`_classify_edited_table_conversion`).
+    """
+    head = statement.strip().upper().split("(", 1)[0]
+    return head.startswith("ALTER TABLE") and "FOREIGN KEY" in head
+
+
 def override_apply_objects(
     objects: Sequence[ApplyObject],
     edited_ddls: dict[str, str],
@@ -476,16 +495,28 @@ def override_apply_objects(
 
     For each object with a user-edited target DDL in ``edited_ddls``, the edited
     script replaces the deterministic statements: it is split into single DDL
-    statements so each is still applied in its own transaction (Property 2). An
-    object with no edit, or whose edit contains no statement, keeps its
-    deterministic DDL (so an accidental blank never silently applies nothing).
-    Order is preserved.
+    statements so each is still applied in its own transaction (Property 2). A
+    preserved foreign-key ``ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY`` in
+    the edited script is EXCLUDED here -- exactly as :func:`build_apply_objects`
+    omits ``foreign_key_ddls`` -- because a foreign key must NOT exist during the
+    concurrent, cross-table bulk load and is (re)created by the post-load
+    foreign-key pass instead. That pass is driven by :func:`applied_table_conversions`,
+    which re-parses the SAME edited script, so removing an FK line from the edit
+    drops it and keeping one applies it post-load; passing the ``ALTER`` on to
+    Schema Apply would only be rejected by the applier's CREATE-only parser. An
+    object with no edit, or whose edit contains no applicable CREATE statement,
+    keeps its deterministic DDL (so an accidental blank -- or an edit reduced to
+    only its FK line -- never silently applies nothing). Order is preserved.
     """
     overridden: list[ApplyObject] = []
     for obj in objects:
         edited = edited_ddls.get(obj.object_name)
         if edited is not None:
-            ddls = tuple(split_sql_statements(edited))
+            ddls = tuple(
+                stmt
+                for stmt in split_sql_statements(edited)
+                if not _is_foreign_key_ddl(stmt)
+            )
             if ddls:
                 overridden.append(ApplyObject(object_name=obj.object_name, ddls=ddls))
                 continue
@@ -701,8 +732,9 @@ def _classify_edited_table_conversion(
             create_ddl = stmt
         elif head.startswith("CREATE") and "INDEX" in head:
             index_ddls.append(stmt)
-        elif head.startswith("ALTER TABLE") and "FOREIGN KEY" in head:
-            # A preserved foreign key, applied as a post-load ADD CONSTRAINT.
+        elif _is_foreign_key_ddl(stmt):
+            # A preserved foreign key, applied as a post-load ADD CONSTRAINT
+            # (excluded from Schema Apply by override_apply_objects -- same test).
             foreign_key_ddls.append(stmt)
     return TableConversion(
         table=deterministic.table,

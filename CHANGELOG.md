@@ -5,6 +5,32 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.406
+
+### Changed
+
+- **Published the `0.1.406` image to all three registries and repointed the
+  `ContainerImageUri` default** in `deploy/cloudformation.yaml` to
+  `public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.406`, so a fresh `git clone`
+  deploy pulls the image that includes the Schema-Apply foreign-key fix below.
+  The deployed Seoul stack (`mysql-dsql-migrator-seoul`, ap-northeast-2) was
+  updated to the `0.1.406` image.
+
+### Fixed
+
+- **Schema Apply no longer rejects an edited table that has a preserved foreign key.**
+  Editing a table's target DDL in Schema Conversion (e.g. changing its primary key)
+  and clicking Apply failed only for the edited tables with
+  `SchemaApplyError: target DDL must be a CREATE TABLE/VIEW/MATERIALIZED VIEW/INDEX
+  statement`. The edited-DDL path (`override_apply_objects`) split the edited script
+  and applied every statement — including the post-load `ALTER TABLE … ADD CONSTRAINT
+  … FOREIGN KEY … NOT VALID` line the preview renders — which the applier's
+  CREATE-only parser rejects. It now excludes that FK `ALTER` from the Schema Apply
+  units, exactly as the non-edited path (`build_apply_objects`) omits
+  `foreign_key_ddls`; the foreign key is still (re)created by the post-load FK pass
+  (driven by `applied_table_conversions`), and removing the FK line from the edit
+  still drops it. A regression introduced with foreign-key preservation (v0.1.400).
+
 ## v0.1.405
 
 ### Changed

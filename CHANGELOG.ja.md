@@ -5,6 +5,30 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.406
+
+### 変更 (Changed)
+
+- **`0.1.406` イメージを 3 つのレジストリすべてに公開し、`deploy/cloudformation.yaml` の
+  `ContainerImageUri` デフォルト**を `public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.406`
+  に更新しました。新規に `git clone` してデプロイすると、以下の Schema Apply 外部キー修正を
+  含むイメージを取得します。デプロイ済みの Seoul スタック(`mysql-dsql-migrator-seoul`、
+  ap-northeast-2)も `0.1.406` イメージに更新しました。
+
+### 修正 (Fixed)
+
+- **外部キーを保持したテーブルを編集しても Schema Apply が拒否しなくなりました。**
+  Schema Conversion でテーブルのターゲット DDL を編集(例: 主キーの変更)して Apply を
+  押すと、編集したテーブルだけが `SchemaApplyError: target DDL must be a CREATE
+  TABLE/VIEW/MATERIALIZED VIEW/INDEX statement` で失敗していました。編集 DDL 経路
+  (`override_apply_objects`)が編集済みスクリプトを分割してすべての文を適用しており、
+  そこにはプレビューが描画するロード後の `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY …
+  NOT VALID` 文が含まれ、アプライヤの CREATE 専用パーサがこれを拒否していました。今後は、
+  非編集経路(`build_apply_objects`)が `foreign_key_ddls` を除外するのと同様に、編集経路も
+  その FK `ALTER` を Schema Apply 単位から除外します。外部キーは引き続きロード後の FK パス
+  (`applied_table_conversions` 由来)で(再)作成され、編集から FK 行を削除すればそのまま
+  削除されます。外部キー保持(v0.1.400)とともに混入したリグレッションです。
+
 ## v0.1.405
 
 ### 変更 (Changed)

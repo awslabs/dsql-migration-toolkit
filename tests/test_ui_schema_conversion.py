@@ -574,6 +574,63 @@ def test_override_apply_objects_blank_edit_keeps_generated_ddl() -> None:
     assert overridden[0].ddls == objects[0].ddls
 
 
+def test_override_apply_objects_defers_edited_preserved_foreign_key() -> None:
+    # Regression: editing a table that has a preserved FK (e.g. changing its PK to
+    # a composite key) leaves the rendered post-load "ALTER TABLE ... ADD CONSTRAINT
+    # ... FOREIGN KEY" line in the edited script. Schema Apply must NOT send that
+    # ALTER to the CREATE-only applier parser (SchemaApplyError); it belongs to the
+    # post-load FK pass, exactly as build_apply_objects omits foreign_key_ddls.
+    from dsql_migrator.core.schema_applier import parse_create_object
+
+    edited = {
+        "orders": (
+            'CREATE TABLE "orders" ("user_id" integer, "id" integer, '
+            '"customer_id" integer, PRIMARY KEY ("user_id", "id"));\n'
+            'CREATE INDEX ASYNC ix_orders_customer ON "orders" ("customer_id");\n'
+            'ALTER TABLE "orders" ADD CONSTRAINT "fk_customer" '
+            'FOREIGN KEY ("customer_id") REFERENCES "customers" ("id") NOT VALID;'
+        )
+    }
+    overridden = override_apply_objects(build_apply_objects(_converted()), edited)
+    orders = next(o for o in overridden if o.object_name == "orders")
+
+    # (1) The edited CREATE TABLE + its index are the apply unit; the FK ALTER is
+    #     excluded, and every remaining statement parses as an applicable CREATE
+    #     (so run_schema_apply/the applier never raises SchemaApplyError on it).
+    assert orders.ddls == (
+        'CREATE TABLE "orders" ("user_id" integer, "id" integer, '
+        '"customer_id" integer, PRIMARY KEY ("user_id", "id"))',
+        'CREATE INDEX ASYNC ix_orders_customer ON "orders" ("customer_id")',
+    )
+    assert not any("ALTER TABLE" in ddl.upper() for ddl in orders.ddls)
+    for ddl in orders.ddls:
+        parse_create_object(ddl)  # must not raise SchemaApplyError
+
+    # (2) The FK is routed to the post-load pass (applied_table_conversions), not
+    #     dropped: the edited ADD CONSTRAINT is honored there.
+    applied = applied_table_conversions(_converted(), edited)
+    assert applied["orders"].foreign_key_ddls
+    assert 'ADD CONSTRAINT "fk_customer"' in applied["orders"].foreign_key_ddls[0]
+
+    # (3) Removing the FK line from the edited script drops it (never applied) --
+    #     Schema Apply is still FK-free and the post-load pass adds nothing.
+    edited_no_fk = {
+        "orders": (
+            'CREATE TABLE "orders" ("user_id" integer, "id" integer, '
+            '"customer_id" integer, PRIMARY KEY ("user_id", "id"));\n'
+            'CREATE INDEX ASYNC ix_orders_customer ON "orders" ("customer_id");'
+        )
+    }
+    overridden_no_fk = override_apply_objects(
+        build_apply_objects(_converted()), edited_no_fk
+    )
+    orders_no_fk = next(o for o in overridden_no_fk if o.object_name == "orders")
+    assert not any("ALTER TABLE" in ddl.upper() for ddl in orders_no_fk.ddls)
+    assert applied_table_conversions(_converted(), edited_no_fk)[
+        "orders"
+    ].foreign_key_ddls == []
+
+
 def test_selected_object_names_strips_leaf_prefixes_and_ignores_groups() -> None:
     node_ids = [
         "schema:app",  # ignored (group)
