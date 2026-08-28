@@ -5,6 +5,15 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.405
+
+### 変更 (Changed)
+
+- **コンテナイメージを `0.1.404` として全レジストリに再公開し、`deploy/cloudformation.yaml` の
+  `ContainerImageUri` デフォルト**を `public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.404` に
+  更新しました。新規デプロイは PostgreSQL Full Load + CDC + 外部キー修正(v0.1.401–404)を含む
+  イメージを取得します。ECR Public および us-east-1 / ap-northeast-2 のプライベート ECR に公開。
+
 ## v0.1.404
 
 ### 修正 (Fixed)

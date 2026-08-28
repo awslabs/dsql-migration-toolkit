@@ -5,6 +5,16 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.405
+
+### Changed
+
+- **Republished the container image at `0.1.404` to all registries and repointed the
+  `ContainerImageUri` default** in `deploy/cloudformation.yaml` to
+  `public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.404`, so a fresh deploy pulls the
+  image that includes the PostgreSQL Full Load + CDC + foreign-key fixes (v0.1.401–404).
+  Image published to ECR Public and the us-east-1 / ap-northeast-2 private ECRs.
+
 ## v0.1.404
 
 ### Fixed

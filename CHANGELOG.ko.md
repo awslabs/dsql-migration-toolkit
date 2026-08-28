@@ -5,6 +5,15 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.405
+
+### 변경 (Changed)
+
+- **컨테이너 이미지를 `0.1.404`로 전 레지스트리에 재게시하고 `deploy/cloudformation.yaml`의
+  `ContainerImageUri` 기본값**을 `public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.404`로
+  갱신했습니다. 새로 배포하면 PostgreSQL Full Load + CDC + 외래 키 수정(v0.1.401–404)이 포함된
+  이미지를 받습니다. ECR Public 및 us-east-1 / ap-northeast-2 프라이빗 ECR에 게시.
+
 ## v0.1.404
 
 ### 수정 (Fixed)
