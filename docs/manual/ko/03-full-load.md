@@ -4,7 +4,8 @@ _언어: [English](../en/03-full-load.md) | **한국어** | [日本語](../ja/03
 
 > **이전:** [2. Evaluation과 Schema Conversion](02-evaluation-and-schema-conversion.md)
 
-**Full Load**는 기존 행을 소스 MySQL에서 Aurora DSQL로 옮기는 도구 자체의 벌크 복사입니다. Debezium
+**Full Load**는 기존 행을 소스 데이터베이스 — RDS / Aurora **MySQL** 또는 RDS / Aurora **PostgreSQL** —
+에서 Aurora DSQL로 옮기는 도구 자체의 벌크 복사입니다. Debezium
 스냅샷이 **아니라** 데이터를 스트리밍하며 DSQL 제약을 지키도록 만든 전용 로더입니다. 테이블을 선택한 뒤
 **Data Migration** 단계에서 실행합니다.
 
@@ -17,7 +18,7 @@ _언어: [English](../en/03-full-load.md) | **한국어** | [日本語](../ja/03
 ## 3.1 큰 그림
 
 ```
-Source MySQL                         Aurora DSQL
+Source (MySQL / PostgreSQL)          Aurora DSQL
   │  keyset 페이지 (PK > last, LIMIT)    ▲  멱등 배치 INSERT
   │  스트리밍 server-side cursor          │  (≤3000행, ≤8 MiB, OCC 재시도)
   └──────────►  타입 변환  ──────────────┘
@@ -30,7 +31,11 @@ Source MySQL                         Aurora DSQL
 4. 한정된 배치(재적용해도 중복 없음)로 DSQL에 **동시 적재**.
 5. 이후 보조 **인덱스** 빌드.
 
-소스는 일관된 스냅샷 안에서 **읽기 전용**으로 읽히며, 로더는 절대 수정하지 않습니다.
+소스는 일관된 스냅샷 안에서 **읽기 전용**으로 읽히며, 로더는 절대 수정하지 않습니다. MySQL 소스는 —
+그리고 PostgreSQL의 Full Load 전용 마이그레이션도 — 절대 쓰이지 않습니다. 유일한 예외는 **PostgreSQL
+CDC**입니다: 워터마크 시점(§3.5)에 도구가 논리 복제 슬롯과, 정확히 마이그레이션 대상 테이블로만 한정된
+publication을 생성하고 teardown 시 삭제합니다(autocommit, 소규모 allowlist로 제한, 감사됨). 이것이 도구가
+어떤 소스에든 수행하는 유일한 쓰기입니다.
 
 ---
 
@@ -40,14 +45,14 @@ Source MySQL                         Aurora DSQL
 
 ```sql
 SELECT <cols> FROM <table>
-WHERE pk > :last           -- 복합 PK: 명시적 사전식 OR 확장(MySQL 5.7+ PK 인덱스 친화)
+WHERE pk > :last           -- 복합 PK: 명시적 사전식 OR 확장(MySQL 5.7+ 및 PostgreSQL에서 PK 인덱스 친화)
 ORDER BY pk
 LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 5000
 ```
 
 각 페이지의 마지막 행 PK로 `:last`를 전진시키며, 짧은 페이지가 끝을 알릴 때까지 반복합니다. 쿼리는
-`START TRANSACTION WITH CONSISTENT SNAPSHOT`(InnoDB repeatable read) 안에서 **server-side/스트리밍
-커서**로 실행되므로:
+단일 repeatable-read 스냅샷 트랜잭션(MySQL: InnoDB의 `START TRANSACTION WITH CONSISTENT SNAPSHOT`;
+PostgreSQL: `REPEATABLE READ` 트랜잭션) 안에서 **server-side/스트리밍 커서**로 실행되므로:
 
 - 테이블 전체가 **RAM에 올라오지 않음** — 메모리가 한 페이지로 한정;
 - 실행 중인 소스가 계속 바뀌어도 읽기는 **단일 일관 스냅샷**으로 유지됨.
@@ -64,12 +69,17 @@ LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 5000
 ## 3.3 행을 읽어 들이면서 타입 변환
 
 행을 한 건씩 읽어 들이는 동안 각 값이 DSQL 저장 형태로 변환됩니다. 이는 Schema Conversion 매핑을
-그대로 따르므로 컬럼 타입과 실제 값이 서로 어긋나지 않습니다. MySQL 사용자가 알아둘 예:
+그대로 따르므로 컬럼 타입과 실제 값이 서로 어긋나지 않습니다. **MySQL 소스**가 만들어 내는 예:
 
 - `TINYINT(1)` → DSQL **boolean** (`0/1` → `false/true`).
 - `BIT(n)` → 정수(소스 바이트에서 디코딩).
 - `DATETIME` → UTC로 정규화된 `timestamp`; `TIMESTAMP` → `timestamptz`.
 - `BLOB`/`BINARY`/`VARBINARY` 계열 → `bytea`.
+
+**PostgreSQL 소스**에서는 Full Load 중 MySQL 방식의 값 변환이 **없습니다**: 양쪽 끝이 모두
+PostgreSQL-16 wire(양쪽 모두 psycopg)이므로 DSQL이 지원하는 값은 그대로 통과합니다. PostgreSQL 타입
+처리 — 미지원 타입은 remodel 대상으로 플래그, `numeric` 정밀도 클램핑, `DEFAULT`/serial/identity 미방출 —
+는 즉석 값 변환이 아니라 **Schema Conversion**에서 일어납니다.
 
 전체 매핑(및 "값당 1 MiB 한도" 같은 DSQL 제약 처리)은
 [2장 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-타입과-제약-처리-참조)과 Schema Conversion
@@ -108,20 +118,26 @@ LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 5000
 
 ## 3.5 워터마크 — CDC로의 다리
 
-적재 전 도구는 **워터마크**를 캡처합니다: 같은 일관 스냅샷 트랜잭션 안에서 기록되는 소스 바이너리 로그의
-일관된 지점. 내용:
+적재 전 도구는 **워터마크**를 캡처합니다: 같은 일관 스냅샷 트랜잭션 안에서 기록되는 소스 변경
+스트림의 일관된 지점입니다. 모든 워터마크는 **UTC 스냅샷 타임스탬프**와 테이블별 **근사** 행 수(스캔
+없는 `information_schema` 추정 — 단순 카운트를 위해 소스를 풀스캔하지 않음)를 담습니다. 엔진별 좌표는
+다릅니다:
 
-- **binlog 파일 + 위치**,
-- **GTID 셋**(`@@GLOBAL.gtid_executed`)과 `server_uuid`,
-- **UTC 스냅샷 타임스탬프**,
-- 테이블별 **근사** 행 수(스캔 없는 `information_schema` 추정 — 단순 카운트를 위해 소스를 풀스캔하지
-  않음).
+- **MySQL** — **binlog 파일 + 위치**, 그리고 **GTID 셋**(`@@GLOBAL.gtid_executed`)과 `server_uuid`.
+  이들은 `SHOW BINARY LOG STATUS`(MySQL 8.2+/8.4, `SHOW MASTER STATUS`가 제거된 버전)로 읽고, 그
+  이하(≤ 8.0.x)에서는 `SHOW MASTER STATUS`로 폴백합니다.
+- **PostgreSQL** — binlog 좌표가 아니라 **WAL LSN**(`Watermark.wal_lsn`). 일관성 지점에서 도구가
+  **publication**(정확히 마이그레이션 대상 테이블에 대한 `FOR TABLE`, 절대 `FOR ALL TABLES` 아님)과
+  `pgoutput` **논리 복제 슬롯**을 생성하고, 슬롯이 반환한 일관 LSN을 슬롯·publication 이름과 함께
+  기록합니다. 이 LSN이 WAL을 고정하여 무손실 `snapshot.mode=never` CDC 핸드오프를 가능하게 합니다.
+  PostgreSQL에는 GTID / `server_uuid` 개념이 없고 `SHOW BINARY LOG STATUS`도 없습니다 — LSN은 생성된
+  슬롯에서 옵니다.
 
 워터마크는 이후 **무손실 CDC 핸드오프**를 가능하게 합니다: CDC가 스냅샷이 끝난 바로 그 지점부터 변경을
-스트리밍 — 갭도 중복도 없음([4장](04-cdc-and-dsql-constraints.md) 참조). 좌표는 `SHOW BINARY LOG STATUS`
-(MySQL 8.2+/8.4, `SHOW MASTER STATUS`가 제거된 버전)로 읽고, 그 이하(≤ 8.0.x)에서는 `SHOW MASTER STATUS`로
-폴백합니다. 바이너리 로깅이 꺼져 있거나 권한이 제한되면 binlog/GTID 필드가 비게 되며, 그 경우 CDC
-핸드오프만 못 받을 뿐 Full Load는 정상 동작합니다.
+스트리밍 — 갭도 중복도 없음([4장](04-cdc-and-dsql-constraints.md) 참조). CDC 사전 조건이 충족되지 않으면 —
+MySQL에서는 바이너리 로깅이 꺼져 있거나 권한이 제한된 경우, PostgreSQL에서는 `wal_level`이 `logical`이
+아니거나 슬롯/publication을 만들 수 없는 경우(복제 권한 누락 또는 standby 엔드포인트) — 좌표가 우아하게
+비워지고 그 경우 CDC 핸드오프만 못 받을 뿐 Full Load는 정상 동작합니다.
 
 > 워터마크의 행 수는 **의도적으로 근사**입니다(소스 부담 최소화). 정확한 `COUNT(*)`와 체크섬은
 > **Validation**([5장](05-validation.md))의 역할이지 Full Load가 아닙니다.
@@ -144,8 +160,10 @@ LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 5000
 값이 **무손실로 변환될 수 없을 때** — 대표 사례는 DSQL `boolean`에 매핑된 `TINYINT(1)` 컬럼이 `{0,1}`
 밖의 값(예: `2`)을 가질 때 — exporter가 `ValueConversionError`를 던집니다. 여기엔 **SQLSTATE가
 없으므로**(DSQL에 묻기도 전, 읽기/변환 중 발생) 행 단위 quarantine이 **아니라** 그 테이블 적재를
-**시끄럽게** 멈춥니다. 의도된 동작입니다 — `2`를 `true`로 뭉개 데이터를 조용히 손상시키지 않습니다.
-소스 데이터를 고치거나(또는 컬럼 제외) 다시 실행하세요.
+**시끄럽게** 멈춥니다. 의도된 동작입니다 — `2`를 `true`로 뭉개 데이터를 조용히 손상시키지 않습니다. 이
+table-fatal `ValueConversionError`는 export 중 값이 변환되는 **MySQL 소스**에서만 발생합니다. **PostgreSQL
+소스**는 타입 변환 없이 그대로 통과하므로 이 특정 사례는 발생하지 않습니다(행 단위 SQLSTATE quarantine은
+두 엔진 모두에 여전히 적용). 소스 데이터를 고치거나(또는 컬럼 제외) 다시 실행하세요.
 
 > **"시끄러운" 실패가 "조용한" 실패보다 나은 이유:** DSQL `boolean`은 `2`를 표현할 수 없습니다.
 > 도구는 조용히 틀린 값 대신 눈에 보이고 고칠 수 있는 실패를 선택합니다.
@@ -174,8 +192,8 @@ LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 5000
 > **명령줄에서 Full Load 실행 (선택).** 동일한 벌크 로더를 CLI 스크립트로도 쓸 수 있습니다 —
 > `scripts/run_full_load.py`(먼저 계획 출력, 그다음 `--yes`; 선택적으로 `--clean`,
 > CDC 워터마크 캡처용 `--watermark-out`) — 웹 UI 없이 자동화나 대용량 실행에 유용합니다. 자세한 내용은
-> [`scripts/README.md`](../../../scripts/README.md) 참고. 소스는 읽기 전용, 로드는 UI와 똑같이
-> 멱등입니다.
+> [`scripts/README.md`](../../../scripts/README.md) 참고. 소스는 읽기 전용(유일한 예외는 §3.1에서 설명한
+> PostgreSQL-CDC 슬롯과 publication)이며, 로드는 UI와 똑같이 멱등입니다.
 
 ---
 

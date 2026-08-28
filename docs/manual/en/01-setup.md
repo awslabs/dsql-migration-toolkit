@@ -4,8 +4,9 @@ _Language: **English** | [한국어](../ko/01-setup.md) | [日本語](../ja/01-s
 
 > **Prev:** [0. Before you begin](00-before-you-begin.md)
 
-This chapter gets you from "I have an Aurora MySQL database" to "the tool is
-open in my browser and connected to both my source and my Aurora DSQL target."
+This chapter gets you from "I have an Amazon RDS or Aurora database (MySQL or
+PostgreSQL)" to "the tool is open in my browser and connected to both my source
+and my Aurora DSQL target."
 
 > **Already deployed on AWS?** If you followed [`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.md)
 > and the UI is already open at your `AppUrl`, skip ahead to [§1.5 Connect](#15-connect-to-your-source-and-target).
@@ -31,14 +32,25 @@ You connect to the **same** source and target in every case; only where the tool
 
 **Your databases**
 
-- A source **Amazon RDS or Aurora MySQL** database you can reach over the
-  network, with a user that can read the schema and data (read-only is enough —
-  the tool never writes to the source).
-  - **Supported source engines & versions** (validated end-to-end — Full Load +
-    CDC + checksum validation): **RDS for MySQL** 5.7 / 8.0 / 8.4, and **Aurora
-    MySQL** 5.7 (v2) / 8.0 (v3) / 8.4. MySQL 5.7 is past end of standard support
-    (RDS/Aurora Extended Support may apply), but the tool fully supports it as a
-    migration source.
+- A source database — **Amazon RDS or Aurora MySQL**, or **Amazon RDS or Aurora
+  PostgreSQL** — you can reach over the network, with a user that can read the
+  schema and data. Read-only is enough for Evaluation, Schema Conversion, Full
+  Load and Validation; a MySQL source (and a PostgreSQL Full-Load-only migration)
+  is never written. The single exception is **PostgreSQL CDC**: at the Full Load
+  consistency point the tool creates — and at teardown drops — a logical
+  replication slot and a publication scoped to exactly the migrated tables
+  (AUTOCOMMIT, restricted to a small allowlist, audited). These are the only
+  writes the tool ever makes to any source.
+  - **Supported source engines & versions** — both source paths (Schema
+    Conversion + Full Load + CDC + cut over) are validated end-to-end on live
+    infrastructure:
+    - **RDS for MySQL** 5.7 / 8.0 / 8.4, and **Aurora MySQL** 5.7 (v2) / 8.0 (v3)
+      / 8.4. MySQL 5.7 is past end of standard support (RDS/Aurora Extended
+      Support may apply), but the tool fully supports it as a migration source.
+    - **RDS for PostgreSQL / Aurora PostgreSQL**, PG **13–16** (tested
+      end-to-end). There is no hard version gate in the tool — it reads the
+      server version for display only and never rejects a major version; PG
+      13–16 is the validated range.
 - A target **Amazon Aurora DSQL** cluster in the **same AWS region** as you'll
   run the tool. (DSQL uses IAM-token auth — there is no password to manage.)
 
@@ -55,27 +67,33 @@ You connect to the **same** source and target in every case; only where the tool
 **For deploying on AWS** — see the full [`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.md);
 the short version is in §1.3.
 
-> **Aurora MySQL users, note:** there is no DSQL "endpoint + password" to copy
+> **Note on the DSQL target:** there is no DSQL "endpoint + password" to copy
 > into a config file. You give the tool the DSQL **cluster endpoint** and your
 > AWS identity; the tool mints a short-lived IAM token per connection. Make sure
 > the identity you run under is allowed to connect to that DSQL cluster.
 
 **For CDC (the optional streaming pipeline)** — only if you'll use CDC for a
 near-zero-downtime cut-over. A **Full-Load-only** migration needs none of this;
-these are the source-side requirements that let Debezium read the binary log. The
-tool's prerequisite gate checks each one before starting CDC and tells you exactly
+these are the source-side requirements that let CDC read the source's change
+stream — the **MySQL binary log**, or, for a PostgreSQL source, the
+**logical-decoding WAL** via a replication slot + publication. The tool's
+prerequisite gate checks each one before starting CDC and tells you exactly
 what's missing, but setting them up is a source-side task you do once.
 
-> **Managed RDS/Aurora is configured differently from community MySQL.** On a
-> self-managed (community) MySQL server you'd edit `my.cnf` and run `SET GLOBAL`.
-> On **Amazon RDS / Aurora MySQL you can't do either** — server variables are set
-> through a **parameter group**, and operational settings like binlog retention
-> are changed with **RDS stored procedures** (`mysql.rds_*`). The steps below use
-> the managed (RDS/Aurora) method, which is what this tool targets.
+> **Managed RDS/Aurora is configured differently from a self-managed (community)
+> server.** On a self-managed MySQL or PostgreSQL server you'd edit `my.cnf` /
+> `postgresql.conf` and run `SET GLOBAL`. On **Amazon RDS / Aurora you can't do
+> either** — server variables are set through a **parameter group** (MySQL:
+> `binlog_format`, etc.; **PostgreSQL: `rds.logical_replication`**), and MySQL
+> operational settings like binlog retention are changed with **RDS stored
+> procedures** (`mysql.rds_*`). PostgreSQL's enabling parameter is **static, so it
+> requires a reboot**. The steps below use the managed (RDS/Aurora) method, which
+> is what this tool targets.
 
-- **Binary logging must be on, in ROW format with a full row image** — `log_bin=ON`,
-  `binlog_format=ROW`, `binlog_row_image=FULL`. This is a **hard requirement** for
-  CDC (the gate fails CDC if it isn't met). How to set it on managed MySQL:
+- **MySQL source — binary logging must be on, in ROW format with a full row image**
+  — `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`. This is a **hard
+  requirement** for CDC (the gate fails CDC if it isn't met). How to set it on
+  managed MySQL:
   - **RDS for MySQL:** you **can't turn `log_bin` on directly** and you **can't edit
     `my.cnf`**. Instead, enable **automated backups** (set the backup retention
     period > 0) — that turns binary logging on — then set `binlog_format=ROW` and
@@ -88,18 +106,30 @@ what's missing, but setting them up is a source-side task you do once.
   - **Community / self-managed MySQL (for contrast):** there you'd set
     `log_bin`/`binlog_format`/`binlog_row_image` in `my.cnf` (or `SET GLOBAL` at
     runtime) and restart — **none of which applies to RDS/Aurora.**
-- **A source user with replication privileges** — `SELECT`, `REPLICATION CLIENT`,
-  and `REPLICATION SLAVE` (plus `RELOAD` and `LOCK TABLES`, used for the initial
-  snapshot bookkeeping). Use a dedicated least-privilege CDC user, not an admin
-  account.
-- **Increase binlog retention so the logs aren't purged before CDC catches up.**
-  RDS/Aurora purge binary logs aggressively by default — **Aurora MySQL keeps them
-  only 24 hours**; on RDS for MySQL they're governed by backup retention. CDC
-  resumes from the **watermark** captured during Full Load, so the binlog at that
-  position **must still exist when CDC starts** — and deploying the CDC stack (MSK +
-  MSK Connect) takes **~15–20 minutes** before streaming even begins. Set a generous
-  window with the RDS stored procedure (hours; works on both RDS for MySQL and
-  Aurora MySQL):
+- **PostgreSQL source — logical decoding must be enabled** — **`wal_level=logical`**
+  (a **hard requirement**; the gate fails CDC if it isn't met). On **RDS for
+  PostgreSQL / Aurora PostgreSQL** set the static parameter
+  **`rds.logical_replication=1`** in a custom DB (cluster) parameter group, then
+  **reboot** (Aurora: reboot the writer). On self-managed PostgreSQL set
+  `wal_level=logical` in `postgresql.conf` and restart. (No
+  `binlog_format`/`binlog_row_image` analog exists for PostgreSQL.)
+- **A source user with replication privileges.** **MySQL:** `SELECT`,
+  `REPLICATION CLIENT`, and `REPLICATION SLAVE` (plus `RELOAD` and `LOCK TABLES`,
+  used for the initial snapshot bookkeeping). **PostgreSQL:** the CDC user must be
+  able to create and read a logical replication slot — it passes if it is a
+  **superuser**, has the **REPLICATION role attribute** (`pg_roles.rolreplication`),
+  or is a member of **`rds_replication`** (on RDS/Aurora, where the REPLICATION
+  attribute can't be granted directly); it also needs **SELECT** on the migrated
+  tables for the snapshot. (This is NOT the community `REPLICATION` object
+  privilege.) Use a dedicated least-privilege CDC user, not an admin account.
+- **MySQL source — increase binlog retention so the logs aren't purged before CDC
+  catches up.** RDS/Aurora purge binary logs aggressively by default — **Aurora
+  MySQL keeps them only 24 hours**; on RDS for MySQL they're governed by backup
+  retention. CDC resumes from the **watermark** captured during Full Load, so the
+  binlog at that position **must still exist when CDC starts** — and deploying the
+  CDC stack (MSK + MSK Connect) takes **~15–20 minutes** before streaming even
+  begins. Set a generous window with the RDS stored procedure (hours; works on both
+  RDS for MySQL and Aurora MySQL):
 
   ```sql
   CALL mysql.rds_set_configuration('binlog retention hours', 168);  -- e.g. 7 days
@@ -111,10 +141,28 @@ what's missing, but setting them up is a source-side task you do once.
   now **warns** (non-blocking) if retention looks too short (under 24h) or is unset,
   so you catch it before the binlog is purged — but it never blocks, since only you
   know how long your Full Load will run.
-- **GTID is recommended, but not required.** With `gtid_mode=ON`, CDC resume
-  survives a source failover or replica promotion; without it, the tool falls back
-  to the binlog `file:position` watermark — which works, but is less robust across
-  failover. The gate reports a missing GTID as informational, never as a blocker.
+- **PostgreSQL source — no binlog-retention setting to change.** Instead the
+  **logical replication slot** the tool creates at the Full Load consistency point
+  **pins the required WAL automatically** from that LSN, so there is nothing to set;
+  the ~15–20 min CDC-stack provisioning is fine because the slot holds the start
+  position. The trade-off is the opposite risk: an **inactive/unconsumed slot keeps
+  pinning WAL and can fill the source's disk**, so monitor WAL/slot health — the
+  tool surfaces `wal_status`, and `wal_status='lost'` means the slot was invalidated
+  → gapless resume is broken → re-run Full Load.
+- **MySQL source — GTID is recommended, but not required.** With `gtid_mode=ON`, CDC
+  resume survives a source failover or replica promotion; without it, the tool falls
+  back to the binlog `file:position` watermark — which works, but is less robust
+  across failover. The gate reports a missing GTID as informational, never as a
+  blocker. (PostgreSQL has no GTID / `file:position` concept.)
+- **PostgreSQL source — CDC must run against the cluster writer.** The source must
+  be the **writer, not a standby** (`pg_is_in_recovery()` must be false) — a standby
+  can't host a replication slot, so point CDC at the writer endpoint.
+- **PostgreSQL source — every replicated table needs a usable REPLICA IDENTITY.** A
+  primary key gives the default; otherwise set `ALTER TABLE … REPLICA IDENTITY FULL`
+  (FULL or an index identity also work). A table left at `REPLICA IDENTITY NOTHING`
+  makes UPDATE/DELETE error on the publisher, so it is refused. Replication-slot /
+  `max_wal_senders` (walsender) **headroom** is checked as a non-blocking **WARN** (a
+  full walsender pool blocks a new slot even when slot entries are free).
 
 ---
 
@@ -235,7 +283,7 @@ Open the tool and start at the **Connect** step. You provide:
 
 | Field | What to enter |
 |---|---|
-| **Source** | Your RDS/Aurora MySQL host, port (3306), user, and password — **or** a Secrets Manager secret ARN/name holding them. |
+| **Source** | Pick your **source engine** (MySQL or PostgreSQL), then enter host, port, user, and password — **or** a Secrets Manager secret ARN/name holding them. The default port follows the engine (**3306** for MySQL, **5432** for PostgreSQL); for PostgreSQL you also give the single **database** to connect to. Auth for both engines is password or Secrets Manager (IAM-token auth is target-DSQL only). |
 | **Target** | Your Aurora DSQL **cluster endpoint**, region, database (fixed to `postgres`, shown read-only), and username (`admin` by default). **No password** — the tool generates an IAM token. |
 
 Then click to **test** each connection. The tool:

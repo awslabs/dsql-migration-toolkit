@@ -4,8 +4,9 @@ _Language: **English** | [한국어](../ko/03-full-load.md) | [日本語](../ja/
 
 > **Prev:** [2. Evaluation and Schema Conversion](02-evaluation-and-schema-conversion.md)
 
-**Full Load** is the tool's own bulk copy of your existing rows from source MySQL
-into Aurora DSQL. It is **not** a Debezium snapshot — it is a purpose-built loader
+**Full Load** is the tool's own bulk copy of your existing rows from the source
+database — RDS / Aurora **MySQL** or RDS / Aurora **PostgreSQL** — into Aurora
+DSQL. It is **not** a Debezium snapshot — it is a purpose-built loader
 that streams data and respects DSQL's constraints. It runs from the **Data
 Migration** step after you've selected tables.
 
@@ -18,7 +19,7 @@ Migration** step after you've selected tables.
 ## 3.1 The big picture
 
 ```
-Source MySQL                         Aurora DSQL
+Source (MySQL / PostgreSQL)          Aurora DSQL
   │  keyset page (PK > last, LIMIT)      ▲  idempotent batched INSERT
   │  streaming server-side cursor        │  (≤3000 rows, ≤8 MiB, OCC retry)
   └──────────►  convert types  ──────────┘
@@ -32,7 +33,11 @@ Source MySQL                         Aurora DSQL
 5. Build secondary **indexes** afterward.
 
 The source is read **read-only** inside a consistent snapshot; the loader never
-modifies it.
+modifies it. A MySQL source — and a PostgreSQL Full-Load-only migration — is never
+written. The single exception is **PostgreSQL CDC**: at the watermark point (§3.5)
+the tool creates, and at teardown drops, a logical replication slot and a
+publication scoped to exactly the migrated tables (autocommit, restricted to a small
+allowlist, audited). These are the only writes the tool ever makes to any source.
 
 ---
 
@@ -42,14 +47,15 @@ The loader reads with **keyset pagination on the primary key**, not `OFFSET`:
 
 ```sql
 SELECT <cols> FROM <table>
-WHERE pk > :last           -- composite PKs: explicit lexicographic OR-expansion (PK-index-friendly on MySQL 5.7+)
+WHERE pk > :last           -- composite PKs: explicit lexicographic OR-expansion (PK-index-friendly on MySQL 5.7+ and on PostgreSQL)
 ORDER BY pk
 LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 5000
 ```
 
 It advances `:last` to the last row of each page until a short page signals the
-end. The query runs over a **server-side / streaming cursor** inside a
-`START TRANSACTION WITH CONSISTENT SNAPSHOT` (InnoDB repeatable read), so:
+end. The query runs over a **server-side / streaming cursor** inside a single
+repeatable-read snapshot transaction (MySQL: `START TRANSACTION WITH CONSISTENT
+SNAPSHOT` on InnoDB; PostgreSQL: a `REPEATABLE READ` transaction), so:
 
 - a whole table is **never loaded into RAM** — memory stays bounded by one page;
 - the read is a **single consistent snapshot** even as the live source changes.
@@ -71,12 +77,19 @@ hot partition on a monotonic key (see [Chapter 7 §7.1](07-performance-and-tunin
 
 As rows stream, each value is converted to the form DSQL stores. This mirrors the
 Schema Conversion mapping (so the column types and the values agree). A few
-examples MySQL users should know:
+examples a **MySQL source** produces:
 
 - `TINYINT(1)` → DSQL **boolean** (`0/1` → `false/true`).
 - `BIT(n)` → integer (decoded from the source bytes).
 - `DATETIME` → `timestamp` normalized to UTC; `TIMESTAMP` → `timestamptz`.
 - `BLOB`/`BINARY`/`VARBINARY` family → `bytea`.
+
+For a **PostgreSQL source** there is **no** MySQL-style value translation during
+Full Load: both ends are PostgreSQL-16 wire (psycopg on both sides), so
+DSQL-supported values pass through unchanged. PostgreSQL type handling — unsupported
+types flagged for remodel, `numeric` precision clamping, no `DEFAULT` / serial /
+identity emitted — happens in **Schema Conversion**, not as an on-the-fly value
+transform.
 
 The full mapping (and how DSQL constraints like the 1 MiB per-value limit are handled)
 lives in [Chapter 2 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-type-and-constraint-handling-reference)
@@ -122,22 +135,31 @@ allows one DDL per transaction and builds indexes asynchronously).
 ## 3.5 The watermark — the bridge to CDC
 
 Before loading, the tool captures a **watermark**: a consistent point in the
-source's binary log, recorded inside the same consistent-snapshot transaction.
-It contains:
+source's change stream, recorded inside the same consistent-snapshot transaction.
+Every watermark carries a **UTC snapshot timestamp** and **approximate** per-table
+row counts (scan-free `information_schema` estimates, so the source isn't
+full-scanned just to count). The engine-specific coordinate differs:
 
-- **binlog file + position**,
-- the **GTID set** (`@@GLOBAL.gtid_executed`) and `server_uuid`,
-- a **UTC snapshot timestamp**, and
-- **approximate** per-table row counts (scan-free `information_schema` estimates,
-  so the source isn't full-scanned just to count).
+- **MySQL** — the **binlog file + position**, plus the **GTID set**
+  (`@@GLOBAL.gtid_executed`) and `server_uuid`. These are read via
+  `SHOW BINARY LOG STATUS` (MySQL 8.2+/8.4, where `SHOW MASTER STATUS` was removed)
+  with a fallback to `SHOW MASTER STATUS` (≤ 8.0.x).
+- **PostgreSQL** — a **WAL LSN** (`Watermark.wal_lsn`), not a binlog coordinate.
+  At the consistency point the tool creates a **publication** (`FOR TABLE` the exact
+  migrated tables, never `FOR ALL TABLES`) and a `pgoutput` **logical replication
+  slot**, and records the slot's returned consistent LSN together with the slot and
+  publication names. That LSN pins WAL and is what makes the gapless
+  `snapshot.mode=never` CDC handoff possible. There is no GTID / `server_uuid`
+  concept on PostgreSQL, and no `SHOW BINARY LOG STATUS` — the LSN comes from the
+  created slot.
 
-The watermark is what makes a later **gapless handoff to CDC** possible: CDC
-starts streaming changes from exactly the point the snapshot ended — no gap, no
-overlap (see [Chapter 4](04-cdc-and-dsql-constraints.md)). The coordinates are read
-via `SHOW BINARY LOG STATUS` (MySQL 8.2+/8.4, where `SHOW MASTER STATUS` was
-removed) with a fallback to `SHOW MASTER STATUS` (≤ 8.0.x). If binary logging is
-disabled or the privilege is restricted, the binlog/GTID fields degrade gracefully
-to empty, and you simply don't get the CDC handoff (Full Load still works).
+The watermark is what makes a later **gapless handoff to CDC** possible: CDC starts
+streaming changes from exactly the point the snapshot ended — no gap, no overlap
+(see [Chapter 4](04-cdc-and-dsql-constraints.md)). If the CDC prerequisites aren't
+met — on MySQL, binary logging disabled or the privilege restricted; on PostgreSQL,
+`wal_level` not `logical`, or the slot / publication can't be created (missing
+replication privilege, or a standby endpoint) — the coordinate degrades gracefully
+and you simply don't get the CDC handoff (Full Load still works).
 
 > The watermark's row counts are **approximate on purpose** (to spare the
 > source). Exact `COUNT(*)` and checksums are the job of **Validation**
@@ -167,8 +189,11 @@ value outside `{0, 1}` (e.g. `2`) — the exporter raises a `ValueConversionErro
 This has **no SQLSTATE** (it happens while reading/converting, before DSQL is
 even asked), so it is **not** a per-row quarantine: it stops that table's load
 **loudly**. This is intentional — the tool refuses to flatten `2` to `true` and
-silently corrupt your data. Fix the source data (or exclude the column) and
-re-run.
+silently corrupt your data. This table-fatal `ValueConversionError` arises only for
+a **MySQL source**, where values are translated during export; a **PostgreSQL
+source** streams pass-through with no type translation, so this specific case does
+not occur (per-row SQLSTATE quarantine still applies to both engines). Fix the
+source data (or exclude the column) and re-run.
 
 > **Why "loud" beats "silent":** DSQL's `boolean` can't represent `2`. The tool
 > chooses a visible, fixable failure over a quiet, wrong value.
@@ -202,7 +227,8 @@ or lose the CDC handoff point.
 > available as a CLI script — `scripts/run_full_load.py` (plan first, then `--yes`;
 > optional `--clean` and `--watermark-out` to capture the CDC watermark) — for
 > automation or a large-scale run without the web UI. See
-> [`scripts/README.md`](../../../scripts/README.md); the source is read-only and the
+> [`scripts/README.md`](../../../scripts/README.md); the source is read-only (the
+> sole exception is the PostgreSQL-CDC slot and publication noted in §3.1) and the
 > load is idempotent, exactly as in the UI.
 
 ---

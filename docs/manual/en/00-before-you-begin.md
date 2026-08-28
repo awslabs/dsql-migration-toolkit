@@ -3,9 +3,13 @@
 _Language: **English** | [한국어](../ko/00-before-you-begin.md) | [日本語](../ja/00-before-you-begin.md)_
 
 Read this short page **before** you start a migration. Aurora DSQL is **not** a
-version of MySQL — it's a different engine with different rules — so a handful of
-facts will shape your plan from the very first step. Each item below is a
-one-line "must know" plus a pointer to the chapter that covers it in depth.
+drop-in replacement for your source engine (MySQL or PostgreSQL) — it's a
+distributed engine with its own rules — so a handful of facts will shape your
+plan from the very first step. (A PostgreSQL source is closer to DSQL — both
+speak the PostgreSQL-16 wire protocol — but it is still bound by DSQL's
+constraints, so the heterogeneous-migration mindset still applies; the dialect
+gap is just smaller than from MySQL.) Each item below is a one-line "must know"
+plus a pointer to the chapter that covers it in depth.
 
 > This page is the **pre-flight checklist**. It does not replace the detailed
 > chapters — it makes sure you don't discover a constraint *after* you've already
@@ -23,9 +27,22 @@ one-line "must know" plus a pointer to the chapter that covers it in depth.
       region too. → [§1.5](01-setup.md#15-connect-to-your-source-and-target),
       [§6.2](06-limitations.md#62-migration-process-limits)
 
-- [ ] **Your source is only ever read.** The tool never writes to your RDS /
-      Aurora MySQL source — a read-capable user is enough. Supported sources:
-      **RDS for MySQL** and **Aurora MySQL**, versions **5.7 / 8.0 / 8.4**.
+- [ ] **Your source is read-only in almost every path.** For MySQL, and for a
+      PostgreSQL Full-Load-only migration, the tool never writes to the source and
+      a read-capable user is enough. The single exception is **PostgreSQL CDC**: at
+      the Full Load consistency point the tool creates — and at teardown drops — a
+      logical replication slot and a publication scoped to exactly the migrated
+      tables (auto-committed, restricted to a small allowlist, audited). These are
+      the only writes the tool ever makes to any source.
+      → [§1.1](01-setup.md#11-prerequisites)
+
+- [ ] **Two source engines are supported.** **RDS for MySQL** and **Aurora
+      MySQL** (versions **5.7 / 8.0 / 8.4**), and **RDS for PostgreSQL** and
+      **Aurora PostgreSQL** (PG **13–16** tested; the tool enforces no hard PG
+      version floor/ceiling). Pick the source engine on the Connect screen (MySQL
+      defaults to port **3306**, PostgreSQL to **5432**; a PostgreSQL source
+      connects to a single database). Both engines authenticate with a password or
+      an **AWS Secrets Manager** username/password — IAM auth is target-DSQL only.
       → [§1.1](01-setup.md#11-prerequisites)
 
 - [ ] **DSQL is PostgreSQL-compatible, IAM-authenticated, and distributed.** It
@@ -42,15 +59,20 @@ one-line "must know" plus a pointer to the chapter that covers it in depth.
       PK to such tables before loading. (Both single-column and composite PKs are
       supported.) → [§6.1](06-limitations.md#61-aurora-dsql-feature-limits-your-schema-must-fit-these)
 
-- [ ] **DSQL intentionally omits some features MySQL has.** No
-      **triggers / stored procedures / events**, a **per-transaction row limit
-      (≤ 3000)**, a **1 MiB per-value limit**, `DECIMAL` **precision ≤ 38**, and
-      **no spatial types**. (**Foreign keys are supported** — Aurora DSQL enforces
-      them — so the tool preserves them and re-creates them after the data load;
-      they are *not* an omitted feature.) You don't have to find these yourself —
-      the **Evaluation** step inspects your schema and flags every one as
-      `AUTO` / `MANUAL` / `UNSUPPORTED` with a recommended action. Plan to resolve
-      the `UNSUPPORTED` items and decide the `MANUAL` ones before loading data.
+- [ ] **DSQL intentionally omits some features your source engine (MySQL or
+      PostgreSQL) may have.** No **triggers / stored procedures / events**, a
+      **per-transaction row limit (≤ 3000)**, a **1 MiB per-value limit**,
+      `DECIMAL` **precision ≤ 38**, and **no spatial types**. (**Foreign keys are
+      supported** — Aurora DSQL enforces them — so the tool preserves them and
+      re-creates them after the data load; they are *not* an omitted feature.) You
+      don't have to find these yourself — the **Evaluation** step inspects your
+      schema and flags every one as `AUTO` / `MANUAL` / `UNSUPPORTED` with a
+      recommended action. For a **PostgreSQL source**, Evaluation additionally
+      flags PG-only column types DSQL can't store — arrays, geometric, network
+      (`inet`/`cidr`/`macaddr`), `xml`, `money`, `bit`/`varbit`,
+      `tsvector`/`tsquery`, range/multirange, `enum`, composite, `pgvector` — as
+      `UNSUPPORTED` to remodel. Plan to resolve the `UNSUPPORTED` items and decide
+      the `MANUAL` ones before loading data.
       → [Chapter 2](02-evaluation-and-schema-conversion.md),
       [Chapter 6](06-limitations.md)
 
@@ -61,16 +83,28 @@ one-line "must know" plus a pointer to the chapter that covers it in depth.
       enough and provisions no streaming infrastructure. → [Chapter 4](04-cdc-and-dsql-constraints.md),
       [§10.1](10-conclusion.md#101-which-path-do-i-need)
 
-- [ ] **CDC requires source binlog set up first (managed-MySQL way).** If you'll
-      use CDC, the source must have **binary logging on in ROW format with a full
-      row image** (`binlog_format=ROW`, `binlog_row_image=FULL`) and a user with
-      **replication privileges** — the prerequisite gate **blocks** CDC until both
-      are met. Also **raise binlog retention** so the binlog at the Full Load
-      watermark still exists when CDC starts; the gate only **warns** here, but
-      too-short retention is a real silent-gap risk. On RDS/Aurora this is done via
-      **parameter groups** and the `mysql.rds_set_configuration` **stored
-      procedure** — not `my.cnf`/`SET GLOBAL` as on community MySQL. Full Load alone
-      needs none of this. → [§1.1](01-setup.md#11-prerequisites)
+- [ ] **CDC requires source-side setup first — and it differs by engine.** If
+      you'll use CDC, the prerequisite gate **blocks** CDC until the source is
+      ready. Full Load alone needs none of this. → [§1.1](01-setup.md#11-prerequisites)
+    - **MySQL source:** enable **binary logging in ROW format with a full row
+      image** (`binlog_format=ROW`, `binlog_row_image=FULL`) and a user with
+      **replication privileges**. Also **raise binlog retention** so the binlog at
+      the Full Load watermark still exists when CDC starts (the gate only **warns**
+      here, but too-short retention is a real silent-gap risk). On RDS/Aurora this
+      is done via **parameter groups** and the `mysql.rds_set_configuration`
+      **stored procedure** — not `my.cnf`/`SET GLOBAL` as on community MySQL.
+    - **PostgreSQL source:** set **`wal_level=logical`** (on RDS/Aurora, set the
+      static parameter **`rds.logical_replication=1`** in a custom DB/cluster
+      parameter group, then **reboot** — on Aurora, reboot the writer; self-managed:
+      set `wal_level=logical` and restart); a user with **replication privileges**
+      (a superuser, the **REPLICATION** role attribute, or **`rds_replication`**
+      membership on RDS/Aurora); the source must be the cluster **writer**
+      endpoint, not a standby (`pg_is_in_recovery()` = false); and **every
+      replicated table needs a usable `REPLICA IDENTITY`** — a primary key gives
+      the default, otherwise set `ALTER TABLE … REPLICA IDENTITY FULL`
+      (`REPLICA IDENTITY NOTHING` is refused). Replication-slot / walsender
+      **headroom** is checked as a non-blocking **warn**. The tool auto-creates the
+      **publication** and **logical replication slot** for you.
 
 - [ ] **CDC replicates data, not schema.** During CDC, source **DDL** changes are
       **not** propagated to DSQL — you re-apply them yourself via Schema

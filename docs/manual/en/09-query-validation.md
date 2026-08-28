@@ -17,9 +17,10 @@ executes DML against the target.
 
 ## 9.1 Convert a query
 
-Paste a MySQL statement and the tool converts it to Aurora DSQL (PostgreSQL) with
-the same deterministic-first engine used for schema conversion (`sqlglot`), then
-classifies it:
+Paste a MySQL statement and the tool converts its MySQL idioms to Aurora DSQL
+(PostgreSQL) with the same deterministic-first engine used for schema conversion
+(`sqlglot`) — the Convert step parses the input as **MySQL**, so it is
+MySQL-source-specific — then classifies it:
 
 - **AUTO** — converted deterministically; ready to test.
 - **MANUAL** — converted, but review it (an idiom that has a caveat on DSQL).
@@ -29,9 +30,18 @@ It also **rewrites** MySQL idioms and **flags** ones that matter on DSQL — e.g
 the conflict target), `JSON_UNQUOTE(JSON_EXTRACT(...))` → `JSON_EXTRACT_PATH_TEXT`,
 MySQL `HAVING`-alias references inlined, and `SELECT ... FOR UPDATE` (which behaves
 differently under DSQL's optimistic concurrency). Every such finding is classified
-**MANUAL**. For the broader application-code anti-pattern scan (`AUTO_INCREMENT` /
-trigger reliance, unsupported functions) see
-[Chapter 2](02-evaluation-and-schema-conversion.md).
+**MANUAL**. For the broader application-code anti-pattern scan (monotonic keys —
+`AUTO_INCREMENT`, serial / `IDENTITY` — / trigger reliance, unsupported functions)
+see [Chapter 2](02-evaluation-and-schema-conversion.md).
+
+> **PostgreSQL source.** Convert transpiles **MySQL** idioms, so the rewrites above
+> (`ON DUPLICATE KEY UPDATE`, `JSON_UNQUOTE`/`JSON_EXTRACT`, MySQL `HAVING`-alias
+> inlining) don't apply to a PostgreSQL source — there, application SQL is already
+> PostgreSQL and runs on Aurora DSQL near-identically (PG → DSQL is a near-identity
+> dialect), so most queries are already valid DSQL. Skip straight to **Test on
+> target** and the **AI DBA**, which are engine-neutral. DSQL execution-model
+> caveats such as `SELECT ... FOR UPDATE` under optimistic concurrency still apply
+> to PostgreSQL-source queries too.
 
 The original and the converted SQL are shown side by side so you can see exactly
 what changed.
@@ -55,10 +65,14 @@ The verdict shows whether DSQL accepted the statement, the exact error (with
 SQLSTATE) if it didn't, the captured query plan, and — with ANALYZE — the DPU cost.
 
 **Which schema is tested.** An unqualified table name (`FROM orders`) resolves
-against a schema via the session `search_path`; the tool defaults to the connected
-source database's same-named schema, and a **Test against schema** picker lets you
-retarget. A `relation "…" does not exist` (SQLSTATE **42P01**) simply means the
-table isn't in the tested schema — pick the right one and re-test.
+against a schema via the session `search_path`. For a **MySQL** source — where a
+database *is* a schema — the tool defaults to the connected database's same-named
+DSQL schema, the natural default. For a **PostgreSQL** source a database holds many
+schemas and tables are schema-qualified (e.g. `public.orders`), so the
+same-named-database default usually won't resolve — use the **Test against schema**
+picker to select the actual target schema (e.g. `public`). A `relation "…" does not
+exist` (SQLSTATE **42P01**) simply means the table isn't in the tested schema —
+pick the right one and re-test.
 
 > **Reading a DSQL plan:** Aurora DSQL is a *distributed* PostgreSQL-compatible
 > engine, so its plans read a little differently — see §9.4.
@@ -140,7 +154,8 @@ you need instead of `SELECT *`; avoid a leading-wildcard `LIKE '%x%'` (it can't 
 an index); add a **redundant join predicate** the optimizer can't infer across a
 join; use **CTE late materialization** for `ORDER BY … LIMIT`; add `INCLUDE` columns
 to make an index covering; and prefer randomly-distributed keys (UUID) over
-monotonic ones (`AUTO_INCREMENT`, timestamps) that create hot partitions.
+monotonic ones (auto-increment, serial / `IDENTITY` / sequence `nextval`,
+timestamps) that create hot partitions.
 
 ---
 

@@ -11,7 +11,9 @@ an authoritative verdict rather than an approximation.
 
 Run it from the **Validation** step after Full Load (and, if you're using CDC,
 after the stream has caught up). It compares the migrated DSQL target against the
-source **as of the watermark**, and reports drift if the live source has moved on.
+source **as of the watermark**, and — on a **MySQL** source — reports drift if the
+live source has moved on (a **PostgreSQL** source does not get a drift verdict; see
+5.2).
 
 ---
 
@@ -36,14 +38,17 @@ count-matched tables are reported as "not deeply checked" (not as a false match)
 > unbounded query that can hit DSQL's ~300 s per-transaction limit (surfaced as a
 > per-table error); single-column-PK tables are keyset-paged and unaffected.
 
-> **Checksum excludes `FLOAT`/`DOUBLE` and `JSON` columns.** These have no
-> byte-identical text form across MySQL and PostgreSQL, so they are left out of the
-> checksum and listed in the report as **"not value-compared."** A value difference
-> confined to such a **non-key** column is therefore not caught by any mode (row count
-> is unchanged by an in-place edit, and reconcile compares PK *presence*, not values).
-> Key columns and every other type are still fully compared. Column count is **not**
-> a checksum limit — a very wide table's columns are hashed in groups (nested MD5) so
-> the checksum stays within DSQL's 100-argument function cap.
+> **Checksum excludes floating-point and JSON columns.** MySQL `FLOAT`/`DOUBLE` and
+> `JSON` (and their PostgreSQL equivalents `real`/`double precision` and `json`) have
+> no stable exact text form to hash identically, so they are left out of the checksum
+> and listed in the report as **"not value-compared."** On a **PostgreSQL** source,
+> `jsonb` (which has a canonical form) **is** checksummed — only plain `json` is
+> excluded — so a jsonb value drift in a non-key column is still caught. A value
+> difference confined to such a **non-key** column is therefore not caught by any mode
+> (row count is unchanged by an in-place edit, and reconcile compares PK *presence*, not
+> values). Key columns and every other type are still fully compared. Column count is
+> **not** a checksum limit — a very wide table's columns are hashed in groups (nested
+> MD5) so the checksum stays within DSQL's 100-argument function cap.
 
 ---
 
@@ -52,14 +57,20 @@ count-matched tables are reported as "not deeply checked" (not as a false match)
 A real source keeps changing while you migrate, so "do the counts match?" needs a
 reference point. Validation uses the **watermark**:
 
-- It compares the **current** source position against the watermark's: by **GTID**
-  when both the watermark and the live source expose one, otherwise by the binlog
-  **file:position** (the path whenever GTID can't be enabled, e.g. RDS MySQL 8.0; the
-  coordinate is read via `SHOW BINARY LOG STATUS` on MySQL 8.2+/8.4, else
-  `SHOW MASTER STATUS`). If
-  the source has advanced, the report marks **`drifted = true`** with the watermark's
-  snapshot timestamp as the "as of" point — so a count difference is correctly
-  attributed to *new source activity since the snapshot*, not to a migration bug.
+- **On a MySQL source**, it compares the **current** source position against the
+  watermark's: by **GTID** when both the watermark and the live source expose one,
+  otherwise by the binlog **file:position** (the path whenever GTID can't be enabled,
+  e.g. RDS MySQL 8.0; the coordinate is read via `SHOW BINARY LOG STATUS` on MySQL
+  8.2+/8.4, else `SHOW MASTER STATUS`). If the source has advanced, the report marks
+  **`drifted = true`**.
+- **On a PostgreSQL source**, the watermark records a **WAL LSN** (plus the logical
+  replication slot and publication), not a binlog/GTID coordinate, and Validation does
+  **not** currently recompute LSN-based drift: the binlog/GTID probes are skipped and
+  `drifted` is reported as **"could not be determined."** Watch the target **converge**
+  during CDC (next bullet) rather than rely on a drift flag.
+- Either way, the report carries the watermark's **snapshot timestamp** as the "as of"
+  point — so a count difference is correctly attributed to *new source activity since
+  the snapshot*, not to a migration bug.
 - During CDC, you typically watch the target **converge** toward the source
   (the lightweight `scripts/compare_rows.py --watch N` re-checks every *N*
   seconds and is handy for this), then run full Validation once it's caught up.
@@ -127,7 +138,8 @@ The report is **exportable** so you can attach it to a cut-over decision.
 
 Once Validation reports a clean **MATCH** (or every difference is explained), the
 final workflow step — **Cut over** — appears in the UI with the runbook for
-switching your application from MySQL to DSQL. See the recommended end-to-end flow
+switching your application from the source database (RDS/Aurora MySQL or PostgreSQL)
+to DSQL. See the recommended end-to-end flow
 in the [Conclusion](10-conclusion.md) for the cut-over sequence (CDC-drain vs
 Full-Load freeze) and the rollback anchor.
 

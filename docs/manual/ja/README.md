@@ -8,12 +8,16 @@ _言語を選択してください:_
 
 > 英語版が正本です。翻訳版と内容が食い違う場合は、英語版が優先されます。
 
-このツールを使って **Amazon RDS / Aurora MySQL** データベースを **Amazon Aurora
-DSQL** へ移行するためのガイド付きマニュアルです。本書は、**MySQL には精通しているが、
-これから Aurora DSQL を使い始めようとしているデータベース運用（DB Operation）担当者**
-を対象としています。DSQL は分散データベースとしての設計上、PostgreSQL と比べても
-かなり多くの点が異なっており、本マニュアルはそれらの相違をまたいで変換する作業を
-ツールが *どのように* 支援するのかを説明します。
+このツールを使って **Amazon RDS / Aurora MySQL または PostgreSQL** データベースを
+**Amazon Aurora DSQL** へ移行するためのガイド付きマニュアルです。本ツールは **2 つの
+ソースエンジン — RDS / Aurora MySQL と RDS / Aurora PostgreSQL —** をサポートしており、
+**Connect** 画面で選択します。本書は主に、**MySQL には精通しているが、これから Aurora
+DSQL を使い始めようとしているデータベース運用（DB Operation）担当者** を対象としています。
+DSQL は分散データベースとしての設計上、PostgreSQL と比べてもかなり多くの点が異なっており、
+本マニュアルはそれらの相違をまたいで変換する作業をツールが *どのように* 支援するのかを
+説明します。PostgreSQL ソースも **完全にサポート** されており、2 つの経路は異なります —
+MySQL ソースは **異種（heterogeneous）** 変換であり、PostgreSQL ソース → DSQL は（どちらも
+PostgreSQL-16 ワイヤを話すため）**ほぼ同一（near-identity）** の変換です。
 
 > プロジェクトが初めてですか？ まずアーキテクチャと利用する AWS サービスの概要を
 > [最上位の README](../../../README.ja.md) でお読みください。本マニュアルは、実際に
@@ -26,10 +30,16 @@ DSQL** へ移行するためのガイド付きマニュアルです。本書は�
 
 ## このツールとは
 
-**異種（heterogeneous）かつ決定論（deterministic）優先の移行**を実行する **Web ツール**
-（およびインポート可能なエンジン）です。つまり MySQL → PostgreSQL 方言 → DSQL 制約という
-流れで変換します。**ソースは常に読み取り専用**です。移行は **Connect** を事前ステップと
-する 5 ステップのガイド付きフローです。
+**決定論（deterministic）優先の移行**を実行する **Web ツール**（およびインポート可能な
+エンジン）であり、経路はソースエンジンによって異なります。**MySQL ソース** は **異種
+（heterogeneous）** 経路である MySQL → PostgreSQL 方言 → DSQL 制約をたどり、**PostgreSQL
+ソース** は方言ステップを省いて **ほぼ同一（near-identity）** の PostgreSQL-16 → DSQL 経路
+（値をそのまま引き渡し、同じワイヤ、DSQL の制約と非対応の型のみを反映）をたどります。**MySQL
+ソース（および PostgreSQL を Full Load 専用でのみ使う移行）には決して書き込みを行いません。**
+唯一の例外は **PostgreSQL CDC** で、Full Load の整合性ポイントにおいて、ツールが移行対象テーブル
+だけに限定した pgoutput 論理レプリケーションスロットと publication を作成し、後片付け（teardown）
+時に削除します（autocommit、許可リストに限定、監査記録あり）。これがツールがソースに対して行う
+唯一の書き込みです。移行は **Connect** を事前ステップとする 5 ステップのガイド付きフローです。
 
 ```
 Connect → 1. Evaluation → 2. Schema Conversion → 3. Data Migration → 4. Validation → 5. Cut over
@@ -44,9 +54,9 @@ Data Migration は **Full Load**（ツール独自のバルクローダー）と
 
 | # | 章 | 学べること |
 |---|---|---|
-| 0 | [Before you begin](00-before-you-begin.md) | 事前チェックリスト — 最初のステップから計画を左右する、必ず知っておくべき事実（同一リージョン限定、読み取り専用ソース、DSQL が省いている機能、CDC は任意・課金対象）。**ここから始めてください。** |
+| 0 | [Before you begin](00-before-you-begin.md) | 事前チェックリスト — 最初のステップから計画を左右する、必ず知っておくべき事実（同一リージョン限定、読み取り専用ソース — ただし PostgreSQL CDC の監査されるスロット／publication は例外、DSQL が省いている機能、CDC は任意・課金対象）。**ここから始めてください。** |
 | 1 | [Set up](01-setup.md) | 前提条件、ツールの実行方法（ローカルまたは AWS）、ソースとターゲットへの接続方法。 |
-| 2 | [Evaluation and Schema Conversion](02-evaluation-and-schema-conversion.md) | DSQL に移せるもの／移せないものをツールがどう評価するか（AUTO / MANUAL / UNSUPPORTED、工数見積り、名前の衝突）と、スキーマの変換・適用。完全な **MySQL → DSQL の型・制約リファレンス** を含みます。 |
+| 2 | [Evaluation and Schema Conversion](02-evaluation-and-schema-conversion.md) | DSQL に移せるもの／移せないものをツールがどう評価するか（AUTO / MANUAL / UNSUPPORTED、工数見積り、名前の衝突）と、スキーマの変換・適用。完全な **MySQL → DSQL および PostgreSQL → DSQL の型・制約リファレンス** を含みます（PostgreSQL リファレンスはほぼ同一で、DSQL が非対応の PG 型 — 配列、幾何（geometric）、ネットワーク、xml、money、bit/varbit、range/multirange、enum、composite、tsvector/tsquery、pgvector — は自動置換せず、Evaluation と Schema Conversion で示します）。 |
 | 3 | [Full Load](03-full-load.md) | バルクスナップショットロードの動作: ストリーミング export、冪等なバッチロード、ウォーターマーク（watermark）、そして失敗をどう隔離するか。 |
 | 4 | [CDC and DSQL constraints](04-cdc-and-dsql-constraints.md) | ストリーミング CDC の動作、隙間のない Full Load → CDC ハンドオフ、そして DSQL の制約（値あたり 1 MiB、OCC、IAM 認証、外部キー適用の延期）をデータ経路でどう扱うか。 |
 | 5 | [Validation](05-validation.md) | ターゲットがソースと一致することをツールがどう証明するか: 行数、チェックサム、PK 全体の突き合わせ、ライブソースのドリフト。 |
@@ -58,12 +68,17 @@ Data Migration は **Full Load**（ツール独自のバルクローダー）と
 | 11 | [Customer FAQ](11-customer-faq.md) | 顧客が最もよく尋ねる質問 — Full Load、CDC、制限、型マッピング、検証、カットオーバー／ロールバック、運用 — を、ツールの実際の動作に基づいて回答し、詳細へのリンクを添えています。 |
 | 12 | [付録: 性能テスト結果](12-performance-test-results.md) | チューニングの根拠を裏付ける、実測の Full Load / Validation / CDC スループットの例と方法論。 |
 
-## MySQL ユーザーへの Aurora DSQL についての注意
+## MySQL・PostgreSQL ユーザーへの Aurora DSQL についての注意
 
 Aurora DSQL は **MySQL ではなく**、**Aurora MySQL をそのまま置き換えられるものでもありません**。
 **PostgreSQL** ワイヤプロトコルを話し、**短命の IAM トークン**（パスワードなし）で認証し、
 **分散型**（ロックではなく楽観的並行性）であり、水平方向にスケールしない機能は意図的に省いて
 います — **トリガーなし、ストアドプロシージャなし、トランザクションあたりの行数制限、値あたり
-1 MiB の制限**（一方、外部キーは **サポートされ、強制されます**）。本マニュアルは、これらが問題になる箇所ごとに一つひとつ指摘し、
+1 MiB の制限**（一方、外部キーは **サポートされ、強制されます**）。そして PostgreSQL ワイヤを話すとはいえ、
+**Aurora PostgreSQL をそのまま置き換えられるものでもありません**。IAM トークン認証と上記のトランザクション
+あたり・値あたりの制限が加わり、トリガー・ストアドプロシージャ・生成列（generated column）・`DEFAULT` の
+サポートが省かれた **制約された分散型 PostgreSQL** であるため、PostgreSQL ユーザーも通常の Aurora
+PostgreSQL のように扱うことはできません。（これらの DSQL の相違は、ソースエンジンに関係なく適用されます。）
+本マニュアルは、これらが問題になる箇所ごとに一つひとつ指摘し、
 ツールがそれに対して何を行うかを示します。これにより、DSQL のルールを苦労して学び直す必要が
 ないようにしています。

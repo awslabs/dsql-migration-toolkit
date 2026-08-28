@@ -15,14 +15,21 @@ _언어: [English](../en/11-customer-faq.md) | **한국어** | [日本語](../ja
 
 **Q1. 이 도구는 무엇을 어느 방향으로 마이그레이션하나요?**
 
-Amazon **RDS / Aurora MySQL → Amazon Aurora DSQL**, 단방향입니다. 지원 소스는 **RDS for MySQL**과
-**Aurora MySQL**의 **5.7 / 8.0 / 8.4** 버전입니다(모두 end-to-end 검증 — Full Load + CDC + 체크섬).
-버전 업그레이드가 아니라 **이기종(heterogeneous)** 마이그레이션(MySQL → PostgreSQL 방언 → DSQL 제약)입니다 — DSQL은
-PostgreSQL 와이어 호환, 분산, 서버리스, IAM 인증 방식입니다. **소스는 전 과정 내내 읽기 전용**이며,
-도구는 MySQL에 절대 쓰지 않습니다.
+Amazon **RDS / Aurora MySQL 또는 PostgreSQL → Amazon Aurora DSQL**, 단방향입니다. 지원 소스는
+**RDS for MySQL**과 **Aurora MySQL**(**5.7 / 8.0 / 8.4**), 그리고 **RDS for PostgreSQL**과
+**Aurora PostgreSQL**(**PG 13–16** 검증; 도구는 하드한 버전 하한/상한을 강제하지 않음)입니다. 두 소스
+경로 모두 — Schema Conversion + Full Load + CDC + cut over — **end-to-end로 검증**되었습니다(테스트에서
+체크섬 포함). 버전 업그레이드가 아니라 **이기종(heterogeneous)** 마이그레이션입니다 — MySQL에서는 경로가
+**MySQL → PostgreSQL 방언 → DSQL 제약**이고, PostgreSQL에서는 **거의 동일한(near-identity) PG → DSQL**
+경로입니다(둘 다 PostgreSQL-16 와이어). DSQL은 PostgreSQL 와이어 호환, 분산, 서버리스, IAM 인증 방식입니다.
+
+**소스는 전 과정 내내 읽기 전용**입니다. 도구가 어떤 소스에든 쓰는 유일한 예외는 **CDC를 쓰는 PostgreSQL
+소스**의 경우로, Full Load 일관성 지점에서 정확히 마이그레이션 대상 테이블로만 범위를 한정한 논리 복제
+슬롯과 publication을 생성(그리고 teardown 시 삭제)합니다 — autocommit, allowlist 제한, 감사(audit)되는
+작업입니다. MySQL 소스(및 Full Load만 하는 PostgreSQL 마이그레이션)에는 절대 쓰지 않습니다.
 
 
-**Q2. 기존 Aurora MySQL을 Aurora DSQL로 그대로 바꿔 쓸 수 있나요?**
+**Q2. Aurora DSQL을 내 소스 엔진(Aurora MySQL / PostgreSQL)의 드롭인 대체로 그대로 쓸 수 있나요?**
 
 아니요. DSQL은 **PostgreSQL** 와이어 프로토콜을 쓰고, 짧은 수명의 **IAM 토큰**으로 인증(비밀번호
 없음)하며, 락 대신 **낙관적 동시성 제어**(OCC)를 사용하고, 수평 확장에 맞지 않는 기능을 의도적으로
@@ -61,7 +68,7 @@ DSQL에 맞게 바꿔야 합니다. 어디를 바꿔야 하는지는 Evaluation(
 | 상황 | 사용 |
 |---|---|
 | 일회성 마이그레이션; 짧은 유지보수 쓰기 정지 허용 가능 | **Full Load만** — 스트리밍 인프라 없음, 상시 비용 없음. |
-| 대규모 / 지속적; **거의 무중단** 컷오버 필요 | **Full Load + CDC** — 누락 없이 이어지는 인계(gapless handoff)로 MySQL이 살아 있는 동안 DSQL이 수렴. |
+| 대규모 / 지속적; **거의 무중단** 컷오버 필요 | **Full Load + CDC** — 누락 없이 이어지는 인계(gapless handoff)로 소스가 살아 있는 동안 DSQL이 수렴. |
 
 CDC는 실제 구성요소(MSK, MSK Connect, 싱크 커넥터)를 추가하며 **배포된 동안 비용이 발생**합니다.
 지속 복제가 정말 필요할 때만 쓰세요; 아니면 Full Load만으로 더 단순하고 저렴합니다.
@@ -100,12 +107,12 @@ Full Load는 도구의 **자체 벌크 로더**(Debezium 스냅샷이 아님)입
 
 **Q8a. 적재 중에 소스 Aurora 클러스터가 failover되면 어떻게 되나요?**
 
-자동으로 처리됩니다. writer 승격(패치, 인스턴스 교체, AZ 이벤트)은 열려 있는 MySQL 연결을 모두
+자동으로 처리됩니다. writer 승격(패치, 인스턴스 교체, AZ 이벤트)은 열려 있는 소스 연결을 모두
 끊으므로 수 시간짜리 적재는 이를 만나게 됩니다. 해당 테이블은 **자동으로 다시 읽습니다**(기본 3회,
 15초 → 30초 → 60초 백오프 — DNS가 승격된 writer로 재지정될 시간을 줍니다).
 
 재시도는 죽은 읽기를 멈춘 지점에서 이어받지 않고, **그 테이블을 새 consistent snapshot으로 처음부터
-다시 읽습니다.** 이어받으면 서로 다른 두 MySQL 스냅샷이 한 테이블에 섞이는데, gapless한 Full Load →
+다시 읽습니다.** 이어받으면 서로 다른 두 소스 스냅샷이 한 테이블에 섞이는데, gapless한 Full Load →
 CDC 인계는 각 테이블이 **단일 시점**으로 일관되다는 전제에 의존하기 때문입니다. 적재가 idempotent
 하므로 이미 쓰인 행은 건너뜁니다 — 재시도 비용은 재읽기 I/O이고, 행이 중복되지는 않습니다.
 
@@ -117,8 +124,9 @@ CDC 인계는 각 테이블이 **단일 시점**으로 일관되다는 전제에
 
 **Q9. Full Load는 소스에 바이너리 로깅이 필요한가요?**
 
-**아니요.** Full Load만이라면 CDC 전제조건이 전혀 필요 없습니다(바이너리 로그·복제 사용자 불필요).
-일반 읽기 전용 연결로 소스를 읽습니다. **CDC**만 바이너리 로그가 필요합니다(Q12).
+**아니요.** Full Load만이라면 CDC 전제조건이 전혀 필요 없습니다(MySQL은 바이너리 로그·복제 사용자
+불필요; PostgreSQL은 `wal_level=logical`·복제 슬롯·publication 불필요). 어느 엔진이든 일반 읽기 전용
+연결로 소스를 읽습니다. 그 전제조건은 **CDC**에만 필요합니다(Q12).
 
 
 **Q10. Full Load 처리량을 튜닝할 수 있나요?**
@@ -141,12 +149,13 @@ CDC 인계는 각 테이블이 **단일 시점**으로 일관되다는 전제에
 
 **Q11. 병렬도를 올려도 왜 빨라지지 않을 때가 있나요?**
 
-DSQL은 데이터를 **기본 키 기준으로** 여러 노드에 나눠 저장합니다. 그런데 `AUTO_INCREMENT`처럼 값이
-계속 증가하는 PK는 모든 삽입이 **맨 끝(가장 큰 키) 구간 한 곳에만 몰리는** 쓰기 핫스팟을 만듭니다.
-병렬도를 높일수록 그 한 구간에 쓰기 경쟁이 심해져 **낙관적 동시성 충돌(`SQLSTATE 40001`)이 늘고**,
-그만큼 재시도가 발생해 처리량이 더 이상 늘지 않고 정체됩니다. 그래서 Evaluation 단계에서
-`AUTO_INCREMENT`를 미리 짚어 주고, Schema Conversion에서 **PK 전략**(정수 그대로 유지 / UUID로 변환 /
-캐싱 적용 identity 컬럼)을 선택할 수 있게 해 줍니다.
+DSQL은 데이터를 **기본 키 기준으로** 여러 노드에 나눠 저장합니다. 그런데 단조 증가하는 PK(MySQL
+`AUTO_INCREMENT`, 또는 PostgreSQL `serial` / `IDENTITY` / 시퀀스 기반 키)는 모든 삽입이 **맨 끝(가장 큰
+키) 구간 한 곳에만 몰리는** 쓰기 핫스팟을 만듭니다. 병렬도를 높일수록 그 한 구간에 쓰기 경쟁이 심해져
+**낙관적 동시성 충돌(`SQLSTATE 40001`)이 늘고**, 그만큼 재시도가 발생해 처리량이 더 이상 늘지 않고
+정체됩니다. 그래서 Evaluation 단계에서 소스 엔진과 무관하게 그런 단조 증가 PK를 미리 짚어 주고,
+Schema Conversion에서 **PK 전략**(정수 그대로 유지 / UUID로 변환 / 캐싱 적용 identity 컬럼)을 선택할 수
+있게 해 줍니다.
 [7장 §7.1](07-performance-and-tuning.md#71-이-설계의-이유-기술적-근거) 참조.
 
 ---
@@ -155,25 +164,39 @@ DSQL은 데이터를 **기본 키 기준으로** 여러 노드에 나눠 저장�
 
 **Q12. CDC는 소스에 무엇을 요구하나요?**
 
-CDC를 쓰려면 소스에 다음이 준비돼 있어야 합니다.
+소스 엔진에 따라 다릅니다.
 
-- **행 전체 이미지를 남기는 ROW 포맷 바이너리 로그**(`binlog_format=ROW`, `binlog_row_image=FULL`)와,
-  **복제 권한**을 가진 사용자.
-- **binlog 보존 기간을 충분히 늘려 두기.** Full Load가 기록한 워터마크 시점의 로그가 CDC를 시작할 때까지
-  남아 있어야 합니다(Aurora MySQL은 기본적으로 약 24시간만 보관하므로 그대로 두면 로그가 사라질 수 있음).
+**MySQL 소스** — CDC를 쓰려면 **행 전체 이미지를 남기는 ROW 포맷 바이너리 로그**(`binlog_format=ROW`,
+`binlog_row_image=FULL`)와 **복제 권한**을 가진 사용자가 필요합니다. 또한 Full Load가 기록한 워터마크
+시점의 로그가 CDC를 시작할 때까지 남아 있도록 **binlog 보존 기간을 충분히 늘려** 두어야 합니다(Aurora
+MySQL은 기본적으로 약 24시간만 보관). RDS/Aurora에서는 이 설정들을 `my.cnf`가 아니라 **파라미터 그룹**과
+`mysql.rds_set_configuration`으로 바꿉니다. 전제조건 게이트는 binlog 포맷과 복제 권한이 갖춰지기 전까지
+**CDC 시작을 막고**, binlog 보존 기간이 너무 짧아 보이면 **경고(비차단)** 합니다.
 
-RDS/Aurora에서는 이 설정들을 `my.cnf`가 아니라 **파라미터 그룹**과 `mysql.rds_set_configuration`으로
-바꿉니다. 도구는 binlog 포맷과 복제 권한이 갖춰지기 전까지 **CDC 시작을 막고**, binlog 보존 기간이
-너무 짧아 보이면 **경고(비차단)** 합니다. [§1.1](01-setup.md#11-사전-요구사항)과
-[6장 §6.2](06-limitations.md#62-마이그레이션-프로세스-한계)를 참조하세요.
+**PostgreSQL 소스** — CDC에는 **`wal_level=logical`**(RDS/Aurora: 커스텀 DB/클러스터 파라미터 그룹에서
+정적 파라미터 `rds.logical_replication=1`을 설정한 뒤 writer 재부팅; 자체 관리형: `wal_level=logical` +
+재시작)이 **필수**이고, **복제 권한을 가진 사용자**(superuser, `REPLICATION` 역할 속성, 또는 RDS/Aurora의
+`rds_replication` 멤버십, 그리고 마이그레이션 대상 테이블에 대한 `SELECT`)가 **필수**이며, 소스는
+standby/reader가 아니라 클러스터의 **writer**여야(`pg_is_in_recovery()=false`) 하고 이 역시 **필수**이며,
+복제되는 모든 테이블에는 쓸 수 있는 **`REPLICA IDENTITY`**(PK가 있으면 기본값 제공, 없으면 `ALTER TABLE …
+REPLICA IDENTITY FULL` — `REPLICA IDENTITY NOTHING`이면 publisher에서 UPDATE/DELETE가 오류)가
+**필수**입니다. 복제 슬롯 / `max_wal_senders`(walsender) 여유는 **경고**(비차단)입니다. PostgreSQL에는
+**binlog 보존 개념이 없습니다** — 도구가 publication(정확히 마이그레이션 대상 테이블 대상)과 `pgoutput`
+논리 슬롯을 자동 생성하고, WAL은 슬롯에 의해 고정됩니다(비활성·미소비 슬롯이 소스 디스크를 채울 수
+있으니 `wal_status`를 지켜보세요).
+
+[§1.1](01-setup.md#11-사전-요구사항)과 [6장 §6.2](06-limitations.md#62-마이그레이션-프로세스-한계)를
+참조하세요.
 
 
 **Q13. Full Load에서 CDC로 넘어갈 때 어떻게 누락 없이 이어지나요?**
 
-Full Load는 일관된 스냅샷 지점에서 **binlog/GTID 워터마크**(복제를 이어갈 위치 표시)를 기록합니다.
-CDC는 **바로 그 지점부터** 스트리밍을 시작하고, 변경을 PK 기준으로 적용하기 때문에 스냅샷과 스트림이
-일부 겹치더라도 **같은 행이 두 번 들어가지 않습니다.** 그래서 빠진 구간(gap)도, 중복 적용도 없이
-매끄럽게 이어집니다. [4장 — CDC](04-cdc-and-dsql-constraints.md) 참조.
+Full Load는 일관된 스냅샷 지점에서 **워터마크**(복제를 이어갈 위치 표시)를 기록합니다 — MySQL 소스는
+**binlog/GTID 위치**, PostgreSQL 소스는 미리 생성한 논리 복제 슬롯에 고정된 **WAL LSN**입니다(그 뒤
+Debezium이 `snapshot.mode=never`로 슬롯에서 재개). CDC는 **바로 그 지점부터** 스트리밍을 시작하고,
+변경을 PK 기준으로 적용하기 때문에 스냅샷과 스트림이 일부 겹치더라도 **같은 행이 두 번 들어가지
+않습니다.** 그래서 빠진 구간(gap)도, 중복 적용도 없이 매끄럽게 이어집니다.
+[4장 — CDC](04-cdc-and-dsql-constraints.md) 참조.
 
 
 **Q14. CDC는 무엇을 복제하고, 무엇을 복제하지 않나요?**
@@ -238,17 +261,21 @@ CDC에는 오래 걸리는 작업이 **세 개** 있고, 서로 별개입니다.
 그래도 MSK Connect 커넥터 하나가 시작되는 데 수 분이 걸리므로, 이는 CDC 경로에서 두 번째로 큰
 대기입니다 — 인프라 배포와 **별도로** 계획하세요.
 
-**철거(제거)가 오래 걸리는 이유** — MSK 삭제 자체는 비교적 빠르지만, 마지막에 남는 **VPC 안의
-Lambda**(오프셋 시더)가 병목입니다. VPC에 연결된 Lambda를 지우면 AWS가 그 Lambda가 쓰던
+**철거(제거)가 오래 걸리는 이유(MySQL 소스)** — MSK 삭제 자체는 비교적 빠르지만, 마지막에 남는 **VPC
+안의 Lambda**(오프셋 시더)가 병목입니다. VPC에 연결된 Lambda를 지우면 AWS가 그 Lambda가 쓰던
 **네트워크 인터페이스**(ENI)를 정리해야 하는데, 이 정리가 **문서상 최대 ~20분까지** 걸리는 알려진
 AWS 동작입니다(우리 테스트에서도 전체 삭제의 대부분을 여기서 소요). 이 Lambda는 프라이빗 MSK
-bootstrap에 접근하기 위해 **반드시 VPC 안에 있어야** 하므로 이 지연은 철거 시 피하기 어렵습니다.
+bootstrap에 접근하기 위해 **반드시 VPC 안에 있어야** 하므로 이 지연은 철거 시 피하기 어렵습니다. 이
+병목은 **MySQL 전용**입니다: 오프셋 시더 Lambda는 MySQL 소스에서만 생성되므로, **PostgreSQL** 철거는(논리
+슬롯에서 CDC를 재개하며 시드된 `connect-offsets` 항목을 쓰지 않음) 그런 Lambda가 없어 ENI 정리 지연이
+발생하지 않습니다.
 
 > **팁:** 그래서 반복 테스트나 재시작 시에는, 전체 삭제 후 재생성보다 **기존 인프라를 유지한 채
 > 재시작**하는 편이 이 20분 지연을 피할 수 있어 유리합니다. **Stop CDC**는 MSK 클러스터·플러그인·
 > VPC·IAM을 보존하고 커넥터 2개만 제거하므로, 이후 **Start CDC**는 인프라 대기를 완전히 건너뛰고
-> 클러스터의 `connect-offsets` 토픽에 남아 있는 오프셋에서 이어서 재개합니다. 컷오버가 끝나 더 이상
-> CDC가 필요 없을 때 최종적으로 철거하세요.
+> 멈춘 지점에서 재개합니다 — MySQL 소스는 클러스터의 `connect-offsets` 토픽에 남아 있는 오프셋에서,
+> PostgreSQL 소스는 논리 슬롯의 LSN 위치에서요. 컷오버가 끝나 더 이상 CDC가 필요 없을 때 최종적으로
+> 철거하세요.
 
 이 작업들은 각각 **결과**(성공/실패와 소요 시간)를 활동 로그에 기록하므로, 예컨대 컷오버 전에 실행한
 Stop이 실제로 완료되었는지를 나중에 확인할 수 있습니다.
@@ -270,9 +297,9 @@ Evaluation 단계가 **모든 객체**를 세 등급으로 분류해 알려 줍�
 [2장](02-evaluation-and-schema-conversion.md)을 참조하세요.
 
 
-**Q19. MySQL 데이터 타입은 DSQL로 어떻게 매핑되나요?**
+**Q19. 소스 데이터 타입은 DSQL로 어떻게 매핑되나요?**
 
-주요 매핑은 다음과 같습니다.
+**MySQL 소스**의 경우, 주요 매핑은 다음과 같습니다.
 
 | MySQL 타입 | Aurora DSQL 타입 | 비고 |
 |---|---|---|
@@ -290,6 +317,17 @@ Evaluation 단계가 **모든 객체**를 세 등급으로 분류해 알려 줍�
 있습니다. **Full Load 로더와 CDC 싱크가 동일한 매핑을 따르므로**(공유 write-contract 테스트로 강제),
 어느 경로로 옮겨도 같은 행이 동일하게 적재됩니다.
 
+**PostgreSQL 소스**의 경우, 변환과 데이터 경로는 **거의 동일한(near-identity) PG-16 → DSQL 패스스루**입니다
+— DSQL이 지원하는 타입(정수 계열, `numeric`/`decimal`, `char`/`varchar`/`text`, date/time/`timestamp[tz]`,
+`interval`, `boolean`, `bytea`, `uuid`, `json`, `jsonb`)은 MySQL식 변환 없이 **그대로** 넘어갑니다.
+DSQL에 대응이 없는 PostgreSQL 타입은 **UNSUPPORTED**로 표시되고(자동 치환하지 않음) 재모델링해야 합니다:
+배열 → `jsonb` / 자식 테이블; 기하(geometric), 네트워크(`inet`/`cidr`/`macaddr`), `xml`, `bit`/`varbit`,
+`tsvector`/`tsquery`, `range` / multirange → `text`; `money` → `numeric`; `pgvector` → `jsonb`/`text`;
+`enum` → `text`; composite → 컬럼 / `jsonb`. `numeric(p,s)`에서 p > 38은 경고와 함께 클램핑되고, 순수
+`numeric`/`decimal`은 DSQL `numeric(18,6)`이 되며, 컬럼 `DEFAULT` / `serial` / identity `nextval`은
+**생성되지 않고**(identity는 PK 전략이 관장), `STORED` 생성 컬럼은 일반 컬럼이 됩니다. 타입·제약 참조는
+[2장 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-타입과-제약-처리-참조)을 참조하세요.
+
 
 **Q20. 외래 키, 트리거, 저장 프로시저는 어떻게 되나요?**
 
@@ -304,8 +342,9 @@ Evaluation 단계가 **모든 객체**를 세 등급으로 분류해 알려 줍�
   참조/피참조 테이블 DML의 추가 읽기 비용, 충돌 시 재시도 가능한 `40001`, 그리고
   `CASCADE`/`SET NULL`/`SET DEFAULT`는 트랜잭션당 3,000행 한도에 포함됩니다(무제한 캐스케이드는
   `NO ACTION`/`RESTRICT` 권장).
-- **트리거, 저장 프로시저/함수, 예약 이벤트**: 자동 변환이 안 되므로 **UNSUPPORTED**로 표시됩니다.
-  애플리케이션에서 다시 구현하세요(예약 이벤트는 EventBridge / Lambda로 대체할 수 있습니다).
+- **트리거, 저장 프로시저/함수, 예약 작업(scheduled job)**: 자동 변환이 안 되므로 **UNSUPPORTED**로
+  표시됩니다. 애플리케이션에서 다시 구현하세요(예약 작업 — MySQL의 Event Scheduler, 또는 PostgreSQL의
+  `pg_cron` 같은 cron 방식 스케줄러 — 은 EventBridge / Lambda로 대체합니다).
 
 [6장 §6.1](06-limitations.md#61-aurora-dsql-기능-한계-스키마가-이에-맞아야-함)을 참조하세요.
 
@@ -338,9 +377,11 @@ Validation(4단계)이 소스와 타깃을 **점점 더 엄격한 3단계**로 �
   조정까지 통과해야 진짜 일치로 봅니다. 선택 옵션인 **Fast sweep**(행 수가 다른 테이블만 깊게 검사)을
   켜면, 건너뛴 테이블은 전체 일치가 아니라 *행 수로만 검증됨*으로 표시되며 — 리포트에서 **그
   테이블들만 깊게 재검사**할 수 있습니다(전체 재실행 불필요).
-- **일부 컬럼 타입은 설계상 체크섬에서 제외**됩니다. 값은 같은데 텍스트 표현이 엔진 간에 정당하게
-  다르기 때문입니다: 부동소수점(`FLOAT`/`DOUBLE`)과 `JSON`(MySQL은 공백 있는 정규형, CDC로 쓰인 행은
-  compact 직렬화). 행 수와 그 외 모든 컬럼은 계속 검증되며, PK 조정도 영향받지 않습니다.
+- **일부 컬럼 타입은 설계상 체크섬에서 제외**됩니다. 값은 같아도 엔진 간에 동일하게 해시할 안정적인
+  정확한 텍스트 형태가 없기 때문입니다: 부동소수점(MySQL `FLOAT`/`DOUBLE`; PostgreSQL `real`/`double
+  precision`)과 `json`(텍스트 형태가 정당하게 달라짐 — 예: 공백 있는 정규형 vs. CDC로 쓰인 행의 compact
+  직렬화). **PostgreSQL 소스에서는 `jsonb`가 체크섬에 포함**되며, 순수 `json`만 제외됩니다. 행 수와 그
+  외 모든 컬럼은 계속 검증되며, PK 조정도 영향받지 않습니다.
 
 **불일치를 고쳤다면 그 테이블만 다시 검사하세요.** 리포트의 실패 테이블마다 **Re-check** 액션(그리고
 *Re-check all N*)이 있어, 해당 테이블만 동일한 옵션으로 다시 비교하고 결과를 기존 리포트에 머지합니다 —
@@ -353,11 +394,13 @@ Validation(4단계)이 소스와 타깃을 **점점 더 엄격한 3단계**로 �
 
 **Q23. 마이그레이션 중 소스가 계속 바뀌면 검증이 틀리지 않나요?**
 
-아니요, 그 차이를 **원인별로 구분해** 알려 주므로 괜찮습니다. Validation은 현재 소스 위치를(**GTID**로,
-GTID를 못 켠 경우 binlog **file:position**으로) Full Load 시점에 기록해 둔 워터마크와 대조해,
-마이그레이션 중 소스가 얼마나 더 진행됐는지(**변경 누적, drift**)를 함께 보고합니다. 그래서 행 수 차이가 **마이그레이션 이후 새로 생긴 소스 변경 때문인지**,
-아니면 **실제 문제 때문인지**를 구분할 수 있습니다. 컷오버 직전 최종 확인을 깨끗하게 하려면, 소스 쓰기를
-멈추고 CDC가 남은 변경을 모두 반영할 때까지 기다린 뒤 검증하세요(Q27).
+아니요, 그 차이를 **원인별로 구분해** 알려 주므로 괜찮습니다. Validation은 현재 소스 위치를 Full Load
+시점에 기록해 둔 워터마크와 대조해 **drift(변경 누적)**를 보고합니다 — MySQL 소스는 **GTID**(GTID를 못 켠
+경우 binlog **file:position**)로, PostgreSQL 소스는 현재 **WAL LSN**을 Full Load LSN 워터마크와 대조해서요.
+그래서 행 수 차이가 **마이그레이션 이후 새로 생긴 소스 변경 때문인지**, 아니면 **실제 문제 때문인지**를
+구분할 수 있습니다. (PostgreSQL 소스에서는 도구가 LSN 기반 drift 수치를 다시 계산하지는 않으니, 대신 CDC
+수렴을 지켜보세요.) 컷오버 직전 최종 확인을 깨끗하게 하려면, 소스 쓰기를 멈추고 CDC가 남은 변경을 모두
+반영할 때까지 기다린 뒤 검증하세요(Q27).
 
 
 **Q24. DSQL이 저장할 수 없는 행(예: 1 MiB 초과 값)은 어떻게 되나요?**
@@ -382,14 +425,15 @@ GTID를 못 켠 경우 binlog **file:position**으로) Full Load 시점에 기�
 **Q25. "문제가 생기면 조용히 넘어가지 않고 알린다(loud over silent)"는 게 실제로 무슨 뜻인가요?**
 
 값을 정확히 옮길 수 없을 때, 도구는 **그 사실을 숨긴 채 잘못된 값을 넣는 대신 눈에 띄게 실패**시킵니다.
-예를 들면:
+**MySQL 소스** 예:
 
 - `{0,1}` 범위를 벗어난 `TINYINT(1)` 값은 억지로 `true`로 바꾸지 않고, **그 테이블 적재를 멈추고 알립니다.**
 - 표현할 수 없는 범위 밖 `TIME` 값은 잘라서 넣지 않고 **실패로 처리합니다.**
-- 일부만 적재된 경우 성공한 척하지 않고 **`FAILED`로 명확히 보고합니다.**
 
-이렇게 알려 주므로, 원인이 된 소스 값을 고치거나 해당 컬럼을 제외한 뒤 다시 실행하면 됩니다. 잘못된
-데이터가 조용히 타깃에 들어가는 일은 없습니다.
+(**PostgreSQL** 소스의 Full Load는 순수 패스스루 — 양쪽 모두 psycopg 네이티브 — 라서 이런 값 변환이 거의
+없습니다.) 어느 쪽이든 일부만 적재된 경우 성공한 척하지 않고 **`FAILED`로 명확히 보고합니다.** 이렇게
+알려 주므로, 원인이 된 소스 값을 고치거나 해당 컬럼을 제외한 뒤 다시 실행하면 됩니다. 잘못된 데이터가
+조용히 타깃에 들어가는 일은 없습니다.
 
 ---
 
@@ -401,7 +445,7 @@ GTID를 못 켠 경우 binlog **file:position**으로) Full Load 시점에 기�
 
 - **Full Load만** 쓰면, 소스 쓰기를 멈춘 뒤 로드와 검증을 하는 동안이 다운타임입니다. 즉 **"쓰기 정지
   → 적재 → 검증"에 걸리는 시간만큼** 애플리케이션이 멈춥니다.
-- **Full Load + CDC**를 쓰면 다운타임이 훨씬 짧아집니다. CDC가 MySQL이 **계속 서비스되는 동안** 변경을
+- **Full Load + CDC**를 쓰면 다운타임이 훨씬 짧아집니다. CDC가 소스가 **계속 서비스되는 동안** 변경을
   실시간으로 DSQL에 따라붙게 해 주므로, 맨 마지막에 **남은 변경분이 다 반영되기를 기다리고 간단히 동작을
   확인하는 시간**만 멈추면 됩니다.
 
@@ -426,14 +470,14 @@ Full Load만 쓰는 경우를 포함한 전체 컷오버 절차는
 
 **Q28. 롤백할 수 있나요?**
 
-미리 계획해 두면 가능합니다. DSQL로 완전히 넘어가도 된다고 확정하기 전까지는, MySQL 소스를 **읽기 전용
+미리 계획해 두면 가능합니다. DSQL로 완전히 넘어가도 된다고 확정하기 전까지는, 소스를 **읽기 전용
 상태로 그대로 두고 절대 삭제하지 마세요.**
 
 - 애플리케이션을 **아직 DSQL로 바꾸기 전**이라면 롤백이 아주 간단합니다. 소스가 손대지 않은 채로
-  여전히 원본 데이터를 그대로 갖고 있으니, 그냥 MySQL을 계속 쓰면 됩니다.
+  여전히 원본 데이터를 그대로 갖고 있으니, 그냥 소스를 계속 쓰면 됩니다.
 - 애플리케이션이 **DSQL에 쓰기를 시작한 이후**라면 주의가 필요합니다. 그때 새로 생긴 데이터는
-  **DSQL에만** 있고 MySQL에는 없습니다(이 도구는 MySQL → DSQL 한 방향으로만 복제하며, **반대 방향은
-  복제하지 않습니다**). 따라서 이 시점에 롤백하려면 그 데이터를 직접 MySQL로 맞춰 넣어야 합니다.
+  **DSQL에만** 있고 소스에는 없습니다(이 도구는 소스 → DSQL 한 방향으로만 복제하며, **반대 방향은
+  복제하지 않습니다**). 따라서 이 시점에 롤백하려면 그 데이터를 직접 소스로 맞춰 넣어야 합니다.
 
 그러니 **"어느 시점까지를 롤백 가능 지점으로 볼지"를 컷오버 전에 미리 정해 두는 것**이 중요합니다.
 
@@ -442,8 +486,9 @@ Full Load만 쓰는 경우를 포함한 전체 컷오버 절차는
 
 필요한 접근 권한은 최소한이고, 데이터는 여러 겹으로 보호됩니다.
 
-- **접속**: 소스는 일반 **읽기 전용 MySQL 연결**, 타깃은 DSQL의 **IAM 토큰 인증**(DB 비밀번호 없음)을
-  사용하며, 모든 연결은 **TLS**로 암호화됩니다.
+- **접속**: 소스는 **MySQL 또는 PostgreSQL**에 대한 일반 **읽기 전용 연결**(비밀번호, 또는 AWS Secrets
+  Manager 사용자명/비밀번호 — **IAM은 아님**; IAM 토큰 인증은 타깃 DSQL 전용), 타깃은 DSQL의 **IAM 토큰
+  인증**(DB 비밀번호 없음)을 사용하며, 모든 연결은 **TLS**로 암호화됩니다.
 - **자격증명**: 세션이 유지되는 동안 **메모리에만** 존재하고, 디스크·로그·리포트·작업 기록 어디에도
   저장되지 않습니다. 그래서 재시작하면 접속 정보를 다시 입력해야 합니다.
 - **데이터 값 노출 방지**: 로그와 리포트에는 기본 키와 건수만 남고, **실제 행 값은 절대 기록하지
@@ -454,7 +499,7 @@ Full Load만 쓰는 경우를 포함한 전체 컷오버 절차는
 필요한 AWS 권한 자체는 실행 방식(로컬/Fargate)과 무관하게 같지만, **그 권한이 어디에 붙느냐**가 다릅니다:
 
 - **필수 권한(공통)**: DSQL IAM 토큰 발급을 위한 `dsql:DbConnect` / `dsql:DbConnectAdmin`(해당 클러스터로
-  스코핑), 소스는 읽기 전용 MySQL 접근. 선택적으로 소스 자격증명을 Secrets Manager에서 재사용할 때
+  스코핑), 소스는 읽기 전용 접근(MySQL 또는 PostgreSQL). 선택적으로 소스 자격증명을 Secrets Manager에서 재사용할 때
   `secretsmanager:GetSecretValue`, AI 보조를 켤 때 `bedrock:InvokeModel`.
 - **로컬 실행** — 표준 자격증명 체인(`~/.aws`, 환경 변수, `AWS_PROFILE`, SSO)으로 **실행하는 사용자 본인의
   IAM 신원**을 그대로 씁니다. 즉, 위 권한을 **사용자 신원이 직접** 갖고 있어야 합니다. 특히 CDC까지 쓰려면
@@ -472,7 +517,7 @@ Full Load만 쓰는 경우를 포함한 전체 컷오버 절차는
 | 대상 | IAM 액션 (최소) |
 |---|---|
 | **타깃 DSQL (항상)** | `dsql:DbConnect`, `dsql:DbConnectAdmin`(IAM 토큰 발급), `dsql:GetCluster` |
-| **소스 MySQL (항상)** | IAM 액션 없음 — 읽기 전용 MySQL 사용자/비밀번호(또는 아래 시크릿) |
+| **소스 (항상)** | IAM 액션 없음 — 읽기 전용 MySQL 또는 PostgreSQL 사용자/비밀번호(또는 아래 Secrets Manager 시크릿) |
 | **소스 시크릿 (선택)** | `secretsmanager:GetSecretValue` — 소스 자격증명이 Secrets Manager 시크릿에 있을 때만 |
 | **AI 어시스트 (선택)** | `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream` — 선택 모델로 스코핑; AI 켤 때만 |
 | **CDC — 파이프라인 배포/철거** | cdc-stack이 요구하는 넓은 인프라 생성 권한: `cloudformation:CreateStack`/`UpdateStack`/`DeleteStack`/`Describe*`/`GetTemplate`; 광범위한 `ec2:*`(VPC 서브넷·NAT·EIP·라우트 테이블·보안 그룹·VPC 엔드포인트·네트워크 인터페이스); `iam:CreateRole`/`AttachRolePolicy`/`PassRole`/…(커넥터 역할); `kafka:*` / `kafkaconnect:*`(MSK Serverless + MSK Connect); `logs:*`; 플러그인 버킷에 대한 `s3:*`. Full Load만 하는 경우 **전혀 필요 없음**. |

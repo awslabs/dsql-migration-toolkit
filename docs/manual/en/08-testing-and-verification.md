@@ -5,19 +5,25 @@ _Language: **English** | [한국어](../ko/08-testing-and-verification.md) | [�
 > **Prev:** [7. Performance and tuning](07-performance-and-tuning.md)
 
 This chapter is organized around a single idea: **each Aurora DSQL characteristic
-forces a specific migration scenario that must be tested.** A MySQL→MySQL
-migration never has to prove these — they exist precisely because DSQL is a
-different engine (PostgreSQL-wire, distributed, serverless, IAM-auth, optimistic
-concurrency). For each DSQL trait below, we list the scenario it forces and how
-the tool exercises it.
+forces a specific migration scenario that must be tested.** A like-for-like
+migration (MySQL→MySQL or PostgreSQL→PostgreSQL) never has to prove these — they
+exist precisely because DSQL is a different engine (PostgreSQL-wire, distributed,
+serverless, IAM-auth, optimistic concurrency). A PostgreSQL→DSQL migration is
+near-homogeneous on the *type* surface (both are PostgreSQL-16 wire), so the
+type-heterogeneity scenario in particular does not apply to a PostgreSQL source —
+but the distributed, serverless, IAM-auth, and OCC scenarios still do. For each
+DSQL trait below, we list the scenario it forces and how the tool exercises it.
 
 > Two test layers back every scenario: an **offline suite** (~3,100 Python + 72
 > Java tests; no AWS — seams injected) that proves the behavior deterministically,
-> and a **live end-to-end run** (real RDS MySQL + Aurora DSQL + MSK) that proves it
-> on real infrastructure with deliberately failing rows (summarized in §8.2). A
-> small `integration`-marked tier (`tests/test_integration_e2e.py`) also exercises a
-> local MySQL + a PostgreSQL-16 container, but only under `RUN_INTEGRATION_TESTS=1`;
-> it self-skips otherwise, so the default `pytest` run stays fully offline.
+> and a **live end-to-end run** on real infrastructure with deliberately failing
+> rows (summarized in §8.2). Both source engines were validated end to end this
+> way — a MySQL source (RDS MySQL + Aurora DSQL + MSK) and a PostgreSQL source
+> (RDS/Aurora PostgreSQL → MSK → DSQL), each across Schema Conversion + Full Load +
+> CDC + cut over. A small `integration`-marked tier (`tests/test_integration_e2e.py`)
+> also exercises a local MySQL + a PostgreSQL-16 container, but only under
+> `RUN_INTEGRATION_TESTS=1`; it self-skips otherwise, so the default `pytest` run
+> stays fully offline.
 
 ---
 
@@ -50,7 +56,7 @@ transaction must **re-run**, and under contention this happens often.
 
 | DSQL characteristic | Scenario tested | How it's exercised |
 |---|---|---|
-| Value > 1 MiB | A LOB/TEXT value over the limit during Full Load **and** during CDC | Per-row **quarantine** (PK + reason recorded, table keeps loading) at Full Load; **DLQ** at the sink, measured before the write (`DsqlSinkTask` oversized guard) |
+| Value > 1 MiB | A large value (MySQL LOB/TEXT, or PostgreSQL `text`/`bytea`/`json`) over the limit during Full Load **and** during CDC | Per-row **quarantine** (PK + reason recorded, table keeps loading) at Full Load; **DLQ** at the sink, measured before the write (`DsqlSinkTask` oversized guard) |
 | Value > 8 MiB (can't traverse Kafka) | An even larger column | Excluded **at capture** via Debezium `column.exclude.list`, driven by the Evaluation `OVERSIZED_LOB` flag |
 
 ### IAM-token auth — no password, 15-min tokens, 60-min connections
@@ -74,22 +80,22 @@ stored procedures, and several types.
 |---|---|---|
 | Foreign keys enforced | An FK-laden source | Each source FK is preserved and re-created as a post-load `ALTER TABLE … ADD CONSTRAINT` (deferred to cut over for a CDC migration), gated by an orphan pre-check; Validation's **orphan check** is that pre-apply gate (and the safety net when FKs are stripped) (`test_orphan_records_are_detected_and_fail_the_match`) |
 | Primary key required | A table with **no** PK; a **composite** PK | No-PK is blocked up front (`UNSUPPORTED`) and keyset export refuses it; composite PK loads via an explicit lexicographic-disjunction keyset predicate (`(k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR …`) — deliberately **not** the row-value tuple form, which isn't PK-index-friendly on MySQL 5.7+ (`test_exporter.py`, scenario doc) |
-| Unsupported types/objects | `DECIMAL` precision > 38, > 255 columns, triggers/routines | Flagged `UNSUPPORTED` in Evaluation with a reason (`test_converter.py`, assessor tests) |
-| TINYINT(1) → boolean, out of range | A `TINYINT(1)` holding `2` | A **loud, table-fatal** error — refuses to flatten `2` to `true` (no silent corruption) |
-| Type heterogeneity (MySQL → PG dialect) | Max type-diversity schema | Full Load (Python) and CDC sink (Java) must encode each type to the **identical** stored form — enforced by a shared **write-contract** parity test (`test_dsql_write_contract.py`) |
+| Unsupported types/objects | **MySQL:** `DECIMAL` precision > 38, > 255 columns, triggers/routines. **PostgreSQL:** unsupported column types — arrays, geometric (point/line/box/…), network (inet/cidr/macaddr), xml, money, bit/bit varying, tsvector/tsquery, range/multirange, enum, composite, pgvector | Flagged `UNSUPPORTED` in Evaluation with a reason and **never auto-substituted** (`test_converter.py`, assessor tests). Behavioral difference: a PG `numeric(p,s)` with p > 38 is **clamped** with a warning (not rejected like MySQL `DECIMAL` > 38), and a bare `numeric`/`decimal` defaults to `numeric(18,6)` |
+| TINYINT(1) → boolean, out of range (MySQL source only) | A `TINYINT(1)` holding `2` | A **loud, table-fatal** error — refuses to flatten `2` to `true` (no silent corruption). A PostgreSQL source has a native `boolean` that passes through unchanged, so it has no analogous flattening risk |
+| Type heterogeneity (MySQL → PG dialect; PostgreSQL source is near-identity pass-through) | Max type-diversity schema | Full Load (Python) and CDC sink (Java) must encode each value to the **identical** stored form — enforced by a shared **write-contract** parity test (`test_dsql_write_contract.py`). For a MySQL source this includes the MySQL→PostgreSQL dialect translation; for a PostgreSQL source there is no translation (both source and DSQL target are PostgreSQL-16 wire), so both loaders pass the value through verbatim — but the parity requirement still holds for both engines |
 
 ### Gapless Full Load → CDC handoff — the hardest correctness property
 
 | DSQL characteristic | Scenario tested | How it's exercised |
 |---|---|---|
-| Bulk load then resume streaming with no gap / no duplicate | Load a snapshot, run a live INSERT/UPDATE/DELETE workload, start CDC from the watermark, converge | Offset seeded to the watermark + `snapshot.mode=recovery`; idempotent PK-keyed apply means overlap can't duplicate (`test_cdc_pipeline.py`, `test_cdc_offset_seed.py`, `test_offset_seeder_lambda.py`) |
+| Bulk load then resume streaming with no gap / no duplicate | Load a snapshot, run a live INSERT/UPDATE/DELETE workload, start CDC from the watermark, converge | **MySQL:** the binlog `file:position` (or GTID) watermark is seeded into Kafka `connect-offsets` by the in-VPC offset-seeder Lambda, and Debezium resumes with `snapshot.mode=recovery`. **PostgreSQL:** the WAL LSN watermark is pinned by a pre-created `pgoutput` logical replication slot (plus a publication for exactly the migrated tables) and Debezium resumes from the slot with `snapshot.mode=never` — no offset-seeder Lambda / `connect-offsets` seed (`seed_mode='external'`). Either way, idempotent PK-keyed apply means overlap can't duplicate (`test_cdc_pipeline.py`, `test_cdc_offset_seed.py`, `test_offset_seeder_lambda.py`; PG slot/publication: `test_cdc_pg_slot.py`, `test_cdc_postgres.py`) |
 | CDC replicates data, not DDL | A source schema change mid-CDC | A row that no longer matches the target shape goes to the **DLQ**, not lost (`test_cdc_dlq.py`) |
 
 ### Live source keeps changing — drift must be attributed correctly
 
 | DSQL characteristic | Scenario tested | How it's exercised |
 |---|---|---|
-| Source advances during/after migration | Validate while the source GTID has moved past the watermark | Drift is detected and reported via watermark GTID, so a count delta is attributed to **new source activity**, not a bug (`test_drift_since_snapshot_is_reported`, `test_no_drift_when_gtid_unchanged`) |
+| Source advances during/after migration | Validate while the source position (MySQL binlog/GTID, or PostgreSQL WAL LSN) has moved past the watermark | A count delta after the snapshot is attributed to **new source activity**, not a bug. **MySQL:** drift is detected and reported via the binlog/GTID position on the watermark (`test_drift_since_snapshot_is_reported`, `test_no_drift_when_gtid_unchanged`). **PostgreSQL:** the watermark records a WAL LSN (`Watermark.wal_lsn`), but Validation does not recompute LSN-based drift (reports `drifted = could not be determined`) — watch CDC convergence instead |
 | Equal counts but different data | Rows match in number but differ in value | **Checksum** catches it; a count-only "match" is never trusted (`test_deliberate_data_mismatch_with_equal_counts_is_not_a_match`) |
 
 ### Resumability — interruptions must not lose or duplicate work
@@ -133,9 +139,9 @@ the Connect form from.
 
 ## 8.2 Putting the scenarios together — the live end-to-end run
 
-The scenarios above were also exercised **together, on real AWS** (RDS MySQL +
-Aurora DSQL + MSK), using a purpose-built schema designed to hit as many DSQL
-characteristics as possible in one run:
+The scenarios above were also exercised **together, on real AWS** — for a **MySQL
+source** (RDS MySQL + Aurora DSQL + MSK), using a purpose-built schema designed to
+hit as many DSQL characteristics as possible in one run:
 
 - A parent → child / lob foreign-key chain (forces the **FK-preservation** + **PK** +
   **orphan-check** scenarios).
@@ -146,6 +152,14 @@ characteristics as possible in one run:
 - **Deliberately failing rows**: ~1.5 MiB LOB values (forces the **1 MiB
   quarantine/DLQ** scenario) and a `TINYINT(1)` = `2` in an isolated table (forces
   the **loud table-fatal** scenario).
+
+> **PostgreSQL source.** The same end-to-end path was validated separately on live
+> infrastructure with a PostgreSQL source (RDS/Aurora PostgreSQL → MSK → Aurora
+> DSQL) — Schema Conversion + Full Load + CDC + cut over, including foreign-key
+> preservation. Because a PostgreSQL source is a near-identity PG-16→DSQL
+> pass-through, the type-heterogeneity and `TINYINT(1)`-flattening scenarios above
+> don't apply to it, but the distributed, serverless, IAM-auth, OCC, and gapless
+> Full Load → CDC handoff scenarios all do.
 
 The run executed the **gapless handoff** scenario for real — Full Load → live
 workload → CDC from the watermark → converge → authoritative per-PK reconciliation.

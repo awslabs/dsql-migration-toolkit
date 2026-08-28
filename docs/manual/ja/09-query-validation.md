@@ -18,7 +18,8 @@ Aurora DSQL に変換し、ターゲットで読み取り専用でテストし�
 ## 9.1 クエリを変換する
 
 MySQL 文を貼り付けると、スキーマ変換と同じ決定論優先（deterministic-first）エンジン
-（`sqlglot`）を使って Aurora DSQL（PostgreSQL）へ変換し、次のように分類します。
+（`sqlglot`）を使って MySQL のイディオムを Aurora DSQL（PostgreSQL）へ変換し、次のように
+分類します。Convert ステップは入力を **MySQL** としてパースするため、MySQL ソース専用です。
 
 - **AUTO** — 決定論的に変換完了。すぐにテストできます。
 - **MANUAL** — 変換はされましたが、確認が必要です（DSQL で注意点のあるイディオム）。
@@ -27,8 +28,17 @@ MySQL 文を貼り付けると、スキーマ変換と同じ決定論優先（de
 `ON DUPLICATE KEY UPDATE` → `INSERT ... ON CONFLICT DO UPDATE`(MANUAL — 競合ターゲットは自分で確認)、
 `JSON_UNQUOTE(JSON_EXTRACT(...))` → `JSON_EXTRACT_PATH_TEXT`、MySQL の `HAVING` エイリアス参照のインライン化、
 そして `SELECT ... FOR UPDATE`（DSQL の楽観的並行性制御のもとで異なる動作）。これらの指摘はすべて **MANUAL**
-に分類されます。アプリケーションコード全体のアンチパターンスキャン（`AUTO_INCREMENT`/トリガー依存、
-未対応関数）は [第 2 章](02-evaluation-and-schema-conversion.md) を参照してください。
+に分類されます。アプリケーションコード全体のアンチパターンスキャン（単調増加キー — `AUTO_INCREMENT`、
+serial / `IDENTITY` — / トリガー依存、未対応関数）は
+[第 2 章](02-evaluation-and-schema-conversion.md) を参照してください。
+
+> **PostgreSQL ソース。** Convert は **MySQL** のイディオムをトランスパイルするため、上記の書き換え
+> (`ON DUPLICATE KEY UPDATE`、`JSON_UNQUOTE`/`JSON_EXTRACT`、MySQL の `HAVING` エイリアスのインライン化) は
+> PostgreSQL ソースには当てはまりません — PostgreSQL ソースではアプリケーション SQL が既に PostgreSQL であり、
+> Aurora DSQL でほぼそのまま（PG → DSQL はほぼ同一の方言で）実行されるため、ほとんどのクエリが既に有効な
+> DSQL です。エンジン中立な **Test on target** と **AI DBA** へそのまま進んでください。楽観的並行性制御の
+> もとで `SELECT ... FOR UPDATE` が異なる動作をするといった DSQL 実行モデルの注意点は、PostgreSQL ソースの
+> クエリにも引き続き当てはまります。
 
 元の SQL と変換後の SQL を並べて表示するため、何が変わったのかを正確に確認できます。
 
@@ -52,9 +62,12 @@ MySQL 文を貼り付けると、スキーマ変換と同じ決定論優先（de
 付き）、取得したクエリプラン、そして ANALYZE の場合は DPU コストが表示されます。
 
 **どのスキーマでテストされるか。** スキーマ修飾のないテーブル名（`FROM orders`）はセッションの
-`search_path` でスキーマに解決されます。ツールは接続元ソース DB と同名のスキーマを既定にし、
-**Test against schema** ピッカーで切り替えられます。`relation "…" does not exist`（SQLSTATE **42P01**）は、
-そのテーブルがテスト対象スキーマに無いことを意味するだけです — 正しいスキーマを選んで再テストしてください。
+`search_path` でスキーマに解決されます。**MySQL** ソースでは — データベースがすなわちスキーマであるため —
+ツールは接続先データベースと同名の DSQL スキーマを自然な既定として使います。**PostgreSQL** ソースでは
+1 つのデータベースが複数のスキーマを保持し、テーブルはスキーマ修飾されるため（例: `public.orders`）、
+同名データベースの既定は通常解決されません — **Test against schema** ピッカーで実際のターゲットスキーマ
+（例: `public`）を選んでください。`relation "…" does not exist`（SQLSTATE **42P01**）は、そのテーブルが
+テスト対象スキーマに無いことを意味するだけです — 正しいスキーマを選んで再テストしてください。
 
 > **DSQL プランの読み方:** Aurora DSQL は*分散型*の PostgreSQL 互換エンジンであるため、
 > プランの読み方が少し異なります — §9.4 を参照してください。
@@ -133,8 +146,8 @@ AI DBA が提案する DSQL に適した一般的な書き換え: `SELECT *` の
 結合をまたいで推論できない**冗長な結合述語（redundant join predicate）**を追加する。
 `ORDER BY … LIMIT` には **CTE の遅延マテリアライゼーション（late materialization）**を使う。
 インデックスをカバリングにするために `INCLUDE` 列を追加する。そして、ホットパーティションを
-生み出す単調増加キー（`AUTO_INCREMENT`、タイムスタンプ）よりも、ランダムに分布するキー
-（UUID）を優先する。
+生み出す単調増加キー（auto-increment、serial / `IDENTITY` / シーケンスの `nextval`、タイムスタンプ）
+よりも、ランダムに分布するキー（UUID）を優先する。
 
 ---
 

@@ -4,8 +4,8 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
 
 > **이전:** [0. 시작하기 전에](00-before-you-begin.md)
 
-이 장은 "Aurora MySQL 데이터베이스가 있다"에서 "도구가 브라우저에 열려 있고 소스와 Aurora DSQL
-타깃 모두에 연결됐다"까지를 안내합니다.
+이 장은 "Amazon RDS 또는 Aurora 데이터베이스(MySQL 또는 PostgreSQL)가 있다"에서 "도구가
+브라우저에 열려 있고 소스와 Aurora DSQL 타깃 모두에 연결됐다"까지를 안내합니다.
 
 > **이미 AWS에 배포했다면?** [`deploy/DEPLOYMENT.ko.md`](../../../deploy/DEPLOYMENT.ko.md)를
 > 따라 UI가 이미 `AppUrl`에서 열려 있다면, [§1.5 연결](#15-소스와-타깃-연결)로 바로 넘어가세요.
@@ -28,12 +28,21 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
 
 **데이터베이스**
 
-- 네트워크로 접근 가능한 소스 **Amazon RDS 또는 Aurora MySQL**. 스키마와 데이터를 읽을 수 있는
-  사용자면 됩니다(읽기 전용으로 충분합니다 — 도구는 소스에 절대 쓰지 않습니다).
-  - **지원 소스 엔진 및 버전**(Full Load + CDC + 체크섬 검증까지 end-to-end 검증됨):
-    **RDS for MySQL** 5.7 / 8.0 / 8.4, **Aurora MySQL** 5.7(v2) / 8.0(v3) / 8.4.
-    MySQL 5.7은 표준 지원이 종료됐지만(RDS/Aurora Extended Support 적용될 수 있음), 도구는
-    마이그레이션 소스로 5.7을 완전히 지원합니다.
+- 네트워크로 접근 가능한 소스 데이터베이스 — **Amazon RDS 또는 Aurora MySQL**, 혹은 **Amazon
+  RDS 또는 Aurora PostgreSQL**. 스키마와 데이터를 읽을 수 있는 사용자면 됩니다. Evaluation,
+  Schema Conversion, Full Load, Validation에는 읽기 전용으로 충분하며, MySQL 소스(그리고 Full
+  Load만 하는 PostgreSQL 마이그레이션)에는 절대 쓰지 않습니다. 유일한 예외는 **PostgreSQL CDC**
+  입니다. Full Load 일관성 지점에서 도구가 마이그레이션 대상 테이블에 정확히 한정된 논리 복제
+  슬롯과 publication을 생성하고(AUTOCOMMIT, 소규모 허용 목록으로 제한, 감사 기록), 정리(teardown)
+  시 삭제합니다. 이것이 도구가 어떤 소스에든 하는 유일한 쓰기입니다.
+  - **지원 소스 엔진 및 버전** — 두 소스 경로(Schema Conversion + Full Load + CDC + cut over)
+    모두 실제 인프라에서 end-to-end로 검증됨:
+    - **RDS for MySQL** 5.7 / 8.0 / 8.4, **Aurora MySQL** 5.7(v2) / 8.0(v3) / 8.4.
+      MySQL 5.7은 표준 지원이 종료됐지만(RDS/Aurora Extended Support 적용될 수 있음), 도구는
+      마이그레이션 소스로 5.7을 완전히 지원합니다.
+    - **RDS for PostgreSQL / Aurora PostgreSQL**, PG **13–16**(end-to-end 테스트됨). 도구에는
+      엄격한 버전 게이트가 없습니다 — 서버 버전은 표시용으로만 읽으며 어떤 메이저 버전도 거부하지
+      않습니다. PG 13–16이 검증된 범위입니다.
 - 도구를 실행할 리전과 **동일한 리전**의 타깃 **Amazon Aurora DSQL** 클러스터. (DSQL은 IAM 토큰
   인증을 쓰므로 관리할 비밀번호가 없습니다.)
 
@@ -48,22 +57,26 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
 
 **AWS 배포 시** — 전체는 [`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.md) 참조. 요약은 §1.3.
 
-> **Aurora MySQL 사용자 참고:** 설정 파일에 복사해 넣을 DSQL "엔드포인트 + 비밀번호"는 없습니다.
+> **DSQL 타깃 참고:** 설정 파일에 복사해 넣을 DSQL "엔드포인트 + 비밀번호"는 없습니다.
 > 도구에 DSQL **클러스터 엔드포인트**와 AWS 신원을 주면, 도구가 연결마다 단기 IAM 토큰을 발급합니다.
 > 실행에 사용하는 신원이 해당 DSQL 클러스터에 연결할 권한이 있는지 확인하세요.
 
 **CDC(선택적 스트리밍 파이프라인) 사용 시** — 거의 무중단 전환을 위해 CDC를 쓸 때만 해당합니다.
-**Full Load만** 하는 마이그레이션은 이 중 아무것도 필요 없습니다. 아래는 Debezium이 바이너리 로그를
-읽을 수 있게 하는 소스 측 요구사항입니다. 도구의 사전 점검 게이트가 CDC 시작 전에 각 항목을 검사해
-무엇이 빠졌는지 정확히 알려 주지만, 설정 자체는 한 번 해 두는 소스 측 작업입니다.
+**Full Load만** 하는 마이그레이션은 이 중 아무것도 필요 없습니다. 아래는 CDC가 소스의 변경
+스트림 — **MySQL 바이너리 로그**, 또는 PostgreSQL 소스라면 복제 슬롯 + publication을 통한
+**논리 디코딩 WAL** — 을 읽을 수 있게 하는 소스 측 요구사항입니다. 도구의 사전 점검 게이트가 CDC
+시작 전에 각 항목을 검사해 무엇이 빠졌는지 정확히 알려 주지만, 설정 자체는 한 번 해 두는 소스 측
+작업입니다.
 
-> **관리형 RDS/Aurora는 community MySQL과 설정 방법이 다릅니다.** 직접 운영하는(community) MySQL
-> 서버라면 `my.cnf`를 편집하고 `SET GLOBAL`을 실행하지만, **Amazon RDS / Aurora MySQL에서는 둘 다
-> 불가능합니다** — 서버 변수는 **파라미터 그룹**으로 설정하고, binlog 보존 같은 운영 설정은 **RDS 저장
-> 프로시저**(`mysql.rds_*`)로 바꿉니다. 아래 단계는 이 도구가 대상으로 하는 관리형(RDS/Aurora)
+> **관리형 RDS/Aurora는 직접 운영하는(community) 서버와 설정 방법이 다릅니다.** 직접 운영하는
+> MySQL이나 PostgreSQL 서버라면 `my.cnf` / `postgresql.conf`를 편집하고 `SET GLOBAL`을 실행하지만,
+> **Amazon RDS / Aurora에서는 둘 다 불가능합니다** — 서버 변수는 **파라미터 그룹**으로 설정하고
+> (MySQL: `binlog_format` 등, **PostgreSQL: `rds.logical_replication`**), binlog 보존 같은 MySQL
+> 운영 설정은 **RDS 저장 프로시저**(`mysql.rds_*`)로 바꿉니다. PostgreSQL의 활성화 파라미터는
+> **정적(static)이라 재부팅이 필요합니다.** 아래 단계는 이 도구가 대상으로 하는 관리형(RDS/Aurora)
 > 방식입니다.
 
-- **바이너리 로깅이 ROW 포맷·full row image로 켜져 있어야 합니다** — `log_bin=ON`,
+- **MySQL 소스 — 바이너리 로깅이 ROW 포맷·full row image로 켜져 있어야 합니다** — `log_bin=ON`,
   `binlog_format=ROW`, `binlog_row_image=FULL`. CDC의 **필수 요건**입니다(충족 안 되면 게이트가 CDC를
   실패 처리). 관리형 MySQL에서 설정하는 방법:
   - **RDS for MySQL:** `log_bin`을 **직접 켤 수 없고** `my.cnf`도 **편집할 수 없습니다.** 대신
@@ -76,13 +89,23 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
   - **Community / 직접 운영 MySQL(대조용):** 그쪽에서는 `log_bin`/`binlog_format`/`binlog_row_image`를
     `my.cnf`(또는 런타임 `SET GLOBAL`)에 설정하고 재시작하지만 — **RDS/Aurora에는 어느 것도
     해당하지 않습니다.**
-- **복제 권한을 가진 소스 사용자** — `SELECT`, `REPLICATION CLIENT`, `REPLICATION SLAVE`(그리고 초기
-  스냅샷 정리에 쓰이는 `RELOAD`, `LOCK TABLES`). admin 계정이 아니라 전용 최소 권한 CDC 사용자를
-  쓰세요.
-- **CDC가 따라잡기 전에 로그가 삭제되지 않도록 binlog 보존을 늘리세요.** RDS/Aurora는 기본적으로
-  바이너리 로그를 공격적으로 삭제합니다 — **Aurora MySQL은 24시간만 보존**하고, RDS for MySQL은 백업
-  보존 기간에 따릅니다. CDC는 Full Load 중 캡처한 **워터마크**부터 재개하므로, 그 위치의 binlog가
-  **CDC 시작 시점에 여전히 존재해야** 합니다 — 게다가 CDC 스택(MSK + MSK Connect) 배포에만
+- **PostgreSQL 소스 — 논리 디코딩이 켜져 있어야 합니다** — **`wal_level=logical`**(**필수 요건**,
+  충족 안 되면 게이트가 CDC를 실패 처리). **RDS for PostgreSQL / Aurora PostgreSQL**에서는 커스텀
+  DB(클러스터) 파라미터 그룹에서 정적 파라미터 **`rds.logical_replication=1`**을 설정한 뒤
+  **재부팅**하세요(Aurora: 라이터를 재부팅). 직접 운영하는 PostgreSQL에서는 `postgresql.conf`에
+  `wal_level=logical`을 설정하고 재시작합니다. (PostgreSQL에는 `binlog_format`/`binlog_row_image`에
+  해당하는 것이 없습니다.)
+- **복제 권한을 가진 소스 사용자.** **MySQL:** `SELECT`, `REPLICATION CLIENT`, `REPLICATION SLAVE`
+  (그리고 초기 스냅샷 정리에 쓰이는 `RELOAD`, `LOCK TABLES`). **PostgreSQL:** CDC 사용자는 논리
+  복제 슬롯을 생성·읽을 수 있어야 합니다 — **superuser**이거나, **REPLICATION 역할 속성**
+  (`pg_roles.rolreplication`)을 갖거나, **`rds_replication`** 멤버(RDS/Aurora에서는 REPLICATION
+  속성을 직접 부여할 수 없음)이면 통과합니다. 스냅샷을 위해 마이그레이션 대상 테이블에 대한
+  **SELECT** 권한도 필요합니다. (이는 community의 `REPLICATION` 객체 권한이 아닙니다.) admin 계정이
+  아니라 전용 최소 권한 CDC 사용자를 쓰세요.
+- **MySQL 소스 — CDC가 따라잡기 전에 로그가 삭제되지 않도록 binlog 보존을 늘리세요.** RDS/Aurora는
+  기본적으로 바이너리 로그를 공격적으로 삭제합니다 — **Aurora MySQL은 24시간만 보존**하고, RDS for
+  MySQL은 백업 보존 기간에 따릅니다. CDC는 Full Load 중 캡처한 **워터마크**부터 재개하므로, 그 위치의
+  binlog가 **CDC 시작 시점에 여전히 존재해야** 합니다 — 게다가 CDC 스택(MSK + MSK Connect) 배포에만
   **약 15~20분**이 걸린 뒤에야 스트리밍이 시작됩니다. RDS 저장 프로시저로 넉넉한 창을 설정하세요(단위:
   시간, RDS for MySQL·Aurora MySQL 모두 동일):
 
@@ -94,9 +117,25 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
   기본값). Aurora MySQL 최댓값은 **2160**(90일)이며, 전환 후 다시 줄여도 됩니다. 이제 게이트가
   보존이 너무 짧거나(24시간 미만) 미설정이면 **경고(WARN, 비차단)** 로 알려주므로 binlog가 삭제되기
   전에 알아챌 수 있습니다 — 다만 Full Load가 얼마나 걸릴지는 사용자만 알기에 차단하지는 않습니다.
-- **GTID는 권장이지만 필수는 아닙니다.** `gtid_mode=ON`이면 소스 장애 조치(failover)나 복제본 승격
-  후에도 CDC 재개가 견고합니다. 없으면 도구가 binlog `file:position` 워터마크로 폴백하는데 — 동작은
-  하지만 장애 조치 상황에서는 덜 견고합니다. 게이트는 GTID 부재를 차단이 아니라 정보성으로 보고합니다.
+- **PostgreSQL 소스 — 바꿔야 할 binlog 보존 설정이 없습니다.** 대신 도구가 Full Load 일관성
+  지점에서 생성하는 **논리 복제 슬롯**이 해당 LSN부터 필요한 WAL을 **자동으로 고정(pin)**하므로 설정할
+  것이 없습니다. 슬롯이 시작 위치를 잡아두므로 약 15~20분의 CDC 스택 프로비저닝도 문제가 되지
+  않습니다. 대신 반대 방향의 위험이 있습니다: **비활성/미소비 슬롯이 계속 WAL을 고정해 소스 디스크를
+  가득 채울 수 있으므로** WAL/슬롯 상태를 모니터링하세요 — 도구가 `wal_status`를 노출하며,
+  `wal_status='lost'`는 슬롯이 무효화됐다는 뜻으로 → gapless 재개가 깨졌으니 → Full Load를 다시
+  실행해야 합니다.
+- **MySQL 소스 — GTID는 권장이지만 필수는 아닙니다.** `gtid_mode=ON`이면 소스 장애 조치(failover)나
+  복제본 승격 후에도 CDC 재개가 견고합니다. 없으면 도구가 binlog `file:position` 워터마크로 폴백하는데
+  — 동작은 하지만 장애 조치 상황에서는 덜 견고합니다. 게이트는 GTID 부재를 차단이 아니라 정보성으로
+  보고합니다. (PostgreSQL에는 GTID / `file:position` 개념이 없습니다.)
+- **PostgreSQL 소스 — CDC는 클러스터 라이터에서 실행해야 합니다.** 소스는 **스탠바이가 아니라
+  라이터**여야 합니다(`pg_is_in_recovery()`가 false여야 함) — 스탠바이는 복제 슬롯을 호스팅할 수
+  없으므로 CDC를 라이터 엔드포인트로 향하게 하세요.
+- **PostgreSQL 소스 — 복제되는 모든 테이블에 사용 가능한 REPLICA IDENTITY가 필요합니다.** 기본 키가
+  있으면 기본값으로 충분하며, 없으면 `ALTER TABLE … REPLICA IDENTITY FULL`을 설정하세요(FULL 또는
+  인덱스 아이덴티티도 동작). `REPLICA IDENTITY NOTHING`으로 남겨진 테이블은 publisher에서
+  UPDATE/DELETE가 오류나므로 거부됩니다. 복제 슬롯 / `max_wal_senders`(walsender) **여유**는 비차단
+  **경고(WARN)**로 검사됩니다(슬롯 항목이 남아 있어도 walsender 풀이 가득 차면 새 슬롯이 막힘).
 
 ---
 
@@ -208,7 +247,7 @@ VPC 내 프라이빗 데이터 경로(소스 → EC2 → DSQL)는 Fargate와 동
 
 | 항목 | 입력 내용 |
 |---|---|
-| **Source** | RDS/Aurora MySQL host, port(3306), user, password — **또는** 이를 담은 Secrets Manager 시크릿 ARN/이름. |
+| **Source** | **소스 엔진**(MySQL 또는 PostgreSQL)을 고른 뒤 host, port, user, password — **또는** 이를 담은 Secrets Manager 시크릿 ARN/이름 — 을 입력. 기본 포트는 엔진에 따릅니다(MySQL은 **3306**, PostgreSQL은 **5432**). PostgreSQL은 연결할 단일 **데이터베이스**도 지정합니다. 두 엔진 모두 인증은 password 또는 Secrets Manager입니다(IAM 토큰 인증은 타깃 DSQL 전용). |
 | **Target** | Aurora DSQL **클러스터 엔드포인트**, 리전, 데이터베이스(`postgres`로 고정, 읽기 전용 표시), 사용자명(기본 `admin`). **비밀번호 없음** — 도구가 IAM 토큰 생성. |
 
 각 연결을 **테스트**합니다. 도구는:

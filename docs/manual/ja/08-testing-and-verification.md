@@ -4,9 +4,9 @@ _言語: [English](../en/08-testing-and-verification.md) | [한국어](../ko/08-
 
 > **前へ:** [7. パフォーマンスとチューニング](07-performance-and-tuning.md)
 
-この章は一つの考え方に沿って構成されています。すなわち、**Aurora DSQL の各特性が、テストすべき特定のマイグレーションシナリオを不可避的に生み出す** という考え方です。MySQL→MySQL のマイグレーションでは、これらを証明する必要は決してありません。これらのシナリオが存在するのは、まさに DSQL が異なるエンジン(PostgreSQL ワイヤプロトコル、分散型、サーバーレス、IAM 認証、楽観的並行性制御)だからです。以下では DSQL の各特性について、それが生み出すシナリオと、ツールがそれをどのように検証するかを列挙します。
+この章は一つの考え方に沿って構成されています。すなわち、**Aurora DSQL の各特性が、テストすべき特定のマイグレーションシナリオを不可避的に生み出す** という考え方です。MySQL→MySQL や PostgreSQL→PostgreSQL のような同種のマイグレーションでは、これらを証明する必要は決してありません。これらのシナリオが存在するのは、まさに DSQL が異なるエンジン(PostgreSQL ワイヤプロトコル、分散型、サーバーレス、IAM 認証、楽観的並行性制御)だからです。PostgreSQL→DSQL のマイグレーションは *型* サーフェスの面ではほぼ同種(どちらも PostgreSQL-16 ワイヤ)なので、特に型の不均一性シナリオは PostgreSQL ソースには当てはまりません — ただし分散、サーバーレス、IAM 認証、OCC のシナリオは依然として当てはまります。以下では DSQL の各特性について、それが生み出すシナリオと、ツールがそれをどのように検証するかを列挙します。
 
-> すべてのシナリオは 2 つのテストレイヤーで裏付けられています。1 つは **オフラインスイート**(約 3,100 件の Python テスト + 72 件の Java テスト。AWS を使わず、シーム(seam)を注入)で、その動作を決定論的に証明します。もう 1 つは **ライブの end-to-end 実行**(実際の RDS MySQL + Aurora DSQL + MSK)で、意図的に失敗させる行を含めて実インフラ上でそれを証明します(§8.2 に要約)。小規模な `integration` マーカー付き
+> すべてのシナリオは 2 つのテストレイヤーで裏付けられています。1 つは **オフラインスイート**(約 3,100 件の Python テスト + 72 件の Java テスト。AWS を使わず、シーム(seam)を注入)で、その動作を決定論的に証明します。もう 1 つは **ライブの end-to-end 実行** で、意図的に失敗させる行を含めて実インフラ上でそれを証明します(§8.2 に要約)。両方のソースエンジンをこの方法で end-to-end に検証しました — MySQL ソース(RDS MySQL + Aurora DSQL + MSK)と PostgreSQL ソース(RDS/Aurora PostgreSQL → MSK → DSQL)を、それぞれ Schema Conversion + Full Load + CDC + カットオーバーにわたって。小規模な `integration` マーカー付き
 ティア(`tests/test_integration_e2e.py`)は、ローカル MySQL + PostgreSQL-16 コンテナも実行しますが、
 `RUN_INTEGRATION_TESTS=1` のときのみ実行され、そうでなければ自動的にスキップされるため、既定の `pytest`
 実行は完全にオフラインのままです。
@@ -39,7 +39,7 @@ DSQL は書き込み競合をコミット時に検出し、`SQLSTATE 40001` を�
 
 | DSQL 特性 | テストするシナリオ | どう検証するか |
 |---|---|---|
-| 1 MiB を超える値 | Full Load 中 **および** CDC 中に、上限を超える LOB/TEXT 値 | Full Load では行単位の **隔離**(quarantine)(PK と理由を記録し、テーブルの読み込みは継続)。シンクでは書き込み前に計測して **DLQ** へ(`DsqlSinkTask` のサイズ超過ガード) |
+| 1 MiB を超える値 | Full Load 中 **および** CDC 中に、上限を超える大きな値(MySQL の LOB/TEXT、または PostgreSQL の `text`/`bytea`/`json`) | Full Load では行単位の **隔離**(quarantine)(PK と理由を記録し、テーブルの読み込みは継続)。シンクでは書き込み前に計測して **DLQ** へ(`DsqlSinkTask` のサイズ超過ガード) |
 | 8 MiB を超える値(Kafka を通過できない) | さらに大きなカラム | Evaluation の `OVERSIZED_LOB` フラグに基づき、Debezium の `column.exclude.list` によって **キャプチャ時点で** 除外する |
 
 ### IAM トークン認証 — パスワードなし、15 分のトークン、60 分の接続
@@ -62,22 +62,22 @@ Aurora DSQL は外部キーを強制し、プライマリキーを必須とし�
 |---|---|---|
 | 外部キーは強制される | FK を多用したソース | 各ソースの FK は保持され、post-load の `ALTER TABLE … ADD CONSTRAINT` として再作成される(CDC マイグレーションではカットオーバーまで延期)。孤立の事前チェックでゲートされる。Validation の **孤立チェック** がその適用前ゲートであり(そして FK を取り除いた場合はセーフティネットになる)(`test_orphan_records_are_detected_and_fail_the_match`) |
 | プライマリキー必須 | PK が **ない** テーブル。**複合** PK | PK なしは前段でブロックされ(`UNSUPPORTED`)、keyset(キーセット)エクスポートはそれを拒否する。複合 PK は明示的な辞書式選言のキーセット述語(`(k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR …`)によってロードされる — これは意図的に行値タプル形式を **使わない**。行値タプル形式は MySQL 5.7 以降で PK インデックスを活用しにくいためである(`test_exporter.py`、シナリオドキュメント) |
-| 非対応の型/オブジェクト | 精度が 38 を超える `DECIMAL`、255 を超えるカラム、トリガー/ルーチン | Evaluation で理由付きで `UNSUPPORTED` としてフラグが立てられる(`test_converter.py`、アセッサのテスト) |
-| TINYINT(1) → boolean、範囲外 | `2` を保持する `TINYINT(1)` | **明示的でテーブル単位で致命的な** エラー。`2` を `true` に平坦化することを拒否する(静かな破損はしない) |
-| 型の不均一性(MySQL → PG 方言) | 型の多様性が最大となるスキーマ | Full Load(Python)と CDC シンク(Java)は各型を **同一の** 保存形式にエンコードしなければならない。共有の **書き込みコントラクト** の同等性テストによって強制される(`test_dsql_write_contract.py`) |
+| 非対応の型/オブジェクト | **MySQL:** 精度が 38 を超える `DECIMAL`、255 を超えるカラム、トリガー/ルーチン。**PostgreSQL:** 非対応のカラム型 — 配列、幾何型(point/line/box など)、ネットワーク型(inet/cidr/macaddr)、xml、money、bit/bit varying、tsvector/tsquery、range/multirange、enum、複合型、pgvector | Evaluation で理由付きで `UNSUPPORTED` としてフラグが立てられ、**自動的に代替されることはない**(`test_converter.py`、アセッサのテスト)。挙動の違い: PostgreSQL の `numeric(p,s)` で p > 38 の場合は(MySQL の `DECIMAL` > 38 のように拒否せず)警告付きで **クランプ** され、精度指定のない `numeric`/`decimal` は `numeric(18,6)` が既定になる |
+| TINYINT(1) → boolean、範囲外(MySQL ソースのみ) | `2` を保持する `TINYINT(1)` | **明示的でテーブル単位で致命的な** エラー。`2` を `true` に平坦化することを拒否する(静かな破損はしない)。PostgreSQL ソースにはネイティブの `boolean` 型があり、そのまま通過するため、これに類する平坦化のリスクはない |
+| 型の不均一性(MySQL → PG 方言。PostgreSQL ソースはほぼ恒等の通過) | 型の多様性が最大となるスキーマ | Full Load(Python)と CDC シンク(Java)は各値を **同一の** 保存形式にエンコードしなければならない。共有の **書き込みコントラクト** の同等性テストによって強制される(`test_dsql_write_contract.py`)。MySQL ソースではこれに MySQL→PostgreSQL の方言変換が含まれるが、PostgreSQL ソースでは変換がなく(ソースと DSQL ターゲットはどちらも PostgreSQL-16 ワイヤ)、両ローダーは値をそのまま通過させる — ただし同等性の要件は両エンジンで依然として成り立つ |
 
 ### ギャップのない Full Load → CDC の引き継ぎ — 最も難しい正しさの性質
 
 | DSQL 特性 | テストするシナリオ | どう検証するか |
 |---|---|---|
-| バルクロードした後、ギャップなし/重複なしでストリーミングを再開する | スナップショットをロードし、ライブの INSERT/UPDATE/DELETE ワークロードを実行し、ウォーターマーク(watermark)から CDC を開始し、収束させる | オフセットをウォーターマーク + `snapshot.mode=recovery` にシードする。PK をキーとした冪等な適用により、重複区間があっても重複は生じない(`test_cdc_pipeline.py`、`test_cdc_offset_seed.py`、`test_offset_seeder_lambda.py`) |
+| バルクロードした後、ギャップなし/重複なしでストリーミングを再開する | スナップショットをロードし、ライブの INSERT/UPDATE/DELETE ワークロードを実行し、ウォーターマーク(watermark)から CDC を開始し、収束させる | **MySQL:** binlog の `file:position`(または GTID)ウォーターマークを VPC 内のオフセットシーダー Lambda が Kafka の `connect-offsets` にシードし、Debezium は `snapshot.mode=recovery` で再開する。**PostgreSQL:** WAL LSN ウォーターマークを事前作成した `pgoutput` の論理レプリケーションスロット(およびマイグレーション対象テーブルだけを含む publication)が固定し、Debezium はスロットから `snapshot.mode=never` で再開する — オフセットシーダー Lambda や `connect-offsets` のシードはない(`seed_mode='external'`)。いずれの場合も、PK をキーとした冪等な適用により、重複区間があっても重複は生じない(`test_cdc_pipeline.py`、`test_cdc_offset_seed.py`、`test_offset_seeder_lambda.py`。PG のスロット/publication: `test_cdc_pg_slot.py`、`test_cdc_postgres.py`) |
 | CDC は DDL ではなくデータを複製する | CDC 中のソーススキーマ変更 | ターゲットの形状にもう一致しない行は失われずに **DLQ** へ送られる(`test_cdc_dlq.py`) |
 
 ### ライブソースは変わり続ける — ドリフトは正しく帰属させなければならない
 
 | DSQL 特性 | テストするシナリオ | どう検証するか |
 |---|---|---|
-| マイグレーション中/後にソースが進む | ソースの GTID がウォーターマークを越えて進んだ状態で検証する | ドリフトはウォーターマークの GTID を介して検出・報告されるため、件数の差分はバグではなく **新しいソースアクティビティ** に帰属される(`test_drift_since_snapshot_is_reported`、`test_no_drift_when_gtid_unchanged`) |
+| マイグレーション中/後にソースが進む | ソースの位置(MySQL の binlog/GTID、または PostgreSQL の WAL LSN)がウォーターマークを越えて進んだ状態で検証する | スナップショット後の件数の差分は、バグではなく **新しいソースアクティビティ** に帰属される。**MySQL:** ドリフトはウォーターマークの binlog/GTID 位置を介して検出・報告される(`test_drift_since_snapshot_is_reported`、`test_no_drift_when_gtid_unchanged`)。**PostgreSQL:** ウォーターマークは WAL LSN(`Watermark.wal_lsn`)を記録するが、Validation は LSN ベースのドリフトを再計算しない(`drifted = 判定不可` と報告)ため、代わりに CDC の収束を見守る |
 | 件数は等しいがデータが異なる | 行数は一致するが値が異なる | **チェックサム** がそれを捕捉する。件数のみの「一致」は決して信頼されない(`test_deliberate_data_mismatch_with_equal_counts_is_not_a_match`) |
 
 ### 再開可能性 — 中断が作業を失わせたり重複させたりしてはならない
@@ -109,11 +109,13 @@ RUN_E2E_CONNECTED=1 .venv/bin/python -m pytest -m e2e   # connected tier too
 
 ## 8.2 シナリオをまとめて実行する — ライブ end-to-end 実行
 
-上記のシナリオは、実際の AWS(RDS MySQL + Aurora DSQL + MSK)上で **まとめて** も検証しました。1 回の実行でできる限り多くの DSQL 特性を突くように設計された、専用のスキーマを用いています。
+上記のシナリオは、実際の AWS 上で **まとめて** も検証しました — **MySQL ソース**(RDS MySQL + Aurora DSQL + MSK)について、1 回の実行でできる限り多くの DSQL 特性を突くように設計された、専用のスキーマを用いています。
 
 - parent → child / lob の外部キーチェーン(**FK の保持** + **PK** + **孤立チェック** のシナリオを強制)。
 - 最大限の型の多様性 — あらゆる整数/unsigned のバリアント、精度が 38 を超えるものを含む `DECIMAL`、`FLOAT`/`DOUBLE`、`BIT`、collation、DATE/TIME ファミリー一式、`ENUM`/`SET`/`JSON`、そして LOB ファミリー一式(**型の不均一性** と **非対応型** のシナリオを強制)。
 - **意図的に失敗させる行**: 約 1.5 MiB の LOB 値(**1 MiB の隔離/DLQ** シナリオを強制)、および分離したテーブル内の `TINYINT(1)` = `2`(**明示的でテーブル単位で致命的な** シナリオを強制)。
+
+> **PostgreSQL ソース。** 同じ end-to-end 経路を、PostgreSQL ソース(RDS/Aurora PostgreSQL → MSK → Aurora DSQL)についても実インフラ上で別途検証しました — Schema Conversion + Full Load + CDC + カットオーバー(外部キーの保持を含む)。PostgreSQL ソースは PG-16→DSQL のほぼ恒等の通過であるため、上記の型の不均一性と `TINYINT(1)` の平坦化のシナリオは当てはまりませんが、分散、サーバーレス、IAM 認証、OCC、ギャップのない Full Load → CDC の引き継ぎのシナリオはすべて当てはまります。
 
 この実行では、**ギャップのない引き継ぎ** シナリオを実際に実行しました — Full Load → ライブワークロード → ウォーターマークからの CDC → 収束 → 権威ある PK ごとの突合。これこそが、実インフラでテストする価値のあるところです。初期の実行で、オフラインスイートでは捕捉できなかった本物の CDC データ損失バグ(ウォーターマークと CDC 開始の間で連続したブロックが失われ、DLQ にも残らない)が表面化しました。これは、静かに失敗していたオフセットシードと Debezium のスキーマ履歴のギャップにまで追跡され、**両方とも修正** されました。最終実行の目的は、その修正が有効であることを証明することでした。
 

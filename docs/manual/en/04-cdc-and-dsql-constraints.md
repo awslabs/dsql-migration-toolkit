@@ -17,20 +17,29 @@ cut-over where a short freeze is acceptable, Full Load alone is enough.
 ## 4.1 The pipeline
 
 <p align="center">
-  <img src="../../images/architecture-cdc-pipeline.png" alt="CDC pipeline: source MySQL binlog → Debezium source connector → Amazon MSK (per-table topics keyed by PK + DLQ) → custom DSQL sink connector → Aurora DSQL" width="900">
+  <img src="../../images/architecture-cdc-pipeline.png" alt="CDC pipeline: source change log (MySQL binlog / PostgreSQL WAL via a logical replication slot) → Debezium source connector → Amazon MSK (per-table topics keyed by PK + DLQ) → custom DSQL sink connector → Aurora DSQL" width="900">
 </p>
 
-- **Debezium MySQL source connector** reads the source's binary log (read-only)
-  and emits change events.
+- **The Debezium source connector (MySQL or PostgreSQL)** reads the source's
+  change log — the binary log for MySQL, or the write-ahead log (WAL) through a
+  logical replication slot for PostgreSQL — and emits change events. The source
+  stays read-only, with the one sanctioned exception that for a PostgreSQL source
+  the tool creates (and at teardown drops) its logical slot and a publication
+  scoped to exactly the migrated tables.
 - **Amazon MSK (Kafka)** is the durable backbone: **one topic per table**, keyed
   by primary key (so all changes for a row stay ordered on one partition), plus a
   dead-letter (DLQ) topic, a Debezium **schema-history** topic (what `recovery`
-  rebuilds), and a **heartbeat** topic that keeps the committed binlog offset
-  advancing during idle windows so a restart can still resume gaplessly.
+  rebuilds — **MySQL source only**; the PostgreSQL/pgoutput connector has no
+  schema-history topic), and a **heartbeat** topic that keeps the committed source
+  position advancing during idle windows — the binlog offset for MySQL, and for
+  PostgreSQL the slot's confirmed LSN (which also stops WAL accumulating) — so a
+  restart can still resume gaplessly.
 - **The custom DSQL sink connector** — a Java Kafka Connect plugin this project
   owns — applies the changes to DSQL. Both connectors run on **managed MSK
   Connect**; the tool runs **no sink compute of its own**, it is the control
-  plane (it builds the configs, seeds the start offset, and monitors).
+  plane (it builds the configs, establishes the resume point — for MySQL it seeds
+  the Kafka start offset, for PostgreSQL it creates the logical replication slot
+  and publication — and monitors).
 
 **Why a *custom* sink and not a stock JDBC sink?**
 
@@ -76,34 +85,60 @@ by hand (the tool never drops target data automatically).
 This is the bit designed to ensure **no missed changes and no duplicates** between
 the bulk load and the stream.
 
-1. Full Load captured a **watermark** (binlog position + GTID) at the snapshot
-   point ([Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)).
-2. When you start CDC, the tool **seeds the connector's start offset** to exactly
-   that watermark (an in-VPC Lambda writes the offset record before the source
-   connector starts). So Debezium begins streaming the **first change after the
-   snapshot** — not from "now," and not by re-reading the data.
-3. The source connector runs with **`snapshot.mode=recovery`**: because an offset
-   is already seeded, Debezium rebuilds its internal **schema history** from the
-   **current source tables** (so it can decode binlog events) **without re-reading
-   any row data**, then resumes from the seeded offset.
+1. Full Load captured a **watermark** at the snapshot point — for MySQL the binlog
+   file:position (plus GTID when available); for PostgreSQL the WAL LSN returned
+   when the logical replication slot is created, recorded together with the slot
+   and publication names
+   ([Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)).
+2. When you start CDC, the tool establishes the resume point at exactly that
+   watermark. **For a MySQL source** it **seeds the connector's start offset** (an
+   in-VPC Lambda writes the offset record before the source connector starts).
+   **For a PostgreSQL source** there is no offset-seeder Lambda; instead, at the
+   Full Load consistency point the tool creates the logical replication slot (and a
+   publication scoped to exactly the migrated tables), and the slot's returned
+   consistent WAL LSN *is* the watermark — CDC resumes directly from that
+   pre-created slot, so nothing is written to Kafka's connect-offsets. Either way
+   Debezium begins streaming the **first change after the snapshot** — not from
+   "now," and not by re-reading the data.
+3. **For a MySQL source**, the source connector runs with
+   **`snapshot.mode=recovery`**: because an offset is already seeded, Debezium
+   rebuilds its internal **schema history** from the **current source tables** (so
+   it can decode binlog events) **without re-reading any row data**, then resumes
+   from the seeded offset. **For a PostgreSQL source**, the Debezium pgoutput
+   connector has no schema-history topic: on the gapless path it runs with
+   **`snapshot.mode=never`** (the logical slot already holds the start LSN and the
+   rows are loaded), while a stand-alone / manual start uses **`initial`** (snapshot
+   then stream). Debezium PostgreSQL can only resume from the slot's own
+   position — it cannot seek an arbitrary WAL LSN.
 
 The result: every change between the snapshot and "now" is applied exactly once.
 Because the sink's applies are **idempotent** (keyed by PK), even an overlap or a
 retry can't create duplicates.
 
-> **The binlog at the watermark must still exist when CDC starts.** This handoff
-> only works if the source hasn't purged the binary log at the watermark position
-> yet. RDS/Aurora purge binlogs aggressively by default (Aurora MySQL keeps them
-> 24 h), and deploying the CDC stack takes ~15–20 min, so **raise binlog retention
-> before you start** — see [§1.1](01-setup.md#11-prerequisites). If the segment is
-> already gone, CDC can't resume gaplessly and you'd re-run Full Load to capture a
+> **MySQL: the binlog at the watermark must still exist when CDC starts.** This
+> handoff only works if the source hasn't purged the binary log at the watermark
+> position yet. RDS/Aurora purge binlogs aggressively by default (Aurora MySQL
+> keeps them 24 h), and deploying the CDC stack takes ~15–20 min, so **raise binlog
+> retention before you start** — see [§1.1](01-setup.md#11-prerequisites). If the
+> segment is already gone, CDC can't resume gaplessly and you'd re-run Full Load to
+> capture a fresh watermark.
+>
+> **PostgreSQL: the logical replication slot pins the WAL for you.** From the
+> moment the slot is created it holds the required WAL, so nothing is purged out
+> from under you — the prerequisite is `wal_level=logical` (RDS/Aurora
+> `rds.logical_replication`), not binlog retention. But the slot must stay healthy:
+> if it falls too far behind and Postgres reports `wal_status='lost'` (slot
+> invalidated), gapless resume is broken and you must re-run Full Load to capture a
 > fresh watermark.
 
-> **Why `recovery` and not a plain schema-only start?** With a seeded offset
-> present, Debezium takes its "resume" path and expects an existing schema-history
-> topic. `recovery` is the mode that rebuilds that history from the live database
-> without re-snapshotting rows — exactly the "I already loaded the data myself,
-> just resume from this offset" situation.
+> **Why `recovery` and not a plain schema-only start? (MySQL source)** With a
+> seeded offset present, Debezium takes its "resume" path and expects an existing
+> schema-history topic. `recovery` is the mode that rebuilds that history from the
+> live database without re-snapshotting rows — exactly the "I already loaded the
+> data myself, just resume from this offset" situation. **This does not apply to a
+> PostgreSQL source:** PG has no schema-history topic, so Debezium simply resumes
+> from the pre-created logical slot with `snapshot.mode=never` (or does an
+> `initial` snapshot for a stand-alone start).
 
 ---
 
@@ -194,7 +229,7 @@ never runs a `COUNT(*)` against your production database. The columns:
 | **Updates** | Cumulative CDC updates applied to this table since Full Load — a **non-negative** per-table running count reported live by the sink (scan-free). |
 | **Deletes** | Cumulative CDC deletes applied to this table since Full Load — a **non-negative** per-table running count reported live by the sink (scan-free). |
 | **Quarantined** | Per-table count of change events set aside to the **DLQ** — permanently-rejected rows (bad type, oversized > 1 MiB value, constraint / schema-drift), reported live by the sink. |
-| **Source rows (est.)** | Scan-free `information_schema` **estimate**. **Target rows** — exact DSQL count. |
+| **Source rows (est.)** | Scan-free catalog **estimate** (`information_schema.tables` for MySQL; `pg_class.reltuples` for PostgreSQL). **Target rows** — exact DSQL count. |
 | **Stream lag** | How far the target is behind the source **in time** (see below). |
 | **Consistency** | A colored badge: green *consistent* = counts match · *replicating…* = catching up · red *rows missing* = the newest change landed but rows went missing mid-stream · red *data quarantined* = the DLQ has un-applied events. |
 

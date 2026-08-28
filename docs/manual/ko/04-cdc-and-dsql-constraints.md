@@ -16,17 +16,23 @@ CDC가 필요한 경우는 **대규모 또는 지속적** 마이그레이션뿐�
 ## 4.1 파이프라인
 
 <p align="center">
-  <img src="../../images/architecture-cdc-pipeline.png" alt="CDC 파이프라인: 소스 MySQL binlog → Debezium 소스 커넥터 → Amazon MSK(PK로 키잉한 테이블별 토픽 + DLQ) → 커스텀 DSQL 싱크 커넥터 → Aurora DSQL" width="900">
+  <img src="../../images/architecture-cdc-pipeline.png" alt="CDC 파이프라인: 소스 변경 로그(MySQL binlog / PostgreSQL의 논리 복제 슬롯을 통한 WAL) → Debezium 소스 커넥터 → Amazon MSK(PK로 키잉한 테이블별 토픽 + DLQ) → 커스텀 DSQL 싱크 커넥터 → Aurora DSQL" width="900">
 </p>
 
-- **Debezium MySQL 소스 커넥터**가 소스 바이너리 로그를 읽기 전용으로 읽어 변경 이벤트를 냅니다.
+- **Debezium 소스 커넥터(MySQL 또는 PostgreSQL)**가 소스 변경 로그 — MySQL은 바이너리 로그,
+  PostgreSQL은 논리 복제 슬롯을 통한 WAL(write-ahead log) — 를 읽어 변경 이벤트를 냅니다. 소스는 읽기
+  전용으로 유지되며, 단 하나의 예외로 PostgreSQL 소스에서는 도구가 마이그레이션 대상 테이블에만 한정된
+  논리 슬롯과 publication을 생성(하고 해체 시 삭제)합니다.
 - **Amazon MSK**(Kafka)가 내구성 있는 백본 역할을 합니다. **테이블당 토픽 1개**, 기본 키로 키잉(한
   행의 모든 변경이 한 파티션에 순서대로 유지), 그리고 DLQ 토픽, Debezium **스키마 히스토리** 토픽
-  (`recovery`가 재구성하는 대상), 그리고 유휴 구간에도 커밋된 binlog offset을 전진시켜 재시작 시 무손실
-  재개를 가능케 하는 **하트비트** 토픽으로 구성됩니다.
+  (`recovery`가 재구성하는 대상 — **MySQL 소스 전용**이며, PostgreSQL/pgoutput 커넥터에는 스키마 히스토리
+  토픽이 없음), 그리고 유휴 구간에도 커밋된 소스 위치를 전진시켜 재시작 시 무손실 재개를 가능케 하는
+  **하트비트** 토픽 — MySQL은 binlog offset, PostgreSQL은 슬롯의 확정 LSN(이는 WAL 누적도 막아 줌) — 으로
+  구성됩니다.
 - **커스텀 DSQL 싱크 커넥터**(이 프로젝트가 소유한 Java Kafka Connect 플러그인)가 변경을 DSQL에
   적용합니다. 두 커넥터 모두 **관리형 MSK Connect**에서 실행되며, 도구는 **자체 싱크 컴퓨트를 돌리지
-  않고** 컨트롤 플레인 역할만 합니다(구성 작성, 시작 오프셋 시드, 모니터링).
+  않고** 컨트롤 플레인 역할만 합니다(구성 작성, 재개 지점 확립 — MySQL은 Kafka 시작 오프셋을 시드하고,
+  PostgreSQL은 논리 복제 슬롯과 publication을 생성 — 모니터링).
 
 **왜 표준 JDBC 싱크가 아니라 *커스텀* 싱크일까요?**
 
@@ -63,28 +69,44 @@ SQLSTATE로 드리프트를 **분류**(컬럼 추가/삭제/타입 변경)하고
 
 벌크 적재와 스트림 사이에 **누락된 변경도 중복도 없도록** 설계된 부분입니다.
 
-1. Full Load가 스냅샷 지점에서 **워터마크**(binlog 위치 + GTID)를 캡처했습니다
-   ([3장 §3.5](03-full-load.md#35-워터마크--cdc로의-다리)).
-2. CDC를 시작하면 도구가 커넥터의 **시작 오프셋을 정확히 그 워터마크로 시드**합니다(소스 커넥터가
-   시작하기 전에 in-VPC Lambda가 오프셋 레코드를 기록). 그래서 Debezium은 **스냅샷 이후 첫 변경**부터
-   스트리밍을 시작합니다 — "지금"부터가 아니며, 데이터를 다시 읽지도 않습니다.
-3. 소스 커넥터는 **`snapshot.mode=recovery`**로 실행됩니다: 오프셋이 이미 시드돼 있으므로 Debezium은
-   내부 **스키마 히스토리**를 **현재 소스 테이블**로부터 재구성한 뒤(binlog 이벤트를 디코딩하기 위해)
-   **행 데이터는 다시 읽지 않고** 시드된 오프셋부터 재개합니다.
+1. Full Load가 스냅샷 지점에서 **워터마크**를 캡처했습니다 — MySQL은 binlog file:position(가능하면 GTID
+   포함), PostgreSQL은 논리 복제 슬롯을 생성할 때 반환되는 WAL LSN이며, 슬롯 이름·publication 이름과 함께
+   기록됩니다 ([3장 §3.5](03-full-load.md#35-워터마크--cdc로의-다리)).
+2. CDC를 시작하면 도구가 바로 그 워터마크에 재개 지점을 확립합니다. **MySQL 소스**에서는 커넥터의
+   **시작 오프셋을 시드**합니다(소스 커넥터가 시작하기 전에 in-VPC Lambda가 오프셋 레코드를 기록).
+   **PostgreSQL 소스**에서는 오프셋 시더 Lambda가 없습니다. 대신 Full Load 정합성 지점에서 도구가 논리 복제
+   슬롯(과 마이그레이션 대상 테이블에만 한정된 publication)을 생성하며, 슬롯이 반환한 정합 WAL LSN이 곧
+   워터마크가 됩니다 — CDC는 그 미리 생성된 슬롯에서 바로 재개하므로 Kafka의 connect-offsets에는 아무것도
+   기록되지 않습니다. 어느 경우든 Debezium은 **스냅샷 이후 첫 변경**부터 스트리밍을 시작합니다 —
+   "지금"부터가 아니며, 데이터를 다시 읽지도 않습니다.
+3. **MySQL 소스**에서는 소스 커넥터가 **`snapshot.mode=recovery`**로 실행됩니다: 오프셋이 이미 시드돼
+   있으므로 Debezium은 내부 **스키마 히스토리**를 **현재 소스 테이블**로부터 재구성한 뒤(binlog 이벤트를
+   디코딩하기 위해) **행 데이터는 다시 읽지 않고** 시드된 오프셋부터 재개합니다. **PostgreSQL 소스**에서는
+   Debezium pgoutput 커넥터에 스키마 히스토리 토픽이 없습니다. 무손실 경로에서는 **`snapshot.mode=never`**로
+   실행되며(논리 슬롯이 이미 시작 LSN을 보유하고 행도 적재됨), 단독/수동 시작에서는 **`initial`**(스냅샷 후
+   스트리밍)을 사용합니다. Debezium PostgreSQL은 슬롯 자체의 위치에서만 재개할 수 있으며, 임의의 WAL LSN으로
+   탐색할 수 없습니다.
 
 그 결과, 스냅샷과 "지금" 사이의 모든 변경이 정확히 한 번 적용됩니다. 싱크는 PK를 기준으로 적용하므로 같은
 변경이 겹치거나 재시도돼도 **중복이 생기지 않습니다**.
 
-> **워터마크 위치의 binlog가 CDC 시작 시점에 여전히 존재해야 합니다.** 이 핸드오프는 소스가 워터마크
+> **MySQL: 워터마크 위치의 binlog가 CDC 시작 시점에 여전히 존재해야 합니다.** 이 핸드오프는 소스가 워터마크
 > 위치의 바이너리 로그를 아직 삭제하지 않았을 때만 동작합니다. RDS/Aurora는 기본적으로 binlog를
 > 공격적으로 삭제하고(Aurora MySQL은 24시간 보존), CDC 스택 배포에만 ~15~20분이 걸리므로 **시작 전에
 > binlog 보존을 늘리세요** — [§1.1](01-setup.md#11-사전-요구사항) 참조. 해당 구간이 이미 사라졌다면 CDC가
 > 무손실로 재개할 수 없고, 새 워터마크를 얻기 위해 Full Load를 다시 실행해야 합니다.
+>
+> **PostgreSQL: 논리 복제 슬롯이 대신 WAL을 고정합니다.** 슬롯이 생성되는 순간부터 필요한 WAL을 붙잡아
+> 두므로 밑에서 무언가가 삭제되어 사라지지 않습니다 — 전제 조건은 binlog 보존이 아니라
+> `wal_level=logical`(RDS/Aurora는 `rds.logical_replication`)입니다. 다만 슬롯은 건강해야 합니다: 너무
+> 뒤처져 Postgres가 `wal_status='lost'`(슬롯 무효화)를 보고하면 무손실 재개가 깨지므로, 새 워터마크를 얻기
+> 위해 Full Load를 다시 실행해야 합니다.
 
-> **왜 단순 schema-only가 아니라 `recovery`인가?** 시드된 오프셋이 있으면 Debezium은 "재개" 경로를
-> 타며 기존 스키마 히스토리 토픽을 기대합니다. `recovery`는 행을 다시 스냅샷하지 않고 그 히스토리를
+> **왜 단순 schema-only가 아니라 `recovery`인가? (MySQL 소스)** 시드된 오프셋이 있으면 Debezium은 "재개"
+> 경로를 타며 기존 스키마 히스토리 토픽을 기대합니다. `recovery`는 행을 다시 스냅샷하지 않고 그 히스토리를
 > 라이브 DB에서 재구성하는 모드 — "데이터는 내가 이미 적재했으니 이 오프셋부터 재개만 해" 상황에 정확히
-> 맞습니다.
+> 맞습니다. **PostgreSQL 소스에는 해당하지 않습니다:** PG에는 스키마 히스토리 토픽이 없으므로 Debezium은
+> 미리 생성된 논리 슬롯에서 `snapshot.mode=never`로 그냥 재개합니다(단독 시작 시에는 `initial` 스냅샷).
 
 ---
 
@@ -165,7 +187,7 @@ CDC 실행 중에는 Data Migration 화면이 테이블별 실시간 모니터�
 | **Updates** | Full Load 이후 이 테이블에 적용된 CDC update 누적 수 — 싱크가 실시간 보고하는 테이블별 **음수가 되지 않는** 누적 카운트(스캔 없음). |
 | **Deletes** | Full Load 이후 이 테이블에 적용된 CDC delete 누적 수 — 싱크가 실시간 보고하는 테이블별 **음수가 되지 않는** 누적 카운트(스캔 없음). |
 | **Quarantined** | **DLQ**로 격리된 변경 이벤트의 테이블별 수 — 영구 거부된 행(타입 불일치, 1 MiB 초과 초대형 값, 제약/스키마 드리프트), 싱크가 실시간 보고. |
-| **Source rows (est.)** | 스캔 없는 `information_schema` **추정치**. **Target rows** — DSQL 정확 카운트. |
+| **Source rows (est.)** | 스캔 없는 카탈로그 **추정치**(MySQL은 `information_schema.tables`, PostgreSQL은 `pg_class.reltuples`). **Target rows** — DSQL 정확 카운트. |
 | **Stream lag** | 타깃이 소스보다 **시간상** 얼마나 뒤처졌는지(아래 참고). |
 | **Consistency** | 색상 배지: 초록 *consistent* = 카운트 일치 · *replicating…* = 따라잡는 중 · 빨강 *rows missing* = 최신 변경은 도착했으나 중간에 행 유실 · 빨강 *data quarantined* = DLQ에 미적용 이벤트 존재. |
 

@@ -15,8 +15,9 @@ Aurora DSQL로 변환하고, 타깃에서 읽기 전용으로 테스트하며, A
 
 ## 9.1 쿼리 변환
 
-MySQL 문을 붙여넣으면 스키마 변환과 동일한 규칙 기반(deterministic-first) 엔진(`sqlglot`)으로 Aurora
-DSQL(PostgreSQL)로 변환하고 분류합니다:
+MySQL 문을 붙여넣으면 스키마 변환과 동일한 규칙 기반(deterministic-first) 엔진(`sqlglot`)으로 MySQL
+관용구를 Aurora DSQL(PostgreSQL)로 변환하고 분류합니다 — Convert 단계는 입력을 **MySQL**로 파싱하므로
+MySQL 소스 전용입니다:
 
 - **AUTO** — 규칙 기반으로 변환 완료; 바로 테스트 가능.
 - **MANUAL** — 변환은 됐으나 검토 필요(DSQL에서 주의점이 있는 관용구).
@@ -25,7 +26,15 @@ DSQL(PostgreSQL)로 변환하고 분류합니다:
 → `INSERT ... ON CONFLICT DO UPDATE`(MANUAL — 충돌 타깃을 직접 확인), `JSON_UNQUOTE(JSON_EXTRACT(...))`
 → `JSON_EXTRACT_PATH_TEXT`, MySQL `HAVING`-별칭 참조 인라인화, 그리고 `SELECT ... FOR UPDATE`(DSQL의
 낙관적 동시성 제어에서 다르게 동작). 이런 발견은 모두 **MANUAL**로 분류됩니다. 애플리케이션 코드 전반의
-안티패턴 스캔(`AUTO_INCREMENT`/트리거 의존, 미지원 함수)은 [2장](02-evaluation-and-schema-conversion.md) 참조.
+안티패턴 스캔(단조 증가 키 — `AUTO_INCREMENT`, serial / `IDENTITY` — /트리거 의존, 미지원 함수)은
+[2장](02-evaluation-and-schema-conversion.md) 참조.
+
+> **PostgreSQL 소스.** Convert는 **MySQL** 관용구를 트랜스파일하므로 위 재작성(`ON DUPLICATE KEY
+> UPDATE`, `JSON_UNQUOTE`/`JSON_EXTRACT`, MySQL `HAVING`-별칭 인라인화)은 PostgreSQL 소스에는 해당하지
+> 않습니다 — PostgreSQL 소스에서는 애플리케이션 SQL이 이미 PostgreSQL이고 Aurora DSQL에서 거의 그대로
+> (PG → DSQL은 거의 동일한 방언) 실행되므로 대부분의 쿼리가 이미 유효한 DSQL입니다. 엔진 중립적인
+> **Test on target**과 **AI DBA**로 바로 넘어가세요. `SELECT ... FOR UPDATE`가 낙관적 동시성 제어에서
+> 다르게 동작하는 것 같은 DSQL 실행 모델 주의점은 PostgreSQL 소스 쿼리에도 여전히 적용됩니다.
 
 원본과 변환된 SQL을 나란히 보여줘 무엇이 바뀌었는지 정확히 확인할 수 있습니다.
 
@@ -47,9 +56,12 @@ DSQL(PostgreSQL)로 변환하고 분류합니다:
 ANALYZE일 때 DPU 비용이 표시됩니다.
 
 **어느 스키마로 테스트되는가.** 스키마 없이 쓴 테이블명(`FROM orders`)은 세션 `search_path`로 스키마에
-해석됩니다; 도구는 연결된 소스 DB의 동일 이름 스키마를 기본값으로 쓰고, **Test against schema** 피커로
-바꿀 수 있습니다. `relation "…" does not exist`(SQLSTATE **42P01**)는 그 테이블이 테스트 대상 스키마에
-없다는 뜻일 뿐 — 올바른 스키마를 골라 다시 테스트하세요.
+해석됩니다. **MySQL** 소스에서는 — 데이터베이스가 곧 스키마이므로 — 도구가 연결된 데이터베이스의 동일
+이름 DSQL 스키마를 자연스러운 기본값으로 씁니다. **PostgreSQL** 소스에서는 데이터베이스 하나가 여러
+스키마를 담고 테이블이 스키마로 한정되므로(예: `public.orders`) 동일 이름 데이터베이스 기본값이 보통
+해석되지 않습니다 — **Test against schema** 피커로 실제 타깃 스키마(예: `public`)를 고르세요.
+`relation "…" does not exist`(SQLSTATE **42P01**)는 그 테이블이 테스트 대상 스키마에 없다는 뜻일 뿐 —
+올바른 스키마를 골라 다시 테스트하세요.
 
 > **DSQL 플랜 읽기:** Aurora DSQL은 *분산* PostgreSQL 호환 엔진이라 플랜이 조금 다르게 읽힙니다 —
 > §9.4 참조.
@@ -119,8 +131,8 @@ Aurora DSQL은 와이어 프로토콜 수준에서는 PostgreSQL과 호환되지
 AI DBA가 제안할 DSQL 적합 재작성: `SELECT *` 대신 필요한 컬럼만 투영; 선행 와일드카드 `LIKE '%x%'`
 회피(인덱스 사용 불가); 옵티마이저가 조인 너머로는 추론하지 못하는 **중복 조인 술어(redundant join
 predicate)** 추가; `ORDER BY … LIMIT`에는 **CTE 지연 구체화(late materialization)**; 인덱스를 커버링으로
-만드는 `INCLUDE` 컬럼; 핫 파티션을 만드는 단조 증가 키(`AUTO_INCREMENT`, 타임스탬프)보다 무작위 분포
-키(UUID) 선호.
+만드는 `INCLUDE` 컬럼; 핫 파티션을 만드는 단조 증가 키(auto-increment, serial / `IDENTITY` / 시퀀스
+`nextval`, 타임스탬프)보다 무작위 분포 키(UUID) 선호.
 
 ---
 

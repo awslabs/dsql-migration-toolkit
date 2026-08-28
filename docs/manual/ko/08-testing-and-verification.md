@@ -14,10 +14,13 @@ _언어: [English](../en/08-testing-and-verification.md) | **한국어** | [日�
 마이그레이션 끝의 **Validation** 단계에서 당신도 *당신의* 데이터로 똑같은 증거를 얻습니다.
 
 > 여기 적힌 동작들은 짐작이 아닙니다. 각 상황을 AWS 없이도 결정론적으로 재현하는 자동 검증과,
-> 실제 RDS MySQL + Aurora DSQL + MSK에 *일부러 실패하도록 심은 데이터*까지 넣어 돌린 라이브
-> 실행으로 확인돼 있습니다(§8.2 요약). 소규모 `integration` 마커 티어(`tests/test_integration_e2e.py`)는
-> 로컬 MySQL + PostgreSQL-16 컨테이너도 돌리지만 `RUN_INTEGRATION_TESTS=1`일 때만 실행되고, 아니면
-> 스스로 스킵돼 기본 `pytest` 실행은 완전 오프라인으로 유지됩니다.
+> 실제 인프라에 *일부러 실패하도록 심은 데이터*까지 넣어 돌린 라이브 실행으로 확인돼
+> 있습니다(§8.2 요약). 두 소스 엔진 모두 이 방식으로 end-to-end 검증했습니다 — MySQL
+> 소스(RDS MySQL + Aurora DSQL + MSK)와 PostgreSQL 소스(RDS/Aurora PostgreSQL → MSK → DSQL)를,
+> 각각 Schema Conversion + Full Load + CDC + cut over 전 구간에 걸쳐. 소규모 `integration` 마커
+> 티어(`tests/test_integration_e2e.py`)는 로컬 MySQL + PostgreSQL-16 컨테이너도 돌리지만
+> `RUN_INTEGRATION_TESTS=1`일 때만 실행되고, 아니면 스스로 스킵돼 기본 `pytest` 실행은 완전
+> 오프라인으로 유지됩니다.
 
 한 가지 원칙만 기억하면 됩니다: **조용한 손상보다 시끄러운 실패가 낫습니다.** 이 도구는 데이터를
 몰래 왜곡하거나 버리느니, 눈에 보이고 고칠 수 있는 오류로 멈춥니다. 불완전한 로드를 성공으로
@@ -27,22 +30,24 @@ _언어: [English](../en/08-testing-and-verification.md) | **한국어** | [日�
 
 ## 8.1 당신의 데이터에서 어긋날 수 있는 것 — 도구가 대신 하는 일
 
-아래는 "MySQL에서는 아무 문제 없던 것이 DSQL로 옮길 때 위험해지는" 대표적인 상황들입니다. 각 행은
-*당신의 데이터에 그런 게 있을 때* 도구가 무엇을 해 주고, 그 결과를 당신이 어디서 확인하는지를
-보여 줍니다.
+아래는 "소스(MySQL·PostgreSQL)에서는 아무 문제 없던 것이 DSQL로 옮길 때 위험해지는" 대표적인
+상황들입니다. 각 행은 *당신의 데이터에 그런 게 있을 때* 도구가 무엇을 해 주고, 그 결과를 당신이
+어디서 확인하는지를 보여 줍니다. PostgreSQL 소스는 타입 표면이 DSQL과 거의 같아서(둘 다
+PostgreSQL-16 와이어) 타입 이질성 상황은 해당되지 않지만, 분산·서버리스·IAM 인증·OCC 관련
+상황은 그대로 적용됩니다.
 
 | 당신의 데이터에 이런 게 있으면 | 순진하게 옮기면 위험한 이유 (DSQL 차이) | 도구가 대신 하는 일 | 당신이 확인하는 곳 |
 |---|---|---|---|
 | **아주 큰 테이블** (수억 행) | DSQL은 트랜잭션당 3,000행·10 MiB·5분·DDL 1개로 제한 — 한 번에 밀어넣으면 실패하거나 잘림 | PK 순서로 **스트리밍**하며 한도에 맞춰 배치로 나눠 적재 — 테이블이 아무리 커도 메모리와 트랜잭션이 안전하게 유지. 인덱스는 데이터 적재를 마친 뒤 따로 생성 | Full Load 진행률, Validation **행 수** |
-| **1 MiB가 넘는 큰 값** (대형 LOB/TEXT) | DSQL은 값 하나가 1 MiB를 넘으면 저장 불가 | 그 **행만 격리**(quarantine)해 PK와 사유를 기록하고 나머지 테이블은 계속 적재. CDC 중에도 같은 값은 DLQ로 분리 — 값 하나 때문에 테이블 전체가 멈추지 않음 | Full Load **에러 로그**, CDC **DLQ**, Validation의 부족분 |
-| **타입이 애매하게 변환되는 값** (예: `TINYINT(1)`에 든 `2`, 24시간 범위를 벗어난 `TIME`) | `TINYINT(1)` → `boolean`에서 `2`를 `true`로 뭉개거나, 범위 밖 `TIME`을 하루 단위로 잘라 넣으면 **조용한 손상** | 그런 값은 임의로 평탄화하지 않고 **그 테이블 적재를 시끄럽게 멈춰** 사람이 판단하도록 넘김(어떤 컬럼·값인지, 어떻게 고칠지도 함께 안내) | Full Load **에러 로그** (테이블 단위 실패) |
-| **DSQL이 지원하지 않는 객체·타입** (트리거, 프로시저, 정밀도 38 초과 `DECIMAL`, 컬럼 255 초과 등) | 그냥 옮기면 적재 도중에야 하나씩 터짐 | **Evaluation** 단계에서 미리 전수 분류(AUTO / MANUAL / UNSUPPORTED)하고 항목마다 사유·권장 조치·작업량을 제시 — 로드 전에 결정 | **Evaluation** 리포트 |
-| **MySQL 고유 타입이 많은 스키마** (모든 정수/unsigned, `DECIMAL`, `BIT`, DATE/TIME 계열, `ENUM`/`SET`/`JSON`, LOB 등) | Full Load(벌크)와 CDC(스트리밍)가 같은 값을 **다르게** 저장하면 나중에 불일치 | 두 경로가 각 타입을 **똑같은 형태**로 저장하도록 하나의 규약으로 강제 | Validation **체크섬** (값까지 비교) |
+| **1 MiB가 넘는 큰 값** (MySQL LOB/TEXT 또는 PostgreSQL `text`/`bytea`/`json`) | DSQL은 값 하나가 1 MiB를 넘으면 저장 불가 | 그 **행만 격리**(quarantine)해 PK와 사유를 기록하고 나머지 테이블은 계속 적재. CDC 중에도 같은 값은 DLQ로 분리 — 값 하나 때문에 테이블 전체가 멈추지 않음 | Full Load **에러 로그**, CDC **DLQ**, Validation의 부족분 |
+| **타입이 애매하게 변환되는 값** (MySQL 소스 한정 — 예: `TINYINT(1)`에 든 `2`, 24시간 범위를 벗어난 `TIME`) | `TINYINT(1)` → `boolean`에서 `2`를 `true`로 뭉개거나, 범위 밖 `TIME`을 하루 단위로 잘라 넣으면 **조용한 손상** | 그런 값은 임의로 평탄화하지 않고 **그 테이블 적재를 시끄럽게 멈춰** 사람이 판단하도록 넘김(어떤 컬럼·값인지, 어떻게 고칠지도 함께 안내). PostgreSQL 소스에는 네이티브 `boolean` 타입이 있어 그대로 통과하므로 이런 평탄화 위험이 없음 | Full Load **에러 로그** (테이블 단위 실패) |
+| **DSQL이 지원하지 않는 객체·타입** (MySQL: 트리거, 프로시저, 정밀도 38 초과 `DECIMAL`, 컬럼 255 초과 등 / PostgreSQL: 배열, 기하 타입(point/line/box 등), 네트워크 타입(inet/cidr/macaddr), xml, money, bit/bit varying, tsvector/tsquery, range/multirange, enum, 복합 타입, pgvector 등) | 그냥 옮기면 적재 도중에야 하나씩 터짐 | **Evaluation** 단계에서 미리 전수 분류(AUTO / MANUAL / UNSUPPORTED)하고 항목마다 사유·권장 조치·작업량을 제시 — 로드 전에 결정. 지원하지 않는 타입은 임의로 대체하지 않음. 단, PostgreSQL `numeric(p,s)`에서 p가 38을 넘으면 (MySQL `DECIMAL`>38처럼 거부하지 않고) 경고와 함께 **클램프**하고, 정밀도 없는 `numeric`/`decimal`은 `numeric(18,6)`으로 기본 지정 | **Evaluation** 리포트 |
+| **소스 고유 타입이 많은 스키마** (MySQL: 모든 정수/unsigned, `DECIMAL`, `BIT`, DATE/TIME 계열, `ENUM`/`SET`/`JSON`, LOB 등) | Full Load(벌크)와 CDC(스트리밍)가 같은 값을 **다르게** 저장하면 나중에 불일치 | 두 경로가 각 값을 **똑같은 형태**로 저장하도록 하나의 규약으로 강제. MySQL 소스는 MySQL→PostgreSQL 방언 변환을 거치지만, PostgreSQL 소스는 변환이 없어(소스·타깃 모두 PostgreSQL-16 와이어) 두 경로가 값을 그대로 전달 — 그래도 두 엔진 모두 이 규약을 지켜야 함 | Validation **체크섬** (값까지 비교) |
 | **쓰기 경합이 잦은 워크로드** | DSQL엔 락이 없고, 커밋 시점에야 충돌(`40001`)을 알림 — 진 트랜잭션은 재실행 필요 | 충돌하면 간격을 두고 **자동 재시도**. 재시도 예산을 다 써도 안 풀리면 **실패로 기록** (조용히 버리지 않음) | 작업 상태 / 에러 요약 |
 | **오래 걸리는 로드·CDC 스트림** | DSQL 접속은 단기 IAM 토큰과 60분 연결 한도 — 오래 걸리면 토큰·연결이 만료 | 죽었거나 반쯤 끊긴 연결을 폐기하고 **새 토큰으로 재연결**해 이어감 — 사용자가 손댈 것 없음 | 자동 (진행률이 끊기지 않고 이어짐) |
-| **벌크 로드에서 CDC로 넘어가는 지점** (거의 무중단 전환) | 벌크 로드에서 CDC로 넘어갈 때 사이 구간을 놓치면 **행 누락**, 겹치면 **중복** | 벌크 로드가 잡아 둔 **워터마크**부터 CDC를 시작하고, PK 기준 **멱등 적용**이라 겹쳐도 중복이 생기지 않음 | Validation **대조** (누락 0 / 잉여 0) |
+| **벌크 로드에서 CDC로 넘어가는 지점** (거의 무중단 전환) | 벌크 로드에서 CDC로 넘어갈 때 사이 구간을 놓치면 **행 누락**, 겹치면 **중복** | 벌크 로드가 잡아 둔 **워터마크**부터 CDC를 시작. **MySQL:** binlog `file:position`(또는 GTID) 워터마크를 in-VPC 오프셋 시더 Lambda가 Kafka `connect-offsets`에 심고 Debezium이 `snapshot.mode=recovery`로 재개. **PostgreSQL:** WAL LSN 워터마크를 미리 만든 `pgoutput` 논리 복제 슬롯(그리고 마이그레이션 대상 테이블만 담은 publication)이 고정하고, Debezium이 `snapshot.mode=never`로 슬롯에서 재개 — 오프셋 시더 Lambda나 `connect-offsets` 시드 없음(`seed_mode='external'`). 어느 쪽이든 PK 기준 **멱등 적용**이라 겹쳐도 중복이 생기지 않음 | Validation **대조** (누락 0 / 잉여 0) |
 | **외래 키가 많은 스키마** | FK를 켠 채 적재·CDC를 돌리면 순서가 뒤섞인 행(부모보다 먼저 온 자식)이 FK 위반으로 실패하고, 소스가 캐스케이드한 삭제는 CDC로 넘어오지 않아 고아 행이 생김 | FK를 DDL에서 떼지 않고 **보존**해 데이터 적재를 마친 뒤(CDC는 cut over 시점) `ADD CONSTRAINT`로 다시 생성. 적용 직전 **고아 검사**가 부모 없는 자식 행을 잡아내며(강제 FK는 고아가 있으면 적용 실패), FK를 떼기로 한 경우엔 앱 측 무결성 안전망 | Validation **고아 검사** |
-| **마이그레이션 중에도 계속 바뀌는 라이브 소스** | 옮기는 사이 소스가 전진하면 행 수 차이가 생기는데, 이게 버그인지 정상인지 헷갈림 | 워터마크 GTID로 **드리프트를 감지**하고, 그 차이가 버그가 아니라 *스냅샷 이후의 신규 소스 활동*임을 밝혀 표시 | Validation 리포트의 **drifted** 플래그 |
+| **마이그레이션 중에도 계속 바뀌는 라이브 소스** | 옮기는 사이 소스가 전진하면 행 수 차이가 생기는데, 이게 버그인지 정상인지 헷갈림 | 스냅샷 이후의 행 수 차이는 버그가 아니라 *신규 소스 활동*으로 귀속. **MySQL:** 워터마크의 binlog/GTID 위치로 **드리프트를 감지·보고**. **PostgreSQL:** 워터마크에 WAL LSN(`Watermark.wal_lsn`)을 기록하지만 Validation이 LSN 기반 드리프트를 재계산하지는 않으므로(`drifted = 판정 불가`) 대신 CDC 수렴을 지켜봄 | Validation 리포트의 **drifted** 플래그 |
 | **중간에 멈추거나 다시 시작** | 순진한 로더는 처음부터 다시 하거나 중복을 만듦 | `INSERT … ON CONFLICT`로 **다시 적용해도 안전**하고, 재개 때는 **미완료 PK 범위만** 다시 실행 | 재개 후 Full Load 진행률 |
 
 > 표의 "확인하는 곳"은 모두 **당신이 UI에서 직접 보는 화면**입니다. 특히 마지막 **Validation**
@@ -53,14 +58,20 @@ _언어: [English](../en/08-testing-and-verification.md) | **한국어** | [日�
 
 ## 8.2 실제 증거 — 일부러 까다롭게 만든 데이터로 돌린 end-to-end 실행
 
-위 상황들을 **한꺼번에** 압박하도록 설계한 스키마로, 실제 AWS(RDS MySQL + Aurora DSQL + MSK)에서
-전체 흐름을 돌려 봤습니다:
+위 상황들을 **한꺼번에** 압박하도록 설계한 스키마로, **MySQL 소스**(RDS MySQL + Aurora DSQL + MSK)에
+대해 실제 AWS에서 전체 흐름을 돌려 봤습니다:
 
 - parent → child → lob로 이어지는 **외래 키 체인** (FK 보존·적용 + PK 필수 + 고아 검사를 강제).
 - **최대한 다양한 타입** — 모든 정수/unsigned, 정밀도 38을 넘는 `DECIMAL`, `FLOAT`/`DOUBLE`, `BIT`,
   collation, 전체 DATE/TIME 계열, `ENUM`/`SET`/`JSON`, 전체 LOB 계열(타입 이질성·미지원 타입을 강제).
 - **일부러 실패하도록 심은 데이터** — 약 1.5 MiB짜리 LOB 값(1 MiB 격리를 강제)과, 격리된 테이블의
   `TINYINT(1)` = `2`(시끄러운 테이블 실패를 강제).
+
+> **PostgreSQL 소스.** 동일한 end-to-end 경로를 PostgreSQL 소스(RDS/Aurora PostgreSQL → MSK →
+> Aurora DSQL)로도 실제 인프라에서 따로 검증했습니다 — Schema Conversion + Full Load + CDC + cut
+> over(외래 키 보존 포함). PostgreSQL 소스는 PG-16→DSQL 거의 동일 통과이므로 위의 타입 이질성과
+> `TINYINT(1)` 평탄화 상황은 해당되지 않지만, 분산·서버리스·IAM 인증·OCC·무손실 Full Load → CDC
+> 핸드오프 상황은 모두 적용됩니다.
 
 이 실행은 가장 어려운 **무손실 핸드오프**를 실제로 수행했습니다 — Full Load → 라이브 워크로드 →
 워터마크부터 CDC → 수렴 → PK 단위 대조. 실제 인프라에서 돌려 볼 가치가 바로 여기 있습니다: 초기

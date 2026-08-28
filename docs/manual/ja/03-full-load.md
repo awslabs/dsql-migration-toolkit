@@ -4,7 +4,8 @@ _言語: [English](../en/03-full-load.md) | [한국어](../ko/03-full-load.md) |
 
 > **前へ:** [2. Evaluation と Schema Conversion](02-evaluation-and-schema-conversion.md)
 
-**Full Load** は、ソース MySQL の既存の行を Aurora DSQL へコピーする、本ツール独自のバルクコピーです。
+**Full Load** は、ソースデータベース — RDS / Aurora **MySQL** または RDS / Aurora **PostgreSQL** — の
+既存の行を Aurora DSQL へコピーする、本ツール独自のバルクコピーです。
 これは Debezium のスナップショットでは**ありません** — データをストリーミングしながら DSQL の制約を守る、
 専用に作られたローダーです。テーブルを選択したあと、**Data Migration** ステップで実行します。
 
@@ -17,7 +18,7 @@ _言語: [English](../en/03-full-load.md) | [한국어](../ko/03-full-load.md) |
 ## 3.1 全体像
 
 ```
-Source MySQL                         Aurora DSQL
+Source (MySQL / PostgreSQL)          Aurora DSQL
   │  keyset page (PK > last, LIMIT)      ▲  idempotent batched INSERT
   │  streaming server-side cursor        │  (≤3000 rows, ≤8 MiB, OCC retry)
   └──────────►  convert types  ──────────┘
@@ -31,7 +32,11 @@ Source MySQL                         Aurora DSQL
 5. そのあとで二次**インデックス**を構築します。
 
 ソースは一貫したスナップショットの中で**読み取り専用**として読み取られ、ローダーがそれを変更することは
-決してありません。
+決してありません。MySQL ソース — そして PostgreSQL の Full Load のみのマイグレーション — に書き込むことは
+決してありません。唯一の例外は **PostgreSQL CDC** です。ウォーターマークの地点(§3.5)で、ツールは論理
+レプリケーションスロットと、移行対象テーブルだけに厳密にスコープされた publication を作成し、teardown 時に
+削除します(autocommit、小さな allowlist に制限、監査あり)。これらが、ツールがいずれのソースに対して行う
+唯一の書き込みです。
 
 ---
 
@@ -41,13 +46,14 @@ Source MySQL                         Aurora DSQL
 
 ```sql
 SELECT <cols> FROM <table>
-WHERE pk > :last           -- composite PKs: explicit lexicographic OR-expansion (PK-index-friendly on MySQL 5.7+)
+WHERE pk > :last           -- composite PKs: explicit lexicographic OR-expansion (PK-index-friendly on MySQL 5.7+ and on PostgreSQL)
 ORDER BY pk
 LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 5000
 ```
 
 各ページの最後の行まで `:last` を進めていき、短いページが終端を知らせるまで繰り返します。このクエリは
-`START TRANSACTION WITH CONSISTENT SNAPSHOT`(InnoDB の repeatable read)の中で、**サーバーサイド /
+単一の repeatable-read スナップショットトランザクション(MySQL: InnoDB の `START TRANSACTION WITH
+CONSISTENT SNAPSHOT`、PostgreSQL: `REPEATABLE READ` トランザクション)の中で、**サーバーサイド /
 ストリーミングカーソル**として実行されます。したがって次のようになります。
 
 - テーブル全体が**RAM にロードされることは決してなく** — メモリは 1 ページ分に一定に保たれます。
@@ -66,13 +72,18 @@ PK を要求するため、Evaluation でも `UNSUPPORTED` としてフラグ付
 ## 3.3 その場でのタイプ変換
 
 行がストリーミングされる際、各値は DSQL が保存する形式へ変換されます。これは Schema Conversion の
-マッピングを踏襲しているため(列の型と値が食い違いません)。MySQL ユーザーが知っておくべき例をいくつか
+マッピングを踏襲しているため(列の型と値が食い違いません)。**MySQL ソース**が生成する例をいくつか
 挙げます。
 
 - `TINYINT(1)` → DSQL の **boolean**(`0/1` → `false/true`)。
 - `BIT(n)` → 整数(ソースのバイト列からデコード)。
 - `DATETIME` → UTC に正規化された `timestamp`、`TIMESTAMP` → `timestamptz`。
 - `BLOB`/`BINARY`/`VARBINARY` 系 → `bytea`。
+
+**PostgreSQL ソース**では、Full Load 中に MySQL 方式の値変換は**行われません**。両端がともに
+PostgreSQL-16 wire(両側とも psycopg)であるため、DSQL がサポートする値はそのまま通過します。PostgreSQL の
+型の扱い — 未サポート型は remodel 対象としてフラグ付け、`numeric` の精度クランプ、`DEFAULT`/serial/identity
+は出力しない — は、その場での値変換ではなく **Schema Conversion** で行われます。
 
 マッピングの全体(および値あたり 1 MiB 制限のような DSQL 制約の扱い方)は
 [第 2 章 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-の型と制約の処理-リファレンス)と
@@ -114,22 +125,29 @@ Schema Conversion ステップにあります。
 
 ## 3.5 ウォーターマーク — CDC への橋渡し
 
-ロードの前に、ツールは**ウォーターマーク**をキャプチャします。これはソースのバイナリログにおける一貫した
-地点で、同じ一貫スナップショットのトランザクションの中で記録されます。内容は次のとおりです。
+ロードの前に、ツールは**ウォーターマーク**をキャプチャします。これはソースの変更ストリームにおける一貫
+した地点で、同じ一貫スナップショットのトランザクションの中で記録されます。どのウォーターマークも
+**UTC のスナップショットタイムスタンプ**と、テーブルごとの**概算**行数(スキャンを伴わない
+`information_schema` の推定値。単に数えるだけのためにソースをフルスキャンしません)を保持します。エンジン
+固有の座標は次のように異なります。
 
-- **binlog ファイル + 位置**、
-- **GTID セット**(`@@GLOBAL.gtid_executed`)と `server_uuid`、
-- **UTC のスナップショットタイムスタンプ**、そして
-- テーブルごとの**概算**行数(スキャンを伴わない `information_schema` の推定値。単に数えるだけのために
-  ソースをフルスキャンしません)。
+- **MySQL** — **binlog ファイル + 位置**、および **GTID セット**(`@@GLOBAL.gtid_executed`)と
+  `server_uuid`。これらは `SHOW BINARY LOG STATUS`(MySQL 8.2+/8.4、`SHOW MASTER STATUS` が削除された
+  バージョン)で読み取り、それ以下(≤ 8.0.x)では `SHOW MASTER STATUS` にフォールバックします。
+- **PostgreSQL** — binlog 座標ではなく **WAL LSN**(`Watermark.wal_lsn`)。一貫性の地点で、ツールは
+  **publication**(移行対象テーブルに厳密に対する `FOR TABLE`。`FOR ALL TABLES` は決して使いません)と
+  `pgoutput` の**論理レプリケーションスロット**を作成し、スロットが返した一貫 LSN を、スロット名・
+  publication 名とともに記録します。この LSN が WAL を固定し、ギャップのない `snapshot.mode=never` の
+  CDC 引き継ぎを可能にします。PostgreSQL には GTID / `server_uuid` の概念はなく、`SHOW BINARY LOG STATUS`
+  もありません — LSN は作成されたスロットから得られます。
 
 このウォーターマークによって、後続の **CDC へのギャップのない引き継ぎ**が可能になります。CDC は
 スナップショットが終了したまさにその地点から変更のストリーミングを開始します — ギャップも重複も
-ありません([第 4 章](04-cdc-and-dsql-constraints.md)を参照)。座標は `SHOW BINARY LOG STATUS`
-(MySQL 8.2+/8.4、`SHOW MASTER STATUS` が削除されたバージョン)で読み取り、それ以下(≤ 8.0.x)では
-`SHOW MASTER STATUS` にフォールバックします。バイナリロギングが無効か権限が制限されている場合、
-binlog/GTID フィールドは穏当に空へフォールバックし、その場合は単に CDC の引き継ぎが受けられなくなる
-だけです(Full Load は引き続き動作します)。
+ありません([第 4 章](04-cdc-and-dsql-constraints.md)を参照)。CDC の前提条件が満たされない場合 —
+MySQL ではバイナリロギングが無効か権限が制限されている場合、PostgreSQL では `wal_level` が `logical` で
+ないか、スロット / publication を作成できない場合(レプリケーション権限の不足、または standby エンドポイント)
+— 座標は穏当に劣化し、その場合は単に CDC の引き継ぎが受けられなくなるだけです(Full Load は引き続き
+動作します)。
 
 > ウォーターマークの行数は**意図的に概算**です(ソースへの負担を抑えるため)。正確な `COUNT(*)` と
 > チェックサムは **Validation**([第 5 章](05-validation.md))の役割であり、Full Load の役割では
@@ -155,7 +173,10 @@ binlog/GTID フィールドは穏当に空へフォールバックし、その�
 `ValueConversionError` を送出します。これには **SQLSTATE がなく**(DSQL に問い合わせる前、読み取り /
 変換の途中で発生するため)、そのため行単位の隔離では**なく**、そのテーブルのロードを**明示的に**
 停止します。これは意図された挙動です — ツールは `2` を `true` につぶして、あなたのデータをひそかに破損
-させることを拒否します。ソースデータを修正する(または列を除外する)うえで、再実行してください。
+させることを拒否します。この table-fatal な `ValueConversionError` は、エクスポート中に値が変換される
+**MySQL ソース**でのみ発生します。**PostgreSQL ソース**は型変換なしでそのまま通過するため、この特定の
+ケースは発生しません(行単位の SQLSTATE 隔離は両エンジンとも引き続き適用されます)。ソースデータを修正する
+(または列を除外する)うえで、再実行してください。
 
 > **なぜ「明示的な」失敗が「サイレントな」失敗に勝るのか:** DSQL の `boolean` は `2` を表現できません。
 > ツールは、ひそかに誤った値を残すよりも、目に見えて修正可能な失敗を選びます。
@@ -186,8 +207,8 @@ CDC の引き継ぎ地点を失ったりすることはありません。
 > **コマンドラインから Full Load を実行(任意)。** 同じバルクローダーは CLI スクリプトとしても
 > 利用できます — `scripts/run_full_load.py`(まずプランを表示し、次に `--yes`。任意で `--clean`、
 > CDC ウォーターマークを取得する `--watermark-out`)— Web UI なしでの自動化や TB 規模の実行に便利です。
-> 詳細は [`scripts/README.md`](../../../scripts/README.md) を参照。ソースは読み取り専用で、ロードは
-> UI と同様に冪等です。
+> 詳細は [`scripts/README.md`](../../../scripts/README.md) を参照。ソースは読み取り専用で(唯一の例外は
+> §3.1 で述べた PostgreSQL-CDC のスロットと publication)、ロードは UI と同様に冪等です。
 
 ---
 

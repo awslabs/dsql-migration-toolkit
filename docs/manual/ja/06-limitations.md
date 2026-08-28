@@ -17,20 +17,20 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
 | 制限 | 影響 | ツールの動作 |
 |---|---|---|
 | **外部キー(強制される。ランタイム上の注意点あり)** | DSQL は **強制される** 外部キーをサポートしますが、参照される側/参照する側のテーブルへの DML は **追加の読み取り** を発生させ、並行する競合は再試行可能な `40001` になり、`CASCADE`/`SET NULL`/`SET DEFAULT` アクションは **3000 行/トランザクション** 制限に算入されます(3000 行を超えるカスケードは失敗します)。 | 保持され、post-load の `ALTER TABLE … ADD CONSTRAINT` として再作成されます(Full Load はデータ着地後に適用し、CDC マイグレーションではカットオーバーまで延期します)。子側のカーディナリティが無制限になりうる場合は `NO ACTION`/`RESTRICT` を優先するか、これらを取り除いて(`preserve_foreign_keys=False`)整合性をアプリで強制してください。 |
-| **ソースの `CHECK` 制約** | MySQL の `CHECK`(8.0.16+)はターゲットに変換されません。 | DDL から削除され **MANUAL** としてフラグ付け — DSQL 互換の `CHECK` を手動で再追加するか、アプリで強制してください。(ツールが `ENUM` 用に *生成* する `CHECK … IN (...)` は影響を受けません。) |
+| **ソースの `CHECK` 制約** | ソースの `CHECK` 制約はターゲットに変換されません(例: MySQL の `CHECK`、8.0.16+)。 | DDL から削除され **MANUAL** としてフラグ付け — DSQL 互換の `CHECK` を手動で再追加するか、アプリで強制してください。(ツールが MySQL の `ENUM` 用に *生成* する `CHECK … IN (...)` は影響を受けません。PostgreSQL ソースでは `ENUM` 型が `text` に変換されるため、ツールが生成する `CHECK` はありません。) |
 | **主キー必須** | PK のないテーブルは移行できません。 | **UNSUPPORTED** としてフラグ付け。Full Load もブロックされます(keyset エクスポートには PK が必要)。 |
 | **トリガー / ストアドプロシージャ / 関数 / スケジュールイベントなし** | サーバー側ロジックは移行されません。 | **UNSUPPORTED** としてフラグ付け — アプリケーションで再実装してください(イベント → EventBridge/Lambda)。 |
 | **ネイティブパーティショニングなし** | DSQL がデータを自動的に分散します。 | パーティション化されたテーブルは **MANUAL** としてフラグ付け(パーティショニングを削除)。 |
-| **値ごとに 1 MiB の上限** | 約 1 MiB を超える単一の `TEXT`/`BLOB` 値は保存できません。 | 1〜8 MiB の値はエラーログ / DLQ に**隔離**(quarantine)されます。> 8 MiB の列は**キャプチャ時に除外**する必要があります。大きな LOB 列は `OVERSIZED_LOB`(MANUAL)としてフラグ付け。 |
+| **値ごとに 1 MiB の上限** | 約 1 MiB を超える単一の大きなテキスト / バイナリ値は保存できません(MySQL の `TEXT`/`BLOB`、PostgreSQL の `text`/`bytea`)。 | 1〜8 MiB の値はエラーログ / DLQ に**隔離**(quarantine)されます。> 8 MiB の列は**キャプチャ時に除外**する必要があります。大きな LOB 列は `OVERSIZED_LOB`(MANUAL)としてフラグ付け。 |
 | **`DECIMAL` の精度 > 38** | これより高い精度は未対応です。 | Evaluation は **UNSUPPORTED**(`NUMERIC_PRECISION`)としてフラグしますが、変換された DDL を適用すると Schema Conversion が **`numeric(38,37)` にクランプ**(非可逆)し警告します — スケールも 37 に制限されます。 |
-| **空間 / geometry 型** | `bytea` に置換されます(元の WKB が Full Load・CDC の全区間でそのまま保存されます)。 | コンバーターが各列を `bytea` に自動置換し、アセッサーがそのテーブルを要レビューの **MANUAL** としてフラグ付け。 |
+| **空間 / geometry 型** | MySQL ソースでは `bytea` に置換されます(元の WKB が Full Load・CDC の全区間でそのまま保存されます)。PostgreSQL ソースは自動置換**されません**。 | MySQL ソース: コンバーターが各列を `bytea` に自動置換し、アセッサーがそのテーブルを要レビューの **MANUAL** としてフラグ付け。PostgreSQL ソース: geometric 型(point/line/lseg/box/path/polygon/circle)は Evaluation(`PG_UNSUPPORTED_TYPE`)と Schema Conversion の両方で **UNSUPPORTED** としてフラグ付けされ、`text` への再モデリングが提案されます — DDL 適用前に自分で再モデリングする必要があります。(自動置換ではなく手動での再モデリングが必要なその他の PG 専用型: 配列、network `inet`/`cidr`/`macaddr`、`xml`、`money`、`bit`/`varbit`、`tsvector`/`tsquery`、range/multirange、`enum`、composite、pgvector。) |
 | **FULLTEXT / SPATIAL インデックス** | 未対応です。 | **UNSUPPORTED** としてフラグ付け。 |
 | **テーブルあたり ≤ 255 列、データベースあたり ≤ 1000 テーブル** | これらを超えると未対応です。 | **UNSUPPORTED**(`TOO_MANY_COLUMNS` / `TABLE_COUNT_LIMIT`)としてフラグ付け。 |
-| **テーブルあたり ≤ 24 インデックス**(PK も数に含まれるため、セカンダリは ≤ 23。MySQL は 64) | 超過分の `CREATE INDEX ASYNC` は、Full Load が全行を書き込んだ**後に**失敗します。 | 計画段階で **MANUAL**(`TOO_MANY_INDEXES`)としてフラグ付けし、Schema Conversion にも同じ注記を表示。 |
-| **主キー・インデックスの列数 ≤ 8**(MySQL は 16) | これを超えるキーは error 54011 で失敗します。 | 主キーが超過する場合は **UNSUPPORTED**(`CREATE TABLE` 自体が拒否されるため、データは一切ロードされません)、インデックスが超過する場合は **MANUAL**(`TOO_MANY_KEY_COLUMNS`)。変換はロード後に必ず失敗する DDL を出力せず、そのインデックスを**省略**し、どのインデックスかを注記に明示します。 |
-| **キーの合計サイズ ≤ 1 KiB**(主キーごと、インデックスごと) | DDL ではなく **`INSERT`/`UPDATE` 時の値**に対して検査されます。したがって実際のキーが長すぎる行のみが失敗します(error 54000 `key size too large`)。 | *宣言された*幅がこれを超えうる場合、変換が警告(**MANUAL** の推奨)し、utf8mb4 を想定して 1 文字 4 バイトで計算した該当キーと最悪ケースのサイズを明示します。ブロックはしません — 宣言が広くても実際の値が短ければ問題なく移行できるためです。 |
-| **クラスターあたり 1 データベース** | DSQL は複数データベースではなくスキーマで構成します。 | 複数データベースのソースは **MANUAL** としてフラグ付け(スキーマに統合するか、クラスターを分割)。 |
-| **`TRUNCATE` なし、トランザクションあたり 1 DDL、楽観的並行性制御** | MySQL とは異なる書き込み / DDL のセマンティクスです。 | 透過的に処理: TRUNCATE の代わりに DROP+再作成、単一 DDL 単位、必要な箇所すべてで `40001` リトライ。 |
+| **テーブルあたり ≤ 24 インデックス**(PK も数に含まれるため、セカンダリは ≤ 23。MySQL ソースは 64) | 超過分の `CREATE INDEX ASYNC` は、Full Load が全行を書き込んだ**後に**失敗します。 | 計画段階で **MANUAL**(`TOO_MANY_INDEXES`)としてフラグ付けし、Schema Conversion にも同じ注記を表示。 |
+| **主キー・インデックスの列数 ≤ 8**(MySQL ソースは 16) | これを超えるキーは error 54011 で失敗します。 | 主キーが超過する場合は **UNSUPPORTED**(`CREATE TABLE` 自体が拒否されるため、データは一切ロードされません)、インデックスが超過する場合は **MANUAL**(`TOO_MANY_KEY_COLUMNS`)。変換はロード後に必ず失敗する DDL を出力せず、そのインデックスを**省略**し、どのインデックスかを注記に明示します。 |
+| **キーの合計サイズ ≤ 1 KiB**(主キーごと、インデックスごと) | DDL ではなく **`INSERT`/`UPDATE` 時の値**に対して検査されます。したがって実際のキーが長すぎる行のみが失敗します(error 54000 `key size too large`)。 | *宣言された*幅がこれを超えうる場合、変換が警告(**MANUAL** の推奨)し、MySQL ソースの utf8mb4 を想定して 1 文字 4 バイトで計算した該当キーと最悪ケースのサイズを明示します。ブロックはしません — 宣言が広くても実際の値が短ければ問題なく移行できるためです。 |
+| **クラスターあたり 1 データベース** | DSQL は複数データベースではなくスキーマで構成します。 | MySQL ソースの場合、複数データベースのソースは **MANUAL** としてフラグ付け(MySQL の 1 データベースが DSQL の 1 スキーマにマップされる — スキーマに統合するか、クラスターを分割)。PostgreSQL ソースは単一のデータベースに接続し、その非システムスキーマがすでに DSQL のスキーマに直接マップされる(修飾された `schema.table`)ため、複数データベースの統合ステップはありません。 |
+| **`TRUNCATE` なし、トランザクションあたり 1 DDL、楽観的並行性制御** | 従来のシングルノード RDBMS(MySQL または PostgreSQL ソース)とは異なる書き込み / DDL のセマンティクスです。 | 透過的に処理: TRUNCATE の代わりに DROP+再作成、単一 DDL 単位、必要な箇所すべてで `40001` リトライ。 |
 | **IAM トークン認証(パスワードなし)、短命トークン** | 静的な DB パスワードはありません。 | ツール(および CDC シンク)が IAM トークンを自動的に発行・更新します。 |
 
 > **スキーマ設計における結論:** 大きな blob、サーバー側ロジック、非常に高精度な数値は、
@@ -46,23 +46,37 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
   利用可能などのリージョンでも動作しますが、**ソースとターゲットは同一リージョンに
   なければならず**、オプションの CDC パイプラインは単一のリージョン / VPC で実行され
   ます。クロスリージョンは未対応です。
-- **CDC にはソース側の前提条件(binlog)があります。** CDC では、ソースで
-  バイナリログが **ROW 形式かつ完全な行イメージ**(full row image)で有効に
-  なっており(`binlog_format=ROW`、`binlog_row_image=FULL`)、**レプリケーション権限**
-  を持つユーザーが必要です。前提条件ゲートは、これらが満たされるまで **CDC を
-  ブロック**します。また、Full Load のウォーターマーク(watermark)時点のログが
-  CDC 開始時まで残るように、**binlog の保持期間を延長**する必要があります
-  (Aurora MySQL はデフォルトで 24 時間しか binlog を保持しません)。RDS/Aurora では
-  これらは `my.cnf` ではなく、パラメータグループと `mysql.rds_set_configuration`
-  で設定します — [§1.1](01-setup.md#11-前提条件) を参照してください。(Full Load
-  のみの場合はこれらは一切不要です。)
+- **CDC にはソース側の前提条件があります(エンジン別)。** 前提条件ゲートは、これらが
+  満たされるまで **CDC をブロック**します。**Full Load のみの場合はこれらは一切不要です。**
+  - **MySQL ソース:** バイナリログが **ROW 形式かつ完全な行イメージ**(full row image)で
+    有効になっており(`binlog_format=ROW`、`binlog_row_image=FULL`)、**レプリケーション権限**
+    を持つユーザーが必要です。また、Full Load のウォーターマーク(watermark)時点のログが
+    CDC 開始時まで残るように、**binlog の保持期間を延長**する必要があります(Aurora MySQL は
+    デフォルトで 24 時間しか binlog を保持しません)。RDS/Aurora ではこれらは `my.cnf` ではなく、
+    パラメータグループと `mysql.rds_set_configuration` で設定します —
+    [§1.1](01-setup.md#11-前提条件) を参照してください。
+  - **PostgreSQL ソース:** `wal_level=logical`(RDS/Aurora: カスタム DB / クラスターパラメータ
+    グループで静的パラメータ `rds.logical_replication=1` を設定してから再起動; 自己管理:
+    `wal_level=logical` を設定して再起動);**レプリケーション権限を持つユーザー**(superuser、
+    `REPLICATION` ロール属性、または RDS/Aurora の `rds_replication` メンバーシップ);ソースは
+    standby/reader ではなくクラスターの **WRITER** でなければなりません(`pg_is_in_recovery()=false`);
+    そして、複製対象の各テーブルには使用可能な **`REPLICA IDENTITY`** が必要です(PK があれば
+    デフォルト、なければ `ALTER TABLE … REPLICA IDENTITY FULL` またはインデックス identity —
+    `NOTHING` は拒否され、publisher で `UPDATE`/`DELETE` がエラーになります)。binlog の保持期間に
+    相当する概念はありません: ツールが Full Load の整合点で**論理レプリケーションスロット**と
+    **移行対象テーブルだけを正確に範囲とする publication** を作成するため、WAL は保持期間ではなく
+    スロットによって固定されます(`wal_status` を監視してください — 非アクティブなスロットはソースの
+    ディスクを埋め尽くす可能性があります)。レプリケーションスロット / `max_wal_senders` の余裕は
+    チェックされます(ブロックはしません)。
 - **CDC が複製するのはデータであり、DDL ではありません。** CDC 中にソースで発生した
   スキーマ変更は DSQL に**伝播されません** — 同等の DDL を DSQL に自分で適用する
   必要があります
   ([第 4 章 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-は-スキーマ-ではなく-データ-を複製する--重要) を参照)。
-- **カスケードする外部キー動作は CDC で複製されません。** InnoDB の `ON DELETE/UPDATE CASCADE`
-  (および `SET NULL`/`SET DEFAULT`)は MySQL の*内部*で発生し binlog に載らないため、CDC は適用できません
-  — ソースがカスケードした子行がターゲットに残されます。ツールは外部キーを DSQL 上で **カットオーバー時**
+- **カスケードする外部キー動作は CDC で複製されません。** サーバー側の `ON DELETE/UPDATE CASCADE`
+  (および `SET NULL`/`SET DEFAULT`)アクションはソースエンジンの*内部*で発生し、変更ストリームに
+  捕捉されない場合があるため、CDC は適用できません — ソースがカスケードした子行がターゲットに
+  残されます(MySQL ソースの場合、InnoDB が binlog に書き込まないまま実行します)。ツールは外部キーを
+  DSQL 上で **カットオーバー時**
   に(レプリケーション中は決してしません)再作成するため、それらの孤立した行は `ADD CONSTRAINT` を
   **ブロック** し、暗黙のうちに乖離するのではなく **Validation の孤立チェック** によって報告されます。
   Evaluation はそうしたテーブルを **MANUAL** としてフラグします。自動アクションはアプリケーション内の
@@ -73,10 +87,11 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
   実行されている間ずっとコストが発生します。Cut over 後は cdc-stack を削除して
   ください。Full Load のみを実行する場合、ストリーミングインフラはプロビジョニング
   されません。
-- **TINYINT(1) の範囲外の値は、設計上テーブル全体の失敗になります。** `{0,1}` の
+- **TINYINT(1) の範囲外の値はテーブル全体の失敗になります(MySQL ソース)。** `{0,1}` の
   範囲外の `TINYINT(1)` 値は、暗黙のうちに `true` に丸められることなく、そのテーブルの
   Full Load を明示的に(loudly)中断させます。ソースデータをクリーンアップ(または
-  その列を除外)してから再実行してください。
+  その列を除外)してから再実行してください。PostgreSQL ソースにはネイティブの `boolean` 型が
+  あるため、この MySQL 固有の `TINYINT(1)`→`boolean` 変換とテーブル全体の失敗ガードは適用されません。
 
 ---
 

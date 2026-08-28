@@ -16,15 +16,24 @@ to the chapter with the full detail. If you read only one thing first, read
 
 **Q1. What does this tool migrate, and in which direction?**
 
-Amazon **RDS / Aurora MySQL → Amazon Aurora DSQL**, one direction only. Supported
-sources are **RDS for MySQL** and **Aurora MySQL**, versions **5.7 / 8.0 / 8.4**
-(all validated end-to-end — Full Load + CDC + checksum). This is a **heterogeneous**
-migration (MySQL → PostgreSQL dialect → DSQL constraints), not a version upgrade —
-DSQL is PostgreSQL-wire-compatible, distributed, serverless, and IAM-authenticated.
-The **source is read-only the entire time**; the tool never writes to your MySQL.
+Amazon **RDS / Aurora MySQL or PostgreSQL → Amazon Aurora DSQL**, one direction
+only. Supported sources are **RDS for MySQL** and **Aurora MySQL** (**5.7 / 8.0 /
+8.4**) and **RDS for PostgreSQL** and **Aurora PostgreSQL** (**PG 13–16** tested; the
+tool enforces no hard version floor/ceiling). Both source paths — Schema Conversion +
+Full Load + CDC + cut over — are **validated end-to-end** (in testing, with a
+checksum). This is a **heterogeneous** migration, not a version upgrade — from MySQL
+the path is **MySQL → PostgreSQL dialect → DSQL constraints**, and from PostgreSQL it
+is a **near-identity PG → DSQL** path (both are PostgreSQL-16-wire). DSQL is
+PostgreSQL-wire-compatible, distributed, serverless, and IAM-authenticated.
+
+The **source is read-only the entire time.** The only write the tool ever makes to
+any source is, for a **PostgreSQL source using CDC**, creating (and at teardown
+dropping) a logical replication slot and a publication scoped to exactly the migrated
+tables — an autocommit, allowlisted, audited operation. A MySQL source (and a
+PostgreSQL Full-Load-only migration) is never written.
 
 
-**Q2. Is Aurora DSQL a drop-in replacement for Aurora MySQL?**
+**Q2. Is Aurora DSQL a drop-in replacement for my source engine (Aurora MySQL / PostgreSQL)?**
 
 No. DSQL speaks the **PostgreSQL** wire protocol, authenticates with short-lived
 **IAM tokens** (no password), uses **optimistic concurrency** instead of locks,
@@ -68,7 +77,7 @@ pipeline runs in a single region/VPC. **Cross-region migration is not supported.
 | Your situation | Use |
 |---|---|
 | One-shot migration; a short maintenance write-freeze is acceptable | **Full Load only** — no streaming infrastructure, no ongoing cost. |
-| Large-scale / continuous; you need **near-zero-downtime** cut-over | **Full Load + CDC** — a gapless handoff keeps DSQL converging while MySQL stays live. |
+| Large-scale / continuous; you need **near-zero-downtime** cut-over | **Full Load + CDC** — a gapless handoff keeps DSQL converging while the source stays live. |
 
 CDC adds real moving parts (MSK, MSK Connect, a sink connector) and **costs money
 while deployed**. Use it only when you genuinely need continuous replication;
@@ -110,13 +119,13 @@ doesn't abort the others.
 **Q8a. What if the source Aurora cluster fails over mid-load?**
 
 It's handled automatically. A writer promotion (patching, an instance replacement, an
-AZ event) closes every open MySQL connection, so a multi-hour load will meet one. The
+AZ event) closes every open source connection, so a multi-hour load will meet one. The
 affected table is **re-read automatically** (3 attempts by default, with a 15s → 30s →
 60s backoff to let DNS re-point at the promoted writer).
 
 The retry deliberately **re-reads that table from a fresh consistent snapshot**
 instead of resuming the dead read where it stopped: resuming would splice two
-different MySQL snapshots into one table, and the gapless Full Load → CDC handoff
+different source snapshots into one table, and the gapless Full Load → CDC handoff
 depends on each table being consistent as of a single point in time. Because the load
 is idempotent, the rows already written are skipped — the retry costs re-read I/O, not
 duplicate rows.
@@ -129,9 +138,10 @@ Tunable via `DSQL_MIGRATOR_FULL_LOAD_SOURCE_RETRY_ATTEMPTS` (1 = no retry).
 
 **Q9. Does Full Load need binary logging on the source?**
 
-**No.** Full Load alone needs none of the CDC prerequisites (no binlog, no
-replication user). It reads the source with an ordinary read-only connection. Only
-**CDC** requires binlog (see Q12).
+**No.** Full Load alone needs none of the CDC prerequisites (no binlog and no
+replication user on MySQL; no `wal_level=logical`, replication slot, or publication on
+PostgreSQL). It reads the source with an ordinary read-only connection on either
+engine. Only **CDC** needs those prerequisites (see Q12).
 
 
 **Q10. Can I tune Full Load throughput?**
@@ -146,12 +156,13 @@ quota. See [Chapter 7 §7.2](07-performance-and-tuning.md#72-tuning-parallelism)
 
 **Q11. Why does raising parallelism sometimes not speed things up?**
 
-DSQL distributes storage **by primary key**, and a monotonic `AUTO_INCREMENT` PK
+DSQL distributes storage **by primary key**, and a monotonic auto-incrementing PK
+(MySQL `AUTO_INCREMENT`, or a PostgreSQL `serial` / `IDENTITY` / sequence-backed key)
 makes every insert target the same "rightmost" key range — a **write hot-spot**. At
 high parallelism this raises the optimistic-concurrency conflict rate (`SQLSTATE
-40001`), so throughput gains flatten. This is why Evaluation flags `AUTO_INCREMENT`
-and Schema Conversion offers PK strategies (keep integer / convert to UUID /
-identity-with-caching). See [Chapter 7 §7.1](07-performance-and-tuning.md#71-why-this-design-the-technical-case).
+40001`), so throughput gains flatten. This is why Evaluation flags such monotonic PKs
+regardless of source engine and Schema Conversion offers PK strategies (keep integer /
+convert to UUID / identity-with-caching). See [Chapter 7 §7.1](07-performance-and-tuning.md#71-why-this-design-the-technical-case).
 
 ---
 
@@ -159,24 +170,44 @@ identity-with-caching). See [Chapter 7 §7.1](07-performance-and-tuning.md#71-wh
 
 **Q12. What does CDC require on the source?**
 
-CDC requires binary logging in **ROW format with a full row image**
-(`binlog_format=ROW`, `binlog_row_image=FULL`) and a user with **replication
+It depends on the source engine.
+
+**MySQL source** — CDC requires binary logging in **ROW format with a full row
+image** (`binlog_format=ROW`, `binlog_row_image=FULL`) and a user with **replication
 privileges**. You must also **raise binlog retention** so the log at the Full Load
 watermark survives until CDC starts (Aurora MySQL keeps binlogs only ~24 h by
 default). On RDS/Aurora these are set via **parameter groups** and
 `mysql.rds_set_configuration`, not `my.cnf`. The prerequisite gate **blocks CDC**
 until the binlog format and replication privileges are met, and **warns**
-(non-blocking) if binlog retention looks too short. See
-[§1.1](01-setup.md#11-prerequisites) and
+(non-blocking) if binlog retention looks too short.
+
+**PostgreSQL source** — CDC requires **`wal_level=logical`** (RDS/Aurora: set the
+static parameter `rds.logical_replication=1` in a custom DB/cluster parameter group,
+then reboot the writer; self-managed: `wal_level=logical` + restart) — required; a
+**replication-privileged user** (superuser, the `REPLICATION` role attribute, or
+`rds_replication` membership on RDS/Aurora, plus `SELECT` on the migrated tables) —
+required; the source must be the cluster **writer, not a standby/reader**
+(`pg_is_in_recovery()=false`) — required; and every replicated table needs a usable
+**`REPLICA IDENTITY`** (a PK gives the default; otherwise `ALTER TABLE … REPLICA
+IDENTITY FULL`, since `REPLICA IDENTITY NOTHING` makes UPDATE/DELETE error on the
+publisher) — required. Replication-slot / `max_wal_senders` (walsender) headroom is a
+**warning** (non-blocking). There is **no binlog-retention concept** for PostgreSQL:
+the tool auto-creates the publication (for the exact migrated tables) and a `pgoutput`
+logical slot, and WAL is pinned by the slot instead (watch `wal_status` — an inactive,
+unconsumed slot can fill the source disk).
+
+See [§1.1](01-setup.md#11-prerequisites) and
 [Chapter 6 §6.2](06-limitations.md#62-migration-process-limits).
 
 
 **Q13. How is the Full Load → CDC handoff "gapless"?**
 
-Full Load captures a **binlog/GTID watermark** at the consistent snapshot point.
-CDC starts streaming from **exactly that watermark**, and because the apply is
-idempotent and PK-keyed, any overlap between the snapshot and the stream **can't
-create duplicates**. The result is no gap and no double-apply. See
+Full Load captures a **watermark** at the consistent snapshot point — for a MySQL
+source a **binlog/GTID position**, for a PostgreSQL source a **WAL LSN** pinned by a
+pre-created logical replication slot (Debezium then resumes from the slot with
+`snapshot.mode=never`). CDC starts streaming from **exactly that watermark**, and
+because the apply is idempotent and PK-keyed, any overlap between the snapshot and the
+stream **can't create duplicates**. The result is no gap and no double-apply. See
 [Chapter 4 — CDC](04-cdc-and-dsql-constraints.md).
 
 
@@ -237,20 +268,24 @@ together. Even so, an MSK Connect connector takes many minutes to start, so this
 the second-largest wait in the CDC path — plan for it separately from the
 infrastructure deploy.
 
-**Why teardown takes a while** — deleting MSK itself is relatively quick, but the
-last resource to go — the in-VPC **offset-seeder Lambda** — is the bottleneck.
-Deleting a VPC-attached Lambda forces AWS to clean up the **network interfaces
-(ENIs)** it used, and that cleanup is a documented AWS behavior that can take **up
-to ~20 minutes** (in our own testing it accounted for most of the delete time). The
-Lambda **must** live inside the VPC to reach the private MSK bootstrap, so this
-delay is hard to avoid on teardown.
+**Why teardown takes a while (MySQL source)** — deleting MSK itself is relatively
+quick, but the last resource to go — the in-VPC **offset-seeder Lambda** — is the
+bottleneck. Deleting a VPC-attached Lambda forces AWS to clean up the **network
+interfaces (ENIs)** it used, and that cleanup is a documented AWS behavior that can
+take **up to ~20 minutes** (in our own testing it accounted for most of the delete
+time). The Lambda **must** live inside the VPC to reach the private MSK bootstrap, so
+this delay is hard to avoid on teardown. This bottleneck is **MySQL-only**: the
+offset-seeder Lambda is created only for a MySQL source, so a **PostgreSQL** teardown
+(which resumes CDC from its logical slot, not a seeded `connect-offsets` entry) has no
+such Lambda and does not incur the ENI-cleanup delay.
 
 > **Tip:** for iterating or restarting, **restart in place (keep the existing
 > infrastructure)** rather than full delete-and-recreate where possible — it avoids
 > this ~20-minute ENI cleanup. **Stop CDC** preserves the MSK cluster, plugins, VPC
 > and IAM (it only removes the two connectors), so a later **Start CDC** skips the
-> infrastructure wait entirely and resumes from the offsets kept in the cluster's
-> `connect-offsets` topic. Tear the stack down for good once cut-over is done and
+> infrastructure wait entirely and resumes where it left off — a MySQL source from the
+> offsets kept in the cluster's `connect-offsets` topic, a PostgreSQL source from its
+> logical slot's LSN position. Tear the stack down for good once cut-over is done and
 > you no longer need CDC.
 
 Each of these operations records its **outcome** (succeeded / failed, with the
@@ -270,9 +305,9 @@ detection. Resolve every UNSUPPORTED item and decide each MANUAL item **before**
 load. See [Chapter 2](02-evaluation-and-schema-conversion.md).
 
 
-**Q19. How are MySQL data types mapped to DSQL?**
+**Q19. How are source data types mapped to DSQL?**
 
-Here are the highlights:
+For a **MySQL source**, here are the highlights:
 
 | MySQL type | Aurora DSQL type | Note |
 |---|---|---|
@@ -290,6 +325,20 @@ The **complete mapping for every type** (target DSQL type + stored value form) i
 The **Full Load loader and the CDC sink honor the identical mapping** (a shared
 write-contract test enforces it), so a row lands the same whichever path migrates it.
 
+**For a PostgreSQL source**, conversion and the data path are a **near-identity
+PG-16 → DSQL pass-through** — DSQL-supported types (the int family, `numeric`/`decimal`,
+`char`/`varchar`/`text`, date/time/`timestamp[tz]`, `interval`, `boolean`, `bytea`,
+`uuid`, `json`, `jsonb`) carry over **verbatim**, with no MySQL-style translation.
+PostgreSQL types with no DSQL equivalent are flagged **UNSUPPORTED** (never
+auto-substituted) and must be remodeled: arrays → `jsonb` / child table; geometric,
+network (`inet`/`cidr`/`macaddr`), `xml`, `bit`/`varbit`, `tsvector`/`tsquery`,
+`range` / multirange → `text`; `money` → `numeric`; `pgvector` → `jsonb`/`text`;
+`enum` → `text`; composite → columns / `jsonb`. `numeric(p,s)` with p > 38 is clamped
+with a warning; a bare `numeric`/`decimal` → DSQL `numeric(18,6)`; column `DEFAULT`s /
+`serial` / identity `nextval` are **not** emitted (the PK strategy governs identity);
+`STORED` generated columns become ordinary columns. See the type-and-constraint
+reference in [Chapter 2 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-type-and-constraint-handling-reference).
+
 
 **Q20. What happens to foreign keys, triggers, and stored procedures?**
 
@@ -301,9 +350,10 @@ the sink streams rows out of order). You can instead **opt to strip** them and
 enforce referential integrity in the application layer. Runtime caveats to weigh:
 DML on related tables incurs **extra reads**, a concurrent conflict is a retryable
 `40001`, and a `CASCADE`/`SET NULL`/`SET DEFAULT` action counts toward DSQL's
-3000-row/txn limit. **Triggers, stored procedures/functions, and scheduled events**
+3000-row/txn limit. **Triggers, stored procedures/functions, and scheduled jobs**
 *are* omitted — flagged UNSUPPORTED — so reimplement them in your application
-(scheduled events → EventBridge / Lambda). See
+(scheduled jobs — MySQL's Event Scheduler, or a PostgreSQL cron-style scheduler such
+as `pg_cron` — move to EventBridge / Lambda). See
 [Chapter 6 §6.1](06-limitations.md#61-aurora-dsql-feature-limits-your-schema-must-fit-these).
 
 
@@ -338,11 +388,13 @@ increasingly strict passes** — each more precise (and more expensive) than the
   whose counts differ), the tables it skipped are labelled *verified by row count
   only* rather than being reported as full matches — and you can **deep-check just
   those** from the report without re-running everything.
-- **A few column types are excluded from the checksum by design**, because their
-  text form legitimately differs between the two engines while the value is equal:
-  floating-point (`FLOAT`/`DOUBLE`) and `JSON` (MySQL renders a spaced canonical
-  form, a CDC-written row holds the compact serialization). Row counts and every
-  other column still validate, and PK reconciliation is unaffected.
+- **A few column types are excluded from the checksum by design**, because they have
+  no stable exact text form to hash identically across engines while the value is
+  equal: floating-point (MySQL `FLOAT`/`DOUBLE`; PostgreSQL `real`/`double precision`)
+  and `json` (its text form varies legitimately — e.g. a spaced canonical form vs. the
+  compact serialization a CDC-written row holds). For a **PostgreSQL source, `jsonb`
+  IS checksummed** — only plain `json` is excluded. Row counts and every other column
+  still validate, and PK reconciliation is unaffected.
 
 **Fixed a mismatch? Re-check that one table.** Each failing table in the report has a
 **Re-check** action (plus *Re-check all N*) that re-compares only that table with the
@@ -358,10 +410,12 @@ source and target actually match**, not on hope. See
 **Q23. The source keeps changing during migration — won't validation be wrong?**
 
 No — it's attributed correctly. Validation compares the source's current position
-(by **GTID**, or the binlog **file:position** when GTID isn't enabled) against the
-Full Load watermark and reports **drift**, so a count delta from **new source
-activity** is distinguished from a bug. For a clean final go/no-go, freeze source writes and
-let CDC drain first (Q27).
+against the Full Load watermark and reports **drift** — for a MySQL source by
+**GTID** (or the binlog **file:position** when GTID isn't enabled), for a PostgreSQL
+source the current **WAL LSN** against the Full Load LSN watermark — so a count delta
+from **new source activity** is distinguished from a bug. (On a PostgreSQL source the
+tool does not recompute an LSN-based drift figure; watch CDC convergence instead.) For
+a clean final go/no-go, freeze source writes and let CDC drain first (Q27).
 
 
 **Q24. What happens to rows DSQL can't store (e.g. a value > 1 MiB)?**
@@ -376,11 +430,12 @@ aside. See [Chapter 6 §6.1](06-limitations.md#61-aurora-dsql-feature-limits-you
 
 **Q25. What does "loud over silent" mean in practice?**
 
-The tool refuses to corrupt data quietly. Examples: a `TINYINT(1)` value outside
-`{0,1}` **stops that table's load** rather than flattening it to `true`; an
-out-of-range `TIME` fails rather than being truncated; an incomplete load is
-reported **FAILED**, never a false success. You fix the source (or exclude the
-column) and re-run.
+The tool refuses to corrupt data quietly. **MySQL-source** examples: a `TINYINT(1)`
+value outside `{0,1}` **stops that table's load** rather than flattening it to
+`true`; an out-of-range `TIME` fails rather than being truncated. (A **PostgreSQL**
+source Full Load is a pure pass-through — psycopg native on both ends — so it has few
+such value conversions.) Either way, an incomplete load is reported **FAILED**, never
+a false success. You fix the source (or exclude the column) and re-run.
 
 ---
 
@@ -390,8 +445,8 @@ column) and re-run.
 
 With **Full Load only**, downtime is the length of the final freeze + load +
 validation. With **Full Load + CDC**, it shrinks to a brief **final drain + smoke
-test** — CDC keeps DSQL converging while MySQL stays live, so you freeze only at the
-very end.
+test** — CDC keeps DSQL converging while the source stays live, so you freeze only at
+the very end.
 
 
 **Q27. What's the safe cut-over sequence?**
@@ -404,18 +459,20 @@ variant are in [Chapter 10 §10.3](10-conclusion.md#103-the-cut-over-switching-y
 
 **Q28. Can I roll back?**
 
-Yes, if you plan it. Keep the MySQL source **frozen (read-only), not dropped** until
+Yes, if you plan it. Keep the source **frozen (read-only), not dropped** until
 you've signed off on DSQL — before you repoint, rollback is trivial (the source is
 untouched and authoritative). **After** the application writes to DSQL, those new
-rows live **only** on DSQL (this tool replicates MySQL → DSQL, **not** the reverse),
+rows live **only** on DSQL (this tool replicates source → DSQL, **not** the reverse),
 so rolling back then means reconciling them yourself. Decide your rollback rule
 *before* you cut over.
 
 
 **Q29. What credentials and permissions are needed, and how is my data protected?**
 
-The source uses an ordinary read-only MySQL connection; the target uses DSQL's
-**IAM-token auth (no DB password)**. All connections use **TLS**. Credentials live
+The source uses an ordinary read-only connection to **MySQL or PostgreSQL** (a
+password, or an AWS Secrets Manager username/password — **never IAM**; IAM-token auth
+is target-DSQL only); the target uses DSQL's **IAM-token auth (no DB password)**. All
+connections use **TLS**. Credentials live
 in **per-session memory only** — never written to disk, logs, reports, or job state.
 Logs and reports record primary keys and counts, **never row values**. Optional
 AI-assist (Amazon Bedrock, off by default) is **advisory only** and **never** in the
@@ -426,7 +483,7 @@ Fargate — what differs is **where those permissions attach**:
 
 - **Required (both modes):** `dsql:DbConnect` / `dsql:DbConnectAdmin` to mint the
   DSQL IAM token (scoped to your cluster), plus read-only access to the source
-  MySQL. Optionally `secretsmanager:GetSecretValue` (to reuse a source-credentials
+  (MySQL or PostgreSQL). Optionally `secretsmanager:GetSecretValue` (to reuse a source-credentials
   secret) and `bedrock:InvokeModel` (only if you enable AI-assist).
 - **Run locally** — the tool uses **your own IAM identity** via the standard
   credential chain (`~/.aws`, env vars, `AWS_PROFILE`, SSO), so *your* identity must
@@ -448,7 +505,7 @@ identity must hold them**):
 | For | IAM actions (minimum) |
 |---|---|
 | **Target DSQL (always)** | `dsql:DbConnect`, `dsql:DbConnectAdmin` (mint the IAM token), `dsql:GetCluster` |
-| **Source MySQL (always)** | none in IAM — an ordinary read-only MySQL user/password (or the secret below) |
+| **Source (always)** | none in IAM — an ordinary read-only MySQL or PostgreSQL user/password (or the Secrets Manager secret below) |
 | **Source secret (optional)** | `secretsmanager:GetSecretValue` — only if the source credentials come from a Secrets Manager secret |
 | **AI assist (optional)** | `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream` — scoped to the chosen model; only when AI is enabled |
 | **CDC — deploy/tear down the pipeline** | the broad infra-creation set the cdc-stack needs: `cloudformation:CreateStack`/`UpdateStack`/`DeleteStack`/`Describe*`/`GetTemplate`; a wide `ec2:*` set (VPC subnets, NAT, EIP, route tables, security groups, VPC endpoints, network interfaces); `iam:CreateRole`/`AttachRolePolicy`/`PassRole`/… (the connector roles); `kafka:*` / `kafkaconnect:*` (MSK Serverless + MSK Connect); `logs:*`; `s3:*` on the plugin bucket. Full-Load-only migrations need **none** of this. |
