@@ -5,6 +5,73 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.409
+
+### Changed
+
+- **Published the `0.1.409` image to all three registries and repointed the
+  `ContainerImageUri` default** in `deploy/cloudformation.yaml`
+  (`0.1.406 → 0.1.409`), so a fresh `git clone` deploy pulls the image with the
+  Bedrock provider-scope (v0.1.407), foreign-key legibility (v0.1.408), and
+  preserve-toggle persistence (v0.1.409) changes. The deployed Seoul stack
+  (`mysql-dsql-migrator-seoul`, ap-northeast-2) was updated to the `0.1.409` image.
+
+### Fixed
+
+- **The "Preserve foreign keys" choice now survives a reconnect / instance restart.**
+  It was not persisted in the session snapshot, so a restored session silently
+  reverted to preserve-by-default — meaning a user who chose to STRIP foreign keys
+  could have them re-created by the post-load / cut-over FK pass after a crash or
+  Fargate task replacement. The toggle is now captured and restored with the rest of
+  the (non-secret) workbench state (older snapshots restore as preserve = True,
+  matching prior behavior). The deferred foreign keys themselves were already
+  crash-safe: the FK `ADD CONSTRAINT` DDL is re-derived from the persisted source
+  inventory and applied idempotently, so a crash/restart resumes and the FK pass
+  re-runs. (Note: source credentials are never persisted (Property 7), so if the
+  session snapshot is lost entirely the schema must be restored by reconnecting and
+  re-running Evaluation — it cannot be re-read automatically.)
+
+## v0.1.408
+
+### Changed
+
+- **Made deferred foreign keys legible in Schema Conversion (no behavior change to
+  the deferred-apply design).** The generated target DDL used to intermix the
+  post-load `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY … NOT VALID` lines with the
+  editable `CREATE` statements, so a user would apply and then find zero foreign keys
+  on the target ("why is the FK missing?"). Now:
+  - the editable target-DDL box (and its diff) shows only the `CREATE
+    SCHEMA/TABLE/INDEX` statements, and the foreign keys appear in a distinct,
+    read-only **"Foreign keys — applied after Full Load, not at Schema Apply"**
+    section (the stored edited DDL is kept whole by recombining on edit, so the
+    post-load FK pass still receives them);
+  - a caption at the **"Preserve foreign keys"** toggle and an info notice in the
+    apply results state plainly that foreign keys are (re)created after Full Load (at
+    cut over for a CDC migration), not by Schema Apply;
+  - a **Full-Load-only** run now records a named `apply foreign keys` step in the
+    activity log (`N applied, S skipped, F failed`), mirroring the CDC cut-over
+    "Apply foreign keys" action, so the foreign keys are visibly (re)created at load
+    end instead of appearing to have gone missing.
+
+## v0.1.407
+
+### Changed
+
+- **The Bedrock `InvokeModel` IAM scope is now provider-wide (any Anthropic model)
+  instead of the single deploy-time `BedrockModelId`,** so an operator can switch the
+  Connect form's Model ID to another Anthropic model **without redeploying** to widen
+  the policy. When `BedrockModelArns` is not overridden, the task role's
+  `bedrock:InvokeModel`/`InvokeModelWithResponseStream` is scoped to
+  `inference-profile/*.anthropic.*` (this account, any region) plus
+  `foundation-model/anthropic.*` (any region). The provider stays pinned to
+  `anthropic.` — non-Anthropic / image / Marketplace models are never invokable and
+  it is never a blanket `*` — because the app only speaks the Anthropic Messages body.
+  `BedrockModelId` is now just the default the UI opens with (still access-gated by
+  your account), and `BedrockModelArns` still lets an operator narrow the scope or
+  allow a non-Anthropic model. **Note:** this does not bypass account-level Bedrock
+  model access — each model must still be enabled in your account/region (otherwise
+  the call fails `MODEL_NOT_ENABLED`, not `AccessDenied`).
+
 ## v0.1.406
 
 ### Changed

@@ -116,6 +116,9 @@ def capture_session_snapshot(
             else None
         ),
         edited_target_ddls=dict(conv_state.edited_target_ddls),  # type: ignore[attr-defined]
+        preserve_foreign_keys=bool(
+            getattr(conv_state, "preserve_foreign_keys", True)  # type: ignore[attr-defined]
+        ),
         migration_job_id=migration_state.job_id,  # type: ignore[attr-defined]
         migration_selection=migration_state.selection.model_copy(deep=True),  # type: ignore[attr-defined]
         migration_selection_touched=migration_state.selection_touched,  # type: ignore[attr-defined]
@@ -314,6 +317,13 @@ def apply_session_snapshot(
         # Restore the customized target DDLs so a re-run recreates tables with the
         # user's schema (e.g. a smallint remap), not the deterministic conversion.
         conv_state.edited_target_ddls = dict(snapshot.edited_target_ddls)  # type: ignore[attr-defined]
+    # Restore the "Preserve foreign keys" choice so a strip-FKs decision survives a
+    # reconnect/restart (older snapshots default True = preserve). Applied
+    # unconditionally: unlike the collections above, a False must overwrite the
+    # preserve-by-default so the post-load / cut-over FK pass honors the choice.
+    conv_state.preserve_foreign_keys = bool(  # type: ignore[attr-defined]
+        getattr(snapshot, "preserve_foreign_keys", True)
+    )
 
     migration_state.job_id = snapshot.migration_job_id  # type: ignore[attr-defined]
     migration_state.selection = snapshot.migration_selection.model_copy(deep=True)  # type: ignore[attr-defined]

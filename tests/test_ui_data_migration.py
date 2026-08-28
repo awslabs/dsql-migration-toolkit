@@ -2562,6 +2562,65 @@ def test_apply_foreign_keys_engine_helper_is_best_effort() -> None:
     engine._apply_foreign_keys(_Boom())  # must not raise
 
 
+def test_apply_foreign_keys_logs_named_activity_step(monkeypatch) -> None:
+    # #4: the Full-Load-only post-pass surfaces as a NAMED activity-log step, so the
+    # user sees the foreign keys being (re)created at load end instead of wondering
+    # where they went (mirrors the CDC cut-over "Apply foreign keys" action).
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        engine,
+        "log_activity",
+        lambda category, action, **kw: events.append((category, action, kw)),
+    )
+
+    class _Applied:
+        def apply_foreign_keys(self):
+            return (2, 1, 0)
+
+    engine._apply_foreign_keys(_Applied())
+    assert len(events) == 1
+    category, action, kw = events[0]
+    assert category is engine.ActivityCategory.FULL_LOAD
+    assert action == "apply foreign keys"
+    assert kw["status"] is engine.ActivityStatus.SUCCESS
+    assert "2 applied" in kw["detail"] and "1 skipped" in kw["detail"]
+
+    # A failure in the pass -> FAILURE status.
+    events.clear()
+
+    class _Failed:
+        def apply_foreign_keys(self):
+            return (0, 0, 3)
+
+    engine._apply_foreign_keys(_Failed())
+    assert events and events[0][2]["status"] is engine.ActivityStatus.FAILURE
+
+
+def test_apply_foreign_keys_no_activity_when_nothing_applied(monkeypatch) -> None:
+    # (0, 0, 0): a no-FK load or a CDC-deferred run emits NO summary line (no noise);
+    # a hook returning None (older/test double) is tolerated with no summary, no error.
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    events: list = []
+    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: events.append((a, k)))
+
+    class _Nothing:
+        def apply_foreign_keys(self):
+            return (0, 0, 0)
+
+    engine._apply_foreign_keys(_Nothing())
+    assert events == []
+
+    class _Legacy:
+        def apply_foreign_keys(self):
+            return None
+
+    engine._apply_foreign_keys(_Legacy())
+    assert events == []
+
+
 def test_count_orphans_retries_on_occ_conflict() -> None:
     # On Aurora DSQL a read can raise OC001/40001 when the target is written
     # concurrently (a live CDC sink at cut over); the orphan pre-gate must retry it,

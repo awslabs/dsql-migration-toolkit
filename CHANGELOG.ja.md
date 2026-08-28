@@ -5,6 +5,66 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.409
+
+### 変更 (Changed)
+
+- **`0.1.409` イメージを 3 つのレジストリすべてに公開し、`deploy/cloudformation.yaml` の
+  `ContainerImageUri` デフォルトを `0.1.406 → 0.1.409` に更新**しました。新規に `git clone`
+  してデプロイすると、Bedrock プロバイダースコープ(v0.1.407)、外部キーの可読性(v0.1.408)、
+  preserve トグルの永続化(v0.1.409)を含むイメージを取得します。デプロイ済みの Seoul スタック
+  (`mysql-dsql-migrator-seoul`、ap-northeast-2)も `0.1.409` イメージに更新しました。
+
+### 修正 (Fixed)
+
+- **"Preserve foreign keys" の選択が、再接続 / インスタンス再起動後も保持されるようになりました。**
+  セッションスナップショットに永続化されておらず、復元時に暗黙的に「保持がデフォルト」に戻って
+  いたため、外部キーを**削除(strip)**する選択をしたユーザーでも、クラッシュや Fargate タスク
+  置換の後にロード後 / カットオーバーの FK パスで外部キーが再作成される可能性がありました。今後は
+  このトグルも他の(非機密)ワークベンチ状態と一緒に保存・復元されます(古いスナップショットは
+  preserve=True で復元、従来動作と同じ)。遅延外部キー自体は既にクラッシュ耐性がありました:
+  FK `ADD CONSTRAINT` DDL は永続化されたソースインベントリから再導出され冪等に適用されるため、
+  クラッシュ/再起動後に再開し FK パスが再実行されます。(注: ソース資格情報は決して永続化しない
+  ため(Property 7)、セッションスナップショットが完全に失われた場合はスキーマを Connect 再接続 +
+  Evaluation 再実行で復元する必要があり、自動的には読み直せません。)
+
+## v0.1.408
+
+### 変更 (Changed)
+
+- **Schema Conversion で遅延適用される外部キーを分かりやすくしました(遅延適用の設計自体は
+  変更なし)。** 従来は生成ターゲット DDL が、ロード後の `ALTER TABLE … ADD CONSTRAINT …
+  FOREIGN KEY … NOT VALID` 行を編集可能な `CREATE` 文と混在表示していたため、適用後に
+  ターゲットへ外部キーが 1 つも無いと「なぜ FK が消えた?」と読めていました。今後は:
+  - 編集用ターゲット DDL ボックス(および差分)は `CREATE SCHEMA/TABLE/INDEX` 文のみを
+    表示し、外部キーは独立した読み取り専用の **"Foreign keys — applied after Full Load,
+    not at Schema Apply"** セクションに表示されます(編集時に再結合するため保存 DDL は
+    完全なまま保たれ、ロード後の FK パスがそのまま受け取ります);
+  - **"Preserve foreign keys"** トグルのキャプションと適用結果の info 通知が、外部キーは
+    Schema Apply ではなく Full Load 後(CDC はカットオーバー時)に(再)作成されると明示します;
+  - **Full Load のみ**の実行は、アクティビティログに `apply foreign keys` ステップ
+    (`N applied, S skipped, F failed`)を記録し、CDC カットオーバーの "Apply foreign keys"
+    アクションと同様に、ロード終了時に外部キーが(再)作成される様子が見えるようになりました。
+
+## v0.1.407
+
+### 変更 (Changed)
+
+- **Bedrock `InvokeModel` の IAM スコープを、デプロイ時の単一 `BedrockModelId` ではなく
+  プロバイダー全体(すべての Anthropic モデル)に広げました。** これにより運用者はポリシーを
+  広げるための再デプロイなしに、Connect フォームの Model ID を別の Anthropic モデルへ切り替え
+  られます。`BedrockModelArns` の上書きがない場合、タスクロールの
+  `bedrock:InvokeModel`/`InvokeModelWithResponseStream` は
+  `inference-profile/*.anthropic.*`(このアカウント、全リージョン)と
+  `foundation-model/anthropic.*`(全リージョン)にスコープされます。プロバイダーは
+  `anthropic.` に固定され — 非 Anthropic / 画像 / Marketplace モデルは呼び出せず、blanket `*`
+  でもありません — アプリは Anthropic Messages ボディのみを使うためです。`BedrockModelId` は
+  UI が最初に開く既定値になり(引き続きアカウントのアクセスでゲートされます)、
+  `BedrockModelArns` でスコープを狭めたり非 Anthropic モデルを許可したりできます。**注意:**
+  これはアカウントレベルの Bedrock モデルアクセスを回避しません — 各モデルはアカウント/リージョン
+  で有効化されている必要があり、そうでなければ呼び出しは `AccessDenied` ではなく
+  `MODEL_NOT_ENABLED` で失敗します。
+
 ## v0.1.406
 
 ### 変更 (Changed)

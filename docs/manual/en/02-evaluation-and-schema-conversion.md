@@ -296,6 +296,68 @@ MySQL→PostgreSQL transpile:
   parsed becomes a clearly-marked placeholder flagged for manual work rather than
   silently dropped.
 
+### Foreign keys — enforced on DSQL, but applied *after* the data loads
+
+Aurora DSQL **enforces** foreign keys, so the tool **preserves** them by default (the
+**Preserve foreign keys** toggle above the DDL). But a foreign key is never part of
+the `CREATE TABLE` and is **never applied during Schema Apply** — it is rendered as a
+separate **post-load** statement:
+
+```sql
+ALTER TABLE "orders" ADD CONSTRAINT "fk_customer"
+  FOREIGN KEY ("customer_id") REFERENCES "customers" ("id") NOT VALID;
+```
+
+**Why it is deferred.** The bulk load writes parent and child tables **concurrently,
+in per-table primary-key order, with no parent-before-child sequencing**, so a child
+row can be written before its parent exists. If the foreign key were already enforced
+that write would fail (`SQLSTATE 23503`); and for a **CDC** migration the sink applies
+row changes **out of order across tables**, so an enforced FK during the stream would
+**dead-letter** those rows. The tool therefore adds the constraints only once the data
+is in a consistent state.
+
+**When they are applied:**
+
+- **Full Load only** — automatically, as a run-level pass **at the end of the load**.
+  The activity log records an `apply foreign keys` step (`N applied, S skipped,
+  F failed`).
+- **CDC** — **deferred to cut over**. After the final drain and **before** you repoint
+  the application, click **Apply foreign keys** in the cut-over runbook (Step 4). It is
+  idempotent — safe to re-run.
+
+`NOT VALID` is used because it is the only `ADD CONSTRAINT` form DSQL accepts: it adds
+the constraint **without scanning existing rows** and **enforces every new write
+immediately**; the already-loaded rows are then checked by a background
+`ALTER TABLE ASYNC … VALIDATE CONSTRAINT`.
+
+**Orphan pre-gate.** Before adding each FK the tool counts child rows whose parent is
+missing. If any exist, that FK is **skipped with an actionable note** (table / foreign
+key / row count) instead of failing with an opaque error — resolve the orphans (often
+an un-replicated source cascade) and click **Apply foreign keys** again.
+
+**In the preview.** Because the FKs run later and separately, the generated target
+script shows them in their own read-only **"Foreign keys — applied after Full Load"**
+section (not in the editable `CREATE` box), and the Apply results say the foreign keys
+were deferred. **A target with no foreign keys immediately after Schema Apply is
+expected, not a failure** — they appear at load end (Full Load) or at cut over (CDC).
+
+**Cascading actions are a CDC gap.** MySQL performs `ON DELETE`/`ON UPDATE CASCADE`
+(and `SET NULL`) *inside the engine*, and those cascaded child changes never reach the
+binary log — so CDC replicates the parent change but **not** the cascade, which can
+leave orphaned or stale child rows. Such FKs are flagged **MANUAL** at Evaluation;
+replace the automatic action with explicit child-row statements, or quiesce source
+writes before the final comparison (see
+[Chapter 4](04-cdc-and-dsql-constraints.md)).
+
+**Prefer to enforce integrity in the application?** Turn **Preserve foreign keys**
+off. The tool then strips the FK DDL from every path (the relationship is still kept as
+metadata for Validation's orphan check). This choice is remembered across a reconnect /
+instance restart, and the deferred-FK DDL itself is re-derived from the read-only
+source, so a crash never loses it. Note that enforced FKs add a per-write read cost and
+use commit-time optimistic concurrency (retryable `40001`), and that
+`CASCADE`/`SET NULL`/`SET DEFAULT` rows count toward DSQL's 3,000-rows-per-transaction
+limit.
+
 ### Query (DML) conversion and anti-pattern linting
 
 Beyond schema, the tool can convert queries and **lint your application's SQL** for

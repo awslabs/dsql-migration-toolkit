@@ -372,6 +372,38 @@ def test_capture_then_apply_restores_full_session() -> None:
     assert m2.active_substep == "full_load"
 
 
+def test_preserve_foreign_keys_toggle_round_trips_and_defaults_true() -> None:
+    # The "Preserve foreign keys" choice must survive a reconnect/restart: otherwise a
+    # restored session silently re-enables FK preservation and the post-load / cut-over
+    # pass would (re)create foreign keys the user deliberately dropped.
+    from dsql_migrator.core.session_state_store import SessionSnapshot
+
+    session, eval_state, conv_state, migration_state = _populated_states()
+    conv_state.preserve_foreign_keys = False
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, conv_state, migration_state
+    )
+    assert snapshot.preserve_foreign_keys is False
+
+    c2 = SchemaConversionState()
+    assert c2.preserve_foreign_keys is True  # app default before restore
+    apply_session_snapshot(
+        snapshot, SessionConnectionState(), EvaluationState(), c2, DataMigrationState()
+    )
+    assert c2.preserve_foreign_keys is False  # the strip-FKs choice is restored
+
+    # An older snapshot lacking the field restores to preserve-by-default (True), and
+    # apply overwrites (not merely leaves) the toggle so a False never lingers.
+    old = SessionSnapshot(session_id="s1")
+    assert old.preserve_foreign_keys is True
+    c3 = SchemaConversionState()
+    c3.preserve_foreign_keys = False
+    apply_session_snapshot(
+        old, SessionConnectionState(), EvaluationState(), c3, DataMigrationState()
+    )
+    assert c3.preserve_foreign_keys is True
+
+
 def test_ai_conversation_round_trips_through_a_snapshot() -> None:
     # The AI transcript is durable: it survives an app restart (snapshot round-trip),
     # not just a browser refresh. Credential-free content only.

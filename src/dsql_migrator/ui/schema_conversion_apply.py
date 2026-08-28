@@ -1114,6 +1114,51 @@ def split_sql_statements(text: str) -> list[str]:
     return [statement.strip() for statement in text.split(";") if statement.strip()]
 
 
+def _join_sql_statements(statements: Sequence[str]) -> str:
+    """Join statements into one script: each ``;``-terminated, blank-line separated.
+
+    Mirrors ``render_target_ddl``'s formatting so a split-then-join round-trips a
+    rendered target script unchanged (modulo whitespace).
+    """
+    return "\n\n".join(f"{s.rstrip().rstrip(';')};" for s in statements if s.strip())
+
+
+def split_target_ddl_fk_sections(script: str) -> tuple[str, str]:
+    """Split a rendered target-DDL script into ``(non_fk, fk)`` sub-scripts.
+
+    Separates the editable ``CREATE SCHEMA/TABLE/INDEX`` statements from the
+    deferred post-load ``ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY`` statements
+    so the UI can present the foreign keys in their own read-only "applied after
+    Full Load" section instead of intermixed in the editable box (which reads as
+    "Schema Apply will create these FKs" when it deliberately will not). Statement
+    order within each bucket is preserved and each statement is ``;``-terminated;
+    either sub-script may be empty (a table with no FKs -> empty ``fk``). This is a
+    PRESENTATION split only: recombining with :func:`join_target_ddl_fk_sections`
+    yields the same statement set, so the STORED edited DDL stays a full script and
+    the apply path (which already excludes the FK ALTERs, see
+    :func:`override_apply_objects`) is unaffected.
+    """
+    statements = split_sql_statements(script)
+    fk = [stmt for stmt in statements if _is_foreign_key_ddl(stmt)]
+    # Nothing to separate: return the script VERBATIM so a table with no foreign
+    # keys (the common case) is displayed/edited exactly as before -- re-splitting
+    # and re-joining would reflow whitespace and could mangle a trailing comment.
+    if not fk:
+        return script, ""
+    non_fk = [stmt for stmt in statements if not _is_foreign_key_ddl(stmt)]
+    return _join_sql_statements(non_fk), _join_sql_statements(fk)
+
+
+def join_target_ddl_fk_sections(non_fk: str, fk: str) -> str:
+    """Recombine an edited non-FK script with its read-only FK section into one
+    stored target-DDL script (blank-line separated), so ``edited_target_ddls`` stays
+    a full script and the deferred FKs still reach the post-load pass. The inverse
+    of :func:`split_target_ddl_fk_sections`; an empty part is dropped.
+    """
+    parts = [part.strip() for part in (non_fk, fk) if part.strip()]
+    return "\n\n".join(parts)
+
+
 # A factory that builds a core per-statement applier for a target + AWS profile.
 # Injectable so tests drive the adapter with a fake core applier (no AWS).
 CoreApplierFactory = Callable[[TargetConnectionConfig, Optional[str]], object]

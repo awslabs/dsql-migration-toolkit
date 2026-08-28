@@ -70,6 +70,13 @@ class SessionSnapshot(BaseModel):
     # a TINYINT(1)->smallint remap) instead of reverting to the deterministic
     # conversion and clobbering the applied target schema.
     edited_target_ddls: dict[str, str] = Field(default_factory=dict)
+    # Step 2 (Schema Conversion): the "Preserve foreign keys" toggle. Persisted so a
+    # reconnect/restart REMEMBERS a strip-FKs choice instead of reverting to the
+    # preserve default -- otherwise a restored session silently re-enables FK
+    # preservation and the post-load / cut-over pass would (re)create foreign keys
+    # the user deliberately dropped. Non-secret. Older snapshots lack it and restore
+    # as True (the app's preserve-by-default), matching pre-persistence behavior.
+    preserve_foreign_keys: bool = True
     # Step 3 (Data Migration) job linkage + table selection.
     migration_job_id: Optional[str] = None
     migration_selection: TableSelection = Field(default_factory=TableSelection)

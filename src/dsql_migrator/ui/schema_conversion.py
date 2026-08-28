@@ -168,11 +168,13 @@ from dsql_migrator.ui.schema_conversion_apply import (  # noqa: F401
     format_statement_summary,
     identity_from_ddl,
     job_status_to_step_status,
+    join_target_ddl_fk_sections,
     override_apply_objects,
     replace_confirmation_message,
     run_schema_apply,
     schema_apply_is_complete,
     split_sql_statements,
+    split_target_ddl_fk_sections,
 )
 
 # Tree node id prefixes, so a selected node maps back to a source object.
@@ -2197,6 +2199,27 @@ def build_schema_conversion_screen(
                         "(Aurora DSQL) browser above; use its refresh icon to "
                         "refresh again."
                     ).classes("text-xs text-gray-500")
+                    # Make the applied set's exclusion of foreign keys explicit, so a
+                    # target with zero FKs right after Apply reads as "deferred by
+                    # design" rather than "silently dropped". The FK ADD CONSTRAINTs
+                    # are a post-load pass (Full Load end / CDC cut over), never part
+                    # of Schema Apply (the concurrent bulk load has no
+                    # parent-before-child ordering). Only meaningful while FKs are
+                    # preserved; when stripped there is nothing deferred to explain.
+                    if conv_state.preserve_foreign_keys:
+                        render_notice(
+                            ui,
+                            tone="info",
+                            header="Foreign keys are applied after Full Load, not here",
+                            body=(
+                                "Preserved foreign keys are intentionally NOT in this "
+                                "apply — they are (re)created as a post-load "
+                                "ALTER TABLE … ADD CONSTRAINT pass after Full Load (at "
+                                "cut over for a CDC migration). A target with no foreign "
+                                "keys immediately after Schema Apply is expected, not a "
+                                "failure."
+                            ),
+                        )
 
                 # Auto-refresh the target browser once after a successful apply so
                 # newly created objects appear without a manual refresh. The flag
@@ -2732,6 +2755,19 @@ def _render_browser_and_preview(
                 ui.label(  # type: ignore[attr-defined]
                     'Generated below — use "Reset all" to generate a new selection.'
                 ).classes("text-xs text-gray-500")
+
+    # Make the deferred-FK behavior legible right at the toggle (not only in the
+    # hover tooltip): the generated target DDL ends with post-load ADD CONSTRAINT
+    # lines that Schema Apply deliberately does NOT run, so state plainly WHEN the
+    # foreign keys appear -- otherwise the target having zero FKs right after Apply
+    # reads as a bug ("why is the FK missing?") rather than the intended design.
+    if conv_state.preserve_foreign_keys:
+        ui.label(  # type: ignore[attr-defined]
+            "Foreign keys are (re)created after Full Load (at cut over for a CDC "
+            "migration), not at Schema Apply — so the target has none immediately "
+            "after Apply. This is by design (the concurrent bulk load has no "
+            "parent-before-child ordering)."
+        ).classes("text-xs text-gray-600")
 
     # --- Generated DDL comparison (only after Generate) -------------------
     if conv_state.generated_node_ids is None:
@@ -3648,6 +3684,42 @@ def _render_ddl_diff(
             _render_ddl_pane(ui, target_ddl, language="PostgreSQL", divider=False)
 
 
+def _render_fk_section(ui: object, fk_ddl: str) -> None:
+    """Render the deferred foreign keys as a labeled, read-only section.
+
+    The generated target script's foreign keys are post-load ``ALTER TABLE ...
+    ADD CONSTRAINT`` statements that Schema Apply does NOT run (the concurrent,
+    cross-table bulk load has no parent-before-child ordering); they are
+    (re)created AFTER Full Load (at cut over for a CDC migration). Presenting them
+    in their own read-only "applied after Full Load" section -- rather than
+    intermixed in the editable box -- signals "this runs later, separately," which
+    is why the target has no foreign keys immediately after Apply. A no-op when
+    there are no foreign keys (e.g. FK preservation is off, or the table has none).
+    """
+    if not fk_ddl.strip():
+        return
+    render_notice(
+        ui,
+        tone="info",
+        header="Foreign keys — applied after Full Load, not at Schema Apply",
+        body=(
+            "These ALTER TABLE … ADD CONSTRAINT statements are (re)created as a "
+            "post-load pass (at cut over for a CDC migration), so they are shown "
+            "read-only here and are NOT part of this object's Schema Apply."
+        ),
+    )
+    ui.add_css(_DDL_PANE_CSS)  # type: ignore[attr-defined]
+    with ui.element("div").classes("w-full min-w-0"):  # type: ignore[attr-defined]
+        # ``disable`` (not ``readonly``) blocks input on NiceGUI's CodeMirror -- the
+        # same read-only treatment as the source/target comparison panes.
+        ui.codemirror(  # type: ignore[attr-defined]
+            fk_ddl,
+            language="PostgreSQL",
+            theme="basicLight",
+            line_wrapping=False,
+        ).classes("w-full ddl-pane").props("disable")
+
+
 def _render_editable_target(
     ui: object,
     preview: DdlPreview,
@@ -3708,6 +3780,14 @@ def _render_editable_target(
         editor_box.clear()  # type: ignore[attr-defined]
         edited = conv_state.get_edited_target_ddl(preview.object_name)
         current = edited if edited is not None else preview.target_ddl
+        # Present the deferred foreign keys in their OWN read-only section (see
+        # _render_fk_section) instead of intermixed in the editable box, so a user
+        # does not read the FK ALTERs as something Schema Apply will run. The editor
+        # and diff show only the CREATE statements; the FK section is shown below.
+        # The stored edited DDL is kept WHOLE by recombining on edit
+        # (join_target_ddl_fk_sections), so the apply path and the post-load FK pass
+        # are unaffected -- this is a presentation split only.
+        create_ddl, fk_ddl = split_target_ddl_fk_sections(current)
         applied = conv_state.get_apply_result(preview.object_name)
         with editor_box:  # type: ignore[attr-defined]
             if not editing:
@@ -3719,8 +3799,9 @@ def _render_editable_target(
                         "text-xs text-gray-500"
                     )
                 _render_ddl_diff(
-                    ui, preview.source_ddl, current, source_type=source_type
+                    ui, preview.source_ddl, create_ddl, source_type=source_type
                 )
+                _render_fk_section(ui, fk_ddl)
                 ui.separator().classes("mt-1")  # type: ignore[attr-defined]
                 with ui.row().classes("items-center gap-2 w-full no-wrap"):  # type: ignore[attr-defined]
                     ui.button(  # type: ignore[attr-defined]
@@ -3743,9 +3824,16 @@ def _render_editable_target(
                         _apply_btn.on_click(lambda _e=None, b=_apply_btn: apply_click(b))
             else:
                 # Editing view (CodeMirror). Edits update the per-object buffer.
+                # The editor holds only the CREATE statements; the deferred FK block
+                # (shown read-only below) is recombined back in on every keystroke so
+                # the STORED target DDL stays whole and the post-load FK pass still
+                # gets its ADD CONSTRAINTs.
                 def on_edit(event: object) -> None:
                     conv_state.set_edited_target_ddl(
-                        preview.object_name, getattr(event, "value", "") or ""
+                        preview.object_name,
+                        join_target_ddl_fk_sections(
+                            getattr(event, "value", "") or "", fk_ddl
+                        ),
                     )
 
                 # SAME header band as the read-only comparison, so the editor is never an
@@ -3784,12 +3872,13 @@ def _render_editable_target(
                             ),
                         )
                     ui.codemirror(  # type: ignore[attr-defined]
-                        current,
+                        create_ddl,
                         language="PostgreSQL",
                         theme="basicLight",
                         line_wrapping=False,
                         on_change=on_edit,
                     ).classes("w-full ddl-pane")
+                _render_fk_section(ui, fk_ddl)
                 with ui.row().classes("items-center gap-2 w-full no-wrap"):  # type: ignore[attr-defined]
                     ui.button(  # type: ignore[attr-defined]
                         "Done", on_click=lambda: render(editing=False)
@@ -4107,6 +4196,8 @@ __all__ = [
     "build_view_preview",
     "preview_for_selection",
     "split_sql_statements",
+    "split_target_ddl_fk_sections",
+    "join_target_ddl_fk_sections",
     "SchemaConversionState",
     "SchemaConversionStore",
     "build_schema_conversion_screen",

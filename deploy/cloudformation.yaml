@@ -170,7 +170,7 @@ Parameters:
   # default and refresh the tag to the released version.
   ContainerImageUri:
     Type: String
-    Default: public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.406
+    Default: public.ecr.aws/z0q0i9j0/mysql-dsql-migrator:0.1.409
     Description: >
       App container image URI. Defaults to the published ECR Public image, so a
       normal deploy needs NO image build -- Fargate pulls it directly (works from
@@ -340,16 +340,18 @@ Parameters:
     AllowedValues: ["true", "false"]
     Description: >
       Opt-in AI-assisted conversion. When false, bedrock:InvokeModel is NOT
-      granted. When true, it is granted scoped to BedrockModelArns only.
+      granted. When true, it is granted scoped to Anthropic models (or to
+      BedrockModelArns when that override is set).
 
   BedrockModelArns:
     Type: CommaDelimitedList
     Default: ""
     Description: >
       OPTIONAL override of the foundation-model/inference-profile ARN(s) the task
-      role may invoke when EnableAiAssist=true. Leave EMPTY (default) to have the
-      scope auto-derived from BedrockModelId. Set it only to use a model not in the
-      BedrockModelId list, or to scope differently (comma-separated ARNs).
+      role may invoke when EnableAiAssist=true. Leave EMPTY (default) for the
+      provider-scoped default (any Anthropic model, so the UI can switch models
+      without a redeploy). Set it to NARROW the scope to specific ARN(s), or to
+      allow a NON-Anthropic model (comma-separated ARNs).
 
   BedrockRegion:
     Type: String
@@ -358,11 +360,13 @@ Parameters:
 
   BedrockModelId:
     Type: String
-    # MUST match DEFAULT_BEDROCK_MODEL_ID in src/dsql_migrator/ui/ai_assist.py. The IAM
-    # scope below is derived from THIS value, while the app falls back to its own default
-    # when the Connect form's Model ID is left blank -- so a mismatch produces an
-    # AccessDenied on "Verify AI access" that looks like a permissions bug rather than a
-    # config drift. It was `us.` here against `global.` in the app for exactly that reason.
+    # SHOULD match DEFAULT_BEDROCK_MODEL_ID in src/dsql_migrator/ui/ai_assist.py: this is
+    # the model the app STARTS with (it seeds the Connect form's Model ID and the app
+    # falls back to it when that field is blank). The IAM scope below is provider-wide
+    # (any Anthropic model), NOT derived from this value, so switching the UI Model ID to
+    # another Anthropic model no longer needs a redeploy and no longer risks the
+    # AccessDenied-looking mismatch this used to cause. It still must be a model the
+    # account has ENABLED (else the call fails MODEL_NOT_ENABLED).
     #
     # Every allowed value is a `global.` profile, which resolves from any commercial
     # region. The `us.` profiles this list used to offer only resolve from
@@ -380,14 +384,13 @@ Parameters:
       - global.anthropic.claude-opus-4-8
       - global.anthropic.claude-sonnet-4-6
     Description: >
-      Anthropic cross-region inference profile for AI-assisted conversion
-      (BEDROCK_MODEL_ID). Every option is a `global.` profile, which resolves from
-      any commercial region -- including ap-northeast-2/Seoul and eu-*.
-      When EnableAiAssist=true, the task role's bedrock:InvokeModel scope is
-      DERIVED from this automatically (the profile ARN in the deploy region +
-      the underlying anthropic foundation-model, region-agnostic) -- you do not
-      need to supply BedrockModelArns. The model must be access-enabled in your
-      account and region.
+      Anthropic cross-region inference profile the app STARTS with for AI-assisted
+      conversion (BEDROCK_MODEL_ID). Every option is a `global.` profile, which
+      resolves from any commercial region -- including ap-northeast-2/Seoul and eu-*.
+      When EnableAiAssist=true, the task role may invoke ANY Anthropic model
+      (provider-scoped), so you can switch the Model ID in the UI without a redeploy
+      and do not need to supply BedrockModelArns. This value is just the default the
+      UI opens with. Any model you use must be access-enabled in your account/region.
 
 # Reject insecure deployment combinations at create/update time (before any
 # resource is provisioned). The app enforces NO auth of its own -- it relies on
@@ -1222,25 +1225,29 @@ Resources:
               - bedrock:InvokeModel
               - bedrock:InvokeModelWithResponseStream
             Resource:
-              # Explicit BedrockModelArns override, else auto-derived scope,
-              # REGION-AGNOSTIC so it works for us. / global. (and apac.) profiles:
-              #   1) the inference profile in THIS deploy region/account, plus
-              #   2) the underlying anthropic foundation-model, scoped to the exact
-              #      model id but ANY region (`*`) -- a geo profile routes to a
-              #      geo-specific and/or region-less set (us: us-east/west; global:
-              #      region-less + calling region; apac: 8 ap-* regions), so we
-              #      cannot enumerate member regions per geo. The `*` is on the
-              #      REGION only; the model id stays exact (never a blanket `*`).
-              # Fm = model id minus its geo prefix: split on "anthropic." (present in
-              # every profile id: us./global./apac.anthropic.<model>) and re-prepend.
+              # Explicit BedrockModelArns override, else a PROVIDER-SCOPED default:
+              # ANY Anthropic model the account may invoke -- so the operator can
+              # switch the UI "Model ID" among Anthropic models (current OR future)
+              # WITHOUT redeploying to widen this policy. Two ARNs cover both invoke
+              # shapes, both pinned to the `anthropic.` provider:
+              #   1) inference-profile/*.anthropic.* -- any geo cross-region profile
+              #      (global./us./apac.anthropic.<model>) in THIS account, any region;
+              #   2) foundation-model/anthropic.*    -- any Anthropic foundation model,
+              #      any region (foundation-model ARNs are AWS-owned: no account id).
+              # The provider stays pinned to `anthropic.`, so non-Anthropic / image /
+              # Marketplace models are NEVER invokable (the app only speaks the
+              # Anthropic Messages body anyway), and it is never a blanket `*`. The
+              # region is `*` on BOTH so a BedrockRegion different from the deploy
+              # region still resolves (the "Region" field on the Connect form).
+              # NB: broad IAM does NOT bypass account-level Bedrock model access --
+              # each model must still be enabled in the account/region (otherwise the
+              # call fails MODEL_NOT_ENABLED, not AccessDenied). Set BedrockModelArns
+              # to narrow this to specific ARN(s) or to allow a non-Anthropic model.
               Fn::If:
                 - HasBedrockModelArnsOverride
                 - Ref: BedrockModelArns
-                - - Fn::Sub: arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}
-                  - Fn::Sub:
-                      - arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.${Fm}
-                      - Fm:
-                          Fn::Select: [1, Fn::Split: ["anthropic.", Ref: BedrockModelId]]
+                - - Fn::Sub: arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*.anthropic.*
+                  - Fn::Sub: arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.*
 
   AlbSecurityGroup:
     Type: AWS::EC2::SecurityGroup

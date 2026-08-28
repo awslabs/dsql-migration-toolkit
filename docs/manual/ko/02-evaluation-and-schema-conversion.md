@@ -240,6 +240,59 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
 - **뷰**는 PostgreSQL `CREATE VIEW`로 변환합니다. 파싱할 수 없는 정의는 조용히 버리지 않고, 수동 작업
   플래그가 붙은 명확한 자리표시자(placeholder)로 표시합니다.
 
+### 외래 키 — DSQL에서 강제되지만, 데이터 적재 *이후*에 적용
+
+Aurora DSQL은 외래 키를 **강제(enforce)**하므로, 도구는 기본적으로 외래 키를 **보존**합니다
+(DDL 위의 **Preserve foreign keys** 토글). 하지만 외래 키는 `CREATE TABLE`의 일부가 아니며
+**Schema Apply 단계에서 적용되지 않습니다** — 별도의 **적재-후(post-load)** 문으로 렌더링됩니다:
+
+```sql
+ALTER TABLE "orders" ADD CONSTRAINT "fk_customer"
+  FOREIGN KEY ("customer_id") REFERENCES "customers" ("id") NOT VALID;
+```
+
+**왜 미루는가.** 벌크 적재는 부모·자식 테이블을 **동시에, 테이블별 기본키 순서로, 부모→자식
+순서 보장 없이** 씁니다. 그래서 자식 행이 부모보다 먼저 기록될 수 있습니다. 외래 키가 이미
+강제되고 있었다면 그 쓰기는 실패하고(`SQLSTATE 23503`), **CDC** 마이그레이션에서는 싱크가 행
+변경을 **테이블 간 순서가 뒤섞인 채** 적용하므로 스트리밍 중 외래 키가 있으면 해당 행이
+**dead-letter** 처리됩니다. 따라서 도구는 데이터가 일관된 상태가 된 뒤에만 제약을 추가합니다.
+
+**언제 적용되는가:**
+
+- **Full Load 전용** — **적재 종료 시점**에 런-레벨 패스로 자동 적용됩니다. 활동 로그에
+  `apply foreign keys` 단계(`N applied, S skipped, F failed`)가 기록됩니다.
+- **CDC** — **cut over로 지연**됩니다. 최종 드레인 후 애플리케이션을 재지정(repoint)하기
+  **전에**, cut-over 런북(Step 4)에서 **Apply foreign keys**를 클릭하세요. 멱등이므로 다시
+  실행해도 안전합니다.
+
+`NOT VALID`를 쓰는 이유는 DSQL이 받아들이는 유일한 `ADD CONSTRAINT` 형태이기 때문입니다:
+기존 행을 **스캔하지 않고** 제약을 추가하면서 **모든 신규 쓰기를 즉시 강제**합니다. 이미 적재된
+행은 이후 백그라운드 `ALTER TABLE ASYNC … VALIDATE CONSTRAINT`로 검증됩니다.
+
+**Orphan(고아) 사전 게이트.** 각 FK를 추가하기 전에 도구는 부모가 없는 자식 행 수를 셉니다.
+있으면 그 FK는 불투명한 오류로 실패하는 대신 **실행 가능한 안내(테이블 / 외래 키 / 행 수)와 함께
+건너뜁니다** — 고아 행을 해결(대개 복제되지 않은 소스 cascade가 원인)한 뒤 **Apply foreign
+keys**를 다시 클릭하세요.
+
+**미리보기에서.** FK는 나중에 별도로 실행되므로, 생성된 대상 스크립트는 이를 편집 가능한
+`CREATE` 박스가 아니라 별도의 읽기 전용 **"Foreign keys — applied after Full Load"** 섹션에
+보여주며, Apply 결과도 외래 키가 지연되었음을 알립니다. **Schema Apply 직후 대상에 외래 키가
+없는 것은 정상이며 실패가 아닙니다** — 적재 종료 시(Full Load) 또는 cut over 시(CDC) 나타납니다.
+
+**Cascade 동작은 CDC의 공백입니다.** MySQL은 `ON DELETE`/`ON UPDATE CASCADE`(및 `SET NULL`)를
+*엔진 내부에서* 수행하고, 그 cascade된 자식 변경은 바이너리 로그에 남지 않습니다 — 그래서 CDC는
+부모 변경만 복제하고 **cascade는 복제하지 않아** 고아/낡은 자식 행이 남을 수 있습니다. 이런
+FK는 Evaluation에서 **MANUAL**로 표시됩니다. 자동 동작을 명시적 자식-행 문으로 바꾸거나, 최종
+비교 전에 소스 쓰기를 정지(quiesce)하세요(자세히는
+[4장](04-cdc-and-dsql-constraints.md) 참고).
+
+**무결성을 애플리케이션에서 강제하고 싶다면?** **Preserve foreign keys**를 끄세요. 그러면
+도구가 모든 경로에서 FK DDL을 떼어 냅니다(관계는 Validation의 orphan 검사를 위해 메타데이터로는
+유지). 이 선택은 재접속 / 인스턴스 재시작 후에도 기억되며, 지연된 FK DDL 자체는 읽기 전용
+소스에서 다시 도출되므로 크래시로 유실되지 않습니다. 참고로 강제된 FK는 쓰기당 추가 읽기 비용이
+있고 커밋 시점 낙관적 동시성(재시도 가능한 `40001`)을 쓰며, `CASCADE`/`SET NULL`/`SET DEFAULT`
+행은 DSQL의 트랜잭션당 3,000행 한도에 포함됩니다.
+
 ### 쿼리(DML) 변환과 안티패턴 린팅
 
 스키마 외에도 도구는 쿼리를 변환하고, DSQL이 받아들이지 않거나 규모가 커지면 성능이 나오지 않을

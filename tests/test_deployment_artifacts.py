@@ -1529,31 +1529,36 @@ def test_bedrock_invoke_is_opt_in_and_scoped(template: dict) -> None:
 
     statement = policy["Properties"]["PolicyDocument"]["Statement"][0]
     assert "bedrock:InvokeModel" in statement["Action"]
-    # Resource is an Fn::If: an explicit BedrockModelArns override, or an
-    # auto-derived scoped list (profile + foundation-model ARNs). Never "*".
+    # Resource is an Fn::If: an explicit BedrockModelArns override, or the
+    # provider-scoped Anthropic default (inference-profile + foundation-model).
+    # Never a blanket "*"; the provider stays pinned to `anthropic.` so a UI model
+    # switch among Anthropic models needs no redeploy but non-Anthropic / image /
+    # Marketplace models are never invokable.
     resource = statement["Resource"]
     assert resource != "*"
     fn_if = resource["Fn::If"]
     assert fn_if[0] == "HasBedrockModelArnsOverride"
     assert fn_if[1] == {"Ref": "BedrockModelArns"}
     derived = fn_if[2]
-    # Region-agnostic scope: the inference-profile ARN (this deploy region) + ONE
-    # region-agnostic foundation-model ARN (region `*`, exact model id). This works
-    # for us./global./apac. profiles without enumerating per-geo member regions.
-    assert isinstance(derived, list) and len(derived) == 2  # profile + FM (any region)
-    # The only `*` allowed is the REGION field of the foundation-model ARN; the
-    # resource must never be a blanket "*" and the model id stays exact.
-    assert resource != "*"
-    fm_arn = derived[1]["Fn::Sub"][0]
-    assert ":bedrock:*::foundation-model/anthropic.${Fm}" in fm_arn
-    # No wildcard on the model id / action scope beyond that region field.
+    assert isinstance(derived, list) and len(derived) == 2  # profile + foundation-model
+    profile_arn = derived[0]["Fn::Sub"]
+    fm_arn = derived[1]["Fn::Sub"]
+    # Account-scoped Anthropic inference profiles (any geo, any region) + any
+    # Anthropic foundation model (region-agnostic, AWS-owned so no account id).
+    assert "${AWS::AccountId}:inference-profile/*.anthropic.*" in profile_arn
+    assert ":bedrock:*::foundation-model/anthropic.*" in fm_arn
+    # Provider PINNED to anthropic. -> never a provider-less wildcard, never "*".
+    assert ".anthropic." in profile_arn
+    assert "foundation-model/anthropic." in fm_arn
     assert "foundation-model/*" not in str(derived)
+    assert "inference-profile/*\"" not in str(derived)  # not a bare inference-profile/*
 
 
 def test_bedrock_model_id_is_curated_dropdown_with_auto_scope(template: dict) -> None:
-    """BedrockModelId is a curated Anthropic picker; the IAM scope is auto-derived
-    from it (HasBedrockModelArnsOverride is false on the empty default), so an
-    operator enables AI by toggling EnableAiAssist + picking a model -- no ARNs."""
+    """BedrockModelId is a curated Anthropic picker for the app's DEFAULT model; the
+    IAM scope is provider-wide (any Anthropic), not derived from this value, and
+    HasBedrockModelArnsOverride is false on the empty default -- so an operator
+    enables AI by toggling EnableAiAssist + picking a model, with no ARNs."""
     spec = template["Parameters"]["BedrockModelId"]
     allowed = spec["AllowedValues"]
     assert spec["Default"] in allowed

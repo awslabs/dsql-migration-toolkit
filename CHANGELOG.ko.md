@@ -5,6 +5,64 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.409
+
+### 변경 (Changed)
+
+- **`0.1.409` 이미지를 세 개 레지스트리 모두에 게시하고 `deploy/cloudformation.yaml`의
+  `ContainerImageUri` 기본값을 `0.1.406 → 0.1.409`로 갱신**했습니다. 새로 `git clone`해
+  배포하면 Bedrock 프로바이더 스코프(v0.1.407), 외래 키 가독성(v0.1.408), preserve 토글
+  영속화(v0.1.409)가 포함된 이미지를 받습니다. 배포된 Seoul 스택(`mysql-dsql-migrator-seoul`,
+  ap-northeast-2)도 `0.1.409` 이미지로 업데이트했습니다.
+
+### 수정 (Fixed)
+
+- **"Preserve foreign keys" 선택이 이제 재접속 / 인스턴스 재시작 후에도 유지됩니다.**
+  세션 스냅샷에 저장되지 않아 복원 시 조용히 "보존 기본값"으로 되돌아갔고 — 즉 외래 키를
+  **제거(strip)** 하기로 한 사용자가 크래시나 Fargate 태스크 교체 후 로드-후/컷오버 FK
+  패스로 외래 키가 다시 생성될 수 있었습니다. 이제 이 토글이 나머지 (비밀이 아닌) 워크벤치
+  상태와 함께 저장/복원됩니다(구 스냅샷은 preserve=True로 복원, 기존 동작과 동일). 지연된
+  외래 키 자체는 이미 크래시-안전했습니다: FK `ADD CONSTRAINT` DDL은 저장된 소스 인벤토리에서
+  다시 도출되어 멱등 적용되므로, 크래시/재시작 후 재개되고 FK 패스가 다시 실행됩니다. (참고:
+  소스 자격증명은 절대 저장하지 않으므로(Property 7) 세션 스냅샷이 완전히 소실되면 스키마는
+  Connect 재접속 + Evaluation 재실행으로 복원해야 하며 자동으로 다시 읽을 수 없습니다.)
+
+## v0.1.408
+
+### 변경 (Changed)
+
+- **Schema Conversion에서 지연 적용되는 외래 키를 명확히 보이게 했습니다(지연-적용 설계
+  자체는 변경 없음).** 기존에는 생성된 대상 DDL이 로드-후 `ALTER TABLE … ADD CONSTRAINT …
+  FOREIGN KEY … NOT VALID` 줄을 편집 가능한 `CREATE` 문과 섞어 보여줘서, 적용 후 대상에
+  외래 키가 하나도 없으면 "왜 FK가 없지?"로 읽혔습니다. 이제:
+  - 편집 대상-DDL 박스(및 diff)는 `CREATE SCHEMA/TABLE/INDEX` 문만 보이고, 외래 키는
+    별도의 읽기 전용 **"Foreign keys — applied after Full Load, not at Schema Apply"**
+    섹션에 나타납니다(편집 시 재결합으로 저장 DDL은 온전히 유지되어 로드-후 FK 패스가
+    그대로 받습니다);
+  - **"Preserve foreign keys"** 토글의 캡션과 적용 결과의 info 알림이, 외래 키는 Schema
+    Apply가 아니라 Full Load 이후(CDC는 컷오버 시)에 (재)생성된다고 분명히 말합니다;
+  - **Full-Load 전용** 실행은 이제 활동 로그에 `apply foreign keys` 단계(`N applied,
+    S skipped, F failed`)를 남겨, CDC 컷오버의 "Apply foreign keys" 동작과 동일하게
+    로드 종료 시 외래 키가 (재)생성되는 것이 눈에 보입니다.
+
+## v0.1.407
+
+### 변경 (Changed)
+
+- **Bedrock `InvokeModel` IAM 범위를 배포 시점의 단일 `BedrockModelId`가 아니라
+  프로바이더 전체(모든 Anthropic 모델)로 넓혔습니다.** 이제 운영자는 정책을 넓히려고
+  재배포하지 않고도 Connect 폼의 Model ID를 다른 Anthropic 모델로 바꿀 수 있습니다.
+  `BedrockModelArns` 오버라이드가 없으면 task role의
+  `bedrock:InvokeModel`/`InvokeModelWithResponseStream`은
+  `inference-profile/*.anthropic.*`(이 계정, 모든 리전)와
+  `foundation-model/anthropic.*`(모든 리전)로 스코프됩니다. 프로바이더는 `anthropic.`로
+  고정되어 — 비-Anthropic / 이미지 / Marketplace 모델은 절대 호출 불가, blanket `*`도 아님 —
+  앱이 Anthropic Messages body만 사용하기 때문입니다. `BedrockModelId`는 이제 UI가 시작할 때
+  여는 기본값일 뿐이고(여전히 계정 액세스로 게이팅됨), `BedrockModelArns`로 범위를 좁히거나
+  비-Anthropic 모델을 허용할 수 있습니다. **주의:** 이는 계정 수준 Bedrock 모델 액세스를
+  우회하지 않습니다 — 각 모델은 여전히 계정/리전에서 활성화되어 있어야 하며, 아니면 호출이
+  `AccessDenied`가 아니라 `MODEL_NOT_ENABLED`로 실패합니다.
+
 ## v0.1.406
 
 ### 변경 (Changed)

@@ -3072,6 +3072,88 @@ def test_ddl_comparison_shows_the_edited_ddl_not_the_generated_one() -> None:
     assert _StubPreview.target_ddl not in targets, targets
 
 
+def test_split_target_ddl_fk_sections_separates_and_roundtrips() -> None:
+    from dsql_migrator.ui.schema_conversion import (
+        join_target_ddl_fk_sections,
+        render_target_ddl,
+        split_target_ddl_fk_sections,
+    )
+
+    script = render_target_ddl(_converted().tables[0])  # orders, has fk_customer
+    create, fk = split_target_ddl_fk_sections(script)
+    # CREATE side keeps the table + indexes but NOT the deferred FK ALTER.
+    assert "CREATE TABLE" in create
+    assert "ALTER TABLE" not in create.upper()
+    # FK side is ONLY the post-load ADD CONSTRAINT.
+    assert 'ADD CONSTRAINT "fk_customer"' in fk
+    assert "CREATE TABLE" not in fk.upper()
+    # Recombining keeps both (so the stored script stays whole for the post-load pass).
+    joined = join_target_ddl_fk_sections(create, fk)
+    assert "CREATE TABLE" in joined and 'ADD CONSTRAINT "fk_customer"' in joined
+
+
+def test_split_target_ddl_fk_sections_verbatim_when_no_fk() -> None:
+    from dsql_migrator.ui.schema_conversion import split_target_ddl_fk_sections
+
+    # Nothing to separate -> the script is returned untouched (no reflow/mangling).
+    script = 'CREATE TABLE "t" ("id" INT); -- note'
+    create, fk = split_target_ddl_fk_sections(script)
+    assert create == script
+    assert fk == ""
+
+
+def test_editing_create_part_preserves_fk_for_post_load_pass() -> None:
+    # Risk-B guard: the editable box shows only CREATE, but on edit the FK section is
+    # recombined back, so the STORED edited DDL keeps the FK ALTER and
+    # applied_table_conversions still feeds it to the post-load foreign-key pass.
+    from dsql_migrator.ui.schema_conversion import (
+        join_target_ddl_fk_sections,
+        render_target_ddl,
+        split_target_ddl_fk_sections,
+    )
+
+    result = _converted()
+    conversion = next(t for t in result.tables if t.table == "orders")
+    create, fk = split_target_ddl_fk_sections(render_target_ddl(conversion))
+    # The user edits ONLY the CREATE part (the FK section is read-only).
+    create_edited = (
+        create + '\n\nCREATE INDEX ASYNC "ix_new_fk" ON "orders" ("customer_id");'
+    )
+    stored = join_target_ddl_fk_sections(create_edited, fk)
+
+    applied = applied_table_conversions(result, {"orders": stored})
+    # The CREATE edit is honored...
+    assert any("ix_new_fk" in ddl for ddl in applied["orders"].index_ddls)
+    # ...and the foreign key still reaches the post-load pass (not dropped by the split).
+    assert applied["orders"].foreign_key_ddls
+    assert 'ADD CONSTRAINT "fk_customer"' in applied["orders"].foreign_key_ddls[0]
+
+
+def test_editable_target_shows_fk_in_separate_readonly_section() -> None:
+    # The FK ADD CONSTRAINT is rendered in its own read-only pane, not intermixed in
+    # the editable/diff target (which shows CREATE only).
+    from dsql_migrator.ui.schema_conversion import (
+        _render_editable_target,
+        render_target_ddl,
+    )
+
+    script = render_target_ddl(_converted().tables[0])  # orders + fk_customer
+    ui = _editable_target_ui()
+    _render_editable_target(ui, _StubPreview(), _StubConvState(edited=script))
+
+    pg_editors = [e for e in ui.editors if e.get("language") == "PostgreSQL"]
+    fk_panes = [e for e in pg_editors if "ADD CONSTRAINT" in e["value"]]
+    diff_targets = [e for e in pg_editors if "ADD CONSTRAINT" not in e["value"]]
+    # A separate FK pane exists and is read-only (disabled), and the diff target is
+    # CREATE-only (the FK ALTER is not shown in the editable comparison).
+    assert fk_panes, pg_editors
+    assert all("disable" in " ".join(e["props"]) for e in fk_panes)
+    assert diff_targets and all(
+        "CREATE TABLE" in e["value"] and "ALTER TABLE" not in e["value"].upper()
+        for e in diff_targets
+    )
+
+
 def _editable_target_ui():
     """A ``_DdlPaneUi`` that also records buttons, so both modes can be inspected."""
 

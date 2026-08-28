@@ -2465,11 +2465,33 @@ def _apply_foreign_keys(migrator: DataMigrator) -> None:
     application, not treated as data loss.
     """
     hook = getattr(migrator, "apply_foreign_keys", None)
-    if callable(hook):
-        try:
-            hook()
-        except Exception:  # noqa: BLE001 - optional post-pass; never fail the run
-            _LOGGER.warning("Foreign-key apply pass failed", exc_info=True)
+    if not callable(hook):
+        return
+    try:
+        counts = hook()
+    except Exception:  # noqa: BLE001 - optional post-pass; never fail the run
+        _LOGGER.warning("Foreign-key apply pass failed", exc_info=True)
+        return
+    # Surface the post-load FK pass as a NAMED step in the activity log (the
+    # migration's visible audit trail), mirroring the CDC cut-over "Apply foreign
+    # keys" action, so a Full-Load-only run shows the foreign keys being (re)created
+    # at load end instead of leaving the user wondering where they went. Emitted
+    # only when the pass actually ran over >=1 FK: a load with no preserved FKs, or a
+    # CDC run that defers them to cut over, returns (0, 0, 0) -> no noise. A hook that
+    # returns nothing (older/test double) is tolerated (no summary line).
+    if not isinstance(counts, tuple) or len(counts) != 3:
+        return
+    applied, skipped, failed = counts
+    if applied or skipped or failed:
+        log_activity(
+            ActivityCategory.FULL_LOAD,
+            "apply foreign keys",
+            status=ActivityStatus.FAILURE if failed else ActivityStatus.SUCCESS,
+            detail=(
+                f"Post-load foreign-key pass: {applied} applied, "
+                f"{skipped} skipped (orphaned rows), {failed} failed."
+            ),
+        )
 
 
 def _log_excluded_lob_columns(
@@ -3549,8 +3571,12 @@ class BatchedTableMigrator:
             except Exception:  # noqa: BLE001 - best-effort; the tables/data are already loaded
                 _LOGGER.warning("Could not recreate dependent view", exc_info=True)
 
-    def apply_foreign_keys(self) -> None:
+    def apply_foreign_keys(self) -> tuple[int, int, int]:
         """Run-level POST-PASS: re-create preserved foreign keys after the data load.
+
+        Returns ``(applied, skipped, failed)`` so the caller can surface the pass as
+        a named step in the activity log; a deferred (CDC) or no-FK run returns
+        ``(0, 0, 0)``.
 
         Aurora DSQL enforces foreign keys, but they must NOT exist during the load
         (the concurrent, sharded, multi-table bulk load has no parent-before-child
@@ -3579,8 +3605,8 @@ class BatchedTableMigrator:
         (``foreign_key_ddls`` empty).
         """
         if self._inputs.cdc_coexisting or self._inputs.cdc_stack_name:
-            return
-        apply_preserved_foreign_keys(
+            return (0, 0, 0)
+        return apply_preserved_foreign_keys(
             self._inputs.table_conversions, self._view_connection_factory()
         )
 
