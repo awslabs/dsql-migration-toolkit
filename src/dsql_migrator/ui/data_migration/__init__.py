@@ -1303,10 +1303,14 @@ def build_data_migration_screen(
                     # quarantine + the standing-gap trap).
                     from dsql_migrator.core.assessment_strategist import (
                         AssessmentStrategist,
+                        source_engine_word,
                     )
 
                     strategist = AssessmentStrategist(
-                        session.ai_assist, aws_profile=session.aws_profile
+                        session.ai_assist, aws_profile=session.aws_profile,
+                        source_engine=source_engine_word(
+                            getattr(session.source_config, "source_type", None)
+                        ),
                     )
                     # Ground the reply in THIS migration's situation (type, CDC
                     # status, DROP+recreate) so it isn't generic.
@@ -1349,10 +1353,14 @@ def build_data_migration_screen(
                 def cdc_ai_opener(scope: str, facts: str, seed: str) -> None:
                     from dsql_migrator.core.assessment_strategist import (
                         AssessmentStrategist,
+                        source_engine_word,
                     )
 
                     strategist = AssessmentStrategist(
-                        session.ai_assist, aws_profile=session.aws_profile
+                        session.ai_assist, aws_profile=session.aws_profile,
+                        source_engine=source_engine_word(
+                            getattr(session.source_config, "source_type", None)
+                        ),
                     )
                     open_ai_scope(
                         scope_id=f"cdc:{scope}",

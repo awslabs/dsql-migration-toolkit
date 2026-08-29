@@ -5,6 +5,23 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.415
+
+### 修正 (Fixed)
+
+- **AI DBA が移行のソースエンジン(MySQL か PostgreSQL か)を認識し、正しい方言で
+  回答するようになりました。** これまではすべての AI DBA プロンプトが「MySQL」を
+  ハードコードしていたため、PostgreSQL ソースの移行では誤った文脈で動作していました —
+  ソースが PostgreSQL でも MySQL の binlog、`AUTO_INCREMENT`、MySQL 構文について
+  話していました。すべてのプロンプト(オブジェクト/スキーマ/クエリチャット、検証・
+  フルロード・CDC・カットオーバー・接続エラーの各アシスタント、バッチ評価)が、
+  セッションのソースタイプから取得した実際のソースエンジンでパラメータ化されました。
+  CDC/検証/カットオーバーの復旧ガイダンスもソース固有の詳細を選択します(PostgreSQL
+  論理レプリケーション vs MySQL binlog、`SERIAL`/`IDENTITY` シーケンス vs
+  `AUTO_INCREMENT`、ロールバック方向)。ターゲットは常に Amazon Aurora DSQL(PostgreSQL
+  互換)として説明されるため、変換・再実装 SQL は引き続き DSQL の PostgreSQL 方言で
+  記述されます。
+
 ## v0.1.414
 
 ### 変更 (Changed)

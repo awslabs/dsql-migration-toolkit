@@ -42,6 +42,7 @@ from typing import Callable, Mapping, Optional, Sequence
 from dsql_migrator.core.assessment_strategist import (
     build_query_chat_system,
     build_query_optimize_system,
+    source_engine_word,
 )
 from dsql_migrator.core.models import Classification, TargetConnectionConfig
 from dsql_migrator.core.query_converter import (
@@ -843,6 +844,9 @@ def build_query_playground_screen(
                     if probe is not None and probe.outcome is ProbeOutcome.FAILED
                     else None
                 )
+                engine = source_engine_word(
+                    getattr(getattr(session, "source_config", None), "source_type", None)
+                )
                 system = build_query_chat_system(
                     result.original_sql,
                     result.converted_sql or "",
@@ -852,15 +856,18 @@ def build_query_playground_screen(
                     warnings=[
                         f"[{w.classification}] {w.message}" for w in result.warnings
                     ],
+                    source_engine=engine,
                 )
                 strategist = AssessmentStrategist(
-                    session.ai_assist, aws_profile=getattr(session, "aws_profile", None)
+                    session.ai_assist,
+                    aws_profile=getattr(session, "aws_profile", None),
+                    source_engine=engine,
                 )
                 first_question = (
                     "This converted query was rejected by Aurora DSQL. Why, and how "
                     "do I fix it so it runs?"
                     if target_error is not None
-                    else "Review this MySQL → Aurora DSQL conversion: is it correct, "
+                    else f"Review this {engine} → Aurora DSQL conversion: is it correct, "
                     "will it run on DSQL, and how would you improve it?"
                 )
                 open_ai_scope(
@@ -894,15 +901,21 @@ def build_query_playground_screen(
                     if probe is not None and probe.dpu is not None
                     else None
                 )
+                engine = source_engine_word(
+                    getattr(getattr(session, "source_config", None), "source_type", None)
+                )
                 system = build_query_optimize_system(
                     result.original_sql,
                     result.converted_sql or "",
                     plan=probe.plan if probe is not None else None,
                     dpu_total=baseline_dpu,
                     analyzed=probe.analyzed if probe is not None else False,
+                    source_engine=engine,
                 )
                 strategist = AssessmentStrategist(
-                    session.ai_assist, aws_profile=getattr(session, "aws_profile", None)
+                    session.ai_assist,
+                    aws_profile=getattr(session, "aws_profile", None),
+                    source_engine=engine,
                 )
                 # send_turn (returned by open_chat) lets us drive a follow-up turn
                 # so the re-test result is delivered BY THE AI, not as a raw panel.

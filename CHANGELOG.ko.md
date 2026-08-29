@@ -5,6 +5,20 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.415
+
+### 수정 (Fixed)
+
+- **AI DBA가 이제 마이그레이션의 소스 엔진(MySQL vs PostgreSQL)을 인지하고 올바른
+  방언으로 답변합니다.** 기존에는 모든 AI DBA 프롬프트가 "MySQL"을 하드코딩하고 있어,
+  PostgreSQL 소스 마이그레이션에서 잘못된 맥락으로 동작했습니다 — 소스가 PostgreSQL인데도
+  MySQL binlog, `AUTO_INCREMENT`, MySQL 문법을 이야기했습니다. 이제 모든 프롬프트(객체/스키마/
+  쿼리 챗, 검증·풀로드·CDC·컷오버·연결오류 어시스턴트, 배치 평가)가 세션의 소스 타입에서
+  가져온 실제 소스 엔진으로 매개변수화됩니다. CDC/검증/컷오버 복구 안내도 소스별 세부사항을
+  선택합니다(PostgreSQL 논리적 복제 vs MySQL binlog, `SERIAL`/`IDENTITY` 시퀀스 vs
+  `AUTO_INCREMENT`, 롤백 방향). 타깃은 항상 Amazon Aurora DSQL(PostgreSQL 호환)로 설명되므로,
+  변환·재구현 SQL은 여전히 DSQL의 PostgreSQL 방언으로 작성됩니다.
+
 ## v0.1.414
 
 ### 변경 (Changed)

@@ -56,6 +56,7 @@ from dsql_migrator.core.assessment_strategist import (
     AssessmentStrategist,
     build_conversion_chat_system,
     build_reimplementation_chat_system,
+    source_engine_word,
 )
 from dsql_migrator.core.converter import (
     ConversionNoteKind,
@@ -1992,11 +1993,15 @@ def build_schema_conversion_screen(
             ) -> None:
                 if open_ai_scope is None or not session.ai_assist.enabled:
                     return
+                engine = source_engine_word(
+                    getattr(session.source_config, "source_type", None)
+                )
                 strategist = AssessmentStrategist(
-                    session.ai_assist, aws_profile=session.aws_profile
+                    session.ai_assist, aws_profile=session.aws_profile,
+                    source_engine=engine,
                 )
                 system = build_conversion_chat_system(
-                    object_name, source_ddl, deterministic
+                    object_name, source_ddl, deterministic, source_engine=engine
                 )
 
                 def _conversion_streamer(messages, on_delta):
@@ -2076,10 +2081,14 @@ def build_schema_conversion_screen(
             def open_reimplementation_chat() -> None:
                 if open_ai_scope is None or not session.ai_assist.enabled:
                     return
-                strategist = AssessmentStrategist(
-                    session.ai_assist, aws_profile=session.aws_profile
+                engine = source_engine_word(
+                    getattr(session.source_config, "source_type", None)
                 )
-                system = build_reimplementation_chat_system()
+                strategist = AssessmentStrategist(
+                    session.ai_assist, aws_profile=session.aws_profile,
+                    source_engine=engine,
+                )
+                system = build_reimplementation_chat_system(source_engine=engine)
 
                 def _reimpl_streamer(messages, on_delta):
                     if ai_tools is not None and ai_tool_execute is not None:

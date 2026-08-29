@@ -57,8 +57,19 @@ from dsql_migrator.core.models import (
     AssessmentReport,
     EffortLevel,
     SourceInventory,
+    SourceType,
     TargetInventory,
 )
+
+
+def source_engine_word(source_type: Optional["SourceType"]) -> str:
+    """Map a :class:`SourceType` to the engine word used to ground the AI DBA.
+
+    The TARGET is always Aurora DSQL (PostgreSQL-compatible); this names the
+    SOURCE dialect so every prompt reasons about the right one. Defaults to
+    ``"MySQL"`` (the original engine) for a missing/unknown type.
+    """
+    return "PostgreSQL" if source_type is SourceType.POSTGRES else "MySQL"
 
 # Output-token budgets. These are the `max_tokens` CAP per model turn, not a
 # target -- the _RESPONSE_STYLE directive keeps answers concise, so a bigger cap
@@ -154,9 +165,10 @@ DSQL_CONSTRAINTS = (
     "on CASCADE actions); every table requires "
     "a primary key; secondary indexes are created asynchronously "
     "(CREATE INDEX ASYNC); the 'C' collation is used; triggers and stored "
-    "procedures are unsupported; AUTO_INCREMENT/monotonic keys cause hot "
-    "partitions; MySQL native partitioning is not used (DSQL distributes data "
-    "automatically); spatial/geometry types have no lossless mapping; there are "
+    "procedures are unsupported; auto-increment / sequential (monotonic) keys "
+    "cause hot partitions; source-side native/declarative partitioning is not used "
+    "(DSQL distributes data automatically); spatial/geometry types have no lossless "
+    "mapping; there are "
     "transaction limits (a single DDL statement per transaction)."
 )
 
@@ -224,6 +236,8 @@ def build_assessment_prompt(
     assessment: AssessmentReport,
     target: TargetInventory,
     conflicts: list[str],
+    *,
+    source_engine: str = "MySQL",
 ) -> str:
     """Build the grounded prompt that asks the model for a structured report.
 
@@ -233,8 +247,8 @@ def build_assessment_prompt(
     can be parsed defensively (Requirement 11.8).
     """
     return (
-        "You are a senior AWS database migration analyst. Analyze a MySQL -> "
-        "Amazon Aurora DSQL (PostgreSQL-compatible) migration and write a "
+        f"You are a senior AWS database migration analyst. Analyze a {source_engine} "
+        "-> Amazon Aurora DSQL (PostgreSQL-16 wire-compatible) migration and write a "
         "concise, well-structured assessment in GitHub-flavored Markdown that "
         "AUGMENTS a deterministic, rule-based assessment. The deterministic "
         "findings below are authoritative facts you MUST respect and never "
@@ -261,7 +275,7 @@ def build_assessment_prompt(
     )
 
 
-def build_object_guidance_prompt(item: AssessmentItem) -> str:
+def build_object_guidance_prompt(item: AssessmentItem, *, source_engine: str = "MySQL") -> str:
     """Build the prompt for on-demand, single-object remediation guidance.
 
     Grounds the model on ONE deterministic :class:`AssessmentItem` (its name,
@@ -274,8 +288,8 @@ def build_object_guidance_prompt(item: AssessmentItem) -> str:
     effort = item.effort.value if item.effort is not None else "NONE"
     return (
         "You are a senior AWS database migration engineer chatting with a "
-        "teammate who is migrating a MySQL database to Amazon Aurora DSQL "
-        "(PostgreSQL-compatible). A deterministic, rule-based assessment flagged "
+        f"teammate who is migrating a {source_engine} database to Amazon Aurora DSQL "
+        "(PostgreSQL-16 wire-compatible). A deterministic, rule-based assessment flagged "
         "the object below. Answer naturally and conversationally, the way you "
         "would in a chat — explain it in your own words, in a friendly, helpful "
         "tone. Do NOT use a rigid template or fixed section headings (no "
@@ -307,7 +321,7 @@ def _coerce_text(value: Any) -> str:
     return value.strip()[:_MAX_TEXT_CHARS]
 
 
-def build_object_chat_system(item: AssessmentItem) -> str:
+def build_object_chat_system(item: AssessmentItem, *, source_engine: str = "MySQL") -> str:
     """Build the system grounding for a multi-turn chat about ONE object.
 
     Unlike :func:`build_object_guidance_prompt` (a single-shot user prompt), this
@@ -320,8 +334,11 @@ def build_object_chat_system(item: AssessmentItem) -> str:
     effort = item.effort.value if item.effort is not None else "NONE"
     return (
         "You are a senior AWS database migration engineer chatting with a "
-        "teammate who is migrating a MySQL database to Amazon Aurora DSQL "
-        "(PostgreSQL-compatible). Answer naturally and conversationally, the way "
+        f"teammate who is migrating a {source_engine} database to Amazon Aurora DSQL "
+        "(PostgreSQL-16 wire-compatible). The SOURCE engine is "
+        f"{source_engine}; the TARGET is Aurora DSQL, so any reimplemented / converted "
+        "SQL must be written in DSQL's PostgreSQL dialect (not the source dialect). "
+        "Answer naturally and conversationally, the way "
         "you would in a chat — explain things in your own words, in a friendly, "
         "helpful tone, and answer follow-up questions in context. Do NOT use a "
         "rigid template or fixed section headings. Light GitHub-flavored Markdown "
@@ -333,8 +350,9 @@ def build_object_chat_system(item: AssessmentItem) -> str:
         "objects, the assessment as a whole, converted DDL, validation results, load "
         "status -- help them: USE ANY TOOLS you have to look up the real data and "
         "answer, rather than refusing just because it is not this object. Only decline "
-        "questions that are genuinely off-topic for a MySQL -> Aurora DSQL migration "
-        "(unrelated technologies, general chit-chat), politely, in one sentence.\n\n"
+        f"questions that are genuinely off-topic for a {source_engine} -> Aurora DSQL "
+        "migration (unrelated technologies, general chit-chat), politely, in one "
+        "sentence.\n\n"
         "The conversation is about this single object, which a deterministic, "
         "rule-based assessment flagged. These facts are authoritative — build on "
         "them and never contradict them:\n"
@@ -350,7 +368,8 @@ def build_object_chat_system(item: AssessmentItem) -> str:
 
 
 def build_general_chat_system(
-    *, current_step: str = "", migration_type: str = "", summary: str = ""
+    *, current_step: str = "", migration_type: str = "", summary: str = "",
+    source_engine: str = "MySQL",
 ) -> str:
     """System grounding for the GENERAL (no specific object) assistant panel.
 
@@ -373,12 +392,15 @@ def build_general_chat_system(
     context_block = "\n".join(where) or "- (no step context captured yet)"
     return (
         "You are a senior AWS database migration engineer chatting with a teammate "
-        "who is migrating a MySQL database to Amazon Aurora DSQL "
-        "(PostgreSQL-compatible) using this tool. Answer naturally and "
-        "conversationally; light GitHub-flavored Markdown is fine, but keep it "
-        "reading like a natural reply, not a form. Be specific and reasonably "
+        f"who is migrating a {source_engine} database to Amazon Aurora DSQL "
+        "(PostgreSQL-16 wire-compatible) using this tool. The SOURCE engine is "
+        f"{source_engine}; the TARGET is Aurora DSQL, so converted/reimplemented SQL "
+        "is written in DSQL's PostgreSQL dialect (not the source dialect). Answer "
+        "naturally and conversationally; light GitHub-flavored Markdown is fine, but "
+        "keep it reading like a natural reply, not a form. Be specific and reasonably "
         "concise.\n\n"
-        "Stay strictly on the topic of THIS MySQL -> Aurora DSQL migration: schema "
+        f"Stay strictly on the topic of THIS {source_engine} -> Aurora DSQL migration: "
+        "schema "
         "conversion, data migration (Full Load / CDC), validation, cut over, and "
         "Aurora DSQL behavior/constraints, plus the current progress. If the user "
         "asks about anything off-topic — unrelated technologies, other systems, "
@@ -392,7 +414,8 @@ def build_general_chat_system(
 
 
 def build_conversion_chat_system(
-    object_name: str, source_ddl: str, deterministic_ddl: str
+    object_name: str, source_ddl: str, deterministic_ddl: str,
+    *, source_engine: str = "MySQL",
 ) -> str:
     """Build the system grounding for a chat about converting ONE object's DDL.
 
@@ -407,8 +430,10 @@ def build_conversion_chat_system(
     target = (deterministic_ddl or "(none)").strip()[:_MAX_TEXT_CHARS]
     return (
         "You are a senior AWS database migration engineer chatting with a "
-        "teammate who is converting a MySQL schema object to Amazon Aurora DSQL "
-        "(PostgreSQL-compatible). Answer naturally and conversationally, the way "
+        f"teammate who is converting a {source_engine} schema object to Amazon Aurora "
+        "DSQL (PostgreSQL-16 wire-compatible). The SOURCE dialect is "
+        f"{source_engine}; the converted DDL/SQL must be Aurora DSQL's PostgreSQL "
+        "dialect. Answer naturally and conversationally, the way "
         "you would in a chat — explain things in your own words, in a friendly, "
         "helpful tone, and answer follow-up questions in context. Do NOT use a "
         "rigid template or fixed section headings. When you propose DDL/SQL, put "
@@ -421,9 +446,10 @@ def build_conversion_chat_system(
         "assessment, other converted DDL, validation, load status -- help them: USE "
         "ANY TOOLS you have to look up the real data and answer, rather than refusing "
         "just because it is not this object. Only decline questions that are genuinely "
-        "off-topic for a MySQL -> Aurora DSQL migration, politely, in one sentence.\n\n"
+        f"off-topic for a {source_engine} -> Aurora DSQL migration, politely, in one "
+        "sentence.\n\n"
         f"Object: {object_name}\n\n"
-        "Source DDL (MySQL):\n"
+        f"Source DDL ({source_engine}):\n"
         f"```sql\n{source}\n```\n\n"
         "The tool's deterministic Aurora DSQL conversion (authoritative starting "
         "point — build on it, don't contradict it):\n"
@@ -432,7 +458,7 @@ def build_conversion_chat_system(
     )
 
 
-def build_reimplementation_chat_system() -> str:
+def build_reimplementation_chat_system(*, source_engine: str = "MySQL") -> str:
     """System grounding for the "reimplement the unconvertible objects" chat.
 
     Aurora DSQL runs no triggers, stored procedures/functions, or scheduled
@@ -444,7 +470,8 @@ def build_reimplementation_chat_system() -> str:
     """
     return (
         "You are a senior AWS database migration engineer helping a teammate migrate "
-        "a MySQL database to Amazon Aurora DSQL (PostgreSQL-compatible). Aurora DSQL "
+        f"a {source_engine} database to Amazon Aurora DSQL (PostgreSQL-16 "
+        "wire-compatible). Aurora DSQL "
         "does NOT support triggers, stored procedures/functions, or scheduled EVENTs, "
         "so this tool cannot convert them — their logic has to be reimplemented "
         "outside the database, and helping with that is your whole job in this chat.\n\n"
@@ -456,7 +483,8 @@ def build_reimplementation_chat_system() -> str:
         "- Trigger → move the logic into the application write path (or a shared "
         "data-access layer): an auditing / derived-column trigger becomes an explicit "
         "app write; a trigger that reacts to row changes can become a consumer of the "
-        "CDC stream. Flag that MySQL trigger/cascade side effects are NOT replicated "
+        f"CDC stream. Flag that {source_engine} trigger/cascade side effects are NOT "
+        "replicated "
         "by CDC, so any logic they performed must be rebuilt on the target side.\n"
         "- Stored procedure/function → reimplement as application code, or — for a "
         "pure, deterministic scalar that fits DSQL's SQL — a PostgreSQL function; "
@@ -478,6 +506,7 @@ def build_query_chat_system(
     *,
     target_error: Optional[str] = None,
     warnings: Optional[Sequence[str]] = None,
+    source_engine: str = "MySQL",
 ) -> str:
     """Build the system grounding for a chat about converting/fixing ONE query.
 
@@ -511,8 +540,10 @@ def build_query_chat_system(
         )
     return (
         "You are a senior AWS database migration engineer chatting with a teammate "
-        "who is converting a MySQL query to Amazon Aurora DSQL "
-        "(PostgreSQL-compatible). Answer naturally and conversationally, the way "
+        f"who is converting a {source_engine} query to Amazon Aurora DSQL "
+        "(PostgreSQL-16 wire-compatible). The SOURCE dialect is "
+        f"{source_engine}; the converted query must run in Aurora DSQL's PostgreSQL "
+        "dialect. Answer naturally and conversationally, the way "
         "you would in a chat — explain things in your own words, in a friendly, "
         "helpful tone, and answer follow-up questions in context. Do NOT use a "
         "rigid template or fixed section headings. When you propose SQL, put it in "
@@ -526,9 +557,9 @@ def build_query_chat_system(
         "produce for it, which indexes already exist -- USE ANY TOOLS you have "
         "(list_target_tables / get_target_schema / get_converted_ddl / "
         "get_source_object_detail) to look up the real data and answer, rather than "
-        "refusing. Only decline questions genuinely off-topic for a MySQL -> Aurora "
-        "DSQL migration, politely, in one sentence.\n\n"
-        "Original query (MySQL):\n"
+        f"refusing. Only decline questions genuinely off-topic for a {source_engine} "
+        "-> Aurora DSQL migration, politely, in one sentence.\n\n"
+        f"Original query ({source_engine}):\n"
         f"```sql\n{source}\n```\n\n"
         "The tool's deterministic Aurora DSQL conversion (starting point — build on "
         "it, don't contradict it unless it is what the target rejected):\n"
@@ -596,6 +627,7 @@ def build_query_optimize_system(
     plan: Optional[str] = None,
     dpu_total: Optional[float] = None,
     analyzed: bool = False,
+    source_engine: str = "MySQL",
 ) -> str:
     """Build the system grounding for the "rewrite this query for efficiency" chat.
 
@@ -647,8 +679,8 @@ def build_query_optimize_system(
         "TOOLS you have (get_target_schema to see the table's existing indexes, "
         "get_converted_ddl / get_source_object_detail for its real structure) to check "
         "what already exists rather than guessing. Only decline questions genuinely "
-        "off-topic for a MySQL -> Aurora DSQL migration, in one sentence.\n\n"
-        "Original query (MySQL):\n"
+        f"off-topic for a {source_engine} -> Aurora DSQL migration, in one sentence.\n\n"
+        f"Original query ({source_engine}):\n"
         f"```sql\n{source}\n```\n\n"
         "The tool's deterministic Aurora DSQL conversion (the query to optimize — "
         "keep its results identical):\n"
@@ -659,14 +691,27 @@ def build_query_optimize_system(
     )
 
 
-# How a migrated MySQL->DSQL pipeline can diverge, and what fixes it. Grounds the
+def _cdc_capture_phrase(source_engine: str) -> str:
+    """Describe the source-specific CDC capture path for the recovery contexts.
+
+    Debezium tails the MySQL binlog vs PostgreSQL logical replication (pgoutput);
+    naming the right one keeps the recovery advice accurate for THIS source.
+    """
+    if source_engine == "PostgreSQL":
+        return "Debezium PostgreSQL logical replication -> Kafka -> a custom DSQL sink"
+    return "Debezium MySQL binlog -> Kafka -> a custom DSQL sink"
+
+
+# How a migrated source->DSQL pipeline can diverge, and what fixes it. Grounds the
 # validation chat so the model reasons about THIS tool's Full Load + CDC model
 # (not generic replication) and recommends the right recovery.
-_VALIDATION_RECOVERY_CONTEXT = (
+def _validation_recovery_context(source_engine: str = "MySQL") -> str:
+    watermark = "LSN" if source_engine == "PostgreSQL" else "binlog"
+    return (
     "How this migration works (use it to reason about WHY a table diverges and "
     "WHAT fixes it):\n"
     "- Full Load is a one-shot bulk copy (the tool's own loader). CDC then streams "
-    "ongoing changes (Debezium MySQL -> Kafka -> a custom DSQL sink) from a binlog "
+    f"ongoing changes ({_cdc_capture_phrase(source_engine)}) from a {watermark} "
     "watermark captured at the snapshot, for a gapless hand-off.\n"
     "- CDC only carries changes GOING FORWARD from the connector's offset. A row "
     "that was lost earlier (e.g. a past sink incident, or a Full Load<->CDC "
@@ -687,7 +732,9 @@ _VALIDATION_RECOVERY_CONTEXT = (
 )
 
 
-def build_validation_chat_system(facts: str, *, scope: str = "table") -> str:
+def build_validation_chat_system(
+    facts: str, *, scope: str = "table", source_engine: str = "MySQL"
+) -> str:
     """Build the system grounding for a chat about a validation MISMATCH.
 
     ``facts`` is a pre-formatted, credential-free block the UI assembles from the
@@ -707,8 +754,8 @@ def build_validation_chat_system(facts: str, *, scope: str = "table") -> str:
     )
     return (
         "You are a senior AWS database migration engineer chatting with a teammate "
-        "who just validated a MySQL -> Amazon Aurora DSQL migration and is looking "
-        f"at {subject}. Answer naturally and conversationally — explain WHY it "
+        f"who just validated a {source_engine} -> Amazon Aurora DSQL migration and is "
+        f"looking at {subject}. Answer naturally and conversationally — explain WHY it "
         "likely diverged and exactly HOW to fix it, in a friendly, helpful tone, "
         "answering follow-ups in context. Do NOT use a rigid template. Light "
         "GitHub-flavored Markdown is fine (a short list, a little emphasis, a fenced "
@@ -720,11 +767,12 @@ def build_validation_chat_system(facts: str, *, scope: str = "table") -> str:
         "-- the converted DDL for the affected table, the assessment, load status, "
         "other tables -- help them: USE ANY TOOLS you have to look up the real data "
         "and answer, rather than refusing. Only decline questions that are genuinely "
-        "off-topic for a MySQL -> Aurora DSQL migration, politely, in one sentence.\n\n"
+        f"off-topic for a {source_engine} -> Aurora DSQL migration, politely, in one "
+        "sentence.\n\n"
         "These deterministic validation facts are authoritative — build on them and "
         "never contradict them:\n"
         f"{facts.strip()[:_MAX_TEXT_CHARS]}\n\n"
-        f"{_VALIDATION_RECOVERY_CONTEXT}\n\n"
+        f"{_validation_recovery_context(source_engine)}\n\n"
         f"Aurora DSQL constraints:\n{DSQL_CONSTRAINTS}"
     )
 
@@ -766,7 +814,8 @@ _FULL_LOAD_RECOVERY_CONTEXT = (
 
 
 def build_full_load_error_chat_system(
-    table_name: str, error_message: str, *, migration_context: str = ""
+    table_name: str, error_message: str, *, migration_context: str = "",
+    source_engine: str = "MySQL",
 ) -> str:
     """Build the system grounding for a chat about a FAILED Full Load table.
 
@@ -789,8 +838,8 @@ def build_full_load_error_chat_system(
         facts += f"\n\nCurrent migration context:\n{migration_context.strip()}"
     return (
         "You are a senior AWS database migration engineer chatting with a teammate "
-        "who is running a MySQL -> Amazon Aurora DSQL migration and just had ONE "
-        "table fail during Full Load. You understand this exact migration's "
+        f"who is running a {source_engine} -> Amazon Aurora DSQL migration and just had "
+        "ONE table fail during Full Load. You understand this exact migration's "
         "situation from the context below — use it so your answer is specific to "
         "THIS migration, not generic advice. Answer naturally and conversationally "
         "— explain WHY this specific error likely happened and exactly HOW to fix "
@@ -805,8 +854,8 @@ def build_full_load_error_chat_system(
         "asks about the WIDER migration -- this table's converted DDL, its real source "
         "structure, the live target schema, other failed tables, the assessment -- USE "
         "ANY TOOLS you have to look up the real data and answer, rather than refusing. "
-        "Only decline questions that are genuinely off-topic for a MySQL -> Aurora DSQL "
-        "migration, politely, in one sentence.\n\n"
+        f"Only decline questions that are genuinely off-topic for a {source_engine} -> "
+        "Aurora DSQL migration, politely, in one sentence.\n\n"
         "These deterministic facts are authoritative — build on them and never "
         "contradict them:\n"
         f"{facts[:_MAX_TEXT_CHARS]}\n\n"
@@ -815,9 +864,15 @@ def build_full_load_error_chat_system(
     )
 
 
-_CDC_RECOVERY_CONTEXT = (
+def _cdc_recovery_context(source_engine: str = "MySQL") -> str:
+    capture = (
+        "PostgreSQL logical replication (pgoutput)"
+        if source_engine == "PostgreSQL"
+        else "MySQL binlog"
+    )
+    return (
     "How this tool's CDC works and how to recover a dead-lettered / drifted stream:\n"
-    "- CDC is Debezium (MySQL binlog) -> Amazon MSK (Kafka) -> a CUSTOM DSQL Sink "
+    f"- CDC is Debezium ({capture}) -> Amazon MSK (Kafka) -> a CUSTOM DSQL Sink "
     "Connector that applies ROW changes (INSERT/UPDATE/DELETE) idempotently. It "
     "replicates row DATA only; it does NOT propagate DDL.\n"
     "- A row the sink cannot apply is dead-lettered to a DLQ (the stream keeps "
@@ -842,7 +897,9 @@ _CDC_RECOVERY_CONTEXT = (
 )
 
 
-def build_cdc_error_chat_system(facts: str, *, scope: str = "dlq") -> str:
+def build_cdc_error_chat_system(
+    facts: str, *, scope: str = "dlq", source_engine: str = "MySQL"
+) -> str:
     """Build the system grounding for a chat about a CDC DLQ / schema-drift problem.
 
     ``facts`` is a pre-formatted, credential-free, row-free block the UI assembles from
@@ -859,8 +916,9 @@ def build_cdc_error_chat_system(facts: str, *, scope: str = "dlq") -> str:
     )
     return (
         "You are a senior AWS database migration engineer chatting with a teammate "
-        f"who is running a MySQL -> Amazon Aurora DSQL streaming CDC pipeline and is "
-        f"looking at {subject}. Answer naturally and conversationally — explain WHY "
+        f"who is running a {source_engine} -> Amazon Aurora DSQL streaming CDC pipeline "
+        f"and is looking at {subject}. Answer naturally and conversationally — explain "
+        "WHY "
         "these failed (root cause from the SQLSTATE / drift kind) and exactly HOW to "
         "fix it, in a friendly, helpful tone, answering follow-ups in context. Do NOT "
         "use a rigid template. Light GitHub-flavored Markdown is fine (a short list, a "
@@ -872,17 +930,23 @@ def build_cdc_error_chat_system(facts: str, *, scope: str = "dlq") -> str:
         "DDL, its real source structure, the live target schema, the load/validation "
         "state -- USE ANY TOOLS you have to look up the real data and answer, rather "
         "than refusing. Only decline questions that are genuinely off-topic for a "
-        "MySQL -> Aurora DSQL migration, politely, in one sentence.\n\n"
+        f"{source_engine} -> Aurora DSQL migration, politely, in one sentence.\n\n"
         "These deterministic CDC facts are authoritative — build on them and never "
         "contradict them:\n"
         f"{facts.strip()[:_MAX_TEXT_CHARS]}\n\n"
-        f"{_CDC_RECOVERY_CONTEXT}\n\n"
+        f"{_cdc_recovery_context(source_engine)}\n\n"
         f"Aurora DSQL constraints:\n{DSQL_CONSTRAINTS}"
     )
 
 
-_CUTOVER_RECOVERY_CONTEXT = (
-    "How to cut a MySQL application over to Amazon Aurora DSQL safely:\n"
+def _cutover_recovery_context(source_engine: str = "MySQL") -> str:
+    identity = (
+        "any AUTO_INCREMENT-derived key"
+        if source_engine != "PostgreSQL"
+        else "any SERIAL / IDENTITY (sequence-backed) key"
+    )
+    return (
+    f"How to cut a {source_engine} application over to Amazon Aurora DSQL safely:\n"
     "- Aurora DSQL is PostgreSQL-wire; DSQL uses IAM-token auth (there is NO password) "
     "and short-lived tokens generated per connection, so the driver must GENERATE and "
     "REFRESH a fresh token whenever it opens a connection. TLS is required: use "
@@ -900,7 +964,7 @@ _CUTOVER_RECOVERY_CONTEXT = (
     "statement. Foreign keys are supported and enforced (they add read cost and "
     "their CASCADE actions count toward the row limit); no TRUNCATE. Batched writes "
     "must stay under DSQL's per-transaction row limit (~3000). CREATE INDEX runs ASYNC.\n"
-    "- Identity keys: any AUTO_INCREMENT-derived key must have had its sequence "
+    f"- Identity keys: {identity} must have had its sequence "
     "advanced past MAX(pk) on the target BEFORE the app repoints, or its first insert "
     "collides (23505). This tool's cut-over runbook exposes 'Sync identity sequences'; "
     "run it and confirm success before the repoint.\n"
@@ -908,9 +972,11 @@ _CUTOVER_RECOVERY_CONTEXT = (
     "clean Validation, 3) sync identity sequences, 4) flip the app to DSQL, 5) smoke-"
     "test reads and writes on DSQL, 6) keep the source READ-ONLY as a rollback anchor "
     "for the agreed window.\n"
-    "- ROLLBACK ASYMMETRY: rolling BACK to MySQL after new writes have landed on DSQL "
+    f"- ROLLBACK ASYMMETRY: rolling BACK to {source_engine} after new writes have landed "
+    "on DSQL "
     "means those new writes are only on DSQL — the source is stale, and the tool does "
-    "NOT reverse-replicate DSQL -> MySQL. So the safe rollback window is 'no new "
+    f"NOT reverse-replicate DSQL -> {source_engine}. So the safe rollback window is 'no "
+    "new "
     "writes to DSQL yet'. After that, going back means data loss of the new writes. "
     "Say so explicitly when discussing rollback.\n"
     "- Do NOT propose changes to the target from a chat: writes to DSQL always go "
@@ -918,7 +984,7 @@ _CUTOVER_RECOVERY_CONTEXT = (
 )
 
 
-def build_cutover_chat_system(facts: str) -> str:
+def build_cutover_chat_system(facts: str, *, source_engine: str = "MySQL") -> str:
     """Build the system grounding for a chat about CUTTING OVER to Aurora DSQL.
 
     ``facts`` is a pre-formatted, credential-free block the UI assembles from the
@@ -930,7 +996,8 @@ def build_cutover_chat_system(facts: str) -> str:
     tool -- not generic PostgreSQL advice."""
     return (
         "You are a senior AWS database migration engineer chatting with a teammate "
-        "who is about to CUT OVER their application from MySQL to Amazon Aurora DSQL "
+        f"who is about to CUT OVER their application from {source_engine} to Amazon "
+        "Aurora DSQL "
         "-- the single least-reversible step of the migration. Help them prepare a "
         "safe repoint. Answer naturally and conversationally; light GitHub-flavored "
         "Markdown is fine, and put runnable connection strings / DDL / commands in "
@@ -940,18 +1007,18 @@ def build_cutover_chat_system(facts: str) -> str:
         "user's framework, is-it-safe verdict, rollback window). If it helps, USE ANY "
         "TOOLS you have to check the real state (validation, CDC health, full-load "
         "gaps, converted DDL) rather than guessing. Only decline questions that are "
-        "genuinely off-topic for a MySQL -> Aurora DSQL migration, politely, in one "
-        "sentence.\n\n"
+        f"genuinely off-topic for a {source_engine} -> Aurora DSQL migration, politely, "
+        "in one sentence.\n\n"
         "These deterministic cut-over facts are authoritative — build on them and "
         "never contradict them:\n"
         f"{facts.strip()[:_MAX_TEXT_CHARS]}\n\n"
-        f"{_CUTOVER_RECOVERY_CONTEXT}\n\n"
+        f"{_cutover_recovery_context(source_engine)}\n\n"
         f"Aurora DSQL constraints:\n{DSQL_CONSTRAINTS}"
     )
 
 
 def build_connection_error_chat_system(
-    *, side: str, coordinates: str, error_message: str
+    *, side: str, coordinates: str, error_message: str, source_engine: str = "MySQL"
 ) -> str:
     """System grounding for a chat about a FAILED connection test (Connect screen).
 
@@ -965,9 +1032,10 @@ def build_connection_error_chat_system(
     connection-troubleshooting checklist.
     """
     is_source = side == "source"
+    src_port = "5432" if source_engine == "PostgreSQL" else "3306"
     engine = (
-        "the SOURCE database (Amazon RDS/Aurora MySQL, username/password or Secrets "
-        "Manager auth)"
+        f"the SOURCE database (Amazon RDS/Aurora {source_engine}, username/password or "
+        "Secrets Manager auth)"
         if is_source
         else "the TARGET database (Amazon Aurora DSQL, PostgreSQL-compatible, "
         "short-lived IAM-token auth -- there is NO password)"
@@ -975,8 +1043,9 @@ def build_connection_error_chat_system(
     # Reference the model CHECKS the entered values against -- deliberately NOT phrased
     # as a checklist of causes to recite (that produced generic, verbose answers).
     reference = (
-        "Reference for spotting a bad value: a MySQL host is normally an RDS/Aurora "
-        "endpoint like <name>.<hash>.<region>.rds.amazonaws.com and the port is 3306."
+        f"Reference for spotting a bad value: a {source_engine} host is normally an "
+        f"RDS/Aurora endpoint like <name>.<hash>.<region>.rds.amazonaws.com and the "
+        f"port is {src_port}."
         if is_source
         else "Reference for spotting a bad value: Aurora DSQL uses IAM-token auth (no "
         "password); its default database is 'postgres' and its default role/username "
@@ -990,8 +1059,8 @@ def build_connection_error_chat_system(
     )
     return (
         "You are a senior AWS database migration engineer helping a teammate whose "
-        f"connection test to {engine} just FAILED on the Connect screen of a MySQL -> "
-        "Amazon Aurora DSQL migration tool.\n\n"
+        f"connection test to {engine} just FAILED on the Connect screen of a "
+        f"{source_engine} -> Amazon Aurora DSQL migration tool.\n\n"
         "Diagnose THIS SPECIFIC attempt, not connections in general. FIRST inspect the "
         "exact entered values and the error text below for a concrete mistake IN THEM "
         "— a misspelled or non-default value (a role/username, database, region, or "
@@ -1190,10 +1259,28 @@ class AssessmentStrategist:
         *,
         aws_profile: Optional[str] = None,
         client: Optional[Any] = None,
+        source_engine: str = "MySQL",
     ) -> None:
         self._config = config
         self._aws_profile = aws_profile
         self._client = client
+        # The migration's SOURCE engine word ("MySQL" / "PostgreSQL"), threaded into
+        # every grounding prompt so the AI DBA reasons about the RIGHT source dialect
+        # (the target is always Aurora DSQL / PostgreSQL). Defaults to "MySQL" — the
+        # original engine — so old call sites stay correct.
+        self._source_engine = source_engine or "MySQL"
+
+    @property
+    def source_engine(self) -> str:
+        """The migration's SOURCE engine word grounding every prompt."""
+        return self._source_engine
+
+    @source_engine.setter
+    def source_engine(self, value: str) -> None:
+        # Injectable factories (e.g. the Evaluation screen's) build the strategist
+        # before the session's source type is in scope; this lets the caller pin the
+        # engine post-construction so the AI DBA is grounded on the right dialect.
+        self._source_engine = value or "MySQL"
 
     def _get_client(self) -> Any:
         """Return the bedrock-runtime client, building it lazily if needed."""
@@ -1217,7 +1304,10 @@ class AssessmentStrategist:
         typed :class:`AiAssistUnavailableError` (credential-free), and empty or
         unparseable output becomes ``INVALID_OUTPUT``.
         """
-        prompt = build_assessment_prompt(inventory, assessment, target, conflicts)
+        prompt = build_assessment_prompt(
+            inventory, assessment, target, conflicts,
+            source_engine=self._source_engine,
+        )
         try:
             response = self._get_client().invoke_model(
                 modelId=self._config.model_id,
@@ -1271,7 +1361,7 @@ class AssessmentStrategist:
         :class:`AiAssistUnavailableError`; empty output becomes
         ``INVALID_OUTPUT`` (Requirements 11.8, 11.10).
         """
-        prompt = build_object_guidance_prompt(item)
+        prompt = build_object_guidance_prompt(item, source_engine=self._source_engine)
         try:
             response = self._get_client().invoke_model(
                 modelId=self._config.model_id,
@@ -1330,7 +1420,7 @@ class AssessmentStrategist:
         called with already-received text, so a mid-stream failure still leaves
         the partial text visible while the outcome explains the interruption.
         """
-        prompt = build_object_guidance_prompt(item)
+        prompt = build_object_guidance_prompt(item, source_engine=self._source_engine)
         try:
             response = self._get_client().invoke_model_with_response_stream(
                 modelId=self._config.model_id,
@@ -1402,11 +1492,12 @@ class AssessmentStrategist:
         """
         if tools is not None and execute is not None:
             return self.tool_chat(
-                build_object_chat_system(item), messages, on_delta,
-                tools=tools, execute=execute,
+                build_object_chat_system(item, source_engine=self._source_engine),
+                messages, on_delta, tools=tools, execute=execute,
             )
         return self.stream_chat(
-            build_object_chat_system(item), messages, on_delta
+            build_object_chat_system(item, source_engine=self._source_engine),
+            messages, on_delta,
         )
 
     def stream_validation_chat(
@@ -1431,7 +1522,9 @@ class AssessmentStrategist:
         :meth:`tool_chat`, so the mismatch chat can also look up the real
         converted DDL / target schema / row counts to root-cause the divergence.
         """
-        system = build_validation_chat_system(facts, scope=scope)
+        system = build_validation_chat_system(
+            facts, scope=scope, source_engine=self._source_engine
+        )
         if tools is not None and execute is not None:
             return self.tool_chat(
                 system, messages, on_delta, tools=tools, execute=execute
@@ -1463,7 +1556,8 @@ class AssessmentStrategist:
         schema / source structure to root-cause a schema/DDL failure by name.
         """
         system = build_full_load_error_chat_system(
-            table_name, error_message, migration_context=migration_context
+            table_name, error_message, migration_context=migration_context,
+            source_engine=self._source_engine,
         )
         if tools is not None and execute is not None:
             return self.tool_chat(
@@ -1490,7 +1584,7 @@ class AssessmentStrategist:
         through :meth:`tool_chat` so it can consult live CDC/validation/load state.
         Never raises.
         """
-        system = build_cutover_chat_system(facts)
+        system = build_cutover_chat_system(facts, source_engine=self._source_engine)
         if tools is not None and execute is not None:
             return self.tool_chat(
                 system, messages, on_delta, tools=tools, execute=execute
@@ -1517,7 +1611,9 @@ class AssessmentStrategist:
         :meth:`tool_chat` so it can look up the affected table's real DDL / schema.
         Never raises.
         """
-        system = build_cdc_error_chat_system(facts, scope=scope)
+        system = build_cdc_error_chat_system(
+            facts, scope=scope, source_engine=self._source_engine
+        )
         if tools is not None and execute is not None:
             return self.tool_chat(
                 system, messages, on_delta, tools=tools, execute=execute
@@ -1750,4 +1846,5 @@ __all__ = [
     "build_full_load_error_chat_system",
     "build_connection_error_chat_system",
     "parse_assessment_output",
+    "source_engine_word",
 ]

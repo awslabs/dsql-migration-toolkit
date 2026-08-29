@@ -30,6 +30,7 @@ from dsql_migrator.core.models import (
     Classification,
     EffortLevel,
     SourceInventory,
+    SourceType,
     TableDef,
     TargetInventory,
 )
@@ -903,3 +904,100 @@ def test_trim_chat_messages_drops_leading_assistant_after_trim() -> None:
     kept = _trim_chat_messages(msgs, 10)
     assert [m["text"][0] for m in kept] == ["z"]
     assert kept[0]["role"] == "user"
+
+
+# ---------------------------------------------------------------------------
+# Source-engine grounding: every AI-DBA prompt must name the RIGHT source
+# dialect (MySQL vs PostgreSQL) while keeping the target Aurora DSQL. A
+# PostgreSQL-source migration was previously mis-grounded as MySQL everywhere.
+# ---------------------------------------------------------------------------
+
+
+def test_source_engine_word_maps_source_type() -> None:
+    from dsql_migrator.core.assessment_strategist import source_engine_word
+
+    assert source_engine_word(SourceType.POSTGRES) == "PostgreSQL"
+    assert source_engine_word(SourceType.MYSQL) == "MySQL"
+    # Missing/unknown defaults to MySQL, the original engine.
+    assert source_engine_word(None) == "MySQL"
+
+
+def test_builders_ground_on_postgres_source_engine() -> None:
+    from dsql_migrator.core.assessment_strategist import (
+        build_assessment_prompt,
+        build_cdc_error_chat_system,
+        build_connection_error_chat_system,
+        build_conversion_chat_system,
+        build_cutover_chat_system,
+        build_full_load_error_chat_system,
+        build_general_chat_system,
+        build_object_chat_system,
+        build_object_guidance_prompt,
+        build_query_chat_system,
+        build_query_optimize_system,
+        build_reimplementation_chat_system,
+        build_validation_chat_system,
+    )
+
+    pg = "PostgreSQL"
+    # Chat / guidance system prompts: the source is PostgreSQL, never MySQL.
+    for system in (
+        build_object_chat_system(_guidance_item(), source_engine=pg),
+        build_object_guidance_prompt(_guidance_item(), source_engine=pg),
+        build_general_chat_system(source_engine=pg),
+        build_conversion_chat_system("orders", "CREATE TABLE", "CREATE TABLE", source_engine=pg),
+        build_reimplementation_chat_system(source_engine=pg),
+        build_query_chat_system("SELECT 1", "SELECT 1", source_engine=pg),
+        build_query_optimize_system("SELECT 1", "SELECT 1", source_engine=pg),
+        build_validation_chat_system("counts", source_engine=pg),
+        build_full_load_error_chat_system("orders", "boom", source_engine=pg),
+        build_cutover_chat_system("facts", source_engine=pg),
+        build_cdc_error_chat_system("facts", source_engine=pg),
+        build_connection_error_chat_system(
+            side="source", coordinates="host=x", error_message="err",
+            source_engine=pg,
+        ),
+        build_assessment_prompt(_inventory(), _assessment(), TargetInventory(), [], source_engine=pg),
+    ):
+        assert "PostgreSQL" in system
+        assert "MySQL" not in system
+
+    # The CDC/cutover recovery contexts pick the PostgreSQL-specific capture path
+    # and identity model, not MySQL binlog / AUTO_INCREMENT.
+    cdc = build_cdc_error_chat_system("facts", source_engine=pg)
+    assert "logical replication" in cdc and "binlog" not in cdc
+    cutover = build_cutover_chat_system("facts", source_engine=pg)
+    assert "IDENTITY" in cutover and "AUTO_INCREMENT" not in cutover
+    val = build_validation_chat_system("counts", source_engine=pg)
+    assert "PostgreSQL logical replication" in val
+
+
+def test_builders_default_to_mysql_source_engine() -> None:
+    from dsql_migrator.core.assessment_strategist import (
+        build_cdc_error_chat_system,
+        build_object_chat_system,
+    )
+
+    # No source_engine passed -> the original MySQL grounding is preserved.
+    assert "MySQL" in build_object_chat_system(_guidance_item())
+    assert "MySQL binlog" in build_cdc_error_chat_system("facts")
+
+
+def test_strategist_threads_source_engine_into_object_chat() -> None:
+    # The strategist's source_engine reaches the internally-built system prompt.
+    client = _FakeStreamClient(["ok"])
+    strategist = AssessmentStrategist(_config(), client=client, source_engine="PostgreSQL")
+    strategist.stream_object_chat(_guidance_item(), [{"role": "user", "text": "hi"}], lambda _s: None)
+    body = json.loads(client.calls[-1]["body"])
+    assert "PostgreSQL" in body["system"]
+    assert "MySQL" not in body["system"]
+
+
+def test_strategist_source_engine_setter_pins_engine() -> None:
+    strategist = AssessmentStrategist(_config())
+    assert strategist.source_engine == "MySQL"
+    strategist.source_engine = "PostgreSQL"
+    assert strategist.source_engine == "PostgreSQL"
+    # A falsy value falls back to the MySQL default.
+    strategist.source_engine = ""
+    assert strategist.source_engine == "MySQL"

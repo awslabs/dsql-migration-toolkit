@@ -41,6 +41,7 @@ from dsql_migrator.config import SecretValue
 from dsql_migrator.core.assessment_strategist import (
     AssessmentStrategist,
     ObjectGuidanceOutcome,
+    source_engine_word,
 )
 from dsql_migrator.core.activity_log import (
     ActivityCategory,
@@ -1230,6 +1231,16 @@ def build_evaluation_screen(
                     strategist = strategist_factory(
                         session.ai_assist, session.aws_profile
                     )
+                    # Ground the AI DBA on THIS migration's source engine (MySQL vs
+                    # PostgreSQL); the factory builds the strategist before the source
+                    # type is in scope, so pin it here (best-effort — a bare fake in
+                    # tests may not expose the setter).
+                    try:
+                        strategist.source_engine = source_engine_word(
+                            getattr(session.source_config, "source_type", None)
+                        )
+                    except AttributeError:
+                        pass
                     if ai_tool_execute is not None:
                         # Give the per-object/finding chat the SAME read-only tools the
                         # general chat has, so a chat started on ONE object can still

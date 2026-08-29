@@ -2340,6 +2340,12 @@ def build_validation_screen(
                     strategist = strategist_factory(
                         session.ai_assist, session.aws_profile
                     )
+                    # Ground the mismatch chat on THIS migration's source engine; the
+                    # factory builds the strategist before the source type is in scope.
+                    try:
+                        strategist.source_engine = _source_engine_word(session)
+                    except AttributeError:
+                        pass
                     # Per-run / per-table mismatch diagnosis deep-links into the
                     # persistent app-wide AI panel; no-op when it is not wired (tests).
                     def diagnose_provider(  # noqa: E731 - small bound opener
@@ -2762,7 +2768,8 @@ def build_cutover_screen(
 
             def _open_cutover_ai() -> None:
                 strategist = AssessmentStrategist(
-                    session.ai_assist, aws_profile=session.aws_profile  # type: ignore[attr-defined]
+                    session.ai_assist, aws_profile=session.aws_profile,  # type: ignore[attr-defined]
+                    source_engine=engine,
                 )
                 open_ai_scope(
                     scope_id="cutover",

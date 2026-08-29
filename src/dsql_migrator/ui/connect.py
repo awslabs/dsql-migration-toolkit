@@ -459,18 +459,21 @@ def build_connect_page(
         from dsql_migrator.core.assessment_strategist import (
             AssessmentStrategist,
             build_connection_error_chat_system,
+            source_engine_word,
         )
 
+        engine = source_engine_word(_engine.get("type"))
         if side == "source":
-            _word = "PostgreSQL" if _engine["type"] is SourceType.POSTGRES else "MySQL"
-            label = f"source ({_word})"
+            label = f"source ({engine})"
         else:
             label = "target (Aurora DSQL)"
         system = build_connection_error_chat_system(
-            side=side, coordinates=coordinates, error_message=detail
+            side=side, coordinates=coordinates, error_message=detail,
+            source_engine=engine,
         )
         strategist = AssessmentStrategist(
-            state.ai_assist, aws_profile=getattr(state, "aws_profile", None)
+            state.ai_assist, aws_profile=getattr(state, "aws_profile", None),
+            source_engine=engine,
         )
         open_ai_scope(
             scope_id=f"connect:{side}",

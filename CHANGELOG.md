@@ -5,6 +5,23 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.415
+
+### Fixed
+
+- **The AI DBA now knows the migration's source engine (MySQL vs PostgreSQL) and
+  answers in the right dialect.** Every AI-DBA grounding prompt previously hard-coded
+  "MySQL", so a PostgreSQL-source migration was mis-grounded — the assistant would talk
+  about MySQL binlog, `AUTO_INCREMENT`, and MySQL syntax even when the source was
+  PostgreSQL. All prompts (object/schema/query chats, the validation, Full Load, CDC,
+  cut over, and connection-error assistants, and the batch assessment) are now
+  parameterized on the real source engine, taken from the session's source type. The
+  CDC/validation/cut-over recovery guidance also picks the source-specific detail
+  (PostgreSQL logical replication vs MySQL binlog; `SERIAL`/`IDENTITY` sequences vs
+  `AUTO_INCREMENT`; rollback direction). The target is always described as Amazon
+  Aurora DSQL (PostgreSQL-compatible), so converted/reimplemented SQL is still written
+  in DSQL's PostgreSQL dialect.
+
 ## v0.1.414
 
 ### Changed

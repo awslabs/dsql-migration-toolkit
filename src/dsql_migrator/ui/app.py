@@ -36,6 +36,7 @@ from dsql_migrator.config import (
 from dsql_migrator.core.assessment_strategist import (
     AssessmentStrategist,
     build_general_chat_system,
+    source_engine_word,
 )
 from dsql_migrator.core.job_manager import JobManager
 from dsql_migrator.core.models import MigrationContext, SourceType
@@ -365,13 +366,19 @@ def build_page(
         st = SESSION_STORE.get_or_create(session_id)
         if not st.ai_assist.enabled:
             return None
-        strategist = AssessmentStrategist(st.ai_assist, aws_profile=st.aws_profile)
+        engine = source_engine_word(
+            getattr(getattr(st, "source_config", None), "source_type", None)
+        )
+        strategist = AssessmentStrategist(
+            st.ai_assist, aws_profile=st.aws_profile, source_engine=engine
+        )
         ctx = _ai_context()
         system = (
             build_general_chat_system(
                 current_step=ctx.current_step,
                 migration_type=ctx.migration_type,
                 summary=ctx.summary,
+                source_engine=engine,
             )
             + _AI_TOOLS_SYSTEM_HINT
         )
