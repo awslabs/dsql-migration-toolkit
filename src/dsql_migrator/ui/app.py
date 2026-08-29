@@ -647,6 +647,22 @@ def build_page(
                 handle.reset()
             except Exception:  # noqa: BLE001 - UI wipe is best-effort; must not fail reset
                 pass
+        # Record the reset in the durable audit trail. "Start over" is a destructive
+        # action (it wipes the session and can trigger a CDC teardown, logged
+        # separately), so the audit log -- which is process-wide and deliberately NOT
+        # cleared by a reset -- must still show WHEN the workbench was reset.
+        from dsql_migrator.core.activity_log import (
+            ActivityCategory,
+            ActivityStatus,
+            log_activity,
+        )
+
+        log_activity(
+            ActivityCategory.SYSTEM,
+            "session reset",
+            status=ActivityStatus.SUCCESS,
+            detail="Start over — session workbench and saved snapshot cleared",
+        )
 
     def _cdc_deployed() -> bool:
         """True when ANY CDC AWS resource exists, so Start over can offer to tear it

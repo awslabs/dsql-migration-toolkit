@@ -223,6 +223,28 @@ def test_configure_activity_stdout_log_adds_idempotent_stream_handler(capsys) ->
     assert obj["action"] == "app started"
 
 
+def test_session_reset_emits_system_success_audit_line(capsys) -> None:
+    """"Start over" records a SYSTEM 'session reset' (success) audit line.
+
+    The audit log is process-wide and deliberately NOT cleared by a reset, so the
+    reset itself must leave a trace (this is the shape ``_reset_session`` emits)."""
+    _reset_activity_logger()
+    configure_activity_stdout_log()
+
+    log_activity(
+        ActivityCategory.SYSTEM,
+        "session reset",
+        status=ActivityStatus.SUCCESS,
+        detail="Start over — session workbench and saved snapshot cleared",
+    )
+    out = capsys.readouterr().out
+    obj = json.loads([ln for ln in out.splitlines() if ln.strip()][-1])
+    assert obj["category"] == "system"
+    assert obj["action"] == "session reset"
+    assert obj["status"] == "success"
+    assert "Start over" in obj["detail"]
+
+
 def test_configure_activity_file_log_uses_default_rotation_bounds(tmp_path) -> None:
     """By default the handler caps each segment at ~20 MiB and keeps 4 backups
     (~100 MiB total retained)."""

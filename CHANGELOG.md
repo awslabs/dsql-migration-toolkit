@@ -5,6 +5,17 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.416
+
+### Added
+
+- **"Start over" now writes a `session reset` entry to the activity log.** The reset
+  wipes the session workbench, the saved snapshot and the AI panel transcript, and can
+  trigger a CDC teardown (logged separately) — but the reset itself previously left no
+  trace. The durable, process-wide activity/audit log (which is intentionally **not**
+  cleared by a reset, so it survives to record that the reset happened) now shows a
+  `[system] session reset (success)` line with the time it occurred.
+
 ## v0.1.415
 
 ### Fixed
