@@ -5,6 +5,40 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.411
+
+### Changed
+
+- **Published the `0.1.411` image to all three registries and repointed the
+  `ContainerImageUri` default** in `deploy/cloudformation.yaml` (`0.1.409 → 0.1.411`),
+  so a fresh `git clone` deploy pulls the image with the FK-note Alert box (v0.1.410)
+  and the advisory-only Evaluation classification fix (v0.1.411). The deployed Seoul
+  stack (`mysql-dsql-migrator-seoul`, ap-northeast-2) was updated to the `0.1.411` image.
+
+### Fixed
+
+- **Evaluation no longer over-counts "Review needed" tables in the report / chart /
+  summary.** A table whose ONLY findings were advisory (a preserved foreign key or an
+  AUTO_INCREMENT throughput note — `RECOMMENDATION`, which nonetheless carried a
+  `MANUAL` classification) was rolled up as `MANUAL` by the assessor, so it read as
+  **Review needed** in everything derived from the item classification (the exported
+  HTML/JSON/text report, the chart, the difficulty summary, the migration score) while
+  the on-screen object list correctly showed it as **Recommended** — e.g. 7 tables
+  marked Review needed in the report vs 5 in the list. An object whose findings are all
+  advisory is now classified **AUTO** (mirroring the effort rule, which already excluded
+  advisory findings), so every surface agrees; the advice is still surfaced as a
+  `RECOMMENDED` concern (nothing is silently marked compatible).
+
+## v0.1.410
+
+### Changed
+
+- **The foreign-key deferral note at the "Preserve foreign keys" toggle is now an
+  Alert box (`render_notice`, info tone) instead of loose gray caption text,** matching
+  the design system (a status/guidance message is a bordered notice with a leading icon
+  and bold header, never plain colored text). Same wording — foreign keys are created
+  after Full Load (at cut over for CDC), not at Schema Apply, by design.
+
 ## v0.1.409
 
 ### Changed

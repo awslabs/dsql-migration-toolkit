@@ -2762,12 +2762,17 @@ def _render_browser_and_preview(
     # foreign keys appear -- otherwise the target having zero FKs right after Apply
     # reads as a bug ("why is the FK missing?") rather than the intended design.
     if conv_state.preserve_foreign_keys:
-        ui.label(  # type: ignore[attr-defined]
-            "Foreign keys are (re)created after Full Load (at cut over for a CDC "
-            "migration), not at Schema Apply — so the target has none immediately "
-            "after Apply. This is by design (the concurrent bulk load has no "
-            "parent-before-child ordering)."
-        ).classes("text-xs text-gray-600")
+        render_notice(
+            ui,
+            tone="info",
+            header="Foreign keys are created after Full Load, not at Schema Apply",
+            body=(
+                "They are (re)created at the end of Full Load (at cut over for a CDC "
+                "migration), so the target has no foreign keys immediately after "
+                "Schema Apply. This is by design — the concurrent bulk load has no "
+                "parent-before-child ordering."
+            ),
+        )
 
     # --- Generated DDL comparison (only after Generate) -------------------
     if conv_state.generated_node_ids is None:

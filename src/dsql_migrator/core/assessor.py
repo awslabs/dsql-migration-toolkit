@@ -1432,9 +1432,13 @@ def _inventory_objects(inventory: SourceInventory) -> list[ObjectKey]:
 def _aggregate(key: ObjectKey, findings: list[Finding]) -> AssessmentItem:
     """Collapse all findings for one object into a single assessment item.
 
-    The most severe classification governs the item; risks and recommendations
-    of every matched rule are combined so no finding is lost. Objects with no
-    findings are classified ``AUTO``.
+    The most severe classification among the object's REAL GAPS governs the item;
+    risks and recommendations of every matched rule are combined so no finding is
+    lost. An object with no findings -- or whose findings are ALL advisory
+    (``RECOMMENDATION``, e.g. a preserved foreign key or an AUTO_INCREMENT
+    throughput note) -- is classified ``AUTO``, since advisory findings report no
+    defect and require no work (the advice is still surfaced as a ``RECOMMENDED``
+    concern).
     """
     if not findings:
         return AssessmentItem(
@@ -1490,18 +1494,27 @@ def _aggregate(key: ObjectKey, findings: list[Finding]) -> AssessmentItem:
     # recommendation, inflating the estimate for the most common table shape there is.
     # Advisory findings keep their own per-concern effort, so the cost of taking the
     # advice is still visible on the finding itself.
-    gap_efforts = [
-        f.effort
-        for f in findings
-        if f.effort is not None and f.note_kind is not ConversionNoteKind.RECOMMENDATION
+    gap_findings = [
+        f for f in findings if f.note_kind is not ConversionNoteKind.RECOMMENDATION
     ]
+    gap_efforts = [f.effort for f in gap_findings if f.effort is not None]
     # An object whose findings are ALL advisory has no required work, so it carries no
     # effort at all rather than borrowing the advice's estimate.
     effort = max(gap_efforts, key=lambda e: _EFFORT_ORDER[e]) if gap_efforts else None
+    # ...and for the SAME reason it is classified AUTO, not by the advisory finding's
+    # (MANUAL) severity. An advisory finding (a foreign key, an AUTO_INCREMENT throughput
+    # note) reports NO defect -- the object converts automatically -- so an object with
+    # only advisory findings is AUTO, mirroring the effort rule above. Leaving it MANUAL
+    # produced a "MANUAL with no effort" object that read as AUTO/Recommended in the
+    # object list (which labels advisory findings RECOMMENDED) but as "Review needed" in
+    # every count derived from ``classification`` (report, chart, summary, score) -- the
+    # two disagreed on the same table. The advice is still surfaced as a RECOMMENDED
+    # concern below, so nothing is silently marked compatible (Property 8 holds).
+    classification = governing.classification if gap_findings else Classification.AUTO
     return AssessmentItem(
         object_name=key.name,
         rule_id=governing.rule_id,
-        classification=governing.classification,
+        classification=classification,
         risk=risk,
         recommendation=recommendation,
         effort=effort,

@@ -5,6 +5,36 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.411
+
+### 변경 (Changed)
+
+- **`0.1.411` 이미지를 세 개 레지스트리 모두에 게시하고 `deploy/cloudformation.yaml`의
+  `ContainerImageUri` 기본값을 `0.1.409 → 0.1.411`로 갱신**했습니다. 새로 `git clone`해
+  배포하면 FK 안내 Alert 박스(v0.1.410)와 advisory-only Evaluation 분류 수정(v0.1.411)이 포함된
+  이미지를 받습니다. 배포된 Seoul 스택(`mysql-dsql-migrator-seoul`, ap-northeast-2)도 `0.1.411`
+  이미지로 업데이트했습니다.
+
+### 수정 (Fixed)
+
+- **Evaluation의 리포트 / 차트 / 요약이 "Review needed" 테이블을 과다 집계하던 문제를
+  수정했습니다.** finding이 조언성(보존 외래 키 또는 AUTO_INCREMENT 처리량 노트 —
+  `RECOMMENDATION`이지만 `MANUAL` 분류를 지님)뿐인 테이블이 assessor에서 `MANUAL`로 집계돼,
+  item 분류에서 파생되는 모든 곳(내보낸 HTML/JSON/텍스트 리포트, 차트, 난이도 요약, 마이그레이션
+  점수)에서 **Review needed**로 표시된 반면, 화면의 객체 리스트는 올바르게 **Recommended**로
+  표시했습니다 — 예: 리포트 7개 vs 리스트 5개. 이제 finding이 전부 조언성인 객체는 **AUTO**로
+  분류됩니다(조언성을 이미 제외하던 effort 규칙과 동일). 그래서 모든 화면이 일치하며, 조언은
+  여전히 `RECOMMENDED` concern으로 표시됩니다(아무것도 조용히 호환으로 표시하지 않음).
+
+## v0.1.410
+
+### 변경 (Changed)
+
+- **"Preserve foreign keys" 토글의 외래 키 지연 안내를 이제 흐린 캡션 텍스트가 아니라 Alert
+  박스(`render_notice`, info 톤)로 표시**합니다 — 디자인 시스템에 맞춰(상태/안내 메시지는 선행
+  아이콘과 굵은 헤더가 있는 테두리 알림 박스여야 하며, 흐린 색 텍스트로 두지 않음). 문구는 동일:
+  외래 키는 Schema Apply가 아니라 Full Load 이후(CDC는 cut over 시)에 설계상 생성됩니다.
+
 ## v0.1.409
 
 ### 변경 (Changed)

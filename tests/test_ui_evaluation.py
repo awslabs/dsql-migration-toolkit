@@ -91,8 +91,9 @@ def _target_config() -> TargetConnectionConfig:
 
 
 def _inventory_with_fk() -> SourceInventory:
-    # A table with a foreign key is classified MANUAL by the assessor, and a
-    # table without a primary key is UNSUPPORTED, giving a non-trivial report.
+    # A table whose only finding is a foreign key converts automatically (the FK is
+    # advisory/RECOMMENDED, re-created after load), so it is AUTO; a table without a
+    # primary key is UNSUPPORTED -- giving a non-trivial report (AUTO + UNSUPPORTED).
     return SourceInventory(
         tables=[
             TableDef(
@@ -186,7 +187,8 @@ def test_run_evaluation_introspects_source_and_target_and_assesses() -> None:
     # Every object is classified (Property 8): 2 tables -> 2 items.
     assert len(result.assessment.items) == 2
     classifications = {item.classification for item in result.assessment.items}
-    assert Classification.MANUAL in classifications
+    # orders has only an advisory FK finding -> AUTO; audit_log has no PK -> UNSUPPORTED.
+    assert Classification.AUTO in classifications
     assert Classification.UNSUPPORTED in classifications
 
 

@@ -5,6 +5,38 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.411
+
+### 変更 (Changed)
+
+- **`0.1.411` イメージを 3 つのレジストリすべてに公開し、`deploy/cloudformation.yaml` の
+  `ContainerImageUri` デフォルトを `0.1.409 → 0.1.411` に更新**しました。新規に `git clone`
+  してデプロイすると、FK 注記の Alert ボックス(v0.1.410)と advisory-only の Evaluation 分類
+  修正(v0.1.411)を含むイメージを取得します。デプロイ済みの Seoul スタック
+  (`mysql-dsql-migrator-seoul`、ap-northeast-2)も `0.1.411` イメージに更新しました。
+
+### 修正 (Fixed)
+
+- **Evaluation のレポート / チャート / サマリーが "Review needed" テーブルを過剰にカウントする
+  問題を修正しました。** 検出結果が助言のみ(保持される外部キー、または AUTO_INCREMENT の
+  スループット注記 — `RECOMMENDATION` だが `MANUAL` 分類を持つ)のテーブルが assessor で
+  `MANUAL` に集計され、item 分類から派生するすべて(エクスポートした HTML/JSON/テキストレポート、
+  チャート、難易度サマリー、移行スコア)で **Review needed** と表示される一方、画面上のオブジェクト
+  一覧は正しく **Recommended** と表示していました — 例:レポート 7 件 vs 一覧 5 件。今後は検出
+  結果がすべて助言のオブジェクトは **AUTO** に分類されます(助言を既に除外していた effort ルールと
+  同様)。これによりすべての画面が一致し、助言は引き続き `RECOMMENDED` concern として表示されます
+  (何も暗黙的に互換とマークしません)。
+
+## v0.1.410
+
+### 変更 (Changed)
+
+- **"Preserve foreign keys" トグルの外部キー遅延の注記を、薄いキャプションテキストではなく
+  Alert ボックス(`render_notice`、info トーン)で表示するようにしました** — デザインシステムに
+  合わせています(状態/案内メッセージは、先頭アイコンと太字ヘッダーを持つ枠付き通知ボックスに
+  すべきで、薄い色のテキストにはしません)。文言は同じ:外部キーは Schema Apply ではなく
+  Full Load の後(CDC はカットオーバー時)に設計上作成されます。
+
 ## v0.1.409
 
 ### 変更 (Changed)

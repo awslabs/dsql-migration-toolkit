@@ -97,6 +97,56 @@ def test_fk_rule_flags_foreign_keys_as_advisory() -> None:
     concern = next(c for c in item.concerns if c.rule_id == "FK_PRESERVED")
     assert concern.is_advisory
     assert item.effort is None
+    # Advisory-only -> AUTO (converts automatically; the FK is re-created for you), so
+    # the report/summary never counts an FK-only table as "Review needed" (MANUAL).
+    assert item.classification is Classification.AUTO
+
+
+def test_advisory_only_table_is_auto_but_mixed_table_stays_manual() -> None:
+    # Regression for the report marking advisory-only tables "Review needed": an object
+    # with ONLY advisory findings is AUTO; add ONE real gap and it becomes MANUAL. The
+    # report/chart/summary derive from item.classification, so this is what keeps the
+    # exported report's "Review needed" count equal to the object list's.
+    advisory_only = SourceInventory(
+        tables=[
+            _table_with_pk(
+                "order_items",
+                auto_increment_column="id",
+                foreign_keys=[
+                    ForeignKeyDef(
+                        name="fk_order",
+                        columns=["order_id"],
+                        referenced_table="orders",
+                        referenced_columns=["id"],
+                    )
+                ],
+            )
+        ]
+    )
+    item = _item_for(_assess(advisory_only), "order_items")
+    assert item.classification is Classification.AUTO
+    assert item.effort is None
+    assert all(c.is_advisory for c in item.concerns)
+
+    # A CI collation is a real gap; the same table with it is MANUAL (with effort).
+    mixed = SourceInventory(
+        tables=[
+            _table_with_pk(
+                "order_items",
+                auto_increment_column="id",
+                columns=[
+                    ColumnDef(name="id", mysql_type="INT"),
+                    ColumnDef(
+                        name="name", mysql_type="VARCHAR(50)",
+                        collation="utf8mb4_general_ci",
+                    ),
+                ],
+            )
+        ]
+    )
+    mixed_item = _item_for(_assess(mixed), "order_items")
+    assert mixed_item.classification is Classification.MANUAL
+    assert mixed_item.effort is not None
 
 
 def test_trigger_unsupported_rule_classifies_trigger_unsupported() -> None:
@@ -146,7 +196,14 @@ def test_auto_increment_rule_reads_as_throughput_advice_not_a_failure() -> None:
     )
     item = _item_for(_assess(inventory), "users")
     assert item.rule_id == "AUTO_INCREMENT"
-    assert item.classification is Classification.MANUAL
+    # An object whose ONLY finding is advisory (throughput advice, no defect) is AUTO,
+    # not MANUAL -- otherwise the report/chart/summary count it as "Review needed" while
+    # the object list shows it as RECOMMENDED, and the two disagree on the same table.
+    # The advice is still surfaced as an advisory concern below.
+    assert item.classification is Classification.AUTO
+    assert item.effort is None
+    concern = next(c for c in item.concerns if c.rule_id == "AUTO_INCREMENT")
+    assert concern.is_advisory
     text = item.risk.lower()
     # Leads with what is TRUE of the table, not with a consequence.
     assert "converts cleanly" in text
@@ -366,14 +423,27 @@ def test_most_severe_classification_wins_when_multiple_rules_match() -> None:
 def test_report_summary_counts_objects_by_classification() -> None:
     inventory = SourceInventory(
         tables=[
-            _table_with_pk("clean"),  # AUTO
-            _table_with_pk("auto_inc", auto_increment_column="id"),  # MANUAL
+            _table_with_pk("clean"),  # AUTO (no findings)
+            # Advisory-only (AUTO_INCREMENT throughput note) -> AUTO, NOT MANUAL: the
+            # summary drives the report/chart "Review needed" count, which must match the
+            # object list (advisory findings read RECOMMENDED there, not Review needed).
+            _table_with_pk("auto_inc", auto_increment_column="id"),  # AUTO (advisory only)
+            _table_with_pk(
+                "ci",
+                columns=[
+                    ColumnDef(name="id", mysql_type="INT"),
+                    ColumnDef(
+                        name="name", mysql_type="VARCHAR(50)",
+                        collation="utf8mb4_general_ci",
+                    ),
+                ],
+            ),  # MANUAL (real gap: CI collation)
             TableDef(name="no_pk", primary_key=[]),  # UNSUPPORTED
         ]
     )
     report = _assess(inventory)
     assert report.summary == {
-        Classification.AUTO: 1,
+        Classification.AUTO: 2,
         Classification.MANUAL: 1,
         Classification.UNSUPPORTED: 1,
     }
