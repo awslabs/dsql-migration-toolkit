@@ -715,7 +715,7 @@ def test_footer_is_one_settings_entry_not_three_inline_panels() -> None:
     # No inline expansions for these utilities any more.
     for module_fn in (
         app._render_tuning_group_controls,
-        app._render_diagnostics_controls,
+        app._render_activity_log_controls,
     ):
         body = inspect.getsource(module_fn)
         assert 'ui.expansion(' not in body, module_fn.__name__
@@ -742,12 +742,12 @@ def test_settings_modal_gives_each_tuning_group_its_own_tab() -> None:
     # No catch-all Performance TAB (the prose may still mention why it went away, so
     # match the ui.tab(...) call rather than the bare string).
     assert 'ui.tab("Performance"' not in src, "the catch-all Performance tab is gone"
-    # The two non-tuning utilities keep their own explicit tabs + panels.
-    for label in ('"Diagnostics"', '"Activity log"'):
-        assert f"ui.tab({label}" in src, label
+    # ONE merged "Activity log" tab (the former separate "Diagnostics" tab is gone --
+    # level + mirror + download are the same subject, so they share one tab + panel).
+    assert 'ui.tab("Activity log"' in src
+    assert 'ui.tab("Diagnostics"' not in src, "Diagnostics merged into Activity log"
     assert "_render_tuning_group_controls(name)" in src
-    assert "_render_diagnostics_controls()" in src
-    assert "_render_activity_log_download(activity_log_path)" in src
+    assert "_render_activity_log_controls(activity_log_path)" in src
 
     # The tab list must be DERIVED, not a literal that happens to match today's
     # registry: hard-coding it would silently drop a group's tab (its knobs would be
@@ -904,6 +904,9 @@ class _FormUi:
     def spinner(self, *_a, **_k):
         return self._El(self)
 
+    def separator(self, *_a, **_k):
+        return self._El(self)
+
     def badge(self, *_a, **_k):
         return self._El(self)
 
@@ -1026,11 +1029,14 @@ def test_validation_tab_is_rendered_without_the_full_load_notice() -> None:
     assert "Connections" not in blob
 
 
-def test_diagnostics_tab_uses_the_same_form_field_rows() -> None:
-    """Two controls of different shapes in one short panel read as unrelated widgets.
+def test_activity_log_tab_uses_the_same_form_field_rows() -> None:
+    """The merged Activity-log tab's two runtime knobs share the tuning tabs' shape.
 
-    Routing both through ``form_field`` gives them the same label/description structure as
-    every tuning tab, and states its timing in the same place.
+    Level + mirror route through ``form_field`` so they read as one form (same
+    label/description structure as every tuning tab). The tab also carries the
+    download action (the former separate "Diagnostics"/"Activity log" split is gone),
+    and the mirror control is named by its DESTINATION ("CloudWatch Logs"), not the
+    opaque "stdout" mechanism.
     """
     import sys
     import types
@@ -1043,7 +1049,7 @@ def test_diagnostics_tab_uses_the_same_form_field_rows() -> None:
     saved = sys.modules.get("nicegui")
     sys.modules["nicegui"] = fake
     try:
-        app._render_diagnostics_controls()
+        app._render_activity_log_controls("/tmp/does-not-matter.ndjson")
     finally:
         if saved is None:
             sys.modules.pop("nicegui", None)
@@ -1051,11 +1057,15 @@ def test_diagnostics_tab_uses_the_same_form_field_rows() -> None:
             sys.modules["nicegui"] = saved
 
     blob = " ".join(ui.texts)
-    assert "Changes apply immediately." in blob
-    assert "Log level" in blob and "Mirror to stdout" in blob
+    assert "Level and mirroring changes apply immediately." in blob
+    # Renamed control: destination, not "stdout".
+    assert "Log level" in blob and "Mirror to CloudWatch Logs" in blob
+    assert "Mirror to stdout" not in blob, "the opaque 'stdout' label must be gone"
     assert ui.selects and ui.selects[0][0] == ("DEBUG", "INFO", "WARNING", "ERROR")
     assert ui.switches
     assert "CloudWatch" in blob
+    # Merged in: the download action lives on this same tab now.
+    assert "Download activity log" in ui.texts
     # The form_field row supplies the label, so the control must NOT carry a floating
     # one too -- Quasar would render "Log level" twice, stacked, in the same row.
     assert ui.texts.count("Log level") == 1, (
@@ -1185,7 +1195,7 @@ def test_activity_log_tab_presents_its_action_at_full_size() -> None:
     saved = sys.modules.get("nicegui")
     sys.modules["nicegui"] = fake
     try:
-        app._render_activity_log_download("/tmp/does-not-matter.ndjson")
+        app._render_activity_log_controls("/tmp/does-not-matter.ndjson")
     finally:
         if saved is None:
             sys.modules.pop("nicegui", None)
@@ -1193,29 +1203,30 @@ def test_activity_log_tab_presents_its_action_at_full_size() -> None:
             sys.modules["nicegui"] = saved
 
     blob = " ".join(ui.texts)
-    # Same lead-in shape as every other tab (states when/what, up front).
+    # The download's own timing/what note (now folded into the merged tab).
     assert "Downloads the log as it stands right now." in blob
-    # A labelled section describing the artifact...
-    assert "Activity log" in blob
     assert "One UTC line per event" in blob
-    # ...and the action NAMES what it downloads, matching the Full Load error-log button
+    # The action NAMES what it downloads, matching the Full Load error-log button
     # ("Download" alone left the verb to be paired with a heading by eye).
     assert "Download activity log" in ui.texts
     # The ephemeral-storage caveat is available without leaving the dialog.
     tooltips = [t for t in ui.texts if t.startswith("[tooltip]")]
-    assert tooltips and "CloudWatch" in tooltips[0]
+    assert any("CloudWatch" in t for t in tooltips)
 
     import inspect
     import re
 
-    src = inspect.getsource(app._render_activity_log_download)
-    # Not a form row: form_field would shrink and right-align the button.
-    assert "form_field(" not in src, (
-        "an action panel must not put its button in a form-field control slot"
+    src = inspect.getsource(app._render_activity_log_controls)
+    # The DOWNLOAD button must not be wedged into a form_field control slot (that would
+    # shrink and right-align it). The merged tab DOES use form_field for its two runtime
+    # knobs (level + mirror), so assert on the button call itself, not the whole function:
+    # the button is created directly under the column, never inside a `with form_field(...)`.
+    button_call = re.search(
+        r'ui\.button\(\s*"Download activity log".*?\.props\(\s*"([^"]*)"', src, re.S
     )
-    # Full-size primary action -- not shrunk by dense/size=sm, since nothing on this tab
-    # competes with it.
-    button_props = re.search(r'ui\.button\(\s*"Download activity log".*?\.props\(\s*"([^"]*)"', src, re.S)
+    assert button_call is not None, "expected the download button in the merged tab"
+    # Full-size primary action -- not shrunk by dense/size=sm, since nothing competes.
+    button_props = button_call
     assert button_props is not None, "expected a props() call on the download button"
     props = button_props.group(1)
     assert "color=primary" in props

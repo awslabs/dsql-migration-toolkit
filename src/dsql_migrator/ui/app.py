@@ -1316,9 +1316,13 @@ def _render_footer_tools(activity_log_path: str) -> None:
             group_tabs = [
                 ui.tab(name, icon=group_icons.get(name, "tune")) for name in groups
             ]
-            diagnostics_tab = ui.tab("Diagnostics", icon="bug_report")
-            activity_tab = ui.tab("Activity log", icon="download")
-        first_tab = group_tabs[0] if group_tabs else diagnostics_tab
+            # ONE "Activity log" tab, not a separate "Diagnostics" tab beside it. The
+            # log LEVEL, the CloudWatch mirror, and the download are all the same
+            # subject -- the one activity/audit log (how much is recorded, where it is
+            # streamed, how to pull it) -- so they belong on one destination, not split
+            # across "Diagnostics" (level + mirror) and "Activity log" (download).
+            activity_tab = ui.tab("Activity log", icon="receipt_long")
+        first_tab = group_tabs[0] if group_tabs else activity_tab
         with ui.tab_panels(tabs, value=first_tab).classes("w-full").style(
             # FIXED height, not a min/max range: with a range the dialog resized on every
             # tab switch (Full Load has three knobs, Validation one), so the card grew and
@@ -1334,10 +1338,8 @@ def _render_footer_tools(activity_log_path: str) -> None:
             for name, tab in zip(groups, group_tabs):
                 with ui.tab_panel(tab).classes("p-0 pt-3"):
                     _render_tuning_group_controls(name)
-            with ui.tab_panel(diagnostics_tab).classes("p-0 pt-3"):
-                _render_diagnostics_controls()
             with ui.tab_panel(activity_tab).classes("p-0 pt-3"):
-                _render_activity_log_download(activity_log_path)
+                _render_activity_log_controls(activity_log_path)
 
         # Footer, BELOW the tabs: this persistence caveat reads as a closing note on the
         # whole panel rather than a banner competing with the title. It prevents a real
@@ -1476,15 +1478,24 @@ def _render_tuning_group_controls(group: str) -> None:
                     ).props("dense outlined").classes("w-24 text-sm")
 
 
-def _render_diagnostics_controls() -> None:
-    """Render runtime troubleshooting controls in the sidebar footer.
+def _render_activity_log_controls(activity_log_path: str) -> None:
+    """Render the merged "Activity log" tab: recording controls + download.
 
-    Deployment is kept parameter-light: the log level and the optional CloudWatch
-    mirror are NOT deploy-time inputs but are adjusted here at runtime, so an
-    operator can flip INFO<->DEBUG (DEBUG adds failure stacktraces) and start/stop
-    mirroring the activity log to stdout (forwarded to CloudWatch on ECS) while
-    troubleshooting -- no redeploy. Changes apply app-wide (single-task app) and
-    reset to the startup defaults on restart.
+    Everything here concerns the ONE activity/audit log, so it lives on one tab
+    instead of being split across a "Diagnostics" tab (level + CloudWatch mirror)
+    and a separate "Activity log" tab (download). The three controls are the same
+    subject seen three ways:
+
+    * **Log level** -- HOW MUCH is recorded (DEBUG adds failure stacktraces).
+    * **Mirror to CloudWatch Logs** -- WHERE it is also streamed (the container's
+      stdout, which the ECS awslogs driver forwards to CloudWatch, giving a durable
+      copy that survives task replacement).
+    * **Download** -- pull the human-readable timeline as it stands right now.
+
+    The level + mirror are runtime knobs (not deploy-time inputs), so an operator can
+    flip INFO<->DEBUG and start/stop the CloudWatch mirror while troubleshooting with
+    no redeploy. Both apply app-wide (single-task app) and reset to the startup
+    defaults on restart; Download is a point-in-time snapshot.
     """
     import logging
 
@@ -1495,6 +1506,7 @@ def _render_diagnostics_controls() -> None:
         configure_activity_stdout_log,
         current_activity_log_level,
         disable_activity_stdout_log,
+        read_activity_log,
         set_activity_log_level,
     )
 
@@ -1506,8 +1518,11 @@ def _render_diagnostics_controls() -> None:
         current = "INFO"
 
     # Same "when does this take effect" lead-in as the tuning panels, so every Settings
-    # tab opens with the same fact in the same place.
-    ui.label("Changes apply immediately.").classes("text-xs text-gray-500 mb-2")
+    # tab opens with the same fact in the same place. Scoped to the runtime knobs (the
+    # level + mirror); the download's own timing is stated on its section below.
+    ui.label("Level and mirroring changes apply immediately.").classes(
+        "text-xs text-gray-500 mb-2"
+    )
 
     def _on_level(event: object) -> None:
         value = str(getattr(event, "value", "INFO"))
@@ -1518,12 +1533,19 @@ def _render_diagnostics_controls() -> None:
         if bool(getattr(event, "value", False)):
             configure_activity_stdout_log(level=current_activity_log_level())
             ui.notify(
-                "Mirroring activity log to stdout (CloudWatch on ECS).",
+                "Mirroring the activity log to CloudWatch Logs (via stdout on ECS).",
                 type="info",
             )
         else:
             disable_activity_stdout_log()
-            ui.notify("Stopped mirroring activity log to stdout.", type="info")
+            ui.notify("Stopped mirroring the activity log to CloudWatch Logs.", type="info")
+
+    def _download() -> None:
+        data = read_activity_log(activity_log_path, "text")
+        if not data:
+            ui.notify("No activity has been logged yet.", type="info")
+            return
+        ui.download(data, "migration_activity.log")
 
     # Same Cloudscape FormField rows as the tuning tabs (label + description + control),
     # rather than a floating-label select beside a bare switch: two controls of different
@@ -1537,63 +1559,44 @@ def _render_diagnostics_controls() -> None:
             ui.select(levels, value=current, on_change=_on_level).props(
                 "dense outlined options-dense"
             ).classes("w-24 text-sm")
+        # Destination-first name: "Mirror to stdout" told the operator the mechanism,
+        # not what it is FOR. "Mirror to CloudWatch Logs" names the durable destination
+        # they actually care about; the description keeps the stdout/ephemeral detail.
         with form_field(
             ui,
-            label="Mirror to stdout",
+            label="Mirror to CloudWatch Logs",
             description=(
-                "What reaches CloudWatch Logs when the app runs on ECS — the log file "
-                "itself lives on ephemeral task storage."
+                "Also streams the activity log to the container's stdout, which the ECS "
+                "awslogs driver forwards to CloudWatch Logs — a durable copy that "
+                "survives task replacement. The log file itself lives on ephemeral task "
+                "storage."
             ),
         ):
             ui.switch(
                 value=activity_stdout_enabled(), on_change=_on_toggle
             ).props("dense")
 
-
-def _render_activity_log_download(activity_log_path: str) -> None:
-    """Render a global "Download activity log" button in the sidebar footer.
-
-    Always available so the operator can pull the full UTC, one-line-per-event
-    timeline (connection / assessment / schema apply / Full Load / CDC) whenever
-    needed, independent of which step is open. Downloads the human-readable text
-    rendering; the raw NDJSON file remains on disk for tooling.
-    """
-    from nicegui import ui
-
-    from dsql_migrator.core.activity_log import read_activity_log
-
-    def _download() -> None:
-        data = read_activity_log(activity_log_path, "text")
-        if not data:
-            ui.notify("No activity has been logged yet.", type="info")
-            return
-        ui.download(data, "migration_activity.log")
-
-    # This tab is an ACTION, not a set of fields -- so it does not use form_field. Wedging
-    # the button into a form row's right-hand control slot made it small and stranded it
-    # far from the text it belongs to, with the description wrapping underneath it: the
-    # slot is sized for a number input, and right-aligning is what makes a COLUMN of
-    # inputs line up, which is meaningless for a single button. Instead: a described
-    # section (same label/description/info structure the other tabs read as) with the
-    # action beneath it at full button size, left-aligned where reading ends.
-    ui.label("Downloads the log as it stands right now.").classes(
-        "text-xs text-gray-500 mb-2"
-    )
-    with ui.column().classes("gap-3 w-full pt-1"):
+        # Download is an ACTION, not a form field -- so it does NOT use form_field (that
+        # would wedge the button into the right-hand control slot, sized for a number
+        # input and right-aligned to line up a COLUMN of inputs, stranding a small button
+        # far from its text). A thin separator sets it apart from the two runtime knobs
+        # above, then a described section with the action beneath it at full button size.
+        ui.separator().classes("my-1")
         with ui.row().classes("items-center gap-1 no-wrap"):
-            ui.label("Activity log").classes("text-sm font-medium text-gray-900")
+            ui.label("Download").classes("text-sm font-medium text-gray-900")
             ui.icon("info_outline").classes(
                 "text-gray-400 text-sm cursor-help shrink-0"
             ).tooltip(
                 "The human-readable rendering of the audit trail. The raw NDJSON file "
                 "stays on disk for tooling.\n\n"
                 "On ECS the file lives on ephemeral task storage, so it is lost when the "
-                "task is replaced — enable Diagnostics → Mirror to stdout for a durable "
-                "copy in CloudWatch Logs."
+                "task is replaced — turn on 'Mirror to CloudWatch Logs' above for a "
+                "durable copy."
             )
         ui.label(
             "One UTC line per event across the whole session — connections, assessment, "
-            "schema apply, Full Load, CDC — independent of which step is open."
+            "schema apply, Full Load, CDC — independent of which step is open. Downloads "
+            "the log as it stands right now."
         ).classes("text-xs text-gray-500 leading-snug")
         # The tab's one action: primary-coloured and unstyled-down (no `dense`/`size=sm`),
         # since nothing here competes with it. Names the artifact rather than a bare verb,

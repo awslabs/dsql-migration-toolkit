@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.417
+
+### Changed
+
+- **Settings: the "Diagnostics" and "Activity log" tabs are merged into one
+  "Activity log" tab, and "Mirror to stdout" is renamed "Mirror to CloudWatch Logs".**
+  The log level, the CloudWatch mirror and the download are all the same subject — the
+  one activity/audit log (how much is recorded, where it is streamed, how to pull it) —
+  so they now live on a single tab instead of being split across two. The mirror toggle
+  is named by its destination ("CloudWatch Logs") rather than the opaque "stdout"
+  mechanism; its description keeps the detail (streams to the container's stdout, which
+  the ECS awslogs driver forwards to CloudWatch — a durable copy that survives task
+  replacement). Manual §7.2 updated to match.
+
 ## v0.1.416
 
 ### Added

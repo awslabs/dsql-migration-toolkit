@@ -447,9 +447,10 @@ PK의 같은 키 구간으로 쓰기가 몰리기 때문으로, §7.1의 핫 파
 
 - **Full Load / CDC / Validation** 탭 — §7.2의 튜닝 knob(테이블·배치 병렬수, 배치 행수, 소스 부하 스로틀,
   CDC 싱크 MCU, 검증 워커)을 각각 해당 단계의 **다음** 실행에 적용.
-- **Diagnostics** 탭 — 앱 **로그 레벨**(DEBUG / INFO / WARNING / ERROR) 설정 + **"mirror to stdout"** 토글로
-  로그를 컨테이너의 CloudWatch 로그 그룹에도 보내 디버깅 창을 확보.
-- **Activity log** 탭 — 세션 활동 로그 다운로드(AI DBA가 읽는 그 피드).
+- **Activity log** 탭 — 하나의 활동/감사 로그에 관한 모든 것을 한곳에: 앱 **로그 레벨**(DEBUG / INFO /
+  WARNING / ERROR) 설정, **"Mirror to CloudWatch Logs"** 토글(로그를 컨테이너 stdout으로도 스트리밍 →
+  ECS에서 CloudWatch로 전달되어 태스크 교체에도 남는 사본 확보), 그리고 세션 활동 로그
+  **다운로드**(AI DBA가 읽는 그 피드).
 
 다이얼로그 변경은 **재시작 시 되돌아갑니다**; 유지하려면 해당 `DSQL_MIGRATOR_*` 환경변수(§7.2 목록)를
 설정하세요.

@@ -5,6 +5,19 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.417
+
+### 変更 (Changed)
+
+- **設定: 「Diagnostics」タブと「Activity log」タブを 1 つの「Activity log」タブに統合し、
+  「Mirror to stdout」を「Mirror to CloudWatch Logs」に改名しました。** ログレベル、
+  CloudWatch ミラー、ダウンロードはすべて 1 つのアクティビティ/監査ログに関するもの
+  （どれだけ記録し、どこへストリーミングし、どう取得するか）なので、2 つのタブに分けず
+  1 つのタブにまとめました。ミラーのトグルは不透明な「stdout」の仕組みではなく宛先
+  （「CloudWatch Logs」）で命名し、説明に詳細（コンテナの stdout へストリーミング → ECS の
+  awslogs ドライバーが CloudWatch へ転送 → タスク置換後も残る永続コピー）を残しました。
+  マニュアル §7.2 も併せて更新。
+
 ## v0.1.416
 
 ### 追加 (Added)
