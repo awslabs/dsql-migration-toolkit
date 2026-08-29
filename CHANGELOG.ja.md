@@ -5,6 +5,30 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.413
+
+### 変更 (Changed)
+
+- **`0.1.413` を 3 つのレジストリすべてに公開し、`ContainerImageUri` デフォルトを
+  `0.1.412 → 0.1.413` に更新**しました。デプロイ済みの両アプリスタック(us-east-1
+  `mysql-dsql-migrator`、Seoul `mysql-dsql-migrator-seoul`)を `0.1.413` に更新。
+- **Evaluation の AI DBA が、未サポートのストアドプロシージャ/関数/トリガー/イベントの実際の
+  ソース本文をオンデマンドで読めるようになりました。** 名前だけの一般ガイダンスではなく、具体的な
+  アプリ側の再実装を提案します。メモリ内の読み取り専用ソース接続で定義を取得します — MySQL
+  `SHOW CREATE …`、PostgreSQL `pg_get_functiondef`/`pg_get_triggerdef` — サイズ上限、インジェクション
+  安全(MySQL 識別子の許可リスト、PostgreSQL バインドパラメータ)、ソース未接続時は名前/種別に
+  フォールバック。
+- **AI DBA ツールを PostgreSQL ソース対応に:** `get_full_load_status` が MySQL の binlog/GTID
+  フィールドに加えて PostgreSQL の WAL-LSN ウォーターマークも返し、エンジン固有のツール説明を
+  中立化して、PostgreSQL 移行でモデルが MySQL ソースと決めつけないようにしました。
+
+### 修正 (Fixed)
+
+- **"What's next?" が、間に別の質問を挟んだ後に再実行されるようになりました。** コンポーザーの
+  フォローアップはパネルを "readiness" スコープに保つため、scope-id の重複排除が再質問を抑制して
+  いました。直前がブリーフィングという真の連続クリックのみスキップし、それ以外のクリックでは毎回
+  再実行します。
+
 ## v0.1.412
 
 ### 変更 (Changed)

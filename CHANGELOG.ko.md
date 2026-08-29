@@ -5,6 +5,28 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.413
+
+### 변경 (Changed)
+
+- **`0.1.413`을 세 개 레지스트리 모두에 게시하고 `ContainerImageUri` 기본값을
+  `0.1.412 → 0.1.413`으로 갱신**했습니다. 배포된 두 앱 스택(us-east-1 `mysql-dsql-migrator`,
+  Seoul `mysql-dsql-migrator-seoul`) 모두 `0.1.413`으로 업데이트.
+- **Evaluation의 AI DBA가 이제 미지원 stored procedure/function/trigger/event의 실제 소스
+  본문을 온디맨드로 읽어** 이름 기반 일반 가이드 대신 구체적인 앱-계층 재구현을 제안합니다.
+  메모리의 읽기 전용 소스 연결로 정의를 가져옵니다 — MySQL `SHOW CREATE …`, PostgreSQL
+  `pg_get_functiondef`/`pg_get_triggerdef` — 크기 상한, 인젝션 안전(MySQL 식별자 화이트리스트,
+  PostgreSQL 바인드 파라미터), 소스 미연결 시 이름/종류 기반으로 폴백.
+- **AI DBA 툴을 PostgreSQL 소스 인지형으로 보정:** `get_full_load_status`가 MySQL binlog/GTID
+  필드와 함께 PostgreSQL WAL-LSN 워터마크도 노출하며, 엔진별 툴 설명을 중립화해 PostgreSQL
+  마이그레이션에서 모델이 MySQL 소스로 단정하지 않도록 했습니다.
+
+### 수정 (Fixed)
+
+- **"What's next?"가 중간 질문 이후 다시 실행됩니다.** composer 후속 질문은 패널을 "readiness"
+  스코프에 유지시켜 scope-id 중복 제거가 재요청을 막았습니다. 이제 직전이 브리핑인 진짜 연속
+  클릭만 스킵하고, 그 외 클릭엔 매번 재실행합니다.
+
 ## v0.1.412
 
 ### 변경 (Changed)

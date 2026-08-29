@@ -978,6 +978,132 @@ class SourceIntrospector:
         finally:
             engine.dispose()
 
+    def fetch_object_definition(
+        self,
+        conn: SourceConnectionConfig,
+        object_name: str,
+        object_type: ObjectType,
+    ) -> Optional[str]:
+        """Fetch the CREATE definition (body) of a routine / trigger / event, read-only.
+
+        Introspection captures only the NAME and kind of stored procedures, functions,
+        triggers and events -- never their body (unlike views, whose definition IS
+        collected) -- so a per-object AI question about one of these otherwise has no
+        source code to reason over. This runs the engine's definition query ON DEMAND
+        through the read-only-guarded engine and returns the raw definition text --
+        MySQL ``SHOW CREATE {PROCEDURE|FUNCTION|TRIGGER|EVENT}``, or PostgreSQL
+        ``pg_get_functiondef`` / ``pg_get_triggerdef`` from the catalog. Best-effort:
+        returns ``None`` on any failure (missing privilege, dropped object, no core
+        equivalent) so the caller falls back to name-only guidance. Read-only
+        (Property 1); the source password is injected by the engine factory and never
+        stored. The engine kind follows ``conn.source_type`` (the factory selects the
+        MySQL vs PostgreSQL driver from it).
+        """
+        source_type = getattr(conn, "source_type", SourceType.MYSQL)
+        ident = None
+        if source_type is SourceType.MYSQL:
+            ident = _quote_mysql_identifier(object_name)
+            if ident is None:
+                return None
+        engine = self._engine_factory(conn)
+        try:
+            with engine.connect() as connection:
+                if source_type is SourceType.POSTGRES:
+                    return _pg_object_definition(connection, object_name, object_type)
+                if ident is not None:
+                    return _mysql_object_definition(connection, ident, object_type)
+                return None
+        except Exception:  # noqa: BLE001 - best-effort; caller falls back to name-only
+            return None
+        finally:
+            engine.dispose()
+
+
+def _quote_mysql_identifier(name: str) -> Optional[str]:
+    """Backtick-quote a (optionally schema-qualified) identifier for ``SHOW CREATE``.
+
+    Returns ``None`` for anything unsafe -- a backtick / quote / semicolon, or a part
+    that is not a plain identifier ``[\\w$]+``. The name comes from introspection (not
+    user input), so this is defense-in-depth, keeping the interpolated ``SHOW CREATE``
+    statement injection-proof.
+    """
+    import re
+
+    if not name or "`" in name or '"' in name or ";" in name:
+        return None
+    parts = name.split(".")
+    if not 1 <= len(parts) <= 2 or any(not re.fullmatch(r"[\w$]+", p) for p in parts):
+        return None
+    return ".".join(f"`{p}`" for p in parts)
+
+
+def _mysql_object_definition(connection, ident: str, object_type: ObjectType) -> Optional[str]:
+    """Return the MySQL ``SHOW CREATE`` body for one routine / trigger / event.
+
+    Each ``SHOW CREATE`` is wrapped so a wrong-kind guess (a ``ROUTINE`` that is really
+    a FUNCTION, tried as a PROCEDURE first) yields ``None`` instead of raising.
+    """
+    def _show(kind: str, column: str) -> Optional[str]:
+        try:
+            row = connection.execute(text(f"SHOW CREATE {kind} {ident}")).mappings().first()
+            return row.get(column) if row else None
+        except Exception:  # noqa: BLE001 - wrong kind / missing object -> None
+            return None
+
+    if object_type is ObjectType.PROCEDURE:
+        return _show("PROCEDURE", "Create Procedure")
+    if object_type is ObjectType.FUNCTION:
+        return _show("FUNCTION", "Create Function")
+    if object_type is ObjectType.ROUTINE:
+        return _show("PROCEDURE", "Create Procedure") or _show("FUNCTION", "Create Function")
+    if object_type is ObjectType.TRIGGER:
+        return _show("TRIGGER", "SQL Original Statement")
+    if object_type is ObjectType.EVENT:
+        return _show("EVENT", "Create Event")
+    return None
+
+
+def _pg_object_definition(connection, object_name: str, object_type: ObjectType) -> Optional[str]:
+    """Return the PostgreSQL definition for one function / procedure / trigger.
+
+    Uses parameterized catalog queries (``pg_get_functiondef`` / ``pg_get_triggerdef``)
+    -- the identifier is BOUND, never interpolated, so this is injection-proof. The name
+    may be schema-qualified (``schema.name``); unqualified matches by name across
+    schemas (first match). ``EVENT`` has no core PostgreSQL equivalent (that is a MySQL
+    scheduled event), so it returns ``None``.
+    """
+    parts = object_name.split(".")
+    schema = parts[0] if len(parts) == 2 else None
+    name = parts[-1]
+
+    def _one(sql: str, **params) -> Optional[str]:
+        try:
+            row = connection.execute(text(sql), params).first()
+            return row[0] if row and row[0] else None
+        except Exception:  # noqa: BLE001 - missing object / privilege -> None
+            return None
+
+    if object_type in (ObjectType.PROCEDURE, ObjectType.FUNCTION, ObjectType.ROUTINE):
+        # pg_get_functiondef covers both functions (prokind 'f') and procedures ('p').
+        sql = (
+            "SELECT pg_get_functiondef(p.oid) FROM pg_proc p "
+            "JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.proname = :name"
+            + (" AND n.nspname = :schema" if schema else "")
+            + " LIMIT 1"
+        )
+        return _one(sql, name=name, **({"schema": schema} if schema else {}))
+    if object_type is ObjectType.TRIGGER:
+        sql = (
+            "SELECT pg_get_triggerdef(t.oid) FROM pg_trigger t "
+            "JOIN pg_class c ON c.oid = t.tgrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE t.tgname = :name AND NOT t.tgisinternal"
+            + (" AND n.nspname = :schema" if schema else "")
+            + " LIMIT 1"
+        )
+        return _one(sql, name=name, **({"schema": schema} if schema else {}))
+    return None
+
 
 __all__ = [
     "SourceIntrospector",

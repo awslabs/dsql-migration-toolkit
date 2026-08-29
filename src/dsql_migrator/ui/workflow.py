@@ -1556,21 +1556,41 @@ def build_workflow_sidebar(
             getattr(state, "source_config", None), "source_type", SourceType.MYSQL
         )
         engine_word = _SOURCE_ENGINE_WORD.get(source_type, "MySQL")
-        ai_panel.open_scope(
+        seed = (
+            f"Given where I am in this {engine_word} → Aurora DSQL migration, what "
+            "should I do next, and what are my top risks right now? Use your tools to "
+            "check my real assessment, schema conversion, data-load, CDC health "
+            "(DLQ poison records, schema drift, a stalled sink) and validation "
+            "state, and call out the specific objects/tables that are blocking "
+            "progress or are standing gaps CDC won't backfill before cut over."
+        )
+        # Re-run the briefing on EVERY click except a true back-to-back one (nothing
+        # asked since the last briefing). Re-focusing without re-asking is right only
+        # while the briefing is still the most recent turn; after ANY intervening
+        # question a fresh briefing should run. A composer follow-up keeps the active
+        # scope on "readiness", so open_scope's scope-id dedupe would otherwise suppress
+        # the re-ask -- hence seed manually via the returned send() unless the last user
+        # turn IS this briefing's seed.
+        convo = state.ai_conversation  # type: ignore[attr-defined]
+        last_user = next(
+            (m for m in reversed(convo.messages) if m.get("role") == "user"), None
+        )
+        already_current = (
+            convo.active_scope is not None
+            and convo.active_scope.scope_id == "readiness"
+            and last_user is not None
+            and last_user.get("text") == seed
+        )
+        send = ai_panel.open_scope(
             scope_id="readiness",
             title="AI DBA",
             subtitle="What's next & top risks",
             chip="Migration readiness",
             streamer=streamer,
-            seed_question=(
-                f"Given where I am in this {engine_word} → Aurora DSQL migration, what "
-                "should I do next, and what are my top risks right now? Use your tools to "
-                "check my real assessment, schema conversion, data-load, CDC health "
-                "(DLQ poison records, schema drift, a stalled sink) and validation "
-                "state, and call out the specific objects/tables that are blocking "
-                "progress or are standing gaps CDC won't backfill before cut over."
-            ),
+            seed_question=None,
         )
+        if not already_current:
+            send(seed)
 
     # --- Header ---------------------------------------------------------------
     with ui.header().classes("items-center justify-between"):

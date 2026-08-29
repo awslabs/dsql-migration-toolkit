@@ -5,6 +5,32 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.413
+
+### Changed
+
+- **Published `0.1.413` to all three registries and repointed the `ContainerImageUri`
+  default** (`0.1.412 → 0.1.413`); both deployed app stacks (us-east-1
+  `mysql-dsql-migrator` and Seoul `mysql-dsql-migrator-seoul`) updated to `0.1.413`.
+- **The Evaluation AI DBA can now read the ACTUAL source body of an unsupported stored
+  procedure / function / trigger / event on demand** and propose a concrete
+  application-side reimplementation, instead of name-only guidance. It fetches the
+  definition through the in-memory, read-only source connection — MySQL
+  `SHOW CREATE …`, PostgreSQL `pg_get_functiondef` / `pg_get_triggerdef` — size-capped,
+  injection-safe (MySQL identifier allow-list; PostgreSQL bound parameters), and falls
+  back to name/kind when the source isn't connected in this session.
+- **Made the AI DBA tools PostgreSQL-source-aware:** `get_full_load_status` now surfaces
+  the PostgreSQL WAL-LSN watermark alongside the MySQL binlog/GTID fields, and
+  engine-specific tool descriptions are neutral so the model doesn't assume a MySQL
+  source for a PostgreSQL migration.
+
+### Fixed
+
+- **"What's next?" re-runs the briefing after an intervening question.** A composer
+  follow-up keeps the panel on the "readiness" scope, so the scope-id dedupe suppressed
+  the re-ask; it now re-runs on every click except a true back-to-back (nothing asked
+  since the last briefing).
+
 ## v0.1.412
 
 ### Changed

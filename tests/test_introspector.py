@@ -125,6 +125,99 @@ def _source_config() -> SourceConnectionConfig:
     return SourceConnectionConfig(host="db.example.com", database="app")
 
 
+class _DefEngine:
+    """Fake engine whose connection returns a canned definition-query result.
+
+    ``mysql``: ``.execute(text).mappings().first()`` -> a column mapping.
+    ``pg``:    ``.execute(text, params).first()`` -> a 1-tuple row.
+    """
+
+    def __init__(self, *, mysql=None, pg=None):
+        self._mysql, self._pg = mysql, pg
+
+    def connect(self):
+        engine = self
+
+        class _Res:
+            def __init__(self, mapping=None, row=None):
+                self._mapping, self._row = mapping, row
+
+            def mappings(self):
+                return self
+
+            def first(self):
+                return self._mapping if self._mapping is not None else self._row
+
+        class _Conn:
+            def __enter__(self_):
+                return self_
+
+            def __exit__(self_, *a):
+                return False
+
+            def execute(self_, statement, parameters=None):
+                sql = str(statement)
+                if engine._mysql and sql.startswith("SHOW CREATE") and any(
+                    k in sql for k in engine._mysql
+                ):
+                    col, val = next(
+                        (c, v) for k, (c, v) in engine._mysql.items() if k in sql
+                    )
+                    return _Res(mapping={col: val})
+                if engine._pg and any(fn in sql for fn in engine._pg):
+                    fn = next(f for f in engine._pg if f in sql)
+                    return _Res(row=(engine._pg[fn],))
+                return _Res(mapping=None, row=None)
+
+        return _Conn()
+
+    def dispose(self):
+        pass
+
+
+def test_fetch_object_definition_mysql_show_create_procedure() -> None:
+    from dsql_migrator.core.models import ObjectType, SourceType
+
+    body = "CREATE DEFINER=`root`@`%` PROCEDURE `app`.`sp_x`() BEGIN SELECT 1; END"
+    intro = SourceIntrospector(
+        engine_factory=lambda _c: _DefEngine(
+            mysql={"PROCEDURE": ("Create Procedure", body)}
+        )
+    )
+    conn = SourceConnectionConfig(host="h", database="app", source_type=SourceType.MYSQL)
+    assert intro.fetch_object_definition(conn, "app.sp_x", ObjectType.PROCEDURE) == body
+
+
+def test_fetch_object_definition_postgres_functiondef() -> None:
+    from dsql_migrator.core.models import ObjectType, SourceType
+
+    body = "CREATE OR REPLACE FUNCTION app.fn_x() RETURNS integer AS $$ ... $$;"
+    intro = SourceIntrospector(
+        engine_factory=lambda _c: _DefEngine(pg={"pg_get_functiondef": body})
+    )
+    conn = SourceConnectionConfig(
+        host="h", database="app", source_type=SourceType.POSTGRES
+    )
+    assert intro.fetch_object_definition(conn, "app.fn_x", ObjectType.FUNCTION) == body
+
+
+def test_fetch_object_definition_is_best_effort_and_identifier_safe() -> None:
+    from dsql_migrator.core.introspector import _quote_mysql_identifier
+    from dsql_migrator.core.models import ObjectType, SourceType
+
+    # Injection-proof identifier quoting.
+    assert _quote_mysql_identifier("sp_x") == "`sp_x`"
+    assert _quote_mysql_identifier("app.sp_x") == "`app`.`sp_x`"
+    assert _quote_mysql_identifier("bad`name") is None
+    assert _quote_mysql_identifier("x; DROP TABLE y") is None
+    assert _quote_mysql_identifier("a.b.c") is None
+
+    # Missing object / empty result -> None (caller falls back to name-only).
+    intro = SourceIntrospector(engine_factory=lambda _c: _DefEngine(mysql={}))
+    conn = SourceConnectionConfig(host="h", database="app", source_type=SourceType.MYSQL)
+    assert intro.fetch_object_definition(conn, "app.gone", ObjectType.PROCEDURE) is None
+
+
 # ---------------------------------------------------------------------------
 # Statement classifier
 # ---------------------------------------------------------------------------

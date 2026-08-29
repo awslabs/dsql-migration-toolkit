@@ -43,7 +43,8 @@ AI_TOOL_SCHEMAS: list[dict] = [
     {
         "name": "get_converted_ddl",
         "description": (
-            "Get the source MySQL DDL and the converted Aurora DSQL DDL for one table "
+            "Get the source DDL (MySQL or PostgreSQL) and the converted Aurora DSQL "
+            "DDL for one table "
             "or view, by name."
         ),
         "input_schema": {
@@ -88,9 +89,12 @@ AI_TOOL_SCHEMAS: list[dict] = [
             "Get the real STRUCTURE of one SOURCE table (or view) by name: columns "
             "(name/type/nullable/default/collation/generated), primary key, indexes "
             "(incl. prefix lengths + type), foreign keys (incl. on_delete/on_update "
-            "cascade), CHECK constraints, and the partitioned flag. Schema only, "
-            "never any row data. Use it to name the EXACT offending column/key/FK "
-            "behind an assessment finding instead of guessing from DDL text."
+            "cascade), CHECK constraints, and the partitioned flag. For a VIEW it "
+            "returns the definition; for a stored PROCEDURE / FUNCTION / TRIGGER / "
+            "EVENT it fetches the actual CREATE body from the live source (read-only), "
+            "so you can propose a concrete application-side reimplementation instead of "
+            "guessing. Schema/definition only, never any row data. Use it to name the "
+            "EXACT offending column/key/FK, or to read a routine's real code."
         ),
         "input_schema": {
             "type": "object",
@@ -178,8 +182,9 @@ AI_TOOL_SCHEMAS: list[dict] = [
             "nothing), the last CDC deploy action + any FAILED deploy stage, the tail "
             "of the deploy log (already-diagnosed, human-actionable failure text — e.g. "
             "partition-quota exhaustion, missing IAM JAAS, bad source creds), and the "
-            "Full Load -> CDC watermark handoff (binlog file:pos / GTID presence, "
-            "snapshot time, resume mode). Use it when CDC shows not-streaming or a "
+            "Full Load -> CDC watermark handoff (MySQL binlog file:pos / GTID, or "
+            "PostgreSQL WAL LSN; snapshot time, resume mode). Use it when CDC shows "
+            "not-streaming or a "
             "deploy failed. All CACHED/local state — states/phases/log text only, never "
             "row data or credentials. No arguments."
         ),
@@ -424,6 +429,48 @@ def build_ai_tool_executor(
                             {"status": "ok", "object_name": _v.name, "kind": "view",
                              "definition": (_v.definition or "")[:4000]}
                         )
+                    # Not a table/view: a stored procedure / function / trigger / event
+                    # has no body in the inventory (only its name+kind). Fetch the real
+                    # CREATE body from the LIVE source (read-only SHOW CREATE) using the
+                    # session's in-memory credentials, so the chat can reason over the
+                    # actual code (e.g. propose an app-side reimplementation of an
+                    # UNSUPPORTED procedure). On-demand + best-effort: if the source is
+                    # not connected in this session, fall back to name/kind only.
+                    for _pool in (_inv.routines, _inv.triggers, _inv.events):
+                        _o = next((o for o in _pool if _matches(o.name)), None)
+                        if _o is None:
+                            continue
+                        _st = SESSION_STORE.get_or_create(session_id)
+                        _sc = getattr(_st, "source_config", None)
+                        _body = None
+                        if _sc is not None:
+                            try:
+                                from dsql_migrator.core.introspector import (
+                                    SourceIntrospector,
+                                )
+                                from dsql_migrator.ui.connect import (
+                                    make_source_engine_factory,
+                                )
+
+                                _body = SourceIntrospector(
+                                    engine_factory=make_source_engine_factory(
+                                        _st.source_password
+                                    )
+                                ).fetch_object_definition(_sc, _o.name, _o.object_type)
+                            except Exception:  # noqa: BLE001 - best-effort live fetch
+                                _body = None
+                        _out = {
+                            "status": "ok", "object_name": _o.name,
+                            "kind": _o.object_type.value.lower(),
+                            "definition": (_body or "")[:8000],
+                        }
+                        if not _body:
+                            _out["note"] = (
+                                "Source body unavailable (reconnect on Connect so the "
+                                "source credentials are in memory, or the object may be "
+                                "gone / lack privilege). Reason from name and kind only."
+                            )
+                        return _json.dumps(_out)
                     return _json.dumps({"status": "not_found", "object_name": _obj})
                 return _json.dumps(
                     {"status": "ok", "object_name": _t.name, "kind": "table",
@@ -711,9 +758,14 @@ def build_ai_tool_executor(
                 if _wm is not None:
                     _snap = getattr(_wm, "snapshot_timestamp", None)
                     _handoff = {
+                        # MySQL source watermark fields...
                         "binlog_file": getattr(_wm, "binlog_file", None),
                         "binlog_position": getattr(_wm, "binlog_position", None),
                         "has_gtid": bool(getattr(_wm, "gtid_executed", None)),
+                        # ...and the PostgreSQL source watermark (WAL LSN). Both are
+                        # always present so the tool works for either source engine;
+                        # the one that does not apply is null.
+                        "wal_lsn": getattr(_wm, "wal_lsn", None),
                         "snapshot_timestamp": _snap.isoformat() if _snap else None,
                     }
                 try:
