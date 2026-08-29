@@ -820,10 +820,10 @@ def test_target_connection_and_unlock_round_trip_for_reconnect() -> None:
 
 
 def test_source_type_hint_round_trips_for_postgres_reconnect() -> None:
-    # The source ENGINE kind (non-secret) is persisted so a reconnect pre-selects
-    # Postgres on Connect -- but the source connection itself (which carries a secret)
-    # is NOT restored. The user re-enters credentials; the engine picker just no longer
-    # snaps back to the MySQL default for a PostgreSQL migration.
+    # The NON-SECRET source connection (engine + host/port/database/username) is
+    # persisted so a reconnect PRE-FILLS the Connect form, mirroring the target -- only
+    # the PASSWORD is re-entered (never persisted, Property 7). The engine also no
+    # longer snaps back to MySQL for a PostgreSQL migration.
     session, eval_state, conv_state, migration_state = _populated_states()
     session.set_source(
         SourceConnectionConfig(
@@ -839,15 +839,23 @@ def test_source_type_hint_round_trips_for_postgres_reconnect() -> None:
         "s1", session, eval_state, conv_state, migration_state
     )
     assert snap.source_type == "postgres"
+    assert snap.source_host == "pg.example"
 
     s2 = SessionConnectionState()
     m2 = DataMigrationState()
     m2.bind_session(s2)
     apply_session_snapshot(snap, s2, EvaluationState(), SchemaConversionState(), m2)
-    # The source secret / connection is NOT restored ...
-    assert s2.source_config is None
-    # ... but the engine hint is, so Connect pre-selects Postgres (not MySQL).
-    assert s2.restored_source_type is SourceType.POSTGRES
+    # The non-secret source connection is restored (Connect pre-fills it) ...
+    assert s2.source_config is not None
+    assert s2.source_config.source_type is SourceType.POSTGRES
+    assert s2.source_config.host == "pg.example"
+    assert s2.source_config.port == 5432
+    assert s2.source_config.database == "app"
+    assert s2.source_config.username == "u"
+    # ... but NOT the password (re-entered on Connect), and it stays unverified so the
+    # nav gate still requires a re-test.
+    assert s2.source_password is None
+    assert s2.source_verified is False
 
 
 def test_source_type_hint_absent_on_old_snapshot_defaults_mysql() -> None:
@@ -884,7 +892,12 @@ def test_source_type_hint_absent_on_old_snapshot_defaults_mysql() -> None:
     apply_session_snapshot(
         mysql_snap, s3, EvaluationState(), SchemaConversionState(), m3
     )
-    assert s3.restored_source_type is SourceType.MYSQL
+    # The MySQL source's non-secret coordinates round-trip into source_config (the
+    # engine now comes from the restored config, and the password is not restored).
+    assert s3.source_config is not None
+    assert s3.source_config.source_type is SourceType.MYSQL
+    assert s3.source_config.host == "my.example"
+    assert s3.source_password is None
 
 
 def test_active_view_round_trips_for_reconnect() -> None:

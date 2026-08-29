@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.414
+
+### Changed
+
+- **Published `0.1.414` to all three registries and repointed the `ContainerImageUri`
+  default** (`0.1.413 → 0.1.414`); both deployed app stacks (us-east-1
+  `mysql-dsql-migrator` + Seoul `mysql-dsql-migrator-seoul`) updated to `0.1.414`.
+- **The source connection endpoint now survives a reconnect / instance restart.** On
+  restore, the Connect form pre-fills the source **host / port / database / username**
+  (previously only the source engine kind was restored, so those fields came back
+  blank), mirroring how the target connection already restores. Only the **password**
+  is re-entered — it is never persisted (Property 7), and the source stays
+  **unverified** until you re-test, so the nav gate still requires a live re-check.
+  `SourceConnectionConfig` is by design safe to serialize (the password lives only in
+  the in-memory `SecretValue`), so persisting these non-secret coordinates matches the
+  target's behavior. Older snapshots (no source coordinates) fall back to the prior
+  engine-hint-only restore.
+
 ## v0.1.413
 
 ### Changed

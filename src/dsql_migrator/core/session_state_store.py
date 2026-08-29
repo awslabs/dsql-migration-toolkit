@@ -137,21 +137,27 @@ class SessionSnapshot(BaseModel):
     # Non-secret target (Aurora DSQL) connection so a reconnecting session can
     # re-probe the cdc-stack phase WITHOUT the user re-entering the target first
     # (DSQL auth is IAM-token based, so endpoint + region are enough to describe).
-    # Source is intentionally NOT persisted (it carries a password / secret ref).
-    # The sticky workflow-unlock latch is persisted so restored steps stay
-    # navigable. ``target_verified`` is deliberately NOT persisted: the user still
-    # re-tests on Connect to confirm live access, but the workbench resumes.
+    # The NON-SECRET source + target connection coordinates. Persisted so a
+    # reconnecting/restarted session pre-fills the Connect form instead of a blank one
+    # -- the user only re-enters the source PASSWORD (the one secret, kept in memory
+    # only, Property 7). ``*_verified`` is deliberately NOT persisted: the user still
+    # re-tests on Connect to confirm live access, but the workbench resumes. The sticky
+    # workflow-unlock latch is persisted so restored steps stay navigable.
     target_endpoint: Optional[str] = None
     target_region: Optional[str] = None
     target_database: Optional[str] = None
     target_username: Optional[str] = None
-    # The source ENGINE kind ("mysql" / "postgres") -- NOT the source connection (that
-    # carries a secret and stays unpersisted, above). Kept so a snapshot restore can
-    # pre-select the right engine on the Connect screen instead of always defaulting to
-    # MySQL; a PostgreSQL operator resuming a restored workbench would otherwise land on
-    # MySQL + port 3306 and have to re-pick. Optional/None on older snapshots -> the
-    # picker falls back to the MySQL default (unchanged for every MySQL session).
+    # Source connection coordinates. ``SourceConnectionConfig`` is by design safe to
+    # serialize (the password is NOT on it -- it lives only in the in-memory
+    # SecretValue), so host/port/database/username are as non-secret as the target's
+    # above and are persisted for the same reason. ``source_type`` is the engine kind
+    # ("mysql" / "postgres"). Optional/None on older snapshots -> Connect stays blank
+    # for that field (unchanged behavior for pre-persistence snapshots).
     source_type: Optional[str] = None
+    source_host: Optional[str] = None
+    source_port: Optional[int] = None
+    source_database: Optional[str] = None
+    source_username: Optional[str] = None
     # AI Assist preference (non-secret: a toggle + Bedrock model id/region, never a
     # credential). Persisted so a reconnecting session keeps the user's choice
     # instead of resetting the toggle to off on every restart. Optional/defaulted

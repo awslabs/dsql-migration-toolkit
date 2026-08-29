@@ -165,6 +165,14 @@ def capture_session_snapshot(
     source_type = getattr(source, "source_type", None)
     if source_type is not None:
         snapshot.source_type = getattr(source_type, "value", source_type)
+    # The NON-SECRET source coordinates (never the password -- it lives only in the
+    # in-memory SecretValue, Property 7), so a reconnect pre-fills the Connect form and
+    # the user re-enters only the password. Mirrors the target connection above.
+    if source is not None:
+        snapshot.source_host = getattr(source, "host", None)
+        snapshot.source_port = getattr(source, "port", None)
+        snapshot.source_database = getattr(source, "database", None)
+        snapshot.source_username = getattr(source, "username", None)
     result = eval_state.result  # type: ignore[attr-defined]
     if result is not None:
         snapshot.inventory = result.inventory
@@ -211,15 +219,39 @@ def apply_session_snapshot(
     from dsql_migrator.ui.evaluation import EvaluationResult
 
     session.set_workflow(snapshot.workflow.model_copy(deep=True))  # type: ignore[attr-defined]
-    # Pre-select the source engine on Connect from the persisted (non-secret) hint. The
-    # source connection itself is not restored -- the user re-enters credentials -- but
-    # a PG operator should not have to re-pick the engine. Unknown/older values fall back
-    # to the MySQL default at the picker (getattr on the enum).
-    if snapshot.source_type and hasattr(session, "set_restored_source_type"):
+    # Restore the NON-SECRET source connection (host/port/database/username + engine)
+    # so Connect pre-fills it, exactly like the target above -- the user re-enters ONLY
+    # the password (never persisted; Property 7), then re-tests. source_verified stays
+    # False (a fresh session), so the nav gate still requires that re-test. Older
+    # snapshots have no source_host: fall back to just the engine hint (prior behavior).
+    if snapshot.source_host and hasattr(session, "set_source"):
+        from dsql_migrator.core.models import SourceConnectionConfig
+
+        try:
+            _stype = (
+                SourceType(snapshot.source_type)
+                if snapshot.source_type
+                else SourceType.MYSQL
+            )
+        except ValueError:
+            _stype = SourceType.MYSQL
+        session.set_source(  # type: ignore[attr-defined]
+            SourceConnectionConfig(
+                source_type=_stype,
+                host=snapshot.source_host,
+                port=snapshot.source_port or 3306,
+                database=snapshot.source_database,
+                username=snapshot.source_username,
+            ),
+            None,  # password is re-entered by the user; never persisted (Property 7)
+        )
+    elif snapshot.source_type and hasattr(session, "set_restored_source_type"):
+        # No persisted coordinates (older snapshot): pre-select the engine only, so a
+        # PostgreSQL operator does not have to re-pick it. Unknown values -> MySQL.
         try:
             session.set_restored_source_type(SourceType(snapshot.source_type))  # type: ignore[attr-defined]
         except ValueError:
-            pass  # unknown engine string -> leave the hint unset (MySQL default)
+            pass
     # Step 4 (Validation): re-hydrate the last report so a reconnect reopens the
     # result page instead of resetting to "Re-run". Marked restored so the UI can
     # note it is as-of the saved time (re-validate if the source has since changed).
