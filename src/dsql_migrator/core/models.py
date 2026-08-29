@@ -1201,6 +1201,19 @@ class AiConversation(BaseModel):
     active_scope: Optional[AiScope] = None
     visible: bool = False
 
+    def reset(self) -> None:
+        """Clear the transcript IN PLACE (Start over) rather than replacing the object.
+
+        The persistent AI panel captures THIS instance by reference when it is built
+        (it is not rebuilt on Start over), so replacing ``session.ai_conversation`` with
+        a new object would orphan the panel's reference and leave the stale transcript
+        on screen. Mutating in place keeps that reference valid; the panel then clears
+        its rendered bubbles via its own ``reset()``.
+        """
+        self.messages.clear()
+        self.active_scope = None
+        self.visible = False
+
 
 class MigrationContext(BaseModel):
     """A credential-free snapshot of where the migration is, for the AI panel.

@@ -1586,6 +1586,22 @@ def test_bedrock_model_id_is_curated_dropdown_with_auto_scope(template: dict) ->
     assert not any("bedrock" in a for a in flat)
 
 
+def test_bedrock_model_dropdown_matches_cfn_allowed_values(template: dict) -> None:
+    """The Connect Model ID dropdown (SUPPORTED_BEDROCK_MODELS) must equal the CFN
+    BedrockModelId AllowedValues, so a model added to one is added to the other and the
+    picker never offers a value the parameter would reject (or vice versa)."""
+    from dsql_migrator.ui.ai_assist import (
+        DEFAULT_BEDROCK_MODEL_ID,
+        SUPPORTED_BEDROCK_MODELS,
+    )
+
+    allowed = template["Parameters"]["BedrockModelId"]["AllowedValues"]
+    assert list(SUPPORTED_BEDROCK_MODELS) == list(allowed)
+    # The app default is offered in the picker and is the CFN default.
+    assert DEFAULT_BEDROCK_MODEL_ID in SUPPORTED_BEDROCK_MODELS
+    assert template["Parameters"]["BedrockModelId"]["Default"] == DEFAULT_BEDROCK_MODEL_ID
+
+
 def test_ai_assist_condition_defaults_off(template: dict) -> None:
     params = template["Parameters"]
     assert params["EnableAiAssist"]["Default"] == "false"

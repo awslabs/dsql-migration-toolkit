@@ -5,6 +5,42 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.412
+
+### Changed
+
+- **On Connect, the Bedrock model/region settings and the "Verify AI access" button
+  are now disabled until "Enable AI Assist" is switched on.** With AI Assist off the
+  app never calls Bedrock, so configuring a model or running the access preflight had
+  no effect; the switch is now the single gate and the Bedrock section reads as
+  contingent on it (the controls re-enable live when you flip the switch).
+- **Refreshed the AI Assist description on Connect** to match the current assistant:
+  a Bedrock-backed AI DBA that spans the whole migration — per-object guidance and
+  conversion suggestions for MANUAL/UNSUPPORTED objects, query-lint and validation
+  help, and a cut-over repoint recipe with a GO/HOLD verdict — plus an always-available
+  AI chat (previously described only "per-object guidance, conversion suggestions, and
+  the AI chat").
+- **The AI Assist section badge turns green "Verified" on a clean "Verify AI access"**
+  and reverts to "Optional" on any edit (model / region / toggle), mirroring Connect's
+  per-connection Verified badge.
+- **The Connect "Model ID" is now a dropdown of the supported Anthropic models**
+  (`SUPPORTED_BEDROCK_MODELS`, seeded from `BedrockModelId`) instead of a free-text
+  field, removing the "typo / wrong id → `MODEL_NOT_ENABLED`" trap. A deploy-configured
+  model outside the curated set is preserved as an extra option, and a test keeps the
+  list in sync with the CFN `BedrockModelId` AllowedValues.
+- **Published the `0.1.412` image to all three registries and repointed the
+  `ContainerImageUri` default** (`0.1.411 → 0.1.412`). Both deployed app stacks were
+  updated to `0.1.412`: us-east-1 (`mysql-dsql-migrator`) and Seoul
+  (`mysql-dsql-migrator-seoul`).
+
+### Fixed
+
+- **Start over now resets the AI DBA chat.** The persistent AI panel captured the
+  session's conversation object by reference, but Start over replaced it with a new
+  object — so the panel kept showing (and appending to) the old transcript. Start over
+  now resets the conversation IN PLACE and wipes the panel's rendered transcript, so a
+  fresh journey opens on an empty AI DBA chat.
+
 ## v0.1.411
 
 ### Changed

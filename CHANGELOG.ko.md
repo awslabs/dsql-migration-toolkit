@@ -5,6 +5,35 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.412
+
+### 변경 (Changed)
+
+- **Connect에서 Bedrock 모델/리전 설정과 "Verify AI access" 버튼이 "Enable AI Assist"를
+  켜기 전까지 비활성화됩니다.** AI Assist가 꺼져 있으면 앱은 Bedrock을 호출하지 않으므로 모델
+  설정이나 액세스 사전 점검이 의미가 없었습니다. 이제 스위치가 단일 게이트가 되어 Bedrock
+  섹션이 토글에 종속되도록 읽히며, 스위치를 켜면 컨트롤이 즉시 다시 활성화됩니다.
+- **Connect의 AI Assist 설명 문구를 현재 assistant에 맞게 갱신**했습니다: 마이그레이션 전체를
+  아우르는 Bedrock 기반 AI DBA — MANUAL/UNSUPPORTED 객체에 대한 객체별 안내와 변환 제안,
+  쿼리 린트·검증 도움, cut over 재지정(repoint) 레시피와 GO/HOLD 판정, 그리고 모든 단계에서
+  쓸 수 있는 AI 채팅(기존에는 "객체별 안내, 변환 제안, AI 채팅"으로만 설명).
+- **AI Assist 섹션 배지가 깨끗한 "Verify AI access" 성공 시 green "Verified"로** 바뀌고,
+  편집(모델/리전/토글) 시 "Optional"로 원복 — Connect의 연결 Verified 배지와 동일.
+- **Connect "Model ID"가 이제 지원 Anthropic 모델 드롭다운**(`SUPPORTED_BEDROCK_MODELS`,
+  `BedrockModelId`로 시드)으로 바뀌어 자유 입력의 "오타/잘못된 id → `MODEL_NOT_ENABLED`"
+  함정을 제거했습니다. 목록에 없는 배포 값은 추가 옵션으로 보존되며, 목록이 CFN
+  `BedrockModelId` AllowedValues와 일치하는지 검증하는 테스트가 있습니다.
+- **`0.1.412` 이미지를 세 개 레지스트리 모두에 게시하고 `ContainerImageUri` 기본값을
+  `0.1.411 → 0.1.412`로 갱신**했습니다. 배포된 두 앱 스택 모두 `0.1.412`로 업데이트:
+  us-east-1(`mysql-dsql-migrator`)와 Seoul(`mysql-dsql-migrator-seoul`).
+
+### 수정 (Fixed)
+
+- **Start over 시 이제 AI DBA 채팅이 리셋됩니다.** 영속 AI 패널이 세션의 대화 객체를 참조로
+  캡처했는데 Start over가 그 객체를 새 것으로 교체해, 패널이 옛 트랜스크립트를 계속 보여주고
+  거기에 append했습니다. 이제 Start over가 대화를 제자리에서(in place) 리셋하고 패널의 렌더된
+  트랜스크립트를 지워, 새 여정이 빈 AI DBA 채팅으로 시작합니다.
+
 ## v0.1.411
 
 ### 변경 (Changed)

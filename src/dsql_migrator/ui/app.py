@@ -630,6 +630,16 @@ def build_page(
         if SESSION_STATE_STORE is not None:
             SESSION_STATE_STORE.delete(session_id)
         _LAST_SESSION_SIGNATURE.pop(session_id, None)
+        # Wipe the persistent AI DBA panel's RENDERED transcript too. The conversation
+        # STATE was just cleared in place by SESSION_STORE.reset_in_place (clear()), but
+        # the panel is app-wide and NOT rebuilt by Start over, so its already-rendered
+        # bubbles would otherwise linger. Best-effort (the panel may not be wired).
+        handle = _ai_panel_holder.get("handle")
+        if handle is not None:
+            try:
+                handle.reset()
+            except Exception:  # noqa: BLE001 - UI wipe is best-effort; must not fail reset
+                pass
 
     def _cdc_deployed() -> bool:
         """True when ANY CDC AWS resource exists, so Start over can offer to tear it

@@ -107,6 +107,7 @@ class AiPanelHandle:
         is_enabled: Callable[[], bool],
         is_visible: Callable[[], bool],
         refresh_context: Callable[[], None],
+        reset: Callable[[], None],
     ) -> None:
         self.open_scope = open_scope
         self.post_event = post_event
@@ -117,6 +118,9 @@ class AiPanelHandle:
         # Re-read the "where you are" step context and update the baseline chip (used by
         # the shell when the user navigates, so the step label follows the nav).
         self.refresh_context = refresh_context
+        # Wipe the rendered transcript + bookkeeping on Start over (the conversation
+        # state itself is cleared in place by SessionConnectionState.clear).
+        self.reset = reset
 
 
 def _panel_css(ui: object) -> None:
@@ -1322,6 +1326,37 @@ def build_ai_panel(
         if active is not None and active.scope_id == "general":
             conversation.active_scope = active.model_copy(update={"chip": chip})
 
+    def reset() -> None:
+        """Wipe the RENDERED transcript + per-panel bookkeeping for Start over.
+
+        The conversation STATE is cleared in place by ``SessionConnectionState.clear``
+        (so ``conversation`` here stays a valid, now-empty reference); this removes the
+        rendered bubbles and resets the panel's own counters / in-flight streamer, then
+        closes the drawer -- so a fresh journey opens on an empty chat instead of the
+        prior transcript. Best-effort: a torn-down slot must never fail Start over.
+        """
+        try:
+            convo.clear()  # type: ignore[attr-defined]  # remove rendered bubbles
+        except Exception:  # noqa: BLE001 - slot may be gone; UI wipe is best-effort
+            pass
+        conv["streamer"] = None
+        conv["busy"] = False
+        conv["stop_requested"] = False
+        conv["scope_start"] = 0
+        conv["unseen"] = 0
+        pending = conv.get("pending")
+        if pending is not None:
+            try:
+                pending.clear()  # type: ignore[union-attr]
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            _set_visible(False)
+            _apply_composer_state()
+            _sync_reopen_tab()
+        except Exception:  # noqa: BLE001 - best-effort
+            pass
+
     # Restore the transcript + chip from the session (open/close, nav, refresh).
     _replay()
     try:
@@ -1363,6 +1398,7 @@ def build_ai_panel(
         is_enabled=is_enabled,
         is_visible=is_visible,
         refresh_context=refresh_context,
+        reset=reset,
     )
 
 

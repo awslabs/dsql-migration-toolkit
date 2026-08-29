@@ -65,6 +65,7 @@ from dsql_migrator.ui.design import (
 )
 from dsql_migrator.ui.ai_assist import (
     DEFAULT_BEDROCK_MODEL_ID,
+    SUPPORTED_BEDROCK_MODELS,
     build_ai_assist_config,
     map_access_check_display,
     run_verify_ai_access,
@@ -1192,7 +1193,7 @@ def build_connect_page(
             # Card header band (like the Source / Target / AWS-profile cards) so
             # this reads as one more step in the same console flow. The "Optional"
             # badge sets the expectation before the user reads a single word.
-            _section_header(
+            ai_badge = _section_header(
                 "auto_awesome", "AI Assist", ("Optional", "grey")
             )
             # The single sentence that says WHAT it is -- kept above the toggle so
@@ -1201,9 +1202,11 @@ def build_connect_page(
             # suggestions, and the AI chat), so the copy is no longer scoped to
             # "conversion" only.
             ui.label(
-                "Augment the deterministic workflow with Amazon Bedrock help — "
-                "per-object guidance, conversion suggestions for objects marked "
-                "MANUAL or UNSUPPORTED, and the AI chat."
+                "Augment the deterministic workflow with an Amazon Bedrock–backed "
+                "AI DBA across the whole migration — per-object guidance and "
+                "conversion suggestions for objects marked MANUAL or UNSUPPORTED, "
+                "query-lint and validation help, and a cut-over repoint recipe with "
+                "a GO/HOLD verdict — plus an always-available AI chat on every step."
             ).classes("text-sm text-gray-700")
 
             # The decision itself, front and centre: a single switch, not buried
@@ -1211,6 +1214,23 @@ def build_connect_page(
             ai_enabled = ui.switch(
                 "Enable AI Assist", value=state.ai_assist.enabled
             )
+
+            # The section badge mirrors Connect's per-connection "Verified" badge: it
+            # turns green only after a SUCCESSFUL "Verify AI access" for the current
+            # settings. Any edit (toggle / model / region) invalidates that and reverts
+            # it to the neutral "Optional" -- an unverified or changed config must never
+            # read as green. In-session only (a preflight is a point-in-time check).
+            ai_verified = {"ok": False}
+
+            def refresh_ai_badge() -> None:
+                if ai_badge is None:
+                    return
+                if bool(ai_enabled.value) and ai_verified["ok"]:
+                    label, color = "Verified", "positive"
+                else:
+                    label, color = "Optional", "grey"
+                ai_badge.set_text(label)
+                ai_badge.props(f"color={color} outline")
             # When a profile is configured but AI is still off, one info notice
             # nudges -- replacing the old free-floating "lightbulb" prose row.
             if ai_profile_configured and not state.ai_assist.enabled:
@@ -1259,13 +1279,27 @@ def build_connect_page(
                 icon="tune",
                 value=state.ai_assist.enabled or ai_profile_configured,
             ).classes("w-full").props("dense"):
-                ai_model = ui.input(
-                    "Model ID (BEDROCK_MODEL_ID)",
-                    value=state.ai_assist.model_id,
-                    placeholder="global.anthropic.claude-sonnet-5",
+                # Curated DROPDOWN (not free text): the supported global.anthropic.*
+                # inference profiles, seeded from the deployment's BEDROCK_MODEL_ID. A
+                # dropdown removes the "typo / wrong id -> MODEL_NOT_ENABLED" trap of a
+                # free-text field; the IAM scope is provider-wide so any option is
+                # invokable without a redeploy (subject to account model access). A
+                # deployment-configured model OUTSIDE the curated set (e.g. a custom
+                # BedrockModelArns override) is preserved as an extra option so it stays
+                # selectable rather than being silently dropped from the picker.
+                _model_options = list(SUPPORTED_BEDROCK_MODELS)
+                if (
+                    state.ai_assist.model_id
+                    and state.ai_assist.model_id not in _model_options
+                ):
+                    _model_options.append(state.ai_assist.model_id)
+                ai_model = ui.select(
+                    _model_options,
+                    label="Model ID (BEDROCK_MODEL_ID)",
+                    value=state.ai_assist.model_id or DEFAULT_BEDROCK_MODEL_ID,
                 ).props(
-                    "hint=\"Use the exact model / inference-profile ID, not the "
-                    "display name (e.g. global.anthropic.claude-sonnet-5).\""
+                    "hint=\"Bedrock model for AI Assist. Must be access-enabled in "
+                    "your account and region.\""
                 ).classes("w-full")
                 ai_region = ui.input(
                     "Region (BEDROCK_REGION, optional)",
@@ -1299,6 +1333,11 @@ def build_connect_page(
                         region=ai_region.value,
                     )
                 )
+                # An edit invalidates any prior successful verify (mirrors Connect
+                # re-locking a verified connection when it is edited), so the badge
+                # reverts to "Optional" until the user re-verifies.
+                ai_verified["ok"] = False
+                refresh_ai_badge()
 
             ai_enabled.on_value_change(persist_ai_settings)
             ai_model.on_value_change(persist_ai_settings)
@@ -1344,6 +1383,10 @@ def build_connect_page(
                 ai_status.classes(replace=f"text-sm {INLINE_HINT_TEXT[tone]}")
                 ai_status.set_text(display.message)
                 ui.notify(display.message, type=display.notify_type)
+                # Turn the section badge green only on a CLEAN pass (a fallback pass is
+                # reported as a warning, not success, so it must not read as Verified).
+                ai_verified["ok"] = display.notify_type == "positive"
+                refresh_ai_badge()
 
             # Verify button + the "auto-saved" reassurance on one row, so the
             # action and its caption sit together at the foot of the card.
@@ -1355,6 +1398,20 @@ def build_connect_page(
             ai_verify_button.on_click(
                 lambda: run_busy(ai_verify_button, on_verify_ai_access)
             )
+
+            # AI Assist is the single gate: with it OFF the app never calls Bedrock,
+            # so the model/region settings and the access preflight are meaningless.
+            # Lock those inputs and the Verify button until the switch is enabled, and
+            # keep them in sync as it flips -- the Bedrock section reads as contingent
+            # on the toggle instead of offering an action for a disabled feature.
+            def sync_ai_controls(_event: object = None) -> None:
+                on = bool(ai_enabled.value)
+                ai_model.set_enabled(on)
+                ai_region.set_enabled(on)
+                ai_verify_button.set_enabled(on)
+
+            sync_ai_controls()
+            ai_enabled.on_value_change(sync_ai_controls)
 
         # --- Continue to the migration workflow ---------------------------
         # Next is locked until BOTH connections have been verified by a

@@ -359,6 +359,35 @@ def test_open_scope_seeds_and_persists_the_conversation() -> None:
     assert sent and sent[0][0]["text"] == "How do I convert orders?"
 
 
+def test_start_over_resets_conversation_in_place_and_wipes_the_panel() -> None:
+    # Start over must reset the AI DBA chat. The panel captures state.ai_conversation
+    # by reference at build time and is NOT rebuilt on Start over, so clear() must reset
+    # it IN PLACE (same object) rather than replace it -- otherwise the panel keeps
+    # rendering (and appending to) the stale transcript. panel.reset() then wipes the
+    # rendered bubbles.
+    state = _enabled_state()
+    ui = _Ui()
+    panel = build_ai_panel(ui, state=state)
+    panel.open_scope(
+        scope_id="eval:orders", title="orders",
+        streamer=_make_streamer("A1"), seed_question="Q1",
+    )
+    _pump(ui)
+    assert state.ai_conversation.messages  # transcript populated
+    conv_obj = state.ai_conversation
+
+    # Start over: clear() resets the conversation IN PLACE; the app then calls the
+    # panel's reset() to wipe the rendered transcript.
+    state.clear()
+    panel.reset()
+
+    # Same object (the panel's captured reference stays valid), now emptied.
+    assert state.ai_conversation is conv_obj
+    assert state.ai_conversation.messages == []
+    assert state.ai_conversation.active_scope is None
+    assert state.ai_conversation.visible is False
+
+
 def test_scope_switch_preserves_transcript_and_reground_window() -> None:
     state = _enabled_state()
     ui = _Ui()

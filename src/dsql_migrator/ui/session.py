@@ -377,8 +377,12 @@ class SessionConnectionState:
         self.workflow = WorkflowState()
         self.ai_assist = AiAssistConfig()
         # Start over discards the AI transcript too: a fresh journey starts a fresh
-        # conversation (a stale prior chat would be confusing).
-        self.ai_conversation = AiConversation()
+        # conversation (a stale prior chat would be confusing). Reset IN PLACE (not a
+        # new object): the persistent AI panel captured this AiConversation by
+        # reference and is not rebuilt on Start over, so replacing it would orphan the
+        # panel's reference and leave the old chat on screen. app._reset_session then
+        # calls the panel's reset() to wipe the rendered bubbles.
+        self.ai_conversation.reset()
         self.aws_profile = None
         self.active_view = None
         self._migration_type = "full_load_only"

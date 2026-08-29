@@ -67,6 +67,21 @@ DEFAULT_BEDROCK_MODEL_ID = "global.anthropic.claude-sonnet-5"
 # suggestions actually came from.
 BEDROCK_MODEL_FALLBACKS: tuple[str, ...] = ("global.anthropic.claude-sonnet-4-6",)
 
+# The curated set the Connect "Model ID" dropdown offers. GLOBAL cross-region Anthropic
+# inference profiles only (they resolve from every commercial region), so the picker
+# never offers a US-only id that fails outside the US. MUST stay in sync with the
+# ``BedrockModelId`` AllowedValues in deploy/cloudformation.yaml -- a deployment test
+# asserts the two match, so a model added in one place must be added in both. The IAM
+# scope is provider-wide (``anthropic.*``), so any of these is invokable without a
+# redeploy (still subject to per-account Bedrock model access). ``DEFAULT_BEDROCK_MODEL_ID``
+# is the first entry.
+SUPPORTED_BEDROCK_MODELS: tuple[str, ...] = (
+    "global.anthropic.claude-sonnet-5",
+    "global.anthropic.claude-opus-5",
+    "global.anthropic.claude-opus-4-8",
+    "global.anthropic.claude-sonnet-4-6",
+)
+
 
 # ---------------------------------------------------------------------------
 # Settings form -> AiAssistConfig
@@ -345,6 +360,7 @@ __all__ = [
     "AI_STATUS_APPROVED",
     "AI_STATUS_REJECTED",
     "DEFAULT_BEDROCK_MODEL_ID",
+    "SUPPORTED_BEDROCK_MODELS",
     "build_ai_assist_config",
     "AiConversionAssistant",
     "edit_suggestion",
