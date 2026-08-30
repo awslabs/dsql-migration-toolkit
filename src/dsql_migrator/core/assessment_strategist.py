@@ -125,6 +125,19 @@ _MAX_CHAT_TRANSCRIPT_CHARS = 24000
 # call-loop and bounds cost. A handful is plenty for "look up X, then answer".
 _MAX_TOOL_ROUNDS = 6
 
+# A model sometimes ENDS its turn (stop_reason="end_turn") with only a "let me look
+# that up" preamble and NO tool_use block -- announcing tool use but never emitting the
+# call. Returning that as the answer leaves the user staring at "Let me pull the
+# assessment details..." with no real reply (reported on the "What's next?" briefing).
+# When that happens before any tool has run, tool_chat nudges ONCE to actually proceed.
+# This matches the intent-to-call cue without tripping on a genuine complete answer.
+_TOOL_PREAMBLE_RE = re.compile(
+    r"\b(let me|let's|i'?ll|i will|i'?m going to|going to|let me just)\b"
+    r".{0,60}\b(check|look|pull|fetch|inspect|review|examine|gather|retrieve|see|"
+    r"take a look|dig|query|read)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
 # Defensive caps on untrusted output so a single response cannot flood the UI.
 _MAX_INSIGHTS = 200
 _MAX_FINDINGS = 100
@@ -1720,6 +1733,8 @@ class AssessmentStrategist:
             }
             for m in _trim_chat_messages(messages, _MAX_CHAT_TRANSCRIPT_CHARS)
         ]
+        tools_used = False
+        nudged = False
         try:
             for _ in range(max(1, max_rounds)):
                 body = json.dumps(
@@ -1769,6 +1784,7 @@ class AssessmentStrategist:
                             }
                         )
                     convo.append({"role": "user", "content": results})
+                    tools_used = True
                     continue
                 # Final answer (end_turn, or a turn with no tool call): join text blocks.
                 final = "".join(
@@ -1778,6 +1794,35 @@ class AssessmentStrategist:
                     and b.get("type") == "text"
                     and isinstance(b.get("text"), str)
                 ).strip()
+                # The model punted: it ended the turn with only an intent-to-look-it-up
+                # preamble and no tool_use, before running ANY tool. Nudge once to make
+                # it actually call the tools + answer, then continue -- rather than
+                # handing the user a bare "Let me pull the assessment details...".
+                if (
+                    final
+                    and not tools_used
+                    and not nudged
+                    and _TOOL_PREAMBLE_RE.search(final)
+                ):
+                    nudged = True
+                    convo.append({"role": "assistant", "content": content})
+                    convo.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Go ahead now: in THIS reply, CALL the tools you "
+                                        "just described to fetch the real data, then give "
+                                        "the full answer. Do not reply with only a 'let "
+                                        "me check' preamble."
+                                    ),
+                                }
+                            ],
+                        }
+                    )
+                    continue
                 if not final:
                     err = AiAssistUnavailableError("INVALID_OUTPUT")
                     return ObjectGuidanceOutcome(

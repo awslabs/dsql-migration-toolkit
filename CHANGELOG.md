@@ -5,6 +5,19 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.419
+
+### Fixed
+
+- **The AI DBA no longer stops at "Let me pull the details…" without answering.** On a
+  tool-using turn (e.g. the header's **"What's next?"** briefing) the model sometimes
+  ended its turn with only an intent-to-look-it-up preamble and no actual tool call, so
+  the tool loop delivered that preamble as the entire reply. The tools instruction now
+  forbids ending a turn with only a preamble, and the tool loop detects that punt and
+  nudges the model once to actually call the tools and answer — so the briefing returns
+  the real, tool-backed answer instead of a dangling "Let me check…". A genuine
+  no-tool answer is unaffected (no extra round).
+
 ## v0.1.418
 
 ### Fixed

@@ -866,6 +866,85 @@ def test_tool_chat_runs_a_tool_then_answers() -> None:
     assert second["messages"][-1]["content"][0]["type"] == "tool_result"
 
 
+def test_tool_chat_nudges_when_model_punts_with_a_preamble_only_turn() -> None:
+    # Reported on the "What's next?" briefing: the model ended its turn with only a
+    # "Let me pull the assessment details..." preamble and NO tool_use, so the user got
+    # that preamble as the whole answer. tool_chat must nudge ONCE and continue, so the
+    # corrective round produces the real answer instead of the bare preamble.
+    class _PuntThenAnswer:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+            self._round = 0
+
+        def invoke_model(self, **kwargs: object) -> dict:
+            self.calls.append(kwargs)
+            self._round += 1
+            if self._round == 1:
+                # A punt: end_turn, text only, NO tool_use.
+                body = json.dumps(
+                    {
+                        "stop_reason": "end_turn",
+                        "content": [
+                            {"type": "text",
+                             "text": "Let me pull the actual assessment details and "
+                                     "check the current state across the pipeline."},
+                        ],
+                    }
+                )
+            else:
+                body = json.dumps(
+                    {
+                        "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "Your top risk is table X."}],
+                    }
+                )
+            return {"body": body}
+
+    client = _PuntThenAnswer()
+    strategist = AssessmentStrategist(_config(), client=client)
+    deltas: list[str] = []
+    outcome = strategist.tool_chat(
+        "SYSTEM", [{"role": "user", "text": "what's next?"}], deltas.append,
+        tools=[{"name": "get_prerequisite_verdicts", "description": "x",
+                "input_schema": {"type": "object", "properties": {}}}],
+        execute=lambda _n, _i: "{}",
+    )
+    assert outcome.available
+    # The REAL answer is returned/streamed, not the preamble.
+    assert "top risk is table X" in outcome.markdown
+    assert "Let me pull" not in outcome.markdown
+    assert len(client.calls) == 2  # punt round, then the nudged answer round
+    # The nudge was fed back as a trailing user turn before the answer round.
+    second = json.loads(client.calls[1]["body"])
+    assert second["messages"][-1]["role"] == "user"
+    assert "CALL the tools" in second["messages"][-1]["content"][0]["text"]
+
+
+def test_tool_chat_does_not_nudge_a_genuine_answer() -> None:
+    # A normal complete answer (no intent-to-look-it-up cue) must be returned as-is,
+    # with no extra round -- the nudge must not fire on a real reply.
+    class _Answer:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def invoke_model(self, **kwargs: object) -> dict:
+            self.calls.append(kwargs)
+            return {"body": json.dumps({
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "Aurora DSQL requires a primary key."}],
+            })}
+
+    client = _Answer()
+    outcome = AssessmentStrategist(_config(), client=client).tool_chat(
+        "SYSTEM", [{"role": "user", "text": "does DSQL need a PK?"}], lambda _t: None,
+        tools=[{"name": "x", "description": "x",
+                "input_schema": {"type": "object", "properties": {}}}],
+        execute=lambda _n, _i: "{}",
+    )
+    assert outcome.available and "primary key" in outcome.markdown
+    assert len(client.calls) == 1  # answered directly, no nudge round
+
+
 def test_tool_chat_maps_bedrock_failure_to_unavailable() -> None:
     strategist = AssessmentStrategist(_config(), client=_BoomClient())
     outcome = strategist.tool_chat(

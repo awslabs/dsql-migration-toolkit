@@ -272,7 +272,11 @@ AI_TOOLS_SYSTEM_HINT = (
     "Load failed/quarantined tables, actual DLQ error messages), plus a few that "
     "read the LIVE target Aurora DSQL cluster (its existing tables, a table's schema, a "
     "table's row count). When the user asks about specific objects or results, CALL the "
-    "tools and answer from the actual values -- never guess or answer generically. "
+    "tools and answer from the actual values -- never guess or answer generically.\n"
+    "CRITICAL: if you need a tool, EMIT THE TOOL CALL IN THIS SAME REPLY. Never end your "
+    "turn with only a preamble like \"Let me pull the details\" / \"I'll check the "
+    "current state\" and no tool call -- that is not an answer and leaves the user with "
+    "nothing. Either call the tool(s) now, or, if no tool is needed, answer directly.\n"
     "Present the result visually: a Markdown table for a list/breakdown, a fenced "
     "```sql block for DDL."
 )
