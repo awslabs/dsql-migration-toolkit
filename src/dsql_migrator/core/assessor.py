@@ -753,8 +753,8 @@ class TooManyIndexesRule(Rule):
                     risk=(
                         f"The table has {count} secondary indexes; with its primary "
                         f"key that is {count + 1} against Aurora DSQL's limit of "
-                        f"{_MAX_INDEXES_PER_TABLE} indexes per table (MySQL allows "
-                        "64). The excess index fails with error 54000 \"more than "
+                        f"{_MAX_INDEXES_PER_TABLE} indexes per table. The excess index "
+                        "fails with error 54000 \"more than "
                         f"{_MAX_INDEXES_PER_TABLE} indexes per table are not "
                         "allowed\" — and because secondary indexes are built AFTER "
                         "the data loads, that failure appears only once Full Load has "
@@ -763,8 +763,8 @@ class TooManyIndexesRule(Rule):
                     recommendation=(
                         f"Drop indexes you no longer need so at most "
                         f"{_MAX_SECONDARY_INDEXES_PER_TABLE} secondary indexes remain "
-                        "(unused or redundant indexes are common — check "
-                        "sys.schema_unused_indexes on the source), or split the table. "
+                        "(unused or redundant indexes are common — review the source's "
+                        "index usage), or split the table. "
                         "Decide before loading: re-running Full Load will not clear "
                         "this, since the limit is not transient."
                     ),
@@ -858,7 +858,7 @@ class TooManyKeyColumnsRule(Rule):
                     risk=(
                         f"{'; '.join(risk_parts)}. Aurora DSQL allows at most "
                         f"{_MAX_KEY_COLUMNS} columns in a primary key or secondary "
-                        "index (MySQL allows 16), so these fail with error 54011 "
+                        "index, so these fail with error 54011 "
                         f'"more than {_MAX_KEY_COLUMNS} column keys are not allowed". '
                         f"{'. '.join(when)}."
                     ),
@@ -1349,8 +1349,20 @@ def check_table_count(inventory: SourceInventory) -> list[AssessmentItem]:
     return [item.model_copy(update={"concerns": _single_concern(item)}) for item in items]
 
 
-def default_inventory_rules() -> list[InventoryRule]:
-    """Return the default inventory-level (cluster-wide) checks."""
+def default_inventory_rules(
+    source_type: SourceType = SourceType.MYSQL,
+) -> list[InventoryRule]:
+    """Return the default inventory-level (cluster-wide) checks for ``source_type``.
+
+    ``check_multiple_source_databases`` is MySQL-only: a PostgreSQL source is
+    introspected SCHEMA-qualified (``schema.table``), and its multiple schemas live
+    within one database, which Aurora DSQL supports and this tool migrates
+    schema-qualified automatically -- so the "spans N databases / consolidate into
+    schemas" finding is both wrong (they already ARE schemas) and misleading for a PG
+    source. The table-count limit applies to every engine.
+    """
+    if source_type is SourceType.POSTGRES:
+        return [check_table_count]
     return [check_multiple_source_databases, check_table_count]
 
 
@@ -1548,7 +1560,7 @@ class CompatibilityAssessor:
         self._inventory_rules: list[InventoryRule] = (
             list(inventory_rules)
             if inventory_rules is not None
-            else default_inventory_rules()
+            else default_inventory_rules(source_type)
         )
 
     def assess(self, inventory: SourceInventory) -> AssessmentReport:
@@ -1630,12 +1642,18 @@ def render_text_report(report: AssessmentReport) -> str:
     return "\n".join(lines)
 
 
-def export_report(report: AssessmentReport, fmt: str = "json") -> str:
+def export_report(
+    report: AssessmentReport,
+    fmt: str = "json",
+    *,
+    source_type: SourceType = SourceType.MYSQL,
+) -> str:
     """Export an assessment report as ``"json"``, ``"text"``, or ``"html"``.
 
     JSON is produced from the Pydantic model (machine-readable, downloadable);
     text is a readable summary; HTML is a styled, standalone document suitable
-    for sharing. Raises ``ValueError`` for unknown formats.
+    for sharing (its title reflects the ``source_type``). Raises ``ValueError`` for
+    unknown formats.
     """
     normalized = fmt.lower()
     if normalized == "json":
@@ -1643,7 +1661,7 @@ def export_report(report: AssessmentReport, fmt: str = "json") -> str:
     if normalized == "text":
         return render_text_report(report)
     if normalized == "html":
-        return render_html_report(report)
+        return render_html_report(report, source_type=source_type)
     raise ValueError(
         f"unsupported report format: {fmt!r} (use 'json', 'text', or 'html')"
     )
@@ -1890,6 +1908,7 @@ def render_html_report(
     ai_report: Optional[AiAssessmentReport] = None,
     target: Optional[TargetInventory] = None,
     conflicts: Optional[list[str]] = None,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> str:
     """Render a styled, standalone HTML assessment report (English).
 
@@ -1902,6 +1921,9 @@ def render_html_report(
     """
     def esc(value: object) -> str:
         return html.escape(str(value)) if value is not None else ""
+
+    source_engine = "PostgreSQL" if source_type is SourceType.POSTGRES else "MySQL"
+    report_title = f"{source_engine} to Aurora DSQL Compatibility Assessment"
 
     classification_summary = "".join(
         f"<li>{c.value}: <strong>{report.summary.get(c, 0)}</strong></li>"
@@ -2041,7 +2063,7 @@ def render_html_report(
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en">\n<head>\n<meta charset="utf-8">\n'
-        "<title>MySQL to Aurora DSQL Compatibility Assessment</title>\n"
+        f"<title>{report_title}</title>\n"
         "<style>\n"
         "body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;"
         "margin:24px;color:#222;}\n"
@@ -2081,7 +2103,7 @@ def render_html_report(
         ".conflict{display:inline-block;border:1px solid #e0a800;color:#8a6d00;"
         "border-radius:10px;padding:1px 8px;margin:2px;font-size:12px;}\n"
         "</style>\n</head>\n<body>\n"
-        "<h1>MySQL to Aurora DSQL Compatibility Assessment</h1>\n"
+        f"<h1>{report_title}</h1>\n"
         "<h2>Classification summary</h2>\n"
         f"<ul>{classification_summary}</ul>\n"
         "<h2>Estimated manual effort (non-automatic objects)</h2>\n"

@@ -5,6 +5,40 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.418
+
+### Fixed
+
+- **PostgreSQL-source correctness sweep — 14 places that still behaved as, or read
+  as, MySQL when the source was PostgreSQL are fixed.** A repo-wide audit found the
+  data path was already engine-dispatched, but a tail of UI text, guidance, and a few
+  behaviors were still MySQL-only. Notably:
+  - **Two functional bugs:** (1) a PostgreSQL column **DEFAULT** was silently dropped
+    from the converted DDL with no warning — now every dropped default raises a MANUAL
+    conversion warning (a serial/identity `nextval` is skipped, as MySQL
+    `AUTO_INCREMENT` already is); (2) **PostgreSQL stand-alone CDC** (Manual re-snapshot)
+    could not be started — the Start CDC button stayed disabled though the start-point
+    card showed "Ready"; the button now mirrors the card's PG gate.
+  - **Schema Conversion source panels** now render a PostgreSQL source in PG syntax
+    (double-quoted identifiers, exact PG types, `CREATE INDEX`, no `AUTO_INCREMENT`),
+    and a PG **view** is parsed/pretty-printed in the PostgreSQL dialect instead of being
+    mangled through MySQL; the CDC **schema-drift "Fix target schema… (ADD COLUMN)"**
+    recovery now reads PG columns and maps PG types instead of erroring.
+  - **Full Load watermark panel** shows the captured **WAL LSN** / replication slot /
+    publication for a PG source instead of rendering the binlog/GTID fields as
+    "unavailable"; the combined prerequisite panel no longer mis-labels PG CDC-only
+    checks (wal_level, replica identity, …) as "Full Load: Blocked".
+  - **Evaluation:** a multi-**schema** PostgreSQL source is no longer flagged as
+    "spans N databases" with MySQL consolidation advice (DSQL supports schemas and the
+    tool migrates them automatically); the exported HTML report is titled by the real
+    source engine; and the shared index/key-limit rules no longer cite MySQL's 64/16
+    limits or `sys.schema_unused_indexes`.
+  - **Text/guidance:** the oversized-LOB exclusion now detects PostgreSQL `text`/`bytea`
+    (not just MySQL LOB types); the validation drift verdict, CDC/param/sink previews,
+    Connect port default on a restored PG session, and various tooltips/blurbs are now
+    engine-aware or engine-neutral. (The AI-DBA prompts were already source-aware as of
+    v0.1.415.)
+
 ## v0.1.417
 
 ### Changed

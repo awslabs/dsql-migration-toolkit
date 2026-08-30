@@ -134,3 +134,41 @@ def test_pg_unsupported_type_rule_ignores_fully_supported_tables() -> None:
         primary_key=["id"],
     )
     assert UnsupportedPostgresTypeRule().evaluate(SourceInventory(tables=[table])) == []
+
+
+def test_multi_schema_pg_source_is_not_flagged_as_multiple_databases() -> None:
+    # A PostgreSQL source is schema-qualified (schema.table); its multiple schemas are
+    # one database that DSQL supports and the tool migrates schema-qualified. The
+    # MySQL-only MULTIPLE_DATABASES finding must NOT fire (it did, with MySQL
+    # consolidation guidance, for essentially every multi-schema PG source).
+    from dsql_migrator.core.assessor import default_inventory_rules
+
+    ids = {rule.__name__ for rule in default_inventory_rules(SourceType.POSTGRES)}
+    assert "check_multiple_source_databases" not in ids
+    assert "check_table_count" in ids  # the table-count limit still applies
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(name="public.users", columns=[ColumnDef(name="id", mysql_type="bigint")], primary_key=["id"]),
+            TableDef(name="sales.orders", columns=[ColumnDef(name="id", mysql_type="bigint")], primary_key=["id"]),
+        ]
+    )
+    report = CompatibilityAssessor(source_type=SourceType.POSTGRES).assess(inventory)
+    rule_ids = {item.rule_id for item in report.items}
+    assert "MULTIPLE_DATABASES" not in rule_ids
+    # A MySQL source with the same two-schema shape DOES still get the finding.
+    mysql_report = CompatibilityAssessor().assess(inventory)
+    assert "MULTIPLE_DATABASES" in {item.rule_id for item in mysql_report.items}
+
+
+def test_html_report_title_reflects_the_postgres_source_engine() -> None:
+    from dsql_migrator.core.assessor import render_html_report
+
+    report = CompatibilityAssessor(source_type=SourceType.POSTGRES).assess(
+        SourceInventory(tables=[TableDef(name="public.t", columns=[ColumnDef(name="id", mysql_type="bigint")], primary_key=["id"])])
+    )
+    pg_html = render_html_report(report, source_type=SourceType.POSTGRES)
+    assert "PostgreSQL to Aurora DSQL Compatibility Assessment" in pg_html
+    assert "MySQL to Aurora DSQL" not in pg_html
+    # Default (MySQL) keeps the original title.
+    assert "MySQL to Aurora DSQL Compatibility Assessment" in render_html_report(report)

@@ -3220,6 +3220,42 @@ class SchemaConverter:
                         )
                     )
 
+            # PostgreSQL column DEFAULTs are not re-emitted on the target in v1
+            # (build_pg_source_ddl emits name + exact type + NOT NULL + PK only).
+            # Dropping one silently would hide a post-cut-over change in INSERT
+            # behavior, so warn per column (Property 6, no silent loss) -- mirroring the
+            # MySQL default-loss loop above. A serial/identity default (nextval) is the
+            # identity mechanism, governed by the primary-key strategy and advanced by
+            # 'Sync identity sequences' at cut over, so it is skipped exactly as the
+            # MySQL auto_increment column's default is; every OTHER default is called out.
+            for column in table.columns:
+                default = (column.default or "").strip()
+                if not default or column.generated:
+                    continue
+                if "nextval(" in default.lower():
+                    continue
+                message = (
+                    f"Column '{column.name}' has a source default ({default}) that is "
+                    "not carried to the Aurora DSQL table; set it in the application or "
+                    "add it with ALTER TABLE after apply."
+                )
+                if not column.nullable:
+                    message += (
+                        " This column is NOT NULL, so an INSERT that omits it succeeds "
+                        "on the source but is REJECTED on Aurora DSQL -- set the value "
+                        "explicitly before cutting over."
+                    )
+                warnings.append(
+                    ConversionWarning(
+                        object_name=table.name,
+                        column_name=column.name,
+                        source_type=column.mysql_type,
+                        target_type=column.mysql_type,
+                        classification=Classification.MANUAL,
+                        message=message,
+                    )
+                )
+
         # Apply DSQL structural constraints (Requirements 3.3, 3.5). Foreign keys
         # are never emitted by _build_source_ddl, so removal only requires
         # preserving them as metadata plus a warning.
@@ -3357,8 +3393,12 @@ class SchemaConverter:
                     )
                 ],
             )
+        # Read the view body in its SOURCE dialect: a PostgreSQL source's view is already
+        # PG (near-identity to the DSQL target), so reading it as MySQL would mangle
+        # PG-only syntax (ANY(ARRAY[...]), ILIKE, `::` casts) into fabricated SQL.
+        read_dialect = _POSTGRES if self._source_type is SourceType.POSTGRES else _MYSQL
         try:
-            parsed = sqlglot.parse_one(definition, read=_MYSQL)
+            parsed = sqlglot.parse_one(definition, read=read_dialect)
             select = parsed.expression if isinstance(parsed, exp.Create) else parsed
             if select is None:
                 raise ValueError("no SELECT body parsed from the view definition")

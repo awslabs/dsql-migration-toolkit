@@ -60,6 +60,7 @@ from dsql_migrator.core.models import (
     Classification,
     SourceConnectionConfig,
     SourceInventory,
+    SourceType,
     StepStatus,
     TargetConnectionConfig,
     TargetInventory,
@@ -198,6 +199,10 @@ class EvaluationResult:
     assessment: AssessmentReport
     target_inventory: TargetInventory
     target_conflicts: list[str]
+    # The migration's SOURCE engine, so the exported report is titled correctly
+    # ("PostgreSQL to Aurora DSQL..." vs "MySQL to..."). Defaults to MySQL for older
+    # callers/tests that build a result without it.
+    source_type: SourceType = SourceType.MYSQL
 
 
 def _find_target_conflicts(
@@ -732,6 +737,7 @@ def run_evaluation(
         assessment=assessment,
         target_inventory=target_inventory,
         target_conflicts=target_conflicts,
+        source_type=inputs.source_config.source_type,
     )
 
 
@@ -828,6 +834,7 @@ def assessment_download(result: EvaluationResult, fmt: str = "json") -> ReportDo
             result.assessment,
             target=result.target_inventory,
             conflicts=result.target_conflicts,
+            source_type=result.source_type,
         )
     else:
         content = export_assessment_report(result.assessment, fmt)

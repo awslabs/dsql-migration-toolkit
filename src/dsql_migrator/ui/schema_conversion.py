@@ -371,6 +371,7 @@ def generate_previews(
     result: SchemaConversionResult,
     *,
     existence_checker: Optional[TargetExistenceChecker] = None,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> list["DdlPreview"]:
     """Build DDL previews for the ticked table/view node ids (Requirement 10.2).
 
@@ -383,7 +384,8 @@ def generate_previews(
     for node_id in node_ids:
         if node_id.startswith(TABLE_PREFIX) or node_id.startswith(VIEW_PREFIX):
             preview = preview_for_selection(
-                node_id, inventory, result, existence_checker=existence_checker
+                node_id, inventory, result,
+                existence_checker=existence_checker, source_type=source_type,
             )
             if preview is not None:
                 previews.append(preview)
@@ -505,8 +507,74 @@ def _render_source_default(column: ColumnDef) -> str:
     return "'" + raw.replace("'", "''") + "'"
 
 
-def render_source_table_ddl(table: TableDef) -> str:
-    """Reconstruct a readable MySQL ``CREATE TABLE`` for ``table`` (display only).
+def _quote_pg_ident(name: str) -> str:
+    """Double-quote a PostgreSQL identifier for the display-only source renderer."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _quote_pg_table(name: str) -> str:
+    """Quote a (possibly ``schema.table``) PostgreSQL name for display."""
+    schema, sep, obj = name.partition(".")
+    if sep and schema and obj:
+        return f"{_quote_pg_ident(schema)}.{_quote_pg_ident(obj)}"
+    return _quote_pg_ident(name)
+
+
+def _render_source_table_ddl_postgres(table: TableDef) -> str:
+    """Reconstruct a readable PostgreSQL ``CREATE TABLE`` for ``table`` (display only).
+
+    The PostgreSQL-source counterpart to the MySQL renderer below: identifiers are
+    double-quoted, ``column.mysql_type`` already holds the EXACT PostgreSQL type, and
+    DEFAULTs are emitted verbatim (a PG server default is valid PG). There is no
+    ``AUTO_INCREMENT`` / ``ON UPDATE`` (MySQL-only), and secondary indexes are rendered
+    as separate ``CREATE INDEX`` statements (PostgreSQL has no inline ``KEY``). Display
+    only -- never executed (the applyable target DDL comes from the converter).
+    """
+    clauses: list[str] = []
+    for column in table.columns:
+        clause = f"  {_quote_pg_ident(column.name)} {column.mysql_type}"
+        if not column.nullable:
+            clause += " NOT NULL"
+        if column.default is not None:
+            clause += f" DEFAULT {column.default}"
+        if column.generated:
+            clause += "  /* GENERATED column - expression not captured */"
+        clauses.append(clause)
+    if table.primary_key:
+        pk_columns = ", ".join(_quote_pg_ident(name) for name in table.primary_key)
+        clauses.append(f"  PRIMARY KEY ({pk_columns})")
+    for foreign_key in table.foreign_keys:
+        columns = ", ".join(_quote_pg_ident(name) for name in foreign_key.columns)
+        ref_columns = ", ".join(
+            _quote_pg_ident(name) for name in foreign_key.referenced_columns
+        )
+        clauses.append(
+            f"  CONSTRAINT {_quote_pg_ident(foreign_key.name)} FOREIGN KEY ({columns}) "
+            f"REFERENCES {_quote_pg_table(foreign_key.referenced_table)} ({ref_columns})"
+        )
+    body = ",\n".join(clauses)
+    rendered = f"CREATE TABLE {_quote_pg_table(table.name)} (\n{body}\n)"
+    for index in table.indexes:
+        unique = "UNIQUE " if index.unique else ""
+        columns = ", ".join(_quote_pg_ident(name) for name in index.columns)
+        rendered += (
+            f";\nCREATE {unique}INDEX {_quote_pg_ident(index.name)} "
+            f"ON {_quote_pg_table(table.name)} ({columns})"
+        )
+    if table.partitioned:
+        rendered += "\n/* PARTITION BY ... - partitioned source table; clause not captured */"
+    return rendered
+
+
+def render_source_table_ddl(
+    table: TableDef, *, source_type: SourceType = SourceType.MYSQL
+) -> str:
+    """Reconstruct a readable ``CREATE TABLE`` for ``table`` (display only).
+
+    Dispatches on the SOURCE engine: a PostgreSQL source is rendered with
+    double-quoted identifiers and its exact PG types (no MySQL backticks / ``KEY`` /
+    ``AUTO_INCREMENT``); a MySQL source keeps the ``SHOW CREATE TABLE``-style rendering
+    below.
 
     This mirrors a ``SHOW CREATE TABLE`` view (columns, primary key, secondary
     indexes, and foreign keys) so the source side of the diff shows exactly what
@@ -531,6 +599,8 @@ def render_source_table_ddl(table: TableDef) -> str:
     (identity must be BIGINT, and CACHE must be stated). That is why the two functions
     stay apart.
     """
+    if source_type is SourceType.POSTGRES:
+        return _render_source_table_ddl_postgres(table)
     clauses: list[str] = []
     for column in table.columns:
         clause = f"  {_quote_mysql(column.name)} {column.mysql_type}"
@@ -619,19 +689,28 @@ def build_table_preview(
     conversion: TableConversion,
     *,
     exists_on_target: Optional[bool] = None,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> DdlPreview:
     """Build the source/target DDL preview for a converted table (Req 10.2)."""
     return DdlPreview(
         object_name=table.name,
-        source_ddl=render_source_table_ddl(table),
+        source_ddl=render_source_table_ddl(table, source_type=source_type),
         target_ddl=render_target_ddl(conversion),
         warnings=tuple(conversion.warnings),
         exists_on_target=exists_on_target,
     )
 
 
-def render_source_view_ddl(view: ViewDef) -> str:
-    """Render a readable MySQL ``CREATE VIEW`` for the source side of the diff.
+def render_source_view_ddl(
+    view: ViewDef, *, source_type: SourceType = SourceType.MYSQL
+) -> str:
+    """Render a readable ``CREATE VIEW`` for the source side of the diff.
+
+    Dispatches on the SOURCE engine so the pane's content matches its "Source —
+    PostgreSQL"/"MySQL" label and highlight: a PostgreSQL view is parsed and
+    pretty-printed in the PostgreSQL dialect (its definition is already PG and there is
+    no ``ALGORITHM``/``DEFINER`` prefix), so PG-only syntax (``ANY(ARRAY[...])``,
+    ``ILIKE``, ``::`` casts) is preserved rather than mangled through the MySQL dialect.
 
     MySQL's ``SHOW CREATE VIEW`` returns the whole definition on ONE line, prefixed
     with server metadata (``ALGORITHM=``, ``DEFINER=``, ``SQL SECURITY``). Shown raw it
@@ -649,6 +728,26 @@ def render_source_view_ddl(view: ViewDef) -> str:
     body = (view.definition or "").strip()
     if not body:
         return f"-- View definition unavailable for {view.name}."
+    if source_type is SourceType.POSTGRES:
+        # PostgreSQL: the definition is already PG (no ALGORITHM/DEFINER prefix). Parse +
+        # pretty-print in the PG dialect so PG-only syntax is preserved; fall back to the
+        # verbatim source when it will not parse.
+        try:
+            import sqlglot
+
+            stripped = body
+            if not stripped.upper().startswith("CREATE"):
+                stripped = f"CREATE VIEW {view.name} AS {stripped}"
+            parsed = sqlglot.parse_one(stripped, read="postgres")
+            if parsed is not None:
+                pretty = parsed.sql(dialect="postgres", pretty=True).strip()
+                if pretty:
+                    return pretty
+        except Exception:  # noqa: BLE001 - unparseable: show the source verbatim
+            logger.debug("View %s could not be pretty-printed; showing raw", view.name)
+        if body.upper().startswith("CREATE"):
+            return body
+        return f"CREATE VIEW {view.name} AS\n{body}"
     try:
         import sqlglot
 
@@ -684,6 +783,7 @@ def build_view_preview(
     conversion: Optional["ViewConversion"] = None,
     *,
     exists_on_target: Optional[bool] = None,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> DdlPreview:
     """Build the source/target DDL preview for a view (Req 10.2).
 
@@ -698,7 +798,7 @@ def build_view_preview(
         target_ddl = _NOT_AUTO_CONVERTED
     return DdlPreview(
         object_name=view.name,
-        source_ddl=render_source_view_ddl(view),
+        source_ddl=render_source_view_ddl(view, source_type=source_type),
         target_ddl=target_ddl,
         warnings=tuple(conversion.warnings) if conversion is not None else (),
         exists_on_target=exists_on_target,
@@ -711,6 +811,7 @@ def preview_for_selection(
     result: SchemaConversionResult,
     *,
     existence_checker: Optional[TargetExistenceChecker] = None,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> Optional[DdlPreview]:
     """Return the DDL preview for the selected tree ``node_id``, if any.
 
@@ -729,7 +830,9 @@ def preview_for_selection(
         if table is None or conversion is None:
             return None
         exists = _check_exists(existence_checker, name)
-        return build_table_preview(table, conversion, exists_on_target=exists)
+        return build_table_preview(
+            table, conversion, exists_on_target=exists, source_type=source_type
+        )
 
     if node_id.startswith(VIEW_PREFIX):
         name = node_id[len(VIEW_PREFIX):]
@@ -738,7 +841,9 @@ def preview_for_selection(
             return None
         conversion = _find_view_conversion(result, name)
         exists = _check_exists(existence_checker, name)
-        return build_view_preview(view, conversion, exists_on_target=exists)
+        return build_view_preview(
+            view, conversion, exists_on_target=exists, source_type=source_type
+        )
 
     return None
 
@@ -2796,6 +2901,7 @@ def _render_browser_and_preview(
         inventory,
         result_provider(),
         existence_checker=existence_checker,
+        source_type=source_type,
     )
     if not previews:
         inline_hint(

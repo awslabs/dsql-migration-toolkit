@@ -5,6 +5,32 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.418
+
+### 수정 (Fixed)
+
+- **PostgreSQL 소스 정합성 일괄 점검 — 소스가 PostgreSQL일 때도 여전히 MySQL처럼
+  동작하거나 표시되던 14곳을 수정했습니다.** 리포지토리 전역 감사 결과 데이터 경로는 이미
+  엔진별로 분기되어 있었으나, UI 텍스트·안내·일부 동작이 MySQL 전용으로 남아 있었습니다. 주요 내용:
+  - **기능 버그 2건:** (1) PostgreSQL 컬럼 **DEFAULT**가 변환 DDL에서 경고 없이 사라지던 문제 →
+    이제 누락되는 모든 기본값에 MANUAL 변환 경고(serial/identity `nextval`은 MySQL
+    `AUTO_INCREMENT`처럼 건너뜀); (2) **PostgreSQL 단독 CDC**(Manual 재스냅샷)가 시작되지 않던
+    문제(카드는 "Ready"인데 Start CDC 버튼이 비활성) → 버튼이 카드의 PG 게이트를 반영.
+  - **Schema Conversion 소스 패널**이 PostgreSQL 소스를 PG 문법(큰따옴표 식별자, 정확한 PG 타입,
+    `CREATE INDEX`, `AUTO_INCREMENT` 없음)으로 렌더링하고, PG **뷰**를 MySQL로 mangle하지 않고
+    PostgreSQL 방언으로 파싱/정리; CDC **스키마 드리프트 "Fix target schema…(ADD COLUMN)"**
+    복구가 PG 컬럼을 읽고 PG 타입을 매핑하도록(기존엔 오류).
+  - **Full Load 워터마크 패널**이 PG 소스에서 binlog/GTID를 "unavailable"로 표시하는 대신 캡처된
+    **WAL LSN**/복제 슬롯/퍼블리케이션을 표시; 통합 사전점검 패널이 PG CDC 전용 체크(wal_level,
+    replica identity 등)를 "Full Load: Blocked"로 잘못 표시하지 않음.
+  - **Evaluation:** 다중 **스키마** PostgreSQL 소스를 MySQL 통합 안내와 함께 "N개 데이터베이스에
+    걸침"으로 표시하지 않음(DSQL은 스키마를 지원하고 도구가 자동 마이그레이션); 내보낸 HTML 보고서
+    제목이 실제 소스 엔진 기준; 공유 인덱스/키 제한 규칙이 MySQL의 64/16 제한이나
+    `sys.schema_unused_indexes`를 더는 언급하지 않음.
+  - **텍스트/안내:** 오버사이즈 LOB 제외가 PostgreSQL `text`/`bytea`도 감지(MySQL LOB 타입뿐 아니라);
+    검증 드리프트 판정, CDC/파라미터/싱크 미리보기, 복원된 PG 세션의 Connect 포트 기본값, 각종
+    툴팁/문구가 엔진 인식형 또는 엔진 중립형으로. (AI DBA 프롬프트는 v0.1.415에서 이미 소스 인식형.)
+
 ## v0.1.417
 
 ### 변경 (Changed)

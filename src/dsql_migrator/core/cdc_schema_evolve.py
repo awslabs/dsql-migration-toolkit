@@ -47,6 +47,11 @@ from typing import Callable, Iterable, Optional, Sequence
 from sqlglot import exp
 
 from dsql_migrator.core.converter import map_mysql_type
+from dsql_migrator.core.converter_postgres import (
+    clamp_pg_numeric,
+    unsupported_dsql_reason,
+)
+from dsql_migrator.core.models import SourceType
 
 # Mirrors converter._quote_pg_identifier. Kept local like exporter/validator keep
 # their own MySQL quoter: the rule is one line and a local copy cannot drift out
@@ -116,19 +121,51 @@ class AddColumnOutcome:
     error: Optional[str] = None
 
 
+def _resolve_target_type(
+    source_type_str: str, source_engine: SourceType
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Map one source column type to its Aurora DSQL type.
+
+    Returns ``(target_type, warning_message, skip_reason)`` -- exactly one of
+    ``target_type`` / ``skip_reason`` is set. MySQL types go through the shared
+    ``map_mysql_type`` remap; a PostgreSQL type is near-identity (it IS a PG type
+    already), so it is emitted verbatim except that a DSQL-unsupported PG type is
+    skipped (never approximated) and an over-precise numeric is clamped with a note --
+    mirroring the converter's PG table path.
+    """
+    if source_engine is SourceType.POSTGRES:
+        reason = unsupported_dsql_reason(source_type_str)
+        if reason is not None:
+            return None, None, reason
+        clamped, clamp_note = clamp_pg_numeric(source_type_str)
+        return clamped, clamp_note, None
+    try:
+        target_type, warning = map_mysql_type(source_type_str)
+    except ValueError as exc:
+        return None, None, f"no Aurora DSQL mapping for this type ({exc})"
+    return target_type, (warning.message if warning is not None else None), None
+
+
 def plan_add_columns(
     table: str,
     source_columns: Sequence[tuple[str, str]],
     target_columns: Iterable[str],
+    *,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> AddColumnPlan:
     """Diff a table's columns and render the additive DDL the target is missing.
 
-    ``source_columns`` is ``[(column_name, mysql_column_type), ...]`` in the
-    source's ordinal order (as ``information_schema.columns`` returns it), and
-    ``target_columns`` is the column names the target already has. Comparison is
-    case-insensitive on the target side because the converter lower-cases
-    identifiers when it creates the target table, so a source ``Full_Name`` maps
-    to a target ``full_name`` and must not be reported as missing.
+    ``source_columns`` is ``[(column_name, source_column_type), ...]`` in the
+    source's ordinal order, and ``target_columns`` is the column names the target
+    already has. Comparison is case-insensitive on the target side because the
+    converter lower-cases identifiers when it creates the target table, so a source
+    ``Full_Name`` maps to a target ``full_name`` and must not be reported as missing.
+
+    ``source_type`` selects how each column type is mapped: a MySQL type is remapped
+    to its DSQL equivalent; a PostgreSQL type is emitted near-verbatim (DSQL-unsupported
+    PG types are skipped, over-precise numerics clamped) -- matching the schema
+    converter, so an ADD COLUMN recovery on a PostgreSQL source produces PG DDL instead
+    of erroring through the MySQL remap.
 
     Pure: no connection, no clock, no IO. Ordering follows the source so a
     multi-column ALTER sequence reads like the source's own change history.
@@ -136,47 +173,76 @@ def plan_add_columns(
     have = {name.lower() for name in target_columns}
     steps: list[AddColumnStep] = []
     skipped: list[SkippedColumn] = []
-    for column, source_type in source_columns:
+    for column, source_column_type in source_columns:
         if column.lower() in have:
             continue
-        try:
-            target_type, warning = map_mysql_type(source_type)
-        except ValueError as exc:
-            # Unparseable/unsupported source type: report it, never approximate.
+        target_type, warning, skip_reason = _resolve_target_type(
+            source_column_type, source_type
+        )
+        if target_type is None:
+            # Unsupported/unmappable source type: report it, never approximate.
             skipped.append(
                 SkippedColumn(
                     column=column,
-                    source_type=source_type,
-                    reason=f"no Aurora DSQL mapping for this type ({exc})",
+                    source_type=source_column_type,
+                    reason=skip_reason or "no Aurora DSQL mapping for this type",
                 )
             )
             continue
         steps.append(
             AddColumnStep(
                 column=column,
-                source_type=source_type,
+                source_type=source_column_type,
                 target_type=target_type,
                 # Nullable, no default -- see the module docstring.
                 ddl=(
                     f"ALTER TABLE {_quote_qualified(table)} "
                     f"ADD COLUMN {_quote_ident(column)} {target_type}"
                 ),
-                warning=warning.message if warning is not None else None,
+                warning=warning,
             )
         )
     return AddColumnPlan(table=table, steps=tuple(steps), skipped=tuple(skipped))
 
 
-def read_source_columns(connection, table: str) -> list[tuple[str, str]]:
-    """Read ``[(column_name, COLUMN_TYPE)]`` for ``schema.table`` from MySQL.
+def read_source_columns(
+    connection, table: str, *, source_type: SourceType = SourceType.MYSQL
+) -> list[tuple[str, str]]:
+    """Read ``[(column_name, source_type)]`` for ``schema.table`` from the source.
 
-    ``COLUMN_TYPE`` (not ``DATA_TYPE``) is what the converter maps, because it
-    keeps the precision/length/unsigned detail the mapping depends on -- the same
-    reason :func:`dsql_migrator.core.introspector.enrich_columns` prefers it.
-    Read-only against ``information_schema`` (Property 1: the source is never
-    modified, and this is scan-free).
+    For MySQL this reads ``COLUMN_TYPE`` (not ``DATA_TYPE``) from
+    ``information_schema.columns`` -- it keeps the precision/length/unsigned detail
+    the mapping depends on (the same reason ``introspector.enrich_columns`` prefers
+    it). For PostgreSQL it reads ``format_type(atttypid, atttypmod)`` from
+    ``pg_attribute`` -- the exact PG type string the converter expects (PG's
+    ``information_schema`` has no ``COLUMN_TYPE`` and loses array/precision detail).
+    Read-only (Property 1: the source is never modified, and this is scan-free).
     """
     schema, _, name = table.partition(".")
+    if source_type is SourceType.POSTGRES:
+        with connection.cursor() as cursor:
+            if schema:
+                cursor.execute(
+                    "SELECT a.attname, format_type(a.atttypid, a.atttypmod) "
+                    "FROM pg_attribute a "
+                    "JOIN pg_class c ON c.oid = a.attrelid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE c.relname = %s AND n.nspname = %s "
+                    "AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+                    (name, schema),
+                )
+            else:
+                cursor.execute(
+                    "SELECT a.attname, format_type(a.atttypid, a.atttypmod) "
+                    "FROM pg_attribute a "
+                    "JOIN pg_class c ON c.oid = a.attrelid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE c.relname = %s AND n.nspname NOT IN "
+                    "('pg_catalog', 'information_schema', 'pg_toast') "
+                    "AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+                    (name,),
+                )
+            return [(row[0], row[1]) for row in cursor.fetchall()]
     with connection.cursor() as cursor:
         cursor.execute(
             "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.columns "

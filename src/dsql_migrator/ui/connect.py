@@ -300,7 +300,8 @@ def make_source_engine_factory(
 ) -> Callable[[SourceConnectionConfig], Engine]:
     """Build an engine factory that injects the in-memory ``password``.
 
-    The returned factory builds a MySQL engine and installs the read-only guard,
+    The returned factory builds a source engine for the config's dialect (MySQL or
+    PostgreSQL, selected by ``conn.source_type``) and installs the read-only guard,
     so any introspection or connection test performed through it cannot write to
     the source (Property 1). The plaintext password is read from the
     :class:`SecretValue` only here, at connect time, and is never stored on the
@@ -538,8 +539,22 @@ def build_connect_page(
     def _eff(value: object, fallback: object) -> object:
         return value if value not in (None, "") else fallback
 
+    # Resolve the effective source engine up front (live config, else the restored
+    # snapshot's type, else MySQL) so the Port PREFILL uses the RIGHT default. Keying
+    # the fallback on MySQL's 3306 left a restored PostgreSQL session showing 3306 even
+    # though the PostgreSQL tile was selected -- and because the port field then reads
+    # `src_port or <engine default>` (src_port=3306 is truthy), the engine-aware default
+    # at the field never took over. This is the SAME resolution `_engine["type"]` uses.
+    _resolved_source_type = (
+        getattr(_sc, "source_type", None)
+        or getattr(state, "restored_source_type", None)
+        or SourceType.MYSQL
+    )
     src_host = _eff(getattr(_sc, "host", None), d.source_host or "")
-    src_port = _eff(getattr(_sc, "port", None), d.source_port or 3306)
+    src_port = _eff(
+        getattr(_sc, "port", None),
+        d.source_port or dialect_for(_resolved_source_type).default_port,
+    )
     src_database = _eff(getattr(_sc, "database", None), d.source_database)
     src_username = _eff(getattr(_sc, "username", None), d.source_username)
     tgt_endpoint = _eff(getattr(_tc, "cluster_endpoint", None), d.target_endpoint or "")

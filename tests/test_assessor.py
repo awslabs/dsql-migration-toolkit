@@ -1093,7 +1093,10 @@ def test_too_many_indexes_explains_the_post_load_failure_timing() -> None:
     # Names the real counts on both sides of the limit.
     assert "30 secondary indexes" in finding.risk
     assert "31" in finding.risk and "24" in finding.risk
-    assert "MySQL allows" in finding.risk
+    # Source-neutral: the shared rule is used for MySQL AND PostgreSQL, so it must not
+    # cite a MySQL-specific limit or the MySQL-only sys.schema_unused_indexes view.
+    assert "MySQL" not in finding.risk
+    assert "sys.schema_unused_indexes" not in finding.recommendation
     # The error the user would otherwise hit, and WHEN.
     assert "54000" in finding.risk
     assert "after the data loads" in finding.risk.lower() or "already written" in finding.risk.lower()
@@ -1183,7 +1186,8 @@ def test_wide_primary_key_is_unsupported_because_nothing_loads() -> None:
     assert finding.effort is EffortLevel.SIGNIFICANT
     assert "12 columns" in finding.risk
     assert "54011" in finding.risk  # the error the user would otherwise hit
-    assert "MySQL allows 16" in finding.risk
+    # Source-neutral (shared MySQL/PostgreSQL rule): no MySQL-specific comparison.
+    assert "MySQL" not in finding.risk
     assert "not transient" in finding.recommendation.lower()
 
 

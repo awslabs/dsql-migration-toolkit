@@ -329,6 +329,7 @@ def _render_cdc_step(
             refresh,
             locked=lob_locked,
             lock_reason=lob_lock_reason,
+            source_type=_cdc_source_type(session),
         )
 
     # 4. START: actually deploy the connectors (cloudformation update_stack) and
@@ -516,9 +517,11 @@ def _render_cdc_source_config_card(
 
     # The sink config (topics, keying, DLQ). DLQ name is the cdc-stack default --
     # NOT derived from a connector that may not exist yet (pre-deploy). Engine-neutral
-    # (the DSQL sink is the same for both source engines).
+    # (the DSQL sink is the same for both source engines); the deployed connector is
+    # named ``<stack>-dsql-sink``, so the preview uses "dsql-sink" (not "mysql-sink",
+    # which was wrong for BOTH engines and misleading on a PostgreSQL source).
     sink = CdcPipelineOrchestrator().build_sink_config(
-        "mysql-sink", tables_for_config, CDC_DEFAULT_DLQ_TOPIC
+        "dsql-sink", tables_for_config, CDC_DEFAULT_DLQ_TOPIC
     )
 
     # Build the deployable cdc-stack parameter set: tool-known values filled,
@@ -629,9 +632,10 @@ def _render_cdc_params_file(ui, params) -> None:
             "size=sm outline icon=content_copy"
         )
         ui.label(  # type: ignore[attr-defined]
-            "Note: the CDC start position (GTID / binlog) is NOT a parameter here "
-            "— it is seeded via the connect-offsets topic after deploy. See the "
-            "start point shown above."
+            "Note: the CDC start position (the source's replication coordinate — "
+            "MySQL binlog/GTID or PostgreSQL WAL LSN) is NOT a parameter here — it is "
+            "seeded via the connect-offsets topic after deploy. See the start point "
+            "shown above."
         ).classes("text-xs text-gray-500")
 
 def _sentinel_watermark() -> "Watermark":
@@ -1773,6 +1777,15 @@ def _render_cdc_start_button(
     resumes_from_offset = bool(
         getattr(migration_state, "cdc_has_committed_offset", False)
     )
+    # A PostgreSQL CDC-only migration (no Full Load, so no watermark and no gapless
+    # slot) is steered to Manual = fresh re-snapshot: that mode needs NO prior start
+    # point, so it is a valid ready state on its own. The start-point card already
+    # treats it as "Ready" (its gate includes `is_pg and mode == "manual"`), so the
+    # button MUST mirror that clause -- otherwise the card says Ready while the button
+    # stays disabled with "Set the CDC start point above first", and PG CDC-only can
+    # never be started.
+    is_pg = _cdc_source_type(session) is SourceType.POSTGRES
+    mode = migration_state.cdc_start_mode()
     ready = (
         resumes_from_offset
         or (override is not None and override.has_coordinates())
@@ -1786,6 +1799,7 @@ def _render_cdc_start_button(
             wm_resume is not None
             and (wm_resume.has_coordinates() or wm_resume.can_resume_from_lsn())
         )
+        or (is_pg and mode == "manual")
     )
     # A restart is a materially different operation from a first start -- it resumes an
     # existing position rather than establishing one -- so it must not be described with

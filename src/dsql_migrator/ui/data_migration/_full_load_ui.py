@@ -93,15 +93,27 @@ def _render_watermark(ui: object, job: MigrationJob) -> None:
             ui.label(display.summary).classes(  # type: ignore[attr-defined]
                 "text-xs text-gray-500 truncate"
             )
-        for label, value in (
-            ("Snapshot (UTC)", display.snapshot_timestamp),
-            ("Binlog file:pos", display.coordinate),
-            ("GTID set", display.gtid),
-            ("Server UUID", display.server_uuid),
-        ):
-            # An unavailable coordinate is normal (binary logging off, or SHOW MASTER
-            # STATUS restricted on RDS/Aurora), so it is muted -- not styled like a
-            # missing required value.
+        # A PostgreSQL source has a WAL LSN + replication slot + publication (no
+        # binlog/GTID/server-uuid), so show those rows instead of rendering the MySQL
+        # fields as "unavailable" and hiding the LSN the loader actually captured.
+        if display.is_postgres:
+            field_rows = (
+                ("Snapshot (UTC)", display.snapshot_timestamp),
+                ("WAL LSN", display.wal_lsn),
+                ("Replication slot", display.slot_name),
+                ("Publication", display.publication_name),
+            )
+        else:
+            field_rows = (
+                ("Snapshot (UTC)", display.snapshot_timestamp),
+                ("Binlog file:pos", display.coordinate),
+                ("GTID set", display.gtid),
+                ("Server UUID", display.server_uuid),
+            )
+        for label, value in field_rows:
+            # An unavailable coordinate is normal (binary logging off / SHOW MASTER
+            # STATUS restricted on RDS/Aurora for MySQL; a not-yet-created slot for PG),
+            # so it is muted -- not styled like a missing required value.
             unavailable = str(value).strip().lower() == _UNAVAILABLE
             with ui.row().classes("items-baseline gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
                 ui.label(label).classes(  # type: ignore[attr-defined]
@@ -1561,8 +1573,8 @@ def _render_full_load_progress(
             style="cursor:help">
             <q-tooltip class="text-body2" style="max-width:340px">
               Rows now on the target vs. the source row count recorded on the export
-              watermark. The source figure is a scan-free information_schema
-              ESTIMATE (InnoDB index sampling), so it is commonly off by a few
+              watermark. The source figure is a scan-free ESTIMATE from the source's
+              catalog statistics, so it is commonly off by a few
               percent and often UNDERCOUNTS — the target legitimately exceeding it is
               normal, not duplicated data. A finished table is 100% because the
               loader streamed it to exhaustion, not because the two numbers match.
@@ -1909,7 +1921,7 @@ def _render_completeness_banner(
             header="Full Load finished — counts differ from the pre-load estimate",
             body=(
                 "The pre-load row counts are approximate (scan-free "
-                "information_schema figures, not exact) and drift when rows change "
+                "catalog-statistics estimates, not exact) and drift when rows change "
                 "during the load: "
                 + "; ".join(notes)
                 + ". This is expected — run Validation (Step 4) for an exact "

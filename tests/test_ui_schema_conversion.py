@@ -468,6 +468,46 @@ def test_render_source_table_ddl_includes_pk_index_and_fk() -> None:
     assert "FOREIGN KEY (`customer_id`)" in ddl
 
 
+def test_render_source_table_ddl_postgres_uses_pg_syntax_not_mysql() -> None:
+    # For a PostgreSQL source, the "Source — PostgreSQL" pane must render PG syntax
+    # (double-quoted identifiers, exact PG types, CREATE INDEX not MySQL `KEY`, no
+    # backticks/AUTO_INCREMENT), matching its label + highlight.
+    from dsql_migrator.core.models import ColumnDef, IndexDef, TableDef
+
+    table = TableDef(
+        name="public.users",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="tags", mysql_type="text[]"),
+            ColumnDef(name="created", mysql_type="timestamp with time zone",
+                      default="now()"),
+        ],
+        primary_key=["id"],
+        indexes=[IndexDef(name="idx_created", columns=["created"], unique=False)],
+    )
+    ddl = render_source_table_ddl(table, source_type=SourceType.POSTGRES)
+    assert "`" not in ddl  # no MySQL backticks
+    assert 'CREATE TABLE "public"."users"' in ddl
+    assert '"tags" text[]' in ddl
+    assert "DEFAULT now()" in ddl
+    assert 'PRIMARY KEY ("id")' in ddl
+    assert 'CREATE INDEX "idx_created"' in ddl  # PG index, not `KEY`
+    assert "AUTO_INCREMENT" not in ddl
+
+
+def test_render_source_view_ddl_postgres_preserves_pg_syntax() -> None:
+    from dsql_migrator.ui.schema_conversion import render_source_view_ddl
+    from dsql_migrator.core.models import ViewDef
+
+    view = ViewDef(
+        name="public.active",
+        definition="CREATE VIEW public.active AS SELECT id FROM users WHERE name ILIKE 'a%'",
+    )
+    rendered = render_source_view_ddl(view, source_type=SourceType.POSTGRES)
+    assert "ILIKE" in rendered.upper()
+    assert "`" not in rendered
+
+
 def test_render_target_ddl_emits_async_index_and_post_load_foreign_key() -> None:
     conversion = _converted().tables[0]
     target = render_target_ddl(conversion)

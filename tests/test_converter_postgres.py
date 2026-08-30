@@ -186,6 +186,63 @@ def test_convert_table_warns_on_array_column_for_pg_source() -> None:
     assert not any(w.column_name == "id" for w in conv.warnings)
 
 
+def test_convert_table_warns_when_a_pg_default_is_dropped() -> None:
+    # v1 does not re-emit PG column DEFAULTs; dropping one silently would hide a
+    # post-cut-over INSERT change (Property 6), so a MANUAL warning must name it. A
+    # NOT NULL column escalates (an omitted INSERT is rejected on the target).
+    table = TableDef(
+        name="events",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="status", mysql_type="text", nullable=False, default="'new'"),
+        ],
+        primary_key=["id"],
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    default_warnings = [
+        w for w in conv.warnings
+        if w.column_name == "status" and "default" in w.message.lower()
+    ]
+    assert len(default_warnings) == 1
+    assert "NOT NULL" in default_warnings[0].message
+
+
+def test_convert_table_does_not_warn_on_a_serial_identity_default() -> None:
+    # A serial/identity default (nextval) is the identity mechanism, handled by the PK
+    # strategy + cut-over sequence sync -- skipped exactly like MySQL AUTO_INCREMENT.
+    table = TableDef(
+        name="seqs",
+        columns=[
+            ColumnDef(
+                name="id", mysql_type="bigint", nullable=False,
+                default="nextval('seqs_id_seq'::regclass)",
+            ),
+        ],
+        primary_key=["id"],
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert not any("default" in w.message.lower() for w in conv.warnings)
+
+
+def test_convert_view_reads_pg_dialect_for_a_pg_source() -> None:
+    # A PostgreSQL view must be parsed as PG, not MySQL -- otherwise PG-only syntax
+    # (ANY(ARRAY[...]), ILIKE, `::` casts) is mangled into fabricated SQL.
+    from dsql_migrator.core.models import ViewDef
+
+    view = ViewDef(
+        name="public.active",
+        definition=(
+            "CREATE VIEW public.active AS SELECT id FROM users "
+            "WHERE status = ANY(ARRAY[1, 2]) AND name ILIKE 'a%'"
+        ),
+    )
+    conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_view(view)
+    assert conv.auto_converted
+    # PG-only syntax survives (pretty-print may wrap whitespace, so check the tokens).
+    assert "ANY(" in conv.target_ddl and "ARRAY[1, 2]" in conv.target_ddl
+    assert "ILIKE" in conv.target_ddl.upper()
+
+
 def test_clamp_pg_numeric_reduces_over_precision_and_scale() -> None:
     # Aurora DSQL caps numeric at precision 38 / scale 37. A PG numeric beyond that must be
     # clamped (with a warning) -- otherwise the verbatim numeric(40,10) is REJECTED by DSQL

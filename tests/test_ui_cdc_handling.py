@@ -71,6 +71,35 @@ def test_lob_exclusion_candidates_flags_only_oversized_lob_columns() -> None:
     assert candidates[0].columns == ("preferences", "avatar")
 
 
+def test_lob_exclusion_candidates_flags_pg_text_and_bytea() -> None:
+    # For a PostgreSQL source, column types are PG names (text/bytea), which the MySQL
+    # LOB set never matched -- so a PG source offered NO exclusions and the panel
+    # falsely reported none. The PG set must flag unbounded text/bytea (not a bounded
+    # varchar, not the PK).
+    from dsql_migrator.core.models import SourceType
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="public.docs",
+                columns=[
+                    ColumnDef(name="id", mysql_type="bigint"),
+                    ColumnDef(name="body", mysql_type="text"),
+                    ColumnDef(name="blob", mysql_type="bytea"),
+                    ColumnDef(name="title", mysql_type="character varying(200)"),
+                ],
+                primary_key=["id"],
+            ),
+        ]
+    )
+    # MySQL set finds nothing (PG type names don't match).
+    assert lob_exclusion_candidates(inventory) == []
+    # PG set flags text + bytea, not the bounded varchar.
+    pg = lob_exclusion_candidates(inventory, source_type=SourceType.POSTGRES)
+    assert len(pg) == 1
+    assert pg[0].columns == ("body", "blob")
+
+
 def test_lob_exclusion_candidates_never_offers_pk_columns() -> None:
     inventory = SourceInventory(
         tables=[

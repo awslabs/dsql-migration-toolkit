@@ -1110,16 +1110,17 @@ def cutover_ai_facts(
         )
     if identity_sync_failed:
         lines.append(
-            "Identity-sync (AUTO_INCREMENT -> sequence): the LAST run FAILED; "
-            "sequences may not be advanced past MAX(pk) -- the first repointed insert "
-            "risks a 23505 duplicate-key collision."
+            "Identity-sync (source auto-increment / identity -> DSQL sequence): the "
+            "LAST run FAILED; sequences may not be advanced past MAX(pk) -- the first "
+            "repointed insert risks a 23505 duplicate-key collision."
         )
     elif identity_sync_result:
         _synced = int(
             (identity_sync_result or {}).get("synced_tables", 0) or 0
         )
         lines.append(
-            f"Identity-sync (AUTO_INCREMENT -> sequence): succeeded on {_synced} "
+            f"Identity-sync (source auto-increment / identity -> DSQL sequence): "
+            f"succeeded on {_synced} "
             "table(s). Confirm this ran AFTER the final validation, or a late source "
             "insert can leave the target sequence behind."
         )
@@ -4655,8 +4656,9 @@ def _validation_run_facts(summary: ValidationSummary, drift: DriftDisplay) -> st
     if drift.available:
         if not drift.determinable:
             lines.append(
-                "Source changes since snapshot: undeterminable (no GTID or binlog "
-                "position to compare)."
+                "Source changes since snapshot: undeterminable (no comparable "
+                "replication coordinate — a MySQL GTID/binlog position or a "
+                "PostgreSQL WAL LSN — to compare)."
             )
         else:
             lines.append(
@@ -5040,10 +5042,10 @@ def drift_verdict(
         return (
             "info",
             "Could not tell whether the source changed",
-            "The source reported neither a GTID nor a comparable binlog position, so "
-            "this run cannot tell whether the source changed after the snapshot. "
-            "Freeze source writes and re-validate for a definitive pre-cut-over "
-            "check.",
+            "The source did not report a comparable replication coordinate (a MySQL "
+            "GTID/binlog position or a PostgreSQL WAL LSN), so this run cannot tell "
+            "whether the source changed after the snapshot. Freeze source writes and "
+            "re-validate for a definitive pre-cut-over check.",
         )
     if not drift.drifted:
         return (
@@ -5108,11 +5110,15 @@ def _render_drift(ui: object, drift: DriftDisplay, *, cdc_in_use: bool = False) 
                 {"field": "Now", "value": drift.current_gtid},
             ]
         else:
+            # Undeterminable (no comparable coordinate). A PostgreSQL source always
+            # lands here (drift-by-WAL-LSN is not computed), so listing four
+            # "unavailable" MySQL GTID/binlog rows is misleading noise -- show a single
+            # source-neutral row instead.
             rows = [
-                {"field": "GTID at snapshot", "value": drift.watermark_gtid},
-                {"field": "GTID now", "value": drift.current_gtid},
-                {"field": "Binlog at snapshot", "value": drift.watermark_binlog},
-                {"field": "Binlog now", "value": drift.current_binlog},
+                {
+                    "field": "Compared using",
+                    "value": "No comparable replication coordinate was available",
+                },
             ]
         rows.append({"field": "Detail", "value": drift.detail})
         ui.table(columns=columns, rows=rows).classes("w-full")  # type: ignore[attr-defined]

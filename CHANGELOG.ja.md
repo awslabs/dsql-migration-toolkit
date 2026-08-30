@@ -5,6 +5,35 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.418
+
+### 修正 (Fixed)
+
+- **PostgreSQL ソース整合性の総点検 — ソースが PostgreSQL のときにまだ MySQL のように
+  動作/表示していた 14 か所を修正しました。** リポジトリ全体の監査の結果、データ経路は
+  既にエンジン別に分岐していましたが、UI テキスト・ガイダンス・一部の挙動が MySQL 専用のまま
+  でした。主な内容:
+  - **機能バグ 2 件:** (1) PostgreSQL の列 **DEFAULT** が変換 DDL から警告なく落ちていた →
+    落ちる既定値ごとに MANUAL 変換警告（serial/identity の `nextval` は MySQL の
+    `AUTO_INCREMENT` と同様にスキップ); (2) **PostgreSQL 単独 CDC**（Manual 再スナップショット）が
+    開始できなかった（カードは "Ready" でも Start CDC ボタンが無効）→ ボタンがカードの PG ゲートを反映。
+  - **Schema Conversion のソースパネル**が PostgreSQL ソースを PG 構文（二重引用符の識別子、正確な
+    PG 型、`CREATE INDEX`、`AUTO_INCREMENT` なし）で描画し、PG **ビュー**を MySQL で崩さず PostgreSQL
+    方言でパース/整形; CDC の**スキーマドリフト "Fix target schema…（ADD COLUMN）"** リカバリが
+    PG 列を読み PG 型をマッピング（従来はエラー）。
+  - **Full Load のウォーターマークパネル**が PG ソースで binlog/GTID を "unavailable" と表示する
+    代わりに、取得した **WAL LSN**/レプリケーションスロット/パブリケーションを表示; 統合前提チェック
+    パネルが PG の CDC 専用チェック（wal_level、replica identity など）を "Full Load: Blocked" と
+    誤表示しない。
+  - **Evaluation:** 複数**スキーマ**の PostgreSQL ソースを MySQL 統合ガイダンス付きで
+    「N 個のデータベースにまたがる」と表示しない（DSQL はスキーマをサポートし、ツールが自動移行）;
+    エクスポートした HTML レポートのタイトルが実際のソースエンジン基準; 共有のインデックス/キー上限
+    ルールが MySQL の 64/16 上限や `sys.schema_unused_indexes` を挙げない。
+  - **テキスト/ガイダンス:** 特大 LOB 除外が PostgreSQL の `text`/`bytea` も検出（MySQL の LOB 型
+    だけでなく）; 検証のドリフト判定、CDC/パラメータ/シンクのプレビュー、復元された PG セッションの
+    Connect ポート既定値、各種ツールチップ/文言がエンジン認識型またはエンジン中立型に。
+    （AI DBA のプロンプトは v0.1.415 で既にソース認識型。）
+
 ## v0.1.417
 
 ### 変更 (Changed)

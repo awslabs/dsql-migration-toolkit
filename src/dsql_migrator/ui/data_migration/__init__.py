@@ -1046,6 +1046,11 @@ def build_data_migration_screen(
                     lock_reason=None,
                     migration_wide=True,
                     selected_tables=selected_names,
+                    source_type=getattr(
+                        getattr(session, "source_config", None),
+                        "source_type",
+                        SourceType.MYSQL,
+                    ),
                 )
             # A Full Load that already ran (live job, or the step reached DONE --
             # both survive a session restore) is proof its prerequisites passed at
@@ -3064,15 +3069,24 @@ def _connector_failure_detail(migration_state, view, name: str) -> str:
     return "; ".join(parts)
 
 
-# Checks that only CDC requires (binlog/GTID/MSK). Everything else is common to
-# Full Load and CDC. Used to tag each result row with the phase that needs it so
-# the combined "Full load + CDC" panel shows it covers both (the CDC run is a
-# superset of the Full Load checks -- see core.prerequisites).
+# Checks that only CDC requires (MySQL binlog/GTID, PostgreSQL WAL/replication, MSK).
+# Everything else is common to Full Load and CDC. Used to tag each result row with the
+# phase that needs it so the combined "Full load + CDC" panel shows it covers both (the
+# CDC run is a superset of the Full Load checks -- see core.prerequisites). The
+# PostgreSQL CDC-only ids (WAL_LEVEL_LOGICAL / REPLICATION_ROLE / REPLICATION_SLOTS /
+# SOURCE_IS_WRITER / REPLICA_IDENTITY) MUST be listed too: omitting them made a PG
+# source's CDC-only failures (e.g. wal_level=replica, the RDS default) read as
+# "Full Load: Blocked" on the combined panel, though Full Load does not need them.
 _CDC_ONLY_CHECK_IDS = frozenset(
     {
         PrerequisiteCheckId.BINLOG_ROW_FORMAT,
         PrerequisiteCheckId.BINLOG_RETENTION,
         PrerequisiteCheckId.GTID_MODE,
+        PrerequisiteCheckId.WAL_LEVEL_LOGICAL,
+        PrerequisiteCheckId.REPLICATION_ROLE,
+        PrerequisiteCheckId.REPLICATION_SLOTS,
+        PrerequisiteCheckId.SOURCE_IS_WRITER,
+        PrerequisiteCheckId.REPLICA_IDENTITY,
         PrerequisiteCheckId.MSK_AVAILABLE,
         PrerequisiteCheckId.MSK_CONNECT_AVAILABLE,
     }

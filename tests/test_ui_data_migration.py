@@ -394,6 +394,25 @@ def test_format_binlog_coordinate_file_only() -> None:
     assert format_binlog_coordinate(watermark) == "mysql-bin.000999"
 
 
+def test_format_watermark_postgres_shows_wal_lsn_not_binlog() -> None:
+    # A PostgreSQL watermark carries a WAL LSN + slot + publication (no binlog/GTID).
+    # The panel must show those and summarize by LSN, instead of rendering the MySQL
+    # fields as "unavailable" and hiding the coordinate the loader actually captured.
+    watermark = Watermark(
+        wal_lsn="0/1A2B3C4",
+        slot_name="dsql_mig_slot",
+        publication_name="dsql_mig_pub",
+        snapshot_timestamp=datetime(2026, 5, 6, 7, 8, 9, tzinfo=timezone.utc),
+    )
+    display = format_watermark(watermark)
+    assert display.is_postgres is True
+    assert display.wal_lsn == "0/1A2B3C4"
+    assert display.slot_name == "dsql_mig_slot"
+    assert display.publication_name == "dsql_mig_pub"
+    assert "WAL LSN 0/1A2B3C4" in display.summary
+    assert "binlog" not in display.summary.lower()
+
+
 # ---------------------------------------------------------------------------
 # Reference BatchedTableMigrator (export stream -> batched import) with fakes
 # ---------------------------------------------------------------------------

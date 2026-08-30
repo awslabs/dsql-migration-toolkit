@@ -21,7 +21,7 @@ from collections.abc import Sequence
 from typing import Optional
 
 from dsql_migrator.core.activity_log import ActivityStatus
-from dsql_migrator.core.models import LoadStatusView, SourceInventory
+from dsql_migrator.core.models import LoadStatusView, SourceInventory, SourceType
 from dsql_migrator.ui.data_migration._cdc_state import (
     _CDC_POLL_INTERVAL_SECONDS,
     _cdc_is_streaming,
@@ -1075,7 +1075,9 @@ async def _open_add_column_dialog(ui, session, table: str, on_refresh=None) -> N
         )
         raw = engine.raw_connection()
         try:
-            source_columns = read_source_columns(raw, table)
+            source_columns = read_source_columns(
+                raw, table, source_type=source_config.source_type
+            )
         finally:
             raw.close()
         if not source_columns:
@@ -1094,7 +1096,10 @@ async def _open_add_column_dialog(ui, session, table: str, on_refresh=None) -> N
             target_columns = read_target_columns(target, table)
         finally:
             target.close()
-        return plan_add_columns(table, source_columns, target_columns)
+        return plan_add_columns(
+            table, source_columns, target_columns,
+            source_type=source_config.source_type,
+        )
 
     try:
         plan = await run.io_bound(_build_plan)
@@ -1695,6 +1700,7 @@ def _render_cdc_lob_exclusion_panel(
     lock_reason: Optional[str] = None,
     migration_wide: bool = False,
     selected_tables: Optional[Sequence[str]] = None,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> None:
     """Render the explicit, opt-in oversized-LOB column exclusion (H13).
 
@@ -1724,7 +1730,7 @@ def _render_cdc_lob_exclusion_panel(
     # schema's LOB columns, even though ``migration_state.selection`` is still the
     # empty "= all" default until the picker is touched (see scope_lob_candidates).
     candidates = scope_lob_candidates(
-        lob_exclusion_candidates(inventory),
+        lob_exclusion_candidates(inventory, source_type=source_type),
         selected_tables=selected_tables,
         stored_selection=migration_state.selection.selected_tables,
     )
@@ -1750,9 +1756,14 @@ def _render_cdc_lob_exclusion_panel(
             ui.label("Oversized LOB columns (optional exclusion)").classes(  # type: ignore[attr-defined]
                 "text-sm font-semibold"
             )
+        lob_noun = (
+            "large text/bytea columns"
+            if source_type is SourceType.POSTGRES
+            else "MySQL LOB/TEXT columns"
+        )
         if migration_wide:
             ui.label(  # type: ignore[attr-defined]
-                "These MySQL LOB/TEXT columns can hold values over the Aurora DSQL "
+                f"These {lob_noun} can hold values over the Aurora DSQL "
                 f"{_DSQL_VALUE_LIMIT_MIB} MiB limit. Ticking one drops it from this "
                 "migration entirely — the Full Load never writes it and (if CDC is "
                 "used) capture excludes it too, so the two stay in lockstep. Leave a "
@@ -1762,7 +1773,7 @@ def _render_cdc_lob_exclusion_panel(
             ).classes("text-xs text-gray-500")
         else:
             ui.label(  # type: ignore[attr-defined]
-                "These MySQL LOB/TEXT columns can hold values over the Aurora DSQL "
+                f"These {lob_noun} can hold values over the Aurora DSQL "
                 f"{_DSQL_VALUE_LIMIT_MIB} MiB limit. A value over the "
                 f"{_BROKER_MESSAGE_LIMIT_MIB} MiB broker limit can't be streamed at "
                 "all, so exclude such columns here to keep CDC from stalling. "

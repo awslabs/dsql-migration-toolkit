@@ -195,9 +195,12 @@ AI_TOOL_SCHEMAS: list[dict] = [
         "description": (
             "Get the latest prerequisite-check verdicts for Full Load and/or CDC — each "
             "check's status (PASS/FAIL/WARN/INFO/SKIP), whether it is required, and its "
-            "detail + remediation (e.g. binlog row format, GTID, MSK / MSK Connect "
-            "availability, target IAM auth, source reachability, replication grants, "
-            "primary keys). Plus can_proceed (blocked only by a required FAIL). Use it "
+            "detail + remediation. The checks depend on the SOURCE engine: MySQL CDC "
+            "needs binlog ROW format / GTID; PostgreSQL CDC needs wal_level=logical, a "
+            "replication role/slots, and REPLICA IDENTITY. Common checks: MSK / MSK "
+            "Connect availability, target IAM auth, source reachability, replication "
+            "grants, primary keys. Plus can_proceed (blocked only by a required FAIL). "
+            "Use it "
             "to explain WHY a mode cannot start and exactly how to fix it. Cached from "
             "the last checks the operator ran (empty if none run yet). Verdicts + "
             "English remediation only, never credentials."
@@ -352,7 +355,7 @@ def build_ai_tool_executor(
                 _res = SchemaConverter(source_type=_stype).convert(_inv, SchemaConvertOptions())
                 _pv = generate_previews(
                     [f"{TABLE_PREFIX}{_obj}", f"{VIEW_PREFIX}{_obj}"],
-                    _inv, _res, existence_checker=None,
+                    _inv, _res, existence_checker=None, source_type=_stype,
                 )
                 _p = next((p for p in _pv if p.object_name == _obj), None)
                 if _p is None:

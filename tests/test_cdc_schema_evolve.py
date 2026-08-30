@@ -111,6 +111,42 @@ def test_plan_ddl_text_is_one_statement_per_line() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# PostgreSQL source: near-identity mapping (no MySQL remap), so ADD COLUMN
+# recovery works on a PG source instead of erroring through map_mysql_type.
+# --------------------------------------------------------------------------- #
+def test_plan_postgres_emits_pg_types_verbatim() -> None:
+    from dsql_migrator.core.models import SourceType
+
+    plan = plan_add_columns(
+        "public.users",
+        [("id", "bigint"), ("tags", "text"), ("created", "timestamp with time zone")],
+        ["id"],
+        source_type=SourceType.POSTGRES,
+    )
+    # The PG types are emitted as-is (no MySQL->DSQL remap); ordinal order preserved.
+    assert [(s.column, s.target_type) for s in plan.steps] == [
+        ("tags", "text"),
+        ("created", "timestamp with time zone"),
+    ]
+    assert plan.skipped == ()
+
+
+def test_plan_postgres_skips_a_dsql_unsupported_type() -> None:
+    from dsql_migrator.core.models import SourceType
+
+    # A PG array/geometric/etc. type DSQL cannot store as a column is skipped, not
+    # approximated (mirrors the converter's PG table path).
+    plan = plan_add_columns(
+        "public.t",
+        [("ok", "integer"), ("labels", "text[]")],
+        [],
+        source_type=SourceType.POSTGRES,
+    )
+    assert [s.column for s in plan.steps] == ["ok"]
+    assert [s.column for s in plan.skipped] == ["labels"]
+
+
+# --------------------------------------------------------------------------- #
 # applier
 # --------------------------------------------------------------------------- #
 class _FakeCursor:

@@ -1160,6 +1160,14 @@ class WatermarkDisplay:
     snapshot_timestamp: str
     summary: str
     table_row_counts: dict[str, int]
+    # PostgreSQL-source coordinates (empty for a MySQL source). A PG watermark has a
+    # WAL LSN + replication slot + publication instead of binlog/GTID/server-uuid, so
+    # the panel must show these rather than rendering the MySQL fields as "unavailable"
+    # and hiding the LSN the loader actually captured.
+    wal_lsn: str = _UNAVAILABLE
+    slot_name: str = _UNAVAILABLE
+    publication_name: str = _UNAVAILABLE
+    is_postgres: bool = False
 
 
 def format_binlog_coordinate(watermark: Watermark) -> str:
@@ -1174,14 +1182,37 @@ def format_binlog_coordinate(watermark: Watermark) -> str:
 def format_watermark(watermark: Watermark) -> WatermarkDisplay:
     """Format a :class:`Watermark` for display (Requirement 8.5 / Property 11).
 
-    Produces the design's one-line summary ("exported as of
-    mysql-bin.000123:45678 (GTID ...), snapshot <ts>") plus the individual
-    fields, so the user can see exactly which consistency point the data was
-    exported as-of.
+    Source-agnostic: a MySQL watermark yields the binlog ``file:position`` (+ GTID)
+    one-line summary; a PostgreSQL watermark (a WAL LSN + slot + publication, no
+    binlog/GTID) yields a "WAL LSN <lsn>" summary and populates the PG fields, so the
+    panel shows the coordinate the loader actually captured instead of rendering every
+    MySQL field as "unavailable".
     """
-    coordinate = format_binlog_coordinate(watermark)
     snapshot_timestamp = watermark.snapshot_timestamp.isoformat()
+    is_postgres = bool(watermark.wal_lsn)
 
+    if is_postgres:
+        coordinate = watermark.wal_lsn or _UNAVAILABLE
+        coordinate_part = (
+            f"WAL LSN {coordinate}"
+            if coordinate != _UNAVAILABLE
+            else "an unavailable WAL LSN"
+        )
+        summary = f"Exported as of {coordinate_part}, snapshot {snapshot_timestamp}"
+        return WatermarkDisplay(
+            coordinate=coordinate,
+            gtid=_UNAVAILABLE,
+            server_uuid=_UNAVAILABLE,
+            snapshot_timestamp=snapshot_timestamp,
+            summary=summary,
+            table_row_counts=dict(watermark.table_row_counts),
+            wal_lsn=coordinate,
+            slot_name=watermark.slot_name or _UNAVAILABLE,
+            publication_name=watermark.publication_name or _UNAVAILABLE,
+            is_postgres=True,
+        )
+
+    coordinate = format_binlog_coordinate(watermark)
     coordinate_part = (
         coordinate
         if coordinate != _UNAVAILABLE
@@ -1234,25 +1265,42 @@ class LobExclusionCandidate:
     columns: tuple[str, ...]
 
 
+# PostgreSQL base types whose values can exceed the DSQL 1 MiB per-value limit:
+# unbounded ``text`` and ``bytea`` (a length-bounded varchar(n) with small n cannot,
+# and json/jsonb are stored differently and are not hit by the text 1 MiB cap the same
+# way). The MySQL set (_OVERSIZED_LOB_BASES) does not match PG type names, so a PG
+# source would otherwise offer NO exclusions and the panel would falsely report none.
+_PG_OVERSIZED_LOB_BASES = frozenset({"text", "bytea"})
+
+
 def lob_exclusion_candidates(
     inventory: Optional[SourceInventory],
+    *,
+    source_type: SourceType = SourceType.MYSQL,
 ) -> list[LobExclusionCandidate]:
     """Return the oversized-LOB columns per table, sorted by table name.
 
-    Pure: derived directly from the source inventory's column types (the same
-    base-type set the evaluation ``OVERSIZED_LOB`` rule uses), so the CDC screen
-    can offer exclusion without re-running evaluation. Primary-key columns are
-    never offered (a PK can't be dropped); returns ``[]`` when nothing qualifies.
+    Pure: derived directly from the source inventory's column types, so the CDC
+    screen can offer exclusion without re-running evaluation. The base-type set is
+    chosen by ``source_type`` -- MySQL ``mediumtext/longtext/mediumblob/longblob`` vs
+    PostgreSQL ``text/bytea`` -- because ``column.mysql_type`` holds the SOURCE engine's
+    type name (matching a MySQL set against PG types found nothing). Primary-key columns
+    are never offered (a PK can't be dropped); returns ``[]`` when nothing qualifies.
     """
     if inventory is None:
         return []
+    bases = (
+        _PG_OVERSIZED_LOB_BASES
+        if source_type is SourceType.POSTGRES
+        else _OVERSIZED_LOB_BASES
+    )
     candidates: list[LobExclusionCandidate] = []
     for table in inventory.tables:
         pk = set(table.primary_key)
         columns = tuple(
             column.name
             for column in table.columns
-            if _base_type(column.mysql_type) in _OVERSIZED_LOB_BASES
+            if _base_type(column.mysql_type) in bases
             and column.name not in pk
         )
         if columns:
@@ -1872,12 +1920,12 @@ _MIGRATION_TYPE_META: dict[MigrationType, _MigrationTypeMeta] = {
         blurb=(
             "Continuous CDC via the optional managed pipeline: check Prerequisites, "
             "then review the CDC setup. Stand-alone (no Full Load in this session) -- "
-            "start from a prior watermark or an external GTID."
+            "start from a prior watermark or an external start position."
         ),
         when="Choose to resume/attach streaming to an already-loaded target.",
         requirements=(
-            "Needs a managed MSK pipeline and the source MySQL binlog enabled in "
-            "ROW mode."
+            "Needs a managed MSK pipeline and source change-data-capture enabled "
+            "(MySQL binlog in ROW mode, or PostgreSQL logical replication)."
         ),
     ),
     MigrationType.FULL_LOAD_AND_CDC: _MigrationTypeMeta(
