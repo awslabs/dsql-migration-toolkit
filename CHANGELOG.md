@@ -5,6 +5,16 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.422
+
+### Changed
+
+- **Lowered the CDC infrastructure-deploy time estimate** shown on the CDC pipeline
+  progress. The `stack_create` (MSK Serverless) stage hint was 9 min, but live deploys
+  now finish the whole infra create in ~2–5 min (CREATE_COMPLETE observed at ~2 min), so
+  the per-stage hint over-reported the wait. Lowered to ~5 min; it remains a ballpark, so
+  a slower AWS run simply overruns the hint rather than misleads.
+
 ## v0.1.421
 
 ### Fixed

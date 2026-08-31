@@ -173,11 +173,11 @@ _CDC_STAGE_ETA_SECONDS = {
         "check_existing": 5,
         "validate_params": 2,
         "create_stack": 10,
-        # MSK Serverless provisioning dominates. Lowered from 18 min after repeated
-        # live runs finished the whole infra create in ~10 min (the per-stage hints
-        # and the total ETA now match the ~10-15 min the deploy dialog states); it is
-        # a ballpark, so a slower AWS run simply overruns the hint rather than misleads.
-        "stack_create": 9 * 60,
+        # MSK Serverless provisioning dominates. Lowered again (was 9 min) after live
+        # runs finished the whole infra create in ~2-5 min (CREATE_COMPLETE observed at
+        # ~2 min); the hint now tracks the typical wait instead of over-reporting it. It
+        # is a ballpark, so a slower AWS run simply overruns the hint rather than misleads.
+        "stack_create": 5 * 60,
         "infra_ready": 2,
     },
     "start": {
