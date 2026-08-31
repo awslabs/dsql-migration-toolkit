@@ -21,6 +21,21 @@ All notable changes to this project are recorded here. This project follows
   `migration_type == FULL_LOAD_AND_CDC`) now forces FK deferral for **every** CDC
   migration, so foreign keys are created only at cut over after the stream drains.
 
+## v0.1.427
+
+### Fixed
+
+- **Full Load Reload / Retry is no longer clickable after a session restore with no live
+  connection.** These actions re-read the source and write the target, so they need a
+  live, verified connection — specifically the in-memory source password, which is never
+  restored (Property 7). The gate keyed on `has_source()`/`has_target()` (config present),
+  but since v0.1.414 a restore re-hydrates the source config (so `has_source()` is True)
+  while leaving it **unverified with no password** — so the gate stopped firing and the
+  per-table **Reload** button was never gated at all. A click then just failed at connect.
+  Both the recovery buttons and the per-table Reload now gate on the **verified** state
+  (`connection_ready()` — tested live this session), showing a "reconnect first" hint
+  until the source and target are re-verified on the Connect step.
+
 ## v0.1.426
 
 ### Fixed

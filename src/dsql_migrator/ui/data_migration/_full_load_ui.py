@@ -733,6 +733,11 @@ def _render_full_load_step(
             rows,
             reload_table=reload_table,
             reload_confirm=_open_reload_confirm,
+            # Reload/Retry need a LIVE source+target (the source password is not restored
+            # after a session restore, Property 7). connection_ready() reflects "verified
+            # this session" -- unlike has_source(), which is True whenever the config is
+            # merely present (now the case after the v0.1.414 source-endpoint restore).
+            connections_ready=session.connection_ready(),
             quarantine_only=_incomplete_is_quarantine_only(
                 current, migration_state.error_log
             ),
@@ -947,15 +952,17 @@ def _render_full_load_step(
             # as escape. ``unsettled`` resumes exactly the unfinished tables.
             failed = unsettled_table_names(job)
             if failed:
-                # Recovery needs a live source AND target. After an app restart the
-                # connections (and the in-memory source password) are NOT restored
-                # (Property 7), so both recovery actions would silently no-op. Tell
-                # the user exactly why and disable the buttons instead of letting a
-                # click do nothing.
+                # Recovery needs a live, VERIFIED source AND target. After a session
+                # restore the connections (and the in-memory source password) are NOT
+                # restored (Property 7), so both recovery actions would just fail at
+                # connect. Gate on the VERIFIED flags, not has_source()/has_target():
+                # since v0.1.414 the restore re-hydrates the source config (so
+                # has_source() is True) but leaves it UNVERIFIED with no password, which
+                # made this gate stop firing. Verified == tested live this session.
                 missing: list[str] = []
-                if not session.has_source():
+                if not session.source_verified:
                     missing.append("source")
-                if not session.has_target():
+                if not session.target_verified:
                     missing.append("target")
                 connections_missing = bool(missing)
                 if connections_missing:
@@ -1398,6 +1405,7 @@ def _render_full_load_progress(
     *,
     reload_table=None,
     reload_confirm=None,
+    connections_ready: bool = True,
     # The accept-the-gap action moved OUT of this function: it now renders after the
     # completeness banner (see _render_accept_quarantine_action), so the button that
     # carries out the banner's remedy sits directly beneath the verdict rather than
@@ -1707,6 +1715,20 @@ def _render_full_load_progress(
 
     def _quar_reload(table_name: str):
         def _btn() -> None:
+            # Reload re-reads from the source and writes to the target, so it needs a
+            # LIVE, verified connection -- specifically the in-memory source password,
+            # which is NOT restored after a session restore (Property 7). Post-restore
+            # the config is re-hydrated (so has_source() is True) but unverified with no
+            # password, so a click would just fail at connect. Disable it with a
+            # reconnect hint until both connections are re-verified this session.
+            if not connections_ready:
+                ui.button("Reload").props(
+                    "flat dense no-caps size=sm color=primary icon=replay disable"
+                ).tooltip(
+                    "Reconnect first: re-verify the source and target on the Connect "
+                    "step (credentials are not restored after a restart), then Reload."
+                )
+                return
             if reload_confirm is not None and terminal:
                 ui.button(
                     "Reload",

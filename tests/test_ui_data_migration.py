@@ -13838,6 +13838,75 @@ def test_every_dropped_row_is_listed_not_one_per_table() -> None:
     assert "3 rows dropped" in ui.badges
 
 
+def test_quarantine_reload_is_gated_on_a_verified_connection() -> None:
+    # Reported: after a session restore the connection is disconnected (unverified, no
+    # source password -- Property 7), yet the per-table Reload was clickable and would
+    # just fail at connect. Reload must be DISABLED with a reconnect hint until the
+    # connection is verified live this session (connections_ready), and enabled otherwise.
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import (
+        _render_full_load_progress,
+        build_full_load_table_rows,
+    )
+
+    class _BtnUi:
+        def __init__(self):
+            self.buttons: list[tuple[str, str, str]] = []  # (text, props, tooltip)
+
+        class _El:
+            def __init__(self, ui, kind, text=""):
+                self._ui, self._kind, self._text = ui, kind, text
+                self._props = ""
+            def __enter__(self): return self
+            def __exit__(self, *e): return False
+            def props(self, spec="", *a, **k):
+                if self._kind == "button":
+                    self._props = str(spec)
+                return self
+            def tooltip(self, text="", *a, **k):
+                if self._kind == "button":
+                    self._ui.buttons.append((self._text, self._props, str(text)))
+                return self
+            def __getattr__(self, _n): return lambda *a, **k: self
+
+        def button(self, text="", *a, **k):
+            return _BtnUi._El(self, "button", str(text))
+        def __getattr__(self, _n):
+            return lambda *a, **k: _BtnUi._El(self, "other")
+
+    def _job():
+        j = MigrationJob(job_id="j1"); j.status = "FAILED"; j.progress_pct = 100.0
+        j.chunks = [ChunkState(chunk_id="ecommerce.product_media", status="DONE",
+                               rows_loaded=12, rows_quarantined=3, attempts=1)]
+        return j
+
+    records = [("ecommerce.product_media",
+                f"quarantined row pk[id={pk}]: datatype limit greater than 1048576 bytes")
+               for pk in (3,)]
+
+    # Disconnected (post-restore): Reload rendered but DISABLED + reconnect hint.
+    ui = _BtnUi()
+    _render_full_load_progress(
+        ui, _job(), build_full_load_table_rows(_job(), None, {"ecommerce.product_media": records[-1][1]}),
+        reload_confirm=lambda *_a, **_k: None, quarantine_only=True,
+        quarantine_records=records, connections_ready=False,
+    )
+    reload_btns = [b for b in ui.buttons if b[0] == "Reload"]
+    assert reload_btns, "a Reload affordance must still be shown"
+    assert all("disable" in b[1] for b in reload_btns)
+    assert any("Reconnect" in b[2] for b in reload_btns)
+
+    # Verified live this session: Reload enabled (no disable prop).
+    ui2 = _BtnUi()
+    _render_full_load_progress(
+        ui2, _job(), build_full_load_table_rows(_job(), None, {"ecommerce.product_media": records[-1][1]}),
+        reload_confirm=lambda *_a, **_k: None, quarantine_only=True,
+        quarantine_records=records, connections_ready=True,
+    )
+    reload_btns2 = [b for b in ui2.buttons if b[0] == "Reload"]
+    assert reload_btns2 and all("disable" not in b[1] for b in reload_btns2)
+
+
 def test_quarantine_detail_falls_back_to_per_table_without_records() -> None:
     # A caller that passes no records (older call site, or a restored session whose
     # in-memory log is gone) still gets the per-table view -- one entry beats none, and
