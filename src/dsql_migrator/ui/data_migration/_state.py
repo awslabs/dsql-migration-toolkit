@@ -296,6 +296,12 @@ class DataMigrationState:
         self.cdc_stack_phase: Optional[str] = None
         self.cdc_stack_phase_status: Optional[str] = None
         self.cdc_stack_phase_checked: bool = False
+        # The credential-free reason the last CDC-state probe (describe_stacks) FAILED,
+        # or None. Set when the read-only AWS check throws (bad creds/permissions/region
+        # /throttle) so the "state not determined" notice can name the real cause and
+        # offer a re-check, instead of always blaming a session restore and leaving the
+        # user stuck. Cleared by a successful probe (``set_cdc_stack_phase``).
+        self.cdc_probe_error: Optional[str] = None
         # True when the probed cdc-stack has ALREADY streamed, so its resume offset is
         # committed to the (Stop-surviving, fixed-name) offsets topic and Start CDC needs
         # NO watermark -- streaming resumes where it stopped. See
@@ -591,6 +597,16 @@ class DataMigrationState:
             self.cdc_stack_phase = phase
             self.cdc_stack_phase_status = status
             self.cdc_stack_phase_checked = True
+            self.cdc_probe_error = None  # a successful probe clears any prior failure
+
+    def set_cdc_probe_error(self, message: Optional[str]) -> None:
+        """Record why the read-only CDC-state probe failed (or clear it with None).
+
+        Leaves ``cdc_stack_phase_checked`` False so the card stays "undetermined", but
+        now with a real, actionable cause the notice can show + a re-check affordance.
+        """
+        with self._lock:
+            self.cdc_probe_error = str(message)[:300] if message else None
 
     def set_cdc_has_committed_offset(self, value: bool) -> None:
         """Cache whether the probed cdc-stack already holds a committed resume offset.

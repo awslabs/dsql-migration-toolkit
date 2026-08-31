@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.421
+
+### Fixed
+
+- **CDC step: a failed CDC-state probe no longer leaves you silently stuck on "CDC
+  state not determined yet".** The read-only `describe_stacks` probe that reads the live
+  CDC state re-raises on an unexpected AWS error (expired/insufficient credentials,
+  missing `cloudformation:DescribeStacks`, wrong region, throttle), but the caller
+  swallowed it — so the card stayed "undetermined" with a misleading "session was
+  restored" message, no Deploy/Start action, and re-verifying the target just re-ran the
+  same failing probe. The probe now records and logs the failure; the notice names the
+  real cause (probe **failed** vs. genuinely **not run yet**) and shows the AWS error;
+  and a **"Re-check CDC state"** button re-runs the probe in place so recovery no longer
+  requires navigating away.
+
 ## v0.1.420
 
 ### Fixed

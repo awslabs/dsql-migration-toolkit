@@ -3839,6 +3839,93 @@ def test_probe_cdc_stack_phase_populates_other_stacks(monkeypatch) -> None:
     assert state.cdc_other_stacks == [("mysql-dsql-cdc-seoul-test", "UPDATE_COMPLETE")]
 
 
+def test_probe_cdc_stack_phase_records_error_when_describe_throws(monkeypatch) -> None:
+    # Reported: after a session restore the CDC card was stuck "state not determined"
+    # even after re-verifying the target. Root cause: describe_stacks threw (bad creds /
+    # missing cloudformation:DescribeStacks / wrong region) and the probe swallowed it
+    # silently, so cdc_stack_phase_checked never flipped. It must now RECORD the cause
+    # (cdc_probe_error) and stay undetermined, so the notice can name it + offer re-check.
+    import dsql_migrator.core.cdc_deployer as deployer_mod
+    from dsql_migrator.ui.data_migration._cdc_status import _probe_cdc_stack_phase
+    from dsql_migrator.ui.data_migration._cdc_ui import cdc_state_is_undetermined
+
+    state = DataMigrationState()
+
+    class _BoomDeployer:
+        def describe_stack_or_none(self, name):
+            raise RuntimeError("AccessDenied: cloudformation:DescribeStacks\n(more)")
+
+        def list_cdc_stacks(self):
+            return []
+
+    monkeypatch.setattr(
+        deployer_mod, "build_cdc_stack_deployer", lambda *a, **k: _BoomDeployer()
+    )
+
+    class _Sess:
+        class target_config:
+            region = "us-east-1"
+
+        aws_profile = None
+
+    _probe_cdc_stack_phase(state, _Sess())
+    # Undetermined (probe never set the phase) BUT the cause is now recorded (first line).
+    assert state.cdc_stack_phase_checked is False
+    assert cdc_state_is_undetermined(state) is True
+    assert state.cdc_probe_error == "AccessDenied: cloudformation:DescribeStacks"
+
+    # A later SUCCESSFUL probe clears the recorded error and resolves the state.
+    state.set_cdc_stack_phase("absent", status=None)
+    assert state.cdc_probe_error is None
+    assert cdc_state_is_undetermined(state) is False
+
+
+def test_cdc_state_unknown_notice_names_the_probe_error() -> None:
+    # When a probe error is recorded, the notice must name the AWS cause (so the user
+    # fixes access) rather than only blaming a session restore.
+    import sys
+    import types
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    recorded: dict = {"bodies": [], "buttons": []}
+
+    class _NoticeUi:
+        class _El:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def __getattr__(self, _n):
+                return lambda *_a, **_k: self
+
+        def button(self, text="", *_a, **_k):
+            recorded["buttons"].append(str(text))
+            return self._El()
+
+        def __getattr__(self, _n):
+            return lambda *_a, **_k: _NoticeUi._El()
+
+    def _fake_render_notice(ui, *, tone, header, body, **_k):
+        recorded["bodies"].append(body)
+
+    monkeypatch_target = _cdc_ui.render_notice
+    _cdc_ui.render_notice = _fake_render_notice  # type: ignore[assignment]
+    try:
+        state = DataMigrationState()
+        state.set_cdc_probe_error("AccessDenied: cloudformation:DescribeStacks")
+        _cdc_ui._render_cdc_state_unknown_notice(_NoticeUi(), state, lambda: None)
+    finally:
+        _cdc_ui.render_notice = monkeypatch_target  # type: ignore[assignment]
+
+    body = " ".join(recorded["bodies"])
+    assert "FAILED" in body and "AccessDenied" in body
+    assert "Re-verifying the target will not help" in body
+    assert any("Re-check CDC state" in b for b in recorded["buttons"])
+
+
 def test_cdc_reconciled_table_names_setter_trims_and_adopt_clears() -> None:
     # The reconciled set is trimmed / blank-dropped, and re-adopting a stack clears
     # it (it belonged to the previously-targeted stack; the fresh probe repopulates).

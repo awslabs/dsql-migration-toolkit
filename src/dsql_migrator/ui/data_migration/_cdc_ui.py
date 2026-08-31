@@ -1422,27 +1422,58 @@ def _render_cdc_redeploy_prompt(ui, migration_state, refresh) -> None:
     ).classes("text-xs text-gray-500")
 
 
-def _render_cdc_state_unknown_notice(ui) -> None:
-    """Say the CDC state is unknown, and how to recover it.
+def _render_cdc_state_unknown_notice(
+    ui, migration_state=None, refresh=None
+) -> None:
+    """Say the CDC state is unknown, WHY, and how to recover it.
 
     Without this the operator gets a deploy form for a pipeline that may already be
     running -- there is no way to tell from the screen that the tool simply has not
-    looked yet. Names the one action that recovers it (re-verify the target, which is
-    what the probe needs) and states plainly that nothing was broken by the restart, so
-    nobody re-runs Start CDC on a live pipeline.
+    looked yet. Two distinct causes, named so the user acts on the right one:
+
+    * **probe FAILED** (``cdc_probe_error`` set) -- the read-only ``describe_stacks``
+      check threw (bad/expired creds, missing ``cloudformation:DescribeStacks``, wrong
+      region, throttle). Re-verifying the target will NOT help; the AWS access has to be
+      fixed. Show the real error so it is actionable.
+    * **probe NOT RUN** (no error) -- a restored session's connections are untrusted
+      until re-verified, so the probe has not run yet. Re-verify the target on Connect.
+
+    Either way a "Re-check CDC state" button re-runs the probe immediately (it clears
+    the discovery throttle + refreshes), so recovery does not require navigating away.
     """
-    render_notice(
-        ui,
-        tone="warning",
-        header="CDC state not determined yet",
-        body=(
+    probe_error = getattr(migration_state, "cdc_probe_error", None)
+    if probe_error:
+        body = (
+            "The read-only AWS check that reads the live CDC state FAILED, so the tool "
+            "cannot tell whether a pipeline exists. Re-verifying the target will not "
+            f"help — fix the AWS access first. Reported error: {probe_error}. Check the "
+            "credentials/permissions (cloudformation:DescribeStacks) and the target "
+            "region, then re-check. Any pipeline you already started keeps streaming."
+        )
+    else:
+        body = (
             "This session was restored, so its connections are not trusted until "
             "re-verified and the read-only AWS check that reads the live CDC state has "
             "not run. Any pipeline you already started is unaffected and keeps "
             "streaming. Re-verify the target connection on the Connect step to recover "
             "the real state here — do not start CDC again until it shows."
-        ),
-    )
+        )
+    render_notice(ui, tone="warning", header="CDC state not determined yet", body=body)
+
+    # A direct re-check so the user is not stuck: clear the discovery throttle so the
+    # next render re-probes immediately, then refresh. (The discovery timer is armed on
+    # render and gated by ``_cdc_discovery_monotonic``.)
+    if migration_state is not None and callable(refresh):
+        def _recheck(_e=None) -> None:
+            try:
+                migration_state._cdc_discovery_monotonic = None
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+            refresh()
+
+        ui.button(  # type: ignore[attr-defined]
+            "Re-check CDC state", icon="refresh", on_click=_recheck
+        ).props("outline size=sm color=primary").classes("mt-2")
 
 
 def _render_cdc_start_action(
@@ -1620,7 +1651,7 @@ def _render_cdc_start_action(
             # connections are untrusted until re-verified), so offering a deploy form
             # here would invite a duplicate, billable MSK cluster for a pipeline that
             # may already be streaming.
-            _render_cdc_state_unknown_notice(ui)
+            _render_cdc_state_unknown_notice(ui, migration_state, refresh)
         else:  # absent -- the probe reported, and there really is nothing
             # Account-scoped discovery: if CDC infra already exists under a name this
             # (reset) session does not target, offer to ADOPT it rather than deploy a

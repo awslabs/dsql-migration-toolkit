@@ -25,9 +25,12 @@ The package ``__init__`` re-imports these names so the public import surface of
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Mapping, Optional, Sequence
+
+_logger = logging.getLogger(__name__)
 
 from dsql_migrator.core.cdc import (
     CDC_DEFAULT_STACK_NAME,
@@ -914,7 +917,15 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
         # deploying a duplicate (a reset single-task session forgets which stack it
         # deployed). Best-effort (list_cdc_stacks returns [] on any read error).
         others = [(n, s) for (n, s) in deployer.list_cdc_stacks() if n != mine]
-    except Exception:  # noqa: BLE001 - leave unprobed; card defaults to Deploy
+    except Exception as exc:  # noqa: BLE001 - leave unprobed, but RECORD why
+        # The read-only describe_stacks failed (bad/expired creds, missing
+        # cloudformation:DescribeStacks, wrong region, throttle). Silently returning
+        # here left the CDC card stuck "state not determined" with a misleading
+        # "session was restored" message and no recovery -- re-verifying the target
+        # just re-runs the same failing probe. Record the cause so the notice can name
+        # it and offer a re-check, and log it for the activity trail.
+        _logger.warning("CDC stack-phase probe failed: %s", exc)
+        migration_state.set_cdc_probe_error(str(exc).splitlines()[0] if str(exc) else type(exc).__name__)
         return
     phase, status = _classify_cdc_stack_phase(discovery)
     migration_state.set_cdc_stack_phase(phase, status=status)
@@ -1691,4 +1702,8 @@ def cdc_discovery_fingerprint(migration_state) -> tuple:
             for entry in (getattr(migration_state, "cdc_other_stacks", ()) or ())
         ),
         bool(getattr(migration_state, "cdc_stack_phase_checked", False)),
+        # A newly-recorded probe FAILURE must trigger a refresh too, so the "state not
+        # determined" notice updates to name the real cause instead of staying on the
+        # generic restored-session message.
+        getattr(migration_state, "cdc_probe_error", None),
     )
