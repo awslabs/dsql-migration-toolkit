@@ -283,7 +283,7 @@ def _render_cdc_step(
     # (_render_cdc_start_action) already owns it: on an absent stack it renders the
     # same BYO-VPC deploy form (or the adopt choice), so adding a second call here
     # showed the identical form twice on one screen. The Prerequisites copy is the
-    # *extra* entry point -- offered there only so the ~15-20 min MSK create can
+    # *extra* entry point -- offered there only so the ~5 min MSK create can
     # overlap a Full Load -- and it is suppressed for CDC only, which has no Full Load
     # to overlap. See _render_cdc_infra_prep_section.
 
@@ -1389,7 +1389,7 @@ def _render_cdc_redeploy_prompt(ui, migration_state, refresh) -> None:
 
     Leads with the outcome the operator was waiting for (the infrastructure is gone and
     is no longer billing), and makes rebuilding an explicit opt-in that states the real
-    cost of saying yes (~15-20 min, billable). Answering yes latches
+    cost of saying yes (~5 min, billable). Answering yes latches
     ``cdc_redeploy_confirmed`` so the form stays open across refreshes.
     """
     render_notice(
@@ -1417,7 +1417,7 @@ def _render_cdc_redeploy_prompt(ui, migration_state, refresh) -> None:
             "Redeploy CDC infrastructure", on_click=_confirm
         ).props("outline size=sm").classes("normal-case")
     ui.label(  # type: ignore[attr-defined]
-        "Rebuilding creates a new MSK Serverless cluster and takes ~10-15 minutes; "
+        "Rebuilding creates a new MSK Serverless cluster and takes ~5 minutes; "
         "it is billable. Leave this alone if you are done with CDC."
     ).classes("text-xs text-gray-500")
 
@@ -1486,7 +1486,7 @@ def _render_cdc_start_action(
     / ``_probe_cdc_stack_phase``):
 
     * **absent** — no stack yet → show the BYO-VPC infrastructure form + a
-      "Deploy CDC infrastructure" button (create_stack, ~15-20 min).
+      "Deploy CDC infrastructure" button (create_stack, ~5 min).
     * **infra** — stack up, no connectors → "Start CDC" (after the start point is
       set): a two-pass update that creates the connectors.
     * **running** — connectors deployed → "Stop CDC" (delete connectors only).
@@ -2052,7 +2052,7 @@ def _render_cdc_infra_prep_section(
     Not the only way to provision: the CDC step's lifecycle card
     (:func:`_render_cdc_start_action`) already renders the same BYO-VPC deploy form (or
     the adopt choice) whenever the stack is absent. This one exists purely so the
-    ~15-20 min MSK create can be started EARLY and OVERLAP the Full Load, instead of
+    ~5 min MSK create can be started EARLY and OVERLAP the Full Load, instead of
     waiting until the operator reaches the CDC step after the load. It also needs a real
     table set (the connector's ``TableIncludeList`` and the topic partition plan), and
     Prerequisites is the first point where both hold: running the checks pins and locks
@@ -2088,10 +2088,10 @@ def _render_cdc_infra_prep_section(
         render_notice(
             ui,
             tone="info",
-            busy=True,  # ~15-20 min live operation: spinner + "In progress" badge
+            busy=True,  # ~5 min live operation: spinner + "In progress" badge
             header="Deploying in the background — start your Full Load now",
             body=(
-                "Amazon MSK takes ~10-15 minutes to provision. Nothing is streaming "
+                "Amazon MSK takes ~5 minutes to provision. Nothing is streaming "
                 "yet, so this does not hold up the snapshot: continue to Full Load "
                 "and let the two run together. You can leave this screen; progress "
                 "is kept and shown when you return."
@@ -2144,7 +2144,7 @@ def _render_cdc_infra_prep_section(
         icon="schedule",
         header="Deploy now so it is ready when the Full Load finishes",
         body=(
-            "CDC needs Amazon MSK, which takes ~10-15 minutes to provision and bills "
+            "CDC needs Amazon MSK, which takes ~5 minutes to provision and bills "
             "while it exists. Deploying it here lets it run WHILE your Full Load "
             "does, instead of waiting afterwards — the snapshot is unaffected, and "
             "no data streams until you explicitly start CDC. You can also skip this "
@@ -2281,7 +2281,7 @@ def _render_cdc_infra_deploy_action(
     ui.label(  # type: ignore[attr-defined]
         "No cdc-stack is deployed yet. Provide your VPC and the plugin/source "
         "details below, then deploy the infrastructure (MSK Serverless, the "
-        "connector networking, plugins and IAM role). This takes ~10-15 minutes "
+        "connector networking, plugins and IAM role). This takes ~5 minutes "
         "and creates billable AWS resources; connectors are created later by "
         "Start CDC."
     ).classes("text-xs text-gray-600")
@@ -2320,7 +2320,7 @@ def _render_cdc_infra_deploy_action(
             session=session,
         )
 
-    # Explicit CDC-prerequisite gate. MSK is billable and takes ~15-20 min to
+    # Explicit CDC-prerequisite gate. MSK is billable and takes ~5 min to
     # create, and a source whose binlog is not ROW/FULL can never stream -- fixing
     # it needs a parameter-group change plus a reboot on RDS. So verify that BEFORE
     # any infrastructure is paid for, rather than discovering it as an undiagnosed
@@ -2678,7 +2678,7 @@ def cdc_deploy_connection_blocker(session) -> Optional[str]:
     return None
 
 async def _open_cdc_infra_dialog(ui, migration_state, on_confirm, *, session=None) -> None:
-    """Confirm dialog before the (~15-20 min, billable) infrastructure create.
+    """Confirm dialog before the (~5 min, billable) infrastructure create.
 
     When ``session`` is given and no manual subnet override is set, runs the
     read-only VPC network diagnosis and shows its outcome (reuse existing subnets,
@@ -2705,7 +2705,7 @@ async def _open_cdc_infra_dialog(ui, migration_state, on_confirm, *, session=Non
         ui.label(  # type: ignore[attr-defined]
             f"This creates the cdc-stack '{stack_name}' (CloudFormation): an MSK "
             "Serverless cluster, connector networking in your VPC, the plugins and "
-            "an IAM role. It takes about 10-15 minutes and creates billable AWS "
+            "an IAM role. It takes about 5 minutes and creates billable AWS "
             "resources. No connectors are created yet — run Start CDC afterwards."
         ).classes("text-sm text-gray-700")
         # Pre-flight connection check: surface a not-ready source/target up front
@@ -3603,7 +3603,7 @@ async def _start_cdc_infra_deploy(
     )
     migration_state.set_cdc_deploy_job_id(job_id, kind="infra")
     _log_cdc_event(_action, detail=_detail)
-    ui.notify("Infrastructure deploy started (~10-15 min).", type="positive", position="top")  # type: ignore[attr-defined]
+    ui.notify("Infrastructure deploy started (~5 min).", type="positive", position="top")  # type: ignore[attr-defined]
     refresh()
 
 def _start_cdc_stop(

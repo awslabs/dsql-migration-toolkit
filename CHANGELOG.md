@@ -5,6 +5,16 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.423
+
+### Changed
+
+- **Lowered the CDC infrastructure-deploy time estimate in the UI copy too** (deploy
+  dialog, infra-inputs panel, "deploying in the background" notice, redeploy note, and
+  the start toast) from ~10–15 / ~15–20 min to ~5 min, matching v0.1.422 and the ~2–5 min
+  live infra creates. MSK Connect **connector bring-up** (~10–20 min) and MSK **teardown**
+  (~15–25 min ENI reclamation, up to ~20 min) estimates are unchanged — those are accurate.
+
 ## v0.1.422
 
 ### Changed
