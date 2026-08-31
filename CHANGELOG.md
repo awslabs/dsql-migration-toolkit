@@ -5,6 +5,21 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.424
+
+### Fixed
+
+- **"Start over" no longer breaks CDC on the deployed stack.** The CDC deploy-role ARN
+  (from the deployment's `DSQL_MIGRATOR_CDC_DEPLOY_ROLE_ARN` env — the `CdcDeployRole`
+  the ECS task assumes for CloudFormation/MSK) is set once at screen-build time, but
+  Start over's in-place reset re-ran the state's `__init__` and cleared it, and the
+  builder never re-runs — so after a Start over every CDC operation (even the read-only
+  state probe) fell back to the bare task role, which lacks `cloudformation:DescribeStacks`,
+  and failed with `AccessDenied` (surfaced as "CDC state not determined yet"). The reset
+  now preserves the deploy-role ARN across Start over, exactly as it already preserves the
+  session binding and an in-flight teardown marker — it is deployment config, not
+  per-session state.
+
 ## v0.1.423
 
 ### Changed

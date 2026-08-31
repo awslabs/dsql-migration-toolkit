@@ -5,6 +5,19 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.424
+
+### 수정 (Fixed)
+
+- **"Start over"가 배포 스택에서 CDC를 망가뜨리지 않습니다.** CDC 배포 역할 ARN(배포의
+  `DSQL_MIGRATOR_CDC_DEPLOY_ROLE_ARN` 환경변수 — ECS 태스크가 CloudFormation/MSK를 위해
+  assume하는 `CdcDeployRole`)은 화면 빌드 시 한 번만 설정되는데, Start over의 in-place 초기화가
+  상태의 `__init__`을 다시 실행해 이를 지웠고 빌더는 다시 실행되지 않았습니다 — 그래서 Start over
+  이후에는 모든 CDC 작업(읽기 전용 상태 프로브 포함)이 `cloudformation:DescribeStacks` 권한이 없는
+  기본 태스크 역할로 폴백해 `AccessDenied`("CDC state not determined yet"로 표시됨)로 실패했습니다.
+  이제 초기화가 세션 바인딩·진행 중 테어다운 마커를 보존하듯 배포 역할 ARN도 Start over에서
+  보존합니다 — 이는 세션 상태가 아니라 배포 구성이기 때문입니다.
+
 ## v0.1.423
 
 ### 변경 (Changed)

@@ -3145,6 +3145,26 @@ def test_reset_in_place_preserves_cdc_teardown_marker() -> None:
     assert state.cdc_teardown_ctx == {"region": "ap-northeast-2", "cleanup_secret": True}
 
 
+def test_reset_in_place_preserves_cdc_deploy_role_arn() -> None:
+    # Start over must NOT wipe the CDC deploy-role ARN: it is deployment config (env
+    # DSQL_MIGRATOR_CDC_DEPLOY_ROLE_ARN, set once at screen-build time), not user state.
+    # Losing it made every post-Start-over CDC op fall back to the bare TaskRole (no
+    # cloudformation:DescribeStacks) -> AccessDenied on the deployed stack.
+    store = DataMigrationStore()
+    state = store.get_or_create("s1")
+    state.cdc_deploy_role_arn = "arn:aws:iam::076914959415:role/mysql-dsql-migrator-cdc-deploy"
+    state.job_id = "job-xyz"
+
+    store.reset_in_place("s1")
+
+    assert store.get_or_create("s1") is state  # same instance
+    assert state.job_id is None  # user state wiped
+    # ...but the deploy-role ARN survives so CDC keeps working after Start over.
+    assert state.cdc_deploy_role_arn == (
+        "arn:aws:iam::076914959415:role/mysql-dsql-migrator-cdc-deploy"
+    )
+
+
 def test_reset_in_place_without_teardown_leaves_marker_clear() -> None:
     # No teardown in flight → reset leaves the marker empty (no spurious banner).
     store = DataMigrationStore()
@@ -9072,7 +9092,8 @@ def test_cdc_infra_prep_section_renders_the_overlap_guidance() -> None:
     assert "CDC streaming infrastructure" in joined
     assert "Not deployed" in joined
     assert "WHILE your Full Load" in joined
-    assert "10-15 minutes" in joined
+    # MSK provisioning ETA (lowered to ~5 min after live runs; see _CDC_STAGE_ETA_SECONDS).
+    assert "~5 minutes" in joined
     # Says it is skippable (the CDC step remains a valid place to deploy later).
     assert "deploy later from the CDC step" in joined
 
@@ -15835,7 +15856,8 @@ def test_redeploy_prompt_leads_with_the_deletion_outcome() -> None:
     assert "no longer" in joined, "say the cluster stopped costing money"
     # Redeploy is offered, but as an explicit opt-in that states the cost.
     assert "Redeploy CDC infrastructure" in joined
-    assert "10-15 minutes" in joined and "billable" in joined
+    # Rebuild ETA (lowered to ~5 min after live runs) + states the cost.
+    assert "~5 minutes" in joined and "billable" in joined
     # And it must NOT dump the BYO-VPC form here.
     assert "Provide your VPC" not in joined
 

@@ -1090,6 +1090,15 @@ class DataMigrationStore:
         state = self._states.get(session_id)
         if state is not None:
             bound = getattr(state, "_session", None)
+            # Preserve the CDC deploy-role ARN across the reset. It is a DEPLOYMENT
+            # CONFIG value (env DSQL_MIGRATOR_CDC_DEPLOY_ROLE_ARN, the CdcDeployRole the
+            # TaskRole assumes for CloudFormation/MSK), set ONCE at screen-build time --
+            # not per-render user state. __init__() below resets it to None, and the
+            # builder does not re-run after Start over, so without this every CDC
+            # operation (even the read-only state probe) would fall back to the bare
+            # TaskRole -- which lacks cloudformation:DescribeStacks -- and fail with
+            # AccessDenied on the deployed stack after any Start over.
+            deploy_role_arn = getattr(state, "cdc_deploy_role_arn", None)
             # Preserve an in-flight CDC teardown marker across the reset. A Start-over
             # that chose stop/delete submits the teardown BEFORE this reset; the
             # persistent teardown banner and the Start-over race-guard both read this
@@ -1105,6 +1114,8 @@ class DataMigrationStore:
             state.__init__()  # type: ignore[misc]  # re-run init on the same object
             if bound is not None:
                 state.bind_session(bound)
+            # Deploy-time config, not user state -- it must outlive Start over.
+            state.cdc_deploy_role_arn = deploy_role_arn
             if teardown[0] is not None:
                 state.set_cdc_teardown(
                     teardown[0], kind=teardown[1], stack=teardown[2], ctx=teardown[3]

@@ -5,6 +5,20 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.424
+
+### 修正 (Fixed)
+
+- **「Start over」がデプロイ済みスタックで CDC を壊さないようにしました。** CDC デプロイロール
+  ARN(デプロイの `DSQL_MIGRATOR_CDC_DEPLOY_ROLE_ARN` 環境変数 — ECS タスクが
+  CloudFormation/MSK のために assume する `CdcDeployRole`)は画面ビルド時に一度だけ設定されますが、
+  Start over のインプレースリセットが状態の `__init__` を再実行して消去し、ビルダーは再実行されない
+  ため、Start over 後はすべての CDC 操作(読み取り専用の状態プローブ含む)が
+  `cloudformation:DescribeStacks` 権限を持たない素のタスクロールにフォールバックし、`AccessDenied`
+  (「CDC state not determined yet」として表示)で失敗していました。リセットが既にセッション
+  バインディングや進行中のテアダウンマーカーを保持するのと同様に、デプロイロール ARN も Start over
+  をまたいで保持するようにしました — これはセッション状態ではなくデプロイ構成だからです。
+
 ## v0.1.423
 
 ### 変更 (Changed)
