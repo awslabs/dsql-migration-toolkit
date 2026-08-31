@@ -5,6 +5,15 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.425
+
+### 변경 (Changed)
+
+- **"Start CDC" 예상 시간을 실제에 맞게 낮췄습니다(~5분, 기존 ~20–26분).** 시작 단계에서
+  지배적인 두 단계(`stack_connectors`, `connectors_running`)가 각각 13분으로 추정돼 있었는데,
+  이는 예전 source→sink 2-pass의 잔재입니다. 이제 source와 sink가 병렬 배포되고 실제 실행이 ~5분에
+  끝나므로 각 단계를 ~3분으로 낮췄고, "provisioning" 알림도 "10–20분" 대신 ~5분으로 표기합니다.
+
 ## v0.1.424
 
 ### 수정 (Fixed)

@@ -5,6 +5,16 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.425
+
+### Changed
+
+- **Lowered the "Start CDC" time estimate to match reality (~5 min, was ~20–26 min).**
+  The two dominant start stages (`stack_connectors`, `connectors_running`) were each
+  estimated at 13 min — a hangover from the old source-then-sink two-pass. Source and
+  sink now deploy in parallel and live runs finish in ~5 min, so each is lowered to ~3
+  min, and the "provisioning" notice now says ~5 minutes instead of "10–20 minutes".
+
 ## v0.1.424
 
 ### Fixed

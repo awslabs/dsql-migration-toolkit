@@ -181,17 +181,20 @@ _CDC_STAGE_ETA_SECONDS = {
         "infra_ready": 2,
     },
     "start": {
-        # MSK Connect connector creation is slow: Fargate provisioning + plugin
-        # download (our plugin zips are ~70-90 MiB) + Kafka Connect worker boot +
-        # Glue Schema Registry connect, ~10-15 min EACH. Source and sink now deploy
-        # IN PARALLEL (one pass, topics pre-created), so the connector-wait stages
-        # are estimated at ONE connector's time (~max), not the sum of two.
+        # MSK Connect connector creation: Fargate provisioning + plugin download (our
+        # plugin zips are ~70-90 MiB) + Kafka Connect worker boot + Glue Schema Registry
+        # connect. Source and sink deploy IN PARALLEL (one pass, topics pre-created), so
+        # the connector-wait stages are estimated at ONE connector's time (~max), not the
+        # sum of two. LOWERED (was 13 min each → total ~26 min) after live runs finished a
+        # Start CDC in ~5 min; the two dominant stages now estimate ~3 min each so the
+        # hint tracks the typical wait instead of over-reporting ~20-26 min. A ballpark:
+        # a slower MSK Connect provision simply overruns the hint rather than misleads.
         "discover_stack": 5,
         "validate_params": 2,
         "fetch_bootstrap": 5,
         "submit_connectors": 10,
-        "stack_connectors": 13 * 60,     # CFN creates topics + both connectors (parallel)
-        "connectors_running": 13 * 60,   # both reach RUNNING concurrently (~max)
+        "stack_connectors": 3 * 60,      # CFN creates topics + both connectors (parallel)
+        "connectors_running": 3 * 60,    # both reach RUNNING concurrently (~max)
         "pipeline_running": 5,
     },
     "stop": {

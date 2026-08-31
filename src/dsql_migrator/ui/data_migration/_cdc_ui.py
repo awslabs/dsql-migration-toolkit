@@ -1607,7 +1607,7 @@ def _render_cdc_start_action(
                 header="CDC pipeline provisioning",
                 body=(
                     "The connectors are deploying on MSK Connect (this takes about "
-                    "10–20 minutes). "
+                    "~5 minutes). "
                     + (
                         f"Still coming up: {', '.join(still)}. "
                         if still
