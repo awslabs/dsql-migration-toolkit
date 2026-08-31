@@ -6,9 +6,10 @@ _언어: [English](../en/12-performance-test-results.md) | **한국어** | [日�
 
 이 부록은 개발 과정에서 두 데이터 경로 — **Full Load**(툴의 Python 벌크 로더)와
 **CDC**(Debezium → MSK → 커스텀 DSQL 싱크 파이프라인) — 의 처리량 측정을 기록하며, 각
-최적화 단계가 최종 성능에 어떻게 기여했는지 보여줍니다. 모든 측정은 소스 RDS MySQL 및 타깃
-Aurora DSQL과 동일 VPC 내 **ECS Fargate**(CDC의 경우 관리형 **MSK Connect**)에서
-수행되었습니다 (1ms 미만 네트워크 RTT).
+최적화 단계가 최종 성능에 어떻게 기여했는지 보여줍니다. 대부분의 측정은 소스 RDS/Aurora
+**MySQL** 및 타깃 Aurora DSQL과 동일 VPC 내 **ECS Fargate**(CDC의 경우 관리형 **MSK Connect**)에서
+수행되었고 (1ms 미만 네트워크 RTT), 별도 절에서 동일 조건의 **PostgreSQL 소스** 1TB Full Load를
+MySQL과 비교합니다.
 
 ---
 
@@ -164,6 +165,93 @@ OCC 경합 완전 제거:
 - 이 경로에서 **샤드 결과 집계 버그**(존재하지 않는 `result.rows_skipped` 참조 → 전량 적재된
   단일 테이블을 잘못 `FAILED` 처리)를 발견·수정했습니다(**v0.1.119**; `rows_skipped`를
   `conflicts`에서 매핑). 멀티테이블(테이블당 1워커, 비샤드)은 영향 없었습니다.
+
+> **주의 — 이 16 PK-range 샤드 수치는 현재의 torn-read 안전 게이트 이전 버전입니다.** 이후 도구는
+> 단일 대형 테이블의 **REPLACE 로드**를 (양 엔진 공통으로) torn-read 안전을 위해 기본 **single-reader**
+> 로 제한합니다(샤드마다 독립 CONSISTENT SNAPSHOT을 열면, 로드 중 소스가 쓰일 때 shard 간 torn read가
+> 가능 → CDC가 post-snapshot 쓰기를 reconcile할 때만 안전). 정적 소스에서 측정용으로만 샤딩을 강제할 수
+> 있습니다. 현행 도구의 단일-테이블 실측(및 그 배경 제약)은 아래 **PostgreSQL 소스** 절의 §단일 1TB
+> 테이블을 참고하세요.
+
+---
+
+## PostgreSQL 소스 1TB Full Load — MySQL 대비 (2026-08-25)
+
+위 1TB 검증과 **동일한 형태**로, 이번엔 **PostgreSQL 소스**(Aurora PostgreSQL) → Aurora DSQL을
+측정했습니다 (us-east-1, 배포 도구 ECS Fargate 16 vCPU, ECS RunTask 자동 스크립팅). 목적은 소스
+엔진만 바꿨을 때 Full Load 성능이 어떻게 달라지는지를 **같은 조건**에서 비교하는 것입니다.
+
+### 테스트 환경 (PostgreSQL 1TB)
+
+| 구성요소 | 설정 |
+|---|---|
+| **ECS Fargate** | 16 vCPU / 32 GB (MySQL 측정과 동일 스펙) |
+| **소스** | **Aurora PostgreSQL 16.14** `db.r7g.8xlarge` (측정 위해 임시 업사이즈) |
+| **타깃** | Aurora DSQL, us-east-1 (MySQL 측정과 동일 클러스터 재사용) |
+| **데이터셋** | `dsql_test_multi` — 20테이블 × 43M행 = **860M행 (≈ 1.02TB)** |
+| **로더 설정** | composite key(`dist_key`) 20/20, `TABLE_PARALLELISM=16`, `BATCH_PARALLELISM=32`, batch-rows 3000, OCC budget 30 |
+
+> PG는 database가 schema를 **포함**하므로(`database=perfdb` 접속 + `schema.table` 한정), MySQL의
+> database==schema와 접속 형태만 다릅니다. Full Load 경로 자체는 dialect 기반이라 소스 엔진 배선만
+> 바꾸면 동일하게 동작합니다.
+
+### 결과 (multi — 20테이블 × 43M)
+
+| 지표 | 값 |
+|---|---|
+| **완주** | **20/20 테이블, 실패 0** |
+| **총 소요 (wall)** | **6,150.6s = 1h42m31s** |
+| **평균 처리량** | 139,824 rows/s |
+| **front-16 병렬 구간** | ~194K rows/s (순간 최대 ~200–231K) |
+| **OCC 40001 재시도** | **0건** (composite key로 hot-partition 경합 제거) |
+| **CPU** | front-16에서 ~1,200% (약 12 of 16 vCPU) — **미포화** |
+
+### 동일 조건 비교 — MySQL vs PostgreSQL
+
+동일 Fargate 16 vCPU · 동일 DSQL 클러스터 · 동일 `tp16·bp32·composite`:
+
+| | MySQL (2026-07-23) | **PostgreSQL (2026-08-25)** |
+|---|---|---|
+| 데이터 | 915.7M (~1.07 TB) | 860M (~1.02 TB) |
+| wall | 8,851s (2h27m) | **6,150s (1h42m)** |
+| overall rows/s | 103.5K | **139.8K** |
+| front-16 rows/s | ~131K | **~194K** |
+| front-16 CPU | ~1,557% (15.6 vCPU, **포화**) | ~1,200% (12 vCPU, **미포화**) |
+| OCC 40001 | 0 | 0 |
+
+- **PG가 MySQL보다 wall ~30% 빠르고 처리량 ~1.5배인데, CPU는 오히려 덜 씁니다.** 원인은 **PG 소스
+  값 변환이 거의 pass-through**(psycopg 네이티브 타입)라는 점 — 로더의 **행당 CPU 비용**이 MySQL
+  방언 변환보다 낮아, 같은 16 vCPU로 더 높은 처리량을 냅니다(MySQL은 CPU 포화가 천장, PG는 CPU가
+  천장이 아님).
+- **PG 특유의 Full Load 버그는 발견되지 않았습니다** — 저비용 검증부터 1TB까지 스키마 변환·composite
+  key·20테이블 병렬·front-16→back-4 전환 모두 클린(연결/DDL storm 수정 v0.1.115/116은 이미 출하돼
+  PG도 상속). tail penalty(20테이블 > 16슬롯)는 MySQL과 동일한 구조적 특성입니다.
+
+### 단일 1TB 테이블 (PostgreSQL) — 현행 도구의 실측 + 제약
+
+단일 대형 테이블(`big_events` 8.65억 행)을 현행 도구로 측정한 결과입니다. 위 MySQL §단일 거대 테이블의
+"16 PK-range 샤드"는 **torn-read 안전 게이트 이전** 버전이며, 아래가 현재 shipped 도구의 실제 동작입니다.
+
+| 형태 | 동시 리더 | 처리량 (plateau) | OCC | 865M 완주 추정 |
+|---|---|---|---|---|
+| ① composite(`dist_key`), REPLACE (기본) | **1** (single-reader) | **~20–23K rows/s** | 0 | ~12h |
+| ② 강제-샤딩(non-composite), 4 shards | **4** | **~42K rows/s** | 0 | ~5.7h |
+
+왜 단일 테이블이 multi(194K)보다 훨씬 느린가 — 세 가지 구조적 제약(**양 엔진 공통**):
+
+1. **샤딩이 torn-read 안전 게이트에 묶임.** 샤드마다 독립 CONSISTENT SNAPSHOT을 여는데, 로드 중 소스가
+   쓰이면 shard 간 torn read가 가능 → **CDC가 post-snapshot 쓰기를 reconcile할 때만 안전**하다고 보고,
+   **REPLACE(CDC 없음) 로드는 single-reader로 강제**합니다(→ ①). 정적 소스는 torn read가 원천 불가하므로,
+   측정용 env 오버라이드로만 샤딩을 켜 ②를 얻습니다(실 소스 금지).
+2. **단일 테이블 동시 샤드 리더가 ~4로 캡됨** (`_MAX_SOURCE_READERS`/tp·shards interplay) — multi처럼
+   16-way가 되지 않습니다.
+3. **쓰기 분산(composite)과 읽기 병렬(샤딩)이 상호배타.** ②는 샤딩을 켜려 composite를 껐는데, 그러면
+   각 샤드의 id-range가 단조 증가 → 단일 fresh 테이블 파티션 워밍업 후에도 write backpressure로
+   ~42K에서 plateau(CPU 미포화 = 읽기 아닌 **쓰기 바운드**). composite를 켜면 샤딩이 꺼져 ①이 됩니다.
+
+> **교훈:** 대형 데이터는 가능하면 **여러 테이블**로 나누세요(multi가 시작부터 파티션·병렬을 확보 →
+> ~194K rows/s). 단일 거대 테이블은 현행 게이트/캡 때문에 훨씬 느립니다 — 후속 개선 후보: 단일-테이블
+> 리더 캡 완화, 정적 소스에서 composite+샤딩 동시 허용.
 
 ---
 
