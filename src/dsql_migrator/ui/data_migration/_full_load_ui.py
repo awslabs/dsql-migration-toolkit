@@ -23,7 +23,11 @@ from dsql_migrator.core.error_log import ErrorLogStore
 from dsql_migrator.core.job_manager import JobNotFoundError
 from dsql_migrator.core.models import LoadKind, LoadStatusView, MigrationJob, StepStatus
 from dsql_migrator.core.target_connection import DsqlConnector
-from dsql_migrator.core.target_introspector import target_primary_keys, tables_with_rows
+from dsql_migrator.core.target_introspector import (
+    target_primary_keys,
+    tables_present,
+    tables_with_rows,
+)
 from dsql_migrator.ui.design import inline_hint, render_notice
 from dsql_migrator.ui.workflow import WorkflowStep, with_status
 from dsql_migrator.ui.data_migration._full_load_engine import (
@@ -356,6 +360,27 @@ def _render_full_load_step(
         recreate_now = (
             [] if cdc_live_now else [n for n in _candidates if n in set(action_tables)]
         )
+        # Selected tables that are genuinely MISSING on the target AND that this run
+        # will NOT create -> an append would fail each (relation does not exist), and if
+        # the user then starts CDC that table is a standing gap CDC never backfills. A
+        # missing table IS created when: 'drop' mode (the pre-pass DROP IF EXISTS +
+        # CREATE recreates every replace table) or it is a recreate candidate (empty /
+        # key-diff, recreated from the applied DDL even in append). Neither runs while
+        # CDC is live. ``target_tables_present`` is None when the probe could not read
+        # the target -> stay conservative and do NOT warn (avoid a false "all missing").
+        _present = migration_state.target_tables_present
+        if _present is None:
+            missing_uncreated: list[str] = []
+        else:
+            _will_create = (
+                set(action_tables)
+                if (migration_state.reload_mode == "drop" and not cdc_live_now)
+                else set(recreate_now)
+            )
+            missing_uncreated = [
+                n for n in action_tables
+                if n not in _present and n not in _will_create
+            ]
         selectable = table_reasons is not None
         # Live set of checked tables (mutated by the per-row checkboxes). Starts as
         # the full action set (all pre-checked) -- the common "retry everything".
@@ -369,6 +394,37 @@ def _render_full_load_step(
                     "tables will receive the snapshot rows; the source is accessed "
                     "read only."
                 ).classes("text-sm")
+                # Missing target tables an append can't create -> warn BEFORE the load
+                # (rather than letting it fail per table, then risk a standing CDC gap).
+                if missing_uncreated:
+                    _m_noun = "table" if len(missing_uncreated) == 1 else "tables"
+                    render_notice(
+                        ui,
+                        tone="warning",
+                        header=(
+                            f"{len(missing_uncreated)} selected {_m_noun} do not exist "
+                            "on the target"
+                        ),
+                        body=(
+                            f"{format_selected_workloads(missing_uncreated)} — not "
+                            "found on Aurora DSQL (deleted, or Schema Conversion not "
+                            "applied). Appending cannot create a table, so the load "
+                            "would fail for "
+                            + ("it" if len(missing_uncreated) == 1 else "each")
+                            + " — and if you then start CDC, "
+                            + ("that table" if len(missing_uncreated) == 1
+                               else "those tables")
+                            + " would be a standing gap CDC will not backfill. Apply "
+                            "Schema Conversion for "
+                            + ("it" if len(missing_uncreated) == 1 else "them")
+                            + " first"
+                            + (", or choose 'Drop & reload' below to (re)create "
+                               + ("it" if len(missing_uncreated) == 1 else "them")
+                               + " from your applied conversion."
+                               if tables_with_data_now and not cdc_live_now
+                               else " (on the Schema Conversion step), then retry.")
+                        ),
+                    )
                 if cdc_live_now:
                     render_notice(
                         ui,
@@ -630,7 +686,7 @@ def _render_full_load_step(
             if target_config is not None and action_tables:
                 from nicegui import run
 
-                def _probe() -> tuple[frozenset[str], dict]:
+                def _probe() -> tuple[frozenset[str], dict, frozenset[str]]:
                     connector = DsqlConnector(
                         target_config, aws_profile=session.aws_profile
                     )
@@ -650,17 +706,28 @@ def _render_full_load_step(
                     keys = target_primary_keys(
                         names, connection_factory=connector.connect
                     )
-                    return found, keys
+                    # Which of the selected tables EXIST on the target -- distinct from
+                    # `found` (rows), so the dialog can warn when a table is genuinely
+                    # missing (deleted, or Schema Conversion not applied) and an append
+                    # would fail it. See tables_present.
+                    present = frozenset(
+                        tables_present(names, connection_factory=connector.connect)
+                    )
+                    return found, keys, present
 
                 try:
-                    found, keys = await run.io_bound(_probe)
+                    found, keys, present = await run.io_bound(_probe)
                     migration_state.set_tables_with_data(found)
                     migration_state.set_target_primary_keys(keys)
+                    migration_state.set_target_tables_present(present)
                 except Exception:  # noqa: BLE001 - on probe failure, warn-less confirm
                     migration_state.set_tables_with_data(frozenset())
                     # Leave the key map EMPTY, not partially filled: an unprobed table
                     # is treated as unknown, so the disclosure stays conservative.
                     migration_state.set_target_primary_keys({})
+                    # None (not empty): "could not read the target", so the dialog must
+                    # NOT warn that every table is missing -- stay conservative.
+                    migration_state.set_target_tables_present(None)
             _open_confirm_dialog_now(
                 action_tables=action_tables,
                 on_confirm=confirm_action,

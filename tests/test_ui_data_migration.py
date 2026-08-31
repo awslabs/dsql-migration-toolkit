@@ -1451,6 +1451,52 @@ def test_confirm_dialog_is_unchanged_when_nothing_will_be_recreated(monkeypatch)
     assert "Recreate and load" not in ui.buttons
 
 
+def test_confirm_dialog_warns_when_a_selected_target_table_is_missing(monkeypatch) -> None:
+    # A target table deleted (or never created by Schema Conversion) is genuinely
+    # missing: an append can't create it, so the load would fail it and -- if CDC then
+    # starts -- it becomes a standing gap. The dialog must WARN before Start, not let it
+    # fail per-table. (Append mode, no recreate candidates -> the table won't be created.)
+    from dsql_migrator.ui.data_migration import _full_load_ui as fl
+
+    monkeypatch.setattr(fl, "DsqlConnector", lambda *a, **k: _StubConnector())
+    monkeypatch.setattr(fl, "tables_with_rows", lambda names, **k: [])  # nothing has rows
+    monkeypatch.setattr(fl, "target_primary_keys", lambda names, **k: {})
+    # 'orders' exists on target; 'gone' does not (deleted / schema not applied).
+    monkeypatch.setattr(fl, "tables_present", lambda names, **k: {"ecommerce.orders"})
+
+    state = DataMigrationState()
+    ui = _open_full_load_confirm_dialog(
+        monkeypatch,
+        recreate_candidates=lambda: [],
+        migration_state=state,
+        session=_StubSession(),
+        selected_names=["ecommerce.orders", "ecommerce.gone"],
+    )
+    body = " ".join(ui.texts)
+    assert "do not exist on the target" in body
+    assert "standing gap" in body  # names the downstream CDC risk
+    assert "Schema Conversion" in body  # the actionable fix
+
+
+def test_confirm_dialog_no_missing_warning_when_targets_exist(monkeypatch) -> None:
+    # When every selected table exists on the target, the missing-table warning is absent.
+    from dsql_migrator.ui.data_migration import _full_load_ui as fl
+
+    monkeypatch.setattr(fl, "DsqlConnector", lambda *a, **k: _StubConnector())
+    monkeypatch.setattr(fl, "tables_with_rows", lambda names, **k: [])
+    monkeypatch.setattr(fl, "target_primary_keys", lambda names, **k: {})
+    monkeypatch.setattr(fl, "tables_present", lambda names, **k: set(names))  # all exist
+
+    ui = _open_full_load_confirm_dialog(
+        monkeypatch,
+        recreate_candidates=lambda: [],
+        migration_state=DataMigrationState(),
+        session=_StubSession(),
+        selected_names=["ecommerce.orders", "ecommerce.gone"],
+    )
+    assert "do not exist on the target" not in " ".join(ui.texts)
+
+
 def test_full_load_step_passes_recreate_candidates_into_the_confirm_dialog() -> None:
     """The disclosure must reach the dialog through a PARAMETER.
 
@@ -1683,6 +1729,9 @@ def test_pre_dialog_probe_caches_each_targets_real_primary_key(monkeypatch) -> N
 
     monkeypatch.setattr(fl, "DsqlConnector", lambda *a, **k: _StubConnector())
     monkeypatch.setattr(fl, "tables_with_rows", lambda names, **k: ["ecommerce.other"])
+    # The probe now also reads which targets EXIST (tables_present); stub it too so the
+    # probe does not fall into its exception path (which would blank the key cache).
+    monkeypatch.setattr(fl, "tables_present", lambda names, **k: set(names))
     real_keys = {
         "ecommerce.orders": ["customer_id", "id"],
         "ecommerce.other": ["id"],

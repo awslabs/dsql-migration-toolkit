@@ -124,6 +124,13 @@ class DataMigrationState:
         # of None means "probed, could not read" -- distinct from an absent key, which
         # means "not probed". Both are treated conservatively downstream.
         self._target_primary_keys: dict[str, Optional[list[str]]] = {}
+        # Which selected tables EXIST on the target, from the SAME pre-dialog probe.
+        # ``None`` means "not probed / probe failed" (treated conservatively: no
+        # missing-table warning); a set means the probe read the target and any selected
+        # table NOT in it is genuinely missing (deleted, or Schema Conversion not
+        # applied) -- so an append load would fail it. Distinct from _tables_with_data
+        # (rows), which treats a missing table the same as an empty one.
+        self._target_tables_present: Optional[frozenset[str]] = None
         # The user's run-wide choice for those pre-existing tables: "append"
         # (keep existing rows, load only the missing ones -- idempotent
         # SKIP_EXISTING, the non-destructive default) or "drop" (DROP+recreate
@@ -836,6 +843,21 @@ class DataMigrationState:
         """Return the pre-existing (non-empty) selected target tables."""
         with self._lock:
             return self._tables_with_data
+
+    def set_target_tables_present(self, names: Optional[frozenset[str]]) -> None:
+        """Record which selected target tables EXIST (probe result), or ``None``.
+
+        ``None`` = not probed / probe failed (no missing-table warning); a set = the
+        target was read, so any selected table not in it is genuinely missing.
+        """
+        with self._lock:
+            self._target_tables_present = names
+
+    @property
+    def target_tables_present(self) -> Optional[frozenset[str]]:
+        """Return the probed set of existing target tables, or ``None`` if unprobed."""
+        with self._lock:
+            return self._target_tables_present
 
     def set_target_primary_keys(
         self, keys: Mapping[str, Optional[list[str]]]

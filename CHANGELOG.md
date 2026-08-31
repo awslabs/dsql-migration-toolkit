@@ -21,6 +21,23 @@ All notable changes to this project are recorded here. This project follows
   `migration_type == FULL_LOAD_AND_CDC`) now forces FK deferral for **every** CDC
   migration, so foreign keys are created only at cut over after the stream drains.
 
+## v0.1.428
+
+### Added
+
+- **Full Load now warns before Start/Reload when a selected target table is missing.**
+  Previously the pre-Start probe only checked which target tables had rows (for the
+  Drop-vs-Append choice) and treated a **missing** table the same as an empty one — so a
+  table deleted on DSQL (or never created because Schema Conversion wasn't applied) was
+  not surfaced; an append load then failed it per-table, and if the operator started CDC
+  the table became a standing gap CDC never backfills. The confirm dialog now runs a
+  distinct existence probe (`tables_present`) and, for selected tables that are missing
+  **and won't be (re)created by this run** (i.e. append mode, not a recreate candidate),
+  shows a warning naming them + the fix: apply Schema Conversion, or choose "Drop &
+  reload" to (re)create them from the applied conversion. Non-blocking (a Drop & reload /
+  recreate-candidate run still creates them), and skipped when the target probe couldn't
+  read the target.
+
 ## v0.1.427
 
 ### Fixed

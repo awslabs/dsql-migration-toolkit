@@ -333,6 +333,52 @@ def tables_with_rows(
     return present
 
 
+def tables_present(
+    table_names: Sequence[str],
+    *,
+    connection_factory: Callable[[], Any],
+) -> set[str]:
+    """Return which of ``table_names`` EXIST on the target (regardless of row count).
+
+    Distinct from :func:`tables_with_rows`, which treats a missing table as "empty"
+    (it only cares whether a table HAS rows): this tells "missing" apart from "empty",
+    so the Full Load confirm can warn that an **append** into a non-existent target
+    table will fail (a table deleted / never created by Schema Conversion). Read-only:
+    ``SELECT 1 FROM <table> LIMIT 0`` per table over a single connection, using the SAME
+    identifier quoting the load uses (so it resolves the table exactly as the load
+    would). A table that errors (does not exist) is simply absent from the result; the
+    transaction is rolled back after each check so one missing table cannot abort the
+    checks for the rest.
+    """
+    from psycopg import sql
+
+    present: set[str] = set()
+    connection = connection_factory()
+    try:
+        for name in table_names:
+            identifier = sql.Identifier(*name.split("."))
+            statement = sql.SQL("SELECT 1 FROM {table} LIMIT 0").format(
+                table=identifier
+            )
+            cursor = connection.cursor()
+            try:
+                cursor.execute(statement)
+                present.add(name)  # the statement succeeded -> the table exists
+            except Exception:  # noqa: BLE001 - a missing table just is not "present"
+                # A failed statement can leave the transaction aborted (PostgreSQL),
+                # which would make every subsequent check fail; reset it so each table
+                # is tested independently. Harmless under an autocommit connection.
+                try:
+                    connection.rollback()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
+            finally:
+                _safe_close(cursor)
+    finally:
+        _safe_close(connection)
+    return present
+
+
 def count_target_rows(
     table_names: Sequence[str],
     *,
