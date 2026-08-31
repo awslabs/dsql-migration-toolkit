@@ -436,6 +436,12 @@ def build_data_migration_screen(
             cdc_stack_name=_pg_cdc_handoff_stack(
                 migration_state, source_config, job_manager
             ),
+            # Source-agnostic "this load hands off to CDC" marker: defers the post-load
+            # FK pass to cut over for EVERY Full Load + CDC run, covering the MySQL
+            # Full-Load-first -> binlog-watermark handoff that cdc_coexisting /
+            # cdc_stack_name both miss (else FKs applied at load end -> 23503 dead-letters).
+            is_cdc_migration=migration_state.migration_type
+            is MigrationType.FULL_LOAD_AND_CDC,
             table_conversions=applied_table_conversions(
                 _conversion,
                 conv_state.edited_target_ddls,
@@ -1213,6 +1219,8 @@ def build_data_migration_screen(
                     staging_bucket=staging_bucket,
                     replace_tables=retry_replace,
                     cdc_coexisting=retry_cdc_coexisting,
+                    is_cdc_migration=migration_state.migration_type
+                    is MigrationType.FULL_LOAD_AND_CDC,
                     table_conversions=applied_table_conversions(
                         _retry_conversion,
                         conv_state.edited_target_ddls,

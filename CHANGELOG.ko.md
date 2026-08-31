@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.427
+
+### 수정 (Fixed)
+
+- **MySQL Full Load + CDC 마이그레이션에서 외래 키(FK)가 더 이상 Full Load 종료 시점에 생성되지
+  않고, 의도대로 cut over로 지연됩니다.** 로드 후 FK 적용 pass가 `cdc_coexisting`(MySQL 커넥터
+  선행 / SKIP_EXISTING)과 `cdc_stack_name`(PostgreSQL 슬롯 핸드오프) 두 신호로만 게이팅되고
+  있었습니다. MySQL의 **Full Load 먼저 → binlog watermark 핸드오프**("Automatic" CDC 시작
+  지점, CDC가 로드 *이후* 시작)에서는 로드 종료 시점에 두 신호가 모두 꺼져 있어 FK가 즉시
+  생성·enforce되었고, 이후 CDC 스트리밍이 시작되면 부모 행이 아직 도착하지 않은 자식 행이 전부
+  dead-letter(DLQ)로 빠졌습니다(`SQLSTATE 23503`, 예: `order_items`/`inventory` → `products`).
+  이제 소스 종류와 무관한 `is_cdc_migration` 입력(`migration_type == FULL_LOAD_AND_CDC`에서
+  파생)이 **모든** CDC 마이그레이션에서 FK 지연을 강제하므로, 외래 키는 스트림이 다 빠진 뒤
+  cut over에서만 생성됩니다.
+
 ## v0.1.426
 
 ### 수정 (Fixed)

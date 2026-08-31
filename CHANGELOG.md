@@ -5,6 +5,22 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.427
+
+### Fixed
+
+- **Foreign keys are no longer applied at Full-Load end for a MySQL Full Load + CDC
+  migration — they now defer to cut over, as intended.** The post-load FK pass was gated
+  only by `cdc_coexisting` (MySQL connectors-first / SKIP_EXISTING) and `cdc_stack_name`
+  (PostgreSQL slot handoff). A MySQL **Full-Load-first → binlog-watermark handoff** (the
+  "Automatic" CDC start point, where CDC starts *after* the load) has neither signal set
+  at load end, so the pass created and enforced the foreign keys immediately — and once
+  CDC began streaming, the out-of-order sink dead-lettered every child row whose parent
+  had not yet arrived (`SQLSTATE 23503`, e.g. `order_items`/`inventory` → `products`). A
+  new source-agnostic `is_cdc_migration` input (derived from
+  `migration_type == FULL_LOAD_AND_CDC`) now forces FK deferral for **every** CDC
+  migration, so foreign keys are created only at cut over after the stream drains.
+
 ## v0.1.426
 
 ### Fixed

@@ -2562,6 +2562,25 @@ def test_apply_foreign_keys_deferred_for_pg_cdc_handoff(monkeypatch) -> None:
     assert applied == []
 
 
+def test_apply_foreign_keys_deferred_for_mysql_fullload_first_cdc(monkeypatch) -> None:
+    # MySQL Full Load + CDC via the binlog-watermark handoff ("Automatic" start point):
+    # the Full Load runs BEFORE CDC is live, so cdc_coexisting is False, and MySQL never
+    # sets cdc_stack_name (PG-only). Neither fine-grained signal is set at load end, so
+    # without is_cdc_migration the FK pass would run here and the later out-of-order sink
+    # stream would dead-letter every child row whose parent has not arrived (SQLSTATE
+    # 23503). Regression: is_cdc_migration (from migration_type == FULL_LOAD_AND_CDC) must
+    # still defer the FKs to cut over.
+    migrator = _view_migrator(
+        cdc_coexisting=False,
+        cdc_stack_name=None,
+        is_cdc_migration=True,
+        table_conversions={"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])},
+    )
+    applied = _patch_fk_apply(monkeypatch, orphans=0)
+    migrator.apply_foreign_keys()
+    assert applied == []
+
+
 def test_apply_foreign_keys_noop_when_preservation_disabled(monkeypatch) -> None:
     # foreign_key_ddls is empty when the user chose to strip FKs in Schema Conversion.
     migrator = _view_migrator(table_conversions={"orders": _fk_conv(foreign_key_ddls=[])})

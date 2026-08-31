@@ -5,6 +5,21 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.427
+
+### 修正 (Fixed)
+
+- **MySQL の Full Load + CDC 移行で、外部キー(FK)が Full Load 終了時に作成されなくなり、意図どおり
+  cut over まで遅延されるようになりました。** ロード後の FK 適用パスは `cdc_coexisting`(MySQL の
+  コネクタ先行 / SKIP_EXISTING)と `cdc_stack_name`(PostgreSQL のスロットハンドオフ)の2つの信号
+  だけでゲートされていました。MySQL の **Full Load 先行 → binlog ウォーターマーク ハンドオフ**
+  (「Automatic」CDC 開始位置、CDC はロードの *後* に開始)では、ロード終了時にどちらの信号も立って
+  いないため FK が即座に作成・enforce され、CDC ストリーミング開始後に親行がまだ届いていない子行が
+  すべて dead-letter(DLQ)に送られていました(`SQLSTATE 23503`、例: `order_items`/`inventory`
+  → `products`)。ソース非依存の新しい `is_cdc_migration` 入力(`migration_type ==
+  FULL_LOAD_AND_CDC` から導出)が **すべての** CDC 移行で FK 遅延を強制するようになり、外部キーは
+  ストリームが排出された後の cut over でのみ作成されます。
+
 ## v0.1.426
 
 ### 修正 (Fixed)

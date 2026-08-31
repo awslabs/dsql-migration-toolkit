@@ -138,6 +138,16 @@ class DataMigrationInputs:
     # PostgreSQL gapless-handoff signal -- distinct from cdc_coexisting, which is MySQL's
     # CDC-live-during-load (SKIP_EXISTING) model that PostgreSQL deliberately does not use.
     cdc_stack_name: Optional[str] = None
+    # True when this run belongs to a Full Load + CDC migration (ANY source), so the
+    # post-load foreign-key pass MUST be deferred to cut over. cdc_coexisting and
+    # cdc_stack_name only cover two of the three CDC sub-flows -- connectors-first
+    # (MySQL SKIP_EXISTING, cdc_coexisting) and the PostgreSQL slot handoff
+    # (cdc_stack_name). A MySQL Full-Load-FIRST -> binlog-watermark handoff (CDC started
+    # AFTER the load, the "Automatic" start point) has NEITHER set at load end, so
+    # without this flag the FK pass would run at load end and the later out-of-order sink
+    # stream would dead-letter every child row whose parent has not arrived yet
+    # (SQLSTATE 23503). Deriving this from migration_type covers all three sub-flows.
+    is_cdc_migration: bool = False
     # Per-table APPLIED target conversion (schema/create/index DDL), keyed by
     # qualified table name, honoring the user's Schema Conversion edits. Single
     # source of truth for the target schema, used to (a) recreate a table on a
@@ -3590,21 +3600,27 @@ class BatchedTableMigrator:
 
         No-op for ANY CDC migration -- foreign keys are applied at cut over, after the
         stream drains, never while the sink streams out-of-order rows (it would
-        dead-letter an FK violation, SQLSTATE 23503). Two distinct CDC signals both
-        force deferral, one per engine's handoff model:
-          * ``cdc_coexisting`` -- MySQL's model, where connectors stream DURING the
-            load (SKIP_EXISTING). CDC is already live, so this is True mid-load.
-          * ``cdc_stack_name`` -- PostgreSQL's Full-Load-FIRST gapless handoff, where
-            CDC starts AFTER this load. Here ``cdc_coexisting`` is False during the
-            initial load, so gating on it alone would wrongly apply FKs at end of the
-            PG load and the later stream would dead-letter (23503). ``cdc_stack_name``
-            is set only for a PostgreSQL Full Load + CDC run (None for a load-only run
-            and always for MySQL), so it is the reliable "this load hands off to CDC"
-            marker.
+        dead-letter an FK violation, SQLSTATE 23503). ``is_cdc_migration`` (derived from
+        ``migration_type == FULL_LOAD_AND_CDC``) is the reliable, source-agnostic marker
+        and forces deferral for every CDC run. It exists because the two finer-grained
+        signals each cover only one handoff model and MISS the MySQL Full-Load-first case:
+          * ``cdc_coexisting`` -- MySQL's connectors-first model, where connectors stream
+            DURING the load (SKIP_EXISTING). CDC is already live, so this is True mid-load.
+            It is False for a MySQL Full-Load-FIRST -> binlog-watermark handoff (CDC started
+            after the load), which is the common flow.
+          * ``cdc_stack_name`` -- PostgreSQL's Full-Load-FIRST gapless handoff. Set only for
+            a PostgreSQL Full Load + CDC run (None for a load-only run and always for
+            MySQL). Without ``is_cdc_migration``, a MySQL Full-Load-first->CDC run had
+            NEITHER signal set at load end, so the FK pass ran and the later stream
+            dead-lettered (23503) -- the bug this flag fixes.
         Also a no-op when the user disabled foreign-key preservation
         (``foreign_key_ddls`` empty).
         """
-        if self._inputs.cdc_coexisting or self._inputs.cdc_stack_name:
+        if (
+            self._inputs.is_cdc_migration
+            or self._inputs.cdc_coexisting
+            or self._inputs.cdc_stack_name
+        ):
             return (0, 0, 0)
         return apply_preserved_foreign_keys(
             self._inputs.table_conversions, self._view_connection_factory()
