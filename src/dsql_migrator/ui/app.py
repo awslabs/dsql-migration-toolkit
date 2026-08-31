@@ -807,6 +807,24 @@ def build_page(
             migration_state.set_cdc_stack_phase("absent", status=None)
             if state == "failed":
                 state = None
+        # Self-heal a stuck RUNNING banner: if the delete job hangs AFTER the stack is
+        # already gone (its post-stack cleanup thread wedged, or a long-lived tab whose
+        # self-poll chain broke), the "deleting…" banner would pin over a stack that no
+        # longer exists. Keying purely on job status missed this (the failed-path
+        # self-heal above did not cover a still-"running" job). Do a THROTTLED best-effort
+        # live check (not on every 10s poll): on a definitive does-not-exist, treat the
+        # teardown as complete and fall through to the clean-completion path below (record
+        # the dismissable "deleted" notice + clear the marker).
+        if state == "running":
+            import time as _t
+
+            _now = _t.monotonic()
+            _last = getattr(migration_state, "_cdc_teardown_gone_check_monotonic", 0.0)
+            if (_now - _last) >= 30.0:
+                migration_state._cdc_teardown_gone_check_monotonic = _now
+                if _cdc_teardown_stack_confirmed_gone(migration_state):
+                    migration_state.set_cdc_stack_phase("absent", status=None)
+                    state = None
         if state in ("running", "failed"):
             info = {
                 "state": state,

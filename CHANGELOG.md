@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.426
+
+### Fixed
+
+- **The "CDC infrastructure teardown in progress" banner now clears once the stack is
+  actually gone.** The persistent teardown banner keyed only on the delete JOB's status,
+  and the "is the stack gone?" self-heal ran only on the *failed* path — so if the delete
+  job hung after the stack had already been deleted (a wedged post-stack cleanup thread,
+  or a long-lived tab whose self-poll chain broke), the "Deleting… (~15–45 min)" banner
+  pinned over a stack that no longer existed. The running banner now also does a throttled
+  (~30s) best-effort live check and, on a definitive does-not-exist, completes the
+  teardown — replacing the banner with the dismissable "CDC infrastructure deleted" notice
+  and clearing the marker.
+
 ## v0.1.425
 
 ### Changed
