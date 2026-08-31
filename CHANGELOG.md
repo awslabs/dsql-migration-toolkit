@@ -5,6 +5,18 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.420
+
+### Fixed
+
+- **Schema Conversion: "Apply all … to target" is now disabled until you Generate the
+  DDL.** The in-card bulk-apply button was only disabled while an apply was already
+  running — never gated on whether "Generate DDL for selected" had been run — so it was
+  clickable before any DDL was generated (and after Start over, which clears the
+  generated scope). It now stays disabled with a "Generate the DDL first" hint until the
+  reviewed DDL exists, and the handler is guarded so it can never apply an un-reviewed
+  scope. (The sidebar Run keeps its own ticked-scope behavior.)
+
 ## v0.1.419
 
 ### Fixed

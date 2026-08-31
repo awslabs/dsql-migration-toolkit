@@ -3478,18 +3478,27 @@ def test_ddl_diff_wires_an_expand_handler_to_each_pane() -> None:
 
 
 class _ApplyControlsUi:
-    """Records label text, button labels and select options for the apply card."""
+    """Records label text, button labels, and the apply button's props (disable)."""
 
     def __init__(self) -> None:
         self.texts: list[str] = []
         self.buttons: list[str] = []
+        self.button_props: list[str] = []
 
     class _El:
+        def __init__(self, ui=None):
+            self._ui = ui
+
         def __enter__(self):
             return self
 
         def __exit__(self, *exc):
             return False
+
+        def props(self, spec="", *_a, **_k):
+            if self._ui is not None:
+                self._ui.button_props.append(str(spec))
+            return self
 
         def __getattr__(self, _name):
             return lambda *_a, **_k: self
@@ -3502,13 +3511,13 @@ class _ApplyControlsUi:
     def button(self, text="", *_a, **_k):
         if text:
             self.buttons.append(str(text))
-        return self._El()
+        return self._El(self)  # carries `self` so .props("disable") is recorded
 
     def __getattr__(self, _name):
         return lambda *_a, **_k: _ApplyControlsUi._El()
 
 
-def _render_apply_card(count: int, *, in_progress: bool = False):
+def _render_apply_card(count: int, *, in_progress: bool = False, generated: bool = True):
     from dsql_migrator.ui.schema_conversion import (
         SchemaConversionState,
         _render_apply_controls,
@@ -3522,6 +3531,7 @@ def _render_apply_card(count: int, *, in_progress: bool = False):
         on_apply_all=lambda: None,
         table_count=count,
         in_progress=in_progress,
+        generated=generated,
     )
     return ui
 
@@ -3568,6 +3578,31 @@ def test_apply_card_button_shows_progress_label_while_applying() -> None:
     ui = _render_apply_card(7, in_progress=True)
     assert "Applying…" in ui.buttons
     assert not any(b.startswith("Apply all") for b in ui.buttons)
+
+
+def test_apply_card_is_disabled_before_ddl_is_generated() -> None:
+    # Reported: "Apply ... to target" was clickable BEFORE "Generate DDL for selected"
+    # (and after Start over, which clears the generated scope). This card applies the
+    # GENERATED, reviewed DDL, so before generation the button must be DISABLED with a
+    # hint -- never a live "Apply all N ..." that would apply an un-reviewed scope.
+    ui = _render_apply_card(7, generated=False)
+    # Button is present but reads as the generic (disabled) label, NOT a scope count.
+    assert "Apply generated DDL to target" in ui.buttons
+    assert not any(b.startswith("Apply all") for b in ui.buttons)
+    # It is disabled.
+    assert any("disable" in p for p in ui.button_props)
+    # The scope line is replaced by a "generate first" hint, and the misleading count /
+    # single-object pointer are gone.
+    assert any("Generate the DDL first" in t for t in ui.texts)
+    assert not any("from the Generated DDL list above" in t for t in ui.texts)
+    assert not any("To apply just one object instead" in t for t in ui.texts)
+
+
+def test_apply_card_is_enabled_once_ddl_is_generated() -> None:
+    # The normal (generated) path stays live and un-disabled.
+    ui = _render_apply_card(7, generated=True)
+    assert "Apply all 7 generated objects to target" in ui.buttons
+    assert not any("disable" in p for p in ui.button_props)
 
 
 # ---------------------------------------------------------------------------

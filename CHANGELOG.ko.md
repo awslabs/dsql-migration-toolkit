@@ -5,6 +5,17 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.420
+
+### 수정 (Fixed)
+
+- **Schema Conversion: "Apply all … to target" 버튼이 이제 DDL을 생성하기 전에는 비활성화됩니다.**
+  카드 내 일괄 적용 버튼은 적용이 진행 중일 때만 비활성화됐을 뿐, "Generate DDL for selected"를
+  실행했는지와는 무관했습니다 — 그래서 DDL 생성 전에도(그리고 생성 범위를 지우는 Start over
+  이후에도) 클릭할 수 있었습니다. 이제 검토된 DDL이 생길 때까지 "먼저 DDL을 생성하세요" 힌트와
+  함께 비활성화되고, 핸들러도 가드를 두어 검토되지 않은 범위를 적용할 수 없게 했습니다. (사이드바
+  Run은 기존의 ticked-범위 동작을 유지합니다.)
+
 ## v0.1.419
 
 ### 수정 (Fixed)

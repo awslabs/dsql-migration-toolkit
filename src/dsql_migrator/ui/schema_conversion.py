@@ -2260,6 +2260,19 @@ def build_schema_conversion_screen(
                 # to show progress; REPLACE opens its confirm dialog and refreshes
                 # on confirm. We must NOT refresh here, or it would tear down the
                 # REPLACE confirm dialog the instant it opens.
+                #
+                # Defensive gate: this card applies the GENERATED, reviewed DDL, so it
+                # is a no-op before "Generate DDL for selected" has been run (the button
+                # is disabled then, but guard the handler too so it can never apply an
+                # un-reviewed scope -- e.g. right after Start over clears the generated
+                # scope). The sidebar Run keeps its own ticked-scope behavior.
+                if conv_state.generated_node_ids is None:
+                    ui.notify(  # type: ignore[attr-defined]
+                        "Generate the DDL for your selected objects first "
+                        "(\"Generate DDL for selected\" above).",
+                        type="warning",
+                    )
+                    return
                 runner()
 
             with ui.card().classes("w-full"):
@@ -2270,6 +2283,7 @@ def build_schema_conversion_screen(
                     on_apply_all=apply_all,
                     table_count=len(_all_apply_objects(inventory)),
                     in_progress=status is StepStatus.IN_PROGRESS,
+                    generated=conv_state.generated_node_ids is not None,
                 )
 
                 error = conv_state.error
@@ -4086,6 +4100,7 @@ def _render_apply_controls(
     on_apply_all: Optional[Callable[[], object]] = None,
     table_count: int = 0,
     in_progress: bool = False,
+    generated: bool = True,
 ) -> None:
     """Render the apply-mode choice and the apply action (with REPLACE confirm).
 
@@ -4097,6 +4112,10 @@ def _render_apply_controls(
     confirmation dialog (so confirmation happens at the moment of applying, not
     via a sticky checkbox). ``table_count`` shows how many objects are in that
     apply scope; ``in_progress`` disables the button while an apply job is running.
+    ``generated`` is whether "Generate DDL for selected" has been run: this card
+    applies the GENERATED, reviewed DDL, so before generation the action is disabled
+    with a hint (clicking it would otherwise apply an un-reviewed scope, and after
+    Start over -- which clears the generated scope -- it must not stay live).
     """
     # Title names the OBJECT of the action ("generated DDL"), not just the action, so
     # this card reads as the bulk action ON the list above rather than a separate
@@ -4109,13 +4128,21 @@ def _render_apply_controls(
     # Restate the scope with its COUNT. The count is the concrete tie back to the list:
     # it moves with the user's selection, so the two sections visibly describe the same
     # set -- which is what the old "...in the Generated DDL list above" pointer was
-    # trying (and failing) to do with words alone.
+    # trying (and failing) to do with words alone. Before generation there IS no scope,
+    # so say that instead of showing a misleading count of the merely-ticked objects.
     noun = "object" if table_count == 1 else "objects"
-    ui.label(  # type: ignore[attr-defined]
-        f"Applies the {table_count} {noun} from the Generated DDL list above "
-        "(plus any approved AI suggestions) — not the whole schema. Choose how to "
-        "handle objects that already exist on the target, then apply."
-    ).classes("text-sm text-gray-500")
+    if not generated:
+        ui.label(  # type: ignore[attr-defined]
+            "Generate the DDL first — tick objects above and click \"Generate DDL for "
+            "selected\". This applies the generated, reviewed DDL, so it stays disabled "
+            "until you generate."
+        ).classes("text-sm text-gray-500")
+    else:
+        ui.label(  # type: ignore[attr-defined]
+            f"Applies the {table_count} {noun} from the Generated DDL list above "
+            "(plus any approved AI suggestions) — not the whole schema. Choose how to "
+            "handle objects that already exist on the target, then apply."
+        ).classes("text-sm text-gray-500")
 
     def on_mode_change(event: object) -> None:
         value = getattr(event, "value", None)
@@ -4157,22 +4184,30 @@ def _render_apply_controls(
             # Say WHAT is being applied, not just "all": "Apply all 7 generated
             # objects" is unambiguous about scope, where a bare "Apply all to target
             # (7)" reads as "everything on the source".
-            apply_label = (
-                "Applying…"
-                if in_progress
-                else f"Apply all {table_count} generated {noun} to target"
-            )
+            if not generated:
+                apply_label = "Apply generated DDL to target"
+            elif in_progress:
+                apply_label = "Applying…"
+            else:
+                apply_label = f"Apply all {table_count} generated {noun} to target"
             apply_button = ui.button(  # type: ignore[attr-defined]
                 apply_label,
                 on_click=on_apply_all,
             ).props("unelevated no-caps color=primary icon=cloud_upload")
-            if in_progress:
+            # Disabled until the DDL is generated (nothing reviewed to apply) or while an
+            # apply is already running.
+            if in_progress or not generated:
                 apply_button.props("disable")  # type: ignore[attr-defined]
+            if not generated:
+                apply_button.tooltip(  # type: ignore[attr-defined]
+                    "Generate the DDL for your selected objects first."
+                )
         # The scope is now carried by the header + button label, so this line only adds
         # what neither says: the single-object alternative. Pointless when the scope IS
         # one object -- the button already applies exactly that -- so it is omitted
-        # rather than telling the user to do what they are about to do.
-        if table_count != 1:
+        # rather than telling the user to do what they are about to do. Also omitted
+        # before generation, when there is no Generated DDL list to point at.
+        if generated and table_count != 1:
             ui.label(  # type: ignore[attr-defined]
                 "To apply just one object instead, use its \"Apply to target\" button "
                 "in the Generated DDL list above."
