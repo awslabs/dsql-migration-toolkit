@@ -93,6 +93,29 @@ fails **loudly** where it can't.
   flattening to `true`. Clean the source data (or exclude the column) and re-run.
   A PostgreSQL source has a native `boolean` type, so this MySQL-specific
   `TINYINT(1)`→`boolean` coercion and its table-fatal guard do not apply.
+- **PostgreSQL 17/18 sources — three version-specific edges (none block a
+  migration).** PG 13–18 are supported; 17 and 18 add three things to keep in mind:
+  - **`interval` `infinity`/`-infinity` (new in PG17).** Aurora DSQL is
+    PostgreSQL-16-compatible and its `interval` input parser rejects these values, so
+    a row carrying an *infinite* `interval` is **quarantined** during Full Load
+    (visible in the quarantine count) and surfaced by Validation as a count/checksum
+    mismatch — never silently altered. Finite intervals and `timestamp`/`timestamptz`
+    `infinity` are unaffected. Remodel such rows (e.g. to a finite sentinel) before
+    migrating the column.
+  - **VIRTUAL generated columns (the DEFAULT kind on PG18).** DSQL has no generated
+    columns, so a `GENERATED ALWAYS AS (expr)` column — STORED **or** VIRTUAL — is
+    created as an ordinary column and flagged **MANUAL/LOSS** in Schema Conversion.
+    Full Load materializes the computed value (the target starts correct), but nothing
+    maintains it afterward and CDC does **not** replicate generated columns (VIRTUAL
+    columns cannot be logically replicated at all). Recompute the value in the
+    application before cut over.
+  - **CDC connector coverage.** The bundled Debezium PostgreSQL connector's tested
+    matrix tops out at PG16. `pgoutput` streaming still works on 17/18 (the logical
+    replication protocol is unchanged and the driver connects over the stable wire
+    protocol), but treat 17/18 CDC as **best-effort** and validate it end to end
+    (Full Load watermark → slot resume → DSQL sink → Validation checksum) before
+    relying on it in production. On PG18 also confirm `idle_replication_slot_timeout`
+    is `0` (disabled) so a quiet period can't auto-invalidate the CDC slot.
 
 ---
 

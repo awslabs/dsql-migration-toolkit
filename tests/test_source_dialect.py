@@ -169,16 +169,18 @@ def test_postgres_dialect_enrich_captures_exact_pg_types() -> None:
     assert table.columns[2].mysql_type == "TEXT"  # not in catalog rows -> unchanged
 
 
-def test_postgres_dialect_enrich_flags_stored_generated_columns() -> None:
-    # T4-4: enrich reads pg_attribute.attgenerated -> a STORED generated column ('s') sets
-    # ColumnDef.generated so the converter can warn (DSQL has no generated columns). An
-    # ordinary column (attgenerated '') stays generated=False.
+def test_postgres_dialect_enrich_flags_stored_and_virtual_generated_columns() -> None:
+    # T4-4: enrich reads pg_attribute.attgenerated -> both a STORED generated column ('s')
+    # and a VIRTUAL generated column ('v', new in PG18 and its DEFAULT kind) set
+    # ColumnDef.generated so the converter can warn (DSQL has no generated columns of either
+    # kind). An ordinary column (attgenerated '') stays generated=False.
     from dsql_migrator.core.models import ColumnDef, TableDef
 
     conn = _FakePgConnection(
         [
             {"col": "id", "typ": "bigint", "gen": ""},
             {"col": "full_name", "typ": "text", "gen": "s"},
+            {"col": "area", "typ": "numeric", "gen": "v"},
         ]
     )
     table = TableDef(
@@ -186,6 +188,7 @@ def test_postgres_dialect_enrich_flags_stored_generated_columns() -> None:
         columns=[
             ColumnDef(name="id", mysql_type="BIGINT"),
             ColumnDef(name="full_name", mysql_type="TEXT"),
+            ColumnDef(name="area", mysql_type="NUMERIC"),
         ],
         primary_key=["id"],
     )
@@ -193,6 +196,7 @@ def test_postgres_dialect_enrich_flags_stored_generated_columns() -> None:
     assert table.columns[0].generated is False  # ordinary column
     assert table.columns[1].generated is True  # STORED generated column
     assert table.columns[1].mysql_type == "text"
+    assert table.columns[2].generated is True  # VIRTUAL generated column (PG18+)
 
 
 def test_postgres_dialect_supports_shared_snapshot_and_renders_export_import_sql() -> None:

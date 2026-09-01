@@ -38,8 +38,10 @@ plus a pointer to the chapter that covers it in depth.
 
 - [ ] **Two source engines are supported.** **RDS for MySQL** and **Aurora
       MySQL** (versions **5.7 / 8.0 / 8.4**), and **RDS for PostgreSQL** and
-      **Aurora PostgreSQL** (PG **13–16** tested; the tool enforces no hard PG
-      version floor/ceiling). Pick the source engine on the Connect screen (MySQL
+      **Aurora PostgreSQL** (PG **13–18**; 13–16 tested end to end, 17/18 verified
+      by a compatibility audit — see [§6.2](06-limitations.md#62-migration-process-limits)
+      for two version-specific edges + a CDC-connector caveat; the tool enforces no
+      hard PG version floor/ceiling). Pick the source engine on the Connect screen (MySQL
       defaults to port **3306**, PostgreSQL to **5432**; a PostgreSQL source
       connects to a single database). Both engines authenticate with a password or
       an **AWS Secrets Manager** username/password — IAM auth is target-DSQL only.

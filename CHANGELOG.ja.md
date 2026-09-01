@@ -5,20 +5,30 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
-## v0.1.427
+## v0.1.429
 
 ### 修正 (Fixed)
 
-- **MySQL の Full Load + CDC 移行で、外部キー(FK)が Full Load 終了時に作成されなくなり、意図どおり
-  cut over まで遅延されるようになりました。** ロード後の FK 適用パスは `cdc_coexisting`(MySQL の
-  コネクタ先行 / SKIP_EXISTING)と `cdc_stack_name`(PostgreSQL のスロットハンドオフ)の2つの信号
-  だけでゲートされていました。MySQL の **Full Load 先行 → binlog ウォーターマーク ハンドオフ**
-  (「Automatic」CDC 開始位置、CDC はロードの *後* に開始)では、ロード終了時にどちらの信号も立って
-  いないため FK が即座に作成・enforce され、CDC ストリーミング開始後に親行がまだ届いていない子行が
-  すべて dead-letter(DLQ)に送られていました(`SQLSTATE 23503`、例: `order_items`/`inventory`
-  → `products`)。ソース非依存の新しい `is_cdc_migration` 入力(`migration_type ==
-  FULL_LOAD_AND_CDC` から導出)が **すべての** CDC 移行で FK 遅延を強制するようになり、外部キーは
-  ストリームが排出された後の cut over でのみ作成されます。
+- **PostgreSQL 18 の VIRTUAL 生成列を検出・表示するようになりました(以前は無通知)。**
+  `PostgresSourceDialect.enrich` は `pg_attribute.attgenerated == 's'`(STORED)のときだけ列を
+  生成列として表示していました。PostgreSQL 18 は VIRTUAL 生成列を追加し、キーワードなしの
+  `GENERATED ALWAYS AS (expr)` の **既定** の種類を VIRTUAL にしました — そのため PG18 ソースで
+  最も一般的な生成列の形(`attgenerated = 'v'`)が通常の列として分類され、Schema Conversion は
+  MANUAL/LOSS 警告を **まったく** 出さず、列は通常列として作成・Full Load で実体化され、その後は
+  何も維持しない(かつ CDC が複製しない)という通知がありませんでした。enrich が `'s'` と `'v'` の
+  両方を生成列として扱うようになり、既存の `_pg_generated_column_warning` が VIRTUAL 列でも STORED
+  と同様に発火します。警告文言も両方の種類を含むよう一般化し、CDC が生成列を維持しないこと
+  (VIRTUAL 列は論理レプリケーション自体ができないこと)を明記します。PostgreSQL 18 ソースのみに
+  影響(13–17 には STORED 生成列のみ)。
+
+### ドキュメント (Documentation)
+
+- **マニュアル: PostgreSQL 17/18 ソースのサポート。** `00-before-you-begin` が PG **13–18** の
+  サポートを明記し、`06-limitations §6.2` が互換性監査で判明した PG17/18 固有のエッジ 3 点を
+  文書化します:PostgreSQL-16 互換の DSQL ターゲットで `interval` の `infinity`/`-infinity`
+  (PG17 で新規)は Full Load が隔離し Validation が検出;PG18 の VIRTUAL 生成列;同梱の Debezium
+  PostgreSQL コネクタのテスト対象が PG16 までであること(17/18 の CDC はベストエフォート — エンド
+  ツーエンドで検証し、PG18 では `idle_replication_slot_timeout=0` を確認)。
 
 ## v0.1.428
 
@@ -34,6 +44,21 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
   します:Schema Conversion を適用するか、「Drop & reload」を選んで適用済み変換から(再)作成。
   非ブロッキング(Drop & reload/再作成候補の実行はそのまま作成)で、ターゲットを読めなかった場合は
   警告を省略します。
+
+## v0.1.427
+
+### 修正 (Fixed)
+
+- **MySQL の Full Load + CDC 移行で、外部キー(FK)が Full Load 終了時に作成されなくなり、意図どおり
+  cut over まで遅延されるようになりました。** ロード後の FK 適用パスは `cdc_coexisting`(MySQL の
+  コネクタ先行 / SKIP_EXISTING)と `cdc_stack_name`(PostgreSQL のスロットハンドオフ)の2つの信号
+  だけでゲートされていました。MySQL の **Full Load 先行 → binlog ウォーターマーク ハンドオフ**
+  (「Automatic」CDC 開始位置、CDC はロードの *後* に開始)では、ロード終了時にどちらの信号も立って
+  いないため FK が即座に作成・enforce され、CDC ストリーミング開始後に親行がまだ届いていない子行が
+  すべて dead-letter(DLQ)に送られていました(`SQLSTATE 23503`、例: `order_items`/`inventory`
+  → `products`)。ソース非依存の新しい `is_cdc_migration` 入力(`migration_type ==
+  FULL_LOAD_AND_CDC` から導出)が **すべての** CDC 移行で FK 遅延を強制するようになり、外部キーは
+  ストリームが排出された後の cut over でのみ作成されます。
 
 ## v0.1.427
 

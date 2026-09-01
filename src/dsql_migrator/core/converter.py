@@ -2229,13 +2229,16 @@ def _generated_column_warning(table: TableDef) -> Optional[ConversionWarning]:
 def _pg_generated_column_warning(table: TableDef) -> Optional[ConversionWarning]:
     """PostgreSQL-source variant of :func:`_generated_column_warning`.
 
-    A PostgreSQL ``GENERATED ALWAYS AS (...) STORED`` column has no Aurora DSQL
-    equivalent, so it is created as an ORDINARY column (``build_pg_source_ddl`` emits
-    no ``GENERATED`` clause). Full Load copies the values the source already computed --
-    the target starts CORRECT -- but nothing maintains them, so any insert/update that
-    does not supply the value drifts. The wording is PG-specific (the MySQL variant names
-    ``SHOW CREATE TABLE``); kept as a separate helper so the MySQL message stays
-    byte-identical.
+    A PostgreSQL ``GENERATED ALWAYS AS (...)`` column -- **STORED** or **VIRTUAL** (the
+    latter new in PG18, where it is the default kind) -- has no Aurora DSQL equivalent, so
+    it is created as an ORDINARY column (``build_pg_source_ddl`` emits no ``GENERATED``
+    clause). Full Load copies the values the source already computed (a VIRTUAL column is
+    computed on read, so its value is materialized too) -- the target starts CORRECT -- but
+    nothing maintains them, so any insert/update that does not supply the value drifts. CDC
+    does not maintain them either: PostgreSQL does not publish generated columns by default,
+    and VIRTUAL generated columns cannot be logically replicated at all. The wording is
+    PG-specific (the MySQL variant names ``SHOW CREATE TABLE``); kept as a separate helper
+    so the MySQL message stays byte-identical.
     """
     columns = [column.name for column in table.columns if column.generated]
     if not columns:
@@ -2246,13 +2249,17 @@ def _pg_generated_column_warning(table: TableDef) -> Optional[ConversionWarning]
         classification=Classification.MANUAL,
         kind=ConversionNoteKind.LOSS,
         message=(
-            f"Columns ({names}) are PostgreSQL STORED generated columns; Aurora DSQL has "
-            "no equivalent, so they are created as ORDINARY columns. Full Load copies the "
-            "values the source already computed, so the target starts correct — but "
-            "nothing maintains them afterwards, so any insert/update that does not supply "
-            "the value will drift. Compute it in the application (or in the query) before "
-            "cut over. The generating expression is not captured here; read it from the "
-            "source (e.g. \\d+ on the table, or pg_get_expr on pg_attrdef)."
+            f"Columns ({names}) are PostgreSQL generated (computed) columns (STORED or "
+            "VIRTUAL); Aurora DSQL has no equivalent, so they are created as ORDINARY "
+            "columns. Full Load copies the values the source already computed, so the "
+            "target starts correct — but nothing maintains them afterwards, so any "
+            "insert/update that does not supply the value will drift. CDC does not maintain "
+            "them either: generated columns are not carried by the replication stream "
+            "(PostgreSQL does not publish them by default, and VIRTUAL columns — the default "
+            "kind on PostgreSQL 18 — cannot be logically replicated at all). Compute the "
+            "value in the application (or in the query) before cut over. The generating "
+            "expression is not captured here; read it from the source (e.g. \\d+ on the "
+            "table, or pg_get_expr on pg_attrdef)."
         ),
     )
 

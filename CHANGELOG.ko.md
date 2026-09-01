@@ -5,20 +5,30 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
-## v0.1.427
+## v0.1.429
 
 ### 수정 (Fixed)
 
-- **MySQL Full Load + CDC 마이그레이션에서 외래 키(FK)가 더 이상 Full Load 종료 시점에 생성되지
-  않고, 의도대로 cut over로 지연됩니다.** 로드 후 FK 적용 pass가 `cdc_coexisting`(MySQL 커넥터
-  선행 / SKIP_EXISTING)과 `cdc_stack_name`(PostgreSQL 슬롯 핸드오프) 두 신호로만 게이팅되고
-  있었습니다. MySQL의 **Full Load 먼저 → binlog watermark 핸드오프**("Automatic" CDC 시작
-  지점, CDC가 로드 *이후* 시작)에서는 로드 종료 시점에 두 신호가 모두 꺼져 있어 FK가 즉시
-  생성·enforce되었고, 이후 CDC 스트리밍이 시작되면 부모 행이 아직 도착하지 않은 자식 행이 전부
-  dead-letter(DLQ)로 빠졌습니다(`SQLSTATE 23503`, 예: `order_items`/`inventory` → `products`).
-  이제 소스 종류와 무관한 `is_cdc_migration` 입력(`migration_type == FULL_LOAD_AND_CDC`에서
-  파생)이 **모든** CDC 마이그레이션에서 FK 지연을 강제하므로, 외래 키는 스트림이 다 빠진 뒤
-  cut over에서만 생성됩니다.
+- **PostgreSQL 18 VIRTUAL 생성 컬럼을 이제 탐지·표시합니다(이전엔 무신호).**
+  `PostgresSourceDialect.enrich`가 `pg_attribute.attgenerated == 's'`(STORED)일 때만 컬럼을
+  생성 컬럼으로 표시했습니다. PostgreSQL 18은 VIRTUAL 생성 컬럼을 추가하고, 키워드 없는
+  `GENERATED ALWAYS AS (expr)`의 **기본** 종류를 VIRTUAL로 만들었습니다 — 그래서 PG18 소스에서
+  가장 흔한 생성 컬럼 형태(`attgenerated = 'v'`)가 일반 컬럼으로 분류돼, Schema Conversion이
+  MANUAL/LOSS 경고를 **전혀** 내지 않고, 컬럼이 일반 컬럼으로 생성·Full Load로 실체화되며 이후
+  아무것도 유지하지 않는다는(그리고 CDC가 복제하지 않는다는) 신호가 없었습니다. 이제 enrich가
+  `'s'`와 `'v'`를 모두 생성 컬럼으로 취급하므로 기존 `_pg_generated_column_warning`이 VIRTUAL
+  컬럼에도 STORED와 동일하게 발동하며, 경고 문구도 두 종류를 포괄하도록 일반화하고 CDC가 생성
+  컬럼을 유지하지 않는다는 점(VIRTUAL 컬럼은 논리 복제 자체가 불가)을 명시합니다. PostgreSQL 18
+  소스에만 영향(13–17에는 STORED 생성 컬럼만 존재).
+
+### 문서 (Documentation)
+
+- **매뉴얼: PostgreSQL 17/18 소스 지원.** `00-before-you-begin`이 이제 PG **13–18** 지원을
+  명시하고, `06-limitations §6.2`가 호환성 감사로 드러난 PG17/18 고유 엣지 3가지를 문서화합니다:
+  PostgreSQL-16 호환 DSQL 타깃에서 `interval`의 `infinity`/`-infinity`(PG17 신규)는 Full Load가
+  격리하고 Validation이 잡아냄; PG18 VIRTUAL 생성 컬럼; 그리고 번들 Debezium PostgreSQL 커넥터의
+  테스트 매트릭스가 PG16까지라는 점(17/18 CDC는 best-effort — 종단 간 검증하고 PG18에서
+  `idle_replication_slot_timeout=0` 확인).
 
 ## v0.1.428
 
@@ -33,6 +43,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
   후보 아님)에 대해 이름과 함께 경고하고 해법을 안내합니다: Schema Conversion을 적용하거나 "Drop &
   reload"를 선택해 적용된 변환으로 (재)생성. 비차단(Drop & reload/재생성 후보 실행은 그대로 생성),
   타깃을 읽지 못했을 땐 경고를 생략합니다.
+
+## v0.1.427
+
+### 수정 (Fixed)
+
+- **MySQL Full Load + CDC 마이그레이션에서 외래 키(FK)가 더 이상 Full Load 종료 시점에 생성되지
+  않고, 의도대로 cut over로 지연됩니다.** 로드 후 FK 적용 pass가 `cdc_coexisting`(MySQL 커넥터
+  선행 / SKIP_EXISTING)과 `cdc_stack_name`(PostgreSQL 슬롯 핸드오프) 두 신호로만 게이팅되고
+  있었습니다. MySQL의 **Full Load 먼저 → binlog watermark 핸드오프**("Automatic" CDC 시작
+  지점, CDC가 로드 *이후* 시작)에서는 로드 종료 시점에 두 신호가 모두 꺼져 있어 FK가 즉시
+  생성·enforce되었고, 이후 CDC 스트리밍이 시작되면 부모 행이 아직 도착하지 않은 자식 행이 전부
+  dead-letter(DLQ)로 빠졌습니다(`SQLSTATE 23503`, 예: `order_items`/`inventory` → `products`).
+  이제 소스 종류와 무관한 `is_cdc_migration` 입력(`migration_type == FULL_LOAD_AND_CDC`에서
+  파생)이 **모든** CDC 마이그레이션에서 FK 지연을 강제하므로, 외래 키는 스트림이 다 빠진 뒤
+  cut over에서만 생성됩니다.
 
 ## v0.1.427
 

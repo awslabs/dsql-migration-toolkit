@@ -76,6 +76,24 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   뭉개지 않고, 해당 테이블의 Full Load를 요란하게 중단시킵니다. 소스 데이터를 정리(또는 해당 컬럼 제외)한 뒤
   다시 실행하세요. PostgreSQL 소스에는 네이티브 `boolean` 타입이 있으므로, 이 MySQL 고유의
   `TINYINT(1)`→`boolean` 강제 변환과 테이블 전체 실패 가드는 적용되지 않습니다.
+- **PostgreSQL 17/18 소스 — 버전별 엣지 3가지(어느 것도 마이그레이션을 막지 않음).** PG 13–18을
+  지원하며, 17·18에서 유의할 점이 3가지 있습니다:
+  - **`interval`의 `infinity`/`-infinity`(PG17 신규).** Aurora DSQL은 PostgreSQL-16 호환이라 그
+    `interval` 입력 파서가 이 값을 거부합니다. 따라서 *무한* `interval`을 담은 행은 Full Load 중
+    **격리(quarantine)**되어(격리 카운트에 표시됨) Validation에서 count/checksum 불일치로 드러납니다 —
+    조용히 변형되는 일은 없습니다. 유한 interval과 `timestamp`/`timestamptz`의 `infinity`는 영향받지
+    않습니다. 해당 컬럼을 마이그레이션하기 전에 그런 행을 재모델링(예: 유한 sentinel 값)하세요.
+  - **VIRTUAL 생성 컬럼(PG18의 기본 종류).** DSQL에는 생성 컬럼이 없으므로 `GENERATED ALWAYS AS
+    (expr)` 컬럼은 — STORED든 **VIRTUAL**이든 — 일반 컬럼으로 생성되고 Schema Conversion에서
+    **MANUAL/LOSS**로 표시됩니다. Full Load는 계산된 값을 실체화하므로(타깃은 처음엔 정확함) 이후엔
+    아무것도 유지하지 않고, CDC도 생성 컬럼을 복제하지 **않습니다**(VIRTUAL 컬럼은 논리 복제 자체가
+    불가). 컷오버 전에 애플리케이션에서 값을 다시 계산하세요.
+  - **CDC 커넥터 커버리지.** 번들된 Debezium PostgreSQL 커넥터의 테스트 매트릭스는 PG16까지입니다.
+    `pgoutput` 스트리밍은 17/18에서도 동작하지만(논리 복제 프로토콜은 그대로이고 드라이버는 안정적인
+    와이어 프로토콜로 연결됨), 17/18 CDC는 **best-effort**로 취급하고 프로덕션에 의존하기 전에 종단 간
+    검증(Full Load 워터마크 → 슬롯 재개 → DSQL 싱크 → Validation 체크섬)을 하세요. PG18에서는
+    `idle_replication_slot_timeout`가 `0`(비활성)인지도 확인해, 유휴 구간에 CDC 슬롯이 자동
+    무효화되지 않도록 하세요.
 
 ---
 

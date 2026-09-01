@@ -30,7 +30,9 @@ PostgreSQL)을 그대로 대체하는 드롭인 대체재가 **아니라** 고�
       → [§1.1](01-setup.md#11-사전-요구사항)
 
 - [ ] **두 가지 소스 엔진을 지원합니다.** **RDS for MySQL**과 **Aurora MySQL**(**5.7 / 8.0 / 8.4**
-      버전), 그리고 **RDS for PostgreSQL**과 **Aurora PostgreSQL**(PG **13–16** 검증; 도구는 PG 버전
+      버전), 그리고 **RDS for PostgreSQL**과 **Aurora PostgreSQL**(PG **13–18**; 13–16은 종단 간
+      검증, 17/18은 호환성 감사로 검증 — 버전별 엣지 2가지 + CDC 커넥터 캐비엇은
+      [§6.2](06-limitations.md#62-마이그레이션-프로세스-한계) 참고. 도구는 PG 버전
       하한/상한을 강제하지 않음). 소스 엔진은 Connect 화면에서 선택합니다(MySQL 기본 포트 **3306**,
       PostgreSQL은 **5432**; PostgreSQL 소스는 단일 데이터베이스에 연결). 두 엔진 모두 비밀번호 또는
       **AWS Secrets Manager**의 사용자명/비밀번호로 인증합니다 — IAM 인증은 타깃 DSQL 전용입니다.

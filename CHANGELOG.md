@@ -5,21 +5,33 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
-## v0.1.427
+## v0.1.429
 
 ### Fixed
 
-- **Foreign keys are no longer applied at Full-Load end for a MySQL Full Load + CDC
-  migration — they now defer to cut over, as intended.** The post-load FK pass was gated
-  only by `cdc_coexisting` (MySQL connectors-first / SKIP_EXISTING) and `cdc_stack_name`
-  (PostgreSQL slot handoff). A MySQL **Full-Load-first → binlog-watermark handoff** (the
-  "Automatic" CDC start point, where CDC starts *after* the load) has neither signal set
-  at load end, so the pass created and enforced the foreign keys immediately — and once
-  CDC began streaming, the out-of-order sink dead-lettered every child row whose parent
-  had not yet arrived (`SQLSTATE 23503`, e.g. `order_items`/`inventory` → `products`). A
-  new source-agnostic `is_cdc_migration` input (derived from
-  `migration_type == FULL_LOAD_AND_CDC`) now forces FK deferral for **every** CDC
-  migration, so foreign keys are created only at cut over after the stream drains.
+- **PostgreSQL 18 VIRTUAL generated columns are now detected and flagged (previously
+  silent).** `PostgresSourceDialect.enrich` marked a column generated only when
+  `pg_attribute.attgenerated == 's'` (STORED). PostgreSQL 18 adds VIRTUAL generated
+  columns and makes VIRTUAL the **default** kind for a keyword-less `GENERATED ALWAYS AS
+  (expr)`, so on a PG18 source the common generated-column form (`attgenerated = 'v'`) was
+  classified as an ordinary column: Schema Conversion emitted **no** MANUAL/LOSS warning,
+  and the column was created as ordinary and materialized by Full Load with no signal that
+  nothing maintains it afterward (and that CDC does not replicate it). enrich now treats
+  both `'s'` and `'v'` as generated, so the existing `_pg_generated_column_warning` fires
+  for VIRTUAL columns exactly as for STORED; the warning wording is generalized to cover
+  both kinds and now states that CDC does not maintain generated columns (VIRTUAL columns
+  cannot be logically replicated at all). Only affects PostgreSQL 18 sources (13–17 have
+  only STORED generated columns).
+
+### Documentation
+
+- **Manual: PostgreSQL 17/18 source support.** `00-before-you-begin` now states PG
+  **13–18** are supported, and `06-limitations §6.2` documents the three PG17/18-specific
+  edges surfaced by a compatibility audit: `interval` `infinity`/`-infinity` (new in PG17)
+  is quarantined by Full Load and caught by Validation on the PostgreSQL-16-compatible DSQL
+  target; PG18 VIRTUAL generated columns; and the bundled Debezium PostgreSQL connector's
+  tested matrix topping out at PG16 (17/18 CDC is best-effort — validate end to end, and
+  confirm `idle_replication_slot_timeout=0` on PG18).
 
 ## v0.1.428
 
@@ -37,6 +49,22 @@ All notable changes to this project are recorded here. This project follows
   reload" to (re)create them from the applied conversion. Non-blocking (a Drop & reload /
   recreate-candidate run still creates them), and skipped when the target probe couldn't
   read the target.
+
+## v0.1.427
+
+### Fixed
+
+- **Foreign keys are no longer applied at Full-Load end for a MySQL Full Load + CDC
+  migration — they now defer to cut over, as intended.** The post-load FK pass was gated
+  only by `cdc_coexisting` (MySQL connectors-first / SKIP_EXISTING) and `cdc_stack_name`
+  (PostgreSQL slot handoff). A MySQL **Full-Load-first → binlog-watermark handoff** (the
+  "Automatic" CDC start point, where CDC starts *after* the load) has neither signal set
+  at load end, so the pass created and enforced the foreign keys immediately — and once
+  CDC began streaming, the out-of-order sink dead-lettered every child row whose parent
+  had not yet arrived (`SQLSTATE 23503`, e.g. `order_items`/`inventory` → `products`). A
+  new source-agnostic `is_cdc_migration` input (derived from
+  `migration_type == FULL_LOAD_AND_CDC`) now forces FK deferral for **every** CDC
+  migration, so foreign keys are created only at cut over after the stream drains.
 
 ## v0.1.427
 

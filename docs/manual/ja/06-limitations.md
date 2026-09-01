@@ -92,6 +92,26 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
   Full Load を明示的に(loudly)中断させます。ソースデータをクリーンアップ(または
   その列を除外)してから再実行してください。PostgreSQL ソースにはネイティブの `boolean` 型が
   あるため、この MySQL 固有の `TINYINT(1)`→`boolean` 変換とテーブル全体の失敗ガードは適用されません。
+- **PostgreSQL 17/18 ソース — バージョン固有のエッジ 3 点（いずれも移行を止めません）。** PG 13–18
+  をサポートします。17・18 では次の 3 点に注意してください:
+  - **`interval` の `infinity`/`-infinity`（PG17 で新規）。** Aurora DSQL は PostgreSQL-16 互換で
+    あり、その `interval` 入力パーサはこれらの値を拒否します。そのため *無限* の `interval` を持つ行は
+    Full Load 中に **隔離（quarantine）** され（隔離カウントに表示）、Validation で count/checksum の
+    不一致として表面化します — 暗黙のうちに変更されることはありません。有限の interval と
+    `timestamp`/`timestamptz` の `infinity` は影響を受けません。その列を移行する前に、該当行を
+    リモデリング（例: 有限のセンチネル値）してください。
+  - **VIRTUAL 生成列（PG18 の既定の種類）。** DSQL には生成列がないため、`GENERATED ALWAYS AS
+    (expr)` 列は — STORED でも **VIRTUAL** でも — 通常の列として作成され、Schema Conversion で
+    **MANUAL/LOSS** として表示されます。Full Load は計算済みの値を実体化するため（ターゲットは最初は
+    正しい）、その後は何も維持せず、CDC も生成列を複製し **ません**（VIRTUAL 列は論理レプリケーション
+    自体ができません）。カットオーバー前にアプリケーションで値を再計算してください。
+  - **CDC コネクタのカバレッジ。** 同梱の Debezium PostgreSQL コネクタのテスト対象は PG16 までです。
+    `pgoutput` ストリーミングは 17/18 でも動作しますが（論理レプリケーションプロトコルは変わらず、
+    ドライバは安定したワイヤプロトコルで接続）、17/18 の CDC は **ベストエフォート** として扱い、
+    本番で依存する前にエンドツーエンドで検証（Full Load ウォーターマーク → スロット再開 → DSQL
+    シンク → Validation チェックサム）してください。PG18 では `idle_replication_slot_timeout` が
+    `0`（無効）であることも確認し、アイドル期間に CDC スロットが自動的に無効化されないようにして
+    ください。
 
 ---
 

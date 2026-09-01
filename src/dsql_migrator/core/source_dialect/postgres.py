@@ -193,9 +193,11 @@ class PostgresSourceDialect(SourceDialect):
                 text(
                     "SELECT a.attname AS col, "
                     "format_type(a.atttypid, a.atttypmod) AS typ, "
-                    # attgenerated: 's' = STORED generated column, '' = ordinary (PG12+,
-                    # the supported floor). DSQL has no generated columns, so the converter
-                    # warns and creates it as ordinary -- see _pg_generated_column_warning.
+                    # attgenerated: 's' = STORED generated column, 'v' = VIRTUAL generated
+                    # column (new in PG18, where it is the DEFAULT kind for a keyword-less
+                    # GENERATED ALWAYS AS (expr)), '' = ordinary. DSQL has no generated
+                    # columns of either kind, so the converter warns and creates it as
+                    # ordinary -- see _pg_generated_column_warning.
                     "a.attgenerated AS gen "
                     "FROM pg_attribute a "
                     "JOIN pg_class c ON c.oid = a.attrelid "
@@ -210,7 +212,7 @@ class PostgresSourceDialect(SourceDialect):
                 resolved = exact.get(column.name)
                 if resolved:
                     column.mysql_type = resolved[0]
-                    if resolved[1] == "s":  # STORED generated column
+                    if resolved[1] in ("s", "v"):  # 's'=STORED, 'v'=VIRTUAL (PG18+)
                         column.generated = True
         return ([], [], [])
 

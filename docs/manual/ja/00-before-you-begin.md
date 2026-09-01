@@ -33,8 +33,10 @@ _言語: [English](../en/00-before-you-begin.md) | [한국어](../ko/00-before-y
       対しても行う唯一の書き込みです。 → [§1.1](01-setup.md#11-前提条件)
 
 - [ ] **2 つのソースエンジンをサポートします。** **RDS for MySQL** と **Aurora MySQL**（**5.7 / 8.0 /
-      8.4** バージョン）、および **RDS for PostgreSQL** と **Aurora PostgreSQL**（PG **13–16** を検証。
-      ツールは PG のバージョン下限/上限を強制しません）。ソースエンジンは Connect 画面で選択します
+      8.4** バージョン）、および **RDS for PostgreSQL** と **Aurora PostgreSQL**（PG **13–18**。
+      13–16 はエンドツーエンドで検証済み、17/18 は互換性監査で検証済み — バージョン固有のエッジ 2 点
+      + CDC コネクタの注意点は [§6.2](06-limitations.md#62-移行プロセスの制限) を参照。ツールは PG の
+      バージョン下限/上限を強制しません）。ソースエンジンは Connect 画面で選択します
       （MySQL の既定ポートは **3306**、PostgreSQL は **5432**。PostgreSQL ソースは単一のデータベースに
       接続します）。どちらのエンジンもパスワードまたは **AWS Secrets Manager** のユーザー名/パスワードで
       認証します — IAM 認証はターゲット DSQL 専用です。 → [§1.1](01-setup.md#11-前提条件)
