@@ -2455,22 +2455,82 @@ def test_run_cutover_foreign_keys_noops_without_state() -> None:
     assert state.cutover_fk_apply == (0, 0, 0)
 
 
+def _fk_inventory_with_unsupported():
+    # Two tables, each with 1 source FK. "orders" converts cleanly (1 rendered
+    # foreign_key_ddl); "broken" has an unparsable MySQL type so it converts to an
+    # UNSUPPORTED comment placeholder whose foreign_key_ddls is empty (its FK is
+    # never applied). Raw inventory FK count = 2; applied count = 1.
+    from dsql_migrator.core.models import (
+        ColumnDef, ForeignKeyDef, SourceInventory, TableDef,
+    )
+
+    inv = _fk_inventory()
+    inv.tables.append(
+        TableDef(
+            name="broken",
+            columns=[
+                ColumnDef(name="id", mysql_type="int"),
+                ColumnDef(name="oid", mysql_type="weird_udt_zzz"),  # unparsable -> UNSUPPORTED
+            ],
+            primary_key=["id"],
+            foreign_keys=[
+                ForeignKeyDef(
+                    name="fk_o",
+                    columns=["oid"],
+                    referenced_table="orders",
+                    referenced_columns=["id"],
+                )
+            ],
+        )
+    )
+    return inv
+
+
 def test_cutover_pending_foreign_keys_counts_and_respects_toggle() -> None:
     from types import SimpleNamespace
 
     from dsql_migrator.ui.validation import _cutover_pending_foreign_keys
 
+    session = SimpleNamespace(source_config=None)  # -> MySQL default
     eval_store = SimpleNamespace(
         get_or_create=lambda sid: SimpleNamespace(
             result=SimpleNamespace(inventory=_fk_inventory())
         )
     )
-    on = SimpleNamespace(get=lambda sid: SimpleNamespace(preserve_foreign_keys=True))
-    off = SimpleNamespace(get=lambda sid: SimpleNamespace(preserve_foreign_keys=False))
+    on = SimpleNamespace(
+        get=lambda sid: SimpleNamespace(preserve_foreign_keys=True, edited_target_ddls={})
+    )
+    off = SimpleNamespace(
+        get=lambda sid: SimpleNamespace(preserve_foreign_keys=False, edited_target_ddls={})
+    )
 
-    assert _cutover_pending_foreign_keys(eval_store, on, "s") == 1
-    assert _cutover_pending_foreign_keys(eval_store, off, "s") == 0  # toggle off
-    assert _cutover_pending_foreign_keys(None, on, "s") == 0  # no eval store
+    assert _cutover_pending_foreign_keys(session, eval_store, on, "s") == 1
+    assert _cutover_pending_foreign_keys(session, eval_store, off, "s") == 0  # toggle off
+    assert _cutover_pending_foreign_keys(session, None, on, "s") == 0  # no eval store
+
+
+def test_cutover_pending_foreign_keys_excludes_unsupported_tables() -> None:
+    # An FK on a table that converts UNSUPPORTED (empty foreign_key_ddls) must NOT be
+    # counted: the count must equal the APPLIED foreign_key_ddls (1), not the raw
+    # inventory FK count (2) that apply_preserved_foreign_keys would never reach.
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.validation import _cutover_pending_foreign_keys
+
+    session = SimpleNamespace(source_config=None)
+    inv = _fk_inventory_with_unsupported()
+    raw_inventory_fk_count = sum(len(t.foreign_keys) for t in inv.tables)
+    assert raw_inventory_fk_count == 2  # sanity: the old (buggy) count
+
+    eval_store = SimpleNamespace(
+        get_or_create=lambda sid: SimpleNamespace(
+            result=SimpleNamespace(inventory=inv)
+        )
+    )
+    on = SimpleNamespace(
+        get=lambda sid: SimpleNamespace(preserve_foreign_keys=True, edited_target_ddls={})
+    )
+    assert _cutover_pending_foreign_keys(session, eval_store, on, "s") == 1
 
 
 def test_cutover_screen_has_no_render_time_sync_entrypoint() -> None:

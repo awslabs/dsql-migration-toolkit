@@ -5,6 +5,26 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.432
+
+### 修正 (Fixed)
+
+- **外部キーの参照アクションのエッジケース**(FK 再作成パスのクロスエンジンレビューで発見 — 中核の
+  `ADD CONSTRAINT ... NOT VALID` パスは MySQL・PostgreSQL ソース間で一貫しています。以下は残りの
+  エッジ):
+  - **PostgreSQL 15+ の列リスト参照アクション**(`ON DELETE SET NULL (col)` / `SET DEFAULT (col)`)が
+    暗黙のうちに `NO ACTION` へ格下げされていた問題 — 括弧内の列サブセットが許可アクション判定を
+    通らず脱落していました。Aurora DSQL / PostgreSQL-16 が表現できないそのサブセットを除去し、基本
+    アクション(`SET NULL` / `SET DEFAULT`)を出力するようになりました。
+  - **`RESTRICT` がソースエンジンに関係なく同一にレンダリングされるようになりました。** MySQL ソースは
+    `RESTRICT` を復元できず(`SHOW CREATE TABLE` が省略 → 既に `NO ACTION` に見える)、PostgreSQL
+    ソースは保持していたため、論理的に同一の FK がソースによって異なっていました。両エンジンとも
+    `RESTRICT` を `NO ACTION` に正規化します(`NOT VALID` の DSQL ターゲットでは機能的に等価:即時
+    チェック vs 遅延チェック)。
+  - **カットオーバーの「保留中の外部キー」件数が過大計上しなくなりました。** すべてのソース FK を
+    数えていました(UNSUPPORTED に変換され適用されないテーブルの FK を含む)が、apply パスが反復する
+    のと同じレンダリング済み `ADD CONSTRAINT` DDL を数えるようになり、実際に作成される数と一致します。
+
 ## v0.1.431
 
 ### 修正 (Fixed)

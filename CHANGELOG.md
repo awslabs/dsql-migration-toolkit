@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.432
+
+### Fixed
+
+- **Foreign-key referential-action edge cases** (found by a cross-engine review of the FK
+  re-creation path — the core `ADD CONSTRAINT ... NOT VALID` path is consistent across
+  MySQL and PostgreSQL sources; these are residual edges):
+  - **A PostgreSQL 15+ column-list referential action** (`ON DELETE SET NULL (col)` /
+    `SET DEFAULT (col)`) was silently downgraded to `NO ACTION` — the parenthesised column
+    subset failed the accepted-action check and fell through. The subset (which Aurora DSQL
+    / PostgreSQL-16 cannot express) is now stripped and the base action (`SET NULL` /
+    `SET DEFAULT`) is emitted instead of being dropped.
+  - **`RESTRICT` now renders identically regardless of source engine.** A MySQL source can
+    never recover `RESTRICT` (`SHOW CREATE TABLE` omits it, so it already reads as
+    `NO ACTION`), while a PostgreSQL source preserved it — so a logically identical foreign
+    key differed by source. `RESTRICT` is now normalized to `NO ACTION` for both engines
+    (functionally equivalent on the `NOT VALID` DSQL target: immediate vs deferred check).
+  - **The cut-over "pending foreign keys" count no longer over-states.** It counted every
+    source FK, including FKs on tables that convert to **UNSUPPORTED** (never applied); it
+    now counts the same rendered `ADD CONSTRAINT` DDLs the apply pass iterates, so the
+    number matches what is actually created.
+
 ## v0.1.431
 
 ### Fixed

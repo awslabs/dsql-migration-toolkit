@@ -2554,15 +2554,25 @@ def _run_cutover_identity_sync(
 
 
 def _cutover_pending_foreign_keys(
+    session: object,
     eval_store: "Optional[EvaluationStore]",
     conversion_store: "Optional[Any]",
     session_id: str,
 ) -> int:
-    """Count foreign keys still to apply at cut over (cheap; reads FK metadata only).
+    """Count foreign keys still to apply at cut over.
 
     Zero when FK preservation is off, no schema-conversion / evaluation state exists,
     or the source has no foreign keys. Used to decide whether the cut-over runbook
-    shows the "Apply foreign keys" action, without a schema re-conversion.
+    shows the "Apply foreign keys" action.
+
+    Counts the SAME rendered ``foreign_key_ddls`` that ``apply_preserved_foreign_keys``
+    will iterate at cut over -- rebuilding the applied conversions exactly as
+    :func:`_run_cutover_foreign_keys` does (a pure, side-effect-free schema
+    re-conversion + Schema-Conversion edits/toggle; no DB). This excludes FKs on a
+    table that converts UNSUPPORTED (its ``foreign_key_ddls`` is empty even though the
+    source FK metadata survives on ``preserved_foreign_keys``), so the count never
+    over-states what apply actually does. The rebuild is heavier than a raw metadata
+    tally, but cut over is not a hot path.
     """
     if conversion_store is None or eval_store is None:
         return 0
@@ -2573,7 +2583,20 @@ def _cutover_pending_foreign_keys(
     inventory = result.inventory if result is not None else None
     if inventory is None:
         return 0
-    return sum(len(table.foreign_keys) for table in inventory.tables)
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.ui.schema_conversion import applied_table_conversions
+
+    stype = (
+        session.source_config.source_type  # type: ignore[attr-defined]
+        if getattr(session, "source_config", None) is not None
+        else SourceType.MYSQL
+    )
+    applied = applied_table_conversions(
+        SchemaConverter(source_type=stype).convert(inventory),
+        conv_state.edited_target_ddls,
+        preserve_foreign_keys=conv_state.preserve_foreign_keys,
+    )
+    return sum(len(conv.foreign_key_ddls) for conv in applied.values())
 
 
 def _run_cutover_foreign_keys(
@@ -2823,7 +2846,7 @@ def build_cutover_screen(
             )
 
         _fk_pending = _cutover_pending_foreign_keys(
-            eval_store, conversion_store, session_id
+            session, eval_store, conversion_store, session_id
         )
 
         # Dev-only UI review: with no clean verdict, synthesize a ready summary so

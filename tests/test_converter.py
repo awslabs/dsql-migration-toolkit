@@ -30,6 +30,7 @@ from dsql_migrator.core.models import (
     ObjectRef,
     ObjectType,
     SourceInventory,
+    SourceType,
     TableDef,
     ViewDef,
 )
@@ -577,7 +578,7 @@ def test_foreign_key_ddl_renders_actions_composite_and_self_reference() -> None:
                 referenced_table="inventory",
                 referenced_columns=["warehouse_id", "product_no"],
                 on_delete="CASCADE",
-                on_update="RESTRICT",
+                on_update="RESTRICT",  # RESTRICT normalises to NO ACTION -> clause omitted
             ),
             ForeignKeyDef(
                 name="fk_parent",
@@ -606,7 +607,7 @@ def test_foreign_key_ddl_renders_actions_composite_and_self_reference() -> None:
     assert SchemaConverter().convert_table(table).foreign_key_ddls == [
         'ALTER TABLE "shipments" ADD CONSTRAINT "fk_inv" FOREIGN KEY '
         '("warehouse_id", "product_no") REFERENCES "inventory" '
-        '("warehouse_id", "product_no") ON DELETE CASCADE ON UPDATE RESTRICT NOT VALID',
+        '("warehouse_id", "product_no") ON DELETE CASCADE NOT VALID',
         'ALTER TABLE "shipments" ADD CONSTRAINT "fk_parent" FOREIGN KEY '
         '("parent_id") REFERENCES "shipments" ("id") ON DELETE SET NULL NOT VALID',
         'ALTER TABLE "shipments" ADD CONSTRAINT "fk_default" FOREIGN KEY '
@@ -615,6 +616,79 @@ def test_foreign_key_ddl_renders_actions_composite_and_self_reference() -> None:
         '("warehouse_id") REFERENCES "other" ("id") '
         'ON DELETE SET DEFAULT ON UPDATE SET DEFAULT NOT VALID',
     ]
+
+
+def test_normalize_fk_action_strips_pg15_column_list_and_maps_restrict() -> None:
+    from dsql_migrator.core.converter import _normalize_fk_action
+
+    # PG15+ column-list variant: strip the trailing "(...)" and keep the base action
+    # rather than silently dropping to NO ACTION (returning None).
+    assert _normalize_fk_action("SET NULL (a)") == "SET NULL"
+    assert _normalize_fk_action("SET DEFAULT (a, b)") == "SET DEFAULT"
+    assert _normalize_fk_action("SET_NULL (a)") == "SET NULL"  # underscored + list
+    # RESTRICT normalises to NO ACTION for both engines (source-identical DDL).
+    assert _normalize_fk_action("RESTRICT") == "NO ACTION"
+    # Unchanged for the plain accepted actions and unknown/missing values.
+    assert _normalize_fk_action("CASCADE") == "CASCADE"
+    assert _normalize_fk_action(None) is None
+    assert _normalize_fk_action("BOGUS") is None
+
+
+def test_foreign_key_ddl_pg15_column_list_action_not_downgraded() -> None:
+    # A PG15+ "SET NULL (col)" action must render "ON DELETE SET NULL", not be
+    # silently omitted (which would downgrade the FK to NO ACTION).
+    table = TableDef(
+        name="t",
+        columns=[
+            ColumnDef(name="id", mysql_type="INT"),
+            ColumnDef(name="a", mysql_type="INT"),
+        ],
+        primary_key=["id"],
+        foreign_keys=[
+            ForeignKeyDef(
+                name="fk_a",
+                columns=["a"],
+                referenced_table="other",
+                referenced_columns=["id"],
+                on_delete="SET NULL (a)",
+            ),
+        ],
+    )
+    ddls = SchemaConverter().convert_table(table).foreign_key_ddls
+    assert ddls == [
+        'ALTER TABLE "t" ADD CONSTRAINT "fk_a" FOREIGN KEY ("a") '
+        'REFERENCES "other" ("id") ON DELETE SET NULL NOT VALID'
+    ]
+
+
+def test_foreign_key_ddl_restrict_source_identical_across_engines() -> None:
+    # A RESTRICT FK renders WITHOUT an ON DELETE clause (NO ACTION) regardless of the
+    # source engine, matching how a MySQL source (SHOW CREATE omits RESTRICT) renders.
+    table = TableDef(
+        name="t",
+        columns=[
+            ColumnDef(name="id", mysql_type="INT"),
+            ColumnDef(name="a", mysql_type="INT"),
+        ],
+        primary_key=["id"],
+        foreign_keys=[
+            ForeignKeyDef(
+                name="fk_a",
+                columns=["a"],
+                referenced_table="other",
+                referenced_columns=["id"],
+                on_delete="RESTRICT",
+            ),
+        ],
+    )
+    expected = [
+        'ALTER TABLE "t" ADD CONSTRAINT "fk_a" FOREIGN KEY ("a") '
+        'REFERENCES "other" ("id") NOT VALID'
+    ]
+    mysql_ddls = SchemaConverter(source_type=SourceType.MYSQL).convert_table(table).foreign_key_ddls
+    pg_ddls = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table).foreign_key_ddls
+    assert mysql_ddls == expected
+    assert pg_ddls == expected
 
 
 def test_secondary_unique_index_emitted_as_create_index_async() -> None:

@@ -5,6 +5,24 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.432
+
+### 수정 (Fixed)
+
+- **외래 키 참조 액션 엣지 케이스** (FK 재생성 경로 크로스엔진 리뷰에서 발견 — 핵심
+  `ADD CONSTRAINT ... NOT VALID` 경로는 MySQL·PostgreSQL 소스 간 일관됨; 아래는 잔여 엣지):
+  - **PostgreSQL 15+ 컬럼리스트 참조 액션**(`ON DELETE SET NULL (col)` / `SET DEFAULT (col)`)이
+    조용히 `NO ACTION`으로 강등되던 문제 — 괄호 안 컬럼 부분집합이 허용-액션 검사를 통과 못 해
+    누락됐습니다. Aurora DSQL/PostgreSQL-16이 표현 못 하는 그 부분집합을 이제 벗겨내고 기본 액션
+    (`SET NULL` / `SET DEFAULT`)을 방출합니다.
+  - **`RESTRICT`가 이제 소스 엔진과 무관하게 동일하게 렌더링됩니다.** MySQL 소스는 `RESTRICT`를
+    복원할 수 없고(`SHOW CREATE TABLE`이 생략 → 이미 `NO ACTION`처럼 보임), PostgreSQL 소스는
+    보존해서 논리적으로 같은 FK가 소스별로 달랐습니다. 이제 두 엔진 모두 `RESTRICT`를
+    `NO ACTION`으로 정규화합니다(`NOT VALID` DSQL 타깃에서 기능 동등: 즉시 vs 지연 검사).
+  - **cut over "대기 중 외래 키" 카운트가 더 이상 과다 계상하지 않습니다.** 모든 소스 FK를 셌는데
+    (UNSUPPORTED로 변환돼 적용되지 않는 테이블의 FK 포함), 이제 apply 패스가 순회하는 것과 동일한
+    렌더링된 `ADD CONSTRAINT` DDL을 세므로 실제 생성 수와 일치합니다.
+
 ## v0.1.431
 
 ### 수정 (Fixed)

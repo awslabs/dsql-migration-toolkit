@@ -1705,10 +1705,28 @@ def _normalize_fk_action(action: Optional[str]) -> Optional[str]:
     (``SET_NULL``). Returns the canonical spelling only when it is one DSQL accepts
     (so an unexpected value is dropped, not emitted verbatim); ``None`` for a
     missing action (the DDL then omits the clause, defaulting to ``NO ACTION``).
+
+    Two source-fidelity normalisations:
+
+    - A PostgreSQL 15+ column-list variant (``SET NULL (a)`` / ``SET DEFAULT (a, b)``)
+      has a trailing parenthesised column subset DSQL/PG16 cannot express. We strip
+      it and emit the base action (``SET NULL`` / ``SET DEFAULT``) rather than letting
+      the unrecognised string fall through to ``None`` and silently downgrade the FK
+      to ``NO ACTION``.
+    - ``RESTRICT`` is mapped to ``NO ACTION`` for BOTH engines so the emitted DDL is
+      source-identical: a MySQL source can never recover ``RESTRICT`` (``SHOW CREATE``
+      omits it, so it already looks like ``NO ACTION``), and the two are functionally
+      equivalent on the ``NOT VALID`` DSQL target (immediate vs deferred check).
     """
     if not action:
         return None
     normalized = " ".join(action.upper().replace("_", " ").split())
+    # Strip a PG15+ trailing column list, e.g. "SET NULL (a)" -> "SET NULL".
+    paren = normalized.find("(")
+    if paren != -1:
+        normalized = normalized[:paren].strip()
+    if normalized == "RESTRICT":
+        return "NO ACTION"
     return normalized if normalized in _FK_ACTIONS else None
 
 
